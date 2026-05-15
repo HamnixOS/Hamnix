@@ -1,390 +1,158 @@
 # Pynux
 
-**A tiny OS for microcontrollers. Python syntax. Native speed.**
+**A Python-syntax systems language being used to incrementally rewrite
+Linux kernel code on x86_64 — one loadable module at a time.**
 
-Pynux is a Python-syntax systems language that compiles to native ARM Thumb-2. Write familiar Python code, get bare-metal performance on Cortex-M microcontrollers.
+Pynux compiles Python-syntax source with static types directly to native
+machine code via a hand-written, zero-dependency compiler. The current
+focus is using Pynux as the target language for a "slow infection" of the
+Linux kernel: real kernel subsystems get reimplemented in Pynux and loaded
+into a stock kernel as `.ko` modules. The end-game is a fully-Pynux
+kernel built up subsystem by subsystem.
 
-## Features
+## Status
 
-- **Python syntax** you already know (with static types)
-- **Compiles to native ARM** - no interpreter, no VM
-- **Full OS** - processes, IPC, filesystem, device drivers
-- **266 passing tests** across 8 test suites
-- **Graphical desktop** via VTNext protocol
-- **QEMU simulation** - develop without hardware
+| Milestone | Description | Status |
+|-----------|-------------|--------|
+| M1 | Hello-world `.ko` written in Pynux that loads, `_printk`s, and unloads under QEMU | **Done** |
+| M2 | 16550A UART serial console driver in pure Pynux — registered with the kernel as a real `struct console` so printk traffic flows through Pynux code | **Done** |
+| M3.1 | `/proc/pynux/state` — procfs entry whose `show` callback is implemented in Pynux | **Done** |
+| M3.2 | `/dev/pynuxdisk` — 8 MiB block device with a Pynux `submit_bio` handler (registration path; full bio walk follow-up) | **Done** |
+| M3.3 | ramfs-class filesystem (mount + file create/write/read + mkdir/rm/rmdir + umount) | **Done** |
+| M3.4 | virtio-blk driver | Deferred |
 
-## Quick Start
+The microcontroller OS the project originally shipped (ARM Cortex-M,
+QEMU mps2-an385, RP2040, STM32F4) still compiles via the original ARM
+Thumb-2 backend. It is intentionally kept working but is no longer the
+focus of new work.
+
+## How it works
+
+```
+Pynux source (.py with static types, def/while/if, structs)
+   │
+   ▼
+compiler/  (CPython-hosted; pynux.py CLI dispatches by --target)
+   │
+   ├──► codegen_x86.py  ─►  GNU `as` (x86_64 SysV) ──► .o ──► .ko (kbuild + modpost)
+   │                        custom kernel + busybox initramfs
+   │                        ──► QEMU -serial stdio ──► dev loop closes
+   │
+   └──► codegen_arm.py  ─►  arm-none-eabi-as/ld ──► .elf ──► QEMU mps2-an385  (legacy MCU OS)
+```
+
+The x86_64 backend is hand-written — no LLVM — for zero external
+dependencies and consistency with the existing ARM backend. Kernel
+codegen constraints (SysV AMD64 ABI, 16-byte stack alignment, ENDBR64
+for IBT, no red zone, RIP-relative `.rodata` refs) are handled directly.
+
+## Quick start
+
+Requirements: `gcc`, `make`, `qemu-system-x86_64`, `flex`, `bison`,
+`libelf-dev`, Python 3.10+.
 
 ```bash
-# Install dependencies
-sudo apt install gcc-arm-none-eabi qemu-system-arm python3
+# One-time: build the custom mitigations-off kernel and busybox initramfs
+sudo apt install qemu-system-x86 flex bison libelf-dev
+./scripts/build_x86_kernel.sh        # ~10-25 min first time, cached after
 
-# Build and run tests (266 tests)
-./build.sh --test --run
-
-# Build and run interactive shell
-./build.sh --run
-
-# Run graphical mode (requires pygame)
-pip install pygame
-./boot_vm.sh
+# Build + boot any kernel-module example and assert its expected output:
+./scripts/run_x86_module.sh kernel-modules/hello         # M1
+./scripts/run_x86_module.sh kernel-modules/m2-arith      # M2.0 compiler tier
+./scripts/run_x86_module.sh kernel-modules/m2-string     # M2.1 ptr/index
+./scripts/run_x86_module.sh kernel-modules/m2-outb       # M2.2 outb/inb
+./scripts/run_x86_module.sh kernel-modules/m2-strout     # M2.3 polled write
+./scripts/run_x86_module.sh kernel-modules/m2-console    # M2.4/5 register_console
+./scripts/run_x86_module.sh kernel-modules/m3-proc       # M3.1 /proc/pynux/state
+./scripts/run_x86_module.sh kernel-modules/m3-disk       # M3.2 /dev/pynuxdisk
+./scripts/run_x86_module.sh kernel-modules/m3-fs         # M3.3 pynuxfs filesystem
 ```
 
-## Architecture
+Each module directory has an `expected.txt` listing the serial-output
+strings that must appear; the runner asserts them. Exit code 0 means the
+module loaded, ran, and produced the expected output.
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    User Programs                             │
-│              (programs/main.py, sensors, motors)             │
-├─────────────────────────────────────────────────────────────┤
-│     Shell      │    Libraries    │   Debug Tools            │
-│  (commands,    │  (io, string,   │  (trace, profiler,       │
-│   job control) │   math, etc.)   │   memtrack, GDB stub)    │
-├─────────────────────────────────────────────────────────────┤
-│  Process Mgmt  │   Filesystem    │   Device Drivers         │
-│  (IPC, pipes,  │   (RAMFS,       │   (GPIO, PWM, ADC,       │
-│   msg queues)  │    devfs)       │    I2C, SPI, sensors)    │
-├─────────────────────────────────────────────────────────────┤
-│                    Kernel / HAL                              │
-│              (timer, memory, interrupts)                     │
-├─────────────────────────────────────────────────────────────┤
-│                  ARM Cortex-M3 Hardware                      │
-└─────────────────────────────────────────────────────────────┘
-```
+## Writing a kernel module in Pynux
 
-## Writing Programs
-
-Create `programs/main.py` - it runs automatically at boot:
+`kernel-modules/hello/hello.py`:
 
 ```python
-# programs/main.py
-from lib.io import console_puts, console_print_int
-from kernel.timer import timer_get_ticks
+extern def _printk(fmt: str) -> int32
 
-last_print_time: int32 = 0
+def init_module() -> int32:
+    _printk("Pynux: hello from init_module\n")
+    return 0
 
-def user_main():
-    """Called once at startup."""
-    console_puts("Hello from Pynux!\n")
-
-def user_tick():
-    """Called repeatedly - cooperative multitasking."""
-    global last_print_time
-    ticks: int32 = timer_get_ticks()
-    if ticks - last_print_time >= 5000:
-        last_print_time = ticks
-        console_puts("Uptime: ")
-        console_print_int(ticks / 1000)
-        console_puts("s\n")
+def cleanup_module():
+    _printk("Pynux: goodbye from cleanup_module\n")
 ```
 
-### Reading Sensors
+`init_module` / `cleanup_module` are the kernel's legacy module-entry
+symbol names, found by the loader directly — no `module_init()` macro
+needed. `_printk` is the modern kernel's exported printk; declared
+`extern def` in Pynux. The compiler emits `.S`; the kernel's `kbuild`
+system (`obj-m := hello.o`) does the rest including modpost (vermagic,
+glue, link).
 
-```python
-from lib.sensors import temp_read, accel_read, light_read
+For an example of real hardware access in Pynux, see
+`kernel-modules/m2-console/m2_console.py` — it declares the kernel's
+`struct console` field-by-field in Pynux, populates the fields in
+`init_module`, and registers itself as a console. The driver's write
+function polls the UART's Line Status Register via the `inb` intrinsic
+and writes bytes via `outb`.
 
-def user_main():
-    # Read temperature (returns millidegrees C)
-    temp: int32 = temp_read(0)
-    console_puts("Temp: ")
-    console_print_int(temp / 1000)
-    console_puts(" C\n")
-
-    # Read accelerometer
-    x: int32 = 0
-    y: int32 = 0
-    z: int32 = 0
-    accel_read(0, &x, &y, &z)
-```
-
-### Controlling Motors
-
-```python
-from lib.motors import servo_write, dc_set_speed
-
-def user_main():
-    servo_write(0, 90)       # Servo to 90 degrees
-    dc_set_speed(0, 50)      # DC motor at 50%
-```
-
-## Shell Commands
-
-### File Operations
-```bash
-ls  cat  cp  mv  rm  mkdir  touch  pwd  cd  head  tail  wc  stat
-```
-
-### System Info
-```bash
-uname  uptime  free  date  hostname  arch
-```
-
-### Hardware
-```bash
-sensors          # Read all sensors
-servo 0 90       # Set servo angle
-motor 0 50       # Set motor speed
-drivers list     # Show loaded drivers
-```
-
-### Job Control
-```bash
-command &        # Run in background
-jobs             # List background jobs
-fg %1            # Bring to foreground
-```
-
-## Device Filesystem
-
-Hardware appears as files under `/dev/`:
-
-```bash
-# Read temperature
-cat /dev/sensors/temp0
-> 23.45
-
-# Set servo angle
-echo 90 > /dev/motors/servo0
-
-# Read GPIO pin
-cat /dev/gpio/pin0
-> 1
-```
-
-### Available Devices
-
-| Path | Read | Write |
-|------|------|-------|
-| `/dev/gpio/pinN` | 0/1 | 0/1 |
-| `/dev/sensors/tempN` | degrees C | - |
-| `/dev/sensors/accelN` | X Y Z | - |
-| `/dev/sensors/lightN` | 0-65535 | - |
-| `/dev/motors/servoN` | angle | 0-180 |
-| `/dev/motors/stepperN` | position | steps |
-| `/dev/motors/dcN` | speed% | -100 to 100 |
-
-## Libraries
-
-### Core
-| Library | Purpose |
-|---------|---------|
-| `lib/io.py` | Console I/O, UART |
-| `lib/memory.py` | Heap allocation |
-| `lib/string.py` | String operations |
-| `lib/math.py` | Math, trig, sqrt |
-
-### Hardware
-| Library | Purpose |
-|---------|---------|
-| `lib/peripherals.py` | GPIO, SPI, I2C, PWM, ADC |
-| `lib/sensors.py` | Temperature, accelerometer, light |
-| `lib/motors.py` | Servo, stepper, DC motors |
-| `lib/i2c.py` | Advanced I2C with simulation |
-| `lib/spi.py` | Advanced SPI with simulation |
-
-### Debug & Profiling
-| Library | Purpose |
-|---------|---------|
-| `lib/trace.py` | Event tracing with timestamps |
-| `lib/profiler.py` | Function timing |
-| `lib/memtrack.py` | Memory leak detection |
-
-### Data Structures
-| Library | Purpose |
-|---------|---------|
-| `lib/list.py` | Dynamic arrays |
-| `lib/dict.py` | Hash maps |
-| `lib/structures.py` | Stack, queue, ring buffer |
-
-### Control Systems
-| Library | Purpose |
-|---------|---------|
-| `lib/pid.py` | PID controller |
-| `lib/filters.py` | Low-pass, Kalman filters |
-| `lib/fsm.py` | Finite state machines |
-
-### Networking (Advanced)
-| Library | Purpose |
-|---------|---------|
-| `lib/net/` | TCP/IP stack for raw Ethernet |
-
-> **Note:** Most microcontroller projects use WiFi chips (ESP8266/ESP32) or hardware TCP/IP chips (Wiznet W5500) that handle networking internally. The `lib/net/` stack is for advanced use cases with raw Ethernet MACs.
-
-## Testing
-
-Pynux has comprehensive tests - 266 tests across 8 suites:
-
-```bash
-# Run all tests in QEMU
-./build.sh --test --run
-
-# Or use the CI script
-./scripts/ci-test.sh
-
-# Run demo programs
-./build.sh --demo --run
-```
-
-### Test Suites
-
-| Suite | Tests | Coverage |
-|-------|-------|----------|
-| IPC | 30 | Pipes, message queues |
-| Memory | 36 | Allocation, free, heap |
-| Timer | 22 | Delays, tick counting |
-| RAMFS | 41 | File/directory operations |
-| DevFS | 30 | Device registration, I/O |
-| Trace | 30 | Event logging, filters |
-| Profiler | 30 | Function timing |
-| Memtrack | 47 | Leak detection |
-
-### Demo Programs
-
-```bash
-./build.sh --demo --run
-```
-
-- **Elevator** - FSM-based floor control system
-- **Traffic Light** - State machine with timed transitions
-- **Thermostat** - PID temperature controller
-
-## CI/CD
-
-GitHub Actions runs on every push/PR:
-
-```yaml
-# .github/workflows/ci.yml
-- Build and test in QEMU (266 tests)
-- Build firmware for RP2040
-- Build firmware for STM32F4
-- Upload firmware artifacts
-```
-
-Run locally:
-```bash
-./scripts/ci-test.sh           # Full test suite
-./scripts/ci-test.sh --demo    # Demo verification
-./scripts/ci-test.sh --quick   # Quick smoke test
-```
-
-## Project Structure
+## Project structure
 
 ```
-compiler/       # Python-to-ARM compiler (runs on host)
-runtime/        # ARM assembly startup
-kernel/         # Kernel, scheduler, filesystem
-lib/            # 30+ libraries
-programs/       # User programs (main.py runs at boot)
-tests/          # Test suites (266 tests)
-scripts/        # CI, flashing, and debug tools
-bsp/            # Board support packages (RP2040, STM32F4)
-vtnext/         # Graphical terminal (pygame)
+compiler/        Pynux compiler (CPython-hosted)
+  pynux.py       CLI: --target=arm-cortex-m3 (default) or x86_64-linux-kernel-module
+  lexer.py       Tokenizer
+  parser.py      Recursive-descent parser → AST
+  ast_nodes.py   AST node definitions
+  codegen_x86.py x86_64 backend (hand-written, growing per milestone)
+  codegen_arm.py ARM Thumb-2 backend for the MCU OS (frozen reference)
+  optimizer.py   AST-level passes
+
+kernel-modules/  Pynux source for each module milestone
+  hello/         M1 hello-world
+  m2-arith/      M2.0 — params/locals/while/if
+  m2-string/     M2.1 — pointer indexing
+  m2-outb/       M2.2 — outb/inb intrinsics
+  m2-strout/     M2.3 — polled string write
+  m2-console/    M2.4 + M2.5 — struct console + register_console
+  m3-proc/       M3.1 — /proc/pynux/state via seq_file
+  m3-disk/       M3.2 — /dev/pynuxdisk block device
+  m3-fs/         M3.3 — pynuxfs mountable filesystem
+
+scripts/         x86 dev-loop infrastructure
+  build_x86_kernel.sh    Fetch + build mitigations-off Linux for QEMU
+  x86_kernel_config.sh   Kernel config knobs
+  make_initramfs.sh      Build static busybox + cpio initramfs
+  run_x86_module.sh      Build module → pack initramfs → boot QEMU → scrape serial
+
+docs/
+  x86-backend.md         Rationale: hand-written encoder, not LLVM
+  ARCHITECTURE.md        Compiler internals
+  API.md, HARDWARE.md    Legacy MCU OS reference
+
+# Legacy MCU OS (still compiles, not the focus):
+kernel/  lib/  programs/  runtime/  bsp/  tests/  coreutils/  vtnext/
+build.sh  boot_vm.sh                # ARM Cortex-M build/boot
 ```
 
-## Target Hardware
+## Working agreements
 
-| Platform | Status | Notes |
-|----------|--------|-------|
-| QEMU mps2-an385 | **Working** | Primary development target, 266 tests pass |
-| RP2040 (Pico) | Experimental | BSP ready, flash scripts included |
-| STM32F4 | Experimental | BSP ready, flash scripts included |
-
-### QEMU (Development)
-
-```bash
-./build.sh --run                    # Interactive shell
-./build.sh --test --run             # Run test suite
-./build.sh --demo --run             # Run demos
-./scripts/debug.sh                  # GDB debugging
-```
-
-### RP2040 (Raspberry Pi Pico)
-
-```bash
-# Build
-./build.sh --target=rp2040
-
-# Flash (requires picotool or drag-and-drop UF2)
-./scripts/flash-rp2040.sh
-
-# Debug (requires SWD debugger + OpenOCD)
-./scripts/debug.sh --rp2040
-```
-
-### STM32F4
-
-```bash
-# Build
-./build.sh --target=stm32f4
-
-# Flash (requires st-flash or OpenOCD)
-./scripts/flash-stm32f4.sh
-
-# Debug (requires ST-Link)
-./scripts/debug.sh --stm32f4
-```
-
-### Hardware Requirements
-
-| Target | Debugger | Flash Tool |
-|--------|----------|------------|
-| RP2040 | Pico Debug Probe / CMSIS-DAP | picotool or UF2 |
-| STM32F4 | ST-Link V2 | st-flash or OpenOCD |
-
-> **Note:** Hardware targets are experimental. Thoroughly tested in QEMU (266 tests), but hardware testing is ongoing.
-
-## Memory Usage
-
-- **Code:** ~485KB
-- **Data:** ~175KB
-- **Heap:** 16KB available
-- **Stack:** 4KB per process
-
-## Building from Source
-
-Requirements:
-- GCC ARM toolchain (`gcc-arm-none-eabi`)
-- QEMU ARM (`qemu-system-arm`)
-- Python 3.10+
-- pygame (optional, for graphical mode)
-
-```bash
-# Ubuntu/Debian
-sudo apt install gcc-arm-none-eabi qemu-system-arm python3
-
-# Build
-./build.sh
-
-# Run
-./boot_vm.sh --shell    # Text mode
-./boot_vm.sh            # Graphical mode
-```
-
-## Language Features
-
-Pynux uses Python syntax with static types:
-
-```python
-# Type annotations required
-count: int32 = 0
-name: Ptr[char] = "hello"
-data: Array[100, uint8]
-
-# Functions with types
-def add(a: int32, b: int32) -> int32:
-    return a + b
-
-# Pointers
-ptr: Ptr[int32] = &count
-value: int32 = ptr[0]
-
-# Arrays
-buffer: Array[256, uint8]
-buffer[0] = 42
-```
-
-See [LANGUAGE.md](LANGUAGE.md) for full syntax reference.
+- Each language extension lands with a `LANGUAGE.md` sentence, a test in
+  `tests/`, and a real use site in a kernel module that justified it.
+- Small commits that boot. A failing-to-load `.ko` is worse than fewer
+  features.
+- When a kernel idiom is awkward, propose a minimal language extension
+  before working around it in user code — the language is meant to grow.
+- Kernel codegen constraints honored as code is written: SysV AMD64 ABI,
+  16-byte stack alignment, ENDBR64, no red zone, RIP-relative `.rodata`.
+  Initial development targets a custom kernel with mitigations off; ratchet
+  them on as the codegen matures.
 
 ## License
 
-GPL-3.0 - See [LICENSE](LICENSE)
+GPL-3.0 — see [LICENSE](LICENSE).

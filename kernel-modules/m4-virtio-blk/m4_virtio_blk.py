@@ -1,0 +1,242 @@
+# Pynux M4.2: a virtio-blk driver. Closes the deferred M3.4.
+#
+# This sub-tier registers a virtio_driver matching VIRTIO_ID_BLOCK, gets a
+# probe callback from the virtio core, sets up a single virtqueue via the
+# vdev->config->find_vqs vtable, allocates a DMA-coherent buffer, and
+# reads sector 0 of the attached disk image. The 32-byte signature in the
+# disk image's sector 0 is then printed back through _printk.
+#
+# Foundations exercised:
+#   * PCI BAR mapping: by virtue of virtio_pci_modern doing it for us via
+#     the vdev->config vtable — we exercise the indirection.
+#   * Virtqueue protocol: split rings, descriptor chains, kick + get_buf.
+#   * DMA-coherent allocation via dma_alloc_coherent on vdev->dev.
+#
+# All struct sizes/offsets probed for linux-6.12.48 (see /tmp/probe runs).
+
+# -------- externs ---------------------------------------------------------
+extern def __register_virtio_driver(drv: Ptr[uint8], owner: Ptr[uint8]) -> int32
+extern def unregister_virtio_driver(drv: Ptr[uint8])
+extern def virtqueue_add_outbuf(vq: Ptr[uint8], sg: Ptr[uint8], num: uint32,
+                                data: Ptr[uint8], gfp: uint32) -> int32
+extern def virtqueue_add_inbuf(vq: Ptr[uint8], sg: Ptr[uint8], num: uint32,
+                               data: Ptr[uint8], gfp: uint32) -> int32
+extern def virtqueue_add_sgs(vq: Ptr[uint8], sgs: Ptr[uint8], out_sgs: uint32,
+                             in_sgs: uint32, data: Ptr[uint8], gfp: uint32) -> int32
+extern def virtqueue_kick(vq: Ptr[uint8]) -> int32
+extern def virtqueue_get_buf(vq: Ptr[uint8], len: Ptr[uint8]) -> Ptr[uint8]
+# dma_alloc_coherent / dma_free_coherent are static inlines that wrap
+# dma_alloc_attrs / dma_free_attrs (with attrs=0). Call the underlying
+# exported functions directly. The virtio bus device sometimes ships
+# with coherent_dma_mask == 0; set it explicitly before allocating.
+extern def dma_alloc_attrs(dev: Ptr[uint8], size: uint64,
+                           dma_handle: Ptr[uint8], gfp: uint32,
+                           attrs: uint64) -> Ptr[uint8]
+extern def dma_free_attrs(dev: Ptr[uint8], size: uint64, vaddr: Ptr[uint8],
+                          dma_handle: uint64, attrs: uint64)
+extern def dma_set_coherent_mask(dev: Ptr[uint8], mask: uint64) -> int32
+extern def dma_set_mask(dev: Ptr[uint8], mask: uint64) -> int32
+extern def sg_init_one(sg: Ptr[uint8], buf: Ptr[uint8], len: uint32)
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+extern def memset(dst: Ptr[uint8], v: int32, n: uint64) -> Ptr[uint8]
+extern def msleep(ms: uint32)
+extern def __this_module() -> int32
+extern def _printk(fmt: str, val: int32) -> int32
+
+
+# -------- struct layouts (probed) ----------------------------------------
+
+# struct device_driver (144 bytes; we only set name@0 and owner@16)
+class DeviceDriver:
+    name: Ptr[char]                     # 0
+    pad_after_name: Array[8, uint8]     # 8..16 (bus pointer, mod_name)
+    owner: Ptr[uint8]                   # 16
+    pad_end: Array[120, uint8]          # 24..144
+
+# struct virtio_driver (240 bytes)
+class VirtioDriver:
+    driver: DeviceDriver                # 0..144
+    id_table: Ptr[uint8]                # 144
+    feature_table: Ptr[uint8]           # 152
+    pad1: Array[32, uint8]              # 160..192
+    probe: Ptr[uint8]                   # 192
+    pad2: Array[8, uint8]               # 200..208
+    remove: Ptr[uint8]                  # 208
+    pad_end: Array[24, uint8]           # 216..240
+
+# struct virtio_device_id (8 bytes: device:u32, vendor:u32)
+class VirtioDeviceId:
+    device: int32                       # 0
+    vendor: int32                       # 4
+
+# struct virtio_blk_outhdr (16 bytes: type:u32, ioprio:u32, sector:u64)
+class VirtioBlkOutHdr:
+    htype: int32                        # 0
+    ioprio: int32                       # 4
+    sector: int64                       # 8
+
+
+# -------- offsets in kernel structs --------------------------------------
+
+# struct virtio_device (792 bytes)
+VDEV_DEV_OFF:       int32 = 16     # struct device (embedded)
+VDEV_CONFIG_OFF:    int32 = 744    # const struct virtio_config_ops *
+
+# struct virtio_config_ops (136 bytes)
+VCO_FIND_VQS_OFF:   int32 = 48     # find_vqs(vdev, nvqs, vqs[], info[], desc)
+
+# struct virtqueue_info (32 bytes: name:char*, callback:fn*, ctx:bool, flags:int)
+# We need one for the request queue.
+
+# -------- constants ------------------------------------------------------
+VIRTIO_ID_BLOCK_VAL: int32 = 2
+VIRTIO_ID_ANY:       int32 = -1     # 0xFFFFFFFF: match any vendor
+VIRTIO_BLK_T_IN:     int32 = 0      # read
+VIRTIO_BLK_T_OUT:    int32 = 1      # write
+SECTOR_SIZE:         uint32 = 512
+GFP_KERNEL:          uint32 = 0xcc0
+
+
+# -------- globals --------------------------------------------------------
+pynux_ids: VirtioDeviceId
+pynux_drv: VirtioDriver
+pynux_vq_name: Array[16, uint8]   # the requestq name string, NUL-terminated
+pynux_vqs_info: Array[32, uint8]  # 1x struct virtqueue_info
+pynux_vqs: Ptr[uint8]             # single virtqueue pointer, set in probe
+pynux_vdev: Ptr[uint8]            # cached vdev for cleanup
+
+
+def pynux_probe(vdev: Ptr[uint8]) -> int32:
+    _printk("[M4-VIRTIO] probe enter\n", 0)
+    pynux_vdev = vdev
+
+    # Build a 16-byte vq name "requestq\0" in our static buffer.
+    memcpy(&pynux_vq_name, "requestq\0", 9)
+
+    # vqs_info layout (per include/linux/virtio_config.h):
+    #   const char *name;       (offset 0)
+    #   vq_callback_t *callback;(offset 8)
+    #   bool ctx;               (offset 16)
+    #   u32 flags;              (offset 20)   <- struct is 32 bytes with padding
+    memset(&pynux_vqs_info, 0, 32)
+    vq_name_addr: Ptr[uint8] = &pynux_vq_name
+    memcpy(&pynux_vqs_info, &vq_name_addr, 8)
+    # callback stays NULL — polled mode for this sub-tier.
+
+    # Walk vdev->config->find_vqs and call it indirectly.
+    config_ptr: Ptr[uint8] = 0
+    memcpy(&config_ptr, vdev + VDEV_CONFIG_OFF, 8)
+    find_vqs_fn: Ptr[uint8] = 0
+    memcpy(&find_vqs_fn, config_ptr + VCO_FIND_VQS_OFF, 8)
+
+    # find_vqs(vdev, nvqs=1, &pynux_vqs (output), &pynux_vqs_info, NULL desc)
+    rc: int32 = find_vqs_fn(vdev, 1, &pynux_vqs, &pynux_vqs_info, 0)
+    _printk("[M4-VIRTIO] find_vqs rc = %d\n", rc)
+    if rc != 0:
+        return rc
+
+    # Allocate DMA-coherent buffer: 16 (outhdr) + 512 (data) + 1 (status)
+    # = 529 bytes. Round up to 1024 for alignment comfort.
+    dma_handle: uint64 = 0
+    dev_ptr: Ptr[uint8] = vdev + VDEV_DEV_OFF
+    # Ensure the virtio device has a coherent_dma_mask set so
+    # dma_alloc_attrs doesn't bail. Use the 64-bit mask.
+    dma_set_mask(dev_ptr, 0xffffffffffffffff)
+    dma_set_coherent_mask(dev_ptr, 0xffffffffffffffff)
+    buf: Ptr[uint8] = dma_alloc_attrs(dev_ptr, 1024, &dma_handle,
+                                       GFP_KERNEL, 0)
+    if buf == 0:
+        _printk("[M4-VIRTIO] dma_alloc_coherent FAILED\n", 0)
+        return -12   # -ENOMEM
+
+    # Write virtio_blk_outhdr at buf[0..16]: type=IN(read), ioprio=0, sector=0.
+    hdr_type: int32 = VIRTIO_BLK_T_IN
+    memcpy(buf, &hdr_type, 4)
+    zero_word: int32 = 0
+    memcpy(buf + 4, &zero_word, 4)
+    sector_val: int64 = 0
+    memcpy(buf + 8, &sector_val, 8)
+
+    # Three single-segment scatterlists for the three regions:
+    # sg_hdr (16B out), sg_data (512B in), sg_status (1B in).
+    # struct scatterlist is 32 bytes; allocate them in a local stack array.
+    sgs: Array[96, uint8]   # 3 sg's of 32 bytes each
+    sg_init_one(&sgs, buf, 16)             # out: header
+    sg_init_one(&sgs + 32, buf + 16, 512)  # in:  data
+    sg_init_one(&sgs + 64, buf + 528, 1)   # in:  status byte
+
+    # virtqueue_add_sgs takes an array of (struct scatterlist *) — one per
+    # SG list. We need three scatterlist pointers.
+    sg_ptrs: Array[24, uint8]
+    p0: Ptr[uint8] = &sgs
+    p1: Ptr[uint8] = &sgs + 32
+    p2: Ptr[uint8] = &sgs + 64
+    memcpy(&sg_ptrs, &p0, 8)
+    memcpy(&sg_ptrs + 8, &p1, 8)
+    memcpy(&sg_ptrs + 16, &p2, 8)
+
+    add_rc: int32 = virtqueue_add_sgs(pynux_vqs, &sg_ptrs, 1, 2, buf,
+                                       GFP_KERNEL)
+    _printk("[M4-VIRTIO] add_sgs rc = %d\n", add_rc)
+    if add_rc != 0:
+        return add_rc
+
+    virtqueue_kick(pynux_vqs)
+
+    # Poll for completion. Bounded loop with break.
+    consumed: Ptr[uint8] = 0
+    completed_len: uint32 = 0
+    tries: int32 = 0
+    while tries < 100000:
+        consumed = virtqueue_get_buf(pynux_vqs, &completed_len)
+        if consumed != 0:
+            break
+        tries = tries + 1
+    if consumed == 0:
+        _printk("[M4-VIRTIO] get_buf TIMED OUT\n", 0)
+        return -110   # -ETIMEDOUT
+
+    # Read back first 4 bytes of the data region as an int and print it.
+    sig0: int32 = 0
+    memcpy(&sig0, buf + 16, 4)
+    _printk("[M4-VIRTIO] sector0 first 4 bytes = 0x%x\n", sig0)
+    # Decode byte-by-byte for human readability.
+    b0: int32 = 0
+    memcpy(&b0, buf + 16, 1)
+    b1: int32 = 0
+    memcpy(&b1, buf + 17, 1)
+    b2: int32 = 0
+    memcpy(&b2, buf + 18, 1)
+    b3: int32 = 0
+    memcpy(&b3, buf + 19, 1)
+    _printk("[M4-VIRTIO] byte0=%d\n", b0)
+    _printk("[M4-VIRTIO] byte1=%d\n", b1)
+    _printk("[M4-VIRTIO] byte2=%d\n", b2)
+    _printk("[M4-VIRTIO] byte3=%d\n", b3)
+
+    return 0
+
+
+def pynux_remove(vdev: Ptr[uint8]):
+    _printk("[M4-VIRTIO] remove called\n", 0)
+
+
+def init_module() -> int32:
+    # id_table entry: match any vendor of VIRTIO_ID_BLOCK.
+    pynux_ids.device = VIRTIO_ID_BLOCK_VAL
+    pynux_ids.vendor = VIRTIO_ID_ANY
+
+    pynux_drv.driver.name = "pynux-virtio-blk"
+    pynux_drv.driver.owner = __this_module
+    pynux_drv.id_table = &pynux_ids
+    pynux_drv.probe = pynux_probe
+    pynux_drv.remove = pynux_remove
+
+    rc: int32 = __register_virtio_driver(&pynux_drv, __this_module)
+    _printk("[M4-VIRTIO] register rc = %d\n", rc)
+    return 0
+
+
+def cleanup_module():
+    unregister_virtio_driver(&pynux_drv)
+    _printk("[M4-VIRTIO] unregistered\n", 0)

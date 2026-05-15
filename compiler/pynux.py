@@ -16,7 +16,33 @@ from pathlib import Path
 from .lexer import tokenize, LexerError
 from .parser import Parser, ParseError, parse
 from .ast_nodes import Program, ImportDecl
-from .codegen_arm import generate, CodeGenError
+from .codegen_arm import generate as generate_arm, CodeGenError
+
+
+# Compilation targets. `codegen` selects the backend; `kbuild` means the
+# Linux kernel build system owns assembly+link, so the CLI stops at emitting
+# a .S file rather than invoking an assembler/linker itself.
+TARGETS = {
+    "arm-cortex-m3": {"codegen": "arm", "kbuild": False},
+    "x86_64-linux-kernel-module": {"codegen": "x86", "kbuild": True},
+}
+DEFAULT_TARGET = "arm-cortex-m3"
+
+
+def get_generator(target: str):
+    """Return the backend's generate(program: Program) -> str function."""
+    spec = TARGETS.get(target)
+    if spec is None:
+        known = ", ".join(TARGETS)
+        print(f"Error: unknown target '{target}'. Known targets: {known}",
+              file=sys.stderr)
+        sys.exit(1)
+    if spec["codegen"] == "arm":
+        return generate_arm
+    if spec["codegen"] == "x86":
+        from .codegen_x86 import generate as generate_x86
+        return generate_x86
+    raise AssertionError(f"unhandled codegen backend: {spec['codegen']}")
 
 
 def find_pynux_root() -> Path:
@@ -125,8 +151,10 @@ def find_runtime() -> Path:
     raise FileNotFoundError("Cannot find runtime directory")
 
 
-def compile_source(source: str, filename: str = "<stdin>") -> str:
-    """Compile Pynux source to ARM assembly (single file, no imports)."""
+def compile_source(source: str, filename: str = "<stdin>",
+                   target: str = DEFAULT_TARGET) -> str:
+    """Compile Pynux source to assembly (single file, no imports)."""
+    generate = get_generator(target)
     try:
         program = parse(source, filename)
         return generate(program)
@@ -135,8 +163,9 @@ def compile_source(source: str, filename: str = "<stdin>") -> str:
         sys.exit(1)
 
 
-def compile_with_imports(main_file: Path) -> str:
+def compile_with_imports(main_file: Path, target: str = DEFAULT_TARGET) -> str:
     """Compile Pynux source with import resolution."""
+    generate = get_generator(target)
     project_root = find_pynux_root()
 
     # Collect all imported files
@@ -255,7 +284,18 @@ def cmd_compile(args: argparse.Namespace) -> int:
         print(f"Error: {source_file} not found", file=sys.stderr)
         return 1
 
-    asm = compile_with_imports(source_file)
+    asm = compile_with_imports(source_file, target=args.target)
+
+    # kbuild targets: the Linux kernel build system owns assembly + link, so
+    # we stop at emitting a .S file for it to consume.
+    if TARGETS[args.target]["kbuild"]:
+        if args.output:
+            output = Path(args.output)
+        else:
+            output = source_file.with_suffix(".S")
+        output.write_text(asm)
+        print(f"Emitted {output} for kbuild ({args.target})")
+        return 0
 
     # Determine output file
     if args.output:
@@ -319,7 +359,7 @@ def cmd_asm(args: argparse.Namespace) -> int:
         return 1
 
     source = source_file.read_text()
-    asm = compile_source(source, str(source_file))
+    asm = compile_source(source, str(source_file), target=args.target)
 
     if args.output:
         Path(args.output).write_text(asm)
@@ -342,6 +382,9 @@ def main() -> int:
     compile_parser.add_argument("-o", "--output", help="Output file (.elf)")
     compile_parser.add_argument("--emit-asm", action="store_true",
                                help="Also emit assembly file")
+    compile_parser.add_argument("--target", default=DEFAULT_TARGET,
+                               choices=list(TARGETS),
+                               help=f"Compilation target (default: {DEFAULT_TARGET})")
     compile_parser.set_defaults(func=cmd_compile)
 
     # Run command
@@ -355,6 +398,9 @@ def main() -> int:
     asm_parser = subparsers.add_parser("asm", help="Emit assembly only")
     asm_parser.add_argument("source", help="Source file (.py)")
     asm_parser.add_argument("-o", "--output", help="Output file (.s)")
+    asm_parser.add_argument("--target", default=DEFAULT_TARGET,
+                           choices=list(TARGETS),
+                           help=f"Compilation target (default: {DEFAULT_TARGET})")
     asm_parser.set_defaults(func=cmd_asm)
 
     args = parser.parse_args()
