@@ -1,0 +1,195 @@
+# drivers/virtio/virtio_ring.py
+#
+# Split-ring virtqueue support — mirror of drivers/virtio/virtio_ring.c
+# at minimum scope. We allocate three regions inside one page:
+#
+#   descriptors:  qsize * 16 bytes
+#   avail ring:   4 + qsize * 2 + 2 bytes (header + ring + used_event)
+#   used ring:    4 + qsize * 8 + 2 bytes (header + ring  + avail_event)
+#
+# For qsize 16 (what we ask for) that's 256 + 38 + 138 = 432 bytes
+# in a single page. Linux pads everything to PAGE_SIZE for stronger
+# alignment guarantees, and we follow suit.
+#
+# Descriptor flags:
+#   VIRTQ_DESC_F_NEXT     0x01   chain continues at .next
+#   VIRTQ_DESC_F_WRITE    0x02   device may write to this buffer
+#   VIRTQ_DESC_F_INDIRECT 0x04   the buffer is a descriptor table
+#
+# This driver issues one in-flight request at a time; we poll the
+# used ring for completion. That keeps the FAT reads simple and
+# defers the IRQ wiring + per-request state until we have a real
+# concurrent workload.
+
+from mm.page_alloc import alloc_pages
+from kernel.printk.printk import printk0, printk1, printk2
+from drivers.virtio.virtio_pci import (
+    virtio_select_queue, virtio_set_queue_pfn, virtio_notify,
+)
+
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
+VIRTQ_DESC_F_NEXT:     uint16 = 1
+VIRTQ_DESC_F_WRITE:    uint16 = 2
+
+VIRTQ_DESC_SIZE: uint64 = 16
+
+
+# Per-queue runtime state. We track ring base addresses + a free-
+# descriptor head (legacy ring: head index + chained .next forms a
+# free-list); after each request we update used_idx_seen so the
+# completion poll knows what we've already drained.
+class VirtQueue:
+    qsize:           uint16
+    free_head:       uint16
+    used_idx_seen:   uint16
+    pad:             uint16
+    desc_addr:       uint64        # qsize * 16 bytes
+    avail_addr:      uint64        # qsize * 2 + 6 bytes
+    used_addr:       uint64        # qsize * 8 + 6 bytes
+    page_addr:       uint64        # the page returned by alloc_page (for PFN)
+
+
+def _align_up(value: uint64, alignment: uint64) -> uint64:
+    return (value + alignment - 1) & ~(alignment - 1)
+
+
+def virtq_setup(iobase: uint32, qidx: uint32, vq: Ptr[VirtQueue]) -> int32:
+    # Linux's setup_vq() at minimum scope: select the queue, read
+    # its host-fixed size, allocate a page, lay out the three rings
+    # by offset, plant the PFN. Legacy virtio requires the queue to
+    # live in a single 4 KiB page (or, more strictly, all three
+    # regions to live in one contiguous allocation page-aligned).
+    qsize: uint32 = virtio_select_queue(iobase, qidx)
+    if qsize == 0:
+        printk1("virtio: queue %d has size 0 (unsupported)\n",
+                cast[uint64](qidx))
+        return -1
+    if qsize > 32:
+        # We size our request descriptors for small queues; clamp
+        # to 32 for safety. Most QEMU virtio-blk queues are 128 by
+        # default — we'd take only the first 32 entries.
+        qsize = 32
+
+    # Legacy virtio requires the used ring to be PAGE_SIZE-aligned
+    # past the avail ring, per Linux's vring_init() (the same shape
+    # QEMU's legacy frontend expects). Even tiny queues (qsize=32)
+    # cross the 4 KiB boundary, so allocate 2 contiguous pages and
+    # park used at the start of the second page. PFN points at the
+    # whole region's first page.
+    page: uint64 = alloc_pages(1)        # order 1 = 2 pages = 8 KiB
+    if page == 0:
+        return -1
+    memset(cast[Ptr[uint8]](page), 0, 8192)
+
+    desc_off:  uint64 = 0
+    desc_size: uint64 = cast[uint64](qsize) * VIRTQ_DESC_SIZE
+    avail_off: uint64 = _align_up(desc_off + desc_size, 2)
+    avail_size: uint64 = 6 + cast[uint64](qsize) * 2
+    used_off: uint64 = _align_up(avail_off + avail_size, 4096)
+
+    vq[0].qsize         = cast[uint16](qsize & 0xFFFF)
+    vq[0].free_head     = 0
+    vq[0].used_idx_seen = 0
+    vq[0].desc_addr     = page + desc_off
+    vq[0].avail_addr    = page + avail_off
+    vq[0].used_addr     = page + used_off
+    vq[0].page_addr     = page
+
+    # Initialise the descriptor free-list: each .next points to the
+    # following descriptor; the last one points nowhere (we'll
+    # rewrite .next when we use a descriptor).
+    i: uint16 = 0
+    while i < vq[0].qsize:
+        d: uint64 = vq[0].desc_addr + cast[uint64](i) * VIRTQ_DESC_SIZE
+        # flags at offset 12 = NEXT, next at offset 14 = i+1
+        cast[Ptr[uint16]](d + 12)[0] = VIRTQ_DESC_F_NEXT
+        cast[Ptr[uint16]](d + 14)[0] = i + 1
+        i = i + 1
+
+    virtio_set_queue_pfn(iobase, page)
+    printk2("virtio: queue %d ready (size=%d)\n",
+            cast[uint64](qidx), cast[uint64](qsize))
+    return 0
+
+
+# One per buffer in a chain. Linux uses struct scatterlist; ours
+# packs address + length + a write-flag into 16 bytes.
+class VirtBuf:
+    addr:   uint64        # 0
+    length: uint32        # 8
+    write:  uint32        # 12 — non-zero = device may write here
+
+
+def virtq_add_chain3(vq: Ptr[VirtQueue], bufs: Ptr[VirtBuf]) -> uint16:
+    # Add a 3-buffer chain to the descriptor ring; returns the head
+    # descriptor index that gets pushed to the avail ring. For a
+    # virtio-blk request the chain is bufs[0] = outhdr (device-
+    # readable), bufs[1] = data (RO or WO depending on op), bufs[2]
+    # = status byte (always device-writable).
+    head: uint16 = vq[0].free_head
+    qsize: uint16 = vq[0].qsize
+    if head + 2 >= qsize:
+        printk0("virtio: descriptor exhausted\n")
+        return 0xFFFF
+
+    i_a: uint16 = head
+    i_b: uint16 = head + 1
+    i_c: uint16 = head + 2
+
+    _desc_set(vq, i_a, bufs[0].addr, bufs[0].length,
+              _flag_with_next(cast[int32](bufs[0].write), 1), i_b)
+    _desc_set(vq, i_b, bufs[1].addr, bufs[1].length,
+              _flag_with_next(cast[int32](bufs[1].write), 1), i_c)
+    _desc_set(vq, i_c, bufs[2].addr, bufs[2].length,
+              VIRTQ_DESC_F_WRITE, 0)
+
+    vq[0].free_head = i_c + 1
+
+    avail: uint64 = vq[0].avail_addr
+    idx: uint16 = cast[Ptr[uint16]](avail + 2)[0]
+    ring_slot: uint16 = idx % qsize
+    cast[Ptr[uint16]](avail + 4 + cast[uint64](ring_slot) * 2)[0] = head
+    # Spec wants a memory barrier between the descriptor write and
+    # the index bump. On x86 stores are TSO-ordered so the bare
+    # write is fine; ARM/RISC-V will need an actual sfence here.
+    cast[Ptr[uint16]](avail + 2)[0] = idx + 1
+    return head
+
+
+def _flag_with_next(want_write: int32, has_next: int32) -> uint16:
+    flags: uint16 = 0
+    if want_write != 0:
+        flags = flags | VIRTQ_DESC_F_WRITE
+    if has_next != 0:
+        flags = flags | VIRTQ_DESC_F_NEXT
+    return flags
+
+
+def _desc_set(vq: Ptr[VirtQueue], idx: uint16,
+              addr: uint64, length: uint32, flags: uint16,
+              next: uint16):
+    d: uint64 = vq[0].desc_addr + cast[uint64](idx) * VIRTQ_DESC_SIZE
+    cast[Ptr[uint64]](d +  0)[0] = addr
+    cast[Ptr[uint32]](d +  8)[0] = length
+    cast[Ptr[uint16]](d + 12)[0] = flags
+    cast[Ptr[uint16]](d + 14)[0] = next
+
+
+def virtq_kick_and_wait(iobase: uint32, qidx: uint32,
+                        vq: Ptr[VirtQueue]) -> int32:
+    # Notify the device, then spin until the used-ring index moves.
+    # Returns 0 on success. Used ring header is 2-byte flags + 2-byte
+    # idx; ring entries follow as {u32 id, u32 len} pairs.
+    virtio_notify(iobase, qidx)
+    used: uint64 = vq[0].used_addr
+    deadline: uint32 = 0
+    while True:
+        cur: uint16 = cast[Ptr[uint16]](used + 2)[0]
+        if cur != vq[0].used_idx_seen:
+            vq[0].used_idx_seen = cur
+            return 0
+        deadline = deadline + 1
+        if deadline > 100000000:
+            printk0("virtio: timeout waiting for used-ring bump\n")
+            return -1

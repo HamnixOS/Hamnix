@@ -62,7 +62,8 @@ ARG_REGS = ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"]
 #   asm_volatile(s): general inline asm — emit the string literal verbatim
 #     as a `.text` instruction. Zero-operand for now (the brief's required
 #     #3 extension); supports cli/sti/pause/mfence/etc.
-X86_INTRINSICS = {"outb", "inb", "outl", "inl", "asm_volatile"}
+X86_INTRINSICS = {"outb", "inb", "outl", "inl", "outw", "inw",
+                  "asm_volatile"}
 
 
 class CodeGenError(Exception):
@@ -1179,6 +1180,28 @@ class X86CodeGen:
             self.emit("    xorq %rax, %rax") # clear %rax
             self.emit("    inl %dx, %eax")
             # movl-to-eax already zero-extends to rax.
+        elif name == "outw":
+            # outw(value: uint16, port: uint16) -> None — sized PIO
+            # writes that some MMIO/register windows demand. virtio-
+            # legacy QUEUE_SEL / QUEUE_NOTIFY are the load-bearing
+            # callers; a 32-bit write would clobber the neighbouring
+            # status/isr bytes packed into the same dword.
+            if len(args) != 2:
+                raise CodeGenError("outw expects (value, port)")
+            self.gen_expr(args[0])           # value -> %rax
+            self.emit("    pushq %rax")
+            self.gen_expr(args[1])           # port  -> %rax
+            self.emit("    movw %ax, %dx")
+            self.emit("    popq %rax")
+            self.emit("    outw %ax, %dx")
+        elif name == "inw":
+            # inw(port: uint16) -> uint16 (zero-extended into %rax)
+            if len(args) != 1:
+                raise CodeGenError("inw expects (port)")
+            self.gen_expr(args[0])           # port -> %rax
+            self.emit("    movw %ax, %dx")
+            self.emit("    xorq %rax, %rax")
+            self.emit("    inw %dx, %ax")
         elif name == "asm_volatile":
             # asm_volatile("instruction") emits the literal instruction.
             # The arg must be a string literal; zero-operand only.

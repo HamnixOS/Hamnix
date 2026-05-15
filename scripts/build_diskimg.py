@@ -183,8 +183,16 @@ def emit_asm(image: bytes, dest: Path) -> None:
 if __name__ == "__main__":
     here = Path(__file__).resolve().parent.parent
     image = build_image()
-    dest = here / "fs" / "diskimg_blob.S"
-    emit_asm(image, dest)
-    print(f"Wrote {dest} ({len(image)} bytes image, "
+    blob_dest = here / "fs" / "diskimg_blob.S"
+    emit_asm(image, blob_dest)
+    # Also write the raw image to build/disk.img so QEMU can mount
+    # it via -drive file=build/disk.img,if=virtio. The block layer
+    # accepts both backings via the same BlockDevice abstraction;
+    # virtio-blk picks up vda, brd picks up ram0.
+    img_dest = here / "build" / "disk.img"
+    img_dest.parent.mkdir(parents=True, exist_ok=True)
+    img_dest.write_bytes(image)
+    print(f"Wrote {blob_dest} ({len(image)} bytes image, "
           f"{TOTAL_SECTORS} sectors of {SECTOR_SIZE})")
+    print(f"Wrote {img_dest} (raw, same bytes)")
     print(f"  embedded /mnt/HELLO.TXT ({len(HELLO_BODY)} bytes)")

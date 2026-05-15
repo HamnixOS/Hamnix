@@ -1,0 +1,168 @@
+# drivers/block/virtio_blk.py
+#
+# Mirror of drivers/block/virtio_blk.c at minimum scope — read-only,
+# single in-flight request, polled completion. Probes the legacy
+# virtio-blk PCI device (1AF4:1001), runs the standard virtio init
+# dance, sets up virtqueue 0, and registers "vda" against the
+# block-layer abstraction so the FAT32 driver can mount against
+# either /dev/ram0 or /dev/vda without caring which.
+#
+# Request shape (virtio-blk legacy):
+#
+#   struct virtio_blk_outhdr {
+#       u32 type;      // 0 = IN (read), 1 = OUT (write), 4 = FLUSH
+#       u32 ioprio;    // ignored by QEMU
+#       u64 sector;
+#   };
+#   [data bytes]       // SECTOR_SIZE * count
+#   u8  status;        // 0 = OK, 1 = IOERR, 2 = UNSUPP
+#
+# We submit them as a 3-descriptor chain (outhdr, data, status).
+# Device sees: read outhdr, write data + status. Caller polls used
+# ring for completion.
+
+from kernel.printk.printk import printk0, printk1, printk2
+from kernel.block.blk import (
+    BlockDeviceOps, register_blockdev, SECTOR_SIZE,
+)
+from drivers.pci.pci import (
+    pci_find, pci_bdf_bus, pci_bdf_dev, pci_bdf_fn,
+    pci_read_bar, pci_enable_io_and_master, PCI_BDF_NONE,
+)
+from drivers.virtio.virtio_pci import (
+    virtio_reset, virtio_acknowledge, virtio_driver_ok,
+    virtio_read_host_features, virtio_write_guest_features,
+    virtio_dev_config_read_u64,
+)
+from drivers.virtio.virtio_ring import (
+    VirtQueue, VirtBuf, virtq_setup, virtq_add_chain3,
+    virtq_kick_and_wait,
+)
+
+
+VIRTIO_VENDOR:     uint32 = 0x1AF4
+VIRTIO_BLK_LEGACY: uint32 = 0x1001   # transitional / legacy virtio-blk
+
+# Block-request header types (virtio-blk spec §5.2.6).
+VIRTIO_BLK_T_IN:    uint32 = 0
+VIRTIO_BLK_T_OUT:   uint32 = 1
+
+# capacity is in 512-byte sectors at config offset 0 (relative to
+# the device-specific config window).
+VIRTIO_BLK_CFG_CAPACITY: uint32 = 0
+
+
+# Per-device state. Single instance for now; we don't have a way
+# to enumerate multiple virtio-blk PCI devices yet.
+class VirtioBlk:
+    iobase:    uint32       # PCI BAR0 IO base (BAR low bit cleared)
+    qsize:     uint32
+    vq:        VirtQueue
+    capacity:  uint64       # sectors
+
+
+# Single in-flight request scratch:
+#   outhdr (16 bytes) | status (1 byte; padded to 8 for alignment).
+# The DATA buffer is the caller-supplied page-aligned target. The
+# header + status are global so the request doesn't malloc; size
+# requirements are tiny.
+class VirtioBlkReq:
+    outhdr_type:    uint32        # 0
+    outhdr_ioprio:  uint32        # 4
+    outhdr_sector:  uint64        # 8
+    status:         uint8         # 16
+    pad:            Array[7, uint8]   # 17..24
+
+
+vblk_state: VirtioBlk
+vblk_req:   VirtioBlkReq
+vblk_ops:   BlockDeviceOps
+# Buffer descriptors live in .bss so we don't re-init per request.
+vblk_bufs:  Array[3, VirtBuf]
+
+
+def virtio_blk_read_sectors(priv: uint64, lba: uint64,
+                            count: uint64, buf: Ptr[uint8]) -> int32:
+    # Build a single 3-descriptor request: outhdr (RO), data (WO),
+    # status (WO). priv unused — we route through the global
+    # vblk_state since there's only one device for now.
+    if count == 0:
+        return 0
+    vblk_req.outhdr_type   = VIRTIO_BLK_T_IN
+    vblk_req.outhdr_ioprio = 0
+    vblk_req.outhdr_sector = lba
+    vblk_req.status        = 0xFF
+
+    vblk_bufs[0].addr   = cast[uint64](&vblk_req.outhdr_type)
+    vblk_bufs[0].length = 16
+    vblk_bufs[0].write  = 0
+    vblk_bufs[1].addr   = cast[uint64](buf)
+    vblk_bufs[1].length = cast[uint32](count * SECTOR_SIZE)
+    vblk_bufs[1].write  = 1
+    vblk_bufs[2].addr   = cast[uint64](&vblk_req.status)
+    vblk_bufs[2].length = 1
+    vblk_bufs[2].write  = 1
+
+    head: uint16 = virtq_add_chain3(&vblk_state.vq, &vblk_bufs[0])
+    if head == 0xFFFF:
+        return -1
+    rc: int32 = virtq_kick_and_wait(vblk_state.iobase, 0, &vblk_state.vq)
+    if rc != 0:
+        return rc
+    # Reset the free list head to 0 after each completed request —
+    # we only have one in flight at a time, so the previous chain
+    # is now free again.
+    vblk_state.vq.free_head = 0
+    if vblk_req.status != 0:
+        printk1("virtio-blk: read failed status=%d\n",
+                cast[uint64](vblk_req.status))
+        return -1
+    return 0
+
+
+def virtio_blk_init() -> int32:
+    # Probe, init, register. Returns 0 on success, -1 on miss /
+    # failure. Caller (init/main.py) treats a miss as "no
+    # virtio-blk attached" — falls back to brd's /dev/ram0.
+    bdf: uint32 = pci_find(VIRTIO_VENDOR, VIRTIO_BLK_LEGACY)
+    if bdf == PCI_BDF_NONE:
+        printk0("virtio-blk: no PCI device found\n")
+        return -1
+
+    pci_enable_io_and_master(bdf)
+    bar0_raw: uint32 = pci_read_bar(bdf, 0)
+    # Legacy virtio uses an IO-space BAR (low bit set); mask to
+    # get the port base.
+    if (bar0_raw & 1) == 0:
+        printk0("virtio-blk: BAR0 is not IO-space (modern virtio?)\n")
+        return -1
+    iobase: uint32 = bar0_raw & 0xFFFFFFFC
+    vblk_state.iobase = iobase
+    printk2("virtio-blk: bdf=%x iobase=%p\n",
+            cast[uint64](bdf), cast[uint64](iobase))
+
+    # Standard init dance: reset, ACK, DRIVER, features, queues,
+    # DRIVER_OK. Skip feature negotiation beyond accepting nothing
+    # — the host's defaults are fine for sector reads.
+    virtio_reset(iobase)
+    virtio_acknowledge(iobase)
+    host_features: uint32 = virtio_read_host_features(iobase)
+    printk1("virtio-blk: host features=%x\n", cast[uint64](host_features))
+    virtio_write_guest_features(iobase, 0)        # take nothing extra
+
+    if virtq_setup(iobase, 0, &vblk_state.vq) < 0:
+        return -1
+
+    # Read capacity from the device-specific config window.
+    cap: uint64 = virtio_dev_config_read_u64(iobase,
+                                             VIRTIO_BLK_CFG_CAPACITY)
+    vblk_state.capacity = cap
+    printk1("virtio-blk: capacity=%d sectors\n", cap)
+
+    virtio_driver_ok(iobase)
+
+    vblk_ops.read_sectors = cast[uint64](&virtio_blk_read_sectors)
+    rc: int32 = register_blockdev("vda", cap, &vblk_ops, 0)
+    if rc < 0:
+        return -1
+    return 0
