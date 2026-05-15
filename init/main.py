@@ -219,16 +219,16 @@ demo_n3:   ListNode
 def _list_walk_and_sum(head: Ptr[ListHead]) -> uint64:
     # Walk forward from head, summing each node's payload `value`.
     # Stops when we loop back to head — the canonical circular-list
-    # termination condition.
+    # termination condition. Uses container_of to recover the
+    # enclosing ListNode from its embedded ListHead pointer; mirrors
+    # Linux's `list_for_each_entry` macro at the body level.
     head_addr: uint64 = cast[uint64](head)
     pos:       uint64 = head[0].next_ptr
     total:     uint64 = 0
     while pos != head_addr:
-        node: Ptr[ListNode] = cast[Ptr[ListNode]](
-            pos - LIST_NODE_LINK_OFFSET
-        )
-        total = total + node[0].value
         link: Ptr[ListHead] = cast[Ptr[ListHead]](pos)
+        node: Ptr[ListNode] = container_of(link, ListNode, link)
+        total = total + node[0].value
         pos = link[0].next_ptr
     return total
 

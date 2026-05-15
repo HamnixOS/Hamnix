@@ -43,7 +43,7 @@ from .ast_nodes import (
     Expr, Stmt,
     CallExpr, Identifier, StringLiteral, IntLiteral, CharLiteral, BoolLiteral,
     BinaryExpr, UnaryExpr, BinOp, UnaryOp,
-    IndexExpr, MemberExpr, CastExpr,
+    IndexExpr, MemberExpr, CastExpr, ContainerOfExpr,
     Type, PointerType, ArrayType, FunctionPointerType, PercpuType,
 )
 
@@ -251,6 +251,11 @@ class X86CodeGen:
             # `cast[Ptr[Foo]](p)[0].field` falls through to "unknown"
             # and member/index codegen can't find the struct layout.
             return expr.target_type
+        if isinstance(expr, ContainerOfExpr):
+            # Result is a pointer to the enclosing struct, so subsequent
+            # member access (`container_of(...)[0].field`) resolves
+            # against the right StructInfo.
+            return PointerType(Type(expr.type_name))
         return None
 
     def element_size_of(self, container: Expr) -> int:
@@ -764,6 +769,29 @@ class X86CodeGen:
                 # need runtime conversion, but no x86 caller exercises
                 # that path yet — when it does we'll specialize here.
                 self.gen_expr(inner)
+
+            case ContainerOfExpr(expr=inner, type_name=tn, field_name=fn):
+                # Evaluate the pointer to the field into %rax, then
+                # subtract the field's byte offset within the enclosing
+                # struct. Result is a pointer to the enclosing struct.
+                si = self.structs.get(tn)
+                if si is None:
+                    raise CodeGenError(
+                        f"x86: container_of: unknown struct '{tn}'"
+                    )
+                off = None
+                for fname, _, fo in si.fields:
+                    if fname == fn:
+                        off = fo
+                        break
+                if off is None:
+                    raise CodeGenError(
+                        f"x86: container_of: struct '{tn}' has no "
+                        f"field '{fn}'"
+                    )
+                self.gen_expr(inner)
+                if off:
+                    self.emit(f"    subq ${off}, %rax")
 
             case _:
                 raise CodeGenError(

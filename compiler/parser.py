@@ -422,7 +422,25 @@ class Parser:
                         else:
                             args.append(arg)
                 self.expect(TokenType.RPAREN)
-                expr = CallExpr(expr, args, kwargs)
+                # `container_of(ptr, Type, field)` is a compile-time
+                # construct, not a real call. Recognise the syntactic
+                # pattern here and rewrite into ContainerOfExpr so the
+                # codegen can resolve the field offset at compile time.
+                # Falling through to a regular CallExpr would (correctly)
+                # fail later because Type/field aren't value identifiers.
+                if (isinstance(expr, Identifier)
+                        and expr.name == "container_of"
+                        and not kwargs
+                        and len(args) == 3
+                        and isinstance(args[1], Identifier)
+                        and isinstance(args[2], Identifier)):
+                    expr = ContainerOfExpr(
+                        expr=args[0],
+                        type_name=args[1].name,
+                        field_name=args[2].name,
+                    )
+                else:
+                    expr = CallExpr(expr, args, kwargs)
 
             elif self.match(TokenType.LBRACKET):
                 # Index or slice

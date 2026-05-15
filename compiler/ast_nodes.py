@@ -387,13 +387,29 @@ class AsmExpr:
     span: Optional[Span] = None
 
 
+@dataclass
+class ContainerOfExpr:
+    """container_of(ptr, TypeName, field_name).
+
+    Mirrors Linux's `container_of()` macro: given a pointer to a struct
+    member, recover a pointer to the enclosing struct by subtracting
+    the member's byte offset. The codegen computes the offset at
+    compile time from the struct layout, so this is just a tiny
+    `subq $offset, %rax` at runtime. Result type is `Ptr[TypeName]`.
+    """
+    expr: 'Expr'
+    type_name: str
+    field_name: str
+    span: Optional[Span] = None
+
+
 # Type alias for expressions
 Expr = (IntLiteral | FloatLiteral | StringLiteral | FStringLiteral |
         CharLiteral | BoolLiteral | NoneLiteral | Identifier |
         BinaryExpr | UnaryExpr | CallExpr | MethodCallExpr |
         IndexExpr | SliceExpr | MemberExpr | ListLiteral |
         DictLiteral | TupleLiteral | ListComprehension | ConditionalExpr |
-        LambdaExpr | SizeOfExpr | CastExpr | AsmExpr)
+        LambdaExpr | SizeOfExpr | CastExpr | AsmExpr | ContainerOfExpr)
 
 
 # Statements
