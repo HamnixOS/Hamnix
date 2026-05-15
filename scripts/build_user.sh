@@ -30,10 +30,16 @@ build_one init
 build_one hello
 build_one echo
 
-# Hamnix-compiled userland binaries (M16.35: the shell).
-echo "[build_user] compiling user/hamsh.ad -> build/user/hamsh.elf"
-python3 -m compiler.adder compile \
-    --target=x86_64-adder-user \
-    user/hamsh.ad \
-    -o build/user/hamsh.elf
-file build/user/hamsh.elf
+# Hamnix-compiled userland binaries.
+build_adder_user() {
+    local name="$1"
+    echo "[build_user] compiling user/${name}.ad -> build/user/${name}.elf"
+    python3 -m compiler.adder compile \
+        --target=x86_64-adder-user \
+        "user/${name}.ad" \
+        -o "build/user/${name}.elf"
+    file "build/user/${name}.elf"
+}
+
+build_adder_user hamsh                # M16.35: interactive shell
+build_adder_user ps                   # M16.36: dumps /proc snapshots
