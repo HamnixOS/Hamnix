@@ -498,13 +498,9 @@ class X86CodeGen:
 
         # Parameters become locals: allocate slots up front so the body can
         # see them via the same symbol-lookup path as VarDecl-introduced
-        # locals. SysV passes the first 6 ints in ARG_REGS; we copy each to
-        # its slot immediately after the prologue.
-        if len(func.params) > len(ARG_REGS):
-            raise CodeGenError(
-                f"x86: more than {len(ARG_REGS)} parameters not yet supported "
-                f"({func.name})"
-            )
+        # locals. SysV passes the first 6 ints in ARG_REGS; args 7+ live on
+        # the caller's stack and the callee reads them at positive %rbp
+        # offsets (+16 for arg 7, +24 for arg 8, ...).
         for param in func.params:
             self.ctx.alloc_local(
                 param.name,
@@ -526,10 +522,18 @@ class X86CodeGen:
         reserve_idx = len(self.output)
         self.emit("    # @STACK_RESERVE@")
 
-        # Spill parameters from arg-regs into their slots.
+        # Spill parameters from arg-regs / caller's stack into their local
+        # slots. Args 0..5 come in via ARG_REGS; args 6+ live at +16(%rbp),
+        # +24(%rbp), ... in right-to-left push order (so arg 6 is closest
+        # to the return address).
         for i, param in enumerate(func.params):
             var = self.ctx.locals[param.name]
-            self.emit(f"    movq {ARG_REGS[i]}, {var.offset}(%rbp)")
+            if i < len(ARG_REGS):
+                self.emit(f"    movq {ARG_REGS[i]}, {var.offset}(%rbp)")
+            else:
+                stack_off = 16 + (i - len(ARG_REGS)) * 8
+                self.emit(f"    movq {stack_off}(%rbp), %rax")
+                self.emit(f"    movq %rax, {var.offset}(%rbp)")
 
         # Body.
         for stmt in func.body:
@@ -1095,12 +1099,6 @@ class X86CodeGen:
             self.gen_io_intrinsic(name, call.args)
             return
 
-        if len(call.args) > len(ARG_REGS):
-            raise CodeGenError(
-                f"x86: more than {len(ARG_REGS)} call arguments not yet "
-                f"supported ({name})"
-            )
-
         # Indirect call: if the name resolves to a local (or global scalar
         # of pointer type), call through the value rather than the symbol.
         # This is how Adder invokes function pointers stored in vtables
@@ -1113,29 +1111,43 @@ class X86CodeGen:
                 and name not in self.extern_funcs)
         )
 
-        # Evaluate each argument to %rax and stage it on the stack, then pop
-        # into the argument registers. The push/pop pairs balance, so %rsp
-        # is back to 16-byte alignment at the call.
-        for arg in call.args:
-            self.gen_expr(arg)
+        n_args = len(call.args)
+        n_reg  = min(n_args, len(ARG_REGS))
+        n_stk  = n_args - n_reg
+
+        # Args 0..5 go in ARG_REGS. Evaluate-and-push, then pop in
+        # reverse so the lowest-indexed arg ends up in %rdi.
+        for i in range(n_reg):
+            self.gen_expr(call.args[i])
             self.emit("    pushq %rax")
-        for i in reversed(range(len(call.args))):
+        for i in reversed(range(n_reg)):
             self.emit(f"    popq {ARG_REGS[i]}")
 
+        # Args 6+ live on the stack at fixed offsets from %rsp. SysV
+        # also wants %rsp 16-aligned before the `call`; reserve a
+        # 16-byte-aligned chunk and write each arg into it.
+        stack_bytes = (n_stk * 8 + 15) & ~15
+        if stack_bytes > 0:
+            self.emit(f"    subq ${stack_bytes}, %rsp")
+            for i in range(n_stk):
+                self.gen_expr(call.args[n_reg + i])
+                self.emit(f"    movq %rax, {i * 8}(%rsp)")
+
         if indirect:
-            # Load function pointer into %r11 (caller-saved, unused above).
             if name in self.ctx.locals:
                 var = self.ctx.locals[name]
                 self.emit(f"    movq {var.offset}(%rbp), %r11")
             else:
                 self.emit(f"    movq {name}(%rip), %r11")
-            # Varargs ABI: zero %al (vector-arg count) before the call.
             self.emit("    xorl %eax, %eax")
             self.emit("    call *%r11")
         else:
-            # Varargs ABI: zero %al (vector-arg count) before the call.
             self.emit("    xorl %eax, %eax")
             self.emit(f"    call {name}")
+
+        # Reclaim the stack slot for args 7+.
+        if stack_bytes > 0:
+            self.emit(f"    addq ${stack_bytes}, %rsp")
 
     def gen_io_intrinsic(self, name: str, args: list[Expr]) -> None:
         """Emit a bare x86 I/O instruction. No `call`."""
