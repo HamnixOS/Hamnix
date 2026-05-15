@@ -1063,6 +1063,12 @@ class Parser:
 
         self.expect(TokenType.COLON)
         self.expect(TokenType.NEWLINE)
+        # Comment-only lines inside the indent block produce extra
+        # NEWLINEs before the first real body token, because the
+        # lexer's handle_indentation() bails on comment lines without
+        # emitting INDENT (see lexer.py:619). Skip any leading blank
+        # NEWLINEs so a class can open with a documenting comment.
+        self.skip_newlines()
         self.expect(TokenType.INDENT)
 
         fields = []
