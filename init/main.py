@@ -38,6 +38,7 @@ from arch.x86.kernel.setup_percpu import setup_per_cpu_areas, get_cpu_id
 from arch.x86.kernel.i8259 import i8259_init, i8259_disable
 from arch.x86.kernel.time import time_init, get_jiffies, get_local_timer_ticks
 from arch.x86.kernel.apic import apic_init, lapic_setup_timer
+from arch.x86.kernel.smp import smp_boot_secondary, get_cpus_online
 from kernel.sched.core import (
     sched_init, kthread_create, create_user_task,
     start_first_task, current_task_pid,
@@ -454,6 +455,13 @@ def start_kernel():
     i8259_disable()
     apic_init()
     lapic_setup_timer()
+
+    # M16.24: bring up the secondary CPU via INIT-SIPI-SIPI. Requires
+    # QEMU launched with `-smp 2`. If launched with -smp 1 the SIPI
+    # delivers nowhere and the AP never bumps cpus_online, which is
+    # caught and reported (timeout, not a hang).
+    smp_boot_secondary()
+    printk1("Pynux: cpus_online = %d\n", get_cpus_online())
 
     # Initialise the VFS fd table BEFORE any user task issues SYS_OPEN.
     vfs_init()

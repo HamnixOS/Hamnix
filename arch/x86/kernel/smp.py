@@ -1,0 +1,117 @@
+# arch/x86/kernel/smp.py
+#
+# Mirrors arch/x86/kernel/smpboot.c in Linux at minimal scope: bring
+# a single AP online via INIT-SIPI-SIPI, get it through the real-mode
+# → long-mode trampoline, and have it bump a shared counter so the
+# BSP can verify it actually started executing.
+#
+# Sequence (mirrors do_boot_cpu in Linux at the simplest level):
+#   1. memcpy the trampoline bytes from their load address into
+#      physical 0x8000 (where SIPI will deliver the AP).
+#   2. Patch the trampoline's three plant slots:
+#        ap_cr3_value     <- BSP's CR3 (shared page tables)
+#        ap_landing_addr  <- &ap_main_64
+#        ap_stack_top     <- top of a fresh per-AP kernel stack
+#   3. Send INIT IPI.
+#   4. (Linux pauses ~10 ms here; QEMU is deterministic enough that
+#       we skip the wait — the LAPIC busy-wait in the ICR helper
+#       provides ordering.)
+#   5. Send Startup IPI with vector 8 (so AP starts at 0x8000).
+#   6. Poll cpus_online until it advances from 1 to 2, or time out.
+#
+# Cuts vs. Linux: no MADT parsing (assume APIC ID 1), no per-CPU
+# %gs base on the AP yet, no AP joining the scheduler, no second
+# SIPI. All of those are follow-ups.
+
+from mm.page_alloc import alloc_page
+from kernel.printk.printk import printk0, printk1, printk2
+from arch.x86.kernel.apic import lapic_send_init, lapic_send_sipi
+
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+extern def get_bsp_cr3() -> uint64
+extern def ap_trampoline_load_addr() -> uint64
+extern def ap_trampoline_size() -> uint64
+extern def ap_cr3_value_addr() -> uint64
+extern def ap_landing_addr_addr() -> uint64
+extern def ap_stack_top_addr() -> uint64
+extern def ap_main_64()
+extern def cpu_relax()
+
+AP_TRAMPOLINE_PHYS: uint64 = 0x8000
+AP_SIPI_VECTOR:     uint32 = 0x08             # 0x08 * 0x1000 = 0x8000
+SECONDARY_APIC_ID:  uint32 = 1
+
+# Boot-state counter: number of CPUs that have entered ap_main_pynux.
+# Starts at 1 (the BSP itself); each AP increments. BSP polls this
+# after sending IPIs to verify the AP made it through the trampoline.
+cpus_online: uint64 = 1
+
+
+def ap_main_pynux():
+    # Entered by the AP after the trampoline lands ap_main_64 here.
+    # We're at CPL 0, long mode, sharing BSP's page tables, on our
+    # own kernel stack. The single observable side-effect of this
+    # function is bumping cpus_online — the BSP polls that to confirm
+    # the AP got this far.
+    #
+    # NOTE: this increment races with any BSP reads, but x86 has
+    # atomic single-quad writes; we accept the race because the BSP
+    # only reads (waits for value >= 2) and the AP only ever writes
+    # this single value once. No memory barrier needed for a single
+    # 8-byte aligned store on x86_64.
+    cpus_online = cpus_online + 1
+
+    # Park the AP. A future milestone wires it into the scheduler.
+    asm_volatile("cli")
+    while True:
+        asm_volatile("hlt")
+
+
+def smp_boot_secondary():
+    # Stage 1: copy the trampoline bytes from kernel image LMA into
+    # physical 0x8000 where SIPI will deliver the AP.
+    src: uint64 = ap_trampoline_load_addr()
+    size: uint64 = ap_trampoline_size()
+    printk2("SMP: copying trampoline (%d bytes from %p) -> 0x8000\n",
+            size, src)
+    memcpy(cast[Ptr[uint8]](AP_TRAMPOLINE_PHYS),
+           cast[Ptr[uint8]](src), size)
+
+    # Stage 2: patch the trampoline's plant slots. Their VMAs are
+    # 0x8000 + offset within the trampoline, which is exactly where
+    # the memcpy just placed them.
+    cast[Ptr[uint64]](ap_cr3_value_addr())[0]    = get_bsp_cr3()
+    cast[Ptr[uint64]](ap_landing_addr_addr())[0] = cast[uint64](&ap_main_64)
+
+    # Allocate a kernel stack for the AP. 4 KiB is enough for the
+    # trivial M16.24 demo; future scheduler-integration will want at
+    # least 16 KiB.
+    ap_stack: uint64 = alloc_page() + 4096
+    cast[Ptr[uint64]](ap_stack_top_addr())[0]    = ap_stack
+    printk1("SMP: AP kernel stack top = %p\n", ap_stack)
+
+    # Stage 3+4: INIT-SIPI sequence.
+    printk1("SMP: sending INIT to APIC id %d\n",
+            cast[uint64](SECONDARY_APIC_ID))
+    lapic_send_init(SECONDARY_APIC_ID)
+    printk1("SMP: sending SIPI vector 0x%x\n",
+            cast[uint64](AP_SIPI_VECTOR))
+    lapic_send_sipi(SECONDARY_APIC_ID, AP_SIPI_VECTOR)
+
+    # Stage 5: poll for the AP to bump cpus_online. Bounded loop so
+    # a stuck AP doesn't hang the BSP indefinitely.
+    spins: uint64 = 0
+    LIMIT: uint64 = 100000000
+    while spins < LIMIT and cpus_online < 2:
+        cpu_relax()
+        spins = spins + 1
+
+    if cpus_online >= 2:
+        printk2("SMP: AP online (cpus_online=%d after %d spins)\n",
+                cpus_online, spins)
+    else:
+        printk1("SMP: AP did not come online (spins=%d)\n", spins)
+
+
+def get_cpus_online() -> uint64:
+    return cpus_online

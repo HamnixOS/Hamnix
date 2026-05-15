@@ -120,3 +120,57 @@ def lapic_send_eoi():
     # Linux's apic_eoi() is one MMIO write to EOI. Any value works;
     # the LAPIC reads the WRITE to advance the in-service register.
     _lapic_write(LAPIC_EOI_REG, 0)
+
+
+# --- IPI sending ---------------------------------------------------
+#
+# The Interrupt Command Register lives at offsets 0x300 (low 32 bits)
+# and 0x310 (high 32 bits). Writing to 0x300 triggers the IPI; the
+# destination APIC ID goes in the high register's bits 24..31. We
+# write high first (it doesn't fire anything) then low (which does).
+#
+# Bit fields in ICR low:
+#   bits  0..7   vector
+#   bits  8..10  delivery mode (0 = fixed, 5 = INIT, 6 = startup)
+#   bit  11      destination mode (0 = physical)
+#   bit  12      delivery status (read-only)
+#   bit  14      level (1 = assert)
+#   bit  15      trigger mode (0 = edge)
+#   bits 18..19  destination shorthand (0 = use APIC ID)
+#
+# INIT IPI: delivery_mode=5, level=1, trigger=0
+#           value = (1 << 14) | (5 << 8)            = 0x4500
+# STARTUP IPI: delivery_mode=6, vector=V, level=1, trigger=0
+#              value = (1 << 14) | (6 << 8) | V    = 0x4600 | V
+# Linux uses the same magic numbers (apic.c::apic_icr_write).
+
+LAPIC_ICR_LOW:  uint64 = 0x300
+LAPIC_ICR_HIGH: uint64 = 0x310
+
+ICR_INIT_LEVEL:    uint32 = 0x4500
+ICR_STARTUP_BASE:  uint32 = 0x4600
+ICR_DELIVERY_BUSY: uint32 = 0x1000          # bit 12
+
+
+def _lapic_wait_icr_idle():
+    # Bit 12 of ICR_LOW reads "delivery pending". Spin briefly.
+    while (_lapic_read(LAPIC_ICR_LOW) & ICR_DELIVERY_BUSY) != 0:
+        pass
+
+
+def lapic_send_init(target_apic_id: uint32):
+    # INIT IPI to a specific AP. Halts the AP in a state ready for
+    # the subsequent SIPI. Linux follows this with a 10 ms wait.
+    _lapic_write(LAPIC_ICR_HIGH, target_apic_id << 24)
+    _lapic_write(LAPIC_ICR_LOW, ICR_INIT_LEVEL)
+    _lapic_wait_icr_idle()
+
+
+def lapic_send_sipi(target_apic_id: uint32, vector: uint32):
+    # Startup IPI carrying the 8-bit "start vector" V. The AP begins
+    # executing at physical CS:IP = (V<<8):0000 = V*0x1000 in 16-bit
+    # real mode. Spec says BSP should send TWO SIPIs spaced 200 µs
+    # apart; we send one and rely on QEMU's deterministic emulation.
+    _lapic_write(LAPIC_ICR_HIGH, target_apic_id << 24)
+    _lapic_write(LAPIC_ICR_LOW, ICR_STARTUP_BASE | (vector & 0xFF))
+    _lapic_wait_icr_idle()

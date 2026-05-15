@@ -40,6 +40,7 @@ echo "[run_x86_bare] Booting in QEMU (10s timeout)..."
 # instead since success means "kernel halted after banner".
 timeout 10s qemu-system-x86_64 \
     -kernel "$ELF" \
+    -smp 2 \
     -nographic \
     -no-reboot \
     -m 256M \

@@ -65,6 +65,22 @@ SECTIONS
         *(.data.*)
     }
 
+    /* AP boot trampoline. VMA = 0x8000 because SIPI delivers the AP
+     * to physical 0x8000 (vector 0x08 × 0x1000); the linker resolves
+     * all symbol references within the section against that address.
+     * LMA is the current load cursor — the bytes ride along in the
+     * kernel image at whatever address that resolves to; the BSP
+     * memcpys them from LMA to VMA before sending SIPI. Mirrors the
+     * same VMA/LMA-split trick Pynux already uses for .data..percpu. */
+    __ap_trampoline_load = .;
+    .ap_trampoline 0x8000 : AT(__ap_trampoline_load) {
+        __ap_trampoline_start = .;
+        KEEP(*(.ap_trampoline))
+        __ap_trampoline_end = .;
+    }
+    __ap_trampoline_size = __ap_trampoline_end - __ap_trampoline_start;
+    . = __ap_trampoline_load + __ap_trampoline_size;
+
     /* Page tables: NOBITS section that the loader zero-fills at load
      * time but the boot-time BSS-zero loop must NOT touch — pml4/pdpt/pd
      * are referenced by CR3 the moment the kernel enters long mode. Live
