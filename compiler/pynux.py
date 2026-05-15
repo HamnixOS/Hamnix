@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """
-Pynux CLI - Compile Python-syntax code to ARM
+Pynux CLI - Compile Python-syntax code to x86_64.
 
 Usage:
-    pynux compile source.py -o output.elf
-    pynux run source.py  # Compile and run in QEMU
+    pynux compile source.py --target=<target> -o output.elf
+
+Targets:
+    x86_64-bare-metal           Standalone kernel image (vmlinux-equivalent)
+    x86_64-linux-kernel-module  Emits .S for kbuild → .ko
+    x86_64-pynux-user           CPL-3 userspace ELF for the bare-metal kernel
+
+The original ARM Cortex-M target lived in compiler/codegen_arm.py and was
+deleted in the legacy cleanup; only the x86_64 backend ships now.
 """
 
 import argparse
@@ -16,14 +23,13 @@ from pathlib import Path
 from .lexer import tokenize, LexerError
 from .parser import Parser, ParseError, parse
 from .ast_nodes import Program, ImportDecl
-from .codegen_arm import generate as generate_arm, CodeGenError
+from .codegen_x86 import generate as generate_x86, CodeGenError
 
 
 # Compilation targets. `codegen` selects the backend; `kbuild` means the
 # Linux kernel build system owns assembly+link, so the CLI stops at emitting
 # a .S file rather than invoking an assembler/linker itself.
 TARGETS = {
-    "arm-cortex-m3": {"codegen": "arm", "kbuild": False, "bare_metal": True},
     "x86_64-linux-kernel-module": {"codegen": "x86", "kbuild": True,
                                    "bare_metal": False},
     # Standalone x86_64 kernel ELF (vmlinux-equivalent). The compiler owns
@@ -39,7 +45,7 @@ TARGETS = {
     "x86_64-pynux-user": {"codegen": "x86", "kbuild": False,
                           "bare_metal": True},
 }
-DEFAULT_TARGET = "arm-cortex-m3"
+DEFAULT_TARGET = "x86_64-bare-metal"
 
 
 def get_generator(target: str):
@@ -50,10 +56,7 @@ def get_generator(target: str):
         print(f"Error: unknown target '{target}'. Known targets: {known}",
               file=sys.stderr)
         sys.exit(1)
-    if spec["codegen"] == "arm":
-        return generate_arm
     if spec["codegen"] == "x86":
-        from .codegen_x86 import generate as generate_x86
         bare = spec.get("bare_metal", False)
         return lambda program: generate_x86(program, bare_metal=bare)
     raise AssertionError(f"unhandled codegen backend: {spec['codegen']}")
@@ -147,22 +150,6 @@ def merge_programs(files: list[Path]) -> Program:
                 all_declarations.append(decl)
 
     return Program(imports=all_imports, declarations=all_declarations)
-
-
-def find_runtime() -> Path:
-    """Find the runtime directory."""
-    # Try relative to this file
-    this_dir = Path(__file__).parent
-    runtime = this_dir.parent / "runtime"
-    if runtime.exists():
-        return runtime
-
-    # Try from current directory
-    runtime = Path("runtime")
-    if runtime.exists():
-        return runtime
-
-    raise FileNotFoundError("Cannot find runtime directory")
 
 
 def compile_source(source: str, filename: str = "<stdin>",
@@ -356,97 +343,6 @@ def assemble_and_link_x86_user(asm_file: Path, output: Path,
     return True
 
 
-def assemble_and_link(asm_file: Path, output: Path, runtime_dir: Path) -> bool:
-    """Assemble and link to create ELF binary."""
-    # Check for toolchain
-    as_cmd = "arm-none-eabi-as"
-    ld_cmd = "arm-none-eabi-ld"
-
-    try:
-        subprocess.run([as_cmd, "--version"], capture_output=True, check=True)
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        print("Error: arm-none-eabi toolchain not found", file=sys.stderr)
-        print("Install with: sudo apt install gcc-arm-none-eabi", file=sys.stderr)
-        return False
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-
-        # Assemble startup.s
-        startup_obj = tmpdir / "startup.o"
-        result = subprocess.run([
-            as_cmd, "-mcpu=cortex-m3", "-mthumb",
-            "-o", str(startup_obj),
-            str(runtime_dir / "startup.s")
-        ], capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"Error assembling startup.s:\n{result.stderr}", file=sys.stderr)
-            return False
-
-        # Assemble io.s
-        io_obj = tmpdir / "io.o"
-        result = subprocess.run([
-            as_cmd, "-mcpu=cortex-m3", "-mthumb",
-            "-o", str(io_obj),
-            str(runtime_dir / "io.s")
-        ], capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"Error assembling io.s:\n{result.stderr}", file=sys.stderr)
-            return False
-
-        # Assemble main program
-        main_obj = tmpdir / "main.o"
-        result = subprocess.run([
-            as_cmd, "-mcpu=cortex-m3", "-mthumb",
-            "-o", str(main_obj),
-            str(asm_file)
-        ], capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"Error assembling {asm_file}:\n{result.stderr}", file=sys.stderr)
-            return False
-
-        # Link
-        linker_script = runtime_dir / "mps2-an385.ld"
-        result = subprocess.run([
-            ld_cmd,
-            "-T", str(linker_script),
-            "-o", str(output),
-            str(startup_obj),
-            str(io_obj),
-            str(main_obj)
-        ], capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"Error linking:\n{result.stderr}", file=sys.stderr)
-            return False
-
-    return True
-
-
-def run_qemu(elf_file: Path, timeout: int = 5) -> None:
-    """Run ELF in QEMU."""
-    qemu_cmd = "qemu-system-arm"
-
-    try:
-        subprocess.run([qemu_cmd, "--version"], capture_output=True, check=True)
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        print("Error: qemu-system-arm not found", file=sys.stderr)
-        print("Install with: sudo apt install qemu-system-arm", file=sys.stderr)
-        sys.exit(1)
-
-    try:
-        result = subprocess.run([
-            qemu_cmd,
-            "-M", "mps2-an385",
-            "-nographic",
-            "-kernel", str(elf_file),
-            "-semihosting-config", "enable=on,target=native"
-        ], timeout=timeout, capture_output=False)
-    except subprocess.TimeoutExpired:
-        pass  # Expected - program loops forever after main returns
-    except KeyboardInterrupt:
-        pass
-
-
 def cmd_compile(args: argparse.Namespace) -> int:
     """Compile command."""
     source_file = Path(args.source)
@@ -489,39 +385,16 @@ def cmd_compile(args: argparse.Namespace) -> int:
         elif args.target == "x86_64-pynux-user":
             ok = assemble_and_link_x86_user(asm_path, output, find_pynux_root())
         else:
-            ok = assemble_and_link(asm_path, output, find_runtime())
+            raise AssertionError(
+                f"x86_64-bare-metal / x86_64-pynux-user are the only "
+                f"non-kbuild link paths; got '{args.target}'"
+            )
         if not ok:
             return 1
     finally:
         asm_path.unlink()
 
     print(f"Compiled to {output}")
-    return 0
-
-
-def cmd_run(args: argparse.Namespace) -> int:
-    """Compile and run command."""
-    source_file = Path(args.source)
-    if not source_file.exists():
-        print(f"Error: {source_file} not found", file=sys.stderr)
-        return 1
-
-    asm = compile_with_imports(source_file)
-
-    runtime_dir = find_runtime()
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        asm_file = tmpdir / "main.s"
-        asm_file.write_text(asm)
-
-        elf_file = tmpdir / "main.elf"
-        if not assemble_and_link(asm_file, elf_file, runtime_dir):
-            return 1
-
-        print(f"Running {source_file} in QEMU (Ctrl+A, X to exit)...")
-        run_qemu(elf_file, timeout=args.timeout)
-
     return 0
 
 
@@ -546,7 +419,7 @@ def cmd_asm(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="pynux",
-        description="Pynux - Python syntax to ARM compiler"
+        description="Pynux compiler — Python syntax to x86_64 native code"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -560,13 +433,6 @@ def main() -> int:
                                choices=list(TARGETS),
                                help=f"Compilation target (default: {DEFAULT_TARGET})")
     compile_parser.set_defaults(func=cmd_compile)
-
-    # Run command
-    run_parser = subparsers.add_parser("run", help="Compile and run in QEMU")
-    run_parser.add_argument("source", help="Source file (.py)")
-    run_parser.add_argument("--timeout", type=int, default=5,
-                           help="QEMU timeout in seconds")
-    run_parser.set_defaults(func=cmd_run)
 
     # Asm command
     asm_parser = subparsers.add_parser("asm", help="Emit assembly only")
