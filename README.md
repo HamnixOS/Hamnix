@@ -1,14 +1,31 @@
 # Pynux
 
-**A Python-syntax systems language being used to incrementally rewrite
-Linux kernel code on x86_64 — one loadable module at a time.**
+**A Python-syntax systems language being used to write a Linux-equivalent
+kernel on x86_64 from boot up — and incrementally infiltrate stock Linux
+along the way.**
 
 Pynux compiles Python-syntax source with static types directly to native
-machine code via a hand-written, zero-dependency compiler. The current
-focus is using Pynux as the target language for a "slow infection" of the
-Linux kernel: real kernel subsystems get reimplemented in Pynux and loaded
-into a stock kernel as `.ko` modules. The end-game is a fully-Pynux
-kernel built up subsystem by subsystem.
+machine code via a hand-written, zero-dependency compiler. Two parallel
+tracks share the same compiler and language:
+
+1. **Bare-metal Pynux kernel** (M16+) — Pynux compiles its own bootable
+   kernel image. QEMU `-kernel build/pynux-vmlinux.elf` boots through
+   multiboot1 into 64-bit long mode, runs a Pynux `start_kernel()`,
+   handles traps and timer interrupts, and schedules cooperative
+   kernel threads. Source tree mirrors Linux's layout
+   (`arch/x86/boot/`, `arch/x86/kernel/`, `init/`, `mm/`, `drivers/`,
+   `kernel/sched/`, `kernel/printk/`) so reading the equivalent Linux
+   file → porting it to Pynux is the unit of work.
+
+2. **.ko module infiltration** (M1..M15) — 40 Pynux-authored kernel
+   modules that load into a stock Linux kernel via the regular kbuild
+   path. Exercise nearly every major kernel subsystem (chrdev, procfs,
+   debugfs, ramfs, slab, kthread, workqueue, hrtimer, mutex, kprobe,
+   kretprobe, sysfs, crypto, virtio-blk/-net, netfilter, kfifo, ...).
+   Still build and pass; kept as the regression baseline as bare-metal
+   subsystems land.
+
+The end-game is a fully Pynux-authored kernel.
 
 ## Status
 
@@ -50,6 +67,13 @@ kernel built up subsystem by subsystem.
 | M14.2 | kretprobe — captures syscall return values from regs->ax on `__x64_sys_openat` exit; matches M14.1's 17 entries | **Done** |
 | M15.1 | register_die_notifier — Pynux on the kernel die/oops/panic notification chain | **Done** |
 | M15.2 | kfifo circular buffer — alloc + in + out via the kernel's lock-free ring; "Hi!" round-trips byte-perfect | **Done** |
+| **M16.1** | **Bare-metal pivot** — Pynux compiles its own bootable kernel image; QEMU multiboot1 → 64-bit long mode → Pynux `start_kernel()` → UART banner | **Done** |
+| M16.2 | IDT + trap handlers — 32 vector stubs, common_trap, Pynux `do_trap` (mirrors `arch/x86/kernel/traps.c`) | **Done** |
+| M16.3 | memblock bump allocator — fixed 2..240 MiB range, aligned alloc (mirrors `mm/memblock.c`) | **Done** |
+| M16.4 | Per-CPU areas + `%gs` base — `smp_processor_id()` = `mov %gs:0, %rax` (mirrors `arch/x86/kernel/setup_percpu.c`) | **Done** |
+| M16.5 | 8259 PIC + PIT timer @ 100 Hz + `jiffies` — first real hardware IRQ (mirrors `arch/x86/kernel/i8259.c` + `time.c`) | **Done** |
+| M16.6 | Cooperative scheduler — `__switch_to_asm`, `kthread_create`, two kernel threads ping-pong "ABAB…" (mirrors `kernel/sched/core.c`) | **Done** |
+| M16.7 | `printk` with `%d`/`%x`/`%s`/`%p`/`%c` — `printk0`/`printk1`/`printk2` variants (mirrors `kernel/printk/printk.c`) | **Done** |
 
 The microcontroller OS the project originally shipped (ARM Cortex-M,
 QEMU mps2-an385, RP2040, STM32F4) still compiles via the original ARM
@@ -64,9 +88,17 @@ Pynux source (.py with static types, def/while/if, structs)
    ▼
 compiler/  (CPython-hosted; pynux.py CLI dispatches by --target)
    │
-   ├──► codegen_x86.py  ─►  GNU `as` (x86_64 SysV) ──► .o ──► .ko (kbuild + modpost)
-   │                        custom kernel + busybox initramfs
-   │                        ──► QEMU -serial stdio ──► dev loop closes
+   ├──► codegen_x86.py  ─► .S
+   │     │
+   │     ├──► x86_64-bare-metal                       (M16+)
+   │     │    as --32 (with .code64) + ld -m elf_i386
+   │     │    ──► pynux-vmlinux.elf
+   │     │    ──► QEMU -kernel multiboot1 ──► long mode ──► start_kernel()
+   │     │
+   │     └──► x86_64-linux-kernel-module              (M1..M15)
+   │          kbuild + modpost ──► .ko
+   │          custom mitigations-off kernel + busybox initramfs
+   │          ──► QEMU -serial stdio ──► dev loop closes
    │
    └──► codegen_arm.py  ─►  arm-none-eabi-as/ld ──► .elf ──► QEMU mps2-an385  (legacy MCU OS)
 ```
@@ -80,6 +112,22 @@ for IBT, no red zone, RIP-relative `.rodata` refs) are handled directly.
 
 Requirements: `gcc`, `make`, `qemu-system-x86_64`, `flex`, `bison`,
 `libelf-dev`, Python 3.10+.
+
+### Boot the Pynux bare-metal kernel (M16+)
+
+```bash
+./scripts/run_x86_bare.sh
+```
+
+Compiles `init/main.py` (plus the imports it pulls in:
+`arch/x86/`, `mm/memblock.py`, `kernel/sched/core.py`,
+`kernel/printk/printk.py`, `drivers/tty/serial/early_8250.py`),
+assembles + links into `build/pynux-vmlinux.elf`, and boots it under
+QEMU. Serial output shows the boot banner, memblock smoke test,
+per-CPU id, PIT timer ticks, then two kernel threads alternating
+"ABAB…" before the box halts.
+
+### Run the kernel-module regression suite (M1..M15)
 
 ```bash
 # One-time: build the custom mitigations-off kernel and busybox initramfs
@@ -127,13 +175,34 @@ and writes bytes via `outb`.
 
 ```
 compiler/        Pynux compiler (CPython-hosted)
-  pynux.py       CLI: --target=arm-cortex-m3 (default) or x86_64-linux-kernel-module
+  pynux.py       CLI: --target= arm-cortex-m3 | x86_64-linux-kernel-module | x86_64-bare-metal
   lexer.py       Tokenizer
   parser.py      Recursive-descent parser → AST
   ast_nodes.py   AST node definitions
   codegen_x86.py x86_64 backend (hand-written, growing per milestone)
   codegen_arm.py ARM Thumb-2 backend for the MCU OS (frozen reference)
   optimizer.py   AST-level passes
+
+# Bare-metal Pynux kernel (M16+) — layout mirrors Linux source tree
+arch/x86/
+  boot/header.S         multiboot1 header + 32→64 long-mode transition
+  kernel/head_64.S      64-bit entry: BSS-zero, call start_kernel
+  kernel/vmlinux.lds    linker script (elf32-i386 wrapper, 64-bit code)
+  kernel/idt_asm.S      per-vector trap stubs + common_trap
+  kernel/idt.py         gate descriptor packing, idt_init
+  kernel/traps.py       do_trap dispatch + hex printing
+  kernel/irq_asm.S      per-IRQ stubs + common_irq (iretq path)
+  kernel/irq.py         do_irq vector dispatch
+  kernel/i8259.py       8259 PIC remap + mask/unmask + EOI
+  kernel/time.py        PIT @ 100 Hz, jiffies, timer_interrupt
+  kernel/setup_percpu.py  + .S  per-CPU area + %gs base
+  kernel/sched_asm.S    __switch_to_asm (context switch primitive)
+  mm/init.py            mem_init() arch-side
+mm/memblock.py          bump allocator (~ mm/memblock.c)
+kernel/sched/core.py    task_struct, kthread_create, schedule
+kernel/printk/printk.py printk0/1/2 with %d/%x/%s/%p/%c
+drivers/tty/serial/early_8250.py  polled 16550A UART + early_print_hex64
+init/main.py            start_kernel()
 
 kernel-modules/  Pynux source for each module milestone
   hello/         M1   hello-world
@@ -178,6 +247,7 @@ kernel-modules/  Pynux source for each module milestone
   m15-kfifo/     M15.2 kfifo circular buffer
 
 scripts/         x86 dev-loop infrastructure
+  run_x86_bare.sh        Compile init/main.py → pynux-vmlinux.elf → QEMU -kernel
   build_x86_kernel.sh    Fetch + build mitigations-off Linux for QEMU
   x86_kernel_config.sh   Kernel config knobs
   make_initramfs.sh      Build static busybox + cpio initramfs
