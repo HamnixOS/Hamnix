@@ -132,7 +132,15 @@ def merge_programs(files: list[Path]) -> Program:
     """Parse all files and merge into a single program."""
     all_imports: list[ImportDecl] = []
     all_declarations = []
-    seen_names: set[str] = set()
+    # Map name -> first file we saw it in. We allow duplicates only
+    # for ExternDecl (the same `extern def foo(...)` may legitimately
+    # appear in multiple modules that each call foo). Every other
+    # collision is an error — silent dedup used to mean two modules
+    # could each define `_find_free_slot` and the second silently
+    # never got compiled, with callers in module B linking against
+    # module A's body. Hours-of-debugging type of bug.
+    from .ast_nodes import ExternDecl
+    seen_names: dict[str, Path] = {}
 
     for file_path in files:
         source = file_path.read_text()
@@ -146,15 +154,27 @@ def merge_programs(files: list[Path]) -> Program:
                     imp.module.startswith("coreutils.")):
                 all_imports.append(imp)
 
-        # Collect declarations, avoiding duplicates
         for decl in program.declarations:
             name = getattr(decl, 'name', None)
-            if name:
-                if name not in seen_names:
-                    seen_names.add(name)
-                    all_declarations.append(decl)
-            else:
+            if not name:
                 all_declarations.append(decl)
+                continue
+            if name in seen_names:
+                if isinstance(decl, ExternDecl):
+                    # Extern decls are forward references; ignoring a
+                    # duplicate `extern def` is harmless.
+                    continue
+                prev = seen_names[name]
+                print(
+                    f"Error: duplicate top-level definition '{name}' in "
+                    f"{file_path} (first seen in {prev}). Rename one of "
+                    f"them — function/class/variable names are global "
+                    f"across all merged modules.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            seen_names[name] = file_path
+            all_declarations.append(decl)
 
     return Program(imports=all_imports, declarations=all_declarations)
 
