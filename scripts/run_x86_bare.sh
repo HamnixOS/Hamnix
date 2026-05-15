@@ -14,6 +14,17 @@ cd "$PROJ_ROOT"
 mkdir -p build
 ELF=build/pynux-vmlinux.elf
 
+# Build the userland binary (e.g. /init) before regenerating the
+# cpio archive — the archive embeds whatever sits in build/user/
+# at the time it's regenerated. Both steps are idempotent and
+# cheap; running them every invocation keeps the kernel ELF in
+# sync with the user/ source tree.
+echo "[run_x86_bare] Building user/init.S -> build/user/init.elf"
+bash scripts/build_user.sh
+
+echo "[run_x86_bare] Regenerating fs/initramfs_blob.S from cpio"
+python3 scripts/build_initramfs.py
+
 echo "[run_x86_bare] Compiling init/main.py -> $ELF"
 python3 -m compiler.pynux compile \
     --target=x86_64-bare-metal \

@@ -26,9 +26,13 @@ from pathlib import Path
 FILES = [
     ("/motd",       b"Welcome to Pynux from a real cpio initramfs!\n"
                     b"This file came out of a newc-formatted blob.\n"),
-    ("/version",    b"Pynux bare-metal kernel, M16.27 - cpio initramfs\n"),
+    ("/version",    b"Pynux bare-metal kernel, M16.30 - ELF /init loader\n"),
     ("/hello.txt",  b"Hello from a third file. cpio supports many.\n"),
 ]
+
+# Path to the userland init binary built by scripts/build_user.sh.
+# If it exists, embed as /init so the kernel can ELF-load + exec it.
+INIT_ELF_PATH = "build/user/init.elf"
 
 
 def cpio_entry(name: str, data: bytes) -> bytes:
@@ -64,6 +68,17 @@ def cpio_trailer() -> bytes:
 
 def build_archive() -> bytes:
     blob = b""
+    # If the userland /init binary has been built, include it first.
+    here = Path(__file__).resolve().parent.parent
+    init_path = here / INIT_ELF_PATH
+    if init_path.exists():
+        init_bytes = init_path.read_bytes()
+        blob += cpio_entry("/init", init_bytes)
+        print(f"  embedded /init ({len(init_bytes)} bytes from "
+              f"{INIT_ELF_PATH})")
+    else:
+        print(f"  (no /init: {INIT_ELF_PATH} not built — run "
+              f"scripts/build_user.sh first)")
     for name, data in FILES:
         blob += cpio_entry(name, data)
     blob += cpio_trailer()

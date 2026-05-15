@@ -49,7 +49,11 @@ from arch.x86.kernel.syscall import syscall_init
 from drivers.video.console.vga_text import (
     vga_init, vga_putc, vga_puts, vga_read_cell_char,
 )
-from fs.vfs import vfs_init
+from fs.vfs import (
+    vfs_init, vfs_open, vfs_read, vfs_close,
+    initramfs_data_ptr, initramfs_data_size,
+)
+from fs.elf import elf_load_blob
 from drivers.pci.pci import pci_scan
 from drivers.net.netfilter import (
     netfilter_init, register_netfilter_hook, nf_run_hooks,
@@ -516,13 +520,30 @@ def start_kernel():
     # Initialise the VFS fd table BEFORE any user task issues SYS_OPEN.
     vfs_init()
 
-    # --- M16.20: register the first user task in the runqueue ----
-    # The parent runs at user_demo_entry; mid-run it calls SYS_CLONE
-    # to spawn the child at user_child_entry. schedule() (called from
-    # the timer ISR) interleaves the two CPL-3 tasks.
+    # --- M16.30: load /init from cpio via the ELF loader ----------
+    # exec() into a real userspace binary instead of the baked-in
+    # user_demo_entry. The ELF lives in the cpio archive (embedded
+    # at build time by scripts/build_initramfs.py); fs/elf.py walks
+    # its PT_LOAD segments and returns the live entry address.
+    init_blob: uint64 = initramfs_data_ptr("/init")
+    init_size: uint64 = initramfs_data_size("/init")
+    if init_blob == 0:
+        printk0("Pynux: /init not in initramfs; falling back to baked entry\n")
+        init_entry: uint64 = cast[uint64](&user_demo_entry)
+    else:
+        printk2("Pynux: ELF-loading /init (%d bytes from %p)\n",
+                init_size, init_blob)
+        init_entry: uint64 = elf_load_blob(
+            cast[Ptr[uint8]](init_blob), init_size)
+        if init_entry == 0:
+            printk0("Pynux: /init load failed; falling back\n")
+            init_entry = cast[uint64](&user_demo_entry)
+        else:
+            printk1("Pynux: /init entry @ %p\n", init_entry)
+
     sched_init()
     parent_slot: int32 = create_user_task(
-        cast[uint64](&user_demo_entry), 0x5f5f706172656e74)
+        init_entry, 0x5f5f696e69745f5f)         # "__init__"
     printk1("Pynux: parent user task @ slot %d\n",
             cast[uint64](parent_slot))
     printk1("Pynux: parent task PML4 = %p (per-task)\n",

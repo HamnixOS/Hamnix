@@ -56,6 +56,24 @@ def vfs_init():
     cpio_init()
 
 
+# Kernel-internal initramfs lookup. Used during boot to read /init
+# BEFORE any user task exists (and therefore before any fd table is
+# in scope). Returns 0 on miss.
+
+def initramfs_data_ptr(name: Ptr[char]) -> uint64:
+    idx: int32 = _lookup_name(name)
+    if idx < 0:
+        return 0
+    return cast[uint64](initramfs_entry_data(cast[uint64](idx)))
+
+
+def initramfs_data_size(name: Ptr[char]) -> uint64:
+    idx: int32 = _lookup_name(name)
+    if idx < 0:
+        return 0
+    return initramfs_entry_size(cast[uint64](idx))
+
+
 def _strcmp_cstr(a: Ptr[char], b: Ptr[char]) -> int32:
     i: int32 = 0
     while True:
