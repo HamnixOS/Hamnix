@@ -43,7 +43,7 @@ from arch.x86.kernel.apic import (
 from arch.x86.kernel.smp import smp_boot_secondary, get_cpus_online
 from kernel.sched.core import (
     sched_init, kthread_create, create_user_task,
-    start_first_task, current_task_pid,
+    start_first_task, current_task_pid, task_pml4,
 )
 from arch.x86.kernel.syscall import syscall_init
 from drivers.video.console.vga_text import (
@@ -480,6 +480,8 @@ def start_kernel():
         cast[uint64](&user_demo_entry), 0x5f5f706172656e74)
     printk1("Pynux: parent user task @ slot %d\n",
             cast[uint64](parent_slot))
+    printk1("Pynux: parent task PML4 = %p (per-task)\n",
+            task_pml4(parent_slot))
 
     # Allocate a single syscall-time kernel stack used by
     # syscall_entry's user_rsp_save / kernel_rsp slots. Each task has

@@ -30,6 +30,9 @@ extern def enter_first_task(task: Ptr[uint8])
 extern def kthread_bootstrap()
 extern def tss_set_rsp0(rsp0: uint64)
 extern def local_irq_disable()
+extern def get_bsp_cr3() -> uint64
+extern def load_cr3(value: uint64)
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
 
 class TaskStruct:
@@ -47,6 +50,12 @@ class TaskStruct:
     # rather than packed so callers don't have to pun bit-fields out.
     fd_idx:       Array[4, uint32]    # offset 64..80
     fd_pos:       Array[4, uint64]    # offset 80..112
+    # Task-specific PML4 physical address. For M16.28 every task
+    # gets its own top-level page table page, freshly cloned from
+    # BSP's so the lower-level mappings (PDPT/PD) are shared — same
+    # kernel-half sharing scheme Linux uses, just without separate
+    # user-half mappings yet.
+    cr3:          uint64              # offset 112
 
 
 # State constants (mirror Linux's task->state space at a tiny scope).
@@ -168,6 +177,9 @@ def kthread_create(entry: uint64, name0: uint64) -> int32:
     task_table[s].state       = STATE_READY
     task_table[s].is_user     = 0
     task_table[s].name0       = name0
+    # Kernel threads share the BSP's page table (no per-task mappings
+    # for them yet — and they don't need user pages anyway).
+    task_table[s].cr3         = get_bsp_cr3()
     _init_fd_table(s)
     next_pid = next_pid + 1
     return slot
@@ -201,6 +213,16 @@ def create_user_task(entry: uint64, name0: uint64) -> int32:
     task_table[s].state       = STATE_READY
     task_table[s].is_user     = 1
     task_table[s].name0       = name0
+    # Per-task PML4: clone the BSP's so the kernel half is mapped
+    # identically (lower-level PDPT/PD tables are shared). When we
+    # add user-only private mappings, they live inside this PML4
+    # without affecting the kernel or other tasks.
+    new_pml4: uint64 = alloc_page()
+    if new_pml4 == 0:
+        return -1
+    memcpy(cast[Ptr[uint8]](new_pml4),
+           cast[Ptr[uint8]](get_bsp_cr3()), 4096)
+    task_table[s].cr3 = new_pml4
     _init_fd_table(s)
     next_pid = next_pid + 1
     return slot
@@ -257,6 +279,12 @@ def schedule():
     # the right stack.
     tss_set_rsp0(task_table[nxt].kstack_top)
 
+    # Switch page tables if the incoming task uses a different PML4.
+    # Skipping the write when CR3 wouldn't change avoids a needless
+    # TLB flush — Linux does the same fast-path in __switch_mm.
+    if task_table[nxt].cr3 != task_table[prev].cr3:
+        load_cr3(task_table[nxt].cr3)
+
     __switch_to_asm(cast[Ptr[uint8]](&task_table[prev]),
                     cast[Ptr[uint8]](&task_table[nxt]))
 
@@ -279,6 +307,13 @@ def start_first_task():
     task_table[0].state = STATE_RUNNING
     current_idx = 0
     tss_set_rsp0(task_table[0].kstack_top)
+    # Load the first task's page table — its PML4 has the same
+    # mappings as BSP's but the address is different. CR3 must point
+    # at the task's PML4 before its iretq-to-user runs, or else any
+    # subsequent CR3 change in schedule() would TLB-flush relative
+    # to the wrong root.
+    if task_table[0].cr3 != 0:
+        load_cr3(task_table[0].cr3)
     enter_first_task(cast[Ptr[uint8]](&task_table[0]))
 
 
@@ -302,6 +337,12 @@ def current_task_is_user() -> uint64:
 
 def current_task() -> Ptr[TaskStruct]:
     return &task_table[current_idx]
+
+
+def task_pml4(slot: int32) -> uint64:
+    # Caller-side accessor — saves init/main.py from poking
+    # task_table directly across the module boundary.
+    return task_table[cast[uint64](slot)].cr3
 
 
 def _init_fd_table(slot: uint64):

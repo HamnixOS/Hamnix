@@ -33,6 +33,19 @@ get_bsp_cr3:
     movq    %cr3, %rax
     ret
 
+/* load_cr3(value): mov %rdi, %cr3.
+ *
+ * Used by schedule() to switch task page tables. The CR3 write
+ * implicitly flushes non-global TLB entries — Linux is careful to
+ * minimise these writes (via PCID / lazy TLB) for that reason, but
+ * for M16.28 we just take the hit; correctness first.
+ */
+    .align 16
+    .globl load_cr3
+load_cr3:
+    movq    %rdi, %cr3
+    ret
+
 /* The linker symbols __ap_trampoline_load / __ap_trampoline_start /
  * __ap_trampoline_size are abs/large values; reach them the same way
  * we reach __per_cpu_template_start - stash as .long words in .rodata
