@@ -40,6 +40,8 @@ kernel built up subsystem by subsystem.
 | M9.3 | kernel UDP socket — sock_create_kern + kernel_bind to port 9999 + sock_release | **Done** |
 | M10.1 | `/dev/pynuxzero` — clone of /dev/zero (reads return NUL bytes via _copy_to_user) | **Done** |
 | M10.2 | delayed_work — queue_delayed_work_on + delayed_work_timer_fn, fires after 10 ms | **Done** |
+| M11.1 | ktime_get nanosecond clock — measures msleep(10) at ~11.6 ms | **Done** |
+| M11.2 | debugfs — Pynux-owned `/sys/kernel/debug/pynux/counter`, bidirectional userspace ↔ kernel u32 | **Done** |
 
 The microcontroller OS the project originally shipped (ARM Cortex-M,
 QEMU mps2-an385, RP2040, STM32F4) still compiles via the original ARM
@@ -156,6 +158,8 @@ kernel-modules/  Pynux source for each module milestone
   m9-socket/     M9.3 in-kernel UDP socket bound to port 9999
   m10-zero/      M10.1 /dev/pynuxzero (clone of /dev/zero)
   m10-dwork/     M10.2 delayed_work via timer-backed workqueue
+  m11-ktime/     M11.1 ktime_get nanosecond clock
+  m11-debugfs/   M11.2 debugfs u32 counter
 
 scripts/         x86 dev-loop infrastructure
   build_x86_kernel.sh    Fetch + build mitigations-off Linux for QEMU

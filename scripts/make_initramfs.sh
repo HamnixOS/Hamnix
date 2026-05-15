@@ -118,6 +118,16 @@ echo "[PYNUX] --- /proc/partitions ---"
 cat /proc/partitions
 echo "[PYNUX] --- end /proc/partitions ---"
 
+if ls /m11_debugfs.ko >/dev/null 2>&1; then
+    mount -t debugfs none /sys/kernel/debug 2>&1 | head -1
+    if [ -e /sys/kernel/debug/pynux/counter ]; then
+        initial=$(cat /sys/kernel/debug/pynux/counter)
+        echo "[PYNUX] dfs initial = $initial"
+        echo 123 > /sys/kernel/debug/pynux/counter
+        echo "[PYNUX] dfs after write = $(cat /sys/kernel/debug/pynux/counter)"
+    fi
+fi
+
 if ls /m5_netfilter.ko >/dev/null 2>&1; then
     echo "[PYNUX] --- exercise netfilter hook ---"
     ifconfig eth0 10.0.2.15 up 2>&1 | head -2
