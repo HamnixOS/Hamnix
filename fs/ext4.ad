@@ -256,6 +256,186 @@ def ext4_inode_first_extent_block(buf: Ptr[uint8]) -> uint64:
 DIR_ENTRY_HDR_BYTES: uint64 = 8
 
 
+def _name_eq_with_len(a: Ptr[uint8], b: Ptr[uint8], n: uint64) -> int32:
+    # Byte-compare a[0..n] against b[0..n-1] plus require b[n] == 0
+    # (so "HELLO" doesn't match against "HELLO.TXT" or vice versa).
+    i: uint64 = 0
+    while i < n:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    if b[n] != 0:
+        return 0
+    return 1
+
+
+def ext4_dir_lookup(dir_inode_buf: Ptr[uint8],
+                    name: Ptr[char]) -> uint32:
+    # Walk the directory's first data block looking for `name`.
+    # Returns the matched inode number, or 0 on miss.
+    blk: uint64 = ext4_inode_first_extent_block(dir_inode_buf)
+    if blk == 0:
+        return 0
+    if _ext4_read_block(blk, &ext4_blk_buf[0]) != 0:
+        return 0
+    pos: uint64 = 0
+    while pos + DIR_ENTRY_HDR_BYTES <= ext4_block_size:
+        e: uint64 = cast[uint64](&ext4_blk_buf[0]) + pos
+        inum: uint32 = _ext4_read_u32(cast[Ptr[uint8]](e + 0))
+        rec_len: uint16 = _ext4_read_u16(cast[Ptr[uint8]](e + 4))
+        if rec_len == 0:
+            return 0
+        if inum != 0:
+            name_len: uint64 = cast[uint64](cast[Ptr[uint8]](e + 6)[0])
+            if _name_eq_with_len(cast[Ptr[uint8]](e + 8),
+                                 cast[Ptr[uint8]](name),
+                                 name_len) != 0:
+                return inum
+        pos = pos + cast[uint64](rec_len)
+    return 0
+
+
+# --- file read ----------------------------------------------------
+#
+# Walks the inode's inline leaf extents looking for the extent that
+# contains logical block N. Returns the physical block, or 0 on miss
+# (sparse file or N past end-of-file). Index nodes (eh_depth > 0)
+# are deferred — they kick in for files >> 50 KiB.
+
+def _ext4_logical_to_physical(inode_buf: Ptr[uint8],
+                              logical_blk: uint64) -> uint64:
+    eh: uint64 = cast[uint64](inode_buf) + INODE_I_BLOCK_OFFSET
+    magic: uint16 = _ext4_read_u16(cast[Ptr[uint8]](eh + 0))
+    if magic != EXT4_EXTENT_MAGIC:
+        return 0
+    depth: uint16 = _ext4_read_u16(cast[Ptr[uint8]](eh + 6))
+    if depth != 0:
+        return 0
+    entries: uint16 = _ext4_read_u16(cast[Ptr[uint8]](eh + 2))
+    i: uint16 = 0
+    while i < entries:
+        ee: uint64 = eh + 12 + cast[uint64](i) * 12
+        ee_block: uint32 = _ext4_read_u32(cast[Ptr[uint8]](ee + 0))
+        ee_len:   uint16 = _ext4_read_u16(cast[Ptr[uint8]](ee + 4))
+        ee_start_lo: uint32 = _ext4_read_u32(cast[Ptr[uint8]](ee + 8))
+        eb: uint64 = cast[uint64](ee_block)
+        if logical_blk >= eb and logical_blk < eb + cast[uint64](ee_len):
+            return cast[uint64](ee_start_lo) + (logical_blk - eb)
+        i = i + 1
+    return 0
+
+
+def ext4_read_file(inum: uint32, pos: uint64, count: uint64,
+                   buf: Ptr[uint8]) -> int64:
+    # Reads `count` bytes starting at file offset `pos` from the
+    # file at inode `inum`. Returns bytes read; 0 on EOF.
+    inode: Array[256, uint8]
+    if ext4_read_inode(cast[uint64](inum), &inode[0]) != 0:
+        return -1
+    size: uint64 = cast[uint64](ext4_inode_size_lo(&inode[0]))
+    if pos >= size:
+        return 0
+    remaining: uint64 = size - pos
+    if count > remaining:
+        count = remaining
+
+    total: uint64 = 0
+    while total < count:
+        cur_off: uint64 = pos + total
+        logical_blk: uint64 = cur_off / ext4_block_size
+        off_in_blk:  uint64 = cur_off % ext4_block_size
+        phys_blk: uint64 = _ext4_logical_to_physical(&inode[0],
+                                                    logical_blk)
+        if phys_blk == 0:
+            return cast[int64](total)
+        if _ext4_read_block(phys_blk, &ext4_blk_buf[0]) != 0:
+            return cast[int64](total)
+        chunk: uint64 = ext4_block_size - off_in_blk
+        if chunk > count - total:
+            chunk = count - total
+        memcpy(cast[Ptr[uint8]](cast[uint64](buf) + total),
+               cast[Ptr[uint8]](cast[uint64](&ext4_blk_buf[0])
+                                + off_in_blk),
+               chunk)
+        total = total + chunk
+    return cast[int64](total)
+
+
+# --- open-file slot table for VFS integration --------------------
+
+class Ext4OpenFile:
+    used:      uint32
+    pad:       uint32
+    inum:      uint32
+    pad2:      uint32
+    file_size: uint64
+
+
+EXT4_MAX_OPEN: uint64 = 8
+ext4_open_files: Array[8, Ext4OpenFile]
+
+
+def ext4_open(name: Ptr[char]) -> int32:
+    # Open /ext/<name> (caller already stripped /ext/). Looks up
+    # the name in root, snapshots inum + size into a slot. Returns
+    # slot index or -1.
+    if ext4_blockdev_slot < 0:
+        return -1
+    if name[0] == 0:
+        return -1                                # we don't open the root dir
+    root_buf: Array[256, uint8]
+    if ext4_read_inode(2, &root_buf[0]) != 0:
+        return -1
+    inum: uint32 = ext4_dir_lookup(&root_buf[0], name)
+    if inum == 0:
+        return -1
+    f_inode: Array[256, uint8]
+    if ext4_read_inode(cast[uint64](inum), &f_inode[0]) != 0:
+        return -1
+    fsize: uint64 = cast[uint64](ext4_inode_size_lo(&f_inode[0]))
+    i: uint64 = 0
+    while i < EXT4_MAX_OPEN:
+        if ext4_open_files[i].used == 0:
+            ext4_open_files[i].used      = 1
+            ext4_open_files[i].inum      = inum
+            ext4_open_files[i].file_size = fsize
+            return cast[int32](i)
+        i = i + 1
+    printk0("ext4: open-file table full\n")
+    return -1
+
+
+def ext4_close(slot: int32):
+    ext4_open_files[cast[uint64](slot)].used = 0
+
+
+def ext4_open_size(slot: int32) -> uint64:
+    return ext4_open_files[cast[uint64](slot)].file_size
+
+
+def ext4_open_inum(slot: int32) -> uint32:
+    return ext4_open_files[cast[uint64](slot)].inum
+
+
+def is_ext_path(name: Ptr[char]) -> int32:
+    # /ext/ prefix check, same shape as is_fat_path.
+    prefix: Ptr[uint8] = "/ext/"
+    i: int32 = 0
+    while True:
+        p: int32 = prefix[i]
+        if p == 0:
+            return 1
+        n: int32 = name[i]
+        if n != p:
+            return 0
+        i = i + 1
+
+
+def strip_ext_prefix(name: Ptr[char]) -> Ptr[char]:
+    # "/ext/" is 5 chars.
+    return cast[Ptr[char]](cast[uint64](name) + 5)
+
+
 def ext4_dir_dump(dir_inode_buf: Ptr[uint8]):
     # Read the directory's first data block and print each entry's
     # name. Only handles single-block dirs for now (no FAT-chain
