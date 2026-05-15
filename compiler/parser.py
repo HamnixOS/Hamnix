@@ -208,6 +208,16 @@ class Parser:
             name = self.advance().value
             # Check for generic args: MyClass[T]
             if self.match(TokenType.LBRACKET):
+                # Per-CPU storage: Percpu[T] — recognised here rather than
+                # by a dedicated token so existing parser callers and the
+                # legacy ARM target aren't disturbed. The codegen handles
+                # the special storage / accessor; non-bare-metal targets
+                # treat Percpu[T] as an ordinary (broken) class type if
+                # they happen to compile such source.
+                if name == "Percpu":
+                    inner = self.parse_type()
+                    self.expect(TokenType.RBRACKET)
+                    return PercpuType(inner, self.make_span(tok))
                 # For now, just parse as string
                 type_args = [self.parse_type()]
                 while self.match(TokenType.COMMA):

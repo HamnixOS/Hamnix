@@ -31,6 +31,10 @@ HZ:           uint64 = 100
 PIT_BASE_HZ:  uint64 = 1193182
 
 jiffies: uint64 = 0
+# Per-CPU tick counter — proves Percpu[T] codegen works for both
+# read and write in interrupt context. Each CPU keeps its own count;
+# on uniprocessor we expect this to track `jiffies`.
+local_timer_ticks: Percpu[uint64]
 
 
 def time_init():
@@ -56,8 +60,16 @@ def timer_interrupt():
     # already armed by the time we return to the new task — Linux
     # has the same ordering in the legacy 8259 timer handler.
     jiffies = jiffies + 1
+    # Also bump the per-CPU counter. The codegen lowers both the read
+    # and the write through `%gs:local_timer_ticks` — proof the
+    # Percpu[T] path works in IRQ context.
+    local_timer_ticks = local_timer_ticks + 1
     i8259_send_eoi(0)
     schedule()
+
+
+def get_local_timer_ticks() -> uint64:
+    return local_timer_ticks
 
 
 def get_jiffies() -> uint64:

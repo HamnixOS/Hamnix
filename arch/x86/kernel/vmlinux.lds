@@ -46,6 +46,20 @@ SECTIONS
         *(.rodata.*)
     }
 
+    /* Per-CPU template lives in a dedicated section just before .data.
+     * The codegen places each Percpu[T] global at a compile-time-known
+     * BYTE OFFSET into this section (tracked in self.percpu_offsets) and
+     * emits `%gs:offset, %rax` directly with a literal displacement —
+     * no symbol relocation, so we sidestep the elf32-i386 / 64-bit
+     * absolute-relocation incompatibility entirely. The section's own
+     * VMA/LMA can be wherever the linker wants; we just need the bytes
+     * loaded somewhere we can memcpy() out at boot. The codegen also
+     * emits __per_cpu_template_start / __per_cpu_template_end markers
+     * around the contents. */
+    .data..percpu : ALIGN(8) {
+        *(.data..percpu)
+    }
+
     .data : ALIGN(16) {
         *(.data)
         *(.data.*)

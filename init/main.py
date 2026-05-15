@@ -36,7 +36,7 @@ from arch.x86.kernel.irq import do_irq             # exported for common_irq
 from arch.x86.mm.init import mem_init
 from arch.x86.kernel.setup_percpu import setup_per_cpu_areas, get_cpu_id
 from arch.x86.kernel.i8259 import i8259_init
-from arch.x86.kernel.time import time_init, get_jiffies
+from arch.x86.kernel.time import time_init, get_jiffies, get_local_timer_ticks
 from kernel.sched.core import (
     sched_init, kthread_create, start_first_task, get_current_pid,
 )
@@ -291,7 +291,10 @@ def task_a_entry():
         printk0("A")
         print_count_a = print_count_a + 1
         if print_count_a + print_count_b >= MAX_PRINTS:
-            printk0("\nPynux: preemption demo done, halting\n")
+            printk0("\n")
+            printk2("Pynux: jiffies=%d  local_timer_ticks=%d (per-CPU)\n",
+                    get_jiffies(), get_local_timer_ticks())
+            printk0("Pynux: preemption demo done, halting\n")
             halt_forever()
         i: uint64 = 0
         while i < inner_iters:
@@ -303,7 +306,10 @@ def task_b_entry():
         printk0("B")
         print_count_b = print_count_b + 1
         if print_count_a + print_count_b >= MAX_PRINTS:
-            printk0("\nPynux: preemption demo done, halting\n")
+            printk0("\n")
+            printk2("Pynux: jiffies=%d  local_timer_ticks=%d (per-CPU)\n",
+                    get_jiffies(), get_local_timer_ticks())
+            printk0("Pynux: preemption demo done, halting\n")
             halt_forever()
         i: uint64 = 0
         while i < inner_iters:

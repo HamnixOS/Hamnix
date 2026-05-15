@@ -42,3 +42,41 @@ wrmsr_gsbase:
 read_cpu_id_percpu:
     movq    %gs:0, %rax
     ret
+
+/* ---------- Per-CPU template accessors --------------------------
+ * The codegen emits `__per_cpu_template_start` / `__per_cpu_template_end`
+ * around the Pynux-side .data..percpu block. setup_per_cpu_areas()
+ * reads these to memcpy() the master template into each CPU's area.
+ *
+ * Pynux has no extern-variable syntax, and absolute references
+ * (`movl sym, %eax`) blow up under elf32-i386 (BFD_RELOC_X86_64_32S).
+ * Workaround: stash the values as plain `.long sym` words in .rodata
+ * where the relocation resolves to a literal 32-bit address at link
+ * time, then expose accessor functions that load from there. Both
+ * target addresses fit in 32 bits (~0x10xxxx) and the difference is
+ * at most a few hundred bytes for the foreseeable future.
+ */
+    .section .rodata
+    .align 4
+__per_cpu_template_start_word:
+    .long __per_cpu_template_start
+__per_cpu_template_end_word:
+    .long __per_cpu_template_end
+
+    .section .text, "ax"
+
+    .align 16
+    .globl get_per_cpu_load
+get_per_cpu_load:
+    leaq    __per_cpu_template_start_word(%rip), %rax
+    movl    (%rax), %eax              /* zero-extends to %rax */
+    ret
+
+    .align 16
+    .globl get_per_cpu_size
+get_per_cpu_size:
+    leaq    __per_cpu_template_end_word(%rip), %rax
+    movl    (%rax), %eax
+    leaq    __per_cpu_template_start_word(%rip), %rcx
+    subl    (%rcx), %eax              /* uses zero-extended sub     */
+    ret

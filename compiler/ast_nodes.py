@@ -103,6 +103,23 @@ class ArrayType:
 
 
 @dataclass
+class PercpuType:
+    """Per-CPU storage: Percpu[T].
+
+    Globals declared with this type live in `.data..percpu` (VMA = 0 in
+    the linker script) and are accessed via `%gs:name` addressing. Each
+    CPU's per-CPU area is a memcpy of the master template; the GS base
+    MSR holds that area's address. Mirrors Linux's DEFINE_PER_CPU(T, name).
+    """
+    base_type: Type
+    span: Optional[Span] = None
+
+    @property
+    def name(self) -> str:
+        return f"Percpu[{self.base_type.name}]"
+
+
+@dataclass
 class ListType:
     """Dynamic list: List[T]"""
     element_type: Type

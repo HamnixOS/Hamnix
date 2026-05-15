@@ -2,66 +2,87 @@
 #
 # Mirrors arch/x86/kernel/setup_percpu.c in Linux. Brings the per-CPU
 # subsystem online by allocating a per-CPU area for each CPU (just the
-# boot CPU for M16.4 — SMP startup comes later) and anchoring %gs at
-# its base so accesses of the form `mov %gs:offset, reg` land in the
-# right area.
+# boot CPU for M16.14 — SMP startup comes later), memcpy'ing the
+# `.data..percpu` template the linker stashed at __per_cpu_load into
+# that area, and pointing IA32_GS_BASE at the area's base. From then
+# on every Percpu[T] global declared in Pynux source resolves through
+# `%gs:name` to the right slot — see the codegen path in
+# compiler/codegen_x86.py:gen_identifier / gen_assignment.
 #
-# Per-CPU layout (M16.4 minimal):
-#   offset  0: cpu_id (uint64, this CPU's logical id)
-#   offset  8..PCPU_AREA_SIZE: reserved for future per-CPU statics
-#
-# The full Linux layout is driven by .data..percpu section linkage and
-# a load-time copy; we'll re-derive that once we have a section
-# allocator. For now a single fixed area for CPU 0 is enough to prove
-# %gs-based access end-to-end.
+# This replaces the M16.4 hand-rolled approach where setup_per_cpu_areas
+# allocated a one-page area and manually wrote a `cpu_id` value at
+# offset 0. Now `cpu_id_pcpu` is a real first-class per-CPU global,
+# declared below as `Percpu[uint64]`, and the codegen handles all the
+# offset arithmetic.
 
 from mm.memblock import memblock_alloc
-from drivers.tty.serial.early_8250 import (
-    early_puts, early_print_hex64,
-)
+from drivers.tty.serial.early_8250 import early_puts, early_print_hex64
+from kernel.printk.printk import printk1, printk2
 
 extern def wrmsr_gsbase(value: uint64)
 extern def read_cpu_id_percpu() -> uint64
+extern def get_per_cpu_load() -> uint64
+extern def get_per_cpu_size() -> uint64
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
-# Page-sized area is overkill for one u64 but matches Linux's per-CPU
-# page convention and leaves room for the second per-CPU variable.
-PCPU_AREA_SIZE: uint64 = 4096
 
-# Saved pointer to the boot CPU's per-CPU area, kept globally so later
-# code (and debug dumps) can find it without re-reading the GS MSR.
+# First per-CPU global ever: the logical CPU id, accessed at the offset
+# 0 slot of every per-CPU area. The convention "offset 0 = cpu id" lets
+# read_cpu_id_percpu() be a single-instruction `mov %gs:0, %rax` in
+# arch/x86/kernel/setup_percpu_asm.S — but with Percpu[T] support, this
+# is now an ordinary Pynux global the codegen routes through %gs.
+#
+# Declared in the file expected to "own" the per-CPU subsystem; future
+# subsystems (sched/core.py, time.py, etc.) will declare their own
+# Percpu[T] globals in their own files, all packed into .data..percpu
+# by the linker.
+cpu_id_pcpu: Percpu[uint64]
+
+# Saved pointer to the boot CPU's per-CPU area, kept globally so the
+# code that later wants to re-derive it (debug dumps, SMP bring-up of
+# secondary CPUs that need a different base) doesn't have to re-read
+# the GS MSR. Note: this is a REGULAR global (in .bss), not Percpu —
+# it's a property of the booting machine, not per-CPU.
 boot_pcpu_area: uint64 = 0
 
 
 def setup_per_cpu_areas():
-    # Mirrors setup_per_cpu_areas() in Linux's setup_percpu.c — but
-    # since we have one CPU and no .data..percpu section yet, the
-    # body is: allocate one page-aligned area, init cpu_id = 0,
-    # point %gs at it.
-    area: uint64 = memblock_alloc(PCPU_AREA_SIZE, 4096)
+    # Linux iterates over present CPUs and allocates one area per. We
+    # have one CPU for now, so the loop body runs once. memblock_alloc
+    # gives us a 4 KiB-aligned chunk sized to the linker-reported
+    # `__per_cpu_size`. The minimum size is a page so the area maps to
+    # a single 4 KiB virtual frame even if the template is tiny —
+    # makes future cache-line / page-aligned per-CPU statics free.
+    size: uint64 = get_per_cpu_size()
+    if size < 4096:
+        size = 4096
+    area: uint64 = memblock_alloc(size, 4096)
     if area == 0:
-        # No more memblock memory — fatal during early boot.
         early_puts("Pynux: setup_per_cpu_areas OOM\n")
         asm_volatile("cli")
         while True:
             asm_volatile("hlt")
 
-    # Store logical CPU id at offset 0. We treat the returned address
-    # as a Ptr[uint64] by writing through a cast. (Pynux globals living
-    # at a numeric address would need a `volatile`-style intrinsic; for
-    # M16.4 we just access via raw pointer arithmetic from Pynux —
-    # which the codegen lowers to a plain `movq imm, %rax; movq $val,
-    # (%rax)`.)
-    cpu_id_slot: Ptr[uint64] = cast[Ptr[uint64]](area)
-    cpu_id_slot[0] = 0
+    # Copy the master template into this CPU's area. Bytes 0..size from
+    # __per_cpu_load are the initialised values of every Percpu[T]
+    # variable, packed in the order the linker placed them.
+    load: uint64 = get_per_cpu_load()
+    memcpy(cast[Ptr[uint8]](area),
+           cast[Ptr[uint8]](load),
+           get_per_cpu_size())
 
     boot_pcpu_area = area
     wrmsr_gsbase(area)
 
-    early_puts("Pynux: per-CPU area @ 0x")
-    early_print_hex64(area)
-    early_puts("\n")
+    # Now that %gs is anchored we can read/write Percpu[T] globals
+    # safely. Stamp this CPU's logical id.
+    cpu_id_pcpu = 0
+
+    printk2("Pynux: per-CPU area @ %p, size = %d bytes\n",
+            area, get_per_cpu_size())
 
 
 def get_cpu_id() -> uint64:
-    # smp_processor_id() equivalent: read CPU id from %gs:0.
-    return read_cpu_id_percpu()
+    # smp_processor_id() equivalent. Reads via the Percpu[uint64]
+    # global — codegen lowers this to `mov %gs:cpu_id_pcpu, %rax`.
+    return cpu_id_pcpu

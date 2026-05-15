@@ -44,7 +44,7 @@ from .ast_nodes import (
     CallExpr, Identifier, StringLiteral, IntLiteral, CharLiteral, BoolLiteral,
     BinaryExpr, UnaryExpr, BinOp, UnaryOp,
     IndexExpr, MemberExpr, CastExpr,
-    Type, PointerType, ArrayType, FunctionPointerType,
+    Type, PointerType, ArrayType, FunctionPointerType, PercpuType,
 )
 
 
@@ -136,6 +136,16 @@ class X86CodeGen:
         self.extern_funcs: set[str] = set()
         self.defined_funcs: set[str] = set()
         self.global_var_types: dict[str, Type] = {}
+        # Per-CPU globals: live in .data..percpu. To avoid the elf32-i386
+        # absolute-symbol-relocation pothole, we track each percpu
+        # global's BYTE OFFSET into the per-CPU area here and emit
+        # `%gs:imm32` literal displacements at access sites — no symbol
+        # relocation, just plain instruction bytes. global_var_types
+        # still tracks them by their PercpuType so the type system can
+        # unwrap to the base type when asked for size etc.
+        self.percpu_globals: set[str] = set()
+        self.percpu_offsets: dict[str, int] = {}
+        self.percpu_size: int = 0
         self.structs: dict[str, StructInfo] = {}
         self.ctx: Optional[FunctionContext] = None
         # Bare-metal target compiles a standalone kernel ELF: skip
@@ -178,6 +188,10 @@ class X86CodeGen:
             return t.size * self.get_type_size(t.element_type)
         if isinstance(t, (PointerType, FunctionPointerType)):
             return 8
+        if isinstance(t, PercpuType):
+            # Storage in .data..percpu is just the wrapped type; the
+            # PercpuType marker doesn't add any bytes of its own.
+            return self.get_type_size(t.base_type)
         name = t.name if hasattr(t, "name") else str(t)
         if name in self.structs:
             return self.structs[name].total_size
@@ -203,7 +217,12 @@ class X86CodeGen:
         if isinstance(expr, Identifier):
             if self.ctx is not None and expr.name in self.ctx.locals:
                 return self.ctx.locals[expr.name].var_type
-            return self.global_var_types.get(expr.name)
+            t = self.global_var_types.get(expr.name)
+            # Reading/writing a Percpu[T]-typed global yields a T value;
+            # the percpu wrapper is a storage hint, not a value type.
+            if isinstance(t, PercpuType):
+                return t.base_type
+            return t
         if isinstance(expr, IndexExpr):
             obj_type = self.get_expr_type(expr.obj)
             if isinstance(obj_type, ArrayType):
@@ -295,6 +314,18 @@ class X86CodeGen:
                     self.defined_funcs.add(name)
                 case VarDecl(name=name, var_type=var_type):
                     self.global_var_types[name] = var_type
+                    if isinstance(var_type, PercpuType):
+                        # Assign a per-CPU area byte offset to this var.
+                        # Pack with natural alignment of the base type.
+                        base = var_type.base_type
+                        align = self.natural_align(base)
+                        size = self.get_type_size(base)
+                        self.percpu_size = (
+                            (self.percpu_size + align - 1) & ~(align - 1)
+                        )
+                        self.percpu_globals.add(name)
+                        self.percpu_offsets[name] = self.percpu_size
+                        self.percpu_size += size
 
         # Pass 2: emit code.
         self.emit('    .text')
@@ -335,47 +366,106 @@ class X86CodeGen:
         self.structs[cls.name] = StructInfo(cls.name, fields, total)
 
     def gen_data(self, program: Program) -> None:
-        """Emit `.data` for top-level VarDecls. M2.2 supports scalar int
-        initializers; all globals are 8 bytes wide for uniform loading.
-        Larger / struct initializers come in M2.4."""
-        globals_with_init = [
-            d for d in program.declarations
-            if isinstance(d, VarDecl) and d.value is not None
-        ]
-        globals_zero_init = [
-            d for d in program.declarations
-            if isinstance(d, VarDecl) and d.value is None
-        ]
-        if globals_with_init:
+        """Emit `.data` / `.bss` / `.data..percpu` for top-level VarDecls.
+
+        Percpu[T] globals live in `.data..percpu` (linker script gives that
+        section VMA = 0) so the symbol value at link time IS the offset
+        into each CPU's per-CPU area. Reads/writes go through `%gs:name`,
+        injecting the per-CPU base at runtime — see gen_identifier /
+        gen_assignment.
+        """
+        regular_init = []
+        regular_zero = []
+        percpu_init  = []
+        percpu_zero  = []
+        for d in program.declarations:
+            if not isinstance(d, VarDecl):
+                continue
+            is_percpu = isinstance(d.var_type, PercpuType)
+            if d.value is not None:
+                (percpu_init if is_percpu else regular_init).append(d)
+            else:
+                (percpu_zero if is_percpu else regular_zero).append(d)
+
+        def emit_init(g: VarDecl):
+            value = g.value
+            neg = False
+            if isinstance(value, UnaryExpr) and value.op is UnaryOp.NEG \
+                    and isinstance(value.operand, IntLiteral):
+                neg = True
+                value = value.operand
+            if not isinstance(value, IntLiteral):
+                raise CodeGenError(
+                    f"x86: global '{g.name}' must have an integer "
+                    f"initializer (got {type(g.value).__name__})"
+                )
+            self.emit(f"    .globl {g.name}")
+            self.emit(f"{g.name}:")
+            self.emit(f"    .quad {-value.value if neg else value.value}")
+
+        def emit_zero(g: VarDecl):
+            size = max(self.get_type_size(g.var_type), 8)
+            self.emit(f"    .globl {g.name}")
+            self.emit(f"    .align 8")
+            self.emit(f"{g.name}:")
+            self.emit(f"    .zero {(size + 7) & ~7}")
+
+        if regular_init:
             self.emit()
             self.emit('    .section .data')
-            for g in globals_with_init:
-                value = g.value
-                # Constant-fold a unary minus over an int literal so users
-                # can write `X: int32 = -28`. Negative IntLiterals never
-                # appear directly because `-` is a unary operator.
-                neg = False
-                if isinstance(value, UnaryExpr) and value.op is UnaryOp.NEG \
-                        and isinstance(value.operand, IntLiteral):
-                    neg = True
-                    value = value.operand
-                if not isinstance(value, IntLiteral):
-                    raise CodeGenError(
-                        f"x86: global '{g.name}' must have an integer "
-                        f"initializer (got {type(g.value).__name__})"
-                    )
-                self.emit(f"    .globl {g.name}")
-                self.emit(f"{g.name}:")
-                self.emit(f"    .quad {-value.value if neg else value.value}")
-        if globals_zero_init:
+            for g in regular_init:
+                emit_init(g)
+        if regular_zero:
             self.emit()
             self.emit('    .section .bss')
-            for g in globals_zero_init:
-                size = max(self.get_type_size(g.var_type), 8)
+            for g in regular_zero:
+                emit_zero(g)
+
+        # Per-CPU template: PROGBITS section, packed in offset order so
+        # the linker preserves the exact byte layout our access sites
+        # assume. We pad between vars when natural alignment requires
+        # gaps. Two linker-visible markers at the boundaries let
+        # setup_per_cpu_areas() know what to memcpy. Note: no symbol
+        # name is emitted for the per-CPU vars themselves — their
+        # identity in generated code is their offset, not a symbol —
+        # but we keep them as `.globl` for ease of debugging via nm.
+        if percpu_init or percpu_zero:
+            ordered = sorted(percpu_init + percpu_zero,
+                             key=lambda g: self.percpu_offsets[g.name])
+            self.emit()
+            self.emit('    .section .data..percpu, "aw"')
+            self.emit('    .align 8')
+            self.emit('    .globl __per_cpu_template_start')
+            self.emit('__per_cpu_template_start:')
+            cursor = 0
+            for g in ordered:
+                want = self.percpu_offsets[g.name]
+                if want > cursor:
+                    self.emit(f"    .zero {want - cursor}")
+                    cursor = want
                 self.emit(f"    .globl {g.name}")
-                self.emit(f"    .align 8")
                 self.emit(f"{g.name}:")
-                self.emit(f"    .zero {(size + 7) & ~7}")
+                if g.value is not None:
+                    # Same constant-fold path as gen_data's init helper.
+                    value = g.value
+                    neg = False
+                    if isinstance(value, UnaryExpr) \
+                            and value.op is UnaryOp.NEG \
+                            and isinstance(value.operand, IntLiteral):
+                        neg = True
+                        value = value.operand
+                    if not isinstance(value, IntLiteral):
+                        raise CodeGenError(
+                            f"x86: percpu '{g.name}' needs an integer "
+                            f"initialiser"
+                        )
+                    self.emit(f"    .quad {-value.value if neg else value.value}")
+                else:
+                    size = self.get_type_size(g.var_type)
+                    self.emit(f"    .zero {(size + 7) & ~7}")
+                cursor += self.get_type_size(g.var_type)
+            self.emit('    .globl __per_cpu_template_end')
+            self.emit('__per_cpu_template_end:')
 
     def gen_rodata(self) -> None:
         if not self.string_literals:
@@ -519,6 +609,26 @@ class X86CodeGen:
             if name in self.ctx.locals:
                 var = self.ctx.locals[name]
                 self.emit(f"    movq %rax, {var.offset}(%rbp)")
+            elif name in self.percpu_globals:
+                # Per-CPU store: literal `%gs:offset` displacement, no
+                # relocations.
+                t = self.global_var_types[name]
+                base = t.base_type if isinstance(t, PercpuType) else t
+                size = self.get_type_size(base)
+                offset = self.percpu_offsets[name]
+                if size == 8:
+                    self.emit(f"    movq %rax, %gs:{offset}")
+                elif size == 4:
+                    self.emit(f"    movl %eax, %gs:{offset}")
+                elif size == 2:
+                    self.emit(f"    movw %ax, %gs:{offset}")
+                elif size == 1:
+                    self.emit(f"    movb %al, %gs:{offset}")
+                else:
+                    raise CodeGenError(
+                        f"x86: Percpu store size {size} not supported "
+                        f"(variable '{name}')"
+                    )
             elif name in self.global_var_types:
                 # Scalar global: store the 64-bit value back to .data
                 self.emit(f"    movq %rax, {name}(%rip)")
@@ -679,6 +789,38 @@ class X86CodeGen:
             # Function reference: load the symbol's address (RIP-relative).
             self.emit(f"    leaq {name}(%rip), %rax")
         elif name in self.global_var_types:
+            if name in self.percpu_globals:
+                # Per-CPU scalar: literal `%gs:offset` displacement. No
+                # symbol relocation involved — the encoder writes the
+                # 32-bit imm directly into the instruction. Aggregates
+                # are not yet supported (would need `&%gs:offset` which
+                # x86 can't compute in a single instruction).
+                t = self.global_var_types[name]
+                base = t.base_type if isinstance(t, PercpuType) else t
+                if isinstance(base, ArrayType) or (
+                    base is not None and hasattr(base, "name")
+                    and base.name in self.structs
+                ):
+                    raise CodeGenError(
+                        f"x86: Percpu[{base.name}] aggregate access not "
+                        f"yet supported (variable '{name}')"
+                    )
+                size = self.get_type_size(base)
+                offset = self.percpu_offsets[name]
+                if size == 8:
+                    self.emit(f"    movq %gs:{offset}, %rax")
+                elif size == 4:
+                    self.emit(f"    movl %gs:{offset}, %eax")
+                elif size == 2:
+                    self.emit(f"    movzwq %gs:{offset}, %rax")
+                elif size == 1:
+                    self.emit(f"    movzbq %gs:{offset}, %rax")
+                else:
+                    raise CodeGenError(
+                        f"x86: Percpu base size {size} not supported "
+                        f"(variable '{name}')"
+                    )
+                return
             t = self.global_var_types[name]
             is_aggregate = (
                 isinstance(t, ArrayType)
