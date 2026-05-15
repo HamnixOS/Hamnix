@@ -240,3 +240,16 @@ sys_dup2:
     syscall
     ret
     .size sys_dup2, .-sys_dup2
+
+
+    /* --- sys_listdir(path, buf, count) -> int64 ----------------------
+     * Pack directory entries from `path` as "NAME.EXT\n" lines into
+     * `buf`, up to `count` bytes. Returns bytes written, or
+     * -errno. /mnt/* only for now. */
+    .globl sys_listdir
+    .type sys_listdir, @function
+sys_listdir:
+    movq    $18, %rax               /* SYS_LISTDIR */
+    syscall
+    ret
+    .size sys_listdir, .-sys_listdir
