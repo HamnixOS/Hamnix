@@ -41,6 +41,12 @@ class TaskStruct:
     state:        uint64       # offset 40: STATE_*
     is_user:      uint64       # offset 48: 1 if CPL=3 task
     name0:        uint64       # offset 56: 8-char ASCII tag (debug)
+    # Per-task file descriptor table — 4 slots. Each fd has a file
+    # index (or special marker for stdin/stdout/stderr) and a
+    # 64-bit read/write position. We keep the two side-by-side
+    # rather than packed so callers don't have to pun bit-fields out.
+    fd_idx:       Array[4, uint32]    # offset 64..80
+    fd_pos:       Array[4, uint64]    # offset 80..112
 
 
 # State constants (mirror Linux's task->state space at a tiny scope).
@@ -162,6 +168,7 @@ def kthread_create(entry: uint64, name0: uint64) -> int32:
     task_table[s].state       = STATE_READY
     task_table[s].is_user     = 0
     task_table[s].name0       = name0
+    _init_fd_table(s)
     next_pid = next_pid + 1
     return slot
 
@@ -194,6 +201,7 @@ def create_user_task(entry: uint64, name0: uint64) -> int32:
     task_table[s].state       = STATE_READY
     task_table[s].is_user     = 1
     task_table[s].name0       = name0
+    _init_fd_table(s)
     next_pid = next_pid + 1
     return slot
 
@@ -276,9 +284,35 @@ def start_first_task():
 
 # --- helpers for syscall layer -------------------------------------
 
+# Special fd_idx markers. Anything < these values is a real initramfs
+# file index; the markers reserve the high quarter of the uint32 space.
+FD_CLOSED_MARK: uint32 = 0xFFFFFFFF
+FD_STDIN_MARK:  uint32 = 0xFFFFFFFC
+FD_STDOUT_MARK: uint32 = 0xFFFFFFFE
+FD_STDERR_MARK: uint32 = 0xFFFFFFFD
+
+
 def current_task_pid() -> uint64:
     return task_table[current_idx].pid
 
 
 def current_task_is_user() -> uint64:
     return task_table[current_idx].is_user
+
+
+def current_task() -> Ptr[TaskStruct]:
+    return &task_table[current_idx]
+
+
+def _init_fd_table(slot: uint64):
+    # Pre-open stdin / stdout / stderr; the rest start CLOSED. Linux's
+    # exec() does the same thing — the launched binary inherits the
+    # parent's standard streams or gets them freshly attached.
+    task_table[slot].fd_idx[0] = FD_STDIN_MARK
+    task_table[slot].fd_idx[1] = FD_STDOUT_MARK
+    task_table[slot].fd_idx[2] = FD_STDERR_MARK
+    task_table[slot].fd_idx[3] = FD_CLOSED_MARK
+    task_table[slot].fd_pos[0] = 0
+    task_table[slot].fd_pos[1] = 0
+    task_table[slot].fd_pos[2] = 0
+    task_table[slot].fd_pos[3] = 0

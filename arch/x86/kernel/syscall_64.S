@@ -169,48 +169,81 @@ enter_user_mode:
     .align 16
     .globl user_demo_entry
 user_demo_entry:
-    /* M16.21 user demo: open /motd, slurp its bytes via SYS_READ in
-     * a small loop, write each byte out with SYS_PUTC, then close
-     * and exit. Exercises the full SYS_OPEN / SYS_READ / SYS_CLOSE
-     * path through fs/vfs.py and the initramfs blob in
-     * fs/initramfs_data.S. */
+    /* M16.26 demo: pre-opened stdout (fd 1) + stderr (fd 2) plus
+     * SYS_WRITE to bulk-print; SYS_LSEEK to reposition; SYS_READ
+     * still slurps the file. Exercises every fd-table-aware path
+     * in fs/vfs.py end-to-end. */
+
+    /* banner via stdout */
+    movq    $1, %rdi
+    leaq    user_banner(%rip), %rsi
+    movq    $user_banner_end - user_banner, %rdx
+    movq    $8, %rax                   /* SYS_WRITE                  */
+    syscall
 
     /* fd = open("/motd") */
     leaq    fname_motd(%rip), %rdi
-    movq    $5, %rax                   /* SYS_OPEN */
+    movq    $5, %rax                   /* SYS_OPEN                   */
     syscall
-    movq    %rax, %r13                 /* save fd in callee-saved reg */
+    movq    %rax, %r13                 /* save fd                    */
 
-    /* Loop: while (n = read(fd, buf, 64)) > 0: putc each */
+    /* Stream the whole file: while ((n = read(fd, buf, 64)) > 0)
+     *                              write(1, buf, n) */
 .Lread_loop:
-    movq    %r13, %rdi                 /* fd                         */
-    leaq    user_read_buf(%rip), %rsi  /* buf                        */
-    movq    $64, %rdx                  /* count                      */
+    movq    %r13, %rdi
+    leaq    user_read_buf(%rip), %rsi
+    movq    $64, %rdx
     movq    $6, %rax                   /* SYS_READ                   */
     syscall
     testq   %rax, %rax
-    jle     .Lread_done                /* EOF (0) or error (<0)      */
+    jle     .Lread_done
 
-    movq    %rax, %r14                 /* %r14 = bytes read          */
-    leaq    user_read_buf(%rip), %r15  /* cursor                     */
-.Lprint_loop:
-    movb    (%r15), %dil
-    movzbq  %dil, %rdi
-    movq    $0, %rax                   /* SYS_PUTC                   */
+    movq    %rax, %rdx                 /* count = bytes read          */
+    movq    $1, %rdi
+    leaq    user_read_buf(%rip), %rsi
+    movq    $8, %rax                   /* SYS_WRITE                  */
     syscall
-    incq    %r15
-    decq    %r14
-    jnz     .Lprint_loop
     jmp     .Lread_loop
 
 .Lread_done:
-    /* close(fd) */
+    /* lseek(fd, 9, SEEK_SET) + read 12 + write to stdout. Byte 9
+     * of /motd is "Pynux from a" — proves the seek repositions. */
+    movq    %r13, %rdi
+    movq    $9, %rsi
+    movq    $0, %rdx                   /* SEEK_SET                   */
+    movq    $9, %rax                   /* SYS_LSEEK                  */
+    syscall
+
+    /* "seeked: " label via stderr to mix the two streams */
+    movq    $2, %rdi
+    leaq    user_seek_label(%rip), %rsi
+    movq    $user_seek_label_end - user_seek_label, %rdx
+    movq    $8, %rax
+    syscall
+
+    movq    %r13, %rdi
+    leaq    user_read_buf(%rip), %rsi
+    movq    $12, %rdx
+    movq    $6, %rax                   /* SYS_READ                   */
+    syscall
+    movq    %rax, %rdx
+    movq    $1, %rdi
+    leaq    user_read_buf(%rip), %rsi
+    movq    $8, %rax                   /* SYS_WRITE                  */
+    syscall
+
+    /* End-of-output via stderr */
+    movq    $2, %rdi
+    leaq    user_eot(%rip), %rsi
+    movq    $user_eot_end - user_eot, %rdx
+    movq    $8, %rax
+    syscall
+
+    /* close + exit */
     movq    %r13, %rdi
     movq    $7, %rax                   /* SYS_CLOSE                  */
     syscall
-
-    /* exit */
-    movq    $1, %rax
+    movq    $1, %rax                   /* SYS_EXIT                   */
     syscall
 
 .user_demo_hang:
@@ -223,6 +256,15 @@ user_demo_entry:
     .section .rodata
 fname_motd:
     .asciz "/motd"
+user_banner:
+    .ascii "[user] M16.26 fd-table / write / lseek demo:\n"
+user_banner_end:
+user_seek_label:
+    .ascii "\n[user] (stderr) after lseek(fd, 9, SEEK_SET): "
+user_seek_label_end:
+user_eot:
+    .ascii "\n[user] (stderr) done.\n"
+user_eot_end:
 
     .section .data
     .align 8
