@@ -1,0 +1,240 @@
+# mm/slab.py
+#
+# Mirrors the smallest meaningful slice of mm/slub.c in Linux: a per-
+# size slab allocator with intra-object free lists, plus a kmalloc /
+# kfree front end. Each kmem_cache owns:
+#   - A linked list of "slab pages" — full 4 KiB pages it grabbed from
+#     mm/page_alloc.
+#   - A single free list spanning all of those pages: free objects
+#     embed a `next-free` pointer in their first 8 bytes (the SLUB
+#     trick — zero metadata overhead per object when it's free).
+#
+# Per-slab-page layout (first 32 bytes are the SlabHeader, then
+# back-to-back objects):
+#
+#     +0   cache       Ptr[KmemCache] back-pointer (so kfree can
+#                      recover the owning cache from any object)
+#     +8   next_slab   next slab page in this cache's list
+#     +16  nr_inuse    bookkeeping: count of allocated objects from
+#                      this page; reaches 0 → page is fully free and
+#                      could (eventually) be reclaimed to page_alloc.
+#                      M16.8 doesn't reap empty slabs yet.
+#     +24  magic       SLAB_MAGIC; sanity check on kfree.
+#     +32  object 0
+#     +32+S object 1
+#     ...
+#
+# Free objects are chained head-first. When we pop one off the head,
+# its `next-free` slot is now garbage from the caller's POV — but
+# that's fine: the caller "owns" the object and won't read it until
+# they fill it.
+#
+# kmalloc(size) picks the smallest power-of-2 cache that fits and
+# delegates to kmem_cache_alloc. kfree(obj) reads the back-pointer
+# out of the slab header and routes to kmem_cache_free. There is no
+# size header on individual objects — the page-aligned mask gives us
+# the slab header for free.
+#
+# Sizing decisions:
+#   - Caches: 32, 64, 128, 256, 512, 1024, 2048 bytes. Anything larger
+#     returns 0 from kmalloc — callers must use alloc_page() / a
+#     future alloc_pages(order). Linux's kmalloc spans 8 B .. 8 MiB;
+#     we'll grow there as use sites appear.
+#   - Object_size <8 is rounded up to 8 so the free-list next pointer
+#     always fits.
+#
+# What's deliberately deferred (and tracked for later):
+#   - per-CPU partial lists (faster path; current allocator is single-
+#     global-list per cache)
+#   - reaping fully-free slabs back to page_alloc
+#   - kzalloc (zero-fill on alloc)
+#   - ctor / dtor callbacks on kmem_cache_create
+#   - SLAB_HWCACHE_ALIGN and friends
+#   - kmemleak / KASAN-style accounting
+
+from mm.page_alloc import alloc_page, free_page, PAGE_SIZE
+from kernel.printk.printk import printk0, printk1, printk2
+
+
+# --- KmemCache struct (64 bytes, all 8-byte fields) -----------------
+class KmemCache:
+    object_size:        uint64
+    objects_per_slab:   uint64
+    slab_pages_head:    uint64
+    free_objects_head:  uint64
+    nr_slabs:           uint64
+    nr_allocated:       uint64
+    nr_free:            uint64
+    name0:              uint64        # 8 ASCII chars, little-endian
+
+
+# --- SlabHeader struct (32 bytes; placed at offset 0 of every slab page)
+class SlabHeader:
+    cache:      uint64
+    next_slab:  uint64
+    nr_inuse:   uint64
+    magic:      uint64
+
+
+SLAB_HEADER_SIZE: uint64 = 32
+
+# Recognizable ASCII magic so heap-corruption mishaps stand out in a
+# memory dump. "PYNUXSLB" little-endian.
+SLAB_MAGIC: uint64 = 0x424C535855_4E_5950
+
+# kmalloc cache table. Seven slots cover 32..2048 in powers of two.
+NUM_KMALLOC_CACHES: uint64 = 7
+kmalloc_caches: Array[7, KmemCache]
+
+
+# --- internals ------------------------------------------------------
+
+def _slab_refill(cache: Ptr[KmemCache]) -> int32:
+    # Pull a fresh 4 KiB page from page_alloc and turn it into a slab
+    # for this cache: header at offset 0, then objects_per_slab back-
+    # to-back objects, all linked into the free list. Returns 0 on
+    # success, -1 on OOM.
+    page: uint64 = alloc_page()
+    if page == 0:
+        return -1
+
+    hdr: Ptr[SlabHeader] = cast[Ptr[SlabHeader]](page)
+    hdr[0].cache     = cast[uint64](cache)
+    hdr[0].next_slab = cache[0].slab_pages_head
+    hdr[0].nr_inuse  = 0
+    hdr[0].magic     = SLAB_MAGIC
+    cache[0].slab_pages_head = page
+
+    first_obj: uint64 = page + SLAB_HEADER_SIZE
+    obj_size:  uint64 = cache[0].object_size
+    n:         uint64 = cache[0].objects_per_slab
+
+    # Walk forwards: object i points to object i+1, last points to
+    # the previous global head (so multiple refills chain correctly).
+    i: uint64 = 0
+    while i < n:
+        obj: uint64 = first_obj + i * obj_size
+        slot: Ptr[uint64] = cast[Ptr[uint64]](obj)
+        if i + 1 < n:
+            slot[0] = first_obj + (i + 1) * obj_size
+        else:
+            slot[0] = cache[0].free_objects_head
+        i = i + 1
+
+    cache[0].free_objects_head = first_obj
+    cache[0].nr_slabs = cache[0].nr_slabs + 1
+    cache[0].nr_free  = cache[0].nr_free + n
+    return 0
+
+
+# --- public API -----------------------------------------------------
+
+def kmem_cache_init(cache: Ptr[KmemCache], object_size: uint64,
+                    name0: uint64):
+    # Initialise a previously zeroed KmemCache. Rounds up to 8-byte
+    # alignment and floors at 8 so the free-list next-pointer fits.
+    size: uint64 = (object_size + 7) & ~7
+    if size < 8:
+        size = 8
+    cache[0].object_size       = size
+    usable: uint64 = PAGE_SIZE - SLAB_HEADER_SIZE
+    cache[0].objects_per_slab  = usable / size
+    cache[0].slab_pages_head   = 0
+    cache[0].free_objects_head = 0
+    cache[0].nr_slabs          = 0
+    cache[0].nr_allocated      = 0
+    cache[0].nr_free           = 0
+    cache[0].name0             = name0
+
+
+def kmem_cache_alloc(cache: Ptr[KmemCache]) -> uint64:
+    if cache[0].free_objects_head == 0:
+        rc: int32 = _slab_refill(cache)
+        if rc != 0:
+            return 0
+    obj: uint64 = cache[0].free_objects_head
+    cache[0].free_objects_head = cast[Ptr[uint64]](obj)[0]
+    cache[0].nr_free      = cache[0].nr_free - 1
+    cache[0].nr_allocated = cache[0].nr_allocated + 1
+
+    # Bump the owning slab's nr_inuse.
+    slab_page: uint64 = obj & ~(PAGE_SIZE - 1)
+    hdr: Ptr[SlabHeader] = cast[Ptr[SlabHeader]](slab_page)
+    hdr[0].nr_inuse = hdr[0].nr_inuse + 1
+    return obj
+
+
+def kmem_cache_free(cache: Ptr[KmemCache], obj: uint64):
+    if obj == 0:
+        return
+    # Prepend onto the free list — next slot of `obj` becomes the
+    # current head, then `obj` itself is the new head.
+    cast[Ptr[uint64]](obj)[0] = cache[0].free_objects_head
+    cache[0].free_objects_head = obj
+    cache[0].nr_free      = cache[0].nr_free + 1
+    cache[0].nr_allocated = cache[0].nr_allocated - 1
+
+    slab_page: uint64 = obj & ~(PAGE_SIZE - 1)
+    hdr: Ptr[SlabHeader] = cast[Ptr[SlabHeader]](slab_page)
+    hdr[0].nr_inuse = hdr[0].nr_inuse - 1
+
+
+# --- kmalloc front end ---------------------------------------------
+
+def _kmalloc_index(size: uint64) -> int32:
+    # Smallest cache that fits. Returns -1 for sizes > 2048; the
+    # caller should fall back to page-granular allocation.
+    if size <= 32:
+        return 0
+    if size <= 64:
+        return 1
+    if size <= 128:
+        return 2
+    if size <= 256:
+        return 3
+    if size <= 512:
+        return 4
+    if size <= 1024:
+        return 5
+    if size <= 2048:
+        return 6
+    return -1
+
+
+def slab_init():
+    # Eight-byte little-endian name tags; useful for /proc/slabinfo-
+    # style dumps once we have those. e.g. 0x00_00_32_33_2D_6B_6D_6B
+    # → "km-32" + NUL padding (read little-endian → "km-32\0\0\0").
+    kmem_cache_init(&kmalloc_caches[0],   32, 0x00_00_00_32_33_2D_6B_6D)
+    kmem_cache_init(&kmalloc_caches[1],   64, 0x00_00_00_34_36_2D_6B_6D)
+    kmem_cache_init(&kmalloc_caches[2],  128, 0x00_00_38_32_31_2D_6B_6D)
+    kmem_cache_init(&kmalloc_caches[3],  256, 0x00_00_36_35_32_2D_6B_6D)
+    kmem_cache_init(&kmalloc_caches[4],  512, 0x00_00_32_31_35_2D_6B_6D)
+    kmem_cache_init(&kmalloc_caches[5], 1024, 0x00_34_32_30_31_2D_6B_6D)
+    kmem_cache_init(&kmalloc_caches[6], 2048, 0x00_38_34_30_32_2D_6B_6D)
+
+
+def kmalloc(size: uint64) -> uint64:
+    idx: int32 = _kmalloc_index(size)
+    if idx < 0:
+        # Anything > 2048 currently has no allocator. Callers needing
+        # 4 KiB+ should use alloc_page() / a future alloc_pages(order).
+        printk1("kmalloc: request for %d bytes exceeds 2048\n", size)
+        return 0
+    return kmem_cache_alloc(&kmalloc_caches[idx])
+
+
+def kfree(obj: uint64):
+    if obj == 0:
+        return
+    slab_page: uint64 = obj & ~(PAGE_SIZE - 1)
+    hdr: Ptr[SlabHeader] = cast[Ptr[SlabHeader]](slab_page)
+    if hdr[0].magic != SLAB_MAGIC:
+        # Caller passed a bad pointer (already-freed, foreign, or
+        # not slab-allocated at all). Loud diagnostic — Linux's
+        # equivalent is BUG() in __kmalloc / kfree.
+        printk1("kfree: bad pointer %p (slab magic mismatch)\n", obj)
+        return
+    cache_addr: uint64 = hdr[0].cache
+    cache: Ptr[KmemCache] = cast[Ptr[KmemCache]](cache_addr)
+    kmem_cache_free(cache, obj)

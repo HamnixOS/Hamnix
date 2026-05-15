@@ -224,6 +224,14 @@ class X86CodeGen:
             if isinstance(base_type, PointerType):
                 return base_type.base_type
             return None
+        if isinstance(expr, CastExpr):
+            # The whole point of `cast[T](x)` at this layer is to declare
+            # the result's type, so downstream lookups (struct field
+            # offsets, element size for indexing) work without first
+            # binding the cast to a local. Without this, the chain
+            # `cast[Ptr[Foo]](p)[0].field` falls through to "unknown"
+            # and member/index codegen can't find the struct layout.
+            return expr.target_type
         return None
 
     def element_size_of(self, container: Expr) -> int:

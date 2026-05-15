@@ -16,7 +16,15 @@
 # which holds for our image (~ 0x108000 < 0x200000).
 
 from mm.memblock import memblock_init
+from mm.page_alloc import page_alloc_init
+from mm.slab import slab_init
 
 
 def mem_init():
+    # Mirrors the layered bring-up of arch/x86/mm/init.c's setup_arch
+    # → mem_init() path: lower allocators come up before higher ones.
+    # memblock owns "all RAM", page_alloc takes pages from it on
+    # demand, slab takes pages from page_alloc.
     memblock_init()
+    page_alloc_init()
+    slab_init()
