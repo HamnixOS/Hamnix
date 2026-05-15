@@ -118,6 +118,24 @@ echo "[PYNUX] --- /proc/partitions ---"
 cat /proc/partitions
 echo "[PYNUX] --- end /proc/partitions ---"
 
+if ls /m5_netfilter.ko >/dev/null 2>&1; then
+    echo "[PYNUX] --- exercise netfilter hook ---"
+    ifconfig eth0 10.0.2.15 up 2>&1 | head -2
+    ping -c 2 -W 1 10.0.2.2 2>&1 | grep -E "transmitted|received" | head -1
+    echo "[PYNUX] --- end netfilter ---"
+fi
+
+if grep -qE '^[ 0-9]*240 pynux$' /proc/devices 2>/dev/null; then
+    echo "[PYNUX] --- exercise /dev/pynux ---"
+    mknod /dev/pynux c 240 0
+    echo "[PYNUX] cat /dev/pynux:"
+    cat /dev/pynux
+    echo "[PYNUX] echo > /dev/pynux:"
+    echo "testdata" > /dev/pynux && echo "[PYNUX] write ok"
+    rm -f /dev/pynux
+    echo "[PYNUX] --- end /dev/pynux ---"
+fi
+
 if grep -q pynuxfs /proc/filesystems 2>/dev/null; then
     echo "[PYNUX] --- exercise pynuxfs ---"
     mkdir -p /mnt/pynuxfs
