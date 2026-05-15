@@ -45,6 +45,7 @@ kernel built up subsystem by subsystem.
 | M12.1 | netfilter packet inspector — parses sk_buff IPv4 header, prints src/dst of every packet | **Done** |
 | M12.2 | `/dev/pynuxnull` — clone of /dev/null | **Done** |
 | M13.1 | utsname reader — pulls kernel release "6.12.48" out of `init_uts_ns` | **Done** |
+| M13.2 | smp_processor_id — reads CPU number from `%gs:pcpu_hot+12` | **Done** |
 
 The microcontroller OS the project originally shipped (ARM Cortex-M,
 QEMU mps2-an385, RP2040, STM32F4) still compiles via the original ARM
@@ -166,6 +167,7 @@ kernel-modules/  Pynux source for each module milestone
   m12-nfdump/    M12.1 netfilter packet inspector
   m12-null/      M12.2 /dev/pynuxnull
   m13-utsname/   M13.1 read kernel release from init_uts_ns
+  m13-cpuid/     M13.2 smp_processor_id via per-CPU segment
 
 scripts/         x86 dev-loop infrastructure
   build_x86_kernel.sh    Fetch + build mitigations-off Linux for QEMU
