@@ -202,3 +202,16 @@ sys_pipe:
     syscall
     ret
     .size sys_pipe, .-sys_pipe
+
+
+    /* --- sys_kill(pid, sig) -> int32 ---------------------------------
+     * Post `sig` into pid's pending-signal bitmap. Default
+     * disposition for every signal is TERM with exit code 128+sig
+     * — no per-process handlers yet. */
+    .globl sys_kill
+    .type sys_kill, @function
+sys_kill:
+    movq    $15, %rax               /* SYS_KILL */
+    syscall
+    ret
+    .size sys_kill, .-sys_kill

@@ -61,10 +61,13 @@ echo "[test_pipe] --- end output ---"
 
 fail=0
 # /cat's reads and writes interleave with the kernel's exit-log
-# printk ("task: pid N exited (code=M)"), which can splice mid-line
-# between /cat's chunks. Sed the printk pattern out so the contig-
-# uous "pipe payload" the pipeline actually delivered is visible.
-cleaned=$(sed 's/task: pid -*[0-9]* exited (code=-*[0-9]*)//g' "$LOG")
+# printk ("task: pid N exited (code=M)") AND its own chunk
+# boundaries (4-byte "pipe", 1-byte " ", 7-byte "payload" hit the
+# pipe in separate writes). To assert delivery robustly, strip the
+# kernel log line and collapse whitespace so "pipe<...>payload"
+# normalizes to "pipe payload" regardless of how the bytes
+# interleaved.
+cleaned=$(sed 's/task: pid -*[0-9]* exited (code=-*[0-9]*)//g' "$LOG" | tr '\n' ' ' | tr -s ' ')
 if echo "$cleaned" | grep -F -q "pipe payload"; then
     echo "[test_pipe] OK: 'pipe payload' delivered via pipe"
 else
