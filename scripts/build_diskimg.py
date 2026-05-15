@@ -41,12 +41,20 @@ SECTORS_PER_FAT     = 1
 ROOT_CLUSTER        = 2
 TOTAL_SECTORS       = 64
 
-# File we ship in the image. Name MUST be uppercase 8.3 so mkfs-style
-# LFN handling is unnecessary on either side. The marker is what
-# scripts/test_fat.sh greps for.
-HELLO_NAME = "HELLO   TXT"          # 8+3, space-padded
-HELLO_BODY = (
+# Files we ship in the image. Names MUST be uppercase 8.3 so
+# mkfs-style LFN handling is unnecessary on either side.
+HELLO_NAME  = "HELLO   TXT"         # 8+3, space-padded
+HELLO_BODY  = (
     b"FAT32_MARKER hello from /mnt/HELLO.TXT in a baked-in image\n"
+)
+
+# M16.45: a subdirectory at root containing a nested file. Exercises
+# fat_lookup's path-component traversal (root → SUBDIR → NESTED.TXT)
+# and the FAT chain walk through a directory cluster.
+SUBDIR_NAME = "SUBDIR     "         # 11 spaces total, all-uppercase
+NESTED_NAME = "NESTED  TXT"
+NESTED_BODY = (
+    b"NESTED_MARKER from /mnt/SUBDIR/NESTED.TXT - subdir walk works\n"
 )
 
 
@@ -94,57 +102,97 @@ def build_fat() -> bytes:
     # number; high 4 bits are reserved and read-as-zero. Entry 0
     # encodes the media descriptor in the low byte; entry 1 is
     # reserved (typically end-of-chain). Entries 2+ describe the
-    # data clusters.
+    # data clusters. Layout:
+    #
+    #   cluster 2: root directory
+    #   cluster 3: HELLO.TXT contents
+    #   cluster 4: SUBDIR/ directory contents
+    #   cluster 5: SUBDIR/NESTED.TXT contents
     EOC = 0x0FFFFFFF
     fat = bytearray(SECTOR_SIZE)
-    struct.pack_into("<I", fat, 0,  0x0FFFFFF8)   # entry 0: media | reserved bits
-    struct.pack_into("<I", fat, 4,  EOC)          # entry 1: reserved
-    struct.pack_into("<I", fat, 8,  EOC)          # entry 2: root dir, single cluster
-    struct.pack_into("<I", fat, 12, EOC)          # entry 3: HELLO.TXT, single cluster
+    struct.pack_into("<I", fat, 0,  0x0FFFFFF8)
+    struct.pack_into("<I", fat, 4,  EOC)
+    struct.pack_into("<I", fat, 8,  EOC)
+    struct.pack_into("<I", fat, 12, EOC)
+    struct.pack_into("<I", fat, 16, EOC)
+    struct.pack_into("<I", fat, 20, EOC)
     return bytes(fat)
 
 
-def build_root_dir(hello_cluster: int, hello_size: int) -> bytes:
-    cluster = bytearray(SECTOR_SIZE)
-    # Single entry: HELLO.TXT.
-    name11 = HELLO_NAME.encode("ascii")
+def _pack_dir_entry(name11: bytes, attr: int, cluster: int,
+                    size: int) -> bytes:
     assert len(name11) == 11
-    cluster[0:11]  = name11
-    cluster[11]    = 0x20                            # attr: ARCHIVE
-    cluster[12]    = 0                               # nt reserved
-    cluster[13]    = 0                               # ctime tenths
-    struct.pack_into("<H", cluster, 14, 0)           # ctime
-    struct.pack_into("<H", cluster, 16, 0)           # cdate
-    struct.pack_into("<H", cluster, 18, 0)           # adate
-    struct.pack_into("<H", cluster, 20, (hello_cluster >> 16) & 0xFFFF)
-    struct.pack_into("<H", cluster, 22, 0)           # mtime
-    struct.pack_into("<H", cluster, 24, 0)           # mdate
-    struct.pack_into("<H", cluster, 26, hello_cluster & 0xFFFF)
-    struct.pack_into("<I", cluster, 28, hello_size)
+    e = bytearray(32)
+    e[0:11] = name11
+    e[11]   = attr
+    struct.pack_into("<H", e, 20, (cluster >> 16) & 0xFFFF)
+    struct.pack_into("<H", e, 26, cluster & 0xFFFF)
+    struct.pack_into("<I", e, 28, size)
+    return bytes(e)
+
+
+def build_root_dir(hello_cluster: int, hello_size: int,
+                   subdir_cluster: int) -> bytes:
+    cluster = bytearray(SECTOR_SIZE)
+    # Entry 0: HELLO.TXT (regular file).
+    cluster[0:32] = _pack_dir_entry(
+        HELLO_NAME.encode("ascii"), attr=0x20,
+        cluster=hello_cluster, size=hello_size,
+    )
+    # Entry 1: SUBDIR (directory). Size is 0 for directories per spec.
+    cluster[32:64] = _pack_dir_entry(
+        SUBDIR_NAME.encode("ascii"), attr=0x10,
+        cluster=subdir_cluster, size=0,
+    )
     return bytes(cluster)
 
 
-def build_hello_cluster() -> bytes:
+def build_subdir_dir(nested_cluster: int, nested_size: int) -> bytes:
     cluster = bytearray(SECTOR_SIZE)
-    cluster[0:len(HELLO_BODY)] = HELLO_BODY
+    # "." entry — points to the subdir itself (well-known convention).
+    cluster[0:32] = _pack_dir_entry(
+        b".          ", attr=0x10,
+        cluster=4,                              # SUBDIR's own cluster
+        size=0,
+    )
+    # ".." entry — points to root. FAT32 convention: parent's cluster
+    # if root, write 0 (not 2).
+    cluster[32:64] = _pack_dir_entry(
+        b"..         ", attr=0x10, cluster=0, size=0,
+    )
+    # The actual nested file.
+    cluster[64:96] = _pack_dir_entry(
+        NESTED_NAME.encode("ascii"), attr=0x20,
+        cluster=nested_cluster, size=nested_size,
+    )
+    return bytes(cluster)
+
+
+def build_file_cluster(body: bytes) -> bytes:
+    cluster = bytearray(SECTOR_SIZE)
+    cluster[0:len(body)] = body
     return bytes(cluster)
 
 
 def build_image() -> bytes:
     img = bytearray(TOTAL_SECTORS * SECTOR_SIZE)
-    # sector 0: BPB
     img[0:SECTOR_SIZE] = build_bpb()
-    # sectors 1..15: reserved, zero.
-    # sectors 16 + 17: FATs.
     fat_bytes = build_fat()
     img[16*SECTOR_SIZE:17*SECTOR_SIZE] = fat_bytes
     img[17*SECTOR_SIZE:18*SECTOR_SIZE] = fat_bytes
-    # sector 18 (cluster 2): root directory.
+    # cluster 2 = root dir
     img[18*SECTOR_SIZE:19*SECTOR_SIZE] = build_root_dir(
         hello_cluster=3, hello_size=len(HELLO_BODY),
+        subdir_cluster=4,
     )
-    # sector 19 (cluster 3): HELLO.TXT contents.
-    img[19*SECTOR_SIZE:20*SECTOR_SIZE] = build_hello_cluster()
+    # cluster 3 = HELLO.TXT
+    img[19*SECTOR_SIZE:20*SECTOR_SIZE] = build_file_cluster(HELLO_BODY)
+    # cluster 4 = SUBDIR/
+    img[20*SECTOR_SIZE:21*SECTOR_SIZE] = build_subdir_dir(
+        nested_cluster=5, nested_size=len(NESTED_BODY),
+    )
+    # cluster 5 = SUBDIR/NESTED.TXT
+    img[21*SECTOR_SIZE:22*SECTOR_SIZE] = build_file_cluster(NESTED_BODY)
     return bytes(img)
 
 
@@ -196,3 +244,4 @@ if __name__ == "__main__":
           f"{TOTAL_SECTORS} sectors of {SECTOR_SIZE})")
     print(f"Wrote {img_dest} (raw, same bytes)")
     print(f"  embedded /mnt/HELLO.TXT ({len(HELLO_BODY)} bytes)")
+    print(f"  embedded /mnt/SUBDIR/NESTED.TXT ({len(NESTED_BODY)} bytes)")
