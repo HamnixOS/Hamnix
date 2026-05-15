@@ -716,6 +716,19 @@ class X86CodeGen:
             case BinOp.SHR:
                 # Logical shift right (Pynux ints are non-negative for M2).
                 self.emit("    shrq %cl, %rax")
+            case BinOp.DIV | BinOp.IDIV:
+                # divq divides %rdx:%rax by the operand and leaves the
+                # quotient in %rax, remainder in %rdx. We zero %rdx for
+                # an unsigned 64/64 → 64 division — Pynux uint types
+                # all share the 64-bit encoding, and current call sites
+                # (PIT divisor math) are non-negative. When signed
+                # division is needed we'll branch on operand type.
+                self.emit("    xorq %rdx, %rdx")
+                self.emit("    divq %rcx")
+            case BinOp.MOD:
+                self.emit("    xorq %rdx, %rdx")
+                self.emit("    divq %rcx")
+                self.emit("    movq %rdx, %rax")
             case BinOp.EQ:
                 self._cmp_set("e")
             case BinOp.NEQ:

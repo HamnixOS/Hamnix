@@ -25,6 +25,7 @@
 # arch/x86/include/asm/desc_defs.h so future readers can diff.
 
 extern def get_trap_stub(vector: uint64) -> uint64
+extern def get_irq_stub(vector: uint64) -> uint64
 extern def idt_load(idt_table_addr: uint64)
 
 KERNEL_CS:      uint64 = 0x08    # 64-bit code segment in boot GDT
@@ -51,13 +52,20 @@ def idt_set_gate(vector: uint64, handler: uint64):
 
 
 def idt_init():
-    # Fill the 32 CPU exception vectors. Vectors 32..255 stay zero
-    # (Present=0); a stray interrupt to one of them would trap as
-    # "gate not present" — but with no IRQs enabled and no devices
-    # wired, none should fire.
+    # Vectors 0..31: CPU exceptions, halt-on-fault traps.
     i: uint64 = 0
     while i < 32:
         handler: uint64 = get_trap_stub(i)
+        idt_set_gate(i, handler)
+        i = i + 1
+
+    # Vectors 32..47: legacy 8259 IRQs (after the i8259 remap). These
+    # use the iretq-returning IRQ entry path, not the halt-on-fault
+    # trap path. Vectors 48..255 stay Present=0 — APIC/MSI not yet
+    # implemented.
+    i = 32
+    while i < 48:
+        handler: uint64 = get_irq_stub(i)
         idt_set_gate(i, handler)
         i = i + 1
 

@@ -1,0 +1,98 @@
+# arch/x86/kernel/i8259.py
+#
+# Mirrors arch/x86/kernel/i8259.c in Linux. Drives the legacy
+# Intel 8259A Programmable Interrupt Controller pair (master @ I/O
+# 0x20/0x21, slave @ 0xA0/0xA1). The PIC raises IRQs 0..15; the boot
+# firmware leaves them mapped onto CPU vectors 0x08..0x0F (master) and
+# 0x70..0x77 (slave), which collide with CPU exception vectors. We
+# remap to 0x20..0x2F so vectors stay in lane.
+
+PIC_MASTER_CMD:  int32 = 0x20
+PIC_MASTER_DATA: int32 = 0x21
+PIC_SLAVE_CMD:   int32 = 0xA0
+PIC_SLAVE_DATA:  int32 = 0xA1
+
+# ICW1: edge-triggered, cascade, ICW4 needed (1 = ICW4 follows; 4 = single-PIC off → cascade).
+ICW1_INIT_ICW4: int32 = 0x11
+# ICW2: vector base. Master gets 0x20, slave gets 0x28.
+PIC_MASTER_OFFSET: int32 = 0x20
+PIC_SLAVE_OFFSET:  int32 = 0x28
+# ICW3: master tells which IRQ has the slave (bit 2 = IRQ2); slave gets its cascade id (2).
+ICW3_MASTER_SLAVE_IRQ2: int32 = 0x04
+ICW3_SLAVE_CASCADE_ID:  int32 = 0x02
+# ICW4: 8086 mode.
+ICW4_8086_MODE: int32 = 0x01
+
+PIC_EOI: int32 = 0x20
+
+
+def io_wait():
+    # Several spec-compliant PIC clones latch a write only after a few
+    # bus cycles. Writing to unused port 0x80 is the canonical short
+    # delay (POST checkpoint port; harmless on every PC since 1981).
+    outb(0, 0x80)
+
+
+def i8259_init():
+    # Save current masks first so anything ALREADY routed (vestigial
+    # firmware programming) gets restored after init. For first boot
+    # the masks are usually 0xFF/0xFF (all masked) which is also our
+    # final state, but reading first matches what Linux does.
+    saved_master: int32 = inb(PIC_MASTER_DATA)
+    saved_slave:  int32 = inb(PIC_SLAVE_DATA)
+
+    # ICW1: start init sequence in cascade mode.
+    outb(ICW1_INIT_ICW4, PIC_MASTER_CMD)
+    io_wait()
+    outb(ICW1_INIT_ICW4, PIC_SLAVE_CMD)
+    io_wait()
+
+    # ICW2: vector offsets.
+    outb(PIC_MASTER_OFFSET, PIC_MASTER_DATA)
+    io_wait()
+    outb(PIC_SLAVE_OFFSET, PIC_SLAVE_DATA)
+    io_wait()
+
+    # ICW3: cascade wiring.
+    outb(ICW3_MASTER_SLAVE_IRQ2, PIC_MASTER_DATA)
+    io_wait()
+    outb(ICW3_SLAVE_CASCADE_ID, PIC_SLAVE_DATA)
+    io_wait()
+
+    # ICW4: 8086 mode (vs MCS-80/85).
+    outb(ICW4_8086_MODE, PIC_MASTER_DATA)
+    io_wait()
+    outb(ICW4_8086_MODE, PIC_SLAVE_DATA)
+    io_wait()
+
+    # All IRQs masked initially. Callers unmask explicitly via
+    # i8259_unmask_irq() once their handlers are wired into the IDT.
+    outb(0xFF, PIC_MASTER_DATA)
+    outb(0xFF, PIC_SLAVE_DATA)
+
+
+def i8259_unmask_irq(irq: int32):
+    # IRQs 0..7 live in the master mask; 8..15 in the slave.
+    if irq < 8:
+        cur: int32 = inb(PIC_MASTER_DATA)
+        outb(cur & ~(1 << irq), PIC_MASTER_DATA)
+    else:
+        cur: int32 = inb(PIC_SLAVE_DATA)
+        outb(cur & ~(1 << (irq - 8)), PIC_SLAVE_DATA)
+
+
+def i8259_mask_irq(irq: int32):
+    if irq < 8:
+        cur: int32 = inb(PIC_MASTER_DATA)
+        outb(cur | (1 << irq), PIC_MASTER_DATA)
+    else:
+        cur: int32 = inb(PIC_SLAVE_DATA)
+        outb(cur | (1 << (irq - 8)), PIC_SLAVE_DATA)
+
+
+def i8259_send_eoi(irq: int32):
+    # IRQs 8..15 came through the slave first, so they need EOIs to
+    # both PICs (slave first, then master via the cascade IRQ2 line).
+    if irq >= 8:
+        outb(PIC_EOI, PIC_SLAVE_CMD)
+    outb(PIC_EOI, PIC_MASTER_CMD)
