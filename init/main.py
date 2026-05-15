@@ -8,26 +8,52 @@
 # call ordering aligned with Linux so the diff against init/main.c
 # stays readable.
 #
-# As of M16.2:
-#   - setup_early_printk()  → drivers/tty/serial/early_8250.py
-#   - trap_init() (→ idt_init() in arch/x86/kernel/idt.py)
-#   - Smoke test: trigger INT3 to confirm the trap path is alive.
-#     The do_trap handler prints "TRAP: vector 0x03 err=0x00" and
-#     halts; if the handler is wrong we'd triple-fault and reset.
+# As of M16.3:
+#   - setup_early_printk() → drivers/tty/serial/early_8250.py
+#   - trap_init()          → arch/x86/kernel/idt.py
+#   - mem_init()           → arch/x86/mm/init.py (memblock bring-up)
+#   - Smoke tests: three memblock allocations + INT3.
 
-from drivers.tty.serial.early_8250 import setup_early_printk, early_puts
+from drivers.tty.serial.early_8250 import (
+    setup_early_printk, early_puts, early_print_hex64,
+)
 from arch.x86.kernel.idt import idt_init
 from arch.x86.kernel.traps import do_trap   # exported so common_trap sees it
+from arch.x86.mm.init import mem_init
+from mm.memblock import memblock_alloc, memblock_used, memblock_avail
 
 extern def trigger_int3()
 
 
 def trap_init():
     # Mirrors trap_init() in arch/x86/kernel/traps.c — sets up the IDT.
-    # Linux additionally registers per-vector handlers and IST stacks
-    # here; we have one common handler so this is currently a thin
-    # wrapper around idt_init().
     idt_init()
+
+
+def memblock_smoke_test():
+    early_puts("Pynux: memblock smoke test\n")
+
+    a: uint64 = memblock_alloc(128, 16)
+    early_puts("  alloc(128,16) = 0x")
+    early_print_hex64(a)
+    early_puts("\n")
+
+    b: uint64 = memblock_alloc(256, 64)
+    early_puts("  alloc(256,64) = 0x")
+    early_print_hex64(b)
+    early_puts("\n")
+
+    c: uint64 = memblock_alloc(64, 8)
+    early_puts("  alloc( 64, 8) = 0x")
+    early_print_hex64(c)
+    early_puts("\n")
+
+    early_puts("  used  = 0x")
+    early_print_hex64(memblock_used())
+    early_puts("\n")
+    early_puts("  avail = 0x")
+    early_print_hex64(memblock_avail())
+    early_puts("\n")
 
 
 def start_kernel():
@@ -36,10 +62,14 @@ def start_kernel():
     early_puts("Pynux: hello from start_kernel\n")
 
     trap_init()
-    early_puts("Pynux: trap_init done, triggering INT3\n")
+    early_puts("Pynux: trap_init done\n")
 
-    # Smoke test: this should land in do_trap with vector=3.
+    mem_init()
+    early_puts("Pynux: mem_init done\n")
+
+    memblock_smoke_test()
+
+    early_puts("Pynux: triggering INT3 (trap path final smoke)\n")
     trigger_int3()
 
-    # We do NOT expect to reach here — do_trap halts.
     early_puts("Pynux: ERROR — returned from trigger_int3\n")

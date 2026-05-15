@@ -67,3 +67,20 @@ def early_puts(s: Ptr[char]):
     while s[i] != 0:
         early_putc(s[i])
         i = i + 1
+
+
+def early_hex_digit(nibble: uint64) -> int32:
+    if nibble < 10:
+        return cast[int32](nibble) + 48        # '0'
+    return cast[int32](nibble) + 87            # 'a' = 10 + 87
+
+
+def early_print_hex64(value: uint64):
+    # Fixed-width 16-digit lowercase hex, no "0x" prefix. Mirrors how
+    # Linux's early_printk(%016llx) renders pointers in early-boot
+    # dmesg lines — keeps the column alignment of memory dumps stable.
+    shift: int32 = 60
+    while shift >= 0:
+        nibble: uint64 = (value >> cast[uint64](shift)) & 0xF
+        early_putc(early_hex_digit(nibble))
+        shift = shift - 4
