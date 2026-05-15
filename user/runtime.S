@@ -215,3 +215,28 @@ sys_kill:
     syscall
     ret
     .size sys_kill, .-sys_kill
+
+
+    /* --- sys_dup(oldfd) -> int32 -------------------------------------
+     * Allocate the smallest free fd; copy oldfd's backing into it.
+     * Pipe refcounts get bumped so closing oldfd later doesn't
+     * affect the dup. Returns the new fd or -EBADF / -EMFILE. */
+    .globl sys_dup
+    .type sys_dup, @function
+sys_dup:
+    movq    $16, %rax               /* SYS_DUP */
+    syscall
+    ret
+    .size sys_dup, .-sys_dup
+
+
+    /* --- sys_dup2(oldfd, newfd) -> int32 -----------------------------
+     * Close newfd (if open) and copy oldfd into it. POSIX behaviour:
+     * if oldfd == newfd this is a no-op and returns newfd. */
+    .globl sys_dup2
+    .type sys_dup2, @function
+sys_dup2:
+    movq    $17, %rax               /* SYS_DUP2 */
+    syscall
+    ret
+    .size sys_dup2, .-sys_dup2

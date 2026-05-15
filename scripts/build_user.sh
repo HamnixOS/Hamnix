@@ -45,3 +45,4 @@ build_adder_user hamsh                # M16.35: interactive shell
 build_adder_user ps                   # M16.36: dumps /proc snapshots
 build_adder_user echo                 # M16.37: writes argv to stdout
 build_adder_user cat                  # M16.37: streams files to stdout
+build_adder_user dup_demo             # M16.41: exercises sys_dup / sys_dup2
