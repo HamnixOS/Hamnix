@@ -131,6 +131,18 @@ if [ -d /sys/pynux ]; then
     echo "[PYNUX] --- end /sys/pynux/info ---"
 fi
 
+if grep -qE '^[ 0-9]*241 pynurand$' /proc/devices 2>/dev/null; then
+    echo "[PYNUX] --- exercise /dev/pynurand ---"
+    mknod /dev/pynurand c 241 0
+    bytes=$(dd if=/dev/pynurand bs=8 count=1 2>/dev/null | wc -c)
+    if [ "$bytes" = "8" ]; then
+        echo "[PYNUX] random ok"
+    else
+        echo "[PYNUX] random FAILED (got $bytes bytes)"
+    fi
+    rm -f /dev/pynurand
+fi
+
 if grep -qE '^[ 0-9]*240 pynux$' /proc/devices 2>/dev/null; then
     echo "[PYNUX] --- exercise /dev/pynux ---"
     mknod /dev/pynux c 240 0

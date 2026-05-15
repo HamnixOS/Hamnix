@@ -14,12 +14,25 @@ kernel built up subsystem by subsystem.
 
 | Milestone | Description | Status |
 |-----------|-------------|--------|
-| M1 | Hello-world `.ko` written in Pynux that loads, `_printk`s, and unloads under QEMU | **Done** |
-| M2 | 16550A UART serial console driver in pure Pynux — registered with the kernel as a real `struct console` so printk traffic flows through Pynux code | **Done** |
-| M3.1 | `/proc/pynux/state` — procfs entry whose `show` callback is implemented in Pynux | **Done** |
-| M3.2 | `/dev/pynuxdisk` — 8 MiB block device with a Pynux `submit_bio` handler (registration path; full bio walk follow-up) | **Done** |
-| M3.3 | ramfs-class filesystem (mount + file create/write/read + mkdir/rm/rmdir + umount) | **Done** |
-| M3.4 | virtio-blk driver | Deferred |
+| M1 | hello-world `.ko` — loads, `_printk`s, unloads | **Done** |
+| M2 | 16550A serial console — printk traffic routed through Pynux `pynux_console_write` (RIP-relative `outb`+LSR poll) | **Done** |
+| M3.1 | `/proc/pynux/state` — procfs entry with Pynux seq_file show callback | **Done** |
+| M3.2 | `/dev/pynuxdisk` — 8 MiB block device, Pynux `submit_bio` | **Done** |
+| M3.3 | `pynuxfs` ramfs-class filesystem — mount + file write/read + mkdir/rm/rmdir + umount | **Done** |
+| M4.1 | UART RX via `request_threaded_irq` — IRQ handler in hardirq context, spinlock-guarded counter, wait_queue wake-up, `asm_volatile("pause")` | **Done** |
+| M4.2 | virtio-blk — find_vqs via vtable, dma_alloc_attrs, virtqueue_add_sgs + kick → read sector 0 of disk image | **Done** |
+| M4.3a | kthread + workqueue — kthread_create_on_node + manual INIT_WORK + queue_work_on | **Done** |
+| M4.3b | virtio-net — register, probe, read MAC via vdev->config->get byte-by-byte, set up (rx, tx) vq pair | **Done** |
+| M5.1 | `/dev/pynux` char device — file_operations.read returns greeting via simple_read_from_buffer | **Done** |
+| M5.2 | kernel timer — init_timer_key + mod_timer + timer_delete, softirq-context callback | **Done** |
+| M5.3 | netfilter hook on NF_INET_PRE_ROUTING — every IPv4 packet goes through Pynux | **Done** |
+| M6.1 | slab cache — __kmem_cache_create_args + kmem_cache_alloc/free + kmalloc/kfree | **Done** |
+| M6.2 | hrtimer — nanosecond-precision timer, 5 ms relative, HRTIMER_NORESTART | **Done** |
+| M6.3 | mutex + completion — kthread takes mutex, signals completion; main waits | **Done** |
+| M7.1 | kprobe — intercepts every `__x64_sys_openat` call before kernel handler runs | **Done** |
+| M7.2 | sysfs — `/sys/pynux/info` via kobject_create_and_add + sysfs_create_file_ns | **Done** |
+| M7.3 | crypto — SHA-256("hello") via crypto_alloc_shash + crypto_shash_tfm_digest | **Done** |
+| M8.1 | `/dev/pynurand` — CSPRNG via get_random_bytes + _copy_to_user | **Done** |
 
 The microcontroller OS the project originally shipped (ARM Cortex-M,
 QEMU mps2-an385, RP2040, STM32F4) still compiles via the original ARM
@@ -57,15 +70,7 @@ sudo apt install qemu-system-x86 flex bison libelf-dev
 ./scripts/build_x86_kernel.sh        # ~10-25 min first time, cached after
 
 # Build + boot any kernel-module example and assert its expected output:
-./scripts/run_x86_module.sh kernel-modules/hello         # M1
-./scripts/run_x86_module.sh kernel-modules/m2-arith      # M2.0 compiler tier
-./scripts/run_x86_module.sh kernel-modules/m2-string     # M2.1 ptr/index
-./scripts/run_x86_module.sh kernel-modules/m2-outb       # M2.2 outb/inb
-./scripts/run_x86_module.sh kernel-modules/m2-strout     # M2.3 polled write
-./scripts/run_x86_module.sh kernel-modules/m2-console    # M2.4/5 register_console
-./scripts/run_x86_module.sh kernel-modules/m3-proc       # M3.1 /proc/pynux/state
-./scripts/run_x86_module.sh kernel-modules/m3-disk       # M3.2 /dev/pynuxdisk
-./scripts/run_x86_module.sh kernel-modules/m3-fs         # M3.3 pynuxfs filesystem
+for d in kernel-modules/*/; do ./scripts/run_x86_module.sh "$d"; done
 ```
 
 Each module directory has an `expected.txt` listing the serial-output
@@ -114,15 +119,29 @@ compiler/        Pynux compiler (CPython-hosted)
   optimizer.py   AST-level passes
 
 kernel-modules/  Pynux source for each module milestone
-  hello/         M1 hello-world
-  m2-arith/      M2.0 — params/locals/while/if
-  m2-string/     M2.1 — pointer indexing
-  m2-outb/       M2.2 — outb/inb intrinsics
-  m2-strout/     M2.3 — polled string write
-  m2-console/    M2.4 + M2.5 — struct console + register_console
-  m3-proc/       M3.1 — /proc/pynux/state via seq_file
-  m3-disk/       M3.2 — /dev/pynuxdisk block device
-  m3-fs/         M3.3 — pynuxfs mountable filesystem
+  hello/         M1   hello-world
+  m2-arith/      M2.0 params/locals/while/if
+  m2-string/     M2.1 pointer indexing
+  m2-outb/       M2.2 outb/inb intrinsics
+  m2-strout/     M2.3 polled string write
+  m2-console/    M2.4 struct console + register_console
+  m3-proc/       M3.1 /proc/pynux/state via seq_file
+  m3-disk/       M3.2 /dev/pynuxdisk block device
+  m3-fs/         M3.3 pynuxfs mountable filesystem
+  m4-uart-rx/    M4.1 UART RX IRQ + spinlock + wait_queue
+  m4-virtio-blk/ M4.2 virtio-blk read sector 0
+  m4-kthread-wq/ M4.3a kthread + workqueue
+  m4-virtio-net/ M4.3b virtio-net probe + MAC read + vq setup
+  m5-chrdev/     M5.1 /dev/pynux char device
+  m5-timer/      M5.2 jiffies-based kernel timer
+  m5-netfilter/  M5.3 netfilter hook on NF_INET_PRE_ROUTING
+  m6-slab/       M6.1 slab cache + kmalloc
+  m6-hrtimer/    M6.2 high-resolution timer
+  m6-sync/       M6.3 mutex + completion
+  m7-kprobe/     M7.1 kprobe intercepting __x64_sys_openat
+  m7-sysfs/      M7.2 /sys/pynux/info kobject
+  m7-crypto/     M7.3 SHA-256 via kernel crypto API
+  m8-random/     M8.1 /dev/pynurand via get_random_bytes
 
 scripts/         x86 dev-loop infrastructure
   build_x86_kernel.sh    Fetch + build mitigations-off Linux for QEMU
