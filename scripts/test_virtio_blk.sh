@@ -60,10 +60,10 @@ cat "$LOG"
 echo "[test_virtio_blk] --- end output ---"
 
 fail=0
-if grep -F -q "using /dev/vda" "$LOG"; then
-    echo "[test_virtio_blk] OK: virtio-blk took precedence"
+if grep -F -q "/dev/vda probed FAT" "$LOG"; then
+    echo "[test_virtio_blk] OK: virtio-blk vda detected as FAT"
 else
-    echo "[test_virtio_blk] MISS: 'using /dev/vda' not in log"
+    echo "[test_virtio_blk] MISS: '/dev/vda probed FAT' not in log"
     fail=1
 fi
 if grep -F -q "FAT32_MARKER" "$LOG"; then
