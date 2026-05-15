@@ -25,6 +25,7 @@
 
 from drivers.tty.serial.early_8250 import early_putc
 from kernel.printk.printk import printk0, printk1, printk2
+from arch.x86.kernel.time import get_jiffies
 
 extern def write_msr(index: uint32, value: uint64)
 extern def read_msr(index: uint32) -> uint64
@@ -38,9 +39,10 @@ IA32_STAR:  uint32 = 0xC0000081
 IA32_LSTAR: uint32 = 0xC0000082
 IA32_FMASK: uint32 = 0xC0000084
 
-# Syscall numbers — kept tiny and demo-focused for M16.17.
-SYS_PUTC: uint64 = 0
-SYS_EXIT: uint64 = 1
+# Syscall numbers — kept tiny and demo-focused.
+SYS_PUTC:        uint64 = 0
+SYS_EXIT:        uint64 = 1
+SYS_GET_JIFFIES: uint64 = 2
 
 # Single-CPU stash slots used by the syscall entry stub to flip
 # between user RSP and kernel RSP. Regular globals (not Percpu[T])
@@ -88,9 +90,11 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         early_putc(cast[int32](a0 & 0xFF))
         return 0
     if nr == SYS_EXIT:
-        printk0("Pynux: user task exited via SYS_EXIT, halting\n")
+        printk1("Pynux: user exited; jiffies=%d, halting\n", get_jiffies())
         local_irq_disable()
         while True:
             asm_volatile("hlt")
+    if nr == SYS_GET_JIFFIES:
+        return get_jiffies()
     printk2("Pynux: unknown syscall nr=%d a0=%x\n", nr, a0)
     return cast[uint64](-1)

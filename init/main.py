@@ -47,6 +47,7 @@ from drivers.video.console.vga_text import (
 
 extern def enter_user_mode(entry: uint64, stack: uint64)
 extern def user_demo_entry()
+extern def tss_init(rsp0: uint64)
 from mm.memblock import memblock_alloc, memblock_used, memblock_avail
 from mm.page_alloc import (
     alloc_page, free_page, alloc_pages, free_pages,
@@ -433,9 +434,16 @@ def start_kernel():
     user_stack:     uint64 = alloc_page() + 4096
 
     syscall_init(syscall_kstack)
+    # TSS / RSP0 lets the CPU find a kernel stack when an IRQ fires
+    # while CPL=3. Reuse the same stack as syscall entry — only one
+    # of the two paths is ever active at a time on uniprocessor.
+    tss_init(syscall_kstack)
     printk2("Pynux: kernel syscall stack @ %p, user stack @ %p\n",
             syscall_kstack, user_stack)
-    printk0("Pynux: entering ring-3 user_demo_entry...\n")
+    # IRQs are still off in the boot context. They'll be enabled
+    # atomically with the iretq into user_demo_entry below — the iret
+    # frame has RFLAGS = 0x202 (IF=1).
+    printk0("Pynux: entering ring-3 user_demo_entry (IF=1, TSS armed)...\n")
     enter_user_mode(cast[uint64](&user_demo_entry), user_stack)
     # NOT REACHED — user task hits SYS_EXIT which halts the box.
     printk0("Pynux: ERROR — returned from enter_user_mode\n")

@@ -140,10 +140,18 @@ def schedule():
     # Called from timer_interrupt() in arch/x86/kernel/time.py.
     # Round-robin between the worker slots. Replace with a proper
     # rq->cfs when fairness becomes a concern.
+    #
+    # No-op when there are no kernel tasks to switch to — this covers
+    # the M16.17 / M16.19 path where start_kernel drops directly into
+    # a userspace task without registering kernel threads. The timer
+    # ISR still fires (bumping jiffies, etc.); schedule() just bails
+    # because the next slot's sp == 0 and there's nothing to load.
     prev: uint64 = current_idx
     nxt:  uint64 = current_idx + 1
     if nxt >= NTASKS:
         nxt = 0
+    if task_table[nxt].sp == 0:
+        return
     current_idx = nxt
     __switch_to_asm(cast[Ptr[uint8]](&task_table[prev]),
                     cast[Ptr[uint8]](&task_table[nxt]))

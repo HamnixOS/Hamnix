@@ -159,6 +159,13 @@ gdt64:
     .quad   0x00CFF2000000FFFF
     /* 0x20: user 64-bit code: P=1, DPL=3, S=1, type=code/exec/read, L=1 */
     .quad   0x00AFFA000000FFFF
+    /* 0x28: TSS descriptor low half  (filled in by tss_init at runtime).
+     * 0x30: TSS descriptor high half (filled in by tss_init at runtime).
+     * 64-bit system descriptors occupy two consecutive GDT slots. We
+     * reserve the space here so the GDT's limit stays correct from
+     * boot; the contents are zero until tss_init programs them. */
+    .quad   0x0000000000000000
+    .quad   0x0000000000000000
 gdt64_end:
 
 gdt64_descriptor:

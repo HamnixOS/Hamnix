@@ -135,7 +135,7 @@ enter_user_mode:
      */
     pushq   $0x1B                      /* SS                          */
     pushq   %rsi                       /* RSP                         */
-    pushq   $0x002                     /* RFLAGS                      */
+    pushq   $0x202                     /* RFLAGS (IF=1 - timer fires) */
     pushq   $0x23                      /* CS                          */
     pushq   %rdi                       /* RIP                         */
     iretq
@@ -180,7 +180,22 @@ user_demo_entry:
     movb    $'O',  %dil; movq $0, %rax; syscall
     movb    $'\n', %dil; movq $0, %rax; syscall
 
-    /* SYS_EXIT — kernel halts the box; never returns. */
+    /* --- Spin loop: prove timer IRQs from CPL=3 work via TSS.RSP0 ---
+     * 50M pause iterations at ~3 cycles each → ~150 ms wall time at
+     * a typical QEMU virtual clock. At HZ=100 that's ~15 timer ticks
+     * firing while we're at CPL 3. Without TSS those would fault.   */
+    movq    $50000000, %rcx
+.Luser_spin:
+    pause
+    decq    %rcx
+    jnz     .Luser_spin
+
+    /* Print 'X' to show the loop finished without crashing. */
+    movb    $'X',  %dil; movq $0, %rax; syscall
+    movb    $'\n', %dil; movq $0, %rax; syscall
+
+    /* SYS_EXIT — kernel halts the box and reports jiffies; if it
+     * advanced above 0, timer fired during the user-mode spin. */
     movq    $1, %rax
     syscall
 
