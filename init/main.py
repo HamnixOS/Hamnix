@@ -20,6 +20,7 @@ from drivers.tty.serial.early_8250 import (
 from arch.x86.kernel.idt import idt_init
 from arch.x86.kernel.traps import do_trap   # exported so common_trap sees it
 from arch.x86.mm.init import mem_init
+from arch.x86.kernel.setup_percpu import setup_per_cpu_areas, get_cpu_id
 from mm.memblock import memblock_alloc, memblock_used, memblock_avail
 
 extern def trigger_int3()
@@ -68,6 +69,11 @@ def start_kernel():
     early_puts("Pynux: mem_init done\n")
 
     memblock_smoke_test()
+
+    setup_per_cpu_areas()
+    early_puts("Pynux: smp_processor_id() = ")
+    early_print_hex64(get_cpu_id())
+    early_puts("\n")
 
     early_puts("Pynux: triggering INT3 (trap path final smoke)\n")
     trigger_int3()
