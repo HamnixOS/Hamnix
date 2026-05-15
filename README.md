@@ -33,6 +33,7 @@ kernel built up subsystem by subsystem.
 | M7.2 | sysfs — `/sys/pynux/info` via kobject_create_and_add + sysfs_create_file_ns | **Done** |
 | M7.3 | crypto — SHA-256("hello") via crypto_alloc_shash + crypto_shash_tfm_digest | **Done** |
 | M8.1 | `/dev/pynurand` — CSPRNG via get_random_bytes + _copy_to_user | **Done** |
+| M8.2 | atomic_t — two kthreads × 1000 atomic increments via `lock incl` inline asm = exactly 2000 | **Done** |
 
 The microcontroller OS the project originally shipped (ARM Cortex-M,
 QEMU mps2-an385, RP2040, STM32F4) still compiles via the original ARM
@@ -142,6 +143,7 @@ kernel-modules/  Pynux source for each module milestone
   m7-sysfs/      M7.2 /sys/pynux/info kobject
   m7-crypto/     M7.3 SHA-256 via kernel crypto API
   m8-random/     M8.1 /dev/pynurand via get_random_bytes
+  m8-atomic/     M8.2 atomic_t via `lock incl` inline asm
 
 scripts/         x86 dev-loop infrastructure
   build_x86_kernel.sh    Fetch + build mitigations-off Linux for QEMU
