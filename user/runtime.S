@@ -37,9 +37,15 @@
      */
     .globl _start
 _start:
+    /* The kernel pre-loaded %rdi = argc, %rsi = argv before iretq/
+     * sysretq landed us here (see arch/x86/kernel/sched/core.ad's
+     * _build_initial_kstack and syscall_64.S's do_execve_finish).
+     * `call main` does not clobber rdi/rsi beforehand, so they
+     * forward directly as main()'s first two SysV arguments. Main
+     * functions that don't declare argc/argv simply ignore them. */
     call    main
     /* main returns int32 in %eax. Sign-extend to %rdi so SYS_EXIT
-     * sees a clean exit code (the kernel currently only logs it). */
+     * sees a clean exit code. */
     movslq  %eax, %rdi
     movq    $1, %rax                /* SYS_EXIT */
     syscall
@@ -138,3 +144,33 @@ sys_getpid:
     syscall
     ret
     .size sys_getpid, .-sys_getpid
+
+
+    /* --- sys_execve(path, argv) -- never returns on success ---------- */
+    .globl sys_execve
+    .type sys_execve, @function
+sys_execve:
+    movq    $10, %rax               /* SYS_EXECVE */
+    syscall
+    ret                             /* only reached on failure */
+    .size sys_execve, .-sys_execve
+
+
+    /* --- sys_spawn(path, argv) -> int32 (child pid or -errno) ------- */
+    .globl sys_spawn
+    .type sys_spawn, @function
+sys_spawn:
+    movq    $11, %rax               /* SYS_SPAWN */
+    syscall
+    ret
+    .size sys_spawn, .-sys_spawn
+
+
+    /* --- sys_waitpid(pid) -> int64 (child exit_code or -errno) ------ */
+    .globl sys_waitpid
+    .type sys_waitpid, @function
+sys_waitpid:
+    movq    $12, %rax               /* SYS_WAITPID */
+    syscall
+    ret
+    .size sys_waitpid, .-sys_waitpid

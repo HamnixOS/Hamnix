@@ -56,6 +56,11 @@ class TaskStruct:
     # kernel-half sharing scheme Linux uses, just without separate
     # user-half mappings yet.
     cr3:          uint64              # offset 112
+    # Parent pid + exit code for the wait/spawn pair (M16.35). pid 0
+    # = no parent recorded (the boot-time /init task). exit_code is
+    # only meaningful after state == STATE_EXITED.
+    parent_pid:   uint64              # offset 120
+    exit_code:    int64               # offset 128
 
 
 # State constants (mirror Linux's task->state space at a tiny scope).
@@ -91,6 +96,11 @@ def _build_initial_kstack(kstack_top: uint64, iret_cs: uint64,
     # pops the 6 and rets, control lands in kthread_bootstrap which
     # iretq's into iret_rip with iret_cs / iret_rsp / iret_ss /
     # RFLAGS = RFLAGS_INITIAL.
+    #
+    # The 9 caller-saved slots are zeroed here. Tasks that want to
+    # land in user-mode with non-zero %rdi / %rsi (SYS_SPAWN with
+    # argc / argv) call _plant_user_args() afterwards — keeping
+    # this helper at <= 6 params so it fits the current x86 backend.
     sp: uint64 = kstack_top
 
     sp = sp - 8
@@ -129,6 +139,25 @@ def _build_initial_kstack(kstack_top: uint64, iret_cs: uint64,
         i = i + 1
 
     return sp
+
+
+# Offsets of the rdi / rsi slots within the 9-caller-saved block
+# kthread_bootstrap pops just before iretq. Numbers come from the
+# stack layout assembled in _build_initial_kstack (high address to
+# low: iret-ss/rsp/rflags/cs/rip + 8B error code + 8B vector + the
+# 9 caller-saved r11/r10/r9/r8/rdi/rsi/rdx/rcx/rax). The 5-quad iret
+# frame plus 2-quad vec/ec puts r11 at top-32-56; rdi lands four
+# slots below r11.
+_KSTACK_RDI_OFFSET_FROM_TOP: uint64 = 96         # iret(40) + vec/ec(16) + 4*8
+_KSTACK_RSI_OFFSET_FROM_TOP: uint64 = 104
+
+
+def _plant_user_args(kstack_top: uint64, argc: uint64, argv: uint64):
+    # Write argc/argv into the rdi/rsi slots that kthread_bootstrap
+    # pops just before iretq. Called by create_user_task_argv when
+    # the new task should see argc/argv in its first %rdi/%rsi.
+    cast[Ptr[uint64]](kstack_top - _KSTACK_RDI_OFFSET_FROM_TOP)[0] = argc
+    cast[Ptr[uint64]](kstack_top - _KSTACK_RSI_OFFSET_FROM_TOP)[0] = argv
 
 
 # --- public: slot management ---------------------------------------
@@ -186,23 +215,46 @@ def kthread_create(entry: uint64, name0: uint64) -> int32:
 
 
 def create_user_task(entry: uint64, name0: uint64) -> int32:
+    # Backwards-compatible wrapper around the argv-aware version
+    # below — used by SYS_CLONE and the boot path, neither of which
+    # cares about argc/argv (their user binaries don't read rdi/rsi).
+    return create_user_task_argv(entry, name0, 0, 0, 0)
+
+
+def create_user_task_argv(entry: uint64, name0: uint64,
+                          user_rsp: uint64, argc: uint64,
+                          argv: uint64) -> int32:
     # Allocate kstack + ustack, build a freshly-preempted-looking
     # stack image whose iret frame returns to CPL=3 at `entry`.
+    # If `user_rsp` is non-zero the caller is supplying a stack with
+    # argv strings + array already laid out at its top; we just plant
+    # that address in the iret frame. Otherwise we allocate a fresh
+    # page and use its top. argc / argv are written into the rdi /
+    # rsi slots so the first iretq into _start delivers them as the
+    # standard SysV first two arguments.
     slot: int32 = _find_free_slot()
     if slot < 0:
         printk0("create_user_task: no free task slot\n")
         return -1
 
     kstack: uint64 = alloc_page()
-    ustack: uint64 = alloc_page()
-    if kstack == 0 or ustack == 0:
+    if kstack == 0:
         return -1
     kstack_top: uint64 = kstack + KSTACK_SIZE
-    ustack_top: uint64 = ustack + USTACK_SIZE
+
+    ustack: uint64 = 0
+    ustack_top: uint64 = user_rsp
+    if user_rsp == 0:
+        ustack = alloc_page()
+        if ustack == 0:
+            return -1
+        ustack_top = ustack + USTACK_SIZE
 
     sp: uint64 = _build_initial_kstack(
         kstack_top, USER_CS_R3, USER_DS_R3, ustack_top, entry,
     )
+    if argc != 0 or argv != 0:
+        _plant_user_args(kstack_top, argc, argv)
 
     s: uint64 = cast[uint64](slot)
     task_table[s].sp          = sp
@@ -213,6 +265,8 @@ def create_user_task(entry: uint64, name0: uint64) -> int32:
     task_table[s].state       = STATE_READY
     task_table[s].is_user     = 1
     task_table[s].name0       = name0
+    task_table[s].parent_pid  = task_table[current_idx].pid
+    task_table[s].exit_code   = 0
     # Per-task PML4: clone the BSP's so the kernel half is mapped
     # identically (lower-level PDPT/PD tables are shared). When we
     # add user-only private mappings, they live inside this PML4
@@ -289,11 +343,15 @@ def schedule():
                     cast[Ptr[uint8]](&task_table[nxt]))
 
 
-def task_exit_current():
-    # Mark the current task EXITED and yield. Stacks intentionally
-    # NOT freed (no reclaim path yet — that's a slab + RCU follow-up).
+def task_exit_current(code: int64):
+    # Mark the current task EXITED, record exit code, and yield.
+    # Stacks intentionally NOT freed (no reclaim path yet — that's a
+    # slab + RCU follow-up). The exit_code is consumed by a parent
+    # in SYS_WAITPID; with no parent the value is simply unread.
+    task_table[current_idx].exit_code = code
     task_table[current_idx].state = STATE_EXITED
-    printk1("task: pid %d exited\n", task_table[current_idx].pid)
+    printk2("task: pid %d exited (code=%d)\n",
+            task_table[current_idx].pid, cast[uint64](code))
     schedule()
     # schedule() never returns when we're EXITED — it halts if there
     # are no other ready tasks, or switches us out forever.
@@ -343,6 +401,36 @@ def task_pml4(slot: int32) -> uint64:
     # Caller-side accessor — saves init/main.py from poking
     # task_table directly across the module boundary.
     return task_table[cast[uint64](slot)].cr3
+
+
+def task_lookup_by_pid(pid: uint64) -> int32:
+    # Linear scan — NTASKS is 4 so this is cheap; switches to a
+    # hashed pidmap when the runqueue grows. Returns -1 on miss.
+    i: uint64 = 0
+    while i < NTASKS:
+        if task_table[i].pid == pid and task_table[i].state != STATE_FREE:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def task_state(slot: int32) -> uint64:
+    return task_table[cast[uint64](slot)].state
+
+
+def task_exit_code(slot: int32) -> int64:
+    return task_table[cast[uint64](slot)].exit_code
+
+
+def task_pid_at(slot: int32) -> uint64:
+    return task_table[cast[uint64](slot)].pid
+
+
+def yield_to_others():
+    # Cooperatively call schedule() while we're still RUNNING. Used
+    # by SYS_WAITPID to spin without burning all CPU between timer
+    # ticks — schedule() will round-robin to any other ready task.
+    schedule()
 
 
 def _init_fd_table(slot: uint64):

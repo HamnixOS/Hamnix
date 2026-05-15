@@ -68,10 +68,13 @@ _start:
     movq    $8, %rax
     syscall
 
-    /* execve("/hello") — replaces this task's user image with the
-     * /hello binary. SYS_EXECVE never returns on success, so the
-     * SYS_EXIT below only runs if the exec fails. */
+    /* execve("/hello", NULL) — replaces this task's user image with
+     * the /hello binary. As of M16.35 SYS_EXECVE takes a1 = argv;
+     * we pass NULL because /hello takes no args. SYS_EXECVE never
+     * returns on success, so the SYS_EXIT below only runs if the
+     * exec fails. */
     leaq    init_path_hello(%rip), %rdi
+    xorq    %rsi, %rsi              /* argv = NULL */
     movq    $10, %rax               /* SYS_EXECVE */
     syscall
 

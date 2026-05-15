@@ -27,8 +27,9 @@ from drivers.tty.serial.early_8250 import early_putc
 from kernel.printk.printk import printk0, printk1, printk2
 from arch.x86.kernel.time import get_jiffies
 from kernel.sched.core import (
-    create_user_task, task_exit_current,
-    current_task_pid,
+    create_user_task, create_user_task_argv, task_exit_current,
+    current_task_pid, task_lookup_by_pid, task_state, task_exit_code,
+    task_pid_at, yield_to_others, STATE_EXITED,
 )
 from fs.vfs import (
     vfs_open, vfs_read, vfs_write, vfs_close, vfs_lseek,
@@ -37,7 +38,8 @@ from fs.vfs import (
 from fs.elf import elf_load_blob
 from mm.page_alloc import alloc_page
 
-extern def do_execve_finish(new_rip: uint64, new_rsp: uint64)
+extern def do_execve_finish(new_rip: uint64, new_rsp: uint64,
+                            argc: uint64, argv: uint64)
 
 extern def write_msr(index: uint32, value: uint64)
 extern def read_msr(index: uint32) -> uint64
@@ -46,6 +48,7 @@ extern def syscall_entry()
 extern def enter_user_mode(entry: uint64, stack: uint64)
 extern def user_demo_entry()
 extern def local_irq_disable()
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
 IA32_STAR:  uint32 = 0xC0000081
 IA32_LSTAR: uint32 = 0xC0000082
@@ -62,23 +65,114 @@ SYS_READ:        uint64 = 6                    # a0=fd, a1=buf, a2=count
 SYS_CLOSE:       uint64 = 7
 SYS_WRITE:       uint64 = 8                    # a0=fd, a1=buf, a2=count
 SYS_LSEEK:       uint64 = 9                    # a0=fd, a1=offset, a2=whence
-SYS_EXECVE:      uint64 = 10                   # a0 = path; never returns
+SYS_EXECVE:      uint64 = 10                   # a0=path, a1=argv; never returns on success
+SYS_SPAWN:       uint64 = 11                   # a0=path, a1=argv; returns child pid
+SYS_WAITPID:     uint64 = 12                   # a0=pid; returns child exit_code
 
-# Single-CPU stash slots used by the syscall entry stub to flip
-# between user RSP and kernel RSP. Regular globals (not Percpu[T])
-# because the stub can't easily resolve the per-CPU offset by name —
-# it uses leaq RIP-relative on the literal symbol. When we add SMP
-# these become Percpu[uint64] and the stub gains a swapgs.
-user_rsp_save: uint64 = 0
-kernel_rsp:    uint64 = 0
+# M16.35: the previous user_rsp_save / kernel_rsp globals were
+# retired in favour of a per-task syscall stack. syscall_entry now
+# reads the current task's kstack_top out of TSS.RSP0 (which
+# schedule() keeps current on every context switch) and parks the
+# user RSP on that stack instead of in a shared global. That lets
+# SYS_WAITPID yield to another task mid-syscall without a sibling
+# syscall clobbering the saved slot.
 
 
-def syscall_init(stack_top: uint64):
-    # `stack_top` is the high address of a kernel stack reserved for
-    # syscall handling. The syscall stub loads %rsp from kernel_rsp on
-    # entry; we plant the value here once at boot. (Linux uses the
-    # current task's kernel stack via cpu_tss_rw.x86_tss.sp0.)
-    kernel_rsp = stack_top
+# Maximum argv we'll honour. Picked to comfortably exceed a shell's
+# typical needs while keeping the user-stack reservation small (each
+# pointer is 8 bytes, each string capped at MAX_ARG_BYTES). Tight
+# fixed caps are fine until hamsh asks for more.
+MAX_ARGV:      uint64 = 16
+MAX_ARG_BYTES: uint64 = 256
+
+
+def _argv_strlen(s: uint64) -> uint64:
+    n: uint64 = 0
+    while cast[Ptr[uint8]](s + n)[0] != 0 and n < MAX_ARG_BYTES:
+        n = n + 1
+    return n
+
+
+def _argv_count(argv: uint64) -> uint64:
+    # Walk a NULL-terminated array of 8-byte pointers, capped at
+    # MAX_ARGV so a malformed argv can't run away. argv == 0 means
+    # "no argv" — count is 0.
+    if argv == 0:
+        return 0
+    n: uint64 = 0
+    while n < MAX_ARGV:
+        p: uint64 = cast[Ptr[uint64]](argv + n * 8)[0]
+        if p == 0:
+            return n
+        n = n + 1
+    return n
+
+
+def _build_user_argv(ustack_top: uint64, argv_user: uint64,
+                     out_argc: Ptr[uint64],
+                     out_argv: Ptr[uint64]) -> uint64:
+    # Lay out an argv block at the top of a freshly-allocated user
+    # stack and return the user's new RSP. Layout, growing down from
+    # ustack_top:
+    #
+    #   high:  "arg0\0arg1\0..."        each NUL-terminated string
+    #          [pad to 8 bytes]
+    #          argv[0]  -> &"arg0"
+    #          argv[1]  -> &"arg1"
+    #          ...
+    #          argv[N]  = 0             NULL terminator
+    #          [pad to 16 bytes]        SysV stack alignment for _start
+    #   low:   <new RSP>
+    #
+    # out_argc / out_argv get the values _start should see in
+    # %rdi / %rsi. The caller wires those into the iret frame or the
+    # sysretq glue.
+    argc: uint64 = _argv_count(argv_user)
+
+    # Copy strings down from ustack_top. Track the bottom of the
+    # string region; that's where the argv pointer array begins.
+    str_sp: uint64 = ustack_top
+    str_addrs: Array[16, uint64]
+    i: uint64 = 0
+    while i < argc:
+        src: uint64 = cast[Ptr[uint64]](argv_user + i * 8)[0]
+        n:   uint64 = _argv_strlen(src) + 1            # incl. NUL
+        str_sp = str_sp - n
+        memcpy(cast[Ptr[uint8]](str_sp),
+               cast[Ptr[uint8]](src), n)
+        str_addrs[i] = str_sp
+        i = i + 1
+
+    # 8-byte align the pointer array.
+    str_sp = str_sp & ~cast[uint64](7)
+
+    # Write argv[N] = NULL then argv[N-1] .. argv[0] (top-down).
+    str_sp = str_sp - 8
+    cast[Ptr[uint64]](str_sp)[0] = 0
+    i = argc
+    while i > 0:
+        i = i - 1
+        str_sp = str_sp - 8
+        cast[Ptr[uint64]](str_sp)[0] = str_addrs[i]
+
+    argv_addr: uint64 = str_sp
+
+    # 16-byte align RSP for SysV. The argv array is already 8-aligned;
+    # mask to a 16-byte boundary by potentially dropping 8 bytes of pad
+    # below it. After _start's `call main` the stack is again 16-aligned.
+    str_sp = str_sp & ~cast[uint64](15)
+
+    out_argc[0] = argc
+    out_argv[0] = argv_addr
+    return str_sp
+
+
+def syscall_init():
+    # M16.35: no longer takes a stack arg — the entry stub reads the
+    # current task's kernel stack from TSS.RSP0 each time it's called,
+    # so there is no single boot-time slot to install. Linux's
+    # syscall_init() reads from cpu_tss_rw.x86_tss.sp0 in exactly the
+    # same way.
 
     # IA32_STAR encoding:
     #   bits 31:0  reserved
@@ -110,9 +204,11 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         early_putc(cast[int32](a0 & 0xFF))
         return 0
     if nr == SYS_EXIT:
-        # Mark current task EXITED and yield. task_exit_current()
-        # halts the box if there are no other live tasks.
-        task_exit_current()
+        # Mark current task EXITED with the user-supplied exit code,
+        # then yield. task_exit_current halts the box if there are
+        # no other live tasks. M16.35: a0 carries the exit code so
+        # SYS_WAITPID can return something meaningful to the parent.
+        task_exit_current(cast[int64](a0))
         # Not reached unless schedule() somehow returns. Be defensive.
         local_irq_disable()
         while True:
@@ -153,11 +249,13 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
                              cast[int64](a1), cast[int32](a2))
         return cast[uint64](n)
     if nr == SYS_EXECVE:
-        # Look up `path` in the initramfs, ELF-load, and SYSRETQ
-        # directly to the new entry. The current task's task_struct
-        # and per-task fd table are preserved (no fork+exec races at
-        # this scale; we behave more like a Linux exec() that replaces
-        # the user image but keeps the kernel-side context).
+        # Look up `path` in the initramfs, ELF-load, build argv on a
+        # fresh user stack, and SYSRETQ directly to the new entry.
+        # The current task's task_struct and per-task fd table are
+        # preserved (no fork+exec races at this scale; we behave
+        # more like a Linux exec() that replaces the user image but
+        # keeps the kernel-side context). a1 = argv (Ptr[uint64]
+        # NULL-terminated array of cstring pointers), or 0 for none.
         path: Ptr[char] = cast[Ptr[char]](a0)
         blob: uint64 = initramfs_data_ptr(path)
         if blob == 0:
@@ -171,11 +269,56 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         # Fresh user stack for the new program. The previous user
         # stack page is leaked for now (no per-task ustack tracking
         # in this code path); proper teardown comes with mm_struct.
-        new_ustack: uint64 = alloc_page() + 4096
+        new_ustack_top: uint64 = alloc_page() + 4096
+        argc_out: uint64 = 0
+        argv_out: uint64 = 0
+        new_rsp: uint64 = _build_user_argv(new_ustack_top, a1,
+                                           &argc_out, &argv_out)
         printk2("execve: jumping to %p with stack %p\n",
-                entry, new_ustack)
-        do_execve_finish(entry, new_ustack)
+                entry, new_rsp)
+        do_execve_finish(entry, new_rsp, argc_out, argv_out)
         # Not reached.
         return 0
+    if nr == SYS_SPAWN:
+        # Like SYS_EXECVE but creates a NEW user task and returns its
+        # pid to the caller. The shell (user/hamsh) uses this to run
+        # external commands without dying itself.
+        path: Ptr[char] = cast[Ptr[char]](a0)
+        blob: uint64 = initramfs_data_ptr(path)
+        if blob == 0:
+            return cast[uint64](-2)            # -ENOENT
+        sz: uint64 = initramfs_data_size(path)
+        entry: uint64 = elf_load_blob(cast[Ptr[uint8]](blob), sz)
+        if entry == 0:
+            return cast[uint64](-8)            # -ENOEXEC
+        ustack: uint64 = alloc_page()
+        if ustack == 0:
+            return cast[uint64](-12)           # -ENOMEM
+        ustack_top: uint64 = ustack + 4096
+        argc_out: uint64 = 0
+        argv_out: uint64 = 0
+        new_rsp: uint64 = _build_user_argv(ustack_top, a1,
+                                           &argc_out, &argv_out)
+        slot: int32 = create_user_task_argv(
+            entry, 0x5f5f7370776e5f5f,         # "__spwn__"
+            new_rsp, argc_out, argv_out,
+        )
+        if slot < 0:
+            return cast[uint64](-1)
+        return task_pid_at(slot)
+    if nr == SYS_WAITPID:
+        # Block until the named child enters STATE_EXITED, then return
+        # its exit_code. With no signals or sleep/wake yet, we busy-
+        # yield via schedule() — the timer ISR keeps round-robin alive
+        # and the child eventually runs to SYS_EXIT.
+        target: int32 = task_lookup_by_pid(a0)
+        if target < 0:
+            return cast[uint64](-10)           # -ECHILD
+        while task_state(target) != STATE_EXITED:
+            yield_to_others()
+            target = task_lookup_by_pid(a0)
+            if target < 0:
+                return cast[uint64](-10)
+        return cast[uint64](task_exit_code(target))
     printk2("Hamnix: unknown syscall nr=%d a0=%x\n", nr, a0)
     return cast[uint64](-1)

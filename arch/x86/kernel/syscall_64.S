@@ -46,20 +46,30 @@ syscall_entry:
      * (%rbx, %rbp, %r12..%r15) intact across the syscall, plus the
      * caller-saved set that the syscall ABI doesn't carve out
      * (%rdi/%rsi/%rdx/%r10/%r8/%r9 are inputs but we shouldn't return
-     * with them changed by the dispatch path). We use %r12 as a
-     * scratch below to load globals; spill it to the user stack BEFORE
-     * the stack switch so we can pop it back at SYSRET time.
+     * with them changed by the dispatch path).
+     *
+     * Per-task syscall stack (M16.35): we read the current task's
+     * kernel stack from TSS.RSP0 (kept current by schedule()) and
+     * stash the user RSP on THAT stack. Earlier revs spilled to a
+     * single global (user_rsp_save / kernel_rsp) which broke as soon
+     * as SYS_WAITPID started yielding mid-syscall — the child's own
+     * later syscall_entry would overwrite the parent's saved slot.
+     *
+     * We use %r12 as a transient scratch — park user %r12 on the
+     * user stack first so we can restore it on return.
      */
     pushq   %r12                      /* park user %r12 on user stack */
 
-    /* Park user RSP, load kernel RSP. user_rsp_save / kernel_rsp are
-     * regular .data globals defined by Hamnix side; leaq RIP-relative
-     * because absolute references generate BFD_RELOC_X86_64_32S in
-     * elf32-i386.   */
-    leaq    user_rsp_save(%rip), %r12
-    movq    %rsp, (%r12)
-    leaq    kernel_rsp(%rip), %r12
-    movq    (%r12), %rsp
+    /* %r12 = current task's kernel stack top (TSS.RSP0). schedule()
+     * keeps tss64.rsp0 pointed at task->kstack_top on every switch. */
+    leaq    tss64(%rip), %r12
+    movq    4(%r12), %r12
+
+    /* Park user RSP at kstack_top - 8, then switch to that slot.
+     * After this, subsequent pushes land below the user-RSP slot,
+     * and the matching popq %rsp at the tail restores it directly. */
+    movq    %rsp, -8(%r12)            /* user rsp (with r12 push) -> kstack */
+    leaq    -8(%r12), %rsp            /* RSP -> kernel stack just below it  */
 
     /* Save the SYSCALL hardware-saved regs for sysretq later. */
     pushq   %r11                      /* user RFLAGS */
@@ -80,12 +90,13 @@ syscall_entry:
 
     call    do_syscall                /* return value lands in %rax */
 
-    /* Restore syscall-control regs and user RSP. */
+    /* Restore syscall-control regs and user RSP. We pop the
+     * (per-task) stored user RSP straight into %rsp; the next pop
+     * pulls user %r12 from the user stack and sysretq returns. */
     popq    %rcx                      /* user RIP    */
     popq    %r11                      /* user RFLAGS */
-    leaq    user_rsp_save(%rip), %r12
-    movq    (%r12), %rsp              /* restore user rsp           */
-    popq    %r12                      /* restore user %r12           */
+    popq    %rsp                      /* user rsp    */
+    popq    %r12                      /* user %r12   */
 
     sysretq                           /* CPL 0 -> 3, RIP=%rcx       */
 
@@ -123,30 +134,36 @@ set_efer_sce:
     wrmsr
     ret
 
-/* ---------- do_execve_finish(new_rip, new_rsp) -------------------- *
+/* ---------- do_execve_finish(new_rip, new_rsp, argc, argv) -------- *
  * Tail-call from the SYS_EXECVE handler when it has loaded a new ELF
  * and wants to "become" that program. We never return through the
  * normal syscall path — instead we set up the registers SYSRETQ
  * reads (%rcx = new RIP, %r11 = new RFLAGS with IF=1) and load the
  * new user RSP directly, then SYSRETQ ourselves out to CPL=3.
  *
- * Why this isn't an ordinary return: the standard syscall path
- * restores the user RIP/RSP/RFLAGS that were captured at entry. To
- * exec(), we have to replace those WITHOUT going through the
- * kernel-stack popping that syscall_entry does at its tail (because
- * the kernel-stack frame still has the syscall-time saved %rcx /
- * %r11, and the user_rsp_save slot still has the syscall-time user
- * stack). Directly sysretq-ing with new state skips all that.
+ * As of M16.35 the kernel also stages argc / argv for user _start by
+ * delivering them in %rdi / %rsi. SysV makes those the first two
+ * arguments to main(), so user code that declares
+ *     def main(argc: int32, argv: Ptr[uint64]) -> int32:
+ * receives them naturally; programs whose main() takes no args
+ * (the existing hello.ad / init.S) simply don't read them.
  *
- * SysV: %rdi = new user RIP, %rsi = new user RSP. No return.
+ * SysV inputs: %rdi=new_rip, %rsi=new_rsp, %rdx=argc, %rcx=argv.
+ * No return.
  */
 
     .align 16
     .globl do_execve_finish
 do_execve_finish:
-    movq    %rdi, %rcx                 /* SYSRETQ pulls RIP from %rcx */
-    movq    $0x202, %r11               /* RFLAGS (IF=1, reserved bit) */
+    /* Stash argv in a scratch reg before we clobber %rcx with the
+     * SYSRETQ RIP. After this we don't need any SysV-input regs
+     * besides the ones being installed for user. */
+    movq    %rcx, %r10                 /* save argv                   */
     movq    %rsi, %rsp                 /* user stack                  */
+    movq    %rdi, %rcx                 /* SYSRETQ pulls RIP from %rcx */
+    movq    %rdx, %rdi                 /* user %rdi = argc            */
+    movq    %r10, %rsi                 /* user %rsi = argv            */
+    movq    $0x202, %r11               /* RFLAGS (IF=1, reserved bit) */
     sysretq
 
 /* ---------- enter_user_mode(entry, stack) ------------------------ *
