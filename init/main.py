@@ -42,7 +42,8 @@ from kernel.sched.core import (
 )
 from mm.memblock import memblock_alloc, memblock_used, memblock_avail
 from mm.page_alloc import (
-    alloc_page, free_page, page_alloc_total, page_alloc_free_count,
+    alloc_page, free_page, alloc_pages, free_pages,
+    page_alloc_total, page_alloc_free_count,
 )
 from mm.slab import kmalloc, kfree, kzalloc
 
@@ -104,6 +105,36 @@ def slab_smoke_test():
     kfree(d)
     kfree(e)
     kfree(0x123456)        # bad pointer — magic check should warn
+
+    # --- large kmalloc path: alloc_pages-backed -------------------
+    # Pick sizes that span multiple order classes:
+    #   8000  ->  order 1 (2 pages = 8 KiB after header)
+    #   20000 ->  order 3 (8 pages = 32 KiB)
+    #   100000 -> order 5 (32 pages = 128 KiB)
+    large1: uint64 = kmalloc(8000)
+    large2: uint64 = kmalloc(20000)
+    large3: uint64 = kmalloc(100000)
+    printk1("  kmalloc(  8000) = %p  (order 1)\n", large1)
+    printk1("  kmalloc( 20000) = %p  (order 3)\n", large2)
+    printk1("  kmalloc(100000) = %p  (order 5)\n", large3)
+
+    # Write/read the last byte of the largest block to prove the
+    # full range is mapped + usable (no segfault here means the
+    # entire 128 KiB is alive).
+    cast[Ptr[uint8]](large3 + 99999)[0] = 0x5A
+    val8: uint8 = cast[Ptr[uint8]](large3 + 99999)[0]
+    printk1("  large3[99999] roundtrip = 0x%x  (expect 0x5a)\n",
+            cast[uint64](val8))
+
+    kfree(large1)
+    kfree(large2)
+    kfree(large3)
+
+    # Re-allocate at the same order — should return one of the
+    # freed runs (LIFO order from the per-order free list).
+    reuse: uint64 = kmalloc(20000)
+    printk1("  kmalloc(20000) after free = %p  (expect == prev)\n", reuse)
+    kfree(reuse)
 
 
 def string_ops_smoke_test():

@@ -52,7 +52,9 @@
 #   - SLAB_HWCACHE_ALIGN and friends
 #   - kmemleak / KASAN-style accounting
 
-from mm.page_alloc import alloc_page, free_page, PAGE_SIZE
+from mm.page_alloc import (
+    alloc_page, free_page, alloc_pages, free_pages, PAGE_SIZE, MAX_ORDER,
+)
 from kernel.printk.printk import printk0, printk1, printk2
 
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
@@ -216,14 +218,59 @@ def slab_init():
     kmem_cache_init(&kmalloc_caches[6], 2048, 0x00_38_34_30_32_2D_6B_6D)
 
 
-def kmalloc(size: uint64) -> uint64:
-    idx: int32 = _kmalloc_index(size)
-    if idx < 0:
-        # Anything > 2048 currently has no allocator. Callers needing
-        # 4 KiB+ should use alloc_page() / a future alloc_pages(order).
-        printk1("kmalloc: request for %d bytes exceeds 2048\n", size)
+# --- kmalloc large-block path (size > 2048) ------------------------
+#
+# Backed by alloc_pages(order). To make kfree() distinguishable from
+# slab-backed kfree() we use:
+#
+#   - Storage: 1 << order contiguous pages, returned address is the
+#     base + LARGE_KMALLOC_HEADER (offset 8). The first 8 bytes hold:
+#       low 32: KMALLOC_LARGE_MAGIC ("PKLG" little-endian)
+#       high 32: order
+#     kfree() recovers the order, calls free_pages(base, order).
+#
+#   - Alignment trick: returned pointer is `base + 8`. Slab objects
+#     sit at base + 32 + N*size, so their low 12 bits are >= 32. A
+#     kfree() can therefore distinguish the two by `obj & 0xFFF == 8`.
+
+KMALLOC_LARGE_MAGIC: uint32 = 0x474C4B50              # "PKLG"
+LARGE_KMALLOC_HEADER: uint64 = 8
+
+
+def _order_for_size(size: uint64) -> int32:
+    # Smallest order such that (PAGE_SIZE << order) >= size + header.
+    total: uint64 = size + LARGE_KMALLOC_HEADER
+    order: int32 = 0
+    block_size: uint64 = PAGE_SIZE
+    while block_size < total:
+        if order >= MAX_ORDER:
+            return -1
+        order = order + 1
+        block_size = block_size << 1
+    return order
+
+
+def _kmalloc_large(size: uint64) -> uint64:
+    order: int32 = _order_for_size(size)
+    if order < 0:
+        printk1("kmalloc: request %d bytes exceeds MAX_ORDER\n", size)
         return 0
-    return kmem_cache_alloc(&kmalloc_caches[idx])
+    page: uint64 = alloc_pages(order)
+    if page == 0:
+        return 0
+    # Pack [order:32 | magic:32] into the first 8 bytes; return base + 8.
+    marker: uint64 = (cast[uint64](order) << 32) | cast[uint64](KMALLOC_LARGE_MAGIC)
+    cast[Ptr[uint64]](page)[0] = marker
+    return page + LARGE_KMALLOC_HEADER
+
+
+def kmalloc(size: uint64) -> uint64:
+    # Small / slab-backed path.
+    idx: int32 = _kmalloc_index(size)
+    if idx >= 0:
+        return kmem_cache_alloc(&kmalloc_caches[idx])
+    # Large / page-backed path: > 2048 bytes routes to alloc_pages.
+    return _kmalloc_large(size)
 
 
 def kzalloc(size: uint64) -> uint64:
@@ -242,6 +289,20 @@ def kzalloc(size: uint64) -> uint64:
 def kfree(obj: uint64):
     if obj == 0:
         return
+    # Dispatch by low-12-bit alignment: page-backed kmalloc returns
+    # page + 8 (offset 8 within a page), while slab objects always sit
+    # at offset 32 + N*object_size (always >= 32, never == 8).
+    in_page_offset: uint64 = obj & cast[uint64](PAGE_SIZE - 1)
+    if in_page_offset == LARGE_KMALLOC_HEADER:
+        page: uint64 = obj - LARGE_KMALLOC_HEADER
+        marker: uint64 = cast[Ptr[uint64]](page)[0]
+        if cast[uint32](marker & 0xFFFFFFFF) != KMALLOC_LARGE_MAGIC:
+            printk1("kfree: page-backed magic mismatch at %p\n", obj)
+            return
+        order: int32 = cast[int32](marker >> 32)
+        free_pages(page, order)
+        return
+
     slab_page: uint64 = obj & ~(PAGE_SIZE - 1)
     hdr: Ptr[SlabHeader] = cast[Ptr[SlabHeader]](slab_page)
     if hdr[0].magic != SLAB_MAGIC:
