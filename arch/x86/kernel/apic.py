@@ -116,6 +116,103 @@ def lapic_setup_timer():
             cast[uint64](TIMER_INITIAL_COUNT))
 
 
+# --- PIT-anchored LAPIC timer calibration --------------------------
+#
+# Mirrors arch/x86/kernel/apic/apic.c::calibrate_APIC_clock(). Run
+# the LAPIC timer counting down from max (0xFFFFFFFF) while gating
+# PIT channel 2 on for a 10 ms one-shot interval. When the PIT's
+# OUT line (visible on port 0x61 bit 4) goes high, sample the LAPIC
+# current count. The difference from the starting max is the number
+# of LAPIC ticks elapsed in 10 ms, which we scale to a periodic
+# initial count for our target HZ (100).
+#
+# PIT channel 2 is the speaker-tied channel; bit 0 of port 0x61
+# gates its counting and bit 1 connects/disconnects the speaker.
+# We toggle the gate and ignore the speaker.
+
+PIT_CH2_DATA:  int32 = 0x42
+PIT_CMD:       int32 = 0x43
+PIT_CTRL:      int32 = 0x61
+
+# Command byte: channel 2 (bits 7..6 = 10), lobyte/hibyte (bits 5..4 =
+# 11), mode 0 = one-shot (bits 3..1 = 000), binary (bit 0 = 0) = 0xB0.
+PIT_CMD_CH2_ONESHOT: int32 = 0xB0
+
+# PIT runs at 1193182 Hz. Divisor for a 10 ms interval = 11932 = 0x2E9C.
+PIT_10MS_DIVISOR: int32 = 0x2E9C
+
+# Port 0x61:
+#   bit 0  speaker timer GATE2  (1 = let channel 2 count)
+#   bit 1  speaker enable        (cosmetic for us)
+#   bit 4  OUT pin status        (1 once channel 2 reaches 0)
+PIT_CTRL_GATE:  int32 = 0x01
+PIT_CTRL_SPEAK: int32 = 0x02
+PIT_CTRL_OUT:   int32 = 0x10
+
+# Target tick rate. Matches what we used to assume; if you tune this
+# the only consequence is the periodic count divisor.
+TIMER_HZ: uint64 = 100
+
+
+def _pit_gate_off():
+    # Stop channel 2 + ensure speaker is off so we don't beep.
+    cur: int32 = inb(PIT_CTRL)
+    outb(cur & ~(PIT_CTRL_GATE | PIT_CTRL_SPEAK), PIT_CTRL)
+
+
+def _pit_gate_on():
+    cur: int32 = inb(PIT_CTRL)
+    outb((cur & ~PIT_CTRL_SPEAK) | PIT_CTRL_GATE, PIT_CTRL)
+
+
+def lapic_calibrate_and_setup_timer():
+    # Step 1: stop / mask everything first.
+    _lapic_write(LAPIC_LVT_TIMER_REG, 0x10000)         # bit 16 = mask
+    _pit_gate_off()
+
+    # Step 2: program PIT channel 2 for 10 ms one-shot.
+    outb(PIT_CMD_CH2_ONESHOT, PIT_CMD)
+    outb(PIT_10MS_DIVISOR & 0xFF, PIT_CH2_DATA)
+    outb((PIT_10MS_DIVISOR >> 8) & 0xFF, PIT_CH2_DATA)
+
+    # Step 3: arm LAPIC timer at max (will count down freely with
+    # divide=16; mask is still set so no IRQ fires).
+    _lapic_write(LAPIC_TIMER_DIVIDE, TIMER_DIVIDE_16)
+    _lapic_write(LAPIC_TIMER_INIT, 0xFFFFFFFF)
+
+    # Step 4: open the PIT gate to start counting. The LAPIC timer
+    # has been counting all along but the reference point is "right
+    # now" — both counters are running synchronously.
+    _pit_gate_on()
+
+    # Step 5: poll OUT pin until PIT expires (10 ms wall-clock).
+    while (inb(PIT_CTRL) & PIT_CTRL_OUT) == 0:
+        pass
+
+    # Step 6: snapshot LAPIC's current count; the delta from max is
+    # the number of LAPIC ticks (post-divide-by-16) that fit in 10 ms.
+    cur: uint32 = _lapic_read(LAPIC_TIMER_CUR)
+    elapsed: uint32 = 0xFFFFFFFF - cur
+
+    # Tidy up: stop the PIT so it doesn't keep gating.
+    _pit_gate_off()
+
+    # Step 7: scale to ticks_per_second + program periodic initial
+    # count for the desired HZ. elapsed corresponds to 10 ms, so
+    # ticks_per_second = elapsed × 100, and the periodic count for
+    # HZ = 100 is exactly `elapsed`.
+    ticks_per_second: uint64 = cast[uint64](elapsed) * 100
+    periodic_count: uint32   = elapsed * cast[uint32](100) / cast[uint32](TIMER_HZ)
+
+    printk1("LAPIC: calibration measured %d Hz (post-÷16)\n",
+            ticks_per_second)
+    printk1("LAPIC: programming periodic count = %d (target 100 Hz)\n",
+            cast[uint64](periodic_count))
+
+    _lapic_write(LAPIC_LVT_TIMER_REG, TIMER_VECTOR | LVT_PERIODIC)
+    _lapic_write(LAPIC_TIMER_INIT,    periodic_count)
+
+
 def lapic_send_eoi():
     # Linux's apic_eoi() is one MMIO write to EOI. Any value works;
     # the LAPIC reads the WRITE to advance the in-service register.

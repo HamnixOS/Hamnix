@@ -37,7 +37,9 @@ from arch.x86.mm.init import mem_init
 from arch.x86.kernel.setup_percpu import setup_per_cpu_areas, get_cpu_id
 from arch.x86.kernel.i8259 import i8259_init, i8259_disable
 from arch.x86.kernel.time import time_init, get_jiffies, get_local_timer_ticks
-from arch.x86.kernel.apic import apic_init, lapic_setup_timer
+from arch.x86.kernel.apic import (
+    apic_init, lapic_setup_timer, lapic_calibrate_and_setup_timer,
+)
 from arch.x86.kernel.smp import smp_boot_secondary, get_cpus_online
 from kernel.sched.core import (
     sched_init, kthread_create, create_user_task,
@@ -454,7 +456,10 @@ def start_kernel():
     time_init()
     i8259_disable()
     apic_init()
-    lapic_setup_timer()
+    # Calibrate the LAPIC timer against PIT channel 2 (10 ms one-shot),
+    # then program periodic mode at the measured rate. Replaces the
+    # M16.22 hand-picked initial count.
+    lapic_calibrate_and_setup_timer()
 
     # M16.24: bring up the secondary CPU via INIT-SIPI-SIPI. Requires
     # QEMU launched with `-smp 2`. If launched with -smp 1 the SIPI
