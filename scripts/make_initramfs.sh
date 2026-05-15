@@ -125,6 +125,12 @@ if ls /m5_netfilter.ko >/dev/null 2>&1; then
     echo "[PYNUX] --- end netfilter ---"
 fi
 
+if [ -d /sys/pynux ]; then
+    echo "[PYNUX] --- /sys/pynux/info ---"
+    cat /sys/pynux/info
+    echo "[PYNUX] --- end /sys/pynux/info ---"
+fi
+
 if grep -qE '^[ 0-9]*240 pynux$' /proc/devices 2>/dev/null; then
     echo "[PYNUX] --- exercise /dev/pynux ---"
     mknod /dev/pynux c 240 0
