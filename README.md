@@ -42,6 +42,9 @@ kernel built up subsystem by subsystem.
 | M10.2 | delayed_work — queue_delayed_work_on + delayed_work_timer_fn, fires after 10 ms | **Done** |
 | M11.1 | ktime_get nanosecond clock — measures msleep(10) at ~11.6 ms | **Done** |
 | M11.2 | debugfs — Pynux-owned `/sys/kernel/debug/pynux/counter`, bidirectional userspace ↔ kernel u32 | **Done** |
+| M12.1 | netfilter packet inspector — parses sk_buff IPv4 header, prints src/dst of every packet | **Done** |
+| M12.2 | `/dev/pynuxnull` — clone of /dev/null | **Done** |
+| M13.1 | utsname reader — pulls kernel release "6.12.48" out of `init_uts_ns` | **Done** |
 
 The microcontroller OS the project originally shipped (ARM Cortex-M,
 QEMU mps2-an385, RP2040, STM32F4) still compiles via the original ARM
@@ -160,6 +163,9 @@ kernel-modules/  Pynux source for each module milestone
   m10-dwork/     M10.2 delayed_work via timer-backed workqueue
   m11-ktime/     M11.1 ktime_get nanosecond clock
   m11-debugfs/   M11.2 debugfs u32 counter
+  m12-nfdump/    M12.1 netfilter packet inspector
+  m12-null/      M12.2 /dev/pynuxnull
+  m13-utsname/   M13.1 read kernel release from init_uts_ns
 
 scripts/         x86 dev-loop infrastructure
   build_x86_kernel.sh    Fetch + build mitigations-off Linux for QEMU
