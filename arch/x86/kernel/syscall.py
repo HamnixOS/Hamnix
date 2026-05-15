@@ -26,6 +26,10 @@
 from drivers.tty.serial.early_8250 import early_putc
 from kernel.printk.printk import printk0, printk1, printk2
 from arch.x86.kernel.time import get_jiffies
+from kernel.sched.core import (
+    create_user_task, task_exit_current,
+    current_task_pid,
+)
 
 extern def write_msr(index: uint32, value: uint64)
 extern def read_msr(index: uint32) -> uint64
@@ -43,6 +47,8 @@ IA32_FMASK: uint32 = 0xC0000084
 SYS_PUTC:        uint64 = 0
 SYS_EXIT:        uint64 = 1
 SYS_GET_JIFFIES: uint64 = 2
+SYS_CLONE:       uint64 = 3                    # a0 = entry, returns new pid
+SYS_GETPID:      uint64 = 4
 
 # Single-CPU stash slots used by the syscall entry stub to flip
 # between user RSP and kernel RSP. Regular globals (not Percpu[T])
@@ -90,11 +96,29 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         early_putc(cast[int32](a0 & 0xFF))
         return 0
     if nr == SYS_EXIT:
-        printk1("Pynux: user exited; jiffies=%d, halting\n", get_jiffies())
+        # Mark current task EXITED and yield. task_exit_current()
+        # halts the box if there are no other live tasks.
+        task_exit_current()
+        # Not reached unless schedule() somehow returns. Be defensive.
         local_irq_disable()
         while True:
             asm_volatile("hlt")
     if nr == SYS_GET_JIFFIES:
         return get_jiffies()
+    if nr == SYS_CLONE:
+        # a0 = entry point address of new user task. We don't have a
+        # real binary loader yet, so callers pass the address of a
+        # pre-existing user-mode function baked into the kernel image.
+        # The child is a brand-new task; when schedule() picks it up
+        # the iretq lands in `entry` directly (not in this syscall
+        # return path) — so the child never sees this return value.
+        # The parent gets back the child's slot index + 1 as a stand-
+        # in pid.
+        slot: int32 = create_user_task(a0, 0x5f5f636c6f6e655f)
+        if slot < 0:
+            return cast[uint64](-1)
+        return cast[uint64](slot) + 1
+    if nr == SYS_GETPID:
+        return current_task_pid()
     printk2("Pynux: unknown syscall nr=%d a0=%x\n", nr, a0)
     return cast[uint64](-1)

@@ -38,7 +38,8 @@ from arch.x86.kernel.setup_percpu import setup_per_cpu_areas, get_cpu_id
 from arch.x86.kernel.i8259 import i8259_init
 from arch.x86.kernel.time import time_init, get_jiffies, get_local_timer_ticks
 from kernel.sched.core import (
-    sched_init, kthread_create, start_first_task, get_current_pid,
+    sched_init, kthread_create, create_user_task,
+    start_first_task, current_task_pid,
 )
 from arch.x86.kernel.syscall import syscall_init
 from drivers.video.console.vga_text import (
@@ -426,25 +427,31 @@ def start_kernel():
     i8259_init()
     time_init()
 
-    # --- M16.17: drop into a userspace task via SYSCALL/SYSRET ----
-    # Allocate a kernel stack to be used by syscall handlers and a
-    # user stack for the demo task itself. Both come from alloc_page,
-    # so each is a single 4 KiB page (plenty for the smoke test).
-    syscall_kstack: uint64 = alloc_page() + 4096
-    user_stack:     uint64 = alloc_page() + 4096
+    # --- M16.20: register the first user task in the runqueue ----
+    # The parent runs at user_demo_entry; mid-run it calls SYS_CLONE
+    # to spawn the child at user_child_entry. schedule() (called from
+    # the timer ISR) interleaves the two CPL-3 tasks.
+    sched_init()
+    parent_slot: int32 = create_user_task(
+        cast[uint64](&user_demo_entry), 0x5f5f706172656e74)
+    printk1("Pynux: parent user task @ slot %d\n",
+            cast[uint64](parent_slot))
 
+    # Allocate a single syscall-time kernel stack used by
+    # syscall_entry's user_rsp_save / kernel_rsp slots. Each task has
+    # its own ring-0 stack already (task->kstack_top); TSS.RSP0 is
+    # updated by schedule() on every context switch so a CPL-3 IRQ
+    # lands on the CURRENT task's kstack. Wiring the syscall path
+    # through the per-task kstack too is a TODO that lands when we
+    # have proper preemption-during-syscall.
+    syscall_kstack: uint64 = alloc_page() + 4096
     syscall_init(syscall_kstack)
-    # TSS / RSP0 lets the CPU find a kernel stack when an IRQ fires
-    # while CPL=3. Reuse the same stack as syscall entry — only one
-    # of the two paths is ever active at a time on uniprocessor.
+    # tss_init's RSP0 arg is just a seed — start_first_task will
+    # overwrite TSS.RSP0 with slot 0's kstack_top before iretq'ing.
     tss_init(syscall_kstack)
-    printk2("Pynux: kernel syscall stack @ %p, user stack @ %p\n",
-            syscall_kstack, user_stack)
-    # IRQs are still off in the boot context. They'll be enabled
-    # atomically with the iretq into user_demo_entry below — the iret
-    # frame has RFLAGS = 0x202 (IF=1).
-    printk0("Pynux: entering ring-3 user_demo_entry (IF=1, TSS armed)...\n")
-    enter_user_mode(cast[uint64](&user_demo_entry), user_stack)
-    # NOT REACHED — user task hits SYS_EXIT which halts the box.
-    printk0("Pynux: ERROR — returned from enter_user_mode\n")
+
+    printk0("Pynux: entering parent via start_first_task...\n")
+    start_first_task()
+    # NOT REACHED — schedule() halts the box when all tasks exit.
+    printk0("Pynux: ERROR — returned from start_first_task\n")
     halt_forever()

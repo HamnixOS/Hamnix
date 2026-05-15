@@ -41,7 +41,16 @@ syscall_entry:
      *   %r11 = saved user RFLAGS
      *   CS / SS already loaded from STAR[47:32]
      *   IF cleared per IA32_FMASK
+     *
+     * Per SysV the user expects every callee-saved register
+     * (%rbx, %rbp, %r12..%r15) intact across the syscall, plus the
+     * caller-saved set that the syscall ABI doesn't carve out
+     * (%rdi/%rsi/%rdx/%r10/%r8/%r9 are inputs but we shouldn't return
+     * with them changed by the dispatch path). We use %r12 as a
+     * scratch below to load globals; spill it to the user stack BEFORE
+     * the stack switch so we can pop it back at SYSRET time.
      */
+    pushq   %r12                      /* park user %r12 on user stack */
 
     /* Park user RSP, load kernel RSP. user_rsp_save / kernel_rsp are
      * regular .data globals defined by Pynux side; leaq RIP-relative
@@ -75,7 +84,8 @@ syscall_entry:
     popq    %rcx                      /* user RIP    */
     popq    %r11                      /* user RFLAGS */
     leaq    user_rsp_save(%rip), %r12
-    movq    (%r12), %rsp
+    movq    (%r12), %rsp              /* restore user rsp           */
+    popq    %r12                      /* restore user %r12           */
 
     sysretq                           /* CPL 0 -> 3, RIP=%rcx       */
 
@@ -159,47 +169,64 @@ enter_user_mode:
     .align 16
     .globl user_demo_entry
 user_demo_entry:
-    /* Print "Pynux user: HELLO\n" — 18 bytes.  We unroll for clarity
-     * over a string-loop (no .rodata trip needed). */
-    movb    $'P',  %dil; movq $0, %rax; syscall
-    movb    $'y',  %dil; movq $0, %rax; syscall
-    movb    $'n',  %dil; movq $0, %rax; syscall
-    movb    $'u',  %dil; movq $0, %rax; syscall
-    movb    $'x',  %dil; movq $0, %rax; syscall
-    movb    $' ',  %dil; movq $0, %rax; syscall
-    movb    $'u',  %dil; movq $0, %rax; syscall
-    movb    $'s',  %dil; movq $0, %rax; syscall
-    movb    $'e',  %dil; movq $0, %rax; syscall
-    movb    $'r',  %dil; movq $0, %rax; syscall
-    movb    $':',  %dil; movq $0, %rax; syscall
-    movb    $' ',  %dil; movq $0, %rax; syscall
-    movb    $'H',  %dil; movq $0, %rax; syscall
-    movb    $'E',  %dil; movq $0, %rax; syscall
-    movb    $'L',  %dil; movq $0, %rax; syscall
-    movb    $'L',  %dil; movq $0, %rax; syscall
-    movb    $'O',  %dil; movq $0, %rax; syscall
-    movb    $'\n', %dil; movq $0, %rax; syscall
+    /* Parent task. Print "P[n]" repeatedly, with a brief pause loop
+     * between prints, until having printed ~20 chars; clone a child
+     * in the middle. Both parent and child are scheduled by the
+     * timer, so the output should interleave 'P' and 'C' chars,
+     * proving multiple user tasks coexist. */
 
-    /* --- Spin loop: prove timer IRQs from CPL=3 work via TSS.RSP0 ---
-     * 50M pause iterations at ~3 cycles each → ~150 ms wall time at
-     * a typical QEMU virtual clock. At HZ=100 that's ~15 timer ticks
-     * firing while we're at CPL 3. Without TSS those would fault.   */
-    movq    $50000000, %rcx
-.Luser_spin:
+    /* "Parent: " banner */
+    movb    $'P', %dil; movq $0, %rax; syscall
+    movb    $':', %dil; movq $0, %rax; syscall
+    movb    $' ', %dil; movq $0, %rax; syscall
+
+    /* Clone the child task. a0 = entry. */
+    leaq    user_child_entry(%rip), %rdi
+    movq    $3, %rax                    /* SYS_CLONE */
+    syscall
+
+    /* Parent loop: print 'P' 10 times with pauses between. */
+    movq    $10, %r12
+.Lpar_loop:
+    movb    $'P', %dil; movq $0, %rax; syscall
+    movq    $1500000, %rcx
+.Lpar_pause:
     pause
     decq    %rcx
-    jnz     .Luser_spin
+    jnz     .Lpar_pause
+    decq    %r12
+    jnz     .Lpar_loop
 
-    /* Print 'X' to show the loop finished without crashing. */
-    movb    $'X',  %dil; movq $0, %rax; syscall
+    /* Done. SYS_EXIT — the kernel will schedule the child or halt
+     * if the child already finished. */
     movb    $'\n', %dil; movq $0, %rax; syscall
-
-    /* SYS_EXIT — kernel halts the box and reports jiffies; if it
-     * advanced above 0, timer fired during the user-mode spin. */
     movq    $1, %rax
     syscall
 
 .user_demo_hang:
-    /* Defensive: shouldn't be reachable. We can't HLT in user mode
-     * (#GP), so just spin. */
     jmp     .user_demo_hang
+
+
+/* ---------- user_child_entry: second ring-3 task ---------------- *
+ * Print 'C' a few times then exit. clone() doesn't return here —
+ * the child starts fresh at this label with all caller-saved regs
+ * zeroed. */
+    .align 16
+    .globl user_child_entry
+user_child_entry:
+    movq    $10, %r12
+.Lchild_loop:
+    movb    $'C', %dil; movq $0, %rax; syscall
+    movq    $1500000, %rcx
+.Lchild_pause:
+    pause
+    decq    %rcx
+    jnz     .Lchild_pause
+    decq    %r12
+    jnz     .Lchild_loop
+
+    movb    $'\n', %dil; movq $0, %rax; syscall
+    movq    $1, %rax
+    syscall
+.user_child_hang:
+    jmp     .user_child_hang

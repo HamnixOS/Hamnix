@@ -91,3 +91,16 @@ tss_init:
     movw    $0x28, %ax
     ltr     %ax
     ret
+
+/* ---------- tss_set_rsp0(rsp0) ---------------------------------- *
+ * Update the RSP0 slot of the already-installed TSS in place. Called
+ * from schedule() each time we context-switch to a new user task so
+ * that a subsequent IRQ-from-user lands on THAT task's kernel stack
+ * rather than the previous task's. The CPU re-reads TSS.RSP0 on the
+ * next CPL change automatically; no TR reload needed.            */
+    .align 16
+    .globl tss_set_rsp0
+tss_set_rsp0:
+    leaq    tss64(%rip), %rax
+    movq    %rdi, 4(%rax)
+    ret
