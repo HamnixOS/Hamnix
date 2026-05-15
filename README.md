@@ -8,8 +8,9 @@ Pynux compiles Python-syntax source with static types directly to native
 machine code via a hand-written, zero-dependency compiler. Two parallel
 tracks share the same compiler and language:
 
-1. **Bare-metal Pynux kernel** (M16+) — Pynux compiles its own bootable
-   kernel image. QEMU `-kernel build/pynux-vmlinux.elf -smp 2` boots
+1. **Bare-metal Pynux kernel + userland** (M16+) — Pynux compiles its
+   own bootable kernel image AND its own user-mode programs.
+   QEMU `-kernel build/pynux-vmlinux.elf -smp 2` boots
    through multiboot1 into 64-bit long mode (4 GiB identity-mapped
    with 1 GiB pages, U/S=1), runs `start_kernel()`, configures traps
    + Local APIC (PIT-calibrated to exactly 100 Hz) + per-CPU storage
@@ -22,13 +23,19 @@ tracks share the same compiler and language:
    a file table, drops into a userspace task that reads `/motd` via
    `SYS_OPEN`/`SYS_READ`/`SYS_WRITE`/`SYS_LSEEK`/`SYS_CLOSE`, spawns
    a sibling via `SYS_CLONE`, and exits cleanly when all tasks
-   finish. Source tree mirrors Linux's layout
+   finish. **The userspace `/init` and a kernel module (`/kmod_hello`)
+   are loaded from a real cpio-format initramfs via an ELF loader
+   that walks PT_LOAD segments.** Userland binaries can be written
+   in Pynux (`user/hello.py` → `python3 -m compiler.pynux compile
+   --target=x86_64-pynux-user ...`) and `SYS_EXECVE` replaces a
+   running user image with a new ELF from the initramfs. Source
+   tree mirrors Linux's layout
    (`arch/x86/boot/`, `arch/x86/kernel/`, `arch/x86/mm/`,
    `arch/x86/lib/`, `arch/x86/realmode/`, `init/`, `mm/`, `kernel/`,
    `kernel/sched/`, `kernel/printk/`, `drivers/tty/serial/`,
-   `drivers/video/console/`, `drivers/pci/`, `drivers/net/`, `fs/`)
-   so reading the equivalent Linux file → porting it to Pynux is the
-   unit of work. The Pynux language has gained a small set of
+   `drivers/video/console/`, `drivers/pci/`, `drivers/net/`, `fs/`,
+   `user/`, `mod/`) so reading the equivalent Linux file → porting
+   it to Pynux is the unit of work. The Pynux language has gained a small set of
    kernel-aware primitives along the way — `Percpu[T]` per-CPU
    storage, `container_of(ptr, Type, field)`, `cast[Ptr[T]](x)`, and
    inline `asm_volatile` / `outb`/`inb`/`outl`/`inl` — so the source
@@ -113,6 +120,10 @@ The end-game is a fully Pynux-authored kernel.
 | M16.27 | Real cpio "newc" initramfs — `scripts/build_initramfs.py` generates the blob; `fs/cpio.py` parses at boot | **Done** |
 | M16.28 | Per-task page tables — each user task owns its own PML4 (clone of BSP's); CR3 switched on context switch | **Done** |
 | M16.29 | PCI bus scan + netfilter chain — enumerates QEMU's i440FX/PIIX3/stdvga/E1000; indirect-call hook dispatch | **Done** |
+| M16.30 | ELF loader — `/init` loaded from cpio initramfs, PT_LOAD segments copied + zero-padded, enter_user_mode jumps in | **Done** |
+| M16.31 | `SYS_EXECVE` — userspace exec() via direct SYSRETQ to new RIP/RSP with new ELF; pid preserved across image replace | **Done** |
+| M16.32 | Loadable kernel modules — insmod-equivalent; `mod/kmod_hello.S` loaded at runtime, calls back via API function-pointer table | **Done** |
+| M16.33 | `x86_64-pynux-user` compiler target — userland programs written in Pynux; `user/hello.py` runs as a real CPL-3 ELF | **Done** |
 
 The microcontroller OS the project originally shipped (ARM Cortex-M,
 QEMU mps2-an385, RP2040, STM32F4) still compiles via the original ARM

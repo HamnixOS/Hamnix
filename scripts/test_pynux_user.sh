@@ -19,7 +19,10 @@ cd "$PROJ_ROOT"
 
 mkdir -p build/user
 ELF=build/pynux-vmlinux.elf
-HELLO_ELF=build/user/hello.elf
+# Use a distinct stem (`pyhello.elf`) so we don't collide with the
+# hand-written user/hello.S that scripts/build_user.sh ships as the
+# /hello cpio entry (referenced by /init's SYS_EXECVE path).
+HELLO_ELF=build/user/pyhello.elf
 BANNER="[hello.py] Pynux user-mode banner from"
 
 echo "[test_pynux_user] (1/5) Compile user/hello.py -> $HELLO_ELF"

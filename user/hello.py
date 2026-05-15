@@ -8,10 +8,14 @@
 #
 # Build:
 #   python3 -m compiler.pynux compile --target=x86_64-pynux-user \
-#       user/hello.py -o build/user/hello.elf
+#       user/hello.py -o build/user/pyhello.elf
 #
 # Run (drops into /init):
-#   INIT_ELF=build/user/hello.elf bash scripts/test_pynux_user.sh
+#   INIT_ELF=build/user/pyhello.elf bash scripts/test_pynux_user.sh
+#
+# Output name `pyhello` is deliberately distinct from the asm
+# user/hello.S → build/user/hello.elf binary (which /init execs via
+# SYS_EXECVE); they're independent user binaries living in the cpio.
 #
 # Pynux can't initialise a global byte-array with a string literal yet
 # (M16-era backend), but it CAN pass a string-literal expression to a
