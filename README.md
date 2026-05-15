@@ -47,6 +47,7 @@ kernel built up subsystem by subsystem.
 | M13.1 | utsname reader — pulls kernel release "6.12.48" out of `init_uts_ns` | **Done** |
 | M13.2 | smp_processor_id — reads CPU number from `%gs:pcpu_hot+12` | **Done** |
 | M14.1 | syscall hook with payload capture — kprobe on `__x64_sys_openat` reads pt_regs->di → syscall pt_regs->si → user filename byte via copy_from_user_nofault | **Done** |
+| M14.2 | kretprobe — captures syscall return values from regs->ax on `__x64_sys_openat` exit; matches M14.1's 17 entries | **Done** |
 
 The microcontroller OS the project originally shipped (ARM Cortex-M,
 QEMU mps2-an385, RP2040, STM32F4) still compiles via the original ARM
@@ -170,6 +171,7 @@ kernel-modules/  Pynux source for each module milestone
   m13-utsname/   M13.1 read kernel release from init_uts_ns
   m13-cpuid/     M13.2 smp_processor_id via per-CPU segment
   m14-syscall/   M14.1 kprobe captures the path of every openat()
+  m14-kretprobe/ M14.2 kretprobe captures the return value
 
 scripts/         x86 dev-loop infrastructure
   build_x86_kernel.sh    Fetch + build mitigations-off Linux for QEMU
