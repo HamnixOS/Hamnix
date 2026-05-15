@@ -253,3 +253,25 @@ sys_listdir:
     syscall
     ret
     .size sys_listdir, .-sys_listdir
+
+
+    /* --- sys_chdir(path) -> int32 ------------------------------------ */
+    .globl sys_chdir
+    .type sys_chdir, @function
+sys_chdir:
+    movq    $19, %rax               /* SYS_CHDIR */
+    syscall
+    ret
+    .size sys_chdir, .-sys_chdir
+
+
+    /* --- sys_getcwd(buf, count) -> int64 -----------------------------
+     * Copies the calling task's CWD into buf as a NUL-terminated
+     * string. Returns bytes written (including the NUL). */
+    .globl sys_getcwd
+    .type sys_getcwd, @function
+sys_getcwd:
+    movq    $20, %rax               /* SYS_GETCWD */
+    syscall
+    ret
+    .size sys_getcwd, .-sys_getcwd
