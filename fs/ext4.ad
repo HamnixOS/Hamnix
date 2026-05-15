@@ -375,24 +375,115 @@ EXT4_MAX_OPEN: uint64 = 8
 ext4_open_files: Array[8, Ext4OpenFile]
 
 
+def _ext4_path_next_component(path: Ptr[char], start: uint64,
+                              out_buf: Ptr[uint8]) -> int64:
+    # Same shape as fat's _path_next_component: copy bytes into
+    # out_buf until '/' or NUL. NUL-terminate, return index of byte
+    # after the slash or -1 on NUL termination.
+    i: uint64 = 0
+    while True:
+        c: int32 = path[start + i]
+        if c == 0:
+            out_buf[i] = 0
+            return -1
+        if c == 47:                               # '/'
+            out_buf[i] = 0
+            return cast[int64](start + i + 1)
+        out_buf[i] = cast[uint8](c & 0xFF)
+        i = i + 1
+
+
+def ext4_resolve_file(path: Ptr[char], out_inum: Ptr[uint32],
+                      out_size: Ptr[uint64]) -> int32:
+    # Walk `path` (caller already stripped /ext/) component by
+    # component. Each component must be a directory entry in the
+    # current directory; the LAST component must be a regular file.
+    # Returns 1 on hit (fills out_inum / out_size), 0 on miss.
+    if path[0] == 0:
+        return 0                                  # empty path → root, not a file
+    cur_inode: Array[256, uint8]
+    if ext4_read_inode(2, &cur_inode[0]) != 0:
+        return 0
+    component: Array[64, uint8]
+    start: uint64 = 0
+    while True:
+        nxt: int64 = _ext4_path_next_component(path, start,
+                                               &component[0])
+        # An empty component (trailing slash, "//") is treated as
+        # "current dir, end of path" — invalid for a file resolve.
+        if component[0] == 0:
+            return 0
+        inum: uint32 = ext4_dir_lookup(&cur_inode[0],
+                                       cast[Ptr[char]](&component[0]))
+        if inum == 0:
+            return 0
+        # Read the matched inode; we need its mode to decide if
+        # it's a directory (descend) or a file (terminate).
+        if ext4_read_inode(cast[uint64](inum), &cur_inode[0]) != 0:
+            return 0
+        mode: uint16 = ext4_inode_mode(&cur_inode[0])
+        is_dir: int32 = 0
+        if (mode & 0xF000) == 0x4000:
+            is_dir = 1
+        if nxt < 0:
+            # Last component. Must be a regular file.
+            if is_dir != 0:
+                return 0
+            out_inum[0] = inum
+            out_size[0] = cast[uint64](ext4_inode_size_lo(&cur_inode[0]))
+            return 1
+        # Intermediate component. Must be a directory.
+        if is_dir == 0:
+            return 0
+        start = cast[uint64](nxt)
+
+
+def ext4_resolve_dir(path: Ptr[char]) -> uint32:
+    # Walk path to a DIRECTORY inode, returning its inum. Empty
+    # path → root (inum 2). Returns 0 on miss / not-a-dir.
+    if path[0] == 0:
+        return 2
+    cur_inode: Array[256, uint8]
+    if ext4_read_inode(2, &cur_inode[0]) != 0:
+        return 0
+    component: Array[64, uint8]
+    start: uint64 = 0
+    cur_inum: uint32 = 2
+    while True:
+        nxt: int64 = _ext4_path_next_component(path, start,
+                                               &component[0])
+        if component[0] == 0:
+            if nxt < 0:
+                return cur_inum
+            start = cast[uint64](nxt)
+            continue
+        inum: uint32 = ext4_dir_lookup(&cur_inode[0],
+                                       cast[Ptr[char]](&component[0]))
+        if inum == 0:
+            return 0
+        if ext4_read_inode(cast[uint64](inum), &cur_inode[0]) != 0:
+            return 0
+        mode: uint16 = ext4_inode_mode(&cur_inode[0])
+        if (mode & 0xF000) != 0x4000:
+            return 0
+        cur_inum = inum
+        if nxt < 0:
+            return cur_inum
+        start = cast[uint64](nxt)
+
+
 def ext4_open(name: Ptr[char]) -> int32:
-    # Open /ext/<name> (caller already stripped /ext/). Looks up
-    # the name in root, snapshots inum + size into a slot. Returns
-    # slot index or -1.
+    # Open /ext/<name> (caller already stripped /ext/). Walks the
+    # full path so nested files like /ext/SUB/NESTED.TXT resolve.
+    # Snapshots inum + size into a slot. Returns slot index or -1.
     if ext4_blockdev_slot < 0:
         return -1
     if name[0] == 0:
-        return -1                                # we don't open the root dir
-    root_buf: Array[256, uint8]
-    if ext4_read_inode(2, &root_buf[0]) != 0:
+        return -1                                # not for the root dir
+    inum: uint32 = 0
+    fsize: uint64 = 0
+    if ext4_resolve_file(name, &inum, &fsize) == 0:
         return -1
-    inum: uint32 = ext4_dir_lookup(&root_buf[0], name)
-    if inum == 0:
-        return -1
-    f_inode: Array[256, uint8]
-    if ext4_read_inode(cast[uint64](inum), &f_inode[0]) != 0:
-        return -1
-    fsize: uint64 = cast[uint64](ext4_inode_size_lo(&f_inode[0]))
     i: uint64 = 0
     while i < EXT4_MAX_OPEN:
         if ext4_open_files[i].used == 0:
@@ -421,22 +512,19 @@ def ext4_listdir(path: Ptr[char], buf: Ptr[uint8],
                  count: uint64) -> int64:
     # Pack the named directory's entries into buf as "NAME\n" lines.
     # path is the post-/ext/-strip tail (e.g. "" for root, "SUB"
-    # for /ext/SUB). For now only the root is supported; nested
-    # ext4 directory lookup needs the path walker that fat_lookup
-    # has. Returns bytes written or -1.
+    # for /ext/SUB). Walks the FS tree via ext4_resolve_dir, then
+    # iterates the resolved inode's first extent's data block.
     if count == 0:
         return -1
-    if path[0] != 0:
-        # Only root listing today. Subdirs return ENOENT (-2)
-        # rather than EINVAL so /ls /ext/foo doesn't look like a
-        # different bug class.
-        return -2
     if ext4_blockdev_slot < 0:
         return -1
-    root: Array[256, uint8]
-    if ext4_read_inode(2, &root[0]) != 0:
+    inum: uint32 = ext4_resolve_dir(path)
+    if inum == 0:
+        return -2                                # -ENOENT
+    dir_inode: Array[256, uint8]
+    if ext4_read_inode(cast[uint64](inum), &dir_inode[0]) != 0:
         return -1
-    blk: uint64 = ext4_inode_first_extent_block(&root[0])
+    blk: uint64 = ext4_inode_first_extent_block(&dir_inode[0])
     if blk == 0:
         return -1
     if _ext4_read_block(blk, &ext4_blk_buf[0]) != 0:

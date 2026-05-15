@@ -45,9 +45,13 @@ set +e
     sleep 3
     printf '/cat /ext/HELLO.TXT\n'
     sleep 1
+    printf '/ls /ext/SUB\n'
+    sleep 1
+    printf '/cat /ext/SUB/NESTED.TXT\n'
+    sleep 1
     printf 'exit\n'
     sleep 1
-) | timeout 15s qemu-system-x86_64 \
+) | timeout 18s qemu-system-x86_64 \
     -kernel "$ELF" \
     -drive file=build/ext4.img,if=virtio,format=raw \
     -smp 2 \
@@ -69,7 +73,9 @@ for needle in \
     "ext4: mounted; block_size=1024 inodes_count=128" \
     "ext4 inode#2 mode=41ed size=1024" \
     "dirent inode=12 name='HELLO.TXT'" \
-    "EXT4_MARKER hello from /ext/HELLO.TXT"
+    "EXT4_MARKER hello from /ext/HELLO.TXT" \
+    "NESTED.TXT" \
+    "EXT4_NESTED_MARKER /ext/SUB/NESTED.TXT"
 do
     if grep -F -q "$needle" "$LOG"; then
         echo "[test_ext4] OK: '$needle'"

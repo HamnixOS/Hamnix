@@ -269,21 +269,34 @@ def build_ext4_image(out_path: Path) -> bytes:
          str(out_path)],
         check=True, capture_output=True,
     )
-    # Plant a known file via debugfs.
-    body = (
+    # Plant /HELLO.TXT and /SUB/NESTED.TXT via debugfs. The mkdir
+    # / cd / write -f sequence is sent as one command stream so
+    # debugfs preserves working-directory state between commands.
+    hello_body = (
         b"EXT4_MARKER hello from /ext/HELLO.TXT - ext4 driver works\n"
     )
-    tmp_body = out_path.with_suffix(".body.tmp")
-    tmp_body.write_bytes(body)
+    nested_body = (
+        b"EXT4_NESTED_MARKER /ext/SUB/NESTED.TXT - subdir walk works\n"
+    )
+    tmp_hello  = out_path.with_suffix(".hello.tmp")
+    tmp_nested = out_path.with_suffix(".nested.tmp")
+    tmp_hello.write_bytes(hello_body)
+    tmp_nested.write_bytes(nested_body)
+    cmd_stream = (
+        f"write {tmp_hello} HELLO.TXT\n"
+        f"mkdir SUB\n"
+        f"cd SUB\n"
+        f"write {tmp_nested} NESTED.TXT\n"
+    )
     try:
         subprocess.run(
-            [debugfs, "-w",
-             "-R", f"write {tmp_body} HELLO.TXT",
-             str(out_path)],
+            [debugfs, "-w", "-f", "/dev/stdin", str(out_path)],
+            input=cmd_stream, text=True,
             check=True, capture_output=True,
         )
     finally:
-        tmp_body.unlink(missing_ok=True)
+        tmp_hello.unlink(missing_ok=True)
+        tmp_nested.unlink(missing_ok=True)
     return out_path.read_bytes()
 
 
