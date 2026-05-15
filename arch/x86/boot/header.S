@@ -55,18 +55,28 @@ _start:
      * Total identity-mapped: 1 GiB. Pynux is well under that for M16.x.   */
     movl    $pml4, %edi
     movl    $pdpt, %eax
-    orl     $0x3, %eax              /* present | rw */
+    orl     $0x7, %eax              /* US | RW | P */
     movl    %eax, (%edi)
 
     movl    $pdpt, %edi
     movl    $pd, %eax
-    orl     $0x3, %eax              /* present | rw */
+    orl     $0x7, %eax              /* US | RW | P */
     movl    %eax, (%edi)
 
-    /* Fill PD with 512 entries, each a 2 MiB page (PS=1, RW=1, P=1). */
+    /* Fill PD with 512 entries, each a 2 MiB page.
+     *   bit 0: P  - present
+     *   bit 1: RW - writable
+     *   bit 2: US - user/supervisor (1 = user accessible)
+     *   bit 7: PS - page size (1 for 2 MiB / 1 GiB pages)
+     * We set US=1 so user-mode (ring 3) code can read/write/execute the
+     * identity-mapped region too. M16.17 introduces a userspace
+     * task that issues SYSCALL; without U=1 the very first user-mode
+     * instruction fetch faults. This is intentionally simple — proper
+     * kernel/user page separation comes when we add per-task page
+     * tables. */
     movl    $pd, %edi
     movl    $0, %ecx                /* loop counter */
-    movl    $0x83, %eax             /* PS | RW | P; phys base = 0 */
+    movl    $0x87, %eax             /* PS | US | RW | P; phys base = 0 */
 1:
     movl    %eax, (%edi)
     movl    $0,   4(%edi)           /* high 32 bits of PTE */
@@ -126,14 +136,29 @@ long_mode_start:
      * and finally invokes the Pynux start_kernel(). */
     jmp     start_kernel_asm_entry
 
-/* ---------- 64-bit GDT used to enter long mode -------------------- */
+/* ---------- 64-bit GDT used to enter long mode -------------------- *
+ * Layout chosen for SYSCALL/SYSRET compatibility:
+ *   0x00 = null
+ *   0x08 = kernel code  (CS for ring 0; SYSCALL CS = STAR[47:32])
+ *   0x10 = kernel data  (SS for ring 0; SYSCALL SS = STAR[47:32] + 8)
+ *   0x18 = user data    (SYSRET SS = STAR[63:48] + 8 = 0x18 with RPL=3)
+ *   0x20 = user code    (SYSRET CS = STAR[63:48] + 16 = 0x20 with RPL=3)
+ * With STAR[63:48] = 0x10 these selectors align with the SYSRET
+ * hardware-imposed +8/+16 offsets. M16.17 introduces the syscall path
+ * that depends on this layout.
+ */
     .align 8
+    .globl gdt64
 gdt64:
     .quad   0x0000000000000000      /* 0x00: null */
     /* 0x08: 64-bit code: P=1, DPL=0, S=1, type=code/exec/read, L=1 */
     .quad   0x00AF9A000000FFFF
     /* 0x10: 64-bit data: P=1, DPL=0, S=1, type=data/rw           */
     .quad   0x00CF92000000FFFF
+    /* 0x18: user 64-bit data: P=1, DPL=3, S=1, type=data/rw      */
+    .quad   0x00CFF2000000FFFF
+    /* 0x20: user 64-bit code: P=1, DPL=3, S=1, type=code/exec/read, L=1 */
+    .quad   0x00AFFA000000FFFF
 gdt64_end:
 
 gdt64_descriptor:

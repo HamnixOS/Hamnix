@@ -40,6 +40,10 @@ from arch.x86.kernel.time import time_init, get_jiffies, get_local_timer_ticks
 from kernel.sched.core import (
     sched_init, kthread_create, start_first_task, get_current_pid,
 )
+from arch.x86.kernel.syscall import syscall_init
+
+extern def enter_user_mode(entry: uint64, stack: uint64)
+extern def user_demo_entry()
 from mm.memblock import memblock_alloc, memblock_used, memblock_avail
 from mm.page_alloc import (
     alloc_page, free_page, alloc_pages, free_pages,
@@ -369,19 +373,18 @@ def start_kernel():
     i8259_init()
     time_init()
 
-    sched_init()
-    kthread_create(0, cast[uint64](&task_a_entry), 0x5f5f615f6b736174)
-    kthread_create(1, cast[uint64](&task_b_entry), 0x5f5f625f6b736174)
+    # --- M16.17: drop into a userspace task via SYSCALL/SYSRET ----
+    # Allocate a kernel stack to be used by syscall handlers and a
+    # user stack for the demo task itself. Both come from alloc_page,
+    # so each is a single 4 KiB page (plenty for the smoke test).
+    syscall_kstack: uint64 = alloc_page() + 4096
+    user_stack:     uint64 = alloc_page() + 4096
 
-    printk0("Pynux: entering task 0 (IRQs enabled atomically via iretq)\n")
-    # Do NOT call local_irq_enable() here. If we did, the very next
-    # timer tick would fire while still in start_kernel's boot context;
-    # schedule() would then save the boot RSP into task slot 0 (where
-    # we previously stashed task A's pre-built bootstrap stack),
-    # corrupting it. The iret frame inside each kthread's pre-built
-    # stack has RFLAGS = 0x202 (IF=1), so IRQs come on atomically with
-    # the iretq that lands in the task's entry function.
-    start_first_task()
-    # NOT REACHED.
-    printk0("Pynux: ERROR — returned from start_first_task\n")
+    syscall_init(syscall_kstack)
+    printk2("Pynux: kernel syscall stack @ %p, user stack @ %p\n",
+            syscall_kstack, user_stack)
+    printk0("Pynux: entering ring-3 user_demo_entry...\n")
+    enter_user_mode(cast[uint64](&user_demo_entry), user_stack)
+    # NOT REACHED — user task hits SYS_EXIT which halts the box.
+    printk0("Pynux: ERROR — returned from enter_user_mode\n")
     halt_forever()
