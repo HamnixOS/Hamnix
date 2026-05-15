@@ -26,6 +26,10 @@ from kernel.printk.printk import (
     pr_info, pr_warn, pr_err, pr_emerg,
 )
 from kernel.panic import WARN_ON
+from kernel.list import (
+    ListHead, INIT_LIST_HEAD, list_add, list_add_tail,
+    list_del, list_empty,
+)
 from arch.x86.kernel.idt import idt_init
 from arch.x86.kernel.traps import do_trap          # exported for common_trap
 from arch.x86.kernel.irq import do_irq             # exported for common_irq
@@ -155,6 +159,88 @@ def string_ops_smoke_test():
     kfree(z)
 
 
+# --- list_head smoke test ------------------------------------------
+#
+# Container struct: a tiny payload + an embedded ListHead. Mirrors
+# how Linux's task_struct / kmem_cache / file etc. embed a
+# `struct list_head` for chaining. Both globals and the offset
+# constant below are referenced from the smoke test below.
+
+class ListNode:
+    value:    uint64           # offset  0
+    pad:      uint64           # offset  8 (keeps link 16-byte aligned)
+    link:     ListHead         # offset 16, size 16
+
+
+# Byte offset of `link` within ListNode. Pynux has no container_of
+# macro, so the container-walk code has to subtract this constant
+# explicitly from a ListHead pointer to recover the surrounding
+# ListNode.
+LIST_NODE_LINK_OFFSET: uint64 = 16
+
+
+demo_head: ListHead
+demo_n1:   ListNode
+demo_n2:   ListNode
+demo_n3:   ListNode
+
+
+def _list_walk_and_sum(head: Ptr[ListHead]) -> uint64:
+    # Walk forward from head, summing each node's payload `value`.
+    # Stops when we loop back to head — the canonical circular-list
+    # termination condition.
+    head_addr: uint64 = cast[uint64](head)
+    pos:       uint64 = head[0].next_ptr
+    total:     uint64 = 0
+    while pos != head_addr:
+        node: Ptr[ListNode] = cast[Ptr[ListNode]](
+            pos - LIST_NODE_LINK_OFFSET
+        )
+        total = total + node[0].value
+        link: Ptr[ListHead] = cast[Ptr[ListHead]](pos)
+        pos = link[0].next_ptr
+    return total
+
+
+def list_smoke_test():
+    printk0("Pynux: list_head smoke test\n")
+
+    INIT_LIST_HEAD(&demo_head)
+    printk1("  list_empty after init = %d  (expect 1)\n",
+            cast[uint64](list_empty(&demo_head)))
+
+    demo_n1.value = 10
+    demo_n2.value = 20
+    demo_n3.value = 30
+
+    # Add at head: post-add order is 1 -> 2 -> 3 ... wait no,
+    # list_add inserts AT THE FRONT, so calling order 1,2,3 yields
+    # head -> 3 -> 2 -> 1 -> back to head.
+    list_add(&demo_n1.link, &demo_head)
+    list_add(&demo_n2.link, &demo_head)
+    list_add(&demo_n3.link, &demo_head)
+
+    printk1("  list_empty after 3 adds = %d  (expect 0)\n",
+            cast[uint64](list_empty(&demo_head)))
+
+    # Walk sum: 30 + 20 + 10 = 60. Independent of insertion order,
+    # which is also a soft validity check on prev pointers.
+    total: uint64 = _list_walk_and_sum(&demo_head)
+    printk1("  walked sum = %d  (expect 60)\n", total)
+
+    # Remove the middle node (n2), walk again. Expected: 30 + 10 = 40.
+    list_del(&demo_n2.link)
+    total = _list_walk_and_sum(&demo_head)
+    printk1("  after list_del(n2): sum = %d  (expect 40)\n", total)
+
+    # list_add_tail puts a node at the BACK; after the del above the
+    # list is head -> 3 -> 1 -> head, so a tail-add of n2 makes it
+    # head -> 3 -> 1 -> 2 -> head. Sum becomes 30+10+20 = 60 again.
+    list_add_tail(&demo_n2.link, &demo_head)
+    total = _list_walk_and_sum(&demo_head)
+    printk1("  after list_add_tail(n2): sum = %d  (expect 60)\n", total)
+
+
 def diag_smoke_test():
     # Exercise the log-level wrappers and WARN_ON. panic() and BUG()
     # are not invoked here because they halt the box; we just confirm
@@ -238,6 +324,7 @@ def start_kernel():
     slab_smoke_test()
     string_ops_smoke_test()
     diag_smoke_test()
+    list_smoke_test()
 
     setup_per_cpu_areas()
     printk1("Pynux: smp_processor_id() = %d\n", get_cpu_id())
