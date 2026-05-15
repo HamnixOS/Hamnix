@@ -1,0 +1,145 @@
+# fs/cpio.py
+#
+# Mirrors init/initramfs.c in Linux at minimum scope: parse a cpio
+# "newc" archive (built by scripts/build_initramfs.py and embedded as
+# raw bytes by fs/initramfs_blob.S) and register every regular file in
+# a small Pynux-side file table. fs/vfs.py reads this table instead of
+# the M16.21 hand-rolled accessors.
+#
+# cpio newc per-entry layout we parse:
+#   bytes   0..  5   magic "070701"
+#   bytes   6.. 13   ino (hex)
+#   bytes  14.. 21   mode (hex)
+#   ...
+#   bytes  54.. 61   filesize (hex)
+#   ...
+#   bytes  94..101   namesize (hex)
+#   bytes 102..109   check (hex)
+#   bytes 110..      NUL-terminated name, padded with NULs so DATA
+#                    starts 4-byte aligned from entry start.
+#   then              file payload, padded so the next entry starts
+#                    4-byte aligned from archive start.
+#
+# A sentinel entry named "TRAILER!!!" with filesize 0 marks the end.
+# We don't validate the magic on every entry past the first; the
+# generator emits a well-formed archive.
+
+from kernel.printk.printk import printk0, printk1, printk2
+
+extern def initramfs_cpio_base() -> uint64
+extern def initramfs_cpio_size() -> uint64
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+
+
+class FileEntry:
+    name:  uint64        # Ptr[char] (into the cpio blob)
+    data:  uint64        # Ptr[uint8]
+    size:  uint64
+
+
+NR_FILES: uint64 = 16
+file_table: Array[16, FileEntry]
+nr_files:   uint64 = 0
+
+
+def _hex_digit_val(c: int32) -> uint64:
+    if c >= 48 and c <= 57:                 # '0'..'9'
+        return cast[uint64](c - 48)
+    if c >= 65 and c <= 70:                 # 'A'..'F'
+        return cast[uint64](c - 55)
+    if c >= 97 and c <= 102:                # 'a'..'f'
+        return cast[uint64](c - 87)
+    return 0
+
+
+def _parse_hex8(p: Ptr[uint8]) -> uint64:
+    # Read an 8-char ASCII hex field (no prefix, uppercase or lower).
+    v: uint64 = 0
+    i: uint64 = 0
+    while i < 8:
+        v = (v << 4) | _hex_digit_val(cast[int32](p[i]))
+        i = i + 1
+    return v
+
+
+def _name_is_trailer(name: Ptr[uint8]) -> int32:
+    # Compare against "TRAILER!!!" (10 chars + NUL). cpio's trailer
+    # is exactly this string; init/initramfs.c uses the same check.
+    expected: Array[11, uint8]
+    expected[0] = 84    # 'T'
+    expected[1] = 82    # 'R'
+    expected[2] = 65    # 'A'
+    expected[3] = 73    # 'I'
+    expected[4] = 76    # 'L'
+    expected[5] = 69    # 'E'
+    expected[6] = 82    # 'R'
+    expected[7] = 33    # '!'
+    expected[8] = 33    # '!'
+    expected[9] = 33    # '!'
+    expected[10] = 0
+    i: uint64 = 0
+    while i < 11:
+        if name[i] != expected[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def _align4(x: uint64) -> uint64:
+    return (x + 3) & ~cast[uint64](3)
+
+
+def cpio_init():
+    # Walk every entry and register non-trailer files.
+    base: uint64 = initramfs_cpio_base()
+    end:  uint64 = base + initramfs_cpio_size()
+    pos:  uint64 = base
+
+    nr_files = 0
+    while pos + 110 <= end:
+        # Filesize at offset 54..61, namesize at offset 94..101.
+        filesize: uint64 = _parse_hex8(
+            cast[Ptr[uint8]](pos + 54))
+        namesize: uint64 = _parse_hex8(
+            cast[Ptr[uint8]](pos + 94))
+
+        name_ptr: uint64 = pos + 110
+        # Stop at TRAILER!!! sentinel.
+        if _name_is_trailer(cast[Ptr[uint8]](name_ptr)) != 0:
+            break
+
+        # Data starts at the next 4-aligned offset from entry start.
+        data_offset: uint64 = _align4(110 + namesize)
+        data_ptr:    uint64 = pos + data_offset
+
+        if nr_files < NR_FILES:
+            file_table[nr_files].name = name_ptr
+            file_table[nr_files].data = data_ptr
+            file_table[nr_files].size = filesize
+            nr_files = nr_files + 1
+        else:
+            printk1("cpio: file table full at %d entries\n",
+                    cast[uint64](NR_FILES))
+
+        # Advance to next entry: skip data + alignment.
+        pos = pos + _align4(data_offset + filesize)
+
+    printk1("cpio: registered %d files from initramfs\n", nr_files)
+
+
+# --- Accessor API used by fs/vfs.py --------------------------------
+
+def initramfs_entry_count() -> uint64:
+    return nr_files
+
+
+def initramfs_entry_name(idx: uint64) -> Ptr[char]:
+    return cast[Ptr[char]](file_table[idx].name)
+
+
+def initramfs_entry_data(idx: uint64) -> Ptr[uint8]:
+    return cast[Ptr[uint8]](file_table[idx].data)
+
+
+def initramfs_entry_size(idx: uint64) -> uint64:
+    return file_table[idx].size

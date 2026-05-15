@@ -25,11 +25,12 @@ from kernel.sched.core import (
     TaskStruct, current_task,
     FD_CLOSED_MARK, FD_STDIN_MARK, FD_STDOUT_MARK, FD_STDERR_MARK,
 )
+from fs.cpio import (
+    cpio_init,
+    initramfs_entry_count, initramfs_entry_name,
+    initramfs_entry_data, initramfs_entry_size,
+)
 
-extern def initramfs_entry_count() -> uint64
-extern def initramfs_entry_name(idx: uint64) -> Ptr[char]
-extern def initramfs_entry_data(idx: uint64) -> Ptr[uint8]
-extern def initramfs_entry_size(idx: uint64) -> uint64
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
 NR_FDS: uint32 = 4
@@ -49,8 +50,10 @@ SEEK_END: int32 = 2
 
 def vfs_init():
     # Per-task fd tables are initialised in create_user_task /
-    # kthread_create. Nothing global to do now.
-    pass
+    # kthread_create. The only filesystem-side work is parsing the
+    # embedded cpio archive into the in-memory file_table that the
+    # initramfs_entry_* accessors consult.
+    cpio_init()
 
 
 def _strcmp_cstr(a: Ptr[char], b: Ptr[char]) -> int32:
