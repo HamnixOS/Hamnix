@@ -219,6 +219,16 @@ def assemble_and_link_x86_bare(asm_file: Path, output: Path,
             print(f"Error: missing {required}", file=sys.stderr)
             return False
 
+    # Additional hand-written .S files under arch/x86/ (excluding the two
+    # boot/early-entry stubs above, which are passed explicitly so we can
+    # guarantee link order: header.o first → multiboot magic lands at top
+    # of .head.text). Anything else in arch/x86/{boot,kernel} that ends in
+    # .S is picked up automatically — drop a new file in and rebuild.
+    extra_s = sorted(
+        p for p in (project_root / "arch/x86").rglob("*.S")
+        if p != boot_s and p != head_s
+    )
+
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
         boot_o = tmpdir / "header.o"
@@ -235,8 +245,13 @@ def assemble_and_link_x86_bare(asm_file: Path, output: Path,
         pynux_s = tmpdir / "pynux_main.S"
         pynux_s.write_text(".code64\n" + asm_file.read_text())
 
-        for src, obj in ((boot_s, boot_o), (head_s, head_o),
-                         (pynux_s, main_o)):
+        extra_objs: list[Path] = []
+        for src in extra_s:
+            obj = tmpdir / (src.stem + ".o")
+            extra_objs.append(obj)
+
+        for src, obj in [(boot_s, boot_o), (head_s, head_o),
+                         (pynux_s, main_o)] + list(zip(extra_s, extra_objs)):
             result = subprocess.run(
                 [as_cmd, "--32", "-o", str(obj), str(src)],
                 capture_output=True, text=True,
@@ -249,12 +264,12 @@ def assemble_and_link_x86_bare(asm_file: Path, output: Path,
         # Order matters: header.o first so multiboot magic lands at the top
         # of .head.text; the linker script enforces section order but listing
         # header.o first eliminates any cross-section ambiguity in the input.
-        result = subprocess.run(
-            [ld_cmd, "-m", "elf_i386", "-nostdlib", "-static",
-             "-T", str(lds), "-o", str(output),
-             str(boot_o), str(head_o), str(main_o)],
-            capture_output=True, text=True,
-        )
+        link_cmd = [
+            ld_cmd, "-m", "elf_i386", "-nostdlib", "-static",
+            "-T", str(lds), "-o", str(output),
+            str(boot_o), str(head_o), str(main_o),
+        ] + [str(o) for o in extra_objs]
+        result = subprocess.run(link_cmd, capture_output=True, text=True)
         if result.returncode != 0:
             print(f"Error linking:\n{result.stderr}", file=sys.stderr)
             return False

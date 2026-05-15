@@ -43,7 +43,7 @@ from .ast_nodes import (
     Expr, Stmt,
     CallExpr, Identifier, StringLiteral, IntLiteral, CharLiteral, BoolLiteral,
     BinaryExpr, UnaryExpr, BinOp, UnaryOp,
-    IndexExpr, MemberExpr,
+    IndexExpr, MemberExpr, CastExpr,
     Type, PointerType, ArrayType, FunctionPointerType,
 )
 
@@ -637,6 +637,15 @@ class X86CodeGen:
 
             case CallExpr():
                 self.gen_call(expr)
+
+            case CastExpr(expr=inner):
+                # All integer types live in a 64-bit %rax slot in our ABI;
+                # widening / narrowing between int32/int64/uint64/etc. is
+                # a no-op at the assembly level (callers that care about
+                # the upper bits use explicit masks). Float<->int would
+                # need runtime conversion, but no x86 caller exercises
+                # that path yet — when it does we'll specialize here.
+                self.gen_expr(inner)
 
             case _:
                 raise CodeGenError(
