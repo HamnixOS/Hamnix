@@ -27,11 +27,53 @@ from arch.x86.mm.init import mem_init
 from arch.x86.kernel.setup_percpu import setup_per_cpu_areas, get_cpu_id
 from arch.x86.kernel.i8259 import i8259_init
 from arch.x86.kernel.time import time_init, get_jiffies
+from kernel.sched.core import sched_init, kthread_create, yield_cpu
 from mm.memblock import memblock_alloc, memblock_used, memblock_avail
 
 extern def trigger_int3()
 extern def local_irq_enable()
 extern def cpu_relax()
+
+print_count: uint64 = 0
+MAX_PRINTS:  uint64 = 30
+
+
+def busy_wait_one_tick():
+    # Spin until jiffies advances by 1 (~10 ms at HZ=100). Used by the
+    # two demo threads so the A/B output is slow enough to read.
+    start: uint64 = get_jiffies()
+    while get_jiffies() == start:
+        cpu_relax()
+
+
+def halt_forever():
+    asm_volatile("cli")
+    while True:
+        asm_volatile("hlt")
+
+
+def task_a_entry():
+    # Kernel thread A — prints 'A', yields. Loops forever until the
+    # shared print_count reaches MAX_PRINTS, then halts the box.
+    while True:
+        early_puts("A")
+        print_count = print_count + 1
+        if print_count >= MAX_PRINTS:
+            early_puts("\nPynux: M16.6 done, halting\n")
+            halt_forever()
+        busy_wait_one_tick()
+        yield_cpu()
+
+
+def task_b_entry():
+    while True:
+        early_puts("B")
+        print_count = print_count + 1
+        if print_count >= MAX_PRINTS:
+            early_puts("\nPynux: M16.6 done, halting\n")
+            halt_forever()
+        busy_wait_one_tick()
+        yield_cpu()
 
 
 def trap_init():
@@ -94,7 +136,15 @@ def start_kernel():
 
     timer_smoke_test()
 
-    early_puts("Pynux: triggering INT3 (trap path final smoke)\n")
-    trigger_int3()
+    sched_init()
+    # Use a 64-bit literal that decodes to "task_a__" in little-endian
+    # byte order when stored as the .name0 field. Decorative only.
+    kthread_create(1, cast[uint64](&task_a_entry), 0x5f5f615f6b736174)
+    kthread_create(2, cast[uint64](&task_b_entry), 0x5f5f625f6b736174)
+    early_puts("Pynux: two kthreads created, entering scheduler\n")
 
-    early_puts("Pynux: ERROR — returned from trigger_int3\n")
+    # Loop yielding until the workers halt the box. Each pass through
+    # the init context costs us roughly 10 ms (one tick) of latency
+    # in the A/B output, which is fine for a smoke test.
+    while True:
+        yield_cpu()
