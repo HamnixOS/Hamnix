@@ -23,14 +23,20 @@ from .codegen_arm import generate as generate_arm, CodeGenError
 # Linux kernel build system owns assembly+link, so the CLI stops at emitting
 # a .S file rather than invoking an assembler/linker itself.
 TARGETS = {
-    "arm-cortex-m3": {"codegen": "arm", "kbuild": False},
-    "x86_64-linux-kernel-module": {"codegen": "x86", "kbuild": True},
+    "arm-cortex-m3": {"codegen": "arm", "kbuild": False, "bare_metal": True},
+    "x86_64-linux-kernel-module": {"codegen": "x86", "kbuild": True,
+                                   "bare_metal": False},
+    # Standalone x86_64 kernel ELF (vmlinux-equivalent). The compiler owns
+    # assembly + link itself (no kbuild), and the codegen skips the .modinfo
+    # license stamp that's only meaningful for loadable modules.
+    "x86_64-bare-metal": {"codegen": "x86", "kbuild": False,
+                          "bare_metal": True},
 }
 DEFAULT_TARGET = "arm-cortex-m3"
 
 
 def get_generator(target: str):
-    """Return the backend's generate(program: Program) -> str function."""
+    """Return a callable program -> assembly string for the target."""
     spec = TARGETS.get(target)
     if spec is None:
         known = ", ".join(TARGETS)
@@ -41,7 +47,8 @@ def get_generator(target: str):
         return generate_arm
     if spec["codegen"] == "x86":
         from .codegen_x86 import generate as generate_x86
-        return generate_x86
+        bare = spec.get("bare_metal", False)
+        return lambda program: generate_x86(program, bare_metal=bare)
     raise AssertionError(f"unhandled codegen backend: {spec['codegen']}")
 
 
@@ -186,6 +193,75 @@ def compile_with_imports(main_file: Path, target: str = DEFAULT_TARGET) -> str:
         sys.exit(1)
 
 
+def assemble_and_link_x86_bare(asm_file: Path, output: Path,
+                                project_root: Path) -> bool:
+    """Assemble + link a Pynux bare-metal x86_64 kernel image.
+
+    Combines the compiler-emitted .S (Pynux init/main.py et al.) with the
+    hand-written boot stubs under arch/x86/boot/header.S and
+    arch/x86/kernel/head_64.S, then links with arch/x86/kernel/vmlinux.lds
+    into an ELF that multiboot1-capable loaders (QEMU -kernel, GRUB) accept.
+    """
+    as_cmd = "as"
+    ld_cmd = "ld"
+
+    try:
+        subprocess.run([as_cmd, "--version"], capture_output=True, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("Error: GNU as not found (install binutils)", file=sys.stderr)
+        return False
+
+    boot_s = project_root / "arch/x86/boot/header.S"
+    head_s = project_root / "arch/x86/kernel/head_64.S"
+    lds = project_root / "arch/x86/kernel/vmlinux.lds"
+    for required in (boot_s, head_s, lds):
+        if not required.exists():
+            print(f"Error: missing {required}", file=sys.stderr)
+            return False
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        boot_o = tmpdir / "header.o"
+        head_o = tmpdir / "head_64.o"
+        main_o = tmpdir / "main.o"
+
+        # Pynux's emitted .S is 64-bit code but has no leading `.code64`
+        # (the codegen is target-mode-agnostic). For the bare-metal target
+        # we assemble with `as --32` to produce an elf32-i386 .o that the
+        # multiboot1 loader will accept, while a leading `.code64` tells
+        # the assembler to encode 64-bit instructions. The same prepend is
+        # applied to head_64.S below by way of the file already declaring
+        # `.code64`. The boot stub (header.S) starts in `.code32`.
+        pynux_s = tmpdir / "pynux_main.S"
+        pynux_s.write_text(".code64\n" + asm_file.read_text())
+
+        for src, obj in ((boot_s, boot_o), (head_s, head_o),
+                         (pynux_s, main_o)):
+            result = subprocess.run(
+                [as_cmd, "--32", "-o", str(obj), str(src)],
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                print(f"Error assembling {src}:\n{result.stderr}",
+                      file=sys.stderr)
+                return False
+
+        # Order matters: header.o first so multiboot magic lands at the top
+        # of .head.text; the linker script enforces section order but listing
+        # header.o first eliminates any cross-section ambiguity in the input.
+        result = subprocess.run(
+            [ld_cmd, "-m", "elf_i386", "-nostdlib", "-static",
+             "-T", str(lds), "-o", str(output),
+             str(boot_o), str(head_o), str(main_o)],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            print(f"Error linking:\n{result.stderr}", file=sys.stderr)
+            return False
+
+    return True
+
+
 def assemble_and_link(asm_file: Path, output: Path, runtime_dir: Path) -> bool:
     """Assemble and link to create ELF binary."""
     # Check for toolchain
@@ -309,14 +385,16 @@ def cmd_compile(args: argparse.Namespace) -> int:
         asm_file.write_text(asm)
         print(f"Assembly written to {asm_file}")
 
-    runtime_dir = find_runtime()
-
     with tempfile.NamedTemporaryFile(suffix=".s", delete=False, mode="w") as f:
         f.write(asm)
         asm_path = Path(f.name)
 
     try:
-        if not assemble_and_link(asm_path, output, runtime_dir):
+        if args.target == "x86_64-bare-metal":
+            ok = assemble_and_link_x86_bare(asm_path, output, find_pynux_root())
+        else:
+            ok = assemble_and_link(asm_path, output, find_runtime())
+        if not ok:
             return 1
     finally:
         asm_path.unlink()

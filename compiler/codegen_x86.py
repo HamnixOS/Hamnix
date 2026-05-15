@@ -129,7 +129,7 @@ class FunctionContext:
 class X86CodeGen:
     """x86_64 (System V AMD64) code generator for the kernel-module target."""
 
-    def __init__(self) -> None:
+    def __init__(self, bare_metal: bool = False) -> None:
         self.output: list[str] = []
         self.string_literals: dict[str, str] = {}
         self.string_counter: int = 0
@@ -138,6 +138,10 @@ class X86CodeGen:
         self.global_var_types: dict[str, Type] = {}
         self.structs: dict[str, StructInfo] = {}
         self.ctx: Optional[FunctionContext] = None
+        # Bare-metal target compiles a standalone kernel ELF: skip
+        # kbuild-specific bits like the .modinfo license stamp that modpost
+        # consumes when building a .ko inside the Linux source tree.
+        self.bare_metal = bare_metal
 
     # -- emission helpers ---------------------------------------------------
 
@@ -303,7 +307,8 @@ class X86CodeGen:
 
         self.gen_data(program)
         self.gen_rodata()
-        self.gen_modinfo()
+        if not self.bare_metal:
+            self.gen_modinfo()
         return "\n".join(self.output) + "\n"
 
     def layout_struct(self, cls: ClassDef) -> None:
@@ -970,6 +975,6 @@ class X86CodeGen:
             raise CodeGenError(f"x86: unknown intrinsic '{name}'")
 
 
-def generate(program: Program) -> str:
+def generate(program: Program, bare_metal: bool = False) -> str:
     """Generate x86_64 assembly from a Pynux AST."""
-    return X86CodeGen().gen_program(program)
+    return X86CodeGen(bare_metal=bare_metal).gen_program(program)
