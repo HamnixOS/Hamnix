@@ -642,7 +642,17 @@ class X86CodeGen:
         """Load an identifier's value into %rax."""
         if self.ctx is not None and name in self.ctx.locals:
             var = self.ctx.locals[name]
-            self.emit(f"    movq {var.offset}(%rbp), %rax")
+            t = var.var_type
+            is_aggregate = (
+                isinstance(t, ArrayType)
+                or (t is not None and hasattr(t, "name")
+                    and t.name in self.structs)
+            )
+            if is_aggregate:
+                # Array / struct local: decay to the slot's address.
+                self.emit(f"    leaq {var.offset}(%rbp), %rax")
+            else:
+                self.emit(f"    movq {var.offset}(%rbp), %rax")
         elif name in self.defined_funcs or name in self.extern_funcs:
             # Function reference: load the symbol's address (RIP-relative).
             self.emit(f"    leaq {name}(%rip), %rax")
