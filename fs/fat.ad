@@ -1,0 +1,363 @@
+# fs/fat.py
+#
+# Read-only FAT32 driver — mirror of fs/fat/inode.c + fs/fat/dir.c
+# + fs/fat/fatent.c at the smallest meaningful scale. Linux's FAT
+# layer has separate caching, LFN handling, write transactions and
+# allocator bitmaps; we expose three calls:
+#
+#   fat_init(blockdev_slot)               parse the BPB once
+#   fat_lookup(name, &cluster, &size)     8.3 lookup in root dir
+#   fat_read(first_cluster, file_size,
+#            pos, count, buf)             stream a file via FAT chain
+#
+# Single mount only (one global state block). Multiple mounts wait
+# for the superblock/inode/dentry refactor that M16.46 EXT4 will
+# force on us.
+#
+# Long filenames (LFN, attr 0x0F) are skipped — we match short-name
+# entries exclusively. The image generator emits uppercase 8.3
+# names so a real round-trip is exercised without LFN parsing.
+
+from kernel.block.blk import blk_read_sectors, SECTOR_SIZE
+from kernel.printk.printk import printk0, printk1, printk2
+
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+
+
+# --- mount-time state (one mount only) ---------------------------
+
+fat_blockdev_slot:    int32  = -1
+fat_sectors_per_clu:  uint64 = 1
+fat_reserved_sectors: uint64 = 0
+fat_num_fats:         uint64 = 0
+fat_sectors_per_fat:  uint64 = 0
+fat_root_cluster:     uint64 = 0
+fat_data_start_lba:   uint64 = 0
+fat_fat_start_lba:    uint64 = 0
+
+
+# Buffers used during read. Allocated once (.bss) — no per-call
+# kmalloc, and the kernel never calls FAT routines reentrantly so
+# a global scratch is safe. SECTOR_SIZE-sized; if a future image
+# bumps cluster size we'll resize.
+fat_sector_buf: Array[512, uint8]
+fat_fat_buf:    Array[512, uint8]
+
+
+def _read_u16_le(p: Ptr[uint8]) -> uint16:
+    return cast[uint16](p[0]) | (cast[uint16](p[1]) << 8)
+
+
+def _read_u32_le(p: Ptr[uint8]) -> uint32:
+    return (cast[uint32](p[0])
+            | (cast[uint32](p[1]) << 8)
+            | (cast[uint32](p[2]) << 16)
+            | (cast[uint32](p[3]) << 24))
+
+
+def fat_init(slot: int32) -> int32:
+    # Read sector 0 (the BPB) and pull out the geometry. Returns 0
+    # on success, -1 on read failure / non-FAT image.
+    rc: int32 = blk_read_sectors(slot, 0, 1, &fat_sector_buf[0])
+    if rc != 0:
+        printk0("fat: failed to read boot sector\n")
+        return -1
+    p: Ptr[uint8] = &fat_sector_buf[0]
+    # Boot signature 0x55 0xAA at offset 510.
+    if p[510] != 0x55 or p[511] != 0xAA:
+        printk0("fat: bad boot signature\n")
+        return -1
+    bytes_per_sector: uint64 = cast[uint64](_read_u16_le(
+        cast[Ptr[uint8]](cast[uint64](p) + 11)))
+    if bytes_per_sector != SECTOR_SIZE:
+        printk1("fat: unsupported sector size %d\n", bytes_per_sector)
+        return -1
+
+    fat_blockdev_slot    = slot
+    fat_sectors_per_clu  = cast[uint64](p[13])
+    fat_reserved_sectors = cast[uint64](_read_u16_le(
+        cast[Ptr[uint8]](cast[uint64](p) + 14)))
+    fat_num_fats         = cast[uint64](p[16])
+    fat_sectors_per_fat  = cast[uint64](_read_u32_le(
+        cast[Ptr[uint8]](cast[uint64](p) + 36)))
+    fat_root_cluster     = cast[uint64](_read_u32_le(
+        cast[Ptr[uint8]](cast[uint64](p) + 44)))
+
+    fat_fat_start_lba    = fat_reserved_sectors
+    fat_data_start_lba   = fat_reserved_sectors \
+                         + fat_num_fats * fat_sectors_per_fat
+
+    printk2("fat: mounted; root_cluster=%d data_lba=%d\n",
+            fat_root_cluster, fat_data_start_lba)
+    return 0
+
+
+def _cluster_to_lba(cluster: uint64) -> uint64:
+    # Linux's fat_clus_to_blknr() at minimum scope: cluster N starts
+    # at data_start_lba + (N - 2) * sectors_per_cluster. The "-2"
+    # is because cluster numbering skips entries 0 and 1 in the FAT
+    # (used for media descriptor and EOC reserved).
+    return fat_data_start_lba + (cluster - 2) * fat_sectors_per_clu
+
+
+FAT_EOC_MIN: uint32 = 0x0FFFFFF8        # 0xFFFFFFF8..0xFFFFFFFF = end-of-chain
+
+
+def _fat_lookup_cluster(cluster: uint64) -> uint32:
+    # Read the FAT entry for `cluster` and return the raw value (low
+    # 28 bits significant per FAT32 spec). Returns 0 if the cluster
+    # is out of range — caller should treat that as "no next".
+    entry_offset_bytes: uint64 = cluster * 4
+    fat_lba: uint64 = fat_fat_start_lba + entry_offset_bytes / SECTOR_SIZE
+    within: uint64 = entry_offset_bytes % SECTOR_SIZE
+    rc: int32 = blk_read_sectors(fat_blockdev_slot, fat_lba, 1,
+                                 &fat_fat_buf[0])
+    if rc != 0:
+        return 0
+    raw: uint32 = _read_u32_le(
+        cast[Ptr[uint8]](cast[uint64](&fat_fat_buf[0]) + within))
+    return raw & 0x0FFFFFFF
+
+
+def _is_end_of_chain(entry: uint32) -> int32:
+    if entry >= FAT_EOC_MIN:
+        return 1
+    return 0
+
+
+# --- 8.3 name normalisation --------------------------------------
+#
+# Convert "/mnt/HELLO.TXT" (or "HELLO.TXT" with prefix already
+# stripped) to the 11-byte "NAME    EXT" form FAT stores in dir
+# entries.  Returns 1 on success, 0 if the name doesn't fit.
+
+def _to_upper(c: uint8) -> uint8:
+    if c >= 97 and c <= 122:                # 'a'..'z'
+        return c - 32
+    return c
+
+
+def fat_name_to_83(name: Ptr[char], out: Ptr[uint8]) -> int32:
+    # Fill `out[0..11]` with the 8.3-padded form. `name` is a
+    # NUL-terminated cstring (already stripped of the /mnt/ prefix).
+    i: int32 = 0
+    # 8-char stem, space-padded
+    j: int32 = 0
+    while j < 8:
+        out[j] = 32                          # space
+        j = j + 1
+    while j < 11:
+        out[j] = 32
+        j = j + 1
+    # Read up to 8 chars of stem until '.' or NUL.
+    while i < 8:
+        c: int32 = name[i]
+        if c == 0 or c == 46:                # NUL or '.'
+            break
+        out[i] = _to_upper(cast[uint8](c & 0xFF))
+        i = i + 1
+    # Skip past any chars until '.' or NUL.
+    while name[i] != 0 and name[i] != 46:
+        i = i + 1
+    if name[i] == 0:
+        return 1
+    i = i + 1                                # past the '.'
+    # Read up to 3 chars of extension.
+    k: int32 = 0
+    while k < 3 and name[i] != 0:
+        out[8 + k] = _to_upper(cast[uint8](name[i] & 0xFF))
+        i = i + 1
+        k = k + 1
+    if name[i] != 0:
+        return 0                             # extension too long
+    return 1
+
+
+# --- directory lookup --------------------------------------------
+
+def _dir_entries_per_sector() -> uint64:
+    return SECTOR_SIZE / 32                  # 16
+
+
+def _name_match(entry: Ptr[uint8], target83: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while i < 11:
+        if entry[i] != target83[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def fat_lookup(name: Ptr[char], out_cluster: Ptr[uint64],
+               out_size: Ptr[uint64]) -> int32:
+    # Walk the root directory cluster chain looking for `name` (8.3
+    # form, already stripped of any /mnt/ prefix). Returns 1 on hit
+    # (and fills out_cluster / out_size), 0 on miss.
+    target83: Array[11, uint8]
+    if fat_name_to_83(name, &target83[0]) == 0:
+        return 0
+
+    cluster: uint64 = fat_root_cluster
+    while _is_end_of_chain(cast[uint32](cluster)) == 0 and cluster != 0:
+        sec_in_cluster: uint64 = 0
+        while sec_in_cluster < fat_sectors_per_clu:
+            lba: uint64 = _cluster_to_lba(cluster) + sec_in_cluster
+            rc: int32 = blk_read_sectors(fat_blockdev_slot, lba, 1,
+                                         &fat_sector_buf[0])
+            if rc != 0:
+                return 0
+            n: uint64 = _dir_entries_per_sector()
+            ei: uint64 = 0
+            while ei < n:
+                entry: Ptr[uint8] = cast[Ptr[uint8]](
+                    cast[uint64](&fat_sector_buf[0]) + ei * 32)
+                first_byte: uint8 = entry[0]
+                if first_byte == 0:
+                    # 0x00 marks end-of-directory; nothing matches further.
+                    return 0
+                attr: uint8 = entry[11]
+                # 0xE5 = deleted entry, 0x0F = LFN — both skipped.
+                if first_byte != 0xE5 and attr != 0x0F:
+                    if _name_match(entry, &target83[0]) != 0:
+                        hi: uint16 = _read_u16_le(
+                            cast[Ptr[uint8]](cast[uint64](entry) + 20))
+                        lo: uint16 = _read_u16_le(
+                            cast[Ptr[uint8]](cast[uint64](entry) + 26))
+                        out_cluster[0] = (cast[uint64](hi) << 16) \
+                                       | cast[uint64](lo)
+                        out_size[0]    = cast[uint64](_read_u32_le(
+                            cast[Ptr[uint8]](cast[uint64](entry) + 28)))
+                        return 1
+                ei = ei + 1
+            sec_in_cluster = sec_in_cluster + 1
+        next_cluster: uint32 = _fat_lookup_cluster(cluster)
+        if _is_end_of_chain(next_cluster) != 0:
+            return 0
+        cluster = cast[uint64](next_cluster)
+    return 0
+
+
+# --- file read (FAT chain walk) -----------------------------------
+
+def fat_read(first_cluster: uint64, file_size: uint64,
+             pos: uint64, count: uint64, buf: Ptr[uint8]) -> int64:
+    # Stream up to `count` bytes from a file (described by its
+    # first cluster + total size) starting at offset `pos`. Returns
+    # bytes copied; 0 = EOF.
+    if pos >= file_size:
+        return 0
+    remaining: uint64 = file_size - pos
+    if count > remaining:
+        count = remaining
+    cluster_bytes: uint64 = fat_sectors_per_clu * SECTOR_SIZE
+    # Walk the FAT chain to the cluster containing `pos`.
+    skip: uint64 = pos / cluster_bytes
+    cluster: uint64 = first_cluster
+    while skip > 0:
+        nxt: uint32 = _fat_lookup_cluster(cluster)
+        if _is_end_of_chain(nxt) != 0:
+            return 0
+        cluster = cast[uint64](nxt)
+        skip = skip - 1
+    off_in_cluster: uint64 = pos % cluster_bytes
+    written: uint64 = 0
+    while written < count:
+        # We always read whole sectors; copy out only the chunk
+        # that fits the request. Walk sectors within the cluster.
+        sec_in_cluster: uint64 = off_in_cluster / SECTOR_SIZE
+        off_in_sector:  uint64 = off_in_cluster % SECTOR_SIZE
+        lba: uint64 = _cluster_to_lba(cluster) + sec_in_cluster
+        rc: int32 = blk_read_sectors(fat_blockdev_slot, lba, 1,
+                                     &fat_sector_buf[0])
+        if rc != 0:
+            return cast[int64](written)
+        chunk: uint64 = SECTOR_SIZE - off_in_sector
+        if chunk > count - written:
+            chunk = count - written
+        memcpy(cast[Ptr[uint8]](cast[uint64](buf) + written),
+               cast[Ptr[uint8]](cast[uint64](&fat_sector_buf[0])
+                                + off_in_sector),
+               chunk)
+        written = written + chunk
+        off_in_cluster = off_in_cluster + chunk
+        if off_in_cluster >= cluster_bytes:
+            # Advance to next cluster via FAT chain.
+            nxt: uint32 = _fat_lookup_cluster(cluster)
+            if _is_end_of_chain(nxt) != 0:
+                return cast[int64](written)
+            cluster = cast[uint64](nxt)
+            off_in_cluster = 0
+    return cast[int64](written)
+
+
+# --- open-file slot table -----------------------------------------
+#
+# Per-open metadata (first_cluster + file_size) lives here keyed by
+# slot index; fd_buf in the per-task fd table just holds that
+# index. Linux's struct file lives one level up in the VFS; we
+# park it in the fs driver until the superblock/inode/dentry
+# refactor that EXT4 will force.
+
+class FatOpenFile:
+    used:          uint32
+    pad:           uint32
+    first_cluster: uint64
+    file_size:     uint64
+
+
+FAT_MAX_OPEN: uint64 = 8
+fat_open_files: Array[8, FatOpenFile]
+
+
+def fat_open(name: Ptr[char]) -> int32:
+    # Look up the path under /mnt/ (caller has already stripped the
+    # prefix) and allocate an open-file slot for it. Returns slot
+    # index or -1. The slot is read-only — fat is read-only.
+    out_cluster: uint64 = 0
+    out_size:    uint64 = 0
+    if fat_lookup(name, &out_cluster, &out_size) == 0:
+        return -1
+    n: uint64 = FAT_MAX_OPEN
+    i: uint64 = 0
+    while i < n:
+        if fat_open_files[i].used == 0:
+            fat_open_files[i].used          = 1
+            fat_open_files[i].first_cluster = out_cluster
+            fat_open_files[i].file_size     = out_size
+            return cast[int32](i)
+        i = i + 1
+    printk0("fat: open-file table full\n")
+    return -1
+
+
+def fat_close(slot: int32):
+    fat_open_files[cast[uint64](slot)].used = 0
+
+
+def fat_open_first_cluster(slot: int32) -> uint64:
+    return fat_open_files[cast[uint64](slot)].first_cluster
+
+
+def fat_open_size(slot: int32) -> uint64:
+    return fat_open_files[cast[uint64](slot)].file_size
+
+
+# --- VFS interface ------------------------------------------------
+
+def is_fat_path(name: Ptr[char]) -> int32:
+    prefix: Ptr[uint8] = "/mnt/"
+    i: int32 = 0
+    while True:
+        p: int32 = prefix[i]
+        if p == 0:
+            return 1
+        n: int32 = name[i]
+        if n != p:
+            return 0
+        i = i + 1
+
+
+def strip_mnt_prefix(name: Ptr[char]) -> Ptr[char]:
+    # /mnt/ is 5 chars; the byte beyond it is the basename's first
+    # char. Caller has already verified is_fat_path returned true.
+    return cast[Ptr[char]](cast[uint64](name) + 5)
