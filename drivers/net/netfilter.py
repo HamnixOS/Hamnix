@@ -1,0 +1,76 @@
+# drivers/net/netfilter.py
+#
+# Mirrors net/netfilter/core.c at the chain-walk core. Pynux's earlier
+# .ko netfilter modules (M5.3, M12.1) hooked into Linux's hook chains;
+# here we own the chain ourselves and walk it on every injected packet.
+#
+# Scope (M16.29):
+#   - one chain (think of it as the equivalent of NF_INET_PRE_ROUTING)
+#   - register_netfilter_hook(fn) appends a function pointer to the
+#     chain. fn signature: `(data: Ptr[uint8], length: uint64) -> int32`
+#     returning 0 = accept (continue), 1 = drop (stop processing).
+#   - nf_run_hooks(data, length) walks the chain; first hook to
+#     return non-zero short-circuits.
+#
+# No real driver feeds packets yet; init/main.py registers a sample
+# hook and feeds a synthetic "packet" so we can see the chain walk
+# happen end-to-end.
+
+from kernel.printk.printk import printk0, printk1
+
+
+NF_MAX_HOOKS: uint64 = 4
+NF_HOOK_ACCEPT: int32 = 0
+NF_HOOK_DROP:   int32 = 1
+
+# Each slot stores a function pointer (uint64) or 0 if empty.
+nf_hooks:    Array[4, uint64]
+nr_nf_hooks: uint64 = 0
+
+
+def netfilter_init():
+    nr_nf_hooks = 0
+    i: uint64 = 0
+    while i < NF_MAX_HOOKS:
+        nf_hooks[i] = 0
+        i = i + 1
+
+
+def register_netfilter_hook(fn: uint64) -> int32:
+    # Returns 0 on success, -1 if the chain is full.
+    if nr_nf_hooks >= NF_MAX_HOOKS:
+        printk0("netfilter: chain full\n")
+        return -1
+    nf_hooks[nr_nf_hooks] = fn
+    nr_nf_hooks = nr_nf_hooks + 1
+    return 0
+
+
+def nf_run_hooks(data: Ptr[uint8], length: uint64) -> int32:
+    # Walk every registered hook. Any hook returning DROP stops the
+    # walk and reports DROP to the caller. ACCEPT just continues.
+    i: uint64 = 0
+    while i < nr_nf_hooks:
+        # Cast the stored function pointer back to a callable. Pynux
+        # supports calling through a uint64-held address via cast +
+        # local binding.
+        hook: uint64 = nf_hooks[i]
+        verdict: int32 = _call_hook(hook, data, length)
+        if verdict != NF_HOOK_ACCEPT:
+            printk1("netfilter: hook %d returned DROP\n", i)
+            return verdict
+        i = i + 1
+    return NF_HOOK_ACCEPT
+
+
+def _call_hook(fn: uint64, data: Ptr[uint8],
+               length: uint64) -> int32:
+    # Pynux idiom for calling through a function-pointer value
+    # (mirrors the .ko-side find_vqs_fn pattern in m4_virtio_blk):
+    # bind the address to a local Ptr[uint8] and "call" it. The
+    # codegen treats any local-named callee as an indirect call;
+    # the function's real signature is honoured at the asm level
+    # by the SysV register ABI (%rdi = data, %rsi = length, %rax
+    # = return).
+    hookfn: Ptr[uint8] = cast[Ptr[uint8]](fn)
+    return hookfn(data, length)

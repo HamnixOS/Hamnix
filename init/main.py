@@ -50,6 +50,11 @@ from drivers.video.console.vga_text import (
     vga_init, vga_putc, vga_puts, vga_read_cell_char,
 )
 from fs.vfs import vfs_init
+from drivers.pci.pci import pci_scan
+from drivers.net.netfilter import (
+    netfilter_init, register_netfilter_hook, nf_run_hooks,
+    NF_HOOK_ACCEPT,
+)
 
 extern def enter_user_mode(entry: uint64, stack: uint64)
 extern def user_demo_entry()
@@ -71,6 +76,45 @@ extern def memmove(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
 def trap_init():
     idt_init()
+
+
+# --- Netfilter smoke-test hook -------------------------------------
+#
+# Counts every packet it sees. Returns ACCEPT so the chain walk
+# continues (no-op since this is the only hook for now). Hook
+# signature matches the convention in drivers/net/netfilter.py:
+#   (data: Ptr[uint8], length: uint64) -> int32
+
+nf_packets_seen: uint64 = 0
+
+
+def packet_count_hook(data: Ptr[uint8], length: uint64) -> int32:
+    nf_packets_seen = nf_packets_seen + 1
+    printk2("netfilter: hook saw packet len=%d (total=%d)\n",
+            length, nf_packets_seen)
+    return NF_HOOK_ACCEPT
+
+
+def net_smoke_test():
+    # Scan PCI bus then run the netfilter chain on a synthetic
+    # 64-byte "packet". The real-driver path comes later; the goal
+    # here is to prove the infrastructure (PCI config-space access,
+    # netfilter hook chain + indirect call) works end-to-end.
+    pci_scan()
+    netfilter_init()
+    rc: int32 = register_netfilter_hook(cast[uint64](&packet_count_hook))
+    if rc != 0:
+        printk0("netfilter: registration failed\n")
+        return
+
+    # Inject a synthetic packet so the hook actually runs. The 64
+    # bytes come from a memblock allocation; we don't care about
+    # contents — the hook only reads `length`.
+    pkt: uint64 = memblock_alloc(64, 8)
+    memset(cast[Ptr[uint8]](pkt), 0xAB, 64)
+    verdict: int32 = nf_run_hooks(cast[Ptr[uint8]](pkt), 64)
+    printk1("netfilter: chain verdict = %d\n",
+            cast[uint64](verdict))
 
 
 def memblock_smoke_test():
@@ -442,6 +486,7 @@ def start_kernel():
     diag_smoke_test()
     list_smoke_test()
     vga_smoke_test()
+    net_smoke_test()
 
     setup_per_cpu_areas()
     printk1("Pynux: smp_processor_id() = %d\n", get_cpu_id())

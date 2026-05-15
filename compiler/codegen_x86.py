@@ -62,7 +62,7 @@ ARG_REGS = ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"]
 #   asm_volatile(s): general inline asm — emit the string literal verbatim
 #     as a `.text` instruction. Zero-operand for now (the brief's required
 #     #3 extension); supports cli/sti/pause/mfence/etc.
-X86_INTRINSICS = {"outb", "inb", "asm_volatile"}
+X86_INTRINSICS = {"outb", "inb", "outl", "inl", "asm_volatile"}
 
 
 class CodeGenError(Exception):
@@ -1160,6 +1160,25 @@ class X86CodeGen:
             self.emit("    xorl %eax, %eax") # clear %rax before zero-byte load
             self.emit("    inb %dx, %al")
             # %al now holds the byte; %rax is zero-extended.
+        elif name == "outl":
+            # outl(value: uint32, port: uint16) -> None
+            if len(args) != 2:
+                raise CodeGenError("outl expects (value, port)")
+            self.gen_expr(args[0])           # value -> %rax
+            self.emit("    pushq %rax")
+            self.gen_expr(args[1])           # port  -> %rax
+            self.emit("    movw %ax, %dx")
+            self.emit("    popq %rax")
+            self.emit("    outl %eax, %dx")
+        elif name == "inl":
+            # inl(port: uint16) -> uint32 (zero-extended into %rax)
+            if len(args) != 1:
+                raise CodeGenError("inl expects (port)")
+            self.gen_expr(args[0])           # port -> %rax
+            self.emit("    movw %ax, %dx")
+            self.emit("    xorq %rax, %rax") # clear %rax
+            self.emit("    inl %dx, %eax")
+            # movl-to-eax already zero-extends to rax.
         elif name == "asm_volatile":
             # asm_volatile("instruction") emits the literal instruction.
             # The arg must be a string literal; zero-operand only.
