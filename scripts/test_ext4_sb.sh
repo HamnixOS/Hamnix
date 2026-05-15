@@ -53,7 +53,8 @@ for needle in \
     "/dev/vda probed non-FAT" \
     "ext4: mounted; block_size=1024 inodes_count=128" \
     "blocks_per_group=8192 inodes_per_group=128" \
-    "first_data_block=1 inode_size=256"
+    "first_data_block=1 inode_size=256" \
+    "ext4 inode#2 mode=41ed size=1024"
 do
     if grep -F -q "$needle" "$LOG"; then
         echo "[test_ext4_sb] OK: '$needle'"
