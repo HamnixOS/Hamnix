@@ -1,0 +1,257 @@
+# linux_abi/api_sysfs.ad - L12 shims (Linux sysfs / kobject ABI).
+#
+# sysfs is the kobject-backed pseudo-filesystem at /sys. Every driver
+# that wants a user-visible knob — settable bus speed, readable serial
+# number, anything tunable at runtime — reaches for the same handful of
+# entry points. M7.2 in the .ko regression suite walks this surface to
+# publish /sys/hamnix/info:
+#
+#   struct kobject *kobject_create_and_add(const char *name,
+#                                          struct kobject *parent);
+#   void  kobject_put(struct kobject *kobj);
+#   int   sysfs_create_file_ns(struct kobject *kobj,
+#                              const struct attribute *attr,
+#                              const void *ns);
+#   void  sysfs_remove_file_ns(struct kobject *kobj,
+#                              const struct attribute *attr,
+#                              const void *ns);
+#   int   __sysfs_match_string(const char * const *array, size_t n,
+#                              const char *s);
+#
+# Implementation strategy (L12 scope):
+#
+# Hamnix has no real /sys mountpoint yet — the dentry/inode wiring that
+# would let `cat /sys/hamnix/info` reach a module-registered show()
+# callback lands in a later milestone. The point of L12 is purely the
+# registration shape: a module's init path must be able to claim a
+# kobject and bind an attribute to it, and the matching exit path must
+# release them, without the loader exploding.
+#
+# A 16-slot static table mirrors the api_proc.ad / api_chrdev.ad
+# convention. Handles handed back to module code are (slot index + 1)
+# widened to pointer width — so 0 stays sentinel (Linux's NULL-on-
+# failure return). The same "kobj handle is slot+1" encoding flows
+# through kobject_put: subtract 1, bounds-check, clear the slot.
+#
+# sysfs_create_file_ns is a no-op-accepted: it records the (kobj, attr)
+# pair into a parallel 16-slot table so that the later read-side wire-in
+# can iterate (sysfs_walk_one entries) over registered attributes. For
+# L12 we just return 0 so M7.2's rc check succeeds.
+#
+# Reference count discipline: Linux's struct kobject carries a kref that
+# kobject_get/kobject_put increments / decrements; the object is freed
+# when the count hits zero. M7.2 doesn't call kobject_get (the only
+# reference is the one held by kobject_create_and_add itself), so a
+# single kobject_put is the matching teardown. We follow that pattern
+# exactly: kobject_create_and_add allocates a slot at refcount 1,
+# kobject_put drops the slot when refcount reaches 0. A future fixture
+# that exercises kobject_get would need a per-slot refcount field; for
+# L12 the implicit "single reference" is enough.
+#
+# __sysfs_match_string is the helper behind sysfs_match_string — a tiny
+# string-table lookup that returns the index of the first matching
+# entry, or -EINVAL if not found. Used by drivers that map a sysfs
+# write of a textual name to an enum value. We implement it directly
+# (no kernel-internal dependencies), so it works the moment a module
+# calls it.
+
+from linux_abi.exports import _add_export
+
+
+# --- 16-slot static kobject table -----------------------------------
+#
+# Slot layout (parallel arrays — same Ptr-in-struct-global pitfall
+# called out in exports.ad):
+#   kobj_slot_name    : caller-owned Ptr[char] cast to uint64;
+#                       0 means "free slot"
+#   kobj_slot_parent  : parent kobject handle (0 for root /sys)
+
+MAX_KOBJ_SLOTS: uint64 = 16
+
+kobj_slot_name:   Array[16, uint64]
+kobj_slot_parent: Array[16, uint64]
+
+
+def _kobj_alloc_slot(name: uint64, parent: uint64) -> uint64:
+    # Linear scan for a free slot. Returns the handle (slot+1 widened)
+    # or 0 on table-full — matches Linux's NULL-on-failure convention
+    # for kobject_create_and_add.
+    i: uint64 = 0
+    while i < MAX_KOBJ_SLOTS:
+        if kobj_slot_name[i] == 0:
+            kobj_slot_name[i]   = name
+            kobj_slot_parent[i] = parent
+            return i + 1
+        i = i + 1
+    return 0
+
+
+def _kobj_free_slot(handle: uint64):
+    # Tolerate the Linux convention that kobject_put(NULL) is a no-op.
+    # Out-of-range handles silently drop too — modules occasionally
+    # double-put on teardown error paths.
+    if handle == 0:
+        return
+    idx: uint64 = handle - 1
+    if idx >= MAX_KOBJ_SLOTS:
+        return
+    kobj_slot_name[idx]   = 0
+    kobj_slot_parent[idx] = 0
+
+
+# --- 16-slot sysfs attribute table ----------------------------------
+#
+# sysfs attributes attach to a kobj_handle by (kobj_handle, attr_ptr)
+# pairs. The later read-side wire-in iterates this table to demux a
+# VFS read on /sys/<kobj_name>/<attr_name> back into the module's
+# show() callback (stored inside the attr struct itself — kobj_attribute
+# embeds struct attribute at offset 0 and carries show/store pointers
+# right after; see m7-sysfs/m7_sysfs.ad for the in-tree layout).
+
+MAX_SYSFS_FILES: uint64 = 16
+
+sysfs_file_kobj: Array[16, uint64]      # kobj_handle; 0 = free
+sysfs_file_attr: Array[16, uint64]      # struct attribute * widened
+
+
+def _sysfs_alloc_file_slot(kobj: uint64, attr: uint64) -> int32:
+    # Returns slot index, or -1 on table-full. The caller maps that
+    # to either 0 (success) or -ENOMEM. attr == 0 is allowed (some
+    # callers stub the attribute out at registration time and patch
+    # it in later) — Linux's __sysfs_create_file doesn't reject NULL
+    # attr either, though it'd promptly oops on first read.
+    i: uint64 = 0
+    while i < MAX_SYSFS_FILES:
+        if sysfs_file_kobj[i] == 0:
+            sysfs_file_kobj[i] = kobj
+            sysfs_file_attr[i] = attr
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _sysfs_find_file_slot(kobj: uint64, attr: uint64) -> int32:
+    # Lookup keyed by (kobj_handle, attr_ptr). Two attributes can't
+    # share the same name on the same kobject in real sysfs — same
+    # invariant holds here implicitly because the module hands us
+    # distinct attr pointers (one per attribute struct in its .data).
+    i: uint64 = 0
+    while i < MAX_SYSFS_FILES:
+        if sysfs_file_kobj[i] == kobj:
+            if sysfs_file_attr[i] == attr:
+                return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+# --- Linux-ABI shims ------------------------------------------------
+
+def _l_kobject_create_and_add(name: uint64, parent: uint64) -> uint64:
+    # Linux: returns a kobject * that's been kobject_init'd, named, and
+    # added to the parent's children list. NULL on failure (kmalloc
+    # short, name dup short, name collision). For L12 we just claim
+    # a slot — name collisions aren't checked yet because there's no
+    # real /sys path resolution to collide with.
+    return _kobj_alloc_slot(name, parent)
+
+
+def _l_kobject_put(kobj: uint64):
+    # Drop one reference. Since we don't track per-slot refcounts at
+    # L12, a single kobject_put unconditionally tears the slot down.
+    # M7.2 matches this — exactly one kobject_create_and_add + exactly
+    # one kobject_put per module lifecycle.
+    _kobj_free_slot(kobj)
+
+
+def _l_sysfs_create_file_ns(kobj: uint64, attr: uint64,
+                             ns: uint64) -> int32:
+    # ns is the per-attribute namespace tag — used by the network
+    # namespace machinery to make /sys/class/net/eth0 different for
+    # different netns'es. For L12 we ignore it (no netns support).
+    #
+    # NULL kobj returns -EINVAL the same way Linux's
+    # sysfs_create_file_ns does (the kobj has to be valid to anchor
+    # the attribute).
+    if kobj == 0:
+        return -22                                # -EINVAL
+    slot: int32 = _sysfs_alloc_file_slot(kobj, attr)
+    if slot < 0:
+        return -12                                # -ENOMEM
+    return 0
+
+
+def _l_sysfs_remove_file_ns(kobj: uint64, attr: uint64, ns: uint64):
+    # Symmetric to create_file_ns. Tolerate a remove on an unregistered
+    # (kobj, attr) pair as a no-op — driver teardown paths sometimes
+    # call this on error-rollback before the create ever succeeded.
+    slot: int32 = _sysfs_find_file_slot(kobj, attr)
+    if slot < 0:
+        return
+    s: uint64 = cast[uint64](slot)
+    sysfs_file_kobj[s] = 0
+    sysfs_file_attr[s] = 0
+
+
+def _streq_short(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    # NUL-terminated byte equality, same shape as exports.ad's _streq.
+    # Duplicated here to avoid leaking _streq across module boundaries
+    # (it's a file-private helper there) — the compiler doesn't import
+    # underscore-prefixed names cleanly.
+    i: uint64 = 0
+    while True:
+        ca: uint8 = a[i]
+        cb: uint8 = b[i]
+        if ca != cb:
+            return 0
+        if ca == 0:
+            return 1
+        i = i + 1
+
+
+def _l___sysfs_match_string(array_of_strs: uint64, n: uint64,
+                              s: uint64) -> int32:
+    # Linux: returns the index of the first array entry that string-
+    # equals s, or -EINVAL if no match. `array` is `const char * const
+    # *` — an array of pointers to NUL-terminated strings.
+    #
+    # We walk the array as uint64 words (each one is a Ptr[char]) and
+    # use the local _streq_short for the byte comparison. n is a count
+    # (number of pointers); a NULL entry in the array terminates the
+    # scan early — sysfs_match_string callers sometimes pass an array
+    # whose effective length is the position of the first NULL rather
+    # than the declared n.
+    if s == 0:
+        return -22                                # -EINVAL
+    if array_of_strs == 0:
+        return -22
+    arr: Ptr[uint64] = cast[Ptr[uint64]](array_of_strs)
+    target: Ptr[uint8] = cast[Ptr[uint8]](s)
+    i: uint64 = 0
+    while i < n:
+        entry: uint64 = arr[i]
+        if entry == 0:
+            return -22                            # -EINVAL (early NULL)
+        candidate: Ptr[uint8] = cast[Ptr[uint8]](entry)
+        if _streq_short(candidate, target) == 1:
+            return cast[int32](i)
+        i = i + 1
+    return -22                                    # -EINVAL (no match)
+
+
+# --- registration ---------------------------------------------------
+
+def linux_abi_register_sysfs():
+    # Called once from linux_abi_exports_init alongside the other
+    # per-subsystem registrations. Order doesn't matter — the export
+    # table is name-keyed — but grouping by milestone keeps the boot
+    # log readable.
+    _add_export("kobject_create_and_add",
+                cast[uint64](&_l_kobject_create_and_add))
+    _add_export("kobject_put",
+                cast[uint64](&_l_kobject_put))
+    _add_export("sysfs_create_file_ns",
+                cast[uint64](&_l_sysfs_create_file_ns))
+    _add_export("sysfs_remove_file_ns",
+                cast[uint64](&_l_sysfs_remove_file_ns))
+    _add_export("__sysfs_match_string",
+                cast[uint64](&_l___sysfs_match_string))
