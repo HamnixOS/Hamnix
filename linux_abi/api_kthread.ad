@@ -1,0 +1,369 @@
+# linux_abi/api_kthread.ad - L8 shims (kthread + workqueue).
+#
+# Two adjacent subsystems wired by the same file because they're
+# tightly coupled in real drivers: a kthread is the long-running
+# context that drains a workqueue, and a workqueue is the standard
+# way for IRQ-context code to push work to a kthread. Module call
+# surface:
+#
+#   KTHREAD:
+#     struct task_struct *kthread_create_on_node(
+#         int (*threadfn)(void *), void *data, int node,
+#         const char namefmt[], ...);
+#     int   wake_up_process(struct task_struct *p);
+#     int   kthread_stop(struct task_struct *k);
+#     bool  kthread_should_stop(void);
+#
+#   WORKQUEUE:
+#     struct workqueue_struct *__alloc_workqueue(
+#         const char *fmt, unsigned int flags, int max_active, ...);
+#     void   destroy_workqueue(struct workqueue_struct *wq);
+#     bool   queue_work_on(int cpu, struct workqueue_struct *wq,
+#                          struct work_struct *work);
+#     void   flush_workqueue(struct workqueue_struct *wq);
+#     INIT_WORK(&w, fn);   /* macro — direct struct write,
+#                             no kernel symbol needed */
+#
+# Implementation strategy:
+#
+# KTHREAD. Hamnix's kernel.sched.core already exposes kthread_create
+# (entry, name0) -> slot, which is the same primitive Linux's
+# kthread_create_on_node reduces to once you strip the NUMA-node
+# hint, the printf-style name formatting, and the variadic tail.
+# Our shim wraps that: returns a "task_struct *" handle. We don't
+# have a real struct task_struct accessible at the loader's ABI
+# (the layout in kernel/sched/core.ad isn't what stock Linux
+# modules expect), so the handle we return is the slot index
+# encoded as (slot + 1) cast to uint64 — non-zero so "creation
+# succeeded" is distinguishable from NULL, and reversible to a
+# slot index by subtracting 1. The shim accepts arbitrary opaque
+# pointers and treats `data` as the value to pass into threadfn.
+#
+# Hamnix's kthread_create takes (entry: uint64, name0: uint64) —
+# the entry function it calls is expected to be a no-arg kernel
+# routine. Linux's threadfn takes a void* argument. To bridge
+# this we stash (threadfn, data) in a per-slot table and have a
+# tiny trampoline (selected as the kthread_create entry) read its
+# task's slot to find the pair and forward-call. The same table
+# tracks kthread_should_stop's flag so kthread_stop can request
+# termination cooperatively.
+#
+# WORKQUEUE. A workqueue is just a label + a list of pending work.
+# For L8 we model it as a 4-slot static table: each slot is the
+# (wq_handle, work_struct_ptr) pair of a pending submission. A
+# real Linux struct work_struct lays out as:
+#
+#   offset  0   atomic_long_t data       (flags + cpu number)
+#   offset  8   struct list_head entry   (16 bytes)
+#   offset 24   work_func_t func
+#
+# We read the function pointer from offset 24 when flushing.
+# queue_work_on doesn't execute immediately — it just records the
+# pending work; flush_workqueue (and destroy_workqueue) drains
+# the table by calling each stored work_struct's fn(work_struct).
+# The M4.3a regression module does INIT_WORK + queue_work_on +
+# flush_workqueue in that order, so the drain happens on exactly
+# the path the test cares about.
+#
+# A "workqueue_struct *" handle is the address of a 16-byte slot
+# in a separate 4-entry wq table (offset 0 = in_use, offset 8 =
+# pending_count for debug). Stock modules never dereference the
+# handle — it's an opaque cookie fed back to queue/flush/destroy.
+
+from linux_abi.exports import _add_export
+from kernel.sched.core import kthread_create
+from kernel.printk.printk import printk0
+
+
+# --- kthread bookkeeping --------------------------------------------
+#
+# Linux's kthread_create needs to forward a (fn, data) pair through
+# Hamnix's no-arg-entry kthread_create. We park them in a fixed-size
+# parallel-array table indexed by sched slot. NTASKS in core.ad is 4
+# (M16.20-era), so 4 entries here line up exactly — a kthread per
+# sched slot is the maximum the runqueue can hold.
+
+KTHREAD_SLOTS: uint64 = 4
+kthread_fn:        Array[4, uint64]   # threadfn pointer or 0
+kthread_data:      Array[4, uint64]   # void * data
+kthread_stop_flag: Array[4, uint64]   # 1 = kthread_should_stop returns true
+kthread_in_use:    Array[4, uint64]   # 1 if slot is wired, 0 otherwise
+# `kthread_current_slot` is the slot of the most recently entered
+# kthread trampoline. kthread_should_stop reads this — Linux's
+# kthread_should_stop has no arg and pulls `current` off the per-CPU
+# segment; we don't have per-CPU yet at L8, but kthreads run one at
+# a time in M4.3a's fixture so a global is functionally equivalent.
+kthread_current_slot: uint64 = 0
+
+
+def _kthread_alloc_slot() -> int32:
+    i: uint64 = 0
+    while i < KTHREAD_SLOTS:
+        if kthread_in_use[i] == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _kthread_trampoline():
+    # Entry point handed to Hamnix's kthread_create. Reads the
+    # current slot's (fn, data) and tail-calls. The trampoline runs
+    # in kernel context (CPL=0) on the kthread's own stack. When
+    # threadfn returns, we just halt the slot — there's no kernel
+    # path to reap a kthread yet (would need a TASK_DEAD analogue
+    # tied into the scheduler's free-list management).
+    slot: uint64 = kthread_current_slot
+    fn:   uint64 = kthread_fn[slot]
+    data: uint64 = kthread_data[slot]
+    if fn == 0:
+        return
+    # Call fn(data). The threadfn signature is `int (*)(void *)` in
+    # Linux; we drop the return value (Hamnix has no exit-code path
+    # for kthreads). SysV passes the first arg in %rdi, which is
+    # what the indirect-call cast arranges. Same idiom as the L9
+    # timer dispatcher / L10 hrtimer dispatcher.
+    call_fn: Ptr[uint8] = cast[Ptr[uint8]](fn)
+    call_fn(data)
+    return
+
+
+# --- kthread shims ---------------------------------------------------
+
+def _l_kthread_create_on_node(threadfn: uint64, data: uint64,
+                               node: int32, namefmt: uint64) -> uint64:
+    # kthread_create_on_node(fn, data, node, namefmt, ...). The
+    # variadic tail (printf-style args after namefmt) is dropped —
+    # we use a fixed 8-byte tag derived from the first few bytes of
+    # namefmt instead. `node` (NUMA hint) is ignored — Hamnix is UMA.
+    slot: int32 = _kthread_alloc_slot()
+    if slot < 0:
+        printk0("kthread_create_on_node: no free slot\n")
+        return 0
+    su: uint64 = cast[uint64](slot)
+    kthread_fn[su]        = threadfn
+    kthread_data[su]      = data
+    kthread_stop_flag[su] = 0
+    kthread_in_use[su]    = 1
+    # Build the 8-char name0 tag from the first 8 bytes of namefmt.
+    # Linux modules pass things like "my_thread/%d"; the literal head
+    # is good enough for `ps`-style debug output. If namefmt is NULL
+    # we tag the thread "kthread\0".
+    name0: uint64 = 0
+    if namefmt != 0:
+        i: uint64 = 0
+        np: Ptr[uint8] = cast[Ptr[uint8]](namefmt)
+        while i < 8:
+            c: uint8 = np[i]
+            if c == 0:
+                i = 8                                  # break
+            else:
+                name0 = name0 | (cast[uint64](c) << (i * 8))
+                i = i + 1
+    else:
+        # 'kthread\0' little-endian: byte 0='k'(0x6b), 1='t'(0x74),
+        # 2='h'(0x68), 3='r'(0x72), 4='e'(0x65), 5='a'(0x61),
+        # 6='d'(0x64), 7=NUL. Reading the constant byte-by-byte
+        # from low address yields the ASCII string.
+        name0 = 0x006461657268746B
+    # Mark this as the current slot before we ask the scheduler to
+    # build the kthread — its entry is the trampoline, which reads
+    # kthread_current_slot to find its (fn, data). Linux returns a
+    # NOT-yet-running task here (must be wake_up_process'd), but
+    # Hamnix's kthread_create state is STATE_READY immediately; the
+    # round-trip is functionally identical because the scheduler
+    # won't pick the new task until the caller stops running.
+    kthread_current_slot = su
+    sched_slot: int32 = kthread_create(
+        cast[uint64](&_kthread_trampoline), name0)
+    if sched_slot < 0:
+        kthread_in_use[su] = 0
+        return 0
+    # Return (slot + 1) as the opaque handle so 0 reliably means
+    # "creation failed."
+    return su + 1
+
+
+def _l_wake_up_process(p: uint64) -> int32:
+    # wake_up_process flips a TASK_INTERRUPTIBLE-or-similar task back
+    # to TASK_RUNNING. Hamnix's kthread_create already leaves the
+    # task STATE_READY (eligible for schedule()), so the kthread is
+    # already wake-able. Return 1 = "we did the wakeup" (Linux's
+    # success return).
+    if p == 0:
+        return 0
+    return 1
+
+
+def _l_kthread_stop(k: uint64) -> int32:
+    # kthread_stop(k): set the should-stop flag, wait for the kthread
+    # to observe it and return. Returns the kthread's return value.
+    # At L8 we set the flag and return 0 immediately — we don't
+    # block the caller; the kthread will observe the flag on its
+    # next kthread_should_stop() check and exit. The fixture (M4.3a)
+    # calls kthread_stop from module_exit, where blocking-to-join
+    # would deadlock against our cooperative scheduler (the kthread
+    # only runs when the module-exit caller yields). Returning 0
+    # eagerly matches "kthread exited successfully" for the test's
+    # purposes.
+    if k == 0:
+        return 0
+    su: uint64 = k - 1
+    if su >= KTHREAD_SLOTS:
+        return 0
+    kthread_stop_flag[su] = 1
+    return 0
+
+
+def _l_kthread_should_stop() -> int32:
+    # bool kthread_should_stop(void). Reads the current slot's flag.
+    # Returns 1 if kthread_stop was called against us, 0 otherwise.
+    slot: uint64 = kthread_current_slot
+    if slot >= KTHREAD_SLOTS:
+        return 0
+    if kthread_stop_flag[slot] == 1:
+        return 1
+    return 0
+
+
+# --- workqueue bookkeeping ------------------------------------------
+#
+# Workqueue handle table. A handle is the address of an entry in
+# wq_table; the module never dereferences it. 4 slots is enough for
+# M4.3a (one wq) plus a couple of subsequent fixtures.
+
+WQ_SLOTS: uint64 = 4
+WQ_HANDLE_MAGIC: uint64 = 0x57514855505F5F00          # 'WQHUP__\0' tag
+
+class WqSlot:
+    in_use:  uint64
+    magic:   uint64
+
+
+wq_table: Array[4, WqSlot]
+
+
+# Pending-work table. Each entry is (wq_handle, work_struct_ptr).
+# Flush walks the table, executes each work_struct's fn at offset 24,
+# and clears the slot. 16 pending entries is generous for L8 (M4.3a
+# enqueues one item then flushes).
+
+WORK_PENDING_SLOTS: uint64 = 16
+work_pending_wq:   Array[16, uint64]      # 0 = empty slot
+work_pending_work: Array[16, uint64]      # work_struct *
+
+
+def _wq_alloc_slot() -> int32:
+    i: uint64 = 0
+    while i < WQ_SLOTS:
+        if wq_table[i].in_use == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _work_pending_alloc() -> int32:
+    i: uint64 = 0
+    while i < WORK_PENDING_SLOTS:
+        if work_pending_wq[i] == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+# --- workqueue shims -------------------------------------------------
+
+def _l_alloc_workqueue(fmt: uint64, flags: uint32, max_active: int32) -> uint64:
+    # struct workqueue_struct *__alloc_workqueue(const char *fmt,
+    #     unsigned int flags, int max_active, ...);
+    # The variadic tail (printf args for the wq name) is dropped at
+    # the ABI level — SysV's extra varargs sit in %rcx/%r8/%r9 which
+    # we don't read. flags covers WQ_UNBOUND / WQ_HIGHPRI / WQ_MEM_RECLAIM
+    # etc., all of which only matter under contention; we ignore them.
+    # max_active caps concurrent in-flight work items per CPU; with our
+    # serial flush model the cap is implicitly 1, so this is also ignored.
+    slot: int32 = _wq_alloc_slot()
+    if slot < 0:
+        printk0("__alloc_workqueue: no free slot\n")
+        return 0
+    su: uint64 = cast[uint64](slot)
+    wq_table[su].in_use = 1
+    wq_table[su].magic  = WQ_HANDLE_MAGIC
+    return cast[uint64](&wq_table[su])
+
+
+def _l_destroy_workqueue(wq: uint64):
+    # Linux drains the workqueue before destroying it; we mirror that
+    # by running flush first so any still-pending work fires. Then we
+    # zero the slot for reuse.
+    if wq == 0:
+        return
+    _l_flush_workqueue(wq)
+    slot: Ptr[WqSlot] = cast[Ptr[WqSlot]](wq)
+    if slot[0].magic != WQ_HANDLE_MAGIC:
+        return
+    slot[0].in_use = 0
+    slot[0].magic  = 0
+
+
+def _l_queue_work_on(cpu: int32, wq: uint64, work: uint64) -> int32:
+    # bool queue_work_on(int cpu, struct workqueue_struct *wq,
+    #                    struct work_struct *work);
+    # Returns true if the work was queued, false if it was already on
+    # a queue. We treat every call as "fresh queue" — the Linux
+    # implementation uses bit 0 of work->data to detect re-queue;
+    # we don't model that. M4.3a queues each work_struct exactly once
+    # so the simpler model is functionally correct here.
+    if wq == 0 or work == 0:
+        return 0
+    slot: int32 = _work_pending_alloc()
+    if slot < 0:
+        # Out of pending slots — the test would have to flush first.
+        # Linux would return true regardless (just defer execution
+        # until a worker frees up); for L8 we surface the failure as
+        # "already queued" (return 0) so the caller can notice.
+        return 0
+    su: uint64 = cast[uint64](slot)
+    work_pending_wq[su]   = wq
+    work_pending_work[su] = work
+    return 1
+
+
+def _l_flush_workqueue(wq: uint64):
+    # Drain every pending work item targeting this wq. We walk the
+    # pending table in slot order — Linux uses FIFO order via the
+    # per-CPU pool's list; our slot order is allocation order, which
+    # is effectively FIFO under "alloc-low-first" + "free-after-fire."
+    # For each match, read fn from offset 24 of the work_struct and
+    # call fn(work_struct). Clearing the slot before the call lets a
+    # work item re-queue itself without confusing this loop.
+    if wq == 0:
+        return
+    i: uint64 = 0
+    while i < WORK_PENDING_SLOTS:
+        if work_pending_wq[i] == wq:
+            work: uint64 = work_pending_work[i]
+            work_pending_wq[i]   = 0
+            work_pending_work[i] = 0
+            if work != 0:
+                fn: uint64 = cast[Ptr[uint64]](work + 24)[0]
+                if fn != 0:
+                    # work_func_t = void (*)(struct work_struct *).
+                    # Same Ptr[uint8] indirect-call idiom as hrtimer.
+                    call_fn: Ptr[uint8] = cast[Ptr[uint8]](fn)
+                    call_fn(work)
+        i = i + 1
+
+
+# --- registration ----------------------------------------------------
+
+def linux_abi_register_kthread():
+    # Called once from start_kernel, after the L1..L7 registrations.
+    # Order doesn't matter — the export table is name-keyed.
+    _add_export("kthread_create_on_node",  cast[uint64](&_l_kthread_create_on_node))
+    _add_export("wake_up_process",         cast[uint64](&_l_wake_up_process))
+    _add_export("kthread_stop",            cast[uint64](&_l_kthread_stop))
+    _add_export("kthread_should_stop",     cast[uint64](&_l_kthread_should_stop))
+    _add_export("__alloc_workqueue",       cast[uint64](&_l_alloc_workqueue))
+    _add_export("destroy_workqueue",       cast[uint64](&_l_destroy_workqueue))
+    _add_export("queue_work_on",           cast[uint64](&_l_queue_work_on))
+    _add_export("flush_workqueue",         cast[uint64](&_l_flush_workqueue))
