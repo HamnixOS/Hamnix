@@ -157,6 +157,23 @@ The end-game is a fully Hamnix-authored kernel.
 | M16.77 | stdout/stderr mirrored to VGA text console — userland writes visible on real-hardware monitor, not just serial | **Done** |
 | M16.78 | hamsh `env` + `unset` builtins — dump and clear shell variables | **Done** |
 | M16.79 | hamsh PATH walker uses `$PATH` variable — colon-separated, falls back to hardcoded `/bin:/sbin:/usr/bin` when unset | **Done** |
+| M16.80 | hamsh double-quoted string tokenization — `echo "hello world"` is one token | **Done** |
+
+## L-series: Linux ABI compatibility
+
+Track that adds binary compatibility with stock Linux 6.12.48 kernel
+modules (`.ko` files). When complete, Hamnix loads unmodified `.ko`
+binaries — including the M1..M15 test modules and stock distro
+drivers (xhci_hcd, nvme, usbhid, e1000e). See
+`linux_abi/TARGET_ABI.md` for the pinned target.
+
+| Milestone | Description | Status |
+|-----------|-------------|--------|
+| **L0** | BTF parser + `scripts/gen_linux_abi.py` + initial generated structs (`module`, `list_head`, `kobject`, `kref`) | **In progress** |
+| **L1** | ET_REL `.ko` loader: ELF parse, relocations, vermagic + MODVERSIONS bypass, `module_init/exit` dispatch. `SYS_INIT_MODULE`/`SYS_DELETE_MODULE`. `/bin/insmod`, `/bin/rmmod` | **In progress** |
+| L2..L28 | (Linux subsystems incrementally exported under their stock names — see commit log for individual milestone descriptions as they land) | Pending |
+| L29 | M1..M15 .ko regression passes against Hamnix | Pending |
+| L40 | First boot on real ThinkPad hardware | Pending |
 
 
 ## How it works
