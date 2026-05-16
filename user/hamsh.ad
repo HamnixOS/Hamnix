@@ -688,6 +688,102 @@ def run_subcmd(argv: Ptr[uint64], argc: uint64) -> int32:
     return result
 
 
+# M16.83: `if cmd; then cmd-list; fi` support.
+#
+# Single-line form only — no nested `if`, no `else`, no `elif`. The
+# detection runs AFTER tokenize() so `if`/`then`/`fi` are just argv
+# tokens. When argv[0] == "if", we slice the argv stream into a
+# condition span (between "if" and the FIRST "then") and a body span
+# (between that "then" and "fi"), serialize each back to ASCII into a
+# scratch buffer, and recurse into process_line on each in turn.
+#
+# Limits baked in:
+#   - Only ONE if-stage per line (the outermost call). Nested ifs
+#     inside the body work via recursion BUT share the scratch buffer
+#     and `argv_buf`, so we cap recursion at IF_DEPTH_MAX.
+#   - Condition + body must fit in IF_LINE_MAX bytes each after
+#     serialization (tokens re-joined with single spaces).
+IF_DEPTH_MAX: uint32 = 4
+IF_LINE_MAX:  uint64 = 128
+
+# Per-depth scratch buffer for the recursive process_line call.
+# Two buffers per level (condition + body) so we can build the body
+# string while the condition recursion is still running its own copy.
+if_scratch: Array[1024, uint8]              # 4 depths * 2 bufs * 128
+if_depth:   uint32 = 0
+
+
+def _tok_eq_lit(tok: Ptr[uint8], lit: Ptr[uint8]) -> int32:
+    # Like streq but inlined to avoid sharing the helper with code
+    # paths that might be in motion when we're called from the if
+    # detection path. Returns 1 on match.
+    i: uint64 = 0
+    while True:
+        a: uint8 = tok[i]
+        b: uint8 = lit[i]
+        if a != b:
+            return 0
+        if a == 0:
+            return 1
+        i = i + 1
+
+
+def _serialize_range(start: uint64, end: uint64,
+                     out: Ptr[uint8], out_max: uint64) -> uint64:
+    # Walk argv_buf[start..end), concatenate each token's bytes with
+    # a single ' ' separator into `out`, NUL-terminate, and return
+    # the byte count written (excluding the NUL). Tokens that are
+    # already 0 (NULed by sub-command splitter etc) are skipped — we
+    # call this BEFORE the sub-command splitter runs so that should
+    # never happen, but it costs nothing to be safe.
+    #
+    # Special case: if a token ENDS in ';' (e.g. "true;" from
+    # `if true; then ...`), emit the body up to but not including the
+    # ';', then emit " ;" as a standalone token. That way the
+    # downstream tokenize() + sub-command splitter sees a proper
+    # `<cmd> ; <next>` sequence with the ';' as its own argv entry.
+    w: uint64 = 0
+    i: uint64 = start
+    first: int32 = 1
+    while i < end:
+        t: uint64 = argv_buf[i]
+        if t != 0:
+            s: Ptr[uint8] = cast[Ptr[uint8]](t)
+            # Measure length so we can detect a trailing ';'.
+            tlen: uint64 = 0
+            while s[tlen] != 0:
+                tlen = tlen + 1
+            body_len: uint64 = tlen
+            trail_semi: int32 = 0
+            if tlen > 1 and s[tlen - 1] == 59:
+                body_len = tlen - 1
+                trail_semi = 1
+            if body_len > 0:
+                if first == 0:
+                    if w + 1 < out_max:
+                        out[w] = 32                # ' '
+                        w = w + 1
+                first = 0
+                j: uint64 = 0
+                while j < body_len and w + 1 < out_max:
+                    out[w] = s[j]
+                    w = w + 1
+                    j = j + 1
+            if trail_semi != 0:
+                if first == 0:
+                    if w + 1 < out_max:
+                        out[w] = 32                # ' '
+                        w = w + 1
+                if w + 1 < out_max:
+                    out[w] = 59                    # ';'
+                    w = w + 1
+                first = 0
+        i = i + 1
+    if w < out_max:
+        out[w] = 0
+    return w
+
+
 def process_line(buf: Ptr[uint8], nu: uint64) -> int32:
     # Parse + execute ONE line of shell input. Used by both the
     # interactive main loop and the M16.73 /etc/rc reader so script
@@ -704,6 +800,89 @@ def process_line(buf: Ptr[uint8], nu: uint64) -> int32:
 
     argc: uint64 = tokenize(buf, nu, &argv_buf[0], ARGV_MAX)
     if argc == 0:
+        return 0
+
+    # M16.83: `if COND ; then BODY ; fi` (single-line). Detect here,
+    # BEFORE the `;`/`&&`/`||` splitter runs, so the condition and
+    # body each get their own clean process_line invocation. The "if"
+    # / "then" / "fi" tokens are matched LITERALLY — they're not
+    # Adder reserved words, just byte sequences we compare against.
+    first_tok: Ptr[uint8] = cast[Ptr[uint8]](argv_buf[0])
+    if _tok_eq_lit(first_tok, "if") != 0:
+        if if_depth >= IF_DEPTH_MAX:
+            write_str(2, "hamsh: if: nesting too deep\n")
+            last_exit_code = 2
+            return 0
+        # Find "then" and "fi" indices.
+        then_idx: uint64 = argc
+        fi_idx:   uint64 = argc
+        ti: uint64 = 1
+        while ti < argc:
+            tk: Ptr[uint8] = cast[Ptr[uint8]](argv_buf[ti])
+            if then_idx == argc and _tok_eq_lit(tk, "then") != 0:
+                then_idx = ti
+            elif _tok_eq_lit(tk, "fi") != 0:
+                fi_idx = ti
+            ti = ti + 1
+        if then_idx == argc or fi_idx == argc or then_idx >= fi_idx:
+            write_str(2, "hamsh: if: missing then/fi\n")
+            last_exit_code = 2
+            return 0
+        # Condition spans (1 .. then_idx). Trim a trailing ';' token
+        # so `if true; then ...` works (the ';' is just a separator
+        # for the human, not part of the condition command).
+        cond_end: uint64 = then_idx
+        if cond_end > 1:
+            last_cond: Ptr[uint8] = cast[Ptr[uint8]](
+                argv_buf[cond_end - 1])
+            if last_cond[0] == 59 and last_cond[1] == 0:
+                cond_end = cond_end - 1
+        # Body spans (then_idx+1 .. fi_idx). Trim trailing ';' the
+        # same way so `... ; fi` doesn't ship an empty sub-command.
+        body_end: uint64 = fi_idx
+        if body_end > then_idx + 1:
+            last_body: Ptr[uint8] = cast[Ptr[uint8]](
+                argv_buf[body_end - 1])
+            if last_body[0] == 59 and last_body[1] == 0:
+                body_end = body_end - 1
+        # Pick scratch slots based on recursion depth. Each level
+        # owns 2 * IF_LINE_MAX = 256 bytes of the scratch arena.
+        base: uint64 = cast[uint64](if_depth) * (IF_LINE_MAX * 2)
+        cond_buf_p: Ptr[uint8] = &if_scratch[base]
+        body_buf_p: Ptr[uint8] = &if_scratch[base + IF_LINE_MAX]
+        cond_len: uint64 = _serialize_range(1, cond_end,
+                                            cond_buf_p, IF_LINE_MAX)
+        body_len: uint64 = _serialize_range(then_idx + 1, body_end,
+                                            body_buf_p, IF_LINE_MAX)
+        # Strip a trailing " ;" (and/or stray spaces) from each
+        # serialized line. _serialize_range emits "<cmd> ;" for any
+        # token that ended in ';' — fine in the middle of the body
+        # where it separates commands, but at the very END it spawns
+        # an empty sub-command that resets last_exit_code to 0. That
+        # would clobber our branch signal for the condition path, so
+        # trim every trailing space/';' byte.
+        while cond_len > 0 \
+                and (cond_buf_p[cond_len - 1] == 59 \
+                     or cond_buf_p[cond_len - 1] == 32):
+            cond_len = cond_len - 1
+            cond_buf_p[cond_len] = 0
+        while body_len > 0 \
+                and (body_buf_p[body_len - 1] == 59 \
+                     or body_buf_p[body_len - 1] == 32):
+            body_len = body_len - 1
+            body_buf_p[body_len] = 0
+        if_depth = if_depth + 1
+        # Run the condition; its last_exit_code is what we branch on.
+        rc_cond: int32 = process_line(cond_buf_p, cond_len)
+        if rc_cond == SHELL_EXIT:
+            if_depth = if_depth - 1
+            return SHELL_EXIT
+        if last_exit_code == 0 and body_len > 0:
+            rc_body: int32 = process_line(body_buf_p, body_len)
+            if rc_body == SHELL_EXIT:
+                if_depth = if_depth - 1
+                return SHELL_EXIT
+        if_depth = if_depth - 1
         return 0
 
     # `$?` and `$NAME` substitution. Token must START with `$`. The
