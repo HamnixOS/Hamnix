@@ -175,6 +175,42 @@ drivers (xhci_hcd, nvme, usbhid, e1000e). See
 | L29 | M1..M15 .ko regression passes against Hamnix | Pending |
 | L40 | First boot on real ThinkPad hardware | Pending |
 
+## U-series: Linux userspace ABI (planned)
+
+The track that lands AFTER L-series completes. Goal: run
+unmodified Linux user binaries (Steam, Firefox, language
+runtimes, graphical apps) on top of Hamnix-the-kernel. Implies:
+
+- Linux x86_64 syscall ABI under the stock numbers (read=0,
+  write=1, …, openat=257, futex=202, etc.). Hamnix's own
+  syscalls move to a high-number range (1000+) to avoid
+  collision.
+- `/lib/ld-linux-x86-64.so.2` dynamic linker — either Hamnix-
+  authored or wrapping Debian's.
+- Glibc / musl compatibility — the layers between
+  syscalls and what apps actually call.
+- `/proc` and `/sys` layouts that satisfy glibc's runtime
+  setup + udev-style device introspection.
+- Threading primitives — `futex(2)`, `clone(CLONE_THREAD)`,
+  TLS via `arch_prctl(ARCH_SET_FS)`.
+- Mmap layout that matches what loaders assume.
+
+## End game
+
+A shippable distribution where:
+- Bootloader + kernel + init + shell + coreutils are all
+  Hamnix-authored (the trust-critical surface).
+- L-series enables loading the NVIDIA driver + closed-source
+  kernel modules.
+- U-series enables installing software from Debian's
+  repositories (`apt install firefox`, `apt install steam`).
+- The long-tail userspace comes from Debian, the
+  security-critical core from Hamnix.
+
+L-series order: L0/L1 (loader + structs) → L2..L28
+(subsystems) → L29 (M-track validation) → L30..L40
+(distro modules → first real-hardware boot).
+
 
 ## How it works
 
