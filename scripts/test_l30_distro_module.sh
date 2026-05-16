@@ -49,12 +49,16 @@ STAGED_KO="$LKM_DIR/distro_crc.ko"
 KREL="$(uname -r)"
 HOST_LIB="/lib/modules/${KREL}/kernel"
 CANDIDATES=(
-    "${HOST_LIB}/lib/crc8.ko"
-    "${HOST_LIB}/lib/crc8.ko.xz"
-    "${HOST_LIB}/lib/libcrc32c.ko"
-    "${HOST_LIB}/lib/libcrc32c.ko.xz"
+    # crc32c_generic FIRST — it has module_init(), exercising the
+    # full L32 struct module.init path.
     "${HOST_LIB}/crypto/crc32c_generic.ko"
     "${HOST_LIB}/crypto/crc32c_generic.ko.xz"
+    "${HOST_LIB}/lib/libcrc32c.ko"
+    "${HOST_LIB}/lib/libcrc32c.ko.xz"
+    # crc8 is library-only (no init); useful fallback for hosts
+    # without the others, but it doesn't validate the init call.
+    "${HOST_LIB}/lib/crc8.ko"
+    "${HOST_LIB}/lib/crc8.ko.xz"
 )
 
 picked=""
