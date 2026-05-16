@@ -209,8 +209,10 @@ drivers (xhci_hcd, nvme, usbhid, e1000e). See
 | **L31** | `__x86_return_thunk` Spectre-v2 retpoline trampoline stub. 28/28 relocs resolved against crc8 | **Done** |
 | **L32** | Read init/exit via `struct module.init/.exit` fields (offset 312/1200 from L0 BTF), not just flat symbols. Library-only modules (no init) handled cleanly | **Done** |
 | **L33** | Relocation walker diagnostics + library-only module proof: `.gnu.linkonce.this_module` relocs (when present) walk via the existing target-section dispatch — no special case needed | **Done** |
-| **L34** | **`__crc32c_le` + 6 crypto-register shims — stock `crc32c_generic.ko`'s `init_module()` actually executes on Hamnix.** Returns -EINVAL from the module's own self-test (placeholder hash math). End-to-end validation of L1-L34: ELF parse → relocations → init call → kernel survives → hamsh prompt returns | **Done** |
-| L35..L37 | usbcore, xhci-pci, xhci-hcd, usbhid, nvme, efifb / simpledrm | Pending |
+| **L34** | `__crc32c_le` + 6 crypto-register shims — `crc32c_generic.ko` init runs, returns -EINVAL (placeholder CRC math) | **Done** |
+| **L35** | Real CRC32C (Castagnoli) implementation in `__crc32c_le` shim — table-driven, matches Linux's `lib/crc32c.c` | **Done** |
+| **L36** | **First stock Debian `.ko` to load cleanly on Hamnix: `crc32c_generic.ko` init returns 0.** Loader gains `R_X86_64_32` + `R_X86_64_32S` reloc support. 95 relocations applied, 0 skipped, 0 unresolved externals | **Done** |
+| L37..L39 | usbcore, xhci-pci, xhci-hcd, usbhid, nvme, efifb / simpledrm | Pending |
 | L38 | UEFI boot path (PE/COFF) | Scaffold |
 | L39 | ACPI MADT/MCFG parsing | Scaffold |
 | L40 | First boot on real ThinkPad hardware | Pending |
