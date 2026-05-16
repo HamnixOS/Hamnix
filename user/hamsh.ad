@@ -237,6 +237,167 @@ def spawn_cmd(argv: Ptr[uint64], stdin_fd: int32, stdout_fd: int32) -> int32:
     return pid
 
 
+# M16.71: sub-command splitting on `;`, `&&`, `||`. Per-iteration
+# tracking arrays sized for up to 8 sub-commands per line.
+SUB_MAX: uint64 = 8
+SUB_CONJ_NONE: uint32 = 0
+SUB_CONJ_AND:  uint32 = 1
+SUB_CONJ_OR:   uint32 = 2
+SUB_CONJ_SEQ:  uint32 = 3
+sub_starts: Array[8, uint64]
+sub_conj:   Array[8, uint32]
+
+# Sentinel for run_subcmd return value: shell wants to exit. -2 is
+# distinct from any real exit code we'd ever capture (those range
+# 0..255 in practice + small negatives for kernel errors).
+SHELL_EXIT: int32 = -2
+
+
+def run_subcmd(argv: Ptr[uint64], argc: uint64) -> int32:
+    # Runs ONE sub-command (no &&/||/;) — handles `>` redirect,
+    # `|` pipeline split, builtin dispatch, spawn, wait. Returns
+    # the last stage's exit code, or SHELL_EXIT if the user typed
+    # the `exit` builtin.
+    if argc == 0:
+        return 0
+
+    # Parse '> file' redirect (last ">" wins, bash-style). Open
+    # the target up-front so a bad redirect is reported before any
+    # spawn happens.
+    redirect_idx: uint64 = find_token(argv, argc, 62)  # '>'
+    out_fd: int32 = -1
+    if redirect_idx < argc:
+        if redirect_idx + 1 >= argc:
+            write_str(2, "hamsh: syntax: '>' needs a target\n")
+            return 2
+        rtarget: Ptr[char] = cast[Ptr[char]](argv[redirect_idx + 1])
+        out_fd = sys_open_write(rtarget)
+        if out_fd < 0:
+            write_str(2, "hamsh: open failed: ")
+            write_str(2, cast[Ptr[uint8]](rtarget))
+            write_str(2, "\n")
+            return 2
+        argv[redirect_idx] = 0
+        argc = redirect_idx
+
+    if argc == 0:
+        write_str(2, "hamsh: syntax: no command before '>'\n")
+        if out_fd >= 0:
+            sys_close(out_fd)
+        return 2
+
+    # Slice argv into stages on every '|'.
+    nseg: uint64 = split_segments(argv, argc,
+                                   &seg_start[0], PIPE_MAX + 1)
+
+    first_cmd: Ptr[uint8] = cast[Ptr[uint8]](argv[seg_start[0]])
+    if nseg == 1:
+        if streq(first_cmd, "exit") != 0:
+            if out_fd >= 0:
+                sys_close(out_fd)
+            write_str(1, "[hamsh] bye.\n")
+            return SHELL_EXIT
+        if streq(first_cmd, "help") != 0:
+            builtin_help()
+            if out_fd >= 0:
+                sys_close(out_fd)
+            return 0
+        if streq(first_cmd, "cd") != 0:
+            cd_rc: int32 = 0
+            if argc < 2:
+                write_str(2, "cd: usage: cd <abs-path>\n")
+                cd_rc = 1
+            else:
+                ctarget: Ptr[char] = cast[Ptr[char]](argv[1])
+                if sys_chdir(ctarget) < 0:
+                    write_str(2, "cd: path too long\n")
+                    cd_rc = 1
+            if out_fd >= 0:
+                sys_close(out_fd)
+            return cd_rc
+    else:
+        if streq(first_cmd, "exit") != 0 or \
+                streq(first_cmd, "help") != 0 or \
+                streq(first_cmd, "cd") != 0:
+            write_str(2, "hamsh: builtins can't pipe\n")
+            if out_fd >= 0:
+                sys_close(out_fd)
+            return 2
+
+    # Validate: no empty segments (consecutive or leading pipes).
+    bad: int32 = 0
+    si: uint64 = 0
+    while si < nseg:
+        head: Ptr[uint64] = &argv[seg_start[si]]
+        if head[0] == 0:
+            bad = 1
+        si = si + 1
+    if bad != 0:
+        write_str(2, "hamsh: syntax: empty pipeline stage\n")
+        if out_fd >= 0:
+            sys_close(out_fd)
+        return 2
+
+    # Open nseg-1 pipes.
+    npipe: uint64 = nseg - 1
+    pi: uint64 = 0
+    pipe_ok: int32 = 1
+    while pi < npipe:
+        pair: Array[2, int32]
+        if sys_pipe(&pair[0]) < 0:
+            write_str(2, "hamsh: pipe failed\n")
+            pipe_ok = 0
+            j: uint64 = 0
+            while j < pi:
+                sys_close(pipe_fds[2 * j + 0])
+                sys_close(pipe_fds[2 * j + 1])
+                j = j + 1
+            break
+        pipe_fds[2 * pi + 0] = pair[0]
+        pipe_fds[2 * pi + 1] = pair[1]
+        pi = pi + 1
+    if pipe_ok == 0:
+        if out_fd >= 0:
+            sys_close(out_fd)
+        return 2
+
+    # Spawn each stage with the right stdin / stdout fds.
+    si = 0
+    while si < nseg:
+        stdin_fd:  int32 = -1
+        stdout_fd: int32 = -1
+        if si > 0:
+            stdin_fd = pipe_fds[2 * (si - 1) + 0]
+        if si + 1 < nseg:
+            stdout_fd = pipe_fds[2 * si + 1]
+        else:
+            stdout_fd = out_fd               # last stage gets `>`
+        seg_argv: Ptr[uint64] = &argv[seg_start[si]]
+        seg_pid[si] = spawn_cmd(seg_argv, stdin_fd, stdout_fd)
+        si = si + 1
+
+    # Close all our copies of the pipe fds + the redirect target.
+    pi = 0
+    while pi < npipe:
+        sys_close(pipe_fds[2 * pi + 0])
+        sys_close(pipe_fds[2 * pi + 1])
+        pi = pi + 1
+    if out_fd >= 0:
+        sys_close(out_fd)
+
+    # Wait for every spawned child. Capture the LAST stage's exit
+    # code (sh convention) into a local and return it.
+    result: int32 = 0
+    si = 0
+    while si < nseg:
+        if seg_pid[si] >= 0:
+            code: int64 = sys_waitpid(seg_pid[si])
+            if si + 1 == nseg:
+                result = cast[int32](code)
+        si = si + 1
+    return result
+
+
 def main() -> int32:
     write_str(1, "[hamsh] M16.35 shell ready. Type 'help' or '/hello'.\n")
     while True:
@@ -253,9 +414,7 @@ def main() -> int32:
         line_buf[nu] = 0
 
         # Comment lines: `#` at the start of the first non-blank
-        # column means the entire line is ignored. Matches sh
-        # syntax. We skip BEFORE tokenize so `#!/hamsh` shebangs
-        # in scripts (M16.70+) also fly through silently.
+        # column means the entire line is ignored. Matches sh syntax.
         scan: uint64 = 0
         while scan < nu and is_space(line_buf[scan]) != 0:
             scan = scan + 1
@@ -267,12 +426,8 @@ def main() -> int32:
         if argc == 0:
             continue
 
-        # `$?` substitution: any token literally equal to "$?" is
-        # rewritten to point at exit_str_buf, which holds the ASCII
-        # decimal of last_exit_code. Single-shot — we don't recurse
-        # into substrings (`prefix$?suffix` stays literal). This is
-        # done before redirect / pipeline parsing so the substituted
-        # value participates as a normal argv element.
+        # `$?` substitution: any token literally "$?" gets rewritten
+        # to point at exit_str_buf (the decimal of last_exit_code).
         _render_exit_code(last_exit_code)
         ai: uint64 = 0
         while ai < argc:
@@ -281,145 +436,57 @@ def main() -> int32:
                 argv_buf[ai] = cast[uint64](&exit_str_buf[0])
             ai = ai + 1
 
-        # 1. Parse '> /tmp/file' redirect (last ">" wins, bash-style).
-        #    Trim it + its target out of argv so the spawned command
-        #    doesn't see them. We OPEN the target up-front so a bad
-        #    redirect is reported before any spawn happens.
-        redirect_idx: uint64 = find_token(&argv_buf[0], argc, 62)  # '>'
-        out_fd: int32 = -1
-        if redirect_idx < argc:
-            if redirect_idx + 1 >= argc:
-                write_str(2, "hamsh: syntax: '>' needs a target\n")
-                continue
-            target: Ptr[char] = cast[Ptr[char]](argv_buf[redirect_idx + 1])
-            out_fd = sys_open_write(target)
-            if out_fd < 0:
-                write_str(2, "hamsh: open failed: ")
-                write_str(2, cast[Ptr[uint8]](target))
-                write_str(2, "\n")
-                continue
-            argv_buf[redirect_idx] = 0
-            argc = redirect_idx
+        # M16.71: split argv on ';', '&&', '||' separators (must be
+        # surrounded by whitespace — tokenize splits on whitespace,
+        # so a literal `cmd1||cmd2` is one token and won't split).
+        # NULL out the separator slot and record (start, conjunction).
+        n_subs: uint64 = 1
+        sub_starts[0] = 0
+        sub_conj[0] = SUB_CONJ_NONE
+        ti: uint64 = 0
+        while ti < argc:
+            t: uint64 = argv_buf[ti]
+            if t != 0:
+                s: Ptr[uint8] = cast[Ptr[uint8]](t)
+                c0: uint8 = s[0]
+                matched: int32 = 0
+                cj: uint32 = SUB_CONJ_NONE
+                if c0 == 38 and s[1] == 38 and s[2] == 0:    # "&&"
+                    matched = 1
+                    cj = SUB_CONJ_AND
+                elif c0 == 124 and s[1] == 124 and s[2] == 0:  # "||"
+                    matched = 1
+                    cj = SUB_CONJ_OR
+                elif c0 == 59 and s[1] == 0:                   # ";"
+                    matched = 1
+                    cj = SUB_CONJ_SEQ
+                if matched != 0:
+                    argv_buf[ti] = 0
+                    if n_subs < SUB_MAX:
+                        sub_starts[n_subs] = ti + 1
+                        sub_conj[n_subs] = cj
+                        n_subs = n_subs + 1
+            ti = ti + 1
 
-        if argc == 0:
-            write_str(2, "hamsh: syntax: no command before '>'\n")
-            if out_fd >= 0:
-                sys_close(out_fd)
-            continue
-
-        # 2. Slice argv into stages on every '|'. nseg == 1 → plain
-        #    command (no pipeline). The builtins live in the parent
-        #    address space and can't pipe; pre-check the first stage.
-        nseg: uint64 = split_segments(&argv_buf[0], argc,
-                                       &seg_start[0], PIPE_MAX + 1)
-
-        first_cmd: Ptr[uint8] = cast[Ptr[uint8]](argv_buf[seg_start[0]])
-        if nseg == 1:
-            if streq(first_cmd, "exit") != 0:
-                if out_fd >= 0:
-                    sys_close(out_fd)
-                write_str(1, "[hamsh] bye.\n")
-                return 0
-            if streq(first_cmd, "help") != 0:
-                builtin_help()
-                if out_fd >= 0:
-                    sys_close(out_fd)
-                continue
-            if streq(first_cmd, "cd") != 0:
-                # cd <abs_path>. Relative paths land when we have
-                # a centralised path-resolver. Empty arg is a no-op.
-                if argc < 2:
-                    write_str(2, "cd: usage: cd <abs-path>\n")
-                else:
-                    target: Ptr[char] = cast[Ptr[char]](argv_buf[1])
-                    if sys_chdir(target) < 0:
-                        write_str(2, "cd: path too long\n")
-                if out_fd >= 0:
-                    sys_close(out_fd)
-                continue
-        else:
-            if streq(first_cmd, "exit") != 0 or \
-                    streq(first_cmd, "help") != 0 or \
-                    streq(first_cmd, "cd") != 0:
-                write_str(2, "hamsh: builtins can't pipe\n")
-                if out_fd >= 0:
-                    sys_close(out_fd)
-                continue
-
-        # Validate: no empty segments (consecutive or leading pipes).
-        bad: int32 = 0
-        si: uint64 = 0
-        while si < nseg:
-            head: Ptr[uint64] = &argv_buf[seg_start[si]]
-            if head[0] == 0:
-                bad = 1
-            si = si + 1
-        if bad != 0:
-            write_str(2, "hamsh: syntax: empty pipeline stage\n")
-            if out_fd >= 0:
-                sys_close(out_fd)
-            continue
-
-        # Open nseg-1 pipes. pipe_fds[2*i+0] = rfd_i, pipe_fds[2*i+1] = wfd_i.
-        npipe: uint64 = nseg - 1
-        pi: uint64 = 0
-        pipe_ok: int32 = 1
-        while pi < npipe:
-            pair: Array[2, int32]
-            if sys_pipe(&pair[0]) < 0:
-                write_str(2, "hamsh: pipe failed\n")
-                pipe_ok = 0
-                # Close any pipes we already opened.
-                j: uint64 = 0
-                while j < pi:
-                    sys_close(pipe_fds[2 * j + 0])
-                    sys_close(pipe_fds[2 * j + 1])
-                    j = j + 1
-                break
-            pipe_fds[2 * pi + 0] = pair[0]
-            pipe_fds[2 * pi + 1] = pair[1]
-            pi = pi + 1
-        if pipe_ok == 0:
-            if out_fd >= 0:
-                sys_close(out_fd)
-            continue
-
-        # Spawn each stage with the right stdin / stdout fds.
-        si = 0
-        while si < nseg:
-            stdin_fd:  int32 = -1
-            stdout_fd: int32 = -1
-            if si > 0:
-                stdin_fd = pipe_fds[2 * (si - 1) + 0]
-            if si + 1 < nseg:
-                stdout_fd = pipe_fds[2 * si + 1]
-            else:
-                stdout_fd = out_fd               # last stage gets `>`
-            seg_argv: Ptr[uint64] = &argv_buf[seg_start[si]]
-            seg_pid[si] = spawn_cmd(seg_argv, stdin_fd, stdout_fd)
-            si = si + 1
-
-        # Close all our copies of the pipe fds + the redirect target
-        # so the children's references are the only ones holding the
-        # channels open.
-        pi = 0
-        while pi < npipe:
-            sys_close(pipe_fds[2 * pi + 0])
-            sys_close(pipe_fds[2 * pi + 1])
-            pi = pi + 1
-        if out_fd >= 0:
-            sys_close(out_fd)
-
-        # Wait for every spawned child. Order doesn't matter — we
-        # just need each one's exit_code drained so the slot frees.
-        # Capture the LAST stage's exit code (sh convention: a
-        # pipeline's exit status is the last command's) into
-        # last_exit_code so future `$?` substitutions can read it.
-        si = 0
-        while si < nseg:
-            if seg_pid[si] >= 0:
-                code: int64 = sys_waitpid(seg_pid[si])
-                if si + 1 == nseg:
-                    last_exit_code = cast[int32](code)
-            si = si + 1
+        # Run each sub-command, applying the conjunction check.
+        sub_i: uint64 = 0
+        while sub_i < n_subs:
+            cj: uint32 = sub_conj[sub_i]
+            skip: int32 = 0
+            if cj == SUB_CONJ_AND and last_exit_code != 0:
+                skip = 1
+            if cj == SUB_CONJ_OR and last_exit_code == 0:
+                skip = 1
+            if skip == 0:
+                start: uint64 = sub_starts[sub_i]
+                end: uint64 = argc
+                if sub_i + 1 < n_subs:
+                    end = sub_starts[sub_i + 1] - 1   # back off the NULL'd separator
+                sub_argv: Ptr[uint64] = &argv_buf[start]
+                sub_argc: uint64 = end - start
+                rc: int32 = run_subcmd(sub_argv, sub_argc)
+                if rc == SHELL_EXIT:
+                    return 0
+                last_exit_code = rc
+            sub_i = sub_i + 1
     return 0
