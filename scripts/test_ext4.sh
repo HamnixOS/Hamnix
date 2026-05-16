@@ -90,7 +90,8 @@ for needle in \
     "EXT4_MARKER hello from /ext/HELLO.TXT" \
     "NESTED.TXT" \
     "EXT4_NESTED_MARKER /ext/SUB/NESTED.TXT" \
-    "DEPTH1_MARKER ext4 index extents work"
+    "DEPTH1_MARKER ext4 index extents work" \
+    "ext4: bitmap smoke PASS"
 do
     if grep -F -q "$needle" "$LOG"; then
         echo "[test_ext4] OK: '$needle'"

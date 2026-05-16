@@ -28,7 +28,7 @@
 #   0x38  s_magic              u16  (0xEF53)
 #   0x58  s_inode_size         u16
 
-from kernel.block.blk import blk_read_sectors, SECTOR_SIZE
+from kernel.block.blk import blk_read_sectors, blk_write_sectors, SECTOR_SIZE
 from kernel.printk.printk import printk0, printk1, printk2
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
@@ -149,6 +149,14 @@ def _ext4_read_block(block_nr: uint64, buf: Ptr[uint8]) -> int32:
     sectors_per_block: uint64 = ext4_block_size / SECTOR_SIZE
     lba: uint64 = block_nr * sectors_per_block
     return blk_read_sectors(ext4_blockdev_slot, lba, sectors_per_block, buf)
+
+
+def _ext4_write_block(block_nr: uint64, buf: Ptr[uint8]) -> int32:
+    # Symmetric write. Used for bitmap updates and (eventually)
+    # data block writes during file create / extend.
+    sectors_per_block: uint64 = ext4_block_size / SECTOR_SIZE
+    lba: uint64 = block_nr * sectors_per_block
+    return blk_write_sectors(ext4_blockdev_slot, lba, sectors_per_block, buf)
 
 
 def ext4_read_inode(inum: uint64, out: Ptr[uint8]) -> int32:
@@ -656,3 +664,153 @@ def ext4_dir_dump(dir_inode_buf: Ptr[uint8]):
                 i = i + 1
             printk0("'\n")
         pos = pos + cast[uint64](rec_len)
+
+
+# --- block bitmap (M16.61) ----------------------------------------
+#
+# Each block group has a one-block bitmap with one bit per data block
+# in the group. Bit set = block is allocated; bit clear = block is
+# free. Layout (low bit first within each byte — matches Linux):
+#
+#     byte 0: bits for blocks N+0..N+7   (low bit = N+0)
+#     byte 1: bits for blocks N+8..N+15
+#     ...
+#
+# where N is the group's first data block. Group 0's bitmap typically
+# lives at the block named in the group descriptor's
+# bg_block_bitmap_lo field (offset 0). For 64BIT ext4, bg_block_bitmap
+# is split lo/hi at offsets 0 and 0x20, but our 1 MiB test image stays
+# 32-bit so the hi half is unused.
+#
+# Scratch buffer for one bitmap block. Separate from ext4_blk_buf
+# because alloc callers want to keep their dir/extent buffer intact
+# while we mutate the bitmap.
+
+ext4_bitmap_buf: Array[1024, uint8]
+
+
+def _ext4_group_desc_field_u32(grp: uint64, field_off: uint64) -> uint32:
+    # Read a u32 field at byte offset `field_off` within group `grp`'s
+    # descriptor. Returns 0 on read failure (caller checks against
+    # known-nonzero fields like bg_block_bitmap).
+    desc_byte_off: uint64 = grp * ext4_desc_size
+    gdt_block:     uint64 = ext4_gdt_block + desc_byte_off / ext4_block_size
+    within:        uint64 = desc_byte_off % ext4_block_size
+    if _ext4_read_block(gdt_block, &ext4_blk_buf[0]) != 0:
+        return 0
+    return _ext4_read_u32(
+        cast[Ptr[uint8]](cast[uint64](&ext4_blk_buf[0]) + within + field_off))
+
+
+def ext4_alloc_block() -> uint64:
+    # Find a free data block in group 0, mark it allocated, write the
+    # bitmap back. Returns the absolute filesystem block number, or
+    # 0 on failure (out-of-space or I/O error).
+    #
+    # M16.61 only searches group 0 — multi-group allocation is the
+    # natural follow-up. For our 1 MiB / 8192-blocks-per-group test
+    # image this is a non-issue; real-world ext4 would loop groups.
+    if ext4_blockdev_slot < 0:
+        return 0
+    bm_block: uint32 = _ext4_group_desc_field_u32(0, 0)        # bg_block_bitmap_lo
+    if bm_block == 0:
+        printk0("ext4: bg_block_bitmap_lo is zero\n")
+        return 0
+    if _ext4_read_block(cast[uint64](bm_block), &ext4_bitmap_buf[0]) != 0:
+        return 0
+    # Scan for the first 0 bit. Group 0's bitmap covers blocks
+    # 0..blocks_per_group-1 of the filesystem, but the first
+    # ~few-dozen blocks are sb+gdt+bitmaps+inode_table and are
+    # already marked allocated by mkfs. We just take the first free
+    # bit we find.
+    byte_idx: uint64 = 0
+    nbytes: uint64 = ext4_block_size
+    if nbytes > ext4_blocks_per_grp / 8:
+        nbytes = ext4_blocks_per_grp / 8
+    while byte_idx < nbytes:
+        b: uint8 = ext4_bitmap_buf[byte_idx]
+        if b != 0xFF:
+            bit_idx: uint64 = 0
+            while bit_idx < 8:
+                mask: uint8 = cast[uint8](1) << cast[uint8](bit_idx)
+                if (b & mask) == 0:
+                    # Mark allocated.
+                    ext4_bitmap_buf[byte_idx] = b | mask
+                    if _ext4_write_block(cast[uint64](bm_block),
+                                         &ext4_bitmap_buf[0]) != 0:
+                        printk0("ext4: bitmap write failed\n")
+                        return 0
+                    # Group 0's blocks start at s_first_data_block;
+                    # bit 0 of the bitmap is block s_first_data_block.
+                    return ext4_first_data_blk \
+                         + byte_idx * 8 + bit_idx
+                bit_idx = bit_idx + 1
+        byte_idx = byte_idx + 1
+    printk0("ext4: no free block in group 0\n")
+    return 0
+
+
+def ext4_free_block(block_nr: uint64) -> int32:
+    # Clear the bitmap bit for `block_nr` and write the bitmap back.
+    # Returns 0 on success, -1 on out-of-range / I/O failure. Like
+    # alloc, M16.61 only handles group 0; cross-group free is the
+    # symmetric follow-up.
+    if ext4_blockdev_slot < 0:
+        return -1
+    if block_nr < ext4_first_data_blk:
+        return -1
+    rel: uint64 = block_nr - ext4_first_data_blk
+    if rel >= ext4_blocks_per_grp:
+        printk0("ext4: free_block: block not in group 0\n")
+        return -1
+    bm_block: uint32 = _ext4_group_desc_field_u32(0, 0)
+    if bm_block == 0:
+        return -1
+    if _ext4_read_block(cast[uint64](bm_block), &ext4_bitmap_buf[0]) != 0:
+        return -1
+    byte_idx: uint64 = rel / 8
+    bit_idx:  uint64 = rel % 8
+    mask: uint8 = cast[uint8](1) << cast[uint8](bit_idx)
+    ext4_bitmap_buf[byte_idx] = ext4_bitmap_buf[byte_idx] & (~mask)
+    return _ext4_write_block(cast[uint64](bm_block),
+                             &ext4_bitmap_buf[0])
+
+
+def ext4_bitmap_smoke_test() -> int32:
+    # Exercise the block allocator: alloc → re-alloc → free both.
+    # Verifies that
+    #   (a) allocations succeed and return distinct blocks
+    #   (b) the bitmap actually mutates on disk (re-alloc would
+    #       return the same block if the write didn't stick)
+    #   (c) free clears the bit (next alloc-after-free returns
+    #       one of the freed blocks)
+    # Returns 0 on PASS, -1 on FAIL. Caller prints the marker.
+    a: uint64 = ext4_alloc_block()
+    if a == 0:
+        printk0("ext4: bitmap smoke FAIL (first alloc)\n")
+        return -1
+    b: uint64 = ext4_alloc_block()
+    if b == 0 or b == a:
+        printk0("ext4: bitmap smoke FAIL (second alloc returned same/zero)\n")
+        ext4_free_block(a)
+        return -1
+    # Free the two blocks. Then allocate again — we should get one
+    # of the freed blocks back (allocator is first-fit so it picks
+    # the lower-numbered one).
+    if ext4_free_block(a) != 0:
+        printk0("ext4: bitmap smoke FAIL (free a)\n")
+        ext4_free_block(b)
+        return -1
+    if ext4_free_block(b) != 0:
+        printk0("ext4: bitmap smoke FAIL (free b)\n")
+        return -1
+    c: uint64 = ext4_alloc_block()
+    if c != a:
+        printk1("ext4: bitmap smoke FAIL (post-free alloc returned %d)\n", c)
+        if c != 0:
+            ext4_free_block(c)
+        return -1
+    # Clean up the round-trip so we leave the FS as we found it.
+    ext4_free_block(c)
+    printk2("ext4: bitmap smoke PASS (alloc=%d/%d)\n", a, b)
+    return 0
