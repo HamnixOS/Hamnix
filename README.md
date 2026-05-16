@@ -158,6 +158,9 @@ The end-game is a fully Hamnix-authored kernel.
 | M16.78 | hamsh `env` + `unset` builtins — dump and clear shell variables | **Done** |
 | M16.79 | hamsh PATH walker uses `$PATH` variable — colon-separated, falls back to hardcoded `/bin:/sbin:/usr/bin` when unset | **Done** |
 | M16.80 | hamsh double-quoted string tokenization — `echo "hello world"` is one token | **Done** |
+| M16.81 | `/bin/banner` + `/bin/strings` | **Done** |
+| M16.82 | `/bin/halt` + `/bin/poweroff` + `/bin/reboot` stubs | **Done** |
+| M16.83 | 7 more coreutils: `/bin/pgrep`, `/bin/kill`, `/bin/sed`, `/bin/awk`, `/bin/less`, `/bin/xargs`, `/bin/ascii` | **Done** |
 
 ## L-series: Linux ABI compatibility
 
