@@ -63,3 +63,18 @@ build_adder_user rev                  # M16.64: per-line reverse
 build_adder_user rm                   # M16.65: tmpfs unlink
 build_adder_user touch                # M16.65: create-empty / truncate
 build_adder_user mkdir                # M16.65: no-op stub (flat tmpfs)
+build_adder_user basename             # M16.66: strip path prefix
+build_adder_user dirname              # M16.66: keep path prefix
+build_adder_user cut                  # M16.66: -c column / range slice
+build_adder_user tr                   # M16.66: SRC->DST byte translate
+build_adder_user od                   # M16.66: -An -tx1 hex dump
+build_adder_user printf               # M16.66: %s/%d + \n/\t/\\ escapes
+build_adder_user cp                   # M16.66: SRC->DST file copy (<=8 KiB)
+build_adder_user whoami               # M16.67: prints "root"
+build_adder_user id                   # M16.67: hard-wired uid=0(root) line
+build_adder_user clear                # M16.67: ANSI clear-screen + home
+build_adder_user hostname             # M16.67: /etc/hostname with fallback
+build_adder_user date                 # M16.67: uptime-as-clock until RTC
+build_adder_user more                 # M16.67: 24-line pager over stdin
+build_adder_user find                 # M16.67: recursive listdir walk
+build_adder_user diff                 # M16.67: byte-compare two files

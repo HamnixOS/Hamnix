@@ -74,9 +74,19 @@ set +e
     sleep 2
     printf '/cat /ext/USERMADE.TXT\n'
     sleep 2
+    # M16.67: ext4 unlink. /rm removes the file we just made; a
+    # second /cat should fail to find it. We test by then
+    # creating /ext/UNLINKED_OK.TXT — if unlink left the inode
+    # bitmap in a bad state, this create would fail.
+    printf '/rm /ext/USERMADE.TXT\n'
+    sleep 2
+    printf '/echo UNLINKED_OK > /ext/UNLINKED_OK.TXT\n'
+    sleep 2
+    printf '/cat /ext/UNLINKED_OK.TXT\n'
+    sleep 2
     printf 'exit\n'
     sleep 1
-) | timeout 40s qemu-system-x86_64 \
+) | timeout 55s qemu-system-x86_64 \
     -kernel "$ELF" \
     -drive file=build/ext4.img,if=virtio,format=raw \
     -smp 2 \
@@ -105,7 +115,8 @@ for needle in \
     "ext4: bitmap smoke PASS" \
     "ext4: create smoke PASS" \
     "CREATE_OK ext4 file-create round-trip works" \
-    "WRITE_VIA_SHELL"
+    "WRITE_VIA_SHELL" \
+    "UNLINKED_OK"
 do
     if grep -F -q "$needle" "$LOG"; then
         echo "[test_ext4] OK: '$needle'"

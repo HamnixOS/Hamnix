@@ -1,0 +1,417 @@
+# drivers/rtc/cmos.py
+#
+# CMOS / Motorola MC146818-compatible Real-Time Clock driver. Mirrors
+# the read path of Linux's arch/x86/kernel/rtc.c plus the mktime
+# helper from include/linux/time.h. We talk to the legacy RTC through
+# the two ISA I/O ports the PC/AT layout has carried forward since
+# 1984:
+#
+#   0x70  index register (write-only) — select which CMOS register
+#   0x71  data  register (read/write) — the byte at that index
+#
+# The RTC continuously updates registers 0..9 (sec, min, hour, day-of-
+# week, day, month, year) once per second. To avoid catching a half-
+# updated time we wait for register A bit 7 ("Update in Progress") to
+# fall, then read everything in one go and re-read to confirm we
+# didn't straddle a rollover — the same belt-and-braces approach
+# Linux's mach_get_cmos_time() uses.
+#
+# Register B bit 2 ("Data Mode") tells us whether the registers are
+# BCD or binary. QEMU defaults to BCD; real BIOSes vary. We honour
+# the bit and convert lazily.
+#
+# Year is two-digit. The CMOS doesn't store a century by default; if
+# the optional register 0x32 reads as a plausible 4-digit century
+# prefix (>= 19) we use it, otherwise the M16.66 windowed-year
+# convention from the spec (YY < 70 → 20YY, else 19YY) applies.
+
+from kernel.printk.printk import printk0, printk1, printk2
+
+# --- I/O port layout ----------------------------------------------
+CMOS_INDEX_PORT: uint16 = 0x70
+CMOS_DATA_PORT:  uint16 = 0x71
+
+# --- CMOS register indices -----------------------------------------
+CMOS_REG_SECONDS:  uint8 = 0x00
+CMOS_REG_MINUTES:  uint8 = 0x02
+CMOS_REG_HOURS:    uint8 = 0x04
+CMOS_REG_DAY:      uint8 = 0x07
+CMOS_REG_MONTH:    uint8 = 0x08
+CMOS_REG_YEAR:     uint8 = 0x09
+CMOS_REG_CENTURY:  uint8 = 0x32
+CMOS_REG_STATUS_A: uint8 = 0x0A
+CMOS_REG_STATUS_B: uint8 = 0x0B
+
+CMOS_STATUS_A_UIP: uint8 = 0x80      # Update-In-Progress flag
+CMOS_STATUS_B_BIN: uint8 = 0x04      # 1 = binary regs, 0 = BCD
+CMOS_STATUS_B_24H: uint8 = 0x02      # 1 = 24-hour mode, 0 = 12-hour
+
+
+# Boot-time cached Unix epoch. Filled by rtc_init() and read back via
+# rtc_boot_epoch_get(). 0 before init / on read error.
+rtc_boot_epoch: uint64 = 0
+
+
+def cmos_read(idx: uint8) -> uint8:
+    # outb(value, port) — argument order matches the kernel's x86
+    # intrinsic. Writing the register index selects which byte is
+    # exposed at the data port; the high bit of 0x70 also gates NMI
+    # on some chipsets, but we preserve current NMI state by only
+    # writing the low 7 bits.
+    outb(idx & 0x7F, CMOS_INDEX_PORT)
+    return cast[uint8](inb(CMOS_DATA_PORT))
+
+
+def cmos_uip_set() -> int32:
+    # Returns 1 while the RTC is mid-update. We read status A
+    # without disturbing register selection elsewhere because every
+    # cmos_read() reasserts the index it wants.
+    if (cmos_read(CMOS_REG_STATUS_A) & CMOS_STATUS_A_UIP) != 0:
+        return 1
+    return 0
+
+
+def bcd_to_bin(v: uint8) -> uint32:
+    # Standard packed-BCD nibble unpack: high nibble = tens, low = units.
+    high: uint32 = cast[uint32]((v >> 4) & 0x0F)
+    low:  uint32 = cast[uint32](v & 0x0F)
+    return high * 10 + low
+
+
+# --- Days-since-epoch helpers --------------------------------------
+#
+# Cumulative day counts at the start of each month in a non-leap
+# year. February correction is applied separately when the year
+# itself is a leap year and the requested month is March or later.
+#                                  J   F   M   A    M    J    J    A    S    O    N    D
+# cumulative_days_in_year[m-1] for m in 1..12
+cumdays_jan: uint32 = 0
+cumdays_feb: uint32 = 31
+cumdays_mar: uint32 = 59
+cumdays_apr: uint32 = 90
+cumdays_may: uint32 = 120
+cumdays_jun: uint32 = 151
+cumdays_jul: uint32 = 181
+cumdays_aug: uint32 = 212
+cumdays_sep: uint32 = 243
+cumdays_oct: uint32 = 273
+cumdays_nov: uint32 = 304
+cumdays_dec: uint32 = 334
+
+
+def cumulative_days(month: uint32) -> uint32:
+    # 1-indexed month → days elapsed since January 1 in a non-leap year.
+    # Implemented as a switch so we don't need a global array of
+    # constants (which adds bss + relocations for one cold path).
+    if month == 1:
+        return cumdays_jan
+    if month == 2:
+        return cumdays_feb
+    if month == 3:
+        return cumdays_mar
+    if month == 4:
+        return cumdays_apr
+    if month == 5:
+        return cumdays_may
+    if month == 6:
+        return cumdays_jun
+    if month == 7:
+        return cumdays_jul
+    if month == 8:
+        return cumdays_aug
+    if month == 9:
+        return cumdays_sep
+    if month == 10:
+        return cumdays_oct
+    if month == 11:
+        return cumdays_nov
+    return cumdays_dec
+
+
+def is_leap(year: uint32) -> int32:
+    # Proleptic Gregorian: divisible by 4, except centuries, except
+    # multiples of 400. 2000 is a leap year, 1900 is not, 2024 is.
+    if (year % 400) == 0:
+        return 1
+    if (year % 100) == 0:
+        return 0
+    if (year % 4) == 0:
+        return 1
+    return 0
+
+
+def leap_days_before(year: uint32) -> uint32:
+    # Count of leap years in [1970, year) — i.e. how many extra Feb-29s
+    # have elapsed between the epoch and the start of `year`. Formula:
+    #   floor((year-1)/4)  - floor((year-1)/100)  + floor((year-1)/400)
+    #   minus the same evaluated at 1969.
+    if year <= 1970:
+        return 0
+    y: uint32 = year - 1
+    cur: uint32 = (y / 4) - (y / 100) + (y / 400)
+    # At y=1969: 1969/4=492, 1969/100=19, 1969/400=4 → 477.
+    base: uint32 = 477
+    return cur - base
+
+
+def mktime_utc(year: uint32, month: uint32, day: uint32,
+               hour: uint32, minute: uint32, second: uint32) -> uint64:
+    # Convert a UTC broken-down time to Unix epoch seconds. Mirrors
+    # Linux's mktime64() in kernel/time/time.c, but written out long-
+    # hand because we have no 13-month trick available without a
+    # division-by-12 helper that handles negatives.
+    if year < 1970:
+        return 0
+    full_years: uint32 = year - 1970
+    days: uint32 = full_years * 365 + leap_days_before(year) \
+                 + cumulative_days(month) + (day - 1)
+    # Add the extra day for Jan/Feb of a leap year: cumulative_days
+    # assumes a non-leap year, so March 1st of 2024 needs +1.
+    if is_leap(year) != 0:
+        if month >= 3:
+            days = days + 1
+    secs: uint64 = cast[uint64](days) * 86400 \
+                 + cast[uint64](hour) * 3600 \
+                 + cast[uint64](minute) * 60 \
+                 + cast[uint64](second)
+    return secs
+
+
+# --- Atomic read of all CMOS time registers -----------------------
+#
+# The Linux approach: spin until UIP=0 (no update mid-flight), read
+# everything, re-read seconds, and if seconds changed, do it again.
+# We extend that to all six fields to be safe — the cost is a few
+# microseconds of busy-spin once per boot.
+
+def _read_raw(out_sec:   Ptr[uint8], out_min: Ptr[uint8],
+              out_hour:  Ptr[uint8], out_day: Ptr[uint8],
+              out_mon:   Ptr[uint8], out_year: Ptr[uint8],
+              out_cent:  Ptr[uint8]):
+    # Read raw register bytes once. Caller is responsible for the
+    # UIP-clear precondition and the rollover-retry loop.
+    out_sec[0]  = cmos_read(CMOS_REG_SECONDS)
+    out_min[0]  = cmos_read(CMOS_REG_MINUTES)
+    out_hour[0] = cmos_read(CMOS_REG_HOURS)
+    out_day[0]  = cmos_read(CMOS_REG_DAY)
+    out_mon[0]  = cmos_read(CMOS_REG_MONTH)
+    out_year[0] = cmos_read(CMOS_REG_YEAR)
+    out_cent[0] = cmos_read(CMOS_REG_CENTURY)
+
+
+def rtc_read_epoch() -> uint64:
+    # Wait for any in-progress update to finish, then snapshot all
+    # the fields. Retry if a rollover happened between the two snaps
+    # (compare every byte, not just seconds — a midnight rollover
+    # bumps day/month/year too).
+    spin: uint32 = 0
+    while cmos_uip_set() != 0:
+        spin = spin + 1
+        if spin > 1000000:
+            # Bogus chip or no RTC — bail rather than hang forever.
+            return 0
+
+    sec1:  uint8 = 0
+    min1:  uint8 = 0
+    hour1: uint8 = 0
+    day1:  uint8 = 0
+    mon1:  uint8 = 0
+    year1: uint8 = 0
+    cent1: uint8 = 0
+    sec2:  uint8 = 0
+    min2:  uint8 = 0
+    hour2: uint8 = 0
+    day2:  uint8 = 0
+    mon2:  uint8 = 0
+    year2: uint8 = 0
+    cent2: uint8 = 0
+
+    _read_raw(&sec1, &min1, &hour1, &day1, &mon1, &year1, &cent1)
+
+    # Re-read; bail to the caller's snapshot if the chip stayed
+    # quiet for the second pass. We loop up to 4 times to cover
+    # the rare case where the read straddled UIP transitions.
+    attempts: uint32 = 0
+    while attempts < 4:
+        # Wait again — UIP could have asserted between reads.
+        s2: uint32 = 0
+        while cmos_uip_set() != 0:
+            s2 = s2 + 1
+            if s2 > 1000000:
+                return 0
+        _read_raw(&sec2, &min2, &hour2, &day2, &mon2, &year2, &cent2)
+        if sec1 == sec2 and min1 == min2 and hour1 == hour2 \
+           and day1 == day2 and mon1 == mon2 and year1 == year2:
+            break
+        sec1  = sec2
+        min1  = min2
+        hour1 = hour2
+        day1  = day2
+        mon1  = mon2
+        year1 = year2
+        cent1 = cent2
+        attempts = attempts + 1
+
+    # Decode mode bits from register B.
+    status_b: uint8 = cmos_read(CMOS_REG_STATUS_B)
+    is_binary: int32 = 0
+    if (status_b & CMOS_STATUS_B_BIN) != 0:
+        is_binary = 1
+    is_24h: int32 = 0
+    if (status_b & CMOS_STATUS_B_24H) != 0:
+        is_24h = 1
+
+    # 12-hour mode flags PM via bit 7 of the hours byte. The other
+    # bits hold the 1..12 hour in whatever mode the rest of the
+    # registers are in (BCD or binary).
+    hour_pm: int32 = 0
+    hour_raw: uint8 = hour2
+    if is_24h == 0:
+        if (hour_raw & 0x80) != 0:
+            hour_pm = 1
+        hour_raw = hour_raw & 0x7F
+
+    sec_v:  uint32 = 0
+    min_v:  uint32 = 0
+    hour_v: uint32 = 0
+    day_v:  uint32 = 0
+    mon_v:  uint32 = 0
+    year_v: uint32 = 0
+    cent_v: uint32 = 0
+    if is_binary != 0:
+        sec_v  = cast[uint32](sec2)
+        min_v  = cast[uint32](min2)
+        hour_v = cast[uint32](hour_raw)
+        day_v  = cast[uint32](day2)
+        mon_v  = cast[uint32](mon2)
+        year_v = cast[uint32](year2)
+        cent_v = cast[uint32](cent2)
+    else:
+        sec_v  = bcd_to_bin(sec2)
+        min_v  = bcd_to_bin(min2)
+        hour_v = bcd_to_bin(hour_raw)
+        day_v  = bcd_to_bin(day2)
+        mon_v  = bcd_to_bin(mon2)
+        year_v = bcd_to_bin(year2)
+        cent_v = bcd_to_bin(cent2)
+
+    if is_24h == 0:
+        # 12 AM is 0 hours, 12 PM is 12 hours, everything else gets
+        # +12 if PM.
+        if hour_v == 12:
+            hour_v = 0
+        if hour_pm != 0:
+            hour_v = hour_v + 12
+
+    # Compose the full 4-digit year. If the century register is
+    # plausible (>= 19) use it; otherwise apply the windowed default.
+    full_year: uint32 = 0
+    if cent_v >= 19 and cent_v <= 99:
+        full_year = cent_v * 100 + year_v
+    else:
+        if year_v < 70:
+            full_year = 2000 + year_v
+        else:
+            full_year = 1900 + year_v
+
+    # Defensive clamp: a wild value would otherwise underflow inside
+    # mktime_utc (year - 1970) and produce a galactic epoch.
+    if full_year < 1970:
+        return 0
+    if mon_v < 1 or mon_v > 12:
+        return 0
+    if day_v < 1 or day_v > 31:
+        return 0
+
+    return mktime_utc(full_year, mon_v, day_v, hour_v, min_v, sec_v)
+
+
+def rtc_boot_epoch_get() -> uint64:
+    return rtc_boot_epoch
+
+
+# --- Banner: decompose epoch back to a printable date ----------
+#
+# Pure inverse of mktime_utc — used only for the boot banner so a
+# human reading the serial log can sanity-check the timestamp.
+# Operates on the epoch we just computed; if anything went wrong
+# upstream the values printed will still match the math.
+
+def _print_banner(epoch: uint64):
+    secs: uint64 = epoch
+    sec: uint32 = cast[uint32](secs % 60)
+    secs = secs / 60
+    minute: uint32 = cast[uint32](secs % 60)
+    secs = secs / 60
+    hour: uint32 = cast[uint32](secs % 24)
+    days: uint32 = cast[uint32](secs / 24)
+
+    # Walk year by year subtracting 365 or 366. Linear scan is fine
+    # for one print at boot; the inner cost is a single divisibility
+    # check per year.
+    year: uint32 = 1970
+    while True:
+        ylen: uint32 = 365
+        if is_leap(year) != 0:
+            ylen = 366
+        if days < ylen:
+            break
+        days = days - ylen
+        year = year + 1
+
+    # Now `days` is the 0-indexed day-of-year. Find the month.
+    month: uint32 = 1
+    while month <= 12:
+        mlen: uint32 = month_length(month, year)
+        if days < mlen:
+            break
+        days = days - mlen
+        month = month + 1
+    day: uint32 = days + 1
+
+    printk1("rtc: boot epoch = %d", epoch)
+    printk2(" (%d-%d", cast[uint64](year), cast[uint64](month))
+    printk2("-%d %d", cast[uint64](day), cast[uint64](hour))
+    printk2(":%d:%d UTC)\n",
+            cast[uint64](minute), cast[uint64](sec))
+
+
+def month_length(month: uint32, year: uint32) -> uint32:
+    # Days in `month` of `year`. Feb has 29 in leap years, 28 otherwise.
+    if month == 1:
+        return 31
+    if month == 2:
+        if is_leap(year) != 0:
+            return 29
+        return 28
+    if month == 3:
+        return 31
+    if month == 4:
+        return 30
+    if month == 5:
+        return 31
+    if month == 6:
+        return 30
+    if month == 7:
+        return 31
+    if month == 8:
+        return 31
+    if month == 9:
+        return 30
+    if month == 10:
+        return 31
+    if month == 11:
+        return 30
+    return 31
+
+
+def rtc_init():
+    # Snapshot the wall clock once at boot, cache it, and print a
+    # banner. Subsequent rtc_read_epoch() calls re-read the chip so
+    # the long-running kernel can still answer "what time is it?".
+    e: uint64 = rtc_read_epoch()
+    rtc_boot_epoch = e
+    if e == 0:
+        printk0("rtc: boot epoch = 0 (RTC unreadable)\n")
+        return
+    _print_banner(e)
