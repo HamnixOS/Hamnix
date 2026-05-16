@@ -92,3 +92,5 @@ build_adder_user ln                   # M16.74: placeholder for symlink/hardlink
 build_adder_user cal                  # M16.74: hard-coded May 2026 month grid
 build_adder_user expr                 # M16.74: A OP B for + - * /
 build_adder_user test                 # M16.74: -z/-n/=/!= predicates
+build_adder_user banner               # M16.81: ASCII-art big text
+build_adder_user strings              # M16.81: print printable runs from a binary
