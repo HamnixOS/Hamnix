@@ -43,8 +43,9 @@ extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
 
 
-PT_LOAD:   uint32 = 1
-PT_INTERP: uint32 = 3
+PT_LOAD:    uint32 = 1
+PT_INTERP:  uint32 = 3
+PT_DYNAMIC: uint32 = 2
 
 # e_ident byte offsets we care about for Linux-ABI detection.
 EI_OSABI:      uint64 = 7
@@ -53,6 +54,26 @@ EI_ABIVERSION: uint64 = 8
 # default), 3 = explicit Linux. Either one means "could be Linux".
 ELFOSABI_SYSV:  uint8 = 0
 ELFOSABI_LINUX: uint8 = 3
+
+# .dynamic section d_tag values (sub-set used by static-PIE binaries).
+# include/uapi/linux/elf.h #defines DT_NULL=0, DT_PLTRELSZ=2, DT_RELA=7,
+# DT_RELASZ=8, DT_RELAENT=9, DT_JMPREL=23.
+DT_NULL:     uint64 = 0
+DT_PLTRELSZ: uint64 = 2
+DT_RELA:     uint64 = 7
+DT_RELASZ:   uint64 = 8
+DT_RELAENT:  uint64 = 9
+DT_JMPREL:   uint64 = 23
+
+# x86_64 relocation types we apply for dynamic relocations
+# (include/uapi/linux/elf.h). RELATIVE is THE one for static-PIE; the
+# symbol-resolving flavors are listed for completeness even though
+# static-PIE binaries virtually never emit them.
+R_X86_64_NONE_DYN:      uint32 = 0
+R_X86_64_64_DYN:        uint32 = 1
+R_X86_64_GLOB_DAT:      uint32 = 6
+R_X86_64_JUMP_SLOT:     uint32 = 7
+R_X86_64_RELATIVE:      uint32 = 8
 
 
 # Returned by elf_load_blob: (entry_addr, load_addr).
@@ -90,6 +111,21 @@ def _read_u64(p: Ptr[uint8]) -> uint64:
     return lo | (hi << 32)
 
 
+def _write_u64(p: Ptr[uint8], v: uint64):
+    # Byte-shuffled 8-byte store. The CPU permits misaligned writes,
+    # but writing it out explicitly keeps the source portable and
+    # mirrors linux_abi/loader.ad's `_wr_u64`. Used by the dynamic-
+    # relocation applier below.
+    p[0] = cast[uint8](v & 0xFF)
+    p[1] = cast[uint8]((v >> 8) & 0xFF)
+    p[2] = cast[uint8]((v >> 16) & 0xFF)
+    p[3] = cast[uint8]((v >> 24) & 0xFF)
+    p[4] = cast[uint8]((v >> 32) & 0xFF)
+    p[5] = cast[uint8]((v >> 40) & 0xFF)
+    p[6] = cast[uint8]((v >> 48) & 0xFF)
+    p[7] = cast[uint8]((v >> 56) & 0xFF)
+
+
 def _validate_magic(blob: Ptr[uint8]) -> int32:
     # 0x7f 'E' 'L' 'F' = 0x7f 0x45 0x4c 0x46
     if blob[0] != 0x7f:
@@ -101,6 +137,138 @@ def _validate_magic(blob: Ptr[uint8]) -> int32:
     if blob[3] != 0x46:
         return 0
     return 1
+
+
+# U10: state shared between _load_elf64 and _apply_dyn_relocs. Adder
+# doesn't support tuple returns, and threading three out-params through
+# the helper signature would be ugly — file-scope globals match the
+# rest of this module (elf_last_load_base, elf_last_was_linux) and the
+# loader is single-threaded.
+elf_reloc_applied: uint64 = 0
+elf_reloc_skipped: uint64 = 0
+
+
+def _apply_dyn_relocs(rela_addr: uint64, rela_size: uint64,
+                      region: uint64, lowest_v: uint64):
+    # Walk a contiguous .rela.dyn / .rela.plt table and apply each
+    # relocation in place. rela_addr is the runtime address (already
+    # rebased: region + (rela_vaddr - lowest_v)). Counts go into the
+    # file-scope elf_reloc_{applied,skipped} so _load_elf64 can print
+    # a single summary line covering both tables.
+    #
+    # Per Elf64_Rela (24 bytes):
+    #   0   r_offset (uint64)  virtual address of the slot to patch
+    #   8   r_info   (uint64)  high 32 = sym index, low 32 = type
+    #   16  r_addend (int64)
+    #
+    # The only relocation type a static-PIE x86_64 binary emits in
+    # bulk is R_X86_64_RELATIVE — the linker uses it to fix up every
+    # absolute pointer (function-pointer tables, .data quad-of-string,
+    # ctor/dtor arrays). Body: *(uint64*)(load_base + r_offset) =
+    # load_base + r_addend. The other supported types resolve symbols;
+    # static-PIE has no .dynsym entries to chase, so they only matter
+    # if a future U milestone wires ld.so.
+    nr_entries: uint64 = rela_size / 24
+    j: uint64 = 0
+    while j < nr_entries:
+        ent: uint64 = rela_addr + j * 24
+        r_offset: uint64 = _read_u64(cast[Ptr[uint8]](ent + 0))
+        r_info:   uint64 = _read_u64(cast[Ptr[uint8]](ent + 8))
+        r_addend: uint64 = _read_u64(cast[Ptr[uint8]](ent + 16))
+
+        r_type: uint32 = cast[uint32](r_info & 0xFFFFFFFF)
+        # Rebase the patch site: r_offset is a link-time virtual
+        # address. Subtract lowest_v then add region to get the
+        # runtime address of the 8-byte slot we're rewriting.
+        target: uint64 = region + (r_offset - lowest_v)
+
+        if r_type == R_X86_64_RELATIVE:
+            # *(uint64*)target = load_base + addend
+            # addend is the link-time virtual address of the referent;
+            # subtract lowest_v and add region to translate it into the
+            # runtime address space, identical to how PT_LOAD rebased.
+            val: uint64 = region + (r_addend - lowest_v)
+            _write_u64(cast[Ptr[uint8]](target), val)
+            elf_reloc_applied = elf_reloc_applied + 1
+        elif r_type == R_X86_64_64_DYN \
+                or r_type == R_X86_64_GLOB_DAT \
+                or r_type == R_X86_64_JUMP_SLOT:
+            # *(uint64*)target = sym_addr + addend. For U10 we don't
+            # resolve symbols (no .dynsym walker yet) — static-PIE
+            # binaries don't emit these. Log and skip so a future
+            # ld.so port can see the count rise.
+            printk1("elf64: dyn-reloc sym-resolved type %d skipped (no dynsym)\n",
+                    cast[uint64](r_type))
+            elf_reloc_skipped = elf_reloc_skipped + 1
+        elif r_type == R_X86_64_NONE_DYN:
+            pass
+        else:
+            # Anything else: log the type number and keep going. The
+            # binary will likely crash on use, but failing-fast at load
+            # time would be worse — the user wouldn't see what was
+            # missing.
+            printk1("elf64: unsupported dyn-reloc type %d\n",
+                    cast[uint64](r_type))
+            elf_reloc_skipped = elf_reloc_skipped + 1
+        j = j + 1
+
+
+def _process_dynamic(blob: Ptr[uint8], dyn_offset: uint64,
+                     region: uint64, lowest_v: uint64):
+    # Walk the .dynamic array at file offset `dyn_offset` (taken from
+    # the PT_DYNAMIC phdr's p_offset), cache the addresses + sizes of
+    # the rela tables, then invoke _apply_dyn_relocs on each. We parse
+    # the .dynamic table from the *file image* (cheaper than walking
+    # the rebased copy and avoids depending on the .dynamic section's
+    # own PT_LOAD having been processed before us).
+    #
+    # Entries are 16 bytes each: d_tag (int64) at +0, d_un (uint64) at
+    # +8, terminated by d_tag == DT_NULL (0). Real-world .dynamic
+    # tables are short (~20 entries even on glibc binaries) so a flat
+    # walk is fine.
+    rela_va:    uint64 = 0
+    rela_sz:    uint64 = 0
+    rela_ent:   uint64 = 24
+    jmprel_va:  uint64 = 0
+    jmprel_sz:  uint64 = 0
+
+    p: uint64 = cast[uint64](blob) + dyn_offset
+    # Cap the walk at 256 entries so a bogus or unterminated .dynamic
+    # can't spin forever; real tables don't come close to this.
+    k: uint64 = 0
+    while k < 256:
+        d_tag: uint64 = _read_u64(cast[Ptr[uint8]](p + k * 16 + 0))
+        d_un:  uint64 = _read_u64(cast[Ptr[uint8]](p + k * 16 + 8))
+        if d_tag == DT_NULL:
+            break
+        if d_tag == DT_RELA:
+            rela_va = d_un
+        elif d_tag == DT_RELASZ:
+            rela_sz = d_un
+        elif d_tag == DT_RELAENT:
+            rela_ent = d_un
+        elif d_tag == DT_JMPREL:
+            jmprel_va = d_un
+        elif d_tag == DT_PLTRELSZ:
+            jmprel_sz = d_un
+        k = k + 1
+
+    if rela_ent != 24 and rela_ent != 0:
+        printk1("elf64: unexpected DT_RELAENT=%d (want 24)\n", rela_ent)
+
+    if rela_va != 0 and rela_sz != 0:
+        # rela_va is a virtual address inside the image — rebase like
+        # every other vaddr. The .rela.dyn lives in a PT_LOAD that's
+        # already been copied into `region`, so the runtime bytes match
+        # what's in the file at the same offset.
+        rela_runtime: uint64 = region + (rela_va - lowest_v)
+        printk2("elf64: .rela.dyn @ 0x%x size=%d\n", rela_va, rela_sz)
+        _apply_dyn_relocs(rela_runtime, rela_sz, region, lowest_v)
+
+    if jmprel_va != 0 and jmprel_sz != 0:
+        jmprel_runtime: uint64 = region + (jmprel_va - lowest_v)
+        printk2("elf64: .rela.plt @ 0x%x size=%d\n", jmprel_va, jmprel_sz)
+        _apply_dyn_relocs(jmprel_runtime, jmprel_sz, region, lowest_v)
 
 
 def _load_elf64(blob: Ptr[uint8], blob_size: uint64) -> uint64:
@@ -184,6 +352,30 @@ def _load_elf64(blob: Ptr[uint8], blob_size: uint64) -> uint64:
             printk2("elf64:   PT_LOAD vaddr=0x%x size=%d\n",
                     p_vaddr, p_memsz)
         i = i + 1
+
+    # U10: third pass — find PT_DYNAMIC and apply dynamic relocations.
+    # Static-PIE binaries (ET_DYN with no PT_INTERP) carry a .rela.dyn
+    # full of R_X86_64_RELATIVE entries that fix up every absolute
+    # pointer embedded in .data / .data.rel.ro (function-pointer tables,
+    # ctor/dtor arrays, the `.quad msg` idiom). Without this pass those
+    # pointers stay at their link-time values (typically tiny: 0x2000,
+    # 0x3000 …) and the program dereferences a low-address NULL on
+    # first use. Non-PIE ET_EXEC binaries have no PT_DYNAMIC so this
+    # whole pass is a no-op for them.
+    elf_reloc_applied = 0
+    elf_reloc_skipped = 0
+    i = 0
+    while i < e_phnum:
+        ph: uint64 = cast[uint64](blob) + e_phoff \
+                    + cast[uint64](i) * cast[uint64](e_phentsize)
+        p_type: uint32 = _read_u32(cast[Ptr[uint8]](ph + 0))
+        if p_type == PT_DYNAMIC:
+            p_offset: uint64 = _read_u64(cast[Ptr[uint8]](ph + 8))
+            _process_dynamic(blob, p_offset, region, lowest_v)
+        i = i + 1
+    if elf_reloc_applied != 0 or elf_reloc_skipped != 0:
+        printk2("elf64: applied %d relocations, skipped %d unsupported types\n",
+                elf_reloc_applied, elf_reloc_skipped)
 
     elf_last_load_base = region
     return region + (e_entry - lowest_v)
