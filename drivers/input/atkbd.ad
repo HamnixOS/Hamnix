@@ -1,0 +1,208 @@
+# drivers/input/atkbd.py
+#
+# PS/2 AT keyboard driver scaffold. Mirrors drivers/input/keyboard/atkbd.c
+# in Linux at the smallest still-recognizable scale: poll the i8042
+# data/status ports, translate Set 1 scancodes to ASCII, and feed a
+# software FIFO that vfs_read can later drain. No IRQ wiring yet —
+# atkbd_poll() is intended to be called from the timer ISR (the same
+# place uart_drain_hw_to_fifo() runs), but the wiring is done by
+# init/main.ad, not here.
+#
+# Linux mapping:
+#   atkbd_interrupt() -> atkbd_poll()      (no IRQ context yet; polled)
+#   atkbd_set2_keycode[] -> sc1_to_ascii[] (Set 1, not Set 2; BIOS leaves
+#                                           the i8042 in translation mode
+#                                           so the host sees Set 1)
+#   serio rx ring     -> kbd_rx_*          (single global ring, no serio
+#                                           layer yet)
+#
+# outb/inb are codegen intrinsics (see compiler/codegen_x86.py
+# X86_INTRINSICS) — no extern declaration needed; declaring them would
+# shadow the intrinsic dispatch. Matches drivers/tty/serial/early_8250.ad
+# which uses the same intrinsics bare.
+
+from kernel.printk.printk import printk0, printk1
+
+# i8042 controller I/O ports — fixed by the ISA PC/AT spec.
+KBD_DATA_PORT:   int32 = 0x60      # read scancodes, write commands/data
+KBD_STATUS_PORT: int32 = 0x64      # read status, write commands
+
+# Status register bit 0 — Output Buffer Full (data available to read
+# from 0x60). We never touch bit 1 (Input Buffer Full, host->ctrl)
+# because we never write commands in the scaffold.
+KBD_STATUS_OBF: int32 = 0x01
+
+# Set 1 high-bit flag — scancode | 0x80 is the break (key-up) event
+# for that scancode. We ignore key-ups entirely for the first cut.
+SC1_BREAK_MASK: int32 = 0x80
+
+
+# --- Scancode -> ASCII translation table -------------------------------
+#
+# Set 1 layout, qwerty US. Index is the make code (0x00..0x7F).
+# Entries that aren't covered stay 0; atkbd_poll() treats 0 as "skip,
+# don't push". Modifiers (shift/ctrl/alt) and the extended-prefix
+# 0xE0 sequences (arrow keys, etc.) are deliberately out of scope —
+# they need state we don't have yet.
+
+SC1_TABLE_SIZE: uint64 = 128
+sc1_to_ascii: Array[128, uint8]
+
+
+def atkbd_build_table():
+    # Number row: 0x02..0x0B -> '1'..'9','0'. Note 0x0B is '0', not '10'.
+    sc1_to_ascii[0x02] = 49        # '1'
+    sc1_to_ascii[0x03] = 50        # '2'
+    sc1_to_ascii[0x04] = 51        # '3'
+    sc1_to_ascii[0x05] = 52        # '4'
+    sc1_to_ascii[0x06] = 53        # '5'
+    sc1_to_ascii[0x07] = 54        # '6'
+    sc1_to_ascii[0x08] = 55        # '7'
+    sc1_to_ascii[0x09] = 56        # '8'
+    sc1_to_ascii[0x0A] = 57        # '9'
+    sc1_to_ascii[0x0B] = 48        # '0'
+
+    # QWERTY top row: 0x10..0x19 -> q w e r t y u i o p
+    sc1_to_ascii[0x10] = 113       # 'q'
+    sc1_to_ascii[0x11] = 119       # 'w'
+    sc1_to_ascii[0x12] = 101       # 'e'
+    sc1_to_ascii[0x13] = 114       # 'r'
+    sc1_to_ascii[0x14] = 116       # 't'
+    sc1_to_ascii[0x15] = 121       # 'y'
+    sc1_to_ascii[0x16] = 117       # 'u'
+    sc1_to_ascii[0x17] = 105       # 'i'
+    sc1_to_ascii[0x18] = 111       # 'o'
+    sc1_to_ascii[0x19] = 112       # 'p'
+
+    # Home row: 0x1E..0x26 -> a s d f g h j k l
+    sc1_to_ascii[0x1E] = 97        # 'a'
+    sc1_to_ascii[0x1F] = 115       # 's'
+    sc1_to_ascii[0x20] = 100       # 'd'
+    sc1_to_ascii[0x21] = 102       # 'f'
+    sc1_to_ascii[0x22] = 103       # 'g'
+    sc1_to_ascii[0x23] = 104       # 'h'
+    sc1_to_ascii[0x24] = 106       # 'j'
+    sc1_to_ascii[0x25] = 107       # 'k'
+    sc1_to_ascii[0x26] = 108       # 'l'
+
+    # Bottom row: 0x2C..0x32 -> z x c v b n m
+    sc1_to_ascii[0x2C] = 122       # 'z'
+    sc1_to_ascii[0x2D] = 120       # 'x'
+    sc1_to_ascii[0x2E] = 99        # 'c'
+    sc1_to_ascii[0x2F] = 118       # 'v'
+    sc1_to_ascii[0x30] = 98        # 'b'
+    sc1_to_ascii[0x31] = 110       # 'n'
+    sc1_to_ascii[0x32] = 109       # 'm'
+
+    # Whitespace and editing keys.
+    sc1_to_ascii[0x39] = 32        # space
+    sc1_to_ascii[0x1C] = 10        # Enter -> '\n' (LF, matches UART RX)
+    sc1_to_ascii[0x0E] = 8         # Backspace -> 0x08 (BS)
+
+
+def sc1_translate(scancode: int32) -> int32:
+    # Returns the ASCII byte for a Set 1 make code, or 0 if unmapped.
+    # Index is bounds-checked against SC1_TABLE_SIZE because a corrupt
+    # or extended scancode could otherwise read off the end of the
+    # 128-byte table.
+    if scancode < 0:
+        return 0
+    if cast[uint64](scancode) >= SC1_TABLE_SIZE:
+        return 0
+    return cast[int32](sc1_to_ascii[scancode])
+
+
+# --- Software RX FIFO --------------------------------------------------
+#
+# Same ring-buffer shape as drivers/tty/serial/early_8250.ad's
+# uart_rx_fifo: head/tail indices, push drops on full, pop returns -1
+# on empty. 128 bytes is plenty for a human typing between timer
+# ticks (10 ms by default) — even 250 wpm tops out at ~20 cps.
+
+KBD_FIFO_SIZE: uint64 = 128
+
+kbd_fifo: Array[128, uint8]
+kbd_head: uint64 = 0                # next-pop index
+kbd_tail: uint64 = 0                # next-push index
+
+
+def kbd_rx_push(b: uint8) -> int32:
+    # Returns 1 if the byte fit, 0 if the FIFO was full (byte dropped).
+    # Dropping is preferable to blocking — we're called from ISR/poll
+    # context where blocking would wedge the timer tick.
+    nxt: uint64 = (kbd_tail + 1) % KBD_FIFO_SIZE
+    if nxt == kbd_head:
+        return 0
+    kbd_fifo[kbd_tail] = b
+    kbd_tail = nxt
+    return 1
+
+
+def kbd_rx_pop() -> int32:
+    # Returns the next byte (0..255), or -1 if the FIFO is empty.
+    if kbd_head == kbd_tail:
+        return -1
+    b: int32 = cast[int32](kbd_fifo[kbd_head])
+    kbd_head = (kbd_head + 1) % KBD_FIFO_SIZE
+    return b
+
+
+def kbd_rx_has() -> int32:
+    # Cheap non-destructive "is there anything?" probe for poll loops
+    # that don't want to commit to consuming a byte yet.
+    if kbd_head == kbd_tail:
+        return 0
+    return 1
+
+
+# --- Polled read path --------------------------------------------------
+#
+# atkbd_poll() is the equivalent of one IRQ1 take in Linux's atkbd_interrupt
+# fast path: read every byte the controller currently has buffered,
+# translate make codes, drop break codes. We drain in a loop because
+# QEMU (and real hardware under typing) will frequently have multiple
+# bytes pending between calls — leaving them queued delays input
+# arbitrarily.
+
+def atkbd_poll():
+    # Status bit 0 must be set before each read; reading 0x60 with OBF
+    # clear returns stale or undefined data on real hardware.
+    while (inb(KBD_STATUS_PORT) & KBD_STATUS_OBF) != 0:
+        sc: int32 = inb(KBD_DATA_PORT) & 0xFF
+        # Break code: high bit set means the key was released. Set 1
+        # encodes break as make | 0x80, so we just mask it off and
+        # skip pushing — we don't track key state yet.
+        if (sc & SC1_BREAK_MASK) != 0:
+            continue
+        ascii: int32 = sc1_translate(sc)
+        if ascii == 0:
+            continue
+        kbd_rx_push(cast[uint8](ascii))
+
+
+# --- Init --------------------------------------------------------------
+
+def atkbd_init() -> int32:
+    # Build the translation table at runtime — Adder global arrays
+    # default to zero, and per-element initializers in a declaration
+    # would need a feature the language doesn't have yet. Cost is one
+    # function call at boot.
+    atkbd_build_table()
+
+    # Drain anything the BIOS/firmware left in the controller output
+    # buffer. If we don't, the first real keystroke arrives behind a
+    # stale byte and the user's first character looks dropped. Mirror
+    # of Linux's i8042_flush() during i8042_controller_init().
+    drained: int32 = 0
+    while (inb(KBD_STATUS_PORT) & KBD_STATUS_OBF) != 0:
+        inb(KBD_DATA_PORT)
+        drained = drained + 1
+        # Hard cap so a wedged controller (status stuck high) can't
+        # spin us forever during boot.
+        if drained > 16:
+            break
+
+    if drained > 0:
+        printk1("atkbd: drained %d stale bytes\n", cast[uint64](drained))
+    printk0("atkbd: ready\n")
+    return 0

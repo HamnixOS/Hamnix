@@ -150,6 +150,9 @@ The end-game is a fully Hamnix-authored kernel.
 | M16.70 | `/df` `/du` `/tail` `/cmp` coreutils | **Done** |
 | M16.71 | hamsh — `;`, `&&`, `\|\|` sub-command separators with conjunction-based skip | **Done** |
 | M16.72 | Userland moved to `/bin/<name>`; hamsh PATH walker resolves bare command names (`/bin`, `/sbin`, `/usr/bin`) | **Done** |
+| M16.73 | hamsh sources `/etc/rc` at startup — boot-time script in the shell's own syntax (motd, echo banners, sets up onboarding) | **Done** |
+| M16.74 | `/bin/which` + 7 more coreutils (`free`, `uptime`, `mv`, `ln` stub, `cal`, `expr`, `test`) + `init2`/`/etc/inittab` scaffold | **Done** |
+| M16.75 | PS/2 keyboard driver — Set 1 scancode translation, 128-byte FIFO, drained on every timer tick; `vfs_read` on stdin pulls from kbd + UART | **Done** |
 
 
 ## How it works
