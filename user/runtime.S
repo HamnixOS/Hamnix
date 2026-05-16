@@ -168,11 +168,13 @@ sys_execve:
     .size sys_execve, .-sys_execve
 
 
-    /* --- sys_spawn(path, argv, stdin_fd, stdout_fd) -> int32 --------
-     * 4-arg syscall. SysV places arg 4 in %rcx, but the syscall
-     * ABI reserves %rcx for the user RIP and uses %r10 for arg 4.
-     * Shuffle %rcx -> %r10 before `syscall`. The next syscall whose
-     * caller has >=4 args needs the same dance. */
+    /* --- sys_spawn(path, argv, stdin_fd, stdout_fd, envp) -> int32 --
+     * 5-arg syscall. SysV places arg 4 in %rcx and arg 5 in %r8,
+     * but the syscall ABI reserves %rcx for the user RIP and uses
+     * %r10 for arg 4. Shuffle %rcx -> %r10 before `syscall`; %r8
+     * (arg 5: envp) already lines up between the two ABIs.
+     * U17: envp is a Ptr[uint64] NULL-terminated array of cstring
+     * pointers to "NAME=VALUE\0", or 0 for empty env. */
     .globl sys_spawn
     .type sys_spawn, @function
 sys_spawn:
