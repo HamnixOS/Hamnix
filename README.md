@@ -201,9 +201,13 @@ drivers (xhci_hcd, nvme, usbhid, e1000e). See
 | **L26** | netfilter: `nf_register_net_hook`, `nf_unregister_net_hook` | **Done** |
 | **L27** | Filesystem registration: `register_filesystem`, `mount_nodev` | **Done** |
 | **L28** | Kernel sockets: `sock_create_kern`, `kernel_bind` | **Done** |
-| L29 | M1..M15 .ko regression passes against Hamnix | Pending |
-| L30..L37 | Stock distro modules (crc32c, xhci_hcd, nvme, usbhid, efifb) | Pending |
-| L38..L39 | UEFI boot + ACPI MADT/MCFG | Pending |
+| L29 | M1..M15 .ko regression passes against Hamnix | Pending (harness shipped; needs Linux 6.12.48 build tree for fixtures) |
+| **L30** | **First stock Debian .ko load attempt** — crc8.ko: ELF parsed, 25/28 relocs applied, no panic; punchlist: `__x86_return_thunk` + struct-module.init field follow-up | **Done (test data captured)** |
+| L31 | Export `__x86_return_thunk` Spectre-v2 retpoline trampoline stub | In progress |
+| L32 | Read init via `struct module.init` field (not flat init_module symbol) | In progress |
+| L33..L37 | usbcore, xhci-pci, xhci-hcd, usbhid, nvme, efifb / simpledrm | Pending |
+| L38 | UEFI boot path (PE/COFF) | Scaffold |
+| L39 | ACPI MADT/MCFG parsing | Scaffold |
 | L40 | First boot on real ThinkPad hardware | Pending |
 
 ## U-series: Linux userspace ABI (planned)
