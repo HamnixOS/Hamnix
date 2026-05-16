@@ -97,12 +97,15 @@ check_marker() {
 # Primary success criterion: musl's crt1 + __libc_start_main ran
 # to completion against the Hamnix syscall surface and main()'s
 # inline write(2) made it onto serial.
+#
+# U20: the kernel no longer processes relocations (and so no
+# "elf64: applied ... relocations" log line) — musl's own
+# _dl_relocate_static_pie inside _start fixes RELATIVE / GLOB_DAT
+# / JUMP_SLOT / IRELATIVE using AT_PHDR / AT_PHNUM / AT_ENTRY from
+# auxv. If "U12: musl hello" hits serial, the self-relocation pass
+# succeeded; there is no kernel-side signal to assert on.
 check_marker "musl main() reached serial" "U12: musl hello"
-# Secondary: U10 reloc summary — musl static-PIE emits *many*
-# R_X86_64_RELATIVE entries (way more than the pie/ fixture's 1),
-# so just check the loader ran the reloc pass.
-check_marker "loader logged relocs"       "elf64: applied"
-# Tertiary: U1/U2 path — the OSABI=Linux byte got noticed.
+# Secondary: U1/U2 path — the OSABI=Linux byte got noticed.
 check_marker "U1/U2 ELF detect"           "Linux-ABI binary detected"
 
 # Sanity: hamsh kept running after the child exited.
