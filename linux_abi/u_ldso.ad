@@ -1,0 +1,256 @@
+# linux_abi/u_ldso.ad
+#
+# U-series: Linux userspace ABI — dynamic linker scaffold.
+#
+# Long-term U-series goal: run unmodified Linux x86_64 user binaries
+# (eventually Firefox, Steam) on top of Hamnix. The K-side (kmod
+# loader, exports table, syscall surface) is already covered by the
+# L-track. What's missing is the *userspace* side of the loader
+# contract — specifically, the dynamic linker.
+#
+# ---------------------------------------------------------------------
+# Dynamic-linker contract (what real Linux does)
+# ---------------------------------------------------------------------
+# A binary built with stock `gcc hello.c` is dynamically linked: its
+# program-header table contains a PT_INTERP entry whose string payload
+# is the path of the runtime linker, conventionally
+#   /lib64/ld-linux-x86-64.so.2
+#
+# The kernel's binfmt_elf, on execve, observes PT_INTERP, mmaps the
+# *interpreter* (not the binary's _start) at a chosen base, builds the
+# initial stack (argv / envp / auxv with AT_PHDR, AT_BASE, AT_ENTRY,
+# AT_RANDOM, ...) and jumps to the interpreter's entry point. argv[0]
+# is the original binary path; the binary's image is mapped but its
+# own _start has *not* run yet.
+#
+# Once running, ld-linux.so.2:
+#   1. walks the binary's PT_DYNAMIC -> .dynamic table
+#   2. for every DT_NEEDED entry, opens the named DSO (libc.so.6,
+#      libpthread.so.0, libm.so.6, ...) via search-path rules
+#      (DT_RPATH/DT_RUNPATH, LD_LIBRARY_PATH, /etc/ld.so.cache)
+#   3. mmaps each DSO, recurses on its DT_NEEDED list
+#   4. processes relocations: DT_RELA (R_X86_64_RELATIVE,
+#      R_X86_64_GLOB_DAT, R_X86_64_64) eagerly; DT_JMPREL
+#      (R_X86_64_JUMP_SLOT) lazily via the PLT/_dl_runtime_resolve
+#      trampoline, unless LD_BIND_NOW=1 / DF_BIND_NOW is set
+#   5. runs each DSO's DT_INIT / DT_INIT_ARRAY constructors
+#   6. transfers control to the binary's e_entry (the value the kernel
+#      stashed in AT_ENTRY)
+#
+# That's a lot of machinery. For Hamnix we have two paths:
+#
+#   (a) Ship a Hamnix-authored ld-linux-x86-64.so.2 that does steps
+#       1..6 above. End-game. Lets us run *any* Debian dynamic binary
+#       byte-for-byte. Targeted at L40+ when the libc and PLT
+#       machinery is mature.
+#
+#   (b) Ship a stub that only accepts PIE / static-PIE binaries — the
+#       kind produced by `gcc -static-pie hello.c` — and refuses
+#       anything with a non-trivial DT_NEEDED list. For dynamically
+#       linked binaries, fall back to a "prefer-static, LD_BIND_NOW=1"
+#       conversion (rebuild against a Hamnix-shipped libc). This is
+#       the L37+ target: cheap to land, exercises PT_INTERP detection
+#       and the dynamic-section walker, but skips the symbol-resolution
+#       and lazy-binding rabbit hole.
+#
+# This file is the SCAFFOLD for (b), with the data-structure layouts
+# already big enough to grow into (a). No wiring into fs/elf.ad yet —
+# see "next steps" at the bottom for the staged rollout.
+
+from kernel.printk.printk import printk0, printk1
+
+
+# ---------------------------------------------------------------------
+# .dynamic entry: 16 bytes
+# ---------------------------------------------------------------------
+# struct Elf64_Dyn {
+#     int64_t   d_tag;       // DT_* identifier (signed by spec, but
+#                            //   the values we care about are all
+#                            //   non-negative)
+#     union {
+#         uint64_t d_val;    // integer payload (e.g. DT_STRSZ size)
+#         uint64_t d_ptr;    // address payload (e.g. DT_STRTAB addr)
+#     } d_un;                // 8 bytes either way
+# };
+#
+# The .dynamic section is an array of these terminated by a DT_NULL
+# entry (d_tag == 0). The dynamic-linker walks it twice: once to
+# collect the section pointers (strtab, symtab, rela, ...) and a
+# second time to pull DT_NEEDED entries (which need d_un.d_val
+# indexed into the now-known strtab to recover the DSO basename).
+
+class Elf64_Dyn:
+    d_tag: int64                                # 0..7   DT_* tag
+    d_un:  uint64                               # 8..15  d_val or d_ptr
+
+
+# ---------------------------------------------------------------------
+# Dynamic-section tag constants
+# ---------------------------------------------------------------------
+# Subset we actually need for the U-series scaffold. The full set
+# is in elf(5) / sys/link.h; everything beyond this is either
+# obsolete (DT_RPATH), GNU-extension (DT_GNU_HASH), or for features
+# we don't ship at scaffold scope (DT_VERSYM, DT_DEBUG, ...).
+#
+# Tagged uint64 so they're directly comparable against Elf64_Dyn.d_tag
+# without a cast at every site; the spec defines them as signed but
+# every value below is < 2^31 so the unsigned reinterpretation is safe.
+
+DT_NULL:     uint64 = 0       # end-of-table sentinel
+DT_NEEDED:   uint64 = 1       # d_val = strtab offset of DSO name
+DT_PLTRELSZ: uint64 = 2       # d_val = total size of PLT relocs (bytes)
+DT_STRTAB:   uint64 = 5       # d_ptr = address of string table
+DT_SYMTAB:   uint64 = 6       # d_ptr = address of symbol table
+DT_RELA:     uint64 = 7       # d_ptr = address of RELA reloc table
+DT_RELASZ:   uint64 = 8       # d_val = total RELA reloc table size
+DT_RELAENT:  uint64 = 9       # d_val = size of one RELA entry (=24)
+DT_STRSZ:    uint64 = 10      # d_val = size of string table
+DT_SYMENT:   uint64 = 11      # d_val = size of one symbol (=24)
+DT_INIT:     uint64 = 12      # d_ptr = init function (pre-main ctor)
+DT_FINI:     uint64 = 13      # d_ptr = fini function (atexit hook)
+DT_JMPREL:   uint64 = 23      # d_ptr = PLT relocations (lazy-bound)
+
+
+# ---------------------------------------------------------------------
+# RELA relocation entry: 24 bytes
+# ---------------------------------------------------------------------
+# struct Elf64_Rela {
+#     uint64_t r_offset;     // address (or offset, depending on
+#                            //   object type) the relocation targets
+#     uint64_t r_info;       // hi32 = symbol index into DT_SYMTAB,
+#                            //   lo32 = R_X86_64_* relocation type
+#                            //   Macros: ELF64_R_SYM(i)  = i >> 32
+#                            //           ELF64_R_TYPE(i) = i & 0xffffffff
+#     int64_t  r_addend;     // signed addend folded into the
+#                            //   computed value at relocation time
+# };
+#
+# RELA (vs REL) means the addend is explicit in the entry — x86_64
+# uses RELA exclusively, REL is a 32-bit holdover. Real ld-linux
+# scans this table and, for each entry, computes a value based on
+# the R_X86_64_* type and patches it into [r_offset]:
+#
+#   R_X86_64_RELATIVE  : *r_offset = load_base + r_addend
+#                        (no symbol involved; the common case for PIE)
+#   R_X86_64_GLOB_DAT  : *r_offset = symbol_value      (for .got slots)
+#   R_X86_64_JUMP_SLOT : *r_offset = symbol_value      (for .got.plt;
+#                        normally lazy via DT_JMPREL + _dl_runtime_resolve,
+#                        eager under LD_BIND_NOW=1)
+#   R_X86_64_64        : *r_offset = symbol_value + r_addend
+#
+# At scaffold scope we define the struct so the (b) path can later
+# scan DT_RELA, count R_X86_64_RELATIVE entries (which need no
+# symbol resolution, just load-base addition), and reject anything
+# else with a diagnostic.
+
+class Elf64_Rela:
+    r_offset: uint64                            # 0..7
+    r_info:   uint64                            # 8..15  sym<<32 | type
+    r_addend: int64                             # 16..23
+
+
+# Elf64_Sym (24 bytes) is parsed inline by linux_abi/loader.ad's
+# _sym_addr (sizeof = 24 hardcoded there) — we deliberately do not
+# re-declare a class here to avoid drift. When the (a) path lands
+# and needs typed symbol access, the Elf64_Sym layout will live in
+# linux_abi/structs/elf64_sym.ad as a single source of truth.
+
+
+# ---------------------------------------------------------------------
+# Stub entry: invoked from fs/elf.ad when PT_INTERP is observed
+# ---------------------------------------------------------------------
+# Real binfmt_elf's PT_INTERP handling triggers a recursive load of
+# the interpreter ELF and a stack-build for it. For now we just log
+# the path and return -ENOSYS so the calling exec() returns cleanly
+# with a "not implemented" error — better than a kernel oops on a
+# binary we can't yet handle, and the userspace probe (sh, hamsh)
+# can fall back to executing static-PIE binaries instead.
+#
+# When the (b) scaffold gains substance, this function will:
+#   1. confirm path == "/lib64/ld-linux-x86-64.so.2" (any other
+#      interpreter — musl's ld-musl, BSD's, an explicit /opt/...
+#      one — is rejected at scaffold scope)
+#   2. open the binary's own PT_DYNAMIC, walk it
+#   3. for each DT_NEEDED, refuse if the name isn't in a hard-coded
+#      whitelist (initially: just libc.so.6, mapped to Hamnix's
+#      shipped shim libc)
+#   4. process R_X86_64_RELATIVE eagerly
+#   5. jump to the original binary's e_entry with a Linux-style
+#      initial stack (argv / envp / auxv)
+#
+# Return value is a Linux errno (negative). -38 = -ENOSYS, the
+# canonical "syscall / feature not implemented" code. Matches what
+# the rest of the syscall surface returns for unwired features.
+
+def u_ldso_load(path: Ptr[char]) -> int32:
+    printk1("u_ldso: would load dynamic binary at %s\n",
+            cast[uint64](path))
+    return -38
+
+
+# ---------------------------------------------------------------------
+# Stub libc-symbol resolver (userspace counterpart to linux_abi_lookup)
+# ---------------------------------------------------------------------
+# linux_abi/exports.ad's linux_abi_lookup serves *kernel-module*
+# UND symbols (printk, kmalloc, ...) from a flat table. The U-series
+# needs the userspace mirror: when ld-linux processes a
+# R_X86_64_GLOB_DAT against "printf" or "malloc" in libc.so.6's
+# DT_SYMTAB, the address it patches in has to come from somewhere.
+#
+# Two implementation choices for the libc shim:
+#
+#   (i)  Hand-written libc.so.6 living in the initramfs, built from
+#        Hamnix-authored .ad files that wrap each libc entry around
+#        the matching Hamnix syscall (write -> sys_write, malloc ->
+#        sbrk + freelist, ...). u_ldso_resolve then just walks
+#        libc.so.6's exported symbol table like any other DSO.
+#
+#   (ii) An in-kernel shim table (mirror of exports.ad but for
+#        userspace symbols) that ld-linux queries at relocation
+#        time. Faster to bootstrap but breaks the "userspace is
+#        userspace" boundary; rejected for the end-game (a) path
+#        but acceptable for (b)'s smoke-test phase.
+#
+# This stub is the seam: for now it always returns 0 (= "symbol not
+# found"). When (b) substantiates, name will be a NUL-terminated
+# C string from libc.so.6's .dynstr and the return is the runtime
+# address of the matching Hamnix shim.
+
+def u_ldso_resolve(name: Ptr[char]) -> uint64:
+    return 0
+
+
+# ---------------------------------------------------------------------
+# Next-steps roadmap (U1..U5)
+# ---------------------------------------------------------------------
+# U1: fs/elf.ad — add PT_INTERP detection in the program-header loop.
+#     Currently fs/elf.ad walks for PT_LOAD only; the extra arm reads
+#     the interp string and calls u_ldso_load(). Smoke test: a
+#     `gcc hello.c` binary prints the "would load" diagnostic instead
+#     of crashing.
+#
+# U2: this file — implement the DT_NEEDED dependency walk. Read the
+#     binary's PT_DYNAMIC, iterate Elf64_Dyn entries, for every
+#     DT_NEEDED resolve the d_val string against DT_STRTAB and either
+#     load the named DSO (recursive) or fail closed. Bring up just
+#     libc.so.6 first; libpthread / libm come later.
+#
+# U3: this file — implement R_X86_64_GLOB_DAT (sym lookup, no addend)
+#     and R_X86_64_JUMP_SLOT (sym lookup, addend ignored — same value
+#     as GLOB_DAT, the distinction is lazy-vs-eager binding, and the
+#     scaffold is eager only). Add R_X86_64_RELATIVE (no-symbol, just
+#     load-base + addend) first — it's the simplest and covers the
+#     bulk of relocation count in real-world DSOs.
+#
+# U4: new files under user/libc/ — hand-written libc.so.6 with stubs
+#     for the syscalls a "hello world" / "/bin/echo" actually needs:
+#     write, exit, brk, mmap, munmap, plus their _start /
+#     __libc_start_main scaffolding. Smallest viable subset; grow on
+#     demand as we run more real binaries.
+#
+# U5: integration milestone — copy a real Debian /bin/echo into the
+#     initramfs, run it from hamsh, observe the expected output. At
+#     that point u_ldso has crossed from scaffold into a working
+#     (if narrow) dynamic linker, and the path to running larger
+#     binaries (sh, ls, gawk) is incremental DSO + relocation
+#     coverage.

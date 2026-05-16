@@ -36,6 +36,12 @@ extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
 EXT4_MAGIC: uint16 = 0xEF53
 
+# struct stat-style inode mode bits we care about. The ext4 i_mode
+# field encodes file type in the high nibble (mask 0xF000). 0x8000 is
+# regular file, 0x4000 is directory, 0xA000 is symlink — the value
+# /usr/include/linux/stat.h calls S_IFLNK.
+S_IFLNK: uint16 = 0xA000
+
 
 # Mount state — single mount.
 ext4_blockdev_slot:   int32  = -1
@@ -450,83 +456,283 @@ def _ext4_path_next_component(path: Ptr[char], start: uint64,
         i = i + 1
 
 
+# --- symlink follow (M16.68) --------------------------------------
+#
+# ext4 stores symlink targets two ways:
+#
+#   * "fast" link (i_size <= 60): target lives INLINE in i_block,
+#     the same 60-byte window normally used for the extent tree.
+#     mkfs/debugfs sets i_blocks_lo = 0 because no data block is
+#     allocated. Linux's ext4_inode_is_fast_symlink() uses the same
+#     test; the read just memcpy's out of i_block.
+#   * "slow" link (i_size > 60): target lives in the file's first
+#     data block, reached via the standard extent walk.
+#
+# In both cases the target is a raw byte string with no trailing NUL
+# on disk — we add one ourselves on the way out so the caller can
+# treat it as a C string.
+
+# Working buffers for path rewriting during symlink follow. Single
+# mount, single thread, so a pair of static buffers is enough.
+ext4_path_work: Array[256, uint8]
+ext4_link_target: Array[256, uint8]
+
+
+def _ext4_read_symlink_target(inode_buf: Ptr[uint8],
+                              out_buf: Ptr[uint8],
+                              out_size: uint64) -> int32:
+    # Read the symlink's target into out_buf, NUL-terminated. Returns
+    # 0 on success, -1 on read failure or empty/truncated link.
+    if out_size == 0:
+        return -1
+    isize: uint64 = cast[uint64](ext4_inode_size_lo(inode_buf))
+    if isize == 0:
+        out_buf[0] = 0
+        return -1
+    # Reserve one byte for our NUL terminator.
+    take: uint64 = isize
+    if take > out_size - 1:
+        take = out_size - 1
+    if isize <= 60:
+        # Fast symlink: target inline in i_block at offset 0x28.
+        src: uint64 = cast[uint64](inode_buf) + INODE_I_BLOCK_OFFSET
+        memcpy(out_buf, cast[Ptr[uint8]](src), take)
+    else:
+        # Slow symlink: target lives in the first data block. Reuse
+        # the standard extent → physical → read pipeline.
+        phys: uint64 = _ext4_logical_to_physical(inode_buf, 0)
+        if phys == 0:
+            return -1
+        if _ext4_read_block(phys, &ext4_blk_buf[0]) != 0:
+            return -1
+        memcpy(out_buf, &ext4_blk_buf[0], take)
+    out_buf[take] = 0
+    return 0
+
+
+def _ext4_strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _ext4_path_starts_with_ext(s: Ptr[uint8]) -> int32:
+    # Match "/ext/" prefix on a raw byte buffer.
+    prefix: Ptr[uint8] = "/ext/"
+    i: uint64 = 0
+    while i < 5:
+        if s[i] != prefix[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+# Resolution result returned by _resolve_with_symlinks. Callers pull
+# the bits they care about (file vs dir, inum, file size).
+class Ext4ResolveResult:
+    inum:       uint32
+    is_dir:     uint32
+    file_size:  uint64
+
+
+def _resolve_with_symlinks(path: Ptr[char],
+                           result: Ptr[Ext4ResolveResult]) -> int32:
+    # Walk `path` from the ext4 root with symlink follow-through. On
+    # an intermediate (or final) component that resolves to a symlink,
+    # splice the target into the working path string and restart from
+    # root. Bounded at 8 follows to break loops (matches Linux's
+    # MAXSYMLINKS default).
+    #
+    # Returns 1 on hit (fills *result), 0 on miss.
+    if path[0] == 0:
+        # Empty path → ext4 root.
+        result[0].inum      = 2
+        result[0].is_dir    = 1
+        result[0].file_size = 0
+        return 1
+
+    # Snapshot the input path into our mutable scratch.
+    pi: uint64 = 0
+    while True:
+        c: int32 = path[pi]
+        if pi >= 255:
+            return 0
+        ext4_path_work[pi] = cast[uint8](c & 0xFF)
+        if c == 0:
+            break
+        pi = pi + 1
+
+    follows: int32 = 0
+    while True:
+        cur_inode: Array[256, uint8]
+        if ext4_read_inode(2, &cur_inode[0]) != 0:
+            return 0
+        cur_inum: uint32 = 2
+        component: Array[64, uint8]
+        start: uint64 = 0
+        restart: int32 = 0
+        while restart == 0:
+            nxt: int64 = _ext4_path_next_component(
+                cast[Ptr[char]](&ext4_path_work[0]), start,
+                &component[0])
+            if component[0] == 0:
+                # Empty component. For a trailing slash on a dir path
+                # we want to return the current dir; bare empty path
+                # was handled above.
+                if nxt < 0:
+                    result[0].inum      = cur_inum
+                    result[0].is_dir    = 1
+                    result[0].file_size = 0
+                    return 1
+                start = cast[uint64](nxt)
+                continue
+            inum: uint32 = ext4_dir_lookup(&cur_inode[0],
+                                           cast[Ptr[char]](&component[0]))
+            if inum == 0:
+                return 0
+            if ext4_read_inode(cast[uint64](inum), &cur_inode[0]) != 0:
+                return 0
+            mode: uint16 = ext4_inode_mode(&cur_inode[0])
+            type_bits: uint16 = mode & 0xF000
+
+            if type_bits == S_IFLNK:
+                if follows >= 8:
+                    return 0
+                follows = follows + 1
+                if _ext4_read_symlink_target(
+                        &cur_inode[0], &ext4_link_target[0], 256) != 0:
+                    return 0
+                # Splice the target into ext4_path_work.
+                # `start` currently points at the first byte of the
+                # component we just consumed; `nxt` points one byte
+                # past the slash that ended it (or is -1 for the
+                # last component). The "tail" (bytes still to walk)
+                # is ext4_path_work[nxt..] for nxt >= 0, else "".
+                tail_start: uint64 = 0
+                has_tail: int32 = 0
+                if nxt >= 0:
+                    tail_start = cast[uint64](nxt)
+                    if ext4_path_work[tail_start] != 0:
+                        has_tail = 1
+                # Pull tail out into its own scratch so we can rewrite
+                # ext4_path_work in place. Reuse `component` (64 B) for
+                # short tails; bail if the tail wouldn't fit.
+                tail_buf: Array[256, uint8]
+                tail_len: uint64 = 0
+                if has_tail != 0:
+                    j: uint64 = 0
+                    while j < 255:
+                        b: uint8 = ext4_path_work[tail_start + j]
+                        tail_buf[j] = b
+                        if b == 0:
+                            break
+                        j = j + 1
+                    tail_buf[255] = 0
+                    tail_len = j
+
+                # Pick the new "prefix" (bytes before the symlink
+                # component) and the spliced "middle" (the target).
+                tgt: Ptr[uint8] = &ext4_link_target[0]
+                middle_off: uint64 = 0          # how many bytes of tgt to skip
+                prefix_len: uint64 = 0          # bytes of ext4_path_work to keep
+                if ext4_link_target[0] == 47:   # '/'
+                    if _ext4_path_starts_with_ext(tgt) == 0:
+                        # Absolute target that doesn't enter /ext/ —
+                        # we don't have a unified rootfs view here, so
+                        # treat as miss.
+                        return 0
+                    middle_off = 5              # skip "/ext/"
+                    prefix_len = 0              # restart from root
+                else:
+                    middle_off = 0
+                    prefix_len = start          # keep walked-bytes
+                tgt_len: uint64 = _ext4_strlen_u8(tgt)
+                if tgt_len < middle_off:
+                    return 0
+                tgt_len = tgt_len - middle_off
+
+                # Build the new working path: [prefix][target tail]['/' tail].
+                need: uint64 = prefix_len + tgt_len
+                if has_tail != 0:
+                    need = need + 1 + tail_len  # '/' + tail bytes
+                if need >= 255:
+                    return 0
+                # If prefix_len == 0 we'd be overwriting from index 0
+                # — same as the "restart from root" case. Either way,
+                # write the target into [prefix_len..] then '/' + tail.
+                k: uint64 = 0
+                while k < tgt_len:
+                    ext4_path_work[prefix_len + k] = \
+                        ext4_link_target[middle_off + k]
+                    k = k + 1
+                wpos: uint64 = prefix_len + tgt_len
+                if has_tail != 0:
+                    ext4_path_work[wpos] = 47   # '/'
+                    wpos = wpos + 1
+                    m: uint64 = 0
+                    while m < tail_len:
+                        ext4_path_work[wpos + m] = tail_buf[m]
+                        m = m + 1
+                    wpos = wpos + tail_len
+                ext4_path_work[wpos] = 0
+                restart = 1
+                continue
+
+            is_dir: int32 = 0
+            if type_bits == 0x4000:
+                is_dir = 1
+            if nxt < 0:
+                # Last component.
+                result[0].inum = inum
+                if is_dir != 0:
+                    result[0].is_dir    = 1
+                    result[0].file_size = 0
+                else:
+                    result[0].is_dir    = 0
+                    result[0].file_size = cast[uint64](
+                        ext4_inode_size_lo(&cur_inode[0]))
+                return 1
+            # Intermediate component. Must be a directory now.
+            if is_dir == 0:
+                return 0
+            cur_inum = inum
+            start = cast[uint64](nxt)
+
+
 def ext4_resolve_file(path: Ptr[char], out_inum: Ptr[uint32],
                       out_size: Ptr[uint64]) -> int32:
     # Walk `path` (caller already stripped /ext/) component by
     # component. Each component must be a directory entry in the
     # current directory; the LAST component must be a regular file.
     # Returns 1 on hit (fills out_inum / out_size), 0 on miss.
+    #
+    # Intermediate or final components that are symlinks are followed
+    # transparently (M16.68); bounded at 8 follows to break loops.
     if path[0] == 0:
         return 0                                  # empty path → root, not a file
-    cur_inode: Array[256, uint8]
-    if ext4_read_inode(2, &cur_inode[0]) != 0:
+    r: Ext4ResolveResult
+    if _resolve_with_symlinks(path, &r) == 0:
         return 0
-    component: Array[64, uint8]
-    start: uint64 = 0
-    while True:
-        nxt: int64 = _ext4_path_next_component(path, start,
-                                               &component[0])
-        # An empty component (trailing slash, "//") is treated as
-        # "current dir, end of path" — invalid for a file resolve.
-        if component[0] == 0:
-            return 0
-        inum: uint32 = ext4_dir_lookup(&cur_inode[0],
-                                       cast[Ptr[char]](&component[0]))
-        if inum == 0:
-            return 0
-        # Read the matched inode; we need its mode to decide if
-        # it's a directory (descend) or a file (terminate).
-        if ext4_read_inode(cast[uint64](inum), &cur_inode[0]) != 0:
-            return 0
-        mode: uint16 = ext4_inode_mode(&cur_inode[0])
-        is_dir: int32 = 0
-        if (mode & 0xF000) == 0x4000:
-            is_dir = 1
-        if nxt < 0:
-            # Last component. Must be a regular file.
-            if is_dir != 0:
-                return 0
-            out_inum[0] = inum
-            out_size[0] = cast[uint64](ext4_inode_size_lo(&cur_inode[0]))
-            return 1
-        # Intermediate component. Must be a directory.
-        if is_dir == 0:
-            return 0
-        start = cast[uint64](nxt)
+    if r.is_dir != 0:
+        return 0
+    out_inum[0] = r.inum
+    out_size[0] = r.file_size
+    return 1
 
 
 def ext4_resolve_dir(path: Ptr[char]) -> uint32:
     # Walk path to a DIRECTORY inode, returning its inum. Empty
     # path → root (inum 2). Returns 0 on miss / not-a-dir.
+    # Symlink-aware (M16.68): intermediate symlinks follow through.
     if path[0] == 0:
         return 2
-    cur_inode: Array[256, uint8]
-    if ext4_read_inode(2, &cur_inode[0]) != 0:
+    r: Ext4ResolveResult
+    if _resolve_with_symlinks(path, &r) == 0:
         return 0
-    component: Array[64, uint8]
-    start: uint64 = 0
-    cur_inum: uint32 = 2
-    while True:
-        nxt: int64 = _ext4_path_next_component(path, start,
-                                               &component[0])
-        if component[0] == 0:
-            if nxt < 0:
-                return cur_inum
-            start = cast[uint64](nxt)
-            continue
-        inum: uint32 = ext4_dir_lookup(&cur_inode[0],
-                                       cast[Ptr[char]](&component[0]))
-        if inum == 0:
-            return 0
-        if ext4_read_inode(cast[uint64](inum), &cur_inode[0]) != 0:
-            return 0
-        mode: uint16 = ext4_inode_mode(&cur_inode[0])
-        if (mode & 0xF000) != 0x4000:
-            return 0
-        cur_inum = inum
-        if nxt < 0:
-            return cur_inum
-        start = cast[uint64](nxt)
+    if r.is_dir == 0:
+        return 0
+    return r.inum
 
 
 def ext4_open(name: Ptr[char]) -> int32:
