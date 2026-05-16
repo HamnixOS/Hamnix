@@ -49,7 +49,28 @@ tracks share the same compiler and language:
    Still build and pass; kept as the regression baseline as bare-metal
    subsystems land.
 
-The end-game is a fully Hamnix-authored kernel.
+The end-game is a fully Hamnix-authored kernel that **also loads
+stock Linux kernel modules and userspace binaries**. As of commit
+`95535a1`:
+
+- Stock Debian `crc32c_generic.ko` loads cleanly on Hamnix —
+  95 relocations applied, 0 unresolved externals, `init_module`
+  returns 0, real CRC32C-Castagnoli math running on the live path
+  through the Linux-ABI shims (`linux_abi/api_crypto.ad`).
+- L1..L36 of the Linux kernel ABI track are shipped (.ko loader,
+  vermagic + MODVERSIONS bypass, six relocation types, ~200 Linux
+  kernel symbols exported under their stock names).
+- U-series (Linux userspace ABI) scaffolding in place:
+  `linux_abi/u_syscalls.ad` (Linux x86_64 syscall number map),
+  `linux_abi/u_ldso.ad` (dynamic-linker scaffold),
+  `linux_abi/u_libc.ad` (mini libc.so.6 — strlen/strcmp/memcpy/...
+  with real bodies, printf/malloc/exit wired through Hamnix
+  syscalls).
+- hamsh has if/then/else/fi + while/do/done + ;/&&/|| + $? +
+  $VAR + double-quoted strings + PATH walker + comments — enough
+  to write real boot scripts.
+- ~60 GNU-style userland binaries in /bin/.
+- 30/30 integration tests pass.
 
 ## Status
 
