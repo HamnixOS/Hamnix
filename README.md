@@ -185,6 +185,7 @@ stock Linux kernel modules and userspace binaries**. As of commit
 | M16.84 | hamsh — single-line `if COND ; then BODY ; fi` conditionals | **Done** |
 | M16.85 | hamsh — `else` branches + `while COND ; do BODY ; done` loops | **Done** |
 | M16.86 | 5 more coreutils: `/bin/base64`, `/bin/md5sum`, `/bin/env_show`, `/bin/watch`, `/bin/whatis` | **Done** |
+| M16.87 | 9 more userland: `/bin/top`, `/bin/ifconfig`, `/bin/route`, `/bin/lsmod`, `/bin/dmesg`, `/bin/su`, `/bin/passwd`, `/bin/login`, `/bin/getty` (mostly stubs; top + getty functional) | **Done** |
 
 ## L-series: Linux ABI compatibility
 
@@ -246,8 +247,8 @@ drivers (xhci_hcd, nvme, usbhid, e1000e). See
 |-----------|-------------|--------|
 | **U1** | Per-task `is_linux_userspace` flag in `TaskStruct`; `do_syscall` forks to `linux_u_syscall_dispatch` when set | **Done** |
 | **U2** | `fs/elf.ad` detects Linux-ABI ELF binaries via OSABI marker + PT_INTERP segment; helper to read the interpreter path | **Done** |
-| U3 | Linux-ELF loader: detect at exec time, build new task, flip flag, iretq through dynamic linker | Pending |
-| U4 | Real `libc.so.6` body bind-paths (printf/malloc/exit through actual Linux syscall numbers) | Pending |
+| **U3** | `elf_load_blob` auto-flips `is_linux_userspace` when ELF has PT_INTERP or OSABI=Linux | **Done** |
+| **U4** | Real Linux syscall handlers — `read`/`write`/`close`/`lseek`/`exit`/`exit_group`/`getpid` forward to Hamnix VFS + sched; `brk` kmalloc-backed; `arch_prctl(ARCH_SET_FS)` writes `%fs_base` via `wrmsr` (critical for glibc TLS); `set_tid_address` records tidptr | **Done** |
 | U5 | Run unmodified `/bin/echo` from a Debian sysroot | Pending |
 
 Surface area below targets the actual end-game.
