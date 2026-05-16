@@ -51,6 +51,11 @@ set +e
     sleep 1
     printf '/cat /ext/BIG.TXT\n'
     sleep 1
+    # M16.63: SMOKE.TXT was created by the kernel at boot via
+    # ext4_create_file. /cat verifies the read path sees the new
+    # dirent, the new inode, and the new data block end-to-end.
+    printf '/cat /ext/SMOKE.TXT\n'
+    sleep 1
     # M16.59: FILE49.TXT lives in the second block of the root dir
     # (which spans 2 blocks after we plant 50 extras). Resolving it
     # exercises the multi-block dir walk; a single-block walker
@@ -91,7 +96,9 @@ for needle in \
     "NESTED.TXT" \
     "EXT4_NESTED_MARKER /ext/SUB/NESTED.TXT" \
     "DEPTH1_MARKER ext4 index extents work" \
-    "ext4: bitmap smoke PASS"
+    "ext4: bitmap smoke PASS" \
+    "ext4: create smoke PASS" \
+    "CREATE_OK ext4 file-create round-trip works"
 do
     if grep -F -q "$needle" "$LOG"; then
         echo "[test_ext4] OK: '$needle'"
@@ -127,13 +134,16 @@ if grep -F -q "/cat /ext/FILE49.TXT" "$LOG"; then
     fi
 fi
 
-# /ls /ext | /wc — root dir has 56 entries (., .., lost+found,
-# HELLO.TXT, BIG.TXT, SUB, FILE00..FILE49). /wc emits "lines words bytes".
-# A single-block-only listdir would stop after ~30 entries.
-if echo "$cleaned" | grep -E -q "(^| )56 56 "; then
-    echo "[test_ext4] OK: /ls /ext listed all 56 entries (multi-block listdir)"
+# /ls /ext | /wc — root dir has 57 entries (., .., lost+found,
+# HELLO.TXT, BIG.TXT, SUB, FILE00..FILE49, SMOKE.TXT). SMOKE.TXT
+# was created by ext4_create_smoke_test at kernel init; the count
+# verifies that BOTH the multi-block listdir works (a single-block
+# walker would stop ~30) AND that the M16.63 dirent insert is
+# visible through the same listdir path. /wc emits "lines words bytes".
+if echo "$cleaned" | grep -E -q "(^| )57 57 "; then
+    echo "[test_ext4] OK: /ls /ext listed all 57 entries (multi-block + create)"
 else
-    echo "[test_ext4] MISS: /ls /ext | /wc didn't show 56-line count"
+    echo "[test_ext4] MISS: /ls /ext | /wc didn't show 57-line count"
     fail=1
 fi
 
