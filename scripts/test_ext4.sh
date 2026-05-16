@@ -158,18 +158,19 @@ if grep -F -q "cat /ext/FILE49.TXT" "$LOG"; then
     fi
 fi
 
-# ls /ext | wc — root dir has 57 entries before the shell write
+# ls /ext | wc — root dir has 58 entries before the shell write
 # (., .., lost+found, HELLO.TXT, BIG.TXT, SUB, FILE00..FILE49,
-# SMOKE.TXT). SMOKE.TXT was created by ext4_create_smoke_test at
-# kernel init; the count verifies that BOTH the multi-block listdir
-# works (a single-block walker would stop ~30) AND that the M16.63
-# dirent insert is visible through the same listdir path. The shell-
-# created USERMADE.TXT comes LATER in the session so it doesn't
-# affect this count.
-if echo "$cleaned" | grep -E -q "(^| )57 57 "; then
-    echo "[test_ext4] OK: ls /ext listed all 57 entries (multi-block + create)"
+# SMOKE.TXT, HELLO_LINK). SMOKE.TXT was created by
+# ext4_create_smoke_test at kernel init; HELLO_LINK is the M16.68
+# symlink planted in the disk image. The count verifies that BOTH
+# the multi-block listdir works (a single-block walker would stop
+# ~30) AND that the M16.63 dirent insert is visible through the
+# same listdir path. The shell-created USERMADE.TXT comes LATER in
+# the session so it doesn't affect this count.
+if echo "$cleaned" | grep -E -q "(^| )58 58 "; then
+    echo "[test_ext4] OK: ls /ext listed all 58 entries (multi-block + create + symlink)"
 else
-    echo "[test_ext4] MISS: ls /ext | wc didn't show 57-line count"
+    echo "[test_ext4] MISS: ls /ext | wc didn't show 58-line count"
     fail=1
 fi
 
