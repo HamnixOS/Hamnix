@@ -75,20 +75,46 @@ syscall_entry:
     pushq   %r11                      /* user RFLAGS */
     pushq   %rcx                      /* user RIP    */
 
-    /* Shuffle user syscall ABI into SysV ABI for do_syscall:
-     *   SysV rdi = nr   (was rax)
-     *   SysV rsi = a0   (was rdi)
-     *   SysV rdx = a1   (was rsi)
-     *   SysV rcx = a2   (was rdx)   <- order matters: free %rcx first
-     *   SysV r8  = a3   (was r10)
+    /* Shuffle user syscall ABI into SysV ABI for do_syscall. The user
+     * register layout coming in:
+     *   rax=nr  rdi=a0  rsi=a1  rdx=a2  r10=a3  r8=a4  r9=a5
+     * SysV (callee) layout for do_syscall(nr, a0, a1, a2, a3, a4, a5):
+     *   rdi=nr  rsi=a0  rdx=a1  rcx=a2  r8=a3  r9=a4  stack=a5
+     *
+     * U7: widened from 4 args (a0..a3) to 6 args (a0..a5) so the Linux
+     * mmap (9) syscall — and any other 6-arg Linux syscall — can see
+     * %r8 / %r9. The 7th arg (a5) is passed on the stack per SysV.
+     *
+     * Stack layout right before `call do_syscall`:
+     *   kstack_top - 24 : already used (r11, rcx, r12-of-user via the
+     *                     popq %rsp trick — see the parking dance above)
+     *   kstack_top - 32 : alignment pad (must be at higher addr than a5)
+     *   kstack_top - 40 : a5 (callee reads at 8(%rsp) after `call`
+     *                     pushes the return address)
+     *
+     * Pre-call rsp = kstack_top - 40, which is 8 mod 16 (because
+     * kstack_top is 16-aligned). After `call` pushes return: rsp =
+     * -48, 16-aligned — SysV alignment satisfied. The two pushes get
+     * undone after the call with `addq $16, %rsp`.
      */
-    movq    %rdx, %rcx                /* a2 */
-    movq    %rsi, %rdx                /* a1 */
-    movq    %rdi, %rsi                /* a0 */
-    movq    %rax, %rdi                /* nr */
-    movq    %r10, %r8                 /* a3 */
+    pushq   $0                        /* alignment pad (higher addr)  */
+    pushq   %r9                       /* a5 -> stack arg 7            */
+
+    /* Now do the register shuffle. Order matters: read each source
+     * register before any move that would clobber it. r9 (target a4)
+     * needs the old r8 (a4) BEFORE we trash r8 with r10 (a3). */
+    movq    %r8,  %r9                 /* a4 (r9 = user r8)            */
+    movq    %r10, %r8                 /* a3 (r8 = user r10)           */
+    movq    %rdx, %rcx                /* a2                           */
+    movq    %rsi, %rdx                /* a1                           */
+    movq    %rdi, %rsi                /* a0                           */
+    movq    %rax, %rdi                /* nr                           */
 
     call    do_syscall                /* return value lands in %rax */
+
+    /* Reclaim the 16 bytes pushed for a5 + pad before unwinding the
+     * rest of the kernel-side spill. */
+    addq    $16, %rsp
 
     /* Restore syscall-control regs and user RSP. We pop the
      * (per-task) stored user RSP straight into %rsp; the next pop

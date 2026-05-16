@@ -159,6 +159,23 @@ def build_archive() -> bytes:
             print(f"  embedded {name} ({len(data)} bytes from "
                   f"tests/linux-modules/{ko.name})")
 
+    # U5: host-built Linux ELF test binaries. Anything staged under
+    # tests/u-binary/ (built by tests/u-binary/src/*/Makefile via
+    # `make install`) lands at /bin/<name>. These are real Linux ABI
+    # ELFs — OSABI=ELFOSABI_LINUX, Linux syscall numbers — used to
+    # smoke-test the U1..U4 syscall-translation chain end to end.
+    # Optional: if the host-side build hasn't been run, this whole
+    # block is skipped and the rest of the initramfs is unaffected
+    # (so CI without the host fixture still builds a kernel).
+    ubin_dir = here / "tests" / "u-binary"
+    if ubin_dir.is_dir():
+        for f in sorted(ubin_dir.iterdir()):
+            if f.is_file() and f.name != ".gitignore":
+                data = f.read_bytes()
+                name = "/bin/" + f.name
+                blob += cpio_entry(name, data)
+                print(f"  embedded {name} ({len(data)} bytes)")
+
     for name, data in FILES:
         blob += cpio_entry(name, data)
     blob += cpio_trailer()

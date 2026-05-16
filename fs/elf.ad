@@ -35,7 +35,9 @@
 from mm.memblock import memblock_alloc
 from kernel.printk.printk import printk0, printk1, printk2
 from kernel.panic import panic
-from kernel.sched.core import set_linux_userspace_mode, current_idx_get
+# Note: elf_load_blob no longer flips is_linux_userspace itself —
+# the caller (SYS_SPAWN / SYS_EXECVE in arch/x86/kernel/syscall.ad)
+# reads elf_last_was_linux and applies it to the correct task slot.
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
@@ -59,6 +61,15 @@ ELFOSABI_LINUX: uint8 = 3
 # that needs it. There's exactly one /init load in M16.30 so the
 # single-slot global is enough.
 elf_last_load_base: uint64 = 0
+
+# Set by elf_load_blob to 1 when the just-loaded image is a Linux-ABI
+# binary (OSABI=Linux or PT_INTERP present). Consumed by SYS_SPAWN /
+# SYS_EXECVE in arch/x86/kernel/syscall.ad to flip is_linux_userspace
+# on the correct task slot (the *child* for SYS_SPAWN, *current* for
+# SYS_EXECVE). Doing the flag flip inside the loader was wrong because
+# SYS_SPAWN runs in the parent's context — the loader would mis-flag
+# the parent (hamsh) instead of the new child.
+elf_last_was_linux: int32 = 0
 
 
 def _read_u16(p: Ptr[uint8]) -> uint32:
@@ -92,6 +103,92 @@ def _validate_magic(blob: Ptr[uint8]) -> int32:
     return 1
 
 
+def _load_elf64(blob: Ptr[uint8], blob_size: uint64) -> uint64:
+    # U5 ELF64 path: Linux x86_64 binaries (ELFCLASS64). Same rebase
+    # model as the ELF32 path — copy PT_LOAD segments into one
+    # memblock allocation at (region + p_vaddr - lowest_v). Works for
+    # any code that is RIP-relative or whose absolute references all
+    # land inside the loaded image. Real Linux binaries with hard-coded
+    # absolute addresses outside their own range need full per-task
+    # PML4 mappings (deferred to U6+).
+    #
+    # ELF64 header offsets (size 64 bytes):
+    #   24  e_entry      uint64
+    #   32  e_phoff      uint64
+    #   54  e_phentsize  uint16  (typically 56)
+    #   56  e_phnum      uint16
+    #
+    # ELF64 program header (56 bytes):
+    #   0   p_type       uint32
+    #   8   p_offset     uint64
+    #   16  p_vaddr      uint64
+    #   32  p_filesz     uint64
+    #   40  p_memsz      uint64
+    if blob_size < 64:
+        printk0("elf64: blob too small for ELF64 header\n")
+        return 0
+    e_entry: uint64 = _read_u64(cast[Ptr[uint8]](
+        cast[uint64](blob) + 24))
+    e_phoff: uint64 = _read_u64(cast[Ptr[uint8]](
+        cast[uint64](blob) + 32))
+    e_phentsize: uint32 = _read_u16(cast[Ptr[uint8]](
+        cast[uint64](blob) + 54))
+    e_phnum: uint32 = _read_u16(cast[Ptr[uint8]](
+        cast[uint64](blob) + 56))
+
+    printk2("elf64: entry=0x%x phnum=%d\n", e_entry,
+            cast[uint64](e_phnum))
+
+    lowest_v:  uint64 = 0xFFFFFFFFFFFFFFFF
+    highest_v: uint64 = 0
+    i: uint32 = 0
+    while i < e_phnum:
+        ph: uint64 = cast[uint64](blob) + e_phoff \
+                    + cast[uint64](i) * cast[uint64](e_phentsize)
+        p_type: uint32 = _read_u32(cast[Ptr[uint8]](ph + 0))
+        if p_type == PT_LOAD:
+            p_vaddr: uint64 = _read_u64(cast[Ptr[uint8]](ph + 16))
+            p_memsz: uint64 = _read_u64(cast[Ptr[uint8]](ph + 40))
+            if p_vaddr < lowest_v:
+                lowest_v = p_vaddr
+            if p_vaddr + p_memsz > highest_v:
+                highest_v = p_vaddr + p_memsz
+        i = i + 1
+
+    if highest_v == 0:
+        printk0("elf64: no PT_LOAD segments\n")
+        return 0
+
+    span: uint64 = highest_v - lowest_v
+    span = (span + 4095) & ~cast[uint64](4095)
+    region: uint64 = memblock_alloc(span, 4096)
+    if region == 0:
+        printk0("elf64: OOM\n")
+        return 0
+    memset(cast[Ptr[uint8]](region), 0, span)
+
+    i = 0
+    while i < e_phnum:
+        ph: uint64 = cast[uint64](blob) + e_phoff \
+                    + cast[uint64](i) * cast[uint64](e_phentsize)
+        p_type: uint32 = _read_u32(cast[Ptr[uint8]](ph + 0))
+        if p_type == PT_LOAD:
+            p_offset: uint64 = _read_u64(cast[Ptr[uint8]](ph + 8))
+            p_vaddr:  uint64 = _read_u64(cast[Ptr[uint8]](ph + 16))
+            p_filesz: uint64 = _read_u64(cast[Ptr[uint8]](ph + 32))
+            p_memsz:  uint64 = _read_u64(cast[Ptr[uint8]](ph + 40))
+            dst: uint64 = region + (p_vaddr - lowest_v)
+            src: uint64 = cast[uint64](blob) + p_offset
+            memcpy(cast[Ptr[uint8]](dst),
+                   cast[Ptr[uint8]](src), p_filesz)
+            printk2("elf64:   PT_LOAD vaddr=0x%x size=%d\n",
+                    p_vaddr, p_memsz)
+        i = i + 1
+
+    elf_last_load_base = region
+    return region + (e_entry - lowest_v)
+
+
 def elf_load_blob(blob: Ptr[uint8], blob_size: uint64) -> uint64:
     # Returns the entry virtual address (= allocated base + entry
     # offset), or 0 on parse error / OOM.
@@ -101,6 +198,19 @@ def elf_load_blob(blob: Ptr[uint8], blob_size: uint64) -> uint64:
     if _validate_magic(blob) == 0:
         printk0("elf: bad magic\n")
         return 0
+
+    # Dispatch on EI_CLASS (e_ident[4]): 1 = ELFCLASS32 (Hamnix's own
+    # compiler wrapper), 2 = ELFCLASS64 (real Linux x86_64). Both paths
+    # share the U3 Linux-ABI detection tail below.
+    elf_last_was_linux = 0
+    ei_class: uint8 = blob[4]
+    if ei_class == 2:
+        entry64: uint64 = _load_elf64(blob, blob_size)
+        if entry64 != 0:
+            if elf_is_linux_binary(blob) != 0:
+                elf_last_was_linux = 1
+                printk0("elf: Linux-ABI binary detected; child task will route syscalls via u_syscalls\n")
+        return entry64
 
     e_entry: uint32 = _read_u32(cast[Ptr[uint8]](
         cast[uint64](blob) + 24))
@@ -171,25 +281,12 @@ def elf_load_blob(blob: Ptr[uint8], blob_size: uint64) -> uint64:
     elf_last_load_base = region
     entry_real: uint64 = region + cast[uint64](e_entry - lowest_v)
 
-    # U3: Linux-ABI auto-detect. Inspect the just-parsed ELF image and,
-    # if it asks for the Linux syscall ABI (PT_INTERP or OSABI=Linux),
-    # flip the current task's is_linux_userspace flag so syscall entry
-    # routes to u_syscalls instead of the native Hamnix table. Native
-    # Hamnix binaries (/bin/hamsh, /bin/ls, ...) have OSABI=0 and no
-    # PT_INTERP, so elf_is_linux_binary returns 0 and we leave the flag
-    # alone — matches the create_user_task default of 0. This wire-in
-    # is dormant until a real Linux ELF (with PT_INTERP=/lib64/ld-...)
-    # actually appears in initramfs.
-    #
-    # Caveat: current_idx_get() picks the *running* task. For SYS_EXECVE
-    # that's correct (exec replaces the current image). For SYS_SPAWN
-    # the new task slot isn't current yet, so the parent would be
-    # mis-flagged if it ever loaded a Linux binary. Since no Linux
-    # binary is in initramfs today the path is untriggered; a later
-    # refactor can plumb the actual target slot through.
-    if elf_is_linux_binary(blob) != 0:
-        set_linux_userspace_mode(cast[int32](current_idx_get()), 1)
-        printk0("elf: Linux-ABI binary detected; syscalls route via u_syscalls\n")
+    # U3: Linux-ABI detection. We record whether this image is a Linux-
+    # ABI binary in elf_last_was_linux; the caller (SYS_SPAWN or
+    # SYS_EXECVE) is responsible for flipping is_linux_userspace on the
+    # correct slot — the child for SPAWN, current for EXECVE. ELF32
+    # path: native Hamnix images, never Linux. Always reset to 0.
+    elf_last_was_linux = 0
 
     return entry_real
 
