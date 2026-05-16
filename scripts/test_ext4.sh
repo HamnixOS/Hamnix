@@ -45,6 +45,12 @@ set +e
     sleep 3
     printf 'cat /ext/HELLO.TXT\n'
     sleep 1
+    # M16.68: HELLO_LINK is a symlink to /HELLO.TXT planted in the
+    # image by build_diskimg.py. Reading it exercises the symlink
+    # follow-through in ext4_resolve_file. The output is HELLO.TXT's
+    # body, so the existing EXT4_MARKER assertion below covers both.
+    printf 'cat /ext/HELLO_LINK\n'
+    sleep 1
     printf 'ls /ext/SUB\n'
     sleep 1
     printf 'cat /ext/SUB/NESTED.TXT\n'

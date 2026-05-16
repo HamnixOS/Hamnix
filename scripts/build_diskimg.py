@@ -304,6 +304,14 @@ def build_ext4_image(out_path: Path) -> bytes:
         f"mkdir SUB\n"
         f"cd SUB\n"
         f"write {tmp_nested} NESTED.TXT\n"
+        # Plant a symlink at /HELLO_LINK → /HELLO.TXT. debugfs's
+        # `symlink <filespec> <target>` argument order is the
+        # opposite of `ln -s` (man debugfs(8): "symlink filespec
+        # target") — first arg is where the link is created, second
+        # is where it points. Resolving /ext/HELLO_LINK on the
+        # kernel side exercises the M16.68 symlink-follow path.
+        f"cd /\n"
+        f"symlink /HELLO_LINK /HELLO.TXT\n"
     )
     try:
         subprocess.run(
