@@ -111,6 +111,14 @@ SYS_DELETE_MODULE:  uint64 = 176                # a0=name, a1=flags
 MAX_ARGV:      uint64 = 16
 MAX_ARG_BYTES: uint64 = 256
 
+# U17: matching caps for envp[] on the Linux process init-stack.
+# Each env string is the literal "NAME=VALUE\0" bytes; both name and
+# value share the per-string byte budget. 64 entries comfortably
+# covers anything hamsh can stuff into its 8-slot variable table plus
+# headroom for what future export semantics might add.
+MAX_ENVP:      uint64 = 64
+MAX_ENV_BYTES: uint64 = 256
+
 
 def _argv_strlen(s: uint64) -> uint64:
     n: uint64 = 0
@@ -128,6 +136,28 @@ def _argv_count(argv: uint64) -> uint64:
     n: uint64 = 0
     while n < MAX_ARGV:
         p: uint64 = cast[Ptr[uint64]](argv + n * 8)[0]
+        if p == 0:
+            return n
+        n = n + 1
+    return n
+
+
+def _envp_strlen(s: uint64) -> uint64:
+    n: uint64 = 0
+    while cast[Ptr[uint8]](s + n)[0] != 0 and n < MAX_ENV_BYTES:
+        n = n + 1
+    return n
+
+
+def _envp_count(envp: uint64) -> uint64:
+    # Same shape as _argv_count but uses the env-side caps so a
+    # malformed envp can't run away. envp == 0 (caller passed no
+    # environment) means "empty env" — count is 0.
+    if envp == 0:
+        return 0
+    n: uint64 = 0
+    while n < MAX_ENVP:
+        p: uint64 = cast[Ptr[uint64]](envp + n * 8)[0]
         if p == 0:
             return n
         n = n + 1
@@ -206,7 +236,8 @@ AT_PAGESZ:  uint64 = 6
 AT_RANDOM:  uint64 = 25
 
 
-def _build_user_argv_linux(ustack_top: uint64, argv_user: uint64) -> uint64:
+def _build_user_argv_linux(ustack_top: uint64, argv_user: uint64,
+                           envp_user: uint64) -> uint64:
     # Linux process init-stack layout. musl's _start does
     # `mov %rsp,%rdi; call _start_c`; _start_c then reads
     # `argc = *(int*)rdi`, `argv = rdi+8`, walks envp from there, and
@@ -214,7 +245,8 @@ def _build_user_argv_linux(ustack_top: uint64, argv_user: uint64) -> uint64:
     #
     # Layout (growing down from ustack_top):
     #
-    #   high:  "arg0\0arg1\0..."          NUL-terminated strings
+    #   high:  "arg0\0arg1\0..."          NUL-terminated argv strings
+    #          "ENV0=VAL\0ENV1=VAL\0..."  NUL-terminated env strings
     #          [16-byte AT_RANDOM blob]   zeroes — no entropy source yet
     #          [pad to 16-byte alignment]
     #          AT_NULL pair  (0, 0)
@@ -224,6 +256,9 @@ def _build_user_argv_linux(ustack_top: uint64, argv_user: uint64) -> uint64:
     #          AT_PHENT pair  (4, 56)
     #          AT_PHDR pair   (3, 0)
     #          NULL                       envp terminator
+    #          envp[envc-1] -> &"NAMEn-1=VAL"
+    #          ...
+    #          envp[0]      -> &"NAME0=VAL"
     #          NULL                       argv terminator
     #          argv[argc-1] -> &"argN-1"
     #          ...
@@ -235,9 +270,15 @@ def _build_user_argv_linux(ustack_top: uint64, argv_user: uint64) -> uint64:
     # musl's _start. _start_c is called via `call`, which pushes 8
     # bytes of return address, so it sees rsp at 8 mod 16 — fine. We
     # achieve the 16-byte alignment for *rsp by counting the variable
-    # part (argc-cell + argv-pointers + 2 NULLs + 6 auxv pairs) and
-    # padding the string-region bottom appropriately.
+    # part (argc-cell + argv-pointers + 2 NULLs + envp-pointers + 6
+    # auxv pairs) and padding the string-region bottom appropriately.
+    #
+    # U17 extends the U16 layout with a real envp[] block populated
+    # from envp_user (a user-side NUL-terminated array of pointers to
+    # "NAME=VALUE\0" strings). envp_user == 0 still works — yields the
+    # exact U16 layout (envp = [NULL]).
     argc: uint64 = _argv_count(argv_user)
+    envc: uint64 = _envp_count(envp_user)
 
     # 1. Copy argv strings down from ustack_top.
     str_sp: uint64 = ustack_top
@@ -250,6 +291,22 @@ def _build_user_argv_linux(ustack_top: uint64, argv_user: uint64) -> uint64:
         memcpy(cast[Ptr[uint8]](str_sp),
                cast[Ptr[uint8]](src), n)
         str_addrs[i] = str_sp
+        i = i + 1
+
+    # 1b. Copy envp strings just below the argv strings. Each entry
+    #     is "NAME=VALUE\0" verbatim — we don't reparse it. envp_user
+    #     pointers point into the parent's address space; we own the
+    #     copy now, so subsequent edits to the parent's env table
+    #     can't disturb the child's view.
+    env_addrs: Array[64, uint64]
+    i = 0
+    while i < envc:
+        src: uint64 = cast[Ptr[uint64]](envp_user + i * 8)[0]
+        n:   uint64 = _envp_strlen(src) + 1            # incl. NUL
+        str_sp = str_sp - n
+        memcpy(cast[Ptr[uint8]](str_sp),
+               cast[Ptr[uint8]](src), n)
+        env_addrs[i] = str_sp
         i = i + 1
 
     # 2. 16 bytes of AT_RANDOM material. Zero is fine for now — Hamnix
@@ -267,16 +324,17 @@ def _build_user_argv_linux(ustack_top: uint64, argv_user: uint64) -> uint64:
     #    Variable contents below the strings/random blob (each 8 bytes):
     #      - 6 auxv pairs * 2 cells   = 12 cells   = 96 bytes
     #      - envp NULL                 =  1 cell   =  8 bytes
+    #      - envp pointers (envc)      =  envc     = envc*8 bytes
     #      - argv NULL                 =  1 cell   =  8 bytes
     #      - argv pointers (argc)      =  argc     = argc*8 bytes
     #      - argc cell                 =  1 cell   =  8 bytes
-    #    Total = (15 + argc) * 8 bytes
+    #    Total = (15 + argc + envc) * 8 bytes
     #
-    #    For *rsp (= argc cell) to be 16-aligned, ((15 + argc) * 8)
-    #    aligned-from str_sp must satisfy that bottom = 16-aligned. We
-    #    pre-bump str_sp down 0 or 8 bytes to make it so.
+    #    For *rsp (= argc cell) to be 16-aligned, ((15 + argc + envc) *
+    #    8) aligned-from str_sp must satisfy that bottom = 16-aligned.
+    #    We pre-bump str_sp down 0 or 8 bytes to make it so.
     str_sp = str_sp & ~cast[uint64](7)
-    fixed_bytes: uint64 = (cast[uint64](15) + argc) * 8
+    fixed_bytes: uint64 = (cast[uint64](15) + argc + envc) * 8
     bottom: uint64 = str_sp - fixed_bytes
     if (bottom & cast[uint64](15)) != 0:
         str_sp = str_sp - 8                            # align pad
@@ -314,9 +372,14 @@ def _build_user_argv_linux(ustack_top: uint64, argv_user: uint64) -> uint64:
     str_sp = str_sp - 8
     cast[Ptr[uint64]](str_sp)[0] = AT_PHDR
 
-    # 5. envp = empty list → just the NULL terminator.
+    # 5. envp array: NULL terminator then envp[envc-1] .. envp[0].
     str_sp = str_sp - 8
     cast[Ptr[uint64]](str_sp)[0] = 0
+    i = envc
+    while i > 0:
+        i = i - 1
+        str_sp = str_sp - 8
+        cast[Ptr[uint64]](str_sp)[0] = env_addrs[i]
 
     # 6. argv array: NULL terminator then argv[N-1] .. argv[0].
     str_sp = str_sp - 8
@@ -485,7 +548,7 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
             # U16: Linux process init-stack — *rsp points to argc;
             # argv/envp/auxv all reachable from rsp+8. musl ignores
             # %rdi/%rsi, so we pass argc=0/argv=0 in the SysV slots.
-            new_rsp = _build_user_argv_linux(new_ustack_top, a1)
+            new_rsp = _build_user_argv_linux(new_ustack_top, a1, 0)
         else:
             new_rsp = _build_user_argv(new_ustack_top, a1,
                                        &argc_out, &argv_out)
@@ -523,7 +586,7 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         # create_user_task_argv).
         is_linux: int32 = elf_last_was_linux
         if is_linux != 0:
-            new_rsp = _build_user_argv_linux(ustack_top, a1)
+            new_rsp = _build_user_argv_linux(ustack_top, a1, 0)
         else:
             new_rsp = _build_user_argv(ustack_top, a1,
                                        &argc_out, &argv_out)
