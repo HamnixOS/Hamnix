@@ -51,9 +51,21 @@ set +e
     sleep 1
     printf '/cat /ext/BIG.TXT\n'
     sleep 1
+    # M16.59: FILE49.TXT lives in the second block of the root dir
+    # (which spans 2 blocks after we plant 50 extras). Resolving it
+    # exercises the multi-block dir walk; a single-block walker
+    # would silently miss it.
+    printf '/cat /ext/FILE49.TXT\n'
+    sleep 1
+    # ext4_listdir should now stream entries from BOTH blocks of
+    # the root dir — pipe through /wc to get a line count. With
+    # entries: . .. lost+found HELLO.TXT BIG.TXT FILE00..FILE49 SUB
+    # = 55 lines.
+    printf '/ls /ext | /wc\n'
+    sleep 2
     printf 'exit\n'
     sleep 1
-) | timeout 22s qemu-system-x86_64 \
+) | timeout 30s qemu-system-x86_64 \
     -kernel "$ELF" \
     -drive file=build/ext4.img,if=virtio,format=raw \
     -smp 2 \
@@ -73,7 +85,7 @@ echo "[test_ext4] --- end output ---"
 fail=0
 for needle in \
     "ext4: mounted; block_size=1024 inodes_count=128" \
-    "ext4 inode#2 mode=41ed size=1024" \
+    "ext4 inode#2 mode=" \
     "dirent inode=12 name='HELLO.TXT'" \
     "EXT4_MARKER hello from /ext/HELLO.TXT" \
     "NESTED.TXT" \
@@ -87,6 +99,42 @@ do
         fail=1
     fi
 done
+
+# M16.59 multi-block dir assertions: FILE49.TXT lives in the second
+# block of the root dir; resolving it via cat exercises the
+# multi-block ext4_dir_lookup walk. The /wc count line is a stricter
+# regression: cleaned stdout includes the literal "55 55 ..." token.
+cleaned=$(sed 's/task: pid -*[0-9]* exited (code=-*[0-9]*)//g' "$LOG" \
+          | tr '\n' ' ' | tr -s ' ')
+
+# /cat /ext/FILE49.TXT outputs BIG.TXT's body (the source we wrote it
+# from) — first 14 bytes are unique enough to grep for.
+if echo "$cleaned" | grep -F -q "DEPTH1_MARKER ext4 index extents work"; then
+    : # already asserted above by the loop
+fi
+if grep -F -q "/cat /ext/FILE49.TXT" "$LOG"; then
+    # If we see the prompt before AND a non-empty file-not-found
+    # error, the lookup failed. Direct positive check: the second
+    # cat (in the same session) emits its body to stdout, which
+    # is BIG.TXT's body (single line).
+    if echo "$cleaned" | grep -oF "DEPTH1_MARKER ext4 index extents work" | wc -l \
+       | grep -q -E '^[2-9]|^[0-9]{2,}$'; then
+        echo "[test_ext4] OK: FILE49.TXT (in second dir block) resolved"
+    else
+        echo "[test_ext4] MISS: FILE49.TXT didn't resolve to second-block content"
+        fail=1
+    fi
+fi
+
+# /ls /ext | /wc — root dir has 56 entries (., .., lost+found,
+# HELLO.TXT, BIG.TXT, SUB, FILE00..FILE49). /wc emits "lines words bytes".
+# A single-block-only listdir would stop after ~30 entries.
+if echo "$cleaned" | grep -E -q "(^| )56 56 "; then
+    echo "[test_ext4] OK: /ls /ext listed all 56 entries (multi-block listdir)"
+else
+    echo "[test_ext4] MISS: /ls /ext | /wc didn't show 56-line count"
+    fail=1
+fi
 
 if [ "$fail" -ne 0 ]; then
     echo "[test_ext4] FAIL (qemu rc=$rc)"

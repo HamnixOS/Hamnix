@@ -288,9 +288,19 @@ def build_ext4_image(out_path: Path) -> bytes:
     tmp_hello.write_bytes(hello_body)
     tmp_nested.write_bytes(nested_body)
     tmp_big.write_bytes(big_body)
+    # Plant 50 additional files (FILE00.TXT..FILE49.TXT, each 1 byte)
+    # in the root directory to force it to span multiple data blocks
+    # — exercises ext4_dir_lookup / ext4_listdir's multi-block walk.
+    # 50 entries × ~24 bytes per dirent = ~1.2 KiB, well past one
+    # 1 KiB block. They all share `tmp_big` as source since the
+    # content doesn't matter for the dir-walk test.
+    extra_writes = "".join(
+        f"write {tmp_big} FILE{i:02d}.TXT\n" for i in range(50)
+    )
     cmd_stream = (
         f"write {tmp_hello} HELLO.TXT\n"
         f"write {tmp_big} BIG.TXT\n"
+        + extra_writes +
         f"mkdir SUB\n"
         f"cd SUB\n"
         f"write {tmp_nested} NESTED.TXT\n"
