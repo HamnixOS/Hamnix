@@ -917,13 +917,13 @@ class X86CodeGen:
             case BinOp.NEQ:
                 self._cmp_set("ne")
             case BinOp.LT:
-                self._cmp_set("l")
+                self._cmp_set(self._rel_cc("l", left, right))
             case BinOp.LTE:
-                self._cmp_set("le")
+                self._cmp_set(self._rel_cc("le", left, right))
             case BinOp.GT:
-                self._cmp_set("g")
+                self._cmp_set(self._rel_cc("g", left, right))
             case BinOp.GTE:
-                self._cmp_set("ge")
+                self._cmp_set(self._rel_cc("ge", left, right))
             case BinOp.AND | BinOp.OR:
                 # Logical and/or: short-circuit-equivalent via a couple of
                 # tests + a conditional set. (Not true short-circuit
@@ -949,6 +949,62 @@ class X86CodeGen:
                 del tmp
             case _:
                 raise CodeGenError(f"x86: binary op {op} not yet supported")
+
+    # Unsigned integer type names. Pointers also compare unsigned (addresses
+    # are positive; nobody writes `p < q` expecting a sign-aware result).
+    _UNSIGNED_INT_NAMES = frozenset({
+        "uint8", "uint16", "uint32", "uint64",
+        "char", "bool",  # narrow unsigned-by-convention scalars
+    })
+    _SIGNED_INT_NAMES = frozenset({
+        "int8", "int16", "int32", "int64", "int",
+    })
+
+    def _is_unsigned_type(self, t: Optional[Type]) -> Optional[bool]:
+        """True if `t` is an unsigned integer / pointer type, False if signed,
+        None if we can't tell (untyped literal, unknown identifier, etc.)."""
+        if t is None:
+            return None
+        if isinstance(t, (PointerType, FunctionPointerType, ArrayType)):
+            return True
+        if isinstance(t, PercpuType):
+            return self._is_unsigned_type(t.base_type)
+        name = getattr(t, "name", None)
+        if name in self._UNSIGNED_INT_NAMES:
+            return True
+        if name in self._SIGNED_INT_NAMES:
+            return False
+        return None
+
+    def _rel_cc(self, signed_cc: str, left: Expr, right: Expr) -> str:
+        """Pick the right setcc/jcc mnemonic for a relational compare.
+
+        x86 uses two separate condition-code families for relational
+        compares because cmp doesn't know whether its operands are signed:
+            signed:   setl  / setle  / setg  / setge   (uses SF/OF)
+            unsigned: setb  / setbe  / seta  / setae   (uses CF)
+        We default to signed (preserves old behavior) and switch to the
+        unsigned family when EITHER operand's static type is unsigned —
+        this matches C's "if either operand is unsigned, promote the
+        comparison to unsigned" semantics and is what we want for the
+        common `if x < 0xFFFF...:` pattern over uint64.
+        """
+        lt = self.get_expr_type(left)
+        rt = self.get_expr_type(right)
+        lu = self._is_unsigned_type(lt)
+        ru = self._is_unsigned_type(rt)
+        # Mixed-sign comparison: if one side is known-unsigned and the other
+        # known-signed, treat as unsigned (C-style implicit promotion). The
+        # common case is `uint64 < int_literal` where the literal is small
+        # and non-negative, so unsigned compare gives the right answer.
+        if lu is True or ru is True:
+            return {
+                "l":  "b",
+                "le": "be",
+                "g":  "a",
+                "ge": "ae",
+            }[signed_cc]
+        return signed_cc
 
     def _cmp_set(self, cc: str) -> None:
         """Compare %rax to %rcx, then materialize a 0/1 result in %rax."""

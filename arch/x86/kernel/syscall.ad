@@ -137,9 +137,11 @@ def _argv_count(argv: uint64) -> uint64:
 def _build_user_argv(ustack_top: uint64, argv_user: uint64,
                      out_argc: Ptr[uint64],
                      out_argv: Ptr[uint64]) -> uint64:
-    # Lay out an argv block at the top of a freshly-allocated user
-    # stack and return the user's new RSP. Layout, growing down from
-    # ustack_top:
+    # Native-Hamnix-ABI argv layout. Strings + NULL-terminated pointer
+    # array at the top of the user stack; out_argc / out_argv get the
+    # values _start should see in %rdi / %rsi.
+    #
+    # Layout (growing down from ustack_top):
     #
     #   high:  "arg0\0arg1\0..."        each NUL-terminated string
     #          [pad to 8 bytes]
@@ -150,9 +152,11 @@ def _build_user_argv(ustack_top: uint64, argv_user: uint64,
     #          [pad to 16 bytes]        SysV stack alignment for _start
     #   low:   <new RSP>
     #
-    # out_argc / out_argv get the values _start should see in
-    # %rdi / %rsi. The caller wires those into the iret frame or the
-    # sysretq glue.
+    # Native-Hamnix binaries read argc / argv from %rdi / %rsi (set up
+    # by the SYS_EXECVE / SYS_SPAWN plumbing); they never look at *rsp.
+    # Linux binaries (musl, glibc) ignore the SysV register handoff and
+    # read directly from *rsp per the Linux process init-stack ABI —
+    # see _build_user_argv_linux below for that path.
     argc: uint64 = _argv_count(argv_user)
 
     # Copy strings down from ustack_top. Track the bottom of the
@@ -190,6 +194,143 @@ def _build_user_argv(ustack_top: uint64, argv_user: uint64,
 
     out_argc[0] = argc
     out_argv[0] = argv_addr
+    return str_sp
+
+
+# Auxv type numbers (Linux include/uapi/linux/auxvec.h subset).
+AT_NULL:    uint64 = 0
+AT_PHDR:    uint64 = 3
+AT_PHENT:   uint64 = 4
+AT_PHNUM:   uint64 = 5
+AT_PAGESZ:  uint64 = 6
+AT_RANDOM:  uint64 = 25
+
+
+def _build_user_argv_linux(ustack_top: uint64, argv_user: uint64) -> uint64:
+    # Linux process init-stack layout. musl's _start does
+    # `mov %rsp,%rdi; call _start_c`; _start_c then reads
+    # `argc = *(int*)rdi`, `argv = rdi+8`, walks envp from there, and
+    # finally reads auxv. So *rsp at user-mode entry MUST be argc.
+    #
+    # Layout (growing down from ustack_top):
+    #
+    #   high:  "arg0\0arg1\0..."          NUL-terminated strings
+    #          [16-byte AT_RANDOM blob]   zeroes — no entropy source yet
+    #          [pad to 16-byte alignment]
+    #          AT_NULL pair  (0, 0)
+    #          AT_RANDOM pair (25, &random_blob)
+    #          AT_PAGESZ pair (6, 4096)
+    #          AT_PHNUM pair  (5, 0)
+    #          AT_PHENT pair  (4, 56)
+    #          AT_PHDR pair   (3, 0)
+    #          NULL                       envp terminator
+    #          NULL                       argv terminator
+    #          argv[argc-1] -> &"argN-1"
+    #          ...
+    #          argv[0]      -> &"arg0"
+    #          argc
+    #   low:   <new RSP>
+    #
+    # SysV requires *rsp to be 16-byte aligned at function entry for
+    # musl's _start. _start_c is called via `call`, which pushes 8
+    # bytes of return address, so it sees rsp at 8 mod 16 — fine. We
+    # achieve the 16-byte alignment for *rsp by counting the variable
+    # part (argc-cell + argv-pointers + 2 NULLs + 6 auxv pairs) and
+    # padding the string-region bottom appropriately.
+    argc: uint64 = _argv_count(argv_user)
+
+    # 1. Copy argv strings down from ustack_top.
+    str_sp: uint64 = ustack_top
+    str_addrs: Array[16, uint64]
+    i: uint64 = 0
+    while i < argc:
+        src: uint64 = cast[Ptr[uint64]](argv_user + i * 8)[0]
+        n:   uint64 = _argv_strlen(src) + 1            # incl. NUL
+        str_sp = str_sp - n
+        memcpy(cast[Ptr[uint8]](str_sp),
+               cast[Ptr[uint8]](src), n)
+        str_addrs[i] = str_sp
+        i = i + 1
+
+    # 2. 16 bytes of AT_RANDOM material. Zero is fine for now — Hamnix
+    #    has no entropy source yet and musl uses these only for stack-
+    #    protector canary seeding, which is best-effort.
+    str_sp = str_sp - 16
+    cast[Ptr[uint64]](str_sp)[0]     = 0
+    cast[Ptr[uint64]](str_sp + 8)[0] = 0
+    random_addr: uint64 = str_sp
+
+    # 3. Compute *rsp = argc cell address after every fixed-size cell
+    #    is accounted for, so we can pre-align the bottom of the string
+    #    region to land *rsp on a 16-byte boundary.
+    #
+    #    Variable contents below the strings/random blob (each 8 bytes):
+    #      - 6 auxv pairs * 2 cells   = 12 cells   = 96 bytes
+    #      - envp NULL                 =  1 cell   =  8 bytes
+    #      - argv NULL                 =  1 cell   =  8 bytes
+    #      - argv pointers (argc)      =  argc     = argc*8 bytes
+    #      - argc cell                 =  1 cell   =  8 bytes
+    #    Total = (15 + argc) * 8 bytes
+    #
+    #    For *rsp (= argc cell) to be 16-aligned, ((15 + argc) * 8)
+    #    aligned-from str_sp must satisfy that bottom = 16-aligned. We
+    #    pre-bump str_sp down 0 or 8 bytes to make it so.
+    str_sp = str_sp & ~cast[uint64](7)
+    fixed_bytes: uint64 = (cast[uint64](15) + argc) * 8
+    bottom: uint64 = str_sp - fixed_bytes
+    if (bottom & cast[uint64](15)) != 0:
+        str_sp = str_sp - 8                            # align pad
+
+    # 4. Push auxv from top down: AT_NULL first (highest addr), then
+    #    each (type, value) pair top-down so that the resulting in-
+    #    memory order — low to high — is the canonical Linux order.
+    str_sp = str_sp - 8
+    cast[Ptr[uint64]](str_sp)[0] = 0                   # AT_NULL.value
+    str_sp = str_sp - 8
+    cast[Ptr[uint64]](str_sp)[0] = AT_NULL             # AT_NULL.type
+
+    str_sp = str_sp - 8
+    cast[Ptr[uint64]](str_sp)[0] = random_addr         # AT_RANDOM.value
+    str_sp = str_sp - 8
+    cast[Ptr[uint64]](str_sp)[0] = AT_RANDOM
+
+    str_sp = str_sp - 8
+    cast[Ptr[uint64]](str_sp)[0] = 4096                # AT_PAGESZ.value
+    str_sp = str_sp - 8
+    cast[Ptr[uint64]](str_sp)[0] = AT_PAGESZ
+
+    str_sp = str_sp - 8
+    cast[Ptr[uint64]](str_sp)[0] = 0                   # AT_PHNUM.value
+    str_sp = str_sp - 8
+    cast[Ptr[uint64]](str_sp)[0] = AT_PHNUM
+
+    str_sp = str_sp - 8
+    cast[Ptr[uint64]](str_sp)[0] = 56                  # AT_PHENT.value
+    str_sp = str_sp - 8
+    cast[Ptr[uint64]](str_sp)[0] = AT_PHENT
+
+    str_sp = str_sp - 8
+    cast[Ptr[uint64]](str_sp)[0] = 0                   # AT_PHDR.value
+    str_sp = str_sp - 8
+    cast[Ptr[uint64]](str_sp)[0] = AT_PHDR
+
+    # 5. envp = empty list → just the NULL terminator.
+    str_sp = str_sp - 8
+    cast[Ptr[uint64]](str_sp)[0] = 0
+
+    # 6. argv array: NULL terminator then argv[N-1] .. argv[0].
+    str_sp = str_sp - 8
+    cast[Ptr[uint64]](str_sp)[0] = 0
+    i = argc
+    while i > 0:
+        i = i - 1
+        str_sp = str_sp - 8
+        cast[Ptr[uint64]](str_sp)[0] = str_addrs[i]
+
+    # 7. argc — the user's new *rsp.
+    str_sp = str_sp - 8
+    cast[Ptr[uint64]](str_sp)[0] = argc
+
     return str_sp
 
 
@@ -329,7 +470,8 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         # U5: exec replaces current image. If the loaded image is a
         # Linux-ABI ELF, flip the current task's is_linux_userspace
         # flag so subsequent syscalls dispatch via u_syscalls.
-        if elf_last_was_linux != 0:
+        is_linux: int32 = elf_last_was_linux
+        if is_linux != 0:
             set_linux_userspace_mode(
                 cast[int32](current_idx_get()), 1)
         # Fresh user stack for the new program. The previous user
@@ -338,8 +480,15 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         new_ustack_top: uint64 = alloc_page() + 4096
         argc_out: uint64 = 0
         argv_out: uint64 = 0
-        new_rsp: uint64 = _build_user_argv(new_ustack_top, a1,
-                                           &argc_out, &argv_out)
+        new_rsp: uint64 = 0
+        if is_linux != 0:
+            # U16: Linux process init-stack — *rsp points to argc;
+            # argv/envp/auxv all reachable from rsp+8. musl ignores
+            # %rdi/%rsi, so we pass argc=0/argv=0 in the SysV slots.
+            new_rsp = _build_user_argv_linux(new_ustack_top, a1)
+        else:
+            new_rsp = _build_user_argv(new_ustack_top, a1,
+                                       &argc_out, &argv_out)
         printk2("execve: jumping to %p with stack %p\n",
                 entry, new_rsp)
         do_execve_finish(entry, new_rsp, argc_out, argv_out)
@@ -367,8 +516,17 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         ustack_top: uint64 = ustack + 4096
         argc_out: uint64 = 0
         argv_out: uint64 = 0
-        new_rsp: uint64 = _build_user_argv(ustack_top, a1,
-                                           &argc_out, &argv_out)
+        new_rsp: uint64 = 0
+        # U16: branch on ABI before laying out the stack. Linux tasks
+        # need argc + argv[] + envp + auxv at *rsp; native tasks get
+        # argc/argv via %rdi/%rsi (planted in the iret frame inside
+        # create_user_task_argv).
+        is_linux: int32 = elf_last_was_linux
+        if is_linux != 0:
+            new_rsp = _build_user_argv_linux(ustack_top, a1)
+        else:
+            new_rsp = _build_user_argv(ustack_top, a1,
+                                       &argc_out, &argv_out)
         slot: int32 = create_user_task_argv(
             entry, 0x5f5f7370776e5f5f,         # "__spwn__"
             new_rsp, argc_out, argv_out,
@@ -380,7 +538,7 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         # *child* slot (not current) so the new task's syscalls route
         # through u_syscalls. Doing this here instead of inside
         # elf_load_blob avoids mis-flagging the parent (hamsh).
-        if elf_last_was_linux != 0:
+        if is_linux != 0:
             set_linux_userspace_mode(slot, 1)
         parent: Ptr[TaskStruct] = current_task()
         sin:  int32 = cast[int32](a2)
