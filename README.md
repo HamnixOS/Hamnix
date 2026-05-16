@@ -153,6 +153,10 @@ The end-game is a fully Hamnix-authored kernel.
 | M16.73 | hamsh sources `/etc/rc` at startup — boot-time script in the shell's own syntax (motd, echo banners, sets up onboarding) | **Done** |
 | M16.74 | `/bin/which` + 7 more coreutils (`free`, `uptime`, `mv`, `ln` stub, `cal`, `expr`, `test`) + `init2`/`/etc/inittab` scaffold | **Done** |
 | M16.75 | PS/2 keyboard driver — Set 1 scancode translation, 128-byte FIFO, drained on every timer tick; `vfs_read` on stdin pulls from kbd + UART | **Done** |
+| M16.76 | hamsh shell variables — `FOO=bar` assignment, `$NAME` substitution, 8-slot static table | **Done** |
+| M16.77 | stdout/stderr mirrored to VGA text console — userland writes visible on real-hardware monitor, not just serial | **Done** |
+| M16.78 | hamsh `env` + `unset` builtins — dump and clear shell variables | **Done** |
+| M16.79 | hamsh PATH walker uses `$PATH` variable — colon-separated, falls back to hardcoded `/bin:/sbin:/usr/bin` when unset | **Done** |
 
 
 ## How it works
