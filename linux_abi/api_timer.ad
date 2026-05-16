@@ -1,0 +1,215 @@
+# linux_abi/api_timer.ad
+#
+# L9: Linux timer_list ABI shims. The classic millisecond-resolution
+# timer wheel — every driver that wants "call this function in N ms"
+# reaches for timer_setup + mod_timer. M5.2 in the regression .ko
+# suite exercises exactly that surface (arm a one-shot timer, wait
+# for the callback to fire, tear it down).
+#
+# Linux signatures (include/linux/timer.h, kernel/time/timer.c):
+#   void timer_setup(struct timer_list *timer,
+#                    void (*func)(struct timer_list *),
+#                    unsigned int flags);
+#   int  mod_timer(struct timer_list *timer, unsigned long expires);
+#   int  timer_delete_sync(struct timer_list *timer);
+#   int  del_timer_sync(struct timer_list *timer);  /* alias */
+#
+# Implementation strategy:
+#
+# A 16-slot static table parallels the layout used by api_proc.ad and
+# api_slab.ad — keeps us out of the global-struct-layout pothole and
+# matches the size cap convention. Each slot records (timer_ptr,
+# fn_addr, expires_jiffies, active). Slot lookup is keyed by the
+# module-supplied struct timer_list * — the same pointer the module
+# passes into mod_timer/del has been recorded by timer_setup.
+#
+# The Linux 6.12 struct timer_list layout starts with `struct
+# hlist_node entry` (2 * 8 bytes = list head + prev), so the
+# `function` field sits at byte offset 16. timer_setup writes the
+# callback there as well — some module code reads timer->function
+# back out, so we keep that field live even though our dispatch path
+# uses the slot table's own fn_addr copy.
+#
+# Firing: timer_walk_one_tick() is the dispatcher called once per
+# jiffy from arch/x86/kernel/time.ad's timer_interrupt (wire-in lands
+# serially; this file just provides the entry point). It walks every
+# active slot, compares expires_jiffies against get_jiffies(), and
+# calls the recorded function pointer with the timer_list * as its
+# single argument (matching Linux's `void (*)(struct timer_list *)`
+# callback signature). A timer fires once — it is marked inactive
+# before the callback runs, so a re-arm from inside the callback
+# (the classic mod_timer-from-callback pattern) reuses the slot
+# without racing against the dispatcher.
+
+from linux_abi.exports import _add_export
+from arch.x86.kernel.time import get_jiffies
+
+
+# --- 16-slot static timer table -------------------------------------
+
+MAX_TIMERS: uint64 = 16
+
+# Parallel arrays — same pattern as proc_slot_*. 0 in timer_ptrs
+# means "free slot".
+timer_ptrs:    Array[16, uint64]   # struct timer_list *  (0 = free)
+timer_fns:     Array[16, uint64]   # void (*fn)(struct timer_list *)
+timer_expires: Array[16, uint64]   # jiffies value at which to fire
+timer_active:  Array[16, uint64]   # 0 = armed-but-not-running / disarmed,
+                                   # 1 = active (mod_timer was called)
+
+# struct timer_list field offsets (Linux 6.12):
+#   struct hlist_node entry;        // offset 0, 16 bytes (next + pprev)
+#   void (*function)(struct timer_list *);  // offset 16
+TIMER_FUNCTION_OFFSET: uint64 = 16
+
+
+def _timer_find_slot(timer_ptr: uint64) -> uint64:
+    # Returns (slot_index + 1) if the timer is already known to us,
+    # 0 otherwise. The +1 convention matches the rest of linux_abi
+    # so 0 stays "not found" sentinel.
+    i: uint64 = 0
+    while i < MAX_TIMERS:
+        if timer_ptrs[i] == timer_ptr:
+            return i + 1
+        i = i + 1
+    return 0
+
+
+def _timer_alloc_slot(timer_ptr: uint64) -> uint64:
+    # Reuse an existing slot if this timer is already registered (the
+    # module called timer_setup twice on the same timer_list — legal),
+    # otherwise grab the first free slot. Returns slot index + 1, or
+    # 0 if the table is full.
+    found: uint64 = _timer_find_slot(timer_ptr)
+    if found != 0:
+        return found
+    i: uint64 = 0
+    while i < MAX_TIMERS:
+        if timer_ptrs[i] == 0:
+            timer_ptrs[i]    = timer_ptr
+            timer_fns[i]     = 0
+            timer_expires[i] = 0
+            timer_active[i]  = 0
+            return i + 1
+        i = i + 1
+    return 0
+
+
+# --- L9 shims --------------------------------------------------------
+
+def _l_timer_setup(timer_ptr: uint64, fn: uint64, flags: uint64):
+    # Linux: timer_setup(t, fn, flags). The flags argument carries
+    # TIMER_DEFERRABLE / TIMER_IRQSAFE / TIMER_PINNED bits — all are
+    # scheduling hints we don't honour yet, so we drop them.
+    #
+    # We also write the function pointer into the timer struct at the
+    # Linux-6.12 layout offset (16 bytes in) so module code reading
+    # back t->function sees what it wrote. Our dispatch path uses the
+    # slot's own copy, so this is purely for ABI faithfulness.
+    if timer_ptr == 0:
+        return
+    handle: uint64 = _timer_alloc_slot(timer_ptr)
+    if handle == 0:
+        return
+    idx: uint64 = handle - 1
+    timer_fns[idx]    = fn
+    timer_active[idx] = 0
+    # Mirror the function pointer into the struct's `function` field.
+    fn_slot: Ptr[uint64] = cast[Ptr[uint64]](
+        timer_ptr + TIMER_FUNCTION_OFFSET)
+    fn_slot[0] = fn
+
+
+def _l_mod_timer(timer_ptr: uint64, expires: uint64) -> int32:
+    # Linux: int mod_timer(t, expires). Returns 1 if the timer was
+    # already pending (re-arm), 0 if it was freshly armed. expires is
+    # an absolute jiffies value.
+    if timer_ptr == 0:
+        return 0
+    handle: uint64 = _timer_find_slot(timer_ptr)
+    if handle == 0:
+        # Module called mod_timer without a preceding timer_setup —
+        # that's a misuse in Linux too, but be tolerant: try to
+        # allocate a slot on the fly so the timer still fires (the
+        # function pointer will be whatever's at offset 16 of the
+        # struct, which static-initialised timers do set).
+        handle = _timer_alloc_slot(timer_ptr)
+        if handle == 0:
+            return 0
+        idx_new: uint64 = handle - 1
+        fn_slot: Ptr[uint64] = cast[Ptr[uint64]](
+            timer_ptr + TIMER_FUNCTION_OFFSET)
+        timer_fns[idx_new] = fn_slot[0]
+    idx: uint64 = handle - 1
+    was_pending: int32 = 0
+    if timer_active[idx] == 1:
+        was_pending = 1
+    timer_expires[idx] = expires
+    timer_active[idx]  = 1
+    return was_pending
+
+
+def _l_timer_delete_sync(timer_ptr: uint64) -> int32:
+    # Linux: int timer_delete_sync(t). Returns 1 if the timer was
+    # pending at the time of the call, 0 otherwise. The "sync" half
+    # of the name means "wait for any in-flight callback to finish";
+    # with no preemption-with-interrupts model yet, we don't have to
+    # spin — the dispatcher and del_sync can't overlap.
+    if timer_ptr == 0:
+        return 0
+    handle: uint64 = _timer_find_slot(timer_ptr)
+    if handle == 0:
+        return 0
+    idx: uint64 = handle - 1
+    was_pending: int32 = 0
+    if timer_active[idx] == 1:
+        was_pending = 1
+    timer_active[idx]  = 0
+    timer_expires[idx] = 0
+    # Note: we keep timer_ptrs[idx] and timer_fns[idx] populated so a
+    # subsequent mod_timer on the same struct re-uses the slot
+    # without going through timer_setup again. Linux behaves the
+    # same way — del_timer doesn't unregister the setup.
+    return was_pending
+
+
+# --- Dispatcher (called from arch/x86/kernel/time.ad on each tick) ---
+
+def timer_walk_one_tick():
+    # Iterate every active slot; fire those whose deadline has passed.
+    # The callback runs in interrupt context (same as Linux's softirq
+    # timer dispatch — close enough for L9). Marking inactive before
+    # the call lets the callback re-arm via mod_timer cleanly.
+    now: uint64 = get_jiffies()
+    i: uint64 = 0
+    while i < MAX_TIMERS:
+        if timer_active[i] == 1:
+            if timer_expires[i] <= now:
+                fn: uint64       = timer_fns[i]
+                timer_ptr: uint64 = timer_ptrs[i]
+                timer_active[i]  = 0
+                if fn != 0:
+                    # void (*fn)(struct timer_list *) — single ptr arg.
+                    # Adder treats a Ptr[uint8] local as an indirect
+                    # call target (same idiom as init_module dispatch
+                    # in arch/x86/kernel/module.ad).
+                    call_fn: Ptr[uint8] = cast[Ptr[uint8]](fn)
+                    call_fn(timer_ptr)
+        i = i + 1
+
+
+# --- Export-table registration --------------------------------------
+
+def linux_abi_register_timer():
+    # Called from start_kernel after the L1/L2 cores are wired up.
+    # del_timer_sync was renamed to timer_delete_sync in Linux 6.x;
+    # both names export the same body so modules built against
+    # either header set find a match.
+    _add_export("timer_setup",
+                cast[uint64](&_l_timer_setup))
+    _add_export("mod_timer",
+                cast[uint64](&_l_mod_timer))
+    _add_export("timer_delete_sync",
+                cast[uint64](&_l_timer_delete_sync))
+    _add_export("del_timer_sync",
+                cast[uint64](&_l_timer_delete_sync))

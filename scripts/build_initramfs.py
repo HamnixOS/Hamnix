@@ -143,6 +143,22 @@ def build_archive() -> bytes:
             print(f"  embedded {name} ({len(data)} bytes from "
                   f"build/mod/{elf.name})")
 
+    # Stock Linux 6.12 .ko fixtures: anything checked in at
+    # tests/linux-modules/*.ko gets embedded as
+    # /lib/modules/6.12/<basename>.ko so the L-track regression
+    # (scripts/test_l_track.sh) can `insmod /lib/modules/6.12/<X>.ko`
+    # without copying files into the initramfs at boot. Mirrors the
+    # etc/ + build/mod/ globs above. Source is tests/linux-modules/
+    # Makefile (built against pinned linux-6.12.48).
+    lkm_dir = here / "tests" / "linux-modules"
+    if lkm_dir.is_dir():
+        for ko in sorted(lkm_dir.glob("*.ko")):
+            data = ko.read_bytes()
+            name = "/lib/modules/6.12/" + ko.name
+            blob += cpio_entry(name, data)
+            print(f"  embedded {name} ({len(data)} bytes from "
+                  f"tests/linux-modules/{ko.name})")
+
     for name, data in FILES:
         blob += cpio_entry(name, data)
     blob += cpio_trailer()

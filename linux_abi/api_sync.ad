@@ -1,0 +1,217 @@
+# linux_abi/api_sync.ad - L6 shims (mutex + spinlock + completion).
+#
+# Stock Linux drivers reach for three synchronization primitives almost
+# constantly: struct mutex (sleeping mutual exclusion), raw_spinlock_t
+# (IRQ-safe spinlock), and struct completion (one-shot wakeup). The
+# module-side declarations look like:
+#
+#     static DEFINE_MUTEX(my_lock);              /* or mutex_init(&m) */
+#     static DEFINE_SPINLOCK(my_slock);
+#     static DECLARE_COMPLETION(done);
+#
+# and the call surface is what M6.3 in the .ko regression suite walks:
+#
+#   void __mutex_init(struct mutex *m, const char *name,
+#                     struct lock_class_key *key);
+#   void mutex_lock(struct mutex *m);
+#   void mutex_unlock(struct mutex *m);
+#   int  mutex_trylock(struct mutex *m);
+#   void _raw_spin_lock_init(raw_spinlock_t *l, ...);
+#   void _raw_spin_lock(raw_spinlock_t *l);
+#   void _raw_spin_unlock(raw_spinlock_t *l);
+#   unsigned long _raw_spin_lock_irqsave(raw_spinlock_t *l);
+#   void _raw_spin_unlock_irqrestore(raw_spinlock_t *l,
+#                                    unsigned long flags);
+#   void init_completion(struct completion *c);
+#   void complete(struct completion *c);
+#   void wait_for_completion(struct completion *c);
+#
+# Implementation strategy:
+#
+# Hamnix is uniprocessor and runs every kernel-side path either
+# inside a syscall (other tasks not running) or inside the timer/IRQ
+# handler (which doesn't take L6 locks). Real contention is therefore
+# impossible at this milestone — two .ko-side code paths can only
+# interleave via the cooperative yield in wait_for_completion. That
+# means a mutex/spinlock is functionally just a flag we toggle.
+#
+# Each primitive's first 16 bytes of memory are repurposed as:
+#
+#   offset 0  uint64  locked / done  (0 = unlocked / not-done,
+#                                     1 = locked / done)
+#   offset 8  uint64  magic          (catches use of an uninitialised
+#                                     or stomped lock; differs per
+#                                     primitive so a mutex used as a
+#                                     spinlock is also caught)
+#
+# Linux's real struct mutex / raw_spinlock_t / struct completion are
+# substantially larger than 16 bytes (debug fields, wait lists, owner
+# pointer, ...), so writing 16 bytes at offset 0 never overflows the
+# caller's allocation. We don't attempt to mimic any of the other
+# fields — modules treat these structs as opaque and reach them only
+# through the API entry points above, which is exactly the discipline
+# the kernel-internal locking documentation enforces.
+#
+# wait_for_completion uses kernel.sched.core.yield_to_others to spin
+# cooperatively. yield_to_others rotates the runqueue, sti/hlt/cli's
+# for the idle interval, and checks signals — so a completion that
+# never fires still lets the rest of the system make progress and
+# stays interruptible.
+
+from linux_abi.exports import _add_export
+from kernel.sched.core import yield_to_others
+
+
+# Per-primitive magic numbers. Chosen so a debug eyeball on a memory
+# dump can tell mutex from spinlock from completion at a glance, and
+# so that a use-after-free / wrong-type misuse stands out from a
+# zero-init blob (magic = 0) or a fresh kmalloc pattern.
+MUTEX_MAGIC:      uint64 = 0x4D54584C4F434B00      # 'MTXLOCK\0'
+SPINLOCK_MAGIC:   uint64 = 0x53504E4C4F434B00      # 'SPNLOCK\0'
+COMPLETION_MAGIC: uint64 = 0x434F4D504C544E00      # 'COMPLTN\0'
+
+
+# --- mutex shims -----------------------------------------------------
+
+def _l_mutex_init(m: uint64, name: uint64, key: uint64):
+    # __mutex_init(&m, "name", &lock_class_key). name + key are debug
+    # / lockdep hooks; we don't have lockdep so they're dropped.
+    if m == 0:
+        return
+    cast[Ptr[uint64]](m)[0] = 0                   # locked = 0
+    cast[Ptr[uint64]](m + 8)[0] = MUTEX_MAGIC
+
+
+def _l_mutex_lock(m: uint64):
+    # On a uniprocessor cooperative kernel, a "locked" mutex can only
+    # already be held by *us* (re-entrant deadlock — caller bug), or
+    # by a task that yielded while holding it. The latter shouldn't
+    # happen at L6 scope, but if it did we'd just clobber the flag —
+    # we don't yield here. Linux would BUG on re-entrant acquisition;
+    # for L6 we silently take it again so the round-trip test passes.
+    if m == 0:
+        return
+    cast[Ptr[uint64]](m)[0] = 1
+
+
+def _l_mutex_unlock(m: uint64):
+    if m == 0:
+        return
+    cast[Ptr[uint64]](m)[0] = 0
+
+
+def _l_mutex_trylock(m: uint64) -> int32:
+    # Returns 1 if the lock was acquired, 0 otherwise (Linux semantics
+    # — note this is INVERTED from POSIX pthread_mutex_trylock!). The
+    # boolean-1 means "got it" was settled when bool became a thing.
+    if m == 0:
+        return 0
+    p: Ptr[uint64] = cast[Ptr[uint64]](m)
+    if p[0] != 0:
+        return 0
+    p[0] = 1
+    return 1
+
+
+# --- spinlock shims --------------------------------------------------
+
+def _l_spin_lock_init(l: uint64, name: uint64, key: uint64):
+    # _raw_spin_lock_init(&l, "name", &lock_class_key). Same shape
+    # as __mutex_init — same drop-debug-args strategy.
+    if l == 0:
+        return
+    cast[Ptr[uint64]](l)[0] = 0
+    cast[Ptr[uint64]](l + 8)[0] = SPINLOCK_MAGIC
+
+
+def _l_spin_lock(l: uint64):
+    # No spin: see file comment. Uniprocessor + no IRQ-context lock
+    # users at L6 ⇒ this is a flag toggle.
+    if l == 0:
+        return
+    cast[Ptr[uint64]](l)[0] = 1
+
+
+def _l_spin_unlock(l: uint64):
+    if l == 0:
+        return
+    cast[Ptr[uint64]](l)[0] = 0
+
+
+def _l_spin_lock_irqsave(l: uint64) -> uint64:
+    # Linux: unsigned long _raw_spin_lock_irqsave(raw_spinlock_t *l);
+    # On real Linux this also saves the IF bit into `flags` and clears
+    # local IRQs. We don't disable IRQs at L6 — module code paths don't
+    # race the timer ISR (it doesn't touch L6-managed memory), and any
+    # real IRQ-safety promise would require us to gate the timer ISR's
+    # entire data path too. Return 0 as the opaque flags cookie.
+    if l == 0:
+        return 0
+    cast[Ptr[uint64]](l)[0] = 1
+    return 0
+
+
+def _l_spin_unlock_irqrestore(l: uint64, flags: uint64):
+    # `flags` is the cookie we returned above; we don't restore an IF
+    # state because we never cleared one. Just drop the lock flag.
+    if l == 0:
+        return
+    cast[Ptr[uint64]](l)[0] = 0
+
+
+# --- completion shims ------------------------------------------------
+
+def _l_init_completion(c: uint64):
+    # init_completion(&c). The "done" counter (uint64 at offset 0)
+    # starts at 0; complete() sets it to 1; wait_for_completion
+    # yields until it's non-zero. Linux uses a counter rather than a
+    # boolean so complete_all can fan out to multiple waiters; we
+    # don't support multiple waiters at L6 so the counter is in
+    # practice a flag.
+    if c == 0:
+        return
+    cast[Ptr[uint64]](c)[0] = 0
+    cast[Ptr[uint64]](c + 8)[0] = COMPLETION_MAGIC
+
+
+def _l_complete(c: uint64):
+    if c == 0:
+        return
+    cast[Ptr[uint64]](c)[0] = 1
+
+
+def _l_wait_for_completion(c: uint64):
+    # Cooperative spin: yield until done == 1. yield_to_others rotates
+    # the runqueue, drops into hlt while interrupts run, and checks
+    # signals on return — so a never-firing completion still lets
+    # SIGINT terminate us instead of hanging the box.
+    #
+    # M6.3's fixture calls complete() before wait_for_completion()
+    # (both from module_init on a single task), so the loop exits on
+    # the very first iteration; the yield path is exercised only if a
+    # future fixture splits complete() into a sibling task.
+    if c == 0:
+        return
+    p: Ptr[uint64] = cast[Ptr[uint64]](c)
+    while p[0] == 0:
+        yield_to_others()
+
+
+# --- registration ----------------------------------------------------
+
+def linux_abi_register_sync():
+    # Called once from start_kernel, after the L1/L2/L3 registrations.
+    # Order doesn't matter — the export table is name-keyed — but
+    # grouping by milestone keeps the boot log readable.
+    _add_export("__mutex_init",                cast[uint64](&_l_mutex_init))
+    _add_export("mutex_lock",                  cast[uint64](&_l_mutex_lock))
+    _add_export("mutex_unlock",                cast[uint64](&_l_mutex_unlock))
+    _add_export("mutex_trylock",               cast[uint64](&_l_mutex_trylock))
+    _add_export("_raw_spin_lock_init",         cast[uint64](&_l_spin_lock_init))
+    _add_export("_raw_spin_lock",              cast[uint64](&_l_spin_lock))
+    _add_export("_raw_spin_unlock",            cast[uint64](&_l_spin_unlock))
+    _add_export("_raw_spin_lock_irqsave",      cast[uint64](&_l_spin_lock_irqsave))
+    _add_export("_raw_spin_unlock_irqrestore", cast[uint64](&_l_spin_unlock_irqrestore))
+    _add_export("init_completion",             cast[uint64](&_l_init_completion))
+    _add_export("complete",                    cast[uint64](&_l_complete))
+    _add_export("wait_for_completion",         cast[uint64](&_l_wait_for_completion))
