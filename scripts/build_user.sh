@@ -99,3 +99,10 @@ build_adder_user poweroff             # M16.82: same as halt for now
 build_adder_user reboot               # M16.82: future i8042 0xFE pulse
 build_adder_user insmod               # L1: load stock Linux 6.12 .ko
 build_adder_user rmmod                # L1: unload by slot id
+build_adder_user pgrep                # /proc/tasks comm-substring -> PIDs
+build_adder_user kill                 # sys_kill(pid, sig); -SIG flag
+build_adder_user sed                  # single s/A/B/ replace per line
+build_adder_user awk                  # literal {print $N} only
+build_adder_user less                 # alias for more (24-line pager)
+build_adder_user xargs                # stdin tokens -> sys_spawn argv
+build_adder_user ascii                # printable ASCII 32..126 table
