@@ -35,9 +35,17 @@ set +e
     sleep 1
     printf 'echo BOTH= $FOO $BAR\n'
     sleep 1
+    # M16.78: env builtin lists every defined variable.
+    printf 'env\n'
+    sleep 1
+    # unset removes a variable; subsequent $FOO stays literal.
+    printf 'unset FOO\n'
+    sleep 1
+    printf 'echo AFTER_UNSET= $FOO\n'
+    sleep 1
     printf 'exit\n'
     sleep 1
-) | timeout 16s qemu-system-x86_64 \
+) | timeout 22s qemu-system-x86_64 \
     -kernel "$ELF" \
     -smp 2 -nographic -no-reboot -m 256M -monitor none -serial stdio \
     > "$LOG" 2>&1
@@ -60,6 +68,20 @@ if grep -F -q "BOTH= hello world" "$LOG"; then
     echo "[test_hamsh_vars] OK: two-var expansion in one command"
 else
     echo "[test_hamsh_vars] MISS: combined two-var expansion"
+    fail=1
+fi
+# M16.78 env builtin — emits KEY=VALUE lines for every shell var.
+if grep -F -q "FOO=hello" "$LOG" && grep -F -q "BAR=world" "$LOG"; then
+    echo "[test_hamsh_vars] OK: env dumped both FOO and BAR"
+else
+    echo "[test_hamsh_vars] MISS: env didn't list both vars"
+    fail=1
+fi
+# After unset FOO, $FOO becomes literal again.
+if grep -F -q 'AFTER_UNSET= $FOO' "$LOG"; then
+    echo "[test_hamsh_vars] OK: unset cleared FOO"
+else
+    echo "[test_hamsh_vars] MISS: unset didn't clear FOO"
     fail=1
 fi
 
