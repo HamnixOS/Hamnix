@@ -39,7 +39,7 @@ from .ast_nodes import (
     Program, FunctionDef, ExternDecl, Parameter,
     ClassDef, ClassField,
     VarDecl, Assignment, ExprStmt, ReturnStmt, IfStmt, WhileStmt,
-    BreakStmt, ContinueStmt, PassStmt,
+    DoWhileStmt, BreakStmt, ContinueStmt, PassStmt,
     Expr, Stmt,
     CallExpr, Identifier, StringLiteral, IntLiteral, CharLiteral, BoolLiteral,
     BinaryExpr, UnaryExpr, BinOp, UnaryOp,
@@ -588,6 +588,9 @@ class X86CodeGen:
             case WhileStmt(condition=cond, body=body):
                 self.gen_while(cond, body)
 
+            case DoWhileStmt(body=body, condition=cond):
+                self.gen_do_while(body, cond)
+
             case BreakStmt():
                 loop = self.ctx.current_loop()
                 if loop is None:
@@ -721,6 +724,32 @@ class X86CodeGen:
             self.gen_stmt(s)
 
         self.emit(f"    jmp {start_label}")
+        self.emit(f"{end_label}:")
+        self.ctx.pop_loop()
+
+    def gen_do_while(self, body: list[Stmt], cond: Expr) -> None:
+        # do-body-while-cond: execute body unconditionally first, then
+        # test. Lowered as:
+        #   start:  <body>
+        #   cont:   <eval cond -> rax>
+        #           testq %rax, %rax
+        #           jnz start
+        #   end:
+        # `continue` inside the body jumps to `cont` (the test) so the
+        # condition still gates the next iteration — that matches both
+        # C's and shell's do-while semantics. `break` jumps to `end`.
+        start_label = self.ctx.new_label("dowhile")
+        cont_label = self.ctx.new_label("dowhile_cont")
+        end_label = self.ctx.new_label("enddowhile")
+        self.ctx.push_loop(cont_label, end_label)
+
+        self.emit(f"{start_label}:")
+        for s in body:
+            self.gen_stmt(s)
+        self.emit(f"{cont_label}:")
+        self.gen_expr(cond)
+        self.emit("    testq %rax, %rax")
+        self.emit(f"    jnz {start_label}")
         self.emit(f"{end_label}:")
         self.ctx.pop_loop()
 

@@ -23,6 +23,7 @@ class TokenType(Enum):
     ELIF = auto()
     ELSE = auto()
     WHILE = auto()
+    DO = auto()
     FOR = auto()
     IN = auto()
     BREAK = auto()
@@ -182,6 +183,7 @@ KEYWORDS: dict[str, TokenType] = {
     "elif": TokenType.ELIF,
     "else": TokenType.ELSE,
     "while": TokenType.WHILE,
+    "do": TokenType.DO,
     "for": TokenType.FOR,
     "in": TokenType.IN,
     "break": TokenType.BREAK,

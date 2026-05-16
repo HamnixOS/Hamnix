@@ -465,6 +465,17 @@ class WhileStmt:
 
 
 @dataclass
+class DoWhileStmt:
+    """do/while loop. Executes body once before the first test, then
+    repeats while the condition holds. The right shape for "run this
+    until X holds" — Python's regular `while` requires duplicating the
+    body or threading a flag, which this avoids."""
+    body: list['Stmt']
+    condition: Expr
+    span: Optional[Span] = None
+
+
+@dataclass
 class ForStmt:
     """For loop: for i in range(...) or for x in items"""
     var: str
@@ -581,7 +592,8 @@ class WithStmt:
 
 # Type alias for statements
 Stmt = (VarDecl | Assignment | ExprStmt | ReturnStmt | IfStmt |
-        WhileStmt | ForStmt | ForUnpackStmt | BreakStmt | ContinueStmt |
+        WhileStmt | DoWhileStmt | ForStmt | ForUnpackStmt |
+        BreakStmt | ContinueStmt |
         PassStmt | DeferStmt | AssertStmt | GlobalStmt | TupleUnpackAssign |
         TryStmt | RaiseStmt | YieldStmt | WithStmt)
 

@@ -754,6 +754,18 @@ class Parser:
             body = self.parse_block()
             return WhileStmt(condition, body, self.make_span(tok))
 
+        # Do/while statement: `do: body; while condition`. The body
+        # parses as a regular indented block (same shape as `while`);
+        # afterwards the parser expects `while <cond>` on its own line
+        # at the same indentation as the `do` header. No NEWLINE is
+        # required between `while` and the condition — same convention
+        # as the rest of the parser.
+        if self.match(TokenType.DO):
+            body = self.parse_block()
+            self.expect(TokenType.WHILE)
+            condition = self.parse_expression()
+            return DoWhileStmt(body, condition, self.make_span(tok))
+
         # For statement
         if self.match(TokenType.FOR):
             var = self.expect(TokenType.IDENT).value
