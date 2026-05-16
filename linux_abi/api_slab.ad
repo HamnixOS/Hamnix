@@ -1,0 +1,144 @@
+# linux_abi/api_slab.ad - L3 shims (kmem_cache_* family).
+#
+# Stock Linux drivers very rarely call kmalloc directly past the
+# initial probe path — almost everything that lives across a few
+# operations is allocated out of a per-driver kmem_cache. Modelling
+# those caches is L3's job.
+#
+# Linux signatures (mm/slab_common.c, include/linux/slab.h):
+#
+#   struct kmem_cache *kmem_cache_create(const char *name,
+#                                        unsigned int size,
+#                                        unsigned int align,
+#                                        slab_flags_t flags,
+#                                        void (*ctor)(void *));
+#   void *kmem_cache_alloc(struct kmem_cache *s, gfp_t flags);
+#   void  kmem_cache_free(struct kmem_cache *s, void *objp);
+#   void  kmem_cache_destroy(struct kmem_cache *s);
+#
+# Implementation strategy:
+#
+# Hamnix's slab front-end is fixed-size (32, 64, 128, ... 2048).
+# Adding per-cache backing pages would mean recursing into slab-
+# from-slab on `create` (we'd need a slab to hold the cache struct
+# itself), which is exactly the chicken-and-egg trap the SLUB
+# bootstrap code in Linux dances around. For L3 we sidestep all of
+# that: a "kmem_cache" is just a recorded object-size, kept in a
+# static 16-slot table inside this module. kmem_cache_alloc(s)
+# expands to kmalloc(s->size); kmem_cache_free expands to kfree.
+# kmem_cache_destroy is a no-op — we don't track allocations on a
+# per-cache basis, so there's nothing to reap.
+#
+# This is functionally equivalent to Linux for any module that just
+# wants "give me an object of size N every now and then": the
+# ctor/dtor and alignment hints are ignored, but the alloc/free
+# cycle is correct. M6.1 in the .ko regression suite exercises
+# exactly that path. When a module shows up that depends on, say,
+# SLAB_HWCACHE_ALIGN or per-cache statistics, we'll grow real
+# per-cache backing storage; not before.
+
+from linux_abi.exports import _add_export
+from mm.slab import kmalloc, kfree, kzalloc
+
+
+# --- L3 kmem_cache handle table -------------------------------------
+#
+# A "handle" is a Ptr[L3KmemCache] returned to the module. The
+# module never dereferences it — it's an opaque cookie that gets
+# fed back to alloc/free/destroy. We park 16 of these in a static
+# array (zero-init, .bss) so create/destroy don't need to allocate
+# memory themselves. 16 is well above the four-or-five caches a
+# single L3-era driver is realistic to spin up, and matches the
+# MAX_EXPORTS scale used elsewhere in linux_abi.
+
+class L3KmemCache:
+    in_use:       uint64       # 0 = free slot, 1 = live cache
+    object_size:  uint64       # bytes per alloc; what kmem_cache_alloc routes to
+
+
+L3_KMEM_CACHE_SLOTS: uint64 = 16
+l3_kmem_caches: Array[16, L3KmemCache]
+
+
+def _l3_alloc_slot() -> uint64:
+    # Linear scan for an unused slot. Returns the slot's address as
+    # a uint64 (the handle the module sees), or 0 if the table is
+    # full. 16 entries is small enough that a free-list head would
+    # be over-engineering.
+    i: uint64 = 0
+    while i < L3_KMEM_CACHE_SLOTS:
+        if l3_kmem_caches[i].in_use == 0:
+            return cast[uint64](&l3_kmem_caches[i])
+        i = i + 1
+    return 0
+
+
+# --- L3 shims --------------------------------------------------------
+
+def _l_kmem_cache_create(name: uint64, size: uint64, align: uint64,
+                          flags: uint64, ctor: uint64) -> uint64:
+    # Linux: kmem_cache_create(name, size, align, flags, ctor).
+    # We ignore everything except size — name is for /proc/slabinfo
+    # (which we don't have yet), align is a hint (slab objects come
+    # out 8-byte aligned regardless), flags covers SLAB_POISON /
+    # SLAB_RED_ZONE / SLAB_HWCACHE_ALIGN (all debugging or perf
+    # hints), and ctor is a per-object initialiser that Linux runs
+    # on first allocation — module code typically passes NULL.
+    handle: uint64 = _l3_alloc_slot()
+    if handle == 0:
+        return 0
+    cache: Ptr[L3KmemCache] = cast[Ptr[L3KmemCache]](handle)
+    cache[0].in_use      = 1
+    cache[0].object_size = size
+    return handle
+
+
+def _l_kmem_cache_alloc(s: uint64, flags: uint64) -> uint64:
+    # gfp_t is ignored — same rationale as the L2 kmalloc shim
+    # (Hamnix's slab serves one zone). NULL handle is treated as
+    # OOM rather than as a bug; the caller can't recover either way.
+    if s == 0:
+        return 0
+    cache: Ptr[L3KmemCache] = cast[Ptr[L3KmemCache]](s)
+    if cache[0].in_use == 0:
+        # Caller passed a destroyed (or never-created) handle.
+        # Linux would BUG_ON here; for L3 we just fail the alloc.
+        return 0
+    return kmalloc(cache[0].object_size)
+
+
+def _l_kmem_cache_free(s: uint64, objp: uint64):
+    # Linux's kmem_cache_free is NOT NULL-safe on the object pointer
+    # (unlike kfree), but most well-behaved modules check anyway.
+    # We forward through kfree, which IS NULL-safe — the `s` argument
+    # is unused because Hamnix's kfree recovers the owning slab
+    # from the object's page-aligned header.
+    if objp == 0:
+        return
+    kfree(objp)
+
+
+def _l_kmem_cache_destroy(s: uint64):
+    # Frees the handle slot for reuse. Linux's kmem_cache_destroy
+    # also walks the cache's slabs and BUG()s if any objects are
+    # still live; we skip that check (no per-cache allocation
+    # tracking) — leaks at destroy time will surface as unfreed
+    # slab objects whenever the broader slab debugging gets added.
+    if s == 0:
+        return
+    cache: Ptr[L3KmemCache] = cast[Ptr[L3KmemCache]](s)
+    cache[0].in_use      = 0
+    cache[0].object_size = 0
+
+
+# --- registration ----------------------------------------------------
+
+def linux_abi_register_slab():
+    # Called once from start_kernel, after linux_abi_exports_init has
+    # populated the L1/L2 rows. Order doesn't matter — the export
+    # table is a flat name-keyed array — but grouping by milestone
+    # keeps the boot log readable.
+    _add_export("kmem_cache_create",  cast[uint64](&_l_kmem_cache_create))
+    _add_export("kmem_cache_alloc",   cast[uint64](&_l_kmem_cache_alloc))
+    _add_export("kmem_cache_free",    cast[uint64](&_l_kmem_cache_free))
+    _add_export("kmem_cache_destroy", cast[uint64](&_l_kmem_cache_destroy))
