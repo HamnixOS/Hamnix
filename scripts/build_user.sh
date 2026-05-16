@@ -83,3 +83,4 @@ build_adder_user df                   # M16.70: dump /proc/mounts
 build_adder_user du                   # M16.70: entry-count under path
 build_adder_user tail                 # M16.70: last N lines of stdin
 build_adder_user cmp                  # M16.70: byte-compare two files
+build_adder_user which                # M16.74: PATH lookup tool
