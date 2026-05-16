@@ -16,6 +16,8 @@
 #   - "DUP_DEMO_MARKER" appears EXACTLY ONCE in the captured log
 #     (only after cat reads it back; never on serial directly).
 
+. "$(dirname "$0")/_build_lock.sh"
+
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"

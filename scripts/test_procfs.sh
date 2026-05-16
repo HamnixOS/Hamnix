@@ -10,6 +10,8 @@
 #                                            task table and rendered
 #                                            the live shell process
 
+. "$(dirname "$0")/_build_lock.sh"
+
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"

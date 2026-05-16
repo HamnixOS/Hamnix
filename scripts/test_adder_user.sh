@@ -13,6 +13,8 @@
 #
 # Exits non-zero if the banner doesn't appear within the QEMU window.
 
+. "$(dirname "$0")/_build_lock.sh"
+
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"

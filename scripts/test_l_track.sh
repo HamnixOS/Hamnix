@@ -19,6 +19,8 @@
 #
 # Pattern mirrors scripts/test_hamsh.sh and scripts/test_procfs.sh.
 
+. "$(dirname "$0")/_build_lock.sh"
+
 set -uo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"

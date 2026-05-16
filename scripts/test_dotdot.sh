@@ -15,6 +15,8 @@
 # The /a/c path is a fake one — `cd` doesn't validate that the
 # target exists yet, so the normalization happens regardless.
 
+. "$(dirname "$0")/_build_lock.sh"
+
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"

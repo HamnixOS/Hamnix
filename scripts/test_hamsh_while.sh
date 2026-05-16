@@ -19,6 +19,8 @@
 #        → IF_ELSE_OK runs, IF_THEN_FAIL does NOT.
 #   7. `exit`                                       → clean shutdown
 
+. "$(dirname "$0")/_build_lock.sh"
+
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"

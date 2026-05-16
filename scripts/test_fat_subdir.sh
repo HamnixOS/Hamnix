@@ -10,6 +10,8 @@
 # component walker descends into a directory entry (attr & 0x10)
 # rather than rejecting paths with slashes.
 
+. "$(dirname "$0")/_build_lock.sh"
+
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"

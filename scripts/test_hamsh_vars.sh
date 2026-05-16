@@ -7,6 +7,8 @@
 #   echo $MISSING     → "$MISSING" (literal — miss left untouched)
 #   echo $?           → still the previous command's exit (separate)
 
+. "$(dirname "$0")/_build_lock.sh"
+
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"

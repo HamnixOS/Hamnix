@@ -15,6 +15,8 @@
 # A successful test prints "blk: write smoke test PASS"; any
 # byte mismatch or driver error prints "FAIL @offset=N".
 
+. "$(dirname "$0")/_build_lock.sh"
+
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"

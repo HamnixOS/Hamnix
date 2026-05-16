@@ -11,6 +11,8 @@
 # directories. Validates the FAT directory walker + SYS_LISTDIR end
 # to end against the baked disk image's two directories.
 
+. "$(dirname "$0")/_build_lock.sh"
+
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"

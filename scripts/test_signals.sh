@@ -12,6 +12,8 @@
 # After the child is killed we send `exit` so hamsh returns cleanly
 # and the box halts, keeping the boot log a manageable size.
 
+. "$(dirname "$0")/_build_lock.sh"
+
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"

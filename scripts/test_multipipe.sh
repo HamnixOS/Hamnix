@@ -11,6 +11,8 @@
 # stdin/stdout to the right pair of ends, and closed the parent's
 # copies so the children can EOF cleanly.
 
+. "$(dirname "$0")/_build_lock.sh"
+
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"

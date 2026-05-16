@@ -8,6 +8,8 @@
 # RX → kernel vfs_read(FD_STDIN_MARK, ...) → user-mode SYS_READ →
 # user SYS_WRITE back out → host stdout.
 
+. "$(dirname "$0")/_build_lock.sh"
+
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"

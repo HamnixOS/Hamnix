@@ -7,6 +7,8 @@
 #   echo "a"b"c"                → glues quoted segments: 1 token "abc"
 #   echo a "b c" d              → 4 tokens (a, "b c", d, but argv 0..3)
 
+. "$(dirname "$0")/_build_lock.sh"
+
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"

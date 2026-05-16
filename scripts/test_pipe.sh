@@ -12,6 +12,8 @@
 # the SYS_PIPE / fd inheritance / blocking-read / writers-closed-EOF
 # chain works end to end.
 
+. "$(dirname "$0")/_build_lock.sh"
+
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"

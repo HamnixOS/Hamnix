@@ -13,6 +13,8 @@
 # resolve_path() at the syscall layer is prepending the calling
 # task's CWD to relative paths.
 
+. "$(dirname "$0")/_build_lock.sh"
+
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"

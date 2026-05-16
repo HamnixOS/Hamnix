@@ -13,6 +13,8 @@
 #   5. # comment line   → silently ignored, no error
 #   6. echo POST_COMMENT_OK
 
+. "$(dirname "$0")/_build_lock.sh"
+
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"

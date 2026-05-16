@@ -11,6 +11,8 @@
 #   2. cat /dev/null prints nothing (no "/dev/null" wrapper output either)
 #   3. The shell can put /dev/zero into a pipeline without panic
 
+. "$(dirname "$0")/_build_lock.sh"
+
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"

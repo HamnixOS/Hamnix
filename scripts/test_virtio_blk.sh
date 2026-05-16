@@ -8,6 +8,8 @@
 # legacy-virtio init → virtq descriptor chain → kick → used-ring
 # completion → FAT chain walk → file bytes to serial.
 
+. "$(dirname "$0")/_build_lock.sh"
+
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"

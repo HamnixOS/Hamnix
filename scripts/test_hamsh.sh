@@ -18,6 +18,8 @@
 # letting each command drain through SYS_READ before sending the next
 # avoids dropped chars. Same trick scripts/test_stdin.sh uses.
 
+. "$(dirname "$0")/_build_lock.sh"
+
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"

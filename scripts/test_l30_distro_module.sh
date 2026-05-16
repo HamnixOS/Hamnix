@@ -36,6 +36,8 @@
 # panicked or the QEMU process never produced any output — those are
 # the only true regressions at this stage.
 
+. "$(dirname "$0")/_build_lock.sh"
+
 set -uo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"

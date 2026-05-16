@@ -5,6 +5,8 @@
 # runs `motd`, which prints /etc/motd. So booting fresh should land
 # us at a prompt with the motd text visible in the captured stream.
 
+. "$(dirname "$0")/_build_lock.sh"
+
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"

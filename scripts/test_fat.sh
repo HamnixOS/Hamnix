@@ -7,6 +7,8 @@
 # to fat_open, vfs_read walks the FAT chain via blk_read_sectors,
 # bytes come out on serial.
 
+. "$(dirname "$0")/_build_lock.sh"
+
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"

@@ -15,6 +15,8 @@
 # fd 1 to a tmpfs entry, echo wrote to it, the entry persisted past
 # the child's exit, and cat reopened it for read.
 
+. "$(dirname "$0")/_build_lock.sh"
+
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
