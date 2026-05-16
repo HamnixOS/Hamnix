@@ -161,6 +161,9 @@ The end-game is a fully Hamnix-authored kernel.
 | M16.81 | `/bin/banner` + `/bin/strings` | **Done** |
 | M16.82 | `/bin/halt` + `/bin/poweroff` + `/bin/reboot` stubs | **Done** |
 | M16.83 | 7 more coreutils: `/bin/pgrep`, `/bin/kill`, `/bin/sed`, `/bin/awk`, `/bin/less`, `/bin/xargs`, `/bin/ascii` | **Done** |
+| M16.84 | hamsh — single-line `if COND ; then BODY ; fi` conditionals | **Done** |
+| M16.85 | hamsh — `else` branches + `while COND ; do BODY ; done` loops | **Done** |
+| M16.86 | 5 more coreutils: `/bin/base64`, `/bin/md5sum`, `/bin/env_show`, `/bin/watch`, `/bin/whatis` | **Done** |
 
 ## L-series: Linux ABI compatibility
 
@@ -202,10 +205,12 @@ drivers (xhci_hcd, nvme, usbhid, e1000e). See
 | **L27** | Filesystem registration: `register_filesystem`, `mount_nodev` | **Done** |
 | **L28** | Kernel sockets: `sock_create_kern`, `kernel_bind` | **Done** |
 | L29 | M1..M15 .ko regression passes against Hamnix | Pending (harness shipped; needs Linux 6.12.48 build tree for fixtures) |
-| **L30** | **First stock Debian .ko load attempt** — crc8.ko: ELF parsed, 25/28 relocs applied, no panic; punchlist: `__x86_return_thunk` + struct-module.init field follow-up | **Done (test data captured)** |
-| L31 | Export `__x86_return_thunk` Spectre-v2 retpoline trampoline stub | In progress |
-| L32 | Read init via `struct module.init` field (not flat init_module symbol) | In progress |
-| L33..L37 | usbcore, xhci-pci, xhci-hcd, usbhid, nvme, efifb / simpledrm | Pending |
+| **L30** | First stock Debian `.ko` load attempt — crc8.ko ELF parsed, 25/28 relocs applied, no panic | **Done** |
+| **L31** | `__x86_return_thunk` Spectre-v2 retpoline trampoline stub. 28/28 relocs resolved against crc8 | **Done** |
+| **L32** | Read init/exit via `struct module.init/.exit` fields (offset 312/1200 from L0 BTF), not just flat symbols. Library-only modules (no init) handled cleanly | **Done** |
+| **L33** | Relocation walker diagnostics + library-only module proof: `.gnu.linkonce.this_module` relocs (when present) walk via the existing target-section dispatch — no special case needed | **Done** |
+| **L34** | **`__crc32c_le` + 6 crypto-register shims — stock `crc32c_generic.ko`'s `init_module()` actually executes on Hamnix.** Returns -EINVAL from the module's own self-test (placeholder hash math). End-to-end validation of L1-L34: ELF parse → relocations → init call → kernel survives → hamsh prompt returns | **Done** |
+| L35..L37 | usbcore, xhci-pci, xhci-hcd, usbhid, nvme, efifb / simpledrm | Pending |
 | L38 | UEFI boot path (PE/COFF) | Scaffold |
 | L39 | ACPI MADT/MCFG parsing | Scaffold |
 | L40 | First boot on real ThinkPad hardware | Pending |
