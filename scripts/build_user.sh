@@ -106,3 +106,8 @@ build_adder_user awk                  # literal {print $N} only
 build_adder_user less                 # alias for more (24-line pager)
 build_adder_user xargs                # stdin tokens -> sys_spawn argv
 build_adder_user ascii                # printable ASCII 32..126 table
+build_adder_user base64               # M16.86: RFC 4648 encode/decode
+build_adder_user md5sum               # M16.86: fixed-hash stub (real MD5 deferred)
+build_adder_user env_show             # M16.86: hint about hamsh's `env` builtin
+build_adder_user watch                # M16.86: -n N CMD, runs CMD twice w/ delay
+build_adder_user whatis               # M16.86: one-line description table
