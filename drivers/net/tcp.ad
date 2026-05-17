@@ -1,11 +1,48 @@
 # drivers/net/tcp.ad
 #
-# L37+ scaffold: TCP segment layout + state-machine constants. Stock
-# Linux's net/ipv4/tcp_input.c is ~7 KLOC of state machine, congestion
-# control, SACK, fast retransmit, etc.; this file just gives the L37+
-# work a place to start. tcp_rx() is a log-and-drop stub.
+# Minimal TCP/IPv4 client (active-open only). Implements just enough
+# of RFC 793 / 9293 to complete a three-way handshake, exchange a few
+# segments, and tear down cleanly via FIN. This is the gating step
+# before HTTP — apt fetches over HTTP, HTTP runs on TCP, and without
+# TCP nothing above the IP layer that the user actually cares about
+# works.
+#
+# State machine (active-open client only — LISTEN / SYN-RCVD are out
+# of scope; passive-open lands when sshd needs it):
+#
+#   CLOSED --tcp_connect()--> SYN_SENT
+#       --recv SYN-ACK / send ACK--> ESTABLISHED
+#       --tcp_send()/tcp_recv() while data flows--
+#       --tcp_close() / send FIN--> FIN_WAIT_1
+#       --recv ACK--> FIN_WAIT_2
+#       --recv FIN / send ACK--> TIME_WAIT --(skip 2*MSL)--> CLOSED
+#
+# Connection table: static 8-entry TCB array. Ephemeral source ports
+# 50000..50007 (one per slot, so the slot index is also the port
+# offset; saves a separate allocator). Single-shot — no retransmit,
+# no congestion control beyond cwnd=1 segment, no SACK, no
+# timestamps, no window scaling. Fine for SLIRP, which doesn't drop.
+#
+# Checksum uses the IPv4 pseudo-header (src_ip, dst_ip, 0, proto=6,
+# tcp_length) prepended to the TCP header + payload — same 1's
+# complement algorithm as UDP/ICMP (ip_csum16 in ip.ad), just fed a
+# concatenation. We build the pseudo-header into a tiny scratch
+# buffer right before the segment in tcp_tx_buf so a single
+# ip_csum16 call covers both.
+#
+# State of `rcv_nxt`: we track "next expected sequence number from
+# the peer" so the ACK we send back ack's everything received so
+# far. We DO NOT buffer out-of-order segments — SLIRP delivers in
+# order, and if a real peer ever reorders we just drop the OoO
+# segment. That's a correctness regression for the real internet
+# but fine for the SLIRP-bounded smoke test.
 
-from kernel.printk.printk import printk0, printk2
+from kernel.printk.printk import printk0, printk1, printk2
+from drivers.net.ip import ip_send, ip_csum16, IPPROTO_TCP, ip_our_ip_b, ip_have_our_ip
+from drivers.net.virtio_net import virtio_net_poll
+from drivers.net.eth import eth_tx, eth_get_mac
+from drivers.net.arp import arp_lookup
+from arch.x86.kernel.time import get_jiffies
 
 
 # TCP control-block states (RFC 793). Numbered to match the order
@@ -25,8 +62,6 @@ TCP_TIME_WAIT:   uint32 = 10
 
 
 # Flag bits in TcpHdr.flags (low byte of the data_off/flags word).
-# We model them as individual uint8 constants; a future bitfield
-# accessor can OR them together.
 TCP_FIN: uint8 = 0x01
 TCP_SYN: uint8 = 0x02
 TCP_RST: uint8 = 0x04
@@ -49,30 +84,717 @@ class TcpHdr:
     urg_ptr:  uint16    # 18
 
 
-# Per-direction segment counter. The real stack tracks per-socket
-# stats in struct tcp_sock; we'll grow into that in the L37+ work.
-tcp_in_segs:  uint64 = 0
-tcp_out_segs: uint64 = 0
+# Sizes / limits.
+TCP_HDR_LEN:        uint64 = 20
+TCP_MSS:            uint64 = 536       # conservative default per RFC 879
+TCP_RX_BUF:         uint64 = 1500
+TCP_TX_BUF:         uint64 = 1500
+TCP_PSEUDO_LEN:     uint64 = 12        # src4 + dst4 + zero + proto + length(2)
+
+# Default receive window we advertise. Generous — SLIRP won't try to
+# fill it, but >0 is required by the spec or peers won't send data.
+TCP_DEFAULT_WIN:    uint16 = 0x4000
 
 
-def tcp_rx(pkt: Ptr[uint8], length: uint64):
-    # Scaffold stub. Eventual flow:
-    #   1. Length-check (>= 20).
-    #   2. Verify checksum (pseudo-header from IP layer + segment).
-    #   3. Look up the matching listen/established socket by 4-tuple
-    #      (src_ip, src_port, dst_ip, dst_port).
-    #   4. Run the state machine on the matching tcp_sock.
+# Connection table. Parallel-array layout to keep the per-slot
+# scalar accesses simple (and to dodge any 2-D Array codegen
+# surprises). 8 slots fits 256 bytes of state — comfortably static.
+TCP_NUM_SLOTS:      uint64 = 8
+TCP_EPHEMERAL_BASE: uint16 = 50000
+
+tcp_slot_state:    Array[8, uint32]      # TCP_CLOSED..TCP_TIME_WAIT
+tcp_slot_local_p:  Array[8, uint16]      # local port (host order)
+tcp_slot_remote_p: Array[8, uint16]      # remote port (host order)
+# Remote IPv4 stored as flat 32-byte array, slot*4 + byte (network
+# order) — same flat-1D dodge dns.ad uses for its result table.
+tcp_slot_remote_ip: Array[32, uint8]
+tcp_slot_snd_nxt:   Array[8, uint32]     # next byte we will send
+tcp_slot_snd_una:   Array[8, uint32]     # oldest unacknowledged byte
+tcp_slot_rcv_nxt:   Array[8, uint32]     # next byte we expect from peer
+tcp_slot_last_act:  Array[8, uint64]     # jiffies of last RX/TX
+
+# Per-slot inbound buffer + valid-byte count. tcp_rx fills these
+# when it sees a segment carrying payload addressed to slot's
+# 4-tuple; tcp_recv drains and clears the count. Single segment of
+# capacity TCP_RX_BUF — no reassembly across multiple inbound
+# segments, no out-of-order buffering.
+tcp_slot_rx_data:   Array[12000, uint8]  # 8 slots * 1500 bytes
+tcp_slot_rx_len:    Array[8, uint64]
+
+# Per-slot flag: did we observe a FIN from the peer? Latched the
+# first time we see it; cleared on tcp_close completion.
+tcp_slot_saw_fin:   Array[8, uint8]
+
+
+# Counters bumped by tcp_rx / tcp_tx. Mirrors a couple of fields in
+# /proc/net/snmp Tcp:; we'll grow the list when the rest of the
+# stack lands.
+tcp_in_segs:    uint64 = 0
+tcp_out_segs:   uint64 = 0
+tcp_in_data:    uint64 = 0
+tcp_out_data:   uint64 = 0
+tcp_resets_in:  uint64 = 0
+tcp_resets_out: uint64 = 0
+
+
+# Initial-sequence-number generator. xorshift64 seeded from
+# get_jiffies() the first time we issue a SYN. Real Linux uses an
+# MD4/SipHash-based per-flow ISN to defend against blind injection;
+# we don't have a threat model that requires that, so a single
+# global xorshift state is fine.
+tcp_isn_state: uint64 = 0
+tcp_isn_init:  uint8  = 0
+
+
+# Scratch buffer for outbound TCP. Laid out as:
+#   [0..TCP_PSEUDO_LEN)            pseudo-header (csum input only)
+#   [TCP_PSEUDO_LEN..+TCP_HDR_LEN) TCP header
+#   [...+payload_len)              payload
+# ip_send is handed the pointer AFTER the pseudo-header.
+tcp_tx_buf: Array[2048, uint8]
+
+# Scratch buffer for the one-shot ARP REQUEST we send before the
+# first connect to a not-yet-cached on-link host. Same shape as
+# dns.ad's _dns_build_arp_request_for_server (14 ETH + 28 ARP +
+# 22 pad = 64 bytes). When a connect targets a guestfwd address
+# like 10.0.2.100, that host has its own MAC distinct from the
+# gateway (10.0.2.2) and the DNS server (10.0.2.3), so we have to
+# ARP for it before ip_send can find a destination MAC.
+tcp_arp_buf: Array[64, uint8]
+
+
+def _tcp_build_arp_request(b0: uint8, b1: uint8,
+                           b2: uint8, b3: uint8) -> int32:
+    # Construct a 42-byte (padded to 60) Ethernet+ARP REQUEST asking
+    # "who-has b0.b1.b2.b3 tell our_ip" and hand it to eth_tx.
+    # Returns 0 on send success, -1 if our IP or MAC isn't ready.
+    our_mac: Ptr[uint8] = eth_get_mac()
+    if our_mac == cast[Ptr[uint8]](0):
+        return -1
+    if ip_have_our_ip() == 0:
+        return -1
+    i: uint64 = 0
+    while i < 64:
+        tcp_arp_buf[i] = 0
+        i = i + 1
+    # Ethernet header: dst=broadcast, src=our MAC, type=0x0806.
+    j: uint64 = 0
+    while j < 6:
+        tcp_arp_buf[j] = 0xFF
+        tcp_arp_buf[6 + j] = our_mac[j]
+        j = j + 1
+    tcp_arp_buf[12] = 0x08
+    tcp_arp_buf[13] = 0x06
+    # ARP body @ offset 14.
+    tcp_arp_buf[14] = 0x00
+    tcp_arp_buf[15] = 0x01            # htype Ethernet
+    tcp_arp_buf[16] = 0x08
+    tcp_arp_buf[17] = 0x00            # ptype IPv4
+    tcp_arp_buf[18] = 6               # hlen
+    tcp_arp_buf[19] = 4               # plen
+    tcp_arp_buf[20] = 0x00
+    tcp_arp_buf[21] = 0x01            # opcode REQUEST
+    # sha = our MAC
+    k: uint64 = 0
+    while k < 6:
+        tcp_arp_buf[22 + k] = our_mac[k]
+        k = k + 1
+    # spa = our IP
+    tcp_arp_buf[28] = ip_our_ip_b(0)
+    tcp_arp_buf[29] = ip_our_ip_b(1)
+    tcp_arp_buf[30] = ip_our_ip_b(2)
+    tcp_arp_buf[31] = ip_our_ip_b(3)
+    # tha already zero (target hardware addr filled in by responder).
+    # tpa = the IP we're asking about.
+    tcp_arp_buf[38] = b0
+    tcp_arp_buf[39] = b1
+    tcp_arp_buf[40] = b2
+    tcp_arp_buf[41] = b3
+    printk1("[tcp] ARP request -> 10.0.2.%d\n", cast[uint64](b3))
+    buf_ptr: Ptr[uint8] = cast[Ptr[uint8]](&tcp_arp_buf[0])
+    return eth_tx(buf_ptr, 60)
+
+
+def _tcp_prime_arp(b0: uint8, b1: uint8, b2: uint8, b3: uint8) -> int32:
+    # If `b0.b1.b2.b3` is already in the ARP cache, we're done.
+    # Otherwise emit one ARP REQUEST and poll the RX ring for up to
+    # ~100 ms until the reply lands in the cache. Returns 0 on cache
+    # hit when we exit, -1 on timeout. Mirrors dns._dns_prime_arp.
+    target: Array[4, uint8]
+    target[0] = b0
+    target[1] = b1
+    target[2] = b2
+    target[3] = b3
+    addr_ptr: Ptr[uint8] = cast[Ptr[uint8]](&target[0])
+    if arp_lookup(addr_ptr) != cast[Ptr[uint8]](0):
+        return 0
+    _tcp_build_arp_request(b0, b1, b2, b3)
+    start: uint64 = get_jiffies()
+    deadline: uint64 = start + 10                 # 10 jiffies == 100 ms
+    while get_jiffies() < deadline:
+        virtio_net_poll()
+        if arp_lookup(addr_ptr) != cast[Ptr[uint8]](0):
+            return 0
+    return -1
+
+
+def _tcp_isn_next() -> uint32:
+    # xorshift64 step. Lazy-seed on first call using get_jiffies()
+    # mixed with a constant so a boot that never sees IRQs (mostly
+    # impossible — time_init is called early) still produces a
+    # non-zero state.
+    if tcp_isn_init == 0:
+        seed: uint64 = get_jiffies() ^ 0x9E3779B97F4A7C15
+        if seed == 0:
+            seed = 0xDEADBEEFCAFEBABE
+        tcp_isn_state = seed
+        tcp_isn_init = 1
+    x: uint64 = tcp_isn_state
+    x = x ^ (x << 13)
+    x = x ^ (x >> 7)
+    x = x ^ (x << 17)
+    tcp_isn_state = x
+    return cast[uint32](x & 0xFFFFFFFF)
+
+
+def _tcp_alloc_slot() -> int32:
+    # Find a free TCB. Returns slot index 0..7 or -1 if all slots
+    # are in use (no eviction — tcp_connect callers must close
+    # their connections to free slots).
+    i: uint64 = 0
+    while i < TCP_NUM_SLOTS:
+        if tcp_slot_state[i] == TCP_CLOSED:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _tcp_find_slot(remote_b0: uint8, remote_b1: uint8,
+                   remote_b2: uint8, remote_b3: uint8,
+                   remote_port: uint16,
+                   local_port: uint16) -> int32:
+    # Match incoming segment against the connection table by
+    # (remote_ip, remote_port, local_port). Returns slot index or
+    # -1 on miss.
+    i: uint64 = 0
+    while i < TCP_NUM_SLOTS:
+        if tcp_slot_state[i] != TCP_CLOSED:
+            if tcp_slot_remote_p[i] == remote_port:
+                if tcp_slot_local_p[i] == local_port:
+                    base: uint64 = i * 4
+                    if tcp_slot_remote_ip[base + 0] == remote_b0:
+                        if tcp_slot_remote_ip[base + 1] == remote_b1:
+                            if tcp_slot_remote_ip[base + 2] == remote_b2:
+                                if tcp_slot_remote_ip[base + 3] == remote_b3:
+                                    return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _tcp_build_and_send(slot: uint64, flags: uint8,
+                        payload: Ptr[uint8],
+                        payload_len: uint64) -> int32:
+    # Build the pseudo-header + TCP header + payload, compute the
+    # checksum, and hand the segment to ip_send. The pseudo-header
+    # is laid down at tcp_tx_buf[0..12); the segment proper starts
+    # at tcp_tx_buf[12]. ip_send only sees the segment pointer.
+    if payload_len + TCP_HDR_LEN + TCP_PSEUDO_LEN > 2048:
+        printk1("[tcp] segment too big (%d bytes payload)\n", payload_len)
+        return -1
+    if ip_have_our_ip() == 0:
+        printk0("[tcp] no local IP configured\n")
+        return -1
+
+    local_port:  uint16 = tcp_slot_local_p[slot]
+    remote_port: uint16 = tcp_slot_remote_p[slot]
+    snd_nxt:     uint32 = tcp_slot_snd_nxt[slot]
+    rcv_nxt:     uint32 = tcp_slot_rcv_nxt[slot]
+    base:        uint64 = slot * 4
+    r0: uint8 = tcp_slot_remote_ip[base + 0]
+    r1: uint8 = tcp_slot_remote_ip[base + 1]
+    r2: uint8 = tcp_slot_remote_ip[base + 2]
+    r3: uint8 = tcp_slot_remote_ip[base + 3]
+
+    # --- Pseudo-header @ tcp_tx_buf[0..12) ---
+    tcp_tx_buf[0] = ip_our_ip_b(0)
+    tcp_tx_buf[1] = ip_our_ip_b(1)
+    tcp_tx_buf[2] = ip_our_ip_b(2)
+    tcp_tx_buf[3] = ip_our_ip_b(3)
+    tcp_tx_buf[4] = r0
+    tcp_tx_buf[5] = r1
+    tcp_tx_buf[6] = r2
+    tcp_tx_buf[7] = r3
+    tcp_tx_buf[8] = 0                 # reserved zero byte
+    tcp_tx_buf[9] = IPPROTO_TCP       # 6
+    seg_len: uint16 = cast[uint16](TCP_HDR_LEN + payload_len)
+    tcp_tx_buf[10] = cast[uint8]((cast[uint32](seg_len) >> 8) & 0xFF)
+    tcp_tx_buf[11] = cast[uint8](cast[uint32](seg_len) & 0xFF)
+
+    # --- TCP header @ tcp_tx_buf[12..32) ---
+    h: uint64 = 12
+    tcp_tx_buf[h + 0] = cast[uint8]((cast[uint32](local_port) >> 8) & 0xFF)
+    tcp_tx_buf[h + 1] = cast[uint8](cast[uint32](local_port) & 0xFF)
+    tcp_tx_buf[h + 2] = cast[uint8]((cast[uint32](remote_port) >> 8) & 0xFF)
+    tcp_tx_buf[h + 3] = cast[uint8](cast[uint32](remote_port) & 0xFF)
+    tcp_tx_buf[h + 4] = cast[uint8]((snd_nxt >> 24) & 0xFF)
+    tcp_tx_buf[h + 5] = cast[uint8]((snd_nxt >> 16) & 0xFF)
+    tcp_tx_buf[h + 6] = cast[uint8]((snd_nxt >> 8) & 0xFF)
+    tcp_tx_buf[h + 7] = cast[uint8](snd_nxt & 0xFF)
+    tcp_tx_buf[h + 8] = cast[uint8]((rcv_nxt >> 24) & 0xFF)
+    tcp_tx_buf[h + 9] = cast[uint8]((rcv_nxt >> 16) & 0xFF)
+    tcp_tx_buf[h + 10] = cast[uint8]((rcv_nxt >> 8) & 0xFF)
+    tcp_tx_buf[h + 11] = cast[uint8](rcv_nxt & 0xFF)
+    tcp_tx_buf[h + 12] = 0x50           # data_off = 5 (20 bytes) << 4
+    tcp_tx_buf[h + 13] = flags
+    tcp_tx_buf[h + 14] = cast[uint8]((cast[uint32](TCP_DEFAULT_WIN) >> 8) & 0xFF)
+    tcp_tx_buf[h + 15] = cast[uint8](cast[uint32](TCP_DEFAULT_WIN) & 0xFF)
+    tcp_tx_buf[h + 16] = 0              # checksum placeholder
+    tcp_tx_buf[h + 17] = 0
+    tcp_tx_buf[h + 18] = 0              # urg_ptr
+    tcp_tx_buf[h + 19] = 0
+
+    # --- Payload @ tcp_tx_buf[32..) ---
+    if payload_len > 0:
+        i: uint64 = 0
+        while i < payload_len:
+            tcp_tx_buf[h + TCP_HDR_LEN + i] = payload[i]
+            i = i + 1
+
+    # --- Checksum: covers pseudo-header + TCP header + payload ---
+    csum_buf: Ptr[uint8] = cast[Ptr[uint8]](&tcp_tx_buf[0])
+    csum_len: uint64 = TCP_PSEUDO_LEN + TCP_HDR_LEN + payload_len
+    csum: uint16 = ip_csum16(csum_buf, csum_len)
+    tcp_tx_buf[h + 16] = cast[uint8]((cast[uint32](csum) >> 8) & 0xFF)
+    tcp_tx_buf[h + 17] = cast[uint8](cast[uint32](csum) & 0xFF)
+
+    # Hand the segment (NOT the pseudo-header) to ip_send.
+    seg_ptr: Ptr[uint8] = cast[Ptr[uint8]](&tcp_tx_buf[12])
+    seg_total: uint64 = TCP_HDR_LEN + payload_len
+    tcp_out_segs = tcp_out_segs + 1
+    if payload_len > 0:
+        tcp_out_data = tcp_out_data + payload_len
+    if (flags & TCP_RST) != 0:
+        tcp_resets_out = tcp_resets_out + 1
+    tcp_slot_last_act[slot] = get_jiffies()
+    return ip_send(r0, r1, r2, r3, IPPROTO_TCP, seg_ptr, seg_total)
+
+
+def tcp_rx(payload: Ptr[uint8], length: uint64,
+           src_b0: uint8, src_b1: uint8,
+           src_b2: uint8, src_b3: uint8):
+    # Parse the incoming TCP segment, look up the matching TCB by
+    # (remote_ip, remote_port, local_port), and run the state
+    # machine. Caller is ip_rx in ip.ad (proto=6 path).
     tcp_in_segs = tcp_in_segs + 1
-    if length < 20:
-        printk0("tcp_rx: runt\n")
+    if length < TCP_HDR_LEN:
+        printk0("[tcp] runt segment\n")
         return
-    hdr: Ptr[TcpHdr] = cast[Ptr[TcpHdr]](pkt)
-    sp: uint64 = cast[uint64](hdr[0].src)
-    dp: uint64 = cast[uint64](hdr[0].dst)
-    printk2("tcp_rx: src_port=%x dst_port=%x\n", sp, dp)
+    # Pull the on-wire fields. Multi-byte values are big-endian on
+    # the wire; we byte-swap inline so the rest of the function
+    # works in host order.
+    sp_hi: uint16 = cast[uint16](payload[0]) << 8
+    sp_lo: uint16 = cast[uint16](payload[1])
+    src_port: uint16 = sp_hi | sp_lo
+    dp_hi: uint16 = cast[uint16](payload[2]) << 8
+    dp_lo: uint16 = cast[uint16](payload[3])
+    dst_port: uint16 = dp_hi | dp_lo
+    seq32: uint32 = (cast[uint32](payload[4]) << 24) | (cast[uint32](payload[5]) << 16) \
+        | (cast[uint32](payload[6]) << 8) | cast[uint32](payload[7])
+    ack32: uint32 = (cast[uint32](payload[8]) << 24) | (cast[uint32](payload[9]) << 16) \
+        | (cast[uint32](payload[10]) << 8) | cast[uint32](payload[11])
+    data_off: uint8 = payload[12]
+    flags:    uint8 = payload[13]
+    hdr_words: uint64 = cast[uint64]((data_off >> 4) & 0x0F)
+    hdr_bytes: uint64 = hdr_words * 4
+    if hdr_bytes < TCP_HDR_LEN:
+        printk0("[tcp] bogus data_off\n")
+        return
+    if length < hdr_bytes:
+        printk0("[tcp] header truncated\n")
+        return
+
+    slot_signed: int32 = _tcp_find_slot(src_b0, src_b1, src_b2, src_b3,
+                                        src_port, dst_port)
+    if slot_signed < 0:
+        # No matching TCB. If the segment has SYN we'd LISTEN/accept;
+        # we don't do passive-open, so we just drop with a diagnostic.
+        # Sending a RST would be technically correct (RFC 793 §3.4)
+        # but generates noise during smoke tests.
+        printk2("[tcp] no TCB for src_port=%d dst_port=%d\n",
+                cast[uint64](src_port), cast[uint64](dst_port))
+        return
+    slot: uint64 = cast[uint64](slot_signed)
+    tcp_slot_last_act[slot] = get_jiffies()
+
+    # If the peer sent RST, blow the TCB away regardless of state.
+    if (flags & TCP_RST) != 0:
+        tcp_resets_in = tcp_resets_in + 1
+        printk1("[tcp] RST on slot=%d -> CLOSED\n", slot)
+        tcp_slot_state[slot] = TCP_CLOSED
+        return
+
+    payload_off: uint64 = hdr_bytes
+    seg_payload_len: uint64 = length - hdr_bytes
+    seg_payload: Ptr[uint8] = cast[Ptr[uint8]](
+        cast[uint64](payload) + payload_off)
+
+    state: uint32 = tcp_slot_state[slot]
+
+    # SYN_SENT: expect SYN+ACK acknowledging our ISN+1. On match we
+    # bump rcv_nxt past the peer's SYN, set snd_una = ack, and
+    # transition to ESTABLISHED. The caller's polling loop in
+    # tcp_connect emits the final ACK after we return.
+    if state == TCP_SYN_SENT:
+        if (flags & TCP_SYN) != 0:
+            if (flags & TCP_ACK) != 0:
+                # The peer's ACK should equal our snd_nxt (= ISN+1).
+                expected_ack: uint32 = tcp_slot_snd_nxt[slot]
+                if ack32 != expected_ack:
+                    printk2("[tcp] SYN-ACK bad ack=%x exp=%x\n",
+                            cast[uint64](ack32),
+                            cast[uint64](expected_ack))
+                    return
+                tcp_slot_snd_una[slot] = ack32
+                # rcv_nxt = peer's ISN + 1 (the SYN consumes one
+                # sequence number even though it carries no data).
+                tcp_slot_rcv_nxt[slot] = seq32 + 1
+                # Emit the third leg of the handshake: pure ACK.
+                _tcp_build_and_send(slot, TCP_ACK,
+                                    cast[Ptr[uint8]](0), 0)
+                tcp_slot_state[slot] = TCP_ESTABLISHED
+                printk1("[tcp] slot=%d -> ESTABLISHED\n", slot)
+                return
+        # Anything else in SYN_SENT is a protocol error; drop.
+        return
+
+    # ESTABLISHED: handle data + FIN. We don't track an out-of-order
+    # queue — if seq32 != rcv_nxt we just drop (SLIRP doesn't reorder).
+    if state == TCP_ESTABLISHED:
+        if seg_payload_len > 0:
+            if seq32 == tcp_slot_rcv_nxt[slot]:
+                # Copy payload into the slot's inbound buffer (truncate
+                # to TCP_RX_BUF; we don't try to reassemble across
+                # multiple segments — apt's HTTP responses fit in one
+                # segment for our smoke tests, and a real fix lands
+                # with the receive-window milestone).
+                copy_len: uint64 = seg_payload_len
+                if copy_len > TCP_RX_BUF:
+                    copy_len = TCP_RX_BUF
+                rx_base: uint64 = slot * TCP_RX_BUF
+                i: uint64 = 0
+                while i < copy_len:
+                    tcp_slot_rx_data[rx_base + i] = seg_payload[i]
+                    i = i + 1
+                tcp_slot_rx_len[slot] = copy_len
+                tcp_slot_rcv_nxt[slot] = seq32 + cast[uint32](seg_payload_len)
+                tcp_in_data = tcp_in_data + seg_payload_len
+                # Send an ACK back so the peer knows we got the data
+                # (and can release its retransmit buffer).
+                _tcp_build_and_send(slot, TCP_ACK,
+                                    cast[Ptr[uint8]](0), 0)
+                printk2("[tcp] slot=%d rx %d bytes\n",
+                        slot, seg_payload_len)
+        if (flags & TCP_FIN) != 0:
+            # Peer half-closed. Advance rcv_nxt past the FIN's
+            # phantom byte and remember we saw it so tcp_close can
+            # finish the four-way termination.
+            tcp_slot_rcv_nxt[slot] = tcp_slot_rcv_nxt[slot] + 1
+            tcp_slot_saw_fin[slot] = 1
+            printk1("[tcp] FIN on established slot=%d\n", slot)
+            # ACK the FIN. We stay ESTABLISHED-like (Linux would go
+            # CLOSE_WAIT here) until the local side calls tcp_close.
+            _tcp_build_and_send(slot, TCP_ACK,
+                                cast[Ptr[uint8]](0), 0)
+        if (flags & TCP_ACK) != 0:
+            # Update snd_una so tcp_send's in-flight check can
+            # advance. We don't queue out-of-window data — tcp_send
+            # only ever has one segment in flight.
+            if ack32 > tcp_slot_snd_una[slot]:
+                tcp_slot_snd_una[slot] = ack32
+        return
+
+    # FIN_WAIT_1: we sent FIN; expect ACK (-> FIN_WAIT_2) and/or
+    # FIN (-> TIME_WAIT). If both arrive in the same segment (common)
+    # we collapse straight through TIME_WAIT -> CLOSED.
+    if state == TCP_FIN_WAIT_1:
+        if (flags & TCP_ACK) != 0:
+            if ack32 >= tcp_slot_snd_nxt[slot]:
+                tcp_slot_snd_una[slot] = ack32
+                tcp_slot_state[slot] = TCP_FIN_WAIT_2
+                printk1("[tcp] slot=%d -> FIN_WAIT_2\n", slot)
+        if (flags & TCP_FIN) != 0:
+            # Peer's FIN. ACK it and move to TIME_WAIT (or CLOSING
+            # if we haven't seen the ACK of our FIN yet).
+            tcp_slot_rcv_nxt[slot] = seq32 + 1
+            _tcp_build_and_send(slot, TCP_ACK,
+                                cast[Ptr[uint8]](0), 0)
+            if tcp_slot_state[slot] == TCP_FIN_WAIT_2:
+                tcp_slot_state[slot] = TCP_TIME_WAIT
+                printk1("[tcp] slot=%d -> TIME_WAIT\n", slot)
+            else:
+                tcp_slot_state[slot] = TCP_CLOSING
+                printk1("[tcp] slot=%d -> CLOSING\n", slot)
+            tcp_slot_saw_fin[slot] = 1
+        return
+
+    if state == TCP_FIN_WAIT_2:
+        if (flags & TCP_FIN) != 0:
+            tcp_slot_rcv_nxt[slot] = seq32 + 1
+            _tcp_build_and_send(slot, TCP_ACK,
+                                cast[Ptr[uint8]](0), 0)
+            tcp_slot_state[slot] = TCP_TIME_WAIT
+            tcp_slot_saw_fin[slot] = 1
+            printk1("[tcp] slot=%d -> TIME_WAIT\n", slot)
+        return
+
+    if state == TCP_CLOSING:
+        if (flags & TCP_ACK) != 0:
+            if ack32 >= tcp_slot_snd_nxt[slot]:
+                tcp_slot_state[slot] = TCP_TIME_WAIT
+                printk1("[tcp] slot=%d -> TIME_WAIT\n", slot)
+        return
+
+    if state == TCP_LAST_ACK:
+        if (flags & TCP_ACK) != 0:
+            if ack32 >= tcp_slot_snd_nxt[slot]:
+                tcp_slot_state[slot] = TCP_CLOSED
+                printk1("[tcp] slot=%d -> CLOSED (last-ack)\n", slot)
+        return
+
+    # TIME_WAIT / CLOSED: ignore (or RST if it's not a stale dup).
+    return
+
+
+def tcp_connect(remote_b0: uint8, remote_b1: uint8,
+                remote_b2: uint8, remote_b3: uint8,
+                remote_port: uint16,
+                timeout_jiffies: uint64) -> int32:
+    # Active-open. Allocate a TCB, pick an ISN, send SYN, poll until
+    # the SYN-ACK arrives (or the deadline elapses), send the final
+    # ACK, transition to ESTABLISHED. Returns slot index on success,
+    # -1 on timeout / no free slot / send failure.
+    slot_signed: int32 = _tcp_alloc_slot()
+    if slot_signed < 0:
+        printk0("[tcp] no free slot for connect\n")
+        return -1
+    slot: uint64 = cast[uint64](slot_signed)
+    # On-link destinations (same /24 as our IP) need their own ARP
+    # entry before ip_send can find a destination MAC; off-link
+    # ones are routed via the gateway whose MAC was cached during
+    # M16.88's ARP probe. We use the same /24 heuristic as
+    # ip._ip_in_subnet — good enough for SLIRP and any other
+    # /24-shaped layout we encounter pre-DHCP-classful-routing.
+    if ip_have_our_ip() == 1:
+        if ip_our_ip_b(0) == remote_b0:
+            if ip_our_ip_b(1) == remote_b1:
+                if ip_our_ip_b(2) == remote_b2:
+                    if _tcp_prime_arp(remote_b0, remote_b1,
+                                      remote_b2, remote_b3) != 0:
+                        printk0("[tcp] ARP for target timed out\n")
+                        return -1
+    isn: uint32 = _tcp_isn_next()
+    local_port: uint16 = TCP_EPHEMERAL_BASE + cast[uint16](slot)
+
+    tcp_slot_state[slot] = TCP_SYN_SENT
+    tcp_slot_local_p[slot] = local_port
+    tcp_slot_remote_p[slot] = remote_port
+    base: uint64 = slot * 4
+    tcp_slot_remote_ip[base + 0] = remote_b0
+    tcp_slot_remote_ip[base + 1] = remote_b1
+    tcp_slot_remote_ip[base + 2] = remote_b2
+    tcp_slot_remote_ip[base + 3] = remote_b3
+    # snd_nxt advances past the SYN's phantom byte immediately so
+    # the expected SYN-ACK ack value is ISN+1.
+    tcp_slot_snd_nxt[slot] = isn + 1
+    tcp_slot_snd_una[slot] = isn
+    tcp_slot_rcv_nxt[slot] = 0
+    tcp_slot_rx_len[slot] = 0
+    tcp_slot_saw_fin[slot] = 0
+    # The SYN segment we transmit needs seq=ISN. We temporarily set
+    # snd_nxt back to ISN for the build, then restore +1.
+    tcp_slot_snd_nxt[slot] = isn
+    printk2("[tcp] slot=%d connect -> port=%d\n",
+            slot, cast[uint64](remote_port))
+    rc: int32 = _tcp_build_and_send(slot, TCP_SYN,
+                                    cast[Ptr[uint8]](0), 0)
+    tcp_slot_snd_nxt[slot] = isn + 1
+    if rc != 0:
+        printk0("[tcp] SYN send failed\n")
+        tcp_slot_state[slot] = TCP_CLOSED
+        return -1
+
+    # Poll until ESTABLISHED or timeout. tcp_rx flips the state.
+    start: uint64 = get_jiffies()
+    deadline: uint64 = start + timeout_jiffies
+    while get_jiffies() < deadline:
+        virtio_net_poll()
+        if tcp_slot_state[slot] == TCP_ESTABLISHED:
+            return cast[int32](slot)
+        if tcp_slot_state[slot] == TCP_CLOSED:
+            # Got a RST while waiting for SYN-ACK.
+            printk0("[tcp] connect refused\n")
+            return -1
+    printk1("[tcp] connect timeout on slot=%d\n", slot)
+    tcp_slot_state[slot] = TCP_CLOSED
+    return -1
+
+
+def tcp_send(slot_signed: int32, buf: Ptr[uint8],
+             length: uint64) -> int64:
+    # Send a single data segment from the slot's snd_nxt. Bumps
+    # snd_nxt by `length` immediately (segment counted as in-flight)
+    # and polls for the ACK up to ~1 second. Returns the number of
+    # bytes accepted by the peer (== length on success) or -1.
+    if slot_signed < 0:
+        return -1
+    slot: uint64 = cast[uint64](slot_signed)
+    if slot >= TCP_NUM_SLOTS:
+        return -1
+    if tcp_slot_state[slot] != TCP_ESTABLISHED:
+        printk1("[tcp] send on non-established slot=%d\n", slot)
+        return -1
+    if length == 0:
+        return 0
+    if length > TCP_MSS:
+        # Truncate — single-segment-at-a-time API. Caller can loop.
+        length = TCP_MSS
+    target_ack: uint32 = tcp_slot_snd_nxt[slot] + cast[uint32](length)
+    rc: int32 = _tcp_build_and_send(slot, TCP_ACK | TCP_PSH,
+                                    buf, length)
+    if rc != 0:
+        return -1
+    tcp_slot_snd_nxt[slot] = target_ack
+    # Poll for the ACK. SLIRP turns segments around in well under
+    # 10 ms; 100 jiffies (1 s) is overkill but cheap.
+    start: uint64 = get_jiffies()
+    deadline: uint64 = start + 100
+    while get_jiffies() < deadline:
+        virtio_net_poll()
+        if tcp_slot_snd_una[slot] >= target_ack:
+            return cast[int64](length)
+        if tcp_slot_state[slot] == TCP_CLOSED:
+            return -1
+    # Timed out waiting for ACK. We DON'T retransmit (per the
+    # M16.102 scope — single-shot is fine for SLIRP). Return what
+    # we sent so the caller can decide whether to consider it lost.
+    printk1("[tcp] send ACK timeout slot=%d\n", slot)
+    return cast[int64](length)
+
+
+def tcp_recv(slot_signed: int32, buf: Ptr[uint8],
+             max_len: uint64, timeout_jiffies: uint64) -> int64:
+    # Block (well, poll) until the slot's rx buffer has bytes,
+    # then copy up to max_len into `buf` and zero the rx_len so the
+    # next inbound segment can refill. Returns bytes copied, 0 on
+    # EOF (peer FIN'd with no pending data), or -1 on error.
+    if slot_signed < 0:
+        return -1
+    slot: uint64 = cast[uint64](slot_signed)
+    if slot >= TCP_NUM_SLOTS:
+        return -1
+    state: uint32 = tcp_slot_state[slot]
+    if state != TCP_ESTABLISHED:
+        if tcp_slot_rx_len[slot] == 0:
+            return -1
+    start: uint64 = get_jiffies()
+    deadline: uint64 = start + timeout_jiffies
+    while get_jiffies() < deadline:
+        virtio_net_poll()
+        if tcp_slot_rx_len[slot] > 0:
+            n: uint64 = tcp_slot_rx_len[slot]
+            if n > max_len:
+                n = max_len
+            rx_base: uint64 = slot * TCP_RX_BUF
+            i: uint64 = 0
+            while i < n:
+                buf[i] = tcp_slot_rx_data[rx_base + i]
+                i = i + 1
+            tcp_slot_rx_len[slot] = 0
+            return cast[int64](n)
+        if tcp_slot_saw_fin[slot] != 0:
+            if tcp_slot_rx_len[slot] == 0:
+                return 0
+        if tcp_slot_state[slot] == TCP_CLOSED:
+            return -1
+    return 0                              # treat timeout-with-no-data as 0
+
+
+def tcp_close(slot_signed: int32) -> int32:
+    # Active close: send FIN, wait for peer's ACK + FIN, send the
+    # final ACK, return to CLOSED. Slot becomes reusable.
+    if slot_signed < 0:
+        return -1
+    slot: uint64 = cast[uint64](slot_signed)
+    if slot >= TCP_NUM_SLOTS:
+        return -1
+    state: uint32 = tcp_slot_state[slot]
+    if state == TCP_CLOSED:
+        return 0
+    # If the peer already FIN'd us (CLOSE_WAIT-shape from the rx
+    # path), we send FIN then move LAST_ACK -> CLOSED on the next
+    # ACK. Otherwise standard FIN_WAIT_1 path.
+    saw_fin: uint8 = tcp_slot_saw_fin[slot]
+    # Emit FIN. seq = current snd_nxt; the FIN consumes one byte of
+    # sequence space, so snd_nxt bumps by 1 immediately.
+    rc: int32 = _tcp_build_and_send(slot, TCP_ACK | TCP_FIN,
+                                    cast[Ptr[uint8]](0), 0)
+    if rc != 0:
+        printk0("[tcp] FIN send failed\n")
+        # Force CLOSED locally — we can't reach the peer anyway.
+        tcp_slot_state[slot] = TCP_CLOSED
+        return -1
+    tcp_slot_snd_nxt[slot] = tcp_slot_snd_nxt[slot] + 1
+    if saw_fin != 0:
+        tcp_slot_state[slot] = TCP_LAST_ACK
+    else:
+        tcp_slot_state[slot] = TCP_FIN_WAIT_1
+    # Poll until CLOSED or TIME_WAIT (treat TIME_WAIT as CLOSED for
+    # the slot-free purpose — we don't honor the 2*MSL quiet period
+    # because SLIRP source ports collide-free for our 50000..50007
+    # range and we cycle through fewer than 8 connections per boot).
+    start: uint64 = get_jiffies()
+    deadline: uint64 = start + 100               # ~1 s
+    while get_jiffies() < deadline:
+        virtio_net_poll()
+        s: uint32 = tcp_slot_state[slot]
+        if s == TCP_CLOSED:
+            tcp_slot_state[slot] = TCP_CLOSED
+            printk1("[tcp] closed slot=%d\n", slot)
+            return 0
+        if s == TCP_TIME_WAIT:
+            tcp_slot_state[slot] = TCP_CLOSED
+            printk1("[tcp] closed slot=%d\n", slot)
+            return 0
+    # Timed out. Force CLOSED so the slot is reusable — the peer's
+    # FIN may arrive later and will get dropped by _tcp_find_slot.
+    printk1("[tcp] close timeout on slot=%d (forcing CLOSED)\n", slot)
+    tcp_slot_state[slot] = TCP_CLOSED
+    return 0
 
 
 def tcp_init():
-    tcp_in_segs  = 0
-    tcp_out_segs = 0
-    printk0("tcp: scaffold initialized\n")
+    tcp_in_segs    = 0
+    tcp_out_segs   = 0
+    tcp_in_data    = 0
+    tcp_out_data   = 0
+    tcp_resets_in  = 0
+    tcp_resets_out = 0
+    tcp_isn_init   = 0
+    tcp_isn_state  = 0
+    i: uint64 = 0
+    while i < TCP_NUM_SLOTS:
+        tcp_slot_state[i] = TCP_CLOSED
+        tcp_slot_local_p[i] = 0
+        tcp_slot_remote_p[i] = 0
+        tcp_slot_snd_nxt[i] = 0
+        tcp_slot_snd_una[i] = 0
+        tcp_slot_rcv_nxt[i] = 0
+        tcp_slot_last_act[i] = 0
+        tcp_slot_rx_len[i] = 0
+        tcp_slot_saw_fin[i] = 0
+        i = i + 1
+    j: uint64 = 0
+    while j < 32:
+        tcp_slot_remote_ip[j] = 0
+        j = j + 1
+    printk0("tcp: initialized (8-slot client TCB table)\n")

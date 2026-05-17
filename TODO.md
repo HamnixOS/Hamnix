@@ -210,9 +210,39 @@ it has to honour.
     or `arp.ad` (today `_dns_prime_arp` duplicates the
     `virtio_net_send_arp_probe` shape locally). When a second
     consumer needs unicast ARP, factor this out.
-- TCP three-way handshake — SYN/SYN-ACK/ACK and a minimal receive
-  window. End-state requirement for `apt` over HTTP. Builds on the
-  IP layer that M16.96/97 brought online.
+- ~~TCP three-way handshake — shipped in M16.102. Minimal active-open
+  client in `drivers/net/tcp.ad` with `tcp_connect` / `tcp_send` /
+  `tcp_recv` / `tcp_close` and an 8-entry static TCB table. SLIRP
+  `guestfwd` echo end-to-end via `[tcp] connected slot=0` →
+  `[tcp] sent 3 bytes` → `[tcp] received 3 bytes: 'hi\n'` →
+  `[tcp] closed slot=0`. See `scripts/test_net_tcp.sh`.~~
+- TCP follow-ups:
+  - Retransmission timer — today the single-shot send returns
+    success even if the peer never ACKs (we run on SLIRP which
+    doesn't drop packets, so retransmission only matters off the
+    virtual wire). Add an RTO based on a running RTT estimate plus
+    exponential backoff per RFC 6298.
+  - Congestion control — initial cwnd of one segment is fine for
+    SLIRP; for the real internet we need at least the slow-start /
+    congestion-avoidance pair from RFC 5681 and probably NewReno
+    fast retransmit.
+  - Passive open (LISTEN + SYN_RCVD) — required before sshd can
+    accept inbound connections. Single global LISTEN slot is enough
+    to bring up an in-kernel telnet/SSH server prototype.
+  - Window scaling + SACK + timestamps — the standard performance
+    options. Not blockers for `apt` (HTTP/1.1 over short
+    single-segment requests), but real-world latency suffers without.
+  - Multi-segment reassembly — `tcp_rx` today drops out-of-order
+    segments and overwrites the per-slot single-segment rx buffer
+    on each delivery; HTTP responses bigger than the receive window
+    will lose data. Track gaps explicitly and reorder before
+    handing up.
+  - HTTP/1.1 client — the consumer that justifies TCP. Minimum:
+    GET / Host / Connection: close request builder + response parser
+    that strips the status line and headers and returns a
+    Content-Length-bounded body. Builds on `tcp_connect`.
+  - Socket(2) API — Plan 9 `/net/tcp/clone` shape lands in Phase F.
+    Today TCP is callable only from in-kernel code paths.
 
 ## Userspace / U-track
 
