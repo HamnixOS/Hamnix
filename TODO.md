@@ -56,6 +56,27 @@ are fair game for any contributor — human or AI agent.
   useful diagnostics out of `errstr(2)`. Cheap, mechanical, but
   hundreds of sites; defer until Phase C lands `rfork` so the
   audience for the messages actually exists.
+- **Next /dev/\* device files** — M16.94 landed `/dev/cons` (read =
+  kbd/UART FIFO pop; write = `early_putc()` fan-out) under
+  `sys/src/9/port/devcons.ad` with `FD_CONS_MARK` plumbing in
+  `fs/vfs.ad`. Follow-ups, all modelled on the same shape (one
+  cdev file per /dev path, stateless `FD_*_MARK` dispatch in
+  vfs_read/vfs_write, no per-fd kmalloc):
+  - `/dev/time` (r) — `read()` returns ASCII decimal "nanoseconds
+    since boot\n". Replaces `SYS_GET_JIFFIES` (2) per the migration
+    table in `docs/native-api.md`. Read body sits next to devcons
+    as `sys/src/9/port/devtime.ad`.
+  - `/dev/pid` (r) — `read()` returns ASCII decimal "calling-task
+    pid\n". Convenience surface alongside the kept `SYS_GETPID`
+    (4); shipping it unblocks userland code that wants to read
+    the pid from a file without crossing a syscall boundary.
+  - `/dev/random` (r) — CSPRNG byte source. Need a real entropy
+    pool first (today the kernel has no RNG); start with a tiny
+    chacha20-style stream seeded from the TSC at boot. Lower
+    priority than the two above because correctness matters here.
+  - Migrate `SYS_PUTC` callers to `write("/dev/cons")` after
+    `/dev/time` lands so the fan-out path has two clients and the
+    migration row in `docs/native-api.md` can be ticked off.
 
 ## Kernel / L-track
 
