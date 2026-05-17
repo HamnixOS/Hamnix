@@ -56,6 +56,28 @@ are fair game for any contributor — human or AI agent.
 - Per-task heap state — `linux_brk` is a single global today;
   multi-process Linux binaries will collide.
 
+## Storage
+
+- ~~Native AHCI driver — shipped in M16.89. PCI class probe, ABAR
+  map, port scan, polled IDENTIFY + READ DMA EXT of LBA 0 (MBR
+  signature check). Unlocks SATA disks on consumer hardware.~~
+- AHCI write path (WRITE DMA EXT, 0x35). Symmetrical to the M16.89
+  read path; needs port stop/start churn audited under repeat I/O.
+- AHCI native command queueing (NCQ) — multiple in-flight commands
+  per port via READ FPDMA QUEUED / WRITE FPDMA QUEUED (0x60 / 0x61),
+  driven by SACT + per-slot completion. Today every command
+  serialises on slot 0.
+- AHCI partition-table read (parse MBR + GPT). With M16.89 we
+  fetched the MBR bytes but didn't decode them; partition entries
+  at MBR offsets 446..510 + GPT header at LBA 1 is the next step
+  before mounting a real-hardware ext4.
+- AHCI hot-plug / COMRESET / port reset retry — real ThinkPads
+  flap SATA on resume; the driver needs to re-init a port that
+  drops link.
+- NVMe driver — sibling effort to AHCI for the modern install base.
+  PCI class=0x01, subclass=0x08, prog_if=0x02; admin queue + I/O
+  submission queue + completion queue dance.
+
 ## Toolchain & install
 
 - Real-hardware boot (ThinkPad). FAT32 read + EXT4 r/w done;

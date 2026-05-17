@@ -196,6 +196,7 @@ GUI app are explicitly **out of scope**. Snapshot:
 | M16.86 | 5 more coreutils: `/bin/base64`, `/bin/md5sum`, `/bin/env_show`, `/bin/watch`, `/bin/whatis` | **Done** |
 | M16.87 | 9 more userland: `/bin/top`, `/bin/ifconfig`, `/bin/route`, `/bin/lsmod`, `/bin/dmesg`, `/bin/su`, `/bin/passwd`, `/bin/login`, `/bin/getty` (mostly stubs; top + getty functional) | **Done** |
 | M16.88 | Bare-metal virtio-net PCI driver (`drivers/net/virtio_net.ad`) — legacy IO-BAR probe, F_MAC negotiation, RX/TX virtqueue setup, 8 pre-populated 1526-byte RX buffers, MAC read from device config space, in-kernel ARP probe → SLIRP gateway round-trip; `eth_rx()` gets real frames. Polled (no IOAPIC yet); IRQ wiring + DHCP/ICMP follow-ups deferred | **Done** |
+| M16.89 | Native AHCI driver (`drivers/ata/ahci.ad`) — PCI class-match (0x01/0x06/0x01), ABAR (BAR5) map, GHC.AE enable, PI/SSTS port scan, per-port 4 KiB DMA page (1 KiB command list + 256 B FIS + 256 B command table), single-slot polled commands; issues IDENTIFY DEVICE (decodes model string + LBA48 capacity) and READ DMA EXT of LBA 0 (MBR signature check). Unlocks SATA on real consumer hardware (~2008+) | **Done** |
 
 ## L-series: Linux ABI compatibility
 

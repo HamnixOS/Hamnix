@@ -1,0 +1,547 @@
+# drivers/ata/ahci.ad
+#
+# Bare-metal AHCI (Advanced Host Controller Interface) driver. Mirror of
+# drivers/ata/ahci.c at minimum useful scope:
+#
+#   1. Walk the PCI bus for class=0x01, subclass=0x06, prog_if=0x01.
+#   2. Map ABAR (BAR5) — a memory-mapped HBA register window.
+#   3. Set GHC.AE (AHCI Enable) so the HBA exposes AHCI semantics.
+#   4. For every port advertised in PI (Ports Implemented) check SSTS;
+#      det==3 && ipm==1 means an active SATA drive is plugged into
+#      that port at a live PHY layer.
+#   5. Allocate one 4 KiB page per active port and carve out:
+#         0x000..0x3FF  command list (32 entries × 32 bytes)
+#         0x400..0x4FF  received-FIS area (256 bytes)
+#         0x500..0x57F  command table (CFIS + PRDT entry)
+#      The page is 4 KiB aligned, which satisfies all three AHCI
+#      alignment requirements (1024 / 256 / 128 bytes).
+#   6. Wire CLB/CLBU + FB/FBU registers, set FRE then ST in CMD —
+#      port is now running.
+#   7. Issue IDENTIFY DEVICE (ATA 0xEC) into a 512-byte kmalloc'd
+#      buffer via slot 0. Poll CI bit clear. Parse out the model
+#      string and total LBA count and log them.
+#   8. Issue READ DMA EXT (ATA 0x25) of LBA 0 into a second 512-byte
+#      buffer. Poll completion. Log the first 16 bytes as hex and
+#      check the MBR boot signature (0xAA55 at bytes 510..511).
+#
+# Why polled, not IRQ-driven? Same reason virtio-net is polled — the
+# kernel brings up the LAPIC for the timer tick but does NOT yet
+# program the IOAPIC, so PCI INTx lines have nowhere to land. MSI
+# would also work but adds complexity ruled out of this milestone.
+# We poll the CI (Command Issue) register for the bit corresponding
+# to our slot to clear.
+#
+# Why a single slot? The spec allows 1..32 in-flight commands per
+# port via NCQ. The smoke test only needs to round-trip two
+# commands; one slot serialised is sufficient. NCQ comes later.
+#
+# AHCI spec (Intel rev 1.3.1) is the canonical reference — see
+# section 3.1 (HBA Memory Registers) and 4.2 (Command List structure).
+
+from kernel.printk.printk import printk0, printk1, printk2
+from drivers.pci.pci import (
+    pci_config_read_dword, pci_config_write_dword,
+    pci_bdf_bus, pci_bdf_dev, pci_bdf_fn, pci_pack_bdf,
+    pci_read_bar, PCI_BDF_NONE,
+    PCI_COMMAND_OFFSET, PCI_COMMAND_MEM, PCI_COMMAND_MASTER,
+)
+from mm.page_alloc import alloc_pages
+from mm.slab import kmalloc
+
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
+
+# --- PCI matching --------------------------------------------------
+#
+# AHCI controllers carry the standard mass-storage / SATA / AHCI class
+# triplet regardless of vendor. We match on class rather than
+# vendor:device so the driver works against QEMU's ich9-ahci
+# (8086:2922), real ICH/PCH SATA, AMD FCH, Marvell, etc.
+AHCI_CLASS:    uint32 = 0x01
+AHCI_SUBCLASS: uint32 = 0x06
+AHCI_PROGIF:   uint32 = 0x01
+
+# Generic Host Control register offsets (relative to ABAR).
+HBA_CAP:   uint64 = 0x00
+HBA_GHC:   uint64 = 0x04
+HBA_IS:    uint64 = 0x08
+HBA_PI:    uint64 = 0x0C
+HBA_VS:    uint64 = 0x10
+
+GHC_AE:    uint32 = 0x80000000        # bit 31 — AHCI Enable
+GHC_HR:    uint32 = 0x00000001        # bit  0 — HBA Reset
+
+# Per-port register block starts at ABAR + 0x100 and is 0x80 bytes wide.
+HBA_PORTS_BASE: uint64 = 0x100
+HBA_PORT_STRIDE: uint64 = 0x80
+
+# Port register offsets within a port's 0x80-byte block.
+PORT_CLB:   uint64 = 0x00
+PORT_CLBU:  uint64 = 0x04
+PORT_FB:    uint64 = 0x08
+PORT_FBU:   uint64 = 0x0C
+PORT_IS:    uint64 = 0x10
+PORT_IE:    uint64 = 0x14
+PORT_CMD:   uint64 = 0x18
+PORT_TFD:   uint64 = 0x20
+PORT_SIG:   uint64 = 0x24
+PORT_SSTS:  uint64 = 0x28
+PORT_SCTL:  uint64 = 0x2C
+PORT_SERR:  uint64 = 0x30
+PORT_SACT:  uint64 = 0x34
+PORT_CI:    uint64 = 0x38
+
+# CMD register bits.
+PORT_CMD_ST:   uint32 = 0x0001        # bit  0 — Start
+PORT_CMD_FRE:  uint32 = 0x0010        # bit  4 — FIS Receive Enable
+PORT_CMD_FR:   uint32 = 0x4000        # bit 14 — FIS Receive Running
+PORT_CMD_CR:   uint32 = 0x8000        # bit 15 — Command List Running
+
+# Task-File Data status bits.
+PORT_TFD_BSY: uint32 = 0x80
+PORT_TFD_DRQ: uint32 = 0x08
+PORT_TFD_ERR: uint32 = 0x01
+
+# Per-page layout we carve out per port (4 KiB page).
+CL_OFFSET:   uint64 = 0x000     # command list   (1024 bytes)
+FIS_OFFSET:  uint64 = 0x400     # received FIS   (256 bytes)
+CT_OFFSET:   uint64 = 0x500     # command table  (256 bytes — plenty)
+
+# Command table layout (relative to CT_OFFSET).
+CT_CFIS_OFF:  uint64 = 0x00
+CT_PRDT_OFF:  uint64 = 0x80     # PRDT entries start 128 bytes in
+
+# ATA commands we issue.
+ATA_CMD_IDENTIFY:    uint8 = 0xEC
+ATA_CMD_READ_DMA_EXT: uint8 = 0x25
+
+# H2D Register FIS type byte (FIS_TYPE_REG_H2D).
+FIS_TYPE_REG_H2D: uint8 = 0x27
+
+# SATA signature constants we recognise. ATA disks report 0x00000101.
+PORT_SIG_ATA: uint32 = 0x00000101
+
+
+# --- MMIO helpers --------------------------------------------------
+
+def _mmio_r32(addr: uint64) -> uint32:
+    return cast[Ptr[uint32]](addr)[0]
+
+
+def _mmio_w32(addr: uint64, value: uint32):
+    cast[Ptr[uint32]](addr)[0] = value
+
+
+# --- Class-based PCI scan (no helper in drivers/pci/pci.ad) --------
+#
+# Returns a packed BDF for the first device whose class triple matches
+# (class_code, subclass, prog_if), or PCI_BDF_NONE. We scan bus 0
+# function 0 only — same scope as drivers/pci/pci.ad's pci_find().
+# QEMU's i440FX/q35 puts the AHCI controller on bus 0 directly.
+
+def _pci_find_class(class_code: uint32, subclass: uint32,
+                    prog_if: uint32) -> uint32:
+    bus: uint32 = 0
+    dev: uint32 = 0
+    while dev < 32:
+        ident: uint32 = pci_config_read_dword(bus, dev, 0, 0x00)
+        v: uint32 = ident & 0xFFFF
+        if v != 0xFFFF:
+            cls: uint32 = pci_config_read_dword(bus, dev, 0, 0x08)
+            # cls layout: [class_code:24..31 | subclass:16..23
+            #              | prog_if:8..15 | revision:0..7]
+            this_class:    uint32 = (cls >> 24) & 0xFF
+            this_subclass: uint32 = (cls >> 16) & 0xFF
+            this_progif:   uint32 = (cls >>  8) & 0xFF
+            if this_class == class_code \
+               and this_subclass == subclass \
+               and this_progif == prog_if:
+                return pci_pack_bdf(bus, dev, 0)
+        dev = dev + 1
+    return PCI_BDF_NONE
+
+
+def _pci_enable_mem_and_master(bdf: uint32):
+    # AHCI lives behind a MEM BAR (BAR5), not an IO BAR. We need
+    # MEM Space Enable + Bus Master flipped on; IO Space Enable
+    # doesn't matter for this device. pci.ad's helper enables IO
+    # which is harmless but not what we want, so we open-code the
+    # MEM+master pair here.
+    bus: uint32 = pci_bdf_bus(bdf)
+    dev: uint32 = pci_bdf_dev(bdf)
+    fn:  uint32 = pci_bdf_fn(bdf)
+    cmd: uint32 = pci_config_read_dword(bus, dev, fn,
+                                        PCI_COMMAND_OFFSET) & 0xFFFF
+    cmd = cmd | PCI_COMMAND_MEM | PCI_COMMAND_MASTER
+    upper: uint32 = pci_config_read_dword(bus, dev, fn,
+                                          PCI_COMMAND_OFFSET) & 0xFFFF0000
+    pci_config_write_dword(bus, dev, fn, PCI_COMMAND_OFFSET,
+                           upper | cmd)
+
+
+# --- Driver state --------------------------------------------------
+
+class AhciState:
+    abar:      uint64          # MMIO base of HBA register window
+    port_num:  int32           # The active port we picked (or -1)
+    port_base: uint64          # ABAR + 0x100 + 0x80*port_num
+    page:      uint64          # 4 KiB working page per port
+    # 16 bytes of model string + NUL — enough to fingerprint the disk.
+    model:     Array[41, uint8]
+
+
+ahci: AhciState
+
+
+# --- Port stop/start (spec §10.1.2) --------------------------------
+
+def _port_stop(port_base: uint64):
+    # Clear ST and FRE; wait for CR and FR to clear. Required before
+    # we touch CLB/FB. AHCI doesn't make this fast — the HBA may be
+    # mid-command — so we busy-wait up to 1 M iterations.
+    cmd: uint32 = _mmio_r32(port_base + PORT_CMD)
+    cmd = cmd & ~PORT_CMD_ST
+    _mmio_w32(port_base + PORT_CMD, cmd)
+    spin: uint64 = 0
+    while spin < 1000000:
+        if (_mmio_r32(port_base + PORT_CMD) & PORT_CMD_CR) == 0:
+            spin = 1000001
+        else:
+            spin = spin + 1
+
+    cmd = _mmio_r32(port_base + PORT_CMD)
+    cmd = cmd & ~PORT_CMD_FRE
+    _mmio_w32(port_base + PORT_CMD, cmd)
+    spin = 0
+    while spin < 1000000:
+        if (_mmio_r32(port_base + PORT_CMD) & PORT_CMD_FR) == 0:
+            spin = 1000001
+        else:
+            spin = spin + 1
+
+
+def _port_start(port_base: uint64):
+    # FRE before ST — spec mandates that ordering. After ST the HBA
+    # walks the command list whenever CI bits become set.
+    cmd: uint32 = _mmio_r32(port_base + PORT_CMD)
+    cmd = cmd | PORT_CMD_FRE
+    _mmio_w32(port_base + PORT_CMD, cmd)
+    cmd = cmd | PORT_CMD_ST
+    _mmio_w32(port_base + PORT_CMD, cmd)
+
+
+# --- Command list / FIS / CT plumbing ------------------------------
+
+def _build_h2d_fis(cfis: uint64, command: uint8, lba: uint64,
+                   count: uint16, dev: uint8):
+    # H2D Register FIS — 20 bytes (5 DWORDs).
+    p: Ptr[uint8] = cast[Ptr[uint8]](cfis)
+    # Zero the 64-byte CFIS area first (slot reused across commands).
+    memset(p, 0, 64)
+    p[0]  = FIS_TYPE_REG_H2D
+    p[1]  = 0x80                  # bit 7 = C (command); PMP = 0
+    p[2]  = command               # ATA command byte
+    p[3]  = 0                     # features (lo)
+    p[4]  = cast[uint8]( lba        & 0xFF)
+    p[5]  = cast[uint8]((lba >>  8) & 0xFF)
+    p[6]  = cast[uint8]((lba >> 16) & 0xFF)
+    p[7]  = dev                   # device register (LBA mode if 0x40)
+    p[8]  = cast[uint8]((lba >> 24) & 0xFF)
+    p[9]  = cast[uint8]((lba >> 32) & 0xFF)
+    p[10] = cast[uint8]((lba >> 40) & 0xFF)
+    p[11] = 0                     # features (hi)
+    p[12] = cast[uint8]( count        & 0xFF)
+    p[13] = cast[uint8]((count >> 8) & 0xFF)
+    p[14] = 0                     # ICC
+    p[15] = 0                     # Control
+    # bytes 16..19 left zero.
+
+
+def _build_cmd_header(clist: uint64, ctba: uint64, cfl_dwords: uint32,
+                      write: uint32, prdtl: uint32):
+    # Slot 0 of the command list. Header is 32 bytes.
+    h: Ptr[uint32] = cast[Ptr[uint32]](clist)
+    # DW0: CFL[0..4] | A | W | P | R | B | C | reserved | PMP[12..15]
+    #      | PRDTL[16..31]
+    dw0: uint32 = (cfl_dwords & 0x1F) | ((write & 1) << 6) \
+                  | ((prdtl & 0xFFFF) << 16)
+    h[0] = dw0
+    h[1] = 0                       # PRDBC (HBA writes this)
+    h[2] = cast[uint32](ctba & 0xFFFFFFFF)
+    h[3] = cast[uint32](ctba >> 32)
+    h[4] = 0
+    h[5] = 0
+    h[6] = 0
+    h[7] = 0
+
+
+def _build_prdt(ct_base: uint64, dba: uint64, bytecount: uint32):
+    # Single PRD entry at CT + 0x80. 16 bytes. dbc encodes (count-1)
+    # in bits 0..21; bit 31 is IOC (interrupt on completion — fine
+    # to leave 0 since we poll).
+    p: Ptr[uint32] = cast[Ptr[uint32]](ct_base + CT_PRDT_OFF)
+    p[0] = cast[uint32](dba & 0xFFFFFFFF)
+    p[1] = cast[uint32](dba >> 32)
+    p[2] = 0
+    p[3] = (bytecount - 1) & 0x3FFFFF       # bits 0..21
+
+
+def _wait_ci_clear(port_base: uint64, slot_mask: uint32) -> int32:
+    # Poll the CI register until our slot's bit clears. Bail out
+    # with -1 on excessive busy-spin so a wedged HBA doesn't hang
+    # the whole kernel — 10 M iterations is several seconds on QEMU
+    # TCG, plenty for any single sector transfer.
+    spin: uint64 = 0
+    while spin < 10000000:
+        ci: uint32 = _mmio_r32(port_base + PORT_CI)
+        if (ci & slot_mask) == 0:
+            tfd: uint32 = _mmio_r32(port_base + PORT_TFD)
+            if (tfd & PORT_TFD_ERR) != 0:
+                printk1("[ahci] command failed (tfd=%x)\n",
+                        cast[uint64](tfd))
+                return -1
+            return 0
+        spin = spin + 1
+    printk0("[ahci] command timeout (CI bit stuck)\n")
+    return -1
+
+
+def _wait_tfd_idle(port_base: uint64) -> int32:
+    # Wait for BSY+DRQ to clear before issuing a command. AHCI may
+    # have the task file busy from probe/COMRESET; we bail after
+    # ~1 M spins to avoid hanging if a port is wedged.
+    spin: uint64 = 0
+    while spin < 1000000:
+        tfd: uint32 = _mmio_r32(port_base + PORT_TFD)
+        if (tfd & (PORT_TFD_BSY | PORT_TFD_DRQ)) == 0:
+            return 0
+        spin = spin + 1
+    return -1
+
+
+# --- IDENTIFY DEVICE ----------------------------------------------
+
+def _byteswap_model(raw: Ptr[uint8], out: Ptr[uint8]):
+    # ATA IDENTIFY returns the model string at words 27..46 (40
+    # bytes total) — but each word is byte-swapped because ATA
+    # stores strings in big-endian-within-word order. Swap each
+    # pair before copying so the printk renders readable ASCII.
+    # We then truncate trailing spaces (the spec pads model with
+    # 0x20).
+    i: uint64 = 0
+    while i < 40:
+        out[i] = raw[i ^ 1]
+        i = i + 1
+    out[40] = 0
+    # Strip trailing spaces.
+    j: int32 = 39
+    while j >= 0:
+        if out[j] != 0x20:
+            j = -1
+        else:
+            out[j] = 0
+            j = j - 1
+
+
+def _do_identify(port_base: uint64, clist: uint64, ct_base: uint64,
+                 buf: uint64) -> int32:
+    # Build CFIS for IDENTIFY DEVICE: no LBA, count=0, dev=0.
+    _build_h2d_fis(ct_base + CT_CFIS_OFF, ATA_CMD_IDENTIFY,
+                   0, 0, 0)
+    # Header: CFL = 5 DWORDs, write=0 (device → host), PRDTL = 1.
+    _build_cmd_header(clist, ct_base, 5, 0, 1)
+    # PRDT: 512 bytes into `buf`.
+    _build_prdt(ct_base, buf, 512)
+
+    if _wait_tfd_idle(port_base) != 0:
+        printk0("[ahci] port busy before IDENTIFY\n")
+        return -1
+    # Clear stale IS and SERR before issuing.
+    _mmio_w32(port_base + PORT_IS, 0xFFFFFFFF)
+    _mmio_w32(port_base + PORT_SERR, 0xFFFFFFFF)
+    # Issue slot 0.
+    _mmio_w32(port_base + PORT_CI, 0x1)
+    return _wait_ci_clear(port_base, 0x1)
+
+
+# --- READ DMA EXT --------------------------------------------------
+
+def _do_read_lba(port_base: uint64, clist: uint64, ct_base: uint64,
+                 buf: uint64, lba: uint64, count: uint16) -> int32:
+    # READ DMA EXT (LBA48). Device register bit 6 = LBA mode.
+    _build_h2d_fis(ct_base + CT_CFIS_OFF, ATA_CMD_READ_DMA_EXT,
+                   lba, count, 0x40)
+    _build_cmd_header(clist, ct_base, 5, 0,
+                      1)        # CFL=5, write=0, PRDTL=1
+    _build_prdt(ct_base, buf, cast[uint32](count) * 512)
+
+    if _wait_tfd_idle(port_base) != 0:
+        printk0("[ahci] port busy before READ_DMA_EXT\n")
+        return -1
+    _mmio_w32(port_base + PORT_IS, 0xFFFFFFFF)
+    _mmio_w32(port_base + PORT_SERR, 0xFFFFFFFF)
+    _mmio_w32(port_base + PORT_CI, 0x1)
+    return _wait_ci_clear(port_base, 0x1)
+
+
+# --- Public entry point --------------------------------------------
+
+def ahci_smoke_test() -> int32:
+    # Probe, init, IDENTIFY, READ LBA 0. Returns 0 on success, -1 on
+    # any failure (no controller, no active port, command failure).
+    # Caller treats failure as "no AHCI present" — the kernel keeps
+    # booting either way.
+    bdf: uint32 = _pci_find_class(AHCI_CLASS, AHCI_SUBCLASS,
+                                  AHCI_PROGIF)
+    if bdf == PCI_BDF_NONE:
+        printk0("[ahci] no controller found\n")
+        return -1
+    printk1("[ahci] controller found bdf=%x\n", cast[uint64](bdf))
+
+    _pci_enable_mem_and_master(bdf)
+
+    bar5_raw: uint32 = pci_read_bar(bdf, 5)
+    # MEM BAR: low bit = 0, bits 1..3 = type, bits 4..31 = base.
+    if (bar5_raw & 1) != 0:
+        printk0("[ahci] BAR5 is IO (not AHCI?)\n")
+        return -1
+    abar: uint64 = cast[uint64](bar5_raw & 0xFFFFFFF0)
+    ahci.abar = abar
+    printk1("[ahci] abar=%p\n", abar)
+
+    # Enable AHCI mode. Some firmware leaves the HBA in legacy IDE
+    # emulation; flipping GHC.AE forces AHCI semantics. We don't
+    # bother with a full HBA reset (GHC.HR) — QEMU's HBA comes up
+    # clean already.
+    ghc: uint32 = _mmio_r32(abar + HBA_GHC)
+    _mmio_w32(abar + HBA_GHC, ghc | GHC_AE)
+
+    cap: uint32 = _mmio_r32(abar + HBA_CAP)
+    pi:  uint32 = _mmio_r32(abar + HBA_PI)
+    vs:  uint32 = _mmio_r32(abar + HBA_VS)
+    printk2("[ahci] cap=%x vs=%x\n", cast[uint64](cap),
+            cast[uint64](vs))
+    printk1("[ahci] ports implemented = %x\n", cast[uint64](pi))
+
+    # Walk port bits. The first port with an active link wins —
+    # we only drive one disk for the smoke test.
+    port_num: int32 = -1
+    i: uint32 = 0
+    while i < 32:
+        if (pi & (cast[uint32](1) << i)) != 0:
+            pb: uint64 = abar + HBA_PORTS_BASE \
+                       + cast[uint64](i) * HBA_PORT_STRIDE
+            ssts: uint32 = _mmio_r32(pb + PORT_SSTS)
+            det: uint32 = ssts & 0xF
+            ipm: uint32 = (ssts >> 8) & 0xF
+            if det == 3 and ipm == 1:
+                printk1("[ahci] port %d link active\n",
+                        cast[uint64](i))
+                if port_num < 0:
+                    port_num = cast[int32](i)
+        i = i + 1
+
+    if port_num < 0:
+        printk0("[ahci] no active port found\n")
+        return -1
+    ahci.port_num = port_num
+
+    port_base: uint64 = abar + HBA_PORTS_BASE \
+                      + cast[uint64](port_num) * HBA_PORT_STRIDE
+    ahci.port_base = port_base
+
+    # Stop the port before re-pointing CLB/FB at our memory. AHCI
+    # spec §10.1.2 mandates this even on a fresh HBA — the BIOS
+    # may have left ST set.
+    _port_stop(port_base)
+
+    # Allocate a 4 KiB page (order 0) for cmd list + FIS + cmd
+    # table. alloc_pages returns a page-aligned physical address;
+    # since the kernel identity-maps low 4 GiB, the same value is
+    # a valid virtual pointer.
+    page: uint64 = alloc_pages(0)
+    if page == 0:
+        printk0("[ahci] alloc_pages(0) failed\n")
+        return -1
+    memset(cast[Ptr[uint8]](page), 0, 4096)
+    ahci.page = page
+
+    clist:   uint64 = page + CL_OFFSET
+    fis:     uint64 = page + FIS_OFFSET
+    ct_base: uint64 = page + CT_OFFSET
+
+    # Plant the bases. We hold all DMA structures below 4 GiB so
+    # high halves are always zero — but write them explicitly to
+    # avoid relying on a fresh-from-BIOS state.
+    _mmio_w32(port_base + PORT_CLB,  cast[uint32](clist & 0xFFFFFFFF))
+    _mmio_w32(port_base + PORT_CLBU, cast[uint32](clist >> 32))
+    _mmio_w32(port_base + PORT_FB,   cast[uint32](fis   & 0xFFFFFFFF))
+    _mmio_w32(port_base + PORT_FBU,  cast[uint32](fis   >> 32))
+    # Clear any pending error / interrupt state from probe.
+    _mmio_w32(port_base + PORT_SERR, 0xFFFFFFFF)
+    _mmio_w32(port_base + PORT_IS,   0xFFFFFFFF)
+
+    _port_start(port_base)
+
+    sig: uint32 = _mmio_r32(port_base + PORT_SIG)
+    printk1("[ahci] port signature = %x\n", cast[uint64](sig))
+    if sig != PORT_SIG_ATA:
+        printk0("[ahci] port is not an ATA disk; skipping I/O\n")
+        return -1
+
+    # IDENTIFY DEVICE → 512 bytes of disk metadata into id_buf.
+    id_buf: uint64 = kmalloc(512)
+    if id_buf == 0:
+        printk0("[ahci] kmalloc(512) for IDENTIFY failed\n")
+        return -1
+    memset(cast[Ptr[uint8]](id_buf), 0, 512)
+    if _do_identify(port_base, clist, ct_base, id_buf) != 0:
+        printk0("[ahci] IDENTIFY failed\n")
+        return -1
+
+    # Parse model (words 27..46, 40 bytes byte-swapped) and LBA count
+    # (words 100..103, 64-bit LE little-endian). LBA48 capacity is
+    # in 512-byte sectors.
+    raw_model: Ptr[uint8] = cast[Ptr[uint8]](id_buf + 27 * 2)
+    _byteswap_model(raw_model, &ahci.model[0])
+    printk1("[ahci] model=%s\n", cast[uint64](&ahci.model[0]))
+
+    lba_count: uint64 = cast[Ptr[uint64]](id_buf + 100 * 2)[0]
+    printk1("[ahci] sectors=%d\n", lba_count)
+
+    # READ LBA 0 (the MBR). 512 bytes into mbr_buf.
+    mbr_buf: uint64 = kmalloc(512)
+    if mbr_buf == 0:
+        printk0("[ahci] kmalloc(512) for MBR failed\n")
+        return -1
+    memset(cast[Ptr[uint8]](mbr_buf), 0, 512)
+    if _do_read_lba(port_base, clist, ct_base, mbr_buf, 0, 1) != 0:
+        printk0("[ahci] READ_DMA_EXT failed\n")
+        return -1
+
+    # Log first 16 bytes as hex for human eyeballing — one byte per
+    # printk1, two hex digits each. The format helper has no width
+    # modifier, so we render high + low nibble manually.
+    printk0("[ahci] LBA0[0..16]=")
+    k: uint64 = 0
+    while k < 16:
+        b: uint64 = cast[uint64](cast[Ptr[uint8]](mbr_buf + k)[0])
+        hi: uint64 = (b >> 4) & 0xF
+        lo: uint64 = b & 0xF
+        printk1("%x", hi)
+        printk1("%x", lo)
+        if k < 15:
+            printk0(" ")
+        k = k + 1
+    printk0("\n")
+
+    # MBR signature check — bytes 510/511 must be 0x55 0xAA.
+    sig_lo: uint8 = cast[Ptr[uint8]](mbr_buf + 510)[0]
+    sig_hi: uint8 = cast[Ptr[uint8]](mbr_buf + 511)[0]
+    if sig_lo == 0x55 and sig_hi == 0xAA:
+        printk0("[ahci] MBR signature OK\n")
+    else:
+        printk2("[ahci] MBR signature MISMATCH (got %x %x)\n",
+                cast[uint64](sig_lo), cast[uint64](sig_hi))
+
+    return 0
