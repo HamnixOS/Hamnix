@@ -1,0 +1,772 @@
+# drivers/net/http.ad
+#
+# Minimal in-kernel HTTP/1.1 GET client. Sits directly on top of the
+# M16.102 TCP client + the M16.99 DNS resolver and exposes a single
+# synchronous entry point:
+#
+#   http_get(url, out_buf, out_max, status_out) -> int64
+#
+# This is the last codec gap between "TCP works" and "apt-shaped
+# fetch over HTTP works": apt downloads its package index files over
+# plain HTTP from `deb.debian.org`, parses the response, then issues
+# more HTTPS-or-HTTP GETs for the .deb files themselves. TLS is a
+# separate large effort (out of scope here); plaintext HTTP is enough
+# to fetch InRelease + Packages and to demonstrate the request /
+# response codec end-to-end.
+#
+# Scope (deliberately tight — the cousin of dns.ad's "smallest thing
+# that unblocks apt"):
+#
+#   - GET only. No POST/PUT/DELETE/HEAD. apt fetches always use GET.
+#   - HTTP/1.1 with `Connection: close`. Each GET opens a fresh TCP
+#     slot, fires the request, drains the response until the peer
+#     half-closes, and tears down. No keep-alive, no pipelining.
+#   - No chunked transfer encoding. By advertising `Connection: close`
+#     the server is free to fall back to "stream until EOF", which
+#     is what every conformant origin does for static files. If a
+#     pathological server insists on `Transfer-Encoding: chunked`
+#     anyway, the body bytes will arrive verbatim — including the
+#     hex length prefixes — which is wrong but at least visible.
+#     Decoding chunked is a documented follow-up.
+#   - No redirects (3xx). We surface the status code through the
+#     `status_out` argument so the caller can decide whether to
+#     re-issue against the Location header.
+#   - No HTTPS. Calling `http_get("https://...")` returns -1.
+#   - URL parser is the absolute minimum: strip the `http://` scheme,
+#     find an optional `:port`, then the path. No userinfo, no IPv6
+#     bracket syntax, no query-string semantics (it just gets passed
+#     through as part of the path).
+#
+# Wire shape we emit (matches the spec subset apt understands):
+#
+#   GET <path> HTTP/1.1\r\n
+#   Host: <host>\r\n
+#   User-Agent: Hamnix-kernel/0.1\r\n
+#   Accept: */*\r\n
+#   Connection: close\r\n
+#   \r\n
+#
+# Wire shape we parse:
+#
+#   HTTP/1.1 <status> <reason>\r\n
+#   <header>: <value>\r\n      (zero or more)
+#   ...
+#   \r\n
+#   <body bytes>               (until Content-Length is satisfied or
+#                               TCP EOF, whichever fires first)
+#
+# Failure model: return -1 from `http_get` for any pre-body error
+# (URL parse failed, DNS missed, TCP connect / send failed, no status
+# line in the first chunk). On a successful TCP exchange where the
+# status line did parse, we always return a non-negative body length
+# (possibly 0 for HEAD-shaped 204/304 replies — which we don't emit,
+# but a misbehaving server still could). `*status_out` carries the
+# numeric status (200, 404, 500, ...) on every successful exchange.
+
+from kernel.printk.printk import printk0, printk1, printk2
+from drivers.net.tcp import (
+    tcp_connect, tcp_send, tcp_recv, tcp_close,
+)
+from drivers.net.dns import dns_lookup
+
+
+# Tuning knobs. Sizes match the spirit of dns.ad / tcp.ad — generous
+# enough for a real apt index page (InRelease is ~6-12 KiB) without
+# blowing the kernel BSS budget.
+HTTP_DEFAULT_PORT:    uint16 = 80
+HTTP_REQ_BUF_BYTES:   uint64 = 1024       # whole request comfortably fits
+HTTP_RX_BUF_BYTES:    uint64 = 4096       # per-tcp_recv scratch
+HTTP_HOST_MAX:        uint64 = 128        # hostname + maybe :port
+HTTP_PATH_MAX:        uint64 = 256
+HTTP_PORTSTR_MAX:     uint64 = 8
+
+# Header-state machine constants. We scan the response stream byte
+# by byte until we cross the `\r\n\r\n` boundary that separates
+# headers from body. The state is a small ordinal:
+#
+#   0 = mid-line (waiting for \r)
+#   1 = saw \r            (waiting for \n)
+#   2 = saw \r\n          (start of line; could be empty -> done)
+#   3 = saw \r\n\r        (waiting for final \n)
+#
+# Hitting state 2 followed by a \r flips to state 3; \n from state 3
+# means the header block ended on this very byte.
+HTTP_HS_TEXT:    uint8 = 0
+HTTP_HS_AFTER_R: uint8 = 1
+HTTP_HS_LINESTART: uint8 = 2
+HTTP_HS_AFTER_RN_R: uint8 = 3
+
+
+# Per-call scratch buffers. We keep these as globals (BSS) rather than
+# locals so the call frame stays tiny — Adder's nested-frame Array
+# quirk (see memory/feedback_compiler_quirks.md) bit dns.ad and arp.ad
+# when locals got large. Single-threaded callers — there's exactly one
+# in-flight http_get at a time, the same way dns_lookup serialises.
+http_req_buf:     Array[1024, uint8]
+http_rx_buf:      Array[4096, uint8]
+http_host_buf:    Array[128, uint8]
+http_path_buf:    Array[256, uint8]
+http_portstr_buf: Array[8, uint8]
+
+
+# Counters bumped per call. Mirrors the dns_in/dns_out style at the
+# tail of dns.ad so a future /proc/net/http can read them out.
+http_requests:    uint64 = 0
+http_2xx:         uint64 = 0
+http_4xx:         uint64 = 0
+http_5xx:         uint64 = 0
+http_bytes_in:    uint64 = 0
+
+
+def _http_strlen(s: Ptr[uint8]) -> uint64:
+    # Walk a NUL-terminated C string and return its length. Adder
+    # doesn't ship a libc strlen, but every consumer of Ptr[uint8]
+    # strings in the kernel hand-rolls this loop.
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _http_is_digit(c: uint8) -> int32:
+    if c < 0x30:
+        return 0
+    if c > 0x39:
+        return 0
+    return 1
+
+
+def _http_parse_uint(s: Ptr[uint8], length: uint64,
+                     out: Ptr[uint32]) -> int32:
+    # Parse `length` decimal digits at `s` into `*out`. Returns 0 on
+    # success, -1 if any byte isn't a digit. Saturates at uint32.
+    if length == 0:
+        return -1
+    acc: uint32 = 0
+    i: uint64 = 0
+    while i < length:
+        c: uint8 = s[i]
+        if _http_is_digit(c) == 0:
+            return -1
+        d: uint32 = cast[uint32](c - 0x30)
+        acc = acc * 10 + d
+        i = i + 1
+    out[0] = acc
+    return 0
+
+
+def _http_lower(c: uint8) -> uint8:
+    # ASCII tolower. HTTP header names are case-insensitive, so the
+    # `Content-Length:` matcher folds before comparing.
+    if c >= 0x41:
+        if c <= 0x5A:
+            return c + 0x20
+    return c
+
+
+def _http_buf_starts_with_ci(buf: Ptr[uint8], buf_len: uint64,
+                             needle: Ptr[uint8],
+                             needle_len: uint64) -> int32:
+    # Case-insensitive prefix match. Returns 1 on match, 0 otherwise.
+    if needle_len > buf_len:
+        return 0
+    i: uint64 = 0
+    while i < needle_len:
+        a: uint8 = _http_lower(buf[i])
+        b: uint8 = _http_lower(needle[i])
+        if a != b:
+            return 0
+        i = i + 1
+    return 1
+
+
+def _http_parse_url(url: Ptr[uint8],
+                    out_host: Ptr[uint8],
+                    out_path: Ptr[uint8],
+                    out_port: Ptr[uint16]) -> int32:
+    # Parse `http://<host>[:<port>]<path>` into the three out buffers.
+    # Returns 0 on success, -1 on malformed input or HTTPS.
+    #
+    # We do the simplest possible left-to-right walk:
+    #   1. Optional `http://` prefix. `https://` is rejected (TLS is
+    #      out of scope; the caller gets -1 with a printk diagnostic).
+    #   2. Host = bytes up to the first `:`, `/`, or NUL.
+    #   3. Port = digits after the `:` (default 80 if absent).
+    #   4. Path = whatever's left, starting at the `/` (or "/" if the
+    #      URL had no path component).
+    #
+    # No userinfo (`user:pass@host`), no fragment (`#anchor`), no
+    # query-string semantics — `?` is just another path byte. apt's
+    # URLs are simple and don't exercise those corners.
+    if url == cast[Ptr[uint8]](0):
+        return -1
+    url_len: uint64 = _http_strlen(url)
+    if url_len == 0:
+        return -1
+
+    pos: uint64 = 0
+    # Try to strip the scheme. Match "http://" literally; reject
+    # "https://" rather than ignoring it so callers don't silently
+    # fall back to plaintext when they meant TLS.
+    http_pfx: Ptr[uint8] = "http://"
+    https_pfx: Ptr[uint8] = "https://"
+    if _http_buf_starts_with_ci(url, url_len, https_pfx, 8) == 1:
+        printk0("[http] HTTPS not supported (TLS out of scope)\n")
+        return -1
+    if _http_buf_starts_with_ci(url, url_len, http_pfx, 7) == 1:
+        pos = 7
+    # If the URL didn't start with "http://" we tolerate it and treat
+    # the whole string as `<host>[:<port>]<path>`. apt callers always
+    # include the scheme, but the tolerance is cheap.
+
+    # Walk the host.
+    host_start: uint64 = pos
+    while pos < url_len:
+        c: uint8 = url[pos]
+        if c == 0x3A:                     # ':'
+            break
+        if c == 0x2F:                     # '/'
+            break
+        pos = pos + 1
+    host_len: uint64 = pos - host_start
+    if host_len == 0:
+        printk0("[http] URL parse: empty host\n")
+        return -1
+    if host_len >= HTTP_HOST_MAX:
+        printk0("[http] URL parse: host too long\n")
+        return -1
+    i: uint64 = 0
+    while i < host_len:
+        out_host[i] = url[host_start + i]
+        i = i + 1
+    out_host[host_len] = 0
+
+    # Default the port to 80; if we hit a ':' parse the digits that
+    # follow. We require at least one digit and stop at the first
+    # non-digit (which should be '/' or NUL).
+    port_val: uint16 = HTTP_DEFAULT_PORT
+    if pos < url_len:
+        if url[pos] == 0x3A:               # ':'
+            pos = pos + 1
+            port_start: uint64 = pos
+            while pos < url_len:
+                c2: uint8 = url[pos]
+                if c2 == 0x2F:             # '/'
+                    break
+                if _http_is_digit(c2) == 0:
+                    printk0("[http] URL parse: bogus port digit\n")
+                    return -1
+                pos = pos + 1
+            port_len: uint64 = pos - port_start
+            if port_len == 0:
+                printk0("[http] URL parse: empty port\n")
+                return -1
+            if port_len >= HTTP_PORTSTR_MAX:
+                printk0("[http] URL parse: port too long\n")
+                return -1
+            # Re-use _http_parse_uint to keep the digit walk in one
+            # place. uint32 result, narrow to uint16 — anything over
+            # 65535 would be a malformed URL anyway.
+            port_ptr_src: Ptr[uint8] = cast[Ptr[uint8]](
+                cast[uint64](url) + port_start)
+            port32: uint32 = 0
+            port32_ptr: Ptr[uint32] = cast[Ptr[uint32]](&port32)
+            if _http_parse_uint(port_ptr_src, port_len,
+                                port32_ptr) != 0:
+                printk0("[http] URL parse: bogus port number\n")
+                return -1
+            if port32 > 65535:
+                printk0("[http] URL parse: port out of range\n")
+                return -1
+            port_val = cast[uint16](port32)
+
+    # Path = either "/" (if the URL ended right after the host/port)
+    # or the rest of the URL starting at the '/'.
+    if pos >= url_len:
+        out_path[0] = 0x2F                # '/'
+        out_path[1] = 0
+    else:
+        path_len: uint64 = url_len - pos
+        if path_len >= HTTP_PATH_MAX:
+            printk0("[http] URL parse: path too long\n")
+            return -1
+        j: uint64 = 0
+        while j < path_len:
+            out_path[j] = url[pos + j]
+            j = j + 1
+        out_path[path_len] = 0
+
+    out_port[0] = port_val
+    return 0
+
+
+def _http_build_request(host: Ptr[uint8], path: Ptr[uint8]) -> int64:
+    # Lay down the GET request into http_req_buf and return its
+    # length, or -1 if it wouldn't fit. The shape matches the spec
+    # quote in this file's header — apt-style minimal HTTP/1.1.
+    pos: uint64 = 0
+
+    # Helper: append a Ptr[uint8] segment, bounded by HTTP_REQ_BUF_BYTES.
+    # Adder doesn't have closures, so the body is inlined per segment.
+    line1_a: Ptr[uint8] = "GET "
+    line1_a_len: uint64 = 4
+    line1_b: Ptr[uint8] = " HTTP/1.1\r\n"
+    line1_b_len: uint64 = 11
+    line2_a: Ptr[uint8] = "Host: "
+    line2_a_len: uint64 = 6
+    line3:   Ptr[uint8] = "User-Agent: Hamnix-kernel/0.1\r\n"
+    line3_len: uint64 = 31
+    line4:   Ptr[uint8] = "Accept: */*\r\n"
+    line4_len: uint64 = 13
+    line5:   Ptr[uint8] = "Connection: close\r\n"
+    line5_len: uint64 = 19
+    crlf:    Ptr[uint8] = "\r\n"
+    crlf_len: uint64 = 2
+
+    host_len: uint64 = _http_strlen(host)
+    path_len: uint64 = _http_strlen(path)
+
+    # Conservative size check. We'll bounds-check each segment as we
+    # write, but a quick add up front catches the gross case.
+    total: uint64 = line1_a_len + path_len + line1_b_len \
+        + line2_a_len + host_len + crlf_len \
+        + line3_len + line4_len + line5_len + crlf_len
+    if total > HTTP_REQ_BUF_BYTES:
+        printk1("[http] request too big (%d bytes)\n", total)
+        return -1
+
+    # Segment 1a: "GET "
+    i: uint64 = 0
+    while i < line1_a_len:
+        http_req_buf[pos + i] = line1_a[i]
+        i = i + 1
+    pos = pos + line1_a_len
+    # Segment 1b: path
+    j: uint64 = 0
+    while j < path_len:
+        http_req_buf[pos + j] = path[j]
+        j = j + 1
+    pos = pos + path_len
+    # Segment 1c: " HTTP/1.1\r\n"
+    k: uint64 = 0
+    while k < line1_b_len:
+        http_req_buf[pos + k] = line1_b[k]
+        k = k + 1
+    pos = pos + line1_b_len
+    # Segment 2a: "Host: "
+    a: uint64 = 0
+    while a < line2_a_len:
+        http_req_buf[pos + a] = line2_a[a]
+        a = a + 1
+    pos = pos + line2_a_len
+    # Segment 2b: host
+    b: uint64 = 0
+    while b < host_len:
+        http_req_buf[pos + b] = host[b]
+        b = b + 1
+    pos = pos + host_len
+    # Segment 2c: "\r\n"
+    c: uint64 = 0
+    while c < crlf_len:
+        http_req_buf[pos + c] = crlf[c]
+        c = c + 1
+    pos = pos + crlf_len
+    # Segment 3: User-Agent line
+    d: uint64 = 0
+    while d < line3_len:
+        http_req_buf[pos + d] = line3[d]
+        d = d + 1
+    pos = pos + line3_len
+    # Segment 4: Accept line
+    e: uint64 = 0
+    while e < line4_len:
+        http_req_buf[pos + e] = line4[e]
+        e = e + 1
+    pos = pos + line4_len
+    # Segment 5: Connection: close line
+    f: uint64 = 0
+    while f < line5_len:
+        http_req_buf[pos + f] = line5[f]
+        f = f + 1
+    pos = pos + line5_len
+    # Final blank line
+    g: uint64 = 0
+    while g < crlf_len:
+        http_req_buf[pos + g] = crlf[g]
+        g = g + 1
+    pos = pos + crlf_len
+
+    return cast[int64](pos)
+
+
+def _http_parse_status_line(buf: Ptr[uint8], length: uint64,
+                            status_out: Ptr[int32]) -> int64:
+    # The status line is the first \r\n-terminated record in the
+    # response. Shape: `HTTP/1.1 NNN <reason>\r\n`. We trust HTTP/1.x
+    # (don't insist on the minor version) so a `HTTP/1.0` reply from
+    # an old server still parses.
+    #
+    # Returns the byte offset just past the trailing \r\n on success
+    # (the start of the first header line), or -1 on a malformed
+    # status line. Writes the numeric status into `*status_out`.
+    if length < 12:
+        printk0("[http] response too short for status line\n")
+        return -1
+    if buf[0] != 0x48:                    # 'H'
+        printk0("[http] status line: no HTTP/ prefix\n")
+        return -1
+    if buf[1] != 0x54:                    # 'T'
+        return -1
+    if buf[2] != 0x54:                    # 'T'
+        return -1
+    if buf[3] != 0x50:                    # 'P'
+        return -1
+    if buf[4] != 0x2F:                    # '/'
+        return -1
+    # Skip "HTTP/" + 3 bytes of version ("1.1" / "1.0").
+    pos: uint64 = 5
+    # The version is technically `N.N` but a few servers emit longer
+    # forms; we just skip until the first space.
+    while pos < length:
+        if buf[pos] == 0x20:              # ' '
+            break
+        pos = pos + 1
+    if pos >= length:
+        return -1
+    pos = pos + 1                          # past the space
+    # 3 digits of status.
+    if pos + 3 > length:
+        return -1
+    status32: uint32 = 0
+    status32_ptr: Ptr[uint32] = cast[Ptr[uint32]](&status32)
+    status_src: Ptr[uint8] = cast[Ptr[uint8]](
+        cast[uint64](buf) + pos)
+    if _http_parse_uint(status_src, 3, status32_ptr) != 0:
+        printk0("[http] status line: non-numeric status\n")
+        return -1
+    status_out[0] = cast[int32](status32)
+    pos = pos + 3
+    # Walk to end of line (the \r\n). We don't care about the reason
+    # phrase, but we have to consume it to find the body.
+    while pos < length:
+        if buf[pos] == 0x0D:              # '\r'
+            if pos + 1 < length:
+                if buf[pos + 1] == 0x0A:  # '\n'
+                    return cast[int64](pos + 2)
+        pos = pos + 1
+    # No \r\n in the first chunk — caller will need another read,
+    # but for the bare-metal HTTP/1.1 reply shape we always get the
+    # whole status line in one segment, so this is a malformed
+    # response for our purposes.
+    printk0("[http] status line: missing CRLF\n")
+    return -1
+
+
+def _http_extract_content_length(buf: Ptr[uint8], hdrs_start: uint64,
+                                 hdrs_end: uint64,
+                                 cl_out: Ptr[uint64]) -> int32:
+    # Walk the header block looking for a case-insensitive
+    # "Content-Length:" record. If found, parse its decimal value into
+    # `*cl_out` and return 1. If not found, return 0. -1 on parse
+    # error (numeric value malformed). Caller treats absent CL as "read
+    # until EOF / connection close".
+    needle: Ptr[uint8] = "content-length:"
+    needle_len: uint64 = 15
+    pos: uint64 = hdrs_start
+    while pos < hdrs_end:
+        # Find the end of this line. RFC 9112 lines are terminated by
+        # \r\n but we tolerate a bare \n too in case some upstream
+        # server is sloppy.
+        line_start: uint64 = pos
+        while pos < hdrs_end:
+            if buf[pos] == 0x0A:          # '\n'
+                break
+            pos = pos + 1
+        # `pos` now indexes the '\n' or hdrs_end. Line content is
+        # [line_start, line_end_excl), with line_end_excl trimmed of
+        # any trailing \r.
+        line_end: uint64 = pos
+        if line_end > line_start:
+            if buf[line_end - 1] == 0x0D:
+                line_end = line_end - 1
+        line_len: uint64 = line_end - line_start
+        line_buf: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](buf) + line_start)
+        if _http_buf_starts_with_ci(line_buf, line_len,
+                                    needle, needle_len) == 1:
+            # Skip past "Content-Length:" then any leading whitespace.
+            vp: uint64 = needle_len
+            while vp < line_len:
+                c: uint8 = line_buf[vp]
+                if c == 0x20:
+                    vp = vp + 1
+                elif c == 0x09:
+                    vp = vp + 1
+                else:
+                    break
+            # Digits up to the end of the line.
+            digit_start: uint64 = vp
+            while vp < line_len:
+                if _http_is_digit(line_buf[vp]) == 0:
+                    break
+                vp = vp + 1
+            digits: uint64 = vp - digit_start
+            if digits == 0:
+                printk0("[http] Content-Length: empty value\n")
+                return -1
+            cl32: uint32 = 0
+            cl32_ptr: Ptr[uint32] = cast[Ptr[uint32]](&cl32)
+            cl_src: Ptr[uint8] = cast[Ptr[uint8]](
+                cast[uint64](line_buf) + digit_start)
+            if _http_parse_uint(cl_src, digits, cl32_ptr) != 0:
+                printk0("[http] Content-Length: malformed\n")
+                return -1
+            cl_out[0] = cast[uint64](cl32)
+            return 1
+        # Skip past the \n if we stopped on one (rather than hdrs_end).
+        if pos < hdrs_end:
+            pos = pos + 1
+    return 0
+
+
+def http_init():
+    # No state needs zeroing — BSS is zero-initialised by start_kernel
+    # and we don't keep a connection table (each http_get opens a
+    # fresh TCP slot). Present for symmetry with dns_init / tcp_init.
+    http_requests = 0
+    http_2xx = 0
+    http_4xx = 0
+    http_5xx = 0
+    http_bytes_in = 0
+    printk0("http: client initialized (HTTP/1.1, GET only)\n")
+
+
+def http_get(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
+             status_out: Ptr[int32]) -> int64:
+    # End-to-end HTTP/1.1 GET:
+    #   1. Parse the URL into (host, port, path).
+    #   2. Resolve host -> IPv4 via dns_lookup.
+    #   3. Open a TCP connection via tcp_connect.
+    #   4. Build the request bytes, hand them to tcp_send.
+    #   5. Stream the response: tcp_recv into http_rx_buf, parse the
+    #      status line on the first chunk, then walk the headers
+    #      (tracking Content-Length), then copy body bytes into
+    #      out_buf up to out_max until either Content-Length is
+    #      reached or tcp_recv returns 0 (EOF).
+    #   6. tcp_close. Return body bytes written.
+    http_requests = http_requests + 1
+    status_out[0] = 0
+
+    if url == cast[Ptr[uint8]](0):
+        return -1
+    if out_buf == cast[Ptr[uint8]](0):
+        return -1
+
+    host_ptr: Ptr[uint8] = cast[Ptr[uint8]](&http_host_buf[0])
+    path_ptr: Ptr[uint8] = cast[Ptr[uint8]](&http_path_buf[0])
+    port_val: uint16 = 0
+    port_ptr: Ptr[uint16] = cast[Ptr[uint16]](&port_val)
+    if _http_parse_url(url, host_ptr, path_ptr, port_ptr) != 0:
+        return -1
+    printk2("[http] GET host=%s port=%d\n",
+            cast[uint64](host_ptr), cast[uint64](port_val))
+    printk1("[http]      path=%s\n", cast[uint64](path_ptr))
+
+    # --- DNS resolution -------------------------------------------------
+    ip_out: Array[4, uint8]
+    ip_ptr: Ptr[uint8] = cast[Ptr[uint8]](&ip_out[0])
+    # 200 jiffies (~2 s) — matches the dns_lookup smoke-test budget.
+    if dns_lookup(host_ptr, ip_ptr, 200) != 0:
+        printk0("[http] DNS lookup failed\n")
+        return -1
+    printk2("[http] resolved to %d.%d", cast[uint64](ip_out[0]),
+            cast[uint64](ip_out[1]))
+    printk2(".%d.%d\n", cast[uint64](ip_out[2]),
+            cast[uint64](ip_out[3]))
+
+    # --- TCP connect ---------------------------------------------------
+    slot: int32 = tcp_connect(ip_out[0], ip_out[1], ip_out[2],
+                              ip_out[3], port_val, 200)
+    if slot < 0:
+        printk0("[http] tcp_connect failed\n")
+        return -1
+
+    # --- Build + send request ------------------------------------------
+    req_len_signed: int64 = _http_build_request(host_ptr, path_ptr)
+    if req_len_signed < 0:
+        tcp_close(slot)
+        return -1
+    req_len: uint64 = cast[uint64](req_len_signed)
+    req_ptr: Ptr[uint8] = cast[Ptr[uint8]](&http_req_buf[0])
+    # tcp_send truncates at TCP_MSS (536 bytes) per segment. Our
+    # request rarely exceeds ~256 bytes, but we loop just in case so
+    # the kernel doesn't silently drop the headers on a long path.
+    sent: uint64 = 0
+    while sent < req_len:
+        chunk: uint64 = req_len - sent
+        chunk_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](req_ptr) + sent)
+        rc: int64 = tcp_send(slot, chunk_ptr, chunk)
+        if rc <= 0:
+            printk0("[http] tcp_send failed\n")
+            tcp_close(slot)
+            return -1
+        sent = sent + cast[uint64](rc)
+    printk1("[http] request sent (%d bytes)\n", req_len)
+
+    # --- Receive + parse response --------------------------------------
+    # We keep two cursors:
+    #   `head_done` = 0 while we're still walking the response header
+    #                 block; flips to 1 once we cross \r\n\r\n.
+    #   `body_written` = bytes already copied into out_buf.
+    # Body bytes that arrive in the SAME tcp_recv chunk as the end of
+    # the headers need to be flushed into out_buf BEFORE we recycle
+    # the rx scratch buffer for the next read.
+    head_done: int32 = 0
+    have_cl:   int32 = 0
+    cl_val:    uint64 = 0
+    body_written: uint64 = 0
+    # Header-scan state: where in http_rx_buf is the byte after the
+    # last \r\n we saw, and whether the last two bytes formed
+    # `\r\n`. The state machine implementation lives below.
+    rx_ptr: Ptr[uint8] = cast[Ptr[uint8]](&http_rx_buf[0])
+
+    while True:
+        # Read up to HTTP_RX_BUF_BYTES at a time. 200 jiffies (~2 s)
+        # is generous for SLIRP + a real internet upstream.
+        n: int64 = tcp_recv(slot, rx_ptr, HTTP_RX_BUF_BYTES, 200)
+        if n < 0:
+            printk0("[http] tcp_recv error\n")
+            tcp_close(slot)
+            return -1
+        if n == 0:
+            # Peer half-closed (or recv timeout with no pending bytes).
+            # If we never saw the status line that's a hard failure;
+            # otherwise we're done — the body ended at EOF.
+            break
+        chunk_n: uint64 = cast[uint64](n)
+        http_bytes_in = http_bytes_in + chunk_n
+
+        body_off: uint64 = 0              # where body starts in this chunk
+
+        if head_done == 0:
+            # Parse the status line if this is the first chunk we've
+            # seen at all (body_written == 0 AND head_done == 0; the
+            # second condition is implicit at this point).
+            if status_out[0] == 0:
+                so: int64 = _http_parse_status_line(
+                    rx_ptr, chunk_n, status_out)
+                if so < 0:
+                    tcp_close(slot)
+                    return -1
+                # Headers start right after the status line.
+                hdr_scan_start: uint64 = cast[uint64](so)
+                # Bump the per-status-class counter for /proc/net/http.
+                s_code: int32 = status_out[0]
+                if s_code >= 200:
+                    if s_code < 300:
+                        http_2xx = http_2xx + 1
+                if s_code >= 400:
+                    if s_code < 500:
+                        http_4xx = http_4xx + 1
+                if s_code >= 500:
+                    if s_code < 600:
+                        http_5xx = http_5xx + 1
+                # Look for \r\n\r\n inside the rest of this chunk.
+                hp: uint64 = hdr_scan_start
+                state: uint8 = HTTP_HS_TEXT
+                found_end: int32 = 0
+                end_off: uint64 = 0
+                while hp < chunk_n:
+                    c: uint8 = http_rx_buf[hp]
+                    if state == HTTP_HS_TEXT:
+                        if c == 0x0D:
+                            state = HTTP_HS_AFTER_R
+                    elif state == HTTP_HS_AFTER_R:
+                        if c == 0x0A:
+                            state = HTTP_HS_LINESTART
+                        else:
+                            state = HTTP_HS_TEXT
+                    elif state == HTTP_HS_LINESTART:
+                        if c == 0x0D:
+                            state = HTTP_HS_AFTER_RN_R
+                        else:
+                            # A non-\r byte means the line wasn't empty;
+                            # we're back inside header text. The next
+                            # transition happens when we see the next \r.
+                            state = HTTP_HS_TEXT
+                    elif state == HTTP_HS_AFTER_RN_R:
+                        if c == 0x0A:
+                            found_end = 1
+                            end_off = hp + 1
+                            hp = chunk_n   # break out
+                            break
+                        else:
+                            state = HTTP_HS_TEXT
+                    hp = hp + 1
+                if found_end == 1:
+                    head_done = 1
+                    # Walk the headers looking for Content-Length.
+                    cl_ptr: Ptr[uint64] = cast[Ptr[uint64]](&cl_val)
+                    rc_cl: int32 = _http_extract_content_length(
+                        rx_ptr, hdr_scan_start, end_off, cl_ptr)
+                    if rc_cl == 1:
+                        have_cl = 1
+                        printk1("[http] Content-Length: %d\n", cl_val)
+                    elif rc_cl == 0:
+                        printk0("[http] no Content-Length; reading until EOF\n")
+                    body_off = end_off
+                else:
+                    # Headers spilled into the next chunk. For the
+                    # smoke-test workload this never happens (example.com
+                    # and apt index files have header blocks well under
+                    # 4 KiB), so we punt: log + treat as truncated. A
+                    # follow-up can accumulate header bytes across reads.
+                    printk0("[http] headers > 4KiB scratch; truncated\n")
+                    tcp_close(slot)
+                    return cast[int64](body_written)
+            else:
+                # Status was parsed in a previous loop iter but the
+                # header block ran past that chunk. Same "headers > 4
+                # KiB" case as above; defer to follow-up.
+                printk0("[http] headers span recv chunks; truncated\n")
+                tcp_close(slot)
+                return cast[int64](body_written)
+
+        # Now copy body_off..chunk_n into out_buf (subject to out_max
+        # and Content-Length).
+        if body_off < chunk_n:
+            copy_avail: uint64 = chunk_n - body_off
+            copy_room:  uint64 = out_max - body_written
+            copy_n: uint64 = copy_avail
+            if copy_n > copy_room:
+                copy_n = copy_room
+            if have_cl == 1:
+                # Stop at the declared body length even if the peer
+                # somehow streams more (defensive — apt's HTTP/1.1
+                # peers don't do this with `Connection: close`).
+                remaining: uint64 = cl_val - body_written
+                if copy_n > remaining:
+                    copy_n = remaining
+            i: uint64 = 0
+            while i < copy_n:
+                out_buf[body_written + i] = http_rx_buf[body_off + i]
+                i = i + 1
+            body_written = body_written + copy_n
+
+        # Termination check: bail out once we've grabbed all the bytes
+        # the caller asked for, or all the bytes Content-Length
+        # promised. Otherwise loop and read more.
+        if body_written >= out_max:
+            break
+        if have_cl == 1:
+            if body_written >= cl_val:
+                break
+
+    tcp_close(slot)
+    if head_done == 0:
+        printk0("[http] no headers received\n")
+        return -1
+    printk2("[http] GET complete: status=%d body=%d bytes\n",
+            cast[uint64](status_out[0]), body_written)
+    return cast[int64](body_written)
