@@ -1,0 +1,609 @@
+# linux_abi/api_l60.ad
+#
+# L60: shims for the ABI gap exposed by five Debian 6.12 modules that
+# layer directly on top of the L59 nf_conntrack core:
+#
+#   * nls_ascii.ko       — fully covered by L<=59; loads with zero new exports
+#   * nls_utf8.ko        — fully covered by L<=59; loads with zero new exports
+#   * xt_conntrack.ko    — fully covered by L<=59; loads with zero new exports
+#   * xt_nat.ko          — needs 1 new export (nf_nat_setup_info)
+#   * nf_nat.ko          — needs 40 new exports
+#
+# nls_ascii / nls_utf8 / xt_conntrack / xt_nat are tiny — their UND
+# surfaces sit at 4..11 symbols each and overlap heavily with the
+# netfilter / __register_nls / xt_register_matches surface already in
+# L1..L59. nf_nat.ko is the bigger fish: it registers the NAT half of
+# the netfilter stateful-firewall stack and pulls in 95 UND symbols,
+# 40 of which are new at L59 — a mix of nf_conntrack runtime API (the
+# upper-half symbols that nf_conntrack.ko itself EXPORTS, which become
+# UND in any module that consumes them), IP/IPv6 helpers (routing,
+# checksums, address selection), notifier chains for inetaddr /
+# inet6addr / netdev, xfrm policy lookup, sk_buff growth, and a few
+# kernel-core odds (get_random_u16, kmemdup_array, rcuref_get_slowpath,
+# __x86_indirect_thunk_rdx).
+#
+# All 41 new shims are init-safe no-ops: each module's init_module body
+# is small (register hooks / register match / register target / register
+# pernet_subsys) and reaches none of these symbols at load time. The
+# UND symbols exist so the .text and the static function-pointer tables
+# in .data / .rodata can be relocated; runtime callers (packet path,
+# expectations, helpers) never fire because Hamnix has no IP stack
+# consumer wiring packets through netfilter yet.
+#
+# UND analysis (`readelf -s --wide`, missing-after-L59):
+#   nls_ascii.ko        0 missing
+#   nls_utf8.ko         0 missing
+#   xt_conntrack.ko     0 missing
+#   xt_nat.ko           1 missing (nf_nat_setup_info)
+#   nf_nat.ko          40 missing (see groups below)
+#   union              41 unique
+#
+# Groups (all init-cold for L60):
+#
+#   Group 1: nf_conntrack runtime API (consumed by nf_nat from
+#            nf_conntrack.ko's EXPORT_SYMBOL surface — these are UND
+#            in nf_nat.ko because they cross the module boundary)
+#     nf_conntrack_find_get, nf_conntrack_htable_size (DATA),
+#     nf_conntrack_tuple_taken, nf_ct_alloc_hashtable, nf_ct_delete,
+#     nf_ct_destroy, nf_ct_expect_related_report, nf_ct_ext_add,
+#     __nf_ct_ext_find, nf_ct_helper_expectfn_register,
+#     nf_ct_helper_expectfn_unregister, nf_ct_invert_tuple,
+#     nf_ct_iterate_cleanup_net, nf_ct_iterate_destroy,
+#     nf_ct_kill_acct, nf_ct_l4proto_find, nf_ct_seqadj_set
+#
+#   Group 2: nf_nat setup (the one xt_nat needs)
+#     nf_nat_setup_info
+#
+#   Group 3: netfilter hook entry edit (raw — used by nf_nat at hook
+#            register time, but the wrapped variants in L<=59 cover the
+#            common path; the _raw variants are the unsynchronized
+#            inner helpers)
+#     nf_hook_entries_delete_raw, nf_hook_entries_insert_raw
+#
+#   Group 4: IPv4/IPv6 networking helpers
+#     csum_ipv6_magic, dst_release,
+#     inet_proto_csum_replace16, inet_select_addr,
+#     ip6_route_me_harder, ip_route_me_harder, ip_send_check,
+#     ipv6_dev_get_saddr
+#
+#   Group 5: sk_buff growth + checksum walker + put
+#     pskb_expand_head, skb_checksum, skb_put
+#
+#   Group 6: xfrm (IPsec policy lookup)
+#     __xfrm_decode_session, xfrm_lookup
+#
+#   Group 7: inetaddr / inet6addr notifier chains (NAT registers
+#            interest in address add/del so it can update its
+#            address-binding cache)
+#     register_inet6addr_notifier, register_inetaddr_notifier,
+#     unregister_inet6addr_notifier, unregister_inetaddr_notifier
+#
+#   Group 8: misc kernel helpers
+#     get_random_u16, kmemdup_array, rcuref_get_slowpath
+#
+#   Group 9: x86 retpoline thunk (rdx)
+#     __x86_indirect_thunk_rdx
+#
+# Stub philosophy mirrors L51..L59:
+#   * Init-path registration functions (register_inetaddr_notifier,
+#     register_inet6addr_notifier, nf_hook_entries_insert_raw) return 0
+#     so nf_nat.ko's init stays on the happy path.
+#   * Retpoline thunk pops %rbp and jumps through %rdx.
+#   * Iteration helpers (nf_ct_iterate_*) accept a callback + cookie
+#     but the in-flight conntrack table is empty, so the callback is
+#     never invoked.
+#   * DATA exports point at zero-initialised backing buffers. The only
+#     DATA in L60 is nf_conntrack_htable_size — a single u32 hash-table
+#     bucket count. nf_nat reads it at init for sizing decisions; a
+#     non-zero default (16384) is plausible and avoids divide-by-zero.
+#   * Every other shim is a no-op returning 0 / NULL / -EINVAL /
+#     -ENOENT as appropriate. Runtime hot paths (packet processing,
+#     NAT mapping setup, conntrack expectation handling) never fire in
+#     our env because Hamnix has no IP-stack consumer wiring packets in.
+#
+# Naming notes:
+#   * Adder reserves `bytes` -> use `nbytes`.
+#   * Adder reserves `file`  -> use `filp` / `f`.
+
+from linux_abi.exports import _add_export
+from kernel.printk.printk import printk0
+from mm.slab import kmalloc, kfree
+
+
+# =====================================================================
+# Group 1: nf_conntrack runtime API
+# =====================================================================
+#
+# nf_nat.ko consumes the upper-half of nf_conntrack via the standard
+# Linux EXPORT_SYMBOL mechanism: when nf_conntrack.ko was loaded at L59
+# it registered its own exports through its .modinfo / .ksymtab path,
+# but our loader doesn't yet ingest a loaded .ko's ksymtab into the
+# Linux-ABI table. So nf_nat.ko's references to those symbols look UND
+# at L60 load time. We shim them here as init-cold stubs — every one
+# of these is reached only from the packet-processing hot path, never
+# at module_init.
+
+def _l_nf_conntrack_find_get(net: uint64, zone: uint64,
+                              tuple: uint64) -> uint64:
+    # struct nf_conntrack_tuple_hash *
+    # nf_conntrack_find_get(struct net *net,
+    #                         const struct nf_conntrack_zone *zone,
+    #                         const struct nf_conntrack_tuple *tuple);
+    # Looks up a conntrack entry by tuple. NULL == not found.
+    return 0
+
+
+def _l_nf_conntrack_tuple_taken(tuple: uint64, ignored_conntrack: uint64) -> int32:
+    # int nf_conntrack_tuple_taken(const struct nf_conntrack_tuple *,
+    #                                const struct nf_conn *ignored_conntrack);
+    # Returns 1 if the tuple is already used by another connection.
+    # Our table is empty -> 0 (free).
+    return 0
+
+
+def _l_nf_ct_alloc_hashtable(sizep: uint64, nulls: int32) -> uint64:
+    # void *nf_ct_alloc_hashtable(unsigned int *sizep, int nulls);
+    # Allocates and initialises a hashtable of `*sizep` hlist_nulls_heads.
+    # On return *sizep may be adjusted to the actually-allocated size.
+    # We allocate a small buffer (1 bucket * 16 bytes) and report 1.
+    if sizep != 0:
+        p: Ptr[uint32] = cast[Ptr[uint32]](sizep)
+        p[0] = 1
+    return kmalloc(16)
+
+
+def _l_nf_ct_delete(ct: uint64, portid: uint32, report: int32) -> int32:
+    # bool nf_ct_delete(struct nf_conn *ct, u32 portid, int report);
+    # Deletes a conntrack entry; returns true if it was actually deleted.
+    # Empty table -> 0.
+    return 0
+
+
+def _l_nf_ct_destroy(nfct: uint64):
+    # void nf_ct_destroy(struct nf_conntrack *nfct);
+    # Final teardown of a conntrack refcount. No-op stub.
+    return
+
+
+def _l_nf_ct_expect_related_report(expect: uint64, portid: uint32,
+                                     report: int32, flags: uint32) -> int32:
+    # int nf_ct_expect_related_report(struct nf_conntrack_expect *,
+    #                                   u32 portid, int report, unsigned int flags);
+    # Inserts a new expectation; returns 0 on success.
+    return 0
+
+
+def _l_nf_ct_ext_add(ct: uint64, id: int32, gfp: uint32) -> uint64:
+    # void *nf_ct_ext_add(struct nf_conn *ct, enum nf_ct_ext_id id, gfp_t gfp);
+    # Adds an extension to a conntrack. NULL == failure; nf_nat handles
+    # that gracefully (logs and proceeds with reduced functionality).
+    return 0
+
+
+def _l___nf_ct_ext_find(ext: uint64, id: int32) -> uint64:
+    # void *__nf_ct_ext_find(const struct nf_ct_ext *ext, u8 id);
+    # Finds an extension on a conntrack; NULL == not present.
+    return 0
+
+
+def _l_nf_ct_helper_expectfn_register(n: uint64):
+    # void nf_ct_helper_expectfn_register(struct nf_ct_helper_expectfn *n);
+    return
+
+
+def _l_nf_ct_helper_expectfn_unregister(n: uint64):
+    # void nf_ct_helper_expectfn_unregister(struct nf_ct_helper_expectfn *n);
+    return
+
+
+def _l_nf_ct_invert_tuple(inverse: uint64, orig: uint64) -> int32:
+    # bool nf_ct_invert_tuple(struct nf_conntrack_tuple *inverse,
+    #                           const struct nf_conntrack_tuple *orig);
+    # Inverts src/dst and L4 fields for reverse-direction lookup.
+    # Return 1 (success) so nf_nat continues; the inverted tuple data
+    # is junk but no consumer reads it on our paths.
+    return 1
+
+
+def _l_nf_ct_iterate_cleanup_net(net: uint64, iter: uint64,
+                                    data: uint64, portid: uint32,
+                                    report: int32):
+    # void nf_ct_iterate_cleanup_net(struct net *,
+    #                                 int (*iter)(struct nf_conn *, void *),
+    #                                 void *data, u32 portid, int report);
+    # Iterates every conntrack in `net`, invoking `iter`. Empty table
+    # -> no callback invocation -> no-op.
+    return
+
+
+def _l_nf_ct_iterate_destroy(iter: uint64, data: uint64):
+    # void nf_ct_iterate_destroy(int (*iter)(struct nf_conn *, void *),
+    #                              void *data);
+    return
+
+
+def _l_nf_ct_kill_acct(ct: uint64) -> int32:
+    # bool nf_ct_kill_acct(struct nf_conn *ct);
+    # Forcibly kills a conntrack and decrements its accounting counters.
+    return 0
+
+
+def _l_nf_ct_l4proto_find(l4proto: uint8) -> uint64:
+    # const struct nf_conntrack_l4proto *nf_ct_l4proto_find(u8 l4num);
+    # Returns the L4 protocol ops table (TCP/UDP/SCTP/...) for `l4num`.
+    # nf_nat uses this to look up the corresponding NAT helper. Stub
+    # returns NULL; nf_nat treats that as "no helper available" and
+    # falls back to its generic NAT path.
+    return 0
+
+
+def _l_nf_ct_seqadj_set(ct: uint64, ctinfo: int32, this_seq: uint32,
+                          off: int32) -> int32:
+    # int nf_ct_seqadj_set(struct nf_conn *ct, enum ip_conntrack_info ctinfo,
+    #                       __be32 this_seq, s32 off);
+    # Updates sequence-number adjustment data for TCP NAT. Stub.
+    return 0
+
+
+# DATA: `unsigned int nf_conntrack_htable_size` — bucket count of the
+# main conntrack hash table. nf_nat reads it at init to size its own
+# parallel structures. Non-zero default to avoid degenerate sizing.
+nf_conntrack_htable_size_val: uint32 = 16384
+
+
+# =====================================================================
+# Group 2: nf_nat setup
+# =====================================================================
+
+def _l_nf_nat_setup_info(ct: uint64, range_: uint64, maniptype: int32) -> int32:
+    # unsigned int nf_nat_setup_info(struct nf_conn *ct,
+    #                                  const struct nf_nat_range2 *range,
+    #                                  enum nf_nat_manip_type maniptype);
+    # Real: allocates a NAT mapping for the connection and registers it
+    # with the conntrack expectation system. Returns one of
+    # NF_ACCEPT / NF_DROP. nf_nat_setup_info is the workhorse called by
+    # the iptables `-j SNAT/DNAT` targets and by xt_nat. Stub returns
+    # NF_ACCEPT (1) so the target appears to succeed.
+    return 1
+
+
+# =====================================================================
+# Group 3: netfilter hook entry edit (raw)
+# =====================================================================
+#
+# nf_hook_entries_{insert,delete}_raw mutate the per-net/per-hook
+# array of hook callbacks WITHOUT taking the global hook_mutex (the
+# caller is responsible). nf_nat uses these via its own registration
+# helpers — the wrapped variants nf_register_net_hooks /
+# nf_unregister_net_hooks already covered in L<=59 cover the common
+# path, but the `_raw` symbols still resolve through the relocations.
+
+def _l_nf_hook_entries_insert_raw(pp: uint64, ops: uint64) -> int32:
+    # int nf_hook_entries_insert_raw(struct nf_hook_entries __rcu **pp,
+    #                                  const struct nf_hook_ops *reg);
+    return 0
+
+
+def _l_nf_hook_entries_delete_raw(pp: uint64, ops: uint64) -> int32:
+    # int nf_hook_entries_delete_raw(struct nf_hook_entries __rcu **pp,
+    #                                  const struct nf_hook_ops *reg);
+    return 0
+
+
+# =====================================================================
+# Group 4: IPv4/IPv6 networking helpers
+# =====================================================================
+
+def _l_csum_ipv6_magic(saddr: uint64, daddr: uint64, len: uint32,
+                        proto: uint32, sum: uint32) -> uint32:
+    # __sum16 csum_ipv6_magic(const struct in6_addr *saddr,
+    #                          const struct in6_addr *daddr,
+    #                          __u32 len, __u8 proto, __wsum sum);
+    # Computes the pseudo-header checksum for IPv6 transport. Stub
+    # returns the seed unchanged.
+    return sum
+
+
+def _l_dst_release(dst: uint64):
+    # void dst_release(struct dst_entry *dst);
+    # Drops a reference on a routing dst entry. No real dst here.
+    return
+
+
+def _l_inet_proto_csum_replace16(sum: uint64, skb: uint64,
+                                   from_: uint64, to: uint64,
+                                   pseudohdr: int32):
+    # void inet_proto_csum_replace16(__sum16 *sum, struct sk_buff *,
+    #                                  const __be32 *from, const __be32 *to,
+    #                                  bool pseudohdr);
+    # In-place csum diff for IPv6 NAT (16-byte address change). No-op.
+    return
+
+
+def _l_inet_select_addr(dev: uint64, dst: uint32, scope: int32) -> uint32:
+    # __be32 inet_select_addr(const struct net_device *dev, __be32 dst,
+    #                           int scope);
+    # Returns a source address suitable for routing to `dst` from `dev`.
+    # 0 (INADDR_ANY) is the "no preferred source" answer.
+    return 0
+
+
+def _l_ip6_route_me_harder(net: uint64, sk: uint64, skb: uint64) -> int32:
+    # int ip6_route_me_harder(struct net *net, struct sock *sk,
+    #                           struct sk_buff *skb);
+    # Re-routes a packet after IPv6 header rewrite. -EINVAL if no route.
+    # 0 == "still routable" — keeps nf_nat happy.
+    return 0
+
+
+def _l_ip_route_me_harder(net: uint64, sk: uint64, skb: uint64,
+                            addr_type: uint32) -> int32:
+    # int ip_route_me_harder(struct net *net, struct sock *sk,
+    #                          struct sk_buff *skb, unsigned int addr_type);
+    return 0
+
+
+def _l_ip_send_check(iph: uint64):
+    # void ip_send_check(struct iphdr *iph);
+    # Recomputes the IPv4 header checksum after a mutation. No-op stub.
+    return
+
+
+def _l_ipv6_dev_get_saddr(net: uint64, dev: uint64, daddr: uint64,
+                            prefs: uint32, saddr: uint64) -> int32:
+    # int ipv6_dev_get_saddr(struct net *net, const struct net_device *dev,
+    #                          const struct in6_addr *daddr,
+    #                          unsigned int prefs, struct in6_addr *saddr);
+    # Selects a source IPv6 address. -EADDRNOTAVAIL if none. Stub.
+    return -99                          # -EADDRNOTAVAIL
+
+
+# =====================================================================
+# Group 5: sk_buff growth + checksum walker + put
+# =====================================================================
+
+def _l_pskb_expand_head(skb: uint64, nhead: int32, ntail: int32,
+                          gfp_mask: uint32) -> int32:
+    # int pskb_expand_head(struct sk_buff *skb, int nhead, int ntail,
+    #                       gfp_t gfp_mask);
+    # Reallocates skb data area with extra head/tail room. Pretends it
+    # was already big enough.
+    return 0
+
+
+def _l_skb_checksum(skb: uint64, offset: int32, nbytes: int32,
+                     csum: uint32) -> uint32:
+    # __wsum skb_checksum(const struct sk_buff *skb, int offset, int len,
+    #                       __wsum csum);
+    # Linear / fragmented checksum walker. Stub returns the seed.
+    return csum
+
+
+def _l_skb_put(skb: uint64, nbytes: uint32) -> uint64:
+    # void *skb_put(struct sk_buff *skb, unsigned int len);
+    # Extends the tail of the linear data area by `len` and returns the
+    # pointer to the start of the new tail bytes. Stub: return NULL;
+    # nf_nat tolerates the failure on its construct-side paths.
+    return 0
+
+
+# =====================================================================
+# Group 6: xfrm (IPsec policy lookup)
+# =====================================================================
+
+def _l___xfrm_decode_session(net: uint64, skb: uint64, fl: uint64,
+                                reverse: int32, family: uint32) -> int32:
+    # int __xfrm_decode_session(struct net *net, struct sk_buff *skb,
+    #                             struct flowi *fl, int reverse,
+    #                             unsigned short family);
+    # Decodes a flow descriptor from `skb` for xfrm policy lookup.
+    # 0 == "no policy applies" / decoded OK.
+    return 0
+
+
+def _l_xfrm_lookup(net: uint64, dst_orig: uint64, fl: uint64,
+                    sk: uint64, flags: int32) -> uint64:
+    # struct dst_entry *xfrm_lookup(struct net *net, struct dst_entry *dst_orig,
+    #                                  const struct flowi *fl, const struct sock *sk,
+    #                                  int flags);
+    # Returns the (possibly transformed) dst for the flow. Stub returns
+    # dst_orig — "no transform applied". nf_nat is fine with that.
+    return dst_orig
+
+
+# =====================================================================
+# Group 7: inetaddr / inet6addr notifier chains
+# =====================================================================
+#
+# nf_nat registers interest in IPv4/IPv6 address-add/del events so it
+# can update its address-binding cache. With no IP stack producing
+# such events in Hamnix, the registration is purely formal — return 0
+# (success) to keep init on the happy path.
+
+def _l_register_inetaddr_notifier(nb: uint64) -> int32:
+    # int register_inetaddr_notifier(struct notifier_block *nb);
+    return 0
+
+
+def _l_unregister_inetaddr_notifier(nb: uint64) -> int32:
+    # int unregister_inetaddr_notifier(struct notifier_block *nb);
+    return 0
+
+
+def _l_register_inet6addr_notifier(nb: uint64) -> int32:
+    # int register_inet6addr_notifier(struct notifier_block *nb);
+    return 0
+
+
+def _l_unregister_inet6addr_notifier(nb: uint64) -> int32:
+    # int unregister_inet6addr_notifier(struct notifier_block *nb);
+    return 0
+
+
+# =====================================================================
+# Group 8: misc kernel helpers
+# =====================================================================
+
+def _l_get_random_u16() -> uint32:
+    # u16 get_random_u16(void);
+    # Linux returns a single random 16-bit value. nf_nat uses it for
+    # port-randomisation seeding during SNAT mapping setup — runtime
+    # only, never reached on our init path. Return a fixed but non-zero
+    # value to avoid degenerate cases if anything ever calls it.
+    return 0x5a5a
+
+
+def _l_kmemdup_array(src: uint64, count: uint64, element_size: uint64,
+                       gfp: uint32) -> uint64:
+    # void *kmemdup_array(const void *src, size_t count, size_t element_size,
+    #                       gfp_t gfp);
+    # Allocates `count * element_size` bytes and copies from src.
+    # Stub: kmalloc + byte-copy. NULL on alloc failure.
+    if src == 0:
+        return 0
+    total: uint64 = count * element_size
+    if total == 0:
+        return 0
+    dst: uint64 = kmalloc(total)
+    if dst == 0:
+        return 0
+    i: uint64 = 0
+    s: Ptr[uint8] = cast[Ptr[uint8]](src)
+    d: Ptr[uint8] = cast[Ptr[uint8]](dst)
+    while i < total:
+        d[i] = s[i]
+        i = i + 1
+    return dst
+
+
+def _l_rcuref_get_slowpath(ref: uint64) -> int32:
+    # bool rcuref_get_slowpath(rcuref_t *ref);
+    # Slow path of the rcuref_get inline — taken when the inline saw
+    # a zero refcount or a saturation flag. Returns true if the
+    # refcount was successfully acquired. Our env doesn't share rcuref
+    # objects across threads; return 1 (acquired).
+    return 1
+
+
+# =====================================================================
+# Group 9: x86 retpoline thunk (rdx)
+# =====================================================================
+
+def _l___x86_indirect_thunk_rdx():
+    # Retpoline replacement for `call *%rdx`. Same shape as the other
+    # __x86_indirect_thunk_* shims (api_lib80211 / api_raid6 /
+    # api_l51..l59).
+    asm_volatile("""
+        popq %rbp
+        jmpq *%rdx
+    """)
+
+
+# =====================================================================
+# Registration
+# =====================================================================
+
+def linux_abi_register_l60():
+    # Called from linux_abi_exports_init() after the L59 batch.
+    # Adds 41 new exports for nf_nat.ko + xt_nat.ko (the nls_*/xt_conntrack
+    # modules in this batch needed zero new exports).
+
+    # ---- Group 1: nf_conntrack runtime API ----
+    _add_export("nf_conntrack_find_get",
+                cast[uint64](&_l_nf_conntrack_find_get))
+    _add_export("nf_conntrack_htable_size",
+                cast[uint64](&nf_conntrack_htable_size_val))
+    _add_export("nf_conntrack_tuple_taken",
+                cast[uint64](&_l_nf_conntrack_tuple_taken))
+    _add_export("nf_ct_alloc_hashtable",
+                cast[uint64](&_l_nf_ct_alloc_hashtable))
+    _add_export("nf_ct_delete",
+                cast[uint64](&_l_nf_ct_delete))
+    _add_export("nf_ct_destroy",
+                cast[uint64](&_l_nf_ct_destroy))
+    _add_export("nf_ct_expect_related_report",
+                cast[uint64](&_l_nf_ct_expect_related_report))
+    _add_export("nf_ct_ext_add",
+                cast[uint64](&_l_nf_ct_ext_add))
+    _add_export("__nf_ct_ext_find",
+                cast[uint64](&_l___nf_ct_ext_find))
+    _add_export("nf_ct_helper_expectfn_register",
+                cast[uint64](&_l_nf_ct_helper_expectfn_register))
+    _add_export("nf_ct_helper_expectfn_unregister",
+                cast[uint64](&_l_nf_ct_helper_expectfn_unregister))
+    _add_export("nf_ct_invert_tuple",
+                cast[uint64](&_l_nf_ct_invert_tuple))
+    _add_export("nf_ct_iterate_cleanup_net",
+                cast[uint64](&_l_nf_ct_iterate_cleanup_net))
+    _add_export("nf_ct_iterate_destroy",
+                cast[uint64](&_l_nf_ct_iterate_destroy))
+    _add_export("nf_ct_kill_acct",
+                cast[uint64](&_l_nf_ct_kill_acct))
+    _add_export("nf_ct_l4proto_find",
+                cast[uint64](&_l_nf_ct_l4proto_find))
+    _add_export("nf_ct_seqadj_set",
+                cast[uint64](&_l_nf_ct_seqadj_set))
+
+    # ---- Group 2: nf_nat setup ----
+    _add_export("nf_nat_setup_info",
+                cast[uint64](&_l_nf_nat_setup_info))
+
+    # ---- Group 3: netfilter hook entry edit (raw) ----
+    _add_export("nf_hook_entries_insert_raw",
+                cast[uint64](&_l_nf_hook_entries_insert_raw))
+    _add_export("nf_hook_entries_delete_raw",
+                cast[uint64](&_l_nf_hook_entries_delete_raw))
+
+    # ---- Group 4: IPv4/IPv6 networking helpers ----
+    _add_export("csum_ipv6_magic",
+                cast[uint64](&_l_csum_ipv6_magic))
+    _add_export("dst_release",
+                cast[uint64](&_l_dst_release))
+    _add_export("inet_proto_csum_replace16",
+                cast[uint64](&_l_inet_proto_csum_replace16))
+    _add_export("inet_select_addr",
+                cast[uint64](&_l_inet_select_addr))
+    _add_export("ip6_route_me_harder",
+                cast[uint64](&_l_ip6_route_me_harder))
+    _add_export("ip_route_me_harder",
+                cast[uint64](&_l_ip_route_me_harder))
+    _add_export("ip_send_check",
+                cast[uint64](&_l_ip_send_check))
+    _add_export("ipv6_dev_get_saddr",
+                cast[uint64](&_l_ipv6_dev_get_saddr))
+
+    # ---- Group 5: sk_buff growth + checksum walker + put ----
+    _add_export("pskb_expand_head",
+                cast[uint64](&_l_pskb_expand_head))
+    _add_export("skb_checksum",
+                cast[uint64](&_l_skb_checksum))
+    _add_export("skb_put",
+                cast[uint64](&_l_skb_put))
+
+    # ---- Group 6: xfrm (IPsec policy lookup) ----
+    _add_export("__xfrm_decode_session",
+                cast[uint64](&_l___xfrm_decode_session))
+    _add_export("xfrm_lookup",
+                cast[uint64](&_l_xfrm_lookup))
+
+    # ---- Group 7: inetaddr / inet6addr notifier chains ----
+    _add_export("register_inetaddr_notifier",
+                cast[uint64](&_l_register_inetaddr_notifier))
+    _add_export("unregister_inetaddr_notifier",
+                cast[uint64](&_l_unregister_inetaddr_notifier))
+    _add_export("register_inet6addr_notifier",
+                cast[uint64](&_l_register_inet6addr_notifier))
+    _add_export("unregister_inet6addr_notifier",
+                cast[uint64](&_l_unregister_inet6addr_notifier))
+
+    # ---- Group 8: misc kernel helpers ----
+    _add_export("get_random_u16",
+                cast[uint64](&_l_get_random_u16))
+    _add_export("kmemdup_array",
+                cast[uint64](&_l_kmemdup_array))
+    _add_export("rcuref_get_slowpath",
+                cast[uint64](&_l_rcuref_get_slowpath))
+
+    # ---- Group 9: x86 retpoline thunk (rdx) ----
+    _add_export("__x86_indirect_thunk_rdx",
+                cast[uint64](&_l___x86_indirect_thunk_rdx))
