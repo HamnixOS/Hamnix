@@ -1,0 +1,218 @@
+# sys/src/9/port/syschan.ad
+#
+# Phase C / M16.107 — Plan 9-shape namespace syscall bodies. Mirrors
+# the three `sys_bind` / `sys_mount` / `sys_unmount` entry points in
+# 9front's /sys/src/9/port/chan.c at minimum scope. Three primitives
+# round out Phase B's namespace surface; together with the file ops
+# in sysfile.ad and the process control in sysproc.ad, the Plan 9
+# native syscall block 256..265 is now fully populated.
+#
+# Coexistence: this file owns the syscall *bodies*. The dispatch
+# wiring lives in arch/x86/kernel/syscall.ad, which reroutes
+# SYS_BIND (257) / SYS_MOUNT (258) / SYS_UNMOUNT (259) here when the
+# user calls them. fs/vfs.ad's resolve_path calls chan_resolve_prefix
+# (in chan.ad) before its existing cpio routing so successful binds
+# become visible through normal SYS_OPEN.
+#
+# What this milestone implements (real):
+#
+#   * do_bind(new, old, flag): record a `new -> old` binding in the
+#     calling task's mount table. Subsequent opens of any path
+#     prefixed by `new` get rewritten to live under `old` before
+#     vfs lookup.
+#
+#   * do_mount(srvfd, afd, old, flag, spec): record a SRV-chan
+#     binding at `old`. The srvfd is stored on the chan; Phase D
+#     (hamwd) grows this into a real 9P attach. afd (auth) is
+#     accepted but ignored — Hamnix has no fauth(2) yet.
+#
+#   * do_unmount(new, old): remove bindings. Two shapes — NULL new
+#     unbinds everything at `old`; non-NULL new removes the
+#     specific edge.
+#
+# What this milestone stubs (not real):
+#
+#   * The chan_attach() call inside do_mount stores the fd but does
+#     NOT speak 9P over it. A future hamwd will Tversion+Tattach
+#     here. For Phase C the fd just identifies the mount target
+#     for unmount() matching; opens through the mount point fall
+#     through to the underlying backend.
+#
+#   * Union mounts (MBEFORE / MAFTER). The flag is recorded but
+#     chan_resolve_prefix picks longest-prefix-only, no union walk.
+#     Phase D follow-up.
+#
+#   * Per-namespace mount-table deep-copy on rfork(RFNAMEG). Today
+#     the rfork helper just allocates a fresh namespace_id; the
+#     mount table itself is shared via _entry_visible's "shared OR
+#     private match" rule rather than copied. Real deep-copy lands
+#     when union semantics need it (Phase D).
+
+from kernel.sched.core import (
+    TaskStruct, current_task, set_current_errstr,
+)
+from sys.src.port9.port.chan import (
+    Chan, MountEntry,
+    chan_init, chan_attach,
+    mnttab_bind, mnttab_mount, mnttab_unmount,
+)
+
+
+# Path-buffer cap used for the kernel-side copy of new/old. Matches
+# MountEntry's inline storage in chan.ad — keeping the two in sync is
+# load-bearing because resolve_path's rewrite buffer is also 256 (the
+# caller passes Array[256, uint8]) and a longer bind path would
+# silently truncate.
+MAXPATH: uint64 = 128
+
+
+# --- helpers ---------------------------------------------------------
+
+def _copy_user_path(user: uint64, dst: Ptr[uint8],
+                    cap: uint64) -> int32:
+    # Copy a NUL-terminated user-space path string into a kernel
+    # buffer of size `cap`. NUL-terminates. Returns 0 on success,
+    # -1 if the string didn't fit (caller surfaces as "path too
+    # long" errstr).
+    #
+    # We don't have a copy_from_user yet — the kernel maps user
+    # pages 1:1 under KERNEL_BASE, so dereferencing the user
+    # pointer directly is safe at this scale. The bounds check is
+    # the only thing standing between us and a runaway walk.
+    if user == 0:
+        return -1
+    src: Ptr[uint8] = cast[Ptr[uint8]](user)
+    i: uint64 = 0
+    while i < cap:
+        c: uint8 = src[i]
+        dst[i] = c
+        if c == 0:
+            return 0
+        i = i + 1
+    # Hit `cap` without finding a NUL — caller's string was too long.
+    if cap > 0:
+        dst[cap - 1] = 0
+    return -1
+
+
+# --- do_bind ---------------------------------------------------------
+#
+# Plan 9 `bind(new, old, flag)`. Graft the name `new` onto the
+# existing name `old` in the calling process's namespace. After a
+# successful bind, opens of `new/x` look up `old/x` via
+# resolve_path's chan_resolve_prefix hook.
+#
+# flag: MREPL (0) replaces any existing binding at `new`;
+# MBEFORE (1) / MAFTER (2) request union semantics (recorded but
+# not yet honoured — Phase D). MCREATE (4) and MCACHE (8) are
+# accepted as bits; we ignore them at this milestone.
+#
+# Returns 0 on success, -1 on failure with errstr set.
+
+def do_bind(new_user: uint64, old_user: uint64,
+            flag: int32) -> int64:
+    if new_user == 0 or old_user == 0:
+        set_current_errstr("bind failed: null path")
+        return cast[int64](-1)
+    new_buf: Array[128, uint8]
+    old_buf: Array[128, uint8]
+    if _copy_user_path(new_user, &new_buf[0], MAXPATH) < 0:
+        set_current_errstr("bind failed: new path too long")
+        return cast[int64](-1)
+    if _copy_user_path(old_user, &old_buf[0], MAXPATH) < 0:
+        set_current_errstr("bind failed: old path too long")
+        return cast[int64](-1)
+    rc: int32 = mnttab_bind(&new_buf[0], &old_buf[0], flag)
+    if rc < 0:
+        set_current_errstr("bind failed: mount table full")
+        return cast[int64](-1)
+    return 0
+
+
+# --- do_mount --------------------------------------------------------
+#
+# Plan 9 `mount(srvfd, afd, old, flag, spec)`. Attach the 9P
+# file server reachable through `srvfd` at path `old`. `afd` is the
+# fauth(2) channel; we accept -1 (no auth) and silently ignore any
+# other value because fauth itself doesn't exist yet. `spec` is the
+# server-specific attach string; chan_attach records the pointer
+# but doesn't dereference it at this milestone (no 9P client).
+#
+# For Phase C: validate srvfd is in-range and refers to an open
+# slot, then record the binding. resolve_path's chan_resolve_prefix
+# skips SRV-kind mounts today (no fall-through path), so an opened
+# /dev/win/* before Phase D's hamwd lands will -ENOENT cleanly.
+# Once hamwd is up, resolve_path's hook is extended to dispatch
+# through the chan and the same userland call works unchanged.
+#
+# Returns 0 on success, -1 on failure with errstr set.
+
+def do_mount(srvfd: int32, afd: int32, old_user: uint64,
+             flag: int32, spec_user: uint64) -> int64:
+    # afd is silently accepted; Plan 9 -1 means "no auth", which is
+    # exactly what Hamnix supports today (no fauth, no auth FS).
+    # Suppress the warning-style accept by reading the parameter so
+    # future codegen tweaks don't think it's dead.
+    _ignored: int32 = afd
+    if old_user == 0:
+        set_current_errstr("mount failed: null path")
+        return cast[int64](-1)
+    # srvfd validation: 0..15 (per-task fd cap). Anything outside
+    # that band is definitely not an open fd. A precise "is it
+    # actually open?" check would consult fd_idx[srvfd] !=
+    # FD_CLOSED_MARK; we keep this lightweight at this milestone
+    # because the real fd consumer (the 9P client) doesn't exist
+    # yet and the mount table just stores the int.
+    if srvfd < 0 or srvfd >= 16:
+        set_current_errstr("mount failed: bad srvfd")
+        return cast[int64](-1)
+    old_buf: Array[128, uint8]
+    if _copy_user_path(old_user, &old_buf[0], MAXPATH) < 0:
+        set_current_errstr("mount failed: old path too long")
+        return cast[int64](-1)
+    # spec is optional (Plan 9 callers pass an empty string when
+    # the server has a single default tree). NULL is fine — chan.ad
+    # ignores it for the Phase C stub.
+    spec_ptr: Ptr[uint8] = cast[Ptr[uint8]](spec_user)
+    rc: int32 = mnttab_mount(srvfd, &old_buf[0], flag, spec_ptr)
+    if rc < 0:
+        set_current_errstr("mount failed: mount table full")
+        return cast[int64](-1)
+    return 0
+
+
+# --- do_unmount ------------------------------------------------------
+#
+# Plan 9 `unmount(new, old)`. Two shapes:
+#
+#   * new == NULL: remove every binding at `old`. Used by callers
+#     that want to wholesale clear a mount point ("unmount /dev/win").
+#
+#   * new != NULL: remove the specific `new -> old` edge. Used by
+#     callers that want to peel back one branch of a union mount
+#     without touching others.
+#
+# Returns 0 on success (>= 1 entry removed), -1 if no matching
+# binding existed (errstr "not mounted").
+
+def do_unmount(new_user: uint64, old_user: uint64) -> int64:
+    if old_user == 0:
+        set_current_errstr("unmount failed: null old path")
+        return cast[int64](-1)
+    old_buf: Array[128, uint8]
+    if _copy_user_path(old_user, &old_buf[0], MAXPATH) < 0:
+        set_current_errstr("unmount failed: old path too long")
+        return cast[int64](-1)
+    # new is optional; NULL is the "unbind everything at old" idiom.
+    new_buf: Array[128, uint8]
+    new_ptr: Ptr[uint8] = cast[Ptr[uint8]](0)
+    if new_user != 0:
+        if _copy_user_path(new_user, &new_buf[0], MAXPATH) < 0:
+            set_current_errstr("unmount failed: new path too long")
+            return cast[int64](-1)
+        new_ptr = &new_buf[0]
+    rc: int32 = mnttab_unmount(new_ptr, &old_buf[0])
+    if rc < 0:
+        set_current_errstr("unmount failed: not mounted")
+        return cast[int64](-1)
+    return 0
