@@ -1,0 +1,685 @@
+# sys/src/9/port/sysfile.ad
+#
+# Layer 1 (Plan 9-shape) file-operations syscall bodies. Mirrors
+# 9front's /sys/src/9/port/sysfile.c at minimal scale. M16.101 opens
+# this file with the five primitives that round out Phase C's file-
+# operations cluster:
+#
+#   * do_create   (SYS_CREATE   = 260) — create-or-truncate + open
+#   * do_stat     (SYS_STAT_P9  = 261) — serialise a Dir record by path
+#   * do_fstat    (SYS_FSTAT_P9 = 262) — same, but by open fd
+#   * do_remove   (SYS_REMOVE   = 263) — alias for vfs_unlink
+#   * do_fd2path  (SYS_FD2PATH  = 264) — recover a path from an open fd
+#
+# After this milestone Phase C's file surface is usable from native
+# Adder code; the remaining holes (bind / mount / unmount) need a
+# chan.ad skeleton + a real mount table — Phase D scope.
+#
+# Coexistence: the existing Linux-shape callers (SYS_OPEN_WRITE = 13,
+# SYS_UNLINK = 21, SYS_MKDIR = 22) stay around verbatim; Phase G
+# retires them once everything has been migrated to the Plan 9
+# numbers. Both numberings work concurrently today.
+#
+# Dir-record layout follows docs/native-api.md ("Directory format"),
+# which mirrors 9P's stat message:
+#
+#   size[2]                          record length minus the 2 size bytes
+#   type[2]    dev[4]                device-specific identifiers
+#   qid.type[1] qid.vers[4] qid.path[8]   unique inode identity
+#   mode[4]    atime[4] mtime[4] length[8]
+#   name[s]    uid[s] gid[s] muid[s]  counted strings: 2-byte length + UTF-8
+#
+# `s` strings are length[2] + UTF-8 bytes (no NUL).
+
+from kernel.sched.core import (
+    TaskStruct, current_task, current_idx_get,
+    set_current_errstr,
+)
+from fs.vfs import (
+    vfs_open, vfs_open_write, vfs_unlink, vfs_close,
+    resolve_path,
+)
+from fs.cpio import (
+    initramfs_entry_count, initramfs_entry_name,
+    initramfs_entry_size,
+)
+from arch.x86.kernel.time import get_jiffies
+
+# FD_*_MARK constants we recognise on the fstat path. Imported here
+# (rather than dereferencing fd_idx integers blindly) so the synthetic
+# Dir records the special-file fds produce carry sensible names —
+# 'cons' for /dev/cons, 'time' for /dev/time, etc.
+from kernel.sched.core import (
+    FD_CLOSED_MARK, FD_CONS_MARK, FD_TIME_MARK, FD_PID_MARK,
+    FD_RANDOM_MARK, FD_DEVNULL_MARK, FD_DEVZERO_MARK,
+    FD_STDIN_MARK, FD_STDOUT_MARK, FD_STDERR_MARK,
+    FD_DIR_MARK, FD_PIPE_MARK_R, FD_PIPE_MARK_W,
+    FD_TMPFS_MARK, FD_FAT_MARK, FD_EXT4_MARK,
+    FD_BUFFER_MARK, FD_SOCKET_MARK,
+)
+
+
+# --- Plan 9 mode-bit constants -----------------------------------
+# Mirrors 9front's <libc.h> DM* set. We only use a handful right now;
+# the rest are kept here for documentation + future wstat code.
+DMDIR:     uint32 = 0x80000000      # directory
+DMAPPEND:  uint32 = 0x40000000      # append-only
+DMEXCL:    uint32 = 0x20000000      # exclusive use
+DMTMP:     uint32 = 0x04000000      # temporary
+DMREAD:    uint32 = 0x00000004      # readable
+DMWRITE:   uint32 = 0x00000002      # writable
+DMEXEC:    uint32 = 0x00000001      # executable
+DMRDWR:    uint32 = 0x00000006      # readable + writable (convenience)
+
+# qid.type bits (9P). Only QTDIR matters today; the others are here
+# for completeness so future wstat/dir-record writers don't have to
+# look up the spec.
+QTDIR:     uint8 = 0x80
+QTAPPEND:  uint8 = 0x40
+QTEXCL:    uint8 = 0x20
+QTAUTH:    uint8 = 0x08
+QTTMP:     uint8 = 0x04
+QTFILE:    uint8 = 0x00
+
+
+# Universal owner triple for files we don't track per-inode metadata
+# for (everything at this milestone). 9front init-rc sets these from
+# /adm/users; Hamnix has no users database yet, so we hard-code the
+# single-user name baked into /etc/passwd ("hamnix").
+HAMNIX_USER_LEN: uint64 = 6     # "hamnix"
+
+
+def _ascii_hamnix(p: Ptr[uint8]):
+    # Write the 6 ASCII bytes "hamnix" into p[0..6]. Used by the Dir
+    # serialiser for the three owner-triple slots (uid / gid / muid).
+    p[0] = 104    # 'h'
+    p[1] = 97     # 'a'
+    p[2] = 109    # 'm'
+    p[3] = 110    # 'n'
+    p[4] = 105    # 'i'
+    p[5] = 120    # 'x'
+
+
+# --- little-endian byte writers -----------------------------------
+# 9P's stat record is little-endian (per stat(5)); we follow. Adder
+# doesn't have a `memcpy_le` primitive, so we open-code the byte writes
+# at each call site through these tiny helpers.
+
+def _write_le16(p: Ptr[uint8], v: uint64):
+    p[0] = cast[uint8](v & 0xFF)
+    p[1] = cast[uint8]((v >> 8) & 0xFF)
+
+
+def _write_le32(p: Ptr[uint8], v: uint64):
+    p[0] = cast[uint8](v & 0xFF)
+    p[1] = cast[uint8]((v >> 8) & 0xFF)
+    p[2] = cast[uint8]((v >> 16) & 0xFF)
+    p[3] = cast[uint8]((v >> 24) & 0xFF)
+
+
+def _write_le64(p: Ptr[uint8], v: uint64):
+    p[0] = cast[uint8](v & 0xFF)
+    p[1] = cast[uint8]((v >> 8) & 0xFF)
+    p[2] = cast[uint8]((v >> 16) & 0xFF)
+    p[3] = cast[uint8]((v >> 24) & 0xFF)
+    p[4] = cast[uint8]((v >> 32) & 0xFF)
+    p[5] = cast[uint8]((v >> 40) & 0xFF)
+    p[6] = cast[uint8]((v >> 48) & 0xFF)
+    p[7] = cast[uint8]((v >> 56) & 0xFF)
+
+
+def _cstr_len_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _basename_offset(path: Ptr[uint8]) -> uint64:
+    # Return the offset into `path` of the basename component (the
+    # first byte after the final '/'). For "/etc/motd" returns the
+    # offset of 'm'. For a path with no '/' (impossible after
+    # resolve_path, but defensive) returns 0.
+    n: uint64 = _cstr_len_u8(path)
+    if n == 0:
+        return 0
+    # Walk backwards to the first '/'. n-1 is the last char; if it's
+    # itself a '/' (e.g. "/"), the basename is empty and we return n
+    # — caller writes a zero-length string.
+    i: uint64 = n
+    while i > 0:
+        i = i - 1
+        if path[i] == 47:        # '/'
+            return i + 1
+    return 0
+
+
+# --- Dir-record serialiser ----------------------------------------
+# Writes a 9P-shape stat message into `buf[0..]`, capped at nbuf
+# bytes. Returns the number of bytes that the COMPLETE record would
+# take (so the caller can decide whether truncation happened). If the
+# buffer is too small to hold the fixed prefix (41 bytes) plus all
+# four counted-string headers (8 bytes), we set errstr and return 0
+# — the caller surfaces this as -1.
+
+def _write_dir_record(buf_user: uint64, nbuf: uint64,
+                      qid_type: uint8, qid_path: uint64,
+                      mode: uint32, length: uint64,
+                      name: Ptr[uint8], name_len: uint64) -> int64:
+    # Fixed prefix (offsets are FROM the buffer start):
+    #
+    #   0..1    size (set last, once we know the record length)
+    #   2..3    type
+    #   4..7    dev
+    #   8       qid.type
+    #   9..12   qid.vers
+    #  13..20   qid.path
+    #  21..24   mode
+    #  25..28   atime
+    #  29..32   mtime
+    #  33..40   length
+    #  41..     name[s] uid[s] gid[s] muid[s]
+    #
+    # We need 41 bytes for the fixed prefix + at least 8 bytes for
+    # the four 2-byte string-length headers (even with zero-length
+    # strings) = 49 minimum. A 1-byte name + 6-byte hamnix triple
+    # adds 1 + 6*3 = 19 bytes → 68 byte typical record.
+    # docs/native-api.md's "~63 bytes minimum for a NAME='X' file"
+    # ignores the four length headers' 8 bytes; the real minimum we
+    # produce is 49 + name_len + 3*HAMNIX_USER_LEN.
+    needed: uint64 = 49 + name_len + 3 * HAMNIX_USER_LEN
+    if nbuf < needed:
+        set_current_errstr("stat buffer too small")
+        return cast[int64](-1)
+    buf: Ptr[uint8] = cast[Ptr[uint8]](buf_user)
+    # Fixed prefix. atime and mtime share the same value at this
+    # milestone (no per-inode mtime tracking; we use boot-relative
+    # jiffies converted to ns by multiplying by 10_000_000 since
+    # M16.86's jiffies tick is 10 ms).
+    now: uint64 = get_jiffies() * 10000000
+    _write_le16(&buf[2],  0)                       # type
+    _write_le32(&buf[4],  0)                       # dev
+    buf[8] = qid_type                              # qid.type
+    _write_le32(&buf[9],  0)                       # qid.vers
+    _write_le64(&buf[13], qid_path)                # qid.path
+    _write_le32(&buf[21], cast[uint64](mode))      # mode
+    _write_le32(&buf[25], now & 0xFFFFFFFF)        # atime (low 32)
+    _write_le32(&buf[29], now & 0xFFFFFFFF)        # mtime (low 32)
+    _write_le64(&buf[33], length)                  # length
+    # Counted strings. Each is "length[2] + UTF-8 bytes" (no NUL).
+    off: uint64 = 41
+    # name
+    _write_le16(&buf[off], name_len)
+    off = off + 2
+    i: uint64 = 0
+    while i < name_len:
+        buf[off + i] = name[i]
+        i = i + 1
+    off = off + name_len
+    # uid
+    _write_le16(&buf[off], HAMNIX_USER_LEN)
+    off = off + 2
+    _ascii_hamnix(&buf[off])
+    off = off + HAMNIX_USER_LEN
+    # gid
+    _write_le16(&buf[off], HAMNIX_USER_LEN)
+    off = off + 2
+    _ascii_hamnix(&buf[off])
+    off = off + HAMNIX_USER_LEN
+    # muid
+    _write_le16(&buf[off], HAMNIX_USER_LEN)
+    off = off + 2
+    _ascii_hamnix(&buf[off])
+    off = off + HAMNIX_USER_LEN
+    # Finally fill in size[2] = total_bytes - 2.
+    _write_le16(&buf[0], off - 2)
+    return cast[int64](off)
+
+
+# --- name matching against the cpio archive -----------------------
+# fs/vfs.ad's _lookup_name is module-private; rather than widening its
+# visibility we re-implement a tiny matcher here. Returns the inode
+# index (>= 0) on hit, -1 on miss.
+
+def _cpio_lookup(name: Ptr[uint8]) -> int32:
+    count: uint64 = initramfs_entry_count()
+    i: uint64 = 0
+    while i < count:
+        cand: Ptr[char] = initramfs_entry_name(i)
+        # Equal-length C-string compare.
+        k: uint64 = 0
+        eq: int32 = 1
+        while True:
+            ca: int32 = cast[int32](name[k] & 0xFF)
+            cb: int32 = cand[k]
+            if ca != cb:
+                eq = 0
+                break
+            if ca == 0:
+                break
+            k = k + 1
+        if eq != 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+# --- do_create ----------------------------------------------------
+# 9front's syscreate is "atomically create-or-truncate + open for
+# I/O". Hamnix's vfs_open_write already does open-or-create plus
+# truncate (M16.61 ext4 path, plus the tmpfs path since M16.49), so
+# we route through it for everything except the DMDIR case.
+#
+# DMDIR: callers want `create("/tmp/dir", OWRITE, DMDIR|0755)` to
+# create a directory and return an fd to it. Hamnix has no mkdir
+# backend at this milestone (SYS_MKDIR=22 is a no-op stub since
+# M16.45); we report -ENOSYS via errstr so userland sees the gap
+# cleanly instead of silently getting a regular-file fd.
+#
+# flags / mode bits beyond DMDIR are accepted but currently
+# unhonoured: there is no per-fd flag store in TaskStruct yet, so
+# OAPPEND / ORCLOSE / OCEXEC are silently dropped. The migration
+# table in docs/native-api.md notes this; Phase G adds fd flag
+# tracking alongside the SYS_OPEN_WRITE retirement.
+
+def do_create(path_user: uint64, flags: int32, mode: uint32) -> int64:
+    # Resolve to absolute first, so vfs_open_write sees the canonical
+    # form (matches SYS_OPEN_WRITE's behaviour) and the errstr we set
+    # on failure references a stable path.
+    if path_user == 0:
+        set_current_errstr("create failed: null path")
+        return cast[int64](-1)
+    abs_path: Array[256, uint8]
+    rc: int32 = resolve_path(cast[Ptr[char]](path_user),
+                             &abs_path[0], 256)
+    if rc != 0:
+        set_current_errstr("create failed: path too long")
+        return cast[int64](-1)
+    # DMDIR: directory creation. No mkdir backend yet — report the
+    # gap via errstr and surface as -1.
+    if (mode & DMDIR) != 0:
+        set_current_errstr("create failed: DMDIR not supported")
+        return cast[int64](-1)
+    fd: int32 = vfs_open_write(cast[Ptr[char]](&abs_path[0]))
+    if fd < 0:
+        # vfs_open_write returns negative errno codes (EROFS / EMFILE /
+        # ENOSPC). Surface a single human-readable reason — the caller
+        # can call errstr(2) to get the message.
+        set_current_errstr("create failed: open_write returned error")
+        return cast[int64](-1)
+    # flags / mode bits beyond DMDIR are accepted silently for now;
+    # see the function header for the rationale + Phase G plan.
+    return cast[int64](fd)
+
+
+# --- do_stat ------------------------------------------------------
+# Look up `path` in the initramfs (other FS backends to follow as
+# they grow stat support) and serialise a Dir record into `buf`.
+# Returns the number of bytes written on success, -1 on failure
+# with errstr set.
+
+def do_stat(path_user: uint64, buf_user: uint64,
+            nbuf: uint64) -> int64:
+    if path_user == 0 or buf_user == 0:
+        set_current_errstr("stat failed: null pointer")
+        return cast[int64](-1)
+    abs_path: Array[256, uint8]
+    rc: int32 = resolve_path(cast[Ptr[char]](path_user),
+                             &abs_path[0], 256)
+    if rc != 0:
+        set_current_errstr("stat failed: path too long")
+        return cast[int64](-1)
+    # cpio / initramfs lookup. tmpfs / ext4 / fat support lands in a
+    # follow-up — for now those paths fall through to "not found".
+    idx: int32 = _cpio_lookup(&abs_path[0])
+    if idx < 0:
+        set_current_errstr("stat failed: file does not exist")
+        return cast[int64](-1)
+    # Build the Dir record. qid.path = inode index, qid.type = file
+    # (cpio is flat so we never hit DMDIR here), mode = 0644.
+    name_off: uint64 = _basename_offset(&abs_path[0])
+    name_len: uint64 = _cstr_len_u8(&abs_path[0]) - name_off
+    size: uint64 = initramfs_entry_size(cast[uint64](idx))
+    return _write_dir_record(buf_user, nbuf,
+                             QTFILE, cast[uint64](idx),
+                             cast[uint32](0644),
+                             size, &abs_path[name_off], name_len)
+
+
+# --- do_fstat -----------------------------------------------------
+# Same as do_stat but by open fd. The per-task fd table tells us
+# what kind of file is behind each slot:
+#
+#   * Initramfs (file_idx < FD_*_MARK constants) — mirror do_stat
+#     using the recorded inode index.
+#   * Special FD_*_MARK files — synthesise a Dir whose name reflects
+#     the device (cons / time / pid / random) and mode is "live"
+#     (DMRDWR | 0666). length is 0 — these are streams, not files.
+#   * Anything else (TMPFS / FAT / EXT4 / pipes) — return -1 with a
+#     "fstat: backend not supported" errstr. Phase G expands as each
+#     backend grows a stat hook.
+
+def _synth_special_dir(buf_user: uint64, nbuf: uint64,
+                       name: Ptr[uint8], name_len: uint64,
+                       mode: uint32, qid_path: uint64) -> int64:
+    return _write_dir_record(buf_user, nbuf,
+                             QTFILE, qid_path,
+                             mode, 0,
+                             name, name_len)
+
+
+def do_fstat(fd: int32, buf_user: uint64, nbuf: uint64) -> int64:
+    if buf_user == 0:
+        set_current_errstr("fstat failed: null buffer")
+        return cast[int64](-1)
+    if fd < 0 or fd >= 16:
+        set_current_errstr("fstat failed: bad fd")
+        return cast[int64](-1)
+    task: Ptr[TaskStruct] = current_task()
+    fdu: uint64 = cast[uint64](fd)
+    file_idx: uint32 = task[0].fd_idx[fdu]
+    if file_idx == FD_CLOSED_MARK:
+        set_current_errstr("fstat failed: fd not open")
+        return cast[int64](-1)
+    # Specialised devices. Each gets a 'cons' / 'time' / 'pid' /
+    # 'random' name and DMRDWR | 0666; qid.path uses the FD mark
+    # value itself so two stats of the same /dev file return the
+    # same qid (Plan 9 idiom).
+    cons:   Array[5, uint8]
+    cons[0] = 99    # 'c'
+    cons[1] = 111   # 'o'
+    cons[2] = 110   # 'n'
+    cons[3] = 115   # 's'
+    cons[4] = 0
+    time4: Array[5, uint8]
+    time4[0] = 116  # 't'
+    time4[1] = 105  # 'i'
+    time4[2] = 109  # 'm'
+    time4[3] = 101  # 'e'
+    time4[4] = 0
+    pid3:  Array[4, uint8]
+    pid3[0] = 112   # 'p'
+    pid3[1] = 105   # 'i'
+    pid3[2] = 100   # 'd'
+    pid3[3] = 0
+    rand:  Array[7, uint8]
+    rand[0] = 114   # 'r'
+    rand[1] = 97    # 'a'
+    rand[2] = 110   # 'n'
+    rand[3] = 100   # 'd'
+    rand[4] = 111   # 'o'
+    rand[5] = 109   # 'm'
+    rand[6] = 0
+    rdwr: uint32 = DMRDWR | cast[uint32](0666)
+    if file_idx == FD_CONS_MARK:
+        return _synth_special_dir(buf_user, nbuf, &cons[0], 4,
+                                  rdwr, cast[uint64](FD_CONS_MARK))
+    if file_idx == FD_TIME_MARK:
+        return _synth_special_dir(buf_user, nbuf, &time4[0], 4,
+                                  rdwr, cast[uint64](FD_TIME_MARK))
+    if file_idx == FD_PID_MARK:
+        return _synth_special_dir(buf_user, nbuf, &pid3[0], 3,
+                                  rdwr, cast[uint64](FD_PID_MARK))
+    if file_idx == FD_RANDOM_MARK:
+        return _synth_special_dir(buf_user, nbuf, &rand[0], 6,
+                                  rdwr, cast[uint64](FD_RANDOM_MARK))
+    if file_idx == FD_DEVNULL_MARK or file_idx == FD_DEVZERO_MARK:
+        # 'null' / 'zero' — same shape as the cdevs above.
+        null4: Array[5, uint8]
+        null4[0] = 110  # 'n'
+        null4[1] = 117  # 'u'
+        null4[2] = 108  # 'l'
+        null4[3] = 108  # 'l'
+        null4[4] = 0
+        zero4: Array[5, uint8]
+        zero4[0] = 122  # 'z'
+        zero4[1] = 101  # 'e'
+        zero4[2] = 114  # 'r'
+        zero4[3] = 111  # 'o'
+        zero4[4] = 0
+        if file_idx == FD_DEVNULL_MARK:
+            return _synth_special_dir(buf_user, nbuf, &null4[0], 4,
+                                      rdwr, cast[uint64](FD_DEVNULL_MARK))
+        return _synth_special_dir(buf_user, nbuf, &zero4[0], 4,
+                                  rdwr, cast[uint64](FD_DEVZERO_MARK))
+    if file_idx == FD_STDIN_MARK or file_idx == FD_STDOUT_MARK \
+            or file_idx == FD_STDERR_MARK:
+        # 'stdin' / 'stdout' / 'stderr'. Plan 9 routes these through
+        # /dev/cons but they have their own fd identities; reflect
+        # that with the literal stdio name.
+        sname: Array[7, uint8]
+        sname[0] = 115  # 's'
+        sname[1] = 116  # 't'
+        sname[2] = 100  # 'd'
+        slen: uint64 = 0
+        qid: uint64 = 0
+        if file_idx == FD_STDIN_MARK:
+            sname[3] = 105  # 'i'
+            sname[4] = 110  # 'n'
+            slen = 5
+            qid = cast[uint64](FD_STDIN_MARK)
+        elif file_idx == FD_STDOUT_MARK:
+            sname[3] = 111  # 'o'
+            sname[4] = 117  # 'u'
+            sname[5] = 116  # 't'
+            slen = 6
+            qid = cast[uint64](FD_STDOUT_MARK)
+        else:
+            sname[3] = 101  # 'e'
+            sname[4] = 114  # 'r'
+            sname[5] = 114  # 'r'
+            slen = 6
+            qid = cast[uint64](FD_STDERR_MARK)
+        return _synth_special_dir(buf_user, nbuf, &sname[0], slen,
+                                  rdwr, qid)
+    if file_idx == FD_DIR_MARK:
+        # Generic 'dir' synthetic stat. Phase G expands to carry the
+        # opened path through the FD_DIR_MARK fd so we can return the
+        # real directory name.
+        dname: Array[4, uint8]
+        dname[0] = 100  # 'd'
+        dname[1] = 105  # 'i'
+        dname[2] = 114  # 'r'
+        dname[3] = 0
+        dmode: uint32 = DMDIR | cast[uint32](0755)
+        return _write_dir_record(buf_user, nbuf,
+                                 QTDIR, 0,
+                                 dmode, 0,
+                                 &dname[0], 3)
+    if file_idx == FD_PIPE_MARK_R or file_idx == FD_PIPE_MARK_W:
+        pname: Array[5, uint8]
+        pname[0] = 112  # 'p'
+        pname[1] = 105  # 'i'
+        pname[2] = 112  # 'p'
+        pname[3] = 101  # 'e'
+        pname[4] = 0
+        return _synth_special_dir(buf_user, nbuf, &pname[0], 4,
+                                  rdwr, cast[uint64](file_idx))
+    if file_idx == FD_TMPFS_MARK or file_idx == FD_FAT_MARK \
+            or file_idx == FD_EXT4_MARK or file_idx == FD_BUFFER_MARK \
+            or file_idx == FD_SOCKET_MARK:
+        # Per-backend stat hooks land in a follow-up; surface as
+        # "unsupported" today so callers can detect the gap.
+        set_current_errstr("fstat: backend not supported")
+        return cast[int64](-1)
+    # Real initramfs file. fd_idx holds the cpio inode index directly.
+    name_p: Ptr[char] = initramfs_entry_name(cast[uint64](file_idx))
+    # initramfs paths are absolute already ("/init", "/bin/cat" etc).
+    base_off: uint64 = _basename_offset(cast[Ptr[uint8]](name_p))
+    name_len: uint64 = _cstr_len_u8(cast[Ptr[uint8]](name_p)) - base_off
+    size: uint64 = initramfs_entry_size(cast[uint64](file_idx))
+    return _write_dir_record(buf_user, nbuf,
+                             QTFILE, cast[uint64](file_idx),
+                             cast[uint32](0644),
+                             size,
+                             cast[Ptr[uint8]](name_p + base_off),
+                             name_len)
+
+
+# --- do_remove ----------------------------------------------------
+# Thin wrapper over vfs_unlink. Per docs/native-api.md the migration
+# table table says SYS_REMOVE replaces SYS_UNLINK semantically; both
+# stay live concurrently until Phase G retires the latter.
+
+def do_remove(path_user: uint64) -> int64:
+    if path_user == 0:
+        set_current_errstr("remove failed: null path")
+        return cast[int64](-1)
+    abs_path: Array[256, uint8]
+    rc: int32 = resolve_path(cast[Ptr[char]](path_user),
+                             &abs_path[0], 256)
+    if rc != 0:
+        set_current_errstr("remove failed: path too long")
+        return cast[int64](-1)
+    rc = vfs_unlink(cast[Ptr[char]](&abs_path[0]))
+    if rc < 0:
+        set_current_errstr("remove failed: unlink returned error")
+        return cast[int64](-1)
+    return 0
+
+
+# --- do_fd2path ---------------------------------------------------
+# Recover a "best-effort" path for an open fd. The brk agent owns
+# TaskStruct edits this round so we CAN NOT add a per-fd path field;
+# instead we look up the cpio inode index stored alongside the fd
+# (when the fd backs an initramfs file) and return the canonical
+# archive name. This differs from 9front's sysfd2path, which returns
+# the EXACT path the caller called open() with — including symlink
+# detours and namespace-relative spellings. The limitation is
+# documented inline; Phase G adds a real per-fd path slot.
+#
+# For FD_*_MARK fds we return a synthetic "/dev/<name>" string so
+# callers writing a path-based round-trip (open + fd2path + open)
+# can at least try.
+
+def _emit_path(buf_user: uint64, nbuf: uint64,
+               src: Ptr[uint8], src_len: uint64) -> int64:
+    # Copy src[0..src_len] into buf_user, NUL-terminated, truncating
+    # at nbuf-1. Returns bytes written (incl NUL). Mirrors getcwd's
+    # semantics so userland already has a copy idiom for this shape.
+    if buf_user == 0 or nbuf == 0:
+        set_current_errstr("fd2path failed: buffer too small")
+        return cast[int64](-1)
+    dst: Ptr[uint8] = cast[Ptr[uint8]](buf_user)
+    n: uint64 = src_len
+    if n + 1 > nbuf:
+        set_current_errstr("fd2path failed: buffer too small")
+        return cast[int64](-1)
+    i: uint64 = 0
+    while i < n:
+        dst[i] = src[i]
+        i = i + 1
+    dst[i] = 0
+    return cast[int64](i + 1)
+
+
+def do_fd2path(fd: int32, buf_user: uint64, nbuf: uint64) -> int64:
+    if fd < 0 or fd >= 16:
+        set_current_errstr("fd2path failed: bad fd")
+        return cast[int64](-1)
+    task: Ptr[TaskStruct] = current_task()
+    fdu: uint64 = cast[uint64](fd)
+    file_idx: uint32 = task[0].fd_idx[fdu]
+    if file_idx == FD_CLOSED_MARK:
+        set_current_errstr("fd2path failed: fd not open")
+        return cast[int64](-1)
+    # Special files map back to their canonical /dev path. The
+    # arrays are stack-local so the helper can take a Ptr[uint8].
+    cons_path:  Array[10, uint8]
+    cons_path[0] = 47    # '/'
+    cons_path[1] = 100   # 'd'
+    cons_path[2] = 101   # 'e'
+    cons_path[3] = 118   # 'v'
+    cons_path[4] = 47    # '/'
+    cons_path[5] = 99    # 'c'
+    cons_path[6] = 111   # 'o'
+    cons_path[7] = 110   # 'n'
+    cons_path[8] = 115   # 's'
+    cons_path[9] = 0
+    if file_idx == FD_CONS_MARK:
+        return _emit_path(buf_user, nbuf, &cons_path[0], 9)
+    time_path:  Array[10, uint8]
+    time_path[0] = 47    # '/'
+    time_path[1] = 100   # 'd'
+    time_path[2] = 101   # 'e'
+    time_path[3] = 118   # 'v'
+    time_path[4] = 47    # '/'
+    time_path[5] = 116   # 't'
+    time_path[6] = 105   # 'i'
+    time_path[7] = 109   # 'm'
+    time_path[8] = 101   # 'e'
+    time_path[9] = 0
+    if file_idx == FD_TIME_MARK:
+        return _emit_path(buf_user, nbuf, &time_path[0], 9)
+    pid_path:   Array[9, uint8]
+    pid_path[0] = 47     # '/'
+    pid_path[1] = 100    # 'd'
+    pid_path[2] = 101    # 'e'
+    pid_path[3] = 118    # 'v'
+    pid_path[4] = 47     # '/'
+    pid_path[5] = 112    # 'p'
+    pid_path[6] = 105    # 'i'
+    pid_path[7] = 100    # 'd'
+    pid_path[8] = 0
+    if file_idx == FD_PID_MARK:
+        return _emit_path(buf_user, nbuf, &pid_path[0], 8)
+    rand_path:  Array[12, uint8]
+    rand_path[0]  = 47    # '/'
+    rand_path[1]  = 100   # 'd'
+    rand_path[2]  = 101   # 'e'
+    rand_path[3]  = 118   # 'v'
+    rand_path[4]  = 47    # '/'
+    rand_path[5]  = 114   # 'r'
+    rand_path[6]  = 97    # 'a'
+    rand_path[7]  = 110   # 'n'
+    rand_path[8]  = 100   # 'd'
+    rand_path[9]  = 111   # 'o'
+    rand_path[10] = 109   # 'm'
+    rand_path[11] = 0
+    if file_idx == FD_RANDOM_MARK:
+        return _emit_path(buf_user, nbuf, &rand_path[0], 11)
+    null_path:  Array[10, uint8]
+    null_path[0] = 47
+    null_path[1] = 100
+    null_path[2] = 101
+    null_path[3] = 118
+    null_path[4] = 47
+    null_path[5] = 110   # 'n'
+    null_path[6] = 117   # 'u'
+    null_path[7] = 108   # 'l'
+    null_path[8] = 108   # 'l'
+    null_path[9] = 0
+    if file_idx == FD_DEVNULL_MARK:
+        return _emit_path(buf_user, nbuf, &null_path[0], 9)
+    zero_path:  Array[10, uint8]
+    zero_path[0] = 47
+    zero_path[1] = 100
+    zero_path[2] = 101
+    zero_path[3] = 118
+    zero_path[4] = 47
+    zero_path[5] = 122   # 'z'
+    zero_path[6] = 101   # 'e'
+    zero_path[7] = 114   # 'r'
+    zero_path[8] = 111   # 'o'
+    zero_path[9] = 0
+    if file_idx == FD_DEVZERO_MARK:
+        return _emit_path(buf_user, nbuf, &zero_path[0], 9)
+    # Backends without a path mapping: pipes / sockets / tmpfs /
+    # fat / ext4 / buffer / stdio. 9front would walk the chan's
+    # parent links to compose the path; Hamnix has no chan
+    # structure yet (Phase D scope). Surface the gap via errstr.
+    if file_idx == FD_PIPE_MARK_R or file_idx == FD_PIPE_MARK_W \
+            or file_idx == FD_SOCKET_MARK or file_idx == FD_TMPFS_MARK \
+            or file_idx == FD_FAT_MARK or file_idx == FD_EXT4_MARK \
+            or file_idx == FD_BUFFER_MARK or file_idx == FD_DIR_MARK \
+            or file_idx == FD_STDIN_MARK or file_idx == FD_STDOUT_MARK \
+            or file_idx == FD_STDERR_MARK:
+        set_current_errstr("fd2path: backend has no path")
+        return cast[int64](-1)
+    # Initramfs file. Return the cpio archive's canonical name —
+    # may differ from the path the caller passed to open() (Phase G
+    # adds per-fd path tracking to fix this).
+    name_p: Ptr[char] = initramfs_entry_name(cast[uint64](file_idx))
+    name_len: uint64 = _cstr_len_u8(cast[Ptr[uint8]](name_p))
+    return _emit_path(buf_user, nbuf,
+                      cast[Ptr[uint8]](name_p), name_len)

@@ -343,3 +343,33 @@ sys_rfork:
     syscall
     ret
     .size sys_rfork, .-sys_rfork
+
+
+    /* --- syscall6(nr, a0, a1, a2, a3, a4, a5) -> int64 ---------------
+     * Generic 6-arg syscall trampoline. SysV passes nr in %rdi, a0..a5
+     * in %rsi/%rdx/%rcx/%r8/%r9/[stack]; the kernel syscall ABI wants
+     * nr in %rax, a0..a5 in %rdi/%rsi/%rdx/%r10/%r8/%r9. We shuffle:
+     *   * %rax <- %rdi (nr)
+     *   * %rdi <- %rsi (a0)
+     *   * %rsi <- %rdx (a1)
+     *   * %rdx <- %rcx (a2)
+     *   * %r10 <- %r8  (a3)
+     *   * %r8  <- %r9  (a4)
+     *   * %r9  <- 8(%rsp) (a5; stack arg)
+     * %rcx is clobbered by SYSCALL (hardware writes user RIP there)
+     * so we don't preserve it. Used by tests/test_p9file.ad to reach
+     * SYS_CREATE/STAT/FSTAT/REMOVE/FD2PATH (260..264) without growing
+     * a dedicated wrapper for each. */
+    .globl syscall6
+    .type syscall6, @function
+syscall6:
+    movq    %rdi, %rax              /* nr */
+    movq    %rsi, %rdi              /* a0 */
+    movq    %rdx, %rsi              /* a1 */
+    movq    %rcx, %rdx              /* a2 */
+    movq    %r8,  %r10              /* a3 (rcx -> r10 swap for syscall ABI) */
+    movq    %r9,  %r8               /* a4 */
+    movq    8(%rsp), %r9            /* a5 from stack */
+    syscall
+    ret
+    .size syscall6, .-syscall6
