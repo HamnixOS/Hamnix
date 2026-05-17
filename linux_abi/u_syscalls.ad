@@ -70,6 +70,8 @@ from fs.vfs import (
     vfs_open, vfs_read, vfs_write, vfs_close, vfs_lseek,
     vfs_dup, vfs_dup2, vfs_unlink, resolve_path, vfs_pipe,
     vfs_listdir,
+    vfs_fd_is_dir, vfs_fd_dir_buf, vfs_fd_dir_buflen,
+    vfs_fd_dir_pos, vfs_fd_dir_set_pos,
 )
 from kernel.sched.core import (
     TaskStruct, current_task,
@@ -372,19 +374,101 @@ def _u_dup3(a0: uint64, a1: uint64, a2: uint64,
 def _u_getdents64(a0: uint64, a1: uint64, a2: uint64,
                   a3: uint64, a4: uint64, a5: uint64) -> int64:
     # ssize_t getdents64(int fd, void *dirp, size_t count)
-    # Hamnix doesn't yet open directories as fds — vfs_open returns
-    # -ENOENT for any directory path, so no fd ever holds dir state.
-    # Until that lands (post-U29: vfs_open(O_DIRECTORY) → FD_DIR_MARK
-    # backed by a kmalloc'd NAME\n buffer from vfs_listdir), every
-    # call here lands on a regular-file or pipe fd, for which Linux
-    # returns -ENOTDIR. busybox + glibc both handle that gracefully
-    # (they fall back to "this isn't a directory; nothing to list").
-    # Validating the fd first matches Linux's order of operations
-    # (EBADF beats ENOTDIR).
+    #
+    # U32: real directory enumeration. vfs_open() now snapshots
+    # immediate children of an opened directory into a kmalloc'd
+    # NAME\n buffer parked on the fd. We repackage each "NAME\n"
+    # entry into a struct linux_dirent64 written to *dirp:
+    #
+    #   struct linux_dirent64 {
+    #       ino64_t        d_ino;        // 8 bytes (monotonic counter)
+    #       off64_t        d_off;        // 8 bytes (next dir_pos)
+    #       unsigned short d_reclen;     // 2 bytes
+    #       unsigned char  d_type;       // 1 byte (DT_REG=8 default)
+    #       char           d_name[];     // NUL-terminated, padded
+    #   };
+    #
+    # d_reclen aligns the next entry to 8 bytes. EOF is reported as
+    # a 0 return; -EINVAL if the user buffer can't hold a single
+    # entry (the smallest possible reclen is 24 — 19-byte header
+    # rounded up — plus a 1-char name + NUL).
     if cast[int32](a0) < 0:
         return ELINUX_BADF
-    # No real directory-fd handling yet; everything else is "not a dir".
-    return ELINUX_NOTDIR
+    fd: int32 = cast[int32](a0)
+    if vfs_fd_is_dir(fd) == 0:
+        return ELINUX_NOTDIR
+    if a1 == 0:
+        return ELINUX_INVAL
+    if a2 == 0:
+        return ELINUX_INVAL
+
+    dir_buf:    uint64 = vfs_fd_dir_buf(fd)
+    dir_buflen: uint64 = vfs_fd_dir_buflen(fd)
+    dir_pos:    uint64 = vfs_fd_dir_pos(fd)
+
+    user: uint64 = a1
+    cap:  uint64 = a2
+    out:  uint64 = 0
+
+    while dir_pos < dir_buflen:
+        # Parse one NAME\n line from the kernel-side dir buffer.
+        line_start: uint64 = dir_pos
+        scan: uint64 = dir_pos
+        while scan < dir_buflen and \
+                cast[Ptr[uint8]](dir_buf + scan)[0] != 10:
+            scan = scan + 1
+        name_len: uint64 = scan - line_start
+        # Skip empty lines defensively (shouldn't happen but cheap).
+        if name_len == 0:
+            if scan < dir_buflen:
+                dir_pos = scan + 1
+            else:
+                dir_pos = scan
+            continue
+        # struct linux_dirent64 header is 19 bytes; +1 for NUL, then
+        # round up to 8-byte alignment for d_reclen.
+        reclen: uint64 = (19 + name_len + 1 + 7) & ~cast[uint64](7)
+        if out + reclen > cap:
+            # Not enough room for this entry. If we've already packed
+            # something, return that; otherwise this is a too-small
+            # caller buffer and Linux returns -EINVAL.
+            if out == 0:
+                return ELINUX_INVAL
+            vfs_fd_dir_set_pos(fd, dir_pos)
+            return cast[int64](out)
+        # Advance dir_pos past the line + its trailing '\n'.
+        next_pos: uint64 = scan
+        if next_pos < dir_buflen:
+            next_pos = next_pos + 1
+        # Lay down the entry.
+        ent: uint64 = user + out
+        # d_ino — fake monotonic counter derived from line offset so
+        # successive calls return stable values. Avoids zero (some
+        # buggy userspace treats ino==0 as deleted).
+        cast[Ptr[uint64]](ent + 0)[0]  = line_start + 1
+        # d_off — position to resume from on next getdents64 call.
+        cast[Ptr[uint64]](ent + 8)[0]  = next_pos
+        # d_reclen — total bytes for this entry incl padding.
+        cast[Ptr[uint16]](ent + 16)[0] = cast[uint16](reclen)
+        # d_type — DT_REG=8. We don't track types in the dir buffer,
+        # and busybox's ls doesn't need DT_DIR (it'll call lstat).
+        cast[Ptr[uint8]](ent + 18)[0]  = 8
+        # d_name + NUL.
+        i: uint64 = 0
+        while i < name_len:
+            cast[Ptr[uint8]](ent + 19 + i)[0] = \
+                cast[Ptr[uint8]](dir_buf + line_start + i)[0]
+            i = i + 1
+        cast[Ptr[uint8]](ent + 19 + name_len)[0] = 0
+        # Pad the rest of reclen with NULs.
+        while i + 19 + 1 < reclen:
+            cast[Ptr[uint8]](ent + 19 + i + 1)[0] = 0
+            i = i + 1
+        out = out + reclen
+        dir_pos = next_pos
+
+    vfs_fd_dir_set_pos(fd, dir_pos)
+    return cast[int64](out)
 
 
 def _u_getpid(a0: uint64, a1: uint64, a2: uint64,
@@ -1211,6 +1295,10 @@ ST_OFF_CTIME:    uint64 = 104
 # coreutils) just need "this is a regular file" to do the right
 # thing; a future device-aware fstat picks up S_IFCHR for ttys etc.
 STAT_MODE_REG:  uint32 = 0o100644
+# S_IFDIR | 0755 — used when fstat sees a directory-flavoured fd
+# (FD_DIR_MARK). busybox's ls / stat keys off the IFDIR bit to decide
+# "enumerate me with getdents64" vs "treat me as a regular file".
+STAT_MODE_DIR:  uint32 = 0o040755
 
 
 def _u_file_size_via_lseek(fd: int32) -> int64:
@@ -1244,7 +1332,12 @@ def _u_fill_stat(buf: uint64, fd: int32) -> int64:
     # ino requires plumbing tmpfs/ext4/initramfs ids out through vfs.
     cast[Ptr[uint64]](buf + ST_OFF_INO)[0] = cast[uint64](fd)
     cast[Ptr[uint64]](buf + ST_OFF_NLINK)[0] = 1
-    cast[Ptr[uint32]](buf + ST_OFF_MODE)[0] = STAT_MODE_REG
+    # U32: report S_IFDIR for directory-flavoured fds so ls(1) decides
+    # to enumerate via getdents64 instead of dumping the dir as a file.
+    mode_v: uint32 = STAT_MODE_REG
+    if vfs_fd_is_dir(fd) != 0:
+        mode_v = STAT_MODE_DIR
+    cast[Ptr[uint32]](buf + ST_OFF_MODE)[0] = mode_v
     cast[Ptr[uint32]](buf + ST_OFF_UID)[0] = 0
     cast[Ptr[uint32]](buf + ST_OFF_GID)[0] = 0
     cast[Ptr[uint64]](buf + ST_OFF_RDEV)[0] = 0
@@ -1330,24 +1423,46 @@ def _u_newfstatat(a0: uint64, a1: uint64, a2: uint64,
                   a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int newfstatat(int dirfd, const char *path, struct stat *buf,
     #                int flags)
-    # Only AT_FDCWD is supported as dirfd (and we ignore the value —
-    # resolve_path consults the task's cwd directly). Flag handling
-    # is minimal: anything other than 0 is reported via printk and
-    # returns -EINVAL, so a regression that starts passing
-    # AT_SYMLINK_NOFOLLOW is visible in the kernel log instead of
-    # silently ignored.
+    # Three dispatch shapes we handle:
+    #   (a) dirfd==AT_FDCWD, path absolute or relative: open + fill.
+    #   (b) dirfd==AT_FDCWD with path absolute: same body.
+    #   (c) AT_EMPTY_PATH set + path == "": stat dirfd directly.
+    # U32 adds (c) because busybox's ls passes a dir fd it just
+    # opened with O_PATH-style flags and asks "what is this fd?".
+    # AT_SYMLINK_NOFOLLOW is accepted-but-ignored (we have no
+    # symlinks); other flag bits still get logged + -EINVAL.
     if a1 == 0 or a2 == 0:
         return ELINUX_INVAL
-    if a3 != 0:
+    flags: uint64 = a3
+    empty_path: int32 = 0
+    if (flags & AT_EMPTY_PATH) != 0:
+        empty_path = 1
+        flags = flags & ~AT_EMPTY_PATH
+    if (flags & AT_SYMLINK_NOFOLLOW) != 0:
+        flags = flags & ~AT_SYMLINK_NOFOLLOW
+    if flags != 0:
         printk2("linux_u: newfstatat unsupported flags=%x path=%x\n",
                 a3, a1)
         return ELINUX_INVAL
-    # Resolve the path (absolute or cwd-relative) and open it. We
-    # don't honour non-AT_FDCWD dirfd at this milestone — that needs
-    # a per-fd dirpath which Hamnix's vfs doesn't track yet.
-    if a0 != AT_FDCWD_U64:
-        # Treat anything else as -EBADF; openat-style dirfd needs
-        # task-level open-directory bookkeeping we don't have yet.
+    # AT_EMPTY_PATH with an empty path string: stat the dirfd itself.
+    p: Ptr[char] = cast[Ptr[char]](a1)
+    is_empty: int32 = 0
+    if cast[uint8](p[0] & 0xFF) == 0:
+        is_empty = 1
+    if empty_path != 0 and is_empty != 0:
+        # Treat dirfd as the fd to fstat. AT_FDCWD with empty path is
+        # not a thing busybox does — bail with EBADF for unknowns.
+        if a0 == AT_FDCWD_U64:
+            return ELINUX_BADF
+        return _u_fill_stat(a2, cast[int32](a0))
+    # Absolute paths ignore dirfd per the openat(2) / fstatat(2) man
+    # pages, so we accept any dirfd as long as the path is absolute.
+    # Only relative paths require AT_FDCWD (until per-fd dirpath state
+    # arrives in a later milestone).
+    is_abs: int32 = 0
+    if cast[uint8](p[0] & 0xFF) == 47:                # '/'
+        is_abs = 1
+    if a0 != AT_FDCWD_U64 and is_abs == 0:
         return ELINUX_BADF
     abs_path: Array[256, uint8]
     rc: int32 = resolve_path(cast[Ptr[char]](a1), &abs_path[0], 256)
