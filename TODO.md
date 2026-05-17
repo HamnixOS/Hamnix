@@ -269,11 +269,28 @@ it has to honour.
     RAL/RAH — QEMU always loads MAC from `-device e1000e,mac=...`,
     but some real cards leave RAH.AV cleared until the driver
     issues an EERD-paced 16-bit-at-a-time read.
-- Realtek r8169-family NIC driver — covers most consumer ASUS /
-  Gigabyte / MSI motherboards + ThinkPads + gaming laptops
-  (vendor 0x10EC, devices 0x8168 / 0x8169 / 0x8139). After
-  e1000e (Intel) + virtio-net (QEMU), Realtek is the remaining
-  high-volume gap on real-hardware NIC coverage.
+- ~~Realtek r8169-family NIC driver — shipped in M16.105. Probes
+  vendor 0x10EC + class 0x02/0x00 with device-ID whitelist {0x8139,
+  0x8136, 0x8161, 0x8168, 0x8169}; the RTL8139 path is fully
+  implemented (PIO BAR0, software reset, MAC read from IDR0..IDR5,
+  8 KiB + slack circular RX buffer, RCR enable, polled drain
+  through `eth_rx`). Together with M16.88 virtio-net + M16.103
+  e1000e covers essentially every consumer x86 box from ~2009
+  onwards. See `scripts/test_net_r8169.sh`.~~
+- r8169 follow-ups:
+  - Gigabit family bring-up (RTL8168 / RTL8169 / RTL8161) — MMIO
+    BAR2 read, 16-descriptor RX + TX rings, descriptor-OWN-bit
+    handshake. The driver currently logs Gigabit device IDs and
+    bails out before touching the chip; the MMIO path is the
+    real follow-up since most consumer motherboards from ~2010
+    onwards carry RTL8168, not RTL8139.
+  - Single-segment TX (`r8169_tx_one`) — enough to send an ARP
+    probe and round-trip an inbound reply, matching the
+    virtio-net M16.88 self-test pattern. Once TX exists, the
+    r8169 test can drop its "no RX assertion" caveat.
+  - Real IRQ wiring (after IOAPIC programming lands) — today
+    `r8169_poll` drains the RX ring on demand from the kernel
+    init spin loop, same shape as virtio_net_poll / e1000e_poll.
 - Broadcom tg3 driver — covers most Dell / HP business laptops
   (BCM57xx series). After r8169 + e1000e the gap to "boots on any
   real laptop" is mostly tg3 and the Atheros AR8161 family.

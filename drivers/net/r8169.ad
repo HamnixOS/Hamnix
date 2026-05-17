@@ -1,0 +1,529 @@
+# drivers/net/r8169.ad
+#
+# Bare-metal Realtek r8169-family NIC driver — third real NIC after
+# the M16.88 virtio-net path and the M16.103 e1000e path. Scope is
+# intentionally narrow (mirrors e1000e): PROBE + IDENTIFY + RECEIVE
+# only. No TX integration with ARP/DHCP/ICMP/DNS/TCP. virtio-net
+# stays the bring-up NIC for the existing network regression tests;
+# r8169 just proves "we can drive Realtek too".
+#
+# Why "r8169" if QEMU emulates rtl8139? Linux groups all Realtek
+# Gigabit + Fast Ethernet chips under `drivers/net/ethernet/realtek/
+# r8169_main.c` (the file is named after the Gigabit RTL8169 even
+# though it drives RTL8168 / RTL8161 / RTL8111 / RTL8136 too). We
+# follow that naming. The RTL8139 (device id 0x8139) is the older
+# Fast-Ethernet predecessor with a simpler register layout — port-
+# mapped I/O instead of MMIO, single circular RX buffer instead of
+# the Gigabit family's 16-descriptor ring — but QEMU's
+# `-device rtl8139` is the only Realtek model available in modern
+# `qemu-system-x86_64`, so that's what this driver targets. The
+# whitelisted device ID set below (0x8139, 0x8136, 0x8161, 0x8168,
+# 0x8169) keeps the same source file ready to bind real Gigabit
+# silicon once we add the MMIO/descriptor-ring path.
+#
+# Why a polling helper and not a real IRQ handler? Same reason
+# virtio_net + e1000e + AHCI + NVMe poll: the kernel brings up the
+# LAPIC for the timer tick but does NOT yet program the IOAPIC,
+# so PCI INTx lines have nowhere to land. MSI / MSI-X would work
+# but adds complexity ruled out of this milestone. `r8169_poll()`
+# drains the RX circular buffer on demand; the kernel calls it from
+# the init smoke-test path after the device is brought up.
+#
+# RTL8139 register layout (all relative to BAR0, PORT I/O):
+#
+#     0x00..0x05  IDR0..5    MAC address (factory-loaded from EEPROM)
+#     0x30        RBSTART    RX buffer DMA base (u32, physical)
+#     0x36        ERSR       Early RX Status (read; w1c)
+#     0x37        CMD        Command Reg: bit 4=RST, 3=RE, 2=TE
+#     0x38        CAPR       Current Address of Packet Read (u16)
+#     0x3A        CBR        Current Buffer Address (u16, read-only)
+#     0x3C        IMR        Interrupt Mask Register (u16)
+#     0x3E        ISR        Interrupt Status Register (u16, w1c)
+#     0x40        TCR        Transmit Configuration Register (u32)
+#     0x44        RCR        Receive Configuration Register (u32)
+#     0x50        9346CR     EEPROM Control (write 0x00 to lock)
+#     0x52        CONFIG1    Config 1: bit 0=PMEn, bit 1=VPDS,
+#                            bit 4=LWAKE, bit 7=LED1
+#
+# RX packet shape in the circular buffer:
+#
+#     [ u16 header | u16 length | packet bytes ... | 4-byte CRC ]
+#
+# - `header` low bit (ROK, 0x0001) means "frame received OK". Other
+#   bits flag runt / oversize / FAE / CRC errors — for this commit
+#   we accept ROK frames only and drop the rest silently.
+# - `length` includes the 4-byte CRC; we hand `length - 4` to
+#   `eth_rx` so the upper layer sees the raw Ethernet frame.
+# - After processing, advance CAPR by `length + 4` (the 4-byte
+#   header + length pair) and round up to 4-byte alignment.
+#
+# Realtek 8139 datasheet (RTL8100/RTL8139C) section 6 is the
+# canonical reference; the Linux driver under `drivers/net/ethernet/
+# realtek/8139cp.c` (and the older `8139too.c`) covers the same
+# silicon with full TX + IRQ + EEPROM support that this commit
+# intentionally omits.
+
+from kernel.printk.printk import printk0, printk1, printk2
+from drivers.pci.pci import (
+    pci_config_read_dword, pci_config_write_dword,
+    pci_bdf_bus, pci_bdf_dev, pci_bdf_fn, pci_pack_bdf,
+    pci_read_bar, PCI_BDF_NONE,
+    PCI_COMMAND_OFFSET, PCI_COMMAND_IO, PCI_COMMAND_MASTER,
+)
+from mm.page_alloc import alloc_pages
+from drivers.net.eth import eth_rx
+
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
+
+# --- PCI matching --------------------------------------------------
+#
+# All r8169-family parts share Realtek's vendor ID 0x10EC and the
+# Ethernet-controller class triple (0x02 / 0x00 / 0x00). Device IDs
+# we accept:
+#   0x8139  RTL8139 / RTL8100  (Fast Ethernet — QEMU emulates this)
+#   0x8136  RTL810x            (Fast Ethernet variant)
+#   0x8161  RTL8111B           (Gigabit, on some chipsets)
+#   0x8168  RTL8168 / RTL8111  (Gigabit — most consumer motherboards)
+#   0x8169  RTL8169            (older Gigabit)
+#
+# The RTL8139 register layout differs from the Gigabit family
+# (PIO vs MMIO, circular RX buffer vs descriptor ring). This commit
+# implements the RTL8139 path only; the Gigabit ID match logs the
+# device but stops short of full bring-up, deferring MMIO + descriptor
+# ring work to a follow-up. The whitelist keeps the same source file
+# ready to bind real Gigabit silicon once that path lands.
+
+R8169_VENDOR_REALTEK: uint32 = 0x10EC
+
+R8169_CLASS:    uint32 = 0x02
+R8169_SUBCLASS: uint32 = 0x00
+
+R8169_DEV_8139:  uint32 = 0x8139      # RTL8139 (QEMU `-device rtl8139`)
+R8169_DEV_8136:  uint32 = 0x8136      # RTL810x variant
+R8169_DEV_8161:  uint32 = 0x8161      # RTL8111B (some chipsets)
+R8169_DEV_8168:  uint32 = 0x8168      # RTL8168 / RTL8111 (consumer)
+R8169_DEV_8169:  uint32 = 0x8169      # RTL8169 (older Gigabit)
+
+
+# --- RTL8139 register offsets (relative to BAR0 PIO base) -----------
+
+RTL8139_IDR0:     uint32 = 0x00       # MAC address (6 bytes, byte-readable)
+RTL8139_RBSTART:  uint32 = 0x30       # RX buffer DMA base (u32)
+RTL8139_ERSR:     uint32 = 0x36       # Early RX Status
+RTL8139_CMD:      uint32 = 0x37       # Command (u8)
+RTL8139_CAPR:     uint32 = 0x38       # Current Address of Packet Read (u16)
+RTL8139_CBR:      uint32 = 0x3A       # Current Buffer Address (u16)
+RTL8139_IMR:      uint32 = 0x3C       # Interrupt Mask Register (u16)
+RTL8139_ISR:      uint32 = 0x3E       # Interrupt Status Register (u16)
+RTL8139_TCR:      uint32 = 0x40       # Transmit Configuration (u32)
+RTL8139_RCR:      uint32 = 0x44       # Receive Configuration (u32)
+RTL8139_9346CR:   uint32 = 0x50       # EEPROM Control / config lock (u8)
+RTL8139_CONFIG1:  uint32 = 0x52       # CONFIG1 (u8)
+
+# CMD bits.
+RTL8139_CMD_RST:   uint32 = 0x10      # Software reset (auto-clears)
+RTL8139_CMD_RE:    uint32 = 0x08      # Receiver Enable
+RTL8139_CMD_TE:    uint32 = 0x04      # Transmitter Enable
+RTL8139_CMD_BUFE:  uint32 = 0x01      # RX buffer empty (RO)
+
+# RCR (Receive Configuration) bits.
+RTL8139_RCR_AAP:   uint32 = 0x00000001    # Accept All Packets (promisc)
+RTL8139_RCR_APM:   uint32 = 0x00000002    # Accept Physical Match
+RTL8139_RCR_AM:    uint32 = 0x00000004    # Accept Multicast
+RTL8139_RCR_AB:    uint32 = 0x00000008    # Accept Broadcast
+RTL8139_RCR_WRAP:  uint32 = 0x00000080    # WRAP: don't wrap at end (need
+                                          # 1500 byte slack after RB end)
+# RBLEN: bits 12..11 select buffer size:
+#   00 → 8 KiB + 16 byte WRAP
+#   01 → 16 KiB + 16 byte
+#   10 → 32 KiB + 16 byte
+#   11 → 64 KiB + 16 byte
+# We use the 8 KiB size and rely on the WRAP slack so the device
+# never wraps a packet across the end of the buffer.
+RTL8139_RCR_RBLEN_8K: uint32 = 0x00000000
+
+# RX packet header (in the circular buffer) bits.
+RTL8139_RXH_ROK:   uint16 = 0x0001    # Receive OK
+
+
+# --- Driver state --------------------------------------------------
+#
+# The RX ring is an 8 KiB buffer + 16 bytes (WRAP overhead) + 1500
+# bytes of slack so the device can safely overrun the wrap point
+# with one max-size frame. We allocate 16 KiB (4 pages, order=2)
+# to cover all three terms comfortably and keep the buffer
+# page-aligned for the controller's 32-bit DMA address.
+
+R8169_RX_BUF_BYTES: uint64 = 9708     # 8192 ring + 16 wrap + 1500 slack
+
+
+class R8169:
+    bdf:        uint32
+    device_id:  uint32
+    iobase:     uint32                # BAR0 — PIO base for the RTL8139
+    pad0:       uint32
+    rx_buf:     uint64                # base of the circular RX buffer
+    rx_offset:  uint32                # next byte to read (mirrors CAPR + 16)
+    pad1:       uint32
+    mac:        Array[6, uint8]
+    rx_packets: uint64
+
+
+r8169_state: R8169
+
+
+# --- PIO helpers ---------------------------------------------------
+
+def _r_outb(iobase: uint32, off: uint32, value: uint32):
+    outb(cast[int32](value & 0xFF), cast[int32](iobase + off))
+
+
+def _r_outw(iobase: uint32, off: uint32, value: uint32):
+    outw(cast[int32](value & 0xFFFF), cast[int32](iobase + off))
+
+
+def _r_outl(iobase: uint32, off: uint32, value: uint32):
+    outl(cast[int32](value), cast[int32](iobase + off))
+
+
+def _r_inb(iobase: uint32, off: uint32) -> uint32:
+    return cast[uint32](inb(cast[int32](iobase + off))) & 0xFF
+
+
+def _r_inw(iobase: uint32, off: uint32) -> uint32:
+    return cast[uint32](inw(cast[int32](iobase + off))) & 0xFFFF
+
+
+def _r_inl(iobase: uint32, off: uint32) -> uint32:
+    return cast[uint32](inl(cast[int32](iobase + off)))
+
+
+# --- Class + vendor + id PCI scan ----------------------------------
+#
+# Walk bus 0 looking for a device whose vendor is Realtek, whose
+# class triple matches Ethernet-controller, AND whose device id
+# appears in our whitelist. Returns the packed BDF on a hit, or
+# PCI_BDF_NONE if no Realtek NIC is attached.
+
+def _r8169_match_devid(device: uint32) -> int32:
+    if device == R8169_DEV_8139:
+        return 1
+    if device == R8169_DEV_8136:
+        return 1
+    if device == R8169_DEV_8161:
+        return 1
+    if device == R8169_DEV_8168:
+        return 1
+    if device == R8169_DEV_8169:
+        return 1
+    return 0
+
+
+def _r8169_pci_find() -> uint32:
+    bus: uint32 = 0
+    dev: uint32 = 0
+    while dev < 32:
+        ident: uint32 = pci_config_read_dword(bus, dev, 0, 0x00)
+        v: uint32 = ident & 0xFFFF
+        if v == R8169_VENDOR_REALTEK:
+            device: uint32 = (ident >> 16) & 0xFFFF
+            if _r8169_match_devid(device) == 1:
+                cls: uint32 = pci_config_read_dword(bus, dev, 0, 0x08)
+                this_class:    uint32 = (cls >> 24) & 0xFF
+                this_subclass: uint32 = (cls >> 16) & 0xFF
+                if this_class == R8169_CLASS \
+                   and this_subclass == R8169_SUBCLASS:
+                    r8169_state.device_id = device
+                    return pci_pack_bdf(bus, dev, 0)
+        dev = dev + 1
+    return PCI_BDF_NONE
+
+
+def _r8169_pci_enable(bdf: uint32):
+    # RTL8139's BAR0 is the PIO window; BAR1 is the same window
+    # exposed as MMIO. We use PIO here (matches the data sheet and
+    # what 8139too.c does on its low-rent path), so we need IO Space
+    # Enable + Bus Master. MEM enable is irrelevant for this device.
+    bus: uint32 = pci_bdf_bus(bdf)
+    dev: uint32 = pci_bdf_dev(bdf)
+    fn:  uint32 = pci_bdf_fn(bdf)
+    cmd: uint32 = pci_config_read_dword(bus, dev, fn,
+                                        PCI_COMMAND_OFFSET) & 0xFFFF
+    cmd = cmd | PCI_COMMAND_IO | PCI_COMMAND_MASTER
+    upper: uint32 = pci_config_read_dword(bus, dev, fn,
+                                          PCI_COMMAND_OFFSET) & 0xFFFF0000
+    pci_config_write_dword(bus, dev, fn, PCI_COMMAND_OFFSET,
+                           upper | cmd)
+
+
+# --- MAC read ------------------------------------------------------
+#
+# The RTL8139 factory-loads its MAC into IDR0..IDR5 at reset. We
+# byte-read those six locations directly — the datasheet allows
+# byte-wide reads of the ID register window without an alignment
+# trap. (Gigabit Realtek silicon puts the MAC at MAC0..MAC5 in MMIO
+# space at BAR2; that path is deferred until the Gigabit bring-up
+# milestone.)
+
+def _r8169_read_mac(iobase: uint32, mac: Ptr[uint8]):
+    i: uint32 = 0
+    while i < 6:
+        b: uint32 = _r_inb(iobase, RTL8139_IDR0 + i)
+        mac[i] = cast[uint8](b & 0xFF)
+        i = i + 1
+
+
+def _r8169_print_mac(mac: Ptr[uint8]):
+    # Same pattern as virtio_net's _print_mac: one printk per nibble
+    # because printk's format only takes a single arg per call. Pad
+    # the leading nibble so every byte renders as two hex digits.
+    printk0("[r8169] mac=")
+    i: uint64 = 0
+    while i < 6:
+        b: uint64 = cast[uint64](mac[i])
+        hi: uint64 = (b >> 4) & 0xF
+        lo: uint64 = b & 0xF
+        printk1("%x", hi)
+        printk1("%x", lo)
+        if i < 5:
+            printk0(":")
+        i = i + 1
+    printk0("\n")
+
+
+# --- Receiver setup ------------------------------------------------
+#
+# The receiver runs in circular-buffer mode: the device DMAs each
+# inbound frame at the current write offset, advances its internal
+# CBR pointer, and we follow with CAPR. The buffer must be 32-bit-
+# addressable (the RBSTART register is u32), which is fine because
+# Hamnix identity-maps the low 4 GiB and `alloc_pages(2)` returns a
+# 4 KiB-aligned address well inside that range.
+
+def _r8169_setup_rx(state: Ptr[R8169]) -> int32:
+    # 4 pages (order=2 = 16 KiB) gives us 8 KiB ring + 16 wrap
+    # overhead + plenty of slack. The buffer is contiguous and
+    # page-aligned, so its physical address fits in 32 bits below
+    # the 4 GiB identity-map boundary.
+    rx: uint64 = alloc_pages(2)
+    if rx == 0:
+        printk0("[r8169] alloc_pages(2) for RX buffer failed\n")
+        return -1
+    memset(cast[Ptr[uint8]](rx), 0, cast[uint64](R8169_RX_BUF_BYTES))
+    state[0].rx_buf    = rx
+    state[0].rx_offset = 0
+
+    iobase: uint32 = state[0].iobase
+
+    # Plant the RX buffer's physical address. RTL8139's RBSTART is
+    # a 32-bit register — we already checked alloc_pages handed us
+    # an address under 4 GiB above.
+    _r_outl(iobase, RTL8139_RBSTART, cast[uint32](rx & 0xFFFFFFFF))
+
+    # Mask all interrupts (we poll). ISR is write-1-to-clear; write
+    # 0xFFFF first to clear any latched sources from the reset path.
+    _r_outw(iobase, RTL8139_IMR, 0)
+    _r_outw(iobase, RTL8139_ISR, 0xFFFF)
+
+    # RCR: accept broadcast + own MAC, 8 KiB buffer, WRAP set so a
+    # packet that lands across the wrap boundary spills into the
+    # 1500-byte slack at the end of the buffer (the device won't
+    # wrap mid-packet). Promiscuous mode (AAP) stays off — we filter
+    # at the hardware level, the same way virtio-net's `F_MAC`
+    # discipline does, so we only see unicasts addressed to us
+    # plus all broadcasts.
+    rcr: uint32 = RTL8139_RCR_APM | RTL8139_RCR_AB \
+                | RTL8139_RCR_WRAP | RTL8139_RCR_RBLEN_8K
+    _r_outl(iobase, RTL8139_RCR, rcr)
+
+    # Enable receiver. (Transmitter stays off — out of scope.)
+    _r_outb(iobase, RTL8139_CMD, RTL8139_CMD_RE)
+
+    # CAPR is initialised to 0xFFF0 on the data sheet so the first
+    # packet header lands at offset 0 of the buffer (CAPR + 16 = 0
+    # modulo 65536). We mirror that, and our shadow rx_offset
+    # tracks `(CAPR + 16) mod 8192`.
+    _r_outw(iobase, RTL8139_CAPR, 0xFFF0)
+    return 0
+
+
+# --- Public entry point --------------------------------------------
+
+def r8169_init() -> int32:
+    # Probe, init, log MAC + status. Returns 0 on success, -1 on
+    # miss / failure. Caller treats failure as "no Realtek NIC
+    # attached" — virtio-net stays the bring-up NIC for the existing
+    # net tests; e1000e covers Intel hardware.
+    r8169_state.bdf        = PCI_BDF_NONE
+    r8169_state.iobase     = 0
+    r8169_state.rx_buf     = 0
+    r8169_state.rx_offset  = 0
+    r8169_state.rx_packets = 0
+
+    bdf: uint32 = _r8169_pci_find()
+    if bdf == PCI_BDF_NONE:
+        printk0("[r8169] no controller found\n")
+        return -1
+    r8169_state.bdf = bdf
+    printk2("[r8169] controller found bdf=%x device=%x\n",
+            cast[uint64](bdf), cast[uint64](r8169_state.device_id))
+
+    # The Gigabit family (8161/8168/8169) needs MMIO + descriptor
+    # ring bring-up, which isn't implemented yet. Log the find but
+    # don't try to drive the chip — a partial bring-up here would
+    # leave the device in a half-state that the eventual Gigabit
+    # path can't recover from cleanly.
+    if r8169_state.device_id != R8169_DEV_8139 \
+       and r8169_state.device_id != R8169_DEV_8136:
+        printk1("[r8169] Gigabit device 0x%x not yet driven\n",
+                cast[uint64](r8169_state.device_id))
+        return -1
+
+    _r8169_pci_enable(bdf)
+
+    # BAR0 = PIO window, 16 ports. Low bit is set for IO BARs; the
+    # actual base sits in bits 31..2.
+    bar0_raw: uint32 = pci_read_bar(bdf, 0)
+    if (bar0_raw & 1) == 0:
+        printk0("[r8169] BAR0 is not IO-space (unexpected for RTL8139)\n")
+        return -1
+    iobase: uint32 = bar0_raw & 0xFFFFFFFC
+    r8169_state.iobase = iobase
+    printk1("[r8169] iobase=%p\n", cast[uint64](iobase))
+
+    # Power up: CONFIG1 bit 4 = LWAKE (Lan Wake Enable, must be
+    # cleared so the chip leaves D3 cold sleep). The 9346CR register
+    # gates writes to CONFIG1 — we write 0xC0 to unlock the config
+    # window, clear LWAKE, then lock again with 0x00. Real silicon
+    # cares; QEMU treats this as a no-op but it costs nothing.
+    _r_outb(iobase, RTL8139_9346CR, 0xC0)        # unlock config
+    _r_outb(iobase, RTL8139_CONFIG1, 0x00)       # clear LWAKE etc.
+    _r_outb(iobase, RTL8139_9346CR, 0x00)        # lock config
+
+    # Software reset: write CMD.RST and poll until the bit clears.
+    # The 8139 self-clears RST in 10 µs on QEMU; real silicon takes
+    # ~100 µs. We bound the poll at a few thousand iterations as a
+    # safety net.
+    _r_outb(iobase, RTL8139_CMD, RTL8139_CMD_RST)
+    spin: uint32 = 0
+    while spin < 100000:
+        cmd: uint32 = _r_inb(iobase, RTL8139_CMD)
+        if (cmd & RTL8139_CMD_RST) == 0:
+            spin = 100000        # break
+        else:
+            spin = spin + 1
+
+    # Read MAC from IDR0..IDR5 and surface it to the kernel log.
+    # (We deliberately do NOT mirror it into `nd_mac` — that global
+    # belongs to virtio-net, the bring-up NIC. The first driver to
+    # win the ARP / IP stack stays in charge of `nd_mac`; r8169 is
+    # a parallel device that just proves it can deliver frames.)
+    _r8169_read_mac(iobase, &r8169_state.mac[0])
+    _r8169_print_mac(&r8169_state.mac[0])
+
+    # RX ring setup. Failure here is "driver init failed" — log
+    # and bail out so the caller knows the device isn't usable.
+    if _r8169_setup_rx(&r8169_state) != 0:
+        printk0("[r8169] RX setup failed\n")
+        return -1
+    printk1("[r8169] RX ring ready (%d bytes)\n",
+            cast[uint64](R8169_RX_BUF_BYTES))
+
+    printk0("[r8169] init done\n")
+    return 0
+
+
+# --- RX polling ----------------------------------------------------
+#
+# The RTL8139 RX path is a circular byte buffer rather than the
+# descriptor ring the Gigabit family (and e1000e) use. Each frame
+# is prefixed with a 4-byte header:
+#
+#     [ u16 status | u16 length-including-CRC ]
+#
+# We loop: while the buffer-not-empty flag in CMD is clear (i.e.,
+# the device has placed at least one frame), read the header,
+# validate status.ROK, hand the frame body to `eth_rx`, advance our
+# shadow read offset, write the offset back to CAPR (minus the 16
+# the data sheet says CAPR is offset against), and continue.
+#
+# This driver does NOT integrate with the ARP / IP / DHCP / DNS /
+# TCP stack — virtio-net stays the bring-up NIC for those tests.
+# r8169 calling `eth_rx` is purely a "did the driver deliver a
+# frame?" probe; the stack will see those frames flow through, log
+# unknown ethertypes, and drop them harmlessly.
+
+def _r8169_rx_handle_one(state: Ptr[R8169]) -> int32:
+    # Returns 1 if a frame was processed, 0 if the buffer was empty,
+    # -1 on a header that looks corrupt (status.ROK clear or length
+    # too small / too large). The caller stops looping on 0 or -1.
+    iobase: uint32 = state[0].iobase
+    cmd: uint32 = _r_inb(iobase, RTL8139_CMD)
+    if (cmd & RTL8139_CMD_BUFE) != 0:
+        return 0
+    buf: uint64 = state[0].rx_buf
+    off: uint64 = cast[uint64](state[0].rx_offset)
+    # Header lives at buf + off in the circular buffer.
+    hdr_ptr: Ptr[uint16] = cast[Ptr[uint16]](buf + off)
+    status: uint16 = hdr_ptr[0]
+    length: uint16 = cast[Ptr[uint16]](buf + off + 2)[0]
+    if (status & RTL8139_RXH_ROK) == 0:
+        printk1("[r8169] bad RX status: %x\n", cast[uint64](status))
+        return -1
+    if length < 14:
+        printk1("[r8169] RX runt: len=%d\n", cast[uint64](length))
+        return -1
+    if length > 1518:
+        printk1("[r8169] RX oversize: len=%d\n", cast[uint64](length))
+        return -1
+    # Hand the L2 frame up. The 4-byte CRC at the tail is included
+    # in `length` — strip it so `eth_rx` sees a clean Ethernet frame.
+    eth_len: uint64 = cast[uint64](length) - 4
+    eth_ptr: Ptr[uint8] = cast[Ptr[uint8]](buf + off + 4)
+    state[0].rx_packets = state[0].rx_packets + 1
+    printk1("[r8169] RX packet: len=%d\n", eth_len)
+    eth_rx(eth_ptr, eth_len)
+    # Advance read pointer past header + payload + CRC, rounded up
+    # to 4-byte alignment (RTL8139 hardware aligns each frame to a
+    # 4-byte boundary in the ring).
+    next_off: uint64 = off + 4 + cast[uint64](length)
+    next_off = (next_off + 3) & ~cast[uint64](3)
+    # Wrap modulo the 8 KiB ring size — RBLEN=00 means the device
+    # treats offsets >= 8192 as off-the-end and uses the 1500-byte
+    # slack. We mirror that, keeping our shadow CAPR in [0, 8191].
+    if next_off >= 8192:
+        next_off = next_off - 8192
+    state[0].rx_offset = cast[uint32](next_off & 0xFFFFFFFF)
+    # CAPR is the offset MINUS 16 (data-sheet quirk: the device
+    # adds 16 internally), and the register is u16 so we mask to
+    # 16 bits. The subtraction-mod-65536 wraps to 0xFFF0 when the
+    # ring is empty.
+    capr: uint32 = (cast[uint32](next_off) - 16) & 0xFFFF
+    _r_outw(iobase, RTL8139_CAPR, capr)
+    return 1
+
+
+def r8169_poll():
+    # No device → no work.
+    if r8169_state.iobase == 0:
+        return
+    # Bound the drain loop at a few thousand iterations as a safety
+    # net against a wedged "always non-empty" buffer-not-empty bit.
+    # In practice the device delivers at most a handful of frames
+    # between polls so this caps at <10.
+    safety: uint32 = 0
+    while safety < 1024:
+        rc: int32 = _r8169_rx_handle_one(&r8169_state)
+        if rc != 1:
+            safety = 1024        # break
+        else:
+            safety = safety + 1
+    # Clear any latched RX-related ISR bits so the device doesn't
+    # think there are unhandled interrupts pending. Write-1-to-clear,
+    # so the broad mask flushes everything.
+    _r_outw(r8169_state.iobase, RTL8139_ISR, 0xFFFF)
+
+
+def r8169_rx_packets() -> uint64:
+    return r8169_state.rx_packets
