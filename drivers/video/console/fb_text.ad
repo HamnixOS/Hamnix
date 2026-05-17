@@ -1,0 +1,254 @@
+# drivers/video/console/fb_text.py
+#
+# Linear-framebuffer text console — the EFI GOP counterpart to
+# drivers/video/console/vga_text.ad. Mirrors the role of Linux's
+# drivers/video/fbcon/fbcon.c (specifically the part that just blits
+# 8x16 monospace glyphs into a linear framebuffer for early-boot
+# printk output), trimmed to the absolute minimum.
+#
+# Why this exists: under UEFI boot, GRUB-EFI does NOT program the
+# legacy CGA text mode at 0xB8000. Writes that vga_text.ad makes to
+# that buffer succeed in RAM but the GPU is scanning out a linear
+# framebuffer somewhere else — the monitor stays dark. The multiboot1
+# header in arch/x86/boot/header.S now asks GRUB for a linear FB
+# (mode_type=0 + bit 2 of flags); when GRUB-EFI honours that, the
+# multiboot info struct comes back populated at offsets 88..109 with
+#   off 88: framebuffer_addr   (uint64 — almost always 0xC0000000+ on
+#                              real hardware; under OVMF QEMU it can
+#                              be anywhere from 0x80000000 up. The
+#                              full 4 GiB identity-map in header.S
+#                              covers anything below 4 GiB.)
+#   off 96: framebuffer_pitch  (uint32 — bytes per scanline, NOT
+#                              bytes-per-pixel * width; pitch may
+#                              exceed width*bpp/8 because GOP often
+#                              pads scanlines to a hw-friendly stride)
+#   off 100: framebuffer_width  (uint32, pixels)
+#   off 104: framebuffer_height (uint32, pixels)
+#   off 108: framebuffer_bpp    (uint8)
+#   off 109: framebuffer_type   (uint8 — 1 = RGB, 2 = EGA-text)
+#
+# We only handle bpp=32 (the GOP common case: 32-bit BGR or RGB with
+# the high byte either 0 = "X" or "A" depending on the framebuffer
+# vendor). 8/16/24 bpp would all need different per-pixel store paths
+# and are extremely rare in practice on x86_64.
+#
+# Mutual exclusion with vga_text.ad: if fb_init() succeeds, it sets
+# fb_initialized=1. Both early_putc fan-out callers can be called
+# unconditionally — fb_putc no-ops when fb_initialized==0 (BIOS path
+# falls through to vga_putc), and vga_putc no-ops when vga_initialized
+# is left at 0 (UEFI path skips it).
+#
+# Font: drivers/video/console/fb_font_8x16.S exports
+# `fb_font_glyph_addr()` — returns the base of an embedded 8x16 VGA
+# ROM-font glyph table (chars 0..127, 16 bytes per glyph, one row per
+# byte with MSB = leftmost pixel). Derived verbatim from Linux's
+# lib/fonts/font_8x16.c.
+
+# NOTE: this file deliberately does NOT import kernel.printk — that
+# would create a cycle (printk → early_8250 → fb_text → printk).
+# All diagnostic logging is done in init/main.ad which orchestrates
+# the fb_init call and inspects the return code; fb_text itself is
+# silent on success and just returns a non-zero error code on
+# rejected modes.
+
+extern def fb_font_glyph_addr() -> uint64
+
+# Framebuffer geometry (populated by fb_init from multiboot info).
+fb_base:   uint64 = 0
+fb_pitch:  uint64 = 0
+fb_width:  uint64 = 0
+fb_height: uint64 = 0
+fb_bpp:    uint64 = 0
+
+# Cursor position, in CHARACTER cells (8x16 each).
+fb_col:    uint64 = 0
+fb_row:    uint64 = 0
+fb_cols:   uint64 = 0       # derived: fb_width / 8
+fb_rows:   uint64 = 0       # derived: fb_height / 16
+
+# Foreground colour (32-bit pixel value). 0xFFFFFFFF = white on both
+# BGR and RGB packings since all three colour channels are saturated.
+FB_FG_PIXEL: uint32 = 0xFFFFFFFF
+FB_BG_PIXEL: uint32 = 0x00000000
+
+# Set to 1 by fb_init() once geometry is validated and the screen is
+# cleared. fb_putc returns early while this is 0 so early-boot
+# printk callers (the UART path runs much earlier) don't scribble on
+# random memory.
+fb_initialized: int32 = 0
+
+# Glyph height / width in pixels. Constants throughout: the font
+# table is fixed at 8x16, so the only adjustable axes are screen
+# geometry.
+GLYPH_W: uint64 = 8
+GLYPH_H: uint64 = 16
+
+
+def fb_is_initialized() -> int32:
+    # Used by early_putc to decide whether to call fb_putc or vga_putc.
+    return fb_initialized
+
+
+def _fb_putpixel(x: uint64, y: uint64, color: uint32):
+    # Single-pixel store. Two supported pixel formats:
+    #   bpp=32: one aligned 32-bit store, byte order matches color
+    #   bpp=24: three packed byte stores (B, G, R) at scanline stride
+    # fb_init refuses any other bpp.
+    #
+    # 24bpp scanline arithmetic: stride is fb_pitch bytes, but pixels
+    # are 3 bytes wide. fb_pitch may be > width*3 (GOP often pads).
+    if fb_bpp == 32:
+        off: uint64 = y * fb_pitch + x * 4
+        cast[Ptr[uint32]](fb_base + off)[0] = color
+    else:
+        # 24bpp BGR packing — same channel order as 32-bit BGRX
+        # framebuffers we already handle. low byte = blue.
+        off: uint64 = y * fb_pitch + x * 3
+        cast[Ptr[uint8]](fb_base + off)[0]     = cast[uint8](color & 0xFF)
+        cast[Ptr[uint8]](fb_base + off + 1)[0] = cast[uint8]((color >> 8) & 0xFF)
+        cast[Ptr[uint8]](fb_base + off + 2)[0] = cast[uint8]((color >> 16) & 0xFF)
+
+
+def fb_clear():
+    # Fill the entire framebuffer with FB_BG_PIXEL. Loop-per-pixel
+    # rather than per-byte memset because the background colour isn't
+    # always a uniform byte (e.g. 0x00112233 → memset(0x00) would set
+    # red+green+blue all to 0 which IS uniform here, but stay correct
+    # if FB_BG_PIXEL ever changes).
+    y: uint64 = 0
+    while y < fb_height:
+        x: uint64 = 0
+        while x < fb_width:
+            _fb_putpixel(x, y, FB_BG_PIXEL)
+            x = x + 1
+        y = y + 1
+
+
+def _fb_draw_glyph(ch: int32, col: uint64, row: uint64):
+    # Render one 8x16 glyph at character cell (col, row). Each font
+    # row is one byte: bit 7 (0x80) is the leftmost pixel.
+    if ch < 0 or ch >= 128:
+        # Out-of-range characters render as a blank cell — same as
+        # how Linux's fbcon falls back when the codepoint isn't in
+        # the loaded font.
+        ch = 0x20                                       # space
+
+    glyph_base: uint64 = fb_font_glyph_addr() + cast[uint64](ch) * 16
+    px:         uint64 = col * GLYPH_W
+    py:         uint64 = row * GLYPH_H
+
+    r: uint64 = 0
+    while r < GLYPH_H:
+        bits: uint8 = cast[Ptr[uint8]](glyph_base + r)[0]
+        c: uint64 = 0
+        while c < GLYPH_W:
+            mask: uint8 = cast[uint8](0x80 >> c)
+            color: uint32 = FB_BG_PIXEL
+            if (bits & mask) != 0:
+                color = FB_FG_PIXEL
+            _fb_putpixel(px + c, py + r, color)
+            c = c + 1
+        r = r + 1
+
+
+def fb_scroll():
+    # Shift the framebuffer up by one character row (16 pixels).
+    # Source = first (fb_height - 16) scanlines starting at offset
+    # GLYPH_H*pitch; destination = top of framebuffer. Then clear the
+    # bottom 16-pixel band to FB_BG_PIXEL.
+    #
+    # Byte-level copy walks fb_pitch bytes per row — works for both
+    # 24 and 32 bpp without caring about pixel packing. Top-down loop
+    # is safe because dst < src by exactly GLYPH_H scanlines and we
+    # copy in the same forward direction.
+    if fb_height < GLYPH_H:
+        return
+    rows_to_copy: uint64 = fb_height - GLYPH_H
+    y: uint64 = 0
+    while y < rows_to_copy:
+        src_off: uint64 = (y + GLYPH_H) * fb_pitch
+        dst_off: uint64 = y * fb_pitch
+        i: uint64 = 0
+        while i < fb_pitch:
+            b: uint8 = cast[Ptr[uint8]](fb_base + src_off + i)[0]
+            cast[Ptr[uint8]](fb_base + dst_off + i)[0] = b
+            i = i + 1
+        y = y + 1
+    # Clear the bottom band.
+    yb: uint64 = rows_to_copy
+    while yb < fb_height:
+        xb: uint64 = 0
+        while xb < fb_width:
+            _fb_putpixel(xb, yb, FB_BG_PIXEL)
+            xb = xb + 1
+        yb = yb + 1
+
+
+def fb_init(base: uint64, pitch: uint64, width: uint64,
+            height: uint64, bpp: uint64) -> int32:
+    # Validate the mode + cache geometry + clear the screen.
+    # Return 0 on success, non-zero on rejected mode (the caller
+    # in init/main.ad falls back to vga_init in that case).
+    # Distinct return codes so the init/main.ad caller can render a
+    # specific log line for each refusal reason. 0 = success.
+    if base == 0:
+        return 1                                # null base
+    if bpp != 32 and bpp != 24:
+        return 2                                # only 32 / 24 bpp supported
+    if width < GLYPH_W or height < GLYPH_H:
+        return 3                                # geometry too small
+    # Each pixel takes bpp/8 bytes; pitch must cover the full scanline.
+    bytes_per_pixel: uint64 = bpp / 8
+    if pitch < width * bytes_per_pixel:
+        return 4                                # pitch < width*bpp/8
+
+    fb_base   = base
+    fb_pitch  = pitch
+    fb_width  = width
+    fb_height = height
+    fb_bpp    = bpp
+    fb_cols   = width  / GLYPH_W
+    fb_rows   = height / GLYPH_H
+    fb_col    = 0
+    fb_row    = 0
+
+    fb_clear()
+    fb_initialized = 1
+    return 0
+
+
+def fb_putc(ch: int32):
+    # Pre-init no-op so early_putc callers can fan into us
+    # unconditionally — same convention vga_putc uses.
+    if fb_initialized == 0:
+        return
+    if ch == 10:                                # '\n'
+        fb_col = 0
+        fb_row = fb_row + 1
+        if fb_row >= fb_rows:
+            fb_scroll()
+            fb_row = fb_rows - 1
+        return
+    if ch == 13:                                # '\r'
+        fb_col = 0
+        return
+    if ch == 8 and fb_col > 0:                  # '\b'
+        fb_col = fb_col - 1
+        _fb_draw_glyph(0x20, fb_col, fb_row)
+        return
+
+    _fb_draw_glyph(ch, fb_col, fb_row)
+    fb_col = fb_col + 1
+    if fb_col >= fb_cols:
+        fb_col = 0
+        fb_row = fb_row + 1
+        if fb_row >= fb_rows:
+            fb_scroll()
+            fb_row = fb_rows - 1
+
+
+def fb_puts(s: Ptr[char]):
+    i: int32 = 0
+    while s[i] != 0:
+        fb_putc(s[i])
+        i = i + 1

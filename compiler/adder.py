@@ -240,13 +240,15 @@ def assemble_and_link_x86_bare(asm_file: Path, output: Path,
             print(f"Error: missing {required}", file=sys.stderr)
             return False
 
-    # Additional hand-written .S files under arch/x86/ (excluding the two
-    # boot/early-entry stubs above, which are passed explicitly so we can
-    # guarantee link order: header.o first → multiboot magic lands at top
-    # of .head.text). Anything else in arch/x86/{boot,kernel} that ends in
-    # .S is picked up automatically — drop a new file in and rebuild.
+    # Additional hand-written .S files under arch/x86/, fs/, drivers/
+    # (excluding the two boot/early-entry stubs above, which are passed
+    # explicitly so we can guarantee link order: header.o first → multiboot
+    # magic lands at top of .head.text). Anything else under these roots
+    # that ends in .S is picked up automatically — drop a new file in
+    # and rebuild. The drivers/ root was added when fb_text.ad needed
+    # an embedded 8x16 font glyph table (drivers/video/console/fb_font_8x16.S).
     extra_s = sorted(
-        p for path_root in ("arch/x86", "fs")
+        p for path_root in ("arch/x86", "fs", "drivers")
         for p in (project_root / path_root).rglob("*.S")
         if p != boot_s and p != head_s
     )

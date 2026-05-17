@@ -83,6 +83,30 @@ cat > "$ISO_STAGE/boot/grub/grub.cfg" <<'GRUB_EOF'
 set timeout=2
 set default=0
 
+# Under GRUB-EFI, multiboot1's MULTIBOOT_VIDEO_MODE flag (bit 2) in
+# the kernel header is necessary but not sufficient: GRUB-EFI also
+# requires that the gfx subsystem be told to KEEP the current GOP
+# mode on hand-off (default: "text" → drops the framebuffer first).
+# Without this set, GRUB-EFI prints "no suitable video mode found"
+# and the multiboot framebuffer flag bit comes back clear — the
+# kernel falls back to VGA, which is dark under UEFI.
+#
+# `keep` means "preserve whatever mode the firmware was using" —
+# typically the OVMF / firmware-default 1024x768 or 1280x800. The
+# `auto` value would let GRUB choose, but real boards often advertise
+# only weird widescreen modes that fail GRUB's internal filters.
+# `keep` always works because the mode is already programmed.
+#
+# Under legacy BIOS via grub-pc, GRUB does its own VBE probe and
+# the variable is a no-op; the BIOS pass keeps working unchanged.
+if loadfont unicode ; then
+    set gfxmode=auto
+    set gfxpayload=keep
+    insmod gfxterm
+    insmod all_video
+    terminal_output gfxterm
+fi
+
 menuentry "Hamnix" {
     echo "Loading Hamnix..."
     multiboot /boot/hamnix.elf

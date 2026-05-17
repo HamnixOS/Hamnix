@@ -23,12 +23,58 @@
     .section .head.text, "ax"
     .code32
 
-/* ---------- Multiboot1 header (must live in first 8 KiB of ELF) ----- */
+/* ---------- Multiboot1 header (must live in first 8 KiB of ELF) ----- *
+ *
+ * Flag bits:
+ *   bit 0 (0x00000001) MULTIBOOT_PAGE_ALIGN    — modules page-aligned
+ *   bit 1 (0x00000002) MULTIBOOT_MEMORY_INFO   — request mem_lower/upper
+ *   bit 2 (0x00000004) MULTIBOOT_VIDEO_MODE    — request a video mode
+ *   bit 16 (0x00010000) MULTIBOOT_AOUT_KLUDGE  — use header_addr fields
+ *
+ * Only bit 2 is set here: we want a linear framebuffer (mode_type=0)
+ * at "any" geometry (width=height=depth=0 → loader picks). When the
+ * kernel is booted by GRUB-EFI (UEFI), this is what convinces GRUB
+ * to call EFI's GOP and hand us a populated framebuffer block in the
+ * multiboot info struct at offsets 88..109. Without bit 2, GRUB-EFI
+ * leaves the framebuffer fields zeroed and the kernel sees a dark
+ * screen on real hardware (UART still works for those with a cable).
+ *
+ * Layout — the spec requires fields at fixed offsets even when the
+ * gating flag bit isn't set, because the loader walks by offset:
+ *   off  0 magic
+ *   off  4 flags
+ *   off  8 checksum
+ *   off 12 header_addr   ┐
+ *   off 16 load_addr     │ ignored (bit 16 clear) but slot must exist
+ *   off 20 load_end_addr │
+ *   off 24 bss_end_addr  │
+ *   off 28 entry_addr    ┘
+ *   off 32 mode_type     ┐ video request (bit 2 set):
+ *   off 36 width         │   mode_type = 0 → linear graphics framebuffer
+ *   off 40 height        │   width = height = depth = 0 → loader's choice
+ *   off 44 depth         ┘
+ */
+    .equ    MB_MAGIC,    0x1BADB002
+    .equ    MB_FLAGS,    0x00000004        /* VIDEO_MODE */
+    .equ    MB_CHECKSUM, -(MB_MAGIC + MB_FLAGS)
+
     .align 4
 multiboot_header:
-    .long   0x1BADB002              /* magic */
-    .long   0x00000000              /* flags: none (ELF, aligned mods n/a) */
-    .long   -(0x1BADB002 + 0)       /* checksum: magic + flags + ck == 0 */
+    .long   MB_MAGIC
+    .long   MB_FLAGS
+    .long   MB_CHECKSUM
+    /* header_addr..entry_addr — unused (bit 16 clear), but placeholders
+     * keep the next group of fields at the spec-mandated offsets. */
+    .long   0x00000000              /* header_addr   */
+    .long   0x00000000              /* load_addr     */
+    .long   0x00000000              /* load_end_addr */
+    .long   0x00000000              /* bss_end_addr  */
+    .long   0x00000000              /* entry_addr    */
+    /* Video request — linear framebuffer, loader picks geometry. */
+    .long   0x00000000              /* mode_type = 0 (linear FB) */
+    .long   0x00000000              /* width  = any              */
+    .long   0x00000000              /* height = any              */
+    .long   0x00000000              /* depth  = any              */
 
 /* ---------- 32-bit protected-mode entry ---------------------------- */
     .globl  _start
