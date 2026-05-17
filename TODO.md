@@ -146,10 +146,31 @@ are fair game for any contributor — human or AI agent.
   hits 0 on a forward path we don't yet have), redirect (type 5).
   None are required for echo, but real peers expect them when
   routes break.
-- DNS resolver — UDP/53 query path + minimal answer parser. With
-  DHCP option-6 already captured, the only missing piece is the
-  query/response codec. Unblocks `apt update http://deb.debian.org`
-  reaching real package mirrors by name.
+- ~~DNS resolver — shipped in M16.99. UDP/53 A-record query / answer
+  codec in `drivers/net/dns.ad`, `dns_lookup(hostname, out_ip,
+  timeout)` synchronous entry point, 4-slot in-flight table, ARP-prime
+  for the DNS server before the first query. Tested against QEMU
+  SLIRP's DNS forwarder (10.0.2.3): `[dns] resolved example.com ->
+  172.66.147.243`. See `scripts/test_dns.sh`.~~
+- DNS follow-ups:
+  - Per-process result cache (TTL-aware) so `apt` doesn't re-query
+    `deb.debian.org` for every URL in its index. The single-query
+    path here clears the slot on completion; a real cache would
+    park the answer keyed by lowercased QNAME until the TTL expires.
+  - Multiple A records — DNS answers often include 3-8 A-records
+    for load-balancing. We take the first and ignore the rest; a
+    fuller implementation would return all of them and let the
+    caller round-robin.
+  - AAAA (IPv6) records — IPv6 is out of scope until the IP layer
+    gets a v6 header, but the DNS codec is type-agnostic and could
+    be extended with TYPE=28 trivially.
+  - TCP/53 fallback for responses larger than 512 bytes (the UDP
+    cap from RFC 1035). Apt may hit this for large MX-style
+    answers; not a blocker for A-only queries.
+  - Generic ARP-request helper in `drivers/net/virtio_net.ad`
+    or `arp.ad` (today `_dns_prime_arp` duplicates the
+    `virtio_net_send_arp_probe` shape locally). When a second
+    consumer needs unicast ARP, factor this out.
 - TCP three-way handshake — SYN/SYN-ACK/ACK and a minimal receive
   window. End-state requirement for `apt` over HTTP. Builds on the
   IP layer that M16.96/97 brought online.
