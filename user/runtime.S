@@ -302,3 +302,20 @@ sys_mkdir:
     syscall
     ret
     .size sys_mkdir, .-sys_mkdir
+
+
+    /* --- sys_errstr(buf, nbuf) -> int32 -----------------------------
+     * Plan 9-shape per-process error string read/write. Reads the
+     * current error message into `buf` (NUL-terminated, truncated to
+     * `nbuf-1` bytes). If `buf[0]` is non-zero on entry, the call ALSO
+     * installs `buf`'s contents as the new current error (swap
+     * semantics). Used as the foundation for every other Plan 9
+     * syscall's error reporting. See docs/native-api.md (265) and
+     * sys/src/9/port/error.ad for the contract. */
+    .globl sys_errstr
+    .type sys_errstr, @function
+sys_errstr:
+    movq    $265, %rax              /* SYS_ERRSTR */
+    syscall
+    ret
+    .size sys_errstr, .-sys_errstr

@@ -19,6 +19,44 @@ are fair game for any contributor — human or AI agent.
 - `match`/`case` keyword tokenisation — reserved but not implemented;
   pick one of "Python 3.10 match" or "C switch" and ship.
 
+## Plan 9 native surface (Layer 1)
+
+- ~~**Phase B** — Reserve the Plan 9 syscall number block (256..274).
+  Shipped in M16.93: SYS_RFORK (256), SYS_BIND (257), SYS_MOUNT (258),
+  SYS_UNMOUNT (259), SYS_CREATE (260), SYS_STAT_P9 (261),
+  SYS_FSTAT_P9 (262), SYS_REMOVE (263), SYS_FD2PATH (264),
+  SYS_ERRSTR (265) all wired through `arch/x86/kernel/syscall.ad`'s
+  `do_syscall`. SYS_ERRSTR has a real body in
+  `sys/src/9/port/error.ad`; the rest return -ENOSYS until Phase C.~~
+- **Phase C** — Land real bodies for the Plan 9 primitives next to
+  the existing Linux-shape calls. Order proposed by
+  `docs/architecture.md`:
+  - `rfork` (256) — implement on top of `do_clone` with RF\* flag
+    translation (RFPROC | RFFDG | RFNAMEG | RFENVG).
+  - `bind` (257) + `mount` (258) + `unmount` (259) — namespace
+    primitives. Need the channel/`chan` skeleton in
+    `sys/src/9/port/chan.ad` (new) first.
+  - `create` (260) — file creation distinct from `open(O_CREAT)`;
+    OWRITE plus DMDIR for directories. Builds on `vfs_open_write`.
+  - `remove` (263) — alias for the existing `vfs_unlink`. Renames
+    `SYS_UNLINK` (21) to `remove` semantically; Phase G deletes 21.
+  - `stat` / `fstat` (261 / 262) — Dir-record encoding (see
+    `docs/native-api.md` directory format). Distinct from any
+    future Linux `SYS_STAT` we keep on the L-track.
+  - `fd2path` (264) — `read(.../cwd)` proxy for getcwd-style use
+    once `/proc/<pid>/cwd` is a real file.
+- **Phase D** prerequisite — `srvfd` channels at `/srv/<name>`.
+  `mount` needs `srvfd` to come from somewhere; without it the
+  Phase C `mount` body has nothing to consume.
+- Wider errstr integration — Phase B / M16.93 only set the error
+  message on `SYS_OPEN → -ENOENT` (the smallest viable
+  demonstration). Every existing syscall failure path that returns
+  a negative errno-shape value should `set_current_errstr(...)`
+  with a human-readable string so Phase C / Plan 9 callers get
+  useful diagnostics out of `errstr(2)`. Cheap, mechanical, but
+  hundreds of sites; defer until Phase C lands `rfork` so the
+  audience for the messages actually exists.
+
 ## Kernel / L-track
 
 - `MAX_EXPORTS=512` ceiling — bump again when we cross ~450 used.
