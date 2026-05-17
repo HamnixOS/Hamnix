@@ -27,6 +27,24 @@ are fair game for any contributor — human or AI agent.
 - `libphy.ko` (~153 UND, Ethernet PHY).
 - usbcore + xhci_hcd — real-hardware drivers.
 
+## Networking
+
+- ~~Bare-metal virtio-net PCI driver — shipped in M16.88. RX
+  delivers real frames to `eth_rx()` via SLIRP-gateway ARP
+  round-trip.~~
+- IOAPIC programming + real virtio-net IRQ handler — today the
+  driver is polled from the kernel init smoke test; without
+  IOAPIC routing of PCI INTx we can't take a real interrupt
+  yet, so `virtio_net_poll()` is the only RX path.
+- Fill in `eth_rx()` body — currently it just logs + drops.
+  Needs the EthHdr cast, proto byte-swap, and L3 dispatch
+  (`arp_rx` / `ip_rx`).
+- ARP responder + cache — reply to who-has queries for our IP
+  so SLIRP-side userspace tools can talk to us.
+- ICMP echo (ping reply) — first proof of two-way IP traffic.
+- DHCP client — replaces the hard-coded 10.0.2.15 in the ARP
+  probe. Unblocks `apt update` reaching real package mirrors.
+
 ## Userspace / U-track
 
 - Real vDSO blob (mapped page advertised via `AT_SYSINFO_EHDR`),

@@ -1,0 +1,443 @@
+# drivers/net/virtio_net.ad
+#
+# Bare-metal virtio-net PCI driver — mirror of drivers/net/virtio_net.c
+# at minimum scope. Probes the legacy virtio-net PCI device
+# (1AF4:1000), runs the standard virtio init dance, sets up the
+# RX (queue 0) and TX (queue 1) virtqueues, pre-populates the RX
+# ring with 8 receive buffers, reads the device MAC, and exposes a
+# polling helper `virtio_net_poll()` that drains the RX used ring
+# and calls `eth_rx()` for each received frame.
+#
+# Why a polling helper and not a real IRQ handler? The bare-metal
+# kernel currently brings up the LAPIC for the timer tick but does
+# NOT program the IOAPIC, so PCI INTx lines have nowhere to land.
+# MSI-X would work but adds complexity ruled out of this milestone.
+# Polling on demand is sufficient to prove the driver delivers
+# frames — `net_smoke_test()` in init/main.ad calls
+# `virtio_net_poll()` in a short busy loop after device init,
+# giving QEMU SLIRP time to inject its initial ARP/DHCP broadcast.
+#
+# Frame shape on the wire vs. in the virtio queue:
+#
+#   virtio_net legacy RX buffer:
+#     [ struct virtio_net_hdr (10 bytes) | ethernet frame ]
+#
+#   struct virtio_net_hdr (without F_MRG_RXBUF) — 10 bytes:
+#       u8  flags
+#       u8  gso_type
+#       u16 hdr_len
+#       u16 gso_size
+#       u16 csum_start
+#       u16 csum_offset
+#
+# We strip the 10-byte virtio_net_hdr before handing the raw
+# Ethernet frame up to eth_rx().
+
+from kernel.printk.printk import printk0, printk1, printk2
+from drivers.pci.pci import (
+    pci_find, pci_read_bar, pci_enable_io_and_master, PCI_BDF_NONE,
+)
+from drivers.virtio.virtio_pci import (
+    virtio_reset, virtio_acknowledge, virtio_driver_ok,
+    virtio_read_host_features, virtio_write_guest_features,
+    virtio_notify, VIRTIO_PCI_CONFIG,
+)
+from mm.page_alloc import alloc_pages
+from mm.slab import kmalloc
+from drivers.net.eth import eth_rx, nd_mac
+
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
+
+VNET_PCI_VENDOR:        uint32 = 0x1AF4
+VIRTIO_NET_LEGACY:    uint32 = 0x1000
+
+# Feature bits we care about (legacy bit positions).
+VIRTIO_NET_F_MAC:     uint32 = 0x20         # bit 5 — config.mac is valid
+
+# Descriptor flags (mirror of drivers/virtio/virtio_ring.ad — duplicated
+# here so this driver isn't tangled in with virtio-blk's helpers, which
+# assume a 3-descriptor chain shape we don't share).
+VNET_DESC_F_NEXT:    uint16 = 1
+VNET_DESC_F_WRITE:   uint16 = 2
+
+# Sizes used by the RX ring layout.
+VIRTIO_NET_HDR_LEN:   uint64 = 10
+RX_BUF_BYTES:         uint64 = 1526        # 10-byte vnet hdr + 1514 ETH frame
+NR_RX_BUFS:           uint64 = 8
+
+# Virtqueue indices in the virtio-net spec.
+VQ_RX:                uint32 = 0
+VQ_TX:                uint32 = 1
+
+# Legacy virtio header offset for the device-specific config window
+# (mac is at offset 0 of that window for virtio-net).
+VNET_CFG_MAC_OFF:     uint32 = 0
+
+
+# Per-virtqueue runtime state. Mirrors virtio_ring's VirtQueue but
+# stays local to this driver — we want a separate descriptor free-list
+# discipline (single-descriptor chains for RX, single-descriptor TX
+# chains too in future) without sharing the 3-buf chain assumption.
+class VNetVQ:
+    qsize:           uint16
+    used_idx_seen:   uint16
+    pad0:            uint16
+    pad1:            uint16
+    desc_addr:       uint64       # qsize * 16 bytes
+    avail_addr:      uint64       # 6 + qsize * 2 bytes
+    used_addr:       uint64       # 6 + qsize * 8 bytes
+    page_addr:       uint64       # base of the contiguous queue allocation
+
+
+class VirtioNet:
+    iobase:          uint32
+    rx:              VNetVQ
+    tx:              VNetVQ
+    rx_buf_addrs:    Array[8, uint64]    # NR_RX_BUFS slots
+    mac:             Array[6, uint8]
+    rx_packets:      uint64
+
+
+vnet_state: VirtioNet
+
+
+def _vnet_align_up(value: uint64, alignment: uint64) -> uint64:
+    return (value + alignment - 1) & ~(alignment - 1)
+
+
+def _vnet_queue_select(iobase: uint32, qidx: uint32) -> uint32:
+    # Inline the queue-select sequence we need (read QUEUE_SIZE for
+    # qidx). Mirrors virtio_select_queue but kept inline so we don't
+    # have to import the helper twice with different prototypes.
+    outw(cast[int32](qidx & 0xFFFF), cast[int32](iobase + 0x0E))
+    return cast[uint32](inw(cast[int32](iobase + 0x0C)))
+
+
+def _vnet_set_queue_pfn(iobase: uint32, page_addr: uint64):
+    pfn: uint32 = cast[uint32](page_addr >> 12)
+    outl(pfn, cast[int32](iobase + 0x08))
+
+
+def _vnet_vq_setup(iobase: uint32, qidx: uint32,
+                   vq: Ptr[VNetVQ]) -> int32:
+    # Standard legacy-virtio queue setup: SELECT, read QUEUE_SIZE,
+    # allocate a single contiguous block large enough for the three
+    # rings (descriptors, avail, used) at the spec-mandated alignment,
+    # zero it, plant the PFN.
+    qsize: uint32 = _vnet_queue_select(iobase, qidx)
+    if qsize == 0:
+        printk1("[virtio-net] queue %d unsupported (size 0)\n",
+                cast[uint64](qidx))
+        return -1
+    if qsize > 256:
+        printk1("[virtio-net] queue %d larger than 256\n",
+                cast[uint64](qidx))
+        return -1
+
+    # 4 pages (order=2 = 16 KiB) is plenty for qsize<=256. Same shape
+    # virtio-blk uses.
+    page: uint64 = alloc_pages(2)
+    if page == 0:
+        return -1
+    memset(cast[Ptr[uint8]](page), 0, 16384)
+
+    desc_off:   uint64 = 0
+    desc_size:  uint64 = cast[uint64](qsize) * 16
+    avail_off:  uint64 = _vnet_align_up(desc_off + desc_size, 2)
+    avail_size: uint64 = 6 + cast[uint64](qsize) * 2
+    used_off:   uint64 = _vnet_align_up(avail_off + avail_size, 4096)
+
+    vq[0].qsize         = cast[uint16](qsize & 0xFFFF)
+    vq[0].used_idx_seen = 0
+    vq[0].desc_addr     = page + desc_off
+    vq[0].avail_addr    = page + avail_off
+    vq[0].used_addr     = page + used_off
+    vq[0].page_addr     = page
+
+    _vnet_set_queue_pfn(iobase, page)
+    printk2("[virtio-net] queue %d ready (size=%d)\n",
+            cast[uint64](qidx), cast[uint64](qsize))
+    return 0
+
+
+def _vnet_desc_set(vq: Ptr[VNetVQ], idx: uint16,
+              addr: uint64, length: uint32, flags: uint16,
+              nxt: uint16):
+    # 16-byte descriptor: u64 addr | u32 len | u16 flags | u16 next.
+    d: uint64 = vq[0].desc_addr + cast[uint64](idx) * 16
+    cast[Ptr[uint64]](d +  0)[0] = addr
+    cast[Ptr[uint32]](d +  8)[0] = length
+    cast[Ptr[uint16]](d + 12)[0] = flags
+    cast[Ptr[uint16]](d + 14)[0] = nxt
+
+
+def _avail_push(vq: Ptr[VNetVQ], head: uint16):
+    # Append `head` to the avail ring and bump the idx. Wraps modulo
+    # qsize. x86 TSO gives us the memory ordering for free.
+    avail: uint64 = vq[0].avail_addr
+    qsize: uint16 = vq[0].qsize
+    idx:   uint16 = cast[Ptr[uint16]](avail + 2)[0]
+    slot:  uint16 = idx % qsize
+    cast[Ptr[uint16]](avail + 4 + cast[uint64](slot) * 2)[0] = head
+    cast[Ptr[uint16]](avail + 2)[0] = idx + 1
+
+
+def _populate_rx(vnet: Ptr[VirtioNet]):
+    # Pre-fill the RX ring with NR_RX_BUFS single-descriptor entries.
+    # Each descriptor points at a kmalloc'd RX_BUF_BYTES buffer; the
+    # device may write up to that much (virtio_net_hdr + Ethernet
+    # frame). After all NR_RX_BUFS entries are linked into the avail
+    # ring we kick the RX queue exactly once — the device will then
+    # use whichever buffer it needs for the first inbound packet.
+    i: uint64 = 0
+    while i < NR_RX_BUFS:
+        buf: uint64 = kmalloc(RX_BUF_BYTES)
+        if buf == 0:
+            printk0("[virtio-net] kmalloc for RX buf failed\n")
+            return
+        memset(cast[Ptr[uint8]](buf), 0, RX_BUF_BYTES)
+        vnet[0].rx_buf_addrs[i] = buf
+        # Descriptor idx == i; single-descriptor chain (no NEXT).
+        _vnet_desc_set(&vnet[0].rx, cast[uint16](i),
+                  buf, cast[uint32](RX_BUF_BYTES),
+                  VNET_DESC_F_WRITE, 0)
+        _avail_push(&vnet[0].rx, cast[uint16](i))
+        i = i + 1
+
+
+def _read_mac(iobase: uint32, mac: Ptr[uint8]):
+    # The device-specific config window starts at BAR0 + 0x14 (legacy).
+    # The MAC is the first 6 bytes there, byte-readable. We use inb
+    # one byte at a time to mirror virtio_cread_bytes() and avoid the
+    # legacy alignment trap on partial-dword reads.
+    i: uint32 = 0
+    while i < 6:
+        b: uint32 = inb(cast[int32](iobase + VIRTIO_PCI_CONFIG + i)) & 0xFF
+        mac[i] = cast[uint8](b)
+        i = i + 1
+
+
+def _print_mac(mac: Ptr[uint8]):
+    # Emit "mac=xx:xx:xx:xx:xx:xx\n" using one printk per pair so the
+    # one-arg printk path is enough. (printk has no formatter beyond
+    # one or two %x specs.) We pad each byte with the high nibble
+    # explicitly so leading zeros render.
+    printk0("[virtio-net] mac=")
+    i: uint64 = 0
+    while i < 6:
+        b: uint64 = cast[uint64](mac[i])
+        hi: uint64 = (b >> 4) & 0xF
+        lo: uint64 = b & 0xF
+        printk1("%x", hi)
+        printk1("%x", lo)
+        if i < 5:
+            printk0(":")
+        i = i + 1
+    printk0("\n")
+
+
+def virtio_net_init() -> int32:
+    # Probe and init. Returns 0 on success, -1 on no-device / failure.
+    # Caller treats a miss as "no virtio-net attached" — net stack
+    # stays scaffold-only.
+    bdf: uint32 = pci_find(VNET_PCI_VENDOR, VIRTIO_NET_LEGACY)
+    if bdf == PCI_BDF_NONE:
+        printk0("[virtio-net] no PCI device found\n")
+        return -1
+
+    pci_enable_io_and_master(bdf)
+    bar0_raw: uint32 = pci_read_bar(bdf, 0)
+    if (bar0_raw & 1) == 0:
+        printk0("[virtio-net] BAR0 is not IO-space (modern virtio?)\n")
+        return -1
+    iobase: uint32 = bar0_raw & 0xFFFFFFFC
+    vnet_state.iobase = iobase
+    vnet_state.rx_packets = 0
+    printk2("[virtio-net] bdf=%x iobase=%p\n",
+            cast[uint64](bdf), cast[uint64](iobase))
+
+    # Standard virtio init dance.
+    virtio_reset(iobase)
+    virtio_acknowledge(iobase)
+
+    # Negotiate features. We accept only F_MAC if the host offers it;
+    # otherwise QEMU's SLIRP backend assigns the MAC anyway but it
+    # won't be readable via config space. F_MRG_RXBUF stays OFF —
+    # that means the device uses exactly one buffer per packet and
+    # never coalesces, which keeps our RX path straightforward
+    # (10-byte virtio_net_hdr + frame, no num_buffers field).
+    host: uint32 = virtio_read_host_features(iobase)
+    printk1("[virtio-net] host features=%x\n", cast[uint64](host))
+    guest: uint32 = host & VIRTIO_NET_F_MAC
+    virtio_write_guest_features(iobase, guest)
+
+    # Set up RX (queue 0) and TX (queue 1).
+    if _vnet_vq_setup(iobase, VQ_RX, &vnet_state.rx) < 0:
+        return -1
+    if _vnet_vq_setup(iobase, VQ_TX, &vnet_state.tx) < 0:
+        return -1
+
+    # Read MAC and copy into the net_device global so userspace
+    # (`/bin/ifconfig`) can render it later. We log it now too so
+    # the test fixture has something obvious to grep for.
+    _read_mac(iobase, &vnet_state.mac[0])
+    i: uint64 = 0
+    while i < 6:
+        nd_mac[i] = vnet_state.mac[i]
+        i = i + 1
+    _print_mac(&vnet_state.mac[0])
+
+    # Pre-populate RX ring + flip DRIVER_OK + kick the device so it
+    # knows there are buffers to use.
+    _populate_rx(&vnet_state)
+    virtio_driver_ok(iobase)
+    virtio_notify(iobase, VQ_RX)
+
+    printk0("[virtio-net] init done; RX queue populated\n")
+    return 0
+
+
+def _rx_handle_one(slot: uint16, length: uint32):
+    # Used-ring entry says descriptor `slot` got a packet of total
+    # length `length` (including the 10-byte virtio_net_hdr). Strip
+    # the header, hand the Ethernet frame to the stack, then re-queue
+    # the same descriptor + buffer so the device has a slot for the
+    # next packet.
+    if length <= cast[uint32](VIRTIO_NET_HDR_LEN):
+        return                                 # runt; drop silently
+    buf: uint64 = vnet_state.rx_buf_addrs[slot]
+    eth_len: uint64 = cast[uint64](length) - VIRTIO_NET_HDR_LEN
+    eth_ptr: Ptr[uint8] = cast[Ptr[uint8]](buf + VIRTIO_NET_HDR_LEN)
+    vnet_state.rx_packets = vnet_state.rx_packets + 1
+    printk1("[virtio-net] RX packet: len=%d\n", eth_len)
+    eth_rx(eth_ptr, eth_len)
+    # Re-queue: rebuild the descriptor (length resets to full buffer
+    # capacity, flags back to device-writable) and push it onto the
+    # avail ring. The device will refill it from the next inbound
+    # packet.
+    _vnet_desc_set(&vnet_state.rx, slot,
+              buf, cast[uint32](RX_BUF_BYTES),
+              VNET_DESC_F_WRITE, 0)
+    _avail_push(&vnet_state.rx, slot)
+
+
+def virtio_net_poll():
+    # Drain the RX used ring. Walks from `used_idx_seen` up to the
+    # current `used.idx` and dispatches each entry. Each used-ring
+    # entry is {u32 id, u32 len} starting at offset 4 of the used
+    # region. The header (offset 0..3) is u16 flags + u16 idx.
+    if vnet_state.iobase == 0:
+        return
+    used: uint64 = vnet_state.rx.used_addr
+    cur: uint16 = cast[Ptr[uint16]](used + 2)[0]
+    seen: uint16 = vnet_state.rx.used_idx_seen
+    if cur == seen:
+        return
+    qsize: uint16 = vnet_state.rx.qsize
+    while seen != cur:
+        slot_in_ring: uint16 = seen % qsize
+        entry: uint64 = used + 4 + cast[uint64](slot_in_ring) * 8
+        desc_id: uint32 = cast[Ptr[uint32]](entry + 0)[0]
+        length:  uint32 = cast[Ptr[uint32]](entry + 4)[0]
+        _rx_handle_one(cast[uint16](desc_id & 0xFFFF), length)
+        seen = seen + 1
+    vnet_state.rx.used_idx_seen = cur
+    # Kick the device after we re-queued so it picks up the refilled
+    # descriptors promptly (otherwise the device might sit idle if
+    # it had drained the avail ring while we were processing).
+    virtio_notify(vnet_state.iobase, VQ_RX)
+
+
+def virtio_net_rx_packets() -> uint64:
+    return vnet_state.rx_packets
+
+
+# --- TX path (single-descriptor, used to provoke RX traffic) -------
+#
+# QEMU SLIRP doesn't send anything spontaneously — no DHCP offer
+# without a request, no router advertisement, no unsolicited ARP.
+# To prove the RX path actually delivers frames we send one ARP
+# request for the SLIRP gateway (10.0.2.2) from our MAC; SLIRP's
+# emulated gateway answers with an ARP reply that lands in our RX
+# ring. The TX path here is intentionally minimal: a single
+# descriptor (no chaining), since virtio-net's legacy TX accepts
+# the virtio_net_hdr inline in the same buffer as the frame.
+
+vnet_arp_buf: Array[64, uint8]
+
+
+def _vnet_arp_build_probe():
+    # Build an ARP request from us to the SLIRP gateway. Buffer
+    # layout: [ 10-byte virtio_net_hdr (zeroed) | 14-byte Ethernet
+    # header | 28-byte ARP payload ] = 52 bytes; we round up to 64
+    # for minimum-frame padding (SLIRP doesn't care but real NICs
+    # do, and zero-padding is harmless here).
+    i: uint64 = 0
+    while i < 64:
+        vnet_arp_buf[i] = 0
+        i = i + 1
+    # Ethernet header @ offset 10:
+    #   dest = ff:ff:ff:ff:ff:ff (broadcast)
+    #   src  = our MAC
+    #   type = 0x0806 (ARP, big-endian)
+    eoff: uint64 = 10
+    j: uint64 = 0
+    while j < 6:
+        vnet_arp_buf[eoff + j] = 0xFF
+        j = j + 1
+    j = 0
+    while j < 6:
+        vnet_arp_buf[eoff + 6 + j] = vnet_state.mac[j]
+        j = j + 1
+    vnet_arp_buf[eoff + 12] = 0x08
+    vnet_arp_buf[eoff + 13] = 0x06
+    # ARP payload @ offset 24 (10 + 14):
+    #   htype = 0x0001  (Ethernet)
+    #   ptype = 0x0800  (IPv4)
+    #   hlen  = 6
+    #   plen  = 4
+    #   oper  = 0x0001  (request)
+    #   sha   = our MAC
+    #   spa   = 10.0.2.15 (default SLIRP guest IP)
+    #   tha   = 00:00:00:00:00:00
+    #   tpa   = 10.0.2.2  (SLIRP gateway)
+    aoff: uint64 = 24
+    vnet_arp_buf[aoff +  0] = 0x00
+    vnet_arp_buf[aoff +  1] = 0x01
+    vnet_arp_buf[aoff +  2] = 0x08
+    vnet_arp_buf[aoff +  3] = 0x00
+    vnet_arp_buf[aoff +  4] = 6
+    vnet_arp_buf[aoff +  5] = 4
+    vnet_arp_buf[aoff +  6] = 0x00
+    vnet_arp_buf[aoff +  7] = 0x01
+    k: uint64 = 0
+    while k < 6:
+        vnet_arp_buf[aoff + 8 + k] = vnet_state.mac[k]
+        k = k + 1
+    vnet_arp_buf[aoff + 14] = 10
+    vnet_arp_buf[aoff + 15] = 0
+    vnet_arp_buf[aoff + 16] = 2
+    vnet_arp_buf[aoff + 17] = 15
+    # tha is already zero from the memset above.
+    vnet_arp_buf[aoff + 24] = 10
+    vnet_arp_buf[aoff + 25] = 0
+    vnet_arp_buf[aoff + 26] = 2
+    vnet_arp_buf[aoff + 27] = 2
+
+
+def virtio_net_send_arp_probe():
+    # Submit the ARP probe through TX (queue 1) as a single-descriptor
+    # device-readable chain. We park the buffer at slot 0 in the TX
+    # descriptor ring — there's no other TX in flight, so reusing
+    # slot 0 every call is fine. The device reads the buffer, marks
+    # the descriptor used, and we don't bother polling completion
+    # (the kernel doesn't yet have a packet sent counter to compare).
+    if vnet_state.iobase == 0:
+        return
+    _vnet_arp_build_probe()
+    addr: uint64 = cast[uint64](&vnet_arp_buf[0])
+    _vnet_desc_set(&vnet_state.tx, 0, addr, 64, 0, 0)
+    _avail_push(&vnet_state.tx, 0)
+    virtio_notify(vnet_state.iobase, VQ_TX)
+    printk0("[virtio-net] ARP probe sent (10.0.2.15 -> 10.0.2.2)\n")
