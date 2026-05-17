@@ -28,12 +28,10 @@ If you're running an agent against this repo:
 See `TODO.md` for items not yet scheduled to a specific milestone. The
 list is intentionally short and concrete; pick any item, ship it.
 
-One example currently waiting:
-- **`do-while` loop in Adder.** Python lacks it, but for the
-  "run-body-then-test" shape it's strictly nicer than the
-  `while True: ... if not cond: break` workaround. The TODO entry
-  has the proposed surface syntax and the four files that need
-  edits.
+`do-while` was the example of "small, concrete language work" that
+used to live here. It shipped in commit c563762 and the entry has
+been retired. See `LANGUAGE.md` for the current syntax. New items
+are added to `TODO.md` as they come up; pick any and ship it.
 
 ## Project Overview
 
@@ -166,10 +164,10 @@ while i < 10:
     # ...
     i = i + 1
 
-# do-while — NOT YET IMPLEMENTED. See TODO.md. Proposed:
-#   do:
-#       body
-#   while condition
+# do-while — body runs at least once, then condition is tested:
+do:
+    body
+while condition
 ```
 
 ## Coding Style

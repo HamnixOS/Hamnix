@@ -161,9 +161,16 @@ sign: int32 = 1 if x > 0 else -1
 ### Loops
 
 ```python
-# While loop
+# While loop — test condition, then run body
 while x > 0:
     x = x - 1
+
+# Do-while loop — run body at least once, then test condition.
+# Unique to Adder among Python-syntax languages; ships in the
+# `do:`/`while` form (no trailing colon on the `while` line).
+do:
+    x = x - 1
+while x > 0
 
 # For loop with range
 for i in range(10):

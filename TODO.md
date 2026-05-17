@@ -31,8 +31,15 @@ are fair game for any contributor — human or AI agent.
 - **Phase C** — Land real bodies for the Plan 9 primitives next to
   the existing Linux-shape calls. Order proposed by
   `docs/architecture.md`:
-  - `rfork` (256) — implement on top of `do_clone` with RF\* flag
-    translation (RFPROC | RFFDG | RFNAMEG | RFENVG).
+  - `rfork` (256) — PENDING. A previous agent (rate-limited mid-
+    flight) left a scaffold at `sys/src/9/port/sysproc.ad` (337
+    lines, untracked); the file is not yet imported anywhere and
+    `SYS_RFORK` (256) still returns -ENOSYS in
+    `arch/x86/kernel/syscall.ad`. Next agent: wire it up properly,
+    add the matching `TaskStruct` fields (`fd_table_refcount`,
+    `namespace_id`, `note_group`), and land `tests/test_rfork.ad`
+    + `scripts/test_rfork.sh` (also untracked scaffolds in the
+    tree).
   - `bind` (257) + `mount` (258) + `unmount` (259) — namespace
     primitives. Need the channel/`chan` skeleton in
     `sys/src/9/port/chan.ad` (new) first.
@@ -107,20 +114,30 @@ are fair game for any contributor — human or AI agent.
   (sender_ip, sender_mac) on both REQUEST and REPLY into an
   8-entry cache; responder builds a reply frame when the target
   protocol address matches our configured IP.~~
-- ARP TX via virtio-net — `arp_send_reply()` currently hands the
-  frame to `eth_tx()`, which is still a logging stub. Wire a
-  real `virtio_net_tx(buf, len)` so peers actually see the
-  reply on the wire. Needed before tap-mode validation of the
-  responder side.
-- IPv4 datagram path beyond the `eth_rx -> ip_rx` stub — header
-  + checksum validation, our-address match, dispatch by
-  `.protocol` (ICMP/UDP/TCP).
-- ICMP echo (ping reply) — first proof of two-way IP traffic.
-  Depends on the ARP TX path so peers can resolve us first.
-- DHCP client — replaces the hard-coded 10.0.2.15 in the ARP
-  probe. Unblocks `apt update` reaching real package mirrors.
-- TCP three-way handshake — SYN/SYN-ACK/ACK and a minimal
-  receive window. End-state requirement for `apt` over HTTP.
+- ~~ARP TX via virtio-net — shipped in M16.96. `eth_tx()` now wires
+  through to `virtio_net_tx()`; ARP replies actually reach the wire.~~
+- ~~IPv4 datagram path beyond the `eth_rx -> ip_rx` stub — shipped
+  in M16.96. Header + checksum validation, dispatch by `.protocol`
+  (1=ICMP / 17=UDP).~~
+- ~~ICMP echo (ping reply) — shipped in M16.97. Two-way IPv4 verified
+  end-to-end against the SLIRP gateway: `[icmp] echo request -> 10.0.2.2`
+  followed by `[icmp] echo reply from 10.0.2.2`. See
+  `scripts/test_net_icmp.sh`.~~
+- ~~DHCP client — shipped in M16.96. Four-way DISCOVER/OFFER/REQUEST/ACK
+  against SLIRP, captures `10.0.2.15` + gateway, mirrors into IP layer
+  + ARP responder. See `scripts/test_net_dhcp.sh`.~~
+- ICMP error message types — destination unreachable (type 3, sent
+  when we can't deliver), time exceeded (type 11, sent when TTL
+  hits 0 on a forward path we don't yet have), redirect (type 5).
+  None are required for echo, but real peers expect them when
+  routes break.
+- DNS resolver — UDP/53 query path + minimal answer parser. With
+  DHCP option-6 already captured, the only missing piece is the
+  query/response codec. Unblocks `apt update http://deb.debian.org`
+  reaching real package mirrors by name.
+- TCP three-way handshake — SYN/SYN-ACK/ACK and a minimal receive
+  window. End-state requirement for `apt` over HTTP. Builds on the
+  IP layer that M16.96/97 brought online.
 
 ## Userspace / U-track
 
