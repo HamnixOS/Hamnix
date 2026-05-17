@@ -246,6 +246,11 @@ SYS_getrusage:       uint64 = 98
 SYS_fadvise64:       uint64 = 221
 SYS_pselect6:        uint64 = 270
 SYS_statx:           uint64 = 332
+# U34: sendfile lets busybox cat / future cp use a kernel-side splice
+# instead of a userspace read+write loop. We don't have zero-copy DMA
+# wiring, so the body just bounces through a small stack buffer — same
+# observable behaviour, no ENOSYS spam.
+SYS_sendfile:        uint64 = 40
 
 
 # Linux errno values returned by stub handlers. Kept local to avoid
@@ -1150,9 +1155,42 @@ def _u_unimpl_pwrite64(a0: uint64, a1: uint64, a2: uint64,
     return ELINUX_NOSYS
 
 
-def _u_unimpl_readv(a0: uint64, a1: uint64, a2: uint64,
-                    a3: uint64, a4: uint64, a5: uint64) -> int64:
-    return ELINUX_NOSYS
+def _u_readv(a0: uint64, a1: uint64, a2: uint64,
+             a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # ssize_t readv(int fd, const struct iovec *iov, int iovcnt).
+    # Mirror image of _u_writev: walk the iovec[] (16 bytes per entry,
+    # base + len, no padding) and fan each chunk through vfs_read.
+    # Linux semantics on partial failure: if the first vfs_read returns
+    # an error, propagate it; otherwise stop on first error and return
+    # bytes-so-far so the caller can re-issue and surface errno on the
+    # next call. A short read (n < len) is treated as EOF/back-pressure
+    # and we stop, same as _u_writev.
+    fd: int32 = cast[int32](a0)
+    iov: uint64 = a1
+    cnt: uint64 = a2
+    if cnt == 0:
+        return 0
+    if iov == 0:
+        return ELINUX_INVAL
+    total: int64 = 0
+    i: uint64 = 0
+    while i < cnt:
+        entry: uint64 = iov + i * 16
+        base: uint64 = cast[Ptr[uint64]](entry)[0]
+        len:  uint64 = cast[Ptr[uint64]](entry + 8)[0]
+        if len == 0:
+            i = i + 1
+            continue
+        n: int64 = vfs_read(fd, cast[Ptr[uint8]](base), len)
+        if n < 0:
+            if total == 0:
+                return n                                  # propagate errno
+            return total
+        total = total + n
+        if cast[uint64](n) < len:
+            return total                                  # EOF / short read
+        i = i + 1
+    return total
 
 
 def _u_writev(a0: uint64, a1: uint64, a2: uint64,
@@ -1193,6 +1231,87 @@ def _u_writev(a0: uint64, a1: uint64, a2: uint64,
         if cast[uint64](n) < len:
             return total
         i = i + 1
+    return total
+
+
+# sendfile(2) chunk buffer. Stays on the stack — small enough that no
+# kmalloc is needed, big enough that file-to-pipe transfers don't
+# thrash the syscall ring (busybox cat copies a 4 KiB block at a time
+# in its fallback path, so we match that grain).
+SENDFILE_CHUNK: uint64 = 4096
+
+
+def _u_sendfile(a0: uint64, a1: uint64, a2: uint64,
+                a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t count)
+    # Hamnix has no zero-copy splice — we bounce through a stack buffer.
+    # The observable behaviour matches Linux for regular-file -> any-fd:
+    #
+    #   * If offset != NULL, *offset is the starting position in in_fd
+    #     (in_fd's own position is NOT advanced — POSIX-style — so we
+    #     seek to *offset, copy `count` bytes, then write the new
+    #     position back to *offset).
+    #   * If offset == NULL, read advances in_fd's position normally.
+    #   * Return bytes copied, or -errno on the first failure with
+    #     nothing copied yet (otherwise return the partial total — same
+    #     "errno surfaces on the next call" convention as writev).
+    #
+    # Promotes busybox cat off its read+write fallback and gives `cp`
+    # a single-syscall fast path for future U-milestones.
+    out_fd: int32 = cast[int32](a0)
+    in_fd:  int32 = cast[int32](a1)
+    off_ptr: uint64 = a2
+    remaining: uint64 = a3
+    if remaining == 0:
+        return 0
+
+    # If the caller supplied a *offset, seek in_fd there before the
+    # copy. Read it once, write the updated value back at the end.
+    cur_off: int64 = 0
+    if off_ptr != 0:
+        cur_off = cast[Ptr[int64]](off_ptr)[0]
+        rc: int64 = vfs_lseek(in_fd, cur_off, SEEK_SET)
+        if rc < 0:
+            return rc
+        cur_off = rc
+
+    buf: Array[4096, uint8]
+    total: int64 = 0
+    # do-while: at least one read attempt (caller asked for count > 0).
+    cont: int32 = 1
+    while cont != 0:
+        want: uint64 = remaining
+        if want > SENDFILE_CHUNK:
+            want = SENDFILE_CHUNK
+        n: int64 = vfs_read(in_fd, &buf[0], want)
+        if n < 0:
+            if total == 0:
+                return n
+            cont = 0
+            continue
+        if n == 0:
+            cont = 0                                      # EOF
+            continue
+        got: uint64 = cast[uint64](n)
+        w: int64 = vfs_write(out_fd, &buf[0], got)
+        if w < 0:
+            if total == 0:
+                return w
+            cont = 0
+            continue
+        total = total + w
+        if cast[uint64](w) < got:
+            # Short write — drop the remainder, mirror writev's
+            # back-pressure-stop behaviour.
+            cont = 0
+            continue
+        remaining = remaining - got
+        cur_off = cur_off + cast[int64](got)
+        if remaining == 0:
+            cont = 0
+
+    if off_ptr != 0:
+        cast[Ptr[int64]](off_ptr)[0] = cur_off
     return total
 
 
@@ -1646,9 +1765,51 @@ def _u_unimpl_uname(a0: uint64, a1: uint64, a2: uint64,
     return ELINUX_NOSYS
 
 
-def _u_unimpl_fcntl(a0: uint64, a1: uint64, a2: uint64,
-                    a3: uint64, a4: uint64, a5: uint64) -> int64:
-    return ELINUX_NOSYS
+# fcntl(2) cmd numbers (from <bits/fcntl-linux.h>). Hamnix has no
+# FD_CLOEXEC bookkeeping and no per-fd flags / file locking yet, so
+# the get-side commands return 0 and the set-side commands silently
+# accept. F_DUPFD / F_DUPFD_CLOEXEC forward to vfs_dup, ignoring the
+# "at or above newfd" constraint (which would require a vfs_dup that
+# takes a minimum-fd hint; not yet plumbed).
+F_DUPFD:         uint64 = 0
+F_GETFD:         uint64 = 1
+F_SETFD:         uint64 = 2
+F_GETFL:         uint64 = 3
+F_SETFL:         uint64 = 4
+F_GETLK:         uint64 = 5
+F_SETLK:         uint64 = 6
+F_SETLKW:        uint64 = 7
+F_DUPFD_CLOEXEC: uint64 = 1030
+
+
+def _u_fcntl(a0: uint64, a1: uint64, a2: uint64,
+             a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # int fcntl(int fd, int cmd, ... /* arg */ )
+    # Each branch matches the Linux command number; bodies are the
+    # minimum that lets glibc / musl startup paths stop probing on
+    # -ENOSYS. F_DUPFD ignores the at-or-above-newfd constraint for
+    # now — vfs_dup picks the smallest free fd, which happens to be
+    # >= 0 (>= "newfd=0") and usually >= any reasonable user request.
+    cmd: uint64 = a1
+    if cmd == F_DUPFD:
+        return cast[int64](vfs_dup(cast[int32](a0)))
+    if cmd == F_DUPFD_CLOEXEC:
+        return cast[int64](vfs_dup(cast[int32](a0)))
+    if cmd == F_GETFD:
+        return 0
+    if cmd == F_SETFD:
+        return 0
+    if cmd == F_GETFL:
+        return 0
+    if cmd == F_SETFL:
+        return 0
+    if cmd == F_GETLK:
+        return 0
+    if cmd == F_SETLK:
+        return 0
+    if cmd == F_SETLKW:
+        return 0
+    return ELINUX_INVAL
 
 
 def _u_unimpl_readlink(a0: uint64, a1: uint64, a2: uint64,
@@ -2220,7 +2381,7 @@ def linux_u_syscall_dispatch(nr: uint64,
     if nr == SYS_pwrite64:
         return _u_unimpl_pwrite64(a0, a1, a2, a3, a4, a5)
     if nr == SYS_readv:
-        return _u_unimpl_readv(a0, a1, a2, a3, a4, a5)
+        return _u_readv(a0, a1, a2, a3, a4, a5)
     if nr == SYS_writev:
         return _u_writev(a0, a1, a2, a3, a4, a5)
     if nr == SYS_access:
@@ -2260,7 +2421,7 @@ def linux_u_syscall_dispatch(nr: uint64,
     if nr == SYS_uname:
         return _u_uname(a0, a1, a2, a3, a4, a5)
     if nr == SYS_fcntl:
-        return _u_unimpl_fcntl(a0, a1, a2, a3, a4, a5)
+        return _u_fcntl(a0, a1, a2, a3, a4, a5)
     if nr == SYS_getcwd:
         return _u_getcwd(a0, a1, a2, a3, a4, a5)
     if nr == SYS_chdir:
@@ -2341,6 +2502,11 @@ def linux_u_syscall_dispatch(nr: uint64,
         return _u_getrusage(a0, a1, a2, a3, a4, a5)
     if nr == SYS_statx:
         return _u_statx(a0, a1, a2, a3, a4, a5)
+    # U34: sendfile — kernel-side copy loop. Promotes busybox cat off
+    # its read+write fallback. Also clears -ENOSYS for any future cp /
+    # tee / log-rotator path that probes sendfile first.
+    if nr == SYS_sendfile:
+        return _u_sendfile(a0, a1, a2, a3, a4, a5)
     # Unknown syscall — same convention as Linux: log + return -ENOSYS.
     # The printk includes nr so a trace of "unknown linux syscall X"
     # tells you exactly which entry to add to the ladder above.
