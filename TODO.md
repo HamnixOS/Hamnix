@@ -56,27 +56,32 @@ are fair game for any contributor — human or AI agent.
   useful diagnostics out of `errstr(2)`. Cheap, mechanical, but
   hundreds of sites; defer until Phase C lands `rfork` so the
   audience for the messages actually exists.
-- **Next /dev/\* device files** — M16.94 landed `/dev/cons` (read =
-  kbd/UART FIFO pop; write = `early_putc()` fan-out) under
-  `sys/src/9/port/devcons.ad` with `FD_CONS_MARK` plumbing in
-  `fs/vfs.ad`. Follow-ups, all modelled on the same shape (one
-  cdev file per /dev path, stateless `FD_*_MARK` dispatch in
+- **Next /dev/\* device files** — M16.94 landed `/dev/cons`; M16.95
+  landed `/dev/time` + `/dev/pid` + `/dev/random` under
+  `sys/src/9/port/devtime.ad`, `devpid.ad`, `devrandom.ad` with
+  `FD_TIME_MARK` / `FD_PID_MARK` / `FD_RANDOM_MARK` plumbing in
+  `fs/vfs.ad`. Remaining follow-ups in the same cdev shape (one
+  file per /dev path, stateless `FD_*_MARK` dispatch in
   vfs_read/vfs_write, no per-fd kmalloc):
-  - `/dev/time` (r) — `read()` returns ASCII decimal "nanoseconds
-    since boot\n". Replaces `SYS_GET_JIFFIES` (2) per the migration
-    table in `docs/native-api.md`. Read body sits next to devcons
-    as `sys/src/9/port/devtime.ad`.
-  - `/dev/pid` (r) — `read()` returns ASCII decimal "calling-task
-    pid\n". Convenience surface alongside the kept `SYS_GETPID`
-    (4); shipping it unblocks userland code that wants to read
-    the pid from a file without crossing a syscall boundary.
-  - `/dev/random` (r) — CSPRNG byte source. Need a real entropy
-    pool first (today the kernel has no RNG); start with a tiny
-    chacha20-style stream seeded from the TSC at boot. Lower
-    priority than the two above because correctness matters here.
-  - Migrate `SYS_PUTC` callers to `write("/dev/cons")` after
-    `/dev/time` lands so the fan-out path has two clients and the
-    migration row in `docs/native-api.md` can be ticked off.
+  - ~~`/dev/time` (r) — shipped in M16.95.~~
+  - ~~`/dev/pid` (r) — shipped in M16.95.~~
+  - ~~`/dev/random` (r) — xorshift64 placeholder shipped in M16.95.~~
+    Upgrade path: detect RDRAND/RDSEED via CPUID, swap the
+    xorshift64 step for a chacha20 stream rekeyed off the CPU
+    hardware RNG. Comment in `devrandom.ad` marks the current
+    state as a placeholder.
+  - `/dev/win/*` (Phase D) — windowing-server cdev family.
+    `/dev/win/ctl` is the entry point: writes (NEWWIN, RESIZE,
+    DESTROY, FOCUS) drive hamwd's window list; reads return
+    the focused window id as ASCII decimal. Subsequent
+    `/dev/win/<id>/{cmd,event,kbd,mouse,data}` files follow
+    once hamwd has a real daemon process. Blocked on
+    `hamwd` skeleton (separate userspace daemon, lives under
+    `user/hamwd.ad` — not yet a milestone).
+  - Migrate `SYS_PUTC` / `SYS_GET_JIFFIES` / `SYS_GETPID` callers
+    to the corresponding `/dev/*` reads now that the fan-out has
+    landed. Tracked separately so the migration row in
+    `docs/native-api.md` can be ticked off per-syscall.
 
 ## Kernel / L-track
 
