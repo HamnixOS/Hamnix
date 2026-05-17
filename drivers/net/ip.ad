@@ -1,18 +1,52 @@
 # drivers/net/ip.ad
 #
-# L37+ scaffold: IPv4 layer. Stock Linux's net/ipv4/ip_input.c does
-# header validation, fragment reassembly, routing (ip_route_input_slow),
-# then dispatches by protocol byte to TCP/UDP/ICMP. We model the
-# wire-format header and a logging stub for ip_rx; everything else
-# is left as comments for the L37+ work.
+# IPv4 layer for the bare-metal kernel. Mirrors stock Linux's
+# net/ipv4/ip_input.c at the absolute minimum needed to pass
+# datagrams up to ICMP / UDP and to build outbound packets for
+# our own DHCP client and ICMP echo responder.
+#
+# Receive side (ip_rx):
+#   1. Length-check (>= 20 byte header).
+#   2. Verify version=4 and IHL>=5.
+#   3. Dispatch by .protocol to icmp_rx (1) or udp_rx (17). Other
+#      protocols are dropped with a diagnostic — TCP isn't wired
+#      up yet (deferred to a follow-up milestone).
+#
+# Transmit side (ip_send):
+#   Build a 20-byte IPv4 header (no options), compute the 1's
+#   complement checksum, look up the destination's MAC via the
+#   ARP cache (or use the configured gateway MAC for off-link
+#   destinations, or broadcast for 255.255.255.255), prepend the
+#   14-byte Ethernet header, and hand the composite frame to
+#   eth_tx.
+#
+# Two pieces of state live here:
+#
+#   ip_our_ip:  our own IPv4 address (network byte order). Set
+#               either by DHCP or by a hardcoded boot-time value.
+#   ip_gateway: next-hop gateway IPv4 address. For SLIRP this is
+#               10.0.2.2. ICMP echoes to off-link destinations
+#               are sent to the gateway's MAC (resolved via ARP).
 
-from kernel.printk.printk import printk0, printk2
+from kernel.printk.printk import printk0, printk1, printk2
+from drivers.net.arp import arp_lookup, arp_set_our_ip
+from drivers.net.eth import eth_tx, eth_get_mac
 
 
 # Protocol numbers (IPv4 header byte 9). Subset used by the L37+ stack.
 IPPROTO_ICMP: uint8 = 1
 IPPROTO_TCP:  uint8 = 6
 IPPROTO_UDP:  uint8 = 17
+
+# Ethernet header constants (kept local to avoid a circular
+# eth.ad → ip.ad import; eth.ad's ETH_HDR_LEN is the canonical 14).
+IP_ETH_HDR_LEN: uint64 = 14
+IP_ETHERTYPE_IPV4_HI: uint8 = 0x08
+IP_ETHERTYPE_IPV4_LO: uint8 = 0x00
+
+# Minimum IPv4 header (no options).
+IP_HDR_LEN:   uint64 = 20
+IP_TTL:       uint8  = 64
 
 
 # 20-byte IPv4 fixed header. Options (bytes 20..(ihl*4)) are not
@@ -39,30 +73,319 @@ ip_in_hdr_err: uint64 = 0
 ip_in_addr_err: uint64 = 0
 
 
+# Outbound state. Both addresses live in network byte order so a
+# direct byte-by-byte copy from the wire / the ARP cache works
+# without a swap on the hot path.
+ip_our_ip:   Array[4, uint8]
+ip_gateway:  Array[4, uint8]
+ip_our_set:  uint8 = 0
+ip_gw_set:   uint8 = 0
+
+# Monotonic IPv4 fragment-ID counter. Stock Linux uses a per-route
+# atomic; we have one route, one TX path, no preemption on this
+# code path, so a plain global is fine.
+ip_next_id:  uint16 = 0
+
+# Scratch frame for outbound IP. 14-byte Ethernet header + up to
+# 1500-byte IP payload = 1514 bytes (the standard Ethernet MTU).
+# Sized at 1600 for a safety margin against off-by-one mistakes
+# in caller-supplied lengths. eth_tx will bounds-check anyway.
+IP_TX_SCRATCH: uint64 = 1600
+ip_tx_buf:     Array[1600, uint8]
+
+
+# --- accessors used by the upper layers (DHCP, ICMP) ---------------
+
+def ip_set_our_ip(b0: uint8, b1: uint8, b2: uint8, b3: uint8):
+    # Set our IPv4 address (each byte separately, network order).
+    # DHCP calls this on a successful ACK. We also push the same
+    # value down to arp.ad's arp_our_ip so the ARP responder
+    # accepts requests for our newly assigned address.
+    ip_our_ip[0] = b0
+    ip_our_ip[1] = b1
+    ip_our_ip[2] = b2
+    ip_our_ip[3] = b3
+    ip_our_set = 1
+    mirror: Array[4, uint8]
+    mirror[0] = b0
+    mirror[1] = b1
+    mirror[2] = b2
+    mirror[3] = b3
+    arp_set_our_ip(cast[Ptr[uint8]](&mirror[0]))
+
+
+def ip_set_gateway(b0: uint8, b1: uint8, b2: uint8, b3: uint8):
+    # Next-hop gateway IP for off-link destinations.
+    ip_gateway[0] = b0
+    ip_gateway[1] = b1
+    ip_gateway[2] = b2
+    ip_gateway[3] = b3
+    ip_gw_set = 1
+
+
+def ip_our_ip_b(i: uint64) -> uint8:
+    return ip_our_ip[i]
+
+
+def ip_gateway_b(i: uint64) -> uint8:
+    return ip_gateway[i]
+
+
+def ip_have_our_ip() -> int32:
+    if ip_our_set == 0:
+        return 0
+    return 1
+
+
+# --- Internet checksum --------------------------------------------
+#
+# RFC 1071: ones' complement of the ones' complement sum of the
+# 16-bit words of the message. The sum is folded into 16 bits at
+# the end. Returns the result in network byte order (high byte of
+# the result becomes the high byte of the on-wire checksum field).
+
+def ip_csum16(buf: Ptr[uint8], length: uint64) -> uint16:
+    # Sum 16-bit big-endian words. Carries are accumulated into a
+    # 32-bit running total and folded at the end. If `length` is
+    # odd the last byte is treated as the high byte of an implicit
+    # zero-padded final word.
+    sum32: uint32 = 0
+    i: uint64 = 0
+    end_pairs: uint64 = length & ~cast[uint64](1)
+    while i < end_pairs:
+        hi: uint32 = cast[uint32](buf[i])
+        lo: uint32 = cast[uint32](buf[i + 1])
+        word: uint32 = (hi << 8) | lo
+        sum32 = sum32 + word
+        i = i + 2
+    if i < length:
+        hi2: uint32 = cast[uint32](buf[i]) << 8
+        sum32 = sum32 + hi2
+    # Fold any carries into 16 bits.
+    while (sum32 >> 16) != 0:
+        sum32 = (sum32 & 0xFFFF) + (sum32 >> 16)
+    csum: uint16 = cast[uint16](~sum32 & 0xFFFF)
+    return csum
+
+
+# --- receive --------------------------------------------------------
+
 def ip_rx(pkt: Ptr[uint8], length: uint64):
-    # Scaffold: peel the header just enough to log src/dst, then drop.
-    # Real implementation will:
-    #   1. Length-check (>= 20, total_length consistency).
-    #   2. version == 4, ihl >= 5.
-    #   3. Verify checksum (one's-complement sum of the header).
-    #   4. ip_route_input(): is this for us? forward? broadcast?
-    #   5. If for us, defragment if needed, then dispatch by .protocol
-    #      to tcp_rx / udp_rx / icmp_rx.
+    # Validate enough header is present, then dispatch by protocol
+    # byte. The packet has already had the 14-byte Ethernet header
+    # peeled by eth_rx, so byte 0 of `pkt` is the version_ihl byte.
     ip_in_pkts = ip_in_pkts + 1
-    if length < 20:
+    if length < IP_HDR_LEN:
         ip_in_hdr_err = ip_in_hdr_err + 1
         printk0("ip_rx: runt\n")
         return
-    hdr: Ptr[IpHdr] = cast[Ptr[IpHdr]](pkt)
-    # Hand the on-wire (big-endian) addresses to printk2 verbatim;
-    # a future hexdump helper can byte-swap for human display.
-    s: uint64 = cast[uint64](hdr[0].src_addr)
-    d: uint64 = cast[uint64](hdr[0].dst_addr)
-    printk2("ip_rx: src=%x dst=%x\n", s, d)
+    version_ihl: uint8 = pkt[0]
+    version: uint8 = (version_ihl >> 4) & 0x0F
+    ihl:     uint8 = version_ihl & 0x0F
+    if version != 4:
+        ip_in_hdr_err = ip_in_hdr_err + 1
+        return
+    if ihl < 5:
+        ip_in_hdr_err = ip_in_hdr_err + 1
+        return
+    proto: uint8 = pkt[9]
+    hdr_bytes: uint64 = cast[uint64](ihl) * 4
+    if length < hdr_bytes:
+        ip_in_hdr_err = ip_in_hdr_err + 1
+        return
+    # Hand the L3 payload (everything past the header) up to the
+    # appropriate L4 handler. We pass the source IP separately for
+    # any handler that needs to address its reply (ICMP echo
+    # builds its reply from this).
+    payload: Ptr[uint8] = cast[Ptr[uint8]](
+        cast[uint64](pkt) + hdr_bytes)
+    payload_len: uint64 = length - hdr_bytes
+    src_b0: uint8 = pkt[12]
+    src_b1: uint8 = pkt[13]
+    src_b2: uint8 = pkt[14]
+    src_b3: uint8 = pkt[15]
+    if proto == IPPROTO_ICMP:
+        icmp_rx(payload, payload_len,
+                src_b0, src_b1, src_b2, src_b3)
+        return
+    if proto == IPPROTO_UDP:
+        udp_rx(payload, payload_len,
+               src_b0, src_b1, src_b2, src_b3)
+        return
+    # Unknown protocol — drop with a diagnostic. Common surprises
+    # here are TCP (6, not yet implemented) and IGMP (2).
+    printk1("ip_rx: unknown proto=%d\n", cast[uint64](proto))
+
+
+# --- transmit -------------------------------------------------------
+
+def _ip_is_broadcast(b0: uint8, b1: uint8, b2: uint8, b3: uint8) -> int32:
+    # Mask to 8 bits before comparison — the SysV ABI doesn't
+    # guarantee zero-extension of sub-word args in registers, so
+    # the upper bytes of the holding register may contain stale
+    # bits left over from the caller's computation. We mask
+    # explicitly to keep the test endian/width-clean.
+    b0m: uint32 = cast[uint32](b0) & 0xFF
+    b1m: uint32 = cast[uint32](b1) & 0xFF
+    b2m: uint32 = cast[uint32](b2) & 0xFF
+    b3m: uint32 = cast[uint32](b3) & 0xFF
+    if b0m != 0xFF:
+        return 0
+    if b1m != 0xFF:
+        return 0
+    if b2m != 0xFF:
+        return 0
+    if b3m != 0xFF:
+        return 0
+    return 1
+
+
+def _ip_in_subnet(b0: uint8, b1: uint8, b2: uint8, b3: uint8) -> int32:
+    # Heuristic: same /24 as our IP counts as on-link, otherwise we
+    # go through the gateway. Good enough for the SLIRP layout
+    # (we're 10.0.2.15 and the gateway is 10.0.2.2 — both on
+    # 10.0.2.0/24) and for any future bridged config that uses a
+    # /24 subnet. A real implementation would honour the netmask
+    # learned via DHCP (option 1).
+    if ip_our_set == 0:
+        return 0
+    if ip_our_ip[0] != b0:
+        return 0
+    if ip_our_ip[1] != b1:
+        return 0
+    if ip_our_ip[2] != b2:
+        return 0
+    return 1
+
+
+def ip_send(dst_b0: uint8, dst_b1: uint8, dst_b2: uint8, dst_b3: uint8,
+            proto: uint8, payload: Ptr[uint8],
+            payload_len: uint64) -> int32:
+    # Build [ ETH | IPv4 | payload ] into ip_tx_buf and hand it to
+    # eth_tx. The destination MAC depends on the destination IP:
+    #
+    #   255.255.255.255  → broadcast (FF:FF:FF:FF:FF:FF). Used by
+    #                      DHCPDISCOVER and DHCPREQUEST.
+    #   on-link host     → ARP-resolved MAC for dst.
+    #   off-link host    → ARP-resolved MAC for the gateway.
+    if payload_len + IP_HDR_LEN + IP_ETH_HDR_LEN > IP_TX_SCRATCH:
+        printk1("ip_send: too big (%d bytes)\n", payload_len)
+        return -1
+    # --- Resolve the destination MAC -------------------------------
+    dst_mac: Ptr[uint8] = cast[Ptr[uint8]](0)
+    bcast: Array[6, uint8]
+    j0: uint64 = 0
+    while j0 < 6:
+        bcast[j0] = 0xFF
+        j0 = j0 + 1
+    lookup_ip: Array[4, uint8]
+    if _ip_is_broadcast(dst_b0, dst_b1, dst_b2, dst_b3) == 1:
+        dst_mac = cast[Ptr[uint8]](&bcast[0])
+    else:
+        if _ip_in_subnet(dst_b0, dst_b1, dst_b2, dst_b3) == 1:
+            lookup_ip[0] = dst_b0
+            lookup_ip[1] = dst_b1
+            lookup_ip[2] = dst_b2
+            lookup_ip[3] = dst_b3
+        else:
+            if ip_gw_set == 0:
+                printk0("ip_send: no gateway configured\n")
+                return -1
+            lookup_ip[0] = ip_gateway[0]
+            lookup_ip[1] = ip_gateway[1]
+            lookup_ip[2] = ip_gateway[2]
+            lookup_ip[3] = ip_gateway[3]
+        # Stash the address into a local before the call so the
+        # codegen for the call site doesn't re-evaluate &lookup_ip[0]
+        # while register args may already be set (the same codegen
+        # quirk that bit udp_send/ip_send earlier).
+        lookup_ptr: Ptr[uint8] = cast[Ptr[uint8]](&lookup_ip[0])
+        dst_mac = arp_lookup(lookup_ptr)
+        if dst_mac == cast[Ptr[uint8]](0):
+            printk2("ip_send: no ARP entry for %d.%d.x.x\n",
+                    cast[uint64](lookup_ip[0]),
+                    cast[uint64](lookup_ip[1]))
+            return -1
+    # --- Compose Ethernet header @ ip_tx_buf[0..14] ----------------
+    i: uint64 = 0
+    while i < 6:
+        ip_tx_buf[i] = dst_mac[i]
+        i = i + 1
+    # Source MAC comes from eth.nd_mac via eth_get_mac.
+    our_mac: Ptr[uint8] = eth_get_mac()
+    i = 0
+    while i < 6:
+        ip_tx_buf[6 + i] = our_mac[i]
+        i = i + 1
+    ip_tx_buf[12] = IP_ETHERTYPE_IPV4_HI
+    ip_tx_buf[13] = IP_ETHERTYPE_IPV4_LO
+    # --- Compose IPv4 header @ ip_tx_buf[14..34] -------------------
+    iph: uint64 = cast[uint64](&ip_tx_buf[0]) + IP_ETH_HDR_LEN
+    p: Ptr[uint8] = cast[Ptr[uint8]](iph)
+    total_len: uint16 = cast[uint16](IP_HDR_LEN + payload_len)
+    p[0] = 0x45                   # version 4, IHL 5
+    p[1] = 0                      # DSCP/ECN
+    p[2] = cast[uint8]((cast[uint32](total_len) >> 8) & 0xFF)
+    p[3] = cast[uint8](cast[uint32](total_len) & 0xFF)
+    id_now: uint16 = ip_next_id
+    ip_next_id = ip_next_id + 1
+    p[4] = cast[uint8]((cast[uint32](id_now) >> 8) & 0xFF)
+    p[5] = cast[uint8](cast[uint32](id_now) & 0xFF)
+    p[6] = 0                      # flags=0, frag=0
+    p[7] = 0
+    p[8] = IP_TTL
+    p[9] = proto
+    p[10] = 0                     # checksum placeholder
+    p[11] = 0
+    # Source IP — use our configured IP, or zeros if not set yet
+    # (DHCPDISCOVER goes out as 0.0.0.0 → 255.255.255.255).
+    if ip_our_set == 1:
+        p[12] = ip_our_ip[0]
+        p[13] = ip_our_ip[1]
+        p[14] = ip_our_ip[2]
+        p[15] = ip_our_ip[3]
+    else:
+        p[12] = 0
+        p[13] = 0
+        p[14] = 0
+        p[15] = 0
+    p[16] = dst_b0
+    p[17] = dst_b1
+    p[18] = dst_b2
+    p[19] = dst_b3
+    # Compute header checksum.
+    csum: uint16 = ip_csum16(p, IP_HDR_LEN)
+    p[10] = cast[uint8]((cast[uint32](csum) >> 8) & 0xFF)
+    p[11] = cast[uint8](cast[uint32](csum) & 0xFF)
+    # --- Copy payload @ ip_tx_buf[34..] ----------------------------
+    pl_off: uint64 = IP_ETH_HDR_LEN + IP_HDR_LEN
+    k: uint64 = 0
+    while k < payload_len:
+        ip_tx_buf[pl_off + k] = payload[k]
+        k = k + 1
+    total_frame: uint64 = pl_off + payload_len
+    return eth_tx(cast[Ptr[uint8]](&ip_tx_buf[0]), total_frame)
 
 
 def ip_init():
     ip_in_pkts     = 0
     ip_in_hdr_err  = 0
     ip_in_addr_err = 0
-    printk0("ip: scaffold initialized\n")
+    ip_our_set = 0
+    ip_gw_set  = 0
+    ip_next_id = 1
+    i: uint64 = 0
+    while i < 4:
+        ip_our_ip[i] = 0
+        ip_gateway[i] = 0
+        i = i + 1
+    printk0("ip: initialized\n")
+
+
+# Note: icmp_rx (drivers/net/icmp.ad) and udp_rx (drivers/net/udp.ad)
+# are called from ip_rx above without import or forward declaration.
+# Importing them would create a real circular dependency (icmp.ad
+# already imports ip_send / ip_csum16 from here); a forward
+# `extern def` would collide with the real definition. Since the
+# Adder build merges all .ad files into a single program and the
+# linker resolves direct calls by name, neither is necessary.

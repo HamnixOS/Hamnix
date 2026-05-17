@@ -1,0 +1,421 @@
+# drivers/net/dhcp.ad
+#
+# Minimal DHCPv4 client (RFC 2131 + RFC 2132). Sends DHCPDISCOVER,
+# parses DHCPOFFER, sends DHCPREQUEST, parses DHCPACK, and installs
+# the assigned IP + gateway + subnet via ip_set_our_ip /
+# ip_set_gateway. This replaces the hardcoded `arp_set_our_ip` boot
+# call so the kernel can pick up whatever address the upstream
+# DHCP server (SLIRP, dnsmasq, a real router) hands out.
+#
+# Wire format (300 bytes minimum, options padded with zeros):
+#
+#   offset 0   op            (1)  = 1 (BOOTREQUEST) / 2 (BOOTREPLY)
+#   offset 1   htype         (1)  = 1 (Ethernet)
+#   offset 2   hlen          (1)  = 6
+#   offset 3   hops          (1)  = 0
+#   offset 4   xid           (4)  transaction ID, picked by us
+#   offset 8   secs          (2)  = 0
+#   offset 10  flags         (2)  = 0x8000 (broadcast bit set)
+#   offset 12  ciaddr        (4)  client IP address (filled by client
+#                                  once already configured; 0 for DISC)
+#   offset 16  yiaddr        (4)  "your" IP — set by the server in
+#                                  OFFER/ACK
+#   offset 20  siaddr        (4)  next-server (DHCP server) IP
+#   offset 24  giaddr        (4)  relay agent IP (we don't use relays)
+#   offset 28  chaddr        (16) client hardware address; first 6
+#                                  bytes = our MAC
+#   offset 44  sname         (64) server hostname (unused)
+#   offset 108 file          (128) boot filename (unused)
+#   offset 236 magic         (4)  0x63825363 (DHCP magic cookie)
+#   offset 240 options       (var)
+#
+# Options we care about:
+#   option 53 (Message Type)  : 1=DISCOVER, 2=OFFER, 3=REQUEST,
+#                                5=ACK, 6=NAK
+#   option 1  (Subnet Mask)   : 4 bytes, e.g. 255.255.255.0
+#   option 3  (Router)        : 4 bytes (first router only, we ignore
+#                                additional ones)
+#   option 6  (DNS)           : 4 bytes (first DNS only)
+#   option 50 (Requested IP)  : 4 bytes, sent in REQUEST
+#   option 54 (Server ID)     : 4 bytes, the DHCP server's address
+#   option 255 (End)          : terminator
+#
+# State machine is trivial:
+#
+#   IDLE → DISCOVER (we send DHCPDISCOVER, broadcast)
+#   DISCOVER → SELECTING (got DHCPOFFER, send DHCPREQUEST)
+#   SELECTING → BOUND (got DHCPACK, install lease)
+#
+# A DHCPNAK or timeout would reset to IDLE; we don't implement
+# rebind / renew (those needs T1/T2 timers; the install path is
+# what unblocks `apt`, not the lease refresh).
+
+from kernel.printk.printk import printk0, printk1, printk2
+from drivers.net.eth import eth_get_mac
+from drivers.net.udp import udp_send, UDP_PORT_DHCP_SERVER, UDP_PORT_DHCP_CLIENT
+from drivers.net.ip import ip_set_our_ip, ip_set_gateway
+
+
+DHCP_OP_BOOTREQUEST: uint8 = 1
+DHCP_OP_BOOTREPLY:   uint8 = 2
+
+DHCP_MSG_DISCOVER: uint8 = 1
+DHCP_MSG_OFFER:    uint8 = 2
+DHCP_MSG_REQUEST:  uint8 = 3
+DHCP_MSG_DECLINE:  uint8 = 4
+DHCP_MSG_ACK:      uint8 = 5
+DHCP_MSG_NAK:      uint8 = 6
+
+DHCP_OPT_SUBNET_MASK: uint8 = 1
+DHCP_OPT_ROUTER:      uint8 = 3
+DHCP_OPT_DNS:         uint8 = 6
+DHCP_OPT_MSG_TYPE:    uint8 = 53
+DHCP_OPT_REQUESTED:   uint8 = 50
+DHCP_OPT_SERVER_ID:   uint8 = 54
+DHCP_OPT_PARAM_LIST:  uint8 = 55
+DHCP_OPT_END:         uint8 = 255
+
+# Magic cookie at offset 236.
+DHCP_MAGIC_0: uint8 = 0x63
+DHCP_MAGIC_1: uint8 = 0x82
+DHCP_MAGIC_2: uint8 = 0x53
+DHCP_MAGIC_3: uint8 = 0x63
+
+# Minimum DHCP message size (header + magic + a few options + END).
+# 300 matches the BOOTP minimum a lot of legacy servers expect.
+DHCP_MIN_LEN: uint64 = 300
+
+# Scratch buffer for outbound DHCP. 300 + a few extra option bytes.
+DHCP_BUF_BYTES: uint64 = 512
+dhcp_tx_buf:    Array[512, uint8]
+
+# Per-session state. xid is generated once at dhcp_discover() and
+# the same value is reused for the matching REQUEST so the server
+# can tie the two together. offer_* fields capture the proposed
+# lease so dhcp_request_for_offer can echo them.
+DHCP_STATE_IDLE:      uint8 = 0
+DHCP_STATE_DISCOVER:  uint8 = 1   # sent DISCOVER, waiting for OFFER
+DHCP_STATE_SELECTING: uint8 = 2   # sent REQUEST, waiting for ACK
+DHCP_STATE_BOUND:     uint8 = 3   # got ACK, lease installed
+
+dhcp_state:        uint8 = 0
+dhcp_xid_b0:       uint8 = 0
+dhcp_xid_b1:       uint8 = 0
+dhcp_xid_b2:       uint8 = 0
+dhcp_xid_b3:       uint8 = 0
+
+dhcp_offer_yiaddr:  Array[4, uint8]
+dhcp_offer_server:  Array[4, uint8]
+dhcp_offer_router:  Array[4, uint8]
+dhcp_offer_mask:    Array[4, uint8]
+dhcp_offer_have_router: uint8 = 0
+dhcp_offer_have_mask:   uint8 = 0
+
+
+def _dhcp_zero_buf():
+    i: uint64 = 0
+    while i < DHCP_BUF_BYTES:
+        dhcp_tx_buf[i] = 0
+        i = i + 1
+
+
+def _dhcp_print_ip(b0: uint8, b1: uint8, b2: uint8, b3: uint8):
+    printk1("%d", cast[uint64](b0))
+    printk0(".")
+    printk1("%d", cast[uint64](b1))
+    printk0(".")
+    printk1("%d", cast[uint64](b2))
+    printk0(".")
+    printk1("%d", cast[uint64](b3))
+
+
+def _dhcp_fill_header(msg_type: uint8) -> uint64:
+    # Fill the fixed-format BOOTP header. Returns the offset of the
+    # first writable option (after the magic cookie + the mandatory
+    # message-type option). Caller appends more options + END.
+    _dhcp_zero_buf()
+    dhcp_tx_buf[0] = DHCP_OP_BOOTREQUEST    # op
+    dhcp_tx_buf[1] = 1                      # htype = Ethernet
+    dhcp_tx_buf[2] = 6                      # hlen = 6
+    dhcp_tx_buf[3] = 0                      # hops
+    dhcp_tx_buf[4] = dhcp_xid_b0
+    dhcp_tx_buf[5] = dhcp_xid_b1
+    dhcp_tx_buf[6] = dhcp_xid_b2
+    dhcp_tx_buf[7] = dhcp_xid_b3
+    # secs (8..9) zero; flags (10..11) zero — we accept unicast OFFERs
+    # to our offered yiaddr. (Setting the broadcast bit 0x8000 is also
+    # valid; we leave it clear because most modern servers can drive
+    # the unicast path for the first OFFER as long as our chaddr is
+    # set, and our virtio-net NIC ignores promiscuity anyway.)
+    # ciaddr / yiaddr / siaddr / giaddr at 12..27 remain zero on
+    # DISCOVER. For REQUEST we leave ciaddr zero (we don't have the
+    # lease yet — option 50 carries the requested IP instead).
+    # chaddr @ offset 28: 16 bytes; first 6 = our MAC.
+    our_mac: Ptr[uint8] = eth_get_mac()
+    i: uint64 = 0
+    while i < 6:
+        dhcp_tx_buf[28 + i] = our_mac[i]
+        i = i + 1
+    # sname @44, file @108 left zero.
+    # Magic cookie @236.
+    dhcp_tx_buf[236] = DHCP_MAGIC_0
+    dhcp_tx_buf[237] = DHCP_MAGIC_1
+    dhcp_tx_buf[238] = DHCP_MAGIC_2
+    dhcp_tx_buf[239] = DHCP_MAGIC_3
+    # Option 53 (Message Type): always first option.
+    dhcp_tx_buf[240] = DHCP_OPT_MSG_TYPE
+    dhcp_tx_buf[241] = 1                    # len
+    dhcp_tx_buf[242] = msg_type
+    return 243
+
+
+def _dhcp_append_param_list(off: uint64) -> uint64:
+    # Option 55 (Parameter Request List). Ask for subnet mask + router
+    # + DNS so the server includes them in the OFFER/ACK. Without
+    # this the server is allowed to omit them and we'd have to fall
+    # back to a hand-picked netmask.
+    dhcp_tx_buf[off + 0] = DHCP_OPT_PARAM_LIST
+    dhcp_tx_buf[off + 1] = 3                # len
+    dhcp_tx_buf[off + 2] = DHCP_OPT_SUBNET_MASK
+    dhcp_tx_buf[off + 3] = DHCP_OPT_ROUTER
+    dhcp_tx_buf[off + 4] = DHCP_OPT_DNS
+    return off + 5
+
+
+def _dhcp_append_end(off: uint64) -> uint64:
+    dhcp_tx_buf[off] = DHCP_OPT_END
+    return off + 1
+
+
+def _dhcp_pad_to_min(off: uint64) -> uint64:
+    # Zero-pad to DHCP_MIN_LEN so legacy servers that ignore short
+    # datagrams still process us.
+    if off >= DHCP_MIN_LEN:
+        return off
+    return DHCP_MIN_LEN
+
+
+def dhcp_discover() -> int32:
+    # Compose + send a DHCPDISCOVER. Picks a fresh xid each call so
+    # late-arriving OFFERs from a prior attempt don't confuse us.
+    # We never bind to a port (no socket(2) yet); we just feed the
+    # datagram into udp_send with src=68, dst=67, dst_ip=broadcast.
+    # The xid is a simple monotonic byte sequence; cryptographic
+    # randomness isn't needed for SLIRP/dnsmasq integration.
+    dhcp_xid_b0 = 0xC0
+    dhcp_xid_b1 = 0xFF
+    dhcp_xid_b2 = 0xEE
+    dhcp_xid_b3 = dhcp_xid_b3 + 1           # bump on each retry
+    off: uint64 = _dhcp_fill_header(DHCP_MSG_DISCOVER)
+    off = _dhcp_append_param_list(off)
+    off = _dhcp_append_end(off)
+    off = _dhcp_pad_to_min(off)
+    dhcp_state = DHCP_STATE_DISCOVER
+    printk0("[dhcp] sending DHCPDISCOVER\n")
+    # Pre-compute the stack arg into a local so the codegen for the
+    # call doesn't try to evaluate &dhcp_tx_buf[0] AFTER it has
+    # popped the register args (which would clobber %rcx via the
+    # array-index push/pop pair in the address expression — real
+    # bug, lost ~30 min of debugging).
+    buf_ptr: Ptr[uint8] = cast[Ptr[uint8]](&dhcp_tx_buf[0])
+    return udp_send(0xFF, 0xFF, 0xFF, 0xFF,
+                    UDP_PORT_DHCP_CLIENT,
+                    UDP_PORT_DHCP_SERVER,
+                    buf_ptr, off)
+
+
+def _dhcp_send_request() -> int32:
+    # Send DHCPREQUEST for the offered yiaddr. Broadcast (per RFC
+    # 2131 section 4.3.2: "MUST broadcast" until in BOUND state).
+    # Includes option 50 (Requested IP) + option 54 (Server ID).
+    off: uint64 = _dhcp_fill_header(DHCP_MSG_REQUEST)
+    # option 50 (Requested IP)
+    dhcp_tx_buf[off + 0] = DHCP_OPT_REQUESTED
+    dhcp_tx_buf[off + 1] = 4
+    dhcp_tx_buf[off + 2] = dhcp_offer_yiaddr[0]
+    dhcp_tx_buf[off + 3] = dhcp_offer_yiaddr[1]
+    dhcp_tx_buf[off + 4] = dhcp_offer_yiaddr[2]
+    dhcp_tx_buf[off + 5] = dhcp_offer_yiaddr[3]
+    off = off + 6
+    # option 54 (Server ID)
+    dhcp_tx_buf[off + 0] = DHCP_OPT_SERVER_ID
+    dhcp_tx_buf[off + 1] = 4
+    dhcp_tx_buf[off + 2] = dhcp_offer_server[0]
+    dhcp_tx_buf[off + 3] = dhcp_offer_server[1]
+    dhcp_tx_buf[off + 4] = dhcp_offer_server[2]
+    dhcp_tx_buf[off + 5] = dhcp_offer_server[3]
+    off = off + 6
+    off = _dhcp_append_param_list(off)
+    off = _dhcp_append_end(off)
+    off = _dhcp_pad_to_min(off)
+    dhcp_state = DHCP_STATE_SELECTING
+    printk0("[dhcp] sending DHCPREQUEST\n")
+    # Pre-compute the stack arg into a local — see the comment in
+    # dhcp_discover above for the codegen-quirk this works around.
+    buf_ptr: Ptr[uint8] = cast[Ptr[uint8]](&dhcp_tx_buf[0])
+    return udp_send(0xFF, 0xFF, 0xFF, 0xFF,
+                    UDP_PORT_DHCP_CLIENT,
+                    UDP_PORT_DHCP_SERVER,
+                    buf_ptr, off)
+
+
+def _dhcp_parse_options(payload: Ptr[uint8], length: uint64,
+                        out_msg_type: Ptr[uint8]) -> int32:
+    # Walk options starting at offset 240. Each option is
+    # [tag, len, data...] except the special PAD (0) which is a
+    # one-byte filler and END (255) which terminates. On success
+    # populates the dhcp_offer_* arrays and sets out_msg_type to
+    # the message-type byte; returns 0. Returns -1 if the magic
+    # cookie is wrong or the buffer is malformed.
+    if length < 240:
+        return -1
+    if payload[236] != DHCP_MAGIC_0:
+        return -1
+    if payload[237] != DHCP_MAGIC_1:
+        return -1
+    if payload[238] != DHCP_MAGIC_2:
+        return -1
+    if payload[239] != DHCP_MAGIC_3:
+        return -1
+    out_msg_type[0] = 0
+    dhcp_offer_have_router = 0
+    dhcp_offer_have_mask = 0
+    i: uint64 = 240
+    while i < length:
+        tag: uint8 = payload[i]
+        if tag == 0:
+            i = i + 1                       # PAD
+            continue
+        if tag == DHCP_OPT_END:
+            return 0
+        # Need at least the length byte.
+        if i + 1 >= length:
+            return -1
+        olen: uint8 = payload[i + 1]
+        data_off: uint64 = i + 2
+        if data_off + cast[uint64](olen) > length:
+            return -1
+        if tag == DHCP_OPT_MSG_TYPE:
+            if olen == 1:
+                out_msg_type[0] = payload[data_off]
+        elif tag == DHCP_OPT_SUBNET_MASK:
+            if olen == 4:
+                dhcp_offer_mask[0] = payload[data_off + 0]
+                dhcp_offer_mask[1] = payload[data_off + 1]
+                dhcp_offer_mask[2] = payload[data_off + 2]
+                dhcp_offer_mask[3] = payload[data_off + 3]
+                dhcp_offer_have_mask = 1
+        elif tag == DHCP_OPT_ROUTER:
+            if olen >= 4:
+                dhcp_offer_router[0] = payload[data_off + 0]
+                dhcp_offer_router[1] = payload[data_off + 1]
+                dhcp_offer_router[2] = payload[data_off + 2]
+                dhcp_offer_router[3] = payload[data_off + 3]
+                dhcp_offer_have_router = 1
+        elif tag == DHCP_OPT_SERVER_ID:
+            if olen == 4:
+                dhcp_offer_server[0] = payload[data_off + 0]
+                dhcp_offer_server[1] = payload[data_off + 1]
+                dhcp_offer_server[2] = payload[data_off + 2]
+                dhcp_offer_server[3] = payload[data_off + 3]
+        # other tags ignored
+        i = data_off + cast[uint64](olen)
+    return 0
+
+
+def dhcp_rx(payload: Ptr[uint8], length: uint64,
+            src_b0: uint8, src_b1: uint8,
+            src_b2: uint8, src_b3: uint8):
+    # Parse an inbound DHCP datagram (op=BOOTREPLY). The minimum
+    # we accept is 240 bytes (BOOTP header up to and including
+    # the magic cookie). Below that we drop silently.
+    if length < 240:
+        return
+    if payload[0] != DHCP_OP_BOOTREPLY:
+        return
+    # Match xid — drop datagrams that aren't a response to OUR
+    # outstanding request. This is the only filter that protects
+    # us against stray OFFERs from a neighbouring DHCP server on
+    # a shared L2 segment.
+    if payload[4] != dhcp_xid_b0:
+        return
+    if payload[5] != dhcp_xid_b1:
+        return
+    if payload[6] != dhcp_xid_b2:
+        return
+    if payload[7] != dhcp_xid_b3:
+        return
+    # Capture yiaddr (offset 16) — the proposed IP.
+    dhcp_offer_yiaddr[0] = payload[16]
+    dhcp_offer_yiaddr[1] = payload[17]
+    dhcp_offer_yiaddr[2] = payload[18]
+    dhcp_offer_yiaddr[3] = payload[19]
+    # Default the server-id to siaddr (offset 20); option 54 may
+    # override. SLIRP uses 10.0.2.2 for both, which matches.
+    dhcp_offer_server[0] = payload[20]
+    dhcp_offer_server[1] = payload[21]
+    dhcp_offer_server[2] = payload[22]
+    dhcp_offer_server[3] = payload[23]
+    msg_type_holder: Array[1, uint8]
+    if _dhcp_parse_options(payload, length,
+                           cast[Ptr[uint8]](&msg_type_holder[0])) != 0:
+        printk0("[dhcp] option parse error\n")
+        return
+    msg_type: uint8 = msg_type_holder[0]
+    if msg_type == DHCP_MSG_OFFER:
+        if dhcp_state != DHCP_STATE_DISCOVER:
+            return
+        printk0("[dhcp] OFFER ip=")
+        _dhcp_print_ip(dhcp_offer_yiaddr[0], dhcp_offer_yiaddr[1],
+                       dhcp_offer_yiaddr[2], dhcp_offer_yiaddr[3])
+        printk0(" server=")
+        _dhcp_print_ip(dhcp_offer_server[0], dhcp_offer_server[1],
+                       dhcp_offer_server[2], dhcp_offer_server[3])
+        printk0("\n")
+        _dhcp_send_request()
+        return
+    if msg_type == DHCP_MSG_ACK:
+        if dhcp_state != DHCP_STATE_SELECTING:
+            return
+        ip_set_our_ip(dhcp_offer_yiaddr[0], dhcp_offer_yiaddr[1],
+                      dhcp_offer_yiaddr[2], dhcp_offer_yiaddr[3])
+        if dhcp_offer_have_router == 1:
+            ip_set_gateway(dhcp_offer_router[0], dhcp_offer_router[1],
+                           dhcp_offer_router[2], dhcp_offer_router[3])
+        dhcp_state = DHCP_STATE_BOUND
+        printk0("[dhcp] got ip=")
+        _dhcp_print_ip(dhcp_offer_yiaddr[0], dhcp_offer_yiaddr[1],
+                       dhcp_offer_yiaddr[2], dhcp_offer_yiaddr[3])
+        if dhcp_offer_have_router == 1:
+            printk0(" gw=")
+            _dhcp_print_ip(dhcp_offer_router[0], dhcp_offer_router[1],
+                           dhcp_offer_router[2], dhcp_offer_router[3])
+        printk0("\n")
+        return
+    if msg_type == DHCP_MSG_NAK:
+        printk0("[dhcp] NAK; resetting to IDLE\n")
+        dhcp_state = DHCP_STATE_IDLE
+        return
+    printk1("[dhcp] unknown msg type=%d\n", cast[uint64](msg_type))
+
+
+def dhcp_init():
+    dhcp_state = DHCP_STATE_IDLE
+    dhcp_xid_b0 = 0
+    dhcp_xid_b1 = 0
+    dhcp_xid_b2 = 0
+    dhcp_xid_b3 = 0
+    dhcp_offer_have_router = 0
+    dhcp_offer_have_mask = 0
+    i: uint64 = 0
+    while i < 4:
+        dhcp_offer_yiaddr[i] = 0
+        dhcp_offer_server[i] = 0
+        dhcp_offer_router[i] = 0
+        dhcp_offer_mask[i] = 0
+        i = i + 1
+    printk0("dhcp: client initialized\n")
+
+
+def dhcp_state_get() -> uint8:
+    return dhcp_state
