@@ -77,6 +77,9 @@ from kernel.sched.core import (
     signal_post, get_cwd_buf, set_task_cwd, current_idx_get,
     set_task_fs_base, set_task_clear_child_tid,
     count_live_linux_peers, yield_to_others,
+    get_task_sig_handler, set_task_sig_handler,
+    get_task_comm_ptr, set_task_pdeathsig,
+    saved_user_rip_ptr, saved_user_rsp_ptr, saved_user_rflags_ptr,
 )
 from arch.x86.kernel.time import get_jiffies
 from mm.slab import kmalloc, kfree, kzalloc
@@ -188,6 +191,10 @@ SYS_chdir:           uint64 = 80
 SYS_mkdir:           uint64 = 83
 SYS_unlink:          uint64 = 87
 SYS_readlink:        uint64 = 89
+# U31: prctl(2). Hamnix handles PR_SET_NAME / PR_GET_NAME (busybox uses
+# these for argv[0] tagging) and accepts PR_SET_DUMPABLE / PR_SET_PDEATHSIG
+# so libc bring-up paths keep moving.
+SYS_prctl:           uint64 = 157
 SYS_arch_prctl:      uint64 = 158
 SYS_time:            uint64 = 201
 SYS_futex:           uint64 = 202
@@ -744,29 +751,49 @@ def _u_unimpl_brk(a0: uint64, a1: uint64, a2: uint64,
     return cast[int64](linux_brk)
 
 
-def _u_unimpl_rt_sigaction(a0: uint64, a1: uint64, a2: uint64,
-                           a3: uint64, a4: uint64, a5: uint64) -> int64:
+def _u_rt_sigaction(a0: uint64, a1: uint64, a2: uint64,
+                    a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int rt_sigaction(int signum, const struct sigaction *act,
     #                  struct sigaction *oldact, size_t sigsetsize).
-    # U18: glibc installs a default handler table for SIGINT/SIGCHLD/...
-    # very early in __libc_start_main. We have no signal delivery yet, so
-    # silently accept every install and pretend the previous handler was
-    # SIG_DFL — that's the contract: succeed and let userspace cache the
-    # "old" handler. If oldact is non-NULL we zero its sa_handler /
-    # sa_mask / sa_flags / sa_restorer bytes. struct sigaction is 152
-    # bytes on x86_64 (sa_handler:8, sa_mask:128, sa_flags:8, sa_restorer:8).
+    #
+    # Kernel struct sigaction (on x86_64):
+    #   off  0: void (*sa_handler)(int)
+    #   off  8: int sa_flags  (+ 4 bytes pad)
+    #   off 16: void (*sa_restorer)(void)
+    #   off 24: sigset_t sa_mask (a3 bytes — typically 8 from musl)
+    #
+    # Musl allocates a tight 32-byte kernel-sigaction buffer (8-byte
+    # mask), so we MUST NOT write past offset 24 + a3 of oldact: an
+    # unconditional 152-byte memset clobbers the caller's stack frame
+    # and trips the stack canary check on return — that's the RIP=0x3
+    # trap observed at U31's signal() bring-up.
+    #
+    # We just write the previous sa_handler (8 bytes at offset 0) to
+    # oldact, leave the rest of the user's buffer untouched, and
+    # record the new sa_handler from act. sa_flags / sa_restorer /
+    # sa_mask are accepted but not enforced — Hamnix's signal
+    # delivery is single-signal-at-a-time and uses a kernel-resident
+    # trampoline (sig_trampoline) for the SA_RESTORER handshake.
+    sig: uint64 = a0
+    if sig == 0 or sig >= 64:
+        return ELINUX_INVAL
     if a2 != 0:
-        memset(cast[Ptr[uint8]](a2), 0, 152)
+        prev: uint64 = get_task_sig_handler(current_idx_get(), sig)
+        cast[Ptr[uint64]](a2)[0] = prev
+    if a1 != 0:
+        new_handler: uint64 = cast[Ptr[uint64]](a1)[0]
+        set_task_sig_handler(current_idx_get(), sig, new_handler)
     return 0
 
 
-def _u_unimpl_rt_sigprocmask(a0: uint64, a1: uint64, a2: uint64,
-                             a3: uint64, a4: uint64, a5: uint64) -> int64:
+def _u_rt_sigprocmask(a0: uint64, a1: uint64, a2: uint64,
+                      a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int rt_sigprocmask(int how, const sigset_t *set, sigset_t *oldset,
     #                    size_t sigsetsize).
-    # No signals delivered yet, so the mask is irrelevant. Zero oldset if
-    # the caller asked for the previous mask (sigsetsize is in bytes;
-    # glibc passes 8 for the 64-bit signal mask).
+    # U31: no per-task mask state yet — signal_check_and_handle delivers
+    # every pending signal unconditionally. Accept the call so libc
+    # bring-up doesn't bail; oldset (if requested) is zeroed which means
+    # "no signals masked" — a defensible answer at this scale.
     if a2 != 0 and a3 != 0:
         n: uint64 = a3
         if n > 128:
@@ -775,9 +802,93 @@ def _u_unimpl_rt_sigprocmask(a0: uint64, a1: uint64, a2: uint64,
     return 0
 
 
-def _u_unimpl_rt_sigreturn(a0: uint64, a1: uint64, a2: uint64,
-                           a3: uint64, a4: uint64, a5: uint64) -> int64:
-    return ELINUX_NOSYS
+def _u_rt_sigreturn(a0: uint64, a1: uint64, a2: uint64,
+                    a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # void rt_sigreturn(void).
+    #
+    # Reached via sig_trampoline (arch/x86/kernel/sigret_asm.S) after a
+    # user signal handler returns. At entry the user stack looks like
+    #
+    #   (low)  RSP -> saved-RIP    (the original post-kill user RIP)
+    #          RSP+8 -> saved-RFLAGS
+    #
+    # We rewrite the kernel-side iret slots parked by syscall_64.S at
+    # kstack_top-24 / -16 so this very syscall returns to the original
+    # post-kill RIP/RFLAGS instead of into the trampoline's hang loop.
+    # The user RSP slot is reset to point AT the user's R12-save slot
+    # so the matching final `popq %r12` reads back the original user
+    # R12 (we preserved that slot in deliver_signal_to_user).
+    rsp_slot: Ptr[uint64]    = saved_user_rsp_ptr()
+    rip_slot: Ptr[uint64]    = saved_user_rip_ptr()
+    rflags_slot: Ptr[uint64] = saved_user_rflags_ptr()
+    # syscall_64.S parks (user_rsp - 8) — undo here. tramp_rsp is the
+    # user RSP at the moment sig_trampoline issued SYS_rt_sigreturn,
+    # which is the address of the saved-RIP slot in our frame.
+    tramp_rsp: uint64 = rsp_slot[0] + 8
+    saved_rip: uint64    = cast[Ptr[uint64]](tramp_rsp)[0]
+    saved_rflags: uint64 = cast[Ptr[uint64]](tramp_rsp + 8)[0]
+    # natural_rsp = tramp_rsp + 24: 16 bytes for the saved RIP+RFLAGS
+    # words we just consumed, plus 8 more to clear the R12-save slot
+    # the entry stub had stashed at [natural_rsp - 8] — that's where
+    # we want the matching popq %r12 to read from, so set the parked
+    # user RSP to (natural_rsp - 8).
+    rip_slot[0]    = saved_rip
+    rflags_slot[0] = saved_rflags
+    rsp_slot[0]    = tramp_rsp + 16
+    # Return value is discarded: the user RIP we resume to is the
+    # post-kill caller, not a sigreturn caller. 0 is conventional.
+    return 0
+
+
+def _u_prctl(a0: uint64, a1: uint64, a2: uint64,
+             a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # int prctl(int option, unsigned long arg2, ..., unsigned long arg5).
+    #
+    # Hamnix handles the operations busybox-static + glibc bring-up
+    # actually exercise; everything else returns -EINVAL.
+    #
+    #   PR_SET_PDEATHSIG   1 — record signal to deliver when parent
+    #                          dies (stored, not yet wired through)
+    #   PR_GET_DUMPABLE    3 — reply 1 (Hamnix never produces core
+    #                          dumps but the default IS dumpable)
+    #   PR_SET_DUMPABLE    4 — accept silently
+    #   PR_SET_NAME       15 — copy up to 15 bytes + NUL into comm
+    #   PR_GET_NAME       16 — copy 16 bytes of comm out
+    if a0 == 1:                                           # PR_SET_PDEATHSIG
+        set_task_pdeathsig(current_idx_get(), a1)
+        return 0
+    if a0 == 3:                                           # PR_GET_DUMPABLE
+        return 1
+    if a0 == 4:                                           # PR_SET_DUMPABLE
+        return 0
+    if a0 == 15:                                          # PR_SET_NAME
+        if a1 == 0:
+            return ELINUX_INVAL
+        dst: Ptr[uint8] = get_task_comm_ptr(current_idx_get())
+        src: Ptr[uint8] = cast[Ptr[uint8]](a1)
+        i: uint64 = 0
+        # Walk up to 15 bytes, stop on NUL, force-terminate at slot 15.
+        # POSIX TASK_COMM_LEN is 16 INCLUDING the trailing NUL.
+        do:
+            c: uint8 = src[i]
+            dst[i] = c
+            if c == 0:
+                return 0
+            i = i + 1
+        while i < 15
+        dst[15] = 0
+        return 0
+    if a0 == 16:                                          # PR_GET_NAME
+        if a1 == 0:
+            return ELINUX_INVAL
+        src: Ptr[uint8] = get_task_comm_ptr(current_idx_get())
+        dst: Ptr[uint8] = cast[Ptr[uint8]](a1)
+        i: uint64 = 0
+        while i < 16:
+            dst[i] = src[i]
+            i = i + 1
+        return 0
+    return ELINUX_INVAL
 
 
 def _u_unimpl_pread64(a0: uint64, a1: uint64, a2: uint64,
@@ -1815,11 +1926,13 @@ def linux_u_syscall_dispatch(nr: uint64,
     if nr == SYS_brk:
         return _u_unimpl_brk(a0, a1, a2, a3, a4, a5)
     if nr == SYS_rt_sigaction:
-        return _u_unimpl_rt_sigaction(a0, a1, a2, a3, a4, a5)
+        return _u_rt_sigaction(a0, a1, a2, a3, a4, a5)
     if nr == SYS_rt_sigprocmask:
-        return _u_unimpl_rt_sigprocmask(a0, a1, a2, a3, a4, a5)
+        return _u_rt_sigprocmask(a0, a1, a2, a3, a4, a5)
     if nr == SYS_rt_sigreturn:
-        return _u_unimpl_rt_sigreturn(a0, a1, a2, a3, a4, a5)
+        return _u_rt_sigreturn(a0, a1, a2, a3, a4, a5)
+    if nr == SYS_prctl:
+        return _u_prctl(a0, a1, a2, a3, a4, a5)
     if nr == SYS_ioctl:
         return _u_ioctl(a0, a1, a2, a3, a4, a5)
     if nr == SYS_pread64:

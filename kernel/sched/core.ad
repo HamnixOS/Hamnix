@@ -124,6 +124,21 @@ class TaskStruct:
     # this slot via do_clone's thread path. 0 means "no clear pending"
     # (default for native tasks + fork children).
     clear_child_tid: uint64           # offset 688
+    # U31: per-task signal handler table. sig_handlers[N] = user
+    # handler address for signal N, or 0 for SIG_DFL (terminate).
+    # Installed via rt_sigaction; consulted by signal_check_and_handle
+    # to decide between TERM-default and "redirect user RIP to the
+    # handler via sig_trampoline". 64 entries match sig_pending's
+    # bitmap width and Linux's max signal number.
+    sig_handlers: Array[64, uint64]   # offset 696..1208
+    # U31: PR_SET_NAME storage. POSIX TASK_COMM_LEN is 16 INCLUDING
+    # the trailing NUL. Used by glibc/musl for pthread_setname_np
+    # plumbing; also surfaces via PR_GET_NAME and /proc/self/comm.
+    comm: Array[16, uint8]            # offset 1208..1224
+    # U31: PR_SET_PDEATHSIG slot. Signal to deliver to this task
+    # when its parent dies. 0 means "none". Stored but not yet
+    # acted on (parent-death wiring is a separate milestone).
+    pdeathsig: uint64                 # offset 1224
 
 
 # State constants (mirror Linux's task->state space at a tiny scope).
@@ -290,6 +305,18 @@ def kthread_create(entry: uint64, name0: uint64) -> int32:
     # stale .bss value (already zero, but be defensive after reap +
     # re-claim) can't route a kthread through the linux dispatch.
     task_table[s].is_linux_userspace = 0
+    # U31: same scrub as create_user_thread. Kernel threads never raise
+    # signals via the user path, but a stale value in sig_handlers
+    # would still confuse any future audit of /proc/<pid>/comm.
+    ksi: uint64 = 0
+    while ksi < 64:
+        task_table[s].sig_handlers[ksi] = 0
+        ksi = ksi + 1
+    kci: uint64 = 0
+    while kci < 16:
+        task_table[s].comm[kci] = 0
+        kci = kci + 1
+    task_table[s].pdeathsig = 0
     _init_fd_table(s)
     next_pid = next_pid + 1
     return slot
@@ -376,6 +403,21 @@ def create_user_thread(entry: uint64, name0: uint64,
     # set_linux_userspace_mode(slot, 1) after this returns to flip the
     # child into Linux-numbered dispatch before its first iretq.
     task_table[s].is_linux_userspace = 0
+    # U31: zero the signal-handler table + comm + pdeathsig at every
+    # creation. STATE_FREE slots may hold stale entries from a prior
+    # occupant (task_reap leaves the body intact); without this scrub
+    # a newly-spawned task would inherit the previous tenant's
+    # handlers and signal_check_and_handle would dispatch to freed
+    # user code.
+    si: uint64 = 0
+    while si < 64:
+        task_table[s].sig_handlers[si] = 0
+        si = si + 1
+    ci: uint64 = 0
+    while ci < 16:
+        task_table[s].comm[ci] = 0
+        ci = ci + 1
+    task_table[s].pdeathsig = 0
     _init_fd_table(s)
     _inherit_cwd_from_parent(s)
     next_pid = next_pid + 1
@@ -837,11 +879,117 @@ def signal_pending(slot: uint64) -> uint64:
     return task_table[slot].sig_pending
 
 
+# U31: read/write accessors for the per-task signal handler table.
+# Exposed so linux_abi/u_syscalls.ad's _u_rt_sigaction can store /
+# retrieve handler addresses without poking task_table directly.
+def get_task_sig_handler(slot: uint64, sig: uint64) -> uint64:
+    if sig >= 64:
+        return 0
+    return task_table[slot].sig_handlers[sig]
+
+
+def set_task_sig_handler(slot: uint64, sig: uint64, handler: uint64):
+    if sig >= 64:
+        return
+    task_table[slot].sig_handlers[sig] = handler
+
+
+# U31: PR_SET_NAME / PR_GET_NAME storage backing.
+def get_task_comm_ptr(slot: uint64) -> Ptr[uint8]:
+    return &task_table[slot].comm[0]
+
+
+def set_task_pdeathsig(slot: uint64, sig: uint64):
+    task_table[slot].pdeathsig = sig
+
+
+def get_task_pdeathsig(slot: uint64) -> uint64:
+    return task_table[slot].pdeathsig
+
+
+# U31: read the saved iret-style user RIP / RSP / RFLAGS slots that
+# syscall_64.S parks just below the current task's kernel stack top.
+# Layout (mirrors the reader in do_clone, syscall.ad):
+#   kstack_top - 8  -> user RSP (with the pushq %r12 of the entry stub)
+#   kstack_top - 16 -> user RFLAGS
+#   kstack_top - 24 -> user RIP
+# These are LIVE pointers — writing them retargets the SYSRETQ that
+# closes out the current syscall. Only meaningful when we're in the
+# middle of servicing a syscall from a CPL=3 caller.
+def saved_user_rip_ptr() -> Ptr[uint64]:
+    kt: uint64 = task_table[current_idx].kstack_top
+    return cast[Ptr[uint64]](kt - 24)
+
+
+def saved_user_rsp_ptr() -> Ptr[uint64]:
+    kt: uint64 = task_table[current_idx].kstack_top
+    return cast[Ptr[uint64]](kt - 8)
+
+
+def saved_user_rflags_ptr() -> Ptr[uint64]:
+    kt: uint64 = task_table[current_idx].kstack_top
+    return cast[Ptr[uint64]](kt - 16)
+
+
+# U31: signal trampoline. Lives in arch/x86/kernel/sigret_asm.S; we
+# only ever take its address (planted into the saved-RIP slot to
+# retarget the next SYSRETQ).
+extern def sig_trampoline()
+
+
+# U31: layout of the signal frame pushed onto the user stack before
+# redirecting user RIP to sig_trampoline.
+#
+# CRITICAL: the slot at [natural_rsp - 8] holds user's original R12,
+# because syscall_64.S's entry does `pushq %r12` to user RSP before
+# parking RSP at kstack_top-8. The matching final `popq %r12` at
+# SYSRETQ time reads that slot back. We MUST NOT overwrite it.
+# The frame layout below leaves that slot intact: the frame spans
+# [natural_rsp - 40 .. natural_rsp - 8), and we set the parked user
+# RSP to (frame_top - 8) so the final popq %r12 reads garbage into
+# %r12 (handlers save R12 themselves per SysV) and leaves RSP at
+# frame_top with signum at the top of the user stack.
+
+
+def deliver_signal_to_user(sig: uint64, handler: uint64):
+    rip_slot: Ptr[uint64]    = saved_user_rip_ptr()
+    rsp_slot: Ptr[uint64]    = saved_user_rsp_ptr()
+    rflags_slot: Ptr[uint64] = saved_user_rflags_ptr()
+
+    saved_rip: uint64    = rip_slot[0]
+    saved_rflags: uint64 = rflags_slot[0]
+    user_rsp: uint64     = rsp_slot[0]
+    natural_rsp: uint64  = user_rsp + 8   # undo the pushq %r12
+
+    # Frame layout (low to high address):
+    #   frame_top + 0   = signum            (popped -> %rdi)
+    #   frame_top + 8   = handler addr      (popped -> %rax)
+    #   frame_top + 16  = saved user RIP    (consumed by _u_rt_sigreturn)
+    #   frame_top + 24  = saved user RFLAGS (consumed by _u_rt_sigreturn)
+    #   [natural_rsp - 8] = user R12 stashed by syscall_64.S — UNTOUCHED
+    frame_top: uint64 = natural_rsp - 40
+    cast[Ptr[uint64]](frame_top)[0]      = sig
+    cast[Ptr[uint64]](frame_top + 8)[0]  = handler
+    cast[Ptr[uint64]](frame_top + 16)[0] = saved_rip
+    cast[Ptr[uint64]](frame_top + 24)[0] = saved_rflags
+
+    # Retarget the SYSRETQ:
+    #   * user RIP <- sig_trampoline (kernel .text, U=1)
+    #   * user RSP <- frame_top - 8: syscall_64.S's final `popq %r12`
+    #     reads 8 bytes at this address into user R12 (irrelevant) and
+    #     leaves RSP at frame_top.
+    rip_slot[0] = cast[uint64](&sig_trampoline)
+    rsp_slot[0] = frame_top - 8
+
+
 def signal_check_and_handle():
-    # If a signal is pending on the current task, terminate it now
-    # with exit code 128+sig. We pick the lowest-numbered pending
-    # signal (also POSIX convention) so SIGINT (2) outranks SIGTERM
-    # (15) if both somehow land before the task notices.
+    # If a signal is pending on the current task: if a user handler is
+    # installed (U31 — sig_handlers[sig] != 0), redirect the SYSRETQ
+    # iret slots so the handler runs in CPL=3 via sig_trampoline.
+    # Otherwise terminate the task with exit code 128+sig (POSIX).
+    #
+    # Lowest-numbered pending signal wins (POSIX): SIGINT (2) outranks
+    # SIGTERM (15) if both somehow land before the task notices.
     pending: uint64 = task_table[current_idx].sig_pending
     if pending == 0:
         return
@@ -849,11 +997,25 @@ def signal_check_and_handle():
     while s < 64:
         bit: uint64 = cast[uint64](1) << s
         if (pending & bit) != 0:
-            # Clear the bit before exiting so a stale value doesn't
-            # confuse anything that inspects the task post-mortem.
+            # Clear the bit before dispatching so a stale value doesn't
+            # confuse anything that inspects the task post-mortem AND
+            # so a re-entrant handler issuing another syscall doesn't
+            # keep re-triggering off the same bit.
             task_table[current_idx].sig_pending = pending & ~bit
-            task_exit_current(cast[int64](128) + cast[int64](s))
-            return                                    # not reached
+            handler: uint64 = task_table[current_idx].sig_handlers[s]
+            # SIGKILL (9) is uncatchable. SIG_DFL is handler == 0;
+            # SIG_IGN is conventionally 1. We treat any value < 16 as
+            # "not a real address" and fall back to default-terminate.
+            if s == SIGKILL or handler == 0 or handler == 1:
+                task_exit_current(cast[int64](128) + cast[int64](s))
+                return                                # not reached
+            # Real user handler: only redirect if we're in a user task.
+            # Kernel threads have no iret frame; treat as default-term.
+            if task_table[current_idx].is_user == 0:
+                task_exit_current(cast[int64](128) + cast[int64](s))
+                return
+            deliver_signal_to_user(s, handler)
+            return
         s = s + 1
 
 
