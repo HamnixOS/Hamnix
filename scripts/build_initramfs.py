@@ -206,8 +206,17 @@ def build_archive() -> bytes:
     # Optional: if the host-side build hasn't been run, this whole
     # block is skipped and the rest of the initramfs is unaffected
     # (so CI without the host fixture still builds a kernel).
+    #
+    # SIZE NOTE: u_* test binaries (glibc-static-pie ~800 KB each,
+    # busybox ~2 MB, C++ demo ~2.4 MB) inflate the cpio archive past
+    # GitHub's 100 MB push limit on fs/initramfs_blob.S. To keep the
+    # committed default initramfs small, only embed u_* binaries when
+    # HAMNIX_EMBED_UBIN=1 is set. Test scripts that need a specific
+    # u_* binary set the env var themselves (most don't — they boot
+    # against init.elf, not these test fixtures).
+    embed_ubin = os.environ.get("HAMNIX_EMBED_UBIN", "0") == "1"
     ubin_dir = here / "tests" / "u-binary"
-    if ubin_dir.is_dir():
+    if embed_ubin and ubin_dir.is_dir():
         for f in sorted(ubin_dir.iterdir()):
             if f.is_file() and f.name != ".gitignore":
                 data = f.read_bytes()

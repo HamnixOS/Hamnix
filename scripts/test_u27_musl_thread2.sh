@@ -12,7 +12,7 @@ ELF=build/hamnix-vmlinux.elf
 HAMSH_ELF=build/user/hamsh.elf
 
 bash scripts/build_user.sh >/dev/null
-INIT_ELF="$HAMSH_ELF" python3 scripts/build_initramfs.py >/dev/null
+HAMNIX_EMBED_UBIN=1 INIT_ELF="$HAMSH_ELF" python3 scripts/build_initramfs.py >/dev/null
 python3 -m compiler.adder compile --target=x86_64-bare-metal init/main.ad -o "$ELF" >/dev/null
 
 LOG=$(mktemp)

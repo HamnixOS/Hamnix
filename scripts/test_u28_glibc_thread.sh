@@ -45,7 +45,7 @@ bash scripts/build_user.sh
 bash scripts/build_modules.sh
 
 echo "[test_u28_glibc_thread] (2/4) Swap /init = $HAMSH_ELF + embed u_glibc_thread"
-INIT_ELF="$HAMSH_ELF" python3 scripts/build_initramfs.py
+HAMNIX_EMBED_UBIN=1 INIT_ELF="$HAMSH_ELF" python3 scripts/build_initramfs.py
 
 echo "[test_u28_glibc_thread] (3/4) Rebuild kernel image"
 python3 -m compiler.adder compile \
