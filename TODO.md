@@ -164,6 +164,31 @@ are fair game for any contributor — human or AI agent.
 - `clone` / `clone3` (56 / 435) — pthread bring-up.
 - Per-task heap state — `linux_brk` is a single global today;
   multi-process Linux binaries will collide.
+- **U39 follow-up: swap MicroPython for full CPython.**
+  `tests/u-binary/u_python` ships MicroPython 1.22.0 because
+  Debian's `libpython3.13.a` is non-PIC and a from-source
+  CPython static-pie build takes 20-40 min. To upgrade:
+  build CPython 3.11 from source with `CFLAGS=-fPIC`,
+  `--disable-shared`, link as static-pie. Expect 50-100 new
+  `-ENOSYS` hits the first boot — strace on host first,
+  cross-reference against `linux_abi/u_syscalls.ad`, add
+  bodies for the boot-path syscalls (`epoll_create1` /
+  `epoll_ctl` / `epoll_wait` can stay -ENOSYS; CPython has
+  a `select(2)` fallback). See `tests/u-binary/src/python/HOWTO.md`.
+- **U39 follow-up: fix glibc-malloc brk-grow corner case.**
+  MicroPython under U39 needs `-X heapsize=64k` because a
+  1 MiB heap forces glibc-malloc's main_arena onto our
+  brk() path; our `_u_unimpl_brk` can only grow contiguously
+  when consecutive kmalloc(LINUX_BRK_GROW) chunks happen to
+  land adjacent, which for million-byte requests they
+  don't, malloc prints "break adjusted to free malloc
+  space" + tries to recover via mmap, then aborts inside
+  arena bookkeeping. Two options: (a) back brk with a real
+  per-task anon-mmap region (pre-reserved virtual range,
+  page-fault populated); (b) detect "grow request larger
+  than one chunk" and pre-allocate the whole tail in one
+  kmalloc call so contiguity is guaranteed up to MAX_ORDER
+  (4 MiB).
 
 ## Storage
 
