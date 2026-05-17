@@ -84,8 +84,18 @@ SECTIONS
     /* Page tables: NOBITS section that the loader zero-fills at load
      * time but the boot-time BSS-zero loop must NOT touch — pml4/pdpt/pd
      * are referenced by CR3 the moment the kernel enters long mode. Live
-     * in their own section explicitly *outside* [__bss_start, __bss_end). */
-    .pgtables (NOLOAD) : ALIGN(4096) {
+     * in their own section explicitly *outside* [__bss_start, __bss_end).
+     *
+     * AT(ADDR(.pgtables)) pins the LMA to match the VMA. QEMU's `-kernel`
+     * multiboot1 loader was lenient about this — it placed NOBITS bytes
+     * at the VMA — but real loaders (grub-mkrescue/grub2) strictly honour
+     * the program-header PhysAddr. Without AT(), ld emits PhysAddr ≠
+     * VirtAddr for this BSS-style PT_LOAD, which makes grub allocate the
+     * zero-fill region at a different physical address than the kernel
+     * writes to in _start. Result: page-table writes land outside the
+     * allocated region and the first instruction fetch under paging
+     * triple-faults. Pinning LMA = VMA closes the gap for both loaders. */
+    .pgtables (NOLOAD) : AT(ADDR(.pgtables)) ALIGN(4096) {
         *(.pgtables)
     }
 
