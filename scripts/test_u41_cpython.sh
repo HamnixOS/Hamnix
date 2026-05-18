@@ -39,6 +39,29 @@
 # the host (`make -C tests/u-binary/src/cpython install`), exit 0
 # with a notice so CI in environments without the host build still
 # passes -- same shape as U22/U24/U39/U40. The build takes 15-30 min.
+#
+# U41 status after the brk/mmap fix:
+#   - The original blocker (Fatal Python error: pycore_interp_init:
+#     failed to initialize importlib / MemoryError) is gone. CPython
+#     now runs through pycore_interp_init, _frozen_importlib bootstrap,
+#     site.py initialisation, and reaches init_fs_encoding.
+#   - The current blocker is a CPython userland packaging issue, NOT
+#     a kernel ABI issue: init_fs_encoding fails with
+#     "ModuleNotFoundError: No module named 'encodings'" because the
+#     CPython stdlib (~50 MB of .py files under Lib/encodings/, Lib/io.py,
+#     Lib/codecs.py, ...) is not packaged into the Hamnix initramfs.
+#     Fix candidates (NOT in this milestone -- belong to the
+#     tests/u-binary/src/cpython/Makefile owner):
+#       a. Embed Lib/encodings + a minimal stdlib subset into the
+#          initramfs alongside u_cpython.
+#       b. Freeze the encodings module via Tools/scripts/freeze_modules.py
+#          and rebuild CPython.
+#       c. Build a zipapp / __frozen__.py that statically bundles the
+#          stdlib bytecode into the binary itself.
+#   - The test still FAILs (since CPython doesn't print) -- that's
+#     accurate -- but it does so for a different reason now, and the
+#     "REGRESSION:" markers below specifically guard against the
+#     pycore_interp_init / mmap-alignment regressions returning.
 
 . "$(dirname "$0")/_build_lock.sh"
 
@@ -142,6 +165,26 @@ check_marker() {
 check_marker "CPython print() output"  "U41OK-5 hello from CPython on Hamnix"
 # Secondary: the U1 ELF-detect path noticed the OSABI=Linux byte.
 check_marker "U1/U2 ELF detect"        "Linux-ABI binary detected"
+
+# Tertiary checks tracking the move past the U41 (054f58b) original
+# blocker -- the silent `Fatal Python error: pycore_interp_init:
+# failed to initialize importlib / MemoryError` that the 4 MiB brk
+# reserve + 32 mmap slots produced. After bumping LINUX_BRK_RESERVE
+# to 32 MiB and LINUX_MMAP_SLOTS to 256 (and fixing the mmap fd=-1
+# 32-vs-64-bit check + the mmap PAGE_ALIGN landing for glibc-malloc's
+# sysmalloc_mmap), pycore_interp_init completes cleanly and CPython
+# proceeds to fs encoding init.
+# These markers should NEVER appear once the original blocker is
+# diagnosed-and-fixed; their absence is part of the regression
+# guarantee for the brk/mmap bump.
+if grep -F -q "pycore_interp_init: failed to initialize importlib" "$LOG"; then
+    echo "[test_u41_cpython] REGRESSION: importlib MemoryError returned"
+    fail=1
+fi
+if grep -F -q "MALLOC_ALIGN_MASK) == 0" "$LOG"; then
+    echo "[test_u41_cpython] REGRESSION: glibc-malloc mmap alignment assertion"
+    fail=1
+fi
 
 # Diagnostics: surface the next-gap signal for triage. The -ENOSYS
 # hits are the main artifact we want from this test: every new N
