@@ -3,17 +3,18 @@
 #
 # Drives hamsh through:
 #
-#     cd /mnt/SUBDIR
-#     pwd                  → /mnt/SUBDIR
+#     cd /etc
+#     pwd                  → /etc
 #     cd ..
-#     pwd                  → /mnt
-#     cd /a/./b/../c
-#     pwd                  → /a/c
+#     pwd                  → /
+#     cd /etc/./../etc
+#     pwd                  → /etc
 #     exit
 #
 # Tests both ".." popping a component and "." being skipped.
-# The /a/c path is a fake one — `cd` doesn't validate that the
-# target exists yet, so the normalization happens regardless.
+# Once SYS_CHDIR validation landed (chdir rejects nonexistent
+# paths), all test paths must point at real cpio entries (was
+# previously /mnt/SUBDIR + the fictional /a/c).
 
 . "$(dirname "$0")/_build_lock.sh"
 
@@ -44,7 +45,7 @@ trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs
 set +e
 (
     sleep 3
-    printf 'cd /mnt/SUBDIR\n'
+    printf 'cd /etc\n'
     sleep 1
     printf 'pwd\n'
     sleep 1
@@ -52,7 +53,7 @@ set +e
     sleep 1
     printf 'pwd\n'
     sleep 1
-    printf 'cd /a/./b/../c\n'
+    printf 'cd /etc/./../etc\n'
     sleep 1
     printf 'pwd\n'
     sleep 1
@@ -77,7 +78,7 @@ echo "[test_dotdot] --- end output ---"
 fail=0
 cleaned=$(sed 's/task: pid -*[0-9]* exited (code=-*[0-9]*)//g' "$LOG")
 # Look for each expected path on its own line.
-for needle in "/mnt/SUBDIR" "/mnt" "/a/c"; do
+for needle in "/etc" "/"; do
     if echo "$cleaned" | grep -E -q "^$needle\$"; then
         echo "[test_dotdot] OK: '$needle' line present"
     else

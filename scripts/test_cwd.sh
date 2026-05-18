@@ -4,9 +4,13 @@
 # Drives hamsh through:
 #
 #     pwd           (expect "/" — default cwd)
-#     cd /mnt
-#     pwd           (expect "/mnt" — inherited from hamsh's chdir)
+#     cd /etc
+#     pwd           (expect "/etc" — inherited from hamsh's chdir)
 #     exit
+#
+# Switched from /mnt/SUBDIR to /etc when SYS_CHDIR validation landed
+# (chdir now rejects nonexistent paths). /etc is in the cpio
+# initramfs — no disk image required.
 
 . "$(dirname "$0")/_build_lock.sh"
 
@@ -39,7 +43,7 @@ set +e
     sleep 3
     printf 'pwd\n'
     sleep 1
-    printf 'cd /mnt/SUBDIR\n'
+    printf 'cd /etc\n'
     sleep 1
     printf 'pwd\n'
     sleep 1
@@ -72,11 +76,11 @@ else
     echo "[test_cwd] MISS: default '/' line"
     fail=1
 fi
-# After cd, pwd should print /mnt/SUBDIR.
-if echo "$cleaned" | grep -F -q "/mnt/SUBDIR"; then
-    echo "[test_cwd] OK: cwd inherited /mnt/SUBDIR"
+# After cd, pwd should print /etc.
+if echo "$cleaned" | grep -E -q "^/etc\$"; then
+    echo "[test_cwd] OK: cwd inherited /etc"
 else
-    echo "[test_cwd] MISS: '/mnt/SUBDIR' after cd"
+    echo "[test_cwd] MISS: '/etc' after cd"
     fail=1
 fi
 

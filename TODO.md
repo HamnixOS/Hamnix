@@ -443,6 +443,16 @@ it has to honour.
 
 ## Userspace / U-track
 
+- **/bin tool audit — more cwd-relative defaults.** The shell-UX
+  bug-fix wave covered `ls`/`find` (commit 51a6974) and `du`
+  (sys_chdir-validation commit, M16.115). Other tools that hardcode
+  a default path when invoked with no args should also be swept:
+  candidates left to inspect across rebuilds — anything that does
+  `argc < 2: ... = "/something"`. Today the obvious offenders are
+  fixed; the audit is bounded by "no tool defaults to `/mnt`" and
+  "every tool with a 'current dir' intent calls sys_getcwd". Adding
+  new tools as Phase G lands should follow ls.ad / find.ad / du.ad
+  as templates.
 - Real vDSO blob (mapped page advertised via `AT_SYSINFO_EHDR`),
   replacing the U11-era kernel-side `_lookup_dynsym` hack we
   retired in U20.
