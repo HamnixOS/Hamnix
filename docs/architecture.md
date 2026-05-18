@@ -149,6 +149,26 @@ stays. New: `SYS_RFORK`, `SYS_BIND`, `SYS_MOUNT`, `SYS_ERRSTR`.
 Linux ABI uses `do_clone` directly; native code can start using
 `rfork`. **All L+U tests keep passing.**
 
+### Phase C.5 — Distro-shape namespaces
+
+A *convention* on top of Phase C's primitives — no new kernel work.
+A userland `distrorun` binary calls rfork(RFNAMEG) + mount of a
+per-distro backing store at `/var/lib/distros/<name>/` + bind of
+shared paths (/home, /net, /srv, /dev, /proc) back in, then exec.
+From inside the namespace, the world looks like Debian / Ubuntu /
+SUSE / etc.; outside, the native Hamnix rootfs is unchanged. apt
+and dpkg are namespaced — they never mutate Hamnix's rootfs.
+
+This is THE answer to "how do we run Linux binaries without
+polluting the native OS identity." Linux compat is a feature
+imported binaries opt into via namespace, not a property of the
+OS itself.
+
+See [`docs/distro-namespaces.md`](distro-namespaces.md) for the
+full spec, including the layout table, boundary rules, backing
+store choices (disk-backed via debootstrap first; `debfs` 9P
+server later), and the `distrorun` entry point.
+
 ### Phase D — Stand up `hamwd` (Layer 3) using v1 single-window mode
 
 `hamwd` opens `/dev/vtnext` (the serial multiplex), implements the
