@@ -399,6 +399,27 @@ it has to honour.
         processes" snapshot (mirror of `/proc/stat`). Reuses the
         cpuinfo CPUID helpers + a new IRQ-count accessor in
         `arch/x86/kernel/irq.ad`.
+      * ~~`/dev/version` + `/dev/hostname` — identity-introspection
+        cdev pair. `/dev/version` emits the release string
+        ("hamnix/0.1 (M16.132+)\n", stateless); `/dev/hostname`
+        is the first READ+WRITE cdev in the family — writes
+        update a kernel-RAM hostname buffer that subsequent reads
+        observe.~~ M16.133 shipped. Follow-ups (separate commits):
+          * Persist hostname writes back to `/etc/hostname`.
+            Blocked on writable initramfs root — the cpio is
+            read-only baked-in today, so the only write-back
+            target is ext4 (`/ext/...`), which isn't where the
+            canonical hostname lives. Once a real writable rootfs
+            is mounted at `/`, devhostname_write should also
+            update the file so the value survives reboot.
+          * `/dev/machine_id` — 128-bit boot-stable identifier
+            (mirror of `/etc/machine-id` / systemd-machine-id-setup).
+            Derive from a RDSEED-keyed hash at first boot, persist
+            once the writable rootfs prerequisite lands.
+          * `/dev/sysname` aggregator — single-blob equivalent of
+            Linux's `/proc/sys/kernel/{ostype,osrelease,version}`
+            concatenation; useful for `uname(1)` callers that want
+            one read instead of three opens.
       * Layer-2 `/proc/cpuinfo` + `/proc/meminfo` translators
         that consume the same bytes via `linux_abi/`.
       * Per-cache slab walker accessor in `mm/slab.ad` so
