@@ -137,6 +137,14 @@ class X86CodeGen:
         self.string_counter: int = 0
         self.extern_funcs: set[str] = set()
         self.defined_funcs: set[str] = set()
+        # Map function name -> return Type, populated in pass 1. Used by
+        # get_expr_type so chained `func()[0].field` / `func().field` /
+        # `arr[func()].field` site can resolve the struct layout without
+        # binding the call result to a local first. Empty for functions
+        # whose AST node has return_type=None (Adder treats a missing
+        # arrow as "no return value"; calls in those positions can't
+        # appear in member-access chains anyway).
+        self.func_return_types: dict[str, Type] = {}
         self.global_var_types: dict[str, Type] = {}
         # Per-CPU globals: live in .data..percpu. To avoid the elf32-i386
         # absolute-symbol-relocation pothole, we track each percpu
@@ -253,6 +261,18 @@ class X86CodeGen:
             # `cast[Ptr[Foo]](p)[0].field` falls through to "unknown"
             # and member/index codegen can't find the struct layout.
             return expr.target_type
+        if isinstance(expr, CallExpr):
+            # Resolve via the function-return-type table populated in
+            # pass 1. Without this, chains like `func()[0].field` or
+            # `arr[func()].field` fall through to "unknown" and
+            # member/index codegen errors with "type of CallExpr/
+            # IndexExpr is not a known struct". Indirect calls (where
+            # `func` isn't a bare Identifier) intentionally return
+            # None — those go through function pointers whose return
+            # type isn't carried in our metadata yet.
+            if isinstance(expr.func, Identifier):
+                return self.func_return_types.get(expr.func.name)
+            return None
         if isinstance(expr, ContainerOfExpr):
             # Result is a pointer to the enclosing struct, so subsequent
             # member access (`container_of(...)[0].field`) resolves
@@ -317,8 +337,12 @@ class X86CodeGen:
             match decl:
                 case ExternDecl(name=name):
                     self.extern_funcs.add(name)
+                    if decl.return_type is not None:
+                        self.func_return_types[name] = decl.return_type
                 case FunctionDef(name=name):
                     self.defined_funcs.add(name)
+                    if decl.return_type is not None:
+                        self.func_return_types[name] = decl.return_type
                 case VarDecl(name=name, var_type=var_type):
                     self.global_var_types[name] = var_type
                     if isinstance(var_type, PercpuType):
