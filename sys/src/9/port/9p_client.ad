@@ -97,6 +97,17 @@ from lib.9p.9p import (
 from fs.pipe import (
     pipe_read, pipe_write, pipe_readers, pipe_writers,
 )
+# V5: bidirectional socketpair transport. When the mount's srvfd is a
+# socketpair endpoint (FD_SOCKETPAIR_MARK), _p9_send / _p9_recv push
+# T-msgs and pull R-msgs through the SAME fd — no `p9rx:` smuggle
+# needed. fs.socketpair has no dep on fs.vfs (just slab + printk), so
+# we avoid the fs.vfs ↔ 9p_client cycle that direct vfs imports would
+# trigger.
+from fs.socketpair import (
+    sockpair_read, sockpair_write, sockpair_peer_alive,
+    sockpair_unpack_slot, sockpair_unpack_dir,
+    FD_SOCKETPAIR_MARK,
+)
 # V4.1: real-fd dispatch needs current_task to translate the connection's
 # srvfd into a pipe slot, plus yield_to_others to block until the peer
 # (the userspace 9P server) has drained / posted bytes. The FD_PIPE_MARK_*
@@ -310,6 +321,25 @@ def _smoke_pump_call(slot: int32) -> int32:
     return hookfn(slot)
 
 
+def _fd_to_sockpair(srvfd: int32, out_slot: Ptr[int32],
+                    out_dir: Ptr[int32]) -> int32:
+    # V5: translate srvfd into a socketpair (slot, direction) if it's
+    # one. Returns 1 if the fd is FD_SOCKETPAIR_MARK (out_slot/out_dir
+    # filled in), 0 otherwise (caller falls through to the pipe path).
+    # Same in-current-task assumption as _fd_to_pipe_slot below — the
+    # 9P client runs on behalf of the calling task's syscall.
+    if srvfd < 0 or srvfd >= 16:
+        return 0
+    task: Ptr[TaskStruct] = current_task()
+    fdu: uint64 = cast[uint64](srvfd)
+    if task[0].fd_idx[fdu] != FD_SOCKETPAIR_MARK:
+        return 0
+    pkd: uint64 = task[0].fd_buf[fdu]
+    out_slot[0] = sockpair_unpack_slot(pkd)
+    out_dir[0]  = sockpair_unpack_dir(pkd)
+    return 1
+
+
 def _fd_to_pipe_slot(srvfd: int32, want_writer: int32) -> int32:
     # V4.1: translate an fd in the CURRENT task's fd table into the
     # underlying pipe slot. Returns the slot index (>= 0) on success,
@@ -361,6 +391,30 @@ def _p9_send(slot: int32, n_bytes: int32) -> int32:
         # holds exactly one R-msg.
         if _smoke_pump_call(slot) != 0:
             return -1
+        return n_bytes
+    # V5: socketpair transport. Try it FIRST so a bidirectional
+    # transport (rio etc.) doesn't have to thread the rx-side fd
+    # through the V4.1 `p9rx:` magic. The same fd carries both
+    # directions; sockpair_write enqueues into the caller's outbound
+    # ring, sockpair_read in _p9_recv drains the peer's inbound ring.
+    sp_slot: int32 = -1
+    sp_dir:  int32 = 0
+    if _fd_to_sockpair(p9_conns[su].srvfd, &sp_slot, &sp_dir) != 0:
+        pushed_sp: uint64 = 0
+        total_sp:  uint64 = cast[uint64](n_bytes)
+        while pushed_sp < total_sp:
+            n: int64 = sockpair_write(sp_slot, sp_dir,
+                                      &p9c_scratch[pushed_sp],
+                                      total_sp - pushed_sp)
+            if n < 0:
+                return -1
+            if n == 0:
+                # Ring full. If peer is gone (refs <= 1) give up.
+                if sockpair_peer_alive(sp_slot, sp_dir) == 0:
+                    return -1
+                yield_to_others()
+            else:
+                pushed_sp = pushed_sp + cast[uint64](n)
         return n_bytes
     # V4.1: real-fd dispatch. Decode the connection's srvfd into a
     # pipe slot and pipe_write the bytes directly. We deliberately
@@ -432,6 +486,48 @@ def _p9_recv(slot: int32) -> int32:
                 return -1
             got = got + cast[uint64](n)
         return cast[int32](total)
+    # V5: socketpair transport. Same as _p9_send — try the
+    # bidirectional path before the V4.1 pipe-pair fallback. R-msgs
+    # come back on the same fd the T-msgs went out on.
+    sp_slot: int32 = -1
+    sp_dir:  int32 = 0
+    if _fd_to_sockpair(p9_conns[su].srvfd, &sp_slot, &sp_dir) != 0:
+        # Read 7-byte header first to learn the total message length.
+        got_sp: uint64 = 0
+        while got_sp < 7:
+            nh: int64 = sockpair_read(sp_slot, sp_dir,
+                                       &p9c_scratch[got_sp], 7 - got_sp)
+            if nh < 0:
+                return -1
+            if nh == 0:
+                if sockpair_peer_alive(sp_slot, sp_dir) == 0:
+                    return -1
+                yield_to_others()
+            else:
+                got_sp = got_sp + cast[uint64](nh)
+        sz_sp: uint32 = 0
+        ty_sp: uint8 = 0
+        tg_sp: uint16 = 0
+        rc_sp: int32 = p9_decode_header(&p9c_scratch[0], 7,
+                                        &sz_sp, &ty_sp, &tg_sp)
+        if rc_sp != 0:
+            return -1
+        total_sp: uint64 = cast[uint64](sz_sp)
+        if total_sp < 7 or total_sp > P9C_BUF_LEN:
+            return -1
+        while got_sp < total_sp:
+            nb: int64 = sockpair_read(sp_slot, sp_dir,
+                                      &p9c_scratch[got_sp],
+                                      total_sp - got_sp)
+            if nb < 0:
+                return -1
+            if nb == 0:
+                if sockpair_peer_alive(sp_slot, sp_dir) == 0:
+                    return -1
+                yield_to_others()
+            else:
+                got_sp = got_sp + cast[uint64](nb)
+        return cast[int32](total_sp)
     # V4.1: real-fd dispatch. R-msgs come back on the connection's
     # rx_srvfd if it was set (the standard userspace-pipe-pair case);
     # otherwise we fall back to srvfd (a future bidirectional

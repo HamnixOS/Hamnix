@@ -130,6 +130,17 @@ from fs.pipe import (
     pipe_alloc, pipe_read, pipe_write,
     pipe_readers, pipe_writers,
 )
+# V5: bidirectional socketpair transport. Each fd marked
+# FD_SOCKETPAIR_MARK is a single fd you can read AND write — retires
+# the V4.1 `p9rx:` smuggle for new use sites (rio etc.). The mark
+# itself lives in fs/socketpair.ad (same colocation pattern devstat.ad
+# uses to avoid editing core.ad).
+from fs.socketpair import (
+    sockpair_alloc, sockpair_read, sockpair_write,
+    sockpair_close, sockpair_inc_ref, sockpair_peer_alive,
+    sockpair_pack, sockpair_unpack_slot, sockpair_unpack_dir,
+    FD_SOCKETPAIR_MARK,
+)
 from fs.fat import (
     is_fat_path, strip_mnt_prefix, fat_open, fat_close,
     fat_open_first_cluster, fat_open_size, fat_read, fat_listdir,
@@ -1151,6 +1162,69 @@ def vfs_pipe(out_fds: Ptr[int32]) -> int32:
     return 0
 
 
+def vfs_socketpair(out_fds: Ptr[int32]) -> int32:
+    # V5: allocate a bidirectional socketpair in the calling task. Two
+    # fds back the same SocketPair slot — fd[0] is end A, fd[1] is end
+    # B. Writes on one fd appear as reads on the other and vice versa.
+    # Returns 0 on success; -EMFILE if the caller can't fit two more
+    # fds, -ENOSPC if the global SocketPair table is full.
+    #
+    # Mirrors vfs_pipe's allocation shape (alloc two fds first, then
+    # the backing slot, roll back on failure) so the failure paths look
+    # the same to the syscall dispatcher.
+    task: Ptr[TaskStruct] = current_task()
+    afd: int32 = _alloc_fd(task)
+    if afd < 0:
+        return EMFILE
+    task[0].fd_idx[cast[uint64](afd)] = FD_SOCKETPAIR_MARK
+    bfd: int32 = _alloc_fd(task)
+    if bfd < 0:
+        task[0].fd_idx[cast[uint64](afd)] = FD_CLOSED_MARK
+        return EMFILE
+
+    slot: int32 = sockpair_alloc()
+    if slot < 0:
+        task[0].fd_idx[cast[uint64](afd)] = FD_CLOSED_MARK
+        return ENOSPC
+
+    afdu: uint64 = cast[uint64](afd)
+    bfdu: uint64 = cast[uint64](bfd)
+    task[0].fd_idx[afdu] = FD_SOCKETPAIR_MARK
+    task[0].fd_pos[afdu] = 0
+    task[0].fd_buf[afdu] = sockpair_pack(slot, 0)
+    task[0].fd_idx[bfdu] = FD_SOCKETPAIR_MARK
+    task[0].fd_pos[bfdu] = 0
+    task[0].fd_buf[bfdu] = sockpair_pack(slot, 1)
+
+    out_fds[0] = afd
+    out_fds[1] = bfd
+    return 0
+
+
+def vfs_fd_is_socketpair(fd: int32) -> int32:
+    # V5: cheap probe so the 9P client (sys/src/9/port/9p_client.ad)
+    # can detect a bidirectional transport without importing
+    # FD_SOCKETPAIR_MARK directly. Returns 1 if `fd` is a live
+    # socketpair endpoint, 0 otherwise.
+    rc: int32 = _check_fd(fd)
+    if rc != 0:
+        return 0
+    task: Ptr[TaskStruct] = current_task()
+    if task[0].fd_idx[cast[uint64](fd)] == FD_SOCKETPAIR_MARK:
+        return 1
+    return 0
+
+
+def vfs_fd_socketpair_packed(fd: int32) -> uint64:
+    # V5: accessor for the (slot << 1 | direction) packed in fd_buf.
+    # Caller is responsible for vfs_fd_is_socketpair(fd) == 1 before
+    # calling; we don't re-validate here because the 9P client has
+    # already gated on the probe and re-running _check_fd would
+    # double the per-byte overhead of every send/recv.
+    task: Ptr[TaskStruct] = current_task()
+    return task[0].fd_buf[cast[uint64](fd)]
+
+
 def vfs_srv_dup_into_current(src_task: Ptr[TaskStruct],
                              src_fdu: uint64) -> int32:
     # V4 / sys_srv_open helper. Allocate the lowest free fd in the
@@ -1566,6 +1640,22 @@ def vfs_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
             if pipe_writers(slot) == 0:
                 return 0                       # all writers gone -> EOF
             yield_to_others()
+    if file_idx == FD_SOCKETPAIR_MARK:
+        # V5: bidirectional read. The packed fd_buf encodes (slot << 1
+        # | direction); end A reads ring_b, end B reads ring_a. We
+        # block-yield like the pipe path until bytes arrive OR the
+        # peer's refs has dropped to 1 (only WE are left, so no future
+        # writes are possible — surface EOF).
+        sp_packed: uint64 = task[0].fd_buf[fdu]
+        sp_slot: int32 = sockpair_unpack_slot(sp_packed)
+        sp_dir:  int32 = sockpair_unpack_dir(sp_packed)
+        while True:
+            n: int64 = sockpair_read(sp_slot, sp_dir, buf, count)
+            if n > 0:
+                return n
+            if sockpair_peer_alive(sp_slot, sp_dir) == 0:
+                return 0                       # peer closed -> EOF
+            yield_to_others()
     if file_idx == FD_FAT_MARK:
         # FAT read — walk the chain from the open file's first
         # cluster, copying out at fd_pos.
@@ -1779,6 +1869,29 @@ def vfs_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
             else:
                 yield_to_others()
         return cast[int64](total)
+    if file_idx == FD_SOCKETPAIR_MARK:
+        # V5: bidirectional write. End A writes ring_a, end B writes
+        # ring_b. Same blocking shape as the pipe path: yield when the
+        # destination ring is full until the peer drains. Peer-gone is
+        # surfaced as EPIPE (refs <= 1 means we're the only endpoint
+        # left, so no future read will ever happen).
+        sp_packed: uint64 = task[0].fd_buf[fdu]
+        sp_slot: int32 = sockpair_unpack_slot(sp_packed)
+        sp_dir:  int32 = sockpair_unpack_dir(sp_packed)
+        total: uint64 = 0
+        while total < count:
+            if sockpair_peer_alive(sp_slot, sp_dir) == 0:
+                if total > 0:
+                    return cast[int64](total)
+                return cast[int64](EPIPE)
+            chunk: int64 = sockpair_write(sp_slot, sp_dir,
+                cast[Ptr[uint8]](cast[uint64](buf) + total),
+                count - total)
+            if chunk > 0:
+                total = total + cast[uint64](chunk)
+            else:
+                yield_to_others()
+        return cast[int64](total)
     if file_idx == FD_PIPE_MARK_R:
         return cast[int64](EBADF)              # can't write a read end
     if file_idx == FD_STDOUT_MARK or file_idx == FD_STDERR_MARK:
@@ -1817,6 +1930,14 @@ def vfs_dup(oldfd: int32) -> int32:
     newfd: int32 = _alloc_fd(task)
     if newfd < 0:
         return EMFILE
+    # V5: bump socketpair refcount before copy_fd_entry. core.ad's
+    # copy_fd_entry only knows about pipe marks; FD_SOCKETPAIR_MARK
+    # needs its inc-ref here so a later vfs_close on either fd
+    # decrements correctly. Same hook lives in vfs_dup2.
+    if task[0].fd_idx[oldu] == FD_SOCKETPAIR_MARK:
+        old_pkd: uint64 = task[0].fd_buf[oldu]
+        sockpair_inc_ref(sockpair_unpack_slot(old_pkd),
+                         sockpair_unpack_dir(old_pkd))
     copy_fd_entry(task, cast[uint64](newfd), task, oldu)
     return newfd
 
@@ -1840,7 +1961,19 @@ def vfs_dup2(oldfd: int32, newfd: int32) -> int32:
     if oldfd == newfd:
         return newfd
     if task[0].fd_idx[newu] != FD_CLOSED_MARK:
+        # V5: if newfd was a socketpair endpoint, decrement its
+        # refcount before close_fd_in_task wipes the slot (same
+        # core.ad-can't-be-touched workaround vfs_close uses).
+        if task[0].fd_idx[newu] == FD_SOCKETPAIR_MARK:
+            new_pkd: uint64 = task[0].fd_buf[newu]
+            sockpair_close(sockpair_unpack_slot(new_pkd),
+                           sockpair_unpack_dir(new_pkd))
         close_fd_in_task(task, newu)
+    # V5: bump socketpair refcount before copy_fd_entry (see vfs_dup).
+    if task[0].fd_idx[oldu] == FD_SOCKETPAIR_MARK:
+        old_pkd: uint64 = task[0].fd_buf[oldu]
+        sockpair_inc_ref(sockpair_unpack_slot(old_pkd),
+                         sockpair_unpack_dir(old_pkd))
     copy_fd_entry(task, newu, task, oldu)
     return newfd
 
@@ -1865,6 +1998,16 @@ def vfs_close(fd: int32) -> int32:
         srvfd_p9: int32 = p9c_decode_srvfd(p9_packed)
         fid_p9:   int32 = p9c_decode_fid(p9_packed)
         p9c_clunk(srvfd_p9, fid_p9)
+    # V5: socketpair endpoint — decrement the SocketPair's refcount
+    # BEFORE close_fd_in_task wipes the slot (it doesn't know about
+    # FD_SOCKETPAIR_MARK, since core.ad is off-limits for this
+    # milestone). On last close (both ends' refs hit 0) sockpair_close
+    # frees the rings. Mirrors the FD_P9_MARK / p9c_clunk shape above.
+    if file_idx == FD_SOCKETPAIR_MARK:
+        sp_pkd:  uint64 = task[0].fd_buf[fdu]
+        sp_slot: int32 = sockpair_unpack_slot(sp_pkd)
+        sp_dir:  int32 = sockpair_unpack_dir(sp_pkd)
+        sockpair_close(sp_slot, sp_dir)
     # /proc/<pid>/<file> fds carry no per-fd backing — devproc_close
     # is a no-op success today (kept as a hook so future per-fd
     # snapshot support can land without re-plumbing the close path).
@@ -1894,6 +2037,7 @@ def vfs_lseek(fd: int32, offset: int64, whence: int32) -> int64:
             or file_idx == FD_PIPE_MARK_R or file_idx == FD_PIPE_MARK_W \
             or file_idx == FD_DEVNULL_MARK or file_idx == FD_DEVZERO_MARK \
             or file_idx == FD_DIR_MARK or file_idx == FD_SOCKET_MARK \
+            or file_idx == FD_SOCKETPAIR_MARK \
             or file_idx == FD_CONS_MARK or file_idx == FD_TIME_MARK \
             or file_idx == FD_PID_MARK or file_idx == FD_RANDOM_MARK \
             or file_idx == FD_MOUSE_MARK or file_idx == FD_CPUINFO_MARK \

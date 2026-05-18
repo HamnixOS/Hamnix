@@ -1,0 +1,304 @@
+# fs/socketpair.ad
+#
+# V0 bidirectional socketpair — the missing transport piece that lets
+# the kernel 9P client read AND write over a single fd (rather than the
+# unidirectional `sys_pipe` pair + `p9rx:` smuggling that V4.1 used).
+#
+# Shape: one SocketPair backs TWO fds, each a bidirectional endpoint.
+# The pair owns two ring buffers:
+#
+#   ring_a    end A writes -> end B reads
+#   ring_b    end B writes -> end A reads
+#
+# fd_buf for a socketpair fd encodes (slot << 1) | direction. direction
+# = 0 is end A, direction = 1 is end B. The same slot index addresses
+# the pair regardless of which end the caller is using; the direction
+# bit picks which ring to read / write.
+#
+# Reference counting (per-endpoint):
+#   refs_a / refs_b each start at 1 (sys_socketpair returns one fd of
+#   each end). vfs_dup / vfs_dup2 / sys_spawn-style cross-task copies
+#   on a socketpair fd bump the matching end's count (vfs.ad does this
+#   manually since kernel/sched/core.ad is off-limits this milestone).
+#   vfs_close decrements the matching end. The slot is freed when
+#   refs_a + refs_b both hit 0.
+#
+#   "Peer is gone" (EOF on read, EPIPE on write) is `refs of the OTHER
+#   end == 0` — not the total. That way an endpoint duped within the
+#   same task / cross-task doesn't make a co-owner falsely look like
+#   the peer.
+#
+#   IMPORTANT: kernel/sched/core.ad is off-limits this milestone, so
+#   close_fd_in_task / copy_fd_entry don't know about
+#   FD_SOCKETPAIR_MARK. The intercepts live entirely in fs/vfs.ad
+#   (vfs_close / vfs_dup / vfs_dup2). Task-exit auto-cleanup runs
+#   through close_fd_in_task which DOES NOT decrement refs — a
+#   socketpair slot can leak if a task dies with its fds still open,
+#   AND sys_spawn's dup_fd_to_child copy_fd_entry path does NOT bump
+#   refs either. Practical consequence: socketpair fds inherited
+#   across spawn behave as "child gets a free reference; child exit
+#   is invisible to the parent's refcount". For the rio prerequisite
+#   (single-task fixtures + one-spawn 9P loop where the child closes
+#   its end implicitly via exit) that's a tractable contract. Lifting
+#   it cleanly requires editing core.ad's close_fd_in_task +
+#   copy_fd_entry once the parallel fence opens.
+#
+# Mirrors fs/pipe.ad's structural shape so the code reads side-by-side.
+
+from mm.slab import kmalloc, kfree
+from kernel.printk.printk import printk0, printk1
+
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+
+
+# FD_SOCKETPAIR_MARK: per-fd marker for sys_socketpair endpoints. Lives
+# here (alongside the rest of the SocketPair surface) to avoid editing
+# kernel/sched/core.ad — same pattern devstat.ad / devmounts.ad /
+# devdiskstats.ad / 9p_client.ad use for their marks. Picked one slot
+# below FD_P9_MARK (0xFFFFFFE3) to stay clear of the FD_*_MARK family
+# already defined in core.ad.
+FD_SOCKETPAIR_MARK: uint32 = 0xFFFFFFE2
+
+
+SOCKPAIR_MAX: uint64 = 32
+SOCKPAIR_CAP: uint64 = 1024
+
+
+class SocketPair:
+    buf_a:   uint64                # ring A (A writes here, B reads)
+    head_a:  uint64                # next-read offset (mod cap)
+    tail_a:  uint64                # next-write offset (mod cap)
+    count_a: uint64                # bytes buffered in ring A
+    buf_b:   uint64                # ring B (B writes here, A reads)
+    head_b:  uint64                # next-read offset (mod cap)
+    tail_b:  uint64                # next-write offset (mod cap)
+    count_b: uint64                # bytes buffered in ring B
+    cap:     uint64                # ring capacity (== SOCKPAIR_CAP)
+    refs_a:  uint64                # open-fd count for end A
+    refs_b:  uint64                # open-fd count for end B
+    used:    uint64                # 1 = in use, 0 = free
+
+
+sockpair_table: Array[32, SocketPair]
+
+
+def _sp_find_free_slot() -> int32:
+    i: uint64 = 0
+    while i < SOCKPAIR_MAX:
+        if sockpair_table[i].used == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def sockpair_alloc() -> int32:
+    # Returns a slot index with refs_a = refs_b = 1 (caller owns one
+    # of each endpoint). -1 on out-of-slots / OOM.
+    slot: int32 = _sp_find_free_slot()
+    if slot < 0:
+        printk0("socketpair: out of slots\n")
+        return -1
+    su: uint64 = cast[uint64](slot)
+
+    if sockpair_table[su].buf_a == 0:
+        ba: uint64 = kmalloc(SOCKPAIR_CAP)
+        if ba == 0:
+            return -1
+        sockpair_table[su].buf_a = ba
+    if sockpair_table[su].buf_b == 0:
+        bb: uint64 = kmalloc(SOCKPAIR_CAP)
+        if bb == 0:
+            # Don't kfree buf_a — leave it for the next alloc to
+            # lazy-reuse (mirrors fs/pipe.ad's strategy).
+            return -1
+        sockpair_table[su].buf_b = bb
+    sockpair_table[su].cap     = SOCKPAIR_CAP
+    sockpair_table[su].head_a  = 0
+    sockpair_table[su].tail_a  = 0
+    sockpair_table[su].count_a = 0
+    sockpair_table[su].head_b  = 0
+    sockpair_table[su].tail_b  = 0
+    sockpair_table[su].count_b = 0
+    sockpair_table[su].refs_a  = 1
+    sockpair_table[su].refs_b  = 1
+    sockpair_table[su].used    = 1
+    return slot
+
+
+def sockpair_inc_ref(slot: int32, direction: int32):
+    su: uint64 = cast[uint64](slot)
+    if su >= SOCKPAIR_MAX:
+        return
+    if sockpair_table[su].used == 0:
+        return
+    if direction == 0:
+        sockpair_table[su].refs_a = sockpair_table[su].refs_a + 1
+    else:
+        sockpair_table[su].refs_b = sockpair_table[su].refs_b + 1
+
+
+def sockpair_close(slot: int32, direction: int32):
+    # Decrement the matching end's refcount; if BOTH ends hit zero,
+    # return the rings to the slab and free the slot. Like fs/pipe.ad,
+    # we keep buf_a/buf_b pointers so the next alloc can lazy-reuse the
+    # existing allocations.
+    su: uint64 = cast[uint64](slot)
+    if su >= SOCKPAIR_MAX:
+        return
+    if sockpair_table[su].used == 0:
+        return
+    if direction == 0:
+        if sockpair_table[su].refs_a > 0:
+            sockpair_table[su].refs_a = sockpair_table[su].refs_a - 1
+    else:
+        if sockpair_table[su].refs_b > 0:
+            sockpair_table[su].refs_b = sockpair_table[su].refs_b - 1
+    if sockpair_table[su].refs_a == 0 and sockpair_table[su].refs_b == 0:
+        if sockpair_table[su].buf_a != 0:
+            kfree(sockpair_table[su].buf_a)
+            sockpair_table[su].buf_a = 0
+        if sockpair_table[su].buf_b != 0:
+            kfree(sockpair_table[su].buf_b)
+            sockpair_table[su].buf_b = 0
+        sockpair_table[su].used = 0
+
+
+def sockpair_peer_alive(slot: int32, direction: int32) -> int32:
+    # Returns 1 if the OTHER end of the pair is still open, 0 if the
+    # peer has hung up (their refs hit 0). Used by vfs_read /
+    # vfs_write / the 9P client to distinguish "would block" from EOF
+    # / EPIPE without conflating intra-end dup counts with the peer's
+    # liveness.
+    su: uint64 = cast[uint64](slot)
+    if su >= SOCKPAIR_MAX:
+        return 0
+    if sockpair_table[su].used == 0:
+        return 0
+    if direction == 0:
+        if sockpair_table[su].refs_b > 0:
+            return 1
+        return 0
+    if sockpair_table[su].refs_a > 0:
+        return 1
+    return 0
+
+
+# --- fd_buf packing -----------------------------------------------
+#
+# fd_buf = (slot << 1) | direction. direction = 0 (end A) or 1 (end B).
+# We pack into the same fd_buf the rest of the FD_*_MARK family uses
+# (kernel/sched/core.ad / TaskStruct.fd_buf[i] / uint64).
+
+def sockpair_pack(slot: int32, direction: int32) -> uint64:
+    s: uint64 = cast[uint64](slot)
+    d: uint64 = cast[uint64](direction) & 1
+    return (s << 1) | d
+
+
+def sockpair_unpack_slot(pkd: uint64) -> int32:
+    return cast[int32](pkd >> 1)
+
+
+def sockpair_unpack_dir(pkd: uint64) -> int32:
+    return cast[int32](pkd & 1)
+
+
+# --- read / write -------------------------------------------------
+#
+# Read on end A drains ring_b (data B has written).
+# Write on end A enqueues into ring_a (B will read it).
+# Read on end B drains ring_a.
+# Write on end B enqueues into ring_b.
+#
+# Non-blocking at this layer; vfs_read / vfs_write wrap the yield
+# loop (mirroring fs/pipe.ad's contract).
+
+def _ring_read(buf_ptr: uint64, cap: uint64, head: uint64,
+               count: uint64, dst: Ptr[uint8], want: uint64) -> uint64:
+    if count == 0 or want == 0:
+        return 0
+    take: uint64 = want
+    if take > count:
+        take = count
+    first: uint64 = cap - head
+    if first > take:
+        first = take
+    memcpy(dst, cast[Ptr[uint8]](buf_ptr + head), first)
+    if take > first:
+        memcpy(cast[Ptr[uint8]](cast[uint64](dst) + first),
+               cast[Ptr[uint8]](buf_ptr), take - first)
+    return take
+
+
+def _ring_write(buf_ptr: uint64, cap: uint64, tail: uint64,
+                count: uint64, src: Ptr[uint8], want: uint64) -> uint64:
+    if count >= cap or want == 0:
+        return 0
+    free_space: uint64 = cap - count
+    take: uint64 = want
+    if take > free_space:
+        take = free_space
+    first: uint64 = cap - tail
+    if first > take:
+        first = take
+    memcpy(cast[Ptr[uint8]](buf_ptr + tail), src, first)
+    if take > first:
+        memcpy(cast[Ptr[uint8]](buf_ptr),
+               cast[Ptr[uint8]](cast[uint64](src) + first), take - first)
+    return take
+
+
+def sockpair_read(slot: int32, direction: int32,
+                  dst: Ptr[uint8], count: uint64) -> int64:
+    su: uint64 = cast[uint64](slot)
+    if su >= SOCKPAIR_MAX or sockpair_table[su].used == 0:
+        return -1
+    cap: uint64 = sockpair_table[su].cap
+    # End A reads ring_b; end B reads ring_a.
+    if direction == 0:
+        head:  uint64 = sockpair_table[su].head_b
+        cnt:   uint64 = sockpair_table[su].count_b
+        bufp:  uint64 = sockpair_table[su].buf_b
+        take: uint64 = _ring_read(bufp, cap, head, cnt, dst, count)
+        if take == 0:
+            return 0
+        sockpair_table[su].head_b  = (head + take) % cap
+        sockpair_table[su].count_b = cnt - take
+        return cast[int64](take)
+    head:  uint64 = sockpair_table[su].head_a
+    cnt:   uint64 = sockpair_table[su].count_a
+    bufp:  uint64 = sockpair_table[su].buf_a
+    take: uint64 = _ring_read(bufp, cap, head, cnt, dst, count)
+    if take == 0:
+        return 0
+    sockpair_table[su].head_a  = (head + take) % cap
+    sockpair_table[su].count_a = cnt - take
+    return cast[int64](take)
+
+
+def sockpair_write(slot: int32, direction: int32,
+                   src: Ptr[uint8], count: uint64) -> int64:
+    su: uint64 = cast[uint64](slot)
+    if su >= SOCKPAIR_MAX or sockpair_table[su].used == 0:
+        return -1
+    cap: uint64 = sockpair_table[su].cap
+    # End A writes ring_a; end B writes ring_b.
+    if direction == 0:
+        tail:  uint64 = sockpair_table[su].tail_a
+        cnt:   uint64 = sockpair_table[su].count_a
+        bufp:  uint64 = sockpair_table[su].buf_a
+        take: uint64 = _ring_write(bufp, cap, tail, cnt, src, count)
+        if take == 0:
+            return 0
+        sockpair_table[su].tail_a  = (tail + take) % cap
+        sockpair_table[su].count_a = cnt + take
+        return cast[int64](take)
+    tail:  uint64 = sockpair_table[su].tail_b
+    cnt:   uint64 = sockpair_table[su].count_b
+    bufp:  uint64 = sockpair_table[su].buf_b
+    take: uint64 = _ring_write(bufp, cap, tail, cnt, src, count)
+    if take == 0:
+        return 0
+    sockpair_table[su].tail_b  = (tail + take) % cap
+    sockpair_table[su].count_b = cnt + take
+    return cast[int64](take)

@@ -206,6 +206,23 @@ sys_pipe:
     .size sys_pipe, .-sys_pipe
 
 
+    /* --- sys_socketpair(domain, type, protocol, sv[2]) -> int32 -----
+     * V5: bidirectional fd pair — both fds are read/write. Picked
+     * Linux syscall number 53 so binaries that expect Linux's
+     * socketpair(2) call site land here unchanged. 4-arg syscall:
+     * SysV places arg 4 in %rcx, but the syscall ABI reserves %rcx
+     * for the user RIP and wants arg 4 in %r10. Shuffle %rcx -> %r10
+     * before SYSCALL (same pattern as sys_spawn / sys_mount). */
+    .globl sys_socketpair
+    .type sys_socketpair, @function
+sys_socketpair:
+    movq    %rcx, %r10              /* arg 4: sv -> r10 for syscall ABI */
+    movq    $53, %rax               /* SYS_SOCKETPAIR */
+    syscall
+    ret
+    .size sys_socketpair, .-sys_socketpair
+
+
     /* --- sys_kill(pid, sig) -> int32 ---------------------------------
      * Post `sig` into pid's pending-signal bitmap. Default
      * disposition for every signal is TERM with exit code 128+sig

@@ -442,6 +442,7 @@ moves break Linux ABI** (Layer 2 has its own dispatch table).
 | `SYS_WAITPID` | 12 | Renumber → keep | `wait` (12) | One-arg `wait(status_ptr)` — pid arg dropped (Plan 9 waits for **any** child; libc helper reimplements pid-specific wait by looping). |
 | `SYS_OPEN_WRITE` | 13 | **Deprecate** | `open(path, OWRITE\|OTRUNC)` | Delete in Phase G. |
 | `SYS_PIPE` | 14 | Keep | `pipe` (14) | Wire identical. Both ends are bidirectional in Plan 9; we honour that. |
+| `SYS_SOCKETPAIR` | 53 | Keep (V5 shipped) | `socketpair` (53) | Linux number 53. `int socketpair(int domain, int type, int protocol, int sv[2])` returns two BIDIRECTIONAL fds. `domain` ignored; `type` must be `SOCK_STREAM` (1) or `SOCK_DGRAM` (2); `protocol` ignored. Each fd is full-duplex — writes on one appear as reads on the other. Backed by `fs/socketpair.ad`; 32-pair pool, 1 KiB rings per direction. Use this (not `SYS_PIPE`) for bidirectional transports (rio, in-kernel 9P client). |
 | `SYS_KILL` | 15 | **→ path** | `write("/proc/<pid>/note", msg)` | Layer 2 translates Linux signo to Plan 9 note string. Delete syscall in Phase G. |
 | `SYS_DUP` | 16 | Keep | `dup(fd, -1)` (16) | |
 | `SYS_DUP2` | 17 | **Merge** | `dup(fd, newfd)` (16) | One call covers both. Phase G removes the 17 entry. |
