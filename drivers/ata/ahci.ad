@@ -127,8 +127,13 @@ CT_CFIS_OFF:  uint64 = 0x00
 CT_PRDT_OFF:  uint64 = 0x80     # PRDT entries start 128 bytes in
 
 # ATA commands we issue.
-ATA_CMD_IDENTIFY:    uint8 = 0xEC
-ATA_CMD_READ_DMA_EXT: uint8 = 0x25
+ATA_CMD_IDENTIFY:     uint8 = 0xEC
+ATA_CMD_READ_DMA_EXT:  uint8 = 0x25
+# WRITE DMA EXT (M16.118). Same LBA48 / FIS shape as READ DMA EXT;
+# the only differences are this command byte + the W bit (DW0 bit 6)
+# in the command header telling the HBA the transfer direction is
+# host-to-device. See AHCI spec §5.3.3 + ATA8 §7.65.
+ATA_CMD_WRITE_DMA_EXT: uint8 = 0x35
 
 # H2D Register FIS type byte (FIS_TYPE_REG_H2D).
 FIS_TYPE_REG_H2D: uint8 = 0x27
@@ -401,6 +406,81 @@ def _do_read_lba(port_base: uint64, clist: uint64, ct_base: uint64,
     return _wait_ci_clear(port_base, 0x1)
 
 
+# --- WRITE DMA EXT -------------------------------------------------
+#
+# M16.118: complementary path to _do_read_lba above. The command-list
+# / command-table / PRDT machinery is identical; only the ATA command
+# byte changes (0x35 vs 0x25) and the W bit in the command header's
+# DW0 (bit 6) flips to 1, telling the HBA the data direction is
+# host-to-device. PRDT still points at the caller's buffer — but now
+# the HBA *reads* it instead of writing it. Polled completion via the
+# CI bit, same as READ.
+
+def _do_write_lba(port_base: uint64, clist: uint64, ct_base: uint64,
+                  buf: uint64, lba: uint64, count: uint16) -> int32:
+    _build_h2d_fis(ct_base + CT_CFIS_OFF, ATA_CMD_WRITE_DMA_EXT,
+                   lba, count, 0x40)
+    # CFL=5, write=1 (W bit set in DW0), PRDTL=1.
+    _build_cmd_header(clist, ct_base, 5, 1, 1)
+    _build_prdt(ct_base, buf, cast[uint32](count) * 512)
+
+    if _wait_tfd_idle(port_base) != 0:
+        printk0("[ahci] port busy before WRITE_DMA_EXT\n")
+        return -1
+    _mmio_w32(port_base + PORT_IS, 0xFFFFFFFF)
+    _mmio_w32(port_base + PORT_SERR, 0xFFFFFFFF)
+    _mmio_w32(port_base + PORT_CI, 0x1)
+    return _wait_ci_clear(port_base, 0x1)
+
+
+# --- Public write_sectors entry ------------------------------------
+#
+# Drives the per-port command-list / command-table that ahci_smoke_test
+# set up. Takes the same shape virtio-blk's write_sectors does so
+# higher layers can dispatch through a uniform BlockDeviceOps vtable
+# once registration lands. NOTE: this commit ships the driver-level
+# primitive only; AHCI is not yet registered with `kernel/block/blk.ad`
+# (the BlockDeviceOps vtable already exposes a write_sectors slot,
+# but wiring AHCI's per-port priv + register_blockdev() is a follow-up
+# to avoid colliding with parallel CPython brk/mmap work in u_syscalls).
+#
+# `port` is the slot index from `ahci.port_num` (we only drive one
+# port today). `count` is in 512-byte sectors. Returns 0 on success,
+# -1 on any failure (HBA wedged, command error, no port set up).
+
+def ahci_write_sectors(port: int32, lba: uint64, count: uint16,
+                       buf: uint64) -> int32:
+    if ahci.abar == 0 or ahci.port_num < 0:
+        printk0("[ahci] write_sectors: driver not initialised\n")
+        return -1
+    if port != ahci.port_num:
+        printk1("[ahci] write_sectors: bad port=%d\n", cast[uint64](port))
+        return -1
+    if count == 0:
+        return 0
+    clist:   uint64 = ahci.page + CL_OFFSET
+    ct_base: uint64 = ahci.page + CT_OFFSET
+    return _do_write_lba(ahci.port_base, clist, ct_base, buf, lba, count)
+
+
+def ahci_read_sectors(port: int32, lba: uint64, count: uint16,
+                      buf: uint64) -> int32:
+    # Counterpart to ahci_write_sectors, exposed for the write-then-
+    # read-back smoke test below. The smoke test in ahci_smoke_test
+    # uses _do_read_lba directly; this wrapper lets callers outside
+    # that function do the same without poking at private state.
+    if ahci.abar == 0 or ahci.port_num < 0:
+        printk0("[ahci] read_sectors: driver not initialised\n")
+        return -1
+    if port != ahci.port_num:
+        return -1
+    if count == 0:
+        return 0
+    clist:   uint64 = ahci.page + CL_OFFSET
+    ct_base: uint64 = ahci.page + CT_OFFSET
+    return _do_read_lba(ahci.port_base, clist, ct_base, buf, lba, count)
+
+
 # --- Public entry point --------------------------------------------
 
 def ahci_smoke_test() -> int32:
@@ -587,6 +667,65 @@ def ahci_smoke_test() -> int32:
     printk2("[ahci] irq pin=%d vec=0x%x\n",
             cast[uint64](ioapic_pin), cast[uint64](AHCI_IRQ_VECTOR))
 
+    # M16.118: exercise the new WRITE DMA EXT path. We get here only
+    # after IDENTIFY + READ LBA 0 already passed, so the port is known
+    # good. The write-smoke test scribbles a pattern to LBA 1 and reads
+    # it back to verify byte-for-byte; on failure we log + fall through
+    # (the controller is still in a clean state since each command
+    # serialises on slot 0).
+    _ahci_write_smoke_test()
+
+    return 0
+
+
+def _ahci_write_smoke_test() -> int32:
+    # M16.118 write+readback verification. Lays down a known pattern
+    # at LBA 1 via the new WRITE DMA EXT path, zeroes the verifier
+    # buffer, reads LBA 1 back via the existing READ DMA EXT path,
+    # and byte-compares. Picks LBA 1 (not LBA 0) so a bug doesn't
+    # clobber the test harness's planted MBR signature at LBA 0
+    # before the existing test_ahci.sh grep'd for it.
+    #
+    # The buffer is kmalloc'd 512 bytes — small enough to live in
+    # the slab without page-fragmenting the kernel heap. The PRD
+    # entries the driver builds don't care whether the buffer is
+    # page-aligned (PRDT alignment is per AHCI spec just 2-byte for
+    # the data buffer when CAP.S64A and CAP.SDBS aren't constraining
+    # us, which on QEMU's ich9-ahci they aren't).
+    wbuf: uint64 = kmalloc(512)
+    rbuf: uint64 = kmalloc(512)
+    if wbuf == 0 or rbuf == 0:
+        printk0("[ahci] write-smoke: kmalloc(512) failed\n")
+        return -1
+    # Plant a recognisable pattern. Byte i = (i ^ 0xA5) & 0xFF so
+    # any single-byte corruption (or a stuck DMA returning zeros)
+    # is visible at index 0 (= 0xA5).
+    i: uint64 = 0
+    wp: Ptr[uint8] = cast[Ptr[uint8]](wbuf)
+    while i < 512:
+        wp[i] = cast[uint8](cast[uint8](i & 0xFF) ^ cast[uint8](0xA5))
+        i = i + 1
+    memset(cast[Ptr[uint8]](rbuf), 0, 512)
+
+    if ahci_write_sectors(ahci.port_num, 1, 1, wbuf) != 0:
+        printk0("[ahci] write-smoke: WRITE DMA EXT failed\n")
+        return -1
+    printk0("[ahci] write LBA=1 nblocks=1 OK\n")
+
+    if ahci_read_sectors(ahci.port_num, 1, 1, rbuf) != 0:
+        printk0("[ahci] write-smoke: read-back failed\n")
+        return -1
+
+    # Byte-compare. Any mismatch fails the smoke test loudly.
+    rp: Ptr[uint8] = cast[Ptr[uint8]](rbuf)
+    j: uint64 = 0
+    while j < 512:
+        if rp[j] != wp[j]:
+            printk2("[ahci] readback MISMATCH at byte %d (got %x)\n",
+                    j, cast[uint64](rp[j]))
+            return -1
+        j = j + 1
+    printk0("[ahci] readback matches pattern\n")
     return 0
 
 

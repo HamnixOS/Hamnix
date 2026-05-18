@@ -540,8 +540,15 @@ it has to honour.
 - ~~Native AHCI driver — shipped in M16.89. PCI class probe, ABAR
   map, port scan, polled IDENTIFY + READ DMA EXT of LBA 0 (MBR
   signature check). Unlocks SATA disks on consumer hardware.~~
-- AHCI write path (WRITE DMA EXT, 0x35). Symmetrical to the M16.89
-  read path; needs port stop/start churn audited under repeat I/O.
+- ~~AHCI write path (WRITE DMA EXT, 0x35). Symmetrical to the M16.89
+  read path; needs port stop/start churn audited under repeat I/O.~~
+  Shipped in M16.118: `ahci_write_sectors` + `_do_write_lba` mirror
+  the READ path with W=1 in the command-header DW0. Boot-time
+  smoke test writes a 512-byte pattern to LBA 1 and reads it back
+  to verify byte-for-byte equality. See `scripts/test_ahci_write.sh`.
+  Block-layer integration (register_blockdev with the AHCI port as
+  priv) is the next follow-up — BlockDeviceOps.write_sectors slot
+  already exists in `kernel/block/blk.ad`.
 - AHCI native command queueing (NCQ) — multiple in-flight commands
   per port via READ FPDMA QUEUED / WRITE FPDMA QUEUED (0x60 / 0x61),
   driven by SACT + per-slot completion. Today every command
@@ -557,9 +564,15 @@ it has to honour.
   64-bit BAR0 map, controller reset + admin SQ/CQ + CC.EN dance,
   IDENTIFY controller + namespace, CREATE-IO-CQ/SQ, I/O READ of LBA 0
   with MBR signature check. Polled completion via CQ phase bit.~~
-- NVMe write path (opcode 0x01) — symmetrical to the M16.92 read path;
+- ~~NVMe write path (opcode 0x01) — symmetrical to the M16.92 read path;
   PRP1 = source buffer, CDW10/11 = LBA, CDW12 = NLB-1. Should reuse
-  the existing I/O queue + `_io_submit_and_wait` plumbing.
+  the existing I/O queue + `_io_submit_and_wait` plumbing.~~ Shipped
+  in M16.118: `nvme_write_lba` reuses `_io_submit_and_wait` over the
+  existing qid=1 I/O SQ/CQ. Boot-time smoke test writes a 512-byte
+  pattern to LBA 1 of namespace 1 and reads it back via the existing
+  READ path to verify byte equality. See `scripts/test_nvme_write.sh`.
+  Block-layer integration (register_blockdev with namespace cookie as
+  priv) is the next follow-up.
 - NVMe multi-queue (one SQ per CPU) — today every I/O serialises on
   qid=1. Per-CPU SQs unlock the scalability the protocol was
   designed for.
@@ -568,6 +581,24 @@ it has to honour.
 - NVMe multi-namespace support — current driver hard-codes NSID=1.
   Real controllers carve multiple namespaces; need IDENTIFY active
   namespace list (CNS=0x02) + a per-NS state struct.
+- M16.118 follow-up: register AHCI + NVMe with `kernel/block/blk.ad`.
+  The driver-level write/read primitives (`ahci_write_sectors`,
+  `nvme_write_lba` + their read counterparts) are in place, and
+  BlockDeviceOps already has a `write_sectors` slot. Wiring requires
+  picking a name ("sda" / "nvme0n1"), allocating a per-controller
+  priv cookie, and calling `register_blockdev` after the smoke test
+  succeeds. Then ext4 / FAT32 / partition-table mounts work
+  uniformly across virtio-blk, brd, AHCI, NVMe.
+- M16.118 follow-up: partition-table parsing for AHCI + NVMe disks.
+  drivers/block/partition.ad (parallel agent) already decodes
+  MBR + GPT against the block layer; once AHCI/NVMe are registered
+  via the previous bullet, `blk_scan_partitions(slot)` immediately
+  works for them too.
+- M16.118 follow-up: ext4 write path + bootloader-install plumbing.
+  With AHCI + NVMe writes in place, `dd if=hamnix.iso of=/dev/sda`
+  from inside Hamnix becomes feasible; the higher-level installer
+  needs ext4-write + GRUB-stage-install + MBR-write helpers built
+  on top of the new primitives.
 
 ## Input
 
