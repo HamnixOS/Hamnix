@@ -40,20 +40,33 @@
 #   option 54 (Server ID)     : 4 bytes, the DHCP server's address
 #   option 255 (End)          : terminator
 #
-# State machine is trivial:
+# State machine (RFC 2131 §4.4):
 #
 #   IDLE → DISCOVER (we send DHCPDISCOVER, broadcast)
 #   DISCOVER → SELECTING (got DHCPOFFER, send DHCPREQUEST)
-#   SELECTING → BOUND (got DHCPACK, install lease)
+#   SELECTING → BOUND (got DHCPACK, install lease + arm T1/T2/T3)
+#   BOUND → RENEWING (T1 elapsed; unicast DHCPREQUEST to server-id)
+#   RENEWING → BOUND (got DHCPACK; re-arm T1/T2/T3)
+#   RENEWING → REBINDING (T2 elapsed; broadcast DHCPREQUEST)
+#   REBINDING → BOUND (got DHCPACK from any server; re-arm timers)
+#   REBINDING → IDLE (T3 = lease expiry; forget lease, send DISCOVER)
 #
-# A DHCPNAK or timeout would reset to IDLE; we don't implement
-# rebind / renew (those needs T1/T2 timers; the install path is
-# what unblocks `apt`, not the lease refresh).
+# A DHCPNAK at any point resets to IDLE.
+#
+# Default timers per RFC 2131 §4.4.5:
+#   T1 = 0.5 × lease
+#   T2 = 0.875 × lease
+#   T3 = lease
+#
+# Time base: HZ = 100 (1 jiffy = 10 ms). Lease is captured in seconds
+# from option 51 of the ACK; T1/T2/T3 are stored as absolute jiffies
+# in our virtual clock (see dhcp_advance_clock_for_test).
 
 from kernel.printk.printk import printk0, printk1, printk2
 from drivers.net.eth import eth_get_mac
 from drivers.net.udp import udp_send, UDP_PORT_DHCP_SERVER, UDP_PORT_DHCP_CLIENT
 from drivers.net.ip import ip_set_our_ip, ip_set_gateway
+from arch.x86.kernel.time import get_jiffies
 
 
 DHCP_OP_BOOTREQUEST: uint8 = 1
@@ -71,9 +84,18 @@ DHCP_OPT_ROUTER:      uint8 = 3
 DHCP_OPT_DNS:         uint8 = 6
 DHCP_OPT_MSG_TYPE:    uint8 = 53
 DHCP_OPT_REQUESTED:   uint8 = 50
+DHCP_OPT_LEASE_TIME:  uint8 = 51
 DHCP_OPT_SERVER_ID:   uint8 = 54
 DHCP_OPT_PARAM_LIST:  uint8 = 55
 DHCP_OPT_END:         uint8 = 255
+
+# Time base. HZ=100 means 1 jiffy == 10 ms; 100 jiffies == 1 s.
+DHCP_HZ:              uint64 = 100
+
+# Default lease, used as a safety net when the server omits option 51
+# (legal per RFC 2131 §3.1 step 4 — "the server MAY include a lease
+# time" — but rare). One hour matches dnsmasq's default.
+DHCP_DEFAULT_LEASE_S: uint64 = 3600
 
 # Magic cookie at offset 236.
 DHCP_MAGIC_0: uint8 = 0x63
@@ -97,6 +119,8 @@ DHCP_STATE_IDLE:      uint8 = 0
 DHCP_STATE_DISCOVER:  uint8 = 1   # sent DISCOVER, waiting for OFFER
 DHCP_STATE_SELECTING: uint8 = 2   # sent REQUEST, waiting for ACK
 DHCP_STATE_BOUND:     uint8 = 3   # got ACK, lease installed
+DHCP_STATE_RENEWING:  uint8 = 4   # T1 fired, unicast REQUEST sent
+DHCP_STATE_REBINDING: uint8 = 5   # T2 fired, broadcast REQUEST sent
 
 dhcp_state:        uint8 = 0
 dhcp_xid_b0:       uint8 = 0
@@ -112,6 +136,29 @@ dhcp_offer_dns:     Array[4, uint8]
 dhcp_offer_have_router: uint8 = 0
 dhcp_offer_have_mask:   uint8 = 0
 dhcp_offer_have_dns:    uint8 = 0
+
+# Lease-time bookkeeping. The ACK's option 51 lands in
+# dhcp_lease_secs. On the BOUND transition we compute absolute
+# jiffies for T1 / T2 / T3 using the virtual clock so test code can
+# fast-forward without waiting wall-clock seconds.
+dhcp_lease_secs:    uint64 = 0
+dhcp_offer_have_lease: uint8 = 0
+dhcp_t1_at_jiffies: uint64 = 0
+dhcp_t2_at_jiffies: uint64 = 0
+dhcp_t3_at_jiffies: uint64 = 0
+
+# Virtual-clock offset. _dhcp_clock_jiffies() returns
+#   get_jiffies() + dhcp_clock_offset_jiffies
+# so tests can call dhcp_advance_clock_for_test(ms) to fast-forward
+# past T1/T2/T3 without burning real wall-clock time. Production code
+# never sets this; it stays zero.
+dhcp_clock_offset_jiffies: uint64 = 0
+
+# Test-only suppress flag. When 1, _dhcp_send_renew_request builds
+# the packet but skips the actual wire transmit, so SLIRP can't
+# race an ACK back into the smoke test. Production paths leave it
+# zero (its only mutator is dhcp_renew_smoke_test).
+dhcp_test_suppress_tx: uint8 = 0
 
 
 def _dhcp_zero_buf():
@@ -261,6 +308,53 @@ def _dhcp_send_request() -> int32:
                     buf_ptr, off)
 
 
+def _dhcp_send_renew_request(broadcast: uint8) -> int32:
+    # Build a DHCPREQUEST for the RENEWING / REBINDING path.
+    #
+    # Per RFC 2131 §4.3.2:
+    #   - In RENEWING / REBINDING the client MUST set ciaddr to its
+    #     currently bound IP.
+    #   - It MUST NOT include option 50 (Requested IP) or option 54
+    #     (Server Identifier) — the server identifies the lease from
+    #     ciaddr alone.
+    #   - RENEWING uses unicast to the lease's server-id; REBINDING
+    #     uses broadcast.
+    #
+    # We reuse the same xid as the BOUND lease so the server links
+    # the renew to the existing binding. Caller is responsible for
+    # logging the state-transition marker (we keep state mutation
+    # here so dhcp_tick stays linear).
+    #
+    # When dhcp_test_suppress_tx is set, we build the packet (so
+    # the codegen path is exercised) but don't hand it to the wire.
+    # The renew smoke test enables this to prevent SLIRP from racing
+    # an ACK back into our state machine mid-test.
+    off: uint64 = _dhcp_fill_header(DHCP_MSG_REQUEST)
+    # Patch ciaddr (offset 12..15) to our currently bound IP.
+    dhcp_tx_buf[12] = dhcp_offer_yiaddr[0]
+    dhcp_tx_buf[13] = dhcp_offer_yiaddr[1]
+    dhcp_tx_buf[14] = dhcp_offer_yiaddr[2]
+    dhcp_tx_buf[15] = dhcp_offer_yiaddr[3]
+    # No option 50, no option 54 — just the param list + END.
+    off = _dhcp_append_param_list(off)
+    off = _dhcp_append_end(off)
+    off = _dhcp_pad_to_min(off)
+    if dhcp_test_suppress_tx == 1:
+        return 0
+    buf_ptr: Ptr[uint8] = cast[Ptr[uint8]](&dhcp_tx_buf[0])
+    if broadcast == 1:
+        return udp_send(0xFF, 0xFF, 0xFF, 0xFF,
+                        UDP_PORT_DHCP_CLIENT,
+                        UDP_PORT_DHCP_SERVER,
+                        buf_ptr, off)
+    # Unicast — destination is the original server-id IP.
+    return udp_send(dhcp_offer_server[0], dhcp_offer_server[1],
+                    dhcp_offer_server[2], dhcp_offer_server[3],
+                    UDP_PORT_DHCP_CLIENT,
+                    UDP_PORT_DHCP_SERVER,
+                    buf_ptr, off)
+
+
 def _dhcp_parse_options(payload: Ptr[uint8], length: uint64,
                         out_msg_type: Ptr[uint8]) -> int32:
     # Walk options starting at offset 240. Each option is
@@ -283,6 +377,7 @@ def _dhcp_parse_options(payload: Ptr[uint8], length: uint64,
     dhcp_offer_have_router = 0
     dhcp_offer_have_mask = 0
     dhcp_offer_have_dns = 0
+    dhcp_offer_have_lease = 0
     i: uint64 = 240
     while i < length:
         tag: uint8 = payload[i]
@@ -332,9 +427,94 @@ def _dhcp_parse_options(payload: Ptr[uint8], length: uint64,
                 dhcp_offer_dns[2] = payload[data_off + 2]
                 dhcp_offer_dns[3] = payload[data_off + 3]
                 dhcp_offer_have_dns = 1
+        elif tag == DHCP_OPT_LEASE_TIME:
+            # Option 51: 32-bit lease time in seconds, big-endian.
+            # Captured for use in the BOUND-state T1/T2/T3 arming.
+            if olen == 4:
+                lb0: uint64 = cast[uint64](payload[data_off + 0])
+                lb1: uint64 = cast[uint64](payload[data_off + 1])
+                lb2: uint64 = cast[uint64](payload[data_off + 2])
+                lb3: uint64 = cast[uint64](payload[data_off + 3])
+                dhcp_lease_secs = (lb0 << 24) | (lb1 << 16) | (lb2 << 8) | lb3
+                dhcp_offer_have_lease = 1
         # other tags ignored
         i = data_off + cast[uint64](olen)
     return 0
+
+
+def _dhcp_clock_jiffies() -> uint64:
+    # Virtual clock = real jiffies + test offset. Production callers
+    # see exactly real jiffies (offset is zero); the renew smoke test
+    # bumps the offset to fast-forward past T1/T2/T3.
+    return get_jiffies() + dhcp_clock_offset_jiffies
+
+
+def _dhcp_arm_lease_timers():
+    # Compute absolute jiffies for T1 / T2 / T3 from the captured
+    # lease length. Falls back to DHCP_DEFAULT_LEASE_S when the
+    # server omitted option 51.
+    lease_s: uint64 = dhcp_lease_secs
+    if dhcp_offer_have_lease == 0:
+        lease_s = DHCP_DEFAULT_LEASE_S
+    if lease_s == 0:
+        lease_s = DHCP_DEFAULT_LEASE_S
+    # T1 = 0.5  × lease; T2 = 0.875 × lease; T3 = lease.
+    # Integer arithmetic: T1 = lease/2, T2 = (lease*7)/8.
+    t1_s: uint64 = lease_s / 2
+    t2_s: uint64 = (lease_s * 7) / 8
+    now: uint64 = _dhcp_clock_jiffies()
+    dhcp_t1_at_jiffies = now + t1_s * DHCP_HZ
+    dhcp_t2_at_jiffies = now + t2_s * DHCP_HZ
+    dhcp_t3_at_jiffies = now + lease_s * DHCP_HZ
+
+
+def dhcp_tick():
+    # Drive the renew / rebind / lease-expiry transitions. Safe to
+    # call at any frequency from any polling loop; cheap (a couple
+    # of compares + the occasional UDP send). Mirrors the
+    # _tcp_check_retrans calling pattern used by drivers/net/tcp.ad.
+    now: uint64 = _dhcp_clock_jiffies()
+    if dhcp_state == DHCP_STATE_BOUND:
+        if now >= dhcp_t1_at_jiffies:
+            dhcp_state = DHCP_STATE_RENEWING
+            printk0("[dhcp renewing] unicast REQUEST to ")
+            _dhcp_print_ip(dhcp_offer_server[0], dhcp_offer_server[1],
+                           dhcp_offer_server[2], dhcp_offer_server[3])
+            printk0("\n")
+            _dhcp_send_renew_request(0)         # unicast
+        return
+    if dhcp_state == DHCP_STATE_RENEWING:
+        if now >= dhcp_t2_at_jiffies:
+            dhcp_state = DHCP_STATE_REBINDING
+            printk0("[dhcp rebinding] broadcast REQUEST\n")
+            _dhcp_send_renew_request(1)         # broadcast
+        return
+    if dhcp_state == DHCP_STATE_REBINDING:
+        if now >= dhcp_t3_at_jiffies:
+            # T3 elapsed: the lease is gone. Forget it and drop back
+            # to IDLE; the caller (or a higher-level reaper) is
+            # responsible for re-issuing dhcp_discover. We avoid
+            # auto-DISCOVER here so the boot path's dhcp_init →
+            # dhcp_discover sequence is the single owner of the
+            # initial transmit (and the renew smoke test can observe
+            # the IDLE drop cleanly).
+            dhcp_state = DHCP_STATE_IDLE
+            ip_set_our_ip(0, 0, 0, 0)
+            dhcp_offer_have_lease = 0
+            printk0("[dhcp lease expired] forgetting lease, back to IDLE\n")
+        return
+    # Other states (IDLE / DISCOVER / SELECTING): nothing to tick.
+
+
+def dhcp_advance_clock_for_test(ms: uint64):
+    # Test-only: bump the virtual-clock offset by `ms` milliseconds.
+    # Production code never calls this. Used by dhcp_renew_smoke_test
+    # and scripts/test_dhcp_renew.sh to fast-forward past T1/T2/T3
+    # without burning real wall-clock time.
+    bump: uint64 = ms / 10                       # 10 ms per jiffy
+    if bump == 0:
+        bump = 1
+    dhcp_clock_offset_jiffies = dhcp_clock_offset_jiffies + bump
 
 
 def dhcp_rx(payload: Ptr[uint8], length: uint64,
@@ -389,22 +569,44 @@ def dhcp_rx(payload: Ptr[uint8], length: uint64,
         _dhcp_send_request()
         return
     if msg_type == DHCP_MSG_ACK:
-        if dhcp_state != DHCP_STATE_SELECTING:
+        # ACK is valid in three states:
+        #   SELECTING — initial lease acquisition (install IP+gw).
+        #   RENEWING  — server confirmed the renew; re-arm timers.
+        #   REBINDING — any server confirmed; re-arm timers.
+        # In all three we re-install the lease and re-arm T1/T2/T3.
+        if dhcp_state == DHCP_STATE_SELECTING:
+            ip_set_our_ip(dhcp_offer_yiaddr[0], dhcp_offer_yiaddr[1],
+                          dhcp_offer_yiaddr[2], dhcp_offer_yiaddr[3])
+            if dhcp_offer_have_router == 1:
+                ip_set_gateway(dhcp_offer_router[0], dhcp_offer_router[1],
+                               dhcp_offer_router[2], dhcp_offer_router[3])
+            _dhcp_arm_lease_timers()
+            dhcp_state = DHCP_STATE_BOUND
+            printk0("[dhcp] got ip=")
+            _dhcp_print_ip(dhcp_offer_yiaddr[0], dhcp_offer_yiaddr[1],
+                           dhcp_offer_yiaddr[2], dhcp_offer_yiaddr[3])
+            if dhcp_offer_have_router == 1:
+                printk0(" gw=")
+                _dhcp_print_ip(dhcp_offer_router[0], dhcp_offer_router[1],
+                               dhcp_offer_router[2], dhcp_offer_router[3])
+            printk0("\n")
             return
-        ip_set_our_ip(dhcp_offer_yiaddr[0], dhcp_offer_yiaddr[1],
-                      dhcp_offer_yiaddr[2], dhcp_offer_yiaddr[3])
-        if dhcp_offer_have_router == 1:
-            ip_set_gateway(dhcp_offer_router[0], dhcp_offer_router[1],
-                           dhcp_offer_router[2], dhcp_offer_router[3])
-        dhcp_state = DHCP_STATE_BOUND
-        printk0("[dhcp] got ip=")
-        _dhcp_print_ip(dhcp_offer_yiaddr[0], dhcp_offer_yiaddr[1],
-                       dhcp_offer_yiaddr[2], dhcp_offer_yiaddr[3])
-        if dhcp_offer_have_router == 1:
-            printk0(" gw=")
-            _dhcp_print_ip(dhcp_offer_router[0], dhcp_offer_router[1],
-                           dhcp_offer_router[2], dhcp_offer_router[3])
-        printk0("\n")
+        if dhcp_state == DHCP_STATE_RENEWING:
+            _dhcp_arm_lease_timers()
+            dhcp_state = DHCP_STATE_BOUND
+            printk0("[dhcp bound] renew ack ip=")
+            _dhcp_print_ip(dhcp_offer_yiaddr[0], dhcp_offer_yiaddr[1],
+                           dhcp_offer_yiaddr[2], dhcp_offer_yiaddr[3])
+            printk0("\n")
+            return
+        if dhcp_state == DHCP_STATE_REBINDING:
+            _dhcp_arm_lease_timers()
+            dhcp_state = DHCP_STATE_BOUND
+            printk0("[dhcp bound] rebind ack ip=")
+            _dhcp_print_ip(dhcp_offer_yiaddr[0], dhcp_offer_yiaddr[1],
+                           dhcp_offer_yiaddr[2], dhcp_offer_yiaddr[3])
+            printk0("\n")
+            return
         return
     if msg_type == DHCP_MSG_NAK:
         printk0("[dhcp] NAK; resetting to IDLE\n")
@@ -422,6 +624,13 @@ def dhcp_init():
     dhcp_offer_have_router = 0
     dhcp_offer_have_mask = 0
     dhcp_offer_have_dns = 0
+    dhcp_offer_have_lease = 0
+    dhcp_lease_secs = 0
+    dhcp_t1_at_jiffies = 0
+    dhcp_t2_at_jiffies = 0
+    dhcp_t3_at_jiffies = 0
+    dhcp_clock_offset_jiffies = 0
+    dhcp_test_suppress_tx = 0
     i: uint64 = 0
     while i < 4:
         dhcp_offer_yiaddr[i] = 0
@@ -449,3 +658,70 @@ def dhcp_get_dns(out: Ptr[uint8]) -> int32:
     out[2] = dhcp_offer_dns[2]
     out[3] = dhcp_offer_dns[3]
     return 0
+
+
+def dhcp_renew_smoke_test():
+    # In-kernel smoke test for the RFC 2131 §4.4.5 renew / rebind /
+    # lease-expiry state machine. Designed to run after the live
+    # SLIRP DHCP path has reached BOUND; we shrink the lease to 60 s,
+    # fast-forward the virtual clock past T1 / T2 / T3 in three
+    # steps, and assert the state machine transitions correctly.
+    #
+    # Wire is suppressed (dhcp_test_suppress_tx = 1) so SLIRP can't
+    # race an ACK back into our state during the test. The renew /
+    # rebind / expiry markers fire from dhcp_tick before any wire
+    # activity would have happened.
+    #
+    # PASS markers (consumed by scripts/test_dhcp_renew.sh):
+    #   [dhcp renewing]      — T1 fired, RENEWING state entered
+    #   [dhcp rebinding]     — T2 fired, REBINDING state entered
+    #   [dhcp lease expired] — T3 fired, dropped back to IDLE
+    #   [dhcp_renew] PASS    — all three transitions observed
+    #
+    # SKIP markers (test script treats them as a soft skip):
+    #   [dhcp_renew] SKIP    — pre-condition failure (no live BOUND
+    #                          state to drive the test from).
+    if dhcp_state != DHCP_STATE_BOUND:
+        printk1("[dhcp_renew] SKIP (state=%d, not BOUND)\n",
+                cast[uint64](dhcp_state))
+        return
+    printk0("[dhcp_renew] starting (lease=60s synthetic)\n")
+    # Force a short lease and re-arm timers relative to the current
+    # virtual clock. After this, T1 == +30 s, T2 == +52.5 s, T3 == +60 s.
+    dhcp_lease_secs = 60
+    dhcp_offer_have_lease = 1
+    _dhcp_arm_lease_timers()
+    dhcp_test_suppress_tx = 1
+
+    # --- T1: BOUND -> RENEWING ----------------------------------
+    # Advance 31 000 ms (1 s past T1) and tick.
+    dhcp_advance_clock_for_test(31000)
+    dhcp_tick()
+    if dhcp_state != DHCP_STATE_RENEWING:
+        printk1("[dhcp_renew] FAIL after T1 (state=%d expected RENEWING=4)\n",
+                cast[uint64](dhcp_state))
+        dhcp_test_suppress_tx = 0
+        return
+
+    # --- T2: RENEWING -> REBINDING ------------------------------
+    # We're at virtual now ≈ 31 s. T2 = 52.5 s; bump 22 s -> ~53 s.
+    dhcp_advance_clock_for_test(22000)
+    dhcp_tick()
+    if dhcp_state != DHCP_STATE_REBINDING:
+        printk1("[dhcp_renew] FAIL after T2 (state=%d expected REBINDING=5)\n",
+                cast[uint64](dhcp_state))
+        dhcp_test_suppress_tx = 0
+        return
+
+    # --- T3: REBINDING -> IDLE (lease expiry) -------------------
+    # Virtual now ≈ 53 s. T3 = 60 s; bump 8 s -> ~61 s.
+    dhcp_advance_clock_for_test(8000)
+    dhcp_tick()
+    if dhcp_state != DHCP_STATE_IDLE:
+        printk1("[dhcp_renew] FAIL after T3 (state=%d expected IDLE=0)\n",
+                cast[uint64](dhcp_state))
+        dhcp_test_suppress_tx = 0
+        return
+
+    dhcp_test_suppress_tx = 0
+    printk0("[dhcp_renew] PASS\n")
