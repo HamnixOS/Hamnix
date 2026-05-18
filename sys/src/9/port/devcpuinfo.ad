@@ -1,0 +1,243 @@
+# sys/src/9/port/devcpuinfo.ad
+#
+# Layer 1 (Plan 9-shape) cpuinfo device — system-introspection cdev,
+# sibling to devtime.ad / devpid.ad / devmouse.ad. One read regenerates
+# a fresh text snapshot describing the host CPU and SMP count:
+#
+#   vendor: GenuineIntel
+#   family: 6
+#   model: 158
+#   brand: Intel(R) Core(TM) i7-8086K CPU @ 4.00GHz
+#   cpus_online: 2
+#   rdrand: yes
+#   rdseed: yes
+#
+# Stateless backend: FD_CPUINFO_MARK fds carry no per-fd slot. Every
+# read regenerates the entire blob, then copies up to `count` bytes
+# into the caller's buffer. Writes return -1 — read-only.
+#
+# Source of truth:
+#   - CPUID leaf 0   (EBX/EDX/ECX, 12 ASCII bytes) for vendor string
+#   - CPUID leaf 1   (EAX bits 8..11 = family, 4..7 = model;
+#                    ECX bit 30 = RDRAND) for family/model + RDRAND
+#   - CPUID leaf 7:0 (EBX bit 18 = RDSEED) for RDSEED
+#   - CPUID leaves 0x80000002/3/4 (EAX/EBX/ECX/EDX, 48 ASCII bytes)
+#     for the processor-brand string
+#   - arch/x86/kernel/smp.ad::get_cpus_online() for the SMP count
+#
+# The CPUID helper is reproduced locally (rather than imported from
+# devrandom.ad) so this file owns its own scratch globals — devrandom's
+# globals are already in flight whenever the entropy path runs and
+# we don't want to step on its values mid-keystream.
+#
+# See docs/native-api.md ("Reserved well-known paths" — /dev/cpuinfo
+# is the Plan 9-shape source-of-truth; a Linux-ABI /proc/cpuinfo
+# translation layer is tracked separately).
+
+from arch.x86.kernel.smp import get_cpus_online
+
+
+# --- CPUID scratch ---------------------------------------------------
+#
+# Module-local globals so the inline asm has somewhere RIP-relative
+# to spill EAX/EBX/ECX/EDX into. Distinct from devrandom.ad's globals
+# of the same shape — see header comment.
+
+ci_eax: uint64 = 0
+ci_ebx: uint64 = 0
+ci_ecx: uint64 = 0
+ci_edx: uint64 = 0
+
+
+def _ci_cpuid(leaf: uint64, subleaf: uint64):
+    # Issue CPUID with %eax=leaf, %ecx=subleaf; park EAX/EBX/ECX/EDX
+    # in ci_*. CPUID clobbers %rbx (callee-saved in SysV) — save and
+    # restore around the instruction so the surrounding Adder ABI
+    # stays intact.
+    ci_eax = leaf
+    ci_ecx = subleaf
+    asm_volatile("""
+        pushq %rbx
+        movq ci_eax(%rip), %rax
+        movq ci_ecx(%rip), %rcx
+        cpuid
+        movq %rax, ci_eax(%rip)
+        movq %rbx, ci_ebx(%rip)
+        movq %rcx, ci_ecx(%rip)
+        movq %rdx, ci_edx(%rip)
+        popq %rbx
+    """)
+
+
+# --- ASCII formatting helpers ----------------------------------------
+
+def _devcpuinfo_u64_to_dec(value: uint64, out: Ptr[uint8]) -> uint64:
+    # Reverse-fill stack then copy out top-down. Same shape as
+    # devtime.ad::_devtime_u64_to_dec. Returns bytes written.
+    if value == 0:
+        out[0] = 48
+        return 1
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    while value != 0:
+        digits[n] = cast[uint8](value % 10) + 48
+        value = value / 10
+        n = n + 1
+    written: uint64 = n
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    return written
+
+
+def _ci_emit_str(out: Ptr[uint8], pos: uint64, s: Ptr[uint8]) -> uint64:
+    # Append a NUL-terminated string to out[pos..], return new pos.
+    i: uint64 = 0
+    while s[i] != 0:
+        out[pos + i] = s[i]
+        i = i + 1
+    return pos + i
+
+
+def _ci_emit_reg_chars(out: Ptr[uint8], pos: uint64,
+                       reg: uint64) -> uint64:
+    # Emit 4 ASCII bytes from a CPUID register (low byte first). Stops
+    # early on a NUL — brand-string leaves 0x80000002/3/4 NUL-terminate
+    # the trailing register on shorter brand names.
+    j: uint64 = 0
+    while j < 4:
+        c: uint8 = cast[uint8]((reg >> (j * 8)) & 0xFF)
+        if c == 0:
+            return pos
+        out[pos] = c
+        pos = pos + 1
+        j = j + 1
+    return pos
+
+
+# --- snapshot builder -------------------------------------------------
+
+def _build_cpuinfo(out: Ptr[uint8], cap: uint64) -> uint64:
+    # Fill out[] with the cpuinfo text. Returns total bytes written
+    # (NOT including any NUL). Caller is expected to have provided a
+    # buffer of at least ~256 bytes — the worst case is ~140 bytes
+    # (vendor 12 + brand 48 + 6 header labels + decimal family/model
+    # + 2 yes/no flags + newlines).
+    pos: uint64 = 0
+
+    # ---- vendor: leaf 0, EBX/EDX/ECX (12 ASCII bytes in that order)
+    _ci_cpuid(0, 0)
+    vendor_ebx: uint64 = ci_ebx
+    vendor_edx: uint64 = ci_edx
+    vendor_ecx: uint64 = ci_ecx
+    max_basic_leaf: uint64 = ci_eax
+
+    pos = _ci_emit_str(out, pos, "vendor: ")
+    pos = _ci_emit_reg_chars(out, pos, vendor_ebx)
+    pos = _ci_emit_reg_chars(out, pos, vendor_edx)
+    pos = _ci_emit_reg_chars(out, pos, vendor_ecx)
+    out[pos] = 10                          # '\n'
+    pos = pos + 1
+
+    # ---- family / model + RDRAND: leaf 1
+    family: uint64 = 0
+    model:  uint64 = 0
+    has_rdrand: uint64 = 0
+    if max_basic_leaf >= 1:
+        _ci_cpuid(1, 0)
+        sig: uint64 = ci_eax
+        family = (sig >> 8) & 0xF
+        model  = (sig >> 4) & 0xF
+        # Extended family/model fields (Intel SDM Vol 2A, CPUID leaf 1)
+        # apply when base family == 0xF (family) or when base family is
+        # 0x6 / 0xF (model). For sane modern CPUs this gives us the
+        # canonical "family 6 / model 158" shape userland expects.
+        if family == 0xF:
+            family = family + ((sig >> 20) & 0xFF)
+        if family == 0x6 or family == 0xF:
+            model = model + (((sig >> 16) & 0xF) << 4)
+        if (ci_ecx & (cast[uint64](1) << 30)) != 0:
+            has_rdrand = 1
+
+    pos = _ci_emit_str(out, pos, "family: ")
+    pos = pos + _devcpuinfo_u64_to_dec(family, &out[pos])
+    out[pos] = 10
+    pos = pos + 1
+
+    pos = _ci_emit_str(out, pos, "model: ")
+    pos = pos + _devcpuinfo_u64_to_dec(model, &out[pos])
+    out[pos] = 10
+    pos = pos + 1
+
+    # ---- brand: leaves 0x80000002 / 3 / 4 (16 ASCII bytes each, EAX
+    # then EBX then ECX then EDX, NUL-terminating somewhere in the
+    # last leaf if the brand is shorter than 48 bytes).
+    _ci_cpuid(0x80000000, 0)
+    max_ext_leaf: uint64 = ci_eax
+    pos = _ci_emit_str(out, pos, "brand: ")
+    if max_ext_leaf >= 0x80000004:
+        leaf_n: uint64 = 0x80000002
+        while leaf_n <= 0x80000004:
+            _ci_cpuid(leaf_n, 0)
+            pos = _ci_emit_reg_chars(out, pos, ci_eax)
+            pos = _ci_emit_reg_chars(out, pos, ci_ebx)
+            pos = _ci_emit_reg_chars(out, pos, ci_ecx)
+            pos = _ci_emit_reg_chars(out, pos, ci_edx)
+            leaf_n = leaf_n + 1
+    out[pos] = 10
+    pos = pos + 1
+
+    # ---- cpus_online
+    pos = _ci_emit_str(out, pos, "cpus_online: ")
+    pos = pos + _devcpuinfo_u64_to_dec(get_cpus_online(), &out[pos])
+    out[pos] = 10
+    pos = pos + 1
+
+    # ---- rdrand / rdseed
+    pos = _ci_emit_str(out, pos, "rdrand: ")
+    if has_rdrand != 0:
+        pos = _ci_emit_str(out, pos, "yes\n")
+    else:
+        pos = _ci_emit_str(out, pos, "no\n")
+
+    has_rdseed: uint64 = 0
+    if max_basic_leaf >= 7:
+        _ci_cpuid(7, 0)
+        if (ci_ebx & (cast[uint64](1) << 18)) != 0:
+            has_rdseed = 1
+    pos = _ci_emit_str(out, pos, "rdseed: ")
+    if has_rdseed != 0:
+        pos = _ci_emit_str(out, pos, "yes\n")
+    else:
+        pos = _ci_emit_str(out, pos, "no\n")
+
+    return pos
+
+
+# --- public API -------------------------------------------------------
+
+def devcpuinfo_read(buf: Ptr[uint8], count: uint64) -> int64:
+    # Stateless snapshot. We synthesize into a 384-byte scratch on the
+    # caller's stack frame (worst-case ~140 bytes today, headroom for
+    # a future cache-size / clock-mhz field), then copy up to `count`
+    # bytes out. Like devtime / devpid, every read regenerates — no
+    # pos tracking, no incremental drain.
+    if count == 0:
+        return 0
+    scratch: Array[384, uint8]
+    n: uint64 = _build_cpuinfo(&scratch[0], 384)
+    take: uint64 = count
+    if take > n:
+        take = n
+    i: uint64 = 0
+    while i < take:
+        buf[i] = scratch[i]
+        i = i + 1
+    return cast[int64](take)
+
+
+def devcpuinfo_write(buf: Ptr[uint8], count: uint64) -> int64:
+    # /dev/cpuinfo is read-only. Mirrors devtime / devpid / devmouse.
+    return -1

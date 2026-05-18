@@ -370,6 +370,29 @@ it has to honour.
     to the corresponding `/dev/*` reads now that the fan-out has
     landed. Tracked separately so the migration row in
     `docs/native-api.md` can be ticked off per-syscall.
+  - ~~System-introspection cdevs `/dev/cpuinfo` + `/dev/meminfo`
+    shipped — Plan 9-shape source-of-truth for "what CPU am I on,
+    how much RAM is live". `sys/src/9/port/devcpuinfo.ad` reads
+    CPUID leaves 0/1/7:0/0x80000002..4 + `get_cpus_online()`;
+    `sys/src/9/port/devmeminfo.ad` reads memblock + page_alloc
+    accessors and emits Linux-shape kB lines so the eventual
+    Layer-2 `/proc/{cpuinfo,meminfo}` translation is a near-direct
+    byte copy. Follow-ups (separate commits):~~
+      * `/dev/uptime` — ASCII decimal seconds-since-boot (+
+        idle-seconds once we have an idle accounting field).
+      * `/dev/loadavg` — Linux-shape "1.00 1.00 1.00 1/N pid".
+        Needs a moving-average runqueue depth counter in
+        `kernel/sched/core.ad` first.
+      * `/dev/stat` — aggregate "cpu / intr / ctxt / btime /
+        processes" snapshot (mirror of `/proc/stat`). Reuses the
+        cpuinfo CPUID helpers + a new IRQ-count accessor in
+        `arch/x86/kernel/irq.ad`.
+      * Layer-2 `/proc/cpuinfo` + `/proc/meminfo` translators
+        that consume the same bytes via `linux_abi/`.
+      * Per-cache slab walker accessor in `mm/slab.ad` so
+        devmeminfo's `KmallocLive` line can show real
+        `sum(nr_inuse * object_size)` instead of the in-use-page
+        proxy it uses today.
 
 ## Kernel / L-track
 
