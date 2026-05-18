@@ -11,6 +11,18 @@
  *   1. Zero the kernel BSS (the Hamnix compiler places globals there).
  *   2. Call the Hamnix-emitted start_kernel().
  *   3. If start_kernel ever returns, halt the CPU.
+ *
+ * Direct UEFI boot path (M16.70):
+ *   Hamnix also ships a standalone PE/COFF EFI application built from
+ *   arch/x86/boot/efi_stub.S — a separate binary (build/hamnix-bootx64.efi)
+ *   that UEFI firmware launches directly from \EFI\BOOT\BOOTX64.EFI on
+ *   the ESP. That stub does NOT currently chain into start_kernel_asm_entry;
+ *   it prints a marker and halts. The full UEFI -> kernel handoff
+ *   (ELF-load the multiboot kernel image, then jump here in 64-bit mode
+ *   skipping the .code32 prologue in header.S) is a follow-up commit.
+ *   When it lands, this file gets a second entry point that bypasses
+ *   the BSS-zero loop (UEFI maps .bss as NOBITS, firmware already zeroed
+ *   it) and goes straight to `call start_kernel`.
  */
 
     .section .text, "ax"

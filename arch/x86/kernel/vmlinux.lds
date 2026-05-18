@@ -18,6 +18,25 @@
  * later switch to a higher-half mapping above 4 GiB, we'll need a true
  * 64-bit ELF and a different boot protocol.
  */
+
+/*
+ * RELATED: Hamnix also ships a separate UEFI PE/COFF entry binary,
+ * `build/hamnix-bootx64.efi`, built from arch/x86/boot/efi_stub.S with
+ * `ld -m i386pep --subsystem 10`. That file is what UEFI firmware
+ * launches from \EFI\BOOT\BOOTX64.EFI on the ESP; this linker script
+ * is NOT involved in producing it.
+ *
+ * Two outputs (one ELF for multiboot, one PE+ for UEFI) instead of a
+ * Linux-style hybrid: file offset 0 can be either `\x7fELF` or `MZ`,
+ * not both. See docs/BOOT.md for the full rationale.
+ *
+ * When the EFI stub gains a real kernel handoff (chain-load this ELF
+ * + jump to a new `start_kernel_efi_entry` in head_64.S that skips the
+ * .code32 prologue), the multiboot ELF this script produces will be
+ * loaded BY the EFI stub at runtime; we may at that point need a
+ * separate `.efi_entry` section to expose a 64-bit-only entry vector,
+ * or the EFI stub will compute it from the ELF symbol table.
+ */
 OUTPUT_FORMAT("elf32-i386")
 OUTPUT_ARCH(i386)
 ENTRY(_start)
