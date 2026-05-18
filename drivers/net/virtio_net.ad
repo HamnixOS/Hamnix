@@ -35,13 +35,17 @@
 
 from kernel.printk.printk import printk0, printk1, printk2
 from drivers.pci.pci import (
-    pci_find, pci_read_bar, pci_enable_io_and_master, PCI_BDF_NONE,
+    pci_find, pci_read_bar, pci_enable_io_and_master,
+    pci_config_read_byte, pci_bdf_bus, pci_bdf_dev, pci_bdf_fn,
+    PCI_BDF_NONE,
 )
 from drivers.virtio.virtio_pci import (
     virtio_reset, virtio_acknowledge, virtio_driver_ok,
     virtio_read_host_features, virtio_write_guest_features,
-    virtio_notify, VIRTIO_PCI_CONFIG,
+    virtio_notify, VIRTIO_PCI_CONFIG, VIRTIO_PCI_ISR,
 )
+from arch.x86.kernel.apic import ioapic_redirect
+from arch.x86.kernel.irq import register_irq_handler
 from mm.page_alloc import alloc_pages
 from mm.slab import kmalloc
 from drivers.net.eth import eth_rx, nd_mac
@@ -74,6 +78,23 @@ VQ_TX:                uint32 = 1
 # (mac is at offset 0 of that window for virtio-net).
 VNET_CFG_MAC_OFF:     uint32 = 0
 
+# PCI config-space offsets used by the IRQ wiring path.
+PCI_INTERRUPT_LINE:   uint32 = 0x3C
+PCI_INTERRUPT_PIN:    uint32 = 0x3D
+
+# CPU vector this driver claims for its INTx IRQ. The IDT runs vectors
+# 32..47 for legacy PIC IRQs and reserves the 48..71 band for IOAPIC-
+# routed PCI INTx (see arch/x86/kernel/idt.ad). 0x40 (64) is the
+# first slot in that band — virtio-net is the bring-up consumer; the
+# other drivers (AHCI / NVMe / e1000e / r8169) will claim 0x41..0x44
+# in follow-up commits.
+VNET_IRQ_VECTOR:      uint32 = 0x40
+
+# LAPIC ID to route the IRQ to. Always the BSP (id 0) for now — once
+# we have IRQ affinity / SMP IRQ steering, this becomes per-IRQ
+# policy.
+VNET_LAPIC_ID:        uint32 = 0
+
 
 # Per-virtqueue runtime state. Mirrors virtio_ring's VirtQueue but
 # stays local to this driver — we want a separate descriptor free-list
@@ -92,11 +113,13 @@ class VNetVQ:
 
 class VirtioNet:
     iobase:          uint32
+    irq_pin:         uint32                # IOAPIC pin we redirected
     rx:              VNetVQ
     tx:              VNetVQ
     rx_buf_addrs:    Array[8, uint64]    # NR_RX_BUFS slots
     mac:             Array[6, uint8]
     rx_packets:      uint64
+    irq_count:       uint64                # IRQs handled by virtio_net_irq_handler
 
 
 vnet_state: VirtioNet
@@ -254,6 +277,8 @@ def virtio_net_init() -> int32:
     iobase: uint32 = bar0_raw & 0xFFFFFFFC
     vnet_state.iobase = iobase
     vnet_state.rx_packets = 0
+    vnet_state.irq_count = 0
+    vnet_state.irq_pin = 0
     printk2("[virtio-net] bdf=%x iobase=%p\n",
             cast[uint64](bdf), cast[uint64](iobase))
 
@@ -294,8 +319,66 @@ def virtio_net_init() -> int32:
     virtio_driver_ok(iobase)
     virtio_notify(iobase, VQ_RX)
 
-    printk0("[virtio-net] init done; RX queue populated\n")
+    # M16.112: wire the IRQ. Read PCI INTERRUPT_PIN/INTERRUPT_LINE
+    # for diagnostic + to discover which IOAPIC redirection entry
+    # corresponds to this device's INTx. On QEMU's i440FX the
+    # virtio-net PCI device defaults to INTA (pin=1) and the firmware
+    # assigns INTERRUPT_LINE based on the slot — typically IRQ 11
+    # (IOAPIC pin 11). We program that pin to deliver our chosen CPU
+    # vector (0x40) to LAPIC id 0, then register the handler.
+    #
+    # If reading PCI returns 0 / 0xFF (uninitialised) we fall back to
+    # IOAPIC pin 11 — the QEMU default for virtio-net under i440FX.
+    bus: uint32 = pci_bdf_bus(bdf)
+    pdev: uint32 = pci_bdf_dev(bdf)
+    fn:  uint32 = pci_bdf_fn(bdf)
+    intx_pin:  uint32 = pci_config_read_byte(bus, pdev, fn,
+                                             PCI_INTERRUPT_PIN)
+    intx_line: uint32 = pci_config_read_byte(bus, pdev, fn,
+                                             PCI_INTERRUPT_LINE)
+    printk2("[virtio-net] PCI INTx pin=%d line=%d\n",
+            cast[uint64](intx_pin), cast[uint64](intx_line))
+    ioapic_pin: uint32 = intx_line
+    if intx_pin == 0 or intx_line == 0 or intx_line >= 24:
+        # Pin 0 means "no interrupt"; out-of-range line means firmware
+        # didn't program it. Use QEMU's documented default for
+        # virtio-net (IOAPIC pin 11).
+        ioapic_pin = 11
+        printk1("[virtio-net] PCI INTx line unreliable; using IOAPIC pin %d\n",
+                cast[uint64](ioapic_pin))
+    vnet_state.irq_pin = ioapic_pin
+    register_irq_handler(cast[uint64](VNET_IRQ_VECTOR),
+                         cast[uint64](&virtio_net_irq_handler))
+    ioapic_redirect(ioapic_pin, VNET_IRQ_VECTOR, VNET_LAPIC_ID)
+    printk1("[virtio-net] init done; RX queue populated; IRQ vec=0x%x\n",
+            cast[uint64](VNET_IRQ_VECTOR))
     return 0
+
+
+def virtio_net_irq_handler():
+    # IRQ context entry point. Runs with interrupts disabled (CPU did
+    # cli on gate entry). Read the device-level ISR to ack the wire
+    # interrupt — virtio's ISR is read-to-clear; the LAPIC EOI is
+    # handled by do_irq AFTER this returns. Then drain the RX ring
+    # the same way the polling path does. If the ISR is 0 the IRQ
+    # was either shared (another device on the same line) or
+    # spurious; we still drain because a packet may have arrived
+    # since the last ISR snapshot.
+    if vnet_state.iobase == 0:
+        return
+    isr: int32 = inb(cast[int32](vnet_state.iobase + cast[uint32](VIRTIO_PCI_ISR)))
+    vnet_state.irq_count = vnet_state.irq_count + 1
+    if (isr & 0x01) != 0:
+        # Queue interrupt — at least one virtqueue advanced.
+        virtio_net_poll()
+
+
+def virtio_net_irq_count() -> uint64:
+    return vnet_state.irq_count
+
+
+def virtio_net_irq_pin() -> uint32:
+    return vnet_state.irq_pin
 
 
 def _rx_handle_one(slot: uint16, length: uint32):

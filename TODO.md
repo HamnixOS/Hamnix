@@ -180,10 +180,43 @@ it has to honour.
 - ~~Bare-metal virtio-net PCI driver — shipped in M16.88. RX
   delivers real frames to `eth_rx()` via SLIRP-gateway ARP
   round-trip.~~
-- IOAPIC programming + real virtio-net IRQ handler — today the
-  driver is polled from the kernel init smoke test; without
-  IOAPIC routing of PCI INTx we can't take a real interrupt
-  yet, so `virtio_net_poll()` is the only RX path.
+- ~~IOAPIC programming + real virtio-net IRQ handler — shipped in
+  M16.112. `arch/x86/kernel/apic.ad` grew `ioapic_redirect(pin,
+  vector, lapic_id)` + lazy `_ioapic_init_once()`;
+  `arch/x86/kernel/irq.ad` grew a 256-slot `irq_handlers[]` table
+  with `register_irq_handler(vec, fn)` and per-vector dispatch in
+  `do_irq` that calls `lapic_send_eoi()` exactly once after the
+  handler returns. `drivers/net/virtio_net.ad` reads PCI
+  INTERRUPT_PIN / INTERRUPT_LINE, programs the IOAPIC redirection
+  entry for that pin to deliver CPU vector 0x40 to LAPIC id 0, and
+  registers `virtio_net_irq_handler` (reads VIRTIO_PCI_ISR to ack,
+  drains RX ring). `virtio_net_poll()` stays as the safety net for
+  the pre-sti smoke-test window. See `scripts/test_net_irq.sh`.~~
+- IOAPIC IRQ wiring follow-ups (one driver per row, all copy the
+  M16.112 virtio-net template):
+  - virtio-blk INTx — same 0x40-band claim shape, vectors 0x41+.
+  - AHCI INTx — uses one IRQ per HBA port; needs per-port pin
+    discovery via the AHCI capabilities + interrupt-status reg.
+  - NVMe MSI-X — replace polled CQ phase-bit drain with vector
+    table programming; needs MSI-X capability discovery (PCI
+    capability ID 0x11) which is the bigger lift mentioned below.
+  - e1000e INTx — `[e1000e]` driver already has the polled RX
+    drain helper; add ICR (Interrupt Cause Read) ack in the handler.
+  - r8169 INTx — same shape as e1000e; ack via IMR/ISR pair.
+  - PS/2 keyboard IRQ 1 — IOAPIC pin 1, edge-triggered active-high
+    (not the PCI level-low default). Needs `ioapic_redirect` to
+    learn a flags arg or a sibling `ioapic_redirect_isa` helper.
+- MSI-X for virtio-net — INTx is the M16.112 baseline; MSI-X is
+  better (per-queue vectors, no level-line sharing). Needs PCI
+  capability walking (cap ID 0x11), MSI-X table mapping (BAR-relative),
+  and per-vector LAPIC programming. Bigger lift but eliminates the
+  shared-INTx coordination headache for multi-queue devices.
+- Multi-IOAPIC systems — M16.112 hard-codes a single IOAPIC at
+  0xFEC00000. Large servers and NUMA boxes have one IOAPIC per
+  socket; the MADT (already parsed by `drivers/acpi/acpi.ad`)
+  carries the address + GSI base of each. Make `ioapic_redirect`
+  consult the MADT-cached IOAPIC list and pick the one whose GSI
+  range covers the requested pin.
 - ~~Fill in `eth_rx()` body — shipped in M16.90. Header length
   check, ethertype byte-swap, dispatch to `arp_rx`/`ip_rx`,
   drop with diagnostic on unknown type.~~

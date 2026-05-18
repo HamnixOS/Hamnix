@@ -30,9 +30,11 @@ irq_stub_\n:
     jmp   common_irq
     .endm
 
-    /* Legacy IRQs 0..15 → vectors 32..47. We expose stub indices
-     * 32..47 to match the vector numbering one-to-one, so a Hamnix
-     * caller doesn't have to add/subtract PIC_BASE_VECTOR. */
+    /* Legacy IRQs 0..15 → vectors 32..47. Vectors 48..71 form the
+     * "device IRQ band" used by IOAPIC-routed PCI INTx and (future)
+     * MSI/MSI-X handlers. virtio-net (M16.112) lives at vector 0x40
+     * (= 64). The stub indices match vector numbers one-to-one so a
+     * Hamnix caller doesn't have to add/subtract any base. */
     IRQ_STUB 32
     IRQ_STUB 33
     IRQ_STUB 34
@@ -49,6 +51,30 @@ irq_stub_\n:
     IRQ_STUB 45
     IRQ_STUB 46
     IRQ_STUB 47
+    IRQ_STUB 48
+    IRQ_STUB 49
+    IRQ_STUB 50
+    IRQ_STUB 51
+    IRQ_STUB 52
+    IRQ_STUB 53
+    IRQ_STUB 54
+    IRQ_STUB 55
+    IRQ_STUB 56
+    IRQ_STUB 57
+    IRQ_STUB 58
+    IRQ_STUB 59
+    IRQ_STUB 60
+    IRQ_STUB 61
+    IRQ_STUB 62
+    IRQ_STUB 63
+    IRQ_STUB 64
+    IRQ_STUB 65
+    IRQ_STUB 66
+    IRQ_STUB 67
+    IRQ_STUB 68
+    IRQ_STUB 69
+    IRQ_STUB 70
+    IRQ_STUB 71
 
 /* ---------- common IRQ dispatch ---------------------------------- */
     .align 16
@@ -109,15 +135,53 @@ irq_stub_table:
     .long irq_stub_45; .long 0
     .long irq_stub_46; .long 0
     .long irq_stub_47; .long 0
+    .long irq_stub_48; .long 0
+    .long irq_stub_49; .long 0
+    .long irq_stub_50; .long 0
+    .long irq_stub_51; .long 0
+    .long irq_stub_52; .long 0
+    .long irq_stub_53; .long 0
+    .long irq_stub_54; .long 0
+    .long irq_stub_55; .long 0
+    .long irq_stub_56; .long 0
+    .long irq_stub_57; .long 0
+    .long irq_stub_58; .long 0
+    .long irq_stub_59; .long 0
+    .long irq_stub_60; .long 0
+    .long irq_stub_61; .long 0
+    .long irq_stub_62; .long 0
+    .long irq_stub_63; .long 0
+    .long irq_stub_64; .long 0
+    .long irq_stub_65; .long 0
+    .long irq_stub_66; .long 0
+    .long irq_stub_67; .long 0
+    .long irq_stub_68; .long 0
+    .long irq_stub_69; .long 0
+    .long irq_stub_70; .long 0
+    .long irq_stub_71; .long 0
 
     .section .text, "ax"
     .align 16
     .globl get_irq_stub
 get_irq_stub:
-    /* %rdi = IRQ vector (32..47). Return irq_stub_table[vec-32]. */
+    /* %rdi = IRQ vector (32..71). Return irq_stub_table[vec-32]. */
     leaq irq_stub_table(%rip), %rax
     subq $32, %rdi
     movq (%rax, %rdi, 8), %rax
+    ret
+
+/* call_irq_handler: indirect tail-call into a Hamnix-registered IRQ
+ * handler function. Adder lacks first-class function pointers (see
+ * TODO.md "First-class function pointers") so the irq_handlers[]
+ * table stores raw uint64 addresses; this trampoline does the
+ * `call *%rax` the language can't currently emit cleanly. The
+ * handler takes no arguments and returns void.                      */
+    .align 16
+    .globl call_irq_handler
+call_irq_handler:
+    /* %rdi = handler function address. */
+    movq  %rdi, %rax
+    call  *%rax
     ret
 
 /* ---------- sti / cli wrappers ----------------------------------- *
