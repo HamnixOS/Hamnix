@@ -337,11 +337,27 @@ it has to honour.
   vfs_read/vfs_write, no per-fd kmalloc):
   - ~~`/dev/time` (r) — shipped in M16.95.~~
   - ~~`/dev/pid` (r) — shipped in M16.95.~~
-  - ~~`/dev/random` (r) — xorshift64 placeholder shipped in M16.95.~~
-    Upgrade path: detect RDRAND/RDSEED via CPUID, swap the
-    xorshift64 step for a chacha20 stream rekeyed off the CPU
-    hardware RNG. Comment in `devrandom.ad` marks the current
-    state as a placeholder.
+  - ~~`/dev/random` (r) — xorshift64 placeholder shipped in M16.95;
+    upgraded in M16.96 to ChaCha20 (RFC 8439) keyed off CPUID-
+    detected RDSEED (preferred) / RDRAND (fallback) / get_jiffies
+    (last resort), with a 4 KiB rekey epoch. Block function
+    verified against the RFC 8439 §2.3.2 test vector;
+    distribution verified by `tests/test_devrandom_chacha.ad` +
+    `scripts/test_devrandom_chacha.sh` (all 256 byte-buckets
+    non-zero over a 4 KiB sample, max/min ratio < 5x).~~
+    Follow-ups (separate commits):
+      * `/dev/urandom` non-blocking variant as a distinct cdev.
+        Today /dev/random is unconditionally non-blocking too —
+        we serve from the keystream regardless of estimated
+        entropy. The Linux-shape split only matters once a real
+        entropy estimator exists.
+      * `getrandom(2)` Linux ABI syscall — already lives at the
+        U21 site; should be re-pointed at `devrandom_read()` so
+        userland callers don't have to open /dev/random.
+      * Real entropy estimator. Today we have none; reads never
+        block. A simple "credit each rekey with 256 bits, drain
+        N bits per output byte" accounting + a blocking variant
+        for /dev/random would mirror Linux 4.x semantics.
   - `/dev/win/*` (Phase D) — windowing-server cdev family.
     `/dev/win/ctl` is the entry point: writes (NEWWIN, RESIZE,
     DESTROY, FOCUS) drive hamwd's window list; reads return

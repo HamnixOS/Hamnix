@@ -1,114 +1,398 @@
 # sys/src/9/port/devrandom.ad
 #
-# Layer 1 (Plan 9-shape) random device — CSPRNG-shaped /dev/random.
+# Layer 1 (Plan 9-shape) random device — cryptographic /dev/random.
 # Mirrors 9front's /sys/src/9/port/devrandom.c at minimum scope: one
-# read fills the caller's buffer with bytes from a kernel-side PRNG;
+# read fills the caller's buffer with bytes from a kernel-side CSPRNG;
 # writes mix new entropy into the state.
 #
-# CAVEAT — M16.95 placeholder: this is xorshift64, NOT a real CSPRNG.
-# It is deterministic given the seed, and seed quality is limited to
-# whatever get_jiffies() returns at first-read time (typically a few
-# thousand ticks since boot, ~13 bits of effective entropy). Adequate
-# for the busybox /dev/urandom fan-out — `mktemp`, `tar` random suffix,
-# /etc/ssh keygen-quality is NOT here yet — and adequate for the test
-# script's "is the byte stream varying?" sanity check.
+# M16.96: ChaCha20 (RFC 8439) keyed off CPU hardware RNG (RDSEED
+# preferred, RDRAND fallback, get_jiffies last resort). Replaces the
+# M16.95 xorshift64 placeholder. The VFS contract
+# (vfs_open("/dev/random") -> FD_RANDOM_MARK -> devrandom_read) is
+# unchanged; only the body of devrandom_read changed.
 #
-# Roadmap: M16.96 (or whenever RDRAND/RDSEED detection lands) will
-# replace the xorshift64 with a chacha20 stream keyed off the CPU
-# hardware RNG and reseeded periodically. The VFS contract here
-# (vfs_open("/dev/random") → FD_RANDOM_MARK → devrandom_read) is
-# stable; only the body of devrandom_read changes.
+# State quantum: every 4096 bytes (64 ChaCha20 blocks) we rekey from
+# RDSEED/RDRAND by XOR-mixing 32 fresh bytes into the key field
+# (state words 4..11) and resetting the counter word (state[12]).
+# This bounds the damage from a (hypothetical) state-recovery attack
+# to the previous 4 KiB of output.
 #
-# Why lazy-seed (init/main.ad off-limits this commit): the DHCP agent
-# is editing init/main.ad concurrently. We can't add a devrandom_init
-# call from start_kernel without colliding. Workaround: seeded_yet
-# flag, seeded on first read using get_jiffies() as a cheap entropy
-# proxy.
+# Lazy seed: init/main.ad does not call devrandom_init() yet (kept
+# off-limits by parallel agents this milestone). seeded_yet flag
+# triggers a full seed on the first read or write — same lazy-init
+# pattern M16.95 used, with stronger entropy now.
 #
 # Stateless backend per-fd: FD_RANDOM_MARK carries no slot, no
-# kmalloc, no refcount. State lives module-global (devrandom_state) so all
-# /dev/random fds across all tasks share one stream. Writes XOR
-# their bytes into devrandom_state's low lane — the Plan 9 model is "write
-# = add entropy", and a simple XOR-mix is fine for a non-crypto
-# placeholder. Hash-mixing follows when the chacha20 backend lands.
+# kmalloc, no refcount. State lives module-global so all /dev/random
+# fds across all tasks share one keystream. Writes XOR caller bytes
+# into the nonce field (state words 13..15) — a poor-man's "add
+# entropy" path; the proper hash-mix would land alongside a real
+# entropy accounting subsystem (out of scope for this commit).
+#
+# RFC 8439 constants ("expand 32-byte k") — these prime state[0..3]
+# and are stable across all ChaCha20 instances.
 
 from arch.x86.kernel.time import get_jiffies
 
-# Module-global PRNG state. Non-zero by construction after the first
-# read (seeded_yet flag toggles, and the xorshift64 cycle excludes 0).
-devrandom_state:  uint64 = 0
-seeded_yet:  uint32 = 0
+# -- module-global state -----------------------------------------------------
+
+# ChaCha20 16-word state.
+#   state[0..3]   : constants "expand 32-byte k"
+#   state[4..11]  : 256-bit key
+#   state[12]     : 32-bit block counter
+#   state[13..15] : 96-bit nonce
+chacha_state: Array[16, uint32]
+
+# 64-byte keystream block. devrandom_read serves bytes from here,
+# regenerating on exhaustion.
+chacha_keystream: Array[64, uint8]
+
+# Position into chacha_keystream (0..63). When == 64, next byte read
+# triggers a fresh block generation.
+chacha_pos: uint64 = 64
+
+# Block counter for periodic rekey. Decrements every block; on 0, we
+# pull fresh RDSEED/RDRAND bytes, XOR-mix into the key field, and
+# reset the counter. 64 blocks * 64 bytes = 4 KiB per epoch.
+chacha_blocks_until_rekey: uint64 = 0
+
+# Lazy-init guard. seeded_yet == 0 => devrandom_read/_write trigger
+# _maybe_seed() before producing output.
+seeded_yet: uint32 = 0
+
+# CPUID feature bits, populated by _detect_hwrng() on first seed.
+#   hwrng_features bit 0 = RDRAND available (CPUID leaf 1 ECX bit 30)
+#   hwrng_features bit 1 = RDSEED available (CPUID leaf 7:0 EBX bit 18)
+hwrng_features: uint64 = 0
+
+# Scratch slot for inline-asm RDRAND/RDSEED/CPUID output. The
+# zero-operand asm_volatile intrinsic cannot return a value to the
+# caller via %rax (the next Adder statement re-loads %rax for its own
+# purposes), so the inline asm parks its result in this RIP-relative
+# global and the wrapping Adder function returns it.
+hwrng_scratch: uint64 = 0
+# CF state from the most recent RDRAND/RDSEED. 1 = success, 0 = failure.
+hwrng_cf: uint64 = 0
+# CPUID outputs (one global per output register).
+cpuid_eax: uint64 = 0
+cpuid_ebx: uint64 = 0
+cpuid_ecx: uint64 = 0
+cpuid_edx: uint64 = 0
+
+
+# -- CPUID / RDRAND / RDSEED wrappers ----------------------------------------
+
+def _cpuid(leaf: uint64, subleaf: uint64):
+    # Issue CPUID with %eax=leaf, %ecx=subleaf; park EAX/EBX/ECX/EDX
+    # in module-globals so callers can read them back. CPUID clobbers
+    # all four GPRs, including %rbx (callee-saved in SysV) — we save
+    # and restore it ourselves so we never break the surrounding
+    # Adder ABI.
+    cpuid_eax = leaf
+    cpuid_ecx = subleaf
+    asm_volatile("""
+        pushq %rbx
+        movq cpuid_eax(%rip), %rax
+        movq cpuid_ecx(%rip), %rcx
+        cpuid
+        movq %rax, cpuid_eax(%rip)
+        movq %rbx, cpuid_ebx(%rip)
+        movq %rcx, cpuid_ecx(%rip)
+        movq %rdx, cpuid_edx(%rip)
+        popq %rbx
+    """)
+
+
+def _detect_hwrng():
+    # CPUID leaf 1: ECX bit 30 == RDRAND.
+    _cpuid(1, 0)
+    features: uint64 = 0
+    if (cpuid_ecx & (cast[uint64](1) << 30)) != 0:
+        features = features | 1
+    # CPUID leaf 7 subleaf 0: EBX bit 18 == RDSEED.
+    _cpuid(7, 0)
+    if (cpuid_ebx & (cast[uint64](1) << 18)) != 0:
+        features = features | 2
+    hwrng_features = features
+
+
+def _rdrand64() -> uint64:
+    # Issue RDRAND %rax up to 10 times until CF=1; park result in
+    # hwrng_scratch and CF in hwrng_cf. Returns 0 on persistent
+    # failure (caller falls back to jiffies entropy).
+    if (hwrng_features & 1) == 0:
+        return 0
+    hwrng_cf = 0
+    hwrng_scratch = 0
+    asm_volatile("""
+        movq $10, %rcx
+    .Lrdrand_retry:
+        rdrand %rax
+        jc .Lrdrand_ok
+        loop .Lrdrand_retry
+        jmp .Lrdrand_done
+    .Lrdrand_ok:
+        movq %rax, hwrng_scratch(%rip)
+        movq $1, hwrng_cf(%rip)
+    .Lrdrand_done:
+    """)
+    if hwrng_cf == 0:
+        return 0
+    return hwrng_scratch
+
+
+def _rdseed64() -> uint64:
+    # Same as _rdrand64() but issues RDSEED. RDSEED is the preferred
+    # entropy source — it returns conditioned full-entropy bits,
+    # vs. RDRAND's CSPRNG-buffered output. Up to 10 retries.
+    if (hwrng_features & 2) == 0:
+        return 0
+    hwrng_cf = 0
+    hwrng_scratch = 0
+    asm_volatile("""
+        movq $10, %rcx
+    .Lrdseed_retry:
+        rdseed %rax
+        jc .Lrdseed_ok
+        loop .Lrdseed_retry
+        jmp .Lrdseed_done
+    .Lrdseed_ok:
+        movq %rax, hwrng_scratch(%rip)
+        movq $1, hwrng_cf(%rip)
+    .Lrdseed_done:
+    """)
+    if hwrng_cf == 0:
+        return 0
+    return hwrng_scratch
+
+
+def _hw_entropy64(counter: uint64) -> uint64:
+    # Best available 64-bit entropy. Prefer RDSEED, fall back to
+    # RDRAND, fall back to (get_jiffies() ^ counter ^ golden-ratio).
+    # The last fallback gives the test environment something to chew
+    # on when the CPU exposes no hardware RNG (very old microarchs);
+    # entropy is then weak but the keystream is still ChaCha20.
+    v: uint64 = _rdseed64()
+    if v != 0:
+        return v
+    v = _rdrand64()
+    if v != 0:
+        return v
+    return get_jiffies() ^ counter ^ 0x9E3779B97F4A7C15
+
+
+# -- ChaCha20 block function -------------------------------------------------
+
+# Rotate-left a 32-bit value by n bits (1..31). Returns a uint32-shape
+# value (high 32 bits are masked off).
+def _rotl32(v: uint32, n: uint64) -> uint32:
+    x: uint64 = cast[uint64](v) & 0xFFFFFFFF
+    lo: uint64 = (x << n) & 0xFFFFFFFF
+    hi: uint64 = x >> (32 - n)
+    return cast[uint32](lo | hi)
+
+
+def _chacha_quarter_round(a_idx: uint64, b_idx: uint64,
+                          c_idx: uint64, d_idx: uint64):
+    # In-place quarter-round on chacha_state[a,b,c,d]. RFC 8439 §2.1.
+    a: uint64 = cast[uint64](chacha_state[a_idx]) & 0xFFFFFFFF
+    b: uint64 = cast[uint64](chacha_state[b_idx]) & 0xFFFFFFFF
+    c: uint64 = cast[uint64](chacha_state[c_idx]) & 0xFFFFFFFF
+    d: uint64 = cast[uint64](chacha_state[d_idx]) & 0xFFFFFFFF
+
+    a = (a + b) & 0xFFFFFFFF
+    d = d ^ a
+    d = cast[uint64](_rotl32(cast[uint32](d), 16))
+
+    c = (c + d) & 0xFFFFFFFF
+    b = b ^ c
+    b = cast[uint64](_rotl32(cast[uint32](b), 12))
+
+    a = (a + b) & 0xFFFFFFFF
+    d = d ^ a
+    d = cast[uint64](_rotl32(cast[uint32](d), 8))
+
+    c = (c + d) & 0xFFFFFFFF
+    b = b ^ c
+    b = cast[uint64](_rotl32(cast[uint32](b), 7))
+
+    chacha_state[a_idx] = cast[uint32](a)
+    chacha_state[b_idx] = cast[uint32](b)
+    chacha_state[c_idx] = cast[uint32](c)
+    chacha_state[d_idx] = cast[uint32](d)
+
+
+def _chacha_block():
+    # Generate one 64-byte keystream block into chacha_keystream:
+    #   working = state
+    #   for 10 rounds: column-round + diagonal-round
+    #   working = working + state (mod 2^32)
+    #   serialise working as little-endian uint32s
+    # Then increment the block counter.
+    #
+    # We perform the 20 rounds in-place on chacha_state, accumulating
+    # the initial state in `orig[]` so we can add it back at the end.
+    orig: Array[16, uint32]
+    i: uint64 = 0
+    while i < 16:
+        orig[i] = chacha_state[i]
+        i = i + 1
+
+    r: uint64 = 0
+    while r < 10:
+        # Column rounds.
+        _chacha_quarter_round(0, 4, 8,  12)
+        _chacha_quarter_round(1, 5, 9,  13)
+        _chacha_quarter_round(2, 6, 10, 14)
+        _chacha_quarter_round(3, 7, 11, 15)
+        # Diagonal rounds.
+        _chacha_quarter_round(0, 5, 10, 15)
+        _chacha_quarter_round(1, 6, 11, 12)
+        _chacha_quarter_round(2, 7, 8,  13)
+        _chacha_quarter_round(3, 4, 9,  14)
+        r = r + 1
+
+    # working += orig (mod 2^32), then serialise little-endian into
+    # chacha_keystream[].
+    i = 0
+    while i < 16:
+        sum_w: uint64 = ((cast[uint64](chacha_state[i]) & 0xFFFFFFFF)
+                         + (cast[uint64](orig[i]) & 0xFFFFFFFF)) & 0xFFFFFFFF
+        base: uint64 = i * 4
+        chacha_keystream[base + 0] = cast[uint8](sum_w & 0xFF)
+        chacha_keystream[base + 1] = cast[uint8]((sum_w >> 8) & 0xFF)
+        chacha_keystream[base + 2] = cast[uint8]((sum_w >> 16) & 0xFF)
+        chacha_keystream[base + 3] = cast[uint8]((sum_w >> 24) & 0xFF)
+        # Restore state[i] to orig[i] — we want the NEXT block to
+        # come from the original state (constants + key + nonce)
+        # with just the counter advanced.
+        chacha_state[i] = orig[i]
+        i = i + 1
+
+    # Advance the 32-bit block counter (state[12]). Wraps every 2^32
+    # blocks = 256 GiB, which we never approach in practice but we
+    # don't paper over the wrap either.
+    counter: uint64 = (cast[uint64](chacha_state[12]) + 1) & 0xFFFFFFFF
+    chacha_state[12] = cast[uint32](counter)
+    chacha_pos = 0
+
+
+def _chacha_rekey():
+    # Pull 32 fresh bytes from RDSEED/RDRAND and XOR-mix them into
+    # the key field (state[4..11]); reset the counter (state[12]).
+    # Called from _maybe_seed (first seed) and every 64 blocks
+    # thereafter from _refill_keystream_if_needed.
+    i: uint64 = 0
+    while i < 8:
+        word: uint64 = _hw_entropy64(i)
+        # Mix the low 32 bits into state[4+i]; mix the high 32 into
+        # state[4 + ((i+4) mod 8)] for an extra splash.
+        lo: uint32 = cast[uint32](word & 0xFFFFFFFF)
+        hi: uint32 = cast[uint32]((word >> 32) & 0xFFFFFFFF)
+        chacha_state[4 + i] = chacha_state[4 + i] ^ lo
+        target: uint64 = 4 + ((i + 4) & 7)
+        chacha_state[target] = chacha_state[target] ^ hi
+        i = i + 1
+    chacha_state[12] = 0
+    chacha_blocks_until_rekey = 64
 
 
 def _maybe_seed():
-    # Lazy seed: only run on the first read or write that observes
-    # seeded_yet == 0. Mixes get_jiffies() in. If jiffies happen to
-    # be zero (read at boot before the PIT has ticked even once), we
-    # force the state to a non-zero constant so xorshift64 has
-    # something to cycle on — xorshift64 with state 0 is stuck at 0.
+    # First-touch initialiser. Sets constants, pulls 256 bits of key
+    # entropy from RDSEED/RDRAND, seeds the nonce from get_jiffies(),
+    # and primes the first keystream block. Idempotent after first call.
     if seeded_yet != 0:
         return
-    seed: uint64 = get_jiffies()
-    # Mix in a constant so cold-boot (jiffies < 1) still seeds the
-    # state to a useful value. 0x9E3779B97F4A7C15 is the golden-ratio
-    # multiplicative constant — same one Linux's hash_64() uses; here
-    # it's just a high-entropy bit pattern to avoid an all-zero seed.
-    devrandom_state = seed ^ 0x9E3779B97F4A7C15
-    if devrandom_state == 0:
-        devrandom_state = 0x9E3779B97F4A7C15
+
+    # CPUID feature detection.
+    _detect_hwrng()
+
+    # state[0..3] = "expand 32-byte k" (sigma).
+    chacha_state[0] = 0x61707865
+    chacha_state[1] = 0x3320646e
+    chacha_state[2] = 0x79622d32
+    chacha_state[3] = 0x6b206574
+
+    # state[4..11] = 256-bit key from RDSEED/RDRAND/jiffies fallback.
+    i: uint64 = 0
+    while i < 8:
+        word: uint64 = _hw_entropy64(i)
+        chacha_state[4 + i] = cast[uint32](word & 0xFFFFFFFF)
+        i = i + 1
+
+    # state[12] = block counter (start at 0 per RFC 8439).
+    chacha_state[12] = 0
+
+    # state[13..15] = 96-bit nonce. Seed from get_jiffies() XORed
+    # with a fresh hwrng word for early-boot variance even when
+    # hwrng is unavailable.
+    nonce_seed: uint64 = _hw_entropy64(0xA5) ^ get_jiffies()
+    chacha_state[13] = cast[uint32](nonce_seed & 0xFFFFFFFF)
+    chacha_state[14] = cast[uint32]((nonce_seed >> 32) & 0xFFFFFFFF)
+    chacha_state[15] = cast[uint32](_hw_entropy64(0xC3) & 0xFFFFFFFF)
+
+    chacha_blocks_until_rekey = 64
+    # Force first read to generate a fresh block.
+    chacha_pos = 64
     seeded_yet = 1
 
 
-def _xorshift64_step() -> uint64:
-    # Marsaglia xorshift64 with the standard 13/7/17 triple. Cycle
-    # length 2^64 - 1 (every non-zero state is visited exactly once).
-    # The low byte of the post-step state is what we hand out per
-    # output byte. Cheap (3 shifts + 3 XORs) and good enough as
-    # placeholder entropy for the test suite.
-    x: uint64 = devrandom_state
-    x = x ^ (x << 13)
-    x = x ^ (x >> 7)
-    x = x ^ (x << 17)
-    devrandom_state = x
-    return x
+def _refill_keystream_if_needed():
+    # Called per output byte. When the current block is drained
+    # (chacha_pos == 64), generate the next block; when 64 blocks
+    # have elapsed, rekey first.
+    if chacha_pos < 64:
+        return
+    if chacha_blocks_until_rekey == 0:
+        _chacha_rekey()
+    _chacha_block()
+    chacha_blocks_until_rekey = chacha_blocks_until_rekey - 1
 
+
+# -- public API (stable since M16.95) ----------------------------------------
 
 def devrandom_init(seed: uint64):
     # External seeding entrypoint (not called from init/main.ad this
-    # commit — DHCP agent is editing it. Kept exported so the Phase D
-    # boot sequence can wire it once init/main.ad becomes editable
-    # again). XOR-mix the seed into devrandom_state.
-    devrandom_state = devrandom_state ^ seed
-    if devrandom_state == 0:
-        devrandom_state = 0x9E3779B97F4A7C15
-    seeded_yet = 1
+    # commit; kept exported so the Phase D boot sequence can wire it
+    # once init/main.ad becomes editable again). XOR-mixes the seed
+    # into the nonce field. Triggers the full _maybe_seed init on
+    # first call if not yet seeded.
+    _maybe_seed()
+    chacha_state[13] = chacha_state[13] ^ cast[uint32](seed & 0xFFFFFFFF)
+    chacha_state[14] = chacha_state[14] ^ cast[uint32]((seed >> 32) & 0xFFFFFFFF)
 
 
 def devrandom_read(buf: Ptr[uint8], count: uint64) -> int64:
-    # Per-byte stream. We could pull 8 bytes per xorshift step for
-    # speed, but byte-at-a-time keeps the implementation small and
-    # the test's "16 bytes varied, not all zero/all FF" check
-    # equally happy.
+    # Per-byte stream out of the ChaCha20 keystream. Hot path: serve
+    # from chacha_keystream[chacha_pos] until exhausted, then refill.
+    # Rekey every 64 blocks (4 KiB) from RDSEED/RDRAND.
     _maybe_seed()
     i: uint64 = 0
     while i < count:
-        next_state: uint64 = _xorshift64_step()
-        buf[i] = cast[uint8](next_state & 0xFF)
+        _refill_keystream_if_needed()
+        buf[i] = chacha_keystream[chacha_pos]
+        chacha_pos = chacha_pos + 1
         i = i + 1
     return cast[int64](count)
 
 
 def devrandom_write(buf: Ptr[uint8], count: uint64) -> int64:
     # "Add entropy" path. Mirrors 9front's devrandom write semantics
-    # at the smallest scope: XOR each input byte into the low lane of
-    # devrandom_state. This is NOT a hash; do not rely on it to undo bias
-    # in user-supplied entropy. The chacha20 reseed path (future)
-    # will replace this with a proper key update.
+    # at the smallest scope: XOR caller bytes into the nonce field of
+    # the ChaCha20 state. The proper hash-mix lands when an entropy
+    # accounting subsystem exists; this is the M16.95-compatible
+    # minimum that lets `echo something > /dev/random` perturb the
+    # stream without breaking the read path.
     _maybe_seed()
     i: uint64 = 0
     while i < count:
-        devrandom_state = devrandom_state ^ cast[uint64](buf[i])
+        # Cycle the input bytes through state[13..15] (the nonce).
+        # Each input byte XORs into one of 3 nonce words at a byte
+        # offset, so a long write spreads its entropy across the
+        # whole 96-bit nonce instead of stomping a single byte slot.
+        target_word: uint64 = 13 + ((i / 4) % 3)
+        shift: uint64 = (i % 4) * 8
+        mixin: uint32 = cast[uint32](cast[uint64](buf[i]) << shift)
+        chacha_state[target_word] = chacha_state[target_word] ^ mixin
         i = i + 1
-    if devrandom_state == 0:
-        devrandom_state = 0x9E3779B97F4A7C15
     return cast[int64](count)
