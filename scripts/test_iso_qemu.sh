@@ -26,11 +26,20 @@
 #      Why two markers and not one: marker (a) ONLY proves the PE/COFF
 #      load worked. Marker (b) proves the full EFI exit handshake
 #      (GetMemoryMap + ExitBootServices + MapKey-staleness retry)
-#      went through. The stub halts after marker (b) — the full
-#      kernel handoff (loading the multiboot ELF + jumping to
-#      start_kernel) is a follow-up commit, blocked on either an
-#      in-stub Simple-File-System loader or merging the two
-#      binaries into one image so the stub can reach kernel symbols.
+#      went through. The stub halts after marker (b).
+#
+#      The full kernel handoff (the post-handshake `jmp
+#      _x86_start_after_loader`) is blocked on a stack of constraints
+#      that the post-M16.124 diagnosis spells out — see
+#      arch/x86/boot/efi_stub.S's header comment (blockers B1..B4)
+#      and docs/BOOT.md's Known-limitations section. The short
+#      version: a single binary cannot be both elf32-i386 (every
+#      `qemu -kernel` test asserts this) AND PE32+ at offset 0 of
+#      the same file. Two real escape paths are sketched in the
+#      header comment (UEFI-side ELF loader in the stub, OR a
+#      bzImage-style flat output); neither has shipped yet, so the
+#      test continues to assert (a)+(b) and the BIOS half remains
+#      the only path that actually reaches a Hamnix banner.
 #
 # Each pass runs for up to ISO_BOOT_TIMEOUT seconds (default 30). The
 # kernel (BIOS) or the EFI stub (UEFI) both halt the CPU after printing

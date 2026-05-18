@@ -30,6 +30,37 @@
  * Linux-style hybrid: file offset 0 can be either `\x7fELF` or `MZ`,
  * not both. See docs/BOOT.md for the full rationale.
  *
+ * The "make the kernel ELF itself the EFI executable" plan
+ * (M16.111+M16.120 follow-up) is blocked beyond the offset-0 magic
+ * conflict by section-layout constraints this very linker script
+ * encodes. Specifically:
+ *
+ *   - `.ap_trampoline` ships with VMA=0x8000 (where SIPI delivers an
+ *     AP) and LMA=__ap_trampoline_load (just past .data, ~0x448000+).
+ *     ELF cleanly expresses VMA != LMA via PT_LOAD's p_paddr vs
+ *     p_vaddr. PE/COFF collapses load address to a single value per
+ *     section, so an `objcopy --target=efi-app-x86_64` conversion of
+ *     this ELF either drops the section, places it at 0x8000 (collides
+ *     with firmware-reserved low memory on every modern UEFI), or
+ *     forces a non-zero ImageBase that conflicts with .ap_trampoline's
+ *     0x8000 VMA ("section below image base").
+ *   - `.pgtables` (NOLOAD) carries pml4/pdpt/pd referenced by CR3 the
+ *     moment paging comes up. PE/COFF NOBITS sections work the same
+ *     way, but the dependency on CR3 being set before .bss-zero
+ *     ordering interacts badly with UEFI image relocation: if firmware
+ *     moves the image by `delta`, .pgtables moves too but the CR3
+ *     value written into it by header.S's 32-bit prologue references
+ *     the pre-relocation address. The kernel has no .reloc table and
+ *     no runtime relocator.
+ *
+ * Both items would need to be re-engineered if a future UEFI handoff
+ * tries to convert THIS ELF to a PE32+ EFI app. Neither is hard
+ * individually; together they make "one source ELF -> two viable
+ * boot formats" expensive enough that the cleaner answer is what
+ * Linux uses — a separate flat bzImage-shape binary with its own
+ * (PE+multiboot) prelude. The docs/BOOT.md Known-limitations
+ * section walks through both paths the cron may try.
+ *
  * When the EFI stub gains a real kernel handoff (chain-load this ELF
  * + jump to a new `start_kernel_efi_entry` in head_64.S that skips the
  * .code32 prologue), the multiboot ELF this script produces will be

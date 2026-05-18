@@ -35,26 +35,111 @@
  *      ONLY fires when the ExitBootServices handshake succeeded.
  *   7. Halt forever (cli; hlt; jmp $-).
  *
- * Why halt after ExitBootServices instead of jumping to start_kernel:
- *   The kernel ELF is currently a SEPARATE binary from this stub
- *   (build/hamnix-vmlinux.elf vs. build/hamnix-bootx64.efi); UEFI
- *   loaded only the stub, so the kernel's .text isn't in memory.
- *   Completing the boot would require either (a) using UEFI's Simple
- *   File System Protocol BEFORE ExitBootServices to read the ELF off
- *   the ESP, parse it, and copy PT_LOADs to their LMA; or (b) merging
- *   the two binaries into one hybrid file (PE header + multiboot1
- *   header at the same offset 0). Both are larger commits. This
- *   commit's win is that the EFI side of the handshake now actually
- *   completes — proven by the second marker firing after firmware has
- *   relinquished control. head_64.S grew a `_x86_start_after_loader`
- *   symbol pre-positioning the merge point for that follow-up.
+ * Why halt after ExitBootServices instead of jumping to start_kernel
+ * (post-M16.124 honest diagnosis):
+ *
+ *   The naive plan "merge the stub + kernel into one hybrid binary so
+ *   the stub can jmp _x86_start_after_loader" — which M16.120 was
+ *   structured to enable — turns out to be blocked by FOUR concrete
+ *   constraints, not a single one. Each is independently fatal to the
+ *   "one file is both formats" framing the M16.111/M16.120 wave
+ *   pursued. Recorded here so the next attempt doesn't rediscover them
+ *   the hard way.
+ *
+ *   (B1) FILE-MAGIC CONFLICT AT OFFSET 0. UEFI's PE/COFF loader
+ *        verifies bytes [0..2) == "MZ" (0x4D 0x5A) before doing
+ *        anything else (IMAGE_DOS_HEADER). The kernel ELF starts
+ *        with "\x7fELF" (0x7F 0x45). The first two bytes can be
+ *        either pattern but not both. Linux's bzImage starts with
+ *        "MZ" precisely because bzImage is NOT an ELF — it's a flat
+ *        binary built by `objcopy -O binary` over a wrapper that
+ *        encapsulates vmlinux. Linux's vmlinux (the ELF) is NOT what
+ *        UEFI loads. The mental model "Linux's kernel ELF is a
+ *        hybrid" is therefore inaccurate; only bzImage is.
+ *
+ *   (B2) LMA/VMA SPLIT IN .ap_trampoline. arch/x86/kernel/vmlinux.lds
+ *        places .ap_trampoline at VMA = 0x8000 (where SIPI delivers
+ *        APs) but LMA = ~0x448100 (just after .data). The kernel
+ *        image carries the trampoline bytes at the LMA and the BSP's
+ *        smp.ad memcpys them to 0x8000 before sending SIPI. The
+ *        ELF program-header machinery cleanly expresses this
+ *        VMA != LMA split. PE/COFF has no equivalent: every section's
+ *        VMA == its load address. Converting the kernel ELF through
+ *        `objcopy --target=efi-app-x86_64` collapses both addresses
+ *        to a single value; UEFI then either loads .ap_trampoline at
+ *        0x8000 (which conflicts with BIOS/EBDA / firmware-reserved
+ *        low memory under modern OVMF) or refuses to load that
+ *        section at all.
+ *
+ *   (B3) IMAGE-BASE RELOCATION. The kernel is non-PIC: page tables,
+ *        the GDT pointer, percpu offsets, smp.ad's hardcoded
+ *        trampoline VMA 0x8000, and many internal pointers are
+ *        absolute. UEFI is free to relocate any PE image whose
+ *        ImageBase the firmware can't honour (page 0 is firmware-
+ *        reserved on every modern UEFI implementation, so an
+ *        ImageBase=0 conversion is ALWAYS relocated). The kernel ELF
+ *        has no .reloc section, no recorded relocations, and no
+ *        runtime relocator — any firmware-relocation silently
+ *        corrupts every absolute reference. PE32+ image-base of
+ *        0x100000 (matching the multiboot LMA) fails objcopy with
+ *        "section below image base" because .ap_trampoline lives at
+ *        0x8000.
+ *
+ *   (B4) GDT / CR3 HANDOFF FROM FIRMWARE. UEFI hands control to the
+ *        EFI entry with firmware's GDT loaded, firmware's IDT
+ *        installed, paging on under firmware's page tables, and
+ *        firmware-defined segment selectors live in CS/SS/DS/ES.
+ *        `_x86_start_after_loader` was pre-positioned by M16.120 on
+ *        the assumption that the loader (multiboot1 header.S OR the
+ *        EFI stub) had already loaded the kernel's gdt64 and set
+ *        CR3 = pml4. Doing this in efi_stub.S after ExitBootServices
+ *        is straightforward (lgdt + ljmp + mov-cr3-pml4 + 5
+ *        instructions) but only works WHEN THE KERNEL CODE IS
+ *        ACTUALLY IN MEMORY — which it isn't on the UEFI path
+ *        because of (B1).
+ *
+ *   Net: the architectural framing "single hybrid binary" cannot be
+ *   reconciled with elf32-i386 (the format ALL of arch/x86/* assumes,
+ *   from `as --32` through the linker script through every test
+ *   harness's `qemu-system-x86_64 -kernel hamnix-vmlinux.elf` —
+ *   ~100 scripts under scripts/test_*.sh that strictly require an
+ *   ELF input file). The two paths that DO close the boot end-to-end:
+ *
+ *   PATH A: Make efi_stub.S a UEFI-side ELF loader.
+ *     Keep two binaries, but the .efi stub uses UEFI's Simple File
+ *     System Protocol BEFORE ExitBootServices to open
+ *     `\hamnix-vmlinux.elf` from the ESP, read it, parse PHdrs, copy
+ *     PT_LOADs to their LMAs (matching what multiboot1 already does
+ *     on the BIOS side), then ExitBootServices and jmp
+ *     `_x86_start_after_loader`. ~300 lines of asm + a small ELF
+ *     parser in the .efi binary. Both binaries ship on the ESP; the
+ *     .efi file remains a tiny ~30 KB loader and the kernel ELF is
+ *     the actual payload.
+ *
+ *   PATH B: Add a bzImage-style flat-binary output.
+ *     Add a third build artifact alongside the elf32-i386 kernel:
+ *     `build/hamnix.bin` — a flat blob produced by
+ *     `objcopy -O binary` over a fresh PE+multiboot+(optionally Linux
+ *     x86 boot header) prelude. The flat binary starts with "MZ", has
+ *     the multiboot1 magic somewhere in the first 8 KiB, and is what
+ *     ships in the ESP as BOOTX64.EFI. The dev-loop kernel ELF and
+ *     test scripts continue to use the elf32-i386 output. This is
+ *     what Linux does (bzImage vs vmlinux); it's larger surgery but
+ *     decouples the UEFI binary's format from the kernel's ELF.
+ *
+ *   This commit took neither path — it just records the diagnosis
+ *   honestly so the next agent doesn't waste a cycle reattempting the
+ *   "one file" merge. The EFI stub still halts at the post-handoff
+ *   marker; the BIOS / multiboot1 path continues to boot to userland
+ *   unaffected.
  *
  * Build:
  *   The Hamnix compiler still emits ELF for the multiboot1 kernel image.
  *   This file is assembled with `as --64` (true 64-bit elf64-x86-64) and
  *   linked with `ld -m i386pep --subsystem 10` to produce a true PE32+
  *   EFI_APPLICATION. See scripts/build_iso.sh for the exact invocation.
- *   Two separate output binaries — see docs/BOOT.md for why.
+ *   Two separate output binaries by necessity — the blockers above are
+ *   why, not a choice we'd unmake if we had time.
  */
 
     .code64
@@ -231,17 +316,22 @@ efi_main:
     leaq    efi_post_handoff_msg(%rip), %rsi
     call    efi_serial_puts
 
-    /* Next steps the follow-up commit takes from here (not in this
-     * commit):
+    /* The follow-up bring-up that would reach start_kernel:
      *   - Load our own GDT via `lgdt` (firmware's GDT is no longer
      *     guaranteed valid post-ExitBootServices on every firmware;
      *     we currently rely on it only for halt).
      *   - Set CR3 to a PML4 we built ourselves.
      *   - jmp _x86_start_after_loader (defined in head_64.S).
      *
-     * Today we halt. The next bring-up step is gated on linking the
-     * EFI stub and the kernel ELF into one image so the stub can
-     * reach kernel symbols. */
+     * All three are mechanically trivial once the kernel's symbols
+     * are reachable from this binary. They aren't — see the four
+     * (B1)..(B4) blockers in the header comment block above; the
+     * short version is that elf32-i386 (every test's `-kernel` arg)
+     * is the same file UEFI would need to be PE32+, and the same
+     * file cannot have both "\x7fELF" and "MZ" at offset 0. The
+     * cron's two real options out (UEFI-side ELF loader in this
+     * stub, OR a bzImage-style flat binary) are documented in the
+     * header too. This stub halts here until one of those lands. */
 .Lefi_halt:
     cli
     hlt

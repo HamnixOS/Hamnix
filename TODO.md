@@ -777,15 +777,35 @@ it has to honour.
   step; `boot_via_efi` + EFI-fallback memblock window
   (arch/x86/kernel/e820.ad) are the kernel-side preposition.~~
 - UEFI stub → start_kernel chain. The EFI handshake is now done;
-  the stub halts after ExitBootServices. Reaching `start_kernel()`
-  needs either (a) using UEFI Simple File System Protocol from
-  inside the stub BEFORE ExitBootServices to read the multiboot
-  kernel ELF off the ESP, parse it, and copy PT_LOADs to their
-  LMA, OR (b) merging the stub + kernel ELF into one hybrid
-  binary (PE header + multiboot1 header at offset 0). Either
-  path then `jmp _x86_start_after_loader`. Sets `boot_via_efi`
-  via `set_boot_via_efi()` from kernel-side before the jump so
-  e820_init() takes the fallback branch.
+  the stub halts after ExitBootServices. The original
+  "merge stub + kernel ELF into one hybrid binary" plan was
+  abandoned at M16.124 — see blockers B1..B4 in
+  `arch/x86/boot/efi_stub.S`'s header comment and the
+  "Why two binaries..." section of `docs/BOOT.md`. Summary:
+  `\x7fELF` and `MZ` can't share file offset 0; `.ap_trampoline`'s
+  LMA/VMA split doesn't survive PE/COFF conversion; the kernel
+  has no `.reloc` table for image-base relocation; and GDT/CR3
+  handoff from firmware is moot when the kernel code isn't in
+  memory. Two real paths forward:
+  - **PATH A: UEFI-side ELF loader in `efi_stub.S`.** Stub uses
+    UEFI's Simple File System Protocol BEFORE ExitBootServices
+    to open `\hamnix-vmlinux.elf` off the ESP, parse PHdrs, copy
+    PT_LOADs to their LMA (same shape as multiboot1's loader on
+    the BIOS side), then ExitBootServices + `jmp
+    _x86_start_after_loader`. ~300 lines of asm + an ELF parser
+    in the stub. Kernel ELF format stays untouched (every
+    `qemu -kernel` test keeps working).
+  - **PATH B: Add a bzImage-style flat-binary output.** Sibling
+    artifact alongside the kernel ELF: `build/hamnix.bin`,
+    produced by `objcopy -O binary` over a hand-written
+    PE+multiboot+(optionally Linux x86 boot header) prelude. The
+    flat binary starts with "MZ", carries the multiboot1 magic
+    in the first 8 KiB, ships as ESP `BOOTX64.EFI`. Larger
+    surgery but cleanly decouples the UEFI binary's format from
+    the kernel ELF.
+  Either path sets `boot_via_efi` via `set_boot_via_efi()` from
+  kernel-side before the jump so e820_init() takes the fallback
+  branch.
 - Parse the real EFI memory map instead of the hardcoded
   2..240 MiB fallback installed by `e820_init()` when
   `boot_via_efi != 0`. The stub already saves a 16 KiB

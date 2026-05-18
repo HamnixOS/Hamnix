@@ -108,11 +108,23 @@ fi
 # ---- Build the native UEFI PE/COFF stub -----------------------------------
 #
 # The stub is a tiny standalone PE32+ EFI_APPLICATION assembled from
-# arch/x86/boot/efi_stub.S. It currently does only what is needed to prove
-# the direct-UEFI boot path: stash the EFI handle + system table, print
-# "[hamnix] EFI entry reached" over COM1, then halt. The full kernel
-# handoff (ELF-load + jump to start_kernel) is a follow-up commit. See
-# docs/BOOT.md for the rationale around the two-output split.
+# arch/x86/boot/efi_stub.S. It currently does the EFI handshake (stash
+# the EFI handle + system table, print "[hamnix] EFI entry reached",
+# call GetMemoryMap + ExitBootServices, print "[hamnix] post-EFI
+# handoff complete") and then halts.
+#
+# Why it still halts instead of `jmp _x86_start_after_loader` (which is
+# all the rest of the wiring is structured around): the M16.111+M16.120
+# wave assumed the kernel ELF and this stub could be merged into ONE
+# hybrid binary so the stub could reach kernel symbols. The detailed
+# diagnosis (post-M16.124) is in efi_stub.S's header comment — four
+# independent constraints (B1..B4) make "one file is both ELF AND PE+"
+# infeasible without restructuring the kernel image format. The cron's
+# two real options out (PATH A: UEFI-side ELF loader in this stub;
+# PATH B: bzImage-style flat-binary output) are also documented there
+# and in docs/BOOT.md's Known-limitations section. Neither was picked
+# this round — this commit only updates the documentation to reflect
+# the actual blocker so the next agent doesn't reattempt the merge.
 #
 # Build invocation, dissected:
 #   as --64 -o efi_stub.o efi_stub.S

@@ -26,13 +26,22 @@
  * Why expose the common symbol explicitly:
  *   The EFI direct-boot path (arch/x86/boot/efi_stub.S) needs a
  *   stable kernel-side hook to merge into the post-loader-specific
- *   work without re-doing the BSS-zero loop. Today the EFI stub is
- *   a separate binary that halts after ExitBootServices; when a
- *   follow-up commit merges the EFI stub + kernel ELF into one
- *   image (so the stub can reach kernel symbols), that merge will
- *   `jmp _x86_start_after_loader` from the post-ExitBootServices
- *   site in efi_stub.S. This refactor pre-positions the symbol so
- *   the merge commit is small and one-sided.
+ *   work without re-doing the BSS-zero loop. The hook is here so
+ *   that whichever path eventually unblocks UEFI-to-start_kernel
+ *   handoff can use a one-line `jmp _x86_start_after_loader` rather
+ *   than duplicating the post-loader plumbing.
+ *
+ *   Post-M16.124 honest diagnosis: the M16.120-era plan
+ *   "merge the EFI stub + kernel ELF into one image" turns out to
+ *   be blocked by a stack of independent constraints. The full
+ *   diagnosis is recorded in arch/x86/boot/efi_stub.S's header
+ *   comment (blockers B1..B4 — file-magic conflict, LMA/VMA split
+ *   in .ap_trampoline, image-base relocation, GDT handoff). Two
+ *   real paths forward (a UEFI-side ELF loader baked into the .efi
+ *   stub, OR a separate bzImage-style flat binary) are documented
+ *   there. _x86_start_after_loader remains the right join point
+ *   either way — neither path needs the BSS-zero loop, both arrive
+ *   in long mode with a valid kernel GDT.
  *
  * Responsibilities of the common path:
  *   1. Call the Hamnix-emitted start_kernel().

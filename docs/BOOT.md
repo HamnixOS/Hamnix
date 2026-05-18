@@ -72,7 +72,9 @@ As of M16.70 the BIOS and UEFI paths run **different code on the way in**:
 
 Linux's bzImage starts with an MZ stub at file offset 0 and is recognised
 as BOTH a multiboot kernel (by GRUB) AND a PE/COFF EFI application (by
-firmware). That works because bzImage is a flat blob, not an ELF.
+firmware). That works because **bzImage is a flat blob, not an ELF** —
+Linux's vmlinux (the ELF) is wrapped inside bzImage, but vmlinux itself
+is not what UEFI loads.
 
 The Hamnix kernel binary is an ELF (compiled with `--target=x86_64-bare-metal`
 through the Adder compiler + `ld -m elf_i386`). An ELF starts with
@@ -90,6 +92,63 @@ one. When the EFI stub grows the ability to chain-load the kernel ELF
 from the ISO9660 filesystem, it'll do so the same way GRUB-EFI does
 today (UEFI Simple File System Protocol → read ELF → copy PT_LOADs →
 jump to entry), but without a 200 KiB GRUB-EFI dependency.
+
+#### Why the "merge them into one hybrid" plan was abandoned
+
+The M16.111 + M16.120 wave was structured around an explicit followup:
+merge `efi_stub.S` and the kernel ELF into a single hybrid binary so
+the stub could reach kernel symbols, then `jmp _x86_start_after_loader`
+after `ExitBootServices`. The post-M16.124 honest diagnosis is that
+this is blocked by FOUR independent constraints — recorded in
+`arch/x86/boot/efi_stub.S`'s header comment as blockers B1..B4 and
+summarised here:
+
+- **B1: File-magic conflict at offset 0.** `\x7fELF` and `MZ` can't
+  coexist as the first two bytes of the same file. Linux's bzImage
+  works around this by being a flat binary; vmlinux (the ELF) is
+  NOT what Linux's UEFI loader executes.
+- **B2: LMA/VMA split in `.ap_trampoline`.** The AP trampoline lives
+  at VMA=0x8000 (SIPI delivery target) with LMA next to `.data`
+  (~0x448100). PE/COFF collapses VMA/LMA to a single value per
+  section, so converting through `objcopy --target=efi-app-x86_64`
+  either drops the section or places it in firmware-reserved low
+  memory.
+- **B3: Image-base relocation.** The kernel is non-PIC (page tables,
+  GDT pointer, percpu offsets all use absolute addresses). UEFI
+  always relocates a PE image whose `ImageBase` is page 0; the
+  kernel has no `.reloc` table or runtime relocator, so any
+  relocation silently corrupts everything.
+- **B4: GDT/CR3 handoff from firmware.** Doing this in the stub is
+  easy in isolation, but only useful if the kernel code is in
+  memory — which it isn't on the UEFI path because of B1.
+
+#### Two real paths forward
+
+The blockers above rule out the "single file" framing but leave two
+straightforward paths to a working UEFI boot:
+
+- **PATH A: UEFI-side ELF loader in `efi_stub.S`.** Keep two binaries
+  on the ESP. The .efi stub uses UEFI's Simple File System Protocol
+  BEFORE `ExitBootServices` to open `\hamnix-vmlinux.elf`, parse its
+  program headers, copy PT_LOADs to their LMAs (matching multiboot1's
+  loader behaviour on the BIOS side), then `ExitBootServices` and
+  `jmp _x86_start_after_loader`. ~300 lines of asm + a small ELF
+  parser in the .efi binary. The kernel ELF format stays untouched
+  — every test script's `qemu -kernel` keeps working unchanged.
+
+- **PATH B: Add a bzImage-style flat-binary output.** Sibling artifact
+  alongside the kernel ELF: `build/hamnix.bin`, produced by
+  `objcopy -O binary` over a hand-written PE+multiboot+(optionally
+  Linux x86 boot header) prelude. The flat binary starts with "MZ",
+  carries the multiboot1 magic somewhere in the first 8 KiB, and is
+  what ships in the ESP as `BOOTX64.EFI`. The dev-loop kernel ELF
+  and test scripts continue to use the elf32-i386 output. This is
+  what Linux does (bzImage vs vmlinux) — larger surgery, but
+  cleanly decouples the UEFI binary's format from the kernel's ELF.
+
+Neither was implemented this round. The stub continues to halt at the
+post-handoff marker; the BIOS / multiboot1 path continues to boot to
+userland unaffected.
 
 ### What the build script does to make UEFI direct
 
@@ -138,9 +197,11 @@ This runs the ISO under QEMU twice:
 
 The two passes look for different banners because the EFI stub
 currently halts after `ExitBootServices()` rather than reaching
-`start_kernel()`. When the stub grows real kernel handoff (load the
-multiboot ELF off the ESP, or merge into one hybrid binary), the
-UEFI banner check will move to `Hamnix kernel booting` too.
+`start_kernel()`. The merge-into-one-binary plan was abandoned at
+M16.124 (blockers B1..B4 in `arch/x86/boot/efi_stub.S`); the live
+options are PATH A (UEFI-side ELF loader baked into the stub) or
+PATH B (bzImage-style flat-binary output). Once one of them lands,
+the UEFI banner check will move to `Hamnix kernel booting` too.
 
 If you only have OVMF locally, set `SKIP_UEFI=1` to skip that pass.
 
@@ -190,21 +251,23 @@ When testing on real hardware:
 
 ## 4. Known limitations / next steps
 
-- **UEFI stub doesn't yet chain to start_kernel**. The native PE
-  entry path is wired up and the EFI handoff handshake
-  (GetMemoryMap + ExitBootServices) now completes; the stub halts
-  after firmware releases control. Reaching `start_kernel()` from
-  there requires either (a) using UEFI's Simple File System
-  Protocol from inside the stub BEFORE `ExitBootServices` to read
-  the multiboot kernel ELF off the ESP, parse it, and copy
-  PT_LOADs to their LMA, OR (b) merging the stub + kernel ELF
-  into one hybrid binary (PE header + multiboot1 header at the
-  same offset 0). The kernel-side join point already exists:
-  `_x86_start_after_loader` in `arch/x86/kernel/head_64.S` is
-  what the post-handoff path will `jmp` to. `boot_via_efi` +
-  the EFI-fallback memblock window in `arch/x86/kernel/e820.ad`
-  are pre-positioned for the EFI path to skip the multiboot mmap
-  parser.
+- **UEFI stub doesn't yet chain to `start_kernel`** — and the original
+  "merge stub + kernel ELF into a hybrid file" plan turns out to be
+  blocked. The native PE entry path is wired up, the EFI handoff
+  handshake (`GetMemoryMap` + `ExitBootServices`) completes, and the
+  stub halts after firmware releases control. Post-M16.124 diagnosis
+  is recorded in `arch/x86/boot/efi_stub.S`'s header comment
+  (blockers B1..B4 — file-magic conflict at offset 0, LMA/VMA split
+  in `.ap_trampoline`, image-base relocation without a `.reloc`
+  table, and GDT/CR3 handoff from firmware). Two real paths forward
+  are PATH A (UEFI-side ELF loader baked into the stub) and PATH B
+  (bzImage-style flat-binary output alongside the kernel ELF) — see
+  the "Why two binaries..." section above for the full sketch.
+  Whichever path lands, the kernel-side join point already exists:
+  `_x86_start_after_loader` in `arch/x86/kernel/head_64.S`, with
+  `boot_via_efi` + the EFI-fallback memblock window in
+  `arch/x86/kernel/e820.ad` pre-positioned for the EFI path to skip
+  the multiboot mmap parser.
 - **No graphical console under direct UEFI boot**. The EFI stub
   doesn't yet program GOP or hand the framebuffer info to the
   kernel; once it chain-loads start_kernel, it'll need to populate
