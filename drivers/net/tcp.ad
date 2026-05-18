@@ -1,14 +1,13 @@
 # drivers/net/tcp.ad
 #
-# Minimal TCP/IPv4 client (active-open only). Implements just enough
-# of RFC 793 / 9293 to complete a three-way handshake, exchange a few
-# segments, and tear down cleanly via FIN. This is the gating step
-# before HTTP — apt fetches over HTTP, HTTP runs on TCP, and without
-# TCP nothing above the IP layer that the user actually cares about
-# works.
+# Minimal TCP/IPv4 stack — both active-open (client) and passive-open
+# (server). Implements just enough of RFC 793 / 9293 to complete a
+# three-way handshake either direction, exchange a few segments, and
+# tear down cleanly via FIN. With LISTEN/SYN_RCVD wired (M16.124) an
+# in-kernel sshd-shaped server can accept inbound connections; the
+# active-open path remains the one apt/HTTP rides on.
 #
-# State machine (active-open client only — LISTEN / SYN-RCVD are out
-# of scope; passive-open lands when sshd needs it):
+# Active-open state machine (client):
 #
 #   CLOSED --tcp_connect()--> SYN_SENT
 #       --recv SYN-ACK / send ACK--> ESTABLISHED
@@ -17,12 +16,25 @@
 #       --recv ACK--> FIN_WAIT_2
 #       --recv FIN / send ACK--> TIME_WAIT --(skip 2*MSL)--> CLOSED
 #
-# Connection table: static 8-entry TCB array. Ephemeral source ports
-# 50000..50007 (one per slot, so the slot index is also the port
-# offset; saves a separate allocator). M16.108 added per-segment
-# retransmission (RFC 6298 RTO + exponential backoff, capped at 5
-# retries). Still no congestion control beyond cwnd=1 segment, no
-# SACK, no timestamps, no window scaling.
+# Passive-open state machine (server, M16.124):
+#
+#   CLOSED --tcp_listen()--> LISTEN
+#       --recv SYN / alloc new TCB + send SYN-ACK--> SYN_RCVD (new slot)
+#       --recv ACK--> ESTABLISHED (new slot)
+#       --tcp_accept() returns the ESTABLISHED slot--
+#   LISTEN slot stays in LISTEN — keeps accepting further SYNs until
+#   tcp_close()'d.
+#
+# Connection table: static 8-entry TCB array. With a single listener
+# slot allocated, the remaining 7 slots are available for accepted
+# connections — the practical cap until per-listener accept queues land.
+# Ephemeral source ports 50000..50007 for active-open (one per slot,
+# so the slot index is also the port offset; saves a separate
+# allocator); passive-open uses the listener's bound port for the
+# local port across all accepted slots.
+# M16.109 added per-segment retransmission (RFC 6298 RTO + exponential
+# backoff, capped at 5 retries). Still no congestion control beyond
+# cwnd=1 segment, no SACK, no timestamps, no window scaling.
 #
 # Checksum uses the IPv4 pseudo-header (src_ip, dst_ip, 0, proto=6,
 # tcp_length) prepended to the TCP header + payload — same 1's
@@ -311,18 +323,37 @@ def _tcp_find_slot(remote_b0: uint8, remote_b1: uint8,
                    local_port: uint16) -> int32:
     # Match incoming segment against the connection table by
     # (remote_ip, remote_port, local_port). Returns slot index or
-    # -1 on miss.
+    # -1 on miss. LISTEN-state slots are intentionally NOT matched
+    # here — they're a wildcard on (remote_ip, remote_port) and need
+    # a separate lookup (_tcp_find_listener) that the SYN-arrival
+    # path in tcp_rx falls back to on a miss.
     i: uint64 = 0
     while i < TCP_NUM_SLOTS:
         if tcp_slot_state[i] != TCP_CLOSED:
-            if tcp_slot_remote_p[i] == remote_port:
-                if tcp_slot_local_p[i] == local_port:
-                    base: uint64 = i * 4
-                    if tcp_slot_remote_ip[base + 0] == remote_b0:
-                        if tcp_slot_remote_ip[base + 1] == remote_b1:
-                            if tcp_slot_remote_ip[base + 2] == remote_b2:
-                                if tcp_slot_remote_ip[base + 3] == remote_b3:
-                                    return cast[int32](i)
+            if tcp_slot_state[i] != TCP_LISTEN:
+                if tcp_slot_remote_p[i] == remote_port:
+                    if tcp_slot_local_p[i] == local_port:
+                        base: uint64 = i * 4
+                        if tcp_slot_remote_ip[base + 0] == remote_b0:
+                            if tcp_slot_remote_ip[base + 1] == remote_b1:
+                                if tcp_slot_remote_ip[base + 2] == remote_b2:
+                                    if tcp_slot_remote_ip[base + 3] == remote_b3:
+                                        return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _tcp_find_listener(local_port: uint16) -> int32:
+    # Search the TCB table for a LISTEN slot bound to `local_port`.
+    # Wildcards on remote (a LISTEN slot accepts SYNs from any
+    # remote_ip / remote_port). Returns slot index or -1 on miss.
+    # Called from tcp_rx after a _tcp_find_slot miss when the
+    # incoming segment might be a passive-open SYN.
+    i: uint64 = 0
+    while i < TCP_NUM_SLOTS:
+        if tcp_slot_state[i] == TCP_LISTEN:
+            if tcp_slot_local_p[i] == local_port:
+                return cast[int32](i)
         i = i + 1
     return -1
 
@@ -625,10 +656,72 @@ def tcp_rx(payload: Ptr[uint8], length: uint64,
     slot_signed: int32 = _tcp_find_slot(src_b0, src_b1, src_b2, src_b3,
                                         src_port, dst_port)
     if slot_signed < 0:
-        # No matching TCB. If the segment has SYN we'd LISTEN/accept;
-        # we don't do passive-open, so we just drop with a diagnostic.
-        # Sending a RST would be technically correct (RFC 793 §3.4)
-        # but generates noise during smoke tests.
+        # No exact 4-tuple match. If this is a SYN aimed at a port
+        # we're listening on (M16.124 passive-open path), allocate a
+        # fresh TCB in SYN_RCVD and send the SYN-ACK. Otherwise drop
+        # with a diagnostic. Sending a RST would be technically
+        # correct (RFC 793 §3.4) but generates noise during smoke
+        # tests and confuses port-scanner-style probes.
+        if (flags & TCP_SYN) != 0:
+            listener_signed: int32 = _tcp_find_listener(dst_port)
+            if listener_signed >= 0:
+                new_signed: int32 = _tcp_alloc_slot()
+                if new_signed < 0:
+                    printk1("[tcp] LISTEN port=%d but TCB table full\n",
+                            cast[uint64](dst_port))
+                    return
+                new_slot: uint64 = cast[uint64](new_signed)
+                isn_srv: uint32 = _tcp_isn_next()
+                # Populate the new TCB. seq32 is the peer's ISN; the
+                # SYN consumes one sequence number so rcv_nxt is
+                # peer_seq + 1. Our snd_nxt starts at ISN; the SYN-ACK
+                # we send carries seq=ISN and bumps snd_nxt to ISN+1
+                # afterwards (mirrors the active-open SYN dance).
+                tcp_slot_state[new_slot] = TCP_SYN_RECV
+                tcp_slot_local_p[new_slot] = dst_port
+                tcp_slot_remote_p[new_slot] = src_port
+                nb: uint64 = new_slot * 4
+                tcp_slot_remote_ip[nb + 0] = src_b0
+                tcp_slot_remote_ip[nb + 1] = src_b1
+                tcp_slot_remote_ip[nb + 2] = src_b2
+                tcp_slot_remote_ip[nb + 3] = src_b3
+                tcp_slot_snd_nxt[new_slot] = isn_srv
+                tcp_slot_snd_una[new_slot] = isn_srv
+                tcp_slot_rcv_nxt[new_slot] = seq32 + 1
+                tcp_slot_rx_len[new_slot] = 0
+                tcp_slot_saw_fin[new_slot] = 0
+                tcp_slot_last_act[new_slot] = get_jiffies()
+                # Reset retransmission state for the new slot.
+                tcp_slot_unacked[new_slot] = 0
+                tcp_slot_retries[new_slot] = 0
+                tcp_slot_rto[new_slot] = TCP_RTO_INITIAL
+                tcp_slot_have_rtt[new_slot] = 0
+                tcp_slot_srtt[new_slot] = 0
+                tcp_slot_rttvar[new_slot] = 0
+                tcp_slot_pend_flags[new_slot] = 0
+                tcp_slot_pend_len[new_slot] = 0
+                tcp_slot_pend_seq[new_slot] = 0
+                printk2("[tcp] SYN -> listen port=%d new slot=%d\n",
+                        cast[uint64](dst_port), new_slot)
+                # Emit SYN-ACK. seq=isn_srv (snd_nxt), ack=rcv_nxt
+                # (peer's seq+1). _tcp_send_segment reads both from
+                # the slot, so we just set them up above and call.
+                rc_sa: int32 = _tcp_build_and_send(new_slot,
+                                                  TCP_SYN | TCP_ACK,
+                                                  cast[Ptr[uint8]](0), 0)
+                # SYN consumes one byte of sequence space on the wire;
+                # advance snd_nxt past it so the expected client ACK
+                # is ISN+1.
+                tcp_slot_snd_nxt[new_slot] = isn_srv + 1
+                if rc_sa == 0:
+                    printk2("[tcp] SYN-ACK -> %d.%d.",
+                            cast[uint64](src_b0), cast[uint64](src_b1))
+                    printk2("%d.%d slot=", cast[uint64](src_b2),
+                            cast[uint64](src_b3))
+                    printk1("%d\n", new_slot)
+                else:
+                    printk0("[tcp] SYN-ACK send failed\n")
+                return
         printk2("[tcp] no TCB for src_port=%d dst_port=%d\n",
                 cast[uint64](src_port), cast[uint64](dst_port))
         return
@@ -648,6 +741,33 @@ def tcp_rx(payload: Ptr[uint8], length: uint64,
         cast[uint64](payload) + payload_off)
 
     state: uint32 = tcp_slot_state[slot]
+
+    # SYN_RCVD: we sent SYN-ACK after a LISTEN match; expect the
+    # peer's bare ACK acknowledging our ISN+1 to finish the
+    # passive-open three-way handshake. M16.124 path. If the ACK
+    # also carries data we hand it to the ESTABLISHED block by
+    # falling through after the transition.
+    if state == TCP_SYN_RECV:
+        if (flags & TCP_ACK) != 0:
+            expected_ack_sr: uint32 = tcp_slot_snd_nxt[slot]
+            if ack32 == expected_ack_sr:
+                tcp_slot_snd_una[slot] = ack32
+                _tcp_clear_pending(slot, ack32)
+                tcp_slot_state[slot] = TCP_ESTABLISHED
+                printk1("[tcp] accepted slot=%d -> ESTABLISHED\n", slot)
+                state = TCP_ESTABLISHED
+                # Fall through to the ESTABLISHED block below in case
+                # this ACK carried data or a FIN tail.
+            else:
+                printk2("[tcp] SYN_RCVD bad ack=%x exp=%x\n",
+                        cast[uint64](ack32),
+                        cast[uint64](expected_ack_sr))
+                return
+        else:
+            # No ACK bit set — drop. Spec also allows a duplicate SYN
+            # to retrigger the SYN-ACK; we just rely on the peer's
+            # own retransmission to resend.
+            return
 
     # SYN_SENT: expect SYN+ACK acknowledging our ISN+1. On match we
     # bump rcv_nxt past the peer's SYN, set snd_una = ack, and
@@ -1025,6 +1145,130 @@ def tcp_close(slot_signed: int32) -> int32:
     printk1("[tcp] close timeout on slot=%d (forcing CLOSED)\n", slot)
     tcp_slot_state[slot] = TCP_CLOSED
     return 0
+
+
+def tcp_listen(local_port: uint16) -> int32:
+    # Passive open. Allocate a TCB, mark it LISTEN, bind it to
+    # `local_port`. Returns the listener slot index, or -1 if no
+    # slot was free (all 8 already used by active connections or
+    # other listeners). The listener slot is a wildcard on
+    # (remote_ip, remote_port); incoming SYNs at local_port spawn
+    # new TCBs in SYN_RCVD via tcp_rx.
+    #
+    # Sizing caveat: with TCP_NUM_SLOTS=8, one listener + 7
+    # connections is the practical cap. A real socket layer would
+    # decouple the accept queue from the active-connection table;
+    # that's deferred until Phase F's /net/tcp/clone shape.
+    slot_signed: int32 = _tcp_alloc_slot()
+    if slot_signed < 0:
+        printk1("[tcp] listen port=%d: no free slot\n",
+                cast[uint64](local_port))
+        return -1
+    slot: uint64 = cast[uint64](slot_signed)
+    tcp_slot_state[slot] = TCP_LISTEN
+    tcp_slot_local_p[slot] = local_port
+    tcp_slot_remote_p[slot] = 0
+    base: uint64 = slot * 4
+    tcp_slot_remote_ip[base + 0] = 0
+    tcp_slot_remote_ip[base + 1] = 0
+    tcp_slot_remote_ip[base + 2] = 0
+    tcp_slot_remote_ip[base + 3] = 0
+    tcp_slot_snd_nxt[slot] = 0
+    tcp_slot_snd_una[slot] = 0
+    tcp_slot_rcv_nxt[slot] = 0
+    tcp_slot_rx_len[slot] = 0
+    tcp_slot_saw_fin[slot] = 0
+    tcp_slot_unacked[slot] = 0
+    tcp_slot_retries[slot] = 0
+    tcp_slot_pend_flags[slot] = 0
+    tcp_slot_pend_len[slot] = 0
+    tcp_slot_pend_seq[slot] = 0
+    printk1("[tcp] listening on port=%d\n", cast[uint64](local_port))
+    return cast[int32](slot)
+
+
+def tcp_accept(listener_slot: int32, timeout_jiffies: uint64) -> int32:
+    # Block (well, poll) until a connection completes the three-way
+    # handshake on the same local_port as `listener_slot` and
+    # transitions to ESTABLISHED. Returns the *new* slot index, or
+    # -1 on timeout / bad listener.
+    #
+    # Walk strategy: scan all non-listener TCBs every poll cycle for
+    # one whose state == ESTABLISHED and local_port matches the
+    # listener's bound port. First match wins. Already-accepted
+    # connections drop out of the scan once the caller stashes the
+    # slot (we don't try to remember "already returned" — re-calling
+    # tcp_accept while a previously-accepted slot is still
+    # ESTABLISHED would return that same slot, which is a caller bug;
+    # the docs say "call accept once per listener-spawned slot").
+    if listener_slot < 0:
+        return -1
+    lslot: uint64 = cast[uint64](listener_slot)
+    if lslot >= TCP_NUM_SLOTS:
+        return -1
+    if tcp_slot_state[lslot] != TCP_LISTEN:
+        return -1
+    listen_port: uint16 = tcp_slot_local_p[lslot]
+    start: uint64 = get_jiffies()
+    deadline: uint64 = start + timeout_jiffies
+    while get_jiffies() < deadline:
+        virtio_net_poll()
+        i: uint64 = 0
+        while i < TCP_NUM_SLOTS:
+            if i != lslot:
+                if tcp_slot_state[i] == TCP_ESTABLISHED:
+                    if tcp_slot_local_p[i] == listen_port:
+                        printk1("[tcp] accept returning slot=%d\n", i)
+                        return cast[int32](i)
+            i = i + 1
+    printk1("[tcp] accept timeout on listener slot=%d\n", lslot)
+    return -1
+
+
+def tcp_listen_smoke_test():
+    # M16.124 passive-open smoke test. Listens on port 80 with a
+    # short timeout so the boot path keeps moving regardless of
+    # whether QEMU has a hostfwd back-channel mapped or not.
+    #
+    # Expected wire activity when run under scripts/test_net_tcp_listen.sh
+    # (which boots QEMU with `-netdev user,hostfwd=tcp::5555-:80`):
+    #
+    #     [tcp] listening on port=80
+    #     [tcp] SYN -> listen port=80 new slot=N
+    #     [tcp] SYN-ACK -> <host>.x.y.z slot=N
+    #     [tcp] accepted slot=N -> ESTABLISHED   (if client's final ACK arrives)
+    #     [tcp] accept returning slot=N
+    #
+    # Without hostfwd we still emit the listening marker; the test
+    # script grades that as half-credit (LISTEN reached but no client
+    # to drive SYN-ACK).
+    printk0("[tcp] listen smoke test starting\n")
+    lslot: int32 = tcp_listen(80)
+    if lslot < 0:
+        printk0("[tcp] listen failed (TCB table full?)\n")
+        return
+    # Poll for up to 300 jiffies (3 s @ HZ=100). Plenty for the
+    # test script's `nc localhost 5555` to round-trip through SLIRP's
+    # hostfwd. With no client we time out cleanly and the listener
+    # slot stays in LISTEN — the test script doesn't require accept
+    # success, only the LISTEN + SYN-ACK markers.
+    conn: int32 = tcp_accept(lslot, 300)
+    if conn >= 0:
+        printk1("[tcp] accepted connection slot=%d\n",
+                cast[uint64](conn))
+        # Read whatever the peer sent us (best effort; nc probably
+        # already closed by the time we polled). 100 jiffies = 1 s.
+        rxbuf: Array[64, uint8]
+        rxbuf_ptr: Ptr[uint8] = cast[Ptr[uint8]](&rxbuf[0])
+        nrecv: int64 = tcp_recv(conn, rxbuf_ptr, 64, 100)
+        if nrecv > 0:
+            printk1("[tcp] listener rx %d bytes\n",
+                    cast[uint64](nrecv))
+        tcp_close(conn)
+    else:
+        printk0("[tcp] listen smoke: no client (hostfwd unmapped?)\n")
+    # Leave the listener slot in LISTEN — it's harmless and the boot
+    # path doesn't reuse the slot before reboot.
 
 
 def tcp_init():
