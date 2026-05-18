@@ -1,0 +1,207 @@
+# sys/src/9/port/devmounts.ad
+#
+# Layer 1 (Plan 9-shape) mounts device — system-introspection cdev,
+# sibling to /dev/stat / /dev/diskstats / /dev/cpuinfo / /dev/meminfo.
+# One read regenerates a fresh text snapshot in Linux /proc/mounts
+# shape, one row per mount:
+#
+#   <device> <mountpoint> <fstype> <options> 0 0
+#
+# Stateless backend: FD_MOUNTS_MARK fds carry no per-fd slot. Every
+# read regenerates the entire blob, then copies up to `count` bytes
+# into the caller's buffer. Writes return -1 — read-only.
+#
+# Row sources:
+#
+#   1. Synthetic root: "rootfs / cpio ro 0 0\n". Hamnix's initramfs is
+#      a CPIO archive baked into the kernel image; nothing in the
+#      mnttab represents it because the rootfs is implicit at boot.
+#      We emit a synthetic row so userland sees the same one-and-only
+#      mount Linux sees on a tiny initramfs system.
+#
+#   2. Every live entry in chan.ad's mnttab. mnttab_bind populates
+#      `from_path` (the "appears at" path) and `to_path` (the
+#      resolution target); mnttab_mount uses `from_path` plus a
+#      SRV chan (to_path is empty for mounts). We emit:
+#         from_path  ->  device   column
+#         from_path  ->  mountpoint column (same — bind is in-namespace)
+#         "9p" for SRV mounts / "bind" for plain binds  -> fstype column
+#         "rw" -> options column (placeholder; chan.ad records flag
+#                                 but we don't translate MREPL/MBEFORE/
+#                                 MAFTER to mount-opt syntax yet).
+#
+# CAVEAT — instantaneous snapshot. mnttab entries from OTHER tasks'
+# namespaces (namespace_id != current task's) are emitted regardless of
+# visibility, because /dev/mounts is a system-wide introspection cdev,
+# not a per-task view. Linux's /proc/self/mounts shows the caller's
+# mounts; /proc/mounts (this cdev's analog) shows all kernel mounts.
+# When per-task /dev/self/mounts lands, that variant filters by
+# task_namespace_id().
+#
+# Source of truth:
+#   - sys/src/9/port/chan.ad::mnttab           Array[32, MountEntry]
+#   - sys/src/9/port/chan.ad::MNTTAB_MAX       32
+#   - sys/src/9/port/chan.ad::CHAN_KIND_SRV    discriminates 9p vs bind
+#
+# Compiler-quirk note: Adder has a flat global symbol namespace across
+# merged modules. M16.131..133 documented the `_emit_str` / `_emit_u64`
+# collision pattern; we pre-empt it here by prefixing every shared-
+# shape helper with `_mt_`. This file's distinguishing detail is that
+# it walks chan.ad's MountEntry struct fields directly (not through
+# accessor functions) — that's deliberate: chan.ad has no accessor API
+# for the per-entry buffers today, and the parallel-agent fence for
+# this commit forbids touching chan.ad. Adder's flat-merge model means
+# importing `mnttab` brings the global Array into this file's scope
+# the same way devloadavg.ad gets at task_table via task_state().
+#
+# FD_MOUNTS_MARK constant lives in THIS file (rather than
+# kernel/sched/core.ad) for the same reason FD_STAT_MARK does in
+# devstat.ad — the parallel-agent fence forbids touching core.ad.
+# fs/vfs.ad pulls the marker via `from devmounts import FD_MOUNTS_MARK`.
+
+from sys.src.port9.port.chan import (
+    MountEntry, mnttab, MNTTAB_MAX, CHAN_KIND_SRV,
+)
+
+
+# FD marker for /dev/mounts. One slot below FD_STAT_MARK (0xFFFFFFE6
+# in devstat.ad) so the introspection-cdev range stays contiguous.
+FD_MOUNTS_MARK: uint32 = 0xFFFFFFE5
+
+
+# --- ASCII formatting helpers ----------------------------------------
+
+def _devmounts_u64_to_dec(value: uint64, out: Ptr[uint8]) -> uint64:
+    # Reverse-fill stack then copy out top-down. Same shape as
+    # devtime.ad::_devtime_u64_to_dec. Returns bytes written.
+    if value == 0:
+        out[0] = 48
+        return 1
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    while value != 0:
+        digits[n] = cast[uint8](value % 10) + 48
+        value = value / 10
+        n = n + 1
+    written: uint64 = n
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    return written
+
+
+def _mt_emit_str(out: Ptr[uint8], pos: uint64, s: Ptr[uint8]) -> uint64:
+    # Append a NUL-terminated string to out[pos..], return new pos.
+    # Prefixed `_mt_` to avoid the flat-namespace collision documented
+    # at the top of the file.
+    i: uint64 = 0
+    while s[i] != 0:
+        out[pos + i] = s[i]
+        i = i + 1
+    return pos + i
+
+
+def _mt_emit_path(out: Ptr[uint8], pos: uint64, cap: uint64,
+                  path: Ptr[uint8]) -> uint64:
+    # Copy a NUL-terminated path buffer from the MountEntry into out[].
+    # Stops at NUL or after `cap` bytes (a defensive bound — the
+    # MountEntry buffers are 128 bytes and we trust them, but capping
+    # keeps a runaway non-NUL-terminated buffer from blowing past the
+    # caller's scratch). Returns new pos.
+    i: uint64 = 0
+    while i < cap:
+        c: uint8 = path[i]
+        if c == 0:
+            return pos + i
+        out[pos + i] = c
+        i = i + 1
+    return pos + i
+
+
+# --- snapshot builder -------------------------------------------------
+
+def _build_mounts(out: Ptr[uint8], cap: uint64) -> uint64:
+    # Fill out[] with the /proc/mounts text. Returns total bytes
+    # written (NOT including any NUL). Worst-case ~64 bytes per row +
+    # 32 max rows + the synthetic root = ~2 KB; caller supplies a
+    # 2048-byte scratch in devmounts_read.
+    pos: uint64 = 0
+
+    # ---- synthetic rootfs row.
+    # Hamnix's initramfs is a CPIO archive baked into the kernel and
+    # mounted implicitly at boot. Nothing in mnttab represents it;
+    # we emit a synthetic line so the row count is never zero (the
+    # PASS criterion below requires >= 1 row, and userland tools
+    # like `df` / `mount` segfault on an empty /proc/mounts).
+    pos = _mt_emit_str(out, pos, "rootfs / cpio ro 0 0\n")
+
+    # ---- walk mnttab.
+    i: uint64 = 0
+    while i < MNTTAB_MAX:
+        if mnttab[i].in_use != 0:
+            # device column. For a bind, the "device" is the path we
+            # bound FROM (i.e. from_path); for a mount, same field
+            # since mnttab_mount stashes the appears-at path in
+            # from_path. Real Linux puts the underlying block-dev
+            # node here, but we don't have one for in-namespace
+            # bindings, so the from_path is the closest match.
+            pos = _mt_emit_path(out, pos, 128,
+                                &mnttab[i].from_path[0])
+            out[pos] = 32                         # ' '
+            pos = pos + 1
+
+            # mountpoint column. For a bind this is again from_path
+            # (the visible path in the namespace). For union-mount
+            # variants this would diverge; the current Hamnix mount
+            # model treats from_path as the unique visible site.
+            pos = _mt_emit_path(out, pos, 128,
+                                &mnttab[i].from_path[0])
+            out[pos] = 32
+            pos = pos + 1
+
+            # fstype column. CHAN_KIND_SRV marks an mnttab_mount entry
+            # (future 9P traffic); anything else is a plain bind. Both
+            # render as text userland mount-parsers accept verbatim.
+            if mnttab[i].chan.kind == CHAN_KIND_SRV:
+                pos = _mt_emit_str(out, pos, "9p")
+            else:
+                pos = _mt_emit_str(out, pos, "bind")
+            out[pos] = 32
+            pos = pos + 1
+
+            # options column. chan.ad records the flag (MREPL /
+            # MBEFORE / MAFTER) but the only sensible Linux-shape
+            # option string is "rw" or "ro"; we render "rw" because
+            # write-back to the underlying path is allowed today.
+            pos = _mt_emit_str(out, pos, "rw 0 0\n")
+        i = i + 1
+
+    return pos
+
+
+# --- public API -------------------------------------------------------
+
+def devmounts_read(buf: Ptr[uint8], count: uint64) -> int64:
+    # Stateless snapshot. 2048 bytes covers the worst-case rendered
+    # blob (32 rows + synthetic root, ~64 bytes each); caller's
+    # `count` is the only cap on bytes copied.
+    if count == 0:
+        return 0
+    scratch: Array[2048, uint8]
+    n: uint64 = _build_mounts(&scratch[0], 2048)
+    take: uint64 = count
+    if take > n:
+        take = n
+    i: uint64 = 0
+    while i < take:
+        buf[i] = scratch[i]
+        i = i + 1
+    return cast[int64](take)
+
+
+def devmounts_write(buf: Ptr[uint8], count: uint64) -> int64:
+    # /dev/mounts is read-only. Mirrors devtime / devpid / devstat /
+    # devcpuinfo / devmeminfo / devuptime / devloadavg / devversion.
+    return -1

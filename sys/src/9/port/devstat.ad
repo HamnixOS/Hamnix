@@ -1,0 +1,219 @@
+# sys/src/9/port/devstat.ad
+#
+# Layer 1 (Plan 9-shape) system-stat device — system-introspection cdev,
+# sibling to /dev/uptime / /dev/loadavg / /dev/cpuinfo / /dev/meminfo.
+# One read regenerates a fresh text snapshot in Linux /proc/stat shape:
+#
+#   cpu  <user> <nice> <system> <idle> 0 0 0 0 0 0
+#   cpu0 <user> 0 0 0 0 0 0 0 0 0
+#   intr <total> ...
+#   ctxt <count>
+#   btime <epoch_seconds>
+#   processes <pid>
+#
+# Stateless backend: FD_STAT_MARK fds carry no per-fd slot. Every read
+# regenerates the entire blob, then copies up to `count` bytes into the
+# caller's buffer. Writes return -1 — read-only.
+#
+# CAVEAT — instantaneous + placeholder accounting. A real Linux
+# /proc/stat splits jiffies across user / nice / system / idle / iowait
+# / irq / softirq / steal / guest / guest_nice. The Hamnix scheduler
+# doesn't accumulate per-state jiffies today (TaskStruct has no
+# rtime/stime field; there's no per-CPU runqueue accounting), so we
+# emit every tick into the "user" column and zero out the rest. That's
+# close enough to true in QEMU — the kernel rarely idles since we
+# only have one or two long-running tasks — and userland tools like
+# `top` just want a non-pathological number to compute deltas against.
+# Swap when scheduler accounting lands; see TODO.md.
+#
+# intr / ctxt: we don't track these either. intr emits 0 placeholders
+# (one for the total + 16 per-IRQ zeros so the field count matches the
+# Linux shape userland sscanf'ing for "intr %llu" sees). ctxt emits 0.
+# Real values need a per-IRQ count accessor in arch/x86/kernel/irq.ad
+# and a context-switch counter in kernel/sched/core.ad — separate
+# follow-up commits (TODO.md).
+#
+# btime: pulls from drivers/rtc/cmos.ad::rtc_boot_epoch_get(). 0 if
+# the RTC failed to read at boot, which is fine — Linux callers either
+# ignore btime or use it as a one-shot anchor; a zero anchor just
+# means "epoch start" which doesn't crash anyone.
+#
+# processes: emits current_task_pid() as a proxy for the
+# total-processes-since-boot counter (Linux's `next_pid - 1`). Same
+# rationale as devloadavg's `lastpid` column — the scheduler's
+# free-list never rewinds pids, so the current pid is a non-decreasing
+# proxy that doesn't require a separate counter.
+#
+# Source of truth:
+#   - arch/x86/kernel/time.ad::get_jiffies()    cpu / cpu0 user column
+#   - drivers/rtc/cmos.ad::rtc_boot_epoch_get() btime column
+#   - kernel/sched/core.ad::current_task_pid()  processes column
+#
+# Compiler-quirk note: Adder has a flat global symbol namespace across
+# merged modules — M16.131/132/133 hit this with devcpuinfo / devmeminfo
+# / devuptime / devloadavg / devversion / devhostname all wanting to
+# define `_emit_str`, forcing renames to `_ci_` / `_mi_` / `_up_` /
+# `_la_` / `_ver_` / `_hn_`. We pre-empt the collision here by
+# prefixing every shared-shape helper with `_st_`.
+#
+# FD_STAT_MARK constant lives in THIS file (rather than
+# kernel/sched/core.ad) as a workaround — the M16.131..133 wave packed
+# constants into core.ad's marker block, but the parallel agent fence
+# for this commit forbids touching core.ad, so we colocate the marker
+# with the dispatch body and let fs/vfs.ad pull it via `from devstat
+# import FD_STAT_MARK`. Adder's flat-merge symbol model means the
+# constant ends up in the same single .bss as core.ad's markers.
+
+from arch.x86.kernel.time import get_jiffies
+from drivers.rtc.cmos import rtc_boot_epoch_get
+from kernel.sched.core import current_task_pid
+
+
+# FD marker for /dev/stat. Next free slot after FD_HOSTNAME_MARK
+# (0xFFFFFFE7) which M16.133 claimed. See header note on why we
+# colocate this here instead of in core.ad.
+FD_STAT_MARK: uint32 = 0xFFFFFFE6
+
+
+# --- ASCII formatting helpers ----------------------------------------
+
+def _devstat_u64_to_dec(value: uint64, out: Ptr[uint8]) -> uint64:
+    # Reverse-fill stack then copy out top-down. Same shape as
+    # devtime.ad::_devtime_u64_to_dec. Returns bytes written.
+    if value == 0:
+        out[0] = 48
+        return 1
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    while value != 0:
+        digits[n] = cast[uint8](value % 10) + 48
+        value = value / 10
+        n = n + 1
+    written: uint64 = n
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    return written
+
+
+def _st_emit_str(out: Ptr[uint8], pos: uint64, s: Ptr[uint8]) -> uint64:
+    # Append a NUL-terminated string to out[pos..], return new pos.
+    # Prefixed `_st_` to avoid the flat-namespace collision documented
+    # at the top of the file.
+    i: uint64 = 0
+    while s[i] != 0:
+        out[pos + i] = s[i]
+        i = i + 1
+    return pos + i
+
+
+def _st_emit_u64(out: Ptr[uint8], pos: uint64, value: uint64) -> uint64:
+    # Emit `value` as ASCII decimal. Convenience wrapper around the
+    # u64_to_dec helper so the snapshot builder reads cleanly.
+    return pos + _devstat_u64_to_dec(value, &out[pos])
+
+
+def _st_emit_zeros(out: Ptr[uint8], pos: uint64, n: uint64) -> uint64:
+    # Emit ` 0` n times. Used for the "everything but user" columns in
+    # the cpu/cpu0 rows and the per-IRQ zero columns after `intr`.
+    i: uint64 = 0
+    while i < n:
+        out[pos]     = 32                         # ' '
+        out[pos + 1] = 48                         # '0'
+        pos = pos + 2
+        i = i + 1
+    return pos
+
+
+# --- snapshot builder -------------------------------------------------
+
+def _build_stat(out: Ptr[uint8], cap: uint64) -> uint64:
+    # Fill out[] with the /proc/stat text. Returns total bytes written
+    # (NOT including any NUL). Worst-case ~256 bytes once intr's 17
+    # columns + ctxt + btime + processes are all rendered with 20-digit
+    # values; caller supplies a 384-byte scratch in devstat_read.
+    j: uint64 = get_jiffies()
+    pos: uint64 = 0
+
+    # ---- aggregate "cpu  <user> <nice> ..." row.
+    # Two spaces after "cpu" matches Linux exactly (it's how the kernel
+    # right-pads "cpu" to align with "cpu0" / "cpu1" / ...).
+    pos = _st_emit_str(out, pos, "cpu  ")
+    pos = _st_emit_u64(out, pos, j)               # user column = all ticks
+    pos = _st_emit_zeros(out, pos, 9)             # nice/sys/idle/iowait/...
+    out[pos] = 10                                 # '\n'
+    pos = pos + 1
+
+    # ---- per-cpu "cpu0 ..." row. We only emit one (the scheduler is
+    # single-CPU today even though SMP boot brings the AP up — the
+    # AP doesn't run a separate runqueue). Same ten columns as above.
+    pos = _st_emit_str(out, pos, "cpu0 ")
+    pos = _st_emit_u64(out, pos, j)
+    pos = _st_emit_zeros(out, pos, 9)
+    out[pos] = 10
+    pos = pos + 1
+
+    # ---- "intr <total> <irq0> <irq1> ... <irq15>".
+    # 17 columns total. We emit 0 across the board — no per-IRQ
+    # accounting in the kernel yet (TODO.md tracks the follow-up).
+    # Field count matches what userland sscanf expects, which is
+    # what matters for `top` / `vmstat` to read without crashing.
+    pos = _st_emit_str(out, pos, "intr 0")
+    pos = _st_emit_zeros(out, pos, 16)
+    out[pos] = 10
+    pos = pos + 1
+
+    # ---- "ctxt <count>" — context switches since boot.
+    # We don't track this; emit 0 as a placeholder. Userland tools
+    # that compute deltas (vmstat) will see a constant value, which
+    # at least doesn't violate the "monotonic non-decreasing"
+    # invariant they assume.
+    pos = _st_emit_str(out, pos, "ctxt 0\n")
+
+    # ---- "btime <epoch_seconds>".
+    # rtc_boot_epoch_get() returns 0 if the RTC read failed at boot,
+    # which is acceptable — Linux callers either ignore it or use it
+    # as a one-shot anchor.
+    pos = _st_emit_str(out, pos, "btime ")
+    pos = _st_emit_u64(out, pos, rtc_boot_epoch_get())
+    out[pos] = 10
+    pos = pos + 1
+
+    # ---- "processes <pid>" — total processes spawned since boot.
+    # current_task_pid() is a monotonically-increasing proxy (the
+    # scheduler's free-list never rewinds pids; same logic
+    # devloadavg uses for its lastpid column).
+    pos = _st_emit_str(out, pos, "processes ")
+    pos = _st_emit_u64(out, pos, current_task_pid())
+    out[pos] = 10
+    pos = pos + 1
+
+    return pos
+
+
+# --- public API -------------------------------------------------------
+
+def devstat_read(buf: Ptr[uint8], count: uint64) -> int64:
+    # Stateless snapshot. 384 bytes covers the worst-case rendered
+    # blob (20-digit jiffies + 16 per-IRQ zeros + btime + processes +
+    # row labels + newlines ~ 200 bytes; round up for headroom).
+    if count == 0:
+        return 0
+    scratch: Array[384, uint8]
+    n: uint64 = _build_stat(&scratch[0], 384)
+    take: uint64 = count
+    if take > n:
+        take = n
+    i: uint64 = 0
+    while i < take:
+        buf[i] = scratch[i]
+        i = i + 1
+    return cast[int64](take)
+
+
+def devstat_write(buf: Ptr[uint8], count: uint64) -> int64:
+    # /dev/stat is read-only. Mirrors devtime / devpid / devcpuinfo /
+    # devmeminfo / devuptime / devloadavg / devversion.
+    return -1
