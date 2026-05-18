@@ -76,16 +76,23 @@ need_tool sha256sum
 # Rebuild the kernel ELF if it isn't already there. We deliberately do
 # not force-rebuild on every iso invocation — keeping the iso build
 # cheap and predictable when the kernel ELF is already current.
-if [ ! -f "$HAMNIX_KERNEL" ]; then
-    echo "[build_iso] $HAMNIX_KERNEL missing — running full kernel build."
-    bash scripts/build_user.sh
-    bash scripts/build_modules.sh
-    python3 scripts/build_initramfs.py
-    python3 -m compiler.adder compile \
-        --target=x86_64-bare-metal \
-        init/main.ad \
-        -o "$HAMNIX_KERNEL"
-fi
+# Always rebuild the userland + initramfs + kernel ELF for the ISO.
+# A stale build/hamnix-vmlinux.elf is the more dangerous failure mode
+# than a couple of redundant seconds of compile time — for instance,
+# a kernel built with the legacy asm /init.elf (which exec'd /hello)
+# would boot on real hardware then halt because /hello no longer
+# exists. The ISO is the user-facing artifact; treat it as fresh.
+echo "[build_iso] Rebuilding userland + initramfs + kernel ELF."
+bash scripts/build_user.sh
+bash scripts/build_modules.sh
+# Use hamsh as /init so the booting user lands in an interactive
+# shell. test scripts override this with their own fixtures; the
+# default (and the human-facing real-hardware boot) is hamsh.
+INIT_ELF=build/user/hamsh.elf python3 scripts/build_initramfs.py
+python3 -m compiler.adder compile \
+    --target=x86_64-bare-metal \
+    init/main.ad \
+    -o "$HAMNIX_KERNEL"
 
 echo "[build_iso] Using kernel: $HAMNIX_KERNEL"
 file "$HAMNIX_KERNEL"
