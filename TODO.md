@@ -737,12 +737,47 @@ it has to honour.
     Real fix: detect the header, then in the body loop strip each
     `<hexlen>\r\n` prefix + the trailing `\r\n` per chunk until the
     `0\r\n\r\n` terminator.
-  - HTTPS / TLS — separate large effort. Needs at minimum a TLS 1.2
-    client with the ECDHE-RSA-AES128-GCM cipher suite, X.509 chain
-    validation against a baked-in CA bundle, and a record-layer
-    splitter that sits between `http_get` and `tcp_send`/`tcp_recv`.
-    Until then, `https://` URLs return -1 with `[http] HTTPS not
-    supported`.
+  - ~~HTTPS / TLS skeleton — M16.x lands `drivers/net/tls.ad` with a
+    TLS 1.3 ClientHello + ServerHello + handshake-key-schedule
+    sequence on top of `tcp_send`/`tcp_recv`. Single cipher suite
+    (TLS_CHACHA20_POLY1305_SHA256), single group (X25519), AEAD via
+    ChaCha20-Poly1305 (RFC 8439), key derivation via HKDF-SHA-256
+    (RFC 5869), X25519 scalar multiplication via the standard
+    Montgomery ladder over five 51-bit limbs (RFC 7748). The
+    `https_get(url, ...)` wrapper in `drivers/net/http.ad` parses
+    `https://<host>[:<port>]<path>`, calls `tcp_connect`, drives
+    `tls_handshake`, and tears down. Reaches the "encrypted
+    ServerHello parsed + AEAD round-trip on first server flight
+    record" milestone — confirms the handshake HKDF schedule is
+    correct end-to-end.~~ Follow-ups carved out below.
+  - HTTPS / TLS — server cert validation. The current `tls_handshake`
+    parses Certificate + CertificateVerify for the transcript hash
+    but DOES NOT validate the X.509 chain. Documented in the
+    `drivers/net/tls.ad` header as "TLS-Unsafe; transport encryption
+    only, no authentication". Needs: DER ASN.1 parser
+    (SubjectPublicKeyInfo, validity, SAN), RSA-PSS + ECDSA P-256
+    signature verifiers, baked-in CA trust store (ca-certificates
+    equivalent), SAN/CN hostname matcher, path building. ~2000-line
+    follow-up — gates real `apt update` over HTTPS.
+  - HTTPS / TLS — finish post-handshake flow. Today `tls_handshake`
+    returns after the AEAD round-trip on the FIRST encrypted server
+    record (EncryptedExtensions). The follow-up consumes Certificate
+    + CertificateVerify + Finished, sends the client Finished,
+    derives application traffic keys, and wires `tls_send` /
+    `tls_recv` to a full encrypted GET + response loop inside
+    `https_get`. Once that lands `[https] GET host=... body=N bytes`
+    shows up and the kernel can fetch
+    `https://deb.debian.org/debian/dists/stable/InRelease` end-to-end.
+  - HTTPS / TLS — AES-128-GCM cipher suite for AES-NI hosts. The
+    current code only implements TLS_CHACHA20_POLY1305_SHA256 —
+    fine because ChaCha20 is shared with the M16.129 CSPRNG path
+    and works on every CPU. Adding TLS_AES_128_GCM_SHA256 lets the
+    kernel match the cipher most CDNs prefer (faster on hardware
+    with AES-NI + CLMUL).
+  - HTTPS / TLS — TLS 1.2 fallback for old servers. TLS 1.3 is the
+    only protocol we negotiate today. A handful of mirrors still
+    sit behind ancient TLS 1.2-only stacks; a single-codepath
+    fallback (ECDHE-RSA-AES128-GCM) would unbreak those.
   - 3xx redirect handling — `http_get` surfaces the status code
     through `status_out` so the caller can re-issue against the
     `Location:` header value; a higher-level `http_get_follow()`
@@ -1070,6 +1105,31 @@ it has to honour.
   from inside Hamnix becomes feasible; the higher-level installer
   needs ext4-write + GRUB-stage-install + MBR-write helpers built
   on top of the new primitives.
+- ~~ext4 mkfs (in-kernel format-on-partition).~~ Shipped in M16.x:
+  `fs/ext4.ad::ext4_mkfs(slot, total_sectors)` lays down a single-
+  group ext4 layout (4 KiB blocks, 256-byte inodes, 8192 inodes/group,
+  legacy 32-byte group descriptors, EXTENTS + FILETYPE incompat flags,
+  no journal) over `blk_write_sectors`. Self-test
+  (`ext4_mkfs_self_test`) lazily triggers on the first VFS open of a
+  /ext path — locates `sd0p1` / `nvme0n1p1`, formats it, re-mounts
+  via `ext4_init`, then walks the freshly-written root dir to confirm
+  `.` and `..` come back. Test fixture is `scripts/test_mkfs.sh` +
+  `tests/test_mkfs.ad` (sfdisk-built MBR primary on a 64 MiB AHCI
+  disk). Follow-ups:
+    * Extents for huge-files mkfs — today's root inode uses extents
+      already (so the existing read path mounts the FS without
+      changes); an `ext4_create_extent_tree` helper would let mkfs
+      lay down pre-allocated multi-extent regular files (lost+found
+      etc.) at format time.
+    * Multi-block-group mkfs — current code clamps `total_blocks`
+      to 32768 (one group, 128 MiB). Real-hardware partitions are
+      tens to hundreds of GiB; a multi-group descriptor table +
+      per-group bitmap/inode-table + redundant SB copies that
+      SPARSE_SUPER selects are the next step.
+    * Journal (`has_journal` feature) — without a journal we run
+      "ext4 without journaling" (a valid tune2fs configuration, but
+      means a crash mid-write loses metadata coherence). The L-track
+      jbd2 module is the natural source; lands alongside fsync().
 
 ## Input
 
