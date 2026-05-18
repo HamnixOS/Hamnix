@@ -45,6 +45,16 @@ from mm.memblock import memblock_alloc
 from mm.page_alloc import alloc_page
 from kernel.printk.printk import printk0, printk1, printk2
 from kernel.panic import panic
+# U42: PT_INTERP loading needs to look up the interpreter binary
+# (typically /lib64/ld-linux-x86-64.so.2) from the cpio initramfs.
+# fs.vfs depends on nothing in fs.elf, so this import doesn't form a
+# cycle. We deliberately use the namespace-AGNOSTIC initramfs_data_*
+# accessors here — matching the kernel's existing exec path in
+# arch/x86/kernel/syscall.ad which also bypasses resolve_path's
+# mount-table rewrite. Phase D will replace both with a chan-based
+# lookup; for now the test fixture stages the interpreter under its
+# canonical "/lib64/ld-linux-x86-64.so.2" path directly.
+from fs.vfs import initramfs_data_ptr, initramfs_data_size
 # Note: elf_load_blob no longer flips is_linux_userspace itself —
 # the caller (SYS_SPAWN / SYS_EXECVE in arch/x86/kernel/syscall.ad)
 # reads elf_last_was_linux and applies it to the correct task slot.
@@ -114,6 +124,52 @@ ELF_ET_EXEC: uint16 = 2
 # SYS_SPAWN runs in the parent's context — the loader would mis-flag
 # the parent (hamsh) instead of the new child.
 elf_last_was_linux: int32 = 0
+
+
+# U42: dynamic-ELF interpreter ("ld-linux-x86-64.so.2") support.
+#
+# When _load_elf64 sees a PT_INTERP segment, it now recursively loads
+# the interpreter as its own ELF image (allocated in a fresh memblock
+# region distinct from the application's). The user-mode RIP becomes
+# the INTERPRETER's e_entry — not the application's; ld.so walks the
+# application's PT_DYNAMIC from inside userspace and eventually
+# jumps to the application's e_entry itself.
+#
+# Auxv (built in arch/x86/kernel/syscall.ad::_build_user_argv_linux)
+# consumes these three globals:
+#
+#   AT_BASE  = elf_last_interp_base        # set on dynamic load, 0 else
+#   AT_ENTRY = elf_last_app_entry_user     # application's e_entry,
+#                                          #   rebased to its load base.
+#   AT_PHDR  = elf_last_load_base + elf_last_phoff
+#                                          # still the APPLICATION's
+#                                          #   phdrs — elf_last_load_base
+#                                          #   keeps pointing at the app
+#                                          #   (NOT the interpreter)
+#                                          #   precisely so glibc's
+#                                          #   dl_main / _dl_aux_init
+#                                          #   can find them here.
+#
+# On a static binary (no PT_INTERP) elf_last_interp_base stays 0 and
+# elf_last_app_entry_user is set to the same value the function
+# returns — so _build_user_argv_linux's static-PIE path is unchanged.
+elf_last_interp_base:    uint64 = 0
+elf_last_app_entry_user: uint64 = 0
+
+# Recursion guard. Set to 1 while we're loading an interpreter, so the
+# nested _load_elf64 call doesn't itself try to recurse on a (hostile
+# or weird) PT_INTERP entry inside the interpreter binary. ld.so is a
+# regular ET_DYN without PT_INTERP in practice, but the guard keeps
+# the worst case bounded at "ignore PT_INTERP one level deep".
+_in_interp_load: int32 = 0
+
+# Where to plant the interpreter relative to its own allocation. We
+# memblock_alloc the interpreter image just like an ET_DYN application
+# — it ends up at a kernel-chosen identity-mapped base. The 0x40000000
+# style "high-half" address the Linux ABI normally uses for ld.so is
+# unnecessary for us: Hamnix doesn't paged-protect user vs. kernel
+# (yet) and every memblock region is reachable from CPL=3 via the
+# identity map.
 
 
 def _read_u16(p: Ptr[uint8]) -> uint32:
@@ -272,22 +328,170 @@ def _load_elf64(blob: Ptr[uint8], blob_size: uint64) -> uint64:
     # we keep the legacy rebase-to-region behaviour — the binary is
     # position-independent and runs fine at the identity-mapped region
     # address.
+    #
+    # U42: PT_INTERP handling runs at the very end of the load — AFTER
+    # the application's segments are in place but BEFORE we commit the
+    # globals + return. Two phases interleave:
+    #
+    #   (a) load the interpreter into a SEPARATE memblock region (the
+    #       recursive _load_elf64 call below); save its load base +
+    #       entry into elf_last_interp_base / a local interp_entry.
+    #   (b) restore the application's elf_last_* globals (the recursion
+    #       trampled them, since they're file-scope) and return the
+    #       INTERPRETER's entry as the user-mode RIP. ld.so's _start
+    #       walks the app's PT_DYNAMIC from userspace and jumps to
+    #       the app's e_entry once relocations + DT_NEEDED resolution
+    #       are done.
+    #
+    # For static binaries (no PT_INTERP) the load is unchanged — same
+    # code path the U18..U22 / U27 / U40 / U41 fixtures already use.
+    app_entry_user: uint64 = 0
+    app_load_base:  uint64 = 0
+    app_needs_map:  int32  = 0
+    app_user_vlow:  uint64 = 0
+    app_user_vhigh: uint64 = 0
+    app_user_phys:  uint64 = 0
     if e_type == cast[uint32](ELF_ET_EXEC):
-        elf_last_needs_user_map = 1
-        elf_last_user_vlow      = lowest_v
-        elf_last_user_vhigh     = lowest_v + span
-        elf_last_user_phys_base = region
-        elf_last_load_base      = lowest_v
+        app_needs_map  = 1
+        app_user_vlow  = lowest_v
+        app_user_vhigh = lowest_v + span
+        app_user_phys  = region
+        app_load_base  = lowest_v
+        app_entry_user = e_entry
         printk2("elf64: ET_EXEC user-map: [0x%x, 0x%x)\n",
                 lowest_v, lowest_v + span)
-        return e_entry
     else:
-        elf_last_needs_user_map = 0
-        elf_last_user_vlow      = 0
-        elf_last_user_vhigh     = 0
-        elf_last_user_phys_base = 0
-        elf_last_load_base      = region
-        return region + (e_entry - lowest_v)
+        app_load_base  = region
+        app_entry_user = region + (e_entry - lowest_v)
+
+    # PT_INTERP: dynamic ELF. Recursively load the interpreter and
+    # return its entry as the user-mode RIP. Only honoured at the
+    # top level (_in_interp_load == 0) — if we somehow find a nested
+    # PT_INTERP inside ld.so itself we ignore it and treat ld.so as
+    # a plain ET_DYN.
+    interp_phdr: uint64 = _find_pt_interp(blob)
+    if interp_phdr != 0 and _in_interp_load == 0:
+        interp_entry: uint64 = _load_interp_elf(blob, interp_phdr)
+        if interp_entry == 0:
+            # Couldn't open / load the interpreter. Don't try to run
+            # the binary unrelocated — that would page-fault on the
+            # first PLT lookup. Return 0 to make execve fail cleanly
+            # with -ENOEXEC.
+            printk0("elf64: PT_INTERP load failed\n")
+            return 0
+        # The recursion overwrote elf_last_* with the interpreter's
+        # values. Re-publish the APPLICATION's values so AT_PHDR /
+        # AT_PHNUM / AT_PHENT in the auxv reflect the app (which is
+        # what glibc's dl_main wants — it reads the app's headers to
+        # walk the app's PT_DYNAMIC). elf_last_interp_base remains
+        # set by _load_interp_elf — the auxv builder reads it for
+        # AT_BASE.
+        elf_last_phoff           = e_phoff
+        elf_last_phnum           = e_phnum
+        elf_last_load_base       = app_load_base
+        elf_last_needs_user_map  = app_needs_map
+        elf_last_user_vlow       = app_user_vlow
+        elf_last_user_vhigh      = app_user_vhigh
+        elf_last_user_phys_base  = app_user_phys
+        elf_last_app_entry_user  = app_entry_user
+        printk2("elf64: dynamic load: interp_base=0x%x interp_entry=0x%x\n",
+                elf_last_interp_base, interp_entry)
+        return interp_entry
+
+    # Static path (no PT_INTERP, or we're *being* loaded as an
+    # interpreter ourselves). Same end-state the pre-U42 loader
+    # reached — elf_last_interp_base stays 0 to signal "no dyn
+    # linker", elf_last_app_entry_user mirrors the return value so
+    # auxv AT_ENTRY reads the same thing as the user RIP.
+    elf_last_interp_base    = 0
+    elf_last_app_entry_user = app_entry_user
+    elf_last_load_base      = app_load_base
+    elf_last_needs_user_map = app_needs_map
+    elf_last_user_vlow      = app_user_vlow
+    elf_last_user_vhigh     = app_user_vhigh
+    elf_last_user_phys_base = app_user_phys
+    return app_entry_user
+
+
+# ---------------------------------------------------------------------
+# U42: interpreter load helper
+# ---------------------------------------------------------------------
+# Reads PT_INTERP's payload string out of the application ELF, opens
+# the named interpreter binary via initramfs_data_ptr, and recursively
+# invokes _load_elf64 on it. Returns the interpreter's user-mode entry
+# address (= its rebased e_entry) or 0 on failure.
+#
+# As a side effect, elf_last_interp_base is populated with the
+# interpreter's load region (the kernel-chosen memblock base) so the
+# caller's auxv-builder can plant it in AT_BASE.
+
+def _load_interp_elf(app_blob: Ptr[uint8],
+                     interp_phdr: uint64) -> uint64:
+    # Read the interpreter path string. PT_INTERP's p_offset/p_filesz
+    # describe a NUL-terminated path in the file. Real Linux dynamic
+    # binaries put e.g. "/lib64/ld-linux-x86-64.so.2\0" here.
+    p_offset: uint64 = _read_u64(cast[Ptr[uint8]](interp_phdr + 8))
+    p_filesz: uint64 = _read_u64(cast[Ptr[uint8]](interp_phdr + 32))
+    if p_filesz == 0 or p_filesz > 255:
+        printk0("elf64: PT_INTERP path bogus (length OOB)\n")
+        return 0
+
+    # Stage the path in a stack buffer so initramfs_data_ptr can
+    # consume a NUL-terminated string. The PT_INTERP segment is
+    # already NUL-terminated in well-formed binaries, but we copy
+    # rather than alias because the file blob lives in initramfs
+    # .rodata and pointer-aliasing into it for a cstring is fragile.
+    interp_path: Array[256, uint8]
+    src: uint64 = cast[uint64](app_blob) + p_offset
+    n: uint64 = p_filesz
+    if n > 255:
+        n = 255
+    i: uint64 = 0
+    while i < n:
+        interp_path[i] = cast[Ptr[uint8]](src + i)[0]
+        i = i + 1
+    # Guarantee NUL even if p_filesz lied.
+    interp_path[n] = 0
+
+    printk1("elf64: PT_INTERP='%s'\n",
+            cast[uint64](&interp_path[0]))
+
+    # Look the interpreter up in the cpio initramfs. The path is
+    # taken verbatim from PT_INTERP — typically "/lib64/ld-linux-
+    # x86-64.so.2" on Debian/Ubuntu, "/lib/ld-musl-x86_64.so.1" on
+    # Alpine. We don't go through resolve_path's mount-table rewrite
+    # here, matching the kernel's existing execve path (see
+    # arch/x86/kernel/syscall.ad::do_execve). Test fixtures that want
+    # to run dynamic binaries are responsible for staging the
+    # interpreter at its canonical path inside the initramfs.
+    interp_blob: uint64 = initramfs_data_ptr(
+        cast[Ptr[char]](&interp_path[0]))
+    if interp_blob == 0:
+        printk1("elf64: interpreter '%s' not in initramfs\n",
+                cast[uint64](&interp_path[0]))
+        return 0
+    interp_size: uint64 = initramfs_data_size(
+        cast[Ptr[char]](&interp_path[0]))
+
+    # Recursive load. _in_interp_load gates PT_INTERP processing
+    # inside the nested call so ld.so itself isn't asked to recurse
+    # on its own (typically non-existent) PT_INTERP.
+    _in_interp_load = 1
+    interp_entry: uint64 = _load_elf64(
+        cast[Ptr[uint8]](interp_blob), interp_size)
+    _in_interp_load = 0
+    if interp_entry == 0:
+        printk0("elf64: failed to load interpreter image\n")
+        return 0
+
+    # _load_elf64's static-path tail set elf_last_load_base to the
+    # interpreter's region (its memblock base). Capture that as the
+    # AT_BASE value the auxv builder will plant. We then overwrite
+    # elf_last_load_base back to the application's base in the
+    # caller (_load_elf64's PT_INTERP arm above) so AT_PHDR remains
+    # anchored at the application's program headers.
+    elf_last_interp_base = elf_last_load_base
+    return interp_entry
 
 
 def elf_load_blob(blob: Ptr[uint8], blob_size: uint64) -> uint64:
@@ -396,6 +600,13 @@ def elf_load_blob(blob: Ptr[uint8], blob_size: uint64) -> uint64:
     elf_last_phoff     = cast[uint64](e_phoff)
     elf_last_phnum     = e_phnum
     entry_real: uint64 = region + cast[uint64](e_entry - lowest_v)
+    # U42: ELF32 path never has a dynamic linker. Pin interp_base = 0
+    # so a previous dynamic ELF64 load doesn't leak into a subsequent
+    # native ELF32 boot's auxv (auxv is Linux-only and ELF32 native
+    # binaries don't consume it, but the auxv builder reads these
+    # globals unconditionally — keep them tidy).
+    elf_last_interp_base    = 0
+    elf_last_app_entry_user = entry_real
 
     # U3: Linux-ABI detection. We record whether this image is a Linux-
     # ABI binary in elf_last_was_linux; the caller (SYS_SPAWN or

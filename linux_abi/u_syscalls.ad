@@ -1141,10 +1141,16 @@ def _u_unimpl_fstat(a0: uint64, a1: uint64, a2: uint64,
 # 4 KiB of .bss for the bookkeeping arrays.
 LINUX_MMAP_SLOTS: uint64 = 256
 
-# MAP_* flag bits from <bits/mman-linux.h>. Only ANON|PRIVATE is honoured;
-# any other combination returns -ENOSYS so the gap is visible in test
-# output instead of silently mapping something we can't actually back.
+# MAP_* flag bits from <bits/mman-linux.h>. Honoured combinations:
+#   * MAP_ANONYMOUS|MAP_PRIVATE (U7..U41 path).
+#   * MAP_PRIVATE alone with a file fd (U42: ld.so's first mmap of
+#     each DSO — read file into freshly-allocated pages).
+#   * MAP_PRIVATE|MAP_FIXED with an addr that lies inside a PRIOR
+#     mmap (U42: ld.so's typical "reserve whole-file region, then
+#     MAP_FIXED each PT_LOAD on top" dance — see _u_mmap_fixed_in_
+#     existing for the matching logic).
 MAP_PRIVATE:   uint64 = 0x02
+MAP_FIXED:     uint64 = 0x10
 MAP_ANONYMOUS: uint64 = 0x20
 
 # Page size used to round the requested length up. Matches the 4 KiB
@@ -1178,16 +1184,160 @@ def _order_for_mmap_size(size: uint64) -> int32:
     return order
 
 
+def _u_mmap_fixed_in_existing(addr: uint64, length_in: uint64,
+                              fd: uint64, offset: uint64) -> int64:
+    # U42: MAP_FIXED inside an existing mapping. ld.so's typical
+    # DSO-load dance is:
+    #   (a) mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0)
+    #       — reserve a region big enough for all PT_LOAD segments.
+    #   (b) for each PT_LOAD:
+    #       mmap(start_addr, ph.p_filesz, ph.prot,
+    #            MAP_PRIVATE|MAP_FIXED, fd, ph.p_offset)
+    #       — overlay the actual segment data at its rebased addr.
+    # We can't honour MAP_FIXED for real (no per-page mapping yet),
+    # but we CAN observe that (b)'s addr falls inside (a)'s region
+    # and just READ THE FILE DATA into that address. The previous
+    # whole-file mmap's bytes get overwritten by the per-PT_LOAD
+    # bytes at the right offsets — which is the end-state ld.so
+    # wanted. We do not track per-PT_LOAD prot bits (every page is
+    # RWX in the identity map; mprotect is a no-op).
+    #
+    # Returns addr on success, ELINUX_NOSYS if no enclosing
+    # mapping exists.
+    end: uint64 = addr + length_in
+    i: uint64 = 0
+    while i < LINUX_MMAP_SLOTS:
+        base: uint64 = linux_mmap_base[i]
+        if base != 0:
+            order: uint64 = linux_mmap_len[i]
+            blen: uint64 = LINUX_MMAP_PAGE << order
+            if base <= addr and end <= base + blen:
+                rc: int64 = vfs_lseek(cast[int32](fd),
+                                      cast[int64](offset), 0)
+                if rc < 0:
+                    return rc
+                nread: int64 = vfs_read(cast[int32](fd),
+                                        cast[Ptr[uint8]](addr),
+                                        length_in)
+                if nread < 0:
+                    return nread
+                return cast[int64](addr)
+        i = i + 1
+    printk1("linux_u: mmap-FIXED addr=0x%x not in any prior mapping\n",
+            addr)
+    return ELINUX_NOSYS
+
+
+def _u_mmap_file(length_in: uint64, flags: uint64,
+                 fd: uint64, offset: uint64) -> int64:
+    # U42: file-backed MAP_PRIVATE. Allocate pages, lseek the fd to
+    # `offset`, fill the mapping by vfs_read, return the base.
+    # length is rounded up to a page; the tail past EOF is left zero
+    # (alloc_pages followed by memset). The caller's fd stays open —
+    # we don't dup it. The mapping is recorded in linux_mmap_base /
+    # linux_mmap_len so munmap can release it via the same code path
+    # as anonymous mmaps.
+    length: uint64 = (length_in + LINUX_MMAP_PAGE - 1) \
+                     & ~(LINUX_MMAP_PAGE - 1)
+    # Find a free slot in the bookkeeping table BEFORE we allocate
+    # so a table-full case doesn't leak pages.
+    slot: int32 = -1
+    i: uint64 = 0
+    while i < LINUX_MMAP_SLOTS:
+        if linux_mmap_base[i] == 0:
+            slot = cast[int32](i)
+            i = LINUX_MMAP_SLOTS                             # break
+        else:
+            i = i + 1
+    if slot < 0:
+        printk1("linux_u: mmap-file table full (slots=%d)\n",
+                LINUX_MMAP_SLOTS)
+        return ELINUX_NOSYS
+    order: int32 = _order_for_mmap_size(length)
+    if order < 0:
+        printk1("linux_u: mmap-file len=%d exceeds MAX_ORDER\n",
+                length)
+        return ELINUX_NOSYS
+    base: uint64 = alloc_pages(order)
+    if base == 0:
+        printk1("linux_u: mmap-file alloc_pages OOM (len=%d)\n",
+                length)
+        return ELINUX_NOSYS
+    # Pre-zero so the tail past EOF / past p_filesz is zero per the
+    # Linux MAP_PRIVATE contract.
+    memset(cast[Ptr[uint8]](base), 0, length)
+    # Seek to the requested offset and read up to length_in bytes.
+    # Partial reads (file shorter than mapping) are accepted —
+    # remaining bytes stay zero. ld.so's first mmap of a DSO is the
+    # whole file followed by mprotect + bss-zero by PT_LOAD; it
+    # doesn't care about the exact byte count we return as long as
+    # the page count matches.
+    rc: int64 = vfs_lseek(cast[int32](fd), cast[int64](offset),
+                          0)            # SEEK_SET
+    if rc < 0:
+        free_pages(base, order)
+        printk1("linux_u: mmap-file lseek failed (rc=%d)\n",
+                cast[uint64](rc))
+        return ELINUX_NOSYS
+    nread: int64 = vfs_read(cast[int32](fd),
+                            cast[Ptr[uint8]](base),
+                            length_in)
+    if nread < 0:
+        free_pages(base, order)
+        printk1("linux_u: mmap-file vfs_read failed (rc=%d)\n",
+                cast[uint64](nread))
+        return ELINUX_NOSYS
+    linux_mmap_base[cast[uint64](slot)] = base
+    linux_mmap_len[cast[uint64](slot)]  = cast[uint64](order)
+    return cast[int64](base)
+
+
 def _u_mmap(a0: uint64, a1: uint64, a2: uint64,
             a3: uint64, a4: uint64, a5: uint64) -> int64:
     # void *mmap(void *addr, size_t length, int prot, int flags,
     #            int fd, off_t offset).
-    # Only MAP_ANONYMOUS|MAP_PRIVATE with fd=-1 is supported. addr and
-    # prot are ignored: we have no per-task page tables at this
-    # milestone (every page is RWX U=1 from the 4 GiB identity map),
-    # so PROT_* are advisory at best, and the kernel picks the address.
+    # Supported combinations:
+    #   * MAP_ANONYMOUS|MAP_PRIVATE with fd=-1 (the U7..U41 path —
+    #     glibc/musl malloc, CPython importlib bytecode arenas, ld.so
+    #     bss-style allocations).
+    #   * MAP_PRIVATE with a valid fd (U42 path — ld.so mmaps DT_NEEDED
+    #     DSOs into the address space). We back this by alloc_pages +
+    #     pread-style fill, so it's really MAP_PRIVATE|MAP_POPULATE
+    #     under the hood — the entire mapped range is materialised
+    #     eagerly from the file. Good enough for ld.so's "map the
+    #     whole file then mprotect+memcpy by PT_LOAD" dance; lazy/
+    #     paged fault-in is deferred to a real VMA layer.
+    # addr is ignored unless MAP_FIXED is set (which we don't honour);
+    # prot is advisory — every page is RWX U=1 from the 4 GiB identity
+    # map.
     if a1 == 0:
         return ELINUX_INVAL
+    need: uint64 = MAP_PRIVATE
+    if (a3 & need) != need:
+        return ELINUX_NOSYS
+    # U42 file-backed branch. Triggered when fd is a real fd (not -1
+    # in either 32-bit or 64-bit form) and MAP_ANONYMOUS is NOT set.
+    # We do read-into-newly-allocated-pages here, not lazy faults.
+    is_neg_fd: int32 = 0
+    if a4 == cast[uint64](0xFFFFFFFFFFFFFFFF):
+        is_neg_fd = 1
+    elif a4 == cast[uint64](0xFFFFFFFF):
+        is_neg_fd = 1
+    if is_neg_fd == 0 and (a3 & MAP_ANONYMOUS) == 0:
+        # MAP_FIXED on top of an existing whole-file mmap: ld.so's
+        # per-PT_LOAD overlay. Read file data into the requested
+        # addr — see _u_mmap_fixed_in_existing for the contract.
+        if (a3 & MAP_FIXED) != 0 and a0 != 0:
+            rc_fixed: int64 = _u_mmap_fixed_in_existing(
+                a0, a1, a4, a5)
+            if rc_fixed >= 0:
+                return rc_fixed
+            # Fall through to the regular file-backed path if the
+            # addr wasn't inside any prior mapping — gives ld.so a
+            # chance to use whatever address we hand back.
+        return _u_mmap_file(a1, a3, a4, a5)
+    # Anonymous path (existing U7..U41 semantics) below.
+    #
     # fd must be -1 for anonymous. glibc/musl pass `int fd = -1` which
     # the syscall ABI delivers in %r8 with the high 32 bits whatever the
     # compiler last put there — for MicroPython/static-musl that's all-
@@ -1198,12 +1348,12 @@ def _u_mmap(a0: uint64, a1: uint64, a2: uint64,
     # as "not anon" with fd=0xFFFFFFFF, which left MAP_ANON|MAP_PRIVATE
     # callers seeing -ENOSYS and produced the silent MemoryError at
     # pycore_interp_init.
-    if a4 != cast[uint64](0xFFFFFFFFFFFFFFFF) and a4 != cast[uint64](0xFFFFFFFF):
+    if is_neg_fd == 0:
         return ELINUX_NOSYS
     if a5 != 0:
         return ELINUX_INVAL
-    need: uint64 = MAP_ANONYMOUS | MAP_PRIVATE
-    if (a3 & need) != need:
+    need2: uint64 = MAP_ANONYMOUS | MAP_PRIVATE
+    if (a3 & need2) != need2:
         return ELINUX_NOSYS
     # Round length up to a page boundary. Linux rounds up; munmap can
     # then unmap the same rounded length and find a matching slot.
@@ -1623,7 +1773,25 @@ def _u_prctl(a0: uint64, a1: uint64, a2: uint64,
 
 def _u_unimpl_pread64(a0: uint64, a1: uint64, a2: uint64,
                       a3: uint64, a4: uint64, a5: uint64) -> int64:
-    return ELINUX_NOSYS
+    # ssize_t pread64(int fd, void *buf, size_t count, off_t offset).
+    # U42: ld.so reads the ELF header of each DSO via pread64 before
+    # mmap'ing the segments. Implement as lseek(SEEK_SET, offset) +
+    # read — non-atomic w.r.t. concurrent seeks on the same fd, but
+    # nothing in our single-threaded ld.so path competes.
+    #
+    # Name kept as _u_unimpl_pread64 for dispatch-table compatibility
+    # — the prefix is now misleading but renaming the symbol cascades
+    # into the dispatcher. Wrapping under the old name is enough.
+    fd: int32 = cast[int32](a0)
+    buf: uint64 = a1
+    cnt: uint64 = a2
+    off: int64 = cast[int64](a3)
+    if cnt == 0:
+        return 0
+    rc: int64 = vfs_lseek(fd, off, 0)             # SEEK_SET
+    if rc < 0:
+        return rc
+    return vfs_read(fd, cast[Ptr[uint8]](buf), cnt)
 
 
 def _u_unimpl_pwrite64(a0: uint64, a1: uint64, a2: uint64,

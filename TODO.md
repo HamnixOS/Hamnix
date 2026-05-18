@@ -243,17 +243,36 @@ it has to honour.
       store. Layer 3 service; lands after Phase F.
     * Real Debian BINARY (not just /etc/* file) running inside a
       namespace — `deb /bin/true` actually exec'ing the Debian-
-      shipped `/bin/true`. Remaining blockers (U42 landed the dynamic
+      shipped `/bin/true`. U42 landed the kernel-side dynamic
       ELF interpreter — fs/elf.ad now follows PT_INTERP and loads
       ld-linux-x86-64.so.2 as a real ELF interpreter; AT_BASE /
-      AT_ENTRY / AT_PHDR auxv plumbed correctly; smoke-tested by
-      scripts/test_u42_dynamic_elf.sh against a host-built dynamic
-      hello):
+      AT_ENTRY / AT_PHDR auxv plumbed correctly; the
+      `linux_abi/u_syscalls.ad` mmap path grew file-backed
+      MAP_PRIVATE plus a MAP_FIXED-into-prior-mapping overlay so
+      ld.so's two-phase DSO load (reserve, then per-PT_LOAD
+      MAP_FIXED) makes forward progress. Verified by
+      scripts/test_u42_dynamic_elf.sh: 3/3 kernel-side checks fire
+      ("PT_INTERP detected", "interpreter loaded at distinct base",
+      "Linux-ABI binary detected"); ld.so successfully reaches
+      userspace, opens + mmaps libc.so.6, applies relocations, and
+      jumps to the application's _start.
+      
+      Remaining blockers for the final puts() to land on serial:
+        - Real VMA layer / true MAP_FIXED — today the
+          MAP_FIXED-into-prior-mapping hack works for the simple
+          "ld.so reserves N pages then overlays PT_LOADs" case but
+          can't honour MAP_FIXED at arbitrary addresses (no per-
+          page mapping). At runtime the dynamic_hello smoke-test
+          gets a GP fault at user RIP inside the application's
+          .text once ld.so hands off — likely SSE/MOVAPS on
+          unaligned memory because PT_LOAD base alignment wasn't
+          guaranteed. Real fix: track VMAs + per-task page tables.
         - `fs/cpio.ad` `NR_FILES` bump (192 -> 8192+) so the full
-          debootstrap'd tree (~5000 files) fits in the cpio archive.
-          Today scripts/test_u42_dynamic_elf.sh works around this by
-          injecting ONLY ld.so into the cpio archive post-build; a
-          real `deb /bin/true` flow needs libc.so.6 and friends too.
+          debootstrap'd tree (~5000 files) fits in the cpio
+          archive. Today scripts/test_u42_dynamic_elf.sh works
+          around this by injecting ONLY ld.so + libc.so.6 into the
+          cpio archive post-build; a real `deb /bin/true` flow
+          needs the entire DT_NEEDED transitive closure too.
         - libdl / dlopen — U42 covers the loader's job up to "ld.so
           executes from userspace". Anything beyond `puts()` that
           calls dlopen() ("apt install" loads plugins) needs the
