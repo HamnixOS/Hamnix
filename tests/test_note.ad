@@ -1,0 +1,248 @@
+# tests/test_note.ad
+#
+# Phase C / M16.109 regression: exercise SYS_NOTIFY (270) + SYS_NOTED
+# (271) end-to-end against the new /proc/<pid>/note write surface.
+#
+# Test shape:
+#
+#   1. main() reads its own pid via SYS_GETPID.
+#   2. main() installs a note handler via syscall6(SYS_NOTIFY, &handler).
+#   3. main() opens /proc/<self_pid>/note (OWRITE) and writes "hello"
+#      to it.
+#   4. The kernel's devproc_write -> deliver_note_to_current path
+#      rewrites the saved-user-RIP of the current syscall frame to
+#      point at our `note_handler` function. SYSRETQ lands in the
+#      handler instead of the sys_write `ret`.
+#   5. note_handler sets a global flag (`handler_ran = 1`), prints a
+#      tag line, and calls syscall6(SYS_NOTED, NCONT) to return.
+#   6. The kernel's do_noted restores the original saved RIP/RSP into
+#      the iret-frame slots; SYSRETQ lands at the sys_write `ret`,
+#      sys_write returns to main, main observes `handler_ran == 1`,
+#      prints PASS.
+#
+# Caveats Phase C accepts:
+#
+#   * Handler is called with no useful arguments. Plan 9's contract is
+#     handler(void *ureg, char *note) — but the Hamnix syscall return
+#     stub deliberately zeroes %rdi outside FUTEX, so we can't deliver
+#     the note string via RDI without touching syscall_64.S. The
+#     message is parked in the task's note_msg slot for retrieval by
+#     a future syscall; this fixture just checks the handler RAN.
+#
+#   * Self-delivery only. The cross-task path (parent writes child's
+#     /proc/<pid>/note) is accepted by devproc_write but logs +
+#     drops — full cross-task delivery is a later milestone.
+#
+# Build:
+#   python3 -m compiler.adder compile --target=x86_64-adder-user \
+#       tests/test_note.ad -o build/user/test_note.elf
+#
+# Run via scripts/test_note.sh.
+#
+# Markers the host-side script greps for:
+#   "[note] start"
+#   "[note] notify_ok"
+#   "[note] handler"            (printed FROM INSIDE the handler)
+#   "[note] back_in_main"
+#   "[note] PASS"
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_close(fd: int32) -> int32
+extern def sys_getpid() -> int32
+extern def sys_exit(code: uint64)
+extern def syscall6(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
+                    a3: uint64, a4: uint64, a5: uint64) -> int64
+
+
+SYS_NOTIFY: uint64 = 270
+SYS_NOTED:  uint64 = 271
+
+NCONT: uint64 = 0
+
+
+# Global flag the handler flips and main() polls. Lives in .bss so
+# the cpio-archived elf still ships a 0 initial value; the handler
+# writes a 1 to it on entry.
+handler_ran: int32 = 0
+
+
+def strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen(s))
+
+
+def write_dec(fd: int32, value: uint64):
+    if value == 0:
+        sys_write(fd, "0", 1)
+        return
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    v: uint64 = value
+    while v != 0:
+        digits[n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    out: Array[24, uint8]
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    sys_write(fd, &out[0], i)
+
+
+# The note handler. The kernel redirects the saved-user-RIP slot of
+# the in-flight write() syscall to this address; when SYSRETQ runs
+# from devproc_write, control lands here at function entry. The
+# compiler emits the standard SysV prologue (push %rbp; mov %rbp,%rsp);
+# user %rsp on entry is at the same address it was when sys_write
+# issued its SYSCALL instruction, so the prologue's push is well-
+# behaved — and CRITICALLY pushes the writer's %rbp onto the user
+# stack at (saved_user_rsp - 8). That's main's %rbp at the moment of
+# the write() syscall, which we need to restore before noted's
+# SYSRETQ lands back in main (without restoring, main's locals
+# accessed via -X(%rbp) point at the handler's frame, and main's
+# leave; ret epilogue corrupts the call chain).
+#
+# The handler MUST end with sys_noted — falling off the end would
+# `ret` to whatever %rsp points at (the original write return
+# address, which is fine), but the iret-frame slots would still
+# hold the handler's RIP, so the next syscall return would again
+# land in the handler. We issue the SYS_NOTED syscall inline via
+# asm_volatile so we can do the `popq %rbp` right before the
+# `syscall` instruction — undoing our own prologue's push and
+# restoring main's %rbp into the user register file. The kernel
+# can't restore %rbp itself: it's a SysV callee-saved register
+# that the syscall stub doesn't save/restore (only %rcx/%r11/%rsp/%r12
+# go through the hardware-saved path, plus the explicit pushes the
+# stub itself does for %rdi/%rsi/%rdx/%r10/%r8/%r9/%rax — see
+# arch/x86/kernel/syscall_64.S). The `popq %rbp` lives inside the
+# asm so the compiler's leave; ret epilogue (which we never reach
+# anyway, since the kernel's RIP-restore jumps us to the original
+# write's `ret`) doesn't have a chance to interfere.
+def note_handler():
+    handler_ran = 1
+    write_str(1, "[note] handler\n")
+    # NCONT — restore saved RIP+RSP and return to where the write()
+    # was originally interrupted. The action value is accepted but
+    # silently treated as NCONT-equivalent by Phase C; we pass 0.
+    #
+    # The popq %rbp undoes the function prologue's `push %rbp` — the
+    # slot it pops from holds the writer's %rbp at write() entry time
+    # (which is main's %rbp), so after this single instruction the
+    # %rbp register has main's value back. We immediately issue the
+    # syscall; the kernel's do_noted (sys/src/9/port/sysnote.ad)
+    # rewrites the saved-user-RIP slot to sys_write's `ret` and the
+    # saved-user-RSP slot to main's natural pre-syscall RSP, so
+    # SYSRETQ lands cleanly back in main with all callee-saved
+    # registers (including %rbp) holding their pre-write values.
+    asm_volatile("""
+        movq $0, %rdi
+        movq $271, %rax
+        popq %rbp
+        syscall
+    """)
+    # Not reached. The kernel's RIP-restore makes the SYSRETQ jump to
+    # sys_write's `ret`, not back here.
+
+
+# Build a "/proc/<pid>/note" path string in `out`. Caller supplies a
+# buffer with room for "/proc/" (6) + up to 6-digit pid + "/note" (5)
+# + NUL = 18 bytes — pid is 1-byte-ish at NTASKS=16 but the buffer is
+# sized for a full 6-digit value to be safe.
+def build_note_path(pid: uint64, out: Ptr[uint8]) -> uint64:
+    # Manual write — same shape as devproc_path emitter, but in user
+    # land. "/proc/" prefix first.
+    out[0] = 47   # '/'
+    out[1] = 112  # 'p'
+    out[2] = 114  # 'r'
+    out[3] = 111  # 'o'
+    out[4] = 99   # 'c'
+    out[5] = 47   # '/'
+    pos: uint64 = 6
+    if pid == 0:
+        out[pos] = 48                            # '0'
+        pos = pos + 1
+    else:
+        digits: Array[8, uint8]
+        n: uint64 = 0
+        v: uint64 = pid
+        while v != 0:
+            digits[n] = cast[uint8](v % 10) + 48
+            v = v / 10
+            n = n + 1
+        while n > 0:
+            n = n - 1
+            out[pos] = digits[n]
+            pos = pos + 1
+    out[pos]     = 47                            # '/'
+    out[pos + 1] = 110                           # 'n'
+    out[pos + 2] = 111                           # 'o'
+    out[pos + 3] = 116                           # 't'
+    out[pos + 4] = 101                           # 'e'
+    out[pos + 5] = 0
+    return pos + 5
+
+
+def main() -> int32:
+    write_str(1, "[note] start\n")
+
+    # 1. Install the handler. SYS_NOTIFY's contract: a0 = handler RIP,
+    #    returns 0 on success. We pass the address of `note_handler`
+    #    cast to uint64 — Adder gives us &fn for free.
+    rc: int64 = syscall6(SYS_NOTIFY,
+                         cast[uint64](&note_handler),
+                         0, 0, 0, 0, 0)
+    if rc != 0:
+        write_str(1, "[note] FAIL: notify returned non-zero\n")
+        return 1
+    write_str(1, "[note] notify_ok\n")
+
+    # 2. Pull our own pid so we can target our own /proc/<self>/note.
+    #    Self-delivery is the supported Phase C path; cross-task is
+    #    accepted but currently dropped.
+    pid32: int32 = sys_getpid()
+    if pid32 < 0:
+        write_str(1, "[note] FAIL: getpid returned negative\n")
+        return 1
+    pid: uint64 = cast[uint64](pid32)
+    write_str(1, "[note] pid=")
+    write_dec(1, pid)
+    write_str(1, "\n")
+
+    # 3. Build the path string and open it for writing.
+    path: Array[24, uint8]
+    build_note_path(pid, &path[0])
+    fd: int32 = sys_open_write(cast[Ptr[char]](&path[0]))
+    if fd < 0:
+        write_str(1, "[note] FAIL: cannot open /proc/<self>/note\n")
+        return 1
+
+    # 4. Write a note string. The write() returns AFTER the handler
+    #    has run + noted() has restored our RIP/RSP — control flow
+    #    leaves the kernel, executes the handler, calls noted(),
+    #    sysrets back to our write() `ret` instruction. The return
+    #    value is whatever do_noted returned (0), NOT the write count
+    #    — documented quirk.
+    sys_write(fd, "hello", 5)
+    sys_close(fd)
+
+    # 5. If we got here, the handler ran AND noted() unwound back to
+    #    us correctly. The global flag is the proof — without the
+    #    handler-then-noted round-trip, this never increments.
+    write_str(1, "[note] back_in_main\n")
+    if handler_ran == 0:
+        write_str(1, "[note] FAIL: handler did not run\n")
+        return 2
+    if handler_ran != 1:
+        write_str(1, "[note] FAIL: handler_ran corrupted\n")
+        return 2
+    write_str(1, "[note] PASS\n")
+    return 0

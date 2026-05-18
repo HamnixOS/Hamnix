@@ -69,9 +69,37 @@ it has to honour.
         a fresh int32 but no actual mount-table deep-copy happens
         because Hamnix has no mount table yet. Lands with the
         `bind` / `mount` bodies below.
-      * Note delivery — `note_group` is tracked but the
-        `notify(2)` / `noted(2)` syscalls don't exist. Adding them
-        unlocks Plan 9's "killable group" idiom for daemons.
+      * ~~Note delivery — `notify(2)` (270) / `noted(2)` (271)
+        shipped in M16.109. Bodies in `sys/src/9/port/sysnote.ad`;
+        TaskStruct grew `note_handler_rip` + `note_pending` +
+        `note_saved_rip` + `note_saved_rsp` + a 128-byte
+        `note_msg` slot (`kernel/sched/core.ad`).
+        `sys/src/9/port/devproc.ad` learned the `note` file_kind:
+        writes to `/proc/<pid>/note` look up the target task,
+        copy the message into its `note_msg` buffer, save the
+        current saved-user-RIP/RSP, and rewrite the saved-RIP slot
+        to the handler — so SYSRETQ on the in-flight write
+        delivers control to the handler in user mode.
+        End-to-end verified by `scripts/test_note.sh`.~~
+        Follow-ups:
+          - `note_group`-wide delivery (Plan 9 "killable group" idiom)
+            — `do_rfork`'s RFNOTEG already tracks the group id; the
+            devproc_write path currently looks up a single target
+            pid. Group walk lands when the daemon-supervisor use
+            case exists.
+          - Cross-task delivery — writing to ANOTHER task's
+            `/proc/<pid>/note` is parsed + accepted but logs and
+            drops; the full path needs to patch the target's
+            stashed iret frame from outside its syscall context.
+          - NDFLT action (default = terminate target). Phase C
+            silently treats every action arg as NCONT (continue).
+          - Handler message argument — Plan 9 calls
+            `handler(void *ureg, char *msg)`. The syscall return
+            stub deliberately zeroes %rdi outside FUTEX (see
+            `arch/x86/kernel/syscall_64.S`); threading the msg
+            pointer through requires touching that stub. Until
+            then the message is parked in `TaskStruct.note_msg`
+            and not yet surfaced to user space.
       * Detach (`RFNOWAIT`) — accepted but does not yet sever the
         child's parent_pid; lands when `wait4` learns to drop
         RFNOWAIT children automatically.

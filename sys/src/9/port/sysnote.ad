@@ -1,0 +1,215 @@
+# sys/src/9/port/sysnote.ad
+#
+# Layer 1 (Plan 9-shape) note (signal) primitives. Mirrors 9front's
+# /sys/src/9/port/sysproc.c::sysnotify + sysnoted at minimum scale.
+# Lands the M16.109 bodies for:
+#
+#   notify(handler) -> SYS_NOTIFY (270)
+#   noted(action)   -> SYS_NOTED  (271)
+#
+# Plan 9 calls signals "notes": a process registers a handler with
+# notify(); other processes (or the kernel) write a note string to
+# the target's /proc/<pid>/note file; the kernel arranges for the
+# target's user-mode RIP to be redirected to the handler. The handler
+# finishes by calling noted() to return to where the target was
+# originally interrupted.
+#
+# Phase C / M16.109 scope (one commit; minimum viable):
+#
+#   * Single-pid delivery only. RFNOTEG-grouped delivery is a Phase G
+#     follow-up; note_group is tracked on TaskStruct (M16.98) but the
+#     delivery walker here looks at one pid at a time.
+#
+#   * Self-delivery is the supported path. A task that writes to its
+#     own /proc/<self_pid>/note gets the handler redirect installed on
+#     its current syscall-return frame; we're already inside that
+#     task's kernel context, so the saved-user-RIP slot at kstack_top-24
+#     IS the slot we want to retarget.
+#
+#   * Cross-task delivery is accepted but Phase C only stashes the
+#     note_pending flag + message — the target's next syscall return
+#     or yield doesn't yet consult note_pending. Wires up in a later
+#     milestone alongside the note_group walker.
+#
+#   * Note ACTIONS: noted(NCONT)-equivalent only. The action argument
+#     is accepted (matches Plan 9's prototype) but every value behaves
+#     as "continue" — restore the saved RIP+RSP and clear note_pending.
+#     NDFLT (default=terminate), NSAVE (save full register state),
+#     NRSTR (restore full register state) are Phase G.
+#
+#   * Message arg in handler: Plan 9's handler signature is
+#     void handler(void *ureg, char *msg). On Hamnix the syscall return
+#     stub (arch/x86/kernel/syscall_64.S) deliberately zeroes %rdi for
+#     non-FUTEX syscalls (a glibc-2.39 static-pie quirk; see comments
+#     in the .S file). Threading the msg pointer through that path
+#     requires touching the asm stub, which is off-limits for this
+#     commit (the comment block at the top of syscall_64.S marks it
+#     "U27 fragile — NEVER touch"). For Phase C the handler is called
+#     without arguments; the note string is parked in the target's
+#     TaskStruct.note_msg slot and retrievable via a future syscall.
+#
+# See docs/native-api.md "Notes (Plan 9 signals)" for the user-facing
+# API contract this body honours.
+
+from kernel.sched.core import (
+    current_idx_get,
+    task_note_handler_rip, set_task_note_handler_rip,
+    task_note_pending, set_task_note_pending,
+    task_note_saved_rip, set_task_note_saved_rip,
+    task_note_saved_rsp, set_task_note_saved_rsp,
+    task_note_msg_ptr,
+    saved_user_rip_ptr, saved_user_rsp_ptr,
+    set_current_errstr,
+)
+from kernel.printk.printk import printk0, printk1, printk2
+
+
+# Plan 9 note action codes (mirrors 9front's <plan9/libc.h>).
+NCONT: int32 = 0                          # continue at noted-return
+NDFLT: int32 = 1                          # take default action (term)
+NSAVE: int32 = 2                          # save state + return
+NRSTR: int32 = 3                          # restore state + return
+
+
+def do_notify(handler: uint64) -> int64:
+    # notify(handler). Install (or clear, when handler==0) the
+    # user-mode note handler for the current task. Returns 0.
+    #
+    # Plan 9's notify(2) is documented to reject NULL handlers in
+    # later releases (the convention is to call notify(0) to remove a
+    # previously-installed handler — same semantics as POSIX
+    # signal(SIGFOO, SIG_DFL)). We follow the "0 means clear" reading,
+    # which is what 9front's sysnotify actually implements at the
+    # u->notify field.
+    #
+    # No validation of the handler address: kernel can't tell user
+    # text from user data without walking the ELF segments, and a
+    # bogus handler will just trap on first execution — same failure
+    # mode Plan 9 ships with. The errstr swap on bad handlers can land
+    # later if it turns out test cases need it.
+    cur: uint64 = current_idx_get()
+    set_task_note_handler_rip(cur, handler)
+    return 0
+
+
+def do_noted(action: int32) -> int64:
+    # noted(action). Called by the user-mode note handler when it
+    # finishes processing a note. For Phase C we accept any action
+    # value and treat it as NCONT (continue at the originally-
+    # interrupted instruction).
+    #
+    # Restore both the saved user RIP and saved user RSP into the
+    # current syscall's iret-frame slots so the SYSRETQ that closes
+    # this noted() call lands at the original write() return site,
+    # NOT at the instruction after sys_noted in the handler.
+    #
+    # The RSP restore is the load-bearing part: the handler ran on
+    # the same user stack it was originally interrupted on, but with
+    # its own call-frame consumption growing the stack downward. Just
+    # restoring RIP without RSP would resume execution at the right
+    # spot but with the handler's local frame still allocated, which
+    # would clobber the original caller's locals on its next push.
+    #
+    # If note_pending is 0, this is a stray noted() (handler called
+    # noted twice, or called it without ever having been entered via
+    # a real note). Return -1 + errstr; the user-side wrapper can
+    # surface it. Plan 9 itself postnotes the offending task with
+    # "noted: not in handler" — Phase G can grow that path.
+    cur: uint64 = current_idx_get()
+    pending: int32 = task_note_pending(cur)
+    if pending == 0:
+        set_current_errstr("noted: not in handler")
+        return -1
+
+    saved_rip: uint64 = task_note_saved_rip(cur)
+    saved_rsp: uint64 = task_note_saved_rsp(cur)
+
+    # The saved-user-RIP slot lives at kstack_top - 24 (see
+    # syscall_64.S layout) — saved_user_rip_ptr returns a Ptr[uint64]
+    # at exactly that address for the CURRENT task. Same for RSP at
+    # kstack_top - 8. Writing through these retargets the SYSRETQ
+    # that closes do_syscall.
+    rip_slot: Ptr[uint64] = saved_user_rip_ptr()
+    rsp_slot: Ptr[uint64] = saved_user_rsp_ptr()
+    rip_slot[0] = saved_rip
+    rsp_slot[0] = saved_rsp
+
+    set_task_note_pending(cur, 0)
+    # Silently swallow the action argument. NDFLT will eventually
+    # call task_exit_current(128+sig); NSAVE / NRSTR want a real
+    # full-register save area on the user stack. None of those
+    # exist yet.
+    if action != NCONT and action != NDFLT and action != NSAVE \
+            and action != NRSTR:
+        # Unknown action — Plan 9's sysnoted errstrs "bad arg in noted"
+        # and bumps the task into a forced-exit path. We just log and
+        # keep going (continue semantics) so the handler can finish
+        # cleanly during early bring-up. Phase G can tighten this.
+        printk1("noted: unknown action=%d, treating as NCONT\n",
+                cast[uint64](cast[uint32](action)))
+    return 0
+
+
+def deliver_note_to_current(msg: Ptr[uint8], count: uint64) -> int64:
+    # Self-delivery path used by devproc_write when the writer is
+    # also the target (same pid, same task slot). The writer is
+    # currently inside the SYS_WRITE syscall, so its kstack frame has
+    # the saved user RIP / RSP we need to retarget at kstack_top-24
+    # and kstack_top-8 — the same slots saved_user_rip_ptr() /
+    # saved_user_rsp_ptr() return.
+    #
+    # Contract:
+    #   * Copies up to 127 bytes of `msg` into the task's note_msg
+    #     buffer (NUL-terminated; truncates if longer). The first
+    #     byte of count==0 is treated as "empty message" and parks an
+    #     empty C string.
+    #   * Captures the current saved-user-RIP and saved-user-RSP into
+    #     note_saved_rip / note_saved_rsp.
+    #   * Rewrites the saved-user-RIP slot to the installed handler.
+    #     The matching RSP slot is left alone — the handler runs on
+    #     the same user stack the writer was using. SYSRETQ pops the
+    #     RSP slot directly, so leaving it intact means the handler
+    #     starts at the writer's natural RSP minus the pushq %r12
+    #     dance the entry stub did (8 bytes); the same property that
+    #     makes the normal write() return work makes the handler
+    #     entry work too.
+    #   * Sets note_pending=1 so do_noted() knows it's being called
+    #     from inside a real handler frame (not a stray invocation).
+    #
+    # Returns `count` on success (the write() caller's full byte
+    # count was "consumed") — matches the Plan 9 convention that a
+    # successful /proc/<pid>/note write returns its full length.
+    cur: uint64 = current_idx_get()
+    handler: uint64 = task_note_handler_rip(cur)
+    if handler == 0:
+        # Should have been filtered in devproc_write, but defensive
+        # check here too. Plan 9's "no handler installed" default is
+        # to terminate the target; we silently drop for Phase C.
+        printk0("note: deliver_note_to_current called without handler\n")
+        return cast[int64](count)
+
+    # Copy the message into the per-task scratch slot. Cap at 127 +
+    # NUL so the buffer is always a valid C string.
+    dst: Ptr[uint8] = task_note_msg_ptr(cur)
+    take: uint64 = count
+    if take > 127:
+        take = 127
+    i: uint64 = 0
+    while i < take:
+        dst[i] = msg[i]
+        i = i + 1
+    dst[i] = 0
+
+    # Capture the current saved-user-RIP / saved-user-RSP slots into
+    # the per-task save area. Then rewrite the RIP slot so SYSRETQ
+    # lands in the handler instead of the write() return site.
+    rip_slot: Ptr[uint64] = saved_user_rip_ptr()
+    rsp_slot: Ptr[uint64] = saved_user_rsp_ptr()
+    set_task_note_saved_rip(cur, rip_slot[0])
+    set_task_note_saved_rsp(cur, rsp_slot[0])
+    rip_slot[0] = handler
+    set_task_note_pending(cur, 1)
+
+    printk2("note: delivered to pid_slot=%d, handler=%x\n",
+            cast[uint64](cast[uint32](cast[int32](cur))), handler)
+    return cast[int64](count)
