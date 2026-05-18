@@ -53,6 +53,7 @@ from kernel.printk.printk import printk0, printk1, printk2
 from kernel.block.blk import (
     blk_read_sectors, blk_write_sectors, SECTOR_SIZE,
 )
+from mm.page_alloc import alloc_page
 
 
 # Per-partition record. `type_short` is a 4-byte ASCII tag the parser
@@ -173,6 +174,76 @@ GPT_HDR_SIG: uint64 = 0x5452415020494645
 GPT_ENT_TYPE_GUID_OFF: uint64 = 0
 GPT_ENT_FIRST_LBA_OFF: uint64 = 32
 GPT_ENT_LAST_LBA_OFF:  uint64 = 40
+
+
+# --- GPT write-side constants (M16.x: GPT mkpart) ------------------
+#
+# UEFI on-disk GUID encoding is mixed-endian: the first three fields
+# of the text form (AAAAAAAA-BBBB-CCCC) are stored little-endian, and
+# the last two fields (DDDD-EEEEEEEEEEEE) are stored big-endian. We
+# bake the canonical type GUIDs as TWO uint64 halves so the write path
+# can store them with a pair of LE u64 stores (matching how
+# _part_read_u64_le reads them back on the parse side).
+#
+#   Linux filesystem (0FC63DAF-8483-4772-8E79-3D69D8477DE4):
+#     on-disk bytes 0..7  = AF 3D C6 0F 83 84 72 47
+#     on-disk bytes 8..15 = 8E 79 3D 69 D8 47 7D E4
+#     LE u64 bytes 0..7  -> 0x4772_8483_0FC6_3DAF
+#     LE u64 bytes 8..15 -> 0xE47D_47D8_693D_798E
+#
+#   EFI System Partition (C12A7328-F81F-11D2-BA4B-00A0C93EC93B):
+#     on-disk bytes 0..7  = 28 73 2A C1 1F F8 D2 11
+#     on-disk bytes 8..15 = BA 4B 00 A0 C9 3E C9 3B
+#     LE u64 bytes 0..7  -> 0x11D2_F81F_C12A_7328
+#     LE u64 bytes 8..15 -> 0x3BC9_3EC9_A000_4BBA
+#
+# The trailing two hex digits of the HIGH half encode the FIRST byte
+# of the big-endian DDDD field: for ESP that's "BA" (== 0xBA in the
+# low byte of the u64), not "4B". A prior pass mistakenly wrote
+# 0x3BC9_3EC9_A000_004B which is a different GUID; the parse_gpt
+# read path would still record the entry (it doesn't validate the
+# full GUID), but UEFI firmware wouldn't recognise it as an ESP.
+GPT_GUID_LINUX_FS_LOW:    uint64 = 0x477284830FC63DAF
+GPT_GUID_LINUX_FS_HIGH:   uint64 = 0xE47D47D8693D798E
+GPT_GUID_EFI_SYSTEM_LOW:  uint64 = 0x11D2F81FC12A7328
+GPT_GUID_EFI_SYSTEM_HIGH: uint64 = 0x3BC93EC9A0004BBA
+
+# Standard 128-entry × 128-byte partition array = 16384 bytes = 32
+# sectors. UEFI mandates a minimum of 128 entries for partition table
+# compatibility; the spec also requires that the size be a multiple
+# of the sector size (16384 is exactly 32 × 512).
+GPT_ENTRY_SIZE:    uint64 = 128
+GPT_ENTRY_COUNT:   uint64 = 128
+GPT_ARRAY_BYTES:   uint64 = 16384       # GPT_ENTRY_COUNT * GPT_ENTRY_SIZE
+GPT_ARRAY_SECTORS: uint64 = 32          # GPT_ARRAY_BYTES / SECTOR_SIZE
+
+# Primary partition array starts at LBA 2 (just past the GPT header
+# at LBA 1). The first usable LBA for partition data is therefore
+# LBA 34 (after 32 sectors of array). The last usable LBA is
+# (total_sectors - 1 - 32 - 1) = total_sectors - 34, leaving 32
+# sectors for the backup array + 1 for the backup header.
+GPT_PRIMARY_ARRAY_LBA: uint64 = 2
+GPT_FIRST_USABLE_LBA:  uint64 = 34
+
+# GPT header field offsets we need on the write side. The existing
+# read-side constants above cover signature + array_lba + counts;
+# the write path additionally touches revision, header_size,
+# header_crc, current_lba, backup_lba, first_usable, last_usable,
+# disk GUID, and partition-array CRC. Header is 92 bytes; the rest
+# of the sector is zero-padded.
+GPT_HDR_REVISION_OFF:        uint64 = 8
+GPT_HDR_HEADER_SIZE_OFF:     uint64 = 12
+GPT_HDR_HEADER_CRC_OFF:      uint64 = 16
+GPT_HDR_RESERVED_OFF:        uint64 = 20
+GPT_HDR_CURRENT_LBA_OFF:     uint64 = 24
+GPT_HDR_BACKUP_LBA_OFF:      uint64 = 32
+GPT_HDR_FIRST_USABLE_OFF:    uint64 = 40
+GPT_HDR_LAST_USABLE_OFF:     uint64 = 48
+GPT_HDR_DISK_GUID_OFF:       uint64 = 56
+GPT_HDR_ARRAY_CRC_OFF:       uint64 = 88
+
+GPT_HEADER_SIZE:             uint32 = 92
+GPT_REVISION:                uint32 = 0x00010000      # 1.0
 
 
 # --- Internal helpers ----------------------------------------------
@@ -497,6 +568,11 @@ def _partition_scan_inner(slot: int32) -> int32:
         # fixture writes doesn't recurse.
         if _mkpart_smoke_eligible(slot) != 0:
             return _partition_mkpart_smoke_dispatch(slot)
+        # M16.x GPT mkpart-write smoke hook: same shape as above but
+        # name-gated on "nvme0n1" so a single QEMU boot can exercise
+        # both MBR (sd0) and GPT (nvme0n1) write paths side-by-side.
+        if _gpt_smoke_eligible(slot) != 0:
+            return _partition_gpt_smoke_dispatch(slot)
         return -1
     partition_log(slot)
     return mbr_rc
@@ -760,3 +836,522 @@ def _partition_mkpart_smoke_dispatch(slot: int32) -> int32:
 # drivers/, never the reverse, with the single dispatch hook above
 # being the only point of contact.
 from tests.test_mkpart import partition_mkpart_smoke_test
+
+
+# --- GPT write path (M16.x) ----------------------------------------
+#
+# Two public entry points mirroring the MBR write side:
+#
+#   gpt_init(slot, total_sectors)
+#     Lays down a fresh GPT: zeroes any existing partition table,
+#     writes a protective MBR at LBA 0 (primary[0].type = 0xEE,
+#     start_lba = 1, span = min(total_sectors-1, 0xFFFFFFFF)),
+#     writes an empty 128-entry partition array at LBA 2..33,
+#     writes the primary GPT header at LBA 1 (with array_crc32 =
+#     CRC of an all-zero 16384-byte array), and writes the backup
+#     GPT header at last_lba (total_sectors - 1) with the backup
+#     array at last_lba-32..last_lba-1.
+#
+#   gpt_mkpart(slot, idx, start_lba, end_lba, type_guid_high,
+#              type_guid_low)
+#     Writes one partition entry at `idx` in the primary array,
+#     mirrors it in the backup array, recomputes the partition-array
+#     CRC32 over all 128 entries (since CRC32 is sequential it has to
+#     scan the whole array), recomputes the header CRC32 over both
+#     primary and backup headers (their array_crc fields are now in
+#     sync; their `current_lba` and `backup_lba` swap so their CRCs
+#     differ — which is correct per the UEFI spec), and writes back
+#     both 1-sector headers + both 32-sector arrays.
+#
+# Both return 0 on success, -1 on any I/O failure or invalid input.
+# After a successful gpt_mkpart, callers should run partition_rescan
+# to repopulate the in-memory partition_table (the read path doesn't
+# auto-refresh on writes).
+#
+# All entries write the unique-partition-GUID field as a function of
+# (idx, type_guid_high, type_guid_low) so the same disk re-mkpart'd
+# at the same idx produces the same on-disk bytes. Not random —
+# determinism beats "real" uniqueness for an install path that an
+# operator may run repeatedly to debug. Real uniqueness (a CSPRNG-
+# driven GUID) lands when we have a kernel-side RNG plumbed in.
+#
+# V0 scope:
+#   - Only Linux FS + ESP type GUIDs are exposed as constants. Any
+#     other GUID can still be passed in via the (high, low) pair.
+#   - 128-entry array hard-coded (UEFI standard).
+#   - No name field (UTF-16LE bytes 56..127 of an entry stay zero).
+#   - No partition attributes (entry bytes 48..55 stay zero).
+
+
+# Standard Ethernet CRC32 (lib/crc32.c style) with reflected polynomial
+# 0xEDB88320. Distinct from the Castagnoli 0x82F63B78 one in
+# linux_abi/api_crypto.ad — GPT mandates the Ethernet poly.
+gpt_crc32_table:      Array[256, uint32]
+gpt_crc32_table_init: int32 = 0
+
+
+def _gpt_crc32_table_build():
+    i: uint32 = 0
+    while i < 256:
+        c: uint32 = i
+        j: uint32 = 0
+        while j < 8:
+            if (c & 1) != 0:
+                c = (c >> 1) ^ cast[uint32](0xEDB88320)
+            else:
+                c = c >> 1
+            j = j + 1
+        gpt_crc32_table[i] = c
+        i = i + 1
+    gpt_crc32_table_init = 1
+
+
+def _crc32_buf(buf: Ptr[uint8], n: uint64) -> uint32:
+    # Standard reflected CRC32 over `n` bytes of `buf`. Returns the
+    # finalised CRC (post xorout = 0xFFFFFFFF). Lazy table init so a
+    # boot that never touches GPT pays nothing for the 1 KiB table.
+    if gpt_crc32_table_init == 0:
+        _gpt_crc32_table_build()
+    c: uint32 = cast[uint32](0xFFFFFFFF)
+    i: uint64 = 0
+    while i < n:
+        b: uint32 = cast[uint32](buf[i])
+        c = gpt_crc32_table[(c ^ b) & 0xFF] ^ (c >> 8)
+        i = i + 1
+    return c ^ cast[uint32](0xFFFFFFFF)
+
+
+def _gpt_write_u32_le(buf: Ptr[uint8], off: uint64, v: uint32):
+    buf[off + 0] = cast[uint8](v & 0xFF)
+    buf[off + 1] = cast[uint8]((v >> 8) & 0xFF)
+    buf[off + 2] = cast[uint8]((v >> 16) & 0xFF)
+    buf[off + 3] = cast[uint8]((v >> 24) & 0xFF)
+
+
+def _gpt_write_u64_le(buf: Ptr[uint8], off: uint64, v: uint64):
+    _gpt_write_u32_le(buf, off + 0, cast[uint32](v & 0xFFFFFFFF))
+    _gpt_write_u32_le(buf, off + 4, cast[uint32]((v >> 32) & 0xFFFFFFFF))
+
+
+# Scratch buffer for the 128-entry partition array. 16 KiB. We can't
+# use a top-level Array[16384, uint8] directly as the I/O target —
+# .bss layout puts the symbol at an arbitrary offset within its page,
+# so a single 512-byte transfer with PRP1-only-NVMe will silently
+# cross the page boundary and no-op. Instead we keep the array bytes
+# in .bss for cheap module-global access (CRC, stamp-entry, etc.) and
+# bounce them through a one-page scratch (alloc_page on first touch)
+# for the actual I/O. Single-threaded — gpt_init / gpt_mkpart are
+# install-time only, no contention.
+gpt_array_scratch: Array[16384, uint8]
+gpt_bounce_page:   uint64 = 0
+
+
+def _gpt_ensure_bounce() -> int32:
+    if gpt_bounce_page != 0:
+        return 0
+    p: uint64 = alloc_page()
+    if p == 0:
+        printk0("[gpt] alloc_page (bounce) failed\n")
+        return -1
+    gpt_bounce_page = p
+    return 0
+
+# Disk GUID baked in for V0 — every install gets the same disk GUID.
+# Real uniqueness waits on a kernel RNG. Bytes 0..15 spell out the
+# ASCII string "HamnixDiskGUID01" so an `xxd` of LBA 1 makes the
+# write-side fingerprint obvious. We split it into two LE u64 halves
+# the same way the type GUIDs are stored.
+#   bytes 0..7  = 'H' 'a' 'm' 'n' 'i' 'x' 'D' 'i' = 0x69 0x44 0x78 0x69 0x6E 0x6D 0x61 0x48
+#   bytes 8..15 = 's' 'k' 'G' 'U' 'I' 'D' '0' '1' = 0x31 0x30 0x44 0x49 0x55 0x47 0x6B 0x73
+GPT_DISK_GUID_LOW:  uint64 = 0x694478696E6D6148
+GPT_DISK_GUID_HIGH: uint64 = 0x3130444955476B73
+
+
+def _gpt_zero_sector(buf: Ptr[uint8]):
+    i: uint64 = 0
+    while i < 512:
+        buf[i] = 0
+        i = i + 1
+
+
+def _gpt_zero_array_scratch():
+    i: uint64 = 0
+    while i < GPT_ARRAY_BYTES:
+        gpt_array_scratch[i] = 0
+        i = i + 1
+
+
+def _gpt_write_protective_mbr(slot: int32, total_sectors: uint64) -> int32:
+    # Plant the protective MBR at LBA 0. Sector layout:
+    #   bytes 0..445   zero (no bootstrap code — UEFI firmware uses
+    #                  the GPT header directly; legacy BIOS sees a
+    #                  one-entry MBR and either chains a separate
+    #                  bootloader from the ESP or refuses to boot,
+    #                  which is the protective-MBR contract).
+    #   bytes 446..461 single MBR primary entry (type = 0xEE,
+    #                  start_lba = 1, span = total_sectors - 1
+    #                  capped to 0xFFFFFFFF).
+    #   bytes 462..509 zero (entries 1..3 stay empty).
+    #   bytes 510..511 0x55 0xAA signature.
+    # We compose into the page-aligned bounce buffer rather than a
+    # stack Array — see _gpt_write_array for the page-boundary /
+    # NVMe-PRP rationale.
+    if _gpt_ensure_bounce() != 0:
+        return -1
+    sp: Ptr[uint8] = cast[Ptr[uint8]](gpt_bounce_page)
+    _gpt_zero_sector(sp)
+    eoff: uint64 = MBR_PART_TABLE_OFFSET
+    # boot flag (0 = inactive)
+    sp[eoff + 0] = 0
+    # CHS start (legacy; 0x000200 = "cylinder 0, head 0, sector 2" is
+    # the canonical protective-MBR value, but parsers ignore it).
+    sp[eoff + 1] = 0
+    sp[eoff + 2] = 2
+    sp[eoff + 3] = 0
+    # type 0xEE — GPT protective.
+    sp[eoff + 4] = MBR_TYPE_GPT_PROTECT
+    # CHS end (legacy; zero is fine).
+    sp[eoff + 5] = 0xFE
+    sp[eoff + 6] = 0xFF
+    sp[eoff + 7] = 0xFF
+    # LBA start = 1 (the GPT header itself).
+    _mbr_write_u32_le(sp, eoff + 8, 1)
+    # Sector count = total_sectors - 1, capped to 0xFFFFFFFF.
+    span: uint64 = total_sectors - 1
+    if span > 0xFFFFFFFF:
+        span = 0xFFFFFFFF
+    _mbr_write_u32_le(sp, eoff + 12, cast[uint32](span & 0xFFFFFFFF))
+    # Signature.
+    sp[MBR_SIG_OFFSET]     = MBR_SIG_LO
+    sp[MBR_SIG_OFFSET + 1] = MBR_SIG_HI
+    rc: int32 = blk_write_sectors(slot, 0, 1, sp)
+    if rc != 0:
+        printk0("[gpt] protective MBR write failed\n")
+        return -1
+    return 0
+
+
+def _gpt_write_array(slot: int32, array_lba: uint64) -> int32:
+    # Write the 32-sector partition array one sector at a time,
+    # bouncing through a page-aligned scratch (alloc_page) on the way.
+    # The bounce is required because gpt_array_scratch is in .bss at
+    # an arbitrary offset within its page — a single 512-byte transfer
+    # could span the page boundary and NVMe's PRP1-only fast path
+    # would silently no-op without copying the trailing bytes.
+    # gpt_bounce_page is exactly 4 KiB and page-aligned, so any
+    # SECTOR_SIZE-aligned offset 0..3584 within it is safe.
+    if _gpt_ensure_bounce() != 0:
+        return -1
+    bounce_ptr: Ptr[uint8] = cast[Ptr[uint8]](gpt_bounce_page)
+    written: uint64 = 0
+    while written < GPT_ARRAY_SECTORS:
+        src_off: uint64 = written * SECTOR_SIZE
+        # Copy one sector from .bss-resident scratch into the bounce.
+        i: uint64 = 0
+        while i < SECTOR_SIZE:
+            bounce_ptr[i] = gpt_array_scratch[src_off + i]
+            i = i + 1
+        rc: int32 = blk_write_sectors(slot, array_lba + written, 1,
+                                      bounce_ptr)
+        if rc != 0:
+            printk1("[gpt] partition-array write failed at LBA %d\n",
+                    array_lba + written)
+            return -1
+        written = written + 1
+    return 0
+
+
+def _gpt_read_array(slot: int32, array_lba: uint64) -> int32:
+    # Mirror of _gpt_write_array — bounce through the page-aligned
+    # scratch on the read path for the same PRP-fits-in-one-page
+    # reason.
+    if _gpt_ensure_bounce() != 0:
+        return -1
+    bounce_ptr: Ptr[uint8] = cast[Ptr[uint8]](gpt_bounce_page)
+    rd: uint64 = 0
+    while rd < GPT_ARRAY_SECTORS:
+        rc: int32 = blk_read_sectors(slot, array_lba + rd, 1, bounce_ptr)
+        if rc != 0:
+            printk1("[gpt] partition-array read failed at LBA %d\n",
+                    array_lba + rd)
+            return -1
+        dst_off: uint64 = rd * SECTOR_SIZE
+        i: uint64 = 0
+        while i < SECTOR_SIZE:
+            gpt_array_scratch[dst_off + i] = bounce_ptr[i]
+            i = i + 1
+        rd = rd + 1
+    return 0
+
+
+def _gpt_fill_header(buf: Ptr[uint8], current_lba: uint64,
+                     backup_lba: uint64, last_usable: uint64,
+                     array_lba: uint64, array_crc: uint32):
+    # Plant the 92 fixed bytes of the GPT header into a freshly-zeroed
+    # 512-byte sector. Caller fills `buf[16..19]` (header CRC) AFTER
+    # this returns, since the CRC is over the header itself with the
+    # CRC field temporarily set to zero.
+    _gpt_zero_sector(buf)
+    # Signature "EFI PART".
+    _gpt_write_u64_le(buf, GPT_HDR_SIG_OFFSET, GPT_HDR_SIG)
+    # Revision 1.0.
+    _gpt_write_u32_le(buf, GPT_HDR_REVISION_OFF, GPT_REVISION)
+    # Header size = 92.
+    _gpt_write_u32_le(buf, GPT_HDR_HEADER_SIZE_OFF, GPT_HEADER_SIZE)
+    # Header CRC = 0 for now; computed and stamped by caller.
+    _gpt_write_u32_le(buf, GPT_HDR_HEADER_CRC_OFF, 0)
+    # Reserved = 0.
+    _gpt_write_u32_le(buf, GPT_HDR_RESERVED_OFF, 0)
+    # Current LBA, backup LBA.
+    _gpt_write_u64_le(buf, GPT_HDR_CURRENT_LBA_OFF, current_lba)
+    _gpt_write_u64_le(buf, GPT_HDR_BACKUP_LBA_OFF,  backup_lba)
+    # First usable / last usable.
+    _gpt_write_u64_le(buf, GPT_HDR_FIRST_USABLE_OFF, GPT_FIRST_USABLE_LBA)
+    _gpt_write_u64_le(buf, GPT_HDR_LAST_USABLE_OFF,  last_usable)
+    # Disk GUID (16 bytes).
+    _gpt_write_u64_le(buf, GPT_HDR_DISK_GUID_OFF + 0, GPT_DISK_GUID_LOW)
+    _gpt_write_u64_le(buf, GPT_HDR_DISK_GUID_OFF + 8, GPT_DISK_GUID_HIGH)
+    # Array starting LBA.
+    _gpt_write_u64_le(buf, GPT_HDR_ARRAY_LBA_OFF, array_lba)
+    # Entry count = 128, entry size = 128.
+    _gpt_write_u32_le(buf, GPT_HDR_NUM_ENTRIES_OFF,
+                      cast[uint32](GPT_ENTRY_COUNT))
+    _gpt_write_u32_le(buf, GPT_HDR_ENTRY_SIZE_OFF,
+                      cast[uint32](GPT_ENTRY_SIZE))
+    # Partition-array CRC.
+    _gpt_write_u32_le(buf, GPT_HDR_ARRAY_CRC_OFF, array_crc)
+
+
+def _gpt_stamp_header_crc(buf: Ptr[uint8]):
+    # Compute CRC32 over header bytes 0..91 (with the CRC field at
+    # offset 16..19 already zeroed), then stamp the result back into
+    # bytes 16..19.
+    crc: uint32 = _crc32_buf(buf, cast[uint64](GPT_HEADER_SIZE))
+    _gpt_write_u32_le(buf, GPT_HDR_HEADER_CRC_OFF, crc)
+
+
+def gpt_init(slot: int32, total_sectors: uint64) -> int32:
+    # mklabel gpt. Wipes the partition area, writes a protective MBR,
+    # plants a fresh primary + backup GPT header with an empty 128-
+    # entry array.
+    if _slot_in_range(slot) == 0:
+        printk0("[gpt] init: slot out of range\n")
+        return -1
+    if total_sectors < 67:
+        # 1 (MBR) + 1 (primary header) + 32 (primary array) + 32
+        # (backup array) + 1 (backup header) = 67 — the smallest disk
+        # geometry that has room for both GPT copies. Anything less
+        # is an installer bug.
+        printk1("[gpt] init: disk too small (%d sectors, need >=67)\n",
+                total_sectors)
+        return -1
+    last_lba:        uint64 = total_sectors - 1
+    backup_array_lba: uint64 = last_lba - GPT_ARRAY_SECTORS
+    last_usable:     uint64 = backup_array_lba - 1
+
+    # Zero the partition array.
+    _gpt_zero_array_scratch()
+    # Array CRC of all-zero 16384 bytes.
+    array_crc: uint32 = _crc32_buf(&gpt_array_scratch[0], GPT_ARRAY_BYTES)
+
+    # Write protective MBR.
+    if _gpt_write_protective_mbr(slot, total_sectors) != 0:
+        return -1
+
+    # Write primary partition array at LBA 2.
+    if _gpt_write_array(slot, GPT_PRIMARY_ARRAY_LBA) != 0:
+        return -1
+    # Write backup partition array at last_lba - 32.
+    if _gpt_write_array(slot, backup_array_lba) != 0:
+        return -1
+
+    # Primary header at LBA 1. We compose into the page-aligned bounce
+    # buffer rather than a stack Array — same NVMe-PRP rationale as
+    # the protective-MBR write above.
+    hp: Ptr[uint8] = cast[Ptr[uint8]](gpt_bounce_page)
+    _gpt_fill_header(hp, 1, last_lba, last_usable,
+                     GPT_PRIMARY_ARRAY_LBA, array_crc)
+    _gpt_stamp_header_crc(hp)
+    if blk_write_sectors(slot, 1, 1, hp) != 0:
+        printk0("[gpt] primary header write failed\n")
+        return -1
+
+    # Backup header at last_lba. Same fields except current_lba and
+    # backup_lba swap, and the array LBA is backup_array_lba.
+    _gpt_fill_header(hp, last_lba, 1, last_usable,
+                     backup_array_lba, array_crc)
+    _gpt_stamp_header_crc(hp)
+    if blk_write_sectors(slot, last_lba, 1, hp) != 0:
+        printk0("[gpt] backup header write failed\n")
+        return -1
+
+    printk2("[gpt] init OK (total=%d last=%d)\n", total_sectors, last_lba)
+    return 0
+
+
+def _gpt_array_stamp_entry(idx: int32, start_lba: uint64,
+                           end_lba: uint64,
+                           type_guid_high: uint64,
+                           type_guid_low: uint64):
+    # Splice one 128-byte entry into gpt_array_scratch at index `idx`.
+    # Layout:
+    #   +0    type GUID low  (LE u64)
+    #   +8    type GUID high (LE u64)
+    #   +16   unique GUID low  (LE u64) — derived from (idx, type)
+    #   +24   unique GUID high (LE u64) — derived from (idx, type)
+    #   +32   first LBA (u64)
+    #   +40   last LBA  (u64, inclusive)
+    #   +48   attributes (u64, zero)
+    #   +56..127 name (UTF-16LE, zero)
+    eoff: uint64 = cast[uint64](idx) * GPT_ENTRY_SIZE
+    sp: Ptr[uint8] = &gpt_array_scratch[eoff]
+    # Zero the entry first so a partial overwrite doesn't leave stale
+    # bytes in the name / attribute regions.
+    j: uint64 = 0
+    while j < GPT_ENTRY_SIZE:
+        sp[j] = 0
+        j = j + 1
+    _gpt_write_u64_le(sp,  0, type_guid_low)
+    _gpt_write_u64_le(sp,  8, type_guid_high)
+    # Unique GUID — deterministic mix of (idx, type). Not crypto-
+    # secure, but reproducible across installer reruns of the same
+    # layout, which is more useful than "different every time" while
+    # the kernel RNG path is still under construction.
+    uniq_low:  uint64 = type_guid_low  ^ (cast[uint64](idx) * 0x9E3779B97F4A7C15)
+    uniq_high: uint64 = type_guid_high ^ (cast[uint64](idx) * 0xBF58476D1CE4E5B9)
+    _gpt_write_u64_le(sp, 16, uniq_low)
+    _gpt_write_u64_le(sp, 24, uniq_high)
+    _gpt_write_u64_le(sp, 32, start_lba)
+    _gpt_write_u64_le(sp, 40, end_lba)
+
+
+def gpt_mkpart(slot: int32, idx: int32, start_lba: uint64,
+               end_lba: uint64, type_guid_high: uint64,
+               type_guid_low: uint64) -> int32:
+    # Plant one GPT entry at index `idx` (0..127). The entry is
+    # mirrored in both the primary and backup arrays; both header
+    # CRCs are recomputed.
+    if _slot_in_range(slot) == 0:
+        printk0("[gpt] mkpart: slot out of range\n")
+        return -1
+    if idx < 0:
+        printk0("[gpt] mkpart: negative idx\n")
+        return -1
+    iu: uint64 = cast[uint64](idx)
+    if iu >= GPT_ENTRY_COUNT:
+        printk1("[gpt] mkpart: idx %d out of range\n", iu)
+        return -1
+    if end_lba < start_lba:
+        printk2("[gpt] mkpart: bad LBA range start=%d end=%d\n",
+                start_lba, end_lba)
+        return -1
+    # Re-read the existing primary array so other entries planted by
+    # earlier gpt_mkpart calls survive.
+    if _gpt_read_array(slot, GPT_PRIMARY_ARRAY_LBA) != 0:
+        return -1
+    _gpt_array_stamp_entry(idx, start_lba, end_lba,
+                           type_guid_high, type_guid_low)
+
+    # Recompute partition-array CRC over all 128 entries.
+    array_crc: uint32 = _crc32_buf(&gpt_array_scratch[0],
+                                   GPT_ARRAY_BYTES)
+
+    # Write primary array back.
+    if _gpt_write_array(slot, GPT_PRIMARY_ARRAY_LBA) != 0:
+        return -1
+
+    # We need the backup array LBA + last_lba; read the primary
+    # header to recover them. (Saves storing them in module-global
+    # state — gpt_init's parameters aren't preserved across calls.)
+    # Bounce buffer reused across the read + both header writes —
+    # same NVMe-PRP-page rationale as gpt_init.
+    if _gpt_ensure_bounce() != 0:
+        return -1
+    hp: Ptr[uint8] = cast[Ptr[uint8]](gpt_bounce_page)
+    if blk_read_sectors(slot, 1, 1, hp) != 0:
+        printk0("[gpt] mkpart: primary header read failed\n")
+        return -1
+    sig: uint64 = _part_read_u64_le(hp, GPT_HDR_SIG_OFFSET)
+    if sig != GPT_HDR_SIG:
+        printk0("[gpt] mkpart: primary header signature mismatch\n")
+        return -1
+    backup_lba:       uint64 = _part_read_u64_le(hp, GPT_HDR_BACKUP_LBA_OFF)
+    last_usable:      uint64 = _part_read_u64_le(hp, GPT_HDR_LAST_USABLE_OFF)
+    primary_array_lba: uint64 = _part_read_u64_le(hp, GPT_HDR_ARRAY_LBA_OFF)
+    backup_array_lba: uint64 = backup_lba - GPT_ARRAY_SECTORS
+
+    # Mirror the array to the backup region.
+    if _gpt_write_array(slot, backup_array_lba) != 0:
+        return -1
+
+    # Rebuild + restamp primary header with the new array CRC.
+    _gpt_fill_header(hp, 1, backup_lba, last_usable,
+                     primary_array_lba, array_crc)
+    _gpt_stamp_header_crc(hp)
+    if blk_write_sectors(slot, 1, 1, hp) != 0:
+        printk0("[gpt] mkpart: primary header write failed\n")
+        return -1
+
+    # Rebuild + restamp backup header. Swap (current_lba, backup_lba)
+    # and point at the backup partition array.
+    _gpt_fill_header(hp, backup_lba, 1, last_usable,
+                     backup_array_lba, array_crc)
+    _gpt_stamp_header_crc(hp)
+    if blk_write_sectors(slot, backup_lba, 1, hp) != 0:
+        printk0("[gpt] mkpart: backup header write failed\n")
+        return -1
+
+    printk2("[gpt] mkpart idx=%d lba=%d..", iu, start_lba)
+    printk1("%d\n", end_lba)
+    return 0
+
+
+# --- GPT mkpart smoke-test dispatch -------------------------------
+#
+# Mirror of the MBR mkpart smoke gate. Fires when a block device named
+# "nvme0n1" boots with no MBR signature — chosen so a single QEMU run
+# can attach BOTH an AHCI disk (mkpart MBR fixture) and an NVMe disk
+# (this fixture) and exercise both write paths without name collisions.
+# All other names (vda, ram0, sd0, sd0p1, ...) skip this gate.
+
+gpt_smoke_fired: uint32 = 0
+
+
+def _gpt_name_is_nvme0n1(slot: int32) -> int32:
+    base: uint64 = _name_base_index(slot)
+    if partition_dev_name[base + 0] != 0x6E:        # 'n'
+        return 0
+    if partition_dev_name[base + 1] != 0x76:        # 'v'
+        return 0
+    if partition_dev_name[base + 2] != 0x6D:        # 'm'
+        return 0
+    if partition_dev_name[base + 3] != 0x65:        # 'e'
+        return 0
+    if partition_dev_name[base + 4] != 0x30:        # '0'
+        return 0
+    if partition_dev_name[base + 5] != 0x6E:        # 'n'
+        return 0
+    if partition_dev_name[base + 6] != 0x31:        # '1'
+        return 0
+    if partition_dev_name[base + 7] != 0:
+        return 0
+    return 1
+
+
+def _gpt_smoke_eligible(slot: int32) -> int32:
+    if gpt_smoke_fired != 0:
+        return 0
+    if _gpt_name_is_nvme0n1(slot) == 0:
+        return 0
+    return 1
+
+
+def _partition_gpt_smoke_dispatch(slot: int32) -> int32:
+    # Mark fired before invoking — the fixture body finishes with a
+    # partition_rescan() that re-enters _partition_scan_inner, and
+    # we don't want a recursive trigger.
+    gpt_smoke_fired = 1
+    return partition_gpt_mkpart_smoke_test(slot)
+
+
+from tests.test_gpt_mkpart import partition_gpt_mkpart_smoke_test
