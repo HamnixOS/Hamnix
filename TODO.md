@@ -508,8 +508,22 @@ it has to honour.
 
 ## Toolchain & install
 
-- Real-hardware boot (ThinkPad). FAT32 read + EXT4 r/w done;
-  UEFI handover outstanding.
+- ~~Real-hardware boot (ThinkPad). FAT32 read + EXT4 r/w done;
+  UEFI handover outstanding.~~ M16.70: native PE/COFF stub
+  (arch/x86/boot/efi_stub.S) now boots under UEFI directly — no
+  GRUB-EFI dependency. ISO still ships GRUB for BIOS.
+  ~~Real-hardware boot test plan (USB-stick image, README on how to
+  test).~~ Shipped as `docs/REAL_HARDWARE.md` — covers ISO build,
+  USB-stick write, firmware boot menus, expected hardware coverage,
+  known limitations, and the issue-report template. Validation
+  against actual physical machines is now a community ask — file
+  reports at https://github.com/ruapotato/Hamnix/issues.
+- UEFI stub → start_kernel chain. The PE stub today prints a marker
+  and halts; next step is to ELF-load the embedded multiboot kernel
+  image and jump to a new `start_kernel_efi_entry` in head_64.S
+  (skips the 32-bit-mode prologue — UEFI is already in long mode).
+  Once that lands, UEFI boot reaches the full kernel without GRUB
+  anywhere in the path.
 - EFI GOP graphical console. Under UEFI boot, GRUB-EFI doesn't
   program legacy VGA text mode, so `drivers/video/console/vga_text.ad`
   (writes to 0xB8000) is dark on the monitor — UEFI users see only

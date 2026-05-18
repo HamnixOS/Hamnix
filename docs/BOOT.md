@@ -144,6 +144,11 @@ partition).
 
 ## 3. Real-hardware boot
 
+For the full install + boot procedure on physical machines (USB stick
+write, firmware boot menus per vendor, expected hardware coverage,
+known limitations, and how to report issues), see
+[`REAL_HARDWARE.md`](REAL_HARDWARE.md).
+
 Tested-on / known-working list (extend as we verify on more machines):
 
 | Vendor / Model        | Mode | Result | Notes                |
