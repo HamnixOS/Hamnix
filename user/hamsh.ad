@@ -37,6 +37,7 @@ extern def sys_close(fd: int32) -> int32
 extern def sys_pipe(fds: Ptr[int32]) -> int32
 extern def sys_chdir(path: Ptr[char]) -> int32
 extern def sys_getcwd(buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_errstr(buf: Ptr[uint8], nbuf: uint64) -> int32
 extern def sys_exit(code: uint64)
 
 
@@ -328,6 +329,75 @@ def print_prompt():
     sys_write(1, "$ ", 2)
 
 
+# M16.x: small history ring. Stores up to HISTORY_MAX completed
+# lines; arrow-Up walks backward through them, arrow-Down walks
+# forward. Each slot is sized to the same 128-byte line cap as
+# line_buf so we can memcpy snapshots in either direction. The
+# `history_count` field is the TOTAL number of lines ever pushed
+# (mod arithmetic on HISTORY_MAX picks the slot); we keep the
+# absolute count so first-time arrow-Up reliably hits the most
+# recent entry even after the ring wraps.
+HISTORY_MAX:  uint64 = 16
+HISTORY_LINE: uint64 = 128
+history_buf:   Array[2048, uint8]               # 16 * 128
+history_count: uint64 = 0
+
+
+def _history_store(buf: Ptr[uint8], n: uint64):
+    # Copy `buf[0..n)` into the next history slot; NUL-terminate.
+    # Skip a blank or single-newline entry — those would push real
+    # history out of the ring with nothing useful.
+    if n == 0:
+        return
+    if n == 1 and (buf[0] == 0x0A or buf[0] == 0x0D):
+        return
+    slot: uint64 = history_count % HISTORY_MAX
+    base: uint64 = slot * HISTORY_LINE
+    copy_len: uint64 = n
+    if copy_len >= HISTORY_LINE:
+        copy_len = HISTORY_LINE - 1
+    # Trim trailing CR/LF — history entries store the raw command,
+    # not the keystroke that terminated it.
+    while copy_len > 0 \
+            and (buf[copy_len - 1] == 0x0A \
+                 or buf[copy_len - 1] == 0x0D):
+        copy_len = copy_len - 1
+    i: uint64 = 0
+    while i < copy_len:
+        history_buf[base + i] = buf[i]
+        i = i + 1
+    history_buf[base + i] = 0
+    history_count = history_count + 1
+
+
+def _history_load(idx_back: uint64, out: Ptr[uint8], cap: uint64) -> uint64:
+    # Load history entry `idx_back` slots back from the most recent
+    # (idx_back=0 → most recent, 1 → second-most-recent, ...). Writes
+    # NUL-terminated bytes into `out`; returns the length (excluding
+    # NUL). Returns 0 if no such entry exists.
+    if history_count == 0:
+        return 0
+    if idx_back >= history_count or idx_back >= HISTORY_MAX:
+        return 0
+    slot: uint64 = (history_count - 1 - idx_back) % HISTORY_MAX
+    base: uint64 = slot * HISTORY_LINE
+    j: uint64 = 0
+    while j + 1 < cap and history_buf[base + j] != 0:
+        out[j] = history_buf[base + j]
+        j = j + 1
+    out[j] = 0
+    return j
+
+
+def _erase_n(n: uint64):
+    # Emit `\b \b` n times to wipe n characters from the terminal.
+    # Each iteration sends 3 bytes; cheap enough at LINE_MAX=128.
+    i: uint64 = 0
+    while i < n:
+        sys_write(1, "\x08 \x08", 3)
+        i = i + 1
+
+
 # Character-at-a-time line reader with local echo. On real hardware
 # the PS/2 keyboard feeds /dev/cons one byte per keystroke; sys_read
 # returns immediately on the first byte, so the previous "read up to
@@ -337,9 +407,24 @@ def print_prompt():
 # byte back so the user sees what they typed, and handles backspace
 # (DEL = 0x7f, M16.100 atkbd convention) by erasing the previous
 # character on screen.
+#
+# M16.x: also handles VT220-style escape sequences emitted by the
+# atkbd driver (M16.100) — arrow keys, Delete, F1..F4. ESC [ A / B
+# walk history backwards/forwards (rewrites the visible line + the
+# in-progress buf). ESC [ C / D (Right/Left arrows) are swallowed
+# silently — we don't support intra-line cursor movement yet, but
+# we MUST consume the bytes so they don't appear on screen as
+# garbage. ESC [ 3 ~ (Delete) acts as Backspace on the trailing
+# char (best effort given no cursor model). ESC O P..S (F1..F4)
+# are swallowed entirely.
 def read_line(buf: Ptr[uint8], cap: uint64) -> int64:
     pos: uint64 = 0
     one: Array[1, uint8]
+    # `hist_idx` tracks how many entries back from the freshest we're
+    # currently showing. 0 = "no history substitution active, what's
+    # in buf is what the user typed". Each Up arrow bumps it; Down
+    # decrements until it hits 0 (then leaves buf empty).
+    hist_idx: uint64 = 0
     while pos < cap - 1:
         n: int64 = sys_read(0, &one[0], 1)
         if n <= 0:
@@ -351,6 +436,99 @@ def read_line(buf: Ptr[uint8], cap: uint64) -> int64:
             pos = pos + 1
             return cast[int64](pos)
         c: uint8 = one[0]
+        if c == 0x1B:
+            # Escape sequence. Look at the next byte to decide what
+            # to do. The atkbd driver (M16.100) emits the standard
+            # VT220 forms; sequences are at most 5 bytes (e.g.
+            # ESC [ 1 5 ~ for F5).
+            nb: Array[1, uint8]
+            r2: int64 = sys_read(0, &nb[0], 1)
+            if r2 <= 0:
+                # Bare ESC at EOF — swallow.
+                continue
+            c2: uint8 = nb[0]
+            if c2 == 0x5B:                          # '[' — CSI sequence
+                r3: int64 = sys_read(0, &nb[0], 1)
+                if r3 <= 0:
+                    continue
+                c3: uint8 = nb[0]
+                if c3 == 0x41:                      # 'A' — Up arrow
+                    # Replace the line in-progress with the next
+                    # older history entry. Erase what's on screen
+                    # first, then print + load the history line.
+                    new_idx: uint64 = hist_idx + 1
+                    out_tmp: Array[128, uint8]
+                    new_len: uint64 = _history_load(
+                        new_idx - 1, &out_tmp[0], HISTORY_LINE)
+                    if new_len > 0:
+                        _erase_n(pos)
+                        pos = 0
+                        sys_write(1, &out_tmp[0], new_len)
+                        ii: uint64 = 0
+                        while ii < new_len and pos < cap - 1:
+                            buf[pos] = out_tmp[ii]
+                            pos = pos + 1
+                            ii = ii + 1
+                        hist_idx = new_idx
+                    continue
+                if c3 == 0x42:                      # 'B' — Down arrow
+                    if hist_idx > 1:
+                        new_idx2: uint64 = hist_idx - 1
+                        out_tmp2: Array[128, uint8]
+                        new_len2: uint64 = _history_load(
+                            new_idx2 - 1, &out_tmp2[0], HISTORY_LINE)
+                        _erase_n(pos)
+                        pos = 0
+                        sys_write(1, &out_tmp2[0], new_len2)
+                        jj: uint64 = 0
+                        while jj < new_len2 and pos < cap - 1:
+                            buf[pos] = out_tmp2[jj]
+                            pos = pos + 1
+                            jj = jj + 1
+                        hist_idx = new_idx2
+                    elif hist_idx == 1:
+                        # Going forward past the freshest entry —
+                        # land on an empty line.
+                        _erase_n(pos)
+                        pos = 0
+                        hist_idx = 0
+                    continue
+                if c3 == 0x43 or c3 == 0x44:        # 'C'/'D' — Right/Left
+                    # No intra-line cursor model yet. Swallow the
+                    # bytes so the user doesn't see ^[[C / ^[[D.
+                    continue
+                if c3 == 0x33:                      # '3' — likely Delete
+                    # Standard form is ESC [ 3 ~ . Consume one more
+                    # byte to eat the trailing '~' (or any digit /
+                    # ';' for the 4-byte variants). Treat as a
+                    # best-effort Backspace on the trailing char.
+                    tilde: Array[1, uint8]
+                    sys_read(0, &tilde[0], 1)
+                    if pos > 0:
+                        pos = pos - 1
+                        sys_write(1, "\x08 \x08", 3)
+                    continue
+                # Unknown CSI sequence — consume up to one more byte
+                # if the third byte is a digit (parametrised forms
+                # like ESC [ 1 5 ~). Either way, swallow silently.
+                if c3 >= 0x30 and c3 <= 0x39:
+                    tail: Array[1, uint8]
+                    while True:
+                        rt: int64 = sys_read(0, &tail[0], 1)
+                        if rt <= 0:
+                            break
+                        tc: uint8 = tail[0]
+                        # Final byte of a CSI is in 0x40..0x7E.
+                        if tc >= 0x40 and tc <= 0x7E:
+                            break
+                continue
+            if c2 == 0x4F:                          # 'O' — F1..F4 prefix
+                # Consume one more byte (P/Q/R/S) and swallow.
+                tail2: Array[1, uint8]
+                sys_read(0, &tail2[0], 1)
+                continue
+            # Lone ESC + something else — swallow both bytes silently.
+            continue
         if c == 0x7F or c == 0x08:
             # DEL / Backspace — erase last char from buffer + screen.
             if pos > 0:
@@ -365,6 +543,7 @@ def read_line(buf: Ptr[uint8], cap: uint64) -> int64:
         if c == 0x0A or c == 0x0D:
             # CR or LF terminates the line. atkbd emits LF for Enter;
             # serial input gives us CR. Either way, return now.
+            _history_store(buf, pos)
             return cast[int64](pos)
     return cast[int64](pos)
 
@@ -680,7 +859,24 @@ def run_subcmd(argv: Ptr[uint64], argc: uint64) -> int32:
             else:
                 ctarget: Ptr[char] = cast[Ptr[char]](argv[1])
                 if sys_chdir(ctarget) < 0:
-                    write_str(2, "cd: path too long\n")
+                    # M16.x: surface the kernel's per-process error
+                    # string instead of the historical fixed "path
+                    # too long" message. SYS_CHDIR sets errstr to
+                    # "chdir: no such directory" / "chdir: not a
+                    # directory" / "chdir: path too long" (see
+                    # arch/x86/kernel/syscall.ad SYS_CHDIR branch,
+                    # M16.116). Empty errstr → fall back to a
+                    # generic message so the user always sees
+                    # something diagnostic.
+                    ebuf: Array[128, uint8]
+                    ebuf[0] = 0
+                    sys_errstr(&ebuf[0], 128)
+                    if ebuf[0] != 0:
+                        write_str(2, "cd: ")
+                        write_str(2, &ebuf[0])
+                        write_str(2, "\n")
+                    else:
+                        write_str(2, "cd: failed\n")
                     cd_rc = 1
             if out_fd >= 0:
                 sys_close(out_fd)

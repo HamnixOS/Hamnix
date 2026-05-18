@@ -865,19 +865,16 @@ it has to honour.
   "every tool with a 'current dir' intent calls sys_getcwd". Adding
   new tools as Phase G lands should follow ls.ad / find.ad / du.ad
   as templates.
-- **hamsh `cd` error message reports wrong cause.** The cd builtin
-  prints `cd: path too long\n` on ANY sys_chdir failure, even when
-  the kernel errstr is "no such directory" (-ENOENT) or "not a
-  directory" (-ENOTDIR). The fix is small — read sys_errstr after a
-  failed chdir and print that — but lives inside hamsh.ad, which is
-  currently off-limits per the M16.x VMA/parallel-agent fence.
-  Surfaced as the user-reported "path too long" symptom in the
-  `ls`/`vfs_listdir` cpio-routing bug investigation (the actual ls
-  bug was different — vfs_listdir falling through to -EINVAL — but
-  the misleading cd error was what got blamed).
+- ~~**hamsh `cd` error message reports wrong cause.**~~ FIXED in the
+  M16.x hamsh-papercut commit. The cd builtin now calls SYS_ERRSTR
+  after a failed sys_chdir and prints `cd: <errstr>` — surfaces
+  "chdir: no such directory" / "chdir: not a directory" /
+  "chdir: path too long" verbatim from the kernel (see
+  arch/x86/kernel/syscall.ad's SYS_CHDIR branch, M16.116). Empty
+  errstr falls back to `cd: failed\n`. Covered by
+  `scripts/test_hamsh_papercuts.sh`.
 - **hamsh small-bug audit.** Surfaced during the M16.x ls/listdir
-  fix investigation; left unfixed to keep that commit narrowly
-  scoped:
+  fix investigation; partially closed by the hamsh-papercut commit:
     * **No Tab completion.** Line editor reads one char at a time
       and never intercepts TAB. Low-stakes but every new user hits
       this within seconds.
@@ -885,15 +882,37 @@ it has to honour.
       blank prompt should re-print the prompt and re-read; verify
       that path doesn't accidentally tokenize argv[0]="" and spawn
       an empty PATH lookup.
-    * **No history / arrow-key navigation.** Up/Down/Left/Right
-      escape sequences appear inline as raw bytes. A real readline
-      replacement (or even a minimal ring buffer) is a separate
-      project; note it here so future shell-UX work doesn't claim
-      hamsh "supports a normal shell experience".
+    * ~~**No history / arrow-key navigation.** Up/Down/Left/Right
+      escape sequences appear inline as raw bytes.~~ FIXED in the
+      hamsh-papercut commit. `read_line()` now recognises ESC + '['
+      and consumes the rest of the CSI sequence so nothing leaks
+      to the terminal; Up/Down also walk a 16-entry history ring
+      (`history_buf` / `history_count`) and rewrite the visible
+      line in place via `_history_load` + `_erase_n`. ESC O P..S
+      (F1..F4) and ESC [ 3 ~ (Delete) are also handled. Follow-ups
+      still pending:
+        - **Real in-line cursor model.** Left/Right arrows are
+          currently SWALLOWED, not honoured — there's no
+          intra-line cursor today. A proper readline-shape edit
+          buffer (cursor index separate from `pos`, redraw-from-
+          cursor on insert/delete, ANSI cursor-move emit for
+          repaint) is the next-level fix. Same applies to Delete:
+          today it backspaces the trailing char rather than the
+          char at the (nonexistent) cursor.
+        - **Real Tab completion** — needs the cursor model above
+          plus a directory walker against /bin and CWD.
+        - **Signal-INT in middle of editing.** Ctrl-C today does
+          nothing useful while a line is being edited; once
+          `sys_kill` reaches the foreground task from the keyboard
+          driver, `read_line` should drop the in-progress buffer
+          and re-prompt.
     * **Argv tokenization corner-case audit.** `tokenize` in
       hamsh.ad uses double-quote-only quoting; single quotes,
       backslash escapes, and `$VAR` interpolation inside `"…"` all
-      need a pass once Tab-completion or history land.
+      need a pass once Tab-completion or history land. (History is
+      done; deferred for the next surgical pass — the tokenize
+      rewrite is the wide-scope change this commit explicitly
+      avoided.)
 - Real vDSO blob (mapped page advertised via `AT_SYSINFO_EHDR`),
   replacing the U11-era kernel-side `_lookup_dynsym` hack we
   retired in U20.
@@ -1013,10 +1032,37 @@ it has to honour.
   type=<short>` log line per live partition. See
   `scripts/test_partition.sh` for the end-to-end virtio-blk fixture.~~
   Partition follow-ups:
-    - mkpart / mklabel write path — sibling to the read side; writes
-      a fresh MBR or GPT (header + array sectors + CRC32) so the
-      installer can lay down partitions before the file system goes
-      down on a freshly-wiped real disk.
+    - ~~mkpart / mklabel write path — sibling to the read side;
+      writes a fresh MBR (or GPT, deferred) so the installer can lay
+      down partitions before the file system goes down on a freshly-
+      wiped real disk.~~ Shipped in M16.x:
+      `drivers/block/partition.ad::partition_mklabel_mbr(slot)` zeroes
+      sector 0 and re-plants the 0x55AA signature;
+      `partition_mkpart_mbr(slot, idx, start_lba, end_lba, type)`
+      read-modify-writes one of the four primary entries (preserving
+      any GRUB-stage-1 bytes at 0..445). `end_lba` is exclusive
+      (one-past-end), matching parted/sfdisk semantics; the
+      read-side parser still emits the inclusive last-LBA form on
+      `[partition]` log lines. `partition_rescan(slot)` refreshes the
+      in-memory table without clobbering the disk display name. Test
+      fixture: `tests/test_mkpart.ad` (kernel-mode smoke fired by
+      `drivers/block/partition.ad` when an AHCI disk named "sd0" boots
+      with no MBR signature), driven by `scripts/test_mkpart.sh`. PASS
+      markers: `[mkpart] mbr label OK`, `[mkpart] partition 0/1 ...`,
+      `[partition] disk=sd0 idx=0/1 ...`, and the block-layer registers
+      `sd0p1` (cap=30720) + `sd0p2` (cap=32768).
+      Sub-follow-ups:
+        * GPT mkpart / mklabel — protective MBR + GPT header + entry
+          array + backup header with CRC32-over-header and
+          CRC32-over-entry-array. The read side already handles GPT
+          (parse_gpt); the write side is deferred until a CRC32 helper
+          lands in `kernel/lib/`.
+        * Partition-table CRC validation on read — today parse_gpt
+          accepts any signature-bearing header; a deliberate fuzz
+          target would force the CRC check.
+        * Full disklabel-style API — `partition_disklabel(slot, ...)`
+          that returns the whole table in one call so userland (once
+          it exists for partitions) doesn't loop over partition_for.
     - `/dev/sd<a-z><N>` naming — today partitions live in a per-slot
       table; the installer needs `open("/dev/sda2")` to resolve via
       `find_blockdev("sda")` + partition index 1 to a slot range

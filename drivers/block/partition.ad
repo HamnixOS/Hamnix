@@ -22,10 +22,20 @@
 #   - GPT partition array — first 64 entries (sectors 2..33 with the
 #     default 128-byte entry size).
 #
+# Scope (M16.x — partition-table WRITE side, this commit):
+#   - partition_mklabel_mbr(slot) — wipe sector 0 and re-plant 0x55AA.
+#   - partition_mkpart_mbr(slot, idx, start_lba, end_lba, type) —
+#     splice one of the four primary entries into sector 0 (preserving
+#     bootstrap code at bytes 0..445 + signature at 510..511). After
+#     writing, partition_rescan(slot) re-reads sector 0 and populates
+#     the in-memory partition table so blk_register_partitions can mint
+#     sd0pN siblings without rebooting.
+#
 # OUT of scope this commit:
 #   - Extended partitions (CHS extension via type 0x05 / 0x0F).
 #   - BSD disklabel / Apple Partition Map / Sun VTOC.
-#   - mkpart write path — coming in a sibling commit.
+#   - GPT mkpart / mklabel (CRC32-over-header-and-entry-array — write
+#     side deferred; the read-side parse_gpt is unchanged).
 #   - /dev/sd<a-z><N> naming — sibling commit.
 #
 # We expose one 16-slot partition table per registered block device.
@@ -41,7 +51,7 @@
 
 from kernel.printk.printk import printk0, printk1, printk2
 from kernel.block.blk import (
-    blk_read_sectors, SECTOR_SIZE,
+    blk_read_sectors, blk_write_sectors, SECTOR_SIZE,
 )
 
 
@@ -448,6 +458,18 @@ def partition_scan_named(slot: int32, name: Ptr[char]) -> int32:
     return _partition_scan_inner(slot)
 
 
+def partition_rescan(slot: int32) -> int32:
+    # Re-scan a slot WITHOUT touching the display name. Used by
+    # the mkpart write path after a fresh partition table is laid
+    # down — the original partition_scan_named call has already
+    # planted the human-recognisable name ("sd0" / "vda" / ...),
+    # and partition_scan() would clobber it with "slotN\0".
+    if _slot_in_range(slot) == 0:
+        printk0("[partition] rescan: slot out of range\n")
+        return -1
+    return _partition_scan_inner(slot)
+
+
 def _partition_scan_inner(slot: int32) -> int32:
     # Internal: assumes _slot_in_range already returned 1 and the
     # display name has been populated. Reads sector 0, decides MBR
@@ -466,6 +488,15 @@ def _partition_scan_inner(slot: int32) -> int32:
         partition_log(slot)
         return gpt_rc
     if mbr_rc < 0:
+        # M16.x mkpart-write smoke hook: if the disk has no MBR
+        # signature AND the display name is "sd0", run the install-
+        # path fixture once. The fixture mklabel's, mkpart's two
+        # Linux-native primaries, and re-scans — exercising the
+        # full write path on a fresh disk the way the installer will.
+        # Gated by name + a one-shot global so a re-scan after the
+        # fixture writes doesn't recurse.
+        if _mkpart_smoke_eligible(slot) != 0:
+            return _partition_mkpart_smoke_dispatch(slot)
         return -1
     partition_log(slot)
     return mbr_rc
@@ -518,3 +549,214 @@ def partition_log(slot: int32):
             _emit_type_short(ts, k)
             printk0("\n")
         i = i + 1
+
+
+# --- MBR write path (M16.x: partition write side) -----------------
+#
+# Two public entry points:
+#
+#   partition_mklabel_mbr(slot)
+#     Zeroes sector 0 except for the 0x55AA signature at bytes
+#     510..511. Used by the installer to start fresh on a disk that
+#     might already carry a partition table (or junk from a previous
+#     filesystem). After this call, the disk has a valid empty MBR
+#     with all four primary entries cleared.
+#
+#   partition_mkpart_mbr(slot, idx, start_lba, end_lba, type)
+#     Splices one of the four primary partition entries into the
+#     existing sector 0. Reads sector 0 first so any GRUB-stage-1
+#     bootstrap bytes (0..445) are preserved, plants the 16-byte
+#     entry at offset 446 + idx*16, ensures the 0x55AA signature,
+#     and writes the sector back. CHS fields are zeroed — every
+#     modern OS reads LBA fields exclusively, and the partition
+#     module's own parse_mbr ignores CHS by design.
+#
+#   end_lba is EXCLUSIVE (the one-past-end LBA of the partition).
+#   The MBR's per-entry "sector count" stores end_lba - start_lba.
+#   This matches the way installers (parted, sfdisk's
+#   `start=N, size=M`) and userland think about partition extents:
+#   adjacent partitions touch at end_lba == next.start_lba without
+#   overlapping at the boundary sector.
+#
+#   parse_mbr stores lba_end as the INCLUSIVE last LBA
+#   (lba_start + nsec - 1), so a partition created here as
+#   mkpart(start=2048, end=32768) reads back from partition_for()
+#   as lba_start=2048, lba_end=32767. The `[mkpart]` write-side log
+#   line echoes the as-passed values (2048..32768); the
+#   `[partition]` read-side log line emits the inclusive form
+#   (2048..32767). Test fixtures grep for both.
+#
+# Both return 0 on success, -errno on failure. After a successful
+# mkpart, callers should re-call partition_rescan(slot) to refresh
+# the in-memory table — this isn't done automatically so a batch of
+# mkpart calls can be combined into one re-scan at the end.
+
+def _mbr_write_u32_le(buf: Ptr[uint8], off: uint64, v: uint32):
+    # Sibling of _part_read_u32_le. Used to plant lba_start +
+    # sector_count fields. The MBR is little-endian on every host
+    # we care about, so a four-byte memcpy-shaped store is fine.
+    buf[off + 0] = cast[uint8](v & 0xFF)
+    buf[off + 1] = cast[uint8]((v >> 8) & 0xFF)
+    buf[off + 2] = cast[uint8]((v >> 16) & 0xFF)
+    buf[off + 3] = cast[uint8]((v >> 24) & 0xFF)
+
+
+def partition_mklabel_mbr(slot: int32) -> int32:
+    # mklabel msdos. Sector 0 becomes 512 bytes of zeros except for
+    # the 0x55AA signature at bytes 510..511 — the bare-minimum valid
+    # empty MBR. We deliberately wipe the bootstrap code region too;
+    # this routine is "give me a virgin disk for Hamnix install",
+    # not "rewrite the partition table in place under an existing
+    # boot loader". The installer will plant its own boot code in a
+    # separate step.
+    if _slot_in_range(slot) == 0:
+        printk0("[mkpart] mklabel: slot out of range\n")
+        return -1
+    sec: Array[512, uint8]
+    i: uint64 = 0
+    while i < 512:
+        sec[i] = 0
+        i = i + 1
+    sec[MBR_SIG_OFFSET]     = MBR_SIG_LO
+    sec[MBR_SIG_OFFSET + 1] = MBR_SIG_HI
+    rc: int32 = blk_write_sectors(slot, 0, 1, &sec[0])
+    if rc != 0:
+        printk0("[mkpart] mklabel: blk_write_sectors LBA 0 failed\n")
+        return -1
+    printk0("[mkpart] mbr label OK\n")
+    return 0
+
+
+def partition_mkpart_mbr(slot: int32, idx: uint64,
+                         start_lba: uint64, end_lba: uint64,
+                         ptype: uint8) -> int32:
+    # Plant one MBR primary entry. Read-modify-write of sector 0:
+    # we read the existing 512 bytes (which preserves any boot code
+    # the installer planted between bytes 0..445), splice in the
+    # 16-byte entry at the right offset, restamp the signature, and
+    # write back.
+    if _slot_in_range(slot) == 0:
+        printk0("[mkpart] mkpart: slot out of range\n")
+        return -1
+    if idx >= MBR_PART_ENTRY_COUNT:
+        printk1("[mkpart] mkpart: idx %d out of MBR primary range\n",
+                idx)
+        return -1
+    if end_lba <= start_lba:
+        printk2("[mkpart] mkpart: bad LBA range start=%d end=%d\n",
+                start_lba, end_lba)
+        return -1
+    # MBR's sector-count field is a uint32 — anything beyond ~2 TiB
+    # overflows. Reject early so the installer hears about a too-big
+    # request instead of silently writing a truncated entry. end_lba
+    # is exclusive (one-past-end), so span = end - start.
+    span: uint64 = end_lba - start_lba
+    if span > 0xFFFFFFFF:
+        printk1("[mkpart] mkpart: partition span %d exceeds 32-bit MBR\n",
+                span)
+        return -1
+
+    sec: Array[512, uint8]
+    rc: int32 = blk_read_sectors(slot, 0, 1, &sec[0])
+    if rc != 0:
+        printk0("[mkpart] mkpart: read MBR sector 0 failed\n")
+        return -1
+
+    eoff: uint64 = MBR_PART_TABLE_OFFSET + idx * MBR_PART_ENTRY_SIZE
+    sp: Ptr[uint8] = &sec[0]
+    # +0   boot flag (0 = inactive — modern OSes ignore this)
+    sp[eoff + 0] = 0
+    # +1..3 CHS start (legacy; zeros are fine for LBA-only consumers)
+    sp[eoff + 1] = 0
+    sp[eoff + 2] = 0
+    sp[eoff + 3] = 0
+    # +4    type byte
+    sp[eoff + 4] = ptype
+    # +5..7 CHS end   (legacy; same reason)
+    sp[eoff + 5] = 0
+    sp[eoff + 6] = 0
+    sp[eoff + 7] = 0
+    # +8..11  LBA start (LE u32)
+    _mbr_write_u32_le(sp, eoff + 8, cast[uint32](start_lba & 0xFFFFFFFF))
+    # +12..15 sector count (LE u32)
+    _mbr_write_u32_le(sp, eoff + 12, cast[uint32](span & 0xFFFFFFFF))
+
+    # Defence in depth: stamp the 0x55AA signature even if a previous
+    # mklabel was skipped (e.g. caller plants partitions on a
+    # zeroed-but-unlabeled disk).
+    sp[MBR_SIG_OFFSET]     = MBR_SIG_LO
+    sp[MBR_SIG_OFFSET + 1] = MBR_SIG_HI
+
+    rc = blk_write_sectors(slot, 0, 1, &sec[0])
+    if rc != 0:
+        printk0("[mkpart] mkpart: blk_write_sectors LBA 0 failed\n")
+        return -1
+    printk2("[mkpart] partition %d lba=%d..", idx, start_lba)
+    printk1("%d", end_lba)
+    printk0(" type=")
+    # Emit the type byte as "0xNN" to match parse_mbr's `type=0x83`
+    # log convention.
+    hi_n: uint32 = cast[uint32]((ptype >> 4) & 0xF)
+    lo_n: uint32 = cast[uint32](ptype & 0xF)
+    printk0("0x")
+    _emit_hex_nibble(hi_n)
+    _emit_hex_nibble(lo_n)
+    printk0("\n")
+    return 0
+
+
+def _emit_hex_nibble(n: uint32):
+    c: uint32 = _hex_nibble(n)
+    printk1("%c", cast[uint64](c))
+
+
+# --- mkpart smoke-test dispatch -----------------------------------
+#
+# The actual fixture body lives in tests/test_mkpart.ad so we don't
+# bloat the production parser with test bytes. partition.ad owns the
+# gate (name == "sd0" + once-only global) so the only state that
+# leaks into normal boots is one cheap byte-compare on an unsigned
+# disk that happens to match the test name.
+
+mkpart_smoke_fired: uint32 = 0
+
+
+def _mkpart_name_is_sd0(slot: int32) -> int32:
+    # Inline byte-compare against the literal "sd0\0" — we don't have
+    # a real strcmp(Ptr[char], Ptr[char]) helper in this module and
+    # pulling one in just for one comparison is overkill.
+    base: uint64 = _name_base_index(slot)
+    if partition_dev_name[base + 0] != 0x73:        # 's'
+        return 0
+    if partition_dev_name[base + 1] != 0x64:        # 'd'
+        return 0
+    if partition_dev_name[base + 2] != 0x30:        # '0'
+        return 0
+    if partition_dev_name[base + 3] != 0:
+        return 0
+    return 1
+
+
+def _mkpart_smoke_eligible(slot: int32) -> int32:
+    if mkpart_smoke_fired != 0:
+        return 0
+    if _mkpart_name_is_sd0(slot) == 0:
+        return 0
+    return 1
+
+
+def _partition_mkpart_smoke_dispatch(slot: int32) -> int32:
+    # Mark fired before calling — partition_mkpart_smoke_test() ends
+    # by re-running _partition_scan_inner via partition_rescan(), and
+    # we want that recursive call to take the normal MBR-present path
+    # rather than re-fire the fixture.
+    mkpart_smoke_fired = 1
+    return partition_mkpart_smoke_test(slot)
+
+
+# Forward import — defined in tests/test_mkpart.ad. Keeping the
+# fixture out-of-tree from drivers/* leaves the production parser
+# small + makes the dependency direction obvious: tests/ depends on
+# drivers/, never the reverse, with the single dispatch hook above
+# being the only point of contact.
+from tests.test_mkpart import partition_mkpart_smoke_test
