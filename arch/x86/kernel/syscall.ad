@@ -40,13 +40,23 @@ from kernel.sched.core import (
     set_task_fs_base, set_task_clear_child_tid,
     task_pml4,
     set_current_errstr,
+    # V4: srv_open needs a Ptr[TaskStruct] for the poster's slot so
+    # vfs_srv_dup_into_current can copy_fd_entry from the poster's
+    # table to the caller's. task_struct_at returns 0 (NULL) for
+    # out-of-range slot indices — the syscall body bails with errstr
+    # "srv: kernel-only" in that case.
+    task_struct_at,
 )
 from fs.vfs import (
     vfs_open, vfs_open_write, vfs_pipe, vfs_read, vfs_write,
     vfs_close, vfs_lseek, vfs_dup, vfs_dup2, vfs_listdir,
-    vfs_unlink, vfs_fd_is_dir,
+    vfs_unlink, vfs_fd_is_dir, vfs_fd_is_open,
     resolve_path,
     initramfs_data_ptr, initramfs_data_size,
+    # V4: cross-task fd dup helper. sys_srv_open hands it the
+    # poster's Ptr[TaskStruct] and the poster-relative srvfd; it
+    # returns a new fd in the caller's table or -errno.
+    vfs_srv_dup_into_current,
 )
 from fs.elf import (
     elf_load_blob, elf_last_was_linux,
@@ -96,6 +106,13 @@ from sys.src.port9.port.syschan import do_bind, do_mount, do_unmount
 # Imported through the port9 directory alias for the same identifier
 # reason as error.ad / sysproc.ad above.
 from sys.src.port9.port.sysnote import do_notify, do_noted
+# Phase D / V4: devsrv post + structured lookup. devsrv_post_from
+# records the poster's task_table slot index so sys_srv_open (276)
+# can later copy_fd_entry the underlying file/pipe into the opener's
+# fd table. Body lives in sys/src/9/port/devsrv.ad.
+from sys.src.port9.port.devsrv import (
+    devsrv_post_from, devsrv_lookup_full,
+)
 
 extern def do_execve_finish(new_rip: uint64, new_rsp: uint64,
                             argc: uint64, argv: uint64)
@@ -170,6 +187,24 @@ SYS_FWSTAT:      uint64 = 267                  # a0=fd, a1=buf, a2=nbuf
 # 270 / 271 in docs/native-api.md; bodies in sys/src/9/port/sysnote.ad.
 SYS_NOTIFY:      uint64 = 270                  # a0=handler RIP (0 = clear); returns 0
 SYS_NOTED:       uint64 = 271                  # a0=action (NCONT/NDFLT/NSAVE/NRSTR); returns 0
+# Phase D / V4: Plan 9 `srv` post/open. Numbers 272..274 are reserved
+# in docs/native-api.md (awake/segattach/segdetach — none implemented),
+# so SYS_SRV_POST / SYS_SRV_OPEN pick the next two free slots above
+# the reserved block. Bodies live inline below (validation + a thin
+# wrapper around sys/src/9/port/devsrv.ad). This is the userspace
+# surface that unblocks V4 — without it /srv stays empty, hamwd has
+# no way to publish itself, and `mount` over a posted srvfd is
+# bootstrap-only.
+SYS_SRV_POST:    uint64 = 275                  # a0=name, a1=srvfd; returns 0/-1
+SYS_SRV_OPEN:    uint64 = 276                  # a0=name; returns new fd / -1
+
+# V4 SYS_SRV_OPEN scratch — two int32 cells the devsrv_lookup_full
+# helper writes into (cell 0 = poster slot, cell 1 = poster-relative
+# srvfd). Top-level so the codegen's Ptr[int32] writes land at a
+# stable address; Adder's nested-frame Array bug also doesn't bite
+# at module scope. Only one syscall runs at a time so a single
+# shared cell pair is safe (no nesting / reentrancy).
+_srv_open_scratch: Array[2, int32]
 
 # Linux-numbered syscalls (L-track, linux_abi/). We use the stock
 # Linux 6.12 x86_64 numbers so userspace tools built against Linux's
@@ -909,6 +944,41 @@ def syscall_init():
     printk0("Hamnix: syscall MSRs armed (SYSCALL/SYSRET enabled)\n")
 
 
+def _srv_name_valid(name: Ptr[char]) -> int32:
+    # V4: validate `/srv/<leaf>` candidates from userspace. Rules
+    # match docs/native-api.md's `/srv/<name>` reserved-path entry:
+    #   * non-NUL first byte (no empty name)
+    #   * <= 32 bytes including NUL
+    #   * ASCII printable only (32 < c < 127); excludes control chars
+    #   * no '/' (would collide with path traversal in fs/vfs.ad's
+    #     _open_srv_name nested-path bail)
+    #   * not "." or "..", and no leading '.' (those would land at the
+    #     same path as the directory itself / parent in the future
+    #     namespace-aware open path)
+    # Returns 1 on accept, 0 on reject.
+    if cast[uint64](name) == 0:
+        return 0
+    c0: int32 = name[0]
+    if c0 == 0:
+        return 0
+    if c0 == 46:                                    # '.'
+        return 0
+    i: uint64 = 0
+    while i < 33:
+        c: int32 = name[i]
+        if c == 0:
+            if i == 0:
+                return 0
+            return 1
+        if c <= 32 or c >= 127:
+            return 0
+        if c == 47:                                 # '/'
+            return 0
+        i = i + 1
+    # 33 bytes scanned without NUL — name is too long (>32 incl NUL).
+    return 0
+
+
 def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
                a3: uint64, a4: uint64, a5: uint64) -> uint64:
     # Tail of the syscall entry path. nr is the user's %rax; a0..a5
@@ -1333,6 +1403,81 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         # every action as NCONT and restores the saved iret-frame
         # RIP/RSP. Body in sys/src/9/port/sysnote.ad.
         return cast[uint64](do_noted(cast[int32](a0)))
+    if nr == SYS_SRV_POST:
+        # Phase D / V4: publish (name -> srvfd) into the kernel-internal
+        # srv table. a0 = NUL-terminated leaf name (Ptr[char]), a1 =
+        # srvfd in the CALLER's fd table. Validation:
+        #   * name must pass _srv_name_valid (1..32 bytes, printable
+        #     ASCII, no '/' or leading '.').
+        #   * srvfd must be open in the current task's fd table.
+        #   * name must not collide with an existing entry, and the
+        #     16-slot table must have room.
+        # Returns 0 on success, -1 with errstr on any failure.
+        nm: Ptr[char] = cast[Ptr[char]](a0)
+        if _srv_name_valid(nm) == 0:
+            set_current_errstr("srv: bad name")
+            return cast[uint64](-1)
+        post_fd: int32 = cast[int32](a1)
+        if post_fd < 0 or post_fd >= 16:
+            set_current_errstr("srv: bad fd")
+            return cast[uint64](-1)
+        if vfs_fd_is_open(post_fd) == 0:
+            set_current_errstr("srv: bad fd")
+            return cast[uint64](-1)
+        poster_slot: int32 = cast[int32](current_idx_get())
+        rc: int32 = devsrv_post_from(nm, post_fd, poster_slot)
+        if rc < 0:
+            # devsrv_post_from returns -1 for both "dup name" and
+            # "table full". The two cases share an error string at
+            # this milestone — `errstr` callers see one of these
+            # two literals; a finer-grained distinction is V4.5 work
+            # if a userspace tool needs to differentiate.
+            set_current_errstr("srv: name in use or table full")
+            return cast[uint64](-1)
+        return 0
+    if nr == SYS_SRV_OPEN:
+        # Phase D / V4: look up (name) and dup the poster's underlying
+        # file/pipe into the CALLER's fd table. a0 = NUL-terminated
+        # leaf name (Ptr[char]). Returns the new fd on success or -1
+        # with errstr on miss. The dup pattern follows sys_pipe and
+        # sys_dup — _alloc_fd in the current task, then copy_fd_entry
+        # bumps any pipe refcount so closing the poster's end doesn't
+        # collapse the channel under the opener.
+        nm2: Ptr[char] = cast[Ptr[char]](a0)
+        if _srv_name_valid(nm2) == 0:
+            set_current_errstr("srv: bad name")
+            return cast[uint64](-1)
+        # The two output cells live in a top-level Array because Adder's
+        # codegen reliably handles `Ptr[int32]` writes against array
+        # elements; stack-allocated `int32` locals taken by-address
+        # tripped a sign/size mismatch in the first cut of this code.
+        # _srv_open_scratch[0] = poster_slot, [1] = poster-relative srvfd.
+        _srv_open_scratch[0] = -1
+        _srv_open_scratch[1] = -1
+        rc2: int32 = devsrv_lookup_full(nm2,
+                                        &_srv_open_scratch[0],
+                                        &_srv_open_scratch[1])
+        if rc2 < 0:
+            set_current_errstr("srv: not posted")
+            return cast[uint64](-1)
+        src_slot: int32 = _srv_open_scratch[0]
+        src_fd:   int32 = _srv_open_scratch[1]
+        if src_slot < 0:
+            # Kernel-posted entry (devsrv_post via the V3 entry point);
+            # no source TaskStruct to dup from. The opener gets a clear
+            # error rather than a silent ENOENT.
+            set_current_errstr("srv: kernel-only")
+            return cast[uint64](-1)
+        src_task: Ptr[TaskStruct] = task_struct_at(src_slot)
+        if cast[uint64](src_task) == 0:
+            set_current_errstr("srv: poster gone")
+            return cast[uint64](-1)
+        new_fd: int32 = vfs_srv_dup_into_current(src_task,
+                                                 cast[uint64](src_fd))
+        if new_fd < 0:
+            set_current_errstr("srv: dup failed")
+            return cast[uint64](-1)
+        return cast[uint64](new_fd)
     if nr == SYS_INIT_MODULE:
         # Linux-ABI .ko loader (L1). a0=Ptr[uint8] image, a1=size,
         # a2=Ptr[char] params (param string, NUL-terminated; can be

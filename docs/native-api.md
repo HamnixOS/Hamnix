@@ -250,6 +250,70 @@ close(fd)
 everything at `old`; otherwise removes the specific `new->old`
 edge from a union mount.
 
+### `srv_post(name: Ptr[uint8], srvfd: int32) -> int32`
+
+**New, number 275.** Publish `srvfd` into the kernel's `srv` table
+under `name`. After a successful call, any task can `srv_open(name)`
+to obtain its own fd referring to the same underlying file/pipe.
+
+Rules for `name`:
+
+- 1..32 bytes including the NUL terminator.
+- Printable ASCII only (32 < byte < 127); no control chars.
+- No `/` — `name` is a single leaf component, not a path.
+- No leading `.` (reserved for future directory semantics).
+- Must not collide with an existing entry; the 16-slot table must
+  have room.
+
+Failure modes (return -1, errstr set):
+
+| errstr                              | meaning                                   |
+|-------------------------------------|-------------------------------------------|
+| `srv: bad name`                     | validation rule above failed              |
+| `srv: bad fd`                       | `srvfd` is closed or out of range         |
+| `srv: name in use or table full`    | collision OR all 16 slots posted          |
+
+The caller retains ownership of `srvfd` — `srv_post` does NOT close
+it on success and does NOT refcount the underlying file/pipe. If
+the poster closes its `srvfd` before any consumer calls `srv_open`,
+the entry stays in the name table but lookups fail with
+`srv: not posted` because the kernel detects the now-closed source
+slot. Phase D follow-up will refcount the underlying object so
+`srv_post` survives the poster's `close`.
+
+### `srv_open(name: Ptr[uint8]) -> int32`
+
+**New, number 276.** Look up `name` in the kernel `srv` table and
+dup the poster's underlying file/pipe into the calling task's fd
+table. Returns the new fd or -1.
+
+Implementation detail (for those debugging cross-task fd flow): the
+kernel records the poster's task-table slot index at `srv_post`
+time, and `srv_open` calls `copy_fd_entry` from the poster's
+TaskStruct into the caller's. Pipe refcounts are bumped — the
+opener's fd survives the poster's `close`.
+
+Failure modes (return -1, errstr set):
+
+| errstr                | meaning                                                |
+|-----------------------|--------------------------------------------------------|
+| `srv: bad name`       | validation rule above failed                            |
+| `srv: not posted`     | no entry under `name`, or poster's fd has been closed  |
+| `srv: kernel-only`    | entry was posted from kernel space (no source task)    |
+| `srv: poster gone`    | poster's task slot is invalid                          |
+| `srv: dup failed`     | caller is out of fd slots, or copy_fd_entry failed     |
+
+Canonical service-consumer pattern (mirrors the `mount` example
+above; the `open("/srv/<name>")` form also works once `init` has
+done its `bind '#s' /srv` recipe, but `srv_open` is direct):
+
+```
+fd = srv_open("hamwd")
+mount(fd, -1, "/dev/win", MREPL, "")
+close(fd)
+# /dev/win/* is now backed by hamwd
+```
+
 ### `chdir(path: Ptr[uint8]) -> int32`
 
 **Number 19.** Change working directory.
@@ -411,6 +475,8 @@ moves break Linux ABI** (Layer 2 has its own dispatch table).
 | 272 | `awake` (reserved) |
 | 273 | `segattach` (reserved) |
 | 274 | `segdetach` (reserved) |
+| 275 | `srv_post` (shipped: V4 — userspace publishes srvfd at `/srv/<name>`) |
+| 276 | `srv_open` (shipped: V4 — opener dups poster's srvfd into its own fd table) |
 
 ## Things deliberately left out
 

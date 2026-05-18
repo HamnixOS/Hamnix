@@ -404,6 +404,41 @@ sys_rfork:
     .size sys_rfork, .-sys_rfork
 
 
+    /* --- sys_srv_post(name, srvfd) -> int32 -------------------------
+     * Phase D / V4: publish (name -> srvfd) into the kernel `srv`
+     * table. `name` is a NUL-terminated leaf ("hamwd", not
+     * "/srv/hamwd"); `srvfd` is an fd open in the calling task.
+     * Returns 0 on success or -1 with errstr ("srv: bad name",
+     * "srv: bad fd", "srv: name in use or table full"). SysV first
+     * two arg regs (%rdi/%rsi) align with the syscall ABI's a0/a1
+     * — no shuffle needed. Mirrors the sys_bind/sys_mount wrappers
+     * above for shape and comment style. */
+    .globl sys_srv_post
+    .type sys_srv_post, @function
+sys_srv_post:
+    movq    $275, %rax              /* SYS_SRV_POST */
+    syscall
+    ret
+    .size sys_srv_post, .-sys_srv_post
+
+
+    /* --- sys_srv_open(name) -> int32 --------------------------------
+     * Phase D / V4: open a posted `srv` name. Returns a fresh fd in
+     * the CALLER's fd table (the kernel copy_fd_entry's the poster's
+     * underlying file/pipe into the caller's table), or -1 with
+     * errstr ("srv: not posted", "srv: kernel-only", "srv: dup
+     * failed"). Once you have the fd you typically pass it straight
+     * to sys_mount + close it, per the docs/native-api.md service-
+     * consumer idiom. */
+    .globl sys_srv_open
+    .type sys_srv_open, @function
+sys_srv_open:
+    movq    $276, %rax              /* SYS_SRV_OPEN */
+    syscall
+    ret
+    .size sys_srv_open, .-sys_srv_open
+
+
     /* --- syscall6(nr, a0, a1, a2, a3, a4, a5) -> int64 ---------------
      * Generic 6-arg syscall trampoline. SysV passes nr in %rdi, a0..a5
      * in %rsi/%rdx/%rcx/%r8/%r9/[stack]; the kernel syscall ABI wants
