@@ -28,7 +28,9 @@
 #   0x38  s_magic              u16  (0xEF53)
 #   0x58  s_inode_size         u16
 
-from kernel.block.blk import blk_read_sectors, blk_write_sectors, SECTOR_SIZE
+from kernel.block.blk import (
+    blk_read_sectors, blk_write_sectors, find_blockdev, SECTOR_SIZE,
+)
 from kernel.printk.printk import printk0, printk1, printk2
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
@@ -134,18 +136,18 @@ def ext4_is_mounted() -> int32:
     return 1
 
 
-# Scratch buffer for one filesystem block. Sized for 1 KiB blocks
-# (our test image); larger block sizes will need bumping or a slab
-# allocation per call.
-ext4_blk_buf: Array[1024, uint8]
+# Scratch buffer for one filesystem block. Sized to cover the 4 KiB
+# blocks ext4_mkfs produces (M16.x) AND the 1 KiB blocks the existing
+# test image uses. Larger block sizes (16 KiB+) would need bumping or
+# a slab allocation per call.
+ext4_blk_buf: Array[4096, uint8]
 
 # Separate scratch for the extent-tree walk. _ext4_logical_to_physical
 # is called by ext4_read_file just BEFORE that function reads the
 # physical data block into ext4_blk_buf — so reusing the same buffer
 # for index-node reads would race with the data read on the same
-# iteration. Keep a dedicated 1 KiB page here. (4 KiB block sizes
-# would need this bumped along with ext4_blk_buf — same constraint.)
-ext4_ext_scratch: Array[1024, uint8]
+# iteration. Same 4 KiB sizing as ext4_blk_buf.
+ext4_ext_scratch: Array[4096, uint8]
 
 
 def _ext4_read_block(block_nr: uint64, buf: Ptr[uint8]) -> int32:
@@ -830,6 +832,15 @@ def ext4_listdir(path: Ptr[char], buf: Ptr[uint8],
 
 def is_ext_path(name: Ptr[char]) -> int32:
     # /ext/ prefix check, same shape as is_fat_path.
+    #
+    # M16.x: also the lazy trigger point for ext4_mkfs_self_test().
+    # block_smoke_test() in init/main.ad runs BEFORE ahci_smoke_test
+    # registers sd0p1, so calling the self-test from ext4_init's tail
+    # fires too early. is_ext_path runs on every VFS open from
+    # userspace — by then ahci_smoke_test has long finished and
+    # sd0p1 is live. The one-shot gate inside _ext4_mkfs_self_test_maybe
+    # keeps subsequent VFS opens cheap (one global compare + branch).
+    _ext4_mkfs_self_test_maybe()
     prefix: Ptr[uint8] = "/ext/"
     i: int32 = 0
     while True:
@@ -897,7 +908,7 @@ def ext4_dir_dump(dir_inode_buf: Ptr[uint8]):
 # because alloc callers want to keep their dir/extent buffer intact
 # while we mutate the bitmap.
 
-ext4_bitmap_buf: Array[1024, uint8]
+ext4_bitmap_buf: Array[4096, uint8]
 
 
 def _ext4_group_desc_field_u32(grp: uint64, field_off: uint64) -> uint32:
@@ -1619,3 +1630,427 @@ def ext4_unlink(name: Ptr[char]) -> int32:
     _ext4_write_u32(cast[Ptr[uint8]](
         cast[uint64](&ext4_blk_buf[0]) + target_pos + 0), 0)
     return _ext4_write_block(target_phys, &ext4_blk_buf[0])
+
+
+# --- ext4_mkfs (M16.x) --------------------------------------------
+#
+# Format a freshly-partitioned slice as ext4. Mirrors the simplest
+# viable subset of e2fsprogs/mke2fs.c — single block group, no
+# journal, extents-only (so the existing M16.51..67 read path picks
+# the FS up unchanged). The resulting filesystem has:
+#
+#   * 4 KiB blocks (s_log_block_size = 2)
+#   * 256-byte inodes (s_inode_size = 256)
+#   * one block group (we accept partitions up to 32768 blocks =
+#     128 MiB; larger slices are clamped to one group — multi-group
+#     mkfs is a documented follow-up)
+#   * 8192 inodes/group, inode #2 = the root directory containing
+#     just "." and ".."
+#   * legacy 32-byte group descriptors (no 64BIT, no metadata_csum,
+#     no journal — Linux's tune2fs -O ^has_journal output shape)
+#   * volume label "hamnix-mkfs"
+#
+# On-disk layout inside the partition (blocks are 4 KiB; sectors are
+# 512 bytes, 8 sectors per block):
+#
+#   block 0   bytes 0..1023 = boot area; bytes 1024..2047 = SB
+#   block 1   group descriptor table (one 32-byte entry, rest zero)
+#   block 2   block bitmap (first 517 bits = metadata + root data)
+#   block 3   inode bitmap (first 10 bits set = inodes 1..10)
+#   block 4..515  inode table (8192 × 256 B = 512 blocks)
+#   block 516 root directory's first data block (. and .. dirents)
+#
+# `ext4_mkfs(slot, total_sectors)` performs no read-back — it just
+# blasts the metadata out. The caller is expected to immediately
+# `ext4_init(slot)` to mount the freshly-formatted FS, which doubles
+# as a self-check that the structures we wrote are coherent.
+
+EXT4_MKFS_BLOCK_SIZE:      uint64 = 4096
+EXT4_MKFS_LOG_BLOCK:       uint32 = 2          # 1024 << 2 = 4096
+EXT4_MKFS_INODE_SIZE:      uint64 = 256
+EXT4_MKFS_INODES_PER_GRP:  uint64 = 8192
+EXT4_MKFS_BLOCKS_PER_GRP:  uint64 = 32768
+EXT4_MKFS_FIRST_INODE:     uint32 = 11
+EXT4_MKFS_RESERVED_INODES: uint64 = 10
+
+# Group-0 metadata block addresses (4 KiB blocks, s_first_data_block=0).
+EXT4_MKFS_SB_BLOCK:           uint64 = 0
+EXT4_MKFS_GDT_BLOCK:          uint64 = 1
+EXT4_MKFS_BLOCK_BITMAP_BLOCK: uint64 = 2
+EXT4_MKFS_INODE_BITMAP_BLOCK: uint64 = 3
+EXT4_MKFS_INODE_TABLE_BLOCK:  uint64 = 4
+EXT4_MKFS_INODE_TABLE_BLOCKS: uint64 = 512     # 8192 × 256 / 4096
+EXT4_MKFS_ROOT_DATA_BLOCK:    uint64 = 516
+EXT4_MKFS_METADATA_BLOCKS:    uint64 = 517     # bits 0..516 in blk bitmap
+
+# 4 KiB scratch buffer for mkfs page writes.
+ext4_mkfs_buf: Array[4096, uint8]
+
+
+def _ext4_mkfs_write_block(slot: int32, blk_nr: uint64,
+                           buf: Ptr[uint8]) -> int32:
+    # Slot-aware write of one 4 KiB block. ext4_mkfs runs BEFORE
+    # ext4_init has populated the mount globals, so we can't use the
+    # global-state-dependent _ext4_write_block.
+    lba: uint64 = blk_nr * 8
+    return blk_write_sectors(slot, lba, 8, buf)
+
+
+def _ext4_mkfs_write_label(p: Ptr[uint8]):
+    # Copy "hamnix-mkfs" (11 bytes + NUL pad) into the 16-byte
+    # s_volume_name area at superblock offset 0x78.
+    label: Ptr[uint8] = "hamnix-mkfs"
+    i: uint64 = 0
+    while i < 11:
+        p[i] = label[i]
+        i = i + 1
+    while i < 16:
+        p[i] = 0
+        i = i + 1
+
+
+def _ext4_mkfs_build_superblock(buf: Ptr[uint8],
+                                blocks_count: uint64,
+                                free_blocks: uint64) -> int32:
+    # Build a 1024-byte superblock at &buf[1024..2047] (the boot area
+    # at 0..1023 stays zero). `buf` is the full 4 KiB block 0 scratch.
+    sb: uint64 = cast[uint64](buf) + 1024
+    _ext4_write_u32(cast[Ptr[uint8]](sb + 0x00),
+                    cast[uint32](EXT4_MKFS_INODES_PER_GRP))
+    _ext4_write_u32(cast[Ptr[uint8]](sb + 0x04),
+                    cast[uint32](blocks_count))
+    _ext4_write_u32(cast[Ptr[uint8]](sb + 0x0C),
+                    cast[uint32](free_blocks))
+    free_inodes: uint64 = EXT4_MKFS_INODES_PER_GRP \
+                          - EXT4_MKFS_RESERVED_INODES
+    _ext4_write_u32(cast[Ptr[uint8]](sb + 0x10),
+                    cast[uint32](free_inodes))
+    _ext4_write_u32(cast[Ptr[uint8]](sb + 0x14), 0)
+    _ext4_write_u32(cast[Ptr[uint8]](sb + 0x18),
+                    EXT4_MKFS_LOG_BLOCK)
+    _ext4_write_u32(cast[Ptr[uint8]](sb + 0x1C),
+                    EXT4_MKFS_LOG_BLOCK)
+    _ext4_write_u32(cast[Ptr[uint8]](sb + 0x20),
+                    cast[uint32](EXT4_MKFS_BLOCKS_PER_GRP))
+    _ext4_write_u32(cast[Ptr[uint8]](sb + 0x24),
+                    cast[uint32](EXT4_MKFS_BLOCKS_PER_GRP))
+    _ext4_write_u32(cast[Ptr[uint8]](sb + 0x28),
+                    cast[uint32](EXT4_MKFS_INODES_PER_GRP))
+    _ext4_write_u16(cast[Ptr[uint8]](sb + 0x38), EXT4_MAGIC)
+    _ext4_write_u16(cast[Ptr[uint8]](sb + 0x3A), 1)
+    _ext4_write_u16(cast[Ptr[uint8]](sb + 0x3C), 1)
+    _ext4_write_u32(cast[Ptr[uint8]](sb + 0x48), 0)
+    _ext4_write_u32(cast[Ptr[uint8]](sb + 0x4C), 1)
+    _ext4_write_u32(cast[Ptr[uint8]](sb + 0x54),
+                    cast[uint32](EXT4_MKFS_FIRST_INODE))
+    _ext4_write_u16(cast[Ptr[uint8]](sb + 0x58),
+                    cast[uint16](EXT4_MKFS_INODE_SIZE))
+    _ext4_write_u32(cast[Ptr[uint8]](sb + 0x5C), 0)
+    # s_feature_incompat: EXTENTS (0x40) | FILETYPE (0x2).
+    _ext4_write_u32(cast[Ptr[uint8]](sb + 0x60), 0x42)
+    # s_feature_ro_compat: SPARSE_SUPER (0x1) | LARGE_FILE (0x2).
+    _ext4_write_u32(cast[Ptr[uint8]](sb + 0x64), 0x3)
+    _ext4_mkfs_write_label(cast[Ptr[uint8]](sb + 0x78))
+    _ext4_write_u16(cast[Ptr[uint8]](sb + 0xFE), 0)
+    return 0
+
+
+def _ext4_mkfs_build_gdt(buf: Ptr[uint8], free_blocks: uint64,
+                         free_inodes: uint64) -> int32:
+    p: uint64 = cast[uint64](buf)
+    _ext4_write_u32(cast[Ptr[uint8]](p + 0x00),
+                    cast[uint32](EXT4_MKFS_BLOCK_BITMAP_BLOCK))
+    _ext4_write_u32(cast[Ptr[uint8]](p + 0x04),
+                    cast[uint32](EXT4_MKFS_INODE_BITMAP_BLOCK))
+    _ext4_write_u32(cast[Ptr[uint8]](p + 0x08),
+                    cast[uint32](EXT4_MKFS_INODE_TABLE_BLOCK))
+    _ext4_write_u16(cast[Ptr[uint8]](p + 0x0C),
+                    cast[uint16](free_blocks))
+    _ext4_write_u16(cast[Ptr[uint8]](p + 0x0E),
+                    cast[uint16](free_inodes))
+    _ext4_write_u16(cast[Ptr[uint8]](p + 0x10), 1)
+    return 0
+
+
+def _ext4_mkfs_build_block_bitmap(buf: Ptr[uint8]) -> int32:
+    in_use: uint64 = EXT4_MKFS_METADATA_BLOCKS
+    full_bytes: uint64 = in_use / 8
+    i: uint64 = 0
+    while i < full_bytes:
+        buf[i] = 0xFF
+        i = i + 1
+    rem: uint64 = in_use % 8
+    if rem != 0:
+        bit_idx: uint64 = 0
+        m: uint8 = 0
+        while bit_idx < rem:
+            m = m | (cast[uint8](1) << cast[uint8](bit_idx))
+            bit_idx = bit_idx + 1
+        buf[full_bytes] = m
+    return 0
+
+
+def _ext4_mkfs_build_inode_bitmap(buf: Ptr[uint8]) -> int32:
+    full_bytes: uint64 = EXT4_MKFS_RESERVED_INODES / 8
+    i: uint64 = 0
+    while i < full_bytes:
+        buf[i] = 0xFF
+        i = i + 1
+    rem: uint64 = EXT4_MKFS_RESERVED_INODES % 8
+    if rem != 0:
+        bit_idx: uint64 = 0
+        m: uint8 = 0
+        while bit_idx < rem:
+            m = m | (cast[uint8](1) << cast[uint8](bit_idx))
+            bit_idx = bit_idx + 1
+        buf[full_bytes] = m
+    return 0
+
+
+def _ext4_mkfs_build_root_inode(buf: Ptr[uint8]) -> int32:
+    p: uint64 = cast[uint64](buf)
+    _ext4_write_u16(cast[Ptr[uint8]](p + 0x00), 0x41ED)
+    _ext4_write_u32(cast[Ptr[uint8]](p + 0x04),
+                    cast[uint32](EXT4_MKFS_BLOCK_SIZE))
+    _ext4_write_u16(cast[Ptr[uint8]](p + 0x1A), 2)
+    _ext4_write_u32(cast[Ptr[uint8]](p + 0x1C), 8)
+    _ext4_write_u32(cast[Ptr[uint8]](p + 0x20), 0x80000)
+    eh: uint64 = p + INODE_I_BLOCK_OFFSET
+    _ext4_write_u16(cast[Ptr[uint8]](eh + 0), EXT4_EXTENT_MAGIC)
+    _ext4_write_u16(cast[Ptr[uint8]](eh + 2), 1)
+    _ext4_write_u16(cast[Ptr[uint8]](eh + 4), 4)
+    _ext4_write_u16(cast[Ptr[uint8]](eh + 6), 0)
+    _ext4_write_u32(cast[Ptr[uint8]](eh + 8), 0)
+    _ext4_write_u32(cast[Ptr[uint8]](eh + 12), 0)
+    _ext4_write_u16(cast[Ptr[uint8]](eh + 16), 1)
+    _ext4_write_u16(cast[Ptr[uint8]](eh + 18), 0)
+    _ext4_write_u32(cast[Ptr[uint8]](eh + 20),
+                    cast[uint32](EXT4_MKFS_ROOT_DATA_BLOCK))
+    return 0
+
+
+def _ext4_mkfs_build_root_dirblock(buf: Ptr[uint8]) -> int32:
+    p: uint64 = cast[uint64](buf)
+    _ext4_write_u32(cast[Ptr[uint8]](p + 0), 2)
+    _ext4_write_u16(cast[Ptr[uint8]](p + 4), 12)
+    cast[Ptr[uint8]](p + 6)[0] = 1
+    cast[Ptr[uint8]](p + 7)[0] = 2
+    cast[Ptr[uint8]](p + 8)[0] = 0x2E
+    rest: uint64 = EXT4_MKFS_BLOCK_SIZE - 12
+    _ext4_write_u32(cast[Ptr[uint8]](p + 12), 2)
+    _ext4_write_u16(cast[Ptr[uint8]](p + 16),
+                    cast[uint16](rest))
+    cast[Ptr[uint8]](p + 18)[0] = 2
+    cast[Ptr[uint8]](p + 19)[0] = 2
+    cast[Ptr[uint8]](p + 20)[0] = 0x2E
+    cast[Ptr[uint8]](p + 21)[0] = 0x2E
+    return 0
+
+
+def ext4_mkfs(slot: int32, total_sectors: uint64) -> int32:
+    # Format the block device at `slot` as a single-group ext4
+    # filesystem. `total_sectors` is the partition capacity in
+    # 512-byte sectors. Returns 0 on success, -1 on failure.
+    if slot < 0:
+        return -1
+    if total_sectors < 4136:
+        printk0("ext4: mkfs: partition too small (need >= 2 MiB)\n")
+        return -1
+    total_blocks: uint64 = total_sectors / 8
+    if total_blocks > EXT4_MKFS_BLOCKS_PER_GRP:
+        total_blocks = EXT4_MKFS_BLOCKS_PER_GRP
+    free_blocks: uint64 = total_blocks - EXT4_MKFS_METADATA_BLOCKS
+    free_inodes: uint64 = EXT4_MKFS_INODES_PER_GRP \
+                          - EXT4_MKFS_RESERVED_INODES
+
+    _ext4_zero(&ext4_mkfs_buf[0], EXT4_MKFS_BLOCK_SIZE)
+    _ext4_mkfs_build_superblock(&ext4_mkfs_buf[0], total_blocks,
+                                free_blocks)
+    if _ext4_mkfs_write_block(slot, EXT4_MKFS_SB_BLOCK,
+                              &ext4_mkfs_buf[0]) != 0:
+        printk0("ext4: mkfs: write superblock failed\n")
+        return -1
+
+    _ext4_zero(&ext4_mkfs_buf[0], EXT4_MKFS_BLOCK_SIZE)
+    _ext4_mkfs_build_gdt(&ext4_mkfs_buf[0], free_blocks, free_inodes)
+    if _ext4_mkfs_write_block(slot, EXT4_MKFS_GDT_BLOCK,
+                              &ext4_mkfs_buf[0]) != 0:
+        printk0("ext4: mkfs: write GDT failed\n")
+        return -1
+
+    _ext4_zero(&ext4_mkfs_buf[0], EXT4_MKFS_BLOCK_SIZE)
+    _ext4_mkfs_build_block_bitmap(&ext4_mkfs_buf[0])
+    if _ext4_mkfs_write_block(slot, EXT4_MKFS_BLOCK_BITMAP_BLOCK,
+                              &ext4_mkfs_buf[0]) != 0:
+        printk0("ext4: mkfs: write block bitmap failed\n")
+        return -1
+
+    _ext4_zero(&ext4_mkfs_buf[0], EXT4_MKFS_BLOCK_SIZE)
+    _ext4_mkfs_build_inode_bitmap(&ext4_mkfs_buf[0])
+    if _ext4_mkfs_write_block(slot, EXT4_MKFS_INODE_BITMAP_BLOCK,
+                              &ext4_mkfs_buf[0]) != 0:
+        printk0("ext4: mkfs: write inode bitmap failed\n")
+        return -1
+
+    # Inode #2 lives at byte offset 256 within the first inode-table
+    # block (table position 1, 0-indexed). Build that block specially;
+    # the rest of the table is plain zeros.
+    _ext4_zero(&ext4_mkfs_buf[0], EXT4_MKFS_BLOCK_SIZE)
+    _ext4_mkfs_build_root_inode(
+        cast[Ptr[uint8]](
+            cast[uint64](&ext4_mkfs_buf[0])
+            + EXT4_MKFS_INODE_SIZE))
+    if _ext4_mkfs_write_block(slot, EXT4_MKFS_INODE_TABLE_BLOCK,
+                              &ext4_mkfs_buf[0]) != 0:
+        printk0("ext4: mkfs: write inode table block 0 failed\n")
+        return -1
+    _ext4_zero(&ext4_mkfs_buf[0], EXT4_MKFS_BLOCK_SIZE)
+    rem_blk: uint64 = 1
+    while rem_blk < EXT4_MKFS_INODE_TABLE_BLOCKS:
+        if _ext4_mkfs_write_block(slot,
+                EXT4_MKFS_INODE_TABLE_BLOCK + rem_blk,
+                &ext4_mkfs_buf[0]) != 0:
+            printk0("ext4: mkfs: write inode table tail failed\n")
+            return -1
+        rem_blk = rem_blk + 1
+
+    _ext4_zero(&ext4_mkfs_buf[0], EXT4_MKFS_BLOCK_SIZE)
+    _ext4_mkfs_build_root_dirblock(&ext4_mkfs_buf[0])
+    if _ext4_mkfs_write_block(slot, EXT4_MKFS_ROOT_DATA_BLOCK,
+                              &ext4_mkfs_buf[0]) != 0:
+        printk0("ext4: mkfs: write root dir block failed\n")
+        return -1
+
+    printk2("[ext4] mkfs slot=%d total_blocks=%d OK\n",
+            cast[uint64](slot), total_blocks)
+    return 0
+
+
+# ---- mkfs self-test ----------------------------------------------
+#
+# Locates sd0p1 (or nvme0n1p1) and runs mkfs + re-mount + verify
+# against it. Save/restore the mount globals around the run so a
+# concurrent /ext mount on a different slot survives.
+ext4_mkfs_self_test_done: uint32 = 0
+
+
+def _ext4_mkfs_find_target() -> int32:
+    s: int32 = find_blockdev("sd0p1")
+    if s >= 0:
+        return s
+    s = find_blockdev("nvme0n1p1")
+    if s >= 0:
+        return s
+    return -1
+
+
+def _ext4_mkfs_verify_root(slot: int32) -> int32:
+    # Read inode #2 and walk its first dir block. Returns 0 on PASS,
+    # -1 on FAIL.
+    ino_buf: Array[256, uint8]
+    if ext4_read_inode(2, &ino_buf[0]) != 0:
+        printk0("[ext4] mkfs verify FAIL (read inode #2)\n")
+        return -1
+    mode: uint16 = ext4_inode_mode(&ino_buf[0])
+    if (mode & 0xF000) != 0x4000:
+        printk1("[ext4] mkfs verify FAIL (inode #2 mode=%x not dir)\n",
+                cast[uint64](mode))
+        return -1
+    phys: uint64 = ext4_inode_first_extent_block(&ino_buf[0])
+    if phys == 0:
+        printk0("[ext4] mkfs verify FAIL (root has no data block)\n")
+        return -1
+    if _ext4_read_block(phys, &ext4_blk_buf[0]) != 0:
+        printk0("[ext4] mkfs verify FAIL (root dir read)\n")
+        return -1
+    e: uint64 = cast[uint64](&ext4_blk_buf[0])
+    e0_inum: uint32 = _ext4_read_u32(cast[Ptr[uint8]](e + 0))
+    e0_rec:  uint16 = _ext4_read_u16(cast[Ptr[uint8]](e + 4))
+    e0_nl:   uint8  = cast[Ptr[uint8]](e + 6)[0]
+    e0_c0:   uint8  = cast[Ptr[uint8]](e + 8)[0]
+    if e0_inum != 2 or e0_nl != 1 or e0_c0 != 0x2E:
+        printk0("[ext4] mkfs verify FAIL (root dirent[0] != .)\n")
+        return -1
+    e2: uint64 = e + cast[uint64](e0_rec)
+    e1_inum: uint32 = _ext4_read_u32(cast[Ptr[uint8]](e2 + 0))
+    e1_nl:   uint8  = cast[Ptr[uint8]](e2 + 6)[0]
+    e1_c0:   uint8  = cast[Ptr[uint8]](e2 + 8)[0]
+    e1_c1:   uint8  = cast[Ptr[uint8]](e2 + 9)[0]
+    if e1_inum != 2 or e1_nl != 2 or e1_c0 != 0x2E or e1_c1 != 0x2E:
+        printk0("[ext4] mkfs verify FAIL (root dirent[1] != ..)\n")
+        return -1
+    return 0
+
+
+def _ext4_mkfs_restore_state(s_slot: int32, s_bs: uint64, s_bpg: uint64,
+                             s_ipg: uint64, s_ic: uint64, s_bc: uint64,
+                             s_fdb: uint64, s_isz: uint64, s_ds: uint64,
+                             s_gdt: uint64):
+    # Restore the mount snapshot taken at the top of
+    # ext4_mkfs_self_test. Factored out so both success and failure
+    # paths reach a single restore point.
+    ext4_blockdev_slot   = s_slot
+    ext4_block_size      = s_bs
+    ext4_blocks_per_grp  = s_bpg
+    ext4_inodes_per_grp  = s_ipg
+    ext4_inodes_count    = s_ic
+    ext4_blocks_count    = s_bc
+    ext4_first_data_blk  = s_fdb
+    ext4_inode_size      = s_isz
+    ext4_desc_size       = s_ds
+    ext4_gdt_block       = s_gdt
+
+
+def ext4_mkfs_self_test() -> int32:
+    target: int32 = _ext4_mkfs_find_target()
+    if target < 0:
+        printk0("[ext4] mkfs self-test SKIP (no partition device)\n")
+        return 0
+    s_slot:  int32  = ext4_blockdev_slot
+    s_bs:    uint64 = ext4_block_size
+    s_bpg:   uint64 = ext4_blocks_per_grp
+    s_ipg:   uint64 = ext4_inodes_per_grp
+    s_ic:    uint64 = ext4_inodes_count
+    s_bc:    uint64 = ext4_blocks_count
+    s_fdb:   uint64 = ext4_first_data_blk
+    s_isz:   uint64 = ext4_inode_size
+    s_ds:    uint64 = ext4_desc_size
+    s_gdt:   uint64 = ext4_gdt_block
+
+    # test_mkfs.sh sizes p1 at 63488 sectors (31 MiB). ext4_mkfs caps
+    # at one block group (32768 blocks = 128 MiB).
+    test_sectors: uint64 = 63488
+    if ext4_mkfs(target, test_sectors) != 0:
+        printk0("[ext4] mkfs self-test FAIL (ext4_mkfs)\n")
+        _ext4_mkfs_restore_state(s_slot, s_bs, s_bpg, s_ipg, s_ic,
+                                 s_bc, s_fdb, s_isz, s_ds, s_gdt)
+        return -1
+    printk1("[ext4] mkfs sd0p1 OK (slot=%d)\n",
+            cast[uint64](target))
+
+    if ext4_init(target) != 0:
+        printk0("[ext4] mkfs self-test FAIL (re-mount)\n")
+        _ext4_mkfs_restore_state(s_slot, s_bs, s_bpg, s_ipg, s_ic,
+                                 s_bc, s_fdb, s_isz, s_ds, s_gdt)
+        return -1
+    printk1("[ext4] mounted sd0p1 ro=0 (slot=%d)\n",
+            cast[uint64](target))
+
+    if _ext4_mkfs_verify_root(target) != 0:
+        _ext4_mkfs_restore_state(s_slot, s_bs, s_bpg, s_ipg, s_ic,
+                                 s_bc, s_fdb, s_isz, s_ds, s_gdt)
+        return -1
+    printk0("[ext4] / contains . ..\n")
+    _ext4_mkfs_restore_state(s_slot, s_bs, s_bpg, s_ipg, s_ic,
+                             s_bc, s_fdb, s_isz, s_ds, s_gdt)
+    printk0("[ext4] mkfs self-test PASS\n")
+    return 0
+
+
+def _ext4_mkfs_self_test_maybe():
+    # Single-shot gate. Called from is_ext_path on every VFS open;
+    # the gate keeps subsequent calls to a single global compare.
+    if ext4_mkfs_self_test_done != 0:
+        return
+    ext4_mkfs_self_test_done = 1
+    ext4_mkfs_self_test()
