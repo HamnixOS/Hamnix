@@ -1,0 +1,381 @@
+# sys/src/9/port/devproc.ad
+#
+# Layer 1 (Plan 9-shape) per-process introspection device — fifth
+# concrete /dev style cdev family on the Hamnix native surface,
+# sibling to devcons.ad / devtime.ad / devpid.ad / devrandom.ad.
+# Mirrors 9front's /sys/src/9/port/devproc.c at minimum scope: a
+# /proc/<pid>/<file> name resolves to a stateless fd whose read
+# produces one line of text describing the named process.
+#
+# See docs/native-api.md ("Reserved well-known paths" — entries for
+# /proc/<pid>/{cwd,status,ns,note}). This commit ships `cwd` and
+# `status` (read-only); `note` is deferred until notify(2)/noted(2)
+# land, and `ns` is deferred until the Phase D namespace machinery
+# in chan.ad gains a real read-side.
+#
+# VFS plumbing: fs/vfs.ad recognises a `/proc/<digits>/<leaf>` path,
+# calls devproc_open(path) which returns an encoded marker fd. The
+# marker carries enough state for devproc_read to recover pid + file
+# kind on its own — no per-fd kmalloc, no slot in any table, close is
+# a no-op. Stateless backend matches the other Plan 9-shape cdevs in
+# this directory; see devcons.ad for the prior-art comment block.
+#
+# Marker encoding (uint32, stored in TaskStruct.fd_idx):
+#
+#     [31:24] = 0xFE                 — high-byte tag for the proc family
+#     [23: 8] = pid (uint16-bounded; we cap at 0xFFFF on encode)
+#     [ 7: 0] = file_kind            — 0=status, 1=cwd, 2=stat (rejected)
+#
+# vfs_read/vfs_write detect a proc fd with
+#   (file_idx & 0xFF000000) == FD_PROC_MARK
+# and forward to devproc_read / devproc_write below. The 0xFE tag is
+# distinct from the 0xFFFFFFxx tags used by FD_CONS_MARK / FD_TIME_MARK
+# / FD_PID_MARK / FD_RANDOM_MARK / FD_*_MARK so a proc fd can't be
+# mistaken for any of them, and it's well above the real initramfs
+# file-index range (~hundreds, never near 2^24) so cpio fds don't
+# collide either.
+#
+# Note on the spec literal: docs/native-api.md sketches a constant
+# named "FD_PROC_MARK = 0xFFFFFFED" alongside the encoding
+# "FD_PROC_MARK | (pid<<8) | file_kind". Those two are mutually
+# inconsistent at the bit level — the literal's low byte (0xED) would
+# force file_kind to be 0xED regardless of what we OR in, and the
+# detection mask (file_idx & 0xFFFFFF00) == FD_PROC_MARK would never
+# fire. We adopt the encoding the spec describes (pid<<8 | file_kind)
+# and choose a high-byte tag that makes the encoding well-formed.
+
+from kernel.sched.core import (
+    task_lookup_by_pid, task_state, task_pid_at, task_pml4,
+    get_cwd_buf, set_current_errstr,
+    STATE_READY, STATE_RUNNING, STATE_EXITED,
+    task_name0_at,
+)
+
+# Marker base. See header for the encoding layout.
+FD_PROC_MARK_BASE:   uint32 = 0xFE000000
+FD_PROC_MARK_MASK:   uint32 = 0xFF000000
+
+# File-kind tags (lowest 8 bits of the marker).
+DEVPROC_KIND_STATUS: uint32 = 0
+DEVPROC_KIND_CWD:    uint32 = 1
+DEVPROC_KIND_STAT:   uint32 = 2
+
+
+def devproc_is_proc_fd(file_idx: uint32) -> int32:
+    # Single-call probe used by fs/vfs.ad to fork into the devproc
+    # dispatch path. Kept here so the encoding constant stays
+    # private to this file.
+    if (file_idx & FD_PROC_MARK_MASK) == FD_PROC_MARK_BASE:
+        return 1
+    return 0
+
+
+def _is_digit(c: uint8) -> int32:
+    if c >= 48 and c <= 57:
+        return 1
+    return 0
+
+
+def _cstr_eq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    # True if the two NUL-terminated strings match. Used for the
+    # leaf-name compare (`status` / `cwd` / `stat`) where we already
+    # know the substring start in `a`. We can't use a generic strcmp
+    # because the surrounding code is path-walking and the leaf
+    # isn't NUL-terminated in-situ — the caller passes a copy.
+    i: uint64 = 0
+    while True:
+        ca: uint8 = a[i]
+        cb: uint8 = b[i]
+        if ca != cb:
+            return 0
+        if ca == 0:
+            return 1
+        i = i + 1
+
+
+def _u64_to_dec(value: uint64, out: Ptr[uint8]) -> uint64:
+    # Same reverse-fill helper devtime.ad / devpid.ad use. Lifted
+    # locally so devproc.ad doesn't depend on its sibling files —
+    # the procfs renderer has its own copy too, and keeping each
+    # cdev self-contained matches how 9front's port files are
+    # structured (no shared "devutil.c" — every cdev inlines its
+    # bit-twiddling).
+    if value == 0:
+        out[0] = 48                              # '0'
+        return 1
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    while value != 0:
+        digits[n] = cast[uint8](value % 10) + 48
+        value = value / 10
+        n = n + 1
+    written: uint64 = n
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    return written
+
+
+def _u64_to_hex(value: uint64, out: Ptr[uint8]) -> uint64:
+    # 16-char fixed-width hex for the pml4 field in the status line.
+    # The pml4 is a kernel physical address; rendering it with leading
+    # zeros keeps the column alignment predictable for grep / awk.
+    HEX: Ptr[uint8] = "0123456789abcdef"
+    out[0] = 48                                  # '0'
+    out[1] = 120                                 # 'x'
+    i: uint64 = 0
+    while i < 16:
+        nibble: uint64 = (value >> ((15 - i) * 4)) & 0xF
+        out[2 + i] = HEX[nibble]
+        i = i + 1
+    return 18
+
+
+def _parse_proc_path(path: Ptr[char], out_pid: Ptr[uint64],
+                     out_kind: Ptr[uint32]) -> int32:
+    # Walk a /proc/<pid>/<file> path. Returns 0 on success and writes
+    # the parsed pid + file_kind through the out-pointers. Non-zero
+    # means "not a /proc/<pid>/<leaf> path" — the caller falls back to
+    # the existing procfs renderer.
+    #
+    # We don't trust the caller to have already prefix-checked
+    # "/proc/" — verifying it here makes this function safe to drop
+    # into _any_ vfs_open call site if devproc grows direct callers.
+    if path[0] != 47:                            # '/'
+        return -1
+    if path[1] != 112 or path[2] != 114 \
+            or path[3] != 111 or path[4] != 99 \
+            or path[5] != 47:                    # "proc/"
+        return -1
+    # Parse decimal digits.
+    i: uint64 = 6
+    if _is_digit(cast[uint8](path[i] & 0xFF)) == 0:
+        return -1
+    pid: uint64 = 0
+    while _is_digit(cast[uint8](path[i] & 0xFF)) != 0:
+        pid = pid * 10 + cast[uint64](path[i] - 48)
+        i = i + 1
+    if path[i] != 47:                            # '/'
+        return -1
+    i = i + 1
+    # The leaf is the rest of the path. Copy into a small scratch so
+    # we can NUL-compare against the literal strings.
+    leaf: Array[16, uint8]
+    j: uint64 = 0
+    while j + 1 < 16 and path[i] != 0:
+        leaf[j] = cast[uint8](path[i] & 0xFF)
+        i = i + 1
+        j = j + 1
+    leaf[j] = 0
+    if path[i] != 0:
+        return -1                                # leaf too long for any
+                                                 # name we serve
+    if _cstr_eq(&leaf[0], "status") != 0:
+        out_pid[0] = pid
+        out_kind[0] = DEVPROC_KIND_STATUS
+        return 0
+    if _cstr_eq(&leaf[0], "cwd") != 0:
+        out_pid[0] = pid
+        out_kind[0] = DEVPROC_KIND_CWD
+        return 0
+    if _cstr_eq(&leaf[0], "stat") != 0:
+        out_pid[0] = pid
+        out_kind[0] = DEVPROC_KIND_STAT
+        return 0
+    return -1
+
+
+def devproc_path_match(path: Ptr[char]) -> int32:
+    # Cheap discriminator used by fs/vfs.ad to decide whether to
+    # route open() to devproc or to the static procfs renderer.
+    # Returns 1 iff path looks like /proc/<digits>/<known-leaf>.
+    pid_scratch:  uint64 = 0
+    kind_scratch: uint32 = 0
+    if _parse_proc_path(path, &pid_scratch, &kind_scratch) == 0:
+        return 1
+    return 0
+
+
+def devproc_open(path: Ptr[char]) -> int64:
+    # Parse the path, look up the task slot, encode the marker.
+    # Returns the encoded uint32 widened to int64 so the high marker
+    # bit doesn't accidentally read as negative when fs/vfs.ad does
+    # its `< 0` failure test. The caller truncates to uint32 before
+    # storing into TaskStruct.fd_idx. Errors return -1 with
+    # set_current_errstr(...) so SYS_ERRSTR (265) callers get a
+    # human-readable reason — Plan 9 convention. fs/vfs.ad maps -1
+    # to the user-visible -ENOENT it would return for any other
+    # missing path.
+    #
+    # Why int64, not int32: the encoded marker is `0xFE000000 | ...`
+    # which, viewed as int32, is a large negative number — every
+    # successful open would then look like a failure to the int32
+    # `< 0` check. Widening to int64 keeps successful encodings
+    # comfortably positive (uint32 max << 2^31), with -1 the only
+    # negative value the caller ever sees.
+    pid64: uint64 = 0
+    kind:  uint32 = 0
+    if _parse_proc_path(path, &pid64, &kind) != 0:
+        set_current_errstr("/proc: malformed pid path")
+        return -1
+    slot: int32 = task_lookup_by_pid(pid64)
+    if slot < 0:
+        set_current_errstr("no such pid")
+        return -1
+    # Encode pid+kind into the marker. Cap pid at 0xFFFF so the
+    # 16-bit field never overflows into the tag byte — at NTASKS=16
+    # with sequentially-allocated pids this is comfortable headroom.
+    pid_field: uint32 = cast[uint32](pid64 & 0xFFFF)
+    enc: uint32 = FD_PROC_MARK_BASE | (pid_field << 8) | (kind & 0xFF)
+    return cast[int64](enc)
+
+
+def _emit_status(buf: Ptr[uint8], count: uint64, slot: int32) -> int64:
+    # One line: "<pid> <name8> <state> <pml4_hex>\n". Format chosen
+    # so awk/cut-style parsers can split on space and find each
+    # field at a fixed column position. Linux's /proc/<pid>/status
+    # is multi-line key/value; the Plan 9 file is one line of
+    # whitespace-separated tokens (see /sys/src/9/port/devproc.c's
+    # statustext()).
+    #
+    # Pointer-arithmetic note: we render into a single Array[128]
+    # scratch and pass `(scratch_base + pos)` pointers into the
+    # _u64_to_dec / _u64_to_hex helpers, computed via cast[uint64]
+    # rather than `&scratch[pos]`. The latter form has tripped the
+    # nested-Array-frame bug in the past (see feedback memory
+    # "nested fixed-size Array locals across call frames"); the
+    # explicit base-plus-offset is the stable workaround.
+    scratch: Array[128, uint8]
+    base: uint64 = cast[uint64](&scratch[0])
+    pos: uint64 = 0
+    pid_n: uint64 = _u64_to_dec(task_pid_at(slot),
+                                cast[Ptr[uint8]](base + pos))
+    pos = pos + pid_n
+    scratch[pos] = 32                            # ' '
+    pos = pos + 1
+    # name0 is 8 ASCII bytes packed into a uint64. We unpack
+    # least-significant byte first — that's the order the
+    # task-creator wrote with `b0 | (b1<<8) | ...`. NUL bytes inside
+    # the 8 mean "name shorter than 8 chars" — stop emitting.
+    name_bits: uint64 = task_name0_at(slot)
+    k: uint64 = 0
+    name_done: int32 = 0
+    while k < 8 and name_done == 0:
+        c: uint8 = cast[uint8]((name_bits >> (k * 8)) & 0xFF)
+        if c == 0:
+            name_done = 1
+        else:
+            scratch[pos] = c
+            pos = pos + 1
+            k = k + 1
+    scratch[pos] = 32                            # ' '
+    pos = pos + 1
+    # State letter. Linux uses R/S/Z; we map the same way fs/procfs.ad
+    # does — RUNNING -> 'R', READY -> 'S' (ready ~= sleeping on a
+    # uniprocessor), EXITED -> 'Z'. Anything else (which shouldn't
+    # happen on a live pid we just looked up) becomes '?'.
+    st: uint64 = task_state(slot)
+    if st == STATE_RUNNING:
+        scratch[pos] = 82                        # 'R'
+    elif st == STATE_READY:
+        scratch[pos] = 83                        # 'S'
+    elif st == STATE_EXITED:
+        scratch[pos] = 90                        # 'Z'
+    else:
+        scratch[pos] = 63                        # '?'
+    pos = pos + 1
+    scratch[pos] = 32                            # ' '
+    pos = pos + 1
+    pml4: uint64 = task_pml4(slot)
+    pml4_n: uint64 = _u64_to_hex(pml4, cast[Ptr[uint8]](base + pos))
+    pos = pos + pml4_n
+    scratch[pos] = 10                            # '\n'
+    pos = pos + 1
+    take: uint64 = count
+    if take > pos:
+        take = pos
+    i: uint64 = 0
+    while i < take:
+        buf[i] = scratch[i]
+        i = i + 1
+    return cast[int64](take)
+
+
+def _emit_cwd(buf: Ptr[uint8], count: uint64, slot: int32) -> int64:
+    # The CWD lives inline in TaskStruct.cwd as a 128-byte
+    # NUL-terminated string; get_cwd_buf returns a pointer to slot 0
+    # of that array. Copy up to count-1 bytes, then append '\n'.
+    src: Ptr[uint8] = get_cwd_buf(cast[uint64](slot))
+    n: uint64 = 0
+    # Find length so we can decide whether the '\n' fits.
+    while src[n] != 0 and n < 127:
+        n = n + 1
+    # Available room in caller's buffer for the path plus newline.
+    if count == 0:
+        return 0
+    out_n: uint64 = n
+    if out_n > count:
+        out_n = count
+    i: uint64 = 0
+    while i < out_n:
+        buf[i] = src[i]
+        i = i + 1
+    # Append '\n' if there's room — matches the trailing-newline
+    # convention of /dev/pid, /dev/time and Plan 9 devproc.
+    if out_n < count:
+        buf[out_n] = 10                          # '\n'
+        out_n = out_n + 1
+    return cast[int64](out_n)
+
+
+def devproc_read(file_idx: uint32, buf: Ptr[uint8],
+                 count: uint64) -> int64:
+    # Decode pid + kind from the marker. Re-validate the slot at read
+    # time — a task that died after the open could leave a stale pid
+    # in our hand. STATE_FREE re-uses the slot, so a passing pid would
+    # then read someone else's status; refusing here keeps the
+    # semantics honest.
+    pid_field: uint32 = (file_idx >> 8) & 0xFFFF
+    kind:      uint32 = file_idx & 0xFF
+    slot: int32 = task_lookup_by_pid(cast[uint64](pid_field))
+    if slot < 0:
+        set_current_errstr("pid vanished")
+        return -1
+    if kind == DEVPROC_KIND_STATUS:
+        return _emit_status(buf, count, slot)
+    if kind == DEVPROC_KIND_CWD:
+        return _emit_cwd(buf, count, slot)
+    if kind == DEVPROC_KIND_STAT:
+        # Plan 9 stat is a Dir record — variable-length serialised
+        # struct, not text. We don't have a Dir-record emitter on
+        # the read side yet (sysfile.ad's _write_dir_record fills a
+        # fixed buffer for SYS_STAT_P9). Deferring keeps this commit
+        # to "the text-file shape works"; the binary Dir record can
+        # land alongside fd2path's per-fd path slot in Phase G.
+        set_current_errstr("stat: not yet supported")
+        return -1
+    set_current_errstr("/proc: unknown file kind")
+    return -1
+
+
+def devproc_write(file_idx: uint32, buf: Ptr[uint8],
+                  count: uint64) -> int64:
+    # Note delivery is the only meaningful write on a /proc/<pid>/*
+    # file (it's how Plan 9 sends signals). notify(2)/noted(2) are
+    # -ENOSYS today, so accepting writes here would silently swallow
+    # signal attempts. Refuse instead — userland sees the rejection
+    # at write(2) time rather than at a phantom successful return.
+    set_current_errstr("write not supported")
+    return -1
+
+
+def devproc_close(file_idx: uint32) -> int32:
+    # Stateless: no per-fd slot, no kmalloc, no refcount. fs/vfs.ad's
+    # close_fd_in_task hits a default fall-through that rewrites the
+    # slot to FD_CLOSED_MARK + zeros the auxiliary fields — that's
+    # all the cleanup we need. The marker carries no aliased
+    # resource a sibling fd could be sharing; close is an
+    # unconditional no-op success.
+    return 0

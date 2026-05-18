@@ -15,7 +15,10 @@
 #   FD_TIME_MARK   = 0xFFFFFFF0       /dev/time — ns-since-boot ASCII
 #   FD_PID_MARK    = 0xFFFFFFEF       /dev/pid  — current task pid ASCII
 #   FD_RANDOM_MARK = 0xFFFFFFEE       /dev/random — xorshift64 placeholder
-# Anything below 0xFFFFFFEE is a real initramfs file index.
+#   FD_PROC_MARK   = 0xFE000000       /proc/<pid>/<file> family
+#     (high-byte tag; low 24 bits encode pid<<8 | file_kind — see
+#      sys/src/9/port/devproc.ad header for the full layout)
+# Anything below 0xFE000000 is a real initramfs file index.
 #
 # Linux semantics we keep:
 #   SEEK_SET / SEEK_CUR / SEEK_END
@@ -42,6 +45,10 @@ from sys.src.port9.port.devcons import devcons_read, devcons_write
 from sys.src.port9.port.devtime import devtime_read, devtime_write
 from sys.src.port9.port.devpid import devpid_read, devpid_write
 from sys.src.port9.port.devrandom import devrandom_read, devrandom_write
+from sys.src.port9.port.devproc import (
+    devproc_open, devproc_read, devproc_write, devproc_close,
+    devproc_is_proc_fd, devproc_path_match,
+)
 # Phase C / M16.107: mount-table prefix rewrite. resolve_path consults
 # the per-task namespace before the existing cpio / tmpfs / ext4
 # routing so a successful bind() of "/sysroot" -> "/etc" makes
@@ -300,6 +307,23 @@ def vfs_open(name: Ptr[char]) -> int32:
         return _open_dev_marked(FD_PID_MARK)
     if _path_eq_const(name, "/dev/random", 11) != 0:
         return _open_dev_marked(FD_RANDOM_MARK)
+    # /proc/<pid>/{cwd,status,stat} are per-process introspection
+    # files served by sys/src/9/port/devproc.ad. They land BEFORE
+    # the static procfs renderer below because the latter would
+    # otherwise turn "/proc/1/status" into an _open_proc() call that
+    # kmalloc's a buffer and asks procfs_render() to fill it — and
+    # procfs_render only knows the static well-known names
+    # (/proc/version, /proc/uptime, ...), so it would return -1 and
+    # we'd surface -ENOENT for a path that should work.
+    if devproc_path_match(name) != 0:
+        rc: int64 = devproc_open(name)
+        if rc < 0:
+            # devproc_open already called set_current_errstr.
+            return ENOENT
+        # rc is the encoded marker widened to int64 (always fits in
+        # uint32; see devproc_open header for why we widen). Truncate
+        # the low 32 bits back to uint32 for the fd_idx slot.
+        return _install_proc_fd(cast[uint32](rc & 0xFFFFFFFF))
     # /proc/* paths are rendered into a per-fd kmalloc'd snapshot up
     # front; the resulting fd is read-only and walks the buffer.
     # Routed before the cpio lookup so a cpio entry literally named
@@ -418,6 +442,15 @@ def vfs_open_write(name: Ptr[char]) -> int32:
         return _open_dev_marked(FD_PID_MARK)
     if _path_eq_const(name, "/dev/random", 11) != 0:
         return _open_dev_marked(FD_RANDOM_MARK)
+    # /proc/<pid>/* also opens on the OWRITE path so future note(2)
+    # delivery (write("/proc/<pid>/note", ...)) flows through the
+    # same dispatch. devproc_write currently returns -1 across the
+    # board — userland sees the rejection at write(2), not open(2).
+    if devproc_path_match(name) != 0:
+        rc: int64 = devproc_open(name)
+        if rc < 0:
+            return ENOENT
+        return _install_proc_fd(cast[uint32](rc & 0xFFFFFFFF))
     if is_tmpfs_path(name) != 0:
         slot: int32 = tmpfs_open_for_write(name)
         if slot < 0:
@@ -769,6 +802,24 @@ def _open_dev_marked(mark: uint32) -> int32:
     return fd
 
 
+def _install_proc_fd(encoded_mark: uint32) -> int32:
+    # /proc/<pid>/<file> fds carry the marker tag PLUS the encoded
+    # pid + file_kind in their fd_idx slot — devproc_read uses the
+    # low 24 bits to recover the target task and which file to
+    # render. No per-fd buffer / slot allocation; stateless like the
+    # other Plan 9-shape cdevs. The marker value itself comes from
+    # devproc_open(), which has already validated the pid exists.
+    task: Ptr[TaskStruct] = current_task()
+    fd: int32 = _alloc_fd(task)
+    if fd < 0:
+        return EMFILE
+    fdu: uint64 = cast[uint64](fd)
+    task[0].fd_idx[fdu] = encoded_mark
+    task[0].fd_pos[fdu] = 0
+    task[0].fd_buf[fdu] = 0
+    return fd
+
+
 def _open_fat_read(name: Ptr[char]) -> int32:
     basename: Ptr[char] = strip_mnt_prefix(name)
     fat_slot: int32 = fat_open(basename)
@@ -881,6 +932,15 @@ def vfs_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         # the caveat in sys/src/9/port/devrandom.ad — not crypto-grade
         # entropy until the chacha20 + RDRAND backend lands.
         return devrandom_read(buf, count)
+    if devproc_is_proc_fd(file_idx) != 0:
+        # /proc/<pid>/{status,cwd,...} read side. The marker carries
+        # pid + file_kind in its low 24 bits; devproc_read decodes
+        # them and renders the one-line text the caller is after.
+        # Stateless — no fd_pos / fd_buf tracking; every read
+        # samples the target task fresh (matching Plan 9 devproc
+        # semantics, and the test_devproc fixture only does a single
+        # read per fd anyway).
+        return devproc_read(file_idx, buf, count)
     if file_idx == FD_BUFFER_MARK:
         # Snapshot read — same shape as initramfs but the backing
         # store is the per-fd kmalloc'd buffer set up at open time.
@@ -1033,6 +1093,14 @@ def vfs_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         # current implementation XOR-folds input into the xorshift64
         # state. Placeholder pending the chacha20 reseed path.
         return devrandom_write(buf, count)
+    if devproc_is_proc_fd(file_idx) != 0:
+        # /proc/<pid>/<file> write side. devproc_write currently
+        # rejects every write (returns -1 + errstr) because the only
+        # meaningful write target is /proc/<pid>/note for note(2)
+        # delivery, and notify/noted are -ENOSYS. We forward the
+        # buffer regardless so the future write-side body can grow
+        # into this seat without another vfs.ad edit.
+        return devproc_write(file_idx, buf, count)
     if file_idx == FD_SOCKET_MARK:
         # U35: stub AF_UNIX socket — no kernel-side routing, no peer.
         # Pretend the bytes were sent (the unread peer-side buffer is
@@ -1163,8 +1231,16 @@ def vfs_close(fd: int32) -> int32:
         return rc
     task: Ptr[TaskStruct] = current_task()
     fdu: uint64 = cast[uint64](fd)
-    if task[0].fd_idx[fdu] == FD_CLOSED_MARK:
+    file_idx: uint32 = task[0].fd_idx[fdu]
+    if file_idx == FD_CLOSED_MARK:
         return EBADF
+    # /proc/<pid>/<file> fds carry no per-fd backing — devproc_close
+    # is a no-op success today (kept as a hook so future per-fd
+    # snapshot support can land without re-plumbing the close path).
+    # We still fall through to close_fd_in_task which rewrites the
+    # slot to FD_CLOSED_MARK and zeros fd_pos/fd_buf/fd_buflen.
+    if devproc_is_proc_fd(file_idx) != 0:
+        devproc_close(file_idx)
     # Delegate the release pattern to kernel/sched/core.py's
     # close_fd_in_task — same helper task_exit_current uses, so
     # explicit-close and implicit-on-exit have identical cleanup
@@ -1193,6 +1269,13 @@ def vfs_lseek(fd: int32, offset: int64, whence: int32) -> int64:
         # we don't distinguish that errno yet, just say EINVAL. procfs
         # files are seekable in Linux but our snapshot semantics make
         # seek on them less useful — punt on it for now.
+        return cast[int64](EINVAL)
+    if devproc_is_proc_fd(file_idx) != 0:
+        # /proc/<pid>/<file> reads are stateless one-shot renders;
+        # there's no buffer to seek over. EINVAL matches the other
+        # char-device cases above (Plan 9 devproc.c returns -1 with
+        # errstr "no seek on /proc"; we don't have ESPIPE wired up
+        # yet so EINVAL is the closest fit).
         return cast[int64](EINVAL)
     if file_idx == FD_TMPFS_MARK:
         slot: int32 = cast[int32](task[0].fd_buf[fdu])
