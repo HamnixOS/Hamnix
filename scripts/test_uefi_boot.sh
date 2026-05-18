@@ -21,12 +21,23 @@
 #   ->  far-jumps to _x86_start_after_loader
 #   ->  start_kernel() and beyond
 #
-# We assert THREE markers in order:
+# We assert FOUR markers in order:
 #   1. "[hamnix] EFI entry reached"          - PE/COFF entry hit.
 #   2. "[hamnix] post-EFI handoff complete"  - ExitBootServices succeeded.
 #   3. "Hamnix kernel booting"               - kernel banner; proves the
 #                                              EFI ELF loader handed off
 #                                              to start_kernel() cleanly.
+#   4. "[hamsh] M16.35 shell ready"          - M16.126 gate: hamsh's first
+#                                              read+printf round-trip
+#                                              completed. This proves
+#                                              tss_init(ltr $0x28), the
+#                                              syscall MSRs, and iretq
+#                                              into user mode all worked
+#                                              with the loaded GDT (the
+#                                              kernel's gdt64, picked up
+#                                              via the +60 handoff slot).
+#                                              Pre-M16.126 this trapped
+#                                              #GP err=0x28 at tss_init.
 # Order matters: a stale fragment of a previous run shouldn't be able
 # to satisfy a later check by appearing earlier in the log.
 #
@@ -42,6 +53,8 @@
 #   UEFI_BANNER_RE      EFI entry marker         (default: PE-entry marker)
 #   UEFI_HANDOFF_RE     post-handoff marker      (default: post-ExitBootServices)
 #   KERNEL_BANNER_RE    kernel banner regex       (default: kernel banner)
+#   USER_READY_RE       hamsh-ready regex         (default: shell-ready
+#                                                  marker — M16.126 gate)
 
 set -euo pipefail
 
@@ -56,6 +69,10 @@ UEFI_BOOT_TIMEOUT="${UEFI_BOOT_TIMEOUT:-45}"
 UEFI_BANNER_RE="${UEFI_BANNER_RE:-\[hamnix\] EFI entry reached}"
 UEFI_HANDOFF_RE="${UEFI_HANDOFF_RE:-\[hamnix\] post-EFI handoff complete}"
 KERNEL_BANNER_RE="${KERNEL_BANNER_RE:-Hamnix kernel booting}"
+# M16.126 gate: hamsh's first line proves we made it through tss_init,
+# syscall_init, and iretq into ring-3 — i.e. all the places that would
+# have re-tripped a missing GDT slot on the UEFI path.
+USER_READY_RE="${USER_READY_RE:-\[hamsh\] M16.35 shell ready}"
 
 # OVMF path resolution: prefer the Debian-style /usr/share/ovmf/OVMF.fd
 # (single-file firmware) but fall back to the 4M split-firmware path
@@ -105,6 +122,7 @@ echo "[test_uefi_boot]   firmware  = $OVMF_FD"
 echo "[test_uefi_boot]   banner_re = \"$UEFI_BANNER_RE\""
 echo "[test_uefi_boot]   handoff_re= \"$UEFI_HANDOFF_RE\""
 echo "[test_uefi_boot]   kernel_re = \"$KERNEL_BANNER_RE\""
+echo "[test_uefi_boot]   user_re   = \"$USER_READY_RE\""
 
 set +e
 timeout "${UEFI_BOOT_TIMEOUT}s" qemu-system-x86_64 \
@@ -148,5 +166,20 @@ MARKER_LINE=0
 check_marker "EFI-entry"    "$UEFI_BANNER_RE"  0           || { echo "[test_uefi_boot] FAIL"; exit 1; }
 check_marker "post-handoff" "$UEFI_HANDOFF_RE" "$MARKER_LINE" || { echo "[test_uefi_boot] FAIL"; exit 1; }
 check_marker "kernel"       "$KERNEL_BANNER_RE" "$MARKER_LINE" || { echo "[test_uefi_boot] FAIL"; exit 1; }
+# M16.126 gate: hamsh actually came up. Pre-fix this would have FAIL'd
+# with a #GP at tss_init — the kernel-banner check above passes, but
+# tss_init runs LATER, just before start_first_task. Without the
+# kernel-gdt handoff, that's where the boot died on UEFI.
+check_marker "user"         "$USER_READY_RE"   "$MARKER_LINE" || { echo "[test_uefi_boot] FAIL"; exit 1; }
+
+# Belt-and-braces: an explicit "no #GP at tss_init" check. Any
+# `TRAP: vector 0x0d err=0x28` line in the log is the M16.125 → M16.126
+# regression we just fixed; reject it loudly even if the markers
+# above somehow lined up.
+if grep -a -q -E "TRAP: vector 0x0d err=0x28" "$LOGFILE"; then
+    echo "[test_uefi_boot] FAIL: tss_init #GP regression (err=0x28) detected." >&2
+    echo "[test_uefi_boot] FAIL"
+    exit 1
+fi
 
 echo "[test_uefi_boot] PASS"

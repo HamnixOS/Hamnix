@@ -54,8 +54,14 @@
  *      PML4[0]->PDPT, PDPT[0..3]->1 GiB pages covering [0, 4 GiB).
  *      Mirrors arch/x86/boot/header.S's 1 GiB-page approach so the
  *      kernel runs with the same identity map regardless of boot path.
- *   9. Load our own GDT (kernel-compatible: 0x08=code64, 0x10=data,
- *      same selector shape as arch/x86/boot/header.S's gdt64).
+ *   9. Load the kernel's OWN gdt64 (M16.126). We pick up its address
+ *      from the handoff table's +60 slot (planted by header.S). This
+ *      is the same 7-entry GDT the multiboot path runs with (null,
+ *      kernel CS, kernel DS, user DS, user CS, TSS-lo, TSS-hi), so
+ *      tss_init's `ltr $0x28` and any subsequent SYSRET that
+ *      references the user CS/DS slots find live descriptors.
+ *      (Pre-M16.126 the stub installed a private 3-entry GDT here
+ *      that #GPed the kernel inside tss_init.)
  *  10. Far-jump through CS=0x08 to flush segments, set CR3 = pml4,
  *      reload data segments, then `jmp *efi_kernel_entry` which is
  *      `_x86_start_after_loader` from arch/x86/kernel/head_64.S.
@@ -399,6 +405,12 @@ efi_main:
      *   +48  HAMNIX_HANDOFF_MAGIC (0x484D4158, "HAMX")
      *   +52  uint32 efi_entry_addr     = &_x86_start_after_loader
      *   +56  uint32 boot_via_efi_addr  = &boot_via_efi
+     *   +60  uint32 gdt64_addr         = &gdt64
+     *
+     * The +60 entry (M16.126) is what makes tss_init's `ltr $0x28`
+     * not #GP on the UEFI path: we use it to lgdt the kernel's own
+     * 7-entry gdt64 (null/k-cs/k-ds/u-ds/u-cs/tss-lo/tss-hi) before
+     * the far-jump, replacing this stub's 3-entry private efi_gdt.
      *
      * Why scan instead of hard-coding 0x100000+offset:
      *   - The kernel image's first PT_LOAD currently starts at
@@ -426,13 +438,21 @@ efi_main:
     jmp     .Lefi_elf_bad
 
 .Lscan_mb_hit:
-    /* %rsi = address of the multiboot1 magic. Read +48..+56. */
+    /* %rsi = address of the multiboot1 magic. Read +48..+60. */
     cmpl    $HAMNIX_HANDOFF_MAGIC, 48(%rsi)
     jne     .Lefi_handoff_bad
     movl    52(%rsi), %eax                  /* efi_entry_addr */
     movl    %eax, efi_kernel_entry(%rip)
     movl    56(%rsi), %eax                  /* boot_via_efi_addr */
     movq    %rax, efi_boot_via_efi_ptr(%rip)
+    /* M16.126: pull &gdt64 out of the +60 handoff slot. We need the
+     * kernel's 7-entry GDT (not this stub's 3-entry private one) so
+     * tss_init's ltr $0x28 — and SYSRET's reliance on selectors 0x18
+     * / 0x20 — find live descriptors instead of trapping #GP for an
+     * out-of-limit selector. Stored as uint32 because the kernel is
+     * elf32-i386 (VMAs < 4 GiB) and we identity-map below 4 GiB. */
+    movl    60(%rsi), %eax                  /* gdt64_addr */
+    movl    %eax, efi_kernel_gdt_addr(%rip)
 
     /* Patch *boot_via_efi = 1 so e820_init() takes the EFI fallback. */
     movq    efi_boot_via_efi_ptr(%rip), %rax
@@ -522,16 +542,31 @@ efi_main:
     call    efi_serial_puts
 
     /* =================================================================
-     * STEP 9: Load our own GDT.
-     * Layout matches arch/x86/boot/header.S's gdt64 (CS=0x08, DS=0x10).
+     * STEP 9: Load the kernel's own gdt64 (M16.126 fix).
      *
-     * PE/COFF has no .reloc section so the static `.long efi_gdt`
-     * inside efi_gdt_descriptor holds the LINK-time offset (image-
-     * base 0), not the run-time VMA. Patch it at runtime via leaq.
+     * History (M16.111..M16.125): this stub used to load a private
+     * 3-entry GDT (efi_gdt: null, k-cs=0x08, k-ds=0x10). That works
+     * for the far-jump-to-flush-CS step below, but it leaves the
+     * GDT limit at 23 bytes — selectors 0x18 (user DS), 0x20 (user
+     * CS), and 0x28 (TSS) all index past the limit and #GP the next
+     * instruction that loads them. In the BIOS multiboot path none of
+     * that matters because header.S's gdt64 has 7 entries already.
+     * In the EFI path, tss_init's `ltr $0x28` was the first such
+     * load — it trapped #GP err=0x28 right after `syscall MSRs armed`
+     * in init/main.ad, never reaching start_first_task.
+     *
+     * The fix is to load the kernel's own gdt64 (whose address we
+     * pulled out of the handoff table's +60 slot above). gdt64 has
+     * 7 quads = 56 bytes, so the limit is 55 = 0x37. We build a
+     * fresh 10-byte (m16:64) gdtr descriptor here at runtime because
+     * the kernel's gdt64_descriptor is 6 bytes (m16:32, for the
+     * 32-bit-protected-mode lgdt in header.S) — wrong shape for a
+     * 64-bit lgdt.
      * ================================================================= */
-    leaq    efi_gdt(%rip), %rax
-    movq    %rax, efi_gdt_descriptor_base(%rip)
-    lgdt    efi_gdt_descriptor(%rip)
+    movw    $0x37, efi_kgdt_descriptor_limit(%rip)   /* 56 - 1 */
+    movl    efi_kernel_gdt_addr(%rip), %eax          /* &gdt64 (uint32) */
+    movq    %rax, efi_kgdt_descriptor_base(%rip)     /* zero-extend to 64-bit */
+    lgdt    efi_kgdt_descriptor(%rip)
 
     /* Debug marker: GDT loaded. */
     leaq    efi_msg_gdt(%rip), %rsi
@@ -775,17 +810,47 @@ efi_kernel_size:            .quad 0
      * uint32 because the kernel is elf32-i386 (VMAs < 4 GiB). */
     .globl efi_kernel_entry
 efi_kernel_entry:           .long 0
-    .long 0                                 /* pad to 8-byte align */
+    /* Address of the kernel's `gdt64` (M16.126), also a uint32. We use
+     * it to build a 10-byte gdtr descriptor at runtime — see
+     * efi_kgdt_descriptor below. The stub's pre-M16.126 private
+     * efi_gdt covered only selectors 0x00/0x08/0x10, which #GPed
+     * the kernel's tss_init when it loaded selector 0x28. */
+    .globl efi_kernel_gdt_addr
+efi_kernel_gdt_addr:        .long 0
 
     /* GDT descriptor (limit + base). Lives in .data because the
      * 8-byte base is runtime-patched in efi_main (PE/COFF has no
-     * .reloc, so the link-time `efi_gdt` value is not the VMA). */
+     * .reloc, so the link-time `efi_gdt` value is not the VMA).
+     *
+     * Pre-M16.126: this was the descriptor actually loaded via lgdt.
+     * Kept for now (zero cost) so that any out-of-tree consumers
+     * that referenced the symbols don't fail to link; the live code
+     * path now uses efi_kgdt_descriptor below. */
     .align 8
     .globl efi_gdt_descriptor
 efi_gdt_descriptor:
     .short  efi_gdt_end - efi_gdt - 1       /* limit (constant) */
     .globl efi_gdt_descriptor_base
 efi_gdt_descriptor_base:    .quad 0         /* base (runtime-patched) */
+
+    /* M16.126: kernel-GDT descriptor (m16:64). limit and base are
+     * both runtime-patched in step 9 of efi_main:
+     *   limit = 55 = 0x37 (gdt64 has 7 entries × 8 bytes - 1)
+     *   base  = &gdt64 (zero-extended from the uint32 in
+     *           efi_kernel_gdt_addr, since the kernel's VMAs are
+     *           all < 4 GiB).
+     *
+     * Has to be a full 10-byte (m16:64) descriptor because we lgdt
+     * from 64-bit code — the kernel's own gdt64_descriptor in
+     * header.S is m16:32 (used from 32-bit protected mode) and would
+     * pull garbage into the upper 32 bits of base if loaded here. */
+    .align 8
+    .globl efi_kgdt_descriptor
+efi_kgdt_descriptor:
+    .globl efi_kgdt_descriptor_limit
+efi_kgdt_descriptor_limit:  .short 0        /* runtime-patched: 0x37 */
+    .globl efi_kgdt_descriptor_base
+efi_kgdt_descriptor_base:   .quad 0         /* runtime-patched: &gdt64 */
 
     /* Far-jump operand (runtime-patched). Offset is computed at
      * runtime via leaq + RIP and stored here; CS selector is the

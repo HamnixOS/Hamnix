@@ -92,6 +92,15 @@ multiboot_header:
      *   +48  uint32  HAMNIX_HANDOFF_MAGIC ("HAMX")
      *   +52  uint32  efi_entry_addr   = &_x86_start_after_loader
      *   +56  uint32  boot_via_efi_addr = &boot_via_efi
+     *   +60  uint32  gdt64_addr       = &gdt64
+     *
+     * The +60 slot was reserved until M16.126: the EFI stub now has to
+     * install the kernel's own gdt64 (with all 7 entries: null, kernel
+     * CS/DS, user DS/CS, TSS-low, TSS-high) BEFORE jumping to the
+     * kernel — otherwise tss_init's `ltr $0x28` (and SYSRET later)
+     * #GPs because the stub's private 3-entry GDT has no slot 5.
+     * Passing &gdt64 through the handoff table lets the stub
+     * lgdt-load the kernel's own GDT instead of guessing at offsets.
      *
      * Why pack these into the kernel image instead of having the EFI
      * stub parse the ELF symbol table:
@@ -110,7 +119,7 @@ multiboot_header:
     .long   HAMNIX_HANDOFF_MAGIC    /* off 48 */
     .long   _x86_start_after_loader /* off 52 */
     .long   boot_via_efi            /* off 56 */
-    .long   0                       /* off 60 reserved */
+    .long   gdt64                   /* off 60 — &gdt64 (M16.126) */
 
 /* ---------- 32-bit protected-mode entry ---------------------------- */
     .globl  _start
