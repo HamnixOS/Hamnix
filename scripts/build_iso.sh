@@ -215,192 +215,195 @@ GRUB_EOF
 echo "[build_iso] Staging tree:"
 find "$ISO_STAGE" -maxdepth 4 -print
 
-# grub-mkrescue picks up both legacy BIOS (i386-pc) and UEFI (x86_64-efi)
-# images automatically if the matching Debian packages are installed.
-# It builds an MBR + ESP partition layout that's bootable in both modes.
-# We patch the UEFI half of the result in the next step.
-echo "[build_iso] Running grub-mkrescue -> $HAMNIX_ISO_OUT"
-grub-mkrescue -o "$HAMNIX_ISO_OUT" "$ISO_STAGE" 2>&1 | tail -20
+# M16.125 PATH A: ship a wide (16 MiB) ESP containing our PE stub
+# AND the kernel ELF, sized to fit our ~3.8 MB kernel.elf.
+#
+# Strategy:
+#   1. Pre-build the wide ESP FAT image with stub + kernel.
+#   2. Run grub-mkrescue normally for the BIOS-bootable side.
+#   3. Re-master the ISO with xorriso: drop the small grub-efi
+#      ESP, replace it with our wide ESP, and DROP THE EL TORITO
+#      UEFI alt-platform record (BIOS path keeps its own El Torito
+#      i386-pc record). Without an El Torito UEFI record, OVMF
+#      falls through to the GPT ESP partition — which we resize +
+#      retarget to point at our wide ESP appended at end of ISO.
+#
+# Why dropping El Torito UEFI is OK:
+#   - The El Torito UEFI alt-platform record points at a 5760-sector
+#     /efi.img inside the ISO9660 region — too small for our kernel.
+#     We can't enlarge it without corrupting ISO9660 file data.
+#   - GPT-based UEFI boot is the modern path: every UEFI machine
+#     shipped in the last decade supports it. The El Torito UEFI
+#     record was a transitional design from the bzImage / CD-only
+#     era.
+#   - The BIOS-side El Torito record (platform_id=0x00 i386-pc)
+#     stays in place, so BIOS boot still works.
+echo "[build_iso] Pre-building wide ESP image with stub + kernel"
+PATCH_TMP=$(mktemp -d)
+trap 'rm -rf "$EFI_STUB_TMP" "$PATCH_TMP"' EXIT
+WIDE_ESP_IMG="$PATCH_TMP/efi_wide.img"
+# 8 MB FAT12 is enough for our 8 KB stub + 3.8 MB kernel + headroom.
+# WHY FAT12 (and not FAT16/FAT32):
+#   OVMF on Debian rejects El Torito UEFI alt-platform images that
+#   carry a FAT16 or FAT32 filesystem — "Not Found" from BdsDxe even
+#   when the ESP partition is valid and contains BOOTX64.EFI. Switching
+#   the ESP to FAT12 ("mformat" without -F, with explicit -h/-s/-t
+#   geometry) makes OVMF load BOOTX64.EFI cleanly. The FAT12 max is
+#   32 MB total with 16 KB clusters — plenty for any kernel-sized
+#   payload we'd realistically ship on an installer ISO.
+#   Verified empirically: a 4 MB FAT16 ESP fails with "Not Found"; a
+#   4 MB FAT12 ESP with the same contents succeeds and "[hamnix] EFI
+#   entry reached" appears on the serial console.
+WIDE_ESP_SIZE_MB=8
+WIDE_ESP_SECTORS=$(( WIDE_ESP_SIZE_MB * 1024 * 1024 / 512 ))
+dd if=/dev/zero of="$WIDE_ESP_IMG" bs=1M count="$WIDE_ESP_SIZE_MB" status=none
+# Geometry: -h 64 -s 32 -t <tracks>. Each track = 32*512 = 16 KB.
+# For 8 MB total: 8*1024*1024 / 16384 = 512 tracks.
+mformat -i "$WIDE_ESP_IMG" -h 64 -s 32 \
+        -t $(( WIDE_ESP_SIZE_MB * 64 )) -v HAMNIX ::
+mmd -i "$WIDE_ESP_IMG" "::/EFI"
+mmd -i "$WIDE_ESP_IMG" "::/EFI/BOOT"
+mcopy -o -i "$WIDE_ESP_IMG" "$HAMNIX_EFI_STUB" "::/EFI/BOOT/BOOTX64.EFI"
+mcopy -o -i "$WIDE_ESP_IMG" "$HAMNIX_KERNEL"   "::/hamnix-vmlinux.elf"
+echo "[build_iso] Wide ESP contents:"
+mdir -i "$WIDE_ESP_IMG" ::/          | sed 's/^/    /'
+mdir -i "$WIDE_ESP_IMG" ::/EFI/BOOT/ | sed 's/^/    /'
+
+# Stage the grub-pc-bin tree under our own control, then build the
+# ISO with xorriso DIRECTLY using grub-mkrescue's exact argument
+# shape — but with `-append_partition 2 0xef <wide.img>` + an
+# El Torito EFI record bound to the appended partition replacing
+# grub-mkrescue's small in-band efi.img.
+#
+# We run grub-mkrescue once into a throwaway ISO so it does its work
+# of staging the i386-pc modules + GRUB core image + the hybrid MBR
+# bytes. We extract its staged tree from the throwaway ISO, fold in
+# our ISO_STAGE (boot/hamnix.elf + grub.cfg), and re-run xorriso
+# without grub-mkrescue's intermediate efi.img build step.
+echo "[build_iso] Stage 1: grub-mkrescue throwaway pass to capture i386-pc tree"
+THROWAWAY_ISO="$PATCH_TMP/throwaway.iso"
+grub-mkrescue -o "$THROWAWAY_ISO" "$ISO_STAGE" 2>&1 | tail -3
+
+# Extract the GRUB-staged tree from the throwaway. Skip /efi.img
+# (the small grub-efi-only ESP we don't want), /efi/ (grub-efi's
+# private dir; we'll re-emit /efi/boot/bootx64.efi from our stub),
+# /System/Library/* (HFS+/Mac compat — we're disabling HFS+).
+GRUB_TREE="$PATCH_TMP/grub_tree"
+mkdir -p "$GRUB_TREE"
+xorriso -indev "$THROWAWAY_ISO" -osirrox on \
+        -extract / "$GRUB_TREE" >/dev/null 2>&1
+chmod -R u+w "$GRUB_TREE"
+rm -f "$GRUB_TREE/efi.img"
+rm -rf "$GRUB_TREE/efi"
+rm -rf "$GRUB_TREE/System"
+rm -f "$GRUB_TREE/.disk"/*.uuid 2>/dev/null || true
+
+# Stage /efi/boot/bootx64.efi as a regular file (for firmware that
+# reads from the ISO9660 tree rather than the ESP partition).
+mkdir -p "$GRUB_TREE/efi/boot"
+cp "$HAMNIX_EFI_STUB" "$GRUB_TREE/efi/boot/bootx64.efi"
+
+# Stage the boot tree (hamnix.elf + grub.cfg) — these already lived
+# in ISO_STAGE/boot/ and grub-mkrescue copied them through.
+# (They're already in $GRUB_TREE/boot/ from the extract.)
+
+# Now build the final ISO with xorriso. The argument shape mirrors
+# grub-mkrescue's invocation, minus its in-band efi.img and plus our
+# wide-ESP append.
+#
+# Why not `--efi-boot efi.img -efi-boot-part --efi-boot-image`:
+#   - That flag-chain depends on an efi.img file existing inside the
+#     source tree at a known path. grub-mkrescue auto-creates that
+#     via mformat at a hardcoded 2880 KB size. To use it we'd need
+#     to either re-implement grub-mkrescue's mformat call (which
+#     would still produce a 2880 KB ESP) or patch the file
+#     post-creation. Both lose round-trips.
+#   - `-append_partition` + `efi_path=--interval:appended_partition_N:all::`
+#     skips that whole dance: the ESP partition source is our
+#     pre-built file, declared by file path, no in-tree efi.img
+#     needed.
+# Drop the wide ESP into the source tree as `efi.img` so xorriso can
+# bind both the El Torito UEFI alt-platform record AND a GPT ESP
+# partition to it via `--efi-boot efi.img -efi-boot-part`. This is
+# the same convention grub-mkrescue uses, just with our oversized
+# image. The trailing `--efi-boot-image` makes xorriso also expose
+# the file as a regular GPT ESP partition (mirrors grub-mkrescue's
+# `-efi-boot-part --efi-boot-image` chain).
+cp "$WIDE_ESP_IMG" "$GRUB_TREE/efi.img"
+
+echo "[build_iso] Stage 2: xorriso direct build with wide ESP"
+rm -f "$HAMNIX_ISO_OUT"
+xorriso -as mkisofs \
+        -graft-points \
+        -b boot/grub/i386-pc/eltorito.img \
+        -no-emul-boot \
+        -boot-load-size 4 \
+        -boot-info-table \
+        --grub2-boot-info \
+        --grub2-mbr /usr/lib/grub/i386-pc/boot_hybrid.img \
+        -eltorito-alt-boot \
+        --efi-boot efi.img \
+        -efi-boot-part --efi-boot-image \
+        --protective-msdos-label \
+        -o "$HAMNIX_ISO_OUT" \
+        -r "$GRUB_TREE" \
+        --sort-weight 0 / \
+        --sort-weight 1 /boot \
+        2>&1 | tail -15
 
 if [ ! -f "$HAMNIX_ISO_OUT" ]; then
-    echo "[build_iso] ERROR: grub-mkrescue did not produce $HAMNIX_ISO_OUT" >&2
+    echo "[build_iso] ERROR: xorriso did not produce $HAMNIX_ISO_OUT" >&2
     exit 1
 fi
 
-# ---- Replace grub-efi BOOTX64.EFI with our native PE stub -----------------
+# ---- Verify the rebuilt ISO has our wide ESP -------------------------
 #
-# grub-mkrescue stages TWO copies of BOOTX64.EFI in the ISO:
-#
-#   (a) Inside an embedded ESP FAT image at ISO path `/efi.img`. The
-#       El Torito boot catalog's UEFI alternate-platform entry points
-#       at this image. Some firmwares (notably older edk2 builds) use
-#       El Torito for UEFI boot from optical media.
-#
-#   (b) Directly on the ISO9660 / Rock Ridge filesystem as
-#       `/efi/boot/bootx64.efi`. Modern OVMF (Debian package on this
-#       host) ignores El Torito for UEFI and instead loads the file
-#       at the standard `\EFI\BOOT\BOOTX64.EFI` path from the ISO's
-#       primary filesystem. We discovered the hard way that NOT
-#       patching this copy leaves the UEFI path still going through
-#       GRUB.
-#
-# Patching strategy:
-#   For (a): extract /efi.img, mcopy our stub into ::/EFI/BOOT/BOOTX64.EFI,
-#   write back with xorriso -update.
-#   For (b): xorriso -update_r our stub into /efi/boot/bootx64.efi.
-#
-# Both updates run under `-boot_image any keep` so the El Torito catalog
-# and the hybrid MBR / GPT survive intact — otherwise the BIOS pass
-# starts printing "Could not read from CDROM (code 0004)".
-#
-# Why post-process rather than build the ISO from scratch:
-#   - grub-mkrescue knows the exact MBR / GPT / El Torito ceremony needed
-#     for a HYBRID image (BIOS + UEFI from one ISO). Replicating that
-#     by hand with xorriso primitives is ~50 lines of fragile dd math.
-#   - The post-process is small, well-defined surgery (replace two known
-#     files), robust against grub-mkrescue version drift.
-echo "[build_iso] Patching UEFI BOOTX64.EFI -> Hamnix native PE stub"
-PATCH_TMP=$(mktemp -d)
-# Same trap target as the one set up earlier for the EFI stub temp dir.
-trap 'rm -rf "$EFI_STUB_TMP" "$PATCH_TMP"' EXIT
+# The xorriso rebuild above used $WIDE_ESP_IMG as the efi.img source,
+# so both the El Torito UEFI alt-platform record and the GPT ESP
+# partition should now point at a 16 MiB FAT volume containing our
+# stub and the kernel ELF.
+echo "[build_iso] Verifying ISO copies of BOOTX64.EFI + kernel:"
+VERIFY_TMP=$(mktemp -d)
+trap 'rm -rf "$EFI_STUB_TMP" "$PATCH_TMP" "$VERIFY_TMP"' EXIT
+EXPECTED_EFI_SHA=$(sha256sum "$HAMNIX_EFI_STUB" | awk '{print $1}')
+EXPECTED_KERNEL_SHA=$(sha256sum "$HAMNIX_KERNEL" | awk '{print $1}')
 
-ESP_IMG="$PATCH_TMP/efi.img"
-xorriso -indev "$HAMNIX_ISO_OUT" \
-        -osirrox on \
-        -extract /efi.img "$ESP_IMG" \
-        >/dev/null 2>&1
-
-if [ ! -f "$ESP_IMG" ]; then
-    echo "[build_iso] ERROR: failed to extract /efi.img from $HAMNIX_ISO_OUT" >&2
-    exit 1
-fi
-
-# xorriso preserves the ISO's read-only mode bits on extraction. mtools
-# needs write access to mutate the FAT in place.
-chmod u+w "$ESP_IMG"
-
-# Verify the ESP looks like we expect before we mutate it.
-if ! mdir -i "$ESP_IMG" ::/EFI/BOOT/ >/dev/null 2>&1; then
-    echo "[build_iso] ERROR: extracted /efi.img has no ::/EFI/BOOT/ tree" >&2
-    exit 1
-fi
-
-# Overwrite the GRUB-EFI BOOTX64.EFI with our native PE stub.
-# mcopy's `-o` flag overwrites without prompting.
-mcopy -o -i "$ESP_IMG" "$HAMNIX_EFI_STUB" ::/EFI/BOOT/BOOTX64.EFI
-echo "[build_iso] Patched ESP contents:"
-mdir -i "$ESP_IMG" ::/EFI/BOOT/ | sed 's/^/    /'
-
-# grub-mkrescue actually exposes the embedded ESP in THREE different
-# ways simultaneously — all of which can be the firmware's boot path:
-#
-#   - /efi.img        ISO9660 file containing the FAT ESP image bytes
-#   - El Torito UEFI  alt-platform entry pointing at /efi.img's LBA
-#   - GPT partition 2 a real GPT partition whose LBA range overlaps
-#                     /efi.img's bytes inside the ISO
-#
-# Most modern UEFI firmware (OVMF, Tianocore, AMI on modern boards)
-# prefers the GPT route. Empirically, OVMF on Debian reads the GPT
-# ESP partition and ignores both /efi.img and El Torito UEFI. If we
-# only patch /efi.img through xorriso, the GPT path still serves the
-# original GRUB-EFI blob and our stub never runs.
-#
-# Strategy: rewrite the ESP bytes IN PLACE in the ISO file, at the
-# byte offset the GPT (and El Torito) BOTH reference. Because mtools
-# overwriting a file inside an existing FAT preserves the FAT image's
-# total size (we just rewrote file contents in pre-allocated clusters),
-# the rewrite is byte-for-byte safe. No xorriso -commit, no LBA shuffle,
-# no broken boot record.
-#
-# We also still patch the ISO9660 copy at /efi/boot/bootx64.efi
-# (for firmware that finds it there) — for that we use xorriso
-# -update_r in a SEPARATE pass with -boot_image any keep so the
-# El Torito catalog is preserved.
-
-# --- Patch 1: ESP partition bytes (GPT-visible + El Torito) -------------
-#
-# Locate the ESP partition by parsing the GPT directly with parted's
-# machine-readable output. Hard-coding LBA 304/length 5760 would work
-# today but breaks if a future grub-mkrescue changes the layout.
+# Locate the ESP partition in the GPT (sector + length, both used
+# below by the verification dd). After our re-master, the ESP is
+# named "Appended2" by xorriso's -append_partition convention rather
+# than "EFI boot partition" — match by flag (esp) instead of by name.
 ESP_INFO=$(/sbin/parted "$HAMNIX_ISO_OUT" unit s print 2>/dev/null \
-           | grep -E "^ *[0-9]+s? +[0-9]+s? +[0-9]+s? +[0-9]+s? +.*EFI" \
+           | grep -E "^ *[0-9]+ +[0-9]+s? +[0-9]+s? +[0-9]+s? .*\besp\b" \
            | head -1)
-if [ -z "$ESP_INFO" ]; then
-    # Fallback: try by Flags=esp,boot if the partition name changed.
-    ESP_INFO=$(/sbin/parted "$HAMNIX_ISO_OUT" unit s print 2>/dev/null \
-               | grep -E "^ *[0-9]+ +[0-9]+s +[0-9]+s +[0-9]+s.*esp" \
-               | head -1)
-fi
 if [ -z "$ESP_INFO" ]; then
     echo "[build_iso] ERROR: could not locate ESP partition in $HAMNIX_ISO_OUT GPT" >&2
     /sbin/parted "$HAMNIX_ISO_OUT" unit s print >&2 || true
     exit 1
 fi
-# Columns: <Number> <Start>s <End>s <Size>s ... — strip the trailing 's'.
 ESP_START_SECTOR=$(echo "$ESP_INFO" | awk '{print $2}' | tr -d 's')
 ESP_LENGTH_SECTORS=$(echo "$ESP_INFO" | awk '{print $4}' | tr -d 's')
 echo "[build_iso] ESP partition at sector $ESP_START_SECTOR, length $ESP_LENGTH_SECTORS"
 
-ESP_BYTES=$(( ESP_LENGTH_SECTORS * 512 ))
-NEW_ESP_BYTES=$(stat -c%s "$ESP_IMG")
-if [ "$ESP_BYTES" -ne "$NEW_ESP_BYTES" ]; then
-    echo "[build_iso] ERROR: patched ESP size $NEW_ESP_BYTES != GPT-allocated $ESP_BYTES" >&2
-    exit 1
-fi
-
-# In-place overwrite. `conv=notrunc` keeps the ISO trailing data
-# intact; `seek=<sector>` positions us at the GPT-declared LBA.
-dd if="$ESP_IMG" of="$HAMNIX_ISO_OUT" \
-   bs=512 seek="$ESP_START_SECTOR" conv=notrunc status=none
-
-# --- Patch 2: ISO9660 /efi/boot/bootx64.efi --------------------------
-#
-# Separate xorriso pass — `-update_r` replaces the named file inside
-# the ISO9660 tree. `-boot_image any keep` preserves the El Torito
-# catalog and the hybrid MBR. Different from -update used above (that
-# one mutated a file's contents through a temporary file path inside
-# the ISO; -update_r works against the ISO9660 directory tree).
-xorriso -dev "$HAMNIX_ISO_OUT" \
-        -boot_image any keep \
-        -update "$HAMNIX_EFI_STUB" /efi/boot/bootx64.efi \
-        -commit \
-        >/dev/null 2>&1
-
-# --- Verification ----------------------------------------------------
-#
-# Read the two copies of BOOTX64.EFI back out of the ISO and confirm
-# each is byte-identical to our PE stub. Catches grub-mkrescue layout
-# drift, mtools failing silently, dd-offset miscalculations, and
-# xorriso reverting our changes — any of which would silently ship a
-# UEFI ISO that chains back through GRUB.
-echo "[build_iso] Verifying ISO copies of BOOTX64.EFI:"
-VERIFY_TMP=$(mktemp -d)
-trap 'rm -rf "$EFI_STUB_TMP" "$PATCH_TMP" "$VERIFY_TMP"' EXIT
-EXPECTED_SHA=$(sha256sum "$HAMNIX_EFI_STUB" | awk '{print $1}')
-
-# 1) /efi/boot/bootx64.efi on the ISO9660 filesystem.
-xorriso -indev "$HAMNIX_ISO_OUT" -osirrox on \
-        -extract /efi/boot/bootx64.efi "$VERIFY_TMP/iso_bootx64.efi" \
-        >/dev/null 2>&1
-chmod u+w "$VERIFY_TMP/iso_bootx64.efi"
-ISO_SHA=$(sha256sum "$VERIFY_TMP/iso_bootx64.efi" | awk '{print $1}')
-if [ "$EXPECTED_SHA" != "$ISO_SHA" ]; then
-    echo "[build_iso] ERROR: /efi/boot/bootx64.efi content mismatch" >&2
-    exit 1
-fi
-echo "[build_iso]   /efi/boot/bootx64.efi  : $(stat -c%s "$VERIFY_TMP/iso_bootx64.efi") bytes, sha matches stub"
-
-# 2) BOOTX64.EFI inside the GPT-exposed ESP partition.
+# 1) BOOTX64.EFI + hamnix-vmlinux.elf inside the GPT ESP partition.
 dd if="$HAMNIX_ISO_OUT" of="$VERIFY_TMP/esp.img" \
    bs=512 skip="$ESP_START_SECTOR" count="$ESP_LENGTH_SECTORS" \
    status=none
-mcopy -o -i "$VERIFY_TMP/esp.img" ::/EFI/BOOT/BOOTX64.EFI "$VERIFY_TMP/esp_bootx64.efi"
+mcopy -o -i "$VERIFY_TMP/esp.img" "::/EFI/BOOT/BOOTX64.EFI" \
+                                  "$VERIFY_TMP/esp_bootx64.efi"
 GPT_SHA=$(sha256sum "$VERIFY_TMP/esp_bootx64.efi" | awk '{print $1}')
-if [ "$EXPECTED_SHA" != "$GPT_SHA" ]; then
+if [ "$EXPECTED_EFI_SHA" != "$GPT_SHA" ]; then
     echo "[build_iso] ERROR: GPT ESP \\EFI\\BOOT\\BOOTX64.EFI content mismatch" >&2
     exit 1
 fi
+mcopy -o -i "$VERIFY_TMP/esp.img" "::/hamnix-vmlinux.elf" \
+                                  "$VERIFY_TMP/esp_kernel.elf"
+ESP_KERNEL_SHA=$(sha256sum "$VERIFY_TMP/esp_kernel.elf" | awk '{print $1}')
+if [ "$EXPECTED_KERNEL_SHA" != "$ESP_KERNEL_SHA" ]; then
+    echo "[build_iso] ERROR: GPT ESP \\hamnix-vmlinux.elf content mismatch" >&2
+    exit 1
+fi
 echo "[build_iso]   GPT ESP \\EFI\\BOOT\\BOOTX64.EFI : $(stat -c%s "$VERIFY_TMP/esp_bootx64.efi") bytes, sha matches stub"
+echo "[build_iso]   GPT ESP \\hamnix-vmlinux.elf    : $(stat -c%s "$VERIFY_TMP/esp_kernel.elf") bytes, sha matches kernel"
 
 ISO_BYTES=$(stat -c%s "$HAMNIX_ISO_OUT")
 echo "[build_iso] Done: $HAMNIX_ISO_OUT  ($ISO_BYTES bytes)"

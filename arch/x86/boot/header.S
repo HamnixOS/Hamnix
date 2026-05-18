@@ -58,23 +58,59 @@
     .equ    MB_FLAGS,    0x00000004        /* VIDEO_MODE */
     .equ    MB_CHECKSUM, -(MB_MAGIC + MB_FLAGS)
 
+    /* Hamnix EFI handoff table magic ("HAMX" little-endian). The EFI
+     * stub (arch/x86/boot/efi_stub.S, M16.125 PATH A) scans the first
+     * 8 KiB of the loaded kernel image for the multiboot1 magic, then
+     * reads the handoff table at multiboot_header + 48 to learn the
+     * post-loader entry point and the address of `boot_via_efi`. */
+    .equ    HAMNIX_HANDOFF_MAGIC, 0x484D4158
+
     .align 4
 multiboot_header:
-    .long   MB_MAGIC
-    .long   MB_FLAGS
-    .long   MB_CHECKSUM
+    .long   MB_MAGIC                /* off  0 */
+    .long   MB_FLAGS                /* off  4 */
+    .long   MB_CHECKSUM             /* off  8 */
     /* header_addr..entry_addr — unused (bit 16 clear), but placeholders
      * keep the next group of fields at the spec-mandated offsets. */
-    .long   0x00000000              /* header_addr   */
-    .long   0x00000000              /* load_addr     */
-    .long   0x00000000              /* load_end_addr */
-    .long   0x00000000              /* bss_end_addr  */
-    .long   0x00000000              /* entry_addr    */
+    .long   0x00000000              /* off 12 header_addr   */
+    .long   0x00000000              /* off 16 load_addr     */
+    .long   0x00000000              /* off 20 load_end_addr */
+    .long   0x00000000              /* off 24 bss_end_addr  */
+    .long   0x00000000              /* off 28 entry_addr    */
     /* Video request — linear framebuffer, loader picks geometry. */
-    .long   0x00000000              /* mode_type = 0 (linear FB) */
-    .long   0x00000000              /* width  = any              */
-    .long   0x00000000              /* height = any              */
-    .long   0x00000000              /* depth  = any              */
+    .long   0x00000000              /* off 32 mode_type = 0 (linear FB) */
+    .long   0x00000000              /* off 36 width  = any              */
+    .long   0x00000000              /* off 40 height = any              */
+    .long   0x00000000              /* off 44 depth  = any              */
+
+    /* ---- Hamnix EFI handoff table (M16.125, PATH A) -----------------
+     *
+     * Lives at fixed offset 48 from multiboot_header. The EFI stub
+     * (arch/x86/boot/efi_stub.S) scans the loaded kernel image for the
+     * multiboot1 magic, then reads:
+     *
+     *   +48  uint32  HAMNIX_HANDOFF_MAGIC ("HAMX")
+     *   +52  uint32  efi_entry_addr   = &_x86_start_after_loader
+     *   +56  uint32  boot_via_efi_addr = &boot_via_efi
+     *
+     * Why pack these into the kernel image instead of having the EFI
+     * stub parse the ELF symbol table:
+     *   - Cheaper: a 2 KiB dword-scan vs. a multi-KB section-header /
+     *     string-table walk.
+     *   - Robust against linker behaviour: the multiboot1 magic is
+     *     already a stable scan target on the BIOS side; the stub
+     *     just reuses the same scan window.
+     *   - The kernel ELF format stays untouched — every existing
+     *     `qemu -kernel hamnix-vmlinux.elf` test keeps working.
+     *
+     * On the multiboot1 BIOS path the loader skips these bytes entirely
+     * (bit 16 is clear, so it stops reading the multiboot header at
+     * offset 48). They're inert padding from the loader's perspective.
+     */
+    .long   HAMNIX_HANDOFF_MAGIC    /* off 48 */
+    .long   _x86_start_after_loader /* off 52 */
+    .long   boot_via_efi            /* off 56 */
+    .long   0                       /* off 60 reserved */
 
 /* ---------- 32-bit protected-mode entry ---------------------------- */
     .globl  _start

@@ -439,9 +439,35 @@ it has to honour.
     SLIRP; for the real internet we need at least the slow-start /
     congestion-avoidance pair from RFC 5681 and probably NewReno
     fast retransmit.
-  - Passive open (LISTEN + SYN_RCVD) — required before sshd can
-    accept inbound connections. Single global LISTEN slot is enough
-    to bring up an in-kernel telnet/SSH server prototype.
+  - ~~Passive open (LISTEN + SYN_RCVD) — shipped in M16.124.
+    `tcp_listen(local_port)` allocates a TCB in LISTEN state;
+    `tcp_accept(listener_slot, timeout)` polls for a connection that
+    completed the three-way handshake on the listener's port. `tcp_rx`
+    falls back to a listener lookup when the 4-tuple doesn't match an
+    existing TCB; on SYN it allocates a fresh slot in SYN_RCVD, picks
+    an ISN (xorshift64 from `get_jiffies`), emits SYN-ACK, and waits
+    for the client's ACK to transition that slot to ESTABLISHED. With
+    the 8-entry TCB table, a single listener + 7 simultaneous accepted
+    connections is the practical cap. See `scripts/test_net_tcp_listen.sh`
+    (uses `hostfwd=tcp::5555-:80` + a host-side `nc localhost 5555`
+    to drive the inbound SYN).~~
+  - TCP passive-open follow-ups:
+    - Multi-listener support — today a single LISTEN slot per port is
+      assumed and there's no per-listener accept queue (incoming SYNs
+      allocate one new TCB at a time, with the LISTEN slot staying
+      LISTEN). For a real concurrent server with hundreds of
+      simultaneous accepts we need either an explicit accept queue
+      per listener or a wider TCB table.
+    - Socket-API binding — `tcp_listen` / `tcp_accept` are callable
+      only from in-kernel code paths. The Plan 9 `/net/tcp/clone`
+      shape (announce/listen/accept files) lands in Phase F.
+    - sshd prerequisite list now reads: (1) passive-open ready
+      (M16.124); (2) crypto primitives — at minimum SHA-256, Curve25519,
+      ChaCha20-Poly1305 (or AES-GCM); (3) a real PRNG seeded from
+      something better than `get_jiffies()` xorshift64; (4) RSA / Ed25519
+      host-key parser + verifier; (5) a /etc/passwd-shaped authentication
+      table or PAM-equivalent stub. Same chain unblocks an in-kernel
+      telnet server (skip steps 2-4).
   - Window scaling + SACK + timestamps — the standard performance
     options. Not blockers for `apt` (HTTP/1.1 over short
     single-segment requests), but real-world latency suffers without.
@@ -732,22 +758,43 @@ it has to honour.
   `blk_read_sectors(slot, ...)`. PASS markers: `[blk] write sd0
   LBA=1 OK`, `[blk] readback sd0 matches`, and equivalents for
   `nvme0n1`. See `scripts/test_block_layer_write.sh`. Follow-ups:
-    * Partition-aware naming (`sd0p1`, `nvme0n1p1`) so the installer
+    * ~~Partition-aware naming (`sd0p1`, `nvme0n1p1`) so the installer
       can `open("/dev/sd0p1")` and have the kernel map that to slot +
-      LBA-base via `partition_for(slot, idx)`.
+      LBA-base via `partition_for(slot, idx)`.~~ Shipped in M16.x:
+      `kernel/block/blk.ad::blk_register_partitions(parent_slot,
+      parent_name)` walks `partition_for(parent_slot, idx)` and
+      registers each live slot as `<parent>pN` (1-indexed) with a
+      partition-aware `BlockDeviceOps` vtable that offsets every
+      read/write by the partition's `lba_start` and bounds-checks
+      against `lba_end`. AHCI + NVMe call it after their own
+      `register_blockdev`. The block-device name field grew from
+      8 to 16 bytes to fit `nvme0n1p15`; `BLKDEV_MAX` grew from 4
+      to 32 so partitions don't evict raw disks. See
+      `scripts/test_partition_naming.sh` — partitions emerge as
+      `blk: registered 'sd0p1' capacity=63488 sectors` etc.
+      Sub-follow-ups:
+        - GPT partition names beyond the first-DWORD type-GUID
+          shorthand: today GPT entries register under the parent's
+          type prefix (the on-disk UTF-16LE name at offset +56 of
+          each GPT entry is decoded for the `[partition]` log but
+          not propagated into the block-device tag).
+        - Mountable Plan 9 syntax `mount /dev/sd0p1 /mnt`: today
+          fs/fat.ad + fs/ext4.ad mount whichever raw disk wins the
+          magic-number probe. The 9P mount(2) front-end needs a
+          path-string-to-slot resolver that walks /dev → block-layer
+          name.
     * Multi-port AHCI naming (`sd1`, `sd2`, ...) — today only the
       first active port wins; the rest of the PI mask is logged but
       not registered.
     * NVMe multi-namespace (`nvme0n2`, `nvme0n3`, ...) — paired with
       IDENTIFY active-namespace-list (CNS=0x02) bringup.
-- M16.118 follow-up: partition-table parsing for AHCI + NVMe disks.
-  drivers/block/partition.ad (parallel agent) already decodes
-  MBR + GPT against the block layer; with M16.119's AHCI/NVMe
-  block-layer registration in place, `blk_scan_partitions(slot)`
-  immediately works for them too — but the kernel doesn't yet call
-  it after the AHCI/NVMe register_blockdev path. Wiring is a single
-  call inside the driver's `_smoke_test` epilogue once a multi-disk
-  partition fixture exists in the regression suite.
+- ~~M16.118 follow-up: partition-table parsing for AHCI + NVMe disks.~~
+  Wired in M16.x alongside partition-aware naming above: the AHCI +
+  NVMe registration paths now call `blk_scan_partitions(slot)`
+  followed by `blk_register_partitions(slot, "<parent>")` after
+  `register_blockdev`. Test fixture is
+  `scripts/test_partition_naming.sh` (sfdisk-built two-primary MBR
+  on an AHCI disk).
 - M16.118 follow-up: ext4 write path + bootloader-install plumbing.
   With AHCI + NVMe writes in place, `dd if=hamnix.iso of=/dev/sda`
   from inside Hamnix becomes feasible; the higher-level installer
@@ -807,36 +854,58 @@ it has to honour.
   (arch/x86/kernel/head_64.S) is the merge point for the next
   step; `boot_via_efi` + EFI-fallback memblock window
   (arch/x86/kernel/e820.ad) are the kernel-side preposition.~~
-- UEFI stub → start_kernel chain. The EFI handshake is now done;
-  the stub halts after ExitBootServices. The original
-  "merge stub + kernel ELF into one hybrid binary" plan was
-  abandoned at M16.124 — see blockers B1..B4 in
-  `arch/x86/boot/efi_stub.S`'s header comment and the
-  "Why two binaries..." section of `docs/BOOT.md`. Summary:
-  `\x7fELF` and `MZ` can't share file offset 0; `.ap_trampoline`'s
-  LMA/VMA split doesn't survive PE/COFF conversion; the kernel
-  has no `.reloc` table for image-base relocation; and GDT/CR3
-  handoff from firmware is moot when the kernel code isn't in
-  memory. Two real paths forward:
-  - **PATH A: UEFI-side ELF loader in `efi_stub.S`.** Stub uses
-    UEFI's Simple File System Protocol BEFORE ExitBootServices
-    to open `\hamnix-vmlinux.elf` off the ESP, parse PHdrs, copy
-    PT_LOADs to their LMA (same shape as multiboot1's loader on
-    the BIOS side), then ExitBootServices + `jmp
-    _x86_start_after_loader`. ~300 lines of asm + an ELF parser
-    in the stub. Kernel ELF format stays untouched (every
-    `qemu -kernel` test keeps working).
-  - **PATH B: Add a bzImage-style flat-binary output.** Sibling
-    artifact alongside the kernel ELF: `build/hamnix.bin`,
-    produced by `objcopy -O binary` over a hand-written
-    PE+multiboot+(optionally Linux x86 boot header) prelude. The
-    flat binary starts with "MZ", carries the multiboot1 magic
-    in the first 8 KiB, ships as ESP `BOOTX64.EFI`. Larger
-    surgery but cleanly decouples the UEFI binary's format from
-    the kernel ELF.
-  Either path sets `boot_via_efi` via `set_boot_via_efi()` from
-  kernel-side before the jump so e820_init() takes the fallback
-  branch.
+- ~~UEFI stub → start_kernel chain. SHIPPED in M16.125 as PATH A
+  (UEFI-side ELF loader baked into `arch/x86/boot/efi_stub.S`):
+  the stub uses HandleProtocol(ImageHandle, LoadedImageGuid) →
+  HandleProtocol(DeviceHandle, SfspGuid) → OpenVolume to find the
+  ESP root, then opens `\hamnix-vmlinux.elf`, AllocatePool-reads
+  the full file in, parses e_phnum program headers, memcpy-copies
+  each PT_LOAD's p_filesz bytes from buffer+p_offset to p_paddr +
+  zero-pads p_memsz-p_filesz trailing bytes. The stub then scans
+  the loaded image for the multiboot1 magic, reads the
+  Hamnix EFI handoff table (planted at multiboot_header+48 in
+  arch/x86/boot/header.S) to extract `_x86_start_after_loader`'s
+  VMA and the address of `boot_via_efi`, patches `boot_via_efi=1`,
+  runs the GetMemoryMap + ExitBootServices retry loop, then
+  installs identity-mapped page tables (PML4[0]->PDPT, PDPT[0..3]
+  -> 1 GiB pages covering 0..4 GiB), loads a kernel-shape GDT
+  (CS=0x08, DS=0x10), and `rex.w ljmp *m16:64` (the 64-bit-offset
+  encoding GAS won't accept as `ljmpq`) to flush CS into 0x08
+  before `jmp *_x86_start_after_loader`. Verified by
+  `scripts/test_iso_qemu.sh`: BIOS + UEFI both reach
+  `cpio: registered N files from initramfs`. Blockers documented:
+  B1..B4 stay as historical context; M16.125 added B5 — OVMF on
+  optical media only accepts FAT12 El Torito UEFI images, so
+  `scripts/build_iso.sh` formats the wide ESP with explicit
+  geometry `mformat -h 64 -s 32 -t <tracks>` (FAT12, no -F).~~
+  Follow-ups:
+  - **EFI memory-map walker** in e820.ad — the stub already saves
+    the 16 KiB descriptor buffer at `efi_mmap_buf` + descsize at
+    `efi_mmap_descsize`; replace the hardcoded 2..240 MiB
+    fallback with a descsize-stride walker classifying entries
+    by Type (EfiConventionalMemory=7). One-screen change;
+    unblocks RAM above 240 MiB on UEFI boot.
+  - **Expose EFI Runtime Services** to kernel code via
+    `efi_system_table->RuntimeServices`. First win:
+    GetTime as a real-hardware alternative to the CMOS RTC
+    in `arch/x86/kernel/time.ad`; second:
+    GetVariable / SetVariable for persistent boot-config knobs
+    (kernel cmdline, default initramfs path).
+  - **Honour the PE relocation table** instead of runtime-
+    patching `efi_gdt_descriptor_base` / `efi_far_jmp_offset` in
+    .data. Add a `.reloc` section + ld script directives that
+    list the absolute references xorriso / ld can fix up at
+    image load. Cosmetic — the runtime patches work end-to-end —
+    but a real `.reloc` table is a prerequisite for Secure Boot
+    signing (the EFI signing chain requires a relocation-clean
+    PE+ image).
+  - **Drop the FAT12 32 MiB cap** by enabling the GPT-ESP
+    direct-mount path that modern OVMF supports — UEFI can read
+    a FAT32 partition referenced by GPT alone without an El
+    Torito UEFI alt-platform record. Conditionally drop the El
+    Torito UEFI record when the GPT ESP is large enough; ship
+    both records when the ESP fits FAT12. Eliminates the 32 MiB
+    ceiling on initramfs growth.
 - Parse the real EFI memory map instead of the hardcoded
   2..240 MiB fallback installed by `e820_init()` when
   `boot_via_efi != 0`. The stub already saves a 16 KiB

@@ -48,25 +48,40 @@ As of M16.70 the BIOS and UEFI paths run **different code on the way in**:
 
 - **UEFI path**: OVMF / firmware → **native Hamnix PE/COFF stub**
   (`build/hamnix-bootx64.efi`, built from `arch/x86/boot/efi_stub.S`).
-  No GRUB-EFI in the boot path. The stub completes the full UEFI
-  handoff handshake: it stashes the EFI ImageHandle and SystemTable,
-  calls `BootServices->GetMemoryMap()` into a 16 KiB static buffer,
-  then `BootServices->ExitBootServices()` with the resulting MapKey
-  (retrying up to four times if firmware returned
-  `EFI_INVALID_PARAMETER` for a stale key), prints `[hamnix] EFI
-  entry reached` then `[hamnix] post-EFI handoff complete` over
-  COM1, and halts. The second marker proves firmware has
-  relinquished the platform — no more boot services, no firmware
-  timer interrupts, no behind-the-back memory allocator. The
-  remaining work to reach `start_kernel()` from this point (loading
-  the multiboot kernel ELF off the ESP via UEFI Simple File System
-  Protocol before ExitBootServices, OR merging the EFI stub + kernel
-  ELF into one hybrid binary) is a follow-up commit. The
-  `_x86_start_after_loader` symbol in `arch/x86/kernel/head_64.S`
-  is the kernel-side join point that follow-up will jump to; the
-  `boot_via_efi` flag + EFI-fallback memblock window in
-  `arch/x86/kernel/e820.ad` are the kernel-side pre-positions that
-  let the EFI path skip the multiboot mmap parser.
+  No GRUB-EFI in the boot path. The stub does the FULL handoff
+  from firmware to `start_kernel()` end-to-end (M16.125 — PATH A
+  from the M16.124 diagnosis):
+    1. Stash EFI ImageHandle + SystemTable.
+    2. Print `[hamnix] EFI entry reached` over COM1.
+    3. Locate the Simple File System Protocol on our load device
+       (via `HandleProtocol(ImageHandle, LoadedImageGuid) ->
+       HandleProtocol(DeviceHandle, SfspGuid) -> OpenVolume`).
+    4. Open `\hamnix-vmlinux.elf` on the ESP, AllocatePool 32 MiB
+       and read the entire ELF in.
+    5. Parse the elf32-i386 header + program headers; for each
+       PT_LOAD, memcpy `p_filesz` bytes from the file buffer to
+       `p_paddr`, then memset `p_memsz - p_filesz` trailing bytes
+       to zero (BSS-within-segment).
+    6. Scan the loaded image for the multiboot1 magic and read the
+       Hamnix EFI handoff table planted right after the multiboot
+       header (`arch/x86/boot/header.S`) — extracts the address of
+       `_x86_start_after_loader` and the address of the
+       `boot_via_efi` flag.
+    7. Patch `boot_via_efi = 1` so `e820_init()` takes the EFI
+       fallback branch instead of the multiboot1 mmap parser.
+    8. `GetMemoryMap` + `ExitBootServices` (retry on stale MapKey).
+       Print `[hamnix] post-EFI handoff complete`.
+    9. Build identity-mapped page tables (1 GiB pages, 4 GiB span,
+       mirrors `arch/x86/boot/header.S`).
+   10. Load a kernel-shape GDT (CS=0x08, DS=0x10).
+   11. Set CR3, far-jump to flush CS, reload data segments,
+       `jmp *_x86_start_after_loader`. The kernel runs.
+
+  Verified by the UEFI half of `scripts/test_iso_qemu.sh`: three
+  markers in order — `[hamnix] EFI entry reached`, `[hamnix] post-EFI
+  handoff complete`, and the kernel-side `cpio: registered N files
+  from initramfs` (proves we got past e820 → memblock → cpio_init,
+  i.e. the EFI handoff is end-to-end functional).
 
 ### Why two binaries instead of one hybrid file
 
@@ -122,33 +137,60 @@ summarised here:
   easy in isolation, but only useful if the kernel code is in
   memory — which it isn't on the UEFI path because of B1.
 
-#### Two real paths forward
+#### M16.125 shipped: PATH A (UEFI-side ELF loader)
 
-The blockers above rule out the "single file" framing but leave two
-straightforward paths to a working UEFI boot:
+PATH A from the M16.124 diagnosis is now the production UEFI path:
 
-- **PATH A: UEFI-side ELF loader in `efi_stub.S`.** Keep two binaries
-  on the ESP. The .efi stub uses UEFI's Simple File System Protocol
-  BEFORE `ExitBootServices` to open `\hamnix-vmlinux.elf`, parse its
-  program headers, copy PT_LOADs to their LMAs (matching multiboot1's
-  loader behaviour on the BIOS side), then `ExitBootServices` and
-  `jmp _x86_start_after_loader`. ~300 lines of asm + a small ELF
-  parser in the .efi binary. The kernel ELF format stays untouched
-  — every test script's `qemu -kernel` keeps working unchanged.
+- The .efi stub uses UEFI's Simple File System Protocol BEFORE
+  `ExitBootServices` to open `\hamnix-vmlinux.elf` off the ESP,
+  parse program headers, copy PT_LOADs to their LMAs (matching
+  multiboot1's loader behaviour on the BIOS side), then
+  `ExitBootServices` and `jmp _x86_start_after_loader`.
+- The kernel ELF format stays untouched — every existing
+  `qemu -kernel hamnix-vmlinux.elf` test keeps working.
 
-- **PATH B: Add a bzImage-style flat-binary output.** Sibling artifact
+**Implementation notes worth recording (the B5 we discovered):**
+
+- **B5 (file-system limit):** OVMF on optical media only accepts a
+  FAT12 El Torito UEFI alt-platform image. A FAT16 or FAT32 ESP at
+  the same LBA range fails BdsDxe loading with "Not Found", even
+  when the image is otherwise valid and `BOOTX64.EFI` is present.
+  `scripts/build_iso.sh` therefore formats the wide ESP with
+  explicit `mformat -h 64 -s 32 -t <tracks>` geometry (FAT12 by
+  default, no `-F`) — FAT12 caps the volume at 32 MiB, comfortably
+  enough for our `~3.8 MB` kernel + `~8 KB` stub plus headroom.
+- **PE32+ image-base relocation:** the stub has no `.reloc` table,
+  so UEFI relocates the image but DOES NOT fix up address-typed
+  data in `.rdata`. The GDT-descriptor base AND the far-jump
+  `m16:64` offset are therefore RUNTIME-PATCHED in `.data` via
+  `leaq <label>(%rip), %rax; mov %rax, <slot>(%rip)` before the
+  `lgdt` / `ljmp` step. Without these patches the stub triple-
+  faults immediately after `mov %rax, %cr3` because the static
+  link-time offsets land in unmapped pages on the firmware-chosen
+  load base.
+- **AT&T `ljmp` quirk:** `ljmp *mem` in 64-bit mode defaults to a
+  16:32 far jump (offset is 4 bytes, not 8). To get a 16:64 far
+  jump we use the `rex.w ljmp *mem` form, encoding REX.W as a
+  prefix byte. GAS rejects the more obvious `ljmpq` spelling.
+- **Wide-ESP packaging:** the grub-mkrescue ISO is a polyglot — the
+  same byte ranges are simultaneously ISO9660 file data AND GPT
+  partition contents AND El Torito boot images. The shipped recipe
+  builds the ISO from scratch via `xorriso -as mkisofs` (mimicking
+  grub-mkrescue's argument shape) with a pre-built FAT12 wide
+  efi.img staged upfront — both the El Torito UEFI record AND the
+  GPT ESP then reference the same wide image from the start.
+
+#### Alternative path (not shipped)
+
+- **PATH B: bzImage-style flat-binary output.** Sibling artifact
   alongside the kernel ELF: `build/hamnix.bin`, produced by
   `objcopy -O binary` over a hand-written PE+multiboot+(optionally
   Linux x86 boot header) prelude. The flat binary starts with "MZ",
-  carries the multiboot1 magic somewhere in the first 8 KiB, and is
-  what ships in the ESP as `BOOTX64.EFI`. The dev-loop kernel ELF
-  and test scripts continue to use the elf32-i386 output. This is
-  what Linux does (bzImage vs vmlinux) — larger surgery, but
-  cleanly decouples the UEFI binary's format from the kernel's ELF.
-
-Neither was implemented this round. The stub continues to halt at the
-post-handoff marker; the BIOS / multiboot1 path continues to boot to
-userland unaffected.
+  carries the multiboot1 magic in the first 8 KiB, and ships as
+  ESP `BOOTX64.EFI`. Larger surgery; not needed now that PATH A
+  is functional. Recorded here for posterity in case a future
+  signed-EFI / Secure-Boot push needs a sb-signable single-file
+  image.
 
 ### What the build script does to make UEFI direct
 
@@ -190,18 +232,17 @@ This runs the ISO under QEMU twice:
 - **UEFI pass**: `qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd
   -cdrom build/hamnix.iso` — OVMF reads the ESP, launches
   `BOOTX64.EFI` directly (= our stub).
-  Banner checks (BOTH must appear, in order):
+  Banner checks (ALL THREE must appear, in order):
   - `[hamnix] EFI entry reached`        — PE/COFF entry reached.
   - `[hamnix] post-EFI handoff complete` — `ExitBootServices()`
     returned `EFI_SUCCESS`; firmware is out of the boot path.
+  - `cpio: registered N files from initramfs` — start_kernel()
+    ran past e820 → memblock → cpio_init(); the EFI ELF loader
+    handed off successfully.
 
-The two passes look for different banners because the EFI stub
-currently halts after `ExitBootServices()` rather than reaching
-`start_kernel()`. The merge-into-one-binary plan was abandoned at
-M16.124 (blockers B1..B4 in `arch/x86/boot/efi_stub.S`); the live
-options are PATH A (UEFI-side ELF loader baked into the stub) or
-PATH B (bzImage-style flat-binary output). Once one of them lands,
-the UEFI banner check will move to `Hamnix kernel booting` too.
+As of M16.125, the UEFI pass now reaches the same depth as the BIOS
+pass: PATH A (UEFI-side ELF loader baked into `efi_stub.S`) is the
+shipped UEFI boot path.
 
 If you only have OVMF locally, set `SKIP_UEFI=1` to skip that pass.
 
@@ -234,7 +275,7 @@ Tested-on / known-working list (extend as we verify on more machines):
 | Vendor / Model        | Mode | Result | Notes                |
 | --------------------- | ---- | ------ | -------------------- |
 | QEMU (SeaBIOS, 10.0)  | BIOS | works  | scripts/test_iso_qemu.sh |
-| QEMU (OVMF, edk2)     | UEFI | works  | direct PE/COFF stub, ExitBootServices handshake completes; halts pre-start_kernel |
+| QEMU (OVMF, edk2)     | UEFI | works  | direct PE/COFF stub, SFSP-loads `\hamnix-vmlinux.elf` from the ESP, reaches `start_kernel()` and beyond (M16.125 PATH A) |
 | _real hardware_       | _?_  | TBD    | needs validation     |
 
 When testing on real hardware:
@@ -251,23 +292,27 @@ When testing on real hardware:
 
 ## 4. Known limitations / next steps
 
-- **UEFI stub doesn't yet chain to `start_kernel`** — and the original
-  "merge stub + kernel ELF into a hybrid file" plan turns out to be
-  blocked. The native PE entry path is wired up, the EFI handoff
-  handshake (`GetMemoryMap` + `ExitBootServices`) completes, and the
-  stub halts after firmware releases control. Post-M16.124 diagnosis
-  is recorded in `arch/x86/boot/efi_stub.S`'s header comment
-  (blockers B1..B4 — file-magic conflict at offset 0, LMA/VMA split
-  in `.ap_trampoline`, image-base relocation without a `.reloc`
-  table, and GDT/CR3 handoff from firmware). Two real paths forward
-  are PATH A (UEFI-side ELF loader baked into the stub) and PATH B
-  (bzImage-style flat-binary output alongside the kernel ELF) — see
-  the "Why two binaries..." section above for the full sketch.
-  Whichever path lands, the kernel-side join point already exists:
-  `_x86_start_after_loader` in `arch/x86/kernel/head_64.S`, with
-  `boot_via_efi` + the EFI-fallback memblock window in
-  `arch/x86/kernel/e820.ad` pre-positioned for the EFI path to skip
-  the multiboot mmap parser.
+- **UEFI direct boot reaches `start_kernel()`** — M16.125 shipped
+  PATH A. The PE/COFF stub now SFSP-loads `\hamnix-vmlinux.elf`
+  from the ESP, parses its program headers, copies PT_LOAD segments
+  to their LMAs, installs identity-mapped page tables + a kernel-
+  shape GDT, and `jmp _x86_start_after_loader`. Verified end-to-end
+  by `scripts/test_iso_qemu.sh`: BIOS and UEFI both reach
+  `cpio: registered N files from initramfs`.
+- **EFI memory map parsing is still the fallback.** The stub saves
+  the UEFI memory map in `efi_mmap_buf` (16 KiB) with descsize at
+  `efi_mmap_descsize`, but `e820_init()` doesn't yet walk it —
+  it installs the hardcoded 2..240 MiB window. A descsize-stride
+  walker that classifies `EfiConventionalMemory` (Type=7) entries
+  and feeds the largest above `kernel_image_end()` to
+  `memblock_set_region` is a one-screen follow-up. Without it,
+  UEFI boots above 240 MiB of RAM waste the excess.
+- **Real EFI Runtime Services aren't exposed yet.** The stub
+  stashes the SystemTable pointer in `efi_system_table` but kernel
+  code doesn't yet call back into RuntimeServices (e.g.
+  `GetVariable` / `SetVariable` for persistent boot config, or
+  `GetTime` as a real-hardware alternative to the legacy CMOS RTC
+  driver in `arch/x86/kernel/time.ad`).
 - **No graphical console under direct UEFI boot**. The EFI stub
   doesn't yet program GOP or hand the framebuffer info to the
   kernel; once it chain-loads start_kernel, it'll need to populate
