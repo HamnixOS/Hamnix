@@ -1,0 +1,709 @@
+# user/hamwd.ad
+#
+# Hamnix Window Daemon (hamwd) — Phase D / Layer 3.
+#
+# This is the SKELETON commit: enough of a daemon to prove the
+# Layer-3 architecture works in code. Per docs/architecture.md
+# Phase D + docs/vtnext-v2.md, the eventual hamwd will:
+#
+#   1. open the renderer wire (serial or TCP),
+#   2. probe-handshake the renderer for V2 capability + font sizes,
+#   3. post itself at /srv/hamwd so client processes can run
+#        sfd = open("/srv/hamwd", ORDWR)
+#        mount(sfd, -1, "/dev/win", MREPL, "")
+#      and then drive windows via /dev/win/ctl + /dev/win/<wid>/draw,
+#   4. translate every line a client writes to a window's draw file
+#      into the framed ESC ] vtn ; <cmd> ; ... BEL wire packet,
+#   5. demux the reverse channel back to /dev/win/<wid>/events.
+#
+# WHAT THIS COMMIT SHIPS (the SKELETON):
+#
+#   * The userland daemon binary (this file) that manages an in-
+#     process window registry, parses VTNext-shaped commands, and
+#     emits framed wire packets to fd 1 (stdout). Stdout is the
+#     renderer-wire stand-in until /srv/hamwd posting + the 9P
+#     transport are wired (see "GAP" notes below).
+#
+#   * Two driving modes:
+#
+#       - "One-shot": `hamwd <cmd> <args...>` runs a single command
+#         (e.g. `hamwd create 800 600 Test`) and exits. Used by the
+#         smoke test to assert a framed wire packet hits the serial
+#         console.
+#
+#       - "Daemon": `hamwd` (no args) reads commands one-per-line
+#         from stdin and processes each. Pipe shell input in
+#         (`echo "create 800 600 \"Test\"" | /bin/hamwd`) to drive
+#         it from hamsh.
+#
+#   * Five commands wired end-to-end: probe, create, destroy, list,
+#     text, present. The rest of the VTNext-v2 lifecycle (place,
+#     resize, focus, zorder, clear, rect, line, circle, cursor,
+#     events) is OUT OF SCOPE for the skeleton; adding them is
+#     trivial follow-up work once this binary lands and the test
+#     pipeline is green.
+#
+#   * A debug line `[hamwd-wire] <printable-frame>` printed to fd 1
+#     alongside every wire emission. The framed bytes themselves
+#     include ESC (0x1B) and BEL (0x07) which don't grep cleanly
+#     against `qemu -serial stdio`; the debug line is the test-
+#     harness contract.
+#
+# WHAT THIS COMMIT DOES NOT SHIP (the GAPs):
+#
+#   * Real /srv/hamwd posting. The Plan 9 idiom is: the daemon
+#     creates a file at /srv/hamwd containing a kernel-recognised
+#     handle (in 9front, a Chan reference) that clients open() to
+#     get an fd they pass to mount(). Hamnix's sys/src/9/port/
+#     chan.ad records SRV-kind mount entries but resolve_path skips
+#     them — there's no 9P client behind the srvfd yet. Adding
+#     real srv posting needs (a) a kernel-side /srv/ tmpfs-like
+#     surface that accepts post-and-open semantics, (b) the chan
+#     resolver in syschan.ad's chan_resolve_prefix to walk a SRV
+#     mount entry through a 9P round-trip on the stored srvfd.
+#     Both are sys/src/9/port/ territory; this commit stays inside
+#     user/ and documents the gap. The smoke test demonstrates the
+#     CALL SHAPE works (mount returns 0 against any open fd —
+#     M16.107 contract) but no bytes flow through the srvfd today.
+#
+#   * Renderer-side handshake. We emit `probe` to fd 1 but there's
+#     no renderer on the other end of `qemu -serial stdio` — the
+#     framed packet just shows up in the serial log. A real cap-
+#     line parse + V2/V1 fallback is a follow-up once we have a
+#     pygame renderer attached.
+#
+#   * Reverse channel (`ESC [ V <kind> ; ...`). No input parsing
+#     yet — events would arrive on the same fd hamwd reads from.
+#     Adding the parser is straight-forward; the wire format is
+#     pinned by docs/vtnext-v2.md.
+#
+# Plan 9 namespace framing reminder (memory/feedback_plan9_namespace_
+# framing.md): there is no global `/dev/win/`. A process that wants
+# graphical output runs `mount /srv/hamwd /dev/win` in ITS OWN
+# namespace. Init's namespace does not have `/dev/win/*`. The whole
+# OS personality of "windows are files" is a per-namespace fact, not
+# a privileged global.
+#
+# Build: scripts/build_user.sh's auto-discovery picks up user/*.ad
+# and emits build/user/hamwd.elf, which build_initramfs.py glob-
+# embeds at /bin/hamwd in the cpio archive.
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_exit(code: uint64)
+
+
+# --- VTNext-v2 wire constants ---------------------------------------
+#
+# Per docs/vtnext-v2.md "Frame format":
+#   Server -> Renderer:  ESC ] vtn ; <cmd> ; <p1> ; <p2> ; ... BEL
+# ESC = 0x1B, BEL = 0x07.
+ESC: uint8 = 27
+BEL: uint8 = 7
+
+
+# --- Window registry ------------------------------------------------
+#
+# Sixteen-slot table. wid=0 is reserved for the boot console (per
+# docs/vtnext-v2.md "Boot console (wid=0)"); we never allocate it
+# here. wids 1..15 are dynamic.
+#
+# We keep four parallel arrays instead of an Array[N, struct]
+# because the Adder compiler's nested-Array codegen has known quirks
+# (memory/feedback_compiler_quirks.md). Parallel-array layout reads
+# more code but compiles cleanly.
+
+WIN_MAX:   uint64 = 16
+TITLE_MAX: uint64 = 32
+
+# Per-slot fields. in_use=0 marks a free slot.
+w_in_use:  Array[16, uint8]
+w_width:   Array[16, uint32]
+w_height:  Array[16, uint32]
+w_visible: Array[16, uint8]
+w_focused: Array[16, uint8]
+# Titles live in a single 16*32 = 512-byte block. We index it as
+# title_buf[wid*TITLE_MAX + i] to avoid the &arr[i][j] codegen
+# quirk in feedback_compiler_quirks.md.
+title_buf: Array[512, uint8]
+
+
+# --- string helpers -------------------------------------------------
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+def put_dec(fd: int32, value: uint64):
+    if value == 0:
+        sys_write(fd, "0", 1)
+        return
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    v: uint64 = value
+    while v != 0:
+        digits[n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    out: Array[24, uint8]
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    sys_write(fd, &out[0], i)
+
+
+def is_ws(c: uint8) -> int32:
+    if c == 32 or c == 9 or c == 10 or c == 13:
+        return 1
+    return 0
+
+
+def is_digit(c: uint8) -> int32:
+    if c >= 48 and c <= 57:
+        return 1
+    return 0
+
+
+def parse_uint_at(buf: Ptr[uint8], start: uint64, end: uint64,
+                  out_end: Ptr[uint64]) -> int32:
+    # Parse a decimal at buf[start..end), skipping leading whitespace.
+    # Writes the position of the first non-digit byte (or `end`) into
+    # *out_end. Returns -1 if no digits were found.
+    i: uint64 = start
+    while i < end and is_ws(buf[i]) != 0:
+        i = i + 1
+    if i >= end or is_digit(buf[i]) == 0:
+        out_end[0] = i
+        return -1
+    n: int32 = 0
+    while i < end and is_digit(buf[i]) != 0:
+        n = n * 10 + cast[int32](buf[i] - 48)
+        i = i + 1
+    out_end[0] = i
+    return n
+
+
+def skip_ws(buf: Ptr[uint8], start: uint64, end: uint64) -> uint64:
+    i: uint64 = start
+    while i < end and is_ws(buf[i]) != 0:
+        i = i + 1
+    return i
+
+
+def str_eq(buf: Ptr[uint8], pos: uint64, end: uint64,
+           lit: Ptr[uint8]) -> int32:
+    # Compare buf[pos..end) against the NUL-terminated literal `lit`.
+    # Returns 1 if every byte of `lit` matches and the next byte in
+    # buf is whitespace, end-of-buf, or NUL (i.e. token boundary).
+    li: uint64 = 0
+    while lit[li] != 0:
+        if pos + li >= end:
+            return 0
+        if buf[pos + li] != lit[li]:
+            return 0
+        li = li + 1
+    # Token boundary check.
+    if pos + li >= end:
+        return 1
+    nb: uint8 = buf[pos + li]
+    if nb == 0 or is_ws(nb) != 0:
+        return 1
+    return 0
+
+
+# --- wire framing ---------------------------------------------------
+#
+# emit_frame_open writes `ESC ] vtn ; <cmd>` (no trailing space; the
+# caller appends `; <param>` blocks via emit_param_* helpers, then
+# closes with emit_frame_close which writes BEL).
+#
+# Every frame is ALSO mirrored to stdout as a `[hamwd-wire] ...`
+# printable debug line — that's the contract the smoke-test bash
+# script greps, because ESC/BEL bytes are too noisy to grep against
+# the serial log directly.
+
+def emit_frame_open(cmd: Ptr[uint8]):
+    sys_write(1, &ESC, 1)
+    sys_write(1, "]", 1)
+    sys_write(1, "vtn;", 4)
+    write_str(1, cmd)
+
+
+def emit_param_str(s: Ptr[uint8]):
+    sys_write(1, ";", 1)
+    write_str(1, s)
+
+
+def emit_param_dec(value: uint64):
+    sys_write(1, ";", 1)
+    put_dec(1, value)
+
+
+def emit_param_qstr(s: Ptr[uint8], n: uint64):
+    # Emit `;"<bytes>"`. Quotes inside `s` are NOT escaped at this
+    # milestone — title strings in the smoke test never contain `"`.
+    # A real V2 emitter would backslash-escape `"` and `\` per
+    # docs/vtnext-v2.md "Frame format".
+    sys_write(1, ";", 1)
+    sys_write(1, "\"", 1)
+    sys_write(1, s, n)
+    sys_write(1, "\"", 1)
+
+
+def emit_frame_close():
+    sys_write(1, &BEL, 1)
+
+
+# --- debug mirror ---------------------------------------------------
+#
+# Emits `[hamwd-wire] vtn;<cmd>;<params>` followed by `\n` to fd 1.
+# The grep contract for scripts/test_hamwd.sh is literal-substring
+# matching against the printable form of the frame body (no ESC,
+# no BEL, no quotes around string params for grep-stability across
+# title contents).
+
+def dbg_open(cmd: Ptr[uint8]):
+    write_str(1, "[hamwd-wire] vtn;")
+    write_str(1, cmd)
+
+
+def dbg_param_str(s: Ptr[uint8]):
+    sys_write(1, ";", 1)
+    write_str(1, s)
+
+
+def dbg_param_dec(value: uint64):
+    sys_write(1, ";", 1)
+    put_dec(1, value)
+
+
+def dbg_param_qstr(s: Ptr[uint8], n: uint64):
+    sys_write(1, ";", 1)
+    sys_write(1, "\"", 1)
+    sys_write(1, s, n)
+    sys_write(1, "\"", 1)
+
+
+def dbg_close():
+    sys_write(1, "\n", 1)
+
+
+# --- window registry ops --------------------------------------------
+
+def _registry_init():
+    i: uint64 = 0
+    while i < WIN_MAX:
+        w_in_use[i] = 0
+        w_width[i] = 0
+        w_height[i] = 0
+        w_visible[i] = 0
+        w_focused[i] = 0
+        i = i + 1
+
+
+def _alloc_wid() -> int32:
+    # Allocate the lowest free slot in 1..WIN_MAX-1. Slot 0 is
+    # reserved for the boot console (docs/vtnext-v2.md "Boot console").
+    i: uint64 = 1
+    while i < WIN_MAX:
+        if w_in_use[i] == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _set_title(wid: int32, src: Ptr[uint8], n: uint64) -> uint64:
+    # Copy up to TITLE_MAX-1 bytes from src into title_buf[wid*32..].
+    # Returns the number of bytes copied (excluding NUL).
+    base: uint64 = cast[uint64](wid) * TITLE_MAX
+    cap: uint64 = TITLE_MAX - 1
+    cpy: uint64 = n
+    if cpy > cap:
+        cpy = cap
+    i: uint64 = 0
+    while i < cpy:
+        title_buf[base + i] = src[i]
+        i = i + 1
+    title_buf[base + cpy] = 0
+    return cpy
+
+
+def _title_ptr(wid: int32) -> Ptr[uint8]:
+    base: uint64 = cast[uint64](wid) * TITLE_MAX
+    return cast[Ptr[uint8]](cast[uint64](&title_buf[0]) + base)
+
+
+# --- command bodies -------------------------------------------------
+
+def cmd_probe():
+    # The renderer-handshake probe. With no renderer attached to fd 1
+    # in this skeleton, the reply never arrives — that's the GAP doc'd
+    # at the top of this file. Emitting it anyway proves the framing
+    # path works end-to-end on the wire.
+    emit_frame_open("probe")
+    emit_frame_close()
+    dbg_open("probe")
+    dbg_close()
+
+
+def cmd_create(width: uint64, height: uint64,
+               title: Ptr[uint8], title_n: uint64) -> int32:
+    wid: int32 = _alloc_wid()
+    if wid < 0:
+        write_str(2, "hamwd: create: window table full\n")
+        return -1
+    w_in_use[cast[uint64](wid)] = 1
+    w_width[cast[uint64](wid)] = cast[uint32](width)
+    w_height[cast[uint64](wid)] = cast[uint32](height)
+    w_visible[cast[uint64](wid)] = 1
+    w_focused[cast[uint64](wid)] = 0
+    nstored: uint64 = _set_title(wid, title, title_n)
+
+    # Wire emission: win_create <wid> "<title>" <w> <h>
+    # (docs/vtnext-v2.md "Window lifecycle").
+    emit_frame_open("win_create")
+    emit_param_dec(cast[uint64](wid))
+    emit_param_qstr(title, nstored)
+    emit_param_dec(width)
+    emit_param_dec(height)
+    emit_frame_close()
+
+    # Debug mirror — the smoke test greps this line.
+    dbg_open("win_create")
+    dbg_param_dec(cast[uint64](wid))
+    dbg_param_qstr(title, nstored)
+    dbg_param_dec(width)
+    dbg_param_dec(height)
+    dbg_close()
+
+    # Echo the wid as ASCII decimal so a ctl-file client could read
+    # it back per docs/native-api.md "ctl-file discovery dance".
+    write_str(1, "[hamwd] created wid=")
+    put_dec(1, cast[uint64](wid))
+    write_str(1, "\n")
+    return wid
+
+
+def cmd_destroy(wid_arg: int32) -> int32:
+    wid: uint64 = cast[uint64](wid_arg)
+    if wid_arg <= 0 or wid >= WIN_MAX or w_in_use[wid] == 0:
+        write_str(2, "hamwd: destroy: bad wid\n")
+        return -1
+    w_in_use[wid] = 0
+    w_visible[wid] = 0
+    w_focused[wid] = 0
+    title_buf[wid * TITLE_MAX] = 0
+
+    emit_frame_open("win_destroy")
+    emit_param_dec(wid)
+    emit_frame_close()
+    dbg_open("win_destroy")
+    dbg_param_dec(wid)
+    dbg_close()
+
+    write_str(1, "[hamwd] destroyed wid=")
+    put_dec(1, wid)
+    write_str(1, "\n")
+    return 0
+
+
+def cmd_list():
+    # No wire emission — list is a daemon-local introspection
+    # facility used by /dev/win/ctl's read side.
+    i: uint64 = 1
+    n_alive: uint64 = 0
+    while i < WIN_MAX:
+        if w_in_use[i] != 0:
+            n_alive = n_alive + 1
+            write_str(1, "[hamwd] wid=")
+            put_dec(1, i)
+            write_str(1, " size=")
+            put_dec(1, cast[uint64](w_width[i]))
+            sys_write(1, "x", 1)
+            put_dec(1, cast[uint64](w_height[i]))
+            write_str(1, " title=")
+            write_str(1, _title_ptr(cast[int32](i)))
+            write_str(1, "\n")
+        i = i + 1
+    write_str(1, "[hamwd] list n=")
+    put_dec(1, n_alive)
+    write_str(1, "\n")
+
+
+def cmd_present(wid_arg: int32) -> int32:
+    wid: uint64 = cast[uint64](wid_arg)
+    if wid_arg < 0 or wid >= WIN_MAX or w_in_use[wid] == 0:
+        write_str(2, "hamwd: present: bad wid\n")
+        return -1
+    # docs/vtnext-v2.md "Drawing" table: `present <wid>`.
+    emit_frame_open("present")
+    emit_param_dec(wid)
+    emit_frame_close()
+    dbg_open("present")
+    dbg_param_dec(wid)
+    dbg_close()
+    return 0
+
+
+def cmd_text(wid_arg: int32, x: uint64, y: uint64,
+             text_str: Ptr[uint8], text_n: uint64) -> int32:
+    # Skeleton: emit the wire form per docs/vtnext-v2.md "Drawing".
+    # Font + size + colour are hard-coded to mono/14/black for now —
+    # the smoke test only needs to see the frame shape on the wire.
+    wid: uint64 = cast[uint64](wid_arg)
+    if wid_arg < 0 or wid >= WIN_MAX or w_in_use[wid] == 0:
+        write_str(2, "hamwd: text: bad wid\n")
+        return -1
+    emit_frame_open("text")
+    emit_param_dec(wid)
+    emit_param_dec(x)
+    emit_param_dec(y)
+    emit_param_str("mono")
+    emit_param_dec(14)
+    emit_param_dec(0)
+    emit_param_dec(0)
+    emit_param_dec(0)
+    emit_param_qstr(text_str, text_n)
+    emit_frame_close()
+    dbg_open("text")
+    dbg_param_dec(wid)
+    dbg_param_dec(x)
+    dbg_param_dec(y)
+    dbg_param_str("mono")
+    dbg_param_dec(14)
+    dbg_param_dec(0)
+    dbg_param_dec(0)
+    dbg_param_dec(0)
+    dbg_param_qstr(text_str, text_n)
+    dbg_close()
+    return 0
+
+
+# --- command-line parsing -------------------------------------------
+#
+# Each command is a whitespace-separated token sequence. Strings
+# (titles, text bodies) are delimited by double quotes; bytes inside
+# quotes are taken verbatim until the closing quote. No escape
+# processing yet (titles in the smoke test are simple ASCII).
+#
+# Returns 0 on success, non-zero on parse / dispatch error.
+
+def parse_line(buf: Ptr[uint8], n: uint64) -> int32:
+    # Skip leading whitespace, then dispatch on the first token.
+    pos: uint64 = skip_ws(buf, 0, n)
+    if pos >= n:
+        return 0       # blank line, no-op
+
+    # ---- probe -----------------------------------------------------
+    if str_eq(buf, pos, n, "probe") != 0:
+        cmd_probe()
+        return 0
+
+    # ---- list ------------------------------------------------------
+    if str_eq(buf, pos, n, "list") != 0:
+        cmd_list()
+        return 0
+
+    # ---- create W H "TITLE" ---------------------------------------
+    if str_eq(buf, pos, n, "create") != 0:
+        pos = pos + 6
+        ep: Array[1, uint64]
+        w_val: int32 = parse_uint_at(buf, pos, n, &ep[0])
+        if w_val < 0:
+            write_str(2, "hamwd: create: expected width\n")
+            return 1
+        pos = ep[0]
+        h_val: int32 = parse_uint_at(buf, pos, n, &ep[0])
+        if h_val < 0:
+            write_str(2, "hamwd: create: expected height\n")
+            return 1
+        pos = ep[0]
+        # Title is either a quoted string or a bare token.
+        pos = skip_ws(buf, pos, n)
+        if pos >= n:
+            write_str(2, "hamwd: create: expected title\n")
+            return 1
+        t_start: uint64
+        t_end: uint64
+        if buf[pos] == 34:   # '"'
+            pos = pos + 1
+            t_start = pos
+            while pos < n and buf[pos] != 34:
+                pos = pos + 1
+            t_end = pos
+        else:
+            t_start = pos
+            while pos < n and is_ws(buf[pos]) == 0:
+                pos = pos + 1
+            t_end = pos
+        title_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](buf) + t_start)
+        cmd_create(cast[uint64](w_val), cast[uint64](h_val),
+                   title_ptr, t_end - t_start)
+        return 0
+
+    # ---- destroy WID ----------------------------------------------
+    if str_eq(buf, pos, n, "destroy") != 0:
+        pos = pos + 7
+        ep: Array[1, uint64]
+        wid_val: int32 = parse_uint_at(buf, pos, n, &ep[0])
+        if wid_val < 0:
+            write_str(2, "hamwd: destroy: expected wid\n")
+            return 1
+        cmd_destroy(wid_val)
+        return 0
+
+    # ---- present WID ----------------------------------------------
+    if str_eq(buf, pos, n, "present") != 0:
+        pos = pos + 7
+        ep: Array[1, uint64]
+        wid_val: int32 = parse_uint_at(buf, pos, n, &ep[0])
+        if wid_val < 0:
+            write_str(2, "hamwd: present: expected wid\n")
+            return 1
+        cmd_present(wid_val)
+        return 0
+
+    # ---- text WID X Y "STR" ---------------------------------------
+    if str_eq(buf, pos, n, "text") != 0:
+        pos = pos + 4
+        ep: Array[1, uint64]
+        wid_val: int32 = parse_uint_at(buf, pos, n, &ep[0])
+        if wid_val < 0:
+            write_str(2, "hamwd: text: expected wid\n")
+            return 1
+        pos = ep[0]
+        x_val: int32 = parse_uint_at(buf, pos, n, &ep[0])
+        if x_val < 0:
+            write_str(2, "hamwd: text: expected x\n")
+            return 1
+        pos = ep[0]
+        y_val: int32 = parse_uint_at(buf, pos, n, &ep[0])
+        if y_val < 0:
+            write_str(2, "hamwd: text: expected y\n")
+            return 1
+        pos = ep[0]
+        pos = skip_ws(buf, pos, n)
+        if pos >= n:
+            write_str(2, "hamwd: text: expected string\n")
+            return 1
+        t_start: uint64
+        t_end: uint64
+        if buf[pos] == 34:
+            pos = pos + 1
+            t_start = pos
+            while pos < n and buf[pos] != 34:
+                pos = pos + 1
+            t_end = pos
+        else:
+            t_start = pos
+            while pos < n and is_ws(buf[pos]) == 0:
+                pos = pos + 1
+            t_end = pos
+        s_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](buf) + t_start)
+        cmd_text(wid_val,
+                 cast[uint64](x_val), cast[uint64](y_val),
+                 s_ptr, t_end - t_start)
+        return 0
+
+    # ---- quit -----------------------------------------------------
+    if str_eq(buf, pos, n, "quit") != 0:
+        write_str(1, "[hamwd] quit\n")
+        sys_exit(0)
+        return 0
+
+    write_str(2, "hamwd: unknown command\n")
+    return 1
+
+
+# --- one-shot mode (argv-driven) ------------------------------------
+#
+# Splice argv[1..argc-1] into a single line-buffer, space-separated,
+# then run it through parse_line. Lets the smoke-test bash script
+# invoke `/bin/hamwd create 800 600 Test` without hamsh quoting
+# subtleties around `"`.
+
+oneshot_buf: Array[512, uint8]
+
+
+def run_one_shot(argc: int32, argv: Ptr[uint64]) -> int32:
+    pos: uint64 = 0
+    i: int32 = 1
+    while i < argc:
+        s: Ptr[uint8] = cast[Ptr[uint8]](argv[cast[uint64](i)])
+        if i > 1 and pos < 511:
+            oneshot_buf[pos] = 32
+            pos = pos + 1
+        sl: uint64 = strlen_u8(s)
+        j: uint64 = 0
+        while j < sl and pos < 511:
+            oneshot_buf[pos] = s[j]
+            pos = pos + 1
+            j = j + 1
+        i = i + 1
+    oneshot_buf[pos] = 0
+    return parse_line(&oneshot_buf[0], pos)
+
+
+# --- daemon-mode stdin loop -----------------------------------------
+#
+# Read stdin in CHUNK-sized blocks, split on '\n', dispatch each
+# line. EOF (read returns 0) exits cleanly. This is the same pattern
+# user/rev.ad uses; pipes (`echo ... | /bin/hamwd`) work end-to-end
+# under hamsh per its M16.37 pipe support.
+
+CHUNK: uint64 = 256
+
+# Global to avoid blowing the kernel-side per-task user stack with
+# a 1 KiB Array local — same pattern as rev.ad's `line`.
+line_buf: Array[512, uint8]
+
+
+def daemon_loop() -> int32:
+    write_str(1, "[hamwd] daemon ready\n")
+    chunk: Array[256, uint8]
+    pos: uint64 = 0
+    while True:
+        n: int64 = sys_read(0, &chunk[0], CHUNK)
+        if n <= 0:
+            break
+        i: uint64 = 0
+        while i < cast[uint64](n):
+            c: uint8 = chunk[i]
+            if c == 10:           # '\n' — line boundary
+                parse_line(&line_buf[0], pos)
+                pos = 0
+            else:
+                if pos + 1 < 512:
+                    line_buf[pos] = c
+                    pos = pos + 1
+            i = i + 1
+    # Trailing line without a final newline.
+    if pos > 0:
+        parse_line(&line_buf[0], pos)
+    return 0
+
+
+# --- main -----------------------------------------------------------
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    _registry_init()
+
+    # Renderer-handshake probe (skeleton: framed bytes hit fd 1 but
+    # no renderer is listening). Mirrors docs/vtnext-v2.md
+    # "Handshake".
+    cmd_probe()
+
+    if argc >= 2:
+        return run_one_shot(argc, argv)
+    return daemon_loop()

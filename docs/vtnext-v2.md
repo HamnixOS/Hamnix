@@ -466,6 +466,54 @@ zero-friction migration during Phase D.
 - **No video.** A v2.1+ extension could add a `video` command
   taking a 4:2:0 frame, but v2 is text + vectors only.
 
+## Implementation status
+
+- **Phase D skeleton (in tree, M16.x):** `user/hamwd.ad` ships a
+  Hamnix userland daemon that implements the wire-emission side of
+  this protocol for `probe`, `win_create`, `win_destroy`,
+  `present`, and `text`. The daemon owns a 16-slot in-process
+  window registry (wid=0 reserved for the boot console per "Boot
+  console (`wid=0`)" above), parses text commands written to
+  stdin, and emits framed `ESC ] vtn ; <cmd> ; ... BEL` packets
+  to stdout. Two driving modes: one-shot (`hamwd create 800 600
+  Test`) and daemon (`echo "create ..." | /bin/hamwd`). Verified
+  end-to-end via `scripts/test_hamwd.sh`.
+- **What is NOT yet shipped (Phase D follow-ups):**
+  - Real `/srv/hamwd` posting. The Plan 9 idiom — daemon creates
+    `/srv/hamwd` as a channel handle that clients `open` and pass
+    to `mount(srvfd, -1, "/dev/win", MREPL, "")` — needs a kernel-
+    side `/srv/` post-and-attach surface plus a 9P client inside
+    the chan resolver (`sys/src/9/port/chan.ad`'s
+    `chan_resolve_prefix`). The skeleton documents this gap; the
+    smoke test exercises the mount() CALL SHAPE against any open
+    fd (the same contract `test_p9mount.ad` exercised at M16.107)
+    so the architectural call sites are in place. Once the
+    resolver learns to walk a SRV-kind chan through the stored
+    srvfd, `mount(open("/srv/hamwd"), -1, "/dev/win", MREPL, "")`
+    starts driving real bytes through hamwd unchanged.
+  - Renderer handshake reply parse. `hamwd` emits `probe`; with no
+    renderer wired to `qemu -serial stdio` no `cap` line comes
+    back. A real handshake is wired once a pygame (or local
+    framebuffer) renderer is attached.
+  - Reverse-channel input. `ESC [ V <kind> ; ...` lines from the
+    renderer aren't demuxed back to per-window `/dev/win/<wid>/
+    events` yet. Wire format is pinned; parser is straightforward.
+  - Full drawing command set (`rect`, `rect_outline`, `line`,
+    `circle`, `clear`, `win_place`, `win_resize`, `win_show`,
+    `win_hide`, `win_zorder`, `win_raise`, `win_lower`,
+    `win_cursor`, `win_title`). Wire frame helpers in `hamwd.ad`
+    generalise to any of these by adding a parse arm; this is
+    incremental work the skeleton unlocks.
+  - hamwd as PID 2 from `/etc/rc`. Today it runs as a foreground
+    invocation under hamsh. Auto-launch via `/etc/rc` is a
+    follow-up once `/srv/hamwd` posting lets the daemon survive
+    across client invocations.
+
+The architectural payoff of this skeleton: Phase D's promise that
+**Layer 3 services use only Layer 1** is no longer a rule on paper.
+A real userland `.ad` binary now emits VTNext frames using
+`open` / `write` / `read` / `mount` and nothing else.
+
 ## References
 
 - v1 renderer source (legacy, for historical context): the

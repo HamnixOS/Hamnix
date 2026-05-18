@@ -358,14 +358,61 @@ it has to honour.
         block. A simple "credit each rekey with 256 bits, drain
         N bits per output byte" accounting + a blocking variant
         for /dev/random would mirror Linux 4.x semantics.
-  - `/dev/win/*` (Phase D) — windowing-server cdev family.
+  - ~~`/dev/win/*` (Phase D) — windowing-server cdev family.
     `/dev/win/ctl` is the entry point: writes (NEWWIN, RESIZE,
     DESTROY, FOCUS) drive hamwd's window list; reads return
     the focused window id as ASCII decimal. Subsequent
     `/dev/win/<id>/{cmd,event,kbd,mouse,data}` files follow
     once hamwd has a real daemon process. Blocked on
     `hamwd` skeleton (separate userspace daemon, lives under
-    `user/hamwd.ad` — not yet a milestone).
+    `user/hamwd.ad` — not yet a milestone).~~ Phase D skeleton
+    shipped — `user/hamwd.ad` runs as a userland daemon that
+    maintains a 16-slot in-process window registry, parses
+    VTNext-shaped commands from stdin (or one-shot argv), and
+    emits framed `ESC ] vtn ; <cmd> ; ... BEL` packets to fd 1
+    for `probe` / `win_create` / `win_destroy` / `present` /
+    `text` (rest of the v2 command set is incremental follow-up).
+    `tests/test_hamwd_smoke.ad` exercises the canonical
+    client call shape `open(/srv/hamwd) → mount(srvfd, -1,
+    "/dev/win", MREPL, "") → unmount` (same M16.107 contract as
+    `test_p9mount.ad`); `scripts/test_hamwd.sh` greps the printable
+    mirror line `[hamwd-wire] vtn;win_create;1;"Test";800;600` in
+    the serial-stdio capture to prove a framed VTNext packet hit
+    the wire. Phase D follow-ups (now unblocked):
+      * Real `/srv/hamwd` posting. Today hamwd reads commands from
+        its own stdin; clients can't yet `open("/srv/hamwd")` and
+        get back an fd that routes to hamwd. Needs a kernel-side
+        `/srv/` tmpfs-like surface (post-and-open semantics) plus
+        a 9P client inside `sys/src/9/port/chan.ad`'s
+        `chan_resolve_prefix` so `mount(srvfd, ...)` actually
+        round-trips Tversion/Tattach/Twalk over the stored srvfd.
+        That's the M16.107 deferred work the skeleton documents
+        as GAP in `user/hamwd.ad`'s header.
+      * Full window lifecycle: `win_place` / `win_resize` /
+        `win_show` / `win_hide` / `win_zorder` / `win_raise` /
+        `win_lower` / `win_cursor` / `win_title`. Wire-frame
+        helpers in `hamwd.ad` generalise — each command is a
+        parse-arm + a fixed number of `emit_param_*` calls. Pinned
+        wire format in `docs/vtnext-v2.md` "Window lifecycle" and
+        "Drawing".
+      * Full drawing primitives: `rect`, `rect_outline`, `line`,
+        `circle`, `clear`. Same shape as the existing `text` emit.
+      * Reverse-channel parser. Demux `ESC [ V <kind> ; ...` lines
+        from the renderer back into per-window event streams
+        (eventual `/dev/win/<wid>/events`). Wire format pinned by
+        `docs/vtnext-v2.md` "Renderer → Server events".
+      * Second-client support. Today each `/bin/hamwd` invocation
+        is a fresh process; the registry doesn't persist between
+        calls. A real daemon survives across client requests —
+        lands once `/srv/hamwd` posting exists (the daemon
+        instance is what posts the srv channel).
+      * Auto-launch from `/etc/rc`. Run `hamwd &` at boot so it's
+        already up when the first GUI client invokes its mount
+        sequence. Needs the persistent-daemon shape above.
+      * Real renderer handshake. `hamwd` emits `probe` at startup
+        but no renderer is wired to `qemu -serial stdio`; cap-line
+        parse + V2/V1 fallback land once a pygame renderer (or a
+        local-framebuffer renderer process per Phase H) attaches.
   - Migrate `SYS_PUTC` / `SYS_GET_JIFFIES` / `SYS_GETPID` callers
     to the corresponding `/dev/*` reads now that the fan-out has
     landed. Tracked separately so the migration row in
@@ -746,6 +793,35 @@ it has to honour.
   "every tool with a 'current dir' intent calls sys_getcwd". Adding
   new tools as Phase G lands should follow ls.ad / find.ad / du.ad
   as templates.
+- **hamsh `cd` error message reports wrong cause.** The cd builtin
+  prints `cd: path too long\n` on ANY sys_chdir failure, even when
+  the kernel errstr is "no such directory" (-ENOENT) or "not a
+  directory" (-ENOTDIR). The fix is small — read sys_errstr after a
+  failed chdir and print that — but lives inside hamsh.ad, which is
+  currently off-limits per the M16.x VMA/parallel-agent fence.
+  Surfaced as the user-reported "path too long" symptom in the
+  `ls`/`vfs_listdir` cpio-routing bug investigation (the actual ls
+  bug was different — vfs_listdir falling through to -EINVAL — but
+  the misleading cd error was what got blamed).
+- **hamsh small-bug audit.** Surfaced during the M16.x ls/listdir
+  fix investigation; left unfixed to keep that commit narrowly
+  scoped:
+    * **No Tab completion.** Line editor reads one char at a time
+      and never intercepts TAB. Low-stakes but every new user hits
+      this within seconds.
+    * **Empty Enter behaviour not audited.** Pressing Enter on a
+      blank prompt should re-print the prompt and re-read; verify
+      that path doesn't accidentally tokenize argv[0]="" and spawn
+      an empty PATH lookup.
+    * **No history / arrow-key navigation.** Up/Down/Left/Right
+      escape sequences appear inline as raw bytes. A real readline
+      replacement (or even a minimal ring buffer) is a separate
+      project; note it here so future shell-UX work doesn't claim
+      hamsh "supports a normal shell experience".
+    * **Argv tokenization corner-case audit.** `tokenize` in
+      hamsh.ad uses double-quote-only quoting; single quotes,
+      backslash escapes, and `$VAR` interpolation inside `"…"` all
+      need a pass once Tab-completion or history land.
 - Real vDSO blob (mapped page advertised via `AT_SYSINFO_EHDR`),
   replacing the U11-era kernel-side `_lookup_dynsym` hack we
   retired in U20.

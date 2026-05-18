@@ -121,3 +121,4 @@ build_adder_user passwd               # M16.87: stub (no shadow file)
 build_adder_user login                # M16.87: stub auth hint
 build_adder_user getty                # M16.87: announces + exec /bin/hamsh
 build_adder_user distrorun            # Phase C.5: distro-shape namespace entry
+build_adder_user hamwd                # Phase D: Hamnix Window Daemon (Layer 3 / 9P file server skeleton)
