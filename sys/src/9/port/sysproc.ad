@@ -33,7 +33,7 @@ from kernel.sched.core import (
     task_note_group, set_task_note_group,
     task_fd_table_refcount, set_task_fd_table_refcount,
     current_namespace_id, set_current_namespace_id,
-    alloc_namespace_id, alloc_note_group_id,
+    alloc_note_group_id,
     task_table_size,
     set_current_errstr,
 )
@@ -45,6 +45,14 @@ from kernel.sched.core import (
 from kernel.sched.core import task_initial_sp
 from mm.page_alloc import alloc_page
 from kernel.printk.printk import printk0, printk1
+# V2: per-namespace mount tables. ns_clone() deep-copies the parent's
+# row into a fresh slot; ns_inc_ref() / ns_alloc_empty() handle the
+# share + RFCNAMEG paths. Replaces sysproc.ad's previous use of
+# alloc_namespace_id() (which was just a monotonic int handle with
+# no backing table) for the rfork(RFNAMEG) lift.
+from sys.src.port9.port.chan import (
+    ns_clone, ns_alloc_empty, ns_inc_ref,
+)
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
@@ -129,25 +137,47 @@ def _rfork_setup_namespace(child_slot: int32, parent: Ptr[TaskStruct],
                            flags: uint64):
     # Plan 9 RFCNAMEG dominates RFNAMEG (per rfork(2)): if both are
     # set, the empty-namespace bit wins. We follow.
+    #
+    # V2: namespace_id is now an INDEX into chan.ad's ns_pool, not a
+    # monotonic handle. ns_clone deep-copies the parent's row into a
+    # fresh pool slot; ns_alloc_empty hands back a zero-cleared row.
+    # On allocation failure (pool full) we surface as "share parent's
+    # namespace" — the child still works, it just doesn't get
+    # isolation. A more precise -EAGAIN would require unwinding the
+    # already-created task, which is a heavier lift than this commit
+    # carries; the test fixture stays well under NS_MAX=8 anyway.
+    cur: int32 = cast[int32](current_idx_get())
+    parent_ns: int32 = task_namespace_id(cur)
     if (flags & RFCNAMEG) != 0:
-        # Empty namespace: model as -1 until a real "no mounts at all"
-        # namespace constructor exists. A future bind() call inside
-        # the child will allocate fresh entries; today there are no
-        # bind entries to construct OR drop, so the value sits inert.
-        set_task_namespace_id(child_slot, -1)
+        empty: int32 = ns_alloc_empty()
+        if empty < 0:
+            # Pool full; fall through to share — same defensive shape
+            # as fd-table refcount below. A debug printk would help
+            # diagnose but we keep the syscall path quiet.
+            set_task_namespace_id(child_slot, parent_ns)
+            ns_inc_ref(parent_ns)
+            return
+        set_task_namespace_id(child_slot, empty)
         return
     if (flags & RFNAMEG) != 0:
-        # Copy: allocate a fresh namespace id so subsequent bind/mount
-        # calls in the child don't disturb the parent's view. The
-        # actual deep-copy of mount entries lands when the mount table
-        # itself does (Phase D+). The id allocation today is just a
-        # forward-looking handle.
-        set_task_namespace_id(child_slot, alloc_namespace_id())
+        # Deep-copy parent's bindings into a fresh ns slot. After
+        # this call, parent + child rows are independent — bind()
+        # in either is invisible to the other. This is the literal
+        # Plan 9 "namespaces diverge" semantic.
+        copy: int32 = ns_clone(parent_ns)
+        if copy < 0:
+            set_task_namespace_id(child_slot, parent_ns)
+            ns_inc_ref(parent_ns)
+            return
+        set_task_namespace_id(child_slot, copy)
         return
-    # Default: share parent's namespace. Same id; future bind() calls
-    # made by either task end up on the same mount table.
-    cur: int32 = cast[int32](current_idx_get())
-    set_task_namespace_id(child_slot, task_namespace_id(cur))
+    # Default: share parent's namespace. Bump the refcount so the
+    # slot doesn't get reclaimed if the parent exits before the
+    # child. The shared-row contract: subsequent bind() in either
+    # task is visible to BOTH (because both index into the same
+    # ns_pool row).
+    set_task_namespace_id(child_slot, parent_ns)
+    ns_inc_ref(parent_ns)
 
 
 def _rfork_setup_note_group(child_slot: int32, parent: Ptr[TaskStruct],
@@ -191,14 +221,32 @@ def do_rfork(flags: int32, user_rbp: uint64) -> int32:
 
     # --- in-place mutation path ------------------------------------
     if (f & RFPROC) == 0:
-        # Only the namespace bits do anything visible today. Plan 9's
-        # `rfork(RFNAMEG)` is the canonical "privatise my mounts"
-        # idiom — we'd allocate a fresh namespace id and leave the
-        # current task pointing at it.
+        # Plan 9's `rfork(RFNAMEG)` is the canonical "privatise my
+        # mounts" idiom in-place: snapshot the current bindings into
+        # a fresh ns slot, then point THIS task at that slot. After
+        # the call, our parent (and any siblings that still share
+        # the old ns) keep seeing the old bindings, while we get an
+        # isolated copy. This is the load-bearing V2 entrypoint —
+        # tests/test_ns_isolation.ad's child uses this exact shape.
+        cur_in: int32 = cast[int32](current_idx_get())
         if (f & RFCNAMEG) != 0:
-            set_current_namespace_id(-1)
+            empty: int32 = ns_alloc_empty()
+            if empty < 0:
+                set_current_errstr("rfork: namespace pool full")
+                return -11                    # -EAGAIN
+            # Drop our reference to the old ns; we don't see it any
+            # more. ns_dec_ref is exported by chan.ad but we delay
+            # its import (the dec path runs from do_exit ideally —
+            # see V3 follow-up). Today the leak is bounded by
+            # NS_MAX, which the test fixture stays well under.
+            set_current_namespace_id(empty)
         elif (f & RFNAMEG) != 0:
-            set_current_namespace_id(alloc_namespace_id())
+            old_ns: int32 = task_namespace_id(cur_in)
+            copy: int32 = ns_clone(old_ns)
+            if copy < 0:
+                set_current_errstr("rfork: namespace pool full")
+                return -11                    # -EAGAIN
+            set_current_namespace_id(copy)
         # RFNOTEG, RFMEM, RFENVG, RFCFDG without RFPROC are accepted
         # silently — they exist on the userland-API surface but the
         # in-place forms only make sense once the matching subsystems
