@@ -137,6 +137,18 @@ NVME_CQ_ENTRY_BYTES: uint64 = 16
 NVME_ADMIN_QID: uint32 = 0
 NVME_IO_QID:    uint32 = 1
 
+# Host page size for PRP arithmetic. CC.MPS=0 -> 4 KiB. NVMe spec §4.3
+# (Physical Region Page Entry and List) requires PRP1 to carry an
+# intra-page offset matching this page boundary, while PRP2 and every
+# entry of a PRP list must be page-aligned (offset = 0).
+NVME_PAGE_SIZE: uint64 = 4096
+NVME_PAGE_MASK: uint64 = 0xFFF
+# Each PRP-list entry is 8 bytes (uint64 LE); a 4 KiB list page holds
+# 512 entries. The last entry is reserved for chaining when the transfer
+# needs more than 512+1 pages — it must point at the next PRP-list page,
+# whose own entries continue the chain.
+NVME_PRP_ENTRIES_PER_PAGE: uint64 = 512
+
 
 # --- Admin and I/O command opcodes (NVMe §5 / §6.x) ----------------
 NVME_ADMIN_DELETE_SQ:   uint8 = 0x00
@@ -197,6 +209,44 @@ nvme: NvmeState
 # namespace id (uint64-encoded) so the adapter wrappers can pass
 # the right NSID through to the I/O primitives.
 nvme_ops: BlockDeviceOps
+
+
+# --- PRP-list page pool (V4.2 — multi-page transfers) -------------
+#
+# NVMe spec §4.3 requires that any transfer crossing more than two host
+# pages reference a PRP-list page in PRP2, where each list entry points
+# to a page-aligned physical address (8 bytes LE per entry). PRP1 may
+# carry an intra-page offset (low 12 bits); every other PRP reference
+# (PRP2 directly + all PRP-list entries) MUST be page-aligned.
+#
+# The pre-V4.2 driver only wrote PRP1, so transfers whose buffer crossed
+# a page boundary silently dropped the bytes past the first page edge
+# (the SQE still completed "successfully"). This surfaced through the
+# GPT mkpart write path in commit c38188d: a 512-byte transfer landing
+# at intra-page offset 0xF10 lost 240 bytes. The bug was papered over
+# with a caller-side bounce buffer in drivers/block/partition.ad; that
+# bounce becomes unnecessary once this pool + the PRP2 logic land.
+#
+# Lifecycle (per-SQE-slot ownership):
+#   - Queue depth is NVME_QUEUE_DEPTH (64). We allocate 64 page-aligned
+#     scratch pages once at I/O queue setup. Each slot owns one
+#     PRP-list page indexed by `iosq_tail` at the moment the SQE is
+#     built. The polled-completion model guarantees the controller is
+#     done with slot N's list page before that slot wraps around the
+#     ring and gets reused.
+#   - For ≤2-page transfers we set PRP2 directly (no list page touched).
+#   - For >2-page transfers we populate the slot's list page with one
+#     8-byte entry per page after the first, then write PRP2 = the list
+#     page's physical address.
+#   - >512+1 pages: the last entry of the list page chains to a second
+#     list page. Single-list-page covers up to 512 entries × 4 KiB +
+#     the first page = ~2 MiB. The chain path is supported but exercised
+#     only by tests/test_nvme_prp.ad at large sizes; the block layer
+#     today never submits a single command beyond NLB=65536 sectors
+#     (32 MiB) which would need ~8192 entries and hence ~16 chained
+#     list pages.
+io_prp_list_pages: Array[64, uint64]
+io_prp_pool_ready: int32 = 0
 
 
 # --- MMIO helpers --------------------------------------------------
@@ -426,6 +476,10 @@ def _io_submit_and_wait(opcode: uint8, nsid: uint32,
                         cdw10: uint32, cdw11: uint32,
                         cdw12: uint32, cdw13: uint32,
                         cdw14: uint32, cdw15: uint32) -> uint32:
+    # Legacy entry point — caller has already resolved both PRP fields.
+    # Retained so non-data-transfer I/O commands (e.g. FLUSH, opcode
+    # 0x00) can still issue without going through the buffer-aware
+    # path. Data-bearing READ/WRITE go via _io_submit_buf_and_wait.
     cid: uint32 = nvme.io_cid
     nvme.io_cid = cid + 1
     slot_addr: uint64 = nvme.iosq \
@@ -442,6 +496,168 @@ def _io_submit_and_wait(opcode: uint8, nsid: uint32,
                             &nvme.iocq_head, &nvme.iocq_phase,
                             _cq_doorbell(NVME_IO_QID),
                             NVME_QUEUE_DEPTH)
+
+
+# --- PRP-list pool helpers (V4.2 multi-page transfers) ------------
+#
+# Allocate one 4 KiB scratch page per SQE slot (64 total at queue
+# depth 64). Returns 0 on success, -1 on any allocation failure. Once
+# initialised, io_prp_pool_ready=1 and the I/O submit path can dip
+# into io_prp_list_pages[slot] for any transfer that needs a PRP list.
+
+def _alloc_io_prp_pool() -> int32:
+    if io_prp_pool_ready != 0:
+        return 0
+    i: uint32 = 0
+    while i < NVME_QUEUE_DEPTH:
+        p: uint64 = alloc_pages(0)
+        if p == 0:
+            printk1("[nvme] PRP-list pool alloc failed at slot=%d\n",
+                    cast[uint64](i))
+            return -1
+        # Zero the page so any unused trailing entries read as 0
+        # (the spec allows trailing zero entries as long as the
+        # transfer doesn't run off the end).
+        memset(cast[Ptr[uint8]](p), 0, 4096)
+        io_prp_list_pages[i] = p
+        i = i + 1
+    io_prp_pool_ready = 1
+    return 0
+
+
+# Compute PRP1 + PRP2 for a (buf_phys, buf_len) transfer destined for
+# I/O queue slot `slot`. On return, prp1_p[0] and prp2_p[0] hold the
+# values to plant in the SQE. Per NVMe spec §4.3:
+#
+#   * PRP1 carries `buf_phys` verbatim (low 12 bits = intra-page offset).
+#   * If the whole transfer fits in the first page, PRP2 = 0.
+#   * If it spans two pages, PRP2 = the page-aligned start of the
+#     second page (i.e. the byte just past the first-page tail).
+#   * If it spans three or more pages, PRP2 = the physical address of
+#     the slot's PRP-list page (page-aligned). The list page holds one
+#     8-byte LE entry per page after the first; for transfers larger
+#     than 512+1 pages, the 511th entry chains to a second list page.
+#
+# Returns 0 on success, -1 if the PRP-list pool isn't initialised when
+# a multi-page transfer asks for one.
+def _compute_io_prp(slot: uint32, buf_phys: uint64, buf_len: uint64,
+                    prp1_p: Ptr[uint64], prp2_p: Ptr[uint64]) -> int32:
+    prp1_p[0] = buf_phys
+    if buf_len == 0:
+        prp2_p[0] = 0
+        return 0
+
+    offset_in_page: uint64 = buf_phys & NVME_PAGE_MASK
+    first_page_bytes: uint64 = NVME_PAGE_SIZE - offset_in_page
+
+    if buf_len <= first_page_bytes:
+        # Single-page transfer: PRP2 unused.
+        prp2_p[0] = 0
+        return 0
+
+    second_page_start: uint64 = (buf_phys + first_page_bytes) \
+                              & ~NVME_PAGE_MASK
+
+    if buf_len <= first_page_bytes + NVME_PAGE_SIZE:
+        # Exactly two pages: PRP2 carries the second page's
+        # page-aligned start. No list page touched.
+        prp2_p[0] = second_page_start
+        return 0
+
+    # Three or more pages: build a PRP list in this slot's pool page.
+    if io_prp_pool_ready == 0:
+        printk0("[nvme] PRP list needed but pool not ready\n")
+        return -1
+    list_page: uint64 = io_prp_list_pages[slot]
+    if list_page == 0:
+        printk1("[nvme] PRP list slot=%d has no page\n",
+                cast[uint64](slot))
+        return -1
+
+    # Count remaining pages (bytes after the first page boundary).
+    remaining_bytes: uint64 = buf_len - first_page_bytes
+    # Pages after the first one — round up (any partial-page residue
+    # at the tail still occupies a whole page on the device side).
+    remaining_pages: uint64 = (remaining_bytes + NVME_PAGE_MASK) \
+                            >> 12
+
+    # Zero the list page upfront so unused tail entries don't leak.
+    memset(cast[Ptr[uint8]](list_page), 0, 4096)
+
+    # Walk the list page, planting one entry per follow-on page.
+    # The page-aligned address of follow-on page N (zero-indexed) is
+    # second_page_start + N * NVME_PAGE_SIZE.
+    cur_entries: Ptr[uint64] = cast[Ptr[uint64]](list_page)
+    idx_in_page: uint64 = 0
+    pg:          uint64 = 0
+    while pg < remaining_pages:
+        # If we're about to fill the last slot of the current list
+        # page AND there are still more pages to map, chain instead:
+        # the last slot stores a pointer to the next list page (per
+        # NVMe spec §4.3 figure 14).
+        if idx_in_page == (NVME_PRP_ENTRIES_PER_PAGE - 1) \
+           and (remaining_pages - pg) > 1:
+            # Need another list page. The 64-slot pre-allocated pool
+            # gives us one list page per SQE slot; >512+1 page
+            # transfers (>2 MiB) chain off-pool via alloc_pages(0).
+            # This branch is unreachable from any current submitter
+            # (the block layer caps each command at NLB=65536 → 32
+            # MiB → ~16 chained list pages); we keep the chain
+            # implemented for spec compliance and to satisfy
+            # tests/test_nvme_prp.ad's >2-page exercises if extended.
+            next_page: uint64 = alloc_pages(0)
+            if next_page == 0:
+                printk0("[nvme] PRP chain alloc failed\n")
+                return -1
+            memset(cast[Ptr[uint8]](next_page), 0, 4096)
+            cur_entries[idx_in_page] = next_page
+            cur_entries = cast[Ptr[uint64]](next_page)
+            idx_in_page = 0
+            # Don't consume `pg` — the next iteration plants this
+            # page's entry into the fresh list page at index 0.
+        page_phys: uint64 = second_page_start \
+                          + pg * NVME_PAGE_SIZE
+        cur_entries[idx_in_page] = page_phys
+        idx_in_page = idx_in_page + 1
+        pg = pg + 1
+
+    prp2_p[0] = list_page
+    return 0
+
+
+# Top-level scratch globals for resolved PRP values. We don't use
+# stack locals here because the Adder compiler has known issues with
+# Ptr[uintN] writes targeting &local addresses (see
+# memory/feedback_compiler_quirks.md). The I/O submit path is
+# single-threaded (we busy-poll completions before re-entering), so
+# a single pair of globals is safe.
+io_prp1_scratch: uint64 = 0
+io_prp2_scratch: uint64 = 0
+
+
+def _io_submit_buf_and_wait(opcode: uint8, nsid: uint32,
+                            buf_phys: uint64, buf_len: uint64,
+                            cdw10: uint32, cdw11: uint32,
+                            cdw12: uint32, cdw13: uint32,
+                            cdw14: uint32, cdw15: uint32) -> uint32:
+    # Data-bearing I/O submit: resolves PRP1/PRP2 from (buf_phys,
+    # buf_len) per NVMe spec §4.3, then falls into the same submit-
+    # and-poll path as _io_submit_and_wait. The slot index used for
+    # PRP-list-pool indexing is the current iosq_tail, which is also
+    # the slot the SQE will land in.
+    slot: uint32 = nvme.iosq_tail
+    io_prp1_scratch = 0
+    io_prp2_scratch = 0
+    rc: int32 = _compute_io_prp(slot, buf_phys, buf_len,
+                                &io_prp1_scratch, &io_prp2_scratch)
+    if rc != 0:
+        # PRP resolution failed — return a synthetic "error" status so
+        # the caller's existing non-zero check fires. Status 0x7FFF is
+        # not a real NVMe code, just an out-of-band sentinel.
+        return 0x7FFF
+    return _io_submit_and_wait(opcode, nsid,
+                               io_prp1_scratch, io_prp2_scratch,
+                               cdw10, cdw11, cdw12, cdw13, cdw14, cdw15)
 
 
 # --- IDENTIFY decoding ---------------------------------------------
@@ -564,8 +780,11 @@ def _nvme_read_lba(lba: uint64, nblocks: uint16, dst: uint64) -> int32:
     cdw10: uint32 = cast[uint32](lba & 0xFFFFFFFF)
     cdw11: uint32 = cast[uint32](lba >> 32)
     cdw12: uint32 = cast[uint32](nblocks - 1) & 0xFFFF
-    status: uint32 = _io_submit_and_wait(
-        NVME_IO_READ, NVME_IO_QID, dst, 0,
+    # V4.2: pass the byte length so _io_submit_buf_and_wait can resolve
+    # PRP1 + PRP2 + (if needed) a PRP-list page for the transfer.
+    buf_len: uint64 = cast[uint64](nblocks) * SECTOR_SIZE
+    status: uint32 = _io_submit_buf_and_wait(
+        NVME_IO_READ, NVME_IO_QID, dst, buf_len,
         cdw10, cdw11, cdw12, 0, 0, 0)
     if status != 0:
         printk1("[nvme] I/O READ failed (status=%x)\n",
@@ -594,8 +813,10 @@ def _nvme_write_lba(lba: uint64, nblocks: uint16, src: uint64) -> int32:
     cdw10: uint32 = cast[uint32](lba & 0xFFFFFFFF)
     cdw11: uint32 = cast[uint32](lba >> 32)
     cdw12: uint32 = cast[uint32](nblocks - 1) & 0xFFFF
-    status: uint32 = _io_submit_and_wait(
-        NVME_IO_WRITE, NVME_IO_QID, src, 0,
+    # V4.2: byte-length-aware PRP resolution (see _nvme_read_lba).
+    buf_len: uint64 = cast[uint64](nblocks) * SECTOR_SIZE
+    status: uint32 = _io_submit_buf_and_wait(
+        NVME_IO_WRITE, NVME_IO_QID, src, buf_len,
         cdw10, cdw11, cdw12, 0, 0, 0)
     if status != 0:
         printk1("[nvme] I/O WRITE failed (status=%x)\n",
@@ -827,6 +1048,17 @@ def nvme_smoke_test() -> int32:
         return -1
     printk0("[nvme] I/O queues online\n")
 
+    # V4.2: PRP-list page pool (one 4 KiB page per SQE slot, indexed
+    # by iosq_tail at submit time). Required for any I/O transfer that
+    # crosses a page boundary; pre-V4.2 the driver only wrote PRP1 and
+    # silently dropped bytes past the first-page edge. Allocation
+    # happens once at queue setup; failure here is fatal because every
+    # subsequent IDENTIFY/READ/WRITE depends on the pool being live.
+    if _alloc_io_prp_pool() != 0:
+        printk0("[nvme] PRP-list pool init failed\n")
+        return -1
+    printk0("[nvme] PRP-list pool ready (64 pages)\n")
+
     # ----- Read LBA 0 -------------------------------------------
     mbr_buf: uint64 = alloc_pages(0)
     if mbr_buf == 0:
@@ -894,6 +1126,13 @@ def nvme_smoke_test() -> int32:
     # so a failure mid-test still leaves the controller in a clean
     # state for any later block-layer integration.
     _nvme_write_smoke_test()
+
+    # V4.2: cross-page PRP smoke. Issues a 512-byte WRITE+READ where
+    # the buffer DELIBERATELY straddles a 4 KiB page boundary (offset
+    # 0xF10 → 240 bytes in page 0, 272 bytes in page 1). Pre-V4.2 the
+    # second-page bytes were silently dropped because only PRP1 was
+    # ever filled; this test catches a regression of that bug.
+    nvme_prp_smoke_test()
 
     # M16.119: register namespace 1 with the kernel block layer as
     # "nvme0n1" (Linux-style: nvme<ctrl>n<ns>). Capacity is the NSZE
@@ -1007,3 +1246,11 @@ def nvme_irq_handler():
 
 def nvme_irq_count() -> uint64:
     return nvme.irq_count
+
+
+# V4.2 PRP-list smoke fixture lives in tests/test_nvme_prp.ad. The
+# import sits at the bottom of the module (matching the pattern
+# drivers/block/partition.ad uses for its GPT mkpart fixture) so the
+# test module can re-import nvme_write_lba / nvme_read_lba without
+# tripping a circular import at load time.
+from tests.test_nvme_prp import nvme_prp_smoke_test
