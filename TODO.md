@@ -420,8 +420,43 @@ it has to honour.
             Linux's `/proc/sys/kernel/{ostype,osrelease,version}`
             concatenation; useful for `uname(1)` callers that want
             one read instead of three opens.
-      * Layer-2 `/proc/cpuinfo` + `/proc/meminfo` translators
-        that consume the same bytes via `linux_abi/`.
+      * ~~Layer-2 `/proc/cpuinfo` + `/proc/meminfo` translators
+        that consume the same bytes via `linux_abi/`.~~ M16.134
+        shipped — `linux_abi/u_syscalls.ad`'s `_u_open` /
+        `_u_openat` rewrite `/proc/<name>` to `/dev/<name>` in
+        place before `vfs_open` for all six native cdev names
+        (cpuinfo, meminfo, uptime, loadavg, version, hostname).
+        Linux ELFs reading `/proc/cpuinfo` now see the exact bytes
+        `/dev/cpuinfo` emits; the native rootfs deliberately has
+        no `/proc/<name>` entries (Plan 9 keeps system
+        introspection under `/dev/`). Native Adder callers doing
+        `sys_open("/proc/cpuinfo")` still flow through fs/procfs.ad's
+        legacy renderer (or get -ENOENT once that's retired) —
+        the translation lives entirely in Layer 2 per
+        docs/architecture.md. Follow-ups (separate commits):
+          * Per-pid `/proc/<pid>/*` translation. devproc.ad
+            already serves `/proc/<pid>/{cwd,status}` natively;
+            the Layer-2 mapping needs to take the Linux caller's
+            `/proc/<pid>/<leaf>` and verify the leaf maps to a
+            native devproc surface (vs. failing fast on unknown
+            leaves like `mounts` or `maps` that don't exist yet).
+          * `/proc/self/*` — translate to the caller's current
+            pid first, then fall through to the per-pid path.
+          * `/proc/stat` aggregator — needs a per-CPU jiffy
+            accessor in `arch/x86/kernel/time.ad` and an IRQ-
+            count accessor in `arch/x86/kernel/irq.ad` (same
+            prerequisites as the `/dev/stat` cdev follow-up
+            above). Once `/dev/stat` lands, the Layer-2 row is
+            a one-line addition to `_u_translate_proc_to_dev`.
+          * `/proc/mounts` — needs to consume the mount-table
+            via chan_resolve_prefix accessors and emit
+            Linux-shape `<src> <target> <fstype> <opts> 0 0`
+            lines. Block on a `/dev/mounts` cdev so the Plan 9
+            source-of-truth lands first.
+          * `/proc/diskstats`, `/proc/net/*`, `/proc/cmdline` —
+            each is its own follow-up, gated on its own native
+            cdev landing first (the architecture rule: Layer 1
+            grows the surface, Layer 2 translates).
       * Per-cache slab walker accessor in `mm/slab.ad` so
         devmeminfo's `KmallocLive` line can show real
         `sum(nr_inuse * object_size)` instead of the in-use-page
