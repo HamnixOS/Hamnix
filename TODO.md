@@ -243,25 +243,39 @@ it has to honour.
       store. Layer 3 service; lands after Phase F.
     * Real Debian BINARY (not just /etc/* file) running inside a
       namespace — `deb /bin/true` actually exec'ing the Debian-
-      shipped `/bin/true`. Blocked on:
+      shipped `/bin/true`. Remaining blockers (U42 landed the dynamic
+      ELF interpreter — fs/elf.ad now follows PT_INTERP and loads
+      ld-linux-x86-64.so.2 as a real ELF interpreter; AT_BASE /
+      AT_ENTRY / AT_PHDR auxv plumbed correctly; smoke-tested by
+      scripts/test_u42_dynamic_elf.sh against a host-built dynamic
+      hello):
         - `fs/cpio.ad` `NR_FILES` bump (192 -> 8192+) so the full
           debootstrap'd tree (~5000 files) fits in the cpio archive.
-        - Dynamic linker — Debian's `/bin/true` is a dynamic ELF with
-          interp=`/lib64/ld-linux-x86-64.so.2`. Hamnix's U-track
-          loader handles static-pie only; bringing up Debian's glibc
-          ld.so as a real ELF interpreter is a separate, larger lift.
-        - Linux-ABI execve: `linux_abi/u_syscalls.ad`'s execve has
-          to follow PT_INTERP and load ld-linux for the dynamic
-          case (today it returns the static-pie code path).
-    * `apt update` inside a namespace — needs (a) the dynamic linker
-      above so `/usr/bin/apt` runs, (b) networking inside the
-      namespace (today /net is the shared bind so this works), and
-      (c) `/var/lib/dpkg/` write-through, which requires the
-      debootstrap tree to be writable from inside the cpio archive
-      (today it's read-only — we'd need to copy `/var/lib/dpkg/` onto
-      a tmpfs overlay during distrorun bring-up).
-    * `/bin/python3` from Debian — exact same shape as `/bin/bash`:
-      land the dynamic linker, run any dynamic Debian binary.
+          Today scripts/test_u42_dynamic_elf.sh works around this by
+          injecting ONLY ld.so into the cpio archive post-build; a
+          real `deb /bin/true` flow needs libc.so.6 and friends too.
+        - libdl / dlopen — U42 covers the loader's job up to "ld.so
+          executes from userspace". Anything beyond `puts()` that
+          calls dlopen() ("apt install" loads plugins) needs the
+          full DT_NEEDED + ld.so.cache search-path machinery to
+          actually find DSOs in the namespace. Out of U42 scope.
+        - Namespace plumbing for the interpreter lookup — fs/elf.ad's
+          `_load_interp_elf` calls initramfs_data_ptr verbatim (no
+          resolve_path / mount-table rewrite). A `deb /bin/true`
+          invocation that picks up Debian's `/lib64/...` via a
+          namespace bind needs the loader to route the interpreter
+          lookup through the chan layer. Small follow-up.
+    * `apt update` inside a namespace — needs (a) libdl/dlopen
+      (above), (b) networking inside the namespace (today /net is
+      the shared bind so this works), and (c) `/var/lib/dpkg/`
+      write-through, which requires the debootstrap tree to be
+      writable from inside the cpio archive (today it's read-only —
+      we'd need to copy `/var/lib/dpkg/` onto a tmpfs overlay during
+      distrorun bring-up).
+    * `/bin/python3` from Debian — U42 makes the dynamic loader run;
+      python3 additionally needs libdl (CPython imports .so
+      extension modules at runtime), so it lands AFTER the libdl
+      follow-up above.
     * Phase D follow-up: once `chan_attach` speaks 9P (Phase D's
       hamwd), replace the four per-subdir binds in `distrorun.ad`
       with a single `mount(srvfd, -1, "/", MREPL, "")` call that
@@ -270,14 +284,31 @@ it has to honour.
 - **Phase D** prerequisite — `srvfd` channels at `/srv/<name>`.
   `mount` needs `srvfd` to come from somewhere; without it the
   Phase C `mount` body has nothing to consume.
-- Wider errstr integration — Phase B / M16.93 only set the error
+- ~~Wider errstr integration — Phase B / M16.93 only set the error
   message on `SYS_OPEN → -ENOENT` (the smallest viable
-  demonstration). Every existing syscall failure path that returns
-  a negative errno-shape value should `set_current_errstr(...)`
-  with a human-readable string so Phase C / Plan 9 callers get
-  useful diagnostics out of `errstr(2)`. Cheap, mechanical, but
-  hundreds of sites; defer until Phase C lands `rfork` so the
-  audience for the messages actually exists.
+  demonstration).~~ DONE: the Phase C follow-up sweep added
+  `set_current_errstr(...)` at every meaningful failure path in
+  `arch/x86/kernel/syscall.ad` (SYS_OPEN / SYS_OPEN_WRITE /
+  SYS_READ / SYS_WRITE / SYS_CLOSE / SYS_LSEEK / SYS_DUP /
+  SYS_DUP2 / SYS_PIPE / SYS_KILL / SYS_CHDIR / SYS_GETCWD /
+  SYS_UNLINK / SYS_LISTDIR / SYS_EXECVE / SYS_SPAWN / SYS_CLONE /
+  SYS_WAITPID / SYS_INIT_MODULE / SYS_DELETE_MODULE), the rfork
+  path (`sys/src/9/port/sysproc.ad`), and the realistic-hit subset
+  of Linux ABI failures in `linux_abi/u_syscalls.ad` (open / pipe /
+  dup2 / chdir / getcwd / unlink / kill / clock_gettime /
+  unknown-syscall fallthrough). `sysfile.ad` / `syschan.ad` /
+  `sysnote.ad` were already covered by their M16.101 / M16.107 /
+  M16.109 bodies. Test fixture +
+  `scripts/test_errstr_coverage.sh` assert 10 distinct subjects
+  end-to-end. Follow-ups:
+  - errstr at the per-backend layers (`fs/ext4.ad` / `fs/fat.ad` /
+    `kernel/block/blk.ad`): right now those return negative values
+    that bubble up through vfs.ad and the syscall site supplies a
+    generic message. Backend-specific strings ("ext4: short read",
+    "fat: cluster chain corrupt", ...) would surface root cause.
+  - User-mode `perror`-style helper in `user/runtime.S`: a thin
+    wrapper that calls `sys_errstr` + `sys_write` so user binaries
+    can `perror("open")` -> `"open: file does not exist\n"`.
 - **Next /dev/\* device files** — M16.94 landed `/dev/cons`; M16.95
   landed `/dev/time` + `/dev/pid` + `/dev/random` under
   `sys/src/9/port/devtime.ad`, `devpid.ad`, `devrandom.ad` with
