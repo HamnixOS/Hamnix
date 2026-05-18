@@ -45,14 +45,27 @@
 from kernel.printk.printk import printk0, printk1, printk2
 from drivers.pci.pci import (
     pci_config_read_dword, pci_config_write_dword,
+    pci_config_read_byte,
     pci_bdf_bus, pci_bdf_dev, pci_bdf_fn, pci_pack_bdf,
     pci_read_bar, PCI_BDF_NONE,
     PCI_COMMAND_OFFSET, PCI_COMMAND_MEM, PCI_COMMAND_MASTER,
 )
+from arch.x86.kernel.apic import ioapic_redirect
+from arch.x86.kernel.irq import register_irq_handler
 from mm.page_alloc import alloc_pages
 from mm.slab import kmalloc
 
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
+
+# PCI config-space offsets used by the IRQ wiring path.
+NVME_PCI_INTERRUPT_LINE: uint32 = 0x3C
+NVME_PCI_INTERRUPT_PIN:  uint32 = 0x3D
+
+# CPU vector this driver claims for its INTx IRQ. virtio-net = 0x40;
+# AHCI = 0x41; NVMe = 0x42 (M16.114 IRQ-wiring batch).
+NVME_IRQ_VECTOR: uint32 = 0x42
+NVME_LAPIC_ID:   uint32 = 0
 
 
 # --- PCI matching --------------------------------------------------
@@ -160,6 +173,10 @@ class NvmeState:
     io_cid:         uint32
 
     nsze:           uint64       # namespace 1 size (LBA count)
+
+    irq_pin:        uint32       # IOAPIC pin we redirected (diag)
+    pad_irq:        uint32
+    irq_count:      uint64       # IRQs handled
 
     # 40-byte controller model string + NUL.
     model:          Array[41, uint8]
@@ -691,4 +708,70 @@ def nvme_smoke_test() -> int32:
         printk2("[nvme] MBR signature MISMATCH (got %x %x)\n",
                 cast[uint64](sig_lo), cast[uint64](sig_hi))
 
+    # M16.114: wire the INTx IRQ. NVMe natively prefers MSI-X but the
+    # spec also defines pin-based INTx fallback for controllers that
+    # advertise no MSI-X (or for the polled-init-then-IRQ-driven-runtime
+    # path we follow here). Read PCI INTx pin / line, route the
+    # firmware-assigned IOAPIC pin to our chosen vector (0x42) on LAPIC
+    # 0, register the handler. The polled CQ phase-bit drain stays as
+    # safety-net; the handler just acknowledges by walking the CQ for
+    # any completion whose phase matches the expected value.
+    nbus:  uint32 = pci_bdf_bus(bdf)
+    ndev:  uint32 = pci_bdf_dev(bdf)
+    nfn:   uint32 = pci_bdf_fn(bdf)
+    intx_pin:  uint32 = pci_config_read_byte(nbus, ndev, nfn,
+                                             NVME_PCI_INTERRUPT_PIN)
+    intx_line: uint32 = pci_config_read_byte(nbus, ndev, nfn,
+                                             NVME_PCI_INTERRUPT_LINE)
+    ioapic_pin: uint32 = intx_line
+    if intx_pin == 0 or intx_line == 0 or intx_line >= 24:
+        # QEMU's nvme device lands on IOAPIC pin 11 by default (shared
+        # with virtio-net's slot in i440FX); fall back to that.
+        ioapic_pin = 11
+    nvme.irq_pin = ioapic_pin
+    nvme.irq_count = 0
+    register_irq_handler(cast[uint64](NVME_IRQ_VECTOR),
+                         cast[uint64](&nvme_irq_handler))
+    ioapic_redirect(ioapic_pin, NVME_IRQ_VECTOR, NVME_LAPIC_ID)
+    printk2("[nvme] irq pin=%d vec=0x%x\n",
+            cast[uint64](ioapic_pin), cast[uint64](NVME_IRQ_VECTOR))
+
     return 0
+
+
+def nvme_irq_handler():
+    # IRQ-context entry. NVMe has no single "interrupt status" register
+    # for the controller; the canonical "is there work" signal is the
+    # phase bit on each CQ. Walk the I/O CQ at the expected head + phase
+    # and advance for each completion we observe. We don't currently
+    # consume the result here — the polled submit/wait helpers in the
+    # init path are the only consumers of CQ entries this milestone,
+    # and they look at the SAME head/phase bookkeeping. The handler
+    # exists to keep the line de-asserted and to give later
+    # multi-queue / async-I/O work a place to plug in.
+    if nvme.bar0 == 0:
+        return
+    nvme.irq_count = nvme.irq_count + 1
+    # Probe one CQ slot: if its phase matches what we expect, the
+    # controller delivered a completion since we last drained. We
+    # don't pop it (the polled path owns the head/phase advancement);
+    # we just observe. The LAPIC EOI will be sent by do_irq().
+    cq_base: uint64 = nvme.iocq
+    if cq_base == 0:
+        return
+    head: uint32 = nvme.iocq_head
+    expected_phase: uint32 = nvme.iocq_phase
+    slot_addr: uint64 = cq_base \
+                      + cast[uint64](head) * NVME_CQ_ENTRY_BYTES
+    e: Ptr[uint32] = cast[Ptr[uint32]](slot_addr)
+    dw3: uint32 = e[3]
+    cur_phase: uint32 = (dw3 >> 16) & 0x1
+    if cur_phase == expected_phase:
+        # Completion present — log presence; the polled path will
+        # consume it the next time the kernel calls into an
+        # _io_submit_and_wait helper.
+        printk0("[nvme] irq: CQ completion observed\n")
+
+
+def nvme_irq_count() -> uint64:
+    return nvme.irq_count

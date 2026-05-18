@@ -41,14 +41,29 @@
 from kernel.printk.printk import printk0, printk1, printk2
 from drivers.pci.pci import (
     pci_config_read_dword, pci_config_write_dword,
+    pci_config_read_byte,
     pci_bdf_bus, pci_bdf_dev, pci_bdf_fn, pci_pack_bdf,
     pci_read_bar, PCI_BDF_NONE,
     PCI_COMMAND_OFFSET, PCI_COMMAND_MEM, PCI_COMMAND_MASTER,
 )
+from arch.x86.kernel.apic import ioapic_redirect
+from arch.x86.kernel.irq import register_irq_handler
 from mm.page_alloc import alloc_pages
 from mm.slab import kmalloc
 
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
+
+# PCI config-space offsets for the IRQ wiring path. Mirror of the
+# pair virtio_net uses; PCI spec §6.2.4.
+AHCI_PCI_INTERRUPT_LINE: uint32 = 0x3C
+AHCI_PCI_INTERRUPT_PIN:  uint32 = 0x3D
+
+# CPU vector this driver claims for its INTx IRQ. virtio-net claims
+# 0x40; AHCI follows at 0x41 (M16.114 IRQ-wiring batch — see
+# `arch/x86/kernel/irq.ad` for the 0x40..0x44 allocation map).
+AHCI_IRQ_VECTOR: uint32 = 0x41
+AHCI_LAPIC_ID:   uint32 = 0
 
 
 # --- PCI matching --------------------------------------------------
@@ -186,6 +201,8 @@ class AhciState:
     port_num:  int32           # The active port we picked (or -1)
     port_base: uint64          # ABAR + 0x100 + 0x80*port_num
     page:      uint64          # 4 KiB working page per port
+    irq_pin:   uint32          # IOAPIC pin we redirected (diag)
+    irq_count: uint64          # IRQs handled
     # 16 bytes of model string + NUL — enough to fingerprint the disk.
     model:     Array[41, uint8]
 
@@ -544,4 +561,67 @@ def ahci_smoke_test() -> int32:
         printk2("[ahci] MBR signature MISMATCH (got %x %x)\n",
                 cast[uint64](sig_lo), cast[uint64](sig_hi))
 
+    # M16.114: wire the IRQ. Same shape as drivers/net/virtio_net.ad's
+    # M16.113 template — read PCI INTx pin / line, route the firmware-
+    # assigned IOAPIC pin to our chosen vector (0x41) on LAPIC 0,
+    # register the handler. The polled smoke-test path above stays as
+    # a safety-net fallback; this addition lets the kernel drain port-
+    # level completions on real hardware via IRQ instead of busy-poll.
+    bus: uint32 = pci_bdf_bus(bdf)
+    pdev: uint32 = pci_bdf_dev(bdf)
+    pfn:  uint32 = pci_bdf_fn(bdf)
+    intx_pin:  uint32 = pci_config_read_byte(bus, pdev, pfn,
+                                             AHCI_PCI_INTERRUPT_PIN)
+    intx_line: uint32 = pci_config_read_byte(bus, pdev, pfn,
+                                             AHCI_PCI_INTERRUPT_LINE)
+    ioapic_pin: uint32 = intx_line
+    # If firmware left INTERRUPT_LINE garbage (0 / 0xFF / >=24), fall
+    # back to QEMU's documented default for the ich9-ahci slot — pin 11.
+    if intx_pin == 0 or intx_line == 0 or intx_line >= 24:
+        ioapic_pin = 11
+    ahci.irq_pin = ioapic_pin
+    ahci.irq_count = 0
+    register_irq_handler(cast[uint64](AHCI_IRQ_VECTOR),
+                         cast[uint64](&ahci_irq_handler))
+    ioapic_redirect(ioapic_pin, AHCI_IRQ_VECTOR, AHCI_LAPIC_ID)
+    printk2("[ahci] irq pin=%d vec=0x%x\n",
+            cast[uint64](ioapic_pin), cast[uint64](AHCI_IRQ_VECTOR))
+
     return 0
+
+
+def ahci_irq_handler():
+    # IRQ-context entry. AHCI uses a two-level interrupt-status model
+    # (spec §5.5):
+    #   1. HBA-level: GHC.IS (ABAR + 0x08) — one bit per port.
+    #   2. Port-level: PxIS (port_base + 0x10) — per-cause within the
+    #      port. Each is write-1-to-clear.
+    # We snapshot HBA IS, ack the per-port PxIS for every bit set,
+    # then write IS back to ack the controller-level interrupt. The
+    # LAPIC EOI is sent by do_irq() after we return.
+    if ahci.abar == 0:
+        return
+    ahci.irq_count = ahci.irq_count + 1
+    is_reg: uint32 = _mmio_r32(ahci.abar + HBA_IS)
+    if is_reg == 0:
+        # Shared INTx; another device on the same line. Still safe to
+        # return — do_irq will EOI for us.
+        return
+    # Walk the IS bits and ack each port's PxIS. We don't currently
+    # drain command completions from IRQ context (the polled smoke
+    # test handled the only commands we issue this milestone); just
+    # acking is sufficient to keep the line de-asserted.
+    i: uint32 = 0
+    while i < 32:
+        if (is_reg & (cast[uint32](1) << i)) != 0:
+            pb: uint64 = ahci.abar + HBA_PORTS_BASE \
+                       + cast[uint64](i) * HBA_PORT_STRIDE
+            pxis: uint32 = _mmio_r32(pb + PORT_IS)
+            _mmio_w32(pb + PORT_IS, pxis)
+        i = i + 1
+    # Ack the HBA-level IS (write-1-to-clear).
+    _mmio_w32(ahci.abar + HBA_IS, is_reg)
+
+
+def ahci_irq_count() -> uint64:
+    return ahci.irq_count
