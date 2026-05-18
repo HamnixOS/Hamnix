@@ -224,6 +224,81 @@ def build_archive() -> bytes:
                 blob += cpio_entry(name, data)
                 print(f"  embedded {name} ({len(data)} bytes)")
 
+    # U41: CPython 3.11 stdlib embedding. CPython needs to find
+    # `encodings/__init__.py` + `encodings/utf_8.py` + a handful of
+    # other stdlib modules on its sys.path at init_fs_encoding time,
+    # otherwise it aborts with:
+    #
+    #   Fatal Python error: init_fs_encoding: failed to get the Python
+    #   codec of the filesystem encoding
+    #
+    # When HAMNIX_EMBED_PYLIB=<path-to-Lib-dir> is set, walk the
+    # directory and embed every .py file at /usr/lib/python3.11/<rel>.
+    # The CPython binary then finds them when PYTHONHOME=/usr/lib/
+    # python3.11 (or PYTHONPATH=/usr/lib/python3.11) is in envp.
+    #
+    # SKIPs:
+    #   - __pycache__/ — compiled-bytecode caches are platform-specific
+    #     and just inflate the cpio without buying anything: CPython
+    #     happily compiles .py -> .pyc in memory at import time.
+    #   - lib-dynload/ — compiled C extensions (.so) need a dynamic
+    #     loader we don't have on the U-track.
+    #   - non-.py files (LICENSE, NEWS, *.png test fixtures, etc.)
+    #
+    # SIZE: the upstream Lib/ tree is ~32 MiB of .py source across
+    # ~1800 files. The cpio overhead is ~140 bytes per entry. The
+    # generated fs/initramfs_blob.S grows from ~18 MiB to ~50-60 MiB
+    # — well over GitHub's 100 MiB push cap on the assembly file,
+    # so HAMNIX_EMBED_PYLIB defaults OFF. Only the U41 test script
+    # sets it.
+    #
+    # KERNEL CAP: fs/cpio.ad caps the in-kernel file table at
+    # NR_FILES=192 entries. The full Lib/ tree plus the existing
+    # baseline (~150 entries) overflows that cap; the kernel will
+    # print "cpio: file table full" and silently drop the tail.
+    # If U41 fails for that reason, the fix is a one-line bump of
+    # NR_FILES in fs/cpio.ad (forbidden in this commit because fs/
+    # is owned by other agents this round).
+    pylib_path = os.environ.get("HAMNIX_EMBED_PYLIB", "")
+    if pylib_path:
+        lib_root = Path(pylib_path)
+        if not lib_root.is_absolute():
+            lib_root = here / lib_root
+        if not lib_root.is_dir():
+            raise SystemExit(
+                f"HAMNIX_EMBED_PYLIB={pylib_path}: not a directory")
+        py_target_prefix = "/usr/lib/python3.11"
+        # Walk every .py file under lib_root, mirroring the relative
+        # path under /usr/lib/python3.11/. Skip __pycache__ + lib-
+        # dynload. The minimum set CPython's -c "print('x')" actually
+        # touches at init_fs_encoding time is:
+        #   encodings/__init__.py, encodings/aliases.py,
+        #   encodings/utf_8.py, encodings/latin_1.py,
+        #   encodings/ascii.py, importlib/* (frozen but still
+        #   exposed), os.py, io.py, codecs.py, abc.py, posixpath.py,
+        #   genericpath.py, _collections_abc.py, _weakrefset.py,
+        #   types.py, enum.py, stat.py, _sitebuiltins.py, site.py
+        # We embed the whole tree (minus the SKIPs) because hand-
+        # curating the include list trades a tiny cpio shave for the
+        # next time a CPython module pulls in a new dep.
+        n_embedded = 0
+        n_bytes = 0
+        for src in sorted(lib_root.rglob("*.py")):
+            rel = src.relative_to(lib_root)
+            parts = rel.parts
+            if any(p == "__pycache__" for p in parts):
+                continue
+            if any(p == "lib-dynload" for p in parts):
+                continue
+            data = src.read_bytes()
+            name = py_target_prefix + "/" + "/".join(parts)
+            blob += cpio_entry(name, data)
+            n_embedded += 1
+            n_bytes += len(data)
+        print(f"  embedded {n_embedded} Python stdlib files "
+              f"({n_bytes} bytes) under {py_target_prefix}/ "
+              f"from {lib_root}")
+
     for name, data in FILES:
         blob += cpio_entry(name, data)
     blob += cpio_trailer()

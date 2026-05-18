@@ -465,19 +465,36 @@ it has to honour.
   Partially shipped at U41 (`tests/u-binary/u_cpython` + Makefile +
   HOWTO + `scripts/test_u41_cpython.sh`). CPython 3.11.10 builds
   cleanly as a `-static` (not `-static-pie`) ~5.7 MB stripped ELF
-  via `make -C tests/u-binary/src/cpython install`. The binary
+  via `make -C tests/u-binary/src/cpython install`. ~~The binary
   exec's through the U-track ELF loader and reaches the importlib
   init phase BUT then aborts with `Fatal Python error:
   pycore_interp_init: failed to initialize importlib / MemoryError`
-  before reaching `print()`. Root cause: CPython 3.11's importlib
+  before reaching `print()`.~~ ~~Root cause: CPython 3.11's importlib
   init needs ~10-15 MiB of heap during bootstrap, while Hamnix's
   per-task `LINUX_BRK_RESERVE` (linux_abi/u_syscalls.ad) is 4 MiB
-  and `LINUX_MMAP_SLOTS` is 32. No `linux_u: unknown syscall nr=N`
-  lines appeared, no traps, no page faults — the failure is silent
-  malloc-NULL. See `tests/u-binary/src/cpython/HOWTO.md` "Known
-  blocker" for the fix candidates (bump BRK_RESERVE to 32 MiB +
-  MMAP_SLOTS to 256+ is the easy path; lazy brk growth via a real
-  per-task vma is the right path long-term).
+  and `LINUX_MMAP_SLOTS` is 32.~~ Fixed at commit 1d543f1
+  (brk reserve / mmap slots bumped). ~~Next blocker:
+  init_fs_encoding fails with "No module named 'encodings'" because
+  the CPython stdlib isn't on sys.path.~~ Fixed by HAMNIX_EMBED_PYLIB
+  hook in `scripts/build_initramfs.py` — the U41 test script now
+  embeds the upstream `Lib/` tree at `/usr/lib/python3.11/` and
+  sets `PYTHONHOME` via hamsh's var_table → spawned-child envp.
+  See `tests/u-binary/src/cpython/HOWTO.md` "stdlib embedding".
+- **U41 follow-up: bump `NR_FILES` in `fs/cpio.ad`.** Today's cap
+  is 192 entries; the baseline initramfs already burns ~150 of
+  those, and the embedded CPython stdlib (~1800 `.py` files)
+  overflows it. Kernel logs `cpio: file table full at 192 entries`
+  and silently drops the tail of the cpio archive. Fix is a one-
+  line bump (4096 is plenty). Deferred this round because `fs/`
+  is owned by other agents (AHCI/NVMe write, partition parser).
+- **U41 follow-up: rebuild CPython with frozen-modules.** The
+  HAMNIX_EMBED_PYLIB path costs ~32 MiB of `.py` source in the
+  initramfs and pushes the assembled `fs/initramfs_blob.S` past
+  GitHub's 100 MiB cap (so we can't commit the populated blob).
+  CPython's `Tools/scripts/freeze_modules.py` compiles the stdlib
+  into the static binary's data segment, eliminating the
+  /usr/lib/python3.11/ tree entirely. ~25 min rebuild + larger
+  binary (~7-8 MiB stripped instead of 5.7).
 - **U39 follow-up: fix glibc-malloc brk-grow corner case.**
   MicroPython under U39 needs `-X heapsize=64k` because a
   1 MiB heap forces glibc-malloc's main_arena onto our

@@ -52,9 +52,28 @@ GCC      := $(shell command -v gcc 2>/dev/null)
 MAKE_BIN := $(shell command -v make 2>/dev/null)
 HAS_LIBC_A := $(shell test -f /usr/lib/x86_64-linux-gnu/libc.a && echo yes || echo no)
 
-.PHONY: all install clean
+.PHONY: all install clean stdlib-path
 
 all: hello
+
+# Prints (to stdout) the absolute path to the extracted upstream
+# CPython source's `Lib/` directory. The U41 test script captures
+# this with `$(make stdlib-path)` and feeds it to
+# `HAMNIX_EMBED_PYLIB=<path>` so scripts/build_initramfs.py can
+# embed the .py tree at /usr/lib/python3.11/.
+#
+# Output is empty (with a non-zero exit) when the source hasn't been
+# extracted yet — `make install` should be run first. We don't auto-
+# build here because the caller may already have a stale tarball and
+# we don't want make-side prints to leak into the consumed path.
+stdlib-path:
+	@if [ -d "$(PY_SRCDIR)/Lib" ]; then \
+	    cd $(PY_SRCDIR) && pwd | tr -d '\n' && echo "/Lib"; \
+	else \
+	    echo "[cpython] stdlib-path: $(PY_SRCDIR)/Lib not found" >&2; \
+	    echo "[cpython]   run 'make -C tests/u-binary/src/cpython install' first" >&2; \
+	    exit 1; \
+	fi
 
 # `hello` is the fixture-target name (matches u_hello / u_python /
 # u_busybox_musl conventions). The underlying artifact is the CPython
