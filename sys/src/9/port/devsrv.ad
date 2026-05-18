@@ -1,0 +1,267 @@
+# sys/src/9/port/devsrv.ad
+#
+# Plan 9 "srv" device — V3 minimum scope. Maintains a kernel-internal
+# table mapping a short name (e.g. "hamwd") to the srvfd a userspace
+# server posted. The classic Plan 9 9front file at
+# /sys/src/9/port/devsrv.c is the prior art; this file is a tiny
+# subset: just enough to populate the root-namespace surface so
+# `ls /srv` works, and so future userspace post/open syscalls (V4)
+# have a clean place to land.
+#
+# V3 scope:
+#
+#   * Internal API only (called from kernel-side wiring, not via
+#     syscalls): devsrv_post / devsrv_open / devsrv_list /
+#     devsrv_path_match.
+#   * fs/vfs.ad routes any `/srv/<name>` open through
+#     devsrv_path_match + devsrv_open_path so `cat /srv/<name>` works
+#     once V4 lets userspace post srvfds. Until then the table starts
+#     empty and `ls /srv` returns no entries.
+#   * `/srv` (the directory itself, no trailing component) is handled
+#     by fs/vfs.ad's dir-open path which calls devsrv_list to render
+#     "name1\nname2\n..." into a kmalloc'd FD_DIR_MARK buffer.
+#
+# V4 scope (deferred):
+#
+#   * sys_srv_post(name, srvfd) syscall.
+#   * sys_srv_open(name) syscall (returns srvfd; userspace can then
+#     pass it to sys_mount).
+#   * Refcounting of posted srvfds so a clunk on the last reference
+#     closes the underlying transport.
+#
+# Adder quirks honoured:
+#
+#   * Top-level Array storage only — the name table and per-entry
+#     name buffers all live at module scope.
+#   * No string concat: every helper hand-writes byte-by-byte copies.
+
+from kernel.printk.printk import printk0, printk1
+
+# Table cap. V3 ships 16 entries — enough for hamwd + a handful of
+# named-pipe-style mounts. Raise (or move to slab) when V4 lands real
+# userspace post/open.
+SRV_CAP: uint64 = 16
+
+# Each name is a NUL-terminated string in a fixed 64-byte slot. Plan 9
+# srv names are conventionally short (e.g. "hamwd", "factotum",
+# "kbdmux") so 64 is comfortable.
+SRV_NAME_MAX: uint64 = 64
+
+
+class SrvEntry:
+    in_use: int32                       # 0 = free, 1 = posted
+    srvfd:  int32                       # the posted descriptor
+    name:   Array[64, uint8]            # NUL-terminated
+
+
+# Top-level pool dodges Adder's nested-frame Array bug.
+srv_table: Array[16, SrvEntry]
+
+# Lazy-init guard. The table is zeroed by BSS so `in_use == 0` on every
+# slot at boot — but a future warm-reset path may want to wipe it
+# explicitly. The flag is also a cheap probe for "have we ever
+# touched this table" from devmounts.ad-style introspection.
+srv_inited: int32 = 0
+
+
+def devsrv_init():
+    # Idempotent. Zero every slot's in_use byte; clears stale state in
+    # case anyone re-runs us. Called from chan.ad's pgrp_init (which
+    # itself is called by init/main.ad's chan_init), so the table is
+    # live before the first user task starts.
+    i: uint64 = 0
+    while i < SRV_CAP:
+        srv_table[i].in_use = 0
+        srv_table[i].srvfd  = -1
+        srv_table[i].name[0] = 0
+        i = i + 1
+    srv_inited = 1
+
+
+def _srv_strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _srv_streq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    # NUL-terminated equality. 1 on match, 0 otherwise.
+    i: uint64 = 0
+    while True:
+        ca: uint8 = a[i]
+        cb: uint8 = b[i]
+        if ca != cb:
+            return 0
+        if ca == 0:
+            return 1
+        i = i + 1
+
+
+def _srv_find(name: Ptr[uint8]) -> int32:
+    # Linear scan; returns slot index or -1.
+    i: uint64 = 0
+    while i < SRV_CAP:
+        if srv_table[i].in_use != 0:
+            if _srv_streq(&srv_table[i].name[0], name) != 0:
+                return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _srv_find_free() -> int32:
+    i: uint64 = 0
+    while i < SRV_CAP:
+        if srv_table[i].in_use == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def devsrv_post(name: Ptr[char], srvfd: int32) -> int32:
+    # Insert (name -> srvfd) into the table. Returns 0 on success, -1
+    # on dup-name or table-full. Caller is kernel-side; for V3 nothing
+    # calls this yet (hamwd-as-9P-server is V4 work). The function
+    # ships now because the table layout needs at least one writer to
+    # validate the shape — devsrv_list at least exercises iteration.
+    if srv_inited == 0:
+        devsrv_init()
+    np: Ptr[uint8] = cast[Ptr[uint8]](name)
+    nlen: uint64 = _srv_strlen(np)
+    if nlen == 0 or nlen + 1 > SRV_NAME_MAX:
+        return -1
+    if _srv_find(np) >= 0:
+        return -1                                    # dup name
+    slot: int32 = _srv_find_free()
+    if slot < 0:
+        return -1                                    # table full
+    su: uint64 = cast[uint64](slot)
+    i: uint64 = 0
+    while i < nlen:
+        srv_table[su].name[i] = np[i]
+        i = i + 1
+    srv_table[su].name[nlen] = 0
+    srv_table[su].srvfd  = srvfd
+    srv_table[su].in_use = 1
+    return 0
+
+
+def devsrv_open(name: Ptr[char]) -> int32:
+    # Look up name and return its posted srvfd. -1 on miss. V3
+    # uses this only for `/srv/<name>` dispatch from fs/vfs.ad; V4
+    # promotes it to a sys_srv_open syscall.
+    if srv_inited == 0:
+        devsrv_init()
+    np: Ptr[uint8] = cast[Ptr[uint8]](name)
+    slot: int32 = _srv_find(np)
+    if slot < 0:
+        return -1
+    return srv_table[cast[uint64](slot)].srvfd
+
+
+def devsrv_unpost(name: Ptr[char]) -> int32:
+    # Drop a name from the table. Used by V4 cleanup; included now so
+    # tests / a future warm-reset path have a knob. Returns 0 on
+    # success, -1 if the name wasn't present.
+    if srv_inited == 0:
+        devsrv_init()
+    np: Ptr[uint8] = cast[Ptr[uint8]](name)
+    slot: int32 = _srv_find(np)
+    if slot < 0:
+        return -1
+    su: uint64 = cast[uint64](slot)
+    srv_table[su].in_use = 0
+    srv_table[su].srvfd  = -1
+    srv_table[su].name[0] = 0
+    return 0
+
+
+def devsrv_list(out_buf: Ptr[uint8], out_max: uint64) -> int64:
+    # Pack every posted name into out_buf as "name1\nname2\n..." lines.
+    # Returns bytes written; truncates at out_max if the buffer is too
+    # small (last partial entry is dropped, not split). Empty table ->
+    # 0 bytes. Used by fs/vfs.ad's "ls /srv" / `cat /srv` path.
+    if srv_inited == 0:
+        devsrv_init()
+    pos: uint64 = 0
+    i: uint64 = 0
+    while i < SRV_CAP:
+        if srv_table[i].in_use != 0:
+            nlen: uint64 = _srv_strlen(&srv_table[i].name[0])
+            # Need nlen + 1 bytes (the name + '\n').
+            if pos + nlen + 1 > out_max:
+                return cast[int64](pos)
+            k: uint64 = 0
+            while k < nlen:
+                out_buf[pos + k] = srv_table[i].name[k]
+                k = k + 1
+            out_buf[pos + nlen] = 10                # '\n'
+            pos = pos + nlen + 1
+        i = i + 1
+    return cast[int64](pos)
+
+
+def devsrv_path_match(path: Ptr[char]) -> int32:
+    # 1 iff `path` looks like "/srv/<non-empty>" with no further '/'
+    # in the leaf. fs/vfs.ad uses this to fork into devsrv dispatch
+    # vs. its other routes (initramfs, ext4, ...). The "no further /"
+    # gate is important: `/srv/foo/bar` is not a srv-table lookup —
+    # whether it means "walk through the mounted server" or "ENOENT"
+    # is a V4 question.
+    if path[0] != 47:                               # '/'
+        return 0
+    if path[1] != 115 or path[2] != 114 \
+            or path[3] != 118 or path[4] != 47:     # "srv/"
+        return 0
+    if path[5] == 0:
+        return 0                                    # bare "/srv/"
+    i: uint64 = 5
+    while path[i] != 0:
+        if path[i] == 47:                           # '/'
+            return 0                                # nested path
+        i = i + 1
+    return 1
+
+
+def devsrv_is_srv_dir(path: Ptr[char]) -> int32:
+    # 1 iff `path` is exactly "/srv" (no trailing slash, no leaf).
+    # fs/vfs.ad uses this for the directory-listing path.
+    if path[0] != 47 or path[1] != 115 or path[2] != 114 \
+            or path[3] != 118:
+        return 0
+    if path[4] != 0:
+        return 0
+    return 1
+
+
+def devsrv_extract_name(path: Ptr[char], out: Ptr[uint8],
+                        out_max: uint64) -> int32:
+    # Copy the leaf of "/srv/<name>" into out (NUL-terminated). Returns
+    # 0 on success, -1 if the path doesn't match the expected shape
+    # or the leaf wouldn't fit. Callers are expected to have already
+    # passed devsrv_path_match.
+    if devsrv_path_match(path) == 0:
+        return -1
+    i: uint64 = 5                                   # skip "/srv/"
+    j: uint64 = 0
+    while path[i] != 0:
+        if j + 1 >= out_max:
+            return -1
+        out[j] = cast[uint8](path[i] & 0xFF)
+        i = i + 1
+        j = j + 1
+    out[j] = 0
+    return 0
+
+
+def devsrv_count() -> uint64:
+    # Number of live entries. Used by tests / introspection.
+    if srv_inited == 0:
+        return 0
+    n: uint64 = 0
+    i: uint64 = 0
+    while i < SRV_CAP:
+        if srv_table[i].in_use != 0:
+            n = n + 1
+        i = i + 1
+    return n
