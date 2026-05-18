@@ -60,8 +60,11 @@ tracks share the same compiler and language:
   syscall surface (~25 calls) and the migration table for every
   existing `SYS_*`.
 - [`docs/vtnext-v2.md`](docs/vtnext-v2.md) — graphical wire protocol
-  spec (apps → `hamwd` → renderer). The path to a windowed desktop
-  without DRM/Mesa/Vulkan.
+  spec (apps → `hamwd` → renderer). Superseded by `docs/rio.md`;
+  kept for historical reference.
+- [`docs/rio.md`](docs/rio.md) — Plan 9-style file-based window
+  system spec. Per-window namespaces; each window has its own
+  `/dev/mouse`, `/dev/cons`, `/dev/draw`. No graphical C API.
 - [`TODO.md`](TODO.md) — open work items, organised by layer.
 - [`docs/BOOT.md`](docs/BOOT.md) — building + booting the ISO,
   real-hardware notes.
