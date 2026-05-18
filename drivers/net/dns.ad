@@ -10,8 +10,16 @@
 #   - One outstanding A-record query per slot; round-robin across 4
 #     in-flight slots so back-to-back lookups don't trip over each
 #     other. Plenty for a single-threaded init smoke test.
-#   - No DNS cache. apt will have its own resolver-side cache later;
-#     we don't try to short-circuit duplicate queries here.
+#   - 16-entry TTL-bounded in-memory result cache (added post-M16.99).
+#     `dns_lookup` consults the cache first; only on miss / expiry do
+#     we hit the wire. `dns_rx` stores both positive answers (TTL
+#     clamped to [60, 86400] seconds) and negative answers (RCODE=3
+#     NXDOMAIN, cached for 60 seconds — same shape as nss-resolve's
+#     negative cache). Saves a UDP/53 round-trip per duplicate query;
+#     critical for `apt update` which fetches Release + Packages +
+#     InRelease from the same handful of mirror hostnames over and
+#     over. Cache eviction is "earliest expiry wins" when all 16
+#     slots are live — trivial linear walk + min.
 #   - No AAAA / CNAME / NS / MX. Only TYPE=A (1), CLASS=IN (1).
 #   - No EDNS0, no DNSSEC, no compression on the query side (we always
 #     emit the full QNAME). Pointers in the response *are* honored
@@ -89,6 +97,42 @@ dns_slot_qid:     Array[4, uint16]
 # Per-slot result: 4 bytes of IPv4 address. Stored as a flat 16-byte
 # array indexed slot*4 + byte to dodge the 2-D codegen quirk.
 dns_slot_ip:      Array[16, uint8]
+# Per-slot hostname stash. We keep a copy of the querying caller's
+# hostname so dns_rx can store the answer in the result cache keyed
+# by name (the wire response repeats the QNAME but uses RFC 1035 §4.1.4
+# compression pointers, so reading it back out is more painful than
+# just remembering it). 64 bytes/slot * 4 slots, flat.
+DNS_HOSTNAME_MAX: uint64 = 64
+dns_slot_host:    Array[256, uint8]    # 4 * DNS_HOSTNAME_MAX
+
+# --- TTL-bounded result cache (added post-M16.99) -----------------
+#
+# 16 entries keyed by lowercase-NUL-terminated hostname. On a fresh
+# `dns_lookup`, we scan the cache for a non-expired match before
+# building/sending a query — saving a UDP round-trip on every cache
+# hit. `dns_rx` writes both positive answers (TTL from the wire,
+# clamped to [60 s, 86400 s]) and negative answers (RCODE=3 NXDOMAIN
+# → TTL=60 s). Eviction picks the entry with the earliest
+# expires_jiffies (a stale entry is a free slot in disguise).
+#
+# Why fixed-size, why flat? We've been bitten by 2-D Array-of-Array
+# codegen — see memory/feedback_compiler_quirks.md — so every "logical
+# 2-D" structure here is a flat 1-D array indexed `slot * stride + i`.
+DNS_CACHE_ENTRIES:  uint64 = 16
+dns_cache_valid:    Array[16, int32]               # 1 = slot in use, 0 = free
+dns_cache_negative: Array[16, int32]               # 1 = NXDOMAIN entry, 0 = positive
+dns_cache_expires:  Array[16, uint64]              # get_jiffies() deadline
+dns_cache_host:     Array[1024, uint8]             # 16 * DNS_HOSTNAME_MAX
+dns_cache_ip:       Array[64, uint8]               # 16 * 4
+
+# TTL clamps. RFC 1035 doesn't mandate either bound — these are
+# operational guard-rails. 60 s floor avoids thrashing on hostile
+# `TTL=0` answers; 86400 s (24 h) ceiling avoids honoring multi-week
+# TTLs from misconfigured upstreams.
+DNS_TTL_MIN:        uint64 = 60
+DNS_TTL_MAX:        uint64 = 86400
+DNS_TTL_NEGATIVE:   uint64 = 60                    # NXDOMAIN cache lifetime
+DNS_JIFFIES_PER_SEC: uint64 = 100                  # HZ=100 (arch/x86/kernel/time.ad)
 
 # DHCP-supplied DNS server address (cached at dns_init time, refreshed
 # on every dns_lookup call so a late DHCP ACK still wins).
@@ -149,10 +193,34 @@ def dns_init():
     dns_server_ip[3] = 0
     dns_server_set = 0
     dns_server_arp_ok = 0
+    # Zero the per-slot hostname stash so a stale dns_rx delivery
+    # can't observe a half-populated name from a previous boot
+    # (relevant under qemu -kernel where .bss isn't always zeroed
+    # before our hands hit it).
+    h: uint64 = 0
+    while h < 256:
+        dns_slot_host[h] = 0
+        h = h + 1
+    # Zero the result cache. valid=0 means "this slot is free"; the
+    # other fields are don't-care until valid flips to 1.
+    c: uint64 = 0
+    while c < DNS_CACHE_ENTRIES:
+        dns_cache_valid[c] = 0
+        dns_cache_negative[c] = 0
+        dns_cache_expires[c] = 0
+        c = c + 1
+    cc: uint64 = 0
+    while cc < 1024:
+        dns_cache_host[cc] = 0
+        cc = cc + 1
+    ci: uint64 = 0
+    while ci < 64:
+        dns_cache_ip[ci] = 0
+        ci = ci + 1
     # Try once at init; dns_lookup will retry the dhcp_get_dns call
     # if it returns -1 here.
     dns_refresh_server()
-    printk0("dns: client initialized (4 slot pool, UDP/53)\n")
+    printk0("dns: client initialized (4 slot pool, 16-entry cache, UDP/53)\n")
 
 
 def _dns_alloc_slot() -> int32:
@@ -170,6 +238,125 @@ def _dns_alloc_slot() -> int32:
     # extra global counter; with 4 slots and 1 in-flight at a time
     # in the smoke test this branch isn't hit).
     return 0
+
+
+def _dns_host_eq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    # Byte-exact NUL-terminated string compare, capped at
+    # DNS_HOSTNAME_MAX so a missing NUL on either side can't walk us
+    # off the end. Returns 1 on match, 0 on mismatch. Case-sensitive —
+    # DNS names are technically case-insensitive (RFC 1035 §2.3.3) but
+    # apt / our own callers always emit lowercase, so we don't bother
+    # folding here.
+    i: uint64 = 0
+    while i < DNS_HOSTNAME_MAX:
+        ca: uint8 = a[i]
+        cb: uint8 = b[i]
+        if ca != cb:
+            return 0
+        if ca == 0:
+            return 1
+        i = i + 1
+    # Ran the full window without a terminator — treat as no-match
+    # rather than risk a false positive on a partially-stashed name.
+    return 0
+
+
+def _dns_host_copy(dst: Ptr[uint8], src: Ptr[uint8]):
+    # Copy a NUL-terminated string from src into dst, capped at
+    # DNS_HOSTNAME_MAX-1 so the destination always ends in NUL.
+    i: uint64 = 0
+    while i < DNS_HOSTNAME_MAX - 1:
+        c: uint8 = src[i]
+        dst[i] = c
+        if c == 0:
+            return
+        i = i + 1
+    dst[DNS_HOSTNAME_MAX - 1] = 0
+
+
+def _dns_cache_remaining(idx: uint64) -> uint64:
+    # Compute remaining TTL in seconds for the entry at `idx`. Caller
+    # guarantees the entry is valid + non-expired. Used purely for the
+    # cache-hit log line.
+    now: uint64 = get_jiffies()
+    expires: uint64 = dns_cache_expires[idx]
+    if expires <= now:
+        return 0
+    return (expires - now) / DNS_JIFFIES_PER_SEC
+
+
+def _dns_cache_lookup(hostname: Ptr[uint8]) -> int32:
+    # Scan the cache for a non-expired entry whose hostname matches.
+    # Returns the cache slot index 0..15 on hit, -1 on miss. Expired
+    # entries are not returned (eviction picks them up lazily).
+    now: uint64 = get_jiffies()
+    i: uint64 = 0
+    while i < DNS_CACHE_ENTRIES:
+        if dns_cache_valid[i] != 0:
+            if dns_cache_expires[i] > now:
+                host_ptr: Ptr[uint8] = cast[Ptr[uint8]](&dns_cache_host[i * DNS_HOSTNAME_MAX])
+                if _dns_host_eq(host_ptr, hostname) != 0:
+                    return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _dns_cache_pick_slot() -> uint64:
+    # Find a slot to (re)use:
+    #   1. Prefer the first slot with valid=0.
+    #   2. Else prefer the first slot whose entry has already expired.
+    #   3. Else evict the entry with the earliest expires_jiffies.
+    # The earliest-expiry tiebreak is the obvious LRU-ish choice for
+    # TTL'd entries: the one with the least time-to-live left is the
+    # closest to being useless anyway.
+    i: uint64 = 0
+    while i < DNS_CACHE_ENTRIES:
+        if dns_cache_valid[i] == 0:
+            return i
+        i = i + 1
+    now: uint64 = get_jiffies()
+    j: uint64 = 0
+    while j < DNS_CACHE_ENTRIES:
+        if dns_cache_expires[j] <= now:
+            return j
+        j = j + 1
+    # All live, all unexpired — evict the entry with the smallest
+    # expires_jiffies (= shortest remaining lifetime).
+    best: uint64 = 0
+    best_exp: uint64 = dns_cache_expires[0]
+    k: uint64 = 1
+    while k < DNS_CACHE_ENTRIES:
+        if dns_cache_expires[k] < best_exp:
+            best_exp = dns_cache_expires[k]
+            best = k
+        k = k + 1
+    return best
+
+
+def _dns_cache_store(hostname: Ptr[uint8], ip0: uint8, ip1: uint8,
+                     ip2: uint8, ip3: uint8, ttl_seconds: uint64,
+                     negative: int32):
+    # Insert (or replace) a cache entry. TTL is in seconds; we convert
+    # to jiffies (HZ=100) on store. Negative=1 marks an NXDOMAIN
+    # entry; ip bytes are stored as 0.0.0.0 in that case but the
+    # `negative` flag is what dns_lookup actually reads.
+    idx: uint64 = _dns_cache_pick_slot()
+    host_dst: Ptr[uint8] = cast[Ptr[uint8]](&dns_cache_host[idx * DNS_HOSTNAME_MAX])
+    _dns_host_copy(host_dst, hostname)
+    dns_cache_ip[idx * 4 + 0] = ip0
+    dns_cache_ip[idx * 4 + 1] = ip1
+    dns_cache_ip[idx * 4 + 2] = ip2
+    dns_cache_ip[idx * 4 + 3] = ip3
+    dns_cache_expires[idx] = get_jiffies() + ttl_seconds * DNS_JIFFIES_PER_SEC
+    dns_cache_negative[idx] = negative
+    dns_cache_valid[idx] = 1
+    if negative != 0:
+        printk1("[dns] cache store %s NXDOMAIN", cast[uint64](hostname))
+        printk1(" (ttl=%ds)\n", ttl_seconds)
+    else:
+        printk1("[dns] cache store %s -> ", cast[uint64](hostname))
+        _dns_print_ip(ip0, ip1, ip2, ip3)
+        printk1(" (ttl=%ds)\n", ttl_seconds)
 
 
 def _dns_encode_qname(hostname: Ptr[uint8], off: uint64) -> uint64:
@@ -300,6 +487,12 @@ def dns_send_query(hostname: Ptr[uint8], slot: uint64,
         return -1
     if slot >= DNS_NUM_SLOTS:
         return -1
+    # Stash the hostname so dns_rx can store the answer in the
+    # result cache when the reply lands. We copy rather than keep a
+    # pointer because the caller's hostname buffer may be on the
+    # stack or otherwise transient.
+    stash_dst: Ptr[uint8] = cast[Ptr[uint8]](&dns_slot_host[slot * DNS_HOSTNAME_MAX])
+    _dns_host_copy(stash_dst, hostname)
     # Zero the header bytes; the rest of the buffer is filled by
     # _dns_encode_qname + the qtype/qclass append below.
     i: uint64 = 0
@@ -408,6 +601,26 @@ def dns_rx(payload: Ptr[uint8], length: uint64,
     if (flags_hi & 0x80) == 0:
         printk0("[dns] not a response (QR=0); drop\n")
         return
+    # RCODE is the low 4 bits of flags_lo (byte 3). RFC 1035 §4.1.1:
+    #   0 = no error, 1 = format error, 2 = server failure,
+    #   3 = name error (NXDOMAIN), 4 = not implemented, 5 = refused.
+    # We treat RCODE=3 as a cacheable negative answer (TTL=60 s, per
+    # nss-resolve / glibc-nss convention); other non-zero RCODEs are
+    # passed through to the "no A-record" branch below without
+    # caching, so a transient SERVFAIL doesn't poison the cache.
+    flags_lo: uint8 = payload[3]
+    rcode: uint8 = flags_lo & 0x0F
+    # Recover the stashed hostname pointer for use as cache key.
+    host_ptr: Ptr[uint8] = cast[Ptr[uint8]](&dns_slot_host[slot * DNS_HOSTNAME_MAX])
+    if rcode == 3:
+        printk1("[dns] NXDOMAIN qid=%d\n", cast[uint64](qid))
+        _dns_cache_store(host_ptr, 0, 0, 0, 0, DNS_TTL_NEGATIVE, 1)
+        b: uint64 = 0
+        while b < 4:
+            dns_slot_ip[slot * 4 + b] = 0
+            b = b + 1
+        dns_slot_used[slot] = 2
+        return
     # Pull QDCOUNT / ANCOUNT. We expect QDCOUNT=1 (our question
     # echoed back) and ANCOUNT >= 1 on success.
     qd_hi: uint16 = cast[uint16](payload[4]) << 8
@@ -480,6 +693,26 @@ def dns_rx(payload: Ptr[uint8], length: uint64,
                     dns_slot_ip[slot * 4 + 2] = b2
                     dns_slot_ip[slot * 4 + 3] = b3
                     dns_slot_used[slot] = 2
+                    # TTL is a 32-bit big-endian unsigned at
+                    # name_end+4 .. name_end+7. Clamp to
+                    # [DNS_TTL_MIN, DNS_TTL_MAX] before stashing —
+                    # the floor stops cache thrashing on TTL=0
+                    # answers (some CDNs serve them as a courtesy);
+                    # the ceiling stops us from honoring multi-week
+                    # TTLs from misconfigured upstreams that would
+                    # outlive our actual IP-to-host mapping anyway.
+                    ttl_b0: uint64 = cast[uint64](payload[name_end + 4])
+                    ttl_b1: uint64 = cast[uint64](payload[name_end + 5])
+                    ttl_b2: uint64 = cast[uint64](payload[name_end + 6])
+                    ttl_b3: uint64 = cast[uint64](payload[name_end + 7])
+                    ttl_raw: uint64 = (ttl_b0 << 24) | (ttl_b1 << 16) | (ttl_b2 << 8) | ttl_b3
+                    ttl_eff: uint64 = ttl_raw
+                    if ttl_eff < DNS_TTL_MIN:
+                        ttl_eff = DNS_TTL_MIN
+                    if ttl_eff > DNS_TTL_MAX:
+                        ttl_eff = DNS_TTL_MAX
+                    _dns_cache_store(host_ptr, b0, b1, b2, b3,
+                                     ttl_eff, 0)
                     printk1("[dns] resolved qid=%d -> ",
                             cast[uint64](qid))
                     _dns_print_ip(b0, b1, b2, b3)
@@ -512,6 +745,33 @@ def dns_lookup(hostname: Ptr[uint8], out_ip: Ptr[uint8],
     # timeout_jiffies elapses. Returns:
     #   0 on success — out_ip[0..3] is populated.
     #  -1 on timeout, missing DNS server, NXDOMAIN, or send failure.
+    # Cache lookup first — a hit skips the entire UDP/53 round-trip,
+    # the ARP-prime, even the DHCP-DNS-server refresh. This is the
+    # whole point of the cache: `apt update` resolves
+    # `deb.debian.org` once and reuses the answer for every subsequent
+    # Release / Packages / InRelease fetch in the same boot. The
+    # entry's `expires_jiffies` is already absolute (set at store
+    # time = now + ttl*HZ), so a single < comparison against
+    # get_jiffies() is enough to decide freshness.
+    cache_hit: int32 = _dns_cache_lookup(hostname)
+    if cache_hit >= 0:
+        idx: uint64 = cast[uint64](cache_hit)
+        if dns_cache_negative[idx] != 0:
+            printk1("[dns] cache hit %s NXDOMAIN", cast[uint64](hostname))
+            printk1(" (ttl=%ds remaining)\n", _dns_cache_remaining(idx))
+            return -1
+        ci0: uint8 = dns_cache_ip[idx * 4 + 0]
+        ci1: uint8 = dns_cache_ip[idx * 4 + 1]
+        ci2: uint8 = dns_cache_ip[idx * 4 + 2]
+        ci3: uint8 = dns_cache_ip[idx * 4 + 3]
+        out_ip[0] = ci0
+        out_ip[1] = ci1
+        out_ip[2] = ci2
+        out_ip[3] = ci3
+        printk1("[dns] cache hit %s -> ", cast[uint64](hostname))
+        _dns_print_ip(ci0, ci1, ci2, ci3)
+        printk1(" (ttl=%ds remaining)\n", _dns_cache_remaining(idx))
+        return 0
     if dns_server_set == 0:
         if dns_refresh_server() != 0:
             printk0("[dns] no DNS server (DHCP not complete?)\n")

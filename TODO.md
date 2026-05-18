@@ -215,10 +215,29 @@ it has to honour.
   SLIRP's DNS forwarder (10.0.2.3): `[dns] resolved example.com ->
   172.66.147.243`. See `scripts/test_dns.sh`.~~
 - DNS follow-ups:
-  - Per-process result cache (TTL-aware) so `apt` doesn't re-query
+  - ~~Per-process result cache (TTL-aware) so `apt` doesn't re-query
     `deb.debian.org` for every URL in its index. The single-query
     path here clears the slot on completion; a real cache would
-    park the answer keyed by lowercased QNAME until the TTL expires.
+    park the answer keyed by lowercased QNAME until the TTL expires.~~
+    Shipped as a kernel-wide 16-entry cache (not per-process —
+    nothing else needs the isolation yet) in `drivers/net/dns.ad`:
+    `_dns_cache_lookup` short-circuits `dns_lookup` before any
+    UDP/53 round-trip; `dns_rx` stores positive answers with the
+    wire TTL clamped to [60 s, 86400 s] and negative answers
+    (RCODE=3 NXDOMAIN) at 60 s. Eviction is "earliest expiry
+    wins". See `scripts/test_net_dns_cache.sh`.
+  - PTR records (reverse lookup) — type 12. Used by `getnameinfo`
+    and reverse-DNS logging in apt-like clients. Same wire codec
+    as A, just a different QTYPE and an in-addr.arpa-formatted
+    QNAME on the request side.
+  - MX records (mail exchange) — type 15. Required before an
+    in-kernel SMTP client could route outbound mail. RDATA is
+    (preference uint16, exchange-domain-name), the latter
+    DNS-compression-pointer-encoded like every other name.
+  - SRV records (service location) — type 33. Used by Kerberos,
+    XMPP, modern HTTP/3 alt-svc lookups, and several Debian
+    repository-mirror autoselection schemes. RDATA is (priority,
+    weight, port, target-name).
   - Multiple A records — DNS answers often include 3-8 A-records
     for load-balancing. We take the first and ignore the rest; a
     fuller implementation would return all of them and let the
