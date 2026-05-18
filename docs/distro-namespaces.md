@@ -2,68 +2,87 @@
 
 **Imported-binary personalities via per-process Layer-1 namespaces.**
 
-Hamnix's native rootfs has its own filesystem identity: Plan 9-shape
-paths, minimal /etc, Adder binaries at /bin. FHS-Linux conventions
-(/lib/x86_64-linux-gnu, /etc/debian_version, /usr/share/doc/, etc.)
-do **not** live in the native rootfs. They live inside per-process
-namespaces called **distro-shape namespaces** that imported Linux
-binaries are run inside.
+In Hamnix, as in Plan 9, there is no global root. The kernel knows
+about file servers — disk filesystem drivers, kernel device drivers,
+9P servers. A namespace is a per-process binding of paths to those
+servers. Init's namespace is constructed at boot from a kernel-default
+set of mounts (hamnixfs at /, devcons at /dev/cons, etc.); every
+subsequent process inherits its parent's namespace and can modify its
+own copy with `bind` / `mount` / `unmount` / `rfork(RFNAMEG)`.
 
-A distro-shape namespace is constructed by rfork(RFNAMEG); mount of a
-distro-rootfs backing store as an overlay at /; bind of selected
-native paths (/home, /net, /srv, /dev, /proc) back into the namespace;
-exec of the target binary. From inside the namespace, the world looks
-like that distribution: /bin/bash, /lib/x86_64-linux-gnu/libc.so.6,
-/etc/passwd in Debian's format. Outside the namespace, nothing
-changed.
+A **distro-shape namespace** is a namespace assembled to look like a
+particular Linux distribution. From inside it, paths resolve to a
+Debian / Ubuntu / SUSE / etc. backing store: `/bin/bash`,
+`/lib/x86_64-linux-gnu/libc.so.6`, `/etc/passwd` in Debian's format.
+It is **not different in kind** from init's namespace — both are just
+namespaces. The convention that init mounts hamnixfs at `/` is a
+choice the boot scripts make, not a privileged property of the kernel.
+A user could legitimately boot Hamnix and immediately replace init's
+`/` mount with a remote 9P export — that's a valid configuration,
+not an escape from anything.
 
-The OS identity is therefore never compromised by what Linux binaries
-expect. There is no global /lib/x86_64-linux-gnu, no global
-/etc/debian_version, no global FHS on Hamnix. Those exist only inside
-the namespaces of processes that need them.
+Imported Linux binaries (apt, dpkg, postgresql, python3) run inside
+distro-shape namespaces because that's the namespace shape they
+expect. Native Adder binaries (hamsh, ls, the coreutils) run inside
+init's default namespace because that's the namespace shape *they*
+expect. Neither is the "real" /; they're peer namespaces.
 
 ## Layout
 
-| Path | Native namespace | Debian-shape namespace |
-|------|------------------|------------------------|
-| /bin | Adder binaries (hamsh, ls, ps, cat, ...) | Debian binaries (bash, ls, apt, dpkg, ...) |
-| /lib | minimal — Adder runtime support | /lib/x86_64-linux-gnu, glibc, ld-linux-x86-64.so.2 |
-| /usr | minimal | full Debian /usr (share, lib, bin, ...) |
-| /etc | Hamnix config (motd, passwd, group, rc, os-release) | Debian config (debian_version, apt/, dpkg/, ld.so.cache, ...) |
-| /var | minimal | Debian /var (lib/dpkg, log, cache/apt, ...) |
-| /home/$user | shared (bound from native) | shared (bound from native) |
-| /net | shared (bound from ipd) | shared (bound from ipd) |
-| /srv | shared | shared |
-| /dev | shared (bound from native) | shared (bound from native) |
-| /proc | shared — pids are global on Hamnix, same as Plan 9 | shared |
+Two example namespaces a user-facing process might inhabit. The
+"Default init namespace" column is the namespace `/etc/rc` builds at
+boot; the "Debian-shape namespace" column is what `distrorun debian-trixie`
+constructs.
+
+| Path | Default init namespace | Debian-shape namespace |
+|------|------------------------|------------------------|
+| /bin | hamnixfs — Adder binaries (hamsh, ls, ps, cat, ...) | distro backing — Debian binaries (bash, ls, apt, dpkg, ...) |
+| /lib | hamnixfs — minimal Adder runtime support | distro backing — `/lib/x86_64-linux-gnu`, glibc, ld-linux-x86-64.so.2 |
+| /usr | hamnixfs — minimal | distro backing — full Debian /usr (share, lib, bin, ...) |
+| /etc | hamnixfs — Hamnix config (motd, passwd, group, rc, os-release) | distro backing — Debian config (debian_version, apt/, dpkg/, ld.so.cache, ...) |
+| /var | hamnixfs — minimal | distro backing — Debian /var (lib/dpkg, log, cache/apt, ...) |
+| /home/$user | shared bind (same file server in both) | shared bind (same file server in both) |
+| /net | ipd 9P server (same in both) | ipd 9P server (same in both) |
+| /srv | srvfs 9P server (same in both) | srvfs 9P server (same in both) |
+| /dev | kernel cdev family (same in both) | kernel cdev family (same in both) |
+| /proc | kernel proc family — pids are global per Plan 9 (same in both) | kernel proc family (same in both) |
+
+Note that `/bin`, `/lib`, `/usr`, `/etc`, `/var` resolve to different
+file servers in each namespace; `/home`, `/net`, `/srv`, `/dev`,
+`/proc` resolve to the same servers in both (via shared `bind`).
 
 ## Boundary rules
 
-1. **Native rootfs MUST NOT contain FHS-Linux files.** No
-   /lib/x86_64-linux-gnu/, no /etc/debian_version, no /usr/share/doc/
-   in the actual on-disk Hamnix rootfs. These live exclusively inside
-   distro-shape namespace backing stores at /var/lib/distros/<name>/.
-2. **`apt` and `dpkg` run only inside their distro-shape namespace.**
-   They write to /var/lib/dpkg, /etc/apt, /usr/lib/* — all of which
-   are inside the namespace's backing store, not on the native rootfs.
-3. **Multiple distro-shape namespaces coexist.** /var/lib/distros/
-   can contain debian-bookworm/, debian-trixie/, ubuntu-noble/,
-   suse-tumbleweed/. Each is its own backing store; processes select
-   one at namespace-construction time.
-4. **Distro-shape namespaces have no init.** They host individual
-   binaries (or a bash shell for interactive use), not a parallel
-   running system. Service management stays on Hamnix's init
-   (hamsh + /etc/rc), which can launch a Linux service *into* a
-   distro-shape namespace when needed.
-5. **Cross-namespace IPC is via /srv (9P) or /net (sockets), both
-   shared by default.** A Debian-shape postgres can talk to a native
+1. **No file server is privileged.** hamnixfs is a file server.
+   /var/lib/distros/debian-trixie/ (mounted via a disk filesystem
+   driver on whatever block device holds it) is a file server. A
+   process binding either at `/` is doing the same kind of thing.
+   The kernel doesn't distinguish "the real root" from "a chroot."
+2. **Distro-shape namespaces have no init.** A namespace is a
+   workspace for running individual binaries (or an interactive
+   bash shell), not a parallel system. Hamnix's service management
+   stays in init's namespace (hamsh + /etc/rc), which can launch a
+   Linux service *into* a distro-shape namespace when needed.
+3. **`apt` and `dpkg` mount their package state in their own
+   namespace.** They write to /var/lib/dpkg, /etc/apt, /usr/lib/* —
+   all of which, in their namespace, resolve to the distro backing
+   store. Init's namespace is untouched not because it's protected
+   but because nothing in the apt namespace binds anything to it.
+4. **Multiple distro-shape namespaces coexist trivially.**
+   /var/lib/distros/debian-bookworm/, debian-trixie/, ubuntu-noble/,
+   suse-tumbleweed/ each back a different namespace shape; processes
+   pick which one to inherit at namespace-construction time.
+5. **Cross-namespace IPC is via shared file servers.** /srv (9P) and
+   /net (ipd's sockets) are bound by convention in every namespace
+   from the same servers. A Debian-shape postgres talks to a native
    Adder service through /srv/postgres or /net/tcp the same way two
    native services would.
 6. **Distro-shape namespaces are NOT a security boundary.** They
-   isolate filesystem layout, not capability. A process inside a
-   distro-shape namespace is exactly as privileged as it would be in
-   the native namespace. For privilege isolation, layer additional
-   namespace restrictions on top.
+   change which file servers serve which paths, not what a process
+   is allowed to do. A process inside a Debian-shape namespace is
+   exactly as privileged as it would be in init's namespace. For
+   privilege isolation, layer additional namespace restrictions on
+   top (e.g., `bind -c` on /dev to drop access to specific cdevs).
 
 ## Backing stores
 
@@ -71,9 +90,10 @@ Two implementations, in order of expected build:
 
 1. **Disk-backed (debootstrap path).** /var/lib/distros/debian-trixie/
    is a real Debian rootfs extracted via `debootstrap` (run once on a
-   host Linux box, copied onto a Hamnix-mounted disk). Entered with
-   `mount /var/lib/distros/debian-trixie /` after rfork RFNAMEG.
-   Heavy but works immediately; what schroot does.
+   host Linux box, copied onto a Hamnix-mounted disk). The disk
+   filesystem driver — ext4, fat — is the file server. Entered with
+   `mount` at the namespace's `/` after `rfork(RFNAMEG)`. Heavy but
+   works immediately.
 2. **`debfs` 9P server (deferred).** A Layer 3 service that
    synthesizes Debian's FHS layout on demand from a package store
    (.deb archives or pre-extracted contents in object-storage form).
@@ -100,15 +120,21 @@ distrorun(distro, argv):
     backing = "/var/lib/distros/" + distro
     if not exists(backing):
         error("unknown distro: " + distro)
-    rfork(RFNAMEG)
-    mount(backing, "/")
-    bind("/home", "/home")
-    bind("/net",  "/net")
-    bind("/srv",  "/srv")
-    bind("/dev",  "/dev")
-    bind("/proc", "/proc")
+    rfork(RFNAMEG)                          # private namespace copy
+    mount(backing, "/", MREPL, "")          # rebind / to the distro server
+    bind("/home", "/home", MREPL)           # keep the shared servers
+    bind("/net",  "/net",  MREPL)
+    bind("/srv",  "/srv",  MREPL)
+    bind("/dev",  "/dev",  MREPL)
+    bind("/proc", "/proc", MREPL)
     exec(argv[0], argv)
 ```
+
+The five `bind` calls are what re-expose the shared file servers
+inside the new namespace. Without them, `/dev/cons` (the console),
+`/net/tcp` (sockets), and `/home/david` (the user's files) would
+all resolve to whatever the distro backing happens to ship for
+those paths — typically nothing useful.
 
 ## Phase placement
 
@@ -119,15 +145,18 @@ for server workloads.
 
 ## Why this shape
 
-- **Hamnix stays Hamnix.** The native rootfs is a pure Hamnix system,
-  not a Debian-Hamnix hybrid. Linux compatibility is a feature
-  imported binaries opt into via namespace, not a property of the OS.
-- **`apt install` is safe.** Package managers operate on a namespace's
-  backing store, never on Hamnix's native /. Removing a distro means
-  `rm -rf /var/lib/distros/<name>`.
-- **Multiple distros coexist trivially.** The same OS image can host
-  Debian-bookworm and Ubuntu-noble concurrently, with no overlap
-  between their /usr trees.
+- **There's no "Hamnix vs. Debian" rivalry at the kernel level.**
+  hamnixfs is one file server. A Debian rootfs on disk is another.
+  Both are equally "real" to the kernel. The OS isn't a Hamnix-Debian
+  hybrid; it's a kernel that lets each process pick a namespace shape.
+- **`apt install` is naturally scoped.** Package managers do their
+  filesystem mutations on whatever file server backs their namespace's
+  /. That happens to be the distro backing store. Removing a distro
+  is `rm -rf /var/lib/distros/<name>/` from a namespace that has the
+  disk file server bound there.
+- **Multiple distros coexist trivially.** Same Hamnix image can host
+  Debian-bookworm and Ubuntu-noble concurrently; their `/usr` trees
+  never overlap because they're served by different file servers.
 - **No new kernel mechanism required.** This is a *convention* on top
   of what Phase C already lands. No new syscalls, no new kernel
   subsystem — just an entry-point binary and a directory naming
@@ -135,21 +164,43 @@ for server workloads.
 
 ## What this does NOT include
 
-- **No distro-shape namespace for native Hamnix binaries.** Adder
-  programs run in the native namespace. Putting them in a Debian-shape
-  namespace would just hide them behind FHS noise.
+- **No distro-shape namespace for native Adder binaries.** They run
+  in init's namespace because that's the one they're built against.
+  Running them inside a Debian-shape namespace would just hide them
+  behind FHS noise.
 - **No automatic path translation between namespaces.** A
   Debian-namespace process referring to /home/david sees the same
-  bytes as a native-namespace process referring to /home/david,
-  because both /home mounts are the same underlying bind. Cross-
-  namespace symbolic-path translation is not a thing.
+  file-server response as a native-namespace process referring to
+  /home/david, because both /home mounts bind the same server. There
+  is no symbolic-path translation across namespaces — bytes match
+  because the same server answers both reads.
 - **No nested distro-shape namespaces.** A process inside Debian-shape
   cannot launch a SUSE-shape sub-namespace from within. Could be added
   if a use case appears; deferred until then.
 - **No PID isolation.** Plan 9 / Hamnix pids are global. /proc shows
-  all processes regardless of namespace. If PID isolation is needed
-  later, it lives at a different layer.
+  all processes regardless of namespace. PID isolation, if ever
+  wanted, lives at a different layer.
 - **No security boundary.** See Boundary rule 6.
+
+## Comparison to Linux schroot
+
+Linux's schroot is the closest existing analog *in shape*: both
+arrange for a binary to see a different `/`. They differ in **what
+"different" means**.
+
+- **schroot** creates a chroot — restricting a process to a subtree
+  of "the real /". There IS a real /, the kernel knows it, and the
+  chrooted process is restricted to a view of it. Escape is a
+  meaningful concept (CVE-able).
+- **Hamnix distrorun** binds the namespace's / to a different file
+  server. There is no "the real /" at the kernel level. The new
+  namespace isn't restricted; it just has different file servers
+  serving different paths. There's nothing to escape from.
+
+The distinction matters: if you internalise schroot's framing,
+distrorun looks like a weaker container. If you internalise Plan 9's
+framing, distrorun looks like a configuration choice. The latter is
+what Hamnix actually does.
 
 ## Test discipline
 
@@ -161,21 +212,24 @@ Phase C.5 lands green when all of the following pass:
 3. `bash scripts/test_distro_namespace.sh` (new):
    - `deb /bin/true` exits 0
    - `deb /bin/bash -c 'echo hi'` prints "hi"
-   - `deb cat /etc/debian_version` reads from the namespace backing
-     store, not from the native rootfs
-   - `cat /etc/os-release` from the native namespace still shows
-     Hamnix's os-release (NOT Debian's)
-   - `deb stat /home/$USER` and `stat /home/$USER` show the same inode
+   - `deb cat /etc/debian_version` reads from the distro backing
+     store (a process in init's namespace and a process in the
+     debian-shape namespace observe different file-server responses
+     at the path /etc/debian_version)
+   - `cat /etc/os-release` from init's namespace still shows
+     Hamnix's os-release — because nothing in init's namespace has
+     rebound /etc to anything else
+   - `deb stat /home/$USER` and `stat /home/$USER` show the same
+     inode — both /home binds resolve to the same file server
    - Two concurrent `deb bash` sessions don't see each other's
-     mount-namespace bindings
+     namespace bindings — each got its own copy via rfork RFNAMEG
 
 ## References
 
 - `docs/architecture.md` — layered model. This doc is the Phase C.5
   addendum to the migration plan.
 - `docs/native-api.md` — `rfork`, `bind`, `mount` contracts (Layer 1).
-- 9front's `none(1)` + `auth/none` patterns inspired the "drop into
-  a different namespace" idiom.
-- Linux's `schroot(1)` is the closest existing analog; this design
-  is schroot with Plan 9's namespace primitives instead of Linux's
-  mount namespaces.
+- Plan 9 4th edition `intro(2)`, `bind(2)`, `namespace(4)`. The
+  shape of distrorun follows directly from these.
+- 9front `none(1)` + `auth/none` — drop-into-a-different-namespace
+  patterns from the canonical Plan 9 lineage.

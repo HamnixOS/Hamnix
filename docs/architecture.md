@@ -152,22 +152,26 @@ Linux ABI uses `do_clone` directly; native code can start using
 ### Phase C.5 — Distro-shape namespaces
 
 A *convention* on top of Phase C's primitives — no new kernel work.
-A userland `distrorun` binary calls rfork(RFNAMEG) + mount of a
-per-distro backing store at `/var/lib/distros/<name>/` + bind of
-shared paths (/home, /net, /srv, /dev, /proc) back in, then exec.
-From inside the namespace, the world looks like Debian / Ubuntu /
-SUSE / etc.; outside, the native Hamnix rootfs is unchanged. apt
-and dpkg are namespaced — they never mutate Hamnix's rootfs.
+A userland `distrorun` binary calls `rfork(RFNAMEG)` + `mount` of a
+per-distro file server at the namespace's `/` + `bind` of shared
+servers (/home, /net, /srv, /dev, /proc) back in, then `exec`. From
+inside the namespace, paths resolve to a Debian / Ubuntu / SUSE file
+server (the distro backing store). Init's namespace is unaffected
+because nothing in the new namespace binds anything to it — there
+is no "the real /" at the kernel level for either namespace to be
+a view of.
 
-This is THE answer to "how do we run Linux binaries without
-polluting the native OS identity." Linux compat is a feature
-imported binaries opt into via namespace, not a property of the
-OS itself.
+This is the architectural answer to "how do we run Linux binaries
+without polluting the OS identity." Linux compat is a namespace
+shape a process opts into, not a property of the kernel or of a
+privileged global FS.
 
 See [`docs/distro-namespaces.md`](distro-namespaces.md) for the
-full spec, including the layout table, boundary rules, backing
-store choices (disk-backed via debootstrap first; `debfs` 9P
-server later), and the `distrorun` entry point.
+full spec — including the layout comparison between init's
+namespace and a Debian-shape namespace, boundary rules, why this
+is NOT schroot (the kernel has no global /), backing store choices
+(disk-backed via debootstrap first; `debfs` 9P server later), and
+the `distrorun` entry point.
 
 ### Phase D — Stand up `hamwd` (Layer 3) using v1 single-window mode
 
