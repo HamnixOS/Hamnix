@@ -1,0 +1,520 @@
+# drivers/block/partition.ad
+#
+# MBR + GPT partition-table parser. Sits on top of kernel/block/blk.ad's
+# vtable-dispatched read path, so it doesn't care whether the underlying
+# device is virtio-blk, AHCI, NVMe, or the baked-in /dev/ram0 — it just
+# calls blk_read_sectors(slot, ...) and decodes the bytes that come back.
+#
+# Linux mapping:
+#
+#   block/partitions/msdos.c     -> parse_mbr()    (this file)
+#   block/partitions/efi.c       -> parse_gpt()    (this file)
+#   block/partitions/check.c     -> partition_scan (this file)
+#   struct parsed_partitions     -> Partition[]    (per-disk table here)
+#
+# Scope (M16.x — partition-table read side):
+#   - MBR primary entries 1..4 at sector 0, bytes 446..509.
+#   - 0x55AA signature check at bytes 510..511.
+#   - Protective-MBR fallback (primary[0].type == 0xEE -> walk GPT).
+#   - GPT header at sector 1 (signature "EFI PART" + partition-array-LBA
+#     at offset 72, partition-entry-count at offset 80, entry size at
+#     offset 84).
+#   - GPT partition array — first 64 entries (sectors 2..33 with the
+#     default 128-byte entry size).
+#
+# OUT of scope this commit:
+#   - Extended partitions (CHS extension via type 0x05 / 0x0F).
+#   - BSD disklabel / Apple Partition Map / Sun VTOC.
+#   - mkpart write path — coming in a sibling commit.
+#   - /dev/sd<a-z><N> naming — sibling commit.
+#
+# We expose one 16-slot partition table per registered block device.
+# Storage is flat — Array[64, Partition] indexed as
+# `partition_table[slot * PARTITIONS_PER_DISK + idx]` — to dodge the
+# Adder codegen quirk around `&arr[i][j]` on 2-D fixed arrays
+# (documented in memory/feedback_compiler_quirks.md). Same shape that
+# drivers/net/arp.ad's `arp_mac` walk uses today.
+#
+# `partition_scan(dev)` is idempotent — if a device is re-scanned (e.g.
+# after media change), the table is zeroed first so a smaller second
+# layout doesn't shadow stale entries from a larger first scan.
+
+from kernel.printk.printk import printk0, printk1, printk2
+from kernel.block.blk import (
+    blk_read_sectors, SECTOR_SIZE,
+)
+
+
+# Per-partition record. `type_short` is a 4-byte ASCII tag the parser
+# fills in:
+#
+#   MBR primaries get the literal MBR type byte zero-padded to 4 bytes,
+#     formatted as "0xNN" so a 0x83 (Linux native) partition reads
+#     back as "0x83". Stored as a uint32 LE so a single `==` compares
+#     four bytes at once.
+#
+#   GPT entries get the first 4 bytes of the partition-type GUID
+#     stamped in. For Linux basic-data partitions (0FC63DAF-...) the
+#     low-DWORD prefix 0x0FC63DAF is fine to record verbatim — anyone
+#     who needs the full 16-byte GUID can re-read sector(s) 2..33.
+#     We log only the first 4 bytes here to keep the on-screen
+#     `[partition]` line compact.
+#
+# `kind`:
+#   0 = empty slot (skip)
+#   1 = MBR primary
+#   2 = GPT partition
+
+class Partition:
+    lba_start:  uint64
+    lba_end:    uint64           # inclusive last LBA (Linux's "end")
+    type_short: uint32           # see above
+    kind:       uint32           # 0 = empty, 1 = MBR, 2 = GPT
+
+
+# Table sizing:
+#   BLKDEV_MAX (kernel/block/blk.ad)  = 4 devices
+#   PARTITIONS_PER_DISK               = 16
+#
+# 4 * 16 * sizeof(Partition) = 4 * 16 * 32 = 2 KiB of .bss. Cheap.
+PARTITIONS_PER_DISK: uint64 = 16
+PARTITION_DEVS:      uint64 = 4
+PARTITION_SLOTS_TOT: uint64 = 64       # PARTITIONS_PER_DISK * PARTITION_DEVS
+
+partition_table: Array[64, Partition]
+
+# Per-disk display name, parallel to partition_table. Plain
+# 16-byte slot so partition_log can emit `disk=<name>` instead of a
+# numeric index. Stored as a flat Array[4*16=64, uint8]. Populated by
+# partition_scan_named(); partition_scan() falls back to "slotN\0".
+PARTITION_NAME_LEN:  uint64 = 16
+partition_dev_name:  Array[64, uint8]
+
+
+# --- MBR layout constants ------------------------------------------
+#
+# Sector 0 byte map:
+#   0x000..0x1BD  bootstrap code (446 bytes)
+#   0x1BE..0x1FD  4 × 16-byte partition entries
+#   0x1FE..0x1FF  0x55 0xAA signature
+#
+# Per-entry (16 bytes):
+#   +0    bootable flag (0x80 = active)
+#   +1..3 CHS start (we ignore — LBA is authoritative on every disk
+#         this kernel will ever see)
+#   +4    partition type byte
+#   +5..7 CHS end   (ignored, ditto)
+#   +8..11  LBA start (LE u32)
+#   +12..15 sector count (LE u32)
+
+MBR_PART_TABLE_OFFSET: uint64 = 0x1BE
+MBR_PART_ENTRY_SIZE:   uint64 = 16
+MBR_PART_ENTRY_COUNT:  uint64 = 4
+
+MBR_SIG_OFFSET:        uint64 = 0x1FE
+MBR_SIG_LO:            uint8  = 0x55
+MBR_SIG_HI:            uint8  = 0xAA
+
+MBR_TYPE_EMPTY:        uint8  = 0x00
+MBR_TYPE_GPT_PROTECT:  uint8  = 0xEE
+
+
+# --- GPT layout constants ------------------------------------------
+#
+# GPT header at LBA 1, 92 bytes used out of 512:
+#   +0    signature "EFI PART" (8 bytes)
+#   +8    revision (u32, expect 0x00010000)
+#   +12   header size (u32)
+#   +16   header CRC32 (u32) — we don't validate; the parser is best-
+#         effort and the consumer can decide whether to trust a bad
+#         CRC, same way Linux does with `force_uuid` etc.
+#   +20   reserved (u32, zero)
+#   +24   current LBA (u64, = 1)
+#   +32   backup LBA (u64)
+#   +40   first usable LBA (u64)
+#   +48   last usable LBA (u64)
+#   +56   disk GUID (16 bytes)
+#   +72   partition-array starting LBA (u64) — usually 2
+#   +80   partition-entry count (u32) — usually 128
+#   +84   partition-entry size (u32) — usually 128
+#
+# Per-entry (128 bytes):
+#   +0     partition-type GUID (16 bytes); all-zero == unused slot
+#   +16    unique partition GUID (16 bytes)
+#   +32    first LBA (u64)
+#   +40    last LBA (u64, inclusive)
+#   +48    attributes (u64)
+#   +56..127 name (UTF-16LE)
+#
+# We walk entries until either:
+#   - we hit `partition-entry count` entries,
+#   - we hit PARTITIONS_PER_DISK records in our local table.
+
+GPT_HDR_SIG_OFFSET:      uint64 = 0
+GPT_HDR_ARRAY_LBA_OFF:   uint64 = 72
+GPT_HDR_NUM_ENTRIES_OFF: uint64 = 80
+GPT_HDR_ENTRY_SIZE_OFF:  uint64 = 84
+
+# "EFI PART" little-endian as a u64. Bytes (offset 0..7) read
+# 'E' 'F' 'I' ' ' 'P' 'A' 'R' 'T'  = 0x45 0x46 0x49 0x20 0x50 0x41 0x52 0x54.
+# Loaded as a u64 LE that gives 0x5452415020494645.
+GPT_HDR_SIG: uint64 = 0x5452415020494645
+
+GPT_ENT_TYPE_GUID_OFF: uint64 = 0
+GPT_ENT_FIRST_LBA_OFF: uint64 = 32
+GPT_ENT_LAST_LBA_OFF:  uint64 = 40
+
+
+# --- Internal helpers ----------------------------------------------
+
+def _part_read_u32_le(buf: Ptr[uint8], off: uint64) -> uint32:
+    b0: uint32 = cast[uint32](buf[off])
+    b1: uint32 = cast[uint32](buf[off + 1])
+    b2: uint32 = cast[uint32](buf[off + 2])
+    b3: uint32 = cast[uint32](buf[off + 3])
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+
+
+def _part_read_u64_le(buf: Ptr[uint8], off: uint64) -> uint64:
+    # Adder doesn't ship a one-line LE-u64 helper; build it by
+    # composing two u32 reads. Branch-free, deterministic.
+    lo: uint64 = cast[uint64](_part_read_u32_le(buf, off))
+    hi: uint64 = cast[uint64](_part_read_u32_le(buf, off + 4))
+    return lo | (hi << 32)
+
+
+def _slot_in_range(slot: int32) -> int32:
+    # Defence in depth: register_blockdev only hands out slots
+    # 0..BLKDEV_MAX-1, but a follow-up that bumps BLKDEV_MAX without
+    # also bumping PARTITION_DEVS would silently overrun our table.
+    if slot < 0:
+        return 0
+    if cast[uint64](slot) >= PARTITION_DEVS:
+        return 0
+    return 1
+
+
+def _part_base_index(slot: int32) -> uint64:
+    # Flatten (slot, idx) into the 1-D partition_table index space.
+    # Caller must have validated `slot`.
+    return cast[uint64](slot) * PARTITIONS_PER_DISK
+
+
+def _name_base_index(slot: int32) -> uint64:
+    # Same idea for the per-disk name buffer.
+    return cast[uint64](slot) * PARTITION_NAME_LEN
+
+
+def _clear_table_for(slot: int32):
+    # Zero the per-device partition table. Called at the start of every
+    # partition_scan so a re-scan after media change doesn't leave
+    # stale entries from a previous (larger) layout.
+    base: uint64 = _part_base_index(slot)
+    i: uint64 = 0
+    while i < PARTITIONS_PER_DISK:
+        partition_table[base + i].lba_start  = 0
+        partition_table[base + i].lba_end    = 0
+        partition_table[base + i].type_short = 0
+        partition_table[base + i].kind       = 0
+        i = i + 1
+
+
+def _record_partition(slot: int32, idx: uint64, lba_start: uint64,
+                      lba_end: uint64, type_short: uint32,
+                      kind: uint32) -> int32:
+    # Plant a single Partition row. Returns 0 if there's no room left
+    # (idx >= PARTITIONS_PER_DISK), 1 on success.
+    if idx >= PARTITIONS_PER_DISK:
+        return 0
+    base: uint64 = _part_base_index(slot)
+    partition_table[base + idx].lba_start  = lba_start
+    partition_table[base + idx].lba_end    = lba_end
+    partition_table[base + idx].type_short = type_short
+    partition_table[base + idx].kind       = kind
+    return 1
+
+
+# --- Public lookup -------------------------------------------------
+
+def partition_for(slot: int32, index: uint64) -> Ptr[Partition]:
+    # Caller checks `kind != 0` to decide whether the slot is live.
+    # Returns 0 (NULL) on out-of-range — callers should clamp before
+    # dereferencing.
+    if _slot_in_range(slot) == 0:
+        return cast[Ptr[Partition]](0)
+    if index >= PARTITIONS_PER_DISK:
+        return cast[Ptr[Partition]](0)
+    base: uint64 = _part_base_index(slot)
+    return &partition_table[base + index]
+
+
+def _set_dev_name(slot: int32, name: Ptr[char]):
+    base: uint64 = _name_base_index(slot)
+    i: uint64 = 0
+    last: uint64 = PARTITION_NAME_LEN - 1
+    while i < last:
+        c: int32 = name[i]
+        partition_dev_name[base + i] = cast[uint8](c & 0xFF)
+        if c == 0:
+            return
+        i = i + 1
+    partition_dev_name[base + last] = 0
+
+
+def _set_dev_name_slot_fallback(slot: int32):
+    # When the caller didn't supply a name we plant "slotN\0" so the
+    # log line is still meaningful.
+    base: uint64 = _name_base_index(slot)
+    partition_dev_name[base + 0] = 0x73          # 's'
+    partition_dev_name[base + 1] = 0x6C          # 'l'
+    partition_dev_name[base + 2] = 0x6F          # 'o'
+    partition_dev_name[base + 3] = 0x74          # 't'
+    partition_dev_name[base + 4] = cast[uint8]((cast[uint64](slot) % 10) + 0x30)
+    partition_dev_name[base + 5] = 0
+
+
+# --- MBR parser ----------------------------------------------------
+#
+# Returns:
+#   >= 0  number of MBR primaries recorded
+#   -1    read failed, or bad signature
+#   -2    protective MBR detected — caller should fall through to GPT
+
+def parse_mbr(slot: int32) -> int32:
+    sec: Array[512, uint8]
+    rc: int32 = blk_read_sectors(slot, 0, 1, &sec[0])
+    if rc != 0:
+        printk0("[partition] read MBR sector 0 failed\n")
+        return -1
+
+    sig_lo: uint8 = sec[MBR_SIG_OFFSET]
+    sig_hi: uint8 = sec[MBR_SIG_OFFSET + 1]
+    if sig_lo != MBR_SIG_LO or sig_hi != MBR_SIG_HI:
+        printk2("[partition] no MBR signature (got %x %x)\n",
+                cast[uint64](sig_lo), cast[uint64](sig_hi))
+        return -1
+
+    # Protective-MBR detection: a GPT-formatted disk plants exactly
+    # one MBR primary spanning the whole disk with type 0xEE. Some
+    # tools emit a hybrid layout (one 0xEE + other primaries); we
+    # treat the presence of 0xEE in slot 0 as "this is a GPT disk"
+    # and let the caller switch over before we record anything.
+    first_type: uint8 = sec[MBR_PART_TABLE_OFFSET + 4]
+    if first_type == MBR_TYPE_GPT_PROTECT:
+        printk0("[partition] protective MBR detected, switching to GPT\n")
+        return -2
+
+    sptr: Ptr[uint8] = &sec[0]
+    found: uint64 = 0
+    i: uint64 = 0
+    while i < MBR_PART_ENTRY_COUNT:
+        eoff: uint64 = MBR_PART_TABLE_OFFSET + i * MBR_PART_ENTRY_SIZE
+        ptype: uint8 = sptr[eoff + 4]
+        if ptype != MBR_TYPE_EMPTY:
+            lba_start_u32: uint32 = _part_read_u32_le(sptr, eoff + 8)
+            nsec_u32:      uint32 = _part_read_u32_le(sptr, eoff + 12)
+            lba_start: uint64 = cast[uint64](lba_start_u32)
+            nsec:      uint64 = cast[uint64](nsec_u32)
+            if nsec > 0:
+                lba_end: uint64 = lba_start + nsec - 1
+                # Pack the type byte as a 4-byte ASCII "0xNN" so the
+                # log line `type=0x83` reads naturally. We store it
+                # as a single uint32 LE: byte0='0', byte1='x',
+                # byte2=hex-hi, byte3=hex-lo.
+                hi_n: uint32 = cast[uint32]((ptype >> 4) & 0xF)
+                lo_n: uint32 = cast[uint32](ptype & 0xF)
+                hi_c: uint32 = _hex_nibble(hi_n)
+                lo_c: uint32 = _hex_nibble(lo_n)
+                tag: uint32 = cast[uint32](0x30) \
+                            | (cast[uint32](0x78) << 8) \
+                            | (hi_c << 16) | (lo_c << 24)
+                _record_partition(slot, found, lba_start, lba_end,
+                                  tag, 1)
+                found = found + 1
+        i = i + 1
+    return cast[int32](found)
+
+
+def _hex_nibble(n: uint32) -> uint32:
+    # 0..9 -> '0'..'9' (0x30..0x39); 10..15 -> 'a'..'f' (0x61..0x66).
+    # Matches the lowercase convention used by `printk("%x")`.
+    if n < 10:
+        return n + 0x30
+    return n - 10 + 0x61
+
+
+# --- GPT parser ----------------------------------------------------
+#
+# Returns:
+#   >= 0  number of GPT partitions recorded
+#   -1    read failed, bad signature, or layout out of bounds
+
+def parse_gpt(slot: int32) -> int32:
+    hdr: Array[512, uint8]
+    rc: int32 = blk_read_sectors(slot, 1, 1, &hdr[0])
+    if rc != 0:
+        printk0("[partition] read GPT header sector 1 failed\n")
+        return -1
+
+    hp: Ptr[uint8] = &hdr[0]
+    sig: uint64 = _part_read_u64_le(hp, GPT_HDR_SIG_OFFSET)
+    if sig != GPT_HDR_SIG:
+        printk1("[partition] GPT signature mismatch (got %x)\n", sig)
+        return -1
+
+    array_lba:   uint64 = _part_read_u64_le(hp, GPT_HDR_ARRAY_LBA_OFF)
+    num_entries: uint32 = _part_read_u32_le(hp, GPT_HDR_NUM_ENTRIES_OFF)
+    entry_size:  uint32 = _part_read_u32_le(hp, GPT_HDR_ENTRY_SIZE_OFF)
+
+    # Sanity: only the canonical 128-byte entry size is handled here.
+    # The spec permits any multiple of 128, but every implementation in
+    # the wild ships 128 — if we ever meet 256 we'll add a sibling path.
+    if entry_size != 128:
+        printk1("[partition] unsupported GPT entry size %d\n",
+                cast[uint64](entry_size))
+        return -1
+
+    printk2("[partition] GPT array_lba=%d num_entries=%d\n",
+            array_lba, cast[uint64](num_entries))
+
+    # The partition array spans (num_entries * entry_size) bytes
+    # starting at array_lba. With 128 entries * 128 B = 16384 B = 32
+    # sectors, the array spans sectors array_lba .. array_lba+31. We
+    # walk one sector at a time so a 512-byte stack buffer is enough.
+    nu: uint64 = cast[uint64](num_entries)
+    if nu > 128:
+        nu = 128                    # cap so we don't loop forever on garbage
+
+    found: uint64 = 0
+    sec_buf: Array[512, uint8]
+    sp: Ptr[uint8] = &sec_buf[0]
+
+    # 4 entries fit in a 512-byte sector at 128 B each.
+    entries_per_sector: uint64 = 4
+
+    e: uint64 = 0
+    while e < nu and found < PARTITIONS_PER_DISK:
+        # Re-read whenever we cross a sector boundary. The first
+        # iteration always reads (cur_sec_lba == array_lba) because
+        # `e % 4 == 0` on entry.
+        if (e % entries_per_sector) == 0:
+            cur_sec_lba: uint64 = array_lba + (e / entries_per_sector)
+            if blk_read_sectors(slot, cur_sec_lba, 1, &sec_buf[0]) != 0:
+                printk1("[partition] read GPT array LBA=%d failed\n",
+                        cur_sec_lba)
+                return -1
+        eoff: uint64 = (e % entries_per_sector) * 128
+
+        # Type GUID all-zero ⇒ unused slot. We check it as two u64
+        # halves to keep the comparison cheap.
+        g_lo: uint64 = _part_read_u64_le(sp, eoff + GPT_ENT_TYPE_GUID_OFF)
+        g_hi: uint64 = _part_read_u64_le(sp, eoff + GPT_ENT_TYPE_GUID_OFF + 8)
+        if g_lo != 0 or g_hi != 0:
+            first_lba: uint64 = _part_read_u64_le(sp, eoff + GPT_ENT_FIRST_LBA_OFF)
+            last_lba:  uint64 = _part_read_u64_le(sp, eoff + GPT_ENT_LAST_LBA_OFF)
+            # Type-short: first 4 bytes of the type GUID as a uint32
+            # LE. For Linux basic-data (0FC63DAF-...) this is
+            # 0x0FC63DAF; for EFI system partition (C12A7328-...) it's
+            # 0xC12A7328. Compact, comparable, and we don't lose
+            # entropy that matters for logging.
+            ts: uint32 = _part_read_u32_le(sp, eoff + GPT_ENT_TYPE_GUID_OFF)
+            _record_partition(slot, found, first_lba, last_lba, ts, 2)
+            found = found + 1
+        e = e + 1
+    return cast[int32](found)
+
+
+# --- Top-level scan ------------------------------------------------
+
+def partition_scan(slot: int32) -> int32:
+    # Single entry point with no name supplied. Falls back to
+    # `slot<N>` for the `disk=` log field.
+    if _slot_in_range(slot) == 0:
+        printk0("[partition] scan: slot out of range\n")
+        return -1
+    _set_dev_name_slot_fallback(slot)
+    return _partition_scan_inner(slot)
+
+
+def partition_scan_named(slot: int32, name: Ptr[char]) -> int32:
+    # Same as partition_scan but plants the supplied name for the
+    # `disk=` field. Called from kernel/block/blk.ad after a device
+    # registers, so the log line carries the human-recognisable tag
+    # ("vda" / "ram0" etc.).
+    if _slot_in_range(slot) == 0:
+        printk0("[partition] scan: slot out of range\n")
+        return -1
+    _set_dev_name(slot, name)
+    return _partition_scan_inner(slot)
+
+
+def _partition_scan_inner(slot: int32) -> int32:
+    # Internal: assumes _slot_in_range already returned 1 and the
+    # display name has been populated. Reads sector 0, decides MBR
+    # vs protective-MBR, parses the right table, populates
+    # partition_table[...], and prints one `[partition]` log line
+    # per live partition.
+    #
+    # Returns the number of partitions recorded, or -1 on any I/O
+    # failure / unparseable layout.
+    _clear_table_for(slot)
+    mbr_rc: int32 = parse_mbr(slot)
+    if mbr_rc == -2:
+        gpt_rc: int32 = parse_gpt(slot)
+        if gpt_rc < 0:
+            return -1
+        partition_log(slot)
+        return gpt_rc
+    if mbr_rc < 0:
+        return -1
+    partition_log(slot)
+    return mbr_rc
+
+
+def _emit_type_short(ts: uint32, kind: uint32):
+    # MBR (kind=1) packed `ts` as four ASCII chars "0xNN" — print them
+    # verbatim. GPT (kind=2) packed the GUID's first DWORD; we print it
+    # as "%x" so the log line reads `type=0fc63daf` for a Linux
+    # basic-data partition.
+    if kind == 1:
+        c0: uint8 = cast[uint8](ts & 0xFF)
+        c1: uint8 = cast[uint8]((ts >> 8) & 0xFF)
+        c2: uint8 = cast[uint8]((ts >> 16) & 0xFF)
+        c3: uint8 = cast[uint8]((ts >> 24) & 0xFF)
+        printk1("%c", cast[uint64](c0))
+        printk1("%c", cast[uint64](c1))
+        printk1("%c", cast[uint64](c2))
+        printk1("%c", cast[uint64](c3))
+    else:
+        printk1("%x", cast[uint64](ts))
+
+
+def partition_log(slot: int32):
+    # Print one banner per live partition. The leading `[partition]`
+    # tag matches the convention every driver in drivers/* uses for
+    # its diagnostic markers (drivers/ata/ahci.ad's `[ahci]`,
+    # drivers/nvme/nvme.ad's `[nvme]`, etc.). Test scripts grep for
+    # this line shape to assert each expected partition was found:
+    #
+    #   [partition] disk=<name> idx=<N> lba=<start>..<end> type=<short>
+    if _slot_in_range(slot) == 0:
+        return
+    name_base: uint64 = _name_base_index(slot)
+    name_arr_base: uint64 = cast[uint64](&partition_dev_name)
+    name_ptr: Ptr[char] = cast[Ptr[char]](name_arr_base + name_base)
+    part_base: uint64 = _part_base_index(slot)
+    i: uint64 = 0
+    while i < PARTITIONS_PER_DISK:
+        k: uint32 = partition_table[part_base + i].kind
+        if k != 0:
+            ls: uint64 = partition_table[part_base + i].lba_start
+            le: uint64 = partition_table[part_base + i].lba_end
+            ts: uint32 = partition_table[part_base + i].type_short
+            printk0("[partition] disk=")
+            printk1("%s", cast[uint64](name_ptr))
+            printk2(" idx=%d lba=%d..", i, ls)
+            printk1("%d", le)
+            printk0(" type=")
+            _emit_type_short(ts, k)
+            printk0("\n")
+        i = i + 1

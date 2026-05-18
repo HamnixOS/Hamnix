@@ -589,10 +589,28 @@ it has to honour.
   per port via READ FPDMA QUEUED / WRITE FPDMA QUEUED (0x60 / 0x61),
   driven by SACT + per-slot completion. Today every command
   serialises on slot 0.
-- AHCI partition-table read (parse MBR + GPT). With M16.89 we
-  fetched the MBR bytes but didn't decode them; partition entries
-  at MBR offsets 446..510 + GPT header at LBA 1 is the next step
-  before mounting a real-hardware ext4.
+- ~~Partition-table read (parse MBR + GPT). Shipped in M16.x as
+  `drivers/block/partition.ad` + `blk_scan_partitions(slot)`. MBR
+  primaries 1..4 + GPT (with protective-MBR fallback) decode against
+  any device the block layer knows about; per-disk 16-slot table
+  populated; one `[partition] disk=<name> idx=N lba=<start>..<end>
+  type=<short>` log line per live partition. See
+  `scripts/test_partition.sh` for the end-to-end virtio-blk fixture.~~
+  Partition follow-ups:
+    - mkpart / mklabel write path — sibling to the read side; writes
+      a fresh MBR or GPT (header + array sectors + CRC32) so the
+      installer can lay down partitions before the file system goes
+      down on a freshly-wiped real disk.
+    - `/dev/sd<a-z><N>` naming — today partitions live in a per-slot
+      table; the installer needs `open("/dev/sda2")` to resolve via
+      `find_blockdev("sda")` + partition index 1 to a slot range
+      derived from `partition_for(slot, idx).lba_start`.
+    - Extended-partition (CHS) chain — types 0x05 / 0x0F. Rare on
+      modern disks but DOS-formatted USB sticks still ship with them.
+    - BSD disklabel — needed for `*BSD` install-media interop.
+    - Apple Partition Map (APM) — pre-GPT Mac partition format.
+      Probably never blocking but cheap once the read framework
+      exists.
 - AHCI hot-plug / COMRESET / port reset retry — real ThinkPads
   flap SATA on resume; the driver needs to re-init a port that
   drops link.
