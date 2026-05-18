@@ -220,11 +220,26 @@ sudo apt-get install grub-pc-bin grub-efi-amd64-bin xorriso mtools \
 
 ### Test under QEMU
 
+Three test scripts cover the hybrid ISO:
+
 ```sh
+# Combined: runs BOTH paths, prints a final summary table.
 bash scripts/test_iso_qemu.sh
+
+# Dedicated: runs just the BIOS path and prints `[test_bios_boot] PASS`.
+bash scripts/test_bios_boot.sh
+
+# Dedicated: runs just the UEFI path and prints `[test_uefi_boot] PASS`.
+bash scripts/test_uefi_boot.sh
 ```
 
-This runs the ISO under QEMU twice:
+The dedicated scripts are the preferred entry points for CI: they have
+predictable PASS markers (`[test_bios_boot] PASS` / `[test_uefi_boot] PASS`)
+that scale easily across cron jobs that want one pass-or-fail line per
+boot path, and they skip cleanly when the relevant prerequisite is
+missing (`test_uefi_boot.sh` prints `SKIP` when OVMF isn't installed).
+
+What each path actually does:
 
 - **BIOS pass**: `qemu-system-x86_64 -cdrom build/hamnix.iso` — SeaBIOS
   picks up the MBR, hands off to GRUB, which loads the multiboot kernel.
@@ -232,19 +247,26 @@ This runs the ISO under QEMU twice:
 - **UEFI pass**: `qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd
   -cdrom build/hamnix.iso` — OVMF reads the ESP, launches
   `BOOTX64.EFI` directly (= our stub).
-  Banner checks (ALL THREE must appear, in order):
+  Banner checks (in order):
   - `[hamnix] EFI entry reached`        — PE/COFF entry reached.
   - `[hamnix] post-EFI handoff complete` — `ExitBootServices()`
     returned `EFI_SUCCESS`; firmware is out of the boot path.
-  - `cpio: registered N files from initramfs` — start_kernel()
-    ran past e820 → memblock → cpio_init(); the EFI ELF loader
-    handed off successfully.
+  - `Hamnix kernel booting`             — kernel banner; proves the
+    EFI ELF loader handed off cleanly into start_kernel().
 
-As of M16.125, the UEFI pass now reaches the same depth as the BIOS
+The combined `test_iso_qemu.sh` script additionally asserts the deeper
+marker `cpio: registered N files from initramfs` (proves start_kernel
+ran past e820 -> memblock -> cpio_init); the dedicated `test_uefi_boot.sh`
+stops at the kernel banner so a kernel-side regression past the banner
+shows up in unrelated tests, not in the boot test.
+
+As of M16.125, the UEFI pass reaches the same depth as the BIOS
 pass: PATH A (UEFI-side ELF loader baked into `efi_stub.S`) is the
 shipped UEFI boot path.
 
-If you only have OVMF locally, set `SKIP_UEFI=1` to skip that pass.
+If you only have OVMF locally, set `SKIP_UEFI=1` to skip the UEFI pass
+of `test_iso_qemu.sh`. `test_uefi_boot.sh` auto-detects the missing
+firmware and prints `[test_uefi_boot] SKIP`.
 
 ### Write to a USB stick
 
@@ -274,8 +296,8 @@ Tested-on / known-working list (extend as we verify on more machines):
 
 | Vendor / Model        | Mode | Result | Notes                |
 | --------------------- | ---- | ------ | -------------------- |
-| QEMU (SeaBIOS, 10.0)  | BIOS | works  | scripts/test_iso_qemu.sh |
-| QEMU (OVMF, edk2)     | UEFI | works  | direct PE/COFF stub, SFSP-loads `\hamnix-vmlinux.elf` from the ESP, reaches `start_kernel()` and beyond (M16.125 PATH A) |
+| QEMU (SeaBIOS, 10.0)  | BIOS | works  | scripts/test_bios_boot.sh PASS |
+| QEMU (OVMF, edk2)     | UEFI | works  | scripts/test_uefi_boot.sh PASS — direct PE/COFF stub, SFSP-loads `\hamnix-vmlinux.elf` from the ESP, reaches `start_kernel()` and beyond (M16.125 PATH A) |
 | _real hardware_       | _?_  | TBD    | needs validation     |
 
 When testing on real hardware:
