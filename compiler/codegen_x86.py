@@ -44,6 +44,7 @@ from .ast_nodes import (
     CallExpr, Identifier, StringLiteral, IntLiteral, CharLiteral, BoolLiteral,
     BinaryExpr, UnaryExpr, BinOp, UnaryOp,
     IndexExpr, MemberExpr, CastExpr, ContainerOfExpr,
+    ConditionalExpr,
     Type, PointerType, ArrayType, FunctionPointerType, PercpuType,
 )
 
@@ -804,6 +805,29 @@ class X86CodeGen:
                 # that path yet — when it does we'll specialize here.
                 self.gen_expr(inner)
 
+            case ConditionalExpr(condition=cond, then_expr=t_expr,
+                                 else_expr=e_expr):
+                # Python-style ternary: `t_expr if cond else e_expr`.
+                # Lowered as:
+                #     <eval cond -> rax>
+                #     testq %rax, %rax
+                #     jz else_label
+                #     <eval t_expr -> rax>
+                #     jmp end_label
+                # else_label:
+                #     <eval e_expr -> rax>
+                # end_label:
+                else_label = self.ctx.new_label("cond_else")
+                end_label = self.ctx.new_label("cond_end")
+                self.gen_expr(cond)
+                self.emit("    testq %rax, %rax")
+                self.emit(f"    jz {else_label}")
+                self.gen_expr(t_expr)
+                self.emit(f"    jmp {end_label}")
+                self.emit(f"{else_label}:")
+                self.gen_expr(e_expr)
+                self.emit(f"{end_label}:")
+
             case ContainerOfExpr(expr=inner, type_name=tn, field_name=fn):
                 # Evaluate the pointer to the field into %rax, then
                 # subtract the field's byte offset within the enclosing
@@ -1200,23 +1224,32 @@ class X86CodeGen:
         n_reg  = min(n_args, len(ARG_REGS))
         n_stk  = n_args - n_reg
 
-        # Args 0..5 go in ARG_REGS. Evaluate-and-push, then pop in
-        # reverse so the lowest-indexed arg ends up in %rdi.
-        for i in range(n_reg):
-            self.gen_expr(call.args[i])
-            self.emit("    pushq %rax")
-        for i in reversed(range(n_reg)):
-            self.emit(f"    popq {ARG_REGS[i]}")
-
-        # Args 6+ live on the stack at fixed offsets from %rsp. SysV
-        # also wants %rsp 16-aligned before the `call`; reserve a
-        # 16-byte-aligned chunk and write each arg into it.
+        # SysV calls need args 6+ at fixed offsets in a 16-aligned
+        # chunk below the caller's %rsp, and args 0..5 in ARG_REGS.
+        # Evaluation order matters: argument expressions can clobber
+        # %rcx (and any other ARG_REG used as scratch) via inner
+        # pushq/popq sequences in gen_expr. So we evaluate the stack
+        # args FIRST (reserving the call slot, then writing each into
+        # its offset before we load any register argument), then
+        # evaluate the register args last and load them right before
+        # the call. This way the stack-arg evaluation can use any
+        # scratch register it wants without trashing reg args.
         stack_bytes = (n_stk * 8 + 15) & ~15
         if stack_bytes > 0:
             self.emit(f"    subq ${stack_bytes}, %rsp")
             for i in range(n_stk):
                 self.gen_expr(call.args[n_reg + i])
                 self.emit(f"    movq %rax, {i * 8}(%rsp)")
+
+        # Args 0..5 go in ARG_REGS. Evaluate-and-push, then pop in
+        # reverse so the lowest-indexed arg ends up in %rdi. The pops
+        # are the LAST writes before `call`, so any inner clobber of
+        # ARG_REGS by an arg's gen_expr is rewritten by these pops.
+        for i in range(n_reg):
+            self.gen_expr(call.args[i])
+            self.emit("    pushq %rax")
+        for i in reversed(range(n_reg)):
+            self.emit(f"    popq {ARG_REGS[i]}")
 
         if indirect:
             if name in self.ctx.locals:
