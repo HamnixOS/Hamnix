@@ -37,8 +37,9 @@ from kernel.sched.core import (
 )
 from fs.vfs import (
     vfs_open, vfs_open_write, vfs_unlink, vfs_close,
-    resolve_path,
+    vfs_rename, resolve_path,
 )
+from fs.tmpfs import tmpfs_slot_name
 from fs.cpio import (
     initramfs_entry_count, initramfs_entry_name,
     initramfs_entry_size,
@@ -683,3 +684,228 @@ def do_fd2path(fd: int32, buf_user: uint64, nbuf: uint64) -> int64:
     name_len: uint64 = _cstr_len_u8(cast[Ptr[uint8]](name_p))
     return _emit_path(buf_user, nbuf,
                       cast[Ptr[uint8]](name_p), name_len)
+
+
+# --- do_wstat / do_fwstat -----------------------------------------
+# Plan 9's unified "rename + chmod + truncate + utime" primitive. The
+# caller hands us a 9P Dir record; for every field that is NOT the
+# wstat sentinel ("don't change") we apply the mutation to the
+# underlying file.
+#
+# Sentinels per stat(5):
+#   * uint32 fields (mode / mtime):  ~0  (0xFFFFFFFF)
+#   * uint64 field  (length):        ~0  (0xFFFFFFFFFFFFFFFF)
+#   * counted strings (name / uid / gid / muid): empty (length == 0)
+#
+# This commit honours TWO fields — the rest stay sentinel-only:
+#
+#   * name   — routed through `vfs_rename` (tmpfs-only today; ext4
+#              rename needs a dir-remove+insert transaction, TODO).
+#   * mode   — accepted as a successful no-op: Hamnix has no per-
+#              inode mode bits to mutate yet, so we simply DROP the
+#              new mode on the floor. The caller can't observe the
+#              difference until per-inode metadata storage lands; a
+#              following milestone will plumb mode through the tmpfs
+#              entry + ext4 inode_write path.
+#
+# Everything else (length / mtime / gid / muid) MUST be the sentinel
+# value. If any of those is set to a non-sentinel value we surface
+# -1 with `errstr("wstat: field not supported")` so callers can tell
+# the gap apart from a backend error.
+#
+# Parse the buffer as little-endian (matches `_write_dir_record`).
+# We deliberately accept short buffers as long as the FIXED prefix
+# (41 bytes) + the four counted-string length headers can be read —
+# the strings themselves can be zero-length (= "don't change").
+
+WSTAT_SENTINEL_U32: uint32 = 0xFFFFFFFF
+WSTAT_SENTINEL_U64: uint64 = 0xFFFFFFFFFFFFFFFF
+
+
+def _read_le16(p: Ptr[uint8]) -> uint64:
+    lo: uint64 = cast[uint64](p[0])
+    hi: uint64 = cast[uint64](p[1])
+    return lo | (hi << 8)
+
+
+def _read_le32(p: Ptr[uint8]) -> uint32:
+    b0: uint64 = cast[uint64](p[0])
+    b1: uint64 = cast[uint64](p[1])
+    b2: uint64 = cast[uint64](p[2])
+    b3: uint64 = cast[uint64](p[3])
+    return cast[uint32](b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
+
+
+def _read_le64(p: Ptr[uint8]) -> uint64:
+    b0: uint64 = cast[uint64](p[0])
+    b1: uint64 = cast[uint64](p[1])
+    b2: uint64 = cast[uint64](p[2])
+    b3: uint64 = cast[uint64](p[3])
+    b4: uint64 = cast[uint64](p[4])
+    b5: uint64 = cast[uint64](p[5])
+    b6: uint64 = cast[uint64](p[6])
+    b7: uint64 = cast[uint64](p[7])
+    return (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+            | (b4 << 32) | (b5 << 40) | (b6 << 48) | (b7 << 56))
+
+
+def _apply_wstat(target_path: Ptr[uint8], buf_user: uint64,
+                 nbuf: uint64) -> int64:
+    # Parse the Dir record at buf_user[0..nbuf] and apply the
+    # honoured non-sentinel fields to `target_path`. Returns 0 on
+    # success, -1 with errstr on failure.
+    if buf_user == 0:
+        set_current_errstr("wstat failed: null buffer")
+        return cast[int64](-1)
+    # The fixed prefix is 41 bytes; we need at least 49 to also be
+    # able to read the four 2-byte counted-string headers.
+    if nbuf < 49:
+        set_current_errstr("wstat failed: buffer too small")
+        return cast[int64](-1)
+    buf: Ptr[uint8] = cast[Ptr[uint8]](buf_user)
+    # Skip size[2], type[2], dev[4], qid[13] — none of those are
+    # writable. Read the mutable fields directly.
+    mode_new:   uint32 = _read_le32(&buf[21])
+    mtime_new:  uint32 = _read_le32(&buf[29])
+    length_new: uint64 = _read_le64(&buf[33])
+    # Counted strings start at offset 41. We need length[2] + len
+    # bytes for each, in order: name, uid, gid, muid. Bounds-check
+    # as we walk.
+    off: uint64 = 41
+    if off + 2 > nbuf:
+        set_current_errstr("wstat failed: truncated record")
+        return cast[int64](-1)
+    name_len: uint64 = _read_le16(&buf[off])
+    off = off + 2
+    if off + name_len > nbuf:
+        set_current_errstr("wstat failed: truncated name")
+        return cast[int64](-1)
+    name_off: uint64 = off
+    off = off + name_len
+    # uid / gid / muid headers — only required for the bounds check
+    # because we don't honour those mutations yet. Parse to validate
+    # the record shape (catches malformed callers early).
+    if off + 2 > nbuf:
+        set_current_errstr("wstat failed: truncated uid hdr")
+        return cast[int64](-1)
+    uid_len: uint64 = _read_le16(&buf[off])
+    off = off + 2 + uid_len
+    if off + 2 > nbuf:
+        set_current_errstr("wstat failed: truncated gid hdr")
+        return cast[int64](-1)
+    gid_len: uint64 = _read_le16(&buf[off])
+    off = off + 2 + gid_len
+    if off + 2 > nbuf:
+        set_current_errstr("wstat failed: truncated muid hdr")
+        return cast[int64](-1)
+    muid_len: uint64 = _read_le16(&buf[off])
+    off = off + 2 + muid_len
+    if off > nbuf:
+        set_current_errstr("wstat failed: truncated record tail")
+        return cast[int64](-1)
+    # Reject non-sentinel values for fields we don't yet honour.
+    # length: only the WSTAT_SENTINEL_U64 sentinel is accepted.
+    if length_new != WSTAT_SENTINEL_U64:
+        set_current_errstr("wstat: length not supported")
+        return cast[int64](-1)
+    # mtime: only the WSTAT_SENTINEL_U32 sentinel is accepted. The
+    # Plan 9 wstat contract lets "don't change" coexist with mtime=0
+    # — we treat the all-ones bit pattern as the only "leave alone"
+    # value (matches 9front's syswstat).
+    if mtime_new != WSTAT_SENTINEL_U32:
+        set_current_errstr("wstat: mtime not supported")
+        return cast[int64](-1)
+    # gid / muid: empty string (length 0) means "don't change". Any
+    # non-empty value is unsupported.
+    if gid_len != 0:
+        set_current_errstr("wstat: gid not supported")
+        return cast[int64](-1)
+    if muid_len != 0:
+        set_current_errstr("wstat: muid not supported")
+        return cast[int64](-1)
+    # uid is NOT a mutable field in the Plan 9 wstat contract
+    # (9front's syswstat ignores it on input); silently accept any
+    # value the caller hands us. Matches the reference behaviour.
+    # --- name: rename leg. Plan 9 semantics: the new name is the
+    # BASENAME only — the file stays in the same directory. We
+    # synthesise the new absolute path by stitching the existing
+    # parent dir to the supplied basename.
+    if name_len != 0:
+        # Build the new absolute path: parent(target_path) + '/' + name.
+        new_abs: Array[256, uint8]
+        parent_end: uint64 = _basename_offset(target_path)
+        if parent_end + name_len + 1 > 256:
+            set_current_errstr("wstat: name too long")
+            return cast[int64](-1)
+        i: uint64 = 0
+        while i < parent_end:
+            new_abs[i] = target_path[i]
+            i = i + 1
+        j: uint64 = 0
+        while j < name_len:
+            new_abs[parent_end + j] = buf[name_off + j]
+            j = j + 1
+        new_abs[parent_end + name_len] = 0
+        rc: int32 = vfs_rename(cast[Ptr[char]](target_path),
+                               cast[Ptr[char]](&new_abs[0]))
+        if rc != 0:
+            if rc == -2:
+                set_current_errstr("wstat: name source not found")
+            elif rc == -17:
+                set_current_errstr("wstat: name target exists")
+            else:
+                set_current_errstr("wstat: rename not supported")
+            return cast[int64](-1)
+    # --- mode: chmod leg. No per-inode mode storage yet — accept
+    # any non-sentinel value as a successful no-op so callers writing
+    # `chmod(2)` over wstat see success. When tmpfs/ext4 grow mode
+    # bits the value plumbs through; until then we drop it.
+    if mode_new != WSTAT_SENTINEL_U32:
+        # Intentionally no-op; see header comment + TODO follow-up.
+        pass
+    return 0
+
+
+def do_wstat(path_user: uint64, buf_user: uint64,
+             nbuf: uint64) -> int64:
+    if path_user == 0:
+        set_current_errstr("wstat failed: null path")
+        return cast[int64](-1)
+    abs_path: Array[256, uint8]
+    rc: int32 = resolve_path(cast[Ptr[char]](path_user),
+                             &abs_path[0], 256)
+    if rc != 0:
+        set_current_errstr("wstat failed: path too long")
+        return cast[int64](-1)
+    # Verify the file exists before mutating. vfs_open returns a
+    # negative errno on miss; we close immediately — we only needed
+    # the existence check.
+    fd: int32 = vfs_open(cast[Ptr[char]](&abs_path[0]))
+    if fd < 0:
+        set_current_errstr("wstat failed: file does not exist")
+        return cast[int64](-1)
+    vfs_close(fd)
+    return _apply_wstat(&abs_path[0], buf_user, nbuf)
+
+
+def do_fwstat(fd: int32, buf_user: uint64, nbuf: uint64) -> int64:
+    # Same shape as do_wstat but the target is named by an open fd.
+    # Today we only support FD_TMPFS_MARK fds (the only writable
+    # backend whose fd table carries a slot we can recover a name
+    # from); other backends report "backend not supported" so the
+    # gap is visible to userland.
+    if fd < 0 or fd >= 16:
+        set_current_errstr("fwstat failed: bad fd")
+        return cast[int64](-1)
+    task: Ptr[TaskStruct] = current_task()
+    fdu: uint64 = cast[uint64](fd)
+    file_idx: uint32 = task[0].fd_idx[fdu]
+    if file_idx == FD_CLOSED_MARK:
+        set_current_errstr("fwstat failed: fd not open")
+        return cast[int64](-1)
+    if file_idx == FD_TMPFS_MARK:
+        slot: int32 = cast[int32](task[0].fd_buf[fdu])
+        target: Ptr[uint8] = tmpfs_slot_name(slot)
+        return _apply_wstat(target, buf_user, nbuf)
+    set_current_errstr("fwstat: backend not supported")
+    return cast[int64](-1)

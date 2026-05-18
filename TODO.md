@@ -157,6 +157,42 @@ it has to honour.
     TaskStruct (deferred this round because the brk agent owns
     TaskStruct edits) so we can return the EXACT open()-time path
     9front's sysfd2path guarantees.~~
+  - ~~`wstat` / `fwstat` (266 / 267) — shipped. Bodies in
+    `sys/src/9/port/sysfile.ad::do_wstat` + `do_fwstat`. Closes the
+    Phase B reserved-syscall block (256..271) — everything reserved
+    is now real. The Dir-record parser honours TWO mutable fields
+    today:
+      * `name` (rename) — routed through new `vfs_rename`
+        (`fs/vfs.ad`) → `tmpfs_rename` (`fs/tmpfs.ad`). The new
+        name is taken as a basename; the kernel stitches the old
+        parent dir onto it (Plan 9 wstat semantics).
+      * `mode` (chmod) — accepted as a successful no-op (no
+        per-inode mode storage yet).
+    `length` / `mtime` / `gid` / `muid` MUST be the wstat sentinel
+    (`~0` for ints, empty string for counted strings); a non-
+    sentinel value surfaces -1 with
+    `errstr("wstat: <field> not supported")`. `fwstat` is wired
+    for FD_TMPFS_MARK fds only; other backends report
+    `errstr("fwstat: backend not supported")`. End-to-end fixture
+    `tests/test_p9wstat.ad`; see `scripts/test_p9wstat.sh`.~~
+    Follow-ups:
+      * `length` (truncate) — needs a backend hook
+        (`tmpfs_truncate`, `ext4_truncate`). Cheap on tmpfs (just
+        set `.size`), harder on ext4 (must walk + free extents).
+      * `mtime` (utime) — Hamnix has no per-inode mtime storage
+        today; the stat path returns boot-jiffies for every file.
+        Plumb a real per-inode mtime through tmpfs + ext4 first,
+        then make wstat write into it.
+      * `gid` / `muid` — wait for a users database (`/adm/users`
+        in Plan 9). Hamnix is single-user (`hamnix`) so the field
+        has nowhere meaningful to land.
+      * `mode` storage — drop the no-op and plumb the new value
+        through `tmpfs.TmpfsEntry` + ext4 inode rewrite once
+        per-inode mode bits exist.
+      * `ext4` rename — `vfs_rename` returns -EROFS for non-tmpfs
+        paths. ext4 needs `ext4_dir_remove` + `ext4_dir_insert` in
+        the same transaction; lands alongside the L-track ext4
+        write expansion.~~
 - **Phase D** prerequisite — `srvfd` channels at `/srv/<name>`.
   `mount` needs `srvfd` to come from somewhere; without it the
   Phase C `mount` body has nothing to consume.

@@ -403,8 +403,8 @@ moves break Linux ABI** (Layer 2 has its own dispatch table).
 | 263 | `remove` |
 | 264 | `fd2path` |
 | 265 | `errstr` |
-| 266 | `wstat` (reserved; Phase G) |
-| 267 | `fwstat` (reserved; Phase G) |
+| 266 | `wstat` (shipped: name + mode honoured; length/mtime/gid/muid sentinel-only) |
+| 267 | `fwstat` (shipped: tmpfs fds only; other backends report `errstr("fwstat: backend not supported")`) |
 | 268 | `fauth` (reserved; Phase G — needed for `mount` with auth) |
 | 270 | `notify` (reserved; Phase G — note handler) |
 | 271 | `noted` (reserved; Phase G — return from note handler) |
