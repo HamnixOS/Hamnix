@@ -451,17 +451,23 @@ it has to honour.
 - `clone` / `clone3` (56 / 435) — pthread bring-up.
 - Per-task heap state — `linux_brk` is a single global today;
   multi-process Linux binaries will collide.
-- **U39 follow-up: swap MicroPython for full CPython.**
-  `tests/u-binary/u_python` ships MicroPython 1.22.0 because
-  Debian's `libpython3.13.a` is non-PIC and a from-source
-  CPython static-pie build takes 20-40 min. To upgrade:
-  build CPython 3.11 from source with `CFLAGS=-fPIC`,
-  `--disable-shared`, link as static-pie. Expect 50-100 new
-  `-ENOSYS` hits the first boot — strace on host first,
-  cross-reference against `linux_abi/u_syscalls.ad`, add
-  bodies for the boot-path syscalls (`epoll_create1` /
-  `epoll_ctl` / `epoll_wait` can stay -ENOSYS; CPython has
-  a `select(2)` fallback). See `tests/u-binary/src/python/HOWTO.md`.
+- ~~**U39 follow-up: swap MicroPython for full CPython.**~~
+  Partially shipped at U41 (`tests/u-binary/u_cpython` + Makefile +
+  HOWTO + `scripts/test_u41_cpython.sh`). CPython 3.11.10 builds
+  cleanly as a `-static` (not `-static-pie`) ~5.7 MB stripped ELF
+  via `make -C tests/u-binary/src/cpython install`. The binary
+  exec's through the U-track ELF loader and reaches the importlib
+  init phase BUT then aborts with `Fatal Python error:
+  pycore_interp_init: failed to initialize importlib / MemoryError`
+  before reaching `print()`. Root cause: CPython 3.11's importlib
+  init needs ~10-15 MiB of heap during bootstrap, while Hamnix's
+  per-task `LINUX_BRK_RESERVE` (linux_abi/u_syscalls.ad) is 4 MiB
+  and `LINUX_MMAP_SLOTS` is 32. No `linux_u: unknown syscall nr=N`
+  lines appeared, no traps, no page faults — the failure is silent
+  malloc-NULL. See `tests/u-binary/src/cpython/HOWTO.md` "Known
+  blocker" for the fix candidates (bump BRK_RESERVE to 32 MiB +
+  MMAP_SLOTS to 256+ is the easy path; lazy brk growth via a real
+  per-task vma is the right path long-term).
 - **U39 follow-up: fix glibc-malloc brk-grow corner case.**
   MicroPython under U39 needs `-X heapsize=64k` because a
   1 MiB heap forces glibc-malloc's main_arena onto our
