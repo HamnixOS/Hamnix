@@ -378,11 +378,23 @@ it has to honour.
     accessors and emits Linux-shape kB lines so the eventual
     Layer-2 `/proc/{cpuinfo,meminfo}` translation is a near-direct
     byte copy. Follow-ups (separate commits):~~
-      * `/dev/uptime` — ASCII decimal seconds-since-boot (+
-        idle-seconds once we have an idle accounting field).
-      * `/dev/loadavg` — Linux-shape "1.00 1.00 1.00 1/N pid".
+      * ~~`/dev/uptime` — ASCII decimal seconds-since-boot (+
+        idle-seconds once we have an idle accounting field).~~
+        M16.132 shipped: `<secs>.<CC> <idle>.<CC>\n` from
+        `get_jiffies()` (HZ=100). Idle column is "0.00" pending
+        per-task idle accounting on TaskStruct — follow-up: add
+        an `idle_jiffies` field that's bumped from the scheduler's
+        idle path so the second column tracks real idle time.
+      * ~~`/dev/loadavg` — Linux-shape "1.00 1.00 1.00 1/N pid".
         Needs a moving-average runqueue depth counter in
-        `kernel/sched/core.ad` first.
+        `kernel/sched/core.ad` first.~~ M16.132 shipped: emits
+        instantaneous RUNNING+READY count three times (NOT an
+        EWMA). Real EWMA wants a per-tick sampler in
+        `arch/x86/kernel/time.ad::timer_interrupt` that snapshots
+        the runqueue depth every HZ ticks and folds into three
+        decay-rated accumulators (1884 / 2014 / 2037 — see
+        Linux's `kernel/sched/loadavg.c`). Idle-accounting
+        prerequisite shared with `/dev/uptime` above.
       * `/dev/stat` — aggregate "cpu / intr / ctxt / btime /
         processes" snapshot (mirror of `/proc/stat`). Reuses the
         cpuinfo CPUID helpers + a new IRQ-count accessor in
