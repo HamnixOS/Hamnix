@@ -39,8 +39,13 @@ python3 -m compiler.adder compile \
     tests/test_9p_v3_defaults.ad \
     -o "$TEST_ELF" >/dev/null
 
-echo "[test_9p_v3_defaults] (3/5) Plant /init = hamsh + /bin/test_9p_v3_defaults in cpio"
-INIT_ELF="$HAMSH_ELF" python3 scripts/build_initramfs.py >/dev/null
+# V3.5: /init is the recipe-applying init.elf, NOT hamsh directly.
+# init runs the canonical Plan 9 binds ('#s' -> /srv, '#p' -> /proc,
+# '#/' -> /n) then exec's hamsh, so the in-shell test sees the same
+# /srv / /n / /proc/<pid>/ns surface V3 promised — just via the V3.5
+# device-alias plumbing rather than hardcoded VFS arms.
+echo "[test_9p_v3_defaults] (3/5) Plant /init = init.elf (which execs hamsh) + /bin/test_9p_v3_defaults in cpio"
+python3 scripts/build_initramfs.py >/dev/null
 
 echo "[test_9p_v3_defaults] (4/5) Rebuild kernel image"
 mkdir -p build
@@ -51,18 +56,19 @@ python3 -m compiler.adder compile \
 
 echo "[test_9p_v3_defaults] (5/5) Boot QEMU + drive the test via hamsh"
 LOG=$(mktemp)
-trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
+trap 'rm -f "$LOG"' EXIT
 
 set +e
 (
-    # Match scripts/test_ns_isolation.sh pacing — let the kernel finish
-    # smoke tests + sched_init before hamsh starts reading stdin.
-    sleep 3
+    # Pacing: V3.5 adds init.elf in front of hamsh, which prints the
+    # recipe + execs. Bump the boot wait one second over V3 so the
+    # shell is prompt-ready before we type.
+    sleep 4
     printf '/bin/test_9p_v3_defaults\n'
     sleep 4
     printf 'exit\n'
     sleep 1
-) | timeout 25s qemu-system-x86_64 \
+) | timeout 30s qemu-system-x86_64 \
     -kernel "$ELF" \
     -smp 2 \
     -nographic \

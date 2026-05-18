@@ -41,6 +41,7 @@ build_adder_user() {
     file "build/user/${name}.elf"
 }
 
+build_adder_user init                 # V3.5: Plan 9 userspace init (PID 1 / namespace recipe + exec hamsh)
 build_adder_user hamsh                # M16.35: interactive shell
 build_adder_user ps                   # M16.36: dumps /proc snapshots
 build_adder_user echo                 # M16.37: writes argv to stdout
