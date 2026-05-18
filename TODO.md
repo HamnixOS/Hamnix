@@ -396,6 +396,31 @@ it has to honour.
   than one chunk" and pre-allocate the whole tail in one
   kmalloc call so contiguity is guaranteed up to MAX_ORDER
   (4 MiB).
+- **U40 follow-up: musl-busybox exit-group / getdents64
+  surface.** `tests/u-binary/u_busybox_musl` lands at M16.X
+  (see `scripts/test_u40_musl_busybox.sh`). The banner +
+  `busybox echo` round-trip cleanly through hamsh, but a
+  follow-up applet that walks a directory (`busybox ls /etc`)
+  trips a #GP at vector 0x0d inside the libc exit-cleanup
+  / getdents64 path. The first echo's tail-of-process
+  teardown is suspect too — the test runs to PASS on the
+  banner + echo markers and explicitly tolerates the TRAP.
+  Fix candidates: (a) trace musl's `exit_group` -> `set_robust_list`
+  -> `rseq` teardown and stub the missing syscall numbers
+  in `linux_abi/u_syscalls.ad`; (b) implement `getdents64`
+  (217) with a real body so `ls` works (today it returns
+  -ENOSYS, which musl handles, but the follow-on cleanup
+  apparently doesn't survive). See
+  `tests/u-binary/src/musl_busybox/HOWTO.md` for the
+  `make -C tests/u-binary/src/musl_busybox install`
+  rebuild path.
+- **U40 follow-up: more musl-built userland.** CPython 3.11
+  static via musl (size sweet spot between MicroPython at
+  900 KB and full CPython at 25 MB), apt-static via musl
+  (the "install Debian packages" goal), then more applet
+  coverage in the busybox `.config` (TLS / awk / sed are
+  off today to keep the binary lean; turn them on once we
+  have a real applet test that needs them).
 
 ## Storage
 
