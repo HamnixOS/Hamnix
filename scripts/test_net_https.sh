@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # scripts/test_net_https.sh — exercise the in-kernel TLS 1.3 client end-
-# to-end via https_get(), with V5 server cert chain validation.
+# to-end via https_get(), with V5 server cert chain validation + V5.1
+# CertificateVerify transcript-binding (RFC 8446 §4.4.3).
 #
 # V5 strategy (path-(a) per the V5 brief):
 #
@@ -20,13 +21,30 @@
 #      127.0.0.1:9443`. The kernel's https_local_smoke_test() calls
 #      https_get("https://10.0.2.200/") → tls_handshake walks the chain,
 #      verifies the leaf against the planted Hamnix Test CA, prints
-#      "[tls] cert chain validated", and the HTTP round-trip completes.
+#      "[tls] cert chain validated", THEN verifies the server's
+#      CertificateVerify signature against the leaf pubkey + transcript
+#      hash, printing "[tls] CertificateVerify ok (rsa_pss)", and the
+#      HTTP round-trip completes.
 #
-# PASS marker (V5): "[test_net_https] PASS (cert-validated)".
-# We require both "[tls] cert chain validated" AND the existing
-# "[https-local] GET 10.0.2.200 -> status=200" + body-shape grep — so a
-# regression that silently accepts an invalid chain still fails the
-# test on the missing validation line.
+# PASS marker (V5+V5.1): "[test_net_https] PASS (cert-validated)".
+# We require ALL of:
+#   - "[tls] cert chain validated"          (V5 chain validation)
+#   - "[tls] CertificateVerify ok (rsa_pss)" (V5.1 transcript binding)
+#   - "[https-local] GET 10.0.2.200 -> status=200"
+#   - HTML body contains "<!doctype html>"
+# so a regression that silently accepts an invalid chain OR a forged
+# CertificateVerify fails the test on the missing line.
+#
+# NEGATIVE CV CASE — NOT IMPLEMENTED (left as a follow-up):
+# Forging a server CertificateVerify signed with the WRONG private key
+# requires a hand-crafted TLS server (Python's ssl module loads cert +
+# key as a pair, refusing mismatched inputs with KEY_VALUES_MISMATCH).
+# A future test fixture could wrap the TLS_AES_128_GCM_SHA256 wire
+# format directly to splice in a forged CertificateVerify and assert
+# "[tls] CertificateVerify FAILED — handshake abort"; the kernel code
+# path is exercised today by the truncated-header + sig-overrun bailout
+# paths in _tls_drive_post_sh, which are unit-testable via _tls_verify_
+# cert_verify(-1)-style returns but not via this E2E fixture.
 
 . "$(dirname "$0")/_build_lock.sh"
 
@@ -211,18 +229,33 @@ echo "[test_net_https] --- srv log ---"
 cat "$SRVLOG" || true
 echo "[test_net_https] --- end srv ---"
 
-# V5 success: cert chain validated AND full TLS round-trip.
+# V5+V5.1 success: cert chain validated AND CertificateVerify ok AND
+# full TLS round-trip. The CV marker comes from
+# drivers/net/tls.ad::_tls_drive_post_sh's TLS_HS_CERT_VERIFY branch.
 if grep -F -q "[tls] cert chain validated" "$LOG"; then
+    if ! grep -F -q "[tls] CertificateVerify ok" "$LOG"; then
+        echo "[test_net_https] FAIL: chain validated but no CertificateVerify ok marker (V5.1 transcript-binding skipped?)"
+        cat "$LOG"
+        exit 1
+    fi
     if grep -F -q "[https-local] GET 10.0.2.200 -> status=200" "$LOG"; then
         if grep -i -E -q '<!doctype html>' "$LOG"; then
             echo "[test_net_https] PASS (cert-validated)"
             exit 0
         fi
-        echo "[test_net_https] FAIL: chain validated + 200 OK but body has no <!doctype html>"
+        echo "[test_net_https] FAIL: chain validated + CV ok + 200 OK but body has no <!doctype html>"
         cat "$LOG"
         exit 1
     fi
-    echo "[test_net_https] FAIL: chain validated but no 200 OK marker"
+    echo "[test_net_https] FAIL: chain validated + CV ok but no 200 OK marker"
+    cat "$LOG"
+    exit 1
+fi
+
+# CertificateVerify failure path (chain validated but CV signature
+# rejected). This is the genuine MITM-detection path.
+if grep -F -q "[tls] CertificateVerify FAILED" "$LOG"; then
+    echo "[test_net_https] FAIL (CertificateVerify rejected — leaf-key/transcript mismatch)"
     cat "$LOG"
     exit 1
 fi

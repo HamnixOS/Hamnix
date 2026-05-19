@@ -33,8 +33,9 @@
 #       ClientHello -> ServerHello -> {EncryptedExtensions, Certificate,
 #       CertificateVerify, Finished} -> Finished -> application data.
 #     Single cipher suite (TLS_CHACHA20_POLY1305_SHA256 = 0x1303), single
-#     group (X25519 = 0x001D), signature_algorithms is sent for compliance
-#     but the server's CertificateVerify signature is NOT validated.
+#     group (X25519 = 0x001D). Both the server's certificate CHAIN (V5)
+#     and the CertificateVerify TRANSCRIPT-BINDING signature (this layer)
+#     are validated before we accept the server Finished.
 #
 # === V5: server cert chain IS validated =================================
 #
@@ -48,6 +49,25 @@
 #     lib/ecdsa/ecdsa.ad       (V3)  ECDSA-P256 signature verify
 #   - lib/x509/chain.ad        (V4)  chain build + CA trust store
 #
+# === V5.1: CertificateVerify transcript binding =========================
+#
+# RFC 8446 §4.4.3. Even with a chain that walks up to a trusted root, an
+# attacker who has obtained a valid LE-issued cert for *some* name could
+# splice it into a handshake for a *different* name as a MITM. The leaf
+# only proves "the holder of leaf.pubkey signed the transcript hash up to
+# and including the Certificate message"; the chain check proves "the
+# leaf was issued by a trusted CA". Both must hold.
+#
+# This layer verifies the CertificateVerify signature against the LEAF
+# pubkey (re-parsed from _tls_chain_ptrs[0]) over the canonical signed-
+# buffer:
+#   64 * 0x20  ||  "TLS 1.3, server CertificateVerify"  ||  0x00
+#       || Transcript-Hash(ClientHello..Certificate)
+# Dispatch:
+#   rsa_pss_rsae_sha256 (0x0804)   -> rsa_pss_verify
+#   ecdsa_secp256r1_sha256 (0x0403) -> ecdsa_p256_verify
+#   anything else                  -> decrypt_error alert + abort
+#
 # Trust anchors:
 #   - ISRG Root X1 (Let's Encrypt) is baked in via /etc/tls-ca-isrg-x1.der
 #     in the initramfs (planted by scripts/build_initramfs.py from
@@ -58,11 +78,13 @@
 #     scripts/test_net_https.sh uses this to inject a fake Hamnix Test
 #     CA without rebuilding the kernel for every harness run.
 #
-# Out of scope for V5 (V4 documented intentional gaps):
+# Out of scope for V5 + V5.1 (V4 documented intentional gaps):
 #   - CRL / OCSP revocation
 #   - RSA-PKCS#1-v1.5 dispatch (PSS + ECDSA only)
 #   - ECDSA curves other than P-256
 #   - const-time hardening
+#   - Client-auth CertificateVerify (server side only here)
+#   - HelloRetryRequest
 # =======================================================================
 
 from kernel.printk.printk import printk0, printk1, printk2
@@ -83,6 +105,14 @@ from lib.ecdsa.ecdsa import ecdsa_init
 from lib.x509.chain import (
     castore_init, castore_add_root, castore_count,
     validate_cert_chain,
+)
+# V5.1: re-parse the leaf cert here and verify CertificateVerify against
+# its public key. The chain validator's leaf_scratch is overwritten by
+# the chain walk for chain_count > 1, so we keep our own scratch.
+from lib.x509.x509 import X509Cert, x509_parse
+from lib.rsa.rsa import RsaPubkey, rsa_parse_pubkey, rsa_pss_verify
+from lib.ecdsa.ecdsa import (
+    EcdsaPubkey, ecdsa_parse_pubkey, ecdsa_p256_verify,
 )
 from fs.cpio import (
     initramfs_entry_count, initramfs_entry_name,
@@ -2378,6 +2408,55 @@ _tls_val_init_ran:   int32 = 0
 TLS_BUILD_EPOCH_FALLBACK: uint64 = 1779667200
 
 
+# -- V5.1 CertificateVerify globals ----------------------------------------
+#
+# Per RFC 8446 §4.4.3 the server CertificateVerify signature is over
+#   64 * 0x20 || "TLS 1.3, server CertificateVerify" || 0x00 ||
+#       Transcript-Hash(ClientHello..Certificate)
+# = 64 + 33 + 1 + 32 = 130 bytes. We freeze the transcript hash after
+# the Certificate message gets streamed into the running transcript;
+# the CertificateVerify message itself is NOT included.
+
+TLS_CV_CONTEXT_LEN:   uint64 = 130   # 64 + 33 + 1 + 32
+TLS_ALERT_DECRYPT_ERROR: uint8 = 51
+
+# Saved transcript hash as-of-Certificate. Filled in the Certificate
+# branch of _tls_drive_post_sh, consumed in the CertificateVerify branch.
+_tls_th_after_cert:   Array[32, uint8]
+# Sticky guard: 1 once _tls_th_after_cert holds a snapshot for this
+# handshake. CertificateVerify before Certificate is a protocol error.
+_tls_th_after_cert_set: int32 = 0
+
+# Stable copy of the LEAF certificate DER bytes. We can't keep the
+# original _tls_chain_ptrs[0] pointer live across plaintext records:
+# tls_pt_buf is reused on every _tls_decrypt_record call, so by the
+# time the CertificateVerify message arrives in a fresh record, the
+# Certificate-message plaintext (and the leaf cert bytes inside it)
+# have already been overwritten. We copy the leaf DER into this BSS
+# slot the moment the chain validator returns success.
+#
+# The X.509 max-cert-size cap matches castore_root_bytes (lib/x509/
+# chain.ad CASTORE_ROOT_BYTES = 2048) — public-CA leaves run
+# 1.2..1.6 KiB; a 2 KiB ceiling is comfortable.
+TLS_LEAF_COPY_MAX:    uint64 = 4096
+_tls_leaf_copy_buf:   Array[4096, uint8]
+_tls_leaf_copy_len:   uint64 = 0
+
+# Canonical signed buffer for CV. Pre-filled with the fixed 98-byte
+# prefix (64 spaces + label + 0x00) by _tls_cv_prefix_init; the trailing
+# 32 bytes are written from the transcript snapshot on every CV verify.
+_tls_cv_signed_buf:   Array[130, uint8]
+_tls_cv_prefix_inited: int32 = 0
+
+# Leaf cert re-parsed from _tls_chain_ptrs[0] for the CV check. We keep
+# our own X509Cert (rather than peeking at chain.ad's leaf_scratch)
+# because the chain walker overwrites leaf_scratch / current_scratch
+# when chain_count > 1.
+_tls_leaf_scratch:    X509Cert
+_tls_leaf_rsa:        RsaPubkey
+_tls_leaf_ecdsa:      EcdsaPubkey
+
+
 def _tls_now_unix() -> uint64:
     # Walltime in unix seconds for the chain validator. Prefer the live
     # RTC read (drivers/rtc/cmos.ad reads the CMOS chip on every call and
@@ -3065,17 +3144,146 @@ def _tls_send_alert_under_hs(tcp_slot: int32, desc: uint8) -> int32:
     return 0
 
 
+# -- V5.1 CertificateVerify helpers ----------------------------------------
+#
+# RFC 8446 §4.4.3 says the signed input is exactly:
+#
+#   64 octets of 0x20 (ASCII space)
+#       || "TLS 1.3, server CertificateVerify"   (33 ASCII bytes)
+#       || 0x00                                  (1 separator byte)
+#       || Transcript-Hash(Handshake Context, Certificate)  (32 bytes)
+#
+# Total 130 bytes for SHA-256-bound suites. We pre-bake the fixed
+# 98-byte prefix once (the 64 spaces + label + NUL) and stamp the
+# transcript snapshot into the trailing 32 bytes on each verify.
+
+def _tls_cv_prefix_init():
+    # Lazy one-shot — runs the first time we get to a CertificateVerify
+    # message. The cost is 130 bytes of BSS plus a single memset+memcpy
+    # at startup, both of which are negligible relative to the per-
+    # handshake rsa_pss_verify call.
+    if _tls_cv_prefix_inited != 0:
+        return
+    _tls_cv_prefix_inited = 1
+    i: uint64 = 0
+    while i < 64:
+        _tls_cv_signed_buf[i] = 0x20      # ASCII space
+        i = i + 1
+    # ASCII for "TLS 1.3, server CertificateVerify" — 33 bytes. We
+    # encode byte-by-byte (Adder lacks byte-literal-string fill, see
+    # memory/feedback_compiler_quirks.md; printf-style "_init_*()"
+    # runtime-fill is the stable pattern).
+    _tls_cv_signed_buf[64]  = 0x54   # T
+    _tls_cv_signed_buf[65]  = 0x4C   # L
+    _tls_cv_signed_buf[66]  = 0x53   # S
+    _tls_cv_signed_buf[67]  = 0x20   # ' '
+    _tls_cv_signed_buf[68]  = 0x31   # 1
+    _tls_cv_signed_buf[69]  = 0x2E   # .
+    _tls_cv_signed_buf[70]  = 0x33   # 3
+    _tls_cv_signed_buf[71]  = 0x2C   # ,
+    _tls_cv_signed_buf[72]  = 0x20   # ' '
+    _tls_cv_signed_buf[73]  = 0x73   # s
+    _tls_cv_signed_buf[74]  = 0x65   # e
+    _tls_cv_signed_buf[75]  = 0x72   # r
+    _tls_cv_signed_buf[76]  = 0x76   # v
+    _tls_cv_signed_buf[77]  = 0x65   # e
+    _tls_cv_signed_buf[78]  = 0x72   # r
+    _tls_cv_signed_buf[79]  = 0x20   # ' '
+    _tls_cv_signed_buf[80]  = 0x43   # C
+    _tls_cv_signed_buf[81]  = 0x65   # e
+    _tls_cv_signed_buf[82]  = 0x72   # r
+    _tls_cv_signed_buf[83]  = 0x74   # t
+    _tls_cv_signed_buf[84]  = 0x69   # i
+    _tls_cv_signed_buf[85]  = 0x66   # f
+    _tls_cv_signed_buf[86]  = 0x69   # i
+    _tls_cv_signed_buf[87]  = 0x63   # c
+    _tls_cv_signed_buf[88]  = 0x61   # a
+    _tls_cv_signed_buf[89]  = 0x74   # t
+    _tls_cv_signed_buf[90]  = 0x65   # e
+    _tls_cv_signed_buf[91]  = 0x56   # V
+    _tls_cv_signed_buf[92]  = 0x65   # e
+    _tls_cv_signed_buf[93]  = 0x72   # r
+    _tls_cv_signed_buf[94]  = 0x69   # i
+    _tls_cv_signed_buf[95]  = 0x66   # f
+    _tls_cv_signed_buf[96]  = 0x79   # y
+    _tls_cv_signed_buf[97]  = 0x00   # NUL separator
+    # The trailing 32 bytes (transcript hash) are filled per-handshake
+    # in _tls_verify_cert_verify; leave them zero here.
+    i = 98
+    while i < TLS_CV_CONTEXT_LEN:
+        _tls_cv_signed_buf[i] = 0
+        i = i + 1
+
+
+def _tls_verify_cert_verify(sig_alg: uint16,
+                             sig_bytes: Ptr[uint8], sig_len: uint64,
+                             leaf_cert: Ptr[uint8], leaf_len: uint64,
+                             th_snapshot: Ptr[uint8]) -> int32:
+    # Verify the server's CertificateVerify signature per RFC 8446
+    # §4.4.3 against the LEAF certificate's public key. Returns 1 on
+    # success, 0 on a structural verify failure (bad signature), -1 on
+    # malformed input or an unsupported signature algorithm.
+    #
+    # The leaf cert is re-parsed here rather than reusing chain.ad's
+    # leaf_scratch — the chain walker overwrites that slot whenever the
+    # caller-supplied chain has >1 element, and we want this verify to
+    # be self-contained.
+    _tls_cv_prefix_init()
+    # Stamp the transcript hash into the trailing 32 bytes.
+    i: uint64 = 0
+    while i < 32:
+        _tls_cv_signed_buf[98 + i] = th_snapshot[i]
+        i = i + 1
+
+    # Re-parse the leaf cert to pull out its SPKI bytes. The caller
+    # passes a stable copy (not _tls_chain_ptrs[0]) because the original
+    # plaintext gets overwritten on the next AEAD record.
+    pr: int32 = x509_parse(leaf_cert, leaf_len, &_tls_leaf_scratch)
+    if pr != 0:
+        printk0("[tls] CertificateVerify: leaf re-parse failed\n")
+        return -1
+    pk_ptr: Ptr[uint8] = cast[Ptr[uint8]](&_tls_leaf_scratch.pubkey_bytes[0])
+    pk_len: uint64    = _tls_leaf_scratch.pubkey_bytes_len
+
+    if sig_alg == TLS_SIG_RSA_PSS_RSAE_SHA256:
+        rc: int32 = rsa_parse_pubkey(pk_ptr, pk_len, &_tls_leaf_rsa)
+        if rc != 0:
+            printk0("[tls] CertificateVerify: leaf RSA pubkey parse failed\n")
+            return -1
+        return rsa_pss_verify(&_tls_leaf_rsa,
+                              cast[Ptr[uint8]](&_tls_cv_signed_buf[0]),
+                              TLS_CV_CONTEXT_LEN,
+                              sig_bytes, sig_len)
+    if sig_alg == TLS_SIG_ECDSA_SECP256R1:
+        rc2: int32 = ecdsa_parse_pubkey(pk_ptr, pk_len, &_tls_leaf_ecdsa)
+        if rc2 != 0:
+            printk0("[tls] CertificateVerify: leaf ECDSA pubkey parse failed\n")
+            return -1
+        return ecdsa_p256_verify(&_tls_leaf_ecdsa,
+                                 cast[Ptr[uint8]](&_tls_cv_signed_buf[0]),
+                                 TLS_CV_CONTEXT_LEN,
+                                 sig_bytes, sig_len)
+    # Anything else (Ed25519, RSA-PKCS#1 v1.5, ECDSA with non-P256, ...)
+    # is treated as malformed for V5.1. V6 may wire in PKCS#1 v1.5.
+    return -1
+
+
 def _tls_drive_post_sh(tcp_slot: int32) -> int32:
     # Run the post-ServerHello half of the handshake to completion:
     #   1. Skip the optional ChangeCipherSpec record (middlebox compat).
     #   2. Loop reading encrypted handshake records under the server
     #      handshake traffic key. Inside each decrypted record, walk
     #      one-or-more handshake messages (type+length+body):
-    #         EncryptedExtensions     -> skip body, feed into transcript
-    #         Certificate             -> skip body (NO validation),
-    #                                    feed into transcript, warn
-    #         CertificateVerify       -> skip body (NO validation),
-    #                                    feed into transcript
+    #         EncryptedExtensions     -> feed into transcript
+    #         Certificate             -> parse list, validate chain
+    #                                    (V5), feed into transcript,
+    #                                    snapshot transcript hash for
+    #                                    the CertificateVerify check
+    #         CertificateVerify       -> verify signature over the
+    #                                    Certificate-snapshot transcript
+    #                                    against the leaf pubkey (V5.1,
+    #                                    RFC 8446 §4.4.3), then feed
+    #                                    into transcript
     #         Finished                -> HMAC-verify against the
     #                                    transcript hash as-of-CertVerify,
     #                                    then feed Finished bytes in.
@@ -3087,6 +3295,11 @@ def _tls_drive_post_sh(tcp_slot: int32) -> int32:
     # left open so the caller can switch to tls_send/tls_recv.
     saw_server_finished: int32 = 0
     th_before_sf: Array[32, uint8]
+    # Reset the per-handshake CertificateVerify-snapshot guard. A
+    # CertificateVerify message arriving before its matching Certificate
+    # is a protocol error; this guard surfaces it as an explicit abort
+    # rather than reading stale bytes from a previous handshake.
+    _tls_th_after_cert_set = 0
     # Per-message walk state across multiple records (a Certificate
     # alone is sometimes > 1 record, but the cipher fragments are
     # already reassembled inside one decrypted plaintext, so each
@@ -3244,20 +3457,91 @@ def _tls_drive_post_sh(tcp_slot: int32) -> int32:
                     _tls_send_alert_under_hs(tcp_slot,
                                              TLS_ALERT_BAD_CERTIFICATE)
                     return -1
+                # V5.1: stash the LEAF cert bytes into a stable BSS slot.
+                # The original _tls_chain_ptrs[0] points into tls_pt_buf,
+                # which gets reused on the NEXT _tls_decrypt_record call —
+                # by the time CertificateVerify arrives in a separate
+                # AEAD record, the original Certificate plaintext is
+                # gone. Copy now, while the bytes are still live.
+                leaf_src_len: uint64 = _tls_chain_lens[0]
+                if leaf_src_len == 0:
+                    printk0("[tls] leaf cert empty after chain validate\n")
+                    _tls_send_alert_under_hs(tcp_slot,
+                                             TLS_ALERT_BAD_CERTIFICATE)
+                    return -1
+                if leaf_src_len > TLS_LEAF_COPY_MAX:
+                    printk1("[tls] leaf cert too big (%d bytes) to copy for CV\n",
+                            leaf_src_len)
+                    _tls_send_alert_under_hs(tcp_slot,
+                                             TLS_ALERT_BAD_CERTIFICATE)
+                    return -1
+                leaf_src_ptr: Ptr[uint8] = _tls_chain_ptrs[0]
+                _tls_memcpy(cast[Ptr[uint8]](&_tls_leaf_copy_buf[0]),
+                            leaf_src_ptr, leaf_src_len)
+                _tls_leaf_copy_len = leaf_src_len
+                # V5.1: snapshot transcript hash AS OF the Certificate
+                # message (i.e. AFTER it has been streamed into the
+                # transcript, BEFORE the CertificateVerify body is fed
+                # in). The server signed exactly this hash; the matching
+                # CertificateVerify branch reads it back out.
+                _tls_sha256_snapshot_into(
+                    cast[Ptr[uint8]](&_tls_th_after_cert[0]))
+                _tls_th_after_cert_set = 1
             elif ht == TLS_HS_CERT_VERIFY:
-                # Wire shape: 2-byte signature_algorithm + 2-byte
-                # signature length + signature bytes. V5 still relies on
-                # the chain-walker's signature verify (which checks the
-                # leaf-to-root sig chain via the parent's pubkey); we
-                # don't separately verify the transcript-signature
-                # against the leaf pubkey yet — that's a V6 follow-up
-                # (RFC 8446 §4.4.3). Feed into the transcript hash so
-                # the subsequent Finished verifies.
-                if mlen >= 2:
-                    sa: uint16 = (cast[uint16](tls_pt_buf[mpos + 4]) << 8) \
-                        | cast[uint16](tls_pt_buf[mpos + 5])
-                    printk1("[tls] CertVerify sig_alg=0x%x (transcript-bind deferred)\n",
-                            cast[uint64](sa))
+                # Wire shape (RFC 8446 §4.4.3):
+                #   uint16 SignatureScheme algorithm;
+                #   opaque signature<0..2^16-1>;
+                # i.e. body = 2 bytes sig_alg + 2 bytes sig_len + sig.
+                # Verify the signature against the LEAF pubkey over the
+                # canonical signed-buffer with the transcript snapshot
+                # taken right after Certificate.
+                if _tls_th_after_cert_set == 0:
+                    printk0("[tls] CertificateVerify before Certificate — protocol abort\n")
+                    _tls_send_alert_under_hs(tcp_slot,
+                                             TLS_ALERT_DECRYPT_ERROR)
+                    return -1
+                if mlen < 4:
+                    printk0("[tls] CertificateVerify truncated header\n")
+                    _tls_send_alert_under_hs(tcp_slot,
+                                             TLS_ALERT_DECRYPT_ERROR)
+                    return -1
+                cv_sig_alg: uint16 = \
+                    (cast[uint16](tls_pt_buf[mpos + 4]) << 8) \
+                    | cast[uint16](tls_pt_buf[mpos + 5])
+                cv_sig_len: uint64 = \
+                    (cast[uint64](tls_pt_buf[mpos + 6]) << 8) \
+                    | cast[uint64](tls_pt_buf[mpos + 7])
+                if 4 + cv_sig_len > mlen:
+                    printk0("[tls] CertificateVerify sig length overruns message\n")
+                    _tls_send_alert_under_hs(tcp_slot,
+                                             TLS_ALERT_DECRYPT_ERROR)
+                    return -1
+                cv_sig_ptr: Ptr[uint8] = \
+                    cast[Ptr[uint8]](&tls_pt_buf[mpos + 8])
+                cv_rc: int32 = _tls_verify_cert_verify(
+                    cv_sig_alg,
+                    cv_sig_ptr, cv_sig_len,
+                    cast[Ptr[uint8]](&_tls_leaf_copy_buf[0]),
+                    _tls_leaf_copy_len,
+                    cast[Ptr[uint8]](&_tls_th_after_cert[0]))
+                if cv_rc == 1:
+                    if cv_sig_alg == TLS_SIG_RSA_PSS_RSAE_SHA256:
+                        printk0("[tls] CertificateVerify ok (rsa_pss)\n")
+                    elif cv_sig_alg == TLS_SIG_ECDSA_SECP256R1:
+                        printk0("[tls] CertificateVerify ok (ecdsa_p256)\n")
+                    else:
+                        printk1("[tls] CertificateVerify ok (sig_alg=0x%x)\n",
+                                cast[uint64](cv_sig_alg))
+                else:
+                    # cv_rc == 0 (well-formed but wrong signature) and
+                    # cv_rc == -1 (malformed / unsupported algorithm)
+                    # both collapse into a single failure marker: the
+                    # peer doesn't get to learn which path tripped.
+                    printk1("[tls] CertificateVerify FAILED — handshake abort (sig_alg=0x%x)\n",
+                            cast[uint64](cv_sig_alg))
+                    _tls_send_alert_under_hs(tcp_slot,
+                                             TLS_ALERT_DECRYPT_ERROR)
+                    return -1
                 _tls_tr_update(
                     cast[Ptr[uint8]](&tls_pt_buf[mpos]), 4 + mlen)
             elif ht == TLS_HS_FINISHED:
