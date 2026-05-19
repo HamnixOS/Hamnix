@@ -28,9 +28,23 @@
  *
  * Stubs (all live in .text):
  *   trap_diag_stub_06   - #UD, no error code; push 0 then vec 6.
+ *   trap_diag_stub_07   - #NM, no error code; push 0 then vec 7.
  *   trap_diag_stub_08   - #DF, error code (always 0 per AMD); push vec 8.
  *   trap_diag_stub_0d   - #GP, error code; push vec 13.
  *   trap_diag_stub_0e   - #PF, error code; push vec 14.
+ *   trap_diag_stub_10   - #MF, no error code; push 0 then vec 16.
+ *   trap_diag_stub_13   - #XF, no error code; push 0 then vec 19.
+ *
+ * M16.155-cr0-probe rationale for the new vectors: on Asus real silicon
+ * neither IRETQ (M16.154-eft) nor SYSRETQ (M16.155) ring-3 dispatch
+ * surfaces a print from the existing #UD/#DF/#GP/#PF handlers. If the
+ * first user instruction is an FPU or SIMD op AND CR0.TS=1 or CR0.EM=1,
+ * the CPU raises #NM (vector 7) — uninstalled, so it cascades through
+ * the boot-stub do_trap path and may not survive whatever made #DF die
+ * here. #MF (16, x87 FP error) and #XF (19, SIMD FP exception) are the
+ * other two FPU-side faults a first user instruction could trip. With
+ * dedicated diag handlers on the same shared IST1 stack we get a print
+ * instead of another stair-step into triple-fault.
  *
  * All four jump to common_trap_diag, which:
  *   1. Reads vec / error_code from stack.
@@ -67,6 +81,14 @@ trap_diag_stub_06:
     jmp     common_trap_diag
 
     .align 16
+    .globl trap_diag_stub_07
+trap_diag_stub_07:
+    /* #NM: device-not-available. No error code; CR0.TS / CR0.EM. */
+    pushq   $0                          /* fake error code for #NM     */
+    pushq   $7
+    jmp     common_trap_diag
+
+    .align 16
     .globl trap_diag_stub_08
 trap_diag_stub_08:
     /* #DF: CPU pushes error code (always 0 per AMD64 spec). */
@@ -85,6 +107,22 @@ trap_diag_stub_0d:
 trap_diag_stub_0e:
     /* #PF: CPU pushes error code (P/W/U/RSVD/I bits). */
     pushq   $14
+    jmp     common_trap_diag
+
+    .align 16
+    .globl trap_diag_stub_10
+trap_diag_stub_10:
+    /* #MF: x87 floating-point error. No error code. */
+    pushq   $0                          /* fake error code for #MF     */
+    pushq   $16
+    jmp     common_trap_diag
+
+    .align 16
+    .globl trap_diag_stub_13
+trap_diag_stub_13:
+    /* #XF: SIMD floating-point exception. No error code. */
+    pushq   $0                          /* fake error code for #XF     */
+    pushq   $19
     jmp     common_trap_diag
 
 /* ---------- common_trap_diag ------------------------------------- *
@@ -161,21 +199,28 @@ common_trap_diag:
  * The Adder side calls get_trap_diag_stub(vector) to translate a
  * vector number → handler virtual address, exactly the way idt.ad
  * already calls get_trap_stub() / get_irq_stub() in idt_asm.S /
- * irq_asm.S. Only vectors 6, 8, 13, 14 are wired; anything else
- * returns 0 (caller treats 0 as "skip"). Keeping the lookup in asm
- * means Adder doesn't have to express &symbol arithmetic.            */
+ * irq_asm.S. Only vectors 6, 7, 8, 13, 14, 16, 19 are wired;
+ * anything else returns 0 (caller treats 0 as "skip"). Keeping the
+ * lookup in asm means Adder doesn't have to express &symbol
+ * arithmetic.                                                          */
     .align 16
     .globl get_trap_diag_stub
 get_trap_diag_stub:
     /* %rdi = vector. Return stub address in %rax (or 0). */
     cmpq    $6,  %rdi
     je      1f
+    cmpq    $7,  %rdi
+    je      5f
     cmpq    $8,  %rdi
     je      2f
     cmpq    $13, %rdi
     je      3f
     cmpq    $14, %rdi
     je      4f
+    cmpq    $16, %rdi
+    je      6f
+    cmpq    $19, %rdi
+    je      7f
     xorq    %rax, %rax
     ret
 1:  leaq    trap_diag_stub_06(%rip), %rax
@@ -185,6 +230,12 @@ get_trap_diag_stub:
 3:  leaq    trap_diag_stub_0d(%rip), %rax
     ret
 4:  leaq    trap_diag_stub_0e(%rip), %rax
+    ret
+5:  leaq    trap_diag_stub_07(%rip), %rax
+    ret
+6:  leaq    trap_diag_stub_10(%rip), %rax
+    ret
+7:  leaq    trap_diag_stub_13(%rip), %rax
     ret
 
 /* ---------- get_trap_diag_ist_stack_top -------------------------- *

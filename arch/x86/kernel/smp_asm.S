@@ -46,6 +46,24 @@ load_cr3:
     movq    %rdi, %cr3
     ret
 
+/* read_cr0() -> uint64: snapshot the current CR0.
+ *
+ * M16.155-cr0-probe: Asus ring-3-transition triple-fault diagnostic.
+ * Both IRETQ (M16.154-eft) and SYSRETQ (M16.155) triple-fault on this
+ * silicon, and none of the trap-diag handlers fire — so the candidate
+ * shifts to "user code IS executing, but the very first instruction
+ * traps in a vector we don't yet override (e.g. #NM / #MF / #XF for
+ * an FPU/SIMD op masked by CR0.TS or CR0.EM)". Surface CR0 so the
+ * next capture confirms or refutes that hypothesis directly.
+ *
+ * Pure read, no side effects, callable from any CPL=0 context.
+ */
+    .align 16
+    .globl read_cr0
+read_cr0:
+    movq    %cr0, %rax
+    ret
+
 /* read_cr4() -> uint64: snapshot the current CR4.
  *
  * M16.154 (Asus iretq triple-fault diagnostic): real silicon enforces
