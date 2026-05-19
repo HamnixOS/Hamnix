@@ -46,6 +46,27 @@ load_cr3:
     movq    %rdi, %cr3
     ret
 
+/* read_cr4() -> uint64: snapshot the current CR4.
+ *
+ * M16.154 (Asus iretq triple-fault diagnostic): real silicon enforces
+ * SMEP / SMAP / OSXSAVE etc. that QEMU TCG enables more permissively.
+ * Surfacing the live CR4 in the ring-3-transition serial dump lets the
+ * next real-hardware capture confirm/refute whether a CR4-controlled
+ * protection bit is firing on the very first CPL=3 instruction fetch
+ * (e.g. CR4.SMEP=1 + a leaf with US=1 is the documented combination
+ * that triple-faults a CPL=0 ifetch — symmetric reasoning here:
+ * surfacing CR4.SMAP=1 with an iretq into a user page reachable from
+ * supervisor code lights up the same blast-radius if any kernel path
+ * accidentally touches user memory before the iretq pops to CPL=3).
+ *
+ * Pure read, no side effects, callable from any CPL=0 context.
+ */
+    .align 16
+    .globl read_cr4
+read_cr4:
+    movq    %cr4, %rax
+    ret
+
 /* The linker symbols __ap_trampoline_load / __ap_trampoline_start /
  * __ap_trampoline_size are abs/large values; reach them the same way
  * we reach __per_cpu_template_start - stash as .long words in .rodata

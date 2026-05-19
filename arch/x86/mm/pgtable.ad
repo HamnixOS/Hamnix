@@ -154,6 +154,39 @@ def _pgtable_stamp_1gb(pdpt_base: uint64, idx: uint64) -> int32:
     return 1
 
 
+def _pgtable_force_stamp_1gb(pdpt_base: uint64, idx: uint64) -> int32:
+    # Belt-and-suspenders variant: UNCONDITIONALLY rewrite PDPT[idx]
+    # with the canonical (idx << 30) | 0x87 value, regardless of any
+    # existing flags. Used on the EFI early-return path (M16.154) to
+    # immunise the live identity map against any boot-stub stamping
+    # mismatch between the M16.152 efi_stub.S 512-entry loop and what
+    # CR3 → PML4 → PML4[0] → PDPT actually points at on real silicon.
+    #
+    # H1 from M16.153's bisect was that the kernel might be looking at
+    # a different physical PDPT page than the one the boot stub
+    # stamped (e.g. if start_kernel later allocates a fresh PML4 with
+    # a fresh PDPT). Code inspection refutes this for the EFI path:
+    # _kthread_create_user (kernel/sched/core.ad) clones the BSP PML4
+    # by memcpy of PML4[0], so per-task PML4[0] points at the SAME
+    # efi_pdpt the boot stub stamped. BUT: a force-stamp through the
+    # live CR3 walk is cheap (512 8-byte stores at boot, well under a
+    # microsecond) and removes "what if some firmware-side address-
+    # translation quirk makes the stub-time efi_pdpt phys differ from
+    # the CR3-walk-time PDPT phys" from the suspect list entirely.
+    # If the next Asus real-hw capture STILL triple-faults on the
+    # iretq, the failure is provably NOT in the PDPT contents and we
+    # can narrow the bisect to GDT / TSS / MSR / CR4 state.
+    #
+    # Returns 1 always (the slot was written), so the caller's "new
+    # entries" accumulator stays a useful "we did do work" indicator.
+    if idx >= PGT_PDPT_ENTRIES:
+        return 0
+    slot: Ptr[uint64] = cast[Ptr[uint64]](pdpt_base + idx * 8)
+    phys: uint64 = idx << PGT_1GB_SHIFT
+    slot[0] = phys | PGT_NEW_FLAGS
+    return 1
+
+
 def pgtable_extend_from_e820():
     # Re-walk the multiboot1 memory map and stamp PDPT entries for
     # every 1 GiB page that overlaps an E820_RAM region. Called from
@@ -176,15 +209,100 @@ def pgtable_extend_from_e820():
     # bogus entries".
     magic: uint64 = get_mb_magic()
     if magic != PGT_MB_MAGIC:
-        printk0("[pgtable] no multiboot1 mmap; identity map unchanged\n")
-        pdpt_base_efi: uint64 = _pgtable_pdpt_base()
-        printk1("[pgtable] EFI/no-mb: pdpt_base=%p\n", pdpt_base_efi)
-        i_efi: uint64 = 0
-        while i_efi < 8:
-            slot_addr: uint64 = pdpt_base_efi + i_efi * 8
-            entry: uint64 = cast[Ptr[uint64]](slot_addr)[0]
-            printk2("[pgtable] EFI/no-mb: pdpt[%d]=%p\n", i_efi, entry)
-            i_efi = i_efi + 1
+        # M16.154: Asus iretq-triple-fault diagnostic + hardening.
+        #
+        # Code inspection (this commit's message body) confirmed that
+        # the EFI boot stub's efi_pdpt page IS the live PDPT the kernel
+        # CR3 → PML4 → PML4[0] walk lands on: arch/x86/boot/efi_stub.S
+        # plants efi_pml4 in CR3 at STEP 10, efi_pml4[0] points at
+        # efi_pdpt, and kernel/sched/core.ad's _kthread_create_user
+        # memcpy's PML4[0] verbatim into per-task PML4s — so the
+        # boot-stub-stamped efi_pdpt[0..511] entries are visible to
+        # every task. The M16.151 H1 hypothesis ("kernel allocates a
+        # NEW PDPT after start_kernel") is REFUTED by code inspection.
+        #
+        # HOWEVER: the Asus laptop still triple-faults on the iretq into
+        # /init's _start (M16.153 bisect localised it to this gate).
+        # That means one of:
+        #   - Boot-stub stamping ran but landed in a different physical
+        #     page than what CR3 currently points at (e.g. firmware
+        #     remapped the EFI image post-stamp — vanishingly unlikely
+        #     but provable here),
+        #   - Some entry the stub stamped got corrupted between then
+        #     and now (a stray kernel write through a bogus pointer
+        #     into the PDPT page),
+        #   - The fault is NOT in the PDPT at all and the next-leaf
+        #     diagnostic in start_first_task will narrow it elsewhere.
+        #
+        # Defensive action: walk the LIVE CR3 → PML4 → PML4[0] → PDPT,
+        # then RE-STAMP every slot [0..512) with the canonical
+        # (i << 30) | 0x87. If the stub-time PDPT is already correct
+        # this is a no-op (same bytes back). If the stub-time PDPT was
+        # somehow wrong, the live PDPT is now provably right going
+        # forward. Either way the post-condition dump immediately
+        # after shows what the CPU will actually use.
+        printk0("[pgtable] no multiboot1 mmap; EFI path — diagnose + re-stamp PDPT\n")
+        cr3_efi: uint64 = get_bsp_cr3()
+        pml4_efi: uint64 = cr3_efi & PGT_ADDR_MASK
+        pml4e0_efi: uint64 = cast[Ptr[uint64]](pml4_efi)[0]
+        pdpt_base_efi: uint64 = pml4e0_efi & PGT_ADDR_MASK
+        # Surface the FULL live-walk chain so a real-hw capture can
+        # be diffed against the QEMU gold capture: identical chain
+        # means M16.154's H1-falsification (PDPT page is shared) is
+        # confirmed in vivo, divergent chain means the firmware did
+        # something exotic and we now know exactly what to chase.
+        printk2("[pgtable-live] CR3=%p PML4=%p\n", cr3_efi, pml4_efi)
+        printk2("[pgtable-live] PML4[0]=%p PDPT phys=%p\n",
+                pml4e0_efi, pdpt_base_efi)
+        # Pre-stamp dump: 16 slots so a 5 GiB Asus log shows slots
+        # 0..7 (boot-stub 4 GiB region + first M16.152-stamped
+        # over-4-GiB slot) AND slots 8..15 (high RAM coverage that
+        # QEMU's small -m sizes don't normally exercise). Lets us
+        # spot non-zero slots above slot 5 on real hardware.
+        i_pre: uint64 = 0
+        while i_pre < 16:
+            slot_addr_pre: uint64 = pdpt_base_efi + i_pre * 8
+            entry_pre: uint64 = cast[Ptr[uint64]](slot_addr_pre)[0]
+            printk2("[pgtable-live] pre  pdpt[%d]=%p\n", i_pre, entry_pre)
+            i_pre = i_pre + 1
+        # Force-stamp all 512 entries. Idempotent on a correctly-
+        # stamped PDPT (writes the same bytes back); corrective on
+        # any corrupted slot. Cost: 512 × 8 B = 4 KiB store-stream,
+        # well under a microsecond on any x86_64 CPU we target.
+        # We use _pgtable_force_stamp_1gb (not _pgtable_stamp_1gb)
+        # because the latter early-returns on P=1 — exactly the
+        # slots we'd be most suspicious of on a corruption-induced
+        # bug. Force-stamping all 512 also covers any 240..256 MiB
+        # ACPI-reclaim region that firmware might want us NOT to
+        # touch as 1 GiB-page RAM; we accept that overshoot — the
+        # boot stub already overshoots PDPT[0..3] the same way and
+        # the kernel only touches memory via memblock-reported
+        # ranges (2..240 MiB on EFI today), so 240 MiB..512 GiB of
+        # PDPT entries are pure address-space placeholders, not RAM.
+        i_stamp: uint64 = 0
+        forced_count: uint64 = 0
+        while i_stamp < PGT_PDPT_ENTRIES:
+            forced_count = forced_count + cast[uint64](
+                _pgtable_force_stamp_1gb(pdpt_base_efi, i_stamp))
+            i_stamp = i_stamp + 1
+        # Reload CR3 to flush the TLB; absent entries weren't cached
+        # but our force-stamp may have rewritten present entries
+        # (which WERE cached) — TLB flush guarantees the next ifetch
+        # sees the new values.
+        load_cr3(cr3_efi)
+        printk1("[pgtable-live] force-stamped %d PDPT entries\n",
+                forced_count)
+        # Post-stamp dump: same 16 slots so a side-by-side
+        # pre/post diff is a one-look operation in the serial log.
+        # If pre and post differ for any slot, the corruption /
+        # mismatch hypothesis was right and this commit fixed it.
+        i_post: uint64 = 0
+        while i_post < 16:
+            slot_addr_post: uint64 = pdpt_base_efi + i_post * 8
+            entry_post: uint64 = cast[Ptr[uint64]](slot_addr_post)[0]
+            printk2("[pgtable-live] post pdpt[%d]=%p\n",
+                    i_post, entry_post)
+            i_post = i_post + 1
         return
 
     info: uint64 = get_mb_info()
