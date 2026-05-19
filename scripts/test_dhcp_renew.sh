@@ -42,7 +42,13 @@ ELF=build/hamnix-vmlinux.elf
 
 echo "[test_dhcp_renew] (1/4) Build userland + initramfs"
 bash scripts/build_user.sh >/dev/null
-INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null
+# ENABLE_DHCP_RENEW_SMOKE plants /etc/dhcp-renew-test so init/main.ad's
+# gated dhcp_renew_smoke_test actually fires. Default boots skip the
+# smoke (it leaves state at IDLE, breaking downstream BOUND-gated
+# tests like test_dns.sh). The EXIT trap below rebuilds the initramfs
+# without the marker so subsequent test runs get a clean default.
+INIT_ELF=build/user/init.elf ENABLE_DHCP_RENEW_SMOKE=1 \
+    python3 scripts/build_initramfs.py >/dev/null
 
 echo "[test_dhcp_renew] (2/4) Rebuild kernel image"
 python3 -m compiler.adder compile \

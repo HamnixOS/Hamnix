@@ -50,6 +50,15 @@ if os.environ.get("ENABLE_TLS_SMOKE") == "1":
 if os.environ.get("ENABLE_TCP_RING_SMOKE") == "1":
     FILES.append(("/etc/tcp-ring-test", b"1\n"))
 
+# DHCP renew/rebind/expiry smoke. Gated the same way as the TLS / TCP
+# ring markers above. The renew smoke leaves DHCP state at IDLE on
+# exit, which breaks any downstream test that requires state == BOUND
+# (test_dns.sh checks `dhcp_state_get() == 3` before resolving). Only
+# scripts/test_dhcp_renew.sh sets this; default boot keeps the BOUND
+# lease intact. See init/main.ad's dhcp_renew_smoke_test gate.
+if os.environ.get("ENABLE_DHCP_RENEW_SMOKE") == "1":
+    FILES.append(("/etc/dhcp-renew-test", b"1\n"))
+
 # V5 cert validation: bake the production ISRG Root X1 anchor into the
 # initramfs at /etc/tls-ca-isrg-x1.der whenever the host has it
 # installed. drivers/net/tls.ad's _tls_validation_init() walks the cpio
