@@ -172,8 +172,14 @@ TLS_X25519_LEN:             uint64 = 32
 
 # TX buffer for the full ClientHello + record framing.
 tls_tx_buf:        Array[2048, uint8]
-# RX buffer for one fragment of a TLS record off the wire.
-tls_rx_buf:        Array[4096, uint8]
+# RX buffer for one TLS record off the wire. Sized to TLS_MAX_CIPHERTEXT
+# (16384 plaintext + 256 pad + 1 type + 16 AEAD tag + 5 record header,
+# rounded up to 16640). V5.2 bumped this from 4096 because real-world
+# TLS 1.3 servers (LE-signed mirrors, Python ssl, openssl s_server)
+# emit handshake-flight ciphertext records up to 16 KiB plaintext by
+# default; the prior 4096 cap tripped "record too large for scratch"
+# before the stitcher could even run.
+tls_rx_buf:        Array[16640, uint8]
 # Reassembly buffer for the multi-record server flight
 # (EncryptedExtensions .. Finished can span multiple TCP segments).
 tls_hs_buf:        Array[16384, uint8]
@@ -2906,7 +2912,7 @@ def _tls_read_record(tcp_slot: int32, timeout_ms: uint64) -> int64:
     tls_rxr_len = 0
     # Need at least 5 bytes to know the record length.
     while have < 5:
-        room: uint64 = 4096 - have
+        room: uint64 = 16640 - have
         n: int64 = tcp_recv(tcp_slot,
                             cast[Ptr[uint8]](cast[uint64](rx_ptr) + have),
                             room, timeout_ms)
@@ -2916,15 +2922,14 @@ def _tls_read_record(tcp_slot: int32, timeout_ms: uint64) -> int64:
     rec_len: uint64 = (cast[uint64](tls_rx_buf[3]) << 8) \
         | cast[uint64](tls_rx_buf[4])
     total: uint64 = 5 + rec_len
-    if total > 4096:
-        # We don't support cipherext records larger than the rx scratch.
+    if total > 16640:
         # TLS 1.3 caps ciphertext at 16640 (16384 plaintext + 256 pad +
-        # type byte + tag); enlarging tls_rx_buf to 16640 lifts this.
+        # type byte + tag); anything larger is malformed/protocol error.
         printk1("[tls] record too large for scratch (%d bytes)\n",
                 rec_len)
         return -1
     while have < total:
-        room: uint64 = 4096 - have
+        room: uint64 = 16640 - have
         n2: int64 = tcp_recv(tcp_slot,
                              cast[Ptr[uint8]](cast[uint64](rx_ptr) + have),
                              room, timeout_ms)
@@ -3300,14 +3305,21 @@ def _tls_drive_post_sh(tcp_slot: int32) -> int32:
     # is a protocol error; this guard surfaces it as an explicit abort
     # rather than reading stale bytes from a previous handshake.
     _tls_th_after_cert_set = 0
-    # Per-message walk state across multiple records (a Certificate
-    # alone is sometimes > 1 record, but the cipher fragments are
-    # already reassembled inside one decrypted plaintext, so each
-    # call here works on one record's plaintext). Stitching messages
-    # across plaintext records would need an inter-record buffer; we
-    # haven't seen that shape on example.com / Let's Encrypt origins.
-    # For TLS 1.3 the EE..Finished flight is typically packed into a
-    # single AEAD record.
+    # V5.2: stitch handshake messages across record boundaries
+    # (RFC 8446 §5.1). Each AEAD record's inner plaintext carries
+    # 0..N handshake fragments; a single handshake message (esp.
+    # Certificate when chained with intermediates, e.g. LE R3 +
+    # leaf) easily exceeds one record's ~1.4 KB-to-16 KiB AEAD
+    # plaintext budget. The pre-V5.2 parser walked each decrypted
+    # record in isolation and tripped "truncated handshake header"
+    # the moment the 4-byte msg header straddled a record edge.
+    # Now we APPEND each record's handshake bytes to tls_hs_buf,
+    # then drain full messages from the front, shifting any
+    # partial tail back to offset 0 so the next record's append
+    # picks up cleanly. tls_pt_buf is reused on every decrypt;
+    # tls_hs_buf is stable until tls_init() / end of handshake,
+    # so chain ptrs and the leaf-copy step now source from it.
+    tls_hs_len = 0
     while saw_server_finished == 0:
         rec_total_signed: int64 = _tls_read_record(tcp_slot, 400)
         if rec_total_signed <= 0:
@@ -3346,25 +3358,47 @@ def _tls_drive_post_sh(tcp_slot: int32) -> int32:
             printk1("[tls] post-SH inner type=%d (want handshake)\n",
                     cast[uint64](real_type))
             return -1
-        # Walk handshake messages in this plaintext.
-        mpos: uint64 = 0
-        while mpos < inner_len:
-            if mpos + 4 > inner_len:
-                printk0("[tls] truncated handshake header\n")
-                return -1
-            ht: uint8 = tls_pt_buf[mpos]
-            mlen: uint64 = (cast[uint64](tls_pt_buf[mpos + 1]) << 16) \
-                | (cast[uint64](tls_pt_buf[mpos + 2]) << 8) \
-                | cast[uint64](tls_pt_buf[mpos + 3])
-            if mpos + 4 + mlen > inner_len:
-                printk0("[tls] handshake message overruns plaintext\n")
+        # Append this record's handshake plaintext to tls_hs_buf.
+        # Cap at 16 KiB (RFC 8446 §5.1 max single handshake msg).
+        if tls_hs_len + inner_len > 16384:
+            printk0("[tls] handshake reassembly buffer overflow (>16 KiB)\n")
+            _tls_send_alert_under_hs(tcp_slot,
+                                     TLS_ALERT_DECRYPT_ERROR)
+            return -1
+        _tls_memcpy(cast[Ptr[uint8]](&tls_hs_buf[tls_hs_len]),
+                    cast[Ptr[uint8]](&tls_pt_buf[0]), inner_len)
+        tls_hs_len = tls_hs_len + inner_len
+        # Drain as many complete handshake messages as the buffer
+        # currently holds. A partial trailing message (header
+        # short OR body short) ends the inner loop and we go read
+        # another record; on the next pass we'll append + retry.
+        while saw_server_finished == 0:
+            if tls_hs_len < 4:
+                # Header not yet fully buffered - need more bytes.
+                break
+            mpos: uint64 = 0
+            ht: uint8 = tls_hs_buf[mpos]
+            mlen: uint64 = (cast[uint64](tls_hs_buf[mpos + 1]) << 16) \
+                | (cast[uint64](tls_hs_buf[mpos + 2]) << 8) \
+                | cast[uint64](tls_hs_buf[mpos + 3])
+            if 4 + mlen > tls_hs_len:
+                # Body not yet fully buffered - need more bytes.
+                # NB: this is the V5.2 fix - the pre-stitch parser
+                # would have errored out here with "truncated
+                # handshake header" / "overruns plaintext"; we
+                # just wait for the next record.
+                break
+            if 4 + mlen > 16384:
+                printk0("[tls] handshake message exceeds 16 KiB cap\n")
+                _tls_send_alert_under_hs(tcp_slot,
+                                         TLS_ALERT_DECRYPT_ERROR)
                 return -1
             if ht == TLS_HS_ENCRYPTED_EXT:
                 printk1("[tls] EncryptedExtensions (%d bytes)\n", mlen)
                 # Update transcript hash with the whole message
                 # (type + 3-byte length + body) per RFC 8446 §4.4.1.
                 _tls_tr_update(
-                    cast[Ptr[uint8]](&tls_pt_buf[mpos]), 4 + mlen)
+                    cast[Ptr[uint8]](&tls_hs_buf[mpos]), 4 + mlen)
             elif ht == TLS_HS_CERTIFICATE:
                 # Parse the Certificate message into (ptr, len) chain
                 # entries and validate IMMEDIATELY. Wire shape
@@ -3374,36 +3408,38 @@ def _tls_drive_post_sh(tcp_slot: int32) -> int32:
                 # Each CertificateEntry: 3-byte cert_data length + cert
                 # bytes + 2-byte extensions length + extensions.
                 #
-                # V5: real validation. The chain pointers index into
-                # tls_pt_buf (the decrypted plaintext scratch), which
-                # stays stable for the rest of this plaintext-walk
-                # iteration; validate_cert_chain runs synchronously here
-                # so the bytes are guaranteed live across the call.
+                # V5: real validation. V5.2: chain pointers now index
+                # into tls_hs_buf (the multi-record reassembly buffer),
+                # which is stable across the rest of the handshake
+                # dispatch loop. The bytes remain live until we shift
+                # this message off the front at the end of the
+                # iteration (which happens AFTER validate_cert_chain +
+                # the leaf-copy step below).
                 _tls_chain_count = 0
                 cpos: uint64 = mpos + 4
                 parse_ok: int32 = 0
                 if cpos + 1 <= mpos + 4 + mlen:
-                    ctx_len: uint64 = cast[uint64](tls_pt_buf[cpos])
+                    ctx_len: uint64 = cast[uint64](tls_hs_buf[cpos])
                     cpos = cpos + 1 + ctx_len
                     if cpos + 3 <= mpos + 4 + mlen:
                         list_len: uint64 = \
-                            (cast[uint64](tls_pt_buf[cpos]) << 16) \
-                            | (cast[uint64](tls_pt_buf[cpos + 1]) << 8) \
-                            | cast[uint64](tls_pt_buf[cpos + 2])
+                            (cast[uint64](tls_hs_buf[cpos]) << 16) \
+                            | (cast[uint64](tls_hs_buf[cpos + 1]) << 8) \
+                            | cast[uint64](tls_hs_buf[cpos + 2])
                         cpos = cpos + 3
                         list_end: uint64 = cpos + list_len
                         if list_end <= mpos + 4 + mlen:
                             parse_ok = 1
                             while cpos + 3 <= list_end:
                                 clen: uint64 = \
-                                    (cast[uint64](tls_pt_buf[cpos]) << 16) \
-                                    | (cast[uint64](tls_pt_buf[cpos + 1]) << 8) \
-                                    | cast[uint64](tls_pt_buf[cpos + 2])
+                                    (cast[uint64](tls_hs_buf[cpos]) << 16) \
+                                    | (cast[uint64](tls_hs_buf[cpos + 1]) << 8) \
+                                    | cast[uint64](tls_hs_buf[cpos + 2])
                                 cpos = cpos + 3
-                                # Record (ptr,len) — pointer into tls_pt_buf.
+                                # Record (ptr,len) — pointer into tls_hs_buf.
                                 if _tls_chain_count < 8:
                                     _tls_chain_ptrs[_tls_chain_count] = \
-                                        cast[Ptr[uint8]](&tls_pt_buf[cpos])
+                                        cast[Ptr[uint8]](&tls_hs_buf[cpos])
                                     _tls_chain_lens[_tls_chain_count] = clen
                                     _tls_chain_count = _tls_chain_count + 1
                                 else:
@@ -3415,8 +3451,8 @@ def _tls_drive_post_sh(tcp_slot: int32) -> int32:
                                     parse_ok = 0
                                     break
                                 ext_len: uint64 = \
-                                    (cast[uint64](tls_pt_buf[cpos]) << 8) \
-                                    | cast[uint64](tls_pt_buf[cpos + 1])
+                                    (cast[uint64](tls_hs_buf[cpos]) << 8) \
+                                    | cast[uint64](tls_hs_buf[cpos + 1])
                                 cpos = cpos + 2 + ext_len
                 printk1("[tls] Certificate: %d certs in chain\n",
                         cast[uint64](_tls_chain_count))
@@ -3427,7 +3463,7 @@ def _tls_drive_post_sh(tcp_slot: int32) -> int32:
                 # transcript state consistent (the alert isn't gated on
                 # Finished verifying).
                 _tls_tr_update(
-                    cast[Ptr[uint8]](&tls_pt_buf[mpos]), 4 + mlen)
+                    cast[Ptr[uint8]](&tls_hs_buf[mpos]), 4 + mlen)
                 if parse_ok == 0:
                     printk0("[tls] cert chain rejected: malformed Certificate message\n")
                     _tls_send_alert_under_hs(tcp_slot,
@@ -3458,11 +3494,11 @@ def _tls_drive_post_sh(tcp_slot: int32) -> int32:
                                              TLS_ALERT_BAD_CERTIFICATE)
                     return -1
                 # V5.1: stash the LEAF cert bytes into a stable BSS slot.
-                # The original _tls_chain_ptrs[0] points into tls_pt_buf,
-                # which gets reused on the NEXT _tls_decrypt_record call —
-                # by the time CertificateVerify arrives in a separate
-                # AEAD record, the original Certificate plaintext is
-                # gone. Copy now, while the bytes are still live.
+                # V5.2: _tls_chain_ptrs[0] now points into tls_hs_buf,
+                # which survives across record reads — but it does NOT
+                # survive the end-of-iteration shift that drops this
+                # Certificate message off the front of the buffer. Copy
+                # now, before mpos = 0 / tls_hs_buf gets reshuffled.
                 leaf_src_len: uint64 = _tls_chain_lens[0]
                 if leaf_src_len == 0:
                     printk0("[tls] leaf cert empty after chain validate\n")
@@ -3506,18 +3542,18 @@ def _tls_drive_post_sh(tcp_slot: int32) -> int32:
                                              TLS_ALERT_DECRYPT_ERROR)
                     return -1
                 cv_sig_alg: uint16 = \
-                    (cast[uint16](tls_pt_buf[mpos + 4]) << 8) \
-                    | cast[uint16](tls_pt_buf[mpos + 5])
+                    (cast[uint16](tls_hs_buf[mpos + 4]) << 8) \
+                    | cast[uint16](tls_hs_buf[mpos + 5])
                 cv_sig_len: uint64 = \
-                    (cast[uint64](tls_pt_buf[mpos + 6]) << 8) \
-                    | cast[uint64](tls_pt_buf[mpos + 7])
+                    (cast[uint64](tls_hs_buf[mpos + 6]) << 8) \
+                    | cast[uint64](tls_hs_buf[mpos + 7])
                 if 4 + cv_sig_len > mlen:
                     printk0("[tls] CertificateVerify sig length overruns message\n")
                     _tls_send_alert_under_hs(tcp_slot,
                                              TLS_ALERT_DECRYPT_ERROR)
                     return -1
                 cv_sig_ptr: Ptr[uint8] = \
-                    cast[Ptr[uint8]](&tls_pt_buf[mpos + 8])
+                    cast[Ptr[uint8]](&tls_hs_buf[mpos + 8])
                 cv_rc: int32 = _tls_verify_cert_verify(
                     cv_sig_alg,
                     cv_sig_ptr, cv_sig_len,
@@ -3543,27 +3579,37 @@ def _tls_drive_post_sh(tcp_slot: int32) -> int32:
                                              TLS_ALERT_DECRYPT_ERROR)
                     return -1
                 _tls_tr_update(
-                    cast[Ptr[uint8]](&tls_pt_buf[mpos]), 4 + mlen)
+                    cast[Ptr[uint8]](&tls_hs_buf[mpos]), 4 + mlen)
             elif ht == TLS_HS_FINISHED:
                 # Snapshot transcript hash BEFORE feeding Finished —
                 # that's what the server HMAC'd.
                 _tls_sha256_snapshot_into(
                     cast[Ptr[uint8]](&th_before_sf[0]))
                 vrc: int32 = _tls_verify_server_finished(
-                    cast[Ptr[uint8]](&tls_pt_buf[mpos + 4]), mlen,
+                    cast[Ptr[uint8]](&tls_hs_buf[mpos + 4]), mlen,
                     cast[Ptr[uint8]](&th_before_sf[0]))
                 if vrc != 0:
                     printk0("[tls] server Finished HMAC mismatch — abort\n")
                     return -1
                 printk0("[tls] server Finished verified OK\n")
                 _tls_tr_update(
-                    cast[Ptr[uint8]](&tls_pt_buf[mpos]), 4 + mlen)
+                    cast[Ptr[uint8]](&tls_hs_buf[mpos]), 4 + mlen)
                 saw_server_finished = 1
             else:
                 printk1("[tls] post-SH unknown handshake type %d\n",
                         cast[uint64](ht))
                 return -1
-            mpos = mpos + 4 + mlen
+            # Shift this consumed message off the front of tls_hs_buf;
+            # any unread tail (bytes for the next message, possibly
+            # only a partial fragment) moves to offset 0 so the outer
+            # loop's per-record append picks up where we left off.
+            consumed: uint64 = mpos + 4 + mlen
+            remaining: uint64 = tls_hs_len - consumed
+            if remaining > 0:
+                _tls_memcpy(cast[Ptr[uint8]](&tls_hs_buf[0]),
+                            cast[Ptr[uint8]](&tls_hs_buf[consumed]),
+                            remaining)
+            tls_hs_len = remaining
     # Compute application traffic keys (transcript hash now includes
     # the server Finished message).
     _tls_compute_app_keys()
