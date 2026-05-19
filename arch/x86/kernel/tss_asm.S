@@ -104,3 +104,16 @@ tss_set_rsp0:
     leaq    tss64(%rip), %rax
     movq    %rdi, 4(%rax)
     ret
+
+/* ---------- tss_get_rsp0() -> uint64 ----------------------------- *
+ * M16.153: read-back of the currently-installed RSP0 slot. Used by
+ * the start_first_task() ring-3-transition diagnostic block to prove
+ * the value the CPU will load on the next CPL=3 -> 0 transition (a
+ * stale RSP0 here is a classic "user syscall lands on garbage kstack
+ * -> triple-fault" cause on real silicon).                          */
+    .align 16
+    .globl tss_get_rsp0
+tss_get_rsp0:
+    leaq    tss64(%rip), %rax
+    movq    4(%rax), %rax
+    ret

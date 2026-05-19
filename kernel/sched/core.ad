@@ -31,11 +31,22 @@ from fs.pipe import (
 )
 from fs.fat import fat_close
 from fs.ext4 import ext4_close
+# M16.153: ring-3 transition diagnostic walks the just-installed
+# per-task PML4 to confirm the user RIP / RSP leaves before SYSRET-or-
+# iretq dispatches into ring 3. pgtable_walk reads from CR3 (which at
+# this point IS the task's PML4 — we've already called load_cr3 above),
+# so the leaf flags we dump are exactly what the CPU will consult on
+# the very next instruction-fetch / data-load from CPL=3.
+from arch.x86.mm.pgtable import pgtable_walk
 
 extern def __switch_to_asm(prev: Ptr[uint8], next: Ptr[uint8])
 extern def enter_first_task(task: Ptr[uint8])
 extern def kthread_bootstrap()
 extern def tss_set_rsp0(rsp0: uint64)
+# M16.153: read-back of TSS.RSP0 for the start_first_task ring-3
+# diagnostic block. The asm body lives in arch/x86/kernel/tss_asm.S
+# next to tss_set_rsp0 so the offset constant stays single-sourced.
+extern def tss_get_rsp0() -> uint64
 extern def local_irq_disable()
 extern def local_irq_enable()
 extern def get_bsp_cr3() -> uint64
@@ -46,6 +57,11 @@ extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 # arch/x86/kernel/syscall_64.S — same primitive arch_prctl uses on the
 # Linux ABI side.
 extern def write_msr(index: uint32, value: uint64)
+# M16.153: ring-3 transition diagnostic also needs to read EFER + STAR
+# back out of MSR space so the serial capture shows them as observed
+# at the moment of SYSRET/iretq into user. Same primitive the apic +
+# linux_abi paths already use.
+extern def read_msr(index: uint32) -> uint64
 
 # V2.5: Pgrp lifecycle entry-points implemented in sys/src/9/port/chan.ad.
 # Declared extern here so task_exit_current can call pgrp_ref_dec without
@@ -813,6 +829,104 @@ def start_first_task():
     # to the wrong root.
     if task_table[0].cr3 != 0:
         load_cr3(task_table[0].cr3)
+    # M16.153: ring-3 transition diagnostic. This block runs on the
+    # KERNEL side of the very last instruction that still has CPL=0
+    # before either the iretq inside kthread_bootstrap (boot path) or
+    # any subsequent SYSRETQ (do_execve_finish) drops to CPL=3 on the
+    # /init image. On Asus real silicon the box triple-faults RIGHT
+    # HERE — the next instruction-fetch from the user RIP resets the
+    # CPU, the firmware reboots, the kernel restarts, loop. QEMU
+    # exhibits the same code path cleanly, so the diagnostic dump is
+    # benign in CI and load-bearing on real hw bisects.
+    #
+    # We pull the user RIP / RSP / RFLAGS out of the freshly-planted
+    # iret frame on slot-0's kstack. _build_initial_kstack lays them
+    # at the following offsets below kstack_top (see comment in that
+    # function for the full layout):
+    #
+    #   kstack_top -  8   SS         (user data, 0x1B = 0x18 | RPL=3)
+    #   kstack_top - 16   RSP        (user stack top, fed to iretq)
+    #   kstack_top - 24   RFLAGS     (RFLAGS_INITIAL = 0x202; also
+    #                                  what %r11 carries if the first
+    #                                  ring-3 entry is a SYSRETQ —
+    #                                  do_execve_finish hard-codes
+    #                                  the same 0x202)
+    #   kstack_top - 32   CS         (user code, 0x23 = 0x20 | RPL=3)
+    #   kstack_top - 40   RIP        (user entry, e.g. /init _start)
+    kstack_top0: uint64 = task_table[0].kstack_top
+    diag_user_rip: uint64 = cast[Ptr[uint64]](kstack_top0 - 40)[0]
+    diag_user_cs:  uint64 = cast[Ptr[uint64]](kstack_top0 - 32)[0]
+    diag_user_rfl: uint64 = cast[Ptr[uint64]](kstack_top0 - 24)[0]
+    diag_user_rsp: uint64 = cast[Ptr[uint64]](kstack_top0 - 16)[0]
+    diag_user_ss:  uint64 = cast[Ptr[uint64]](kstack_top0 -  8)[0]
+    diag_cr3:      uint64 = get_bsp_cr3()
+    diag_rsp0:     uint64 = tss_get_rsp0()
+    diag_star:     uint64 = read_msr(0xC0000081)   # IA32_STAR
+    diag_efer:     uint64 = read_msr(0xC0000080)   # IA32_EFER
+    diag_lstar:    uint64 = read_msr(0xC0000082)   # IA32_LSTAR
+    diag_fmask:    uint64 = read_msr(0xC0000084)   # IA32_FMASK
+    # First, dump the static state: user RIP, CR3, TSS RSP0, MSRs.
+    printk1("[ring3-diag] target rip=%p\n", diag_user_rip)
+    printk2("[ring3-diag] target cs=%p ss=%p\n", diag_user_cs, diag_user_ss)
+    printk2("[ring3-diag] target rsp=%p rflags=%p\n",
+            diag_user_rsp, diag_user_rfl)
+    printk1("[ring3-diag] CR3=%p\n", diag_cr3)
+    printk1("[ring3-diag] TSS RSP0=%p\n", diag_rsp0)
+    printk1("[ring3-diag] STAR=%p\n", diag_star)
+    printk1("[ring3-diag] EFER=%p\n", diag_efer)
+    printk2("[ring3-diag] LSTAR=%p FMASK=%p\n", diag_lstar, diag_fmask)
+    # Then walk the per-task PML4 for the user-side leaves. We compare
+    # against the same leaf-flag word the CPU will load when its
+    # instruction-fetch (RIP) or stack push (RSP-8) walks the same
+    # tree. The two leaves we MUST see with P|US set are:
+    #
+    #   1. RIP page (PT_LOAD code). If US=0, the very first user
+    #      instruction-fetch faults #PF with err=0x05 ("user-mode
+    #      read of supervisor page") — exact match for the observed
+    #      real-hw triple-fault (no productive user-mode #PF handler
+    #      yet -> #DF -> triple).
+    #
+    #   2. RSP-8 page (top of the user stack — iretq pops 5 quads BUT
+    #      the first hardware push from user mode is e.g. a CALL or a
+    #      future syscall pushing return state). If unmapped or US=0,
+    #      first user-mode stack touch faults #PF same shape.
+    leaf_rip: uint64 = pgtable_walk(diag_user_rip)
+    leaf_rsp: uint64 = pgtable_walk(diag_user_rsp - 8)
+    printk2("[ring3-diag] user-leaf rip-va=%p leaf=%p\n",
+            diag_user_rip, leaf_rip)
+    printk2("[ring3-diag] user-leaf rsp-va=%p leaf=%p\n",
+            diag_user_rsp - 8, leaf_rsp)
+    # Decoded flag commentary on the RIP leaf — the most-suspicious
+    # field on this triple-fault. US=1 is mandatory for ring-3
+    # instruction fetch; XD=0 (or EFER.NXE=0) is mandatory for
+    # instruction fetch on real CPUs that enforce NX. Real silicon
+    # enforces XD when EFER.NXE=1; QEMU TCG often does not, which
+    # exactly matches the QEMU-passes-real-hw-triple-faults shape.
+    if leaf_rip == 0:
+        printk0("[ring3-diag] WARN: rip leaf is UNMAPPED — first ifetch will #PF\n")
+    else:
+        rip_us: uint64 = (leaf_rip >> 2) & 0x1
+        rip_rw: uint64 = (leaf_rip >> 1) & 0x1
+        rip_p:  uint64 = leaf_rip & 0x1
+        rip_xd: uint64 = (leaf_rip >> 63) & 0x1
+        printk2("[ring3-diag] rip leaf flags: US=%d RW=%d\n", rip_us, rip_rw)
+        printk2("[ring3-diag] rip leaf flags: P=%d XD=%d\n", rip_p, rip_xd)
+        if rip_us == 0:
+            printk0("[ring3-diag] WARN: rip leaf US=0 — CPL=3 ifetch will #PF err=0x05\n")
+        efer_nxe: uint64 = (diag_efer >> 11) & 0x1
+        if rip_xd != 0 and efer_nxe != 0:
+            printk0("[ring3-diag] WARN: rip leaf XD=1 with EFER.NXE=1 — ifetch will #PF\n")
+    if leaf_rsp == 0:
+        printk0("[ring3-diag] WARN: rsp leaf is UNMAPPED — first user push will #PF\n")
+    else:
+        rsp_us: uint64 = (leaf_rsp >> 2) & 0x1
+        rsp_rw: uint64 = (leaf_rsp >> 1) & 0x1
+        printk2("[ring3-diag] rsp leaf flags: US=%d RW=%d\n", rsp_us, rsp_rw)
+        if rsp_us == 0:
+            printk0("[ring3-diag] WARN: rsp leaf US=0 — CPL=3 data touch will #PF err=0x05\n")
+        if rsp_rw == 0:
+            printk0("[ring3-diag] WARN: rsp leaf RW=0 — first user write will #PF err=0x07\n")
+    printk0("[ring3-diag] all checks emitted; handing off to enter_first_task\n")
     enter_first_task(cast[Ptr[uint8]](&task_table[0]))
 
 
