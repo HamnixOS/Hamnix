@@ -1,0 +1,428 @@
+# lib/bigint/bigint.ad
+#
+# Fixed-width bigint arithmetic for RSA-PSS-SHA256 cert verification
+# (V2 of Hamnix's TLS cert validation stack). Sized for 4096-bit
+# moduli to cover the full range of in-the-wild RSA keys: 2048-bit
+# (the common case), 3072-bit (rare but legal), and 4096-bit (the
+# upper bound of what serious CAs issue today).
+#
+# REPRESENTATION
+#
+#   class Bigint:
+#     limbs: Array[64, uint64]   # 64 × 64 = 4096 bits of capacity
+#     n_limbs: uint64            # active limb count (0..64), little-endian
+#
+# `limbs[0]` is the low 64 bits; `limbs[n_limbs-1]` is the high 64
+# bits. Bytes-beyond `n_limbs` are treated as zero by every operation
+# but bigint_zero() always blanks the full 64-slot array to keep
+# debugging predictable.
+#
+# REDUCTION CHOICE — bit-by-bit modular multiplication
+# ----------------------------------------------------
+# We compute `out = (a × b) mod m` using the textbook
+# "shift-and-add modular multiply":
+#
+#     result := 0
+#     for i from msb(b) down to 0:
+#         result := (result × 2) mod m          # left-shift + cond-sub
+#         if bit i of b == 1:
+#             result := (result + a) mod m      # cond-sub
+#
+# Each iteration touches `result` at most twice with `if r >= m: r -= m`.
+# Because `result < m` before the doubling, `result < 2m` after, and a
+# single conditional subtraction restores `result < m`. Same after the
+# add of `a`. So we never need a full divide and never need a 2n-limb
+# intermediate product. The whole algorithm runs entirely in n-limb
+# space with limb-level shift / add / subtract / compare primitives.
+#
+# Why not Barrett or Montgomery: those would be faster for a verifier
+# that runs many modmuls per second. We run 17 modmuls per cert
+# (16 squarings + 1 multiply for e=65537). At ~2048 iterations per
+# modmul on the largest realistic modulus that's ~35k limb-loops —
+# milliseconds of CPU on a real x86_64 box. Simplicity wins here:
+# the bit-by-bit kernel is ~30 lines and is hard to get wrong.
+#
+# CONST-TIME DISCLOSURE — this layer is NOT const-time. Specifically:
+#   - bigint_cmp branches as soon as a limb differs.
+#   - bigint_sub_in_place's conditional-subtract takes a data-dependent
+#     branch on `r >= m`.
+#   - bigint_modmul's per-bit loop branches on each bit of `b`.
+# For RSA-PSS *verification* the only secret-bearing operand is the
+# signed message hash; the exponent and modulus are public per RFC
+# 8017. So timing leaks here don't endanger keys. V4's chain-validator
+# may need const-time work if/when we ever switch this surface to
+# decrypt-side use; document the gap explicitly.
+
+# -- Bigint container --------------------------------------------------------
+
+BIGINT_MAX_LIMBS: uint64 = 64       # 64 × 64-bit = 4096 bits
+
+
+class Bigint:
+    limbs: Array[64, uint64]
+    n_limbs: uint64
+
+
+def bigint_zero(b: Ptr[Bigint]):
+    i: uint64 = 0
+    while i < BIGINT_MAX_LIMBS:
+        b[0].limbs[i] = 0
+        i = i + 1
+    b[0].n_limbs = 0
+
+
+def bigint_copy(dst: Ptr[Bigint], src: Ptr[Bigint]):
+    i: uint64 = 0
+    while i < BIGINT_MAX_LIMBS:
+        dst[0].limbs[i] = src[0].limbs[i]
+        i = i + 1
+    dst[0].n_limbs = src[0].n_limbs
+
+
+# Internal: recompute n_limbs by scanning from the top limb downward
+# until we find the highest non-zero limb. We *cannot* trust the
+# existing n_limbs value because add_in_place / shl1 may push the
+# carry into limbs above n_limbs (we operate over the full backing
+# Array regardless of n_limbs, to keep the kernels branch-free across
+# different operand sizes). So normalize must rescan the whole array.
+def _bigint_normalize(b: Ptr[Bigint]):
+    n: uint64 = BIGINT_MAX_LIMBS
+    while n > 0:
+        if b[0].limbs[n - 1] != 0:
+            break
+        n = n - 1
+    b[0].n_limbs = n
+
+
+# -- bigint_from_bytes_be ----------------------------------------------------
+#
+# Load a big-endian byte string into a Bigint. ASN.1 DER INTEGERs come
+# in this form. The leading 0x00 sign-pad byte that DER prepends to
+# positive integers with a high bit set is stripped (src[0]==0 AND
+# src_len>1).
+#
+# Returns 0 on success, -1 on overflow (more bytes than 64×8 = 512 bits
+# could absorb after the optional sign-strip).
+
+def bigint_from_bytes_be(b: Ptr[Bigint],
+                         src: Ptr[uint8], src_len: uint64) -> int32:
+    bigint_zero(b)
+    # Strip the DER leading-zero sign indicator.
+    off: uint64 = 0
+    eff_len: uint64 = src_len
+    if eff_len > 1:
+        if src[0] == 0:
+            off = 1
+            eff_len = eff_len - 1
+    # Capacity check.
+    if eff_len > BIGINT_MAX_LIMBS * 8:
+        return -1
+    # Fill limbs from the least-significant byte (the last src byte)
+    # upward. Byte i from the end goes into bit (i*8) of the bigint.
+    i: uint64 = 0
+    while i < eff_len:
+        src_idx: uint64 = off + eff_len - 1 - i
+        byte_v: uint64 = cast[uint64](src[src_idx])
+        limb_idx: uint64 = i / 8
+        bit_off: uint64 = (i % 8) * 8
+        b[0].limbs[limb_idx] = b[0].limbs[limb_idx] | (byte_v << bit_off)
+        i = i + 1
+    b[0].n_limbs = (eff_len + 7) / 8
+    _bigint_normalize(b)
+    return 0
+
+
+# -- bigint_to_bytes_be ------------------------------------------------------
+#
+# Emit big-endian bytes of the value. Pads with leading zeros to
+# exactly dst_len bytes. Returns dst_len on success, -1 if the value
+# requires more than dst_len bytes.
+
+def bigint_to_bytes_be(b: Ptr[Bigint], dst: Ptr[uint8],
+                       dst_len: uint64) -> int64:
+    # Total byte count of the actual value (high bytes that are zero
+    # are fine as long as they fit in dst_len).
+    nl: uint64 = b[0].n_limbs
+    # Find the highest non-zero byte position.
+    # Worst case: nl*8 bytes. If nl == 0 the value is zero — fill zeros.
+    if nl == 0:
+        i: uint64 = 0
+        while i < dst_len:
+            dst[i] = 0
+            i = i + 1
+        return cast[int64](dst_len)
+    # Walk from MSB of top limb downward, counting needed bytes.
+    top_limb: uint64 = b[0].limbs[nl - 1]
+    top_bytes: uint64 = 8
+    # Strip leading zero bytes inside the top limb.
+    while top_bytes > 0:
+        shift: uint64 = (top_bytes - 1) * 8
+        if ((top_limb >> shift) & 0xFF) != 0:
+            break
+        top_bytes = top_bytes - 1
+    needed: uint64 = (nl - 1) * 8 + top_bytes
+    if needed > dst_len:
+        return cast[int64](-1)
+    # Zero-pad the prefix.
+    pad: uint64 = dst_len - needed
+    i: uint64 = 0
+    while i < pad:
+        dst[i] = 0
+        i = i + 1
+    # Emit bytes from MSB to LSB of the value.
+    j: uint64 = 0
+    while j < needed:
+        # Byte index from MSB-side, starting at 0.
+        byte_pos_from_lsb: uint64 = needed - 1 - j
+        limb_idx: uint64 = byte_pos_from_lsb / 8
+        bit_off: uint64 = (byte_pos_from_lsb % 8) * 8
+        v: uint64 = (b[0].limbs[limb_idx] >> bit_off) & 0xFF
+        dst[pad + j] = cast[uint8](v)
+        j = j + 1
+    return cast[int64](dst_len)
+
+
+# -- bigint_equal ------------------------------------------------------------
+#
+# Returns 1 if a == b in value, 0 otherwise. Compares full limb space
+# rather than n_limbs to be robust against callers that forgot to
+# normalize.
+
+def bigint_equal(a: Ptr[Bigint], b: Ptr[Bigint]) -> int32:
+    i: uint64 = 0
+    while i < BIGINT_MAX_LIMBS:
+        if a[0].limbs[i] != b[0].limbs[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+# -- bigint_cmp --------------------------------------------------------------
+#
+# Compare absolute values: returns -1 if a<b, 0 if a==b, 1 if a>b. The
+# n_limbs field is treated as a hint; the loop scans the full
+# BIGINT_MAX_LIMBS space from high to low.
+
+def bigint_cmp(a: Ptr[Bigint], b: Ptr[Bigint]) -> int32:
+    i: uint64 = BIGINT_MAX_LIMBS
+    while i > 0:
+        i = i - 1
+        av: uint64 = a[0].limbs[i]
+        bv: uint64 = b[0].limbs[i]
+        if av != bv:
+            # uint64 compare via sign-flip trick — Adder's `<` is
+            # signed-aware now (the quirk fix landed) but we keep the
+            # explicit ordering for readability.
+            if av < bv:
+                return -1
+            return 1
+    return 0
+
+
+# -- bigint_sub_in_place -----------------------------------------------------
+#
+# r := r - s. Caller guarantees r >= s. No return value.
+
+def bigint_sub_in_place(r: Ptr[Bigint], s: Ptr[Bigint]):
+    borrow: uint64 = 0
+    i: uint64 = 0
+    while i < BIGINT_MAX_LIMBS:
+        rv: uint64 = r[0].limbs[i]
+        sv: uint64 = s[0].limbs[i]
+        # r' = r - s - borrow. Compute via two-step subtract with
+        # explicit borrow tracking, since Adder lacks SBB intrinsics.
+        first: uint64 = rv - sv
+        new_borrow: uint64 = 0
+        if rv < sv:
+            new_borrow = 1
+        out: uint64 = first - borrow
+        if first < borrow:
+            new_borrow = new_borrow + 1
+        r[0].limbs[i] = out
+        borrow = new_borrow
+        i = i + 1
+    _bigint_normalize(r)
+
+
+# -- bigint_add_in_place -----------------------------------------------------
+#
+# r := r + s. Returns 1 if the addition overflowed the 64-limb space
+# (carry out of the top limb), 0 otherwise.
+
+def bigint_add_in_place(r: Ptr[Bigint], s: Ptr[Bigint]) -> int32:
+    carry: uint64 = 0
+    i: uint64 = 0
+    while i < BIGINT_MAX_LIMBS:
+        rv: uint64 = r[0].limbs[i]
+        sv: uint64 = s[0].limbs[i]
+        sum1: uint64 = rv + sv
+        new_carry: uint64 = 0
+        if sum1 < rv:
+            new_carry = 1
+        out: uint64 = sum1 + carry
+        if out < sum1:
+            new_carry = new_carry + 1
+        r[0].limbs[i] = out
+        carry = new_carry
+        i = i + 1
+    _bigint_normalize(r)
+    if carry != 0:
+        return 1
+    return 0
+
+
+# -- bigint_shl1 -------------------------------------------------------------
+#
+# r := r << 1. Returns 1 if the shift carried out of the top limb, 0
+# otherwise.
+
+def bigint_shl1(r: Ptr[Bigint]) -> int32:
+    carry: uint64 = 0
+    i: uint64 = 0
+    while i < BIGINT_MAX_LIMBS:
+        v: uint64 = r[0].limbs[i]
+        new_v: uint64 = (v << 1) | carry
+        carry = (v >> 63) & 1
+        r[0].limbs[i] = new_v
+        i = i + 1
+    _bigint_normalize(r)
+    if carry != 0:
+        return 1
+    return 0
+
+
+# -- _bigint_test_bit --------------------------------------------------------
+#
+# Return bit at position `bit_idx` (0 = LSB) as 0/1.
+
+def _bigint_test_bit(b: Ptr[Bigint], bit_idx: uint64) -> uint64:
+    limb_idx: uint64 = bit_idx / 64
+    bit_off: uint64 = bit_idx % 64
+    if limb_idx >= BIGINT_MAX_LIMBS:
+        return 0
+    return (b[0].limbs[limb_idx] >> bit_off) & 1
+
+
+# -- _bigint_bit_length ------------------------------------------------------
+#
+# Return the position of the highest set bit + 1 (i.e. the bit length).
+# 0 for a zero bigint.
+
+def _bigint_bit_length(b: Ptr[Bigint]) -> uint64:
+    nl: uint64 = b[0].n_limbs
+    if nl == 0:
+        return 0
+    top: uint64 = b[0].limbs[nl - 1]
+    if top == 0:
+        # Shouldn't happen post-normalize but be defensive.
+        return 0
+    # Find MSB position within top limb.
+    msb: uint64 = 63
+    while msb > 0:
+        if ((top >> msb) & 1) != 0:
+            break
+        msb = msb - 1
+    return (nl - 1) * 64 + msb + 1
+
+
+# -- bigint_modmul: shift-and-add modular multiplication ---------------------
+#
+# out := (a × b) mod m. Uses the bit-by-bit "double-and-add"
+# kernel described at the top of this file. Per iteration the
+# `result` bigint shifts left by 1 (conditional-subtract m) then
+# optionally adds `a` (conditional-subtract m again).
+#
+# Precondition: a < m AND b < m. (modexp ensures this by reducing the
+# base and never producing intermediates >= m.)
+#
+# Returns 0 on success. There's no failure mode given the
+# precondition; the return-value slot is reserved for future
+# const-time / hardened variants.
+#
+# IMPLEMENTATION NOTE: Bigint is 520 bytes (64 limbs + n_limbs). Stack-
+# allocating it in nested call frames (modexp -> modmul, both with
+# their own Bigint locals) trips the nested-frame Array spill quirk
+# described in memory/feedback_compiler_quirks.md. We dodge that by
+# keeping the working buffers at module scope. Cert verify is one-shot
+# during the TLS handshake; mutual exclusion is enforced by the fact
+# that V5 will call rsa_pss_verify exactly once per cert in a
+# single-threaded handshake state machine.
+
+_bigint_modmul_result: Bigint
+_bigint_modexp_base_red: Bigint
+_bigint_modexp_result: Bigint
+_bigint_modexp_tmp: Bigint
+
+
+def bigint_modmul(out: Ptr[Bigint], a: Ptr[Bigint],
+                  b: Ptr[Bigint], m: Ptr[Bigint]) -> int32:
+    bigint_zero(&_bigint_modmul_result)
+
+    # Iterate from MSB of b down to bit 0.
+    nbits: uint64 = _bigint_bit_length(b)
+    if nbits == 0:
+        # b == 0 -> result is 0.
+        bigint_copy(out, &_bigint_modmul_result)
+        return 0
+
+    i: uint64 = nbits
+    while i > 0:
+        i = i - 1
+        # result := (result << 1) mod m
+        bigint_shl1(&_bigint_modmul_result)
+        if bigint_cmp(&_bigint_modmul_result, m) >= 0:
+            bigint_sub_in_place(&_bigint_modmul_result, m)
+        # If bit i of b is set: result := (result + a) mod m
+        if _bigint_test_bit(b, i) != 0:
+            bigint_add_in_place(&_bigint_modmul_result, a)
+            if bigint_cmp(&_bigint_modmul_result, m) >= 0:
+                bigint_sub_in_place(&_bigint_modmul_result, m)
+    bigint_copy(out, &_bigint_modmul_result)
+    return 0
+
+
+# -- bigint_modexp: square-and-multiply -------------------------------------
+#
+# out := base^exp mod mod. Standard binary modexp: walk the exponent
+# from MSB to LSB, square each step, multiply by base when the bit is
+# set.
+#
+# Returns 0 on success, -1 if mod is zero (would divide by zero).
+
+def bigint_modexp(out: Ptr[Bigint], base: Ptr[Bigint],
+                  exp: Ptr[Bigint], mod: Ptr[Bigint]) -> int32:
+    if _bigint_bit_length(mod) == 0:
+        return -1
+
+    # Reduce base mod m in case the caller passed a non-reduced value.
+    bigint_copy(&_bigint_modexp_base_red, base)
+    while bigint_cmp(&_bigint_modexp_base_red, mod) >= 0:
+        bigint_sub_in_place(&_bigint_modexp_base_red, mod)
+
+    # result := 1
+    bigint_zero(&_bigint_modexp_result)
+    _bigint_modexp_result.limbs[0] = 1
+    _bigint_modexp_result.n_limbs = 1
+
+    nbits: uint64 = _bigint_bit_length(exp)
+    if nbits == 0:
+        # exp == 0 -> result is 1 (already set).
+        bigint_copy(out, &_bigint_modexp_result)
+        return 0
+
+    i: uint64 = nbits
+    while i > 0:
+        i = i - 1
+        # square: result := result * result mod m
+        bigint_modmul(&_bigint_modexp_tmp,
+                      &_bigint_modexp_result,
+                      &_bigint_modexp_result, mod)
+        bigint_copy(&_bigint_modexp_result, &_bigint_modexp_tmp)
+        # if bit i set: result := result * base mod m
+        if _bigint_test_bit(exp, i) != 0:
+            bigint_modmul(&_bigint_modexp_tmp,
+                          &_bigint_modexp_result,
+                          &_bigint_modexp_base_red, mod)
+            bigint_copy(&_bigint_modexp_result, &_bigint_modexp_tmp)
+    bigint_copy(out, &_bigint_modexp_result)
+    return 0

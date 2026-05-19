@@ -1,0 +1,610 @@
+# lib/rsa/rsa.ad
+#
+# RSA-PSS-SHA256 signature verification (V2 of Hamnix's TLS cert
+# validation stack). Sits atop lib/bigint/bigint.ad for the modular
+# exponentiation kernel and a self-contained SHA-256 (the existing
+# SHA-256 in drivers/net/tls.ad is `_tls_`-prefixed and effectively
+# file-private, so we carry our own copy of constants + compress
+# function here; V5 may consolidate when it wires the cert validator
+# into the TLS handshake).
+#
+# Spec: RFC 8017 §8.1.2 (RSASSA-PSS verification) plus §9.1.2 (the
+# EMSA-PSS-VERIFY encoding-side check that consumes the modexp output).
+#
+# WHAT THIS LAYER VERIFIES
+#
+#   rsa_pss_verify(pubkey, message, msg_len, signature, sig_len)
+#     -> 1  signature is valid for message under pubkey
+#        0  signature is invalid (bad hash, bad trailer, bad PS bytes)
+#       -1  malformed input (signature length doesn't match modulus,
+#            modulus too small, bigint range failures)
+#
+# Defaults: salt length = 32 bytes (= hash length), MGF1 hash = SHA-256.
+# These match every modern Let's Encrypt / commercial RSA-PSS cert.
+#
+# The pubkey parser handles the SubjectPublicKeyInfo BIT STRING value
+# bytes that V1's x509_parse hands back (a DER SEQUENCE wrapping two
+# INTEGERs: modulus and publicExponent).
+#
+# CONST-TIME: V2 is correctness-only. Comparison of the recovered
+# hash with the recomputed hash is byte-wise short-circuiting; for a
+# PUBLIC signature value this is fine, but if a sibling agent later
+# repurposes rsa_pss_verify into a decryption oracle they'll need to
+# revisit. Documented at top of bigint.ad as well.
+
+from lib.bigint.bigint import (
+    Bigint,
+    bigint_zero,
+    bigint_copy,
+    bigint_from_bytes_be,
+    bigint_to_bytes_be,
+    bigint_modexp,
+)
+from lib.asn1.asn1 import (
+    Asn1Cursor,
+    asn1_cursor_init,
+    asn1_read_sequence,
+    asn1_read_integer,
+)
+
+
+# -- RSA public-key record ---------------------------------------------------
+#
+# Per-key state. The modulus + exponent live as raw big-endian byte
+# strings rather than nested Bigints because the Adder compiler does
+# not (yet) cleanly handle nested class instances as fields — observed
+# behavior is that a second nested-Bigint field's writes alias the
+# first one's tail. We hoist the actual bigints into module-scope
+# scratch (see rsa_mod_bn / rsa_exp_bn below) and re-load them from
+# these raw bytes on each verify. The cost is tiny — modulus load is
+# 256 bytes once per cert.
+
+class RsaPubkey:
+    mod_bytes_be: Array[520, uint8]
+    mod_len:      uint64
+    exp_bytes_be: Array[8, uint8]
+    exp_len:      uint64
+    mod_bits:     uint64    # bit length of the modulus (e.g. 2048)
+    mod_bytes:    uint64    # = ceil(mod_bits / 8) (the "k" in RFC 8017)
+
+
+# -- helpers -----------------------------------------------------------------
+
+def _rsa_memzero(p: Ptr[uint8], n: uint64):
+    i: uint64 = 0
+    while i < n:
+        p[i] = 0
+        i = i + 1
+
+
+def _rsa_memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64):
+    i: uint64 = 0
+    while i < n:
+        dst[i] = src[i]
+        i = i + 1
+
+
+# Compute the bit length of a big-endian byte string (the position of
+# its highest set bit + 1). Used to recover modBits from the parsed
+# modulus byte width.
+
+def _rsa_be_bit_length(buf: Ptr[uint8], n: uint64) -> uint64:
+    # Skip leading zero bytes.
+    i: uint64 = 0
+    while i < n:
+        if buf[i] != 0:
+            break
+        i = i + 1
+    if i == n:
+        return 0
+    # Find highest set bit in buf[i].
+    top: uint8 = buf[i]
+    bit: uint64 = 7
+    while bit > 0:
+        if ((top >> bit) & 1) != 0:
+            break
+        bit = bit - 1
+    full_bytes: uint64 = n - i - 1
+    return full_bytes * 8 + bit + 1
+
+
+# -- rsa_parse_pubkey --------------------------------------------------------
+#
+# Parse the BIT STRING value bytes of a SubjectPublicKeyInfo whose
+# AlgorithmIdentifier is rsaEncryption or rsassa-pss. The bytes are a
+# DER SEQUENCE of two INTEGERs: (modulus, publicExponent).
+#
+# Returns 0 on success, -1 on malformed input.
+
+def rsa_parse_pubkey(spki_bytes: Ptr[uint8], spki_len: uint64,
+                     out: Ptr[RsaPubkey]) -> int32:
+    c: Asn1Cursor
+    asn1_cursor_init(&c, spki_bytes, spki_len)
+    inner: Asn1Cursor
+    rc: int32 = asn1_read_sequence(&c, &inner)
+    if rc != 0:
+        return -1
+    # Modulus: up to 512 bytes (4096 bits) + 1 byte sign-pad.
+    mod_len: uint64 = 0
+    n: int64 = asn1_read_integer(&inner, &out[0].mod_bytes_be[0],
+                                 &mod_len, cast[uint64](520))
+    if n < cast[int64](0):
+        return -1
+    out[0].mod_len = mod_len
+    # Exponent: small (usually 3 bytes for 65537).
+    exp_len: uint64 = 0
+    n = asn1_read_integer(&inner, &out[0].exp_bytes_be[0], &exp_len,
+                          cast[uint64](8))
+    if n < cast[int64](0):
+        return -1
+    out[0].exp_len = exp_len
+
+    # Derive modBits / modBytes. The leading byte may be a DER sign-pad
+    # 0x00 (when the modulus's high bit is set).
+    skip: uint64 = 0
+    if mod_len > 1:
+        if out[0].mod_bytes_be[0] == 0:
+            skip = 1
+    eff_buf: Ptr[uint8] = &out[0].mod_bytes_be[skip]
+    eff_len: uint64 = mod_len - skip
+    out[0].mod_bits = _rsa_be_bit_length(eff_buf, eff_len)
+    out[0].mod_bytes = (out[0].mod_bits + 7) / 8
+    return 0
+
+
+# -- self-contained SHA-256 --------------------------------------------------
+#
+# Carried locally because drivers/net/tls.ad's SHA-256 is private to
+# that module (the symbols are `_tls_*` and the module isn't exported
+# in an importable way). Constants are FIPS 180-4 §4.2.2; algorithm
+# straight from §6.2.2. V5 may consolidate by promoting one copy to
+# lib/crypto/sha256.ad — leaving that as a follow-on so we don't trip
+# on the V5 boundary right now.
+
+rsa_sha256_k: Array[64, uint32]
+
+
+def _rsa_sha256_init_k():
+    rsa_sha256_k[0]  = 0x428A2F98
+    rsa_sha256_k[1]  = 0x71374491
+    rsa_sha256_k[2]  = 0xB5C0FBCF
+    rsa_sha256_k[3]  = 0xE9B5DBA5
+    rsa_sha256_k[4]  = 0x3956C25B
+    rsa_sha256_k[5]  = 0x59F111F1
+    rsa_sha256_k[6]  = 0x923F82A4
+    rsa_sha256_k[7]  = 0xAB1C5ED5
+    rsa_sha256_k[8]  = 0xD807AA98
+    rsa_sha256_k[9]  = 0x12835B01
+    rsa_sha256_k[10] = 0x243185BE
+    rsa_sha256_k[11] = 0x550C7DC3
+    rsa_sha256_k[12] = 0x72BE5D74
+    rsa_sha256_k[13] = 0x80DEB1FE
+    rsa_sha256_k[14] = 0x9BDC06A7
+    rsa_sha256_k[15] = 0xC19BF174
+    rsa_sha256_k[16] = 0xE49B69C1
+    rsa_sha256_k[17] = 0xEFBE4786
+    rsa_sha256_k[18] = 0x0FC19DC6
+    rsa_sha256_k[19] = 0x240CA1CC
+    rsa_sha256_k[20] = 0x2DE92C6F
+    rsa_sha256_k[21] = 0x4A7484AA
+    rsa_sha256_k[22] = 0x5CB0A9DC
+    rsa_sha256_k[23] = 0x76F988DA
+    rsa_sha256_k[24] = 0x983E5152
+    rsa_sha256_k[25] = 0xA831C66D
+    rsa_sha256_k[26] = 0xB00327C8
+    rsa_sha256_k[27] = 0xBF597FC7
+    rsa_sha256_k[28] = 0xC6E00BF3
+    rsa_sha256_k[29] = 0xD5A79147
+    rsa_sha256_k[30] = 0x06CA6351
+    rsa_sha256_k[31] = 0x14292967
+    rsa_sha256_k[32] = 0x27B70A85
+    rsa_sha256_k[33] = 0x2E1B2138
+    rsa_sha256_k[34] = 0x4D2C6DFC
+    rsa_sha256_k[35] = 0x53380D13
+    rsa_sha256_k[36] = 0x650A7354
+    rsa_sha256_k[37] = 0x766A0ABB
+    rsa_sha256_k[38] = 0x81C2C92E
+    rsa_sha256_k[39] = 0x92722C85
+    rsa_sha256_k[40] = 0xA2BFE8A1
+    rsa_sha256_k[41] = 0xA81A664B
+    rsa_sha256_k[42] = 0xC24B8B70
+    rsa_sha256_k[43] = 0xC76C51A3
+    rsa_sha256_k[44] = 0xD192E819
+    rsa_sha256_k[45] = 0xD6990624
+    rsa_sha256_k[46] = 0xF40E3585
+    rsa_sha256_k[47] = 0x106AA070
+    rsa_sha256_k[48] = 0x19A4C116
+    rsa_sha256_k[49] = 0x1E376C08
+    rsa_sha256_k[50] = 0x2748774C
+    rsa_sha256_k[51] = 0x34B0BCB5
+    rsa_sha256_k[52] = 0x391C0CB3
+    rsa_sha256_k[53] = 0x4ED8AA4A
+    rsa_sha256_k[54] = 0x5B9CCA4F
+    rsa_sha256_k[55] = 0x682E6FF3
+    rsa_sha256_k[56] = 0x748F82EE
+    rsa_sha256_k[57] = 0x78A5636F
+    rsa_sha256_k[58] = 0x84C87814
+    rsa_sha256_k[59] = 0x8CC70208
+    rsa_sha256_k[60] = 0x90BEFFFA
+    rsa_sha256_k[61] = 0xA4506CEB
+    rsa_sha256_k[62] = 0xBEF9A3F7
+    rsa_sha256_k[63] = 0xC67178F2
+
+
+# Running SHA-256 state. Single-threaded use (cert verify is one-shot
+# during handshake) — global state is OK.
+rsa_sha_state:      Array[8, uint32]
+rsa_sha_buf:        Array[64, uint8]
+rsa_sha_buflen:     uint64 = 0
+rsa_sha_total_bits: uint64 = 0
+rsa_sha_w:          Array[64, uint32]
+rsa_sha_state_scratch: Array[8, uint32]
+
+
+def _rsa_rotr32(v: uint32, n: uint64) -> uint32:
+    x: uint64 = cast[uint64](v) & 0xFFFFFFFF
+    lo: uint64 = x >> n
+    hi: uint64 = (x << (32 - n)) & 0xFFFFFFFF
+    return cast[uint32](lo | hi)
+
+
+def _rsa_sha256_compress(block_ptr: Ptr[uint8]):
+    i: uint64 = 0
+    while i < 16:
+        b0: uint32 = cast[uint32](block_ptr[i * 4 + 0])
+        b1: uint32 = cast[uint32](block_ptr[i * 4 + 1])
+        b2: uint32 = cast[uint32](block_ptr[i * 4 + 2])
+        b3: uint32 = cast[uint32](block_ptr[i * 4 + 3])
+        rsa_sha_w[i] = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+        i = i + 1
+    while i < 64:
+        s0: uint32 = _rsa_rotr32(rsa_sha_w[i - 15], 7) \
+            ^ _rsa_rotr32(rsa_sha_w[i - 15], 18) \
+            ^ (rsa_sha_w[i - 15] >> 3)
+        s1: uint32 = _rsa_rotr32(rsa_sha_w[i - 2], 17) \
+            ^ _rsa_rotr32(rsa_sha_w[i - 2], 19) \
+            ^ (rsa_sha_w[i - 2] >> 10)
+        sum_v: uint64 = (cast[uint64](rsa_sha_w[i - 16]) & 0xFFFFFFFF) \
+            + (cast[uint64](s0) & 0xFFFFFFFF) \
+            + (cast[uint64](rsa_sha_w[i - 7]) & 0xFFFFFFFF) \
+            + (cast[uint64](s1) & 0xFFFFFFFF)
+        rsa_sha_w[i] = cast[uint32](sum_v & 0xFFFFFFFF)
+        i = i + 1
+
+    i = 0
+    while i < 8:
+        rsa_sha_state_scratch[i] = rsa_sha_state[i]
+        i = i + 1
+    a: uint32 = rsa_sha_state_scratch[0]
+    b: uint32 = rsa_sha_state_scratch[1]
+    c: uint32 = rsa_sha_state_scratch[2]
+    d: uint32 = rsa_sha_state_scratch[3]
+    e: uint32 = rsa_sha_state_scratch[4]
+    f: uint32 = rsa_sha_state_scratch[5]
+    g: uint32 = rsa_sha_state_scratch[6]
+    h: uint32 = rsa_sha_state_scratch[7]
+    i = 0
+    while i < 64:
+        S1: uint32 = _rsa_rotr32(e, 6) ^ _rsa_rotr32(e, 11) \
+            ^ _rsa_rotr32(e, 25)
+        ch: uint32 = (e & f) ^ ((~e) & g)
+        t1_64: uint64 = (cast[uint64](h) & 0xFFFFFFFF) \
+            + (cast[uint64](S1) & 0xFFFFFFFF) \
+            + (cast[uint64](ch) & 0xFFFFFFFF) \
+            + (cast[uint64](rsa_sha256_k[i]) & 0xFFFFFFFF) \
+            + (cast[uint64](rsa_sha_w[i]) & 0xFFFFFFFF)
+        t1: uint32 = cast[uint32](t1_64 & 0xFFFFFFFF)
+        S0: uint32 = _rsa_rotr32(a, 2) ^ _rsa_rotr32(a, 13) \
+            ^ _rsa_rotr32(a, 22)
+        maj: uint32 = (a & b) ^ (a & c) ^ (b & c)
+        t2_64: uint64 = (cast[uint64](S0) & 0xFFFFFFFF) \
+            + (cast[uint64](maj) & 0xFFFFFFFF)
+        t2: uint32 = cast[uint32](t2_64 & 0xFFFFFFFF)
+        h = g
+        g = f
+        f = e
+        d64: uint64 = (cast[uint64](d) & 0xFFFFFFFF) \
+            + (cast[uint64](t1) & 0xFFFFFFFF)
+        e = cast[uint32](d64 & 0xFFFFFFFF)
+        d = c
+        c = b
+        b = a
+        a64: uint64 = (cast[uint64](t1) & 0xFFFFFFFF) \
+            + (cast[uint64](t2) & 0xFFFFFFFF)
+        a = cast[uint32](a64 & 0xFFFFFFFF)
+        i = i + 1
+    sum_v0: uint64 = cast[uint64](rsa_sha_state[0]) + cast[uint64](a)
+    sum_v1: uint64 = cast[uint64](rsa_sha_state[1]) + cast[uint64](b)
+    sum_v2: uint64 = cast[uint64](rsa_sha_state[2]) + cast[uint64](c)
+    sum_v3: uint64 = cast[uint64](rsa_sha_state[3]) + cast[uint64](d)
+    sum_v4: uint64 = cast[uint64](rsa_sha_state[4]) + cast[uint64](e)
+    sum_v5: uint64 = cast[uint64](rsa_sha_state[5]) + cast[uint64](f)
+    sum_v6: uint64 = cast[uint64](rsa_sha_state[6]) + cast[uint64](g)
+    sum_v7: uint64 = cast[uint64](rsa_sha_state[7]) + cast[uint64](h)
+    rsa_sha_state[0] = cast[uint32](sum_v0 & 0xFFFFFFFF)
+    rsa_sha_state[1] = cast[uint32](sum_v1 & 0xFFFFFFFF)
+    rsa_sha_state[2] = cast[uint32](sum_v2 & 0xFFFFFFFF)
+    rsa_sha_state[3] = cast[uint32](sum_v3 & 0xFFFFFFFF)
+    rsa_sha_state[4] = cast[uint32](sum_v4 & 0xFFFFFFFF)
+    rsa_sha_state[5] = cast[uint32](sum_v5 & 0xFFFFFFFF)
+    rsa_sha_state[6] = cast[uint32](sum_v6 & 0xFFFFFFFF)
+    rsa_sha_state[7] = cast[uint32](sum_v7 & 0xFFFFFFFF)
+
+
+def _rsa_sha256_reset():
+    rsa_sha_state[0] = 0x6A09E667
+    rsa_sha_state[1] = 0xBB67AE85
+    rsa_sha_state[2] = 0x3C6EF372
+    rsa_sha_state[3] = 0xA54FF53A
+    rsa_sha_state[4] = 0x510E527F
+    rsa_sha_state[5] = 0x9B05688C
+    rsa_sha_state[6] = 0x1F83D9AB
+    rsa_sha_state[7] = 0x5BE0CD19
+    rsa_sha_buflen = 0
+    rsa_sha_total_bits = 0
+
+
+def _rsa_sha256_update(data: Ptr[uint8], n: uint64):
+    block_ptr: Ptr[uint8] = cast[Ptr[uint8]](&rsa_sha_buf[0])
+    pos: uint64 = 0
+    while pos < n:
+        room: uint64 = 64 - rsa_sha_buflen
+        take: uint64 = n - pos
+        if take > room:
+            take = room
+        i: uint64 = 0
+        while i < take:
+            rsa_sha_buf[rsa_sha_buflen + i] = data[pos + i]
+            i = i + 1
+        rsa_sha_buflen = rsa_sha_buflen + take
+        pos = pos + take
+        if rsa_sha_buflen == 64:
+            _rsa_sha256_compress(block_ptr)
+            rsa_sha_buflen = 0
+    rsa_sha_total_bits = rsa_sha_total_bits + n * 8
+
+
+def _rsa_sha256_finish_into(out_hash: Ptr[uint8]):
+    block_ptr: Ptr[uint8] = cast[Ptr[uint8]](&rsa_sha_buf[0])
+    saved_bits: uint64 = rsa_sha_total_bits
+    rsa_sha_buf[rsa_sha_buflen] = 0x80
+    rsa_sha_buflen = rsa_sha_buflen + 1
+    if rsa_sha_buflen > 56:
+        while rsa_sha_buflen < 64:
+            rsa_sha_buf[rsa_sha_buflen] = 0
+            rsa_sha_buflen = rsa_sha_buflen + 1
+        _rsa_sha256_compress(block_ptr)
+        rsa_sha_buflen = 0
+    while rsa_sha_buflen < 56:
+        rsa_sha_buf[rsa_sha_buflen] = 0
+        rsa_sha_buflen = rsa_sha_buflen + 1
+    i: uint64 = 0
+    while i < 8:
+        shift: uint64 = (7 - i) * 8
+        rsa_sha_buf[56 + i] = cast[uint8]((saved_bits >> shift) & 0xFF)
+        i = i + 1
+    _rsa_sha256_compress(block_ptr)
+    i = 0
+    while i < 8:
+        w: uint32 = rsa_sha_state[i]
+        out_hash[i * 4 + 0] = cast[uint8]((w >> 24) & 0xFF)
+        out_hash[i * 4 + 1] = cast[uint8]((w >> 16) & 0xFF)
+        out_hash[i * 4 + 2] = cast[uint8]((w >> 8) & 0xFF)
+        out_hash[i * 4 + 3] = cast[uint8](w & 0xFF)
+        i = i + 1
+
+
+def _rsa_sha256_oneshot(data: Ptr[uint8], n: uint64,
+                        out_hash: Ptr[uint8]):
+    _rsa_sha256_reset()
+    _rsa_sha256_update(data, n)
+    _rsa_sha256_finish_into(out_hash)
+
+
+# -- rsa_init ----------------------------------------------------------------
+#
+# Initialize the SHA-256 round-constants table. Userland call sites
+# (and the eventual kernel call site in drivers/net/tls.ad V5) must
+# call this once before invoking rsa_pss_verify.
+
+def rsa_init():
+    _rsa_sha256_init_k()
+
+
+# -- MGF1(seed, mask_len) ----------------------------------------------------
+#
+# Mask Generation Function 1 from RFC 8017 §B.2.1, instantiated with
+# SHA-256. Produces `mask_len` bytes of output by repeatedly hashing
+# seed || I2OSP(counter, 4) for counter = 0, 1, 2, ...
+
+def _rsa_mgf1(seed: Ptr[uint8], seed_len: uint64,
+              mask_out: Ptr[uint8], mask_len: uint64):
+    counter: uint32 = 0
+    written: uint64 = 0
+    block: Array[32, uint8]
+    cnt_be: Array[4, uint8]
+    while written < mask_len:
+        # I2OSP(counter, 4)
+        cnt_be[0] = cast[uint8]((counter >> 24) & 0xFF)
+        cnt_be[1] = cast[uint8]((counter >> 16) & 0xFF)
+        cnt_be[2] = cast[uint8]((counter >> 8) & 0xFF)
+        cnt_be[3] = cast[uint8](counter & 0xFF)
+        # SHA-256(seed || counter_bytes)
+        _rsa_sha256_reset()
+        _rsa_sha256_update(seed, seed_len)
+        _rsa_sha256_update(&cnt_be[0], cast[uint64](4))
+        _rsa_sha256_finish_into(&block[0])
+        # Copy up to 32 bytes into mask_out at offset `written`.
+        remaining: uint64 = mask_len - written
+        take: uint64 = 32
+        if take > remaining:
+            take = remaining
+        j: uint64 = 0
+        while j < take:
+            mask_out[written + j] = block[j]
+            j = j + 1
+        written = written + take
+        counter = counter + 1
+
+
+# -- rsa_pss_verify ----------------------------------------------------------
+#
+# RFC 8017 §8.1.2 RSASSA-PSS-VERIFY. Returns:
+#   1   signature valid
+#   0   signature invalid
+#  -1   malformed input (length mismatch, key sanity)
+#
+# Defaults: sLen = 32 (== hash length), MGF1 = SHA-256.
+
+# Scratch space — these are sized for the worst-case 4096-bit modulus
+# (mod_bytes = 512). Put them at module scope to avoid blowing the
+# stack frame (per the kernel-side small-stack discipline) and to
+# sidestep the nested-frame Array spill quirk (memory/feedback_compiler_quirks.md).
+#
+# rsa_em_buf is also publicly readable (test fixtures may dump it for
+# diagnostics after a failed verify).
+rsa_em_buf:        Array[512, uint8]
+rsa_db_buf:        Array[512, uint8]
+rsa_mask_buf:      Array[512, uint8]
+rsa_mhash:         Array[32, uint8]
+rsa_hprime:        Array[32, uint8]
+rsa_mprime:        Array[256, uint8]   # 8 + 32 + sLen<=216 — sLen=32 today
+
+# Bigint scratch — Bigint is 520 bytes; stack-allocating it nested
+# inside a verify call (alongside bigint_modexp's own locals) trips
+# the nested-frame Array spill quirk. Park them at module scope.
+# Also nested-class-instance fields don't work cleanly in Adder
+# (multiple back-to-back Bigint fields alias each other), so we keep
+# the live modulus/exponent bigints out here rather than embedded in
+# RsaPubkey.
+rsa_sig_bn:        Bigint
+rsa_em_bn:         Bigint
+rsa_mod_bn:        Bigint
+rsa_exp_bn:        Bigint
+
+
+def rsa_pss_verify(pubkey: Ptr[RsaPubkey],
+                   message: Ptr[uint8], msg_len: uint64,
+                   signature: Ptr[uint8], sig_len: uint64) -> int32:
+    h_len: uint64 = 32
+    s_len: uint64 = 32   # PSS-SHA256 default per RFC 8017 §A.2.3
+    k: uint64 = pubkey[0].mod_bytes
+    mod_bits: uint64 = pubkey[0].mod_bits
+
+    # Sanity bounds. Per RFC 8017 §8.1.2: signature octet length must
+    # equal `k` (the modulus byte length).
+    if sig_len != k:
+        return -1
+    # emBits = modBits - 1; emLen = ceil(emBits / 8).
+    if mod_bits == 0:
+        return -1
+    em_bits: uint64 = mod_bits - 1
+    em_len: uint64 = (em_bits + 7) / 8
+    # Spec note: when modBits ≡ 1 mod 8 (rare), emLen = k - 1 and EM
+    # is one byte shorter than the signature. For the common case of
+    # 2048/3072/4096-bit moduli, modBits % 8 == 0 so em_len == k.
+    # We support both branches by checking em_len against k below.
+
+    # PSS encoding-side length check from RFC 8017 §9.1.2 step 3:
+    # emLen < hLen + sLen + 2  → inconsistent.
+    if em_len < h_len + s_len + 2:
+        return -1
+
+    # Load modulus + exponent into module-scope Bigints. (See the
+    # comment near rsa_mod_bn for why these don't live inside RsaPubkey.)
+    rc: int32 = bigint_from_bytes_be(&rsa_mod_bn,
+                                     &pubkey[0].mod_bytes_be[0],
+                                     pubkey[0].mod_len)
+    if rc != 0:
+        return -1
+    rc = bigint_from_bytes_be(&rsa_exp_bn,
+                              &pubkey[0].exp_bytes_be[0],
+                              pubkey[0].exp_len)
+    if rc != 0:
+        return -1
+
+    # RSAVP1: m = sig^e mod n
+    rc = bigint_from_bytes_be(&rsa_sig_bn, signature, sig_len)
+    if rc != 0:
+        return -1
+    rc = bigint_modexp(&rsa_em_bn, &rsa_sig_bn, &rsa_exp_bn, &rsa_mod_bn)
+    if rc != 0:
+        return -1
+    # Serialize EM as em_len big-endian bytes.
+    n64: int64 = bigint_to_bytes_be(&rsa_em_bn, &rsa_em_buf[0], em_len)
+    if n64 < cast[int64](0):
+        return -1
+
+    # Step 4: last byte of EM must be 0xBC.
+    if rsa_em_buf[em_len - 1] != 0xBC:
+        return 0
+
+    # Step 5: maskedDB = EM[0..emLen-hLen-1), H = EM[emLen-hLen-1..emLen-1)
+    masked_db_len: uint64 = em_len - h_len - 1
+    masked_db: Ptr[uint8] = &rsa_em_buf[0]
+    H: Ptr[uint8] = &rsa_em_buf[masked_db_len]
+
+    # Step 6: leftmost (8*emLen - emBits) bits of EM[0] must be 0.
+    zero_bits: uint64 = 8 * em_len - em_bits
+    if zero_bits > 0:
+        if zero_bits > 8:
+            # Defensive — this would only fire on an absurd em_len.
+            return 0
+        # The top `zero_bits` bits of masked_db[0] must be zero.
+        keep_mask: uint8 = cast[uint8]((cast[uint32](1) << (8 - zero_bits)) - 1)
+        invert_mask: uint8 = ~keep_mask
+        if (masked_db[0] & invert_mask) != 0:
+            return 0
+
+    # Step 7: dbMask = MGF1(H, emLen - hLen - 1)
+    _rsa_mgf1(H, h_len, &rsa_mask_buf[0], masked_db_len)
+
+    # Step 8: DB = maskedDB XOR dbMask
+    i: uint64 = 0
+    while i < masked_db_len:
+        rsa_db_buf[i] = masked_db[i] ^ rsa_mask_buf[i]
+        i = i + 1
+
+    # Step 9: zero the top (8*emLen - emBits) bits of DB[0].
+    if zero_bits > 0:
+        keep_mask2: uint8 = cast[uint8]((cast[uint32](1) << (8 - zero_bits)) - 1)
+        rsa_db_buf[0] = rsa_db_buf[0] & keep_mask2
+
+    # Step 10: DB = PS (zero bytes) || 0x01 || salt
+    # PS length = emLen - sLen - hLen - 2
+    ps_len: uint64 = em_len - s_len - h_len - 2
+    i = 0
+    while i < ps_len:
+        if rsa_db_buf[i] != 0:
+            return 0
+        i = i + 1
+    if rsa_db_buf[ps_len] != 0x01:
+        return 0
+    salt: Ptr[uint8] = &rsa_db_buf[ps_len + 1]
+
+    # Step 11: M' = (0x00 * 8) || mHash || salt
+    _rsa_sha256_oneshot(message, msg_len, &rsa_mhash[0])
+    i = 0
+    while i < 8:
+        rsa_mprime[i] = 0
+        i = i + 1
+    i = 0
+    while i < h_len:
+        rsa_mprime[8 + i] = rsa_mhash[i]
+        i = i + 1
+    i = 0
+    while i < s_len:
+        rsa_mprime[8 + h_len + i] = salt[i]
+        i = i + 1
+
+    # Step 12: H' = SHA-256(M')
+    _rsa_sha256_oneshot(&rsa_mprime[0], 8 + h_len + s_len,
+                        &rsa_hprime[0])
+
+    # Step 13: H == H' ?
+    i = 0
+    while i < h_len:
+        if rsa_hprime[i] != H[i]:
+            return 0
+        i = i + 1
+    return 1
