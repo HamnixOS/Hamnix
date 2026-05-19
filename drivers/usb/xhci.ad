@@ -1,0 +1,470 @@
+# drivers/usb/xhci.ad
+#
+# xHCI (eXtensible Host Controller Interface) HCD driver — V0 scope.
+# xHCI is the only USB host controller exposed on any 2026-era x86
+# laptop or motherboard. EHCI/UHCI/OHCI controllers stopped shipping
+# around 2014; chipsets since Intel Skylake / AMD Zen route all USB
+# ports through xHCI, including USB 2.x devices. Without this driver
+# the only path to a keyboard on modern hardware is the (often
+# absent) PS/2 i8042 — so for ThinkPads from ~T480 on, Dell Latitudes,
+# all post-2018 Apple hardware, and every desktop without a PS/2 DIN,
+# xHCI is the only way the user can type anything into hamsh.
+#
+# Scope of THIS milestone (V0 — controller-detect + port-scan):
+#
+#   1. PCI scan for class=0x0C subclass=0x03 progIF=0x30 (xHCI class
+#      triple, same encoding QEMU's qemu-xhci uses + every real
+#      controller on real silicon).
+#   2. Map BAR0 — a 64-bit MEM BAR holding the capability registers
+#      (offset 0) and the operational registers (offset CAPLENGTH).
+#   3. Decode HCSPARAMS1 → MaxSlots + MaxPorts + MaxIntrs. Print
+#      enough info that a regression in the BAR mapping is loud.
+#   4. Walk PORTSC for each root-hub port, log connected ports
+#      + USB speed. When the PCC (Current Connect Status) bit is
+#      set, log "[xhci] root hub: device at port N speed=..."; if
+#      the speed matches a USB 2.x boot keyboard we additionally
+#      log "[xhci] root hub: keyboard candidate at port N" so the
+#      test script has a deterministic marker to grep.
+#   5. Bring the HID-class translator (drivers/usb/hid.ad) online so
+#      its self-test runs and pushes bytes through the same kbd
+#      FIFO the PS/2 driver feeds. Surfaces a "[usb_hid] self-test
+#      PASS (N cases)" banner — this is the load-bearing pass marker
+#      the test harness asserts on.
+#
+# Explicitly OUT of scope for V0 (deferred to V1+):
+#   - Transfer-ring construction (Command Ring + Event Ring + per-
+#     endpoint Transfer Rings). The skeleton is in place — we
+#     allocate scratchpad pages + CRCR-target page so the V1
+#     transfer-engine landing patch doesn't have to relocate the
+#     I/O memory map. But we do NOT submit any TRBs.
+#   - Address Device / Configure Endpoint commands. Without these
+#     the controller can't actually exchange a SETUP transaction
+#     with a device, so no GET_DESCRIPTOR, SET_PROTOCOL, or
+#     interrupt-in polling. V0 stops at "device is electrically
+#     connected and link-trained, host-side state machine knows
+#     about it".
+#   - USB 3.x SuperSpeed enumeration. xHCI requires a separate
+#     "SuperSpeed" port set for USB 3.0/3.1/3.2/3.x devices; V0
+#     only logs HighSpeed/FullSpeed ports as keyboard candidates,
+#     SuperSpeed ports are flagged as "out-of-scope speed" so a
+#     regression doesn't pretend it found a keyboard.
+#   - Hubs past the root hub. Real-hardware laptops sometimes have
+#     an internal USB hub between the xHCI and the built-in
+#     keyboard; that path is not walked.
+#
+# References:
+#   - xHCI 1.2 spec §5 (register map), §6 (data structures), §3.4
+#     (slot lifecycle).
+#   - Linux drivers/usb/host/xhci.c — full implementation.
+#   - drivers/nvme/nvme.ad — sibling MMIO-driven PCI driver in-tree.
+
+from kernel.printk.printk import printk0, printk1, printk2
+from drivers.pci.pci import (
+    pci_config_read_dword, pci_config_write_dword,
+    pci_bdf_bus, pci_bdf_dev, pci_bdf_fn, pci_pack_bdf,
+    pci_read_bar, PCI_BDF_NONE,
+    PCI_COMMAND_OFFSET, PCI_COMMAND_MEM, PCI_COMMAND_MASTER,
+)
+from mm.page_alloc import alloc_pages
+from drivers.usb.hid import hid_init
+from drivers.usb.usb import (
+    USB_SPEED_UNKNOWN, USB_SPEED_FULL, USB_SPEED_LOW,
+    USB_SPEED_HIGH, USB_SPEED_SUPER,
+)
+
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
+
+# --- PCI class triple ---------------------------------------------
+#
+# Per PCI Code-and-ID assignments: serial-bus (0x0C), USB (0x03),
+# xHCI prog_if (0x30). QEMU's qemu-xhci device matches; so do
+# Intel Wildcat Point / Cannon Lake / Tiger Lake PCH USB
+# controllers and the AMD chipset equivalents.
+
+XHCI_PCI_CLASS:    uint32 = 0x0C
+XHCI_PCI_SUBCLASS: uint32 = 0x03
+XHCI_PCI_PROGIF:   uint32 = 0x30
+
+
+# --- Capability register offsets (BAR0 + N, xHCI §5.3) -----------
+#
+# These live at the very start of the MMIO region and are read-only.
+# CAPLENGTH (1 byte) tells us where the operational-register block
+# begins; HCSPARAMS1 carries MaxSlots / MaxIntrs / MaxPorts.
+
+XHCI_CAP_CAPLENGTH:   uint64 = 0x00    # u8
+XHCI_CAP_HCIVERSION:  uint64 = 0x02    # u16 BCD (e.g. 0x0100 = 1.0)
+XHCI_CAP_HCSPARAMS1:  uint64 = 0x04    # u32  MaxSlots / MaxIntrs / MaxPorts
+XHCI_CAP_HCSPARAMS2:  uint64 = 0x08    # u32  scratchpad bufs etc.
+XHCI_CAP_HCCPARAMS1:  uint64 = 0x10    # u32  64-bit addressing, contexts...
+XHCI_CAP_DBOFF:       uint64 = 0x14    # u32  doorbell array offset
+XHCI_CAP_RTSOFF:      uint64 = 0x18    # u32  runtime regs offset
+
+
+# --- Operational register offsets (relative to BAR0+CAPLENGTH) ---
+#
+# We list what we'd touch at full enable; V0 only reads CMD/STS and
+# walks the PORTSC array, leaving CRCR/DCBAAP cleared (the controller
+# is left in the "not yet running" state).
+
+XHCI_OP_USBCMD:     uint64 = 0x00     # u32
+XHCI_OP_USBSTS:     uint64 = 0x04     # u32
+XHCI_OP_PAGESIZE:   uint64 = 0x08     # u32
+XHCI_OP_DNCTRL:     uint64 = 0x14     # u32
+XHCI_OP_CRCR:       uint64 = 0x18     # u64  Command Ring Control
+XHCI_OP_DCBAAP:     uint64 = 0x30     # u64  Device Context Base Array Ptr
+XHCI_OP_CONFIG:     uint64 = 0x38     # u32  Max Device Slots Enabled
+
+# Per-port registers start at op_base + 0x400 and span 16 bytes
+# (PORTSC, PORTPMSC, PORTLI, reserved).
+XHCI_PORT_BASE:     uint64 = 0x400
+XHCI_PORT_STRIDE:   uint64 = 0x10
+XHCI_PORT_PORTSC:   uint64 = 0x00
+
+# USBCMD bits.
+XHCI_CMD_RS:       uint32 = 0x01      # Run/Stop
+XHCI_CMD_HCRST:    uint32 = 0x02      # Host Controller Reset
+XHCI_CMD_INTE:     uint32 = 0x04      # Interrupter Enable
+
+# USBSTS bits.
+XHCI_STS_HCH:      uint32 = 0x01      # Host Controller Halted
+XHCI_STS_HSE:      uint32 = 0x04      # Host System Error
+XHCI_STS_EINT:     uint32 = 0x08      # Event Interrupt
+XHCI_STS_CNR:      uint32 = 0x800     # Controller Not Ready
+
+# PORTSC bits (xHCI §5.4.8).
+XHCI_PORTSC_CCS:   uint32 = 0x01      # Current Connect Status
+XHCI_PORTSC_PED:   uint32 = 0x02      # Port Enabled
+XHCI_PORTSC_PR:    uint32 = 0x10      # Port Reset
+# Speed lives in bits 10..13 (4 bits). 1=FullSpeed, 2=LowSpeed,
+# 3=HighSpeed, 4=SuperSpeed.
+XHCI_PORTSC_SPEED_SHIFT: uint32 = 10
+XHCI_PORTSC_SPEED_MASK:  uint32 = 0xF
+
+
+# --- Driver state -------------------------------------------------
+#
+# Single-controller scope. If a system has two xHCI controllers (rare
+# on QEMU, possible on real silicon with discrete USB add-in cards),
+# we'll bind to the first one we find. Multi-controller is a tidy
+# V1 extension once we have an actual transfer engine.
+
+class XhciState:
+    bdf:          uint32      # PCI bus/dev/fn
+    bar0:         uint64      # capability-register base (MMIO)
+    op_base:      uint64      # operational-register base = bar0 + CAPLENGTH
+    db_base:      uint64      # doorbell array base = bar0 + DBOFF
+    rt_base:      uint64      # runtime-register base = bar0 + RTSOFF
+    max_slots:    uint32      # from HCSPARAMS1[7:0]
+    max_intrs:    uint32      # from HCSPARAMS1[18:8]
+    max_ports:    uint32      # from HCSPARAMS1[31:24]
+    hci_version:  uint32      # BCD, e.g. 0x0100
+
+    # V1-preallocated scratch — left mapped but inert in V0 so a
+    # later patch doesn't have to refactor the I/O memory map. None
+    # of these are written to xHCI registers in V0.
+    dcbaa:        uint64      # Device Context Base Array (4 KiB)
+    cmd_ring:     uint64      # Command Ring (4 KiB)
+    event_ring:   uint64      # Event Ring segment (4 KiB)
+
+    # Per-port discovery counters surfaced in the boot banner.
+    ports_connected: uint32
+    kbd_candidates:  uint32
+
+
+xhci: XhciState
+
+
+# --- MMIO helpers --------------------------------------------------
+#
+# Same pattern as drivers/nvme/nvme.ad: explicit ptr-cast read/write,
+# no volatile keyword (the compiler doesn't reorder past extern calls
+# and we don't hoist these into a tight loop). 32-bit width is the
+# norm for xHCI registers; only CRCR and DCBAAP are 64-bit and we
+# read/write those as two halves to dodge any unaligned-MMIO concern
+# (xHCI 1.2 §5.2 says all registers are naturally aligned, so 64-bit
+# would be fine too, but the half-write is one cheap insurance line).
+
+def _xhci_r32(addr: uint64) -> uint32:
+    return cast[Ptr[uint32]](addr)[0]
+
+
+def _xhci_w32(addr: uint64, value: uint32):
+    cast[Ptr[uint32]](addr)[0] = value
+
+
+def _xhci_r8(addr: uint64) -> uint32:
+    return cast[uint32](cast[Ptr[uint8]](addr)[0])
+
+
+def _xhci_r16(addr: uint64) -> uint32:
+    return cast[uint32](cast[Ptr[uint16]](addr)[0])
+
+
+# --- PCI plumbing --------------------------------------------------
+
+def _xhci_pci_find_class(class_code: uint32, subclass: uint32,
+                         prog_if: uint32) -> uint32:
+    # Same shape as drivers/nvme/_nvme_pci_find_class. xHCI controllers
+    # don't expose a stable vendor:device pair (Intel uses several;
+    # AMD does too; QEMU's qemu-xhci is 1B36:000D); class-match is the
+    # only sane way to find them.
+    bus: uint32 = 0
+    dev: uint32 = 0
+    while dev < 32:
+        ident: uint32 = pci_config_read_dword(bus, dev, 0, 0x00)
+        v: uint32 = ident & 0xFFFF
+        if v != 0xFFFF:
+            cls: uint32 = pci_config_read_dword(bus, dev, 0, 0x08)
+            this_class:    uint32 = (cls >> 24) & 0xFF
+            this_subclass: uint32 = (cls >> 16) & 0xFF
+            this_progif:   uint32 = (cls >>  8) & 0xFF
+            if this_class == class_code \
+               and this_subclass == subclass \
+               and this_progif == prog_if:
+                return pci_pack_bdf(bus, dev, 0)
+        dev = dev + 1
+    return PCI_BDF_NONE
+
+
+def _xhci_pci_enable_mem_and_master(bdf: uint32):
+    # xHCI BAR0 is a MEM BAR + the controller DMAs into host memory
+    # (event ring writes, scratchpad reads): both MEM-enable and
+    # Bus-Master are mandatory. Mirrors _nvme_pci_enable_mem_and_master.
+    bus: uint32 = pci_bdf_bus(bdf)
+    dev: uint32 = pci_bdf_dev(bdf)
+    fn:  uint32 = pci_bdf_fn(bdf)
+    cmd: uint32 = pci_config_read_dword(bus, dev, fn,
+                                        PCI_COMMAND_OFFSET) & 0xFFFF
+    cmd = cmd | PCI_COMMAND_MEM | PCI_COMMAND_MASTER
+    upper: uint32 = pci_config_read_dword(bus, dev, fn,
+                                          PCI_COMMAND_OFFSET) & 0xFFFF0000
+    pci_config_write_dword(bus, dev, fn, PCI_COMMAND_OFFSET,
+                           upper | cmd)
+
+
+def _xhci_pci_read_bar0_64(bdf: uint32) -> uint64:
+    # xHCI BAR0 is a 64-bit MEM BAR (per xHCI §5.2.1). Same decode
+    # as NVMe. Mask the type+prefetch bits out of the low half.
+    low:  uint32 = pci_read_bar(bdf, 0)
+    high: uint32 = pci_read_bar(bdf, 1)
+    base: uint64 = cast[uint64](low & 0xFFFFFFF0) \
+                 | (cast[uint64](high) << 32)
+    return base
+
+
+# --- Speed helpers -------------------------------------------------
+
+def _xhci_speed_str(speed: uint32) -> Ptr[char]:
+    if speed == USB_SPEED_FULL:
+        return "FullSpeed"
+    if speed == USB_SPEED_LOW:
+        return "LowSpeed"
+    if speed == USB_SPEED_HIGH:
+        return "HighSpeed"
+    if speed == USB_SPEED_SUPER:
+        return "SuperSpeed"
+    return "??"
+
+
+def _xhci_speed_is_usb2(speed: uint32) -> int32:
+    # FullSpeed (USB 1.1 / USB 2.x low-bw) and HighSpeed (USB 2.0)
+    # are the speeds boot-protocol HID keyboards live at. LowSpeed
+    # would also technically be valid (USB 1.1 keyboards exist) but
+    # we don't yet support its smaller-MaxPacketSize path in the
+    # transfer engine — flag SuperSpeed and LowSpeed as "out of scope
+    # for V0" rather than printing a misleading "keyboard candidate".
+    if speed == USB_SPEED_FULL:
+        return 1
+    if speed == USB_SPEED_HIGH:
+        return 1
+    return 0
+
+
+# --- Port scan -----------------------------------------------------
+
+def _xhci_scan_ports():
+    # Walk PORTSC[1..max_ports] (xHCI port indexing is 1-based per
+    # §5.4.8; PORTSC for port N lives at op_base + 0x400 + (N-1)*0x10).
+    # For each connected port, log speed + flag boot-keyboard
+    # candidates. We do NOT issue a Port Reset here — that's a
+    # transfer-engine prerequisite, and resetting without an event-
+    # ring to consume the resulting Port-Status-Change Event would
+    # wedge the controller's internal state machine.
+    xhci.ports_connected = 0
+    xhci.kbd_candidates  = 0
+
+    n: uint32 = 0
+    while n < xhci.max_ports:
+        port_addr: uint64 = xhci.op_base + XHCI_PORT_BASE \
+                          + cast[uint64](n) * XHCI_PORT_STRIDE \
+                          + XHCI_PORT_PORTSC
+        portsc: uint32 = _xhci_r32(port_addr)
+        if (portsc & XHCI_PORTSC_CCS) != 0:
+            speed: uint32 = (portsc >> XHCI_PORTSC_SPEED_SHIFT) \
+                          & XHCI_PORTSC_SPEED_MASK
+            xhci.ports_connected = xhci.ports_connected + 1
+            printk2("[xhci] port %d connected speed=%s\n",
+                    cast[uint64](n + 1),
+                    cast[uint64](_xhci_speed_str(speed)))
+            if _xhci_speed_is_usb2(speed) != 0:
+                # qemu-xhci's `-device usb-kbd` lands as HighSpeed
+                # (with the default qemu-xhci) or FullSpeed (with
+                # `-device usb-kbd,bus=usb-bus.0` on the older
+                # nec-usb-xhci model). Either way it's a candidate.
+                xhci.kbd_candidates = xhci.kbd_candidates + 1
+                printk1("[xhci] root hub: keyboard at port %d\n",
+                        cast[uint64](n + 1))
+            else:
+                # SuperSpeed / LowSpeed — log as out-of-scope so the
+                # test log makes it clear we noticed but won't try
+                # to drive it in V0.
+                printk1("[xhci] port %d speed out-of-scope-V0\n",
+                        cast[uint64](n + 1))
+        n = n + 1
+    printk2("[xhci] root hub scan: %d connected, %d keyboard candidate(s)\n",
+            cast[uint64](xhci.ports_connected),
+            cast[uint64](xhci.kbd_candidates))
+
+
+# --- Reset / capability decode -------------------------------------
+
+def _xhci_wait_cnr_clear(op_base: uint64) -> int32:
+    # CNR (Controller Not Ready) is set after reset and clears once
+    # the controller is willing to accept register writes. xHCI §5.4.2
+    # says drivers must wait for CNR=0 before touching CONFIG/CRCR/
+    # DCBAAP. Generous spin budget — QEMU TCG can be slow.
+    spin: uint64 = 0
+    while spin < 10000000:
+        sts: uint32 = _xhci_r32(op_base + XHCI_OP_USBSTS)
+        if (sts & XHCI_STS_CNR) == 0:
+            return 0
+        spin = spin + 1
+    printk0("[xhci] CNR clear timeout\n")
+    return -1
+
+
+def _xhci_reset(op_base: uint64) -> int32:
+    # Set HCRST and poll until the controller clears it AND CNR
+    # becomes 0. The clear-then-wait dance is mandatory per §4.2 —
+    # writing CRCR before CNR clears is undefined.
+    cmd: uint32 = _xhci_r32(op_base + XHCI_OP_USBCMD)
+    _xhci_w32(op_base + XHCI_OP_USBCMD, cmd | XHCI_CMD_HCRST)
+    spin: uint64 = 0
+    while spin < 10000000:
+        c2: uint32 = _xhci_r32(op_base + XHCI_OP_USBCMD)
+        if (c2 & XHCI_CMD_HCRST) == 0:
+            return _xhci_wait_cnr_clear(op_base)
+        spin = spin + 1
+    printk0("[xhci] HCRST clear timeout\n")
+    return -1
+
+
+# --- Public entry point -------------------------------------------
+
+def xhci_init() -> int32:
+    # PCI-scan, BAR-map, capability-decode, port-scan, bring HID
+    # online. Returns 0 on success, -1 on any failure. Non-fatal:
+    # failure here just means USB keyboards won't work this boot;
+    # PS/2 keyboards (atkbd) continue to function unchanged.
+    bdf: uint32 = _xhci_pci_find_class(XHCI_PCI_CLASS,
+                                       XHCI_PCI_SUBCLASS,
+                                       XHCI_PCI_PROGIF)
+    if bdf == PCI_BDF_NONE:
+        printk0("[xhci] no controller found\n")
+        return -1
+    xhci.bdf = bdf
+    printk1("[xhci] controller found bdf=%x\n", cast[uint64](bdf))
+
+    _xhci_pci_enable_mem_and_master(bdf)
+
+    bar0: uint64 = _xhci_pci_read_bar0_64(bdf)
+    if bar0 == 0:
+        printk0("[xhci] BAR0 is unmapped\n")
+        return -1
+    xhci.bar0 = bar0
+    printk1("[xhci] bar0=%p\n", bar0)
+
+    # Capability registers — read-only, no enable required.
+    caplength: uint32 = _xhci_r8(bar0 + XHCI_CAP_CAPLENGTH)
+    hciversion: uint32 = _xhci_r16(bar0 + XHCI_CAP_HCIVERSION)
+    hcsparams1: uint32 = _xhci_r32(bar0 + XHCI_CAP_HCSPARAMS1)
+    dboff:  uint32 = _xhci_r32(bar0 + XHCI_CAP_DBOFF) & 0xFFFFFFFC
+    rtsoff: uint32 = _xhci_r32(bar0 + XHCI_CAP_RTSOFF) & 0xFFFFFFE0
+
+    xhci.op_base    = bar0 + cast[uint64](caplength)
+    xhci.db_base    = bar0 + cast[uint64](dboff)
+    xhci.rt_base    = bar0 + cast[uint64](rtsoff)
+    xhci.hci_version = hciversion
+    xhci.max_slots  = hcsparams1 & 0xFF
+    xhci.max_intrs  = (hcsparams1 >> 8) & 0x7FF
+    xhci.max_ports  = (hcsparams1 >> 24) & 0xFF
+
+    printk2("[xhci] HCIVERSION=%x CAPLENGTH=%d\n",
+            cast[uint64](hciversion), cast[uint64](caplength))
+    printk2("[xhci] op_base=%p db_base=%p\n",
+            xhci.op_base, xhci.db_base)
+    printk2("[xhci] max_slots=%d max_ports=%d\n",
+            cast[uint64](xhci.max_slots),
+            cast[uint64](xhci.max_ports))
+
+    # Halt + reset the controller. After this the operational state
+    # is the spec-defined power-on default — port-status reads are
+    # still valid because PORTSC.CCS reflects the PHY layer's view
+    # of the cable, which the reset doesn't tear down.
+    sts: uint32 = _xhci_r32(xhci.op_base + XHCI_OP_USBSTS)
+    if (sts & XHCI_STS_HCH) == 0:
+        # Controller is running — stop it before resetting (xHCI §4.2
+        # forbids HCRST while RS=1; QEMU is more lenient but real
+        # silicon will fault).
+        cmd: uint32 = _xhci_r32(xhci.op_base + XHCI_OP_USBCMD)
+        _xhci_w32(xhci.op_base + XHCI_OP_USBCMD, cmd & ~XHCI_CMD_RS)
+        # Spin briefly for HCH=1.
+        spin: uint64 = 0
+        while spin < 1000000:
+            s2: uint32 = _xhci_r32(xhci.op_base + XHCI_OP_USBSTS)
+            if (s2 & XHCI_STS_HCH) != 0:
+                spin = 1000000          # break
+            else:
+                spin = spin + 1
+    if _xhci_reset(xhci.op_base) != 0:
+        printk0("[xhci] reset failed — abort init\n")
+        return -1
+    printk0("[xhci] controller reset complete\n")
+
+    # V1 prep — allocate the three scratch pages a transfer engine
+    # would point CRCR / DCBAAP / Event Ring at. We DO NOT write
+    # them into registers yet (doing so without a corresponding
+    # Address Device flow leaves the controller waiting for events
+    # we'll never produce). Logging the allocations confirms the
+    # page allocator is healthy at this point in boot — a regression
+    # in mm.page_alloc surfaces here loudly, not silently at V1.
+    dcbaa: uint64 = alloc_pages(0)
+    cmdr:  uint64 = alloc_pages(0)
+    evtr:  uint64 = alloc_pages(0)
+    if dcbaa == 0 or cmdr == 0 or evtr == 0:
+        printk0("[xhci] scratch page allocation failed\n")
+        return -1
+    memset(cast[Ptr[uint8]](dcbaa), 0, 4096)
+    memset(cast[Ptr[uint8]](cmdr),  0, 4096)
+    memset(cast[Ptr[uint8]](evtr),  0, 4096)
+    xhci.dcbaa      = dcbaa
+    xhci.cmd_ring   = cmdr
+    xhci.event_ring = evtr
+    printk2("[xhci] scratch dcbaa=%p cmd_ring=%p\n", dcbaa, cmdr)
+
+    # Walk the root-hub PORTSC array to see what's connected. Logs
+    # are the load-bearing artifact for V0 — they prove the BAR
+    # mapping landed at the right physical address and the
+    # capability decode produced a sensible max_ports.
+    _xhci_scan_ports()
+
+    # Bring the HID class driver up. Its self-test runs synthetic
+    # boot-keyboard reports through the same kbd_rx_push the PS/2
+    # driver feeds — that's the proof-of-concept that USB HID bytes
+    # could reach hamsh's read_line *if* we had a transfer engine
+    # to receive them off the wire.
+    hid_init()
+
+    return 0
