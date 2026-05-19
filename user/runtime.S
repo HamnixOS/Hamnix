@@ -25,6 +25,53 @@
     .code64
     .section .text, "ax"
 
+    /* --- Stack-protector runtime (user side) -------------------------
+     * V0 stack-canary support. The Adder x86_64 codegen emits a
+     * canary load/store pair around every function it tags
+     * `needs_canary` (Array[N>=8] local or any &local — same
+     * heuristic gcc's -fstack-protector-strong uses). The prologue
+     * references __stack_chk_guard(%rip) and a mismatch tail-call's
+     * __stack_chk_fail. Both symbols must resolve in every user
+     * binary's link, so we provide weak definitions here in
+     * runtime.S — every user ELF picks up runtime.o, so the
+     * symbols are always present. A user binary that wants
+     * stronger semantics (e.g. a real PRNG-seeded guard) can
+     * supply a strong definition and the linker preference rules
+     * pick that one instead.
+     *
+     * On mismatch, sys_exit(134) — Linux's SIGABRT exit code, what
+     * glibc's __stack_chk_fail uses. The shell + initramfs runner
+     * see exit code 134 and the test script greps for it as the
+     * "canary detected" marker.
+     */
+    .weak __stack_chk_guard
+    .section .data
+    .align 8
+__stack_chk_guard:
+    /* Same C0FFEE..C0 magic as kernel/stack_protect.ad's pre-init
+     * value. User binaries don't have a __stack_chk_init phase
+     * (no PRNG access from CPL 3 yet), so the magic IS the live
+     * guard for the binary's whole lifetime. */
+    .quad 0xC0FFEEDEADBEEFC0
+
+    .section .text, "ax"
+    .weak __stack_chk_fail
+    .type __stack_chk_fail, @function
+__stack_chk_fail:
+    /* Move 134 (Linux SIGABRT exit code) into %rdi, sys_exit. The
+     * code path is a tail-call from the canary epilogue; the
+     * caller's frame is already partly-corrupted (that's how we
+     * got here), so making a fresh syscall is the only safe
+     * forward action. SYS_EXIT does not return; defensively spin
+     * if it ever does. */
+    movq    $134, %rdi
+    movq    $1, %rax                /* SYS_EXIT */
+    syscall
+.L_chk_fail_hang:
+    jmp     .L_chk_fail_hang
+    .size __stack_chk_fail, .-__stack_chk_fail
+
+
     /* --- _start ------------------------------------------------------
      * Kernel hands us a freshly-allocated user stack already aligned to
      * 16 bytes (see arch/x86/kernel/sched/core.py:create_user_task and

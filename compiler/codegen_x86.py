@@ -67,6 +67,35 @@ X86_INTRINSICS = {"outb", "inb", "outl", "inl", "outw", "inw",
                   "asm_volatile"}
 
 
+# Stack-protector: minimum Array[N, T] N to flag a function as canary-
+# needing. Mirrors gcc's `-fstack-protector-strong` heuristic which
+# protects any function with a byte-array of >= 8 bytes. Smaller arrays
+# rarely host the kind of length-driven overrun this catches (the TLS
+# bug was a 2 KiB buffer overrun by ~500 bytes), and protecting every
+# tiny scratch [4, uint8] would explode prologue/epilogue counts for
+# zero real safety. Picked 8 to match the gcc default exactly.
+STACK_PROTECTOR_ARRAY_THRESHOLD = 8
+
+# Stack-protector: function names that MUST NOT get a canary. Any
+# function in this set is skipped during pre_scan_function regardless
+# of what its body looks like. The two existential cases:
+#   * __stack_chk_fail itself — recurses forever otherwise.
+#   * panic / hlt_forever / similar one-way-doors — entering them
+#     already means the system is gone, and the canary check at exit
+#     can never run anyway.
+# Pattern is exact-match prefix to avoid surprising third-party callers.
+STACK_PROTECTOR_SKIP_NAMES = frozenset({
+    "__stack_chk_fail",
+    "__stack_chk_init",
+    "_linux_stack_chk_fail",
+})
+STACK_PROTECTOR_SKIP_PREFIXES = (
+    "panic_",
+    "stack_smash_panic_",
+    "_hang",          # kernel/panic.ad:_hang_forever
+)
+
+
 class CodeGenError(Exception):
     """Error during code generation."""
     pass
@@ -104,6 +133,15 @@ class FunctionContext:
     stack_size: int = 0
     label_counter: int = 0
     loop_stack: list[LoopContext] = field(default_factory=list)
+    # Stack-protector: when True, gen_function prologue reserves an
+    # 8-byte canary slot at -8(%rbp) BEFORE laying out any other
+    # locals, and every return path routes through a single epilogue
+    # label that re-loads __stack_chk_guard, XORs with the slot, and
+    # tail-calls __stack_chk_fail on mismatch. Set in pre_scan_function;
+    # consumed in gen_function. epilogue_label is the shared return
+    # target used by ReturnStmt and the fallthrough.
+    needs_canary: bool = False
+    epilogue_label: str = ""
 
     def alloc_local(self, name: str, size: int = 8,
                     var_type: Optional[Type] = None) -> LocalVar:
@@ -616,10 +654,173 @@ class X86CodeGen:
         self.emit('.modinfo_license:')
         self.emit('    .asciz "license=GPL"')
 
+    # -- stack protector ----------------------------------------------------
+    #
+    # V0 stack-canary support. Mirrors gcc's `-fstack-protector-strong`:
+    # a function gets a canary if it has an Array[N, T] local with
+    # N >= STACK_PROTECTOR_ARRAY_THRESHOLD, OR if it takes the address
+    # of any local with `&`. The prologue stashes __stack_chk_guard at
+    # -8(%rbp); every return path routes through a single epilogue that
+    # XORs the slot with the guard and tail-calls __stack_chk_fail on
+    # mismatch. See kernel/stack_protect.ad for the guard/fail runtime.
+    #
+    # The canary slot lives at the TOP of the frame (closest to the
+    # saved return address) so a typical "write past the end of a local
+    # array" overrun corrupts the canary on its way out — which is the
+    # exact class of bug `-fstack-protector-strong` exists to catch.
+
+    def _stmt_uses_addr_of_local(self, node) -> bool:
+        """Recursive walk: does this AST subtree contain `&ident`?
+
+        We can't tell at scan time whether `ident` resolves to a local
+        vs. a global, so we conservatively flag ANY `&ident`. Globals
+        are .data symbols and don't need protection, so the false-
+        positive rate is small (a handful of `&__stack_chk_guard`-style
+        sites) and the cost (one extra prologue/epilogue per protected
+        fn) is negligible."""
+        if node is None:
+            return False
+        # Expr forms that could host nested ADDR ops.
+        if isinstance(node, UnaryExpr):
+            if node.op is UnaryOp.ADDR:
+                return True
+            return self._stmt_uses_addr_of_local(node.operand)
+        if isinstance(node, BinaryExpr):
+            return (self._stmt_uses_addr_of_local(node.left)
+                    or self._stmt_uses_addr_of_local(node.right))
+        if isinstance(node, CallExpr):
+            for a in node.args:
+                if self._stmt_uses_addr_of_local(a):
+                    return True
+            for v in node.kwargs.values():
+                if self._stmt_uses_addr_of_local(v):
+                    return True
+            return False
+        if isinstance(node, IndexExpr):
+            return (self._stmt_uses_addr_of_local(node.obj)
+                    or self._stmt_uses_addr_of_local(node.index))
+        if isinstance(node, MemberExpr):
+            return self._stmt_uses_addr_of_local(node.obj)
+        if isinstance(node, CastExpr):
+            return self._stmt_uses_addr_of_local(node.expr)
+        if isinstance(node, ConditionalExpr):
+            return (self._stmt_uses_addr_of_local(node.condition)
+                    or self._stmt_uses_addr_of_local(node.then_expr)
+                    or self._stmt_uses_addr_of_local(node.else_expr))
+        if isinstance(node, ContainerOfExpr):
+            return self._stmt_uses_addr_of_local(node.expr)
+        # Stmt forms.
+        if isinstance(node, VarDecl):
+            return self._stmt_uses_addr_of_local(node.value)
+        if isinstance(node, Assignment):
+            return (self._stmt_uses_addr_of_local(node.target)
+                    or self._stmt_uses_addr_of_local(node.value))
+        if isinstance(node, ExprStmt):
+            return self._stmt_uses_addr_of_local(node.expr)
+        if isinstance(node, ReturnStmt):
+            return self._stmt_uses_addr_of_local(node.value)
+        if isinstance(node, IfStmt):
+            if self._stmt_uses_addr_of_local(node.condition):
+                return True
+            for s in node.then_body:
+                if self._stmt_uses_addr_of_local(s):
+                    return True
+            for cond, body in node.elif_branches:
+                if self._stmt_uses_addr_of_local(cond):
+                    return True
+                for s in body:
+                    if self._stmt_uses_addr_of_local(s):
+                        return True
+            if node.else_body:
+                for s in node.else_body:
+                    if self._stmt_uses_addr_of_local(s):
+                        return True
+            return False
+        if isinstance(node, WhileStmt):
+            if self._stmt_uses_addr_of_local(node.condition):
+                return True
+            for s in node.body:
+                if self._stmt_uses_addr_of_local(s):
+                    return True
+            return False
+        if isinstance(node, DoWhileStmt):
+            if self._stmt_uses_addr_of_local(node.condition):
+                return True
+            for s in node.body:
+                if self._stmt_uses_addr_of_local(s):
+                    return True
+            return False
+        # Leaf / no-children Expr or Stmt: nothing to recurse into.
+        return False
+
+    def _stmt_has_big_array_local(self, node) -> bool:
+        """Recursive walk: does this AST subtree introduce an
+        Array[N, T] VarDecl with N >= STACK_PROTECTOR_ARRAY_THRESHOLD?
+
+        Walking nested IfStmt/WhileStmt bodies catches arrays declared
+        inside conditional blocks (rare but exists)."""
+        if node is None:
+            return False
+        if isinstance(node, VarDecl):
+            t = node.var_type
+            if isinstance(t, ArrayType) \
+                    and t.size >= STACK_PROTECTOR_ARRAY_THRESHOLD:
+                return True
+            return False
+        if isinstance(node, IfStmt):
+            for s in node.then_body:
+                if self._stmt_has_big_array_local(s):
+                    return True
+            for _, body in node.elif_branches:
+                for s in body:
+                    if self._stmt_has_big_array_local(s):
+                        return True
+            if node.else_body:
+                for s in node.else_body:
+                    if self._stmt_has_big_array_local(s):
+                        return True
+            return False
+        if isinstance(node, (WhileStmt, DoWhileStmt)):
+            for s in node.body:
+                if self._stmt_has_big_array_local(s):
+                    return True
+            return False
+        return False
+
+    def _function_needs_canary(self, func: FunctionDef) -> bool:
+        """Return True iff `func` should get a stack canary."""
+        name = func.name
+        if name in STACK_PROTECTOR_SKIP_NAMES:
+            return False
+        for prefix in STACK_PROTECTOR_SKIP_PREFIXES:
+            if name.startswith(prefix):
+                return False
+        for stmt in func.body:
+            if self._stmt_has_big_array_local(stmt):
+                return True
+        for stmt in func.body:
+            if self._stmt_uses_addr_of_local(stmt):
+                return True
+        return False
+
     # -- functions ----------------------------------------------------------
 
     def gen_function(self, func: FunctionDef) -> None:
         self.ctx = FunctionContext(name=func.name)
+        self.ctx.needs_canary = self._function_needs_canary(func)
+        self.ctx.epilogue_label = f".__epilogue_{func.name}"
+
+        # Stack-protector V0: when needs_canary is set, reserve the 8-byte
+        # canary slot at the TOP of the frame (closest to saved %rbp / the
+        # return address) BEFORE any real locals. alloc_local picks the
+        # next-most-negative offset, so allocating the canary first puts
+        # it at -8(%rbp), and subsequent locals at -16, -24, ... This is
+        # the standard layout an x86 overrun-detector wants: a write that
+        # runs past the end of a local Array[N, T] sweeps up THROUGH the
+        # canary slot before reaching the saved return address, so the
+        # epilogue check trips before the bogus `ret` does.
+        if self.ctx.needs_canary:
+            self.ctx.alloc_local("__canary", 8, None)
 
         # Parameters become locals: allocate slots up front so the body can
         # see them via the same symbol-lookup path as VarDecl-introduced
@@ -646,6 +847,16 @@ class X86CodeGen:
         # body is walked (VarDecls may allocate more locals). Patched below.
         reserve_idx = len(self.output)
         self.emit("    # @STACK_RESERVE@")
+
+        # Stack-protector prologue: load the current __stack_chk_guard
+        # value (a non-zero magic before __stack_chk_init runs, or the
+        # randomised post-init value) into the canary slot. Uses %rax
+        # which is about to be overwritten by either a param spill (next
+        # block) or the body's first expr — no other live state to
+        # preserve at this point.
+        if self.ctx.needs_canary:
+            self.emit("    movq __stack_chk_guard(%rip), %rax")
+            self.emit("    movq %rax, -8(%rbp)")
 
         # Spill parameters from arg-regs / caller's stack into their local
         # slots. Args 0..5 come in via ARG_REGS; args 6+ live at +16(%rbp),
@@ -695,11 +906,50 @@ class X86CodeGen:
         else:
             self.output[reserve_idx] = ""
 
-        # Fallthrough epilogue for void paths. Skipping it after an explicit
-        # return suppresses objtool's "unreachable instruction" warning.
-        if not (func.body and isinstance(func.body[-1], ReturnStmt)):
+        # Epilogue. For canary-protected functions we ALWAYS emit the
+        # epilogue label + check + ret, even if the body falls through
+        # to a ReturnStmt (which jumps to the label) — every return
+        # path lands here so the check runs exactly once. The check
+        # XORs the slot with the live guard value; equal canaries
+        # produce zero (testq sets ZF=1), differing canaries land in
+        # __stack_chk_fail which never returns.
+        last_is_return = (func.body
+                          and isinstance(func.body[-1], ReturnStmt))
+        if self.ctx.needs_canary:
+            # If the body falls through (no explicit trailing return)
+            # we still need to enter the epilogue; emit an explicit
+            # jmp to keep the label as a join point rather than the
+            # fallthrough target. (objtool warns on label-after-fall
+            # if we don't have a `jmp`; the jmp also defangs the
+            # "unreachable instruction" warning the same way the old
+            # void-path comment described.)
+            if not last_is_return:
+                self.emit(f"    jmp {self.ctx.epilogue_label}")
+            self.emit(f"{self.ctx.epilogue_label}:")
+            # CRITICAL: the canary check MUST NOT clobber %rax — that
+            # holds the function's return value at this point (set by
+            # the body before the jmp here). Use %rcx as the scratch
+            # for the XOR-and-test. %rcx is caller-saved in SysV so we
+            # don't owe the caller anything, and our own epilogue is
+            # the only code between here and `ret`.
+            self.emit("    movq -8(%rbp), %rcx")
+            self.emit("    xorq __stack_chk_guard(%rip), %rcx")
+            # testq sets ZF=1 iff %rcx==0 (canary matched the guard);
+            # jnz on ZF=0 (mismatch) tail-calls __stack_chk_fail which
+            # never returns. %rax is preserved across this whole
+            # sequence so the eventual `ret` hands the right value
+            # back to the caller.
+            self.emit("    testq %rcx, %rcx")
+            self.emit("    jnz __stack_chk_fail")
             self.emit("    leave")
             self.emit("    ret")
+        else:
+            # Non-canary path: same shape as before. Skipping the
+            # fallthrough epilogue after an explicit return suppresses
+            # objtool's "unreachable instruction" warning.
+            if not last_is_return:
+                self.emit("    leave")
+                self.emit("    ret")
         self.emit(f"    .size {func.name}, .-{func.name}")
         self.ctx = None
 
@@ -732,8 +982,17 @@ class X86CodeGen:
             case ReturnStmt(value=value):
                 if value is not None:
                     self.gen_expr(value)
-                self.emit("    leave")
-                self.emit("    ret")
+                # Canary-protected functions route every return through
+                # the shared epilogue label so the check happens exactly
+                # once per function regardless of how many `return`s the
+                # body contains. Plain functions emit leave/ret inline
+                # (preserves the pre-canary asm shape that compiler-test
+                # asm-grepping relies on).
+                if self.ctx is not None and self.ctx.needs_canary:
+                    self.emit(f"    jmp {self.ctx.epilogue_label}")
+                else:
+                    self.emit("    leave")
+                    self.emit("    ret")
 
             case IfStmt(condition=cond, then_body=then_body,
                         elif_branches=elifs, else_body=else_body):

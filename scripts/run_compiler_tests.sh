@@ -40,6 +40,7 @@ TESTS=(
     "cast_arr_u32:bash scripts/test_compiler_cast_arr_u32.sh"
     "nested_frame_array:bash scripts/test_compiler_nested_frame_array.sh"
     "nested_class_fields:bash scripts/test_compiler_nested_class_fields.sh"
+    "stack_canary:bash scripts/test_compiler_stack_canary.sh"
 )
 
 results=()
