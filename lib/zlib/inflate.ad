@@ -1,0 +1,1368 @@
+# lib/zlib/inflate.ad
+#
+# Streaming DEFLATE (RFC 1951) + gzip-wrapper (RFC 1952) inflater.
+# V0 primitive used by `apt update` to decompress `Packages.gz` (and
+# kin: `Sources.gz`, `Translation-en.gz`) once the chunked HTTP body
+# reaches the client. Wire-up into drivers/net/http.ad belongs to V1
+# — this file only ships the primitive plus its self-test.
+#
+# DESIGN: caller-driven streaming.
+#
+#   1. caller stack-allocates an `InflateState`, then calls
+#      `inflate_init(&state)` to reset to start-of-stream.
+#   2. caller pushes input bytes + pulls output bytes with
+#      `inflate_feed(&state, in_buf, in_len, out_buf, out_max,
+#                    &out_consumed, &in_consumed, &done)`.
+#   3. repeat (2) until `done=1` or rc<0.
+#
+# NO HEAP. The state object contains every scratch buffer (a 32 KB
+# sliding window, the Huffman code-length tables, the literal/length
+# and distance tables). It's ~40 KB; the caller stack-allocates it at
+# the call site or parks it at module scope — both work. The user's
+# `out_buf` is also caller-owned, sized to fit the *entire* expected
+# decompressed output (the inflater errors with "out_max insufficient"
+# if it runs out of room; we don't ring-buffer the output, only the
+# 32 KB LZ77 window).
+#
+# SCOPE (V0 caveats, documented up front so callers know what to ship):
+#   - **Single gzip member only.** RFC 1952 §2.2 allows concatenating
+#     multiple `gz1 gz2 gz3` members; once the first member's trailer
+#     verifies we set `done=1` and stop. Almost no HTTP body uses
+#     multi-member encoding; if a Debian mirror ever does, V1 must
+#     refactor.
+#   - **gzip wrapper only.** zlib's 2-byte RFC 1950 header (`78 9C` /
+#     `78 DA`) is *not* accepted here. apt uses gzip end-to-end (this
+#     was verified against actual Debian mirror responses).
+#   - **CRC32 mismatch is FATAL.** The gzip trailer's CRC32 is
+#     computed over decompressed output and verified at end-of-stream.
+#     A mismatch returns -1 from the final `inflate_feed`. Callers
+#     who want a "warn-and-pass" mode must wrap and ignore the error
+#     code.
+#   - **All three DEFLATE block types** (BTYPE=00 stored, BTYPE=01
+#     fixed-Huffman, BTYPE=10 dynamic-Huffman) are implemented. BTYPE=11
+#     is reserved-and-illegal per RFC 1951 §3.2.3 and we reject it.
+#
+# RETURN CODES — `inflate_feed`:
+#   0   partial: consumed some input, may have written some output;
+#       caller should top up the input buffer and call again.
+#  +1   stream-end: trailer verified, `*done=1`. Final byte counts in
+#       `*in_consumed`/`*out_consumed` are valid.
+#  -1   error (malformed stream, CRC mismatch, BTYPE=11, ran out of
+#       output room, or invalid Huffman tree).
+#
+# WIRE-FORMAT REFERENCE:
+#   RFC 1951 (DEFLATE): https://www.rfc-editor.org/rfc/rfc1951
+#   RFC 1952 (gzip):    https://www.rfc-editor.org/rfc/rfc1952
+#   §3.2.6 lists fixed-Huffman code lengths; §3.2.7 the dynamic codes;
+#   §3.2.5 the length/distance extra-bits tables we reproduce below.
+
+# -- state-machine phases ----------------------------------------------------
+
+INF_PHASE_GZIP_HDR:      int32 = 0   # 10-byte fixed header
+INF_PHASE_GZIP_XLEN:     int32 = 1   # FEXTRA: 2-byte XLEN then skip XLEN bytes
+INF_PHASE_GZIP_FNAME:    int32 = 2   # FNAME: skip to NUL
+INF_PHASE_GZIP_FCOMMENT: int32 = 3   # FCOMMENT: skip to NUL
+INF_PHASE_GZIP_FHCRC:    int32 = 4   # FHCRC: skip 2 bytes
+INF_PHASE_BLOCK_HEADER:  int32 = 5   # 3-bit BFINAL+BTYPE
+INF_PHASE_STORED_LEN:    int32 = 6   # 4-byte LEN+NLEN (byte-aligned)
+INF_PHASE_STORED_DATA:   int32 = 7   # raw LEN bytes
+INF_PHASE_DYN_HEADER:    int32 = 8   # HLIT/HDIST/HCLEN + code-length codes
+INF_PHASE_BLOCK_BODY:    int32 = 9   # symbol decode loop (BTYPE=01/10)
+INF_PHASE_GZIP_TRAILER:  int32 = 10  # 8-byte CRC32+ISIZE
+INF_PHASE_DONE:          int32 = 11
+INF_PHASE_ERROR:         int32 = 12
+
+# Block-body sub-state: tracks where we are within the decode of a
+# single length-code → distance-code → copy triple. Each step can
+# block on input, so we have to be able to resume at any boundary.
+INF_BODY_NORMAL:         int32 = 0   # ready to decode next ll symbol
+INF_BODY_LEN_EXTRA:      int32 = 1   # have a ll length code, need extra
+INF_BODY_DIST_SYM:       int32 = 2   # have full match_len, need dist sym
+INF_BODY_DIST_EXTRA:     int32 = 3   # have dist code, need extra
+INF_BODY_COPY:           int32 = 4   # ready to emit copy_len bytes
+
+# RFC 1951 §3.2.5 — length code (257..285) base lengths and extra bits.
+# Length codes start at code 257, so length_base[c-257] etc.
+# (286 codes total in literal/length table; 257..285 carry lengths,
+# 256 = end-of-block, 0..255 = literals.)
+length_base:   Array[29, uint16]
+length_extra:  Array[29, uint8]
+
+# RFC 1951 §3.2.5 — distance code (0..29) base distances and extra bits.
+dist_base:   Array[30, uint16]
+dist_extra:  Array[30, uint8]
+
+# RFC 1951 §3.2.7 — code-length-code alphabet permutation (19 entries).
+clen_order:  Array[19, uint8]
+
+# Module-scope CRC32 table. Init lazily so we tolerate being called
+# from boot before any single-shot initializer fires.
+crc32_table:        Array[256, uint32]
+crc32_table_inited: int32 = 0
+
+# Scratch for _build_huffman's symbol-placement pass. Parked at module
+# scope to dodge the U9 nested-frame Array spill quirk
+# (memory/feedback_compiler_quirks.md). 16 = INF_MAX_BITS + 1.
+hf_offsets: Array[16, uint16]
+
+
+def _init_static_tables():
+    # length_base, length_extra: code 257..285 -> length, extra bits.
+    # Pasted from RFC 1951 §3.2.5 Table.
+    length_base[0]  = 3
+    length_base[1]  = 4
+    length_base[2]  = 5
+    length_base[3]  = 6
+    length_base[4]  = 7
+    length_base[5]  = 8
+    length_base[6]  = 9
+    length_base[7]  = 10
+    length_base[8]  = 11
+    length_base[9]  = 13
+    length_base[10] = 15
+    length_base[11] = 17
+    length_base[12] = 19
+    length_base[13] = 23
+    length_base[14] = 27
+    length_base[15] = 31
+    length_base[16] = 35
+    length_base[17] = 43
+    length_base[18] = 51
+    length_base[19] = 59
+    length_base[20] = 67
+    length_base[21] = 83
+    length_base[22] = 99
+    length_base[23] = 115
+    length_base[24] = 131
+    length_base[25] = 163
+    length_base[26] = 195
+    length_base[27] = 227
+    length_base[28] = 258
+
+    length_extra[0]  = 0
+    length_extra[1]  = 0
+    length_extra[2]  = 0
+    length_extra[3]  = 0
+    length_extra[4]  = 0
+    length_extra[5]  = 0
+    length_extra[6]  = 0
+    length_extra[7]  = 0
+    length_extra[8]  = 1
+    length_extra[9]  = 1
+    length_extra[10] = 1
+    length_extra[11] = 1
+    length_extra[12] = 2
+    length_extra[13] = 2
+    length_extra[14] = 2
+    length_extra[15] = 2
+    length_extra[16] = 3
+    length_extra[17] = 3
+    length_extra[18] = 3
+    length_extra[19] = 3
+    length_extra[20] = 4
+    length_extra[21] = 4
+    length_extra[22] = 4
+    length_extra[23] = 4
+    length_extra[24] = 5
+    length_extra[25] = 5
+    length_extra[26] = 5
+    length_extra[27] = 5
+    length_extra[28] = 0
+
+    # dist_base, dist_extra: code 0..29 -> distance, extra bits.
+    dist_base[0]  = 1
+    dist_base[1]  = 2
+    dist_base[2]  = 3
+    dist_base[3]  = 4
+    dist_base[4]  = 5
+    dist_base[5]  = 7
+    dist_base[6]  = 9
+    dist_base[7]  = 13
+    dist_base[8]  = 17
+    dist_base[9]  = 25
+    dist_base[10] = 33
+    dist_base[11] = 49
+    dist_base[12] = 65
+    dist_base[13] = 97
+    dist_base[14] = 129
+    dist_base[15] = 193
+    dist_base[16] = 257
+    dist_base[17] = 385
+    dist_base[18] = 513
+    dist_base[19] = 769
+    dist_base[20] = 1025
+    dist_base[21] = 1537
+    dist_base[22] = 2049
+    dist_base[23] = 3073
+    dist_base[24] = 4097
+    dist_base[25] = 6145
+    dist_base[26] = 8193
+    dist_base[27] = 12289
+    dist_base[28] = 16385
+    dist_base[29] = 24577
+
+    dist_extra[0]  = 0
+    dist_extra[1]  = 0
+    dist_extra[2]  = 0
+    dist_extra[3]  = 0
+    dist_extra[4]  = 1
+    dist_extra[5]  = 1
+    dist_extra[6]  = 2
+    dist_extra[7]  = 2
+    dist_extra[8]  = 3
+    dist_extra[9]  = 3
+    dist_extra[10] = 4
+    dist_extra[11] = 4
+    dist_extra[12] = 5
+    dist_extra[13] = 5
+    dist_extra[14] = 6
+    dist_extra[15] = 6
+    dist_extra[16] = 7
+    dist_extra[17] = 7
+    dist_extra[18] = 8
+    dist_extra[19] = 8
+    dist_extra[20] = 9
+    dist_extra[21] = 9
+    dist_extra[22] = 10
+    dist_extra[23] = 10
+    dist_extra[24] = 11
+    dist_extra[25] = 11
+    dist_extra[26] = 12
+    dist_extra[27] = 12
+    dist_extra[28] = 13
+    dist_extra[29] = 13
+
+    # Code-length-code permutation (RFC 1951 §3.2.7).
+    clen_order[0]  = 16
+    clen_order[1]  = 17
+    clen_order[2]  = 18
+    clen_order[3]  = 0
+    clen_order[4]  = 8
+    clen_order[5]  = 7
+    clen_order[6]  = 9
+    clen_order[7]  = 6
+    clen_order[8]  = 10
+    clen_order[9]  = 5
+    clen_order[10] = 11
+    clen_order[11] = 4
+    clen_order[12] = 12
+    clen_order[13] = 3
+    clen_order[14] = 13
+    clen_order[15] = 2
+    clen_order[16] = 14
+    clen_order[17] = 1
+    clen_order[18] = 15
+
+
+def _init_crc32_table():
+    # Standard reflected polynomial 0xEDB88320 (gzip / PNG).
+    if crc32_table_inited != 0:
+        return
+    i: uint32 = 0
+    while i < 256:
+        c: uint32 = i
+        j: int32 = 0
+        while j < 8:
+            if (c & 1) != 0:
+                c = (c >> 1) ^ 0xEDB88320
+            else:
+                c = c >> 1
+            j = j + 1
+        crc32_table[i] = c
+        i = i + 1
+    crc32_table_inited = 1
+
+
+def crc32_update(crc: uint32, buf: Ptr[uint8], len: uint64) -> uint32:
+    # crc starts at 0xFFFFFFFF, final result XOR 0xFFFFFFFF.
+    c: uint32 = crc
+    i: uint64 = 0
+    while i < len:
+        idx: uint32 = (c ^ cast[uint32](buf[i])) & 0xFF
+        c = (c >> 8) ^ crc32_table[idx]
+        i = i + 1
+    return c
+
+
+# -- Huffman table representation --------------------------------------------
+#
+# A canonical Huffman code (RFC 1951 §3.2.2) is fully specified by the
+# bit-lengths of each symbol. Decoder side uses a "count table + symbol
+# table" representation (this is the same shape zlib's inflate.c uses
+# under a different name; see also Hennessy/Patterson Appendix E).
+#
+# For a tree over N symbols with max code length MAX_BITS:
+#   counts[i]  = number of symbols whose code is `i` bits long
+#                (counts[0] is unused; valid i is 1..MAX_BITS).
+#   symbols[]  = symbols sorted by (code_length asc, symbol_id asc).
+#
+# To decode: read 1 bit, append to `code`. After reading `len` bits,
+# offset = code - first_code[len]. If 0 <= offset < counts[len], the
+# symbol is symbols[base[len] + offset], where base[len] is the
+# cumulative count of all shorter-length symbols. We compute first_code
+# and base implicitly during the decode walk.
+
+# Literal/length alphabet: 286 symbols (0..285), max code length 15.
+# Distance alphabet:        30 symbols (0..29),   max code length 15.
+# Code-length alphabet:     19 symbols (0..18),   max code length 7.
+
+INF_MAX_BITS:          int32  = 15
+INF_LITLEN_SYMS:       int32  = 286
+INF_DIST_SYMS:         int32  = 30
+INF_CLEN_SYMS:         int32  = 19
+INF_WINDOW_BYTES:      uint64 = 32768   # 32 KB sliding window
+
+
+class InflateState:
+    # ---- input cursor (caller-fed) ----
+    # Bit accumulator: lowest 32 bits hold buffered bits read out of
+    # the input stream LSB-first (per RFC 1951 §3.1.1 packing rule).
+    bit_buf:    uint32
+    bit_count:  int32
+
+    # ---- top-level state machine ----
+    phase:      int32
+    err:        int32        # cached error code; once non-zero, sticky
+
+    # ---- gzip header decoder state ----
+    gz_hdr_idx: int32        # bytes of fixed 10-byte header consumed
+    gz_flg:     uint8        # FLG byte (FTEXT/FHCRC/FEXTRA/FNAME/FCOMMENT)
+    gz_xlen:    uint32       # FEXTRA length-to-skip remaining
+    gz_xlen_lo: int32        # bytes of 2-byte XLEN read so far (0|1|2)
+    gz_trail_idx: int32      # bytes of 8-byte trailer consumed
+    gz_trail_crc: uint32     # accumulated trailer CRC32 field
+    gz_trail_isize: uint32   # accumulated trailer ISIZE field
+
+    # ---- block-level state ----
+    bfinal:     int32        # 1 if current block has BFINAL set
+    btype:      int32        # 0|1|2 (3 = error)
+    body_state: int32        # INF_BODY_NORMAL or INF_BODY_COPY
+
+    # ---- stored-block state ----
+    stored_hdr_idx: int32    # bytes of 4-byte LEN+NLEN consumed
+    stored_remaining: uint32 # bytes of stored body still to copy
+
+    # ---- dynamic header decode state ----
+    dyn_hlit:   int32
+    dyn_hdist: int32
+    dyn_hclen: int32
+    dyn_phase:  int32        # 0=read counts, 1=read clen lengths,
+                             # 2=decode litlen+dist lengths
+    dyn_clen_idx: int32      # index into clen_order while reading
+    dyn_codelen_idx: int32   # index into combined litlen+dist length list
+    dyn_last_codelen: int32  # for repeat codes (16)
+
+    # ---- LZ77 backreference in progress (for streaming output) ----
+    copy_len:   uint32       # bytes still to emit from current match
+    copy_dist:  uint32       # back-distance
+    # Latched length-code metadata across LEN_EXTRA -> DIST_SYM and
+    # across DIST_EXTRA -> COPY boundaries:
+    lz_lcode:   int32        # length-code index (0..28) when in LEN_EXTRA
+    lz_dcode:   int32        # distance-code index when in DIST_EXTRA
+
+    # Resumable Huffman walk state. Set to non-zero when a previous
+    # _huff_decode_resume call ran out of input mid-walk; the next
+    # call picks up at hw_len_bits with hw_code / hw_first / hw_base
+    # already partially populated.
+    hw_active:   int32
+    hw_code:     int32
+    hw_first:    int32
+    hw_base:     int32
+    hw_len_bits: int32
+
+    # ---- Huffman tables for the current block ----
+    # Literal/length tree (max 286 syms, max 15 bits).
+    ll_counts:  Array[16, uint16]    # counts[0..15]
+    ll_symbols: Array[286, uint16]
+    ll_count:   int32
+
+    # Distance tree (max 30 syms, max 15 bits).
+    dist_counts:  Array[16, uint16]
+    dist_symbols: Array[30, uint16]
+    dist_count:   int32
+
+    # Code-length-code tree (max 19 syms, max 7 bits) — transient
+    # during dynamic-header decode.
+    clen_counts:  Array[8, uint16]   # 0..7 bits
+    clen_symbols: Array[19, uint16]
+
+    # Combined code-length list for litlen + dist alphabets.
+    # Filled during DYN_HEADER, then split into the two trees.
+    dyn_codelens: Array[320, uint8]
+
+    # ---- 32 KB sliding window for LZ77 backreferences ----
+    # Plus a position counter that wraps mod 32768.
+    window:     Array[32768, uint8]
+    window_pos: uint64         # next byte to write (wraps mod 32768)
+    window_filled: uint64      # total bytes ever written (caps at WINDOW)
+
+    # ---- decompressed-output accounting ----
+    # Independent of the sliding window; used for the gzip trailer
+    # CRC32 + ISIZE check. We never re-read these.
+    crc:        uint32         # CRC32 accumulator (pre-XOR)
+    out_total:  uint32         # ISIZE mod 2^32
+
+    # ---- caller-supplied I/O cursors (set per inflate_feed call) ----
+    in_ptr:     Ptr[uint8]
+    in_len:     uint64
+    in_pos:     uint64
+    out_ptr:    Ptr[uint8]
+    out_max:    uint64
+    out_pos:    uint64
+
+
+# -- public entry points -----------------------------------------------------
+
+def inflate_init(s: Ptr[InflateState]) -> int32:
+    _init_static_tables()
+    _init_crc32_table()
+
+    s[0].bit_buf = 0
+    s[0].bit_count = 0
+    s[0].phase = INF_PHASE_GZIP_HDR
+    s[0].err = 0
+
+    s[0].gz_hdr_idx = 0
+    s[0].gz_flg = 0
+    s[0].gz_xlen = 0
+    s[0].gz_xlen_lo = 0
+    s[0].gz_trail_idx = 0
+    s[0].gz_trail_crc = 0
+    s[0].gz_trail_isize = 0
+
+    s[0].bfinal = 0
+    s[0].btype = 0
+    s[0].body_state = INF_BODY_NORMAL
+
+    s[0].stored_hdr_idx = 0
+    s[0].stored_remaining = 0
+
+    s[0].dyn_hlit = 0
+    s[0].dyn_hdist = 0
+    s[0].dyn_hclen = 0
+    s[0].dyn_phase = 0
+    s[0].dyn_clen_idx = 0
+    s[0].dyn_codelen_idx = 0
+    s[0].dyn_last_codelen = 0
+
+    s[0].copy_len = 0
+    s[0].copy_dist = 0
+    s[0].lz_lcode = 0
+    s[0].lz_dcode = 0
+    s[0].hw_active = 0
+    s[0].hw_code = 0
+    s[0].hw_first = 0
+    s[0].hw_base = 0
+    s[0].hw_len_bits = 0
+
+    s[0].ll_count = 0
+    s[0].dist_count = 0
+
+    s[0].window_pos = 0
+    s[0].window_filled = 0
+    s[0].crc = 0xFFFFFFFF
+    s[0].out_total = 0
+    return 0
+
+
+# -- input-bit helpers -------------------------------------------------------
+#
+# RFC 1951 §3.1.1: data is packed LSB-first into bytes. We accumulate
+# bytes into bit_buf low-to-high and pull `n` bits off the low end.
+# When the input cursor runs dry we return a sentinel so the outer
+# state machine can yield back to the caller for a refill.
+
+def _need_bits(s: Ptr[InflateState], n: int32) -> int32:
+    # Returns 1 if we have >=n bits buffered (after possibly pulling
+    # more bytes from in_ptr), 0 if we ran out of input.
+    while s[0].bit_count < n:
+        if s[0].in_pos >= s[0].in_len:
+            return 0
+        b: uint32 = cast[uint32](s[0].in_ptr[s[0].in_pos])
+        s[0].in_pos = s[0].in_pos + 1
+        s[0].bit_buf = s[0].bit_buf | (b << cast[uint32](s[0].bit_count))
+        s[0].bit_count = s[0].bit_count + 8
+    return 1
+
+
+def _drop_bits(s: Ptr[InflateState], n: int32):
+    s[0].bit_buf = s[0].bit_buf >> cast[uint32](n)
+    s[0].bit_count = s[0].bit_count - n
+
+
+def _peek_bits(s: Ptr[InflateState], n: int32) -> uint32:
+    mask: uint32 = (cast[uint32](1) << cast[uint32](n)) - 1
+    return s[0].bit_buf & mask
+
+
+def _byte_align(s: Ptr[InflateState]):
+    # Discard bits to the next byte boundary (RFC 1951 §3.2.4 for
+    # stored blocks).
+    drop: int32 = s[0].bit_count & 7
+    if drop != 0:
+        _drop_bits(s, drop)
+
+
+def _read_byte(s: Ptr[InflateState], out: Ptr[uint8]) -> int32:
+    # Byte-aligned read from the underlying input cursor (used for
+    # stored block LEN/NLEN, gzip header bytes, and trailer). Requires
+    # bit_count == 0 OR caller has already aligned.
+    if s[0].bit_count >= 8:
+        # Tail bytes that were pre-fetched into bit_buf: peel them.
+        out[0] = cast[uint8](s[0].bit_buf & 0xFF)
+        _drop_bits(s, 8)
+        return 1
+    if s[0].in_pos >= s[0].in_len:
+        return 0
+    out[0] = s[0].in_ptr[s[0].in_pos]
+    s[0].in_pos = s[0].in_pos + 1
+    return 1
+
+
+# -- output / sliding window -------------------------------------------------
+
+def _emit_byte(s: Ptr[InflateState], b: uint8) -> int32:
+    # Push one byte into the caller out_buf, the 32 KB window, and the
+    # running CRC/ISIZE accumulators. Returns 1 on success, 0 if
+    # out_buf is full (caller-buffer overflow — fatal).
+    if s[0].out_pos >= s[0].out_max:
+        return 0
+    s[0].out_ptr[s[0].out_pos] = b
+    s[0].out_pos = s[0].out_pos + 1
+
+    wp: uint64 = s[0].window_pos
+    s[0].window[wp] = b
+    wp = wp + 1
+    if wp >= INF_WINDOW_BYTES:
+        wp = 0
+    s[0].window_pos = wp
+    if s[0].window_filled < INF_WINDOW_BYTES:
+        s[0].window_filled = s[0].window_filled + 1
+
+    # CRC32 update — single-byte path.
+    idx: uint32 = (s[0].crc ^ cast[uint32](b)) & 0xFF
+    s[0].crc = (s[0].crc >> 8) ^ crc32_table[idx]
+    s[0].out_total = s[0].out_total + 1
+    return 1
+
+
+def _window_byte_at(s: Ptr[InflateState], dist: uint32) -> uint8:
+    # Read a byte that is `dist` bytes behind window_pos (1 = most
+    # recent emitted byte). Caller MUST have verified dist <=
+    # window_filled.
+    wp: uint64 = s[0].window_pos
+    d: uint64 = cast[uint64](dist)
+    # Modular subtraction in the ring.
+    if wp >= d:
+        idx: uint64 = wp - d
+        return s[0].window[idx]
+    idx2: uint64 = INF_WINDOW_BYTES - (d - wp)
+    return s[0].window[idx2]
+
+
+# -- canonical Huffman builder -----------------------------------------------
+#
+# Input: per-symbol bit-lengths (0 == symbol absent). Output: populates
+# counts[] and symbols[] in the InflateState. Returns 0 on success,
+# -1 if the code is malformed (lengths over-subscribe or under-subscribe
+# the code space, except for the special-case empty code).
+
+def _build_huffman(lengths: Ptr[uint8], n_syms: int32,
+                   counts: Ptr[uint16], symbols: Ptr[uint16],
+                   max_bits: int32) -> int32:
+    # Bin symbols by code length.
+    i: int32 = 0
+    while i <= max_bits:
+        counts[i] = 0
+        i = i + 1
+
+    j: int32 = 0
+    while j < n_syms:
+        l: int32 = cast[int32](lengths[j])
+        if l > max_bits:
+            return -1
+        if l > 0:
+            counts[l] = counts[l] + 1
+        j = j + 1
+
+    # Kraft inequality check: sum(counts[l] * 2^(max_bits-l)) ==
+    # 2^max_bits exactly, OR all counts are zero (legal empty code,
+    # e.g. dynamic block with no distance codes).
+    total: uint64 = 0
+    any_sym: int32 = 0
+    k: int32 = 1
+    while k <= max_bits:
+        # NB: shift has LOWER precedence than +, so we parenthesise the
+        # << explicitly. Otherwise `total + counts[k] << shift` parses
+        # as `(total + counts[k]) << shift` and silently breaks the
+        # Kraft check for non-trivial trees.
+        contrib: uint64 = cast[uint64](counts[k]) << cast[uint64](max_bits - k)
+        total = total + contrib
+        if counts[k] > 0:
+            any_sym = 1
+        k = k + 1
+    if any_sym != 0:
+        # Reject OVER-subscribed codes (Kraft > 2^max_bits). We
+        # accept under-subscribed codes for two reasons:
+        #   (1) RFC 1951 §3.2.6 fixed distance tree: 30 5-bit codes,
+        #       Kraft = 30 << 10 = 30720 < 32768. Codes 30,31 are
+        #       reserved-and-unused but the tree is still valid.
+        #   (2) Single-symbol codes (one symbol of length 1) leave
+        #       half the code space empty; zlib's inflater treats
+        #       both 0 and 1 bits as decoding that lone symbol.
+        # Over-subscribe is unambiguous malformed input though.
+        if total > (cast[uint64](1) << cast[uint64](max_bits)):
+            return -1
+
+    # Build the symbol table sorted by (length asc, symbol_id asc).
+    # offsets[l] = starting index in symbols[] for length l.
+    # NB: parked at module scope (hf_offsets[]) to dodge the
+    # nested-frame Array spill quirk; _build_huffman is reentrant
+    # in the sense that gzip streams can rebuild trees per block,
+    # but never called concurrently — single-threaded inflate.
+    hf_offsets[0] = 0
+    o: int32 = 1
+    acc: uint16 = 0
+    while o <= max_bits:
+        hf_offsets[o] = acc
+        acc = acc + counts[o]
+        o = o + 1
+
+    m: int32 = 0
+    while m < n_syms:
+        ml: int32 = cast[int32](lengths[m])
+        if ml > 0:
+            symbols[hf_offsets[ml]] = cast[uint16](m)
+            hf_offsets[ml] = hf_offsets[ml] + 1
+        m = m + 1
+    return 0
+
+
+def _huff_decode(s: Ptr[InflateState], counts: Ptr[uint16],
+                 symbols: Ptr[uint16], max_bits: int32,
+                 out_sym: Ptr[uint32]) -> int32:
+    # Canonical-Huffman decode walk with resumable state. Reads one
+    # bit at a time, growing `code` by the new bit's value. At each
+    # length, checks whether `code - first_code` falls in counts[len].
+    # On input-exhaust we *save* the partial walk into the
+    # InflateState (hw_active=1 + hw_code/hw_first/hw_base/hw_len_bits)
+    # so the next call resumes where we left off. Without this, the
+    # bits we'd already pulled into bit_buf and dropped would be lost.
+    code: int32 = 0
+    first: int32 = 0
+    base: int32 = 0
+    len_bits: int32 = 1
+    if s[0].hw_active != 0:
+        code = s[0].hw_code
+        first = s[0].hw_first
+        base = s[0].hw_base
+        len_bits = s[0].hw_len_bits
+    while len_bits <= max_bits:
+        if _need_bits(s, 1) == 0:
+            s[0].hw_active = 1
+            s[0].hw_code = code
+            s[0].hw_first = first
+            s[0].hw_base = base
+            s[0].hw_len_bits = len_bits
+            return 0
+        bit: int32 = cast[int32](_peek_bits(s, 1))
+        _drop_bits(s, 1)
+        code = (code << 1) | bit
+        cnt: int32 = cast[int32](counts[len_bits])
+        if code < first + cnt:
+            idx: int32 = base + (code - first)
+            out_sym[0] = cast[uint32](symbols[idx])
+            s[0].hw_active = 0
+            return 1
+        base = base + cnt
+        first = (first + cnt) << 1
+        len_bits = len_bits + 1
+    # Fell off the end without matching — malformed stream.
+    s[0].err = -1
+    s[0].phase = INF_PHASE_ERROR
+    s[0].hw_active = 0
+    return 0
+
+
+# -- fixed Huffman codes (RFC 1951 §3.2.6) -----------------------------------
+#
+# Code lengths are fixed:
+#   syms   0..143 -> 8 bits
+#   syms 144..255 -> 9 bits
+#   syms 256..279 -> 7 bits
+#   syms 280..287 -> 8 bits
+# (287 is reserved but listed for canonical-code consistency.)
+# Distance: all 30 syms are 5 bits.
+
+dyn_lens_fixed_ll:   Array[288, uint8]
+dyn_lens_fixed_dist: Array[30, uint8]
+fixed_built: int32 = 0
+
+
+def _build_fixed_trees(s: Ptr[InflateState]) -> int32:
+    if fixed_built == 0:
+        i: int32 = 0
+        while i < 144:
+            dyn_lens_fixed_ll[i] = 8
+            i = i + 1
+        while i < 256:
+            dyn_lens_fixed_ll[i] = 9
+            i = i + 1
+        while i < 280:
+            dyn_lens_fixed_ll[i] = 7
+            i = i + 1
+        while i < 288:
+            dyn_lens_fixed_ll[i] = 8
+            i = i + 1
+        j: int32 = 0
+        while j < 30:
+            dyn_lens_fixed_dist[j] = 5
+            j = j + 1
+        fixed_built = 1
+
+    rc: int32 = _build_huffman(&dyn_lens_fixed_ll[0], 288,
+                               &s[0].ll_counts[0], &s[0].ll_symbols[0],
+                               INF_MAX_BITS)
+    if rc != 0:
+        return -1
+    rc = _build_huffman(&dyn_lens_fixed_dist[0], 30,
+                        &s[0].dist_counts[0], &s[0].dist_symbols[0],
+                        INF_MAX_BITS)
+    if rc != 0:
+        return -1
+    return 0
+
+
+# -- gzip header decode ------------------------------------------------------
+#
+# Returns: 1=done, 0=need more input, -1=error. State pointer advances
+# through phases as we consume bytes.
+
+GZIP_FTEXT:     uint8 = 0x01
+GZIP_FHCRC:     uint8 = 0x02
+GZIP_FEXTRA:    uint8 = 0x04
+GZIP_FNAME:     uint8 = 0x08
+GZIP_FCOMMENT:  uint8 = 0x10
+
+def _gzip_decode_hdr(s: Ptr[InflateState]) -> int32:
+    # 10-byte fixed header: ID1 ID2 CM FLG MTIME[4] XFL OS.
+    while s[0].gz_hdr_idx < 10:
+        if s[0].in_pos >= s[0].in_len:
+            return 0
+        b: uint8 = s[0].in_ptr[s[0].in_pos]
+        s[0].in_pos = s[0].in_pos + 1
+        idx: int32 = s[0].gz_hdr_idx
+        if idx == 0:
+            if b != 0x1F:
+                s[0].err = -1
+                s[0].phase = INF_PHASE_ERROR
+                return -1
+        elif idx == 1:
+            if b != 0x8B:
+                s[0].err = -1
+                s[0].phase = INF_PHASE_ERROR
+                return -1
+        elif idx == 2:
+            if b != 0x08:                       # CM=8 (DEFLATE)
+                s[0].err = -1
+                s[0].phase = INF_PHASE_ERROR
+                return -1
+        elif idx == 3:
+            s[0].gz_flg = b
+        # bytes 4..7 = MTIME, 8 = XFL, 9 = OS — all ignored.
+        s[0].gz_hdr_idx = s[0].gz_hdr_idx + 1
+
+    # Advance to next phase based on FLG bits.
+    if (s[0].gz_flg & GZIP_FEXTRA) != 0:
+        s[0].phase = INF_PHASE_GZIP_XLEN
+        s[0].gz_xlen_lo = 0
+        s[0].gz_xlen = 0
+        return 1
+    if (s[0].gz_flg & GZIP_FNAME) != 0:
+        s[0].phase = INF_PHASE_GZIP_FNAME
+        return 1
+    if (s[0].gz_flg & GZIP_FCOMMENT) != 0:
+        s[0].phase = INF_PHASE_GZIP_FCOMMENT
+        return 1
+    if (s[0].gz_flg & GZIP_FHCRC) != 0:
+        s[0].phase = INF_PHASE_GZIP_FHCRC
+        s[0].gz_xlen_lo = 0
+        return 1
+    s[0].phase = INF_PHASE_BLOCK_HEADER
+    return 1
+
+
+def _gzip_decode_xlen(s: Ptr[InflateState]) -> int32:
+    # Consume 2-byte XLEN, then XLEN bytes of extra-field data.
+    while s[0].gz_xlen_lo < 2:
+        if s[0].in_pos >= s[0].in_len:
+            return 0
+        b: uint8 = s[0].in_ptr[s[0].in_pos]
+        s[0].in_pos = s[0].in_pos + 1
+        if s[0].gz_xlen_lo == 0:
+            s[0].gz_xlen = cast[uint32](b)
+        else:
+            s[0].gz_xlen = s[0].gz_xlen | (cast[uint32](b) << 8)
+        s[0].gz_xlen_lo = s[0].gz_xlen_lo + 1
+    # Skip XLEN extra-field bytes.
+    while s[0].gz_xlen > 0:
+        if s[0].in_pos >= s[0].in_len:
+            return 0
+        s[0].in_pos = s[0].in_pos + 1
+        s[0].gz_xlen = s[0].gz_xlen - 1
+    # Advance to next conditional phase.
+    if (s[0].gz_flg & GZIP_FNAME) != 0:
+        s[0].phase = INF_PHASE_GZIP_FNAME
+    elif (s[0].gz_flg & GZIP_FCOMMENT) != 0:
+        s[0].phase = INF_PHASE_GZIP_FCOMMENT
+    elif (s[0].gz_flg & GZIP_FHCRC) != 0:
+        s[0].phase = INF_PHASE_GZIP_FHCRC
+        s[0].gz_xlen_lo = 0
+    else:
+        s[0].phase = INF_PHASE_BLOCK_HEADER
+    return 1
+
+
+def _gzip_skip_nul(s: Ptr[InflateState], next_phase_if_fcomment: int32,
+                   next_phase_if_fhcrc: int32) -> int32:
+    # Skip bytes up to and including the next NUL terminator.
+    while True:
+        if s[0].in_pos >= s[0].in_len:
+            return 0
+        b: uint8 = s[0].in_ptr[s[0].in_pos]
+        s[0].in_pos = s[0].in_pos + 1
+        if b == 0:
+            break
+    # Find next phase. We use the FLG bits + caller-passed phases so
+    # both FNAME and FCOMMENT can share this function.
+    if next_phase_if_fcomment != 0 and (s[0].gz_flg & GZIP_FCOMMENT) != 0:
+        s[0].phase = INF_PHASE_GZIP_FCOMMENT
+    elif (s[0].gz_flg & GZIP_FHCRC) != 0:
+        s[0].phase = INF_PHASE_GZIP_FHCRC
+        s[0].gz_xlen_lo = 0
+    else:
+        s[0].phase = INF_PHASE_BLOCK_HEADER
+    return 1
+
+
+def _gzip_decode_fhcrc(s: Ptr[InflateState]) -> int32:
+    # Skip 2 bytes of header CRC16. We don't validate it; RFC 1952
+    # says nothing forces the decoder to.
+    while s[0].gz_xlen_lo < 2:
+        if s[0].in_pos >= s[0].in_len:
+            return 0
+        s[0].in_pos = s[0].in_pos + 1
+        s[0].gz_xlen_lo = s[0].gz_xlen_lo + 1
+    s[0].phase = INF_PHASE_BLOCK_HEADER
+    return 1
+
+
+# -- gzip trailer ------------------------------------------------------------
+
+def _gzip_decode_trailer(s: Ptr[InflateState]) -> int32:
+    # 8 bytes: CRC32 (little-endian) + ISIZE (mod 2^32, little-endian).
+    while s[0].gz_trail_idx < 8:
+        if s[0].in_pos >= s[0].in_len:
+            # If we've already moved bytes into the bit accumulator we
+            # need to pull them back out byte-by-byte first.
+            if s[0].bit_count >= 8:
+                b: uint8 = cast[uint8](s[0].bit_buf & 0xFF)
+                _drop_bits(s, 8)
+                idx: int32 = s[0].gz_trail_idx
+                if idx < 4:
+                    sh: uint32 = cast[uint32](idx * 8)
+                    s[0].gz_trail_crc = (s[0].gz_trail_crc
+                                         | (cast[uint32](b) << sh))
+                else:
+                    sh2: uint32 = cast[uint32]((idx - 4) * 8)
+                    s[0].gz_trail_isize = (s[0].gz_trail_isize
+                                           | (cast[uint32](b) << sh2))
+                s[0].gz_trail_idx = s[0].gz_trail_idx + 1
+                continue
+            return 0
+        b2: uint8 = s[0].in_ptr[s[0].in_pos]
+        s[0].in_pos = s[0].in_pos + 1
+        idx2: int32 = s[0].gz_trail_idx
+        if idx2 < 4:
+            sh3: uint32 = cast[uint32](idx2 * 8)
+            s[0].gz_trail_crc = (s[0].gz_trail_crc
+                                 | (cast[uint32](b2) << sh3))
+        else:
+            sh4: uint32 = cast[uint32]((idx2 - 4) * 8)
+            s[0].gz_trail_isize = (s[0].gz_trail_isize
+                                   | (cast[uint32](b2) << sh4))
+        s[0].gz_trail_idx = s[0].gz_trail_idx + 1
+
+    # Validate.
+    final_crc: uint32 = s[0].crc ^ 0xFFFFFFFF
+    if final_crc != s[0].gz_trail_crc:
+        s[0].err = -1
+        s[0].phase = INF_PHASE_ERROR
+        return -1
+    if s[0].out_total != s[0].gz_trail_isize:
+        s[0].err = -1
+        s[0].phase = INF_PHASE_ERROR
+        return -1
+    s[0].phase = INF_PHASE_DONE
+    return 1
+
+
+# -- DEFLATE block header ----------------------------------------------------
+
+def _read_block_header(s: Ptr[InflateState]) -> int32:
+    # 3-bit header: BFINAL (1 bit) + BTYPE (2 bits).
+    if _need_bits(s, 3) == 0:
+        return 0
+    s[0].bfinal = cast[int32](_peek_bits(s, 1))
+    _drop_bits(s, 1)
+    s[0].btype = cast[int32](_peek_bits(s, 2))
+    _drop_bits(s, 2)
+    if s[0].btype == 3:
+        s[0].err = -1
+        s[0].phase = INF_PHASE_ERROR
+        return -1
+    if s[0].btype == 0:
+        _byte_align(s)
+        s[0].phase = INF_PHASE_STORED_LEN
+        s[0].stored_hdr_idx = 0
+        s[0].stored_remaining = 0
+        return 1
+    if s[0].btype == 1:
+        rc: int32 = _build_fixed_trees(s)
+        if rc != 0:
+            s[0].err = -1
+            s[0].phase = INF_PHASE_ERROR
+            return -1
+        s[0].phase = INF_PHASE_BLOCK_BODY
+        s[0].body_state = INF_BODY_NORMAL
+        return 1
+    # BTYPE = 2: dynamic Huffman. Switch to header decoder.
+    s[0].phase = INF_PHASE_DYN_HEADER
+    s[0].dyn_phase = 0
+    s[0].dyn_clen_idx = 0
+    s[0].dyn_codelen_idx = 0
+    s[0].dyn_last_codelen = 0
+    return 1
+
+
+# -- stored block ------------------------------------------------------------
+
+def _stored_decode(s: Ptr[InflateState]) -> int32:
+    # 4-byte header: LEN (uint16 LE) + NLEN (~LEN). Then LEN raw bytes.
+    if s[0].phase == INF_PHASE_STORED_LEN:
+        while s[0].stored_hdr_idx < 4:
+            b: uint8 = 0
+            if _read_byte(s, &b) == 0:
+                return 0
+            idx: int32 = s[0].stored_hdr_idx
+            if idx == 0:
+                s[0].stored_remaining = cast[uint32](b)
+            elif idx == 1:
+                s[0].stored_remaining = (s[0].stored_remaining
+                                         | (cast[uint32](b) << 8))
+            # idx 2,3 = NLEN — skip without validating (RFC says we
+            # should check ~LEN == NLEN; lenient mode is fine for V0).
+            s[0].stored_hdr_idx = s[0].stored_hdr_idx + 1
+        s[0].phase = INF_PHASE_STORED_DATA
+
+    # Copy LEN bytes verbatim.
+    while s[0].stored_remaining > 0:
+        b2: uint8 = 0
+        if _read_byte(s, &b2) == 0:
+            return 0
+        if _emit_byte(s, b2) == 0:
+            s[0].err = -1
+            s[0].phase = INF_PHASE_ERROR
+            return -1
+        s[0].stored_remaining = s[0].stored_remaining - 1
+
+    # Done with this block; back to block header (or trailer if BFINAL).
+    if s[0].bfinal != 0:
+        s[0].phase = INF_PHASE_GZIP_TRAILER
+    else:
+        s[0].phase = INF_PHASE_BLOCK_HEADER
+    return 1
+
+
+# -- dynamic Huffman header decode (RFC 1951 §3.2.7) -------------------------
+#
+# Structure:
+#   HLIT  (5 bits) — #literal/length codes - 257    [257..286]
+#   HDIST (5 bits) — #distance codes - 1            [1..32]
+#   HCLEN (4 bits) — #code-length codes - 4         [4..19]
+#   HCLEN code lengths (3 bits each, in clen_order[])
+#   HLIT+HDIST code-length codes (using the code-length Huffman),
+#     with run-length encoding via codes 16/17/18.
+
+def _dyn_header_decode(s: Ptr[InflateState]) -> int32:
+    if s[0].dyn_phase == 0:
+        if _need_bits(s, 14) == 0:
+            return 0
+        s[0].dyn_hlit = cast[int32](_peek_bits(s, 5)) + 257
+        _drop_bits(s, 5)
+        s[0].dyn_hdist = cast[int32](_peek_bits(s, 5)) + 1
+        _drop_bits(s, 5)
+        s[0].dyn_hclen = cast[int32](_peek_bits(s, 4)) + 4
+        _drop_bits(s, 4)
+        if s[0].dyn_hlit > 286 or s[0].dyn_hdist > 30 or s[0].dyn_hclen > 19:
+            s[0].err = -1
+            s[0].phase = INF_PHASE_ERROR
+            return -1
+        # Zero the clen-code length array. We use dyn_codelens[0..18]
+        # as scratch (initialized via clen_order[]); not the same use
+        # as the later phase, but it's the same allocation and we
+        # consume it before reusing.
+        z: int32 = 0
+        while z < 19:
+            s[0].dyn_codelens[z] = 0
+            z = z + 1
+        s[0].dyn_phase = 1
+
+    if s[0].dyn_phase == 1:
+        while s[0].dyn_clen_idx < s[0].dyn_hclen:
+            if _need_bits(s, 3) == 0:
+                return 0
+            l: uint8 = cast[uint8](_peek_bits(s, 3))
+            _drop_bits(s, 3)
+            sym: uint8 = clen_order[s[0].dyn_clen_idx]
+            s[0].dyn_codelens[sym] = l
+            s[0].dyn_clen_idx = s[0].dyn_clen_idx + 1
+        # Build the code-length-code Huffman tree.
+        rc: int32 = _build_huffman(&s[0].dyn_codelens[0], 19,
+                                   &s[0].clen_counts[0],
+                                   &s[0].clen_symbols[0], 7)
+        if rc != 0:
+            s[0].err = -1
+            s[0].phase = INF_PHASE_ERROR
+            return -1
+        # Zero the combined litlen+dist code-length array.
+        z2: int32 = 0
+        while z2 < 320:
+            s[0].dyn_codelens[z2] = 0
+            z2 = z2 + 1
+        s[0].dyn_phase = 2
+
+    if s[0].dyn_phase == 2:
+        total: int32 = s[0].dyn_hlit + s[0].dyn_hdist
+        while s[0].dyn_codelen_idx < total:
+            sym: uint32 = 0
+            ok: int32 = _huff_decode(s, &s[0].clen_counts[0],
+                                     &s[0].clen_symbols[0], 7, &sym)
+            if ok == 0:
+                if s[0].phase == INF_PHASE_ERROR:
+                    return -1
+                return 0
+            if sym < 16:
+                s[0].dyn_codelens[s[0].dyn_codelen_idx] = cast[uint8](sym)
+                s[0].dyn_last_codelen = cast[int32](sym)
+                s[0].dyn_codelen_idx = s[0].dyn_codelen_idx + 1
+            elif sym == 16:
+                # Repeat previous code length 3..6 times (2 extra bits).
+                if _need_bits(s, 2) == 0:
+                    return 0
+                rep: int32 = cast[int32](_peek_bits(s, 2)) + 3
+                _drop_bits(s, 2)
+                if s[0].dyn_codelen_idx == 0:
+                    s[0].err = -1
+                    s[0].phase = INF_PHASE_ERROR
+                    return -1
+                k: int32 = 0
+                while k < rep:
+                    if s[0].dyn_codelen_idx >= total:
+                        s[0].err = -1
+                        s[0].phase = INF_PHASE_ERROR
+                        return -1
+                    s[0].dyn_codelens[s[0].dyn_codelen_idx] = (
+                        cast[uint8](s[0].dyn_last_codelen))
+                    s[0].dyn_codelen_idx = s[0].dyn_codelen_idx + 1
+                    k = k + 1
+            elif sym == 17:
+                # Repeat zero 3..10 times (3 extra bits).
+                if _need_bits(s, 3) == 0:
+                    return 0
+                rep2: int32 = cast[int32](_peek_bits(s, 3)) + 3
+                _drop_bits(s, 3)
+                kk: int32 = 0
+                while kk < rep2:
+                    if s[0].dyn_codelen_idx >= total:
+                        s[0].err = -1
+                        s[0].phase = INF_PHASE_ERROR
+                        return -1
+                    s[0].dyn_codelens[s[0].dyn_codelen_idx] = 0
+                    s[0].dyn_codelen_idx = s[0].dyn_codelen_idx + 1
+                    kk = kk + 1
+                s[0].dyn_last_codelen = 0
+            else:
+                # sym == 18: repeat zero 11..138 times (7 extra bits).
+                if _need_bits(s, 7) == 0:
+                    return 0
+                rep3: int32 = cast[int32](_peek_bits(s, 7)) + 11
+                _drop_bits(s, 7)
+                kkk: int32 = 0
+                while kkk < rep3:
+                    if s[0].dyn_codelen_idx >= total:
+                        s[0].err = -1
+                        s[0].phase = INF_PHASE_ERROR
+                        return -1
+                    s[0].dyn_codelens[s[0].dyn_codelen_idx] = 0
+                    s[0].dyn_codelen_idx = s[0].dyn_codelen_idx + 1
+                    kkk = kkk + 1
+                s[0].dyn_last_codelen = 0
+
+        # Build the two Huffman trees.
+        rc2: int32 = _build_huffman(&s[0].dyn_codelens[0], s[0].dyn_hlit,
+                                    &s[0].ll_counts[0], &s[0].ll_symbols[0],
+                                    INF_MAX_BITS)
+        if rc2 != 0:
+            s[0].err = -1
+            s[0].phase = INF_PHASE_ERROR
+            return -1
+        # Distance lengths start at offset dyn_hlit.
+        rc3: int32 = _build_huffman(&s[0].dyn_codelens[s[0].dyn_hlit],
+                                    s[0].dyn_hdist,
+                                    &s[0].dist_counts[0],
+                                    &s[0].dist_symbols[0], INF_MAX_BITS)
+        if rc3 != 0:
+            s[0].err = -1
+            s[0].phase = INF_PHASE_ERROR
+            return -1
+        s[0].phase = INF_PHASE_BLOCK_BODY
+        s[0].body_state = INF_BODY_NORMAL
+        return 1
+    return 1
+
+
+# -- block body (symbol decode + LZ77 copy) ---------------------------------
+
+def _block_body_decode(s: Ptr[InflateState]) -> int32:
+    # Re-enter at whatever sub-state we suspended in. The
+    # if-ladder is a fall-through machine: each successful
+    # sub-state transitions to the next and `continue`-s.
+    while True:
+        if s[0].body_state == INF_BODY_NORMAL:
+            # Decode one literal/length symbol.
+            sym: uint32 = 0
+            ok: int32 = _huff_decode(s, &s[0].ll_counts[0],
+                                     &s[0].ll_symbols[0], INF_MAX_BITS, &sym)
+            if ok == 0:
+                if s[0].phase == INF_PHASE_ERROR:
+                    return -1
+                return 0
+            if sym < 256:
+                # Literal.
+                if _emit_byte(s, cast[uint8](sym)) == 0:
+                    s[0].err = -1
+                    s[0].phase = INF_PHASE_ERROR
+                    return -1
+                continue
+            if sym == 256:
+                if s[0].bfinal != 0:
+                    s[0].phase = INF_PHASE_GZIP_TRAILER
+                else:
+                    s[0].phase = INF_PHASE_BLOCK_HEADER
+                return 1
+            # Length code (257..285).
+            lcode: int32 = cast[int32](sym) - 257
+            if lcode < 0 or lcode >= 29:
+                s[0].err = -1
+                s[0].phase = INF_PHASE_ERROR
+                return -1
+            s[0].lz_lcode = lcode
+            s[0].copy_len = cast[uint32](length_base[lcode])
+            s[0].body_state = INF_BODY_LEN_EXTRA
+            continue
+
+        if s[0].body_state == INF_BODY_LEN_EXTRA:
+            ne: int32 = cast[int32](length_extra[s[0].lz_lcode])
+            if ne > 0:
+                if _need_bits(s, ne) == 0:
+                    return 0
+                s[0].copy_len = s[0].copy_len + _peek_bits(s, ne)
+                _drop_bits(s, ne)
+            s[0].body_state = INF_BODY_DIST_SYM
+            continue
+
+        if s[0].body_state == INF_BODY_DIST_SYM:
+            dsym: uint32 = 0
+            ok2: int32 = _huff_decode(s, &s[0].dist_counts[0],
+                                      &s[0].dist_symbols[0],
+                                      INF_MAX_BITS, &dsym)
+            if ok2 == 0:
+                if s[0].phase == INF_PHASE_ERROR:
+                    return -1
+                return 0
+            if dsym >= 30:
+                s[0].err = -1
+                s[0].phase = INF_PHASE_ERROR
+                return -1
+            s[0].lz_dcode = cast[int32](dsym)
+            s[0].copy_dist = cast[uint32](dist_base[dsym])
+            s[0].body_state = INF_BODY_DIST_EXTRA
+            continue
+
+        if s[0].body_state == INF_BODY_DIST_EXTRA:
+            ne2: int32 = cast[int32](dist_extra[s[0].lz_dcode])
+            if ne2 > 0:
+                if _need_bits(s, ne2) == 0:
+                    return 0
+                s[0].copy_dist = s[0].copy_dist + _peek_bits(s, ne2)
+                _drop_bits(s, ne2)
+            # Validate distance against window before entering COPY.
+            if cast[uint64](s[0].copy_dist) > s[0].window_filled:
+                s[0].err = -1
+                s[0].phase = INF_PHASE_ERROR
+                return -1
+            s[0].body_state = INF_BODY_COPY
+            continue
+
+        if s[0].body_state == INF_BODY_COPY:
+            while s[0].copy_len > 0:
+                if s[0].out_pos >= s[0].out_max:
+                    s[0].err = -1
+                    s[0].phase = INF_PHASE_ERROR
+                    return -1
+                b: uint8 = _window_byte_at(s, s[0].copy_dist)
+                if _emit_byte(s, b) == 0:
+                    s[0].err = -1
+                    s[0].phase = INF_PHASE_ERROR
+                    return -1
+                s[0].copy_len = s[0].copy_len - 1
+            s[0].body_state = INF_BODY_NORMAL
+            continue
+
+        # Unknown body sub-state.
+        s[0].err = -1
+        s[0].phase = INF_PHASE_ERROR
+        return -1
+    return 0
+
+
+# -- main driver -------------------------------------------------------------
+
+def inflate_feed(s: Ptr[InflateState],
+                 in_buf: Ptr[uint8], in_len: uint64,
+                 out_buf: Ptr[uint8], out_max: uint64,
+                 out_consumed: Ptr[uint64],
+                 in_consumed: Ptr[uint64],
+                 done: Ptr[int32]) -> int32:
+    # If we previously errored, refuse further calls.
+    if s[0].err != 0:
+        out_consumed[0] = 0
+        in_consumed[0] = 0
+        done[0] = 0
+        return -1
+    s[0].in_ptr = in_buf
+    s[0].in_len = in_len
+    s[0].in_pos = 0
+    s[0].out_ptr = out_buf
+    s[0].out_max = out_max
+    s[0].out_pos = 0
+    done[0] = 0
+
+    while True:
+        if s[0].phase == INF_PHASE_GZIP_HDR:
+            r: int32 = _gzip_decode_hdr(s)
+            if r == 0:
+                in_consumed[0] = s[0].in_pos
+                out_consumed[0] = s[0].out_pos
+                return 0
+            if r < 0:
+                in_consumed[0] = s[0].in_pos
+                out_consumed[0] = s[0].out_pos
+                return -1
+            continue
+        if s[0].phase == INF_PHASE_GZIP_XLEN:
+            r2: int32 = _gzip_decode_xlen(s)
+            if r2 == 0:
+                in_consumed[0] = s[0].in_pos
+                out_consumed[0] = s[0].out_pos
+                return 0
+            continue
+        if s[0].phase == INF_PHASE_GZIP_FNAME:
+            r3: int32 = _gzip_skip_nul(s, 1, 1)
+            if r3 == 0:
+                in_consumed[0] = s[0].in_pos
+                out_consumed[0] = s[0].out_pos
+                return 0
+            continue
+        if s[0].phase == INF_PHASE_GZIP_FCOMMENT:
+            r4: int32 = _gzip_skip_nul(s, 0, 1)
+            if r4 == 0:
+                in_consumed[0] = s[0].in_pos
+                out_consumed[0] = s[0].out_pos
+                return 0
+            continue
+        if s[0].phase == INF_PHASE_GZIP_FHCRC:
+            r5: int32 = _gzip_decode_fhcrc(s)
+            if r5 == 0:
+                in_consumed[0] = s[0].in_pos
+                out_consumed[0] = s[0].out_pos
+                return 0
+            continue
+        if s[0].phase == INF_PHASE_BLOCK_HEADER:
+            r6: int32 = _read_block_header(s)
+            if r6 == 0:
+                in_consumed[0] = s[0].in_pos
+                out_consumed[0] = s[0].out_pos
+                return 0
+            if r6 < 0:
+                in_consumed[0] = s[0].in_pos
+                out_consumed[0] = s[0].out_pos
+                return -1
+            continue
+        if (s[0].phase == INF_PHASE_STORED_LEN or
+                s[0].phase == INF_PHASE_STORED_DATA):
+            r7: int32 = _stored_decode(s)
+            if r7 == 0:
+                in_consumed[0] = s[0].in_pos
+                out_consumed[0] = s[0].out_pos
+                return 0
+            if r7 < 0:
+                in_consumed[0] = s[0].in_pos
+                out_consumed[0] = s[0].out_pos
+                return -1
+            continue
+        if s[0].phase == INF_PHASE_DYN_HEADER:
+            r8: int32 = _dyn_header_decode(s)
+            if r8 == 0:
+                in_consumed[0] = s[0].in_pos
+                out_consumed[0] = s[0].out_pos
+                return 0
+            if r8 < 0:
+                in_consumed[0] = s[0].in_pos
+                out_consumed[0] = s[0].out_pos
+                return -1
+            continue
+        if s[0].phase == INF_PHASE_BLOCK_BODY:
+            r9: int32 = _block_body_decode(s)
+            if r9 == 0:
+                in_consumed[0] = s[0].in_pos
+                out_consumed[0] = s[0].out_pos
+                return 0
+            if r9 < 0:
+                in_consumed[0] = s[0].in_pos
+                out_consumed[0] = s[0].out_pos
+                return -1
+            continue
+        if s[0].phase == INF_PHASE_GZIP_TRAILER:
+            r10: int32 = _gzip_decode_trailer(s)
+            if r10 == 0:
+                in_consumed[0] = s[0].in_pos
+                out_consumed[0] = s[0].out_pos
+                return 0
+            if r10 < 0:
+                in_consumed[0] = s[0].in_pos
+                out_consumed[0] = s[0].out_pos
+                return -1
+            # Trailer OK -> DONE.
+            continue
+        if s[0].phase == INF_PHASE_DONE:
+            done[0] = 1
+            in_consumed[0] = s[0].in_pos
+            out_consumed[0] = s[0].out_pos
+            return 1
+        # Unknown phase: error.
+        in_consumed[0] = s[0].in_pos
+        out_consumed[0] = s[0].out_pos
+        return -1
+    return 0
