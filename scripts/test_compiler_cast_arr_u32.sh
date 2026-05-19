@@ -31,9 +31,17 @@ qemu-system-x86_64 -kernel init/main.elf -nographic \
     -append "console=ttyS0" -no-reboot -m 256M \
     > "$TMP/serial.log" 2>&1 &
 QEMU=$!
+# Early-out only on the fixture's specific PASS banner. The previous
+# loop matched a bare "PASS" which fires in iteration 1 — many early
+# boot lines contain "PASS" (atkbd self-test, auxmouse self-test, etc.)
+# — and breaks out of the wait before the kernel has even reached the
+# SMP bring-up, let alone user-mode. Killing qemu that early stops the
+# serial-log capture mid-`SMP: sending SIPI vector 0x8`, which makes
+# the failure look like an AP-bringup hang instead of a polling-loop
+# bug. Match the exact marker the second grep checks for.
 for _i in $(seq 1 60); do
     sleep 1
-    if grep -q "PASS" "$TMP/serial.log" 2>/dev/null; then break; fi
+    if grep -q "\[comp_cast32\] PASS" "$TMP/serial.log" 2>/dev/null; then break; fi
     kill -0 $QEMU 2>/dev/null || break
 done
 kill -9 $QEMU 2>/dev/null || true
