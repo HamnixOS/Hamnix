@@ -36,36 +36,59 @@
 #     group (X25519 = 0x001D), signature_algorithms is sent for compliance
 #     but the server's CertificateVerify signature is NOT validated.
 #
-# === TLS-Unsafe — transport encryption only, no authentication =========
+# === V5: server cert chain IS validated =================================
 #
-# THIS COMMIT DOES NOT VALIDATE THE SERVER CERTIFICATE CHAIN.
-# We parse the Certificate record so the handshake transcript hash
-# stays correct, but the X.509 chain is discarded after parsing. A
-# man-in-the-middle with the ability to inject any cert (self-signed,
-# expired, wrong-name, no relation to the real CA hierarchy) can
-# decrypt and observe all traffic. The bytes that go over the wire
-# are still confidentiality-protected against a passive observer
-# who cannot mint a cert — so this is strictly better than plaintext
-# HTTP — but it is NOT TLS as IETF defines it.
+# Each handshake now feeds the server's Certificate message through the
+# lib/x509/chain.ad validator BEFORE we accept the server Finished and
+# send our own. The validator dispatches to:
+#   - lib/asn1/asn1.ad         (V0)  DER walker + named OIDs
+#   - lib/x509/x509.ad         (V1)  X.509 v3 parse + SAN/CN match
+#   - lib/rsa/rsa.ad           (V2)  RSA-PSS-SHA256 signature verify
+#   - lib/ec/p256.ad +
+#     lib/ecdsa/ecdsa.ad       (V3)  ECDSA-P256 signature verify
+#   - lib/x509/chain.ad        (V4)  chain build + CA trust store
 #
-# Real cert validation needs:
-#   - DER ASN.1 parser (X.509 SubjectPublicKeyInfo, signature alg,
-#     validity, SAN extension).
-#   - RSA-PSS and/or ECDSA P-256 signature verifiers.
-#   - A baked-in CA trust store (ca-certificates equivalent) and
-#     hostname matching against SAN/CN.
-#   - Path building + signature chain walk.
+# Trust anchors:
+#   - ISRG Root X1 (Let's Encrypt) is baked in via /etc/tls-ca-isrg-x1.der
+#     in the initramfs (planted by scripts/build_initramfs.py from
+#     /etc/ssl/certs/ISRG_Root_X1.pem on the host). SHA-256:
+#         96:bc:ec:06:26:49:76:f3:74:60:77:9a:cf:28:c5:a7
+#         cf:e8:a3:c0:aa:e1:1a:8f:fc:ee:05:c0:bd:df:08:c6
+#   - Test fixtures can ALSO ship a one-off CA at /etc/tls-ca.der;
+#     scripts/test_net_https.sh uses this to inject a fake Hamnix Test
+#     CA without rebuilding the kernel for every harness run.
 #
-# That's a separate ~2000 line effort tracked as a follow-up in TODO.md.
-# Until it lands, the public surface is named `tls_*` rather than e.g.
-# `secure_tls_*` so callers can see the unauthenticated-mode label in
-# the symbol — and `https_get` in http.ad echoes the
-# `[tls] WARNING: server cert NOT validated` banner on every handshake.
+# Out of scope for V5 (V4 documented intentional gaps):
+#   - CRL / OCSP revocation
+#   - RSA-PKCS#1-v1.5 dispatch (PSS + ECDSA only)
+#   - ECDSA curves other than P-256
+#   - const-time hardening
 # =======================================================================
 
 from kernel.printk.printk import printk0, printk1, printk2
 from drivers.net.tcp import tcp_send, tcp_recv, tcp_close
 from arch.x86.kernel.time import get_jiffies
+
+# --- V5 cert-validation stack imports -------------------------------------
+# All five primitives need their own runtime init (OID byte tables, P-256
+# curve constants, RSA params, ECDSA dispatch, CA-store empty slot table).
+# `_tls_validation_init` (called lazily on the first handshake) drives them
+# in order, adds the baked ISRG Root X1 anchor, and optionally absorbs an
+# extra anchor from /etc/tls-ca.der when the initramfs ships one (the
+# test_net_https.sh fixture uses this to inject a fake Hamnix Test CA).
+from lib.asn1.asn1 import asn1_init_oids
+from lib.ec.p256 import p256_init
+from lib.rsa.rsa import rsa_init
+from lib.ecdsa.ecdsa import ecdsa_init
+from lib.x509.chain import (
+    castore_init, castore_add_root, castore_count,
+    validate_cert_chain,
+)
+from fs.cpio import (
+    initramfs_entry_count, initramfs_entry_name,
+    initramfs_entry_data, initramfs_entry_size,
+)
+from drivers.rtc.cmos import rtc_read_epoch
 
 
 # -- TLS 1.3 wire constants -------------------------------------------------
@@ -2321,6 +2344,128 @@ def _tls_compute_nonce(seq: uint64, base_iv: Ptr[uint8],
 tls_selftest_ran:    int32 = 0
 
 
+# -- V5 cert-validation module globals -------------------------------------
+#
+# Chain table populated by the Certificate-message parser in
+# _tls_drive_post_sh. We hold up to MAX_CHAIN_DEPTH (8) (ptr, len) pairs;
+# the pointers index directly into tls_pt_buf (the AEAD-decrypted scratch).
+# The bytes in tls_pt_buf stay stable for the duration of the validate
+# call (we run it synchronously from the same plaintext-walk iteration).
+
+_tls_chain_ptrs:     Array[8, Ptr[uint8]]
+_tls_chain_lens:     Array[8, uint64]
+_tls_chain_count:    int32 = 0
+
+# The SNI hostname passed into tls_handshake. We stash it on the module
+# globals so _tls_drive_post_sh can pass it to validate_cert_chain (the
+# chain-walker's SAN matcher). 0 means "no host pinned" — validate_cert_
+# chain will then reject every chain (hostname check is mandatory).
+# Stored as uint64 so the global takes an integer initializer; the
+# handshake path casts to Ptr[uint8] when reading.
+_tls_sni_host_raw:   uint64 = 0
+
+# Once-per-boot guard. The OID tables / curve constants / RSA params /
+# castore are loaded the first time a handshake actually fires (not at
+# tls_init time — net_smoke_test runs tls_init BEFORE rtc_init + vfs_init,
+# and we want the cpio entry table available for the optional fixture-CA
+# load).
+_tls_val_init_ran:   int32 = 0
+
+# When the RTC is unreadable we fall back to a build-time epoch so the
+# validity-window check stays meaningful. Picked roughly "now" at V5
+# landing time (2026-05-18 00:00:00 UTC). Once a real RTC reader works
+# end-to-end on every test target this fallback gets retired.
+TLS_BUILD_EPOCH_FALLBACK: uint64 = 1779667200
+
+
+def _tls_now_unix() -> uint64:
+    # Walltime in unix seconds for the chain validator. Prefer the live
+    # RTC read (drivers/rtc/cmos.ad reads the CMOS chip on every call and
+    # is good to ~1 s); if that returns 0 (no RTC / unreadable) fall back
+    # to the build epoch. Hardcoded fallback is intentional so a kernel
+    # booted on a target with a stale or absent RTC still validates
+    # certs against a sensible window.
+    e: uint64 = rtc_read_epoch()
+    if e == 0:
+        printk1("[tls] RTC unreadable; using build epoch %d\n",
+                TLS_BUILD_EPOCH_FALLBACK)
+        return TLS_BUILD_EPOCH_FALLBACK
+    return e
+
+
+def _tls_name_eq(name: Ptr[char], target: Ptr[uint8],
+                 target_len: uint64) -> int32:
+    # Compare a NUL-terminated cpio entry name against `target` (length-
+    # prefixed; the comparison runs over target_len bytes and additionally
+    # requires the name to terminate at exactly that position).
+    i: uint64 = 0
+    while i < target_len:
+        if cast[uint8](name[i]) != target[i]:
+            return 0
+        i = i + 1
+    if cast[uint8](name[target_len]) != 0:
+        return 0
+    return 1
+
+
+def _tls_load_initramfs_anchor(path: Ptr[uint8], path_len: uint64) -> int32:
+    # Walk the cpio entry table looking for the named DER blob, and add it
+    # as a CA-store anchor on hit. Returns the slot index on success,
+    # -1 if the file is absent, -2 if castore_add_root rejected it.
+    tm_count: uint64 = initramfs_entry_count()
+    tm_idx: uint64 = 0
+    while tm_idx < tm_count:
+        tm_name: Ptr[char] = initramfs_entry_name(tm_idx)
+        if _tls_name_eq(tm_name, path, path_len) == 1:
+            blob: Ptr[uint8] = initramfs_entry_data(tm_idx)
+            sz:   uint64    = initramfs_entry_size(tm_idx)
+            slot: int32 = castore_add_root(blob, sz)
+            if slot < 0:
+                return -2
+            return slot
+        tm_idx = tm_idx + 1
+    return -1
+
+
+def _tls_validation_init():
+    # Lazy one-shot init for the cert-validation stack. Called from
+    # tls_handshake() before the first time we touch validate_cert_chain.
+    if _tls_val_init_ran != 0:
+        return
+    _tls_val_init_ran = 1
+    asn1_init_oids()
+    p256_init()
+    rsa_init()
+    ecdsa_init()
+    castore_init()
+    # Bake-in production anchor: ISRG Root X1 (Let's Encrypt).
+    isrg_path: Ptr[uint8] = "/etc/tls-ca-isrg-x1.der"
+    rc_isrg: int32 = _tls_load_initramfs_anchor(isrg_path, 23)
+    if rc_isrg >= 0:
+        printk1("[tls] CA anchor loaded: ISRG Root X1 (slot %d)\n",
+                cast[uint64](rc_isrg))
+    elif rc_isrg == -1:
+        printk0("[tls] CA anchor absent: ISRG Root X1 (not in initramfs)\n")
+    else:
+        # x509_parse rejects ISRG Root X1 today: it's a 4096-bit RSA root
+        # signed with sha256WithRSAEncryption (PKCS#1 v1.5) which V4's
+        # signature-verify dispatch doesn't handle (PSS + ECDSA only).
+        # The anchor still gets refused at castore_add_root time so the
+        # gate fails closed. V6 will add v1.5 dispatch.
+        printk0("[tls] CA anchor REJECTED: ISRG Root X1 (parse failed; PKCS#1 v1.5 unsupported in V5)\n")
+    # Optional fixture-supplied anchor. test_net_https.sh plants this so
+    # the in-tree TLS server's leaf chains up through a known CA.
+    fixture_path: Ptr[uint8] = "/etc/tls-ca.der"
+    rc_fix: int32 = _tls_load_initramfs_anchor(fixture_path, 15)
+    if rc_fix >= 0:
+        printk1("[tls] CA anchor loaded: fixture (/etc/tls-ca.der, slot %d)\n",
+                cast[uint64](rc_fix))
+    elif rc_fix == -2:
+        printk0("[tls] CA anchor REJECTED: /etc/tls-ca.der (parse failed)\n")
+    printk1("[tls] cert-validation init complete (%d anchors loaded)\n",
+            cast[uint64](castore_count()))
+
+
 def tls_init():
     # Module init: zero scratch + load SHA-256 K constants. Called once
     # by https_get before the first handshake.
@@ -2526,7 +2671,17 @@ def tls_handshake(tcp_slot: int32, host: Ptr[uint8]) -> int32:
     if tcp_slot < 0:
         return -1
     printk1("[tls] handshake start (host=%s)\n", cast[uint64](host))
-    printk0("[tls] WARNING: server cert NOT validated this commit\n")
+    # V5: lazy-init the cert-validation stack (OID tables, RSA/ECDSA
+    # primitives, CA store) on the first handshake of this boot. We do
+    # this here rather than in tls_init() because net_smoke_test calls
+    # tls_init BEFORE rtc_init / vfs_init, and the CA-anchor loader
+    # wants the initramfs cpio table populated.
+    _tls_validation_init()
+    # Stash the SNI host so _tls_drive_post_sh can hand it to the chain
+    # validator alongside the chain-table it builds while walking the
+    # Certificate message.
+    _tls_sni_host_raw = cast[uint64](host)
+    _tls_chain_count = 0
     tls_tcp_slot = tcp_slot
 
     # Build + send ClientHello.
@@ -2866,6 +3021,50 @@ def _tls_verify_server_finished(verify_body: Ptr[uint8],
                        verify_body, 32)
 
 
+# Alert level + description constants from RFC 8446 §6.
+TLS_ALERT_LEVEL_FATAL:      uint8 = 2
+TLS_ALERT_BAD_CERTIFICATE:  uint8 = 42
+TLS_ALERT_CERT_UNKNOWN:     uint8 = 46
+
+
+def _tls_send_alert_under_hs(tcp_slot: int32, desc: uint8) -> int32:
+    # Send a fatal AEAD-encrypted alert under the server-handshake-secret
+    # direction's CLIENT key (post-ServerHello, pre-Finished window).
+    # Inner plaintext = level + desc + inner-content-type (TLS_CT_ALERT).
+    # On any wire error we still return -1, but the cert-validation
+    # caller's plan is to tear the connection down regardless, so the
+    # alert is best-effort: get the bytes onto the wire so a wireshark
+    # trace shows WHY we hung up.
+    inner: Array[8, uint8]
+    inner[0] = TLS_ALERT_LEVEL_FATAL
+    inner[1] = desc
+    inner[2] = TLS_CT_ALERT
+    inner_len: uint64 = 3
+    record_len: uint64 = inner_len + TLS_AEAD_TAG
+    tls_tx_buf[0] = TLS_CT_APPLICATION
+    tls_tx_buf[1] = 0x03
+    tls_tx_buf[2] = 0x03
+    tls_tx_buf[3] = cast[uint8]((record_len >> 8) & 0xFF)
+    tls_tx_buf[4] = cast[uint8](record_len & 0xFF)
+    nonce: Array[12, uint8]
+    _tls_compute_nonce(tls_client_seq,
+                       cast[Ptr[uint8]](&tls_client_hs_iv[0]),
+                       cast[Ptr[uint8]](&nonce[0]))
+    _tls_aead_seal(cast[Ptr[uint8]](&tls_client_hs_key[0]),
+                   cast[Ptr[uint8]](&nonce[0]),
+                   cast[Ptr[uint8]](&tls_tx_buf[0]), 5,
+                   cast[Ptr[uint8]](&inner[0]), inner_len,
+                   cast[Ptr[uint8]](&tls_tx_buf[5]),
+                   cast[Ptr[uint8]](&tls_tx_buf[5 + inner_len]))
+    tls_client_seq = tls_client_seq + 1
+    total: uint64 = 5 + record_len
+    sent: int64 = tcp_send(tcp_slot, cast[Ptr[uint8]](&tls_tx_buf[0]),
+                           total)
+    if sent < cast[int64](total):
+        return -1
+    return 0
+
+
 def _tls_drive_post_sh(tcp_slot: int32) -> int32:
     # Run the post-ServerHello half of the handshake to completion:
     #   1. Skip the optional ChangeCipherSpec record (middlebox compat).
@@ -2954,21 +3153,22 @@ def _tls_drive_post_sh(tcp_slot: int32) -> int32:
                 _tls_tr_update(
                     cast[Ptr[uint8]](&tls_pt_buf[mpos]), 4 + mlen)
             elif ht == TLS_HS_CERTIFICATE:
-                # Parse the Certificate message just enough to log how
-                # many certs were in the chain. Wire shape (RFC 8446
-                # §4.4.2):
+                # Parse the Certificate message into (ptr, len) chain
+                # entries and validate IMMEDIATELY. Wire shape
+                # (RFC 8446 §4.4.2):
                 #   opaque certificate_request_context<0..255>;
                 #   CertificateEntry certificate_list<0..2^24-1>;
                 # Each CertificateEntry: 3-byte cert_data length + cert
                 # bytes + 2-byte extensions length + extensions.
                 #
-                # V0: skip-validate. The cert bytes are real X.509 DER
-                # but we discard them rather than parse — needs a real
-                # ASN.1 + signature pipeline, deferred. Update the
-                # transcript hash with the whole message so the server's
-                # Finished HMAC still checks out.
-                cnt: uint64 = 0
+                # V5: real validation. The chain pointers index into
+                # tls_pt_buf (the decrypted plaintext scratch), which
+                # stays stable for the rest of this plaintext-walk
+                # iteration; validate_cert_chain runs synchronously here
+                # so the bytes are guaranteed live across the call.
+                _tls_chain_count = 0
                 cpos: uint64 = mpos + 4
+                parse_ok: int32 = 0
                 if cpos + 1 <= mpos + 4 + mlen:
                     ctx_len: uint64 = cast[uint64](tls_pt_buf[cpos])
                     cpos = cpos + 1 + ctx_len
@@ -2980,33 +3180,83 @@ def _tls_drive_post_sh(tcp_slot: int32) -> int32:
                         cpos = cpos + 3
                         list_end: uint64 = cpos + list_len
                         if list_end <= mpos + 4 + mlen:
+                            parse_ok = 1
                             while cpos + 3 <= list_end:
                                 clen: uint64 = \
                                     (cast[uint64](tls_pt_buf[cpos]) << 16) \
                                     | (cast[uint64](tls_pt_buf[cpos + 1]) << 8) \
                                     | cast[uint64](tls_pt_buf[cpos + 2])
-                                cpos = cpos + 3 + clen
+                                cpos = cpos + 3
+                                # Record (ptr,len) — pointer into tls_pt_buf.
+                                if _tls_chain_count < 8:
+                                    _tls_chain_ptrs[_tls_chain_count] = \
+                                        cast[Ptr[uint8]](&tls_pt_buf[cpos])
+                                    _tls_chain_lens[_tls_chain_count] = clen
+                                    _tls_chain_count = _tls_chain_count + 1
+                                else:
+                                    # Server sent > 8 certs — reject as
+                                    # chain too deep (V4's MAX_CHAIN_DEPTH).
+                                    parse_ok = 0
+                                cpos = cpos + clen
                                 if cpos + 2 > list_end:
+                                    parse_ok = 0
                                     break
                                 ext_len: uint64 = \
                                     (cast[uint64](tls_pt_buf[cpos]) << 8) \
                                     | cast[uint64](tls_pt_buf[cpos + 1])
                                 cpos = cpos + 2 + ext_len
-                                cnt = cnt + 1
-                printk1("[tls] Certificate: %d certs in chain (NOT validated)\n",
-                        cnt)
-                printk0("[tls] WARNING: server cert NOT validated\n")
+                printk1("[tls] Certificate: %d certs in chain\n",
+                        cast[uint64](_tls_chain_count))
+                # Feed the message into the transcript hash regardless of
+                # validation outcome — the server-Finished HMAC computes
+                # against the transcript up to & including this message,
+                # so even if we're about to alert+abort we want the
+                # transcript state consistent (the alert isn't gated on
+                # Finished verifying).
                 _tls_tr_update(
                     cast[Ptr[uint8]](&tls_pt_buf[mpos]), 4 + mlen)
+                if parse_ok == 0:
+                    printk0("[tls] cert chain rejected: malformed Certificate message\n")
+                    _tls_send_alert_under_hs(tcp_slot,
+                                             TLS_ALERT_BAD_CERTIFICATE)
+                    return -1
+                if _tls_chain_count <= 0:
+                    printk0("[tls] cert chain rejected: empty\n")
+                    _tls_send_alert_under_hs(tcp_slot,
+                                             TLS_ALERT_BAD_CERTIFICATE)
+                    return -1
+                now_unix: uint64 = _tls_now_unix()
+                vrc_chain: int32 = validate_cert_chain(
+                    cast[Ptr[Ptr[uint8]]](&_tls_chain_ptrs[0]),
+                    cast[Ptr[uint64]](&_tls_chain_lens[0]),
+                    _tls_chain_count,
+                    cast[Ptr[char]](_tls_sni_host_raw),
+                    now_unix)
+                if vrc_chain == 1:
+                    printk0("[tls] cert chain validated\n")
+                elif vrc_chain == 0:
+                    printk0("[tls] cert chain rejected: untrusted / hostname / time\n")
+                    _tls_send_alert_under_hs(tcp_slot,
+                                             TLS_ALERT_CERT_UNKNOWN)
+                    return -1
+                else:
+                    printk0("[tls] cert chain rejected: malformed DER / unsupported sig alg\n")
+                    _tls_send_alert_under_hs(tcp_slot,
+                                             TLS_ALERT_BAD_CERTIFICATE)
+                    return -1
             elif ht == TLS_HS_CERT_VERIFY:
                 # Wire shape: 2-byte signature_algorithm + 2-byte
-                # signature length + signature bytes. V0 skip-validates;
-                # we still feed it into the transcript hash so the
-                # subsequent Finished verifies.
+                # signature length + signature bytes. V5 still relies on
+                # the chain-walker's signature verify (which checks the
+                # leaf-to-root sig chain via the parent's pubkey); we
+                # don't separately verify the transcript-signature
+                # against the leaf pubkey yet — that's a V6 follow-up
+                # (RFC 8446 §4.4.3). Feed into the transcript hash so
+                # the subsequent Finished verifies.
                 if mlen >= 2:
                     sa: uint16 = (cast[uint16](tls_pt_buf[mpos + 4]) << 8) \
                         | cast[uint16](tls_pt_buf[mpos + 5])
-                    printk1("[tls] CertVerify sig_alg=0x%x (NOT validated)\n",
+                    printk1("[tls] CertVerify sig_alg=0x%x (transcript-bind deferred)\n",
                             cast[uint64](sa))
                 _tls_tr_update(
                     cast[Ptr[uint8]](&tls_pt_buf[mpos]), 4 + mlen)

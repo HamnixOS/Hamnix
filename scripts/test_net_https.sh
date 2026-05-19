@@ -1,32 +1,32 @@
 #!/usr/bin/env bash
 # scripts/test_net_https.sh — exercise the in-kernel TLS 1.3 client end-
-# to-end via https_get().
+# to-end via https_get(), with V5 server cert chain validation.
 #
-# Strategy:
+# V5 strategy (path-(a) per the V5 brief):
 #
-#   1. Generate a fresh self-signed cert (RSA-2048; SAN=10.0.2.200).
-#      The kernel does NOT validate the chain (V0 — see drivers/net/
-#      tls.ad header), so any cert with TLS 1.3 + ChaCha20-Poly1305 +
-#      X25519 support on the server side works.
-#   2. Spawn a Python TLS 1.3 server on 127.0.0.1:9443 that answers
-#      `GET /` with a fixed HTML reply starting with `<!doctype html>`.
-#   3. Boot QEMU with `-netdev user,guestfwd=tcp:10.0.2.200:443-tcp:
-#      127.0.0.1:9443` so the guest's tcp_connect(10.0.2.200,443)
-#      routes through SLIRP to the host loopback.
-#   4. The kernel's https_local_smoke_test() runs as part of net_smoke
-#      _test() and calls https_get("https://10.0.2.200/"). The IP-
-#      literal fast path bypasses DNS so this works in CI sandboxes
-#      that block outbound UDP/53.
-#   5. Grep the boot log for the PASS marker.
+#   1. Generate a fresh fake "Hamnix Test CA" (RSA-2048, CA:TRUE).
+#   2. Generate a leaf cert (RSA-2048) with subjectAltName=DNS:10.0.2.200,
+#      signed by the test CA using rsassaPss + SHA-256 (matches V4's
+#      OID_RSASSA_PSS dispatch).
+#   3. Convert the test CA to DER and plant its bytes in the initramfs
+#      as /etc/tls-ca.der via the TLS_CA_DER env var; build_initramfs.py
+#      embeds it, and drivers/net/tls.ad's _tls_validation_init reads it
+#      out of the cpio table on first handshake and castore_add_root's
+#      it. (ISRG Root X1 from the host's ca-certificates is also baked
+#      in unconditionally — see _ISRG_HOST_PEM in build_initramfs.py.)
+#   4. Spawn a Python TLS 1.3 server on 127.0.0.1:9443 serving the leaf
+#      cert + key.
+#   5. Boot QEMU with `-netdev user,guestfwd=tcp:10.0.2.200:443-tcp:
+#      127.0.0.1:9443`. The kernel's https_local_smoke_test() calls
+#      https_get("https://10.0.2.200/") → tls_handshake walks the chain,
+#      verifies the leaf against the planted Hamnix Test CA, prints
+#      "[tls] cert chain validated", and the HTTP round-trip completes.
 #
-# Outcomes:
-#   - "[https-local] GET 10.0.2.200 -> status=200" + body contains
-#     "<!doctype html>" -> PASS (full TLS 1.3 + HTTP round-trip).
-#   - "[tls] AEAD decrypt FAILED" or "[tls] server Finished HMAC
-#     mismatch" -> FAIL.
-#   - "[https-local] SKIP" -> SKIP (port 9443 already taken / openssl
-#     not available / Python TLS bind failed; treated as PASS so
-#     the regression suite isn't held hostage by host env quirks).
+# PASS marker (V5): "[test_net_https] PASS (cert-validated)".
+# We require both "[tls] cert chain validated" AND the existing
+# "[https-local] GET 10.0.2.200 -> status=200" + body-shape grep — so a
+# regression that silently accepts an invalid chain still fails the
+# test on the missing validation line.
 
 . "$(dirname "$0")/_build_lock.sh"
 
@@ -36,23 +36,16 @@ cd "$PROJ_ROOT"
 
 ELF=build/hamnix-vmlinux.elf
 
-echo "[test_net_https] (1/4) Build userland + initramfs"
-bash scripts/build_user.sh >/dev/null
-# Plant /etc/tls-test so init/main.ad's net_smoke_test() calls
-# https_local_smoke_test() — see the gate around that call site.
-INIT_ELF=build/user/init.elf ENABLE_TLS_SMOKE=1 python3 scripts/build_initramfs.py >/dev/null
-
-echo "[test_net_https] (2/4) Rebuild kernel image"
-python3 -m compiler.adder compile \
-    --target=x86_64-bare-metal \
-    init/main.ad \
-    -o "$ELF" >/dev/null
-
-echo "[test_net_https] (3/4) Set up local Python TLS 1.3 server"
+echo "[test_net_https] (1/5) Generate Hamnix Test CA + leaf cert"
 TMPDIR=$(mktemp -d -t hamnix-tls-XXXXXX)
 LOG="$TMPDIR/qemu.log"
-CERT="$TMPDIR/cert.pem"
-KEY="$TMPDIR/key.pem"
+CA_KEY="$TMPDIR/ca.key"
+CA_CRT="$TMPDIR/ca.crt"
+CA_DER="$TMPDIR/ca.der"
+LEAF_KEY="$TMPDIR/leaf.key"
+LEAF_CSR="$TMPDIR/leaf.csr"
+LEAF_CRT="$TMPDIR/leaf.crt"
+LEAF_CFG="$TMPDIR/leaf.cfg"
 SRVLOG="$TMPDIR/srv.log"
 SRVPY="$TMPDIR/srv.py"
 SRVPORT=9443
@@ -68,14 +61,61 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Self-signed RSA-2048 cert (CN + SAN). The kernel doesn't validate
-# anyway but openssl s_server / Python ssl wants a complete cert.
+# CA: RSA-2048 self-signed root with CA:TRUE. We deliberately keep the
+# OpenSSL command shape simple (no -config files) because the kernel's
+# X.509 parser is a strict subset (V1) and the modern openssl req
+# defaults emit a tidy cert.
 openssl req -x509 -nodes -newkey rsa:2048 -days 30 \
-    -keyout "$KEY" -out "$CERT" \
-    -subj "/CN=10.0.2.200" \
-    -addext "subjectAltName=IP:10.0.2.200" \
+    -keyout "$CA_KEY" -out "$CA_CRT" \
+    -subj "/CN=Hamnix Test CA" \
+    -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
+    -addext "keyUsage=critical,keyCertSign" \
     >/dev/null 2>&1
+openssl x509 -in "$CA_CRT" -outform DER -out "$CA_DER" 2>/dev/null
 
+# Leaf: RSA-2048, signed by the test CA with rsassaPss-SHA256 so it
+# dispatches through lib/rsa/rsa.ad's rsa_pss_verify path.
+openssl genrsa -out "$LEAF_KEY" 2048 >/dev/null 2>&1
+cat > "$LEAF_CFG" << 'CFGEOF'
+[req]
+distinguished_name = req_dn
+prompt             = no
+req_extensions     = v3_req
+[req_dn]
+CN = 10.0.2.200
+[v3_req]
+basicConstraints = CA:FALSE
+subjectAltName   = DNS:10.0.2.200
+CFGEOF
+openssl req -new -key "$LEAF_KEY" -out "$LEAF_CSR" -config "$LEAF_CFG" \
+    >/dev/null 2>&1
+openssl x509 -req -in "$LEAF_CSR" -CA "$CA_CRT" -CAkey "$CA_KEY" \
+    -CAcreateserial -out "$LEAF_CRT" -days 30 \
+    -sha256 \
+    -sigopt rsa_padding_mode:pss \
+    -sigopt rsa_pss_saltlen:32 \
+    -extfile "$LEAF_CFG" -extensions v3_req \
+    >/dev/null 2>&1
+echo "[test_net_https]   CA DER: $(wc -c < "$CA_DER") bytes"
+echo "[test_net_https]   leaf:   $(openssl x509 -in "$LEAF_CRT" -noout -subject -issuer | tr '\n' ' ')"
+
+echo "[test_net_https] (2/5) Build userland + initramfs (with CA anchor)"
+bash scripts/build_user.sh >/dev/null
+# Plant /etc/tls-test so init/main.ad's net_smoke_test() calls
+# https_local_smoke_test(); plant /etc/tls-ca.der so the validator has
+# the matching anchor.
+INIT_ELF=build/user/init.elf \
+    ENABLE_TLS_SMOKE=1 \
+    TLS_CA_DER="$CA_DER" \
+    python3 scripts/build_initramfs.py >/dev/null
+
+echo "[test_net_https] (3/5) Rebuild kernel image"
+python3 -m compiler.adder compile \
+    --target=x86_64-bare-metal \
+    init/main.ad \
+    -o "$ELF" >/dev/null
+
+echo "[test_net_https] (4/5) Set up local Python TLS 1.3 server"
 cat > "$SRVPY" << 'PYEOF'
 import socket, ssl, sys, threading
 
@@ -83,8 +123,6 @@ CERT = sys.argv[1]
 KEY  = sys.argv[2]
 PORT = int(sys.argv[3])
 
-# RFC 2606 example.com-shape HTML so the test wrapper's
-# `<!doctype html>` grep matches.
 BODY = (b"<!doctype html>\n"
         b"<html><head><title>Hamnix TLS test</title></head>\n"
         b"<body><h1>It works.</h1></body></html>\n")
@@ -97,17 +135,7 @@ RESP = (b"HTTP/1.1 200 OK\r\n"
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx.minimum_version = ssl.TLSVersion.TLSv1_3
 ctx.load_cert_chain(certfile=CERT, keyfile=KEY)
-# Hamnix's TCP layer overwrites tcp_slot_rx_data on every new segment
-# (single-segment RX buffer, no accumulation) — see drivers/net/tcp.ad.
-# Multiple post-handshake NewSessionTicket records sent by the server
-# would otherwise be silently overwritten by the subsequent HTTP
-# response in our RX ring, putting our app-key seq counter out of
-# sync with the server's. Disable NSTs entirely; the kernel TLS
-# client doesn't consume them yet either (resumption is V1+).
 ctx.num_tickets = 0
-# Make sure ChaCha20-Poly1305 is offered (it's in default TLS 1.3
-# suite list, but explicit is better; OpenSSL TLS 1.3 ciphersuites
-# are negotiated independently of the legacy cipher list).
 try:
     ctx.set_ciphers("TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256")
 except Exception:
@@ -123,8 +151,6 @@ def handle(c, peer):
     try:
         tls = ctx.wrap_socket(c, server_side=True)
         print(f"[srv] TLS handshake OK with {peer}", flush=True)
-        # Read up to ~4 KiB of the request (we don't actually parse
-        # it; the kernel sends "GET / HTTP/1.1\r\nHost: ...\r\n...").
         data = b""
         while b"\r\n\r\n" not in data and len(data) < 4096:
             chunk = tls.recv(4096)
@@ -133,11 +159,6 @@ def handle(c, peer):
             data += chunk
         print(f"[srv] read {len(data)} bytes of request", flush=True)
         tls.sendall(RESP)
-        # Don't tls.unwrap() — the in-kernel client doesn't send
-        # close_notify yet (TLS V0), and unwrap() would hang waiting
-        # for our peer's close_notify. Drop straight to TCP close —
-        # the client picks up EOF via the TCP FIN and exits the body
-        # loop on Content-Length anyway.
     except Exception as e:
         print(f"[srv] error: {e}", flush=True)
     finally:
@@ -154,7 +175,7 @@ while True:
     t.start()
 PYEOF
 
-python3 "$SRVPY" "$CERT" "$KEY" "$SRVPORT" > "$SRVLOG" 2>&1 &
+python3 "$SRVPY" "$LEAF_CRT" "$LEAF_KEY" "$SRVPORT" > "$SRVLOG" 2>&1 &
 SRV_PID=$!
 # Wait up to 3 s for the server to start listening.
 for _ in $(seq 1 30); do
@@ -172,14 +193,8 @@ if ! grep -F -q "listening on 127.0.0.1:${SRVPORT}" "$SRVLOG"; then
 fi
 echo "[test_net_https] Python TLS server up on 127.0.0.1:${SRVPORT}"
 
-echo "[test_net_https] (4/4) Boot QEMU with virtio-net + SLIRP guestfwd"
+echo "[test_net_https] (5/5) Boot QEMU with virtio-net + SLIRP guestfwd"
 set +e
-# We pre-arrange TWO guestfwds: one to our local TLS server for the
-# HTTPS smoke at 10.0.2.200:443, plus a no-op `cat` echo at 10.0.2.100:7
-# so the unrelated tcp_smoke_test() that runs as part of net_smoke_test
-# doesn't stall on its own ARP timeout. (The handshake/HTTPS smoke
-# fires AFTER vfs_init, which is AFTER net_smoke_test — so we have
-# to keep the rest of the boot path quick.)
 timeout 60s qemu-system-x86_64 \
     -kernel "$ELF" \
     -netdev "user,id=n0,guestfwd=tcp:10.0.2.200:443-tcp:127.0.0.1:${SRVPORT},guestfwd=tcp:10.0.2.100:7-cmd:cat" \
@@ -196,18 +211,33 @@ echo "[test_net_https] --- srv log ---"
 cat "$SRVLOG" || true
 echo "[test_net_https] --- end srv ---"
 
-# 1. Full local round-trip success.
-if grep -F -q "[https-local] GET 10.0.2.200 -> status=200" "$LOG"; then
-    if grep -i -E -q '<!doctype html>' "$LOG"; then
-        echo "[test_net_https] PASS (local TLS 1.3 round-trip: 200 + doctype)"
-        exit 0
+# V5 success: cert chain validated AND full TLS round-trip.
+if grep -F -q "[tls] cert chain validated" "$LOG"; then
+    if grep -F -q "[https-local] GET 10.0.2.200 -> status=200" "$LOG"; then
+        if grep -i -E -q '<!doctype html>' "$LOG"; then
+            echo "[test_net_https] PASS (cert-validated)"
+            exit 0
+        fi
+        echo "[test_net_https] FAIL: chain validated + 200 OK but body has no <!doctype html>"
+        cat "$LOG"
+        exit 1
     fi
-    echo "[test_net_https] FAIL: 200 OK but body has no <!doctype html>"
+    echo "[test_net_https] FAIL: chain validated but no 200 OK marker"
     cat "$LOG"
     exit 1
 fi
 
-# 2. Hard crypto/protocol failures.
+# Chain-rejected path. Could be:
+#   (a) Fixture CA didn't make it into the initramfs (build-side bug).
+#   (b) Kernel can't read RTC + build-epoch is wrong (unlikely).
+#   (c) Genuine regression in validate_cert_chain.
+if grep -F -q "[tls] cert chain rejected" "$LOG"; then
+    echo "[test_net_https] FAIL (chain rejected — fixture CA missing or validator bug)"
+    cat "$LOG"
+    exit 1
+fi
+
+# Hard crypto/protocol failures predate the cert path.
 if grep -F -q "[tls] AEAD decrypt FAILED" "$LOG"; then
     echo "[test_net_https] FAIL (AEAD round-trip failure - key schedule)"
     cat "$LOG"
@@ -219,15 +249,7 @@ if grep -F -q "[tls] server Finished HMAC mismatch" "$LOG"; then
     exit 1
 fi
 
-# 3. example.com path (only fires when SLIRP DNS + outbound 443 work).
-if grep -F -q "[https] GET example.com -> status=200" "$LOG"; then
-    if grep -i -E -q '<!doctype html>' "$LOG"; then
-        echo "[test_net_https] PASS (example.com TLS round-trip)"
-        exit 0
-    fi
-fi
-
-# 4. Skip paths.
+# Skip paths.
 if grep -F -q "[https-local] SKIP" "$LOG"; then
     echo "[test_net_https] SKIP (local guestfwd unreachable - host SLIRP shape?)"
     echo "[test_net_https] PASS"
@@ -239,7 +261,7 @@ if grep -F -q "no ACK received during init poll" "$LOG"; then
     exit 0
 fi
 
-# 5. AEAD selftest only proves crypto primitives compile.
+# AEAD selftest only proves crypto primitives compile.
 if grep -F -q "[tls] selftest: AEAD + X25519 OK" "$LOG"; then
     echo "[test_net_https] SKIP (selftest OK but live handshake didn't fire)"
     echo "[test_net_https] PASS"

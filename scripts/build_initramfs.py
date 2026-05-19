@@ -40,6 +40,40 @@ FILES = [
 if os.environ.get("ENABLE_TLS_SMOKE") == "1":
     FILES.append(("/etc/tls-test", b"1\n"))
 
+# V5 cert validation: bake the production ISRG Root X1 anchor into the
+# initramfs at /etc/tls-ca-isrg-x1.der whenever the host has it
+# installed. drivers/net/tls.ad's _tls_validation_init() walks the cpio
+# table for this exact path and castore_add_root's the bytes. Without
+# this, no anchor is loaded and every chain fails closed.
+_ISRG_HOST_PEM = "/etc/ssl/certs/ISRG_Root_X1.pem"
+if os.path.exists(_ISRG_HOST_PEM):
+    import subprocess
+    try:
+        _isrg_der = subprocess.run(
+            ["openssl", "x509", "-in", _ISRG_HOST_PEM, "-outform", "DER"],
+            check=True, capture_output=True,
+        ).stdout
+        FILES.append(("/etc/tls-ca-isrg-x1.der", _isrg_der))
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        # openssl absent or PEM unreadable — kernel will log
+        # "CA anchor absent" and refuse every real chain, which is the
+        # correct fail-closed behaviour.
+        pass
+
+# Test-fixture anchor: scripts/test_net_https.sh writes a path to its
+# generated Hamnix Test CA DER into TLS_CA_DER, and we plant it here.
+# The kernel adds it to the CA store in addition to ISRG Root X1 so the
+# fixture's server cert (signed by the test CA) validates without
+# breaking real-world ISRG-signed chains.
+_TLS_CA_DER_PATH = os.environ.get("TLS_CA_DER", "")
+if _TLS_CA_DER_PATH:
+    try:
+        with open(_TLS_CA_DER_PATH, "rb") as _f:
+            FILES.append(("/etc/tls-ca.der", _f.read()))
+    except OSError as _e:
+        raise SystemExit(
+            f"TLS_CA_DER={_TLS_CA_DER_PATH}: unreadable ({_e})")
+
 # See INIT_ELF handling inside build_archive(): set INIT_ELF=path to
 # override which on-disk file becomes /init in the cpio archive, e.g.
 # to swap in a Hamnix-compiled user binary without touching user/init.S.
