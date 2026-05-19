@@ -1283,10 +1283,23 @@ class X86CodeGen:
 
     def gen_index_address(self, expr: IndexExpr) -> None:
         """Compute the address of `expr` (an IndexExpr) into %rax."""
-        # Evaluate index, push, evaluate base, pop index into %rcx.
+        # Evaluate index, push, compute base address (NOT value), pop index.
+        #
+        # For obj typed Array[N, T], we want the BASE ADDRESS — `gen_expr`
+        # of an array-typed Identifier already gives us the address (it
+        # leaq's the symbol). But for nested IndexExprs like `arr2d[i][j]`
+        # the inner `arr2d[i]` resolves to `gen_index_load` which would
+        # dereference — yielding the 8-byte VALUE at arr2d[i][0], not the
+        # address of the row. Use `gen_addr_of` for Array-typed bases so
+        # the nested-arrays case works. Pointer-typed bases (`Ptr[T]`)
+        # carry the address as their value, so `gen_expr` is correct there.
         self.gen_expr(expr.index)
         self.emit("    pushq %rax")
-        self.gen_expr(expr.obj)
+        obj_type = self.get_expr_type(expr.obj)
+        if isinstance(obj_type, ArrayType):
+            self.gen_addr_of(expr.obj)
+        else:
+            self.gen_expr(expr.obj)
         self.emit("    popq %rcx")
         elem_size = self.element_size_of(expr.obj)
         # Scale %rcx by elem_size.
