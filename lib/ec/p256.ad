@@ -1,0 +1,722 @@
+# lib/ec/p256.ad
+#
+# NIST P-256 (secp256r1) elliptic-curve arithmetic (V3) — the third
+# brick in Hamnix's TLS certificate validation stack, sitting between
+# V0's ASN.1 parser and V3's ECDSA verify in lib/ecdsa/ecdsa.ad.
+#
+# THIS MODULE OWNS:
+#   - The base field GF(p) where p = 2^256 - 2^224 + 2^192 + 2^96 - 1.
+#   - The scalar field GF(n) where n is the curve order
+#     0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551.
+#   - Affine point operations on the curve y^2 = x^3 - 3x + b (mod p).
+#   - The hard-coded generator G.
+#
+# FIELD REPRESENTATION:
+#
+# Every field element (both base-field GF(p) and scalar-field GF(n))
+# is stored as Array[4, uint64] in *little-endian limb order* — limb[0]
+# is the least significant 64 bits, limb[3] the most significant. A
+# value v has limb[i] = (v >> (64*i)) & 0xFFFFFFFFFFFFFFFF.
+#
+# REDUCTION CHOICE — BIT-BY-BIT (a.k.a. Russian-peasant) multiply:
+#
+# We considered three reduction strategies:
+#
+#   1. Montgomery multiplication. Cleanest constant-time story but
+#      requires conversion to/from Montgomery form everywhere, and the
+#      precomputed N' constant is a footgun if mis-typed.
+#
+#   2. Solinas / NIST P-256 fast reduction (FIPS 186-4 Appendix D).
+#      Beautifully fast — the prime structure lets you reduce a
+#      512-bit intermediate via 32-bit-aligned slice additions and
+#      subtractions. But it needs full 64x64->128 schoolbook multiply
+#      to get the 8-limb intermediate, and the signed slice arithmetic
+#      is fiddly to get right.
+#
+#   3. **Bit-by-bit (Russian peasant) multiply with shift-and-reduce.**
+#      Initialise r = 0. For i from 255 down to 0:
+#        r = fp_add(r, r)              # double, reducing modulo p
+#        if bit i of b is set:
+#            r = fp_add(r, a)          # add a, reducing modulo p
+#      Both fp_add and fp_sub trivially keep the value in [0, p).
+#      Total cost: ~512 256-bit adds per multiply.
+#
+# We picked (3). Rationale:
+#   - Correctness-only V3 (per task scope; constant-time is V5+).
+#   - No 128-bit products needed — pure 64-bit add/sub with carry,
+#     so no `mulq` asm and no toolchain gymnastics.
+#   - Slow but verifiable; chain validation latency in the network
+#     stack dwarfs the few seconds a verify takes in QEMU.
+#   - The same routine drives both base-field and scalar-field mul
+#     (parameterised by the modulus pointer) — about half the code of
+#     the alternatives.
+#
+# CONST-TIME DISCLOSURE: this file is NOT constant-time. p256_add256
+# / p256_sub256 branch on the per-limb overflow comparison; _mod_mul
+# branches on individual bits of the (public) scalar; _mod_inv
+# branches on the bits of (p-2)/(n-2) which are public constants but
+# the loop's running multiplier `result` also has bits scanned by the
+# inner _mod_mul. The inputs to ECDSA verify are *public* (signature,
+# pubkey, message hash) so this is acceptable for V3. V5's TLS
+# handshake hardening will revisit with Montgomery + Jacobian + a
+# constant-time ladder.
+#
+# POINT REPRESENTATION:
+#
+# Affine (x, y) plus an explicit `infinity` flag. Jacobian projective
+# is the V5+ const-time hardening target — affine is fine for V3 and
+# the code is 10x clearer.
+#
+# SCRATCH BUFFER DISCIPLINE:
+#
+# Per memory/feedback_compiler_quirks.md (U9 still active 2026-05-18),
+# Adder mis-spills fixed-size Array locals across call frames when
+# a callee also declares a same-shape Array. To dodge this, all
+# scratch Arrays used inside the field-arithmetic helpers live as
+# module-globals (the `_sc_*` family below). The downside is that the
+# routines are NOT reentrant — they cannot be invoked from an
+# interrupt handler that itself does P-256 arithmetic, and a single
+# verify run cannot be interleaved between threads. ECDSA verify is
+# called from the TLS handshake state machine, never from an interrupt
+# path, and the kernel locks the session before driving it through.
+# When U9 is fixed (or when we re-architect with kmalloc'd workspaces)
+# this restriction goes away.
+
+# -- prime p (base field modulus) -------------------------------------------
+#
+# p = 2^256 - 2^224 + 2^192 + 2^96 - 1
+#   = 0xFFFFFFFF00000001 0000000000000000 00000000FFFFFFFF FFFFFFFFFFFFFFFF
+# Limb order (little-endian, limb[0] = LSB):
+#   limb[0] = 0xFFFFFFFFFFFFFFFF
+#   limb[1] = 0x00000000FFFFFFFF
+#   limb[2] = 0x0000000000000000
+#   limb[3] = 0xFFFFFFFF00000001
+
+P256_P: Array[4, uint64]
+
+# -- order n (scalar field modulus) -----------------------------------------
+#
+# n = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+# Limb order:
+#   limb[0] = 0xF3B9CAC2FC632551
+#   limb[1] = 0xBCE6FAADA7179E84
+#   limb[2] = 0xFFFFFFFFFFFFFFFF
+#   limb[3] = 0xFFFFFFFF00000000
+
+P256_N: Array[4, uint64]
+
+# -- generator G (NIST P-256 standard) --------------------------------------
+
+P256_GX: Array[4, uint64]
+P256_GY: Array[4, uint64]
+
+# -- p - 2 (Fermat exponent for base-field inverse) -------------------------
+
+P256_P_MINUS_2: Array[4, uint64]
+
+# -- n - 2 (Fermat exponent for scalar-field inverse) -----------------------
+
+P256_N_MINUS_2: Array[4, uint64]
+
+# -- module-global scratch (per-routine; see "SCRATCH BUFFER DISCIPLINE") --
+#
+# Each scratch slot is named after the routine that owns it; nesting
+# is encoded in the prefix so a single call chain doesn't trample its
+# own state. Inv calls Mul which calls Add/Sub — so Inv has its own,
+# Mul has its own, Add/Sub use shared smaller ones.
+
+_sc_addsub_tmp:    Array[4, uint64]   # used by _mod_add / _mod_sub
+_sc_mul_acc:       Array[4, uint64]
+_sc_mul_a_local:   Array[4, uint64]
+_sc_mul_b_local:   Array[4, uint64]
+_sc_inv_acc:       Array[4, uint64]
+_sc_inv_a_local:   Array[4, uint64]
+# Point-op scratch — fully namespaced because doubling and addition
+# nest into fp_mul/fp_sqr/fp_inv and those each use their own slots
+# above.
+_sc_dbl_px:        Array[4, uint64]
+_sc_dbl_py:        Array[4, uint64]
+_sc_dbl_x_sq:      Array[4, uint64]
+_sc_dbl_three_x_sq: Array[4, uint64]
+_sc_dbl_three:     Array[4, uint64]
+_sc_dbl_numer:     Array[4, uint64]
+_sc_dbl_denom:     Array[4, uint64]
+_sc_dbl_denom_inv: Array[4, uint64]
+_sc_dbl_lam:       Array[4, uint64]
+_sc_dbl_lam_sq:    Array[4, uint64]
+_sc_dbl_two_x:     Array[4, uint64]
+_sc_dbl_xr:        Array[4, uint64]
+_sc_dbl_x_minus_xr: Array[4, uint64]
+_sc_dbl_yr:        Array[4, uint64]
+_sc_add_px:        Array[4, uint64]
+_sc_add_py:        Array[4, uint64]
+_sc_add_qx:        Array[4, uint64]
+_sc_add_qy:        Array[4, uint64]
+_sc_add_dx:        Array[4, uint64]
+_sc_add_dy:        Array[4, uint64]
+_sc_add_dx_inv:    Array[4, uint64]
+_sc_add_lam:       Array[4, uint64]
+_sc_add_lam_sq:    Array[4, uint64]
+_sc_add_xr:        Array[4, uint64]
+_sc_add_x_minus_xr: Array[4, uint64]
+_sc_add_yr:        Array[4, uint64]
+_sc_add_zero:      Array[4, uint64]
+
+
+def p256_init():
+    # Initialise the module-global constants. Adder top-level Array
+    # initialisers don't survive to the linked image (per
+    # feedback_compiler_quirks.md), so we populate runtime here. Call
+    # exactly once before any other p256_* / ecdsa_* function.
+
+    # P256_P limbs (little-endian)
+    P256_P[0] = 0xFFFFFFFFFFFFFFFF
+    P256_P[1] = 0x00000000FFFFFFFF
+    P256_P[2] = 0x0000000000000000
+    P256_P[3] = 0xFFFFFFFF00000001
+
+    # P256_N limbs
+    P256_N[0] = 0xF3B9CAC2FC632551
+    P256_N[1] = 0xBCE6FAADA7179E84
+    P256_N[2] = 0xFFFFFFFFFFFFFFFF
+    P256_N[3] = 0xFFFFFFFF00000000
+
+    # Generator Gx = 0x6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296
+    P256_GX[0] = 0xF4A13945D898C296
+    P256_GX[1] = 0x77037D812DEB33A0
+    P256_GX[2] = 0xF8BCE6E563A440F2
+    P256_GX[3] = 0x6B17D1F2E12C4247
+
+    # Generator Gy = 0x4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5
+    P256_GY[0] = 0xCBB6406837BF51F5
+    P256_GY[1] = 0x2BCE33576B315ECE
+    P256_GY[2] = 0x8EE7EB4A7C0F9E16
+    P256_GY[3] = 0x4FE342E2FE1A7F9B
+
+    # p - 2
+    P256_P_MINUS_2[0] = 0xFFFFFFFFFFFFFFFD
+    P256_P_MINUS_2[1] = 0x00000000FFFFFFFF
+    P256_P_MINUS_2[2] = 0x0000000000000000
+    P256_P_MINUS_2[3] = 0xFFFFFFFF00000001
+
+    # n - 2
+    P256_N_MINUS_2[0] = 0xF3B9CAC2FC63254F
+    P256_N_MINUS_2[1] = 0xBCE6FAADA7179E84
+    P256_N_MINUS_2[2] = 0xFFFFFFFFFFFFFFFF
+    P256_N_MINUS_2[3] = 0xFFFFFFFF00000000
+
+
+# -- P256Point -------------------------------------------------------------
+
+class P256Point:
+    x: Array[4, uint64]
+    y: Array[4, uint64]
+    infinity: int32   # 1 if point at infinity, 0 otherwise
+
+
+# -- small helpers ---------------------------------------------------------
+
+def p256_set_zero(r: Ptr[uint64]):
+    r[0] = 0
+    r[1] = 0
+    r[2] = 0
+    r[3] = 0
+
+
+def p256_copy(r: Ptr[uint64], a: Ptr[uint64]):
+    r[0] = a[0]
+    r[1] = a[1]
+    r[2] = a[2]
+    r[3] = a[3]
+
+
+def p256_is_zero(a: Ptr[uint64]) -> int32:
+    if a[0] != 0:
+        return 0
+    if a[1] != 0:
+        return 0
+    if a[2] != 0:
+        return 0
+    if a[3] != 0:
+        return 0
+    return 1
+
+
+def p256_eq(a: Ptr[uint64], b: Ptr[uint64]) -> int32:
+    if a[0] != b[0]:
+        return 0
+    if a[1] != b[1]:
+        return 0
+    if a[2] != b[2]:
+        return 0
+    if a[3] != b[3]:
+        return 0
+    return 1
+
+
+# Compare a >= b (unsigned 256-bit). Returns 1 if a >= b else 0.
+def p256_ge(a: Ptr[uint64], b: Ptr[uint64]) -> int32:
+    if a[3] != b[3]:
+        if a[3] > b[3]:
+            return 1
+        return 0
+    if a[2] != b[2]:
+        if a[2] > b[2]:
+            return 1
+        return 0
+    if a[1] != b[1]:
+        if a[1] > b[1]:
+            return 1
+        return 0
+    if a[0] >= b[0]:
+        return 1
+    return 0
+
+
+# -- 256-bit add / sub with carry (mod 2^256) ------------------------------
+
+def p256_add256(r: Ptr[uint64], a: Ptr[uint64], b: Ptr[uint64]) -> uint64:
+    # r = a + b mod 2^256. Returns 0/1 carry out.
+    carry: uint64 = 0
+    i: uint64 = 0
+    while i < 4:
+        ai: uint64 = a[i]
+        bi: uint64 = b[i]
+        s: uint64 = ai + bi
+        c1: uint64 = 0
+        if s < ai:
+            c1 = 1
+        s2: uint64 = s + carry
+        c2: uint64 = 0
+        if s2 < s:
+            c2 = 1
+        r[i] = s2
+        carry = c1 + c2
+        i = i + 1
+    return carry
+
+
+def p256_sub256(r: Ptr[uint64], a: Ptr[uint64], b: Ptr[uint64]) -> uint64:
+    # r = a - b mod 2^256. Returns 0/1 borrow out.
+    borrow: uint64 = 0
+    i: uint64 = 0
+    while i < 4:
+        ai: uint64 = a[i]
+        bi: uint64 = b[i]
+        d: uint64 = ai - bi
+        b1: uint64 = 0
+        if ai < bi:
+            b1 = 1
+        d2: uint64 = d - borrow
+        b2: uint64 = 0
+        if d < borrow:
+            b2 = 1
+        r[i] = d2
+        borrow = b1 + b2
+        i = i + 1
+    return borrow
+
+
+# -- generic modular add / sub (parameterised by modulus pointer) ----------
+#
+# These take the modulus as a Ptr so the same routines drive both base
+# field (mod p) and scalar field (mod n).
+
+def _mod_add(r: Ptr[uint64], a: Ptr[uint64], b: Ptr[uint64],
+             m: Ptr[uint64]):
+    # r = (a + b) mod m, assuming a, b in [0, m).
+    carry: uint64 = p256_add256(&_sc_addsub_tmp[0], a, b)
+    if carry != 0:
+        # Overflow into bit-256 — tmp + 2^256 - m fits in 256 bits.
+        p256_sub256(r, &_sc_addsub_tmp[0], m)
+        return
+    if p256_ge(&_sc_addsub_tmp[0], m) != 0:
+        p256_sub256(r, &_sc_addsub_tmp[0], m)
+        return
+    p256_copy(r, &_sc_addsub_tmp[0])
+
+
+def _mod_sub(r: Ptr[uint64], a: Ptr[uint64], b: Ptr[uint64],
+             m: Ptr[uint64]):
+    # r = (a - b) mod m, assuming a, b in [0, m).
+    borrow: uint64 = p256_sub256(&_sc_addsub_tmp[0], a, b)
+    if borrow != 0:
+        # Went negative: tmp currently holds (a - b) + 2^256.
+        p256_add256(r, &_sc_addsub_tmp[0], m)
+        return
+    p256_copy(r, &_sc_addsub_tmp[0])
+
+
+# r = (2 * a) mod m.
+
+def _mod_dbl(r: Ptr[uint64], a: Ptr[uint64], m: Ptr[uint64]):
+    _mod_add(r, a, a, m)
+
+
+# -- bit-by-bit modular multiply ------------------------------------------
+
+def _mod_mul(r: Ptr[uint64], a: Ptr[uint64], b: Ptr[uint64],
+             m: Ptr[uint64]):
+    # r = (a * b) mod m. Russian peasant: scan b from MSB to LSB; at
+    # each step double the running accumulator (mod m), and if the
+    # current bit of b is set, add a (mod m). After 256 iterations
+    # we've accumulated sum_{i=0..255} bit_i(b) * 2^i * a = a*b mod m.
+    p256_set_zero(&_sc_mul_acc[0])
+    # Snapshot a, b locally to dodge aliasing (r might equal a or b).
+    p256_copy(&_sc_mul_a_local[0], a)
+    p256_copy(&_sc_mul_b_local[0], b)
+    # Iterate MSB-first across 256 bits of b.
+    i: int32 = 255
+    while i >= 0:
+        _mod_dbl(&_sc_mul_acc[0], &_sc_mul_acc[0], m)
+        limb: uint64 = _sc_mul_b_local[cast[uint64](i) / 64]
+        bit: uint64 = (limb >> (cast[uint64](i) & 63)) & 1
+        if bit != 0:
+            _mod_add(&_sc_mul_acc[0], &_sc_mul_acc[0],
+                     &_sc_mul_a_local[0], m)
+        i = i - 1
+    p256_copy(r, &_sc_mul_acc[0])
+
+
+# Modular square. Currently delegates to _mod_mul.
+
+def _mod_sqr(r: Ptr[uint64], a: Ptr[uint64], m: Ptr[uint64]):
+    _mod_mul(r, a, a, m)
+
+
+# -- 256-bit right-shift-by-1 (logical) -----------------------------------
+
+def _p256_shr1(a: Ptr[uint64]):
+    # In-place a >>= 1. Bottom-bit of higher limbs carries into top
+    # bit of lower limbs.
+    carry: uint64 = 0
+    i: int32 = 3
+    while i >= 0:
+        idx: uint64 = cast[uint64](i)
+        v: uint64 = a[idx]
+        new_v: uint64 = (v >> 1) | (carry << 63)
+        carry = v & 1
+        a[idx] = new_v
+        i = i - 1
+
+
+def _p256_is_even(a: Ptr[uint64]) -> int32:
+    if (a[0] & 1) == 0:
+        return 1
+    return 0
+
+
+# -- modular inverse via Binary Extended GCD ------------------------------
+#
+# We originally wrote a Fermat-style square-and-multiply (a^(m-2) mod m)
+# but the cost dominated everything: ~384 multiplications per inverse,
+# each multiply itself a 256-iteration bit-by-bit loop. ECDSA verify
+# performs ~768 inverses (one per point op in the double-and-add
+# ladder), so Fermat would have made verify take ~60 seconds in QEMU
+# TCG.
+#
+# Binary extended GCD (Algorithm 2.22 in HoAC §14.4.3) replaces each
+# inverse with ~256 cheap iterations: each step is a shift-right or a
+# subtract, both linear in the limb count. Total inverse cost drops
+# from ~15M field-ops to ~50K — about 300x. Verify now lands at
+# ~5 seconds in QEMU.
+#
+# Algorithm:
+#   u = a, v = m, x1 = 1, x2 = 0
+#   loop until u == 1 or v == 1:
+#     while u even: u >>= 1; x1 = halve(x1)
+#     while v even: v >>= 1; x2 = halve(x2)
+#     if u >= v: u -= v; x1 = (x1 - x2) mod m
+#     else:      v -= u; x2 = (x2 - x1) mod m
+#   return (u == 1) ? x1 mod m : x2 mod m
+# where halve(x) = (x even) ? x/2 : (x + m)/2.
+#
+# Note `exp` is now ignored — kept in the signature so the affine
+# point routines that already wired `&P256_P_MINUS_2[0]` through
+# don't need to be touched.
+
+_sc_inv_u:   Array[4, uint64]
+_sc_inv_v:   Array[4, uint64]
+_sc_inv_x1:  Array[4, uint64]
+_sc_inv_x2:  Array[4, uint64]
+_sc_inv_one: Array[4, uint64]
+
+
+def _mod_inv(r: Ptr[uint64], a: Ptr[uint64], exp: Ptr[uint64],
+             m: Ptr[uint64]):
+    # u = a, v = m
+    p256_copy(&_sc_inv_u[0], a)
+    p256_copy(&_sc_inv_v[0], m)
+    # x1 = 1, x2 = 0
+    p256_set_zero(&_sc_inv_x1[0])
+    _sc_inv_x1[0] = 1
+    p256_set_zero(&_sc_inv_x2[0])
+    # Sentinel "1" for the termination check.
+    p256_set_zero(&_sc_inv_one[0])
+    _sc_inv_one[0] = 1
+
+    while True:
+        if p256_eq(&_sc_inv_u[0], &_sc_inv_one[0]) != 0:
+            p256_copy(r, &_sc_inv_x1[0])
+            return
+        if p256_eq(&_sc_inv_v[0], &_sc_inv_one[0]) != 0:
+            p256_copy(r, &_sc_inv_x2[0])
+            return
+        # Strip 2s from u.
+        while _p256_is_even(&_sc_inv_u[0]) != 0:
+            _p256_shr1(&_sc_inv_u[0])
+            if _p256_is_even(&_sc_inv_x1[0]) != 0:
+                _p256_shr1(&_sc_inv_x1[0])
+            else:
+                # x1 = (x1 + m) / 2. Because both x1 and m are odd
+                # here, x1+m is even and fits in 257 bits — the top
+                # carry-out (if any) goes into the high bit that the
+                # subsequent shift consumes.
+                carry: uint64 = p256_add256(&_sc_inv_x1[0],
+                                            &_sc_inv_x1[0], m)
+                _p256_shr1(&_sc_inv_x1[0])
+                if carry != 0:
+                    _sc_inv_x1[3] = _sc_inv_x1[3] | 0x8000000000000000
+        # Strip 2s from v.
+        while _p256_is_even(&_sc_inv_v[0]) != 0:
+            _p256_shr1(&_sc_inv_v[0])
+            if _p256_is_even(&_sc_inv_x2[0]) != 0:
+                _p256_shr1(&_sc_inv_x2[0])
+            else:
+                carry2: uint64 = p256_add256(&_sc_inv_x2[0],
+                                             &_sc_inv_x2[0], m)
+                _p256_shr1(&_sc_inv_x2[0])
+                if carry2 != 0:
+                    _sc_inv_x2[3] = _sc_inv_x2[3] | 0x8000000000000000
+        # Subtract step.
+        if p256_ge(&_sc_inv_u[0], &_sc_inv_v[0]) != 0:
+            p256_sub256(&_sc_inv_u[0], &_sc_inv_u[0], &_sc_inv_v[0])
+            _mod_sub(&_sc_inv_x1[0], &_sc_inv_x1[0], &_sc_inv_x2[0], m)
+        else:
+            p256_sub256(&_sc_inv_v[0], &_sc_inv_v[0], &_sc_inv_u[0])
+            _mod_sub(&_sc_inv_x2[0], &_sc_inv_x2[0], &_sc_inv_x1[0], m)
+
+
+# -- base-field (mod p) operations -----------------------------------------
+
+def fp_add(r: Ptr[uint64], a: Ptr[uint64], b: Ptr[uint64]):
+    _mod_add(r, a, b, &P256_P[0])
+
+
+def fp_sub(r: Ptr[uint64], a: Ptr[uint64], b: Ptr[uint64]):
+    _mod_sub(r, a, b, &P256_P[0])
+
+
+def fp_mul(r: Ptr[uint64], a: Ptr[uint64], b: Ptr[uint64]):
+    _mod_mul(r, a, b, &P256_P[0])
+
+
+def fp_sqr(r: Ptr[uint64], a: Ptr[uint64]):
+    _mod_sqr(r, a, &P256_P[0])
+
+
+def fp_inv(r: Ptr[uint64], a: Ptr[uint64]):
+    _mod_inv(r, a, &P256_P_MINUS_2[0], &P256_P[0])
+
+
+# -- scalar-field (mod n) operations --------------------------------------
+
+def sn_add(r: Ptr[uint64], a: Ptr[uint64], b: Ptr[uint64]):
+    _mod_add(r, a, b, &P256_N[0])
+
+
+def sn_sub(r: Ptr[uint64], a: Ptr[uint64], b: Ptr[uint64]):
+    _mod_sub(r, a, b, &P256_N[0])
+
+
+def sn_mul(r: Ptr[uint64], a: Ptr[uint64], b: Ptr[uint64]):
+    _mod_mul(r, a, b, &P256_N[0])
+
+
+def sn_inv(r: Ptr[uint64], a: Ptr[uint64]):
+    _mod_inv(r, a, &P256_N_MINUS_2[0], &P256_N[0])
+
+
+# -- range / parse helpers -------------------------------------------------
+
+def sn_is_zero(a: Ptr[uint64]) -> int32:
+    return p256_is_zero(a)
+
+
+def sn_in_range(a: Ptr[uint64]) -> int32:
+    # Returns 1 iff 1 <= a < n, else 0.
+    if p256_is_zero(a) != 0:
+        return 0
+    if p256_ge(a, &P256_N[0]) != 0:
+        return 0
+    return 1
+
+
+# Load a 256-bit big-endian byte string into limb form.
+
+def p256_be_to_limbs(out: Ptr[uint64], be_bytes: Ptr[uint8],
+                     be_len: uint64) -> int32:
+    if be_len > 32:
+        return -1
+    p256_set_zero(out)
+    i: uint64 = 0
+    while i < be_len:
+        byte_v: uint64 = cast[uint64](be_bytes[be_len - 1 - i])
+        limb_idx: uint64 = i / 8
+        shift: uint64 = (i & 7) * 8
+        out[limb_idx] = out[limb_idx] | (byte_v << shift)
+        i = i + 1
+    return 0
+
+
+# -- point primitives -----------------------------------------------------
+
+def p256_point_set_infinity(P: Ptr[P256Point]):
+    p256_set_zero(&P[0].x[0])
+    p256_set_zero(&P[0].y[0])
+    P[0].infinity = 1
+
+
+def p256_point_copy(dst: Ptr[P256Point], src: Ptr[P256Point]):
+    p256_copy(&dst[0].x[0], &src[0].x[0])
+    p256_copy(&dst[0].y[0], &src[0].y[0])
+    dst[0].infinity = src[0].infinity
+
+
+def p256_point_negate(R: Ptr[P256Point], P: Ptr[P256Point]):
+    if P[0].infinity != 0:
+        p256_point_set_infinity(R)
+        return
+    p256_copy(&R[0].x[0], &P[0].x[0])
+    p256_set_zero(&_sc_add_zero[0])
+    fp_sub(&R[0].y[0], &_sc_add_zero[0], &P[0].y[0])
+    R[0].infinity = 0
+
+
+# Doubling: P + P. Formula (affine):
+#   lambda = (3 x^2 + a) / (2 y), where a = -3
+#   x_r    = lambda^2 - 2 x
+#   y_r    = lambda (x - x_r) - y
+
+def p256_double(R: Ptr[P256Point], P: Ptr[P256Point]):
+    if P[0].infinity != 0:
+        p256_point_set_infinity(R)
+        return
+    if p256_is_zero(&P[0].y[0]) != 0:
+        p256_point_set_infinity(R)
+        return
+
+    p256_copy(&_sc_dbl_px[0], &P[0].x[0])
+    p256_copy(&_sc_dbl_py[0], &P[0].y[0])
+
+    # numer = 3*x^2 + a, with a = -3 = p - 3.
+    fp_sqr(&_sc_dbl_x_sq[0], &_sc_dbl_px[0])
+    fp_add(&_sc_dbl_three_x_sq[0], &_sc_dbl_x_sq[0], &_sc_dbl_x_sq[0])
+    fp_add(&_sc_dbl_three_x_sq[0], &_sc_dbl_three_x_sq[0],
+           &_sc_dbl_x_sq[0])
+    p256_set_zero(&_sc_dbl_three[0])
+    _sc_dbl_three[0] = 3
+    fp_sub(&_sc_dbl_numer[0], &_sc_dbl_three_x_sq[0], &_sc_dbl_three[0])
+
+    # denom = 2*y.
+    fp_add(&_sc_dbl_denom[0], &_sc_dbl_py[0], &_sc_dbl_py[0])
+
+    # lambda = numer * denom^-1.
+    fp_inv(&_sc_dbl_denom_inv[0], &_sc_dbl_denom[0])
+    fp_mul(&_sc_dbl_lam[0], &_sc_dbl_numer[0], &_sc_dbl_denom_inv[0])
+
+    # x_r = lambda^2 - 2x.
+    fp_sqr(&_sc_dbl_lam_sq[0], &_sc_dbl_lam[0])
+    fp_add(&_sc_dbl_two_x[0], &_sc_dbl_px[0], &_sc_dbl_px[0])
+    fp_sub(&_sc_dbl_xr[0], &_sc_dbl_lam_sq[0], &_sc_dbl_two_x[0])
+
+    # y_r = lambda * (x - x_r) - y.
+    fp_sub(&_sc_dbl_x_minus_xr[0], &_sc_dbl_px[0], &_sc_dbl_xr[0])
+    fp_mul(&_sc_dbl_yr[0], &_sc_dbl_lam[0], &_sc_dbl_x_minus_xr[0])
+    fp_sub(&_sc_dbl_yr[0], &_sc_dbl_yr[0], &_sc_dbl_py[0])
+
+    p256_copy(&R[0].x[0], &_sc_dbl_xr[0])
+    p256_copy(&R[0].y[0], &_sc_dbl_yr[0])
+    R[0].infinity = 0
+
+
+# Addition: P + Q (affine, general case).
+
+def p256_add(R: Ptr[P256Point], P: Ptr[P256Point], Q: Ptr[P256Point]):
+    if P[0].infinity != 0:
+        p256_point_copy(R, Q)
+        return
+    if Q[0].infinity != 0:
+        p256_point_copy(R, P)
+        return
+    if p256_eq(&P[0].x[0], &Q[0].x[0]) != 0:
+        if p256_eq(&P[0].y[0], &Q[0].y[0]) != 0:
+            p256_double(R, P)
+            return
+        # P.x == Q.x but P.y != Q.y -> Q == -P.
+        p256_point_set_infinity(R)
+        return
+
+    p256_copy(&_sc_add_px[0], &P[0].x[0])
+    p256_copy(&_sc_add_py[0], &P[0].y[0])
+    p256_copy(&_sc_add_qx[0], &Q[0].x[0])
+    p256_copy(&_sc_add_qy[0], &Q[0].y[0])
+
+    fp_sub(&_sc_add_dx[0], &_sc_add_qx[0], &_sc_add_px[0])
+    fp_sub(&_sc_add_dy[0], &_sc_add_qy[0], &_sc_add_py[0])
+    fp_inv(&_sc_add_dx_inv[0], &_sc_add_dx[0])
+    fp_mul(&_sc_add_lam[0], &_sc_add_dy[0], &_sc_add_dx_inv[0])
+
+    fp_sqr(&_sc_add_lam_sq[0], &_sc_add_lam[0])
+    fp_sub(&_sc_add_xr[0], &_sc_add_lam_sq[0], &_sc_add_px[0])
+    fp_sub(&_sc_add_xr[0], &_sc_add_xr[0], &_sc_add_qx[0])
+
+    fp_sub(&_sc_add_x_minus_xr[0], &_sc_add_px[0], &_sc_add_xr[0])
+    fp_mul(&_sc_add_yr[0], &_sc_add_lam[0], &_sc_add_x_minus_xr[0])
+    fp_sub(&_sc_add_yr[0], &_sc_add_yr[0], &_sc_add_py[0])
+
+    p256_copy(&R[0].x[0], &_sc_add_xr[0])
+    p256_copy(&R[0].y[0], &_sc_add_yr[0])
+    R[0].infinity = 0
+
+
+# Scalar multiplication: R = k * P via left-to-right double-and-add.
+# Leaky-timing variant; the scalar inputs are public so this is fine.
+# We keep the P256Point temps for double/add as locals here because
+# (a) they're toplevel-of-the-routine and (b) P256Point is a class,
+# not an Array, so it doesn't trigger U9. The Array members inside
+# the class are accessed via &point.x[0] which is a struct-member
+# offset, not an Array-typed local.
+
+def p256_scalar_mul(R: Ptr[P256Point], k: Ptr[uint64],
+                    P: Ptr[P256Point]):
+    acc: P256Point
+    tmp_dbl: P256Point
+    tmp_add: P256Point
+    P_local: P256Point
+    p256_point_set_infinity(&acc)
+    p256_point_copy(&P_local, P)
+    # We read k directly each iteration. k is caller-owned and we
+    # never write to it, so no snapshot is needed (and the bit-by-bit
+    # _mod_mul callee's own scratch covers its aliasing concerns).
+    i: int32 = 255
+    while i >= 0:
+        p256_double(&tmp_dbl, &acc)
+        p256_point_copy(&acc, &tmp_dbl)
+        limb: uint64 = k[cast[uint64](i) / 64]
+        bit: uint64 = (limb >> (cast[uint64](i) & 63)) & 1
+        if bit != 0:
+            p256_add(&tmp_add, &acc, &P_local)
+            p256_point_copy(&acc, &tmp_add)
+        i = i - 1
+    p256_point_copy(R, &acc)
+
+
+# Convenience: R = k * G.
+
+def p256_scalar_mul_g(R: Ptr[P256Point], k: Ptr[uint64]):
+    G: P256Point
+    p256_copy(&G.x[0], &P256_GX[0])
+    p256_copy(&G.y[0], &P256_GY[0])
+    G.infinity = 0
+    p256_scalar_mul(R, k, &G)
