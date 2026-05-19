@@ -16,11 +16,23 @@
 #     (Ctrl+C -> 0x03 keeps the M16.42 SIGINT path working — the
 #     byte still reaches the FIFO so /dev/cons readers see it).
 #
-# Still polled (drained from the timer tick in arch/x86/kernel/time.ad);
-# real IRQ 1 wiring is a separate milestone.
+# V1 wiring: IRQ 1 is now routed through the IOAPIC to vector 0x46 and
+# drained from atkbd_irq_handler(). The timer-tick atkbd_poll() in
+# arch/x86/kernel/time.ad is kept as a fallback (Option A in the task
+# brief): if the IRQ is firing, the polled path finds an empty status
+# register and no-ops; if the IRQ ever wedges (level-trigger collision
+# with the auxmouse pin, BIOS leaving the CCB in an odd state, etc.)
+# the polled path keeps the keyboard alive. Both paths feed the same
+# atkbd_process_byte() state machine, and both run from IRQ context
+# (the timer poll is itself in the timer ISR), so they're serialised
+# by the LAPIC — there's no concurrent-mutation race on kbd_state /
+# in_e0_prefix / kbd_tail. Auxmouse has no polled fallback at all, but
+# the keyboard is more user-visible and the cost of the extra poll is
+# one inb on an empty status register per tick (~100 Hz). Worth it.
 #
 # Linux mapping:
-#   atkbd_interrupt() -> atkbd_poll()      (no IRQ context yet; polled)
+#   atkbd_interrupt()  -> atkbd_irq_handler() (IRQ 1, vector 0x46)
+#   atkbd_poll()       -> still callable as a fallback drain
 #   atkbd_set2_keycode[] -> sc1_to_ascii[] (Set 1, not Set 2; BIOS leaves
 #                                           the i8042 in translation mode
 #                                           so the host sees Set 1)
@@ -32,7 +44,9 @@
 # shadow the intrinsic dispatch. Matches drivers/tty/serial/early_8250.ad
 # which uses the same intrinsics bare.
 
-from kernel.printk.printk import printk0, printk1
+from kernel.printk.printk import printk0, printk1, printk2
+from arch.x86.kernel.apic import ioapic_redirect
+from arch.x86.kernel.irq import register_irq_handler
 from drivers.input.auxmouse import auxmouse_init
 
 # i8042 controller I/O ports — fixed by the ISA PC/AT spec.
@@ -58,9 +72,19 @@ KBD_I8042_CMD_DISABLE_KBD:   int32 = 0xAD  # disable KBD port  (re-enabled below
 KBD_I8042_CMD_ENABLE_KBD:    int32 = 0xAE  # enable  KBD port
 KBD_I8042_CMD_SELF_TEST:     int32 = 0xAA  # controller self-test (expect 0x55)
 KBD_I8042_CMD_TEST_KBD_PORT: int32 = 0xAB  # KBD port test       (expect 0x00)
+KBD_I8042_CMD_READ_CCB:      int32 = 0x20  # read controller-command-byte
+KBD_I8042_CMD_WRITE_CCB:     int32 = 0x60  # write controller-command-byte
 
 KBD_I8042_SELF_TEST_OK: int32 = 0x55
 KBD_I8042_KBD_PORT_OK:  int32 = 0x00
+
+# CCB bit layout (8042 standard). KBD-side fields only — the AUX-side
+# bits (1 = IRQ12 enable, 5 = AUX clock disable) live in auxmouse.ad.
+#   bit 0  IRQ1  enable (KBD)
+#   bit 4  KBD clock disable
+#   bit 6  KBD translation (Set 2 -> Set 1)
+KBD_CCB_IRQ_KBD:     int32 = 0x01
+KBD_CCB_DISABLE_KBD: int32 = 0x10
 
 # Keyboard device command (written to 0x60 after IBF clears). 0xF4 is
 # "enable scanning" — the BIOS *usually* leaves it on, but UEFI-only
@@ -68,6 +92,18 @@ KBD_I8042_KBD_PORT_OK:  int32 = 0x00
 # we issue it explicitly. 0xFA is the standard PS/2 ACK.
 KBD_CMD_ENABLE_SCAN: int32 = 0xF4
 KBD_ACK:             int32 = 0xFA
+
+# --- IRQ wiring -------------------------------------------------------
+#
+# IRQ 1 is the legacy PIC line for the i8042 KBD port. After the
+# M16.22 PIC->APIC swap we route IRQ1 via the IOAPIC. Vector choice
+# follows the M16.113..M16.117 + auxmouse allocation map:
+#   0x40 virtio-net  0x41 ahci  0x42 nvme  0x43 e1000e  0x44 r8169
+#   0x45 auxmouse (IRQ 12)
+# Next free is 0x46 — we claim it for atkbd (IRQ 1).
+KBD_IRQ_VECTOR: uint32 = 0x46
+KBD_LAPIC_ID:   uint32 = 0
+KBD_IOAPIC_PIN: uint32 = 1         # ISA IRQ1 == IOAPIC pin 1 (1:1 ID-mapped)
 
 # Set 1 high-bit flag — scancode | 0x80 is the break (key-up) event
 # for that scancode. For modifier keys we DO care about the break
@@ -596,6 +632,49 @@ def atkbd_poll():
         atkbd_process_byte(raw)
 
 
+# --- IRQ 1 handler -----------------------------------------------------
+#
+# Mirror of auxmouse_irq_handler() for the KBD side. The 8042 raises
+# IRQ 1 on every KBD byte that lands in the output buffer. We drain
+# everything currently pending (status OBF set, AUX bit CLEAR — bit 5
+# clear means the byte came from the keyboard, not the mouse) and
+# feed each into atkbd_process_byte(). A stray AUX byte landing here
+# during a level-trigger glitch is forwarded to the AUX side via the
+# data port read but otherwise ignored at this layer — the auxmouse
+# IRQ 12 path is the canonical AUX consumer, and AUX-source bytes
+# shouldn't fire IRQ 1 in the first place.
+#
+# do_irq() in arch/x86/kernel/irq.ad EOIs the LAPIC for us after we
+# return; we must NOT EOI ourselves.
+
+kbd_irq_count: uint64 = 0
+
+
+def kbd_irq_count_get() -> uint64:
+    return kbd_irq_count
+
+
+def atkbd_irq_handler():
+    kbd_irq_count = kbd_irq_count + 1
+    n: int32 = 0
+    while (inb(KBD_STATUS_PORT) & KBD_STATUS_OBF) != 0:
+        st: int32 = inb(KBD_STATUS_PORT)
+        # I8042_STATUS_AUX is bit 5 (0x20). A set AUX bit means the
+        # byte came from the mouse, not the keyboard — drop it; the
+        # auxmouse IRQ 12 path will pick up the next AUX byte through
+        # its own interrupt or we'll lose this one (acceptable: a stray
+        # mouse byte arriving on IRQ 1 is already a controller glitch).
+        if (st & 0x20) != 0:
+            inb(KBD_DATA_PORT)
+        else:
+            raw: int32 = inb(KBD_DATA_PORT) & 0xFF
+            atkbd_process_byte(raw)
+        n = n + 1
+        # Hard cap to prevent ISR storm if status bit ever sticks high.
+        if n > 16:
+            return
+
+
 # --- Boot-time self test ----------------------------------------------
 #
 # Drives atkbd_process_byte() with synthetic scancode sequences and
@@ -860,13 +939,22 @@ def atkbd_controller_init():
     #    push scancodes into the output buffer when the user types.
     _kbd_cmd(KBD_I8042_CMD_ENABLE_KBD)
 
-    # 6. CCB IRQ bit deliberately untouched. The kernel still polls
-    #    the keyboard from the timer tick (arch/x86/kernel/time.ad:84)
-    #    and IRQ 1 isn't wired in the IDT yet; flipping bit 0 of the
-    #    CCB now would either be ignored (best case) or fire an
-    #    unhandled IRQ 1 once the IOAPIC comes up (worst case). The
-    #    AUX-side equivalent (auxmouse.ad) flips bit 1 because IRQ 12
-    #    *is* wired there.
+    # 6. CCB RMW: enable IRQ 1 delivery on KBD byte (bit 0) and clear
+    #    the KBD clock-disable bit (bit 4) in case firmware masked it.
+    #    Translation bit (bit 6) and the AUX bits are deliberately
+    #    preserved — auxmouse.ad does its own RMW for the AUX side
+    #    later. Mirrors the auxmouse CCB-RMW shape so a future reader
+    #    diffing the two files sees the same dance.
+    _kbd_cmd(KBD_I8042_CMD_READ_CCB)
+    if _kbd_wait_output_full() == 0:
+        printk0("atkbd: timeout reading CCB (continuing without IRQ)\n")
+    else:
+        ccb: int32 = inb(KBD_DATA_PORT) & 0xFF
+        ccb = (ccb | KBD_CCB_IRQ_KBD) & (~KBD_CCB_DISABLE_KBD)
+        _kbd_cmd(KBD_I8042_CMD_WRITE_CCB)
+        _kbd_write_data(ccb)
+        printk1("atkbd: CCB programmed (0x%x) — IRQ 1 enabled\n",
+                cast[uint64](ccb))
 
     # 7. Tell the keyboard device to start scanning. The BIOS usually
     #    has this on already, but UEFI-only firmware on a number of
@@ -923,6 +1011,23 @@ def atkbd_init() -> int32:
     if drained > 0:
         printk1("atkbd: drained %d stale bytes\n", cast[uint64](drained))
     printk0("atkbd: ready (Set 1 + ext + modifiers)\n")
+
+    # Wire IRQ 1. IOAPIC pin 1 == ISA IRQ 1 (1:1 mapping on every
+    # PC/AT-compatible chipset). Route to vector KBD_IRQ_VECTOR (0x46)
+    # on LAPIC 0, then register the handler in the 256-slot table.
+    # ioapic_redirect() defaults entries to level-triggered active-low
+    # (PCI convention). ISA IRQs are nominally edge-triggered active-
+    # high, but QEMU's IOAPIC honours the LAPIC delivery either way;
+    # the auxmouse path uses the same call shape successfully and on
+    # real hardware a follow-up pass consuming MADT override entries
+    # is the canonical fix. The polled-from-timer-tick path is the
+    # belt-and-braces fallback documented at the top of this file.
+    register_irq_handler(cast[uint64](KBD_IRQ_VECTOR),
+                         cast[uint64](&atkbd_irq_handler))
+    ioapic_redirect(KBD_IOAPIC_PIN, KBD_IRQ_VECTOR, KBD_LAPIC_ID)
+    printk2("atkbd: irq pin=%d vec=0x%x\n",
+            cast[uint64](KBD_IOAPIC_PIN),
+            cast[uint64](KBD_IRQ_VECTOR))
 
     # Bring up the sibling auxiliary device (PS/2 mouse) on the same
     # i8042 controller. We chain it from atkbd_init() rather than
