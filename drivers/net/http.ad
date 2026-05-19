@@ -168,6 +168,27 @@ http_5xx:         uint64 = 0
 http_bytes_in:    uint64 = 0
 
 
+# --- 3xx redirect-follow state -----------------------------------------
+# Real-world `deb.debian.org` 302s to geo mirrors; without redirect
+# following the apt fetch path stops at the first hop. We implement RFC
+# 7231 §7.1.2 + RFC 3986 §5 absolute-URL Location handling here.
+#
+# `http_location_buf` holds the Location: header value extracted from
+# the most recent 3xx response (NUL-terminated, V0 supports absolute
+# URLs only). `http_visited_buf` is a tiny ring of NUL-terminated URLs
+# the redirect loop has already fetched, used for cycle detection per
+# the spec ("reject revisits"). Up to HTTP_MAX_REDIRECTS entries at
+# HTTP_URL_MAX bytes each — bounded so the inner loop can't spin
+# forever on a malicious chain.
+HTTP_MAX_REDIRECTS:  uint64 = 10
+HTTP_URL_MAX:        uint64 = 512
+http_location_buf:   Array[512, uint8]
+http_location_len:   uint64 = 0
+http_location_set:   int32 = 0
+http_visited_buf:    Array[5120, uint8]   # 10 * 512
+http_visited_count:  uint64 = 0
+
+
 def _http_strlen(s: Ptr[uint8]) -> uint64:
     # Walk a NUL-terminated C string and return its length. Adder
     # doesn't ship a libc strlen, but every consumer of Ptr[uint8]
@@ -745,6 +766,149 @@ def _http_extract_gzip_ce(buf: Ptr[uint8], hdrs_start: uint64,
     return 0
 
 
+def _http_extract_location(buf: Ptr[uint8], hdrs_start: uint64,
+                           hdrs_end: uint64) -> int32:
+    # Walk the header block for a case-insensitive `Location:` line per
+    # RFC 7231 §7.1.2. The value lives between the colon and the line's
+    # \r\n; we strip leading OWS (SP/HT) and reject embedded control
+    # characters. The extracted URL is written NUL-terminated into the
+    # module-level `http_location_buf` and `http_location_set` flips to
+    # 1. Returns 1 on a clean extraction, 0 if no Location header was
+    # found, -1 on malformed value (control char, oversize).
+    #
+    # V0 stores the value verbatim and lets the redirect loop reject
+    # anything that isn't an absolute URL — RFC 3986 §5 relative-URL
+    # resolution is out of scope for this commit (the spec calls out
+    # `V0 implement absolute URLs only`).
+    needle: Ptr[uint8] = "location:"
+    needle_len: uint64 = 9
+    pos: uint64 = hdrs_start
+    http_location_set = 0
+    http_location_len = 0
+    while pos < hdrs_end:
+        line_start: uint64 = pos
+        while pos < hdrs_end:
+            if buf[pos] == 0x0A:              # '\n'
+                break
+            pos = pos + 1
+        line_end: uint64 = pos
+        if line_end > line_start:
+            if buf[line_end - 1] == 0x0D:
+                line_end = line_end - 1
+        line_len: uint64 = line_end - line_start
+        line_buf: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](buf) + line_start)
+        if _http_buf_starts_with_ci(line_buf, line_len,
+                                    needle, needle_len) == 1:
+            # Skip "Location:" then leading OWS.
+            vp: uint64 = needle_len
+            while vp < line_len:
+                c: uint8 = line_buf[vp]
+                if c == 0x20:
+                    vp = vp + 1
+                elif c == 0x09:
+                    vp = vp + 1
+                else:
+                    break
+            val_len: uint64 = line_len - vp
+            if val_len == 0:
+                printk0("[http] Location: empty value\n")
+                return -1
+            if val_len >= HTTP_URL_MAX:
+                printk0("[http] Location: value too long for redirect buf\n")
+                return -1
+            # Reject control characters in the value. RFC 7230 §3.2.6
+            # says field-content excludes %x00-1F / %x7F (HT excepted
+            # but already consumed as OWS). Any leftover control byte
+            # here is either header smuggling or a buggy server.
+            k: uint64 = 0
+            while k < val_len:
+                cc: uint8 = line_buf[vp + k]
+                if cc < 0x20:
+                    printk0("[http] Location: control char in value\n")
+                    return -1
+                if cc == 0x7F:
+                    printk0("[http] Location: DEL in value\n")
+                    return -1
+                http_location_buf[k] = cc
+                k = k + 1
+            http_location_buf[val_len] = 0
+            http_location_len = val_len
+            http_location_set = 1
+            return 1
+        if pos < hdrs_end:
+            pos = pos + 1
+    return 0
+
+
+def _http_url_streq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    # NUL-terminated case-sensitive string compare. Returns 1 on match,
+    # 0 otherwise. Used by the visited-URL cycle detector — the URL we
+    # store is whatever the server sent, byte-for-byte, so exact match
+    # is the right check (an attacker can't bypass detection by
+    # varying case without re-resolving to a different origin anyway).
+    i: uint64 = 0
+    while True:
+        ca: uint8 = a[i]
+        cb: uint8 = b[i]
+        if ca != cb:
+            return 0
+        if ca == 0:
+            return 1
+        i = i + 1
+    return 0
+
+
+def _http_visited_check(url: Ptr[uint8]) -> int32:
+    # Returns 1 if `url` already appears in the visited ring (cycle),
+    # 0 otherwise. The ring is a flat byte buffer with up to
+    # HTTP_MAX_REDIRECTS NUL-terminated URL slots laid out
+    # back-to-back, each slot HTTP_URL_MAX bytes wide.
+    i: uint64 = 0
+    while i < http_visited_count:
+        slot_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](&http_visited_buf[0]) + i * HTTP_URL_MAX)
+        if _http_url_streq(slot_ptr, url) == 1:
+            return 1
+        i = i + 1
+    return 0
+
+
+def _http_visited_add(url: Ptr[uint8]) -> int32:
+    # Append `url` to the visited ring. Returns 0 on success, -1 if
+    # the URL is longer than a slot or the ring is full. The cycle
+    # check below `_http_visited_check` runs BEFORE the add so a
+    # full-ring + cycle situation surfaces as a cycle rather than a
+    # spurious capacity error.
+    if http_visited_count >= HTTP_MAX_REDIRECTS:
+        return -1
+    ulen: uint64 = _http_strlen(url)
+    if ulen >= HTTP_URL_MAX:
+        return -1
+    slot_off: uint64 = http_visited_count * HTTP_URL_MAX
+    i: uint64 = 0
+    while i < ulen:
+        http_visited_buf[slot_off + i] = url[i]
+        i = i + 1
+    http_visited_buf[slot_off + ulen] = 0
+    http_visited_count = http_visited_count + 1
+    return 0
+
+
+def _http_url_scheme_is_https(url: Ptr[uint8]) -> int32:
+    # Returns 1 if `url` starts with `https://` (case-insensitive),
+    # 0 for `http://`, -1 if it has neither prefix (rejected as a
+    # non-absolute Location per the V0 scope note).
+    ulen: uint64 = _http_strlen(url)
+    https_pfx: Ptr[uint8] = "https://"
+    http_pfx:  Ptr[uint8] = "http://"
+    if _http_buf_starts_with_ci(url, ulen, https_pfx, 8) == 1:
+        return 1
+    if _http_buf_starts_with_ci(url, ulen, http_pfx, 7) == 1:
+        return 0
+    return -1
+
+
 def _http_emit_body(src: Ptr[uint8], src_len: uint64,
                     out_buf: Ptr[uint8], out_max: uint64,
                     body_written_p: Ptr[uint64],
@@ -1110,8 +1274,16 @@ def http_init():
     printk0("http: client initialized (HTTP/1.1, GET + gzip)\n")
 
 
-def http_get(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
-             status_out: Ptr[int32]) -> int64:
+def _http_get_once(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
+                   status_out: Ptr[int32]) -> int64:
+    # Single-hop HTTP/1.1 GET — the original http_get body, factored
+    # out so the new public http_get / https_get wrappers can drive a
+    # redirect-follow loop on top. On any 3xx response the function
+    # ALSO extracts the Location: header into the module-level
+    # http_location_buf (flipping http_location_set=1) and returns
+    # 0 body bytes; the wrapper checks status_out + http_location_set
+    # to decide whether to recurse.
+    #
     # End-to-end HTTP/1.1 GET:
     #   1. Parse the URL into (host, port, path).
     #   2. Resolve host -> IPv4 via dns_lookup.
@@ -1125,6 +1297,8 @@ def http_get(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
     #   6. tcp_close. Return body bytes written.
     http_requests = http_requests + 1
     status_out[0] = 0
+    http_location_set = 0
+    http_location_len = 0
 
     if url == cast[Ptr[uint8]](0):
         return -1
@@ -1287,6 +1461,42 @@ def http_get(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
                     hp = hp + 1
                 if found_end == 1:
                     head_done = 1
+                    # 3xx redirect: extract the Location: header value
+                    # into the module-level scratch buffer so the
+                    # http_get / https_get wrapper can decide whether
+                    # to chase it. We bail BEFORE the gzip/chunked
+                    # detection — redirect bodies are uninteresting
+                    # (typically an apology HTML page) and a real apt
+                    # client just discards them. RFC 7231 §6.4
+                    # enumerates the 3xx codes; we follow 301/302/303/
+                    # 307/308 the same way (all as GET since this
+                    # module is GET-only).
+                    rd_code: int32 = status_out[0]
+                    is_3xx: int32 = 0
+                    if rd_code == 301:
+                        is_3xx = 1
+                    if rd_code == 302:
+                        is_3xx = 1
+                    if rd_code == 303:
+                        is_3xx = 1
+                    if rd_code == 307:
+                        is_3xx = 1
+                    if rd_code == 308:
+                        is_3xx = 1
+                    if is_3xx == 1:
+                        loc_rc: int32 = _http_extract_location(
+                            rx_ptr, hdr_scan_start, end_off)
+                        if loc_rc < 0:
+                            tcp_close(slot)
+                            return -1
+                        if loc_rc == 1:
+                            printk1("[http] %d redirect; Location captured\n",
+                                    cast[uint64](rd_code))
+                        else:
+                            printk1("[http] %d redirect with no Location header\n",
+                                    cast[uint64](rd_code))
+                        tcp_close(slot)
+                        return 0
                     # V6: Content-Encoding: gzip detection has to land
                     # BEFORE the chunked branch so the chunked
                     # decoder's data-copy block can route bytes
@@ -1585,9 +1795,15 @@ def _https_parse_ipv4(host: Ptr[uint8], out_ip: Ptr[uint8]) -> int32:
     return 0
 
 
-def https_get(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
-              status_out: Ptr[int32]) -> int64:
-    # Mirror of http_get for `https://` URLs. End-to-end HTTPS/1.1 GET:
+def _https_get_once(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
+                    status_out: Ptr[int32]) -> int64:
+    # Single-hop HTTPS GET — the original https_get body, factored out
+    # to match the http_get refactor. On a 3xx response the Location:
+    # header is extracted into http_location_buf the same way as
+    # _http_get_once and the function returns 0 body bytes so the
+    # wrapper can chase the redirect.
+    #
+    # End-to-end HTTPS/1.1 GET:
     #   1. Parse the URL into (host, port, path).
     #   2. DNS lookup -> IPv4.
     #   3. tcp_connect.
@@ -1602,6 +1818,8 @@ def https_get(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
     # failure. status_out carries the numeric HTTP status.
     tls_init()
     status_out[0] = 0
+    http_location_set = 0
+    http_location_len = 0
     if url == cast[Ptr[uint8]](0):
         return -1
     if out_buf == cast[Ptr[uint8]](0):
@@ -1733,6 +1951,36 @@ def https_get(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
                     hp = hp + 1
                 if found_end == 1:
                     head_done = 1
+                    # 3xx redirect: extract Location: into the shared
+                    # http_location_buf — mirrors _http_get_once so
+                    # the wrapper can drive the redirect-follow loop
+                    # over a TLS hop.
+                    rd_code: int32 = status_out[0]
+                    is_3xx: int32 = 0
+                    if rd_code == 301:
+                        is_3xx = 1
+                    if rd_code == 302:
+                        is_3xx = 1
+                    if rd_code == 303:
+                        is_3xx = 1
+                    if rd_code == 307:
+                        is_3xx = 1
+                    if rd_code == 308:
+                        is_3xx = 1
+                    if is_3xx == 1:
+                        loc_rc: int32 = _http_extract_location(
+                            rx_ptr, hdr_scan_start, end_off)
+                        if loc_rc < 0:
+                            tls_close()
+                            return -1
+                        if loc_rc == 1:
+                            printk1("[https] %d redirect; Location captured\n",
+                                    cast[uint64](rd_code))
+                        else:
+                            printk1("[https] %d redirect with no Location header\n",
+                                    cast[uint64](rd_code))
+                        tls_close()
+                        return 0
                     # V6: gzip detection lands before the chunked
                     # branch so the chunked decoder's inner data-copy
                     # block can route bytes through inflate_feed.
@@ -1851,3 +2099,145 @@ def https_get(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
     printk2("[https] GET complete: status=%d body=%d bytes\n",
             cast[uint64](status_out[0]), body_written)
     return cast[int64](body_written)
+
+
+# ---------------------------------------------------------------------------
+# Public http_get / https_get: redirect-following wrappers around the
+# single-hop _http_get_once / _https_get_once. Real-world hosts like
+# deb.debian.org 302 to geo mirrors; without these loops apt stops at
+# the first hop.
+#
+# RFC 7231 §6.4 enumerates the 3xx codes — we follow 301/302/303/307/308.
+# Since this module is GET-only the method-preservation rules of 307/308
+# are trivially honoured (we always re-issue as GET).
+#
+# Cycle detection: every URL we fetch goes into a small visited ring;
+# revisits are rejected with -1 + a printk so a poorly-configured server
+# pair can't pin the kernel in an infinite chase.
+#
+# TLS safety: https:// -> http:// redirects are rejected per the agent
+# spec — a downgrade to plaintext is exactly the kind of silent
+# weakening an attacker could exploit, and apt's mirror chain never
+# legitimately downgrades. http:// -> https:// is permitted (an
+# UPGRADE; the dispatcher hands off to _https_get_once).
+# ---------------------------------------------------------------------------
+
+
+def _http_fetch_url(url: Ptr[uint8], out_buf: Ptr[uint8],
+                    out_max: uint64, status_out: Ptr[int32]) -> int64:
+    # Scheme dispatch — pick _https_get_once or _http_get_once based on
+    # the URL prefix. Returns whatever the inner function returned;
+    # status_out + http_location_set are populated as side effects.
+    sch: int32 = _http_url_scheme_is_https(url)
+    if sch == 1:
+        return _https_get_once(url, out_buf, out_max, status_out)
+    if sch == 0:
+        return _http_get_once(url, out_buf, out_max, status_out)
+    printk0("[http] redirect Location is not an absolute http(s) URL\n")
+    return -1
+
+
+def http_get(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
+             status_out: Ptr[int32]) -> int64:
+    # Redirect-following wrapper over _http_get_once. Caller passes an
+    # http:// URL; we follow up to HTTP_MAX_REDIRECTS hops, with cycle
+    # detection via the visited-URL ring. http:// -> https:// is a
+    # permitted scheme upgrade.
+    if url == cast[Ptr[uint8]](0):
+        return -1
+    sch0: int32 = _http_url_scheme_is_https(url)
+    if sch0 == 1:
+        # Preserve the original contract: http_get refuses https URLs.
+        # Callers wanting TLS should call https_get directly.
+        printk0("[http] HTTPS not supported via http_get (call https_get)\n")
+        return -1
+    # Tolerate URLs without an explicit scheme (the original parser
+    # treats them as http://). sch0 == -1 falls through here.
+
+    http_visited_count = 0
+    cur_url: Ptr[uint8] = url
+    n_hops: uint64 = 0
+    while n_hops <= HTTP_MAX_REDIRECTS:
+        if _http_visited_check(cur_url) == 1:
+            printk0("[http] redirect cycle detected; rejecting\n")
+            return -1
+        if _http_visited_add(cur_url) != 0:
+            printk0("[http] visited-URL ring full or URL too long\n")
+            return -1
+        # First hop always uses _http_get_once (caller asked for
+        # http_get and we already rejected an https:// initial URL
+        # above). Subsequent hops dispatch by scheme of the redirect
+        # target.
+        n: int64 = 0
+        if n_hops == 0:
+            n = _http_get_once(cur_url, out_buf, out_max, status_out)
+        else:
+            n = _http_fetch_url(cur_url, out_buf, out_max, status_out)
+        if n < 0:
+            return -1
+        # If the single-hop didn't flag a redirect, we have the body —
+        # return it. Status-class counters were already bumped inside
+        # _http_get_once / _https_get_once.
+        if http_location_set == 0:
+            return n
+        # 3xx + Location: validate scheme and either chase or reject.
+        new_url: Ptr[uint8] = cast[Ptr[uint8]](&http_location_buf[0])
+        new_sch: int32 = _http_url_scheme_is_https(new_url)
+        if new_sch < 0:
+            # V0 supports absolute URLs only (RFC 3986 §5
+            # relative-reference resolution is out of scope). A
+            # Location with a relative or absolute-path-only value
+            # bails so a follow-up can land the base-URL resolver
+            # cleanly.
+            printk0("[http] non-absolute Location not supported in V0\n")
+            return -1
+        # Initial scheme was http://. http -> https UPGRADE is fine.
+        cur_url = new_url
+        n_hops = n_hops + 1
+    printk1("[http] too many redirects (>%d)\n",
+            cast[uint64](HTTP_MAX_REDIRECTS))
+    return -1
+
+
+def https_get(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
+              status_out: Ptr[int32]) -> int64:
+    # Redirect-following wrapper over _https_get_once. https:// ->
+    # http:// is REJECTED as a TLS downgrade (the spec calls this
+    # out explicitly). https:// -> https:// chases normally.
+    if url == cast[Ptr[uint8]](0):
+        return -1
+    sch0: int32 = _http_url_scheme_is_https(url)
+    if sch0 != 1:
+        printk0("[https] URL doesn't start with https://\n")
+        return -1
+    http_visited_count = 0
+    cur_url: Ptr[uint8] = url
+    n_hops: uint64 = 0
+    while n_hops <= HTTP_MAX_REDIRECTS:
+        if _http_visited_check(cur_url) == 1:
+            printk0("[https] redirect cycle detected; rejecting\n")
+            return -1
+        if _http_visited_add(cur_url) != 0:
+            printk0("[https] visited-URL ring full or URL too long\n")
+            return -1
+        n: int64 = _https_get_once(cur_url, out_buf, out_max, status_out)
+        if n < 0:
+            return -1
+        if http_location_set == 0:
+            return n
+        new_url: Ptr[uint8] = cast[Ptr[uint8]](&http_location_buf[0])
+        new_sch: int32 = _http_url_scheme_is_https(new_url)
+        if new_sch < 0:
+            printk0("[https] non-absolute Location not supported in V0\n")
+            return -1
+        if new_sch == 0:
+            # https -> http is a TLS downgrade. Print the orig + new
+            # URLs so the operator can spot a misconfigured mirror.
+            printk2("[http] downgrade redirect rejected: %s -> %s\n",
+                    cast[uint64](cur_url), cast[uint64](new_url))
+            return -1
+        cur_url = new_url
+        n_hops = n_hops + 1
+    printk1("[https] too many redirects (>%d)\n",
+            cast[uint64](HTTP_MAX_REDIRECTS))
+    return -1

@@ -96,6 +96,20 @@ if os.environ.get("ENABLE_TCP_FIN_WAIT2_SMOKE") == "1":
 if os.environ.get("ENABLE_DHCP_RENEW_SMOKE") == "1":
     FILES.append(("/etc/dhcp-renew-test", b"1\n"))
 
+# HTTP 3xx redirect-follow smoke. Gated the same way as the markers
+# above. scripts/test_net_http_redirect.sh stands up a Python HTTP
+# server that 302s to a same-host /final endpoint serving "hello";
+# init/main.ad's http_redirect_smoke_test exercises the kernel's
+# redirect-follow loop end-to-end. Default boot omits the marker so
+# unrelated test runs don't try to reach 10.0.2.200:80.
+if os.environ.get("ENABLE_HTTP_REDIRECT_SMOKE") == "1":
+    FILES.append(("/etc/http-redirect-test", b"1\n"))
+    # The unconditional https://example.com leg in net_smoke_test
+    # traps mid-handshake on the AES-256-GCM record (separate
+    # residual; same defence the gzip/finwait2 markers apply); skip
+    # it so the kernel reaches the redirect smoke below.
+    FILES.append(("/etc/skip-https-internet-smoke", b"1\n"))
+
 # V5 cert validation: bake the production ISRG Root X1 anchor into the
 # initramfs at /etc/tls-ca-isrg-x1.der whenever the host has it
 # installed. drivers/net/tls.ad's _tls_validation_init() walks the cpio
