@@ -99,6 +99,33 @@ PGT_1GB_SHIFT: uint64 = 30
 # PDPT has 512 entries → 512 GiB maximum coverage with 1 GiB pages.
 PGT_PDPT_ENTRIES: uint64 = 512
 
+# Multiboot1 mmap entry-type codes (mirrors arch/x86/kernel/e820.ad's
+# MMAP_TYPE_* constants). Kept inline so the per-entry diagnostic log
+# line in pgtable_extend_from_e820 doesn't have to import e820's
+# private surface.
+PGT_MMAP_TYPE_RESERVED:     uint64 = 2
+PGT_MMAP_TYPE_ACPI_RECLAIM: uint64 = 3
+PGT_MMAP_TYPE_NVS:          uint64 = 4
+PGT_MMAP_TYPE_BAD:          uint64 = 5
+
+
+def _pgtable_type_name(t: uint64) -> Ptr[char]:
+    # Short 4-char identifier for the per-entry log line. Matches the
+    # _type_name() helper in arch/x86/kernel/e820.ad so a side-by-side
+    # diff of the two log streams is readable in a real-hardware boot
+    # capture.
+    if t == PGT_MMAP_TYPE_RAM:
+        return "RAM "
+    if t == PGT_MMAP_TYPE_RESERVED:
+        return "RSVD"
+    if t == PGT_MMAP_TYPE_ACPI_RECLAIM:
+        return "ACPI"
+    if t == PGT_MMAP_TYPE_NVS:
+        return "NVS "
+    if t == PGT_MMAP_TYPE_BAD:
+        return "BAD "
+    return "????"
+
 
 def _pgtable_pdpt_base() -> uint64:
     # Locate the live PDPT by reading CR3 -> PML4 -> PML4[0] -> PDPT
@@ -140,9 +167,24 @@ def pgtable_extend_from_e820():
     # nothing to extend: the existing 4 GiB identity map already
     # covers every memblock byte. Return early and emit a log line
     # so the absence is visible.
+    #
+    # ALSO dump the live PDPT base + current 1 GiB coverage on this
+    # branch so a UEFI real-hardware capture shows the same shape of
+    # diagnostic as the multiboot1 path. Without this, a UEFI hang
+    # diagnosed via serial console can't be told apart from "we
+    # silently skipped extension" vs. "extension ran and produced
+    # bogus entries".
     magic: uint64 = get_mb_magic()
     if magic != PGT_MB_MAGIC:
         printk0("[pgtable] no multiboot1 mmap; identity map unchanged\n")
+        pdpt_base_efi: uint64 = _pgtable_pdpt_base()
+        printk1("[pgtable] EFI/no-mb: pdpt_base=%p\n", pdpt_base_efi)
+        i_efi: uint64 = 0
+        while i_efi < 8:
+            slot_addr: uint64 = pdpt_base_efi + i_efi * 8
+            entry: uint64 = cast[Ptr[uint64]](slot_addr)[0]
+            printk2("[pgtable] EFI/no-mb: pdpt[%d]=%p\n", i_efi, entry)
+            i_efi = i_efi + 1
         return
 
     info: uint64 = get_mb_info()
@@ -166,6 +208,7 @@ def pgtable_extend_from_e820():
     # when memory > 4 GiB is present).
     total_ram_bytes: uint64 = 0
     new_entries:     uint64 = 0
+    entry_idx:       uint64 = 0
 
     pos: uint64 = mmap_addr
     end: uint64 = mmap_addr + mmap_length
@@ -174,6 +217,21 @@ def pgtable_extend_from_e820():
         base:       uint64 = cast[Ptr[uint64]](pos + 4)[0]
         length:     uint64 = cast[Ptr[uint64]](pos + 12)[0]
         type_code:  uint64 = cast[uint64](cast[Ptr[uint32]](pos + 20)[0])
+
+        # Per-entry diagnostic: dump every walked e820 record with its
+        # type tag and chosen action (map / skip). On real hardware the
+        # serial log shows exactly which firmware-reported regions we
+        # consumed vs. ignored. Reading this back tells us at a glance
+        # whether (a) the firmware advertised any RAM above 4 GiB at
+        # all, (b) we mapped the regions we should have, and (c) we
+        # left Reserved/MMIO/ACPI alone (NOT pulling those into the
+        # 1 GiB-page identity window — they'd mask real RAM otherwise).
+        printk2("[pgtable] e820[%d] base=%p ", entry_idx, base)
+        printk2("len=%p type=%d ", length, type_code)
+        if type_code == PGT_MMAP_TYPE_RAM:
+            printk1("(%s) action=map\n", cast[uint64](_pgtable_type_name(type_code)))
+        else:
+            printk1("(%s) action=skip\n", cast[uint64](_pgtable_type_name(type_code)))
 
         if type_code == PGT_MMAP_TYPE_RAM:
             total_ram_bytes = total_ram_bytes + length
@@ -196,6 +254,7 @@ def pgtable_extend_from_e820():
                 cur = cur + PGT_1GB
 
         pos = pos + entry_size + 4
+        entry_idx = entry_idx + 1
 
     # If we actually added new entries, flush the TLB. x86 page-walkers
     # don't cache absent entries, so this is defensive — costs < 1 μs
@@ -209,3 +268,129 @@ def pgtable_extend_from_e820():
     total_gb: uint64 = (total_ram_bytes + PGT_1GB - 1) >> PGT_1GB_SHIFT
     printk2("[pgtable] extended identity map: %d GiB total RAM via e820 (+%d new 1GiB entries)\n",
             total_gb, new_entries)
+
+
+# --- pgtable_walk / pgtable_assert_mapped --------------------------
+#
+# Diagnostic page-table walker. Given a virtual address, walks the
+# active page tables (CR3 -> PML4 -> PDPT -> [PD -> PT]) and returns
+# either the leaf entry (with its flags in the low 12 bits) or 0 if
+# any level along the way is not-present.
+#
+# Why we need this:
+#   The first kmalloc inside p9_smoke_test()'s pipe_alloc has been
+#   the silent-hang point on Asus UEFI real hardware. The symptom is
+#   "kernel writes [p9smoke] start, never writes [p9smoke] pipes
+#   tx=N rx=N". If pipe_alloc's kmalloc returns a physical address
+#   whose backing 1 GiB / 2 MiB page isn't actually present in the
+#   live page tables, the very next instruction that touches the
+#   returned pointer faults #PF (vector 0x0e), and because we have
+#   no productive kernel-mode #PF handler the box triple-faults
+#   into the firmware reset path — silent hang from the serial
+#   console's perspective.
+#
+#   pgtable_walk() is the post-mortem: call it on the suspect
+#   address BEFORE the first store/load, log the result, and the
+#   serial capture tells us whether the mapping exists. A non-zero
+#   return with the P bit set means "mapped" — anything else is the
+#   smoking gun.
+#
+# Return-value encoding:
+#   0                          - not mapped at any level (P=0 found)
+#   non-zero & PGT_FLAG_P == 0 - shouldn't happen (defensive: any
+#                                non-zero return guarantees P=1
+#                                because we only return on P=1)
+#   non-zero & PGT_FLAG_PS != 0 - leaf was a huge page (1 GiB at
+#                                 PDPT level or 2 MiB at PD level);
+#                                 the high bits hold the page's
+#                                 physical base, the low 12 bits
+#                                 hold the leaf flags.
+#   non-zero & PGT_FLAG_PS == 0 - leaf was a 4 KiB PTE; ordinary
+#                                 page-table walk result.
+#
+# We deliberately use the SAME PGT_ADDR_MASK we use everywhere else
+# in this file so behavioural drift between extension-time and
+# walk-time is impossible. Intel SDM Vol 3A §4.5 confirms bits
+# 12..M-1 (M typically 52) hold the physical frame for every level.
+PGT_FLAG_PS_BIT: uint64 = 0x80         # bit 7 — PS for huge pages
+
+def pgtable_walk(va: uint64) -> uint64:
+    # 4-level page walk. PML4 -> PDPT -> PD -> PT, with early-out on
+    # huge-page PS bits at PDPT (1 GiB) or PD (2 MiB) level.
+    pml4_idx: uint64 = (va >> 39) & 0x1FF
+    pdpt_idx: uint64 = (va >> 30) & 0x1FF
+    pd_idx:   uint64 = (va >> 21) & 0x1FF
+    pt_idx:   uint64 = (va >> 12) & 0x1FF
+
+    cr3:   uint64 = get_bsp_cr3()
+    pml4:  uint64 = cr3 & PGT_ADDR_MASK
+    pml4e: uint64 = cast[Ptr[uint64]](pml4 + pml4_idx * 8)[0]
+    if (pml4e & PGT_FLAG_P) == 0:
+        return 0
+
+    pdpt:  uint64 = pml4e & PGT_ADDR_MASK
+    pdpte: uint64 = cast[Ptr[uint64]](pdpt + pdpt_idx * 8)[0]
+    if (pdpte & PGT_FLAG_P) == 0:
+        return 0
+    if (pdpte & PGT_FLAG_PS_BIT) != 0:
+        # 1 GiB huge page — pdpte IS the leaf.
+        return pdpte
+
+    pd:   uint64 = pdpte & PGT_ADDR_MASK
+    pde:  uint64 = cast[Ptr[uint64]](pd + pd_idx * 8)[0]
+    if (pde & PGT_FLAG_P) == 0:
+        return 0
+    if (pde & PGT_FLAG_PS_BIT) != 0:
+        # 2 MiB huge page — pde IS the leaf.
+        return pde
+
+    pt:  uint64 = pde & PGT_ADDR_MASK
+    pte: uint64 = cast[Ptr[uint64]](pt + pt_idx * 8)[0]
+    if (pte & PGT_FLAG_P) == 0:
+        return 0
+    return pte
+
+
+def pgtable_dump_mapping(label: Ptr[char], va: uint64):
+    # Diagnostic: print whether `va` is mapped, and if so what the
+    # leaf entry looks like. Designed to be called from any point in
+    # boot AFTER mem_init() (page tables must be live). Safe to call
+    # with any 64-bit address; pgtable_walk is read-only.
+    #
+    # Output shape (one line, fits in a printk2 column):
+    #   [pgtable] <label> va=<va> -> UNMAPPED
+    #   [pgtable] <label> va=<va> -> leaf=<entry> (1G | 2M | 4K)
+    #
+    # On the Asus real-hardware UEFI hang case the expected gold
+    # output is "1G | flags=0x87" for any address inside the
+    # boot-stub's 4 GiB identity window, and "UNMAPPED" for anything
+    # above 4 GiB until pgtable_extend_from_e820 has run an EFI
+    # memmap parse. UNMAPPED above 4 GiB IS the smoking gun if a
+    # subsequent kmalloc returned that address.
+    leaf: uint64 = pgtable_walk(va)
+    if leaf == 0:
+        printk2("[pgtable] %s va=%p -> UNMAPPED\n",
+                cast[uint64](label), va)
+        return
+    # Bit 7 set = huge page. At PDPT level that's a 1 GiB page; at PD
+    # level a 2 MiB page. We can't tell which level from `leaf`
+    # alone, so we synthesise the answer by re-walking and checking
+    # whether the PDPT entry already carried PS=1 — but for the
+    # diagnostic line a single hint string is enough.
+    if (leaf & PGT_FLAG_PS_BIT) != 0:
+        printk2("[pgtable] %s va=%p -> leaf=", cast[uint64](label), va)
+        printk1("%p (huge page, PS=1)\n", leaf)
+    else:
+        printk2("[pgtable] %s va=%p -> leaf=", cast[uint64](label), va)
+        printk1("%p (4 KiB page)\n", leaf)
+
+
+def pgtable_assert_mapped(va: uint64) -> uint64:
+    # Public single-call API: returns the leaf entry (with flags) or
+    # 0 if not mapped. Callers that just want a bool/yes/no use
+    # `pgtable_assert_mapped(va) != 0`. Callers that want flags can
+    # consume the return value directly — bits 0..11 are the leaf
+    # PDPT/PD/PT entry's flag word per Intel SDM Vol 3A §4.5.4 Table
+    # 4-15 (1 GiB page) / Table 4-17 (2 MiB page) / Table 4-19
+    # (4 KiB page). 0 means "not mapped" (P=0 on at least one level).
+    return pgtable_walk(va)
