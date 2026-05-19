@@ -98,13 +98,17 @@ if [ -z "$OVMF_FD" ] || [ ! -f "$OVMF_FD" ]; then
     exit 0
 fi
 
-# Build the ISO on demand.
-if [ ! -f "$HAMNIX_ISO" ]; then
-    echo "[test_uefi_boot] $HAMNIX_ISO not found — running scripts/build_iso.sh."
+# Always rebuild the ISO. Skipping the rebuild silently reused stale
+# artifacts in past sessions and made hours of post-fix testing look
+# like the fix didn't land; never again. Set HAMNIX_SKIP_BUILD=1 to
+# explicitly opt out (CI parallelism etc.).
+if [ "${HAMNIX_SKIP_BUILD:-0}" != "1" ]; then
+    echo "[test_uefi_boot] rebuilding ISO via scripts/build_iso.sh"
+    rm -f "$HAMNIX_ISO"
     bash "$PROJ_ROOT/scripts/build_iso.sh"
 fi
 if [ ! -f "$HAMNIX_ISO" ]; then
-    echo "[test_uefi_boot] FAIL: $HAMNIX_ISO still missing after build_iso.sh." >&2
+    echo "[test_uefi_boot] FAIL: $HAMNIX_ISO missing after build_iso.sh." >&2
     exit 1
 fi
 

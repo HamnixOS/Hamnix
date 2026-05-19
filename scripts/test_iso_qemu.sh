@@ -81,8 +81,16 @@ UEFI_HANDOFF_RE="${UEFI_HANDOFF_RE:-\[hamnix\] post-EFI handoff complete}"
 UEFI_KERNEL_RE="${UEFI_KERNEL_RE:-cpio: registered [0-9]+ files from initramfs}"
 OVMF_FD="/usr/share/ovmf/OVMF.fd"
 
+# Always rebuild the ISO. Skipping silently reused stale artifacts in
+# past sessions and produced misleading PASSes; never again. Set
+# HAMNIX_SKIP_BUILD=1 to opt out (CI parallelism etc.).
+if [ "${HAMNIX_SKIP_BUILD:-0}" != "1" ]; then
+    echo "[test_iso_qemu] rebuilding ISO via scripts/build_iso.sh"
+    rm -f "$HAMNIX_ISO"
+    bash "$PROJ_ROOT/scripts/build_iso.sh"
+fi
 if [ ! -f "$HAMNIX_ISO" ]; then
-    echo "[test_iso_qemu] $HAMNIX_ISO not found — run scripts/build_iso.sh first." >&2
+    echo "[test_iso_qemu] FAIL: $HAMNIX_ISO missing after build_iso.sh." >&2
     exit 1
 fi
 
