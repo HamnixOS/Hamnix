@@ -198,6 +198,169 @@ enter_first_task:
     popq    %rbp
     ret                                /* tail into kthread_bootstrap */
 
+/* ---------- enter_first_task_sysret: SYSRETQ-based first-task -- *
+ * M16.155: real-hardware workaround for an Asus Core-2-era CPU
+ * stepping where the IRETQ in kthread_bootstrap triple-faults
+ * directly — no #UD/#DF/#GP/#PF handler fires, the box reboots.
+ * Every static pre-flight check (GDT/TSS/CR3/CR4/MSRs/iret frame)
+ * is GREEN on real silicon; the fault is inside IRETQ's own
+ * microcode. QEMU TCG + KVM both pass the IRETQ path, so this
+ * isn't a kernel bug we can reproduce in CI — but SYSRETQ has
+ * DIFFERENT microcode that bypasses whatever IRETQ-specific
+ * validation Asus is failing:
+ *
+ *   IRETQ pops 5 qwords from the iret frame and validates CS/SS
+ *   selector + GDT descriptor + RPL/CPL transitions in a sequence
+ *   we don't fully control. SYSRETQ loads CS = (STAR[63:48]+16)|3
+ *   and SS = (STAR[63:48]+8)|3 from MSR_STAR unconditionally; it
+ *   doesn't touch the iret frame at all. RIP comes from %rcx,
+ *   RFLAGS from %r11, RSP we set explicitly. CPL is forced to 3.
+ *
+ * Pre-conditions (verified by the M16.153/M16.154 ring3-diag
+ * block in start_first_task before this is called):
+ *   - EFER.SCE = 1                       (current: EFER=0x501)
+ *   - STAR upper-16 = 0x10               (-> user-CS 0x23, SS 0x1B)
+ *   - target RIP canonical (< 2^47 OK)   (current: 0x100803012)
+ *   - target RSP canonical               (kernel-mapped user stack)
+ *   - RFLAGS bit 1 (reserved-MBS) = 1    (current: 0x202)
+ *
+ * %rdi entry contract identical to enter_first_task: ptr to
+ * task_struct, sp at offset 0. We keep BOTH helpers exported so
+ * a one-line revert (call site swap in kernel/sched/core.ad) is
+ * available if SYSRETQ turns out to have its own real-hw bug. */
+    .align 16
+    .globl enter_first_task_sysret
+enter_first_task_sysret:
+    /* %rdi = ptr to task_struct (sp at offset 0). */
+    movq    0(%rdi), %rsp
+
+    /* Reuse the step1 marker — identical semantics ("post-rsp-load
+     * succeeded"). Same diag-stack scratch protocol as the IRETQ
+     * helper above. */
+    movq    %rsp, %r15
+    leaq    _eft_diag_stack_top(%rip), %rsp
+    leaq    _eft_step1_msg(%rip), %rdi
+    call    early_puts
+    movq    %r15, %rsp
+
+    /* Pop the 6 callee-saved (all zero for a fresh task), then drop
+     * the planted &kthread_bootstrap ret-slot and tail-jump into
+     * sysret_bootstrap directly. We deliberately bypass the ret-
+     * slot rather than overwriting it in _build_initial_kstack, so
+     * the IRETQ path (enter_first_task) remains a one-line revert
+     * away. sysret_bootstrap below mirrors kthread_bootstrap's
+     * prologue (9 caller-saved pops + addq $16) — the layout
+     * planted by _build_initial_kstack is unchanged. */
+    popq    %r15
+    popq    %r14
+    popq    %r13
+    popq    %r12
+    popq    %rbx
+    popq    %rbp
+    addq    $8, %rsp                   /* drop &kthread_bootstrap */
+    jmp     sysret_bootstrap
+
+/* ---------- sysret_bootstrap: SYSRETQ tail for the first task --- *
+ * Mirrors kthread_bootstrap's prologue (9 caller-saved pops + drop
+ * vec/ec) so the layout planted by _build_initial_kstack is still
+ * the source of truth — no change required there. After the
+ * prologue, %rsp points at the 5-qword iret frame:
+ *
+ *      +0    RIP    -> %rcx (SYSRETQ reads RIP from %rcx)
+ *      +8    CS     -> ignored (SYSRETQ uses STAR for CS)
+ *      +16   RFLAGS -> %r11  (SYSRETQ reads RFLAGS from %r11)
+ *      +24   RSP    -> %rsp  (we set user RSP explicitly)
+ *      +32   SS     -> ignored (SYSRETQ uses STAR for SS)
+ *
+ * We read the three slots we need IN ORDER: RIP and RFLAGS first
+ * (still off the kernel stack), THEN load %rsp last — because
+ * once %rsp points at the user stack, any further memory read off
+ * the OLD stack is gone.
+ *
+ * Note on %rdi / %rsi: the 9-caller-saved pop chain has ALREADY
+ * planted user argc -> %rdi and user argv -> %rsi (and the
+ * CLONE_THREAD worker fn -> %r9) from the iret_rdi/iret_rsi/iret_r9
+ * slots in _build_initial_kstack. SYSRETQ does not touch general-
+ * purpose regs other than RCX/R11/RSP, so those values reach
+ * _start untouched.
+ */
+    .align 16
+    .globl sysret_bootstrap
+sysret_bootstrap:
+    popq    %r11                       /* iret-frame %r11 slot       */
+    popq    %r10
+    popq    %r9                        /* user r9 (musl __clone fn)  */
+    popq    %r8
+    popq    %rdi                       /* user argc                  */
+    popq    %rsi                       /* user argv                  */
+    popq    %rdx
+    popq    %rcx                       /* iret-frame %rcx slot       */
+    popq    %rax
+    addq    $16, %rsp                  /* drop vec + error_code      */
+
+    /* %rsp now points at the 5-qword iret frame. Rewrite into the
+     * regs SYSRETQ wants. Order matters: read RIP + RFLAGS off the
+     * kernel stack BEFORE we point %rsp at the user stack. */
+    movq    0(%rsp), %rcx              /* RIP slot   -> %rcx         */
+    movq    16(%rsp), %r11             /* RFLAGS slot -> %r11        */
+    movq    24(%rsp), %rsp             /* RSP slot   -> %rsp (user!) */
+
+    /* --- [eft] step2-sr: pre-sysretq diagnostic ------------------ *
+     * After the rsp-rewrite, %rsp is the USER stack — we must NOT
+     * push onto it here (would corrupt the user's initial frame).
+     * Stash %rsp → %r15 (callee-saved), swap to the dedicated diag
+     * stack, push the SYSRETQ register set we just installed
+     * (%rcx, %r11, %rdi, %rsi, %r9) so early_puts can't trash
+     * them, print the marker, restore. After this block, %r15 is
+     * the saved user RSP; we re-load %rsp from %r15 and then zero
+     * %r15 so the user task wakes with r15 = 0 (matches the IRETQ
+     * path's contract). */
+    movq    %rsp, %r15
+    leaq    _eft_diag_stack_top(%rip), %rsp
+    pushq   %rcx                       /* preserve user RIP */
+    pushq   %r11                       /* preserve user RFLAGS */
+    pushq   %rdi                       /* preserve user argc */
+    pushq   %rsi                       /* preserve user argv */
+    pushq   %r9                        /* preserve user r9 (clone fn) */
+    leaq    _eft_step2_sr_msg(%rip), %rdi
+    call    early_puts
+    popq    %r9
+    popq    %rsi
+    popq    %rdi
+    popq    %r11
+    popq    %rcx
+    movq    %r15, %rsp                 /* back to user rsp */
+    xorq    %r15, %r15                 /* user wakes with r15 = 0 */
+
+    /* SYSRETQ in 64-bit mode:
+     *   CS = (STAR[63:48] + 0x10) | 3      = 0x23
+     *   SS = (STAR[63:48] + 0x08) | 3      = 0x1B
+     *   CPL = 3
+     *   RIP = %rcx                          (must be canonical on Intel)
+     *   RFLAGS = (%r11 & ~FMASK_RESERVED) | bit1=1   (per Intel SDM
+     *     vol.2 SYSRET pseudocode: RF = R11 with specific bits forced.
+     *     0x202 in %r11 maps to 0x202 in user RFLAGS — IF=1, MBS=1.)
+     */
+    sysretq
+
+    /* --- [eft] step3-sr: POST-sysretq (unreachable) -------------- *
+     * sysretq on a Core-2-era CPU drops to CPL=3 atomically; the
+     * only way control re-enters here is if sysretq #GPs with
+     * non-canonical RCX (we verify canonical RIP in the pre-flight
+     * ring3-diag block) or if the kernel is missing IA32_EFER.SCE
+     * (the same pre-flight prints EFER, which shows SCE=1). Both
+     * are impossible by construction — but the hang loop is here
+     * so a debug capture won't run off into arbitrary memory. */
+    movq    %rsp, %r15
+    leaq    _eft_diag_stack_top(%rip), %rsp
+    leaq    _eft_step3_sr_msg(%rip), %rdi
+    call    early_puts
+    movq    %r15, %rsp
+.Lsysret_step3_hang:
+    cli
+    hlt
+    jmp     .Lsysret_step3_hang
+
 /* ---------- [eft] diagnostic strings ------------------------------ */
     .section .rodata
     .align 8
@@ -207,6 +370,10 @@ _eft_step2_msg:
     .asciz "[eft] step2: pre-iretq (kthread_bootstrap tail)\n"
 _eft_step3_msg:
     .asciz "[eft] step3: POST-iretq (impossible - iretq returned to ring 0)\n"
+_eft_step2_sr_msg:
+    .asciz "[eft] step2-sr: pre-sysretq (sysret_bootstrap tail)\n"
+_eft_step3_sr_msg:
+    .asciz "[eft] step3-sr: POST-sysretq (impossible - sysretq returned to ring 0)\n"
 
 /* ---------- [eft] dedicated diagnostic stack ---------------------- *
  * Lives in .bss (zero-filled at boot by head_64.S's rep stosq). We
