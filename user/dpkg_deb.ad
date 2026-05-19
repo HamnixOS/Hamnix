@@ -1,0 +1,670 @@
+# user/dpkg_deb.ad
+#
+# Hamnix V0 of `dpkg-deb -x` — the missing apt-path piece. Given a
+# `.deb` (a System V `ar` archive containing debian-binary,
+# control.tar.<comp>, data.tar.<comp>) and a target directory, this
+# binary slurps the .deb into RAM, walks the ar table-of-contents to
+# locate `data.tar.gz`, inflates it via lib/zlib/inflate.ad, then
+# walks the embedded ustar stream and writes each regular file's
+# contents under <target>/.
+#
+# V0 SCOPE (documented up front so the next agent knows where to pick up):
+#   - Compression: gzip only. `.xz` and `.zst` produce a loud error
+#     to stderr + non-zero rc (V1 hooks in xz/zstd decoders).
+#   - Tar types: regular ('0'/'\0') + directory ('5') extracted.
+#     Symlinks ('2') and other typeflags (hardlink/device/etc.) are
+#     skipped with a one-line warning on stderr. The extraction does
+#     NOT fail on a skipped entry.
+#   - Path safety: any tar entry whose name starts with '/' or
+#     contains a `..` path component is REJECTED + skipped. This is
+#     standard dpkg policy and matters even for trusted .debs.
+#   - Tar checksum: header chksum is verified (sum of all 512 bytes
+#     treating the chksum field as 8 ASCII spaces). A mismatch
+#     terminates extraction with rc=1.
+#   - Hardlinks, sparse files, pax extended headers, long-name `L`/
+#     long-link `K` entries, owner/group, mtime: not handled. (Debian
+#     data.tar entries fit ustar's 100-byte name limit overwhelmingly;
+#     L/K appear in very-long-path packages, which V1 covers.)
+#   - File size cap: .deb input ~256 KiB, inflated tar output ~512 KiB.
+#     Plenty for control + simple package fixtures; raise the BSS
+#     caps when V1 wants to extract glibc.
+#
+# WHY NOT STREAM? V0 reads the whole .deb into RAM and inflates the
+# whole tar into RAM too. The Plan-9-shaped streaming version (feed
+# inflate one ar member's bytes at a time, drive a streaming-tar
+# state machine off the inflate output cursor) is V1 work. Two
+# bounded BSS buffers are simpler than two streaming state machines
+# and keeps this milestone reviewable.
+#
+# Build: scripts/build_user.sh auto-discovers via build_adder_user dpkg_deb.
+# Test:  scripts/test_dpkg_deb_x.sh boots QEMU, runs
+#        `/bin/dpkg_deb -x /tests/sample.deb /tmp/extracted`, then
+#        cat's the extracted file and asserts the known byte.
+
+from lib.zlib.inflate import (
+    InflateState,
+    inflate_init,
+    inflate_feed,
+)
+
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_mkdir(path: Ptr[char]) -> int32
+
+
+# -- bounded BSS buffers (per Hamnix idiom: never park large Arrays in
+#    a nested frame — see memory/feedback_compiler_quirks.md U9) ---------------
+
+DEB_CAP:  uint64 = 262144      # 256 KiB raw .deb image cap
+TAR_CAP:  uint64 = 524288      # 512 KiB inflated-tar cap
+
+deb_buf: Array[262144, uint8]
+tar_buf: Array[524288, uint8]
+
+# Inflater state (~40 KiB; the test_inflate fixture parks it the same way).
+inf_state: InflateState
+
+# Scratch path-join buffer. tmpfs caps names at 32 chars but our path
+# safety check + warning messages need a larger transient buffer; ext4
+# leaf names plus a target-dir prefix fit comfortably under 256.
+path_buf: Array[512, uint8]
+
+# Scratch typeflag-warning name (NUL-terminated entry name for stderr).
+warn_buf: Array[128, uint8]
+
+
+# -- tiny stdio helpers (mirrors cat.ad / touch.ad convention) ---------------
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+def write_dec_u64(fd: int32, value: uint64):
+    if value == 0:
+        sys_write(fd, "0", 1)
+        return
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    v: uint64 = value
+    while v != 0:
+        digits[n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    out: Array[24, uint8]
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    sys_write(fd, &out[0], i)
+
+
+# -- ar (System V/BSD common variant) parser ---------------------------------
+#
+# Layout per ar(5):
+#   8-byte global magic "!<arch>\n"
+#   then a sequence of file headers:
+#     [0..16)  name (space-padded; SysV: trailing '/' delimiter)
+#     [16..28) mtime (decimal ASCII, space-padded)
+#     [28..34) owner uid
+#     [34..40) gid
+#     [40..48) mode (octal)
+#     [48..58) size (decimal ASCII)
+#     [58..60) terminator "`\n" (0x60 0x0A)
+#   then `size` bytes of body, then a single 0x0A pad byte if size is
+#   odd (next header must start at an even offset).
+#
+# Debian .debs use the SysV convention: the name field is left-aligned
+# and terminated by '/' (or by spaces if no slash). We strip that
+# terminator. SysV's "//" / "/N" long-name extensions don't show up in
+# real Debian packages — every member name fits in 16 chars.
+
+AR_HDR_SIZE: uint64 = 60
+
+
+def _ar_parse_size(hdr: Ptr[uint8]) -> int64:
+    # Decimal-ASCII, space-padded, in bytes [48..58).
+    n: int64 = 0
+    i: uint64 = 48
+    while i < 58:
+        c: uint8 = hdr[i]
+        if c == 32:                                     # ' '
+            i = i + 1
+            continue
+        if c < 48 or c > 57:
+            return -1
+        n = n * 10 + cast[int64](c - 48)
+        i = i + 1
+    return n
+
+
+def _ar_member_name_eq(hdr: Ptr[uint8], want: Ptr[uint8],
+                       want_len: uint64) -> int32:
+    # Compare the 16-byte name field's leading non-separator run
+    # against `want` (want_len chars, no NUL terminator needed). The
+    # SysV terminator is '/'; anything beyond it (space pad or
+    # another byte) ends the comparison.
+    i: uint64 = 0
+    while i < want_len:
+        if i >= 16:
+            return 0
+        c: uint8 = hdr[i]
+        if c != want[i]:
+            return 0
+        i = i + 1
+    # After matching the prefix the next byte (if any) MUST be the
+    # separator '/' or a space pad — otherwise want_len was just a
+    # prefix of a longer name.
+    if i >= 16:
+        return 1
+    nx: uint8 = hdr[i]
+    if nx == 47 or nx == 32:                            # '/' or ' '
+        return 1
+    return 0
+
+
+def _ar_member_name_starts_with(hdr: Ptr[uint8], want: Ptr[uint8],
+                                want_len: uint64) -> int32:
+    # True if the 16-byte name field starts with `want`.
+    i: uint64 = 0
+    while i < want_len:
+        if i >= 16:
+            return 0
+        if hdr[i] != want[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+# -- ustar tar walker --------------------------------------------------------
+#
+# 512-byte header layout per ustar (subset; everything past the 156th
+# byte we ignore for V0 except the magic-check we DON'T enforce —
+# real Debian data.tar's are sometimes GNU-tar-bare with magic
+# slightly different):
+#   [0..100)   name
+#   [100..108) mode (octal, NUL-terminated)
+#   [108..116) uid
+#   [116..124) gid
+#   [124..136) size (octal, NUL-terminated; up to 11 octal digits)
+#   [136..148) mtime
+#   [148..156) chksum (octal, 6 octal digits + NUL + space)
+#   [156]      typeflag
+
+def _tar_parse_octal(p: Ptr[uint8], maxlen: uint64) -> uint64:
+    n: uint64 = 0
+    i: uint64 = 0
+    # Skip leading spaces (some tar implementations space-pad).
+    while i < maxlen and p[i] == 32:
+        i = i + 1
+    while i < maxlen:
+        c: uint8 = p[i]
+        if c == 0 or c == 32:
+            break
+        if c < 48 or c > 55:
+            # Not octal — treat as end-of-field; defensive against
+            # GNU-tar base-256 binary size encoding (high bit set on
+            # first byte). V0 doesn't handle base-256; a stray non-
+            # octal byte just truncates the field.
+            break
+        n = (n << 3) + cast[uint64](c - 48)
+        i = i + 1
+    return n
+
+
+def _tar_chksum_ok(hdr: Ptr[uint8]) -> int32:
+    # Per ustar: sum every byte of the 512-byte header treating the
+    # 8-byte chksum field [148..156) as 8 ASCII spaces (0x20). The
+    # stored field is "%06o\0 " (6 octal digits, NUL, space) — we
+    # parse it as octal and compare.
+    stored: uint64 = _tar_parse_octal(&hdr[148], 8)
+    s: uint64 = 0
+    i: uint64 = 0
+    while i < 512:
+        if i >= 148 and i < 156:
+            s = s + 32
+        else:
+            s = s + cast[uint64](hdr[i])
+        i = i + 1
+    if s == stored:
+        return 1
+    return 0
+
+
+def _tar_header_is_zero(hdr: Ptr[uint8]) -> int32:
+    # All-zero 512-byte block = end-of-archive sentinel (two
+    # consecutive zero blocks terminate, but in practice the first
+    # zero block is sufficient — we still consume the second).
+    i: uint64 = 0
+    while i < 512:
+        if hdr[i] != 0:
+            return 0
+        i = i + 1
+    return 1
+
+
+def _name_copy_nul(dst: Ptr[uint8], src: Ptr[uint8], maxlen: uint64) -> uint64:
+    # Copy NUL- or maxlen-terminated string. Returns the byte count
+    # written (excluding the NUL we plant on the end).
+    i: uint64 = 0
+    while i < maxlen:
+        c: uint8 = src[i]
+        if c == 0:
+            break
+        dst[i] = c
+        i = i + 1
+    dst[i] = 0
+    return i
+
+
+def _entry_name_is_unsafe(name: Ptr[uint8]) -> int32:
+    # Reject absolute paths and any path with a '..' component. This
+    # is the dpkg path-traversal guard.
+    if name[0] == 47:                                   # '/'
+        return 1
+    # Walk components separated by '/'.
+    i: uint64 = 0
+    while True:
+        # At the start of a component, check for ".." (length 2,
+        # followed by '/' or NUL).
+        if name[i] == 46 and name[i + 1] == 46:         # ".."
+            t: uint8 = name[i + 2]
+            if t == 0 or t == 47:
+                return 1
+        # Advance to the next component.
+        while name[i] != 0 and name[i] != 47:
+            i = i + 1
+        if name[i] == 0:
+            return 0
+        # Skip the '/' separator(s).
+        while name[i] == 47:
+            i = i + 1
+        if name[i] == 0:
+            return 0
+
+
+def _strip_dot_slash(name: Ptr[uint8]) -> Ptr[uint8]:
+    # Debian data.tar entries are prefixed "./"; collapse it so we
+    # don't end up with "/target//etc/foo".
+    if name[0] == 46 and name[1] == 47:                 # "./"
+        return cast[Ptr[uint8]](cast[uint64](name) + cast[uint64](2))
+    return name
+
+
+def _join_path(out: Ptr[uint8], target: Ptr[uint8],
+               entry: Ptr[uint8], cap: uint64) -> int64:
+    # Build out = target + ("/" if target doesn't already end in '/')
+    # + entry. Caller passes `cap` = total bytes available in `out`
+    # (must include space for the NUL). Returns the written length
+    # excluding NUL, or -1 if the join overflows.
+    o: uint64 = 0
+    i: uint64 = 0
+    while target[i] != 0:
+        if o + 1 >= cap:
+            return -1
+        out[o] = target[i]
+        o = o + 1
+        i = i + 1
+    if o == 0 or out[o - 1] != 47:                      # need a '/'
+        if o + 1 >= cap:
+            return -1
+        out[o] = 47
+        o = o + 1
+    j: uint64 = 0
+    while entry[j] != 0:
+        if o + 1 >= cap:
+            return -1
+        out[o] = entry[j]
+        o = o + 1
+        j = j + 1
+    out[o] = 0
+    return cast[int64](o)
+
+
+def _write_full(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
+    # sys_write may short-write on tmpfs once we approach TMPFS_FILE_CAP;
+    # spin until either every byte is acknowledged or the kernel signals
+    # an error (rc < 0 from the syscall) or no forward progress (rc == 0).
+    written: uint64 = 0
+    while written < count:
+        room: uint64 = count - written
+        ptr: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](buf) + written)
+        rc: int64 = sys_write(fd, ptr, room)
+        if rc < 0:
+            return rc
+        if rc == 0:
+            return cast[int64](written)
+        written = written + cast[uint64](rc)
+    return cast[int64](written)
+
+
+# -- ar walk -----------------------------------------------------------------
+#
+# Returns the byte-offset of `data.tar.gz`'s body within deb_buf
+# (+ writes its size to *out_size), or -1 if no `data.tar.gz` member
+# was found. Errors loudly to stderr on `data.tar.xz` / `data.tar.zst`
+# and returns -2 in that case so the caller can distinguish "no member"
+# from "unsupported compression".
+
+def _ar_find_data_tar_gz(deb_len: uint64, out_size: Ptr[uint64]) -> int64:
+    # Verify global magic.
+    if deb_len < 8:
+        write_str(2, "dpkg-deb: file too short for ar magic\n")
+        return -1
+    magic: Ptr[uint8] = "!<arch>\n"
+    i: uint64 = 0
+    while i < 8:
+        if deb_buf[i] != magic[i]:
+            write_str(2, "dpkg-deb: not an ar archive (bad magic)\n")
+            return -1
+        i = i + 1
+
+    off: uint64 = 8
+    while off + AR_HDR_SIZE <= deb_len:
+        hdr: Ptr[uint8] = &deb_buf[off]
+        # Header terminator at [58..60) must be 0x60 0x0A. Bail out on
+        # a mismatch — the alignment got out of sync.
+        if hdr[58] != 0x60 or hdr[59] != 0x0A:
+            write_str(2, "dpkg-deb: ar header terminator missing\n")
+            return -1
+        sz: int64 = _ar_parse_size(hdr)
+        if sz < 0:
+            write_str(2, "dpkg-deb: ar header size parse failure\n")
+            return -1
+        body: uint64 = off + AR_HDR_SIZE
+        body_sz: uint64 = cast[uint64](sz)
+        if body + body_sz > deb_len:
+            write_str(2, "dpkg-deb: ar member overflows file\n")
+            return -1
+
+        # Look for "data.tar.<comp>" — the only member we care about.
+        if _ar_member_name_starts_with(hdr,
+                                       cast[Ptr[uint8]]("data.tar"),
+                                       8) != 0:
+            # The 9th char is either '/' (= "data.tar/" — uncompressed,
+            # rare) or '.' (= "data.tar.<ext>/").
+            c9: uint8 = hdr[8]
+            if c9 == 47:                                # '/'
+                write_str(2, "dpkg-deb: uncompressed data.tar not supported (V0 expects data.tar.gz)\n")
+                return -1
+            if c9 == 46:
+                # Read up to the trailing '/' (SysV terminator).
+                ext0: uint8 = hdr[9]
+                ext1: uint8 = hdr[10]
+                ext2: uint8 = hdr[11]
+                # data.tar.gz/  -> ext0='g', ext1='z', ext2='/'
+                if ext0 == 103 and ext1 == 122 and ext2 == 47:
+                    out_size[0] = body_sz
+                    return cast[int64](body)
+                # data.tar.xz/
+                if ext0 == 120 and ext1 == 122 and ext2 == 47:
+                    write_str(2, "dpkg-deb: unsupported compression: .xz; V0 supports .gz only\n")
+                    return -2
+                # data.tar.zst/  (4 chars: 'z' 's' 't' '/')
+                if ext0 == 122 and ext1 == 115 and ext2 == 116:
+                    write_str(2, "dpkg-deb: unsupported compression: .zst; V0 supports .gz only\n")
+                    return -2
+                # data.tar.bz2/
+                if ext0 == 98 and ext1 == 122 and ext2 == 50:
+                    write_str(2, "dpkg-deb: unsupported compression: .bz2; V0 supports .gz only\n")
+                    return -2
+                write_str(2, "dpkg-deb: unknown data.tar compression extension; V0 supports .gz only\n")
+                return -2
+
+        # Advance to next member: skip body + 1-byte pad if body_sz is odd.
+        off = body + body_sz
+        if (body_sz % 2) != 0:
+            off = off + 1
+
+    write_str(2, "dpkg-deb: no data.tar.<comp> member found\n")
+    return -1
+
+
+# -- gzip-inflate the data.tar.gz body into tar_buf --------------------------
+
+def _inflate_data_tar(in_ptr: Ptr[uint8], in_len: uint64) -> int64:
+    # One-shot inflate. We have the entire compressed buffer in RAM
+    # and the entire output buffer (tar_buf) sized to fit a small
+    # package's worth of plaintext. Returns the inflated byte count
+    # on success, -1 on inflate error.
+    inflate_init(&inf_state)
+    out_consumed: uint64 = 0
+    in_consumed: uint64 = 0
+    done: int32 = 0
+    rc: int32 = inflate_feed(&inf_state, in_ptr, in_len,
+                             &tar_buf[0], TAR_CAP,
+                             &out_consumed, &in_consumed, &done)
+    if rc < 0:
+        write_str(2, "dpkg-deb: gzip inflate failed (corrupt or truncated)\n")
+        return -1
+    if done == 0:
+        write_str(2, "dpkg-deb: gzip inflate did not reach end-of-stream (out_max insufficient?)\n")
+        return -1
+    return cast[int64](out_consumed)
+
+
+# -- tar extraction ----------------------------------------------------------
+#
+# Returns 0 on full extraction, -1 on a hard error (checksum mismatch,
+# truncated tar, write failure). Per-entry warnings (unsafe path,
+# unsupported typeflag) DO NOT fail the run.
+
+def _extract_tar(tar_len: uint64, target: Ptr[uint8]) -> int32:
+    off: uint64 = 0
+    while off + 512 <= tar_len:
+        hdr: Ptr[uint8] = &tar_buf[off]
+        if _tar_header_is_zero(hdr) != 0:
+            return 0                                    # end-of-archive
+        if _tar_chksum_ok(hdr) == 0:
+            write_str(2, "dpkg-deb: tar header checksum mismatch at offset ")
+            write_dec_u64(2, off)
+            write_str(2, "\n")
+            return -1
+
+        # Parse fields we need.
+        size: uint64 = _tar_parse_octal(&hdr[124], 12)
+        typeflag: uint8 = hdr[156]
+
+        # Pull out the NUL-or-100-bounded name into warn_buf for safe
+        # printing + path-join scratch.
+        nlen: uint64 = _name_copy_nul(&warn_buf[0], &hdr[0], 100)
+
+        # Always skip empty-name records defensively.
+        if nlen == 0:
+            off = off + 512
+            continue
+
+        # Strip Debian-style "./" prefix for cleanliness; safety check
+        # runs against the stripped name (so "./foo" is treated like
+        # "foo", and "/etc/..." remains unsafe).
+        entry: Ptr[uint8] = _strip_dot_slash(&warn_buf[0])
+
+        # Path safety: reject absolute + ".." traversals.
+        unsafe: int32 = _entry_name_is_unsafe(entry)
+        # Also reject if the *original* name (before strip) was abs —
+        # _strip_dot_slash only strips "./", not "/".
+        if warn_buf[0] == 47:
+            unsafe = 1
+        if unsafe != 0:
+            write_str(2, "dpkg-deb: refusing unsafe path: ")
+            write_str(2, &warn_buf[0])
+            write_str(2, "\n")
+            # Advance past header + zero-padded body.
+            off = off + 512
+            body_blocks: uint64 = (size + 511) / 512
+            off = off + body_blocks * 512
+            continue
+
+        # Skip the trivial "./" record some tars emit at the head.
+        if entry[0] == 0:
+            off = off + 512
+            body_blocks2: uint64 = (size + 511) / 512
+            off = off + body_blocks2 * 512
+            continue
+
+        if typeflag == 53:                              # '5' = directory
+            joined: int64 = _join_path(&path_buf[0], target, entry, 512)
+            if joined < 0:
+                write_str(2, "dpkg-deb: path too long: ")
+                write_str(2, &warn_buf[0])
+                write_str(2, "\n")
+            else:
+                # sys_mkdir is a flat-tmpfs no-op today; the syscall
+                # still succeeds and userland sees rc=0.
+                sys_mkdir(cast[Ptr[char]](&path_buf[0]))
+            off = off + 512
+            # Directory entries have size=0; nothing to skip.
+            continue
+
+        if typeflag == 50:                              # '2' = symlink
+            write_str(2, "dpkg-deb: warning: skipping symlink: ")
+            write_str(2, &warn_buf[0])
+            write_str(2, "\n")
+            off = off + 512
+            continue
+
+        if typeflag != 0 and typeflag != 48:            # not regular file
+            # '1' hardlink / '3' char / '4' blk / '6' fifo / 'L' GNU long
+            # name / 'K' GNU long link / 'x' pax / etc.
+            write_str(2, "dpkg-deb: warning: skipping unsupported typeflag '")
+            tf_str: Array[2, uint8]
+            tf_str[0] = typeflag
+            tf_str[1] = 0
+            sys_write(2, &tf_str[0], 1)
+            write_str(2, "' for: ")
+            write_str(2, &warn_buf[0])
+            write_str(2, "\n")
+            off = off + 512
+            body_blocks3: uint64 = (size + 511) / 512
+            off = off + body_blocks3 * 512
+            continue
+
+        # Regular file. Build dest path; write `size` bytes from the
+        # padded body region.
+        joined2: int64 = _join_path(&path_buf[0], target, entry, 512)
+        if joined2 < 0:
+            write_str(2, "dpkg-deb: path too long: ")
+            write_str(2, &warn_buf[0])
+            write_str(2, "\n")
+            off = off + 512
+            body_blocks4: uint64 = (size + 511) / 512
+            off = off + body_blocks4 * 512
+            continue
+
+        body_off: uint64 = off + 512
+        if body_off + size > tar_len:
+            write_str(2, "dpkg-deb: tar body overflows archive\n")
+            return -1
+
+        fd: int32 = sys_open_write(cast[Ptr[char]](&path_buf[0]))
+        if fd < 0:
+            write_str(2, "dpkg-deb: cannot create ")
+            write_str(2, &path_buf[0])
+            write_str(2, "\n")
+            # Still advance past this entry so subsequent files extract.
+            off = body_off
+            body_blocks5: uint64 = (size + 511) / 512
+            off = off + body_blocks5 * 512
+            continue
+        if size > 0:
+            wn: int64 = _write_full(fd, &tar_buf[body_off], size)
+            if wn < 0 or cast[uint64](wn) != size:
+                write_str(2, "dpkg-deb: short write extracting ")
+                write_str(2, &path_buf[0])
+                write_str(2, "\n")
+                sys_close(fd)
+                return -1
+        sys_close(fd)
+
+        off = body_off
+        body_blocks6: uint64 = (size + 511) / 512
+        off = off + body_blocks6 * 512
+
+    # Hit end-of-buffer without a zero block; tolerate as best-effort.
+    return 0
+
+
+# -- top-level driver --------------------------------------------------------
+
+def _slurp_file(path: Ptr[char], cap: uint64) -> int64:
+    fd: int32 = sys_open(path)
+    if fd < 0:
+        write_str(2, "dpkg-deb: cannot open ")
+        write_str(2, cast[Ptr[uint8]](path))
+        write_str(2, "\n")
+        return -1
+    total: uint64 = 0
+    while total < cap:
+        room: uint64 = cap - total
+        ptr: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](&deb_buf[0]) + total)
+        n: int64 = sys_read(fd, ptr, room)
+        if n <= 0:
+            break
+        total = total + cast[uint64](n)
+    sys_close(fd)
+    if total == 0:
+        write_str(2, "dpkg-deb: empty input\n")
+        return -1
+    if total >= cap:
+        write_str(2, "dpkg-deb: .deb exceeds 256 KiB cap (V0 limit)\n")
+        return -1
+    return cast[int64](total)
+
+
+def _usage(progname: Ptr[uint8]) -> int32:
+    write_str(2, "Usage: ")
+    write_str(2, progname)
+    write_str(2, " -x <archive.deb> <target-directory>\n")
+    return 2
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    progname: Ptr[uint8] = cast[Ptr[uint8]](argv[0])
+    if argc != 4:
+        return _usage(progname)
+    flag: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
+    if flag[0] != 45 or flag[1] != 120 or flag[2] != 0:
+        # not "-x\0"
+        write_str(2, "dpkg-deb: V0 only supports -x (extract)\n")
+        return _usage(progname)
+    deb_path: Ptr[char] = cast[Ptr[char]](argv[2])
+    target: Ptr[char] = cast[Ptr[char]](argv[3])
+
+    deb_len_i: int64 = _slurp_file(deb_path, DEB_CAP)
+    if deb_len_i < 0:
+        return 1
+    deb_len: uint64 = cast[uint64](deb_len_i)
+
+    data_size: uint64 = 0
+    data_off_i: int64 = _ar_find_data_tar_gz(deb_len, &data_size)
+    if data_off_i == -2:
+        return 1                                        # unsupported comp
+    if data_off_i < 0:
+        return 1
+    data_off: uint64 = cast[uint64](data_off_i)
+
+    tar_len_i: int64 = _inflate_data_tar(&deb_buf[data_off], data_size)
+    if tar_len_i < 0:
+        return 1
+    tar_len: uint64 = cast[uint64](tar_len_i)
+
+    # The target directory is the user-provided argv[3]. We make a
+    # best-effort mkdir for it up front; tmpfs treats it as a no-op
+    # but ext4 / future hierarchical FS will treat it as the parent
+    # of every extracted entry.
+    sys_mkdir(target)
+
+    rc: int32 = _extract_tar(tar_len, cast[Ptr[uint8]](target))
+    if rc != 0:
+        return 1
+    return 0

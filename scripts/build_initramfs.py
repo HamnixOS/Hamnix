@@ -110,6 +110,21 @@ if os.environ.get("ENABLE_HTTP_REDIRECT_SMOKE") == "1":
     # it so the kernel reaches the redirect smoke below.
     FILES.append(("/etc/skip-https-internet-smoke", b"1\n"))
 
+# apt-path V0: scripts/test_dpkg_deb_x.sh generates a tiny .deb
+# fixture on the host, points HAMNIX_DEB_FIXTURE at it, and this
+# block plants the bytes at /tests/sample.deb inside the cpio
+# initramfs so the userland `/bin/dpkg_deb` binary can extract it
+# under QEMU. Off-default: an unset env var leaves the initramfs
+# alone, exactly like every other gated marker above.
+_DEB_FIXTURE_PATH = os.environ.get("HAMNIX_DEB_FIXTURE", "")
+if _DEB_FIXTURE_PATH:
+    try:
+        with open(_DEB_FIXTURE_PATH, "rb") as _fdeb:
+            FILES.append(("/tests/sample.deb", _fdeb.read()))
+    except OSError as _e:
+        raise SystemExit(
+            f"HAMNIX_DEB_FIXTURE={_DEB_FIXTURE_PATH}: unreadable ({_e})")
+
 # V5 cert validation: bake the production ISRG Root X1 anchor into the
 # initramfs at /etc/tls-ca-isrg-x1.der whenever the host has it
 # installed. drivers/net/tls.ad's _tls_validation_init() walks the cpio
