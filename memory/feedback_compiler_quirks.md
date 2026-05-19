@@ -10,6 +10,32 @@ metadata:
 Known Adder compiler quirks surfaced during Hamnix kernel work. Real
 bugs to file, but in the meantime the workarounds are stable.
 
+## Nested class-instance fields — UNVERIFIED (2026-05-18, V2 agent claim)
+
+The V2 RSA-PSS agent at commit `3c4f152` reported that
+`class RsaPubkey { modulus: Bigint, exponent: Bigint }` had the
+exponent's writes aliasing into the modulus's tail. Worked around by
+flattening RsaPubkey to raw byte buffers + holding live bigints in
+module-scope scratch.
+
+**Attempted reproduction** (orchestrator, same day): minimal repro at
+`tests/test_compiler_nested_class_fields.ad` — two nested
+`Inner { data: Array[8, uint64] }` inside `Outer` — **PASSES**. The
+simple case is sound. The V2 agent's symptom may have been:
+- The OTHER bug they flagged: `_bigint_normalize` not scanning
+  high-limb-down after add/shl1 pushed carry past cached `n_limbs`.
+  This produces "numerically correct limbs but renders as zeros"
+  which looks aliasing-shaped at the byte boundary.
+- A subtler shape issue requiring 64×uint64 + uint64 (Bigint shape)
+  to trip. The fixture extension attempt with that shape stalled on
+  a parser issue and was not pursued further.
+
+**How to apply:** don't propagate the workaround to new code without
+reproducing the failure first. If a future kernel module hits the
+symptom, extend `test_compiler_nested_class_fields.ad` with the
+specific shape that fails — that's the regression-test discipline
+from M16.137 working as intended.
+
 ## ~~Ptr[int32] writes to `&local` get clobbered~~ FIXED 2026-05-18
 
 Was: scalar locals (int8/int16/int32) always stored with `movq` (8 bytes)

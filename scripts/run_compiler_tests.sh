@@ -39,6 +39,7 @@ TESTS=(
     "addr_of_nested:bash scripts/test_compiler_addr_of_nested.sh"
     "cast_arr_u32:bash scripts/test_compiler_cast_arr_u32.sh"
     "nested_frame_array:bash scripts/test_compiler_nested_frame_array.sh"
+    "nested_class_fields:bash scripts/test_compiler_nested_class_fields.sh"
 )
 
 results=()
