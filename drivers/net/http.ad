@@ -72,6 +72,15 @@ from drivers.net.tls import (
     tls_init, tls_handshake, tls_send, tls_recv, tls_close,
     TLS_DEFAULT_PORT,
 )
+# V6: transparent Content-Encoding: gzip decompression. Real Debian
+# mirrors compress Packages / Sources / Translation-en with gzip and
+# mark the response `Content-Encoding: gzip` over chunked transport
+# (RFC 7230 §3.3.1 reverse-order: dechunk first, then ungzip). Without
+# the inflater wired into the body path, apt would receive opaque gzip
+# bytes. See lib/zlib/inflate.ad for the streaming primitive.
+from lib.zlib.inflate import (
+    InflateState, inflate_init, inflate_feed,
+)
 
 
 # Tuning knobs. Sizes match the spirit of dns.ad / tcp.ad — generous
@@ -129,6 +138,25 @@ HTTP_CHUNKED_BUF_BYTES: uint64 = 4096
 http_chunked_buf: Array[4096, uint8]
 http_chunked_head: uint64 = 0     # next byte to consume
 http_chunked_tail: uint64 = 0     # one past last valid byte
+
+
+# V6: Content-Encoding: gzip inflater state. Parked at module scope
+# rather than the http_get/https_get stack frame because the
+# InflateState carries a 32 KB sliding window + ~8 KB of Huffman tables
+# (~40 KB total) — well past the per-task stack budget Adder gives us.
+# Single-threaded callers (same serialisation contract as the chunked
+# decoder above) — `http_inflate_active` flips on for the lifetime of
+# one http_get / https_get call when its response headers contained
+# `Content-Encoding: gzip` and the inflater stitches every chunked or
+# Content-Length body byte before they land in the caller's out_buf.
+http_inflate_state:  InflateState
+http_inflate_active: int32 = 0
+# Latched stream-end signal — set by _http_emit_body once
+# inflate_feed reports done==1 (gzip trailer verified). Both the
+# http_get / https_get top-level loops AND the chunked decoder check
+# this on completion to distinguish "full gzip stream received" from
+# "encoded body ended mid-stream (truncated)".
+http_inflate_done:   int32 = 0
 
 
 # Counters bumped per call. Mirrors the dns_in/dns_out style at the
@@ -620,6 +648,190 @@ def _http_extract_chunked_te(buf: Ptr[uint8], hdrs_start: uint64,
     return 0
 
 
+def _http_extract_gzip_ce(buf: Ptr[uint8], hdrs_start: uint64,
+                          hdrs_end: uint64) -> int32:
+    # Walk the header block looking for a case-insensitive
+    # `Content-Encoding:` line whose value is exactly the single token
+    # `gzip` (case-insensitive, optional leading whitespace). Returns:
+    #   1  -> single-token gzip, route the body through inflate_feed.
+    #   0  -> header absent, identity body, no inflation.
+    #  -1  -> header present but value is multi-token (e.g. "gzip,
+    #         deflate" or "identity, gzip") — V0 explicitly rejects so
+    #         a future codec-stack agent can land it as a follow-up
+    #         without a silent semantic change here.
+    # Real Debian mirror responses for Packages.gz / Sources.gz / .deb
+    # signed-by manifests all use bare `Content-Encoding: gzip`, which
+    # is what apt fetches care about for M16.<gzip-wireup>.
+    needle: Ptr[uint8] = "content-encoding:"
+    needle_len: uint64 = 17
+    gzip_lit: Ptr[uint8] = "gzip"
+    gzip_lit_len: uint64 = 4
+    pos: uint64 = hdrs_start
+    while pos < hdrs_end:
+        line_start: uint64 = pos
+        while pos < hdrs_end:
+            if buf[pos] == 0x0A:                  # '\n'
+                break
+            pos = pos + 1
+        line_end: uint64 = pos
+        if line_end > line_start:
+            if buf[line_end - 1] == 0x0D:
+                line_end = line_end - 1
+        line_len: uint64 = line_end - line_start
+        line_buf: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](buf) + line_start)
+        if _http_buf_starts_with_ci(line_buf, line_len,
+                                    needle, needle_len) == 1:
+            # Skip "Content-Encoding:" then any leading whitespace.
+            vp: uint64 = needle_len
+            while vp < line_len:
+                c: uint8 = line_buf[vp]
+                if c == 0x20:
+                    vp = vp + 1
+                elif c == 0x09:
+                    vp = vp + 1
+                else:
+                    break
+            # First token: bytes up to whitespace, comma, or EOL.
+            tok_start: uint64 = vp
+            while vp < line_len:
+                cc: uint8 = line_buf[vp]
+                if cc == 0x20:
+                    break
+                if cc == 0x09:
+                    break
+                if cc == 0x2C:                    # ','
+                    break
+                vp = vp + 1
+            tok_len: uint64 = vp - tok_start
+            # Skip trailing whitespace after the first token.
+            while vp < line_len:
+                cd: uint8 = line_buf[vp]
+                if cd == 0x20:
+                    vp = vp + 1
+                elif cd == 0x09:
+                    vp = vp + 1
+                else:
+                    break
+            # Multi-token detection: any byte left after the first
+            # token (and its trailing whitespace) is either a comma
+            # (`gzip, deflate`) or unexpected garbage. Either way we
+            # bail with -1 + an explicit log line so callers don't
+            # silently fall back to passing raw bytes through.
+            if vp < line_len:
+                printk0("[http] Content-Encoding: multi-token list (only bare gzip in V0)\n")
+                return -1
+            if tok_len != gzip_lit_len:
+                # Not gzip — could be `identity`, `br`, `deflate`,
+                # `zstd`. V0 supports only gzip; identity is the
+                # plaintext default so silently treat any single-token
+                # non-gzip the same as "no Content-Encoding header".
+                # Log to make a surprise zstd response visible.
+                identity_lit: Ptr[uint8] = "identity"
+                tok_ptr2: Ptr[uint8] = cast[Ptr[uint8]](
+                    cast[uint64](line_buf) + tok_start)
+                if _http_buf_starts_with_ci(tok_ptr2, tok_len,
+                                            identity_lit, 8) == 0:
+                    printk0("[http] Content-Encoding: not gzip (V0 supports gzip only)\n")
+                return 0
+            tok_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+                cast[uint64](line_buf) + tok_start)
+            if _http_buf_starts_with_ci(tok_ptr, tok_len,
+                                        gzip_lit, gzip_lit_len) == 1:
+                return 1
+            return 0
+        if pos < hdrs_end:
+            pos = pos + 1
+    return 0
+
+
+def _http_emit_body(src: Ptr[uint8], src_len: uint64,
+                    out_buf: Ptr[uint8], out_max: uint64,
+                    body_written_p: Ptr[uint64],
+                    inflate_done_p: Ptr[int32]) -> int32:
+    # Common body-emit path used by both the non-chunked
+    # (Content-Length / EOF-delimited) loop in http_get/https_get AND
+    # the chunked-decoder data-copy block. When the per-call inflater
+    # flag is OFF this is a bounded memcpy into out_buf. When the
+    # flag is ON, the bytes are streamed through inflate_feed and
+    # the inflated output lands in out_buf.
+    #
+    # Returns 0 on partial success (no error yet, more input may
+    # follow), +1 once the gzip stream's trailer has verified (caller
+    # can stop reading), -1 on hard error (inflate_feed rejected the
+    # stream, out_buf overflowed, etc.). `*body_written_p` is the
+    # caller's running output cursor (out_buf bytes consumed so far)
+    # and is advanced in place. `*inflate_done_p` is set to 1 once
+    # the inflater reports stream-end (idempotent — caller can poll).
+    if http_inflate_active == 0:
+        # Identity body — bounded memcpy into out_buf.
+        body_written: uint64 = body_written_p[0]
+        if body_written >= out_max:
+            # Buffer already full; drop the rest silently. This
+            # matches the chunked-decoder's truncate-then-drain
+            # convention so the TCP/TLS session can still close
+            # cleanly afterwards.
+            return 0
+        room: uint64 = out_max - body_written
+        copy_n: uint64 = src_len
+        if copy_n > room:
+            copy_n = room
+        i: uint64 = 0
+        while i < copy_n:
+            out_buf[body_written + i] = src[i]
+            i = i + 1
+        body_written_p[0] = body_written + copy_n
+        return 0
+    # Inflate path. inflate_feed wants `out_buf + body_written` as
+    # the destination cursor and `out_max - body_written` as the
+    # remaining cap. We loop because a single feed call may consume
+    # the whole src but produce a few partial output blocks; the
+    # inner state machine drives the loop forward.
+    body_w: uint64 = body_written_p[0]
+    in_pos: uint64 = 0
+    while in_pos < src_len:
+        in_consumed: uint64 = 0
+        out_consumed: uint64 = 0
+        done: int32 = 0
+        feed_in: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](src) + in_pos)
+        feed_out: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](out_buf) + body_w)
+        feed_out_max: uint64 = 0
+        if body_w < out_max:
+            feed_out_max = out_max - body_w
+        infl_state_p: Ptr[InflateState] = cast[Ptr[InflateState]](
+            &http_inflate_state)
+        rc: int32 = inflate_feed(infl_state_p,
+                                 feed_in, src_len - in_pos,
+                                 feed_out, feed_out_max,
+                                 &out_consumed, &in_consumed,
+                                 &done)
+        body_w = body_w + out_consumed
+        in_pos = in_pos + in_consumed
+        if rc < 0:
+            printk0("[http] inflate_feed: stream error\n")
+            body_written_p[0] = body_w
+            return -1
+        if done == 1:
+            body_written_p[0] = body_w
+            inflate_done_p[0] = 1
+            http_inflate_done = 1
+            # Tolerate trailing bytes after gzip trailer — apt-style
+            # peers send `0\r\n\r\n` after the gzip-ISIZE field for
+            # chunked transport, and they aren't part of the gzip
+            # stream. Caller (chunked decoder OR CL loop) keeps
+            # draining; we just stop forwarding to inflate_feed.
+            return 1
+        if rc == 0 and in_consumed == 0 and out_consumed == 0:
+            # Defensive: stalled inflater (e.g. waiting for more
+            # bits) with nothing further we can supply this call.
+            # Break to caller and resume on the next feed.
+            break
+    body_written_p[0] = body_w
+    return 0
+
+
 def _http_hex_val(c: uint8) -> int32:
     # Map an ASCII hex digit (0-9 / a-f / A-F) to its 0..15 value, or
     # -1 if `c` isn't a hex digit. Used by the chunk-size parser.
@@ -826,21 +1038,40 @@ def _http_chunked_decode(transport: uint8, slot: int32,
             take: uint64 = avail
             if take > remaining:
                 take = remaining
-            # Copy into out_buf (bounded by out_max), drop the rest
-            # silently — we still need to advance head so subsequent
-            # CRLF / next-chunk scanning works.
+            # Hand the take-byte slice to _http_emit_body. When the
+            # inflater is OFF (`http_inflate_active == 0`) this is a
+            # bounded memcpy into out_buf. When it's ON the bytes
+            # are streamed through inflate_feed and the inflated
+            # output lands in out_buf — RFC 7230 §3.3.1 reverse
+            # order (dechunk first, then ungzip), driven entirely
+            # from inside the same data-copy loop so we never
+            # double-buffer the encoded body.
             if truncated == 0:
-                room: uint64 = out_max - body_written
-                copy_n: uint64 = take
-                if copy_n > room:
-                    copy_n = room
+                inflate_done_local: int32 = 0
+                src_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+                    cast[uint64](&http_chunked_buf[0])
+                    + http_chunked_head)
+                body_p: Ptr[uint64] = cast[Ptr[uint64]](&body_written)
+                rc_emit: int32 = _http_emit_body(
+                    src_ptr, take, out_buf, out_max,
+                    body_p, &inflate_done_local)
+                if rc_emit < 0:
+                    printk0("[http] chunked: inflate error in data copy\n")
+                    return -1
+                if inflate_done_local == 1:
+                    # gzip stream is finished. Any further chunked
+                    # bytes are post-trailer noise; flip truncated
+                    # so the rest of this chunk + any later chunks
+                    # are silently drained (the chunked decoder
+                    # still needs the bookkeeping bytes to find the
+                    # last-chunk marker and trailer).
                     truncated = 1
-                ii: uint64 = 0
-                while ii < copy_n:
-                    out_buf[body_written + ii] = \
-                        http_chunked_buf[http_chunked_head + ii]
-                    ii = ii + 1
-                body_written = body_written + copy_n
+                # _http_emit_body's identity path bumps body_written
+                # only up to room; detect that here so a subsequent
+                # chunked refill doesn't keep overwriting at body_max.
+                if http_inflate_active == 0:
+                    if body_written >= out_max:
+                        truncated = 1
             http_chunked_head = http_chunked_head + take
             remaining = remaining - take
 
@@ -874,7 +1105,9 @@ def http_init():
     http_bytes_in = 0
     http_chunked_head = 0
     http_chunked_tail = 0
-    printk0("http: client initialized (HTTP/1.1, GET only)\n")
+    http_inflate_active = 0
+    http_inflate_done = 0
+    printk0("http: client initialized (HTTP/1.1, GET + gzip)\n")
 
 
 def http_get(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
@@ -962,6 +1195,18 @@ def http_get(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
     have_cl:   int32 = 0
     cl_val:    uint64 = 0
     body_written: uint64 = 0
+    # V6: when Content-Encoding: gzip is in flight, `body_written`
+    # counts inflated output bytes (what the caller sees in out_buf)
+    # while `body_consumed_enc` counts encoded body bytes pulled off
+    # the transport (what Content-Length measures). The two diverge
+    # whenever the inflater is active, which is why the CL
+    # termination check must read the latter, not the former.
+    body_consumed_enc: uint64 = 0
+    inflate_done_flag: int32 = 0
+    # Defensive reset: prior http_get may have errored out without
+    # clearing the flag. Idempotent — only matters on the first
+    # call after a previous gzip response.
+    http_inflate_active = 0
     # Header-scan state: where in http_rx_buf is the byte after the
     # last \r\n we saw, and whether the last two bytes formed
     # `\r\n`. The state machine implementation lives below.
@@ -1042,6 +1287,29 @@ def http_get(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
                     hp = hp + 1
                 if found_end == 1:
                     head_done = 1
+                    # V6: Content-Encoding: gzip detection has to land
+                    # BEFORE the chunked branch so the chunked
+                    # decoder's data-copy block can route bytes
+                    # through inflate_feed instead of memcpy.
+                    # RFC 7230 §3.3.1: when both `Transfer-Encoding:
+                    # chunked` and `Content-Encoding: gzip` are
+                    # present, codecs apply in reverse-receive order
+                    # (dechunk first, then ungzip). Multi-token
+                    # Content-Encoding values (`gzip, deflate`) bail
+                    # with -1 — V0 wireup matches single-token gzip
+                    # only.
+                    gz_rc: int32 = _http_extract_gzip_ce(
+                        rx_ptr, hdr_scan_start, end_off)
+                    if gz_rc < 0:
+                        tcp_close(slot)
+                        return -1
+                    if gz_rc == 1:
+                        http_inflate_active = 1
+                        http_inflate_done = 0
+                        infl_p: Ptr[InflateState] = cast[Ptr[InflateState]](
+                            &http_inflate_state)
+                        inflate_init(infl_p)
+                        printk0("[http] Content-Encoding: gzip (inflater wired in)\n")
                     # Walk the headers looking for Content-Length and
                     # Transfer-Encoding. Per RFC 7230 §3.3.3, chunked
                     # takes precedence over Content-Length when both
@@ -1058,13 +1326,30 @@ def http_get(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
                         carry_len: uint64 = chunk_n - end_off
                         carry_ptr: Ptr[uint8] = cast[Ptr[uint8]](
                             cast[uint64](rx_ptr) + end_off)
+                        chunked_active_gz: int32 = http_inflate_active
                         dec_rc: int64 = _http_chunked_decode(
                             HTTP_TRANS_TCP, slot, out_buf, out_max,
                             carry_ptr, carry_len)
-                        tcp_close(slot)
                         if dec_rc < 0:
+                            http_inflate_active = 0
+                            tcp_close(slot)
                             return -1
+                        if chunked_active_gz == 1:
+                            # Same "emit-before-close" guard as the
+                            # non-chunked path: the kernel log
+                            # carries the gzip wireup outcome
+                            # regardless of the active-close stall.
+                            printk2("[http] inflate complete (chunked): written=%d done=%d\n",
+                                    cast[uint64](dec_rc),
+                                    cast[uint64](http_inflate_done))
+                        tcp_close(slot)
+                        if chunked_active_gz == 1:
+                            if http_inflate_done == 0:
+                                printk0("[http] inflate: chunked body ended before gzip trailer (truncated)\n")
+                                http_inflate_active = 0
+                                return -1
                         body_written = cast[uint64](dec_rc)
+                        http_inflate_active = 0
                         printk2("[http] GET complete: status=%d body=%d bytes\n",
                                 cast[uint64](status_out[0]), body_written)
                         return dec_rc
@@ -1094,40 +1379,77 @@ def http_get(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
                 tcp_close(slot)
                 return cast[int64](body_written)
 
-        # Now copy body_off..chunk_n into out_buf (subject to out_max
-        # and Content-Length).
+        # Hand the body slice to _http_emit_body. Identity path is a
+        # bounded memcpy into out_buf; gzip path streams the bytes
+        # through inflate_feed and accumulates inflated output in
+        # out_buf. Either way, body_written tracks bytes WRITTEN TO
+        # out_buf (i.e. inflated output bytes when gzip is on),
+        # which is what the caller cares about and what we return.
+        # body_consumed_enc tracks ENCODED bytes pulled from the
+        # transport — needed for Content-Length termination since CL
+        # counts the encoded body length.
         if body_off < chunk_n:
             copy_avail: uint64 = chunk_n - body_off
-            copy_room:  uint64 = out_max - body_written
-            copy_n: uint64 = copy_avail
-            if copy_n > copy_room:
-                copy_n = copy_room
+            consume_n: uint64 = copy_avail
             if have_cl == 1:
                 # Stop at the declared body length even if the peer
                 # somehow streams more (defensive — apt's HTTP/1.1
                 # peers don't do this with `Connection: close`).
-                remaining: uint64 = cl_val - body_written
-                if copy_n > remaining:
-                    copy_n = remaining
-            i: uint64 = 0
-            while i < copy_n:
-                out_buf[body_written + i] = http_rx_buf[body_off + i]
-                i = i + 1
-            body_written = body_written + copy_n
+                remaining: uint64 = cl_val - body_consumed_enc
+                if consume_n > remaining:
+                    consume_n = remaining
+            src_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+                cast[uint64](&http_rx_buf[0]) + body_off)
+            body_p: Ptr[uint64] = cast[Ptr[uint64]](&body_written)
+            inflate_done_local: int32 = 0
+            rc_emit: int32 = _http_emit_body(
+                src_ptr, consume_n, out_buf, out_max,
+                body_p, &inflate_done_local)
+            if rc_emit < 0:
+                http_inflate_active = 0
+                tcp_close(slot)
+                return -1
+            body_consumed_enc = body_consumed_enc + consume_n
+            if inflate_done_local == 1:
+                inflate_done_flag = 1
 
         # Termination check: bail out once we've grabbed all the bytes
         # the caller asked for, or all the bytes Content-Length
-        # promised. Otherwise loop and read more.
+        # promised. When inflate is active, treat done==1 as the
+        # equivalent of "Content-Length satisfied" — any further
+        # bytes are post-gzip-trailer noise we don't care about.
         if body_written >= out_max:
             break
+        if inflate_done_flag == 1:
+            break
         if have_cl == 1:
-            if body_written >= cl_val:
+            if body_consumed_enc >= cl_val:
                 break
 
+    if http_inflate_active == 1:
+        # Emit the inflate summary BEFORE tcp_close. The active-close
+        # half-close handshake stalls in FIN_WAIT_2 on some
+        # SLIRP-forwarded peers (pre-existing TCP bug, see V6
+        # residuals); printing here guarantees the kernel log
+        # always carries the gzip wireup outcome even when the
+        # close races.
+        printk2("[http] inflate complete: written=%d done=%d\n",
+                body_written, cast[uint64](inflate_done_flag))
     tcp_close(slot)
     if head_done == 0:
+        http_inflate_active = 0
         printk0("[http] no headers received\n")
         return -1
+    if http_inflate_active == 1:
+        if inflate_done_flag == 0:
+            # Encoded body ended before the gzip trailer fired —
+            # truncated upstream OR our caller's out_buf overflowed
+            # mid-stream. Either way, surface to the caller with -1
+            # so they don't ship a partial Packages.gz upstream.
+            printk0("[http] inflate: stream ended before gzip trailer (truncated body)\n")
+            http_inflate_active = 0
+            return -1
+    http_inflate_active = 0
     printk2("[http] GET complete: status=%d body=%d bytes\n",
             cast[uint64](status_out[0]), body_written)
     return cast[int64](body_written)
@@ -1342,6 +1664,12 @@ def https_get(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
     have_cl:   int32 = 0
     cl_val:    uint64 = 0
     body_written: uint64 = 0
+    # V6: encoded-body cursor + gzip-stream-done flag mirror the
+    # http_get path above so Content-Encoding: gzip responses
+    # decompress transparently here too.
+    body_consumed_enc: uint64 = 0
+    inflate_done_flag: int32 = 0
+    http_inflate_active = 0
     rx_ptr: Ptr[uint8] = cast[Ptr[uint8]](&http_rx_buf[0])
 
     while True:
@@ -1405,6 +1733,21 @@ def https_get(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
                     hp = hp + 1
                 if found_end == 1:
                     head_done = 1
+                    # V6: gzip detection lands before the chunked
+                    # branch so the chunked decoder's inner data-copy
+                    # block can route bytes through inflate_feed.
+                    gz_rc: int32 = _http_extract_gzip_ce(
+                        rx_ptr, hdr_scan_start, end_off)
+                    if gz_rc < 0:
+                        tls_close()
+                        return -1
+                    if gz_rc == 1:
+                        http_inflate_active = 1
+                        http_inflate_done = 0
+                        infl_p: Ptr[InflateState] = cast[Ptr[InflateState]](
+                            &http_inflate_state)
+                        inflate_init(infl_p)
+                        printk0("[https] Content-Encoding: gzip (inflater wired in)\n")
                     is_chunked: int32 = _http_extract_chunked_te(
                         rx_ptr, hdr_scan_start, end_off)
                     if is_chunked == 1:
@@ -1414,13 +1757,26 @@ def https_get(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
                         carry_len: uint64 = chunk_n - end_off
                         carry_ptr: Ptr[uint8] = cast[Ptr[uint8]](
                             cast[uint64](rx_ptr) + end_off)
+                        chunked_active_gz: int32 = http_inflate_active
                         dec_rc: int64 = _http_chunked_decode(
                             HTTP_TRANS_TLS, slot, out_buf, out_max,
                             carry_ptr, carry_len)
-                        tls_close()
                         if dec_rc < 0:
+                            http_inflate_active = 0
+                            tls_close()
                             return -1
+                        if chunked_active_gz == 1:
+                            printk2("[https] inflate complete (chunked): written=%d done=%d\n",
+                                    cast[uint64](dec_rc),
+                                    cast[uint64](http_inflate_done))
+                        tls_close()
+                        if chunked_active_gz == 1:
+                            if http_inflate_done == 0:
+                                printk0("[https] inflate: chunked body ended before gzip trailer (truncated)\n")
+                                http_inflate_active = 0
+                                return -1
                         body_written = cast[uint64](dec_rc)
+                        http_inflate_active = 0
                         printk2("[https] GET complete: status=%d body=%d bytes\n",
                                 cast[uint64](status_out[0]), body_written)
                         return dec_rc
@@ -1447,30 +1803,51 @@ def https_get(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
 
         if body_off < chunk_n:
             copy_avail: uint64 = chunk_n - body_off
-            copy_room:  uint64 = out_max - body_written
-            copy_n: uint64 = copy_avail
-            if copy_n > copy_room:
-                copy_n = copy_room
+            consume_n: uint64 = copy_avail
             if have_cl == 1:
-                remaining: uint64 = cl_val - body_written
-                if copy_n > remaining:
-                    copy_n = remaining
-            i: uint64 = 0
-            while i < copy_n:
-                out_buf[body_written + i] = http_rx_buf[body_off + i]
-                i = i + 1
-            body_written = body_written + copy_n
+                remaining: uint64 = cl_val - body_consumed_enc
+                if consume_n > remaining:
+                    consume_n = remaining
+            src_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+                cast[uint64](&http_rx_buf[0]) + body_off)
+            body_p: Ptr[uint64] = cast[Ptr[uint64]](&body_written)
+            inflate_done_local: int32 = 0
+            rc_emit: int32 = _http_emit_body(
+                src_ptr, consume_n, out_buf, out_max,
+                body_p, &inflate_done_local)
+            if rc_emit < 0:
+                http_inflate_active = 0
+                tls_close()
+                return -1
+            body_consumed_enc = body_consumed_enc + consume_n
+            if inflate_done_local == 1:
+                inflate_done_flag = 1
 
         if body_written >= out_max:
             break
+        if inflate_done_flag == 1:
+            break
         if have_cl == 1:
-            if body_written >= cl_val:
+            if body_consumed_enc >= cl_val:
                 break
 
+    if http_inflate_active == 1:
+        # Emit-before-close (see http_get's matching comment) so the
+        # gzip wireup outcome lands in the kernel log regardless of
+        # the active-close stall.
+        printk2("[https] inflate complete: written=%d done=%d\n",
+                body_written, cast[uint64](inflate_done_flag))
     tls_close()
     if head_done == 0:
+        http_inflate_active = 0
         printk0("[https] no headers received\n")
         return -1
+    if http_inflate_active == 1:
+        if inflate_done_flag == 0:
+            printk0("[https] inflate: stream ended before gzip trailer (truncated body)\n")
+            http_inflate_active = 0
+            return -1
+    http_inflate_active = 0
     printk2("[https] GET complete: status=%d body=%d bytes\n",
             cast[uint64](status_out[0]), body_written)
     return cast[int64](body_written)

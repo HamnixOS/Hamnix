@@ -47,6 +47,21 @@ if os.environ.get("ENABLE_TLS_SMOKE") == "1":
 if os.environ.get("ENABLE_TLS_CHUNKED_SMOKE") == "1":
     FILES.append(("/etc/tls-chunked-test", b"1\n"))
 
+# Content-Encoding: gzip wireup smoke. See
+# scripts/test_net_https_gzip.sh; the harness sets
+# ENABLE_TLS_GZIP_SMOKE=1 to plant /etc/tls-gzip-test, and
+# init/main.ad's https_gzip_smoke_test gates on that file. The
+# fixture serves a chunked+gzip body and the kernel-side smoke
+# verifies the inflated bytes match the expected plaintext.
+# The same env var also plants /etc/skip-https-internet-smoke so
+# the unconditional https://example.com leg in net_smoke_test
+# doesn't fire (the current baseline traps mid-TLS-handshake on
+# the AES-256-GCM record, a separate residual that would
+# otherwise kill the kernel before reaching the gzip smoke).
+if os.environ.get("ENABLE_TLS_GZIP_SMOKE") == "1":
+    FILES.append(("/etc/tls-gzip-test", b"1\n"))
+    FILES.append(("/etc/skip-https-internet-smoke", b"1\n"))
+
 # V5.3 TCP RX-ring multi-segment smoke. Gated the same way as
 # /etc/tls-test so the kernel doesn't try to ARP / SYN 10.0.2.201
 # during boot when the test_tcp_ring.sh harness isn't running —
