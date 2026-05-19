@@ -35,7 +35,11 @@ qemu-system-x86_64 -kernel init/main.elf -nographic \
     -append "console=ttyS0" -no-reboot -m 256M \
     > "$TMP/serial.log" 2>&1 &
 QEMU=$!
-sleep 30
+for _i in $(seq 1 60); do
+    sleep 1
+    if grep -q "PASS" "$TMP/serial.log" 2>/dev/null; then break; fi
+    kill -0 $QEMU 2>/dev/null || break
+done
 kill -9 $QEMU 2>/dev/null || true
 wait $QEMU 2>/dev/null || true
 
