@@ -80,13 +80,72 @@ extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 E1000E_PCI_INTERRUPT_LINE: uint32 = 0x3C
 E1000E_PCI_INTERRUPT_PIN:  uint32 = 0x3D
 
-# CPU vector this driver claims for its INTx IRQ. virtio-net = 0x40;
-# AHCI = 0x41; NVMe = 0x42; e1000e = 0x43 (M16.114 IRQ-wiring batch).
-E1000E_IRQ_VECTOR: uint32 = 0x43
+# PCI Status register (offset 0x06, 16-bit half of the 0x04 dword). Bit 4
+# = "Capabilities List" — when set, the byte at PCI config offset 0x34
+# holds the byte-offset of the first capability struct. Required for any
+# device that wants to expose MSI / MSI-X / PCIe extended caps.
+E1000E_PCI_STATUS_OFFSET:    uint32 = 0x06
+E1000E_PCI_STATUS_CAP_LIST:  uint32 = 0x10           # bit 4
+E1000E_PCI_CAP_PTR_OFFSET:   uint32 = 0x34
+
+# Capability IDs we walk for.
+E1000E_PCI_CAP_ID_MSI:    uint32 = 0x05
+E1000E_PCI_CAP_ID_MSIX:   uint32 = 0x11              # diagnostic only — V2 stays single-vector
+
+# MSI Capability layout (relative to the cap's base offset in PCI config):
+#   +0  uint8  Capability ID (0x05)
+#   +1  uint8  Next-cap pointer
+#   +2  uint16 Message Control
+#                bit 0     MSI Enable
+#                bits 1..3 Multiple Message Capable  (RO, log2 of vectors)
+#                bits 4..6 Multiple Message Enable   (we leave at 0 — 1 vector)
+#                bit 7     64-bit Address Capable
+#                bit 8     Per-vector Masking Capable
+#   +4  uint32 Message Address Low  (32 bits or low half of 64)
+#   +8  uint32 Message Address High (only present when 64-bit Capable)
+#   32-bit layout: +8  uint16 Message Data
+#   64-bit layout: +12 uint16 Message Data
+E1000E_MSI_CTRL_OFFSET:       uint32 = 0x02
+E1000E_MSI_ADDR_LOW_OFFSET:   uint32 = 0x04
+E1000E_MSI_ADDR_HIGH_OFFSET:  uint32 = 0x08
+E1000E_MSI_DATA_OFFSET_32:    uint32 = 0x08
+E1000E_MSI_DATA_OFFSET_64:    uint32 = 0x0C
+
+E1000E_MSI_CTRL_ENABLE:       uint32 = 0x0001        # bit 0
+E1000E_MSI_CTRL_64BIT:        uint32 = 0x0080        # bit 7
+E1000E_MSI_CTRL_MMC_MASK:     uint32 = 0x000E        # bits 1..3
+E1000E_MSI_CTRL_MME_MASK:     uint32 = 0x0070        # bits 4..6 — written as 0 (1 vector)
+
+# LAPIC MSI message-address pattern. PCI spec / Intel SDM: an MSI write
+# targeting the local APIC uses physical addresses
+#   0xFEE0_0000 | (lapic_id << 12) | (redirection_hint << 3) | dest_mode_bit
+# We use RH=0 (no redirection), DM=0 (physical), so the only variable bit
+# is the destination LAPIC id in [19..12]. Single-CPU boot puts the BSP
+# at LAPIC id 0, so the address typically lands at exactly 0xFEE00000.
+E1000E_LAPIC_MSI_BASE: uint64 = 0xFEE00000
+
+# CPU vector this driver claims. Vector allocation map (single-vector
+# fixed-delivery to LAPIC 0, kept dense to leave room for MSI-X follow-up):
+#   0x40 virtio-net  0x41 ahci  0x42 nvme  0x43 (was e1000e INTx, retired)
+#   0x44 r8169       0x45 auxmouse  0x46 atkbd
+# V2 e1000e (MSI) claims the next free slot, 0x47. The IOAPIC fallback
+# (no MSI capability discovered) re-uses the same vector — IOAPIC
+# routing is by pin → vector, MSI is by config-space programming, but
+# both arrive at the same do_irq() table slot.
+E1000E_IRQ_VECTOR: uint32 = 0x47
 E1000E_LAPIC_ID:   uint32 = 0
 
+# Intel MSI message-data layout (per Intel SDM Vol 3A §10.11.2):
+#   bits  0..7   vector
+#   bits  8..10  delivery mode (0 = fixed)
+#   bit  14      level  (1 = assert; only meaningful when trigger=level)
+#   bit  15      trigger mode (0 = edge — what we want for MSI)
+# We use fixed-delivery edge-trigger, so the data field is simply the
+# vector with the upper bits cleared.
+E1000E_MSI_DATA_VECTOR_MASK: uint32 = 0x00FF
+
 # e1000e Interrupt Cause Read register (BAR0 + 0xC0). Read-to-clear.
-# Bit fields we care about for INTx:
+# Bit fields we care about:
 #   0   TXDW    — Transmit Descriptor Written Back
 #   1   TXQE    — Transmit Queue Empty
 #   2   LSC     — Link Status Change
@@ -95,7 +154,20 @@ E1000E_LAPIC_ID:   uint32 = 0
 #   7   RXT0    — Receiver Timer Interrupt (a frame has been delivered
 #                 to a host descriptor in the RX ring)
 E1000_ICR:         uint64 = 0x000C0
+E1000_ICR_TXDW:    uint32 = 0x00000001
+E1000_ICR_RXDMT0:  uint32 = 0x00000010
 E1000_ICR_RXT0:    uint32 = 0x00000080
+
+# IMS = Interrupt Mask Set/Read (BAR0 + 0xD0). Write 1s to unmask the
+# corresponding ICR bits — the device only raises an MSI / INTx pin
+# when (ICR & IMS) is non-zero. RXT0 + TXDW is the canonical
+# "drain RX on packet arrival, free TX descs on completion" pair.
+E1000_IMS:         uint64 = 0x000D0
+# IMC = Interrupt Mask Clear (BAR0 + 0xD8). Write 1s to mask. We use
+# this only to quiesce the device pre-MSI-program: writing 0xFFFF_FFFF
+# masks every source, so a stale latched cause from BIOS / firmware
+# can't fire the moment we enable the MSI capability.
+E1000_IMC:         uint64 = 0x000D8
 
 
 # --- PCI matching --------------------------------------------------
@@ -238,7 +310,7 @@ class E1000e:
     pad2:         uint32
     mac:          Array[6, uint8]
     rx_packets:   uint64
-    irq_pin:      uint32
+    irq_pin:      uint32                  # IOAPIC pin (fallback path only)
     pad_irq:      uint32
     irq_count:    uint64
     tx_ring:      uint64                  # base of the 4 KiB TX descriptor ring
@@ -246,6 +318,14 @@ class E1000e:
     pad_tx0:      uint16
     pad_tx1:      uint32
     tx_packets:   uint64
+    # MSI state (M16.x V2). msi_cap_off == 0 means "no MSI cap found;
+    # fell back to legacy INTx via IOAPIC". The is64 flag picks the
+    # data-register offset (+8 for 32-bit, +12 for 64-bit). enabled is
+    # the boolean we surface to the test fixture / boot log.
+    msi_cap_off:  uint32
+    msi_is_64:    uint32
+    msi_enabled:  uint32
+    pad_msi:      uint32
 
 
 e1000e_state: E1000e
@@ -526,6 +606,165 @@ def _e1000e_setup_tx(state: Ptr[E1000e]) -> int32:
     return 0
 
 
+# --- PCI capability list walking + MSI bring-up --------------------
+#
+# Mirrors drivers/pci/msi.c::pci_find_capability() at the smallest scale:
+# read the PCI Status register's Capabilities-List bit; if set, follow
+# the linked list rooted at config-space offset 0x34. Each capability
+# is two header bytes (ID, next-pointer) plus capability-specific
+# payload. We only walk for MSI (ID 0x05). MSI-X (ID 0x11) is logged
+# for diagnostic but is V3 scope — V2 stays single-vector MSI.
+#
+# Returns the byte offset of the MSI capability within PCI config
+# space (the offset whose first byte holds 0x05) or 0 if MSI isn't
+# present. 0 is a safe sentinel because PCI config offset 0 holds the
+# vendor/device-id dword — never a capability header.
+
+def _e1000e_msi_find_cap(bdf: uint32) -> uint32:
+    bus: uint32 = pci_bdf_bus(bdf)
+    dev: uint32 = pci_bdf_dev(bdf)
+    fn:  uint32 = pci_bdf_fn(bdf)
+
+    # 1. Check the "Capabilities List" bit in the Status register.
+    #    The Status register is the high 16 bits of the 0x04 dword;
+    #    a single dword read picks up both Command and Status.
+    cmd_status: uint32 = pci_config_read_dword(bus, dev, fn, 0x04)
+    status: uint32 = (cmd_status >> 16) & 0xFFFF
+    if (status & E1000E_PCI_STATUS_CAP_LIST) == 0:
+        printk0("[e1000e] PCI status reports no capability list\n")
+        return 0
+
+    # 2. Read the capability pointer at config offset 0x34. Mask to
+    #    DWORD-aligned offsets (low 2 bits reserved per spec).
+    cap_ptr: uint32 = pci_config_read_byte(bus, dev, fn,
+                                           E1000E_PCI_CAP_PTR_OFFSET) & 0xFC
+    # 3. Walk. Cap a maximum of 64 iterations as a malformed-list guard
+    #    (config space is 256 bytes / 2 bytes per cap header = 128 max,
+    #    but a circular list would otherwise wedge boot — 64 is plenty
+    #    for any real device).
+    steps: uint32 = 0
+    while cap_ptr != 0 and steps < 64:
+        cap_id: uint32 = pci_config_read_byte(bus, dev, fn, cap_ptr)
+        if cap_id == E1000E_PCI_CAP_ID_MSI:
+            return cap_ptr
+        if cap_id == E1000E_PCI_CAP_ID_MSIX:
+            # Diagnostic only — full MSI-X (multi-vector) is V3 scope.
+            # Continue walking past it because the device may expose
+            # both caps (real silicon usually does); pick MSI if both.
+            printk1("[e1000e] MSI-X cap seen at offset=0x%x (V3 scope)\n",
+                    cast[uint64](cap_ptr))
+        # Next pointer is at cap_ptr+1, DWORD-aligned per spec.
+        cap_ptr = pci_config_read_byte(bus, dev, fn, cap_ptr + 1) & 0xFC
+        steps = steps + 1
+    return 0
+
+
+def _e1000e_msi_program(bdf: uint32, cap_off: uint32) -> int32:
+    # Program the MSI capability:
+    #   - Message Address: 0xFEE00000 | (lapic_id << 12). RH=0, DM=0 →
+    #     direct delivery to a single physical LAPIC, no redirection.
+    #   - Message Address High: 0 (we're targeting a 32-bit LAPIC MMIO
+    #     window; the spec allows up to 64 bits for IOMMU-remapped
+    #     setups we don't support yet).
+    #   - Message Data: vector | (0 << 8)  → fixed delivery, edge.
+    #   - Control: bit 0 = MSI Enable. Multiple-Message-Enable stays 0
+    #     (single vector). We do NOT touch bits 8/9 (per-vector masking
+    #     capability) — we never enable per-vector masking for V2.
+    # Returns 0 on success, -1 if the cap is somehow malformed.
+    bus: uint32 = pci_bdf_bus(bdf)
+    dev: uint32 = pci_bdf_dev(bdf)
+    fn:  uint32 = pci_bdf_fn(bdf)
+
+    # 1. Read the Message Control register (at cap_off + 2, 16-bit).
+    #    Each dword in PCI config space is at a 4-byte boundary; the
+    #    MSI cap header (id, next) is in the low 16 bits of the cap_off
+    #    dword, Message Control is the high 16 bits. Read the whole
+    #    dword and extract.
+    ctrl_dword_off: uint32 = cap_off & 0xFC
+    ctrl_dword: uint32 = pci_config_read_dword(bus, dev, fn,
+                                               ctrl_dword_off)
+    ctrl: uint32 = (ctrl_dword >> 16) & 0xFFFF
+    is_64: uint32 = 0
+    if (ctrl & E1000E_MSI_CTRL_64BIT) != 0:
+        is_64 = 1
+    mmc: uint32 = (ctrl & E1000E_MSI_CTRL_MMC_MASK) >> 1
+    printk2("[e1000e] MSI cap found at offset=0x%x ctrl=0x%x\n",
+            cast[uint64](cap_off), cast[uint64](ctrl))
+    printk2("[e1000e] MSI is64=%d multimsg_capable=2^%d\n",
+            cast[uint64](is_64), cast[uint64](mmc))
+
+    # 2. Compose the Message Address. LAPIC id 0 lives at exactly
+    #    0xFEE00000; non-zero ids shift into bits 19..12.
+    addr_lo: uint32 = cast[uint32](E1000E_LAPIC_MSI_BASE & 0xFFFFFFFF) \
+                   | ((E1000E_LAPIC_ID & 0xFF) << 12)
+    addr_hi: uint32 = 0
+
+    # 3. Compose the Message Data. Fixed delivery (mode=000), edge
+    #    trigger (bit 15 clear), vector in low 8 bits.
+    data: uint32 = E1000E_IRQ_VECTOR & E1000E_MSI_DATA_VECTOR_MASK
+
+    # 4. Write Message Address Low. This is at cap_off+4, dword-aligned
+    #    iff cap_off is dword-aligned (which it is — see _e1000e_msi_find_cap).
+    pci_config_write_dword(bus, dev, fn, cap_off + E1000E_MSI_ADDR_LOW_OFFSET,
+                           addr_lo)
+
+    # 5. Write Message Address High (only meaningful when 64-bit cap),
+    #    Data, and Control. Message Data sits at +8 (32-bit MSI) or
+    #    +12 (64-bit MSI); compute the dword offset once.
+    data_dword_off: uint32 = (cap_off + E1000E_MSI_DATA_OFFSET_32) & 0xFC
+    if is_64 != 0:
+        pci_config_write_dword(bus, dev, fn,
+                               cap_off + E1000E_MSI_ADDR_HIGH_OFFSET,
+                               addr_hi)
+        data_dword_off = (cap_off + E1000E_MSI_DATA_OFFSET_64) & 0xFC
+    # Preserve the upper 16 bits of the data dword by RMW (those bits
+    # are reserved per spec but real silicon sometimes returns non-zero
+    # on read — overwriting them with 0 is a portability hazard).
+    data_dword: uint32 = pci_config_read_dword(bus, dev, fn,
+                                               data_dword_off)
+    data_dword = (data_dword & 0xFFFF0000) | (data & 0xFFFF)
+    pci_config_write_dword(bus, dev, fn, data_dword_off, data_dword)
+
+    # 6. Set the MSI Enable bit (bit 0 of Message Control). RMW the
+    #    high half of the ctrl dword so we don't disturb the cap
+    #    header (low half) or the multimsg-enable bits we deliberately
+    #    leave at zero.
+    new_ctrl: uint32 = (ctrl | E1000E_MSI_CTRL_ENABLE) & 0xFFFF
+    # Also explicitly clear MME (bits 4..6) to advertise 1 vector even
+    # if firmware left a stale value latched there. MSI-X cleanup
+    # (separate cap, separate enable bit) is V3 scope.
+    new_ctrl = new_ctrl & (~E1000E_MSI_CTRL_MME_MASK)
+    new_dword: uint32 = (ctrl_dword & 0x0000FFFF) | (new_ctrl << 16)
+    pci_config_write_dword(bus, dev, fn, ctrl_dword_off, new_dword)
+
+    e1000e_state.msi_cap_off = cap_off
+    e1000e_state.msi_is_64   = is_64
+    e1000e_state.msi_enabled = 1
+    printk2("[e1000e] MSI vector=0x%x enabled (addr=0x%x",
+            cast[uint64](E1000E_IRQ_VECTOR), cast[uint64](addr_lo))
+    printk1(" data=0x%x)\n", cast[uint64](data))
+    return 0
+
+
+def _e1000e_unmask_device_irqs():
+    # Tell the controller which causes are allowed to raise an interrupt.
+    # IMS is a SET register: writing 1s to a bit unmasks the matching ICR
+    # cause. RXT0 (frame delivered) + TXDW (TX descriptor completed) is
+    # the V2 minimum. ICR | other bits stay masked — RXO / LSC / etc are
+    # follow-up work.
+    if e1000e_state.bar0 == 0:
+        return
+    # Quiesce first: write 0xFFFF_FFFF to IMC to mask everything so a
+    # latched stale cause from BIOS / firmware can't fire on the
+    # very first ICR read after we enable MSI. Then read+clear ICR
+    # (read-to-clear semantics).
+    _e1000e_mmio_w32(e1000e_state.bar0 + E1000_IMC, 0xFFFFFFFF)
+    _e1000e_mmio_r32(e1000e_state.bar0 + E1000_ICR)
+    # Now unmask the causes we care about.
+    ims_bits: uint32 = E1000_ICR_RXT0 | E1000_ICR_TXDW
+    _e1000e_mmio_w32(e1000e_state.bar0 + E1000_IMS, ims_bits)
+
+
 # --- Public entry point --------------------------------------------
 
 def e1000e_init() -> int32:
@@ -620,47 +859,111 @@ def e1000e_init() -> int32:
     printk1("[e1000e] TX ring ready (%d descriptors)\n",
             cast[uint64](NR_TX_DESCS))
 
-    # M16.114: wire the INTx IRQ. Same shape as drivers/net/virtio_net.ad
-    # — read PCI INTx pin / line, route the firmware-assigned IOAPIC pin
-    # to our chosen vector (0x43) on LAPIC 0, register the handler. The
-    # polled e1000e_poll() stays as safety-net for the pre-sti window.
-    bus_e:  uint32 = pci_bdf_bus(bdf)
-    dev_e:  uint32 = pci_bdf_dev(bdf)
-    fn_e:   uint32 = pci_bdf_fn(bdf)
-    intx_pin:  uint32 = pci_config_read_byte(bus_e, dev_e, fn_e,
-                                             E1000E_PCI_INTERRUPT_PIN)
-    intx_line: uint32 = pci_config_read_byte(bus_e, dev_e, fn_e,
-                                             E1000E_PCI_INTERRUPT_LINE)
-    ioapic_pin: uint32 = intx_line
-    if intx_pin == 0 or intx_line == 0 or intx_line >= 24:
-        # QEMU's e1000e lands on IOAPIC pin 11 by default (PCI slot
-        # rotation under i440FX). Use that as the safety default.
-        ioapic_pin = 11
-    e1000e_state.irq_pin = ioapic_pin
+    # V2: prefer MSI over legacy INTx. MSI sidesteps the boot-order trap
+    # that kept V1 polled — INTx requires the IOAPIC be programmed and
+    # the LAPIC be online, but pci_scan() runs in net_smoke_test() BEFORE
+    # i8259_init() / apic_init(). MSI writes go straight from the PCI
+    # device to the LAPIC's MMIO window (0xFEE0_xxxx); the only
+    # prerequisite that's actually load-bearing at pci_scan() time is
+    # the IDT being populated (it is, from start_kernel before
+    # net_smoke_test). MSI delivery will start once the LAPIC is
+    # software-enabled later in start_kernel and the IF flag is set.
+    #
+    # If the device doesn't expose an MSI capability (real silicon
+    # whose firmware suppresses it, or a VM without `-device e1000e`'s
+    # MSI emulation enabled) we fall back to the M16.114 IOAPIC INTx
+    # path. Same vector, different delivery — do_irq() doesn't care.
     e1000e_state.irq_count = 0
+    e1000e_state.msi_cap_off = 0
+    e1000e_state.msi_is_64   = 0
+    e1000e_state.msi_enabled = 0
     register_irq_handler(cast[uint64](E1000E_IRQ_VECTOR),
                          cast[uint64](&e1000e_irq_handler))
-    ioapic_redirect(ioapic_pin, E1000E_IRQ_VECTOR, E1000E_LAPIC_ID)
-    printk2("[e1000e] irq pin=%d vec=0x%x\n",
-            cast[uint64](ioapic_pin), cast[uint64](E1000E_IRQ_VECTOR))
+
+    msi_off: uint32 = _e1000e_msi_find_cap(bdf)
+    if msi_off != 0:
+        # MSI capability present — program it. The "no ioapic_redirect"
+        # path is the whole point of V2: MSI bypasses the IOAPIC, so a
+        # single write to PCI config space is enough to wire the IRQ.
+        _e1000e_msi_program(bdf, msi_off)
+    else:
+        # Fallback: legacy INTx via the IOAPIC. Identical to the V1
+        # path — reads PCI INTERRUPT_PIN/LINE for diagnostic, routes
+        # the firmware-assigned IOAPIC pin to our vector. Note that
+        # this only fires once i8259_init() / apic_init() have run
+        # AND IF is set; the polled e1000e_poll() in pci_scan() is
+        # still load-bearing for the during-init ARP-probe round-trip.
+        printk0("[e1000e] no MSI capability; falling back to IOAPIC INTx\n")
+        bus_e:  uint32 = pci_bdf_bus(bdf)
+        dev_e:  uint32 = pci_bdf_dev(bdf)
+        fn_e:   uint32 = pci_bdf_fn(bdf)
+        intx_pin:  uint32 = pci_config_read_byte(bus_e, dev_e, fn_e,
+                                                 E1000E_PCI_INTERRUPT_PIN)
+        intx_line: uint32 = pci_config_read_byte(bus_e, dev_e, fn_e,
+                                                 E1000E_PCI_INTERRUPT_LINE)
+        ioapic_pin: uint32 = intx_line
+        if intx_pin == 0 or intx_line == 0 or intx_line >= 24:
+            # QEMU's e1000e lands on IOAPIC pin 11 by default (PCI slot
+            # rotation under i440FX). Use that as the safety default.
+            ioapic_pin = 11
+        e1000e_state.irq_pin = ioapic_pin
+        ioapic_redirect(ioapic_pin, E1000E_IRQ_VECTOR, E1000E_LAPIC_ID)
+        printk2("[e1000e] INTx fallback pin=%d vec=0x%x\n",
+                cast[uint64](ioapic_pin), cast[uint64](E1000E_IRQ_VECTOR))
+
+    # Unmask the device-side causes (IMS = RXT0 | TXDW). With both MSI
+    # AND the device-level mask set, an inbound frame or TX-completion
+    # will fire an MSI write — once interrupts are globally enabled.
+    _e1000e_unmask_device_irqs()
+
+    # Make the IRQ-count counter visible at init time. Starts at 0 —
+    # actual IRQs only fire once apic_init() has run and the IF flag
+    # is set, both of which happen later in start_kernel(). Operators
+    # / tests can re-read e1000e_irq_count() any time after that.
+    printk1("[e1000e] IRQ counter armed (count=%d)\n",
+            e1000e_state.irq_count)
 
     printk0("[e1000e] init done\n")
     return 0
 
 
 def e1000e_irq_handler():
-    # IRQ-context entry. Read ICR (Interrupt Cause Read) — the
-    # canonical Intel "acknowledge interrupt" register. It is
-    # read-to-clear: reading it returns the latched cause bits AND
-    # clears them in one go. If RXT0 is set, at least one descriptor
-    # has been written back; drain the RX ring the same way the
-    # polling path does.
+    # IRQ-context entry, reached via MSI (V2 primary path) or via INTx
+    # through the IOAPIC (V1 fallback). Both paths arrive at the same
+    # vector and call do_irq() -> this handler. The LAPIC EOI is
+    # written by do_irq() AFTER this returns; we must NOT EOI here.
+    #
+    # Read ICR (Interrupt Cause Read) — the canonical Intel
+    # "acknowledge interrupt" register. e1000e ICR is read-to-clear:
+    # reading it returns the latched cause bits AND clears them in
+    # one go.
     if e1000e_state.bar0 == 0:
         return
     e1000e_state.irq_count = e1000e_state.irq_count + 1
     icr: uint32 = _e1000e_mmio_r32(e1000e_state.bar0 + E1000_ICR)
-    if (icr & E1000_ICR_RXT0) != 0:
+    # Surface a periodic counter so the boot log makes the IRQ-driven
+    # path visible without burying it in every-IRQ noise. First IRQ
+    # gets a single line; subsequent IRQs are silent (counter readable
+    # via e1000e_irq_count()).
+    if e1000e_state.irq_count == 1:
+        printk2("[e1000e] first IRQ fired (icr=0x%x count=%d)\n",
+                cast[uint64](icr), e1000e_state.irq_count)
+    # RXT0 (receiver-timer) or RXDMT0 (RX descriptor min threshold) →
+    # drain the RX ring with the existing poll helper.
+    if (icr & (E1000_ICR_RXT0 | E1000_ICR_RXDMT0)) != 0:
         e1000e_poll()
+    # TXDW (transmit descriptor written back) → in the V2 scope the TX
+    # path is still spin-wait-on-DD inside e1000e_tx(), so the only
+    # work here is acknowledging the cause (already done by the ICR
+    # read). Counter for diagnostic; richer TX-completion handling
+    # (free-on-DD, multi-in-flight) is V3.
+
+
+def e1000e_msi_enabled() -> uint32:
+    # Test fixtures can observe MSI vs INTx via this getter — the
+    # "[e1000e] MSI vector=... enabled" log line is the primary signal,
+    # this is the secondary state-machine probe.
+    return e1000e_state.msi_enabled
 
 
 def e1000e_irq_count() -> uint64:
