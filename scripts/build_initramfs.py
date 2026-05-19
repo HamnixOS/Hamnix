@@ -72,6 +72,21 @@ if os.environ.get("ENABLE_TLS_GZIP_SMOKE") == "1":
 if os.environ.get("ENABLE_TCP_RING_SMOKE") == "1":
     FILES.append(("/etc/tcp-ring-test", b"1\n"))
 
+# TCP FIN_WAIT_2 timeout smoke. Gated the same way as the TLS / TCP
+# ring markers above. The fixture (scripts/test_tcp_fin_wait2.sh)
+# stands up a Python server that ACKs our FIN but never sends its
+# own — exercising the RFC 793 §3.5 / RFC 7414 §2.17 FIN_WAIT_2
+# timeout path in drivers/net/tcp.ad. Only that one harness sets
+# this; other tests run without the marker (and so without an
+# ARP-stall on the unreachable 10.0.2.202).
+# Same defence as the gzip smoke: also plant skip-https-internet-smoke
+# so the unconditional https://example.com leg in net_smoke_test
+# doesn't trap on the AES-256-GCM record (separate residual; would
+# otherwise kill the kernel before reaching the FW2 gate).
+if os.environ.get("ENABLE_TCP_FIN_WAIT2_SMOKE") == "1":
+    FILES.append(("/etc/tcp-finwait2-test", b"1\n"))
+    FILES.append(("/etc/skip-https-internet-smoke", b"1\n"))
+
 # DHCP renew/rebind/expiry smoke. Gated the same way as the TLS / TCP
 # ring markers above. The renew smoke leaves DHCP state at IDLE on
 # exit, which breaks any downstream test that requires state == BOUND
