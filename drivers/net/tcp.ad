@@ -100,7 +100,15 @@ class TcpHdr:
 # Sizes / limits.
 TCP_HDR_LEN:        uint64 = 20
 TCP_MSS:            uint64 = 536       # conservative default per RFC 879
-TCP_RX_BUF:         uint64 = 1500
+# Per-slot inbound ring capacity. V5.3 (M16.x): bumped from 1500 →
+# 16384 so multiple back-to-back inbound segments (TLS handshake
+# bursts that fragment a server's Certificate flight across two or
+# three TCP segments are the load-bearing case) can accumulate in
+# the same poll cycle without the second segment clobbering the
+# first. 16384 is also the TLS 1.3 record max plaintext, so a
+# single record always fits even if it shards across N TCP
+# segments. See `tcp_slot_rx_head` / `tcp_slot_rx_tail` below.
+TCP_RX_BUF:         uint64 = 16384
 TCP_TX_BUF:         uint64 = 1500
 TCP_PSEUDO_LEN:     uint64 = 12        # src4 + dst4 + zero + proto + length(2)
 
@@ -126,13 +134,28 @@ tcp_slot_snd_una:   Array[8, uint32]     # oldest unacknowledged byte
 tcp_slot_rcv_nxt:   Array[8, uint32]     # next byte we expect from peer
 tcp_slot_last_act:  Array[8, uint64]     # jiffies of last RX/TX
 
-# Per-slot inbound buffer + valid-byte count. tcp_rx fills these
-# when it sees a segment carrying payload addressed to slot's
-# 4-tuple; tcp_recv drains and clears the count. Single segment of
-# capacity TCP_RX_BUF — no reassembly across multiple inbound
-# segments, no out-of-order buffering.
-tcp_slot_rx_data:   Array[12000, uint8]  # 8 slots * 1500 bytes
-tcp_slot_rx_len:    Array[8, uint64]
+# Per-slot inbound RX ring. V5.3 (M16.x): replaces the M16.102
+# single-segment overwrite buffer (1500 bytes / slot, blown away on
+# every inbound segment) with a grow-and-append queue. tcp_rx
+# appends each in-order segment's payload at [tail], advances tail.
+# tcp_recv consumes from [head] toward tail, advances head. When
+# head == tail (drained) both reset to 0 so the buffer compacts;
+# while head > 0 but head < tail we leave bytes in place — the next
+# tcp_recv reads from `head` directly.
+#
+# Overflow policy: if `tail + seg_len > TCP_RX_BUF`, the segment is
+# DROPPED and rcv_nxt is NOT advanced — the peer's TCP retransmit
+# will resend the same bytes after RTO. 16384 / slot covers a
+# whole TLS 1.3 record max-plaintext flight, so the dropped-and-
+# retransmit path is only reachable when the consumer (e.g. TLS
+# stitcher) hasn't drained between record boundaries — a real
+# slowdown but never silent corruption. See V5.3 commit message.
+#
+# Layout: flat 1-D array of slot*TCP_RX_BUF + offset (same dodge
+# every other table here uses to keep nested-Array codegen happy).
+tcp_slot_rx_data:   Array[131072, uint8]  # 8 slots * 16384 bytes
+tcp_slot_rx_head:   Array[8, uint64]      # consumer position (drain)
+tcp_slot_rx_tail:   Array[8, uint64]      # producer position (append)
 
 # Per-slot flag: did we observe a FIN from the peer? Latched the
 # first time we see it; cleared on tcp_close completion.
@@ -688,7 +711,8 @@ def tcp_rx(payload: Ptr[uint8], length: uint64,
                 tcp_slot_snd_nxt[new_slot] = isn_srv
                 tcp_slot_snd_una[new_slot] = isn_srv
                 tcp_slot_rcv_nxt[new_slot] = seq32 + 1
-                tcp_slot_rx_len[new_slot] = 0
+                tcp_slot_rx_head[new_slot] = 0
+                tcp_slot_rx_tail[new_slot] = 0
                 tcp_slot_saw_fin[new_slot] = 0
                 tcp_slot_last_act[new_slot] = get_jiffies()
                 # Reset retransmission state for the new slot.
@@ -803,28 +827,35 @@ def tcp_rx(payload: Ptr[uint8], length: uint64,
     if state == TCP_ESTABLISHED:
         if seg_payload_len > 0:
             if seq32 == tcp_slot_rcv_nxt[slot]:
-                # Copy payload into the slot's inbound buffer (truncate
-                # to TCP_RX_BUF; we don't try to reassemble across
-                # multiple segments — apt's HTTP responses fit in one
-                # segment for our smoke tests, and a real fix lands
-                # with the receive-window milestone).
-                copy_len: uint64 = seg_payload_len
-                if copy_len > TCP_RX_BUF:
-                    copy_len = TCP_RX_BUF
-                rx_base: uint64 = slot * TCP_RX_BUF
-                i: uint64 = 0
-                while i < copy_len:
-                    tcp_slot_rx_data[rx_base + i] = seg_payload[i]
-                    i = i + 1
-                tcp_slot_rx_len[slot] = copy_len
-                tcp_slot_rcv_nxt[slot] = seq32 + cast[uint32](seg_payload_len)
-                tcp_in_data = tcp_in_data + seg_payload_len
-                # Send an ACK back so the peer knows we got the data
-                # (and can release its retransmit buffer).
-                _tcp_build_and_send(slot, TCP_ACK,
-                                    cast[Ptr[uint8]](0), 0)
-                printk2("[tcp] slot=%d rx %d bytes\n",
-                        slot, seg_payload_len)
+                # V5.3: append the payload at the slot's ring tail so
+                # back-to-back inbound segments (TLS handshake bursts
+                # where Certificate spans two TCP segments) accumulate
+                # until tcp_recv drains them. If the ring would overflow
+                # we DROP the segment and DO NOT advance rcv_nxt — the
+                # peer's TCP retransmit will resend after RTO. Silent
+                # truncation here would corrupt the stream.
+                tail: uint64 = tcp_slot_rx_tail[slot]
+                if tail + seg_payload_len > TCP_RX_BUF:
+                    printk2(
+                        "[tcp] slot=%d rx ring full (tail=%d), drop seg\n",
+                        slot, tail)
+                    # No ACK — peer will retransmit when its RTO fires.
+                    # Don't advance rcv_nxt or rx_tail.
+                else:
+                    rx_base: uint64 = slot * TCP_RX_BUF
+                    i: uint64 = 0
+                    while i < seg_payload_len:
+                        tcp_slot_rx_data[rx_base + tail + i] = seg_payload[i]
+                        i = i + 1
+                    tcp_slot_rx_tail[slot] = tail + seg_payload_len
+                    tcp_slot_rcv_nxt[slot] = seq32 + cast[uint32](seg_payload_len)
+                    tcp_in_data = tcp_in_data + seg_payload_len
+                    # Send an ACK back so the peer knows we got the data
+                    # (and can release its retransmit buffer).
+                    _tcp_build_and_send(slot, TCP_ACK,
+                                        cast[Ptr[uint8]](0), 0)
+                    printk2("[tcp] slot=%d rx %d bytes\n",
+                            slot, seg_payload_len)
         if (flags & TCP_FIN) != 0:
             # Peer half-closed. Advance rcv_nxt past the FIN's
             # phantom byte and remember we saw it so tcp_close can
@@ -944,7 +975,8 @@ def tcp_connect(remote_b0: uint8, remote_b1: uint8,
     tcp_slot_snd_nxt[slot] = isn + 1
     tcp_slot_snd_una[slot] = isn
     tcp_slot_rcv_nxt[slot] = 0
-    tcp_slot_rx_len[slot] = 0
+    tcp_slot_rx_head[slot] = 0
+    tcp_slot_rx_tail[slot] = 0
     tcp_slot_saw_fin[slot] = 0
     # Fresh per-slot retransmission state. The first SYN we send
     # gets armed by _tcp_send_segment; if no SYN-ACK comes back the
@@ -1046,10 +1078,14 @@ def tcp_send(slot_signed: int32, buf: Ptr[uint8],
 
 def tcp_recv(slot_signed: int32, buf: Ptr[uint8],
              max_len: uint64, timeout_jiffies: uint64) -> int64:
-    # Block (well, poll) until the slot's rx buffer has bytes,
-    # then copy up to max_len into `buf` and zero the rx_len so the
-    # next inbound segment can refill. Returns bytes copied, 0 on
-    # EOF (peer FIN'd with no pending data), or -1 on error.
+    # Block (well, poll) until the slot's rx ring has bytes, then copy
+    # up to `max_len` from [head..tail) into `buf` and advance head.
+    # If the read drains the ring (head == tail) both pointers reset
+    # to 0 so the next append starts from offset zero. Returns bytes
+    # copied, 0 on EOF (peer FIN'd with no pending data), or -1 on
+    # error. V5.3: ring-backed, so accumulated multi-segment data
+    # (think: TLS handshake split across two TCP segments) survives a
+    # virtio_net_poll cycle without overwrite.
     if slot_signed < 0:
         return -1
     slot: uint64 = cast[uint64](slot_signed)
@@ -1057,25 +1093,35 @@ def tcp_recv(slot_signed: int32, buf: Ptr[uint8],
         return -1
     state: uint32 = tcp_slot_state[slot]
     if state != TCP_ESTABLISHED:
-        if tcp_slot_rx_len[slot] == 0:
+        if tcp_slot_rx_head[slot] == tcp_slot_rx_tail[slot]:
             return -1
     start: uint64 = get_jiffies()
     deadline: uint64 = start + timeout_jiffies
     while get_jiffies() < deadline:
         virtio_net_poll()
-        if tcp_slot_rx_len[slot] > 0:
-            n: uint64 = tcp_slot_rx_len[slot]
+        head: uint64 = tcp_slot_rx_head[slot]
+        tail: uint64 = tcp_slot_rx_tail[slot]
+        if tail > head:
+            avail: uint64 = tail - head
+            n: uint64 = avail
             if n > max_len:
                 n = max_len
             rx_base: uint64 = slot * TCP_RX_BUF
             i: uint64 = 0
             while i < n:
-                buf[i] = tcp_slot_rx_data[rx_base + i]
+                buf[i] = tcp_slot_rx_data[rx_base + head + i]
                 i = i + 1
-            tcp_slot_rx_len[slot] = 0
+            new_head: uint64 = head + n
+            if new_head == tail:
+                # Fully drained — compact so the next inbound segment
+                # appends from the start of the slot's window.
+                tcp_slot_rx_head[slot] = 0
+                tcp_slot_rx_tail[slot] = 0
+            else:
+                tcp_slot_rx_head[slot] = new_head
             return cast[int64](n)
         if tcp_slot_saw_fin[slot] != 0:
-            if tcp_slot_rx_len[slot] == 0:
+            if tcp_slot_rx_head[slot] == tcp_slot_rx_tail[slot]:
                 return 0
         if tcp_slot_state[slot] == TCP_CLOSED:
             return -1
@@ -1176,7 +1222,8 @@ def tcp_listen(local_port: uint16) -> int32:
     tcp_slot_snd_nxt[slot] = 0
     tcp_slot_snd_una[slot] = 0
     tcp_slot_rcv_nxt[slot] = 0
-    tcp_slot_rx_len[slot] = 0
+    tcp_slot_rx_head[slot] = 0
+    tcp_slot_rx_tail[slot] = 0
     tcp_slot_saw_fin[slot] = 0
     tcp_slot_unacked[slot] = 0
     tcp_slot_retries[slot] = 0
@@ -1289,7 +1336,8 @@ def tcp_init():
         tcp_slot_snd_una[i] = 0
         tcp_slot_rcv_nxt[i] = 0
         tcp_slot_last_act[i] = 0
-        tcp_slot_rx_len[i] = 0
+        tcp_slot_rx_head[i] = 0
+        tcp_slot_rx_tail[i] = 0
         tcp_slot_saw_fin[i] = 0
         tcp_slot_last_send[i] = 0
         tcp_slot_rto[i] = TCP_RTO_INITIAL
