@@ -42,9 +42,15 @@ cd "$PROJ_ROOT"
 
 ELF=build/hamnix-vmlinux.elf
 
-echo "[test_tcp_ring] (1/4) Build userland + initramfs"
+echo "[test_tcp_ring] (1/4) Build userland + initramfs (with /etc/tcp-ring-test marker)"
 bash scripts/build_user.sh >/dev/null
-INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null
+# ENABLE_TCP_RING_SMOKE=1 makes build_initramfs.py plant
+# /etc/tcp-ring-test in the cpio archive; init/main.ad gates
+# tcp_ring_smoke_test() on that file's presence so other test
+# harnesses (test_net_tcp.sh, test_net_https.sh, run_x86_bare.sh)
+# don't trip on an unreachable 10.0.2.201 during boot.
+INIT_ELF=build/user/init.elf ENABLE_TCP_RING_SMOKE=1 \
+    python3 scripts/build_initramfs.py >/dev/null
 
 echo "[test_tcp_ring] (2/4) Rebuild kernel image"
 python3 -m compiler.adder compile \
@@ -85,21 +91,30 @@ CHUNK_B = bytes((((i + 0x80) & 0xFF)) for i in range(2048))
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind((HOST, PORT))
-s.listen(1)
+s.listen(4)
+# Note: 180 s overall server lifetime is comfortably longer than the
+# kernel-side QEMU boot-to-tcp-ring-smoke latency (typically 30-60 s
+# under TCG) plus the 120 s `timeout` cap on the QEMU run.
+s.settimeout(180)
 print(f"[srv] listening on {HOST}:{PORT}", flush=True)
 
-# Accept a single client (the kernel under test). Re-accept after
-# close so a flaky boot can retry. Cap at 5 connections.
-for connno in range(5):
+# Accept loop. SLIRP can connect-and-disconnect eagerly at QEMU
+# startup (depending on libslirp version) before the kernel reaches
+# tcp_ring_smoke_test — that produces an early conn that recv'd
+# nothing, which we just close and move on from. The PULL-bearing
+# connection arrives later. Cap at 8 connections defensively.
+for connno in range(8):
     try:
-        s.settimeout(60)
         conn, addr = s.accept()
-    except socket.timeout:
-        print("[srv] accept timeout — exiting", flush=True)
+    except (socket.timeout, OSError) as exc:
+        print(f"[srv] accept gave up ({exc!r})", flush=True)
         sys.exit(0)
     print(f"[srv] conn#{connno} from {addr}", flush=True)
     try:
-        conn.settimeout(5)
+        # NO short recv timeout. The kernel can take its time to send
+        # PULL after the SLIRP connection is established (multitasking
+        # kernel = unpredictable lag between syn-ack and data segment).
+        conn.settimeout(60)
         # Read PULL\n (5 bytes). Tolerate short reads.
         buf = b""
         while len(buf) < 5:
@@ -118,10 +133,16 @@ for connno in range(5):
             print("[srv] sent 4096 bytes (2x2048)", flush=True)
             # Give the kernel time to drain before we close.
             time.sleep(0.5)
+            # Mission accomplished — exit so the bash wrapper
+            # doesn't wait on subsequent accepts.
+            conn.close()
+            print("[srv] PULL served, exiting", flush=True)
+            sys.exit(0)
     except Exception as exc:
         print(f"[srv] error: {exc!r}", flush=True)
     finally:
-        conn.close()
+        try: conn.close()
+        except Exception: pass
 sys.exit(0)
 PYEOF
 

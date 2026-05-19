@@ -40,6 +40,16 @@ FILES = [
 if os.environ.get("ENABLE_TLS_SMOKE") == "1":
     FILES.append(("/etc/tls-test", b"1\n"))
 
+# V5.3 TCP RX-ring multi-segment smoke. Gated the same way as
+# /etc/tls-test so the kernel doesn't try to ARP / SYN 10.0.2.201
+# during boot when the test_tcp_ring.sh harness isn't running —
+# without the marker, an unreachable peer would stall tcp_connect
+# (jiffies aren't ticking yet at net_smoke_test time, so its
+# polling-loop deadline never fires). See init/main.ad's
+# tcp_ring_smoke_test gate.
+if os.environ.get("ENABLE_TCP_RING_SMOKE") == "1":
+    FILES.append(("/etc/tcp-ring-test", b"1\n"))
+
 # V5 cert validation: bake the production ISRG Root X1 anchor into the
 # initramfs at /etc/tls-ca-isrg-x1.der whenever the host has it
 # installed. drivers/net/tls.ad's _tls_validation_init() walks the cpio
