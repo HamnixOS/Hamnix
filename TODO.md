@@ -3,6 +3,31 @@
 Open work items not yet scheduled to a specific milestone. Items here
 are fair game for any contributor — human or AI agent.
 
+> **Before picking an item, check [`STATUS.md`](STATUS.md) first.** A
+> lot of TODO entries below were written before the V-series wave
+> shipped (9P V0..V4.1, TLS-CERT V0..V6 + V5.1/V5.2/V5.3/V5.4, HTTP
+> chunked + gzip, NVMe PRP2, USB HID V0/V1/V2, RTC reader, DHCP
+> renew/rebind, TCP rx-ring, EFI ISO direct-boot to hamsh, build-lock
+> per-worktree — all closed on `main`). Specifically:
+>
+> - The Plan 9 native-syscall surface (`rfork`/`bind`/`mount` bodies,
+>   per-process namespace machinery, `sys_srv_post`/`sys_srv_open`,
+>   `sys_socketpair`) is **done end-to-end**. Items below that reference
+>   a missing mount table or stub `bind`/`mount` body are stale.
+> - TLS cert validation is **closed for LE-signed chains** (PSS + ECDSA
+>   + PKCS#1 v1.5 + chain builder + CA store + validity + CertificateVerify
+>   transcript binding + multi-record stitching + TCP rx-ring under it).
+>   Real `apt update` is now gated on AES-256-GCM-SHA384 cipher
+>   (Cloudflare-fronted mirrors force it), HTTP redirects (in flight),
+>   and apt-glue userland (Release → Packages.gz → .deb → dpkg) — not
+>   on cert validation any more.
+> - The compiler `Ptr[T]`-to-`&local` clobber, `&arr[i][j]` lower-to-
+>   NULL, and signed-only compare quirks are all fixed at the source.
+>   Workarounds in driver code have been retired.
+>
+> When in doubt about whether an item is done, check `git log --grep`
+> for the closing commit, or `STATUS.md` for the milestone row.
+
 **Source of truth for the project direction lives in `docs/`:**
 
 - [`docs/architecture.md`](docs/architecture.md) — the layered model

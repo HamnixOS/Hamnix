@@ -1,5 +1,19 @@
 # VTNext-v2 — graphical wire protocol
 
+> **⚠️ SUPERSEDED.** VTNext-v2 was Hamnix's first attempt at a window-
+> system wire protocol — an ESC-coded byte stream between apps,
+> `hamwd`, and a renderer. The architectural review concluded that a
+> single shared byte stream cannot give each window its own private
+> `/dev/mouse` / `/dev/cons` / `/dev/draw` (the "moving the mouse in
+> window A doesn't appear in window B's mouse file" invariant). The
+> replacement design is **[`docs/rio.md`](rio.md)**, which models the
+> window system as a Plan 9 9P file server with per-window namespaces.
+>
+> This document is **kept for historical reference only**. Don't
+> implement against it. The codec library briefly built against it
+> (`drivers/vt/vtnext.ad`) was never merged to `main` and lives in
+> the shelved worktree `.claude/worktrees/agent-abaa05e2…/`.
+
 VTNext-v2 is Hamnix's window-system wire protocol. It carries
 vector drawing commands and input events between three parties:
 
