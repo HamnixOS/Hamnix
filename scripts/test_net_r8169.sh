@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# scripts/test_net_r8169.sh — end-to-end test for the M16.105
-# bare-metal r8169-family Realtek NIC driver.
+# scripts/test_net_r8169.sh — V1 end-to-end test for the bare-metal
+# r8169-family Realtek NIC driver.
 #
 # Boots the kernel with a QEMU rtl8139 device attached to SLIRP.
 # `pci_scan()` (in drivers/pci/pci.ad) calls `r8169_init()` once
@@ -11,22 +11,24 @@
 # resets the chip, reads the MAC from IDR0..IDR5, allocates the
 # circular RX buffer (8 KiB + 16 overhead + 1500 slack), plants its
 # physical address at RBSTART, configures RCR (AB + APM + WRAP +
-# RBLEN=8K), and flips CMD.RE to enable the receiver.
+# RBLEN=8K), and flips CMD.RE|TE to enable RX + TX.
 #
-# Scope is PROBE + IDENTIFY + RECEIVE only — no TX, no integration
-# with the ARP/IP/UDP/ICMP/DHCP/DNS/TCP stack. virtio-net (M16.88)
-# stays the bring-up NIC for those tests; r8169 just proves the
-# driver works.
+# After init the kernel submits one 64-byte ARP probe (10.0.2.15 ->
+# 10.0.2.2) through the 4-slot 8139 TX path; SLIRP answers with an
+# ARP reply that lands in the circular RX buffer and r8169_poll()
+# delivers it to eth_rx(). The test asserts both the tx-ok log and
+# at least one RX-packet log, matching the V1 acceptance bar that
+# `scripts/test_net_e1000e.sh` already enforces for the Intel NIC.
 #
-# Why rtl8139 and not the Gigabit-family RTL8168? QEMU's available
-# Realtek device list (verify with
-# `qemu-system-x86_64 -device help | grep -i rtl`) on modern
-# installs is only `rtl8139`. The Gigabit RTL8168 / RTL8169
-# (MMIO + 16-descriptor ring) lives in the same driver source file
-# under the same `drivers/net/r8169.ad` name (Linux groups all
-# Realtek Ethernet under `drivers/net/ethernet/realtek/r8169_main.c`
-# regardless of generation) but its bring-up path is deferred to a
-# follow-up commit.
+# Why rtl8139 and not rtl8169? QEMU's available Realtek device list
+# (verify with `qemu-system-x86_64 -device help | grep -i rtl`) on
+# modern installs is only `rtl8139`. The Gigabit RTL8168 / RTL8169
+# (MMIO + 16-descriptor ring) code lives in the same source file
+# under the `_r8169_init_gigabit` branch; it dispatches on PCI
+# device-id (0x8167 / 0x8168 / 0x8169) and is exercised only on
+# real hardware — Linux groups all Realtek Ethernet variants under
+# `drivers/net/ethernet/realtek/r8169_main.c` regardless of
+# generation, and we follow that grouping.
 #
 # The test asserts:
 #   1. "[r8169] controller found bdf=" — PCI vendor/device match
@@ -36,15 +38,10 @@
 #   3. "[r8169] RX ring ready" — the 8 KiB + slack RX buffer
 #      allocated cleanly and RBSTART + RCR are programmed.
 #   4. "[r8169] init done" — top-level driver entry returned 0.
-#
-# RX packet observation is NOT asserted — SLIRP under
-# `-device rtl8139` rarely emits spontaneous frames (no DHCP
-# requests originate from us, no link-up broadcasts originate from
-# SLIRP), and we deliberately don't expose a TX path under this
-# driver to provoke a reply. The follow-up M16.105.1 milestone
-# would add a single-segment TX helper + an ARP probe to
-# round-trip an inbound frame; this commit's test bar is
-# "driver alive".
+#   5. "[r8169] tx ok len=64" — single 64-byte ARP probe made it
+#      onto the wire (TSD OWN+TOK writeback observed).
+#   6. "[r8169] RX packet: len=" — at least one inbound frame
+#      delivered (SLIRP's ARP reply).
 
 . "$(dirname "$0")/_build_lock.sh"
 
@@ -90,7 +87,9 @@ for needle in \
     "[r8169] controller found bdf=" \
     "[r8169] mac=52:54:00:12:34:56" \
     "[r8169] RX ring ready" \
-    "[r8169] init done"
+    "[r8169] init done" \
+    "[r8169] tx ok len=64" \
+    "[r8169] RX packet: len="
 do
     if grep -F -q "$needle" "$LOG"; then
         echo "[test_net_r8169] OK: '$needle'"
@@ -99,13 +98,6 @@ do
         fail=1
     fi
 done
-
-# Optional: if we did happen to see an RX packet (rare under
-# SLIRP without a TX path), log that it fired — but DO NOT gate
-# the test on it.
-if grep -F -q "[r8169] RX packet: len=" "$LOG"; then
-    echo "[test_net_r8169] INFO: at least one RX frame observed"
-fi
 
 if [ "$fail" -ne 0 ]; then
     echo "[test_net_r8169] FAIL (qemu rc=$rc)"
