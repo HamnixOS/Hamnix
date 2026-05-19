@@ -87,11 +87,15 @@ Concretely this means closing four named gates:
    El Torito quirk) are in place, but **L40 is Pending** — no T480
    / Dell / HP physical box has run the ISO yet.
 2. **TLS-CERT — X.509 + RSA-PSS / ECDSA verify with a baked CA store.**
-   M16.136 ships TLS 1.3 handshake + HTTPS GET, but the server cert
-   chain is NOT validated; `[tls] WARNING: server cert NOT validated`
-   fires per connection. **No HTTPS-apt before this lands.** Estimated
-   ~2000 lines: ASN.1 DER parser + RSA-PSS-SHA256 modexp + ECDSA-P256
-   verify + chain-builder + baked CA bundle.
+   **Structurally closed** in V0..V5 (commits `f47449e` → `f678649`):
+   ASN.1 parser, X.509 walker, RSA-PSS-SHA256 verify with bigint modexp,
+   ECDSA-P256 verify with binary-GCD modular inverse, chain builder with
+   8-anchor CA store, validity-window check, all wired into
+   `drivers/net/tls.ad::tls_handshake`. Banner replaced with real
+   `[tls] cert chain validated`. **Real-world `apt update` still blocked**
+   on two residuals: PKCS#1 v1.5 dispatch (ISRG Root X1 uses v1.5;
+   we currently only dispatch PSS) and CertificateVerify transcript-
+   binding (RFC 8446 §4.4.3). Both bounded follow-ups.
 3. **USB HID V2 — interrupt-IN poll** so real `sendkey x` keystrokes
    reach hamsh stdin. M16.139 V0+V1 ship the controller + transfer
    engine end-to-end on `qemu-xhci + usb-kbd`; the continuous polling
@@ -111,16 +115,19 @@ beyond MVP.
 
 | Gate | Status | Impact |
 |--|--|--|
-| **TLS cert validation** | Not yet started | HTTPS-apt is one DNS poison from a malicious-package install. Don't run apt against untrusted mirrors. |
+| **TLS cert validation** | **Closed structurally** — `apt over HTTPS` still gated on residuals below | Full chain validation against a baked-in trust store ships in V0..V5 (`lib/asn1/`, `lib/x509/`, `lib/rsa/`, `lib/ec/`, `lib/ecdsa/`, `drivers/net/tls.ad`). PSS-SHA256 + ECDSA-P256 dispatch wired into the handshake; warning banner replaced with real `[tls] cert chain validated`. **Real-world `apt update` still blocked** on **PKCS#1 v1.5 signature dispatch** (ISRG Root X1 is RSA v1.5; we only dispatch PSS today) and on **CertificateVerify transcript-binding** (RFC 8446 §4.4.3 — defense-in-depth). |
 | **L40: real T480 boot** | Pending | "Real hardware" verification is QEMU+OVMF today; no physical box has been booted yet. The cron-priority claim is **structurally** complete, not **physically** verified. |
-| **USB HID V2 polling** | In flight | Keys typed in QEMU monitor's `sendkey` don't yet reach hamsh stdin; the wire is half-built. |
-| **U9 nested-frame Array spill** | Active compiler bug | `Array[N, T]` locals with the same shape in caller + callee miscompile. Workaround: inline the callee. See [`memory/feedback_compiler_quirks.md`](#) (orchestrator's notes, not in repo). |
+| **USB HID V2 polling** | Closed structurally; wire-side verification in QEMU `sendkey` pending `socat` install | Continuous interrupt-IN poll wired into the timer tick; synthetic Transfer Events round-trip through `kbd_rx_push`. Real keypress on `qemu sendkey x` would now go through the same path but the harness can't inject without `socat`. |
+| **Inbound SSH** | Not yet started | Needed for "useful server OS" but no SSH protocol code exists. Crypto primitives are in place (ChaCha20-Poly1305, X25519, SHA-256, ECDSA-P256, RSA-PSS); the SSH layer itself isn't. |
+| **U9 nested-frame Array spill** | Active compiler bug | `Array[N, T]` locals with the same shape in caller + callee miscompile. Workaround: inline the callee. See [`memory/feedback_compiler_quirks.md`](memory/feedback_compiler_quirks.md). |
 
-Three other compiler bugs landed proper fixes during the current session
+Four other compiler bugs landed proper fixes during the recent sessions
 (M16.135): `Ptr[T]` writes to `&local` sub-8-byte scalars, `&arr[i][j]`
-on 2-D Array globals, and a confirmed-phantom cast-load report. Going
-forward, language quirks land in `compiler/tests/` as guarded regressions
-the moment they're surfaced — see [Working agreements](#working-agreements).
+on 2-D Array globals, a confirmed-phantom cast-load report, and the
+already-fixed signed-only comparison rediscovery. Language quirks land
+in `tests/test_compiler_*.ad` as guarded regressions the moment they're
+surfaced — see [`scripts/run_compiler_tests.sh`](scripts/run_compiler_tests.sh)
+(7 fixtures, all green).
 
 ---
 
