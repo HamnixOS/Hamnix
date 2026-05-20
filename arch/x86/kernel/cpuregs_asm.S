@@ -163,3 +163,50 @@ cpuid_get:
     movl    %edx, 12(%r8)              /* out[3] = edx */
     popq    %rbx
     ret
+
+/* ---------- fninit_helper() -------------------------------------- *
+ *
+ * M16.156 Asus real-hw mitigation #1 (FPU init).
+ *
+ * On real laptops the firmware may leave the FPU in an inconsistent
+ * state (denormal exception unmasked, stale tag word, control-word
+ * defaults that the Hamnix kernel did not pick). If the very first
+ * user instruction at ring-3 entry touches the FPU or SSE state, that
+ * inconsistency can manifest as a #MF / #XF / #UD that the SYSRETQ
+ * window's microcode treats as part of the transition — same blast
+ * radius as the existing "silent triple-fault before any handler"
+ * Asus symptom we've been chasing.
+ *
+ * `fninit` issues the non-waiting form (no #MF on a pending FPU error)
+ * and reinitialises the FPU to its power-on defaults: tag word = all
+ * empty, status word = 0, control word = 0x037F (all exceptions
+ * masked, precision=64-bit, rounding=nearest). It does NOT alter the
+ * x87 / SSE register file (we don't need to — first user is the only
+ * thing that touches those, and it can clear them itself if it cares).
+ *
+ * No arguments, no return value, no clobbers (the FPU touch happens
+ * in coprocessor state, GP regs untouched). Safe at any CPL=0.
+ */
+    .align 16
+    .globl fninit_helper
+fninit_helper:
+    fninit
+    ret
+
+/* ---------- write_cr4(value: uint64) ----------------------------- *
+ *
+ * M16.156 Asus real-hw mitigation #2 (CR4.OSXSAVE).
+ *
+ * Companion to read_cr4. Loads %rdi straight into %cr4. Called only
+ * from start_first_task after the CPUID.01h:ECX bit-26 check so the
+ * caller is responsible for OR-ing the desired bit into the live CR4
+ * before invoking us. We do NOT mask or validate — this is a thin
+ * "store the qword to the control register" primitive.
+ *
+ * SysV ABI: %rdi = new CR4 value. No return. Clobbers %cr4 only.
+ */
+    .align 16
+    .globl write_cr4
+write_cr4:
+    movq    %rdi, %cr4
+    ret

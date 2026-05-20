@@ -231,6 +231,20 @@ enter_first_task:
     .align 16
     .globl enter_first_task_sysret
 enter_first_task_sysret:
+    /* M16.156 mitigation #3 (belt-and-suspenders): clear IF on the
+     * kernel side before we touch the task stack. The companion change
+     * in start_first_task (kernel/sched/core.ad) rewrites the iret-
+     * frame RFLAGS slot at kstack_top - 24 from 0x202 to 0x002 so the
+     * user wakes with IF=0; the `cli` here guarantees the BSP itself
+     * cannot take a timer / NMI in the window between the last
+     * printk in start_first_task and the SYSRETQ below. Without this,
+     * a stray timer IRQ inside this window would push an iret frame
+     * onto the kernel stack at a location that no longer matches the
+     * 5-qword frame the SYSRETQ-tail code is about to read. Cleared
+     * automatically when SYSRETQ loads RFLAGS from %r11 (which we
+     * load from the now-IF-cleared iret-frame slot a few instructions
+     * down). */
+    cli
     /* %rdi = ptr to task_struct (sp at offset 0). */
     movq    0(%rdi), %rsp
 
