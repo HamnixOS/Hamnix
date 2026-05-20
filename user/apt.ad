@@ -10,12 +10,45 @@
 #   apt update <base-url> <suite>   fetch + decompress + store the index
 #   apt show <pkg>                  print one package's stanza
 #   apt pkgnames                    print every package name
+#   apt install <pkg>               download + verify + dpkg-install a .deb
 #
 # (Modern Debian unifies apt-get + apt-cache into a single `apt`
 # front-end; this binary follows that — `apt update` is `apt-get
 # update`, `apt show`/`apt pkgnames` are `apt-cache show`/`apt-cache
 # pkgnames`. The Hamnix build maps user/apt.ad -> /bin/apt; argv[1]
 # selects the sub-command.)
+#
+# -- apt install <pkg> -------------------------------------------------
+#
+# Chains the apt-path pieces end to end: index lookup -> HTTP download
+# -> SHA-256 verification -> `dpkg -i`.
+#
+#   1. Read the base-url back from /tmp/apt/base-url — a one-line file
+#      `apt update` now writes (it is the only place the base-url is
+#      known; `apt install` is a separate process invocation).
+#   2. Read /tmp/apt/Packages, find the stanza for <pkg>, and extract
+#      its `Filename` (path to the .deb relative to base-url), `Size`
+#      and `SHA256` fields.
+#   3. HTTP GET <base-url>/<Filename> — reuses the same _http_get code
+#      `apt update` uses. The .deb is BINARY: the body bytes are saved
+#      raw (no text processing) to /tmp/apt/<pkg>.deb.
+#   4. SHA-256-verify the downloaded bytes against the index's SHA256
+#      field. A mismatch is a hard error: the .deb is NOT installed and
+#      the process exits non-zero. SHA-256 is a standalone port here
+#      (the kernel TLS stack's SHA-256 in drivers/net/tls.ad keys off
+#      tls_* globals and is not callable from userland) — see the
+#      `_sha256_*` section. The Size field, when present, is also
+#      checked against the byte count actually downloaded.
+#   5. sys_spawn `/bin/dpkg -i /tmp/apt/<pkg>.deb`; dpkg's exit code is
+#      surfaced as our own.
+#   6. Print `apt: installed <pkg> <version>` on success.
+#
+# NOT in V0 (V0.1/V1 backlog): dependency resolution (installing the
+# package's `Depends:` — V0 installs only the one named package),
+# HTTPS, `apt remove`, version selection (V0 installs whatever the
+# index lists). The .deb download budget is the same 256 KiB HTTP cap
+# as the index fetch — a larger .deb is a hard error (streaming to a
+# file is a V1 concern).
 #
 # -- apt update <base-url> <suite> -------------------------------------
 #
@@ -88,6 +121,11 @@ extern def sys_close(fd: int32) -> int32
 extern def sys_mkdir(path: Ptr[char]) -> int32
 extern def sys_socket(domain: int32, sock_type: int32, proto: int32) -> int32
 extern def sys_connect(fd: int32, addr: Ptr[uint8], addrlen: uint64) -> int32
+# `apt install` shells out to /bin/dpkg -i to do the actual install.
+extern def sys_spawn(path: Ptr[char], argv: Ptr[uint64],
+                     stdin_fd: int32, stdout_fd: int32,
+                     envp: Ptr[uint64]) -> int32
+extern def sys_waitpid(pid: int32) -> int64
 
 
 # -- bounded BSS arenas (Hamnix idiom: never park large Arrays in a
@@ -114,6 +152,39 @@ url_path_buf: Array[768, uint8]
 
 # struct sockaddr_in, 16 bytes (built fresh for each connect).
 sa_buf: Array[16, uint8]
+
+# -- apt install scratch ----------------------------------------------
+#
+# The .deb download lands in `deb_buf`. Same 256 KiB cap as the HTTP
+# response — a fixture-sized .deb sits far inside it; a larger .deb is
+# a hard error (streaming straight to a file is a V1 concern). It is a
+# separate top-level BSS arena (the U9 nested-frame-Array quirk) so the
+# raw binary body never has to share http_buf with the inflate state.
+DEB_CAP:  uint64 = 262144      # 256 KiB raw downloaded .deb
+deb_buf:  Array[262144, uint8]
+
+# Fields lifted out of the matched Packages stanza for `apt install`.
+fld_filename: Array[512, uint8]    # Filename: path of the .deb (rel base-url)
+fld_sha256:   Array[80, uint8]     # SHA256: 64 lowercase hex chars + NUL
+fld_size:     Array[32, uint8]     # Size: decimal byte count + NUL
+fld_version2: Array[256, uint8]    # Version: for the summary line
+
+# The base-url, read back from /tmp/apt/base-url by `apt install`.
+baseurl_buf: Array[768, uint8]
+
+# Composed /tmp/apt/<pkg>.deb output path.
+debpath_buf: Array[256, uint8]
+
+# argv handed to the spawned `/bin/dpkg -i <debpath>`.
+dpkg_argv:   Array[8, uint64]
+
+# SHA-256 working state for the download-verification path.
+sha_state:   Array[8, uint32]      # 8 working hash words
+sha_k:       Array[64, uint32]     # round constants
+sha_w:       Array[64, uint32]     # message schedule scratch
+sha_block:   Array[64, uint8]      # one 64-byte input block
+sha_digest:  Array[32, uint8]      # 32-byte final digest
+sha_hex:     Array[80, uint8]      # digest as 64 lowercase hex chars + NUL
 
 
 # -- tiny stdio helpers (mirrors dpkg.ad / cat.ad) ---------------------
@@ -508,6 +579,244 @@ def _count_stanzas(plen: uint64) -> uint64:
     return count
 
 
+# -- SHA-256 (FIPS 180-4), standalone userland port --------------------
+#
+# `apt install` must verify the downloaded .deb against the index's
+# SHA256 field. The kernel TLS stack carries a SHA-256
+# (drivers/net/tls.ad) but it keys off tls_* kernel globals and a
+# running-transcript model — it is not callable from a userland binary.
+# A standalone SHA-256 is small (~130 lines); this is a faithful one-
+# shot port. State lives in the sha_* BSS arenas above (frames stay
+# tiny — the U9 quirk). _sha256_hash() hashes deb_buf[0, n) and writes
+# the 64-char lowercase-hex digest into sha_hex.
+
+def _sha256_rotr32(v: uint32, n: uint64) -> uint32:
+    x: uint64 = cast[uint64](v) & 0xFFFFFFFF
+    lo: uint64 = x >> n
+    hi: uint64 = (x << (32 - n)) & 0xFFFFFFFF
+    return cast[uint32](lo | hi)
+
+
+def _sha256_init_k():
+    sha_k[0]  = 0x428A2F98
+    sha_k[1]  = 0x71374491
+    sha_k[2]  = 0xB5C0FBCF
+    sha_k[3]  = 0xE9B5DBA5
+    sha_k[4]  = 0x3956C25B
+    sha_k[5]  = 0x59F111F1
+    sha_k[6]  = 0x923F82A4
+    sha_k[7]  = 0xAB1C5ED5
+    sha_k[8]  = 0xD807AA98
+    sha_k[9]  = 0x12835B01
+    sha_k[10] = 0x243185BE
+    sha_k[11] = 0x550C7DC3
+    sha_k[12] = 0x72BE5D74
+    sha_k[13] = 0x80DEB1FE
+    sha_k[14] = 0x9BDC06A7
+    sha_k[15] = 0xC19BF174
+    sha_k[16] = 0xE49B69C1
+    sha_k[17] = 0xEFBE4786
+    sha_k[18] = 0x0FC19DC6
+    sha_k[19] = 0x240CA1CC
+    sha_k[20] = 0x2DE92C6F
+    sha_k[21] = 0x4A7484AA
+    sha_k[22] = 0x5CB0A9DC
+    sha_k[23] = 0x76F988DA
+    sha_k[24] = 0x983E5152
+    sha_k[25] = 0xA831C66D
+    sha_k[26] = 0xB00327C8
+    sha_k[27] = 0xBF597FC7
+    sha_k[28] = 0xC6E00BF3
+    sha_k[29] = 0xD5A79147
+    sha_k[30] = 0x06CA6351
+    sha_k[31] = 0x14292967
+    sha_k[32] = 0x27B70A85
+    sha_k[33] = 0x2E1B2138
+    sha_k[34] = 0x4D2C6DFC
+    sha_k[35] = 0x53380D13
+    sha_k[36] = 0x650A7354
+    sha_k[37] = 0x766A0ABB
+    sha_k[38] = 0x81C2C92E
+    sha_k[39] = 0x92722C85
+    sha_k[40] = 0xA2BFE8A1
+    sha_k[41] = 0xA81A664B
+    sha_k[42] = 0xC24B8B70
+    sha_k[43] = 0xC76C51A3
+    sha_k[44] = 0xD192E819
+    sha_k[45] = 0xD6990624
+    sha_k[46] = 0xF40E3585
+    sha_k[47] = 0x106AA070
+    sha_k[48] = 0x19A4C116
+    sha_k[49] = 0x1E376C08
+    sha_k[50] = 0x2748774C
+    sha_k[51] = 0x34B0BCB5
+    sha_k[52] = 0x391C0CB3
+    sha_k[53] = 0x4ED8AA4A
+    sha_k[54] = 0x5B9CCA4F
+    sha_k[55] = 0x682E6FF3
+    sha_k[56] = 0x748F82EE
+    sha_k[57] = 0x78A5636F
+    sha_k[58] = 0x84C87814
+    sha_k[59] = 0x8CC70208
+    sha_k[60] = 0x90BEFFFA
+    sha_k[61] = 0xA4506CEB
+    sha_k[62] = 0xBEF9A3F7
+    sha_k[63] = 0xC67178F2
+
+
+# Compress the 64-byte block in sha_block into sha_state.
+
+def _sha256_compress():
+    i: uint64 = 0
+    while i < 16:
+        b0: uint32 = cast[uint32](sha_block[i * 4 + 0])
+        b1: uint32 = cast[uint32](sha_block[i * 4 + 1])
+        b2: uint32 = cast[uint32](sha_block[i * 4 + 2])
+        b3: uint32 = cast[uint32](sha_block[i * 4 + 3])
+        sha_w[i] = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+        i = i + 1
+    while i < 64:
+        s0: uint32 = _sha256_rotr32(sha_w[i - 15], 7) \
+            ^ _sha256_rotr32(sha_w[i - 15], 18) \
+            ^ (sha_w[i - 15] >> 3)
+        s1: uint32 = _sha256_rotr32(sha_w[i - 2], 17) \
+            ^ _sha256_rotr32(sha_w[i - 2], 19) \
+            ^ (sha_w[i - 2] >> 10)
+        sum_v: uint64 = (cast[uint64](sha_w[i - 16]) & 0xFFFFFFFF) \
+            + (cast[uint64](s0) & 0xFFFFFFFF) \
+            + (cast[uint64](sha_w[i - 7]) & 0xFFFFFFFF) \
+            + (cast[uint64](s1) & 0xFFFFFFFF)
+        sha_w[i] = cast[uint32](sum_v & 0xFFFFFFFF)
+        i = i + 1
+
+    a: uint32 = sha_state[0]
+    b: uint32 = sha_state[1]
+    c: uint32 = sha_state[2]
+    d: uint32 = sha_state[3]
+    e: uint32 = sha_state[4]
+    f: uint32 = sha_state[5]
+    g: uint32 = sha_state[6]
+    h: uint32 = sha_state[7]
+    i = 0
+    while i < 64:
+        S1: uint32 = _sha256_rotr32(e, 6) ^ _sha256_rotr32(e, 11) \
+            ^ _sha256_rotr32(e, 25)
+        ch: uint32 = (e & f) ^ ((~e) & g)
+        t1_64: uint64 = (cast[uint64](h) & 0xFFFFFFFF) \
+            + (cast[uint64](S1) & 0xFFFFFFFF) \
+            + (cast[uint64](ch) & 0xFFFFFFFF) \
+            + (cast[uint64](sha_k[i]) & 0xFFFFFFFF) \
+            + (cast[uint64](sha_w[i]) & 0xFFFFFFFF)
+        t1: uint32 = cast[uint32](t1_64 & 0xFFFFFFFF)
+        S0: uint32 = _sha256_rotr32(a, 2) ^ _sha256_rotr32(a, 13) \
+            ^ _sha256_rotr32(a, 22)
+        maj: uint32 = (a & b) ^ (a & c) ^ (b & c)
+        t2_64: uint64 = (cast[uint64](S0) & 0xFFFFFFFF) \
+            + (cast[uint64](maj) & 0xFFFFFFFF)
+        t2: uint32 = cast[uint32](t2_64 & 0xFFFFFFFF)
+        h = g
+        g = f
+        f = e
+        d64: uint64 = (cast[uint64](d) & 0xFFFFFFFF) \
+            + (cast[uint64](t1) & 0xFFFFFFFF)
+        e = cast[uint32](d64 & 0xFFFFFFFF)
+        d = c
+        c = b
+        b = a
+        a64: uint64 = (cast[uint64](t1) & 0xFFFFFFFF) \
+            + (cast[uint64](t2) & 0xFFFFFFFF)
+        a = cast[uint32](a64 & 0xFFFFFFFF)
+        i = i + 1
+
+    sum_0: uint64 = cast[uint64](sha_state[0]) + cast[uint64](a)
+    sum_1: uint64 = cast[uint64](sha_state[1]) + cast[uint64](b)
+    sum_2: uint64 = cast[uint64](sha_state[2]) + cast[uint64](c)
+    sum_3: uint64 = cast[uint64](sha_state[3]) + cast[uint64](d)
+    sum_4: uint64 = cast[uint64](sha_state[4]) + cast[uint64](e)
+    sum_5: uint64 = cast[uint64](sha_state[5]) + cast[uint64](f)
+    sum_6: uint64 = cast[uint64](sha_state[6]) + cast[uint64](g)
+    sum_7: uint64 = cast[uint64](sha_state[7]) + cast[uint64](h)
+    sha_state[0] = cast[uint32](sum_0 & 0xFFFFFFFF)
+    sha_state[1] = cast[uint32](sum_1 & 0xFFFFFFFF)
+    sha_state[2] = cast[uint32](sum_2 & 0xFFFFFFFF)
+    sha_state[3] = cast[uint32](sum_3 & 0xFFFFFFFF)
+    sha_state[4] = cast[uint32](sum_4 & 0xFFFFFFFF)
+    sha_state[5] = cast[uint32](sum_5 & 0xFFFFFFFF)
+    sha_state[6] = cast[uint32](sum_6 & 0xFFFFFFFF)
+    sha_state[7] = cast[uint32](sum_7 & 0xFFFFFFFF)
+
+
+# _sha256_hash(n): one-shot SHA-256 of deb_buf[0, n). Writes the
+# 64-char lowercase-hex digest (NUL-terminated) into sha_hex.
+
+def _sha256_hash(n: uint64):
+    _sha256_init_k()
+    sha_state[0] = 0x6A09E667
+    sha_state[1] = 0xBB67AE85
+    sha_state[2] = 0x3C6EF372
+    sha_state[3] = 0xA54FF53A
+    sha_state[4] = 0x510E527F
+    sha_state[5] = 0x9B05688C
+    sha_state[6] = 0x1F83D9AB
+    sha_state[7] = 0x5BE0CD19
+
+    # Compress every full 64-byte block of the input.
+    off: uint64 = 0
+    while off + 64 <= n:
+        i: uint64 = 0
+        while i < 64:
+            sha_block[i] = deb_buf[off + i]
+            i = i + 1
+        _sha256_compress()
+        off = off + 64
+
+    # Final block(s): the tail bytes + 0x80 + zero-pad + 64-bit BE
+    # message length in bits.
+    rem: uint64 = n - off
+    buflen: uint64 = 0
+    i: uint64 = 0
+    while i < rem:
+        sha_block[buflen] = deb_buf[off + i]
+        buflen = buflen + 1
+        i = i + 1
+    sha_block[buflen] = 0x80
+    buflen = buflen + 1
+    if buflen > 56:
+        while buflen < 64:
+            sha_block[buflen] = 0
+            buflen = buflen + 1
+        _sha256_compress()
+        buflen = 0
+    while buflen < 56:
+        sha_block[buflen] = 0
+        buflen = buflen + 1
+    total_bits: uint64 = n * 8
+    j: uint64 = 0
+    while j < 8:
+        shift: uint64 = (7 - j) * 8
+        sha_block[56 + j] = cast[uint8]((total_bits >> shift) & 0xFF)
+        j = j + 1
+    _sha256_compress()
+
+    # State -> 32 big-endian bytes -> 64 lowercase hex chars.
+    hexd: Ptr[uint8] = "0123456789abcdef"
+    k: uint64 = 0
+    while k < 8:
+        w: uint32 = sha_state[k]
+        sha_digest[k * 4 + 0] = cast[uint8]((w >> 24) & 0xFF)
+        sha_digest[k * 4 + 1] = cast[uint8]((w >> 16) & 0xFF)
+        sha_digest[k * 4 + 2] = cast[uint8]((w >> 8) & 0xFF)
+        sha_digest[k * 4 + 3] = cast[uint8](w & 0xFF)
+        k = k + 1
+    m: uint64 = 0
+    while m < 32:
+        byte_v: uint8 = sha_digest[m]
+        sha_hex[m * 2 + 0] = hexd[cast[uint64]((byte_v >> 4) & 0x0F)]
+        sha_hex[m * 2 + 1] = hexd[cast[uint64](byte_v & 0x0F)]
+        m = m + 1
+    sha_hex[64] = 0
+
+
 # -- apt update --------------------------------------------------------
 
 def _do_update(base_url: Ptr[uint8], suite: Ptr[uint8]) -> int32:
@@ -569,6 +878,22 @@ def _do_update(base_url: Ptr[uint8], suite: Ptr[uint8]) -> int32:
     sys_close(wfd)
     if wn < 0 or cast[uint64](wn) != pkg_len:
         write_str(2, "apt-get: short write storing Packages index\n")
+        return 1
+
+    # 4b. Persist the base-url to /tmp/apt/base-url (a one-line file)
+    #     so a later `apt install` — a separate process invocation —
+    #     can recover the mirror to download .debs from. A trailing
+    #     newline is written; `apt install`'s reader trims it.
+    base_len: uint64 = strlen_u8(base_url)
+    bfd: int32 = sys_open_write(cast[Ptr[char]]("/tmp/apt/base-url"))
+    if bfd < 0:
+        write_str(2, "apt-get: cannot open /tmp/apt/base-url for write\n")
+        return 1
+    bw: int64 = _write_full(bfd, base_url, base_len)
+    sys_write(bfd, "\n", 1)
+    sys_close(bfd)
+    if bw < 0 or cast[uint64](bw) != base_len:
+        write_str(2, "apt-get: short write storing base-url\n")
         return 1
 
     # 5. Summary.
@@ -717,6 +1042,384 @@ def _do_pkgnames() -> int32:
     return 0
 
 
+# -- apt install -------------------------------------------------------
+#
+# Chains: read base-url -> find stanza -> HTTP GET the .deb -> SHA-256
+# verify -> dpkg -i. The helpers below extract one named field from the
+# matched stanza into a destination buffer.
+
+
+# Read /tmp/apt/base-url back into baseurl_buf (NUL-terminated, trailing
+# newline / CR trimmed). Returns 0 on success, -1 if the file is absent
+# (apt update never ran) or empty.
+
+def _read_base_url() -> int32:
+    fd: int32 = sys_open(cast[Ptr[char]]("/tmp/apt/base-url"))
+    if fd < 0:
+        write_str(2, "apt: no base-url on file — run `apt update` first\n")
+        return -1
+    total: uint64 = 0
+    while total + 1 < 768:
+        room: uint64 = 768 - 1 - total
+        ptr: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](&baseurl_buf[0]) + total)
+        n: int64 = sys_read(fd, ptr, room)
+        if n <= 0:
+            break
+        total = total + cast[uint64](n)
+    sys_close(fd)
+    # Trim a trailing newline / carriage return.
+    while total > 0 and (baseurl_buf[total - 1] == 10
+                         or baseurl_buf[total - 1] == 13):
+        total = total - 1
+    baseurl_buf[total] = 0
+    if total == 0:
+        write_str(2, "apt: /tmp/apt/base-url is empty — run `apt update` first\n")
+        return -1
+    return 0
+
+
+# _stanza_extract_field: within pkg_buf[sstart, send) — a single RFC822
+# stanza — find the line beginning "<name>:" in column 0 and copy its
+# value (leading blanks trimmed, trailing CR trimmed) into `dst` of
+# capacity `cap`. Returns 1 if the field was found, else 0. `dst` is
+# left NUL-terminated either way.
+
+def _stanza_extract_field(sstart: uint64, send: uint64,
+                          name: Ptr[uint8], name_len: uint64,
+                          dst: Ptr[uint8], cap: uint64) -> int32:
+    dst[0] = 0
+    pos: uint64 = sstart
+    while pos < send:
+        lstart: uint64 = pos
+        lend: uint64 = pos
+        while lend < send and pkg_buf[lend] != 10:
+            lend = lend + 1
+        # A field line begins in column 0; continuation lines start
+        # with a space/tab and are skipped.
+        first: uint8 = pkg_buf[lstart]
+        if first != 32 and first != 9:
+            # Does the line start with "<name>:"?
+            is_match: int32 = 1
+            if lstart + name_len + 1 > lend:
+                is_match = 0
+            if is_match != 0:
+                i: uint64 = 0
+                while i < name_len:
+                    if pkg_buf[lstart + i] != name[i]:
+                        is_match = 0
+                        break
+                    i = i + 1
+            if is_match != 0 and pkg_buf[lstart + name_len] != 58:   # ':'
+                is_match = 0
+            if is_match != 0:
+                v: uint64 = lstart + name_len + 1
+                vend: uint64 = lend
+                if vend > lstart and pkg_buf[vend - 1] == 13:
+                    vend = vend - 1
+                while v < vend and (pkg_buf[v] == 32 or pkg_buf[v] == 9):
+                    v = v + 1
+                o: uint64 = 0
+                while v < vend and o + 1 < cap:
+                    dst[o] = pkg_buf[v]
+                    o = o + 1
+                    v = v + 1
+                dst[o] = 0
+                return 1
+        pos = lend
+        if pos < send:
+            pos = pos + 1
+    return 0
+
+
+# Locate the stanza for <pkg> in pkg_buf[0, ilen) and pull Filename,
+# SHA256, Size and Version into the fld_* buffers. Returns 0 on
+# success, -1 if the package is absent or has no Filename field.
+
+def _lookup_install_fields(pkg: Ptr[uint8], ilen: uint64) -> int32:
+    pkg_len: uint64 = strlen_u8(pkg)
+    pos: uint64 = 0
+    while pos < ilen:
+        lstart: uint64 = pos
+        lend: uint64 = pos
+        while lend < ilen and pkg_buf[lend] != 10:
+            lend = lend + 1
+        if _line_is_package(lstart, lend) != 0:
+            # Stanza spans [lstart, send) up to the next blank line.
+            send: uint64 = lstart
+            while send < ilen:
+                ls: uint64 = send
+                le: uint64 = send
+                while le < ilen and pkg_buf[le] != 10:
+                    le = le + 1
+                te: uint64 = le
+                if te > ls and pkg_buf[te - 1] == 13:
+                    te = te - 1
+                if te == ls:                            # blank line
+                    break
+                send = le
+                if send < ilen:
+                    send = send + 1
+
+            # The Package: value: column 8 to EOL, leading blanks
+            # trimmed, trailing CR trimmed.
+            v: uint64 = lstart + 8
+            vend: uint64 = lend
+            if vend > lstart and pkg_buf[vend - 1] == 13:
+                vend = vend - 1
+            while v < vend and (pkg_buf[v] == 32 or pkg_buf[v] == 9):
+                v = v + 1
+            eq: int32 = 1
+            i: uint64 = 0
+            while i < pkg_len:
+                if v + i >= vend or pkg_buf[v + i] != pkg[i]:
+                    eq = 0
+                    break
+                i = i + 1
+            if eq != 0 and (v + pkg_len) != vend:
+                eq = 0
+            if eq != 0:
+                # This is our package — extract the install fields.
+                fld_filename[0] = 0
+                fld_sha256[0] = 0
+                fld_size[0] = 0
+                fld_version2[0] = 0
+                if _stanza_extract_field(lstart, send,
+                                         cast[Ptr[uint8]]("Filename"), 8,
+                                         &fld_filename[0], 512) == 0:
+                    write_str(2, "apt: package '")
+                    write_str(2, pkg)
+                    write_str(2, "' has no Filename field in the index\n")
+                    return -1
+                _stanza_extract_field(lstart, send,
+                                      cast[Ptr[uint8]]("SHA256"), 6,
+                                      &fld_sha256[0], 80)
+                _stanza_extract_field(lstart, send,
+                                      cast[Ptr[uint8]]("Size"), 4,
+                                      &fld_size[0], 32)
+                _stanza_extract_field(lstart, send,
+                                      cast[Ptr[uint8]]("Version"), 7,
+                                      &fld_version2[0], 256)
+                return 0
+            pos = send
+        else:
+            pos = lend
+        if pos < ilen:
+            pos = pos + 1
+
+    write_str(2, "apt: package '")
+    write_str(2, pkg)
+    write_str(2, "' not found in index — run `apt update` first?\n")
+    return -1
+
+
+# Compose "<base-path>/<Filename>" into url_path_buf. The Filename in a
+# Packages index is repo-root-relative ("pool/main/..."); the result
+# always begins with a single '/'.
+
+def _build_deb_path():
+    o: uint64 = 0
+    bi: uint64 = 0
+    while path_buf[bi] != 0 and o + 1 < 768:
+        url_path_buf[o] = path_buf[bi]
+        o = o + 1
+        bi = bi + 1
+    url_path_buf[o] = 47                                # '/'
+    o = o + 1
+    fi: uint64 = 0
+    # Skip any leading '/' on the Filename so we never emit "//".
+    if fld_filename[0] == 47:
+        fi = 1
+    while fld_filename[fi] != 0 and o + 1 < 768:
+        url_path_buf[o] = fld_filename[fi]
+        o = o + 1
+        fi = fi + 1
+    url_path_buf[o] = 0
+
+
+# Compose /tmp/apt/<pkg>.deb into debpath_buf. The last path component
+# is "<pkg>.deb"; tmpfs caps a component at TMPFS_NAME_LEN(32) bytes
+# including the NUL, so the package name is truncated to 27 chars
+# (".deb"(4) + NUL(1) = 5 reserved). A fixture-sized package name sits
+# far inside that — the truncation is a defensive cap, not a normal
+# path.
+
+def _build_debpath(pkg: Ptr[uint8]):
+    prefix: Ptr[uint8] = "/tmp/apt/"
+    o: uint64 = 0
+    while prefix[o] != 0:
+        debpath_buf[o] = prefix[o]
+        o = o + 1
+    i: uint64 = 0
+    while pkg[i] != 0 and i < 27:
+        debpath_buf[o] = pkg[i]
+        o = o + 1
+        i = i + 1
+    suffix: Ptr[uint8] = ".deb"
+    k: uint64 = 0
+    while suffix[k] != 0:
+        debpath_buf[o] = suffix[k]
+        o = o + 1
+        k = k + 1
+    debpath_buf[o] = 0
+
+
+# Parse decimal ASCII in fld_size into a uint64. Returns -1 if the
+# field is empty or non-numeric (treated as "Size absent").
+
+def _parse_size() -> int64:
+    if fld_size[0] == 0:
+        return -1
+    n: int64 = 0
+    i: uint64 = 0
+    while fld_size[i] != 0:
+        c: uint8 = fld_size[i]
+        if c < 48 or c > 57:
+            return -1
+        n = n * 10 + cast[int64](c - 48)
+        i = i + 1
+    return n
+
+
+# apt install <pkg>: download the .deb, verify it, hand it to dpkg -i.
+# Returns 0 on success, non-zero on any failure.
+
+def _do_install(pkg: Ptr[uint8]) -> int32:
+    # 1. Recover the mirror base-url and re-parse it for host/port/path.
+    if _read_base_url() != 0:
+        return 1
+    port: int64 = _parse_url(&baseurl_buf[0])
+    if port < 0:
+        return 1
+
+    # 2. Read the package index and locate <pkg>'s stanza.
+    ilen_i: int64 = _read_index()
+    if ilen_i < 0:
+        return 1
+    if _lookup_install_fields(pkg, cast[uint64](ilen_i)) != 0:
+        return 1
+
+    # 3. HTTP GET <base-url>/<Filename> — the .deb is binary, the body
+    #    bytes are captured raw (no text processing). _http_get drains
+    #    into http_buf; we then copy the body span verbatim into
+    #    deb_buf so the SHA-256 + dpkg paths see a clean image.
+    _build_deb_path()
+    write_str(1, "apt: fetching ")
+    write_str(1, &fld_filename[0])
+    write_str(1, "\n")
+    body_off: uint64 = 0
+    body_len_i: int64 = _http_get(port, &body_off)
+    if body_len_i < 0:
+        write_str(2, "apt: failed to download the .deb\n")
+        return 1
+    if body_len_i == 0:
+        write_str(2, "apt: downloaded .deb is empty\n")
+        return 1
+    deb_len: uint64 = cast[uint64](body_len_i)
+    if deb_len > DEB_CAP:
+        write_str(2, "apt: .deb exceeds 256 KiB cap (V0 limit)\n")
+        return 1
+    ci: uint64 = 0
+    while ci < deb_len:
+        deb_buf[ci] = http_buf[body_off + ci]
+        ci = ci + 1
+
+    # 4. Optional Size cross-check: a Size mismatch means the wrong /
+    #    truncated file — bail before the (more expensive) hash.
+    want_size: int64 = _parse_size()
+    if want_size >= 0 and cast[uint64](want_size) != deb_len:
+        write_str(2, "apt: downloaded size mismatch — expected ")
+        write_dec_u64(2, cast[uint64](want_size))
+        write_str(2, " bytes, got ")
+        write_dec_u64(2, deb_len)
+        write_str(2, "\n")
+        return 1
+
+    # 5. SHA-256 verification. The index's SHA256 field is the trust
+    #    anchor: hash the bytes we downloaded and compare. A mismatch
+    #    aborts the install — the corrupt/wrong .deb is NEVER handed to
+    #    dpkg. If the index carries no SHA256 we proceed with a loud
+    #    warning (documented V0.1 backlog: require it).
+    if fld_sha256[0] == 0:
+        write_str(2, "apt: WARNING: SHA256 not verified (index stanza has no SHA256 field)\n")
+    else:
+        _sha256_hash(deb_len)
+        # Compare lowercase-hex digests. The index field is normalised
+        # to lowercase as we compare so an uppercase index value still
+        # matches.
+        hash_ok: int32 = 1
+        i: uint64 = 0
+        while i < 64:
+            want_c: uint8 = fld_sha256[i]
+            if want_c >= 65 and want_c <= 70:           # 'A'..'F'
+                want_c = want_c + 32
+            if want_c != sha_hex[i]:
+                hash_ok = 0
+                break
+            i = i + 1
+        if hash_ok != 0 and fld_sha256[64] != 0:
+            hash_ok = 0                                 # index hash too long
+        if hash_ok == 0:
+            write_str(2, "apt: SHA256 verification FAILED for ")
+            write_str(2, pkg)
+            write_str(2, "\n")
+            write_str(2, "apt:   expected ")
+            write_str(2, &fld_sha256[0])
+            write_str(2, "\n")
+            write_str(2, "apt:   computed ")
+            write_str(2, &sha_hex[0])
+            write_str(2, "\n")
+            write_str(2, "apt: refusing to install a corrupt package\n")
+            return 1
+        write_str(1, "apt: SHA256 OK (")
+        write_dec_u64(1, deb_len)
+        write_str(1, " bytes)\n")
+
+    # 6. Save the verified .deb to /tmp/apt/<pkg>.deb.
+    _build_debpath(pkg)
+    wfd: int32 = sys_open_write(cast[Ptr[char]](&debpath_buf[0]))
+    if wfd < 0:
+        write_str(2, "apt: cannot open ")
+        write_str(2, &debpath_buf[0])
+        write_str(2, " for write\n")
+        return 1
+    wn: int64 = _write_full(wfd, &deb_buf[0], deb_len)
+    sys_close(wfd)
+    if wn < 0 or cast[uint64](wn) != deb_len:
+        write_str(2, "apt: short write saving the downloaded .deb\n")
+        return 1
+
+    # 7. Hand the .deb to `/bin/dpkg -i <debpath>`. dpkg records the
+    #    package in the status DB; its exit code is surfaced as ours.
+    dpkg_argv[0] = cast[uint64](cast[Ptr[uint8]]("/bin/dpkg"))
+    dpkg_argv[1] = cast[uint64](cast[Ptr[uint8]]("-i"))
+    dpkg_argv[2] = cast[uint64](&debpath_buf[0])
+    dpkg_argv[3] = 0
+    pid: int32 = sys_spawn(cast[Ptr[char]]("/bin/dpkg"), &dpkg_argv[0],
+                           0, 1, cast[Ptr[uint64]](0))
+    if pid < 0:
+        write_str(2, "apt: failed to spawn /bin/dpkg\n")
+        return 1
+    rc: int64 = sys_waitpid(pid)
+    if rc != 0:
+        write_str(2, "apt: dpkg -i failed (exit ")
+        if rc < 0:
+            write_str(2, "-")
+            write_dec_u64(2, cast[uint64](0 - rc))
+        else:
+            write_dec_u64(2, cast[uint64](rc))
+        write_str(2, ")\n")
+        return 1
+
+    # 8. Success summary.
+    write_str(1, "apt: installed ")
+    write_str(1, pkg)
+    if fld_version2[0] != 0:
+        write_str(1, " ")
+        write_str(1, &fld_version2[0])
+    write_str(1, "\n")
+    return 0
+
+
 # -- top-level driver --------------------------------------------------
 
 def _usage(progname: Ptr[uint8]) -> int32:
@@ -729,6 +1432,9 @@ def _usage(progname: Ptr[uint8]) -> int32:
     write_str(2, "       ")
     write_str(2, progname)
     write_str(2, " pkgnames\n")
+    write_str(2, "       ")
+    write_str(2, progname)
+    write_str(2, " install <package>\n")
     return 2
 
 
@@ -767,5 +1473,11 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
             return _usage(progname)
         return _do_pkgnames()
 
-    write_str(2, "apt: unknown sub-command (supports: update, show, pkgnames)\n")
+    # install <package>
+    if _streq(verb, cast[Ptr[uint8]]("install")) != 0:
+        if argc != 3:
+            return _usage(progname)
+        return _do_install(cast[Ptr[uint8]](argv[2]))
+
+    write_str(2, "apt: unknown sub-command (supports: update, show, pkgnames, install)\n")
     return _usage(progname)
