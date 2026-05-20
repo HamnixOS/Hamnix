@@ -43,12 +43,39 @@
 #      surfaced as our own.
 #   6. Print `apt: installed <pkg> <version>` on success.
 #
-# NOT in V0 (V0.1/V1 backlog): dependency resolution (installing the
-# package's `Depends:` — V0 installs only the one named package),
-# HTTPS, `apt remove`, version selection (V0 installs whatever the
-# index lists). The .deb download budget is the same 256 KiB HTTP cap
-# as the index fetch — a larger .deb is a hard error (streaming to a
-# file is a V1 concern).
+# -- DEPENDENCY RESOLUTION (V1, this milestone) ------------------------
+#
+# `apt install <pkg>` now installs <pkg>'s transitive `Depends:` first.
+# Before downloading anything it walks the index: for <pkg> and every
+# dependency it has not yet seen and is not already installed, it reads
+# that package's `Depends:` field and recurses. The walk is recorded
+# post-order, so a package's dependencies always land before it in the
+# install order (deps before dependents). A "seen" set both
+# de-duplicates a diamond dependency and breaks a cycle. A dependency
+# already in the dpkg DB is skipped; a dependency name absent from the
+# index aborts the WHOLE install with a clear diagnostic (no partial
+# install).
+#
+# The resolved closure is then installed in TWO phases: Phase 1
+# downloads + SHA-256-verifies + saves every .deb; Phase 2 `dpkg -i`'s
+# them all in dependency order. The split — plus a short settle delay
+# between successive downloads — works around an in-kernel TCP-stack
+# limitation: several back-to-back active-open connections that reuse
+# the same ephemeral source port wedge the handshake (see the
+# _settle_before_connect / two-phase notes for the full rationale).
+#
+# V1 `Depends:` parsing is pragmatic: the field is split on ',', the
+# name of a term is the token before any '(' or '|', an alternative
+# ("a | b") picks the FIRST alternative, and version constraints
+# ("(>= x)") are parsed-past but NOT checked. The closure is bounded at
+# 64 packages (DEP_MAX) — exceeding it is a hard error.
+#
+# NOT in V1 (V2 backlog): version-constraint satisfaction,
+# alternative-preference logic beyond "first wins",
+# Conflicts:/Breaks:/Pre-Depends: ordering, Recommends:/Suggests:,
+# HTTPS, `apt remove`. The .deb download budget is the same 256 KiB
+# HTTP cap as the index fetch — a larger .deb is a hard error
+# (streaming to a file is a V1 concern).
 #
 # -- apt update <base-url> <suite> -------------------------------------
 #
@@ -131,6 +158,9 @@ extern def sys_spawn(path: Ptr[char], argv: Ptr[uint64],
                      stdin_fd: int32, stdout_fd: int32,
                      envp: Ptr[uint64]) -> int32
 extern def sys_waitpid(pid: int32) -> int64
+# Jiffy counter (100 Hz) — used to space successive .deb downloads
+# apart (see _settle_before_connect).
+extern def sys_get_jiffies() -> uint64
 
 
 # -- bounded BSS arenas (Hamnix idiom: never park large Arrays in a
@@ -182,6 +212,53 @@ debpath_buf: Array[256, uint8]
 
 # argv handed to the spawned `/bin/dpkg -i <debpath>`.
 dpkg_argv:   Array[8, uint64]
+
+# -- dependency-resolution scratch (V1) -------------------------------
+#
+# `apt install <pkg>` now walks the package's `Depends:` field
+# transitively. Two fixed-size BSS tables back the resolver (top-level
+# arenas — the U9 nested-frame-Array quirk):
+#
+#   dep_seen   — every package name visited by the resolver. Doubles
+#                as the dedup set AND the cycle guard: a package
+#                already in dep_seen is never recursed into again, so
+#                a dependency that loops back into the set terminates.
+#   dep_order  — the resolved install order, appended post-order
+#                (deepest dependency first, the named package last).
+#
+# Both are bounded at DEP_MAX entries; exceeding that is a hard error
+# (a real Debian dependency closure is far larger, but a fixture-sized
+# graph sits well inside 64). Each name slot is DEP_NAME_CAP bytes.
+DEP_MAX:      uint64 = 64          # max packages in one install closure
+DEP_NAME_CAP: uint64 = 64          # max package-name length (+ NUL)
+
+dep_seen:   Array[4096, uint8]     # DEP_MAX * DEP_NAME_CAP visited names
+dep_seen_n: uint64 = 0             # count of names in dep_seen
+
+dep_order:  Array[4096, uint8]     # DEP_MAX * DEP_NAME_CAP install order
+dep_order_n: uint64 = 0            # count of names in dep_order
+
+# Scratch: one dependency name pulled out of a `Depends:` term. This
+# is shared scratch — clobbered by every _dep_term_name call — so the
+# resolver copies the name it cares about into the per-depth name
+# stack below before recursing.
+dep_name_buf: Array[64, uint8]
+
+# Per-recursion-depth name stack. _resolve copies its `pkg` argument
+# (which itself points into the shared dep_name_buf of the caller)
+# into its own DEP_NAME_CAP-byte slot here on entry, so a nested
+# _resolve clobbering dep_name_buf does not corrupt this frame's name.
+# Bounded at DEP_MAX depths — a chain deeper than 64 is a hard error.
+dep_namestack: Array[4096, uint8]   # DEP_MAX * DEP_NAME_CAP
+
+# Scratch: the raw `Depends:` field value of the stanza being resolved.
+# Like dep_name_buf this is clobbered by a nested _resolve; the term
+# loop re-extracts it after each recursive call.
+dep_field_buf: Array[1024, uint8]
+
+# Scratch: the resolver records which package's dependency was missing
+# so the abort diagnostic can name the dependent.
+dep_missing_parent: Array[64, uint8]
 
 # SHA-256 working state for the download-verification path.
 sha_state:   Array[8, uint32]      # 8 working hash words
@@ -1177,11 +1254,15 @@ def _stanza_extract_field(sstart: uint64, send: uint64,
     return 0
 
 
-# Locate the stanza for <pkg> in pkg_buf[0, ilen) and pull Filename,
-# SHA256, Size and Version into the fld_* buffers. Returns 0 on
-# success, -1 if the package is absent or has no Filename field.
+# _find_stanza: locate the RFC822 stanza in pkg_buf[0, ilen) whose
+# `Package:` value equals <pkg>. On success writes the stanza span
+# [*out_start, *out_end) and returns 0; returns -1 if <pkg> has no
+# stanza in the index. Factored out of _lookup_install_fields so the
+# dependency resolver can find a package's stanza to read its
+# `Depends:` field without pulling the install fields too.
 
-def _lookup_install_fields(pkg: Ptr[uint8], ilen: uint64) -> int32:
+def _find_stanza(pkg: Ptr[uint8], ilen: uint64,
+                 out_start: Ptr[uint64], out_end: Ptr[uint64]) -> int32:
     pkg_len: uint64 = strlen_u8(pkg)
     pos: uint64 = 0
     while pos < ilen:
@@ -1224,38 +1305,51 @@ def _lookup_install_fields(pkg: Ptr[uint8], ilen: uint64) -> int32:
             if eq != 0 and (v + pkg_len) != vend:
                 eq = 0
             if eq != 0:
-                # This is our package — extract the install fields.
-                fld_filename[0] = 0
-                fld_sha256[0] = 0
-                fld_size[0] = 0
-                fld_version2[0] = 0
-                if _stanza_extract_field(lstart, send,
-                                         cast[Ptr[uint8]]("Filename"), 8,
-                                         &fld_filename[0], 512) == 0:
-                    write_str(2, "apt: package '")
-                    write_str(2, pkg)
-                    write_str(2, "' has no Filename field in the index\n")
-                    return -1
-                _stanza_extract_field(lstart, send,
-                                      cast[Ptr[uint8]]("SHA256"), 6,
-                                      &fld_sha256[0], 80)
-                _stanza_extract_field(lstart, send,
-                                      cast[Ptr[uint8]]("Size"), 4,
-                                      &fld_size[0], 32)
-                _stanza_extract_field(lstart, send,
-                                      cast[Ptr[uint8]]("Version"), 7,
-                                      &fld_version2[0], 256)
+                out_start[0] = lstart
+                out_end[0] = send
                 return 0
             pos = send
         else:
             pos = lend
         if pos < ilen:
             pos = pos + 1
-
-    write_str(2, "apt: package '")
-    write_str(2, pkg)
-    write_str(2, "' not found in index — run `apt update` first?\n")
     return -1
+
+
+# Locate the stanza for <pkg> in pkg_buf[0, ilen) and pull Filename,
+# SHA256, Size and Version into the fld_* buffers. Returns 0 on
+# success, -1 if the package is absent or has no Filename field.
+
+def _lookup_install_fields(pkg: Ptr[uint8], ilen: uint64) -> int32:
+    sstart: uint64 = 0
+    send: uint64 = 0
+    if _find_stanza(pkg, ilen, &sstart, &send) != 0:
+        write_str(2, "apt: package '")
+        write_str(2, pkg)
+        write_str(2, "' not found in index — run `apt update` first?\n")
+        return -1
+    # Extract the install fields out of the matched stanza.
+    fld_filename[0] = 0
+    fld_sha256[0] = 0
+    fld_size[0] = 0
+    fld_version2[0] = 0
+    if _stanza_extract_field(sstart, send,
+                             cast[Ptr[uint8]]("Filename"), 8,
+                             &fld_filename[0], 512) == 0:
+        write_str(2, "apt: package '")
+        write_str(2, pkg)
+        write_str(2, "' has no Filename field in the index\n")
+        return -1
+    _stanza_extract_field(sstart, send,
+                          cast[Ptr[uint8]]("SHA256"), 6,
+                          &fld_sha256[0], 80)
+    _stanza_extract_field(sstart, send,
+                          cast[Ptr[uint8]]("Size"), 4,
+                          &fld_size[0], 32)
+    _stanza_extract_field(sstart, send,
+                          cast[Ptr[uint8]]("Version"), 7,
+                          &fld_version2[0], 256)
+    return 0
 
 
 # Compose "<base-path>/<Filename>" into url_path_buf. The Filename in a
@@ -1326,28 +1420,347 @@ def _parse_size() -> int64:
     return n
 
 
-# apt install <pkg>: download the .deb, verify it, hand it to dpkg -i.
-# Returns 0 on success, non-zero on any failure.
+# -- dependency resolution (V1) ----------------------------------------
+#
+# `apt install <pkg>` now installs <pkg>'s transitive `Depends:` first.
+# The algorithm is a recursive post-order walk of the dependency graph:
+#
+#   resolve(p):
+#       if p in dep_seen:        return        # dedup + cycle guard
+#       add p to dep_seen
+#       if p already installed:  return        # dpkg DB already has it
+#       for each dep in p's Depends: field:
+#           resolve(dep)                       # recurse FIRST
+#       append p to dep_order                  # ...then record p
+#
+# Post-order append means a package's dependencies always precede it
+# in dep_order — exactly the install order we want (deps before
+# dependents). The dep_seen set both de-duplicates a diamond
+# dependency and breaks a cycle: a package that depends back into the
+# closure is already in dep_seen and is not recursed into a second
+# time.
+#
+# V1 SCOPE — pragmatic `Depends:` parsing only:
+#   * the field is split on ',' into terms;
+#   * for a term, the package name is the token before any '(' or '|';
+#   * an alternative ("libfoo | libbar") picks the FIRST alternative;
+#   * version constraints ("(>= 2.34)") are IGNORED — the name is
+#     resolved, the constraint is not checked.
+# Version-aware resolution, alternative-preference logic, and
+# Conflicts:/Breaks:/Pre-Depends: ordering are all V2 backlog.
 
-def _do_install(pkg: Ptr[uint8]) -> int32:
-    # 1. Recover the mirror base-url and re-parse it for host/port/path.
-    if _read_base_url() != 0:
-        return 1
-    port: int64 = _parse_url(&baseurl_buf[0])
-    if port < 0:
-        return 1
 
-    # 2. Read the package index and locate <pkg>'s stanza.
+# Does dep_seen already contain the NUL-terminated name <name>?
+# Returns 1 if present, 0 if not.
+
+def _dep_seen_has(name: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while i < dep_seen_n:
+        base: uint64 = i * 64
+        eq: int32 = 1
+        j: uint64 = 0
+        while True:
+            a: uint8 = dep_seen[base + j]
+            b: uint8 = name[j]
+            if a != b:
+                eq = 0
+                break
+            if a == 0:
+                break
+            j = j + 1
+        if eq != 0:
+            return 1
+        i = i + 1
+    return 0
+
+
+# Append <name> to dep_seen. Returns 0 on success, -1 if the table is
+# full (closure exceeds DEP_MAX packages).
+
+def _dep_seen_add(name: Ptr[uint8]) -> int32:
+    if dep_seen_n >= 64:
+        write_str(2, "apt: dependency closure exceeds 64 packages (V1 limit)\n")
+        return -1
+    base: uint64 = dep_seen_n * 64
+    i: uint64 = 0
+    while name[i] != 0 and i + 1 < 64:
+        dep_seen[base + i] = name[i]
+        i = i + 1
+    dep_seen[base + i] = 0
+    dep_seen_n = dep_seen_n + 1
+    return 0
+
+
+# Append <name> to dep_order (the resolved install order). Returns 0
+# on success, -1 if the table is full.
+
+def _dep_order_add(name: Ptr[uint8]) -> int32:
+    if dep_order_n >= 64:
+        write_str(2, "apt: install order exceeds 64 packages (V1 limit)\n")
+        return -1
+    base: uint64 = dep_order_n * 64
+    i: uint64 = 0
+    while name[i] != 0 and i + 1 < 64:
+        dep_order[base + i] = name[i]
+        i = i + 1
+    dep_order[base + i] = 0
+    dep_order_n = dep_order_n + 1
+    return 0
+
+
+# Pointer to the i'th name in dep_order.
+
+def _dep_order_at(i: uint64) -> Ptr[uint8]:
+    return cast[Ptr[uint8]](cast[uint64](&dep_order[0]) + i * 64)
+
+
+# Is <pkg> already recorded in the dpkg status DB? Reads the flattened
+# tmpfs status DB /tmp/dpkg-status (same path dpkg.ad's -i path writes
+# and -s reads) and scans it for a stanza whose `Package:` value
+# equals <pkg>. Returns 1 if installed, 0 if not (or the DB is absent).
+#
+# The status DB is reused as scratch in pkg_buf's tail-free region —
+# but pkg_buf already holds the live Packages index, so the DB is read
+# into deb_buf instead (deb_buf is otherwise idle until a download).
+
+def _is_installed(pkg: Ptr[uint8]) -> int32:
+    fd: int32 = sys_open(cast[Ptr[char]]("/tmp/dpkg-status"))
+    if fd < 0:
+        return 0
+    total: uint64 = 0
+    while total < DEB_CAP:
+        room: uint64 = DEB_CAP - total
+        ptr: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](&deb_buf[0]) + total)
+        n: int64 = sys_read(fd, ptr, room)
+        if n <= 0:
+            break
+        total = total + cast[uint64](n)
+    sys_close(fd)
+
+    pkg_len: uint64 = strlen_u8(pkg)
+    name: Ptr[uint8] = "Package:"
+    pos: uint64 = 0
+    while pos < total:
+        lstart: uint64 = pos
+        lend: uint64 = pos
+        while lend < total and deb_buf[lend] != 10:
+            lend = lend + 1
+        # Does this line begin with "Package:"?
+        is_pkg: int32 = 1
+        if lstart + 8 > lend:
+            is_pkg = 0
+        if is_pkg != 0:
+            k: uint64 = 0
+            while k < 8:
+                if deb_buf[lstart + k] != name[k]:
+                    is_pkg = 0
+                    break
+                k = k + 1
+        if is_pkg != 0:
+            v: uint64 = lstart + 8
+            vend: uint64 = lend
+            if vend > lstart and deb_buf[vend - 1] == 13:
+                vend = vend - 1
+            while v < vend and (deb_buf[v] == 32 or deb_buf[v] == 9):
+                v = v + 1
+            eq: int32 = 1
+            i: uint64 = 0
+            while i < pkg_len:
+                if v + i >= vend or deb_buf[v + i] != pkg[i]:
+                    eq = 0
+                    break
+                i = i + 1
+            if eq != 0 and (v + pkg_len) != vend:
+                eq = 0
+            if eq != 0:
+                return 1
+        pos = lend
+        if pos < total:
+            pos = pos + 1
+    return 0
+
+
+# _dep_term_name: extract the package name from one `Depends:` term
+# starting at dep_field_buf[start]. The name is the run of bytes up to
+# (but not including) the first '(' , '|' , ',' or NUL, with leading
+# and trailing blanks trimmed. For an alternative ("libfoo | libbar")
+# this naturally takes the FIRST alternative (the run stops at '|').
+# The name is written NUL-terminated into dep_name_buf. Returns 1 if a
+# non-empty name was extracted, 0 if the term was blank.
+
+def _dep_term_name(start: uint64, term_end: uint64) -> int32:
+    # Trim leading blanks.
+    s: uint64 = start
+    while s < term_end and (dep_field_buf[s] == 32 or dep_field_buf[s] == 9):
+        s = s + 1
+    # The name ends at the first '(' , '|' or the term end.
+    e: uint64 = s
+    while e < term_end:
+        c: uint8 = dep_field_buf[e]
+        if c == 40 or c == 124:                         # '(' or '|'
+            break
+        e = e + 1
+    # Trim trailing blanks of the name span.
+    while e > s and (dep_field_buf[e - 1] == 32 or dep_field_buf[e - 1] == 9):
+        e = e - 1
+    if e <= s:
+        dep_name_buf[0] = 0
+        return 0
+    o: uint64 = 0
+    i: uint64 = s
+    while i < e and o + 1 < 64:
+        dep_name_buf[o] = dep_field_buf[i]
+        o = o + 1
+        i = i + 1
+    dep_name_buf[o] = 0
+    return 1
+
+
+# Pointer to recursion-depth `d`'s slot in dep_namestack.
+
+def _dep_namestack_at(d: uint64) -> Ptr[uint8]:
+    return cast[Ptr[uint8]](cast[uint64](&dep_namestack[0]) + d * 64)
+
+
+# _resolve: recursive post-order walk of <pkg>'s dependency closure.
+# On return, dep_order holds the install order with <pkg> last and its
+# (transitive) dependencies before it. dep_seen is the dedup + cycle
+# guard. Returns 0 on success, -1 on any error (table full, recursion
+# too deep, or a dependency name absent from the index — a hard abort).
+#
+# `ilen` is the live Packages-index length in pkg_buf. `depth` is the
+# recursion depth: _resolve copies <pkg> into dep_namestack[depth] on
+# entry so that a nested _resolve clobbering the shared dep_name_buf
+# (the buffer <pkg> typically points into) cannot corrupt this frame's
+# notion of which package it is resolving.
+
+def _resolve(pkg: Ptr[uint8], ilen: uint64, depth: uint64) -> int32:
+    if depth >= 64:
+        write_str(2, "apt: dependency chain exceeds 64 levels (V1 limit)\n")
+        return -1
+    # Stabilise <pkg> into this frame's own name slot — every read of
+    # the package name below uses `me`, never the volatile `pkg`.
+    me: Ptr[uint8] = _dep_namestack_at(depth)
+    np: uint64 = 0
+    while pkg[np] != 0 and np + 1 < 64:
+        me[np] = pkg[np]
+        np = np + 1
+    me[np] = 0
+
+    # Already visited — dedup, and (since dep_seen is added BEFORE the
+    # recursion) the cycle guard. A package that depends back into the
+    # closure is already here and is not walked a second time.
+    if _dep_seen_has(me) != 0:
+        return 0
+    if _dep_seen_add(me) != 0:
+        return -1
+
+    # Already installed — skip it (and its subtree: a satisfied
+    # dependency's own deps are by definition already satisfied too).
+    # The package is NOT added to dep_order — nothing to download.
+    if _is_installed(me) != 0:
+        write_str(1, "apt: ")
+        write_str(1, me)
+        write_str(1, " already installed, skipping\n")
+        return 0
+
+    # Find this package's stanza so we can read its `Depends:` field.
+    sstart: uint64 = 0
+    send: uint64 = 0
+    if _find_stanza(me, ilen, &sstart, &send) != 0:
+        # A missing *dependency* is reported here with its parent (set
+        # by the caller); a missing root package has no parent set.
+        if dep_missing_parent[0] != 0:
+            write_str(2, "apt: dependency '")
+            write_str(2, me)
+            write_str(2, "' of '")
+            write_str(2, &dep_missing_parent[0])
+            write_str(2, "' not found in index\n")
+        else:
+            write_str(2, "apt: package '")
+            write_str(2, me)
+            write_str(2, "' not found in index — run `apt update` first?\n")
+        return -1
+
+    # Pull the `Depends:` field. Absent / empty -> no dependencies.
+    have_deps: int32 = _stanza_extract_field(sstart, send,
+                                             cast[Ptr[uint8]]("Depends"), 7,
+                                             &dep_field_buf[0], 1024)
+    if have_deps != 0 and dep_field_buf[0] != 0:
+        # Walk the comma-separated terms, recursing into each.
+        flen: uint64 = strlen_u8(&dep_field_buf[0])
+        term_start: uint64 = 0
+        i: uint64 = 0
+        while i <= flen:
+            if i == flen or dep_field_buf[i] == 44:      # ',' or end
+                if _dep_term_name(term_start, i) != 0:
+                    # Record `me` as the parent so a missing-dep abort
+                    # names the dependent.
+                    p: uint64 = 0
+                    while me[p] != 0 and p + 1 < 64:
+                        dep_missing_parent[p] = me[p]
+                        p = p + 1
+                    dep_missing_parent[p] = 0
+                    # _dep_term_name wrote the dependency name into the
+                    # shared dep_name_buf; recurse on it. The nested
+                    # _resolve copies it into its own depth slot first.
+                    if _resolve(&dep_name_buf[0], ilen, depth + 1) != 0:
+                        return -1
+                    # A nested _resolve clobbered dep_field_buf with the
+                    # child's Depends — re-extract this stanza's Depends
+                    # for the remaining terms.
+                    _stanza_extract_field(sstart, send,
+                                          cast[Ptr[uint8]]("Depends"), 7,
+                                          &dep_field_buf[0], 1024)
+                term_start = i + 1
+            i = i + 1
+
+    # Post-order: record `me` AFTER all its dependencies.
+    if _dep_order_add(me) != 0:
+        return -1
+    return 0
+
+
+# -- two-phase install: fetch-all then dpkg-all ------------------------
+#
+# `apt install <pkg>` installs the whole dependency closure in two
+# distinct phases:
+#
+#   Phase 1 (_fetch_one per package): download + SHA-256-verify + save
+#            each .deb to /tmp/apt/<pkg>.deb. Every package is fetched
+#            BEFORE any dpkg runs; successive downloads are spaced
+#            apart by _settle_before_connect.
+#   Phase 2 (_dpkg_one per package): `dpkg -i` each saved .deb, in
+#            dependency order, with no networking.
+#
+# Two reasons for the split: (1) keeping every network connect() ahead
+# of the first dpkg spawn, and (2) the in-kernel TCP stack / SLIRP path
+# wedges when several active-open connections reuse the same ephemeral
+# source port back-to-back (the slot allocator hands out the same low
+# slot, so every connection uses the same port). The settle delay
+# between downloads lets the host retire the previous 4-tuple; the
+# phase split keeps the dpkg spawns out of the network path entirely.
+# Both are userland work-arounds for kernel-side socket limitations.
+
+
+# _fetch_one — download + verify + save one package's .deb. `port` is
+# the parsed mirror port. Returns 0 on success, non-zero on any
+# failure. The .deb lands at /tmp/apt/<pkg>.deb. Performs exactly one
+# socket connect; the caller spaces successive calls with
+# _settle_before_connect.
+
+def _fetch_one(pkg: Ptr[uint8], port: int64) -> int32:
+    # Locate <pkg>'s stanza and pull the install fields.
     ilen_i: int64 = _read_index()
     if ilen_i < 0:
         return 1
     if _lookup_install_fields(pkg, cast[uint64](ilen_i)) != 0:
         return 1
 
-    # 3. HTTP GET <base-url>/<Filename> — the .deb is binary, the body
-    #    bytes are captured raw (no text processing). _http_get drains
-    #    into http_buf; we then copy the body span verbatim into
-    #    deb_buf so the SHA-256 + dpkg paths see a clean image.
+    # HTTP GET <base-url>/<Filename> — the .deb is binary, the body
+    # bytes are captured raw (no text processing). _http_get drains
+    # into http_buf; we then copy the body span verbatim into deb_buf
+    # so the SHA-256 path sees a clean image.
     _build_deb_path()
     write_str(1, "apt: fetching ")
     write_str(1, &fld_filename[0])
@@ -1369,8 +1782,8 @@ def _do_install(pkg: Ptr[uint8]) -> int32:
         deb_buf[ci] = http_buf[body_off + ci]
         ci = ci + 1
 
-    # 4. Optional Size cross-check: a Size mismatch means the wrong /
-    #    truncated file — bail before the (more expensive) hash.
+    # Optional Size cross-check: a Size mismatch means the wrong /
+    # truncated file — bail before the (more expensive) hash.
     want_size: int64 = _parse_size()
     if want_size >= 0 and cast[uint64](want_size) != deb_len:
         write_str(2, "apt: downloaded size mismatch — expected ")
@@ -1380,11 +1793,11 @@ def _do_install(pkg: Ptr[uint8]) -> int32:
         write_str(2, "\n")
         return 1
 
-    # 5. SHA-256 verification. The index's SHA256 field is the trust
-    #    anchor: hash the bytes we downloaded and compare. A mismatch
-    #    aborts the install — the corrupt/wrong .deb is NEVER handed to
-    #    dpkg. If the index carries no SHA256 we proceed with a loud
-    #    warning (documented V0.1 backlog: require it).
+    # SHA-256 verification. The index's SHA256 field is the trust
+    # anchor: hash the bytes we downloaded and compare. A mismatch
+    # aborts the install — the corrupt/wrong .deb is NEVER handed to
+    # dpkg. If the index carries no SHA256 we proceed with a loud
+    # warning (documented V0.1 backlog: require it).
     if fld_sha256[0] == 0:
         write_str(2, "apt: WARNING: SHA256 not verified (index stanza has no SHA256 field)\n")
     else:
@@ -1420,7 +1833,7 @@ def _do_install(pkg: Ptr[uint8]) -> int32:
         write_dec_u64(1, deb_len)
         write_str(1, " bytes)\n")
 
-    # 6. Save the verified .deb to /tmp/apt/<pkg>.deb.
+    # Save the verified .deb to /tmp/apt/<pkg>.deb for Phase 2.
     _build_debpath(pkg)
     wfd: int32 = sys_open_write(cast[Ptr[char]](&debpath_buf[0]))
     if wfd < 0:
@@ -1433,9 +1846,25 @@ def _do_install(pkg: Ptr[uint8]) -> int32:
     if wn < 0 or cast[uint64](wn) != deb_len:
         write_str(2, "apt: short write saving the downloaded .deb\n")
         return 1
+    return 0
 
-    # 7. Hand the .deb to `/bin/dpkg -i <debpath>`. dpkg records the
-    #    package in the status DB; its exit code is surfaced as ours.
+
+# Phase 2 — `dpkg -i` one already-downloaded package. The .deb is the
+# /tmp/apt/<pkg>.deb that _fetch_one saved. Re-reads the index only to
+# recover the Version for the summary line (no networking). Returns 0
+# on success, non-zero on any failure.
+
+def _dpkg_one(pkg: Ptr[uint8]) -> int32:
+    # Recover the Version field for the summary line (index re-read is
+    # local — /tmp/apt/Packages — and does not touch the network).
+    fld_version2[0] = 0
+    ilen_i: int64 = _read_index()
+    if ilen_i >= 0:
+        _lookup_install_fields(pkg, cast[uint64](ilen_i))
+
+    # Hand the saved .deb to `/bin/dpkg -i <debpath>`. dpkg records the
+    # package in the status DB; its exit code gates ours.
+    _build_debpath(pkg)
     dpkg_argv[0] = cast[uint64](cast[Ptr[uint8]]("/bin/dpkg"))
     dpkg_argv[1] = cast[uint64](cast[Ptr[uint8]]("-i"))
     dpkg_argv[2] = cast[uint64](&debpath_buf[0])
@@ -1456,13 +1885,169 @@ def _do_install(pkg: Ptr[uint8]) -> int32:
         write_str(2, ")\n")
         return 1
 
-    # 8. Success summary.
+    # Per-package summary.
     write_str(1, "apt: installed ")
     write_str(1, pkg)
     if fld_version2[0] != 0:
         write_str(1, " ")
         write_str(1, &fld_version2[0])
     write_str(1, "\n")
+    return 0
+
+
+# _settle_before_connect — burn real wall-clock time between two .deb
+# downloads. Phase 1 calls this before every download after the first.
+#
+# Why: every active-open the in-kernel TCP stack makes reuses the same
+# ephemeral source port (TCP_EPHEMERAL_BASE + slot, and the slot
+# allocator hands back the same low slot each time). Hammering the host
+# (SLIRP user-net) with back-to-back connections from one source port
+# wedges the 3rd/4th handshake — the connection's SYN-ACK never
+# arrives and tcp_connect livelocks. Spacing the downloads apart in
+# WALL time lets the host side retire the previous 4-tuple before the
+# next connection reuses the port. `apt update`'s two connections and
+# every single-download `apt install` already work because they are
+# naturally spaced; this makes a multi-dependency install behave the
+# same.
+#
+# Implementation note: this is a fixed-ITERATION-COUNT busy loop, not a
+# jiffy-deadline loop. The guest's jiffy counter advances in bursts
+# under the TCG-emulated CPU, so `while get_jiffies() < deadline` can
+# satisfy its deadline in near-zero wall time — useless for spacing a
+# host-observable event. A fixed iteration count of a real syscall
+# (sys_get_jiffies, which the compiler cannot elide and which has a
+# genuine per-call cost) burns deterministic wall time instead — the
+# same reasoning drivers/net/tcp.ad's close path documents for its
+# 500_000-iteration poll loop.
+
+SETTLE_ITERS: uint64 = 20000000     # tens of seconds of wall time on TCG x86_64
+
+def _settle_before_connect():
+    i: uint64 = 0
+    acc: uint64 = 0
+    while i < SETTLE_ITERS:
+        # The syscall both defeats loop elision and paces the burn.
+        acc = acc + sys_get_jiffies()
+        i = i + 1
+    # Touch `acc` so the loop body is not dead-code-eliminated.
+    if acc == 0xFFFFFFFFFFFFFFFF:
+        write_str(2, "")
+
+
+# apt install <pkg>: resolve <pkg>'s transitive `Depends:`, then
+# install the whole closure in dependency order (deepest dependency
+# first, <pkg> last). Returns 0 on success, non-zero on any failure.
+#
+# A dependency already recorded in the dpkg DB is skipped; a
+# dependency name absent from the index aborts the WHOLE install
+# before any package is downloaded — no partial install.
+
+def _do_install(pkg: Ptr[uint8]) -> int32:
+    # 1. Recover the mirror base-url and validate it parses — this is
+    #    an early, clean failure if `apt update` never ran. The actual
+    #    downloads happen in `apt __fetch1` children, which re-recover
+    #    the base-url themselves (Phase 1).
+    if _read_base_url() != 0:
+        return 1
+    port: int64 = _parse_url(&baseurl_buf[0])
+    if port < 0:
+        return 1
+
+    # 2. Read the package index — the resolver walks it in pkg_buf.
+    ilen_i: int64 = _read_index()
+    if ilen_i < 0:
+        return 1
+    ilen: uint64 = cast[uint64](ilen_i)
+
+    # The named root package must exist before we resolve anything.
+    rs: uint64 = 0
+    re: uint64 = 0
+    if _find_stanza(pkg, ilen, &rs, &re) != 0:
+        write_str(2, "apt: package '")
+        write_str(2, pkg)
+        write_str(2, "' not found in index — run `apt update` first?\n")
+        return 1
+
+    # 3. Resolve the dependency closure (post-order -> dep_order).
+    dep_seen_n = 0
+    dep_order_n = 0
+    dep_missing_parent[0] = 0
+    if _resolve(pkg, ilen, 0) != 0:
+        write_str(2, "apt: aborting — dependency resolution failed (no packages installed)\n")
+        return 1
+
+    # 4. Print the install plan. dep_order ends with <pkg>; everything
+    #    before it is a (transitive) dependency to install first.
+    ndeps: uint64 = 0
+    if dep_order_n > 0:
+        ndeps = dep_order_n - 1
+    write_str(1, "apt: installing ")
+    write_str(1, pkg)
+    write_str(1, " and ")
+    write_dec_u64(1, ndeps)
+    if ndeps == 1:
+        write_str(1, " dependency")
+    else:
+        write_str(1, " dependencies")
+    if dep_order_n > 0:
+        write_str(1, ": ")
+        oi: uint64 = 0
+        while oi < dep_order_n:
+            if oi > 0:
+                write_str(1, ", ")
+            write_str(1, _dep_order_at(oi))
+            oi = oi + 1
+    write_str(1, "\n")
+
+    # 5. Phase 1 — download + verify + save every package's .deb. Every
+    #    network connect() happens here, BEFORE the first dpkg spawn.
+    #    Successive downloads are spaced apart by _settle_before_connect
+    #    so the host side retires each connection's 4-tuple before the
+    #    next reuses the (always-identical) ephemeral source port — back
+    #    -to-back connections otherwise wedge the TCP handshake (see the
+    #    _settle_before_connect note). A package already in the dpkg DB
+    #    is skipped — but the resolver already pruned installed packages
+    #    from dep_order, so this is a defensive re-check only.
+    ii: uint64 = 0
+    did_fetch: int32 = 0
+    while ii < dep_order_n:
+        one: Ptr[uint8] = _dep_order_at(ii)
+        if _is_installed(one) != 0:
+            write_str(1, "apt: ")
+            write_str(1, one)
+            write_str(1, " already installed, skipping\n")
+        else:
+            # Space this download apart from the previous one (and from
+            # the `apt update` that almost certainly just ran).
+            if did_fetch != 0:
+                _settle_before_connect()
+            if _fetch_one(one, port) != 0:
+                write_str(2, "apt: download of '")
+                write_str(2, one)
+                write_str(2, "' failed — aborting\n")
+                return 1
+            did_fetch = 1
+        ii = ii + 1
+
+    # 6. Phase 2 — `dpkg -i` every downloaded package, in dependency
+    #    order (dependencies before dependents). No networking here.
+    ij: uint64 = 0
+    while ij < dep_order_n:
+        one2: Ptr[uint8] = _dep_order_at(ij)
+        if _is_installed(one2) == 0:
+            if _dpkg_one(one2) != 0:
+                write_str(2, "apt: install of '")
+                write_str(2, one2)
+                write_str(2, "' failed — aborting\n")
+                return 1
+        ij = ij + 1
+
+    # 7. Final summary.
+    write_str(1, "apt: installed ")
+    write_str(1, pkg)
+    write_str(1, " (+")
+    write_dec_u64(1, ndeps)
+    write_str(1, " deps)\n")
     return 0
 
 
