@@ -55,14 +55,15 @@ from kernel.printk.printk import printk1
 from kernel.sched.core import (
     TaskStruct,
     task_vma_list_head, set_task_vma_list_head,
-    current_idx_get,
+    current_idx_get, task_pml4,
 )
 from mm.slab import kmalloc, kfree
 from mm.page_alloc import alloc_pages, free_pages
-from fs.elf import vm_fork_copy_install
+from fs.elf import vm_fork_copy_install, elf_install_user_mapping
 
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+extern def load_cr3(value: uint64)
 
 # ---------------------------------------------------------------------
 # Constants
@@ -83,10 +84,62 @@ VMA_PROT_EXEC:  int32 = 0x4
 
 VMA_PAGE_SIZE: uint64 = 0x1000
 
+# Buddy allocator MAX_ORDER (mm/page_alloc.ad) is 10 -> the largest
+# single alloc_pages call covers 2^10 pages = 4 MiB. A VMA whose
+# page-rounded length exceeds this is backed by MULTIPLE buddy chunks
+# (each up to 4 MiB) mapped at consecutive virtual addresses so the
+# VMA still presents one contiguous virtual range. See vma_alloc.
+VMA_MAX_ORDER:    int32  = 10
+VMA_MAX_CHUNK:    uint64 = 0x400000          # 4 MiB == 2^MAX_ORDER pages
+
+# A multi-chunk VMA owns an array of VmaChunk descriptors (one per
+# buddy allocation). Each descriptor is 16 bytes; the array is kmalloc'd
+# and pointed to by VmaNode.chunks. Single-chunk / alias VMAs leave
+# chunks == 0 and nchunks == 0 and use the legacy backing/order fields.
+VMA_CHUNK_SIZE:   uint64 = 16
+
+# Virtual-address window for multi-chunk VMAs.
+#
+# A single-chunk VMA returns its buddy chunk's physical/identity
+# address as the VMA base — the buddy allocator owns that physical
+# run exclusively, so the VMA's virtual range can never be re-handed
+# to another allocation. A multi-chunk VMA can't do that: its virtual
+# range [base, base+length) is far larger than chunk 0's 4 MiB, and
+# the buddy allocator would happily hand the physical pages sitting
+# under [base+4MiB, base+length) to the NEXT large mmap — two VMAs
+# would then overlap virtually and corrupt each other.
+#
+# So multi-chunk VMAs live in a DEDICATED virtual window starting at
+# 1 GiB. QEMU/typical hardware RAM here is far under 1 GiB and the
+# buddy allocator only ever hands out physical pages from real low
+# RAM, so nothing else — no buddy allocation, no small VMA (which
+# sits at its low identity address), no ELF image / brk / stack —
+# ever lands in [1 GiB, 4 GiB). A monotonic bump pointer carves
+# 4-MiB-aligned windows out of it; freed windows are not reclaimed
+# (consistent with the buddy allocator's no-merge stance and the
+# kstack/ustack leak task_reap already tolerates). EVERY chunk of a
+# multi-chunk VMA — including chunk 0 — is overlaid into the page
+# table, because the window has no physical RAM behind its identity
+# mapping. The window stays inside the boot stub's 4 GiB identity map
+# so elf_install_user_mapping's PDPT walker always finds a live entry.
+VMA_LARGE_BASE:   uint64 = 0x40000000           # 1 GiB
+VMA_LARGE_LIMIT:  uint64 = 0xFFC00000           # just under 4 GiB
+
+# Bump pointer for the next free multi-chunk virtual window. 4-MiB-
+# aligned so every 4-MiB chunk install stays within one 1 GiB PDPT
+# entry (elf_install_user_mapping refuses a range crossing 1 GiB).
+vma_large_next:   uint64 = 0x40000000
+
 
 # ---------------------------------------------------------------------
-# VmaNode
+# VmaChunk / VmaNode
 # ---------------------------------------------------------------------
+
+class VmaChunk:
+    phys:  uint64
+    order: int32
+    pad:   int32
+
 
 class VmaNode:
     start:       uint64
@@ -94,10 +147,13 @@ class VmaNode:
     file_offset: uint64
     backing:     uint64
     next:        uint64
+    chunks:      uint64
     prot:        int32
     flags:       int32
     file_fd:     int32
     order:       int32
+    nchunks:     int32
+    pad0:        int32
 
 
 # ---------------------------------------------------------------------
@@ -105,10 +161,10 @@ class VmaNode:
 # ---------------------------------------------------------------------
 
 def _vma_node_new() -> uint64:
-    p: uint64 = kmalloc(56)
+    p: uint64 = kmalloc(72)
     if p == 0:
         return 0
-    memset(cast[Ptr[uint8]](p), 0, 56)
+    memset(cast[Ptr[uint8]](p), 0, 72)
     return p
 
 
@@ -125,6 +181,9 @@ def _vma_node_set(node: uint64, start: uint64, end: uint64,
     cast[Ptr[VmaNode]](node)[0].backing     = backing
     cast[Ptr[VmaNode]](node)[0].order       = order
     cast[Ptr[VmaNode]](node)[0].next        = 0
+    cast[Ptr[VmaNode]](node)[0].chunks      = 0
+    cast[Ptr[VmaNode]](node)[0].nchunks     = 0
+    cast[Ptr[VmaNode]](node)[0].pad0        = 0
 
 
 def _vma_node_get_next(node: uint64) -> uint64:
@@ -148,6 +207,25 @@ def _vma_node_free(node: uint64):
     # backing == 0 marks "no kernel-owned pages here" (an alias node
     # for a MAP_FIXED slice inside an enclosing region; only the
     # enclosing node owns the pages).
+    #
+    # A multi-chunk VMA (nchunks > 0) instead owns an array of VmaChunk
+    # descriptors; free every chunk at its own order, then release the
+    # descriptor array. backing/order are unused for such nodes.
+    nchunks: int32 = cast[Ptr[VmaNode]](node)[0].nchunks
+    if nchunks > 0:
+        carr: uint64 = cast[Ptr[VmaNode]](node)[0].chunks
+        if carr != 0:
+            i: int32 = 0
+            while i < nchunks:
+                ce: uint64 = carr + cast[uint64](i) * VMA_CHUNK_SIZE
+                cphys: uint64 = cast[Ptr[VmaChunk]](ce)[0].phys
+                corder: int32 = cast[Ptr[VmaChunk]](ce)[0].order
+                if cphys != 0:
+                    free_pages(cphys, corder)
+                i = i + 1
+            kfree(carr)
+        kfree(node)
+        return
     backing: uint64 = cast[Ptr[VmaNode]](node)[0].backing
     if backing != 0:
         order: int32 = cast[Ptr[VmaNode]](node)[0].order
@@ -157,12 +235,26 @@ def _vma_node_free(node: uint64):
 
 def _order_for_bytes(n: uint64) -> int32:
     # Smallest alloc_pages(order) that satisfies an n-byte request.
-    # MAX_ORDER=10 -> 4 MiB per single alloc_pages call.
+    # MAX_ORDER=10 -> 4 MiB per single alloc_pages call. Returns -1
+    # when n exceeds one MAX_ORDER chunk; callers above 4 MiB take the
+    # multi-chunk path instead of treating that as an error.
     order: int32 = 0
     block: uint64 = VMA_PAGE_SIZE
     while block < n:
-        if order >= 10:
+        if order >= VMA_MAX_ORDER:
             return -1
+        order = order + 1
+        block = block << 1
+    return order
+
+
+def _order_for_chunk(n: uint64) -> int32:
+    # Order covering an n-byte chunk that is KNOWN to be <= 4 MiB.
+    # Identical to _order_for_bytes but never returns -1 (the caller
+    # guarantees n <= VMA_MAX_CHUNK).
+    order: int32 = 0
+    block: uint64 = VMA_PAGE_SIZE
+    while block < n:
         order = order + 1
         block = block << 1
     return order
@@ -269,6 +361,158 @@ def _vma_carve_range(slot: uint64, start: uint64, end: uint64):
 
 
 # ---------------------------------------------------------------------
+# _vma_alloc_large — multi-chunk backing path
+# ---------------------------------------------------------------------
+#
+# A VMA whose page-rounded length exceeds VMA_MAX_CHUNK (4 MiB, the
+# buddy allocator's largest single run) cannot be backed by one
+# alloc_pages call. glibc's pthread library defaults to an 8 MiB
+# thread stack, so this is a real, common request.
+#
+# _vma_alloc_large() backs such a VMA with MULTIPLE buddy chunks (each
+# up to 4 MiB) and stitches them into ONE contiguous virtual range:
+#
+#   1. A 4-MiB-aligned virtual window of `length` bytes is carved from
+#      the dedicated multi-chunk region [1 GiB, 4 GiB) by the
+#      vma_large_next bump pointer. Nothing else is ever placed there
+#      (buddy physical RAM is well under 1 GiB; small VMAs sit at their
+#      low identity addresses; ELF image / brk / stack load low), so
+#      two large VMAs can never overlap and no buddy allocation can
+#      re-hand the physical pages under the window.
+#   2. Each 4-MiB-or-smaller chunk gets its own buddy allocation
+#      (scattered low physical pages) and is zeroed via its identity
+#      address.
+#   3. EVERY chunk — including chunk 0 — is overlaid into the calling
+#      task's PML4 by elf_install_user_mapping() so the whole window
+#      [base, base+length) points at the right physical chunk. (Unlike
+#      a single-chunk VMA, the window has no physical RAM behind its
+#      identity mapping, so chunk 0 cannot rely on identity.)
+#   4. The chunk array (phys, order per chunk) is recorded on the
+#      VmaNode so _vma_node_free releases every chunk and vma_fork_copy
+#      copies every chunk.
+#
+# Because we overlay the live task's PML4, the caller's CR3 is reloaded
+# afterwards to flush any stale TLB entries for the remapped range.
+#
+# Returns the resolved base on success, or a negative Linux errno.
+
+def _vma_alloc_large(slot: uint64, length: uint64, prot: int32,
+                     flags: int32, file_fd: int32,
+                     file_offset: uint64) -> int64:
+    # Number of chunks: ceil(length / 4 MiB).
+    nchunks: int32 = cast[int32]((length + VMA_MAX_CHUNK - 1)
+                                 / VMA_MAX_CHUNK)
+    if nchunks <= 0:
+        return cast[int64](-22)
+
+    # Carve a 4-MiB-aligned virtual window. Rounding the reservation
+    # up to a 4 MiB multiple keeps vma_large_next 4-MiB-aligned so
+    # every per-chunk install stays inside one 1 GiB PDPT entry.
+    window: uint64 = (length + VMA_MAX_CHUNK - 1) \
+                     & ~(VMA_MAX_CHUNK - 1)
+    base: uint64 = vma_large_next
+    if base + window > VMA_LARGE_LIMIT:
+        printk1("vma: large window exhausted (need 0x%x)\n", window)
+        return cast[int64](-12)
+
+    node: uint64 = _vma_node_new()
+    if node == 0:
+        return cast[int64](-12)
+
+    carr: uint64 = kmalloc(cast[uint64](nchunks) * VMA_CHUNK_SIZE)
+    if carr == 0:
+        kfree(node)
+        return cast[int64](-12)
+    memset(cast[Ptr[uint8]](carr), 0,
+           cast[uint64](nchunks) * VMA_CHUNK_SIZE)
+
+    pml4: uint64 = task_pml4(cast[int32](slot))
+
+    # Allocate + zero every chunk.
+    i: int32 = 0
+    ok: int32 = 1
+    while i < nchunks and ok != 0:
+        off: uint64 = cast[uint64](i) * VMA_MAX_CHUNK
+        remain: uint64 = length - off
+        csize: uint64 = VMA_MAX_CHUNK
+        if remain < csize:
+            csize = remain
+        corder: int32 = _order_for_chunk(csize)
+        cphys: uint64 = alloc_pages(corder)
+        if cphys == 0:
+            printk1("vma: large alloc OOM at chunk order=%d\n",
+                    cast[uint64](corder))
+            ok = 0
+        else:
+            memset(cast[Ptr[uint8]](cphys), 0, csize)
+            ce: uint64 = carr + cast[uint64](i) * VMA_CHUNK_SIZE
+            cast[Ptr[VmaChunk]](ce)[0].phys  = cphys
+            cast[Ptr[VmaChunk]](ce)[0].order = corder
+            cast[Ptr[VmaChunk]](ce)[0].pad   = 0
+            i = i + 1
+
+    if ok == 0:
+        # Roll back: free whatever chunks we already grabbed.
+        j: int32 = 0
+        while j < i:
+            ce: uint64 = carr + cast[uint64](j) * VMA_CHUNK_SIZE
+            free_pages(cast[Ptr[VmaChunk]](ce)[0].phys,
+                       cast[Ptr[VmaChunk]](ce)[0].order)
+            j = j + 1
+        kfree(carr)
+        kfree(node)
+        return cast[int64](-12)
+
+    # Overlay EVERY chunk into the calling task's PML4 so the whole
+    # window [base, base+length) presents one contiguous virtual range.
+    m: int32 = 0
+    while m < nchunks:
+        ce: uint64 = carr + cast[uint64](m) * VMA_CHUNK_SIZE
+        cphys: uint64 = cast[Ptr[VmaChunk]](ce)[0].phys
+        off: uint64 = cast[uint64](m) * VMA_MAX_CHUNK
+        remain: uint64 = length - off
+        csize: uint64 = VMA_MAX_CHUNK
+        if remain < csize:
+            csize = remain
+        vlo: uint64 = base + off
+        rc: int32 = elf_install_user_mapping(pml4, vlo, vlo + csize,
+                                             cphys)
+        if rc < 0:
+            printk1("vma: large remap failed at chunk %d\n",
+                    cast[uint64](m))
+            # Roll back every chunk allocation; the partial page-table
+            # overlay is harmless (it points at our own freed pages and
+            # is torn down with the task's PML4) but the box stays
+            # diagnosable rather than aliasing live memory.
+            j2: int32 = 0
+            while j2 < nchunks:
+                ce2: uint64 = carr + cast[uint64](j2) * VMA_CHUNK_SIZE
+                free_pages(cast[Ptr[VmaChunk]](ce2)[0].phys,
+                           cast[Ptr[VmaChunk]](ce2)[0].order)
+                j2 = j2 + 1
+            kfree(carr)
+            kfree(node)
+            return cast[int64](-12)
+        m = m + 1
+
+    # The overlay touched the live task's PML4; flush stale TLB
+    # entries for the remapped range by reloading CR3 with its own
+    # value (drops every non-global entry).
+    load_cr3(pml4)
+
+    # Commit the window: bump the allocator past it.
+    vma_large_next = base + window
+
+    end_v: uint64 = base + length
+    _vma_node_set(node, base, end_v, prot, flags, file_fd,
+                  file_offset, 0, 0)
+    cast[Ptr[VmaNode]](node)[0].chunks  = carr
+    cast[Ptr[VmaNode]](node)[0].nchunks = nchunks
+    _vma_insert_sorted(slot, node)
+    return cast[int64](base)
+
+
+# ---------------------------------------------------------------------
 # vma_alloc
 # ---------------------------------------------------------------------
 
@@ -284,15 +528,15 @@ def vma_alloc(slot: uint64, addr_in: uint64, len_in: uint64,
 
     length: uint64 = (len_in + VMA_PAGE_SIZE - 1) & ~(VMA_PAGE_SIZE - 1)
 
-    order: int32 = _order_for_bytes(length)
-    if order < 0:
-        printk1("vma: alloc len=%d exceeds MAX_ORDER\n", length)
-        return cast[int64](-12)
-
     is_fixed: int32 = 0
     if (flags & VMA_MAP_FIXED) != 0:
         is_fixed = 1
 
+    # MAP_FIXED handling runs FIRST so a large MAP_FIXED that lands
+    # inside an existing reservation is recorded as a metadata-only
+    # alias (regardless of length); a non-enclosed MAP_FIXED carves
+    # the overlap and then falls through to the size-based routing
+    # below with addr_in treated as a hint.
     if is_fixed != 0 and addr_in != 0:
         end_req: uint64 = addr_in + length
         encl: uint64 = _vma_find_enclosing(slot, addr_in, end_req)
@@ -306,11 +550,25 @@ def vma_alloc(slot: uint64, addr_in: uint64, len_in: uint64,
             _vma_insert_sorted(slot, alias)
             return cast[int64](addr_in)
         # MAP_FIXED but no enclosing region: carve any overlap then
-        # fall through and let alloc_pages pick a base (the user's
-        # requested addr is effectively a hint).
+        # fall through (the user's requested addr is just a hint).
         _vma_carve_range(slot, addr_in, end_req)
         printk1("vma: MAP_FIXED at 0x%x not enclosed; addr as hint\n",
                 addr_in)
+
+    # Large request: more than one buddy MAX_ORDER chunk. Back it with
+    # multiple chunks stitched into a contiguous virtual range. glibc's
+    # 8 MiB default pthread stack lands here.
+    if length > VMA_MAX_CHUNK:
+        return _vma_alloc_large(slot, length, prot, flags,
+                                file_fd, file_offset)
+
+    order: int32 = _order_for_bytes(length)
+    if order < 0:
+        # Defensive: _order_for_bytes only returns -1 above 4 MiB, and
+        # that case was already routed to _vma_alloc_large. Treat any
+        # residual -1 as a multi-chunk request rather than failing.
+        return _vma_alloc_large(slot, length, prot, flags,
+                                file_fd, file_offset)
 
     base: uint64 = alloc_pages(order)
     if base == 0:
@@ -397,9 +655,98 @@ def vma_clear(slot: uint64):
 #      into mmap'd memory stay valid for the child),
 #   4. links a child VmaNode mirroring the parent's metadata.
 #
-# Alias VMAs (backing == 0 — a MAP_FIXED slice inside an enclosing
-# region) are copied as metadata only; the enclosing node already
-# carried the bytes. Returns 0 on success, -1 on OOM.
+# Alias VMAs (backing == 0, nchunks == 0 — a MAP_FIXED slice inside an
+# enclosing region) are copied as metadata only; the enclosing node
+# already carried the bytes.
+#
+# A MULTI-CHUNK VMA (nchunks > 0) is fork-copied chunk-by-chunk: the
+# child gets its own VmaChunk array, a fresh buddy allocation per
+# chunk, the parent's bytes copied into each, and a per-chunk overlay
+# installed into the child PML4 so the child's [p_start, p_end) is the
+# same contiguous virtual range — see _vma_fork_copy_chunks.
+#
+# Returns 0 on success, -1 on OOM.
+
+
+def _vma_fork_copy_chunks(parent_node: uint64, child_node: uint64,
+                          child_pml4: uint64) -> int32:
+    # Give `child_node` a private, fully-mapped copy of every chunk a
+    # multi-chunk `parent_node` owns. The parent's [p_start, p_end) is
+    # contiguously mapped in the parent's (currently live) PML4, so a
+    # memcpy from p_start + off reads the parent's chunk bytes.
+    # Returns 0 on success, -1 on OOM (caller frees child_node).
+    p_start:  uint64 = cast[Ptr[VmaNode]](parent_node)[0].start
+    p_end:    uint64 = cast[Ptr[VmaNode]](parent_node)[0].end
+    nchunks:  int32  = cast[Ptr[VmaNode]](parent_node)[0].nchunks
+    p_carr:   uint64 = cast[Ptr[VmaNode]](parent_node)[0].chunks
+    if nchunks <= 0 or p_carr == 0:
+        return -1
+    length: uint64 = p_end - p_start
+
+    c_carr: uint64 = kmalloc(cast[uint64](nchunks) * VMA_CHUNK_SIZE)
+    if c_carr == 0:
+        return -1
+    memset(cast[Ptr[uint8]](c_carr), 0,
+           cast[uint64](nchunks) * VMA_CHUNK_SIZE)
+
+    i: int32 = 0
+    while i < nchunks:
+        p_ce: uint64 = p_carr + cast[uint64](i) * VMA_CHUNK_SIZE
+        c_order: int32  = cast[Ptr[VmaChunk]](p_ce)[0].order
+        c_phys:  uint64 = alloc_pages(c_order)
+        if c_phys == 0:
+            printk1("vma_fork: OOM copying chunk order=%d\n",
+                    cast[uint64](c_order))
+            # Roll back the chunks we already grabbed.
+            j: int32 = 0
+            while j < i:
+                jce: uint64 = c_carr + cast[uint64](j) * VMA_CHUNK_SIZE
+                free_pages(cast[Ptr[VmaChunk]](jce)[0].phys,
+                           cast[Ptr[VmaChunk]](jce)[0].order)
+                j = j + 1
+            kfree(c_carr)
+            return -1
+        off: uint64 = cast[uint64](i) * VMA_MAX_CHUNK
+        # Logical chunk size — what the parent actually mapped for this
+        # chunk (min(4 MiB, bytes left), matching _vma_alloc_large). The
+        # physical buddy run (2^c_order pages) may be larger; copying
+        # only the logical span avoids reading past the VMA.
+        remain: uint64 = length - off
+        csize: uint64 = VMA_MAX_CHUNK
+        if remain < csize:
+            csize = remain
+        # Copy the parent's contiguous virtual sub-range into the
+        # child's fresh physical chunk.
+        memcpy(cast[Ptr[uint8]](c_phys),
+               cast[Ptr[uint8]](p_start + off), csize)
+        # Overlay [p_start + off, ...) -> c_phys in the child PML4 so
+        # the child sees the same contiguous virtual range.
+        if elf_install_user_mapping(child_pml4, p_start + off,
+                                    p_start + off + csize,
+                                    c_phys) < 0:
+            printk1("vma_fork: chunk remap failed at %d\n",
+                    cast[uint64](i))
+            free_pages(c_phys, c_order)
+            j2: int32 = 0
+            while j2 < i:
+                jce: uint64 = c_carr + cast[uint64](j2) * VMA_CHUNK_SIZE
+                free_pages(cast[Ptr[VmaChunk]](jce)[0].phys,
+                           cast[Ptr[VmaChunk]](jce)[0].order)
+                j2 = j2 + 1
+            kfree(c_carr)
+            return -1
+        c_ce: uint64 = c_carr + cast[uint64](i) * VMA_CHUNK_SIZE
+        cast[Ptr[VmaChunk]](c_ce)[0].phys  = c_phys
+        cast[Ptr[VmaChunk]](c_ce)[0].order = c_order
+        cast[Ptr[VmaChunk]](c_ce)[0].pad   = 0
+        i = i + 1
+
+    cast[Ptr[VmaNode]](child_node)[0].chunks  = c_carr
+    cast[Ptr[VmaNode]](child_node)[0].nchunks = nchunks
+    cast[Ptr[VmaNode]](child_node)[0].backing = 0
+    cast[Ptr[VmaNode]](child_node)[0].order   = 0
+    return 0
+
 
 def vma_fork_copy(child_slot: uint64, parent_slot: uint64,
                   child_pml4: uint64) -> int32:
@@ -413,29 +760,42 @@ def vma_fork_copy(child_slot: uint64, parent_slot: uint64,
         p_off:    uint64 = cast[Ptr[VmaNode]](cur)[0].file_offset
         p_back:   uint64 = cast[Ptr[VmaNode]](cur)[0].backing
         p_order:  int32  = cast[Ptr[VmaNode]](cur)[0].order
-        child_back: uint64 = 0
-        if p_back != 0:
-            # Private copy of the backing pages.
-            child_back = alloc_pages(p_order)
-            if child_back == 0:
-                printk1("vma_fork: OOM copying VMA backing order=%d\n",
-                        cast[uint64](p_order))
-                return -1
-            span: uint64 = p_end - p_start
-            memcpy(cast[Ptr[uint8]](child_back),
-                   cast[Ptr[uint8]](p_start), span)
-            # Remap [p_start, p_end) -> child_back in the child PML4.
-            if vm_fork_copy_install(child_pml4, p_start, p_end,
-                                    child_back) < 0:
-                printk1("vma_fork: remap failed for VMA @ 0x%x\n",
-                        p_start)
-                return -1
+        p_nchunks: int32 = cast[Ptr[VmaNode]](cur)[0].nchunks
         node: uint64 = _vma_node_new()
         if node == 0:
             return -1
-        _vma_node_set(node, p_start, p_end, p_prot, p_flags,
-                      p_fd, p_off, child_back, p_order)
-        _vma_insert_sorted(child_slot, node)
+        if p_nchunks > 0:
+            # Multi-chunk VMA: copy EVERY chunk into the child.
+            _vma_node_set(node, p_start, p_end, p_prot, p_flags,
+                          p_fd, p_off, 0, 0)
+            if _vma_fork_copy_chunks(cur, node, child_pml4) < 0:
+                kfree(node)
+                return -1
+            _vma_insert_sorted(child_slot, node)
+        else:
+            child_back: uint64 = 0
+            if p_back != 0:
+                # Private copy of the single backing run.
+                child_back = alloc_pages(p_order)
+                if child_back == 0:
+                    printk1("vma_fork: OOM copying VMA backing order=%d\n",
+                            cast[uint64](p_order))
+                    kfree(node)
+                    return -1
+                span: uint64 = p_end - p_start
+                memcpy(cast[Ptr[uint8]](child_back),
+                       cast[Ptr[uint8]](p_start), span)
+                # Remap [p_start, p_end) -> child_back in the child PML4.
+                if vm_fork_copy_install(child_pml4, p_start, p_end,
+                                        child_back) < 0:
+                    printk1("vma_fork: remap failed for VMA @ 0x%x\n",
+                            p_start)
+                    free_pages(child_back, p_order)
+                    kfree(node)
+                    return -1
+            _vma_node_set(node, p_start, p_end, p_prot, p_flags,
+                          p_fd, p_off, child_back, p_order)
+            _vma_insert_sorted(child_slot, node)
         cur = cast[Ptr[VmaNode]](cur)[0].next
     return 0
 
