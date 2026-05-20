@@ -9,6 +9,12 @@
  * read-only: they do NOT change any register state, they only export
  * what the CPU already holds.
  *
+ * M16.155-cpuid extends this with cpuid_get(leaf, subleaf, out): a
+ * single-shot CPUID dispatcher used by start_first_task's diag block
+ * to surface vendor / family / model / brand / extended-feature flags
+ * (esp. CPUID.80000001h:EDX.Page1GB / bit 26) so the 1 GiB-huge-pages
+ * hypothesis is decidable in one serial capture.
+ *
  * Convention mirrors arch/x86/kernel/smp_asm.S::get_bsp_cr3 and
  * tss_asm.S::tss_get_rsp0 — single instruction, return via %rax,
  * SysV ABI (no clobbers beyond %rax + %rdx for the sgdt buffer
@@ -118,4 +124,42 @@ read_gdtr_limit:
     sgdt    (%rdx)
     xorq    %rax, %rax
     movw    (%rdx), %ax                /* limit at offset +0 (low 16 bits) */
+    ret
+
+/* ---------- cpuid_get(leaf, subleaf, out) ----------------------- *
+ *
+ * M16.155-cpuid: Asus ring-3-transition triple-fault hypothesis #N+1.
+ * Both UD2 and HLT probes confirm user-RIP[0] is overwritten but
+ * NEITHER fires its expected exception — the CPU triple-faults silently
+ * before executing the first user instruction. The leading hypothesis
+ * is that this Core-2-era pre-Penryn silicon does NOT support 1 GiB
+ * huge pages (CPUID.80000001h:EDX bit 26 = Page1GB), and our PDPT
+ * entries with PS=1 cause a reserved-bit-violation #PF that cascades
+ * to triple-fault. Surface CPUID directly in the ring3-diag block so
+ * the next real-hw test can hand-decode bit 26 in one look.
+ *
+ * SysV ABI:
+ *   %edi = leaf     (uint32)
+ *   %esi = subleaf  (uint32)
+ *   %rdx = out_ptr  (Ptr[uint32], 4 dwords: eax, ebx, ecx, edx)
+ *
+ * %rbx is callee-saved in SysV; CPUID clobbers it, so we save +
+ * restore around the instruction. %rdi/%rsi/%rcx/%rdx are all
+ * caller-saved — free to use as scratch.
+ *
+ * Pure read, no side effects, callable from any CPL=0 context.
+ */
+    .align 16
+    .globl cpuid_get
+cpuid_get:
+    pushq   %rbx                       /* %rbx is callee-saved */
+    movq    %rdx, %r8                  /* save out_ptr (CPUID clobbers %rdx) */
+    movl    %edi, %eax                 /* leaf -> %eax */
+    movl    %esi, %ecx                 /* subleaf -> %ecx */
+    cpuid
+    movl    %eax,  0(%r8)              /* out[0] = eax */
+    movl    %ebx,  4(%r8)              /* out[1] = ebx */
+    movl    %ecx,  8(%r8)              /* out[2] = ecx */
+    movl    %edx, 12(%r8)              /* out[3] = edx */
+    popq    %rbx
     ret
