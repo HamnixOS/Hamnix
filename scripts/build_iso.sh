@@ -311,24 +311,29 @@ echo "[build_iso] Pre-building wide ESP image with stub + kernel"
 PATCH_TMP=$(mktemp -d)
 trap 'rm -rf "$EFI_STUB_TMP" "$PATCH_TMP"' EXIT
 WIDE_ESP_IMG="$PATCH_TMP/efi_wide.img"
-# 8 MB FAT12 is enough for our 8 KB stub + 3.8 MB kernel + headroom.
+# 24 MB FAT12 holds our 8 KB stub + the ~10 MB higher-half ELF64
+# kernel + headroom for growth. (The kernel grew past the old 8 MB
+# budget when it moved to elf64-x86-64 / higher-half.)
 # WHY FAT12 (and not FAT16/FAT32):
 #   OVMF on Debian rejects El Torito UEFI alt-platform images that
 #   carry a FAT16 or FAT32 filesystem — "Not Found" from BdsDxe even
 #   when the ESP partition is valid and contains BOOTX64.EFI. Switching
 #   the ESP to FAT12 ("mformat" without -F, with explicit -h/-s/-t
-#   geometry) makes OVMF load BOOTX64.EFI cleanly. The FAT12 max is
-#   32 MB total with 16 KB clusters — plenty for any kernel-sized
-#   payload we'd realistically ship on an installer ISO.
+#   geometry) makes OVMF load BOOTX64.EFI cleanly.
 #   Verified empirically: a 4 MB FAT16 ESP fails with "Not Found"; a
 #   4 MB FAT12 ESP with the same contents succeeds and "[hamnix] EFI
 #   entry reached" appears on the serial console.
-WIDE_ESP_SIZE_MB=8
+# WHY -c 32 (16 KB clusters): FAT12 has only 4084 usable clusters, so
+#   at 24 MB the cluster size must be large enough to stay under that
+#   ceiling — 24 MB / 16 KB = 1536 clusters, comfortably FAT12. Without
+#   an explicit -c, mformat would pick small clusters and silently
+#   produce a FAT16 volume that OVMF rejects.
+WIDE_ESP_SIZE_MB=24
 WIDE_ESP_SECTORS=$(( WIDE_ESP_SIZE_MB * 1024 * 1024 / 512 ))
 dd if=/dev/zero of="$WIDE_ESP_IMG" bs=1M count="$WIDE_ESP_SIZE_MB" status=none
 # Geometry: -h 64 -s 32 -t <tracks>. Each track = 32*512 = 16 KB.
-# For 8 MB total: 8*1024*1024 / 16384 = 512 tracks.
-mformat -i "$WIDE_ESP_IMG" -h 64 -s 32 \
+# For 24 MB total: 24*1024*1024 / 16384 = 1536 tracks.
+mformat -i "$WIDE_ESP_IMG" -h 64 -s 32 -c 32 \
         -t $(( WIDE_ESP_SIZE_MB * 64 )) -v HAMNIX ::
 mmd -i "$WIDE_ESP_IMG" "::/EFI"
 mmd -i "$WIDE_ESP_IMG" "::/EFI/BOOT"
