@@ -422,130 +422,118 @@ chr(65)        # Int to character: 'A'
 
 ## Hardware Intrinsics
 
-### Memory Barriers
+The x86_64 backend recognizes a small set of names as **inline
+intrinsics** — calls that lower to bare machine instructions instead
+of a `call`. Anything not on this list is an ordinary function call.
+
+### Port I/O
+
+The x86 `in`/`out` instructions, for talking to legacy ISA-style
+hardware (PIC, PIT, serial UART, CMOS, ...). Each is emitted inline —
+there is no exported symbol behind them.
 
 ```python
-dmb()  # Data Memory Barrier
-dsb()  # Data Synchronization Barrier
-isb()  # Instruction Synchronization Barrier
+outb(value, port)            # 8-bit  write   (out  %al,  %dx)
+v8:  uint8  = inb(port)       # 8-bit  read    (in   %dx,  %al)
+outw(value, port)            # 16-bit write   (out  %ax,  %dx)
+v16: uint16 = inw(port)       # 16-bit read    (in   %dx,  %ax)
+outl(value, port)            # 32-bit write   (out  %eax, %dx)
+v32: uint32 = inl(port)       # 32-bit read    (in   %dx,  %eax)
 ```
 
-### Power Management
+Example (from `arch/x86/kernel/time.ad`, programming the PIT):
 
 ```python
-wfi()  # Wait For Interrupt
-wfe()  # Wait For Event
-sev()  # Send Event
+outb(PIT_CMD_CH0_LOHI_MODE3, PIT_CMD)
+outb(div_lo, PIT_CHANNEL0_DATA)
+outb(div_hi, PIT_CHANNEL0_DATA)
 ```
 
-### Atomic Operations
+### `asm_volatile` — single inline instruction
 
-All atomic operations use LDREX/STREX for lock-free access:
+For everything else — `cli`/`sti`, `hlt`, `pause`, `mfence`,
+control-register pokes — use `asm_volatile`, which emits the string
+literal verbatim into `.text`. It takes exactly one **string-literal**
+argument and has no operand-substitution: it is for zero-operand (or
+fully self-contained) instructions only.
 
 ```python
-# Basic atomics
-val: int32 = atomic_load(ptr)
-success: int32 = atomic_store(ptr, value)
-
-# Atomic read-modify-write (returns old value)
-old: int32 = atomic_add(ptr, 5)
-old: int32 = atomic_sub(ptr, 1)
-old: int32 = atomic_or(ptr, 0xFF)
-old: int32 = atomic_and(ptr, 0x0F)
-old: int32 = atomic_xor(ptr, mask)
-
-# Compare and swap
-old: int32 = atomic_cmpxchg(ptr, expected, desired)
-
-# Clear exclusive monitor
-clrex()
+asm_volatile("cli")          # disable interrupts
+asm_volatile("hlt")          # halt the CPU until the next interrupt
+asm_volatile("pause")        # spin-loop hint
+asm_volatile("mfence")       # full memory fence
 ```
 
-### Critical Sections
+A memory **barrier** on x86_64 is just the matching fence instruction
+via `asm_volatile` (`mfence` / `lfence` / `sfence`); there are no
+`dmb`/`dsb`/`isb` builtins (those were ARM mnemonics). There are no
+`atomic_*` builtins and no `LDREX`/`STREX` — x86 atomicity is achieved
+with `lock`-prefixed instructions emitted through `asm_volatile`, or
+by calling into the kernel's own helpers.
 
-```python
-state: int32 = critical_enter()  # Disable interrupts
-# ... critical code ...
-critical_exit(state)              # Restore interrupts
-```
-
-### Bit Manipulation
-
-```python
-# Single bit operations
-val = bit_set(val, 5)      # Set bit 5
-val = bit_clear(val, 3)    # Clear bit 3
-val = bit_toggle(val, 0)   # Toggle bit 0
-is_set: int32 = bit_test(val, 7)  # Test bit 7
-
-# Bit field operations
-field: int32 = bits_get(val, 8, 4)   # Extract 4 bits starting at bit 8
-val = bits_set(val, field, 16, 8)    # Insert 8-bit field at bit 16
-
-# Hardware bit operations
-zeros: int32 = clz(val)    # Count leading zeros
-reversed: int32 = rbit(val)  # Bit reverse
-swapped: int32 = rev(val)    # Byte reverse (endian swap)
-swapped: int32 = rev16(val)  # Halfword byte swap
-```
+A multi-instruction string passed to `asm_volatile` is emitted line by
+line (each non-blank line is one instruction), but for any non-trivial
+assembly the kernel keeps a hand-written `.S` file and reaches it via
+`extern def` (see *Inline Assembly* below) — that is the preferred
+pattern.
 
 ---
 
 ## Inline Assembly
 
-### Single Line
+There is no `asm("...")` statement form on the x86_64 backend. Two
+mechanisms cover assembly-level code:
+
+### 1. `asm_volatile` for a single instruction
+
+See *Hardware Intrinsics* above — best for one self-contained
+instruction (`cli`, `hlt`, `mfence`, ...).
+
+### 2. A `.S` file reached via `extern def`
+
+Anything that needs multiple instructions, labels, register operands,
+or a defined calling convention lives in a hand-written `.S` file
+assembled alongside the Adder output, and is declared in Adder as an
+`extern def`. This is how the kernel does context switches, trap
+stubs, and EFI-handoff glue.
 
 ```python
-asm("nop")
-asm("cpsid i")  # Disable interrupts
+# kernel/sched/core.ad — the routine is defined in a .S file
+extern def __switch_to_asm(prev: Ptr[uint8], next: Ptr[uint8])
+
+def context_switch(prev: int32, next: int32):
+    __switch_to_asm(cast[Ptr[uint8]](&task_table[prev]),
+                    cast[Ptr[uint8]](&task_table[next]))
 ```
 
-### Multi-line Block
-
-```python
-asm("""
-    push {r4, r5}
-    mov r4, #0
-    mov r5, #100
-loop:
-    add r4, r4, #1
-    cmp r4, r5
-    bne loop
-    pop {r4, r5}
-""")
-```
+The assembler routine (`arch/x86/kernel/*.S`) follows the System V
+AMD64 calling convention — arguments arrive in `%rdi`, `%rsi`, `%rdx`,
+`%rcx`, `%r8`, `%r9` and the result is returned in `%rax`.
 
 ---
 
 ## Decorators
 
-### @interrupt
+The x86_64 backend does not generate any special prologue/epilogue
+from a decorator. Decorators are parsed and carried on the AST, but
+the codegen treats a decorated `def` as an ordinary function.
 
-Generates proper interrupt handler with full register save/restore:
+There is **no `@interrupt` decorator**. Interrupt and exception
+handling is wired up explicitly:
 
-```python
-@interrupt
-def SysTick_Handler() -> None:
-    tick_count = tick_count + 1
-```
+- The CPU-facing trap stubs (the actual IDT entry points, with the
+  hardware-defined register/error-code stack frame) are hand-written
+  assembly in `arch/x86/kernel/idt_asm.S` (`trap_stub_0` ..
+  `trap_stub_31`, `common_trap`).
+- `idt_set_gate(vector, handler)` in `arch/x86/kernel/idt.ad` fills
+  the 256-entry IDT, and `idt_load` installs it.
+- The C-level handler is a *plain* `def` — e.g. `do_trap` in
+  `arch/x86/kernel/traps.ad` — called by the asm stub after it has
+  saved state. It is an ordinary Adder function with no decorator.
 
-Generated code includes:
-- Push all registers (r0-r12, lr)
-- Handler body
-- Pop all registers
-- Return with `bx lr`
-
-### @packed
-
-Indicates struct should have no padding (for hardware registers):
-
-```python
-@packed
-class UARTRegs:
-    data: uint32
-    status: uint32
-    control: uint32
-```
+So an interrupt handler in Adder is just a normal function that the
+assembly stub calls; the save/restore lives in the `.S` stub, not in
+a compiler-generated wrapper.
 
 ---
 
