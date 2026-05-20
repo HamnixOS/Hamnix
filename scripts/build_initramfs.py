@@ -136,6 +136,22 @@ if _DEB_FIXTURE_PATH:
         raise SystemExit(
             f"HAMNIX_DEB_FIXTURE={_DEB_FIXTURE_PATH}: unreadable ({_e})")
 
+# httpd docroot staging: scripts/test_httpd.sh sets HAMNIX_HTTPD_DOCROOT=1
+# to plant a tiny static-file tree at /var/www inside the cpio initramfs
+# so the userland /bin/httpd daemon has something to serve under QEMU.
+# The httpd test boots with httpd as /init, binds guest port 8080, and a
+# host curl drives real HTTP GETs through the in-kernel TCP stack. The
+# files land at fixed cpio paths (subdirs are flattened into the path
+# string — fs/cpio.ad resolves "/var/www/index.html" by exact match).
+# Off-default: an unset env var leaves the initramfs alone, exactly like
+# every other gated marker above.
+if os.environ.get("HAMNIX_HTTPD_DOCROOT") == "1":
+    FILES.append(("/var/www/index.html",
+                  b"<html><body><h1>Hamnix httpd</h1>"
+                  b"<p>static-file HTTP/1.0 server</p></body></html>\n"))
+    FILES.append(("/var/www/hello.txt",
+                  b"hello from hamnix httpd\n"))
+
 # V5 cert validation: bake the production ISRG Root X1 anchor into the
 # initramfs at /etc/tls-ca-isrg-x1.der whenever the host has it
 # installed. drivers/net/tls.ad's _tls_validation_init() walks the cpio
