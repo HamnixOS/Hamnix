@@ -49,6 +49,38 @@ When picking a TODO item, check which layer it belongs to and which
 phase it's blocking, then look at the relevant doc for the contract
 it has to honour.
 
+---
+
+> ## ⚠ Namespace law — read before touching any shim / distro / package work
+>
+> Hamnix is a **Plan 9-shaped system. There is NO global filesystem
+> route.** A process sees a path only because something was *bound or
+> mounted into its own namespace*.
+>
+> This means **no work may write to a global `/var`, `/usr`, `/etc`,
+> `/var/lib/dpkg`, `/var/cache/apt`, `/var/www`, etc.** Those are not
+> global locations — they are per-namespace bindings.
+>
+> All Linux-binary shim state and all distro / package-manager state
+> (dpkg database, apt index + cache, httpd docroot, a distro's FHS
+> tree) lives inside a **distro-shaped namespace** whose filesystem is
+> exported by the userland **`distrofs` 9P file-server daemon** (a
+> daemon in the spirit of `rio` / `hamwd`). A shim is launched by:
+> `rfork(RFNAMEG)` → mount/bind the `distrofs` server into the new
+> private namespace → exec the binary. `dpkg` still *sees*
+> `/var/lib/dpkg` — but it resolves through that process's namespace
+> to the `distrofs` server, never to a global tree.
+>
+> A TODO item is **mis-shaped** if it says "write X to `/var/...`"
+> without saying "...in the shim's distrofs namespace". If you catch
+> one, fix the wording. See `memory/feedback_distro_namespace.md`,
+> `docs/distro-namespaces.md`, and the Phase C.5 section below.
+>
+> Historical debt being corrected: the native `apt`/`dpkg`/`httpd`
+> tools and commit `86a13bd` (global `/var` tmpfs) were built against
+> global paths before this law was written down. They are tracked for
+> migration into the `distrofs` namespace under Phase C.5.
+
 ## Language
 
 (No open language-extension items. Extensions land per the working
@@ -151,9 +183,26 @@ the parent still reads `hamnix/0.1`. Open follow-ups:
       up Debian's `/lib64/...` via a namespace bind needs the loader to
       route the interpreter lookup through the chan layer.
 - `apt update` inside a namespace — needs libdl/dlopen (above) and
-  `/var/lib/dpkg/` write-through (the debootstrap tree is read-only in
-  the cpio archive today — needs a tmpfs overlay during bring-up).
+  `/var/lib/dpkg/` write-through served by `distrofs` (NOT a global
+  tmpfs — see the Namespace law above).
 - `/bin/python3` from Debian — lands after the libdl follow-up.
+
+**Distrofs namespace migration (correcting the global-path debt):**
+- `distrofs` 9P daemon — a userland 9P file server exporting a
+  distro-shaped tree (`/var`, `/usr`, `/etc`, ...). Plan 9-pure, a
+  daemon like `rio`/`hamwd`. (V0 in flight: `user/distrofs.ad`.)
+- Migrate the native `apt`/`dpkg`/`httpd` tools off global paths:
+  each must be launched in a private namespace (`rfork(RFNAMEG)` +
+  mount `distrofs`) so `/var/lib/dpkg`, `/var/cache/apt`, `/var/www`
+  resolve through the namespace to the `distrofs` server. Today they
+  write a global `/tmp/...` or global `/var/...` — wrong shape.
+- Supersede commit `86a13bd` (global `/var` tmpfs subtree) — once
+  `distrofs` + the namespace launch path land, the global `/var`
+  is removed; nothing should depend on a global `/var`.
+- Shim launcher — a small `rfork(RFNAMEG)` + `mount(distrofs)` +
+  `exec` front-end that every Linux-binary / package tool runs
+  behind. Probably needs 9P V4.1 (kernel-side `_p9_send`/`_p9_recv`
+  real-fd dispatch — see `memory/project_plan9_pivot.md`).
 - Phase D follow-up: once `chan_attach` speaks 9P, replace the four
   per-subdir binds in `distrorun.ad` with a single
   `mount(srvfd, -1, "/", MREPL, "")` call.
