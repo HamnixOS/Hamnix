@@ -121,34 +121,6 @@ if os.environ.get("ENABLE_HTTP_REDIRECT_SMOKE") == "1":
     # it so the kernel reaches the redirect smoke below.
     FILES.append(("/etc/skip-https-internet-smoke", b"1\n"))
 
-# M16.155-cr0-probe: ring-3 transition diagnostic. When set, plants
-# /etc/ring3-probe-ud2 in the cpio archive — init/main.ad's
-# post-elf_load_blob probe checks for this marker and, if present,
-# overwrites the first 4 bytes of /init's entry-point with
-# `0F 0B 90 90` (ud2; nop; nop). The next ring-3 ifetch is then a
-# guaranteed #UD which the M16.154-trapdiag vector-6 handler prints.
-# This isolates "ring-3 transition itself fails" (no print at all)
-# from "transition works, original /init bytes were the trigger"
-# (vec=0x06 prints). DEFAULT OFF — QEMU regression tests
-# (test_uefi_boot.sh / test_bios_boot.sh) need the unmodified /init
-# bytes to reach hamsh. Real-hw bisects set the env var explicitly.
-if os.environ.get("ENABLE_RING3_PROBE_UD2") == "1":
-    FILES.append(("/etc/ring3-probe-ud2", b"1\n"))
-
-# M16.155-cr0-probe-verify: independent second probe using a
-# legal-but-privileged opcode (HLT = 0xF4) instead of UD2. HLT in
-# ring 3 raises #GP unconditionally on every x86 — different
-# microcode path from #UD, so if the UD2 probe stays silent on Asus
-# real hw but HLT fires `[trap-diag] vec=0x0d err=0`, we know ring-3
-# IS being entered and the absence of #UD is a UD2-fetch oddity
-# rather than a transition failure. The two markers are exclusive:
-# init/main.ad takes the HLT branch first; if neither marker is in
-# the cpio, /init bytes are left untouched and the default boot
-# proceeds normally. DEFAULT OFF — same regression-test rationale
-# as the UD2 marker above.
-if os.environ.get("ENABLE_RING3_PROBE_HLT") == "1":
-    FILES.append(("/etc/ring3-probe-hlt", b"1\n"))
-
 # apt-path V0: scripts/test_dpkg_deb_x.sh generates a tiny .deb
 # fixture on the host, points HAMNIX_DEB_FIXTURE at it, and this
 # block plants the bytes at /tests/sample.deb inside the cpio

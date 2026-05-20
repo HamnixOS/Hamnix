@@ -242,8 +242,7 @@ get_trap_diag_stub:
  * Adder-side helper: returns the top of the IST1 stack so
  * trap_diag_install() can write it into TSS.IST1 via tss_set_ist1.
  * "Top" = highest address; the CPU subtracts BEFORE pushing on entry.
- * (Same convention as tss64.rsp0 / _eft_diag_stack_top in
- *  sched_asm.S.)                                                       */
+ * (Same convention as tss64.rsp0.)                                     */
     .align 16
     .globl get_trap_diag_ist_stack_top
 get_trap_diag_ist_stack_top:
