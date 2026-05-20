@@ -23,7 +23,7 @@
 # test_apt_get.sh's fake-Debian-repo fixture:
 #
 #   1. Generate a fresh fake "Hamnix Test CA" (RSA-2048, CA:TRUE) and a
-#      leaf cert (RSA-2048) with subjectAltName=DNS:10.0.2.200, signed
+#      leaf cert (RSA-2048) with subjectAltName=DNS:10.0.2.2, signed
 #      by the CA with rsassaPss + SHA-256.
 #   2. Plant the CA's DER bytes into the initramfs as /etc/tls-ca.der
 #      (TLS_CA_DER env -> build_initramfs.py) so the kernel TLS
@@ -33,9 +33,11 @@
 #          dists/stable/main/binary-amd64/Packages.gz   (gzip)
 #   4. Spawn a Python TLS 1.3 server (ssl-wrapped http.server) rooted
 #      at the repo tree on 127.0.0.1:9445, serving the leaf cert + key.
-#   5. Boot QEMU with /init = hamsh and SLIRP guestfwd routing the
-#      guest's 10.0.2.200:443 to the host TLS server, then drive:
-#          /bin/apt update https://10.0.2.200:443 stable
+#   5. Boot QEMU with /init = hamsh; the guest reaches the host server
+#      via SLIRP's native NAT alias 10.0.2.2 (the route test_apt_get.sh
+#      uses — it services apt's back-to-back Release + Packages.gz
+#      fetches, which a one-shot guestfwd cannot). Then drive:
+#          /bin/apt update https://10.0.2.2:9445 stable
 #          /bin/apt show <pkg>
 #          /bin/apt pkgnames
 #   6. Assert the index was fetched over a validated TLS connection,
@@ -67,11 +69,19 @@ PKG_C='hamnix-utils'
 VER_C='0.9'
 MISSING_PKG='no-such-package'
 
-# The guest reaches the TLS server through the SLIRP guestfwd alias
-# 10.0.2.200:443 (the leaf cert's subjectAltName is DNS:10.0.2.200, so
-# the SNI host apt passes to tls_connect must match it). The host
-# server itself binds a fixed loopback port.
+# The guest reaches the TLS server through SLIRP's built-in host alias
+# 10.0.2.2 — the same native-NAT route scripts/test_apt_get.sh uses
+# for plain HTTP. `apt update` opens TWO connections back-to-back (one
+# for Release, one for Packages.gz); SLIRP's native NAT services any
+# number of guest connections, whereas a `guestfwd=...-tcp:` rule only
+# reliably relays the first (the second connection never reached the
+# host server, so the original guestfwd-based test could never pass).
+# 10.0.2.2 forwards a guest connection to 10.0.2.2:PORT straight to
+# the host's 127.0.0.1:PORT, so the leaf cert's CN / subjectAltName is
+# the dotted-quad 10.0.2.2 — the SNI host apt hands tls_connect must
+# match it for the in-kernel leaf-cert name check.
 SRVPORT=9445
+TLS_HOST=10.0.2.2
 
 echo "[test_apt_https] (1/6) Generate Hamnix Test CA + leaf cert"
 TMPDIR=$(mktemp -d -t hamnix-apt-https-XXXXXX)
@@ -107,18 +117,20 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 30 \
     >/dev/null 2>&1
 openssl x509 -in "$CA_CRT" -outform DER -out "$CA_DER" 2>/dev/null
 
-# Leaf: RSA-2048, signed by the test CA with rsassaPss-SHA256.
+# Leaf: RSA-2048, signed by the test CA with rsassaPss-SHA256. CN /
+# subjectAltName is the SLIRP host alias 10.0.2.2 — the host apt's
+# tls_connect SNI / cert-name check runs against.
 openssl genrsa -out "$LEAF_KEY" 2048 >/dev/null 2>&1
-cat > "$LEAF_CFG" << 'CFGEOF'
+cat > "$LEAF_CFG" << CFGEOF
 [req]
 distinguished_name = req_dn
 prompt             = no
 req_extensions     = v3_req
 [req_dn]
-CN = 10.0.2.200
+CN = ${TLS_HOST}
 [v3_req]
 basicConstraints = CA:FALSE
-subjectAltName   = DNS:10.0.2.200
+subjectAltName   = DNS:${TLS_HOST}
 CFGEOF
 openssl req -new -key "$LEAF_KEY" -out "$LEAF_CSR" -config "$LEAF_CFG" \
     >/dev/null 2>&1
@@ -283,11 +295,11 @@ if ! grep -F -q "listening on 127.0.0.1:${SRVPORT}" "$SRVLOG"; then
 fi
 echo "[test_apt_https] Python TLS repo server up on 127.0.0.1:${SRVPORT}"
 
-echo "[test_apt_https] (6/6) Boot QEMU with virtio-net + SLIRP guestfwd"
+echo "[test_apt_https] (6/6) Boot QEMU with virtio-net + SLIRP native NAT"
 set +e
 (
     sleep 60
-    printf '/bin/apt update https://10.0.2.200:443 stable\n'
+    printf '/bin/apt update https://%s:%s stable\n' "$TLS_HOST" "$SRVPORT"
     sleep 25
     printf 'echo APT_SHOW_START\n'
     printf '/bin/apt show %s\n' "$PKG_B"
@@ -305,7 +317,7 @@ set +e
     sleep 2
 ) | timeout 260s qemu-system-x86_64 \
     -kernel "$ELF" \
-    -netdev "user,id=n0,guestfwd=tcp:10.0.2.200:443-tcp:127.0.0.1:${SRVPORT},guestfwd=tcp:10.0.2.100:7-cmd:cat" \
+    -netdev "user,id=n0,guestfwd=tcp:10.0.2.100:7-cmd:cat" \
     -device virtio-net-pci,netdev=n0,mac=52:54:00:12:34:56 \
     -smp 2 \
     -nographic \
@@ -337,7 +349,7 @@ check() {
 # (a) the TLS 1.3 handshake completed AND the kernel validated the
 #     server cert chain — a regression that skips cert validation must
 #     fail the test.
-check "apt: TLS handshake ok for 10.0.2.200"
+check "apt: TLS handshake ok for ${TLS_HOST}"
 check "[tls] cert chain validated"
 
 # (b) `apt update` fetched + decompressed + parsed the index over TLS.

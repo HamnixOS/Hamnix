@@ -539,6 +539,87 @@ def _resolve_host(out0: Ptr[uint8], out1: Ptr[uint8],
     return 0
 
 
+# -- HTTP response-length probe ----------------------------------------
+#
+# Given the `total` bytes drained into http_buf so far, work out how
+# many bytes the whole HTTP response will be, when that is already
+# knowable. The response is complete once we have the CRLFCRLF header
+# terminator plus a `Content-Length:` worth of body bytes.
+#
+# Returns the expected total response length (header bytes + body
+# bytes) once BOTH the header terminator AND a Content-Length header
+# have been seen; returns 0 while either is still missing — i.e. "keep
+# reading". A 0 result is also the answer for a response with no
+# Content-Length at all, in which case _http_get falls back to draining
+# until the peer FINs (read() == 0).
+#
+# Why this matters for HTTPS: a plain-HTTP server FINs promptly after
+# the body, so a read-until-EOF loop sees a clean 0. The kernel TLS
+# stack's peer (and real TLS mirrors) can be slow to send the
+# close_notify / FIN, so a post-body read() blocks for the kernel
+# socket-read budget on every fetch — and a syscall runs with the
+# timer IRQ masked, so `jiffies` doesn't advance and that bounded poll
+# never times out: the read wedges forever. Stopping as soon as
+# Content-Length bytes have arrived avoids that trailing read entirely.
+#
+# Header-name matching is case-insensitive (RFC 7230 §3.2); the value
+# is parsed as a run of ASCII digits after optional spaces.
+
+def _http_expected_len(total: uint64) -> uint64:
+    # 1. Locate the end of the header block (first CRLFCRLF).
+    hdr_end: uint64 = 0
+    found: int32 = 0
+    p: uint64 = 0
+    while p + 3 < total:
+        if http_buf[p] == 13 and http_buf[p + 1] == 10 \
+                and http_buf[p + 2] == 13 and http_buf[p + 3] == 10:
+            hdr_end = p + 4
+            found = 1
+            break
+        p = p + 1
+    if found == 0:
+        return 0                               # headers still arriving
+
+    # 2. Walk the header lines looking for "Content-Length:" (ci).
+    name: Ptr[uint8] = "content-length"
+    name_len: uint64 = 14
+    line: uint64 = 0
+    while line < hdr_end:
+        # Does this line start with the Content-Length field name?
+        match_n: int32 = 1
+        j: uint64 = 0
+        while j < name_len:
+            c: uint8 = http_buf[line + j]
+            # ASCII upper -> lower so the compare is case-insensitive.
+            if c >= 65 and c <= 90:
+                c = c + 32
+            if c != name[j]:
+                match_n = 0
+                break
+            j = j + 1
+        if match_n != 0 and http_buf[line + name_len] == 58:    # ':'
+            # Skip the ':' and any leading spaces, then parse digits.
+            v: uint64 = line + name_len + 1
+            while v < hdr_end and http_buf[v] == 32:            # ' '
+                v = v + 1
+            clen: uint64 = 0
+            have_digit: int32 = 0
+            while v < hdr_end and http_buf[v] >= 48 \
+                    and http_buf[v] <= 57:
+                clen = clen * 10 + cast[uint64](http_buf[v] - 48)
+                have_digit = 1
+                v = v + 1
+            if have_digit != 0:
+                return hdr_end + clen
+            return 0
+        # Advance to the start of the next header line (past the LF).
+        nl: uint64 = line
+        while nl < hdr_end and http_buf[nl] != 10:              # '\n'
+            nl = nl + 1
+        line = nl + 1
+    return 0                                   # no Content-Length header
+
+
 # -- HTTP GET ----------------------------------------------------------
 #
 # Connect to host:port, issue a raw HTTP/1.0 GET for `url_path` (a
@@ -610,10 +691,11 @@ def _http_get(port: int64, body_off: Ptr[uint64]) -> int64:
         write_str(1, "\n")
 
     # Build the request: HTTP/1.0 + Connection: close so the server
-    # FINs after the body — read() then returns a clean 0 EOF without
-    # us having to parse Content-Length. The string literals are
-    # materialised inline (the x86_64 backend rejects string-literal
-    # globals).
+    # FINs after the body. The response drain below stops on the
+    # Content-Length boundary when one is present (see
+    # _http_expected_len) and otherwise falls back to a read()==0 EOF.
+    # The string literals are materialised inline (the x86_64 backend
+    # rejects string-literal globals).
     ro: uint64 = 0
     g: Ptr[uint8] = "GET "
     gi: uint64 = 0
@@ -650,12 +732,22 @@ def _http_get(port: int64, body_off: Ptr[uint64]) -> int64:
         sys_close(fd)
         return -1
 
-    # Drain the response into http_buf. read() returns 0 at peer FIN.
+    # Drain the response into http_buf. We stop as soon as the whole
+    # response is in hand: once the headers + a Content-Length worth of
+    # body bytes have arrived (_http_expected_len), we must NOT issue
+    # another read() — on the https path a trailing read past the body
+    # blocks until the peer's slow close_notify/FIN and wedges the
+    # syscall (the timer IRQ is masked in syscall context, so the
+    # kernel socket-read's bounded poll never times out). A response
+    # with no Content-Length falls back to draining until read()==0.
     total: uint64 = 0
     while total < HTTP_CAP:
+        want: uint64 = _http_expected_len(total)
+        if want != 0 and total >= want:
+            break                              # full response received
         room: uint64 = HTTP_CAP - total
-        ptr: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](&http_buf[0]) + total)
-        n: int64 = sys_read(fd, ptr, room)
+        n: int64 = sys_read(fd, cast[Ptr[uint8]](
+            cast[uint64](&http_buf[0]) + total), room)
         if n < 0:
             write_str(2, "apt-get: read() error on HTTP response\n")
             sys_close(fd)
@@ -664,6 +756,13 @@ def _http_get(port: int64, body_off: Ptr[uint64]) -> int64:
             break
         total = total + cast[uint64](n)
     sys_close(fd)
+
+    # If Content-Length was known, trim any bytes a final read pulled
+    # in past the body (e.g. a TLS close_notify record riding the same
+    # segment) so the returned body length is exact.
+    exact: uint64 = _http_expected_len(total)
+    if exact != 0 and total > exact:
+        total = exact
 
     if total == 0:
         write_str(2, "apt-get: empty HTTP response\n")
