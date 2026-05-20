@@ -366,6 +366,27 @@ sys_resolve:
     .size sys_resolve, .-sys_resolve
 
 
+    /* --- sys_tls_connect(fd, hostname, hostlen) -> int32 -------------
+     * U-TLS: native-ABI tls_connect(2). Takes a socket fd that has
+     * already been connect(2)'d and runs the in-kernel TLS 1.3
+     * handshake (drivers/net/tls.ad) over its TCP slot via
+     * SYS_TLS_CONNECT (277) -> _u_tls_connect. `hostname` (%rsi) is a
+     * NUL-terminated string used for SNI + the leaf-cert name check;
+     * `hostlen` (%rdx) is its byte length. On success the fd becomes
+     * TLS-active: subsequent sys_write / sys_read transparently route
+     * through the TLS record layer, and sys_close sends a close_notify
+     * alert. Returns 0 on success or a negative errno (-71 == EPROTO,
+     * the TLS handshake / certificate validation failed). The three
+     * args fit the SysV/syscall-ABI overlap directly — no shuffle. */
+    .globl sys_tls_connect
+    .type sys_tls_connect, @function
+sys_tls_connect:
+    movq    $277, %rax              /* SYS_TLS_CONNECT */
+    syscall
+    ret
+    .size sys_tls_connect, .-sys_tls_connect
+
+
     /* --- sys_kill(pid, sig) -> int32 ---------------------------------
      * Post `sig` into pid's pending-signal bitmap. Default
      * disposition for every signal is TERM with exit code 128+sig

@@ -65,7 +65,7 @@
 # values in the [-4095, -1] range are errno; everything else is a
 # normal return. This matches Linux's syscall return convention.
 
-from kernel.printk.printk import printk1, printk2
+from kernel.printk.printk import printk0, printk1, printk2
 from fs.vfs import (
     vfs_open, vfs_read, vfs_write, vfs_close, vfs_lseek,
     vfs_dup, vfs_dup2, vfs_unlink, vfs_mkdir, resolve_path, vfs_pipe,
@@ -88,9 +88,18 @@ from linux_abi.u_socket_state import (
     usock_set_tcp_slot, usock_get_state, usock_get_tcp_slot,
     usock_fdbuf_for_record, usock_record_for_fdbuf,
     usock_set_bound, usock_get_bound_port, usock_port_in_use,
+    usock_set_tls, usock_is_tls, usock_any_tls_active,
     USOCK_CREATED, USOCK_CONNECTED, USOCK_LISTENING,
     USOCK_AF_INET, USOCK_SOCK_STREAM,
 )
+# U-TLS: bridge userland tls_connect(2) to the in-kernel TLS 1.3 stack
+# (drivers/net/tls.ad). tls_handshake drives the full handshake —
+# X25519 key exchange, server cert-chain validation against the CA
+# store, CertificateVerify transcript binding — over an already-
+# connected TCP slot. Same single-session module-global state the
+# in-kernel http.ad https_get path uses; tls_connect(2) serialises
+# access to it via usock_any_tls_active().
+from drivers.net.tls import tls_init, tls_handshake
 from kernel.sched.core import (
     TaskStruct, current_task,
     current_task_pid, task_lookup_by_pid, task_exit_current,
@@ -398,6 +407,9 @@ ELINUX_NOTCONN:      int64 = -107   # ENOTCONN — socket not connected
 ELINUX_ISCONN:       int64 = -106   # EISCONN — already connected
 ELINUX_MFILE:        int64 = -24    # EMFILE — fd / record table exhausted
 ELINUX_ADDRINUSE:    int64 = -98    # EADDRINUSE — bind port already in use
+# U-TLS: extra errnos the tls_connect(2) bridge surfaces.
+ELINUX_BUSY:         int64 = -16    # EBUSY — a TLS session is already live
+ELINUX_PROTO:        int64 = -71    # EPROTO — TLS handshake / cert validation failed
 
 
 # =====================================================================
@@ -1235,6 +1247,114 @@ def _u_connect(a0: uint64, a1: uint64, a2: uint64,
     usock_set_state(rec, USOCK_CONNECTED)
     printk1("[u_socket] connected: tcp slot=%d\n",
             cast[uint64](tcp_slot))
+    return 0
+
+
+# U-TLS: kernel-side scratch for the hostname tls_connect(2) receives
+# from userland. tls_handshake() wants a NUL-terminated string (for
+# SNI + the leaf-cert name check); the user buffer may be neither
+# NUL-terminated nor stable, so we copy it into this top-level BSS
+# arena (the U9 nested-frame-Array quirk: never park an Array in a
+# nested frame). 256 bytes covers any DNS name (RFC 1035 caps a
+# hostname at 253 chars); a longer name is rejected with -EINVAL.
+U_TLS_HOST_MAX: uint64 = 256
+u_tls_host_buf: Array[256, uint8]
+
+
+def _u_tls_connect(a0: uint64, a1: uint64, a2: uint64,
+                   a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # int tls_connect(int sockfd, const char *hostname, size_t hostlen)
+    #
+    # U-TLS: take an already-connect(2)'d AF_INET SOCK_STREAM socket fd
+    # and run the in-kernel TLS 1.3 handshake (drivers/net/tls.ad) over
+    # its live TCP slot. `hostname` is used both for the SNI extension
+    # and the leaf-cert subject/SAN name check; the handshake validates
+    # the server's certificate chain against the kernel CA store and
+    # verifies the CertificateVerify transcript binding. On success the
+    # socket fd is marked TLS-active: subsequent write(2)/read(2) route
+    # transparently through the TLS record layer (fs/vfs.ad's
+    # FD_SOCKET_MARK arms), and close(2) sends a close_notify alert.
+    #
+    # The TLS stack is single-session (module-global key/transcript
+    # state), so only one socket fd can be TLS-active at a time; a
+    # second tls_connect(2) while a session is live returns -EBUSY.
+    #
+    # Returns 0 on success, or a negative errno:
+    #   -EBADF   sockfd is not a live socket fd
+    #   -ENOTCONN sockfd has no live TCP connection (connect(2) first)
+    #   -EBUSY   another socket already has a live TLS session
+    #   -EINVAL  null / over-long hostname
+    #   -EPROTO  handshake failed (incl. cert-chain / CertificateVerify
+    #            rejection — the user sees the connection fail, never
+    #            an un-validated plaintext channel)
+    fd: int32 = cast[int32](a0)
+    if vfs_fd_is_socket(fd) == 0:
+        set_current_errstr("tls_connect: not a socket fd")
+        return ELINUX_BADF
+    rec: int32 = usock_record_for_fdbuf(vfs_socket_fd_get_record(fd))
+    if usock_valid(rec) == 0:
+        set_current_errstr("tls_connect: socket has no backing record")
+        return ELINUX_BADF
+    if usock_get_state(rec) != USOCK_CONNECTED:
+        # TLS rides on an ESTABLISHED TCP connection — the caller must
+        # connect(2) first. A LISTENING / CREATED / CLOSED socket has
+        # no peer to handshake with.
+        set_current_errstr("tls_connect: socket not connected")
+        return ELINUX_NOTCONN
+    if usock_is_tls(rec) != 0:
+        # Already handshaked on this fd — a double tls_connect(2).
+        set_current_errstr("tls_connect: TLS already established")
+        return ELINUX_ISCONN
+    if usock_any_tls_active() != 0:
+        # The TLS stack carries one global session; a second concurrent
+        # handshake would clobber the first session's keys.
+        set_current_errstr("tls_connect: a TLS session is already active")
+        return ELINUX_BUSY
+    tcp_slot: int32 = usock_get_tcp_slot(rec)
+    if tcp_slot < 0:
+        set_current_errstr("tls_connect: socket has no TCP slot")
+        return ELINUX_NOTCONN
+    if a1 == 0:
+        set_current_errstr("tls_connect: null hostname")
+        return ELINUX_INVAL
+    # Copy the user hostname into kernel BSS and NUL-terminate. a2 is
+    # the caller-supplied length (advisory); we copy at most
+    # U_TLS_HOST_MAX-1 bytes and stop early at an embedded NUL.
+    hlen: uint64 = a2
+    if hlen >= U_TLS_HOST_MAX:
+        set_current_errstr("tls_connect: hostname too long")
+        return ELINUX_INVAL
+    src: Ptr[uint8] = cast[Ptr[uint8]](a1)
+    i: uint64 = 0
+    while i < hlen:
+        b: uint8 = src[i]
+        if b == 0:
+            break
+        u_tls_host_buf[i] = b
+        i = i + 1
+    u_tls_host_buf[i] = 0
+    if i == 0:
+        set_current_errstr("tls_connect: empty hostname")
+        return ELINUX_INVAL
+    printk1("[u_tls] tls_connect fd=%d", cast[uint64](fd))
+    printk1(" tcp slot=%d\n", cast[uint64](tcp_slot))
+    # Initialise the TLS module (idempotent — clears scratch + loads
+    # SHA-256 K constants) then drive the full handshake. tls_handshake
+    # polls virtio_net internally, the same blocking model the userland
+    # connect(2) above already uses successfully from syscall context.
+    tls_init()
+    hs: int32 = tls_handshake(tcp_slot, cast[Ptr[uint8]](&u_tls_host_buf[0]))
+    if hs != 0:
+        # Handshake or cert-chain / CertificateVerify validation failed.
+        # tls_handshake already logged the specific stage; the user
+        # gets a failed connection rather than an un-validated channel.
+        set_current_errstr("tls_connect: TLS handshake failed")
+        return ELINUX_PROTO
+    # Handshake done — tls_active is 1 and the TLS session is keyed to
+    # this TCP slot. Mark the fd so vfs read/write/close route through
+    # the TLS record layer.
+    usock_set_tls(rec, 1)
+    printk0("[u_tls] handshake complete — fd is now TLS-active\n")
     return 0
 
 

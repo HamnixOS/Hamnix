@@ -154,8 +154,14 @@ from drivers.net.tcp import tcp_send, tcp_recv, tcp_close, tcp_listen_close
 from linux_abi.u_socket_state import (
     usock_record_for_fdbuf, usock_get_state, usock_get_tcp_slot,
     usock_set_state, usock_set_tcp_slot, usock_free,
+    usock_is_tls, usock_set_tls,
     USOCK_CONNECTED, USOCK_CLOSED, USOCK_LISTENING,
 )
+# U-TLS: a socket fd marked TLS-active (by tls_connect(2)) routes its
+# read/write/close through the in-kernel TLS 1.3 record layer instead
+# of raw tcp_send/tcp_recv. tls.ad imports tcp.ad + cpio.ad + the
+# crypto libs but never fs/vfs.ad, so no import cycle.
+from drivers.net.tls import tls_send, tls_recv, tls_close_notify, tls_close
 from fs.fat import (
     is_fat_path, strip_mnt_prefix, fat_open, fat_close,
     fat_open_first_cluster, fat_open_size, fat_read, fat_listdir,
@@ -1670,6 +1676,18 @@ def vfs_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         sk_tcp: int32 = usock_get_tcp_slot(sk_rec)
         if sk_tcp < 0:
             return 0
+        # U-TLS: if tls_connect(2) ran a handshake on this fd, read(2)
+        # pulls the next decrypted application_data record off the wire
+        # via the TLS record layer. tls_recv tcp_recv's + AEAD-decrypts
+        # internally; it returns >0 plaintext bytes, 0 on close_notify /
+        # clean EOF, or -1 on a hard decrypt / protocol error. We latch
+        # CLOSED on the EOF/error answers (an error there is genuinely
+        # un-recoverable for a stream socket).
+        if usock_is_tls(sk_rec) != 0:
+            n_tls: int64 = tls_recv(sk_tcp, buf, count, 500)
+            if n_tls <= 0:
+                usock_set_state(sk_rec, USOCK_CLOSED)
+            return n_tls
         # 500 jiffies (~5 s @ HZ=100) blocking budget — generous for a
         # local server, bounded so a dead peer can't wedge the syscall.
         # tcp_recv polls virtio_net internally; on a connected socket
@@ -2011,6 +2029,32 @@ def vfs_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         sk_tcp: int32 = usock_get_tcp_slot(sk_rec)
         if sk_tcp < 0:
             return cast[int64](EPIPE)
+        # U-TLS: a TLS-active fd encrypts each write through the TLS
+        # record layer before tcp_send. tls_send's plaintext scratch is
+        # a 2048-byte frame (Array[2048]), so it caps one record at
+        # ~2026 plaintext bytes; we chunk the user buffer at 2000 bytes
+        # per call so a write(2) larger than one TLS record drains as a
+        # sequence of records. tls_send returns the byte count sealed
+        # on success or -1 on a wire / AEAD error.
+        if usock_is_tls(sk_rec) != 0:
+            tls_sent: uint64 = 0
+            while tls_sent < count:
+                tls_chunk: uint64 = count - tls_sent
+                if tls_chunk > 2000:
+                    tls_chunk = 2000
+                tls_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+                    cast[uint64](buf) + tls_sent)
+                tls_rc: int64 = tls_send(sk_tcp, tls_ptr, tls_chunk)
+                if tls_rc <= 0:
+                    # Encrypt / transport failure. Latch CLOSED; report
+                    # a short count if earlier records made it, else
+                    # EPIPE.
+                    usock_set_state(sk_rec, USOCK_CLOSED)
+                    if tls_sent > 0:
+                        return cast[int64](tls_sent)
+                    return cast[int64](EPIPE)
+                tls_sent = tls_sent + cast[uint64](tls_rc)
+            return cast[int64](tls_sent)
         sk_sent: uint64 = 0
         while sk_sent < count:
             chunk_ptr: Ptr[uint8] = cast[Ptr[uint8]](
@@ -2226,6 +2270,15 @@ def vfs_close(fd: int32) -> int32:
         if sk_rec >= 0:
             sk_tcp: int32 = usock_get_tcp_slot(sk_rec)
             if sk_tcp >= 0:
+                # U-TLS: a TLS-active fd gets a graceful TLS shutdown
+                # first — send a close_notify alert (best-effort) and
+                # reset the in-kernel TLS session so a later
+                # tls_connect(2) can claim it again. Then the TCP slot
+                # is torn down the same way a plain socket fd is.
+                if usock_is_tls(sk_rec) != 0:
+                    tls_close_notify(sk_tcp)
+                    tls_close()
+                    usock_set_tls(sk_rec, 0)
                 # A LISTENING socket's tcp slot is a passive TCB with no
                 # peer — tcp_listen_close resets it without a FIN. A
                 # CONNECTED / CLOSED socket gets the full FIN handshake
