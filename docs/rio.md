@@ -534,49 +534,38 @@ direction so the V0 file tree leaves room.
 
 ---
 
-## 7. What happens to VTNext-v2
+## 7. The retired VTNext design (historical)
 
-VTNext-v2 (`docs/vtnext-v2.md`, shelved library on the
-`agent-abaa05e205853d5bf` worktree at `drivers/vt/vtnext.ad`) is an
-**ESC-coded byte-stream wire protocol** between `apps`, `hamwd`,
-and a renderer. It has no notion of which window opened which file
-— a single `/dev/win/<wid>/draw` is the only window scoping, and
-events come back through `/dev/win/<wid>/events`.
+Before rio, the window system was going to be **VTNext** — an
+ESC-coded byte-stream wire protocol between apps, a `hamwd` display
+daemon, and a renderer, with a single global `/dev/win/<wid>/draw`
+file as the only window scoping. It was retired before any of it
+shipped; this section records why, so the decision is not
+relitigated.
 
-This is the **wrong shape** for rio's per-window-namespace model.
-The reasons, in order of severity:
+VTNext was the **wrong shape** for the per-window-namespace model:
 
-  1. **No per-namespace isolation.** VTNext-v2's `/dev/win/<wid>`
-     is in a global namespace; window A's process can `open(
-     "/dev/win/B/events")` and snoop B's input. There is no
-     namespace-private dev tree.
+  1. **No per-namespace isolation.** A global `/dev/win/<wid>` tree
+     let window A's process `open("/dev/win/B/events")` and snoop
+     B's input. There was no namespace-private dev tree.
 
-  2. **ESC framing assumes a terminal-emulator transport.** The
-     `ESC ] vtn ; … BEL` framing is meant for tunnelling through
-     a tty; on a per-window file server it's pure overhead and
-     prevents binary draw commands.
+  2. **ESC framing assumed a terminal-emulator transport.** The
+     `ESC ] … BEL` framing was meant for tunnelling through a tty;
+     on a per-window file server it is pure overhead and prevents
+     binary draw commands.
 
-  3. **`hamwd` is a separate daemon from "the window system".**
-     VTNext-v2 splits drawing (`hamwd`) from compositing
-     (renderer); rio collapses them into one 9P server.
+  3. **`hamwd` was a separate daemon from "the window system".**
+     VTNext split drawing (`hamwd`) from compositing (renderer);
+     rio collapses them into one 9P server.
 
   4. **The Plan 9 draw protocol already exists** and is a strict
-     superset of what VTNext-v2's drawing layer would need. There
-     is no reason to invent a parallel encoding.
+     superset of what VTNext's drawing layer would have needed —
+     no reason to invent a parallel encoding.
 
-**Recommendation: retire VTNext-v2.** The shelved
-`drivers/vt/vtnext.ad` library does not merge. `docs/vtnext-v2.md`
-gets a one-line preamble pointing at `docs/rio.md` and is kept
-for historical reference; the design is not deleted from git, just
-not promoted into the kernel.
-
-A secondary option — recycling the ESC-coded framing as the
-**internal byte-codec** for `/dev/draw/<id>/data` packets, with each
-"command" mapping to one VTNext frame — is rejected. Plan 9's binary
-draw protocol is well-specified, has reference implementations, and
-is what ported Plan 9 programs (and the future `libdraw` shim) will
-emit. Reframing it through VTNext adds an encoder/decoder round-trip
-for no gain.
+Recycling the ESC-coded framing as the internal byte-codec for
+`/dev/draw/<id>/data` was also rejected: Plan 9's binary draw
+protocol is well-specified, has reference implementations, and is
+what ported Plan 9 programs (and a future `libdraw` shim) emit.
 
 ---
 
@@ -711,5 +700,3 @@ should weigh in before Phase 4 starts.
       - `docs/architecture.md` — Layer 0..5 model; rio lives at
         Layer 5 (apps) speaking through Layer 1 (native syscalls)
         and Layer 4 (the draw byte protocol).
-      - `docs/vtnext-v2.md` — historical reference for the
-        retired window-protocol design (see §7).

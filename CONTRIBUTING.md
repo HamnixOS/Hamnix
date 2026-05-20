@@ -88,7 +88,7 @@ Hamnix/
 ├── kernel-modules/       # Legacy M1..M15 .ko regression baseline
 ├── init/main.ad          # Kernel entry
 ├── scripts/              # build_user.sh, test_*.sh, build_iso.sh, …
-└── docs/                 # architecture.md, native-api.md, vtnext-v2.md,
+└── docs/                 # architecture.md, native-api.md, rio.md,
                           # x86-backend.md, BOOT.md, L_TRACK_HOWTO.md
 ```
 

@@ -31,7 +31,7 @@ When the project decides to advance to a newer LTS:
 
 1. Update this file with the new version + tag.
 2. Re-run `scripts/gen_linux_abi.py` against the new vmlinux's BTF.
-3. Commit the regenerated `linux_abi/structs/*.py`.
+3. Commit the regenerated `linux_abi/structs/*.ad`.
 4. Re-validate the M1..M15 .ko artifacts against the new headers.
 5. Bump M13.1's utsname expectation.
 

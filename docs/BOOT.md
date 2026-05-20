@@ -2,25 +2,40 @@
 
 This document covers the three ways to boot the Hamnix kernel today:
 
-1. **Direct kernel boot** via QEMU `-kernel` (dev loop).
+1. **Developer dev loop** via `scripts/run_x86_bare.sh` (GRUB-ISO shim).
 2. **Hybrid ISO** (`build/hamnix.iso`) — boots under BIOS legacy *or* UEFI.
 3. **USB stick** — same hybrid ISO, written byte-for-byte to a USB device.
 
 The hybrid ISO is the priority boot path: it's the foundation for booting
 Hamnix on real server hardware.
 
-## 1. Direct kernel boot (developer loop)
+The Hamnix kernel is a true **`elf64-x86-64`** ELF, linked into the
+**higher half** at `0xffffffff80000000` (see `arch/x86/kernel/vmlinux.lds`).
+It is loaded by multiboot1 (GRUB) on BIOS and by a native PE/COFF EFI stub
+on UEFI; both honour the 64-bit `p_paddr` program-header fields the
+kernel's VMA/LMA split needs.
 
-For the inner dev loop while iterating on `init/main.ad` or kernel modules,
-boot the multiboot1 ELF directly:
+## 1. Developer dev loop
+
+For the inner dev loop while iterating on `init/main.ad` or kernel modules:
 
 ```sh
 bash scripts/run_x86_bare.sh
 ```
 
 This rebuilds userland, modules, the initramfs, and the kernel ELF, then
-boots it via `qemu-system-x86_64 -kernel build/hamnix-vmlinux.elf`. No ISO
-mastering involved — much faster turnaround.
+boots it in QEMU.
+
+> **QEMU's `-kernel` cannot load the kernel directly.** QEMU's built-in
+> `-kernel` multiboot1 loader rejects 64-bit ELFs outright ("Cannot load
+> x86-64 image, give a 32bit one") — it only accepts ELFCLASS32. So the
+> test harness boots via a BIOS-GRUB-ISO PATH shim: `scripts/_kernel_iso.sh`
+> installs an executable `qemu-system-x86_64` shim into `build/binshim/`
+> and prepends it to `PATH`. The shim detects an ELFCLASS64 `-kernel <file>`
+> argument, wraps the kernel in a minimal BIOS GRUB ISO, and execs the real
+> QEMU with `-cdrom <iso>` substituted in. GRUB's multiboot1 loader (unlike
+> QEMU's) happily loads ELFCLASS64. No ISO mastering is visible to the
+> caller — much faster turnaround than building the full hybrid ISO.
 
 ## 2. Hybrid bootable ISO
 
@@ -58,7 +73,7 @@ As of M16.70 the BIOS and UEFI paths run **different code on the way in**:
        HandleProtocol(DeviceHandle, SfspGuid) -> OpenVolume`).
     4. Open `\hamnix-vmlinux.elf` on the ESP, AllocatePool 32 MiB
        and read the entire ELF in.
-    5. Parse the elf32-i386 header + program headers; for each
+    5. Parse the elf64-x86-64 header + program headers; for each
        PT_LOAD, memcpy `p_filesz` bytes from the file buffer to
        `p_paddr`, then memset `p_memsz - p_filesz` trailing bytes
        to zero (BSS-within-segment).
@@ -92,15 +107,15 @@ Linux's vmlinux (the ELF) is wrapped inside bzImage, but vmlinux itself
 is not what UEFI loads.
 
 The Hamnix kernel binary is an ELF (compiled with `--target=x86_64-bare-metal`
-through the Adder compiler + `ld -m elf_i386`). An ELF starts with
+through the Adder compiler + `ld -m elf_x86_64`). An ELF starts with
 `\x7fELF` at file offset 0; a PE/COFF starts with `MZ`. The same first
 four bytes can't be both magic numbers, so Hamnix takes the simpler
 split-output approach:
 
-- `build/hamnix-vmlinux.elf` — ELF32-i386 wrapper around 64-bit code,
-  multiboot1-loaded. (Unchanged.)
+- `build/hamnix-vmlinux.elf` — true `elf64-x86-64` higher-half kernel
+  ELF (linked at `0xffffffff80000000`), multiboot1-loaded by GRUB.
 - `build/hamnix-bootx64.efi` — true PE32+ EFI_APPLICATION, x86-64,
-  subsystem 10. (New.)
+  subsystem 10.
 
 Both are placed in the ISO; the BIOS / UEFI firmware pick the right
 one. When the EFI stub grows the ability to chain-load the kernel ELF
@@ -147,7 +162,8 @@ PATH A from the M16.124 diagnosis is now the production UEFI path:
   multiboot1's loader behaviour on the BIOS side), then
   `ExitBootServices` and `jmp _x86_start_after_loader`.
 - The kernel ELF format stays untouched — every existing
-  `qemu -kernel hamnix-vmlinux.elf` test keeps working.
+  `qemu ... -kernel hamnix-vmlinux.elf` test keeps working (via the
+  `scripts/_kernel_iso.sh` GRUB-ISO PATH shim — see §1).
 
 **Implementation notes worth recording (the B5 we discovered):**
 

@@ -6,13 +6,12 @@ Linux internally** because that's where the porting work is bounded.
 Each layer has exactly one source of design influence. The
 translations between layers are explicit.
 
-> **Note (2026-05): the window-system design moved on.** This document
-> describes the Layer-4 wire protocol as **VTNext-v2** (a serial/TCP
-> byte stream). That design has been **superseded by the Plan 9 rio
-> shape** — see [`rio.md`](rio.md). VTNext-v2 (`vtnext-v2.md`) is kept
-> for historical reference only. Wherever the phases below say
-> "VTNext", read "the rio file-server protocol"; the layered model and
-> the migration phases are otherwise current.
+> **Note: the window system is the Plan 9 `rio` model.** Hamnix's
+> display layer is a userspace 9P file server — see [`rio.md`](rio.md).
+> Each window is a per-process namespace; programs draw and read input
+> by opening files under `/dev`. An earlier serial/TCP byte-stream
+> design ("VTNext") was considered and retired before any of it
+> shipped; references to it in older docs are stale.
 
 ## Layered model
 
@@ -28,14 +27,14 @@ translations between layers are explicit.
            v                      v
 +---------------------------+ +---------------+ ----------
 | Layer 4: Wire protocols   | |   (kernel     |
-|   VTNext-v2 (serial/TCP)  | |    delivers   | Hamnix +
-|   9P-over-net (mounts)    | |    bytes)     | Plan 9
+|   rio draw protocol       | |    delivers   | Hamnix +
+|   9P (mounts, /srv, net)  | |    bytes)     | Plan 9
 +-------------+-------------+ +-------+-------+ ----------
               |                       |
               v                       |
 +---------------------------+         |          ----------
 | Layer 3: User services    |         |
-|   hamwd  → /dev/win/*     |         |
+|   rio    → /dev/win/*     |         |
 |   ipd    → /net/tcp,/udp  |         |
 |   plumb  → /srv/plumber   |         |  Plan 9
 |   timed  → /dev/time      |         |
@@ -78,7 +77,7 @@ yourself wanting Plan 9 at Layer 2, you have a bug.
 | 1 | Native syscall surface (Plan 9-shaped) | `sys/src/9/port/` (new), `arch/x86/kernel/syscall.ad` (dispatch) |
 | 2 | Linux compat layer for `.ko` + ELF | `linux_abi/` |
 | 3 | User services (9P file servers) | `sys/src/cmd/` (new) |
-| 4 | Wire protocols (VTNext, 9P-net) | docs only — protocols are spec, not source |
+| 4 | Wire protocols (rio draw protocol, 9P) | docs only — protocols are spec, not source |
 | 5 | Apps | `user/`, `mod/`, `tests/u-binary/`, plus stock Debian binaries at runtime |
 
 ## Boundary rules
@@ -92,10 +91,10 @@ yourself wanting Plan 9 at Layer 2, you have a bug.
 4. **Layer 0 doesn't know about personalities.** It exposes
    primitives (`task_clone`, `fd_table_dup`, `vm_map`). Layer 1 and
    Layer 2 compose those into user-visible behavior.
-5. **Layer 4 protocols never enter the kernel.** VTNext parsing
-   lives in `hamwd` (Layer 3); the kernel only ferries bytes
-   to/from the device file. Exception: kernel may emit minimal
-   VTNext to `wid=0` during early boot, before `hamwd` exists.
+5. **Layer 4 protocols never enter the kernel.** The rio draw
+   protocol is parsed in `rio` (Layer 3); the kernel only ferries
+   bytes to/from the device file and owns the raw framebuffer +
+   input devices.
 
 ## Layer-of-record for each existing subsystem
 
@@ -123,7 +122,7 @@ yourself wanting Plan 9 at Layer 2, you have a bug.
 | Kernel modules in Adder | `kernel-modules/*` (M1..M15) | 5 (running) → loaded by Linux .ko path → uses Layer 2 | Stays as regression baseline |
 | Linux modules (stock .ko) | `tests/linux-modules/*.ko` | 5 (running) → Layer 2 | Stays |
 | Linux ELF userland | `tests/u-binary/u_*` | 5 (running) → Layer 2 | Stays |
-| hamwd display server | not yet built | 3 | New Layer 3 service for VTNext |
+| rio display server | not yet built | 3 | New Layer 3 service — file-based window system (see `rio.md`) |
 | ipd net daemon | not yet built | 3 | Owns the IP stack as a /net 9P server |
 | Compiler | `compiler/*.py` | host tool | Not part of the OS — runs on the build host |
 
@@ -137,7 +136,7 @@ end (and even then, only their internals).
 
 ### Phase A — Specs land (this pass)
 
-Three docs (`architecture.md`, `native-api.md`, `vtnext-v2.md`) plus
+Three docs (`architecture.md`, `native-api.md`, `rio.md`) plus
 a `sys/src/9/port/README.md` placeholder stake out the new
 directory. No code moves. **All L+U tests keep passing trivially.**
 
@@ -181,19 +180,20 @@ is NOT schroot (the kernel has no global /), backing store choices
 (disk-backed via debootstrap first; `debfs` 9P server later), and
 the `distrorun` entry point.
 
-### Phase D — Stand up `hamwd` (Layer 3) using v1 single-window mode
+### Phase D — Stand up `rio` (Layer 3), one-window skeleton
 
-`hamwd` opens `/dev/vtnext` (the serial multiplex), implements the
-v1 protocol, exposes a single `/dev/win/0/{ctl,draw,present}` tree
-via 9P-in-process (mount via `srv` channel). Existing v1 callers
-keep working. **All L+U tests keep passing.**
+`rio` posts a srvfd via `srv_post`, serves a one-window file tree
+(`/dev/cons`, `/dev/mouse`, `/dev/text`, …) via 9P-in-process, and
+runs `hamsh` inside it. No drawing yet — text only. **All L+U tests
+keep passing** because they're console-only.
 
-### Phase E — Roll out v2: multi-window, wid prefix, reverse channel
+### Phase E — Multi-window via `/dev/wsys`
 
-`hamwd` flips to v2 wire format (probe handshake → V2 capability
-line). v1 apps are recompiled against the new client lib (still
-sees a window-shaped surface, just one). **L+U tests keep passing**
-because they're console-only.
+`rio` implements `wsys new`: each new window gets its own
+namespace, its own per-window FIFOs, its own srvfd. This proves the
+load-bearing invariant — events route to exactly one window's
+`/dev/mouse` at a time. **L+U tests keep passing** because they're
+console-only. See [`rio.md`](rio.md) for the full phase breakdown.
 
 ### Phase F — Move the network stack to `/net/`
 
@@ -213,11 +213,10 @@ deprecated, then deleted. Linux ELF callers were never using these
 (they call `linux_abi/u_syscalls.ad`'s implementations); native
 callers are migrated wholesale. **L+U tests keep passing.**
 
-### Phase H — VTNext-v3 in-kernel framebuffer renderer
+### Phase H — Framebuffer-backed `/dev/draw`
 
-Optional. A kernel-side VTNext sink that draws to the EFI GOP
-framebuffer using the same wire protocol. `hamwd` doesn't know
-whether it's talking to pygame over serial or to a kernel sink. **L+U
+Optional. `rio` lights up `/dev/draw/new` against the EFI GOP
+framebuffer and implements the Plan 9 draw protocol subset. **L+U
 tests keep passing** — orthogonal to syscall ABI.
 
 ### Test discipline
@@ -259,7 +258,7 @@ phase that breaks either reverts before merge.
 - `sys/src/9/port/` — Plan 9-shape syscall bodies.
 - `sys/src/9/cdev/` — Plan 9-shape device-file backends (`devcons`,
   `devtime`, `devpid`, `devrandom`).
-- `sys/src/cmd/hamwd/` — display server (Phase D).
+- `sys/src/cmd/rio/` — display server (Phase D; see `rio.md`).
 - `sys/src/cmd/ipd/` — network daemon (Phase F).
 - `sys/src/cmd/plumb/` — plumber (deferred).
 - `sys/src/cmd/srvfs/` — `/srv/` registry server (Phase D/E
@@ -276,18 +275,19 @@ phase that breaks either reverts before merge.
   cosmetic.
 - **Layer 2 absorbs all Linux compat** so Linux apps can't infect
   the native API by demanding their concepts upstream.
-- **Layer 3 is where the OS personality lives** — hamwd, ipd,
+- **Layer 3 is where the OS personality lives** — rio, ipd,
   plumb. Adding a feature usually means adding a Layer 3 service,
   not a Layer 1 syscall.
-- **Layer 4 protocols are external by design.** VTNext over serial
-  to a pygame on a laptop is the same protocol as VTNext to a local
-  framebuffer — the kernel doesn't need a graphics stack.
+- **Layer 4 protocols are external by design.** The rio draw
+  protocol is bytes on a file; the kernel only owns the raw
+  framebuffer and input devices, not a graphics stack.
 
 ## What this design does NOT include
 
-- **No DRM / Mesa / Vulkan / Wayland / X11.** Graphics is VTNext
-  end-to-end. If we ever need 3D, the renderer (laptop pygame OR
-  local framebuffer process) handles it; the OS doesn't.
+- **No DRM / Mesa / Vulkan / Wayland / X11.** Graphics is the rio
+  file-based draw protocol end-to-end. If we ever need 3D, an app
+  software-rasterises and writes pixels via `draw` ops; the OS
+  doesn't ship a GPU stack.
 - **No epoll/kqueue.** Plan 9 doesn't have them; Layer 2 implements
   them on top of `read` blocking semantics when Linux callers need.
 - **No ioctl.** Control surfaces are `ctl` files. Layer 2 translates
@@ -302,7 +302,7 @@ phase that breaks either reverts before merge.
 
 1. This document.
 2. `native-api.md` — the syscall surface and the migration table.
-3. `vtnext-v2.md` — the graphical wire protocol.
+3. `rio.md` — the file-based window system and its draw protocol.
 4. `README.md` — current state of the implementation against this
    architecture.
 5. `linux_abi/TARGET_ABI.md` — the pinned Linux ABI we translate

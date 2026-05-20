@@ -64,12 +64,11 @@ push limit, so it stays opt-in.
 
 To boot Hamnix with debian-minbase available:
 
-    HAMNIX_EMBED_DEBIAN=1 INIT_ELF=build/user/hamsh.elf \
-        python3 scripts/build_initramfs.py
-    python3 -m compiler.adder compile --target=x86_64-bare-metal \
-        init/main.ad -o build/hamnix-vmlinux.elf
-    qemu-system-x86_64 -kernel build/hamnix-vmlinux.elf -m 512M \
-        -nographic -no-reboot
+    HAMNIX_EMBED_DEBIAN=1 bash scripts/run_x86_bare.sh
+
+`run_x86_bare.sh` rebuilds the kernel and boots it under QEMU via the
+`scripts/_kernel_iso.sh` GRUB-ISO shim (QEMU's `-kernel` cannot load the
+`elf64-x86-64` higher-half kernel directly — see `docs/BOOT.md` §1).
 
 Then inside hamsh:
 

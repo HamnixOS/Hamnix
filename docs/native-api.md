@@ -238,10 +238,10 @@ MREPL/MBEFORE/MAFTER/MCREATE with `bind`. Reference: 9front
 The canonical pattern for service consumers:
 
 ```
-fd = open("/srv/hamwd", ORDWR)
+fd = open("/srv/rio", ORDWR)
 mount(fd, -1, "/dev/win", MREPL, "")
 close(fd)
-# /dev/win/* is now backed by the hamwd daemon
+# /dev/win/* is now backed by the rio daemon
 ```
 
 ### `unmount(new: Ptr[uint8], old: Ptr[uint8]) -> int32`
@@ -308,10 +308,10 @@ above; the `open("/srv/<name>")` form also works once `init` has
 done its `bind '#s' /srv` recipe, but `srv_open` is direct):
 
 ```
-fd = srv_open("hamwd")
+fd = srv_open("rio")
 mount(fd, -1, "/dev/win", MREPL, "")
 close(fd)
-# /dev/win/* is now backed by hamwd
+# /dev/win/* is now backed by rio
 ```
 
 ### `chdir(path: Ptr[uint8]) -> int32`
@@ -358,11 +358,11 @@ shape.
 | `/dev/random` | r | CSPRNG bytes. |
 | `/dev/pid` | r | ASCII decimal: calling process's pid. |
 | `/dev/eth<n>` | r/w | Raw ethernet frames for NIC `n`. Owned by `ipd`. |
-| `/dev/win/ctl` | r/w | Global windowing control (see vtnext-v2.md). |
-| `/dev/win/<wid>/ctl` | r/w | Per-window control. |
-| `/dev/win/<wid>/draw` | w | Drawing commands. |
-| `/dev/win/<wid>/events` | r | Input events for this window. |
-| `/dev/win/<wid>/present` | w | Flush draws. |
+| `/dev/mouse` | r/w | Per-window mouse events; write repositions cursor. Served by `rio` (see `rio.md`). |
+| `/dev/draw/new` | r/w | Allocate a draw context; read lists open ids. Served by `rio`. |
+| `/dev/draw/<id>/{data,ctl,refresh}` | r/w | Per-context draw protocol, control, and repaint wait. Served by `rio`. |
+| `/dev/wctl` | r/w | Per-window control (resize/move/raise). Served by `rio`. |
+| `/dev/wsys` | r/w | System-wide window control; write spawns a window. Served by `rio`. |
 | `/net/tcp/clone` | r/w | Open then read to get a new TCP connection number; further I/O on the per-conn `/net/tcp/<n>/{ctl,data,local,remote,status}`. Plan 9 idiom. |
 | `/net/udp/*` | r/w | Same shape, UDP. |
 | `/proc/<pid>/cwd` | r | Read returns the process's current working directory string. |
@@ -390,30 +390,27 @@ service's man page**, not **call ioctl with a magic number**.
 ## The ctl-file discovery dance
 
 The canonical pattern for any newly-allocated resource. Example:
-windowing.
+allocating a `rio` draw context.
 
 ```
-fd = open("/dev/win/ctl", ORDWR)
-write(fd, "create 800 600 \"Process List\"\n", 30)
-read(fd, buf, 16)            # → "17\n"
-                             # /dev/win/17/* now exists
-draw = open("/dev/win/17/draw", OWRITE)
-write(draw, "rect 0 0 800 600 200 200 200 255\n", 33)
-write(draw, "text 10 30 mono 14 0 0 0 \"Hello\"\n", 33)
-present = open("/dev/win/17/present", OWRITE)
-write(present, "1", 1)
-close(present); close(draw); close(fd)
+fd = open("/dev/draw/new", ORDWR)
+write(fd, "", 0)             # the act of writing allocates
+read(fd, buf, 16)            # → "3\n"
+                             # /dev/draw/3/* now exists
+data = open("/dev/draw/3/data", ORDWR)
+write(data, draw_cmds, n)    # binary draw-protocol commands
+close(data); close(fd)
 ```
 
 Three properties of this pattern that matter:
 
-1. **Allocation is a write+read.** The `ctl` file echoes back the
-   id of the newly-created resource.
-2. **No special opcode for "give me a window".** It's just bytes
-   on a file.
-3. **The kernel doesn't know about windows.** `hamwd` runs in
-   userspace, served the read, allocated the wid, set up
-   `/dev/win/17/*` in its mount. The kernel only delivered the
+1. **Allocation is a write+read.** The `ctl` (or `new`) file echoes
+   back the id of the newly-created resource.
+2. **No special opcode for "give me a draw context".** It's just
+   bytes on a file.
+3. **The kernel doesn't know about windows.** `rio` runs in
+   userspace, served the read, allocated the id, set up
+   `/dev/draw/3/*` in its mount. The kernel only delivered the
    bytes.
 
 Network connection setup (`/net/tcp/clone` → `/net/tcp/<n>/{ctl,
