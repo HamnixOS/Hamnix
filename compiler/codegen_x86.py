@@ -558,6 +558,44 @@ class X86CodeGen:
 
         def emit_init(g: VarDecl):
             value = g.value
+            # String-literal global: `name: Array[N, uint8] = "..."`.
+            # The literal's bytes are placed directly into `.data`,
+            # NUL-padded out to the declared array length. This lets
+            # globals carry constant strings instead of forcing every
+            # call site to materialise the bytes inline (the legacy
+            # `_init_*()` runtime-fill workaround). A 1-byte element
+            # type (uint8/int8/char) is required — a string can't
+            # initialise a wider-element array.
+            if isinstance(value, StringLiteral):
+                t = g.var_type
+                if not isinstance(t, ArrayType):
+                    raise CodeGenError(
+                        f"x86: global '{g.name}' has a string initializer "
+                        f"but is not typed Array[N, uint8]"
+                    )
+                elem_sz = self.get_type_size(t.element_type)
+                if elem_sz != 1:
+                    raise CodeGenError(
+                        f"x86: global '{g.name}': string initializer needs "
+                        f"a 1-byte element type (got element size {elem_sz})"
+                    )
+                raw = value.value.encode("utf-8", "surrogateescape")
+                cap = t.size
+                if len(raw) > cap:
+                    raise CodeGenError(
+                        f"x86: global '{g.name}': string initializer "
+                        f"({len(raw)} bytes) overflows Array[{cap}, ...]"
+                    )
+                self.emit(f"    .globl {g.name}")
+                self.emit(f"    .align 8")
+                self.emit(f"{g.name}:")
+                self.emit(f'    .ascii "{self._escape(value.value)}"')
+                # Pad with NULs out to the declared length so the symbol
+                # occupies exactly get_type_size() bytes — adjacent
+                # globals and any sizeof-style arithmetic stay correct.
+                if cap > len(raw):
+                    self.emit(f"    .zero {cap - len(raw)}")
+                return
             neg = False
             if isinstance(value, UnaryExpr) and value.op is UnaryOp.NEG \
                     and isinstance(value.operand, IntLiteral):

@@ -30,8 +30,8 @@ cd "$PROJ_ROOT"
 
 VERBOSE="${HAMNIX_COMPILER_TESTS_VERBOSE:-0}"
 
-# Order: cheapest first. lexer_test is pure-Python (<1s). The four
-# QEMU-boot fixtures take ~30-90s each. The xfail fixture also boots.
+# Order: cheapest first. lexer_test is pure-Python (<1s). The
+# QEMU-boot fixtures take ~30-90s each.
 TESTS=(
     "lexer_test:python3 compiler/lexer_test.py"
     "lex_digit_idents:bash scripts/test_lex_digit_idents.sh"
@@ -40,6 +40,7 @@ TESTS=(
     "cast_arr_u32:bash scripts/test_compiler_cast_arr_u32.sh"
     "nested_frame_array:bash scripts/test_compiler_nested_frame_array.sh"
     "nested_class_fields:bash scripts/test_compiler_nested_class_fields.sh"
+    "string_global:bash scripts/test_compiler_string_global.sh"
     "stack_canary:bash scripts/test_compiler_stack_canary.sh"
 )
 
