@@ -126,3 +126,4 @@ build_adder_user hamwd                # Phase D: Hamnix Window Daemon (Layer 3 /
 build_adder_user p9srv_demo           # Phase D / V4: minimum-viable userspace 9P server (test fixture)
 build_adder_user dpkg_deb             # apt-path V0: extract data.tar.gz from a .deb to a target dir
 build_adder_user dpkg                 # apt-path V1: parse control + record installed package in dpkg DB
+build_adder_user apt                  # apt-path V0: fetch + decompress + parse a Debian repo index over HTTP

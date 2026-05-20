@@ -270,6 +270,37 @@ sys_socketpair:
     .size sys_socketpair, .-sys_socketpair
 
 
+    /* --- sys_socket(domain, type, protocol) -> int32 ----------------
+     * U-socket: native-ABI entry point to the same socket(2) bridge
+     * the Linux ABI exposes at number 41. A native Adder user binary
+     * (built with this runtime.S) reaches the in-kernel TCP stack via
+     * SYS_SOCKET (41) -> _u_socket in arch/x86/kernel/syscall.ad. V0
+     * supports AF_INET + SOCK_STREAM only. SysV first three arg regs
+     * (%rdi/%rsi/%rdx) align with the syscall ABI's a0/a1/a2 — no
+     * shuffle needed. */
+    .globl sys_socket
+    .type sys_socket, @function
+sys_socket:
+    movq    $41, %rax               /* SYS_SOCKET */
+    syscall
+    ret
+    .size sys_socket, .-sys_socket
+
+
+    /* --- sys_connect(fd, addr, addrlen) -> int32 --------------------
+     * U-socket: native-ABI connect(2). Drives a real TCP active open
+     * through drivers/net/tcp.ad via SYS_CONNECT (42) -> _u_connect.
+     * `addr` points at a 16-byte struct sockaddr_in. Three args fit
+     * the SysV/syscall-ABI overlap directly. */
+    .globl sys_connect
+    .type sys_connect, @function
+sys_connect:
+    movq    $42, %rax               /* SYS_CONNECT */
+    syscall
+    ret
+    .size sys_connect, .-sys_connect
+
+
     /* --- sys_kill(pid, sig) -> int32 ---------------------------------
      * Post `sig` into pid's pending-signal bitmap. Default
      * disposition for every signal is TERM with exit code 128+sig

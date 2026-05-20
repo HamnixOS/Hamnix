@@ -1,0 +1,771 @@
+# user/apt.ad
+#
+# Hamnix V0 of the `apt`/`apt-get`/`apt-cache` package-index tool — the
+# first userland binary to fetch and parse a Debian repository index
+# over the network. It is the apt-path piece that follows dpkg_deb
+# (.deb unpack) and dpkg (local DB record/query): where those operate
+# on a .deb already on disk, `apt` reaches OUT to a Debian mirror,
+# pulls the repo index, decompresses it and answers queries against it.
+#
+#   apt update <base-url> <suite>   fetch + decompress + store the index
+#   apt show <pkg>                  print one package's stanza
+#   apt pkgnames                    print every package name
+#
+# (Modern Debian unifies apt-get + apt-cache into a single `apt`
+# front-end; this binary follows that — `apt update` is `apt-get
+# update`, `apt show`/`apt pkgnames` are `apt-cache show`/`apt-cache
+# pkgnames`. The Hamnix build maps user/apt.ad -> /bin/apt; argv[1]
+# selects the sub-command.)
+#
+# -- apt update <base-url> <suite> -------------------------------------
+#
+#   1. Parse <base-url> into host + port + path. V0 accepts plain
+#      `http://host[:port][/path]` only — no HTTPS (that needs the TLS
+#      stack; V1), no userinfo, no query string. Default port 80.
+#   2. Open an AF_INET SOCK_STREAM socket, connect to host:port, and
+#      issue a raw HTTP/1.0 GET for
+#          <path>/dists/<suite>/Release
+#      HTTP/1.0 + `Connection: close` so the server FINs after the body
+#      — a clean read() EOF without Content-Length parsing. Read the
+#      whole response, then strip the HTTP headers (everything up to
+#      and including the first CRLFCRLF).
+#   3. Same fetch for
+#          <path>/dists/<suite>/main/binary-amd64/Packages.gz
+#      The body is a single gzip member; inflate it via lib/zlib/
+#      inflate.ad into the decompressed `Packages` index.
+#   4. `mkdir /tmp/apt` (tmpfs grew real nested directories — commit
+#      dcf30f3) and write the decompressed index to /tmp/apt/Packages.
+#   5. Print `apt-get: fetched index, N packages` where N counts the
+#      blank-line-separated RFC822 stanzas.
+#
+# -- apt show <pkg> / apt pkgnames -------------------------------------
+#
+# Both read /tmp/apt/Packages (written by `apt update`) and treat it as
+# a run of RFC822 stanzas — the same wire format dpkg.ad's status DB
+# uses, parsed with the same field-matching approach. `show` prints the
+# stanza whose `Package:` value equals <pkg> (stderr + non-zero exit if
+# absent); `pkgnames` prints every `Package:` value, one per line.
+#
+# -- BUFFER CAPS (documented per spec) ---------------------------------
+#
+# The HTTP response and the inflated Packages index can be large. A
+# real Debian `main/binary-amd64/Packages` is tens of MB; that does NOT
+# fit here and is a V1 concern (streaming inflate straight to a file).
+# V0 budgets generously for a *test-fixture-sized* repo:
+#
+#   HTTP_CAP   = 262144  (256 KiB)  raw HTTP response (headers + body)
+#   PKG_CAP    = 262144  (256 KiB)  decompressed Packages index
+#
+# A response or an inflated index that exceeds its cap is a hard error
+# with a diagnostic — V0 will not silently truncate. The test fixture
+# (2-3 stanzas, a few KiB) sits far inside both caps. Buffers live in
+# top-level BSS arenas (the U9 nested-frame-Array compiler quirk:
+# large Arrays must never be parked in a nested frame).
+#
+# NOT in V0 (V1 backlog): downloading/installing .debs, dependency
+# resolution, signature/InRelease verification, the canonical
+# /var/lib/apt/lists/ paths, HTTPS, chunked transfer-encoding,
+# redirects, multi-arch.
+#
+# Build: scripts/build_user.sh -> build/user/apt.elf -> /bin/apt.
+# Test:  scripts/test_apt_get.sh.
+
+from lib.zlib.inflate import (
+    InflateState,
+    inflate_init,
+    inflate_feed,
+)
+
+# Native-ABI syscalls. socket()/connect() are the U-socket bridge
+# (runtime.S numbers 41/42 -> _u_socket/_u_connect); read/write/close
+# on a socket fd already route through the in-kernel TCP stack via the
+# FD_SOCKET_MARK arms in fs/vfs.ad.
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_mkdir(path: Ptr[char]) -> int32
+extern def sys_socket(domain: int32, sock_type: int32, proto: int32) -> int32
+extern def sys_connect(fd: int32, addr: Ptr[uint8], addrlen: uint64) -> int32
+
+
+# -- bounded BSS arenas (Hamnix idiom: never park large Arrays in a
+#    nested frame — memory/feedback_compiler_quirks.md U9) -------------
+
+HTTP_CAP: uint64 = 262144      # 256 KiB raw HTTP response (hdr + body)
+PKG_CAP:  uint64 = 262144      # 256 KiB decompressed Packages index
+
+http_buf: Array[262144, uint8]   # raw bytes off the socket
+pkg_buf:  Array[262144, uint8]   # inflated Packages index
+
+# Streaming gzip inflater state (~40 KiB).
+inf_state: InflateState
+
+# Scratch: the HTTP request line/headers we send.
+req_buf:  Array[1024, uint8]
+
+# Scratch: the parsed-out connection target.
+host_buf: Array[256, uint8]      # NUL-terminated hostname / dotted-quad
+path_buf: Array[512, uint8]      # NUL-terminated base path (no trailing /)
+
+# Scratch: the absolute repo path for one GET (path + dists/... ).
+url_path_buf: Array[768, uint8]
+
+# struct sockaddr_in, 16 bytes (built fresh for each connect).
+sa_buf: Array[16, uint8]
+
+
+# -- tiny stdio helpers (mirrors dpkg.ad / cat.ad) ---------------------
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+def write_dec_u64(fd: int32, value: uint64):
+    if value == 0:
+        sys_write(fd, "0", 1)
+        return
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    v: uint64 = value
+    while v != 0:
+        digits[n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    out: Array[24, uint8]
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    sys_write(fd, &out[0], i)
+
+
+def _write_full(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
+    written: uint64 = 0
+    while written < count:
+        room: uint64 = count - written
+        ptr: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](buf) + written)
+        rc: int64 = sys_write(fd, ptr, room)
+        if rc < 0:
+            return rc
+        if rc == 0:
+            return cast[int64](written)
+        written = written + cast[uint64](rc)
+    return cast[int64](written)
+
+
+# -- URL parsing -------------------------------------------------------
+#
+# V0 accepts only `http://host[:port][/path]`. Splits the URL into
+# host_buf (NUL-terminated), path_buf (NUL-terminated, no trailing
+# slash, "" for a bare host) and returns the port (default 80), or -1
+# on a malformed URL. No HTTPS, no userinfo, no query string.
+
+def _parse_url(url: Ptr[uint8]) -> int64:
+    # Require the "http://" scheme prefix (7 chars).
+    scheme: Ptr[uint8] = "http://"
+    i: uint64 = 0
+    while i < 7:
+        if url[i] != scheme[i]:
+            write_str(2, "apt-get: only http:// URLs supported in V0 (HTTPS is V1)\n")
+            return -1
+        i = i + 1
+
+    # Authority spans from index 7 up to the first '/' or the NUL.
+    a: uint64 = 7
+    auth_end: uint64 = a
+    while url[auth_end] != 0 and url[auth_end] != 47:   # '/'
+        auth_end = auth_end + 1
+
+    # Within the authority, ':' (if present) splits host from port.
+    colon: uint64 = a
+    have_colon: int32 = 0
+    j: uint64 = a
+    while j < auth_end:
+        if url[j] == 58:                                # ':'
+            colon = j
+            have_colon = 1
+            break
+        j = j + 1
+
+    host_end: uint64 = auth_end
+    if have_colon != 0:
+        host_end = colon
+    if host_end <= a:
+        write_str(2, "apt-get: malformed URL (empty host)\n")
+        return -1
+
+    # Copy the host.
+    ho: uint64 = 0
+    k: uint64 = a
+    while k < host_end and ho + 1 < 256:
+        host_buf[ho] = url[k]
+        ho = ho + 1
+        k = k + 1
+    host_buf[ho] = 0
+
+    # Parse the port (decimal) if a ':' was present, else default 80.
+    port: int64 = 80
+    if have_colon != 0:
+        port = 0
+        p: uint64 = colon + 1
+        if p >= auth_end:
+            write_str(2, "apt-get: malformed URL (empty port)\n")
+            return -1
+        while p < auth_end:
+            c: uint8 = url[p]
+            if c < 48 or c > 57:
+                write_str(2, "apt-get: malformed URL (non-numeric port)\n")
+                return -1
+            port = port * 10 + cast[int64](c - 48)
+            if port > 65535:
+                write_str(2, "apt-get: malformed URL (port out of range)\n")
+                return -1
+            p = p + 1
+
+    # Copy the path = everything from auth_end onward, with any single
+    # trailing '/' trimmed so later joins produce "<path>/dists/..."
+    # not "<path>//dists/...". A bare host yields the empty path.
+    po: uint64 = 0
+    m: uint64 = auth_end
+    while url[m] != 0 and po + 1 < 512:
+        path_buf[po] = url[m]
+        po = po + 1
+        m = m + 1
+    while po > 0 and path_buf[po - 1] == 47:            # trim trailing '/'
+        po = po - 1
+    path_buf[po] = 0
+
+    return port
+
+
+# -- IPv4 dotted-quad parsing ------------------------------------------
+#
+# V0 connects by IPv4 literal only (no DNS resolver in the userland
+# socket path yet — the test reaches the host at the SLIRP alias
+# 10.0.2.2). Parses host_buf "A.B.C.D" into the four octets written
+# through out0..out3. Returns 0 on success, -1 if host_buf is not a
+# dotted-quad.
+
+def _parse_ipv4(out0: Ptr[uint8], out1: Ptr[uint8],
+                out2: Ptr[uint8], out3: Ptr[uint8]) -> int32:
+    octet: uint32 = 0
+    have_digit: int32 = 0
+    idx: uint32 = 0                                     # which octet (0..3)
+    i: uint64 = 0
+    while True:
+        c: uint8 = host_buf[i]
+        if c == 46 or c == 0:                           # '.' or NUL
+            if have_digit == 0:
+                write_str(2, "apt-get: host must be an IPv4 literal in V0 (no DNS yet)\n")
+                return -1
+            if octet > 255:
+                write_str(2, "apt-get: IPv4 octet out of range\n")
+                return -1
+            if idx == 0:
+                out0[0] = cast[uint8](octet)
+            elif idx == 1:
+                out1[0] = cast[uint8](octet)
+            elif idx == 2:
+                out2[0] = cast[uint8](octet)
+            else:
+                out3[0] = cast[uint8](octet)
+            if c == 0:
+                if idx != 3:
+                    write_str(2, "apt-get: host must be an IPv4 literal in V0 (no DNS yet)\n")
+                    return -1
+                return 0
+            idx = idx + 1
+            if idx > 3:
+                write_str(2, "apt-get: host must be an IPv4 literal in V0 (no DNS yet)\n")
+                return -1
+            octet = 0
+            have_digit = 0
+        elif c >= 48 and c <= 57:
+            octet = octet * 10 + cast[uint32](c - 48)
+            have_digit = 1
+        else:
+            write_str(2, "apt-get: host must be an IPv4 literal in V0 (no DNS yet)\n")
+            return -1
+        i = i + 1
+
+
+# -- HTTP GET ----------------------------------------------------------
+#
+# Connect to host:port, issue a raw HTTP/1.0 GET for `url_path` (a
+# NUL-terminated absolute path beginning with '/'), drain the whole
+# response into http_buf, and return the byte offset where the body
+# starts (just past the first CRLFCRLF) packed with the total length.
+#
+# Returns the BODY length, writes the body start offset through
+# *body_off. Returns -1 on any socket / HTTP error.
+
+def _http_get(port: int64, body_off: Ptr[uint64]) -> int64:
+    # Resolve the dotted-quad host into the sockaddr_in octets.
+    ip0: uint8 = 0
+    ip1: uint8 = 0
+    ip2: uint8 = 0
+    ip3: uint8 = 0
+    if _parse_ipv4(&ip0, &ip1, &ip2, &ip3) != 0:
+        return -1
+
+    # struct sockaddr_in: family(2, host order) port(2, BE) addr(4, BE)
+    # zero(8). AF_INET == 2.
+    k: uint64 = 0
+    while k < 16:
+        sa_buf[k] = 0
+        k = k + 1
+    sa_buf[0] = 2                                       # AF_INET low
+    sa_buf[1] = 0                                       # AF_INET high
+    sa_buf[2] = cast[uint8]((cast[uint64](port) >> 8) & 0xFF)   # port hi
+    sa_buf[3] = cast[uint8](cast[uint64](port) & 0xFF)         # port lo
+    sa_buf[4] = ip0
+    sa_buf[5] = ip1
+    sa_buf[6] = ip2
+    sa_buf[7] = ip3
+
+    # AF_INET == 2, SOCK_STREAM == 1, protocol 0 (= TCP).
+    fd: int32 = sys_socket(2, 1, 0)
+    if fd < 0:
+        write_str(2, "apt-get: socket() failed\n")
+        return -1
+
+    crc: int32 = sys_connect(fd, &sa_buf[0], 16)
+    if crc != 0:
+        write_str(2, "apt-get: connect() failed (is the mirror reachable?)\n")
+        sys_close(fd)
+        return -1
+
+    # Build the request: HTTP/1.0 + Connection: close so the server
+    # FINs after the body — read() then returns a clean 0 EOF without
+    # us having to parse Content-Length. The string literals are
+    # materialised inline (the x86_64 backend rejects string-literal
+    # globals).
+    ro: uint64 = 0
+    g: Ptr[uint8] = "GET "
+    gi: uint64 = 0
+    while g[gi] != 0:
+        req_buf[ro] = g[gi]
+        ro = ro + 1
+        gi = gi + 1
+    pi: uint64 = 0
+    while url_path_buf[pi] != 0 and ro < 1000:
+        req_buf[ro] = url_path_buf[pi]
+        ro = ro + 1
+        pi = pi + 1
+    tail1: Ptr[uint8] = " HTTP/1.0\r\nHost: "
+    ti: uint64 = 0
+    while tail1[ti] != 0:
+        req_buf[ro] = tail1[ti]
+        ro = ro + 1
+        ti = ti + 1
+    hi: uint64 = 0
+    while host_buf[hi] != 0 and ro < 1000:
+        req_buf[ro] = host_buf[hi]
+        ro = ro + 1
+        hi = hi + 1
+    tail2: Ptr[uint8] = "\r\nUser-Agent: hamnix-apt/0\r\nConnection: close\r\n\r\n"
+    si: uint64 = 0
+    while tail2[si] != 0:
+        req_buf[ro] = tail2[si]
+        ro = ro + 1
+        si = si + 1
+
+    wn: int64 = _write_full(fd, &req_buf[0], ro)
+    if wn < 0 or cast[uint64](wn) != ro:
+        write_str(2, "apt-get: short write sending HTTP request\n")
+        sys_close(fd)
+        return -1
+
+    # Drain the response into http_buf. read() returns 0 at peer FIN.
+    total: uint64 = 0
+    while total < HTTP_CAP:
+        room: uint64 = HTTP_CAP - total
+        ptr: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](&http_buf[0]) + total)
+        n: int64 = sys_read(fd, ptr, room)
+        if n < 0:
+            write_str(2, "apt-get: read() error on HTTP response\n")
+            sys_close(fd)
+            return -1
+        if n == 0:
+            break
+        total = total + cast[uint64](n)
+    sys_close(fd)
+
+    if total == 0:
+        write_str(2, "apt-get: empty HTTP response\n")
+        return -1
+    if total >= HTTP_CAP:
+        write_str(2, "apt-get: HTTP response exceeds 256 KiB cap (V0 limit)\n")
+        return -1
+
+    # The status line must be "HTTP/1.x 200 ...". Anything else (404,
+    # 301, 500, ...) is a hard error — V0 does not follow redirects.
+    if total < 12:
+        write_str(2, "apt-get: truncated HTTP status line\n")
+        return -1
+    if http_buf[0] != 72 or http_buf[1] != 84 or http_buf[2] != 84 \
+            or http_buf[3] != 80:                       # "HTTP"
+        write_str(2, "apt-get: malformed HTTP status line\n")
+        return -1
+    # Status code occupies bytes 9..11 ("HTTP/1.0 NNN ...").
+    if http_buf[9] != 50 or http_buf[10] != 48 or http_buf[11] != 48:  # "200"
+        write_str(2, "apt-get: HTTP request did not return 200 OK\n")
+        return -1
+
+    # Find the header/body boundary: the first CRLFCRLF.
+    bo: uint64 = 0
+    found: int32 = 0
+    p: uint64 = 0
+    while p + 3 < total:
+        if http_buf[p] == 13 and http_buf[p + 1] == 10 \
+                and http_buf[p + 2] == 13 and http_buf[p + 3] == 10:
+            bo = p + 4
+            found = 1
+            break
+        p = p + 1
+    if found == 0:
+        write_str(2, "apt-get: HTTP response has no header terminator\n")
+        return -1
+
+    body_off[0] = bo
+    return cast[int64](total - bo)
+
+
+# -- compose "<base-path>/dists/<suite>/<tail>" into url_path_buf ------
+#
+# `tail` is the suffix below the suite directory (e.g. "Release" or
+# "main/binary-amd64/Packages.gz"). The base path may be empty (a bare
+# host); the result always begins with a single '/'.
+
+def _build_index_path(suite: Ptr[uint8], tail: Ptr[uint8]):
+    o: uint64 = 0
+    # Base path (already trimmed of a trailing '/'). If empty we still
+    # want the result to start with '/', which the literal below adds.
+    bi: uint64 = 0
+    while path_buf[bi] != 0 and o + 1 < 768:
+        url_path_buf[o] = path_buf[bi]
+        o = o + 1
+        bi = bi + 1
+    mid: Ptr[uint8] = "/dists/"
+    mi: uint64 = 0
+    while mid[mi] != 0 and o + 1 < 768:
+        url_path_buf[o] = mid[mi]
+        o = o + 1
+        mi = mi + 1
+    si: uint64 = 0
+    while suite[si] != 0 and o + 1 < 768:
+        url_path_buf[o] = suite[si]
+        o = o + 1
+        si = si + 1
+    url_path_buf[o] = 47                                # '/'
+    o = o + 1
+    ti: uint64 = 0
+    while tail[ti] != 0 and o + 1 < 768:
+        url_path_buf[o] = tail[ti]
+        o = o + 1
+        ti = ti + 1
+    url_path_buf[o] = 0
+
+
+# -- count RFC822 stanzas in pkg_buf[0, len) ---------------------------
+#
+# A Packages index is blank-line-separated stanzas. We count a stanza
+# for every run of non-blank lines: a transition from "inside blank
+# region" to "inside a stanza". Trailing blank lines don't add a count.
+
+def _count_stanzas(plen: uint64) -> uint64:
+    count: uint64 = 0
+    in_stanza: int32 = 0
+    pos: uint64 = 0
+    while pos < plen:
+        lstart: uint64 = pos
+        lend: uint64 = pos
+        while lend < plen and pkg_buf[lend] != 10:
+            lend = lend + 1
+        # Trim a trailing '\r' so CRLF indexes count cleanly.
+        tend: uint64 = lend
+        if tend > lstart and pkg_buf[tend - 1] == 13:
+            tend = tend - 1
+        if tend == lstart:
+            in_stanza = 0                               # blank line
+        else:
+            if in_stanza == 0:
+                count = count + 1
+                in_stanza = 1
+        pos = lend
+        if pos < plen:
+            pos = pos + 1
+    return count
+
+
+# -- apt update --------------------------------------------------------
+
+def _do_update(base_url: Ptr[uint8], suite: Ptr[uint8]) -> int32:
+    port: int64 = _parse_url(base_url)
+    if port < 0:
+        return 1
+
+    # 1. Fetch the Release file. V0 fetches it mainly to confirm the
+    #    suite exists and the mirror is well-formed; the index hashes
+    #    inside are not yet verified (that is V1's InRelease check).
+    _build_index_path(suite, cast[Ptr[uint8]]("Release"))
+    rel_body_off: uint64 = 0
+    rel_len: int64 = _http_get(port, &rel_body_off)
+    if rel_len < 0:
+        write_str(2, "apt-get: failed to fetch Release\n")
+        return 1
+    write_str(1, "apt-get: fetched Release (")
+    write_dec_u64(1, cast[uint64](rel_len))
+    write_str(1, " bytes)\n")
+
+    # 2. Fetch Packages.gz.
+    _build_index_path(suite,
+                      cast[Ptr[uint8]]("main/binary-amd64/Packages.gz"))
+    gz_body_off: uint64 = 0
+    gz_len: int64 = _http_get(port, &gz_body_off)
+    if gz_len < 0:
+        write_str(2, "apt-get: failed to fetch Packages.gz\n")
+        return 1
+    if gz_len == 0:
+        write_str(2, "apt-get: Packages.gz body is empty\n")
+        return 1
+
+    # 3. Inflate the gzip body into pkg_buf.
+    inflate_init(&inf_state)
+    out_consumed: uint64 = 0
+    in_consumed: uint64 = 0
+    done: int32 = 0
+    irc: int32 = inflate_feed(&inf_state,
+                              &http_buf[gz_body_off], cast[uint64](gz_len),
+                              &pkg_buf[0], PKG_CAP,
+                              &out_consumed, &in_consumed, &done)
+    if irc < 0:
+        write_str(2, "apt-get: Packages.gz inflate failed (corrupt or exceeds 256 KiB cap)\n")
+        return 1
+    if done == 0:
+        write_str(2, "apt-get: Packages.gz inflate did not reach end-of-stream\n")
+        return 1
+    pkg_len: uint64 = out_consumed
+
+    # 4. mkdir /tmp/apt (tmpfs grew real nested directories — dcf30f3)
+    #    and store the decompressed index. mkdir of an existing dir is
+    #    harmless here; we don't fail the run if it returns non-zero.
+    sys_mkdir(cast[Ptr[char]]("/tmp/apt"))
+    wfd: int32 = sys_open_write(cast[Ptr[char]]("/tmp/apt/Packages"))
+    if wfd < 0:
+        write_str(2, "apt-get: cannot open /tmp/apt/Packages for write\n")
+        return 1
+    wn: int64 = _write_full(wfd, &pkg_buf[0], pkg_len)
+    sys_close(wfd)
+    if wn < 0 or cast[uint64](wn) != pkg_len:
+        write_str(2, "apt-get: short write storing Packages index\n")
+        return 1
+
+    # 5. Summary.
+    nstanzas: uint64 = _count_stanzas(pkg_len)
+    write_str(1, "apt-get: fetched index, ")
+    write_dec_u64(1, nstanzas)
+    write_str(1, " packages\n")
+    return 0
+
+
+# -- Packages-index queries (show / pkgnames) --------------------------
+#
+# Both readers slurp /tmp/apt/Packages into pkg_buf and walk it as a
+# run of RFC822 stanzas (same wire format dpkg.ad parses).
+
+def _read_index() -> int64:
+    fd: int32 = sys_open(cast[Ptr[char]]("/tmp/apt/Packages"))
+    if fd < 0:
+        write_str(2, "apt-cache: no package index — run `apt update` first\n")
+        return -1
+    total: uint64 = 0
+    while total < PKG_CAP:
+        room: uint64 = PKG_CAP - total
+        ptr: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](&pkg_buf[0]) + total)
+        n: int64 = sys_read(fd, ptr, room)
+        if n <= 0:
+            break
+        total = total + cast[uint64](n)
+    sys_close(fd)
+    return cast[int64](total)
+
+
+# _line_is_package(lstart, lend): the line begins exactly with
+# "Package:" in column 0. Returns 1 if so, else 0.
+
+def _line_is_package(lstart: uint64, lend: uint64) -> int32:
+    name: Ptr[uint8] = "Package:"
+    if lstart + 8 > lend:
+        return 0
+    i: uint64 = 0
+    while i < 8:
+        if pkg_buf[lstart + i] != name[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+# apt show <pkg>: print the stanza whose Package: value equals <pkg>.
+# Returns 0 on success, 1 if the index is unreadable or the package is
+# absent.
+
+def _do_show(pkg: Ptr[uint8]) -> int32:
+    ilen_i: int64 = _read_index()
+    if ilen_i < 0:
+        return 1
+    ilen: uint64 = cast[uint64](ilen_i)
+    pkg_len: uint64 = strlen_u8(pkg)
+
+    pos: uint64 = 0
+    while pos < ilen:
+        lstart: uint64 = pos
+        lend: uint64 = pos
+        while lend < ilen and pkg_buf[lend] != 10:
+            lend = lend + 1
+        if _line_is_package(lstart, lend) != 0:
+            # The stanza runs [sstart, send): from this Package: line
+            # to the next blank line (or end of buffer).
+            sstart: uint64 = lstart
+            send: uint64 = lstart
+            while send < ilen:
+                ls: uint64 = send
+                le: uint64 = send
+                while le < ilen and pkg_buf[le] != 10:
+                    le = le + 1
+                te: uint64 = le
+                if te > ls and pkg_buf[te - 1] == 13:
+                    te = te - 1
+                if te == ls:                            # blank line
+                    break
+                send = le
+                if send < ilen:
+                    send = send + 1
+
+            # The Package: value spans column 8 to end-of-line, with
+            # leading blanks trimmed.
+            v: uint64 = lstart + 8
+            vend: uint64 = lend
+            if vend > lstart and pkg_buf[vend - 1] == 13:
+                vend = vend - 1
+            while v < vend and (pkg_buf[v] == 32 or pkg_buf[v] == 9):
+                v = v + 1
+            # Compare the value to `pkg` exactly.
+            eq: int32 = 1
+            i: uint64 = 0
+            while i < pkg_len:
+                if v + i >= vend or pkg_buf[v + i] != pkg[i]:
+                    eq = 0
+                    break
+                i = i + 1
+            if eq != 0 and (v + pkg_len) != vend:
+                eq = 0
+            if eq != 0:
+                _write_full(1, &pkg_buf[sstart], send - sstart)
+                write_str(1, "\n")
+                return 0
+            pos = send
+        else:
+            pos = lend
+        if pos < ilen:
+            pos = pos + 1
+
+    write_str(2, "apt-cache: package '")
+    write_str(2, pkg)
+    write_str(2, "' not found in index\n")
+    return 1
+
+
+# apt pkgnames: print every Package: value, one per line. Returns 0 on
+# success, 1 if the index is unreadable.
+
+def _do_pkgnames() -> int32:
+    ilen_i: int64 = _read_index()
+    if ilen_i < 0:
+        return 1
+    ilen: uint64 = cast[uint64](ilen_i)
+
+    pos: uint64 = 0
+    while pos < ilen:
+        lstart: uint64 = pos
+        lend: uint64 = pos
+        while lend < ilen and pkg_buf[lend] != 10:
+            lend = lend + 1
+        if _line_is_package(lstart, lend) != 0:
+            v: uint64 = lstart + 8
+            vend: uint64 = lend
+            if vend > lstart and pkg_buf[vend - 1] == 13:
+                vend = vend - 1
+            while v < vend and (pkg_buf[v] == 32 or pkg_buf[v] == 9):
+                v = v + 1
+            if vend > v:
+                _write_full(1, &pkg_buf[v], vend - v)
+            write_str(1, "\n")
+        pos = lend
+        if pos < ilen:
+            pos = pos + 1
+    return 0
+
+
+# -- top-level driver --------------------------------------------------
+
+def _usage(progname: Ptr[uint8]) -> int32:
+    write_str(2, "Usage: ")
+    write_str(2, progname)
+    write_str(2, " update <base-url> <suite>\n")
+    write_str(2, "       ")
+    write_str(2, progname)
+    write_str(2, " show <package>\n")
+    write_str(2, "       ")
+    write_str(2, progname)
+    write_str(2, " pkgnames\n")
+    return 2
+
+
+def _streq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while True:
+        if a[i] != b[i]:
+            return 0
+        if a[i] == 0:
+            return 1
+        i = i + 1
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    progname: Ptr[uint8] = cast[Ptr[uint8]](argv[0])
+    if argc < 2:
+        return _usage(progname)
+    verb: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
+
+    # update <base-url> <suite>
+    if _streq(verb, cast[Ptr[uint8]]("update")) != 0:
+        if argc != 4:
+            return _usage(progname)
+        return _do_update(cast[Ptr[uint8]](argv[2]),
+                          cast[Ptr[uint8]](argv[3]))
+
+    # show <package>
+    if _streq(verb, cast[Ptr[uint8]]("show")) != 0:
+        if argc != 3:
+            return _usage(progname)
+        return _do_show(cast[Ptr[uint8]](argv[2]))
+
+    # pkgnames
+    if _streq(verb, cast[Ptr[uint8]]("pkgnames")) != 0:
+        if argc != 2:
+            return _usage(progname)
+        return _do_pkgnames()
+
+    write_str(2, "apt: unknown sub-command (supports: update, show, pkgnames)\n")
+    return _usage(progname)
