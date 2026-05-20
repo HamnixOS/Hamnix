@@ -22,6 +22,7 @@
 # contains all three banners.
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_qemu_drive.sh"
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -54,27 +55,14 @@ echo "[test_rfork] (5/5) Boot QEMU + drive the test via hamsh"
 LOG=$(mktemp)
 trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
 
+# Prompt-aware drive: wait for hamsh's ready banner before sending
+# input — the 16550 RX FIFO has no software buffer, so an early byte
+# is simply dropped (see _qemu_drive.sh).
 set +e
-(
-    # Let the kernel finish its smoke tests before hamsh starts
-    # SYS_READ'ing stdin. Same pacing as scripts/test_errstr.sh —
-    # the 16550 RX FIFO is 16 bytes and there's no software buffer
-    # so we hand-feed each line.
-    sleep 3
-    printf '/bin/test_rfork\n'
-    sleep 3
-    printf 'exit\n'
-    sleep 1
-) | timeout 20s qemu-system-x86_64 \
-    -kernel "$ELF" \
-    -smp 2 \
-    -nographic \
-    -no-reboot \
-    -m 256M \
-    -monitor none \
-    -serial stdio \
-    > "$LOG" 2>&1
-rc=$?
+qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 40 \
+    -- "/bin/test_rfork" 4 \
+       "exit" 1
+rc="$QEMU_DRIVE_RC"
 set -e
 
 echo "[test_rfork] --- captured output ---"

@@ -36,6 +36,7 @@
 # best-effort XFAIL diagnostic, never a fail criterion.
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_qemu_drive.sh"
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -71,33 +72,17 @@ echo "[test_u37_busybox_pipe3] (4/4) Boot QEMU + drive 3-stage pipeline"
 LOG=$(mktemp)
 trap 'rm -f "$LOG" tests/u-binary/busybox; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
 
+# Prompt-aware drive: wait for hamsh's ready banner, then feed the
+# pipeline commands with settle delays between them (see
+# _qemu_drive.sh — a fixed pre-sleep races boot-time variance).
 set +e
-(
-    sleep 3
-    # Sentinel BEFORE so we can grep cleanly even if the kernel banner
-    # echoes other "hello"-bearing lines.
-    printf 'busybox echo BEFORE_PIPE3\n'
-    sleep 2
-    # The U37 target: a real 3-process pipeline driven by hamsh.
-    printf 'busybox echo hello | busybox cat | busybox grep hello\n'
-    sleep 6
-    # Best-effort diagnostic: the sh-internal pipeline variant.
-    printf 'busybox sh -c "echo a | grep a"\n'
-    sleep 5
-    printf 'busybox echo AFTER_PIPE3\n'
-    sleep 2
-    printf 'exit\n'
-    sleep 1
-) | timeout 120s qemu-system-x86_64 \
-    -kernel "$ELF" \
-    -smp 2 \
-    -nographic \
-    -no-reboot \
-    -m 256M \
-    -monitor none \
-    -serial stdio \
-    > "$LOG" 2>&1
-rc=$?
+qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 120 \
+    -- "busybox echo BEFORE_PIPE3" 2 \
+       "busybox echo hello | busybox cat | busybox grep hello" 6 \
+       "busybox sh -c \"echo a | grep a\"" 5 \
+       "busybox echo AFTER_PIPE3" 2 \
+       "exit" 1
+rc="$QEMU_DRIVE_RC"
 set -e
 
 echo "[test_u37_busybox_pipe3] --- captured output (last 250 lines) ---"
@@ -117,8 +102,12 @@ fi
 
 # Required: the 3-stage hamsh pipeline produced 'hello'. Look for it
 # between the two sentinels so we don't match a stray banner line.
+# The serial console line-prefixes EVERY line (printk AND user write)
+# with a "[NNNNNN] " jiffy stamp (drivers/tty/serial/early_8250.ad's
+# _emit_line_prefix) — so the match must tolerate an optional leading
+# "[digits] " before the literal `hello`.
 LINES_BETWEEN=$(awk '/BEFORE_PIPE3/{flag=1;next} /AFTER_PIPE3/{flag=0} flag' "$LOG")
-if echo "$LINES_BETWEEN" | grep -E -q "^hello[[:space:]]*$"; then
+if echo "$LINES_BETWEEN" | grep -E -q "^(\[[0-9]+\] )?hello[[:space:]]*$"; then
     echo "[test_u37_busybox_pipe3] OK   pipe3: 'hello' printed by 3-stage pipeline"
 else
     echo "[test_u37_busybox_pipe3] FAIL pipe3: 'hello' not seen from"
