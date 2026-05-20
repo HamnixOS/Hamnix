@@ -24,6 +24,7 @@
 #     make -C tests/u-binary/src/musl_thread install
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_qemu_drive.sh"
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -59,23 +60,13 @@ echo "[test_u27_musl_thread] (4/4) Boot QEMU + run /bin/u_musl_thread via hamsh"
 LOG=$(mktemp)
 trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
 
+# Prompt-aware drive: wait for hamsh's ready banner before sending
+# input (a fixed sleep races boot-time variance — see _qemu_drive.sh).
 set +e
-(
-    sleep 3
-    printf 'u_musl_thread\n'
-    sleep 8
-    printf 'exit\n'
-    sleep 1
-) | timeout 40s qemu-system-x86_64 \
-    -kernel "$ELF" \
-    -smp 2 \
-    -nographic \
-    -no-reboot \
-    -m 256M \
-    -monitor none \
-    -serial stdio \
-    > "$LOG" 2>&1
-rc=$?
+qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 45 \
+    -- "u_musl_thread" 8 \
+       "exit" 1
+rc="$QEMU_DRIVE_RC"
 set -e
 
 echo "[test_u27_musl_thread] --- captured output ---"

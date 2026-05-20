@@ -21,6 +21,7 @@
 # notice so CI in environments without `as`/`ld` still passes.
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_qemu_drive.sh"
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -53,23 +54,13 @@ echo "[test_u7_mmap] (4/4) Boot QEMU + run /bin/u_mmap via hamsh"
 LOG=$(mktemp)
 trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
 
+# Prompt-aware drive: wait for hamsh's ready banner before sending
+# input (a fixed sleep races boot-time variance — see _qemu_drive.sh).
 set +e
-(
-    sleep 3
-    printf 'u_mmap\n'
-    sleep 3
-    printf 'exit\n'
-    sleep 1
-) | timeout 25s qemu-system-x86_64 \
-    -kernel "$ELF" \
-    -smp 2 \
-    -nographic \
-    -no-reboot \
-    -m 256M \
-    -monitor none \
-    -serial stdio \
-    > "$LOG" 2>&1
-rc=$?
+qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 35 \
+    -- "u_mmap" 3 \
+       "exit" 1
+rc="$QEMU_DRIVE_RC"
 set -e
 
 echo "[test_u7_mmap] --- captured output ---"
