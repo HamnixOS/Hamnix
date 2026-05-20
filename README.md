@@ -220,9 +220,11 @@ also `ovmf`.
 ```
 
 Compiles `init/main.ad` (plus imports), assembles + links into
-`build/hamnix-vmlinux.elf`, boots via QEMU `-kernel` multiboot1. Serial
-shows the boot banner, memblock smoke, per-CPU id, PIT timer ticks, the
-init task, and the hamsh prompt.
+`build/hamnix-vmlinux.elf` — an `elf64-x86-64` kernel relocated to the
+higher half (`0xffffffff80000000`). QEMU's multiboot1 `-kernel` loader
+can't load a 64-bit ELF, so the harness boots it via a BIOS-GRUB ISO
+(`scripts/_kernel_iso.sh`). Serial shows the boot banner, memblock
+smoke, per-CPU id, PIT timer ticks, the init task, and the hamsh prompt.
 
 ### Build + boot the hybrid ISO
 
@@ -382,7 +384,7 @@ memory/          Orchestrator session memory (not in repo)
   reference + migration table.
 - [`docs/9p.md`](docs/9p.md) — 9P2000 wire spec.
 - [`docs/rio.md`](docs/rio.md) — file-based window system spec
-  (Plan 9 rio shape). Supersedes the older `docs/vtnext-v2.md`.
+  (Plan 9 rio shape).
 - [`docs/BOOT.md`](docs/BOOT.md) — building + booting the ISO,
   real-hardware notes.
 - [`docs/REAL_HARDWARE.md`](docs/REAL_HARDWARE.md) — how to test on

@@ -53,8 +53,8 @@ are fair game for any contributor — human or AI agent.
   mapping every existing `SYS_*` to its new home.
 - [`docs/rio.md`](docs/rio.md) — file-based window-system spec (Plan 9
   rio shape; per-window namespaces, `/dev/draw`, `/dev/mouse`).
-  Supersedes the retired `docs/vtnext-v2.md`. Implementation gated on
-  the open design questions in `memory/project_rio_open_questions.md`.
+  Implementation gated on the open design questions in
+  `memory/project_rio_open_questions.md`.
 - [`README.md`](README.md) — current implementation snapshot:
   shipped milestones (M16.x bare-metal kernel, L-track .ko's,
   U-track Linux ELFs), commit references, working agreements.
@@ -287,10 +287,9 @@ is wired. Open follow-ups:
 
 The Phase D hamwd skeleton (`user/hamwd.ad`) shipped — a userland
 daemon with a 16-slot window registry that emits framed wire packets.
-**Note:** the wire protocol design has since moved to the Plan 9 rio
-shape (`docs/rio.md`); the older VTNext-v2 design is retired. rio
-implementation is gated on the open design questions in
-`memory/project_rio_open_questions.md`. Open follow-ups:
+**Note:** the wire protocol follows the Plan 9 rio shape
+(`docs/rio.md`); rio implementation is gated on the open design
+questions in `memory/project_rio_open_questions.md`. Open follow-ups:
 
 - Real `/srv/hamwd` posting so clients can `open("/srv/hamwd")` and
   `mount` it — needs the 9P client inside `chan_resolve_prefix` to
@@ -302,20 +301,6 @@ implementation is gated on the open design questions in
 
 ## Kernel / L-track
 
-- **`syscall_64.S` `%rdi`-preservation ABI fix — PROPOSED, pending
-  maintainer review, NOT landed.** A fix to preserve `%rdi` across
-  the syscall entry stub exists on a worktree branch but is held: it
-  touches a fenced file (`arch/x86/kernel/syscall_64.S`). Symptom it
-  addresses: musl `open()` with `O_CLOEXEC` returns 0, which breaks
-  `busybox ls` directory enumeration. Do not mark done until it has
-  been reviewed and landed on `main`.
-- **Higher-half kernel** — the kernel image is identity-mapped low,
-  so `fs/elf.ad` must *refuse* any fixed-address ET_EXEC whose LOAD
-  range collides with it (`653d962`). Moving the kernel to the
-  canonical higher-half (`0xffffffff80000000`) would free the low
-  address space and let fixed-address ET_EXEC binaries (glibc
-  `-static` at 0x400000) load. Until then only ET_DYN static-PIE
-  Linux binaries run.
 - `MAX_EXPORTS=512` ceiling — bump again when we cross ~450 used.
 - nf_conntrack core (~155 UND) — blocking conntrack helpers.
 - `8021q.ko` (~118 UND, VLAN).
