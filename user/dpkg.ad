@@ -1,0 +1,853 @@
+# user/dpkg.ad
+#
+# Hamnix V1 of the `dpkg` package-database front-end — the next
+# apt-path piece after `dpkg-deb` (user/dpkg_deb.ad). Where dpkg_deb
+# unpacks a `.deb`'s tar members, `dpkg` *records* an installed
+# package in the dpkg database.
+#
+#   dpkg -i <file.deb>
+#       1. Slurp the .deb into RAM, walk the `ar` table-of-contents,
+#          locate control.tar.gz and data.tar.gz (reusing the proven
+#          dpkg_deb ar-walk + gzip-inflate + ustar-parse code paths).
+#       2. Inflate control.tar.gz, find the `./control` member, and
+#          parse its RFC822-style fields: Package, Version,
+#          Architecture, Maintainer, Description. Multi-line
+#          Description continuation lines (lines that begin with a
+#          space) are folded into the Description value.
+#       3. Append a Debian-format status stanza to the dpkg status
+#          database (see DB path note below).
+#       4. Inflate data.tar.gz, walk its ustar headers, and write the
+#          installed-file manifest (one path per line) to the
+#          per-package `<package>.list` file — what `dpkg -L` reads.
+#       5. Print: `dpkg: registered <package> <version> (<N> files)`.
+#
+# -- DATABASE PATH (Hamnix tmpfs limitation, documented per spec) ----
+#
+# Real dpkg writes /var/lib/dpkg/status and /var/lib/dpkg/info/*.list.
+# Hamnix's writable filesystem at this milestone is tmpfs (fs/tmpfs.ad):
+# a FLAT namespace — no directories — keyed by an absolute path that
+# must (a) start with "/tmp/" and (b) fit in TMPFS_NAME_LEN = 32 bytes
+# including the NUL. The cpio initramfs that backs `/` and `/var` is
+# read-only. So `/var/lib/dpkg/` simply cannot be created here:
+#   * sys_mkdir is a no-op stub (flat tmpfs — see user/mkdir.ad);
+#   * open_write of `/var/lib/dpkg/status` falls through every writable
+#     backend in vfs_open_write and returns an error.
+#
+# V1 therefore writes the database to FLATTENED tmpfs names:
+#       status DB   ->  /tmp/dpkg-status
+#       file list   ->  /tmp/dpkg.<package>.list
+# The list-name budget is tight: TMPFS_NAME_LEN(32) - len("/tmp/")(5)
+# - 1 (NUL) = 26 chars for "dpkg.<package>.list". "dpkg." + ".list" is
+# 10 chars, leaving 16 chars for the package name. Longer package
+# names are truncated for the *list filename only* (the stanza in the
+# status DB always carries the full Package name).
+#
+# V2 FIX: when tmpfs grows real nested directories (or ext4 root grows
+# an mkdir path), switch DB_STATUS_PATH/the list path back to the
+# canonical /var/lib/dpkg/{status,info/<pkg>.list} and drop the
+# flatten/truncate logic. The stanza format + parsing stay identical.
+#
+# -- V1 SCOPE (NOT done — V2 backlog) --------------------------------
+#   * No dedup/replace: if a stanza for the same Package already exists
+#     in the status DB, V1 just APPENDS a new stanza. dpkg's real
+#     "update-or-insert" (find the existing stanza by Package, replace
+#     it in place) is V2.
+#   * No data.tar extraction to the live filesystem — that is
+#     `dpkg-deb -x` (user/dpkg_deb.ad), already shipped. `dpkg -i` here
+#     records metadata only.
+#   * No dependency resolution (Depends/Pre-Depends/Conflicts).
+#   * No maintainer scripts (preinst/postinst/prerm/postrm).
+#   * No conffiles handling, no triggers, no `dpkg --remove`/`-r`.
+#   * No `dpkg -L`/`-l`/`-s` query sub-commands (the data they read —
+#     the .list file and the status stanza — IS written, so V2 can add
+#     the readers cheaply).
+#   * Compression: gzip only (same as dpkg_deb V0); .xz/.zst error out.
+#
+# Build: scripts/build_user.sh auto-discovers via build_adder_user dpkg.
+# Test:  scripts/test_dpkg_db.sh.
+
+from lib.zlib.inflate import (
+    InflateState,
+    inflate_init,
+    inflate_feed,
+)
+
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+
+
+# -- bounded BSS buffers (Hamnix idiom: never park large Arrays in a
+#    nested frame — memory/feedback_compiler_quirks.md U9) -------------
+
+DEB_CAP:  uint64 = 262144      # 256 KiB raw .deb image cap
+TAR_CAP:  uint64 = 524288      # 512 KiB inflated-tar cap
+
+deb_buf: Array[262144, uint8]
+tar_buf: Array[524288, uint8]
+
+# Inflater state (~40 KiB).
+inf_state: InflateState
+
+# Scratch path-join / name-compose buffer.
+path_buf: Array[512, uint8]
+
+# Scratch NUL-terminated tar entry name.
+warn_buf: Array[128, uint8]
+
+# Parsed control-field values. RFC822 control fields are short; a
+# Description with several continuation lines is the longest. 2 KiB
+# each is comfortable headroom for a V1 fixture-sized package.
+fld_package:  Array[256, uint8]
+fld_version:  Array[256, uint8]
+fld_arch:     Array[256, uint8]
+fld_maint:    Array[512, uint8]
+fld_desc:     Array[2048, uint8]
+
+# The Debian stanza we assemble before writing it to the status DB.
+stanza_buf: Array[4096, uint8]
+
+# Read-modify-write scratch for the append-to-status path: tmpfs has
+# no O_APPEND, so we read the current status file, then rewrite it
+# with the new stanza concatenated. Capped at TMPFS_FILE_CAP (4096).
+status_buf: Array[4096, uint8]
+
+# Composed file-list path ( /tmp/dpkg.<pkg>.list ) and the manifest
+# body ( one path per line ).
+list_path:  Array[64, uint8]
+list_buf:   Array[4096, uint8]
+
+
+# -- tiny stdio helpers (mirrors dpkg_deb.ad / cat.ad) -----------------
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+def write_dec_u64(fd: int32, value: uint64):
+    if value == 0:
+        sys_write(fd, "0", 1)
+        return
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    v: uint64 = value
+    while v != 0:
+        digits[n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    out: Array[24, uint8]
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    sys_write(fd, &out[0], i)
+
+
+# -- ar (System V variant) parser, lifted from dpkg_deb.ad -------------
+
+AR_HDR_SIZE: uint64 = 60
+
+
+def _ar_parse_size(hdr: Ptr[uint8]) -> int64:
+    n: int64 = 0
+    i: uint64 = 48
+    while i < 58:
+        c: uint8 = hdr[i]
+        if c == 32:
+            i = i + 1
+            continue
+        if c < 48 or c > 57:
+            return -1
+        n = n * 10 + cast[int64](c - 48)
+        i = i + 1
+    return n
+
+
+def _ar_member_name_starts_with(hdr: Ptr[uint8], want: Ptr[uint8],
+                                want_len: uint64) -> int32:
+    i: uint64 = 0
+    while i < want_len:
+        if i >= 16:
+            return 0
+        if hdr[i] != want[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+# _ar_find_tar_gz(stem, stem_len, deb_len, out_size) — returns the
+# byte offset of "<stem>.tar.gz"'s body inside deb_buf (+ its size via
+# out_size), -1 if no "<stem>.tar.<comp>" member exists, -2 if found
+# but with unsupported compression.
+
+def _ar_find_tar_gz(stem: Ptr[uint8], stem_len: uint64,
+                    deb_len: uint64, out_size: Ptr[uint64]) -> int64:
+    if deb_len < 8:
+        write_str(2, "dpkg: file too short for ar magic\n")
+        return -1
+    magic: Ptr[uint8] = "!<arch>\n"
+    i: uint64 = 0
+    while i < 8:
+        if deb_buf[i] != magic[i]:
+            write_str(2, "dpkg: not an ar archive (bad magic)\n")
+            return -1
+        i = i + 1
+
+    off: uint64 = 8
+    # Compose "<stem>.tar" into path_buf for the prefix match.
+    j: uint64 = 0
+    while j < stem_len:
+        path_buf[j] = stem[j]
+        j = j + 1
+    path_buf[j] = 46                                    # '.'
+    path_buf[j + 1] = 116                               # 't'
+    path_buf[j + 2] = 97                                # 'a'
+    path_buf[j + 3] = 114                               # 'r'
+    prefix_len: uint64 = stem_len + 4
+
+    while off + AR_HDR_SIZE <= deb_len:
+        hdr: Ptr[uint8] = &deb_buf[off]
+        if hdr[58] != 0x60 or hdr[59] != 0x0A:
+            write_str(2, "dpkg: ar header terminator missing\n")
+            return -1
+        sz: int64 = _ar_parse_size(hdr)
+        if sz < 0:
+            write_str(2, "dpkg: ar header size parse failure\n")
+            return -1
+        body: uint64 = off + AR_HDR_SIZE
+        body_sz: uint64 = cast[uint64](sz)
+        if body + body_sz > deb_len:
+            write_str(2, "dpkg: ar member overflows file\n")
+            return -1
+
+        if _ar_member_name_starts_with(hdr, &path_buf[0], prefix_len) != 0:
+            cN: uint8 = hdr[prefix_len]
+            if cN == 47:                                # '/'
+                write_str(2, "dpkg: uncompressed .tar not supported (V1 expects .tar.gz)\n")
+                return -1
+            if cN == 46:
+                ext0: uint8 = hdr[prefix_len + 1]
+                ext1: uint8 = hdr[prefix_len + 2]
+                ext2: uint8 = hdr[prefix_len + 3]
+                if ext0 == 103 and ext1 == 122 and ext2 == 47:   # gz/
+                    out_size[0] = body_sz
+                    return cast[int64](body)
+                if ext0 == 120 and ext1 == 122 and ext2 == 47:   # xz/
+                    write_str(2, "dpkg: unsupported compression: .xz; V1 supports .gz only\n")
+                    return -2
+                if ext0 == 122 and ext1 == 115 and ext2 == 116:  # zst
+                    write_str(2, "dpkg: unsupported compression: .zst; V1 supports .gz only\n")
+                    return -2
+                if ext0 == 98 and ext1 == 122 and ext2 == 50:    # bz2
+                    write_str(2, "dpkg: unsupported compression: .bz2; V1 supports .gz only\n")
+                    return -2
+                write_str(2, "dpkg: unknown .tar compression extension; V1 supports .gz only\n")
+                return -2
+
+        off = body + body_sz
+        if (body_sz % 2) != 0:
+            off = off + 1
+
+    write_str(2, "dpkg: no matching .tar.<comp> member found\n")
+    return -1
+
+
+# -- ustar tar walker, lifted from dpkg_deb.ad -------------------------
+
+def _tar_parse_octal(p: Ptr[uint8], maxlen: uint64) -> uint64:
+    n: uint64 = 0
+    i: uint64 = 0
+    while i < maxlen and p[i] == 32:
+        i = i + 1
+    while i < maxlen:
+        c: uint8 = p[i]
+        if c == 0 or c == 32:
+            break
+        if c < 48 or c > 55:
+            break
+        n = (n << 3) + cast[uint64](c - 48)
+        i = i + 1
+    return n
+
+
+def _tar_chksum_ok(hdr: Ptr[uint8]) -> int32:
+    stored: uint64 = _tar_parse_octal(&hdr[148], 8)
+    s: uint64 = 0
+    i: uint64 = 0
+    while i < 512:
+        if i >= 148 and i < 156:
+            s = s + 32
+        else:
+            s = s + cast[uint64](hdr[i])
+        i = i + 1
+    if s == stored:
+        return 1
+    return 0
+
+
+def _tar_header_is_zero(hdr: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while i < 512:
+        if hdr[i] != 0:
+            return 0
+        i = i + 1
+    return 1
+
+
+def _name_copy_nul(dst: Ptr[uint8], src: Ptr[uint8], maxlen: uint64) -> uint64:
+    i: uint64 = 0
+    while i < maxlen:
+        c: uint8 = src[i]
+        if c == 0:
+            break
+        dst[i] = c
+        i = i + 1
+    dst[i] = 0
+    return i
+
+
+# -- gzip inflate the named tar.gz body into tar_buf -------------------
+
+def _inflate_tar(in_ptr: Ptr[uint8], in_len: uint64) -> int64:
+    inflate_init(&inf_state)
+    out_consumed: uint64 = 0
+    in_consumed: uint64 = 0
+    done: int32 = 0
+    rc: int32 = inflate_feed(&inf_state, in_ptr, in_len,
+                             &tar_buf[0], TAR_CAP,
+                             &out_consumed, &in_consumed, &done)
+    if rc < 0:
+        write_str(2, "dpkg: gzip inflate failed (corrupt or truncated)\n")
+        return -1
+    if done == 0:
+        write_str(2, "dpkg: gzip inflate did not reach end-of-stream\n")
+        return -1
+    return cast[int64](out_consumed)
+
+
+def _slurp_file(path: Ptr[char], cap: uint64) -> int64:
+    fd: int32 = sys_open(path)
+    if fd < 0:
+        write_str(2, "dpkg: cannot open ")
+        write_str(2, cast[Ptr[uint8]](path))
+        write_str(2, "\n")
+        return -1
+    total: uint64 = 0
+    while total < cap:
+        room: uint64 = cap - total
+        ptr: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](&deb_buf[0]) + total)
+        n: int64 = sys_read(fd, ptr, room)
+        if n <= 0:
+            break
+        total = total + cast[uint64](n)
+    sys_close(fd)
+    if total == 0:
+        write_str(2, "dpkg: empty input\n")
+        return -1
+    if total >= cap:
+        write_str(2, "dpkg: .deb exceeds 256 KiB cap (V1 limit)\n")
+        return -1
+    return cast[int64](total)
+
+
+def _write_full(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
+    written: uint64 = 0
+    while written < count:
+        room: uint64 = count - written
+        ptr: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](buf) + written)
+        rc: int64 = sys_write(fd, ptr, room)
+        if rc < 0:
+            return rc
+        if rc == 0:
+            return cast[int64](written)
+        written = written + cast[uint64](rc)
+    return cast[int64](written)
+
+
+# -- locate the `control` member body inside the inflated control.tar -
+#
+# Returns the byte offset of the control file body within tar_buf and
+# writes its length to *out_len. Returns -1 on tar error, -3 if no
+# `control` member exists.
+
+def _find_control_body(tar_len: uint64, out_len: Ptr[uint64]) -> int64:
+    off: uint64 = 0
+    while off + 512 <= tar_len:
+        hdr: Ptr[uint8] = &tar_buf[off]
+        if _tar_header_is_zero(hdr) != 0:
+            break
+        if _tar_chksum_ok(hdr) == 0:
+            write_str(2, "dpkg: control tar header checksum mismatch at offset ")
+            write_dec_u64(2, off)
+            write_str(2, "\n")
+            return -1
+
+        size: uint64 = _tar_parse_octal(&hdr[124], 12)
+        typeflag: uint8 = hdr[156]
+        nlen: uint64 = _name_copy_nul(&warn_buf[0], &hdr[0], 100)
+        body_blocks: uint64 = (size + 511) / 512
+
+        if nlen == 0:
+            off = off + 512
+            off = off + body_blocks * 512
+            continue
+
+        # Strip a leading "./" so "./control" matches "control".
+        entry: Ptr[uint8] = &warn_buf[0]
+        if warn_buf[0] == 46 and warn_buf[1] == 47:     # "./"
+            entry = cast[Ptr[uint8]](cast[uint64](&warn_buf[0]) + 2)
+
+        # Match leaf name "control" exactly on a regular-file entry.
+        if (typeflag == 0 or typeflag == 48) and \
+           entry[0] == 99 and entry[1] == 111 and entry[2] == 110 and \
+           entry[3] == 116 and entry[4] == 114 and entry[5] == 111 and \
+           entry[6] == 108 and entry[7] == 0:
+            body_off: uint64 = off + 512
+            if body_off + size > tar_len:
+                write_str(2, "dpkg: control body overflows archive\n")
+                return -1
+            out_len[0] = size
+            return cast[int64](body_off)
+
+        off = off + 512
+        off = off + body_blocks * 512
+
+    write_str(2, "dpkg: control file not found in control.tar.gz\n")
+    return -3
+
+
+# -- RFC822 control-field parsing --------------------------------------
+#
+# A Debian `control` file is a single stanza of "Field: value" lines.
+# A line that begins with a space (or tab) is a CONTINUATION of the
+# previous field's value (used heavily by multi-line Description). We
+# parse the five fields V1 records into their fld_* BSS buffers.
+#
+# _field_name_matches(line, name, name_len): the line begins with
+# "<name>:" — case-sensitively, the canonical capitalisation.
+
+def _field_name_matches(line: Ptr[uint8], lstart: uint64, llen: uint64,
+                         name: Ptr[uint8], name_len: uint64) -> int32:
+    if name_len + 1 > llen:                             # need name + ':'
+        return 0
+    i: uint64 = 0
+    while i < name_len:
+        if line[lstart + i] != name[i]:
+            return 0
+        i = i + 1
+    if line[lstart + name_len] != 58:                   # ':'
+        return 0
+    return 1
+
+
+# _store_field: copy bytes [vstart, vend) of the control buffer into
+# `dst` (capacity `cap`, leaving room for a NUL). Leading spaces of the
+# value are trimmed. Returns the count written (excluding NUL).
+
+def _store_field(ctl: Ptr[uint8], vstart: uint64, vend: uint64,
+                 dst: Ptr[uint8], cap: uint64) -> uint64:
+    s: uint64 = vstart
+    while s < vend and (ctl[s] == 32 or ctl[s] == 9):
+        s = s + 1
+    o: uint64 = 0
+    i: uint64 = s
+    while i < vend and o + 1 < cap:
+        dst[o] = ctl[i]
+        o = o + 1
+        i = i + 1
+    dst[o] = 0
+    return o
+
+
+# _append_continuation: a Description (or other field) continuation
+# line. dpkg's wire format keeps continuation lines verbatim, each
+# prefixed by exactly one space, separated by '\n'. We append "\n" +
+# the raw line bytes (the leading space is already part of the line).
+
+def _append_continuation(dst: Ptr[uint8], dstlen: uint64, cap: uint64,
+                         ctl: Ptr[uint8], lstart: uint64,
+                         lend: uint64) -> uint64:
+    o: uint64 = dstlen
+    if o + 1 < cap:
+        dst[o] = 10                                     # '\n'
+        o = o + 1
+    i: uint64 = lstart
+    while i < lend and o + 1 < cap:
+        dst[o] = ctl[i]
+        o = o + 1
+        i = i + 1
+    dst[o] = 0
+    return o
+
+
+# Parse the whole control body. Returns 0 on success, -1 if the
+# mandatory Package field was absent. Unset optional fields are left
+# as the empty string.
+
+def _parse_control(ctl: Ptr[uint8], ctl_len: uint64) -> int32:
+    fld_package[0] = 0
+    fld_version[0] = 0
+    fld_arch[0] = 0
+    fld_maint[0] = 0
+    fld_desc[0] = 0
+    desc_len: uint64 = 0
+
+    # `cur` tracks which field a continuation line extends:
+    #   0 none / unrecognised, 1 Package, 2 Version, 3 Architecture,
+    #   4 Maintainer, 5 Description.
+    cur: int32 = 0
+
+    pos: uint64 = 0
+    while pos < ctl_len:
+        # Line spans [lstart, lend); skip the '\n' to advance.
+        lstart: uint64 = pos
+        lend: uint64 = pos
+        while lend < ctl_len and ctl[lend] != 10:
+            lend = lend + 1
+        # Trim a trailing '\r' so CRLF control files parse cleanly.
+        tend: uint64 = lend
+        if tend > lstart and ctl[tend - 1] == 13:
+            tend = tend - 1
+        llen: uint64 = tend - lstart
+
+        if llen == 0:
+            # Blank line ends the stanza (a control file is one
+            # stanza; bytes past it, if any, are ignored).
+            break
+
+        first: uint8 = ctl[lstart]
+        if first == 32 or first == 9:
+            # Continuation line: extends the current field. Only
+            # Description carries them in practice; for any other
+            # current field we fold the line in identically.
+            if cur == 5:
+                desc_len = _append_continuation(&fld_desc[0], desc_len,
+                                                2048, ctl, lstart, tend)
+            # cur 1..4 continuations are rare; ignored for V1.
+        else:
+            # New field line. Find the ':' delimiter.
+            if _field_name_matches(ctl, lstart, llen,
+                                   cast[Ptr[uint8]]("Package"), 7) != 0:
+                _store_field(ctl, lstart + 8, tend, &fld_package[0], 256)
+                cur = 1
+            elif _field_name_matches(ctl, lstart, llen,
+                                     cast[Ptr[uint8]]("Version"), 7) != 0:
+                _store_field(ctl, lstart + 8, tend, &fld_version[0], 256)
+                cur = 2
+            elif _field_name_matches(ctl, lstart, llen,
+                                     cast[Ptr[uint8]]("Architecture"), 12) != 0:
+                _store_field(ctl, lstart + 13, tend, &fld_arch[0], 256)
+                cur = 3
+            elif _field_name_matches(ctl, lstart, llen,
+                                     cast[Ptr[uint8]]("Maintainer"), 10) != 0:
+                _store_field(ctl, lstart + 11, tend, &fld_maint[0], 512)
+                cur = 4
+            elif _field_name_matches(ctl, lstart, llen,
+                                     cast[Ptr[uint8]]("Description"), 11) != 0:
+                desc_len = _store_field(ctl, lstart + 12, tend,
+                                        &fld_desc[0], 2048)
+                cur = 5
+            else:
+                # Some other field (Section, Priority, Depends, ...).
+                # Recorded fields don't include it; mark `cur` neutral
+                # so its continuation lines don't leak into Description.
+                cur = 0
+
+        pos = lend
+        if pos < ctl_len:
+            pos = pos + 1                               # skip '\n'
+
+    if fld_package[0] == 0:
+        write_str(2, "dpkg: control file has no Package field\n")
+        return -1
+    return 0
+
+
+# -- stanza assembly ---------------------------------------------------
+#
+# Build the Debian status stanza into stanza_buf. Fields with an empty
+# value still emit their line (real dpkg keeps the key present); this
+# keeps the parser symmetric for a future V2 reader. Returns the
+# stanza byte length.
+
+def _sb_append(dst: Ptr[uint8], pos: uint64, cap: uint64,
+               s: Ptr[uint8]) -> uint64:
+    o: uint64 = pos
+    i: uint64 = 0
+    while s[i] != 0 and o + 1 < cap:
+        dst[o] = s[i]
+        o = o + 1
+        i = i + 1
+    dst[o] = 0
+    return o
+
+
+def _build_stanza() -> uint64:
+    o: uint64 = 0
+    o = _sb_append(&stanza_buf[0], o, 4096, cast[Ptr[uint8]]("Package: "))
+    o = _sb_append(&stanza_buf[0], o, 4096, &fld_package[0])
+    o = _sb_append(&stanza_buf[0], o, 4096,
+                   cast[Ptr[uint8]]("\nStatus: install ok installed\nVersion: "))
+    o = _sb_append(&stanza_buf[0], o, 4096, &fld_version[0])
+    o = _sb_append(&stanza_buf[0], o, 4096, cast[Ptr[uint8]]("\nArchitecture: "))
+    o = _sb_append(&stanza_buf[0], o, 4096, &fld_arch[0])
+    o = _sb_append(&stanza_buf[0], o, 4096, cast[Ptr[uint8]]("\nMaintainer: "))
+    o = _sb_append(&stanza_buf[0], o, 4096, &fld_maint[0])
+    o = _sb_append(&stanza_buf[0], o, 4096, cast[Ptr[uint8]]("\nDescription: "))
+    # The Description value may itself contain embedded '\n' for the
+    # continuation lines — those were stored verbatim (each already
+    # prefixed by a space) so the stanza wire format is correct.
+    o = _sb_append(&stanza_buf[0], o, 4096, &fld_desc[0])
+    # Stanza terminator: newline ending the Description line, then a
+    # blank line separating this stanza from the next.
+    o = _sb_append(&stanza_buf[0], o, 4096, cast[Ptr[uint8]]("\n\n"))
+    return o
+
+
+# -- append the stanza to the status DB --------------------------------
+#
+# tmpfs has no O_APPEND: open_for_write truncates. So we read the
+# existing /tmp/dpkg-status (if any) into status_buf, then rewrite the
+# whole file = old contents + new stanza. Capped at 4096 (TMPFS_FILE_CAP).
+# Returns 0 on success, -1 on a write/overflow error.
+#
+# The DB path is the flattened tmpfs name "/tmp/dpkg-status" — see the
+# DATABASE PATH note at the top of this file for why it isn't the
+# canonical /var/lib/dpkg/status. The compiler rejects string-literal
+# globals, so the literal is materialised inline at each use site.
+
+
+def _append_to_status(stanza_len: uint64) -> int32:
+    db_path: Ptr[char] = cast[Ptr[char]]("/tmp/dpkg-status")
+    old_len: uint64 = 0
+    rfd: int32 = sys_open(db_path)
+    if rfd >= 0:
+        while old_len < 4096:
+            room: uint64 = 4096 - old_len
+            ptr: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](&status_buf[0]) + old_len)
+            n: int64 = sys_read(rfd, ptr, room)
+            if n <= 0:
+                break
+            old_len = old_len + cast[uint64](n)
+        sys_close(rfd)
+
+    if old_len + stanza_len > 4096:
+        write_str(2, "dpkg: status DB would exceed tmpfs 4 KiB cap (V1 limit)\n")
+        return -1
+
+    wfd: int32 = sys_open_write(db_path)
+    if wfd < 0:
+        write_str(2, "dpkg: cannot open status DB for write: ")
+        write_str(2, cast[Ptr[uint8]](db_path))
+        write_str(2, "\n")
+        return -1
+    ok: int32 = 0
+    if old_len > 0:
+        w1: int64 = _write_full(wfd, &status_buf[0], old_len)
+        if w1 < 0 or cast[uint64](w1) != old_len:
+            ok = -1
+    if ok == 0:
+        w2: int64 = _write_full(wfd, &stanza_buf[0], stanza_len)
+        if w2 < 0 or cast[uint64](w2) != stanza_len:
+            ok = -1
+    sys_close(wfd)
+    if ok != 0:
+        write_str(2, "dpkg: short write updating status DB\n")
+        return -1
+    return 0
+
+
+# -- compose the per-package .list file path ---------------------------
+#
+# /tmp/dpkg.<pkg>.list — package name truncated to fit the 32-byte
+# tmpfs name cap (see the DATABASE PATH note up top). Writes the NUL-
+# terminated path into list_path and returns its length.
+
+def _compose_list_path() -> uint64:
+    prefix: Ptr[uint8] = "/tmp/dpkg."
+    o: uint64 = 0
+    while prefix[o] != 0:
+        list_path[o] = prefix[o]
+        o = o + 1
+    # 32-byte tmpfs name cap minus NUL minus ".list"(5) minus what we
+    # have so far ("/tmp/dpkg." = 10) leaves 16 chars for the name.
+    name_room: uint64 = 16
+    i: uint64 = 0
+    while fld_package[i] != 0 and i < name_room:
+        list_path[o] = fld_package[i]
+        o = o + 1
+        i = i + 1
+    suffix: Ptr[uint8] = ".list"
+    k: uint64 = 0
+    while suffix[k] != 0:
+        list_path[o] = suffix[k]
+        o = o + 1
+        k = k + 1
+    list_path[o] = 0
+    return o
+
+
+# -- walk data.tar, build the file manifest, write the .list file ------
+#
+# Returns the number of file/dir entries recorded, or -1 on a tar
+# error. The manifest body is one tar path per line — exactly the
+# bytes `dpkg -L <pkg>` would print.
+
+def _write_file_list(data_tar_len: uint64) -> int64:
+    off: uint64 = 0
+    mlen: uint64 = 0
+    count: uint64 = 0
+    while off + 512 <= data_tar_len:
+        hdr: Ptr[uint8] = &tar_buf[off]
+        if _tar_header_is_zero(hdr) != 0:
+            break
+        if _tar_chksum_ok(hdr) == 0:
+            write_str(2, "dpkg: data tar header checksum mismatch at offset ")
+            write_dec_u64(2, off)
+            write_str(2, "\n")
+            return -1
+
+        size: uint64 = _tar_parse_octal(&hdr[124], 12)
+        typeflag: uint8 = hdr[156]
+        nlen: uint64 = _name_copy_nul(&warn_buf[0], &hdr[0], 100)
+        body_blocks: uint64 = (size + 511) / 512
+
+        if nlen == 0:
+            off = off + 512
+            off = off + body_blocks * 512
+            continue
+
+        # Record regular files ('0'/NUL), directories ('5') and
+        # symlinks ('2') — everything that lands in a real package's
+        # .list. Skip the bare "./" head record and pax/GNU extension
+        # headers.
+        record: int32 = 0
+        if typeflag == 0 or typeflag == 48 or typeflag == 53 or typeflag == 50:
+            record = 1
+        # The "./" head entry (name is exactly "./") is noise.
+        if warn_buf[0] == 46 and warn_buf[1] == 47 and warn_buf[2] == 0:
+            record = 0
+
+        if record != 0:
+            i: uint64 = 0
+            while warn_buf[i] != 0 and mlen + 1 < 4096:
+                list_buf[mlen] = warn_buf[i]
+                mlen = mlen + 1
+                i = i + 1
+            if mlen + 1 < 4096:
+                list_buf[mlen] = 10                     # '\n'
+                mlen = mlen + 1
+            count = count + 1
+
+        off = off + 512
+        off = off + body_blocks * 512
+
+    list_buf[mlen] = 0
+
+    # Write the manifest to /tmp/dpkg.<pkg>.list.
+    _compose_list_path()
+    wfd: int32 = sys_open_write(cast[Ptr[char]](&list_path[0]))
+    if wfd < 0:
+        write_str(2, "dpkg: cannot open file list for write: ")
+        write_str(2, &list_path[0])
+        write_str(2, "\n")
+        return -1
+    if mlen > 0:
+        wn: int64 = _write_full(wfd, &list_buf[0], mlen)
+        if wn < 0 or cast[uint64](wn) != mlen:
+            sys_close(wfd)
+            write_str(2, "dpkg: short write updating file list\n")
+            return -1
+    sys_close(wfd)
+    return cast[int64](count)
+
+
+# -- top-level driver --------------------------------------------------
+
+def _usage(progname: Ptr[uint8]) -> int32:
+    write_str(2, "Usage: ")
+    write_str(2, progname)
+    write_str(2, " -i <archive.deb>\n")
+    return 2
+
+
+def _do_install(deb_path: Ptr[char]) -> int32:
+    # 1. Slurp the .deb into deb_buf.
+    deb_len_i: int64 = _slurp_file(deb_path, DEB_CAP)
+    if deb_len_i < 0:
+        return 1
+    deb_len: uint64 = cast[uint64](deb_len_i)
+
+    # 2. Locate + inflate control.tar.gz, parse the control file.
+    ctl_member_size: uint64 = 0
+    ctl_off_i: int64 = _ar_find_tar_gz(cast[Ptr[uint8]]("control"), 7,
+                                       deb_len, &ctl_member_size)
+    if ctl_off_i < 0:
+        return 1
+    ctl_tar_i: int64 = _inflate_tar(&deb_buf[cast[uint64](ctl_off_i)],
+                                    ctl_member_size)
+    if ctl_tar_i < 0:
+        return 1
+    ctl_body_len: uint64 = 0
+    ctl_body_off_i: int64 = _find_control_body(cast[uint64](ctl_tar_i),
+                                               &ctl_body_len)
+    if ctl_body_off_i < 0:
+        return 1
+    if _parse_control(&tar_buf[cast[uint64](ctl_body_off_i)],
+                      ctl_body_len) != 0:
+        return 1
+
+    # 3. Build the stanza and append it to the status DB.
+    stanza_len: uint64 = _build_stanza()
+    if _append_to_status(stanza_len) != 0:
+        return 1
+
+    # 4. Locate + inflate data.tar.gz, write the per-package file list.
+    #    NOTE: this re-inflates into the SAME tar_buf, clobbering the
+    #    control tar — fine, because _parse_control already copied the
+    #    five fields we need into the fld_* buffers.
+    data_member_size: uint64 = 0
+    data_off_i: int64 = _ar_find_tar_gz(cast[Ptr[uint8]]("data"), 4,
+                                        deb_len, &data_member_size)
+    if data_off_i < 0:
+        return 1
+    data_tar_i: int64 = _inflate_tar(&deb_buf[cast[uint64](data_off_i)],
+                                     data_member_size)
+    if data_tar_i < 0:
+        return 1
+    nfiles_i: int64 = _write_file_list(cast[uint64](data_tar_i))
+    if nfiles_i < 0:
+        return 1
+
+    # 5. Summary line.
+    write_str(1, "dpkg: registered ")
+    write_str(1, &fld_package[0])
+    write_str(1, " ")
+    write_str(1, &fld_version[0])
+    write_str(1, " (")
+    write_dec_u64(1, cast[uint64](nfiles_i))
+    write_str(1, " files)\n")
+    return 0
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    progname: Ptr[uint8] = cast[Ptr[uint8]](argv[0])
+    if argc != 3:
+        return _usage(progname)
+    flag: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
+    # Only "-i" (install) is wired for V1.
+    if flag[0] != 45 or flag[1] != 105 or flag[2] != 0:     # "-i"
+        write_str(2, "dpkg: unknown action (V1 supports: -i <file.deb>)\n")
+        return _usage(progname)
+    deb_path: Ptr[char] = cast[Ptr[char]](argv[2])
+    return _do_install(deb_path)
