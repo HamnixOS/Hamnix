@@ -66,8 +66,10 @@ cat "$LOG"
 echo "[test_cwd] --- end output ---"
 
 fail=0
-# Strip "task: pid N exited" lines so multi-line greps are reliable.
-cleaned=$(sed 's/task: pid -*[0-9]* exited (code=-*[0-9]*)//g' "$LOG")
+# Strip "task: pid N exited" lines AND the "[NNNNNN] " kernel printk
+# timestamp prefix that fronts every serial line, so the ^/$ / ^/etc$
+# anchors below match pwd's bare output.
+cleaned=$(sed -E 's/task: pid -*[0-9]* exited \(code=-*[0-9]*\)//g; s/^\[[0-9]+\] //' "$LOG")
 
 # Sanity: pwd before cd prints "/" on its own line.
 if echo "$cleaned" | grep -E -q "^/$"; then

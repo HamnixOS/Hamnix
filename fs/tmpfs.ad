@@ -1,21 +1,46 @@
 # fs/tmpfs.py
 #
-# Minimal in-memory writable filesystem — Hamnix's tmpfs. Backs any
-# path under /tmp/ with a fixed-capacity kmalloc'd buffer. Entries
+# In-memory writable filesystem — Hamnix's tmpfs. Backs any path
+# under /tmp/ with a fixed-capacity kmalloc'd buffer per file. Entries
 # persist across opens, so:
 #
 #     /echo hello > /tmp/x
 #     /cat /tmp/x          → "hello\n"
 #
-# works the way the user expects. No directories, no permissions, no
-# inode/dentry split; one flat name table indexed by absolute path.
-# Real fs/ramfs.c shape comes later when EXT4/FAT force a proper
-# superblock/inode/dentry layout (see [[project-install-roadmap]]).
+# works the way the user expects.
 #
-# Capacity is per-file (TMPFS_FILE_CAP) and global (TMPFS_MAX_FILES).
-# Writes past TMPFS_FILE_CAP are short-write'd; out-of-slots opens
-# return -ENOSPC. Mirrors how Linux's tmpfs degrades when the in-
-# memory backing fills up.
+# V1 (nested dirs): tmpfs is now a real tree, not a flat name table.
+# Each entry has a `kind` (0 = file, 1 = directory) and a
+# `parent_idx` (the slot index of the containing directory, or -1 for
+# the synthetic /tmp root). `name` holds a SINGLE path component, not
+# the whole absolute path. Path lookup walks component-by-component
+# from the root, matching `name` within the current parent. So:
+#
+#     mkdir /tmp/a
+#     mkdir /tmp/a/b
+#     /echo hi > /tmp/a/b/hello
+#     /cat /tmp/a/b/hello   → "hi\n"
+#
+# all work. `/tmp/foo` is just a file whose parent is the root dir —
+# the flat case is the depth-1 special case of the tree.
+#
+# Slot 0 is reserved as the synthetic /tmp root directory
+# (parent_idx = -1, kind = 1). It is created lazily by _tmpfs_ensure_root()
+# the first time any tmpfs entry point runs, so there is no ordering
+# dependency on vfs_init().
+#
+# Caps (V1):
+#   TMPFS_MAX_FILES = 64   total entries (files + directories), incl.
+#                          the reserved root in slot 0 → 63 usable.
+#   TMPFS_FILE_CAP  = 4096 bytes per file, fixed.
+#   TMPFS_NAME_LEN  = 32   bytes per path COMPONENT (NUL-terminated).
+#                          Full absolute paths may be longer; only a
+#                          single component between two '/' is capped.
+#
+# Not in V1: O_APPEND, rename of directories with children moved,
+# hard links, permissions/ownership, mmap of tmpfs files. The backing
+# buffer of an unlinked file is deliberately NOT kfreed (reused on the
+# next create into the same slot) — see tmpfs_unlink.
 
 from mm.slab import kmalloc
 from kernel.printk.printk import printk0, printk1
@@ -24,22 +49,51 @@ extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
 
 
-TMPFS_MAX_FILES: uint64 = 8
+TMPFS_MAX_FILES: uint64 = 64
 TMPFS_FILE_CAP:  uint64 = 4096        # per-file fixed cap
-TMPFS_NAME_LEN:  uint64 = 32          # NUL-terminated path, incl prefix
+TMPFS_NAME_LEN:  uint64 = 32          # NUL-terminated path COMPONENT
+
+TMPFS_KIND_FILE: uint64 = 0
+TMPFS_KIND_DIR:  uint64 = 1
+
+TMPFS_ROOT_SLOT: uint64 = 0           # reserved synthetic /tmp root
 
 
 class TmpfsEntry:
-    used:     uint64                  # 0 = free slot
-    size:     uint64                  # current bytes
-    data:     uint64                  # kmalloc'd backing or 0
-    name:     Array[32, uint8]        # NUL-terminated path
+    used:       uint64                # 0 = free slot
+    kind:       uint64                # 0 = file, 1 = directory
+    parent_idx: int64                 # containing dir slot, -1 = root
+    size:       uint64                # current bytes (files only)
+    data:       uint64                # kmalloc'd backing or 0
+    name:       Array[32, uint8]      # NUL-terminated path COMPONENT
 
 
-tmpfs_table: Array[8, TmpfsEntry]
+tmpfs_table: Array[64, TmpfsEntry]
+_tmpfs_root_ready: uint64             # 0 until _tmpfs_ensure_root() has run
 
 
-def _name_eq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+def _tmpfs_ensure_root():
+    # Lazily install slot 0 as the synthetic /tmp root directory.
+    # Idempotent: safe to call from every public entry point.
+    if _tmpfs_root_ready != 0:
+        return
+    tmpfs_table[TMPFS_ROOT_SLOT].used       = 1
+    tmpfs_table[TMPFS_ROOT_SLOT].kind       = TMPFS_KIND_DIR
+    tmpfs_table[TMPFS_ROOT_SLOT].parent_idx = -1
+    tmpfs_table[TMPFS_ROOT_SLOT].size       = 0
+    tmpfs_table[TMPFS_ROOT_SLOT].data       = 0
+    tmpfs_table[TMPFS_ROOT_SLOT].name[0]    = 0
+    _tmpfs_root_ready = 1
+
+
+def tmpfs_init():
+    # Optional explicit init hook (vfs_init may call this). The lazy
+    # _tmpfs_ensure_root() path makes it non-mandatory.
+    _tmpfs_ensure_root()
+
+
+def _comp_eq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    # Compare two NUL-terminated path components for equality.
     i: uint64 = 0
     while True:
         ca: uint8 = a[i]
@@ -51,25 +105,45 @@ def _name_eq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
         i = i + 1
 
 
-def _name_copy(dst: Ptr[uint8], src: Ptr[uint8], max: uint64) -> int32:
-    # Copy NUL-terminated src into dst, cap at max-1. Returns 1 on
-    # success, 0 if src was too long (caller treats as -ENAMETOOLONG).
+def _comp_copy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64,
+               max: uint64) -> int32:
+    # Copy `n` bytes of src into dst and NUL-terminate. Returns 1 on
+    # success, 0 if the component is too long for the name slot
+    # (caller treats as -ENAMETOOLONG).
+    if n + 1 > max:
+        return 0
     i: uint64 = 0
-    while i + 1 < max:
-        c: uint8 = src[i]
-        dst[i] = c
-        if c == 0:
-            return 1
+    while i < n:
+        dst[i] = src[i]
         i = i + 1
-    if src[i] == 0:
-        dst[i] = 0
-        return 1
-    return 0
+    dst[i] = 0
+    return 1
 
 
-def is_tmpfs_path(name: Ptr[char]) -> int32:
-    # True if `name` starts with "/tmp/". Same shape as procfs.is_proc_path —
-    # cheap prefix walk, no strncmp dependency.
+def _find_child(parent: int64, comp: Ptr[uint8], clen: uint64) -> int32:
+    # Find the slot of a child named `comp` (length `clen`) directly
+    # under directory slot `parent`. Returns the slot index or -1.
+    scratch: Array[32, uint8]
+    if clen + 1 > TMPFS_NAME_LEN:
+        return -1
+    j: uint64 = 0
+    while j < clen:
+        scratch[j] = comp[j]
+        j = j + 1
+    scratch[clen] = 0
+    i: uint64 = 0
+    while i < TMPFS_MAX_FILES:
+        if tmpfs_table[i].used != 0:
+            if tmpfs_table[i].parent_idx == parent:
+                if _comp_eq(&tmpfs_table[i].name[0], &scratch[0]) != 0:
+                    return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _is_tmp_prefix(name: Ptr[char]) -> int32:
+    # True if `name` starts with "/tmp/" (the writable prefix). Shared
+    # by is_tmpfs_path and the resolve helpers.
     prefix: Ptr[uint8] = "/tmp/"
     i: int32 = 0
     while True:
@@ -82,20 +156,147 @@ def is_tmpfs_path(name: Ptr[char]) -> int32:
         i = i + 1
 
 
-def tmpfs_lookup(name: Ptr[char]) -> int32:
-    n: uint64 = TMPFS_MAX_FILES
-    i: uint64 = 0
-    while i < n:
-        if tmpfs_table[i].used != 0:
-            if _name_eq(&tmpfs_table[i].name[0],
-                        cast[Ptr[uint8]](name)) != 0:
-                return cast[int32](i)
+def is_tmpfs_path(name: Ptr[char]) -> int32:
+    # True if `name` starts with "/tmp/". Same shape as
+    # procfs.is_proc_path — cheap prefix walk, no strncmp dependency.
+    return _is_tmp_prefix(name)
+
+
+def is_tmpfs_dir_path(name: Ptr[char]) -> int32:
+    # True if `name` is exactly "/tmp" — the tmpfs mount point. Used by
+    # the VFS so `ls /tmp` and `cd /tmp` route into tmpfs rather than
+    # falling through to the cpio initramfs (which has no /tmp entry).
+    if name[0] != 47:                                  # '/'
+        return 0
+    if name[1] != 116:                                 # 't'
+        return 0
+    if name[2] != 109:                                 # 'm'
+        return 0
+    if name[3] != 112:                                 # 'p'
+        return 0
+    if name[4] != 0:
+        return 0
+    return 1
+
+
+# --- path resolution ------------------------------------------------
+#
+# A tmpfs path is "/tmp" (the root) or "/tmp/<comp>/<comp>/...".
+# _resolve_parent walks every component EXCEPT the last and returns
+# the slot of the directory that should contain the final component;
+# the final component itself is written into out_comp / out_len.
+# _resolve_full walks ALL components and returns the slot of the named
+# entry (file or dir), or a negative errno.
+
+TMPFS_ENOENT:  int32 = -2
+TMPFS_EEXIST:  int32 = -17
+TMPFS_ENOTDIR: int32 = -20
+TMPFS_ENAMETOOLONG: int32 = -36
+TMPFS_ENOSPC:  int32 = -28
+
+
+def _path_after_tmp(name: Ptr[char]) -> int32:
+    # Return the index of the first character AFTER "/tmp" (i.e. of
+    # the '/' that begins the first component, or of the terminating
+    # NUL if the path is exactly "/tmp"). Caller guarantees the path
+    # is a tmpfs path.
+    return 4
+
+
+def _resolve_parent(name: Ptr[char], out_comp: Ptr[uint8],
+                    out_len: Ptr[uint64]) -> int32:
+    # Walk every component of `name` except the last. Returns the slot
+    # of the directory that should contain the last component, and
+    # writes the last component (NUL-terminated) + its length out.
+    # Returns a negative TMPFS_E* on error (missing intermediate dir,
+    # an intermediate that is a file, or a too-long component).
+    _tmpfs_ensure_root()
+    cur: int32 = cast[int32](TMPFS_ROOT_SLOT)
+    i: uint64 = cast[uint64](_path_after_tmp(name))     # at the '/'
+    # Skip the leading '/'.
+    if name[i] == 47:
         i = i + 1
-    return -1
+    while True:
+        # Scan one component [start, end).
+        start: uint64 = i
+        while name[i] != 0 and name[i] != 47:
+            i = i + 1
+        clen: uint64 = i - start
+        if clen == 0:
+            # Empty component (trailing slash or "//") — skip it.
+            if name[i] == 0:
+                return TMPFS_ENOENT
+            i = i + 1
+            continue
+        if clen + 1 > TMPFS_NAME_LEN:
+            return TMPFS_ENAMETOOLONG
+        if name[i] == 0:
+            # This was the LAST component — it is the target name.
+            j: uint64 = 0
+            while j < clen:
+                out_comp[j] = name[start + j]
+                j = j + 1
+            out_comp[clen] = 0
+            out_len[0] = clen
+            return cur
+        # Intermediate component — must resolve to an existing dir.
+        comp_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](name) + start)
+        child: int32 = _find_child(cast[int64](cur), comp_ptr, clen)
+        if child < 0:
+            return TMPFS_ENOENT
+        if tmpfs_table[cast[uint64](child)].kind != TMPFS_KIND_DIR:
+            return TMPFS_ENOTDIR
+        cur = child
+        i = i + 1
+
+
+def _resolve_full(name: Ptr[char]) -> int32:
+    # Walk ALL components of `name`. Returns the slot of the named
+    # entry, or a negative TMPFS_E*. "/tmp" itself resolves to the
+    # root slot.
+    _tmpfs_ensure_root()
+    if is_tmpfs_dir_path(name) != 0:
+        return cast[int32](TMPFS_ROOT_SLOT)
+    comp: Array[32, uint8]
+    clen: uint64 = 0
+    parent: int32 = _resolve_parent(name, &comp[0], &clen)
+    if parent < 0:
+        return parent
+    child: int32 = _find_child(cast[int64](parent), &comp[0], clen)
+    if child < 0:
+        return TMPFS_ENOENT
+    return child
+
+
+def tmpfs_lookup(name: Ptr[char]) -> int32:
+    # Resolve `name` to a slot index, or -1 on any miss. Kept as a
+    # boolean-ish accessor for callers that only care "does it exist".
+    slot: int32 = _resolve_full(name)
+    if slot < 0:
+        return -1
+    return slot
+
+
+def tmpfs_is_dir(slot: int32) -> int32:
+    if slot < 0:
+        return 0
+    if tmpfs_table[cast[uint64](slot)].kind == TMPFS_KIND_DIR:
+        return 1
+    return 0
+
+
+def tmpfs_path_is_dir(name: Ptr[char]) -> int32:
+    # True if `name` resolves to an existing tmpfs directory.
+    slot: int32 = _resolve_full(name)
+    if slot < 0:
+        return 0
+    return tmpfs_is_dir(slot)
 
 
 def _tmpfs_find_free_slot() -> int32:
-    i: uint64 = 0
+    # Slot 0 is the reserved root; usable slots start at 1.
+    i: uint64 = 1
     while i < TMPFS_MAX_FILES:
         if tmpfs_table[i].used == 0:
             return cast[int32](i)
@@ -103,24 +304,74 @@ def _tmpfs_find_free_slot() -> int32:
     return -1
 
 
+def tmpfs_mkdir(name: Ptr[char]) -> int32:
+    # Create a directory entry for `name`. Returns:
+    #     0  on success
+    #   -2  (-ENOENT)        a parent component is missing
+    #  -17  (-EEXIST)        the name already exists
+    #  -20  (-ENOTDIR)       a parent component is a file
+    #  -28  (-ENOSPC)        out of entry slots
+    #  -36  (-ENAMETOOLONG)  the final component is too long
+    _tmpfs_ensure_root()
+    if is_tmpfs_dir_path(name) != 0:
+        return TMPFS_EEXIST                           # "/tmp" exists
+    comp: Array[32, uint8]
+    clen: uint64 = 0
+    parent: int32 = _resolve_parent(name, &comp[0], &clen)
+    if parent < 0:
+        return parent
+    if _find_child(cast[int64](parent), &comp[0], clen) >= 0:
+        return TMPFS_EEXIST
+    slot: int32 = _tmpfs_find_free_slot()
+    if slot < 0:
+        printk0("tmpfs: out of entry slots\n")
+        return TMPFS_ENOSPC
+    su: uint64 = cast[uint64](slot)
+    j: uint64 = 0
+    while j < clen:
+        tmpfs_table[su].name[j] = comp[j]
+        j = j + 1
+    tmpfs_table[su].name[clen] = 0
+    tmpfs_table[su].used       = 1
+    tmpfs_table[su].kind       = TMPFS_KIND_DIR
+    tmpfs_table[su].parent_idx = cast[int64](parent)
+    tmpfs_table[su].size       = 0
+    tmpfs_table[su].data       = 0
+    return 0
+
+
 def tmpfs_open_for_write(name: Ptr[char]) -> int32:
-    # Lookup or create. If the file exists, truncate (size = 0).
-    # Returns the slot index, or -1 on out-of-slots / bad name.
-    existing: int32 = tmpfs_lookup(name)
+    # Lookup or create a FILE. If the file exists, truncate (size = 0)
+    # and return its slot. If it does not exist, create it under the
+    # resolved parent directory. Returns the slot index, or a negative
+    # TMPFS_E* on error. A path that resolves to an existing directory
+    # cannot be opened for write — returns -EEXIST (-17), matching the
+    # VFS contract that you can't clobber a dir with a file write.
+    _tmpfs_ensure_root()
+    existing: int32 = _resolve_full(name)
     if existing >= 0:
+        if tmpfs_table[cast[uint64](existing)].kind == TMPFS_KIND_DIR:
+            return TMPFS_EEXIST
         tmpfs_table[cast[uint64](existing)].size = 0
         return existing
+
+    comp: Array[32, uint8]
+    clen: uint64 = 0
+    parent: int32 = _resolve_parent(name, &comp[0], &clen)
+    if parent < 0:
+        return parent
 
     slot: int32 = _tmpfs_find_free_slot()
     if slot < 0:
         printk0("tmpfs: out of file slots\n")
-        return -1
+        return TMPFS_ENOSPC
     su: uint64 = cast[uint64](slot)
 
-    if _name_copy(&tmpfs_table[su].name[0],
-                  cast[Ptr[uint8]](name), TMPFS_NAME_LEN) == 0:
-        printk0("tmpfs: name too long\n")
-        return -1
+    j: uint64 = 0
+    while j < clen:
+        tmpfs_table[su].name[j] = comp[j]
+        j = j + 1
+    tmpfs_table[su].name[clen] = 0
 
     # Lazily allocate the backing buffer on first create.
     if tmpfs_table[su].data == 0:
@@ -129,8 +380,10 @@ def tmpfs_open_for_write(name: Ptr[char]) -> int32:
             return -1
         tmpfs_table[su].data = buf
 
-    tmpfs_table[su].used = 1
-    tmpfs_table[su].size = 0
+    tmpfs_table[su].used       = 1
+    tmpfs_table[su].kind       = TMPFS_KIND_FILE
+    tmpfs_table[su].parent_idx = cast[int64](parent)
+    tmpfs_table[su].size       = 0
     return slot
 
 
@@ -147,64 +400,171 @@ def tmpfs_data(slot: int32) -> Ptr[uint8]:
 
 
 def tmpfs_unlink(name: Ptr[char]) -> int32:
-    # Mark the named entry free. We deliberately DO NOT kfree the
-    # backing buffer — tmpfs_open_for_write reuses it on the next
-    # create into the same slot ("if data == 0 then kmalloc" path),
-    # which keeps the slab churn down and matches the lazy-alloc
-    # shape of the create path. Real Linux tmpfs frees the inode's
-    # pages here; we'll wire that up when slab grows a free path
-    # we trust. Returns 0 on success, -ENOENT (-2) on miss.
-    slot: int32 = tmpfs_lookup(name)
+    # Remove the named entry. Marks the slot free; for files the
+    # backing buffer is deliberately NOT kfreed (reused on the next
+    # create into the same slot — keeps slab churn down, matches the
+    # lazy-alloc create path). A directory can only be removed if it
+    # is empty (Linux rmdir semantics) — refuse with -ENOTEMPTY-ish
+    # behaviour (we reuse -EEXIST(-17)'s "in the way" sense; callers
+    # of unlink on tmpfs only ever target files today).
+    #
+    # Returns 0 on success, -ENOENT (-2) on miss.
+    _tmpfs_ensure_root()
+    slot: int32 = _resolve_full(name)
     if slot < 0:
-        return -2
+        return TMPFS_ENOENT
     su: uint64 = cast[uint64](slot)
+    if su == TMPFS_ROOT_SLOT:
+        return TMPFS_EEXIST                           # can't remove /tmp
+    if tmpfs_table[su].kind == TMPFS_KIND_DIR:
+        # Refuse to remove a non-empty directory.
+        i: uint64 = 0
+        while i < TMPFS_MAX_FILES:
+            if tmpfs_table[i].used != 0:
+                if tmpfs_table[i].parent_idx == cast[int64](slot):
+                    return TMPFS_EEXIST
+            i = i + 1
     tmpfs_table[su].used = 0
     tmpfs_table[su].size = 0
     # Wipe the first byte of the name so a half-matched stale key
-    # can't accidentally compare equal in tmpfs_lookup before the
-    # slot gets reused.
+    # can't accidentally compare equal before the slot gets reused.
     tmpfs_table[su].name[0] = 0
     return 0
 
 
 def tmpfs_rename(oldname: Ptr[char], newname: Ptr[char]) -> int32:
     # Plan 9 wstat(2)'s name-change primitive routed through tmpfs.
-    # Looks up the slot for `oldname`, refuses if `newname` already
-    # exists (Plan 9 wstat returns "exists" in that case), then
-    # overwrites the slot's name. The backing data + size are
-    # preserved — only the path key moves.
+    # V1 scope: rename only moves the path key WITHIN THE SAME PARENT
+    # DIRECTORY (a pure component rename). Cross-directory moves are
+    # V2 backlog. Looks up the slot for `oldname`, refuses if
+    # `newname` already exists, then overwrites the slot's name
+    # component. Backing data + size are preserved.
     #
     # Returns:
     #    0 on success
     #   -2 (-ENOENT) if oldname doesn't exist
-    #  -17 (-EEXIST) if newname is already taken
-    # -36 (-ENAMETOOLONG) if newname is too long for the name slot
-    src_slot: int32 = tmpfs_lookup(oldname)
+    #  -17 (-EEXIST) if newname is taken / parents differ
+    # -36 (-ENAMETOOLONG) if newname's component is too long
+    _tmpfs_ensure_root()
+    src_slot: int32 = _resolve_full(oldname)
     if src_slot < 0:
-        return -2
-    if tmpfs_lookup(newname) >= 0:
-        return -17
+        return TMPFS_ENOENT
+    if _resolve_full(newname) >= 0:
+        return TMPFS_EEXIST
+    new_comp: Array[32, uint8]
+    new_len: uint64 = 0
+    new_parent: int32 = _resolve_parent(newname, &new_comp[0], &new_len)
+    if new_parent < 0:
+        return new_parent
     su: uint64 = cast[uint64](src_slot)
-    if _name_copy(&tmpfs_table[su].name[0],
-                  cast[Ptr[uint8]](newname), TMPFS_NAME_LEN) == 0:
-        return -36
+    # V1: same-parent renames only.
+    if tmpfs_table[su].parent_idx != cast[int64](new_parent):
+        return TMPFS_EEXIST
+    if new_len + 1 > TMPFS_NAME_LEN:
+        return TMPFS_ENAMETOOLONG
+    j: uint64 = 0
+    while j < new_len:
+        tmpfs_table[su].name[j] = new_comp[j]
+        j = j + 1
+    tmpfs_table[su].name[new_len] = 0
     return 0
 
 
+_slot_path_buf: Array[256, uint8]
+
+
 def tmpfs_slot_name(slot: int32) -> Ptr[uint8]:
-    # Recover the NUL-terminated path key for a given slot. Used by
-    # do_fwstat to convert an FD_TMPFS_MARK fd back into a path so the
-    # rename leg of wstat can apply. Returns the name buffer pointer;
-    # callers must not write through it.
-    return &tmpfs_table[cast[uint64](slot)].name[0]
+    # Recover the FULL absolute path ("/tmp/.../name") for a given
+    # slot. Used by do_fwstat to convert an FD_TMPFS_MARK fd back into
+    # a path so the rename leg of wstat can route through vfs_rename
+    # (which expects an absolute /tmp/ path).
+    #
+    # In the tree model the slot only stores its bare name component
+    # plus a parent_idx, so we walk the parent chain to the root,
+    # collecting components, then emit them in forward order into a
+    # module-level scratch buffer. Single-threaded fs ops at this
+    # scale make the shared buffer safe. Returns a pointer to that
+    # buffer; callers must not write through it.
+    #
+    # Component slots are gathered into a small fixed array (a path
+    # can be at most TMPFS_MAX_FILES dirs deep).
+    chain: Array[64, int32]
+    depth: uint64 = 0
+    cur: int64 = cast[int64](slot)
+    while cur >= 0:
+        if cast[uint64](cur) == TMPFS_ROOT_SLOT:
+            cur = -1
+        else:
+            chain[depth] = cast[int32](cur)
+            depth = depth + 1
+            cur = tmpfs_table[cast[uint64](cur)].parent_idx
+    # Emit "/tmp" then each component from outermost to innermost.
+    out: uint64 = 0
+    prefix: Ptr[uint8] = "/tmp"
+    pi: uint64 = 0
+    while prefix[pi] != 0:
+        _slot_path_buf[out] = prefix[pi]
+        out = out + 1
+        pi = pi + 1
+    d: int64 = cast[int64](depth) - 1
+    while d >= 0:
+        _slot_path_buf[out] = 47                       # '/'
+        out = out + 1
+        cslot: uint64 = cast[uint64](chain[cast[uint64](d)])
+        k: uint64 = 0
+        while tmpfs_table[cslot].name[k] != 0:
+            if out + 1 >= 256:
+                _slot_path_buf[out] = 0
+                return &_slot_path_buf[0]
+            _slot_path_buf[out] = tmpfs_table[cslot].name[k]
+            out = out + 1
+            k = k + 1
+        d = d - 1
+    _slot_path_buf[out] = 0
+    return &_slot_path_buf[0]
+
+
+def tmpfs_listdir(name: Ptr[char], buf: Ptr[uint8],
+                  count: uint64) -> int64:
+    # Pack the immediate children of directory `name` into `buf` as
+    # "NAME\n" lines. `name` is "/tmp" or "/tmp/<dir>/...". Returns the
+    # number of bytes written, or a negative TMPFS_E* (path missing /
+    # not a directory).
+    _tmpfs_ensure_root()
+    if count == 0:
+        return 0
+    slot: int32 = _resolve_full(name)
+    if slot < 0:
+        return cast[int64](slot)
+    if tmpfs_table[cast[uint64](slot)].kind != TMPFS_KIND_DIR:
+        return cast[int64](TMPFS_ENOTDIR)
+    slot64: int64 = cast[int64](slot)
+    out: uint64 = 0
+    i: uint64 = 0
+    while i < TMPFS_MAX_FILES:
+        if tmpfs_table[i].used != 0:
+            pidx: int64 = tmpfs_table[i].parent_idx
+            if pidx == slot64:
+                k: uint64 = 0
+                while tmpfs_table[i].name[k] != 0:
+                    if out + 1 >= count:
+                        return cast[int64](out)
+                    buf[out] = tmpfs_table[i].name[k]
+                    out = out + 1
+                    k = k + 1
+                if out + 1 >= count:
+                    return cast[int64](out)
+                buf[out] = 10                          # '\n'
+                out = out + 1
+        i = i + 1
+    return cast[int64](out)
 
 
 def tmpfs_write(slot: int32, src: Ptr[uint8], pos: uint64,
                 count: uint64) -> uint64:
     # Write up to `count` bytes from `src` to entry `slot` starting at
     # offset `pos`. Caps at TMPFS_FILE_CAP — short-writes if the
-    # caller would overflow. Returns bytes actually written; the
-    # caller advances fd_pos accordingly and updates `size`.
+    # caller would overflow. Returns bytes actually written.
     su: uint64 = cast[uint64](slot)
     cap: uint64 = TMPFS_FILE_CAP
     if pos >= cap:

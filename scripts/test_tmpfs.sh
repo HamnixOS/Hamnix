@@ -74,13 +74,15 @@ else
     fail=1
 fi
 
-# Sanity: the literal line should appear EXACTLY ONCE — once /cat
-# replays it. If it appears twice, the redirect didn't catch and
-# echo also wrote to serial. (Boot logs may contain other "hello"
-# words; we anchor on the exact phrase to avoid false positives.)
-count=$(grep -F -c "hello tmpfs world" "$LOG" || true)
+# Sanity: the phrase should be replayed by /cat EXACTLY ONCE — and the
+# redirect must have caught echo's stdout (echo must NOT have written
+# the phrase to serial itself). QEMU's serial echoes the *typed input
+# line* `echo hello tmpfs world > /tmp/x` back to the log; that line
+# is not echo's output — it carries the redirect operator `>`, so we
+# exclude it. What remains must be exactly one line: the /cat replay.
+count=$(grep -F "hello tmpfs world" "$LOG" | grep -v '>' | grep -c . || true)
 if [ "$count" != "1" ]; then
-    echo "[test_tmpfs] MISS: expected exactly 1 occurrence, got $count"
+    echo "[test_tmpfs] MISS: expected exactly 1 cat replay, got $count"
     fail=1
 fi
 
