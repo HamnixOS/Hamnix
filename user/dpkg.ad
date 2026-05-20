@@ -3,7 +3,16 @@
 # Hamnix V1 of the `dpkg` package-database front-end — the next
 # apt-path piece after `dpkg-deb` (user/dpkg_deb.ad). Where dpkg_deb
 # unpacks a `.deb`'s tar members, `dpkg` *records* an installed
-# package in the dpkg database.
+# package in the dpkg database — and now also *queries* it.
+#
+#   dpkg -i <file.deb>     install: record a package in the DB
+#   dpkg -l                list all installed packages
+#   dpkg -s <package>      show one package's status stanza
+#   dpkg -L <package>      list one package's installed files
+#
+# The -l/-s/-L query sub-commands are pure readers over the data the
+# -i path already writes: the status DB and the per-package .list
+# manifests. See the QUERY section near _do_list for the stanza model.
 #
 #   dpkg -i <file.deb>
 #       1. Slurp the .deb into RAM, walk the `ar` table-of-contents,
@@ -58,10 +67,12 @@
 #   * No dependency resolution (Depends/Pre-Depends/Conflicts).
 #   * No maintainer scripts (preinst/postinst/prerm/postrm).
 #   * No conffiles handling, no triggers, no `dpkg --remove`/`-r`.
-#   * No `dpkg -L`/`-l`/`-s` query sub-commands (the data they read —
-#     the .list file and the status stanza — IS written, so V2 can add
-#     the readers cheaply).
 #   * Compression: gzip only (same as dpkg_deb V0); .xz/.zst error out.
+#   * The -l/-s/-L query sub-commands are shipped (see the QUERY
+#     section). What is still V2 there: -l column alignment is naive
+#     single-space padding (no fixed-width columns), and -s/-L key the
+#     status DB / .list paths off the flattened tmpfs names — they
+#     follow the same V2 path migration as -i.
 #
 # Build: scripts/build_user.sh auto-discovers via build_adder_user dpkg.
 # Test:  scripts/test_dpkg_db.sh.
@@ -118,6 +129,12 @@ status_buf: Array[4096, uint8]
 # body ( one path per line ).
 list_path:  Array[64, uint8]
 list_buf:   Array[4096, uint8]
+
+# Scratch for the query sub-commands (-l/-s/-L): a single extracted
+# field value (Package/Version/Architecture/Description) lifted out of
+# a status stanza. RFC822 field values are short; the longest a `-l`
+# row prints is the Description first line.
+qf_buf: Array[512, uint8]
 
 
 # -- tiny stdio helpers (mirrors dpkg_deb.ad / cat.ad) -----------------
@@ -672,8 +689,14 @@ def _append_to_status(stanza_len: uint64) -> int32:
 # /tmp/dpkg.<pkg>.list — package name truncated to fit the 32-byte
 # tmpfs name cap (see the DATABASE PATH note up top). Writes the NUL-
 # terminated path into list_path and returns its length.
+#
+# _compose_list_path_for(name) builds the path for an arbitrary NUL-
+# terminated package name — `dpkg -i` passes &fld_package[0] (the name
+# just parsed from control), `dpkg -L` passes the name off argv. The
+# 16-char truncation rule is identical at both call sites, so it lives
+# here once and is never duplicated.
 
-def _compose_list_path() -> uint64:
+def _compose_list_path_for(name: Ptr[uint8]) -> uint64:
     prefix: Ptr[uint8] = "/tmp/dpkg."
     o: uint64 = 0
     while prefix[o] != 0:
@@ -683,8 +706,8 @@ def _compose_list_path() -> uint64:
     # have so far ("/tmp/dpkg." = 10) leaves 16 chars for the name.
     name_room: uint64 = 16
     i: uint64 = 0
-    while fld_package[i] != 0 and i < name_room:
-        list_path[o] = fld_package[i]
+    while name[i] != 0 and i < name_room:
+        list_path[o] = name[i]
         o = o + 1
         i = i + 1
     suffix: Ptr[uint8] = ".list"
@@ -695,6 +718,10 @@ def _compose_list_path() -> uint64:
         k = k + 1
     list_path[o] = 0
     return o
+
+
+def _compose_list_path() -> uint64:
+    return _compose_list_path_for(&fld_package[0])
 
 
 # -- walk data.tar, build the file manifest, write the .list file ------
@@ -772,12 +799,239 @@ def _write_file_list(data_tar_len: uint64) -> int64:
     return cast[int64](count)
 
 
+# -- query sub-commands: -l / -s / -L ----------------------------------
+#
+# These are the READERS for the data `dpkg -i` already writes: the
+# status DB at /tmp/dpkg-status and the per-package /tmp/dpkg.<pkg>.list
+# manifests. They reuse the exact path-construction the install path
+# uses (the "/tmp/dpkg-status" literal here, _compose_list_path_for for
+# the .list). No new path rules are introduced.
+#
+# Stanza model: the status DB is a run of Debian stanzas, each a block
+# of "Field: value" lines, stanzas separated by a blank line. A stanza
+# begins at a "Package:" line and runs up to (not including) the next
+# blank line.
+
+
+# Slurp /tmp/dpkg-status into status_buf. Returns the byte length, or
+# -1 if the DB cannot be opened (no package has ever been installed).
+
+def _read_status_db() -> int64:
+    db_path: Ptr[char] = cast[Ptr[char]]("/tmp/dpkg-status")
+    rfd: int32 = sys_open(db_path)
+    if rfd < 0:
+        return -1
+    total: uint64 = 0
+    while total < 4096:
+        room: uint64 = 4096 - total
+        ptr: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](&status_buf[0]) + total)
+        n: int64 = sys_read(rfd, ptr, room)
+        if n <= 0:
+            break
+        total = total + cast[uint64](n)
+    sys_close(rfd)
+    return cast[int64](total)
+
+
+# Extract the value of field `name` from the stanza occupying
+# status_buf[sstart, send). The value is copied (NUL-terminated, leading
+# whitespace trimmed) into qf_buf; only the FIRST physical line of the
+# value is taken (continuation lines are ignored — a `-l` row wants the
+# Description's first line only). Returns 1 if the field was found, 0
+# otherwise. qf_buf is always left NUL-terminated.
+
+def _stanza_field(sstart: uint64, send: uint64,
+                  name: Ptr[uint8], name_len: uint64) -> int32:
+    qf_buf[0] = 0
+    pos: uint64 = sstart
+    while pos < send:
+        lstart: uint64 = pos
+        lend: uint64 = pos
+        while lend < send and status_buf[lend] != 10:
+            lend = lend + 1
+        # A field line begins in column 0 (continuation lines start
+        # with a space/tab — skip them; they belong to a prior field).
+        first: uint8 = status_buf[lstart]
+        if first != 32 and first != 9:
+            if _field_name_matches(&status_buf[0], lstart, lend - lstart,
+                                   name, name_len) != 0:
+                # Value starts after "<name>:" — trim leading blanks.
+                v: uint64 = lstart + name_len + 1
+                while v < lend and (status_buf[v] == 32 or status_buf[v] == 9):
+                    v = v + 1
+                o: uint64 = 0
+                while v < lend and o + 1 < 512:
+                    qf_buf[o] = status_buf[v]
+                    o = o + 1
+                    v = v + 1
+                qf_buf[o] = 0
+                return 1
+        pos = lend
+        if pos < send:
+            pos = pos + 1
+    return 0
+
+
+# dpkg -l : list every installed package, one `ii  pkg  ver  arch  desc`
+# row per stanza. The `ii` prefix mimics real dpkg (desired=install,
+# status=installed). Returns 0 on success, 1 if the DB is unreadable.
+
+def _do_list() -> int32:
+    db_len_i: int64 = _read_status_db()
+    if db_len_i < 0:
+        write_str(2, "dpkg-query: status database is empty (no packages installed)\n")
+        return 1
+    db_len: uint64 = cast[uint64](db_len_i)
+
+    pos: uint64 = 0
+    while pos < db_len:
+        # Find the start of the next stanza (a "Package:" line).
+        lstart: uint64 = pos
+        lend: uint64 = pos
+        while lend < db_len and status_buf[lend] != 10:
+            lend = lend + 1
+        if _field_name_matches(&status_buf[0], lstart, lend - lstart,
+                               cast[Ptr[uint8]]("Package"), 7) != 0:
+            # Stanza spans [lstart, send) where send is the next blank
+            # line (or end of buffer).
+            send: uint64 = lstart
+            while send < db_len:
+                ls: uint64 = send
+                le: uint64 = send
+                while le < db_len and status_buf[le] != 10:
+                    le = le + 1
+                if le == ls:                            # blank line
+                    break
+                send = le
+                if send < db_len:
+                    send = send + 1
+
+            write_str(1, "ii  ")
+            _stanza_field(lstart, send, cast[Ptr[uint8]]("Package"), 7)
+            write_str(1, &qf_buf[0])
+            write_str(1, "  ")
+            _stanza_field(lstart, send, cast[Ptr[uint8]]("Version"), 7)
+            write_str(1, &qf_buf[0])
+            write_str(1, "  ")
+            _stanza_field(lstart, send, cast[Ptr[uint8]]("Architecture"), 12)
+            write_str(1, &qf_buf[0])
+            write_str(1, "  ")
+            _stanza_field(lstart, send, cast[Ptr[uint8]]("Description"), 11)
+            write_str(1, &qf_buf[0])
+            write_str(1, "\n")
+
+            pos = send
+        else:
+            pos = lend
+        if pos < db_len:
+            pos = pos + 1
+    return 0
+
+
+# dpkg -s <package> : print the raw status stanza for one package.
+# Returns 0 on success, 1 if the DB is unreadable or the package is
+# not present (with the dpkg-query "is not installed" diagnostic).
+
+def _do_status(pkg: Ptr[uint8]) -> int32:
+    db_len_i: int64 = _read_status_db()
+    if db_len_i < 0:
+        write_str(2, "dpkg-query: package '")
+        write_str(2, pkg)
+        write_str(2, "' is not installed\n")
+        return 1
+    db_len: uint64 = cast[uint64](db_len_i)
+
+    pkg_len: uint64 = strlen_u8(pkg)
+
+    pos: uint64 = 0
+    while pos < db_len:
+        lstart: uint64 = pos
+        lend: uint64 = pos
+        while lend < db_len and status_buf[lend] != 10:
+            lend = lend + 1
+        if _field_name_matches(&status_buf[0], lstart, lend - lstart,
+                               cast[Ptr[uint8]]("Package"), 7) != 0:
+            # Stanza body runs [lstart, send) up to the next blank line.
+            send: uint64 = lstart
+            while send < db_len:
+                ls: uint64 = send
+                le: uint64 = send
+                while le < db_len and status_buf[le] != 10:
+                    le = le + 1
+                if le == ls:
+                    break
+                send = le
+                if send < db_len:
+                    send = send + 1
+            # Does this stanza's Package value equal `pkg`?
+            _stanza_field(lstart, send, cast[Ptr[uint8]]("Package"), 7)
+            eq: int32 = 1
+            i: uint64 = 0
+            while i < pkg_len:
+                if qf_buf[i] != pkg[i]:
+                    eq = 0
+                    break
+                i = i + 1
+            if eq != 0 and qf_buf[pkg_len] != 0:
+                eq = 0
+            if eq != 0:
+                # Print the raw stanza bytes verbatim, then a newline.
+                _write_full(1, &status_buf[lstart], send - lstart)
+                write_str(1, "\n")
+                return 0
+            pos = send
+        else:
+            pos = lend
+        if pos < db_len:
+            pos = pos + 1
+
+    write_str(2, "dpkg-query: package '")
+    write_str(2, pkg)
+    write_str(2, "' is not installed\n")
+    return 1
+
+
+# dpkg -L <package> : print the per-package file manifest (the contents
+# of /tmp/dpkg.<pkg>.list, one path per line). Returns 0 on success, 1
+# if no .list exists for that package.
+
+def _do_files(pkg: Ptr[uint8]) -> int32:
+    _compose_list_path_for(pkg)
+    fd: int32 = sys_open(cast[Ptr[char]](&list_path[0]))
+    if fd < 0:
+        write_str(2, "dpkg-query: package '")
+        write_str(2, pkg)
+        write_str(2, "' is not installed\n")
+        return 1
+    total: uint64 = 0
+    while total < 4096:
+        room: uint64 = 4096 - total
+        ptr: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](&list_buf[0]) + total)
+        n: int64 = sys_read(fd, ptr, room)
+        if n <= 0:
+            break
+        total = total + cast[uint64](n)
+    sys_close(fd)
+    if total > 0:
+        _write_full(1, &list_buf[0], total)
+    return 0
+
+
 # -- top-level driver --------------------------------------------------
 
 def _usage(progname: Ptr[uint8]) -> int32:
     write_str(2, "Usage: ")
     write_str(2, progname)
     write_str(2, " -i <archive.deb>\n")
+    write_str(2, "       ")
+    write_str(2, progname)
+    write_str(2, " -l\n")
+    write_str(2, "       ")
+    write_str(2, progname)
+    write_str(2, " -s <package>\n")
+    write_str(2, "       ")
+    write_str(2, progname)
+    write_str(2, " -L <package>\n")
     return 2
 
 
@@ -842,12 +1096,39 @@ def _do_install(deb_path: Ptr[char]) -> int32:
 
 def main(argc: int32, argv: Ptr[uint64]) -> int32:
     progname: Ptr[uint8] = cast[Ptr[uint8]](argv[0])
-    if argc != 3:
+    if argc < 2:
         return _usage(progname)
     flag: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
-    # Only "-i" (install) is wired for V1.
-    if flag[0] != 45 or flag[1] != 105 or flag[2] != 0:     # "-i"
-        write_str(2, "dpkg: unknown action (V1 supports: -i <file.deb>)\n")
+    # Single-letter flags only ("-i", "-l", "-s", "-L"); reject "-xyz".
+    if flag[0] != 45 or flag[1] == 0 or flag[2] != 0:       # "-?"
+        write_str(2, "dpkg: unknown action (supports: -i, -l, -s, -L)\n")
         return _usage(progname)
-    deb_path: Ptr[char] = cast[Ptr[char]](argv[2])
-    return _do_install(deb_path)
+    op: uint8 = flag[1]
+
+    # -i <file.deb>  (install: parse a .deb, record it in the DB).
+    if op == 105:                                           # 'i'
+        if argc != 3:
+            return _usage(progname)
+        deb_path: Ptr[char] = cast[Ptr[char]](argv[2])
+        return _do_install(deb_path)
+
+    # -l  (list every installed package).
+    if op == 108:                                           # 'l'
+        if argc != 2:
+            return _usage(progname)
+        return _do_list()
+
+    # -s <package>  (show one package's status stanza).
+    if op == 115:                                           # 's'
+        if argc != 3:
+            return _usage(progname)
+        return _do_status(cast[Ptr[uint8]](argv[2]))
+
+    # -L <package>  (list one package's installed files).
+    if op == 76:                                            # 'L'
+        if argc != 3:
+            return _usage(progname)
+        return _do_files(cast[Ptr[uint8]](argv[2]))
+
+    write_str(2, "dpkg: unknown action (supports: -i, -l, -s, -L)\n")
+    return _usage(progname)

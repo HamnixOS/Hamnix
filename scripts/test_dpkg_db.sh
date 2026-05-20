@@ -13,13 +13,22 @@
 #     /bin/dpkg -i /tests/sample.deb
 #     cat /tmp/dpkg-status
 #     cat /tmp/dpkg.hamnix-fixture.list
+#     /bin/dpkg -l                  query: list installed packages
+#     /bin/dpkg -s <pkg>            query: show one package's stanza
+#     /bin/dpkg -L <pkg>            query: list one package's files
+#     /bin/dpkg -s nonexistent-pkg  query: error path (not installed)
 #
 # Asserts:
 #   * the summary line `dpkg: registered <pkg> <ver> (<N> files)`;
 #   * the status DB stanza fields (Package/Status/Version/
 #     Architecture/Maintainer/Description) AND the Description
 #     continuation line are present;
-#   * the per-package .list manifest contains the data.tar entry paths.
+#   * the per-package .list manifest contains the data.tar entry paths;
+#   * `dpkg -l` lists the installed package with the `ii` prefix;
+#   * `dpkg -s <pkg>` prints the package's status stanza fields;
+#   * `dpkg -L <pkg>` prints the package's installed-file manifest;
+#   * `dpkg -s nonexistent-pkg` emits the dpkg-query "is not installed"
+#     diagnostic to stderr.
 #
 # DB-PATH NOTE: Hamnix tmpfs is a flat namespace (no directories)
 # capped at TMPFS_NAME_LEN=32 bytes/name, and the cpio `/var` is
@@ -54,6 +63,8 @@ DESC_CONT_MARKER='DPKGDB_CONT continuation line ok'
 LIST_PATH="/tmp/dpkg.${PKG_NAME}.list"
 DATA_ENTRY_A='./usr/bin/hamfix'
 DATA_ENTRY_B='./usr/share/doc/hamfix/readme'
+# A package name that is NOT in the DB — drives the `-s` error path.
+MISSING_PKG='nonexistent-pkg'
 
 echo "[test_dpkg_db] (1/6) Build userland"
 bash scripts/build_user.sh >/dev/null
@@ -132,9 +143,22 @@ set +e
     sleep 2
     printf 'cat %s\n' "$LIST_PATH"
     sleep 2
+    # Query sub-commands: read back the DB the install above populated.
+    printf 'echo DPKG_QUERY_L_START\n'
+    printf '/bin/dpkg -l\n'
+    sleep 2
+    printf 'echo DPKG_QUERY_S_START\n'
+    printf '/bin/dpkg -s %s\n' "$PKG_NAME"
+    sleep 2
+    printf 'echo DPKG_QUERY_BIGL_START\n'
+    printf '/bin/dpkg -L %s\n' "$PKG_NAME"
+    sleep 2
+    printf 'echo DPKG_QUERY_MISS_START\n'
+    printf '/bin/dpkg -s %s\n' "$MISSING_PKG"
+    sleep 2
     printf 'exit\n'
     sleep 1
-) | timeout 30s qemu-system-x86_64 \
+) | timeout 45s qemu-system-x86_64 \
     -kernel "$ELF" \
     -smp 2 \
     -nographic \
@@ -241,6 +265,50 @@ if grep -F -q "cat: cannot open /tmp/dpkg-status" "$LOG"; then
 fi
 if grep -F -q "cat: cannot open $LIST_PATH" "$LOG"; then
     echo "[test_dpkg_db] MISS: .list file never created"
+    fail=1
+fi
+
+# (g) `dpkg -l` lists the installed package. The row carries the real
+# dpkg `ii` desired/status prefix followed by the package name. The
+# serial log prefixes each line with "[NNNNNN] ", so the `ii` token is
+# matched anywhere on the line rather than anchored at column 0.
+if grep -E -q "(^|\] )ii  +$PKG_NAME " "$LOG"; then
+    echo "[test_dpkg_db] OK: dpkg -l listed $PKG_NAME with ii prefix"
+else
+    echo "[test_dpkg_db] MISS: dpkg -l did not list $PKG_NAME (ii row absent)"
+    fail=1
+fi
+
+# (h) `dpkg -s <pkg>` prints the package's status stanza. The stanza
+# output lands in the window between the -s and -L echo markers; we
+# slice that window and confirm the Package + Status lines are inside
+# it (the Status line is unique to the status DB stanza, so this is a
+# genuine read-back via -s, not an echo of the -i parse).
+S_WINDOW=$(sed -n '/DPKG_QUERY_S_START/,/DPKG_QUERY_BIGL_START/p' "$LOG")
+if echo "$S_WINDOW" | grep -F -q "Package: $PKG_NAME" \
+   && echo "$S_WINDOW" | grep -F -q "Status: install ok installed"; then
+    echo "[test_dpkg_db] OK: dpkg -s printed the $PKG_NAME stanza"
+else
+    echo "[test_dpkg_db] MISS: dpkg -s did not print the $PKG_NAME stanza"
+    fail=1
+fi
+
+# (i) `dpkg -L <pkg>` prints the per-package file manifest. Slice the
+# window after the -L marker and confirm a known data.tar entry path
+# appears there (so we know it came from -L, not the earlier `cat`).
+L_WINDOW=$(sed -n '/DPKG_QUERY_BIGL_START/,/DPKG_QUERY_MISS_START/p' "$LOG")
+if echo "$L_WINDOW" | grep -F -q "$DATA_ENTRY_A"; then
+    echo "[test_dpkg_db] OK: dpkg -L printed the $PKG_NAME file manifest"
+else
+    echo "[test_dpkg_db] MISS: dpkg -L did not print the file manifest"
+    fail=1
+fi
+
+# (j) `dpkg -s <missing>` errors with the dpkg-query diagnostic.
+if grep -F -q "dpkg-query: package '$MISSING_PKG' is not installed" "$LOG"; then
+    echo "[test_dpkg_db] OK: dpkg -s on a missing package errors correctly"
+else
+    echo "[test_dpkg_db] MISS: dpkg -s on a missing package did not error"
     fail=1
 fi
 
