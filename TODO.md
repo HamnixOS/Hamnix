@@ -106,13 +106,11 @@ site. See `LANGUAGE.md` for the current surface.)
 
 ## Compiler
 
-- **U9 nested-frame Array spill (active bug).** `Array[N, T]` locals
-  with the same shape in caller + callee miscompile. Workaround:
-  inline the callee. See `memory/feedback_compiler_quirks.md`.
-- Unsigned-comparison codegen extended past `<`/`<=`/`>`/`>=` — also
-  need `shrq` (logical) for unsigned right-shift (today always signed
-  `sarq`), and `divq`/`modq` family for unsigned types (today always
-  signed `idivq`).
+- **Unsigned shift/divide codegen.** Unsigned-comparison codegen was
+  extended past `<`/`<=`/`>`/`>=`, but `>>` on an unsigned operand
+  still emits arithmetic `sarq` (needs logical `shrq`), and `/`/`%`
+  on unsigned operands still emit signed `idivq` (need `divq`). A
+  real correctness bug for unsigned-typed kernel code.
 - First-class function pointers — currently every indirect call
   drops into `asm_volatile("call *%rax")`. A real `Fn[R, *A]` type
   with proper SysV codegen would clean up dozens of asm helpers.

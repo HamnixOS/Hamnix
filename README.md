@@ -195,15 +195,14 @@ beyond MVP.
 | **`syscall_64.S` `%rdi` ABI fix** | Proposed — pending maintainer review, NOT landed | A fix to preserve `%rdi` across the syscall entry stub exists on a worktree branch but is held pending review (it touches a fenced file). Symptom it addresses: musl `open()` with `O_CLOEXEC` returns 0. |
 | **Inbound SSH** | Not yet started | Needed for "useful server OS" but no SSH protocol code exists. Crypto primitives are in place (ChaCha20-Poly1305, AES-128/256-GCM, X25519, SHA-256/384, ECDSA-P256, RSA-PSS); the SSH layer itself isn't. |
 | **busybox `ls` enumeration** | Open XFAIL | CPython 3.11.10 and busybox 1.36 run as musl static-PIE binaries in QEMU; `python3 -c` and a multi-applet `busybox sh` pipeline pass. But `busybox ls` directory enumeration prints nothing — musl's `opendir`/`readdir` round-trip the directory fd incorrectly (a direct `getdents64` syscall enumerates fine). busybox `sh`'s *internal* pipeline (`sh -c "a \| b"`) also trips a `#GP`. Both are marked XFAIL in the U-track tests. |
-| **U9 nested-frame Array spill** | Active compiler bug | `Array[N, T]` locals with the same shape in caller + callee miscompile. Workaround: inline the callee. See [`memory/feedback_compiler_quirks.md`](memory/feedback_compiler_quirks.md). |
-
-Four other compiler bugs landed proper fixes during the recent sessions
-(M16.135): `Ptr[T]` writes to `&local` sub-8-byte scalars, `&arr[i][j]`
-on 2-D Array globals, a confirmed-phantom cast-load report, and the
-already-fixed signed-only comparison rediscovery. Language quirks land
-in `tests/test_compiler_*.ad` as guarded regressions the moment they're
+Compiler bugs that surfaced during development have landed proper
+fixes — do not work around them: the U9 nested-frame `Array` spill,
+`Ptr[T]` writes to `&local` sub-8-byte scalars, `&arr[i][j]` on 2-D
+`Array` globals, string-literal-initialised globals, and the
+signed-only integer comparison. Language quirks land in
+`tests/test_compiler_*.ad` as guarded regressions the moment they're
 surfaced — see [`scripts/run_compiler_tests.sh`](scripts/run_compiler_tests.sh)
-(7 fixtures, all green).
+(9 fixtures, all green).
 
 ---
 
