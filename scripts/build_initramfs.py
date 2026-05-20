@@ -135,6 +135,20 @@ if os.environ.get("ENABLE_HTTP_REDIRECT_SMOKE") == "1":
 if os.environ.get("ENABLE_RING3_PROBE_UD2") == "1":
     FILES.append(("/etc/ring3-probe-ud2", b"1\n"))
 
+# M16.155-cr0-probe-verify: independent second probe using a
+# legal-but-privileged opcode (HLT = 0xF4) instead of UD2. HLT in
+# ring 3 raises #GP unconditionally on every x86 — different
+# microcode path from #UD, so if the UD2 probe stays silent on Asus
+# real hw but HLT fires `[trap-diag] vec=0x0d err=0`, we know ring-3
+# IS being entered and the absence of #UD is a UD2-fetch oddity
+# rather than a transition failure. The two markers are exclusive:
+# init/main.ad takes the HLT branch first; if neither marker is in
+# the cpio, /init bytes are left untouched and the default boot
+# proceeds normally. DEFAULT OFF — same regression-test rationale
+# as the UD2 marker above.
+if os.environ.get("ENABLE_RING3_PROBE_HLT") == "1":
+    FILES.append(("/etc/ring3-probe-hlt", b"1\n"))
+
 # apt-path V0: scripts/test_dpkg_deb_x.sh generates a tiny .deb
 # fixture on the host, points HAMNIX_DEB_FIXTURE at it, and this
 # block plants the bytes at /tests/sample.deb inside the cpio
