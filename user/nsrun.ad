@@ -1,0 +1,345 @@
+# user/nsrun.ad
+#
+# nsrun — the Plan 9-shape shim launcher for Hamnix.
+#
+# WHAT THIS IS
+# ------------
+# `nsrun <program> [args...]` runs `<program>` in a FRESH, private
+# namespace whose `/var` subtree is served by a live `distrofs` 9P
+# daemon instance — NOT by any global filesystem path. From inside
+# the launched program, a path like `/var/lib/dpkg/status` resolves
+# through 9P to that daemon; the parent shell's `/var` is untouched.
+#
+# This is the piece that makes Hamnix properly Plan 9-shaped for
+# package / distro tooling (apt, dpkg). It is `distrorun` generalised
+# from "graft initramfs cpio subdirs" to "mount a real userland 9P
+# file server", using the V4.1 real-fd kernel 9P client.
+#
+# WHY A NEW FILE (not a distrorun.ad edit)
+# ----------------------------------------
+# `distrorun` mounts a per-distro *backing directory* and its mount()
+# of that directory's fd is explicitly INERT (a Phase-C stub — see the
+# header of distrorun.ad). Its real work is four `bind`s of cpio
+# subdirs. `nsrun` instead spawns a 9P *daemon* and wires a live pipe-
+# pair transport to it; the spawn + pipe + srv_post + srv_open + the
+# "p9rx:" mount-spec magic are entirely new plumbing with no overlap.
+# Keeping them as peer binaries (deb-flavoured vs. 9P-flavoured) keeps
+# each file honest about what it does.
+#
+# THE SEQUENCE (Plan 9 invariant: rfork BEFORE mount)
+# ---------------------------------------------------
+#   1. sys_pipe(c2s)   client->server  (kernel writes T-msgs here)
+#      sys_pipe(s2c)   server->client  (kernel reads R-msgs here)
+#   2. sys_spawn("/bin/distrofs", argv, stdin=c2s_rfd, stdout=s2c_wfd)
+#      — distrofs reads 9P T-msgs on fd 0, writes R-msgs on fd 1.
+#   3. sys_srv_post("nsrun.distrofs", c2s_wfd) +
+#      srv_fd = sys_srv_open("nsrun.distrofs")
+#      — publish + re-open the T-msg writer end so mount() can consume
+#        it as a srvfd (a posted srv entry is the kernel's handle on
+#        a userland file server).
+#   4. sys_rfork(RFNAMEG)  — privatise THIS task's namespace FIRST, so
+#      the mount below lands ONLY in our (soon-to-be-exec'd) view and
+#      never pollutes the parent shell's Pgrp. RFNAMEG without RFPROC
+#      mutates the current task in place: pgrp_clone() deep-copies the
+#      mount table into a fresh Pgrp. exec() does NOT reset the Pgrp,
+#      so the launched program inherits exactly this namespace.
+#   5. sys_mount(srv_fd, -1, "/var", MREPL, "p9rx:<s2c_rfd>:")
+#      — the kernel runs Tversion + Tattach over the pipe pair and
+#        records a SRV-kind chan at /var. The "p9rx:<fd>:" prefix in
+#        the spec hands the kernel client the rx-side pipe fd (Hamnix
+#        pipes are unidirectional; see 9p_client.ad::_parse_rx_prefix).
+#   6. sys_execve(<program>, argv) — the program replaces nsrun in this
+#      same task. Its fd table + its private distrofs-backed namespace
+#      carry across exec untouched.
+#
+# After this, an open of `/var/<anything>` in the launched program
+# routes through fs/vfs.ad's chan_find_srv_prefix -> p9c_walk_open_path
+# / p9c_walk_create_path -> the distrofs daemon. The parent shell's
+# `/var` resolves to whatever it was (initramfs / nothing) because
+# nothing in the parent's Pgrp was rebound.
+#
+# SCOPE
+# -----
+# This is the launcher + mount plumbing ONLY. apt.ad / dpkg.ad are NOT
+# migrated to assume they run under nsrun — that is a follow-up. nsrun
+# just proves `nsrun <prog>` gives `<prog>` a distrofs-backed /var.
+#
+# Build: scripts/build_user.sh's build_adder_user list calls this;
+# the .elf lands at /bin/nsrun via build_initramfs.py's build/user/*
+# glob.
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_pipe(fds: Ptr[int32]) -> int32
+extern def sys_rfork(flags: int32) -> int32
+extern def sys_srv_post(name: Ptr[char], srvfd: int32) -> int32
+extern def sys_srv_open(name: Ptr[char]) -> int32
+extern def sys_mount(srvfd: int32, afd: int32, old: Ptr[char],
+                     flag: int32, spec: Ptr[char]) -> int32
+extern def sys_spawn(path: Ptr[char], argv: Ptr[uint64],
+                     stdin_fd: int32, stdout_fd: int32,
+                     envp: Ptr[uint64]) -> int32
+extern def sys_execve(path: Ptr[char], argv: Ptr[uint64],
+                      envp: Ptr[uint64]) -> int32
+extern def sys_errstr(buf: Ptr[uint8], nbuf: uint64) -> int32
+
+
+# Plan 9 rfork flag. RFNAMEG alone (no RFPROC) mutates the CURRENT
+# task in place — clones the namespace without spawning a child.
+# That is exactly what we want: privatise our own mount view, then
+# mount distrofs into it, then exec the target into the same task.
+RFNAMEG: int32 = 0x008
+
+# Plan 9 mount flag. MREPL replaces any existing binding at the
+# target path; the only sub-flag chan.ad honours today.
+MREPL: int32 = 0
+
+# afd = -1 means "no auth" (Plan 9 idiom; Hamnix has no fauth yet).
+NO_AFD: int32 = -1
+
+
+# -- top-level BSS scratch (U9 nested-frame-Array quirk) ----------------
+#
+# Arrays declared inside a function body that itself nests frames
+# mis-codegen on the Adder x86_64 backend; the in-tree workaround is
+# to hoist every Array to module scope. We do that for all of nsrun's
+# buffers below.
+
+c2s_fds:  Array[2, int32]      # client->server pipe (rfd, wfd)
+s2c_fds:  Array[2, int32]      # server->client pipe (rfd, wfd)
+spawn_argv: Array[2, uint64]   # argv passed to /bin/distrofs
+err_buf:  Array[128, uint8]    # sys_errstr scratch
+
+# mount spec "p9rx:<NN>:" + NUL — hands the rx-side pipe fd to the
+# kernel 9P client. 32 bytes is ample (prefix 5 + <= 20 digit + ':' +
+# NUL).
+spec_buf: Array[32, uint8]
+
+# distrofs is mounted at "/var" — the root of the distro-shaped tree
+# distrofs exports (/var, /var/lib/dpkg, /var/cache/apt, ...). A single
+# mount at /var covers every path the brief's verification target
+# (/var/lib/dpkg/) touches; distrofs' /usr and /etc roots are left for
+# a follow-up multi-mount once a real backing store exists.
+mount_path: Array[8, uint8]    # "/var" + NUL
+
+# The /srv leaf nsrun posts the distrofs T-msg writer under. Unique
+# per-launch is not required at this milestone (one nsrun at a time in
+# the test); a V1 follow-up would suffix the pid.
+srv_name: Array[16, uint8]     # "nsrun.distrofs" + NUL
+
+# Literal "/bin/distrofs" hoisted so its address is stable for argv.
+distrofs_path: Array[16, uint8]
+
+
+# -- tiny helpers -------------------------------------------------------
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+def write_errstr_line(prefix: Ptr[uint8]):
+    # Pull the kernel's per-process error string and emit
+    # "prefix: <errstr>\n" to stderr. Passing buf[0]==0 to sys_errstr
+    # gives pure read semantics; the kernel NUL-terminates the message.
+    err_buf[0] = 0
+    sys_errstr(&err_buf[0], 128)
+    write_str(2, prefix)
+    write_str(2, ": ")
+    write_str(2, &err_buf[0])
+    write_str(2, "\n")
+
+
+def init_strings():
+    # "/var" — distrofs mount point.
+    mount_path[0] = 47    # '/'
+    mount_path[1] = 118   # 'v'
+    mount_path[2] = 97    # 'a'
+    mount_path[3] = 114   # 'r'
+    mount_path[4] = 0
+    # "nsrun.distrofs" — the /srv leaf the T-msg writer is posted at.
+    srv_name[0]  = 110    # 'n'
+    srv_name[1]  = 115    # 's'
+    srv_name[2]  = 114    # 'r'
+    srv_name[3]  = 117    # 'u'
+    srv_name[4]  = 110    # 'n'
+    srv_name[5]  = 46     # '.'
+    srv_name[6]  = 100    # 'd'
+    srv_name[7]  = 105    # 'i'
+    srv_name[8]  = 115    # 's'
+    srv_name[9]  = 116    # 't'
+    srv_name[10] = 114    # 'r'
+    srv_name[11] = 111    # 'o'
+    srv_name[12] = 102    # 'f'
+    srv_name[13] = 115    # 's'
+    srv_name[14] = 0
+    # "/bin/distrofs" — the daemon binary.
+    distrofs_path[0]  = 47    # '/'
+    distrofs_path[1]  = 98    # 'b'
+    distrofs_path[2]  = 105   # 'i'
+    distrofs_path[3]  = 110   # 'n'
+    distrofs_path[4]  = 47    # '/'
+    distrofs_path[5]  = 100   # 'd'
+    distrofs_path[6]  = 105   # 'i'
+    distrofs_path[7]  = 115   # 's'
+    distrofs_path[8]  = 116   # 't'
+    distrofs_path[9]  = 114   # 'r'
+    distrofs_path[10] = 111   # 'o'
+    distrofs_path[11] = 102   # 'f'
+    distrofs_path[12] = 115   # 's'
+    distrofs_path[13] = 0
+
+
+def fill_spec(rx_fd: int32):
+    # Build "p9rx:<rx_fd>:var" + NUL into spec_buf. The mount `spec`
+    # argument does double duty:
+    #
+    #   * "p9rx:<rx_fd>:" — the kernel 9P client's _parse_rx_prefix
+    #     strips this prefix before Tversion runs and records <rx_fd>
+    #     as the connection's rx (R-msg) pipe fd (Hamnix pipes are
+    #     unidirectional, so the kernel needs the rx-side fd that
+    #     mount()'s single srvfd argument can't carry).
+    #
+    #   * "var" — the REMAINDER after the closing ':' is forwarded by
+    #     the kernel verbatim as the 9P Tattach `aname`. distrofs
+    #     honours a subtree aname (see user/distrofs.ad::_aname_root):
+    #     aname "var" attaches the client's root fid at distrofs' /var
+    #     node. That cancels with the "/var" mount-point prefix the
+    #     kernel strips, so /var/lib/dpkg/X in the namespace resolves
+    #     to distrofs' lib/dpkg/X under its var node.
+    spec_buf[0] = 112    # 'p'
+    spec_buf[1] = 57     # '9'
+    spec_buf[2] = 114    # 'r'
+    spec_buf[3] = 120    # 'x'
+    spec_buf[4] = 58     # ':'
+    pos: uint64 = 5
+    v: uint64 = cast[uint64](rx_fd)
+    if v == 0:
+        spec_buf[pos] = 48                       # '0'
+        pos = pos + 1
+    else:
+        digits: Array[20, uint8]
+        n: uint64 = 0
+        while v != 0:
+            digits[n] = cast[uint8](v % 10) + 48
+            v = v / 10
+            n = n + 1
+        while n > 0:
+            n = n - 1
+            spec_buf[pos] = digits[n]
+            pos = pos + 1
+    spec_buf[pos] = 58                           # ':'
+    pos = pos + 1
+    # Append the attach-subtree aname "var".
+    spec_buf[pos]     = 118   # 'v'
+    spec_buf[pos + 1] = 97    # 'a'
+    spec_buf[pos + 2] = 114   # 'r'
+    spec_buf[pos + 3] = 0
+
+
+# -- main ---------------------------------------------------------------
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    if argc < 2:
+        write_str(2,
+            "nsrun: usage: nsrun <program> [args...]\n")
+        return 1
+    init_strings()
+
+    # 1) Transport pipes. c2s carries client->server T-msgs; s2c carries
+    #    server->client R-msgs. Hamnix pipes are unidirectional, hence a
+    #    pair rather than one bidirectional fd.
+    if sys_pipe(&c2s_fds[0]) < 0:
+        write_errstr_line("nsrun: sys_pipe c2s failed")
+        return 1
+    if sys_pipe(&s2c_fds[0]) < 0:
+        write_errstr_line("nsrun: sys_pipe s2c failed")
+        return 1
+    c2s_rfd: int32 = c2s_fds[0]                  # distrofs reads T here
+    c2s_wfd: int32 = c2s_fds[1]                  # kernel writes T here
+    s2c_rfd: int32 = s2c_fds[0]                  # kernel reads R here
+    s2c_wfd: int32 = s2c_fds[1]                  # distrofs writes R here
+
+    # 2) Spawn the distrofs daemon. stdin = c2s_rfd (T-msgs in),
+    #    stdout = s2c_wfd (R-msgs out) — distrofs' wire transport is
+    #    exactly fd 0 / fd 1 (see user/distrofs.ad header). envp = 0.
+    spawn_argv[0] = cast[uint64](&distrofs_path[0])
+    spawn_argv[1] = 0
+    pid: int32 = sys_spawn(cast[Ptr[char]](&distrofs_path[0]),
+                           &spawn_argv[0],
+                           c2s_rfd, s2c_wfd,
+                           cast[Ptr[uint64]](0))
+    if pid < 0:
+        write_errstr_line("nsrun: spawn /bin/distrofs failed")
+        return 1
+    write_str(2, "[nsrun] distrofs daemon spawned\n")
+
+    # The child has its own dups of the inherited ends; drop the
+    # launcher-side copies of the two ends distrofs owns. We KEEP
+    # c2s_wfd (kernel-write T) and s2c_rfd (kernel-read R) — the kernel
+    # 9P client needs both to reach the daemon.
+    sys_close(c2s_rfd)
+    sys_close(s2c_wfd)
+
+    # 3) Publish the T-msg writer end on /srv, then re-open it. mount()
+    #    consumes a srvfd that "speaks 9P"; sys_srv_open hands back a
+    #    fresh fd dup'd onto the posted writer end. (Posting then
+    #    re-opening is the Plan 9 srv(3) idiom — it gives the kernel a
+    #    clean fd-table handle independent of our own bookkeeping fd.)
+    if sys_srv_post(cast[Ptr[char]](&srv_name[0]), c2s_wfd) < 0:
+        write_errstr_line("nsrun: sys_srv_post failed")
+        return 1
+    srv_fd: int32 = sys_srv_open(cast[Ptr[char]](&srv_name[0]))
+    if srv_fd < 0:
+        write_errstr_line("nsrun: sys_srv_open failed")
+        return 1
+
+    # 4) Privatise the namespace BEFORE the mount. rfork(RFNAMEG)
+    #    without RFPROC clones THIS task's Pgrp (mount table) in place.
+    #    Doing this first is the Plan 9 invariant: the mount below then
+    #    lands ONLY in our private view; the parent shell's /var is
+    #    never touched. exec() (step 6) does not reset the Pgrp, so the
+    #    launched program inherits exactly this namespace.
+    if sys_rfork(RFNAMEG) < 0:
+        write_errstr_line("nsrun: rfork(RFNAMEG) failed")
+        return 1
+    write_str(2, "[nsrun] private namespace cloned\n")
+
+    # 5) Mount the distrofs 9P server at /var. The kernel runs
+    #    Tversion + Tattach over the pipe pair inside do_mount; the
+    #    "p9rx:<s2c_rfd>:" spec hands the client the rx-side fd so
+    #    _p9_recv reads R-msgs from the right pipe slot.
+    fill_spec(s2c_rfd)
+    rc: int32 = sys_mount(srv_fd, NO_AFD,
+                          cast[Ptr[char]](&mount_path[0]),
+                          MREPL,
+                          cast[Ptr[char]](&spec_buf[0]))
+    if rc < 0:
+        write_errstr_line("nsrun: mount distrofs at /var failed")
+        return 1
+    write_str(2, "[nsrun] distrofs mounted at /var\n")
+
+    # 6) Exec the target program. It replaces nsrun in this task —
+    #    inheriting this task's fd table (including srv_fd / c2s_wfd /
+    #    s2c_rfd, which the kernel 9P connection keeps using) and this
+    #    task's private distrofs-backed namespace. argv[1..argc-1]
+    #    becomes the program's argv; envp forwarded as 0 (native exec
+    #    ignores it).
+    target: Ptr[char] = cast[Ptr[char]](argv[1])
+    new_argv: Ptr[uint64] = cast[Ptr[uint64]](
+        cast[uint64](argv) + cast[uint64](8))    # &argv[1]
+    write_str(2, "[nsrun] exec target in namespace\n")
+    sys_execve(target, new_argv, cast[Ptr[uint64]](0))
+
+    # Only reached if exec failed.
+    write_errstr_line("nsrun: exec failed")
+    write_str(2, "nsrun: target was: ")
+    write_str(2, cast[Ptr[uint8]](target))
+    write_str(2, "\n")
+    return 1

@@ -125,6 +125,7 @@ build_adder_user distrorun            # Phase C.5: distro-shape namespace entry
 build_adder_user hamwd                # Phase D: Hamnix Window Daemon (Layer 3 / 9P file server skeleton)
 build_adder_user p9srv_demo           # Phase D / V4: minimum-viable userspace 9P server (test fixture)
 build_adder_user distrofs             # Plan 9 distro: userland 9P file-server daemon for the distro /var tree
+build_adder_user nsrun                 # Plan 9 shim launcher: runs a program in a private distrofs-backed namespace
 build_adder_user dpkg_deb             # apt-path V0: extract data.tar.gz from a .deb to a target dir
 build_adder_user dpkg                 # apt-path V1: parse control + record installed package in dpkg DB
 build_adder_user apt                  # apt-path V0: fetch + decompress + parse a Debian repo index over HTTP
