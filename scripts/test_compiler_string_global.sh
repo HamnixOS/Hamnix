@@ -52,6 +52,8 @@ fi
 
 echo "[string_global] (2/3) Build tests/test_compiler_string_global.ad"
 INIT_ELF=build/user/test_compiler_string_global.elf
+# _build_lock.sh auto-wipes build/user each run; recreate it first.
+mkdir -p build/user
 if ! python3 -m compiler.adder compile --target=x86_64-adder-user \
         tests/test_compiler_string_global.ad -o "$INIT_ELF" \
         >"$TMP/build.log" 2>&1; then

@@ -20,6 +20,8 @@ TMP="$(mktemp -d)"
 trap "rm -rf $TMP" EXIT
 
 INIT_ELF=build/user/test_compiler_nested_class_fields.elf
+# _build_lock.sh auto-wipes build/user each run; recreate it first.
+mkdir -p build/user
 python3 -m compiler.adder compile --target=x86_64-adder-user \
     tests/test_compiler_nested_class_fields.ad -o "$INIT_ELF" \
     >"$TMP/build.log" 2>&1 || {

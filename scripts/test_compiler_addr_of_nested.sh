@@ -19,6 +19,8 @@ ROOT="$(pwd)"
 TMP="$(mktemp -d)"
 trap "rm -rf $TMP" EXIT
 INIT_ELF=build/user/test_compiler_addr_of_nested.elf
+# _build_lock.sh auto-wipes build/user each run; recreate it first.
+mkdir -p build/user
 python3 -m compiler.adder compile --target=x86_64-adder-user \
     tests/test_compiler_addr_of_nested.ad -o "$INIT_ELF" >"$TMP/build.log" 2>&1 || {
     echo "[addr_of_nested] FAIL: fixture did not compile"

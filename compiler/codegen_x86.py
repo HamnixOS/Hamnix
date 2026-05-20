@@ -1406,23 +1406,41 @@ class X86CodeGen:
             case BinOp.BIT_XOR:
                 self.emit("    xorq %rcx, %rax")
             case BinOp.SHL:
-                # x86 shift count must be in %cl.
+                # x86 shift count must be in %cl. shlq is correct for both
+                # signed and unsigned operands (the low bits are identical).
                 self.emit("    shlq %cl, %rax")
             case BinOp.SHR:
-                # Logical shift right (Adder ints are non-negative for M2).
-                self.emit("    shrq %cl, %rax")
+                # Right shift must honour operand signedness: sarq for a
+                # signed operand (sign-extends, arithmetic), shrq for an
+                # unsigned operand (zero-fills, logical). Emitting shrq for
+                # a negative signed value, or sarq for an unsigned value
+                # with the high bit set, both corrupt the result. See
+                # _binop_signed_op for the operand-signedness rule.
+                if self._binop_signed_op(left, right):
+                    self.emit("    sarq %cl, %rax")
+                else:
+                    self.emit("    shrq %cl, %rax")
             case BinOp.DIV | BinOp.IDIV:
-                # divq divides %rdx:%rax by the operand and leaves the
-                # quotient in %rax, remainder in %rdx. We zero %rdx for
-                # an unsigned 64/64 → 64 division — Adder uint types
-                # all share the 64-bit encoding, and current call sites
-                # (PIT divisor math) are non-negative. When signed
-                # division is needed we'll branch on operand type.
-                self.emit("    xorq %rdx, %rdx")
-                self.emit("    divq %rcx")
+                # Division must honour operand signedness. divq is the
+                # unsigned 64/64 -> 64 division (dividend in %rdx:%rax,
+                # %rdx zeroed); idivq is the signed form (dividend
+                # sign-extended into %rdx via cqo). Emitting divq for a
+                # negative dividend, or idivq for an unsigned dividend
+                # with the high bit set, both yield a wrong quotient.
+                if self._binop_signed_op(left, right):
+                    self.emit("    cqo")
+                    self.emit("    idivq %rcx")
+                else:
+                    self.emit("    xorq %rdx, %rdx")
+                    self.emit("    divq %rcx")
             case BinOp.MOD:
-                self.emit("    xorq %rdx, %rdx")
-                self.emit("    divq %rcx")
+                # Same signedness rule as DIV; remainder lands in %rdx.
+                if self._binop_signed_op(left, right):
+                    self.emit("    cqo")
+                    self.emit("    idivq %rcx")
+                else:
+                    self.emit("    xorq %rdx, %rdx")
+                    self.emit("    divq %rcx")
                 self.emit("    movq %rdx, %rax")
             case BinOp.EQ:
                 self._cmp_set("e")
@@ -1517,6 +1535,37 @@ class X86CodeGen:
                 "ge": "ae",
             }[signed_cc]
         return signed_cc
+
+    def _binop_signed_op(self, left: Expr, right: Expr) -> bool:
+        """Decide whether a `>>` / `/` / `%` should use the SIGNED machine
+        instruction (sarq / idivq) rather than the unsigned one (shrq /
+        divq).
+
+        x86 has separate signed and unsigned forms for right-shift and
+        division because the instruction, not the data, carries the
+        signedness:
+            shift:  sarq (signed, sign-extends) vs shrq (unsigned, zero-fill)
+            divide: idivq (signed, cqo-extended) vs divq (unsigned, %rdx=0)
+        Picking the wrong one corrupts any value the choice actually
+        matters for — a negative signed operand under shrq/divq, or an
+        unsigned operand with the high bit set under sarq/idivq.
+
+        Rule (C's usual-arithmetic-conversion: unsigned wins on a mix):
+          * either operand known-unsigned        -> UNSIGNED
+          * an operand known-signed, none unsigned -> SIGNED
+          * both operands of unknown type          -> UNSIGNED (default)
+        The unknown-default is unsigned because Adder kernel code is
+        overwhelmingly unsigned arithmetic (uint64 register/bit math) and
+        that is also the long-standing behaviour this backend shipped;
+        only an explicitly signed operand opts into the signed form.
+        """
+        lu = self._is_unsigned_type(self.get_expr_type(left))
+        ru = self._is_unsigned_type(self.get_expr_type(right))
+        if lu is True or ru is True:
+            return False
+        # No operand is known-unsigned: signed iff some operand is
+        # known-signed (lu/ru is False). All-unknown stays unsigned.
+        return lu is False or ru is False
 
     def _cmp_set(self, cc: str) -> None:
         """Compare %rax to %rcx, then materialize a 0/1 result in %rax."""

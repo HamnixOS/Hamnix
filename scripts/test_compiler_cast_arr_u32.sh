@@ -19,6 +19,8 @@ ROOT="$(pwd)"
 TMP="$(mktemp -d)"
 trap "rm -rf $TMP" EXIT
 INIT_ELF=build/user/test_compiler_cast_arr_u32.elf
+# _build_lock.sh auto-wipes build/user each run; recreate it first.
+mkdir -p build/user
 python3 -m compiler.adder compile --target=x86_64-adder-user \
     tests/test_compiler_cast_arr_u32.ad -o "$INIT_ELF" >"$TMP/build.log" 2>&1 || {
     echo "[cast_arr_u32] FAIL: fixture did not compile"
