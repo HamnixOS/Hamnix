@@ -74,4 +74,20 @@ if ! flock -x -w "$_HAMNIX_BUILD_LOCK_TIMEOUT" 200; then
          "Override timeout: HAMNIX_BUILD_LOCK_TIMEOUT=<seconds>" >&2
     exit 1
 fi
+
+# Auto-wipe stale compiled outputs so every test starts from a clean
+# build. A build interrupted hard (kill -9 of a compiler.adder compile)
+# leaves TRUNCATED .elf / blob artifacts that the incremental rebuild
+# won't regenerate — silently poisoning the next test (e.g. a kernel
+# that boots to nothing, or a "not found" for an embedded binary).
+# We hold the build lock here, so nothing races this wipe.
+#   - WIPED: compiled code outputs (the poison surface).
+#   - SPARED: build/*.img disk images (some tests persist + reuse them)
+#             and build/.build_lock (a dotfile; * doesn't match it, and
+#             fd 200 stays valid regardless).
+rm -rf "$_HAMNIX_BUILD_LOCK_DIR"/user "$_HAMNIX_BUILD_LOCK_DIR"/mod \
+       "$_HAMNIX_BUILD_LOCK_DIR"/iso "$_HAMNIX_BUILD_LOCK_DIR"/*.elf \
+       "$_HAMNIX_BUILD_LOCK_DIR"/*.iso 2>/dev/null || true
+rm -f "$_HAMNIX_BUILD_LOCK_DIR/../fs/initramfs_blob.S" 2>/dev/null || true
+
 export HAMNIX_BUILD_LOCK_HELD="$_HAMNIX_BUILD_LOCK"
