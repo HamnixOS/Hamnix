@@ -89,10 +89,47 @@ bash scripts/build_modules.sh
 # shell. test scripts override this with their own fixtures; the
 # default (and the human-facing real-hardware boot) is hamsh.
 INIT_ELF=build/user/hamsh.elf python3 scripts/build_initramfs.py
+
+# Stale/partial-intermediate guard. Belt-and-braces for the
+# recurring "multiboot1 magic not found" false failure (the primary
+# root cause is the SIGPIPE race fixed in the magic check below):
+#
+#   `ld` writes its output file IN PLACE, incrementally, and is NOT
+#   atomic. If a prior build_iso.sh (or any test_*.sh that wraps it)
+#   is killed mid-link — agents routinely `timeout` their boot tests,
+#   and cron kills runs — `ld` leaves a truncated/partial ELF sitting
+#   at the final path build/hamnix-vmlinux.elf. The multiboot1 magic
+#   lives at file offset 0x1000; a file truncated before that point
+#   has no magic.
+#
+# Fix, in two parts:
+#   1. Delete any leftover build/hamnix-vmlinux.elf up front, so the
+#      magic check can never see a stale partial file from an aborted
+#      prior run.
+#   2. Compile to a unique temp path in build/, then `mv` it into the
+#      final name. A rename within the same filesystem is atomic — a
+#      reader either sees the complete file or no file at all, never a
+#      half-written prefix. If THIS run is interrupted mid-link, only
+#      the temp file is damaged; the final name is never a partial.
+rm -f "$HAMNIX_KERNEL"
+KERNEL_TMP="${HAMNIX_KERNEL}.tmp.$$"
+rm -f "$KERNEL_TMP"
+# Clean any orphaned *.tmp.* from earlier interrupted runs so build/
+# doesn't accumulate junk (best-effort; never fatal).
+rm -f "${HAMNIX_KERNEL}".tmp.* 2>/dev/null || true
 python3 -m compiler.adder compile \
     --target=x86_64-bare-metal \
     init/main.ad \
-    -o "$HAMNIX_KERNEL"
+    -o "$KERNEL_TMP"
+if [ ! -f "$KERNEL_TMP" ]; then
+    echo "[build_iso] ERROR: compiler did not produce $KERNEL_TMP" >&2
+    exit 1
+fi
+# Flush the freshly-linked ELF to stable storage, then atomically
+# publish it under the final name. The magic check below therefore
+# runs strictly AFTER the file is fully written and renamed into place.
+sync "$KERNEL_TMP" 2>/dev/null || sync
+mv -f "$KERNEL_TMP" "$HAMNIX_KERNEL"
 
 echo "[build_iso] Using kernel: $HAMNIX_KERNEL"
 file "$HAMNIX_KERNEL"
@@ -100,8 +137,40 @@ file "$HAMNIX_KERNEL"
 # Verify the multiboot1 magic before we bother grub. If the magic is
 # missing, grub will silently boot to an unhelpful "you need to load
 # the kernel first" prompt.
-if ! od -An -tx4 -N8192 "$HAMNIX_KERNEL" | tr -s ' \n' '\n' | grep -q '^1badb002$'; then
+#
+# ROOT CAUSE of the recurring spurious "multiboot1 magic not found"
+# false failure (do NOT revert this to the old one-liner):
+#
+#   The old check was:
+#       od ... | tr ... | grep -q '^1badb002$'
+#   under `set -o pipefail`. `grep -q` exits the instant it sees the
+#   first match — i.e. as soon as the magic word streams past. When
+#   `grep` then closes the read end of the pipe, the still-running
+#   upstream `tr` (which has ~8 KiB more to write) gets SIGPIPE and
+#   dies with exit status 141 (128 + SIGPIPE). With `pipefail`, the
+#   pipeline's status becomes that rightmost non-zero 141, the `if !`
+#   negates it to "true", and the build aborts — even though the
+#   magic was found. It is intermittent purely on scheduling: if `tr`
+#   happens to flush its whole output before `grep -q` exits, the run
+#   succeeds (PIPESTATUS 0 0 0); otherwise it fails (PIPESTATUS
+#   0 141 0). Measured ~2-in-3 spurious failures under load.
+#
+# FIX: materialise the dump into a variable FIRST (a command
+# substitution — no pipe is live while we search), then search the
+# string with bash's own pattern match. No process can be SIGPIPE'd,
+# so the result depends only on the file contents, never on timing.
+# By construction (atomic mv above) this also reads a complete,
+# freshly-built ELF, never a stale/partial one.
+MAGIC_DUMP=$(od -An -tx4 -N8192 "$HAMNIX_KERNEL" | tr -s ' \n' ' ')
+if [[ " $MAGIC_DUMP " != *" 1badb002 "* ]]; then
+    KERNEL_SIZE=$(stat -c%s "$HAMNIX_KERNEL" 2>/dev/null || echo '?')
     echo "[build_iso] ERROR: multiboot1 magic 0x1BADB002 not found in first 8 KiB of $HAMNIX_KERNEL" >&2
+    echo "[build_iso]   file size = ${KERNEL_SIZE} bytes; magic is expected at offset 0x1000." >&2
+    echo "[build_iso]   This ELF was just freshly built and atomically renamed into place," >&2
+    echo "[build_iso]   and the check no longer races on SIGPIPE, so a stale/partial" >&2
+    echo "[build_iso]   intermediate is ruled out — this is a genuine kernel-image" >&2
+    echo "[build_iso]   regression. Inspect arch/x86/boot/header.S and the linker" >&2
+    echo "[build_iso]   script arch/x86/kernel/vmlinux.lds." >&2
     exit 1
 fi
 
