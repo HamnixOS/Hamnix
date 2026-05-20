@@ -42,7 +42,7 @@
 # vaddr; gaps are part of the same allocation.
 
 from mm.memblock import memblock_alloc
-from mm.page_alloc import alloc_page
+from mm.page_alloc import alloc_page, alloc_pages
 from kernel.printk.printk import printk0, printk1, printk2
 from kernel.panic import panic
 # U42: PT_INTERP loading needs to look up the interpreter binary
@@ -125,6 +125,33 @@ elf_last_user_vlow:      uint64 = 0
 elf_last_user_vhigh:     uint64 = 0
 elf_last_user_phys_base: uint64 = 0
 ELF_ET_EXEC: uint16 = 2
+
+# Per-process address space (fork) support.
+#
+# Hamnix runs ET_DYN binaries identity-mapped: the user virtual address
+# of every loaded segment EQUALS the physical address of the memblock
+# region the loader copied them into. There is therefore no per-process
+# isolation by default — every task's PML4 is a verbatim clone of the
+# BSP's and the lower-level page tables are shared.
+#
+# fork() needs a CHILD that has a PRIVATE copy of every writable region
+# (ELF .data/.bss, the brk heap, the user stack, anonymous mmaps) but
+# mapped at the SAME virtual address as the parent — otherwise every
+# absolute pointer the child inherits (saved %rbp chain, return
+# addresses, glibc's _IO_2_1_stdout_ FILE struct, the TCB) would point
+# at the PARENT's physical memory and the two processes would trample
+# each other.
+#
+# elf_last_img_lo / elf_last_img_hi record the page-aligned virtual
+# span of the WHOLE loaded ELF image (code + rodata + data + bss) so
+# do_clone can copy it wholesale into the child's private pages. For
+# ET_DYN this is [region, region + span); for ET_EXEC it is the
+# link-time [vlow, vhigh). Whole-image (not just the writable segment)
+# keeps the copy logic simple and guarantees zero aliasing — the few
+# hundred KiB of read-only .text duplicated per process is a cheap
+# price for a correct address space, and a COW pass can de-dup it later.
+elf_last_img_lo: uint64 = 0
+elf_last_img_hi: uint64 = 0
 
 # Set by elf_load_blob to 1 when the just-loaded image is a Linux-ABI
 # binary (OSABI=Linux or PT_INTERP present). Consumed by SYS_SPAWN /
@@ -361,6 +388,10 @@ def _load_elf64(blob: Ptr[uint8], blob_size: uint64) -> uint64:
     app_user_vlow:  uint64 = 0
     app_user_vhigh: uint64 = 0
     app_user_phys:  uint64 = 0
+    # Whole-image virtual span, page-aligned, for fork's address-space
+    # copy. `span` is already 4 KiB-rounded above.
+    app_img_lo: uint64 = 0
+    app_img_hi: uint64 = 0
     if e_type == cast[uint32](ELF_ET_EXEC):
         app_needs_map  = 1
         app_user_vlow  = lowest_v
@@ -368,11 +399,17 @@ def _load_elf64(blob: Ptr[uint8], blob_size: uint64) -> uint64:
         app_user_phys  = region
         app_load_base  = lowest_v
         app_entry_user = e_entry
+        app_img_lo     = lowest_v
+        app_img_hi     = lowest_v + span
         printk2("elf64: ET_EXEC user-map: [0x%x, 0x%x)\n",
                 lowest_v, lowest_v + span)
     else:
         app_load_base  = region
         app_entry_user = region + (e_entry - lowest_v)
+        # ET_DYN runs identity-mapped at `region`; the image occupies
+        # [region, region + span).
+        app_img_lo     = region
+        app_img_hi     = region + span
 
     # PT_INTERP: dynamic ELF. Recursively load the interpreter and
     # return its entry as the user-mode RIP. Only honoured at the
@@ -404,6 +441,8 @@ def _load_elf64(blob: Ptr[uint8], blob_size: uint64) -> uint64:
         elf_last_user_vhigh      = app_user_vhigh
         elf_last_user_phys_base  = app_user_phys
         elf_last_app_entry_user  = app_entry_user
+        elf_last_img_lo          = app_img_lo
+        elf_last_img_hi          = app_img_hi
         printk2("elf64: dynamic load: interp_base=0x%x interp_entry=0x%x\n",
                 elf_last_interp_base, interp_entry)
         return interp_entry
@@ -420,6 +459,8 @@ def _load_elf64(blob: Ptr[uint8], blob_size: uint64) -> uint64:
     elf_last_user_vlow      = app_user_vlow
     elf_last_user_vhigh     = app_user_vhigh
     elf_last_user_phys_base = app_user_phys
+    elf_last_img_lo         = app_img_lo
+    elf_last_img_hi         = app_img_hi
     return app_entry_user
 
 
@@ -974,3 +1015,151 @@ def elf_last_needs_user_map_get() -> int32:
     # Accessor for the caller — saves a direct module-global read at
     # the call site without exporting elf_last_needs_user_map itself.
     return elf_last_needs_user_map
+
+
+def elf_last_img_lo_get() -> uint64:
+    # Accessor: page-aligned low vaddr of the most-recently-loaded ELF
+    # image. do_execve stashes this on the task so fork can copy it.
+    return elf_last_img_lo
+
+
+def elf_last_img_hi_get() -> uint64:
+    # Accessor: page-aligned high vaddr of the most-recently-loaded ELF
+    # image.
+    return elf_last_img_hi
+
+
+# ---------------------------------------------------------------------
+# Per-process address space — fork()'s private-copy machinery.
+# ---------------------------------------------------------------------
+#
+# vm_fork_copy_range() is the keystone of a real per-process address
+# space. Given a CHILD PML4 and a virtual range [vlo, vhi) that the
+# PARENT currently owns, it:
+#
+#   1. allocates fresh physical pages (in <=4 MiB alloc_pages chunks,
+#      since the buddy allocator's MAX_ORDER caps a single request at
+#      4 MiB),
+#   2. copies the parent's bytes from [vlo, vhi) into those pages
+#      (the kernel reads the parent range at its identity vaddr —
+#      every region we copy is identity-mapped, so a plain memcpy from
+#      the vaddr reads the parent's physical bytes),
+#   3. installs a mapping into the CHILD's PML4 that re-points the
+#      SAME virtual range [vlo, vhi) at the freshly-copied physical
+#      pages.
+#
+# After this the child, running on its own PML4, sees the identical
+# virtual addresses the parent does — so every absolute pointer the
+# child inherited (saved %rbp, return addresses, glibc FILE structs,
+# the TCB) stays valid — but every WRITE lands in the child's private
+# physical memory. Parent and child no longer trample each other.
+#
+# This reuses elf_install_user_mapping's page-table walker, which
+# already knows how to crack the BSP's shared 1 GiB / 2 MiB identity
+# entries into per-task 4 KiB PTEs inside one task's PML4 without
+# disturbing the kernel half or any other task.
+#
+# Returns 0 on success, -1 on OOM / a range elf_install_user_mapping
+# refuses (kernel-image collision, or a range that spans a 1 GiB
+# boundary — neither happens for the regions fork copies, all of which
+# are single allocator chunks well clear of the kernel image).
+
+# 4 MiB — one MAX_ORDER alloc_pages chunk. Copy bigger ranges piecewise.
+VM_FORK_CHUNK: uint64 = 0x400000
+
+
+def vm_fork_copy_range(child_pml4: uint64, vlo_in: uint64,
+                       vhi_in: uint64) -> int32:
+    # Page-align the range outward so partial pages at either end are
+    # still fully backed (callers pass already-aligned ranges, but a
+    # defensive round keeps the PT walker's alignment asserts happy).
+    if vhi_in <= vlo_in:
+        return 0
+    vlo: uint64 = vlo_in & ~cast[uint64](PAGE_SIZE_4K - 1)
+    vhi: uint64 = (vhi_in + PAGE_SIZE_4K - 1) \
+                  & ~cast[uint64](PAGE_SIZE_4K - 1)
+    cur: uint64 = vlo
+    do:
+        chunk: uint64 = vhi - cur
+        if chunk > VM_FORK_CHUNK:
+            chunk = VM_FORK_CHUNK
+        # alloc_pages takes a buddy order; size up to the next power of
+        # two number of pages that covers `chunk`.
+        pages_needed: uint64 = chunk / PAGE_SIZE_4K
+        order: int32 = 0
+        cap: uint64 = 1
+        while cap < pages_needed:
+            cap = cap * 2
+            order = order + 1
+        phys: uint64 = alloc_pages(order)
+        if phys == 0:
+            printk1("vm_fork: OOM copying range chunk size=%d\n", chunk)
+            return -1
+        # Copy the parent's bytes. Parent's [cur, cur+chunk) is
+        # identity-mapped, so reading from the vaddr reads parent
+        # physical memory directly.
+        memcpy(cast[Ptr[uint8]](phys),
+               cast[Ptr[uint8]](cur), chunk)
+        # Remap [cur, cur+chunk) -> phys in the CHILD's PML4 only.
+        rc: int32 = elf_install_user_mapping(child_pml4, cur,
+                                             cur + chunk, phys)
+        if rc < 0:
+            printk2("vm_fork: install failed for [0x%x, 0x%x)\n",
+                    cur, cur + chunk)
+            return -1
+        cur = cur + chunk
+    while cur < vhi
+    return 0
+
+
+def vm_fork_install_all(child_pml4: uint64,
+                        img_lo: uint64, img_hi: uint64,
+                        brk_lo: uint64, brk_max: uint64,
+                        ust_lo: uint64, ust_sz: uint64,
+                        sp_fallback: uint64) -> int32:
+    # One-shot: give a forked child a PRIVATE physical copy of the
+    # three fixed writable regions — the loaded ELF image, the brk
+    # heap, and the user stack — each remapped at the SAME virtual
+    # address in the child's PML4. (mmap VMAs are copied separately by
+    # mm/vma.ad::vma_fork_copy, which the caller invokes too.)
+    #
+    # Any region whose range is unset (lo == 0 or empty) is skipped:
+    #   * a native Hamnix ELF32 binary has no recorded image span,
+    #   * a process that never called brk() has brk_lo == 0,
+    #   * a task with no recorded stack region falls back to copying
+    #     the single page around sp_fallback (the user RSP) so the
+    #     child at least doesn't alias the parent's live frame.
+    #
+    # Returns 0 on success, -1 on OOM / a refused mapping. Shared by
+    # do_clone (Linux fork) and do_rfork (Plan 9 rfork).
+    if img_lo != 0 and img_hi > img_lo:
+        if vm_fork_copy_range(child_pml4, img_lo, img_hi) < 0:
+            return -1
+    if brk_lo != 0 and brk_max > brk_lo:
+        if vm_fork_copy_range(child_pml4, brk_lo, brk_max) < 0:
+            return -1
+    if ust_lo != 0 and ust_sz != 0:
+        if vm_fork_copy_range(child_pml4, ust_lo, ust_lo + ust_sz) < 0:
+            return -1
+    elif sp_fallback != 0:
+        sp_pg: uint64 = sp_fallback & ~cast[uint64](PAGE_SIZE_4K - 1)
+        if vm_fork_copy_range(child_pml4, sp_pg,
+                              sp_pg + PAGE_SIZE_4K) < 0:
+            return -1
+    return 0
+
+
+def vm_fork_copy_install(child_pml4: uint64, vlo: uint64,
+                         vhi: uint64, phys_base: uint64) -> int32:
+    # Thin wrapper: the caller already allocated `phys_base` and copied
+    # the parent's bytes into it; this just installs the same-vaddr
+    # remapping into the child's PML4. Used by mm/vma.ad's per-VMA
+    # fork copy, where the VmaNode's own page-allocation already
+    # produced the physical backing.
+    if vhi <= vlo:
+        return 0
+    vlo_a: uint64 = vlo & ~cast[uint64](PAGE_SIZE_4K - 1)
+    vhi_a: uint64 = (vhi + PAGE_SIZE_4K - 1) \
+                    & ~cast[uint64](PAGE_SIZE_4K - 1)
+    return elf_install_user_mapping(child_pml4, vlo_a, vhi_a,
+                                    phys_base)

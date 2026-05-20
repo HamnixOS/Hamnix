@@ -36,14 +36,21 @@ from kernel.sched.core import (
     alloc_note_group_id,
     task_table_size,
     set_current_errstr,
+    # Per-process address space: rfork's new-process path gives the
+    # child a private copy of the parent's image / heap / stack — same
+    # machinery do_clone uses for Linux fork().
+    task_image_lo, task_image_hi, set_task_image_range,
+    task_ustack_lo, task_ustack_sz, set_task_ustack_range,
+    task_brk_base, task_brk_end, task_brk_max, set_task_brk_range,
 )
+from fs.elf import vm_fork_install_all
+from mm.vma import vma_fork_copy
 # task_table is module-private to core.ad; we need a per-slot read of
 # the saved kernel-stack pointer so we can patch the callee-saved
 # %rbp slot in the child's initial-stack image. Going through a small
 # helper keeps the access pattern explicit. The function lives in
 # kernel/sched/core.ad and is added in M16.98 specifically for this.
 from kernel.sched.core import task_initial_sp
-from mm.page_alloc import alloc_page
 from kernel.printk.printk import printk0, printk1
 # V2.5: per-process group (Pgrp) lifecycle. pgrp_clone() deep-copies
 # the parent's mtab into a fresh slot (ref=1); pgrp_alloc() hands back
@@ -318,63 +325,67 @@ def do_rfork(flags: int32, user_rbp: uint64) -> int32:
     parent_user_rsp: uint64 = cast[Ptr[uint64]](kstack_top - 8)[0] + 8
     parent_user_rip: uint64 = cast[Ptr[uint64]](kstack_top - 24)[0]
 
-    # Deep-copy the parent's user stack page so the child has its own
-    # locals + return chain. Identical to do_clone()'s fork branch —
-    # we don't have COW MMU plumbing yet, so the eager copy stands in.
-    parent_ustack_top: uint64 = (parent_user_rsp + 4095) & ~cast[uint64](4095)
-    parent_ustack_base: uint64 = parent_ustack_top - 4096
-    child_ustack_base: uint64 = alloc_page()
-    if child_ustack_base == 0:
-        set_current_errstr("rfork: out of memory")
-        return -11                              # -EAGAIN
-    memcpy(cast[Ptr[uint8]](child_ustack_base),
-           cast[Ptr[uint8]](parent_ustack_base), 4096)
-    rsp_offset: uint64 = parent_user_rsp - parent_ustack_base
-    child_user_rsp: uint64 = child_ustack_base + rsp_offset
-
-    # Create the child. create_user_task_argv with a non-zero user_rsp
-    # skips its own fresh-ustack allocation and plants our supplied
-    # RSP straight into the iret frame; argc/argv go into rdi/rsi
-    # (irrelevant on the rfork return path — userland's rfork wrapper
-    # doesn't read those after syscall return). _build_initial_kstack
-    # zero-fills the rax slot, which is exactly what we want: the
-    # child sees a 0 return value from rfork().
+    # Create the child. The new-process rfork gives the child a real
+    # PRIVATE address space — same machinery as do_clone's fork path.
+    # Because every writable region is copied into the child's own
+    # physical pages but remapped at the SAME virtual address, the
+    # child's RSP and the saved %rbp chain are IDENTICAL to the
+    # parent's — no per-page translation is needed. We pass
+    # parent_user_rsp straight in; the non-zero value tells
+    # create_user_task_argv to skip its own ustack allocation and
+    # plant our RSP into the iret frame. _build_initial_kstack
+    # zero-fills the rax slot, so the child sees a 0 return from
+    # rfork().
     slot: int32 = create_user_task_argv(
         parent_user_rip,
         0x5f5f72666f726b5f,                     # "__rfork_"
-        child_user_rsp,
+        parent_user_rsp,
         0, 0,
     )
     if slot < 0:
-        # Couldn't allocate a task slot. The kstack page we already
-        # reserved leaks — same as do_clone's fork branch (no
-        # alloc_page reclaim path yet).
         set_current_errstr("rfork: out of tasks")
         return -11                              # -EAGAIN
+    pidx: uint64 = current_idx_get()
+    child_pml4: uint64 = task_pml4(slot)
+    cslot: uint64 = cast[uint64](slot)
+
+    # Private-copy the parent's three fixed writable regions (ELF
+    # image, brk heap, user stack) into the child's PML4 at the same
+    # virtual addresses. For a native Hamnix ELF32 binary (the
+    # test_rfork fixture) image_lo / brk_base are 0 and those copies
+    # are skipped — only the stack-page fallback runs, which is the
+    # behaviour the native fixture relied on before. For a Linux-ABI
+    # rfork caller this is the full per-process address space.
+    if vm_fork_install_all(child_pml4,
+                           task_image_lo(pidx), task_image_hi(pidx),
+                           task_brk_base(pidx), task_brk_max(pidx),
+                           task_ustack_lo(pidx), task_ustack_sz(pidx),
+                           parent_user_rsp) < 0:
+        set_current_errstr("rfork: address-space copy OOM")
+        return -12                              # -ENOMEM
+    # Anonymous + file-backed mmap VMAs.
+    if vma_fork_copy(cslot, pidx, child_pml4) < 0:
+        set_current_errstr("rfork: vma copy OOM")
+        return -12                              # -ENOMEM
+    # Propagate the address-space bookkeeping so a grandchild rfork
+    # finds the same regions.
+    set_task_image_range(cslot, task_image_lo(pidx),
+                         task_image_hi(pidx))
+    set_task_ustack_range(cslot, task_ustack_lo(pidx),
+                          task_ustack_sz(pidx))
+    set_task_brk_range(cslot, task_brk_base(pidx),
+                       task_brk_end(pidx), task_brk_max(pidx))
 
     # Patch the child's saved-%rbp slot in the initial __switch_to
     # stack image so its first user-mode instruction has a valid
     # frame pointer. _build_initial_kstack laid down 6 zero quads for
     # the callee-saved set (r15, r14, r13, r12, rbx, rbp — lowest to
-    # highest), then a return-address quad, then the iret frame.
-    # %rbp lives at sp + 40 (5 quads above the lowest callee-saved).
-    #
-    # The parent's user_rbp points into the PARENT's stack page; the
-    # child's stack page is at a different VA, but holds a byte-for-
-    # byte copy. Translate the address so the child's %rbp lands in
-    # its own page. This only makes sense if user_rbp is within the
-    # one page we just copied (parent_ustack_base..parent_ustack_top).
-    # If it's outside (deep callees with frames spanning multiple
-    # pages), fall back to the raw value — the identity map will at
-    # least keep reads functional, at the cost of cross-task writes
-    # showing up in the parent's stack. That's a real bug surface
-    # but only matters once the frame chain spans pages; the simple
-    # test fixture stays within one page.
-    child_rbp: uint64 = user_rbp
-    if user_rbp >= parent_ustack_base and user_rbp < parent_ustack_top:
-        child_rbp = child_ustack_base + (user_rbp - parent_ustack_base)
+    # highest), then a return-address quad, then the iret frame;
+    # %rbp lives at sp + 40. The child's stack is a byte-for-byte
+    # copy at the SAME virtual address, so user_rbp is already
+    # correct for the child — no translation.
     child_sp: uint64 = task_initial_sp(slot)
-    cast[Ptr[uint64]](child_sp + 40)[0] = child_rbp
+    cast[Ptr[uint64]](child_sp + 40)[0] = user_rbp
 
     # Inherit fs_base + Linux-ABI bit + vfork_done state from the
     # parent. Native rfork callers leave fs_base = 0, but defensive
@@ -407,12 +418,12 @@ def do_rfork(flags: int32, user_rbp: uint64) -> int32:
     # Real detach handling lands when wait() learns to drop
     # RFNOWAIT children automatically.
 
-    # RFENVG semantics: copy environment. The environment today lives
-    # on the user stack as part of the auxv layout we built at
-    # spawn/execve time. Because we just deep-copied the user stack
-    # page above, RFENVG is effectively honoured for free. RFMEM
-    # would have shared the page (no copy) — but we already
-    # short-circuited that case above with -ENOSYS.
+    # RFENVG semantics: copy environment. The environment lives on the
+    # user stack as part of the auxv layout built at spawn/execve time.
+    # Because the new-process path above gave the child a private copy
+    # of the WHOLE user stack, RFENVG is honoured for free. RFMEM would
+    # have shared the address space (no copy) — already short-circuited
+    # above with -ENOSYS.
 
     child_pid: uint64 = task_pid_at(slot)
     printk1("rfork: child created, pid=%d\n", cast[int32](child_pid))

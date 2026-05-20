@@ -40,6 +40,12 @@ from kernel.sched.core import (
     set_task_fs_base, set_task_clear_child_tid,
     task_pml4,
     set_current_errstr,
+    # Per-process address space (fork). do_execve records the loaded
+    # image span + user-stack region; do_clone copies them into the
+    # child's private pages.
+    set_task_image_range, set_task_ustack_range,
+    task_image_lo, task_image_hi, task_ustack_lo, task_ustack_sz,
+    task_brk_base, task_brk_end, task_brk_max, set_task_brk_range,
     # V4: srv_open needs a Ptr[TaskStruct] for the poster's slot so
     # vfs_srv_dup_into_current can copy_fd_entry from the poster's
     # table to the caller's. task_struct_at returns 0 (NULL) for
@@ -73,13 +79,18 @@ from fs.elf import (
     # (elf_last_app_entry_user) and AT_BASE = interp base
     # (elf_last_interp_base, = 0 on the static path).
     elf_last_interp_base, elf_last_app_entry_user,
+    # Per-process address space (fork): the loaded ELF image span +
+    # the private-copy machinery do_clone uses to give a forked child
+    # its own physical pages remapped at the same virtual addresses.
+    elf_last_img_lo_get, elf_last_img_hi_get,
+    vm_fork_install_all,
 )
 from mm.page_alloc import alloc_page, alloc_pages
 # U42 follow-up: per-task VMA list. do_execve clears the outgoing
 # image's mappings before ELF-loading the incoming image so the new
 # program starts with a clean vma_list. Subsequent mmap() calls from
 # the new image extend the list via mm/vma.ad::vma_alloc.
-from mm.vma import vma_clear
+from mm.vma import vma_clear, vma_fork_copy
 from linux_abi.loader import kmod_linux_load, kmod_linux_unload
 from linux_abi.u_syscalls import (
     linux_u_syscall_dispatch,
@@ -297,6 +308,13 @@ MAX_ARG_BYTES: uint64 = 256
 # headroom for what future export semantics might add.
 MAX_ENVP:      uint64 = 64
 MAX_ENV_BYTES: uint64 = 256
+
+# Linux ELF user stack: 256 KiB (64 pages = buddy order 6). Big enough
+# for glibc's static-PIE startup AND a forked child unwinding through
+# the fork epilogue + atexit + _IO_cleanup on its own private stack.
+# do_clone eager-copies this whole region on fork().
+LINUX_USTACK_ORDER: int32  = 6
+LINUX_USTACK_SIZE:  uint64 = 262144      # 64 * 4096
 
 
 def _argv_strlen(s: uint64) -> uint64:
@@ -699,12 +717,23 @@ def do_execve(a0: uint64, a1: uint64, a2: uint64) -> int64:
     # Fresh user stack for the new program. The previous user
     # stack page is leaked for now (no per-task ustack tracking
     # in this code path); proper teardown comes with mm_struct.
-    # U38: 16 KiB (4 contiguous pages, order 2) so glibc's static-PIE
-    # startup has room for its argv/envp/auxv copy + the _dl_static_init
-    # tower of stack frames. Earlier U26..U37 used a single 4 KiB page;
-    # busybox-static post-exec then page-faulted partway through
-    # _dl_relocate_static_pie when the stack walked off the bottom.
-    new_ustack_top: uint64 = alloc_pages(2) + (4096 * 4)
+    # U38: 16 KiB was enough for glibc's static-PIE startup. The
+    # per-process-address-space fork (this commit) eager-copies the
+    # whole user stack on fork(); a child that returns from fork()
+    # then unwinds through glibc's fork epilogue + atexit + _IO_cleanup
+    # on its private stack. 256 KiB (64 pages, buddy order 6) gives
+    # that call tower comfortable headroom and matches the floor the
+    # mission set for the Linux user stack.
+    new_ustack_base: uint64 = alloc_pages(LINUX_USTACK_ORDER)
+    new_ustack_top:  uint64 = new_ustack_base + LINUX_USTACK_SIZE
+    # Record the loaded image span + the user stack region on THIS
+    # task so a later fork() can give the child a private copy of
+    # each, remapped at the same virtual address.
+    set_task_image_range(current_idx_get(),
+                         elf_last_img_lo_get(),
+                         elf_last_img_hi_get())
+    set_task_ustack_range(current_idx_get(),
+                          new_ustack_base, LINUX_USTACK_SIZE)
     argc_out: uint64 = 0
     argv_out: uint64 = 0
     new_rsp: uint64 = 0
@@ -859,47 +888,92 @@ def do_clone(flags: uint64, child_stack: uint64,
                 cast[int32](child_pid))
         return cast[int64](child_pid)
 
-    # --- fork path (legacy U26 behaviour) ---------------------------
-    # Give the child its OWN user stack page, page-aligned, with the
-    # parent's stack content copied byte-for-byte so the child sees the
-    # same locals/canary/return chain as the parent did. Without this
-    # the two tasks would share the same stack page: glibc's child-side
-    # post-fork cleanup walks FILE._lock pointers and zeros them, and
-    # any FILE whose _lock happens to live on the stack (or any glibc
-    # global referencing a stack-relative pointer set up at __libc_init
-    # time) corrupts the parent's stack frame, blowing the canary check
-    # when the parent's fork() wrapper unwinds.
-    parent_ustack_top: uint64 = (parent_user_rsp + 4095) & ~cast[uint64](4095)
-    parent_ustack_base: uint64 = parent_ustack_top - 4096
-    child_ustack_base: uint64 = alloc_page()
-    if child_ustack_base == 0:
-        set_current_errstr("clone: out of memory")
-        return cast[int64](-11)               # -EAGAIN
-    memcpy(cast[Ptr[uint8]](child_ustack_base),
-           cast[Ptr[uint8]](parent_ustack_base), 4096)
-    # Child's RSP lands at the same OFFSET into its private page that
-    # the parent has into hers — so the relative arrangement of saved
-    # rbp/rbx, the canary at rsp+8, the call return chain above, etc.,
-    # are all valid from the child's PoV too. Linux's COW fork has the
-    # exact same semantics; we're doing it eagerly because we lack the
-    # MMU plumbing for real COW.
-    rsp_offset: uint64 = parent_user_rsp - parent_ustack_base
-    child_user_rsp: uint64 = child_ustack_base + rsp_offset
-    # create_user_task_argv with a non-zero user_rsp skips the fresh
-    # ustack allocation and plants the supplied RSP straight into the
-    # iret frame — exactly what we want here, our child_user_rsp goes
-    # straight into the iret frame. argc / argv go into the iret rdi /
-    # rsi slots; glibc's fork() wrapper doesn't read those after
-    # syscall return so 0/0 is fine.
+    # --- fork path: real per-process address space ------------------
+    #
+    # Hamnix runs ET_DYN binaries identity-mapped, so a forked child
+    # MUST get a PRIVATE physical copy of every writable region the
+    # parent has, each remapped at the SAME virtual address in the
+    # child's own PML4. Then the child runs at identical virtual
+    # addresses but on private physical memory — every absolute
+    # pointer it inherited (saved %rbp chain, return addresses,
+    # glibc's _IO_2_1_stdout_ FILE struct, the TCB at fs_base) stays
+    # valid, and parent and child no longer trample each other's
+    # heap / stack / .data.
+    #
+    # Regions copied (each at the same vaddr in the child's PML4):
+    #   * the whole loaded ELF image (code + rodata + data + bss),
+    #   * the brk heap [brk_base, brk_end),
+    #   * the user stack [ustack_lo, ustack_lo + ustack_sz),
+    #   * every anonymous / file-backed mmap VMA.
+    #
+    # The child's RSP is IDENTICAL to the parent's user RSP — the
+    # stack is copied byte-for-byte to the same virtual address, so
+    # every saved-rbp / return-address in it is already correct from
+    # the child's point of view. We pass parent_user_rsp straight
+    # into create_user_task_argv; the non-zero value tells it to skip
+    # the fresh-stack allocation and plant our RSP into the iret frame.
+    parent_idx: uint64 = current_idx_get()
     slot: int32 = create_user_task_argv(parent_user_rip,
                                         0x5f5f666f726b5f5f,        # "__fork__"
-                                        child_user_rsp, 0, 0)
+                                        parent_user_rsp, 0, 0)
     if slot < 0:
         set_current_errstr("fork: out of tasks")
         return cast[int64](-11)               # -EAGAIN
+    child_pml4: uint64 = task_pml4(slot)
+    cslot: uint64 = cast[uint64](slot)
+
+    # Eager-copy the three fixed writable regions into the child's
+    # private physical pages, each remapped at the SAME virtual
+    # address in the child's PML4:
+    #
+    #   * the loaded ELF image (code + rodata + data + bss) — without
+    #     a private copy the child shares glibc's writable globals
+    #     (_IO_2_1_stdout_, the malloc arena header, errno);
+    #   * the brk heap — copied across its ENTIRE reserved window
+    #     [brk_base, brk_max), NOT just the used [brk_base, brk_end)
+    #     prefix: glibc-malloc's sysmalloc grows the arena by calling
+    #     brk(new) PAST the current break, so the child must own
+    #     private pages all the way to brk_max (the static-PIE glibc
+    #     TLS/TCB block is sbrk-allocated, so this also gives the
+    #     child a private TCB that its inherited fs_base resolves to);
+    #   * the user stack — the whole recorded region, so the child's
+    #     deepest call (the fork epilogue unwinding through atexit +
+    #     _IO_cleanup) stays inside private memory.
+    img_lo: uint64 = task_image_lo(parent_idx)
+    img_hi: uint64 = task_image_hi(parent_idx)
+    brk_lo: uint64 = task_brk_base(parent_idx)
+    brk_mx: uint64 = task_brk_max(parent_idx)
+    ust_lo: uint64 = task_ustack_lo(parent_idx)
+    ust_sz: uint64 = task_ustack_sz(parent_idx)
+    if vm_fork_install_all(child_pml4, img_lo, img_hi,
+                           brk_lo, brk_mx, ust_lo, ust_sz,
+                           parent_user_rsp) < 0:
+        set_current_errstr("fork: address-space copy OOM")
+        return cast[int64](-12)               # -ENOMEM
+
+    # Copy 4: anonymous + file-backed mmap VMAs (glibc-malloc arenas,
+    # ld.so DSO maps). Each VMA's backing pages are copied and remapped
+    # at the same vaddr, and a mirrored VmaNode lands on the child's
+    # list so the child's own munmap / mremap stays honest.
+    if vma_fork_copy(cslot, parent_idx, child_pml4) < 0:
+        set_current_errstr("fork: vma copy OOM")
+        return cast[int64](-12)               # -ENOMEM
+
+    # Propagate the address-space bookkeeping so a GRANDCHILD fork
+    # finds the same regions to copy.
+    set_task_image_range(cslot, img_lo, img_hi)
+    set_task_ustack_range(cslot, ust_lo, ust_sz)
+    # brk cursors: the child's heap is a private copy at the same
+    # vaddrs, so the cursors carry over unchanged. base/end track the
+    # used heap; max bounds the reserved window.
+    set_task_brk_range(cslot, brk_lo, task_brk_end(parent_idx), brk_mx)
+    printk1("fork: child pid=%d given a private address space\n",
+            cast[int32](task_pid_at(slot)))
+
     # Inherit parent's fs_base so the child's first syscall sees the
-    # same TLS the parent had. Threads override this via CLONE_SETTLS;
-    # fork shares the parent's TCB pointer until exec replaces it.
+    # same TLS the parent had — and because copy 2 gave the child a
+    # private heap, that same fs_base value resolves into the child's
+    # own TCB copy, not the parent's.
     set_task_fs_base(slot, parent[0].fs_base)
     # Make the child's first read of the wake flag explicit. It's also
     # zeroed by bss/_find_free_slot reuse, but defensive setting here
@@ -937,11 +1011,14 @@ def do_clone(flags: uint64, child_stack: uint64,
     # reader) or its post-fork bookkeeping aborts (glibc fork-epilogue
     # stack canary checks fail when the child wakes on a different RSP).
     # With concurrent execution, both tasks are STATE_READY and the
-    # scheduler picks the next one on every timer tick / yield. Address
-    # space is shared (per-task PML4 clones share lower-level PDPT/PD
-    # entries), and each task got its own ustack page above, so no
-    # stack aliasing. wait4 still uses the vfork_done / STATE_EXITED
-    # transition for waitpid bookkeeping.
+    # scheduler picks the next one on every timer tick / yield. The
+    # child now has a fully PRIVATE address space (image + heap +
+    # stack + VMAs were eager-copied above into its own physical
+    # pages, each remapped at the same virtual address in the child's
+    # PML4) — parent and child no longer share any writable memory, so
+    # both can run glibc fork-epilogue / atexit / _IO_cleanup
+    # concurrently without trampling each other. wait4 still uses the
+    # vfork_done / STATE_EXITED transition for waitpid bookkeeping.
     return cast[int64](child_pid)
 
 
@@ -1214,18 +1291,17 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         if entry == 0:
             set_current_errstr("spawn: bad ELF image")
             return cast[uint64](-8)            # -ENOEXEC
-        # U38: 16 KiB user stack (4 contiguous pages, order 2). Earlier
-        # U26..U37 gave SYS_SPAWN'd tasks a single 4 KiB page; busybox
-        # sh (vs. simpler applets like echo / cat) consumes most of
-        # that running its argv parser + applet dispatch + the
-        # static-PIE glibc startup that precedes main(), and trips
-        # a #GP on stack underflow on its way into the pipeline
-        # builder. Matches the execve(2) ustack growth above.
-        ustack: uint64 = alloc_pages(2)
+        # 256 KiB user stack (64 contiguous pages, buddy order 6).
+        # Earlier U26..U37 gave SYS_SPAWN'd tasks a single 4 KiB page,
+        # then U38 bumped to 16 KiB. The per-process-address-space fork
+        # (this commit) eager-copies the whole user stack on fork(); a
+        # forked child unwinding through glibc's fork epilogue + atexit
+        # + _IO_cleanup on its private stack wants comfortable headroom.
+        ustack: uint64 = alloc_pages(LINUX_USTACK_ORDER)
         if ustack == 0:
             set_current_errstr("spawn: out of memory")
             return cast[uint64](-12)           # -ENOMEM
-        ustack_top: uint64 = ustack + (4096 * 4)
+        ustack_top: uint64 = ustack + LINUX_USTACK_SIZE
         argc_out: uint64 = 0
         argv_out: uint64 = 0
         new_rsp: uint64 = 0
@@ -1254,6 +1330,18 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         if slot < 0:
             set_current_errstr("spawn: out of tasks")
             return cast[uint64](-1)
+        # Per-process address space: record the loaded image span +
+        # the user-stack region on the NEW task so that if the spawned
+        # program later fork()s, do_clone can give the grandchild a
+        # private copy of each. SYS_SPAWN is the path hamsh uses to
+        # launch every Linux ELF, so without this every fork() from a
+        # hamsh-spawned binary would find image_lo == 0 and fail to
+        # copy glibc's writable .data/.bss.
+        set_task_image_range(cast[uint64](slot),
+                             elf_last_img_lo_get(),
+                             elf_last_img_hi_get())
+        set_task_ustack_range(cast[uint64](slot),
+                              ustack, LINUX_USTACK_SIZE)
         # U30: install the ET_EXEC user-vaddr mapping into the child's
         # PML4 (cloned from BSP inside create_user_task_argv). The
         # child hasn't been scheduled yet, so its CR3 has never been
