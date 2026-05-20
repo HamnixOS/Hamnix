@@ -1,15 +1,54 @@
 # tests/u-binary/src/musl_busybox/Makefile -- U40 fixture build.
 #
-# Produces ../../u_busybox_musl -- a tiny static busybox 1.36.1 linked
-# against musl libc. The intent is to replace the M16.37+
-# glibc-static busybox (tests/u-binary/u_busybox, ~2 MB) with a leaner
-# musl-static variant for the U-track. musl emits ~10x smaller static
-# binaries than glibc and reaches a markedly smaller syscall surface;
-# both properties matter as we scope Hamnix toward a real server OS.
+# Produces ../../u_busybox_musl -- a tiny busybox 1.36.1 linked
+# against musl libc and built **static-PIE (ET_DYN)**. The intent is
+# to replace the M16.37+ glibc-static busybox (tests/u-binary/
+# u_busybox, ~2 MB) with a leaner musl variant for the U-track: musl
+# emits ~10x smaller static binaries than glibc and reaches a
+# markedly smaller syscall surface; both properties matter as we
+# scope Hamnix toward a real server OS.
 #
 # The glibc-static u_busybox stays put -- M16.37+ pipe tests
 # (test_u29_busybox.sh, test_u32_busybox_ls.sh, ...) depend on its
 # exact applet menu. u_busybox_musl is a SECOND binary, side by side.
+#
+# Why static-PIE (ET_DYN), NOT `-static` (ET_EXEC)?  [U42 fix]
+#
+# This Makefile originally built with `LDFLAGS=-static`, producing an
+# **ET_EXEC linked at 0x400000**. Commit 653d962 ("elf loader: refuse
+# ET_EXEC overlay that collides with kernel image") added a kernel-
+# image collision guard to fs/elf.ad: an ET_EXEC whose fixed [vlow,
+# vhigh) overlaps the ~12 MiB identity-mapped Hamnix kernel image is
+# REFUSED with -ENOEXEC. Standard x86_64 -no-pie binaries link at
+# 0x400000 -- squarely inside that range -- so a `-static` busybox is
+# now dead on arrival (and pre-653d962 would silently dead-freeze the
+# box once schedule() loaded the colliding CR3).
+#
+# The fix mirrors the U41 CPython fixture (commit d9f31ca): build
+# **musl static-PIE** -- ET_DYN, statically linked, no PT_INTERP.
+# ET_DYN binaries load at Hamnix's kernel-chosen identity-mapped load
+# region with NO fixed-address overlay, so there is nothing to
+# collide. musl (vs glibc) static-PIE also avoids the glibc 2.41
+# `_dl_relocate_static_pie` TLS bug: the staged binary carries 0
+# R_X86_64_TPOFF64 relocations (verify: `readelf -rW u_busybox_musl |
+# grep -c TPOFF64` prints 0).
+#
+# How the static-PIE link is wired (busybox build knobs):
+#   * CONFIG_STATIC stays OFF. CONFIG_STATIC=y appends `-static` to
+#     `CFLAGS_busybox` (Makefile.flags:127) -- `-static` and
+#     `-static-pie` are mutually exclusive at the gcc driver.
+#   * CONFIG_PIE stays OFF. CONFIG_PIE=y produces a *dynamic* PIE
+#     (needs ld.so) -- not what we want.
+#   * CONFIG_EXTRA_CFLAGS="-fPIE" -- position-independent codegen
+#     for every object. This is a compile-only flag; safe everywhere.
+#   * `-static-pie` is passed via the `CFLAGS_busybox` make variable
+#     on the command line, NOT via CONFIG_EXTRA_LDFLAGS. busybox does
+#     several `ld -r` partial links (scripts/Makefile.build:177) that
+#     consume the exported `$(LDFLAGS)` -- and `ld -r` rejects `-pie`
+#     ("-r and -pie may not be used together"). `CFLAGS_busybox` is
+#     applied ONLY to the final `$(CC)`-driven busybox link
+#     (scripts/trylink), never to a partial `ld -r`, so `-static-pie`
+#     lands exactly where it belongs.
 #
 # REQUIRES (build host):
 #   - musl-gcc (apt-get install musl-tools, ~10 MB)
@@ -23,7 +62,7 @@
 #
 # Output stamping: e_ident[EI_OSABI] is rewritten to ELFOSABI_LINUX
 # (3) so Hamnix's U1 ELF-detect path (elf_is_linux_binary) returns 1
-# unambiguously -- host gcc emits OSABI=0 (SysV) by default.
+# unambiguously -- musl-gcc emits OSABI=0 (SysV) by default.
 #
 # Applet menu: the .config shipped here enables a tight subset that
 # matches what hamsh tests want to exec -- ash, ls, cat, echo, cp,
@@ -108,12 +147,20 @@ ifeq ($(MUSL_GCC),)
 	@exit 0
 else
 	# Start from defconfig (everything sensible turned on), then
-	# disable the applets we don't want and force the static link
+	# disable the applets we don't want and set the static-PIE
 	# + musl-gcc settings. busybox's own Kconfig is sed-driven --
 	# no `make menuconfig` needed.
 	$(MAKE) -C $(BB_SRCDIR) defconfig
-	# Force static link.
-	sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' $(BB_SRCDIR)/.config
+	# Static-PIE link, NOT `-static` (CONFIG_STATIC). See the header
+	# comment "Why static-PIE (ET_DYN), NOT `-static` (ET_EXEC)?":
+	# a `-static` busybox is an ET_EXEC at 0x400000 and the fs/elf.ad
+	# kernel-image collision guard (commit 653d962) REFUSES it.
+	#   * CONFIG_STATIC stays OFF -- it would inject `-static` into
+	#     CFLAGS_busybox, which conflicts with the `-static-pie` we
+	#     pass on the build command line below.
+	#   * CONFIG_EXTRA_CFLAGS="-fPIE" -- position-independent codegen
+	#     for every object (compile-only; safe in `ld -r` too).
+	sed -i 's/^CONFIG_EXTRA_CFLAGS=.*/CONFIG_EXTRA_CFLAGS="-fPIE"/' $(BB_SRCDIR)/.config
 	# Disable TLS / pam / selinux / efence / unicode (musl + small).
 	sed -i 's/^CONFIG_TLS=y/# CONFIG_TLS is not set/' $(BB_SRCDIR)/.config || true
 	sed -i 's/^CONFIG_PAM=y/# CONFIG_PAM is not set/' $(BB_SRCDIR)/.config || true
@@ -135,10 +182,13 @@ else
 	sed -i 's/^CONFIG_FEATURE_INETD_RPC=y/# CONFIG_FEATURE_INETD_RPC is not set/' $(BB_SRCDIR)/.config || true
 	# Re-run oldconfig so dependent symbols settle.
 	yes "" | $(MAKE) -C $(BB_SRCDIR) oldconfig >/dev/null
-	# Build with musl-gcc. LDFLAGS=-static forces a fully static
-	# binary even though busybox's own Kconfig already set
-	# CONFIG_STATIC=y -- belt-and-braces against future busybox
-	# Makefile drift.
+	# Build with musl-gcc, static-PIE. `-static-pie` is passed via
+	# the `CFLAGS_busybox` make variable -- NOT CONFIG_EXTRA_LDFLAGS
+	# / LDFLAGS. busybox does `ld -r` partial links that consume the
+	# exported $(LDFLAGS), and `ld -r` rejects `-pie`. `CFLAGS_busybox`
+	# is applied ONLY to the final $(CC)-driven busybox link
+	# (scripts/trylink), so `-static-pie` lands exactly there and
+	# produces an ET_DYN, statically-linked, no-PT_INTERP binary.
 	#
 	# `-isystem /usr/include` augments musl-gcc's default include
 	# path (which is just /usr/include/x86_64-linux-musl + the
@@ -169,8 +219,7 @@ else
 	fi
 	$(MAKE) -C $(BB_SRCDIR) -j$$(nproc) \
 	    CC="$(MUSL_GCC) -isystem $(CURDIR)/$(BB_SRCDIR)/uapi" HOSTCC=gcc \
-	    CFLAGS_busybox=-static \
-	    LDFLAGS=-static \
+	    CFLAGS_busybox=-static-pie \
 	    SKIP_STRIP=n
 endif
 
