@@ -6,15 +6,19 @@ reporting what worked + what didn't.
 
 It **extends** [`BOOT.md`](BOOT.md) — that doc covers QEMU and the ISO
 build pipeline; this one covers the steps and expectations specific to
-physical machines. L40 ("first boot on real ThinkPad hardware") is one
-of four named MVP gates in the README and is **Pending** until someone
-runs the ISO on metal.
+physical machines.
 
-> **This is not a marketing claim.** Hamnix has not been QA'd against a
-> matrix of real hardware. The classes-of-machine lists below are what
-> *should* work given the drivers shipped today; "should" is not
-> "tested". Filing an issue with what you tried is how we turn "should"
-> into "tested".
+> **Real-hardware status (2026-05, M16.156).** Hamnix boots all the
+> way to the `hamsh` shell on a real **Asus i5-4210U (Haswell ULT)**
+> laptop in **Legacy/BIOS mode**. This is the first confirmed boot on
+> physical silicon. Two things are NOT yet confirmed on that machine:
+> the **built-in keyboard does not work** (leading hypothesis: it is
+> routed through the EHCI USB 2.0 controller, not the i8042 — see §7),
+> and the **UEFI direct-boot path** has not been re-verified on metal
+> since the M16.151–156 debugging wave. Other machine classes below
+> are what *should* work given the drivers shipped; "should" is not
+> "tested" — filing an issue with what you tried is how we turn
+> "should" into "tested".
 
 ## The 5-minute test
 
@@ -180,15 +184,25 @@ supported.
   1.36.1 glibc-static + musl-static.
 
 
-## 2. What does NOT work today (the L40 caveats)
+## 2. What does NOT work today (the real-hardware caveats)
 
-These are the real-hardware risks that QEMU + OVMF verification does
-**not** exercise. Most failures on a first physical boot will land
-here.
+These are the real-hardware risks. One physical box (an Asus i5-4210U)
+has booted to `hamsh` in Legacy/BIOS mode — but most of the surface
+below is still QEMU + OVMF verification only, and the Asus boot
+surfaced a still-open keyboard blocker.
 
-- **No physical box has been booted yet** — every "works" claim above
-  is verified on QEMU + KVM + OVMF + GNOME Boxes. Real silicon has
-  edge cases firmware emulators flatten.
+- **Built-in keyboard is dead on the Asus i5-4210U.** Hamnix boots to
+  the shell but the laptop's keyboard produces nothing — atkbd's
+  i8042 RESET/IDENTIFY probes return nothing on metal. Leading
+  hypothesis: the keyboard is on the EHCI USB 2.0 controller, not the
+  i8042. An EHCI driver is in flight. See §7. Serial-console input
+  works for diagnostics.
+- **UEFI on the real Asus is not re-confirmed.** Legacy/BIOS boot is
+  confirmed; the UEFI direct-boot path on that laptop has not been
+  re-verified since the M16.151–156 wave.
+- **Most "works" claims above are QEMU-only** — verified on
+  QEMU + KVM + OVMF + GNOME Boxes. Real silicon has edge cases
+  firmware emulators flatten.
 - **xHCI SMM hand-off** (USBLEGSUP capability) not claimed. On real
   Intel/AMD silicon SMM may still own the controller when the OS comes
   up. The xHCI driver issues HCRST without first walking the extended-
@@ -398,14 +412,14 @@ thing to look at.
 | 6 | `Hamnix: smp_processor_id() = 0`                        | per-CPU areas + LAPIC up; one CPU online (SMP is open work).               |
 | 7 | `cpio: registered N files from initramfs`               | initramfs unpacked; `/init` is visible.                                    |
 | 8 | `syscall MSRs armed` / `[sched]` markers                | TSS + GDT loaded, ring-3 transition is about to fire.                      |
-| 9 | `[eft] step1: post-rsp-load`                            | enter_first_task() entered; task stack switched.                           |
-|10 | `[eft] step2: pre-iretq`                                | About to drop to ring 3 via `iretq`. **NEXT marker MUST be hamsh.**        |
-|11 | `[hamsh] M16.35 shell ready. Type 'help' or '/hello'.`  | Ring 3 reached, userspace runs. **You are booted.**                        |
+| 9 | `[hamsh] M16.35 shell ready. Type 'help' or '/hello'.`  | Ring 3 reached, userspace runs. **You are booted.**                        |
 
-If you ever see `[eft] step3: POST-iretq (impossible ...)` — that's
-the recorded diagnostic for `iretq` returning to ring 0 (something the
-CPU should never do). It's the artifact for the Asus laptop bug
-tracked in §7.
+Older transcripts show a block of `[ring3-diag]` / `[eft]` /
+`[cpuid]` diagnostic lines between markers 8 and 9 — that
+instrumentation was added in M16.151–155 to chase the Asus
+ring-3-transition triple-fault and **removed in M16.157** once the
+bug was fixed (M16.156). A current kernel goes straight from the
+syscall-MSR markers to the hamsh prompt.
 
 **BIOS / legacy path** is the same from marker 3 onwards; markers 1 and
 2 are replaced with GRUB's own output:
@@ -433,8 +447,7 @@ likely causes:
 | `[hamnix] EFI entry reached` then silence   | EFI stub reached but SFSP can't find `\hamnix-vmlinux.elf`. ESP corruption — re-dd the USB |
 | `[hamnix] post-EFI handoff complete` then silence | EFI memory map / page-table handoff failed on real silicon. New territory; capture the FULL serial log |
 | `Hamnix kernel booting` then triple-fault   | Almost certainly the M16.138 GDT path — should be fixed; if not, this is a regression |
-| `syscall MSRs armed` then silence           | Pre-M16.138 GDT bug. Update to a kernel ≥ M16.138 |
-| `[eft] step1` then triple-fault on `iretq`  | **Asus iretq triple-fault** (M16.151..M16.154 in flight). See §7.    |
+| `syscall MSRs armed` then silence / triple-fault | Ring-3-transition fault. M16.156 fixed the known Asus case (`fninit` + `CR4.OSXSAVE` + cleared `RFLAGS.IF`); a fresh occurrence on other silicon is new territory — capture the full serial log. See §7. |
 | `cpio: registered N files from initramfs` then silence | Userland init failed to find `/init`. Check the initramfs build |
 | `[xhci] HCRST timed out`                    | Likely SMM-owned controller. Try a USB 2.0 port; otherwise use PS/2 |
 | `[ahci] no port with ATA signature found`   | SATA controller is in RAID mode — flip to AHCI in firmware setup |
@@ -458,9 +471,10 @@ Most laptops have no serial port. On a frozen box where the screen
    landscape photo at 12 MP captures every glyph.
 4. **The serial-console-and-screen output are identical.** A photo is
    sufficient; we don't need both for triage.
-5. **Read the last `[eft] stepN` / `[hamnix] ...` / `Hamnix: ...` line
-   off the photo and quote it verbatim in the issue** — that's the
-   single most useful triage datum.
+5. **Read the last `[NNNNNN]`-prefixed / `[hamnix] ...` / `Hamnix: ...`
+   line off the photo and quote it verbatim in the issue** — that's
+   the single most useful triage datum. (Every console line now
+   carries a monotonic `[NNNNNN]` sequence prefix.)
 
 If you're investigating a repeatable hang, a $5 USB-to-serial adapter
 (CH340G / FTDI / Silicon Labs CP2102) clipped to the board's COM1
@@ -471,27 +485,44 @@ header is worth it. Otherwise: phone camera, every time.
 These are actively-tracked issues. If your box matches, comment on the
 existing issue rather than filing a new one.
 
-### Asus laptops — UEFI path triple-faults at `iretq` into ring 3
+### Asus i5-4210U — built-in keyboard does not work (OPEN)
 
-- **Symptom:** boot reaches marker 10 (`[eft] step2: pre-iretq`),
-  then the CPU triple-faults instead of dropping cleanly to ring 3.
-  Marker 11 (`[hamsh] M16.35 shell ready`) never appears. The
-  diagnostic `[eft] step3: POST-iretq (impossible ...)` is the
-  smoking gun the next agent will look for.
-- **Models confirmed:** one Asus laptop (specific model in the issue
-  thread). Other Asus chassis may share the firmware quirk; data
-  welcome.
-- **Boot mode affected:** UEFI direct boot. BIOS legacy mode hits the
-  same fault — the bug is in the ring-3 transition, not in the EFI
-  stub.
-- **Tracked artifacts:** the M16.151..M16.154 diagnostic block in
-  `arch/x86/kernel/sched_asm.S` (search for `[eft] step1`, `[eft]
-  step2`, `[eft] step3`), `arch/x86/mm/pgtable.ad` (live-PDPT
-  force-stamp), and the EFI stub PDPT-fill in
-  `arch/x86/boot/efi_stub.S` (M16.152). Separate diag agents are
-  investigating; this doc is not the authoritative pathology.
-- **Workaround:** none today. Hamnix is unbootable on the affected
-  Asus until M16.151..M16.154 closes.
+- **Symptom:** Hamnix boots all the way to the `hamsh` shell on this
+  Asus i5-4210U (Haswell ULT) laptop in Legacy/BIOS mode, but the
+  built-in keyboard produces nothing — Caps Lock doesn't toggle, no
+  keystroke reaches the shell.
+- **Diagnosis so far:** the atkbd path got an i8042 controller
+  bring-up handshake, IRQ 1 wiring, and an ISA-edge IOAPIC redirect
+  fix (`dbd40e6`) — all confirmed working under QEMU. On the real
+  laptop, atkbd's keyboard RESET (`0xFF`) and IDENTIFY (`0xF2`)
+  probes return nothing, which is strong evidence the keyboard is
+  **not on the i8042 controller at all**.
+- **Leading hypothesis (unverified):** the built-in keyboard is
+  routed through the laptop's **EHCI USB 2.0** host controller.
+  Hamnix has an xHCI driver but EHCI bring-up is in flight; until an
+  EHCI HID path lands, the laptop keyboard stays dark.
+- **Workaround:** use a serial console for input, or (untested) a
+  USB keyboard on a port the xHCI driver enumerates.
+
+### Asus i5-4210U — ring-3 transition triple-fault (FIXED, M16.156)
+
+- **Historical:** earlier kernels triple-faulted on this Asus at the
+  kernel→userspace ring-3 transition — both `IRETQ` and `SYSRETQ`
+  vanished the CPU before any trap handler ran. M16.151–155 added
+  heavy boot diagnostics to chase it.
+- **Fix (M16.156):** issue `fninit` to reset the FPU to power-on
+  defaults, set `CR4.OSXSAVE` conditionally when CPUID advertises
+  XSAVE, and clear `RFLAGS.IF` in the first task's iret frame so
+  `/init` wakes with interrupts disabled across the SYSRETQ. The
+  diagnostic scaffolding was stripped in M16.157. The Asus now boots
+  to `hamsh`.
+
+### UEFI on the real Asus — not re-confirmed
+
+UEFI direct boot reaches `hamsh` under QEMU+OVMF. On the real Asus,
+Legacy/BIOS boot is confirmed; the UEFI path has not been re-verified
+since the M16.151–156 wave. If you have this laptop, a UEFI boot
+report is welcome.
 
 ### Anything in §2 still applies
 

@@ -6,6 +6,14 @@ Linux internally** because that's where the porting work is bounded.
 Each layer has exactly one source of design influence. The
 translations between layers are explicit.
 
+> **Note (2026-05): the window-system design moved on.** This document
+> describes the Layer-4 wire protocol as **VTNext-v2** (a serial/TCP
+> byte stream). That design has been **superseded by the Plan 9 rio
+> shape** — see [`rio.md`](rio.md). VTNext-v2 (`vtnext-v2.md`) is kept
+> for historical reference only. Wherever the phases below say
+> "VTNext", read "the rio file-server protocol"; the layered model and
+> the migration phases are otherwise current.
+
 ## Layered model
 
 ```

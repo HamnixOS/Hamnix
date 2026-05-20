@@ -298,7 +298,8 @@ Tested-on / known-working list (extend as we verify on more machines):
 | --------------------- | ---- | ------ | -------------------- |
 | QEMU (SeaBIOS, 10.0)  | BIOS | works  | scripts/test_bios_boot.sh PASS |
 | QEMU (OVMF, edk2)     | UEFI | works  | scripts/test_uefi_boot.sh PASS — direct PE/COFF stub, SFSP-loads `\hamnix-vmlinux.elf` from the ESP, reaches `start_kernel()` and beyond (M16.125 PATH A) |
-| _real hardware_       | _?_  | TBD    | needs validation     |
+| Asus i5-4210U (Haswell ULT) | BIOS | boots to `hamsh` | First confirmed real-hardware boot (M16.156). Built-in keyboard does NOT work — see [`REAL_HARDWARE.md`](REAL_HARDWARE.md) §7. |
+| Asus i5-4210U         | UEFI | not re-confirmed | UEFI boot on this laptop has not been re-verified since the M16.151–156 wave |
 
 When testing on real hardware:
 
@@ -321,25 +322,26 @@ When testing on real hardware:
   shape GDT, and `jmp _x86_start_after_loader`. Verified end-to-end
   by `scripts/test_iso_qemu.sh`: BIOS and UEFI both reach
   `cpio: registered N files from initramfs`.
-- **EFI memory map parsing is still the fallback.** The stub saves
-  the UEFI memory map in `efi_mmap_buf` (16 KiB) with descsize at
-  `efi_mmap_descsize`, but `e820_init()` doesn't yet walk it —
-  it installs the hardcoded 2..240 MiB window. A descsize-stride
-  walker that classifies `EfiConventionalMemory` (Type=7) entries
-  and feeds the largest above `kernel_image_end()` to
-  `memblock_set_region` is a one-screen follow-up. Without it,
-  UEFI boots above 240 MiB of RAM waste the excess.
+- **EFI memory-map memblock window is still a fallback.** The stub
+  saves the UEFI memory map in `efi_mmap_buf` (16 KiB) with descsize
+  at `efi_mmap_descsize`, but `e820_init()` doesn't yet walk it for
+  the memblock allocator window — it installs the hardcoded
+  2..240 MiB window. A descsize-stride walker classifying
+  `EfiConventionalMemory` (Type=7) entries is a one-screen follow-up.
+  (Note: the >4 GiB *identity-map* gap is closed — `arch/x86/mm/pgtable.ad`
+  re-walks the memory map and extends the identity map per 1 GiB
+  RAM page. This remaining item is only the memblock window.)
 - **Real EFI Runtime Services aren't exposed yet.** The stub
   stashes the SystemTable pointer in `efi_system_table` but kernel
   code doesn't yet call back into RuntimeServices (e.g.
   `GetVariable` / `SetVariable` for persistent boot config, or
   `GetTime` as a real-hardware alternative to the legacy CMOS RTC
   driver in `arch/x86/kernel/time.ad`).
-- **No graphical console under direct UEFI boot**. The EFI stub
-  doesn't yet program GOP or hand the framebuffer info to the
-  kernel; once it chain-loads start_kernel, it'll need to populate
-  the same multiboot-framebuffer-tag-shaped struct the BIOS path
-  fills in via GRUB.
+- **Graphical console:** the EFI GOP framebuffer text console has
+  landed — UEFI boot renders 8×16 bitmap glyphs into the linear
+  framebuffer (the framebuffer info is parsed from the EFI system
+  table at handoff). The console scrolls top-to-bottom via a cached
+  shadow grid so it doesn't read back the uncached GOP framebuffer.
 - **No PCI passthrough boot**: the kernel still hard-codes a few
   legacy assumptions (PCI bus 0, no PCIe ECAM). Real-hardware systems
   will need MCFG-based config space access — already implemented in

@@ -5,6 +5,12 @@ systems language with a hand-written x86_64 compiler (no LLVM).**
 Hamnix is the OS; Adder is the language and compiler used to write it.
 Boots on BIOS + UEFI; reaches a real userspace shell.
 
+**As of M16.156, Hamnix boots on real hardware** — an Asus i5-4210U
+(Haswell ULT) laptop reaches the `hamsh` shell in Legacy/BIOS mode.
+Earlier the project only ran under QEMU/KVM + OVMF. See the "Known
+blockers" section for what is *not* yet confirmed on metal (the
+built-in keyboard, UEFI real-hardware boot).
+
 The novel claim is the **layered architecture**: native Plan 9-shape
 syscalls underneath, with a Linux ABI shim sitting on top so unmodified
 Linux binaries also run. Both worlds share one kernel.
@@ -44,20 +50,33 @@ srvfds. See M16.135 + 9P V0..V4.1 in [STATUS.md](STATUS.md).
 
 ## What it boots into today
 
+- **Real hardware** — an Asus i5-4210U (Haswell ULT) laptop boots to
+  the `hamsh` shell in Legacy/BIOS mode (M16.156 fixed the
+  ring-3-transition triple-fault that previously killed the boot:
+  `fninit` to reset the FPU, conditional `CR4.OSXSAVE`, and a
+  cleared `RFLAGS.IF` across the first SYSRETQ). The built-in
+  keyboard does **not** work yet on that laptop — see "Known
+  blockers".
 - **Hybrid BIOS+UEFI ISO** built by `scripts/build_iso.sh` — boots under
   SeaBIOS, OVMF UEFI, and GNOME Boxes.
 - **UEFI direct boot**: PE/COFF stub uses SFSP to load the kernel ELF
   off the ESP, runs ExitBootServices, jumps to long mode. Reaches the
-  hamsh prompt end-to-end on the UEFI path (M16.126, M16.138).
+  hamsh prompt end-to-end on the UEFI path under QEMU+OVMF (M16.126,
+  M16.138). UEFI on the real Asus is not yet re-confirmed.
 - **Linux ABI**: ~250 syscall numbers wired; 24 stock Debian `.ko`
   modules load cleanly; musl-static, glibc-static-pie, and CPython
   3.11 (frozen-stdlib build) all run real ELF binaries.
-- **Network stack**: virtio-net / e1000e / r8169 / Realtek MAC drivers;
-  ARP/IP/UDP/TCP/ICMP/DHCP (with renew+rebind)/DNS/HTTP/TLS 1.3 client
-  with HTTPS GET working end-to-end.
+- **Network stack**: virtio-net / e1000e / r8169 drivers; e1000e and
+  r8169 both have a TX path (reset + TX ring + ARP round-trip) and an
+  MSI single-vector path; ARP/IP/UDP/TCP/ICMP/DHCP (with
+  renew+rebind)/DNS/HTTP/TLS 1.3 client with HTTPS GET working
+  end-to-end. HTTP follows 3xx redirects and inflates gzip responses.
 - **Block stack**: AHCI + NVMe, MBR + GPT read+write, FAT32 read,
   EXT4 read+write, partition-aware block-device naming (`sd0p1`,
   `nvme0n1p2`).
+- **dpkg userland**: `dpkg-deb` (`-x`/`-I`/`-c`) and a `dpkg` tool with
+  `-i` (control parse + status database + file manifest) and the
+  query subcommands `-l`/`-s`/`-L` — the apt-path groundwork.
 - **Plan 9 base**: codec + spec, kernel 9P client, per-process Pgrps
   (heap-allocated), `/srv` / `/n` / `/proc/<pid>/ns` namespace
   primitives, userspace recipe-driven init, `sys_srv_post`/`sys_srv_open`
@@ -81,13 +100,18 @@ Hamnix is a wide project. The minimum-viable shape we're converging on:
 
 Concretely this means closing four named gates:
 
-1. **L40 — boot on real ThinkPad hardware.** Pending. Today's UEFI
-   verification is QEMU + OVMF firmware + GNOME Boxes. Structural
-   pieces (PE/COFF stub, SFSP ELF loader, GDT handoff at M16.138,
-   FAT12 ESP per OVMF's El Torito quirk) all in place. No T480 /
-   Dell / HP physical box has run the ISO yet. `docs/REAL_HARDWARE.md`
-   has the concrete USB-stick recipe + firmware checklist for the
-   first volunteer.
+1. **L40 — boot on real hardware.** **Largely closed.** As of
+   M16.156 an Asus i5-4210U (Haswell ULT) laptop boots all the way
+   to the `hamsh` shell in **Legacy/BIOS mode**. The arc that got
+   there: e820-driven dynamic identity-map extension for >4 GiB RAM,
+   GOP-framebuffer fixes (legacy VGA writes were corrupting the GOP
+   scanout on UEFI), an xHCI self-test guard for boxes with no USB
+   keyboard, and the ring-3-transition triple-fault fix in M16.156.
+   Still open on metal: the laptop's **built-in keyboard does not
+   work** (leading hypothesis: it's on the EHCI USB 2.0 controller,
+   not the i8042 — unverified), and **UEFI boot on the real Asus is
+   not yet re-confirmed** (only Legacy/BIOS is). `docs/REAL_HARDWARE.md`
+   has the USB-stick recipe + firmware checklist.
 2. **TLS-CERT — X.509 + RSA-PSS / ECDSA verify with a baked CA store.**
    **Closed.** V0..V6 + V5.1/V5.2/V5.3 (commits `f47449e` → `dc7676c`).
    ASN.1 parser, X.509 walker, RSA-PSS-SHA256, ECDSA-P256 (binary-GCD
@@ -117,9 +141,9 @@ Concretely this means closing four named gates:
    server OS" is functionally demonstrated.
 
 Stack-canary compiler hardening (`-fstack-protector-strong` equivalent)
-just landed in flight — it would have caught today's `_tls_aead_seal`
-2 KiB `mac_buf` overflow at function-exit instead of crashing later
-in unrelated code. That class of bug, now caught at the source.
+has landed (`f9d8d2f`) — it catches the class of stack-local overflow
+(e.g. the `_tls_aead_seal` 2 KiB `mac_buf` case) at function-exit
+instead of letting it crash later in unrelated code.
 
 Everything else on the project — GUI / rio, full real cert validation
 for outbound TLS, multi-core scheduler polish, additional drivers — is
@@ -131,10 +155,12 @@ beyond MVP.
 
 | Gate | Status | Impact |
 |--|--|--|
-| **TLS cert validation** | **Closed** — apt-over-HTTPS against LE-signed mirrors is MITM-resistant for chains that fit one AEAD record | Full chain validation V0..V6 + V5.1: ASN.1 parser, X.509 walker, RSA-PSS-SHA256 verify, ECDSA-P256 verify, PKCS#1 v1.5 verify (`ba2d9dc`), chain builder + CA store + validity window, CertificateVerify transcript binding per RFC 8446 §4.4.3 (`563e23f`). The two V5-disclosed residuals both landed. Remaining real-world fragilities are smaller: (a) multi-record handshake stitching is unsupported — LE chains > ~1.4 KB across two AEAD records will trip; (b) no CRL/OCSP (intentional per RFC 5280 §6 — out of scope); (c) timing-channel hardening pending in V2/V3 primitives; (d) `_tls_now_unix` falls back to a build epoch when RTC is unavailable, opening a clock-rolled-back attack on expired certs. |
-| **L40: real T480 boot** | Pending | "Real hardware" verification is QEMU+OVMF today; no physical box has been booted yet. The cron-priority claim is **structurally** complete, not **physically** verified. |
-| **USB HID V2 polling** | Closed structurally; wire-side verification in QEMU `sendkey` pending `socat` install | Continuous interrupt-IN poll wired into the timer tick; synthetic Transfer Events round-trip through `kbd_rx_push`. Real keypress on `qemu sendkey x` would now go through the same path but the harness can't inject without `socat`. |
-| **Inbound SSH** | Not yet started | Needed for "useful server OS" but no SSH protocol code exists. Crypto primitives are in place (ChaCha20-Poly1305, X25519, SHA-256, ECDSA-P256, RSA-PSS); the SSH layer itself isn't. |
+| **TLS cert validation** | **Closed** — apt-over-HTTPS against LE-signed mirrors is MITM-resistant | Full chain validation V0..V7: ASN.1 parser, X.509 walker, RSA-PSS-SHA256 verify, ECDSA-P256 verify, PKCS#1 v1.5 verify, chain builder + CA store + validity window, CertificateVerify transcript binding per RFC 8446 §4.4.3, multi-record handshake stitching, TCP per-slot RX ring. V6 added the AES-256-GCM-SHA384 cipher suite (codepoint 0x1302) + SHA-384; V6.1/V7 fixed ISRG Root X1 / RSA-4096 chain validation (x509 SPKI buffer cap + bigint limb count). Remaining real-world fragilities: (a) no CRL/OCSP (intentional per RFC 5280 §6 — out of scope); (b) timing-channel hardening still pending in primitives; (c) `_tls_now_unix` falls back to a build epoch when RTC is unavailable, opening a clock-rolled-back attack on expired certs. |
+| **Real-hardware keyboard** | Open blocker | Hamnix boots to `hamsh` on the real Asus laptop, but the built-in keyboard produces nothing. The atkbd path got an i8042 controller bring-up handshake + IRQ 1 wiring + an ISA-edge IOAPIC redirect fix (`dbd40e6`), all confirmed under QEMU; on the real laptop the keyboard still does not respond. Leading hypothesis: the keyboard is on the EHCI USB 2.0 controller, not the i8042 — **unverified**. An EHCI driver is in flight. |
+| **UEFI real-hardware boot** | Not re-confirmed | UEFI direct boot reaches `hamsh` under QEMU+OVMF. Legacy/BIOS boot is confirmed on the real Asus; the UEFI path on that laptop has not been re-verified after the M16.151–156 wave. |
+| **`apt update` end-to-end** | Not yet exercised | The transport (TLS 1.3 + cert validation + HTTP redirects + gzip inflate) and the dpkg userland (`dpkg-deb`, `dpkg -i`/`-l`/`-s`/`-L`) are in place, but a real `apt update` against a live Debian mirror has not been run end-to-end. |
+| **Inbound SSH** | Not yet started | Needed for "useful server OS" but no SSH protocol code exists. Crypto primitives are in place (ChaCha20-Poly1305, AES-128/256-GCM, X25519, SHA-256/384, ECDSA-P256, RSA-PSS); the SSH layer itself isn't. |
+| **Static Python / musl-busybox follow-ons** | Open | CPython runs (frozen-stdlib static build); a fuller apt-installable Python and broader musl-busybox applet coverage remain. |
 | **U9 nested-frame Array spill** | Active compiler bug | `Array[N, T]` locals with the same shape in caller + callee miscompile. Workaround: inline the callee. See [`memory/feedback_compiler_quirks.md`](memory/feedback_compiler_quirks.md). |
 
 Four other compiler bugs landed proper fixes during the recent sessions
@@ -190,8 +216,9 @@ targets > 64 GiB by default, and prompts for explicit confirmation.
 See [`docs/REAL_HARDWARE.md`](docs/REAL_HARDWARE.md) for the full
 real-hardware boot procedure — firmware setup per vendor, expected
 serial-console marker sequence, diagnostic-dump cheat-sheet for boxes
-without a serial cable, and the known Asus iretq triple-fault
-tracked under M16.151..M16.154.
+without a serial cable, and the current real-hardware status (Legacy
+boot confirmed on an Asus i5-4210U; built-in keyboard still an open
+issue).
 
 ### Run the M1..M15 stock-Linux .ko regression suite
 
