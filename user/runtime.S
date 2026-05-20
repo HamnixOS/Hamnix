@@ -301,6 +301,54 @@ sys_connect:
     .size sys_connect, .-sys_connect
 
 
+    /* --- sys_sock_bind(fd, addr, addrlen) -> int32 ------------------
+     * U-socket server side: native-ABI bind(2). Records the bound port
+     * on the socket fd's backing record via SYS_BIND_SOCK (49) ->
+     * _u_bind. NOTE the name: this is socket bind, NOT the Plan 9
+     * namespace sys_bind (syscall 257) defined below — the two share
+     * the C name `bind` in POSIX/Plan 9 but are wholly different
+     * syscalls, so the socket one carries the _sock suffix. `addr`
+     * points at a 16-byte struct sockaddr_in. Three args fit the
+     * SysV/syscall-ABI overlap directly. */
+    .globl sys_sock_bind
+    .type sys_sock_bind, @function
+sys_sock_bind:
+    movq    $49, %rax               /* SYS_BIND_SOCK */
+    syscall
+    ret
+    .size sys_sock_bind, .-sys_sock_bind
+
+
+    /* --- sys_listen(fd, backlog) -> int32 ---------------------------
+     * U-socket server side: native-ABI listen(2). Calls the in-kernel
+     * tcp_listen for the port recorded by sys_sock_bind via
+     * SYS_LISTEN_SOCK (50) -> _u_listen, transitioning the socket to
+     * the LISTENING state. Two args fit the ABI overlap directly. */
+    .globl sys_listen
+    .type sys_listen, @function
+sys_listen:
+    movq    $50, %rax               /* SYS_LISTEN_SOCK */
+    syscall
+    ret
+    .size sys_listen, .-sys_listen
+
+
+    /* --- sys_accept(fd, addr, addrlen) -> int32 ---------------------
+     * U-socket server side: native-ABI accept(2). Blocks (bounded
+     * poll) on a LISTENING socket via SYS_ACCEPT_SOCK (43) ->
+     * _u_accept until the in-kernel TCP stack completes a handshake,
+     * then returns a fresh socket fd for the accepted connection.
+     * `addr` (peer sockaddr out, may be NULL) / `addrlen` are filled
+     * when supplied. Three args fit the ABI overlap directly. */
+    .globl sys_accept
+    .type sys_accept, @function
+sys_accept:
+    movq    $43, %rax               /* SYS_ACCEPT_SOCK */
+    syscall
+    ret
+    .size sys_accept, .-sys_accept
+
+
     /* --- sys_resolve(hostname, len) -> int64 ------------------------
      * U-resolve: native-ABI hostname -> IPv4. Hands a NUL-terminated
      * hostname (%rdi) + its length (%rsi) to the in-kernel DNS

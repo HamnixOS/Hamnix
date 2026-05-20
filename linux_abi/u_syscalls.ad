@@ -81,13 +81,14 @@ from fs.vfs import (
 # close dispatch arms.
 from drivers.net.tcp import (
     tcp_connect, TCP_ERR_NOSLOT, TCP_ERR_ARP, TCP_ERR_REFUSED,
-    TCP_ERR_TIMEOUT,
+    TCP_ERR_TIMEOUT, tcp_listen, tcp_accept,
 )
 from linux_abi.u_socket_state import (
     usock_alloc, usock_free, usock_valid, usock_set_state,
-    usock_set_tcp_slot, usock_get_state,
+    usock_set_tcp_slot, usock_get_state, usock_get_tcp_slot,
     usock_fdbuf_for_record, usock_record_for_fdbuf,
-    USOCK_CREATED, USOCK_CONNECTED,
+    usock_set_bound, usock_get_bound_port, usock_port_in_use,
+    USOCK_CREATED, USOCK_CONNECTED, USOCK_LISTENING,
     USOCK_AF_INET, USOCK_SOCK_STREAM,
 )
 from kernel.sched.core import (
@@ -396,6 +397,7 @@ ELINUX_TIMEDOUT:     int64 = -110   # ETIMEDOUT — SYN-ACK never arrived
 ELINUX_NOTCONN:      int64 = -107   # ENOTCONN — socket not connected
 ELINUX_ISCONN:       int64 = -106   # EISCONN — already connected
 ELINUX_MFILE:        int64 = -24    # EMFILE — fd / record table exhausted
+ELINUX_ADDRINUSE:    int64 = -98    # EADDRINUSE — bind port already in use
 
 
 # =====================================================================
@@ -1240,15 +1242,81 @@ def _u_accept(a0: uint64, a1: uint64, a2: uint64,
               a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
     #
-    # U-socket V0 is CLIENT-SIDE ONLY: socket()/connect() drive a real
-    # TCP active open, but the server side (bind/listen/accept) is NOT
-    # bridged yet — the TCP stack does have tcp_listen / tcp_accept
-    # (drivers/net/tcp.ad), so V1 can wire this. Until then accept
-    # returns -EAGAIN, the would-block answer a non-blocking listening
-    # socket gets in Linux when no connection is pending.
-    if vfs_fd_is_socket(cast[int32](a0)) == 0:
+    # U-socket V1 server side: block (bounded poll) on a LISTENING
+    # socket until the in-kernel TCP stack completes a three-way
+    # handshake on the bound port, then hand back a brand-new socket fd
+    # for the accepted connection. read/write/close on the returned fd
+    # route through the existing FD_SOCKET_MARK arms (fs/vfs.ad) — the
+    # new record is USOCK_CONNECTED and carries the accepted TCP slot.
+    #
+    # `addr` / `addrlen` (the peer sockaddr out-params) are filled with
+    # the connection's remote (ip, port) when supplied; a NULL addr is
+    # honoured (Linux allows it). V1 is BLOCKING only — no O_NONBLOCK
+    # / accept4 SOCK_NONBLOCK fast path (see the V1 backlog).
+    fd: int32 = cast[int32](a0)
+    if vfs_fd_is_socket(fd) == 0:
         return ELINUX_BADF
-    return ELINUX_AGAIN
+    rec: int32 = usock_record_for_fdbuf(vfs_socket_fd_get_record(fd))
+    if usock_valid(rec) == 0:
+        return ELINUX_BADF
+    if usock_get_state(rec) != USOCK_LISTENING:
+        # accept(2) on a socket that never reached listen(2) — Linux
+        # returns -EINVAL ("Socket is not listening for connections").
+        set_current_errstr("accept: socket not listening")
+        return ELINUX_INVAL
+    lslot: int32 = usock_get_tcp_slot(rec)
+    if lslot < 0:
+        set_current_errstr("accept: no TCP listener slot")
+        return ELINUX_INVAL
+    # Block on the listener. 500 jiffies (~5 s @ HZ=100) mirrors the
+    # connect(2) budget — bounded so a server with no client doesn't
+    # wedge the syscall forever; tcp_accept polls virtio_net itself.
+    conn_slot: int32 = tcp_accept(lslot, 500)
+    if conn_slot < 0:
+        # No connection completed the handshake before the deadline.
+        # -EAGAIN is the would-block answer Linux gives a listening
+        # socket with an empty accept queue.
+        set_current_errstr("accept: no connection pending")
+        return ELINUX_AGAIN
+    # A connection is ESTABLISHED. Allocate a fresh socket fd + backing
+    # record for it so the caller gets an independent fd it can
+    # read/write/close while the listener stays open for more accepts.
+    nfd: int32 = vfs_alloc_socket_fd()
+    if nfd < 0:
+        # Out of fd slots — the TCP connection itself stays up; the
+        # caller can retry accept() after closing something.
+        set_current_errstr("accept: out of fd slots")
+        return ELINUX_MFILE
+    nrec: int32 = usock_alloc(USOCK_AF_INET, USOCK_SOCK_STREAM)
+    if nrec < 0:
+        vfs_close(nfd)
+        set_current_errstr("accept: out of socket records")
+        return ELINUX_MFILE
+    usock_set_tcp_slot(nrec, conn_slot)
+    usock_set_state(nrec, USOCK_CONNECTED)
+    if vfs_socket_fd_set_record(nfd, usock_fdbuf_for_record(nrec)) != 0:
+        usock_free(nrec)
+        vfs_close(nfd)
+        set_current_errstr("accept: fd record bind failed")
+        return ELINUX_BADF
+    # Fill the peer sockaddr_out if the caller asked for one. We have
+    # no per-connection peer-address table exposed from tcp.ad yet, so
+    # the family is reported faithfully (AF_INET) but ip/port come back
+    # zero — matching the getpeername stub. addrlen is set to 16.
+    if a1 != 0:
+        pa: Ptr[uint8] = cast[Ptr[uint8]](a1)
+        pa[0] = cast[uint8](USOCK_AF_INET & 0xFF)
+        pa[1] = cast[uint8]((USOCK_AF_INET >> 8) & 0xFF)
+        i: uint64 = 2
+        while i < 16:
+            pa[i] = 0
+            i = i + 1
+    if a2 != 0:
+        cast[Ptr[uint32]](a2)[0] = 16
+    printk2("[u_socket] accept: listener slot=%d -> conn slot=%d\n",
+            cast[uint64](lslot), cast[uint64](conn_slot))
+    printk1("[u_socket] accept: new fd=%d\n", cast[uint64](nfd))
+    return cast[int64](nfd)
 
 
 def _u_accept4(a0: uint64, a1: uint64, a2: uint64,
@@ -1264,12 +1332,59 @@ def _u_bind(a0: uint64, a1: uint64, a2: uint64,
             a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
     #
-    # U-socket V0 stub (server side not bridged — see _u_accept). We
-    # accept and discard the address so a program that bind()s before
-    # it discovers accept() is unsupported doesn't fail prematurely.
-    # V1 should record the bound port and pass it to tcp_listen.
-    if vfs_fd_is_socket(cast[int32](a0)) == 0:
+    # U-socket V1 server side: parse the sockaddr_in and record the
+    # (port, addr) on the socket's backing record. TCP doesn't truly
+    # "bind" until listen(2) calls tcp_listen — recording the port here
+    # is enough; listen(2) reads it back. INADDR_ANY (0.0.0.0) is the
+    # common case and is stored verbatim (addr 0).
+    #
+    # struct sockaddr_in (Linux <netinet/in.h>, 16 bytes):
+    #   offset 0 : uint16 sin_family  (host order — AF_INET == 2)
+    #   offset 2 : uint16 sin_port    (network / big-endian)
+    #   offset 4 : uint32 sin_addr    (network / big-endian IPv4)
+    #   offset 8 : uint8[8] sin_zero  (padding)
+    fd: int32 = cast[int32](a0)
+    if vfs_fd_is_socket(fd) == 0:
         return ELINUX_BADF
+    rec: int32 = usock_record_for_fdbuf(vfs_socket_fd_get_record(fd))
+    if usock_valid(rec) == 0:
+        return ELINUX_BADF
+    if usock_get_state(rec) != USOCK_CREATED:
+        # Already bound + listening, or connected, or closed — Linux
+        # returns -EINVAL ("socket is already bound to an address").
+        set_current_errstr("bind: socket already bound")
+        return ELINUX_INVAL
+    if a1 == 0:
+        set_current_errstr("bind: null sockaddr")
+        return ELINUX_INVAL
+    if a2 < 16:
+        set_current_errstr("bind: addrlen too short for sockaddr_in")
+        return ELINUX_INVAL
+    addr: Ptr[uint8] = cast[Ptr[uint8]](a1)
+    sin_family: uint32 = cast[uint32](addr[0]) \
+                       | (cast[uint32](addr[1]) << 8)
+    if sin_family != USOCK_AF_INET:
+        set_current_errstr("bind: sockaddr family not AF_INET")
+        return ELINUX_AFNOSUPPORT
+    # sin_port — network byte order (big-endian): high byte first.
+    bind_port: uint32 = (cast[uint32](addr[2]) << 8) \
+                      | cast[uint32](addr[3])
+    # sin_addr — network byte order: addr[4] is the first IPv4 octet.
+    # Store host-order so the octets read naturally; 0 == INADDR_ANY.
+    bind_addr: uint32 = (cast[uint32](addr[4]) << 24) \
+                      | (cast[uint32](addr[5]) << 16) \
+                      | (cast[uint32](addr[6]) << 8) \
+                      | cast[uint32](addr[7])
+    if bind_port == 0:
+        # Ephemeral-port bind (port 0) isn't supported — a server has
+        # to name its port so the host side knows where to connect.
+        set_current_errstr("bind: port 0 (ephemeral) not supported")
+        return ELINUX_INVAL
+    if usock_port_in_use(bind_port) != 0:
+        set_current_errstr("bind: address already in use")
+        return ELINUX_ADDRINUSE
+    usock_set_bound(rec, bind_port, bind_addr)
+    printk1("[u_socket] bind: port=%d\n", cast[uint64](bind_port))
     return 0
 
 
@@ -1277,11 +1392,42 @@ def _u_listen(a0: uint64, a1: uint64, a2: uint64,
               a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int listen(int sockfd, int backlog)
     #
-    # U-socket V0 stub (server side not bridged — see _u_accept). V1
-    # should call tcp_listen(bound_port) and move the record into a
-    # LISTEN state so accept() can return tcp_accept()'s slot.
-    if vfs_fd_is_socket(cast[int32](a0)) == 0:
+    # U-socket V1 server side: call the in-kernel tcp_listen for the
+    # port recorded by bind(2), stash the returned TCP_LISTEN slot on
+    # the backing record, and move the record to USOCK_LISTENING so
+    # accept(2) can poll it. `backlog` is advisory — tcp.ad's accept
+    # queue depth is fixed by TCP_NUM_SLOTS, so we don't honour it
+    # beyond what tcp_accept already provides (see V1 backlog).
+    fd: int32 = cast[int32](a0)
+    if vfs_fd_is_socket(fd) == 0:
         return ELINUX_BADF
+    rec: int32 = usock_record_for_fdbuf(vfs_socket_fd_get_record(fd))
+    if usock_valid(rec) == 0:
+        return ELINUX_BADF
+    st: uint32 = usock_get_state(rec)
+    if st == USOCK_LISTENING:
+        # Idempotent re-listen — Linux allows listen() twice (it just
+        # updates the backlog). Nothing to re-do; report success.
+        return 0
+    if st != USOCK_CREATED:
+        set_current_errstr("listen: socket not in a listenable state")
+        return ELINUX_INVAL
+    bound_port: uint32 = usock_get_bound_port(rec)
+    if bound_port == 0:
+        # listen(2) before bind(2). Linux auto-binds an ephemeral port
+        # here; Hamnix requires an explicit bind so the server's port
+        # is known to the host test driver.
+        set_current_errstr("listen: socket not bound")
+        return ELINUX_INVAL
+    lslot: int32 = tcp_listen(cast[uint16](bound_port & 0xFFFF))
+    if lslot < 0:
+        # All 8 TCP slots in use — no room for a listener TCB.
+        set_current_errstr("listen: no TCP listener slot")
+        return ELINUX_ADDRINUSE
+    usock_set_tcp_slot(rec, lslot)
+    usock_set_state(rec, USOCK_LISTENING)
+    printk2("[u_socket] listen: port=%d -> tcp listener slot=%d\n",
+            cast[uint64](bound_port), cast[uint64](lslot))
     return 0
 
 
