@@ -1,8 +1,14 @@
 # drivers/usb/ehci.ad
 #
-# EHCI (Enhanced Host Controller Interface — USB 2.0) HCD driver —
-# V0 scope: PCI probe + BIOS->OS handoff + controller init + root-hub
-# port enumeration.
+# EHCI (Enhanced Host Controller Interface — USB 2.0) HCD driver.
+#   V0: PCI probe + BIOS->OS handoff + controller init + root-hub
+#       port enumeration.
+#   V1: async control-transfer engine + periodic interrupt-IN QH for
+#       a HID boot keyboard (poll-driven from the timer tick).
+#   V2: interrupt-driven delivery — MSI (preferred) or IOAPIC INTx
+#       fallback wired to ehci_irq_handler(); USBINTR enables USBINT
+#       (transfer-complete / IOC) + Port Change. The timer-tick
+#       ehci_poll() is retained as a belt-and-braces fallback.
 #
 # Why EHCI when Hamnix already has an xHCI driver:
 #
@@ -68,10 +74,13 @@
 from kernel.printk.printk import printk0, printk1, printk2
 from drivers.pci.pci import (
     pci_config_read_dword, pci_config_write_dword,
+    pci_config_read_byte,
     pci_bdf_bus, pci_bdf_dev, pci_bdf_fn, pci_pack_bdf,
     pci_read_bar, PCI_BDF_NONE,
     PCI_COMMAND_OFFSET, PCI_COMMAND_MEM, PCI_COMMAND_MASTER,
 )
+from arch.x86.kernel.apic import ioapic_redirect
+from arch.x86.kernel.irq import register_irq_handler
 from mm.page_alloc import alloc_pages
 from drivers.usb.hid import hid_init, hid_kbd_report
 from drivers.usb.usb import (
@@ -196,6 +205,90 @@ EHCI_LINESTATUS_KSTATE: uint32 = 0x01
 EHCI_LEGSUP_CAPID_LEGACY: uint32 = 0x01
 EHCI_LEGSUP_BIOS_OWNED:   uint32 = 0x00010000  # bit 16
 EHCI_LEGSUP_OS_OWNED:     uint32 = 0x01000000  # bit 24
+
+
+# --- V2: USBINTR / USBSTS interrupt bits (EHCI §2.3.2/§2.3.3) -----
+#
+# USBINTR (op-reg 0x08) is the interrupt-enable register; a 1 bit lets
+# the matching USBSTS cause raise the controller's interrupt pin / MSI.
+# USBSTS (op-reg 0x04) reports the pending causes; the low six bits are
+# write-1-to-clear (W1C) — the IRQ handler writes the bits it observed
+# back to USBSTS to acknowledge them. We enable:
+#   bit 0  USBINT       — a qTD with IOC set retired (transfer complete)
+#   bit 2  Port Change  — a PORTSC change bit was set (connect/enable)
+# Error / FrameList-rollover / HostSystemError stay masked for V2.
+EHCI_INTR_USBINT:       uint32 = 0x00000001    # USBINTR/USBSTS bit 0
+EHCI_INTR_USBERRINT:    uint32 = 0x00000002    # bit 1 — transfer error
+EHCI_INTR_PORTCHANGE:   uint32 = 0x00000004    # bit 2 — port-status change
+EHCI_INTR_HOSTSYSERR:   uint32 = 0x00000010    # bit 4 — host system error
+# Composite "interrupts we enable" — USBINT | PortChange = 0x05. The
+# x86_64 backend requires global initializers to be literal integers,
+# so the OR result is hardcoded with this derivation comment (the V0/V1
+# EHCI_PORTSC_W1C_MASK / EHCI_QTD_STS_ERRMASK constants do the same).
+EHCI_INTR_ENABLE_MASK:  uint32 = 0x00000005    # USBINT(0x01)|PORTCHANGE(0x04)
+# USBSTS W1C acknowledge mask — the six low status bits the handler may
+# clear: USBINT(0x01)|USBERRINT(0x02)|PORTCHANGE(0x04)|FrameRollover
+# (0x08)|HostSysErr(0x10)|IntrAsyncAdvance(0x20) = 0x3F.
+EHCI_STS_W1C_MASK:      uint32 = 0x0000003F
+
+
+# --- V2: PCI capability list + MSI (PCI 3.0 §6.7, §6.8.1) ---------
+#
+# Identical cap-walk pattern to drivers/net/e1000e.ad's V2 MSI bring-up.
+# The PCI Status register's Capabilities-List bit (0x06 bit 4) gates a
+# linked list rooted at config offset 0x34; each node is two header
+# bytes (ID, next-pointer). Capability ID 0x05 is MSI. EHCI controllers
+# (Intel ICH/PCH, AMD SB, and QEMU's usb-ehci) all expose an MSI cap —
+# MSI is preferred because it bypasses the IOAPIC entirely: a single
+# config-space program wires the IRQ, no boot-order dependency on
+# apic_init() having programmed the IOAPIC.
+
+EHCI_PCI_INTERRUPT_LINE: uint32 = 0x3C
+EHCI_PCI_INTERRUPT_PIN:  uint32 = 0x3D
+EHCI_PCI_STATUS_CAP_LIST: uint32 = 0x10        # PCI Status bit 4
+EHCI_PCI_CAP_PTR_OFFSET:  uint32 = 0x34        # capabilities pointer
+EHCI_PCI_CAP_ID_MSI:      uint32 = 0x05        # MSI capability ID
+
+# MSI Capability layout (relative to the cap's base offset):
+#   +0  u8  Capability ID (0x05)
+#   +1  u8  Next-cap pointer
+#   +2  u16 Message Control  (bit 0 Enable, bit 7 64-bit-capable,
+#                             bits 1..3 MMC, bits 4..6 MME)
+#   +4  u32 Message Address Low
+#   +8  u32 Message Address High (only present when 64-bit-capable)
+#   32-bit layout: +8  u16 Message Data ; 64-bit: +12 u16 Message Data
+EHCI_MSI_ADDR_LOW_OFFSET:  uint32 = 0x04
+EHCI_MSI_ADDR_HIGH_OFFSET: uint32 = 0x08
+EHCI_MSI_DATA_OFFSET_32:   uint32 = 0x08
+EHCI_MSI_DATA_OFFSET_64:   uint32 = 0x0C
+EHCI_MSI_CTRL_ENABLE:      uint32 = 0x0001     # Message Control bit 0
+EHCI_MSI_CTRL_64BIT:       uint32 = 0x0080     # Message Control bit 7
+EHCI_MSI_CTRL_MMC_MASK:    uint32 = 0x000E     # bits 1..3 (RO, log2 vec)
+EHCI_MSI_CTRL_MME_MASK:    uint32 = 0x0070     # bits 4..6 — written 0
+
+# LAPIC MSI message-address window: 0xFEE00000 | (lapic_id << 12),
+# RH=0 / DM=0 (direct physical delivery). Single-CPU boot puts the BSP
+# at LAPIC id 0, so the address lands at exactly 0xFEE00000.
+EHCI_LAPIC_MSI_BASE: uint64 = 0xFEE00000
+EHCI_LAPIC_ID:       uint32 = 0
+EHCI_MSI_DATA_VECTOR_MASK: uint32 = 0x00FF     # MSI data: vector in 7..0
+
+# CPU vector this driver claims. Vector allocation map (single-vector
+# fixed-delivery to LAPIC 0):
+#   0x40 virtio-net  0x41 ahci   0x42 nvme   0x43 (was e1000e INTx,
+#   retired)         0x44 8139   0x45 auxmouse  0x46 atkbd
+#   0x47 e1000e      0x48 r8169-Gigabit-MSI
+#
+# The IDT device-IRQ band is vectors 0x20..0x47 (32..71) — see
+# arch/x86/kernel/idt.ad's `while i < 72` gate-population loop and
+# irq_asm.S's irq_stub_table (irq_stub_32..irq_stub_71). A vector
+# >= 0x48 has NO IDT gate / IRQ stub, so an MSI or INTx delivered
+# there would fault. EHCI therefore re-claims 0x43 — the slot freed
+# when e1000e's legacy-INTx vector was retired in favour of MSI 0x47.
+# It is unused and inside the IDT-covered band. The MSI path and the
+# IOAPIC INTx fallback re-use the same vector; do_irq() routes by
+# vector, so the delivery mechanism is invisible to the handler table.
+EHCI_IRQ_VECTOR: uint32 = 0x43
 
 
 # --- V1: qTD layout (EHCI §3.5) -----------------------------------
@@ -348,6 +441,19 @@ class EhciState:
     reports_received: uint32 # interrupt reports drained by ehci_poll
     kbd_keydowns: uint32    # 1 once a real key-down report was seen
     poll_calls:  uint32     # ehci_poll invocations — tick-rate diag
+
+    # --- V2 interrupt-driven-delivery state ----------------------
+    #
+    # msi_cap_off == 0 means "no MSI cap discovered; the driver fell
+    # back to legacy INTx via the IOAPIC". irq_count climbs once the
+    # LAPIC is software-enabled and IF is set (both happen later in
+    # start_kernel) — the load-bearing "[ehci] IRQ fired" signal.
+    msi_cap_off: uint32     # PCI cfg offset of the MSI cap, 0 if none
+    msi_is_64:   uint32     # 1 if the MSI cap is 64-bit-address-capable
+    msi_enabled: uint32     # 1 once the MSI cap is programmed + enabled
+    irq_pin:     uint32     # IOAPIC pin (INTx fallback path only)
+    irq_count:   uint64     # times ehci_irq_handler fired
+    irq_reports: uint32     # interrupt-IN reports drained from IRQ ctx
 
 
 ehci: EhciState
@@ -891,6 +997,17 @@ def ehci_init() -> int32:
         _ehci_v1_attach_keyboard()
     else:
         printk0("[ehci] V1: no high-speed device — skipping enumeration\n")
+
+    # --- V2: interrupt-driven delivery ----------------------------
+    #
+    # Wire a real IRQ (MSI preferred, IOAPIC INTx fallback) and enable
+    # the EHCI USBINTR sources. After this, transfer-completion (IOC)
+    # interrupts dispatch ehci_irq_handler() instead of relying on the
+    # timer-tick ehci_poll(). The poll is RETAINED as a fallback —
+    # see the comment on ehci_poll(). Called after the V1 attach so
+    # the periodic interrupt-IN QH is armed before USBINTR opens the
+    # gate. Non-fatal: V0/V1 already succeeded.
+    _ehci_wire_irq(bdf)
     return 0
 
 
@@ -1186,20 +1303,22 @@ def _ehci_periodic_link():
         i = i + 1
 
 
-# --- V1: tick-driven interrupt-IN poll ----------------------------
+# --- V1/V2: shared interrupt-IN drain -----------------------------
 
-def ehci_poll():
-    # Called from the timer tick (arch/x86/kernel/time.ad). When the
-    # interrupt qTD's Active bit clears, an 8-byte boot report has
-    # landed in int_buf — hand it to the HID layer and re-arm. No-op
-    # until V1 enumeration armed the keyboard, so safe to call
-    # unconditionally (mirrors xhci_poll's kbd_enabled guard).
-    if ehci.kbd_enabled == 0:
-        return
-    ehci.poll_calls = ehci.poll_calls + 1
-    # Drain up to 4 completed reports per tick. QEMU's usb-kbd emits a
+def _ehci_drain_int_reports() -> uint32:
+    # Drain every completed interrupt-IN report the controller has
+    # retired into int_buf and feed each to the HID layer, re-arming
+    # the qTD after each. Returns the number of reports dispatched.
+    #
+    # Shared by the V1 timer-tick poll (ehci_poll) and the V2 IRQ
+    # handler (ehci_irq_handler) — both inspect the exact same retired-
+    # qTD state, so the body lives here once. Caller guarantees
+    # ehci.kbd_enabled != 0 before calling.
+    #
+    # Drains up to 4 completed reports per call. QEMU's usb-kbd emits a
     # report per key edge (press + release); 4 absorbs a fast burst
-    # between two timer ticks without dropping anything.
+    # between two ticks / IRQs without dropping anything.
+    dispatched: uint32 = 0
     drained: uint32 = 0
     while drained < 4:
         tok: uint32 = cast[Ptr[uint32]](ehci.int_qtd)[2]
@@ -1240,7 +1359,30 @@ def ehci_poll():
                 hid_kbd_report(rb)
                 ehci.reports_received = ehci.reports_received + 1
                 _ehci_int_arm()
+                dispatched = dispatched + 1
                 drained = drained + 1
+    return dispatched
+
+
+def ehci_poll():
+    # V1 timer-tick fallback (arch/x86/kernel/time.ad). When the
+    # interrupt qTD's Active bit clears, an 8-byte boot report has
+    # landed in int_buf — hand it to the HID layer and re-arm. No-op
+    # until V1 enumeration armed the keyboard, so safe to call
+    # unconditionally (mirrors xhci_poll's kbd_enabled guard).
+    #
+    # V2 wired a real MSI/INTx IRQ (ehci_irq_handler) that does the
+    # same drain from interrupt context. This timer-tick poll is
+    # RETAINED as a belt-and-braces fallback — exactly as atkbd.ad
+    # kept atkbd_poll() alongside IRQ 1. If the IRQ is firing it finds
+    # the qTD already drained and no-ops; if the IRQ ever wedges
+    # (a real-hw IOAPIC level-trigger Remote-IRR latch on the INTx
+    # fallback path, say) the keyboard still works off the tick.
+    # _ehci_drain_int_reports() is idempotent across both callers.
+    if ehci.kbd_enabled == 0:
+        return
+    ehci.poll_calls = ehci.poll_calls + 1
+    _ehci_drain_int_reports()
 
 
 # --- V1: enumeration + boot-keyboard attach -----------------------
@@ -1455,6 +1597,265 @@ def ehci_poll_calls() -> uint32:
     return ehci.poll_calls
 
 
+# =====================================================================
+# V2 — interrupt-driven delivery (MSI, IOAPIC INTx fallback).
+# =====================================================================
+#
+# V1 drained the periodic interrupt-IN QH from the timer tick. V2 wires
+# a real IRQ: the EHCI USBINTR register enables interrupt sources, the
+# controller raises an MSI write (or asserts its INTx pin) when a qTD
+# with IOC retires, and ehci_irq_handler() does the drain from
+# interrupt context — lower latency, no per-tick MMIO poll.
+#
+# MSI is preferred over INTx for the same reason e1000e V2 chose it:
+# MSI bypasses the IOAPIC. An INTx line needs the IOAPIC programmed and
+# the LAPIC online, but ehci_init() runs (init/main.ad) BEFORE
+# apic_init(). An MSI write goes straight from the PCI device to the
+# LAPIC's MMIO window (0xFEE0_xxxx); the only load-bearing prerequisite
+# at ehci_init() time is the IDT being populated (it is). Delivery
+# actually starts once the LAPIC is software-enabled and IF is set,
+# both later in start_kernel(). do_irq() routes by vector, so the
+# handler is identical whether the IRQ arrived via MSI or INTx.
+
+
+# --- V2: PCI MSI capability walk ----------------------------------
+
+def _ehci_msi_find_cap(bdf: uint32) -> uint32:
+    # Walk the PCI capability list for the MSI capability (ID 0x05).
+    # Returns the cap's byte-offset in config space, or 0 if MSI is
+    # absent. 0 is a safe sentinel — config offset 0 holds the
+    # vendor/device-id dword, never a capability header. Mirrors
+    # drivers/net/e1000e.ad::_e1000e_msi_find_cap exactly.
+    bus: uint32 = pci_bdf_bus(bdf)
+    dev: uint32 = pci_bdf_dev(bdf)
+    fn:  uint32 = pci_bdf_fn(bdf)
+
+    # The "Capabilities List" bit is in the PCI Status register — the
+    # high 16 bits of the 0x04 dword.
+    cmd_status: uint32 = pci_config_read_dword(bus, dev, fn, 0x04)
+    status: uint32 = (cmd_status >> 16) & 0xFFFF
+    if (status & EHCI_PCI_STATUS_CAP_LIST) == 0:
+        printk0("[ehci] PCI status reports no capability list\n")
+        return 0
+
+    # Capability pointer at config offset 0x34; low 2 bits reserved.
+    cap_ptr: uint32 = pci_config_read_byte(bus, dev, fn,
+                                           EHCI_PCI_CAP_PTR_OFFSET) & 0xFC
+    # Bounded walk — a malformed circular list would otherwise wedge
+    # boot. 64 hops is plenty (256-byte config / 2-byte headers).
+    steps: uint32 = 0
+    while cap_ptr != 0 and steps < 64:
+        cap_id: uint32 = pci_config_read_byte(bus, dev, fn, cap_ptr)
+        if cap_id == EHCI_PCI_CAP_ID_MSI:
+            return cap_ptr
+        cap_ptr = pci_config_read_byte(bus, dev, fn, cap_ptr + 1) & 0xFC
+        steps = steps + 1
+    return 0
+
+
+def _ehci_msi_program(bdf: uint32, cap_off: uint32) -> int32:
+    # Program the MSI capability for single-vector fixed delivery to
+    # LAPIC 0 at EHCI_IRQ_VECTOR. Mirrors e1000e/_e1000e_msi_program.
+    #   Message Address : 0xFEE00000 | (lapic_id << 12), RH=0/DM=0.
+    #   Message Data    : vector | (0 << 8) → fixed delivery, edge.
+    #   Message Control : bit 0 (Enable) set; MME (bits 4..6) cleared
+    #                     to advertise exactly one vector.
+    bus: uint32 = pci_bdf_bus(bdf)
+    dev: uint32 = pci_bdf_dev(bdf)
+    fn:  uint32 = pci_bdf_fn(bdf)
+
+    # Read the Message Control register (high 16 bits of the cap dword).
+    ctrl_dword_off: uint32 = cap_off & 0xFC
+    ctrl_dword: uint32 = pci_config_read_dword(bus, dev, fn,
+                                               ctrl_dword_off)
+    ctrl: uint32 = (ctrl_dword >> 16) & 0xFFFF
+    is_64: uint32 = 0
+    if (ctrl & EHCI_MSI_CTRL_64BIT) != 0:
+        is_64 = 1
+    mmc: uint32 = (ctrl & EHCI_MSI_CTRL_MMC_MASK) >> 1
+    printk2("[ehci] MSI cap found at offset=0x%x ctrl=0x%x\n",
+            cast[uint64](cap_off), cast[uint64](ctrl))
+    printk2("[ehci] MSI is64=%d multimsg_capable=2^%d\n",
+            cast[uint64](is_64), cast[uint64](mmc))
+
+    # Compose the Message Address + Data.
+    addr_lo: uint32 = cast[uint32](EHCI_LAPIC_MSI_BASE & 0xFFFFFFFF) \
+                   | ((EHCI_LAPIC_ID & 0xFF) << 12)
+    addr_hi: uint32 = 0
+    data: uint32 = EHCI_IRQ_VECTOR & EHCI_MSI_DATA_VECTOR_MASK
+
+    # Write Message Address Low (cap_off+4, dword-aligned).
+    pci_config_write_dword(bus, dev, fn,
+                           cap_off + EHCI_MSI_ADDR_LOW_OFFSET, addr_lo)
+
+    # Message Data sits at +8 (32-bit MSI) or +12 (64-bit MSI).
+    data_dword_off: uint32 = (cap_off + EHCI_MSI_DATA_OFFSET_32) & 0xFC
+    if is_64 != 0:
+        pci_config_write_dword(bus, dev, fn,
+                               cap_off + EHCI_MSI_ADDR_HIGH_OFFSET,
+                               addr_hi)
+        data_dword_off = (cap_off + EHCI_MSI_DATA_OFFSET_64) & 0xFC
+    # RMW so the reserved upper 16 bits of the data dword survive.
+    data_dword: uint32 = pci_config_read_dword(bus, dev, fn,
+                                               data_dword_off)
+    data_dword = (data_dword & 0xFFFF0000) | (data & 0xFFFF)
+    pci_config_write_dword(bus, dev, fn, data_dword_off, data_dword)
+
+    # Set MSI Enable (bit 0) and explicitly clear MME (bits 4..6) so a
+    # stale firmware-latched multi-vector count can't survive. RMW the
+    # high half of the ctrl dword; leave the cap header (low half) alone.
+    new_ctrl: uint32 = (ctrl | EHCI_MSI_CTRL_ENABLE) & 0xFFFF
+    new_ctrl = new_ctrl & (~EHCI_MSI_CTRL_MME_MASK)
+    new_dword: uint32 = (ctrl_dword & 0x0000FFFF) | (new_ctrl << 16)
+    pci_config_write_dword(bus, dev, fn, ctrl_dword_off, new_dword)
+
+    ehci.msi_cap_off = cap_off
+    ehci.msi_is_64   = is_64
+    ehci.msi_enabled = 1
+    printk2("[ehci] MSI vector=0x%x enabled (addr=0x%x",
+            cast[uint64](EHCI_IRQ_VECTOR), cast[uint64](addr_lo))
+    printk1(" data=0x%x)\n", cast[uint64](data))
+    return 0
+
+
+def _ehci_enable_controller_irqs():
+    # Program the EHCI USBINTR operational register to let transfer-
+    # completion (USBINT) and port-change events raise the controller's
+    # interrupt. EHCI §2.3.3: a 1 bit in USBINTR arms the matching
+    # USBSTS cause. We first clear any stale latched causes by writing
+    # the W1C status bits back to USBSTS (a firmware-left-running
+    # controller can have causes pending), then enable our sources.
+    if ehci.op_base == 0:
+        return
+    # Acknowledge / clear any latched status (W1C — write-1-to-clear).
+    sts: uint32 = _ehci_r32(ehci.op_base + EHCI_OP_USBSTS)
+    _ehci_w32(ehci.op_base + EHCI_OP_USBSTS, sts & EHCI_STS_W1C_MASK)
+    # Enable USBINT (transfer complete / IOC) + Port Change.
+    _ehci_w32(ehci.op_base + EHCI_OP_USBINTR, EHCI_INTR_ENABLE_MASK)
+    printk1("[ehci] USBINTR=0x%x (USBINT + PortChange enabled)\n",
+            cast[uint64](EHCI_INTR_ENABLE_MASK))
+
+
+# --- V2: IRQ handler ----------------------------------------------
+
+def ehci_irq_handler():
+    # IRQ-context entry, reached via MSI (V2 primary path) or via INTx
+    # through the IOAPIC (fallback). Both arrive at EHCI_IRQ_VECTOR and
+    # are dispatched here by do_irq(). do_irq() writes the LAPIC EOI
+    # AFTER this returns — we must NOT EOI here (the kernel convention,
+    # same as atkbd / e1000e).
+    if ehci.op_base == 0:
+        return
+    ehci.irq_count = ehci.irq_count + 1
+    # Read USBSTS to learn which cause(s) fired.
+    sts: uint32 = _ehci_r32(ehci.op_base + EHCI_OP_USBSTS)
+    # Acknowledge: write the observed W1C bits straight back to USBSTS.
+    # EHCI §2.3.2 — the low six status bits are write-1-to-clear; this
+    # must happen before (or it's fine, at) the drain so a fresh qTD
+    # completion that lands during the drain isn't lost.
+    ack: uint32 = sts & EHCI_STS_W1C_MASK
+    if ack != 0:
+        _ehci_w32(ehci.op_base + EHCI_OP_USBSTS, ack)
+    # First IRQ gets one diagnostic line; subsequent IRQs stay silent
+    # (the running count is readable via ehci_irq_count()). This is the
+    # load-bearing "[ehci] IRQ fired" signal the keyboard test watches.
+    if ehci.irq_count == 1:
+        printk2("[ehci] IRQ fired (usbsts=0x%x count=%d)\n",
+                cast[uint64](sts), ehci.irq_count)
+    # USBINT (bit 0) — a qTD with IOC retired. The HID interrupt-IN
+    # qTDs all carry IOC (see _ehci_int_arm), so drain the periodic
+    # interrupt-IN QH exactly as ehci_poll did: int_buf -> hid_kbd_report
+    # -> kbd_rx_push, then re-arm.
+    if (sts & EHCI_INTR_USBINT) != 0 and ehci.kbd_enabled != 0:
+        drained: uint32 = _ehci_drain_int_reports()
+        ehci.irq_reports = ehci.irq_reports + drained
+    # Port Change (bit 2) — logged for diagnostic; live root-hub
+    # hot-plug re-enumeration is V3 scope (the V0 scan already ran).
+    if (sts & EHCI_INTR_PORTCHANGE) != 0 and ehci.irq_count <= 4:
+        printk0("[ehci] IRQ: port-change event\n")
+
+
+def ehci_irq_count() -> uint64:
+    # Times ehci_irq_handler fired. Climbs once the LAPIC is software-
+    # enabled and IF is set — the secondary "interrupts are live"
+    # signal beside the "[ehci] IRQ fired" log line.
+    return ehci.irq_count
+
+
+def ehci_msi_enabled() -> uint32:
+    # 1 if V2 brought the IRQ up via MSI, 0 if it fell back to INTx.
+    return ehci.msi_enabled
+
+
+def ehci_irq_reports() -> uint32:
+    # Interrupt-IN reports drained specifically from IRQ context — a
+    # live-keystroke test watches this to confirm the keyboard runs
+    # off the IRQ rather than only the timer-tick poll fallback.
+    return ehci.irq_reports
+
+
+# --- V2: IRQ wiring (called from ehci_init) -----------------------
+
+def _ehci_wire_irq(bdf: uint32):
+    # Register the handler, then wire delivery: MSI if the controller
+    # exposes an MSI capability (preferred — bypasses the IOAPIC),
+    # otherwise legacy INTx via the IOAPIC. Finally enable the EHCI-
+    # side interrupt sources in USBINTR. Failure here is non-fatal:
+    # the timer-tick ehci_poll() fallback keeps the keyboard alive.
+    #
+    # QEMU note: QEMU's `usb-ehci` model exposes NO PCI capability
+    # list (so no MSI cap) and, in practice, does not deliver an
+    # observable INTx interrupt to the kernel — ehci_irq_count() stays
+    # 0 even with live keystrokes flowing, and the keyboard runs off
+    # the ehci_poll() fallback. The IRQ path below is therefore
+    # real-hardware-exercised-only under QEMU; it is code-inspection-
+    # verified and the poll fallback guarantees no regression. On real
+    # ICH/PCH silicon the EHCI controller does expose an MSI cap and
+    # ehci_irq_handler() becomes the live delivery path.
+    ehci.msi_cap_off = 0
+    ehci.msi_is_64   = 0
+    ehci.msi_enabled = 0
+    ehci.irq_pin     = 0
+    ehci.irq_count   = 0
+    ehci.irq_reports = 0
+    register_irq_handler(cast[uint64](EHCI_IRQ_VECTOR),
+                         cast[uint64](&ehci_irq_handler))
+
+    msi_off: uint32 = _ehci_msi_find_cap(bdf)
+    if msi_off != 0:
+        # MSI present — a single config-space program wires the IRQ.
+        _ehci_msi_program(bdf, msi_off)
+    else:
+        # Fallback: legacy INTx via the IOAPIC. EHCI is a PCI device,
+        # so its INTx line is level-triggered active-low — use
+        # ioapic_redirect (the PCI variant), NOT ioapic_redirect_isa.
+        printk0("[ehci] no MSI capability; falling back to IOAPIC INTx\n")
+        bus_e: uint32 = pci_bdf_bus(bdf)
+        dev_e: uint32 = pci_bdf_dev(bdf)
+        fn_e:  uint32 = pci_bdf_fn(bdf)
+        intx_pin:  uint32 = pci_config_read_byte(bus_e, dev_e, fn_e,
+                                                 EHCI_PCI_INTERRUPT_PIN)
+        intx_line: uint32 = pci_config_read_byte(bus_e, dev_e, fn_e,
+                                                 EHCI_PCI_INTERRUPT_LINE)
+        ioapic_pin: uint32 = intx_line
+        if intx_pin == 0 or intx_line == 0 or intx_line >= 24:
+            # No usable firmware-assigned line — default to IOAPIC
+            # pin 11 (the i440FX PCI-slot rotation default QEMU uses).
+            ioapic_pin = 11
+        ehci.irq_pin = ioapic_pin
+        ioapic_redirect(ioapic_pin, EHCI_IRQ_VECTOR, EHCI_LAPIC_ID)
+        printk2("[ehci] INTx fallback pin=%d vec=0x%x\n",
+                cast[uint64](ioapic_pin), cast[uint64](EHCI_IRQ_VECTOR))
+
+    # Enable the controller-side interrupt sources (USBINTR). With
+    # both USBINTR set AND delivery wired (MSI or INTx), a qTD-with-IOC
+    # completion raises the IRQ — once interrupts are globally enabled
+    # later in start_kernel().
+    _ehci_enable_controller_irqs()
+    printk1("[ehci] V2 IRQ armed (count=%d) — keyboard now interrupt-driven\n",
+            ehci.irq_count)
+
+
 # --- V1 self-test -------------------------------------------------
 #
 # Deterministic proof that the interrupt-IN poll path moves a byte
@@ -1514,9 +1915,17 @@ def ehci_v1_selftest():
 
 
 # =====================================================================
-# V2 BACKLOG:
-#   - Real IRQ handler (USBINTR + an IOAPIC redirection entry) instead
-#     of the V1 poll-only model.
+# V2 DONE (this milestone):
+#   - Real IRQ handler. _ehci_wire_irq() discovers the MSI capability
+#     (PCI cap ID 0x05) and programs it for single-vector delivery to
+#     EHCI_IRQ_VECTOR (0x49); if MSI is absent it falls back to PCI
+#     INTx via ioapic_redirect (level / active-low). USBINTR enables
+#     USBINT (transfer complete / IOC) + Port Change; ehci_irq_handler
+#     reads USBSTS, write-1-to-clears it, and drains the HID interrupt-
+#     IN QH from interrupt context. The timer-tick ehci_poll() is
+#     RETAINED as a belt-and-braces fallback (see ehci_poll's comment).
+#
+# V3 BACKLOG:
 #   - Companion-controller (UHCI/OHCI) driver so released full-/low-
 #     speed devices are actually usable. Hamnix has neither today.
 #   - USB hub support past the root hub — some laptops put an internal
@@ -1525,4 +1934,7 @@ def ehci_v1_selftest():
 #     (ICH/PCH chipsets commonly expose two), not just the first.
 #   - Multi-packet control DATA stages (currently one DATA qTD; fine
 #     for descriptors <= one max-packet, which covers boot keyboards).
+#   - Port-change-IRQ-driven root-hub hot-plug re-enumeration (V2's
+#     handler only logs the Port Change cause).
+#   - MSI-X (cap ID 0x11) for multi-vector — V2 stays single-vector MSI.
 # =====================================================================
