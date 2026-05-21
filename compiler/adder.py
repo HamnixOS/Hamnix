@@ -128,24 +128,308 @@ def collect_all_imports(main_file: Path, project_root: Path) -> list[Path]:
     return ordered
 
 
-def merge_programs(files: list[Path]) -> Program:
-    """Parse all files and merge into a single program."""
-    all_imports: list[ImportDecl] = []
-    all_declarations = []
-    # Map name -> first file we saw it in. We allow duplicates only
-    # for ExternDecl (the same `extern def foo(...)` may legitimately
-    # appear in multiple modules that each call foo). Every other
-    # collision is an error — silent dedup used to mean two modules
-    # could each define `_find_free_slot` and the second silently
-    # never got compiled, with callers in module B linking against
-    # module A's body. Hours-of-debugging type of bug.
-    from .ast_nodes import ExternDecl
-    seen_names: dict[str, Path] = {}
+# ---------------------------------------------------------------------------
+# Per-module symbol scoping
+# ---------------------------------------------------------------------------
+#
+# Adder has no `export`/`pub` keyword. Visibility is by *convention*:
+#
+#   * A top-level name that DOES NOT start with `_` is PUBLIC — it lives
+#     in the single global symbol namespace, exactly as before. Two
+#     modules defining the same public name is still a hard error.
+#
+#   * A top-level name that DOES start with `_` is MODULE-PRIVATE: it is
+#     mangled to `<module_slug>__<name>` so a `_helper` in one .ad file
+#     never collides with a `_helper` in another. Intra-module references
+#     to that private name (calls, identifier loads, `&fn` address-of)
+#     are rewritten to the mangled spelling so they still resolve.
+#
+#   * EXCEPTION — the `import` statement is itself the export annotation.
+#     If any module does `from M import _name`, then `_name` is part of
+#     an explicit cross-module contract: it is promoted to PUBLIC and
+#     left un-mangled, so the importer's bare `_name` reference resolves.
+#     (Today's cross-module underscore symbols: `_add_export`,
+#     `__stack_chk_fail/guard/init`, `_u_errstr`.)
+#
+#   * ExternDecl names are NEVER mangled — they name real external
+#     symbols. A private def that *backs* an `extern def` of the same
+#     name elsewhere is likewise promoted to public.
+#
+# This needs ZERO migration of the ~350 existing .ad files: public API
+# names are untouched, and underscore helpers — which are exactly the
+# things that collide and exactly the things that are conventionally
+# private — get scoped automatically.
 
+# Symbols the x86_64 codegen emits references to by a hard-coded name
+# (compiler/codegen_x86.py's stack-protector prologue/epilogue). These
+# must never be mangled regardless of import status.
+_CODEGEN_RESERVED_SYMBOLS = frozenset({
+    "__stack_chk_guard",
+    "__stack_chk_fail",
+    "__stack_chk_init",
+})
+
+
+def _module_name_for(file_path: Path, project_root: Path) -> str:
+    """Derive a dotted module path from a source file path.
+
+    Inverse of resolve_import(): `kernel/sched/core.ad` ->
+    `kernel.sched.core`. Used both as the scoping key and as the
+    private-name mangle prefix.
+    """
+    try:
+        rel = file_path.resolve().relative_to(project_root.resolve())
+    except ValueError:
+        # File outside the project tree (e.g. an ad-hoc temp file in a
+        # standalone test). Fall back to the bare stem.
+        rel = Path(file_path.name)
+    parts = list(rel.with_suffix("").parts)
+    return ".".join(parts)
+
+
+def _mangle_private(module: str, name: str) -> str:
+    """Mangle a module-private name to a globally-unique symbol.
+
+    `<module_slug>__<name>` where the slug is the dotted module path
+    with dots replaced by underscores. `name` already begins with `_`,
+    so the result is e.g. `kernel_sched_core___emit_str` — the triple
+    underscore (slug `_` + private `_`) is intentional and harmless.
+    The result is a valid assembler identifier.
+    """
+    slug = module.replace(".", "_")
+    return f"{slug}_{name}"
+
+
+def _is_private_name(name: str) -> bool:
+    """A leading-underscore top-level name is private by convention."""
+    return name.startswith("_")
+
+
+def _iter_child_nodes(node):
+    """Yield every dataclass-typed child reachable from `node`.
+
+    Generic structural walk: recurses into dataclass fields, lists,
+    tuples and dict values. Used to find every Identifier (and the
+    handful of name-bearing type nodes) in a declaration subtree.
+    """
+    import dataclasses
+    if dataclasses.is_dataclass(node):
+        for f in dataclasses.fields(node):
+            yield getattr(node, f.name)
+    elif isinstance(node, (list, tuple)):
+        for item in node:
+            yield item
+    elif isinstance(node, dict):
+        for v in node.values():
+            yield v
+
+
+def _collect_local_names(node, acc: set) -> None:
+    """Collect names BOUND as locals within a function body subtree.
+
+    A name bound locally (parameter, `x: T = ...`, for-loop var,
+    `except E as e`, `with ... as w`, comprehension/lambda var, or a
+    tuple unpack target) shadows a same-named module-private top-level
+    symbol, so its references must NOT be mangled. A `global _x`
+    statement is the opposite — it forces `_x` to mean the module
+    global — so global-declared names are deliberately NOT collected
+    here (they SHOULD be mangled along with the global decl).
+
+    We over-approximate the rest deliberately: treating a name as
+    "local" only ever SUPPRESSES a rewrite, and the codegen already
+    resolves locals-before-globals, so a false positive is safe (it
+    just leaves a genuine global reference un-mangled) while a false
+    negative would miscompile.
+    """
+    from .ast_nodes import (
+        FunctionDef, VarDecl, ForStmt, ForUnpackStmt, ExceptHandler,
+        WithItem, ListComprehension, LambdaExpr, TupleUnpackAssign,
+        Parameter,
+    )
+    if node is None:
+        return
+    if isinstance(node, Parameter):
+        acc.add(node.name)
+    elif isinstance(node, VarDecl):
+        acc.add(node.name)
+    elif isinstance(node, ForStmt):
+        acc.add(node.var)
+    elif isinstance(node, ForUnpackStmt):
+        acc.update(node.vars)
+    elif isinstance(node, ExceptHandler):
+        if node.name:
+            acc.add(node.name)
+    elif isinstance(node, WithItem):
+        if node.var:
+            acc.add(node.var)
+    elif isinstance(node, ListComprehension):
+        acc.add(node.var)
+    elif isinstance(node, LambdaExpr):
+        acc.update(node.params)
+    elif isinstance(node, TupleUnpackAssign):
+        acc.update(node.targets)
+    # FunctionDef params are Parameter nodes handled above via recursion.
+    for child in _iter_child_nodes(node):
+        _collect_local_names(child, acc)
+
+
+def _rewrite_refs(node, rename: dict, shadowed: frozenset) -> None:
+    """Rewrite identifier references to module-private mangled names.
+
+    `rename` maps a module-private source name -> its mangled symbol.
+    `shadowed` is the set of names bound as locals somewhere in the
+    enclosing function (see _collect_local_names) — references to a
+    shadowed name are left alone.
+
+    Every symbol-by-name reference in Adder lands on an `Identifier`
+    node: a bare variable/global load, the `func` of a CallExpr, and
+    the operand of a `&` address-of are all `Identifier`. We also
+    defensively rewrite the name-bearing type nodes (StructInitExpr,
+    ContainerOfExpr, Type) — no private *types* exist in the codebase
+    today, but handling them keeps the scheme correct if one is added.
+    """
+    from .ast_nodes import (
+        Identifier, StructInitExpr, ContainerOfExpr, Type,
+    )
+    if node is None:
+        return
+    if isinstance(node, Identifier):
+        if node.name in rename and node.name not in shadowed:
+            node.name = rename[node.name]
+        return
+    if isinstance(node, StructInitExpr):
+        if node.struct_name in rename:
+            node.struct_name = rename[node.struct_name]
+    elif isinstance(node, ContainerOfExpr):
+        if node.type_name in rename:
+            node.type_name = rename[node.type_name]
+    elif isinstance(node, Type):
+        if node.name in rename:
+            node.name = rename[node.name]
+    for child in _iter_child_nodes(node):
+        _rewrite_refs(child, rename, shadowed)
+
+
+def _collect_exported_names(programs: list) -> set:
+    """Names that must stay global (un-mangled) despite a leading `_`.
+
+    A leading-underscore name is normally module-private, but a name
+    that is part of an explicit cross-module contract must stay global:
+
+      * any name appearing in some module's `from M import name` list
+        — the import statement IS the export annotation;
+      * any ExternDecl name — extern decls reference real external
+        symbols, and a private def backing one must keep its name;
+      * the codegen-reserved stack-protector symbols.
+    """
+    from .ast_nodes import ExternDecl
+    exported: set = set(_CODEGEN_RESERVED_SYMBOLS)
+    for program in programs:
+        for imp in program.imports:
+            # `from M import a, b` names cross-module symbols. A plain
+            # `import M` / `import M as x` has an empty names list.
+            for nm in imp.names:
+                exported.add(nm)
+        for decl in program.declarations:
+            if isinstance(decl, ExternDecl):
+                exported.add(decl.name)
+    return exported
+
+
+def resolve_module_scopes(programs: list) -> None:
+    """Apply per-module private-name scoping to a list of programs.
+
+    Mutates each Program in place: mangles its module-private
+    declaration names and rewrites every intra-module reference to
+    them. After this runs, the merged declaration set has no private
+    name collisions and every public name is still global.
+
+    Each Program MUST already have its `.module` field set.
+    """
+    exported = _collect_exported_names(programs)
+
+    for program in programs:
+        module = program.module or ""
+        # Build this module's private-name rename map.
+        rename: dict[str, str] = {}
+        for decl in program.declarations:
+            name = getattr(decl, "name", None)
+            if not name:
+                continue
+            # ExternDecl names are real external symbols — never mangle.
+            from .ast_nodes import ExternDecl
+            if isinstance(decl, ExternDecl):
+                continue
+            if not _is_private_name(name):
+                continue
+            if name in exported:
+                # Promoted to public by an explicit import / extern.
+                continue
+            rename[name] = _mangle_private(module, name)
+
+        if not rename:
+            continue
+
+        # Rename the declarations themselves, preserving orig_name so
+        # name-based codegen heuristics keep working.
+        from .ast_nodes import FunctionDef, VarDecl
+        for decl in program.declarations:
+            name = getattr(decl, "name", None)
+            if name in rename:
+                if isinstance(decl, (FunctionDef, VarDecl)):
+                    decl.orig_name = name
+                decl.name = rename[name]
+
+        # Rewrite intra-module references. Local bindings (params,
+        # `x: T`, loop vars, ...) shadow a same-named private global,
+        # so collect them per-function and exclude them.
+        for decl in program.declarations:
+            shadow: set = set()
+            _collect_local_names(decl, shadow)
+            _rewrite_refs(decl, rename, frozenset(shadow))
+
+
+def merge_programs(files: list[Path]) -> Program:
+    """Parse all files and merge into a single program.
+
+    Before merging, the per-module scoping pass (resolve_module_scopes)
+    mangles each module's private (leading-underscore) names so they
+    cannot collide. After that, the only remaining name collisions are
+    between PUBLIC names — and those are still a hard error, exactly as
+    before: silent dedup once meant two modules each defined
+    `_find_free_slot`, the second was silently dropped, and callers in
+    module B linked against module A's body — hours-of-debugging bug.
+    """
+    from .ast_nodes import ExternDecl
+
+    project_root = find_hamnix_root()
+
+    # Parse every file once, tagging each Program with its module path.
+    programs: list[Program] = []
+    program_files: list[Path] = []
     for file_path in files:
         source = file_path.read_text()
         program = parse(source, str(file_path))
+        program.module = _module_name_for(file_path, project_root)
+        for decl in program.declarations:
+            # Tag each top-level decl with its origin module.
+            if hasattr(decl, "module"):
+                decl.module = program.module
+        programs.append(program)
+        program_files.append(file_path)
 
+    # Scope module-private names BEFORE merging into one namespace.
+    resolve_module_scopes(programs)
+
+    all_imports: list[ImportDecl] = []
+    all_declarations = []
+    # Map name -> first file we saw it in. Duplicates are allowed only
+    # for ExternDecl (the same `extern def foo(...)` may legitimately
+    # appear in multiple modules that each call foo). Every other
+    # collision is an error.
+    seen_names: dict[str, Path] = {}
+
+    for program, file_path in zip(programs, program_files):
         # Collect imports (runtime only)
         for imp in program.imports:
             # Skip internal imports (lib.*, kernel.*, coreutils.*)
@@ -168,8 +452,10 @@ def merge_programs(files: list[Path]) -> Program:
                 print(
                     f"Error: duplicate top-level definition '{name}' in "
                     f"{file_path} (first seen in {prev}). Rename one of "
-                    f"them — function/class/variable names are global "
-                    f"across all merged modules.",
+                    f"them — these are PUBLIC names, global across all "
+                    f"merged modules. (Module-private helpers — names "
+                    f"starting with '_' — are scoped per-module and do "
+                    f"not collide.)",
                     file=sys.stderr,
                 )
                 sys.exit(1)

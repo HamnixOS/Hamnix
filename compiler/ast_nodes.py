@@ -415,12 +415,19 @@ Expr = (IntLiteral | FloatLiteral | StringLiteral | FStringLiteral |
 # Statements
 @dataclass
 class VarDecl:
-    """Variable declaration: x: int32 = 42"""
+    """Variable declaration: x: int32 = 42
+
+    `module` / `orig_name` are populated for *top-level* VarDecls by the
+    module-resolution pass (compiler/adder.py merge_programs); they are
+    unused for function-local VarDecls.
+    """
     name: str
     var_type: Optional[Type] = None
     value: Optional[Expr] = None
     is_const: bool = False
     span: Optional[Span] = None
+    module: Optional[str] = None
+    orig_name: Optional[str] = None
 
 
 @dataclass
@@ -610,7 +617,15 @@ class Parameter:
 
 @dataclass
 class FunctionDef:
-    """Function definition."""
+    """Function definition.
+
+    `module` and `orig_name` are populated by the module-resolution
+    pass in compiler/adder.py (merge_programs). `module` is the dotted
+    module path the decl was parsed from; `orig_name` is the name as
+    written in source, preserved across private-name mangling so
+    name-based codegen heuristics (the stack-protector skip list) can
+    still recognise the original symbol.
+    """
     name: str
     params: list[Parameter]
     return_type: Optional[Type] = None
@@ -618,6 +633,8 @@ class FunctionDef:
     decorators: list[str] = field(default_factory=list)
     type_params: list[GenericType] = field(default_factory=list)
     span: Optional[Span] = None
+    module: Optional[str] = None
+    orig_name: Optional[str] = None
 
 
 @dataclass
@@ -672,11 +689,18 @@ class UnionDef:
 
 @dataclass
 class ExternDecl:
-    """External function declaration."""
+    """External function declaration.
+
+    `module` is populated by the module-resolution pass. ExternDecl
+    names are NEVER mangled — they name real external symbols (the
+    Linux-ABI/runtime ones such as `_printk`, `__switch_to_asm`) — so
+    there is no `orig_name`.
+    """
     name: str
     params: list[Parameter]
     return_type: Optional[Type] = None
     span: Optional[Span] = None
+    module: Optional[str] = None
 
 
 @dataclass
@@ -723,10 +747,17 @@ class MatchStmt:
 # Program
 @dataclass
 class Program:
-    """Top-level program."""
+    """Top-level program.
+
+    `module` is the dotted module path this program was parsed from
+    (e.g. `kernel.sched.core`). It is set by the module-resolution
+    pass in compiler/adder.py for the per-file programs it merges; it
+    is None for an ad-hoc single-file parse with no import context.
+    """
     imports: list[ImportDecl] = field(default_factory=list)
     declarations: list[FunctionDef | ClassDef | EnumDef | ExternDecl | VarDecl] = field(default_factory=list)
     span: Optional[Span] = None
+    module: Optional[str] = None
 
     def __repr__(self) -> str:
         return f"Program({len(self.imports)} imports, {len(self.declarations)} decls)"

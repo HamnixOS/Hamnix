@@ -827,7 +827,12 @@ class X86CodeGen:
 
     def _function_needs_canary(self, func: FunctionDef) -> bool:
         """Return True iff `func` should get a stack canary."""
-        name = func.name
+        # Match the skip list against the name as written in source.
+        # The module-resolution pass (compiler/adder.py) may have
+        # mangled a module-private name (e.g. `_hang_forever` ->
+        # `kernel_panic___hang_forever`); `orig_name` carries the
+        # pre-mangle spelling so this exact-match check still fires.
+        name = func.orig_name if func.orig_name is not None else func.name
         if name in STACK_PROTECTOR_SKIP_NAMES:
             return False
         for prefix in STACK_PROTECTOR_SKIP_PREFIXES:
