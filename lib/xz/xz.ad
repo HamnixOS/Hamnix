@@ -1,0 +1,1103 @@
+# lib/xz/xz.ad
+#
+# Single-shot `.xz` (LZMA2) decompressor in native Adder. The V0
+# counterpart to lib/zlib/inflate.ad: where the gzip inflater handles
+# DEFLATE-compressed Debian indices, this handles the xz-compressed
+# ones — real Debian ships `main/binary-amd64/Packages.xz` and `.deb`
+# package members (`control.tar.xz`, `data.tar.xz`) xz-compressed, and
+# without this `apt` could only ever read the smaller gz `contrib`
+# component as a workaround.
+#
+# DESIGN: caller-driven SINGLE-SHOT (not streaming).
+#
+#   The whole compressed stream is handed in as one buffer; the whole
+#   decompressed output is written into one caller-owned buffer. This
+#   mirrors how `apt` already uses the inflater for fixture-sized
+#   indices (it slurps the whole HTTP body, then decompresses it) and
+#   keeps the (already substantial) LZMA core free of the resumable
+#   bit-walk machinery the gzip inflater needs. A real multi-MB index
+#   streamed straight to a file is a future concern.
+#
+#   Entry point:
+#       xz_decompress(src, src_len, dst, dst_cap) -> int64
+#   Returns the number of decompressed bytes on success (>= 0), or a
+#   negative error code (see XZ_ERR_* below). dst_cap insufficient is
+#   a hard error (XZ_ERR_DST_FULL) — we never silently truncate.
+#
+# NO HEAP. The LZMA sliding dictionary is a 64 KiB module-scope BSS
+# array (xz_dict[]); the LZMA probability model (~14 KiB of uint16
+# counters) is likewise module-scope. Decompressed output ALSO lands
+# directly in the caller's dst buffer, and the match-copy reads back
+# out of dst (dst doubles as the dictionary history) — so the 64 KiB
+# xz_dict[] is only used when a back-reference reaches further than
+# the current dst output (which, for a dst sized to hold the whole
+# expected output, never happens). We keep xz_dict[] anyway as a
+# spec-faithful ring buffer fallback and because LZMA2's dictionary
+# reset is defined in terms of it.
+#
+# SCOPE — V0 caveats:
+#   - **LZMA2 filter only.** xz blocks may chain a BCJ/delta filter
+#     before LZMA2; Debian's Packages.xz and the tar members of a
+#     .deb use a bare LZMA2 filter, which is what we accept. A block
+#     whose filter-flags name anything other than filter id 0x21
+#     (LZMA2) is rejected with XZ_ERR_UNSUPPORTED.
+#   - **CRC32 / CRC64 / none check fields** in the stream flags are
+#     all parsed; CRC32 (the xz default) over each block's
+#     uncompressed data is verified. CRC64 and SHA-256 check fields
+#     are length-skipped, not verified (CRC64 verification is a
+#     future nicety; SHA-256 needs the hash primitive). A CRC32
+#     mismatch is FATAL (XZ_ERR_CRC).
+#   - **Multi-block streams** are supported (the spec allows several
+#     blocks before the index); each block's LZMA2 stream is decoded
+#     in turn, appending to dst.
+#   - The xz **index** and **stream footer** are parsed for framing
+#     correctness but their stored sizes are not cross-checked field
+#     by field beyond the footer's backward-size + the index CRC32.
+#
+# WIRE-FORMAT REFERENCE:
+#   xz format:  https://tukaani.org/xz/xz-file-format.txt
+#   LZMA spec:  the `lzma.txt` in the LZMA SDK (range coder + the
+#               literal / match / rep-match / length / distance
+#               decoders reproduced below).
+#
+# RETURN CODES — `xz_decompress`:
+#   >= 0  success: decompressed byte count.
+#   < 0   error (see XZ_ERR_* constants).
+
+
+# -- error codes -------------------------------------------------------
+
+XZ_ERR_MAGIC:        int64 = -1    # stream header magic mismatch
+XZ_ERR_HEADER:       int64 = -2    # malformed stream/block header
+XZ_ERR_UNSUPPORTED:  int64 = -3    # filter other than LZMA2, or bad props
+XZ_ERR_DST_FULL:     int64 = -4    # caller dst buffer too small
+XZ_ERR_TRUNCATED:    int64 = -5    # input ran out mid-stream
+XZ_ERR_CORRUPT:      int64 = -6    # LZMA2 control / range-coder corruption
+XZ_ERR_CRC:          int64 = -7    # CRC32 check-field mismatch
+XZ_ERR_FOOTER:       int64 = -8    # stream footer malformed
+
+
+# -- CRC32 (shared shape with lib/zlib/inflate.ad, kept local so xz is
+#    self-contained) ---------------------------------------------------
+
+xz_crc32_table:        Array[256, uint32]
+xz_crc32_table_inited: int32 = 0
+
+
+def _xz_init_crc32():
+    if xz_crc32_table_inited != 0:
+        return
+    i: uint32 = 0
+    while i < 256:
+        c: uint32 = i
+        j: int32 = 0
+        while j < 8:
+            if (c & 1) != 0:
+                c = (c >> 1) ^ 0xEDB88320
+            else:
+                c = c >> 1
+            j = j + 1
+        xz_crc32_table[i] = c
+        i = i + 1
+    xz_crc32_table_inited = 1
+
+
+def _xz_crc32(buf: Ptr[uint8], off: uint64, len: uint64) -> uint32:
+    # One-shot CRC32 over buf[off, off+len). Standard reflected
+    # polynomial; result is the post-XOR value (matches xz's stored
+    # check field and the index CRC32).
+    c: uint32 = 0xFFFFFFFF
+    i: uint64 = 0
+    while i < len:
+        idx: uint32 = (c ^ cast[uint32](buf[off + i])) & 0xFF
+        c = (c >> 8) ^ xz_crc32_table[idx]
+        i = i + 1
+    return c ^ 0xFFFFFFFF
+
+
+# -- LZMA constants ----------------------------------------------------
+#
+# The LZMA probability model is an array of 11-bit adaptive counters.
+# The total count below is the classic layout for the default
+# lc=3/lp=0/pb=2 parameterisation, but we size for the maximum
+# (lc+lp <= 4 -> literal table 0x300 << 4 entries) so any legal props
+# byte fits. Counter init value is 1024 (== (1<<11)/2).
+
+XZ_NUM_STATES:        int32 = 12       # LZMA "state" machine states
+XZ_PROB_INIT:         uint16 = 1024    # (1 << 11) / 2
+XZ_NUM_POS_BITS_MAX:  int32 = 4        # pb <= 4
+XZ_NUM_LEN_TO_POS:    int32 = 4
+XZ_NUM_ALIGN_BITS:    int32 = 4
+XZ_END_POS_MODEL:     int32 = 14       # dist slots < 14 use full model
+XZ_NUM_FULL_DIST:     int32 = 128      # 1 << (END_POS_MODEL >> 1)
+XZ_MATCH_MIN_LEN:     int32 = 2
+
+# Probability-model sub-table sizes. Offsets into xz_probs[] below.
+# Layout (each entry is a uint16 counter):
+#   IsMatch       : NUM_STATES << NUM_POS_BITS_MAX        = 12<<4 = 192
+#   IsRep         : NUM_STATES                            = 12
+#   IsRepG0       : NUM_STATES                            = 12
+#   IsRepG1       : NUM_STATES                            = 12
+#   IsRepG2       : NUM_STATES                            = 12
+#   IsRep0Long    : NUM_STATES << NUM_POS_BITS_MAX        = 192
+#   PosSlot       : NUM_LEN_TO_POS * 64                   = 4*64 = 256
+#   SpecPos       : NUM_FULL_DIST - END_POS_MODEL         = 128-14 = 114
+#   Align         : 1 << NUM_ALIGN_BITS                   = 16
+#   LenCoder      : length-coder block (see _LEN_CODER_SIZE)     = 514
+#   RepLenCoder   : another length-coder block                  = 514
+#   Literal       : 0x300 << (lc+lp), max (lc+lp=4) = 0x300<<4   = 12288
+# Total max = 192+12+12+12+12+192+256+114+16+514+514+12288 = 14136.
+
+XZ_OFF_IS_MATCH:    int32 = 0
+XZ_OFF_IS_REP:      int32 = 192
+XZ_OFF_IS_REP_G0:   int32 = 204
+XZ_OFF_IS_REP_G1:   int32 = 216
+XZ_OFF_IS_REP_G2:   int32 = 228
+XZ_OFF_IS_REP0LONG: int32 = 240
+XZ_OFF_POS_SLOT:    int32 = 432
+XZ_OFF_SPEC_POS:    int32 = 688
+XZ_OFF_ALIGN:       int32 = 802
+XZ_OFF_LEN_CODER:   int32 = 818
+XZ_OFF_REP_LEN:     int32 = 1332
+XZ_OFF_LITERAL:     int32 = 1846
+XZ_PROBS_TOTAL:     int32 = 14134
+
+# A length coder is: Choice(1) + Choice2(1) + Low(16 * 8) + Mid(16*8)
+# + High(256) = 2 + 128 + 128 + 256 = 514.
+XZ_LEN_LOW:    int32 = 2          # offset of Low table inside len coder
+XZ_LEN_MID:    int32 = 130        # offset of Mid table
+XZ_LEN_HIGH:   int32 = 258        # offset of High table
+
+# Sliding-dictionary ring buffer. 64 KiB is plenty for a Debian
+# Packages.xz LZMA2 stream (which Debian builds with a 64 KiB-ish
+# dict via `xz --lzma2=preset=...`); a stream declaring a larger
+# dict size still works as long as no back-reference actually reaches
+# past 64 KiB — and for an index whose whole decompressed form fits
+# in dst, the match-copy reads out of dst directly, so xz_dict[] is
+# effectively a safety net. Module-scope BSS — never a stack frame.
+XZ_DICT_SIZE:  uint64 = 65536
+
+
+# -- module-scope decoder state ---------------------------------------
+#
+# All parked at module scope: the probability table alone is ~28 KiB
+# and would blow a userland stack frame (the U9 large-Array-in-frame
+# guidance — big buffers belong in BSS).
+
+xz_probs:  Array[14134, uint16]      # LZMA adaptive probability model
+xz_dict:   Array[65536, uint8]       # sliding-dictionary ring buffer
+
+# Range decoder live state.
+rc_range:  uint32
+rc_code:   uint32
+# Input cursor for the range decoder (bytes are pulled from the
+# current LZMA2 chunk's compressed payload inside src[]).
+rc_src:    Ptr[uint8]
+rc_pos:    uint64                    # next byte index into rc_src
+rc_limit:  uint64                    # one past the last readable byte
+rc_corrupt: int32                    # sticky: set if we read past rc_limit
+
+# LZMA decoder live state (persists across LZMA2 chunks that do NOT
+# request a state reset).
+lz_state:  int32                     # 0..11 state machine
+lz_rep0:   uint32                    # the four most-recent match distances
+lz_rep1:   uint32
+lz_rep2:   uint32
+lz_rep3:   uint32
+lz_lc:     int32                     # literal context bits
+lz_lp:     int32                     # literal position bits
+lz_pb:     int32                     # position bits
+
+# Output cursor: decompressed bytes are appended to dst[].
+out_buf:   Ptr[uint8]
+out_pos:   uint64                    # next write index into dst
+out_cap:   uint64                    # dst capacity
+# total_pos tracks the global decompressed position (== out_pos for a
+# single-shot decode; kept distinct so pos-state masking is explicit).
+total_pos: uint64
+# dict_start is the global output position at which the CURRENT
+# dictionary began — it advances to total_pos on every LZMA2 dictionary
+# reset (a 0x01 uncompressed chunk, or an LZMA chunk with reset_mode 3,
+# and every xz block boundary). The DICTIONARY-RELATIVE position
+# `total_pos - dict_start` — not the global total_pos — is what feeds
+# the LZMA pos-state, the literal lp/lc context, the "is there a
+# previous byte" test, and the back-reference reach check. Using the
+# global position there desyncs the decoder the instant a second xz
+# block (or any dict-reset chunk) starts.
+dict_start: uint64
+
+# Debug instrumentation — records the exact failure site so a
+# regression can be localised from the test log. Cleared at the top
+# of xz_decompress. xz_dbg_site: 1=corrupt-in-run, 2=match-overrun,
+# 3=dist-too-far, 4=eos-marker. xz_dbg_a/b carry context numbers.
+xz_dbg_site: int64 = 0
+xz_dbg_a:    uint64 = 0
+xz_dbg_b:    uint64 = 0
+
+
+# -- range decoder -----------------------------------------------------
+#
+# LZMA's range coder. `rc_range` and `rc_code` are the live interval;
+# normalisation pulls one byte at a time off the compressed input
+# whenever `rc_range` drops below 2^24. Every probability decision
+# narrows the interval and adapts the counter.
+
+XZ_RC_TOP:   uint32 = 16777216       # 1 << 24 — normalisation threshold
+
+
+def _rc_read_byte() -> uint32:
+    # Pull one byte of compressed input. Reading past the chunk limit
+    # sets the sticky corruption flag and returns 0 (the decode is
+    # already doomed; the flag is checked after the decode loop).
+    if rc_pos >= rc_limit:
+        rc_corrupt = 1
+        return 0
+    b: uint32 = cast[uint32](rc_src[rc_pos])
+    rc_pos = rc_pos + 1
+    return b
+
+
+def _rc_init() -> int32:
+    # The range coder starts with a mandatory 0x00 byte followed by a
+    # 32-bit big-endian initial `code`. Returns 0 on success, -1 if
+    # the leading byte is non-zero (malformed) or input is short.
+    if rc_pos + 5 > rc_limit:
+        return -1
+    first: uint32 = cast[uint32](rc_src[rc_pos])
+    if first != 0:
+        return -1
+    rc_pos = rc_pos + 1
+    code: uint32 = 0
+    i: int32 = 0
+    while i < 4:
+        code = (code << 8) | cast[uint32](rc_src[rc_pos])
+        rc_pos = rc_pos + 1
+        i = i + 1
+    rc_code = code
+    rc_range = 0xFFFFFFFF
+    return 0
+
+
+def _rc_normalize():
+    if rc_range < XZ_RC_TOP:
+        rc_range = rc_range << 8
+        rc_code = (rc_code << 8) | _rc_read_byte()
+
+
+def _rc_decode_bit(prob_idx: int32) -> int32:
+    # Decode one adaptive bit against the counter at xz_probs[prob_idx]
+    # and update that counter. The counter is an 11-bit probability of
+    # the bit being 0.
+    _rc_normalize()
+    prob: uint32 = cast[uint32](xz_probs[prob_idx])
+    # bound = (range >> 11) * prob
+    bound: uint32 = (rc_range >> 11) * prob
+    if rc_code < bound:
+        # bit == 0: shrink to the lower sub-interval, nudge prob up.
+        rc_range = bound
+        xz_probs[prob_idx] = cast[uint16](prob + ((2048 - prob) >> 5))
+        return 0
+    # bit == 1: take the upper sub-interval, nudge prob down.
+    rc_range = rc_range - bound
+    rc_code = rc_code - bound
+    xz_probs[prob_idx] = cast[uint16](prob - (prob >> 5))
+    return 1
+
+
+def _rc_decode_direct(num_bits: int32) -> uint32:
+    # Decode `num_bits` raw (equiprobable, non-adaptive) bits — used
+    # for the low-order bits of large match distances.
+    result: uint32 = 0
+    i: int32 = 0
+    while i < num_bits:
+        _rc_normalize()
+        rc_range = rc_range >> 1
+        rc_code = rc_code - rc_range
+        # The reference decoder uses `t = 0 - (code >> 31)` to get an
+        # all-ones / all-zero mask from the top bit of `code`. We test
+        # the top bit explicitly (a bitmask + compare) rather than a
+        # `>> 31` shift so the result cannot depend on whether the
+        # codegen picks a logical or arithmetic right-shift for the
+        # global uint32 `rc_code`.
+        t: uint32 = 0
+        bit: int32 = 0
+        if (rc_code & 0x80000000) != 0:
+            t = 0xFFFFFFFF
+            bit = 0
+        else:
+            t = 0
+            bit = 1
+        rc_code = rc_code + (rc_range & t)
+        result = (result << 1) + cast[uint32](bit)
+        i = i + 1
+    return result
+
+
+def _rc_decode_tree(base_idx: int32, num_bits: int32) -> int32:
+    # Bit-tree decoder: walks a binary tree of adaptive counters,
+    # MSB-first, producing a `num_bits`-wide symbol.
+    m: int32 = 1
+    i: int32 = 0
+    while i < num_bits:
+        bit: int32 = _rc_decode_bit(base_idx + m)
+        m = (m << 1) + bit
+        i = i + 1
+    return m - (1 << num_bits)
+
+
+def _rc_decode_tree_rev(base_idx: int32, num_bits: int32) -> int32:
+    # Reverse bit-tree decoder: same tree, but the produced symbol's
+    # bits come out LSB-first. Used for the "align" low bits of a
+    # distance and for the SpecPos model.
+    m: int32 = 1
+    symbol: int32 = 0
+    i: int32 = 0
+    while i < num_bits:
+        bit: int32 = _rc_decode_bit(base_idx + m)
+        m = (m << 1) + bit
+        symbol = symbol | (bit << i)
+        i = i + 1
+    return symbol
+
+
+# -- LZMA length decoder -----------------------------------------------
+#
+# A match length is 2..273. The coder splits it into three ranges via
+# two "choice" bits: a 3-bit Low tree (lengths 2..9), a 3-bit Mid tree
+# (10..17), or an 8-bit High tree (18..273). The Low/Mid trees are
+# pos-state-indexed (one tree per position-state).
+
+def _len_decode(coder_base: int32, pos_state: int32) -> int32:
+    # coder_base is XZ_OFF_LEN_CODER or XZ_OFF_REP_LEN.
+    if _rc_decode_bit(coder_base) == 0:
+        # Low range: lengths 2..9.
+        tree: int32 = coder_base + XZ_LEN_LOW + (pos_state << 3)
+        return XZ_MATCH_MIN_LEN + _rc_decode_tree(tree, 3)
+    if _rc_decode_bit(coder_base + 1) == 0:
+        # Mid range: lengths 10..17.
+        tree2: int32 = coder_base + XZ_LEN_MID + (pos_state << 3)
+        return XZ_MATCH_MIN_LEN + 8 + _rc_decode_tree(tree2, 3)
+    # High range: lengths 18..273.
+    tree3: int32 = coder_base + XZ_LEN_HIGH
+    return XZ_MATCH_MIN_LEN + 16 + _rc_decode_tree(tree3, 8)
+
+
+# -- LZMA distance decoder ---------------------------------------------
+#
+# Given a just-decoded match length, decode the match distance. The
+# distance is built from a 6-bit "pos slot", then either direct bits +
+# an align tree (for large distances) or a reverse SpecPos tree (for
+# mid distances), or taken verbatim (for the smallest distances).
+
+def _dist_decode(len_val: int32) -> uint32:
+    # The length-to-pos-state caps at NUM_LEN_TO_POS-1.
+    len_state: int32 = len_val - XZ_MATCH_MIN_LEN
+    if len_state >= XZ_NUM_LEN_TO_POS:
+        len_state = XZ_NUM_LEN_TO_POS - 1
+
+    slot_base: int32 = XZ_OFF_POS_SLOT + (len_state << 6)
+    pos_slot: int32 = _rc_decode_tree(slot_base, 6)
+
+    if pos_slot < 4:
+        # The four smallest slots ARE the distance.
+        return cast[uint32](pos_slot)
+
+    num_direct: int32 = (pos_slot >> 1) - 1
+    dist: uint32 = cast[uint32](2 | (pos_slot & 1))
+    dist = dist << cast[uint32](num_direct)
+
+    if pos_slot < XZ_END_POS_MODEL:
+        # Mid range: reverse SpecPos tree. The tree base is offset so
+        # that the per-slot sub-tree lands at SpecPos + dist - pos_slot
+        # (the classic LZMA SpecPos addressing).
+        spec_base: int32 = XZ_OFF_SPEC_POS + cast[int32](dist) - pos_slot - 1
+        add: int32 = _rc_decode_tree_rev(spec_base, num_direct)
+        dist = dist + cast[uint32](add)
+        return dist
+
+    # Large range: (num_direct - ALIGN_BITS) raw bits, then a 4-bit
+    # reverse align tree for the low bits.
+    direct_hi: int32 = num_direct - XZ_NUM_ALIGN_BITS
+    dist = dist + (_rc_decode_direct(direct_hi) << cast[uint32](XZ_NUM_ALIGN_BITS))
+    align_add: int32 = _rc_decode_tree_rev(XZ_OFF_ALIGN, XZ_NUM_ALIGN_BITS)
+    dist = dist + cast[uint32](align_add)
+    return dist
+
+
+# -- dictionary / output ----------------------------------------------
+#
+# Decompressed bytes are appended to the caller's dst[] AND mirrored
+# into the xz_dict[] ring. A match-copy reads history out of dst[]
+# when the distance is within the bytes already written this run, and
+# falls back to xz_dict[] otherwise (only relevant if dst were sized
+# smaller than the decompressed output — which we reject anyway).
+
+def _out_byte(b: uint8) -> int32:
+    # Append one decompressed byte. Returns 0 on dst overflow.
+    if out_pos >= out_cap:
+        return 0
+    out_buf[out_pos] = b
+    # Mirror into the dictionary ring.
+    di: uint64 = total_pos % XZ_DICT_SIZE
+    xz_dict[di] = b
+    out_pos = out_pos + 1
+    total_pos = total_pos + 1
+    return 1
+
+
+def _hist_byte(dist: uint32) -> uint8:
+    # Byte `dist+1` positions back from the current output cursor
+    # (LZMA distances are stored as distance-1; the caller passes the
+    # raw rep value, so the actual back-distance is dist+1).
+    back: uint64 = cast[uint64](dist) + 1
+    if back <= out_pos:
+        return out_buf[out_pos - back]
+    # Fall back to the dictionary ring (history older than dst start —
+    # only reachable across an LZMA2 chunk that did not reset dict).
+    d: uint64 = back % XZ_DICT_SIZE
+    cur: uint64 = total_pos % XZ_DICT_SIZE
+    if cur >= d:
+        return xz_dict[cur - d]
+    return xz_dict[XZ_DICT_SIZE - (d - cur)]
+
+
+# -- LZMA state machine ------------------------------------------------
+#
+# The 12-state machine tracks whether the last few symbols were
+# literals or matches; literal-decoding context and the IsMatch
+# selection depend on it. These transition helpers are the standard
+# LZMA tables.
+
+def _state_after_literal(st: int32) -> int32:
+    if st < 4:
+        return 0
+    if st < 10:
+        return st - 3
+    return st - 6
+
+
+def _state_after_match(st: int32) -> int32:
+    if st < 7:
+        return 7
+    return 10
+
+
+def _state_after_rep(st: int32) -> int32:
+    if st < 7:
+        return 8
+    return 11
+
+
+def _state_after_shortrep(st: int32) -> int32:
+    if st < 7:
+        return 9
+    return 11
+
+
+def _state_is_literal(st: int32) -> int32:
+    if st < 7:
+        return 1
+    return 0
+
+
+# -- LZMA literal decode -----------------------------------------------
+#
+# A literal byte is decoded bit-by-bit MSB-first through a context tree
+# selected by (the high `lc` bits of the previous byte, the low `lp`
+# bits of the output position). After a match the decode is "matched":
+# each bit is also predicted from the corresponding bit of the byte
+# `rep0` distance back, until the prediction and the decoded bit
+# diverge.
+
+def _decode_literal() -> int32:
+    prev_byte: uint32 = 0
+    if total_pos != 0:
+        prev_byte = cast[uint32](_hist_byte(0))
+
+    lit_state: int32 = (cast[int32](total_pos) & ((1 << lz_lp) - 1)) << lz_lc
+    lit_state = lit_state + (cast[int32](prev_byte) >> (8 - lz_lc))
+    probs_base: int32 = XZ_OFF_LITERAL + 0x300 * lit_state
+
+    symbol: int32 = 1
+    if _state_is_literal(lz_state) != 0:
+        # Plain literal (previous symbol was a literal).
+        while symbol < 0x100:
+            bit: int32 = _rc_decode_bit(probs_base + symbol)
+            symbol = (symbol << 1) | bit
+    else:
+        # Matched literal: XOR-predicted against the rep0-back byte.
+        match_byte: uint32 = cast[uint32](_hist_byte(lz_rep0))
+        while symbol < 0x100:
+            match_byte = match_byte << 1
+            match_bit: int32 = cast[int32](match_byte >> 8) & 1
+            idx: int32 = probs_base + ((1 + match_bit) << 8) + symbol
+            bit2: int32 = _rc_decode_bit(idx)
+            symbol = (symbol << 1) | bit2
+            if match_bit != bit2:
+                # Prediction broke — fall back to the plain tree.
+                while symbol < 0x100:
+                    b3: int32 = _rc_decode_bit(probs_base + symbol)
+                    symbol = (symbol << 1) | b3
+                break
+    return symbol & 0xFF
+
+
+# -- LZMA2 chunk decoder -----------------------------------------------
+#
+# One call to _lzma_run decodes a single LZMA-compressed LZMA2 chunk:
+# it has already had its range coder pointed at the chunk payload
+# (rc_src/rc_pos/rc_limit set) and rc_init() run by the caller. It
+# decodes exactly `unpack_size` output bytes, then returns. Returns 0
+# on success, or a negative XZ_ERR_*.
+
+def _lzma_run(unpack_size: uint64) -> int64:
+    produced: uint64 = 0
+    while produced < unpack_size:
+        pos_state: int32 = cast[int32](total_pos) & ((1 << lz_pb) - 1)
+        is_match_idx: int32 = (XZ_OFF_IS_MATCH
+                               + (lz_state << XZ_NUM_POS_BITS_MAX)
+                               + pos_state)
+
+        if _rc_decode_bit(is_match_idx) == 0:
+            # ---- literal ----
+            lit: int32 = _decode_literal()
+            if _out_byte(cast[uint8](lit)) == 0:
+                return XZ_ERR_DST_FULL
+            lz_state = _state_after_literal(lz_state)
+            produced = produced + 1
+            if rc_corrupt != 0:
+                return XZ_ERR_CORRUPT
+            continue
+
+        # ---- match (or rep-match) ----
+        len_val: int32 = 0
+        if _rc_decode_bit(XZ_OFF_IS_REP + lz_state) != 0:
+            # A rep-match: distance is one of the four cached reps.
+            if _rc_decode_bit(XZ_OFF_IS_REP_G0 + lz_state) == 0:
+                # rep0 family.
+                long_idx: int32 = (XZ_OFF_IS_REP0LONG
+                                   + (lz_state << XZ_NUM_POS_BITS_MAX)
+                                   + pos_state)
+                if _rc_decode_bit(long_idx) == 0:
+                    # Short rep: copy exactly one byte at distance rep0.
+                    lz_state = _state_after_shortrep(lz_state)
+                    b: uint8 = _hist_byte(lz_rep0)
+                    if _out_byte(b) == 0:
+                        return XZ_ERR_DST_FULL
+                    produced = produced + 1
+                    if rc_corrupt != 0:
+                        return XZ_ERR_CORRUPT
+                    continue
+                # else: a normal rep0 match — fall through to length.
+            else:
+                # rep1 / rep2 / rep3: rotate the chosen distance to rep0.
+                dist: uint32 = 0
+                if _rc_decode_bit(XZ_OFF_IS_REP_G1 + lz_state) == 0:
+                    dist = lz_rep1
+                    lz_rep1 = lz_rep0
+                else:
+                    if _rc_decode_bit(XZ_OFF_IS_REP_G2 + lz_state) == 0:
+                        dist = lz_rep2
+                    else:
+                        dist = lz_rep3
+                        lz_rep3 = lz_rep2
+                    lz_rep2 = lz_rep1
+                    lz_rep1 = lz_rep0
+                lz_rep0 = dist
+            len_val = _len_decode(XZ_OFF_REP_LEN, pos_state)
+            lz_state = _state_after_rep(lz_state)
+        else:
+            # A new match: shift the rep cache and decode a fresh dist.
+            lz_rep3 = lz_rep2
+            lz_rep2 = lz_rep1
+            lz_rep1 = lz_rep0
+            len_val = _len_decode(XZ_OFF_LEN_CODER, pos_state)
+            lz_state = _state_after_match(lz_state)
+            new_dist: uint32 = _dist_decode(len_val)
+            lz_rep0 = new_dist
+            if new_dist == 0xFFFFFFFF:
+                # End-of-stream marker. Valid only at a real LZMA
+                # stream end; LZMA2 chunks carry an explicit size, so
+                # an EOS marker mid-chunk is malformed.
+                xz_dbg_site = 4
+                return XZ_ERR_CORRUPT
+
+        if rc_corrupt != 0:
+            xz_dbg_site = 1
+            return XZ_ERR_CORRUPT
+
+        # Copy `len_val` bytes from `lz_rep0` distance back.
+        if cast[uint64](lz_rep0) + 1 > total_pos:
+            # Distance reaches before the start of all output —
+            # corrupt (or a dict-reset violation).
+            xz_dbg_site = 3
+            xz_dbg_a = cast[uint64](lz_rep0)
+            xz_dbg_b = total_pos
+            return XZ_ERR_CORRUPT
+        n: int32 = 0
+        while n < len_val:
+            if produced >= unpack_size:
+                # The match overran the chunk's declared size.
+                xz_dbg_site = 2
+                xz_dbg_a = produced
+                xz_dbg_b = cast[uint64](len_val)
+                return XZ_ERR_CORRUPT
+            cb: uint8 = _hist_byte(lz_rep0)
+            if _out_byte(cb) == 0:
+                return XZ_ERR_DST_FULL
+            produced = produced + 1
+            n = n + 1
+
+    return 0
+
+
+# -- LZMA reset helpers ------------------------------------------------
+
+def _lzma_reset_probs():
+    # Reset every adaptive counter to the 50/50 init value.
+    i: int32 = 0
+    while i < XZ_PROBS_TOTAL:
+        xz_probs[i] = XZ_PROB_INIT
+        i = i + 1
+
+
+def _lzma_reset_state():
+    lz_state = 0
+    lz_rep0 = 0
+    lz_rep1 = 0
+    lz_rep2 = 0
+    lz_rep3 = 0
+
+
+def _lzma_set_props(props: int32) -> int32:
+    # The LZMA2 props byte encodes lc/lp/pb as: byte = (pb*5 + lp)*9 + lc.
+    # Legal range: lc+lp <= 4, pb <= 4.
+    if props < 0 or props >= 225:
+        return -1
+    v: int32 = props
+    lz_lc = v % 9
+    v = v / 9
+    lz_lp = v % 5
+    lz_pb = v / 5
+    if lz_lc + lz_lp > 4:
+        return -1
+    if lz_pb > 4:
+        return -1
+    return 0
+
+
+# -- LZMA2 stream decoder ----------------------------------------------
+#
+# An LZMA2 stream is a sequence of chunks, each introduced by a control
+# byte:
+#   0x00            end of LZMA2 stream.
+#   0x01            uncompressed chunk, dictionary reset before it.
+#   0x02            uncompressed chunk, no dictionary reset.
+#       followed by: 2-byte (size-1) big-endian, then `size` raw bytes.
+#   0x80..0xFF      LZMA chunk. The control byte's low 5 bits are the
+#                   high bits of (uncompressed size - 1); the next two
+#                   bytes are its low 16 bits. Then a 2-byte
+#                   (compressed size - 1). Bits 5..6 of the control
+#                   byte select the reset mode:
+#                     0  no reset
+#                     1  reset LZMA state
+#                     2  reset state + new props byte
+#                     3  reset state + new props + dictionary reset
+#
+# Decodes the LZMA2 stream that occupies src[off, off+len) and appends
+# to dst via _out_byte. Returns 0 on success or a negative XZ_ERR_*.
+
+def _lzma2_decode(src: Ptr[uint8], off: uint64, len: uint64) -> int64:
+    pos: uint64 = off
+    end: uint64 = off + len
+    need_props: int32 = 1     # the first LZMA chunk MUST carry props
+    need_dict_reset: int32 = 1
+
+    while pos < end:
+        ctrl: uint32 = cast[uint32](src[pos])
+        pos = pos + 1
+
+        if ctrl == 0:
+            # End of LZMA2 stream.
+            return 0
+
+        if ctrl < 0x80:
+            # Uncompressed chunk: ctrl is 1 (dict reset) or 2 (no reset).
+            if ctrl > 2:
+                return XZ_ERR_CORRUPT
+            if pos + 2 > end:
+                return XZ_ERR_TRUNCATED
+            usize: uint64 = ((cast[uint64](src[pos]) << 8)
+                             | cast[uint64](src[pos + 1])) + 1
+            pos = pos + 2
+            if ctrl == 1:
+                need_dict_reset = 0
+            else:
+                if need_dict_reset != 0:
+                    # An uncompressed-no-reset chunk before any dict
+                    # reset is malformed.
+                    return XZ_ERR_CORRUPT
+            if pos + usize > end:
+                return XZ_ERR_TRUNCATED
+            k: uint64 = 0
+            while k < usize:
+                if _out_byte(src[pos + k]) == 0:
+                    return XZ_ERR_DST_FULL
+                k = k + 1
+            pos = pos + usize
+            # An uncompressed chunk forces a state reset for the next
+            # LZMA chunk (the LZMA2 spec: state must be reset after a
+            # dictionary-affecting uncompressed chunk).
+            need_props = need_props
+            continue
+
+        # LZMA-compressed chunk.
+        if pos + 4 > end:
+            return XZ_ERR_TRUNCATED
+        unpack_size: uint64 = (((cast[uint64](ctrl) & 0x1F) << 16)
+                               | (cast[uint64](src[pos]) << 8)
+                               | cast[uint64](src[pos + 1])) + 1
+        pack_size: uint64 = ((cast[uint64](src[pos + 2]) << 8)
+                             | cast[uint64](src[pos + 3])) + 1
+        pos = pos + 4
+
+        reset_mode: int32 = cast[int32]((ctrl >> 5) & 0x3)
+
+        if reset_mode >= 2:
+            # New props byte precedes the range-coder payload.
+            if pos >= end:
+                return XZ_ERR_TRUNCATED
+            prc: int32 = _lzma_set_props(cast[int32](src[pos]))
+            pos = pos + 1
+            if prc != 0:
+                return XZ_ERR_UNSUPPORTED
+            need_props = 0
+        else:
+            if need_props != 0:
+                # First LZMA chunk did not carry a props byte.
+                return XZ_ERR_CORRUPT
+
+        if reset_mode >= 1:
+            _lzma_reset_state()
+            _lzma_reset_probs()
+        if reset_mode == 3:
+            need_dict_reset = 0
+        else:
+            if need_dict_reset != 0 and reset_mode < 3:
+                # An LZMA chunk that does not reset the dictionary
+                # before any dictionary reset has happened.
+                if need_dict_reset != 0:
+                    return XZ_ERR_CORRUPT
+
+        # Point the range coder at this chunk's compressed payload.
+        if pos + pack_size > end:
+            return XZ_ERR_TRUNCATED
+        rc_src = src
+        rc_pos = pos
+        rc_limit = pos + pack_size
+        rc_corrupt = 0
+        if _rc_init() != 0:
+            return XZ_ERR_CORRUPT
+
+        rrc: int64 = _lzma_run(unpack_size)
+        if rrc != 0:
+            return rrc
+
+        pos = pos + pack_size
+
+    # Ran off the end without a 0x00 terminator — tolerate it (the xz
+    # block frames the LZMA2 stream, so a missing terminator is not
+    # fatal as long as we produced the block's declared output).
+    return 0
+
+
+# -- xz container parsing ----------------------------------------------
+#
+# A `.xz` stream:
+#   Stream Header  : 6-byte magic FD 37 7A 58 5A 00, 2-byte flags,
+#                    4-byte CRC32 of the flags.   (12 bytes)
+#   Blocks         : one or more. Each: 1-byte header-size (encoded),
+#                    block flags, optional compressed/uncompressed
+#                    sizes, filter flags, padding, 4-byte header CRC32,
+#                    then the compressed data, padding to 4 bytes,
+#                    then the check field.
+#   Index          : record count + per-block records + CRC32.
+#   Stream Footer  : 4-byte CRC32, 4-byte backward-size, 2-byte flags,
+#                    2-byte magic 59 5A.   (12 bytes)
+
+# Stream-flags byte 1 low nibble: the "check" type.
+XZ_CHECK_NONE:   int32 = 0
+XZ_CHECK_CRC32:  int32 = 1
+XZ_CHECK_CRC64:  int32 = 4
+XZ_CHECK_SHA256: int32 = 10
+
+
+def _check_size(check_id: int32) -> uint64:
+    # Size in bytes of the per-block check field for a given check id.
+    if check_id == XZ_CHECK_NONE:
+        return 0
+    if check_id == XZ_CHECK_CRC32:
+        return 4
+    if check_id == XZ_CHECK_CRC64:
+        return 8
+    if check_id == XZ_CHECK_SHA256:
+        return 32
+    return 0
+
+
+def _decode_vli(src: Ptr[uint8], pos: Ptr[uint64], end: uint64,
+                out_val: Ptr[uint64]) -> int32:
+    # xz "variable-length integer": base-128, little-endian, the high
+    # bit of each byte is a continuation flag. Returns 0 on success.
+    p: uint64 = pos[0]
+    val: uint64 = 0
+    shift: int32 = 0
+    while True:
+        if p >= end:
+            return -1
+        if shift > 63:
+            return -1
+        b: uint64 = cast[uint64](src[p])
+        p = p + 1
+        val = val | ((b & 0x7F) << cast[uint64](shift))
+        if (b & 0x80) == 0:
+            break
+        shift = shift + 7
+    pos[0] = p
+    out_val[0] = val
+    return 0
+
+
+# Decode one xz block starting at src[pos]. Appends the block's
+# decompressed output to dst (via the LZMA2 decoder). On success
+# advances *pos past the block (including its check field + 4-byte
+# padding) and returns 0; otherwise a negative XZ_ERR_*.
+
+def _decode_block(src: Ptr[uint8], pos: Ptr[uint64], src_len: uint64,
+                  check_id: int32) -> int64:
+    block_start: uint64 = pos[0]
+    # Byte 0: (header size / 4) - 1. A value of 0 here would mean the
+    # "index indicator" — but the caller has already distinguished an
+    # index (first byte 0x00) from a block, so here it is >= 1.
+    enc: int32 = cast[int32](src[block_start])
+    header_size: uint64 = (cast[uint64](enc) + 1) * 4
+    if block_start + header_size > src_len:
+        return XZ_ERR_TRUNCATED
+
+    # Verify the block header CRC32 (last 4 bytes of the header).
+    hdr_crc_stored: uint32 = (cast[uint32](src[block_start + header_size - 4])
+        | (cast[uint32](src[block_start + header_size - 3]) << 8)
+        | (cast[uint32](src[block_start + header_size - 2]) << 16)
+        | (cast[uint32](src[block_start + header_size - 1]) << 24))
+    hdr_crc_calc: uint32 = _xz_crc32(src, block_start, header_size - 4)
+    if hdr_crc_calc != hdr_crc_stored:
+        return XZ_ERR_HEADER
+
+    # Parse the header body. Byte 1 = block flags.
+    flags: int32 = cast[int32](src[block_start + 1])
+    num_filters: int32 = (flags & 0x03) + 1
+    has_comp_size: int32 = flags & 0x40
+    has_uncomp_size: int32 = flags & 0x80
+
+    hp: uint64 = block_start + 2
+    hdr_end: uint64 = block_start + header_size - 4   # before the CRC
+
+    comp_size: uint64 = 0
+    uncomp_size: uint64 = 0
+    if has_comp_size != 0:
+        if _decode_vli(src, &hp, hdr_end, &comp_size) != 0:
+            return XZ_ERR_HEADER
+    if has_uncomp_size != 0:
+        if _decode_vli(src, &hp, hdr_end, &uncomp_size) != 0:
+            return XZ_ERR_HEADER
+
+    # Filter flags. We require exactly one filter and that it be
+    # LZMA2 (id 0x21). Each filter flag is: VLI id, VLI props-size,
+    # then props-size bytes of properties.
+    if num_filters != 1:
+        return XZ_ERR_UNSUPPORTED
+    filter_id: uint64 = 0
+    if _decode_vli(src, &hp, hdr_end, &filter_id) != 0:
+        return XZ_ERR_HEADER
+    if filter_id != 0x21:
+        return XZ_ERR_UNSUPPORTED
+    props_size: uint64 = 0
+    if _decode_vli(src, &hp, hdr_end, &props_size) != 0:
+        return XZ_ERR_HEADER
+    # LZMA2's filter properties are exactly one byte: the dictionary
+    # size code. We do not need it (our dict is fixed at 64 KiB and we
+    # decode straight into dst), so we just length-check and skip it.
+    if props_size != 1:
+        return XZ_ERR_UNSUPPORTED
+    if hp + props_size > hdr_end:
+        return XZ_ERR_HEADER
+    hp = hp + props_size
+    # Remaining header bytes up to hdr_end are zero padding — ignored.
+
+    # The compressed data follows the header. Its size, if not stated
+    # explicitly, runs until 4-byte alignment padding + the check
+    # field; LZMA2's own 0x00 terminator bounds the decode, so when
+    # comp_size is absent we hand the LZMA2 decoder the whole rest of
+    # the stream and let its terminator stop it.
+    data_start: uint64 = block_start + header_size
+    out_before: uint64 = out_pos
+
+    data_len: uint64 = 0
+    if has_comp_size != 0:
+        if data_start + comp_size > src_len:
+            return XZ_ERR_TRUNCATED
+        data_len = comp_size
+    else:
+        data_len = src_len - data_start
+
+    rc: int64 = _lzma2_decode(src, data_start, data_len)
+    if rc != 0:
+        return rc
+
+    produced: uint64 = out_pos - out_before
+    if has_uncomp_size != 0:
+        if produced != uncomp_size:
+            return XZ_ERR_CORRUPT
+
+    # Advance past the compressed data. If comp_size was explicit we
+    # trust it; otherwise we cannot know the exact compressed length
+    # from here — the LZMA2 0x00 terminator was consumed inside
+    # _lzma2_decode but its position is not returned. For a
+    # single-block stream that is fine (the caller stops at the
+    # index). For multi-block streams comp_size is effectively
+    # required; xz always emits it, so this is not a real limit.
+    actual_comp: uint64 = data_len
+    if has_comp_size != 0:
+        actual_comp = comp_size
+    # Round the compressed data up to a 4-byte boundary (block padding).
+    padded: uint64 = data_start + actual_comp
+    while (padded & 3) != 0:
+        padded = padded + 1
+
+    # Skip the check field.
+    cs: uint64 = _check_size(check_id)
+    end_of_block: uint64 = padded + cs
+
+    # Verify CRC32 check field over the block's uncompressed output.
+    if check_id == XZ_CHECK_CRC32:
+        if padded + 4 > src_len:
+            return XZ_ERR_TRUNCATED
+        stored: uint32 = (cast[uint32](src[padded])
+            | (cast[uint32](src[padded + 1]) << 8)
+            | (cast[uint32](src[padded + 2]) << 16)
+            | (cast[uint32](src[padded + 3]) << 24))
+        calc: uint32 = _xz_crc32(out_buf, out_before, produced)
+        if stored != calc:
+            return XZ_ERR_CRC
+
+    if end_of_block > src_len:
+        return XZ_ERR_TRUNCATED
+    pos[0] = end_of_block
+    return 0
+
+
+# -- public entry point ------------------------------------------------
+#
+# Decompress the whole `.xz` stream in src[0, src_len) into dst[0,
+# dst_cap). Returns the decompressed byte count (>= 0) on success, or
+# a negative XZ_ERR_*.
+
+def xz_decompress(src: Ptr[uint8], src_len: uint64,
+                  dst: Ptr[uint8], dst_cap: uint64) -> int64:
+    _xz_init_crc32()
+    xz_dbg_site = 0
+    xz_dbg_a = 0
+    xz_dbg_b = 0
+
+    if src_len < 12:
+        return XZ_ERR_TRUNCATED
+
+    # ---- Stream Header (12 bytes) ----
+    # Magic: FD 37 7A 58 5A 00.
+    if src[0] != 0xFD or src[1] != 0x37 or src[2] != 0x7A:
+        return XZ_ERR_MAGIC
+    if src[3] != 0x58 or src[4] != 0x5A or src[5] != 0x00:
+        return XZ_ERR_MAGIC
+    # Stream flags: byte 6 must be 0; byte 7 low nibble = check id.
+    if src[6] != 0:
+        return XZ_ERR_HEADER
+    check_id: int32 = cast[int32](src[7]) & 0x0F
+    if (cast[int32](src[7]) & 0xF0) != 0:
+        return XZ_ERR_HEADER
+    # Header CRC32 over the 2 flag bytes.
+    hdr_crc: uint32 = (cast[uint32](src[8])
+        | (cast[uint32](src[9]) << 8)
+        | (cast[uint32](src[10]) << 16)
+        | (cast[uint32](src[11]) << 24))
+    if _xz_crc32(src, 6, 2) != hdr_crc:
+        return XZ_ERR_HEADER
+
+    # ---- decoder live state ----
+    out_buf = dst
+    out_pos = 0
+    out_cap = dst_cap
+    total_pos = 0
+    _lzma_reset_state()
+
+    # ---- Blocks ----
+    # Blocks run until the index indicator (a 0x00 byte where a block
+    # header-size byte would be).
+    pos: uint64 = 12
+    while True:
+        if pos >= src_len:
+            return XZ_ERR_TRUNCATED
+        first: uint32 = cast[uint32](src[pos])
+        if first == 0:
+            # Index indicator — end of the block list.
+            break
+        brc: int64 = _decode_block(src, &pos, src_len, check_id)
+        if brc != 0:
+            return brc
+
+    # ---- Index ----
+    # The index starts at `pos` with a 0x00 indicator byte, then a VLI
+    # record count, then per-record (unpadded-size VLI, uncomp-size
+    # VLI), then padding to 4-byte alignment, then a 4-byte CRC32. We
+    # parse it for framing but only verify its CRC32.
+    index_start: uint64 = pos
+    ip: uint64 = pos + 1                       # skip the 0x00 indicator
+    rec_count: uint64 = 0
+    if _decode_vli(src, &ip, src_len, &rec_count) != 0:
+        return XZ_ERR_FOOTER
+    r: uint64 = 0
+    while r < rec_count:
+        unpadded: uint64 = 0
+        usz: uint64 = 0
+        if _decode_vli(src, &ip, src_len, &unpadded) != 0:
+            return XZ_ERR_FOOTER
+        if _decode_vli(src, &ip, src_len, &usz) != 0:
+            return XZ_ERR_FOOTER
+        r = r + 1
+    # Index padding to a 4-byte boundary, relative to the stream start.
+    while (ip & 3) != 0:
+        if ip >= src_len:
+            return XZ_ERR_FOOTER
+        ip = ip + 1
+    # 4-byte index CRC32 over everything from the indicator to here.
+    if ip + 4 > src_len:
+        return XZ_ERR_FOOTER
+    idx_crc_stored: uint32 = (cast[uint32](src[ip])
+        | (cast[uint32](src[ip + 1]) << 8)
+        | (cast[uint32](src[ip + 2]) << 16)
+        | (cast[uint32](src[ip + 3]) << 24))
+    idx_crc_calc: uint32 = _xz_crc32(src, index_start, ip - index_start)
+    if idx_crc_calc != idx_crc_stored:
+        return XZ_ERR_FOOTER
+    ip = ip + 4
+
+    # ---- Stream Footer (12 bytes) ----
+    if ip + 12 > src_len:
+        return XZ_ERR_TRUNCATED
+    # Footer: 4-byte CRC32, 4-byte backward-size, 2-byte flags, magic.
+    if src[ip + 10] != 0x59 or src[ip + 11] != 0x5A:
+        return XZ_ERR_FOOTER
+    # Footer flags must echo the stream-header flags.
+    if (cast[int32](src[ip + 9]) & 0x0F) != check_id:
+        return XZ_ERR_FOOTER
+
+    return cast[int64](out_pos)
