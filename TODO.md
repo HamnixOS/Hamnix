@@ -165,12 +165,13 @@ knows which it holds.
 - [ ] Per-CPU runqueues + real SMP scheduling (AP bringup works;
   single-rq today); load balancing / work stealing; CPU affinity.
 
-## §9 Interrupts & PCI  (off critical path — parallelizable)
-- [ ] MSI-X: PCI cap-walk (0x11), table mapping, per-vector LAPIC
-  programming — per-queue virtio-net.
-- [ ] virtio-blk INTx wiring (vectors 0x41+).
-- [ ] Multi-IOAPIC: consult the MADT-cached list, pick by GSI range
-  (hard-coded `0xFEC00000` today).
+## §9 Interrupts & PCI
+- [x] MSI-X: PCI cap-walk (0x11), table mapping, per-vector LAPIC
+  programming — virtio-net routes one vector per virtqueue
+  (RX/TX/config), verified delivery (`b15ffc4`).
+- [x] virtio-blk INTx wiring (vector 0x43) — `b15ffc4`.
+- [x] Multi-IOAPIC: `acpi_parse_ioapics()` caches the MADT type-1
+  list; redirects select the owning IOAPIC by GSI range (`b15ffc4`).
 
 ## §10 Networking  (off critical path — parallelizable)
 - [ ] **(ARCH)** Expose TCP/UDP as a `/net` 9P file tree
@@ -228,9 +229,10 @@ Phase D (the prerequisite gate, `4964a6b`), §1 (process model / AS,
 are **landed**. Remaining critical path: **§4 — dynamic loader
 (`dlopen`/libdl, namespace-routed interp lookup) + the capstone demo**
 (`deb /bin/true` running a stock dynamic Debian binary over SSH).
-Off the critical path, safe to dispatch in parallel: §9, §7, §13,
-§12, §10, §3. §11 and §16 are landed; §6 has only the vDSO item left.
-Everything in §5 is Layer-2-only per the boundary law.
+Off the critical path, safe to dispatch in parallel: §7, §13,
+§12, §10. §9, §11, §16 are landed; §6 has only the vDSO item left;
+§3 (signals) is in flight. Everything in §5 is Layer-2-only per the
+boundary law.
 
 ---
 
