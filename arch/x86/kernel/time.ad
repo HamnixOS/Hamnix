@@ -19,9 +19,14 @@
 
 from arch.x86.kernel.i8259 import i8259_send_eoi, i8259_unmask_irq
 from arch.x86.kernel.apic import lapic_send_eoi
+from kernel.printk.printk import printk1
 from kernel.sched.core import (
     schedule, signal_post_to_foreground, SIGINT, preempt_tick,
 )
+
+# read_tsc() lives in arch/x86/kernel/syscall_64.S — it issues an
+# LFENCE-ordered RDTSC and returns the 64-bit Time Stamp Counter.
+extern def read_tsc() -> uint64
 from drivers.tty.serial.early_8250 import uart_drain_hw_to_fifo
 from drivers.input.atkbd import atkbd_poll, atkbd_diag_tick
 # V1 USB HID: drain the xHCI Event Ring + dispatch interrupt-IN
@@ -157,11 +162,14 @@ def get_jiffies() -> uint64:
 # ≈ 10 ms at HZ=100) — the network poll loops that use it call it every
 # virtio_net_poll() iteration, far faster than that.
 #
-# Channel 0 runs in mode 3 (square wave), so the count decrements by 2
-# and the latched value sweeps the full [0, divisor) range twice per
-# audible period; treating it as a plain down-counter still yields a
-# monotonic accumulator because we only ever add the positive delta
-# (or, on a detected reload, divisor minus the old value plus the new).
+# Channel 0 runs in mode 3 (square wave). In mode 3 the 8254 decrements
+# the count by TWO on every PIT input clock, so the latched count value
+# sweeps the full [0, divisor) range in only divisor/2 input clocks. The
+# accumulator below measures count-VALUE units traversed; to convert to
+# real elapsed time it must divide by 2 (a count-units delta of N
+# corresponds to N/2 PIT input clocks at PIT_BASE_HZ). The pre-fix code
+# omitted that /2 and over-reported elapsed time by exactly 2x — see the
+# `(2 * PIT_BASE_HZ)` divisor in pit_monotonic_us().
 
 pit_us_accum:   uint64 = 0      # accumulated microseconds since first call
 pit_last_count: uint64 = 0      # last latched PIT counter value
@@ -202,9 +210,171 @@ def pit_monotonic_us() -> uint64:
     else:
         ticks = pit_last_count + divisor - cur
     pit_last_count = cur
-    # Convert PIT ticks to microseconds: us = ticks * 1e6 / PIT_BASE_HZ.
-    # Carry the remainder so a long poll does not lose fractional ticks.
+    # Convert traversed count-units to microseconds. Channel 0 is mode 3
+    # (square wave): the count decrements by 2 per PIT input clock, so
+    # `ticks` count-units == ticks/2 input clocks. Therefore
+    #   us = (ticks / 2) * 1e6 / PIT_BASE_HZ = ticks * 1e6 / (2*PIT_BASE_HZ)
+    # Doing the *1e6 before the divide (and carrying the remainder)
+    # keeps sub-microsecond precision over a long poll.
     num: uint64 = ticks * 1000000 + pit_tick_rem
-    pit_us_accum = pit_us_accum + (num / PIT_BASE_HZ)
-    pit_tick_rem = num % PIT_BASE_HZ
+    pit_us_accum = pit_us_accum + (num / (2 * PIT_BASE_HZ))
+    pit_tick_rem = num % (2 * PIT_BASE_HZ)
     return pit_us_accum
+
+
+# -- TSC-based high-resolution monotonic clock -------------------------
+#
+# `jiffies` has 10 ms granularity and freezes whenever EFLAGS.IF is
+# clear; pit_monotonic_us() has microsecond granularity but needs a
+# 16-bit PIT latch + two `inb`s per call and depends on being polled
+# faster than the ~10 ms PIT wrap. The CPU Time Stamp Counter is the
+# real high-resolution monotonic source: a 64-bit register the CPU
+# increments at a (constant, on every CPU we target) rate, readable in
+# a handful of cycles by RDTSC. At a few GHz it gives sub-nanosecond
+# resolution and a 64-bit counter does not wrap for ~100 years.
+#
+# To turn raw TSC ticks into nanoseconds we must know the TSC
+# frequency. We measure it the same way calibrate_APIC_clock() in
+# arch/x86/kernel/apic.ad measures the LAPIC: gate PIT channel 2 on
+# for a precise 10 ms one-shot, sample RDTSC at both ends, and the
+# delta is "TSC ticks per 10 ms". ×100 gives the TSC frequency in Hz.
+#
+# Conversion ns = ticks * 1e9 / tsc_hz is done as a fixed-point
+# multiply: we precompute tsc_ns_mult = (1e9 << TSC_SHIFT) / tsc_hz
+# once at calibration time, then each query is
+#     ns = (delta_ticks * tsc_ns_mult) >> TSC_SHIFT
+# which is a single 64-bit multiply + shift, no per-call division.
+# TSC_SHIFT = 20 keeps the multiplier comfortably inside 64 bits for
+# any plausible TSC frequency (at 1e12 Hz the multiplier is still only
+# ~1e9) while giving ~1e-6 relative precision.
+#
+# Overflow note: `delta_ticks * tsc_ns_mult` is a 64-bit product. At a
+# ~4 GHz TSC, tsc_ns_mult ≈ 2^18, so the product overflows once
+# delta_ticks exceeds ~2^46 ticks ≈ several hours of uptime. That is
+# well beyond any test horizon; a wrap-free multi-day clock would need
+# a 128-bit intermediate (or periodic re-basing of tsc_base from a
+# timer-driven seconds accumulator) — noted as a follow-up.
+
+# Same PIT channel 2 wiring the LAPIC calibration uses. Channel 2 is
+# the one channel whose GATE we can software-control (port 0x61 bit 0)
+# and whose OUT pin we can poll (port 0x61 bit 5).
+TSC_PIT_CH2_DATA:  int32 = 0x42
+TSC_PIT_CTRL_PORT: int32 = 0x61
+# Channel 2, lobyte/hibyte, mode 0 (one-shot), binary = 0xB0.
+TSC_PIT_CMD_CH2:   int32 = 0xB0
+# 10 ms at 1193182 Hz: 11932 = 0x2E9C.
+TSC_PIT_10MS_DIV:  int32 = 0x2E9C
+TSC_CAL_MS:        uint64 = 10
+# Port 0x61: bit 0 GATE2, bit 1 speaker, bit 5 channel-2 OUT.
+TSC_PIT_GATE:  int32 = 0x01
+TSC_PIT_SPEAK: int32 = 0x02
+TSC_PIT_OUT:   int32 = 0x20
+
+# Fixed-point shift for the ticks->ns multiply (see banner).
+TSC_SHIFT: uint64 = 20
+
+tsc_hz:      uint64 = 0    # measured TSC frequency, Hz (0 until calibrated)
+tsc_ns_mult: uint64 = 0    # (1e9 << TSC_SHIFT) / tsc_hz
+tsc_base:    uint64 = 0    # RDTSC value captured at calibration ("t=0")
+tsc_ready:   uint8  = 0    # 1 once tsc_init() succeeded
+
+
+def _tsc_pit_gate_off():
+    cur: int32 = inb(TSC_PIT_CTRL_PORT)
+    outb(cur & ~(TSC_PIT_GATE | TSC_PIT_SPEAK), TSC_PIT_CTRL_PORT)
+
+
+def _tsc_pit_gate_on():
+    cur: int32 = inb(TSC_PIT_CTRL_PORT)
+    outb((cur & ~TSC_PIT_SPEAK) | TSC_PIT_GATE, TSC_PIT_CTRL_PORT)
+
+
+def tsc_init():
+    # Calibrate the TSC frequency against a PIT channel 2 10 ms
+    # one-shot, then derive the fixed-point ns multiplier and capture
+    # the monotonic-clock zero point. Safe to call once, after the PIT
+    # exists (post-time_init). Interrupts should be off; the busy-poll
+    # below would otherwise be perturbed by an IRQ — but a perturbation
+    # only stretches the measured window, it cannot make TSC run
+    # backwards, so calibration stays monotonic-safe regardless.
+
+    # Stop channel 2 + silence the speaker before programming.
+    _tsc_pit_gate_off()
+
+    # Program channel 2: mode 0 one-shot, 10 ms divisor.
+    outb(TSC_PIT_CMD_CH2, PIT_CMD)
+    outb(TSC_PIT_10MS_DIV & 0xFF, TSC_PIT_CH2_DATA)
+    outb((TSC_PIT_10MS_DIV >> 8) & 0xFF, TSC_PIT_CH2_DATA)
+
+    # Open the gate and immediately snapshot the TSC: t0.
+    _tsc_pit_gate_on()
+    t0: uint64 = read_tsc()
+
+    # Spin until the channel-2 OUT pin (port 0x61 bit 5) goes high —
+    # that is the 10 ms terminal count.
+    while (inb(TSC_PIT_CTRL_PORT) & TSC_PIT_OUT) == 0:
+        pass
+
+    t1: uint64 = read_tsc()
+    _tsc_pit_gate_off()
+
+    delta: uint64 = t1 - t0
+    # delta TSC ticks elapsed in TSC_CAL_MS milliseconds.
+    # tsc_hz = delta * 1000 / TSC_CAL_MS.
+    tsc_hz = delta * 1000 / TSC_CAL_MS
+
+    # Guard: a wildly implausible measurement (PIT poll exited early,
+    # or RDTSC unavailable) would poison every later conversion. If the
+    # frequency is outside a sane window [1 MHz, 100 GHz], fall back to
+    # a nominal 1 GHz so the clock still advances rather than dividing
+    # by something absurd. Real CPUs and QEMU/TCG both land well inside.
+    if tsc_hz < 1000000 or tsc_hz > 100000000000:
+        printk1("tsc: calibration implausible (%d Hz) — fallback 1 GHz\n",
+                tsc_hz)
+        tsc_hz = 1000000000
+
+    # Precompute the fixed-point ns multiplier: tsc_ns_mult such that
+    # ns = (ticks * tsc_ns_mult) >> TSC_SHIFT  ≈  ticks * 1e9 / tsc_hz.
+    tsc_ns_mult = (1000000000 << TSC_SHIFT) / tsc_hz
+
+    # Capture the zero point. tsc_monotonic_ns() reports time since
+    # this instant.
+    tsc_base = read_tsc()
+    tsc_ready = 1
+
+    mhz: uint64 = tsc_hz / 1000000
+    printk1("tsc: calibrated %d MHz", mhz)
+    printk1(" (%d Hz)\n", tsc_hz)
+
+
+def tsc_calibrated() -> uint64:
+    # 1 once tsc_init() has run, else 0. Lets callers fall back to the
+    # jiffies clock before the TSC is up.
+    return cast[uint64](tsc_ready)
+
+
+def tsc_hz_get() -> uint64:
+    return tsc_hz
+
+
+def tsc_monotonic_ns() -> uint64:
+    # Nanoseconds since tsc_init() captured the zero point. Monotonic
+    # and high-resolution; valid with CPU interrupts masked (RDTSC does
+    # not depend on EFLAGS.IF). Before calibration, fall back to the
+    # jiffies clock (10 ms granularity) so callers still get a sane,
+    # advancing value.
+    if tsc_ready == 0:
+        return get_jiffies() * 10000000
+    now: uint64 = read_tsc()
+    # TSC is a free-running up-counter; `now` cannot be below tsc_base
+    # in normal operation. Guard the subtraction anyway so a spurious
+    # reading can never produce a gigantic unsigned wrap.
+    delta: uint64 = 0
+    if now > tsc_base:
+        delta = now - tsc_base
+    return (delta * tsc_ns_mult) >> TSC_SHIFT
+
+
+def tsc_monotonic_us() -> uint64:
+    # Microsecond form of tsc_monotonic_ns().
+    return tsc_monotonic_ns() / 1000

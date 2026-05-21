@@ -175,6 +175,27 @@ read_msr:
     orq     %rdx, %rax
     ret
 
+/* ---------- read_tsc() -> uint64 -------------------------------- *
+ * Read the 64-bit Time Stamp Counter. RDTSC writes the low 32 bits
+ * to %eax and the high 32 bits to %edx (the high bits of %rax/%rdx
+ * are zeroed by the instruction). Stitch them into a single 64-bit
+ * value in %rax for the SysV return register.
+ *
+ * lfence first: RDTSC is not a serialising instruction, so without
+ * a barrier the CPU may execute it out of order relative to the
+ * surrounding code, skewing a delta measurement. LFENCE is the
+ * lightweight ordering fence Linux uses on the rdtsc_ordered() path
+ * (it waits for all prior loads to retire before RDTSC issues).
+ */
+    .align 16
+    .globl read_tsc
+read_tsc:
+    lfence
+    rdtsc
+    shlq    $32, %rdx
+    orq     %rdx, %rax
+    ret
+
 /* ---------- set_efer_sce: enable SYSCALL/SYSRET ------------------ */
 
     .align 16
