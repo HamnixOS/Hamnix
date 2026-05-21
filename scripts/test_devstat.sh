@@ -104,11 +104,17 @@ else
     fail=1
 fi
 if grep -E -q "\[test_devuptime\] uptime_secs=[0-9]+" "$LOG"; then
-    us=$(grep -E -o 'uptime_secs=[0-9]+' "$LOG" | head -n1 | cut -d= -f2)
+    # `|| true` guards the command substitutions: under `set -o
+    # pipefail`, `grep | head` can SIGPIPE the grep (head closes the
+    # pipe early), and the QEMU serial log lines carry printk's
+    # "[NNNNNN]" timestamp prefix so the `^digit` blob regex finds
+    # nothing — either way the pipeline exits non-zero. The values
+    # are cosmetic PASS-marker echoes, so a miss must not abort.
+    us=$(grep -E -o 'uptime_secs=[0-9]+' "$LOG" | head -n1 | cut -d= -f2 || true)
     # Re-emit the raw "<secs>.<CC>" first field from the blob for the
     # exact PASS marker contract (the orchestrator's report greps
-    # this line for "[devuptime] N.NN").
-    blob_field=$(grep -E -o '^[0-9]+\.[0-9]{2} [0-9]+\.[0-9]{2}' "$LOG" | head -n1 | awk '{print $1}')
+    # this line for "[devuptime] N.NN"). Allow the printk prefix.
+    blob_field=$(grep -E -o '[0-9]+\.[0-9]{2} [0-9]+\.[0-9]{2}' "$LOG" | head -n1 | awk '{print $1}' || true)
     echo "[devuptime] ${blob_field:-${us}.00}"
 else
     echo "[test_devstat] MISS: uptime_secs line absent"
@@ -135,8 +141,11 @@ else
     fail=1
 fi
 if grep -F -q "[test_devloadavg] field_count=5" "$LOG"; then
-    # Echo the raw loadavg blob line as the PASS marker.
-    la_line=$(grep -E -o '^[0-9]+\.[0-9]{2} [0-9]+\.[0-9]{2} [0-9]+\.[0-9]{2} [0-9]+/[0-9]+ [0-9]+' "$LOG" | head -n1)
+    # Echo the raw loadavg blob line as the PASS marker. `|| true`
+    # for the same pipefail/SIGPIPE reason as the uptime block above;
+    # the regex no longer anchors on `^` so the printk line prefix
+    # doesn't defeat the match.
+    la_line=$(grep -E -o '[0-9]+\.[0-9]{2} [0-9]+\.[0-9]{2} [0-9]+\.[0-9]{2} [0-9]+/[0-9]+ [0-9]+' "$LOG" | head -n1 || true)
     echo "[devloadavg] ${la_line}"
 else
     echo "[test_devstat] MISS: field_count=5 line absent"

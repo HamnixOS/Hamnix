@@ -110,6 +110,8 @@ check_marker "/proc/cpuinfo opens"   "[proc-translation] /proc/cpuinfo open OK"
 check_marker "/dev/cpuinfo opens"    "[proc-translation] /dev/cpuinfo open OK"
 check_marker "byte-equality"         "[proc-translation] /proc/cpuinfo == /dev/cpuinfo OK"
 check_marker "vendor line present"   "[proc-translation] vendor line present OK"
+# §13: /proc/self resolution for Linux-ABI processes.
+check_marker "/proc/self/stat opens" "[proc-translation] /proc/self/stat open OK"
 
 # Surface every diagnostic the fixture emits so a regression names
 # itself in the test log. Each negative marker corresponds to one of
@@ -121,7 +123,10 @@ for negmark in \
     "[proc-translation] read(/dev/cpuinfo) FAIL" \
     "[proc-translation] length mismatch FAIL" \
     "[proc-translation] byte mismatch FAIL" \
-    "[proc-translation] vendor line missing FAIL"
+    "[proc-translation] vendor line missing FAIL" \
+    "[proc-translation] open(/proc/self/stat) FAIL" \
+    "[proc-translation] read(/proc/self/stat) FAIL" \
+    "[proc-translation] /proc/self/stat shape FAIL"
 do
     if grep -F -q "$negmark" "$LOG"; then
         echo "[test_proc_translation] DIAG: fixture reported '$negmark'"

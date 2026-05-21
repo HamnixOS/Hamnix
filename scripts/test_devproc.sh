@@ -108,6 +108,29 @@ else
     fail=1
 fi
 
+# §13: real Linux-shape /proc/<pid>/stat. The fixture asserts the
+# line opens with "1 (" (field 1 = pid, field 2 = "(comm)").
+if grep -E -q "\[test_devproc\] stat=1 \(" "$LOG"; then
+    echo "[test_devproc] OK: /proc/1/stat returned Linux-shape line"
+else
+    echo "[test_devproc] MISS: /proc/1/stat missing / wrong shape"
+    fail=1
+fi
+
+# §13: /proc/<pid>/cmdline + /proc/<pid>/maps.
+if grep -F -q "[test_devproc] cmdline_ok" "$LOG"; then
+    echo "[test_devproc] OK: /proc/1/cmdline served"
+else
+    echo "[test_devproc] MISS: /proc/1/cmdline failed"
+    fail=1
+fi
+if grep -F -q "[test_devproc] maps_ok" "$LOG"; then
+    echo "[test_devproc] OK: /proc/1/maps served"
+else
+    echo "[test_devproc] MISS: /proc/1/maps failed"
+    fail=1
+fi
+
 if grep -F -q "[test_devproc] bad_open_ok" "$LOG"; then
     echo "[test_devproc] OK: open(/proc/999/status) rejected"
 else

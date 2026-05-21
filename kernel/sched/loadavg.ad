@@ -1,0 +1,191 @@
+# kernel/sched/loadavg.ad
+#
+# §13: real system-load accounting for the introspection cdevs.
+#
+# Before this module /dev/loadavg emitted the SAME instantaneous
+# runnable count in all three columns, /dev/uptime emitted a hardcoded
+# "0.00" idle field, and /dev/stat emitted "ctxt 0". The data simply
+# was not tracked. This module is the source of truth for all three:
+#
+#   * EWMA load averages — exponentially-weighted moving averages of
+#     the runnable-task count, sampled once per LOAD_SAMPLE_TICKS
+#     (5 s at HZ=100), with the classic Linux decay constants. Three
+#     windows: 1 / 5 / 15 minutes.
+#
+#   * idle jiffies — ticks the timer caught the CPU NOT running a
+#     userland task. timer_interrupt() passes `user_ctx` (1 iff the
+#     timer froze ring-3 code); a tick with user_ctx == 0 is a tick
+#     where no userland process was on-CPU, i.e. the kernel was idle
+#     or doing housekeeping. That is the honest "idle" signal the
+#     uniprocessor has — there is no dedicated idle task to clock, so
+#     "wall ticks minus userland ticks" is what /proc/uptime's idle
+#     column means here. A real Linux idle task would split this into
+#     idle vs. iowait vs. softirq; we have one bucket.
+#
+#   * ctxt — context-switch counter. schedule() calls loadavg_note_
+#     switch() exactly once per real (prev != next) switch.
+#
+# WHY A SEPARATE MODULE
+# ---------------------
+# The EWMA arithmetic, the 5-second sampler ring, and the decay
+# constants are self-contained accounting state. Putting them here
+# (rather than in kernel/sched/core.ad) keeps core.ad's edit down to a
+# single one-line call in schedule(), and keeps arch/x86/kernel/time.ad
+# down to a single call in timer_interrupt() — the same colocation
+# discipline the devstat / devdiskstats cdevs use for their FD marks.
+#
+# FIXED-POINT REPRESENTATION
+# --------------------------
+# A load average is fractional; Adder's kernel side has no float. We
+# carry the load in FSHIFT fixed point — load << 11 — exactly like
+# Linux's include/linux/sched/loadavg.h. The exported accessors return
+# load * 100 as an integer so the cdev can render "<n/100>.<n%100>"
+# with two decimal places and no float.
+
+from arch.x86.kernel.time import get_jiffies
+from kernel.sched.core import (
+    task_state, task_table_size,
+    STATE_RUNNING, STATE_READY,
+)
+
+
+# --- fixed-point constants -------------------------------------------
+#
+# FSHIFT / FIXED_1 mirror Linux's loadavg.h. EXP_1 / EXP_5 / EXP_15 are
+# the decay multipliers for a 5-second sample interval:
+#   EXP_N = 2^FSHIFT * exp(-5/(60*N))
+# rounded to the integer Linux ships. These are the canonical values.
+FSHIFT:    uint64 = 11
+FIXED_1:   uint64 = 2048          # 1.0 in FSHIFT fixed point (1 << 11)
+EXP_1:     uint64 = 1884          # 1/exp(5sec/1min)
+EXP_5:     uint64 = 2014          # 1/exp(5sec/5min)
+EXP_15:    uint64 = 2037          # 1/exp(5sec/15min)
+
+# Sample the runnable count this often. 5 s at HZ=100 = 500 ticks —
+# the exact cadence Linux's calc_load() runs at.
+LOAD_SAMPLE_TICKS: uint64 = 500
+
+
+# --- module-global accounting state ----------------------------------
+#
+# Every storage name here is `_la_`-prefixed: Adder merges all modules
+# into one flat global symbol namespace, so a bare `idle_jiffies` /
+# `inited` / `ctxt_count` would collide with same-named globals in
+# other modules (devhostname.ad already owns `inited`). The leading
+# underscore makes each name module-private — same discipline the
+# devcpuinfo / devstat / devhostname cdevs use for their helpers.
+
+# Three EWMA accumulators, each load << FSHIFT. Seeded to 0 (BSS).
+_la_avg_load_1:  uint64 = 0
+_la_avg_load_5:  uint64 = 0
+_la_avg_load_15: uint64 = 0
+
+# Idle-jiffies counter — ticks the timer caught a non-userland context.
+_la_idle_jiffies: uint64 = 0
+
+# Context-switch counter — bumped once per real schedule() switch.
+_la_ctxt_count: uint64 = 0
+
+# Jiffies value at which the next EWMA sample is due. Seeded to the
+# literal LOAD_SAMPLE_TICKS value (500) — Adder requires an integer
+# literal in a global initialiser, not a constant reference. The
+# first loadavg_tick() re-stamps it relative to the live jiffies
+# clock anyway, so this seed only matters before the first tick.
+_la_next_sample_jiffies: uint64 = 500
+
+# Lazy-init latch. The BSS zero-seed is already correct for every
+# field above except _la_next_sample_jiffies (handled by its
+# initialiser) — so this latch only guards the one-time stamp below.
+_la_inited: int32 = 0
+
+
+# --- runnable-count probe --------------------------------------------
+
+def loadavg_runnable_count() -> uint64:
+    # Tasks in STATE_RUNNING or STATE_READY — the population a load
+    # average measures. Linux also folds in TASK_UNINTERRUPTIBLE; the
+    # Hamnix scheduler has no uninterruptible-sleep state today, so
+    # RUNNING+READY is the complete runnable set. Scans through the
+    # core.ad accessors so this module never touches task_table
+    # storage directly.
+    n: uint64 = task_table_size()
+    i: uint64 = 0
+    runnable: uint64 = 0
+    while i < n:
+        st: uint64 = task_state(cast[int32](i))
+        if st == STATE_RUNNING or st == STATE_READY:
+            runnable = runnable + 1
+        i = i + 1
+    return runnable
+
+
+# --- EWMA update ------------------------------------------------------
+
+def _calc_load(load: uint64, exp: uint64, active: uint64) -> uint64:
+    # One EWMA step, identical to Linux's calc_load() in
+    # kernel/sched/loadavg.c:
+    #   load = load*exp + active*(FIXED_1 - exp);  load >>= FSHIFT
+    # `active` is the runnable count carried into FSHIFT fixed point.
+    new_load: uint64 = load * exp + active * (FIXED_1 - exp)
+    return new_load >> FSHIFT
+
+
+def loadavg_tick(user_ctx: uint64):
+    # Called once per 100 Hz timer tick from timer_interrupt(), after
+    # the EOI. `user_ctx` is 1 iff the timer froze ring-3 code.
+    #
+    # (a) idle accounting: a tick with user_ctx == 0 caught the CPU
+    #     not running userland — count it as idle.
+    # (b) EWMA sampling: every LOAD_SAMPLE_TICKS we fold the current
+    #     runnable count into the three moving averages.
+    if _la_inited == 0:
+        _la_next_sample_jiffies = get_jiffies() + LOAD_SAMPLE_TICKS
+        _la_inited = 1
+
+    if user_ctx == 0:
+        _la_idle_jiffies = _la_idle_jiffies + 1
+
+    j: uint64 = get_jiffies()
+    if j >= _la_next_sample_jiffies:
+        runnable: uint64 = loadavg_runnable_count()
+        active: uint64 = runnable << FSHIFT
+        _la_avg_load_1  = _calc_load(_la_avg_load_1,  EXP_1,  active)
+        _la_avg_load_5  = _calc_load(_la_avg_load_5,  EXP_5,  active)
+        _la_avg_load_15 = _calc_load(_la_avg_load_15, EXP_15, active)
+        _la_next_sample_jiffies = j + LOAD_SAMPLE_TICKS
+
+
+def loadavg_note_switch():
+    # Called from schedule() on every real (prev != next) context
+    # switch. One unconditional increment — the whole "ctxt" column.
+    _la_ctxt_count = _la_ctxt_count + 1
+
+
+# --- exported accessors ----------------------------------------------
+
+def loadavg_get_ctxt() -> uint64:
+    return _la_ctxt_count
+
+
+def loadavg_get_idle_jiffies() -> uint64:
+    return _la_idle_jiffies
+
+
+def _load_to_centi(load_fixed: uint64) -> uint64:
+    # Convert an FSHIFT-fixed-point load into load*100 (integer), so a
+    # caller can render "<v/100>.<v%100>" with two decimal places. The
+    # *100 happens BEFORE the >>FSHIFT so the two fractional digits are
+    # not rounded away — same trick as Linux's LOAD_INT/LOAD_FRAC pair.
+    return (load_fixed * 100) >> FSHIFT
+
+
+def loadavg_get_load1_centi() -> uint64:
+    return _load_to_centi(_la_avg_load_1)
+
+
+def loadavg_get_load5_centi() -> uint64:
+    return _load_to_centi(_la_avg_load_5)
+
+
+def loadavg_get_load15_centi() -> uint64:
+    return _load_to_centi(_la_avg_load_15)

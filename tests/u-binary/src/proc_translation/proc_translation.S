@@ -179,12 +179,91 @@ scan_hit:
     movq    $len_vendor_ok, %rdx
     syscall
 
-    /* ---- 5. exit_group(0) ---------------------------------------- */
+    /* ---- 5. open("/proc/self/stat", O_RDONLY) -------------------- *
+     * §13: /proc/self resolution. The Layer-2 shim rewrites
+     * "/proc/self/<leaf>" to "/proc/<pid>/<leaf>" where <pid> is the
+     * caller's own pid, then vfs_open routes it through devproc.
+     * Without the resolver this would -ENOENT (the native namespace
+     * has no "self" entry). A successful open + non-empty read whose
+     * first byte is an ASCII digit (field 1 of /proc/<pid>/stat is
+     * the pid) proves the whole path works. */
+    movq    $2, %rax                   /* SYS_open                    */
+    leaq    self_path(%rip), %rdi
+    xorq    %rsi, %rsi
+    xorq    %rdx, %rdx
+    syscall
+    testq   %rax, %rax
+    js      fail_open_self
+    movq    %rax, %r12
+
+    movq    $0, %rax                   /* SYS_read                    */
+    movq    %r12, %rdi
+    leaq    self_buf(%rip), %rsi
+    movq    $256, %rdx
+    syscall
+    testq   %rax, %rax
+    jle     fail_read_self
+
+    movq    $3, %rax                   /* SYS_close                   */
+    movq    %r12, %rdi
+    syscall
+
+    /* first byte of /proc/<pid>/stat must be an ASCII digit */
+    leaq    self_buf(%rip), %rsi
+    movzbl  (%rsi), %eax
+    cmpb    $'0', %al
+    jb      fail_self_shape
+    cmpb    $'9', %al
+    ja      fail_self_shape
+
+    movq    $1, %rax
+    movq    $1, %rdi
+    leaq    msg_self_ok(%rip), %rsi
+    movq    $len_self_ok, %rdx
+    syscall
+
+    /* ---- 6. exit_group(0) ---------------------------------------- */
     movq    $231, %rax
     xorq    %rdi, %rdi
     syscall
 spin0:
     jmp     spin0
+
+fail_open_self:
+    movq    $1, %rax
+    movq    $2, %rdi
+    leaq    msg_fail_open_self(%rip), %rsi
+    movq    $len_fail_open_self, %rdx
+    syscall
+    movq    $231, %rax
+    movq    $8, %rdi
+    syscall
+spin8:
+    jmp     spin8
+
+fail_read_self:
+    movq    $1, %rax
+    movq    $2, %rdi
+    leaq    msg_fail_read_self(%rip), %rsi
+    movq    $len_fail_read_self, %rdx
+    syscall
+    movq    $231, %rax
+    movq    $9, %rdi
+    syscall
+spin9:
+    jmp     spin9
+
+fail_self_shape:
+    movq    $1, %rax
+    movq    $2, %rdi
+    leaq    msg_fail_self_shape(%rip), %rsi
+    movq    $len_fail_self_shape, %rdx
+    syscall
+    movq    $231, %rax
+    movq    $10, %rdi
+    syscall
+spin10:
+    jmp     spin10
 
 fail_open_proc:
     movq    $1, %rax
@@ -273,6 +352,7 @@ spin7:
     .section .rodata
 proc_path: .asciz "/proc/cpuinfo"
 dev_path:  .asciz "/dev/cpuinfo"
+self_path: .asciz "/proc/self/stat"
 
 msg_open_proc_ok:    .ascii "[proc-translation] /proc/cpuinfo open OK\n"
 len_open_proc_ok = . - msg_open_proc_ok
@@ -307,7 +387,20 @@ len_fail_compare_byte = . - msg_fail_compare_byte
 msg_fail_no_vendor:  .ascii "[proc-translation] vendor line missing FAIL\n"
 len_fail_no_vendor = . - msg_fail_no_vendor
 
+msg_self_ok:         .ascii "[proc-translation] /proc/self/stat open OK\n"
+len_self_ok = . - msg_self_ok
+
+msg_fail_open_self:  .ascii "[proc-translation] open(/proc/self/stat) FAIL\n"
+len_fail_open_self = . - msg_fail_open_self
+
+msg_fail_read_self:  .ascii "[proc-translation] read(/proc/self/stat) FAIL\n"
+len_fail_read_self = . - msg_fail_read_self
+
+msg_fail_self_shape: .ascii "[proc-translation] /proc/self/stat shape FAIL\n"
+len_fail_self_shape = . - msg_fail_self_shape
+
     .section .bss
     .align 8
 proc_buf:  .skip 512
 dev_buf:   .skip 512
+self_buf:  .skip 512
