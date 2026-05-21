@@ -64,7 +64,7 @@ from drivers.net.ip import ip_send, ip_csum16, IPPROTO_TCP, ip_our_ip_b, ip_have
 from drivers.net.virtio_net import virtio_net_poll
 from drivers.net.eth import eth_tx, eth_get_mac
 from drivers.net.arp import arp_lookup
-from arch.x86.kernel.time import get_jiffies
+from arch.x86.kernel.time import get_jiffies, pit_monotonic_us
 
 
 # TCP control-block states (RFC 793). Numbered to match the order
@@ -129,13 +129,18 @@ TCP_MSS:            uint64 = 536       # conservative default per RFC 879
 # first. 16384 is also the TLS 1.3 record max plaintext, so a
 # single record always fits even if it shards across N TCP
 # segments. See `tcp_slot_rx_head` / `tcp_slot_rx_tail` below.
-TCP_RX_BUF:         uint64 = 16384
+TCP_RX_BUF:         uint64 = 262144    # 256 KiB circular RX ring / slot
 TCP_TX_BUF:         uint64 = 1500
 TCP_PSEUDO_LEN:     uint64 = 12        # src4 + dst4 + zero + proto + length(2)
 
-# Default receive window we advertise. Generous — SLIRP won't try to
-# fill it, but >0 is required by the spec or peers won't send data.
-TCP_DEFAULT_WIN:    uint16 = 0x4000
+# Receive window we advertise BEFORE a slot has a live ring (SYN /
+# SYN-ACK, where rx_count is 0). Once ESTABLISHED, every segment
+# advertises the actual free ring space via _tcp_adv_window — see the
+# RX-ring banner. Capped at 0xFFFF: classic TCP has no window scaling
+# so the largest advertisable window is 65535 bytes; the 256 KiB ring
+# is drained fast enough that a 64 KiB peer-side flight is plenty.
+TCP_DEFAULT_WIN:    uint16 = 0xFFFF
+TCP_WIN_MAX:        uint64 = 65535     # no window scaling -> 16-bit cap
 
 
 # Connection table. Parallel-array layout to keep the per-slot
@@ -175,24 +180,36 @@ tcp_slot_last_act:  Array[8, uint64]     # jiffies of last RX/TX
 # single-segment overwrite buffer (1500 bytes / slot, blown away on
 # every inbound segment) with a grow-and-append queue. tcp_rx
 # appends each in-order segment's payload at [tail], advances tail.
-# tcp_recv consumes from [head] toward tail, advances head. When
-# head == tail (drained) both reset to 0 so the buffer compacts;
-# while head > 0 but head < tail we leave bytes in place — the next
-# tcp_recv reads from `head` directly.
+# The RX ring is a TRUE CIRCULAR buffer: `head` (consumer) and `tail`
+# (producer) both advance modulo TCP_RX_BUF, and a separate `count`
+# tracks how many bytes are currently buffered (head==tail is then
+# unambiguous — empty when count==0, full when count==TCP_RX_BUF).
 #
-# Overflow policy: if `tail + seg_len > TCP_RX_BUF`, the segment is
-# DROPPED and rcv_nxt is NOT advanced — the peer's TCP retransmit
-# will resend the same bytes after RTO. 16384 / slot covers a
-# whole TLS 1.3 record max-plaintext flight, so the dropped-and-
-# retransmit path is only reachable when the consumer (e.g. TLS
-# stitcher) hasn't drained between record boundaries — a real
-# slowdown but never silent corruption. See V5.3 commit message.
+# Why circular, not the old linear "compact only on full drain":
+# fetching a real Debian `Release` (~150 KiB) or `Packages.gz` off a
+# live mirror streams far more than one ring's worth of data, and the
+# consumer (the TLS record stitcher) drains a record at a time. A
+# linear buffer wastes all the space below `head` until a complete
+# drain, so `tail` hit TCP_RX_BUF and segments were DROPPED mid-
+# transfer even though the ring was half-empty. A circular ring reuses
+# the freed front immediately.
 #
-# Layout: flat 1-D array of slot*TCP_RX_BUF + offset (same dodge
-# every other table here uses to keep nested-Array codegen happy).
-tcp_slot_rx_data:   Array[131072, uint8]  # 8 slots * 16384 bytes
+# Flow control: every ACK/segment we emit advertises a receive window
+# equal to the ACTUAL free ring space (_tcp_adv_window). When the
+# consumer lags and the ring fills, the advertised window shrinks
+# toward 0 and the peer's TCP stops sending — no drop, no retransmit
+# storm. As tcp_recv drains, it emits a window-update ACK so the peer
+# reopens. A segment that still does not fit (peer ignored a zero
+# window) is dropped without advancing rcv_nxt, exactly as before — a
+# correctness backstop, no longer the normal path.
+#
+# 256 KiB / slot comfortably holds a whole real-world index response
+# in flight. Layout: flat 1-D array of slot*TCP_RX_BUF + offset (the
+# nested-Array-codegen dodge every other table here uses).
+tcp_slot_rx_data:   Array[2097152, uint8] # 8 slots * 262144 bytes
 tcp_slot_rx_head:   Array[8, uint64]      # consumer position (drain)
 tcp_slot_rx_tail:   Array[8, uint64]      # producer position (append)
+tcp_slot_rx_count:  Array[8, uint64]      # bytes currently buffered
 
 # Per-slot flag: did we observe a FIN from the peer? Latched the
 # first time we see it; cleared on tcp_close completion.
@@ -600,6 +617,24 @@ def _tcp_check_retrans(slot: uint64) -> int32:
     return 1
 
 
+# _tcp_adv_window: the receive window to advertise on the next segment
+# this slot sends — the actual free space in its circular RX ring,
+# capped at TCP_WIN_MAX (classic TCP has no window scaling, so a window
+# wider than 65535 cannot be expressed on the wire). When the consumer
+# lags and the ring fills this returns 0, which tells the peer's TCP to
+# stop sending until a later tcp_recv drains the ring and emits a
+# window-update ACK.
+
+def _tcp_adv_window(slot: uint64) -> uint16:
+    used: uint64 = tcp_slot_rx_count[slot]
+    free: uint64 = 0
+    if used < TCP_RX_BUF:
+        free = TCP_RX_BUF - used
+    if free > TCP_WIN_MAX:
+        free = TCP_WIN_MAX
+    return cast[uint16](free)
+
+
 def _tcp_build_and_send(slot: uint64, flags: uint8,
                         payload: Ptr[uint8],
                         payload_len: uint64) -> int32:
@@ -665,8 +700,11 @@ def _tcp_send_segment(slot: uint64, flags: uint8,
     tcp_tx_buf[h + 11] = cast[uint8](rcv_nxt & 0xFF)
     tcp_tx_buf[h + 12] = 0x50           # data_off = 5 (20 bytes) << 4
     tcp_tx_buf[h + 13] = flags
-    tcp_tx_buf[h + 14] = cast[uint8]((cast[uint32](TCP_DEFAULT_WIN) >> 8) & 0xFF)
-    tcp_tx_buf[h + 15] = cast[uint8](cast[uint32](TCP_DEFAULT_WIN) & 0xFF)
+    # Advertise the actual free RX-ring space so the peer's TCP flow
+    # control throttles to our drain rate (see the RX-ring banner).
+    adv_win: uint16 = _tcp_adv_window(slot)
+    tcp_tx_buf[h + 14] = cast[uint8]((cast[uint32](adv_win) >> 8) & 0xFF)
+    tcp_tx_buf[h + 15] = cast[uint8](cast[uint32](adv_win) & 0xFF)
     tcp_tx_buf[h + 16] = 0              # checksum placeholder
     tcp_tx_buf[h + 17] = 0
     tcp_tx_buf[h + 18] = 0              # urg_ptr
@@ -781,6 +819,7 @@ def tcp_rx(payload: Ptr[uint8], length: uint64,
                 tcp_slot_rcv_nxt[new_slot] = seq32 + 1
                 tcp_slot_rx_head[new_slot] = 0
                 tcp_slot_rx_tail[new_slot] = 0
+                tcp_slot_rx_count[new_slot] = 0
                 tcp_slot_saw_fin[new_slot] = 0
                 tcp_slot_last_act[new_slot] = get_jiffies()
                 # Reset retransmission state for the new slot.
@@ -895,27 +934,37 @@ def tcp_rx(payload: Ptr[uint8], length: uint64,
     if state == TCP_ESTABLISHED:
         if seg_payload_len > 0:
             if seq32 == tcp_slot_rcv_nxt[slot]:
-                # V5.3: append the payload at the slot's ring tail so
-                # back-to-back inbound segments (TLS handshake bursts
-                # where Certificate spans two TCP segments) accumulate
-                # until tcp_recv drains them. If the ring would overflow
-                # we DROP the segment and DO NOT advance rcv_nxt — the
-                # peer's TCP retransmit will resend after RTO. Silent
-                # truncation here would corrupt the stream.
-                tail: uint64 = tcp_slot_rx_tail[slot]
-                if tail + seg_payload_len > TCP_RX_BUF:
+                # Append the payload into the slot's CIRCULAR RX ring.
+                # `tail` is the producer cursor (mod TCP_RX_BUF); the
+                # bytes wrap around the end of the slot's window. If the
+                # ring genuinely has no room (peer ignored our shrunken
+                # advertised window) we DROP the segment and DO NOT
+                # advance rcv_nxt — the peer's TCP retransmit resends
+                # after RTO. With per-segment free-space window
+                # advertisement (_tcp_adv_window) this drop path is now
+                # a backstop, not the normal flow.
+                free: uint64 = 0
+                if tcp_slot_rx_count[slot] < TCP_RX_BUF:
+                    free = TCP_RX_BUF - tcp_slot_rx_count[slot]
+                if seg_payload_len > free:
                     printk2(
-                        "[tcp] slot=%d rx ring full (tail=%d), drop seg\n",
-                        slot, tail)
+                        "[tcp] slot=%d rx ring full (count=%d), drop seg\n",
+                        slot, tcp_slot_rx_count[slot])
                     # No ACK — peer will retransmit when its RTO fires.
-                    # Don't advance rcv_nxt or rx_tail.
+                    # Don't advance rcv_nxt or rx_count.
                 else:
                     rx_base: uint64 = slot * TCP_RX_BUF
+                    tail: uint64 = tcp_slot_rx_tail[slot]
                     i: uint64 = 0
                     while i < seg_payload_len:
-                        tcp_slot_rx_data[rx_base + tail + i] = seg_payload[i]
+                        tcp_slot_rx_data[rx_base + tail] = seg_payload[i]
+                        tail = tail + 1
+                        if tail >= TCP_RX_BUF:
+                            tail = 0
                         i = i + 1
-                    tcp_slot_rx_tail[slot] = tail + seg_payload_len
+                    tcp_slot_rx_tail[slot] = tail
+                    tcp_slot_rx_count[slot] = tcp_slot_rx_count[slot] \
+                        + seg_payload_len
                     tcp_slot_rcv_nxt[slot] = seq32 + cast[uint32](seg_payload_len)
                     tcp_in_data = tcp_in_data + seg_payload_len
                     # Send an ACK back so the peer knows we got the data
@@ -1048,6 +1097,7 @@ def tcp_connect(remote_b0: uint8, remote_b1: uint8,
     tcp_slot_rcv_nxt[slot] = 0
     tcp_slot_rx_head[slot] = 0
     tcp_slot_rx_tail[slot] = 0
+    tcp_slot_rx_count[slot] = 0
     tcp_slot_saw_fin[slot] = 0
     tcp_slot_last_act[slot] = get_jiffies()
     # Fresh per-slot retransmission state. A slot just returned to
@@ -1170,49 +1220,62 @@ def tcp_recv(slot_signed: int32, buf: Ptr[uint8],
         return -1
     state: uint32 = tcp_slot_state[slot]
     if state != TCP_ESTABLISHED:
-        if tcp_slot_rx_head[slot] == tcp_slot_rx_tail[slot]:
+        if tcp_slot_rx_count[slot] == 0:
             return -1
-    # Bound the poll by an ITERATION COUNT, not a get_jiffies() deadline.
-    # tcp_recv runs from userland-syscall context (read(2) on a socket
-    # fd) with CPU interrupts IF-masked, so the LAPIC timer never ticks
-    # and `jiffies` is frozen for the whole call — a `while
-    # get_jiffies() < deadline` loop then degenerates into `while True`
-    # whenever the peer goes quiet (it never has, but apt's HTTPS read
-    # path is the first to exercise a genuinely-no-more-data read, and
-    # it wedged forever). tcp_close already switched to this iteration-
-    # count scheme for exactly this reason; tcp_recv must match. The
-    # caller's `timeout_jiffies` is reinterpreted as a budget: ~1000
-    # virtio_net_poll iterations per jiffy of intended wait, the same
-    # ratio tcp_close uses (its 500000-iter cap ≈ a 500-jiffy wait).
-    iters: uint64 = 0
-    iter_cap: uint64 = timeout_jiffies * 1000
-    if iter_cap == 0:
-        iter_cap = 500000
-    while iters < iter_cap:
+    # Bound the poll by a REAL WALL-CLOCK deadline read off the free-
+    # running PIT counter (pit_monotonic_us). tcp_recv runs from
+    # userland-syscall context (read(2) on a socket fd) with CPU
+    # interrupts IF-masked, so the LAPIC timer never ticks and `jiffies`
+    # is frozen for the whole call — a `while get_jiffies() < deadline`
+    # loop degenerates into `while True`. A pre-fix attempt used a fixed
+    # ITERATION COUNT instead, but that is CPU-speed-dependent and far
+    # too short for real-internet RTT: against a live CDN the 500k-iter
+    # budget elapsed in a few ms — well before the mirror's response
+    # crossed the wire — so apt's HTTPS read returned a spurious EOF.
+    # The 8254 PIT channel-0 counter keeps running regardless of IF, so
+    # pit_monotonic_us() gives us a true microsecond clock here. The
+    # caller's `timeout_jiffies` is the intended wait in jiffies
+    # (HZ=100 -> 10 ms each); convert to a microsecond budget.
+    budget_us: uint64 = timeout_jiffies * 10000
+    if budget_us == 0:
+        budget_us = 5000000                       # 5 s default
+    start_us: uint64 = pit_monotonic_us()
+    while True:
         virtio_net_poll()
-        head: uint64 = tcp_slot_rx_head[slot]
-        tail: uint64 = tcp_slot_rx_tail[slot]
-        if tail > head:
-            avail: uint64 = tail - head
+        avail: uint64 = tcp_slot_rx_count[slot]
+        if avail > 0:
             n: uint64 = avail
             if n > max_len:
                 n = max_len
+            # Copy from the CIRCULAR ring starting at `head`, wrapping
+            # at the slot's window boundary.
             rx_base: uint64 = slot * TCP_RX_BUF
+            head: uint64 = tcp_slot_rx_head[slot]
             i: uint64 = 0
             while i < n:
-                buf[i] = tcp_slot_rx_data[rx_base + head + i]
+                buf[i] = tcp_slot_rx_data[rx_base + head]
+                head = head + 1
+                if head >= TCP_RX_BUF:
+                    head = 0
                 i = i + 1
-            new_head: uint64 = head + n
-            if new_head == tail:
-                # Fully drained — compact so the next inbound segment
-                # appends from the start of the slot's window.
-                tcp_slot_rx_head[slot] = 0
-                tcp_slot_rx_tail[slot] = 0
-            else:
-                tcp_slot_rx_head[slot] = new_head
+            tcp_slot_rx_head[slot] = head
+            was_full: int32 = 0
+            if avail >= TCP_RX_BUF:
+                was_full = 1
+            tcp_slot_rx_count[slot] = avail - n
+            # Window-update ACK: draining the ring just enlarged the
+            # free space we can advertise. If the ring had been full
+            # (advertised window 0), the peer is parked waiting for a
+            # window update — send an ACK now so it resumes. (When the
+            # ring was not full the peer is still sending and our
+            # per-segment ACKs already carry the fresh window, so this
+            # extra ACK is only needed on the full -> not-full edge.)
+            if was_full != 0 and tcp_slot_state[slot] == TCP_ESTABLISHED:
+                _tcp_build_and_send(slot, TCP_ACK,
+                                    cast[Ptr[uint8]](0), 0)
             return cast[int64](n)
         if tcp_slot_saw_fin[slot] != 0:
-            if tcp_slot_rx_head[slot] == tcp_slot_rx_tail[slot]:
+            if tcp_slot_rx_count[slot] == 0:
                 return 0
         if tcp_slot_state[slot] == TCP_CLOSED:
             return -1
@@ -1223,8 +1286,9 @@ def tcp_recv(slot_signed: int32, buf: Ptr[uint8],
         rtx: int32 = _tcp_check_retrans(slot)
         if rtx < 0:
             return -1
-        iters = iters + 1
-    return 0                              # treat timeout-with-no-data as 0
+        # Wall-clock deadline check off the free-running PIT counter.
+        if pit_monotonic_us() - start_us >= budget_us:
+            return 0                      # treat timeout-with-no-data as 0
 
 
 def tcp_close(slot_signed: int32) -> int32:
@@ -1283,13 +1347,14 @@ def tcp_close(slot_signed: int32) -> int32:
     # in-kernel smokes. A `while get_jiffies() < deadline` loop in
     # that phase becomes effectively `while True` if no inbound
     # packet flips the state — which is exactly the FIN_WAIT_2
-    # half-open shape. Counting busy-poll iterations bounds wall
-    # time deterministically regardless of jiffies. Empirically
-    # ~500_000 iterations of virtio_net_poll+state-check runs in
-    # the low single-digit seconds on TCG-emulated x86_64.
-    iters: uint64 = 0
-    iter_cap: uint64 = 500000
-    while iters < iter_cap:
+    # half-open shape. The free-running 8254 PIT counter keeps
+    # advancing regardless of EFLAGS.IF, so pit_monotonic_us() gives a
+    # real microsecond clock here (a fixed iteration count would be
+    # CPU-speed-dependent — the same flaw the tcp_recv path hit). Bound
+    # the close wait at ~5 s of real wall-clock time.
+    close_budget_us: uint64 = 5000000             # 5 s
+    close_start_us: uint64 = pit_monotonic_us()
+    while True:
         virtio_net_poll()
         s: uint32 = tcp_slot_state[slot]
         if s == TCP_CLOSED:
@@ -1305,7 +1370,8 @@ def tcp_close(slot_signed: int32) -> int32:
             # Peer dropped off the wire — slot is dead.
             tcp_slot_state[slot] = TCP_CLOSED
             return 0
-        iters = iters + 1
+        if pit_monotonic_us() - close_start_us >= close_budget_us:
+            break                                 # fall through to timeout
     # Timed out. Distinguish FIN_WAIT_2 (peer ACK'd our FIN, never
     # sent theirs — half-open) from FIN_WAIT_1 (peer never ACK'd
     # our FIN — totally unresponsive) so the diagnostic is precise.
@@ -1350,6 +1416,7 @@ def tcp_listen(local_port: uint16) -> int32:
     tcp_slot_rcv_nxt[slot] = 0
     tcp_slot_rx_head[slot] = 0
     tcp_slot_rx_tail[slot] = 0
+    tcp_slot_rx_count[slot] = 0
     tcp_slot_saw_fin[slot] = 0
     tcp_slot_unacked[slot] = 0
     tcp_slot_retries[slot] = 0
@@ -1485,6 +1552,7 @@ def tcp_init():
         tcp_slot_last_act[i] = 0
         tcp_slot_rx_head[i] = 0
         tcp_slot_rx_tail[i] = 0
+        tcp_slot_rx_count[i] = 0
         tcp_slot_saw_fin[i] = 0
         tcp_slot_last_send[i] = 0
         tcp_slot_rto[i] = TCP_RTO_INITIAL
