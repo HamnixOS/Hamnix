@@ -325,6 +325,48 @@ class TaskStruct:
     # -ECHILD. Default 0 (a normal, reapable child). Placed at the end
     # of TaskStruct so it shifts no earlier offset.
     detached:     uint64              # offset 1624
+    # §3 / Linux-ABI signals. LAYER-2-ONLY state — a confined facility
+    # for Linux guests, never consulted by native (Layer-1) code.
+    #
+    #   sig_mask        — blocked-signal bitmap (rt_sigprocmask). Bit N
+    #                     set ⇒ signal N is blocked: signal_check_and_-
+    #                     handle skips it (it stays latched in
+    #                     sig_pending until unblocked). SIGKILL/SIGSTOP
+    #                     can never be masked — enforced at sigprocmask.
+    #   sig_saved_mask  — the mask in effect BEFORE the current handler
+    #                     was entered. rt_sigreturn restores it (the
+    #                     authoritative copy also lives in the ucontext
+    #                     on the user stack; this is the kernel mirror).
+    #   sig_in_handler  — 1 while a signal handler is running. Guards
+    #                     against a second handler being stacked on the
+    #                     same syscall-return frame before the first
+    #                     rt_sigreturn (which would corrupt user state).
+    #   sig_flags[N]    — sa_flags recorded by rt_sigaction for signal N.
+    #                     SA_SIGINFO (0x4) decides the handler argument
+    #                     shape; SA_NODEFER (0x40000000) suppresses the
+    #                     auto-block of the signal during its own
+    #                     handler. All zero on a fresh slot.
+    # Cleared at every create_user_task / create_user_thread and never
+    # inherited across fork(): a child resets its signal disposition,
+    # matching POSIX (handlers ARE inherited — sig_handlers — but the
+    # pending set and in-handler state are not).
+    sig_mask:       uint64            # offset 1632
+    sig_saved_mask: uint64            # offset 1640
+    sig_in_handler: uint64            # offset 1648
+    sig_flags:      Array[64, uint64] # offset 1656..2168
+    # §3: termination cause. 0 ⇒ the task exited normally (exit_code is
+    # the _exit() status). Non-zero ⇒ the task was KILLED by signal N;
+    # wait4 then encodes a WIFSIGNALED wait-status (low 7 bits = N)
+    # instead of WIFEXITED. Set by the default-disposition path in
+    # signal_check_and_handle right before task_exit_current.
+    term_sig:       uint64            # offset 2168
+    # §3: address of the ucontext_t inside the rt_sigframe most
+    # recently built by deliver_signal_to_user. rt_sigreturn reads the
+    # frame's RIP / RSP / RFLAGS / uc_sigmask back through this pointer
+    # to restore the interrupted context — the trampoline cannot pass
+    # it back as a syscall arg because rt_sigreturn takes none, so the
+    # kernel stashes it here for the lifetime of the in-flight handler.
+    sig_frame_uctx: uint64            # offset 2176
 
 
 # State constants (mirror Linux's task->state space at a tiny scope).
@@ -570,6 +612,19 @@ def kthread_create(entry: uint64, name0: uint64) -> int32:
     task_table[s].alt_stack_sp    = 0
     task_table[s].alt_stack_size  = 0
     task_table[s].alt_stack_flags = 0
+    # §3: Linux-ABI signal state. Kernel threads never run the user
+    # signal-delivery path, but scrub so a recycled slot can't carry a
+    # prior user tenant's pending bits / blocked mask forward.
+    task_table[s].sig_pending    = 0
+    task_table[s].sig_mask       = 0
+    task_table[s].sig_saved_mask = 0
+    task_table[s].sig_in_handler = 0
+    task_table[s].term_sig       = 0
+    task_table[s].sig_frame_uctx = 0
+    ksfi: uint64 = 0
+    while ksfi < 64:
+        task_table[s].sig_flags[ksfi] = 0
+        ksfi = ksfi + 1
     # Phase B / M16.93: zero the per-task Plan 9 errstr buffer. Kernel
     # threads never call SYS_ERRSTR, but a stale-slot reclaim could leave
     # a previous user's error message visible if the slot is later reused
@@ -746,6 +801,21 @@ def create_user_thread(entry: uint64, name0: uint64,
     task_table[s].alt_stack_sp    = 0
     task_table[s].alt_stack_size  = 0
     task_table[s].alt_stack_flags = 0
+    # §3: Linux-ABI signal state. Fresh task starts with no signals
+    # pending, none blocked, not inside a handler, and every sa_flags
+    # slot clear. task_reap leaves the slot body intact, so a reused
+    # slot would otherwise inherit a prior tenant's pending bits and
+    # signal_check_and_handle would dispatch a stale signal.
+    task_table[s].sig_pending    = 0
+    task_table[s].sig_mask       = 0
+    task_table[s].sig_saved_mask = 0
+    task_table[s].sig_in_handler = 0
+    task_table[s].term_sig       = 0
+    task_table[s].sig_frame_uctx = 0
+    sfi: uint64 = 0
+    while sfi < 64:
+        task_table[s].sig_flags[sfi] = 0
+        sfi = sfi + 1
     # Phase B / M16.93: every freshly-created user task starts with a
     # zeroed Plan 9 errstr buffer. Plan 9 semantics: errstr is per-task
     # and NOT inherited across rfork/fork (each child sees "no error"),
@@ -1005,6 +1075,28 @@ def task_exit_current(code: int64):
         cast[Ptr[int32]](ctid)[0] = 0
         task_table[current_idx].clear_child_tid = 0
         futex_wake_all(ctid)
+    # §3: SIGCHLD to the parent. POSIX: a child entering its zombie
+    # (STATE_EXITED) state raises SIGCHLD in its parent so a daemon
+    # blocked elsewhere learns a child is reapable. We post to the
+    # parent's sig_pending bitmap; signal_check_and_handle delivers it
+    # at the parent's next syscall boundary / yield. A detached child
+    # (RFNOWAIT) has no waitable parent so it skips this. The parent's
+    # default SIGCHLD disposition is SIG_IGN-equivalent here (handler
+    # 0 → 128+17 terminate would be wrong) — so we ONLY post SIGCHLD
+    # when the parent has actually installed a handler for it; a parent
+    # that never registered one is not disturbed, exactly matching
+    # Linux's "SIGCHLD default action is ignore" semantics.
+    if task_table[current_idx].detached == 0:
+        ppid: uint64 = task_table[current_idx].parent_pid
+        if ppid != 0:
+            pslot: int32 = task_lookup_by_pid(ppid)
+            if pslot >= 0:
+                psu: uint64 = cast[uint64](pslot)
+                pst: uint64 = task_table[psu].state
+                if pst == STATE_READY or pst == STATE_RUNNING:
+                    chld_h: uint64 = task_table[psu].sig_handlers[SIGCHLD]
+                    if chld_h != 0 and chld_h != 1:
+                        signal_post(psu, SIGCHLD)
     # §1 / rfork RFNOWAIT: a detached task has no waitable ancestor.
     # Transition it straight to STATE_FREE (self-reap) instead of
     # STATE_EXITED so it never lingers as a zombie and the slot is
@@ -1515,13 +1607,18 @@ def yield_to_others():
     signal_check_and_handle()
 
 
-# --- M16.39: signals --------------------------------------------
+# --- §3: signals -------------------------------------------------
 #
-# Tiny bitmap-based signal subsystem. Every TaskStruct has a
-# `sig_pending` uint64; bit N = signal N is pending. The default
-# disposition for every signal is "terminate with exit code 128+N"
-# (POSIX convention) since we don't yet have sigaction / user
-# handlers / per-process signal masks.
+# Bitmap-based signal subsystem. Every TaskStruct carries:
+#   sig_pending  — bit N set ⇒ signal N is pending delivery
+#   sig_mask     — bit N set ⇒ signal N is BLOCKED (rt_sigprocmask)
+#   sig_handlers — per-signal user handler RIP (0 ⇒ SIG_DFL)
+#   sig_flags    — per-signal sa_flags (SA_SIGINFO, SA_NODEFER, ...)
+#
+# Default disposition (SIG_DFL, handler==0) terminates the task with
+# exit code 128+N (POSIX). A non-zero handler is invoked in CPL=3 via
+# a full Linux-ABI rt_sigframe (siginfo + ucontext) — see
+# deliver_signal_to_user. SIG_IGN (handler==1) drops the signal.
 #
 # Delivery points:
 #   1. yield_to_others — after each cooperative yield (covers
@@ -1530,12 +1627,24 @@ def yield_to_others():
 #      arch/x86/kernel/syscall.ad before sysret — covers
 #      synchronous syscalls that didn't yield.
 #
-# A handler may never get to run if delivery races with normal exit,
-# but at this scale (all signals → TERM) that's indistinguishable.
+# BOUNDARY-DISCIPLINE: this Linux-ABI signal mechanism is a Layer-2
+# facility for Linux guests. Native (Layer-1) code MUST NOT depend on
+# it — the Plan 9 note mechanism (sys/src/9/port/sysnote.ad) is the
+# native-side equivalent. The two share TaskStruct storage but never
+# call into each other.
 
 SIGINT:  uint64 = 2
 SIGKILL: uint64 = 9
+SIGSEGV: uint64 = 11
+SIGPIPE: uint64 = 13
 SIGTERM: uint64 = 15
+SIGCHLD: uint64 = 17
+SIGSTOP: uint64 = 19
+
+# sa_flags bits we recognise (asm-generic / x86_64 <asm/signal.h>).
+SA_SIGINFO:  uint64 = 0x00000004
+SA_RESTART:  uint64 = 0x10000000
+SA_NODEFER:  uint64 = 0x40000000
 
 
 def signal_post(slot: uint64, sig: uint64):
@@ -1547,6 +1656,92 @@ def signal_post(slot: uint64, sig: uint64):
 
 def signal_pending(slot: uint64) -> uint64:
     return task_table[slot].sig_pending
+
+
+# §3: per-task signal-mask accessors. The Linux-ABI rt_sigprocmask
+# syscall reads/writes the blocked-signal bitmap through these.
+def get_task_sig_mask(slot: uint64) -> uint64:
+    return task_table[slot].sig_mask
+
+
+def set_task_sig_mask(slot: uint64, mask: uint64):
+    # SIGKILL (9) and SIGSTOP (19) can NEVER be blocked — POSIX. Force
+    # their bits clear no matter what userspace asked for.
+    kill_stop: uint64 = (cast[uint64](1) << SIGKILL) \
+                      | (cast[uint64](1) << SIGSTOP)
+    task_table[slot].sig_mask = mask & ~kill_stop
+
+
+# §3: per-task sa_flags accessors (recorded by rt_sigaction).
+def get_task_sig_flags(slot: uint64, sig: uint64) -> uint64:
+    if sig >= 64:
+        return 0
+    return task_table[slot].sig_flags[sig]
+
+
+def set_task_sig_flags(slot: uint64, sig: uint64, flags: uint64):
+    if sig >= 64:
+        return
+    task_table[slot].sig_flags[sig] = flags
+
+
+# §3: in-handler depth flag. 1 while a signal handler runs; cleared by
+# rt_sigreturn. Guards against a second signal frame being stacked on
+# the same syscall-return slot before the first handler completes.
+def get_task_sig_in_handler(slot: uint64) -> uint64:
+    return task_table[slot].sig_in_handler
+
+
+def set_task_sig_in_handler(slot: uint64, v: uint64):
+    task_table[slot].sig_in_handler = v
+
+
+def get_task_sig_saved_mask(slot: uint64) -> uint64:
+    return task_table[slot].sig_saved_mask
+
+
+def set_task_sig_saved_mask(slot: uint64, v: uint64):
+    task_table[slot].sig_saved_mask = v
+
+
+# §3: termination cause. wait4 reads this to decide WIFEXITED vs
+# WIFSIGNALED. 0 ⇒ normal exit.
+def get_task_term_sig(slot: uint64) -> uint64:
+    return task_table[slot].term_sig
+
+
+# §3: address of the in-flight rt_sigframe's ucontext. rt_sigreturn
+# reads/clears it through these accessors.
+def get_task_sig_frame_uctx(slot: uint64) -> uint64:
+    return task_table[slot].sig_frame_uctx
+
+
+def set_task_sig_frame_uctx(slot: uint64, v: uint64):
+    task_table[slot].sig_frame_uctx = v
+
+
+# §3: POSIX fork inheritance. A fork child inherits the parent's
+# signal DISPOSITIONS (sig_handlers + sig_flags) and its signal MASK,
+# but NOT the pending-signal set or the in-handler state — those are
+# cleared in the child. create_user_task already zeroed everything;
+# do_clone's fork path calls this to copy the dispositions + mask
+# from the parent. (The thread path does NOT call this — CLONE_THREAD
+# siblings share dispositions implicitly via the same process, and
+# the existing thread code leaves them zeroed, which is harmless for
+# the pthread workloads in the U-track.)
+def copy_sig_state_to_child(child_slot: int32, parent_slot: uint64):
+    cs: uint64 = cast[uint64](child_slot)
+    i: uint64 = 0
+    while i < 64:
+        task_table[cs].sig_handlers[i] = task_table[parent_slot].sig_handlers[i]
+        task_table[cs].sig_flags[i]    = task_table[parent_slot].sig_flags[i]
+        i = i + 1
+    task_table[cs].sig_mask = task_table[parent_slot].sig_mask
+    # Pending set + in-handler state are NOT inherited — POSIX.
+    task_table[cs].sig_pending    = 0
+    task_table[cs].sig_in_handler = 0
+    task_table[cs].sig_saved_mask = 0
+    task_table[cs].sig_frame_uctx = 0
 
 
 # U31: read/write accessors for the per-task signal handler table.
@@ -1665,27 +1860,74 @@ def saved_user_rflags_ptr() -> Ptr[uint64]:
     return cast[Ptr[uint64]](kt - 16)
 
 
-# U31: signal trampoline. Lives in arch/x86/kernel/sigret_asm.S; we
+# §3: signal trampoline. Lives in arch/x86/kernel/sigret_asm.S; we
 # only ever take its address (planted into the saved-RIP slot to
 # retarget the next SYSRETQ).
 extern def sig_trampoline()
 
 
-# U31: layout of the signal frame pushed onto the user stack before
+# §3: Linux-ABI rt_sigframe layout built on the user stack before
 # redirecting user RIP to sig_trampoline.
 #
-# CRITICAL: the slot at [natural_rsp - 8] holds user's original R12,
-# because syscall_64.S's entry does `pushq %r12` to user RSP before
-# parking RSP at kstack_top-8. The matching final `popq %r12` at
-# SYSRETQ time reads that slot back. We MUST NOT overwrite it.
-# The frame layout below leaves that slot intact: the frame spans
-# [natural_rsp - 40 .. natural_rsp - 8), and we set the parked user
-# RSP to (frame_top - 8) so the final popq %r12 reads garbage into
-# %r12 (handlers save R12 themselves per SysV) and leaves RSP at
-# frame_top with signum at the top of the user stack.
+# The handler is invoked (via the trampoline) as the SysV-3-arg
+#   void handler(int signo, siginfo_t *info, void *ucontext)
+# matching glibc/musl's SA_SIGINFO contract. A handler installed
+# WITHOUT SA_SIGINFO simply ignores rsi/rdx — the one-arg form
+# void handler(int) is a strict prefix, so the same frame serves both.
+#
+# Frame layout on the user stack (low → high address):
+#
+#   trampoline RSP → signo        (popped → %rdi  — arg 1)
+#                    info_ptr     (popped → %rsi  — arg 2)
+#                    uc_ptr       (popped → %rdx  — arg 3)
+#                    handler      (popped → %rax  — call target)
+#                  ┌ siginfo_t    (SIGFRAME_SIGINFO_SZ bytes)
+#       info_ptr ──┘
+#                  ┌ ucontext_t   (SIGFRAME_UCTX_SZ bytes)
+#         uc_ptr ──┘
+#   (high)         original user RSP region — untouched
+#
+# rt_sigreturn reads the ucontext to restore RIP / RSP / RFLAGS and
+# the pre-handler signal mask, then resumes the interrupted code.
+#
+# Register fidelity: signals are only delivered at a syscall-return
+# boundary (do_syscall tail / yield_to_others). At that boundary the
+# x86_64 SysV syscall ABI already declares the caller-saved scratch
+# registers clobbered, so the ucontext's gpr slots for them carry 0 —
+# that is CORRECT for this delivery model. RIP / RSP / RFLAGS are the
+# load-bearing fields and ARE faithfully captured and restored.
+
+# struct sizes — generous fixed allocations (Linux's are 128 / ~256).
+SIGFRAME_SIGINFO_SZ: uint64 = 128
+SIGFRAME_UCTX_SZ:    uint64 = 256
+
+# uc_mcontext.gregs index of RSP / RIP / EFLAGS within the ucontext.
+# ucontext layout: uc_flags(0) uc_link(8) uc_stack(16,24B) then
+# uc_mcontext at offset 40. mcontext gregs[] starts at uc_mcontext+0.
+# gregs order: R8 R9 R10 R11 R12 R13 R14 R15 RDI RSI RBP RBX RDX RAX
+#              RCX RSP RIP EFL ... — so RSP is gregs[15], RIP gregs[16],
+# EFL gregs[17]. uc_sigmask follows the mcontext.
+#   UCTX_GREG_RSP_OFF = 40 + 15*8 = 160
+#   UCTX_GREG_RIP_OFF = 40 + 16*8 = 168
+#   UCTX_GREG_EFL_OFF = 40 + 17*8 = 176
+# (the Adder compiler requires literal global initializers — the
+#  arithmetic is spelled out in this comment, not the expression).
+#   UCTX_GREG_RAX_OFF = 40 + 13*8 = 144
+UCTX_MCONTEXT_OFF: uint64 = 40
+UCTX_GREG_RAX_OFF: uint64 = 144             # uc_mcontext.gregs[REG_RAX]
+UCTX_GREG_RSP_OFF: uint64 = 160             # uc_mcontext.gregs[REG_RSP]
+UCTX_GREG_RIP_OFF: uint64 = 168             # uc_mcontext.gregs[REG_RIP]
+UCTX_GREG_EFL_OFF: uint64 = 176             # uc_mcontext.gregs[REG_EFL]
+# uc_sigmask sits past the mcontext (gregs[23] + fpstate ptr + pad).
+# We park it at a fixed slot inside our generous 256-byte ucontext;
+# rt_sigreturn reads it back from the SAME offset, so the exact Linux
+# placement only matters to a handler that introspects uc_sigmask
+# (rare) — 200 leaves comfortable room after the 184-byte gregs array.
+UCTX_SIGMASK_OFF:  uint64 = 200
 
 
-def deliver_signal_to_user(sig: uint64, handler: uint64):
+def deliver_signal_to_user(sig: uint64, handler: uint64,
+                           sa_flags: uint64, syscall_rc: uint64):
     rip_slot: Ptr[uint64]    = saved_user_rip_ptr()
     rsp_slot: Ptr[uint64]    = saved_user_rsp_ptr()
     rflags_slot: Ptr[uint64] = saved_user_rflags_ptr()
@@ -1693,64 +1935,179 @@ def deliver_signal_to_user(sig: uint64, handler: uint64):
     saved_rip: uint64    = rip_slot[0]
     saved_rflags: uint64 = rflags_slot[0]
     user_rsp: uint64     = rsp_slot[0]
-    natural_rsp: uint64  = user_rsp + 8   # undo the pushq %r12
+    # syscall_64.S's entry stub does `pushq %r12` on the user stack
+    # then parks (user_rsp - 8). Undo that to recover the natural RSP
+    # the interrupted user code expects to resume on.
+    natural_rsp: uint64  = user_rsp + 8
 
-    # Frame layout (low to high address):
-    #   frame_top + 0   = signum            (popped -> %rdi)
-    #   frame_top + 8   = handler addr      (popped -> %rax)
-    #   frame_top + 16  = saved user RIP    (consumed by _u_rt_sigreturn)
-    #   frame_top + 24  = saved user RFLAGS (consumed by _u_rt_sigreturn)
-    #   [natural_rsp - 8] = user R12 stashed by syscall_64.S — UNTOUCHED
-    frame_top: uint64 = natural_rsp - 40
-    cast[Ptr[uint64]](frame_top)[0]      = sig
-    cast[Ptr[uint64]](frame_top + 8)[0]  = handler
-    cast[Ptr[uint64]](frame_top + 16)[0] = saved_rip
-    cast[Ptr[uint64]](frame_top + 24)[0] = saved_rflags
+    # x86_64 ABI: leave a 128-byte red zone below the interrupted RSP
+    # untouched — the user code may have live data there.
+    base: uint64 = natural_rsp - 128
+
+    # Carve the ucontext and siginfo below the red zone, then the
+    # 4-slot pop area. Keep everything 16-byte aligned so the handler
+    # sees a SysV-correct stack (callq inside the trampoline pushes 8,
+    # so the pop-area top must be 16-aligned).
+    uc_ptr:   uint64 = (base - SIGFRAME_UCTX_SZ) & ~cast[uint64](15)
+    info_ptr: uint64 = (uc_ptr - SIGFRAME_SIGINFO_SZ) & ~cast[uint64](15)
+    pop_top:  uint64 = (info_ptr - 32) & ~cast[uint64](15)
+
+    # --- zero-fill siginfo + ucontext -------------------------------
+    zi: uint64 = 0
+    while zi < SIGFRAME_SIGINFO_SZ:
+        cast[Ptr[uint8]](info_ptr + zi)[0] = 0
+        zi = zi + 1
+    zu: uint64 = 0
+    while zu < SIGFRAME_UCTX_SZ:
+        cast[Ptr[uint8]](uc_ptr + zu)[0] = 0
+        zu = zu + 1
+
+    # --- siginfo_t: si_signo / si_code -------------------------------
+    # struct siginfo { int si_signo; int si_errno; int si_code; ... }.
+    # si_code = SI_KERNEL (0x80) — "sent by the kernel". A handler that
+    # consults si_code (e.g. to tell a kill() from a fault) gets a
+    # defensible answer; si_pid / si_uid stay 0.
+    cast[Ptr[uint32]](info_ptr)[0]     = cast[uint32](sig)   # si_signo
+    cast[Ptr[uint32]](info_ptr + 8)[0] = cast[uint32](128)   # si_code
+
+    # --- ucontext_t: capture the resumption state --------------------
+    cur: uint64 = current_idx
+    cast[Ptr[uint64]](uc_ptr + UCTX_GREG_RSP_OFF)[0] = natural_rsp
+    cast[Ptr[uint64]](uc_ptr + UCTX_GREG_RIP_OFF)[0] = saved_rip
+    cast[Ptr[uint64]](uc_ptr + UCTX_GREG_EFL_OFF)[0] = saved_rflags
+    # %rax holds the interrupted syscall's return value. rt_sigreturn
+    # restores it so the interrupted code sees the syscall result it
+    # expects — without this, the rt_sigreturn syscall's own return
+    # value (0) would leak into the resumed code's %rax and a write()
+    # that failed with -EPIPE would look like it returned 0.
+    cast[Ptr[uint64]](uc_ptr + UCTX_GREG_RAX_OFF)[0] = syscall_rc
+    # uc_sigmask: the blocked-signal set in effect when the handler is
+    # entered. rt_sigreturn restores sig_mask FROM this slot. Stored in
+    # USER sigset_t convention (signal N at bit N-1, kernel >> 1) so a
+    # handler that introspects uc_sigmask sees a correct Linux bitmap;
+    # rt_sigreturn shifts it back by 1 on the way in.
+    cast[Ptr[uint64]](uc_ptr + UCTX_SIGMASK_OFF)[0] = \
+        task_table[cur].sig_saved_mask >> 1
+
+    # --- pop area: signo / info_ptr / uc_ptr / handler ---------------
+    cast[Ptr[uint64]](pop_top)[0]      = sig
+    cast[Ptr[uint64]](pop_top + 8)[0]  = info_ptr
+    cast[Ptr[uint64]](pop_top + 16)[0] = uc_ptr
+    cast[Ptr[uint64]](pop_top + 24)[0] = handler
+
+    # Stash the ucontext address so rt_sigreturn can recover the
+    # interrupted RIP / RSP / RFLAGS / mask (it takes no syscall args).
+    task_table[cur].sig_frame_uctx = uc_ptr
 
     # Retarget the SYSRETQ:
     #   * user RIP <- sig_trampoline (kernel .text, U=1)
-    #   * user RSP <- frame_top - 8: syscall_64.S's final `popq %r12`
-    #     reads 8 bytes at this address into user R12 (irrelevant) and
-    #     leaves RSP at frame_top.
+    #   * user RSP <- pop_top - 8: syscall_64.S's final `popq %r12`
+    #     reads the 8 bytes BELOW the pop area into user %r12 (a
+    #     handler saves %r12 itself per SysV) and leaves RSP at
+    #     pop_top, where the trampoline's four pops begin.
     rip_slot[0] = cast[uint64](&sig_trampoline)
-    rsp_slot[0] = frame_top - 8
+    rsp_slot[0] = pop_top - 8
 
 
-def signal_check_and_handle():
-    # If a signal is pending on the current task: if a user handler is
-    # installed (U31 — sig_handlers[sig] != 0), redirect the SYSRETQ
-    # iret slots so the handler runs in CPL=3 via sig_trampoline.
-    # Otherwise terminate the task with exit code 128+sig (POSIX).
+def signal_dispatch(syscall_rc: uint64, allow_handler: int32):
+    # Deliver the highest-priority pending+unblocked signal on the
+    # current task. SIG_DFL (handler 0) → terminate 128+sig; SIG_IGN
+    # (handler 1) → drop; a real handler → rt_sigframe + redirect.
     #
     # Lowest-numbered pending signal wins (POSIX): SIGINT (2) outranks
-    # SIGTERM (15) if both somehow land before the task notices.
-    pending: uint64 = task_table[current_idx].sig_pending
+    # SIGTERM (15) if both land before the task notices.
+    #
+    # syscall_rc — the return value of the syscall whose tail we are
+    #   running at. Stashed into the rt_sigframe's %rax slot so
+    #   rt_sigreturn restores the interrupted code's %rax correctly.
+    # allow_handler — 1 ⇒ user-handler delivery is permitted (only the
+    #   do_syscall exit-side check, which knows the real syscall_rc,
+    #   passes 1). 0 ⇒ only the default-terminate disposition acts;
+    #   a pending user-handler signal stays latched for the exit check
+    #   (which has the correct %rax). This keeps the entry-side and
+    #   mid-syscall (yield_to_others) checks from building a frame with
+    #   a wrong %rax — SIG_DFL termination needs no %rax so it is
+    #   always safe.
+    cur: uint64 = current_idx
+    pending: uint64 = task_table[cur].sig_pending
     if pending == 0:
         return
+    # A handler already in flight on this syscall-return frame? Do not
+    # stack a second frame on top — that would corrupt the first
+    # handler's saved context. The pending signal stays latched and is
+    # delivered after the in-flight handler's rt_sigreturn.
+    if task_table[cur].sig_in_handler != 0:
+        return
+    mask: uint64 = task_table[cur].sig_mask
     s: uint64 = 1
     while s < 64:
         bit: uint64 = cast[uint64](1) << s
+        # SIGKILL is uncatchable AND unblockable — it bypasses the mask
+        # entirely. Every other signal that the task has blocked stays
+        # latched in sig_pending and is skipped here.
         if (pending & bit) != 0:
-            # Clear the bit before dispatching so a stale value doesn't
-            # confuse anything that inspects the task post-mortem AND
-            # so a re-entrant handler issuing another syscall doesn't
-            # keep re-triggering off the same bit.
-            task_table[current_idx].sig_pending = pending & ~bit
-            handler: uint64 = task_table[current_idx].sig_handlers[s]
-            # SIGKILL (9) is uncatchable. SIG_DFL is handler == 0;
-            # SIG_IGN is conventionally 1. We treat any value < 16 as
-            # "not a real address" and fall back to default-terminate.
-            if s == SIGKILL or handler == 0 or handler == 1:
-                task_exit_current(cast[int64](128) + cast[int64](s))
-                return                                # not reached
-            # Real user handler: only redirect if we're in a user task.
-            # Kernel threads have no iret frame; treat as default-term.
-            if task_table[current_idx].is_user == 0:
-                task_exit_current(cast[int64](128) + cast[int64](s))
+            if s == SIGKILL or (mask & bit) == 0:
+                handler: uint64 = task_table[cur].sig_handlers[s]
+                # SIGKILL is uncatchable. SIG_DFL is handler == 0;
+                # SIG_IGN is conventionally 1. Values < 16 are not real
+                # addresses → fall back to default-terminate. Kernel
+                # threads have no iret frame, so they always default.
+                is_default: int32 = 0
+                if s == SIGKILL or handler == 0 or handler == 1 \
+                        or task_table[cur].is_user == 0:
+                    is_default = 1
+                if is_default != 0:
+                    # Clear the bit; the disposition is resolved here.
+                    task_table[cur].sig_pending = \
+                        task_table[cur].sig_pending & ~bit
+                    if handler == 1 and s != SIGKILL:
+                        # SIG_IGN: drop silently, keep scanning.
+                        s = s + 1
+                        continue
+                    task_table[cur].term_sig = s
+                    task_exit_current(cast[int64](128) + cast[int64](s))
+                    return                            # not reached
+                # Real user handler. Defer it to the exit-side check
+                # if this caller cannot supply the syscall return value
+                # (entry / mid-syscall yield) — leaving the bit latched.
+                if allow_handler == 0:
+                    return
+                # Clear the bit before dispatching so a handler issuing
+                # another syscall doesn't re-trigger off it.
+                task_table[cur].sig_pending = \
+                    task_table[cur].sig_pending & ~bit
+                # Build the blocked-mask the handler runs under: the
+                # pre-handler mask, plus this signal itself (unless
+                # SA_NODEFER).
+                sa_flags: uint64 = task_table[cur].sig_flags[s]
+                task_table[cur].sig_saved_mask = mask
+                new_mask: uint64 = mask
+                if (sa_flags & SA_NODEFER) == 0:
+                    new_mask = new_mask | bit
+                set_task_sig_mask(cur, new_mask)
+                task_table[cur].sig_in_handler = 1
+                deliver_signal_to_user(s, handler, sa_flags, syscall_rc)
                 return
-            deliver_signal_to_user(s, handler)
-            return
         s = s + 1
+
+
+def signal_check_and_handle():
+    # Terminate-only signal check. Used by the do_syscall ENTRY-side
+    # probe and by yield_to_others (mid-syscall): a SIG_DFL signal
+    # terminates the task promptly, but a user-handler signal is left
+    # latched for signal_deliver_on_return — which knows the real
+    # syscall %rax. Kept as the historical no-arg name so existing
+    # callers in the trap / yield paths need no change.
+    signal_dispatch(0, 0)
+
+
+def signal_deliver_on_return(syscall_rc: uint64) -> uint64:
+    # do_syscall exit-side delivery. Knows the syscall's return value,
+    # so it can build a faithful rt_sigframe (correct %rax) and is the
+    # ONLY caller permitted to deliver a user handler. Returns the
+    # syscall_rc unchanged so do_syscall can `return` it directly.
+    signal_dispatch(syscall_rc, 1)
+    return syscall_rc
 
 
 def signal_post_to_foreground(sig: uint64):

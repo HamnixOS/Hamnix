@@ -110,6 +110,13 @@ from kernel.sched.core import (
     set_task_fs_base, set_task_clear_child_tid,
     count_live_linux_peers, yield_to_others,
     get_task_sig_handler, set_task_sig_handler,
+    get_task_sig_mask, set_task_sig_mask,
+    get_task_sig_flags, set_task_sig_flags,
+    get_task_sig_in_handler, set_task_sig_in_handler,
+    get_task_sig_saved_mask, set_task_sig_saved_mask,
+    get_task_sig_frame_uctx, set_task_sig_frame_uctx,
+    UCTX_GREG_RAX_OFF, UCTX_GREG_RSP_OFF, UCTX_GREG_RIP_OFF,
+    UCTX_GREG_EFL_OFF, UCTX_SIGMASK_OFF, SIGPIPE, SIGCHLD,
     get_task_comm_ptr, set_task_pdeathsig,
     saved_user_rip_ptr, saved_user_rsp_ptr, saved_user_rflags_ptr,
     get_task_alt_stack_sp, set_task_alt_stack_sp,
@@ -378,6 +385,10 @@ SYS_setsid:          uint64 = 112
 SYS_getpgid:         uint64 = 121
 SYS_getsid:          uint64 = 124
 SYS_gettid:          uint64 = 186
+# §3: tkill(tid, sig) — the pre-tgkill single-arg kill-by-tid call.
+# musl's raise(3) issues tkill(gettid(), sig), so the full signal
+# surface needs it wired even though tgkill (234) is the modern form.
+SYS_tkill:           uint64 = 200
 SYS_tgkill:          uint64 = 234
 # U37: sigaltstack — glibc reaches for this during static-PIE signal
 # setup so a SIGSEGV handler can land on a known-good page if the
@@ -414,6 +425,7 @@ ELINUX_ADDRINUSE:    int64 = -98    # EADDRINUSE — bind port already in use
 # U-TLS: extra errnos the tls_connect(2) bridge surfaces.
 ELINUX_BUSY:         int64 = -16    # EBUSY — a TLS session is already live
 ELINUX_PROTO:        int64 = -71    # EPROTO — TLS handshake / cert validation failed
+ELINUX_PIPE:         int64 = -32    # EPIPE — write to a pipe / socket with no reader
 
 
 # =====================================================================
@@ -536,8 +548,19 @@ def _u_read(a0: uint64, a1: uint64, a2: uint64,
 def _u_write(a0: uint64, a1: uint64, a2: uint64,
              a3: uint64, a4: uint64, a5: uint64) -> int64:
     # ssize_t write(int fd, const void *buf, size_t count)
+    #
+    # §3: SIGPIPE. A write whose destination pipe / socket has no
+    # remaining reader fails with -EPIPE in vfs_write; POSIX also
+    # requires a SIGPIPE be raised in the writer. We post it to the
+    # current task's sig_pending — signal_check_and_handle at the
+    # do_syscall tail then either terminates the task (SIG_DFL, the
+    # daemon-friendly "broken connection ⇒ die" default) or invokes
+    # the installed handler. Either way write(2) still returns -EPIPE,
+    # so a daemon that ignores SIGPIPE sees the errno and copes.
     n: int64 = vfs_write(cast[int32](a0),
                          cast[Ptr[uint8]](a1), a2)
+    if n == ELINUX_PIPE:
+        signal_post(current_idx_get(), SIGPIPE)
     return n
 
 
@@ -1677,7 +1700,13 @@ def _u_sendto(a0: uint64, a1: uint64, a2: uint64,
     # FD_SOCKET_MARK arm routes the bytes through tcp_send.
     if vfs_fd_is_socket(cast[int32](a0)) == 0:
         return ELINUX_BADF
-    return vfs_write(cast[int32](a0), cast[Ptr[uint8]](a1), a2)
+    # §3: SIGPIPE on a send to a peer that has gone away — same
+    # contract as write(2). vfs_write's FD_SOCKET_MARK arm returns
+    # -EPIPE when the TCP slot is CLOSED / unconnected.
+    sn: int64 = vfs_write(cast[int32](a0), cast[Ptr[uint8]](a1), a2)
+    if sn == ELINUX_PIPE:
+        signal_post(current_idx_get(), SIGPIPE)
+    return sn
 
 
 def _u_recvfrom(a0: uint64, a1: uint64, a2: uint64,
@@ -2149,32 +2178,40 @@ def _u_rt_sigaction(a0: uint64, a1: uint64, a2: uint64,
     #                  struct sigaction *oldact, size_t sigsetsize).
     #
     # Kernel struct sigaction (on x86_64):
-    #   off  0: void (*sa_handler)(int)
-    #   off  8: int sa_flags  (+ 4 bytes pad)
+    #   off  0: void (*sa_handler)(int)   / sa_sigaction
+    #   off  8: unsigned long sa_flags
     #   off 16: void (*sa_restorer)(void)
     #   off 24: sigset_t sa_mask (a3 bytes — typically 8 from musl)
     #
     # Musl allocates a tight 32-byte kernel-sigaction buffer (8-byte
     # mask), so we MUST NOT write past offset 24 + a3 of oldact: an
     # unconditional 152-byte memset clobbers the caller's stack frame
-    # and trips the stack canary check on return — that's the RIP=0x3
-    # trap observed at U31's signal() bring-up.
+    # and trips the stack canary check on return.
     #
-    # We just write the previous sa_handler (8 bytes at offset 0) to
-    # oldact, leave the rest of the user's buffer untouched, and
-    # record the new sa_handler from act. sa_flags / sa_restorer /
-    # sa_mask are accepted but not enforced — Hamnix's signal
-    # delivery is single-signal-at-a-time and uses a kernel-resident
-    # trampoline (sig_trampoline) for the SA_RESTORER handshake.
+    # We record sa_handler + sa_flags per signal. sa_flags drives the
+    # handler-argument shape (SA_SIGINFO) and the auto-block of the
+    # delivered signal (SA_NODEFER) in signal_check_and_handle.
+    # SIGKILL (9) and SIGSTOP (19) cannot have a handler installed —
+    # rt_sigaction on either returns -EINVAL, matching Linux.
     sig: uint64 = a0
     if sig == 0 or sig >= 64:
         return ELINUX_INVAL
+    if sig == 9 or sig == 19:                             # SIGKILL/SIGSTOP
+        return ELINUX_INVAL
+    slot: uint64 = current_idx_get()
     if a2 != 0:
-        prev: uint64 = get_task_sig_handler(current_idx_get(), sig)
-        cast[Ptr[uint64]](a2)[0] = prev
+        prev: uint64 = get_task_sig_handler(slot, sig)
+        prev_fl: uint64 = get_task_sig_flags(slot, sig)
+        # Write only the first 16 bytes (sa_handler + sa_flags). The
+        # caller's sa_restorer / sa_mask slots are left as the caller
+        # initialised them — they are inputs to us, not outputs.
+        cast[Ptr[uint64]](a2)[0]     = prev
+        cast[Ptr[uint64]](a2 + 8)[0] = prev_fl
     if a1 != 0:
         new_handler: uint64 = cast[Ptr[uint64]](a1)[0]
-        set_task_sig_handler(current_idx_get(), sig, new_handler)
+        new_flags:   uint64 = cast[Ptr[uint64]](a1 + 8)[0]
+        set_task_sig_handler(slot, sig, new_handler)
+        set_task_sig_flags(slot, sig, new_flags)
     return 0
 
 
@@ -2182,15 +2219,45 @@ def _u_rt_sigprocmask(a0: uint64, a1: uint64, a2: uint64,
                       a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int rt_sigprocmask(int how, const sigset_t *set, sigset_t *oldset,
     #                    size_t sigsetsize).
-    # U31: no per-task mask state yet — signal_check_and_handle delivers
-    # every pending signal unconditionally. Accept the call so libc
-    # bring-up doesn't bail; oldset (if requested) is zeroed which means
-    # "no signals masked" — a defensible answer at this scale.
-    if a2 != 0 and a3 != 0:
-        n: uint64 = a3
-        if n > 128:
-            n = 128                                       # cap defensively
-        memset(cast[Ptr[uint8]](a2), 0, n)
+    #
+    # §3: real per-task signal-mask state. signal_check_and_handle
+    # consults sig_mask and skips any pending-but-blocked signal
+    # (SIGKILL excepted — uncatchable AND unblockable). how:
+    #   SIG_BLOCK   (0) — mask |= *set
+    #   SIG_UNBLOCK (1) — mask &= ~*set
+    #   SIG_SETMASK (2) — mask  = *set
+    # *set / *oldset are 64-bit sigset_t bitmaps (musl/glibc pass 8).
+    #
+    # BIT CONVENTION: a Linux userspace sigset_t encodes signal N at
+    # bit (N-1). The kernel's internal sig_mask / sig_pending bitmaps
+    # use bit N directly (so `1 << sig` indexes signal sig). We bridge
+    # the two with a 1-bit shift at this boundary: kernel = user << 1,
+    # user = kernel >> 1.
+    SIG_BLOCK:   uint64 = 0
+    SIG_UNBLOCK: uint64 = 1
+    SIG_SETMASK: uint64 = 2
+    slot: uint64 = current_idx_get()
+    old_k: uint64 = get_task_sig_mask(slot)              # kernel-convention
+    # oldset first — POSIX returns the PRE-call mask even when set!=0.
+    # Convert kernel (bit N) → user (bit N-1).
+    if a2 != 0:
+        cast[Ptr[uint64]](a2)[0] = old_k >> 1
+    if a1 != 0:
+        # Convert user (bit N-1) → kernel (bit N).
+        want_k: uint64 = cast[Ptr[uint64]](a1)[0] << 1
+        new_mask: uint64 = old_k
+        if a0 == SIG_BLOCK:
+            new_mask = old_k | want_k
+        elif a0 == SIG_UNBLOCK:
+            new_mask = old_k & ~want_k
+        elif a0 == SIG_SETMASK:
+            new_mask = want_k
+        else:
+            return ELINUX_INVAL
+        # set_task_sig_mask force-clears SIGKILL/SIGSTOP — those can
+        # never be blocked, so a SIG_BLOCK including them is silently
+        # narrowed, exactly as Linux does.
+        set_task_sig_mask(slot, new_mask)
     return 0
 
 
@@ -2199,37 +2266,58 @@ def _u_rt_sigreturn(a0: uint64, a1: uint64, a2: uint64,
     # void rt_sigreturn(void).
     #
     # Reached via sig_trampoline (arch/x86/kernel/sigret_asm.S) after a
-    # user signal handler returns. At entry the user stack looks like
+    # user signal handler returns. The ucontext built by
+    # deliver_signal_to_user holds the interrupted RIP / RSP / RFLAGS
+    # and the pre-handler signal mask; its address was stashed in the
+    # task's sig_frame_uctx slot (rt_sigreturn takes no syscall args,
+    # so it cannot be passed in a register).
     #
-    #   (low)  RSP -> saved-RIP    (the original post-kill user RIP)
-    #          RSP+8 -> saved-RFLAGS
-    #
-    # We rewrite the kernel-side iret slots parked by syscall_64.S at
-    # kstack_top-24 / -16 so this very syscall returns to the original
-    # post-kill RIP/RFLAGS instead of into the trampoline's hang loop.
-    # The user RSP slot is reset to point AT the user's R12-save slot
-    # so the matching final `popq %r12` reads back the original user
-    # R12 (we preserved that slot in deliver_signal_to_user).
-    rsp_slot: Ptr[uint64]    = saved_user_rsp_ptr()
+    # We rewrite the iret-return slots parked by syscall_64.S at
+    # kstack_top-24 / -16 / -8 so the SYSRETQ closing this very syscall
+    # lands back on the interrupted user instruction with the original
+    # stack and flags, restore the signal mask, and clear the
+    # in-handler flag so the next pending signal can be delivered.
+    slot: uint64 = current_idx_get()
+    uc: uint64 = get_task_sig_frame_uctx(slot)
+    if uc == 0:
+        # Stray rt_sigreturn — never entered a handler. Leave the iret
+        # slots alone (the syscall just returns normally) and report
+        # 0; a misbehaving binary that did this gets undefined-but-
+        # contained behaviour rather than a kernel fault.
+        return 0
+    saved_rip:    uint64 = cast[Ptr[uint64]](uc + UCTX_GREG_RIP_OFF)[0]
+    saved_rsp:    uint64 = cast[Ptr[uint64]](uc + UCTX_GREG_RSP_OFF)[0]
+    saved_rflags: uint64 = cast[Ptr[uint64]](uc + UCTX_GREG_EFL_OFF)[0]
+    saved_rax:    uint64 = cast[Ptr[uint64]](uc + UCTX_GREG_RAX_OFF)[0]
+    # uc_sigmask is stored in USER sigset_t convention (bit N-1); the
+    # kernel sig_mask uses bit N — shift back by 1. A handler that
+    # mutated uc_sigmask in place changes the resumed mask, exactly as
+    # Linux's rt_sigreturn semantics promise.
+    saved_mask:   uint64 = cast[Ptr[uint64]](uc + UCTX_SIGMASK_OFF)[0] << 1
+
     rip_slot: Ptr[uint64]    = saved_user_rip_ptr()
+    rsp_slot: Ptr[uint64]    = saved_user_rsp_ptr()
     rflags_slot: Ptr[uint64] = saved_user_rflags_ptr()
-    # syscall_64.S parks (user_rsp - 8) — undo here. tramp_rsp is the
-    # user RSP at the moment sig_trampoline issued SYS_rt_sigreturn,
-    # which is the address of the saved-RIP slot in our frame.
-    tramp_rsp: uint64 = rsp_slot[0] + 8
-    saved_rip: uint64    = cast[Ptr[uint64]](tramp_rsp)[0]
-    saved_rflags: uint64 = cast[Ptr[uint64]](tramp_rsp + 8)[0]
-    # natural_rsp = tramp_rsp + 24: 16 bytes for the saved RIP+RFLAGS
-    # words we just consumed, plus 8 more to clear the R12-save slot
-    # the entry stub had stashed at [natural_rsp - 8] — that's where
-    # we want the matching popq %r12 to read from, so set the parked
-    # user RSP to (natural_rsp - 8).
     rip_slot[0]    = saved_rip
     rflags_slot[0] = saved_rflags
-    rsp_slot[0]    = tramp_rsp + 16
-    # Return value is discarded: the user RIP we resume to is the
-    # post-kill caller, not a sigreturn caller. 0 is conventional.
-    return 0
+    # syscall_64.S's exit does `popq %r12` then `sysretq`, consuming 8
+    # bytes off the parked RSP slot. deliver_signal_to_user accounted
+    # for the same 8-byte skew on the way IN; undo it here so the
+    # interrupted code resumes on its natural RSP.
+    rsp_slot[0]    = saved_rsp - 8
+
+    # Restore the pre-handler mask and release the in-handler latch so
+    # the exit-side delivery (which runs at this syscall's tail) can
+    # deliver any signal that arrived while the handler ran.
+    set_task_sig_mask(slot, saved_mask)
+    set_task_sig_saved_mask(slot, 0)
+    set_task_sig_in_handler(slot, 0)
+    set_task_sig_frame_uctx(slot, 0)
+    # CRITICAL: return the INTERRUPTED syscall's %rax. do_syscall puts
+    # our return value into the caller's %rax; the interrupted code
+    # resumes expecting its own syscall's result there (e.g. a write()
+    # that failed with -EPIPE). Returning 0 would corrupt that.
+    return cast[int64](saved_rax)
 
 
 def _u_prctl(a0: uint64, a1: uint64, a2: uint64,
@@ -2378,6 +2466,10 @@ def _u_writev(a0: uint64, a1: uint64, a2: uint64,
             continue
         n: int64 = vfs_write(fd, cast[Ptr[uint8]](base), len)
         if n < 0:
+            # §3: SIGPIPE if the underlying pipe / socket broke —
+            # same contract as write(2)/sendto(2).
+            if n == ELINUX_PIPE:
+                signal_post(current_idx_get(), SIGPIPE)
             if total == 0:
                 return n                                  # propagate errno
             return total                                  # short write
@@ -3159,6 +3251,21 @@ def _u_gettid(a0: uint64, a1: uint64, a2: uint64,
     return cast[int64](current_task_pid())
 
 
+def _u_tkill(a0: uint64, a1: uint64, a2: uint64,
+             a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # int tkill(pid_t tid, int sig)
+    # §3: the single-arg kill-by-tid syscall. musl's raise(3) uses it
+    # (raise → tkill(gettid(), sig)). Lookup by tid (a0), post to the
+    # target's sig_pending; delivery happens at the target's next
+    # syscall boundary / yield (self-targeted raises deliver at this
+    # syscall's own tail in do_syscall).
+    tgt: int32 = task_lookup_by_pid(a0)
+    if tgt < 0:
+        return ELINUX_SRCH
+    signal_post(cast[uint64](tgt), a1)
+    return 0
+
+
 def _u_tgkill(a0: uint64, a1: uint64, a2: uint64,
               a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int tgkill(pid_t tgid, pid_t tid, int sig)
@@ -3866,6 +3973,8 @@ def linux_u_syscall_dispatch(nr: uint64,
     # comments below for the single-task answers.
     if nr == SYS_gettid:
         return _u_gettid(a0, a1, a2, a3, a4, a5)
+    if nr == SYS_tkill:
+        return _u_tkill(a0, a1, a2, a3, a4, a5)
     if nr == SYS_tgkill:
         return _u_tgkill(a0, a1, a2, a3, a4, a5)
     if nr == SYS_setsid:

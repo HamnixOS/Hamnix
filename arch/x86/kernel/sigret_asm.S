@@ -1,5 +1,5 @@
 /*
- * arch/x86/kernel/sigret_asm.S - U31 user-mode signal trampoline.
+ * arch/x86/kernel/sigret_asm.S - §3 user-mode signal trampoline.
  *
  * Runs at CPL=3. Hamnix's 1 GiB identity map carries US=1 on every
  * PDPT entry (arch/x86/boot/header.S), so kernel .text is directly
@@ -10,49 +10,55 @@
  *
  * Contract with deliver_signal_to_user() in kernel/sched/core.ad:
  *
- *   At trampoline entry, the user stack looks like
+ *   At trampoline entry the user stack holds a 4-quad "pop area"
+ *   built by deliver_signal_to_user, with the full siginfo_t and
+ *   ucontext_t carved just above it:
  *
- *       (low)  RSP -> signum              <- first quad of our frame
- *              RSP+8 -> handler addr
- *              RSP+16-> saved user RIP
- *              RSP+24-> saved user RFLAGS
- *       (high)
+ *       (low)  RSP -> signo        <- arg 1, popped into %rdi
+ *              RSP+8  -> info_ptr  <- arg 2, popped into %rsi
+ *              RSP+16 -> uc_ptr    <- arg 3, popped into %rdx
+ *              RSP+24 -> handler   <- call target, popped into %rax
+ *       (high) siginfo_t / ucontext_t (read by an SA_SIGINFO handler
+ *                                      and by rt_sigreturn)
  *
  *   syscall_64.S parks user RSP at (natural_user_rsp - 8) on entry —
  *   the pushq %r12 of the entry stub consumed those 8 bytes — and the
  *   matching popq %r12 at exit lifts RSP back up by 8 before SYSRETQ
  *   resumes user mode. deliver_signal_to_user accounts for that by
- *   writing rsp_slot[0] = frame_top - 8: the final popq %r12 reads
- *   the 8 bytes BELOW our frame (the value loaded into user %r12 is
- *   irrelevant — handlers save R12 themselves per SysV) and RSP ends
- *   up at frame_top with signum at the top of the stack.
+ *   writing rsp_slot[0] = pop_top - 8: the final popq %r12 reads the
+ *   8 bytes BELOW the pop area (the value loaded into user %r12 is
+ *   irrelevant — a SysV handler saves %r12 itself) and RSP ends up at
+ *   pop_top with `signo` at the top of the stack.
  *
  *   On entry:
- *     %rdi: caller's %rdi as restored by syscall_64.S's ABI-correct
- *           exit path (syscall_64.S no longer zeroes %rdi). Its
- *           value here is irrelevant: the `popq %rdi` below
- *           immediately overwrites it with `signum` from our frame.
- *     %rsi..%r11: per the SYSRETQ contract — caller-saved, may carry
- *                stale syscall-return scratch values
+ *     %rdi..%r11: per the SYSRETQ contract — caller-saved, may carry
+ *                stale syscall-return scratch values. The four pops
+ *                below overwrite %rdi/%rsi/%rdx/%rax with our frame
+ *                values before the handler runs.
  *     RFLAGS: 0x202 (IF=1, reserved bit), forced by SYSRETQ
  *
  *   The trampoline:
- *     1. pops signum into %rdi (SysV first arg to the handler)
- *     2. pops the handler addr into %rax
+ *     1. pops signo / info_ptr / uc_ptr / handler into
+ *        %rdi / %rsi / %rdx / %rax — the SysV 3-arg handler ABI
+ *          void handler(int signo, siginfo_t *info, void *ucontext)
+ *        A non-SA_SIGINFO handler `void handler(int)` simply ignores
+ *        %rsi/%rdx — the 1-arg form is a strict prefix of the 3-arg.
  *     3. calls *%rax  -- the user's signal handler
  *     4. on return, invokes SYS_rt_sigreturn (Linux nr 15). The kernel
- *        side (linux_abi/u_syscalls.ad::_u_rt_sigreturn) restores the
- *        saved RIP/RFLAGS into the iret slot and SYSRETQs to the
- *        original post-kill user instruction.
+ *        side (linux_abi/u_syscalls.ad::_u_rt_sigreturn) reads the
+ *        ucontext to restore RIP / RSP / RFLAGS and the pre-handler
+ *        signal mask, then SYSRETQs to the interrupted instruction.
  *
- *   Stack alignment: SysV requires RSP%16 == 0 at the *call site* of
- *   the handler. The natural user RSP at kill() entry is 16-aligned
- *   (musl's `kill` wrapper does no stack work besides `syscall`), so
- *   `natural - 32` (our frame_top) is still 16-aligned. After the two
- *   popq's RSP is at frame_top + 16, which is 16-aligned. `callq`
- *   pushes 8 bytes of return-address -> RSP%16 == 8 at the entry of
- *   the handler — which is exactly what SysV requires (the called
- *   function sees RSP+8 as 16-aligned).
+ *   Stack alignment: deliver_signal_to_user 16-aligns pop_top. After
+ *   the four popq's RSP is at pop_top + 32, still 16-aligned. `callq`
+ *   pushes 8 bytes of return-address → RSP%16 == 8 at the handler's
+ *   first instruction — exactly what SysV requires.
+ *
+ *   After the handler returns, RSP is back at pop_top + 32. The
+ *   ucontext that rt_sigreturn consults lives ABOVE that — its pointer
+ *   was passed in %rdx and the kernel parked a copy of the address it
+ *   needs; rt_sigreturn recovers the frame purely from the parked
+ *   kstack slots, so the trampoline does not need to preserve %rdx.
  */
 
     .code64
@@ -61,34 +67,35 @@
     .align 16
     .globl sig_trampoline
 sig_trampoline:
-    /* %rdi <- signum (SysV first arg). */
+    /* %rdi <- signo (SysV arg 1). */
     popq    %rdi
 
-    /* %rax <- handler addr. We use %rax because the SysV caller-saved
-     * convention lets us trash it freely, and because `callq *%rax`
-     * is one byte shorter than the indirect form via memory. */
+    /* %rsi <- info_ptr (SysV arg 2 — siginfo_t *). */
+    popq    %rsi
+
+    /* %rdx <- uc_ptr (SysV arg 3 — ucontext *). */
+    popq    %rdx
+
+    /* %rax <- handler addr. %rax is caller-saved so we may trash it,
+     * and `callq *%rax` is one byte shorter than the memory form. */
     popq    %rax
 
-    /* Invoke the user handler. On return, RSP points at the saved-RIP
-     * slot (24 bytes into the original frame, 16 bytes after the two
-     * pops). */
+    /* Invoke the user handler: handler(signo, info, ucontext). */
     callq   *%rax
 
-    /* Tail-call into SYS_rt_sigreturn. The kernel side reads the
-     * 16-byte (rip + rflags) restore frame at RSP and rewrites the
-     * iret slot in syscall_64.S's parked area so the original
-     * post-kill user RIP runs next. We never come back from this
-     * syscall — _u_rt_sigreturn drains the frame, fixes up the
-     * saved-RIP/RFLAGS in kernel-stack slot kstack_top-24/-16, and
-     * returns 0; SYSRETQ then jumps to the rewritten RIP.
+    /* Tail-call into SYS_rt_sigreturn. The kernel side recovers the
+     * full rt_sigframe from the parked kstack slots, restores the
+     * interrupted RIP / RSP / RFLAGS and the pre-handler signal mask,
+     * and rewrites the iret-return slots so SYSRETQ lands back on the
+     * interrupted user instruction. We never return through this stub.
      *
      * Linux nr 15 = rt_sigreturn (asm-generic/unistd.h). */
     movq    $15, %rax
     syscall
 
     /* Unreachable. SYS_rt_sigreturn never returns through this stub —
-     * SYSRETQ lands on the original post-kill RIP. If something
-     * goes wrong (kernel bug), hang to make the failure visible
-     * instead of running off into arbitrary user memory. */
+     * SYSRETQ lands on the interrupted RIP. If something goes wrong
+     * (kernel bug), hang to make the failure visible instead of
+     * running off into arbitrary user memory. */
 .Lsig_tramp_hang:
     jmp     .Lsig_tramp_hang
