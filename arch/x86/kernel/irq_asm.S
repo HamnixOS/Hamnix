@@ -90,8 +90,24 @@ common_irq:
     pushq %r10
     pushq %r11
 
-    /* Vector is at %rsp + 72 (9 saved quads * 8 bytes). */
+    /* Stack layout right now (low -> high), 9 caller-saved quads
+     * pushed above the stub's vec/ec and the CPU's iret frame:
+     *    0..64  r11/r10/r9/r8/rdi/rsi/rdx/rcx/rax
+     *    72     vector       (pushed by the per-IRQ stub)
+     *    80     error_code   (fake 0, pushed by the stub)
+     *    88     rip          (pushed by the CPU)
+     *    96     cs           (pushed by the CPU)
+     *   104     rflags
+     *   112     rsp
+     *   120     ss
+     *
+     * arg1 (%rdi) = vector; arg2 (%rsi) = the interrupted CS. The
+     * preemption gate in timer_interrupt() inspects CS's low two
+     * bits: RPL 3 means the timer hit ring-3 (userland) code, which
+     * is the only context safe to preempt. Passing CS here keeps the
+     * ring test in C-level Adder rather than smearing it across asm. */
     movq  72(%rsp), %rdi
+    movq  96(%rsp), %rsi
     call  do_irq
 
     popq  %r11

@@ -360,6 +360,29 @@ task_table:  Array[16, TaskStruct]
 next_pid:    uint64 = 1
 current_idx: uint64 = 0                  # index into task_table
 
+# --- Preemption: per-task quantum -----------------------------------
+#
+# Before this change the timer ISR called schedule() on EVERY tick
+# (and, separately, the real workload never had two concurrent READY
+# user tasks, so it was effectively cooperative). Two problems with
+# "switch every tick": (a) it preempts kernel/IRQ context, which is
+# unsafe (a kthread mid-update of a shared structure), and (b) a 10 ms
+# round-robin slice is needlessly fine-grained.
+#
+# The quantum fixes both. SCHED_QUANTUM_TICKS is the number of 100 Hz
+# timer ticks a task is allowed to run before the timer ISR rotates
+# the runqueue. `quantum_left` counts down; preempt_tick() decrements
+# it on every tick and, when it hits zero AND the timer interrupted
+# ring-3 (userland) code AND another task is STATE_READY, performs the
+# context switch via the existing schedule() path.
+#
+# 5 ticks = 50 ms. Long enough that an interactive syscall-bound task
+# almost always blocks (and yields cooperatively) before its quantum
+# expires, so preemption only actually fires against a task that is
+# genuinely CPU-bound — exactly the starvation case we are closing.
+SCHED_QUANTUM_TICKS: uint64 = 5
+quantum_left:        uint64 = 5
+
 # Phase C / M16.98: monotonic id allocator for the Plan 9 rfork
 # note-group handle. Each call to alloc_note_group_id hands back the
 # next int32 and increments. There is no recycling — at NTASKS=16 the
@@ -850,6 +873,15 @@ def schedule():
     task_table[nxt].state = STATE_RUNNING
     current_idx = nxt
 
+    # Every actual context switch — preemptive OR cooperative — hands
+    # the incoming task a fresh full quantum. Without this a task that
+    # is dispatched right after another's quantum partly elapsed would
+    # inherit the stale (small) count and get preempted almost
+    # immediately. preempt_tick() also re-arms on the tick that drives
+    # a preemptive switch; resetting here additionally covers the
+    # cooperative yield_to_others / task_exit_current paths.
+    quantum_left = SCHED_QUANTUM_TICKS
+
     # Update RSP0 BEFORE the swap so a stray CPL-3 IRQ that happens
     # between this point and the next sysret/iretq still lands on
     # the right stack.
@@ -874,6 +906,62 @@ def schedule():
 
     __switch_to_asm(cast[Ptr[uint8]](&task_table[prev]),
                     cast[Ptr[uint8]](&task_table[nxt]))
+
+
+def _another_task_ready() -> uint64:
+    # Returns 1 if some slot OTHER than current_idx is STATE_READY —
+    # i.e. there is genuinely a runnable peer to preempt in favour of.
+    # schedule()/_pick_next would early-return when current is the
+    # only READY/RUNNING slot, so the timer ISR uses this to avoid the
+    # cost (and the EOI-ordering subtlety) of a no-op schedule() call.
+    i: uint64 = 0
+    while i < NTASKS:
+        if i != current_idx:
+            if task_table[i].state == STATE_READY:
+                return 1
+        i = i + 1
+    return 0
+
+
+def preempt_tick(from_user: uint64) -> uint64:
+    # Called once per 100 Hz timer tick from timer_interrupt(), AFTER
+    # the timer EOI has been sent. `from_user` is non-zero when the
+    # timer interrupted ring-3 (userland) code.
+    #
+    # Returns 1 if the caller should now perform a preemptive context
+    # switch (timer_interrupt() then calls schedule()); 0 otherwise.
+    # We do NOT call schedule() ourselves so the EOI-before-switch
+    # ordering stays visible at the timer_interrupt() call site.
+    #
+    # Preemption-point policy (V1): preempt ONLY when the timer caught
+    # the CPU in ring 3. Userland has no kernel locks held and no
+    # half-updated kernel state, so freezing it at an arbitrary
+    # instruction and resuming it later is always safe. Ring-0 context
+    # (kthreads, IRQ handlers, and — though SYSCALL masks IF so the
+    # timer can't normally fire there — syscall code) is treated as
+    # non-preemptible: the cooperative yields (yield_to_others on every
+    # blocking syscall, schedule() on exit) already cover it, and
+    # preempting arbitrary kernel code risks corrupting a lock or a
+    # partially-updated structure. A ring-0 tick therefore ages the
+    # quantum but never switches and never re-arms — so a ring-3 tick
+    # that lands after the quantum has already drained to 0 preempts
+    # on its very next occurrence.
+    if quantum_left > 0:
+        quantum_left = quantum_left - 1
+    if quantum_left != 0:
+        return 0
+    # Quantum exhausted. Only act on a ring-3 tick with a runnable peer.
+    if from_user == 0:
+        return 0
+    # On a ring-3 tick the quantum is spent; re-arm a fresh slice for
+    # whoever runs next. With no runnable peer there is nobody to
+    # switch to, so return 0 — but the re-arm still happens, so a peer
+    # that becomes READY mid-slice gets a fair full quantum of its own
+    # rather than being preempted into instantly.
+    quantum_left = SCHED_QUANTUM_TICKS
+    if _another_task_ready() == 0:
+        return 0
+    return 1
 
 
 def task_exit_current(code: int64):
