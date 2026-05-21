@@ -160,6 +160,200 @@ def pci_enable_io_and_master(bdf: uint32):
                            upper | cmd)
 
 
+# --- PCI capability list + MSI-X support ---------------------------
+#
+# Mirrors drivers/pci/pci.c::pci_find_capability() and
+# drivers/pci/msi.c. A PCI device that has anything beyond the
+# 64-byte standard header (MSI, MSI-X, power-management, PCIe, ...)
+# advertises it through a linked list of capability structures: the
+# Status register's bit 4 ("Capabilities List") says the list is
+# present, config offset 0x34 holds the byte offset of the first
+# capability, and each capability's second byte points at the next
+# one (0 terminates).
+#
+# This is the shared infrastructure §9 of the kernel roadmap needs:
+# virtio-net walks it to find MSI-X (cap ID 0x11) and route one
+# LAPIC vector per virtqueue; any future PCIe driver re-uses the
+# same walker. e1000e/r8169 carry their own private copies of this
+# logic for MSI (cap ID 0x05) — those predate this generic helper
+# and are left alone to avoid churning the net agent's files.
+
+PCI_STATUS_OFFSET:    uint32 = 0x06     # Status reg (high half of 0x04 dword)
+PCI_STATUS_CAP_LIST:  uint32 = 0x10     # bit 4 — capability list present
+PCI_CAP_PTR_OFFSET:   uint32 = 0x34     # first capability byte offset
+
+PCI_CAP_ID_MSI:       uint32 = 0x05
+PCI_CAP_ID_MSIX:      uint32 = 0x11
+
+# MSI-X capability layout (PCIe spec §7.7.2):
+#   +0  (u8)  capability ID (0x11)
+#   +1  (u8)  next-capability pointer
+#   +2  (u16) Message Control
+#               bits 0..10  Table Size minus one
+#               bit 14      Function Mask (1 = mask all vectors)
+#               bit 15      MSI-X Enable
+#   +4  (u32) Table   Offset/BIR  (low 3 bits = BAR index, rest = offset)
+#   +8  (u32) PBA     Offset/BIR
+MSIX_CTRL_OFFSET:     uint32 = 0x02
+MSIX_TABLE_OFFSET:    uint32 = 0x04
+MSIX_PBA_OFFSET:      uint32 = 0x08
+
+MSIX_CTRL_ENABLE:     uint32 = 0x8000   # Message Control bit 15
+MSIX_CTRL_FUNC_MASK:  uint32 = 0x4000   # Message Control bit 14
+MSIX_CTRL_TABLE_SIZE_MASK: uint32 = 0x07FF   # bits 0..10
+
+MSIX_BIR_MASK:        uint32 = 0x07     # low 3 bits select the BAR
+
+# Each MSI-X table entry is 16 bytes:
+#   +0  (u32) Message Address Low
+#   +4  (u32) Message Address High
+#   +8  (u32) Message Data
+#   +12 (u32) Vector Control   (bit 0 = Mask)
+MSIX_ENTRY_SIZE:      uint64 = 16
+MSIX_VECTOR_CTRL_MASK: uint32 = 0x01
+
+# x86 LAPIC MSI message-address window. Bits 31..20 are the fixed
+# 0xFEE prefix; the destination LAPIC id goes in bits 19..12.
+# Redirection-hint and destination-mode bits stay 0 (physical,
+# direct delivery to one LAPIC) — the same convention e1000e's MSI
+# path uses.
+PCI_MSI_ADDR_BASE:    uint64 = 0xFEE00000
+
+
+def pci_find_capability(bdf: uint32, cap_id: uint32) -> uint32:
+    # Walk the PCI capability list looking for `cap_id`. Returns the
+    # config-space byte offset of the matching capability header, or
+    # 0 if the device has no capability list or the cap is absent.
+    # 0 is a safe "not found" sentinel — config offset 0 always holds
+    # the vendor/device-id dword, never a capability header.
+    bus: uint32 = pci_bdf_bus(bdf)
+    dev: uint32 = pci_bdf_dev(bdf)
+    fn:  uint32 = pci_bdf_fn(bdf)
+
+    status: uint32 = pci_config_read_word(bus, dev, fn, PCI_STATUS_OFFSET)
+    if (status & PCI_STATUS_CAP_LIST) == 0:
+        return 0
+
+    cap_ptr: uint32 = pci_config_read_byte(bus, dev, fn,
+                                           PCI_CAP_PTR_OFFSET) & 0xFC
+    # Bound the walk: 256-byte config space holds at most 128 two-byte
+    # cap headers; 64 iterations is plenty and guards a circular list.
+    steps: uint32 = 0
+    while cap_ptr != 0 and steps < 64:
+        this_id: uint32 = pci_config_read_byte(bus, dev, fn, cap_ptr)
+        if this_id == cap_id:
+            return cap_ptr
+        cap_ptr = pci_config_read_byte(bus, dev, fn, cap_ptr + 1) & 0xFC
+        steps = steps + 1
+    return 0
+
+
+def pci_msix_table_size(bdf: uint32, cap_off: uint32) -> uint32:
+    # Number of MSI-X table entries the device supports. The Message
+    # Control register encodes (table_size - 1) in bits 0..10, so we
+    # read it and add one.
+    bus: uint32 = pci_bdf_bus(bdf)
+    dev: uint32 = pci_bdf_dev(bdf)
+    fn:  uint32 = pci_bdf_fn(bdf)
+    ctrl: uint32 = pci_config_read_word(bus, dev, fn,
+                                        cap_off + MSIX_CTRL_OFFSET)
+    return (ctrl & MSIX_CTRL_TABLE_SIZE_MASK) + 1
+
+
+def pci_bar_mem_base(bdf: uint32, bar_index: uint32) -> uint64:
+    # Resolve a MEM BAR to its physical base address. Handles both
+    # 32-bit and 64-bit MEM BARs (a 64-bit BAR's high half lives in
+    # the next BAR slot). The first 4 GiB are identity-mapped with
+    # 1 GiB pages by arch/x86/boot/header.S, so any MMIO base a QEMU
+    # virtio / PCIe device hands us under 4 GiB is directly
+    # dereferenceable without extra page-table work.
+    low: uint32 = pci_read_bar(bdf, bar_index)
+    if (low & 1) != 0:
+        # IO-space BAR — caller asked for the wrong kind.
+        return 0
+    # Bits 2..1 == 0b10 means a 64-bit MEM BAR.
+    base: uint64 = cast[uint64](low & 0xFFFFFFF0)
+    if (low & 0x6) == 0x4:
+        high: uint32 = pci_read_bar(bdf, bar_index + 1)
+        base = base | (cast[uint64](high) << 32)
+    return base
+
+
+def pci_msix_table_addr(bdf: uint32, cap_off: uint32) -> uint64:
+    # Resolve the virtual/physical address of the MSI-X table itself.
+    # The Table Offset/BIR dword names a BAR (low 3 bits) and a byte
+    # offset into it (the rest, with the low 3 bits masked off).
+    bus: uint32 = pci_bdf_bus(bdf)
+    dev: uint32 = pci_bdf_dev(bdf)
+    fn:  uint32 = pci_bdf_fn(bdf)
+    tbl: uint32 = pci_config_read_dword(bus, dev, fn,
+                                        cap_off + MSIX_TABLE_OFFSET)
+    bir: uint32 = tbl & MSIX_BIR_MASK
+    off: uint64 = cast[uint64](tbl & ~MSIX_BIR_MASK)
+    base: uint64 = pci_bar_mem_base(bdf, bir)
+    if base == 0:
+        return 0
+    return base + off
+
+
+def pci_msix_program_vector(table_addr: uint64, entry: uint32,
+                            cpu_vector: uint32, lapic_id: uint32):
+    # Program one MSI-X table entry to deliver `cpu_vector` to the
+    # LAPIC with id `lapic_id`. Message Address routes to the LAPIC
+    # MMIO window (physical destination, fixed delivery); Message
+    # Data carries the vector with edge trigger / fixed delivery
+    # (mode bits 0). The Vector Control Mask bit (bit 0) is CLEARED
+    # so the entry is live. Spec ordering: write address + data while
+    # masked, then clear the mask last — we write all four dwords in
+    # ascending order which satisfies that (vector control is last).
+    e: uint64 = table_addr + cast[uint64](entry) * MSIX_ENTRY_SIZE
+    addr_lo: uint32 = cast[uint32](PCI_MSI_ADDR_BASE & 0xFFFFFFFF) \
+                    | ((lapic_id & 0xFF) << 12)
+    data: uint32 = cpu_vector & 0xFF
+    cast[Ptr[uint32]](e +  0)[0] = addr_lo
+    cast[Ptr[uint32]](e +  4)[0] = 0                       # address high
+    cast[Ptr[uint32]](e +  8)[0] = data
+    cast[Ptr[uint32]](e + 12)[0] = 0                       # unmask (bit 0 = 0)
+
+
+def pci_msix_mask_vector(table_addr: uint64, entry: uint32):
+    # Re-mask one MSI-X table entry (set Vector Control bit 0).
+    e: uint64 = table_addr + cast[uint64](entry) * MSIX_ENTRY_SIZE
+    cast[Ptr[uint32]](e + 12)[0] = MSIX_VECTOR_CTRL_MASK
+
+
+def pci_msix_enable(bdf: uint32, cap_off: uint32):
+    # Flip the MSI-X Enable bit (Message Control bit 15) and clear the
+    # global Function Mask (bit 14) so programmed vectors can fire.
+    # Read-modify-write the 16-bit Message Control via the dword it
+    # shares with the cap header so the ID/next bytes survive.
+    bus: uint32 = pci_bdf_bus(bdf)
+    dev: uint32 = pci_bdf_dev(bdf)
+    fn:  uint32 = pci_bdf_fn(bdf)
+    dword_off: uint32 = (cap_off + MSIX_CTRL_OFFSET) & 0xFC
+    dword: uint32 = pci_config_read_dword(bus, dev, fn, dword_off)
+    ctrl: uint32 = (dword >> 16) & 0xFFFF
+    ctrl = (ctrl | MSIX_CTRL_ENABLE) & ~MSIX_CTRL_FUNC_MASK
+    dword = (dword & 0x0000FFFF) | (ctrl << 16)
+    pci_config_write_dword(bus, dev, fn, dword_off, dword)
+
+
+def pci_enable_mem_and_master(bdf: uint32):
+    # Memory Space Enable + Bus Master — the command bits a MEM-BAR
+    # device (and any MSI-X consumer, whose table lives in a MEM BAR)
+    # needs. Mirror of pci_enable_io_and_master but for the MEM path.
+    bus: uint32 = pci_bdf_bus(bdf)
+    dev: uint32 = pci_bdf_dev(bdf)
+    fn:  uint32 = pci_bdf_fn(bdf)
+    cmd: uint32 = pci_config_read_dword(bus, dev, fn,
+                                        PCI_COMMAND_OFFSET) & 0xFFFF
+    cmd = cmd | PCI_COMMAND_MEM | PCI_COMMAND_MASTER
+    upper: uint32 = pci_config_read_dword(bus, dev, fn,
+                                          PCI_COMMAND_OFFSET) & 0xFFFF0000
+    pci_config_write_dword(bus, dev, fn, PCI_COMMAND_OFFSET,
+                           upper | cmd)
+
+
 def pci_describe_class(class_code: uint32) -> Ptr[char]:
     # PCI base class codes from PCI spec — covers the cases we expect
     # under QEMU's default PC machine + virtio.

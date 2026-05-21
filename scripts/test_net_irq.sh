@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# scripts/test_net_irq.sh — verify the M16.112 IOAPIC + virtio-net
-# IRQ path lands on the wire alongside the existing polled path.
+# scripts/test_net_irq.sh — verify the virtio-net legacy-INTx IRQ
+# path: IOAPIC redirection-entry programming alongside the polled
+# path.
 #
-# Today's bare-metal kernel polls every device because the IOAPIC
-# wasn't programmed; M16.112 fixes that for virtio-net. The driver
-# now:
+# QEMU's virtio-net-pci advertises MSI-X by default, and the driver
+# now prefers MSI-X when it can (see scripts/test_msix.sh). This
+# test deliberately attaches the device with `vectors=0`, which
+# disables the MSI-X capability so the driver exercises the legacy
+# INTx fallback path:
 #   1. Reads PCI INTERRUPT_PIN / INTERRUPT_LINE from config space.
-#   2. Programs IOAPIC redirection entry for that pin to deliver
-#      CPU vector 0x40 to LAPIC id 0.
+#   2. Programs the IOAPIC redirection entry for that GSI to deliver
+#      CPU vector 0x40 to LAPIC id 0 (IOAPIC selected by GSI range
+#      from the MADT-cached list).
 #   3. Registers `virtio_net_irq_handler` for vector 0x40 in the
 #      irq_handlers[] table.
 # The existing virtio_net_poll() loop in net_smoke_test stays —
@@ -47,7 +51,7 @@ python3 -m compiler.adder compile \
     init/main.ad \
     -o "$ELF" >/dev/null
 
-echo "[test_net_irq] (3/3) Boot QEMU with virtio-net + IOAPIC visible"
+echo "[test_net_irq] (3/3) Boot QEMU with virtio-net (vectors=0 → INTx)"
 LOG=$(mktemp)
 trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
 
@@ -55,7 +59,7 @@ set +e
 timeout 20s qemu-system-x86_64 \
     -kernel "$ELF" \
     -netdev user,id=n0 \
-    -device virtio-net-pci,netdev=n0,mac=52:54:00:12:34:56 \
+    -device virtio-net-pci,netdev=n0,mac=52:54:00:12:34:56,vectors=0 \
     -nographic -no-reboot -m 256M -monitor none -serial stdio \
     > "$LOG" 2>&1 < /dev/null
 rc=$?

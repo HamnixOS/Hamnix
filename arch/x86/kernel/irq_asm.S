@@ -30,11 +30,13 @@ irq_stub_\n:
     jmp   common_irq
     .endm
 
-    /* Legacy IRQs 0..15 → vectors 32..47. Vectors 48..71 form the
-     * "device IRQ band" used by IOAPIC-routed PCI INTx and (future)
-     * MSI/MSI-X handlers. virtio-net (M16.112) lives at vector 0x40
-     * (= 64). The stub indices match vector numbers one-to-one so a
-     * Hamnix caller doesn't have to add/subtract any base. */
+    /* Legacy IRQs 0..15 → vectors 32..47. Vectors 48..95 form the
+     * "device IRQ band" used by IOAPIC-routed PCI INTx and MSI/MSI-X
+     * handlers. virtio-net INTx lives at 0x40 (= 64); its per-queue
+     * MSI-X vectors land at 0x49..0x4B. The band was 32..71; it now
+     * runs 32..95 so multi-vector MSI-X devices have room. The stub
+     * indices match vector numbers one-to-one so a Hamnix caller
+     * doesn't have to add/subtract any base. */
     IRQ_STUB 32
     IRQ_STUB 33
     IRQ_STUB 34
@@ -75,6 +77,30 @@ irq_stub_\n:
     IRQ_STUB 69
     IRQ_STUB 70
     IRQ_STUB 71
+    IRQ_STUB 72
+    IRQ_STUB 73
+    IRQ_STUB 74
+    IRQ_STUB 75
+    IRQ_STUB 76
+    IRQ_STUB 77
+    IRQ_STUB 78
+    IRQ_STUB 79
+    IRQ_STUB 80
+    IRQ_STUB 81
+    IRQ_STUB 82
+    IRQ_STUB 83
+    IRQ_STUB 84
+    IRQ_STUB 85
+    IRQ_STUB 86
+    IRQ_STUB 87
+    IRQ_STUB 88
+    IRQ_STUB 89
+    IRQ_STUB 90
+    IRQ_STUB 91
+    IRQ_STUB 92
+    IRQ_STUB 93
+    IRQ_STUB 94
+    IRQ_STUB 95
 
 /* ---------- common IRQ dispatch ---------------------------------- */
     .align 16
@@ -126,12 +152,13 @@ common_irq:
     iretq
 
 /* ---------- irq_stub_table --------------------------------------- *
- * Forty entries, one per IRQ vector (32..71). Consumed by idt_init()
- * via get_irq_stub() to populate IDT gates 32..71. Each entry is the
- * full 64-bit virtual address of the stub; the kernel is a true
- * elf64-x86-64 object so `.quad sym` (R_X86_64_64) works directly —
- * no more `.long sym; .long 0` split (the kernel is linked in the
- * higher half now, where the addresses genuinely need 64 bits).
+ * Sixty-four entries, one per IRQ vector (32..95). Consumed by
+ * idt_init() via get_irq_stub() to populate IDT gates 32..95. Each
+ * entry is the full 64-bit virtual address of the stub; the kernel
+ * is a true elf64-x86-64 object so `.quad sym` (R_X86_64_64) works
+ * directly — no more `.long sym; .long 0` split (the kernel is
+ * linked in the higher half now, where the addresses genuinely need
+ * 64 bits).
  */
     .section .rodata
     .align 8
@@ -177,12 +204,36 @@ irq_stub_table:
     .quad irq_stub_69
     .quad irq_stub_70
     .quad irq_stub_71
+    .quad irq_stub_72
+    .quad irq_stub_73
+    .quad irq_stub_74
+    .quad irq_stub_75
+    .quad irq_stub_76
+    .quad irq_stub_77
+    .quad irq_stub_78
+    .quad irq_stub_79
+    .quad irq_stub_80
+    .quad irq_stub_81
+    .quad irq_stub_82
+    .quad irq_stub_83
+    .quad irq_stub_84
+    .quad irq_stub_85
+    .quad irq_stub_86
+    .quad irq_stub_87
+    .quad irq_stub_88
+    .quad irq_stub_89
+    .quad irq_stub_90
+    .quad irq_stub_91
+    .quad irq_stub_92
+    .quad irq_stub_93
+    .quad irq_stub_94
+    .quad irq_stub_95
 
     .section .text, "ax"
     .align 16
     .globl get_irq_stub
 get_irq_stub:
-    /* %rdi = IRQ vector (32..71). Return irq_stub_table[vec-32]. */
+    /* %rdi = IRQ vector (32..95). Return irq_stub_table[vec-32]. */
     leaq irq_stub_table(%rip), %rax
     subq $32, %rdi
     movq (%rax, %rdi, 8), %rax

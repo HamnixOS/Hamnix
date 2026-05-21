@@ -33,7 +33,10 @@
 # preemption visibly. Real Linux calibrates LAPIC ticks-per-second
 # against PIT/HPET on boot; we'll port that once we want stable HZ.
 
-from kernel.printk.printk import printk0, printk1
+from kernel.printk.printk import printk0, printk1, printk2
+from drivers.acpi.acpi import (
+    acpi_init, acpi_ioapic_count, acpi_ioapic_addr, acpi_ioapic_gsi_base,
+)
 
 extern def read_msr(index: uint32) -> uint64
 extern def write_msr(index: uint32, value: uint64)
@@ -88,6 +91,26 @@ def apic_enable():
     write_msr(IA32_APIC_BASE_MSR, v | APIC_BASE_ENABLE)
 
 
+lapic_enabled: uint32 = 0
+
+
+def lapic_ensure_enabled():
+    # Minimal idempotent LAPIC bring-up: flip the IA32_APIC_BASE
+    # global-enable MSR bit and set the SVR software-enable bit +
+    # spurious vector. Both are mandatory before the LAPIC will
+    # accept ANY interrupt message — including an MSI / MSI-X memory
+    # write from a PCI device. apic_init() does the same plus
+    # diagnostics; an early MSI-X consumer (virtio-net's delivery
+    # self-test, which runs before start_kernel reaches apic_init)
+    # calls THIS so it can take its interrupt. A no-op after the
+    # first call, so apic_init() running later is harmless.
+    if lapic_enabled != 0:
+        return
+    lapic_enabled = 1
+    apic_enable()
+    _lapic_write(LAPIC_SVR_REG, SVR_ENABLE | SPURIOUS_VECTOR)
+
+
 def apic_init():
     # Linux's setup_local_APIC() does a great deal more — TPR clear,
     # ESR clear, LVT LINT0/LINT1 program, PERF/THERM masks. For M16.22
@@ -103,6 +126,7 @@ def apic_init():
     # Software-enable the APIC and pick a spurious vector. Without
     # this bit set the LAPIC ignores all incoming IPIs / LVT events.
     _lapic_write(LAPIC_SVR_REG, SVR_ENABLE | SPURIOUS_VECTOR)
+    lapic_enabled = 1
 
 
 def lapic_setup_timer():
@@ -304,7 +328,9 @@ def lapic_send_sipi(target_apic_id: uint32, vector: uint32):
 # system bus and accepts edge / level-triggered IRQ inputs from
 # PCI INTx, the legacy ISA pins, and the rest of the chipset, then
 # delivers them as messages to the LAPIC(s). On a single-socket
-# x86 box it lives at physical 0xFEC00000.
+# x86 box it lives at physical 0xFEC00000; a multi-socket / server
+# board has SEVERAL, each owning a contiguous slice of the Global
+# System Interrupt (GSI) space starting at its `gsi_base`.
 #
 # Register interface is INDIRECT through two MMIO ports:
 #
@@ -333,9 +359,10 @@ def lapic_send_sipi(target_apic_id: uint32, vector: uint32):
 #   bits 56..63  destination APIC ID (physical mode)
 #
 # We program PCI INTx pins as level-triggered active-low (PCI spec
-# §2.2.6) and ISA pins as edge-triggered active-high. For the
-# virtio-net commit only PCI INTx matters; the helper takes flags
-# so future ISA callers can override.
+# §2.2.6) and ISA pins as edge-triggered active-high. The caller
+# names a GSI, not a (controller, pin) pair — the GSI is resolved
+# to the owning IOAPIC + its local pin index via the MADT-cached
+# IOAPIC list (see _ioapic_for_gsi).
 
 IOAPIC_PHYS_BASE: uint64 = 0xFEC00000
 
@@ -354,16 +381,27 @@ IOAPIC_RED_MASK:        uint32 = 0x10000     # bit 16
 IOAPIC_RED_TRIG_LEVEL:  uint32 = 0x8000      # bit 15
 IOAPIC_RED_POL_LOW:     uint32 = 0x2000      # bit 13
 
+# Per-IOAPIC routing table. Populated by _ioapic_init_once() from
+# the MADT-cached IOAPIC list (drivers/acpi/acpi.ad). Slot N holds
+# IOAPIC N's MMIO base, GSI base, and pin count (= max_redir + 1).
+# Eight is far more IOAPICs than any board we target.
+IOAPIC_MAX: uint64 = 8
+ioapic_n:          uint32 = 0
+ioapic_bases:      Array[8, uint64]
+ioapic_gsi_bases:  Array[8, uint32]
+ioapic_npins:      Array[8, uint32]
 
-def _ioapic_read(reg: uint32) -> uint32:
-    # Two MMIO accesses: select the register, then read IOWIN.
-    cast[Ptr[uint32]](IOAPIC_PHYS_BASE + IOAPIC_REGSEL_OFF)[0] = reg
-    return cast[Ptr[uint32]](IOAPIC_PHYS_BASE + IOAPIC_IOWIN_OFF)[0]
+
+def _ioapic_read_at(base: uint64, reg: uint32) -> uint32:
+    # Two MMIO accesses on a specific IOAPIC: select the register,
+    # then read IOWIN.
+    cast[Ptr[uint32]](base + IOAPIC_REGSEL_OFF)[0] = reg
+    return cast[Ptr[uint32]](base + IOAPIC_IOWIN_OFF)[0]
 
 
-def _ioapic_write(reg: uint32, value: uint32):
-    cast[Ptr[uint32]](IOAPIC_PHYS_BASE + IOAPIC_REGSEL_OFF)[0] = reg
-    cast[Ptr[uint32]](IOAPIC_PHYS_BASE + IOAPIC_IOWIN_OFF)[0] = value
+def _ioapic_write_at(base: uint64, reg: uint32, value: uint32):
+    cast[Ptr[uint32]](base + IOAPIC_REGSEL_OFF)[0] = reg
+    cast[Ptr[uint32]](base + IOAPIC_IOWIN_OFF)[0] = value
 
 
 ioapic_initialized: uint32 = 0
@@ -372,56 +410,120 @@ ioapic_initialized: uint32 = 0
 def _ioapic_init_once():
     # Lazy bring-up: triggered by the first ioapic_redirect call (or
     # any other consumer-facing helper). We do this lazily because
-    # the M1-era boot order calls virtio_net_init() — which is the
-    # only ioapic consumer today — BEFORE apic_init(), so there is
-    # no apic-init-time hook we can piggyback on.
+    # the boot order runs virtio_net_init() / virtio_blk_init() —
+    # ioapic consumers — BEFORE start_kernel reaches apic_init(), so
+    # there is no apic-init-time hook we can piggyback on.
     if ioapic_initialized != 0:
         return
     ioapic_initialized = 1
 
-    # Read ID + VER for diagnostic + to confirm the MMIO map works.
-    # On QEMU's default i440FX machine this is a 24-entry ICH9-style
-    # IOAPIC at 0xFEC00000.
-    id_reg:  uint32 = _ioapic_read(IOAPIC_REG_ID)
-    ver_reg: uint32 = _ioapic_read(IOAPIC_REG_VER)
-    apic_id:    uint32 = (id_reg >> 24) & 0x0F
-    version:    uint32 = ver_reg & 0xFF
-    max_redir:  uint32 = (ver_reg >> 16) & 0xFF
-    printk1("[ioapic] id=%d ", cast[uint64](apic_id))
-    printk1("version=0x%x ", cast[uint64](version))
-    printk1("max_redir=%d\n", cast[uint64](max_redir))
+    # Make sure the MADT IOAPIC list is parsed. acpi_init() is
+    # idempotent — a no-op if start_kernel already ran it.
+    acpi_init()
 
-    # Default-mask every redirection entry. QEMU resets them masked
-    # but real chipsets sometimes hand us garbage; this guarantees
-    # nothing fires until ioapic_redirect() unmasks a specific pin.
-    i: uint32 = 0
-    while i <= max_redir:
-        _ioapic_write(IOAPIC_REDTBL_BASE + 2 * i, IOAPIC_RED_MASK)
-        _ioapic_write(IOAPIC_REDTBL_BASE + 2 * i + 1, 0)
-        i = i + 1
+    n: uint32 = acpi_ioapic_count()
+    if n == 0:
+        # No MADT or no type-1 entries — fall back to the legacy
+        # single-IOAPIC PC/AT assumption (one ICH-style IOAPIC at
+        # 0xFEC00000 owning GSI 0..). This keeps a legacy box (or a
+        # firmware that hid the MADT) working.
+        ioapic_n            = 1
+        ioapic_bases[0]     = IOAPIC_PHYS_BASE
+        ioapic_gsi_bases[0] = 0
+        ioapic_npins[0]     = 24
+        printk0("[ioapic] no MADT IOAPIC list — assuming single IOAPIC @ 0xFEC00000\n")
+    else:
+        if cast[uint64](n) > IOAPIC_MAX:
+            n = cast[uint32](IOAPIC_MAX)
+        ioapic_n = n
+        k: uint32 = 0
+        while k < n:
+            ioapic_bases[k]     = acpi_ioapic_addr(k)
+            ioapic_gsi_bases[k] = acpi_ioapic_gsi_base(k)
+            k = k + 1
+
+    # Probe + mask every IOAPIC. Read VER for max_redir (the real
+    # pin count), then default-mask all redirection entries. QEMU
+    # resets them masked but real chipsets sometimes hand us garbage;
+    # this guarantees nothing fires until ioapic_redirect() unmasks
+    # a specific pin.
+    idx: uint32 = 0
+    while idx < ioapic_n:
+        base: uint64 = ioapic_bases[idx]
+        id_reg:  uint32 = _ioapic_read_at(base, IOAPIC_REG_ID)
+        ver_reg: uint32 = _ioapic_read_at(base, IOAPIC_REG_VER)
+        apic_id:   uint32 = (id_reg >> 24) & 0x0F
+        version:   uint32 = ver_reg & 0xFF
+        max_redir: uint32 = (ver_reg >> 16) & 0xFF
+        ioapic_npins[idx] = max_redir + 1
+        printk2("[ioapic] id=%d gsi_base=%d ",
+                cast[uint64](apic_id),
+                cast[uint64](ioapic_gsi_bases[idx]))
+        printk1("version=0x%x ", cast[uint64](version))
+        printk1("max_redir=%d\n", cast[uint64](max_redir))
+
+        i: uint32 = 0
+        while i <= max_redir:
+            _ioapic_write_at(base, IOAPIC_REDTBL_BASE + 2 * i,
+                             IOAPIC_RED_MASK)
+            _ioapic_write_at(base, IOAPIC_REDTBL_BASE + 2 * i + 1, 0)
+            i = i + 1
+        idx = idx + 1
 
 
-def ioapic_redirect(pin: uint32, vector: uint32, lapic_id: uint32):
-    # Program redirection entry `pin` to deliver vector `vector` to
-    # the LAPIC with id `lapic_id` (physical destination mode, fixed
-    # delivery). PCI INTx lines are level-triggered active-low per
-    # PCI spec §2.2.6, so set both bits. Unmasked.
+def _ioapic_for_gsi(gsi: uint32) -> uint32:
+    # Return the index of the IOAPIC that owns Global System Interrupt
+    # `gsi` — the one whose [gsi_base, gsi_base + npins) range contains
+    # it. Returns 0 as a safe fallback if no IOAPIC claims the GSI (a
+    # single-IOAPIC box always has IOAPIC 0 owning GSI 0..23, which is
+    # every PCI INTx / ISA pin we route).
+    idx: uint32 = 0
+    while idx < ioapic_n:
+        lo: uint32 = ioapic_gsi_bases[idx]
+        hi: uint32 = lo + ioapic_npins[idx]
+        if gsi >= lo and gsi < hi:
+            return idx
+        idx = idx + 1
+    return 0
+
+
+def _ioapic_program(gsi: uint32, low: uint32, high: uint32,
+                    mode: Ptr[char]):
+    # Shared back-end for ioapic_redirect / ioapic_redirect_isa:
+    # resolve `gsi` to the owning IOAPIC, translate to that
+    # controller's local pin index, and write the redirection entry
+    # (HIGH first per spec — it doesn't fire anything — then LOW,
+    # which latches the unmask).
     _ioapic_init_once()
+    which: uint32 = _ioapic_for_gsi(gsi)
+    base:  uint64 = ioapic_bases[which]
+    pin:   uint32 = gsi - ioapic_gsi_bases[which]
+    _ioapic_write_at(base, IOAPIC_REDTBL_BASE + 2 * pin + 1, high)
+    _ioapic_write_at(base, IOAPIC_REDTBL_BASE + 2 * pin, low)
+    # One-line wiring summary. The "redirect pin=N vec=0xXX" prefix
+    # shape is what scripts/test_net_irq.sh greps for; the trailing
+    # ioapic=M / mode= fields name the IOAPIC selected by GSI range.
+    printk2("[ioapic] redirect pin=%d vec=0x%x ",
+            cast[uint64](gsi), cast[uint64](low & 0xFF))
+    printk2("ioapic=%d mode=%s\n",
+            cast[uint64](which), cast[uint64](mode))
+
+
+def ioapic_redirect(gsi: uint32, vector: uint32, lapic_id: uint32):
+    # Program the IOAPIC redirection entry for Global System Interrupt
+    # `gsi` to deliver `vector` to the LAPIC with id `lapic_id`
+    # (physical destination mode, fixed delivery). PCI INTx lines are
+    # level-triggered active-low per PCI spec §2.2.6, so set both
+    # bits. Unmasked. The owning IOAPIC is selected by GSI range, so
+    # a multi-IOAPIC machine routes correctly.
     low: uint32 = (vector & 0xFF) \
                 | IOAPIC_RED_TRIG_LEVEL \
                 | IOAPIC_RED_POL_LOW
     high: uint32 = (lapic_id & 0xFF) << 24
-    # Spec mandates writing HIGH first (it doesn't fire anything)
-    # then LOW (which can latch the unmask).
-    _ioapic_write(IOAPIC_REDTBL_BASE + 2 * pin + 1, high)
-    _ioapic_write(IOAPIC_REDTBL_BASE + 2 * pin, low)
-    # One-line wiring summary. mode=PCI-level == level-triggered,
-    # active-low: the correct convention for PCI INTx sources.
-    printk2("[ioapic] pin=%d vec=0x%x mode=PCI-level\n",
-            cast[uint64](pin), cast[uint64](vector))
+    _ioapic_program(gsi, low, high, "PCI-level")
 
 
-def ioapic_redirect_isa(pin: uint32, vector: uint32, lapic_id: uint32):
+def ioapic_redirect_isa(gsi: uint32, vector: uint32, lapic_id: uint32):
     # ISA-pin variant of ioapic_redirect(). ISA interrupt lines (the
     # i8042 keyboard on IRQ 1, the PS/2 mouse on IRQ 12, the PIT on
     # IRQ 0, the RTC on IRQ 8, ...) are EDGE-triggered and ACTIVE-HIGH
@@ -447,32 +549,35 @@ def ioapic_redirect_isa(pin: uint32, vector: uint32, lapic_id: uint32):
     # override entry when it deviates from that. Consuming Type 2
     # entries is the fully-correct follow-up; for IRQ 1 the 1:1
     # default is what every real chipset uses.
-    _ioapic_init_once()
+    #
     # Note: no IOAPIC_RED_TRIG_LEVEL, no IOAPIC_RED_POL_LOW — edge +
     # active-high is the all-zero state of bits 13 and 15.
     low:  uint32 = (vector & 0xFF)
     high: uint32 = (lapic_id & 0xFF) << 24
-    _ioapic_write(IOAPIC_REDTBL_BASE + 2 * pin + 1, high)
-    _ioapic_write(IOAPIC_REDTBL_BASE + 2 * pin, low)
-    # One-line wiring summary. mode=ISA-edge == edge-triggered,
-    # active-high: the correct convention for legacy ISA IRQ lines.
-    printk2("[ioapic] pin=%d vec=0x%x mode=ISA-edge\n",
-            cast[uint64](pin), cast[uint64](vector))
+    _ioapic_program(gsi, low, high, "ISA-edge")
 
 
-def ioapic_redirect_diag(pin: uint32) -> uint32:
+def ioapic_redirect_diag(gsi: uint32) -> uint32:
     # Read back a redirection-table entry's low 32 bits for boot-time
     # diagnostics. Lets a driver print exactly what the IOAPIC latched
     # — vector in bits 0..7, trigger mode in bit 15, polarity in bit
     # 13, mask in bit 16 — so a real-hardware test transcript shows
     # whether the entry is programmed the way the driver intended.
+    # `gsi` is resolved to the owning IOAPIC + local pin.
     _ioapic_init_once()
-    return _ioapic_read(IOAPIC_REDTBL_BASE + 2 * pin)
+    which: uint32 = _ioapic_for_gsi(gsi)
+    base:  uint64 = ioapic_bases[which]
+    pin:   uint32 = gsi - ioapic_gsi_bases[which]
+    return _ioapic_read_at(base, IOAPIC_REDTBL_BASE + 2 * pin)
 
 
-def ioapic_mask(pin: uint32):
+def ioapic_mask(gsi: uint32):
     # Re-mask a redirection entry. Preserves the rest of the entry
     # so a subsequent ioapic_redirect doesn't need to re-supply the
     # vector / destination — useful for runtime IRQ disable.
-    cur: uint32 = _ioapic_read(IOAPIC_REDTBL_BASE + 2 * pin)
-    _ioapic_write(IOAPIC_REDTBL_BASE + 2 * pin, cur | IOAPIC_RED_MASK)
+    _ioapic_init_once()
+    which: uint32 = _ioapic_for_gsi(gsi)
+    base:  uint64 = ioapic_bases[which]
+    pin:   uint32 = gsi - ioapic_gsi_bases[which]
+    cur: uint32 = _ioapic_read_at(base, IOAPIC_REDTBL_BASE + 2 * pin)
+    _ioapic_write_at(base, IOAPIC_REDTBL_BASE + 2 * pin, cur | IOAPIC_RED_MASK)

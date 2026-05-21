@@ -1,28 +1,28 @@
 #!/usr/bin/env bash
-# scripts/test_drivers_irq.sh — verify the M16.114 IRQ-wiring batch
-# lands on the wire for all four bare-metal drivers (AHCI, NVMe,
-# e1000e, r8169). M16.113 added the IOAPIC + per-vector handler-
-# registration mechanism and proved it on virtio-net at vector 0x40.
-# This commit extends the same template to the next four drivers,
-# claiming vectors 0x41..0x44:
+# scripts/test_drivers_irq.sh — verify per-vector IRQ wiring lands on
+# the wire for the bare-metal drivers (AHCI, NVMe, e1000e, r8169).
+# M16.113 added the IOAPIC + per-vector handler-registration
+# mechanism and proved it on virtio-net at vector 0x40; the device
+# drivers each claim their own vector:
 #
-#     AHCI    = 0x41
-#     NVMe    = 0x42
-#     e1000e  = 0x47  (MSI single-vector; the INTx 0x43 pin path was
-#                      retired at 9306cb8 when e1000e gained MSI)
-#     r8169   = 0x44
+#     AHCI    = 0x41   (IOAPIC INTx)
+#     NVMe    = 0x42   (IOAPIC INTx)
+#     r8169   = 0x44   (IOAPIC INTx, RTL8139)
+#     e1000e  = 0x47   (MSI — bypasses the IOAPIC)
 #
-# Each driver reads PCI INTERRUPT_PIN / INTERRUPT_LINE from config
-# space, programs an IOAPIC redirection entry to deliver its vector
-# to LAPIC id 0, and registers its irq_handler in the per-vector
-# table. The existing polled paths (ahci_smoke_test poll, nvme
-# polled CQ phase drain, e1000e_poll, r8169_poll) all stay as
-# safety-net fallbacks — this commit is additive.
+# Vector 0x43 is now claimed by virtio-blk (kernel roadmap §9); the
+# e1000e INTx slot it used to hold was retired when e1000e moved to
+# single-vector MSI.
+#
+# Each driver registers its irq_handler in the per-vector table; the
+# IOAPIC-routed ones (AHCI / NVMe / r8169) also program a redirection
+# entry, while e1000e programs an MSI capability instead. The polled
+# paths (ahci_smoke_test poll, nvme polled CQ phase drain,
+# e1000e_poll, r8169_poll) all stay as safety-net fallbacks.
 #
 # The test attaches ALL four QEMU devices simultaneously so a single
-# boot exercises every code path, then asserts the canonical
-# "[<driver>] irq pin=" + "[irq] handler registered for vector 0x4X"
-# pair for each.
+# boot exercises every code path, then asserts each driver's IRQ-wire
+# banner + its "[irq] handler registered for vector 0x4X" line.
 #
 # RX packet / completion observation is NOT asserted — SLIRP doesn't
 # always provoke a real IRQ in QEMU TCG before the assertion window
@@ -80,19 +80,18 @@ rc=$?
 set -e
 
 echo "[test_drivers_irq] --- captured (ioapic / irq / driver banners) ---"
-grep -E '\[ioapic\]|\[irq\]|\[ahci\] irq |\[nvme\] irq |\[e1000e\] irq |\[e1000e\] MSI |\[r8169\] irq ' "$LOG" || true
+grep -aE '\[ioapic\]|\[irq\]|\[ahci\] irq |\[nvme\] irq |\[e1000e\] (irq|MSI) |\[r8169\] irq ' "$LOG" || true
 echo "[test_drivers_irq] --- end ---"
 
 fail=0
 for needle in \
     "[ahci] irq pin=" \
     "[nvme] irq pin=" \
-    "[e1000e] MSI vector=0x47 enabled" \
     "[r8169] irq pin=" \
     "[irq] handler registered for vector 0x41" \
     "[irq] handler registered for vector 0x42" \
-    "[irq] handler registered for vector 0x47" \
-    "[irq] handler registered for vector 0x44"
+    "[irq] handler registered for vector 0x44" \
+    "[irq] handler registered for vector 0x47"
 do
     if grep -F -q "$needle" "$LOG"; then
         echo "[test_drivers_irq] OK: '$needle'"
@@ -101,6 +100,15 @@ do
         fail=1
     fi
 done
+
+# e1000e prefers single-vector MSI but falls back to IOAPIC INTx if
+# the device exposes no MSI capability — accept either banner.
+if grep -aE -q '\[e1000e\] MSI vector=|\[e1000e\] INTx fallback pin=' "$LOG"; then
+    echo "[test_drivers_irq] OK: e1000e IRQ wired (MSI or INTx)"
+else
+    echo "[test_drivers_irq] MISS: e1000e IRQ not wired"
+    fail=1
+fi
 
 if [ "$fail" -ne 0 ]; then
     echo "[test_drivers_irq] FAIL (qemu rc=$rc)"

@@ -36,13 +36,18 @@
 from kernel.printk.printk import printk0, printk1, printk2
 from drivers.pci.pci import (
     pci_find, pci_read_bar, pci_enable_io_and_master,
+    pci_enable_mem_and_master,
     pci_config_read_byte, pci_bdf_bus, pci_bdf_dev, pci_bdf_fn,
-    PCI_BDF_NONE,
+    PCI_BDF_NONE, PCI_CAP_ID_MSIX,
+    pci_find_capability, pci_msix_table_size, pci_msix_table_addr,
+    pci_msix_program_vector, pci_msix_enable,
 )
 from drivers.virtio.virtio_pci import (
     virtio_reset, virtio_acknowledge, virtio_driver_ok,
     virtio_read_host_features, virtio_write_guest_features,
-    virtio_notify, VIRTIO_PCI_CONFIG, VIRTIO_PCI_ISR,
+    virtio_notify, VIRTIO_PCI_CONFIG, VIRTIO_PCI_CONFIG_MSIX,
+    VIRTIO_PCI_ISR, VIRTIO_MSI_NO_VECTOR,
+    virtio_set_config_msix_vector, virtio_set_queue_msix_vector,
 )
 from arch.x86.kernel.apic import ioapic_redirect
 from arch.x86.kernel.irq import register_irq_handler
@@ -88,9 +93,24 @@ PCI_INTERRUPT_PIN:    uint32 = 0x3D
 # 32..47 for legacy PIC IRQs and reserves the 48..71 band for IOAPIC-
 # routed PCI INTx (see arch/x86/kernel/idt.ad). 0x40 (64) is the
 # first slot in that band — virtio-net is the bring-up consumer; the
-# other drivers (AHCI / NVMe / e1000e / r8169) will claim 0x41..0x44
-# in follow-up commits.
+# other drivers (AHCI / NVMe / e1000e / r8169) claim 0x41..0x47.
 VNET_IRQ_VECTOR:      uint32 = 0x40
+
+# MSI-X CPU vectors. When the device advertises the MSI-X capability
+# we route each interrupt source to its own LAPIC vector — one per
+# virtqueue plus one for config-change — which is the prerequisite
+# for per-queue scaling. The IDT IRQ band runs through 0x71, so the
+# 0x49..0x4B slots are free (0x48 is r8169-gigabit MSI).
+#   0x49  RX queue (virtqueue 0)
+#   0x4A  TX queue (virtqueue 1)
+#   0x4B  config-change
+# The MSI-X table-entry indices are 0/1/2 in the same order.
+VNET_MSIX_VEC_RX:     uint32 = 0x49
+VNET_MSIX_VEC_TX:     uint32 = 0x4A
+VNET_MSIX_VEC_CFG:    uint32 = 0x4B
+VNET_MSIX_ENTRY_RX:   uint32 = 0
+VNET_MSIX_ENTRY_TX:   uint32 = 1
+VNET_MSIX_ENTRY_CFG:  uint32 = 2
 
 # LAPIC ID to route the IRQ to. Always the BSP (id 0) for now — once
 # we have IRQ affinity / SMP IRQ steering, this becomes per-IRQ
@@ -115,7 +135,10 @@ class VNetVQ:
 
 class VirtioNet:
     iobase:          uint32
-    irq_pin:         uint32                # IOAPIC pin we redirected
+    irq_pin:         uint32                # IOAPIC pin we redirected (INTx)
+    cfg_base:        uint32                # device-config window: 0x14 INTx, 0x18 MSI-X
+    msix_enabled:    uint32                # 1 once MSI-X is the interrupt path
+    msix_table:      uint64                # mapped MSI-X table base (MSI-X path)
     rx:              VNetVQ
     tx:              VNetVQ
     rx_buf_addrs:    Array[8, uint64]    # NR_RX_BUFS slots
@@ -236,14 +259,17 @@ def _populate_rx(vnet: Ptr[VirtioNet]):
         i = i + 1
 
 
-def _read_mac(iobase: uint32, mac: Ptr[uint8]):
-    # The device-specific config window starts at BAR0 + 0x14 (legacy).
-    # The MAC is the first 6 bytes there, byte-readable. We use inb
-    # one byte at a time to mirror virtio_cread_bytes() and avoid the
-    # legacy alignment trap on partial-dword reads.
+def _read_mac(iobase: uint32, cfg_base: uint32, mac: Ptr[uint8]):
+    # The device-specific config window starts at BAR0 + 0x14 on the
+    # legacy INTx layout, but shifts to BAR0 + 0x18 once MSI-X is
+    # enabled (the two 16-bit MSI-X vector registers occupy 0x14..0x17).
+    # `cfg_base` carries whichever applies. The MAC is the first 6
+    # bytes there, byte-readable. We use inb one byte at a time to
+    # mirror virtio_cread_bytes() and avoid the legacy alignment trap
+    # on partial-dword reads.
     i: uint32 = 0
     while i < 6:
-        b: uint32 = inb(cast[int32](iobase + VIRTIO_PCI_CONFIG + i)) & 0xFF
+        b: uint32 = inb(cast[int32](iobase + cfg_base + i)) & 0xFF
         mac[i] = cast[uint8](b)
         i = i + 1
 
@@ -276,7 +302,13 @@ def virtio_net_init() -> int32:
         printk0("[virtio-net] no PCI device found\n")
         return -1
 
+    # Enable both IO and MEM decoding + bus-master. Legacy virtio
+    # drives its registers through the IO BAR0, but the MSI-X table
+    # lives in a MEM BAR, so a device that advertises MSI-X needs
+    # Memory Space Enable too. Enabling both is harmless when MSI-X
+    # is absent.
     pci_enable_io_and_master(bdf)
+    pci_enable_mem_and_master(bdf)
     bar0_raw: uint32 = pci_read_bar(bdf, 0)
     if (bar0_raw & 1) == 0:
         printk0("[virtio-net] BAR0 is not IO-space (modern virtio?)\n")
@@ -286,6 +318,9 @@ def virtio_net_init() -> int32:
     vnet_state.rx_packets = 0
     vnet_state.irq_count = 0
     vnet_state.irq_pin = 0
+    vnet_state.msix_enabled = 0
+    vnet_state.msix_table = 0
+    vnet_state.cfg_base = cast[uint32](VIRTIO_PCI_CONFIG)
     printk2("[virtio-net] bdf=%x iobase=%p\n",
             cast[uint64](bdf), cast[uint64](iobase))
 
@@ -304,16 +339,88 @@ def virtio_net_init() -> int32:
     guest: uint32 = host & VIRTIO_NET_F_MAC
     virtio_write_guest_features(iobase, guest)
 
+    # --- MSI-X capability detection + enable (kernel roadmap §9) ----
+    # Walk the PCI capability list for the MSI-X capability (ID 0x11).
+    # If the device advertises it (QEMU's virtio-net-pci does by
+    # default — `vectors=3`), enable MSI-X NOW, before reading device
+    # config or setting up queues: enabling MSI-X shifts the legacy
+    # BAR0 device-config window from 0x14 to 0x18 (the two 16-bit
+    # MSI-X vector registers occupy 0x14..0x17). Programming the
+    # MSI-X table entries (message address/data) and the per-queue
+    # vector mapping happens after the virtqueues exist.
+    msix_cap: uint32 = pci_find_capability(bdf, PCI_CAP_ID_MSIX)
+    if msix_cap != 0:
+        tbl_sz: uint32 = pci_msix_table_size(bdf, msix_cap)
+        tbl_addr: uint64 = pci_msix_table_addr(bdf, msix_cap)
+        printk2("[virtio-net] MSI-X cap at 0x%x table_size=%d\n",
+                cast[uint64](msix_cap), cast[uint64](tbl_sz))
+        # Need at least 3 table entries (RX, TX, config-change). If
+        # the device offers fewer, fall back to INTx rather than
+        # half-wiring MSI-X.
+        if tbl_sz >= 3 and tbl_addr != 0:
+            printk1("[virtio-net] MSI-X table @ %p\n", tbl_addr)
+            # Program the three table entries: each routes its CPU
+            # vector to the BSP LAPIC. Entries are masked-then-
+            # unmasked inside pci_msix_program_vector (vector control
+            # written last).
+            pci_msix_program_vector(tbl_addr, VNET_MSIX_ENTRY_RX,
+                                    VNET_MSIX_VEC_RX, VNET_LAPIC_ID)
+            pci_msix_program_vector(tbl_addr, VNET_MSIX_ENTRY_TX,
+                                    VNET_MSIX_VEC_TX, VNET_LAPIC_ID)
+            pci_msix_program_vector(tbl_addr, VNET_MSIX_ENTRY_CFG,
+                                    VNET_MSIX_VEC_CFG, VNET_LAPIC_ID)
+            # Read back entry 0 to confirm the MMIO writes landed —
+            # a zero readback means the table writes never reached the
+            # device (which would make it raise an MSI to physical
+            # address 0, corrupting low RAM).
+            rb_addr: uint32 = cast[Ptr[uint32]](tbl_addr + 0)[0]
+            rb_data: uint32 = cast[Ptr[uint32]](tbl_addr + 8)[0]
+            rb_ctrl: uint32 = cast[Ptr[uint32]](tbl_addr + 12)[0]
+            printk2("[virtio-net] MSI-X entry0 readback addr=0x%x data=0x%x\n",
+                    cast[uint64](rb_addr), cast[uint64](rb_data))
+            printk1("[virtio-net] MSI-X entry0 vector-control=0x%x\n",
+                    cast[uint64](rb_ctrl))
+            # Flip the MSI-X Enable bit in the capability's Message
+            # Control register. From here the device-config window is
+            # at 0x18 and the queue/config MSI-X vector registers are
+            # live at 0x14/0x16.
+            pci_msix_enable(bdf, msix_cap)
+            vnet_state.msix_enabled = 1
+            vnet_state.msix_table   = tbl_addr
+            vnet_state.cfg_base     = cast[uint32](VIRTIO_PCI_CONFIG_MSIX)
+        else:
+            printk0("[virtio-net] MSI-X table too small — using INTx\n")
+
     # Set up RX (queue 0) and TX (queue 1).
     if _vnet_vq_setup(iobase, VQ_RX, &vnet_state.rx) < 0:
         return -1
     if _vnet_vq_setup(iobase, VQ_TX, &vnet_state.tx) < 0:
         return -1
 
+    # If MSI-X is on, tell the device which MSI-X table entry each
+    # virtqueue (and the config-change source) maps to. The device
+    # echoes the value back; 0xFFFF means it rejected the mapping —
+    # if that happens we abandon MSI-X and fall back to INTx so the
+    # device still delivers interrupts somehow.
+    if vnet_state.msix_enabled != 0:
+        rx_echo:  uint32 = virtio_set_queue_msix_vector(iobase, VQ_RX,
+                                                        VNET_MSIX_ENTRY_RX)
+        tx_echo:  uint32 = virtio_set_queue_msix_vector(iobase, VQ_TX,
+                                                        VNET_MSIX_ENTRY_TX)
+        cfg_echo: uint32 = virtio_set_config_msix_vector(iobase,
+                                                         VNET_MSIX_ENTRY_CFG)
+        if rx_echo == VIRTIO_MSI_NO_VECTOR \
+                or tx_echo == VIRTIO_MSI_NO_VECTOR \
+                or cfg_echo == VIRTIO_MSI_NO_VECTOR:
+            printk0("[virtio-net] device rejected MSI-X vector map — INTx\n")
+            vnet_state.msix_enabled = 0
+            vnet_state.cfg_base = cast[uint32](VIRTIO_PCI_CONFIG)
+
     # Read MAC and copy into the net_device global so userspace
     # (`/bin/ifconfig`) can render it later. We log it now too so
-    # the test fixture has something obvious to grep for.
-    _read_mac(iobase, &vnet_state.mac[0])
+    # the test fixture has something obvious to grep for. cfg_base
+    # already accounts for the MSI-X config-window shift.
+    _read_mac(iobase, vnet_state.cfg_base, &vnet_state.mac[0])
     i: uint64 = 0
     while i < 6:
         nd_mac[i] = vnet_state.mac[i]
@@ -326,16 +433,34 @@ def virtio_net_init() -> int32:
     virtio_driver_ok(iobase)
     virtio_notify(iobase, VQ_RX)
 
-    # M16.112: wire the IRQ. Read PCI INTERRUPT_PIN/INTERRUPT_LINE
-    # for diagnostic + to discover which IOAPIC redirection entry
-    # corresponds to this device's INTx. On QEMU's i440FX the
+    # --- Interrupt wiring ------------------------------------------
+    if vnet_state.msix_enabled != 0:
+        # MSI-X path: each virtqueue has its own LAPIC vector, routed
+        # straight from the device to the LAPIC with no IOAPIC in the
+        # path. Register the per-vector handlers. The RX/TX vectors
+        # both drain their respective rings; the config-change vector
+        # just acknowledges. This is the per-queue interrupt model
+        # modern multi-queue NICs use.
+        register_irq_handler(cast[uint64](VNET_MSIX_VEC_RX),
+                             cast[uint64](&virtio_net_msix_rx_handler))
+        register_irq_handler(cast[uint64](VNET_MSIX_VEC_TX),
+                             cast[uint64](&virtio_net_msix_tx_handler))
+        register_irq_handler(cast[uint64](VNET_MSIX_VEC_CFG),
+                             cast[uint64](&virtio_net_msix_cfg_handler))
+        printk2("[virtio-net] MSI-X wired: RX vec=0x%x TX vec=0x%x\n",
+                cast[uint64](VNET_MSIX_VEC_RX),
+                cast[uint64](VNET_MSIX_VEC_TX))
+        printk1("[virtio-net] init done; RX queue populated; MSI-X cfg vec=0x%x\n",
+                cast[uint64](VNET_MSIX_VEC_CFG))
+        return 0
+
+    # INTx fallback path: the device raises a single shared pin-based
+    # PCI INTx. Read PCI INTERRUPT_PIN/INTERRUPT_LINE to discover the
+    # firmware-assigned IOAPIC redirection entry. On QEMU's i440FX the
     # virtio-net PCI device defaults to INTA (pin=1) and the firmware
     # assigns INTERRUPT_LINE based on the slot — typically IRQ 11
-    # (IOAPIC pin 11). We program that pin to deliver our chosen CPU
-    # vector (0x40) to LAPIC id 0, then register the handler.
-    #
-    # If reading PCI returns 0 / 0xFF (uninitialised) we fall back to
-    # IOAPIC pin 11 — the QEMU default for virtio-net under i440FX.
+    # (IOAPIC pin 11). We program that pin to deliver CPU vector 0x40
+    # to LAPIC id 0, then register the handler.
     bus: uint32 = pci_bdf_bus(bdf)
     pdev: uint32 = pci_bdf_dev(bdf)
     fn:  uint32 = pci_bdf_fn(bdf)
@@ -360,6 +485,41 @@ def virtio_net_init() -> int32:
     printk1("[virtio-net] init done; RX queue populated; IRQ vec=0x%x\n",
             cast[uint64](VNET_IRQ_VECTOR))
     return 0
+
+
+def virtio_net_msix_rx_handler():
+    # MSI-X RX-queue interrupt. An MSI-X message is edge-triggered
+    # and has no shared device-level ISR to ack (that is the whole
+    # point — no INTx line to deassert), so we go straight to
+    # draining the RX used ring. do_irq sends the LAPIC EOI after we
+    # return.
+    if vnet_state.iobase == 0:
+        return
+    vnet_state.irq_count = vnet_state.irq_count + 1
+    virtio_net_poll()
+
+
+def virtio_net_msix_tx_handler():
+    # MSI-X TX-queue interrupt. The TX path is fire-and-forget today
+    # (no completion bookkeeping), so this handler just counts the
+    # IRQ — the descriptor slot is reused unconditionally on the next
+    # transmit. A real TX-completion reclaim would hook in here.
+    if vnet_state.iobase == 0:
+        return
+    vnet_state.irq_count = vnet_state.irq_count + 1
+
+
+def virtio_net_msix_cfg_handler():
+    # MSI-X config-change interrupt. Fires on link-status / MAC
+    # changes. We have no dynamic-reconfig path, so acknowledge by
+    # counting it.
+    if vnet_state.iobase == 0:
+        return
+    vnet_state.irq_count = vnet_state.irq_count + 1
+
+
+def virtio_net_msix_enabled() -> uint32:
+    return vnet_state.msix_enabled
 
 
 def virtio_net_irq_handler():

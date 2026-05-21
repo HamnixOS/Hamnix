@@ -28,16 +28,19 @@ from kernel.block.blk import (
 from drivers.pci.pci import (
     pci_find, pci_bdf_bus, pci_bdf_dev, pci_bdf_fn,
     pci_read_bar, pci_enable_io_and_master, PCI_BDF_NONE,
+    pci_config_read_byte,
 )
 from drivers.virtio.virtio_pci import (
     virtio_reset, virtio_acknowledge, virtio_driver_ok,
     virtio_read_host_features, virtio_write_guest_features,
-    virtio_dev_config_read_u64,
+    virtio_dev_config_read_u64, VIRTIO_PCI_ISR,
 )
 from drivers.virtio.virtio_ring import (
     VirtQueue, VirtBuf, virtq_setup, virtq_add_chain3,
     virtq_kick_and_wait,
 )
+from arch.x86.kernel.apic import ioapic_redirect
+from arch.x86.kernel.irq import register_irq_handler
 
 
 VIRTIO_VENDOR:     uint32 = 0x1AF4
@@ -51,6 +54,21 @@ VIRTIO_BLK_T_OUT:   uint32 = 1
 # the device-specific config window).
 VIRTIO_BLK_CFG_CAPACITY: uint32 = 0
 
+# PCI config-space offsets used by the INTx IRQ wiring path.
+VBLK_PCI_INTERRUPT_LINE: uint32 = 0x3C
+VBLK_PCI_INTERRUPT_PIN:  uint32 = 0x3D
+
+# CPU vector this driver claims for its INTx IRQ. The IOAPIC-routed
+# PCI-INTx band runs 0x40..0x47 (see arch/x86/kernel/idt.ad):
+#   0x40 virtio-net   0x41 AHCI   0x42 NVMe   0x44 r8169 (8139)
+#   0x45 PS/2 mouse   0x46 PS/2 kbd   0x47 e1000e
+# 0x43 is the free slot in that band — virtio-blk claims it. The
+# roadmap notes "vectors 0x41+" for this item.
+VBLK_IRQ_VECTOR: uint32 = 0x43
+
+# LAPIC id the IRQ is routed to — always the BSP (id 0) for now.
+VBLK_LAPIC_ID:   uint32 = 0
+
 
 # Per-device state. Single instance for now; we don't have a way
 # to enumerate multiple virtio-blk PCI devices yet.
@@ -59,6 +77,8 @@ class VirtioBlk:
     qsize:     uint32
     vq:        VirtQueue
     capacity:  uint64       # sectors
+    irq_pin:   uint32       # IOAPIC pin (GSI) we redirected
+    irq_count: uint64       # IRQs serviced by virtio_blk_irq_handler
 
 
 # Single in-flight request scratch:
@@ -204,4 +224,73 @@ def virtio_blk_init() -> int32:
     rc: int32 = register_blockdev("vda", cap, &vblk_ops, 0)
     if rc < 0:
         return -1
+
+    # --- INTx IRQ wiring (kernel roadmap §9) -----------------------
+    # Finish the legacy INTx path so block completions are
+    # interrupt-driven rather than purely poll-driven. virtio-blk's
+    # legacy transport raises a pin-based PCI INTx whenever a
+    # virtqueue advances; we route the firmware-assigned IOAPIC pin
+    # to CPU vector 0x43 on the BSP LAPIC and register a handler.
+    #
+    # The synchronous block-layer API still drives completion through
+    # virtq_kick_and_wait()'s used-ring poll — that stays as the
+    # safety-net for the early-boot FAT mount, which runs before
+    # interrupts are enabled. Once `sti` is live the handler below
+    # acknowledges the device-level ISR (read-to-clear) so the INTx
+    # line deasserts; the same handler is what an async bio path
+    # would hang completion off in future. Mirrors how AHCI / NVMe
+    # keep their polled drains alongside the wired IRQ.
+    vbus: uint32 = pci_bdf_bus(bdf)
+    vdev: uint32 = pci_bdf_dev(bdf)
+    vfn:  uint32 = pci_bdf_fn(bdf)
+    intx_pin:  uint32 = pci_config_read_byte(vbus, vdev, vfn,
+                                             VBLK_PCI_INTERRUPT_PIN)
+    intx_line: uint32 = pci_config_read_byte(vbus, vdev, vfn,
+                                             VBLK_PCI_INTERRUPT_LINE)
+    printk2("virtio-blk: PCI INTx pin=%d line=%d\n",
+            cast[uint64](intx_pin), cast[uint64](intx_line))
+    ioapic_pin: uint32 = intx_line
+    if intx_pin == 0 or intx_line == 0 or intx_line >= 24:
+        # Pin 0 = "no interrupt"; an out-of-range line means firmware
+        # never programmed it. QEMU's virtio-blk on i440FX lands on
+        # IOAPIC pin 11 by default — fall back to that.
+        ioapic_pin = 11
+        printk1("virtio-blk: PCI INTx line unreliable; using IOAPIC pin %d\n",
+                cast[uint64](ioapic_pin))
+    vblk_state.irq_pin   = ioapic_pin
+    vblk_state.irq_count = 0
+    register_irq_handler(cast[uint64](VBLK_IRQ_VECTOR),
+                         cast[uint64](&virtio_blk_irq_handler))
+    ioapic_redirect(ioapic_pin, VBLK_IRQ_VECTOR, VBLK_LAPIC_ID)
+    printk2("virtio-blk: irq pin=%d vec=0x%x\n",
+            cast[uint64](ioapic_pin), cast[uint64](VBLK_IRQ_VECTOR))
     return 0
+
+
+def virtio_blk_irq_handler():
+    # INTx handler. Runs with interrupts disabled (CPU did cli on
+    # gate entry); do_irq() sends the LAPIC EOI after we return. The
+    # virtio device-level ISR at BAR0 + 0x13 is read-to-clear: a
+    # single inb() here both tells us why the IRQ fired (bit 0 =
+    # queue advanced) AND deasserts the INTx line so the IOAPIC
+    # level-triggered entry's Remote-IRR clears on the EOI. Reading
+    # it is therefore mandatory even though the synchronous
+    # virtq_kick_and_wait() poll is what actually retires the request
+    # — skipping the ISR read would wedge the INTx line asserted.
+    if vblk_state.iobase == 0:
+        return
+    isr: int32 = inb(cast[int32](vblk_state.iobase
+                                 + cast[uint32](VIRTIO_PCI_ISR)))
+    vblk_state.irq_count = vblk_state.irq_count + 1
+    # isr bit 0 set => at least one virtqueue advanced (a block
+    # request completed). The completed request's data is retired by
+    # the in-flight virtq_kick_and_wait() caller; nothing else to do
+    # here for the current synchronous block API.
+
+
+def virtio_blk_irq_count() -> uint64:
+    return vblk_state.irq_count
+
+
+def virtio_blk_irq_pin() -> uint32:
+    return vblk_state.irq_pin
