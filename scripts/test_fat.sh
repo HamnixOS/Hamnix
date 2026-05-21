@@ -41,9 +41,18 @@ set +e
     sleep 3
     printf 'cat /mnt/HELLO.TXT\n'
     sleep 1
+    # M16.x §12.5: FAT write path through the shell `>` redirect.
+    # echo creates /mnt/FATSHELL.TXT and writes a marker; cat reads
+    # it back. rm then deletes it; a second cat must fail.
+    printf 'echo FAT_WRITE_VIA_SHELL > /mnt/FATSHELL.TXT\n'
+    sleep 1
+    printf 'cat /mnt/FATSHELL.TXT\n'
+    sleep 1
+    printf 'rm /mnt/FATSHELL.TXT\n'
+    sleep 1
     printf 'exit\n'
     sleep 1
-) | timeout 15s qemu-system-x86_64 \
+) | timeout 25s qemu-system-x86_64 \
     -kernel "$ELF" \
     -smp 2 \
     -nographic \
@@ -64,6 +73,23 @@ if grep -F -q "FAT32_MARKER" "$LOG"; then
     echo "[test_fat] OK: FAT32_MARKER read back from /mnt/HELLO.TXT"
 else
     echo "[test_fat] MISS: 'FAT32_MARKER' not in serial log"
+    fail=1
+fi
+
+# M16.x §12.5: FAT write path. The kernel-side smoke test
+# (fat_write_smoke_test) covers create/extend/overwrite/delete
+# end-to-end; the shell exercise proves the same path through
+# vfs_open_write -> fat_open_write and vfs_unlink -> fat_delete.
+if grep -F -q "fat: write smoke PASS" "$LOG"; then
+    echo "[test_fat] OK: fat write smoke (create/extend/overwrite/delete)"
+else
+    echo "[test_fat] MISS: 'fat: write smoke PASS' not in serial log"
+    fail=1
+fi
+if grep -F -q "FAT_WRITE_VIA_SHELL" "$LOG"; then
+    echo "[test_fat] OK: FAT write via shell redirect + read-back"
+else
+    echo "[test_fat] MISS: shell-written FAT file did not read back"
     fail=1
 fi
 

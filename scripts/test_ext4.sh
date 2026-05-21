@@ -123,6 +123,9 @@ for needle in \
     "ext4: bitmap smoke PASS" \
     "ext4: create smoke PASS" \
     "CREATE_OK ext4 file-create round-trip works" \
+    "ext4: rename smoke PASS" \
+    "ext4: truncate smoke PASS" \
+    "ext4: fsync smoke PASS" \
     "WRITE_VIA_SHELL" \
     "UNLINKED_OK"
 do

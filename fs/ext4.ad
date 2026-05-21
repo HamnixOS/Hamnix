@@ -29,9 +29,11 @@
 #   0x58  s_inode_size         u16
 
 from kernel.block.blk import (
-    blk_read_sectors, blk_write_sectors, find_blockdev, SECTOR_SIZE,
+    blk_read_sectors, blk_write_sectors, blk_flush, find_blockdev,
+    SECTOR_SIZE,
 )
 from kernel.printk.printk import printk0, printk1, printk2
+from drivers.rtc.cmos import rtc_read_unix_time
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
@@ -778,6 +780,14 @@ def ext4_open_inum(slot: int32) -> uint32:
     return ext4_open_files[cast[uint64](slot)].inum
 
 
+def ext4_set_open_size(slot: int32, size: uint64):
+    # Refresh the cached file_size after an out-of-band size change
+    # (ftruncate) so ext4_open_size() stays accurate for read-back.
+    if slot < 0:
+        return
+    ext4_open_files[cast[uint64](slot)].file_size = size
+
+
 def ext4_listdir(path: Ptr[char], buf: Ptr[uint8],
                  count: uint64) -> int64:
     # Pack the named directory's entries into buf as "NAME\n" lines.
@@ -1175,6 +1185,76 @@ def _ext4_write_u32(p: Ptr[uint8], v: uint32):
 ext4_new_inode_buf: Array[256, uint8]
 
 
+# --- per-inode mtime (M16.x §12.3) --------------------------------
+#
+# ext4 stores three 32-bit Unix timestamps in the inode:
+#
+#   0x08  i_atime   last access
+#   0x0C  i_ctime   last status change (inode metadata)
+#   0x10  i_mtime   last data modification
+#
+# (256-byte inodes also carry *_extra nanosecond/epoch-high words at
+# 0x84/0x88/0x8C, but a plain seconds timestamp at the lo offsets is
+# what `stat` and make's timestamp logic read first — Linux fills the
+# extra words only when the inode is large enough AND the feature is
+# on. We keep it to the lo words, which every ext2/3/4 reader honours.)
+#
+# A freshly-mkfs'd inode has all three at 0; we stamp them with the
+# RTC epoch on create and refresh i_mtime + i_ctime on every write or
+# truncate so `stat` reports a real, monotonically-advancing mtime and
+# make-style "is the target newer than the source" logic works.
+
+INODE_I_ATIME_OFFSET: uint64 = 0x08
+INODE_I_CTIME_OFFSET: uint64 = 0x0C
+INODE_I_MTIME_OFFSET: uint64 = 0x10
+
+
+def _ext4_now_epoch() -> uint32:
+    # Wall-clock seconds for a timestamp stamp. The RTC is the source
+    # of truth; if it's unreadable we fall back to 0 (the mkfs default)
+    # rather than inventing a bogus time.
+    t: int64 = rtc_read_unix_time()
+    if t < 0:
+        return 0
+    return cast[uint32](t)
+
+
+def ext4_inode_mtime(buf: Ptr[uint8]) -> uint32:
+    # struct ext4_inode.i_mtime — Unix epoch seconds. Exposed so the
+    # VFS stat path can report a real mtime instead of a jiffies guess.
+    return _ext4_read_u32(
+        cast[Ptr[uint8]](cast[uint64](buf) + INODE_I_MTIME_OFFSET))
+
+
+def _ext4_stamp_mtime(inode_buf: Ptr[uint8]):
+    # Refresh i_mtime + i_ctime in an in-memory inode buffer. ctime
+    # tracks any inode-metadata change, so a data write (which bumps
+    # i_size / extents) bumps ctime too — matches Linux's
+    # ext4_current_time() use in ext4_write_end / ext4_setattr.
+    now: uint32 = _ext4_now_epoch()
+    _ext4_write_u32(
+        cast[Ptr[uint8]](cast[uint64](inode_buf) + INODE_I_MTIME_OFFSET),
+        now)
+    _ext4_write_u32(
+        cast[Ptr[uint8]](cast[uint64](inode_buf) + INODE_I_CTIME_OFFSET),
+        now)
+
+
+def _ext4_stamp_all_times(inode_buf: Ptr[uint8]):
+    # Stamp atime + ctime + mtime — used at create time so a fresh
+    # inode carries a coherent timestamp triple instead of epoch 0.
+    now: uint32 = _ext4_now_epoch()
+    _ext4_write_u32(
+        cast[Ptr[uint8]](cast[uint64](inode_buf) + INODE_I_ATIME_OFFSET),
+        now)
+    _ext4_write_u32(
+        cast[Ptr[uint8]](cast[uint64](inode_buf) + INODE_I_CTIME_OFFSET),
+        now)
+    _ext4_write_u32(
+        cast[Ptr[uint8]](cast[uint64](inode_buf) + INODE_I_MTIME_OFFSET),
+        now)
+
+
 def _ext4_zero(p: Ptr[uint8], n: uint64):
     i: uint64 = 0
     while i < n:
@@ -1212,6 +1292,9 @@ def _ext4_init_regular_inode(data_blk: uint64, size: uint64):
     _ext4_write_u16(cast[Ptr[uint8]](eh + 18), 0)
     _ext4_write_u32(cast[Ptr[uint8]](eh + 20),
                     cast[uint32](data_blk))
+    # Stamp atime/ctime/mtime with the wall clock so a freshly-created
+    # file reports a real mtime through stat (M16.x §12.3).
+    _ext4_stamp_all_times(p)
 
 
 def _ext4_strlen(name: Ptr[char]) -> uint64:
@@ -1534,17 +1617,20 @@ def ext4_write_open_file(slot: int32, src: Ptr[uint8],
            src, take)
     if _ext4_write_block(phys, &ext4_blk_buf[0]) != 0:
         return -1
-    # Extend i_size if needed.
+    # Extend i_size if needed, and always refresh mtime: a write
+    # mutates the data even when it doesn't grow the file, so stat
+    # must see a fresh mtime regardless (M16.x §12.3).
     cur_size: uint32 = ext4_inode_size_lo(&inode[0])
     new_end:  uint64 = pos + take
     if new_end > cast[uint64](cur_size):
         _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](&inode[0]) + 4),
                         cast[uint32](new_end))
-        if ext4_write_inode(cast[uint64](inum), &inode[0]) != 0:
-            return -1
         # Update the cached size in the open-file slot so the
         # ext4_open_size() helper stays accurate for read-back.
         ext4_open_files[cast[uint64](slot)].file_size = new_end
+    _ext4_stamp_mtime(&inode[0])
+    if ext4_write_inode(cast[uint64](inum), &inode[0]) != 0:
+        return -1
     return cast[int64](take)
 
 
@@ -1630,6 +1716,750 @@ def ext4_unlink(name: Ptr[char]) -> int32:
     _ext4_write_u32(cast[Ptr[uint8]](
         cast[uint64](&ext4_blk_buf[0]) + target_pos + 0), 0)
     return _ext4_write_block(target_phys, &ext4_blk_buf[0])
+
+
+# --- truncate / ftruncate (M16.x §12.2) ---------------------------
+#
+# Resize a regular file to an arbitrary byte length, freeing or
+# allocating blocks as needed and updating i_size. Scope: files whose
+# extents fit inline in the inode's i_block window (depth-0 leaf,
+# eh_max 4) — that covers everything our create/write path produces
+# and any small file on a real ext4 volume. A file deep enough to
+# need an index node (eh_depth > 0) is rejected with -1; growing such
+# a file would need to split the extent tree, which is a documented
+# follow-up.
+#
+# Linux's ext4_truncate() does the same two jobs: ext4_ext_remove_space
+# for a shrink, and (on grow) leaves the tail sparse / zero-fills the
+# partial block. We mirror that: shrink frees the now-unreachable
+# blocks and trims/drops leaf extents; grow appends extents (each one
+# block) and zero-fills, so a read of the grown region returns zeros.
+
+EXT4_EH_DEPTH_OFFSET:   uint64 = 6
+EXT4_EH_ENTRIES_OFFSET: uint64 = 2
+
+
+def _ext4_leaf_entries(inode_buf: Ptr[uint8]) -> int32:
+    # Number of extents in the inode's inline leaf. Returns -1 if the
+    # inode is not a depth-0 extents inode (bad magic, or an index
+    # node we don't rewrite).
+    eh: uint64 = cast[uint64](inode_buf) + INODE_I_BLOCK_OFFSET
+    magic: uint16 = _ext4_read_u16(cast[Ptr[uint8]](eh + 0))
+    if magic != EXT4_EXTENT_MAGIC:
+        return -1
+    depth: uint16 = _ext4_read_u16(
+        cast[Ptr[uint8]](eh + EXT4_EH_DEPTH_OFFSET))
+    if depth != 0:
+        return -1
+    return cast[int32](_ext4_read_u16(
+        cast[Ptr[uint8]](eh + EXT4_EH_ENTRIES_OFFSET)))
+
+
+def _ext4_inode_block_count(inode_buf: Ptr[uint8]) -> uint64:
+    # Total logical blocks covered by the inline leaf extents — i.e.
+    # how many blocks of file data are currently allocated. Returns 0
+    # for an empty or non-leaf inode.
+    n: int32 = _ext4_leaf_entries(inode_buf)
+    if n < 0:
+        return 0
+    eh: uint64 = cast[uint64](inode_buf) + INODE_I_BLOCK_OFFSET
+    total: uint64 = 0
+    i: int32 = 0
+    while i < n:
+        ee: uint64 = eh + 12 + cast[uint64](i) * 12
+        ee_block: uint32 = _ext4_read_u32(cast[Ptr[uint8]](ee + 0))
+        ee_len:   uint16 = _ext4_read_u16(cast[Ptr[uint8]](ee + 4))
+        end: uint64 = cast[uint64](ee_block) + cast[uint64](ee_len)
+        if end > total:
+            total = end
+        i = i + 1
+    return total
+
+
+def _ext4_extent_append_block(inode_buf: Ptr[uint8],
+                              logical_blk: uint64,
+                              phys_blk: uint64) -> int32:
+    # Append a one-block extent (ee_block=logical_blk, ee_len=1) to the
+    # inode's inline leaf. If the new logical block is contiguous with
+    # the last extent's physical run, the last extent is simply
+    # lengthened instead of consuming a new slot (the same coalescing
+    # ext4_ext_try_to_merge does). Returns 0 on success, -1 if the
+    # leaf is full (eh_entries == eh_max) and no merge was possible.
+    eh: uint64 = cast[uint64](inode_buf) + INODE_I_BLOCK_OFFSET
+    magic: uint16 = _ext4_read_u16(cast[Ptr[uint8]](eh + 0))
+    if magic != EXT4_EXTENT_MAGIC:
+        return -1
+    depth: uint16 = _ext4_read_u16(
+        cast[Ptr[uint8]](eh + EXT4_EH_DEPTH_OFFSET))
+    if depth != 0:
+        return -1
+    entries: uint16 = _ext4_read_u16(
+        cast[Ptr[uint8]](eh + EXT4_EH_ENTRIES_OFFSET))
+    eh_max: uint16 = _ext4_read_u16(cast[Ptr[uint8]](eh + 4))
+    if entries > 0:
+        # Try to extend the last extent if the new block continues it.
+        last: uint64 = eh + 12 + cast[uint64](entries - 1) * 12
+        l_block:    uint32 = _ext4_read_u32(cast[Ptr[uint8]](last + 0))
+        l_len:      uint16 = _ext4_read_u16(cast[Ptr[uint8]](last + 4))
+        l_start_hi: uint16 = _ext4_read_u16(cast[Ptr[uint8]](last + 6))
+        l_start_lo: uint32 = _ext4_read_u32(cast[Ptr[uint8]](last + 8))
+        l_phys: uint64 = (cast[uint64](l_start_hi) << 32) \
+                       | cast[uint64](l_start_lo)
+        l_logend:  uint64 = cast[uint64](l_block) + cast[uint64](l_len)
+        l_physend: uint64 = l_phys + cast[uint64](l_len)
+        if l_logend == logical_blk and l_physend == phys_blk \
+                and l_len < 32768:
+            _ext4_write_u16(cast[Ptr[uint8]](last + 4),
+                            cast[uint16](l_len + 1))
+            return 0
+    if entries >= eh_max:
+        printk0("ext4: extent leaf full (truncate-grow needs index)\n")
+        return -1
+    ne: uint64 = eh + 12 + cast[uint64](entries) * 12
+    _ext4_write_u32(cast[Ptr[uint8]](ne + 0),
+                    cast[uint32](logical_blk))
+    _ext4_write_u16(cast[Ptr[uint8]](ne + 4), 1)
+    _ext4_write_u16(cast[Ptr[uint8]](ne + 6),
+                    cast[uint16]((phys_blk >> 32) & 0xFFFF))
+    _ext4_write_u32(cast[Ptr[uint8]](ne + 8),
+                    cast[uint32](phys_blk & 0xFFFFFFFF))
+    _ext4_write_u16(cast[Ptr[uint8]](eh + EXT4_EH_ENTRIES_OFFSET),
+                    cast[uint16](entries + 1))
+    return 0
+
+
+def _ext4_extent_trim_to(inode_buf: Ptr[uint8],
+                         keep_blocks: uint64) -> int32:
+    # Drop file data past logical block `keep_blocks`: free every
+    # physical block at logical index >= keep_blocks and rewrite the
+    # leaf so only the first `keep_blocks` logical blocks survive. An
+    # extent that straddles the cut is split (its ee_len shrunk);
+    # extents entirely past the cut are dropped and their blocks
+    # freed. Returns 0 on success, -1 on a non-leaf inode.
+    n: int32 = _ext4_leaf_entries(inode_buf)
+    if n < 0:
+        return -1
+    eh: uint64 = cast[uint64](inode_buf) + INODE_I_BLOCK_OFFSET
+    surviving: int32 = 0
+    i: int32 = 0
+    while i < n:
+        ee: uint64 = eh + 12 + cast[uint64](i) * 12
+        ee_block:    uint32 = _ext4_read_u32(cast[Ptr[uint8]](ee + 0))
+        ee_len:      uint16 = _ext4_read_u16(cast[Ptr[uint8]](ee + 4))
+        ee_start_hi: uint16 = _ext4_read_u16(cast[Ptr[uint8]](ee + 6))
+        ee_start_lo: uint32 = _ext4_read_u32(cast[Ptr[uint8]](ee + 8))
+        eb:    uint64 = cast[uint64](ee_block)
+        elen:  uint64 = cast[uint64](ee_len)
+        ephys: uint64 = (cast[uint64](ee_start_hi) << 32) \
+                      | cast[uint64](ee_start_lo)
+        if eb >= keep_blocks:
+            # Whole extent is past the cut — free every block in it.
+            k: uint64 = 0
+            while k < elen:
+                ext4_free_block(ephys + k)
+                k = k + 1
+        elif eb + elen > keep_blocks:
+            # Extent straddles the cut — keep the head, free the tail.
+            keep_len: uint64 = keep_blocks - eb
+            j: uint64 = keep_len
+            while j < elen:
+                ext4_free_block(ephys + j)
+                j = j + 1
+            sv: uint64 = eh + 12 + cast[uint64](surviving) * 12
+            _ext4_write_u32(cast[Ptr[uint8]](sv + 0),
+                            cast[uint32](eb))
+            _ext4_write_u16(cast[Ptr[uint8]](sv + 4),
+                            cast[uint16](keep_len))
+            _ext4_write_u16(cast[Ptr[uint8]](sv + 6),
+                            cast[uint16]((ephys >> 32) & 0xFFFF))
+            _ext4_write_u32(cast[Ptr[uint8]](sv + 8),
+                            cast[uint32](ephys & 0xFFFFFFFF))
+            surviving = surviving + 1
+        else:
+            # Extent is entirely before the cut — copy it down to the
+            # next surviving slot (compaction; no-op when i == surviving).
+            sv: uint64 = eh + 12 + cast[uint64](surviving) * 12
+            if sv != ee:
+                _ext4_write_u32(cast[Ptr[uint8]](sv + 0), ee_block)
+                _ext4_write_u16(cast[Ptr[uint8]](sv + 4), ee_len)
+                _ext4_write_u16(cast[Ptr[uint8]](sv + 6), ee_start_hi)
+                _ext4_write_u32(cast[Ptr[uint8]](sv + 8), ee_start_lo)
+            surviving = surviving + 1
+        i = i + 1
+    # Zero the dropped slots so a stale extent never gets walked.
+    z: int32 = surviving
+    while z < n:
+        zz: uint64 = eh + 12 + cast[uint64](z) * 12
+        _ext4_zero(cast[Ptr[uint8]](zz), 12)
+        z = z + 1
+    _ext4_write_u16(cast[Ptr[uint8]](eh + EXT4_EH_ENTRIES_OFFSET),
+                    cast[uint16](surviving))
+    return 0
+
+
+def ext4_truncate_inode(inum: uint32, new_len: uint64) -> int32:
+    # Resize the file at `inum` to exactly `new_len` bytes. Backs both
+    # truncate(2) (path) and ftruncate(2) (fd) — the caller resolves
+    # the path / fd to an inum, this does the inode-level work.
+    #
+    #   shrink: free the blocks past the new length, trim the leaf,
+    #           drop i_size. The first block of the surviving region
+    #           keeps its bytes; the bytes past new_len within the
+    #           last kept block are left as-is on disk but are
+    #           unreachable (i_size hides them) — Linux does the same.
+    #   grow:   allocate fresh zero-filled blocks for the new tail,
+    #           append one-block extents, raise i_size. A read of the
+    #           grown region returns zeros (the new blocks are zeroed
+    #           before being written out).
+    #
+    # Returns 0 on success, -1 on I/O error / unsupported inode shape.
+    if ext4_blockdev_slot < 0:
+        return -1
+    inode: Array[256, uint8]
+    if ext4_read_inode(cast[uint64](inum), &inode[0]) != 0:
+        return -1
+    if _ext4_leaf_entries(&inode[0]) < 0:
+        printk0("ext4: truncate: inode not a depth-0 extents file\n")
+        return -1
+    old_len: uint64 = cast[uint64](ext4_inode_size_lo(&inode[0]))
+    if new_len == old_len:
+        return 0
+    old_blocks: uint64 = (old_len + ext4_block_size - 1) \
+                       / ext4_block_size
+    new_blocks: uint64 = (new_len + ext4_block_size - 1) \
+                       / ext4_block_size
+
+    if new_len < old_len:
+        # Shrink. Free blocks past new_blocks, trim the leaf.
+        if _ext4_extent_trim_to(&inode[0], new_blocks) != 0:
+            return -1
+        # If the new end falls mid-block, zero the slack inside the
+        # last surviving block so a later grow can't resurrect stale
+        # bytes (Linux's block_truncate_page).
+        tail: uint64 = new_len % ext4_block_size
+        if tail != 0 and new_blocks > 0:
+            phys: uint64 = _ext4_logical_to_physical(&inode[0],
+                                                     new_blocks - 1)
+            if phys != 0:
+                if _ext4_read_block(phys, &ext4_blk_buf[0]) == 0:
+                    _ext4_zero(
+                        cast[Ptr[uint8]](
+                            cast[uint64](&ext4_blk_buf[0]) + tail),
+                        ext4_block_size - tail)
+                    if _ext4_write_block(phys,
+                                         &ext4_blk_buf[0]) != 0:
+                        return -1
+    else:
+        # Grow. Allocate + zero each new block, append an extent.
+        lb: uint64 = old_blocks
+        while lb < new_blocks:
+            nb: uint64 = ext4_alloc_block()
+            if nb == 0:
+                printk0("ext4: truncate-grow: out of space\n")
+                return -1
+            _ext4_zero(&ext4_blk_buf[0], ext4_block_size)
+            if _ext4_write_block(nb, &ext4_blk_buf[0]) != 0:
+                ext4_free_block(nb)
+                return -1
+            if _ext4_extent_append_block(&inode[0], lb, nb) != 0:
+                ext4_free_block(nb)
+                return -1
+            lb = lb + 1
+        # If old_len ended mid-block, that partial block already
+        # carries its old bytes; the grown region beyond old_len in
+        # that same block must read as zero. Zero the slack.
+        tail: uint64 = old_len % ext4_block_size
+        if tail != 0 and old_blocks > 0:
+            phys: uint64 = _ext4_logical_to_physical(&inode[0],
+                                                     old_blocks - 1)
+            if phys != 0:
+                if _ext4_read_block(phys, &ext4_blk_buf[0]) == 0:
+                    _ext4_zero(
+                        cast[Ptr[uint8]](
+                            cast[uint64](&ext4_blk_buf[0]) + tail),
+                        ext4_block_size - tail)
+                    if _ext4_write_block(phys,
+                                         &ext4_blk_buf[0]) != 0:
+                        return -1
+
+    # Commit the new size + a fresh mtime/ctime.
+    _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](&inode[0]) + 4),
+                    cast[uint32](new_len))
+    _ext4_stamp_mtime(&inode[0])
+    if ext4_write_inode(cast[uint64](inum), &inode[0]) != 0:
+        return -1
+    return 0
+
+
+# --- ext4 rename (M16.x §12.1) ------------------------------------
+#
+# Move a directory entry from one parent directory to another (or
+# rename it within the same directory). Mirrors fs/ext4/namei.c
+# ext4_rename at minimum scope:
+#
+#   1. resolve the source's parent dir + the source dirent (inum,
+#      file_type),
+#   2. resolve the destination's parent dir,
+#   3. if the destination name already exists, unlink it first
+#      (overwrite semantics — what rename(2) and `mv` expect),
+#   4. insert a dirent for (dest_name -> src_inum) in the dest dir,
+#   5. tombstone the source dirent.
+#
+# The same-directory case (dst parent == src parent) is just a
+# special case of the cross-directory path and needs no extra code,
+# EXCEPT that we must insert into the new name BEFORE tombstoning the
+# old one so the inode is never momentarily unreferenced. We order it
+# that way unconditionally.
+#
+# Scope: regular files in directories reachable from the ext4 root.
+# Renaming a directory inode works too (the dirent move is identical)
+# but we don't fix up the moved dir's ".." entry — a follow-up. The
+# VFS only routes file renames here today.
+
+def _ext4_dir_find_entry(dir_inum: uint64, name: Ptr[char],
+                         out_inum: Ptr[uint32],
+                         out_ftype: Ptr[uint8]) -> int32:
+    # Locate `name` in directory `dir_inum`. On hit, fills out_inum +
+    # out_ftype and returns 1; returns 0 on miss, -1 on I/O error.
+    if dir_inum == 0:
+        return -1
+    dir_inode: Array[256, uint8]
+    if ext4_read_inode(dir_inum, &dir_inode[0]) != 0:
+        return -1
+    dir_size: uint64 = cast[uint64](ext4_inode_size_lo(&dir_inode[0]))
+    if dir_size == 0:
+        return 0
+    nlen: uint64 = _ext4_strlen(name)
+    nblocks: uint64 = (dir_size + ext4_block_size - 1) \
+                    / ext4_block_size
+    lb: uint64 = 0
+    while lb < nblocks:
+        phys: uint64 = _ext4_logical_to_physical(&dir_inode[0], lb)
+        if phys == 0:
+            return 0
+        if _ext4_read_block(phys, &ext4_blk_buf[0]) != 0:
+            return -1
+        pos: uint64 = 0
+        while pos < ext4_block_size:
+            e: uint64 = cast[uint64](&ext4_blk_buf[0]) + pos
+            e_inum:    uint32 = _ext4_read_u32(cast[Ptr[uint8]](e + 0))
+            e_rec_len: uint16 = _ext4_read_u16(cast[Ptr[uint8]](e + 4))
+            if e_rec_len == 0:
+                break
+            if e_inum != 0:
+                e_name_len: uint64 = cast[uint64](
+                    cast[Ptr[uint8]](e + 6)[0])
+                if e_name_len == nlen \
+                        and _name_eq_with_len(cast[Ptr[uint8]](e + 8),
+                                              cast[Ptr[uint8]](name),
+                                              nlen) != 0:
+                    out_inum[0]  = e_inum
+                    out_ftype[0] = cast[Ptr[uint8]](e + 7)[0]
+                    return 1
+            pos = pos + cast[uint64](e_rec_len)
+        lb = lb + 1
+    return 0
+
+
+def _ext4_dir_tombstone(dir_inum: uint64, name: Ptr[char]) -> int32:
+    # Mark the dirent for `name` in directory `dir_inum` as inum=0.
+    # Returns the previous inum on hit, 0 on miss / error. Works on
+    # any directory (not just root) — the generalisation of
+    # _ext4_dir_unlink_in_root that rename needs.
+    if dir_inum == 0:
+        return 0
+    dir_inode: Array[256, uint8]
+    if ext4_read_inode(dir_inum, &dir_inode[0]) != 0:
+        return 0
+    dir_size: uint64 = cast[uint64](ext4_inode_size_lo(&dir_inode[0]))
+    if dir_size == 0:
+        return 0
+    nlen: uint64 = _ext4_strlen(name)
+    nblocks: uint64 = (dir_size + ext4_block_size - 1) \
+                    / ext4_block_size
+    lb: uint64 = 0
+    while lb < nblocks:
+        phys: uint64 = _ext4_logical_to_physical(&dir_inode[0], lb)
+        if phys == 0:
+            return 0
+        if _ext4_read_block(phys, &ext4_blk_buf[0]) != 0:
+            return 0
+        pos: uint64 = 0
+        while pos < ext4_block_size:
+            e: uint64 = cast[uint64](&ext4_blk_buf[0]) + pos
+            e_inum:    uint32 = _ext4_read_u32(cast[Ptr[uint8]](e + 0))
+            e_rec_len: uint16 = _ext4_read_u16(cast[Ptr[uint8]](e + 4))
+            if e_rec_len == 0:
+                break
+            if e_inum != 0:
+                e_name_len: uint64 = cast[uint64](
+                    cast[Ptr[uint8]](e + 6)[0])
+                if e_name_len == nlen \
+                        and _name_eq_with_len(cast[Ptr[uint8]](e + 8),
+                                              cast[Ptr[uint8]](name),
+                                              nlen) != 0:
+                    _ext4_write_u32(cast[Ptr[uint8]](e + 0), 0)
+                    if _ext4_write_block(phys, &ext4_blk_buf[0]) != 0:
+                        return 0
+                    return e_inum
+            pos = pos + cast[uint64](e_rec_len)
+        lb = lb + 1
+    return 0
+
+
+def _ext4_split_dir_path(path: Ptr[char], parent_out: Ptr[uint8],
+                         leaf_out: Ptr[uint8]) -> int32:
+    # Split a /ext-relative path "SUB/FILE.TXT" into the parent dir
+    # path "SUB" (parent_out) and the leaf name "FILE.TXT" (leaf_out).
+    # A bare leaf "FILE.TXT" yields parent "" (the ext4 root). Both
+    # output buffers are 256 bytes. Returns 0 on success, -1 if the
+    # leaf is empty or the path is too long.
+    n: uint64 = _ext4_strlen(path)
+    if n == 0 or n >= 255:
+        return -1
+    # Find the last '/'.
+    last_slash: int64 = -1
+    i: uint64 = 0
+    while i < n:
+        if path[i] == 47:
+            last_slash = cast[int64](i)
+        i = i + 1
+    if last_slash < 0:
+        parent_out[0] = 0
+        j: uint64 = 0
+        while j <= n:
+            leaf_out[j] = cast[uint8](path[j] & 0xFF)
+            j = j + 1
+        return 0
+    ls: uint64 = cast[uint64](last_slash)
+    k: uint64 = 0
+    while k < ls:
+        parent_out[k] = cast[uint8](path[k] & 0xFF)
+        k = k + 1
+    parent_out[ls] = 0
+    # Leaf is everything after the slash.
+    src: uint64 = ls + 1
+    m: uint64 = 0
+    while src + m <= n:
+        leaf_out[m] = cast[uint8](path[src + m] & 0xFF)
+        m = m + 1
+    if leaf_out[0] == 0:
+        return -1
+    return 0
+
+
+# Scratch path buffers for rename's parent/leaf split. Single mount,
+# single thread, so static buffers are safe.
+ext4_rn_old_parent: Array[256, uint8]
+ext4_rn_old_leaf:   Array[256, uint8]
+ext4_rn_new_parent: Array[256, uint8]
+ext4_rn_new_leaf:   Array[256, uint8]
+
+
+def ext4_rename(old_path: Ptr[char], new_path: Ptr[char]) -> int32:
+    # Rename / move within the ext4 volume. `old_path` and `new_path`
+    # are both /ext-relative (caller stripped the /ext/ prefix).
+    # Returns 0 on success, a negative errno on failure.
+    if ext4_blockdev_slot < 0:
+        return -1
+    if _ext4_split_dir_path(old_path, &ext4_rn_old_parent[0],
+                            &ext4_rn_old_leaf[0]) != 0:
+        return -2                                  # -ENOENT-ish
+    if _ext4_split_dir_path(new_path, &ext4_rn_new_parent[0],
+                            &ext4_rn_new_leaf[0]) != 0:
+        return -2
+
+    old_parent_inum: uint32 = ext4_resolve_dir(
+        cast[Ptr[char]](&ext4_rn_old_parent[0]))
+    if old_parent_inum == 0:
+        return -2
+    new_parent_inum: uint32 = ext4_resolve_dir(
+        cast[Ptr[char]](&ext4_rn_new_parent[0]))
+    if new_parent_inum == 0:
+        return -2
+
+    # Resolve the source dirent (inum + file_type) BEFORE touching
+    # anything — if the source doesn't exist there is nothing to do.
+    src_inum:  uint32 = 0
+    src_ftype: uint8  = 0
+    sr: int32 = _ext4_dir_find_entry(
+        cast[uint64](old_parent_inum),
+        cast[Ptr[char]](&ext4_rn_old_leaf[0]),
+        &src_inum, &src_ftype)
+    if sr <= 0:
+        return -2                                  # -ENOENT
+
+    # If source and destination name the same dirent, nothing to do.
+    if old_parent_inum == new_parent_inum:
+        same: int32 = _name_eq_with_len(
+            &ext4_rn_old_leaf[0], &ext4_rn_new_leaf[0],
+            _ext4_strlen(cast[Ptr[char]](&ext4_rn_old_leaf[0])))
+        if same != 0:
+            return 0
+
+    # Overwrite case: if the destination name already exists, unlink
+    # the old occupant first (free its inode + first data block, then
+    # tombstone its dirent). rename(2) replaces atomically — we don't
+    # have a journal, so we accept the tiny window where the dest
+    # name is briefly absent.
+    dst_inum:  uint32 = 0
+    dst_ftype: uint8  = 0
+    dr: int32 = _ext4_dir_find_entry(
+        cast[uint64](new_parent_inum),
+        cast[Ptr[char]](&ext4_rn_new_leaf[0]),
+        &dst_inum, &dst_ftype)
+    if dr < 0:
+        return -1
+    if dr > 0:
+        # Free the overwritten file's inode + its inline-leaf blocks.
+        victim: Array[256, uint8]
+        if ext4_read_inode(cast[uint64](dst_inum), &victim[0]) == 0:
+            vblocks: uint64 = _ext4_inode_block_count(&victim[0])
+            vb: uint64 = 0
+            while vb < vblocks:
+                vphys: uint64 = _ext4_logical_to_physical(&victim[0],
+                                                          vb)
+                if vphys != 0:
+                    ext4_free_block(vphys)
+                vb = vb + 1
+        ext4_free_inode(dst_inum)
+        _ext4_dir_tombstone(cast[uint64](new_parent_inum),
+                            cast[Ptr[char]](&ext4_rn_new_leaf[0]))
+
+    # Insert the dirent under the new name FIRST (so src_inum is never
+    # momentarily unreferenced), then tombstone the old dirent.
+    if ext4_dir_insert(cast[uint64](new_parent_inum),
+                       cast[Ptr[char]](&ext4_rn_new_leaf[0]),
+                       src_inum, src_ftype) != 0:
+        printk0("ext4: rename: dir_insert failed (dest dir full)\n")
+        return -1
+    if _ext4_dir_tombstone(cast[uint64](old_parent_inum),
+                           cast[Ptr[char]](&ext4_rn_old_leaf[0])) == 0:
+        # The source vanished between find and tombstone — unusual,
+        # but the new dirent is already in place, so the file is not
+        # lost. Report success: the rename's effect is complete.
+        printk0("ext4: rename: source dirent already gone\n")
+    return 0
+
+
+# --- ext4 fsync (M16.x §12.4) -------------------------------------
+#
+# Our ext4 write path is write-through: ext4_write_open_file,
+# ext4_truncate_inode, ext4_create_file and friends all push data and
+# metadata to the block device with synchronous blk_write_sectors
+# calls, and they order those calls data-before-metadata (the data
+# block is written before the inode that points at it; the inode is
+# written before the dirent that names it). So by the time any of
+# those functions returns, the *ordering* half of fsync's contract is
+# already satisfied on disk.
+#
+# What fsync still owes is the device-cache barrier: a hint to the
+# block device to push its own volatile write cache to non-volatile
+# media. blk_flush issues that barrier (SYNCHRONIZE CACHE / NVMe
+# FLUSH / virtio FLUSH); a device with no volatile cache reports
+# immediate success. So ext4_fsync is, correctly, just blk_flush on
+# the mounted device — there are no buffered-but-unwritten ext4
+# structures of our own to drain first.
+#
+# A future buffered/write-back ext4 (a real page cache, delayed
+# allocation) would grow a "flush my dirty buffers, in order, THEN
+# blk_flush" body here. Until then this is complete, not a stub.
+
+def ext4_fsync() -> int32:
+    # Flush the mounted ext4 device's write cache. Returns 0 on
+    # success, -1 if no ext4 volume is mounted.
+    if ext4_blockdev_slot < 0:
+        return -1
+    return blk_flush(ext4_blockdev_slot)
+
+
+# --- §12 smoke tests ----------------------------------------------
+#
+# Exercise rename, truncate/ftruncate, fsync and the persistence of
+# all three through the ext4 read path. Run once at boot (gated by
+# the same one-shot as the mkfs self-test); each prints a PASS/FAIL
+# marker the test scripts grep for.
+
+def _ext4_read_back_eq(inum: uint32, expect: Ptr[uint8],
+                       n: uint64) -> int32:
+    # Read n bytes from inode `inum` and byte-compare against expect.
+    # Returns 1 on match, 0 on mismatch / short read.
+    rb: Array[256, uint8]
+    if n > 256:
+        return 0
+    got: int64 = ext4_read_file(inum, 0, n, &rb[0])
+    if got != cast[int64](n):
+        return 0
+    i: uint64 = 0
+    while i < n:
+        if rb[i] != expect[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def ext4_rename_smoke_test() -> int32:
+    # Create RNSRC.TXT, rename it to RNDST.TXT, verify the bytes
+    # survive the move and that the old name is gone. Then create a
+    # second file and rename it ONTO RNDST.TXT to exercise the
+    # overwrite-existing-target path.
+    if ext4_blockdev_slot < 0:
+        return 0
+    body: Ptr[uint8] = "RENAME_PAYLOAD ext4 rename keeps data\n"
+    blen: uint64 = _ext4_strlen(cast[Ptr[char]](body))
+    src_inum: uint32 = ext4_create_file(2, "RNSRC.TXT", body, blen)
+    if src_inum == 0:
+        printk0("ext4: rename smoke FAIL (create RNSRC)\n")
+        return -1
+    if ext4_rename("RNSRC.TXT", "RNDST.TXT") != 0:
+        printk0("ext4: rename smoke FAIL (rename op)\n")
+        return -1
+    # Old name must be gone.
+    gi: uint32 = 0
+    gs: uint64 = 0
+    if ext4_resolve_file("RNSRC.TXT", &gi, &gs) != 0:
+        printk0("ext4: rename smoke FAIL (old name still resolves)\n")
+        return -1
+    # New name must resolve to the SAME inode with the SAME bytes.
+    ni: uint32 = 0
+    ns: uint64 = 0
+    if ext4_resolve_file("RNDST.TXT", &ni, &ns) == 0:
+        printk0("ext4: rename smoke FAIL (new name missing)\n")
+        return -1
+    if ni != src_inum:
+        printk0("ext4: rename smoke FAIL (inode changed)\n")
+        return -1
+    if _ext4_read_back_eq(ni, body, blen) == 0:
+        printk0("ext4: rename smoke FAIL (data corrupt after move)\n")
+        return -1
+    # Overwrite case: a second file renamed onto RNDST.TXT.
+    body2: Ptr[uint8] = "OVERWRITE_PAYLOAD ext4 rename clobbers dst\n"
+    b2len: uint64 = _ext4_strlen(cast[Ptr[char]](body2))
+    src2: uint32 = ext4_create_file(2, "RNSRC2.TXT", body2, b2len)
+    if src2 == 0:
+        printk0("ext4: rename smoke FAIL (create RNSRC2)\n")
+        return -1
+    if ext4_rename("RNSRC2.TXT", "RNDST.TXT") != 0:
+        printk0("ext4: rename smoke FAIL (overwrite rename)\n")
+        return -1
+    oi: uint32 = 0
+    os: uint64 = 0
+    if ext4_resolve_file("RNDST.TXT", &oi, &os) == 0:
+        printk0("ext4: rename smoke FAIL (dst missing post-overwrite)\n")
+        return -1
+    if oi != src2:
+        printk0("ext4: rename smoke FAIL (dst not the new inode)\n")
+        return -1
+    if _ext4_read_back_eq(oi, body2, b2len) == 0:
+        printk0("ext4: rename smoke FAIL (overwrite data wrong)\n")
+        return -1
+    # Leave the FS as we found it — unlink the test leftover so the
+    # root-dir entry count other tests assert against is unperturbed.
+    ext4_unlink("RNDST.TXT")
+    printk0("ext4: rename smoke PASS\n")
+    return 0
+
+
+def ext4_truncate_smoke_test() -> int32:
+    # Create a file, grow it past one block, shrink it back inside one
+    # block, verify i_size and the data tracking the resize.
+    if ext4_blockdev_slot < 0:
+        return 0
+    body: Ptr[uint8] = "TRUNC_HEAD ext4 truncate test base bytes\n"
+    blen: uint64 = _ext4_strlen(cast[Ptr[char]](body))
+    inum: uint32 = ext4_create_file(2, "TRUNC.TXT", body, blen)
+    if inum == 0:
+        printk0("ext4: truncate smoke FAIL (create)\n")
+        return -1
+    # Grow to 2.5 blocks. The new tail must read back as zeros.
+    grow_to: uint64 = ext4_block_size * 2 + ext4_block_size / 2
+    if ext4_truncate_inode(inum, grow_to) != 0:
+        printk0("ext4: truncate smoke FAIL (grow op)\n")
+        return -1
+    g_inode: Array[256, uint8]
+    if ext4_read_inode(cast[uint64](inum), &g_inode[0]) != 0:
+        printk0("ext4: truncate smoke FAIL (reread after grow)\n")
+        return -1
+    if cast[uint64](ext4_inode_size_lo(&g_inode[0])) != grow_to:
+        printk0("ext4: truncate smoke FAIL (grown i_size wrong)\n")
+        return -1
+    # The original head bytes must still be intact.
+    rb: Array[256, uint8]
+    if ext4_read_file(inum, 0, blen, &rb[0]) != cast[int64](blen):
+        printk0("ext4: truncate smoke FAIL (head read short)\n")
+        return -1
+    i: uint64 = 0
+    while i < blen:
+        if rb[i] != body[i]:
+            printk0("ext4: truncate smoke FAIL (head corrupt)\n")
+            return -1
+        i = i + 1
+    # A byte well past old EOF (but inside the grown region) reads 0.
+    zb: Array[16, uint8]
+    if ext4_read_file(inum, ext4_block_size + 100, 16, &zb[0]) \
+            != 16:
+        printk0("ext4: truncate smoke FAIL (zero region read short)\n")
+        return -1
+    j: uint64 = 0
+    while j < 16:
+        if zb[j] != 0:
+            printk0("ext4: truncate smoke FAIL (grown tail not zero)\n")
+            return -1
+        j = j + 1
+    # Shrink back to 10 bytes — inside the first block.
+    if ext4_truncate_inode(inum, 10) != 0:
+        printk0("ext4: truncate smoke FAIL (shrink op)\n")
+        return -1
+    s_inode: Array[256, uint8]
+    if ext4_read_inode(cast[uint64](inum), &s_inode[0]) != 0:
+        printk0("ext4: truncate smoke FAIL (reread after shrink)\n")
+        return -1
+    if cast[uint64](ext4_inode_size_lo(&s_inode[0])) != 10:
+        printk0("ext4: truncate smoke FAIL (shrunk i_size wrong)\n")
+        return -1
+    # A read past the new 10-byte EOF must return 0 (EOF).
+    if ext4_read_file(inum, 10, 8, &zb[0]) != 0:
+        printk0("ext4: truncate smoke FAIL (read past shrunk EOF)\n")
+        return -1
+    # First 10 bytes must still match the original head.
+    if ext4_read_file(inum, 0, 10, &rb[0]) != 10:
+        printk0("ext4: truncate smoke FAIL (post-shrink head short)\n")
+        return -1
+    k: uint64 = 0
+    while k < 10:
+        if rb[k] != body[k]:
+            printk0("ext4: truncate smoke FAIL (post-shrink head bad)\n")
+            return -1
+        k = k + 1
+    # File is back inside one block after the shrink — unlink cleanly.
+    ext4_unlink("TRUNC.TXT")
+    printk0("ext4: truncate smoke PASS\n")
+    return 0
+
+
+def ext4_fsync_smoke_test() -> int32:
+    # Create a file, write a marker, fsync, then re-read via the
+    # standard read path. fsync must return 0 and the bytes must
+    # survive. A real crash-consistency proof lives in the persistence
+    # test (reboot QEMU against the same image) — this checks the
+    # fsync call itself succeeds and orders correctly.
+    if ext4_blockdev_slot < 0:
+        return 0
+    body: Ptr[uint8] = "FSYNC_DURABLE ext4 fsync flushed this\n"
+    blen: uint64 = _ext4_strlen(cast[Ptr[char]](body))
+    inum: uint32 = ext4_create_file(2, "FSYNC.TXT", body, blen)
+    if inum == 0:
+        printk0("ext4: fsync smoke FAIL (create)\n")
+        return -1
+    if ext4_fsync() != 0:
+        printk0("ext4: fsync smoke FAIL (fsync returned error)\n")
+        return -1
+    if _ext4_read_back_eq(inum, body, blen) == 0:
+        printk0("ext4: fsync smoke FAIL (data wrong after fsync)\n")
+        return -1
+    ext4_unlink("FSYNC.TXT")
+    printk0("ext4: fsync smoke PASS\n")
+    return 0
 
 
 # --- ext4_mkfs (M16.x) --------------------------------------------

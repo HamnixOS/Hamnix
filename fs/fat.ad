@@ -18,7 +18,10 @@
 # entries exclusively. The image generator emits uppercase 8.3
 # names so a real round-trip is exercised without LFN parsing.
 
-from kernel.block.blk import blk_read_sectors, SECTOR_SIZE
+from kernel.block.blk import (
+    blk_read_sectors, blk_write_sectors, blk_capacity_sectors,
+    SECTOR_SIZE,
+)
 from kernel.printk.printk import printk0, printk1, printk2
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
@@ -506,7 +509,22 @@ def fat_open(name: Ptr[char]) -> int32:
     return -1
 
 
+# A FAT fd's per-task fd_buf carries the open-file slot index. A
+# write-mode open ORs 0x80000000 into that word (the VFS sets it so
+# its write/read dispatch can tell the two apart). fat_close is the
+# single close hook the scheduler's close_fd_in_task calls for every
+# FD_FAT_MARK fd — so it must accept either flavour and route a
+# write-bit-tagged value to the write-slot table.
+FAT_WRITE_SLOT_BIT: int32 = -2147483648         # 0x80000000 as int32
+
+
 def fat_close(slot: int32):
+    # `slot` is the raw fd_buf word. If the write bit is set, this is
+    # a write-mode fd — release the write slot. Otherwise it's a
+    # read-mode open-file slot.
+    if (slot & FAT_WRITE_SLOT_BIT) != 0:
+        fat_write_slots[cast[uint64](slot & 0x7FFFFFFF)].used = 0
+        return
     fat_open_files[cast[uint64](slot)].used = 0
 
 
@@ -516,6 +534,648 @@ def fat_open_first_cluster(slot: int32) -> uint64:
 
 def fat_open_size(slot: int32) -> uint64:
     return fat_open_files[cast[uint64](slot)].file_size
+
+
+# --- FAT write path (M16.x §12.5) ---------------------------------
+#
+# Brings the FAT32 driver to write parity for the basic operations:
+# create a file, write/extend its data, and delete it. Mirrors the
+# write side of Linux's fs/fat/fatent.c (cluster allocator),
+# fs/fat/dir.c (directory entry add/remove) and fs/fat/inode.c at
+# minimum scope.
+#
+# Single mount, no LFN, 8.3 names only — same constraints as the
+# read path. The cluster allocator is first-fit over the in-core FAT
+# sector; every FAT mutation is written to ALL `fat_num_fats` copies
+# so a fsck-style cross-check of the mirror stays consistent.
+#
+# Scope honesty: a directory is assumed to occupy a single cluster
+# (true for our root + the one subdir in the test image, and for any
+# small directory). Growing a directory across a cluster boundary is
+# a documented follow-up. File data, by contrast, grows across an
+# arbitrary cluster chain — that is fully implemented.
+
+def _write_u16_le(p: Ptr[uint8], v: uint16):
+    p[0] = cast[uint8](v & 0xFF)
+    p[1] = cast[uint8]((v >> 8) & 0xFF)
+
+
+def _write_u32_le(p: Ptr[uint8], v: uint32):
+    p[0] = cast[uint8](v & 0xFF)
+    p[1] = cast[uint8]((v >> 8) & 0xFF)
+    p[2] = cast[uint8]((v >> 16) & 0xFF)
+    p[3] = cast[uint8]((v >> 24) & 0xFF)
+
+
+def _fat_set_cluster(cluster: uint64, value: uint32) -> int32:
+    # Write FAT entry `cluster` = `value` in every FAT copy. The 28-bit
+    # value is masked into the low bits; the high 4 bits of the on-disk
+    # u32 are reserved and preserved as-is (Linux does the same). The
+    # entry's sector is read-modify-written so neighbouring entries in
+    # the same sector survive. Returns 0 on success, -1 on I/O error.
+    entry_offset_bytes: uint64 = cluster * 4
+    rel_sector: uint64 = entry_offset_bytes / SECTOR_SIZE
+    within:     uint64 = entry_offset_bytes % SECTOR_SIZE
+    fat_idx: uint64 = 0
+    while fat_idx < fat_num_fats:
+        fat_lba: uint64 = fat_fat_start_lba \
+                        + fat_idx * fat_sectors_per_fat + rel_sector
+        if blk_read_sectors(fat_blockdev_slot, fat_lba, 1,
+                            &fat_fat_buf[0]) != 0:
+            return -1
+        p: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](&fat_fat_buf[0]) + within)
+        old: uint32 = _read_u32_le(p)
+        # Keep the reserved top nibble, replace the 28-bit cluster val.
+        merged: uint32 = (old & 0xF0000000) | (value & 0x0FFFFFFF)
+        _write_u32_le(p, merged)
+        if blk_write_sectors(fat_blockdev_slot, fat_lba, 1,
+                             &fat_fat_buf[0]) != 0:
+            return -1
+        fat_idx = fat_idx + 1
+    return 0
+
+
+FAT_EOC_WRITE: uint32 = 0x0FFFFFFF              # end-of-chain we stamp
+
+
+def _fat_total_clusters() -> uint64:
+    # Number of data clusters the volume holds — used to bound the
+    # allocator's scan so it never indexes a FAT entry past the
+    # on-disk FAT.
+    data_sectors: uint64 = blk_capacity_sectors(fat_blockdev_slot)
+    if data_sectors <= fat_data_start_lba:
+        return 0
+    data_sectors = data_sectors - fat_data_start_lba
+    return data_sectors / fat_sectors_per_clu
+
+
+def _fat_alloc_cluster() -> uint64:
+    # First-fit search for a free FAT entry (value 0). Marks it as a
+    # fresh end-of-chain and returns the cluster number, or 0 on a
+    # full volume / I/O error. Cluster numbering starts at 2.
+    total: uint64 = _fat_total_clusters()
+    # The FAT itself can only describe sectors_per_fat * 128 entries;
+    # clamp the scan to the smaller of the two bounds.
+    fat_entries: uint64 = fat_sectors_per_fat * (SECTOR_SIZE / 4)
+    limit: uint64 = total + 2
+    if limit > fat_entries:
+        limit = fat_entries
+    c: uint64 = 2
+    while c < limit:
+        v: uint32 = _fat_lookup_cluster(c)
+        if v == 0:
+            if _fat_set_cluster(c, FAT_EOC_WRITE) != 0:
+                return 0
+            return c
+        c = c + 1
+    printk0("fat: no free cluster\n")
+    return 0
+
+
+def _fat_zero_cluster(cluster: uint64) -> int32:
+    # Zero every sector of `cluster` — used right after allocation so
+    # a freshly-claimed cluster never exposes a previous tenant's
+    # bytes. Returns 0 on success, -1 on I/O error.
+    s: uint64 = 0
+    while s < fat_sectors_per_clu:
+        i: uint64 = 0
+        while i < SECTOR_SIZE:
+            fat_sector_buf[i] = 0
+            i = i + 1
+        lba: uint64 = _cluster_to_lba(cluster) + s
+        if blk_write_sectors(fat_blockdev_slot, lba, 1,
+                             &fat_sector_buf[0]) != 0:
+            return -1
+        s = s + 1
+    return 0
+
+
+def _fat_free_chain(first_cluster: uint64) -> int32:
+    # Walk a cluster chain from `first_cluster` and mark every link
+    # free (FAT entry = 0). Used by delete. Returns 0 on success.
+    # A bounded loop guards a corrupt self-referential chain.
+    cluster: uint64 = first_cluster
+    safety: uint64 = _fat_total_clusters() + 4
+    while cluster >= 2 and _is_end_of_chain(cast[uint32](cluster)) == 0:
+        if safety == 0:
+            printk0("fat: free_chain: chain too long (corrupt?)\n")
+            return -1
+        safety = safety - 1
+        nxt: uint32 = _fat_lookup_cluster(cluster)
+        if _fat_set_cluster(cluster, 0) != 0:
+            return -1
+        if _is_end_of_chain(nxt) != 0:
+            return 0
+        cluster = cast[uint64](nxt)
+    return 0
+
+
+# --- directory entry create / delete ------------------------------
+
+def _fat_dir_find_free_slot(dir_cluster: uint64,
+                            out_lba: Ptr[uint64],
+                            out_off: Ptr[uint64]) -> int32:
+    # Scan the directory's first cluster for a usable 32-byte slot —
+    # either an end-of-directory sentinel (first byte 0x00) or a
+    # deleted entry (first byte 0xE5). Fills out_lba + out_off with the
+    # slot's location. Returns 1 on hit, 0 if the cluster is full.
+    #
+    # Single-cluster directory scope: our root + subdir each fit one
+    # cluster; growing a directory across clusters is a follow-up.
+    sec: uint64 = 0
+    while sec < fat_sectors_per_clu:
+        lba: uint64 = _cluster_to_lba(dir_cluster) + sec
+        if blk_read_sectors(fat_blockdev_slot, lba, 1,
+                            &fat_sector_buf[0]) != 0:
+            return 0
+        n: uint64 = _dir_entries_per_sector()
+        ei: uint64 = 0
+        while ei < n:
+            first_byte: uint8 = fat_sector_buf[ei * 32]
+            if first_byte == 0 or first_byte == 0xE5:
+                out_lba[0] = lba
+                out_off[0] = ei * 32
+                return 1
+            ei = ei + 1
+        sec = sec + 1
+    return 0
+
+
+def _fat_write_dir_entry(lba: uint64, off: uint64, name83: Ptr[uint8],
+                         attr: uint8, cluster: uint64,
+                         size: uint64) -> int32:
+    # Read-modify-write a 32-byte directory entry at (lba, off). The
+    # rest of the sector — sibling entries — is preserved. Returns 0
+    # on success, -1 on I/O error.
+    if blk_read_sectors(fat_blockdev_slot, lba, 1,
+                        &fat_sector_buf[0]) != 0:
+        return -1
+    e: uint64 = cast[uint64](&fat_sector_buf[0]) + off
+    ep: Ptr[uint8] = cast[Ptr[uint8]](e)
+    i: uint64 = 0
+    while i < 11:
+        ep[i] = name83[i]
+        i = i + 1
+    ep[11] = attr
+    # Bytes 12..19: reserved / case / creation time — zero them.
+    j: uint64 = 12
+    while j < 20:
+        ep[j] = 0
+        j = j + 1
+    # 0x14: high 16 bits of first cluster.
+    _write_u16_le(cast[Ptr[uint8]](e + 20),
+                  cast[uint16]((cluster >> 16) & 0xFFFF))
+    # 0x16..0x19: write time / date — zero (no RTC plumbing here).
+    ep[22] = 0
+    ep[23] = 0
+    ep[24] = 0
+    ep[25] = 0
+    # 0x1A: low 16 bits of first cluster.
+    _write_u16_le(cast[Ptr[uint8]](e + 26),
+                  cast[uint16](cluster & 0xFFFF))
+    # 0x1C: 32-bit file size.
+    _write_u32_le(cast[Ptr[uint8]](e + 28), cast[uint32](size))
+    return blk_write_sectors(fat_blockdev_slot, lba, 1,
+                             &fat_sector_buf[0])
+
+
+def _fat_dir_find_entry(dir_cluster: uint64, target83: Ptr[uint8],
+                        out_lba: Ptr[uint64], out_off: Ptr[uint64],
+                        out_cluster: Ptr[uint64],
+                        out_size: Ptr[uint64]) -> int32:
+    # Locate the live 8.3 entry matching `target83` in the directory's
+    # first cluster. Fills the slot location + first cluster + size.
+    # Returns 1 on hit, 0 on miss.
+    sec: uint64 = 0
+    while sec < fat_sectors_per_clu:
+        lba: uint64 = _cluster_to_lba(dir_cluster) + sec
+        if blk_read_sectors(fat_blockdev_slot, lba, 1,
+                            &fat_sector_buf[0]) != 0:
+            return 0
+        n: uint64 = _dir_entries_per_sector()
+        ei: uint64 = 0
+        while ei < n:
+            entry: Ptr[uint8] = cast[Ptr[uint8]](
+                cast[uint64](&fat_sector_buf[0]) + ei * 32)
+            first_byte: uint8 = entry[0]
+            if first_byte == 0:
+                return 0                        # end-of-directory
+            attr: uint8 = entry[11]
+            if first_byte != 0xE5 and attr != 0x0F:
+                if _name_match(entry, target83) != 0:
+                    hi: uint16 = _read_u16_le(
+                        cast[Ptr[uint8]](cast[uint64](entry) + 20))
+                    lo: uint16 = _read_u16_le(
+                        cast[Ptr[uint8]](cast[uint64](entry) + 26))
+                    out_cluster[0] = (cast[uint64](hi) << 16) \
+                                   | cast[uint64](lo)
+                    out_size[0] = cast[uint64](_read_u32_le(
+                        cast[Ptr[uint8]](cast[uint64](entry) + 28)))
+                    out_lba[0] = lba
+                    out_off[0] = ei * 32
+                    return 1
+            ei = ei + 1
+        sec = sec + 1
+    return 0
+
+
+def _fat_resolve_parent_dir(path: Ptr[char],
+                            leaf_out: Ptr[uint8]) -> uint64:
+    # Split `path` into its parent directory + leaf name, resolve the
+    # parent to a cluster, and copy the leaf (NUL-terminated) into
+    # leaf_out (64-byte buffer). Returns the parent dir cluster, or 0
+    # on a missing parent. A bare leaf resolves the parent to root.
+    n: uint64 = 0
+    while path[n] != 0:
+        n = n + 1
+    last_slash: int64 = -1
+    i: uint64 = 0
+    while i < n:
+        if path[i] == 47:
+            last_slash = cast[int64](i)
+        i = i + 1
+    if last_slash < 0:
+        j: uint64 = 0
+        while j <= n:
+            leaf_out[j] = cast[uint8](path[j] & 0xFF)
+            j = j + 1
+        return fat_root_cluster
+    ls: uint64 = cast[uint64](last_slash)
+    # Copy the leaf (everything after the slash).
+    src: uint64 = ls + 1
+    m: uint64 = 0
+    while src + m <= n:
+        leaf_out[m] = cast[uint8](path[src + m] & 0xFF)
+        m = m + 1
+    # Resolve the parent: temporarily NUL-terminate at the slash by
+    # building a scratch copy of the parent path.
+    parent: Array[256, uint8]
+    k: uint64 = 0
+    while k < ls and k < 255:
+        parent[k] = cast[uint8](path[k] & 0xFF)
+        k = k + 1
+    parent[k] = 0
+    return _fat_resolve_dir(cast[Ptr[char]](&parent[0]))
+
+
+def fat_create(path: Ptr[char]) -> int32:
+    # Create an empty regular file at `path` (caller stripped /mnt/).
+    # Allocates a first data cluster, zero-fills it, and writes a
+    # directory entry. Returns 0 on success, -1 on failure. If the
+    # file already exists this truncates it to empty (O_CREAT|O_TRUNC).
+    if fat_blockdev_slot < 0:
+        return -1
+    leaf: Array[64, uint8]
+    parent_cluster: uint64 = _fat_resolve_parent_dir(path, &leaf[0])
+    if parent_cluster == 0:
+        return -1
+    target83: Array[11, uint8]
+    if fat_name_to_83(cast[Ptr[char]](&leaf[0]), &target83[0]) == 0:
+        return -1
+    # If the name already exists, free its old chain and reuse the
+    # slot (truncate-to-empty semantics).
+    ex_lba:  uint64 = 0
+    ex_off:  uint64 = 0
+    ex_clu:  uint64 = 0
+    ex_size: uint64 = 0
+    hit: int32 = _fat_dir_find_entry(parent_cluster, &target83[0],
+                                     &ex_lba, &ex_off, &ex_clu,
+                                     &ex_size)
+    new_cluster: uint64 = _fat_alloc_cluster()
+    if new_cluster == 0:
+        return -1
+    if _fat_zero_cluster(new_cluster) != 0:
+        _fat_set_cluster(new_cluster, 0)
+        return -1
+    if hit != 0:
+        # Free the previous chain, rewrite the existing dir slot.
+        if ex_clu >= 2:
+            _fat_free_chain(ex_clu)
+        if _fat_write_dir_entry(ex_lba, ex_off, &target83[0],
+                                0x20, new_cluster, 0) != 0:
+            _fat_set_cluster(new_cluster, 0)
+            return -1
+        return 0
+    # Fresh create: find a free directory slot.
+    slot_lba: uint64 = 0
+    slot_off: uint64 = 0
+    if _fat_dir_find_free_slot(parent_cluster, &slot_lba,
+                               &slot_off) == 0:
+        printk0("fat: directory full (no free slot)\n")
+        _fat_set_cluster(new_cluster, 0)
+        return -1
+    if _fat_write_dir_entry(slot_lba, slot_off, &target83[0],
+                            0x20, new_cluster, 0) != 0:
+        _fat_set_cluster(new_cluster, 0)
+        return -1
+    return 0
+
+
+def _fat_chain_nth(first_cluster: uint64, n: uint64) -> uint64:
+    # Walk to the n-th cluster of a chain, returning 0 if the chain
+    # ends before reaching it.
+    cluster: uint64 = first_cluster
+    steps: uint64 = n
+    while steps > 0:
+        nxt: uint32 = _fat_lookup_cluster(cluster)
+        if _is_end_of_chain(nxt) != 0:
+            return 0
+        cluster = cast[uint64](nxt)
+        steps = steps - 1
+    return cluster
+
+
+def fat_write(path: Ptr[char], src: Ptr[uint8], pos: uint64,
+              count: uint64) -> int64:
+    # Write `count` bytes from `src` into the file at `path` starting
+    # at byte offset `pos`. Grows the cluster chain as needed and
+    # updates the directory entry's size. Returns bytes written, or
+    # -1 on failure. Mirrors fs/fat/file.c's write side at min scope.
+    if fat_blockdev_slot < 0:
+        return -1
+    if count == 0:
+        return 0
+    leaf: Array[64, uint8]
+    parent_cluster: uint64 = _fat_resolve_parent_dir(path, &leaf[0])
+    if parent_cluster == 0:
+        return -1
+    target83: Array[11, uint8]
+    if fat_name_to_83(cast[Ptr[char]](&leaf[0]), &target83[0]) == 0:
+        return -1
+    d_lba:  uint64 = 0
+    d_off:  uint64 = 0
+    first:  uint64 = 0
+    size:   uint64 = 0
+    if _fat_dir_find_entry(parent_cluster, &target83[0],
+                           &d_lba, &d_off, &first, &size) == 0:
+        return -1
+    cluster_bytes: uint64 = fat_sectors_per_clu * SECTOR_SIZE
+    end_off: uint64 = pos + count
+    # Ensure the chain is long enough to cover end_off bytes.
+    needed_clusters: uint64 = (end_off + cluster_bytes - 1) \
+                            / cluster_bytes
+    if needed_clusters == 0:
+        needed_clusters = 1
+    # Count existing clusters and find the tail.
+    have: uint64 = 1
+    tail: uint64 = first
+    if first < 2:
+        return -1
+    while _is_end_of_chain(cast[uint32](
+            _fat_lookup_cluster(tail))) == 0:
+        nxt: uint32 = _fat_lookup_cluster(tail)
+        tail = cast[uint64](nxt)
+        have = have + 1
+    # Extend the chain to needed_clusters.
+    while have < needed_clusters:
+        nc: uint64 = _fat_alloc_cluster()
+        if nc == 0:
+            return -1
+        if _fat_zero_cluster(nc) != 0:
+            _fat_set_cluster(nc, 0)
+            return -1
+        # Link the old tail to the new cluster; nc was stamped EOC by
+        # _fat_alloc_cluster, so the chain stays terminated.
+        if _fat_set_cluster(tail, cast[uint32](nc)) != 0:
+            return -1
+        tail = nc
+        have = have + 1
+    # Walk to the cluster holding `pos` and stream the bytes out.
+    skip: uint64 = pos / cluster_bytes
+    cluster: uint64 = _fat_chain_nth(first, skip)
+    if cluster == 0:
+        return -1
+    off_in_cluster: uint64 = pos % cluster_bytes
+    written: uint64 = 0
+    while written < count:
+        sec_in_cluster: uint64 = off_in_cluster / SECTOR_SIZE
+        off_in_sector:  uint64 = off_in_cluster % SECTOR_SIZE
+        lba: uint64 = _cluster_to_lba(cluster) + sec_in_cluster
+        # RMW the sector so a partial write keeps neighbouring bytes.
+        if blk_read_sectors(fat_blockdev_slot, lba, 1,
+                            &fat_sector_buf[0]) != 0:
+            return -1
+        chunk: uint64 = SECTOR_SIZE - off_in_sector
+        if chunk > count - written:
+            chunk = count - written
+        memcpy(cast[Ptr[uint8]](cast[uint64](&fat_sector_buf[0])
+                                + off_in_sector),
+               cast[Ptr[uint8]](cast[uint64](src) + written),
+               chunk)
+        if blk_write_sectors(fat_blockdev_slot, lba, 1,
+                             &fat_sector_buf[0]) != 0:
+            return -1
+        written = written + chunk
+        off_in_cluster = off_in_cluster + chunk
+        if off_in_cluster >= cluster_bytes and written < count:
+            nxt: uint32 = _fat_lookup_cluster(cluster)
+            if _is_end_of_chain(nxt) != 0:
+                # Chain ran out — shouldn't happen, we pre-extended.
+                break
+            cluster = cast[uint64](nxt)
+            off_in_cluster = 0
+    # Update the directory entry's size if the write grew the file.
+    if end_off > size:
+        if _fat_write_dir_entry(d_lba, d_off, &target83[0],
+                                0x20, first, end_off) != 0:
+            return cast[int64](written)
+    return cast[int64](written)
+
+
+def fat_delete(path: Ptr[char]) -> int32:
+    # Delete the file at `path`: free its cluster chain and mark the
+    # directory entry deleted (0xE5 in byte 0). Returns 0 on success,
+    # -1 on a missing file / I/O error.
+    if fat_blockdev_slot < 0:
+        return -1
+    leaf: Array[64, uint8]
+    parent_cluster: uint64 = _fat_resolve_parent_dir(path, &leaf[0])
+    if parent_cluster == 0:
+        return -1
+    target83: Array[11, uint8]
+    if fat_name_to_83(cast[Ptr[char]](&leaf[0]), &target83[0]) == 0:
+        return -1
+    d_lba:  uint64 = 0
+    d_off:  uint64 = 0
+    first:  uint64 = 0
+    size:   uint64 = 0
+    if _fat_dir_find_entry(parent_cluster, &target83[0],
+                           &d_lba, &d_off, &first, &size) == 0:
+        return -1
+    if first >= 2:
+        _fat_free_chain(first)
+    # Tombstone the dirent: first byte 0xE5 marks it deleted.
+    if blk_read_sectors(fat_blockdev_slot, d_lba, 1,
+                        &fat_sector_buf[0]) != 0:
+        return -1
+    fat_sector_buf[d_off] = 0xE5
+    return blk_write_sectors(fat_blockdev_slot, d_lba, 1,
+                             &fat_sector_buf[0])
+
+
+def fat_write_smoke_test() -> int32:
+    # End-to-end FAT write exercise: create a file, write bytes past
+    # one cluster (forcing chain extension), read them back via the
+    # existing read path, then delete and confirm the read path no
+    # longer finds it. Returns 0 on PASS, -1 on FAIL.
+    if fat_blockdev_slot < 0:
+        return 0
+    name: Ptr[char] = "FATW.TXT"
+    if fat_create(name) != 0:
+        printk0("fat: write smoke FAIL (create)\n")
+        return -1
+    # Write a payload that spans more than one 512-byte cluster so the
+    # chain-extend path is exercised.
+    payload: Array[700, uint8]
+    i: uint64 = 0
+    while i < 700:
+        payload[i] = cast[uint8]((i * 7 + 13) & 0xFF)
+        i = i + 1
+    n: int64 = fat_write(name, &payload[0], 0, 700)
+    if n != 700:
+        printk1("fat: write smoke FAIL (short write %d)\n",
+                cast[uint64](n))
+        return -1
+    # Read it back via fat_lookup + fat_read.
+    rc_cluster: uint64 = 0
+    rc_size:    uint64 = 0
+    if fat_lookup(name, &rc_cluster, &rc_size) == 0:
+        printk0("fat: write smoke FAIL (lookup after write)\n")
+        return -1
+    if rc_size != 700:
+        printk1("fat: write smoke FAIL (size %d != 700)\n", rc_size)
+        return -1
+    readback: Array[700, uint8]
+    got: int64 = fat_read(rc_cluster, rc_size, 0, 700, &readback[0])
+    if got != 700:
+        printk1("fat: write smoke FAIL (short read %d)\n",
+                cast[uint64](got))
+        return -1
+    j: uint64 = 0
+    while j < 700:
+        if readback[j] != payload[j]:
+            printk1("fat: write smoke FAIL (byte %d mismatch)\n", j)
+            return -1
+        j = j + 1
+    # Overwrite a slice in the middle and confirm the RMW is precise.
+    patch: Array[8, uint8]
+    k: uint64 = 0
+    while k < 8:
+        patch[k] = cast[uint8](0xA0 + k)
+        k = k + 1
+    if fat_write(name, &patch[0], 600, 8) != 8:
+        printk0("fat: write smoke FAIL (mid-file overwrite)\n")
+        return -1
+    if fat_read(rc_cluster, 700, 600, 8, &readback[0]) != 8:
+        printk0("fat: write smoke FAIL (read patched slice)\n")
+        return -1
+    m: uint64 = 0
+    while m < 8:
+        if readback[m] != patch[m]:
+            printk0("fat: write smoke FAIL (patch not applied)\n")
+            return -1
+        m = m + 1
+    # Delete and confirm the file is gone.
+    if fat_delete(name) != 0:
+        printk0("fat: write smoke FAIL (delete)\n")
+        return -1
+    gone_cluster: uint64 = 0
+    gone_size:    uint64 = 0
+    if fat_lookup(name, &gone_cluster, &gone_size) != 0:
+        printk0("fat: write smoke FAIL (file still found after delete)\n")
+        return -1
+    printk0("fat: write smoke PASS\n")
+    return 0
+
+
+# --- FAT write-mode open slots ------------------------------------
+#
+# A write-mode open needs the file's PATH for fat_write/fat_delete
+# (which re-resolve the directory entry on every call so a chain
+# extension is reflected in the on-disk size). The existing
+# FatOpenFile struct only carries first_cluster + file_size; rather
+# than grow that struct (the Adder compiler can miscompile a function
+# that references a struct after a new field is added), the write
+# path keeps a PARALLEL slot table keyed by the same index space.
+#
+# fat_open_write returns a slot index; the VFS write/close path uses
+# it. The path string is snapshotted into the slot so the fd stays
+# valid even if the caller's path buffer is reused.
+
+FAT_PATH_MAX: uint64 = 96
+
+
+class FatWriteSlot:
+    used: uint32
+    pad:  uint32
+    pos:  uint64                                # current byte size
+    path: Array[96, uint8]
+
+
+fat_write_slots: Array[8, FatWriteSlot]
+
+
+def fat_open_write(path: Ptr[char]) -> int32:
+    # O_CREAT|O_TRUNC open of a FAT path for writing. Creates (or
+    # truncates) the file, snapshots the path into a write slot, and
+    # returns the slot index. Returns -1 on failure.
+    if fat_blockdev_slot < 0:
+        return -1
+    if fat_create(path) != 0:
+        return -1
+    i: uint64 = 0
+    while i < FAT_MAX_OPEN:
+        if fat_write_slots[i].used == 0:
+            fat_write_slots[i].used = 1
+            fat_write_slots[i].pos  = 0
+            j: uint64 = 0
+            while j < FAT_PATH_MAX - 1:
+                c: int32 = path[j]
+                fat_write_slots[i].path[j] = cast[uint8](c & 0xFF)
+                if c == 0:
+                    break
+                j = j + 1
+            fat_write_slots[i].path[FAT_PATH_MAX - 1] = 0
+            return cast[int32](i)
+        i = i + 1
+    printk0("fat: write-slot table full\n")
+    return -1
+
+
+def fat_write_slot(slot: int32, src: Ptr[uint8], pos: uint64,
+                   count: uint64) -> int64:
+    # Write through a write-mode slot. Forwards to fat_write with the
+    # snapshotted path.
+    #
+    # NOTE: this deliberately does NOT gate on fat_write_slots[].used.
+    # A shell `>` redirect opens the file, fork+execs the writer, and
+    # the PARENT closes its copy of the fd before the child writes —
+    # fat_close(write fd) would have cleared `used` by then. The
+    # snapshotted path is still valid (fat_close leaves it intact),
+    # and fat_write re-resolves the directory entry on every call, so
+    # a logically-closed-but-still-referenced slot still writes
+    # correctly. This mirrors ext4_write_open_file, which likewise
+    # reads its slot's inum without checking `used`. The slot's path
+    # only becomes stale when fat_open_write reuses the index — and a
+    # fresh open always overwrites the path before any write.
+    if slot < 0:
+        return -1
+    su: uint64 = cast[uint64](slot)
+    n: int64 = fat_write(
+        cast[Ptr[char]](&fat_write_slots[su].path[0]),
+        src, pos, count)
+    if n > 0:
+        end: uint64 = pos + cast[uint64](n)
+        if end > fat_write_slots[su].pos:
+            fat_write_slots[su].pos = end
+    return n
+
+
+def fat_close_write(slot: int32):
+    if slot < 0:
+        return
+    fat_write_slots[cast[uint64](slot)].used = 0
 
 
 # --- VFS interface ------------------------------------------------
