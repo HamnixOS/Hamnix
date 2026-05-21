@@ -112,12 +112,14 @@ knows which it holds.
 - [x] VMA deep-copy on fork; copy-on-write pages (COW fault handler +
   refcounted shared frames) — landed, whole address space incl. mmap.
 - [x] VMA share on RFMEM / thread address-space sharing — pthreads run.
-- [ ] `rfork` RFMEM thread path (Plan 9 side still -ENOSYS): caller
-  `child_stack` + CLONE_SETTLS-shape TLS.
-- [ ] `rfork` RFNOWAIT detach: sever child `parent_pid`; `wait4`
-  auto-drops RFNOWAIT children.
-- [ ] MAP_SHARED with cross-process coherence (`/dev/shm`-style).
-- [ ] `mprotect` / `madvise` / MAP_FIXED maturity for arbitrary callers.
+- [x] `rfork` RFMEM thread path — caller `child_stack` + CLONE_SETTLS
+  TLS, Layer-1 primitives only (`e32ec28`).
+- [x] `rfork` RFNOWAIT detach — `detached` flag severs `parent_pid`,
+  `task_exit_current` self-reaps, `wait4` gets -ECHILD (`e32ec28`).
+- [x] MAP_SHARED with cross-process coherence — anon MAP_SHARED maps
+  the same refcounted frames across fork (`e32ec28`).
+- [x] `mprotect` / `madvise` / MAP_FIXED maturity — range-walk PTEs +
+  VMA split, MAP_FIXED replaces, MADV_DONTNEED zeroes (`e32ec28`).
 
 ## §2 Concurrency primitives → threads  (needed by glibc)
 - [x] `futex(2)` + `%fs`-base TLS (`arch_prctl`) — **Layer 2 only**;
@@ -207,8 +209,9 @@ knows which it holds.
 
 ## §15 Compiler / language infra  (off critical path — parallelizable)
 - [x] Unsigned shift/divide codegen (`shrq`/`divq` honoring signedness).
-- [ ] First-class function pointers `Fn[R, *A]` with SysV codegen —
-  kills the `asm_volatile("call *%rax")` hacks.
+- [x] First-class function pointers `Fn[R, A...]` with SysV indirect-call
+  codegen — `d321f53`; removed the `asm_volatile("call *%rax")` dispatch
+  hacks (IRQ table, block vtable, netfilter, module init, timers).
 - [ ] `match`/`case` tokenization → implement.
 
 ## §16 Build / initramfs
@@ -220,11 +223,13 @@ knows which it holds.
   `nf_conntrack` core. Weigh against native drivers before spending.
 
 ## Critical path & parallelization
-Phase D (the prerequisite gate) is **landed** (`4964a6b`); §2 (futex /
-TLS) is landed. Remaining critical path: **§1 (`rfork` RFMEM thread
-path, RFNOWAIT, MAP_SHARED) → §4 (dynamic loader + the capstone demo).**
-Off the critical path, safe to dispatch in parallel: §15, §9, §7, §13,
-§12, §10. §11 and §16 are landed; §6 has only the vDSO item left.
+Phase D (the prerequisite gate, `4964a6b`), §1 (process model / AS,
+`e32ec28`), §2 (futex / TLS), and §15 (function pointers, `d321f53`)
+are **landed**. Remaining critical path: **§4 — dynamic loader
+(`dlopen`/libdl, namespace-routed interp lookup) + the capstone demo**
+(`deb /bin/true` running a stock dynamic Debian binary over SSH).
+Off the critical path, safe to dispatch in parallel: §9, §7, §13,
+§12, §10, §3. §11 and §16 are landed; §6 has only the vDSO item left.
 Everything in §5 is Layer-2-only per the boundary law.
 
 ---
