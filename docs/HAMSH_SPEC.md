@@ -488,7 +488,7 @@ Each stage ships with a test before moving on. All run in QEMU.
 2. **Typed values + list interpolation.** Test: `args = ["-la","/dev"]; echo
    $args` yields exactly two argv entries; a value containing spaces is one
    argument (no splitting).
-3. **Brace blocks + control flow + `fn`.** Test: multi-line `if`/`for`/`while`
+3. **Brace blocks + control flow + `def`.** Test: multi-line `if`/`for`/`while`
    parse from paste and from the continuation prompt; mismatched braces error
    cleanly.
 4. **Stdio-as-/fd + pipe/redirect/dup as bind.** Test: `a | b`, `> file`, `2>&1`
