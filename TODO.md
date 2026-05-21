@@ -132,16 +132,18 @@ knows which it holds.
 - [ ] Plan 9 note follow-ups: `note_group`-wide (killable group),
   cross-task `/proc/<pid>/note`, NDFLT action, surface handler `msg`.
 
-## §4 Dynamic linking / loader  (depends on §1 + Phase D)
-- [ ] `dlopen`/libdl: DT_NEEDED resolution + `ld.so.cache` search path —
-  unlocks apt plugins, CPython `.so`, stock Debian.
-- [ ] Route interpreter lookup through the chan/namespace layer
-  (`_load_interp_elf` hardcodes `initramfs_data_ptr` today).
-- [ ] Verify AT_BASE/AT_ENTRY/AT_PHDR auxv for a binary loaded *inside*
-  a namespace.
-- [ ] **Capstone demo:** `deb /bin/true` exec'ing the stock dynamic
-  Debian binary inside a namespace, driven over SSH (depends on Phase D
-  + §1 + this + §16 cpio bump).
+## §4 Dynamic linking / loader
+- [x] `dlopen`/libdl + DT_NEEDED resolution — handled by the stock
+  glibc ld.so the loader maps; `dlopen()`+`dlsym()` verified
+  (`6d9898e`, test_u44). Enabling kernel fixes: `MAP_FIXED` BSS-overlay
+  zero-fill (`mm/vma.ad`) and a stable `fstat` `st_ino` (`fs/vfs.ad`).
+- [x] Interpreter + library lookup routed through the chan/namespace
+  layer — `ns_blob_ptr` runs paths through `resolve_path()` (`6d9898e`).
+- [x] AT_BASE/AT_ENTRY/AT_PHDR auxv — anchored to load addresses;
+  namespace-routing does not perturb them (`6d9898e`).
+- [x] **Capstone:** a stock dynamically-linked binary runs end-to-end
+  inside a `distrorun` namespace — PT_INTERP + DT_NEEDED both resolved
+  through the namespace bind (`6d9898e`, test_u43).
 
 ## §5 Modern async I/O  (**Layer 2 only**, depends on §2/§3)
 - [ ] `epoll` (`epoll_create1`/`ctl`/`wait`); `io_uring` SQ/CQ rings;
@@ -224,15 +226,13 @@ knows which it holds.
   `nf_conntrack` core. Weigh against native drivers before spending.
 
 ## Critical path & parallelization
-Phase D (the prerequisite gate, `4964a6b`), §1 (process model / AS,
-`e32ec28`), §2 (futex / TLS), and §15 (function pointers, `d321f53`)
-are **landed**. Remaining critical path: **§4 — dynamic loader
-(`dlopen`/libdl, namespace-routed interp lookup) + the capstone demo**
-(`deb /bin/true` running a stock dynamic Debian binary over SSH).
-Off the critical path, safe to dispatch in parallel: §7, §13,
-§12, §10. §9, §11, §16 are landed; §6 has only the vDSO item left;
-§3 (signals) is in flight. Everything in §5 is Layer-2-only per the
-boundary law.
+The dependency-ordered critical path is **COMPLETE**: Phase D
+(`4964a6b`) → §1 (`e32ec28`) → §2 (futex/TLS) → §4 (dynamic loader,
+`6d9898e`) are all landed — a stock dynamically-linked binary now runs
+inside a namespace. Remaining work is off the critical path and
+parallelizable: §7, §10, §13. §3 (signals) and §12 (fs write) are
+landing now; §9, §11, §15, §16 are landed; §6 has only the vDSO item
+left. Everything in §5 is Layer-2-only per the boundary law.
 
 ---
 
