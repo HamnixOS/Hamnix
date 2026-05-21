@@ -148,6 +148,14 @@ from lib.zlib.inflate import (
     inflate_feed,
 )
 
+# xz/LZMA2 decompressor — modern Debian ships `Packages.xz` (LZMA2)
+# as the primary binary-amd64 index. `apt update` probes for `.xz`
+# first and routes the body through xz_decompress(); a single-shot
+# call mirroring how inflate_feed handles the gzip `.gz` fallback.
+from lib.xz.xz import (
+    xz_decompress,
+)
+
 # Native-ABI syscalls. socket()/connect() are the U-socket bridge
 # (runtime.S numbers 41/42 -> _u_socket/_u_connect); read/write/close
 # on a socket fd already route through the in-kernel TCP stack via the
@@ -640,8 +648,15 @@ def _http_expected_len(total: uint64) -> uint64:
 #
 # Returns the BODY length, writes the body start offset through
 # *body_off. Returns -1 on any socket / HTTP error.
+#
+# `quiet`: when non-zero, a non-200 HTTP status (notably a 404 — the
+# expected outcome when probing for an optional resource like
+# Packages.xz on a mirror that only ships Packages.gz) returns the
+# distinct sentinel -2 WITHOUT writing a diagnostic to stderr, so the
+# caller can fall back silently. Socket-level failures still return -1
+# and still print. quiet==0 keeps the original loud behaviour.
 
-def _http_get(port: int64, body_off: Ptr[uint64]) -> int64:
+def _http_get(port: int64, body_off: Ptr[uint64], quiet: int32) -> int64:
     # Resolve the host into the sockaddr_in octets. A dotted-quad
     # literal is used as-is; a hostname is resolved through the
     # in-kernel DNS resolver via sys_resolve (SYS_RESOLVE 269).
@@ -793,6 +808,10 @@ def _http_get(port: int64, body_off: Ptr[uint64]) -> int64:
         return -1
     # Status code occupies bytes 9..11 ("HTTP/1.0 NNN ...").
     if http_buf[9] != 50 or http_buf[10] != 48 or http_buf[11] != 48:  # "200"
+        if quiet != 0:
+            # Probe miss (e.g. a 404 for an optional Packages.xz) — the
+            # caller will fall back; stay silent.
+            return -2
         write_str(2, "apt-get: HTTP request did not return 200 OK\n")
         return -1
 
@@ -851,15 +870,21 @@ def _build_index_path(suite: Ptr[uint8], tail: Ptr[uint8]):
     url_path_buf[o] = 0
 
 
-# -- compose the binary-amd64 Packages.gz path into url_path_buf ------
+# -- compose the binary-amd64 Packages index path into url_path_buf ---
 #
 # Builds "<base-path>/dists/<suite>/<component>/binary-amd64/
-# Packages.gz" where <component> is the comp_buf global (`main` by
-# default, or whatever `apt update`'s optional 4th argument named).
+# Packages.<ext>" where <component> is the comp_buf global (`main` by
+# default, or whatever `apt update`'s optional 4th argument named) and
+# <ext> is the caller-supplied compression suffix ("xz" or "gz").
 # Split out from _build_index_path because the component is a runtime
 # value, not a string-literal tail.
+#
+# `ext` is "gz" or "xz": real Debian ships an xz-compressed
+# `Packages.xz` (LZMA2) alongside the older `Packages.gz`, and
+# `apt update` probes for `.xz` first (smaller, the modern default)
+# before falling back to `.gz`.
 
-def _build_packages_path(suite: Ptr[uint8]):
+def _build_packages_path(suite: Ptr[uint8], ext: Ptr[uint8]):
     o: uint64 = 0
     bi: uint64 = 0
     while path_buf[bi] != 0 and o + 1 < 768:
@@ -884,12 +909,17 @@ def _build_packages_path(suite: Ptr[uint8]):
         url_path_buf[o] = comp_buf[ci]
         o = o + 1
         ci = ci + 1
-    tail: Ptr[uint8] = "/binary-amd64/Packages.gz"
+    tail: Ptr[uint8] = "/binary-amd64/Packages."
     ti: uint64 = 0
     while tail[ti] != 0 and o + 1 < 768:
         url_path_buf[o] = tail[ti]
         o = o + 1
         ti = ti + 1
+    ei: uint64 = 0
+    while ext[ei] != 0 and o + 1 < 768:
+        url_path_buf[o] = ext[ei]
+        o = o + 1
+        ei = ei + 1
     url_path_buf[o] = 0
 
 
@@ -1185,7 +1215,7 @@ def _do_update(base_url: Ptr[uint8], suite: Ptr[uint8],
     #    inside are not yet verified (that is V1's InRelease check).
     _build_index_path(suite, cast[Ptr[uint8]]("Release"))
     rel_body_off: uint64 = 0
-    rel_len: int64 = _http_get(port, &rel_body_off)
+    rel_len: int64 = _http_get(port, &rel_body_off, 0)
     if rel_len < 0:
         write_str(2, "apt-get: failed to fetch Release\n")
         return 1
@@ -1193,35 +1223,70 @@ def _do_update(base_url: Ptr[uint8], suite: Ptr[uint8],
     write_dec_u64(1, cast[uint64](rel_len))
     write_str(1, " bytes)\n")
 
-    # 2. Fetch <component>/binary-amd64/Packages.gz (component is the
-    #    comp_buf global — `main` by default, set from `apt update`'s
-    #    optional 4th argument).
-    _build_packages_path(suite)
-    gz_body_off: uint64 = 0
-    gz_len: int64 = _http_get(port, &gz_body_off)
-    if gz_len < 0:
-        write_str(2, "apt-get: failed to fetch Packages.gz\n")
-        return 1
-    if gz_len == 0:
-        write_str(2, "apt-get: Packages.gz body is empty\n")
-        return 1
+    # 2. Fetch the <component>/binary-amd64 Packages index (component
+    #    is the comp_buf global — `main` by default, set from
+    #    `apt update`'s optional 4th argument).
+    #
+    #    Modern Debian ships `Packages.xz` (LZMA2) as the primary
+    #    index and only keeps `Packages.gz` for compatibility — and
+    #    the `.xz` form is materially smaller, which matters against
+    #    apt's 256 KiB V0 caps. So we probe for `Packages.xz` FIRST
+    #    (a quiet GET — a 404 just means this mirror has no `.xz`),
+    #    and fall back to `Packages.gz` only if the `.xz` is absent.
+    #
+    #    pkg_len is the decompressed index length, set by whichever
+    #    branch wins.
+    pkg_len: uint64 = 0
 
-    # 3. Inflate the gzip body into pkg_buf.
-    inflate_init(&inf_state)
-    out_consumed: uint64 = 0
-    in_consumed: uint64 = 0
-    done: int32 = 0
-    irc: int32 = inflate_feed(&inf_state,
-                              &http_buf[gz_body_off], cast[uint64](gz_len),
-                              &pkg_buf[0], PKG_CAP,
-                              &out_consumed, &in_consumed, &done)
-    if irc < 0:
-        write_str(2, "apt-get: Packages.gz inflate failed (corrupt or exceeds 256 KiB cap)\n")
-        return 1
-    if done == 0:
-        write_str(2, "apt-get: Packages.gz inflate did not reach end-of-stream\n")
-        return 1
-    pkg_len: uint64 = out_consumed
+    _build_packages_path(suite, cast[Ptr[uint8]]("xz"))
+    xz_body_off: uint64 = 0
+    xz_len: int64 = _http_get(port, &xz_body_off, 1)
+
+    if xz_len > 0:
+        # Packages.xz is present — decompress it via the LZMA2 decoder.
+        write_str(1, "apt-get: using xz-compressed index (Packages.xz)\n")
+        drc: int64 = xz_decompress(&http_buf[xz_body_off],
+                                   cast[uint64](xz_len),
+                                   &pkg_buf[0], PKG_CAP)
+        if drc < 0:
+            write_str(2, "apt-get: Packages.xz decompress failed (corrupt or exceeds 256 KiB cap)\n")
+            return 1
+        pkg_len = cast[uint64](drc)
+    else:
+        # No Packages.xz (xz_len == -2 quiet 404, or a socket error
+        # surfaced as -1). Fall back to the gzip index.
+        if xz_len == -1:
+            # A socket-level failure already printed its own
+            # diagnostic; a retry on `.gz` would just fail the same
+            # way, so give up here.
+            write_str(2, "apt-get: failed to fetch Packages index\n")
+            return 1
+        _build_packages_path(suite, cast[Ptr[uint8]]("gz"))
+        gz_body_off: uint64 = 0
+        gz_len: int64 = _http_get(port, &gz_body_off, 0)
+        if gz_len < 0:
+            write_str(2, "apt-get: failed to fetch Packages.gz\n")
+            return 1
+        if gz_len == 0:
+            write_str(2, "apt-get: Packages.gz body is empty\n")
+            return 1
+
+        # Inflate the gzip body into pkg_buf.
+        inflate_init(&inf_state)
+        out_consumed: uint64 = 0
+        in_consumed: uint64 = 0
+        done: int32 = 0
+        irc: int32 = inflate_feed(&inf_state,
+                                  &http_buf[gz_body_off], cast[uint64](gz_len),
+                                  &pkg_buf[0], PKG_CAP,
+                                  &out_consumed, &in_consumed, &done)
+        if irc < 0:
+            write_str(2, "apt-get: Packages.gz inflate failed (corrupt or exceeds 256 KiB cap)\n")
+            return 1
+        if done == 0:
+            write_str(2, "apt-get: Packages.gz inflate did not reach end-of-stream\n")
+            return 1
+        pkg_len = out_consumed
 
     # 4. mkdir /tmp/apt (tmpfs grew real nested directories — dcf30f3)
     #    and store the decompressed index. mkdir of an existing dir is
@@ -1992,7 +2057,7 @@ def _fetch_one(pkg: Ptr[uint8], port: int64) -> int32:
     write_str(1, &fld_filename[0])
     write_str(1, "\n")
     body_off: uint64 = 0
-    body_len_i: int64 = _http_get(port, &body_off)
+    body_len_i: int64 = _http_get(port, &body_off, 0)
     if body_len_i < 0:
         write_str(2, "apt: failed to download the .deb\n")
         return 1
