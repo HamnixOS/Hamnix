@@ -1,67 +1,25 @@
 # Hamnix TODO
 
-Open work items not yet scheduled to a specific milestone. Items here
-are fair game for any contributor — human or AI agent.
+Open work, not yet milestone-scheduled. The **Kernel Roadmap** below is
+the priority spine — it is dependency-ordered and **Phase D is the
+prerequisite gate**. Sections after it are areas the roadmap
+deliberately excludes (metal bring-up, userspace polish, storage-driver
+maturity).
 
-> **Before picking an item, check [`STATUS.md`](STATUS.md) first.**
-> This file was pruned as of the apt / EHCI / userland-sockets wave
-> (commit `a73e5fb`); the entries below are believed open, but
-> `STATUS.md` is the source of truth for what shipped. Recent waves
-> that closed large chunks of this file:
->
-> - **Real-hardware boot (M16.156).** Hamnix boots to `hamsh` on a
->   real Asus i5-4210U laptop in Legacy/BIOS mode. The ring-3
->   triple-fault, >4 GiB identity-map gap, GOP-framebuffer
->   corruption, and xHCI-no-keyboard hang are all fixed.
-> - The Plan 9 native-syscall surface (`rfork`/`bind`/`mount` bodies,
->   per-process namespaces, `sys_srv_post`/`sys_srv_open`,
->   `sys_socketpair`) is done end-to-end. 9P V4.1 adds `create` over
->   a real fd; the connection table is released on unmount + task
->   exit. `distrofs` (userland 9P file server) + `nsrun` (private-
->   namespace shim launcher) have shipped.
-> - TLS cert validation is closed for LE-signed chains (PSS + ECDSA
->   + PKCS#1 v1.5 + chain builder + CA store + CertificateVerify
->   binding + multi-record stitching + AES-256-GCM-SHA384 + RSA-4096).
->   HTTP follows 3xx redirects and inflates gzip.
-> - **Package userland (verified in QEMU):** `dpkg-deb`, `dpkg`
->   (`-i`/`-l`/`-s`/`-L`/`-r`), a native `apt`
->   (`update`/`show`/`pkgnames`/`install` with transitive `Depends:`
->   + SHA-256 verify over HTTP **and HTTPS**), and an `httpd`
->   static-file server.
-> - **Userland networking:** `socket`/`connect`/`read`/`write`/`close`
->   (client) and `bind`/`listen`/`accept` (server) bridged to the
->   in-kernel TCP stack; `sys_resolve` DNS; `tls_connect(2)` for
->   userland HTTPS. CPython 3.11.10 and busybox 1.36 run as musl
->   static-PIE binaries.
-> - **EHCI (USB 2.0) driver** — V0 probe/port-enum, V1 control
->   transfers + HID boot keyboard, V2 interrupt-driven MSI/INTx.
-> - The compiler `Ptr[T]`-to-`&local` clobber, `&arr[i][j]` lower-to-
->   NULL, signed-only compare quirks, and stack-protector hardening
->   are all in. Driver-code workarounds are retired.
->
-> When in doubt about whether an item is done, check `git log --grep`
-> for the closing commit, or `STATUS.md` for the milestone row.
+> **Check [`STATUS.md`](STATUS.md) before picking an item** — it is the
+> source of truth for what shipped. Large chunks already closed: real
+> hardware boot (BIOS + UEFI), the Plan 9 native-syscall surface,
+> per-process namespaces, `distrofs`/`nsrun`, TLS 1.3 + X.509 chain
+> validation, the `dpkg`/`apt`/`httpd` userland, userland sockets,
+> CPython + busybox as musl static-PIE, fork → copy-on-write, the
+> higher-half ELF64 kernel, preemptive scheduling, the SSH-2.0 server,
+> xz decompression, apt streaming + GPG verification.
 
-**Source of truth for the project direction lives in `docs/`:**
-
-- [`docs/architecture.md`](docs/architecture.md) — the layered model
-  (Layer 0..5), boundary rules, per-subsystem layer assignments, and
-  the eight-phase migration plan. Read this first; the L+U tracks
-  must keep passing through every phase.
-- [`docs/native-api.md`](docs/native-api.md) — Layer 1 Plan 9-shape
-  syscall reference (~25 calls). Includes the full migration table
-  mapping every existing `SYS_*` to its new home.
-- [`docs/rio.md`](docs/rio.md) — file-based window-system spec (Plan 9
-  rio shape; per-window namespaces, `/dev/draw`, `/dev/mouse`).
-  Implementation gated on the open design questions in
-  `memory/project_rio_open_questions.md`.
-- [`README.md`](README.md) — current implementation snapshot:
-  shipped milestones (M16.x bare-metal kernel, L-track .ko's,
-  U-track Linux ELFs), commit references, working agreements.
-
-When picking a TODO item, check which layer it belongs to and which
-phase it's blocking, then look at the relevant doc for the contract
-it has to honour.
+**Project-direction docs:** [`docs/architecture.md`](docs/architecture.md)
+(layered model, boundary rules, migration phases),
+[`docs/native-api.md`](docs/native-api.md) (Layer 1 Plan 9 syscalls),
+[`docs/rio.md`](docs/rio.md) (window system), [`README.md`](README.md)
+(current snapshot).
 
 ---
 
@@ -69,507 +27,237 @@ it has to honour.
 >
 > Hamnix is a **Plan 9-shaped system. There is NO global filesystem
 > route.** A process sees a path only because something was *bound or
-> mounted into its own namespace*.
->
-> This means **no work may write to a global `/var`, `/usr`, `/etc`,
-> `/var/lib/dpkg`, `/var/cache/apt`, `/var/www`, etc.** Those are not
-> global locations — they are per-namespace bindings.
->
-> All Linux-binary shim state and all distro / package-manager state
-> (dpkg database, apt index + cache, httpd docroot, a distro's FHS
-> tree) lives inside a **distro-shaped namespace** whose filesystem is
-> exported by the userland **`distrofs` 9P file-server daemon** (a
-> daemon in the spirit of `rio` / `hamwd`). A shim is launched by:
-> `rfork(RFNAMEG)` → mount/bind the `distrofs` server into the new
-> private namespace → exec the binary. `dpkg` still *sees*
-> `/var/lib/dpkg` — but it resolves through that process's namespace
-> to the `distrofs` server, never to a global tree.
->
-> A TODO item is **mis-shaped** if it says "write X to `/var/...`"
-> without saying "...in the shim's distrofs namespace". If you catch
-> one, fix the wording. See `memory/feedback_distro_namespace.md`,
-> `docs/distro-namespaces.md`, and the Phase C.5 section below.
->
-> Historical debt being corrected: the native `apt`/`dpkg`/`httpd`
-> tools and commit `86a13bd` (global `/var` tmpfs) were built against
-> global paths before this law was written down. The `distrofs` 9P
-> daemon and the `nsrun` shim launcher have since shipped — but the
-> tools have **not** yet been migrated to run *under* `nsrun`; they
-> still write global paths. That migration is tracked under Phase C.5
-> and is genuinely-open work.
+> mounted into its own namespace*. **No work may write to a global
+> `/var`, `/usr`, `/etc`, `/var/lib/dpkg`, `/var/cache/apt`, `/var/www`.**
+> All Linux-binary-shim and distro/package state lives inside a
+> distro-shaped namespace exported by the userland **`distrofs`** 9P
+> daemon; a shim is launched `rfork(RFNAMEG)` → mount/bind `distrofs`
+> → exec. A TODO item is mis-shaped if it says "write X to `/var/...`"
+> without "...in the shim's distrofs namespace" — fix the wording.
+> See `memory/feedback_distro_namespace.md`, `docs/distro-namespaces.md`.
 
-## Language
+---
 
-(No open language-extension items. Extensions land per the working
-agreement: a `LANGUAGE.md` sentence + a `tests/` fixture + a real use
-site. See `LANGUAGE.md` for the current surface.)
+# Kernel Roadmap — Plan 9-central (dependency-ordered)
 
-## Compiler
+**Direction:** Plan 9 is the *core architecture*, not a layer retrofitted
+onto a Linux-shape kernel. 9P + per-process namespaces are the spine; the
+Linux VFS, the fd table, and the Linux ABI are *consumers* of that spine,
+never the substrate beneath it.
 
-- **Unsigned shift/divide codegen.** Unsigned-comparison codegen was
-  extended past `<`/`<=`/`>`/`>=`, but `>>` on an unsigned operand
-  still emits arithmetic `sarq` (needs logical `shrq`), and `/`/`%`
-  on unsigned operands still emit signed `idivq` (need `divq`). A
-  real correctness bug for unsigned-typed kernel code.
-- First-class function pointers — currently every indirect call
-  drops into `asm_volatile("call *%rax")`. A real `Fn[R, *A]` type
-  with proper SysV codegen would clean up dozens of asm helpers.
-- `match`/`case` keyword tokenisation — reserved but not implemented;
-  pick one of "Python 3.10 match" or "C switch" and ship.
+This roadmap is dependency-ordered. **Phase D is the prerequisite gate** —
+most resource-model work is mis-shaped (bolted on as a VFS special) until
+the chan/9P layer is the primary resource path. Honor the order rather
+than dispatching every section in parallel.
 
-## Plan 9 native surface (Layer 1)
+Markers: `[x]` done · `[~]` in flight · `[ ]` open · `(ARCH)`
+architectural inversion · `(NEW)` not previously tracked.
 
-The Plan 9 native syscall surface (Phase B reserved block 256..271,
-Phase C bodies for `rfork`/`bind`/`mount`/`unmount`/`create`/`stat`/
-`fstat`/`remove`/`fd2path`/`wstat`/`fwstat`/`notify`/`noted`, and
-Phase C.5 distro-shape namespaces) is **shipped end-to-end** — see
-`STATUS.md` and the 9P V0..V4.1 rows. Genuinely-open follow-ups:
+## ⚠ Boundary-discipline law — defend in every review
 
-- `rfork` `RFMEM` (thread path) returns -ENOSYS — the full thread
-  route needs caller-supplied `child_stack` + CLONE_SETTLS-shape TLS
-  plumbing; mirror the `do_clone` thread branch into `do_rfork` once
-  a Plan 9 `pthread`-equivalent caller exists.
-- `rfork` `RFNOWAIT` (detach) — accepted but doesn't yet sever the
-  child's `parent_pid`; lands when `wait4` learns to drop RFNOWAIT
-  children automatically.
-- Note delivery (`notify`/`noted`) follow-ups: `note_group`-wide
-  delivery (the "killable group" idiom — `do_rfork` tracks the group
-  id but `devproc_write` looks up a single pid); cross-task delivery
-  (writing another task's `/proc/<pid>/note` is parsed but logged +
-  dropped); NDFLT action (Phase C treats every action as NCONT);
-  surfacing the handler `msg` argument to user space (parked in
-  `TaskStruct.note_msg` today — threading it through requires the
-  `arch/x86/kernel/syscall_64.S` return stub).
-- `bind`/`mount` follow-ups: union mounts (`MBEFORE`/`MAFTER` — the
-  flag is recorded but `chan_resolve_prefix` is longest-prefix only);
-  per-namespace mount-table deep-copy on `rfork(RFNAMEG)` (today the
-  table is shared via the "shared OR private match" rule, not
-  copied); real 9P `chan_attach` that speaks `Tversion`/`Tattach`
-  over a stored srvfd (Phase D's hamwd job).
-- `create` (260) DMDIR — `do_create` returns -1 with
-  `errstr("create failed: DMDIR not supported")`; wire it to a real
-  directory-create path once tmpfs / ext4 grow `mkdir`.
-- `stat` / `fstat` per-backend hooks — `do_stat` / `do_fstat` handle
-  cpio + the synthetic `FD_*_MARK` dirs; tmpfs / fat / ext4 / socket
-  fds return `errstr("fstat: backend not supported")`. Grow per-backend
-  stat hooks.
-- `fd2path` exact path — returns the canonical cpio archive name
-  (which may differ from the path `open()` was called with). Phase G
-  adds a per-fd path slot to `TaskStruct` for the exact open()-time
-  path 9front's `sysfd2path` guarantees.
-- `wstat` / `fwstat` field follow-ups: `length` (truncate — needs
-  `tmpfs_truncate` / `ext4_truncate`); `mtime` (Hamnix has no
-  per-inode mtime storage — stat returns boot-jiffies); `gid` / `muid`
-  (waits for a users database); `mode` storage (accepted as a no-op
-  today); ext4 `rename` (`vfs_rename` is -EROFS for non-tmpfs paths).
+**Layer 1 (native) stays pure 9P / namespace. No exceptions.** The
+non-file modern mechanisms — `io_uring`, `epoll`, `futex`,
+signalfd/eventfd/timerfd — are the antithesis of "everything is a file."
+They are permitted **only inside Layer 2** as confined kernel objects
+that exist to satisfy Linux guests. The moment one becomes a dependency
+of native code or of the resource model below Layer 1, the architecture
+has been retrofitted backwards. The Linux ABI is a guest allowed its
+warts; the warts must not leak downward.
 
-### Phase C.5 — distro-shape namespaces (follow-ups)
+## PHASE D — Plan 9-central core  ⟵ PREREQUISITE GATE, front of the line
 
-`user/distrorun.ad` + the debootstrap'd `debian-minbase` backing have
-shipped: `distrorun debian-minbase /bin/cat /etc/debian_version` reads
-the real Debian release token from inside an isolated namespace while
-the parent still reads `hamnix/0.1`. Open follow-ups:
+The inversion: `namec` + a `devtab`-style dispatch + a real `Mnt` becomes
+the one true resource path. A local-device Chan and a mounted-9P Chan are
+the *same type* with the *same operation interface* — the consumer never
+knows which it holds.
 
-- Convenience aliases at `/bin/deb`, `/bin/ubuntu`, `/bin/suse`
-  that pre-translate the distro name (a ~200-byte wrapper around
-  `distrorun <fixed-distro-name> ...argv`).
-- `debfs` 9P server (`docs/distro-namespaces.md` Backing stores #2) —
-  replaces disk-backed `/var/lib/distros/<name>/` with an on-demand
-  9P-served FHS view assembled from a `.deb` package store. Layer 3
-  service; lands after Phase F.
-- Real Debian BINARY (not just /etc/* file) running inside a
-  namespace — `deb /bin/true` actually exec'ing the Debian-shipped
-  `/bin/true`. U42 + the per-task VMA layer (`mm/vma.ad`) shipped the
-  kernel-side dynamic ELF interpreter (`fs/elf.ad` follows PT_INTERP,
-  loads `ld-linux-x86-64.so.2`, plumbs AT_BASE/AT_ENTRY/AT_PHDR;
-  file-backed MAP_PRIVATE + MAP_FIXED overlay). Remaining blockers:
-    * VMA share / deep-copy on `rfork` — every fresh task starts with
-      an empty `vma_list_head`; RFMEM (share) needs `create_user_thread`
-      to copy the head pointer, RFPROC + no RFMEM (deep copy) needs a
-      walk-and-clone in `do_clone`.
-    * MAP_SHARED with cross-process coherence — `/dev/shm`-style cases.
-    * `fs/cpio.ad` `NR_FILES` bump (192 → 8192+) so the full
-      debootstrap'd tree (~5000 files) fits in the cpio archive.
-    * libdl / dlopen — U42 covers the loader up to "ld.so runs from
-      userspace"; `dlopen()` (apt plugins, CPython `.so` modules)
-      needs the DT_NEEDED + ld.so.cache search-path machinery.
-    * Namespace plumbing for the interpreter lookup — `_load_interp_elf`
-      calls `initramfs_data_ptr` verbatim; a `deb /bin/true` that picks
-      up Debian's `/lib64/...` via a namespace bind needs the loader to
-      route the interpreter lookup through the chan layer.
-- `apt update` inside a namespace — needs libdl/dlopen (above) and
-  `/var/lib/dpkg/` write-through served by `distrofs` (NOT a global
-  tmpfs — see the Namespace law above).
-- `/bin/python3` from Debian — lands after the libdl follow-up.
+- [~] **(ARCH) Real `chan_attach` over a stored srvfd** — Tversion /
+  Tattach / Twalk / Topen / Tread / Twrite / Tclunk; install a real
+  `Mnt` so Chan ops on a mounted server marshal into 9P T-messages.
+  (`lib/9p`, `sys/src/9/port`, `chan_resolve_prefix`)
+- [~] **(ARCH) `/srv/<name>` srvfd channel posting** — so `mount` has a
+  real conversation to consume.
+- [~] **(ARCH) `namec()` + `devtab` dispatch as the universal open
+  path** — *all* opens (native AND Linux-ABI) resolve through the
+  process's mount table to a `Chan`; replaces the `FD_*_MARK`
+  special-casing in `fs/vfs.ad`.
+- [~] **(ARCH) Per-Pgrp mount-table deep-copy on `rfork(RFNAMEG)`** —
+  shared via a "shared-or-private match" rule today; make the copy real.
+  (the four `[~]` items above are in flight as the Phase D core agent)
+- [ ] **(ARCH) Convert the 12 `FD_*_MARK` cdevs into served Chans** —
+  cons/time/pid/random/proc/mouse/cpuinfo/meminfo/uptime/loadavg/
+  version/hostname become `Dev`-table file servers, not magic-number fds.
+- [ ] **(ARCH) Layer-2 `/proc → /dev` translation becomes a namespace
+  bind** — retire the `_u_translate_proc_to_dev` string-rewrite; the
+  Linux-ABI process gets `bind '#c' /proc`-shape entries instead.
+- [ ] **(ARCH) Route the Linux ABI through the chan layer** — `linux_abi/`
+  open/read/write resolve through the namespace to a Chan; the shim
+  becomes a syscall-number translation onto chan/9P ops, not a parallel
+  path with its own state.
+- [ ] Union mounts MBEFORE / MAFTER (flag recorded; longest-prefix only).
+- [ ] Collapse the 4 per-subdir binds in `distrorun.ad` into one
+  `mount(srvfd, -1, "/", MREPL, "")`.
+- [ ] `create(260)` DMDIR → real directory create (needs tmpfs/ext4 mkdir).
+- [ ] `stat`/`fstat` per-backend hooks (tmpfs/fat/ext4/socket).
+- [ ] `fd2path` exact open()-time path (per-fd path slot in `TaskStruct`).
+- [ ] `wstat`/`fwstat` fields: `length` (truncate), `mtime`, `gid`/`muid`,
+  `mode` storage.
+- [ ] **distrofs migration capstone:** run `apt`/`dpkg`/`httpd` *under*
+  `nsrun` so `/var/lib/dpkg`, `/var/cache/apt`, `/var/www` resolve
+  through distrofs; then delete the global `/var` tmpfs (supersede
+  `86a13bd`). The largest open Namespace-law debt.
+- [ ] distrofs persistent backing (ext4 partition / disk image) so an
+  installed package survives reboot.
 
-**Distrofs namespace migration (correcting the global-path debt):**
+## §1 Process model & address space  (gates threads, the loader, all real software)
+- [x] VMA deep-copy on fork; copy-on-write pages (COW fault handler +
+  refcounted shared frames) — landed, whole address space incl. mmap.
+- [x] VMA share on RFMEM / thread address-space sharing — pthreads run.
+- [ ] `rfork` RFMEM thread path (Plan 9 side still -ENOSYS): caller
+  `child_stack` + CLONE_SETTLS-shape TLS.
+- [ ] `rfork` RFNOWAIT detach: sever child `parent_pid`; `wait4`
+  auto-drops RFNOWAIT children.
+- [ ] MAP_SHARED with cross-process coherence (`/dev/shm`-style).
+- [ ] `mprotect` / `madvise` / MAP_FIXED maturity for arbitrary callers.
 
-The `distrofs` 9P daemon (`user/distrofs.ad`) and the `nsrun` shim
-launcher (`user/nsrun.ad` — `rfork(RFNAMEG)` + mount `distrofs` so a
-child sees `/var`,`/usr`,`/etc` through 9P) have **shipped**, as has
-9P V4.1 (`create` over a real fd). The genuinely-open work is the
-*migration* of the package tools onto them:
+## §2 Concurrency primitives → threads  (needed by glibc)
+- [x] `futex(2)` + `%fs`-base TLS (`arch_prctl`) — **Layer 2 only**;
+  glibc + musl pthreads programs verified.
 
-- **Migrate the native `apt`/`dpkg`/`httpd` tools off global paths.**
-  They still write a global `/var/...` / `/tmp/...` today — wrong
-  shape. Each must be launched *under* `nsrun` so `/var/lib/dpkg`,
-  `/var/cache/apt`, `/var/www` resolve through the private namespace
-  to the `distrofs` server. This is the largest open Namespace-law
-  debt.
-- Supersede commit `86a13bd` (global `/var` tmpfs subtree) — once the
-  tools run under `nsrun`, the global `/var` is removed; nothing
-  should depend on a global `/var`.
-- `distrofs` persistence — `distrofs` serves a tmpfs-backed tree that
-  does not survive a reboot. A persistent backing store (an ext4
-  partition, or a disk-backed image) is needed before an installed
-  package survives a power cycle.
-- Phase D follow-up: once `chan_attach` speaks 9P, replace the four
-  per-subdir binds in `distrorun.ad` with a single
-  `mount(srvfd, -1, "/", MREPL, "")` call.
-- **Phase D** prerequisite — `srvfd` channels at `/srv/<name>`.
-  `mount` needs `srvfd` to come from somewhere; without it the
-  Phase C `mount` body has nothing to consume.
+## §3 Signals  (real daemons live or die here)
+- [ ] Full Linux-ABI signals: `sigaction`, `sigprocmask`, masks,
+  signal-frame setup, `rt_sigreturn` (only Ctrl-C SIGINT today).
+- [ ] SIGCHLD + reaping; SIGPIPE on broken pipe/socket; SIGTERM/SIGKILL.
+- [ ] Plan 9 note follow-ups: `note_group`-wide (killable group),
+  cross-task `/proc/<pid>/note`, NDFLT action, surface handler `msg`.
 
-### errstr follow-ups
+## §4 Dynamic linking / loader  (depends on §1 + Phase D)
+- [ ] `dlopen`/libdl: DT_NEEDED resolution + `ld.so.cache` search path —
+  unlocks apt plugins, CPython `.so`, stock Debian.
+- [ ] Route interpreter lookup through the chan/namespace layer
+  (`_load_interp_elf` hardcodes `initramfs_data_ptr` today).
+- [ ] Verify AT_BASE/AT_ENTRY/AT_PHDR auxv for a binary loaded *inside*
+  a namespace.
+- [ ] **Capstone demo:** `deb /bin/true` exec'ing the stock dynamic
+  Debian binary inside a namespace, driven over SSH (depends on Phase D
+  + §1 + this + §16 cpio bump).
 
-Wider errstr integration shipped — `set_current_errstr(...)` is wired
-at every meaningful failure path across `syscall.ad`, the rfork path,
-and the realistic Linux-ABI failure subset. Open follow-ups:
+## §5 Modern async I/O  (**Layer 2 only**, depends on §2/§3)
+- [ ] `epoll` (`epoll_create1`/`ctl`/`wait`); `io_uring` SQ/CQ rings;
+  `eventfd`/`timerfd`/`signalfd`; `poll`/`select` fallback.
+- [ ] O_NONBLOCK end-to-end: stop masking `SOCK_NONBLOCK`, EAGAIN on
+  would-block across socket + file fds.
 
-- errstr at the per-backend layers (`fs/ext4.ad` / `fs/fat.ad` /
-  `kernel/block/blk.ad`): those return negative values that bubble up
-  through vfs.ad and the syscall site supplies a generic message.
-  Backend-specific strings ("ext4: short read", "fat: cluster chain
-  corrupt", ...) would surface root cause.
-- User-mode `perror`-style helper in `user/runtime.S`: a thin wrapper
-  that calls `sys_errstr` + `sys_write` so user binaries can
-  `perror("open")` -> `"open: file does not exist\n"`.
+## §6 Timekeeping (vDSO)  — [~] in flight
+- [~] `clock_gettime` CLOCK_MONOTONIC/REALTIME; TSC high-res monotonic
+  clock; LAPIC timer calibration fix (fires ~70× fast under TCG).
+- [ ] vDSO: map `gettimeofday`/`clock_gettime` without syscall overhead.
 
-### /dev cdev family — follow-ups
+## §7 Entropy / RNG  (served Chans post Phase D)
+- [ ] ChaCha20 CSPRNG (replacing xorshift64) + RDRAND/RDSEED seeding;
+  `getrandom(2)` repointed at the random Chan; distinct non-blocking
+  `/dev/urandom` + blocking `/dev/random`.
 
-The Plan 9 cdev family is twelve files deep (cons / time / pid /
-random / proc / mouse / cpuinfo / meminfo / uptime / loadavg /
-version / hostname), plus the M16.135 devsys trio (stat / mounts /
-diskstats), and Layer-2 `/proc/<name>` → `/dev/<name>` translation
-is wired. Open follow-ups:
+## §8 SMP & scheduler
+- [x] Preemptive scheduling — the timer preempts a CPU-bound userland
+  task (per-task quantum, ring-3 preemption points).
+- [ ] Per-CPU runqueues + real SMP scheduling (AP bringup works;
+  single-rq today); load balancing / work stealing; CPU affinity.
 
-- `/dev/urandom` as a distinct non-blocking cdev + a real entropy
-  estimator + a blocking `/dev/random` variant. Today `/dev/random`
-  is unconditionally non-blocking.
-- `getrandom(2)` should be re-pointed at `devrandom_read()` so
-  userland doesn't have to open `/dev/random`.
-- `/dev/uptime` idle column is `0.00` — needs an `idle_jiffies`
-  field on TaskStruct bumped from the scheduler's idle path.
-- `/dev/loadavg` emits the instantaneous runnable count three times,
-  not an EWMA — needs a per-tick runqueue-depth sampler in
-  `timer_interrupt` (decay rates per Linux `kernel/sched/loadavg.c`).
-- `/dev/stat` columns are placeholders (all jiffies in the "user"
-  bucket; intr/ctxt zeros) — needs TaskStruct rtime/stime fields +
-  a per-IRQ counter in `arch/x86/kernel/irq.ad`.
-- `/dev/diskstats` 14-column counters are zero — needs BlockDevice
-  `rd_ios`/`wr_ios` fields bumped from the read/write paths.
-- Persist `/dev/hostname` writes back to `/etc/hostname` (blocked on
-  a writable rootfs); `/dev/machine_id` (128-bit boot-stable id);
-  `/dev/sysname` aggregator.
-- Layer-2 translation follow-ups: `/proc/{stat,mounts,diskstats}`
-  (extend `_u_translate_proc_to_dev`); per-pid `/proc/<pid>/*` and
-  `/proc/self/*`; `/proc/net/*`, `/proc/cmdline` (each gated on its
-  own native cdev landing first).
-- Per-cache slab walker accessor in `mm/slab.ad` so devmeminfo's
-  `KmallocLive` shows real `sum(nr_inuse * object_size)`.
-- Migrate `SYS_PUTC` / `SYS_GET_JIFFIES` / `SYS_GETPID` callers to
-  the corresponding `/dev/*` reads (per-syscall migration tracked in
-  `docs/native-api.md`).
+## §9 Interrupts & PCI  (off critical path — parallelizable)
+- [ ] MSI-X: PCI cap-walk (0x11), table mapping, per-vector LAPIC
+  programming — per-queue virtio-net.
+- [ ] virtio-blk INTx wiring (vectors 0x41+).
+- [ ] Multi-IOAPIC: consult the MADT-cached list, pick by GSI range
+  (hard-coded `0xFEC00000` today).
 
-### hamwd / windowing — follow-ups
+## §10 Networking  (off critical path — parallelizable)
+- [ ] **(ARCH)** Expose TCP/UDP as a `/net` 9P file tree
+  (`/net/tcp/clone`, `/net/tcp/N/{ctl,data,status}`); `socket(2)` →
+  Layer-2 consumer of it. Do once the chan layer is real (Phase D).
+- [ ] Congestion control: slow-start + congestion-avoidance (RFC 5681),
+  NewReno or CUBIC.
+- [ ] Multi-listener accept queue / wider TCB table; window scaling +
+  SACK + timestamps.
+- [ ] ICMP errors (dest-unreachable, time-exceeded, redirect); generic
+  unicast ARP helper; UDP sockets; `getsockopt`/`setsockopt`; close a
+  socket fd's TCP slot at task exit.
 
-The Phase D hamwd skeleton (`user/hamwd.ad`) shipped — a userland
-daemon with a 16-slot window registry that emits framed wire packets.
-**Note:** the wire protocol follows the Plan 9 rio shape
-(`docs/rio.md`); rio implementation is gated on the open design
-questions in `memory/project_rio_open_questions.md`. Open follow-ups:
+## §11 DNS resolver  (off critical path — parallelizable)
+- [ ] Multiple A-records (return all + round-robin); PTR/MX/SRV record
+  types; AAAA (gated on an IPv6 header); TCP/53 fallback for > 512 B.
 
-- Real `/srv/hamwd` posting so clients can `open("/srv/hamwd")` and
-  `mount` it — needs the 9P client inside `chan_resolve_prefix` to
-  round-trip Tversion/Tattach/Twalk over the stored srvfd.
-- Full window lifecycle + drawing primitives + a reverse-channel
-  event parser, per the rio spec.
-- A persistent daemon (survives across client requests), auto-launch
-  from `/etc/rc`, and a real renderer handshake.
+## §12 Filesystem write maturity & persistence
+- [ ] ext4 `rename` (-EROFS off-tmpfs today); `truncate`/`ftruncate`;
+  per-inode mtime storage; `fsync` + barrier ordering; FAT write path.
 
-## Kernel / L-track
+## §13 cdev / proc field completions  (after the Phase D Chan conversion)
+- [ ] `/dev/uptime` idle column; `/dev/loadavg` EWMA; `/dev/stat` real
+  columns; `/dev/diskstats` counters; persist `/dev/hostname`.
+- [ ] Layer-2 `/proc` extensions via bind: `stat`/`mounts`/`diskstats`,
+  per-pid `/proc/<pid>/*`, `/proc/self`, `/proc/net/*`, `/proc/cmdline`.
+- [ ] Real `KmallocLive` (per-cache slab walker); per-backend errstr
+  (ext4/fat/blk); user-mode `perror` helper.
 
-- `MAX_EXPORTS=512` ceiling — bump again when we cross ~450 used.
-- nf_conntrack core (~155 UND) — blocking conntrack helpers.
-- `8021q.ko` (~118 UND, VLAN).
-- `libphy.ko` (~153 UND, Ethernet PHY).
-- usbcore + xhci_hcd — real-hardware drivers.
+## §14 Resource control & security  (stretch)
+- [ ] Per-namespace CPU/memory caps (ride the namespace model, not Linux
+  cgroups); `seccomp-bpf`; POSIX capabilities (drop-root daemons).
 
-## Networking
+## §15 Compiler / language infra  (off critical path — parallelizable)
+- [x] Unsigned shift/divide codegen (`shrq`/`divq` honoring signedness).
+- [ ] First-class function pointers `Fn[R, *A]` with SysV codegen —
+  kills the `asm_volatile("call *%rax")` hacks.
+- [ ] `match`/`case` tokenization → implement.
 
-The bare-metal network stack — virtio-net + e1000e + r8169 NIC
-drivers, IOAPIC programming, ARP/IP/UDP/ICMP/DHCP/DNS/TCP/HTTP, and
-IRQ wiring for the bare-metal devices (M16.117) plus the PS/2 IRQ 1
-ISA-edge fix — has shipped. e1000e and r8169 both have TX + an MSI
-single-vector path. Open follow-ups:
+## §16 Build / initramfs  — [~] in flight
+- [~] cpio `NR_FILES` 192 → 8192+ so a real debootstrap tree (~5000
+  files) fits — prereq for the §4 capstone.
 
-- MSI-X for virtio-net — per-queue vectors instead of shared INTx.
-  Needs PCI capability walking (cap ID 0x11), MSI-X table mapping
-  (BAR-relative), per-vector LAPIC programming.
-- virtio-blk INTx wiring (vectors 0x41+, copies the virtio-net
-  template).
-- Multi-IOAPIC systems — the IOAPIC is hard-coded at 0xFEC00000;
-  large/NUMA boxes have one IOAPIC per socket. Make `ioapic_redirect`
-  consult the MADT-cached IOAPIC list and pick by GSI range.
-- ICMP error message types — destination unreachable (type 3), time
-  exceeded (type 11), redirect (type 5). Real peers expect them when
-  routes break.
-- DNS follow-ups:
-  - PTR records (reverse lookup) — type 12. Used by `getnameinfo`
-    and reverse-DNS logging in apt-like clients. Same wire codec
-    as A, just a different QTYPE and an in-addr.arpa-formatted
-    QNAME on the request side.
-  - MX records (mail exchange) — type 15. Required before an
-    in-kernel SMTP client could route outbound mail. RDATA is
-    (preference uint16, exchange-domain-name), the latter
-    DNS-compression-pointer-encoded like every other name.
-  - SRV records (service location) — type 33. Used by Kerberos,
-    XMPP, modern HTTP/3 alt-svc lookups, and several Debian
-    repository-mirror autoselection schemes. RDATA is (priority,
-    weight, port, target-name).
-  - Multiple A records — DNS answers often include 3-8 A-records
-    for load-balancing. We take the first and ignore the rest; a
-    fuller implementation would return all of them and let the
-    caller round-robin.
-  - AAAA (IPv6) records — IPv6 is out of scope until the IP layer
-    gets a v6 header, but the DNS codec is type-agnostic and could
-    be extended with TYPE=28 trivially.
-  - TCP/53 fallback for responses larger than 512 bytes (the UDP
-    cap from RFC 1035). Apt may hit this for large MX-style
-    answers; not a blocker for A-only queries.
-  - Generic ARP-request helper in `drivers/net/virtio_net.ad`
-    or `arp.ad` (today `_dns_prime_arp` duplicates the
-    `virtio_net_send_arp_probe` shape locally). When a second
-    consumer needs unicast ARP, factor this out.
-TCP (active-open + passive-open + RFC 6298 retransmission), HTTP/1.1
-(chunked transfer-encoding + 3xx redirect-follow + gzip inflate), and
-TLS 1.3 with full X.509 chain validation have all shipped. Open
-follow-ups:
+## §17 L-track stock-Linux `.ko`  (lowest priority)
+- [ ] `MAX_EXPORTS` bump; `usbcore`+`xhci_hcd`, `libphy`, `8021q`,
+  `nf_conntrack` core. Weigh against native drivers before spending.
 
-- TCP congestion control — initial cwnd of one segment is fine for
-  SLIRP; the real internet needs slow-start / congestion-avoidance
-  (RFC 5681), probably NewReno fast retransmit.
-- TCP multi-listener support — a single LISTEN slot per port today,
-  no per-listener accept queue. A real concurrent server needs an
-  explicit accept queue per listener or a wider TCB table.
-- TCP window scaling + SACK + timestamps — performance options; not
-  blockers for `apt`'s short single-segment requests.
-- Socket(2) API — V0 + server side done: userland `socket`/`connect`/
-  `read`/`write`/`close` (client) and `bind`/`listen`/`accept`
-  (server) on an `AF_INET` + `SOCK_STREAM` fd are bridged to the
-  in-kernel TCP stack, for both native Adder and Linux-ABI binaries
-  (`linux_abi/u_socket_state.ad` backing records; `fs/vfs.ad`'s
-  `FD_SOCKET_MARK` arms). `tls_connect(2)` (`SYS_TLS_CONNECT 277`)
-  gives userland HTTPS through the in-kernel TLS stack;
-  `scripts/test_u_socket.sh` / `test_u_server.sh` / `test_u_tls.sh`
-  cover it. Open backlog:
-  - Non-blocking sockets / `O_NONBLOCK` — `socket` masks
-    `SOCK_NONBLOCK` off today; connect/read/write always block (poll
-    with a bounded deadline). Needs an `EAGAIN`-on-would-block path.
-  - `select`/`poll` on socket fds — `poll(2)` reports every open fd as
-    `POLLIN`-ready; a socket fd should consult the tcp slot's rx ring.
-  - UDP sockets (`SOCK_DGRAM`) — rejected with `-EPROTONOSUPPORT` in
-    V0; needs a `udp.ad` send/recv bridge.
-  - IPv6 (`AF_INET6`) — rejected with `-EAFNOSUPPORT`.
-  - `getsockopt`/`setsockopt` beyond no-op (e.g. real `SO_ERROR`,
-    `TCP_NODELAY`).
-  - Socket fds left open at task exit leak their TCP slot —
-    `close_fd_in_task` doesn't know about `FD_SOCKET_MARK` records.
-  - The Plan 9 `/net/tcp/clone` shape (announce/listen/accept files)
-    is the separate Phase F design.
-- HTTPS / TLS — TLS 1.2 fallback for old servers (a single-codepath
-  ECDHE-RSA-AES128-GCM fallback for mirrors behind ancient stacks).
-- HTTP keep-alive (`Connection: keep-alive`) — every GET opens a
-  fresh TCP slot today; keep-alive would cut handshake overhead for
-  apt's many small fetches.
-- HTTP header continuation lines (folded headers, RFC 9112 §5.2) and
-  a header block spanning multiple `tcp_recv` chunks (the parser
-  punts past a 4 KiB scratch today).
-- sshd has SHIPPED (`user/sshd.ad`) — native-Adder SSH-2.0:
-  curve25519-sha256 KEX, ECDSA-P256 host key, chacha20-poly1305,
-  password auth, an interactive session channel. Open follow-ups:
-  publickey auth, a generated (not build-constant) host key, an
-  RFC 6979 deterministic nonce for the host-key signature.
-The Intel e1000e and Realtek r8169 NIC drivers have shipped with TX +
-MSI single-vector paths (V1/V2). Open follow-ups:
+## Critical path & parallelization
+On the critical path: **Phase D → §1 → §2 → §4 capstone.** Off the
+critical path, safe to dispatch in parallel immediately: §15, §16, §6,
+§9, §11. Everything in §5 is Layer-2-only per the boundary law.
 
-- e1000e EEPROM-walk (`EERD`) for real cards that leave RAH.AV
-  cleared until the driver issues an EERD-paced 16-bit-at-a-time read
-  (QEMU always pre-loads the MAC from `-device e1000e,mac=...`).
-- e1000e / r8169 full ARP/IP/UDP/ICMP/DHCP/DNS/TCP integration —
-  virtio-net is still the bring-up NIC for the protocol stack tests;
-  the physical NICs prove silicon reachability + ARP round-trip.
-- r8169 RX path on real Gigabit silicon — verify the MMIO descriptor
-  rings against a physical RTL8168.
-- Broadcom tg3 driver — covers most Dell / HP business laptops
-  (BCM57xx series). After r8169 + e1000e the gap to "boots on any
-  real laptop" is mostly tg3 and the Atheros AR8161 family.
-- Intel igb driver — covers I210 / I350 server NICs that ship on
-  most modern motherboards but aren't part of the e1000e device-ID
-  whitelist (they use the igb register layout, not e1000e's).
+---
 
-## Userspace / U-track
+# Metal bring-up  (human-in-the-loop lane — excluded from the roadmap)
+- Real-hardware keyboard: the built-in keyboard on the Asus i5-4210U
+  does not respond; leading hypothesis is an EHCI-routed keyboard (the
+  EHCI driver is QEMU-verified, not yet tested on metal).
+- UEFI on the real Asus — Legacy/BIOS confirmed; re-verify the UEFI
+  direct-boot path on that laptop.
+- Real NIC silicon: e1000e EEPROM-walk, r8169 RX on a physical RTL8168,
+  Broadcom tg3, Intel igb — verify against metal.
+- EFI memory-map walker in `e820.ad` (RAM > 240 MiB on UEFI boot); EFI
+  Runtime Services (`GetTime`, `GetVariable`); PE `.reloc` table (Secure
+  Boot prereq); drop the FAT12 32 MiB ESP cap via the GPT-ESP path.
 
-- **/bin tool audit — more cwd-relative defaults.** The shell-UX
-  bug-fix wave covered `ls`/`find` (commit 51a6974) and `du`
-  (sys_chdir-validation commit, M16.115). Other tools that hardcode
-  a default path when invoked with no args should also be swept:
-  candidates left to inspect across rebuilds — anything that does
-  `argc < 2: ... = "/something"`. Today the obvious offenders are
-  fixed; the audit is bounded by "no tool defaults to `/mnt`" and
-  "every tool with a 'current dir' intent calls sys_getcwd". Adding
-  new tools as Phase G lands should follow ls.ad / find.ad / du.ad
-  as templates.
-- **hamsh line-editor follow-ups.** History + arrow-key CSI
-  consumption shipped. Still open: a real in-line cursor model
-  (Left/Right are swallowed, not honoured; Delete backspaces the
-  trailing char); Tab completion (needs the cursor model + a
-  directory walker against `/bin` and CWD); Ctrl-C dropping the
-  in-progress edit buffer once `sys_kill` reaches the foreground
-  task; an argv-tokenization rewrite (single quotes, backslash
-  escapes, `$VAR` inside `"…"` — `$VAR`/`$?` in-token expansion
-  itself shipped in `c2337f8`).
-- Real vDSO blob (mapped page advertised via `AT_SYSINFO_EHDR`),
-  replacing the U11-era kernel-side `_lookup_dynsym` hack retired
-  in U20.
-- **U41 CPython follow-ups.** CPython 3.11.10 runs as a musl
-  static-PIE (ET_DYN) frozen-stdlib ELF — `python3 -c "print(...)"`
-  works in QEMU. Open: trim the frozen set (the `<encodings.*>` glob
-  pulls in ~1 MB of bytecode the boot path doesn't touch);
-  `--enable-optimizations` (PGO+LTO); C extensions (`_ssl`,
-  `_hashlib`, `_socket`, `_curses` — need a U-track `ld.so` or
-  static-linked extensions).
-- **busybox `ls` enumeration — open XFAIL.** busybox 1.36 runs as a
-  musl static-PIE; the u29/u32/u33/u36/u37 tests pass (multi-call
-  banner, `echo`/`cat`/`pwd`/`uname` applets, `sh -c`, a 3-stage
-  hamsh pipeline). But `busybox ls` directory enumeration prints
-  nothing — musl's `opendir`/`readdir` hand `getdents64` the wrong
-  fd (a direct `SYS_getdents64` syscall enumerates a directory
-  cleanly, so `getdents64` itself is correct; the gap is the musl
-  DIR-struct fd round-trip). The `syscall_64.S` `%rdi`-preservation
-  fix landed (`633dad2`) — it addressed musl `open(O_CLOEXEC)`
-  returning 0, the suspected root cause; whether `busybox ls`
-  enumeration is fully fixed now needs re-confirmation. Marked
-  XFAIL in u32/u33 until then.
-- **busybox `sh` internal pipeline `#GP`.** `busybox sh -c "a | b"`
-  trips a `#GP` that halts the kernel. The u37 test deliberately
-  drives the strictly-wider hamsh-driven 3-process pipeline instead,
-  which passes. Open: diagnose the `#GP` (likely a clone/exec path
-  busybox's internal pipeline takes that the hamsh path doesn't).
-- Broader busybox applet coverage; an `apt`-static via musl.
+# Storage driver maturity
+- AHCI NCQ (serialises on slot 0 today); hot-plug / COMRESET retry;
+  multi-port naming (`sd1`...). NVMe multi-queue + multi-namespace.
+- Partition: extended-CHS chains, BSD disklabel, APM; GPT UTF-16 names
+  into the block tag; `mount /dev/sd0p1 /mnt` path-to-slot resolver.
+- ext4 mkfs: multi-block-group layout, journal (jbd2). Installer
+  plumbing (ext4-write + GRUB-install + MBR-write).
 
-## Storage
+# Input
+- International keyboard layouts (`kbd_set_layout` + compiled-in tables);
+  dead-key / compose / IME; PS/2 mouse 4-byte scroll-wheel protocol;
+  blocking read on `/dev/mouse`; MADT IRQ-override consumption.
 
-AHCI + NVMe (read + write, registered as `sd0` / `nvme0n1`), MBR +
-GPT read + write (mkpart/mklabel), partition-aware block-device
-naming (`sd0p1`, `nvme0n1p2`), and in-kernel ext4 mkfs have all
-shipped. Open follow-ups:
-
-- AHCI native command queueing (NCQ) — every command serialises on
-  slot 0 today.
-- AHCI hot-plug / COMRESET / port reset retry — real laptops flap
-  SATA on resume; the driver needs to re-init a dropped-link port.
-- NVMe multi-queue (one SQ per CPU) and multi-namespace
-  (`nvme0n2`, ... — needs IDENTIFY active-namespace-list CNS=0x02).
-- Multi-port AHCI naming (`sd1`, `sd2`, ...) — only the first active
-  port is registered today.
-- Extended-partition (CHS) chains (types 0x05 / 0x0F), BSD disklabel,
-  Apple Partition Map — install-media interop.
-- GPT-entry UTF-16LE partition names into the block-device tag (the
-  name is decoded for the `[partition]` log but not propagated).
-- `mount /dev/sd0p1 /mnt` — the 9P `mount(2)` front-end needs a
-  path-string-to-slot resolver walking /dev → block-layer name; today
-  fs/fat.ad + fs/ext4.ad mount whichever raw disk wins the magic
-  probe.
-- ext4 mkfs follow-ups: multi-block-group layout (clamped to 32768
-  blocks / 128 MiB today), pre-allocated multi-extent regular files
-  at format time, a journal (`has_journal` — the L-track jbd2 module
-  is the natural source, lands alongside `fsync()`).
-- Installer plumbing — with block-write in place, a higher-level
-  installer needs ext4-write + GRUB-stage-install + MBR-write helpers
-  to lay Hamnix down on a real disk and boot from it.
-
-## Input
-
-PS/2 keyboard (extended scancodes + modifiers + i8042 bring-up + IRQ 1
-wiring), PS/2 mouse (3-byte protocol, IRQ 12, `/dev/mouse` cdev), and
-USB HID via xHCI (V0/V1/V2) **and EHCI** (V0/V1/V2) have all shipped.
-The IRQ 1 / IRQ 12
-ISA-edge IOAPIC redirect bug is fixed (`dbd40e6` / `9ec996c`). Open
-follow-ups:
-
-- **Real-hardware keyboard (open blocker).** The built-in keyboard on
-  the real Asus i5-4210U laptop does not respond — atkbd's i8042
-  handshake, RESET (0xFF), and IDENTIFY (0xF2) probes return nothing
-  on metal. Leading hypothesis: the keyboard is on the **EHCI USB 2.0
-  controller**, not the i8042. A native-Adder EHCI driver has since
-  landed (V0 probe/port-enum, V1 control transfers + HID boot
-  keyboard, V2 interrupt-driven MSI/INTx) and is verified under QEMU
-  `usb-ehci` + `usb-kbd` — but it has **not yet been tested on the
-  real Asus**; the keyboard there may or may not now work. The atkbd
-  path is confirmed working under QEMU.
-- International keyboard layouts (Dvorak, AZERTY, German QWERTZ, UK)
-  — `sc1_to_ascii` / `sc1_to_shifted` are hard-coded US-104; a
-  `kbd_set_layout(name)` entry point + a registry of compiled-in
-  layout tables would suffice.
-- Dead-key / compose / IME — standard X11-shape compose tables + a
-  2-byte pending-deadkey state for the European-Latin set.
-- PS/2 mouse 4-byte protocol with scroll wheel (the `0xF3 200/100/80`
-  knock pattern); adds a `<dz>` column to `/dev/mouse`.
-- Blocking read on `/dev/mouse` — needs the syscall layer's
-  wait-queue story finalised; the cdev is poll-only today.
-- MADT IRQ-override consumption — the ISA-edge fix is hard-coded;
-  a future ACPI-driven override pass would derive trigger/polarity
-  from the MADT.
-
-## Toolchain & install
-
-The hybrid BIOS+UEFI ISO, the native PE/COFF UEFI stub (SFSP ELF
-loader, GetMemoryMap + ExitBootServices, GDT handoff), the e820
-identity-map extension for >4 GiB RAM, the EFI GOP framebuffer text
-console, and `docs/REAL_HARDWARE.md` have all shipped. **Real-hardware
-boot is confirmed** — an Asus i5-4210U boots to `hamsh` in Legacy/BIOS
-mode (M16.156). Open follow-ups:
-
-- **Real-hardware keyboard** — see the Input section. The leading
-  hypothesis is an EHCI-routed built-in keyboard; the EHCI USB 2.0
-  host-controller driver (V0/V1/V2) has landed and is QEMU-verified
-  but not yet tested on the real Asus.
-- **UEFI on the real Asus** — Legacy/BIOS boot is confirmed; the UEFI
-  direct-boot path on that laptop has not been re-verified since the
-  M16.151–156 wave. Re-test it. (See also the real-hardware keyboard
-  retest above — both want a fresh on-metal run.)
-- **EFI memory-map walker** in `e820.ad` — the stub saves the 16 KiB
-  descriptor buffer at `efi_mmap_buf` (+ `efi_mmap_descsize`), but
-  `e820_init()` still installs a hardcoded 2..240 MiB memblock window
-  on the EFI path. A descsize-stride walker classifying entries by
-  Type (EfiConventionalMemory=7) and feeding the largest region above
-  `kernel_image_end()` to `memblock_set_region` unblocks RAM above
-  240 MiB on UEFI boot. (Note: the >4 GiB *identity-map* gap is
-  already closed by `arch/x86/mm/pgtable.ad`; this remaining item is
-  the memblock allocator window.)
-- **Expose EFI Runtime Services** via `efi_system_table->RuntimeServices`
-  — `GetTime` as a real-hardware alternative to the CMOS RTC;
-  `GetVariable`/`SetVariable` for persistent boot-config.
-- **Honour the PE relocation table** instead of runtime-patching the
-  GDT descriptor base / far-jump offset in `.data` — a real `.reloc`
-  table is a prerequisite for Secure Boot signing.
-- **Drop the FAT12 32 MiB ESP cap** by conditionally using the
-  GPT-ESP direct-mount path modern OVMF supports — eliminates the
-  ceiling on initramfs growth.
-- **`apt` against a live Debian mirror** — the native `apt` streams a
-  real `main`-sized index, decompresses gzip + xz, and verifies the
-  `Release`/`InRelease` OpenPGP signature (RSA PKCS#1 v1.5, SHA-512,
-  multi-key keyrings) against a baked Debian-archive key. The
-  end-to-end run against the genuine `deb.debian.org` `main` suite is
-  the remaining exercise.
+# Userspace polish
+- `apt` against a live `deb.debian.org` mirror — streaming + xz +
+  GPG-verify are all in; the genuine end-to-end run is the last step.
+- hamsh line editor: in-line cursor model (Left/Right/Delete), Tab
+  completion, Ctrl-C drops the edit buffer, argv-tokenization rewrite
+  (single quotes, backslash escapes).
+- CPython: trim the frozen stdlib set; PGO/LTO; C extensions (`_ssl`,
+  `_socket`, ...) once a U-track `ld.so` exists.
+- busybox `ls` enumeration XFAIL (musl DIR-fd round-trip) — re-confirm
+  after the `%rdi` fix; busybox `sh -c "a|b"` internal-pipeline `#GP`.
+- `/bin` tool audit for cwd-relative defaults; SSH follow-ups (publickey
+  auth, generated host key, RFC 6979 nonce).
