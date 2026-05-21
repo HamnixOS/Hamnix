@@ -9,7 +9,7 @@
 #      so the cpio archive's /init is the Hamnix-compiled binary.
 #   3. Rebuild the kernel image (init/main.ad -> build/hamnix-vmlinux.elf).
 #   4. Boot it under QEMU and capture the serial output.
-#   5. Grep the serial log for the hello.py banner.
+#   5. Grep the serial log for the hello.ad banner.
 #
 # Exits non-zero if the banner doesn't appear within the QEMU window.
 
@@ -25,7 +25,7 @@ ELF=build/hamnix-vmlinux.elf
 # hand-written user/hello.S that scripts/build_user.sh ships as the
 # hello cpio entry (referenced by /init's SYS_EXECVE path).
 HELLO_ELF=build/user/pyhello.elf
-BANNER="[hello.py] Hamnix user-mode banner from"
+BANNER="[hello.ad] Hamnix user-mode banner from"
 
 echo "[test_hamnix_user] (1/5) Compile user/hello.ad -> $HELLO_ELF"
 python3 -m compiler.adder compile \
@@ -68,7 +68,7 @@ echo "[test_hamnix_user] (raw output end) ----"
 
 echo "[test_hamnix_user] (5/5) Grep for banner: '$BANNER'"
 if grep -F -q "$BANNER" "$LOG"; then
-    echo "[test_hamnix_user] PASS: hello.py banner found in serial output."
+    echo "[test_hamnix_user] PASS: hello.ad banner found in serial output."
     # Restore the default /init (user/init.S) so a follow-up
     # `bash scripts/run_x86_bare.sh` works without surprises.
     INIT_ELF="build/user/init.elf" python3 scripts/build_initramfs.py >/dev/null
