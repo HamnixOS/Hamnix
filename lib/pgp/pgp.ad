@@ -36,27 +36,40 @@
 #     - SHA-1 / MD5 digests in signatures (refused — weak).
 #       SHA-256/384/512 are accepted; the digest itself is computed
 #       by the caller (apt) which owns the SHA implementation.
-#     - Subkey binding-signature validation. The baked keyring is the
-#       primary signing key directly; we parse the first Public-Key
-#       packet and use it as the trust anchor.
+#     - Subkey binding-signature validation. A keyring holds the
+#       primary signing keys directly; we collect every Public-Key
+#       packet (tag 6) and treat each as a trust anchor.
 #     - Detached `Release` + `Release.gpg`. apt fetches the inline
 #       `InRelease`, which is one HTTP GET and self-contained.
 #
+# MULTI-KEY KEYRING
+#
+#   The real `debian-archive-keyring.gpg` carries SEVERAL signing keys
+#   (the current archive key plus older still-valid ones). pgp_keyring_load
+#   walks the whole packet stream and collects EVERY Tag 6 Public-Key
+#   packet into a PgpKeyring (capacity PGP_KEYRING_MAX_KEYS). The caller
+#   (apt) tries each key in turn — a signature verifies if ANY trusted
+#   key accepts it. The signature's Issuer subpacket (the 8-byte key ID)
+#   is exposed for diagnostics / a fast-path match, but correctness does
+#   not depend on it: trying every key is sound and avoids needing a
+#   SHA-1 fingerprint computation just to index the keyring.
+#
 # HOW apt USES IT
 #
-#   1. pgp_keyring_load(keyring_bytes)        -> recover trusted (n,e)
+#   1. pgp_keyring_load(keyring_bytes)        -> recover all trusted keys
 #   2. pgp_inrelease_split(inrelease_bytes)   -> cleartext span +
 #                                                signature-armor span
 #   3. pgp_dearmor(armor_span)                -> raw signature packet
 #   4. pgp_sig_parse(raw_sig_packet)          -> hash alg, hashed
 #                                                section span, RSA
-#                                                signature-MPI span
+#                                                signature-MPI span,
+#                                                issuer key ID
 #   5. pgp_build_signed_data(cleartext)       -> the exact byte string
 #                                                the digest is taken
 #                                                over (canon || hashed
 #                                                section || v4 trailer)
-#   6. apt then SHA-256s that byte string and calls
-#      rsa_pkcs1_v1_5_verify with the keyring's (n,e).
+#   6. apt then hashes that byte string and calls rsa_pkcs1_v1_5_verify
+#      against each keyring key until one accepts.
 #
 # This module does NOT do the RSA math or the SHA itself — it reuses
 # lib/rsa/rsa.ad + that module's SHA-256 through apt. Keeping the
@@ -104,6 +117,28 @@ class PgpPubkey:
     valid:   int32               # 1 once pgp_keyring_load succeeded
 
 
+# -- multi-key trust anchor --------------------------------------------
+#
+# A keyring blob may carry several Public-Key packets. PgpKeyring holds
+# every RSA signing key recovered from one. PGP_KEYRING_MAX_KEYS caps
+# the count — a real `debian-archive-keyring.gpg` carries well under a
+# dozen keys; 16 is generous headroom. A keyring with more keys than
+# the cap loads the first PGP_KEYRING_MAX_KEYS and reports success
+# (the remainder are simply not trust anchors).
+#
+# The keys array is a flat fixed-size Array of PgpPubkey rather than a
+# pointer table — the Adder backend handles a top-level Array of class
+# instances, and `&keys[i]` yields a usable Ptr[PgpPubkey].
+
+PGP_KEYRING_MAX_KEYS: uint64 = 16
+
+
+class PgpKeyring:
+    keys:    Array[16, PgpPubkey]
+    n_keys:  uint64               # number of valid keys in `keys`
+    valid:   int32                # 1 once pgp_keyring_load succeeded
+
+
 # -- parsed signature packet -------------------------------------------
 #
 # pgp_sig_parse fills this in. The hashed-section span and the RSA
@@ -118,6 +153,8 @@ class PgpSig:
     hashed_len:     uint64       # length of the v4 hashed section
     sig_mpi_off:    uint64       # offset of the RSA signature value
     sig_mpi_len:    uint64       # length (bytes) of the signature value
+    issuer:         Array[8, uint8]  # 8-byte issuer key ID (subpacket 16)
+    has_issuer:     int32        # 1 if an Issuer subpacket was present
     valid:          int32
 
 
@@ -377,39 +414,28 @@ def pgp_read_mpi(buf: Ptr[uint8], off: uint64, buf_len: uint64,
     return val_off + nbytes
 
 
-# -- pgp_keyring_load --------------------------------------------------
+# -- _pgp_parse_pubkey_body --------------------------------------------
 #
-# Parse a baked OpenPGP keyring blob — the raw bytes of
-# `gpg --export <signing-key>`. The first packet must be a v4
-# Public-Key packet (tag 6) for an RSA key (public-key algorithm 1, 2
-# or 3). Recovers the RSA modulus + exponent MPIs into `out`.
+# Recover the RSA (n, e) MPIs from one v4 Public-Key packet BODY span
+# (buf[body_off .. body_off+body_len)) into `out`. Returns 0 on success,
+# -1 on a malformed / non-RSA / non-v4 packet body.
 #
-# Returns 0 on success, -1 on malformed input / unsupported key.
+# Shared by pgp_keyring_load — factored out so the keyring walk can
+# apply it to every Tag 6 packet it encounters.
 
-def pgp_keyring_load(keyring: Ptr[uint8], keyring_len: uint64,
-                     out: Ptr[PgpPubkey]) -> int32:
+def _pgp_parse_pubkey_body(buf: Ptr[uint8], body_off: uint64,
+                           body_len: uint64,
+                           out: Ptr[PgpPubkey]) -> int32:
     out[0].valid = 0
-    tag: uint8 = 0
-    body_off: uint64 = 0
-    body_len: uint64 = 0
-    pkt_end: uint64 = pgp_packet_header(keyring, 0, keyring_len,
-                                        &tag, &body_off, &body_len)
-    if pkt_end == 0:
-        return -1
-    # Tag 6 == Public-Key packet. (A keyring may also lead with tag 5,
-    # a Secret-Key packet — never the right input for a trust anchor,
-    # and refused here.)
-    if tag != 6:
-        return -1
     if body_len < 6:
         return -1
     # v4 Public-Key packet body: version(1) created(4) algorithm(1)
     # then the algorithm-specific MPIs. v3 (version 2/3) keys are
     # long obsolete and not emitted by modern gpg — refuse them.
-    version: uint8 = keyring[body_off]
+    version: uint8 = buf[body_off]
     if version != 4:
         return -1
-    alg: uint8 = keyring[body_off + 5]
+    alg: uint8 = buf[body_off + 5]
     # RSA public-key algorithm ids: 1 (encrypt+sign), 2 (encrypt),
     # 3 (sign). Debian archive keys are id 1.
     if alg != 1 and alg != 2 and alg != 3:
@@ -420,8 +446,7 @@ def pgp_keyring_load(keyring: Ptr[uint8], keyring_len: uint64,
     mpi_off: uint64 = body_off + 6
     val_off: uint64 = 0
     val_len: uint64 = 0
-    mpi_off = pgp_read_mpi(keyring, mpi_off, body_end,
-                           &val_off, &val_len)
+    mpi_off = pgp_read_mpi(buf, mpi_off, body_end, &val_off, &val_len)
     if mpi_off == 0:
         return -1
     if val_len == 0 or val_len > 520:
@@ -429,12 +454,11 @@ def pgp_keyring_load(keyring: Ptr[uint8], keyring_len: uint64,
     out[0].mod_len = val_len
     i: uint64 = 0
     while i < val_len:
-        out[0].mod_be[i] = keyring[val_off + i]
+        out[0].mod_be[i] = buf[val_off + i]
         i = i + 1
 
     # MPI 2: RSA public exponent e.
-    mpi_off = pgp_read_mpi(keyring, mpi_off, body_end,
-                           &val_off, &val_len)
+    mpi_off = pgp_read_mpi(buf, mpi_off, body_end, &val_off, &val_len)
     if mpi_off == 0:
         return -1
     if val_len == 0 or val_len > 8:
@@ -442,10 +466,137 @@ def pgp_keyring_load(keyring: Ptr[uint8], keyring_len: uint64,
     out[0].exp_len = val_len
     i = 0
     while i < val_len:
-        out[0].exp_be[i] = keyring[val_off + i]
+        out[0].exp_be[i] = buf[val_off + i]
         i = i + 1
 
     out[0].valid = 1
+    return 0
+
+
+# -- pgp_keyring_load --------------------------------------------------
+#
+# Parse a baked OpenPGP keyring blob — the raw bytes of
+# `gpg --export`. A real `debian-archive-keyring.gpg` carries SEVERAL
+# keys (each a Tag 6 Public-Key packet followed by User-ID / Signature
+# / Public-Subkey packets). This walks the WHOLE packet stream and
+# collects every RSA Tag 6 Public-Key packet into `out`, up to
+# PGP_KEYRING_MAX_KEYS.
+#
+# Non-key packets (User-ID tag 13, Signature tag 2, User-Attribute
+# tag 17, Public-Subkey tag 14, Trust tag 12, ...) are skipped. Tag 14
+# Public-Subkey packets are deliberately NOT collected as trust anchors
+# — the primary keys are what sign the archive Release; treating a
+# subkey as an anchor without validating its binding signature would
+# widen trust incorrectly.
+#
+# A Tag 6 packet that fails to parse as RSA is skipped (not fatal) —
+# the keyring may legitimately also carry an EdDSA/ECDSA key we don't
+# use. The load fails (-1) only if NO usable RSA key is found, or the
+# packet framing itself is corrupt.
+#
+# Returns 0 on success (>= 1 key collected), -1 on malformed input.
+
+def pgp_keyring_load(keyring: Ptr[uint8], keyring_len: uint64,
+                     out: Ptr[PgpKeyring]) -> int32:
+    out[0].valid = 0
+    out[0].n_keys = 0
+
+    pos: uint64 = 0
+    saw_packet: int32 = 0
+    while pos < keyring_len:
+        tag: uint8 = 0
+        body_off: uint64 = 0
+        body_len: uint64 = 0
+        pkt_end: uint64 = pgp_packet_header(keyring, pos, keyring_len,
+                                            &tag, &body_off, &body_len)
+        if pkt_end == 0:
+            # A truncated / malformed packet header. If we have already
+            # collected at least one key, treat the rest as junk and
+            # stop; otherwise the whole blob is unusable.
+            break
+        saw_packet = 1
+        # Tag 5 (Secret-Key) is never a valid trust-anchor input.
+        if tag == 5:
+            return -1
+        # Tag 6 == Public-Key packet — a candidate trust anchor.
+        if tag == 6:
+            if out[0].n_keys < PGP_KEYRING_MAX_KEYS:
+                rc: int32 = _pgp_parse_pubkey_body(
+                    keyring, body_off, body_len,
+                    &out[0].keys[out[0].n_keys])
+                if rc == 0:
+                    out[0].n_keys = out[0].n_keys + 1
+        # All other tags (13 User-ID, 2 Signature, 14 Public-Subkey,
+        # 17 User-Attribute, 12 Trust, ...) are skipped.
+        pos = pkt_end
+
+    if saw_packet == 0:
+        return -1
+    if out[0].n_keys == 0:
+        return -1
+    out[0].valid = 1
+    return 0
+
+
+# -- _pgp_scan_issuer --------------------------------------------------
+#
+# Walk an OpenPGP subpacket region buf[region_off .. region_off+region_len)
+# looking for an Issuer subpacket (type 16: an 8-byte key ID). On the
+# first one found, copies the 8 key-ID bytes into `out_issuer` and
+# returns 1; returns 0 if none is present.
+#
+# Each subpacket is: a length (RFC 4880 §5.2.3.1 — the same 1/2/5-octet
+# encoding as new-format packet bodies) then a 1-byte type then the
+# type-specific body. The length octet counts the type byte + body.
+# A type with bit 0x80 set is "critical" — irrelevant to locating an
+# Issuer, so the high bit is masked off the type for comparison.
+
+def _pgp_scan_issuer(buf: Ptr[uint8], region_off: uint64,
+                     region_len: uint64,
+                     out_issuer: Ptr[uint8]) -> int32:
+    region_end: uint64 = region_off + region_len
+    p: uint64 = region_off
+    while p < region_end:
+        # Subpacket length (1/2/5-octet, same encoding as packet bodies).
+        l0: uint64 = cast[uint64](buf[p])
+        sp_len: uint64 = 0
+        hdr: uint64 = 0
+        if l0 < 192:
+            sp_len = l0
+            hdr = 1
+        elif l0 < 255:
+            if p + 1 >= region_end:
+                return 0
+            l1: uint64 = cast[uint64](buf[p + 1])
+            sp_len = ((l0 - 192) << 8) + l1 + 192
+            hdr = 2
+        else:
+            if p + 4 >= region_end:
+                return 0
+            sp_len = (cast[uint64](buf[p + 1]) << 24) \
+                | (cast[uint64](buf[p + 2]) << 16) \
+                | (cast[uint64](buf[p + 3]) << 8) \
+                | cast[uint64](buf[p + 4])
+            hdr = 5
+        if sp_len == 0:
+            return 0
+        type_off: uint64 = p + hdr
+        if type_off >= region_end:
+            return 0
+        sp_type: uint8 = buf[type_off] & 0x7F   # mask the critical bit
+        sp_body_off: uint64 = type_off + 1
+        sp_body_len: uint64 = sp_len - 1
+        # Type 16 == Issuer (8-byte key ID).
+        if sp_type == 16 and sp_body_len == 8:
+            if sp_body_off + 8 > region_end:
+                return 0
+            i: uint64 = 0
+            while i < 8:
+                out_issuer[i] = buf[sp_body_off + i]
+                i = i + 1
+            return 1
+        # Advance to the next subpacket.
+        p = type_off + sp_body_len + 1
     return 0
 
 
@@ -461,6 +612,12 @@ def pgp_keyring_load(keyring: Ptr[uint8], keyring_len: uint64,
 #   unhashed-subpkt-count(2) unhashed-subpkts...
 #   left16(2)                (high 2 bytes of the digest)
 #   signature MPI(s)         (one MPI for RSA)
+#
+# The Issuer subpacket (type 16) — searched first in the hashed region,
+# then the unhashed region — is recorded in out[0].issuer / has_issuer.
+# It is advisory: it lets a caller fast-path to the matching keyring
+# key, but a missing or wrong issuer never affects correctness (the
+# caller falls back to trying every key).
 #
 # Returns 0 on success, -1 on malformed / unsupported input.
 
@@ -508,17 +665,36 @@ def pgp_sig_parse(pkt: Ptr[uint8], pkt_len: uint64,
     out[0].hashed_off = body_off
     out[0].hashed_len = (hashed_data_off + hashed_count) - body_off
 
-    # Unhashed subpacket region (skipped — not security-relevant).
+    # Unhashed subpacket region. Its contents are not security-relevant
+    # to the signed data, but gpg conventionally places the Issuer
+    # subpacket here (only the issuer FINGERPRINT subpacket is normally
+    # hashed). We scan it for the issuer key ID.
     uh_count_off: uint64 = hashed_data_off + hashed_count
     if uh_count_off + 2 > body_end:
         return -1
     unhashed_count: uint64 = (cast[uint64](pkt[uh_count_off]) << 8) \
         | cast[uint64](pkt[uh_count_off + 1])
-    after_unhashed: uint64 = uh_count_off + 2 + unhashed_count
+    unhashed_data_off: uint64 = uh_count_off + 2
+    after_unhashed: uint64 = unhashed_data_off + unhashed_count
     # left16 — 2 bytes of the digest, a cheap pre-check value.
     left16_off: uint64 = after_unhashed
     if left16_off + 2 > body_end:
         return -1
+
+    # Locate the Issuer subpacket (type 16, 8-byte key ID). Try the
+    # hashed region first, then the unhashed region. Advisory only —
+    # used to fast-path the keyring lookup; never affects correctness.
+    out[0].has_issuer = 0
+    ii: uint64 = 0
+    while ii < 8:
+        out[0].issuer[ii] = 0
+        ii = ii + 1
+    if _pgp_scan_issuer(pkt, hashed_data_off, hashed_count,
+                        &out[0].issuer[0]) != 0:
+        out[0].has_issuer = 1
+    elif _pgp_scan_issuer(pkt, unhashed_data_off, unhashed_count,
+                          &out[0].issuer[0]) != 0:
+        out[0].has_issuer = 1
 
     # The RSA signature MPI.
     mpi_off: uint64 = left16_off + 2

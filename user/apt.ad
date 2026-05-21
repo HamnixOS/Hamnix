@@ -190,6 +190,7 @@ from lib.xz.xz import (
 # signature framework; lib/rsa does the RSA PKCS#1 v1.5 math.
 from lib.pgp.pgp import (
     PgpPubkey,
+    PgpKeyring,
     PgpSig,
     pgp_keyring_load,
     pgp_inrelease_split,
@@ -203,6 +204,9 @@ from lib.rsa.rsa import (
     RsaPubkey,
     rsa_init,
     rsa_pkcs1_v1_5_verify,
+    RSA_DIGEST_SHA256,
+    RSA_DIGEST_SHA384,
+    RSA_DIGEST_SHA512,
 )
 
 # Native-ABI syscalls. socket()/connect() are the U-socket bridge
@@ -407,20 +411,30 @@ sha_hex:     Array[80, uint8]      # digest as 64 lowercase hex chars + NUL
 # The baked OpenPGP trust anchor lives in the initramfs at
 # /etc/apt-trusted.gpg (planted by scripts/build_initramfs.py, the same
 # way the kernel's TLS CA roots are baked at /etc/tls-ca-*.der). It is
-# the raw bytes of `gpg --export <archive-signing-key>` — one v4 RSA
-# Public-Key packet. apt loads it once at `apt update` time and uses it
-# to verify the OpenPGP signature on the repository's `InRelease`.
+# the raw bytes of `gpg --export` — a stream of v4 RSA Public-Key
+# packets. The real `debian-archive-keyring.gpg` carries SEVERAL
+# signing keys; apt loads ALL of them once at `apt update` time and
+# verifies the `InRelease` signature against whichever key signed it.
 #
 # These are top-level BSS arenas — never function-locals — per the U9
 # nested-frame-Array quirk (memory/feedback_compiler_quirks.md). The
 # keyring path "/etc/apt-trusted.gpg" is materialised inline at the
 # call sites (the x86_64 backend rejects string-literal globals).
-APT_KEYRING_CAP:  uint64 = 16384       # exported RSA-4096 key is ~3 KiB
+#
+# APT_KEYRING_CAP is sized for a real multi-key debian-archive-keyring
+# (each RSA-4096 key + its User-ID + self-signature runs a few KiB; a
+# dozen keys plus headroom).
+APT_KEYRING_CAP:  uint64 = 131072      # multi-key keyring, ~128 KiB cap
 
-apt_keyring_buf:  Array[16384, uint8]  # raw baked keyring blob
-apt_pgp_key:      PgpPubkey            # parsed trust-anchor RSA key
+apt_keyring_buf:  Array[131072, uint8] # raw baked keyring blob
+apt_pgp_ring:     PgpKeyring           # all parsed trust-anchor RSA keys
 apt_pgp_sig:      PgpSig               # parsed InRelease signature packet
-apt_rsa_key:      RsaPubkey            # the same key, in lib/rsa's shape
+# The keyring's keys re-shaped into lib/rsa's RsaPubkey form, one per
+# PgpKeyring slot. Verification walks these until one accepts the
+# signature. A flat top-level Array of RsaPubkey — `&apt_rsa_keys[i]`
+# is a usable Ptr[RsaPubkey].
+apt_rsa_keys:     Array[16, RsaPubkey]
+apt_rsa_nkeys:    uint64 = 0
 
 # The InRelease body is fetched into http_buf; before the (later)
 # Packages fetch overwrites http_buf, the InRelease bytes are copied
@@ -1615,6 +1629,38 @@ def _sha256_hash(n: uint64):
 # repository suite. On a return of 1 the verified `InRelease` cleartext
 # is available in inrelease_buf[0, inrelease_len).
 
+# Re-shape one parsed OpenPGP key (`src`) into lib/rsa's RsaPubkey
+# (`dst`). The modulus / exponent byte strings transfer directly;
+# mod_bits / mod_bytes are derived the same way rsa_parse_pubkey does.
+
+def _reshape_rsa_key(src: Ptr[PgpPubkey], dst: Ptr[RsaPubkey]):
+    i: uint64 = 0
+    while i < src[0].mod_len:
+        dst[0].mod_bytes_be[i] = src[0].mod_be[i]
+        i = i + 1
+    dst[0].mod_len = src[0].mod_len
+    i = 0
+    while i < src[0].exp_len:
+        dst[0].exp_bytes_be[i] = src[0].exp_be[i]
+        i = i + 1
+    dst[0].exp_len = src[0].exp_len
+    # Bit length of the modulus (skip a leading DER-style 0x00 if the
+    # MPI carried one — OpenPGP MPIs are minimal so this is rare, but
+    # harmless to guard).
+    skip: uint64 = 0
+    if src[0].mod_len > 1 and src[0].mod_be[0] == 0:
+        skip = 1
+    top: uint8 = src[0].mod_be[skip]
+    bit: uint64 = 7
+    while bit > 0:
+        if ((top >> bit) & 1) != 0:
+            break
+        bit = bit - 1
+    full_bytes: uint64 = src[0].mod_len - skip - 1
+    dst[0].mod_bits = full_bytes * 8 + bit + 1
+    dst[0].mod_bytes = (dst[0].mod_bits + 7) / 8
+
+
 def _load_trust_anchor() -> int32:
     fd: int32 = sys_open(cast[Ptr[char]]("/etc/apt-trusted.gpg"))
     if fd < 0:
@@ -1631,38 +1677,18 @@ def _load_trust_anchor() -> int32:
     sys_close(fd)
     if total == 0:
         return -1
-    rc: int32 = pgp_keyring_load(&apt_keyring_buf[0], total, &apt_pgp_key)
+    # Load EVERY Public-Key packet from the (possibly multi-key)
+    # keyring. A real debian-archive-keyring.gpg carries several.
+    rc: int32 = pgp_keyring_load(&apt_keyring_buf[0], total, &apt_pgp_ring)
     if rc != 0:
         write_str(2, "apt-get: baked keyring /etc/apt-trusted.gpg is malformed\n")
         return -1
-    # Re-shape the parsed OpenPGP key into lib/rsa's RsaPubkey. The
-    # modulus / exponent byte strings transfer directly; mod_bits /
-    # mod_bytes are derived the same way rsa_parse_pubkey does.
-    i: uint64 = 0
-    while i < apt_pgp_key.mod_len:
-        apt_rsa_key.mod_bytes_be[i] = apt_pgp_key.mod_be[i]
-        i = i + 1
-    apt_rsa_key.mod_len = apt_pgp_key.mod_len
-    i = 0
-    while i < apt_pgp_key.exp_len:
-        apt_rsa_key.exp_bytes_be[i] = apt_pgp_key.exp_be[i]
-        i = i + 1
-    apt_rsa_key.exp_len = apt_pgp_key.exp_len
-    # Bit length of the modulus (skip a leading DER-style 0x00 if the
-    # MPI carried one — OpenPGP MPIs are minimal so this is rare, but
-    # harmless to guard).
-    skip: uint64 = 0
-    if apt_pgp_key.mod_len > 1 and apt_pgp_key.mod_be[0] == 0:
-        skip = 1
-    top: uint8 = apt_pgp_key.mod_be[skip]
-    bit: uint64 = 7
-    while bit > 0:
-        if ((top >> bit) & 1) != 0:
-            break
-        bit = bit - 1
-    full_bytes: uint64 = apt_pgp_key.mod_len - skip - 1
-    apt_rsa_key.mod_bits = full_bytes * 8 + bit + 1
-    apt_rsa_key.mod_bytes = (apt_rsa_key.mod_bits + 7) / 8
+    # Re-shape each parsed OpenPGP key into lib/rsa's RsaPubkey form.
+    apt_rsa_nkeys = apt_pgp_ring.n_keys
+    ki: uint64 = 0
+    while ki < apt_rsa_nkeys:
+        _reshape_rsa_key(&apt_pgp_ring.keys[ki], &apt_rsa_keys[ki])
+        ki = ki + 1
     return 0
 
 
@@ -1720,14 +1746,15 @@ def _verify_inrelease(port: int64, suite: Ptr[uint8]) -> int32:
         write_str(2, "or uses an unsupported algorithm\n")
         return 0
 
-    # This verifier reuses lib/rsa's PKCS#1 v1.5 path, which today
-    # computes a SHA-256 digest. OpenPGP hash-algorithm id 8 == SHA-256;
-    # 9/10 are SHA-384/512. A non-SHA-256 signature is refused loudly
-    # rather than verified against the wrong digest.
-    if apt_pgp_sig.hash_alg != 8:
-        write_str(2, "apt-get: InRelease signed with a non-SHA-256 ")
-        write_str(2, "digest — unsupported, cannot verify\n")
-        return 0
+    # Map the OpenPGP hash-algorithm id to lib/rsa's digest selector.
+    # 8 == SHA-256, 9 == SHA-384, 10 == SHA-512 (pgp_sig_parse already
+    # rejected anything else). The real deb.debian.org archive signs
+    # `InRelease` with a SHA-512 digest; all three are now supported.
+    digest_alg: int32 = RSA_DIGEST_SHA256
+    if apt_pgp_sig.hash_alg == 9:
+        digest_alg = RSA_DIGEST_SHA384
+    elif apt_pgp_sig.hash_alg == 10:
+        digest_alg = RSA_DIGEST_SHA512
 
     # 6. Assemble the v4 signed-data byte string.
     signed_len: uint64 = 0
@@ -1737,37 +1764,46 @@ def _verify_inrelease(port: int64, suite: Ptr[uint8]) -> int32:
         write_str(2, "apt-get: InRelease cleartext too large to verify\n")
         return 0
 
-    # Right-align the (minimal-length) OpenPGP signature MPI into a
-    # k-byte buffer — lib/rsa's verifier requires a signature octet
-    # string of length exactly the modulus byte width.
-    k: uint64 = apt_rsa_key.mod_bytes
-    if apt_pgp_sig.sig_mpi_len > k or k > 520:
-        write_str(2, "apt-get: InRelease signature length inconsistent ")
-        write_str(2, "with the trust-anchor key\n")
+    # 7. RSA PKCS#1 v1.5 verification. The keyring may carry several
+    #    archive keys; the signature is valid if ANY of them accepts
+    #    it. We try each in turn — the signature's Issuer subpacket is
+    #    advisory only, so trying every key is the sound approach (and
+    #    avoids needing a SHA-1 fingerprint to index the keyring).
+    #
+    #    For each key: right-align the (minimal-length) OpenPGP
+    #    signature MPI into a k-byte buffer (lib/rsa's verifier requires
+    #    a signature octet string of length exactly the modulus byte
+    #    width), then rsa_pkcs1_v1_5_verify hashes the signed-data,
+    #    recovers the EM via s^e mod n, and byte-exact-compares against
+    #    the expected EMSA-PKCS1-v1_5 encoding.
+    if apt_rsa_nkeys == 0:
+        write_str(2, "apt-get: no usable keys in the trust anchor\n")
         return 0
-    pad: uint64 = k - apt_pgp_sig.sig_mpi_len
-    pi: uint64 = 0
-    while pi < pad:
-        apt_sig_padded[pi] = 0
-        pi = pi + 1
-    pi = 0
-    while pi < apt_pgp_sig.sig_mpi_len:
-        apt_sig_padded[pad + pi] = \
-            pgp_sig_packet[apt_pgp_sig.sig_mpi_off + pi]
-        pi = pi + 1
-
-    # 7. RSA PKCS#1 v1.5 verification against the trust anchor. The
-    #    "message" is the assembled v4 signed-data; rsa_pkcs1_v1_5_verify
-    #    SHA-256s it internally, recovers the EM via s^e mod n, and
-    #    byte-exact-compares against the expected EMSA-PKCS1-v1_5
-    #    encoding.
-    vrc: int32 = rsa_pkcs1_v1_5_verify(
-        &apt_rsa_key,
-        cast[Ptr[uint8]](0), cast[uint64](0),
-        &pgp_signed_data[0], signed_len,
-        &apt_sig_padded[0], k)
-    if vrc == 1:
-        return 1
+    ki: uint64 = 0
+    while ki < apt_rsa_nkeys:
+        k: uint64 = apt_rsa_keys[ki].mod_bytes
+        # A key whose modulus is too small for this signature simply
+        # cannot be the signer — skip it rather than fail outright.
+        if apt_pgp_sig.sig_mpi_len <= k and k <= 520:
+            pad: uint64 = k - apt_pgp_sig.sig_mpi_len
+            pi: uint64 = 0
+            while pi < pad:
+                apt_sig_padded[pi] = 0
+                pi = pi + 1
+            pi = 0
+            while pi < apt_pgp_sig.sig_mpi_len:
+                apt_sig_padded[pad + pi] = \
+                    pgp_sig_packet[apt_pgp_sig.sig_mpi_off + pi]
+                pi = pi + 1
+            vrc: int32 = rsa_pkcs1_v1_5_verify(
+                &apt_rsa_keys[ki],
+                cast[Ptr[uint8]](0), cast[uint64](0),
+                digest_alg,
+                &pgp_signed_data[0], signed_len,
+                &apt_sig_padded[0], k)
+            if vrc == 1:
+                return 1
+        ki = ki + 1
     return 0
 
 
