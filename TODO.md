@@ -71,29 +71,28 @@ the one true resource path. A local-device Chan and a mounted-9P Chan are
 the *same type* with the *same operation interface* — the consumer never
 knows which it holds.
 
-- [~] **(ARCH) Real `chan_attach` over a stored srvfd** — Tversion /
+- [x] **(ARCH) Real `chan_attach` over a stored srvfd** — Tversion /
   Tattach / Twalk / Topen / Tread / Twrite / Tclunk; install a real
   `Mnt` so Chan ops on a mounted server marshal into 9P T-messages.
-  (`lib/9p`, `sys/src/9/port`, `chan_resolve_prefix`)
-- [~] **(ARCH) `/srv/<name>` srvfd channel posting** — so `mount` has a
-  real conversation to consume.
-- [~] **(ARCH) `namec()` + `devtab` dispatch as the universal open
+  (landed pre-Phase-D as 9P V1–V4.1; confirmed by `4964a6b`)
+- [x] **(ARCH) `/srv/<name>` srvfd channel posting** — so `mount` has a
+  real conversation to consume. (`sys_srv_post`/`sys_srv_open` + `devsrv.ad`)
+- [x] **(ARCH) `namec()` + `devtab` dispatch as the universal open
   path** — *all* opens (native AND Linux-ABI) resolve through the
-  process's mount table to a `Chan`; replaces the `FD_*_MARK`
-  special-casing in `fs/vfs.ad`.
-- [~] **(ARCH) Per-Pgrp mount-table deep-copy on `rfork(RFNAMEG)`** —
-  shared via a "shared-or-private match" rule today; make the copy real.
-  (the four `[~]` items above are in flight as the Phase D core agent)
-- [ ] **(ARCH) Convert the 12 `FD_*_MARK` cdevs into served Chans** —
-  cons/time/pid/random/proc/mouse/cpuinfo/meminfo/uptime/loadavg/
-  version/hostname become `Dev`-table file servers, not magic-number fds.
+  process's mount table to a `Chan`; replaced the `FD_*_MARK`
+  special-casing in `fs/vfs.ad`. (`4964a6b` — `sys/src/9/port/namec.ad`)
+- [x] **(ARCH) Per-Pgrp mount-table deep-copy on `rfork(RFNAMEG)`** —
+  `pgrp_clone` does a real field-by-field deep copy into a fresh Pgrp.
+- [x] **(ARCH) Convert the 12 `FD_*_MARK` cdevs into served Chans** —
+  all 14 cdevs are now `devtab` Chans (`4964a6b`); the `FD_P9_MARK`
+  opener was deleted, dispatch arms kept as a non-regressing net.
 - [ ] **(ARCH) Layer-2 `/proc → /dev` translation becomes a namespace
   bind** — retire the `_u_translate_proc_to_dev` string-rewrite; the
   Linux-ABI process gets `bind '#c' /proc`-shape entries instead.
-- [ ] **(ARCH) Route the Linux ABI through the chan layer** — `linux_abi/`
-  open/read/write resolve through the namespace to a Chan; the shim
-  becomes a syscall-number translation onto chan/9P ops, not a parallel
-  path with its own state.
+- [x] **(ARCH) Route the Linux ABI through the chan layer** —
+  `linux_abi/u_syscalls.ad` open/read/write resolve through `namec` →
+  devtab/mountrpc; the Linux ABI is a consumer of the chan spine
+  (`4964a6b`). Deferred: `#c` console alias still uses `FD_CONS_MARK`.
 - [ ] Union mounts MBEFORE / MAFTER (flag recorded; longest-prefix only).
 - [ ] Collapse the 4 per-subdir binds in `distrorun.ad` into one
   `mount(srvfd, -1, "/", MREPL, "")`.
@@ -148,9 +147,9 @@ knows which it holds.
 - [ ] O_NONBLOCK end-to-end: stop masking `SOCK_NONBLOCK`, EAGAIN on
   would-block across socket + file fds.
 
-## §6 Timekeeping (vDSO)  — [~] in flight
-- [~] `clock_gettime` CLOCK_MONOTONIC/REALTIME; TSC high-res monotonic
-  clock; LAPIC timer calibration fix (fires ~70× fast under TCG).
+## §6 Timekeeping (vDSO)
+- [x] `clock_gettime` CLOCK_MONOTONIC/REALTIME; TSC high-res monotonic
+  clock; LAPIC timer calibration fix — `96032e8`.
 - [ ] vDSO: map `gettimeofday`/`clock_gettime` without syscall overhead.
 
 ## §7 Entropy / RNG  (served Chans post Phase D)
@@ -184,8 +183,11 @@ knows which it holds.
   socket fd's TCP slot at task exit.
 
 ## §11 DNS resolver  (off critical path — parallelizable)
-- [ ] Multiple A-records (return all + round-robin); PTR/MX/SRV record
-  types; AAAA (gated on an IPv6 header); TCP/53 fallback for > 512 B.
+- [x] Multiple A-records (return all + round-robin), PTR/MX/SRV record
+  types, TCP/53 fallback for > 512 B — `461a134` (`drivers/net/dns.ad`,
+  6/6 offline self-tests + live multi-A resolve).
+- [ ] AAAA records — deferred; gated on an IPv6 header (IP layer is
+  IPv4-only today).
 
 ## §12 Filesystem write maturity & persistence
 - [ ] ext4 `rename` (-EROFS off-tmpfs today); `truncate`/`ftruncate`;
@@ -209,18 +211,21 @@ knows which it holds.
   kills the `asm_volatile("call *%rax")` hacks.
 - [ ] `match`/`case` tokenization → implement.
 
-## §16 Build / initramfs  — [~] in flight
-- [~] cpio `NR_FILES` 192 → 8192+ so a real debootstrap tree (~5000
-  files) fits — prereq for the §4 capstone.
+## §16 Build / initramfs
+- [x] cpio `NR_FILES` 192 → 8192 so a real debootstrap tree (~5000
+  files) fits — `40ebdc0` (prereq for the §4 capstone).
 
 ## §17 L-track stock-Linux `.ko`  (lowest priority)
 - [ ] `MAX_EXPORTS` bump; `usbcore`+`xhci_hcd`, `libphy`, `8021q`,
   `nf_conntrack` core. Weigh against native drivers before spending.
 
 ## Critical path & parallelization
-On the critical path: **Phase D → §1 → §2 → §4 capstone.** Off the
-critical path, safe to dispatch in parallel immediately: §15, §16, §6,
-§9, §11. Everything in §5 is Layer-2-only per the boundary law.
+Phase D (the prerequisite gate) is **landed** (`4964a6b`); §2 (futex /
+TLS) is landed. Remaining critical path: **§1 (`rfork` RFMEM thread
+path, RFNOWAIT, MAP_SHARED) → §4 (dynamic loader + the capstone demo).**
+Off the critical path, safe to dispatch in parallel: §15, §9, §7, §13,
+§12, §10. §11 and §16 are landed; §6 has only the vDSO item left.
+Everything in §5 is Layer-2-only per the boundary law.
 
 ---
 
