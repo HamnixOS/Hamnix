@@ -274,11 +274,19 @@ Everything in §5 is Layer-2-only per the boundary law.
   blocking read on `/dev/mouse`; MADT IRQ-override consumption.
 
 # Userspace polish
-- `apt` against a live `deb.debian.org` mirror — streaming + xz +
-  GPG-verify are all in; the genuine end-to-end run is the last step.
-- hamsh line editor: in-line cursor model (Left/Right/Delete), Tab
-  completion, Ctrl-C drops the edit buffer, argv-tokenization rewrite
-  (single quotes, backslash escapes).
+- `apt` against the live `deb.debian.org` mirror — DONE: `apt update`
+  verifies the real InRelease (`6d72a5d`) and `apt install hello`
+  installs the genuine Debian package end-to-end (`d2fe317`).
+  Remaining: `dpkg` extracting `data.tar` into a distrofs namespace
+  (flat tmpfs can't hold nested paths), and streaming xz + larger
+  `.deb`/index caps for big packages.
+- hamsh: superseded by the clean-sheet rewrite — see
+  `docs/HAMSH_SPEC.md` (two-mode command/expression shell, pipes-as-
+  Chans, `ns`/`enter`/`spawn` namespace verbs, errstr `try/catch`).
+  The line-editor / argv-tokenization polish is folded into that
+  rewrite. Open design point: the expression sublanguage should be a
+  small self-contained dynamically-typed evaluator with Adder-like
+  syntax, NOT embedded Adder semantics (pending user sign-off).
 - CPython: trim the frozen stdlib set; PGO/LTO; C extensions (`_ssl`,
   `_socket`, ...) once a U-track `ld.so` exists.
 - busybox `ls` enumeration XFAIL (musl DIR-fd round-trip) — re-confirm
