@@ -8,7 +8,8 @@
 #
 #     AHCI    = 0x41
 #     NVMe    = 0x42
-#     e1000e  = 0x43
+#     e1000e  = 0x47  (MSI single-vector; the INTx 0x43 pin path was
+#                      retired at 9306cb8 when e1000e gained MSI)
 #     r8169   = 0x44
 #
 # Each driver reads PCI INTERRUPT_PIN / INTERRUPT_LINE from config
@@ -79,18 +80,18 @@ rc=$?
 set -e
 
 echo "[test_drivers_irq] --- captured (ioapic / irq / driver banners) ---"
-grep -E '\[ioapic\]|\[irq\]|\[ahci\] irq |\[nvme\] irq |\[e1000e\] irq |\[r8169\] irq ' "$LOG" || true
+grep -E '\[ioapic\]|\[irq\]|\[ahci\] irq |\[nvme\] irq |\[e1000e\] irq |\[e1000e\] MSI |\[r8169\] irq ' "$LOG" || true
 echo "[test_drivers_irq] --- end ---"
 
 fail=0
 for needle in \
     "[ahci] irq pin=" \
     "[nvme] irq pin=" \
-    "[e1000e] irq pin=" \
+    "[e1000e] MSI vector=0x47 enabled" \
     "[r8169] irq pin=" \
     "[irq] handler registered for vector 0x41" \
     "[irq] handler registered for vector 0x42" \
-    "[irq] handler registered for vector 0x43" \
+    "[irq] handler registered for vector 0x47" \
     "[irq] handler registered for vector 0x44"
 do
     if grep -F -q "$needle" "$LOG"; then
