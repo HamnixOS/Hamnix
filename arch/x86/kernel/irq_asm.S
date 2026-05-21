@@ -188,19 +188,11 @@ get_irq_stub:
     movq (%rax, %rdi, 8), %rax
     ret
 
-/* call_irq_handler: indirect tail-call into a Hamnix-registered IRQ
- * handler function. Adder lacks first-class function pointers (see
- * TODO.md "First-class function pointers") so the irq_handlers[]
- * table stores raw uint64 addresses; this trampoline does the
- * `call *%rax` the language can't currently emit cleanly. The
- * handler takes no arguments and returns void.                      */
-    .align 16
-    .globl call_irq_handler
-call_irq_handler:
-    /* %rdi = handler function address. */
-    movq  %rdi, %rax
-    call  *%rax
-    ret
+/* call_irq_handler removed: Adder now has a first-class function-
+ * pointer type, so arch/x86/kernel/irq.ad's irq_handlers[] table is
+ * typed Array[256, Fn[None]] and do_irq() invokes the handler
+ * directly (`irq_handlers[vector]()`). The indirect-call trampoline
+ * that used to live here is no longer needed.                       */
 
 /* ---------- sti / cli wrappers ----------------------------------- *
  * Hamnix can express these via asm_volatile("sti") / asm_volatile("cli")

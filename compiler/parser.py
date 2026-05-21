@@ -116,6 +116,14 @@ class Parser:
         """Parse a type annotation."""
         tok = self.current()
 
+        # `None` as a type — the void / no-value type. Only meaningful
+        # as the return type of a function-pointer type (`Fn[None, ...]`,
+        # i.e. `void (*)(...)`); a bare `def f():` already omits the
+        # return type entirely. Codegen treats it like any other return
+        # type (result lands in %rax and is simply ignored by callers).
+        if self.match(TokenType.NONE):
+            return Type("None", self.make_span(tok))
+
         # Volatile type modifier: volatile int32
         if self.match(TokenType.VOLATILE):
             inner = self.parse_type()

@@ -596,6 +596,30 @@ class X86CodeGen:
                 if cap > len(raw):
                     self.emit(f"    .zero {cap - len(raw)}")
                 return
+            # Function-pointer global: `name: Fn[R, A...] = some_func`.
+            # The initialiser is a bare function name; emit an 8-byte
+            # slot holding a relocation against that function symbol so
+            # the global comes up already pointing at the function. This
+            # lets a `devtab`-style dispatch table be a real initialised
+            # global rather than something a runtime `_init_*()` fills.
+            if isinstance(g.var_type, FunctionPointerType):
+                if not isinstance(value, Identifier):
+                    raise CodeGenError(
+                        f"x86: function-pointer global '{g.name}' must be "
+                        f"initialised with a function name (got "
+                        f"{type(value).__name__})"
+                    )
+                fn = value.name
+                if fn not in self.defined_funcs and fn not in self.extern_funcs:
+                    raise CodeGenError(
+                        f"x86: function-pointer global '{g.name}' "
+                        f"initialiser '{fn}' is not a known function"
+                    )
+                self.emit(f"    .globl {g.name}")
+                self.emit(f"    .align 8")
+                self.emit(f"{g.name}:")
+                self.emit(f"    .quad {fn}")
+                return
             neg = False
             if isinstance(value, UnaryExpr) and value.op is UnaryOp.NEG \
                     and isinstance(value.operand, IntLiteral):
@@ -1721,34 +1745,62 @@ class X86CodeGen:
                 return
 
     def gen_call(self, call: CallExpr) -> None:
-        if not isinstance(call.func, Identifier):
-            raise CodeGenError("x86: only direct calls by name are supported")
-        name = call.func.name
         if call.kwargs:
-            raise CodeGenError(f"x86: keyword arguments not supported ({name})")
+            fname = (call.func.name if isinstance(call.func, Identifier)
+                     else type(call.func).__name__)
+            raise CodeGenError(f"x86: keyword arguments not supported ({fname})")
+
+        # ---- classify the call target -------------------------------------
+        # A call is "direct" iff `call.func` is a bare Identifier naming a
+        # real function symbol (a `def` or `extern def`) that is NOT
+        # shadowed by a same-named local. Direct calls emit `call <name>`.
+        #
+        # Everything else is an "indirect call through a first-class
+        # function-pointer value": calling a `Fn[...]`-typed local /
+        # global, an element of a dispatch table (`devtab[i](...)`), a
+        # struct field (`(ops.handler)(...)`), the result of another call,
+        # a cast, etc. The function-pointer VALUE is produced by the same
+        # `gen_expr` path that loads any other value, so storing/loading
+        # function pointers in locals, globals, struct fields and arrays
+        # all compose for free. Indirect calls emit `call *%r11`.
+        name = call.func.name if isinstance(call.func, Identifier) else None
 
         # Intrinsics short-circuit before the standard ABI shuffle — they
         # need operands in specific registers (AL/DX) rather than the
         # standard arg-regs, and emit a bare instruction instead of `call`.
-        if name in X86_INTRINSICS:
+        if name is not None and name in X86_INTRINSICS:
             self.gen_io_intrinsic(name, call.args)
             return
 
-        # Indirect call: if the name resolves to a local (or global scalar
-        # of pointer type), call through the value rather than the symbol.
-        # This is how Adder invokes function pointers stored in vtables
-        # (e.g. `find_vqs_fn(vdev, ...)` after loading from
-        # `vdev->config->find_vqs`).
-        indirect = (
-            (self.ctx is not None and name in self.ctx.locals)
-            or (name in self.global_var_types
-                and name not in self.defined_funcs
-                and name not in self.extern_funcs)
+        is_direct = (
+            name is not None
+            and (name in self.defined_funcs or name in self.extern_funcs)
+            and not (self.ctx is not None and name in self.ctx.locals)
         )
 
         n_args = len(call.args)
         n_reg  = min(n_args, len(ARG_REGS))
         n_stk  = n_args - n_reg
+
+        # Indirect call: evaluate the function-pointer expression FIRST,
+        # before any argument or stack-slot setup, and stash it on the
+        # stack. Evaluating it first means a complex target expression
+        # (`devtab[i].open`, `lookup()`, ...) can freely use scratch
+        # registers without colliding with marshalled arguments; the
+        # value is reclaimed into %r11 immediately before the `call`.
+        #
+        # We reserve a full 16 bytes (not a bare 8-byte push) so %rsp
+        # stays 16-aligned: SysV requires %rsp 16-aligned at the `call`,
+        # and `stack_bytes` below is already a multiple of 16, so a
+        # lone 8-byte push would leave the `call` misaligned. The
+        # pointer lives in the high half of the pair; the low 8 bytes
+        # are unused padding.
+        target_pushed = False
+        if not is_direct:
+            self.gen_expr(call.func)        # function pointer -> %rax
+            self.emit("    subq $16, %rsp") # 16-byte stash slot (alignment)
+            self.emit("    movq %rax, 8(%rsp)")
+            target_pushed = True
 
         # SysV calls need args 6+ at fixed offsets in a 16-aligned
         # chunk below the caller's %rsp, and args 0..5 in ARG_REGS.
@@ -1760,6 +1812,9 @@ class X86CodeGen:
         # evaluate the register args last and load them right before
         # the call. This way the stack-arg evaluation can use any
         # scratch register it wants without trashing reg args.
+        #
+        # Indirect and direct calls share this exact argument-marshaling
+        # path — only the final `call` operand differs.
         stack_bytes = (n_stk * 8 + 15) & ~15
         if stack_bytes > 0:
             self.emit(f"    subq ${stack_bytes}, %rsp")
@@ -1777,21 +1832,26 @@ class X86CodeGen:
         for i in reversed(range(n_reg)):
             self.emit(f"    popq {ARG_REGS[i]}")
 
-        if indirect:
-            if name in self.ctx.locals:
-                var = self.ctx.locals[name]
-                self.emit(f"    movq {var.offset}(%rbp), %r11")
-            else:
-                self.emit(f"    movq {name}(%rip), %r11")
-            self.emit("    xorl %eax, %eax")
-            self.emit("    call *%r11")
-        else:
+        if is_direct:
             self.emit("    xorl %eax, %eax")
             self.emit(f"    call {name}")
+        else:
+            # Reclaim the function pointer. It sits in the high 8 bytes
+            # of the 16-byte stash, which is below the stack-arg block,
+            # so its displacement from %rsp is `stack_bytes + 8` (the
+            # popq's above already restored %rsp to just past that
+            # block).
+            self.emit(f"    movq {stack_bytes + 8}(%rsp), %r11")
+            self.emit("    xorl %eax, %eax")
+            self.emit("    call *%r11")
 
         # Reclaim the stack slot for args 7+.
         if stack_bytes > 0:
             self.emit(f"    addq ${stack_bytes}, %rsp")
+
+        # Reclaim the 16-byte function-pointer stash (indirect calls only).
+        if target_pushed:
+            self.emit("    addq $16, %rsp")
 
     def gen_io_intrinsic(self, name: str, args: list[Expr]) -> None:
         """Emit a bare x86 I/O instruction. No `call`."""

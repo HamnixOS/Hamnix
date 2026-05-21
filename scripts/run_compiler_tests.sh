@@ -41,6 +41,7 @@ TESTS=(
     "nested_frame_array:bash scripts/test_compiler_nested_frame_array.sh"
     "nested_class_fields:bash scripts/test_compiler_nested_class_fields.sh"
     "string_global:bash scripts/test_compiler_string_global.sh"
+    "fnptr:bash scripts/test_compiler_fnptr.sh"
     "stack_canary:bash scripts/test_compiler_stack_canary.sh"
     "unsigned_divshift:bash scripts/test_compiler_unsigned_divshift.sh"
     "module_private:bash scripts/test_compiler_module_private.sh"
