@@ -457,10 +457,11 @@ MSI single-vector paths (V1/V2). Open follow-ups:
   nothing — musl's `opendir`/`readdir` hand `getdents64` the wrong
   fd (a direct `SYS_getdents64` syscall enumerates a directory
   cleanly, so `getdents64` itself is correct; the gap is the musl
-  DIR-struct fd round-trip). Tracked by the held `syscall_64.S`
-  `%rdi`-preservation fix (see Kernel / L-track) — musl `open()`
-  with `O_CLOEXEC` returning 0 is the suspected root cause. Marked
-  XFAIL in u32/u33.
+  DIR-struct fd round-trip). The `syscall_64.S` `%rdi`-preservation
+  fix landed (`633dad2`) — it addressed musl `open(O_CLOEXEC)`
+  returning 0, the suspected root cause; whether `busybox ls`
+  enumeration is fully fixed now needs re-confirmation. Marked
+  XFAIL in u32/u33 until then.
 - **busybox `sh` internal pipeline `#GP`.** `busybox sh -c "a | b"`
   trips a `#GP` that halts the kernel. The u37 test deliberately
   drives the strictly-wider hamsh-driven 3-process pipeline instead,
