@@ -32,6 +32,13 @@ cd "$PROJ_ROOT"
 # from this parent shell self-deadlocks. build_iso.sh's own lock is
 # sufficient for the kernel-rebuild + ISO-build steps. The QEMU
 # screendump phase needs no build-serialisation.
+#
+# We DO source _kernel_iso.sh directly though — it carries no lock,
+# it just installs the qemu-system-x86_64 PATH shim, which injects
+# `-accel kvm` when /dev/kvm is usable. Without this, the direct
+# `qemu-system-x86_64` call below would miss the accelerator.
+# shellcheck source=_kernel_iso.sh
+source "$PROJ_ROOT/scripts/_kernel_iso.sh"
 
 HAMNIX_ISO="${HAMNIX_ISO:-build/hamnix.iso}"
 OVMF_FD="/usr/share/ovmf/OVMF.fd"

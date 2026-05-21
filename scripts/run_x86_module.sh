@@ -30,6 +30,13 @@ INITRAMFS="$PROJ_ROOT/build/initramfs.cpio.gz"
 
 cd "$PROJ_ROOT"
 
+# Install the qemu-system-x86_64 shim (PATH-prepended). It transparently
+# wraps an ELFCLASS64 `-kernel` in a GRUB ISO and — relevant here —
+# injects `-accel kvm` when /dev/kvm is usable, so this real-Linux
+# bzImage boot also gets hardware acceleration. See scripts/_kernel_iso.sh.
+# shellcheck source=_kernel_iso.sh
+source "$PROJ_ROOT/scripts/_kernel_iso.sh"
+
 # --- preflight --------------------------------------------------------------
 if ! command -v qemu-system-x86_64 >/dev/null; then
     echo "[run] error: qemu-system-x86_64 not found (apt install qemu-system-x86)" >&2

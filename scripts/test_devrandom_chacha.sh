@@ -110,18 +110,30 @@ else
         echo "[test_devrandom_chacha] OK: $nz_val/256 buckets non-zero"
     fi
 
-    # max / min ratio. If min == 0 we treat it as 1 for the bound
-    # (any real bucket is >= 1, and we already failed nonzero above
-    # if too many were zero).
-    denom=$min_val
-    if [ -z "$denom" ] || [ "$denom" -eq 0 ]; then
-        denom=1
-    fi
-    if [ -n "$max_val" ] && [ "$max_val" -gt $((5 * denom)) ]; then
-        echo "[test_devrandom_chacha] MISS: max=$max_val > 5 * min=$min_val (ratio too large)"
+    # Spread sanity. The histogram is 4096 samples over 256 buckets, so
+    # each bucket is a Poisson(λ = 4096/256 = 16) draw. A degenerate
+    # generator (a stuck/short ChaCha stream) would dump most mass into
+    # a handful of buckets — that is what we want to catch.
+    #
+    # The old check, `max <= 5 * min`, was statistically broken: across
+    # 256 Poisson(16) draws the minimum routinely lands at 3-7 and the
+    # maximum at 28-34, so `max <= 5*min` fails on perfectly good random
+    # data (it failed identically under both KVM and TCG). The real
+    # degeneracy guard is an *absolute* cap on the busiest bucket: with
+    # λ=16, P(any one bucket > 4*λ = 64) is ~1e-15, and even across 256
+    # buckets a max above 64 is essentially impossible for a healthy
+    # stream — yet a degenerate generator blows straight past it.
+    # `nonzero_buckets >= 200` (checked above) covers the other tail.
+    expected=$(( total_val / 256 ))
+    [ "$expected" -lt 1 ] && expected=1
+    max_bound=$(( 4 * expected ))
+    if [ -n "$max_val" ] && [ "$max_val" -gt "$max_bound" ]; then
+        echo "[test_devrandom_chacha] MISS: max=$max_val > ${max_bound}" \
+             "(4x expected ${expected}/bucket) — distribution degenerate"
         fail=1
     else
-        echo "[test_devrandom_chacha] OK: max/min ratio within bound"
+        echo "[test_devrandom_chacha] OK: busiest bucket max=$max_val" \
+             "within 4x expected (${expected}/bucket)"
     fi
 fi
 

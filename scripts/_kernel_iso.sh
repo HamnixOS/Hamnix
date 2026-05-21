@@ -105,6 +105,34 @@ _install_qemu_shim() {
 # file in a BIOS GRUB ISO and execs the real QEMU with `-cdrom <iso>`.
 # Any other invocation is passed straight through. Do not edit — edit
 # scripts/_kernel_iso.sh instead.
+#
+# HARDWARE ACCELERATION
+#
+# Every Hamnix QEMU invocation routes through this shim (it is named
+# `qemu-system-x86_64` and prepended to PATH). So this is the ONE place
+# the accelerator is chosen. Pure-TCG software emulation is ~10-50x
+# slower than KVM and, with several worktree-isolated test agents
+# running concurrently, thrashes the box. When `/dev/kvm` is readable
+# AND writable by the current user the shim injects `-accel kvm` (plus
+# `-cpu host` if the caller did not pick a CPU model). On a host with
+# no usable `/dev/kvm` (CI runners, KVM-less environments) nothing is
+# injected and QEMU keeps its default TCG accelerator — the fallback
+# stays fully functional. The injection is suppressed if the caller
+# already chose an accelerator (`-accel`, `-enable-kvm`, or
+# `-machine ...accel=`), so explicit overrides always win.
+#
+# GLOBAL (CROSS-WORKTREE) CONCURRENCY CAP
+#
+# scripts/_build_lock.sh only serialises builds WITHIN one worktree.
+# Several agents in separate worktrees can each spawn QEMU at once and
+# thrash a 12-core box. Because every QEMU invocation funnels through
+# this shim, the shim is also the natural place for a global limiter:
+# before exec'ing the real QEMU it grabs one of N flock slots under a
+# fixed absolute path (HAMNIX_QEMU_SLOT_DIR, default /tmp/hamnix-qemu-
+# slots). The flock fd is inherited across `exec` and auto-released
+# when QEMU exits, so the *total* number of concurrent QEMU processes
+# across ALL worktrees is capped at N (default: ncores/2). Set
+# HAMNIX_QEMU_SLOTS=0 to disable the cap.
 set -euo pipefail
 
 # Find the REAL qemu-system-x86_64, skipping this shim's own directory.
@@ -129,14 +157,69 @@ if [ -z "$REAL_QEMU" ]; then
     exit 127
 fi
 
+# qemu_exec — acquire a global concurrency slot, then exec the real
+# QEMU with the given argv. The flock fd survives `exec` and is held
+# for QEMU's whole lifetime; the kernel releases it when QEMU exits.
+# That makes the slot dir a counting semaphore shared by every agent
+# worktree. If all slots stay busy past the backstop, or the cap is
+# disabled / unusable, we exec anyway — correctness must not depend on
+# the limiter, it only smooths load.
+qemu_exec() {
+    local slots slot_dir
+    slots="${HAMNIX_QEMU_SLOTS:-}"
+    if [ -z "$slots" ]; then
+        # Default cap: ncores/2, floored at 1.
+        local nc
+        nc="$(nproc 2>/dev/null || echo 4)"
+        slots=$(( nc / 2 ))
+        [ "$slots" -lt 1 ] && slots=1
+    fi
+    slot_dir="${HAMNIX_QEMU_SLOT_DIR:-/tmp/hamnix-qemu-slots}"
+
+    if [ "$slots" -gt 0 ] && command -v flock >/dev/null 2>&1 \
+       && mkdir -p "$slot_dir" 2>/dev/null; then
+        # Pre-create the slot files so the fd-8 open below cannot fail.
+        local s
+        for (( s=1; s<=slots; s++ )); do
+            : >> "$slot_dir/slot.$s" 2>/dev/null || true
+        done
+        # Backstop: don't wait forever — a crashed holder must not
+        # wedge the suite. ~10 min is well past the slowest test.
+        local deadline=$(( SECONDS + 600 ))
+        while :; do
+            for (( s=1; s<=slots; s++ )); do
+                # fd 8 carries the slot lock into the exec'd QEMU; the
+                # kernel drops it when QEMU exits. Reopening fd 8 onto
+                # the next slot file releases any prior (failed) lock.
+                exec 8>>"$slot_dir/slot.$s"
+                if flock -n 8; then
+                    exec "$REAL_QEMU" "$@"
+                fi
+            done
+            if [ "$SECONDS" -ge "$deadline" ]; then
+                echo "[qemu-shim] WARN: no QEMU slot free after 600s;" \
+                     "running uncapped" >&2
+                break
+            fi
+            sleep 0.5
+        done
+    fi
+    # Cap disabled or unavailable: exec uncapped.
+    exec "$REAL_QEMU" "$@"
+}
+
 # Locate a `-kernel <file>` pair and an optional `-append <cmdline>`.
 # A GRUB ISO boot has no `-kernel`/`-append`; the kernel command line
 # (if any) goes on the grub.cfg `multiboot` line, and QEMU rejects a
 # bare `-append` without `-kernel`. So we capture both and drop them.
-# Also note whether the caller already set `-boot`.
+# Also note whether the caller already set `-boot`, picked a CPU model
+# (`-cpu`), or chose an accelerator (`-accel`/`-enable-kvm`/`-machine
+# accel=`).
 KELF=""
 KAPPEND=""
 HAS_BOOT=0
+HAS_CPU=0
+HAS_ACCEL=0
 args=("$@")
 n=$#
 for (( i=0; i<n; i++ )); do
@@ -146,8 +229,34 @@ for (( i=0; i<n; i++ )); do
         KAPPEND="${args[$((i+1))]}"
     elif [ "${args[$i]}" = "-boot" ]; then
         HAS_BOOT=1
+    elif [ "${args[$i]}" = "-cpu" ]; then
+        HAS_CPU=1
+    elif [ "${args[$i]}" = "-accel" ] || [ "${args[$i]}" = "-enable-kvm" ]; then
+        HAS_ACCEL=1
+    elif [ "${args[$i]}" = "-machine" ] || [ "${args[$i]}" = "-M" ]; then
+        case "${args[$((i+1))]:-}" in *accel=*) HAS_ACCEL=1 ;; esac
     fi
 done
+
+# --- accelerator selection ------------------------------------------
+# Inject `-accel kvm` (the ~10-50x speedup over TCG) when the host has
+# a usable /dev/kvm and the caller did not already pick an accelerator.
+# `-cpu host` exposes the bare-metal CPU to the guest, but it is only
+# valid under a hardware accelerator — add it only when we are turning
+# KVM on AND the caller did not already choose a `-cpu` model. With no
+# usable /dev/kvm, ACCEL_ARGS stays empty and QEMU keeps its default
+# TCG accelerator, so KVM-less hosts (CI) still work unchanged.
+# HAMNIX_QEMU_NO_KVM=1 forces the TCG fallback even when /dev/kvm is
+# usable — handy for reproducing CI behaviour or A/B timing.
+ACCEL_ARGS=()
+if [ "$HAS_ACCEL" -eq 0 ] && [ "${HAMNIX_QEMU_NO_KVM:-0}" != "1" ]; then
+    if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+        ACCEL_ARGS+=("-accel" "kvm")
+        if [ "$HAS_CPU" -eq 0 ]; then
+            ACCEL_ARGS+=("-cpu" "host")
+        fi
+    fi
+fi
 
 # Pass through unchanged unless -kernel names an ELFCLASS64 ELF.
 is_elf64=0
@@ -158,7 +267,10 @@ if [ -n "$KELF" ] && [ -f "$KELF" ]; then
     fi
 fi
 if [ "$is_elf64" -ne 1 ]; then
-    exec "$REAL_QEMU" "$@"
+    # Pass-through boot (real Linux bzImage, or a `-cdrom`/`-bios` ISO
+    # boot such as test_bios_boot / test_uefi_boot / test_iso_qemu).
+    # Still inject the accelerator so these paths get KVM too.
+    qemu_exec "${ACCEL_ARGS[@]}" "$@"
 fi
 
 # Wrap the ELFCLASS64 Hamnix kernel in a BIOS GRUB ISO. Any `-append`
@@ -212,7 +324,7 @@ done
 if [ "$HAS_BOOT" -eq 0 ]; then
     out+=("-boot" "d")
 fi
-exec "$REAL_QEMU" "${out[@]}"
+qemu_exec "${ACCEL_ARGS[@]}" "${out[@]}"
 SHIM_EOF
     chmod +x "$shim"
 
