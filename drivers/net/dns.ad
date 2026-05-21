@@ -1,31 +1,52 @@
 # drivers/net/dns.ad
 #
-# Minimal DNS resolver client (RFC 1035, subset). Sends UDP/53 A-record
-# queries to the DHCP-supplied DNS server (option 6, see dhcp.ad) and
-# parses the answer to extract a single A-record RDATA.
+# DNS resolver client (RFC 1035 + RFC 2782, real-internet grade subset).
+# Sends queries to the DHCP-supplied DNS server (option 6, see dhcp.ad)
+# over UDP/53, with TCP/53 fallback when a UDP answer is truncated.
+# Parses A, PTR, MX and SRV record types out of the answer section.
 #
-# Scope (deliberately tight — this is the smallest thing that unblocks
-# `apt install python3` reaching deb.debian.org by name):
+# Scope (kernel roadmap §11 — bringing the resolver to real-internet
+# grade so `apt` against a CDN host like deb.debian.org behaves):
 #
-#   - One outstanding A-record query per slot; round-robin across 4
-#     in-flight slots so back-to-back lookups don't trip over each
-#     other. Plenty for a single-threaded init smoke test.
+#   - Multiple A-records per answer. A real DNS reply for a CDN host
+#     carries several A-records for load balancing; we parse *all* of
+#     them (up to DNS_MAX_A per slot) and the public dns_lookup
+#     round-robins across the set so a dead front-end doesn't wedge a
+#     lookup. The result cache stores the full set too.
+#   - PTR (type 12): reverse lookup. Same wire codec as A — an
+#     `in-addr.arpa`-formatted QNAME on the request, a domain-name
+#     RDATA in the answer. dns_lookup_ptr() builds the in-addr.arpa
+#     QNAME from 4 octets.
+#   - MX (type 15): RDATA is (preference uint16, exchange domain-name).
+#     The exchange name may use a DNS compression pointer back into
+#     the message — decoded via the shared _dns_read_name codec.
+#   - SRV (type 33): RDATA is (priority u16, weight u16, port u16,
+#     target domain-name). dns_lookup_srv() returns the first record.
+#   - AAAA (type 28): OUT OF SCOPE / DEFERRED. An AAAA answer needs an
+#     IPv6 IP-layer header to be useful end-to-end and the IP layer
+#     (drivers/net/ip.ad) is IPv4-only — see DNS_QTYPE_AAAA below. We
+#     never issue an AAAA query; revisit once the IP layer gains IPv6.
+#   - One outstanding query per slot; round-robin across 4 in-flight
+#     slots so back-to-back lookups don't trip over each other.
 #   - 16-entry TTL-bounded in-memory result cache (added post-M16.99).
 #     `dns_lookup` consults the cache first; only on miss / expiry do
 #     we hit the wire. `dns_rx` stores both positive answers (TTL
 #     clamped to [60, 86400] seconds) and negative answers (RCODE=3
 #     NXDOMAIN, cached for 60 seconds — same shape as nss-resolve's
-#     negative cache). Saves a UDP/53 round-trip per duplicate query;
+#     negative cache). Saves a round-trip per duplicate query;
 #     critical for `apt update` which fetches Release + Packages +
 #     InRelease from the same handful of mirror hostnames over and
 #     over. Cache eviction is "earliest expiry wins" when all 16
-#     slots are live — trivial linear walk + min.
-#   - No AAAA / CNAME / NS / MX. Only TYPE=A (1), CLASS=IN (1).
+#     slots are live — trivial linear walk + min. The cache keys on
+#     hostname only and caches A-record answers; PTR/MX/SRV go
+#     straight to the wire (low-frequency, no caching needed).
 #   - No EDNS0, no DNSSEC, no compression on the query side (we always
 #     emit the full QNAME). Pointers in the response *are* honored
 #     when parsing — SLIRP's upstream forwarder uses them heavily.
-#   - No TCP fallback. UDP/53 only. Responses >512 bytes will be
-#     truncated (TC bit set in the reply); we accept that.
+#   - TCP/53 fallback (RFC 7766): when a UDP response sets the TC
+#     (truncated) bit, the same query is retried over TCP/53 with a
+#     2-byte big-endian length prefix. Real MX answers and large
+#     multi-A CDN answers routinely exceed the 512-byte UDP cap.
 #
 # The ip_send path resolves the destination MAC via the ARP cache.
 # On a fresh boot the cache only contains the SLIRP gateway (10.0.2.2,
@@ -58,8 +79,9 @@
 #   - Answer section: each RR is { NAME (compressed pointer or labels),
 #     TYPE (2), CLASS (2), TTL (4), RDLENGTH (2), RDATA (RDLENGTH) }.
 #     For TYPE=A / CLASS=IN, RDLENGTH=4 and RDATA is the IPv4 address.
-#     We take the first matching A-record and copy its 4 bytes into
-#     the per-slot result.
+#     We collect every matching A-record into the per-slot result set.
+#     For PTR (12) / MX (15) / SRV (33) the RDATA carries a domain
+#     name (MX/SRV) or is itself a name (PTR); see _dns_read_name.
 
 from kernel.printk.printk import printk0, printk1, printk2
 from drivers.net.udp import udp_send, UDP_PORT_DNS_CLIENT_LO
@@ -68,6 +90,7 @@ from drivers.net.ip import ip_have_our_ip, ip_our_ip_b
 from drivers.net.virtio_net import virtio_net_poll
 from drivers.net.eth import eth_tx, eth_get_mac
 from drivers.net.arp import arp_lookup
+from drivers.net.tcp import tcp_connect, tcp_send, tcp_recv, tcp_close
 from arch.x86.kernel.time import get_jiffies
 
 
@@ -79,10 +102,29 @@ UDP_PORT_DNS_SERVER:     uint16 = 53
 
 # Header field positions and constants (RFC 1035 section 4.1.1).
 DNS_HDR_LEN:    uint64 = 12
-DNS_QTYPE_A:    uint16 = 1
 DNS_QCLASS_IN:  uint16 = 1
 DNS_FLAG_RD_HI: uint8  = 0x01      # high byte of 0x0100 (RD=1)
 DNS_FLAG_RD_LO: uint8  = 0x00
+
+# Record / query types (RFC 1035 §3.2.2 + RFC 2782).
+#   A     (1)  — IPv4 address.
+#   PTR   (12) — reverse lookup; RDATA is a domain name.
+#   MX    (15) — mail exchange; RDATA = (preference u16, exchange name).
+#   AAAA  (28) — IPv6 address. DEFERRED: the IP layer is IPv4-only, so
+#                an AAAA answer can't be carried end-to-end. We never
+#                issue an AAAA query and the answer parser has no AAAA
+#                arm; the constant exists only to document the gap.
+#   SRV   (33) — service location; RDATA = (prio u16, weight u16,
+#                port u16, target name).
+DNS_QTYPE_A:    uint16 = 1
+DNS_QTYPE_PTR:  uint16 = 12
+DNS_QTYPE_MX:   uint16 = 15
+DNS_QTYPE_AAAA: uint16 = 28        # deferred — see banner / dns_lookup
+DNS_QTYPE_SRV:  uint16 = 33
+
+# TC (truncated) bit lives in the high byte of the flags word
+# (byte 2 of the header): 0x02 == bit 9 of the 16-bit flags.
+DNS_FLAG_TC:    uint8  = 0x02
 
 # Per-slot state. The compiler's 2-D Array-of-Array address-of quirk
 # (see memory/feedback_compiler_quirks.md) bit us in arp.ad; we keep
@@ -94,9 +136,54 @@ DNS_MAX_QUERIES:  uint16 = 4
 
 dns_slot_used:    Array[4, uint8]      # 0 = free, 1 = in-flight, 2 = answered
 dns_slot_qid:     Array[4, uint16]
-# Per-slot result: 4 bytes of IPv4 address. Stored as a flat 16-byte
-# array indexed slot*4 + byte to dodge the 2-D codegen quirk.
+# Per-slot query type (DNS_QTYPE_A / _PTR / _MX / _SRV). dns_rx reads
+# this to know which RR type to extract; dns_send_query / the TCP
+# fallback set it. Flat per-slot scalar array.
+dns_slot_qtype:   Array[4, uint16]
+
+# --- Multi-A result set --------------------------------------------
+#
+# A real DNS answer for a CDN host (deb.debian.org, the Debian
+# mirrors, any fastly/cloudfront-fronted name) carries SEVERAL
+# A-records — the upstream resolver hands the client a rotated set
+# for load balancing. The pre-§11 resolver took the first and threw
+# the rest away, so if that one front-end was down the lookup was
+# wedged even though three live alternatives were in the same packet.
+#
+# We now collect up to DNS_MAX_A addresses per slot. Storage is a
+# flat 1-D array indexed `slot * DNS_MAX_A * 4 + rec * 4 + byte` to
+# dodge the 2-D Array-of-Array codegen quirk. dns_slot_acount holds
+# how many were actually parsed.
+DNS_MAX_A:        uint64 = 8
+dns_slot_acount:  Array[4, uint8]            # A-records parsed this answer
+dns_slot_aips:    Array[128, uint8]          # 4 slots * DNS_MAX_A * 4
+# Per-slot result: 4 bytes of IPv4 address — the round-robin-selected
+# A-record. Kept as a flat 16-byte array indexed slot*4 + byte.
 dns_slot_ip:      Array[16, uint8]
+# Monotonic round-robin cursor used by dns_lookup to spread successive
+# lookups across the A-record set. Plain global; wraps harmlessly.
+dns_rr_cursor:    uint64 = 0
+
+# --- PTR / MX / SRV result stash -----------------------------------
+#
+# PTR/MX/SRV are low-frequency (no caching), so a single shared
+# result block keyed by the answering slot is enough. dns_rx writes
+# here; the dns_lookup_ptr / _mx / _srv wrappers copy it back out
+# before returning. Flat per-slot layout.
+#   name : the decoded RDATA domain name (PTR target / MX exchange /
+#          SRV target). 256 bytes/slot.
+#   aux0..aux2 : type-specific 16-bit integers —
+#          MX  -> aux0 = preference
+#          SRV -> aux0 = priority, aux1 = weight, aux2 = port
+DNS_NAME_MAX:     uint64 = 256
+dns_slot_rname:   Array[1024, uint8]         # 4 * DNS_NAME_MAX
+dns_slot_aux0:    Array[4, uint16]
+dns_slot_aux1:    Array[4, uint16]
+dns_slot_aux2:    Array[4, uint16]
+# Set by dns_rx when an inbound UDP answer has the TC (truncated) bit
+# set. dns_lookup polls for this and, when it sees it, abandons the
+# UDP slot and retries the identical query over TCP/53. Flat per-slot.
+dns_slot_truncated: Array[4, uint8]
 # Per-slot hostname stash. We keep a copy of the querying caller's
 # hostname so dns_rx can store the answer in the result cache keyed
 # by name (the wire response repeats the QNAME but uses RFC 1035 §4.1.4
@@ -123,7 +210,13 @@ dns_cache_valid:    Array[16, int32]               # 1 = slot in use, 0 = free
 dns_cache_negative: Array[16, int32]               # 1 = NXDOMAIN entry, 0 = positive
 dns_cache_expires:  Array[16, uint64]              # get_jiffies() deadline
 dns_cache_host:     Array[1024, uint8]             # 16 * DNS_HOSTNAME_MAX
-dns_cache_ip:       Array[64, uint8]               # 16 * 4
+# The cache stores the FULL A-record set, not just the first address —
+# a CDN host's load-balanced set is cached intact so a cache hit can
+# round-robin exactly like a fresh wire answer. Flat layout indexed
+# `entry * DNS_MAX_A * 4 + rec * 4 + byte`; dns_cache_acount holds the
+# count for each entry.
+dns_cache_acount:   Array[16, uint8]               # A-records in this entry
+dns_cache_ip:       Array[512, uint8]              # 16 * DNS_MAX_A * 4
 
 # TTL clamps. RFC 1035 doesn't mandate either bound — these are
 # operational guard-rails. 60 s floor avoids thrashing on hostile
@@ -156,6 +249,19 @@ dns_tx_buf:       Array[512, uint8]
 # ARP cache for the DNS server. 64 bytes (14 ETH + 28 ARP + 22 pad).
 dns_arp_buf:      Array[64, uint8]
 
+# --- TCP/53 fallback scratch ---------------------------------------
+#
+# When a UDP/53 answer has the TC (truncated) bit set, RFC 7766 says
+# retry the *identical* query over TCP/53. The TCP framing prepends a
+# 2-byte big-endian message length to both the query and the
+# response. dns_tcp_tx holds [len_hi, len_lo, <DNS message>]; the
+# message itself is just the contents of dns_tx_buf (header + QNAME +
+# QTYPE + QCLASS). 2048 bytes is generous: a fully-populated MX or
+# multi-A answer for a busy host is well under 1 KiB.
+DNS_TCP_BYTES:    uint64 = 2048
+dns_tcp_tx:       Array[2048, uint8]
+dns_tcp_rx:       Array[2048, uint8]
+
 
 def dns_refresh_server() -> int32:
     # Pull the DNS server IP from the DHCP cache. Returns 0 on
@@ -182,11 +288,28 @@ def dns_init():
     while i < DNS_NUM_SLOTS:
         dns_slot_used[i] = 0
         dns_slot_qid[i] = 0
+        dns_slot_qtype[i] = DNS_QTYPE_A
+        dns_slot_acount[i] = 0
+        dns_slot_aux0[i] = 0
+        dns_slot_aux1[i] = 0
+        dns_slot_aux2[i] = 0
+        dns_slot_truncated[i] = 0
         i = i + 1
     j: uint64 = 0
     while j < 16:
         dns_slot_ip[j] = 0
         j = j + 1
+    # Zero the multi-A result set (4 slots * DNS_MAX_A * 4) and the
+    # PTR/MX/SRV name stash (4 * DNS_NAME_MAX).
+    ja: uint64 = 0
+    while ja < 128:
+        dns_slot_aips[ja] = 0
+        ja = ja + 1
+    jn: uint64 = 0
+    while jn < 1024:
+        dns_slot_rname[jn] = 0
+        jn = jn + 1
+    dns_rr_cursor = 0
     dns_server_ip[0] = 0
     dns_server_ip[1] = 0
     dns_server_ip[2] = 0
@@ -208,19 +331,20 @@ def dns_init():
         dns_cache_valid[c] = 0
         dns_cache_negative[c] = 0
         dns_cache_expires[c] = 0
+        dns_cache_acount[c] = 0
         c = c + 1
     cc: uint64 = 0
     while cc < 1024:
         dns_cache_host[cc] = 0
         cc = cc + 1
     ci: uint64 = 0
-    while ci < 64:
+    while ci < 512:
         dns_cache_ip[ci] = 0
         ci = ci + 1
     # Try once at init; dns_lookup will retry the dhcp_get_dns call
     # if it returns -1 here.
     dns_refresh_server()
-    printk0("dns: client initialized (4 slot pool, 16-entry cache, UDP/53)\n")
+    printk0("dns: client initialized (4 slot pool, 16-entry cache, UDP+TCP/53)\n")
 
 
 def _dns_alloc_slot() -> int32:
@@ -333,20 +457,27 @@ def _dns_cache_pick_slot() -> uint64:
     return best
 
 
-def _dns_cache_store(hostname: Ptr[uint8], ip0: uint8, ip1: uint8,
-                     ip2: uint8, ip3: uint8, ttl_seconds: uint64,
-                     negative: int32):
-    # Insert (or replace) a cache entry. TTL is in seconds; we convert
-    # to jiffies (HZ=100) on store. Negative=1 marks an NXDOMAIN
-    # entry; ip bytes are stored as 0.0.0.0 in that case but the
-    # `negative` flag is what dns_lookup actually reads.
+def _dns_cache_store_set(hostname: Ptr[uint8], src_aips: Ptr[uint8],
+                         acount: uint8, ttl_seconds: uint64,
+                         negative: int32):
+    # Insert (or replace) a cache entry holding the FULL A-record set.
+    # `src_aips` points at a flat [rec*4 + byte] array of `acount`
+    # IPv4 addresses (DNS_MAX_A max). TTL is in seconds; we convert to
+    # jiffies (HZ=100) on store. Negative=1 marks an NXDOMAIN entry
+    # (acount stored as 0). For a positive entry, dns_lookup reads the
+    # whole set back and round-robins over it.
     idx: uint64 = _dns_cache_pick_slot()
     host_dst: Ptr[uint8] = cast[Ptr[uint8]](&dns_cache_host[idx * DNS_HOSTNAME_MAX])
     _dns_host_copy(host_dst, hostname)
-    dns_cache_ip[idx * 4 + 0] = ip0
-    dns_cache_ip[idx * 4 + 1] = ip1
-    dns_cache_ip[idx * 4 + 2] = ip2
-    dns_cache_ip[idx * 4 + 3] = ip3
+    n: uint64 = cast[uint64](acount)
+    if n > DNS_MAX_A:
+        n = DNS_MAX_A
+    base: uint64 = idx * DNS_MAX_A * 4
+    i: uint64 = 0
+    while i < n * 4:
+        dns_cache_ip[base + i] = src_aips[i]
+        i = i + 1
+    dns_cache_acount[idx] = cast[uint8](n)
     dns_cache_expires[idx] = get_jiffies() + ttl_seconds * DNS_JIFFIES_PER_SEC
     dns_cache_negative[idx] = negative
     dns_cache_valid[idx] = 1
@@ -355,8 +486,8 @@ def _dns_cache_store(hostname: Ptr[uint8], ip0: uint8, ip1: uint8,
         printk1(" (ttl=%ds)\n", ttl_seconds)
     else:
         printk1("[dns] cache store %s -> ", cast[uint64](hostname))
-        _dns_print_ip(ip0, ip1, ip2, ip3)
-        printk1(" (ttl=%ds)\n", ttl_seconds)
+        _dns_print_ip(src_aips[0], src_aips[1], src_aips[2], src_aips[3])
+        printk2(" (+%d more, ttl=%ds)\n", n - 1, ttl_seconds)
 
 
 def _dns_encode_qname(hostname: Ptr[uint8], off: uint64) -> uint64:
@@ -477,24 +608,13 @@ def _dns_prime_arp() -> int32:
     return -1
 
 
-def dns_send_query(hostname: Ptr[uint8], slot: uint64,
-                   qid: uint16) -> int32:
-    # Build an A-record query for `hostname` with `qid` and send it
-    # from the slot's ephemeral source port to the DHCP-supplied DNS
-    # server on UDP/53. Returns 0 on udp_send success, -1 on size
-    # overflow or missing server.
-    if dns_server_set == 0:
-        return -1
-    if slot >= DNS_NUM_SLOTS:
-        return -1
-    # Stash the hostname so dns_rx can store the answer in the
-    # result cache when the reply lands. We copy rather than keep a
-    # pointer because the caller's hostname buffer may be on the
-    # stack or otherwise transient.
-    stash_dst: Ptr[uint8] = cast[Ptr[uint8]](&dns_slot_host[slot * DNS_HOSTNAME_MAX])
-    _dns_host_copy(stash_dst, hostname)
-    # Zero the header bytes; the rest of the buffer is filled by
-    # _dns_encode_qname + the qtype/qclass append below.
+def _dns_build_query(hostname: Ptr[uint8], qid: uint16,
+                     qtype: uint16) -> uint64:
+    # Build a DNS query for `hostname` of record type `qtype` into
+    # dns_tx_buf. Returns the message length (header + QNAME + QTYPE +
+    # QCLASS), or 0 on size overflow. Shared by both the UDP send path
+    # and the TCP/53 fallback — the wire message is identical, only
+    # the framing differs (TCP prepends a 2-byte length).
     i: uint64 = 0
     while i < DNS_HDR_LEN:
         dns_tx_buf[i] = 0
@@ -511,13 +631,35 @@ def dns_send_query(hostname: Ptr[uint8], slot: uint64,
     # Bounds check before we write QTYPE + QCLASS (4 more bytes).
     if pos + 4 > DNS_TX_BYTES:
         printk1("[dns] query too big for %d byte buffer\n", DNS_TX_BYTES)
-        return -1
-    # QTYPE = A (1), QCLASS = IN (1).
-    dns_tx_buf[pos + 0] = 0
-    dns_tx_buf[pos + 1] = 1
+        return 0
+    # QTYPE = `qtype` (be16), QCLASS = IN (1).
+    dns_tx_buf[pos + 0] = cast[uint8]((cast[uint32](qtype) >> 8) & 0xFF)
+    dns_tx_buf[pos + 1] = cast[uint8](cast[uint32](qtype) & 0xFF)
     dns_tx_buf[pos + 2] = 0
     dns_tx_buf[pos + 3] = 1
     pos = pos + 4
+    return pos
+
+
+def dns_send_query(hostname: Ptr[uint8], slot: uint64,
+                   qid: uint16, qtype: uint16) -> int32:
+    # Build a query of record type `qtype` for `hostname` with `qid`
+    # and send it from the slot's ephemeral source port to the DHCP-
+    # supplied DNS server on UDP/53. Returns 0 on udp_send success,
+    # -1 on size overflow or missing server.
+    if dns_server_set == 0:
+        return -1
+    if slot >= DNS_NUM_SLOTS:
+        return -1
+    # Stash the hostname (cache key for A; just bookkeeping for the
+    # rest) and the query type so dns_rx knows what to extract. We
+    # copy the hostname because the caller's buffer may be transient.
+    stash_dst: Ptr[uint8] = cast[Ptr[uint8]](&dns_slot_host[slot * DNS_HOSTNAME_MAX])
+    _dns_host_copy(stash_dst, hostname)
+    dns_slot_qtype[slot] = qtype
+    pos: uint64 = _dns_build_query(hostname, qid, qtype)
+    if pos == 0:
+        return -1
     # Compute ephemeral source port = LO + slot. (53000..53003.)
     src_port: uint16 = UDP_PORT_DNS_CLIENT_LO + cast[uint16](slot)
     # Stash buf base into a local first (codegen quirk workaround
@@ -552,6 +694,69 @@ def _dns_skip_qname(buf: Ptr[uint8], length: uint64,
     return 0                          # ran off the end — malformed
 
 
+def _dns_read_name(buf: Ptr[uint8], length: uint64, off: uint64,
+                   dst: Ptr[uint8], dst_max: uint64) -> int32:
+    # DECODE a DNS name at `off` into a dotted ASCII string in `dst`
+    # (NUL-terminated, capped at dst_max-1). This is the shared name
+    # codec that PTR / MX / SRV all reuse: PTR's whole RDATA is a
+    # name, MX's exchange and SRV's target are names, and any of them
+    # may use an RFC 1035 §4.1.4 compression pointer back into the
+    # message. _dns_skip_qname only *measures* an encoded name (for
+    # advancing `pos`); this one actually materialises it.
+    #
+    # Pointer-following is bounded: each 0xC0 jump must point STRICTLY
+    # BACKWARD relative to the lowest offset we've followed so far, so
+    # a maliciously self-referential or forward-cycling message can't
+    # spin us forever. Returns 0 on success, -1 on malformed input.
+    dpos: uint64 = 0                    # write cursor into dst
+    pos: uint64 = off
+    # `min_seen` is the floor a compression pointer must stay below to
+    # guarantee forward progress; initialised to `off` so the first
+    # pointer must aim before the name we started on.
+    min_seen: uint64 = off
+    hops: uint64 = 0                    # hard cap on pointer follows
+    first_label: int32 = 1
+    while pos < length:
+        b: uint8 = buf[pos]
+        if b == 0:
+            # Root terminator — name complete.
+            if dpos < dst_max:
+                dst[dpos] = 0
+            else:
+                dst[dst_max - 1] = 0
+            return 0
+        if (b & 0xC0) == 0xC0:
+            # Compression pointer: 14-bit offset across this + next byte.
+            if pos + 1 >= length:
+                return -1
+            ptr: uint64 = (cast[uint64](b & 0x3F) << 8) | cast[uint64](buf[pos + 1])
+            if ptr >= min_seen:
+                return -1               # not strictly backward — reject
+            if hops >= 32:
+                return -1               # pointer-chase budget exhausted
+            hops = hops + 1
+            min_seen = ptr
+            pos = ptr
+        else:
+            # Plain label of `b` bytes.
+            label_len: uint64 = cast[uint64](b)
+            if pos + 1 + label_len > length:
+                return -1
+            if first_label == 0:
+                if dpos < dst_max - 1:
+                    dst[dpos] = 46      # '.'
+                    dpos = dpos + 1
+            first_label = 0
+            k: uint64 = 0
+            while k < label_len:
+                if dpos < dst_max - 1:
+                    dst[dpos] = buf[pos + 1 + k]
+                    dpos = dpos + 1
+                k = k + 1
+            pos = pos + 1 + label_len
+    return -1                           # ran off the end — malformed
+
+
 def _dns_find_slot_for_qid(qid: uint16) -> int32:
     # Linear scan; 4 slots, no need for anything smarter.
     i: uint64 = 0
@@ -573,14 +778,238 @@ def _dns_print_ip(b0: uint8, b1: uint8, b2: uint8, b3: uint8):
     printk1("%d", cast[uint64](b3))
 
 
+def _dns_clamp_ttl(ttl_raw: uint64) -> uint64:
+    # Clamp a wire TTL to [DNS_TTL_MIN, DNS_TTL_MAX]. The floor stops
+    # cache thrashing on TTL=0 answers (some CDNs serve them as a
+    # courtesy); the ceiling stops us honoring multi-week TTLs from
+    # misconfigured upstreams that outlive our IP-to-host mapping.
+    ttl_eff: uint64 = ttl_raw
+    if ttl_eff < DNS_TTL_MIN:
+        ttl_eff = DNS_TTL_MIN
+    if ttl_eff > DNS_TTL_MAX:
+        ttl_eff = DNS_TTL_MAX
+    return ttl_eff
+
+
+def _dns_parse_response(slot: uint64, payload: Ptr[uint8],
+                        length: uint64):
+    # Shared answer-section parser, used by BOTH the UDP dns_rx path
+    # and the TCP/53 fallback. `slot` is an already-matched in-flight
+    # slot; on return the slot is marked answered (dns_slot_used = 2)
+    # with its result fields populated according to dns_slot_qtype.
+    #
+    #   A   -> collects up to DNS_MAX_A addresses into dns_slot_aips,
+    #          dns_slot_acount; mirrors the first into dns_slot_ip and
+    #          stores the whole set in the result cache.
+    #   PTR -> dns_slot_rname = the decoded target name.
+    #   MX  -> dns_slot_rname = exchange name, aux0 = preference.
+    #   SRV -> dns_slot_rname = target name, aux0/1/2 = prio/weight/port.
+    #
+    # The caller has already validated the header's QR bit.
+    want: uint16 = dns_slot_qtype[slot]
+    host_ptr: Ptr[uint8] = cast[Ptr[uint8]](&dns_slot_host[slot * DNS_HOSTNAME_MAX])
+    rname_ptr: Ptr[uint8] = cast[Ptr[uint8]](&dns_slot_rname[slot * DNS_NAME_MAX])
+    # RCODE = low 4 bits of flags_lo (byte 3). 3 = NXDOMAIN (cacheable
+    # negative, A-queries only); other non-zero RCODEs fall through to
+    # the empty-answer path uncached so a transient SERVFAIL doesn't
+    # poison the cache.
+    rcode: uint8 = payload[3] & 0x0F
+    if rcode == 3:
+        printk0("[dns] NXDOMAIN\n")
+        if want == DNS_QTYPE_A:
+            zero_aips: Array[4, uint8]
+            zero_aips[0] = 0
+            zero_aips[1] = 0
+            zero_aips[2] = 0
+            zero_aips[3] = 0
+            _dns_cache_store_set(host_ptr,
+                                 cast[Ptr[uint8]](&zero_aips[0]),
+                                 0, DNS_TTL_NEGATIVE, 1)
+        dns_slot_acount[slot] = 0
+        b: uint64 = 0
+        while b < 4:
+            dns_slot_ip[slot * 4 + b] = 0
+            b = b + 1
+        rname_ptr[0] = 0
+        dns_slot_used[slot] = 2
+        return
+    an_hi: uint16 = cast[uint16](payload[6]) << 8
+    an_lo: uint16 = cast[uint16](payload[7])
+    ancount: uint16 = an_hi | an_lo
+    qd_hi: uint16 = cast[uint16](payload[4]) << 8
+    qd_lo: uint16 = cast[uint16](payload[5])
+    qdcount: uint16 = qd_hi | qd_lo
+    if ancount == 0:
+        printk0("[dns] empty answer\n")
+        dns_slot_acount[slot] = 0
+        b: uint64 = 0
+        while b < 4:
+            dns_slot_ip[slot * 4 + b] = 0
+            b = b + 1
+        rname_ptr[0] = 0
+        dns_slot_used[slot] = 2
+        return
+    # Walk past the questions section. Each question is
+    # { QNAME (variable), QTYPE (2), QCLASS (2) }.
+    pos: uint64 = DNS_HDR_LEN
+    q: uint16 = 0
+    while q < qdcount:
+        new_pos: uint64 = _dns_skip_qname(payload, length, pos)
+        if new_pos == 0:
+            printk0("[dns] malformed question\n")
+            dns_slot_used[slot] = 2
+            return
+        pos = new_pos + 4              # +QTYPE + QCLASS
+        if pos > length:
+            printk0("[dns] truncated question\n")
+            dns_slot_used[slot] = 2
+            return
+        q = q + 1
+    # Walk the answers section. Each RR is { NAME (variable),
+    # TYPE (2), CLASS (2), TTL (4), RDLENGTH (2), RDATA (RDLENGTH) }.
+    acount: uint8 = 0
+    best_ttl: uint64 = DNS_TTL_MAX
+    found_aux: int32 = 0               # 1 once a PTR/MX/SRV RR matched
+    a: uint16 = 0
+    while a < ancount:
+        name_end: uint64 = _dns_skip_qname(payload, length, pos)
+        if name_end == 0:
+            printk0("[dns] malformed RR name\n")
+            dns_slot_used[slot] = 2
+            return
+        if name_end + 10 > length:
+            printk0("[dns] truncated RR header\n")
+            dns_slot_used[slot] = 2
+            return
+        type_hi: uint16 = cast[uint16](payload[name_end + 0]) << 8
+        type_lo: uint16 = cast[uint16](payload[name_end + 1])
+        rr_type: uint16 = type_hi | type_lo
+        class_hi: uint16 = cast[uint16](payload[name_end + 2]) << 8
+        class_lo: uint16 = cast[uint16](payload[name_end + 3])
+        rr_class: uint16 = class_hi | class_lo
+        ttl_b0: uint64 = cast[uint64](payload[name_end + 4])
+        ttl_b1: uint64 = cast[uint64](payload[name_end + 5])
+        ttl_b2: uint64 = cast[uint64](payload[name_end + 6])
+        ttl_b3: uint64 = cast[uint64](payload[name_end + 7])
+        ttl_raw: uint64 = (ttl_b0 << 24) | (ttl_b1 << 16) | (ttl_b2 << 8) | ttl_b3
+        rdlen_hi: uint16 = cast[uint16](payload[name_end + 8]) << 8
+        rdlen_lo: uint16 = cast[uint16](payload[name_end + 9])
+        rdlength: uint16 = rdlen_hi | rdlen_lo
+        rdata_off: uint64 = name_end + 10
+        if rdata_off + cast[uint64](rdlength) > length:
+            printk0("[dns] truncated RDATA\n")
+            dns_slot_used[slot] = 2
+            return
+        # --- A: collect every record (multi-A load-balanced set) ---
+        if want == DNS_QTYPE_A:
+            if rr_type == DNS_QTYPE_A:
+                if rr_class == DNS_QCLASS_IN:
+                    if rdlength == 4:
+                        if cast[uint64](acount) < DNS_MAX_A:
+                            ab: uint64 = slot * DNS_MAX_A * 4 + cast[uint64](acount) * 4
+                            dns_slot_aips[ab + 0] = payload[rdata_off + 0]
+                            dns_slot_aips[ab + 1] = payload[rdata_off + 1]
+                            dns_slot_aips[ab + 2] = payload[rdata_off + 2]
+                            dns_slot_aips[ab + 3] = payload[rdata_off + 3]
+                            acount = acount + 1
+                        cl: uint64 = _dns_clamp_ttl(ttl_raw)
+                        if cl < best_ttl:
+                            best_ttl = cl
+        # --- PTR: RDATA is itself a domain name -------------------
+        if want == DNS_QTYPE_PTR:
+            if rr_type == DNS_QTYPE_PTR:
+                if found_aux == 0:
+                    if _dns_read_name(payload, length, rdata_off,
+                                      rname_ptr, DNS_NAME_MAX) == 0:
+                        found_aux = 1
+        # --- MX: (preference u16, exchange name) ------------------
+        if want == DNS_QTYPE_MX:
+            if rr_type == DNS_QTYPE_MX:
+                if found_aux == 0:
+                    if rdlength >= 3:
+                        pref_hi: uint16 = cast[uint16](payload[rdata_off + 0]) << 8
+                        pref_lo: uint16 = cast[uint16](payload[rdata_off + 1])
+                        if _dns_read_name(payload, length, rdata_off + 2,
+                                          rname_ptr, DNS_NAME_MAX) == 0:
+                            dns_slot_aux0[slot] = pref_hi | pref_lo
+                            found_aux = 1
+        # --- SRV: (priority, weight, port, target name) -----------
+        if want == DNS_QTYPE_SRV:
+            if rr_type == DNS_QTYPE_SRV:
+                if found_aux == 0:
+                    if rdlength >= 7:
+                        prio_hi: uint16 = cast[uint16](payload[rdata_off + 0]) << 8
+                        prio_lo: uint16 = cast[uint16](payload[rdata_off + 1])
+                        wt_hi: uint16 = cast[uint16](payload[rdata_off + 2]) << 8
+                        wt_lo: uint16 = cast[uint16](payload[rdata_off + 3])
+                        pt_hi: uint16 = cast[uint16](payload[rdata_off + 4]) << 8
+                        pt_lo: uint16 = cast[uint16](payload[rdata_off + 5])
+                        if _dns_read_name(payload, length, rdata_off + 6,
+                                          rname_ptr, DNS_NAME_MAX) == 0:
+                            dns_slot_aux0[slot] = prio_hi | prio_lo
+                            dns_slot_aux1[slot] = wt_hi | wt_lo
+                            dns_slot_aux2[slot] = pt_hi | pt_lo
+                            found_aux = 1
+        # Advance to the next RR. SLIRP commonly precedes the answer
+        # with a CNAME chain, so we always walk past every RR.
+        pos = rdata_off + cast[uint64](rdlength)
+        if pos > length:
+            printk0("[dns] truncated answer section\n")
+            dns_slot_used[slot] = 2
+            return
+        a = a + 1
+    # --- Finalise per query type ----------------------------------
+    if want == DNS_QTYPE_A:
+        dns_slot_acount[slot] = acount
+        if acount == 0:
+            printk0("[dns] no A-record in answer; treating as NXDOMAIN\n")
+            z: uint64 = 0
+            while z < 4:
+                dns_slot_ip[slot * 4 + z] = 0
+                z = z + 1
+        else:
+            base: uint64 = slot * DNS_MAX_A * 4
+            dns_slot_ip[slot * 4 + 0] = dns_slot_aips[base + 0]
+            dns_slot_ip[slot * 4 + 1] = dns_slot_aips[base + 1]
+            dns_slot_ip[slot * 4 + 2] = dns_slot_aips[base + 2]
+            dns_slot_ip[slot * 4 + 3] = dns_slot_aips[base + 3]
+            _dns_cache_store_set(host_ptr,
+                                 cast[Ptr[uint8]](&dns_slot_aips[base]),
+                                 acount, best_ttl, 0)
+            printk1("[dns] resolved %d A-record(s) -> ",
+                    cast[uint64](acount))
+            _dns_print_ip(dns_slot_aips[base + 0], dns_slot_aips[base + 1],
+                          dns_slot_aips[base + 2], dns_slot_aips[base + 3])
+            printk0("\n")
+        dns_slot_used[slot] = 2
+        return
+    # PTR / MX / SRV: a single result. If nothing matched, leave an
+    # empty name so the wrapper returns -1.
+    if found_aux == 0:
+        printk0("[dns] no matching PTR/MX/SRV RR in answer\n")
+        rname_ptr[0] = 0
+    else:
+        if want == DNS_QTYPE_PTR:
+            printk1("[dns] PTR -> %s\n", cast[uint64](rname_ptr))
+        if want == DNS_QTYPE_MX:
+            printk1("[dns] MX pref=%d ", cast[uint64](dns_slot_aux0[slot]))
+            printk1("exchange=%s\n", cast[uint64](rname_ptr))
+        if want == DNS_QTYPE_SRV:
+            printk2("[dns] SRV prio=%d weight=%d ",
+                    cast[uint64](dns_slot_aux0[slot]),
+                    cast[uint64](dns_slot_aux1[slot]))
+            printk1("port=%d ", cast[uint64](dns_slot_aux2[slot]))
+            printk1("target=%s\n", cast[uint64](rname_ptr))
+    dns_slot_used[slot] = 2
+
+
 def dns_rx(payload: Ptr[uint8], length: uint64,
            src_b0: uint8, src_b1: uint8,
            src_b2: uint8, src_b3: uint8):
-    # Parse an inbound DNS response. Match the qid against an
-    # in-flight slot, walk past the question, then walk the answer
-    # section looking for the first A-record (TYPE=1, CLASS=1). On
-    # match, copy the 4-byte RDATA into dns_slot_ip[slot*4..slot*4+4]
-    # and mark the slot as answered (value 2).
+    # Parse an inbound UDP/53 DNS response. Match the qid against an
+    # in-flight slot, check the QR bit, then either hand off to
+    # _dns_parse_response or — if the TC (truncated) bit is set — flag
+    # the slot so dns_lookup retries the query over TCP/53.
     if length < DNS_HDR_LEN:
         printk0("[dns] runt response\n")
         return
@@ -593,185 +1022,111 @@ def dns_rx(payload: Ptr[uint8], length: uint64,
                 cast[uint64](qid))
         return
     slot: uint64 = cast[uint64](slot_signed)
-    # Header bytes 2..3 are flags; check QR bit (high bit of byte 2)
-    # is set so we don't accidentally parse a stray *query* the same
-    # way we'd parse a response. (SLIRP's emulated DNS server only
-    # ever sends responses, so this is defensive belt-and-braces.)
+    # QR bit (high bit of flags byte 2) must be set — otherwise this
+    # is a stray query, not a response. SLIRP only sends responses,
+    # so this is defensive belt-and-braces.
     flags_hi: uint8 = payload[2]
     if (flags_hi & 0x80) == 0:
         printk0("[dns] not a response (QR=0); drop\n")
         return
-    # RCODE is the low 4 bits of flags_lo (byte 3). RFC 1035 §4.1.1:
-    #   0 = no error, 1 = format error, 2 = server failure,
-    #   3 = name error (NXDOMAIN), 4 = not implemented, 5 = refused.
-    # We treat RCODE=3 as a cacheable negative answer (TTL=60 s, per
-    # nss-resolve / glibc-nss convention); other non-zero RCODEs are
-    # passed through to the "no A-record" branch below without
-    # caching, so a transient SERVFAIL doesn't poison the cache.
-    flags_lo: uint8 = payload[3]
-    rcode: uint8 = flags_lo & 0x0F
-    # Recover the stashed hostname pointer for use as cache key.
-    host_ptr: Ptr[uint8] = cast[Ptr[uint8]](&dns_slot_host[slot * DNS_HOSTNAME_MAX])
-    if rcode == 3:
-        printk1("[dns] NXDOMAIN qid=%d\n", cast[uint64](qid))
-        _dns_cache_store(host_ptr, 0, 0, 0, 0, DNS_TTL_NEGATIVE, 1)
-        b: uint64 = 0
-        while b < 4:
-            dns_slot_ip[slot * 4 + b] = 0
-            b = b + 1
+    # TC (truncated) bit: the answer did not fit in a UDP datagram.
+    # Don't try to parse the partial answer — flag the slot and let
+    # dns_lookup re-issue the identical query over TCP/53 (RFC 7766).
+    if (flags_hi & DNS_FLAG_TC) != 0:
+        printk1("[dns] truncated UDP answer qid=%d -> TCP/53 fallback\n",
+                cast[uint64](qid))
+        dns_slot_truncated[slot] = 1
         dns_slot_used[slot] = 2
         return
-    # Pull QDCOUNT / ANCOUNT. We expect QDCOUNT=1 (our question
-    # echoed back) and ANCOUNT >= 1 on success.
-    qd_hi: uint16 = cast[uint16](payload[4]) << 8
-    qd_lo: uint16 = cast[uint16](payload[5])
-    qdcount: uint16 = qd_hi | qd_lo
-    an_hi: uint16 = cast[uint16](payload[6]) << 8
-    an_lo: uint16 = cast[uint16](payload[7])
-    ancount: uint16 = an_hi | an_lo
-    if ancount == 0:
-        printk0("[dns] NXDOMAIN or empty answer\n")
-        # Mark the slot answered with a zero IP so the caller can
-        # distinguish "we got a response, name didn't resolve" from
-        # "we timed out". The slot_ip bytes are already zero from
-        # dns_init / the previous free, but be explicit.
-        b: uint64 = 0
-        while b < 4:
-            dns_slot_ip[slot * 4 + b] = 0
-            b = b + 1
-        dns_slot_used[slot] = 2
-        return
-    # Walk past the questions section. Each question is
-    # { QNAME (variable), QTYPE (2), QCLASS (2) }.
-    pos: uint64 = DNS_HDR_LEN
-    q: uint16 = 0
-    while q < qdcount:
-        new_pos: uint64 = _dns_skip_qname(payload, length, pos)
-        if new_pos == 0:
-            printk0("[dns] malformed question\n")
-            return
-        pos = new_pos + 4              # +QTYPE + QCLASS
-        if pos > length:
-            printk0("[dns] truncated question\n")
-            return
-        q = q + 1
-    # Walk the answers section. Each RR is { NAME (variable),
-    # TYPE (2), CLASS (2), TTL (4), RDLENGTH (2), RDATA (RDLENGTH) }.
-    a: uint16 = 0
-    while a < ancount:
-        name_end: uint64 = _dns_skip_qname(payload, length, pos)
-        if name_end == 0:
-            printk0("[dns] malformed RR name\n")
-            return
-        # Need 10 bytes of fixed RR header after the NAME.
-        if name_end + 10 > length:
-            printk0("[dns] truncated RR header\n")
-            return
-        type_hi: uint16 = cast[uint16](payload[name_end + 0]) << 8
-        type_lo: uint16 = cast[uint16](payload[name_end + 1])
-        rr_type: uint16 = type_hi | type_lo
-        class_hi: uint16 = cast[uint16](payload[name_end + 2]) << 8
-        class_lo: uint16 = cast[uint16](payload[name_end + 3])
-        rr_class: uint16 = class_hi | class_lo
-        # Skip TTL (4 bytes at name_end+4..+7), read RDLENGTH.
-        rdlen_hi: uint16 = cast[uint16](payload[name_end + 8]) << 8
-        rdlen_lo: uint16 = cast[uint16](payload[name_end + 9])
-        rdlength: uint16 = rdlen_hi | rdlen_lo
-        rdata_off: uint64 = name_end + 10
-        if rdata_off + cast[uint64](rdlength) > length:
-            printk0("[dns] truncated RDATA\n")
-            return
-        if rr_type == DNS_QTYPE_A:
-            if rr_class == DNS_QCLASS_IN:
-                if rdlength == 4:
-                    b0: uint8 = payload[rdata_off + 0]
-                    b1: uint8 = payload[rdata_off + 1]
-                    b2: uint8 = payload[rdata_off + 2]
-                    b3: uint8 = payload[rdata_off + 3]
-                    dns_slot_ip[slot * 4 + 0] = b0
-                    dns_slot_ip[slot * 4 + 1] = b1
-                    dns_slot_ip[slot * 4 + 2] = b2
-                    dns_slot_ip[slot * 4 + 3] = b3
-                    dns_slot_used[slot] = 2
-                    # TTL is a 32-bit big-endian unsigned at
-                    # name_end+4 .. name_end+7. Clamp to
-                    # [DNS_TTL_MIN, DNS_TTL_MAX] before stashing —
-                    # the floor stops cache thrashing on TTL=0
-                    # answers (some CDNs serve them as a courtesy);
-                    # the ceiling stops us from honoring multi-week
-                    # TTLs from misconfigured upstreams that would
-                    # outlive our actual IP-to-host mapping anyway.
-                    ttl_b0: uint64 = cast[uint64](payload[name_end + 4])
-                    ttl_b1: uint64 = cast[uint64](payload[name_end + 5])
-                    ttl_b2: uint64 = cast[uint64](payload[name_end + 6])
-                    ttl_b3: uint64 = cast[uint64](payload[name_end + 7])
-                    ttl_raw: uint64 = (ttl_b0 << 24) | (ttl_b1 << 16) | (ttl_b2 << 8) | ttl_b3
-                    ttl_eff: uint64 = ttl_raw
-                    if ttl_eff < DNS_TTL_MIN:
-                        ttl_eff = DNS_TTL_MIN
-                    if ttl_eff > DNS_TTL_MAX:
-                        ttl_eff = DNS_TTL_MAX
-                    _dns_cache_store(host_ptr, b0, b1, b2, b3,
-                                     ttl_eff, 0)
-                    printk1("[dns] resolved qid=%d -> ",
-                            cast[uint64](qid))
-                    _dns_print_ip(b0, b1, b2, b3)
-                    printk0("\n")
-                    return
-        # Not an A-record we want; advance past this RR and try the
-        # next one. SLIRP often returns CNAME chains so we have to
-        # walk past those before we find the final A-record.
-        pos = rdata_off + cast[uint64](rdlength)
-        if pos > length:
-            printk0("[dns] truncated answer section\n")
-            return
-        a = a + 1
-    # Walked the entire answer section without finding an A-record.
-    # Treat the same as NXDOMAIN — mark answered with zero IP so the
-    # caller doesn't sit on the slot until timeout.
-    printk0("[dns] no A-record in answer; treating as NXDOMAIN\n")
-    z: uint64 = 0
-    while z < 4:
-        dns_slot_ip[slot * 4 + z] = 0
-        z = z + 1
-    dns_slot_used[slot] = 2
+    _dns_parse_response(slot, payload, length)
 
 
-def dns_lookup(hostname: Ptr[uint8], out_ip: Ptr[uint8],
+def _dns_tcp_fallback(hostname: Ptr[uint8], slot: uint64,
+                      qid: uint16, qtype: uint16) -> int32:
+    # RFC 7766 TCP/53 fallback. The UDP answer was truncated (TC bit);
+    # re-issue the *identical* query — same qid, same QNAME, same
+    # QTYPE — over a TCP connection to the DNS server on port 53. TCP
+    # DNS frames every message with a 2-byte big-endian length prefix,
+    # both on the query and the response. On success the slot is left
+    # in the answered state with its result fields populated exactly
+    # as the UDP path would have. Returns 0 on success, -1 otherwise.
+    printk1("[dns] TCP/53 fallback for qid=%d\n", cast[uint64](qid))
+    # Rebuild the query message into dns_tx_buf (the buffer may have
+    # been reused by a sibling slot since the original send).
+    msg_len: uint64 = _dns_build_query(hostname, qid, qtype)
+    if msg_len == 0:
+        return -1
+    if msg_len + 2 > DNS_TCP_BYTES:
+        printk0("[dns] TCP query too big\n")
+        return -1
+    # Prepend the 2-byte big-endian message length.
+    dns_tcp_tx[0] = cast[uint8]((msg_len >> 8) & 0xFF)
+    dns_tcp_tx[1] = cast[uint8](msg_len & 0xFF)
+    i: uint64 = 0
+    while i < msg_len:
+        dns_tcp_tx[2 + i] = dns_tx_buf[i]
+        i = i + 1
+    # tcp_connect handles its own ARP priming for an on-link target.
+    tcp_slot: int32 = tcp_connect(dns_server_ip[0], dns_server_ip[1],
+                                  dns_server_ip[2], dns_server_ip[3],
+                                  UDP_PORT_DNS_SERVER, 300)
+    if tcp_slot < 0:
+        printk1("[dns] TCP connect to DNS server failed (%d)\n",
+                cast[uint64](tcp_slot))
+        return -1
+    sent: int64 = tcp_send(tcp_slot, cast[Ptr[uint8]](&dns_tcp_tx[0]),
+                           msg_len + 2)
+    if sent < 0:
+        printk0("[dns] TCP send failed\n")
+        tcp_close(tcp_slot)
+        return -1
+    # Read the response. The first 2 bytes are the message length;
+    # the message itself follows. A real DNS-over-TCP answer may
+    # straddle multiple TCP segments, so accumulate into dns_tcp_rx
+    # until we have the whole length-prefixed message.
+    total: uint64 = 0
+    expect: uint64 = 0                  # 0 = length prefix not seen yet
+    while True:
+        chunk: int64 = tcp_recv(tcp_slot,
+                                cast[Ptr[uint8]](&dns_tcp_rx[total]),
+                                DNS_TCP_BYTES - total, 300)
+        if chunk <= 0:
+            break
+        total = total + cast[uint64](chunk)
+        if expect == 0:
+            if total >= 2:
+                expect = (cast[uint64](dns_tcp_rx[0]) << 8) \
+                       | cast[uint64](dns_tcp_rx[1])
+        if expect != 0:
+            if total >= expect + 2:
+                break
+        if total >= DNS_TCP_BYTES:
+            break
+    tcp_close(tcp_slot)
+    if expect == 0:
+        printk0("[dns] TCP response too short\n")
+        return -1
+    if total < expect + 2:
+        printk0("[dns] TCP response incomplete\n")
+        return -1
+    # Hand the un-prefixed DNS message to the shared parser. dns_rx
+    # already flipped dns_slot_used to 2 + set dns_slot_truncated;
+    # _dns_parse_response re-marks it answered when it completes.
+    dns_slot_truncated[slot] = 0
+    _dns_parse_response(slot, cast[Ptr[uint8]](&dns_tcp_rx[2]), expect)
+    return 0
+
+
+def _dns_query(hostname: Ptr[uint8], qtype: uint16,
                timeout_jiffies: uint64) -> int32:
-    # Synchronous A-record lookup. Allocates a slot, sends the query,
-    # then polls virtio_net_poll() in a loop checking the slot's
-    # state until either it becomes "answered" (value 2) or
-    # timeout_jiffies elapses. Returns:
-    #   0 on success — out_ip[0..3] is populated.
-    #  -1 on timeout, missing DNS server, NXDOMAIN, or send failure.
-    # Cache lookup first — a hit skips the entire UDP/53 round-trip,
-    # the ARP-prime, even the DHCP-DNS-server refresh. This is the
-    # whole point of the cache: `apt update` resolves
-    # `deb.debian.org` once and reuses the answer for every subsequent
-    # Release / Packages / InRelease fetch in the same boot. The
-    # entry's `expires_jiffies` is already absolute (set at store
-    # time = now + ttl*HZ), so a single < comparison against
-    # get_jiffies() is enough to decide freshness.
-    cache_hit: int32 = _dns_cache_lookup(hostname)
-    if cache_hit >= 0:
-        idx: uint64 = cast[uint64](cache_hit)
-        if dns_cache_negative[idx] != 0:
-            printk1("[dns] cache hit %s NXDOMAIN", cast[uint64](hostname))
-            printk1(" (ttl=%ds remaining)\n", _dns_cache_remaining(idx))
-            return -1
-        ci0: uint8 = dns_cache_ip[idx * 4 + 0]
-        ci1: uint8 = dns_cache_ip[idx * 4 + 1]
-        ci2: uint8 = dns_cache_ip[idx * 4 + 2]
-        ci3: uint8 = dns_cache_ip[idx * 4 + 3]
-        out_ip[0] = ci0
-        out_ip[1] = ci1
-        out_ip[2] = ci2
-        out_ip[3] = ci3
-        printk1("[dns] cache hit %s -> ", cast[uint64](hostname))
-        _dns_print_ip(ci0, ci1, ci2, ci3)
-        printk1(" (ttl=%ds remaining)\n", _dns_cache_remaining(idx))
-        return 0
+    # Shared synchronous query core for every record type. Allocates a
+    # slot, sends a UDP/53 query of type `qtype`, polls virtio_net_poll
+    # until the slot is answered or the deadline elapses, and — if the
+    # UDP answer was truncated — transparently retries over TCP/53.
+    # Returns the slot index 0..3 on success (caller reads the slot's
+    # result fields), or -1 on timeout / send failure / missing
+    # server. The slot is left in the answered state (dns_slot_used 2)
+    # for the caller to drain; the caller must reset dns_slot_used to 0.
     if dns_server_set == 0:
         if dns_refresh_server() != 0:
             printk0("[dns] no DNS server (DHCP not complete?)\n")
@@ -779,12 +1134,11 @@ def dns_lookup(hostname: Ptr[uint8], out_ip: Ptr[uint8],
     # Prime the ARP cache for the DNS server. The SLIRP DNS forwarder
     # at 10.0.2.3 has its own MAC distinct from the gateway at
     # 10.0.2.2 — the ARP probe sent during init only learned the
-    # gateway, so the first dns_lookup needs its own ARP round-trip.
+    # gateway, so the first query needs its own ARP round-trip.
     if dns_server_arp_ok == 0:
         if _dns_prime_arp() != 0:
             printk0("[dns] ARP for DNS server timed out\n")
             return -1
-    # Allocate a slot + qid.
     slot_signed: int32 = _dns_alloc_slot()
     if slot_signed < 0:
         printk0("[dns] no free slot\n")
@@ -793,54 +1147,602 @@ def dns_lookup(hostname: Ptr[uint8], out_ip: Ptr[uint8],
     dns_next_qid = dns_next_qid + 1
     qid: uint16 = dns_next_qid
     # Mark in-flight + clear stale result bytes BEFORE sending so
-    # dns_rx can write into them without racing (we're single-thread
-    # but the polling loop also drains rx queues).
+    # dns_rx can write without racing the polling loop's rx drain.
     dns_slot_used[slot] = 1
     dns_slot_qid[slot] = qid
+    dns_slot_truncated[slot] = 0
+    dns_slot_acount[slot] = 0
     b: uint64 = 0
     while b < 4:
         dns_slot_ip[slot * 4 + b] = 0
         b = b + 1
-    printk2("[dns] querying slot=%d qid=%d\n",
-            slot, cast[uint64](qid))
-    rc: int32 = dns_send_query(hostname, slot, qid)
+    printk2("[dns] querying slot=%d qid=%d\n", slot, cast[uint64](qid))
+    rc: int32 = dns_send_query(hostname, slot, qid, qtype)
     if rc != 0:
         dns_slot_used[slot] = 0
         printk0("[dns] send failed\n")
         return -1
-    # Poll loop. We use get_jiffies for the wall-clock cutoff so
-    # `timeout_jiffies` units match the rest of the kernel (HZ=100,
-    # 1 jiffy = 10 ms). Inside each iteration we let virtio_net_poll
-    # service the RX ring; when a DNS reply arrives, udp_rx will
-    # eventually dispatch it to dns_rx, which flips dns_slot_used to
-    # 2. We exit either way.
+    # Poll loop — get_jiffies wall-clock cutoff, virtio_net_poll
+    # services the RX ring each iteration. udp_rx dispatches the
+    # reply to dns_rx, which flips dns_slot_used to 2.
     start: uint64 = get_jiffies()
     deadline: uint64 = start + timeout_jiffies
     while get_jiffies() < deadline:
         virtio_net_poll()
         if dns_slot_used[slot] == 2:
-            # Got a response. Distinguish success (non-zero IP)
-            # from NXDOMAIN (all zeros).
-            ip0: uint8 = dns_slot_ip[slot * 4 + 0]
-            ip1: uint8 = dns_slot_ip[slot * 4 + 1]
-            ip2: uint8 = dns_slot_ip[slot * 4 + 2]
-            ip3: uint8 = dns_slot_ip[slot * 4 + 3]
-            dns_slot_used[slot] = 0
-            zero: uint8 = ip0 | ip1 | ip2 | ip3
-            if zero == 0:
-                printk0("[dns] NXDOMAIN / empty answer\n")
-                return -1
-            out_ip[0] = ip0
-            out_ip[1] = ip1
-            out_ip[2] = ip2
-            out_ip[3] = ip3
-            return 0
-    # Timed out without an answer. Free the slot so the next caller
-    # can reuse it (a late response will land in
-    # _dns_find_slot_for_qid → -1 and be dropped harmlessly).
+            if dns_slot_truncated[slot] != 0:
+                # UDP answer was truncated — retry over TCP/53.
+                if _dns_tcp_fallback(hostname, slot, qid, qtype) != 0:
+                    dns_slot_used[slot] = 0
+                    return -1
+            return cast[int32](slot)
     dns_slot_used[slot] = 0
     printk0("[dns] timeout\n")
     return -1
+
+
+def dns_lookup(hostname: Ptr[uint8], out_ip: Ptr[uint8],
+               timeout_jiffies: uint64) -> int32:
+    # Synchronous A-record lookup. Returns 0 on success (out_ip[0..3]
+    # populated with an IPv4 address) or -1 on timeout / NXDOMAIN /
+    # missing DNS server / send failure.
+    #
+    # Multi-A round-robin: a real CDN answer carries several A-records.
+    # We parse them all (dns_rx -> dns_slot_aips) and rotate which one
+    # we hand back via dns_rr_cursor — so back-to-back lookups for the
+    # same name spread across the live front-ends and a single dead
+    # front-end doesn't wedge every caller. The result cache stores the
+    # full set, so a cache hit round-robins exactly the same way.
+    #
+    # Cache lookup first — a hit skips the UDP/53 round-trip, the
+    # ARP-prime, even the DHCP-DNS-server refresh. `apt update`
+    # resolves `deb.debian.org` once and reuses it for every Release /
+    # Packages / InRelease fetch in the same boot.
+    cache_hit: int32 = _dns_cache_lookup(hostname)
+    if cache_hit >= 0:
+        idx: uint64 = cast[uint64](cache_hit)
+        if dns_cache_negative[idx] != 0:
+            printk1("[dns] cache hit %s NXDOMAIN", cast[uint64](hostname))
+            printk1(" (ttl=%ds remaining)\n", _dns_cache_remaining(idx))
+            return -1
+        n: uint64 = cast[uint64](dns_cache_acount[idx])
+        if n == 0:
+            n = 1
+        pick: uint64 = dns_rr_cursor % n
+        dns_rr_cursor = dns_rr_cursor + 1
+        cbase: uint64 = idx * DNS_MAX_A * 4 + pick * 4
+        ci0: uint8 = dns_cache_ip[cbase + 0]
+        ci1: uint8 = dns_cache_ip[cbase + 1]
+        ci2: uint8 = dns_cache_ip[cbase + 2]
+        ci3: uint8 = dns_cache_ip[cbase + 3]
+        out_ip[0] = ci0
+        out_ip[1] = ci1
+        out_ip[2] = ci2
+        out_ip[3] = ci3
+        printk1("[dns] cache hit %s -> ", cast[uint64](hostname))
+        _dns_print_ip(ci0, ci1, ci2, ci3)
+        printk2(" (rec %d/%d", pick, n)
+        printk1(", ttl=%ds remaining)\n", _dns_cache_remaining(idx))
+        return 0
+    slot_signed: int32 = _dns_query(hostname, DNS_QTYPE_A, timeout_jiffies)
+    if slot_signed < 0:
+        return -1
+    slot: uint64 = cast[uint64](slot_signed)
+    acount: uint8 = dns_slot_acount[slot]
+    dns_slot_used[slot] = 0
+    if acount == 0:
+        printk0("[dns] NXDOMAIN / empty answer\n")
+        return -1
+    # Round-robin pick across the parsed A-record set.
+    n2: uint64 = cast[uint64](acount)
+    pick2: uint64 = dns_rr_cursor % n2
+    dns_rr_cursor = dns_rr_cursor + 1
+    abase: uint64 = slot * DNS_MAX_A * 4 + pick2 * 4
+    out_ip[0] = dns_slot_aips[abase + 0]
+    out_ip[1] = dns_slot_aips[abase + 1]
+    out_ip[2] = dns_slot_aips[abase + 2]
+    out_ip[3] = dns_slot_aips[abase + 3]
+    if n2 > 1:
+        printk2("[dns] multi-A: %d records, serving rec %d\n", n2, pick2)
+    return 0
+
+
+def dns_lookup_all(hostname: Ptr[uint8], out_ips: Ptr[uint8],
+                   max_records: uint64,
+                   timeout_jiffies: uint64) -> int32:
+    # Resolve `hostname` and copy EVERY parsed A-record into `out_ips`
+    # (a flat [rec*4 + byte] buffer with room for `max_records`).
+    # Returns the number of A-records written (>= 1 on success), or -1
+    # on failure. This is the API a connect-with-retry caller wants:
+    # try each address in turn so a dead CDN front-end is skipped
+    # instead of wedging the whole lookup.
+    cache_hit: int32 = _dns_cache_lookup(hostname)
+    if cache_hit >= 0:
+        idx: uint64 = cast[uint64](cache_hit)
+        if dns_cache_negative[idx] != 0:
+            return -1
+        n: uint64 = cast[uint64](dns_cache_acount[idx])
+        if n > max_records:
+            n = max_records
+        i: uint64 = 0
+        while i < n * 4:
+            out_ips[i] = dns_cache_ip[idx * DNS_MAX_A * 4 + i]
+            i = i + 1
+        return cast[int32](n)
+    slot_signed: int32 = _dns_query(hostname, DNS_QTYPE_A, timeout_jiffies)
+    if slot_signed < 0:
+        return -1
+    slot: uint64 = cast[uint64](slot_signed)
+    acount: uint8 = dns_slot_acount[slot]
+    n2: uint64 = cast[uint64](acount)
+    if n2 > max_records:
+        n2 = max_records
+    base: uint64 = slot * DNS_MAX_A * 4
+    j: uint64 = 0
+    while j < n2 * 4:
+        out_ips[j] = dns_slot_aips[base + j]
+        j = j + 1
+    dns_slot_used[slot] = 0
+    if acount == 0:
+        return -1
+    return cast[int32](n2)
+
+
+def _dns_ptr_octet(buf: Ptr[uint8], pos: uint64, v: uint8) -> uint64:
+    # Emit the decimal ASCII of `v` (0..255) into `buf` at `pos`,
+    # followed by a '.'. Returns the new position. Helper for the
+    # in-addr.arpa QNAME builder; no leading zeros.
+    p: uint64 = pos
+    if v >= 100:
+        buf[p] = 48 + (v / 100)
+        p = p + 1
+    if v >= 10:
+        buf[p] = 48 + ((v / 10) % 10)
+        p = p + 1
+    buf[p] = 48 + (v % 10)
+    p = p + 1
+    buf[p] = 46                          # '.'
+    p = p + 1
+    return p
+
+
+def dns_lookup_ptr(b0: uint8, b1: uint8, b2: uint8, b3: uint8,
+                   out_name: Ptr[uint8], out_max: uint64,
+                   timeout_jiffies: uint64) -> int32:
+    # Reverse lookup (PTR, type 12). Builds the in-addr.arpa QNAME for
+    # the IPv4 address b0.b1.b2.b3 — RFC 1035 §3.5: the octets are
+    # reversed, so 1.2.3.4 -> "4.3.2.1.in-addr.arpa" — then issues a
+    # PTR query. On success the decoded hostname is copied into
+    # out_name (NUL-terminated, capped at out_max-1) and 0 is
+    # returned; -1 on failure.
+    qname: Array[64, uint8]
+    p: uint64 = 0
+    p = _dns_ptr_octet(cast[Ptr[uint8]](&qname[0]), p, b3)
+    p = _dns_ptr_octet(cast[Ptr[uint8]](&qname[0]), p, b2)
+    p = _dns_ptr_octet(cast[Ptr[uint8]](&qname[0]), p, b1)
+    p = _dns_ptr_octet(cast[Ptr[uint8]](&qname[0]), p, b0)
+    # Append the literal "in-addr.arpa" suffix.
+    suffix: Ptr[uint8] = "in-addr.arpa"
+    s: uint64 = 0
+    while suffix[s] != 0:
+        qname[p] = suffix[s]
+        p = p + 1
+        s = s + 1
+    qname[p] = 0
+    slot_signed: int32 = _dns_query(cast[Ptr[uint8]](&qname[0]),
+                                    DNS_QTYPE_PTR, timeout_jiffies)
+    if slot_signed < 0:
+        return -1
+    slot: uint64 = cast[uint64](slot_signed)
+    rname: Ptr[uint8] = cast[Ptr[uint8]](&dns_slot_rname[slot * DNS_NAME_MAX])
+    dns_slot_used[slot] = 0
+    if rname[0] == 0:
+        return -1
+    i: uint64 = 0
+    while i < out_max - 1:
+        c: uint8 = rname[i]
+        out_name[i] = c
+        if c == 0:
+            return 0
+        i = i + 1
+    out_name[out_max - 1] = 0
+    return 0
+
+
+def dns_lookup_mx(hostname: Ptr[uint8], out_exchange: Ptr[uint8],
+                  out_max: uint64, out_pref: Ptr[uint16],
+                  timeout_jiffies: uint64) -> int32:
+    # MX lookup (type 15). On success copies the mail-exchange domain
+    # name into out_exchange (NUL-terminated, capped at out_max-1) and
+    # writes the 16-bit preference through out_pref; returns 0. -1 on
+    # failure. Note: a real domain may have several MX records; this
+    # returns the FIRST one in the answer (callers wanting lowest-
+    # preference selection would iterate — left as a future item).
+    slot_signed: int32 = _dns_query(hostname, DNS_QTYPE_MX,
+                                    timeout_jiffies)
+    if slot_signed < 0:
+        return -1
+    slot: uint64 = cast[uint64](slot_signed)
+    rname: Ptr[uint8] = cast[Ptr[uint8]](&dns_slot_rname[slot * DNS_NAME_MAX])
+    pref: uint16 = dns_slot_aux0[slot]
+    dns_slot_used[slot] = 0
+    if rname[0] == 0:
+        return -1
+    out_pref[0] = pref
+    i: uint64 = 0
+    while i < out_max - 1:
+        c: uint8 = rname[i]
+        out_exchange[i] = c
+        if c == 0:
+            return 0
+        i = i + 1
+    out_exchange[out_max - 1] = 0
+    return 0
+
+
+def dns_lookup_srv(service: Ptr[uint8], out_target: Ptr[uint8],
+                   out_max: uint64, out_prio: Ptr[uint16],
+                   out_weight: Ptr[uint16], out_port: Ptr[uint16],
+                   timeout_jiffies: uint64) -> int32:
+    # SRV lookup (type 33, RFC 2782). `service` is the full SRV name,
+    # e.g. "_sip._tcp.example.com". On success copies the target host
+    # into out_target and writes priority / weight / port through the
+    # respective out pointers; returns 0. -1 on failure. Returns the
+    # FIRST SRV record in the answer.
+    slot_signed: int32 = _dns_query(service, DNS_QTYPE_SRV,
+                                    timeout_jiffies)
+    if slot_signed < 0:
+        return -1
+    slot: uint64 = cast[uint64](slot_signed)
+    rname: Ptr[uint8] = cast[Ptr[uint8]](&dns_slot_rname[slot * DNS_NAME_MAX])
+    prio: uint16 = dns_slot_aux0[slot]
+    weight: uint16 = dns_slot_aux1[slot]
+    port: uint16 = dns_slot_aux2[slot]
+    dns_slot_used[slot] = 0
+    if rname[0] == 0:
+        return -1
+    out_prio[0] = prio
+    out_weight[0] = weight
+    out_port[0] = port
+    i: uint64 = 0
+    while i < out_max - 1:
+        c: uint8 = rname[i]
+        out_target[i] = c
+        if c == 0:
+            return 0
+        i = i + 1
+    out_target[out_max - 1] = 0
+    return 0
+
+
+# --- Offline self-test (kernel roadmap §11) ------------------------
+#
+# dns_selftest builds DNS response packets in memory and runs them
+# through the real _dns_parse_response codec, asserting the parsed
+# results. This proves the multi-A / PTR / MX / SRV parsing — and the
+# shared compression-pointer name codec — WITHOUT needing real
+# internet, so it's deterministic in CI. Each sub-test prints a
+# `[dns-selftest] <name> PASS` / `... FAIL` line; the harness greps
+# for those.
+
+dns_st_buf:       Array[512, uint8]          # scratch DNS message
+dns_st_fail:      int32 = 0                  # cumulative failure count
+
+
+def _dns_st_eq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    # NUL-terminated string equality, capped. 1 = equal, 0 = not.
+    i: uint64 = 0
+    while i < 256:
+        ca: uint8 = a[i]
+        cb: uint8 = b[i]
+        if ca != cb:
+            return 0
+        if ca == 0:
+            return 1
+        i = i + 1
+    return 0
+
+
+def _dns_st_check(name: Ptr[uint8], ok: int32):
+    if ok != 0:
+        printk1("[dns-selftest] %s PASS\n", cast[uint64](name))
+    else:
+        printk1("[dns-selftest] %s FAIL\n", cast[uint64](name))
+        dns_st_fail = dns_st_fail + 1
+
+
+def _dns_st_put16(off: uint64, v: uint16):
+    # Write a big-endian uint16 into dns_st_buf at `off`.
+    dns_st_buf[off] = cast[uint8]((cast[uint32](v) >> 8) & 0xFF)
+    dns_st_buf[off + 1] = cast[uint8](cast[uint32](v) & 0xFF)
+
+
+def _dns_st_hdr(qid: uint16, ancount: uint16):
+    # Lay down a 12-byte response header: QR=1, RD=1, RCODE=0,
+    # QDCOUNT=1, ANCOUNT=ancount, NSCOUNT=ARCOUNT=0.
+    _dns_st_put16(0, qid)
+    dns_st_buf[2] = 0x81                 # QR=1, RD=1
+    dns_st_buf[3] = 0x80                 # RA=1, RCODE=0
+    _dns_st_put16(4, 1)                  # QDCOUNT
+    _dns_st_put16(6, ancount)            # ANCOUNT
+    _dns_st_put16(8, 0)                  # NSCOUNT
+    _dns_st_put16(10, 0)                 # ARCOUNT
+
+
+def _dns_st_qname(off: uint64, host: Ptr[uint8]) -> uint64:
+    # Encode `host` as length-prefixed labels into dns_st_buf at `off`;
+    # returns the offset past the root terminator. Mirrors
+    # _dns_encode_qname but targets the self-test buffer.
+    pos: uint64 = off
+    lp: uint64 = pos
+    dns_st_buf[lp] = 0
+    pos = pos + 1
+    lb: uint8 = 0
+    i: uint64 = 0
+    while host[i] != 0:
+        c: uint8 = host[i]
+        if c == 46:
+            dns_st_buf[lp] = lb
+            lp = pos
+            dns_st_buf[lp] = 0
+            pos = pos + 1
+            lb = 0
+        else:
+            dns_st_buf[pos] = c
+            pos = pos + 1
+            lb = lb + 1
+        i = i + 1
+    dns_st_buf[lp] = lb
+    dns_st_buf[pos] = 0
+    pos = pos + 1
+    return pos
+
+
+def dns_selftest():
+    # Offline proof of the §11 record-type parsing. Reserves DNS slot
+    # 3 (the smoke test only ever uses slot 0..1 concurrently) and
+    # drives _dns_parse_response with hand-built response packets.
+    printk0("[dns-selftest] begin (multi-A / PTR / MX / SRV)\n")
+    dns_st_fail = 0
+    slot: uint64 = 3
+
+    # === Test 1: multi-A answer (3 load-balanced A-records) ========
+    # Question for "cdn.example.com", then 3 A-records pointing at
+    # 192.0.2.10 / .11 / .12 — the classic CDN round-robin set.
+    host1: Ptr[uint8] = "cdn.example.com"
+    _dns_st_hdr(0x1234, 3)
+    qend: uint64 = _dns_st_qname(DNS_HDR_LEN, host1)
+    _dns_st_put16(qend, DNS_QTYPE_A)             # QTYPE
+    _dns_st_put16(qend + 2, DNS_QCLASS_IN)       # QCLASS
+    p: uint64 = qend + 4
+    # 3 A-records, each: NAME(ptr 0x0C) TYPE CLASS TTL RDLEN RDATA.
+    aoct: uint64 = 10
+    ai: uint64 = 0
+    while ai < 3:
+        dns_st_buf[p + 0] = 0xC0                 # compression pointer
+        dns_st_buf[p + 1] = cast[uint8](DNS_HDR_LEN)  # -> the question
+        _dns_st_put16(p + 2, DNS_QTYPE_A)
+        _dns_st_put16(p + 4, DNS_QCLASS_IN)
+        dns_st_buf[p + 6] = 0                    # TTL = 300 (be32)
+        dns_st_buf[p + 7] = 0
+        dns_st_buf[p + 8] = 1
+        dns_st_buf[p + 9] = 0x2C
+        _dns_st_put16(p + 10, 4)                 # RDLENGTH
+        dns_st_buf[p + 12] = 192
+        dns_st_buf[p + 13] = 0
+        dns_st_buf[p + 14] = 2
+        dns_st_buf[p + 15] = cast[uint8](aoct)
+        p = p + 16
+        aoct = aoct + 1
+        ai = ai + 1
+    # Drive the parser. Set up the slot exactly as _dns_query would.
+    dns_slot_used[slot] = 1
+    dns_slot_qtype[slot] = DNS_QTYPE_A
+    dns_slot_acount[slot] = 0
+    host1_dst: Ptr[uint8] = cast[Ptr[uint8]](&dns_slot_host[slot * DNS_HOSTNAME_MAX])
+    _dns_host_copy(host1_dst, host1)
+    _dns_parse_response(slot, cast[Ptr[uint8]](&dns_st_buf[0]), p)
+    multi_ok: int32 = 0
+    if dns_slot_acount[slot] == 3:
+        ab: uint64 = slot * DNS_MAX_A * 4
+        c0: int32 = 0
+        if dns_slot_aips[ab + 0] == 192:
+            if dns_slot_aips[ab + 3] == 10:
+                c0 = 1
+        c1: int32 = 0
+        if dns_slot_aips[ab + 4 + 3] == 11:
+            c1 = 1
+        c2: int32 = 0
+        if dns_slot_aips[ab + 8 + 3] == 12:
+            c2 = 1
+        if c0 != 0:
+            if c1 != 0:
+                if c2 != 0:
+                    multi_ok = 1
+    _dns_st_check("multi-A", multi_ok)
+
+    # === Test 2: PTR answer ========================================
+    # Reverse query "4.2.0.192.in-addr.arpa" answered with a PTR
+    # record pointing at "host.example.com".
+    ptr_q: Ptr[uint8] = "4.2.0.192.in-addr.arpa"
+    ptr_target: Ptr[uint8] = "host.example.com"
+    _dns_st_hdr(0x2222, 1)
+    qend2: uint64 = _dns_st_qname(DNS_HDR_LEN, ptr_q)
+    _dns_st_put16(qend2, DNS_QTYPE_PTR)
+    _dns_st_put16(qend2 + 2, DNS_QCLASS_IN)
+    p2: uint64 = qend2 + 4
+    dns_st_buf[p2 + 0] = 0xC0
+    dns_st_buf[p2 + 1] = cast[uint8](DNS_HDR_LEN)
+    _dns_st_put16(p2 + 2, DNS_QTYPE_PTR)
+    _dns_st_put16(p2 + 4, DNS_QCLASS_IN)
+    dns_st_buf[p2 + 6] = 0
+    dns_st_buf[p2 + 7] = 0
+    dns_st_buf[p2 + 8] = 1
+    dns_st_buf[p2 + 9] = 0x2C
+    # RDATA = the target name, encoded inline (no pointer).
+    rd_start2: uint64 = p2 + 12
+    rd_end2: uint64 = _dns_st_qname(rd_start2, ptr_target)
+    _dns_st_put16(p2 + 10, cast[uint16](rd_end2 - rd_start2))
+    dns_slot_used[slot] = 1
+    dns_slot_qtype[slot] = DNS_QTYPE_PTR
+    _dns_parse_response(slot, cast[Ptr[uint8]](&dns_st_buf[0]), rd_end2)
+    rname: Ptr[uint8] = cast[Ptr[uint8]](&dns_slot_rname[slot * DNS_NAME_MAX])
+    _dns_st_check("PTR", _dns_st_eq(rname, ptr_target))
+
+    # === Test 3: MX answer (with a compression pointer) ============
+    # Query "example.com" answered with an MX record: preference 10,
+    # exchange "mail" + a compression pointer back to "example.com" in
+    # the question — exercises _dns_read_name's pointer-follow path.
+    mx_host: Ptr[uint8] = "example.com"
+    _dns_st_hdr(0x3333, 1)
+    qend3: uint64 = _dns_st_qname(DNS_HDR_LEN, mx_host)
+    _dns_st_put16(qend3, DNS_QTYPE_MX)
+    _dns_st_put16(qend3 + 2, DNS_QCLASS_IN)
+    p3: uint64 = qend3 + 4
+    dns_st_buf[p3 + 0] = 0xC0
+    dns_st_buf[p3 + 1] = cast[uint8](DNS_HDR_LEN)
+    _dns_st_put16(p3 + 2, DNS_QTYPE_MX)
+    _dns_st_put16(p3 + 4, DNS_QCLASS_IN)
+    dns_st_buf[p3 + 6] = 0
+    dns_st_buf[p3 + 7] = 0
+    dns_st_buf[p3 + 8] = 1
+    dns_st_buf[p3 + 9] = 0x2C
+    # RDATA: preference(2) + exchange name. Exchange = label "mail"
+    # then a 0xC0 pointer back to "example.com" at DNS_HDR_LEN.
+    rd_start3: uint64 = p3 + 12
+    _dns_st_put16(rd_start3, 10)                 # preference
+    dns_st_buf[rd_start3 + 2] = 4                # label length
+    dns_st_buf[rd_start3 + 3] = 109              # 'm'
+    dns_st_buf[rd_start3 + 4] = 97               # 'a'
+    dns_st_buf[rd_start3 + 5] = 105              # 'i'
+    dns_st_buf[rd_start3 + 6] = 108              # 'l'
+    dns_st_buf[rd_start3 + 7] = 0xC0             # compression pointer
+    dns_st_buf[rd_start3 + 8] = cast[uint8](DNS_HDR_LEN)
+    rd_end3: uint64 = rd_start3 + 9
+    _dns_st_put16(p3 + 10, cast[uint16](rd_end3 - rd_start3))
+    dns_slot_used[slot] = 1
+    dns_slot_qtype[slot] = DNS_QTYPE_MX
+    _dns_parse_response(slot, cast[Ptr[uint8]](&dns_st_buf[0]), rd_end3)
+    mx_ok: int32 = 0
+    if dns_slot_aux0[slot] == 10:
+        if _dns_st_eq(rname, "mail.example.com") != 0:
+            mx_ok = 1
+    _dns_st_check("MX", mx_ok)
+
+    # === Test 4: SRV answer ========================================
+    # Query "_sip._tcp.example.com" answered with an SRV record:
+    # priority 5, weight 20, port 5060, target "sipserver.example.com".
+    srv_q: Ptr[uint8] = "_sip._tcp.example.com"
+    srv_target: Ptr[uint8] = "sipserver.example.com"
+    _dns_st_hdr(0x4444, 1)
+    qend4: uint64 = _dns_st_qname(DNS_HDR_LEN, srv_q)
+    _dns_st_put16(qend4, DNS_QTYPE_SRV)
+    _dns_st_put16(qend4 + 2, DNS_QCLASS_IN)
+    p4: uint64 = qend4 + 4
+    dns_st_buf[p4 + 0] = 0xC0
+    dns_st_buf[p4 + 1] = cast[uint8](DNS_HDR_LEN)
+    _dns_st_put16(p4 + 2, DNS_QTYPE_SRV)
+    _dns_st_put16(p4 + 4, DNS_QCLASS_IN)
+    dns_st_buf[p4 + 6] = 0
+    dns_st_buf[p4 + 7] = 0
+    dns_st_buf[p4 + 8] = 1
+    dns_st_buf[p4 + 9] = 0x2C
+    rd_start4: uint64 = p4 + 12
+    _dns_st_put16(rd_start4 + 0, 5)              # priority
+    _dns_st_put16(rd_start4 + 2, 20)             # weight
+    _dns_st_put16(rd_start4 + 4, 5060)           # port
+    rd_tname_end: uint64 = _dns_st_qname(rd_start4 + 6, srv_target)
+    _dns_st_put16(p4 + 10, cast[uint16](rd_tname_end - rd_start4))
+    dns_slot_used[slot] = 1
+    dns_slot_qtype[slot] = DNS_QTYPE_SRV
+    _dns_parse_response(slot, cast[Ptr[uint8]](&dns_st_buf[0]), rd_tname_end)
+    srv_ok: int32 = 0
+    if dns_slot_aux0[slot] == 5:
+        if dns_slot_aux1[slot] == 20:
+            if dns_slot_aux2[slot] == 5060:
+                if _dns_st_eq(rname, srv_target) != 0:
+                    srv_ok = 1
+    _dns_st_check("SRV", srv_ok)
+
+    # === Test 5: truncated-UDP detection ===========================
+    # Build a header with the TC bit set and feed it through the full
+    # dns_rx path (qid must match an in-flight slot). dns_rx should
+    # flag dns_slot_truncated rather than parse the partial answer.
+    dns_slot_used[slot] = 1
+    dns_slot_qid[slot] = 0x5555
+    dns_slot_qtype[slot] = DNS_QTYPE_A
+    dns_slot_truncated[slot] = 0
+    _dns_st_hdr(0x5555, 0)
+    dns_st_buf[2] = 0x81 | DNS_FLAG_TC           # QR=1, RD=1, TC=1
+    dns_rx(cast[Ptr[uint8]](&dns_st_buf[0]), DNS_HDR_LEN, 0, 0, 0, 0)
+    _dns_st_check("TC-bit", dns_slot_truncated[slot])
+
+    # === Test 6: TCP/53 length-prefix framing ======================
+    # The TCP fallback frames every message with a 2-byte big-endian
+    # length prefix. Build a 2-A-record answer for "tcp.example.com",
+    # prepend the prefix into dns_tcp_rx exactly as a DNS-over-TCP
+    # peer would, then verify the prefix-strip math: read the length
+    # from bytes [0..1] and parse the message at offset 2. This proves
+    # the framing _dns_tcp_fallback relies on without needing a live
+    # TCP/53 server (SLIRP's forwarder is UDP-only).
+    tcp_host: Ptr[uint8] = "tcp.example.com"
+    _dns_st_hdr(0x6666, 2)
+    qend6: uint64 = _dns_st_qname(DNS_HDR_LEN, tcp_host)
+    _dns_st_put16(qend6, DNS_QTYPE_A)
+    _dns_st_put16(qend6 + 2, DNS_QCLASS_IN)
+    p6: uint64 = qend6 + 4
+    toct: uint64 = 50
+    ti: uint64 = 0
+    while ti < 2:
+        dns_st_buf[p6 + 0] = 0xC0
+        dns_st_buf[p6 + 1] = cast[uint8](DNS_HDR_LEN)
+        _dns_st_put16(p6 + 2, DNS_QTYPE_A)
+        _dns_st_put16(p6 + 4, DNS_QCLASS_IN)
+        dns_st_buf[p6 + 6] = 0
+        dns_st_buf[p6 + 7] = 0
+        dns_st_buf[p6 + 8] = 1
+        dns_st_buf[p6 + 9] = 0x2C
+        _dns_st_put16(p6 + 10, 4)
+        dns_st_buf[p6 + 12] = 198
+        dns_st_buf[p6 + 13] = 51
+        dns_st_buf[p6 + 14] = 100
+        dns_st_buf[p6 + 15] = cast[uint8](toct)
+        p6 = p6 + 16
+        toct = toct + 1
+        ti = ti + 1
+    # Frame it: [len_hi, len_lo, <message>] into dns_tcp_rx.
+    dns_tcp_rx[0] = cast[uint8]((p6 >> 8) & 0xFF)
+    dns_tcp_rx[1] = cast[uint8](p6 & 0xFF)
+    cf: uint64 = 0
+    while cf < p6:
+        dns_tcp_rx[2 + cf] = dns_st_buf[cf]
+        cf = cf + 1
+    # Strip the prefix exactly as _dns_tcp_fallback does and parse.
+    exp_len: uint64 = (cast[uint64](dns_tcp_rx[0]) << 8) \
+                    | cast[uint64](dns_tcp_rx[1])
+    dns_slot_used[slot] = 1
+    dns_slot_qtype[slot] = DNS_QTYPE_A
+    dns_slot_acount[slot] = 0
+    tcp_host_dst: Ptr[uint8] = cast[Ptr[uint8]](&dns_slot_host[slot * DNS_HOSTNAME_MAX])
+    _dns_host_copy(tcp_host_dst, tcp_host)
+    tcp_frame_ok: int32 = 0
+    if exp_len == p6:
+        _dns_parse_response(slot, cast[Ptr[uint8]](&dns_tcp_rx[2]), exp_len)
+        if dns_slot_acount[slot] == 2:
+            tb: uint64 = slot * DNS_MAX_A * 4
+            if dns_slot_aips[tb + 3] == 50:
+                if dns_slot_aips[tb + 4 + 3] == 51:
+                    tcp_frame_ok = 1
+    _dns_st_check("TCP-frame", tcp_frame_ok)
+
+    # Release the self-test slot.
+    dns_slot_used[slot] = 0
+    dns_slot_truncated[slot] = 0
+    if dns_st_fail == 0:
+        printk0("[dns-selftest] ALL PASS\n")
+    else:
+        printk1("[dns-selftest] %d FAILURE(S)\n",
+                cast[uint64](dns_st_fail))
 
 
 # Note: udp_rx (in drivers/net/udp.ad) dispatches to dns_rx for
