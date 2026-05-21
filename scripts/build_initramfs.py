@@ -197,6 +197,42 @@ if _TLS_CA_DER_PATH:
         raise SystemExit(
             f"TLS_CA_DER={_TLS_CA_DER_PATH}: unreadable ({_e})")
 
+# apt chain-of-trust anchor: the userland `apt` (user/apt.ad) verifies
+# the OpenPGP signature on a repository's `InRelease` against a baked
+# archive signing key at /etc/apt-trusted.gpg. The blob is the raw
+# bytes of `gpg --export <archive-key>` — one v4 RSA Public-Key packet,
+# parsed by lib/pgp/pgp.ad. scripts/test_apt_inrelease.sh generates a
+# throwaway test key, signs its fixture `Release`, and points
+# APT_TRUSTED_GPG at the exported public key so apt can authenticate
+# the fixture without trusting any real-world Debian key. Off-default:
+# an unset env var leaves the initramfs alone, exactly like the other
+# gated markers above.
+_APT_TRUSTED_GPG = os.environ.get("APT_TRUSTED_GPG", "")
+if _APT_TRUSTED_GPG:
+    try:
+        with open(_APT_TRUSTED_GPG, "rb") as _f:
+            FILES.append(("/etc/apt-trusted.gpg", _f.read()))
+    except OSError as _e:
+        raise SystemExit(
+            f"APT_TRUSTED_GPG={_APT_TRUSTED_GPG}: unreadable ({_e})")
+else:
+    # No test/override key supplied: bake the production Debian
+    # archive keyring if the host has the `debian-archive-keyring`
+    # package installed. apt then authenticates a real Debian mirror
+    # out of the box. Absent it, apt simply has no anchor and reports
+    # the repository as UNAUTHENTICATED (fail-loud, never fail-open).
+    for _dak in (
+        "/usr/share/keyrings/debian-archive-keyring.gpg",
+        "/etc/apt/trusted.gpg.d/debian-archive-keyring.gpg",
+    ):
+        if os.path.exists(_dak):
+            try:
+                with open(_dak, "rb") as _f:
+                    FILES.append(("/etc/apt-trusted.gpg", _f.read()))
+            except OSError:
+                pass
+            break
+
 # See INIT_ELF handling inside build_archive(): set INIT_ELF=path to
 # override which on-disk file becomes /init in the cpio archive, e.g.
 # to swap in a Hamnix-compiled user binary without touching user/init.S.

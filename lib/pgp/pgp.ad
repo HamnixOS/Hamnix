@@ -1,0 +1,730 @@
+# lib/pgp/pgp.ad
+#
+# Minimal OpenPGP (RFC 4880) signature verification for Hamnix's
+# userland `apt`. The single job of this module: take a Debian-style
+# clearsigned `InRelease` file plus a trusted OpenPGP public key
+# (`apt`'s baked keyring) and answer one question — was this `Release`
+# content really signed by the key we trust?
+#
+# WHAT IS / ISN'T HERE
+#
+#   IN SCOPE
+#     - OpenPGP packet framing: old-format and new-format CTBs, the
+#       1/2/4-byte (and new-format 5-byte) body-length encodings
+#       (RFC 4880 §4.2).
+#     - Tag 6 Public-Key packet: v4 RSA — recover the (n, e) MPIs.
+#     - Tag 2 Signature packet: v4 — the one-pass-signature class
+#       0x01 ("canonical text document") that `gpg --clearsign`
+#       emits, its hashed-subpacket region, and the trailing RSA
+#       signature MPI (RFC 4880 §5.2.3).
+#     - Cleartext-signature framework (RFC 4880 §7): splitting an
+#       `InRelease` into its cleartext body + ASCII-armored signature,
+#       dash-unescaping, and the cleartext-to-hashed-text
+#       canonicalisation (trailing-whitespace strip, CRLF line ends,
+#       no trailing line separator).
+#     - Radix-64 (base64) de-armor of the signature block, including
+#       the trailing `=CRC` checksum line which we simply discard.
+#     - Assembling the v4 signed-data digest input: the canonicalised
+#       cleartext, then the signature packet's hashed section, then
+#       the v4 trailer `04 FF <uint32 hashed-len>` (RFC 4880 §5.2.4).
+#
+#   OUT OF SCOPE (deliberately — Debian archive keys don't need them)
+#     - DSA / ECDSA / EdDSA / ElGamal signatures. Debian's
+#       ftp-master archive keys are RSA-4096; `apt` only ever sees
+#       RSA here. A non-RSA algorithm id is reported as a parse
+#       failure, never silently accepted.
+#     - SHA-1 / MD5 digests in signatures (refused — weak).
+#       SHA-256/384/512 are accepted; the digest itself is computed
+#       by the caller (apt) which owns the SHA implementation.
+#     - Subkey binding-signature validation. The baked keyring is the
+#       primary signing key directly; we parse the first Public-Key
+#       packet and use it as the trust anchor.
+#     - Detached `Release` + `Release.gpg`. apt fetches the inline
+#       `InRelease`, which is one HTTP GET and self-contained.
+#
+# HOW apt USES IT
+#
+#   1. pgp_keyring_load(keyring_bytes)        -> recover trusted (n,e)
+#   2. pgp_inrelease_split(inrelease_bytes)   -> cleartext span +
+#                                                signature-armor span
+#   3. pgp_dearmor(armor_span)                -> raw signature packet
+#   4. pgp_sig_parse(raw_sig_packet)          -> hash alg, hashed
+#                                                section span, RSA
+#                                                signature-MPI span
+#   5. pgp_build_signed_data(cleartext)       -> the exact byte string
+#                                                the digest is taken
+#                                                over (canon || hashed
+#                                                section || v4 trailer)
+#   6. apt then SHA-256s that byte string and calls
+#      rsa_pkcs1_v1_5_verify with the keyring's (n,e).
+#
+# This module does NOT do the RSA math or the SHA itself — it reuses
+# lib/rsa/rsa.ad + that module's SHA-256 through apt. Keeping the
+# crypto primitives in one place was an explicit constraint.
+#
+# CONST-TIME: not a goal. Every value here (a public key, a public
+# signature, public repo metadata) is non-secret; short-circuit
+# comparisons are fine.
+
+
+# -- module-scope scratch ----------------------------------------------
+#
+# Big buffers live at module scope, never in a function frame — the
+# Adder x86_64 backend's nested-frame Array spill quirk
+# (memory/feedback_compiler_quirks.md U9) makes a large function-local
+# Array unsafe. apt sizes its HTTP buffer at 256 KiB; a Debian
+# `Release` is a few KiB to a few hundred KiB, so 256 KiB covers the
+# canonicalised-cleartext + hashed-section + trailer assembly.
+
+PGP_SIGNED_DATA_CAP: uint64 = 262144
+
+# The fully assembled v4 signed-data byte string (what the digest is
+# taken over). apt reads this back after pgp_build_signed_data().
+pgp_signed_data: Array[262144, uint8]
+pgp_signed_data_len: uint64 = 0
+
+# De-armored raw signature packet bytes (one OpenPGP packet, header +
+# body). A v4 RSA-4096 signature packet is ~570 bytes; 4 KiB is ample.
+pgp_sig_packet: Array[4096, uint8]
+pgp_sig_packet_len: uint64 = 0
+
+
+# -- parsed trust-anchor key -------------------------------------------
+#
+# The RSA modulus + exponent recovered from the baked keyring's
+# Public-Key packet, as raw big-endian byte strings. apt feeds these
+# straight into rsa_parse-style consumption (it builds an RsaPubkey
+# from mod_bytes_be / exp_bytes_be).
+
+class PgpPubkey:
+    mod_be:  Array[520, uint8]   # RSA modulus, big-endian (<= 4096 bit)
+    mod_len: uint64
+    exp_be:  Array[8, uint8]     # RSA public exponent, big-endian
+    exp_len: uint64
+    valid:   int32               # 1 once pgp_keyring_load succeeded
+
+
+# -- parsed signature packet -------------------------------------------
+#
+# pgp_sig_parse fills this in. The hashed-section span and the RSA
+# signature MPI span are offsets into pgp_sig_packet.
+
+class PgpSig:
+    version:        uint8
+    sig_type:       uint8        # 0x01 == canonical text document
+    pub_alg:        uint8        # 1 == RSA
+    hash_alg:       uint8        # 8 SHA-256, 9 SHA-384, 10 SHA-512
+    hashed_off:     uint64       # offset of the v4 hashed section
+    hashed_len:     uint64       # length of the v4 hashed section
+    sig_mpi_off:    uint64       # offset of the RSA signature value
+    sig_mpi_len:    uint64       # length (bytes) of the signature value
+    valid:          int32
+
+
+# -- helpers -----------------------------------------------------------
+
+def _pgp_memcmp(a: Ptr[uint8], b: Ptr[uint8], n: uint64) -> int32:
+    i: uint64 = 0
+    while i < n:
+        if a[i] != b[i]:
+            return 1
+        i = i + 1
+    return 0
+
+
+# Does buf[off..] begin with the NUL-terminated literal `lit`?
+# Returns the literal length on a match, 0 otherwise.
+
+def _pgp_starts_with(buf: Ptr[uint8], off: uint64, buf_len: uint64,
+                     lit: Ptr[uint8]) -> uint64:
+    i: uint64 = 0
+    while lit[i] != 0:
+        if off + i >= buf_len:
+            return 0
+        if buf[off + i] != lit[i]:
+            return 0
+        i = i + 1
+    return i
+
+
+# -- radix-64 (base64) decode — RFC 4880 §6.1 --------------------------
+#
+# Decode the ASCII-armored signature block body. The input is the
+# armor between the `-----BEGIN PGP SIGNATURE-----` header (and its
+# trailing blank line) and the `-----END PGP SIGNATURE-----` footer.
+# A trailing `=CRC24` checksum line is present; we stop at the first
+# `=` that begins a line (radix-64 padding `=` only ever appears at
+# the very end of the data, so a line-leading `=` is unambiguously
+# the CRC line).
+#
+# Returns the number of decoded bytes, or -1 on a malformed alphabet
+# character.
+
+def _pgp_b64_val(c: uint8) -> int32:
+    # 'A'..'Z' -> 0..25
+    if c >= 65 and c <= 90:
+        return cast[int32](c - 65)
+    # 'a'..'z' -> 26..51
+    if c >= 97 and c <= 122:
+        return cast[int32](c - 97) + 26
+    # '0'..'9' -> 52..61
+    if c >= 48 and c <= 57:
+        return cast[int32](c - 48) + 52
+    if c == 43:                  # '+'
+        return 62
+    if c == 47:                  # '/'
+        return 63
+    return -1
+
+
+def pgp_dearmor(armor: Ptr[uint8], armor_off: uint64,
+                armor_end: uint64,
+                out: Ptr[uint8], out_cap: uint64) -> int64:
+    # Walk lines. Skip whitespace-only and header lines; decode
+    # radix-64 data lines; stop at the CRC line (line begins '=') or
+    # the END footer.
+    acc: uint32 = 0
+    nbits: uint32 = 0
+    written: uint64 = 0
+    pos: uint64 = armor_off
+
+    while pos < armor_end:
+        # Slice the current line [pos, line_end).
+        line_start: uint64 = pos
+        line_end: uint64 = pos
+        while line_end < armor_end and armor[line_end] != 10:
+            line_end = line_end + 1
+
+        # Trim a trailing CR.
+        trimmed_end: uint64 = line_end
+        if trimmed_end > line_start and armor[trimmed_end - 1] == 13:
+            trimmed_end = trimmed_end - 1
+
+        # Advance `pos` past the newline for the next iteration.
+        pos = line_end
+        if pos < armor_end:
+            pos = pos + 1
+
+        # Empty line — armor header/body separator, skip.
+        if trimmed_end == line_start:
+            continue
+        first: uint8 = armor[line_start]
+        # CRC line ("=....") — radix-64 data never starts a line with
+        # '='; this is the end of the payload.
+        if first == 61:                              # '='
+            break
+        # An armor header / footer line ("-----...").
+        if first == 45:                              # '-'
+            # The END footer terminates the block.
+            if _pgp_starts_with(armor, line_start, armor_end,
+                                "-----END") != 0:
+                break
+            continue
+        # An "Armor Header" key:value line ("Version: ...", "Hash:
+        # ...") may appear before the blank separator. radix-64 data
+        # never contains ':' — a colon means this is a header line.
+        is_header: int32 = 0
+        scan: uint64 = line_start
+        while scan < trimmed_end:
+            if armor[scan] == 58:                    # ':'
+                is_header = 1
+                break
+            scan = scan + 1
+        if is_header != 0:
+            continue
+
+        # Decode this radix-64 data line.
+        ci: uint64 = line_start
+        while ci < trimmed_end:
+            c: uint8 = armor[ci]
+            ci = ci + 1
+            if c == 61:                              # '=' padding
+                continue
+            v: int32 = _pgp_b64_val(c)
+            if v < 0:
+                return -1
+            acc = (acc << 6) | cast[uint32](v)
+            nbits = nbits + 6
+            if nbits >= 8:
+                nbits = nbits - 8
+                if written >= out_cap:
+                    return -1
+                out[written] = cast[uint8]((acc >> nbits) & 0xFF)
+                written = written + 1
+
+    return cast[int64](written)
+
+
+# -- OpenPGP packet header parse — RFC 4880 §4.2 -----------------------
+#
+# Reads one packet header starting at buf[off]. Writes the packet tag,
+# the offset of the packet body, and the body length through the out
+# pointers. Returns the offset just past the packet (body end) on
+# success, or 0 on a malformed / partial-length header.
+#
+# Handles both the old-format CTB (bit 0x40 clear) with 1/2/4-byte
+# lengths and the new-format CTB (bit 0x40 set) with 1/2/5-byte
+# definite lengths. Partial body lengths (new-format, used for huge
+# streamed literal data) are NOT expected on a signature packet and
+# are rejected.
+
+def pgp_packet_header(buf: Ptr[uint8], off: uint64, buf_len: uint64,
+                      out_tag: Ptr[uint8],
+                      out_body_off: Ptr[uint64],
+                      out_body_len: Ptr[uint64]) -> uint64:
+    if off >= buf_len:
+        return 0
+    ctb: uint8 = buf[off]
+    # Bit 0x80 must be set on a valid packet CTB.
+    if (ctb & 0x80) == 0:
+        return 0
+
+    if (ctb & 0x40) != 0:
+        # New-format packet. Tag is the low 6 bits.
+        tag: uint8 = ctb & 0x3F
+        p: uint64 = off + 1
+        if p >= buf_len:
+            return 0
+        l0: uint64 = cast[uint64](buf[p])
+        body_len: uint64 = 0
+        body_off: uint64 = 0
+        if l0 < 192:
+            body_len = l0
+            body_off = p + 1
+        elif l0 < 224:
+            # Two-octet length.
+            if p + 1 >= buf_len:
+                return 0
+            l1: uint64 = cast[uint64](buf[p + 1])
+            body_len = ((l0 - 192) << 8) + l1 + 192
+            body_off = p + 2
+        elif l0 == 255:
+            # Five-octet length.
+            if p + 4 >= buf_len:
+                return 0
+            body_len = (cast[uint64](buf[p + 1]) << 24) \
+                | (cast[uint64](buf[p + 2]) << 16) \
+                | (cast[uint64](buf[p + 3]) << 8) \
+                | cast[uint64](buf[p + 4])
+            body_off = p + 5
+        else:
+            # 224..254 — a partial body length. Not valid for the
+            # packets this module parses.
+            return 0
+        out_tag[0] = tag
+        out_body_off[0] = body_off
+        out_body_len[0] = body_len
+        if body_off + body_len > buf_len:
+            return 0
+        return body_off + body_len
+
+    # Old-format packet. Tag is bits 5..2; length type is bits 1..0.
+    tag2: uint8 = (ctb >> 2) & 0x0F
+    len_type: uint8 = ctb & 0x03
+    q: uint64 = off + 1
+    blen: uint64 = 0
+    boff: uint64 = 0
+    if len_type == 0:
+        if q >= buf_len:
+            return 0
+        blen = cast[uint64](buf[q])
+        boff = q + 1
+    elif len_type == 1:
+        if q + 1 >= buf_len:
+            return 0
+        blen = (cast[uint64](buf[q]) << 8) | cast[uint64](buf[q + 1])
+        boff = q + 2
+    elif len_type == 2:
+        if q + 3 >= buf_len:
+            return 0
+        blen = (cast[uint64](buf[q]) << 24) \
+            | (cast[uint64](buf[q + 1]) << 16) \
+            | (cast[uint64](buf[q + 2]) << 8) \
+            | cast[uint64](buf[q + 3])
+        boff = q + 4
+    else:
+        # len_type 3 — indeterminate length (to end of packet). Not
+        # used by the key / signature packets we handle.
+        return 0
+    out_tag[0] = tag2
+    out_body_off[0] = boff
+    out_body_len[0] = blen
+    if boff + blen > buf_len:
+        return 0
+    return boff + blen
+
+
+# -- read an OpenPGP MPI — RFC 4880 §3.2 -------------------------------
+#
+# An MPI is a 2-byte big-endian bit count followed by ceil(bits/8)
+# big-endian value octets. Returns the offset just past the MPI, or 0
+# on a truncated MPI. The value octet span is reported through
+# out_val_off / out_val_len.
+
+def pgp_read_mpi(buf: Ptr[uint8], off: uint64, buf_len: uint64,
+                 out_val_off: Ptr[uint64],
+                 out_val_len: Ptr[uint64]) -> uint64:
+    if off + 1 >= buf_len:
+        return 0
+    bits: uint64 = (cast[uint64](buf[off]) << 8) \
+        | cast[uint64](buf[off + 1])
+    nbytes: uint64 = (bits + 7) / 8
+    val_off: uint64 = off + 2
+    if val_off + nbytes > buf_len:
+        return 0
+    out_val_off[0] = val_off
+    out_val_len[0] = nbytes
+    return val_off + nbytes
+
+
+# -- pgp_keyring_load --------------------------------------------------
+#
+# Parse a baked OpenPGP keyring blob — the raw bytes of
+# `gpg --export <signing-key>`. The first packet must be a v4
+# Public-Key packet (tag 6) for an RSA key (public-key algorithm 1, 2
+# or 3). Recovers the RSA modulus + exponent MPIs into `out`.
+#
+# Returns 0 on success, -1 on malformed input / unsupported key.
+
+def pgp_keyring_load(keyring: Ptr[uint8], keyring_len: uint64,
+                     out: Ptr[PgpPubkey]) -> int32:
+    out[0].valid = 0
+    tag: uint8 = 0
+    body_off: uint64 = 0
+    body_len: uint64 = 0
+    pkt_end: uint64 = pgp_packet_header(keyring, 0, keyring_len,
+                                        &tag, &body_off, &body_len)
+    if pkt_end == 0:
+        return -1
+    # Tag 6 == Public-Key packet. (A keyring may also lead with tag 5,
+    # a Secret-Key packet — never the right input for a trust anchor,
+    # and refused here.)
+    if tag != 6:
+        return -1
+    if body_len < 6:
+        return -1
+    # v4 Public-Key packet body: version(1) created(4) algorithm(1)
+    # then the algorithm-specific MPIs. v3 (version 2/3) keys are
+    # long obsolete and not emitted by modern gpg — refuse them.
+    version: uint8 = keyring[body_off]
+    if version != 4:
+        return -1
+    alg: uint8 = keyring[body_off + 5]
+    # RSA public-key algorithm ids: 1 (encrypt+sign), 2 (encrypt),
+    # 3 (sign). Debian archive keys are id 1.
+    if alg != 1 and alg != 2 and alg != 3:
+        return -1
+    body_end: uint64 = body_off + body_len
+
+    # MPI 1: RSA modulus n.
+    mpi_off: uint64 = body_off + 6
+    val_off: uint64 = 0
+    val_len: uint64 = 0
+    mpi_off = pgp_read_mpi(keyring, mpi_off, body_end,
+                           &val_off, &val_len)
+    if mpi_off == 0:
+        return -1
+    if val_len == 0 or val_len > 520:
+        return -1
+    out[0].mod_len = val_len
+    i: uint64 = 0
+    while i < val_len:
+        out[0].mod_be[i] = keyring[val_off + i]
+        i = i + 1
+
+    # MPI 2: RSA public exponent e.
+    mpi_off = pgp_read_mpi(keyring, mpi_off, body_end,
+                           &val_off, &val_len)
+    if mpi_off == 0:
+        return -1
+    if val_len == 0 or val_len > 8:
+        return -1
+    out[0].exp_len = val_len
+    i = 0
+    while i < val_len:
+        out[0].exp_be[i] = keyring[val_off + i]
+        i = i + 1
+
+    out[0].valid = 1
+    return 0
+
+
+# -- pgp_sig_parse -----------------------------------------------------
+#
+# Parse one OpenPGP signature packet (tag 2) from `pkt[0..pkt_len)`.
+# The packet must be a v4 RSA signature; the hashed-subpacket region
+# and the RSA signature MPI value are located for the caller.
+#
+# v4 signature packet body (RFC 4880 §5.2.3):
+#   version(1)=4  sig-type(1)  pub-alg(1)  hash-alg(1)
+#   hashed-subpkt-count(2)   hashed-subpkts...
+#   unhashed-subpkt-count(2) unhashed-subpkts...
+#   left16(2)                (high 2 bytes of the digest)
+#   signature MPI(s)         (one MPI for RSA)
+#
+# Returns 0 on success, -1 on malformed / unsupported input.
+
+def pgp_sig_parse(pkt: Ptr[uint8], pkt_len: uint64,
+                  out: Ptr[PgpSig]) -> int32:
+    out[0].valid = 0
+    tag: uint8 = 0
+    body_off: uint64 = 0
+    body_len: uint64 = 0
+    pkt_end: uint64 = pgp_packet_header(pkt, 0, pkt_len,
+                                        &tag, &body_off, &body_len)
+    if pkt_end == 0:
+        return -1
+    if tag != 2:                 # not a Signature packet
+        return -1
+    if body_len < 8:
+        return -1
+    body_end: uint64 = body_off + body_len
+
+    version: uint8 = pkt[body_off]
+    if version != 4:
+        return -1
+    sig_type: uint8 = pkt[body_off + 1]
+    pub_alg: uint8 = pkt[body_off + 2]
+    hash_alg: uint8 = pkt[body_off + 3]
+
+    # RSA only (algorithm id 1 or 3).
+    if pub_alg != 1 and pub_alg != 3:
+        return -1
+    # Accept SHA-256 / SHA-384 / SHA-512 only. SHA-1 (2) and MD5 (1)
+    # are weak; refuse them rather than verify against a broken hash.
+    if hash_alg != 8 and hash_alg != 9 and hash_alg != 10:
+        return -1
+
+    # Hashed subpacket region.
+    hashed_count: uint64 = (cast[uint64](pkt[body_off + 4]) << 8) \
+        | cast[uint64](pkt[body_off + 5])
+    hashed_data_off: uint64 = body_off + 6
+    if hashed_data_off + hashed_count > body_end:
+        return -1
+
+    # The v4 "hashed section" fed to the digest is the packet body
+    # from the version byte through the end of the hashed subpackets
+    # (RFC 4880 §5.2.4) — i.e. body_off .. hashed_data_off+hashed_count.
+    out[0].hashed_off = body_off
+    out[0].hashed_len = (hashed_data_off + hashed_count) - body_off
+
+    # Unhashed subpacket region (skipped — not security-relevant).
+    uh_count_off: uint64 = hashed_data_off + hashed_count
+    if uh_count_off + 2 > body_end:
+        return -1
+    unhashed_count: uint64 = (cast[uint64](pkt[uh_count_off]) << 8) \
+        | cast[uint64](pkt[uh_count_off + 1])
+    after_unhashed: uint64 = uh_count_off + 2 + unhashed_count
+    # left16 — 2 bytes of the digest, a cheap pre-check value.
+    left16_off: uint64 = after_unhashed
+    if left16_off + 2 > body_end:
+        return -1
+
+    # The RSA signature MPI.
+    mpi_off: uint64 = left16_off + 2
+    val_off: uint64 = 0
+    val_len: uint64 = 0
+    mpi_end: uint64 = pgp_read_mpi(pkt, mpi_off, body_end,
+                                   &val_off, &val_len)
+    if mpi_end == 0:
+        return -1
+    if val_len == 0 or val_len > 520:
+        return -1
+
+    out[0].version = version
+    out[0].sig_type = sig_type
+    out[0].pub_alg = pub_alg
+    out[0].hash_alg = hash_alg
+    out[0].sig_mpi_off = val_off
+    out[0].sig_mpi_len = val_len
+    out[0].valid = 1
+    return 0
+
+
+# -- cleartext-signature framework — RFC 4880 §7 -----------------------
+#
+# pgp_inrelease_split locates the two spans of an `InRelease` file:
+#   - the cleartext body  (between the line after the blank line that
+#     follows `-----BEGIN PGP SIGNED MESSAGE-----` and its armor
+#     headers, and the `-----BEGIN PGP SIGNATURE-----` line)
+#   - the signature armor (from `-----BEGIN PGP SIGNATURE-----` to the
+#     end of the buffer)
+#
+# Returns 0 on success, -1 if the framing markers are absent.
+
+def pgp_inrelease_split(buf: Ptr[uint8], buf_len: uint64,
+                        out_clear_off: Ptr[uint64],
+                        out_clear_end: Ptr[uint64],
+                        out_armor_off: Ptr[uint64]) -> int32:
+    # The file must begin with the SIGNED MESSAGE header.
+    if _pgp_starts_with(buf, 0, buf_len,
+                        "-----BEGIN PGP SIGNED MESSAGE-----") == 0:
+        return -1
+
+    # Walk lines. After the header line come zero or more armor-header
+    # lines ("Hash: SHA256"), then ONE blank line; the cleartext body
+    # starts on the next line.
+    pos: uint64 = 0
+    # Skip the header line.
+    while pos < buf_len and buf[pos] != 10:
+        pos = pos + 1
+    if pos < buf_len:
+        pos = pos + 1
+
+    # Consume armor-header lines up to and including the blank line.
+    found_blank: int32 = 0
+    while pos < buf_len:
+        line_start: uint64 = pos
+        line_end: uint64 = pos
+        while line_end < buf_len and buf[line_end] != 10:
+            line_end = line_end + 1
+        trimmed_end: uint64 = line_end
+        if trimmed_end > line_start and buf[trimmed_end - 1] == 13:
+            trimmed_end = trimmed_end - 1
+        pos = line_end
+        if pos < buf_len:
+            pos = pos + 1
+        if trimmed_end == line_start:
+            found_blank = 1
+            break
+    if found_blank == 0:
+        return -1
+
+    clear_off: uint64 = pos
+    out_clear_off[0] = clear_off
+
+    # Scan forward for the signature armor header. It begins a line.
+    scan: uint64 = clear_off
+    armor_off: uint64 = 0
+    found_sig: int32 = 0
+    while scan < buf_len:
+        if scan == 0 or buf[scan - 1] == 10:
+            if _pgp_starts_with(buf, scan, buf_len,
+                                "-----BEGIN PGP SIGNATURE-----") != 0:
+                armor_off = scan
+                found_sig = 1
+                break
+        scan = scan + 1
+    if found_sig == 0:
+        return -1
+
+    # The cleartext body ends just before the signature header line.
+    out_clear_end[0] = armor_off
+    out_armor_off[0] = armor_off
+    return 0
+
+
+# -- pgp_build_signed_data ---------------------------------------------
+#
+# Assemble the exact byte string whose digest a v4 cleartext signature
+# is computed over, into the module-scope `pgp_signed_data` buffer:
+#
+#   1. The canonicalised cleartext (RFC 4880 §7.1):
+#        - dash-unescaping: a line beginning "- " has those two bytes
+#          removed; a line that is exactly "-" becomes empty.
+#        - trailing whitespace (SP / TAB) stripped from every line.
+#        - lines joined with CRLF; NO trailing line separator after
+#          the final line.
+#   2. The signature packet's v4 hashed section
+#      (pkt[sig.hashed_off .. +sig.hashed_len)).
+#   3. The v4 trailer: 0x04, 0xFF, then the hashed-section length as a
+#      4-byte big-endian integer (RFC 4880 §5.2.4).
+#
+# `clear` points at the cleartext span; `pkt` at the raw signature
+# packet `sig` was parsed from. The assembled length is also written
+# through `out_len`. Returns 0 on success, -1 if the assembled string
+# would exceed PGP_SIGNED_DATA_CAP.
+
+def pgp_build_signed_data(clear: Ptr[uint8],
+                          clear_off: uint64, clear_end: uint64,
+                          pkt: Ptr[uint8],
+                          sig: Ptr[PgpSig],
+                          out_len: Ptr[uint64]) -> int32:
+    w: uint64 = 0
+
+    # --- 1. canonicalised cleartext ---
+    # Iterate the cleartext line by line.
+    pos: uint64 = clear_off
+    first_line: int32 = 1
+    while pos < clear_end:
+        line_start: uint64 = pos
+        line_end: uint64 = pos
+        while line_end < clear_end and clear[line_end] != 10:
+            line_end = line_end + 1
+        # Content of the line excluding the LF.
+        content_end: uint64 = line_end
+        # Strip a CR immediately before the LF.
+        if content_end > line_start and clear[content_end - 1] == 13:
+            content_end = content_end - 1
+
+        # Dash-unescaping: "- " prefix removed; a lone "-" -> "".
+        body_start: uint64 = line_start
+        if content_end - body_start >= 2:
+            if clear[body_start] == 45 and clear[body_start + 1] == 32:
+                body_start = body_start + 2
+        elif content_end - body_start == 1:
+            if clear[body_start] == 45:
+                body_start = content_end          # whole line dropped
+
+        # Strip trailing SP / TAB from the (post-unescape) content.
+        trimmed: uint64 = content_end
+        while trimmed > body_start:
+            ch: uint8 = clear[trimmed - 1]
+            if ch != 32 and ch != 9:
+                break
+            trimmed = trimmed - 1
+
+        # Emit a CRLF separator before every line except the first.
+        if first_line == 0:
+            if w + 2 > PGP_SIGNED_DATA_CAP:
+                return -1
+            pgp_signed_data[w] = 13
+            pgp_signed_data[w + 1] = 10
+            w = w + 2
+        first_line = 0
+
+        # Emit the line content.
+        k: uint64 = body_start
+        while k < trimmed:
+            if w >= PGP_SIGNED_DATA_CAP:
+                return -1
+            pgp_signed_data[w] = clear[k]
+            w = w + 1
+            k = k + 1
+
+        # Advance past the LF.
+        pos = line_end
+        if pos < clear_end:
+            pos = pos + 1
+    # NOTE: if the cleartext ended with a trailing LF, the loop above
+    # produced a final empty line. RFC 4880 §7.1: the line ending of
+    # the last line is NOT hashed, and a trailing blank line so
+    # produced contributes nothing. The "no trailing separator" rule
+    # is already satisfied — we only emit CRLF *before* a line, so the
+    # final line (empty or not) carries no separator after it.
+
+    # --- 2. the v4 hashed section of the signature packet ---
+    hoff: uint64 = sig[0].hashed_off
+    hlen: uint64 = sig[0].hashed_len
+    j: uint64 = 0
+    while j < hlen:
+        if w >= PGP_SIGNED_DATA_CAP:
+            return -1
+        pgp_signed_data[w] = pkt[hoff + j]
+        w = w + 1
+        j = j + 1
+
+    # --- 3. the v4 trailer: 04 FF <uint32 BE hashed-section length> ---
+    if w + 6 > PGP_SIGNED_DATA_CAP:
+        return -1
+    pgp_signed_data[w] = 0x04
+    pgp_signed_data[w + 1] = 0xFF
+    pgp_signed_data[w + 2] = cast[uint8]((hlen >> 24) & 0xFF)
+    pgp_signed_data[w + 3] = cast[uint8]((hlen >> 16) & 0xFF)
+    pgp_signed_data[w + 4] = cast[uint8]((hlen >> 8) & 0xFF)
+    pgp_signed_data[w + 5] = cast[uint8](hlen & 0xFF)
+    w = w + 6
+
+    pgp_signed_data_len = w
+    out_len[0] = w
+    return 0

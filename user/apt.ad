@@ -180,6 +180,31 @@ from lib.xz.xz import (
     xz_decompress,
 )
 
+# OpenPGP signature verification of the repository `InRelease` file.
+# This closes the apt chain-of-trust gap: before V1, apt trusted the
+# `Release`/`Packages` index on transport security alone — a MITM or a
+# malicious mirror could serve a forged index. `apt update` now fetches
+# the inline-clearsigned `InRelease`, verifies its OpenPGP signature
+# against a baked Debian-style archive key, and only then trusts the
+# metadata. lib/pgp parses the OpenPGP packet stream + the cleartext-
+# signature framework; lib/rsa does the RSA PKCS#1 v1.5 math.
+from lib.pgp.pgp import (
+    PgpPubkey,
+    PgpSig,
+    pgp_keyring_load,
+    pgp_inrelease_split,
+    pgp_dearmor,
+    pgp_sig_parse,
+    pgp_build_signed_data,
+    pgp_signed_data,
+    pgp_sig_packet,
+)
+from lib.rsa.rsa import (
+    RsaPubkey,
+    rsa_init,
+    rsa_pkcs1_v1_5_verify,
+)
+
 # Native-ABI syscalls. socket()/connect() are the U-socket bridge
 # (runtime.S numbers 41/42 -> _u_socket/_u_connect); read/write/close
 # on a socket fd already route through the in-kernel TCP stack via the
@@ -376,6 +401,40 @@ sha_w:       Array[64, uint32]     # message schedule scratch
 sha_block:   Array[64, uint8]      # one 64-byte input block
 sha_digest:  Array[32, uint8]      # 32-byte final digest
 sha_hex:     Array[80, uint8]      # digest as 64 lowercase hex chars + NUL
+
+# -- InRelease signature verification (V1: chain of trust) ------------
+#
+# The baked OpenPGP trust anchor lives in the initramfs at
+# /etc/apt-trusted.gpg (planted by scripts/build_initramfs.py, the same
+# way the kernel's TLS CA roots are baked at /etc/tls-ca-*.der). It is
+# the raw bytes of `gpg --export <archive-signing-key>` — one v4 RSA
+# Public-Key packet. apt loads it once at `apt update` time and uses it
+# to verify the OpenPGP signature on the repository's `InRelease`.
+#
+# These are top-level BSS arenas — never function-locals — per the U9
+# nested-frame-Array quirk (memory/feedback_compiler_quirks.md). The
+# keyring path "/etc/apt-trusted.gpg" is materialised inline at the
+# call sites (the x86_64 backend rejects string-literal globals).
+APT_KEYRING_CAP:  uint64 = 16384       # exported RSA-4096 key is ~3 KiB
+
+apt_keyring_buf:  Array[16384, uint8]  # raw baked keyring blob
+apt_pgp_key:      PgpPubkey            # parsed trust-anchor RSA key
+apt_pgp_sig:      PgpSig               # parsed InRelease signature packet
+apt_rsa_key:      RsaPubkey            # the same key, in lib/rsa's shape
+
+# The InRelease body is fetched into http_buf; before the (later)
+# Packages fetch overwrites http_buf, the InRelease bytes are copied
+# here so verification survives the second GET.
+INRELEASE_CAP:    uint64 = 262144
+inrelease_buf:    Array[262144, uint8]
+inrelease_len:    uint64 = 0
+
+# The RSA signature value, left-zero-padded to exactly the modulus
+# byte length. OpenPGP MPIs are minimal-length (no leading zero
+# octets), but lib/rsa's PKCS#1 v1.5 verify requires a signature
+# octet string of length exactly k (RFC 8017 §8.2.2 step 1), so the
+# minimal MPI is right-aligned into this k-byte buffer.
+apt_sig_padded:   Array[520, uint8]
 
 
 # -- tiny stdio helpers (mirrors dpkg.ad / cat.ad) ---------------------
@@ -1526,6 +1585,192 @@ def _sha256_hash(n: uint64):
     sha_hex[64] = 0
 
 
+# -- InRelease OpenPGP signature verification --------------------------
+#
+# Closes the apt chain-of-trust gap. The flow:
+#
+#   1. Load the baked trust anchor from /etc/apt-trusted.gpg — the raw
+#      `gpg --export` of the archive signing key. Parsed once into an
+#      RsaPubkey.
+#   2. Fetch <dists>/<suite>/InRelease — the inline-clearsigned
+#      `Release`. One HTTP GET, self-contained.
+#   3. Split it into cleartext body + ASCII-armored signature.
+#   4. De-armor (base64-decode) the signature into an OpenPGP packet
+#      and parse it: hash algorithm, hashed-subpacket region, RSA
+#      signature MPI.
+#   5. Assemble the v4 signed-data byte string (canonicalised
+#      cleartext || hashed section || 04 FF <len> trailer) and run
+#      RSA PKCS#1 v1.5 verification against the trust anchor.
+#
+# Returns:
+#    1  signature present and VALID — the InRelease is authentic.
+#    0  signature present but INVALID — forged / tampered. apt MUST
+#       abort: the repository cannot be trusted.
+#   -1  InRelease not available (404) or no trust anchor baked — the
+#       repository is UNAUTHENTICATED. apt warns loudly and (for an
+#       unsigned mirror) may proceed; a tampered signature never
+#       reaches this branch.
+#
+# `port` is the connection port (from _parse_url); `suite` the
+# repository suite. On a return of 1 the verified `InRelease` cleartext
+# is available in inrelease_buf[0, inrelease_len).
+
+def _load_trust_anchor() -> int32:
+    fd: int32 = sys_open(cast[Ptr[char]]("/etc/apt-trusted.gpg"))
+    if fd < 0:
+        return -1
+    total: uint64 = 0
+    while total < APT_KEYRING_CAP:
+        room: uint64 = APT_KEYRING_CAP - total
+        ptr: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](&apt_keyring_buf[0]) + total)
+        n: int64 = sys_read(fd, ptr, room)
+        if n <= 0:
+            break
+        total = total + cast[uint64](n)
+    sys_close(fd)
+    if total == 0:
+        return -1
+    rc: int32 = pgp_keyring_load(&apt_keyring_buf[0], total, &apt_pgp_key)
+    if rc != 0:
+        write_str(2, "apt-get: baked keyring /etc/apt-trusted.gpg is malformed\n")
+        return -1
+    # Re-shape the parsed OpenPGP key into lib/rsa's RsaPubkey. The
+    # modulus / exponent byte strings transfer directly; mod_bits /
+    # mod_bytes are derived the same way rsa_parse_pubkey does.
+    i: uint64 = 0
+    while i < apt_pgp_key.mod_len:
+        apt_rsa_key.mod_bytes_be[i] = apt_pgp_key.mod_be[i]
+        i = i + 1
+    apt_rsa_key.mod_len = apt_pgp_key.mod_len
+    i = 0
+    while i < apt_pgp_key.exp_len:
+        apt_rsa_key.exp_bytes_be[i] = apt_pgp_key.exp_be[i]
+        i = i + 1
+    apt_rsa_key.exp_len = apt_pgp_key.exp_len
+    # Bit length of the modulus (skip a leading DER-style 0x00 if the
+    # MPI carried one — OpenPGP MPIs are minimal so this is rare, but
+    # harmless to guard).
+    skip: uint64 = 0
+    if apt_pgp_key.mod_len > 1 and apt_pgp_key.mod_be[0] == 0:
+        skip = 1
+    top: uint8 = apt_pgp_key.mod_be[skip]
+    bit: uint64 = 7
+    while bit > 0:
+        if ((top >> bit) & 1) != 0:
+            break
+        bit = bit - 1
+    full_bytes: uint64 = apt_pgp_key.mod_len - skip - 1
+    apt_rsa_key.mod_bits = full_bytes * 8 + bit + 1
+    apt_rsa_key.mod_bytes = (apt_rsa_key.mod_bits + 7) / 8
+    return 0
+
+
+def _verify_inrelease(port: int64, suite: Ptr[uint8]) -> int32:
+    # 1. Load the baked trust anchor.
+    if _load_trust_anchor() != 0:
+        write_str(2, "apt-get: WARNING: no archive keyring baked at ")
+        write_str(2, "/etc/apt-trusted.gpg")
+        write_str(2, " — cannot authenticate the repository\n")
+        return -1
+
+    # 2. Fetch the inline-clearsigned InRelease. A quiet GET — a 404
+    #    just means this mirror publishes only an unsigned `Release`.
+    _build_index_path(suite, cast[Ptr[uint8]]("InRelease"))
+    ir_body_off: uint64 = 0
+    ir_len: int64 = _http_get(port, &ir_body_off, 1)
+    if ir_len <= 0:
+        write_str(2, "apt-get: WARNING: no InRelease on this mirror — ")
+        write_str(2, "repository is UNAUTHENTICATED\n")
+        return -1
+
+    # Copy the InRelease body out of http_buf — the later Packages
+    # fetch reuses http_buf and would otherwise clobber it.
+    irl: uint64 = cast[uint64](ir_len)
+    if irl > INRELEASE_CAP:
+        write_str(2, "apt-get: InRelease exceeds 256 KiB cap\n")
+        return 0
+    ci: uint64 = 0
+    while ci < irl:
+        inrelease_buf[ci] = http_buf[ir_body_off + ci]
+        ci = ci + 1
+    inrelease_len = irl
+
+    # 3. Split InRelease into cleartext body + signature armor.
+    clear_off: uint64 = 0
+    clear_end: uint64 = 0
+    armor_off: uint64 = 0
+    if pgp_inrelease_split(&inrelease_buf[0], inrelease_len,
+                           &clear_off, &clear_end, &armor_off) != 0:
+        write_str(2, "apt-get: InRelease is not a valid clearsigned file\n")
+        return 0
+
+    # 4. De-armor the signature block into a raw OpenPGP packet.
+    sig_n: int64 = pgp_dearmor(&inrelease_buf[0], armor_off,
+                               inrelease_len,
+                               &pgp_sig_packet[0], cast[uint64](4096))
+    if sig_n <= 0:
+        write_str(2, "apt-get: InRelease signature armor is malformed\n")
+        return 0
+
+    # 5. Parse the signature packet.
+    if pgp_sig_parse(&pgp_sig_packet[0], cast[uint64](sig_n),
+                     &apt_pgp_sig) != 0:
+        write_str(2, "apt-get: InRelease signature packet is malformed ")
+        write_str(2, "or uses an unsupported algorithm\n")
+        return 0
+
+    # This verifier reuses lib/rsa's PKCS#1 v1.5 path, which today
+    # computes a SHA-256 digest. OpenPGP hash-algorithm id 8 == SHA-256;
+    # 9/10 are SHA-384/512. A non-SHA-256 signature is refused loudly
+    # rather than verified against the wrong digest.
+    if apt_pgp_sig.hash_alg != 8:
+        write_str(2, "apt-get: InRelease signed with a non-SHA-256 ")
+        write_str(2, "digest — unsupported, cannot verify\n")
+        return 0
+
+    # 6. Assemble the v4 signed-data byte string.
+    signed_len: uint64 = 0
+    if pgp_build_signed_data(&inrelease_buf[0], clear_off, clear_end,
+                             &pgp_sig_packet[0], &apt_pgp_sig,
+                             &signed_len) != 0:
+        write_str(2, "apt-get: InRelease cleartext too large to verify\n")
+        return 0
+
+    # Right-align the (minimal-length) OpenPGP signature MPI into a
+    # k-byte buffer — lib/rsa's verifier requires a signature octet
+    # string of length exactly the modulus byte width.
+    k: uint64 = apt_rsa_key.mod_bytes
+    if apt_pgp_sig.sig_mpi_len > k or k > 520:
+        write_str(2, "apt-get: InRelease signature length inconsistent ")
+        write_str(2, "with the trust-anchor key\n")
+        return 0
+    pad: uint64 = k - apt_pgp_sig.sig_mpi_len
+    pi: uint64 = 0
+    while pi < pad:
+        apt_sig_padded[pi] = 0
+        pi = pi + 1
+    pi = 0
+    while pi < apt_pgp_sig.sig_mpi_len:
+        apt_sig_padded[pad + pi] = \
+            pgp_sig_packet[apt_pgp_sig.sig_mpi_off + pi]
+        pi = pi + 1
+
+    # 7. RSA PKCS#1 v1.5 verification against the trust anchor. The
+    #    "message" is the assembled v4 signed-data; rsa_pkcs1_v1_5_verify
+    #    SHA-256s it internally, recovers the EM via s^e mod n, and
+    #    byte-exact-compares against the expected EMSA-PKCS1-v1_5
+    #    encoding.
+    vrc: int32 = rsa_pkcs1_v1_5_verify(
+        &apt_rsa_key,
+        cast[Ptr[uint8]](0), cast[uint64](0),
+        &pgp_signed_data[0], signed_len,
+        &apt_sig_padded[0], k)
+    if vrc == 1:
+        return 1
+    return 0
+
+
 # -- apt update --------------------------------------------------------
 
 def _do_update(base_url: Ptr[uint8], suite: Ptr[uint8],
@@ -1544,9 +1789,35 @@ def _do_update(base_url: Ptr[uint8], suite: Ptr[uint8],
         cc = cc + 1
     comp_buf[cc] = 0
 
-    # 1. Fetch the Release file. V0 fetches it mainly to confirm the
-    #    suite exists and the mirror is well-formed; the index hashes
-    #    inside are not yet verified (that is V1's InRelease check).
+    # 0. Authenticate the repository BEFORE trusting any metadata from
+    #    it. apt fetches the inline-clearsigned `InRelease` and verifies
+    #    its OpenPGP signature against the baked archive key. This is
+    #    the chain-of-trust anchor: without it a MITM or a malicious
+    #    mirror could serve a forged index.
+    #
+    #      verify == 1  -> InRelease signature VALID; the repository is
+    #                      authentic, proceed.
+    #      verify == 0  -> InRelease signature INVALID (forged/tampered)
+    #                      -> HARD ABORT. We refuse to touch the index.
+    #      verify == -1 -> InRelease absent / no keyring baked; the
+    #                      repository is unsigned. _verify_inrelease has
+    #                      already printed a loud WARNING. We proceed
+    #                      (an unsigned mirror is still usable, exactly
+    #                      as `apt` treats a `[trusted=yes]` source) —
+    #                      but a tampered signature can NEVER land here.
+    rsa_init()
+    vrc: int32 = _verify_inrelease(port, suite)
+    if vrc == 0:
+        write_str(2, "apt-get: InRelease signature verification FAILED ")
+        write_str(2, "— repository is NOT authentic, aborting\n")
+        return 1
+    if vrc == 1:
+        write_str(1, "apt-get: InRelease OpenPGP signature verified ")
+        write_str(1, "— repository is authentic\n")
+
+    # 1. Fetch the Release file. With a verified InRelease in hand the
+    #    Release fetch mainly confirms the suite exists; when no
+    #    InRelease was available it is still the only metadata we have.
     _build_index_path(suite, cast[Ptr[uint8]]("Release"))
     rel_body_off: uint64 = 0
     rel_len: int64 = _http_get(port, &rel_body_off, 0)
