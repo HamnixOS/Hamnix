@@ -62,7 +62,10 @@ from kernel.sched.core import (
 from mm.slab import kmalloc, kfree
 from mm.page_alloc import alloc_pages, free_pages, free_page
 from mm.cow import cow_drop_page, cow_pte_bit
-from fs.elf import elf_install_user_mapping, vm_cow_share_range
+from fs.elf import (
+    elf_install_user_mapping, vm_cow_share_range,
+    vm_share_range, vm_protect_range, vm_pin_range,
+)
 
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
@@ -75,6 +78,7 @@ extern def load_cr3(value: uint64)
 # MAP_* flag bits. Mirror Linux <bits/mman-linux.h>. Same numeric
 # values defined locally in linux_abi/u_syscalls.ad (kept in sync by
 # hand — the two files import from each other not at all).
+VMA_MAP_SHARED:    int32 = 0x01
 VMA_MAP_PRIVATE:   int32 = 0x02
 VMA_MAP_FIXED:     int32 = 0x10
 VMA_MAP_ANONYMOUS: int32 = 0x20
@@ -171,19 +175,45 @@ class VmaNode:
     # COW node by walking the owning task's page table page-by-page and
     # routing each physical page through cow_drop_page. A non-COW node
     # (0) keeps the fast bulk free_pages path. Replaces the old `pad0`
-    # padding slot, so the struct size (72 bytes) is unchanged.
+    # padding slot.
     is_cow:      int32
+    # §1 / MAP_SHARED: 1 once this node's anonymous pages are genuinely
+    # SHARED across a fork boundary — the child maps the SAME physical
+    # frames RW (no COW marking), so a write by either side is visible
+    # to the other (/dev/shm-style coherence). Like a COW node, a
+    # shared node's pages are reference-counted in mm/cow.ad's per-PFN
+    # table, so _vma_node_free walks the page table and routes each
+    # frame through cow_drop_page — the frame is returned to the buddy
+    # allocator only when the last mapper unmaps. is_cow and is_shared
+    # are mutually exclusive (a VMA is either copy-on-write OR shared).
+    is_shared:   int32
+    # §1 / VMA splitting: 1 once this node's frames are refcount-managed
+    # because the VMA was SPLIT (mprotect / MAP_FIXED carved part of an
+    # owner VMA). A single-chunk VMA's virtual range is its physical
+    # buddy run, which can only be freed whole — so a split owner VMA
+    # converts to per-PFN refcounting (vm_pin_range) and every piece
+    # frees via _vma_free_cow_range. Distinct from is_shared because a
+    # pinned (split, but private) VMA still forks COPY-ON-WRITE, whereas
+    # an is_shared VMA forks genuinely shared. A node with is_pinned set
+    # frees through the refcount path exactly like is_cow / is_shared.
+    is_pinned:   int32
 
 
 # ---------------------------------------------------------------------
 # Allocation helpers
 # ---------------------------------------------------------------------
 
+# VmaNode size: 6 uint64 (48) + 9 int32 (36) -> padded to 88 bytes
+# after §1 added is_shared + is_pinned. kmalloc/memset use this
+# constant so the two stay in lockstep.
+VMA_NODE_SIZE: uint64 = 88
+
+
 def _vma_node_new() -> uint64:
-    p: uint64 = kmalloc(72)
+    p: uint64 = kmalloc(VMA_NODE_SIZE)
     if p == 0:
         return 0
-    memset(cast[Ptr[uint8]](p), 0, 72)
+    memset(cast[Ptr[uint8]](p), 0, VMA_NODE_SIZE)
     return p
 
 
@@ -203,6 +233,8 @@ def _vma_node_set(node: uint64, start: uint64, end: uint64,
     cast[Ptr[VmaNode]](node)[0].chunks      = 0
     cast[Ptr[VmaNode]](node)[0].nchunks     = 0
     cast[Ptr[VmaNode]](node)[0].is_cow      = 0
+    cast[Ptr[VmaNode]](node)[0].is_shared   = 0
+    cast[Ptr[VmaNode]](node)[0].is_pinned   = 0
 
 
 def _vma_node_get_next(node: uint64) -> uint64:
@@ -322,13 +354,30 @@ def _vma_node_free(node: uint64, pml4_phys: uint64):
     # descriptors; free every chunk at its own order, then release the
     # descriptor array. backing/order are unused for such nodes.
     is_cow: int32 = cast[Ptr[VmaNode]](node)[0].is_cow
-    if is_cow != 0:
+    is_shared: int32 = cast[Ptr[VmaNode]](node)[0].is_shared
+    is_pinned: int32 = cast[Ptr[VmaNode]](node)[0].is_pinned
+    if is_cow != 0 or is_shared != 0 or is_pinned != 0:
+        # COW node, §1 MAP_SHARED node, OR §1 pinned (split) node: in
+        # all three the recorded backing run is no longer the authority
+        # for what this task maps. A COW node's PTEs can be repointed
+        # at fresh pages by the COW resolver; a shared node maps frames
+        # it co-owns with other processes; a pinned node is one piece
+        # of a split VMA whose buddy run is co-owned by sibling pieces.
+        # Free by walking the owning task's page table over
+        # [start, end) and routing each present frame through
+        # cow_drop_page — which returns the frame to the buddy
+        # allocator only when its per-PFN refcount falls to 0, so a
+        # frame still mapped elsewhere (COW, shared, or a sibling split
+        # piece) is left untouched. _vma_free_cow_range serves all
+        # three: cow_drop_page is refcount arithmetic that does not
+        # care why the frame was multiply held.
         v_start: uint64 = cast[Ptr[VmaNode]](node)[0].start
         v_end:   uint64 = cast[Ptr[VmaNode]](node)[0].end
         _vma_free_cow_range(pml4_phys, v_start, v_end)
-        # The COW node never owns a separate backing run / chunk array
-        # of its own (vma_fork_copy clears both on the share path), so
-        # there is nothing else to release but the descriptor blocks.
+        # The COW / shared node never owns a separate backing run /
+        # chunk array of its own (vma_fork_copy clears both on the
+        # share path), so there is nothing else to release but the
+        # descriptor blocks.
         carr: uint64 = cast[Ptr[VmaNode]](node)[0].chunks
         if carr != 0:
             kfree(carr)
@@ -442,6 +491,100 @@ def _vma_insert_sorted(slot: uint64, node: uint64):
 
 
 # ---------------------------------------------------------------------
+# §1 — VMA splitting (mprotect / MAP_FIXED over arbitrary ranges)
+# ---------------------------------------------------------------------
+#
+# mprotect and MAP_FIXED both need to operate on a SUB-range of an
+# existing VMA: mprotect changes the prot of a slice, MAP_FIXED
+# replaces a slice. Either way the enclosing VMA must be split so the
+# slice is its own node.
+#
+# The hard part is physical ownership. A single-chunk owner VMA's
+# virtual range IS its buddy run (identity-mapped); a multi-chunk VMA
+# owns an array of buddy chunks. Neither can be partially freed. So
+# before a VMA is ever split, _vma_make_refcounted brings its frames
+# under per-PFN refcount management (vm_pin_range takes one ref on
+# each frame) and converts the node to is_pinned. From then on every
+# piece — original or split-off — frees via the refcount path
+# (_vma_free_cow_range), and the underlying buddy run is returned to
+# the allocator only when the last piece releases its last frame. The
+# node's own backing / chunks descriptors are dropped (set to 0): the
+# page table + refcount table are now the sole authority.
+
+def _vma_make_refcounted(slot: uint64, node: uint64) -> int32:
+    # Convert an owner VMA to per-PFN refcount management so it can be
+    # safely split. Idempotent: a node that is already refcount-managed
+    # (is_cow / is_shared / is_pinned) is left untouched. Returns 0 on
+    # success, -1 on OOM.
+    if cast[Ptr[VmaNode]](node)[0].is_cow != 0:
+        return 0
+    if cast[Ptr[VmaNode]](node)[0].is_shared != 0:
+        return 0
+    if cast[Ptr[VmaNode]](node)[0].is_pinned != 0:
+        return 0
+    s: uint64 = cast[Ptr[VmaNode]](node)[0].start
+    e: uint64 = cast[Ptr[VmaNode]](node)[0].end
+    backing: uint64 = cast[Ptr[VmaNode]](node)[0].backing
+    nchunks: int32 = cast[Ptr[VmaNode]](node)[0].nchunks
+    # An alias node (backing == 0, nchunks == 0) owns no pages — its
+    # frames belong to an enclosing owner VMA. It must NOT be flagged
+    # refcount-managed: routing an alias through _vma_free_cow_range
+    # would cow_drop_page the enclosing owner's frames and free them
+    # out from under the owner. An alias is trivially splittable as-is
+    # (no pages to track) — _vma_split_at just copies its metadata.
+    # Nothing to do here; return success so the caller can split it.
+    if backing == 0 and nchunks <= 0:
+        return 0
+    pml4: uint64 = task_pml4(cast[int32](slot))
+    if vm_pin_range(pml4, s, e) < 0:
+        return -1
+    # The page table + per-PFN refcount table are now authoritative.
+    # Drop the buddy-run descriptors so _vma_node_free does not ALSO
+    # try to free the run via free_pages (double free) — the is_pinned
+    # path frees purely by walking the page table.
+    carr: uint64 = cast[Ptr[VmaNode]](node)[0].chunks
+    if carr != 0:
+        kfree(carr)
+    cast[Ptr[VmaNode]](node)[0].backing = 0
+    cast[Ptr[VmaNode]](node)[0].order   = 0
+    cast[Ptr[VmaNode]](node)[0].chunks  = 0
+    cast[Ptr[VmaNode]](node)[0].nchunks = 0
+    cast[Ptr[VmaNode]](node)[0].is_pinned = 1
+    return 0
+
+
+def _vma_split_at(slot: uint64, node: uint64, at: uint64) -> uint64:
+    # Split `node` at virtual address `at` (page-aligned, strictly
+    # inside (start, end)). The original node keeps [start, at); a
+    # fresh node covering [at, end) is inserted after it and returned.
+    # `node` MUST already be refcount-managed (_vma_make_refcounted) so
+    # both halves can free independently. Returns 0 on OOM or if `at`
+    # is not strictly interior.
+    s: uint64 = cast[Ptr[VmaNode]](node)[0].start
+    e: uint64 = cast[Ptr[VmaNode]](node)[0].end
+    if at <= s or at >= e:
+        return 0
+    tail: uint64 = _vma_node_new()
+    if tail == 0:
+        return 0
+    prot:  int32  = cast[Ptr[VmaNode]](node)[0].prot
+    flags: int32  = cast[Ptr[VmaNode]](node)[0].flags
+    fd:    int32  = cast[Ptr[VmaNode]](node)[0].file_fd
+    off:   uint64 = cast[Ptr[VmaNode]](node)[0].file_offset
+    # file_offset of the tail advances by the bytes the head keeps.
+    _vma_node_set(tail, at, e, prot, flags, fd,
+                  off + (at - s), 0, 0)
+    # The tail inherits the head's sharing mode — every piece of a
+    # split owner VMA is refcount-managed.
+    cast[Ptr[VmaNode]](tail)[0].is_cow    = cast[Ptr[VmaNode]](node)[0].is_cow
+    cast[Ptr[VmaNode]](tail)[0].is_shared = cast[Ptr[VmaNode]](node)[0].is_shared
+    cast[Ptr[VmaNode]](tail)[0].is_pinned = cast[Ptr[VmaNode]](node)[0].is_pinned
+    cast[Ptr[VmaNode]](node)[0].end = at
+    _vma_insert_sorted(slot, tail)
+    return tail
+
+
+# ---------------------------------------------------------------------
 # Carve / unmap
 # ---------------------------------------------------------------------
 
@@ -464,13 +607,24 @@ def _vma_unlink(slot: uint64, target: uint64) -> int32:
 
 
 def _vma_carve_range(slot: uint64, start: uint64, end: uint64):
-    # Remove every node whose range overlaps [start, end). Any
-    # overlap -> drop the whole node and free its pages. No partial-
-    # range split: no current Linux userspace consumer munmaps a
-    # partial range from the middle of a VMA.
+    # Remove EXACTLY [start, end) from the task's VMA list. §1 makes
+    # this honest for arbitrary ranges (munmap of a partial range,
+    # MAP_FIXED replacing part of a VMA):
     #
-    # A COW-shared node frees through the refcount, so _vma_node_free
-    # needs the owning task's PML4 to walk its page table.
+    #   * A node fully inside [start, end) is dropped whole.
+    #   * A node that straddles a boundary is SPLIT at that boundary
+    #     so the overlapping piece is fully covered (and dropped) while
+    #     the non-overlapping remainder survives at its original
+    #     vaddr. Splitting first brings the node under per-PFN refcount
+    #     management (_vma_make_refcounted) so the surviving piece and
+    #     the dropped piece can free independently — the buddy run is
+    #     returned only when the last reference falls.
+    #
+    # A COW / shared / pinned node frees through the refcount, so
+    # _vma_node_free needs the owning task's PML4 to walk its page
+    # table.
+    if end <= start:
+        return
     pml4: uint64 = task_pml4(cast[int32](slot))
     cur: uint64 = task_vma_list_head(slot)
     done: int32 = 0
@@ -479,9 +633,52 @@ def _vma_carve_range(slot: uint64, start: uint64, end: uint64):
         s: uint64 = _vma_node_start(cur)
         e: uint64 = _vma_node_end(cur)
         if s < end and start < e:
-            _vma_unlink(slot, cur)
-            _vma_node_free(cur, pml4)
-            cur = nxt
+            # Overlap. Trim the non-covered head/tail by splitting.
+            if s < start:
+                # Keep [s, start); split there. The tail [start, e) is
+                # the overlapping part — re-process it next iteration.
+                if _vma_make_refcounted(slot, cur) < 0:
+                    # OOM: fall back to dropping the whole node so the
+                    # carve still makes progress (over-unmaps the head
+                    # remainder — rare, OOM-only).
+                    _vma_unlink(slot, cur)
+                    _vma_node_free(cur, pml4)
+                    cur = nxt
+                else:
+                    tail: uint64 = _vma_split_at(slot, cur, start)
+                    if tail == 0:
+                        _vma_unlink(slot, cur)
+                        _vma_node_free(cur, pml4)
+                        cur = nxt
+                    else:
+                        # Re-walk from the tail (the overlapping part).
+                        cur = tail
+            elif e > end:
+                # s >= start and the node extends past `end`. Keep
+                # [end, e); split there. The head [s, end) is fully
+                # covered — drop it; continue from the surviving tail.
+                if _vma_make_refcounted(slot, cur) < 0:
+                    _vma_unlink(slot, cur)
+                    _vma_node_free(cur, pml4)
+                    cur = nxt
+                else:
+                    tail2: uint64 = _vma_split_at(slot, cur, end)
+                    if tail2 == 0:
+                        _vma_unlink(slot, cur)
+                        _vma_node_free(cur, pml4)
+                        cur = nxt
+                    else:
+                        # `cur` is now [s, end) — fully covered. Drop
+                        # it; the surviving tail2 is past `end` so the
+                        # carve is complete.
+                        _vma_unlink(slot, cur)
+                        _vma_node_free(cur, pml4)
+                        done = 1
+            else:
+                # Node fully inside [start, end): drop it whole.
+                _vma_unlink(slot, cur)
+                _vma_node_free(cur, pml4)
+                cur = nxt
         elif s >= end:
             done = 1
         else:
@@ -641,6 +838,112 @@ def _vma_alloc_large(slot: uint64, length: uint64, prot: int32,
 
 
 # ---------------------------------------------------------------------
+# §1 — _vma_alloc_fixed_at: honest MAP_FIXED at an arbitrary address
+# ---------------------------------------------------------------------
+#
+# A genuine MAP_FIXED that is NOT enclosed by a prior reservation must
+# land EXACTLY at the caller's requested address — the old code
+# carved the overlap then fell through and let alloc_pages pick a
+# different address, which silently broke any caller relying on the
+# MAP_FIXED contract once it stepped outside ld.so's reserve+overlay
+# idiom.
+#
+# Because Hamnix is identity-mapped, a freshly alloc_pages'd run sits
+# at its own physical address — not at `addr_in`. So we OVERLAY the
+# fresh pages into the task's PML4 at `addr_in` (the same mechanism
+# _vma_alloc_large uses for its 1 GiB window), in up-to-4-MiB chunks,
+# and record the VMA at [addr_in, addr_in+length). Any prior mapping
+# in the target range was already carved by the caller.
+#
+# Returns the resolved base (== addr_in) on success, or a negative
+# Linux errno.
+
+def _vma_alloc_fixed_at(slot: uint64, addr_in: uint64, length: uint64,
+                        prot: int32, flags: int32, file_fd: int32,
+                        file_offset: uint64) -> int64:
+    nchunks: int32 = cast[int32]((length + VMA_MAX_CHUNK - 1)
+                                 / VMA_MAX_CHUNK)
+    if nchunks <= 0:
+        return cast[int64](-22)
+    node: uint64 = _vma_node_new()
+    if node == 0:
+        return cast[int64](-12)
+    carr: uint64 = kmalloc(cast[uint64](nchunks) * VMA_CHUNK_SIZE)
+    if carr == 0:
+        kfree(node)
+        return cast[int64](-12)
+    memset(cast[Ptr[uint8]](carr), 0,
+           cast[uint64](nchunks) * VMA_CHUNK_SIZE)
+    pml4: uint64 = task_pml4(cast[int32](slot))
+
+    # Allocate + zero every chunk.
+    i: int32 = 0
+    ok: int32 = 1
+    while i < nchunks and ok != 0:
+        off: uint64 = cast[uint64](i) * VMA_MAX_CHUNK
+        remain: uint64 = length - off
+        csize: uint64 = VMA_MAX_CHUNK
+        if remain < csize:
+            csize = remain
+        corder: int32 = _order_for_chunk(csize)
+        cphys: uint64 = alloc_pages(corder)
+        if cphys == 0:
+            ok = 0
+        else:
+            memset(cast[Ptr[uint8]](cphys), 0, csize)
+            ce: uint64 = carr + cast[uint64](i) * VMA_CHUNK_SIZE
+            cast[Ptr[VmaChunk]](ce)[0].phys  = cphys
+            cast[Ptr[VmaChunk]](ce)[0].order = corder
+            cast[Ptr[VmaChunk]](ce)[0].pad   = 0
+            i = i + 1
+    if ok == 0:
+        j: int32 = 0
+        while j < i:
+            ce: uint64 = carr + cast[uint64](j) * VMA_CHUNK_SIZE
+            free_pages(cast[Ptr[VmaChunk]](ce)[0].phys,
+                       cast[Ptr[VmaChunk]](ce)[0].order)
+            j = j + 1
+        kfree(carr)
+        kfree(node)
+        return cast[int64](-12)
+
+    # Overlay every chunk at addr_in + offset in the task's PML4.
+    m: int32 = 0
+    while m < nchunks:
+        ce: uint64 = carr + cast[uint64](m) * VMA_CHUNK_SIZE
+        cphys: uint64 = cast[Ptr[VmaChunk]](ce)[0].phys
+        off: uint64 = cast[uint64](m) * VMA_MAX_CHUNK
+        remain: uint64 = length - off
+        csize: uint64 = VMA_MAX_CHUNK
+        if remain < csize:
+            csize = remain
+        vlo: uint64 = addr_in + off
+        rc: int32 = elf_install_user_mapping(pml4, vlo, vlo + csize,
+                                             cphys)
+        if rc < 0:
+            printk1("vma: MAP_FIXED overlay failed @ 0x%x\n", vlo)
+            j2: int32 = 0
+            while j2 < nchunks:
+                ce2: uint64 = carr + cast[uint64](j2) * VMA_CHUNK_SIZE
+                free_pages(cast[Ptr[VmaChunk]](ce2)[0].phys,
+                           cast[Ptr[VmaChunk]](ce2)[0].order)
+                j2 = j2 + 1
+            kfree(carr)
+            kfree(node)
+            return cast[int64](-12)
+        m = m + 1
+    load_cr3(pml4)
+
+    end_v: uint64 = addr_in + length
+    _vma_node_set(node, addr_in, end_v, prot, flags, file_fd,
+                  file_offset, 0, 0)
+    cast[Ptr[VmaNode]](node)[0].chunks  = carr
+    cast[Ptr[VmaNode]](node)[0].nchunks = nchunks
+    _vma_insert_sorted(slot, node)
+    return cast[int64](addr_in)
+
+
+# ---------------------------------------------------------------------
 # vma_alloc
 # ---------------------------------------------------------------------
 
@@ -660,28 +963,45 @@ def vma_alloc(slot: uint64, addr_in: uint64, len_in: uint64,
     if (flags & VMA_MAP_FIXED) != 0:
         is_fixed = 1
 
-    # MAP_FIXED handling runs FIRST so a large MAP_FIXED that lands
-    # inside an existing reservation is recorded as a metadata-only
-    # alias (regardless of length); a non-enclosed MAP_FIXED carves
-    # the overlap and then falls through to the size-based routing
-    # below with addr_in treated as a hint.
+    # MAP_FIXED handling runs FIRST.
+    #   * Enclosed by an existing reservation -> metadata-only alias
+    #     (ld.so's reserve+overlay idiom — the enclosing VMA owns the
+    #     pages; the alias just records the slice's prot/fd).
+    #   * §1: NOT enclosed -> an honest fixed mapping. Carve whatever
+    #     overlapped the target range (split-aware _vma_carve_range
+    #     preserves the non-overlapping remainders of straddled VMAs),
+    #     then OVERLAY fresh pages at exactly addr_in via
+    #     _vma_alloc_fixed_at. The old code dropped addr_in to a mere
+    #     hint here, which broke any MAP_FIXED outside ld.so's pattern.
     if is_fixed != 0 and addr_in != 0:
         end_req: uint64 = addr_in + length
         encl: uint64 = _vma_find_enclosing(slot, addr_in, end_req)
         if encl != 0:
-            # MAP_FIXED into existing reservation: alias node.
-            alias: uint64 = _vma_node_new()
-            if alias == 0:
-                return cast[int64](-12)
-            _vma_node_set(alias, addr_in, end_req, prot, flags,
-                          file_fd, file_offset, 0, 0)
-            _vma_insert_sorted(slot, alias)
-            return cast[int64](addr_in)
-        # MAP_FIXED but no enclosing region: carve any overlap then
-        # fall through (the user's requested addr is just a hint).
+            encl_s: uint64 = _vma_node_start(encl)
+            encl_e: uint64 = _vma_node_end(encl)
+            # Alias ONLY for a STRICT sub-region of a larger enclosing
+            # reservation — the ld.so "reserve big, MAP_FIXED small
+            # segments inside" idiom. An EXACT-size MAP_FIXED over an
+            # identical existing VMA is a genuine REPLACE (Linux:
+            # MAP_FIXED always replaces); aliasing it would silently
+            # hand back the OLD pages. So fall through to the carve +
+            # fresh-overlay path unless the request is strictly
+            # smaller than the region it lands in.
+            if encl_s < addr_in or end_req < encl_e:
+                alias: uint64 = _vma_node_new()
+                if alias == 0:
+                    return cast[int64](-12)
+                _vma_node_set(alias, addr_in, end_req, prot, flags,
+                              file_fd, file_offset, 0, 0)
+                _vma_insert_sorted(slot, alias)
+                return cast[int64](addr_in)
+        # MAP_FIXED, not a strict sub-region: replace exactly
+        # [addr_in, end_req). Carve any prior mapping (split-aware —
+        # preserves the non-overlapping remainder of a straddled VMA)
+        # then overlay fresh pages at exactly addr_in.
         _vma_carve_range(slot, addr_in, end_req)
-        printk1("vma: MAP_FIXED at 0x%x not enclosed; addr as hint\n",
-                addr_in)
+        return _vma_alloc_fixed_at(slot, addr_in, length, prot, flags,
+                                   file_fd, file_offset)
 
     # Large request: more than one buddy MAX_ORDER chunk. Back it with
     # multiple chunks stitched into a contiguous virtual range. glibc's
@@ -729,27 +1049,128 @@ def vma_unmap(slot: uint64, addr: uint64, len_in: uint64) -> int64:
 # vma_protect (mprotect)
 # ---------------------------------------------------------------------
 
+VMA_PROT_W: int32 = 0x2          # PROT_WRITE — mirror linux PROT_*
+
+
 def vma_protect(slot: uint64, addr: uint64, len_in: uint64,
                 prot: int32) -> int64:
+    # §1: honest mprotect over an ARBITRARY range.
+    #
+    #   1. Re-walk the page table over [addr, addr+len) and update
+    #      every present PTE's RW bit to match PROT_WRITE — the real,
+    #      enforced effect (a store to a page mprotect'd PROT_READ now
+    #      faults in do_page_fault). Hamnix has no NX, so PROT_EXEC /
+    #      the read/exec split is not separately enforceable; the
+    #      writable bit is, and that is what mprotect's callers
+    #      (glibc relro, JITs toggling W^X) actually depend on.
+    #   2. Update the `prot` metadata on every covered VMA, SPLITTING
+    #      any VMA that the range only partially covers so the prot
+    #      field is accurate per-slice. A VMA must be made refcount-
+    #      managed before it is split (see _vma_split_at).
+    #
+    # Returns 0 on success, a negative errno on a bad argument / OOM.
     if len_in == 0:
         return cast[int64](-22)
     length: uint64 = (len_in + VMA_PAGE_SIZE - 1) & ~(VMA_PAGE_SIZE - 1)
-    end_v: uint64 = addr + length
+    addr_al: uint64 = addr & ~(VMA_PAGE_SIZE - 1)
+    end_v: uint64 = addr_al + length
+
+    want_write: int32 = 0
+    if (prot & VMA_PROT_W) != 0:
+        want_write = 1
+
+    # Step 1 — PTE re-walk. This is the load-bearing enforcement; do it
+    # first so the protection takes effect even if the metadata split
+    # below OOMs partway.
+    pml4: uint64 = task_pml4(cast[int32](slot))
+    if vm_protect_range(pml4, addr_al, end_v, want_write) < 0:
+        printk1("vma: mprotect PTE walk OOM @ 0x%x\n", addr_al)
+        return cast[int64](-12)
+
+    # Step 2 — metadata. Split partially-covered boundary VMAs so the
+    # prot field is accurate per-slice, then stamp prot on every fully-
+    # covered node.
     cur: uint64 = task_vma_list_head(slot)
     done: int32 = 0
     while cur != 0 and done == 0:
+        nxt: uint64 = _vma_node_get_next(cur)
         s: uint64 = _vma_node_start(cur)
         e: uint64 = _vma_node_end(cur)
-        if s < end_v and addr < e:
+        if s < end_v and addr_al < e:
+            # Trim a straddling head: keep [s, addr_al) at the old prot.
+            if s < addr_al:
+                if _vma_make_refcounted(slot, cur) >= 0:
+                    htail: uint64 = _vma_split_at(slot, cur, addr_al)
+                    if htail != 0:
+                        # Re-process the tail (the in-range part).
+                        cur = htail
+                        nxt = _vma_node_get_next(cur)
+                        s = _vma_node_start(cur)
+                        e = _vma_node_end(cur)
+            # Trim a straddling tail: keep [end_v, e) at the old prot.
+            if e > end_v and s < end_v:
+                if _vma_make_refcounted(slot, cur) >= 0:
+                    _vma_split_at(slot, cur, end_v)
+                    e = _vma_node_end(cur)
+            # `cur` is now within [addr_al, end_v): stamp the new prot.
             cast[Ptr[VmaNode]](cur)[0].prot = prot
         if s >= end_v:
             done = 1
-        else:
-            cur = _vma_node_get_next(cur)
-    # Always 0 — anything outside the VMA list is in the kernel's
-    # identity map which is RWX U=1 anyway. glibc-startup mprotect
-    # of GOT/relro pages used to succeed unconditionally and we keep
-    # that compat.
+        cur = nxt
+    return 0
+
+
+# ---------------------------------------------------------------------
+# §1 — vma_madvise (MADV_DONTNEED actually drops pages)
+# ---------------------------------------------------------------------
+
+MADV_DONTNEED: int32 = 4
+MADV_FREE:     int32 = 8
+MADV_REMOVE:   int32 = 9
+
+
+def vma_madvise(slot: uint64, addr: uint64, len_in: uint64,
+                advice: int32) -> int64:
+    # §1: madvise. Most advice values are hints with no backing
+    # readahead / swap state for Hamnix to act on — accepted as a
+    # no-op (return 0, never -EINVAL, so glibc's malloc-trim path
+    # stays quiet). MADV_DONTNEED / MADV_FREE / MADV_REMOVE, however,
+    # have an OBSERVABLE contract on anonymous memory: after the call
+    # the range reads back as zero. Hamnix has no demand paging, so we
+    # honour that by zeroing the physical pages in place — the next
+    # read genuinely sees zeros, which is exactly what a caller doing
+    # "madvise(buf, n, MADV_DONTNEED)" to cheaply reset a scratch
+    # buffer expects.
+    if len_in == 0:
+        return 0
+    if advice != MADV_DONTNEED and advice != MADV_FREE \
+       and advice != MADV_REMOVE:
+        # A pure hint — nothing to do, but never error.
+        return 0
+    length: uint64 = (len_in + VMA_PAGE_SIZE - 1) & ~(VMA_PAGE_SIZE - 1)
+    addr_al: uint64 = addr & ~(VMA_PAGE_SIZE - 1)
+    end_v: uint64 = addr_al + length
+    # Only zero memory that actually belongs to one of this task's
+    # VMAs — a DONTNEED on an unmapped range is a silent no-op (Linux
+    # returns -ENOMEM there, but a no-op is friendlier and no current
+    # caller checks). Walk page-by-page so a range spanning several
+    # VMAs (and gaps) is handled correctly.
+    va: uint64 = addr_al
+    while va < end_v:
+        node: uint64 = vma_find(slot, va)
+        if node != 0:
+            # The VMA's pages are identity-mapped (single / multi-chunk)
+            # or reached via the task's PML4; zeroing through the
+            # virtual address is correct for the running task (madvise
+            # only ever targets the CURRENT task). Skip a non-writable
+            # VMA: a memset there would take a genuine protection
+            # fault. A COW page is fine — the memset's write faults
+            # into the COW resolver, which copies then the zero lands
+            # privately, matching the DONTNEED contract.
+            np: int32 = cast[Ptr[VmaNode]](node)[0].prot
+            if (np & VMA_PROT_WRITE) != 0:
+                memset(cast[Ptr[uint8]](va), 0, VMA_PAGE_SIZE)
+        va = va + VMA_PAGE_SIZE
     return 0
 
 
@@ -821,6 +1242,7 @@ def vma_clear(slot: uint64):
 def vma_fork_copy(child_slot: uint64, parent_slot: uint64,
                   child_pml4: uint64) -> int32:
     parent_pml4: uint64 = task_pml4(cast[int32](parent_slot))
+    touched_parent: int32 = 0
     cur: uint64 = task_vma_list_head(parent_slot)
     while cur != 0:
         p_start:  uint64 = cast[Ptr[VmaNode]](cur)[0].start
@@ -831,36 +1253,78 @@ def vma_fork_copy(child_slot: uint64, parent_slot: uint64,
         p_off:    uint64 = cast[Ptr[VmaNode]](cur)[0].file_offset
         p_back:   uint64 = cast[Ptr[VmaNode]](cur)[0].backing
         p_nchunks: int32 = cast[Ptr[VmaNode]](cur)[0].nchunks
+        p_is_cow:    int32 = cast[Ptr[VmaNode]](cur)[0].is_cow
+        p_is_shared: int32 = cast[Ptr[VmaNode]](cur)[0].is_shared
+        p_is_pinned: int32 = cast[Ptr[VmaNode]](cur)[0].is_pinned
         node: uint64 = _vma_node_new()
         if node == 0:
             return -1
 
+        # Does this VMA hold (a share of) physical pages? A fresh owner
+        # has backing / chunks; but a node that was ALREADY refcount-
+        # managed by a prior fork or a VMA split (is_cow / is_shared /
+        # is_pinned) has backing == 0 yet STILL maps pages reachable
+        # through the page table — a grandchild fork must re-share
+        # those, not metadata-alias them (which would hand the
+        # grandchild writable pages with no COW protection). Only a
+        # genuine alias node — never refcount-managed, no backing —
+        # is a pure metadata copy.
         owns_pages: int32 = 0
         if p_nchunks > 0:
             owns_pages = 1
         elif p_back != 0:
             owns_pages = 1
+        elif p_is_cow != 0 or p_is_shared != 0 or p_is_pinned != 0:
+            owns_pages = 1
 
         if owns_pages != 0:
-            # Owner VMA — COW-share every page across [p_start, p_end)
-            # between parent and child. The child node mirrors the
-            # parent's metadata but owns NO private backing run: it
-            # shares the parent's physical pages COW. Both nodes are
-            # flagged is_cow so _vma_node_free routes their frees
-            # through cow_drop_page.
-            _vma_node_set(node, p_start, p_end, p_prot, p_flags,
-                          p_fd, p_off, 0, 0)
-            cast[Ptr[VmaNode]](node)[0].is_cow = 1
-            if vm_cow_share_range(parent_pml4, child_pml4,
+            is_shared: int32 = 0
+            if (p_flags & VMA_MAP_SHARED) != 0:
+                is_shared = 1
+            if is_shared != 0:
+                # §1 / MAP_SHARED — owner VMA is genuinely SHARED. The
+                # child maps the parent's SAME physical frames writable
+                # at the same vaddr (no COW marking, no copy-on-write
+                # split): a write by either process is visible to the
+                # other. Both nodes are flagged is_shared so
+                # _vma_node_free routes frees through cow_drop_page —
+                # the frame is released only when the last mapper
+                # unmaps it.
+                _vma_node_set(node, p_start, p_end, p_prot, p_flags,
+                              p_fd, p_off, 0, 0)
+                cast[Ptr[VmaNode]](node)[0].is_shared = 1
+                if vm_share_range(parent_pml4, child_pml4,
                                   p_start, p_end) < 0:
-                printk1("vma_fork: COW share OOM for VMA @ 0x%x\n",
-                        p_start)
-                kfree(node)
-                return -1
-            # The parent's pages are now COW-shared too — its node must
-            # also free through the refcount from here on.
-            cast[Ptr[VmaNode]](cur)[0].is_cow = 1
-            _vma_insert_sorted(child_slot, node)
+                    printk1("vma_fork: share OOM for VMA @ 0x%x\n",
+                            p_start)
+                    kfree(node)
+                    return -1
+                # The parent's frames are now multi-mapped; its node
+                # must also free through the refcount from here on.
+                cast[Ptr[VmaNode]](cur)[0].is_shared = 1
+                touched_parent = 1
+                _vma_insert_sorted(child_slot, node)
+            else:
+                # Owner VMA — COW-share every page across
+                # [p_start, p_end) between parent and child. The child
+                # node mirrors the parent's metadata but owns NO
+                # private backing run: it shares the parent's physical
+                # pages COW. Both nodes are flagged is_cow so
+                # _vma_node_free routes their frees through
+                # cow_drop_page.
+                _vma_node_set(node, p_start, p_end, p_prot, p_flags,
+                              p_fd, p_off, 0, 0)
+                cast[Ptr[VmaNode]](node)[0].is_cow = 1
+                if vm_cow_share_range(parent_pml4, child_pml4,
+                                      p_start, p_end) < 0:
+                    printk1("vma_fork: COW share OOM for VMA @ 0x%x\n",
+                            p_start)
+                    kfree(node)
+                    return -1
+                # The parent's pages are now COW-shared too — its node
+                # must also free through the refcount from here on.
+                cast[Ptr[VmaNode]](cur)[0].is_cow = 1
+                _vma_insert_sorted(child_slot, node)
         else:
             # Alias VMA (MAP_FIXED slice in an enclosing region): pure
             # metadata copy. Its pages were COW-shared via the enclosing
@@ -869,6 +1333,16 @@ def vma_fork_copy(child_slot: uint64, parent_slot: uint64,
                           p_fd, p_off, 0, 0)
             _vma_insert_sorted(child_slot, node)
         cur = cast[Ptr[VmaNode]](cur)[0].next
+    # §1: vm_share_range may have CRACKED parent huge-page identity
+    # entries down to 4 KiB PTs while adding the child's mappings. The
+    # cracked range maps the SAME frames at the SAME permissions, so it
+    # is correct as-is — but a stale parent TLB entry from the old huge
+    # page could linger. Reload the parent's CR3 once (drops every
+    # non-global TLB entry) so the parent's subsequent accesses to a
+    # shared region always go through the fresh 4 KiB PTEs. The COW
+    # path already invlpg's per page; only the shared path needs this.
+    if touched_parent != 0:
+        load_cr3(parent_pml4)
     return 0
 
 

@@ -45,7 +45,7 @@ from mm.memblock import memblock_alloc
 from mm.page_alloc import alloc_page, alloc_pages
 from mm.cow import (
     cow_share_page, cow_page_is_shared, cow_drop_page,
-    cow_boot_cr3,
+    cow_ref_inc, cow_boot_cr3,
 )
 from kernel.printk.printk import printk0, printk1, printk2
 from kernel.panic import panic
@@ -1313,6 +1313,164 @@ def vm_cow_share_range(parent_pml4: uint64, child_pml4: uint64,
     while vaddr < vhi:
         if _cow_share_one_page(parent_pml4, child_pml4, vaddr) < 0:
             return -1
+        vaddr = vaddr + PAGE_SIZE_4K
+    return 0
+
+
+# §1 / MAP_SHARED — genuine cross-process shared memory.
+#
+# vm_share_range is the SHARED counterpart of vm_cow_share_range: it
+# maps the parent's physical frames into the child's PML4 at the SAME
+# virtual address, KEEPING THEM WRITABLE in both — no COW marker, no
+# copy-on-write split. A write by either process lands in the same
+# physical frame and is immediately visible to the other (the
+# /dev/shm-style coherence MAP_SHARED promises).
+#
+# Each frame's per-PFN refcount (mm/cow.ad) is bumped so the frame is
+# returned to the buddy allocator only when the LAST mapper unmaps it.
+# The COW refcount table is reused as-is: cow_share_page goes 0->2 on
+# the first share (owner + child) and N->N+1 afterwards; the SHARED
+# VMA's free path routes every frame through cow_drop_page, which frees
+# only at refcount 0. is_cow and is_shared are mutually exclusive — a
+# shared frame is never COW-marked, so the #PF COW resolver never sees
+# it (a write to a shared page does not fault: it stays RW).
+
+def _share_one_page(parent_pml4: uint64, child_pml4: uint64,
+                    vaddr: uint64) -> int32:
+    # Map the single page at `vaddr` SHARED (writable) into the child.
+    # Returns 0 on success (or "nothing mapped here" — skipped), -1 on
+    # OOM cracking a page table.
+    pslot: uint64 = _cow_resolve_pte_slot(parent_pml4, vaddr)
+    if pslot == 0:
+        return -1
+    parent_pte: uint64 = cast[Ptr[uint64]](pslot)[0]
+    if (parent_pte & PT_FLAG_P) == 0:
+        return 0
+    phys: uint64 = parent_pte & PT_ADDR_MASK
+    cslot: uint64 = _cow_resolve_pte_slot(child_pml4, vaddr)
+    if cslot == 0:
+        return -1
+    # Child PTE -> SAME physical frame, present + user + WRITABLE. We
+    # deliberately do NOT clear RW and do NOT set the COW bit: a shared
+    # page must stay directly writable so neither side faults on a
+    # store. Preserve the parent PTE's low flag bits (PCD/PWT) and
+    # force present|user|RW.
+    parent_flags: uint64 = parent_pte & ~PT_ADDR_MASK
+    shared_flags: uint64 = parent_flags | PT_FLAG_RW \
+                           | PT_FLAG_P | PT_FLAG_US
+    cast[Ptr[uint64]](cslot)[0] = phys | shared_flags
+    # The parent keeps its existing writable PTE untouched — we only
+    # add a sharer. Account the new reference in the per-PFN table.
+    cow_share_page(phys)
+    return 0
+
+
+def vm_share_range(parent_pml4: uint64, child_pml4: uint64,
+                   vlo_in: uint64, vhi_in: uint64) -> int32:
+    # SHARE every present page in [vlo_in, vhi_in) — map the parent's
+    # frames writable in the child at the same vaddr. Returns 0 on
+    # success, -1 on OOM.
+    if vhi_in <= vlo_in:
+        return 0
+    vlo: uint64 = vlo_in & ~cast[uint64](PAGE_SIZE_4K - 1)
+    vhi: uint64 = (vhi_in + PAGE_SIZE_4K - 1) \
+                  & ~cast[uint64](PAGE_SIZE_4K - 1)
+    vaddr: uint64 = vlo
+    while vaddr < vhi:
+        if _share_one_page(parent_pml4, child_pml4, vaddr) < 0:
+            return -1
+        vaddr = vaddr + PAGE_SIZE_4K
+    return 0
+
+
+# §1 / mprotect — per-page PTE permission update.
+#
+# vm_protect_range re-walks the page table over [vlo, vhi) and updates
+# each present 4 KiB PTE's RW bit to match the requested protection:
+# PROT_WRITE in `prot` -> RW set; otherwise RW cleared. Hamnix has no
+# NX, so PROT_EXEC / PROT_READ are not separately enforceable, but the
+# writable bit IS — a store to a page mprotect'd PROT_READ then faults
+# in do_page_fault (a genuine, non-COW fault — exactly the protection
+# violation the caller asked the kernel to enforce).
+#
+# A page reached through a COW-shared PTE keeps its COW marker: we mask
+# the new RW bit through the COW state so a still-shared COW page that
+# is mprotect'd PROT_WRITE does not become silently writable (that
+# would skip the copy). Concretely — if the PTE has the COW bit set we
+# leave RW CLEARED regardless of `prot`; the first write still faults
+# into the COW resolver, which sets RW as part of resolution. A
+# mprotect to PROT_READ on a COW page just clears RW (already clear).
+#
+# `pml4_phys` is the target task's PML4. The range is cracked down to
+# 4 KiB granularity by _cow_resolve_pte_slot so every page gets a
+# private PTE before its RW bit is touched. Returns 0 on success, -1
+# on OOM.
+
+def vm_protect_range(pml4_phys: uint64, vlo_in: uint64, vhi_in: uint64,
+                     want_write: int32) -> int32:
+    if vhi_in <= vlo_in:
+        return 0
+    vlo: uint64 = vlo_in & ~cast[uint64](PAGE_SIZE_4K - 1)
+    vhi: uint64 = (vhi_in + PAGE_SIZE_4K - 1) \
+                  & ~cast[uint64](PAGE_SIZE_4K - 1)
+    vaddr: uint64 = vlo
+    while vaddr < vhi:
+        pslot: uint64 = _cow_resolve_pte_slot(pml4_phys, vaddr)
+        if pslot == 0:
+            return -1
+        pte: uint64 = cast[Ptr[uint64]](pslot)[0]
+        if (pte & PT_FLAG_P) != 0:
+            phys: uint64 = pte & PT_ADDR_MASK
+            flags: uint64 = pte & ~PT_ADDR_MASK
+            if (flags & PT_FLAG_COW) != 0:
+                # COW page: never force-writable here — the copy must
+                # happen via the #PF resolver. Just ensure RW stays
+                # clear so a write still faults.
+                flags = flags & ~PT_FLAG_RW
+            elif want_write != 0:
+                flags = flags | PT_FLAG_RW
+            else:
+                flags = flags & ~PT_FLAG_RW
+            cast[Ptr[uint64]](pslot)[0] = phys | flags
+            invlpg_one(vaddr)
+        vaddr = vaddr + PAGE_SIZE_4K
+    return 0
+
+
+# §1 / mm/vma.ad VMA splitting — bring a contiguous run under per-PFN
+# refcount management.
+#
+# A single-chunk VMA's virtual range IS its physical buddy run (Hamnix
+# runs identity-mapped). That run can only be freed as one whole
+# (base, order) — the buddy allocator cannot free a sub-range. So once
+# mprotect / MAP_FIXED needs to SPLIT such a VMA, no piece can own the
+# run outright: every piece must instead hold a per-frame refcount and
+# free through cow_drop_page, so the run is returned to the allocator
+# only when the last surviving piece releases its last frame.
+#
+# vm_pin_range cracks [vlo, vhi) to 4 KiB PTEs (so every frame is
+# reached through a private leaf) and takes ONE refcount on each
+# present frame. The caller (mm/vma.ad::_vma_make_refcounted) calls
+# this exactly once per owner VMA before its first split; afterwards
+# each split piece is flagged refcount-managed and frees via the same
+# _vma_free_cow_range path COW / shared nodes use. Returns 0 on
+# success, -1 on OOM cracking a table.
+
+def vm_pin_range(pml4_phys: uint64, vlo_in: uint64,
+                 vhi_in: uint64) -> int32:
+    if vhi_in <= vlo_in:
+        return 0
+    vlo: uint64 = vlo_in & ~cast[uint64](PAGE_SIZE_4K - 1)
+    vhi: uint64 = (vhi_in + PAGE_SIZE_4K - 1) \
+                  & ~cast[uint64](PAGE_SIZE_4K - 1)
+    vaddr: uint64 = vlo
+    while vaddr < vhi:
+        pslot: uint64 = _cow_resolve_pte_slot(pml4_phys, vaddr)
+        if pslot == 0:
+            return -1
+        pte: uint64 = cast[Ptr[uint64]](pslot)[0]
+        if (pte & PT_FLAG_P) != 0:
+            cow_ref_inc(pte & PT_ADDR_MASK)
         vaddr = vaddr + PAGE_SIZE_4K
     return 0
 

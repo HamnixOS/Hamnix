@@ -615,6 +615,30 @@ sys_rfork:
     .size sys_rfork, .-sys_rfork
 
 
+    /* --- sys_rfork_thread(flags, child_stack, tls) -> int32 ---------
+     * §1: the RFMEM (POSIX-thread) form of rfork. Creates a child that
+     * SHARES the caller's address space and runs on `child_stack` with
+     * `tls` as its %fs base (0 = inherit). The caller MUST set RFMEM in
+     * `flags`; without it the kernel takes the plain fork path and the
+     * extra args are ignored.
+     *
+     * SysV passes flags in %rdi (a0), child_stack in %rsi (a1), tls in
+     * %rdx (a2) — all three align with the syscall ABI's a0/a1/a2, no
+     * shuffle needed. %r9 (a5) carries the caller's %rbp exactly like
+     * sys_rfork: do_rfork patches the child's initial-stack frame
+     * pointer (the fork path uses it; the thread path ignores it since
+     * the child runs on its own stack). Returns child pid in the
+     * creator, 0 in the new thread, -EINVAL/-EAGAIN on error. */
+    .globl sys_rfork_thread
+    .type sys_rfork_thread, @function
+sys_rfork_thread:
+    movq    %rbp, %r9               /* a5 = creator user %rbp */
+    movq    $256, %rax              /* SYS_RFORK */
+    syscall
+    ret
+    .size sys_rfork_thread, .-sys_rfork_thread
+
+
     /* --- sys_srv_post(name, srvfd) -> int32 -------------------------
      * Phase D / V4: publish (name -> srvfd) into the kernel `srv`
      * table. `name` is a NUL-terminated leaf ("hamwd", not

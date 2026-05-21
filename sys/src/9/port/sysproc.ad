@@ -23,8 +23,8 @@
 
 from kernel.sched.core import (
     TaskStruct, current_task, current_idx_get,
-    create_user_task_argv,
-    task_pid_at, task_pml4,
+    create_user_task_argv, create_user_thread,
+    task_pid_at, task_pml4, set_task_cr3,
     set_task_vfork_done, set_task_fs_base,
     set_linux_userspace_mode,
     set_task_cwd, get_cwd_buf,
@@ -42,6 +42,8 @@ from kernel.sched.core import (
     task_image_lo, task_image_hi, set_task_image_range,
     task_ustack_lo, task_ustack_sz, set_task_ustack_range,
     task_brk_base, task_brk_end, task_brk_max, set_task_brk_range,
+    # §1 / rfork RFNOWAIT: detach a child so the parent never reaps it.
+    set_task_detached, set_task_parent_pid,
 )
 from fs.elf import vm_cow_share_all
 from mm.vma import vma_fork_copy
@@ -51,7 +53,7 @@ from mm.vma import vma_fork_copy
 # helper keeps the access pattern explicit. The function lives in
 # kernel/sched/core.ad and is added in M16.98 specifically for this.
 from kernel.sched.core import task_initial_sp
-from kernel.printk.printk import printk0, printk1
+from kernel.printk.printk import printk1
 # V2.5: per-process group (Pgrp) lifecycle. pgrp_clone() deep-copies
 # the parent's mtab into a fresh slot (ref=1); pgrp_alloc() hands back
 # a fresh empty Pgrp (ref=1); pgrp_ref_inc() bumps the share path's
@@ -221,7 +223,126 @@ def _rfork_setup_note_group(child_slot: int32, parent: Ptr[TaskStruct],
     set_task_note_group(child_slot, task_note_group(cur))
 
 
-def do_rfork(flags: int32, user_rbp: uint64) -> int32:
+def _rfork_thread(f: uint64, child_stack: uint64, tls: uint64) -> int32:
+    # §1: RFMEM thread path — the native Plan 9-side equivalent of
+    # do_clone()'s CLONE_VM | CLONE_THREAD branch. The child SHARES the
+    # parent's whole address space (VMAs, image, heap) and runs on a
+    # CALLER-SUPPLIED stack, optionally with its own TLS base.
+    #
+    # Boundary discipline: this path shares the SAME underlying kernel
+    # primitives do_clone uses (create_user_thread + set_task_cr3 PML4
+    # share + set_task_fs_base TLS) — it is NOT a consumer of any
+    # Layer-2 confined object (no futex / eventfd). futex-based join
+    # is a userland concern; rfork itself only needs the address-space
+    # share + stack/TLS plumbing, all of which are Layer-1 primitives.
+    #
+    # Contract (mirrors rfork(2) for the thread case, Hamnix-extended
+    # with an explicit child_stack so the child does not clobber the
+    # parent's stack the instant both return — real Plan 9 leaves that
+    # hazard to libthread; Hamnix closes it at the syscall):
+    #   * child_stack MUST be non-zero — a thread with no private stack
+    #     would corrupt the parent's. -EINVAL otherwise.
+    #   * tls != 0 installs the child's %fs base (CLONE_SETTLS-shape);
+    #     tls == 0 leaves it inheriting the parent's.
+    #   * returns the child pid in the parent, 0 in the child.
+    parent: Ptr[TaskStruct] = current_task()
+    kstack_top: uint64 = parent[0].kstack_top
+    parent_user_rip: uint64 = cast[Ptr[uint64]](kstack_top - 24)[0]
+
+    if child_stack == 0:
+        set_current_errstr("rfork: RFMEM thread needs child stack")
+        return -22                              # -EINVAL
+
+    # create_user_thread builds the iret frame returning to CPL=3 at
+    # parent_user_rip on the caller-supplied stack. The child resumes
+    # at the instruction right after the rfork syscall — same RIP as
+    # the parent — but on its own stack, so the Plan 9 contract "both
+    # return from rfork" holds with no stack collision. We pass 0 for
+    # user_r9/rdx/r8: the native rfork-thread ABI does not park a
+    # worker function in a register (that is a musl/glibc __clone
+    # detail); the child simply runs straight-line user code.
+    slot: int32 = create_user_thread(parent_user_rip,
+                                     0x5f5f72667468725f,    # "__rfthr_"
+                                     child_stack, 0, 0,
+                                     0, 0, 0)
+    if slot < 0:
+        set_current_errstr("rfork: out of tasks")
+        return -11                              # -EAGAIN
+
+    # RFMEM == share the address space. The thread must run on the
+    # SAME PML4 as its creator — not the fresh BSP-clone create_user_-
+    # thread allocated — so every per-task page-table overlay (mmap
+    # VMAs, multi-chunk large mappings) is visible to it. Identical to
+    # do_clone's set_task_cr3 step.
+    set_task_cr3(slot, task_pml4(cast[int32](current_idx_get())))
+
+    # Inherit the ABI mode. Native rfork callers are is_linux_userspace
+    # == 0; mirror defensively so a future Linux consumer of native
+    # rfork still dispatches correctly.
+    if parent[0].is_linux_userspace != 0:
+        set_linux_userspace_mode(slot, 1)
+
+    # Share the fd table — RFMEM threads share I/O state (Plan 9's
+    # rfork(RFPROC|RFMEM) shares fds unless RFFDG is also given). Deep-
+    # copy is the only mechanism we have; mark both refcounts so future
+    # real sharing can detect the invariant. Honour RFFDG as "private
+    # copy" the same way the fork path does.
+    pidx: int32 = cast[int32](current_idx_get())
+    i: uint64 = 0
+    while i < 16:
+        dup_fd_to_child(slot, i, parent, i)
+        i = i + 1
+    if (f & RFFDG) != 0:
+        set_task_fd_table_refcount(slot, 1)
+    else:
+        set_task_fd_table_refcount(slot, 2)
+        prc: int32 = task_fd_table_refcount(pidx)
+        if prc < 1:
+            prc = 1
+        set_task_fd_table_refcount(pidx, prc + 1)
+
+    # Share cwd + namespace + note group. A thread shares its creator's
+    # namespace by default (RFNAMEG / RFCNAMEG / RFNOTEG still honoured
+    # via the same helpers the fork path uses).
+    set_task_cwd(cast[uint64](slot), get_cwd_buf(current_idx_get()))
+    _rfork_setup_namespace(slot, parent, f)
+    _rfork_setup_note_group(slot, parent, f)
+
+    # The thread shares the parent's address space, so it shares the
+    # heap + loaded image span. Propagate the brk cursors + image range
+    # explicitly (create_user_thread's fresh-task branch zeroed them
+    # because the native rfork-thread call passes user_r9=0). ustack_*
+    # stays 0 — the thread runs on its own caller-supplied stack, which
+    # is not a fork-copied region.
+    cu: uint64 = current_idx_get()
+    cslot: uint64 = cast[uint64](slot)
+    set_task_brk_range(cslot, task_brk_base(cu),
+                       task_brk_end(cu), task_brk_max(cu))
+    set_task_image_range(cslot, task_image_lo(cu), task_image_hi(cu))
+
+    # CLONE_SETTLS-shape: install the child's %fs base if the caller
+    # supplied one. schedule()'s wrmsr restores it on first dispatch;
+    # we do NOT wrmsr here (the parent is still running and a wrmsr
+    # would clobber HER %fs). tls == 0 -> inherit the parent's fs_base.
+    if tls != 0:
+        set_task_fs_base(slot, tls)
+    else:
+        set_task_fs_base(slot, parent[0].fs_base)
+    set_task_vfork_done(slot, 1)
+
+    # RFNOWAIT detaches the thread so the creator never has to reap it.
+    if (f & RFNOWAIT) != 0:
+        set_task_detached(slot, 1)
+        set_task_parent_pid(slot, 0)
+
+    child_pid: uint64 = task_pid_at(slot)
+    printk1("rfork: RFMEM thread created, pid=%d\n",
+            cast[int32](child_pid))
+    return cast[int32](child_pid)
+
+
+def do_rfork(flags: int32, child_stack: uint64, tls: uint64,
+             user_rbp: uint64) -> int32:
     # Plan 9-shape process / namespace primitive. Behaviour pivots on
     # whether RFPROC is set:
     #
@@ -239,6 +360,9 @@ def do_rfork(flags: int32, user_rbp: uint64) -> int32:
     # `flags` is signed int32 for symmetry with the Plan 9 prototype
     # (rfork(int) at the C level); we widen to uint64 internally so
     # bit-masking against 0x100 / 0x200 doesn't sign-extend.
+    # `child_stack` / `tls` are consumed ONLY on the RFMEM thread path
+    # (a0=flags, a1=child_stack, a2=tls — see user/runtime.S::
+    # sys_rfork_thread). The plain fork wrapper sys_rfork leaves them 0.
     # `user_rbp` is the parent's user-side %rbp, captured by the
     # syscall wrapper in user/runtime.S::sys_rfork and forwarded
     # through the SYS_RFORK dispatch site as syscall arg a5. We need
@@ -299,22 +423,13 @@ def do_rfork(flags: int32, user_rbp: uint64) -> int32:
     # Mirror do_clone()'s fork branch in arch/x86/kernel/syscall.ad
     # but parameterised by RF* bits instead of hard-coded
     # vfork-style semantics. RFMEM is the equivalent of CLONE_VM
-    # (POSIX thread); we DO NOT implement a separate thread path
-    # in this commit because (a) the test we're shipping uses the
-    # POSIX-fork idiom RFPROC|RFFDG|RFNAMEG|RFENVG, and (b) the
-    # full thread path needs caller-supplied child_stack +
-    # CLONE_SETTLS-shape TLS plumbing — those land in a follow-up
-    # milestone.
+    # (POSIX thread): the child shares the parent's address space and
+    # runs on a caller-supplied stack. §1 lands that path here —
+    # _rfork_thread mirrors do_clone's CLONE_VM|CLONE_THREAD branch
+    # using the SAME Layer-1 primitives (PML4 share + per-task fs_base),
+    # not any Layer-2 confined object.
     if (f & RFMEM) != 0:
-        # Acceptable shape but not yet implemented. Plan 9 itself
-        # supports rfork(RFPROC|RFMEM) as "thread with own stack"
-        # — Hamnix will route that through this same body once the
-        # thread machinery merges with the fork machinery. For
-        # now, surface as -ENOSYS so userland sees the deferral
-        # cleanly instead of silently getting fork semantics.
-        printk0("rfork: RFMEM (thread path) not yet implemented\n")
-        set_current_errstr("rfork: RFMEM not yet supported")
-        return -38                              # -ENOSYS
+        return _rfork_thread(f, child_stack, tls)
 
     parent: Ptr[TaskStruct] = current_task()
     kstack_top: uint64 = parent[0].kstack_top
@@ -419,14 +534,13 @@ def do_rfork(flags: int32, user_rbp: uint64) -> int32:
     _rfork_setup_note_group(slot, parent, f)
 
     # RFNOWAIT semantically detaches the child so the parent never
-    # reaps. Hamnix's current parent-pid model is a single uint64 on
-    # the child; we'd flip it to 0 (init) to surface "no waitable
-    # ancestor". The TaskStruct field exists; we leave it alone for
-    # now because none of the current callers exercise the detach
-    # path, and zeroing it would break the existing parent_pid =
-    # current_idx assumption that create_user_task_argv installed.
-    # Real detach handling lands when wait() learns to drop
-    # RFNOWAIT children automatically.
+    # reaps it. §1: set the detached flag + sever the parent_pid link.
+    # task_exit_current then self-reaps the child (STATE_FREE instead
+    # of STATE_EXITED) so it never lingers as a zombie, and a wait4 /
+    # waitpid on its pid returns -ECHILD instead of blocking forever.
+    if (f & RFNOWAIT) != 0:
+        set_task_detached(slot, 1)
+        set_task_parent_pid(slot, 0)
 
     # RFENVG semantics: copy environment. The environment lives on the
     # user stack as part of the auxv layout built at spawn/execve time.
