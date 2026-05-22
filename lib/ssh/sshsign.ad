@@ -14,17 +14,28 @@
 #   s = k^{-1} * (e + r*d) mod n      (retry if s == 0)
 #   signature = (r, s)
 #
-# NONCE k — DETERMINISTIC, NOT RFC 6979:
-#   Hamnix userland has no crypto-grade RNG (the /dev/random backend is
-#   an xorshift placeholder). A random k drawn from a weak PRNG would
-#   leak the private key. Instead we derive k deterministically from
-#   the private key d and the message hash:
-#       k = SHA-256(d_bytes || H || counter) mod n
-#   incrementing `counter` until k is in range. This is a SIMPLIFIED
-#   deterministic nonce — not the full HMAC-DRBG of RFC 6979 — but it
-#   is deterministic (no entropy needed) and unpredictable to anyone
-#   who does not know d, which is the security property that matters.
-#   A full RFC 6979 HMAC-DRBG is a worthwhile follow-up.
+# NONCE k — RFC 6979 DETERMINISTIC (HMAC-SHA256 DRBG):
+#   Hamnix's /dev/random is now a real ChaCha20+RDSEED CSPRNG, but a
+#   deterministic nonce is still the right choice: it removes ALL RNG
+#   dependence from the signing path, so a (hypothetical) RNG fault can
+#   never produce a repeated or biased k — and a repeated/biased ECDSA
+#   nonce leaks the private key outright. RFC 6979 §3.2 derives k from
+#   the private key d and the message hash h1 via an HMAC-SHA256
+#   DRBG; the result is uniform in [1, q-1] and unpredictable to anyone
+#   who does not know d. For P-256, qlen == hlen == 256 bits, so the
+#   bits2int / bits2octets steps collapse to "take 32 bytes, reduce
+#   once mod n if >= n" — implemented in _rfc6979_bits_mod_n below.
+#
+#   RFC 6979 §3.2 step-by-step (q = P256_N, hlen = 32):
+#     a. h1 = H(message)                    (the 32-byte digest)
+#     b. V = 0x01 repeated 32 times
+#     c. K = 0x00 repeated 32 times
+#     d. K = HMAC_K(V || 0x00 || int2octets(d) || bits2octets(h1))
+#     e. V = HMAC_K(V)
+#     f. K = HMAC_K(V || 0x01 || int2octets(d) || bits2octets(h1))
+#     g. V = HMAC_K(V)
+#     h. loop: T = HMAC_K(V); k = bits2int(T); accept if 1<=k<q,
+#        else K = HMAC_K(V || 0x00), V = HMAC_K(V), retry.
 #
 # CONST-TIME DISCLOSURE: inherits lib/ec/p256.ad's non-constant-time
 # scalar multiply. The signing nonce k IS secret, so this leaks via
@@ -74,25 +85,187 @@ def _sshsign_hash_to_scalar(out: Ptr[uint64], hash32: Ptr[uint8]):
         p256_copy(out, &red[0])
 
 
-# Derive the deterministic nonce k for a given (d, digest, counter).
-# k is returned in limb form; the caller checks sn_in_range and bumps
-# counter on a miss. `digest` is the 32-byte SHA-256(message) — the
-# same e-source the signature is computed over.
-_sshsign_kmat: Array[65, uint8]    # d(32) || digest(32) || counter(1)
-_sshsign_khash: Array[32, uint8]
+# --- HMAC-SHA256 (RFC 2104) ---------------------------------------------
+#
+# RFC 6979's DRBG is built on HMAC with the same hash the signature
+# uses (SHA-256 here). SHA-256's block size B is 64 bytes; the key is
+# always 32 bytes in the RFC 6979 use, so the B > keylen pad path is
+# the only one exercised — but we handle keylen <= B fully for
+# correctness. Scratch buffers are module-scope flat arrays (the
+# top-level-BSS Array discipline; signing is single-threaded).
+
+_hmac_k0:      Array[64, uint8]      # key padded/zeroed to the block size
+_hmac_ipad:    Array[64, uint8]
+_hmac_opad:    Array[64, uint8]
+_hmac_inner:   Array[1024, uint8]    # ipad(64) || message
+_hmac_inner_h: Array[32, uint8]
+_hmac_outer:   Array[96, uint8]      # opad(64) || inner-hash(32)
 
 
-def _sshsign_derive_k(out_k: Ptr[uint64], d_be: Ptr[uint8],
-                      digest: Ptr[uint8], counter: uint8):
+def _hmac_sha256(key: Ptr[uint8], key_len: uint64,
+                 msg: Ptr[uint8], msg_len: uint64, out32: Ptr[uint8]):
+    # HMAC-SHA256(key, msg). msg_len must be <= 960 (inner buffer is
+    # 1024 with a 64-byte ipad prefix). RFC 6979's DRBG messages are
+    # short (V || tag || d || h1 == 32+1+32+32 = 97 bytes at most), so
+    # this bound is never approached.
+    i: uint64 = 0
+    while i < 64:
+        _hmac_k0[i] = 0
+        i = i + 1
+    if key_len > 64:
+        # K0 = H(key) padded with zeros.
+        ecdsa_sha256(key, key_len, &_hmac_k0[0])
+    else:
+        i = 0
+        while i < key_len:
+            _hmac_k0[i] = key[i]
+            i = i + 1
+    i = 0
+    while i < 64:
+        _hmac_ipad[i] = _hmac_k0[i] ^ 0x36
+        _hmac_opad[i] = _hmac_k0[i] ^ 0x5C
+        i = i + 1
+    # inner = H(ipad || msg).
+    i = 0
+    while i < 64:
+        _hmac_inner[i] = _hmac_ipad[i]
+        i = i + 1
+    i = 0
+    while i < msg_len:
+        _hmac_inner[64 + i] = msg[i]
+        i = i + 1
+    ecdsa_sha256(&_hmac_inner[0], 64 + msg_len, &_hmac_inner_h[0])
+    # out = H(opad || inner).
+    i = 0
+    while i < 64:
+        _hmac_outer[i] = _hmac_opad[i]
+        i = i + 1
+    i = 0
+    while i < 32:
+        _hmac_outer[64 + i] = _hmac_inner_h[i]
+        i = i + 1
+    ecdsa_sha256(&_hmac_outer[0], cast[uint64](96), out32)
+
+
+# --- RFC 6979 deterministic-nonce DRBG ----------------------------------
+#
+# State: V and K, each 32 bytes (= hlen for SHA-256). The DRBG is
+# initialised once per signing operation by _rfc6979_init, then
+# _rfc6979_next is called to draw each candidate k. A candidate that
+# is out of [1, n-1] is rejected by the caller, which calls
+# _rfc6979_next again — RFC 6979 §3.2 step h's K/V update is done
+# inside _rfc6979_next so a re-draw is a plain repeated call.
+
+_rfc6979_v:  Array[32, uint8]
+_rfc6979_k:  Array[32, uint8]
+_rfc6979_drawn: int32 = 0            # 0 before the first _rfc6979_next
+
+# Scratch for the HMAC message V || tag || d || h1 (97 bytes max).
+_rfc6979_msg: Array[128, uint8]
+# bits2octets(h1): h1 reduced mod n, 32 big-endian bytes.
+_rfc6979_h1n: Array[32, uint8]
+
+
+# Reduce a 32-byte big-endian value once mod n if it is >= n. For
+# P-256 a SHA-256 digest is at most 2^256-1 and n > 2^255, so a single
+# conditional subtraction suffices. This is exactly bits2octets /
+# bits2int when qlen == hlen == 256 (RFC 6979 §2.3.2 / §2.3.4).
+def _rfc6979_bits_mod_n(out_be: Ptr[uint8], in_be: Ptr[uint8]):
+    v: Array[4, uint64]
+    p256_be_to_limbs(&v[0], in_be, cast[uint64](32))
+    if p256_ge(&v[0], &P256_N[0]) != 0:
+        i: uint64 = 0
+        borrow: uint64 = 0
+        red: Array[4, uint64]
+        while i < 4:
+            vi: uint64 = v[i]
+            ni: uint64 = P256_N[i]
+            d: uint64 = vi - ni
+            b1: uint64 = 0
+            if vi < ni:
+                b1 = 1
+            d2: uint64 = d - borrow
+            b2: uint64 = 0
+            if d < borrow:
+                b2 = 1
+            red[i] = d2
+            borrow = b1 + b2
+            i = i + 1
+        p256_copy(&v[0], &red[0])
+    _sshsign_limbs_to_be(out_be, &v[0])
+
+
+# RFC 6979 §3.2 steps a..g — initialise V and K from (d, digest).
+def _rfc6979_init(d_be: Ptr[uint8], digest: Ptr[uint8]):
+    # bits2octets(h1) = h1 mod n, 32 BE bytes.
+    _rfc6979_bits_mod_n(&_rfc6979_h1n[0], digest)
+    # b. V = 0x01 * 32 ;  c. K = 0x00 * 32.
     i: uint64 = 0
     while i < 32:
-        _sshsign_kmat[i] = d_be[i]
-        _sshsign_kmat[32 + i] = digest[i]
+        _rfc6979_v[i] = 0x01
+        _rfc6979_k[i] = 0x00
         i = i + 1
-    _sshsign_kmat[64] = counter
-    ecdsa_sha256(&_sshsign_kmat[0], cast[uint64](65),
-                 &_sshsign_khash[0])
-    p256_be_to_limbs(out_k, &_sshsign_khash[0], cast[uint64](32))
+    # d. K = HMAC_K(V || 0x00 || int2octets(d) || bits2octets(h1)).
+    #    int2octets(d) is d itself — already a 32-byte BE scalar.
+    i = 0
+    while i < 32:
+        _rfc6979_msg[i] = _rfc6979_v[i]
+        i = i + 1
+    _rfc6979_msg[32] = 0x00
+    i = 0
+    while i < 32:
+        _rfc6979_msg[33 + i] = d_be[i]
+        _rfc6979_msg[65 + i] = _rfc6979_h1n[i]
+        i = i + 1
+    _hmac_sha256(&_rfc6979_k[0], cast[uint64](32),
+                 &_rfc6979_msg[0], cast[uint64](97), &_rfc6979_k[0])
+    # e. V = HMAC_K(V).
+    _hmac_sha256(&_rfc6979_k[0], cast[uint64](32),
+                 &_rfc6979_v[0], cast[uint64](32), &_rfc6979_v[0])
+    # f. K = HMAC_K(V || 0x01 || int2octets(d) || bits2octets(h1)).
+    i = 0
+    while i < 32:
+        _rfc6979_msg[i] = _rfc6979_v[i]
+        i = i + 1
+    _rfc6979_msg[32] = 0x01
+    i = 0
+    while i < 32:
+        _rfc6979_msg[33 + i] = d_be[i]
+        _rfc6979_msg[65 + i] = _rfc6979_h1n[i]
+        i = i + 1
+    _hmac_sha256(&_rfc6979_k[0], cast[uint64](32),
+                 &_rfc6979_msg[0], cast[uint64](97), &_rfc6979_k[0])
+    # g. V = HMAC_K(V).
+    _hmac_sha256(&_rfc6979_k[0], cast[uint64](32),
+                 &_rfc6979_v[0], cast[uint64](32), &_rfc6979_v[0])
+    _rfc6979_drawn = 0
+
+
+# RFC 6979 §3.2 step h — draw the next candidate nonce. On the first
+# call after _rfc6979_init this returns bits2int(HMAC_K(V)); on each
+# subsequent call it first runs the K/V re-key (the step-h "if k is
+# not in [1,q-1]" branch) and then draws again. Result lands in
+# out_k (limb form). The caller checks sn_in_range and re-calls on a
+# miss.
+def _rfc6979_next(out_k: Ptr[uint64]):
+    if _rfc6979_drawn != 0:
+        # Re-key: K = HMAC_K(V || 0x00) ;  V = HMAC_K(V).
+        i: uint64 = 0
+        while i < 32:
+            _rfc6979_msg[i] = _rfc6979_v[i]
+            i = i + 1
+        _rfc6979_msg[32] = 0x00
+        _hmac_sha256(&_rfc6979_k[0], cast[uint64](32),
+                     &_rfc6979_msg[0], cast[uint64](33), &_rfc6979_k[0])
+        _hmac_sha256(&_rfc6979_k[0], cast[uint64](32),
+                     &_rfc6979_v[0], cast[uint64](32), &_rfc6979_v[0])
+    # T = HMAC_K(V).  hlen == qlen == 256, so a single block is exactly
+    # one 256-bit candidate (no T-accumulation loop needed).
+    _hmac_sha256(&_rfc6979_k[0], cast[uint64](32),
+                 &_rfc6979_v[0], cast[uint64](32), &_rfc6979_v[0])
+    # bits2int(T) — qlen == hlen, no shift; just load the 32 bytes.
+    p256_be_to_limbs(out_k, &_rfc6979_v[0], cast[uint64](32))
+    _rfc6979_drawn = 1
 
 
 # Scratch for the message digest SHA-256(message).
@@ -129,10 +302,15 @@ def ecdsa_p256_sign(d_be: Ptr[uint8], msg: Ptr[uint8], msg_len: uint64,
     if sn_in_range(&d[0]) == 0:
         return -1
 
+    # Seed the RFC 6979 HMAC-SHA256 DRBG from (d, digest). Each
+    # _rfc6979_next draws a candidate nonce; an out-of-range one or a
+    # degenerate (r==0 / s==0) signature triggers the RFC's K/V re-key
+    # on the next draw. 16 draws is an astronomically loose bound.
+    _rfc6979_init(d_be, &_sshsign_digest[0])
     counter: uint8 = 0
     while counter < 16:
         k: Array[4, uint64]
-        _sshsign_derive_k(&k[0], d_be, &_sshsign_digest[0], counter)
+        _rfc6979_next(&k[0])
         counter = counter + 1
         # k must be a usable scalar in [1, n-1].
         if sn_in_range(&k[0]) == 0:

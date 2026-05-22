@@ -173,6 +173,24 @@ if os.environ.get("HAMNIX_HTTPD_DOCROOT") == "1":
     FILES.append(("/var/www/hello.txt",
                   b"hello from hamnix httpd\n"))
 
+# sshd publickey auth: scripts/test_sshd_pubkey.sh generates a
+# throwaway ECDSA-P256 keypair on the host, points HAMNIX_SSH_AUTHKEYS
+# at the public-key file, and this block bakes it into the cpio
+# initramfs at /var/lib/ssh/authorized_keys. user/sshd.ad reads that
+# path (the daemon's /var/lib/ssh namespace dir) at startup and
+# authenticates a client offering the matching private key. A /var
+# path tmpfs does not itself hold falls through to this cpio-baked
+# entry (see the fs/vfs.ad /var dispatch note). Off-default: an unset
+# env var leaves the initramfs alone, like every other gated marker.
+_SSH_AUTHKEYS = os.environ.get("HAMNIX_SSH_AUTHKEYS", "")
+if _SSH_AUTHKEYS:
+    try:
+        with open(_SSH_AUTHKEYS, "rb") as _f:
+            FILES.append(("/var/lib/ssh/authorized_keys", _f.read()))
+    except OSError as _e:
+        raise SystemExit(
+            f"HAMNIX_SSH_AUTHKEYS={_SSH_AUTHKEYS}: unreadable ({_e})")
+
 # V5 cert validation: bake the production ISRG Root X1 anchor into the
 # initramfs at /etc/tls-ca-isrg-x1.der whenever the host has it
 # installed. drivers/net/tls.ad's _tls_validation_init() walks the cpio

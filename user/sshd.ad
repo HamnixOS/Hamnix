@@ -12,21 +12,36 @@
 #     exchange hash H signed with ECDSA-P256.
 #   * Cipher: chacha20-poly1305@openssh.com for the encrypted packet
 #     stream once NEWKEYS is exchanged.
-#   * User auth (RFC 4252): the `password` method against a fixed
-#     credential (see SSHD_USER / SSHD_PASS below).
+#   * User auth (RFC 4252): the `publickey` method (RFC 4252 §7,
+#     RFC 5656 — ecdsa-sha2-nistp256) verified against an
+#     authorized_keys file, AND the `password` method against a fixed
+#     credential. publickey is tried first; password is the fallback.
 #   * Connection layer (RFC 4254): one `session` channel, a minimal
 #     pty-req accept + `shell`, then hamsh is spawned and the channel's
 #     data is bridged to hamsh's stdin/stdout via two pipes.
 #
-# FIXED CREDENTIAL — V1 has no /etc/shadow integration. The accepted
-# login is user "root", password "hamnix" (SSHD_USER / SSHD_PASS).
-# This is a deliberate, clearly-flagged V1 simplification.
+# FIXED PASSWORD CREDENTIAL — V1 has no /etc/shadow integration. The
+# password fallback accepts user "root", password "hamnix"
+# (SSHD_USER / SSHD_PASS). A deliberate, clearly-flagged V1
+# simplification; publickey auth is the real path.
 #
-# FIXED HOST KEY — the ECDSA-P256 host private scalar is a build-time
-# constant (SSHD_HOSTKEY_D). A real deployment would generate one per
-# host and persist it; for the V1 milestone a fixed key is acceptable
-# and keeps the daemon stateless. The host key fingerprint is therefore
-# the same on every Hamnix boot — flagged, not a bug.
+# GENERATED HOST KEY — the ECDSA-P256 host private scalar is generated
+# on first start from /dev/random (a real ChaCha20+RDSEED CSPRNG) and
+# persisted at /var/lib/ssh/ssh_host_ecdsa_key. On every later start
+# the existing key is loaded, so each Hamnix system keeps a stable identity
+# (a consistent fingerprint) across reboots within a /var lifetime.
+# /var is RAM-backed today, so the key regenerates if /var is wiped —
+# correct behaviour: a fresh /var is a fresh host identity.
+#
+# AUTHORIZED KEYS — publickey auth reads an OpenSSH-format
+# authorized_keys file at /var/lib/ssh/authorized_keys (one
+# `ecdsa-sha2-nistp256 <base64-blob> [comment]` line per key). A
+# client offering a key listed there, with a valid signature over the
+# session-scoped blob, is authenticated.
+#
+# NAMESPACE — both files live under /var/lib/ssh/ (the daemon's
+# namespace-reachable state directory, pre-created by the tmpfs /var
+# skeleton), NOT a hardcoded global /etc/ssh path.
 #
 # Build:
 #   python3 -m compiler.adder compile --target=x86_64-adder-user \
@@ -46,15 +61,21 @@ from lib.ssh.sshcrypto import (
 )
 from lib.ssh.sshsign import ecdsa_p256_sign
 from lib.ec.p256 import (
-    P256Point, P256_GX, P256_GY,
+    P256Point, P256_GX, P256_GY, P256_N,
     p256_init, p256_copy, p256_be_to_limbs, p256_scalar_mul_g,
+    p256_is_zero, p256_ge,
 )
-from lib.ecdsa.ecdsa import ecdsa_sha256, ecdsa_init
+from lib.ecdsa.ecdsa import (
+    EcdsaPubkey, ecdsa_sha256, ecdsa_init,
+    ecdsa_parse_pubkey, ecdsa_p256_verify_rs,
+)
 
 extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_close(fd: int32) -> int32
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
 extern def sys_exit(code: uint64)
 extern def sys_socket(domain: int32, sock_type: int32,
                       proto: int32) -> int32
@@ -90,6 +111,7 @@ SSH_MSG_USERAUTH_REQUEST: uint8 = 50
 SSH_MSG_USERAUTH_FAILURE: uint8 = 51
 SSH_MSG_USERAUTH_SUCCESS: uint8 = 52
 SSH_MSG_USERAUTH_BANNER:  uint8 = 53
+SSH_MSG_USERAUTH_PK_OK:   uint8 = 60
 SSH_MSG_GLOBAL_REQUEST:   uint8 = 80
 SSH_MSG_CHANNEL_OPEN:              uint8 = 90
 SSH_MSG_CHANNEL_OPEN_CONFIRMATION: uint8 = 91
@@ -603,15 +625,29 @@ def _build_kexinit():
 
 
 # === host key (ecdsa-sha2-nistp256) ======================================
+#
+# The host key is GENERATED on first start and PERSISTED so the host
+# keeps a stable identity. The on-disk format is dead simple: the raw
+# 32-byte big-endian private scalar d. (Q is recomputed as d*G on
+# every load — there is no need to store the public half.)
 
-# The fixed host private scalar d (32-byte big-endian). A real host
-# would generate + persist its own; for V1 this constant IS the key.
-# Value: a fixed, nonzero scalar well inside [1, n-1].
+# The host private scalar d (32-byte big-endian, 1 <= d < n).
 sshd_hostkey_d: Array[32, uint8]
 
 # Host public key point Q = d*G, stored as 65-byte SEC1 uncompressed
 # (0x04 || X(32) || Y(32)).
 host_q: Array[65, uint8]
+
+# Scratch for reading/writing the host-key file.
+hostkey_io: Array[64, uint8]
+
+
+# Persisted host-key path. Under /var/lib/ssh — the daemon's
+# namespace-reachable state dir, NOT a global /etc path. Returned as
+# a fresh Ptr[char] each call (string-literal module globals are not
+# supported by the Adder compiler; a function-local literal is).
+def _hostkey_path() -> Ptr[char]:
+    return cast[Ptr[char]]("/var/lib/ssh/ssh_host_ecdsa_key")
 
 
 def _limbs_to_be32(out_be: Ptr[uint8], limbs: Ptr[uint64]):
@@ -623,25 +659,108 @@ def _limbs_to_be32(out_be: Ptr[uint8], limbs: Ptr[uint64]):
         i = i + 1
 
 
-def _init_host_key():
-    # Fill the fixed host private scalar, then compute Q = d*G and the
-    # SEC1 public point + the K_S host-key blob.
-    di: uint64 = 0
-    while di < 32:
-        sshd_hostkey_d[di] = 0
-        di = di + 1
-    # d = a fixed 256-bit value (big-endian). Chosen arbitrary, < n.
-    sshd_hostkey_d[0]  = 0x4A
-    sshd_hostkey_d[1]  = 0x3C
-    sshd_hostkey_d[2]  = 0x91
-    sshd_hostkey_d[3]  = 0x18
-    sshd_hostkey_d[7]  = 0x5D
-    sshd_hostkey_d[11] = 0xA2
-    sshd_hostkey_d[15] = 0x7E
-    sshd_hostkey_d[19] = 0xC4
-    sshd_hostkey_d[23] = 0x1B
-    sshd_hostkey_d[27] = 0x33
-    sshd_hostkey_d[31] = 0x65
+# A 32-byte big-endian scalar is a usable host private key iff it is
+# in [1, n-1]. Returns 1 if so, 0 if not.
+def _scalar_in_range(d_be: Ptr[uint8]) -> int32:
+    d_limbs: Array[4, uint64]
+    if p256_be_to_limbs(&d_limbs[0], d_be, cast[uint64](32)) != 0:
+        return 0
+    if p256_is_zero(&d_limbs[0]) != 0:
+        return 0
+    if p256_ge(&d_limbs[0], &P256_N[0]) != 0:
+        return 0
+    return 1
+
+
+# Try to load the persisted host key. Returns 1 if a valid 32-byte
+# scalar was read into sshd_hostkey_d, 0 if the file is missing /
+# short / out of range (caller then generates a fresh key).
+def _load_host_key() -> int32:
+    fd: int32 = sys_open(_hostkey_path())
+    if fd < 0:
+        return 0
+    got: uint64 = 0
+    while got < 32:
+        r: int64 = sys_read(fd, cast[Ptr[uint8]](
+                            cast[uint64](&hostkey_io[0]) + got), 32 - got)
+        if r <= 0:
+            break
+        got = got + cast[uint64](r)
+    sys_close(fd)
+    if got != 32:
+        return 0
+    if _scalar_in_range(&hostkey_io[0]) == 0:
+        return 0
+    i: uint64 = 0
+    while i < 32:
+        sshd_hostkey_d[i] = hostkey_io[i]
+        i = i + 1
+    return 1
+
+
+# Generate a fresh host private scalar from /dev/random (a real
+# ChaCha20+RDSEED CSPRNG) and persist it. Returns 0 on success, -1 if
+# entropy could not be drawn (the in-RAM key is still usable for this
+# boot even if the persist write fails). The draw retries until the
+# 32-byte value lands in [1, n-1] — overwhelmingly the first try.
+def _generate_host_key() -> int32:
+    rfd: int32 = sys_open("/dev/random")
+    if rfd < 0:
+        _log("[sshd] /dev/random open failed — cannot generate host key\n")
+        return -1
+    tries: uint32 = 0
+    ok: int32 = 0
+    while tries < 16:
+        tries = tries + 1
+        got: uint64 = 0
+        while got < 32:
+            r: int64 = sys_read(rfd, cast[Ptr[uint8]](
+                                cast[uint64](&hostkey_io[0]) + got),
+                                32 - got)
+            if r <= 0:
+                break
+            got = got + cast[uint64](r)
+        if got != 32:
+            continue
+        if _scalar_in_range(&hostkey_io[0]) != 0:
+            ok = 1
+            break
+    sys_close(rfd)
+    if ok == 0:
+        _log("[sshd] host-key entropy draw failed\n")
+        return -1
+    i: uint64 = 0
+    while i < 32:
+        sshd_hostkey_d[i] = hostkey_io[i]
+        i = i + 1
+    # Persist it. A write failure is non-fatal: the daemon still has a
+    # usable in-RAM key, it just won't survive a restart.
+    wfd: int32 = sys_open_write(_hostkey_path())
+    if wfd < 0:
+        _log("[sshd] WARN: could not persist host key (volatile this boot)\n")
+        return 0
+    _send_file_all(wfd, &sshd_hostkey_d[0], cast[uint64](32))
+    sys_close(wfd)
+    _log("[sshd] generated + persisted a new host key\n")
+    return 0
+
+
+# Write n bytes to fd, looping over short writes (used for the
+# host-key persist; the socket has its own _send_all).
+def _send_file_all(fd: int32, buf: Ptr[uint8], n: uint64) -> int32:
+    pos: uint64 = 0
+    while pos < n:
+        w: int64 = sys_write(fd, cast[Ptr[uint8]](
+                             cast[uint64](buf) + pos), n - pos)
+        if w <= 0:
+            return -1
+        pos = pos + cast[uint64](w)
+    return 0
+
+
+def _build_ks_blob():
+    # Compute Q = d*G and assemble the SEC1 public point + the K_S
+    # host-key blob from the (already populated) private scalar.
     d_limbs: Array[4, uint64]
     p256_be_to_limbs(&d_limbs[0], &sshd_hostkey_d[0], cast[uint64](32))
     Q: P256Point
@@ -656,6 +775,20 @@ def _init_host_key():
     o = _put_cstr(&ks_blob[0], o, "nistp256")
     o = _put_string(&ks_blob[0], o, &host_q[0], cast[uint64](65))
     ks_blob_len[0] = o
+
+
+def _init_host_key() -> int32:
+    # Load the persisted host key, or generate + persist a fresh one
+    # on first start. Either way sshd_hostkey_d ends up holding a
+    # valid scalar; then derive Q + K_S. Returns 0 on success, -1 if
+    # no key could be obtained (caller aborts).
+    if _load_host_key() != 0:
+        _log("[sshd] loaded persisted host key\n")
+    else:
+        if _generate_host_key() != 0:
+            return -1
+    _build_ks_blob()
+    return 0
 
 
 # Encode a 32-byte big-endian integer as an SSH `mpint` (RFC 4251 §5)
@@ -845,7 +978,7 @@ def _do_kex() -> int32:
 
 # === user authentication (RFC 4252) =====================================
 
-# Fixed credential. V1 simplification — no /etc/shadow yet.
+# Fixed password credential. V1 fallback — no /etc/shadow yet.
 def _check_credential(user: Ptr[uint8], ulen: uint64,
                       pass_p: Ptr[uint8], plen: uint64) -> int32:
     want_u: Ptr[uint8] = "root"
@@ -859,6 +992,365 @@ def _check_credential(user: Ptr[uint8], ulen: uint64,
     if _memeq(pass_p, want_p, plen) == 0:
         return 0
     return 1
+
+
+# === publickey authentication (RFC 4252 §7, RFC 5656) ====================
+#
+# An authorized public key for ecdsa-sha2-nistp256 is, on the wire,
+# the public-key blob:
+#     string "ecdsa-sha2-nistp256" || string "nistp256"
+#       || string Q   (Q = 0x04 || X(32) || Y(32), SEC1 uncompressed)
+# An OpenSSH-format authorized_keys line carries that blob base64'd:
+#     ecdsa-sha2-nistp256 AAAAE2Vj...<base64>...  optional-comment
+#
+# sshd loads up to AUTHKEYS_MAX authorized keys at startup. Each key
+# is stored as the 65-byte SEC1 point Q (the algorithm is fixed, so
+# only Q distinguishes keys). At auth time the client's offered key
+# blob is decoded to a Q and matched byte-for-byte against the stored
+# set; a match plus a valid signature authenticates.
+
+AUTHKEYS_MAX: uint64 = 8
+
+
+# authorized_keys path — same /var/lib/ssh namespace dir. Returned as
+# a fresh Ptr[char] (see _hostkey_path on the string-global quirk).
+def _authkeys_path() -> Ptr[char]:
+    return cast[Ptr[char]]("/var/lib/ssh/authorized_keys")
+
+# Parallel arrays (one struct field per key would risk the known
+# add-a-field miscompile; flat arrays are safe). authkey_q holds the
+# i-th key's 65-byte SEC1 point at offset i*65.
+authkey_q:     Array[520, uint8]      # AUTHKEYS_MAX * 65
+authkey_count: Array[1, uint64]
+
+# Raw authorized_keys file bytes + the line-decode scratch.
+authkeys_raw:  Array[4096, uint8]
+authkeys_raw_len: Array[1, uint64]
+authkey_blob:  Array[256, uint8]      # one decoded key blob
+b64_line:      Array[512, uint8]      # the base64 field of one line
+
+
+# Base64 decode: `in_len` chars from `inp` -> bytes into `out`.
+# Returns the decoded byte count, or -1 on a malformed character.
+# Standard RFC 4648 alphabet; '=' padding tolerated.
+def _b64_val(c: uint8) -> int32:
+    if c >= 65 and c <= 90:                   # 'A'..'Z'
+        return cast[int32](c) - 65
+    if c >= 97 and c <= 122:                  # 'a'..'z'
+        return cast[int32](c) - 97 + 26
+    if c >= 48 and c <= 57:                   # '0'..'9'
+        return cast[int32](c) - 48 + 52
+    if c == 43:                               # '+'
+        return 62
+    if c == 47:                               # '/'
+        return 63
+    return -1
+
+
+def _b64_decode(inp: Ptr[uint8], in_len: uint64,
+                out: Ptr[uint8], out_cap: uint64) -> int64:
+    acc: uint32 = 0
+    nbits: uint32 = 0
+    olen: uint64 = 0
+    i: uint64 = 0
+    while i < in_len:
+        c: uint8 = inp[i]
+        i = i + 1
+        if c == 61:                           # '=' padding — stop
+            break
+        v: int32 = _b64_val(c)
+        if v < 0:
+            return -1
+        acc = (acc << 6) | cast[uint32](v)
+        nbits = nbits + 6
+        if nbits >= 8:
+            nbits = nbits - 8
+            if olen >= out_cap:
+                return -1
+            out[olen] = cast[uint8]((acc >> nbits) & 0xFF)
+            olen = olen + 1
+    return cast[int64](olen)
+
+
+# Validate a decoded ecdsa-sha2-nistp256 public-key blob and, on
+# success, copy its 65-byte SEC1 point into out_q. Returns 0 on a
+# well-formed P-256 key blob, -1 otherwise. Blob layout:
+#   string "ecdsa-sha2-nistp256" || string "nistp256" || string Q.
+def _parse_ecdsa_keyblob(blob: Ptr[uint8], blob_len: uint64,
+                         out_q: Ptr[uint8]) -> int32:
+    if blob_len < 4:
+        return -1
+    p: uint64 = 0
+    alg_len: uint32 = _get_u32(blob, p)
+    p = p + 4
+    if cast[uint64](alg_len) != 19:
+        return -1
+    if p + 19 > blob_len:
+        return -1
+    if _memeq(cast[Ptr[uint8]](cast[uint64](blob) + p),
+              cast[Ptr[uint8]]("ecdsa-sha2-nistp256"),
+              cast[uint64](19)) == 0:
+        return -1
+    p = p + 19
+    if p + 4 > blob_len:
+        return -1
+    crv_len: uint32 = _get_u32(blob, p)
+    p = p + 4
+    if cast[uint64](crv_len) != 8:
+        return -1
+    if p + 8 > blob_len:
+        return -1
+    if _memeq(cast[Ptr[uint8]](cast[uint64](blob) + p),
+              cast[Ptr[uint8]]("nistp256"), cast[uint64](8)) == 0:
+        return -1
+    p = p + 8
+    if p + 4 > blob_len:
+        return -1
+    q_len: uint32 = _get_u32(blob, p)
+    p = p + 4
+    if cast[uint64](q_len) != 65:
+        return -1
+    if p + 65 > blob_len:
+        return -1
+    if blob[p] != 0x04:                       # SEC1 uncompressed marker
+        return -1
+    _memcpy(out_q, cast[Ptr[uint8]](cast[uint64](blob) + p),
+            cast[uint64](65))
+    return 0
+
+
+# Parse one authorized_keys line into the authorized-key set. The
+# line is `<algo> <base64-blob> [comment]`; only ecdsa-sha2-nistp256
+# is recognised. Lines that are blank, comments (`#`), or for other
+# algorithms are silently skipped.
+def _parse_authkey_line(line: Ptr[uint8], line_len: uint64):
+    # Skip leading whitespace.
+    s: uint64 = 0
+    while s < line_len:
+        if line[s] != 32 and line[s] != 9:
+            break
+        s = s + 1
+    if s >= line_len:
+        return
+    if line[s] == 35:                         # '#' comment
+        return
+    # First field = algorithm name; require "ecdsa-sha2-nistp256".
+    a0: uint64 = s
+    while s < line_len:
+        if line[s] == 32 or line[s] == 9:
+            break
+        s = s + 1
+    alen: uint64 = s - a0
+    if alen != 19:
+        return
+    if _memeq(cast[Ptr[uint8]](cast[uint64](line) + a0),
+              cast[Ptr[uint8]]("ecdsa-sha2-nistp256"),
+              cast[uint64](19)) == 0:
+        return
+    # Skip whitespace before the base64 field.
+    while s < line_len:
+        if line[s] != 32 and line[s] != 9:
+            break
+        s = s + 1
+    # Second field = base64 blob.
+    b0: uint64 = s
+    while s < line_len:
+        if line[s] == 32 or line[s] == 9:
+            break
+        s = s + 1
+    blen: uint64 = s - b0
+    if blen == 0 or blen > 512:
+        return
+    j: uint64 = 0
+    while j < blen:
+        b64_line[j] = line[b0 + j]
+        j = j + 1
+    dec: int64 = _b64_decode(&b64_line[0], blen,
+                             &authkey_blob[0], cast[uint64](256))
+    if dec < 0:
+        return
+    q: Array[65, uint8]
+    if _parse_ecdsa_keyblob(&authkey_blob[0], cast[uint64](dec),
+                            &q[0]) != 0:
+        return
+    if authkey_count[0] >= AUTHKEYS_MAX:
+        return
+    base: uint64 = authkey_count[0] * 65
+    _memcpy(cast[Ptr[uint8]](cast[uint64](&authkey_q[0]) + base),
+            &q[0], cast[uint64](65))
+    authkey_count[0] = authkey_count[0] + 1
+
+
+# Load the authorized_keys file and parse every line. Best-effort: a
+# missing file simply yields an empty authorized-key set.
+def _load_authorized_keys():
+    authkey_count[0] = 0
+    fd: int32 = sys_open(_authkeys_path())
+    if fd < 0:
+        _log("[sshd] no authorized_keys file (publickey auth disabled)\n")
+        return
+    total: uint64 = 0
+    while total < 4096:
+        r: int64 = sys_read(fd, cast[Ptr[uint8]](
+                            cast[uint64](&authkeys_raw[0]) + total),
+                            4096 - total)
+        if r <= 0:
+            break
+        total = total + cast[uint64](r)
+    sys_close(fd)
+    authkeys_raw_len[0] = total
+    # Split into lines on '\n' and parse each.
+    ls: uint64 = 0
+    i: uint64 = 0
+    while i < total:
+        if authkeys_raw[i] == 10:             # '\n'
+            _parse_authkey_line(cast[Ptr[uint8]](
+                cast[uint64](&authkeys_raw[0]) + ls), i - ls)
+            ls = i + 1
+        i = i + 1
+    if ls < total:
+        _parse_authkey_line(cast[Ptr[uint8]](
+            cast[uint64](&authkeys_raw[0]) + ls), total - ls)
+    if authkey_count[0] != 0:
+        _log("[sshd] authorized_keys loaded\n")
+    else:
+        _log("[sshd] authorized_keys present but no usable keys\n")
+
+
+# Does the 65-byte SEC1 point `q` match an authorized key? Returns 1
+# if it does, 0 otherwise.
+def _authkey_known(q: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while i < authkey_count[0]:
+        base: uint64 = i * 65
+        if _memeq(cast[Ptr[uint8]](cast[uint64](&authkey_q[0]) + base),
+                  q, cast[uint64](65)) != 0:
+            return 1
+        i = i + 1
+    return 0
+
+
+# The signed-data blob for publickey auth (RFC 4252 §7):
+#   string  session_id
+#   byte    SSH_MSG_USERAUTH_REQUEST
+#   string  user_name
+#   string  service_name
+#   string  "publickey"
+#   boolean TRUE
+#   string  public_key_algorithm_name
+#   string  public_key_blob
+# We assemble it here and the client's ECDSA signature is verified
+# over it (ecdsa-sha2-nistp256 hashes it with SHA-256 internally).
+pk_sigdata: Array[2048, uint8]
+
+# Extracted client-signature scalars r, s (32-byte big-endian each).
+pk_sig_r: Array[32, uint8]
+pk_sig_s: Array[32, uint8]
+
+
+# Parse the ecdsa-sha2-nistp256 signature blob the client sends:
+#   string "ecdsa-sha2-nistp256" || string ( mpint r || mpint s )
+# into the 32-byte big-endian pk_sig_r / pk_sig_s. Returns 0 on
+# success, -1 on a malformed blob.
+def _parse_ecdsa_sig(sig: Ptr[uint8], sig_len: uint64) -> int32:
+    if sig_len < 4:
+        return -1
+    p: uint64 = 0
+    alg_len: uint32 = _get_u32(sig, p)
+    p = p + 4
+    if cast[uint64](alg_len) != 19:
+        return -1
+    if p + 19 > sig_len:
+        return -1
+    if _memeq(cast[Ptr[uint8]](cast[uint64](sig) + p),
+              cast[Ptr[uint8]]("ecdsa-sha2-nistp256"),
+              cast[uint64](19)) == 0:
+        return -1
+    p = p + 19
+    if p + 4 > sig_len:
+        return -1
+    inner_len: uint32 = _get_u32(sig, p)
+    p = p + 4
+    if p + cast[uint64](inner_len) > sig_len:
+        return -1
+    # Inner blob = mpint r || mpint s. Decode each into 32-byte BE.
+    ip: uint64 = p
+    iend: uint64 = p + cast[uint64](inner_len)
+    if _read_mpint_be32(sig, &ip, iend, &pk_sig_r[0]) != 0:
+        return -1
+    if _read_mpint_be32(sig, &ip, iend, &pk_sig_s[0]) != 0:
+        return -1
+    return 0
+
+
+# Read one SSH mpint at *pos and store it right-aligned in a 32-byte
+# big-endian buffer. An mpint is `uint32 length || length bytes`
+# (two's-complement big-endian; for our positive scalars the leading
+# byte may be a 0x00 sign pad). Rejects values wider than 33 bytes or
+# whose significant width exceeds 32. Advances *pos. Returns 0 / -1.
+def _read_mpint_be32(buf: Ptr[uint8], pos: Ptr[uint64], endp: uint64,
+                     out_be32: Ptr[uint8]) -> int32:
+    p: uint64 = pos[0]
+    if p + 4 > endp:
+        return -1
+    mlen: uint32 = _get_u32(buf, p)
+    p = p + 4
+    ml: uint64 = cast[uint64](mlen)
+    if p + ml > endp:
+        return -1
+    # Strip an optional single leading 0x00 sign-extension byte.
+    start: uint64 = 0
+    if ml > 1:
+        if buf[p] == 0:
+            start = 1
+    sig: uint64 = ml - start
+    if sig > 32:
+        return -1
+    i: uint64 = 0
+    while i < 32:
+        out_be32[i] = 0
+        i = i + 1
+    i = 0
+    while i < sig:
+        out_be32[32 - sig + i] = buf[p + start + i]
+        i = i + 1
+    pos[0] = p + ml
+    return 0
+
+
+# Verify a client publickey-auth signature. `q` is the offered key's
+# 65-byte SEC1 point; `sig`/`sig_len` is the wire signature blob;
+# user/service are the request's user and service strings (verbatim
+# bytes + lengths) needed to rebuild the signed data. Returns 1 on a
+# good signature, 0 on a bad one, -1 on a malformed signature blob.
+def _verify_pk_signature(q: Ptr[uint8],
+                         user: Ptr[uint8], ulen: uint64,
+                         svc: Ptr[uint8], svclen: uint64,
+                         keyblob: Ptr[uint8], keyblob_len: uint64,
+                         sig: Ptr[uint8], sig_len: uint64) -> int32:
+    if _parse_ecdsa_sig(sig, sig_len) != 0:
+        return -1
+    # Rebuild the signed-data blob (RFC 4252 §7).
+    o: uint64 = 0
+    o = _put_string(&pk_sigdata[0], o, &session_id[0], cast[uint64](32))
+    pk_sigdata[o] = SSH_MSG_USERAUTH_REQUEST
+    o = o + 1
+    o = _put_string(&pk_sigdata[0], o, user, ulen)
+    o = _put_string(&pk_sigdata[0], o, svc, svclen)
+    o = _put_cstr(&pk_sigdata[0], o, "publickey")
+    pk_sigdata[o] = 1                          # boolean TRUE
+    o = o + 1
+    o = _put_cstr(&pk_sigdata[0], o, "ecdsa-sha2-nistp256")
+    o = _put_string(&pk_sigdata[0], o, keyblob, keyblob_len)
+    # Build the EcdsaPubkey from the SEC1 point and verify.
+    pub: EcdsaPubkey
+    if ecdsa_parse_pubkey(q, cast[uint64](65), &pub) != 0:
+        return 0
+    rc: int32 = ecdsa_p256_verify_rs(&pub, &pk_sigdata[0], o,
+                                     &pk_sig_r[0], &pk_sig_s[0])
+    if rc == 1:
+        return 1
+    return 0
 
 
 def _do_userauth() -> int32:
@@ -877,11 +1369,12 @@ def _do_userauth() -> int32:
         return -1
     _log("[sshd] sent SERVICE_ACCEPT\n")
 
-    # Authentication request loop. We accept the `password` method
-    # against the fixed credential; everything else gets a FAILURE that
-    # lists `password` as the continuation.
+    # Authentication request loop. `publickey` is verified against the
+    # authorized_keys set; `password` is verified against the fixed
+    # credential. Anything else gets a FAILURE that lists both methods
+    # as continuations.
     attempts: uint32 = 0
-    while attempts < 6:
+    while attempts < 8:
         attempts = attempts + 1
         if _recv_packet() != 0:
             return -1
@@ -900,15 +1393,85 @@ def _do_userauth() -> int32:
         user_p: Ptr[uint8] = cast[Ptr[uint8]](&pkt_in[p + 4])
         p = p + 4 + cast[uint64](ulen)
         svclen: uint32 = _get_u32(&pkt_in[0], p)
+        svc_p: Ptr[uint8] = cast[Ptr[uint8]](&pkt_in[p + 4])
         p = p + 4 + cast[uint64](svclen)
         mlen: uint32 = _get_u32(&pkt_in[0], p)
         meth_p: Ptr[uint8] = cast[Ptr[uint8]](&pkt_in[p + 4])
         p = p + 4 + cast[uint64](mlen)
-        # Is the method "password"?
+
+        # --- publickey method (RFC 4252 §7) --------------------------
+        is_pk: int32 = 0
+        if mlen == 9:
+            if _memeq(meth_p, cast[Ptr[uint8]]("publickey"),
+                      cast[uint64](9)) != 0:
+                is_pk = 1
+        if is_pk != 0:
+            # boolean has_signature || string pk_algorithm
+            #   || string pk_blob || [ string signature ]
+            has_sig: uint8 = pkt_in[p]
+            p = p + 1
+            alg_len: uint32 = _get_u32(&pkt_in[0], p)
+            alg_p: Ptr[uint8] = cast[Ptr[uint8]](&pkt_in[p + 4])
+            p = p + 4 + cast[uint64](alg_len)
+            blob_len: uint32 = _get_u32(&pkt_in[0], p)
+            blob_p: Ptr[uint8] = cast[Ptr[uint8]](&pkt_in[p + 4])
+            p = p + 4 + cast[uint64](blob_len)
+            # Only ecdsa-sha2-nistp256 keys are recognised.
+            alg_ok: int32 = 0
+            if alg_len == 19:
+                if _memeq(alg_p, cast[Ptr[uint8]]("ecdsa-sha2-nistp256"),
+                          cast[uint64](19)) != 0:
+                    alg_ok = 1
+            offered_q: Array[65, uint8]
+            key_ok: int32 = 0
+            if alg_ok != 0:
+                if _parse_ecdsa_keyblob(blob_p, cast[uint64](blob_len),
+                                        &offered_q[0]) == 0:
+                    if _authkey_known(&offered_q[0]) != 0:
+                        key_ok = 1
+            if key_ok == 0:
+                # Unknown / unusable key — fall through to FAILURE.
+                pass
+            elif has_sig == 0:
+                # Probe: the key is acceptable. Reply PK_OK so the
+                # client signs and re-sends. PK_OK = byte 60
+                #   || string pk_algorithm || string pk_blob.
+                o: uint64 = 0
+                pkt_out[o] = SSH_MSG_USERAUTH_PK_OK
+                o = o + 1
+                o = _put_string(&pkt_out[0], o, alg_p,
+                                cast[uint64](alg_len))
+                o = _put_string(&pkt_out[0], o, blob_p,
+                                cast[uint64](blob_len))
+                if _send_packet(&pkt_out[0], o) != 0:
+                    return -1
+                attempts = attempts - 1     # the probe is not an attempt
+                continue
+            else:
+                # Signed request: verify the signature over the
+                # session-scoped blob.
+                sig_len: uint32 = _get_u32(&pkt_in[0], p)
+                sig_p: Ptr[uint8] = cast[Ptr[uint8]](&pkt_in[p + 4])
+                vrc: int32 = _verify_pk_signature(
+                    &offered_q[0], user_p, cast[uint64](ulen),
+                    svc_p, cast[uint64](svclen),
+                    blob_p, cast[uint64](blob_len),
+                    sig_p, cast[uint64](sig_len))
+                if vrc == 1:
+                    ack: Array[1, uint8]
+                    ack[0] = SSH_MSG_USERAUTH_SUCCESS
+                    if _send_packet(&ack[0], cast[uint64](1)) != 0:
+                        return -1
+                    _log("[sshd] publickey authentication succeeded\n")
+                    return 0
+                _log("[sshd] publickey signature rejected\n")
+                # Bad signature — fall through to FAILURE.
+
+        # --- password method -----------------------------------------
         is_pw: int32 = 0
-        pw_lit: Ptr[uint8] = "password"
         if mlen == 8:
-            if _memeq(meth_p, pw_lit, cast[uint64](8)) != 0:
+            if _memeq(meth_p, cast[Ptr[uint8]]("password"),
+                      cast[uint64](8)) != 0:
                 is_pw = 1
         if is_pw != 0:
             # password method: boolean FALSE || string password.
@@ -922,16 +1485,19 @@ def _do_userauth() -> int32:
                 ack[0] = SSH_MSG_USERAUTH_SUCCESS
                 if _send_packet(&ack[0], cast[uint64](1)) != 0:
                     return -1
-                _log("[sshd] authentication succeeded\n")
+                _log("[sshd] password authentication succeeded\n")
                 return 0
+
         # Failure: byte 51 || name-list methods || boolean partial.
-        o: uint64 = 0
-        pkt_out[o] = SSH_MSG_USERAUTH_FAILURE
-        o = o + 1
-        o = _put_cstr(&pkt_out[0], o, "password")
-        pkt_out[o] = 0                      # partial success = FALSE
-        o = o + 1
-        if _send_packet(&pkt_out[0], o) != 0:
+        # Advertise publickey first so a client offers a key before
+        # falling back to a password prompt.
+        o2: uint64 = 0
+        pkt_out[o2] = SSH_MSG_USERAUTH_FAILURE
+        o2 = o2 + 1
+        o2 = _put_cstr(&pkt_out[0], o2, "publickey,password")
+        pkt_out[o2] = 0                     # partial success = FALSE
+        o2 = o2 + 1
+        if _send_packet(&pkt_out[0], o2) != 0:
             return -1
     _log("[sshd] authentication failed (attempts exhausted)\n")
     return -1
@@ -1460,8 +2026,13 @@ def main() -> int32:
     # Bring up the crypto constant tables.
     p256_init()
     ecdsa_init()
-    _init_host_key()
+    if _init_host_key() != 0:
+        _log("[sshd] FATAL: no host key available\n")
+        return 1
     _log("[sshd] host key ready (ecdsa-sha2-nistp256)\n")
+    # Load authorized public keys for publickey auth (best-effort —
+    # an absent file just means publickey auth has nothing to match).
+    _load_authorized_keys()
 
     # socket / bind / listen on port 22.
     lfd: int32 = sys_socket(2, 1, 0)
