@@ -111,11 +111,12 @@ echo "[test_hamsh_complete] --- end output ---"
 
 fail=0
 
-# Command OUTPUT (vs. input echo) is the discriminator: the kernel
-# console prefixes every output line with a `[NNNNNN]` timestamp, while
-# the line editor's redraw always re-paints the `hamsh$ ` prompt first.
-# A line matching `^[NNNNNN] <marker>` is genuine command output.
-ran() { grep -E -q "^\[[0-9]+\] $1( |\$|\r)" "$LOG"; }
+# Command OUTPUT (vs. input echo) is the discriminator. Userland
+# writes (the prompt redraw and command output) no longer go through
+# the kernel printk line-prefix path, so genuine command output
+# appears on its own line with nothing before the marker, while the
+# line editor's redraw always re-paints `hamsh$ ` first.
+ran() { grep -E -q "^$1( |\$|\r)" "$LOG"; }
 
 # Test 1: command completion — `ech`+Tab completed to `echo`, so the
 # command `echo cmdcomplete_ok` ran and produced the marker output.

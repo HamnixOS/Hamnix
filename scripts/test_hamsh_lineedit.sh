@@ -141,17 +141,24 @@ echo "[test_hamsh_lineedit] --- end output ---"
 fail=0
 
 # Command OUTPUT (vs. input echo) is the discriminator. The `echo`
-# builtin writes its argument on a line of its own; the kernel console
-# prefixes every output line with a `[NNNNNN]` timestamp. The line
-# editor's redraw, by contrast, always re-paints the `hamsh$ ` prompt
-# first. So a line matching `^[NNNNNN] <marker>` is genuine command
-# output — proof the EDITED command actually ran — whereas a line with
-# `hamsh$` before the marker is only the input being echoed back.
+# builtin writes its argument on a line of its own; the line editor's
+# redraw, by contrast, always re-paints the `hamsh$ ` prompt first.
+# So a line whose ENTIRE content is `<marker>` (with no `hamsh$ `
+# preceding it on the same line) is genuine command output — proof
+# the EDITED command actually ran — whereas a line with `hamsh$`
+# before the marker is only the input being echoed back.
+#
+# (Up to M16.x kernel printk and userland writes shared a single
+# fan-out point that stamped a `[NNNNNN] ` per-line sequence prefix
+# on everything; that prefix is now strictly a KERNEL-printk
+# diagnostic stamp — userland writes via /dev/cons and FD_STDOUT
+# emit raw bytes. So command output appears on its own line with
+# nothing before the marker.)
 #
 # ran <marker>  -> 0 if <marker> appeared as echo command output.
-ran() { grep -E -q "^\[[0-9]+\] $1( |\$|\r)" "$LOG"; }
+ran() { grep -E -q "^$1( |\$|\r)" "$LOG"; }
 # ran_count <marker> -> number of command-output lines for <marker>.
-ran_count() { grep -E -c "^\[[0-9]+\] $1( |\$|\r)" "$LOG" || true; }
+ran_count() { grep -E -c "^$1( |\$|\r)" "$LOG" || true; }
 
 # Test 1: Left + mid-line insert — the CORRECTED `echo hello_one` ran,
 # and the typo'd `helo_one` never ran as a command.

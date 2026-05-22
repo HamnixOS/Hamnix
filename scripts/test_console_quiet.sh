@@ -61,7 +61,9 @@ set +e
     sleep 9
     # Sentinel marks the boundary between the idle-window console and
     # the dmesg replay. Echoed by the shell to stdout — userland
-    # output is always console-visible (console_force_mirror).
+    # output is always console-visible (the userland write path via
+    # early_putc_user bypasses the console-loglevel gate that
+    # otherwise suppresses low-severity kernel printk post-interactive).
     printf 'echo CONSOLE_QUIET_PROBE\n'
     sleep 1
     printf 'dmesg\n'
