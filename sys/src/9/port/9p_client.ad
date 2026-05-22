@@ -184,6 +184,21 @@ class P9Conn:
     # verbatim as the 9P attach aname, so we strip and consume the
     # prefix here without touching syschan.ad.
     rx_srvfd:      int32
+    # CACHED pipe slots — the transport-layer fix that makes a 9P
+    # connection drivable from ANY task in the namespace, not just the
+    # one that ran mount(). srvfd / rx_srvfd are fd numbers in the
+    # MOUNTING task's fd table; a process that later inherits the
+    # namespace (e.g. dpkg spawned inside an nsrun distrofs namespace)
+    # does NOT have those fds open, so translating them per-call via
+    # current_task() would fail. Instead, at attach time — running in
+    # the mounting task's context, where the fds ARE valid — we resolve
+    # srvfd → tx pipe slot and rx_srvfd → rx pipe slot ONCE and cache
+    # the slot indices here. Pipe slots are global kernel objects, so
+    # _p9_send / _p9_recv can use the cached slots from any task. A
+    # value of -1 means "not a pipe / not resolved" — the per-call
+    # _fd_to_pipe_slot path is kept as the fallback.
+    tx_pipe_slot:  int32
+    rx_pipe_slot:  int32
 
 
 p9_conns: Array[16, P9Conn]
@@ -235,6 +250,8 @@ def _conn_alloc(srvfd: int32) -> int32:
     p9_conns[su].smoke_tx_slot = -1
     p9_conns[su].smoke_rx_slot = -1
     p9_conns[su].rx_srvfd      = -1
+    p9_conns[su].tx_pipe_slot  = -1
+    p9_conns[su].rx_pipe_slot  = -1
     # Clear fid_used.
     i: uint64 = 0
     while i < P9C_FIDS_PER_CONN:
@@ -259,6 +276,8 @@ def _conn_release(slot: int32):
     p9_conns[su].smoke_tx_slot = -1
     p9_conns[su].smoke_rx_slot = -1
     p9_conns[su].rx_srvfd      = -1
+    p9_conns[su].tx_pipe_slot  = -1
+    p9_conns[su].rx_pipe_slot  = -1
     p9_conns[su].root_fid      = 0xFFFFFFFF
     # Clear the fid pool so a reused slot starts with no fids held.
     i: uint64 = 0
@@ -551,7 +570,14 @@ def _p9_send(slot: int32, n_bytes: int32) -> int32:
     # (the FD_P9_MARK route in fs/vfs.ad invokes p9c_walk_open_path,
     # which lands here), and vfs_write on the same task's fd table
     # would race the dispatcher's own pos accounting.
-    pipe_slot: int32 = _fd_to_pipe_slot(p9_conns[su].srvfd, 1)
+    # Prefer the pipe slot cached at attach time — it is task-
+    # independent, so a process that inherited this namespace (and so
+    # does NOT have the transport fd open) can still drive the wire.
+    # Fall back to a per-call fd-table translation only when no slot
+    # was cached (legacy / smoke / non-pipe transports).
+    pipe_slot: int32 = p9_conns[su].tx_pipe_slot
+    if pipe_slot < 0:
+        pipe_slot = _fd_to_pipe_slot(p9_conns[su].srvfd, 1)
     if pipe_slot < 0:
         # Not a pipe fd — preserve the V1 -1 stub so non-pipe srvfds
         # (e.g. the /etc/motd fd test_p9mount.ad uses to assert the
@@ -661,10 +687,15 @@ def _p9_recv(slot: int32) -> int32:
     # otherwise we fall back to srvfd (a future bidirectional
     # transport like a socketpair). Same vfs.ad re-entrancy concern as
     # _p9_send drives us through pipe_read directly.
-    rx_fd: int32 = p9_conns[su].rx_srvfd
-    if rx_fd < 0:
-        rx_fd = p9_conns[su].srvfd
-    rx_slot: int32 = _fd_to_pipe_slot(rx_fd, 0)
+    # Prefer the rx pipe slot cached at attach time (task-independent;
+    # see the matching note in _p9_send). Fall back to a per-call
+    # fd-table translation only when no slot was cached.
+    rx_slot: int32 = p9_conns[su].rx_pipe_slot
+    if rx_slot < 0:
+        rx_fd: int32 = p9_conns[su].rx_srvfd
+        if rx_fd < 0:
+            rx_fd = p9_conns[su].srvfd
+        rx_slot = _fd_to_pipe_slot(rx_fd, 0)
     if rx_slot < 0:
         return -1
     # Block until we have a full 7-byte header. pipe_read returns 0
@@ -859,6 +890,20 @@ def p9c_attach_run(slot: int32, aname: Ptr[char],
     # V4.1: peel any "p9rx:<fd>:" prefix off the aname so the user-
     # space pipe-pair transport works (see _parse_rx_prefix above).
     aname = _parse_rx_prefix(slot, aname)
+    # Resolve the transport fds to GLOBAL pipe slot indices NOW, while
+    # we still run in the mounting task's context (its fd table has
+    # srvfd / rx_srvfd open). The cached slots let _p9_send / _p9_recv
+    # drive the connection from ANY task that later inherits this
+    # namespace — e.g. a dpkg spawned inside an nsrun distrofs
+    # namespace, whose own fd table never had the transport fds. A
+    # non-pipe transport (socketpair, the smoke fixture) leaves these
+    # -1 and the per-call path stays in effect.
+    su0: uint64 = cast[uint64](slot)
+    p9_conns[su0].tx_pipe_slot = _fd_to_pipe_slot(p9_conns[su0].srvfd, 1)
+    rxfd0: int32 = p9_conns[su0].rx_srvfd
+    if rxfd0 < 0:
+        rxfd0 = p9_conns[su0].srvfd
+    p9_conns[su0].rx_pipe_slot = _fd_to_pipe_slot(rxfd0, 0)
     if _p9_negotiate(slot) < 0:
         _conn_release(slot)
         return -1
@@ -1397,6 +1442,126 @@ def p9c_walk_create_path(srvfd: int32, root_fid: int32,
         p9c_clunk(srvfd, parent_fid)
         return -1
     return parent_fid
+
+
+# -- path-aware mkdir -p used by fs/vfs.ad -------------------------
+#
+# Given a srvfd, the connection's root fid, and a relative path (the
+# bytes after the mount-point prefix), ensure every component of the
+# path exists as a directory on the 9P server — creating any missing
+# component with Tcreate(DMDIR). This is `mkdir -p`: a path like
+# "usr/share/doc/hello" lands all four directories even if none of
+# them existed. An already-existing component (file OR dir) is walked
+# through, not recreated; a component that exists as a *file* makes
+# the call fail (you can't mkdir under a regular file).
+#
+# Returns 0 on success (the full directory chain now exists), -1 on
+# any failure. No fid is left open — every walked / created fid is
+# clunked before return.
+#
+# Per-component leaf storage is a dedicated top-level buffer so this
+# routine never aliases _p9c_path_comp_storage (it walks one name at
+# a time, so a single-slot buffer suffices).
+
+DMDIR_BIT: uint32 = 0x80000000          # 9P perm DMDIR (docs/9p.md §3.8)
+
+_p9c_mkdir_leaf: Array[128, uint8]      # one NUL-terminated component
+
+
+def p9c_walk_mkdir_path(srvfd: int32, root_fid: int32,
+                        rel_path: Ptr[uint8]) -> int32:
+    slot: int32 = _conn_find_by_srvfd(srvfd)
+    if slot < 0:
+        return -1
+    plen: uint64 = 0
+    while rel_path[plen] != 0:
+        plen = plen + 1
+    if plen == 0:
+        return 0                                 # "" — root, nothing to do
+    # cur_fid tracks the fid that references the directory we have
+    # walked to so far. It starts as a fresh clone of the root.
+    qroot: Array[13, uint8]
+    cur_fid: int32 = p9c_walk(srvfd, root_fid,
+                              cast[Ptr[Ptr[char]]](&_p9c_path_comp_ptrs[0]),
+                              0, &qroot[0])
+    if cur_fid < 0:
+        return -1
+    i: uint64 = 0
+    if rel_path[0] == 47:                        # skip a leading '/'
+        i = 1
+    ok: int32 = 0
+    while i < plen and ok == 0:
+        # Extract the next component into _p9c_mkdir_leaf.
+        cidx: uint64 = 0
+        while i < plen and rel_path[i] != 47 \
+                and cidx + 1 < P9C_MAX_NAME_LEN:
+            _p9c_mkdir_leaf[cidx] = rel_path[i]
+            cidx = cidx + 1
+            i = i + 1
+        _p9c_mkdir_leaf[cidx] = 0
+        # Skip the '/' separator(s) (tolerate "a//b" and a trailing '/').
+        while i < plen and rel_path[i] == 47:
+            i = i + 1
+        if cidx == 0:
+            continue                             # empty component — skip
+        # Try to walk into the component from the current directory. A
+        # success means it already exists; clunk cur_fid, adopt the
+        # walked fid as the new current directory.
+        _p9c_path_comp_ptrs[0] = cast[Ptr[char]](&_p9c_mkdir_leaf[0])
+        qc: Array[13, uint8]
+        step_fid: int32 = p9c_walk(srvfd, cur_fid,
+                                   cast[Ptr[Ptr[char]]](&_p9c_path_comp_ptrs[0]),
+                                   1, &qc[0])
+        if step_fid >= 0:
+            # Component exists. If it is a file (qid.type bit 0x80 ==
+            # QTDIR is clear) we cannot descend further.
+            is_dir: int32 = 0
+            if (cast[uint64](qc[0]) & 0x80) != 0:
+                is_dir = 1
+            p9c_clunk(srvfd, cur_fid)
+            if is_dir == 0:
+                p9c_clunk(srvfd, step_fid)
+                ok = -1
+            else:
+                cur_fid = step_fid
+        else:
+            # Component is missing — create it as a directory. Tcreate
+            # mutates cur_fid in place: a clone is needed first so we
+            # do not lose the parent fid for a failed create. We just
+            # Tcreate on a fresh clone of cur_fid.
+            clone_fid: int32 = p9c_walk(srvfd, cur_fid,
+                                        cast[Ptr[Ptr[char]]](&_p9c_path_comp_ptrs[0]),
+                                        0, &qc[0])
+            if clone_fid < 0:
+                p9c_clunk(srvfd, cur_fid)
+                ok = -1
+            else:
+                # Tcreate the directory (DMDIR | 0o755, opened OREAD).
+                cr: int32 = p9c_create(srvfd, clone_fid,
+                                       cast[Ptr[char]](&_p9c_mkdir_leaf[0]),
+                                       DMDIR_BIT | 0x1ED, 0)
+                if cr < 0:
+                    p9c_clunk(srvfd, clone_fid)
+                    p9c_clunk(srvfd, cur_fid)
+                    ok = -1
+                else:
+                    # clone_fid now references the new directory, open
+                    # for I/O. Clunk it (we don't keep it open) and
+                    # re-walk into it from cur_fid for the next step.
+                    p9c_clunk(srvfd, clone_fid)
+                    qd: Array[13, uint8]
+                    next_fid: int32 = p9c_walk(srvfd, cur_fid,
+                                               cast[Ptr[Ptr[char]]](&_p9c_path_comp_ptrs[0]),
+                                               1, &qd[0])
+                    p9c_clunk(srvfd, cur_fid)
+                    if next_fid < 0:
+                        ok = -1
+                    else:
+                        cur_fid = next_fid
+    if ok == 0:
+        p9c_clunk(srvfd, cur_fid)
+        return 0
+    return -1
 
 
 def p9c_encode_fd_buf(srvfd: int32, fid: int32) -> uint64:

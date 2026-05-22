@@ -32,7 +32,18 @@
 #          append — overwrite) the installed-file manifest (one path
 #          per line) to the per-package `<package>.list` file — what
 #          `dpkg -L` reads.
-#       5. Print: `dpkg: registered <package> <version> (<N> files)`.
+#       5. LAND the package's files: walk data.tar again and extract
+#          every directory + regular file to its nested absolute distro
+#          path (/usr/bin/hello, /usr/share/doc/<pkg>/copyright, ...).
+#          This is what makes `dpkg -i` a *real* install — the binary
+#          and docs are present and usable afterwards, not just
+#          recorded. The writes route through the namespace: run inside
+#          an nsrun/distrorun distro-shape namespace they land on the
+#          distrofs 9P daemon serving /usr,/etc,/var; run outside one
+#          they are refused + reported (never a global-path write).
+#          See _extract_data_tar and docs/distro-namespaces.md.
+#       6. Print: `dpkg: registered <package> <version> (<N> files)`
+#          and `dpkg: unpacked <M> files to the distro namespace`.
 #
 #   dpkg -r <package>
 #       Deregister a package: find its stanza in the status DB by
@@ -76,9 +87,12 @@
 #     NOT delete the package's installed files from the filesystem.
 #     A real "remove" walks the .list manifest and unlinks each
 #     recorded path before deleting the .list itself.
-#   * No data.tar extraction to the live filesystem — that is
-#     `dpkg-deb -x` (user/dpkg_deb.ad), already shipped. `dpkg -i` here
-#     records metadata only (control + the installed-file manifest).
+#   * data.tar IS extracted now (step 5 above / _extract_data_tar) —
+#     `dpkg -i` lands the package's files into the distrofs-served
+#     distro namespace, not just records metadata. Persistence of the
+#     landed tree across reboots (ext4-backed distrofs) is the next
+#     step — today distrofs is RAM-backed, so the namespace VIEW is
+#     ephemeral while the dpkg DB record (in /tmp) is what survives.
 #   * No dependency resolution (Depends/Pre-Depends/Conflicts).
 #   * No maintainer scripts (preinst/postinst/prerm/postrm).
 #   * No conffiles handling, no triggers, no `dpkg --purge`.
@@ -132,6 +146,7 @@ extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_close(fd: int32) -> int32
 extern def sys_unlink(path: Ptr[char]) -> int32
+extern def sys_mkdir(path: Ptr[char]) -> int32
 
 
 # -- bounded BSS buffers (Hamnix idiom: never park large Arrays in a
@@ -184,6 +199,12 @@ status_buf: Array[65536, uint8]
 # body ( one path per line ). Capped at LIST_CAP.
 list_path:  Array[64, uint8]
 list_buf:   Array[65536, uint8]
+
+# Scratch absolute-path buffer for the data.tar extraction step. A
+# data.tar entry name ("./usr/share/doc/hello/changelog.Debian.gz")
+# tops out well under 256 bytes for a small package; 512 is ample
+# headroom and matches the kernel-side _namec_parent_buf cap.
+extract_path: Array[512, uint8]
 
 # Scratch for the query sub-commands (-l/-s/-L): a single extracted
 # field value (Package/Version/Architecture/Description) lifted out of
@@ -1018,6 +1039,196 @@ def _write_file_list(data_tar_len: uint64) -> int64:
     return cast[int64](count)
 
 
+# -- land data.tar files into the distro namespace ---------------------
+#
+# This is the step that makes `dpkg -i` a *real* install: it places
+# every regular file + directory from data.tar onto the filesystem so
+# the installed program is actually present and runnable.
+#
+# WHERE the files land — the namespace law (docs/distro-namespaces.md):
+# a Debian data.tar entry is "./usr/bin/hello", "./usr/share/doc/...",
+# etc. Stripping the leading "." yields an absolute distro path
+# ("/usr/bin/hello"). dpkg does NOT write a global /usr — it relies on
+# being run inside a distro-shape namespace (nsrun / distrorun) where
+# /usr, /etc, /var are each served by a distrofs 9P daemon. The write
+# of "/usr/bin/hello" then routes — via fs/vfs.ad's namec probe — to
+# the distrofs daemon backing /usr. Run OUTSIDE such a namespace the
+# writes fall on whatever backs /usr there (the read-only initramfs),
+# fail cleanly, and are reported as skipped — no global path is ever
+# mutated.
+#
+# Intermediate directories: dpkg explicitly sys_mkdir's every data.tar
+# directory entry (typeflag '5'); the kernel's namec_mkdir does mkdir
+# -p so a deep path lands even if data.tar lists the leaf dir only.
+# Belt-and-suspenders, the kernel's namec_create also mkdir -p's a
+# file's parent chain — so a regular file lands even if its directory
+# entry was absent or out of order.
+#
+# Path safety: an entry whose name is absolute ("/...") or carries a
+# ".." component is refused (standard dpkg traversal guard).
+#
+# Returns the number of regular files written, or -1 on a tar error.
+# A per-entry failure (write refused, path too long) is a warning, not
+# a hard failure — extraction continues so a partial namespace is at
+# least usable.
+
+def _entry_unsafe(name: Ptr[uint8]) -> int32:
+    # Reject absolute paths and any ".." path component.
+    if name[0] == 47:                                   # '/'
+        return 1
+    i: uint64 = 0
+    while True:
+        if name[i] == 46 and name[i + 1] == 46:         # ".."
+            t: uint8 = name[i + 2]
+            if t == 0 or t == 47:
+                return 1
+        while name[i] != 0 and name[i] != 47:
+            i = i + 1
+        if name[i] == 0:
+            return 0
+        while name[i] == 47:
+            i = i + 1
+        if name[i] == 0:
+            return 0
+
+
+# Compose the absolute distro path for a data.tar entry into
+# extract_path. A Debian entry is "./usr/bin/hello"; we want
+# "/usr/bin/hello" — strip a leading "." (the "./" prefix) so the
+# remaining "/usr/bin/hello" is already the absolute path. An entry
+# with no leading "./" (a bare "usr/bin/hello") gets a '/' prepended.
+# Returns the composed length, or 0 if it would overflow extract_path.
+
+def _compose_extract_path(entry: Ptr[uint8]) -> uint64:
+    o: uint64 = 0
+    src: Ptr[uint8] = entry
+    # "./foo" -> drop the '.', keep the '/foo'.
+    if entry[0] == 46 and entry[1] == 47:               # "./"
+        src = cast[Ptr[uint8]](cast[uint64](entry) + 1)
+    # If the (possibly stripped) path does not start with '/', prepend
+    # one so we always land an absolute distro path.
+    if src[0] != 47:
+        if o + 1 >= 512:
+            return 0
+        extract_path[o] = 47
+        o = o + 1
+    i: uint64 = 0
+    while src[i] != 0:
+        if o + 1 >= 512:
+            return 0
+        extract_path[o] = src[i]
+        o = o + 1
+        i = i + 1
+    # Trim a trailing '/' (directory entries are listed as "foo/").
+    if o > 1 and extract_path[o - 1] == 47:
+        o = o - 1
+    extract_path[o] = 0
+    return o
+
+
+# Walk data.tar (already decompressed into tar_buf) and land every
+# directory + regular file onto the namespace filesystem.
+
+def _extract_data_tar(data_tar_len: uint64) -> int64:
+    off: uint64 = 0
+    nfiles: uint64 = 0
+    while off + 512 <= data_tar_len:
+        hdr: Ptr[uint8] = &tar_buf[off]
+        if _tar_header_is_zero(hdr) != 0:
+            break
+        if _tar_chksum_ok(hdr) == 0:
+            write_str(2, "dpkg: data tar header checksum mismatch at offset ")
+            write_dec_u64(2, off)
+            write_str(2, "\n")
+            return -1
+        size: uint64 = _tar_parse_octal(&hdr[124], 12)
+        typeflag: uint8 = hdr[156]
+        nlen: uint64 = _name_copy_nul(&warn_buf[0], &hdr[0], 100)
+        body_blocks: uint64 = (size + 511) / 512
+        body_off: uint64 = off + 512
+
+        if nlen == 0:
+            off = body_off + body_blocks * 512
+            continue
+
+        # The bare "./" head record is noise.
+        if warn_buf[0] == 46 and warn_buf[1] == 47 and warn_buf[2] == 0:
+            off = body_off + body_blocks * 512
+            continue
+
+        # Strip "./" for the safety check; "/etc/..." stays absolute
+        # (and thus unsafe). pax/GNU long-name headers (typeflag 'L'/
+        # 'x') are skipped — a small package's paths fit ustar's 100.
+        entry: Ptr[uint8] = &warn_buf[0]
+        if warn_buf[0] == 46 and warn_buf[1] == 47:
+            entry = cast[Ptr[uint8]](cast[uint64](&warn_buf[0]) + 2)
+        unsafe: int32 = _entry_unsafe(entry)
+        if warn_buf[0] == 47:
+            unsafe = 1
+        if unsafe != 0:
+            write_str(2, "dpkg: refusing unsafe path: ")
+            write_str(2, &warn_buf[0])
+            write_str(2, "\n")
+            off = body_off + body_blocks * 512
+            continue
+
+        if typeflag == 53:                              # '5' directory
+            if _compose_extract_path(&warn_buf[0]) > 0:
+                # sys_mkdir routes a 9P-mounted path through the
+                # kernel's namec_mkdir (mkdir -p). A failure (path is
+                # not under a distrofs mount, parent unwritable) is a
+                # warning — file entries below still try their own
+                # parent-mkdir via namec_create.
+                sys_mkdir(cast[Ptr[char]](&extract_path[0]))
+            off = body_off + body_blocks * 512
+            continue
+
+        if typeflag == 50:                              # '2' symlink
+            # distrofs has no symlink node kind; record nothing on
+            # disk for it. The .list manifest still carries the name.
+            write_str(2, "dpkg: note: symlink not materialised: ")
+            write_str(2, &warn_buf[0])
+            write_str(2, "\n")
+            off = body_off + body_blocks * 512
+            continue
+
+        if typeflag != 0 and typeflag != 48:            # not a regular file
+            # Hardlink / device / fifo / GNU long headers — skipped.
+            off = body_off + body_blocks * 512
+            continue
+
+        # Regular file. Land its bytes at the absolute distro path.
+        if body_off + size > data_tar_len:
+            write_str(2, "dpkg: data body overflows archive\n")
+            return -1
+        if _compose_extract_path(&warn_buf[0]) == 0:
+            write_str(2, "dpkg: path too long, skipping: ")
+            write_str(2, &warn_buf[0])
+            write_str(2, "\n")
+            off = body_off + body_blocks * 512
+            continue
+        wfd: int32 = sys_open_write(cast[Ptr[char]](&extract_path[0]))
+        if wfd < 0:
+            # Not fatal: outside a distrofs namespace /usr is read-only
+            # so this is expected; report it and keep going.
+            write_str(2, "dpkg: warning: could not create ")
+            write_str(2, &extract_path[0])
+            write_str(2, " (not in a writable distro namespace?)\n")
+            off = body_off + body_blocks * 512
+            continue
+        if size > 0:
+            wn: int64 = _write_full(wfd, &tar_buf[body_off], size)
+            if wn < 0 or cast[uint64](wn) != size:
+                write_str(2, "dpkg: short write landing ")
+                write_str(2, &extract_path[0])
+                write_str(2, "\n")
+        sys_close(wfd)
+        nfiles = nfiles + 1
+
+        off = body_off + body_blocks * 512
+    return cast[int64](nfiles)
+
+
 # -- query sub-commands: -l / -s / -L ----------------------------------
 #
 # These are the READERS for the data `dpkg -i` already writes: the
@@ -1381,7 +1592,20 @@ def _do_install(deb_path: Ptr[char]) -> int32:
     if nfiles_i < 0:
         return 1
 
-    # 5. Summary line.
+    # 5. Land the package's files. This is the step that makes the
+    #    install REAL: every regular file + directory in data.tar is
+    #    written to its nested absolute distro path. Run inside an
+    #    nsrun/distrorun distro-shape namespace those paths route to a
+    #    distrofs 9P daemon; run outside one the writes are refused +
+    #    reported, never landing on a global path. _extract_data_tar
+    #    re-walks the SAME tar_buf _write_file_list just walked (read-
+    #    only — neither mutates it), so no re-decompress is needed.
+    extracted_i: int64 = _extract_data_tar(cast[uint64](data_tar_i))
+    if extracted_i < 0:
+        return 1
+
+    # 6. Summary line: report both the recorded manifest count and the
+    #    count of files actually landed on the filesystem.
     write_str(1, "dpkg: registered ")
     write_str(1, &fld_package[0])
     write_str(1, " ")
@@ -1389,6 +1613,9 @@ def _do_install(deb_path: Ptr[char]) -> int32:
     write_str(1, " (")
     write_dec_u64(1, cast[uint64](nfiles_i))
     write_str(1, " files)\n")
+    write_str(1, "dpkg: unpacked ")
+    write_dec_u64(1, cast[uint64](extracted_i))
+    write_str(1, " files to the distro namespace\n")
     return 0
 
 

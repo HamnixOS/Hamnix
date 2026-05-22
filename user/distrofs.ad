@@ -53,14 +53,26 @@
 #
 # CAPS (top-level BSS — U9 nested-frame-Array quirk; tune here)
 # -------------------------------------------------------------
-#   NODE_CAP   = 128    nodes (dirs + files) total
-#   FID_CAP    =  64    concurrent fids
+#   NODE_CAP   =  384   nodes (dirs + files) total
+#   FID_CAP    =   64   concurrent fids
 #   FILE_CAP   =  65536 bytes per file (64 KiB)
-#   NAME_CAP   =  64    bytes per node name
-# A file's data buffer is a fixed 64 KiB slot indexed by node index;
-# the data-buffer pool is NODE_CAP * FILE_CAP = 8 MiB of BSS. That is
-# coarse but matches "RAM-backed cache, volatile" — V1 makes file data
-# a slab/extent allocator.
+#   NAME_CAP   =   64   bytes per node name
+#   DATA_SLOT_CAP = 160 file-data slots
+#
+# A real Debian package is mostly DIRECTORIES plus many small files: the
+# canonical `hello` package has ~143 data.tar entries, roughly half of
+# them directories (the 50-odd /usr/share/locale/<lang>/LC_MESSAGES
+# chains). So NODE_CAP must be a few hundred, but the *file-data* pool
+# should NOT be NODE_CAP-wide — a directory node needs no data buffer.
+#
+# Hence file data is decoupled from the node index: a node's data
+# buffer is a DATA_SLOT_CAP-pooled 64 KiB slot, allocated lazily on the
+# node's first Twrite (node_dataslot[i], -1 until allocated). The pool
+# is DATA_SLOT_CAP * FILE_CAP = 160 * 64 KiB = 10 MiB of BSS — far less
+# than the old NODE_CAP-wide pool would cost at NODE_CAP=384, and it
+# comfortably holds every regular file a small package installs.
+# Still RAM-backed + volatile (the namespace VIEW is ephemeral; durable
+# persistence — ext4-backed distrofs — is the documented next step).
 #
 # 9P MESSAGE COVERAGE
 # -------------------
@@ -112,10 +124,11 @@ from lib.9p.9p import (
 
 # -- Caps --------------------------------------------------------------
 
-NODE_CAP:  uint64 = 128
-FID_CAP:   uint64 = 64
-FILE_CAP:  uint64 = 65536            # 64 KiB per file
-NAME_CAP:  uint64 = 64
+NODE_CAP:      uint64 = 384
+FID_CAP:       uint64 = 64
+FILE_CAP:      uint64 = 65536        # 64 KiB per file
+NAME_CAP:      uint64 = 64
+DATA_SLOT_CAP: uint64 = 160          # pooled file-data slots
 
 # Node kinds.
 KIND_FREE: uint8 = 0
@@ -138,25 +151,32 @@ srv_buf: Array[8192, uint8]
 # Parallel arrays — one logical "node" per index. Index 0 is the root
 # directory. A node is `kind == KIND_FREE` until allocated.
 #
-#   node_kind[i]    KIND_FREE | KIND_DIR | KIND_FILE
-#   node_parent[i]  parent node index (root's parent is itself, 0)
-#   node_name[i]    NAME_CAP bytes, NUL-padded basename
-#   node_namelen[i] basename length in bytes
-#   node_size[i]    file: data byte count; dir: unused (0)
-#   node_vers[i]    qid.vers — bumped on every write
+#   node_kind[i]      KIND_FREE | KIND_DIR | KIND_FILE
+#   node_parent[i]    parent node index (root's parent is itself, 0)
+#   node_name[i]      NAME_CAP bytes, NUL-padded basename
+#   node_namelen[i]   basename length in bytes
+#   node_size[i]      file: data byte count; dir: unused (0)
+#   node_vers[i]      qid.vers — bumped on every write
+#   node_dataslot[i]  index into the file-data pool, or -1 (no data
+#                     buffer allocated yet — directories stay -1)
 #
 # A node's qid.path is just its index (+ 1 so root is path 1, matching
 # the p9srv_demo convention of "no file has path 0").
 
-node_kind:    Array[128, uint8]
-node_parent:  Array[128, uint64]
-node_name:    Array[8192, uint8]      # NODE_CAP * NAME_CAP
-node_namelen: Array[128, uint64]
-node_size:    Array[128, uint64]
-node_vers:    Array[128, uint32]
+node_kind:     Array[384, uint8]
+node_parent:   Array[384, uint64]
+node_name:     Array[24576, uint8]    # NODE_CAP * NAME_CAP
+node_namelen:  Array[384, uint64]
+node_size:     Array[384, uint64]
+node_vers:     Array[384, uint32]
+node_dataslot: Array[384, int64]      # -1 until a data slot is bound
 
-# File data pool: NODE_CAP slots of FILE_CAP bytes = 128 * 64 KiB = 8 MiB.
-node_data: Array[8388608, uint8]
+# File-data pool: DATA_SLOT_CAP slots of FILE_CAP bytes = 160 * 64 KiB
+# = 10 MiB. Decoupled from the node index — directories never consume a
+# slot. dataslot_used[s] marks a slot live; a slot is bound to a node
+# lazily on that node's first Twrite (see _node_ensure_dataslot).
+node_data:      Array[10485760, uint8]
+dataslot_used:  Array[160, uint8]
 
 # -- Fid table (top-level BSS) -----------------------------------------
 #
@@ -216,11 +236,12 @@ def node_alloc(kind: uint8, parent: uint64,
     i: uint64 = 0
     while i < NODE_CAP:
         if node_kind[i] == KIND_FREE:
-            node_kind[i]    = kind
-            node_parent[i]  = parent
-            node_namelen[i] = namelen
-            node_size[i]    = 0
-            node_vers[i]    = 0
+            node_kind[i]     = kind
+            node_parent[i]   = parent
+            node_namelen[i]  = namelen
+            node_size[i]     = 0
+            node_vers[i]     = 0
+            node_dataslot[i] = cast[int64](-1)   # no data buffer yet
             j: uint64 = 0
             while j < namelen:
                 node_name[i * NAME_CAP + j] = name[j]
@@ -230,6 +251,23 @@ def node_alloc(kind: uint8, parent: uint64,
                 j = j + 1
             return cast[int64](i)
         i = i + 1
+    return cast[int64](-1)
+
+
+# Bind a file-data pool slot to node `idx` if it does not have one yet.
+# Returns the slot index (>= 0) on success, -1 if the data pool is
+# exhausted. Directories never call this — only a Twrite to a file.
+
+def _node_ensure_dataslot(idx: uint64) -> int64:
+    if node_dataslot[idx] >= cast[int64](0):
+        return node_dataslot[idx]
+    s: uint64 = 0
+    while s < DATA_SLOT_CAP:
+        if dataslot_used[s] == 0:
+            dataslot_used[s] = 1
+            node_dataslot[idx] = cast[int64](s)
+            return cast[int64](s)
+        s = s + 1
     return cast[int64](-1)
 
 
@@ -302,12 +340,13 @@ def add_dir(parent: uint64, lit: Ptr[uint8]) -> int64:
 
 def init_tree():
     # Root is node 0.
-    node_kind[0]    = KIND_DIR
-    node_parent[0]  = 0
-    node_namelen[0] = 0
-    node_size[0]    = 0
-    node_vers[0]    = 0
-    node_name[0]    = 0
+    node_kind[0]     = KIND_DIR
+    node_parent[0]   = 0
+    node_namelen[0]  = 0
+    node_size[0]     = 0
+    node_vers[0]     = 0
+    node_dataslot[0] = cast[int64](-1)
+    node_name[0]     = 0
     # Distro-shaped skeleton. String literals are materialised inline by
     # the compiler; we pass their addresses straight to add_dir.
     var_i:  int64 = add_dir(0, "var")
@@ -752,9 +791,16 @@ def _serve_tread(in_len: uint64) -> int32:
     # Cap to what fits inside one msize reply (header + count[4] = 11).
     if cast[uint64](available) > SRV_BUF_CAP - 16:
         available = cast[uint32](SRV_BUF_CAP - 16)
-    data_ptr: Ptr[uint8] = &node_data[node * FILE_CAP]
+    # A file with no data slot yet (never written) reads as empty.
+    ds: int64 = node_dataslot[node]
+    if ds < cast[int64](0):
+        available = 0
+    base: uint64 = 0
+    if ds >= cast[int64](0):
+        base = cast[uint64](ds) * FILE_CAP
+    data_ptr: Ptr[uint8] = &node_data[base]
     if offset > 0:
-        data_ptr = &node_data[node * FILE_CAP + offset]
+        data_ptr = &node_data[base + offset]
     c: P9Cursor
     p9_cursor_init(&c, &srv_buf[0], SRV_BUF_CAP)
     n: int32 = p9_emit_rread(&c, tg, data_ptr, available)
@@ -787,6 +833,10 @@ def _serve_twrite(in_len: uint64) -> int32:
     node: uint64 = fid_node[slot]
     if node_kind[node] != KIND_FILE:
         return _emit_rerror(tg, "distrofs: cannot write a directory")
+    # Bind a file-data pool slot lazily on the first write.
+    ds: int64 = _node_ensure_dataslot(node)
+    if ds < cast[int64](0):
+        return _emit_rerror(tg, "distrofs: file-data pool exhausted")
     # Clamp the write window to the per-file cap.
     end: uint64 = offset + cast[uint64](count)
     if end > FILE_CAP:
@@ -794,7 +844,7 @@ def _serve_twrite(in_len: uint64) -> int32:
     written: uint64 = 0
     if end > offset:
         written = end - offset
-    base: uint64 = node * FILE_CAP
+    base: uint64 = cast[uint64](ds) * FILE_CAP
     i: uint64 = 0
     while i < written:
         node_data[base + offset + i] = data_p[i]
@@ -902,6 +952,10 @@ def _serve_tremove(in_len: uint64) -> int32:
         if node_has_children(node) != 0:
             return _emit_rerror(tg, "distrofs: directory not empty")
     parent: uint64 = node_parent[node]
+    # Release the file-data pool slot, if one was bound.
+    if node_dataslot[node] >= cast[int64](0):
+        dataslot_used[cast[uint64](node_dataslot[node])] = 0
+        node_dataslot[node] = cast[int64](-1)
     node_kind[node] = KIND_FREE
     node_size[node] = 0
     node_namelen[node] = 0
