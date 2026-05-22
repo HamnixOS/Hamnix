@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # scripts/build_user.sh - assemble + link userland binaries.
 #
-# For now we have exactly one user binary: user/init.S → build/init.elf
-# (elf32-i386 wrapper with 64-bit code inside, just like the kernel's
-# own wrapper). The output ELF is read by scripts/build_initramfs.py
-# and embedded into the cpio archive as /init.
+# Builds two kinds of user binary:
+#   * a couple of hand-written .S programs (hello, stdin_demo) linked
+#     with user/init.lds — elf32-i386 wrappers with 64-bit code inside.
+#   * the Adder-compiled userland (init, hamsh, coreutils, daemons).
+# The output ELFs are read by scripts/build_initramfs.py and embedded
+# into the cpio archive; build/user/init.elf becomes the kernel's
+# /init (a thin shim that execs /bin/hamsh with boot rc /etc/rc.boot).
 #
-# Run this whenever you touch a user/*.S file or the linker script.
-# scripts/build_initramfs.py is what gets called next.
+# Run this whenever you touch a user/*.S / user/*.ad file or the
+# linker script. scripts/build_initramfs.py is what gets called next.
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -26,7 +29,6 @@ build_one() {
     file "build/user/${name}.elf"
 }
 
-build_one init
 build_one hello
 build_one stdin_demo                   # used by scripts/test_stdin.sh
 
@@ -41,7 +43,7 @@ build_adder_user() {
     file "build/user/${name}.elf"
 }
 
-build_adder_user init                 # V3.5: Plan 9 userspace init (PID 1 / namespace recipe + exec hamsh)
+build_adder_user init                 # PID 1 shim: execs /bin/hamsh with boot rc /etc/rc.boot
 build_adder_user hamsh                # M16.35: interactive shell
 build_adder_user ps                   # M16.36: dumps /proc snapshots
 build_adder_user echo                 # M16.37: writes argv to stdout
@@ -86,7 +88,6 @@ build_adder_user du                   # M16.70: entry-count under path
 build_adder_user tail                 # M16.70: last N lines of stdin
 build_adder_user cmp                  # M16.70: byte-compare two files
 build_adder_user which                # M16.74: PATH lookup tool
-build_adder_user init2                # M16.74: Adder /sbin/init reading /etc/inittab
 build_adder_user free                 # M16.74: /proc/meminfo as free table
 build_adder_user uptime               # M16.74: /proc/uptime in seconds
 build_adder_user mv                   # M16.74: copy + unlink (no rename(2))

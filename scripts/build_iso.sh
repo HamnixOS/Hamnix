@@ -85,10 +85,14 @@ need_tool sha256sum
 echo "[build_iso] Rebuilding userland + initramfs + kernel ELF."
 bash scripts/build_user.sh
 bash scripts/build_modules.sh
-# Use hamsh as /init so the booting user lands in an interactive
-# shell. test scripts override this with their own fixtures; the
-# default (and the human-facing real-hardware boot) is hamsh.
-INIT_ELF=build/user/hamsh.elf python3 scripts/build_initramfs.py
+# Use the DEFAULT /init (build/user/init.elf — the shim built by
+# build_user.sh). The shim execs /bin/hamsh with the boot rc
+# /etc/rc.boot; hamsh-as-PID-1 sources that rc (the namespace recipe
+# + boot services, all in the hamsh language) and then drops the
+# booting user to an interactive shell. This is the user-facing
+# real-hardware boot path. Test scripts that need a different first
+# task override /init with their own INIT_ELF fixture.
+python3 scripts/build_initramfs.py
 
 # Stale/partial-intermediate guard. Belt-and-braces for the
 # recurring "multiboot1 magic not found" false failure (the primary

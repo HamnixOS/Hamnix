@@ -175,6 +175,11 @@ check_marker "kernel"       "$KERNEL_BANNER_RE" "$MARKER_LINE" || { echo "[test_
 # tss_init runs LATER, just before start_first_task. Without the
 # kernel-gdt handoff, that's where the boot died on UEFI.
 check_marker "user"         "$USER_READY_RE"   "$MARKER_LINE" || { echo "[test_uefi_boot] FAIL"; exit 1; }
+# The user-facing ISO boots through the hamsh rc system: /init (shim)
+# execs hamsh, hamsh-as-PID-1 sources /etc/rc.boot which applies the
+# namespace recipe. Assert the recipe marker AFTER shell-ready so the
+# UEFI boot gate also covers the rc path.
+check_marker "rc-boot"      "rc.boot: namespace recipe applied" "$MARKER_LINE" || { echo "[test_uefi_boot] FAIL"; exit 1; }
 
 # Belt-and-braces: an explicit "no #GP at tss_init" check. Any
 # `TRAP: vector 0x0d err=0x28` line in the log is the M16.125 → M16.126

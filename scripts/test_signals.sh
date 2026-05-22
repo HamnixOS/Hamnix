@@ -64,21 +64,25 @@ cat "$LOG"
 echo "[test_signals] --- end output ---"
 
 fail=0
-# cat is killed by SIGINT — default exit code is 128+2=130. PID is
-# no longer hardcoded to 2 since /etc/rc now spawns several tasks
-# before the prompt opens, so we match any pid with exit code 130.
+# cat is killed by SIGINT — default exit code is 128+2=130. We match
+# any pid with exit code 130 (the cat child); init runs hamsh
+# directly here, so the pid is not a fixed number.
 if grep -E -q "task: pid [0-9]+ exited \(code=130\)" "$LOG"; then
     echo "[test_signals] OK: cat killed by SIGINT (exit code 130)"
 else
     echo "[test_signals] MISS: 'task: pid N exited (code=130)' not found"
     fail=1
 fi
-# hamsh ('[hamsh] bye.') still ran after the child died — meaning
-# SIGINT was correctly scoped to non-pid-1 tasks.
-if grep -F -q "[hamsh] bye." "$LOG"; then
-    echo "[test_signals] OK: hamsh survived the Ctrl-C"
+# hamsh survived the Ctrl-C: the prompt reappeared AFTER the child
+# died (a pid-N-exited-130 line followed by another `hamsh$`). That
+# proves SIGINT was scoped to the child, not pid 1 — the shell read
+# the next line. (The rewritten hamsh no longer prints a "bye"
+# message on exit, so we check the prompt round-trip instead.)
+if grep -A20 -E "task: pid [0-9]+ exited \(code=130\)" "$LOG" \
+        | grep -F -q 'hamsh$'; then
+    echo "[test_signals] OK: hamsh survived the Ctrl-C (prompt reappeared)"
 else
-    echo "[test_signals] MISS: hamsh didn't reach its exit path"
+    echo "[test_signals] MISS: hamsh prompt did not reappear after Ctrl-C"
     fail=1
 fi
 

@@ -82,4 +82,17 @@ if ! grep -a -q -E "$BANNER_RE" "$LOGFILE"; then
 fi
 
 echo "[test_bios_boot] kernel banner detected (\"$BANNER_RE\")."
+
+# The user-facing ISO boots through the hamsh rc system: /init (shim)
+# execs hamsh, hamsh-as-PID-1 sources /etc/rc.boot which applies the
+# namespace recipe. Assert that here so a regression that drops the
+# rc path is caught by the BIOS boot gate.
+if ! grep -a -q -F "rc.boot: namespace recipe applied" "$LOGFILE"; then
+    echo "[test_bios_boot] FAIL: boot did not go through the hamsh rc" \
+         "(/etc/rc.boot namespace recipe marker missing)." >&2
+    echo "[test_bios_boot] FAIL"
+    exit 1
+fi
+
+echo "[test_bios_boot] booted via hamsh rc (/etc/rc.boot applied)."
 echo "[test_bios_boot] PASS"
