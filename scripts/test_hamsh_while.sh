@@ -1,23 +1,19 @@
 #!/usr/bin/env bash
-# scripts/test_hamsh_while.sh — M16.85 verification.
+# scripts/test_hamsh_while.sh — hamsh `while { }` loop (new shell).
 #
-# Exercises hamsh's new `else` clause on if/then/fi and the new
-# `while COND ; do BODY ; done` loop (single-line forms, sharing
-# the if_depth recursion cap with M16.84's if-block parser).
+# Ported from the old `while COND; do BODY; done` test to the
+# rewritten shell's C-style brace blocks (HAMSH_SPEC §5). Where
+# test_hamsh_blocks.sh (§18 stage 3) parses a multi-line while, this
+# keeps the EXACT-ITERATION-COUNT behaviour covered: a while whose
+# condition stops being true after the body mutates the counter must
+# run its body a precise number of times, then exit.
 #
 # Lines typed at the prompt:
-#   1. `echo START`                                 → START present
-#   2. `i=3`                                        → shell var set
-#   3. `while test $i = 3 ; do echo LOOP_BODY ; i=NEXT ; done`
-#        → loop iterates exactly once: body runs (i becomes NEXT),
-#          next condition check fails (NEXT != 3), loop exits.
-#          LOOP_BODY appears exactly once.
-#   4. `echo POST_WHILE`                            → POST_WHILE present
-#   5. `if true ; then echo IF_THEN_BODY ; else echo IF_ELSE_BODY ; fi`
-#        → IF_THEN_BODY runs, IF_ELSE_BODY does NOT.
-#   6. `if false ; then echo IF_THEN_FAIL ; else echo IF_ELSE_OK ; fi`
-#        → IF_ELSE_OK runs, IF_THEN_FAIL does NOT.
-#   7. `exit`                                       → clean shutdown
+#   1. `echo START`                       → START present
+#   2. `i = 0`                            → assignment, no command
+#   3. `while i < 3 { echo LOOP_BODY ; i = i + 1 }`
+#        → body runs exactly 3 times (i: 0,1,2), then i==3 stops it.
+#   4. `echo POST_WHILE I=${ i }`         → I=3, shell survived
 
 . "$(dirname "$0")/_build_lock.sh"
 
@@ -41,15 +37,11 @@ set +e
     sleep 3
     printf 'echo START\n'
     sleep 1
-    printf 'i=3\n'
+    printf 'i = 0\n'
     sleep 1
-    printf 'while test $i = 3 ; do echo LOOP_BODY ; i=NEXT ; done\n'
+    printf 'while i < 3 { echo LOOP_BODY ; i = i + 1 }\n'
     sleep 2
-    printf 'echo POST_WHILE\n'
-    sleep 1
-    printf 'if true ; then echo IF_THEN_BODY ; else echo IF_ELSE_BODY ; fi\n'
-    sleep 1
-    printf 'if false ; then echo IF_THEN_FAIL ; else echo IF_ELSE_OK ; fi\n'
+    printf 'echo POST_WHILE final ${ i }\n'
     sleep 1
     printf 'exit\n'
     sleep 1
@@ -61,49 +53,21 @@ set -e
 
 fail=0
 
-# while: LOOP_BODY appears exactly once.
+# while: LOOP_BODY appears exactly three times.
 loop_count=$(grep -c -F "LOOP_BODY" "$LOG" || true)
-if [ "$loop_count" -eq 1 ]; then
-    echo "[test_hamsh_while] OK: while body ran exactly once"
+if [ "$loop_count" -eq 3 ]; then
+    echo "[test_hamsh_while] OK: while body ran exactly three times"
 else
-    echo "[test_hamsh_while] MISS: LOOP_BODY count=$loop_count (expected 1)"
+    echo "[test_hamsh_while] MISS: LOOP_BODY count=$loop_count (expected 3)"
     fail=1
 fi
 
-# while: POST_WHILE present (shell survived the loop).
-if grep -F -q "POST_WHILE" "$LOG"; then
-    echo "[test_hamsh_while] OK: shell survived the while loop"
+# while: counter has the post-loop value (shell survived the loop).
+if grep -F -q "POST_WHILE final 3" "$LOG"; then
+    echo "[test_hamsh_while] OK: shell survived; counter ended at 3"
 else
-    echo "[test_hamsh_while] MISS: POST_WHILE absent (shell hung/crashed?)"
+    echo "[test_hamsh_while] MISS: POST_WHILE final 3 absent (loop hung/wrong count)"
     fail=1
-fi
-
-# if/else: true → then branch.
-if grep -F -q "IF_THEN_BODY" "$LOG"; then
-    echo "[test_hamsh_while] OK: if true → then-body executed"
-else
-    echo "[test_hamsh_while] MISS: IF_THEN_BODY absent"
-    fail=1
-fi
-if grep -F -q "IF_ELSE_BODY" "$LOG"; then
-    echo "[test_hamsh_while] MISS: IF_ELSE_BODY leaked (true should skip else)"
-    fail=1
-else
-    echo "[test_hamsh_while] OK: if true correctly skipped else-body"
-fi
-
-# if/else: false → else branch.
-if grep -F -q "IF_ELSE_OK" "$LOG"; then
-    echo "[test_hamsh_while] OK: if false → else-body executed"
-else
-    echo "[test_hamsh_while] MISS: IF_ELSE_OK absent"
-    fail=1
-fi
-if grep -F -q "IF_THEN_FAIL" "$LOG"; then
-    echo "[test_hamsh_while] MISS: IF_THEN_FAIL leaked (false should skip then)"
-    fail=1
-else
-    echo "[test_hamsh_while] OK: if false correctly skipped then-body"
 fi
 
 if [ "$fail" -ne 0 ]; then

@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# scripts/test_hamsh_logic.sh — M16.71 verification.
+# scripts/test_hamsh_logic.sh — hamsh `&&` / `||` / `;` (new shell).
 #
-# Exercises hamsh's `;`, `&&`, `||` separators:
+# Ported to the rewritten shell. The `&&` / `||` command chaining and
+# `;` statement separator are unchanged surface between the old and
+# new shells, but no §18 stage test covers them — this one does:
 #   true && echo AFTER_AND_TRUE      → executes
 #   false && echo AFTER_AND_FALSE    → skipped
 #   true || echo AFTER_OR_TRUE       → skipped
 #   false || echo AFTER_OR_FALSE     → executes
-#   echo SEQ1 ; echo SEQ2            → both execute
-#   false ; echo AFTER_SEMI          → executes (sequencing ignores prev exit)
+#   echo SEQ1 ; echo SEQ2            → both execute (`;` separates stmts)
+#   false ; echo AFTER_SEMI          → executes (`;` ignores prev exit)
 
 . "$(dirname "$0")/_build_lock.sh"
 

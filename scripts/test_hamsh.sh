@@ -6,12 +6,12 @@
 # stdio, and greps the captured serial log for evidence that:
 #
 #   1. the hamsh banner appeared        → main() ran
-#   2. the help builtin output appeared → tokenize + builtin dispatch
+#   2. the help builtin output appeared → lex + builtin dispatch
 #   3. the hello child banner appeared → SYS_SPAWN + ELF load worked
-#   4. the hamsh "bye" line appeared    → SYS_WAITPID returned and
-#                                          the shell's main loop
-#                                          continued to the exit
-#                                          builtin
+#   4. the kernel halted "no live tasks" → the `exit` builtin unwound
+#                                          the read-eval loop cleanly
+#                                          (the rewritten shell prints
+#                                          no "bye" banner)
 #
 # Inputs are spaced out with sleeps because the 16550 RX FIFO is only
 # 16 bytes and there is no kernel-side software buffer yet (M16.34);
@@ -75,9 +75,8 @@ echo "[test_hamsh] --- end output ---"
 fail=0
 for needle in \
     "[hamsh] M16.35 shell ready" \
-    "hamsh builtins: exit, help" \
-    "[/hello] hello from a second ELF" \
-    "[hamsh] bye."
+    "hamsh — the Hamnix shell." \
+    "[/hello] hello from a second ELF"
 do
     if grep -F -q "$needle" "$LOG"; then
         echo "[test_hamsh] OK: '$needle'"
@@ -86,6 +85,16 @@ do
         fail=1
     fi
 done
+
+# `exit` unwinds the read-eval loop cleanly: the shell (pid 1) exits,
+# so the kernel halts with "no live tasks" — the new shell prints no
+# "bye" banner (the old one did). This proves `exit` returned.
+if grep -F -q "no live tasks" "$LOG"; then
+    echo "[test_hamsh] OK: 'exit' unwound the shell cleanly"
+else
+    echo "[test_hamsh] MISS: shell did not exit cleanly"
+    fail=1
+fi
 
 if [ "$fail" -ne 0 ]; then
     echo "[test_hamsh] FAIL (qemu rc=$rc)"

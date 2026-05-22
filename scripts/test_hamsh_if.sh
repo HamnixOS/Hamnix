@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# scripts/test_hamsh_if.sh — M16.83 verification.
+# scripts/test_hamsh_if.sh — hamsh `if { } else { }` (new shell).
 #
-# Exercises hamsh's `if COND ; then BODY ; fi` construct
-# (single-line form, no else). Three lines are typed:
-#   1. `if true;  then echo IF_TRUE_PATH;  fi`
-#        → IF_TRUE_PATH should appear (condition true → body runs)
-#   2. `if false; then echo IF_FALSE_PATH; fi`
+# Ported from the old `if COND; then BODY; fi` test to the rewritten
+# shell's C-style brace blocks (HAMSH_SPEC §5). test_hamsh_blocks.sh
+# (§18 stage 3) covers MULTI-LINE if from the continuation prompt;
+# this keeps the SINGLE-LINE interactive form covered:
+#   1. `if 1 > 0 { echo IF_TRUE_PATH }`
+#        → IF_TRUE_PATH appears (condition true → body runs)
+#   2. `if 1 > 2 { echo IF_FALSE_PATH }`
 #        → IF_FALSE_PATH must NOT appear (condition false → skip)
-#   3. `echo POST_IF`
-#        → POST_IF must appear (the shell survived both ifs).
+#   3. `if 0 > 1 { echo IFE_THEN } else { echo IFE_ELSE }`
+#        → IFE_ELSE runs, IFE_THEN does not.
+#   4. `echo POST_IF` → POST_IF appears (the shell survived).
 
 . "$(dirname "$0")/_build_lock.sh"
 
@@ -30,15 +33,17 @@ trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs
 set +e
 (
     sleep 3
-    printf 'if true; then echo IF_TRUE_PATH; fi\n'
+    printf 'if 1 > 0 { echo IF_TRUE_PATH }\n'
     sleep 1
-    printf 'if false; then echo IF_FALSE_PATH; fi\n'
+    printf 'if 1 > 2 { echo IF_FALSE_PATH }\n'
+    sleep 1
+    printf 'if 0 > 1 { echo IFE_THEN } else { echo IFE_ELSE }\n'
     sleep 1
     printf 'echo POST_IF\n'
     sleep 1
     printf 'exit\n'
     sleep 1
-) | timeout 20s qemu-system-x86_64 \
+) | timeout 25s qemu-system-x86_64 \
     -kernel "$ELF" \
     -smp 2 -nographic -no-reboot -m 256M -monitor none -serial stdio \
     > "$LOG" 2>&1
@@ -56,6 +61,12 @@ if grep -F -q "IF_FALSE_PATH" "$LOG"; then
     fail=1
 else
     echo "[test_hamsh_if] OK: if-false body correctly skipped"
+fi
+if grep -F -q "IFE_ELSE" "$LOG" && ! grep -F -q "IFE_THEN" "$LOG"; then
+    echo "[test_hamsh_if] OK: false condition took the else branch"
+else
+    echo "[test_hamsh_if] MISS: if/else branch selection wrong"
+    fail=1
 fi
 if grep -F -q "POST_IF" "$LOG"; then
     echo "[test_hamsh_if] OK: shell survived the if blocks"

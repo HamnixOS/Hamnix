@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# scripts/test_hamsh_quotes.sh — M16.80 verification.
+# scripts/test_hamsh_quotes.sh — hamsh quoting (new shell, HAMSH_SPEC §4).
 #
-# Tests double-quoted strings in hamsh tokenize:
-#   echo "hello world"          → 2 tokens (echo + "hello world")
-#                                  emits "hello world" not "hello\nworld"
-#   echo "a"b"c"                → glues quoted segments: 1 token "abc"
-#   echo a "b c" d              → 4 tokens (a, "b c", d, but argv 0..3)
+# Ported to the rewritten shell. No §18 stage test covers quoting on
+# its own, so this one does:
+#   * `echo "hello world"` — a double-quoted word with a space is ONE
+#     argument (no word-splitting — the §3 list rule's sibling).
+#   * `echo "$who there"` — double quotes interpolate `$`.
+#   * `echo '$who literal'` — single quotes are literal: no interpolation.
+#   * `echo a "b c" d` — mixed quoted/bare words; echo joins with spaces.
 
 . "$(dirname "$0")/_build_lock.sh"
 
@@ -26,16 +28,20 @@ trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs
 
 set +e
 (
-    sleep 4
+    sleep 3
     printf 'echo "hello world"\n'
     sleep 1
-    printf 'echo "FOO BAR"\n'
+    printf 'who = "ham"\n'
+    sleep 1
+    printf 'echo "$who there"\n'
+    sleep 1
+    printf "echo '\$who literal'\n"
     sleep 1
     printf 'echo a "b c" d\n'
     sleep 1
     printf 'exit\n'
     sleep 1
-) | timeout 18s qemu-system-x86_64 \
+) | timeout 20s qemu-system-x86_64 \
     -kernel "$ELF" \
     -smp 2 -nographic -no-reboot -m 256M -monitor none -serial stdio \
     > "$LOG" 2>&1
@@ -43,19 +49,25 @@ set -e
 
 fail=0
 if grep -F -q "hello world" "$LOG"; then
-    echo "[test_hamsh_quotes] OK: \"hello world\" preserved as one token"
+    echo "[test_hamsh_quotes] OK: \"hello world\" preserved as one argument"
 else
-    echo "[test_hamsh_quotes] MISS: hello world not seen as one token"
+    echo "[test_hamsh_quotes] MISS: hello world not preserved"
     fail=1
 fi
-if grep -F -q "FOO BAR" "$LOG"; then
-    echo "[test_hamsh_quotes] OK: \"FOO BAR\" preserved"
+if grep -F -q "ham there" "$LOG"; then
+    echo "[test_hamsh_quotes] OK: double quotes interpolate \$who"
 else
-    echo "[test_hamsh_quotes] MISS: FOO BAR not preserved"
+    echo "[test_hamsh_quotes] MISS: double-quote interpolation failed"
+    fail=1
+fi
+if grep -F -q '$who literal' "$LOG"; then
+    echo "[test_hamsh_quotes] OK: single quotes are literal (no interpolation)"
+else
+    echo "[test_hamsh_quotes] MISS: single quote interpolated or dropped"
     fail=1
 fi
 if grep -F -q "a b c d" "$LOG"; then
-    echo "[test_hamsh_quotes] OK: mixed quoted/unquoted joined by echo"
+    echo "[test_hamsh_quotes] OK: mixed quoted/bare words joined by echo"
 else
     echo "[test_hamsh_quotes] MISS: mixed echo output"
     fail=1
