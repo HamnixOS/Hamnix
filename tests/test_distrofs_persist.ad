@@ -1,0 +1,580 @@
+# tests/test_distrofs_persist.ad
+#
+# Reboot-persistence fixture for user/distrofs.ad's ext4-backed
+# durable store. distrofs is RAM-backed for serving speed but
+# snapshots its node + data tables to a file on the mounted ext4
+# volume (sys_dfs_save) so an installed package survives a reboot,
+# and reloads that snapshot on startup (sys_dfs_load).
+#
+# This fixture runs in TWO modes, selected by argv[1], across TWO
+# QEMU boots that share the SAME ext4 disk image:
+#
+#   boot 1 — `test_distrofs_persist write`
+#     Spawns /bin/distrofs, then over a 9P pipe pair:
+#       Tversion / Tattach / walk /var/lib/dpkg / Tcreate "pkgfile"
+#       / Twrite a uniquely-marked payload / Tclunk.
+#     The Tclunk of the written fid makes distrofs snapshot its
+#     tables to the ext4 volume. Then the fixture closes the pipes;
+#     distrofs sees EOF and takes a final snapshot before exiting.
+#
+#   boot 2 — `test_distrofs_persist read`
+#     The ext4.img is NOT regenerated — same disk. Spawns a FRESH
+#     /bin/distrofs, which on startup loads the snapshot from the
+#     ext4 volume. The fixture then Tversion / Tattach / walks
+#     /var/lib/dpkg/pkgfile / Topen / Tread and asserts the marker
+#     payload written on boot 1 comes back byte-for-byte.
+#
+# If the snapshot reached the disk image, the marker survives the
+# reboot — that is the proof of durable distrofs backing.
+#
+# Markers grepped by scripts/test_distrofs_persist.sh:
+#   [dfsp] start mode=write   /  [dfsp] start mode=read
+#   [dfsp] spawn OK
+#   [dfsp] write done          (boot 1: file created + written + clunked)
+#   [dfsp] WRITE PASS
+#   [dfsp] read match OK       (boot 2: payload survived the reboot)
+#   [dfsp] READ PASS
+#   [dfsp] FAIL: <reason>
+#
+# Build:
+#   python3 -m compiler.adder compile --target=x86_64-adder-user \
+#       tests/test_distrofs_persist.ad -o build/user/test_distrofs_persist.elf
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_pipe(fds: Ptr[int32]) -> int32
+extern def sys_waitpid(pid: int32) -> int64
+extern def sys_exit(code: uint64)
+extern def sys_errstr(buf: Ptr[uint8], nbuf: uint64) -> int32
+extern def sys_spawn(path: Ptr[char], argv: Ptr[uint64],
+                     stdin_fd: int32, stdout_fd: int32,
+                     envp: Ptr[uint64]) -> int32
+
+from lib.9p.9p import (
+    P9Cursor, p9_cursor_init,
+    p9_decode_header,
+    p9_emit_tversion, p9_decode_rversion,
+    p9_emit_tattach,  p9_decode_rattach,
+    p9_emit_twalk,    p9_decode_rwalk,
+    p9_emit_topen,    p9_decode_ropen,
+    p9_emit_tcreate,  p9_decode_rcreate,
+    p9_emit_tread,    p9_decode_rread,
+    p9_emit_twrite,   p9_decode_rwrite,
+    p9_emit_tclunk,   p9_decode_rclunk,
+    p9_decode_rerror,
+    P9_NOFID, P9_NOTAG,
+    P9_OREAD, P9_ORDWR, P9_QTFILE, P9_QTDIR,
+    P9_RERROR,
+)
+
+# Top-level scratch buffers (Adder nested-frame Array bug avoidance).
+CLI_BUF_CAP: uint64 = 8192
+cli_buf: Array[8192, uint8]
+rsp_buf: Array[8192, uint8]
+
+c2s_fds: Array[2, int32]
+s2c_fds: Array[2, int32]
+spawn_argv: Array[2, uint64]
+err_buf: Array[128, uint8]
+
+# Walk-name pointer arrays (top-level — P9_MAX_WELEM = 16).
+walk_names: Array[16, Ptr[uint8]]
+walk_lens:  Array[16, uint64]
+walk_qtypes_in: Array[16, uint8]
+walk_qvers_in:  Array[16, uint32]
+walk_qpaths_in: Array[16, uint64]
+
+# Path components — distrofs's pre-created tree has /var/lib/dpkg.
+comp_var:  Array[8, uint8] = "var"
+comp_lib:  Array[8, uint8] = "lib"
+comp_dpkg: Array[8, uint8] = "dpkg"
+# The file we create on boot 1 and read back on boot 2.
+comp_file: Array[8, uint8] = "pkgfile"
+
+# The uniquely-marked payload. The SAME literal on both boots: boot 1
+# writes it, boot 2 must read exactly these bytes back from the
+# ext4-backed snapshot. A non-trivial length so a single-block-only
+# backing bug would surface.
+payload: Array[64, uint8] = "HAMNIX_DISTROFS_PERSIST_MARKER_2026 durable-ext4-backing-ok"
+PAYLOAD_LEN: uint64 = 58
+
+# Fid plan.
+ROOT_FID: uint32 = 0
+DPKG_FID: uint32 = 1
+READ_FID: uint32 = 2
+
+
+def strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen(s))
+
+
+def dump_errstr(label: Ptr[uint8]):
+    sys_errstr(&err_buf[0], 128)
+    write_str(1, label)
+    write_str(1, &err_buf[0])
+    write_str(1, "\n")
+
+
+# --- pipe I/O helpers -------------------------------------------------
+
+def _read_exact(fd: int32, buf: Ptr[uint8], want: uint64) -> int64:
+    got: uint64 = 0
+    while got < want:
+        n: int64 = sys_read(fd, &buf[got], want - got)
+        if n <= 0:
+            return n
+        got = got + cast[uint64](n)
+    return cast[int64](got)
+
+
+def _send_tmsg(tx_fd: int32, n: int32) -> int32:
+    if n <= 0:
+        return -1
+    sent: int64 = sys_write(tx_fd, &cli_buf[0], cast[uint64](n))
+    if sent != cast[int64](n):
+        return -1
+    return 0
+
+
+def _recv_rmsg(rx_fd: int32) -> int32:
+    h: int64 = _read_exact(rx_fd, &rsp_buf[0], 7)
+    if h != cast[int64](7):
+        return -1
+    sz: uint32 = 0
+    ty: uint8 = 0
+    tg: uint16 = 0
+    rc: int32 = p9_decode_header(&rsp_buf[0], 7, &sz, &ty, &tg)
+    if rc != 0:
+        return -1
+    total: uint64 = cast[uint64](sz)
+    if total < 7 or total > CLI_BUF_CAP:
+        return -1
+    if total > 7:
+        b: int64 = _read_exact(rx_fd, &rsp_buf[7], total - 7)
+        if b != cast[int64](total - 7):
+            return -1
+    return cast[int32](total)
+
+
+def _dump_rerror():
+    tg: uint16 = 0
+    ep: Ptr[uint8] = cast[Ptr[uint8]](0)
+    el: uint64 = 0
+    rc: int64 = p9_decode_rerror(&rsp_buf[0], CLI_BUF_CAP, &tg, &ep, &el)
+    if rc < cast[int64](0):
+        return
+    write_str(1, "[dfsp]   Rerror: ")
+    sys_write(1, ep, el)
+    write_str(1, "\n")
+
+
+# --- 9P client legs ---------------------------------------------------
+
+def _client_version(tx: int32, rx: int32) -> int32:
+    c: P9Cursor
+    p9_cursor_init(&c, &cli_buf[0], CLI_BUF_CAP)
+    ver: Array[8, uint8]
+    ver[0] = 57    # '9'
+    ver[1] = 80    # 'P'
+    ver[2] = 50    # '2'
+    ver[3] = 48
+    ver[4] = 48
+    ver[5] = 48
+    n: int32 = p9_emit_tversion(&c, P9_NOTAG, 8192, &ver[0], 6)
+    if n < 0:
+        return -1
+    if _send_tmsg(tx, n) < 0:
+        return -1
+    rn: int32 = _recv_rmsg(rx)
+    if rn < 0:
+        return -1
+    if rsp_buf[4] == P9_RERROR:
+        _dump_rerror()
+        return -1
+    tg: uint16 = 0
+    ms: uint32 = 0
+    vptr: Ptr[uint8] = cast[Ptr[uint8]](0)
+    vlen: uint64 = 0
+    rc: int64 = p9_decode_rversion(&rsp_buf[0], cast[uint64](rn),
+                                   &tg, &ms, &vptr, &vlen)
+    if rc < cast[int64](0):
+        return -1
+    return 0
+
+
+def _client_attach(tx: int32, rx: int32) -> int32:
+    c: P9Cursor
+    p9_cursor_init(&c, &cli_buf[0], CLI_BUF_CAP)
+    empty: Array[1, uint8]
+    empty[0] = 0
+    n: int32 = p9_emit_tattach(&c, 1, ROOT_FID, P9_NOFID,
+                               &empty[0], 0, &empty[0], 0)
+    if n < 0:
+        return -1
+    if _send_tmsg(tx, n) < 0:
+        return -1
+    rn: int32 = _recv_rmsg(rx)
+    if rn < 0:
+        return -1
+    if rsp_buf[4] == P9_RERROR:
+        _dump_rerror()
+        return -1
+    tg: uint16 = 0
+    qt: uint8 = 0
+    qv: uint32 = 0
+    qp: uint64 = 0
+    rc: int64 = p9_decode_rattach(&rsp_buf[0], cast[uint64](rn),
+                                  &tg, &qt, &qv, &qp)
+    if rc < cast[int64](0):
+        return -1
+    if qt != P9_QTDIR:
+        return -1
+    return 0
+
+
+def _client_walk(tx: int32, rx: int32, newfid: uint32,
+                 ncomp: uint16) -> int32:
+    c: P9Cursor
+    p9_cursor_init(&c, &cli_buf[0], CLI_BUF_CAP)
+    n: int32 = p9_emit_twalk(&c, 2, ROOT_FID, newfid, ncomp,
+                             &walk_names[0], &walk_lens[0])
+    if n < 0:
+        return -1
+    if _send_tmsg(tx, n) < 0:
+        return -1
+    rn: int32 = _recv_rmsg(rx)
+    if rn < 0:
+        return -1
+    if rsp_buf[4] == P9_RERROR:
+        _dump_rerror()
+        return -1
+    tg: uint16 = 0
+    nq: uint16 = 0
+    rc: int64 = p9_decode_rwalk(&rsp_buf[0], cast[uint64](rn),
+                                &tg, &nq,
+                                &walk_qtypes_in[0],
+                                &walk_qvers_in[0],
+                                &walk_qpaths_in[0])
+    if rc < cast[int64](0):
+        return -1
+    if nq != ncomp:
+        write_str(1, "[dfsp] FAIL: partial walk\n")
+        return -1
+    return 0
+
+
+def _client_walk_dpkg(tx: int32, rx: int32) -> int32:
+    walk_names[0] = &comp_var[0]
+    walk_lens[0]  = 3
+    walk_names[1] = &comp_lib[0]
+    walk_lens[1]  = 3
+    walk_names[2] = &comp_dpkg[0]
+    walk_lens[2]  = 4
+    if _client_walk(tx, rx, DPKG_FID, 3) < 0:
+        return -1
+    if walk_qtypes_in[2] != P9_QTDIR:
+        write_str(1, "[dfsp] FAIL: dpkg not a directory\n")
+        return -1
+    return 0
+
+
+def _client_create_file(tx: int32, rx: int32) -> int32:
+    # Tcreate "pkgfile" inside DPKG_FID as a regular file.
+    c: P9Cursor
+    p9_cursor_init(&c, &cli_buf[0], CLI_BUF_CAP)
+    n: int32 = p9_emit_tcreate(&c, 3, DPKG_FID,
+                               &comp_file[0], 7, 0x1FF, P9_ORDWR)
+    if n < 0:
+        return -1
+    if _send_tmsg(tx, n) < 0:
+        return -1
+    rn: int32 = _recv_rmsg(rx)
+    if rn < 0:
+        return -1
+    if rsp_buf[4] == P9_RERROR:
+        _dump_rerror()
+        return -1
+    tg: uint16 = 0
+    qt: uint8 = 0
+    qv: uint32 = 0
+    qp: uint64 = 0
+    iou: uint32 = 0
+    rc: int64 = p9_decode_rcreate(&rsp_buf[0], cast[uint64](rn),
+                                  &tg, &qt, &qv, &qp, &iou)
+    if rc < cast[int64](0):
+        return -1
+    if qt != P9_QTFILE:
+        write_str(1, "[dfsp] FAIL: created node not a file\n")
+        return -1
+    return 0
+
+
+def _client_write_file(tx: int32, rx: int32) -> int32:
+    # After Tcreate, DPKG_FID references the new file, open for I/O.
+    c: P9Cursor
+    p9_cursor_init(&c, &cli_buf[0], CLI_BUF_CAP)
+    n: int32 = p9_emit_twrite(&c, 4, DPKG_FID, 0,
+                              &payload[0], cast[uint32](PAYLOAD_LEN))
+    if n < 0:
+        return -1
+    if _send_tmsg(tx, n) < 0:
+        return -1
+    rn: int32 = _recv_rmsg(rx)
+    if rn < 0:
+        return -1
+    if rsp_buf[4] == P9_RERROR:
+        _dump_rerror()
+        return -1
+    tg: uint16 = 0
+    count: uint32 = 0
+    rc: int64 = p9_decode_rwrite(&rsp_buf[0], cast[uint64](rn),
+                                 &tg, &count)
+    if rc < cast[int64](0):
+        return -1
+    if cast[uint64](count) != PAYLOAD_LEN:
+        write_str(1, "[dfsp] FAIL: short write\n")
+        return -1
+    return 0
+
+
+def _client_clunk(tx: int32, rx: int32, fid: uint32) -> int32:
+    c: P9Cursor
+    p9_cursor_init(&c, &cli_buf[0], CLI_BUF_CAP)
+    n: int32 = p9_emit_tclunk(&c, 5, fid)
+    if n < 0:
+        return -1
+    if _send_tmsg(tx, n) < 0:
+        return -1
+    rn: int32 = _recv_rmsg(rx)
+    if rn < 0:
+        return -1
+    if rsp_buf[4] == P9_RERROR:
+        _dump_rerror()
+        return -1
+    tg: uint16 = 0
+    rc: int64 = p9_decode_rclunk(&rsp_buf[0], cast[uint64](rn), &tg)
+    if rc < cast[int64](0):
+        return -1
+    return 0
+
+
+def _client_walk_file(tx: int32, rx: int32) -> int32:
+    # Walk root -> var/lib/dpkg/pkgfile into READ_FID.
+    walk_names[0] = &comp_var[0]
+    walk_lens[0]  = 3
+    walk_names[1] = &comp_lib[0]
+    walk_lens[1]  = 3
+    walk_names[2] = &comp_dpkg[0]
+    walk_lens[2]  = 4
+    walk_names[3] = &comp_file[0]
+    walk_lens[3]  = 7
+    if _client_walk(tx, rx, READ_FID, 4) < 0:
+        return -1
+    if walk_qtypes_in[3] != P9_QTFILE:
+        write_str(1, "[dfsp] FAIL: pkgfile not a file\n")
+        return -1
+    return 0
+
+
+def _client_open_file(tx: int32, rx: int32) -> int32:
+    c: P9Cursor
+    p9_cursor_init(&c, &cli_buf[0], CLI_BUF_CAP)
+    n: int32 = p9_emit_topen(&c, 6, READ_FID, P9_OREAD)
+    if n < 0:
+        return -1
+    if _send_tmsg(tx, n) < 0:
+        return -1
+    rn: int32 = _recv_rmsg(rx)
+    if rn < 0:
+        return -1
+    if rsp_buf[4] == P9_RERROR:
+        _dump_rerror()
+        return -1
+    tg: uint16 = 0
+    qt: uint8 = 0
+    qv: uint32 = 0
+    qp: uint64 = 0
+    iou: uint32 = 0
+    rc: int64 = p9_decode_ropen(&rsp_buf[0], cast[uint64](rn),
+                                &tg, &qt, &qv, &qp, &iou)
+    if rc < cast[int64](0):
+        return -1
+    if qt != P9_QTFILE:
+        return -1
+    return 0
+
+
+def _client_read_file(tx: int32, rx: int32) -> int32:
+    # Read the file back and assert the marker payload matches.
+    c: P9Cursor
+    p9_cursor_init(&c, &cli_buf[0], CLI_BUF_CAP)
+    n: int32 = p9_emit_tread(&c, 7, READ_FID, 0, 256)
+    if n < 0:
+        return -1
+    if _send_tmsg(tx, n) < 0:
+        return -1
+    rn: int32 = _recv_rmsg(rx)
+    if rn < 0:
+        return -1
+    if rsp_buf[4] == P9_RERROR:
+        _dump_rerror()
+        return -1
+    tg: uint16 = 0
+    dptr: Ptr[uint8] = cast[Ptr[uint8]](0)
+    count: uint32 = 0
+    rc: int64 = p9_decode_rread(&rsp_buf[0], cast[uint64](rn),
+                                &tg, &dptr, &count)
+    if rc < cast[int64](0):
+        return -1
+    if cast[uint64](count) != PAYLOAD_LEN:
+        write_str(1, "[dfsp] FAIL: read count mismatch after reboot\n")
+        return -1
+    i: uint64 = 0
+    while i < PAYLOAD_LEN:
+        if dptr[i] != payload[i]:
+            write_str(1, "[dfsp] FAIL: payload mismatch after reboot\n")
+            return -1
+        i = i + 1
+    write_str(1, "[dfsp] read match OK\n")
+    return 0
+
+
+# --- mode selection ---------------------------------------------------
+
+def _arg_is(argv: Ptr[uint64], idx: int32, lit: Ptr[uint8]) -> int32:
+    # 1 if argv[idx] equals the NUL-terminated literal `lit`, else 0.
+    a: Ptr[uint8] = cast[Ptr[uint8]](argv[cast[uint64](idx)])
+    if a == cast[Ptr[uint8]](0):
+        return 0
+    i: uint64 = 0
+    while True:
+        if a[i] != lit[i]:
+            return 0
+        if lit[i] == 0:
+            return 1
+        i = i + 1
+    return 0
+
+
+def _spawn_distrofs(c2s_rfd: int32, s2c_wfd: int32) -> int32:
+    spawn_argv[0] = cast[uint64](&"/bin/distrofs"[0])
+    spawn_argv[1] = 0
+    return sys_spawn("/bin/distrofs", &spawn_argv[0],
+                     c2s_rfd, s2c_wfd, cast[Ptr[uint64]](0))
+
+
+# boot 1: create + write + clunk the marked file, then EOF the daemon.
+def _do_write() -> int32:
+    write_str(1, "[dfsp] start mode=write\n")
+    if sys_pipe(&c2s_fds[0]) < 0:
+        dump_errstr("[dfsp] FAIL: sys_pipe c2s errstr=")
+        return 2
+    if sys_pipe(&s2c_fds[0]) < 0:
+        dump_errstr("[dfsp] FAIL: sys_pipe s2c errstr=")
+        return 3
+    c2s_rfd: int32 = c2s_fds[0]
+    c2s_wfd: int32 = c2s_fds[1]
+    s2c_rfd: int32 = s2c_fds[0]
+    s2c_wfd: int32 = s2c_fds[1]
+    pid: int32 = _spawn_distrofs(c2s_rfd, s2c_wfd)
+    if pid < 0:
+        dump_errstr("[dfsp] FAIL: sys_spawn errstr=")
+        return 4
+    write_str(1, "[dfsp] spawn OK\n")
+    sys_close(c2s_rfd)
+    sys_close(s2c_wfd)
+
+    if _client_version(c2s_wfd, s2c_rfd) < 0:
+        write_str(1, "[dfsp] FAIL: Tversion exchange\n")
+        return 5
+    if _client_attach(c2s_wfd, s2c_rfd) < 0:
+        write_str(1, "[dfsp] FAIL: Tattach exchange\n")
+        return 6
+    if _client_walk_dpkg(c2s_wfd, s2c_rfd) < 0:
+        write_str(1, "[dfsp] FAIL: Twalk var/lib/dpkg\n")
+        return 7
+    if _client_create_file(c2s_wfd, s2c_rfd) < 0:
+        write_str(1, "[dfsp] FAIL: Tcreate pkgfile\n")
+        return 8
+    if _client_write_file(c2s_wfd, s2c_rfd) < 0:
+        write_str(1, "[dfsp] FAIL: Twrite pkgfile\n")
+        return 9
+    # Clunking the written fid triggers distrofs's durable snapshot.
+    if _client_clunk(c2s_wfd, s2c_rfd, DPKG_FID) < 0:
+        write_str(1, "[dfsp] FAIL: Tclunk pkgfile fid\n")
+        return 10
+    write_str(1, "[dfsp] write done\n")
+    # Close the pipes: distrofs sees EOF and takes a final snapshot
+    # before exiting. Wait for it so the snapshot is fully on disk
+    # before this fixture returns.
+    sys_close(c2s_wfd)
+    sys_close(s2c_rfd)
+    sys_waitpid(pid)
+    write_str(1, "[dfsp] WRITE PASS\n")
+    return 0
+
+
+# boot 2: a fresh distrofs loads the snapshot; read the marker back.
+def _do_read() -> int32:
+    write_str(1, "[dfsp] start mode=read\n")
+    if sys_pipe(&c2s_fds[0]) < 0:
+        dump_errstr("[dfsp] FAIL: sys_pipe c2s errstr=")
+        return 2
+    if sys_pipe(&s2c_fds[0]) < 0:
+        dump_errstr("[dfsp] FAIL: sys_pipe s2c errstr=")
+        return 3
+    c2s_rfd: int32 = c2s_fds[0]
+    c2s_wfd: int32 = c2s_fds[1]
+    s2c_rfd: int32 = s2c_fds[0]
+    s2c_wfd: int32 = s2c_fds[1]
+    pid: int32 = _spawn_distrofs(c2s_rfd, s2c_wfd)
+    if pid < 0:
+        dump_errstr("[dfsp] FAIL: sys_spawn errstr=")
+        return 4
+    write_str(1, "[dfsp] spawn OK\n")
+    sys_close(c2s_rfd)
+    sys_close(s2c_wfd)
+
+    if _client_version(c2s_wfd, s2c_rfd) < 0:
+        write_str(1, "[dfsp] FAIL: Tversion exchange\n")
+        return 5
+    if _client_attach(c2s_wfd, s2c_rfd) < 0:
+        write_str(1, "[dfsp] FAIL: Tattach exchange\n")
+        return 6
+    # The crux: the file was created on a PREVIOUS boot. It only
+    # walks if distrofs reloaded its snapshot off the ext4 volume.
+    if _client_walk_file(c2s_wfd, s2c_rfd) < 0:
+        write_str(1, "[dfsp] FAIL: pkgfile gone after reboot\n")
+        return 7
+    if _client_open_file(c2s_wfd, s2c_rfd) < 0:
+        write_str(1, "[dfsp] FAIL: Topen pkgfile after reboot\n")
+        return 8
+    if _client_read_file(c2s_wfd, s2c_rfd) < 0:
+        write_str(1, "[dfsp] FAIL: Tread pkgfile after reboot\n")
+        return 9
+    if _client_clunk(c2s_wfd, s2c_rfd, READ_FID) < 0:
+        write_str(1, "[dfsp] FAIL: Tclunk read fid\n")
+        return 10
+    sys_close(c2s_wfd)
+    sys_close(s2c_rfd)
+    sys_waitpid(pid)
+    write_str(1, "[dfsp] READ PASS\n")
+    return 0
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    if argc >= 2:
+        if _arg_is(argv, 1, "write") != 0:
+            return _do_write()
+        if _arg_is(argv, 1, "read") != 0:
+            return _do_read()
+    write_str(1, "[dfsp] FAIL: usage: test_distrofs_persist write|read\n")
+    return 1

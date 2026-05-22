@@ -2462,6 +2462,157 @@ def ext4_fsync_smoke_test() -> int32:
     return 0
 
 
+# --- ext4 blob save / load (distrofs persistent backing) ----------
+#
+# distrofs (user/distrofs.ad) is a userland 9P file-server whose node
+# + data tables live in RAM. To make an installed package survive a
+# reboot it needs a DURABLE backing store: it serialises its whole
+# table image into one buffer and asks the kernel to persist that
+# buffer as a single root-directory file on the mounted ext4 volume.
+#
+# ext4_blob_save writes an arbitrary-length buffer to a named file in
+# the ext4 root directory, growing the file across as many data blocks
+# as the length needs. The existing M16.64 create/write path is
+# single-block; this is the multi-block writer the persistent-distrofs
+# milestone needs. It is NOT a general open()/write() path — it always
+# create-or-truncates the WHOLE file from one in-memory buffer, which
+# is exactly the snapshot semantics distrofs wants and keeps the code
+# small and corruption-free (no partial-block RMW, no extent surgery
+# on an existing tree).
+#
+# Block allocation: ext4_alloc_block() always returns the first free
+# bit, so calling it N times in a row hands back N CONSECUTIVE blocks.
+# _ext4_extent_append_block() coalesces a contiguous run into a single
+# extent, so the inline depth-0 leaf (eh_max 4) holds a blob of any
+# size as long as the run stays contiguous — which it does on a fresh
+# region. A fragmented volume could need >4 extents; ext4_blob_save
+# detects a full leaf and fails cleanly (-1) rather than corrupt.
+#
+# ext4_blob_load resolves the named root file and reads it back via
+# the standard multi-block ext4_read_file path.
+
+# Per-block scratch for blob save (separate from ext4_blk_buf so an
+# in-flight inode read during the loop can't trample it).
+ext4_blob_buf: Array[4096, uint8]
+# Inode scratch for the blob writer.
+ext4_blob_inode: Array[256, uint8]
+
+
+def ext4_blob_save(name: Ptr[char], src: Ptr[uint8],
+                   length: uint64) -> int64:
+    # Create-or-overwrite the root-directory file `name` so it holds
+    # exactly `length` bytes copied from `src`, then fsync the volume.
+    # Returns the byte count written on success, -1 on any failure.
+    if ext4_blockdev_slot < 0:
+        return cast[int64](-1)
+    # Drop any previous incarnation of the file: tombstone its dirent
+    # and free its inode. We also walk its extent leaf and free every
+    # data block so a repeated save does not leak the volume away.
+    old_inum: uint32 = _ext4_dir_unlink_in_root(name)
+    if old_inum != 0:
+        if ext4_read_inode(cast[uint64](old_inum),
+                           &ext4_blob_inode[0]) == 0:
+            _ext4_extent_trim_to(&ext4_blob_inode[0], 0)
+        ext4_free_inode(old_inum)
+    # Allocate a fresh inode for the new file.
+    new_inum: uint32 = ext4_alloc_inode()
+    if new_inum == 0:
+        printk0("ext4: blob_save FAIL (alloc_inode)\n")
+        return cast[int64](-1)
+    # Start from a minimal empty regular inode: mode 0664 + IFREG, an
+    # empty depth-0 extent leaf, i_size 0. _ext4_init_regular_inode
+    # wants a data block; we instead hand-build an EMPTY leaf so the
+    # append loop below grows it block by block.
+    p: Ptr[uint8] = &ext4_blob_inode[0]
+    _ext4_zero(p, ext4_inode_size)
+    _ext4_write_u16(p, 0x81B4)                       # i_mode = IFREG|0664
+    _ext4_write_u16(cast[Ptr[uint8]](cast[uint64](p) + 26), 1)  # i_links
+    _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](p) + 32),
+                    0x80000)                         # EXT4_EXTENTS_FL
+    eh: uint64 = cast[uint64](p) + INODE_I_BLOCK_OFFSET
+    _ext4_write_u16(cast[Ptr[uint8]](eh + 0), EXT4_EXTENT_MAGIC)
+    _ext4_write_u16(cast[Ptr[uint8]](eh + 2), 0)     # eh_entries = 0
+    _ext4_write_u16(cast[Ptr[uint8]](eh + 4), 4)     # eh_max = 4
+    _ext4_write_u16(cast[Ptr[uint8]](eh + 6), 0)     # eh_depth = 0
+    _ext4_write_u32(cast[Ptr[uint8]](eh + 8), 0)     # eh_generation
+    _ext4_stamp_all_times(p)
+    # Grow the file block by block.
+    nblocks: uint64 = (length + ext4_block_size - 1) / ext4_block_size
+    sectors_per_block: uint64 = ext4_block_size / SECTOR_SIZE
+    lb: uint64 = 0
+    while lb < nblocks:
+        nb: uint64 = ext4_alloc_block()
+        if nb == 0:
+            printk0("ext4: blob_save FAIL (out of blocks)\n")
+            _ext4_extent_trim_to(&ext4_blob_inode[0], lb)
+            ext4_free_inode(new_inum)
+            return cast[int64](-1)
+        # Fill the block: copy this slice of src, zero-pad the tail.
+        _ext4_zero(&ext4_blob_buf[0], ext4_block_size)
+        off: uint64 = lb * ext4_block_size
+        chunk: uint64 = length - off
+        if chunk > ext4_block_size:
+            chunk = ext4_block_size
+        if chunk > 0:
+            memcpy(&ext4_blob_buf[0],
+                   cast[Ptr[uint8]](cast[uint64](src) + off), chunk)
+        if _ext4_write_block(nb, &ext4_blob_buf[0]) != 0:
+            printk0("ext4: blob_save FAIL (write data block)\n")
+            ext4_free_block(nb)
+            _ext4_extent_trim_to(&ext4_blob_inode[0], lb)
+            ext4_free_inode(new_inum)
+            return cast[int64](-1)
+        if _ext4_extent_append_block(&ext4_blob_inode[0], lb, nb) != 0:
+            printk0("ext4: blob_save FAIL (extent leaf full)\n")
+            ext4_free_block(nb)
+            _ext4_extent_trim_to(&ext4_blob_inode[0], lb)
+            ext4_free_inode(new_inum)
+            return cast[int64](-1)
+        lb = lb + 1
+    # Stamp i_size and i_blocks, write the inode out.
+    _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](p) + 4),
+                    cast[uint32](length))            # i_size_lo
+    _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](p) + 28),
+                    cast[uint32](nblocks * sectors_per_block))  # i_blocks_lo
+    _ext4_stamp_mtime(p)
+    if ext4_write_inode(cast[uint64](new_inum),
+                        &ext4_blob_inode[0]) != 0:
+        printk0("ext4: blob_save FAIL (write inode)\n")
+        _ext4_extent_trim_to(&ext4_blob_inode[0], 0)
+        ext4_free_inode(new_inum)
+        return cast[int64](-1)
+    # Splice the dirent into the root directory (EXT4_FT_REG_FILE = 1).
+    if ext4_dir_insert(2, name, new_inum, 1) != 0:
+        printk0("ext4: blob_save FAIL (dir_insert)\n")
+        _ext4_extent_trim_to(&ext4_blob_inode[0], 0)
+        ext4_free_inode(new_inum)
+        return cast[int64](-1)
+    # Durable: flush the block-device write cache (the same barrier
+    # ext4_fsync issues). Without this the snapshot is only in the
+    # device cache and a reboot could lose it.
+    blk_flush(ext4_blockdev_slot)
+    return cast[int64](length)
+
+
+def ext4_blob_load(name: Ptr[char], dst: Ptr[uint8],
+                   max_len: uint64) -> int64:
+    # Read the root-directory file `name` into `dst` (at most max_len
+    # bytes). Returns the byte count read, 0 if the file does not
+    # exist, -1 on I/O error / no ext4 volume.
+    if ext4_blockdev_slot < 0:
+        return cast[int64](-1)
+    inum: uint32 = 0
+    size: uint64 = 0
+    if ext4_resolve_file(name, &inum, &size) == 0:
+        return cast[int64](0)                        # no snapshot yet
+    want: uint64 = size
+    if want > max_len:
+        want = max_len
+    if want == 0:
+        return cast[int64](0)
+    return ext4_read_file(inum, 0, want, dst)
+
+
 # --- ext4_mkfs (M16.x) --------------------------------------------
 #
 # Format a freshly-partitioned slice as ext4. Mirrors the simplest

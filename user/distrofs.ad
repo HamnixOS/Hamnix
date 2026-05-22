@@ -101,6 +101,15 @@ extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_exit(code: uint64)
 extern def sys_srv_post(name: Ptr[char], srvfd: int32) -> int32
+# distrofs persistent backing — snapshot the RAM node/data tables to /
+# from a single durable file on the ext4 volume so an installed
+# package survives a reboot. The kernel owns the backing-file name;
+# no path is passed (namespace law: the ext4 image is distrofs's
+# private backing store, not a globally-mounted route).
+extern def sys_dfs_load(inst: uint64, buf: Ptr[uint8],
+                        max_len: uint64) -> int64
+extern def sys_dfs_save(inst: uint64, buf: Ptr[uint8],
+                        length: uint64) -> int64
 
 from lib.9p.9p import (
     P9Cursor, p9_cursor_init,
@@ -186,11 +195,14 @@ dataslot_used:  Array[160, uint8]
 #   fid_open[s]   0 = walked-not-opened, 1 = opened for I/O
 #   fid_mode[s]   the Plan 9 open mode byte (valid only when fid_open)
 
-fid_used: Array[64, uint8]
-fid_id:   Array[64, uint32]
-fid_node: Array[64, uint64]
-fid_open: Array[64, uint8]
-fid_mode: Array[64, uint8]
+fid_used:  Array[64, uint8]
+fid_id:    Array[64, uint32]
+fid_node:  Array[64, uint64]
+fid_open:  Array[64, uint8]
+fid_mode:  Array[64, uint8]
+# fid_dirty[s]  set when this fid created or wrote a file — its Tclunk
+# triggers a durable snapshot to the ext4 backing (see _dfs_save_to_disk).
+fid_dirty: Array[64, uint8]
 
 # -- Twalk decode scratch (top-level; P9_MAX_WELEM = 16) ---------------
 
@@ -199,6 +211,297 @@ walk_wlens:  Array[16, uint64]
 walk_qtypes: Array[16, uint8]
 walk_qvers:  Array[16, uint32]
 walk_qpaths: Array[16, uint64]
+
+
+# -- persistent backing store (ext4-backed snapshot) -------------------
+#
+# distrofs's node + data tables are RAM-backed and volatile. To make
+# an installed package DURABLE — survive a reboot — the whole table
+# image is serialised into one buffer and persisted by the kernel as a
+# single file on the mounted ext4 volume (sys_dfs_save). On startup
+# distrofs loads that snapshot back (sys_dfs_load) so it resumes with
+# every previously-installed file in place.
+#
+# This is RAM-cache-over-ext4: every Twalk / Tread / Twrite still hits
+# the RAM tables at full speed (the fast path is completely unchanged).
+# The ext4 image is purely the durable BACKING — the namespace VIEW
+# stays ephemeral, only the STATE persists, exactly the HAMSH_SPEC §12
+# view-vs-state model. A snapshot is taken on every Tclunk of a fid
+# that was opened for write (so once per installed file, not once per
+# Twrite) and at clean EOF.
+#
+# SNAPSHOT FORMAT (little-endian, version 02)
+#   magic[8]              "DFSIMG02"
+#   node_kind[NODE_CAP]            u8   each
+#   node_parent[NODE_CAP]          u64  each
+#   node_name[NODE_CAP*NAME_CAP]   u8   each
+#   node_namelen[NODE_CAP]         u64  each
+#   node_size[NODE_CAP]            u64  each
+#   node_vers[NODE_CAP]            u32  each
+#   node_dataslot[NODE_CAP]        i64  each
+#   then, for every KIND_FILE node that has a bound data slot, in
+#   ascending node index order: node_size[i] bytes of that node's
+#   file data. Directories and never-written files contribute none.
+#
+# The fixed metadata block is NODE_CAP-derived and small (~38 KiB at
+# NODE_CAP=384); the data block is the sum of every written file's
+# size. SNAP_CAP bounds the whole image — 4 MiB comfortably holds a
+# small Debian package (the `hello` package's data is well under
+# 100 KiB) while staying a fraction of the 10 MiB data pool.
+
+SNAP_MAGIC0: uint8 = 68      # 'D'
+SNAP_MAGIC1: uint8 = 70      # 'F'
+SNAP_MAGIC2: uint8 = 83      # 'S'
+SNAP_MAGIC3: uint8 = 73      # 'I'
+SNAP_MAGIC4: uint8 = 77      # 'M'
+SNAP_MAGIC5: uint8 = 71      # 'G'
+SNAP_MAGIC6: uint8 = 48      # '0'
+SNAP_MAGIC7: uint8 = 50      # '2'
+
+SNAP_CAP: uint64 = 4194304   # 4 MiB serialisation buffer
+snap_buf: Array[4194304, uint8]
+
+# Persistent-backing instance id (0..15). One Hamnix host can run
+# several distrofs daemons (nsrun spawns one each for /var, /usr,
+# /etc); each must persist to a DISTINCT, reboot-stable ext4 file.
+# The id is derived from argv[1] in main() — a stable launch property,
+# never the pid — and threaded into every sys_dfs_load / sys_dfs_save.
+# Default 0: a standalone distrofs (the test-fixture shape) is one
+# daemon and persists to instance 0.
+dfs_instance: uint64 = 0
+
+# dfs_backing_ok — 1 once an ext4 backing volume is confirmed present
+# (the startup load returned >= 0), 0 if there is no ext4 volume at
+# all. When 0, distrofs skips every save attempt silently: a host
+# booted without an ext4 disk runs distrofs purely RAM-backed exactly
+# as before, with no per-clunk failure noise on stderr.
+dfs_backing_ok: int32 = 0
+
+
+def _snap_put_u64(off: uint64, v: uint64) -> uint64:
+    # Write v little-endian at snap_buf[off]; return off + 8.
+    i: uint64 = 0
+    while i < 8:
+        snap_buf[off + i] = cast[uint8]((v >> (i * 8)) & 0xFF)
+        i = i + 1
+    return off + 8
+
+
+def _snap_get_u64(off: uint64) -> uint64:
+    v: uint64 = 0
+    i: uint64 = 0
+    while i < 8:
+        v = v | (cast[uint64](snap_buf[off + i]) << (i * 8))
+        i = i + 1
+    return v
+
+
+def _snap_put_u32(off: uint64, v: uint32) -> uint64:
+    i: uint64 = 0
+    while i < 4:
+        snap_buf[off + i] = cast[uint8]((cast[uint64](v) >> (i * 8)) & 0xFF)
+        i = i + 1
+    return off + 4
+
+
+def _snap_get_u32(off: uint64) -> uint32:
+    v: uint64 = 0
+    i: uint64 = 0
+    while i < 4:
+        v = v | (cast[uint64](snap_buf[off + i]) << (i * 8))
+        i = i + 1
+    return cast[uint32](v)
+
+
+def _dfs_serialize() -> uint64:
+    # Serialise the live node + data tables into snap_buf. Returns the
+    # total image byte length, or 0 if it would not fit in SNAP_CAP.
+    off: uint64 = 0
+    # Magic.
+    snap_buf[0] = SNAP_MAGIC0
+    snap_buf[1] = SNAP_MAGIC1
+    snap_buf[2] = SNAP_MAGIC2
+    snap_buf[3] = SNAP_MAGIC3
+    snap_buf[4] = SNAP_MAGIC4
+    snap_buf[5] = SNAP_MAGIC5
+    snap_buf[6] = SNAP_MAGIC6
+    snap_buf[7] = SNAP_MAGIC7
+    off = 8
+    # node_kind[].
+    i: uint64 = 0
+    while i < NODE_CAP:
+        snap_buf[off] = node_kind[i]
+        off = off + 1
+        i = i + 1
+    # node_parent[].
+    i = 0
+    while i < NODE_CAP:
+        off = _snap_put_u64(off, node_parent[i])
+        i = i + 1
+    # node_name[].
+    i = 0
+    while i < NODE_CAP * NAME_CAP:
+        snap_buf[off] = node_name[i]
+        off = off + 1
+        i = i + 1
+    # node_namelen[].
+    i = 0
+    while i < NODE_CAP:
+        off = _snap_put_u64(off, node_namelen[i])
+        i = i + 1
+    # node_size[].
+    i = 0
+    while i < NODE_CAP:
+        off = _snap_put_u64(off, node_size[i])
+        i = i + 1
+    # node_vers[].
+    i = 0
+    while i < NODE_CAP:
+        off = _snap_put_u32(off, node_vers[i])
+        i = i + 1
+    # node_dataslot[].
+    i = 0
+    while i < NODE_CAP:
+        off = _snap_put_u64(off, cast[uint64](node_dataslot[i]))
+        i = i + 1
+    # File data: node_size bytes for every KIND_FILE node with a slot.
+    i = 0
+    while i < NODE_CAP:
+        if node_kind[i] == KIND_FILE and node_dataslot[i] >= cast[int64](0):
+            sz: uint64 = node_size[i]
+            if off + sz > SNAP_CAP:
+                return 0                          # image too large
+            base: uint64 = cast[uint64](node_dataslot[i]) * FILE_CAP
+            j: uint64 = 0
+            while j < sz:
+                snap_buf[off + j] = node_data[base + j]
+                j = j + 1
+            off = off + sz
+        i = i + 1
+    return off
+
+
+def _dfs_deserialize(image_len: uint64) -> int32:
+    # Rebuild the node + data tables from a snapshot already loaded
+    # into snap_buf. Returns 1 on success, 0 if the image is missing /
+    # malformed (caller keeps the fresh skeleton in that case).
+    if image_len < 8:
+        return 0
+    if snap_buf[0] != SNAP_MAGIC0 or snap_buf[1] != SNAP_MAGIC1:
+        return 0
+    if snap_buf[2] != SNAP_MAGIC2 or snap_buf[3] != SNAP_MAGIC3:
+        return 0
+    if snap_buf[4] != SNAP_MAGIC4 or snap_buf[5] != SNAP_MAGIC5:
+        return 0
+    if snap_buf[6] != SNAP_MAGIC6 or snap_buf[7] != SNAP_MAGIC7:
+        return 0
+    # Fixed metadata block size — reject a truncated image up front.
+    meta: uint64 = 8 \
+                 + NODE_CAP \
+                 + NODE_CAP * 8 \
+                 + NODE_CAP * NAME_CAP \
+                 + NODE_CAP * 8 \
+                 + NODE_CAP * 8 \
+                 + NODE_CAP * 4 \
+                 + NODE_CAP * 8
+    if image_len < meta:
+        return 0
+    off: uint64 = 8
+    i: uint64 = 0
+    while i < NODE_CAP:
+        node_kind[i] = snap_buf[off]
+        off = off + 1
+        i = i + 1
+    i = 0
+    while i < NODE_CAP:
+        node_parent[i] = _snap_get_u64(off)
+        off = off + 8
+        i = i + 1
+    i = 0
+    while i < NODE_CAP * NAME_CAP:
+        node_name[i] = snap_buf[off]
+        off = off + 1
+        i = i + 1
+    i = 0
+    while i < NODE_CAP:
+        node_namelen[i] = _snap_get_u64(off)
+        off = off + 8
+        i = i + 1
+    i = 0
+    while i < NODE_CAP:
+        node_size[i] = _snap_get_u64(off)
+        off = off + 8
+        i = i + 1
+    i = 0
+    while i < NODE_CAP:
+        node_vers[i] = _snap_get_u32(off)
+        off = off + 4
+        i = i + 1
+    i = 0
+    while i < NODE_CAP:
+        node_dataslot[i] = cast[int64](_snap_get_u64(off))
+        off = off + 8
+        i = i + 1
+    # Reset the data-slot allocator and rebuild it from the loaded
+    # node_dataslot bindings, copying each file's bytes back into its
+    # pool slot.
+    s: uint64 = 0
+    while s < DATA_SLOT_CAP:
+        dataslot_used[s] = 0
+        s = s + 1
+    i = 0
+    while i < NODE_CAP:
+        if node_kind[i] == KIND_FILE and node_dataslot[i] >= cast[int64](0):
+            ds: uint64 = cast[uint64](node_dataslot[i])
+            if ds >= DATA_SLOT_CAP:
+                return 0                          # malformed slot index
+            dataslot_used[ds] = 1
+            sz: uint64 = node_size[i]
+            if sz > FILE_CAP:
+                return 0
+            if off + sz > image_len:
+                return 0                          # data block truncated
+            base: uint64 = ds * FILE_CAP
+            j: uint64 = 0
+            while j < sz:
+                node_data[base + j] = snap_buf[off + j]
+                j = j + 1
+            off = off + sz
+        i = i + 1
+    return 1
+
+
+def _dfs_load_from_disk() -> int32:
+    # Pull the durable snapshot off the ext4 volume into the live
+    # tables. Returns 1 if a snapshot was found and applied, 0 if
+    # there is no snapshot yet (or no ext4 volume) — caller keeps the
+    # fresh distro skeleton in that case. Also latches dfs_backing_ok:
+    # a return >= 0 means an ext4 volume is mounted (snapshot present
+    # or not); -1 means no ext4 backing at all.
+    n: int64 = sys_dfs_load(dfs_instance, &snap_buf[0], SNAP_CAP)
+    if n >= cast[int64](0):
+        dfs_backing_ok = 1
+    if n <= cast[int64](0):
+        return 0
+    return _dfs_deserialize(cast[uint64](n))
+
+
+def _dfs_save_to_disk() -> int32:
+    # Snapshot the live tables to the ext4 volume. Returns 1 on
+    # success, 0 on failure / no backing. distrofs keeps serving from
+    # RAM either way. With no ext4 backing this is a silent no-op —
+    # a RAM-only host (no ext4 disk) behaves exactly as before.
+    if dfs_backing_ok == 0:
+        return 0
+    image_len: uint64 = _dfs_serialize()
+    if image_len == 0:
+        write_str(2, "[distrofs] snapshot too large to persist\n")
+        return 0
+    w: int64 = sys_dfs_save(dfs_instance, &snap_buf[0], image_len)
+    if w != cast[int64](image_len):
+        write_str(2, "[distrofs] persist failed (ext4 I/O error)\n")
+        return 0
+    return 1
 
 
 # -- tiny helpers ------------------------------------------------------
@@ -317,19 +620,21 @@ def fid_alloc(id: uint32, node: uint64) -> int64:
     s: uint64 = 0
     while s < FID_CAP:
         if fid_used[s] == 0:
-            fid_used[s] = 1
-            fid_id[s]   = id
-            fid_node[s] = node
-            fid_open[s] = 0
-            fid_mode[s] = 0
+            fid_used[s]  = 1
+            fid_id[s]    = id
+            fid_node[s]  = node
+            fid_open[s]  = 0
+            fid_mode[s]  = 0
+            fid_dirty[s] = 0
             return cast[int64](s)
         s = s + 1
     return cast[int64](-1)
 
 
 def fid_free(slot: uint64):
-    fid_used[slot] = 0
-    fid_open[slot] = 0
+    fid_used[slot]  = 0
+    fid_open[slot]  = 0
+    fid_dirty[slot] = 0
 
 
 # -- skeleton tree -----------------------------------------------------
@@ -431,7 +736,8 @@ def _serve_tversion(in_len: uint64) -> int32:
     # A fresh Tversion resets the connection: clunk every fid.
     s: uint64 = 0
     while s < FID_CAP:
-        fid_used[s] = 0
+        fid_used[s]  = 0
+        fid_dirty[s] = 0
         s = s + 1
     ver: Array[8, uint8]
     ver[0] = 57    # '9'
@@ -694,6 +1000,9 @@ def _serve_tcreate(in_len: uint64) -> int32:
     fid_node[slot] = new_u
     fid_open[slot] = 1
     fid_mode[slot] = mode
+    # Creating a node mutates the tree — mark the fid dirty so its
+    # Tclunk persists the new directory / empty file to the backing.
+    fid_dirty[slot] = 1
     node_vers[parent] = node_vers[parent] + 1
     c: P9Cursor
     p9_cursor_init(&c, &srv_buf[0], SRV_BUF_CAP)
@@ -854,6 +1163,8 @@ def _serve_twrite(in_len: uint64) -> int32:
     if offset + written > node_size[node]:
         node_size[node] = offset + written
     node_vers[node] = node_vers[node] + 1
+    # Mark this fid dirty so its Tclunk snapshots the durable backing.
+    fid_dirty[slot] = 1
     c: P9Cursor
     p9_cursor_init(&c, &srv_buf[0], SRV_BUF_CAP)
     n: int32 = p9_emit_rwrite(&c, tg, cast[uint32](written))
@@ -873,7 +1184,14 @@ def _serve_tclunk(in_len: uint64) -> int32:
     src: int64 = fid_lookup(fid)
     if src < cast[int64](0):
         return _emit_rerror(tg, "distrofs: unknown fid")
+    # If this fid created or wrote a file, take a durable snapshot of
+    # the table image to the ext4 backing BEFORE freeing the fid — so
+    # an installed package's files survive a reboot. This is once per
+    # file (dpkg writes a file then clunks it), not once per Twrite.
+    clunk_dirty: uint8 = fid_dirty[cast[uint64](src)]
     fid_free(cast[uint64](src))
+    if clunk_dirty != 0:
+        _dfs_save_to_disk()
     c: P9Cursor
     p9_cursor_init(&c, &srv_buf[0], SRV_BUF_CAP)
     n: int32 = p9_emit_rclunk(&c, tg)
@@ -960,6 +1278,8 @@ def _serve_tremove(in_len: uint64) -> int32:
     node_size[node] = 0
     node_namelen[node] = 0
     node_vers[parent] = node_vers[parent] + 1
+    # An unlink mutates the durable tree — snapshot it to the backing.
+    _dfs_save_to_disk()
     # Hand-build Rremove: size[4]=7, type[1]=123, tag[2].
     srv_buf[0] = 7
     srv_buf[1] = 0
@@ -1062,8 +1382,30 @@ def _serve_one() -> int32:
     return 1
 
 
-def main() -> int32:
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
     init_tree()
+    # Persistent-backing instance id. argv[1], when present and a
+    # single ASCII digit '0'..'9', selects which durable backing file
+    # this daemon uses — nsrun passes the subtree index so its /var,
+    # /usr, /etc daemons each get a distinct, reboot-stable file. A
+    # standalone distrofs (no argv[1]) keeps instance 0. argv[1] is a
+    # tiny launch parameter, never a path: the namespace law holds.
+    if argc >= 2:
+        a1: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
+        if a1 != cast[Ptr[uint8]](0):
+            c0: uint8 = a1[0]
+            if c0 >= 48 and c0 <= 57 and a1[1] == 0:
+                dfs_instance = cast[uint64](c0 - 48)
+    # Persistent backing: if a durable snapshot exists on the ext4
+    # volume, load it so distrofs resumes with every previously-
+    # installed package's files in place. With no snapshot (or no ext4
+    # backing) the fresh distro skeleton from init_tree() stands —
+    # distrofs is still fully usable, just non-persistent. The RAM
+    # tables remain the live, full-speed serving copy either way.
+    if _dfs_load_from_disk() != 0:
+        write_str(2, "[distrofs] restored snapshot from ext4 backing\n")
+    else:
+        write_str(2, "[distrofs] no snapshot — fresh distro skeleton\n")
     write_str(2, "[distrofs] server starting\n")
     # If launched as `distrofs post`, publish on the kernel srv table so
     # a 9P client can sys_srv_open("distrofs"). The transport is still
@@ -1077,6 +1419,9 @@ def main() -> int32:
     while True:
         rc: int32 = _serve_one()
         if rc == 0:
+            # Clean shutdown — take a final durable snapshot so any
+            # state not yet flushed by a per-file Tclunk is persisted.
+            _dfs_save_to_disk()
             write_str(2, "[distrofs] EOF, exiting\n")
             return 0
         if rc < 0:
