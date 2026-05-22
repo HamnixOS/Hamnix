@@ -164,6 +164,7 @@ from fs.tmpfs import (
 from fs.pipe import (
     pipe_alloc, pipe_read, pipe_write,
     pipe_readers, pipe_writers,
+    pipe_readable, pipe_writable,
 )
 # V5: bidirectional socketpair transport. Each fd marked
 # FD_SOCKETPAIR_MARK is a single fd you can read AND write — retires
@@ -173,6 +174,7 @@ from fs.pipe import (
 from fs.socketpair import (
     sockpair_alloc, sockpair_read, sockpair_write,
     sockpair_close, sockpair_inc_ref, sockpair_peer_alive,
+    sockpair_readable,
     sockpair_pack, sockpair_unpack_slot, sockpair_unpack_dir,
     FD_SOCKETPAIR_MARK,
 )
@@ -183,7 +185,7 @@ from fs.socketpair import (
 # also a leaf — shared with linux_abi/u_syscalls.ad's socket(2)/
 # connect(2) bodies.
 from drivers.net.tcp import (
-    tcp_send, tcp_recv, tcp_recv_nb, tcp_slot_at_eof,
+    tcp_send, tcp_recv, tcp_recv_nb, tcp_recv_pending, tcp_slot_at_eof,
     tcp_close, tcp_listen_close,
 )
 from linux_abi.u_socket_state import (
@@ -207,6 +209,21 @@ from drivers.net.udp import (
 # of raw tcp_send/tcp_recv. tls.ad imports tcp.ad + cpio.ad + the
 # crypto libs but never fs/vfs.ad, so no import cycle.
 from drivers.net.tls import tls_send, tls_recv, tls_close_notify, tls_close
+# §5 Layer-2 async I/O: eventfd / timerfd / signalfd fds tagged with the
+# FD_*_MARK markers below route their read/write back into the confined
+# Layer-2 object pools in linux_abi/u_epoll.ad. That module is a Layer-2
+# leaf (imports printk + the jiffy clock only — never fs/vfs.ad), so no
+# cycle. epoll fds are NOT readable/writable — epoll_wait drives them
+# via the u_syscalls.ad shim, never through vfs_read. The signalfd read
+# arm needs the caller's pending-signal word, which u_syscalls.ad
+# supplies; vfs_read just reports it has no data (the shim handles it).
+from linux_abi.u_epoll import (
+    FD_EPOLL_MARK, FD_EVENTFD_MARK, FD_TIMERFD_MARK, FD_SIGNALFD_MARK,
+    uefd_release, uefd_readable, uefd_read, uefd_write,
+    utfd_release, utfd_readable, utfd_read,
+    usfd_release,
+    uepoll_release,
+)
 from fs.fat import (
     is_fat_path, strip_mnt_prefix, fat_open, fat_close,
     fat_open_write, fat_write_slot, fat_close_write, fat_delete,
@@ -1576,6 +1593,171 @@ def vfs_fd_is_open(fd: int32) -> int32:
     return 1
 
 
+# =====================================================================
+# §5 Layer-2 async I/O — fd-table helpers
+# =====================================================================
+#
+# epoll / eventfd / timerfd / signalfd objects (linux_abi/u_epoll.ad)
+# are referenced through a real per-task fd-table slot tagged with one
+# of u_epoll.ad's FD_*_MARK markers; the slot's fd_buf carries the
+# object's `slot_id + 1` (0 == "no object"). linux_abi/u_syscalls.ad
+# cannot poke the fd table directly (it is per-task private state in
+# core.ad), so these accessors are the bridge — the same shape as
+# vfs_alloc_socket_fd / vfs_socket_fd_set_record above.
+
+def vfs_alloc_l2_fd(mark: uint32) -> int32:
+    # Claim an empty fd-table slot and tag it with a Layer-2 marker
+    # (FD_EPOLL_MARK / FD_EVENTFD_MARK / FD_TIMERFD_MARK /
+    # FD_SIGNALFD_MARK). fd_buf / fd_pos / fd_buflen start zero — the
+    # caller fills fd_buf with the encoded object slot. Returns the fd
+    # or -EMFILE when the table is full.
+    task: Ptr[TaskStruct] = current_task()
+    fd: int32 = _alloc_fd(task)
+    if fd < 0:
+        return EMFILE
+    fdu: uint64 = cast[uint64](fd)
+    task[0].fd_idx[fdu]    = mark
+    task[0].fd_pos[fdu]    = 0
+    task[0].fd_buf[fdu]    = 0
+    task[0].fd_buflen[fdu] = 0
+    return fd
+
+
+def vfs_fd_marker(fd: int32) -> uint32:
+    # Raw fd_idx marker for `fd`, or FD_CLOSED_MARK for a bad/closed fd.
+    # Lets the Layer-2 shim recognise its own object fds without
+    # importing the per-task fd table.
+    rc: int32 = _check_fd(fd)
+    if rc != 0:
+        return FD_CLOSED_MARK
+    task: Ptr[TaskStruct] = current_task()
+    return task[0].fd_idx[cast[uint64](fd)]
+
+
+def vfs_l2_fd_set_buf(fd: int32, val: uint64) -> int32:
+    # Stash the encoded Layer-2 object slot into a Layer-2 fd's fd_buf.
+    # Returns 0 on success, -EBADF if `fd` is not one of our markers.
+    m: uint32 = vfs_fd_marker(fd)
+    if m != FD_EPOLL_MARK and m != FD_EVENTFD_MARK \
+            and m != FD_TIMERFD_MARK and m != FD_SIGNALFD_MARK:
+        return EBADF
+    task: Ptr[TaskStruct] = current_task()
+    task[0].fd_buf[cast[uint64](fd)] = val
+    return 0
+
+
+def vfs_l2_fd_get_buf(fd: int32) -> uint64:
+    # Read back the encoded object slot from a Layer-2 fd's fd_buf.
+    # Returns 0 ("no object") for a non-Layer-2 / closed fd.
+    m: uint32 = vfs_fd_marker(fd)
+    if m != FD_EPOLL_MARK and m != FD_EVENTFD_MARK \
+            and m != FD_TIMERFD_MARK and m != FD_SIGNALFD_MARK:
+        return 0
+    task: Ptr[TaskStruct] = current_task()
+    return task[0].fd_buf[cast[uint64](fd)]
+
+
+def vfs_fd_poll(fd: int32) -> uint32:
+    # Non-destructive readiness probe for poll(2) / select(2) / epoll(7).
+    # Returns a bitmask in the POLLIN(0x1)/POLLOUT(0x4)/POLLERR(0x8)/
+    # POLLHUP(0x10) layout (which matches the low EPOLL* bits). NO bytes
+    # are consumed — epoll_wait must be able to re-report a readable fd
+    # on every wait. The Layer-2 epoll shim translates the result to the
+    # caller's requested event mask.
+    #
+    # readiness model per fd kind:
+    #   socket (TCP)   POLLIN if data buffered or peer FIN/closed;
+    #                  POLLOUT always (the tx path never blocks here);
+    #                  POLLHUP once the connection is CLOSED.
+    #   socket (UDP)   POLLIN if a datagram is queued; POLLOUT always.
+    #   pipe read end  POLLIN if bytes buffered; POLLHUP if all writers
+    #                  gone (epoll treats a hung-up read end as ready).
+    #   pipe write end POLLOUT if ring has space; POLLERR if no readers.
+    #   socketpair     POLLIN if bytes buffered; POLLOUT always.
+    #   eventfd        POLLIN if counter != 0; POLLOUT always.
+    #   timerfd        POLLIN if an expiration is pending.
+    #   signalfd       handled by the u_syscalls.ad shim (needs the
+    #                  caller's pending-signal word) — reported 0 here.
+    #   regular file / stdio / cdev — always POLLIN|POLLOUT (a regular
+    #                  file is always immediately readable in Hamnix).
+    rc: int32 = _check_fd(fd)
+    if rc != 0:
+        return 0x0020                       # POLLNVAL
+    task: Ptr[TaskStruct] = current_task()
+    fdu: uint64 = cast[uint64](fd)
+    fi: uint32 = task[0].fd_idx[fdu]
+    if fi == FD_CLOSED_MARK:
+        return 0x0020                       # POLLNVAL
+    if fi == FD_SOCKET_MARK:
+        sk_rec: int32 = usock_record_for_fdbuf(task[0].fd_buf[fdu])
+        if sk_rec < 0:
+            return 0x0008                   # POLLERR — recordless socket
+        if usock_get_type(sk_rec) == USOCK_SOCK_DGRAM:
+            ud: int32 = usock_get_tcp_slot(sk_rec)
+            ev_u: uint32 = 0x0004           # UDP tx never blocks
+            if udp_socket_recv_pending(ud) != 0:
+                ev_u = ev_u | 0x0001
+            return ev_u
+        if usock_get_state(sk_rec) != USOCK_CONNECTED:
+            return 0x0014                   # POLLHUP|POLLOUT
+        sk_tcp: int32 = usock_get_tcp_slot(sk_rec)
+        if sk_tcp < 0:
+            return 0x0014
+        ev_t: uint32 = 0x0004               # POLLOUT — tx path never blocks
+        if tcp_recv_pending(sk_tcp) != 0:
+            ev_t = ev_t | 0x0001            # POLLIN — data or EOF
+        if tcp_slot_at_eof(sk_tcp) != 0:
+            ev_t = ev_t | 0x0011            # POLLHUP + POLLIN
+        return ev_t
+    if fi == FD_PIPE_MARK_R:
+        slot: int32 = cast[int32](task[0].fd_buf[fdu])
+        ev_pr: uint32 = 0
+        if pipe_readable(slot) != 0:
+            ev_pr = 0x0001
+        if pipe_writers(slot) == 0:
+            ev_pr = ev_pr | 0x0011          # POLLHUP + POLLIN (EOF readable)
+        return ev_pr
+    if fi == FD_PIPE_MARK_W:
+        slot: int32 = cast[int32](task[0].fd_buf[fdu])
+        if pipe_readers(slot) == 0:
+            return 0x0008                   # POLLERR — no readers
+        ev_pw: uint32 = 0
+        if pipe_writable(slot) != 0:
+            ev_pw = 0x0004
+        return ev_pw
+    if fi == FD_SOCKETPAIR_MARK:
+        sp_pkd:  uint64 = task[0].fd_buf[fdu]
+        sp_slot: int32 = sockpair_unpack_slot(sp_pkd)
+        sp_dir:  int32 = sockpair_unpack_dir(sp_pkd)
+        ev_sp: uint32 = 0x0004              # tx side (best effort)
+        if sockpair_readable(sp_slot, sp_dir) != 0:
+            ev_sp = ev_sp | 0x0001
+        if sockpair_peer_alive(sp_slot, sp_dir) == 0:
+            ev_sp = ev_sp | 0x0011
+        return ev_sp
+    if fi == FD_EVENTFD_MARK:
+        es: int32 = cast[int32](task[0].fd_buf[fdu]) - 1
+        ev_e: uint32 = 0x0004               # an eventfd is always writable
+        if uefd_readable(es) != 0:
+            ev_e = ev_e | 0x0001
+        return ev_e
+    if fi == FD_TIMERFD_MARK:
+        ts: int32 = cast[int32](task[0].fd_buf[fdu]) - 1
+        if utfd_readable(ts) != 0:
+            return 0x0001
+        return 0
+    if fi == FD_SIGNALFD_MARK:
+        # Needs the caller's sig_pending word — the u_syscalls.ad shim
+        # answers this one. From vfs's view: not readable.
+        return 0
+    if fi == FD_EPOLL_MARK:
+        # An epoll fd is itself pollable (readable when any watched fd
+        # is ready) — the shim handles nested epoll; vfs reports 0.
+        return 0
+    # Regular file, stdio, cdev, dir — always ready for both.
+    return 0x0005                           # POLLIN | POLLOUT
+
+
 def vfs_fd_inode(fd: int32) -> uint64:
     # §4: a STABLE, per-FILE-unique inode number for fstat(2).
     #
@@ -1916,6 +2098,47 @@ def vfs_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
     return vfs_read(fd, buf, count)
 
 
+def vfs_write_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
+    # §5: non-blocking write backing O_NONBLOCK on a pipe / socket fd.
+    # Returns >0 bytes accepted, 0 if the fd is open but momentarily
+    # full ("would block" — the Layer-2 shim translates this to
+    # -EAGAIN), or a negative errno on a hard error (EPIPE, EBADF).
+    # Only the two fd kinds an event-loop daemon writes are special-
+    # cased; every other kind delegates to the ordinary vfs_write (a
+    # regular file / cdev write never blocks meaningfully here).
+    rc: int32 = _check_fd(fd)
+    if rc != 0:
+        return cast[int64](rc)
+    task: Ptr[TaskStruct] = current_task()
+    fdu: uint64 = cast[uint64](fd)
+    file_idx: uint32 = task[0].fd_idx[fdu]
+    if file_idx == FD_CLOSED_MARK:
+        return cast[int64](EBADF)
+    if file_idx == FD_PIPE_MARK_W:
+        # A single non-blocking pipe write: pipe_write enqueues what the
+        # ring will take (0 when full). EPIPE if every reader is gone.
+        slot: int32 = cast[int32](task[0].fd_buf[fdu])
+        if pipe_readers(slot) == 0:
+            return cast[int64](EPIPE)
+        return pipe_write(slot, buf, count)
+    if file_idx == FD_SOCKETPAIR_MARK:
+        sp_pkd:  uint64 = task[0].fd_buf[fdu]
+        sp_slot: int32 = sockpair_unpack_slot(sp_pkd)
+        sp_dir:  int32 = sockpair_unpack_dir(sp_pkd)
+        if sockpair_peer_alive(sp_slot, sp_dir) == 0:
+            return cast[int64](EPIPE)
+        return sockpair_write(sp_slot, sp_dir, buf, count)
+    if file_idx == FD_SOCKET_MARK:
+        # A connected TCP socket: tcp_send already does a single
+        # non-blocking enqueue into the tx ring (it does not yield),
+        # so a plain vfs_write on a socket is effectively non-blocking
+        # already. Delegate — vfs_write returns the byte count or the
+        # errno directly.
+        return vfs_write(fd, buf, count)
+    # Anything else: an ordinary write — never blocks meaningfully.
+    return vfs_write(fd, buf, count)
+
+
 def vfs_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
     rc: int32 = _check_fd(fd)
     if rc != 0:
@@ -2168,6 +2391,39 @@ def vfs_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         memcpy(buf, cast[Ptr[uint8]](cast[uint64](src) + pos), take)
         task[0].fd_pos[fdu] = pos + take
         return cast[int64](take)
+    if file_idx == FD_EVENTFD_MARK:
+        # §5: a blocking read(2) on an eventfd. The 8-byte counter is
+        # returned (and reset, or decremented in semaphore mode) once it
+        # is non-zero; until then we yield-block, the same cadence the
+        # pipe read end uses. count < 8 is -EINVAL per Linux. The
+        # non-blocking variant is handled in the u_syscalls.ad shim
+        # (which checks O_NONBLOCK and returns -EAGAIN instead).
+        if count < 8:
+            return cast[int64](EINVAL)
+        es: int32 = cast[int32](task[0].fd_buf[fdu]) - 1
+        while True:
+            ev: int64 = uefd_read(es)
+            if ev >= 0:
+                cast[Ptr[uint64]](buf)[0] = cast[uint64](ev)
+                return 8
+            if ev != -11:                      # not EAGAIN -> hard error
+                return ev
+            yield_to_others()
+    if file_idx == FD_TIMERFD_MARK:
+        # §5: a blocking read(2) on a timerfd. Returns the 8-byte
+        # expiration count once at least one timer tick has fired;
+        # yields until then. count < 8 is -EINVAL.
+        if count < 8:
+            return cast[int64](EINVAL)
+        ts: int32 = cast[int32](task[0].fd_buf[fdu]) - 1
+        while True:
+            tv: int64 = utfd_read(ts)
+            if tv >= 0:
+                cast[Ptr[uint64]](buf)[0] = cast[uint64](tv)
+                return 8
+            if tv != -11:
+                return tv
+            yield_to_others()
     if file_idx == FD_PIPE_MARK_R:
         # Blocking read: yield until pipe_read returns >0 OR every
         # writer has closed (EOF). We don't sleep on a wait queue
@@ -2509,6 +2765,21 @@ def vfs_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         if n > 0:
             task[0].fd_pos[fdu] = pos + cast[uint64](n)
         return n
+    if file_idx == FD_EVENTFD_MARK:
+        # §5: write(2) on an eventfd — add the 8-byte value to the
+        # counter. write < 8 bytes is -EINVAL. uefd_write rejects the
+        # all-ones value and a counter overflow with -EINVAL too.
+        if count < 8:
+            return cast[int64](EINVAL)
+        es: int32 = cast[int32](task[0].fd_buf[fdu]) - 1
+        addend: uint64 = cast[Ptr[uint64]](buf)[0]
+        return uefd_write(es, addend)
+    if file_idx == FD_TIMERFD_MARK:
+        return cast[int64](EINVAL)             # a timerfd is not writable
+    if file_idx == FD_SIGNALFD_MARK:
+        return cast[int64](EINVAL)             # a signalfd is not writable
+    if file_idx == FD_EPOLL_MARK:
+        return cast[int64](EINVAL)             # an epoll fd is not writable
     if file_idx == FD_PIPE_MARK_W:
         # Blocking write: drain as much as the ring will accept,
         # yielding when full until a reader makes room. EPIPE if
@@ -2717,6 +2988,25 @@ def vfs_close(fd: int32) -> int32:
                     else:
                         tcp_close(sk_tcp)
                 usock_free(sk_rec)
+    # §5: a Layer-2 async-I/O fd (epoll / eventfd / timerfd / signalfd)
+    # carries an object slot in fd_buf (encoded slot+1). Release the
+    # confined object in linux_abi/u_epoll.ad BEFORE close_fd_in_task
+    # wipes fd_buf — core.ad knows nothing of these markers (it must
+    # not; they are Layer-2-only), so the teardown happens here, the
+    # exact pattern the FD_SOCKET_MARK / FD_SOCKETPAIR_MARK arms use.
+    # NOTE: a dup'd Layer-2 fd shares the underlying object; releasing
+    # on first close and letting the dup keep a dangling slot id would
+    # be a use-after-free. At this scope the Linux daemons under test
+    # do not dup epoll/eventfd objects, so a plain release on close is
+    # correct; a refcount is the V2 hardening (flagged in the report).
+    if file_idx == FD_EPOLL_MARK:
+        uepoll_release(cast[int32](task[0].fd_buf[fdu]) - 1)
+    if file_idx == FD_EVENTFD_MARK:
+        uefd_release(cast[int32](task[0].fd_buf[fdu]) - 1)
+    if file_idx == FD_TIMERFD_MARK:
+        utfd_release(cast[int32](task[0].fd_buf[fdu]) - 1)
+    if file_idx == FD_SIGNALFD_MARK:
+        usfd_release(cast[int32](task[0].fd_buf[fdu]) - 1)
     # /proc/<pid>/<file> fds carry no per-fd backing — devproc_close
     # is a no-op success today (kept as a hook so future per-fd
     # snapshot support can land without re-plumbing the close path).
