@@ -72,6 +72,15 @@ if os.environ.get("ENABLE_TLS_GZIP_SMOKE") == "1":
 if os.environ.get("ENABLE_TCP_RING_SMOKE") == "1":
     FILES.append(("/etc/tcp-ring-test", b"1\n"))
 
+# /net 9P file-tree smoke (ARCH §10). scripts/test_net_devnet.sh sets
+# ENABLE_DEVNET_SMOKE=1 to plant /etc/devnet-test; init/main.ad gates
+# devnet_smoke_test() (the /net/tcp/clone open + ctl connect + data
+# transfer round-trip) on it. Gated for the same reason as the TCP
+# ring marker above: without a guestfwd echo target the `connect` ctl
+# command stalls tcp_connect, so only that one harness plants it.
+if os.environ.get("ENABLE_DEVNET_SMOKE") == "1":
+    FILES.append(("/etc/devnet-test", b"1\n"))
+
 # TCP FIN_WAIT_2 timeout smoke. Gated the same way as the TLS / TCP
 # ring markers above. The fixture (scripts/test_tcp_fin_wait2.sh)
 # stands up a Python server that ACKs our FIN but never sends its

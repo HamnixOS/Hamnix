@@ -331,52 +331,16 @@ sys_connect:
     .size sys_connect, .-sys_connect
 
 
-    /* --- sys_sock_bind(fd, addr, addrlen) -> int32 ------------------
-     * U-socket server side: native-ABI bind(2). Records the bound port
-     * on the socket fd's backing record via SYS_BIND_SOCK (49) ->
-     * _u_bind. NOTE the name: this is socket bind, NOT the Plan 9
-     * namespace sys_bind (syscall 257) defined below — the two share
-     * the C name `bind` in POSIX/Plan 9 but are wholly different
-     * syscalls, so the socket one carries the _sock suffix. `addr`
-     * points at a 16-byte struct sockaddr_in. Three args fit the
-     * SysV/syscall-ABI overlap directly. */
-    .globl sys_sock_bind
-    .type sys_sock_bind, @function
-sys_sock_bind:
-    movq    $49, %rax               /* SYS_BIND_SOCK */
-    syscall
-    ret
-    .size sys_sock_bind, .-sys_sock_bind
-
-
-    /* --- sys_listen(fd, backlog) -> int32 ---------------------------
-     * U-socket server side: native-ABI listen(2). Calls the in-kernel
-     * tcp_listen for the port recorded by sys_sock_bind via
-     * SYS_LISTEN_SOCK (50) -> _u_listen, transitioning the socket to
-     * the LISTENING state. Two args fit the ABI overlap directly. */
-    .globl sys_listen
-    .type sys_listen, @function
-sys_listen:
-    movq    $50, %rax               /* SYS_LISTEN_SOCK */
-    syscall
-    ret
-    .size sys_listen, .-sys_listen
-
-
-    /* --- sys_accept(fd, addr, addrlen) -> int32 ---------------------
-     * U-socket server side: native-ABI accept(2). Blocks (bounded
-     * poll) on a LISTENING socket via SYS_ACCEPT_SOCK (43) ->
-     * _u_accept until the in-kernel TCP stack completes a handshake,
-     * then returns a fresh socket fd for the accepted connection.
-     * `addr` (peer sockaddr out, may be NULL) / `addrlen` are filled
-     * when supplied. Three args fit the ABI overlap directly. */
-    .globl sys_accept
-    .type sys_accept, @function
-sys_accept:
-    movq    $43, %rax               /* SYS_ACCEPT_SOCK */
-    syscall
-    ret
-    .size sys_accept, .-sys_accept
+    /* --- RETIRED: sys_sock_bind / sys_listen / sys_accept -----------
+     * ARCH §10: the native server-side socket syscalls SYS_BIND_SOCK
+     * (49) / SYS_LISTEN_SOCK (50) / SYS_ACCEPT_SOCK (43) are RETIRED.
+     * bind()/listen()/accept() are BSD/Linux concepts — Hamnix Layer 1
+     * is Plan-9-shaped, so networking is the /net file tree, NOT a
+     * socket syscall family. Native servers now announce + accept by
+     * open/read/write on /net/tcp via user/net9.ad's net_announce /
+     * net_accept (which use sys_open / sys_read / sys_write). The
+     * wrapper stubs that issued syscalls 49/50/43 are gone with them;
+     * those numbers are unassigned in the native dispatch table. */
 
 
     /* --- sys_resolve(hostname, len) -> int64 ------------------------

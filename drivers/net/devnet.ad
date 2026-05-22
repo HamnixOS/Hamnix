@@ -1,0 +1,936 @@
+# drivers/net/devnet.ad
+#
+# The `/net` 9P file tree — Hamnix's Plan-9-shaped networking surface.
+#
+# ARCHITECTURE
+# ------------
+# Plan 9 (and therefore Hamnix Layer 1) does NOT have socket()/connect()/
+# bind()/listen()/accept() — those are BSD/Linux concepts. Networking is
+# a FILE TREE. This module is the kernel-side device that backs it:
+#
+#   /net/tcp/clone          open it -> a new connection is allocated;
+#                            read the fd to get its number N (ASCII).
+#   /net/tcp/N/ctl          write text commands:
+#                              connect <a.b.c.d>!<port>
+#                              announce <port>          (passive open)
+#                              accept                   (block for a peer)
+#                              hangup                   (tear the conn down)
+#   /net/tcp/N/data         read/write the connection's byte stream.
+#   /net/tcp/N/status       read: one-line state summary.
+#   /net/tcp/N/local        read: local  a.b.c.d!port
+#   /net/tcp/N/remote       read: remote a.b.c.d!port
+#   /net/udp/...            datagram analogue (clone/ctl/data/...).
+#
+# This is exactly Plan 9's `#I` / `/net`. Native code does networking by
+# open/read/write on these files — no syscall family. The Linux ABI's
+# socket(2) becomes a Layer-2 consumer of this same surface (it formats
+# ctl strings and calls the devnet_* functions here).
+#
+# This file owns a fixed connection table. Each /net connection wraps a
+# drivers/net/tcp.ad TCB slot (for /net/tcp) or a drivers/net/udp.ad
+# socket slot (for /net/udp). fs/vfs.ad installs FD_NET_MARK fds whose
+# fd_buf encodes (proto, conn, file-kind); vfs read/write/close dispatch
+# back here.
+#
+# ADDER QUIRKS honoured: top-level Array storage only (no nested-frame
+# Arrays — U9 quirk); parallel arrays instead of an Array-of-structs; no
+# adjacent string-literal concatenation; byte-by-byte string work.
+
+from kernel.printk.printk import printk0, printk1, printk2
+from drivers.net.tcp import (
+    tcp_connect, tcp_send, tcp_recv, tcp_recv_nb, tcp_recv_pending,
+    tcp_close, tcp_listen, tcp_accept, tcp_listen_close,
+    tcp_slot_at_eof,
+    TCP_ERR_NOSLOT, TCP_ERR_ARP, TCP_ERR_REFUSED, TCP_ERR_TIMEOUT,
+)
+from drivers.net.udp import (
+    udp_socket_open, udp_socket_close, udp_socket_bind,
+    udp_socket_connect, udp_socket_sendto, udp_socket_recvfrom,
+    udp_socket_recv_pending, udp_socket_local_port,
+)
+
+
+# --- /net fd marker --------------------------------------------------
+#
+# fs/vfs.ad tags every /net fd with this in the per-task fd_idx slot.
+# It lives here (not kernel/sched/core.ad) because core.ad is fenced;
+# Adder's flat-merge symbol model puts it in the same image .bss as the
+# other FD_*_MARK constants, so it is indistinguishable to the codegen.
+FD_NET_MARK: uint32 = 0xFFFFFFD8
+
+
+# --- protocol + file-kind tags --------------------------------------
+
+NET_PROTO_TCP: int32 = 0
+NET_PROTO_UDP: int32 = 1
+
+# A /net fd points at one of these "files" within a connection dir, or
+# at the top-level clone file. The file-kind is packed into fd_buf so
+# read/write know what the fd means.
+NET_FILE_CLONE:  int32 = 0      # /net/<proto>/clone
+NET_FILE_CTL:    int32 = 1      # /net/<proto>/N/ctl
+NET_FILE_DATA:   int32 = 2      # /net/<proto>/N/data
+NET_FILE_STATUS: int32 = 3      # /net/<proto>/N/status
+NET_FILE_LOCAL:  int32 = 4      # /net/<proto>/N/local
+NET_FILE_REMOTE: int32 = 5      # /net/<proto>/N/remote
+
+
+# --- connection table -----------------------------------------------
+#
+# A single fixed pool covers both /net/tcp and /net/udp connections.
+# The pool is generous over the stack's real capacity (tcp.ad has 8
+# TCBs, udp.ad has a small socket table) — a clone past the stack's
+# capacity still gets a /net conn slot; the ctl `connect`/`announce`
+# then fails cleanly with an errstr instead of -EMFILE-on-clone.
+NET_CONN_MAX: uint64 = 32
+
+# Per-conn lifecycle.
+NETC_FREE:      uint32 = 0      # slot not allocated
+NETC_OPEN:      uint32 = 1      # cloned, no connect/announce yet
+NETC_CONNECTED: uint32 = 2      # active conn established (data flows)
+NETC_LISTEN:    uint32 = 3      # announce done — passive, awaiting accept
+NETC_CLOSED:    uint32 = 4      # hung up / peer FIN — no more I/O
+
+# Parallel-array backing store (top-level BSS — Adder U9 quirk).
+netc_inuse:   Array[32, uint8]    # 1 if slot live
+netc_proto:   Array[32, int32]    # NET_PROTO_TCP / NET_PROTO_UDP
+netc_state:   Array[32, uint32]   # NETC_*
+netc_slot:    Array[32, int32]    # tcp.ad TCB slot / udp.ad socket slot, -1
+netc_lport:   Array[32, uint32]   # local  port (host order)
+netc_rip:     Array[32, uint32]   # remote IPv4 (host order)
+netc_rport:   Array[32, uint32]   # remote port (host order)
+# Refcount: a /net conn can be referenced by several fds at once (its
+# ctl + data fds, plus dups). The conn is torn down only when the last
+# fd referencing it closes. clone gives ref 1; opening ctl/data/... of
+# an existing conn bumps it.
+netc_refs:    Array[32, int32]
+# accept bookkeeping: when a /net ctl `accept` completes on a listening
+# conn, the accepted peer gets its OWN fresh conn (the listener stays
+# listening — Plan 9 keeps the announce live for repeated accepts).
+# netc_accepted[listener] holds the accepted conn number; a read of the
+# listener's ctl file returns it (the clone-style discovery dance).
+netc_accepted: Array[32, int32]
+
+netc_inited: int32 = 0
+
+
+def devnet_init():
+    # Reset the connection table. Called once during kernel bring-up
+    # (init/main.ad) so a slot left dirty by a previous boot image
+    # can't be mistaken for a live conn. Idempotent.
+    i: uint64 = 0
+    while i < NET_CONN_MAX:
+        netc_inuse[i] = 0
+        netc_proto[i] = NET_PROTO_TCP
+        netc_state[i] = NETC_FREE
+        netc_slot[i]  = -1
+        netc_lport[i] = 0
+        netc_rip[i]   = 0
+        netc_rport[i] = 0
+        netc_refs[i]  = 0
+        netc_accepted[i] = -1
+        i = i + 1
+    netc_inited = 1
+    printk0("[devnet] /net connection table initialised\n")
+
+
+def _netc_valid(conn: int32) -> int32:
+    # 1 iff `conn` names a live connection slot.
+    if conn < 0:
+        return 0
+    cu: uint64 = cast[uint64](conn)
+    if cu >= NET_CONN_MAX:
+        return 0
+    if netc_inuse[cu] == 0:
+        return 0
+    return 1
+
+
+# --- clone: allocate a new /net connection ---------------------------
+
+def devnet_clone(proto: int32) -> int32:
+    # Allocate the lowest free connection slot for `proto`. Returns the
+    # connection number (0..NET_CONN_MAX-1) or -1 if the pool is full.
+    # The conn starts in NETC_OPEN with no stack slot — the ctl
+    # `connect` / `announce` command wires the stack slot in. Refcount
+    # starts at 1 (the clone fd holds it).
+    if netc_inited == 0:
+        devnet_init()
+    i: uint64 = 0
+    while i < NET_CONN_MAX:
+        if netc_inuse[i] == 0:
+            netc_inuse[i] = 1
+            netc_proto[i] = proto
+            netc_state[i] = NETC_OPEN
+            netc_slot[i]  = -1
+            netc_lport[i] = 0
+            netc_rip[i]   = 0
+            netc_rport[i] = 0
+            netc_refs[i]  = 1
+            netc_accepted[i] = -1
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def devnet_conn_ref(conn: int32):
+    # Bump a conn's refcount — called when a second fd (ctl/data/...)
+    # for an already-cloned conn is opened.
+    if _netc_valid(conn) == 0:
+        return
+    netc_refs[cast[uint64](conn)] = netc_refs[cast[uint64](conn)] + 1
+
+
+def _devnet_teardown(conn: int32):
+    # Tear the underlying stack object down and free the slot. Called
+    # by devnet_conn_unref on the last reference, and by the ctl
+    # `hangup` command's caller path.
+    cu: uint64 = cast[uint64](conn)
+    slot: int32 = netc_slot[cu]
+    if slot >= 0:
+        if netc_proto[cu] == NET_PROTO_TCP:
+            if netc_state[cu] == NETC_LISTEN:
+                tcp_listen_close(slot)
+            else:
+                tcp_close(slot)
+        else:
+            udp_socket_close(slot)
+    netc_inuse[cu] = 0
+    netc_proto[cu] = NET_PROTO_TCP
+    netc_state[cu] = NETC_FREE
+    netc_slot[cu]  = -1
+    netc_lport[cu] = 0
+    netc_rip[cu]   = 0
+    netc_rport[cu] = 0
+    netc_refs[cu]  = 0
+    netc_accepted[cu] = -1
+
+
+def devnet_conn_unref(conn: int32):
+    # Drop one reference. On the last reference the underlying TCP/UDP
+    # object is torn down (FIN handshake for a connected TCP conn) and
+    # the conn slot is returned to the pool.
+    if _netc_valid(conn) == 0:
+        return
+    cu: uint64 = cast[uint64](conn)
+    netc_refs[cu] = netc_refs[cu] - 1
+    if netc_refs[cu] <= 0:
+        _devnet_teardown(conn)
+
+
+# --- ctl command parsing --------------------------------------------
+#
+# A ctl write carries ONE text command. Recognised:
+#   connect <a.b.c.d>!<port>     active open
+#   announce <port>              passive open (listen)
+#   accept                       block for an inbound peer (TCP)
+#   hangup                       tear the connection down
+#
+# Plan 9's ctl files take text — discovery is "read the man page", not
+# "ioctl with a magic number". The parser is deliberately small and
+# hand-rolled (no string library at Layer 0/1).
+
+def _is_digit(c: uint8) -> int32:
+    if c >= 48 and c <= 57:
+        return 1
+    return 0
+
+
+def _skip_spaces(buf: Ptr[uint8], pos: uint64, len: uint64) -> uint64:
+    p: uint64 = pos
+    while p < len:
+        if buf[p] != 32 and buf[p] != 9:
+            return p
+        p = p + 1
+    return p
+
+
+def _word_eq(buf: Ptr[uint8], pos: uint64, len: uint64,
+             word: Ptr[uint8]) -> int32:
+    # 1 iff buf[pos..] begins with `word` (NUL-terminated) AND the next
+    # byte is a separator (space/tab/newline/NUL/end).
+    i: uint64 = 0
+    while word[i] != 0:
+        if pos + i >= len:
+            return 0
+        if buf[pos + i] != word[i]:
+            return 0
+        i = i + 1
+    if pos + i >= len:
+        return 1
+    nb: uint8 = buf[pos + i]
+    if nb == 32 or nb == 9 or nb == 10 or nb == 13 or nb == 0:
+        return 1
+    return 0
+
+
+def _parse_uint(buf: Ptr[uint8], pos: Ptr[uint64], len: uint64) -> int64:
+    # Parse a decimal integer at *pos, advancing *pos past it. Returns
+    # the value, or -1 if no digit was present.
+    p: uint64 = pos[0]
+    if p >= len or _is_digit(buf[p]) == 0:
+        return -1
+    v: uint64 = 0
+    while p < len:
+        if _is_digit(buf[p]) == 0:
+            break
+        v = v * 10 + cast[uint64](buf[p] - 48)
+        p = p + 1
+    pos[0] = p
+    return cast[int64](v)
+
+
+def _parse_ipv4(buf: Ptr[uint8], pos: Ptr[uint64], len: uint64,
+                out_ip: Ptr[uint32]) -> int32:
+    # Parse "a.b.c.d" at *pos, advancing *pos. Stores the IPv4 in host
+    # order into *out_ip. Returns 0 on success, -1 on a malformed quad.
+    octet: int32 = 0
+    ip: uint32 = 0
+    while octet < 4:
+        v: int64 = _parse_uint(buf, pos, len)
+        if v < 0 or v > 255:
+            return -1
+        ip = (ip << 8) | cast[uint32](v)
+        if octet < 3:
+            if pos[0] >= len or buf[pos[0]] != 46:    # '.'
+                return -1
+            pos[0] = pos[0] + 1
+        octet = octet + 1
+    out_ip[0] = ip
+    return 0
+
+
+# devnet_ctl return codes.
+NET_CTL_OK:        int32 = 0
+NET_CTL_EBADCONN:  int32 = -1     # conn id invalid
+NET_CTL_EBADCMD:   int32 = -2     # unrecognised / malformed command
+NET_CTL_ESTATE:    int32 = -3     # command not valid in this state
+NET_CTL_ECONNECT:  int32 = -4     # connect: TCP active open failed
+NET_CTL_EARP:      int32 = -5     # connect: network unreachable
+NET_CTL_ETIMEOUT:  int32 = -6     # connect/accept: timed out
+NET_CTL_EREFUSED:  int32 = -7     # connect: peer RST
+NET_CTL_ENOSLOT:   int32 = -8     # no stack slot free
+NET_CTL_EADDRINUSE: int32 = -9    # announce: port already taken
+
+# A connect / accept blocks up to this many jiffies (~5 s @ HZ=100).
+# Mirrors the budget the retired socket syscalls used.
+NET_BLOCK_JIFFIES: uint64 = 500
+
+
+def devnet_ctl(conn: int32, buf: Ptr[uint8], len: uint64) -> int32:
+    # Execute ONE ctl command. Returns NET_CTL_OK or one of the
+    # negative codes above. The caller (vfs.ad / the Linux shim)
+    # translates these into errstr / errno text.
+    if _netc_valid(conn) == 0:
+        return NET_CTL_EBADCONN
+    cu: uint64 = cast[uint64](conn)
+    pos: uint64 = _skip_spaces(buf, 0, len)
+
+    # --- connect <a.b.c.d>!<port> ------------------------------------
+    if _word_eq(buf, pos, len, "connect") != 0:
+        if netc_state[cu] != NETC_OPEN:
+            return NET_CTL_ESTATE
+        pos = pos + 7
+        pos = _skip_spaces(buf, pos, len)
+        ip: uint32 = 0
+        ipp: uint64 = pos
+        if _parse_ipv4(buf, &ipp, len, &ip) != 0:
+            return NET_CTL_EBADCMD
+        pos = ipp
+        # The Plan 9 separator between host and service is '!'.
+        if pos >= len or buf[pos] != 33:               # '!'
+            return NET_CTL_EBADCMD
+        pos = pos + 1
+        pp: uint64 = pos
+        portv: int64 = _parse_uint(buf, &pp, len)
+        if portv < 0 or portv > 65535:
+            return NET_CTL_EBADCMD
+        port: uint16 = cast[uint16](portv)
+        b0: uint8 = cast[uint8]((ip >> 24) & 0xFF)
+        b1: uint8 = cast[uint8]((ip >> 16) & 0xFF)
+        b2: uint8 = cast[uint8]((ip >> 8) & 0xFF)
+        b3: uint8 = cast[uint8](ip & 0xFF)
+        if netc_proto[cu] == NET_PROTO_TCP:
+            ts: int32 = tcp_connect(b0, b1, b2, b3, port,
+                                    NET_BLOCK_JIFFIES)
+            if ts < 0:
+                if ts == TCP_ERR_ARP:
+                    return NET_CTL_EARP
+                if ts == TCP_ERR_TIMEOUT:
+                    return NET_CTL_ETIMEOUT
+                if ts == TCP_ERR_REFUSED:
+                    return NET_CTL_EREFUSED
+                return NET_CTL_ECONNECT
+            netc_slot[cu]  = ts
+            netc_state[cu] = NETC_CONNECTED
+            netc_rip[cu]   = ip
+            netc_rport[cu] = cast[uint32](port)
+            return NET_CTL_OK
+        # UDP: connect just records a fixed peer (no handshake).
+        us: int32 = netc_slot[cu]
+        if us < 0:
+            us = udp_socket_open()
+            if us < 0:
+                return NET_CTL_ENOSLOT
+            netc_slot[cu] = us
+        if udp_socket_connect(us, ip, port) != 0:
+            return NET_CTL_ECONNECT
+        netc_state[cu] = NETC_CONNECTED
+        netc_rip[cu]   = ip
+        netc_rport[cu] = cast[uint32](port)
+        return NET_CTL_OK
+
+    # --- announce <port> --- passive open / listen -------------------
+    if _word_eq(buf, pos, len, "announce") != 0:
+        if netc_state[cu] != NETC_OPEN:
+            return NET_CTL_ESTATE
+        pos = pos + 8
+        pos = _skip_spaces(buf, pos, len)
+        pp: uint64 = pos
+        portv: int64 = _parse_uint(buf, &pp, len)
+        if portv < 0 or portv > 65535:
+            return NET_CTL_EBADCMD
+        port: uint16 = cast[uint16](portv)
+        if netc_proto[cu] == NET_PROTO_TCP:
+            ls: int32 = tcp_listen(port)
+            if ls < 0:
+                return NET_CTL_EADDRINUSE
+            netc_slot[cu]  = ls
+            netc_state[cu] = NETC_LISTEN
+            netc_lport[cu] = cast[uint32](port)
+            return NET_CTL_OK
+        # UDP: announce binds the socket to a local port.
+        us: int32 = netc_slot[cu]
+        if us < 0:
+            us = udp_socket_open()
+            if us < 0:
+                return NET_CTL_ENOSLOT
+            netc_slot[cu] = us
+        ubrc: int32 = udp_socket_bind(us, port)
+        if ubrc == -2:
+            return NET_CTL_EADDRINUSE
+        if ubrc != 0:
+            return NET_CTL_EBADCMD
+        netc_state[cu] = NETC_CONNECTED          # UDP usable after bind
+        netc_lport[cu] = cast[uint32](port)
+        return NET_CTL_OK
+
+    # --- accept --- block for an inbound peer (TCP only) -------------
+    # accept blocks on the listening conn until the in-kernel TCP stack
+    # completes a 3-way handshake, then allocates a FRESH conn for the
+    # accepted peer (the listener stays announced — Plan 9 keeps the
+    # announce live for repeated accepts). The accepted conn number is
+    # stashed in netc_accepted[listener]; a read of the listener's ctl
+    # file returns it (the clone-style discovery dance). The accepted
+    # conn starts with refcount 0 — whoever opens /net/tcp/<M>/* picks
+    # up the references; until then devnet_accept_take hands ownership
+    # over to the Linux-ABI accept(2) shim.
+    if _word_eq(buf, pos, len, "accept") != 0:
+        if netc_state[cu] != NETC_LISTEN:
+            return NET_CTL_ESTATE
+        if netc_proto[cu] != NET_PROTO_TCP:
+            return NET_CTL_EBADCMD
+        ls: int32 = netc_slot[cu]
+        cs: int32 = tcp_accept(ls, NET_BLOCK_JIFFIES)
+        if cs < 0:
+            return NET_CTL_ETIMEOUT
+        acc: int32 = devnet_clone(NET_PROTO_TCP)
+        if acc < 0:
+            tcp_close(cs)
+            return NET_CTL_ENOSLOT
+        au: uint64 = cast[uint64](acc)
+        netc_slot[au]  = cs
+        netc_state[au] = NETC_CONNECTED
+        # The accepted conn is "pending in the accept queue" — unowned
+        # until something opens /net/tcp/<acc>/* (or the Linux accept(2)
+        # shim takes it). Drop the refcount devnet_clone set to 1 down
+        # to 0 so the first fd into the conn becomes its sole owner and
+        # the usual last-close teardown applies. (A pending conn whose
+        # peer never opens it leaks one slot until reboot — acceptable;
+        # an accept queue is short-lived.)
+        netc_refs[au] = 0
+        netc_accepted[cu] = acc
+        return NET_CTL_OK
+
+    # --- hangup --- tear the connection's transport down -------------
+    if _word_eq(buf, pos, len, "hangup") != 0:
+        slot: int32 = netc_slot[cu]
+        if slot >= 0:
+            if netc_proto[cu] == NET_PROTO_TCP:
+                if netc_state[cu] == NETC_LISTEN:
+                    tcp_listen_close(slot)
+                else:
+                    tcp_close(slot)
+            else:
+                udp_socket_close(slot)
+        netc_slot[cu]  = -1
+        netc_state[cu] = NETC_CLOSED
+        return NET_CTL_OK
+
+    return NET_CTL_EBADCMD
+
+
+# --- data read/write -------------------------------------------------
+
+def devnet_data_write(conn: int32, buf: Ptr[uint8],
+                      count: uint64) -> int64:
+    # Write `count` bytes onto the connection's byte stream. Returns
+    # bytes accepted or -1.
+    if _netc_valid(conn) == 0:
+        return -1
+    cu: uint64 = cast[uint64](conn)
+    slot: int32 = netc_slot[cu]
+    if slot < 0:
+        return -1
+    if netc_state[cu] == NETC_CLOSED:
+        return -1
+    if netc_proto[cu] == NET_PROTO_TCP:
+        # tcp_send caps one segment at the MSS — loop until the whole
+        # buffer drains so a write of the connection's `data` file
+        # behaves like a stream write, not a single-segment send.
+        sent: uint64 = 0
+        while sent < count:
+            chunk_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+                cast[uint64](buf) + sent)
+            rc: int64 = tcp_send(slot, chunk_ptr, count - sent)
+            if rc <= 0:
+                netc_state[cu] = NETC_CLOSED
+                if sent > 0:
+                    return cast[int64](sent)
+                return -1
+            sent = sent + cast[uint64](rc)
+        return cast[int64](sent)
+    # UDP: send one datagram to the connected peer.
+    if netc_rip[cu] == 0:
+        return -1
+    return udp_socket_sendto(slot, netc_rip[cu],
+                             cast[uint16](netc_rport[cu] & 0xFFFF),
+                             buf, count)
+
+
+def devnet_data_read(conn: int32, buf: Ptr[uint8],
+                     count: uint64) -> int64:
+    # Blocking read from the connection's byte stream. Returns bytes
+    # read, 0 on EOF (peer FIN), or -1 on error.
+    if _netc_valid(conn) == 0:
+        return -1
+    cu: uint64 = cast[uint64](conn)
+    slot: int32 = netc_slot[cu]
+    if slot < 0:
+        return 0
+    if netc_proto[cu] == NET_PROTO_TCP:
+        n: int64 = tcp_recv(slot, buf, count, NET_BLOCK_JIFFIES)
+        if n < 0:
+            netc_state[cu] = NETC_CLOSED
+        return n
+    # UDP: pull one datagram.
+    ud: int64 = udp_socket_recvfrom(slot, buf, count, NET_BLOCK_JIFFIES,
+                                    cast[Ptr[uint32]](0),
+                                    cast[Ptr[uint16]](0))
+    if ud < 0:
+        return 0
+    return ud
+
+
+def devnet_data_read_nb(conn: int32, buf: Ptr[uint8],
+                        count: uint64) -> int64:
+    # Non-blocking read: >0 bytes, 0 = would-block, -1 = EOF/error.
+    if _netc_valid(conn) == 0:
+        return -1
+    cu: uint64 = cast[uint64](conn)
+    slot: int32 = netc_slot[cu]
+    if slot < 0:
+        return -1
+    if netc_proto[cu] == NET_PROTO_TCP:
+        n: int64 = tcp_recv_nb(slot, buf, count)
+        if n < 0:
+            netc_state[cu] = NETC_CLOSED
+        return n
+    if udp_socket_recv_pending(slot) == 0:
+        return 0
+    ud: int64 = udp_socket_recvfrom(slot, buf, count, 1,
+                                    cast[Ptr[uint32]](0),
+                                    cast[Ptr[uint16]](0))
+    if ud < 0:
+        return 0
+    return ud
+
+
+def devnet_data_pending(conn: int32) -> int32:
+    # 1 if a read would not block (data buffered, or at EOF), else 0.
+    # Backs poll(2) on a /net data fd.
+    if _netc_valid(conn) == 0:
+        return 1
+    cu: uint64 = cast[uint64](conn)
+    slot: int32 = netc_slot[cu]
+    if slot < 0:
+        return 1
+    if netc_proto[cu] == NET_PROTO_TCP:
+        if tcp_recv_pending(slot) != 0:
+            return 1
+        if tcp_slot_at_eof(slot) != 0:
+            return 1
+        return 0
+    if udp_socket_recv_pending(slot) != 0:
+        return 1
+    return 0
+
+
+def devnet_data_at_eof(conn: int32) -> int32:
+    # 1 iff a TCP conn has truly reached end-of-stream.
+    if _netc_valid(conn) == 0:
+        return 1
+    cu: uint64 = cast[uint64](conn)
+    if netc_state[cu] == NETC_CLOSED:
+        return 1
+    slot: int32 = netc_slot[cu]
+    if slot < 0:
+        return 1
+    if netc_proto[cu] == NET_PROTO_TCP:
+        return tcp_slot_at_eof(slot)
+    return 0
+
+
+# --- status / local / remote info files -----------------------------
+
+def _put_str(out: Ptr[uint8], pos: uint64, s: Ptr[uint8]) -> uint64:
+    i: uint64 = 0
+    while s[i] != 0:
+        out[pos + i] = s[i]
+        i = i + 1
+    return pos + i
+
+
+def _put_dec(out: Ptr[uint8], pos: uint64, v: uint64) -> uint64:
+    if v == 0:
+        out[pos] = 48
+        return pos + 1
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    while v != 0:
+        digits[n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    p: uint64 = pos
+    while n > 0:
+        n = n - 1
+        out[p] = digits[n]
+        p = p + 1
+    return p
+
+
+def _put_ipv4(out: Ptr[uint8], pos: uint64, ip: uint32) -> uint64:
+    p: uint64 = pos
+    p = _put_dec(out, p, cast[uint64]((ip >> 24) & 0xFF))
+    out[p] = 46                                        # '.'
+    p = p + 1
+    p = _put_dec(out, p, cast[uint64]((ip >> 16) & 0xFF))
+    out[p] = 46
+    p = p + 1
+    p = _put_dec(out, p, cast[uint64]((ip >> 8) & 0xFF))
+    out[p] = 46
+    p = p + 1
+    p = _put_dec(out, p, cast[uint64](ip & 0xFF))
+    return p
+
+
+def devnet_status_render(conn: int32, out: Ptr[uint8],
+                         max: uint64) -> int64:
+    # Render a one-line status: "<proto> <state>\n". `out` must be at
+    # least 32 bytes. Returns bytes written.
+    if _netc_valid(conn) == 0:
+        return 0
+    cu: uint64 = cast[uint64](conn)
+    p: uint64 = 0
+    if netc_proto[cu] == NET_PROTO_TCP:
+        p = _put_str(out, p, "tcp ")
+    else:
+        p = _put_str(out, p, "udp ")
+    st: uint32 = netc_state[cu]
+    if st == NETC_OPEN:
+        p = _put_str(out, p, "Open")
+    elif st == NETC_CONNECTED:
+        p = _put_str(out, p, "Established")
+    elif st == NETC_LISTEN:
+        p = _put_str(out, p, "Announced")
+    else:
+        p = _put_str(out, p, "Closed")
+    out[p] = 10                                        # '\n'
+    p = p + 1
+    if p > max:
+        p = max
+    return cast[int64](p)
+
+
+def devnet_local_render(conn: int32, out: Ptr[uint8],
+                        max: uint64) -> int64:
+    # Render "0.0.0.0!<lport>\n" — the local end. We do not track the
+    # local IP per conn (the stack has a single host IP); 0.0.0.0 is
+    # the honest placeholder.
+    if _netc_valid(conn) == 0:
+        return 0
+    cu: uint64 = cast[uint64](conn)
+    p: uint64 = 0
+    p = _put_ipv4(out, p, 0)
+    out[p] = 33                                        # '!'
+    p = p + 1
+    p = _put_dec(out, p, cast[uint64](netc_lport[cu]))
+    out[p] = 10
+    p = p + 1
+    if p > max:
+        p = max
+    return cast[int64](p)
+
+
+def devnet_remote_render(conn: int32, out: Ptr[uint8],
+                         max: uint64) -> int64:
+    # Render "<a.b.c.d>!<rport>\n" — the remote end.
+    if _netc_valid(conn) == 0:
+        return 0
+    cu: uint64 = cast[uint64](conn)
+    p: uint64 = 0
+    p = _put_ipv4(out, p, netc_rip[cu])
+    out[p] = 33                                        # '!'
+    p = p + 1
+    p = _put_dec(out, p, cast[uint64](netc_rport[cu]))
+    out[p] = 10
+    p = p + 1
+    if p > max:
+        p = max
+    return cast[int64](p)
+
+
+# --- accessors for the Linux-ABI consumer ---------------------------
+
+def devnet_conn_state(conn: int32) -> uint32:
+    if _netc_valid(conn) == 0:
+        return NETC_FREE
+    return netc_state[cast[uint64](conn)]
+
+
+def devnet_conn_proto(conn: int32) -> int32:
+    if _netc_valid(conn) == 0:
+        return -1
+    return netc_proto[cast[uint64](conn)]
+
+
+def devnet_accept_pending(conn: int32) -> int32:
+    # The conn number of a peer accepted on `conn` (a listening conn),
+    # or -1 if no accept has completed since the last take. Used by a
+    # read of the listener's ctl file and by the Linux accept(2) shim.
+    if _netc_valid(conn) == 0:
+        return -1
+    return netc_accepted[cast[uint64](conn)]
+
+
+def devnet_accept_take(conn: int32) -> int32:
+    # Take ownership of a pending accepted conn: returns its number and
+    # clears the listener's netc_accepted slot so the next accept can
+    # land. -1 if nothing is pending.
+    if _netc_valid(conn) == 0:
+        return -1
+    cu: uint64 = cast[uint64](conn)
+    acc: int32 = netc_accepted[cu]
+    netc_accepted[cu] = -1
+    return acc
+
+
+def devnet_conn_stack_slot(conn: int32) -> int32:
+    # The underlying drivers/net/tcp.ad TCB slot (or udp.ad socket
+    # slot) backing this /net connection, or -1 if it has none yet.
+    # The Linux-ABI socket() shim (Layer 2) uses this: it sets a
+    # connection up by driving the /net ctl protocol, then reads the
+    # stack slot back so the TLS record layer — which keys on the raw
+    # TCP slot — can ride the same connection. This is the controlled
+    # seam between Layer 2 and the /net device: Layer 2 drives /net to
+    # allocate + connect, then consults this accessor.
+    if _netc_valid(conn) == 0:
+        return -1
+    return netc_slot[cast[uint64](conn)]
+
+
+def devnet_conn_remote_ip(conn: int32) -> uint32:
+    # The connected peer's IPv4 (host order), or 0 if not connected.
+    if _netc_valid(conn) == 0:
+        return 0
+    return netc_rip[cast[uint64](conn)]
+
+
+def devnet_conn_remote_port(conn: int32) -> uint32:
+    # The connected peer's port (host order), or 0 if not connected.
+    if _netc_valid(conn) == 0:
+        return 0
+    return netc_rport[cast[uint64](conn)]
+
+
+def devnet_conn_set_accepted(conn: int32, tcp_slot: int32):
+    # After a /net ctl `accept` completed on a listening conn this
+    # records the accepted TCP slot + flips the conn to CONNECTED.
+    # devnet_ctl already does this internally; the accessor is kept
+    # so the Linux-ABI accept(2) shim — which clones a SEPARATE conn
+    # for the accepted peer — can wire the accepted slot in.
+    if _netc_valid(conn) == 0:
+        return
+    cu: uint64 = cast[uint64](conn)
+    netc_slot[cu]  = tcp_slot
+    netc_state[cu] = NETC_CONNECTED
+
+
+def devnet_conn_count() -> uint64:
+    # Live connection count — used by tests / introspection.
+    if netc_inited == 0:
+        return 0
+    n: uint64 = 0
+    i: uint64 = 0
+    while i < NET_CONN_MAX:
+        if netc_inuse[i] != 0:
+            n = n + 1
+        i = i + 1
+    return n
+
+
+# --- /net path matching + parsing ------------------------------------
+#
+# fs/vfs.ad calls devnet_path_classify to decide whether an open()
+# target is a /net file. The path grammar:
+#
+#   /net                       directory
+#   /net/tcp        /net/udp   directory
+#   /net/tcp/clone  /net/udp/clone
+#   /net/tcp/<N>               directory
+#   /net/tcp/<N>/{ctl,data,status,local,remote}
+#
+# devnet_path_classify returns one of the NETPATH_* codes; on a
+# per-file hit it also fills *out_proto / *out_conn / *out_file.
+
+NETPATH_MISS:  int32 = 0      # not a /net path
+NETPATH_DIR:   int32 = 1      # a /net directory (no per-file fd)
+NETPATH_FILE:  int32 = 2      # a concrete /net file
+
+
+def _streq(a: Ptr[char], b: Ptr[char]) -> int32:
+    i: uint64 = 0
+    while True:
+        ca: char = a[i]
+        cb: char = b[i]
+        if ca != cb:
+            return 0
+        if ca == 0:
+            return 1
+        i = i + 1
+
+
+def _seg_eq(path: Ptr[uint8], pos: uint64, word: Ptr[uint8],
+            wlen: uint64) -> int32:
+    # 1 iff path[pos..pos+wlen) == word AND path[pos+wlen] is '/' or NUL.
+    i: uint64 = 0
+    while i < wlen:
+        if path[pos + i] != word[i]:
+            return 0
+        i = i + 1
+    nb: uint8 = path[pos + wlen]
+    if nb == 47 or nb == 0:
+        return 1
+    return 0
+
+
+def devnet_path_classify(path: Ptr[char], out_proto: Ptr[int32],
+                         out_conn: Ptr[int32],
+                         out_file: Ptr[int32]) -> int32:
+    # Classify `path`. On NETPATH_FILE, *out_proto / *out_conn /
+    # *out_file are set; *out_conn is -1 for a clone file (no conn yet).
+    p: Ptr[uint8] = cast[Ptr[uint8]](path)
+    # Must start with "/net".
+    if p[0] != 47 or p[1] != 110 or p[2] != 101 or p[3] != 116:
+        return NETPATH_MISS
+    if p[4] == 0:
+        return NETPATH_DIR                              # exactly "/net"
+    if p[4] != 47:                                      # '/'
+        return NETPATH_MISS
+    pos: uint64 = 5
+    proto: int32 = -1
+    if _seg_eq(p, pos, "tcp", 3) != 0:
+        proto = NET_PROTO_TCP
+        pos = pos + 3
+    elif _seg_eq(p, pos, "udp", 3) != 0:
+        proto = NET_PROTO_UDP
+        pos = pos + 3
+    else:
+        return NETPATH_MISS
+    if p[pos] == 0:
+        return NETPATH_DIR                              # "/net/tcp"
+    pos = pos + 1                                       # skip '/'
+    out_proto[0] = proto
+    # clone file?
+    if _streq(cast[Ptr[char]](cast[uint64](p) + pos), "clone") != 0:
+        out_conn[0] = -1
+        out_file[0] = NET_FILE_CLONE
+        return NETPATH_FILE
+    # Otherwise the next segment is a decimal connection number.
+    if _is_digit(p[pos]) == 0:
+        return NETPATH_MISS
+    conn: uint64 = 0
+    while _is_digit(p[pos]) != 0:
+        conn = conn * 10 + cast[uint64](p[pos] - 48)
+        pos = pos + 1
+    out_conn[0] = cast[int32](conn)
+    if p[pos] == 0:
+        return NETPATH_DIR                              # "/net/tcp/<N>"
+    if p[pos] != 47:                                    # '/'
+        return NETPATH_MISS
+    pos = pos + 1
+    leaf: Ptr[char] = cast[Ptr[char]](cast[uint64](p) + pos)
+    if _streq(leaf, "ctl") != 0:
+        out_file[0] = NET_FILE_CTL
+        return NETPATH_FILE
+    if _streq(leaf, "data") != 0:
+        out_file[0] = NET_FILE_DATA
+        return NETPATH_FILE
+    if _streq(leaf, "status") != 0:
+        out_file[0] = NET_FILE_STATUS
+        return NETPATH_FILE
+    if _streq(leaf, "local") != 0:
+        out_file[0] = NET_FILE_LOCAL
+        return NETPATH_FILE
+    if _streq(leaf, "remote") != 0:
+        out_file[0] = NET_FILE_REMOTE
+        return NETPATH_FILE
+    return NETPATH_MISS
+
+
+# --- fd_buf packing --------------------------------------------------
+#
+# A /net fd carries (proto, conn, file-kind) in its 64-bit fd_buf:
+#   bits  7.. 0  file-kind  (NET_FILE_*)
+#   bits 15.. 8  proto      (NET_PROTO_*)
+#   bits 31..16  conn       (0..NET_CONN_MAX-1, or 0xFFFF for "none")
+# A clone fd that has not yet been read carries conn == 0xFFFF; reading
+# the clone fd allocates the conn and rewrites its own fd_buf (done in
+# vfs.ad's FD_NET_MARK read arm).
+
+NET_CONN_NONE: uint64 = 0xFFFF
+
+
+def devnet_pack(proto: int32, conn: int32, file_kind: int32) -> uint64:
+    cf: uint64 = NET_CONN_NONE
+    if conn >= 0:
+        cf = cast[uint64](conn) & 0xFFFF
+    pk: uint64 = cf << 16
+    pk = pk | ((cast[uint64](proto) & 0xFF) << 8)
+    pk = pk | (cast[uint64](file_kind) & 0xFF)
+    return pk
+
+
+def devnet_unpack_file(pkv: uint64) -> int32:
+    return cast[int32](pkv & 0xFF)
+
+
+def devnet_unpack_proto(pkv: uint64) -> int32:
+    return cast[int32]((pkv >> 8) & 0xFF)
+
+
+def devnet_unpack_conn(pkv: uint64) -> int32:
+    c: uint64 = (pkv >> 16) & 0xFFFF
+    if c == NET_CONN_NONE:
+        return -1
+    return cast[int32](c)

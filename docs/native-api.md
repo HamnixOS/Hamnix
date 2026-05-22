@@ -363,8 +363,11 @@ shape.
 | `/dev/draw/<id>/{data,ctl,refresh}` | r/w | Per-context draw protocol, control, and repaint wait. Served by `rio`. |
 | `/dev/wctl` | r/w | Per-window control (resize/move/raise). Served by `rio`. |
 | `/dev/wsys` | r/w | System-wide window control; write spawns a window. Served by `rio`. |
-| `/net/tcp/clone` | r/w | Open then read to get a new TCP connection number; further I/O on the per-conn `/net/tcp/<n>/{ctl,data,local,remote,status}`. Plan 9 idiom. |
-| `/net/udp/*` | r/w | Same shape, UDP. |
+| `/net/tcp/clone` | r/w | Open then read to get a new TCP connection number N; further I/O on the per-conn `/net/tcp/<N>/{ctl,data,local,remote,status}`. Plan 9 idiom. Implemented by `drivers/net/devnet.ad`. |
+| `/net/tcp/<N>/ctl` | w | Write one text command: `connect <a.b.c.d>!<port>`, `announce <port>`, `accept`, `hangup`. After `accept`, read the ctl file to get the accepted connection number. |
+| `/net/tcp/<N>/data` | r/w | The connection's byte stream. |
+| `/net/tcp/<N>/{status,local,remote}` | r | Readable connection info. |
+| `/net/udp/*` | r/w | Same shape, UDP (datagram). |
 | `/proc/<pid>/cwd` | r | Read returns the process's current working directory string. |
 | `/proc/<pid>/note` | w | Write a note string to deliver a signal. |
 | `/proc/<pid>/ns` | r | Read returns the process's namespace as text. |
@@ -481,6 +484,26 @@ moves break Linux ABI** (Layer 2 has its own dispatch table).
 - **`socket`/`bind` (Linux)/`listen`/`accept`/`connect`/`send`/`recv`.**
   Layer 2 translates these by opening `/net/tcp/clone` or
   `/net/udp/clone` and writing the appropriate `ctl` commands.
+
+  **Status (ARCH §10 — landed).** The `/net` file tree is implemented
+  (`drivers/net/devnet.ad`): `/net/tcp/clone`, `/net/udp/clone`, and
+  the per-connection `/net/<proto>/<N>/{ctl,data,status,local,remote}`
+  files, backed by the in-kernel TCP/UDP stack. Native code does
+  networking by `open`/`read`/`write` on these files
+  (`user/net9.ad`'s `net_dial` / `net_announce` / `net_accept`). The
+  native server-side socket syscalls `SYS_BIND_SOCK` (49) /
+  `SYS_LISTEN_SOCK` (50) / `SYS_ACCEPT_SOCK` (43) are **retired** —
+  those numbers are unassigned in the native dispatch table. The
+  Linux-ABI `socket()`/`connect()`/`bind()`/`listen()`/`accept()`
+  shims (`linux_abi/u_syscalls.ad`) are now Layer-2 *consumers* of
+  `/net` — they drive `devnet_clone` + the `connect`/`announce`/
+  `accept` ctl protocol, not `tcp_connect` directly. `SYS_SOCKET`
+  (41) / `SYS_CONNECT` (42) survive only because `SYS_TLS_CONNECT`
+  (277) — a documented `/net` follow-up — still needs a socket fd to
+  run the TLS handshake on; native non-TLS clients use `/net`
+  directly. DNS (`SYS_RESOLVE` 269), TLS (`SYS_TLS_CONNECT` 277) and
+  the netcfg syscall (`SYS_NETCFG` 286) are related Layer-1-networking
+  calls left for a follow-up — they are *not* `/net`-shaped yet.
 - **`epoll`, `select`, `poll`.** Plan 9 blocks on a single fd at
   a time; concurrency comes from rfork-shared-fd-table workers
   per blocked fd. Layer 2 emulates `select` with helper threads

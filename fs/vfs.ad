@@ -53,7 +53,7 @@ from kernel.sched.core import (
     FD_UPTIME_MARK, FD_LOADAVG_MARK,
     FD_VERSION_MARK, FD_HOSTNAME_MARK,
     close_fd_in_task, copy_fd_entry, yield_to_others,
-    get_cwd_buf, current_idx_get,
+    get_cwd_buf, current_idx_get, set_current_errstr,
 )
 from sys.src.port9.port.devcons import devcons_read, devcons_write
 from sys.src.port9.port.devtime import devtime_read, devtime_write
@@ -196,6 +196,7 @@ from fs.socket_state import (
     usock_set_state, usock_set_tcp_slot, usock_free,
     usock_is_tls, usock_set_tls, usock_get_type,
     usock_get_peer_addr, usock_get_peer_port,
+    usock_get_netconn,
     USOCK_CONNECTED, USOCK_CLOSED, USOCK_LISTENING,
     USOCK_SOCK_DGRAM,
 )
@@ -212,6 +213,28 @@ from drivers.net.udp import (
 # of raw tcp_send/tcp_recv. tls.ad imports tcp.ad + cpio.ad + the
 # crypto libs but never fs/vfs.ad, so no import cycle.
 from drivers.net.tls import tls_send, tls_recv, tls_close_notify, tls_close
+# ARCH §10: the /net 9P file tree. /net is Hamnix's Plan-9-shaped
+# networking surface — networking is a file tree, not a socket() family.
+# fs/vfs.ad installs an FD_NET_MARK fd for an open of /net/tcp/clone or
+# a /net/<proto>/<N>/<file>; the read/write/close arms below dispatch
+# back into the devnet_* connection-table API. devnet.ad imports tcp.ad
+# + udp.ad (both import leaves) but never fs/vfs.ad — no import cycle.
+from drivers.net.devnet import (
+    FD_NET_MARK,
+    NET_PROTO_TCP, NET_PROTO_UDP,
+    NET_FILE_CLONE, NET_FILE_CTL, NET_FILE_DATA,
+    NET_FILE_STATUS, NET_FILE_LOCAL, NET_FILE_REMOTE,
+    NETPATH_MISS, NETPATH_DIR, NETPATH_FILE,
+    devnet_path_classify, devnet_clone, devnet_conn_ref,
+    devnet_conn_unref, devnet_ctl,
+    devnet_data_read, devnet_data_read_nb, devnet_data_write,
+    devnet_data_pending, devnet_data_at_eof,
+    devnet_status_render, devnet_local_render, devnet_remote_render,
+    devnet_pack, devnet_unpack_file, devnet_unpack_proto,
+    devnet_unpack_conn, devnet_conn_proto,
+    devnet_accept_take, devnet_accept_pending,
+    NET_CTL_OK,
+)
 # §5 Layer-2 async I/O: eventfd / timerfd / signalfd fds tagged with the
 # FD_*_MARK markers below route their read/write back into the confined
 # Layer-2 object pools in linux_abi/u_epoll.ad. That module is a Layer-2
@@ -550,6 +573,14 @@ def vfs_open(name: Ptr[char]) -> int32:
     chan_fd: int32 = _namec_open(name, 0)              # OREAD
     if chan_fd != P9_NO_MOUNT:
         return chan_fd
+    # ARCH §10: the /net 9P file tree. /net/tcp/clone, /net/udp/clone
+    # and the per-connection /net/<proto>/<N>/{ctl,data,status,local,
+    # remote} files are the Plan-9-shaped networking surface — open
+    # them, then read/write to do TCP/UDP. Routed before the on-disk
+    # FS arms so /net is a device, not a file.
+    net_fd: int32 = _open_net(name)
+    if net_fd != NET_NOT:
+        return net_fd
     # V3.5: the V3-era `/srv`, `/srv/<name>`, `/n` direct routing arms
     # are gone. Those paths now come in here as `#s`, `#s/<name>`,
     # `#/` (rewritten by chan_resolve_prefix after the userspace init
@@ -940,6 +971,13 @@ def vfs_open_write(name: Ptr[char]) -> int32:
     # it did through the old FD_<NAME>_MARK arms. /dev/hostname's
     # devtab write arm accepts bytes. A P9_NO_MOUNT result means namec
     # does not own this path — fall through to the FS write routing.
+    # ARCH §10: the /net file tree opens identically for read and
+    # write — a /net file (ctl, data, ...) is r/w. Routed here so
+    # open(.../ctl, OWRITE) and open(.../data, ORDWR) both land on an
+    # FD_NET_MARK fd.
+    net_wfd: int32 = _open_net(name)
+    if net_wfd != NET_NOT:
+        return net_wfd
     chan_wfd: int32 = _namec_open(name, 1)             # OWRITE
     if chan_wfd != P9_NO_MOUNT:
         if chan_wfd == ENOENT:
@@ -1726,6 +1764,21 @@ def vfs_fd_poll(fd: int32) -> uint32:
         if tcp_slot_at_eof(sk_tcp) != 0:
             ev_t = ev_t | 0x0011            # POLLHUP + POLLIN
         return ev_t
+    if fi == FD_NET_MARK:
+        # ARCH §10: a /net data fd polls the connection's readiness.
+        # tx never blocks (POLLOUT always); POLLIN once data or EOF is
+        # buffered; POLLHUP once the connection is closed. The non-data
+        # files (clone/status/local/remote) are always readable.
+        net_pk: uint64 = task[0].fd_buf[fdu]
+        if devnet_unpack_file(net_pk) != NET_FILE_DATA:
+            return 0x0005                   # POLLIN|POLLOUT
+        net_conn: int32 = devnet_unpack_conn(net_pk)
+        ev_n: uint32 = 0x0004               # POLLOUT — tx never blocks
+        if devnet_data_pending(net_conn) != 0:
+            ev_n = ev_n | 0x0001            # POLLIN — data or EOF
+        if devnet_data_at_eof(net_conn) != 0:
+            ev_n = ev_n | 0x0011            # POLLHUP + POLLIN
+        return ev_n
     if fi == FD_PIPE_MARK_R:
         slot: int32 = cast[int32](task[0].fd_buf[fdu])
         ev_pr: uint32 = 0
@@ -1878,6 +1931,105 @@ def _open_dev_marked(mark: uint32) -> int32:
     task[0].fd_pos[fdu] = 0
     task[0].fd_buf[fdu] = 0
     return fd
+
+
+# --- ARCH §10: the /net 9P file-tree open path ----------------------
+#
+# An open of a /net path produces an FD_NET_MARK fd. The fd_buf packs
+# (proto, conn, file-kind) — see devnet.ad's devnet_pack. Three cases:
+#
+#   * /net/<proto>/clone — allocate a connection immediately so the
+#     conn number is stable from the moment the fd exists; a read of
+#     the clone fd renders that number. The clone fd itself holds the
+#     conn's first reference, so closing it tears the conn down (Plan 9
+#     keeps the conn alive as long as ANY fd into its dir is open).
+#   * /net/<proto>/<N>/<file> — a per-file fd into an existing conn.
+#     The conn's refcount is bumped; close drops it.
+#   * /net or /net/<proto> or /net/<proto>/<N> directory — no readable
+#     file shape yet; reported as ENOENT (a `ls /net` lister is a
+#     follow-up).
+#
+# Returns a real fd >= 0, the NET_NOT sentinel when `name` is not a
+# /net path (caller falls through), or an errno on a /net path that
+# could not be opened.
+NET_NOT: int32 = -20001
+
+
+def _devnet_render_dec(v: int32, out: Ptr[uint8]) -> int64:
+    # Render `v` (a /net connection number) as ASCII decimal + '\n'
+    # into `out`. Returns bytes written. Used by the clone fd's read.
+    if v < 0:
+        out[0] = 45                                    # '-'
+        out[1] = 49                                    # '1'
+        out[2] = 10                                    # '\n'
+        return 3
+    val: uint64 = cast[uint64](v)
+    if val == 0:
+        out[0] = 48                                    # '0'
+        out[1] = 10
+        return 2
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    while val != 0:
+        digits[n] = cast[uint8](val % 10) + 48
+        val = val / 10
+        n = n + 1
+    p: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[p] = digits[n]
+        p = p + 1
+    out[p] = 10                                        # '\n'
+    p = p + 1
+    return cast[int64](p)
+
+
+def _open_net(name: Ptr[char]) -> int32:
+    proto: int32 = NET_PROTO_TCP
+    conn:  int32 = -1
+    fkind: int32 = NET_FILE_CLONE
+    cls: int32 = devnet_path_classify(name, &proto, &conn, &fkind)
+    if cls == NETPATH_MISS:
+        return NET_NOT
+    if cls == NETPATH_DIR:
+        # A /net directory — no file to open. (Directory listing is a
+        # follow-up; for now an open of a bare dir is ENOENT.)
+        set_current_errstr("net: not a file")
+        return ENOENT
+    # NETPATH_FILE.
+    task: Ptr[TaskStruct] = current_task()
+    if fkind == NET_FILE_CLONE:
+        # clone: allocate the connection now.
+        new_conn: int32 = devnet_clone(proto)
+        if new_conn < 0:
+            set_current_errstr("net: connection table full")
+            return EMFILE
+        fd: int32 = _alloc_fd(task)
+        if fd < 0:
+            devnet_conn_unref(new_conn)
+            return EMFILE
+        fdu: uint64 = cast[uint64](fd)
+        task[0].fd_idx[fdu]    = FD_NET_MARK
+        task[0].fd_pos[fdu]    = 0
+        task[0].fd_buf[fdu]    = devnet_pack(proto, new_conn,
+                                             NET_FILE_CLONE)
+        task[0].fd_buflen[fdu] = 0
+        return fd
+    # A per-file fd into an existing conn. The conn must already exist.
+    if devnet_conn_proto(conn) < 0:
+        set_current_errstr("net: no such connection")
+        return ENOENT
+    devnet_conn_ref(conn)
+    fd2: int32 = _alloc_fd(task)
+    if fd2 < 0:
+        devnet_conn_unref(conn)
+        return EMFILE
+    fd2u: uint64 = cast[uint64](fd2)
+    task[0].fd_idx[fd2u]    = FD_NET_MARK
+    task[0].fd_pos[fd2u]    = 0
+    task[0].fd_buf[fd2u]    = devnet_pack(proto, conn, fkind)
+    task[0].fd_buflen[fd2u] = 0
+    return fd2
 
 
 # --- Phase D: the universal namec open path -------------------------
@@ -2115,6 +2267,16 @@ def vfs_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         if pipe_writers(slot) == 0:
             return -1
         return 0
+    if file_idx == FD_NET_MARK:
+        # ARCH §10: a non-blocking read of a /net data file. >0 bytes,
+        # 0 = would-block, -1 = EOF/error. Only the data file has a
+        # would-block notion; clone/status/local/remote are one-shot
+        # snapshots — delegate those to the blocking vfs_read.
+        net_pk: uint64 = task[0].fd_buf[fdu]
+        if devnet_unpack_file(net_pk) == NET_FILE_DATA:
+            return devnet_data_read_nb(devnet_unpack_conn(net_pk),
+                                       buf, count)
+        return vfs_read(fd, buf, count)
     # Anything else: no would-block semantics — fall back to the
     # ordinary blocking read.
     return vfs_read(fd, buf, count)
@@ -2221,6 +2383,56 @@ def vfs_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
     if file_idx == FD_DEVNULL_MARK:
         # /dev/null reads always return EOF.
         return 0
+    if file_idx == FD_NET_MARK:
+        # ARCH §10: a /net file-tree fd. fd_buf packs (proto, conn,
+        # file-kind). The clone / info files render text snapshots that
+        # `cat` walks to EOF (fd_pos gates the second read); the data
+        # file streams the connection's bytes.
+        net_pk: uint64 = task[0].fd_buf[fdu]
+        nf:  int32 = devnet_unpack_file(net_pk)
+        nc:  int32 = devnet_unpack_conn(net_pk)
+        if nf == NET_FILE_DATA:
+            # The connection byte stream — a blocking read.
+            return devnet_data_read(nc, buf, count)
+        # clone / status / local / remote: one-shot text snapshots. A
+        # second read (fd_pos advanced) is EOF so `cat` terminates.
+        if task[0].fd_pos[fdu] > 0:
+            return 0
+        snap: Array[64, uint8]
+        nlen: int64 = 0
+        if nf == NET_FILE_CLONE:
+            # Reading the clone fd yields the connection number — the
+            # canonical "ctl-file discovery dance" from native-api.md.
+            nlen = _devnet_render_dec(nc, &snap[0])
+        elif nf == NET_FILE_STATUS:
+            nlen = devnet_status_render(nc, &snap[0], 64)
+        elif nf == NET_FILE_LOCAL:
+            nlen = devnet_local_render(nc, &snap[0], 64)
+        elif nf == NET_FILE_REMOTE:
+            nlen = devnet_remote_render(nc, &snap[0], 64)
+        elif nf == NET_FILE_CTL:
+            # A read of a ctl file returns the connection number of a
+            # peer accepted on this conn (the clone-style discovery
+            # dance — after a `accept` ctl write, read the ctl file to
+            # learn the accepted conn number). If no accept is pending
+            # the read is empty.
+            acc: int32 = devnet_accept_take(nc)
+            if acc < 0:
+                return 0
+            nlen = _devnet_render_dec(acc, &snap[0])
+        else:
+            return 0
+        if nlen <= 0:
+            return 0
+        take: uint64 = cast[uint64](nlen)
+        if take > count:
+            take = count
+        i: uint64 = 0
+        while i < take:
+            buf[i] = snap[i]
+            i = i + 1
+        task[0].fd_pos[fdu] = task[0].fd_pos[fdu] + take
+        return cast[int64](take)
     if file_idx == FD_SOCKET_MARK:
         # U-socket: a socket fd backed by a live TCP connection routes
         # read(2) into the real stack via tcp_recv. fd_buf carries the
@@ -2619,6 +2831,26 @@ def vfs_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         # /dev/null and /dev/zero swallow writes silently — the
         # full `count` is returned as bytes-written.
         return cast[int64](count)
+    if file_idx == FD_NET_MARK:
+        # ARCH §10: a /net file-tree fd. A write to the data file
+        # streams bytes onto the connection; a write to the ctl file
+        # is ONE text command (connect/announce/accept/hangup).
+        net_pk: uint64 = task[0].fd_buf[fdu]
+        nf: int32 = devnet_unpack_file(net_pk)
+        nc: int32 = devnet_unpack_conn(net_pk)
+        if nf == NET_FILE_DATA:
+            return devnet_data_write(nc, buf, count)
+        if nf == NET_FILE_CTL:
+            rc_ctl: int32 = devnet_ctl(nc, buf, count)
+            if rc_ctl != NET_CTL_OK:
+                set_current_errstr("net: ctl command failed")
+                return -1
+            # A ctl write consumes the whole command — report the full
+            # count so the caller does not retry a "short write".
+            return cast[int64](count)
+        # clone / status / local / remote are not writable.
+        set_current_errstr("net: file not writable")
+        return -1
     if file_idx == FD_CONS_MARK:
         # M16.94: /dev/cons write side — fan out to UART + VGA/fb +
         # printk via devcons_write → early_putc. Same byte stream
@@ -2987,6 +3219,19 @@ def vfs_close(fd: int32) -> int32:
         sp_slot: int32 = sockpair_unpack_slot(sp_pkd)
         sp_dir:  int32 = sockpair_unpack_dir(sp_pkd)
         sockpair_close(sp_slot, sp_dir)
+    # ARCH §10: a /net file-tree fd carries (proto, conn, file-kind) in
+    # fd_buf. Every /net fd into a connection holds one reference to
+    # that connection; dropping it here (BEFORE close_fd_in_task wipes
+    # fd_buf — core.ad knows nothing of FD_NET_MARK, same rationale as
+    # the FD_SOCKET_MARK / FD_SOCKETPAIR_MARK arms) tears the TCP/UDP
+    # transport down on the last reference. The clone fd holds the
+    # conn's first reference, so closing every fd into the conn dir
+    # FIN-closes it — the Plan 9 model.
+    if file_idx == FD_NET_MARK:
+        net_pk: uint64 = task[0].fd_buf[fdu]
+        net_conn: int32 = devnet_unpack_conn(net_pk)
+        if net_conn >= 0:
+            devnet_conn_unref(net_conn)
     # U-socket: an AF_INET socket fd carrying a live TCP connection
     # must tear that connection down (FIN handshake via tcp_close)
     # and release its backing record BEFORE close_fd_in_task wipes the
@@ -2997,6 +3242,7 @@ def vfs_close(fd: int32) -> int32:
         sk_rec: int32 = usock_record_for_fdbuf(task[0].fd_buf[fdu])
         if sk_rec >= 0:
             sk_tcp: int32 = usock_get_tcp_slot(sk_rec)
+            sk_netconn: int32 = usock_get_netconn(sk_rec)
             # §10 UDP: a datagram socket's stack slot is a udp.ad socket
             # slot — release it via udp_socket_close (no FIN handshake;
             # UDP is connectionless). Then free the backing record.
@@ -3005,21 +3251,26 @@ def vfs_close(fd: int32) -> int32:
                     udp_socket_close(sk_tcp)
                 usock_free(sk_rec)
             else:
+                # U-TLS: a TLS-active fd gets a graceful TLS shutdown
+                # first — send a close_notify alert (best-effort) and
+                # reset the in-kernel TLS session so a later
+                # tls_connect(2) can claim it again.
                 if sk_tcp >= 0:
-                    # U-TLS: a TLS-active fd gets a graceful TLS shutdown
-                    # first — send a close_notify alert (best-effort) and
-                    # reset the in-kernel TLS session so a later
-                    # tls_connect(2) can claim it again. Then the TCP
-                    # slot is torn down the same way a plain socket fd
-                    # is.
                     if usock_is_tls(sk_rec) != 0:
                         tls_close_notify(sk_tcp)
                         tls_close()
                         usock_set_tls(sk_rec, 0)
-                    # A LISTENING socket's tcp slot is a passive TCB
-                    # with no peer — tcp_listen_close resets it without
-                    # a FIN. A CONNECTED / CLOSED socket gets the full
-                    # FIN handshake via tcp_close.
+                # ARCH §10: a TCP socket fd's connection is owned by the
+                # /net file tree (connect(2)/listen(2)/accept(2) cloned
+                # it). Dropping the /net reference FIN-tears the TCP
+                # transport down — the same teardown the /net device's
+                # own fd-close arm runs. A record with no /net conn
+                # (legacy / never-connected) falls back to a direct
+                # tcp_close so a created-but-unconnected socket fd still
+                # releases cleanly.
+                if sk_netconn >= 0:
+                    devnet_conn_unref(sk_netconn)
+                elif sk_tcp >= 0:
                     if usock_get_state(sk_rec) == USOCK_LISTENING:
                         tcp_listen_close(sk_tcp)
                     else:

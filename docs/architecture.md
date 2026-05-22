@@ -110,6 +110,7 @@ yourself wanting Plan 9 at Layer 2, you have a bug.
 | Block: NVMe | `drivers/nvme/nvme.ad` (in flight) | 0 | Native bare-metal driver |
 | NIC: virtio-net | `drivers/net/virtio_net.ad` | 0 | M16.88 native |
 | Net stack (eth/arp/ip/udp/tcp/icmp/dhcp) | `drivers/net/*.ad` | **3 (eventually)** | Today in-kernel for bring-up; **target home is a `/net` 9P server under Layer 3** |
+| `/net` file tree (TCP/UDP as files) | `drivers/net/devnet.ad` | **1** | ARCH §10: the Plan-9-shaped networking surface — `/net/tcp/clone`, `/net/<proto>/<N>/{ctl,data,status,local,remote}`. A kernel-side device backed by the in-kernel TCP/UDP stack. Replaces the retired native socket syscalls; the Linux-ABI `socket()` is a Layer-2 consumer of it. |
 | Serial UART | `drivers/tty/serial/early_8250.ad` | 0 | Bytes |
 | Console: VGA text, EFI GOP framebuffer | `drivers/video/console/{vga_text,fb_text}.ad` + `fb_font_8x16.S` | 0 | Bytes |
 | PS/2 keyboard | `drivers/input/atkbd.ad` | 0 | Bytes |
