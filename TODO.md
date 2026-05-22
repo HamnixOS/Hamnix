@@ -101,15 +101,14 @@ knows which it holds.
 - [ ] `fd2path` exact open()-time path (per-fd path slot in `TaskStruct`).
 - [ ] `wstat`/`fwstat` fields: `length` (truncate), `mtime`, `gid`/`muid`,
   `mode` storage.
-- [~] **distrofs migration capstone:** `dpkg -i` of a real `.deb` now
-  lands all files into the distrofs namespace under `nsrun` (`463c3e8`,
-  verified with Debian `hello`). Remaining: run `apt install` itself
-  under `nsrun` (apt still spawns `dpkg` directly, so apt's own
-  extraction hits the read-only initramfs `/usr`); then delete the
-  global `/var` tmpfs.
-- [ ] distrofs persistent backing (ext4 partition / disk image) so an
-  installed package survives reboot — distrofs is RAM-backed today
-  (`463c3e8`); §12 ext4 write maturity makes ext4-backing viable.
+- [~] **distrofs migration capstone:** `dpkg -i` (`463c3e8`) and
+  `apt install` (`d886f17`) of a real `.deb` both land all files into
+  the distrofs namespace under `nsrun`, verified with Debian `hello`.
+  Remaining: delete the global `/var` tmpfs (the last Namespace-law
+  debt) once nothing else depends on it.
+- [x] distrofs persistent backing — `ea22407`: RAM-cache-over-ext4,
+  state serialized to an ext4-backed image, snapshot on dirty-clunk/
+  remove/EOF. An installed file survives a full reboot (verified).
 
 ## §1 Process model & address space  (gates threads, the loader, all real software)
 - [x] VMA deep-copy on fork; copy-on-write pages (COW fault handler +
