@@ -88,7 +88,7 @@ if [ ! -f "$UBIN" ]; then
 fi
 echo "[test_u42_dynamic_elf]   $(file -b "$UBIN")"
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
 echo "[test_u42_dynamic_elf] (2/5) Build userland (hamsh + helpers)"

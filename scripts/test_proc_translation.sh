@@ -47,7 +47,7 @@ UBIN=tests/u-binary/u_proc_translation
 # real build failure.
 ensure_ubin_or_skip test_proc_translation u_proc_translation proc_translation
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
 echo "[test_proc_translation] (1/4) Build userland (hamsh + helpers)"

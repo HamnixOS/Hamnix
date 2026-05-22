@@ -40,7 +40,7 @@ UBIN_CHILD=tests/u-binary/u_glibc_hello
 ensure_ubin_or_skip test_u25_exec u_glibc_exec  glibc_exec
 ensure_ubin_or_skip test_u25_exec u_glibc_hello glibc_hello
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
 echo "[test_u25_exec] (1/4) Build userland (hamsh + helpers)"

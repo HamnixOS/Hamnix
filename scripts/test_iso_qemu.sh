@@ -8,7 +8,7 @@
 #   2. UEFI via -bios /usr/share/ovmf/OVMF.fd (only if OVMF.fd exists).
 #      As of M16.125 PATH A, the UEFI path now reaches start_kernel()
 #      too via the ELF-loader bake-in (arch/x86/boot/efi_stub.S
-#      SFSP-reads \hamnix-vmlinux.elf off the ESP, parses program
+#      SFSP-reads \hamnix-kernel.elf off the ESP, parses program
 #      headers, copies PT_LOAD segments to their LMA, then jumps to
 #      _x86_start_after_loader). The UEFI assertion now requires
 #      BOTH the EFI handoff markers AND a deep kernel marker that
@@ -34,7 +34,7 @@
 #      MapKey-staleness retry) went through. Marker (c) is the new
 #      M16.125 hurdle — it can only appear if the EFI stub's ELF
 #      loader (PATH A from M16.124's diagnosis) successfully:
-#         - opened \hamnix-vmlinux.elf via SFSP,
+#         - opened \hamnix-kernel.elf via SFSP,
 #         - copied every PT_LOAD segment to its LMA,
 #         - installed identity-mapped page tables + a kernel-shape GDT,
 #         - jumped to _x86_start_after_loader,

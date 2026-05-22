@@ -73,7 +73,7 @@ if [ ! -f "$UBIN" ]; then
 fi
 echo "[test_u43_dynamic_namespace]   $(file -b "$UBIN")"
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
 echo "[test_u43_dynamic_namespace] (2/5) Build userland (hamsh + distrorun)"

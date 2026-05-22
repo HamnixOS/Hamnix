@@ -641,7 +641,7 @@ def main() -> int32:
 Three sub-targets via `python3 -m compiler.adder compile --target=<X>`:
 
 - **`x86_64-bare-metal`** — links into the multiboot1 kernel image at
-  `build/hamnix-vmlinux.elf`. Used for everything under `arch/`, `mm/`,
+  `build/hamnix-kernel.elf`. Used for everything under `arch/`, `mm/`,
   `kernel/`, `drivers/`, `fs/`, `sys/`, `init/main.ad`. No red zone,
   ENDBR64 for IBT, RIP-relative `.rodata`, 16-byte stack alignment.
 - **`x86_64-adder-user`** — CPL-3 userland ELFs (`user/*.ad`,

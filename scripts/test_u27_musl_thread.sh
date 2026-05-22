@@ -37,7 +37,7 @@ UBIN=tests/u-binary/u_musl_thread
 # failure (e.g. a genuine missing musl-gcc).
 ensure_ubin_or_skip test_u27_musl_thread u_musl_thread musl_thread
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
 echo "[test_u27_musl_thread] (1/4) Build userland (hamsh + helpers)"

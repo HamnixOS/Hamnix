@@ -64,7 +64,7 @@ cd "$PROJ_ROOT"
 # shellcheck source=_build_lock.sh
 source "$PROJ_ROOT/scripts/_build_lock.sh"
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 
 echo "[test_usb_hid] (1/3) Build userland (init.elf must exist for cpio)"
 bash scripts/build_user.sh >/dev/null

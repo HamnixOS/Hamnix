@@ -36,7 +36,7 @@ UBIN=tests/u-binary/u_musl_hello
 # failure (e.g. a genuine missing musl-gcc).
 ensure_ubin_or_skip test_u12_musl_hello u_musl_hello musl_hello
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
 echo "[test_u12_musl_hello] (1/4) Build userland (hamsh + helpers)"

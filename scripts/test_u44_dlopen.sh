@@ -61,7 +61,7 @@ if [ ! -f "$UBIN" ] || [ ! -f "$DSO" ]; then
 fi
 echo "[test_u44_dlopen]   $(file -b "$UBIN")"
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
 echo "[test_u44_dlopen] (2/5) Build userland (hamsh + helpers)"

@@ -78,7 +78,7 @@ supported.
 - **UEFI (no Secure Boot)** — hybrid ISO ESP carries the Hamnix
   PE/COFF stub as `\EFI\BOOT\BOOTX64.EFI` (PE32+ subsystem 10). Firmware
   launches it directly; no GRUB-EFI in the path. The stub SFSP-loads
-  `\hamnix-vmlinux.elf` from the ESP, copies PT_LOADs to their LMAs,
+  `\hamnix-kernel.elf` from the ESP, copies PT_LOADs to their LMAs,
   installs kernel page tables + GDT, calls `ExitBootServices`, and
   jumps into `_x86_start_after_loader`. End-to-end verified through
   the hamsh prompt (M16.126 PATH A; M16.138 GDT-handoff fix).
@@ -444,7 +444,7 @@ likely causes:
 | ------------------------------------------- | -------------------------------------------------- |
 | (firmware splash, no Hamnix output at all)  | Wrong boot mode / Secure Boot still on / USB not in boot order |
 | GRUB menu, "Hamnix" entry highlighted but stuck | GRUB on legacy can't read the ISO9660 tree — try UEFI mode |
-| `[hamnix] EFI entry reached` then silence   | EFI stub reached but SFSP can't find `\hamnix-vmlinux.elf`. ESP corruption — re-dd the USB |
+| `[hamnix] EFI entry reached` then silence   | EFI stub reached but SFSP can't find `\hamnix-kernel.elf`. ESP corruption — re-dd the USB |
 | `[hamnix] post-EFI handoff complete` then silence | EFI memory map / page-table handoff failed on real silicon. New territory; capture the FULL serial log |
 | `Hamnix kernel booting` then triple-fault   | Almost certainly the M16.138 GDT path — should be fixed; if not, this is a regression |
 | `syscall MSRs armed` then silence / triple-fault | Ring-3-transition fault. M16.156 fixed the known Asus case (`fninit` + `CR4.OSXSAVE` + cleared `RFLAGS.IF`); a fresh occurrence on other silicon is new territory — capture the full serial log. See §7. |

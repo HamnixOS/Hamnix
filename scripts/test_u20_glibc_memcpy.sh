@@ -34,7 +34,7 @@ UBIN=tests/u-binary/u_glibc_memcpy
 # failure (e.g. a genuine missing static glibc).
 ensure_ubin_or_skip test_u20_glibc_memcpy u_glibc_memcpy glibc_memcpy
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
 echo "[test_u20_glibc_memcpy] (1/4) Build userland (hamsh + helpers)"

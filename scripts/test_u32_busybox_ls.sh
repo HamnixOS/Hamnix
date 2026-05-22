@@ -44,7 +44,7 @@ UBIN=tests/u-binary/u_busybox_musl
 # busybox upstream tarball).
 ensure_ubin_or_skip test_u32_busybox_ls u_busybox_musl musl_busybox
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
 echo "[test_u32_busybox_ls] (1/4) Build userland + modules"

@@ -59,7 +59,7 @@ cd "$PROJ_ROOT"
 # shellcheck source=_build_lock.sh
 source "$PROJ_ROOT/scripts/_build_lock.sh"
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 
 echo "[test_usb_hid_v2] (1/3) Build userland"
 bash scripts/build_user.sh >/dev/null

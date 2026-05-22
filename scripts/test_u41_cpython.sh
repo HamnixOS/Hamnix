@@ -74,7 +74,7 @@ UBIN=tests/u-binary/u_cpython
 # skip reason.
 ensure_ubin_or_skip test_u41_cpython u_cpython cpython
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
 echo "[test_u41_cpython] (1/4) Build userland (hamsh + helpers)"

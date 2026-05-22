@@ -10,7 +10,7 @@ The hybrid ISO is the priority boot path: it's the foundation for booting
 Hamnix on real server hardware.
 
 The Hamnix kernel is a true **`elf64-x86-64`** ELF, linked into the
-**higher half** at `0xffffffff80000000` (see `arch/x86/kernel/vmlinux.lds`).
+**higher half** at `0xffffffff80000000` (see `arch/x86/kernel/kernel.lds`).
 It is loaded by multiboot1 (GRUB) on BIOS and by a native PE/COFF EFI stub
 on UEFI; both honour the 64-bit `p_paddr` program-header fields the
 kernel's VMA/LMA split needs.
@@ -59,7 +59,7 @@ This produces `build/hamnix.iso`, a hybrid CD/USB image that:
 As of M16.70 the BIOS and UEFI paths run **different code on the way in**:
 
 - **BIOS path (unchanged)**: SeaBIOS → GRUB (via grub-pc-bin) → multiboot1 →
-  `build/hamnix-vmlinux.elf` → `start_kernel()`. Same as before.
+  `build/hamnix-kernel.elf` → `start_kernel()`. Same as before.
 
 - **UEFI path**: OVMF / firmware → **native Hamnix PE/COFF stub**
   (`build/hamnix-bootx64.efi`, built from `arch/x86/boot/efi_stub.S`).
@@ -71,7 +71,7 @@ As of M16.70 the BIOS and UEFI paths run **different code on the way in**:
     3. Locate the Simple File System Protocol on our load device
        (via `HandleProtocol(ImageHandle, LoadedImageGuid) ->
        HandleProtocol(DeviceHandle, SfspGuid) -> OpenVolume`).
-    4. Open `\hamnix-vmlinux.elf` on the ESP, AllocatePool 32 MiB
+    4. Open `\hamnix-kernel.elf` on the ESP, AllocatePool 32 MiB
        and read the entire ELF in.
     5. Parse the elf64-x86-64 header + program headers; for each
        PT_LOAD, memcpy `p_filesz` bytes from the file buffer to
@@ -112,7 +112,7 @@ through the Adder compiler + `ld -m elf_x86_64`). An ELF starts with
 four bytes can't be both magic numbers, so Hamnix takes the simpler
 split-output approach:
 
-- `build/hamnix-vmlinux.elf` — true `elf64-x86-64` higher-half kernel
+- `build/hamnix-kernel.elf` — true `elf64-x86-64` higher-half kernel
   ELF (linked at `0xffffffff80000000`), multiboot1-loaded by GRUB.
 - `build/hamnix-bootx64.efi` — true PE32+ EFI_APPLICATION, x86-64,
   subsystem 10.
@@ -157,12 +157,12 @@ summarised here:
 PATH A from the M16.124 diagnosis is now the production UEFI path:
 
 - The .efi stub uses UEFI's Simple File System Protocol BEFORE
-  `ExitBootServices` to open `\hamnix-vmlinux.elf` off the ESP,
+  `ExitBootServices` to open `\hamnix-kernel.elf` off the ESP,
   parse program headers, copy PT_LOADs to their LMAs (matching
   multiboot1's loader behaviour on the BIOS side), then
   `ExitBootServices` and `jmp _x86_start_after_loader`.
 - The kernel ELF format stays untouched — every existing
-  `qemu ... -kernel hamnix-vmlinux.elf` test keeps working (via the
+  `qemu ... -kernel hamnix-kernel.elf` test keeps working (via the
   `scripts/_kernel_iso.sh` GRUB-ISO PATH shim — see §1).
 
 **Implementation notes worth recording (the B5 we discovered):**
@@ -313,7 +313,7 @@ Tested-on / known-working list (extend as we verify on more machines):
 | Vendor / Model        | Mode | Result | Notes                |
 | --------------------- | ---- | ------ | -------------------- |
 | QEMU (SeaBIOS, 10.0)  | BIOS | works  | scripts/test_bios_boot.sh PASS |
-| QEMU (OVMF, edk2)     | UEFI | works  | scripts/test_uefi_boot.sh PASS — direct PE/COFF stub, SFSP-loads `\hamnix-vmlinux.elf` from the ESP, reaches `start_kernel()` and beyond (M16.125 PATH A) |
+| QEMU (OVMF, edk2)     | UEFI | works  | scripts/test_uefi_boot.sh PASS — direct PE/COFF stub, SFSP-loads `\hamnix-kernel.elf` from the ESP, reaches `start_kernel()` and beyond (M16.125 PATH A) |
 | Asus i5-4210U (Haswell ULT) | BIOS | boots to `hamsh` | First confirmed real-hardware boot (M16.156). Built-in keyboard does NOT work — see [`REAL_HARDWARE.md`](REAL_HARDWARE.md) §7. |
 | Asus i5-4210U         | UEFI | not re-confirmed | UEFI boot on this laptop has not been re-verified since the M16.151–156 wave |
 
@@ -332,7 +332,7 @@ When testing on real hardware:
 ## 4. Known limitations / next steps
 
 - **UEFI direct boot reaches `start_kernel()`** — M16.125 shipped
-  PATH A. The PE/COFF stub now SFSP-loads `\hamnix-vmlinux.elf`
+  PATH A. The PE/COFF stub now SFSP-loads `\hamnix-kernel.elf`
   from the ESP, parses its program headers, copies PT_LOAD segments
   to their LMAs, installs identity-mapped page tables + a kernel-
   shape GDT, and `jmp _x86_start_after_loader`. Verified end-to-end

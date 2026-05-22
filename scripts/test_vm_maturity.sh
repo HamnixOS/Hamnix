@@ -35,7 +35,7 @@ cd "$PROJ_ROOT"
 UBIN=tests/u-binary/u_vm_maturity
 ensure_ubin_or_skip test_vm_maturity u_vm_maturity vm_maturity
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
 echo "[test_vm_maturity] (1/4) Build userland (hamsh + helpers)"

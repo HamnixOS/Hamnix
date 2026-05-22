@@ -2,7 +2,7 @@
 # scripts/build_iso.sh - Build a hybrid (BIOS + UEFI) bootable ISO for Hamnix.
 #
 # Pipeline:
-#   1. Ensure build/hamnix-vmlinux.elf exists (rebuild via run_x86_bare's
+#   1. Ensure build/hamnix-kernel.elf exists (rebuild via run_x86_bare's
 #      build steps if missing).
 #   2. Build the native UEFI PE/COFF stub (build/hamnix-bootx64.efi) from
 #      arch/x86/boot/efi_stub.S.
@@ -29,7 +29,7 @@
 #
 # Env overrides:
 #   HAMNIX_ISO_OUT   output path             (default: build/hamnix.iso)
-#   HAMNIX_KERNEL    kernel ELF to embed     (default: build/hamnix-vmlinux.elf)
+#   HAMNIX_KERNEL    kernel ELF to embed     (default: build/hamnix-kernel.elf)
 #   HAMNIX_EFI_STUB  PE/COFF stub output     (default: build/hamnix-bootx64.efi)
 
 set -euo pipefail
@@ -42,7 +42,7 @@ cd "$PROJ_ROOT"
 # shellcheck source=_build_lock.sh
 source "$PROJ_ROOT/scripts/_build_lock.sh"
 
-HAMNIX_KERNEL="${HAMNIX_KERNEL:-build/hamnix-vmlinux.elf}"
+HAMNIX_KERNEL="${HAMNIX_KERNEL:-build/hamnix-kernel.elf}"
 HAMNIX_EFI_STUB="${HAMNIX_EFI_STUB:-build/hamnix-bootx64.efi}"
 HAMNIX_ISO_OUT="${HAMNIX_ISO_OUT:-build/hamnix.iso}"
 ISO_STAGE="build/iso"
@@ -77,7 +77,7 @@ need_tool sha256sum
 # not force-rebuild on every iso invocation — keeping the iso build
 # cheap and predictable when the kernel ELF is already current.
 # Always rebuild the userland + initramfs + kernel ELF for the ISO.
-# A stale build/hamnix-vmlinux.elf is the more dangerous failure mode
+# A stale build/hamnix-kernel.elf is the more dangerous failure mode
 # than a couple of redundant seconds of compile time — for instance,
 # a kernel built with the legacy asm /init.elf (which exec'd /hello)
 # would boot on real hardware then halt because /hello no longer
@@ -102,12 +102,12 @@ python3 scripts/build_initramfs.py
 #   atomic. If a prior build_iso.sh (or any test_*.sh that wraps it)
 #   is killed mid-link — agents routinely `timeout` their boot tests,
 #   and cron kills runs — `ld` leaves a truncated/partial ELF sitting
-#   at the final path build/hamnix-vmlinux.elf. The multiboot1 magic
+#   at the final path build/hamnix-kernel.elf. The multiboot1 magic
 #   lives at file offset 0x1000; a file truncated before that point
 #   has no magic.
 #
 # Fix, in two parts:
-#   1. Delete any leftover build/hamnix-vmlinux.elf up front, so the
+#   1. Delete any leftover build/hamnix-kernel.elf up front, so the
 #      magic check can never see a stale partial file from an aborted
 #      prior run.
 #   2. Compile to a unique temp path in build/, then `mv` it into the
@@ -174,7 +174,7 @@ if [[ " $MAGIC_DUMP " != *" 1badb002 "* ]]; then
     echo "[build_iso]   and the check no longer races on SIGPIPE, so a stale/partial" >&2
     echo "[build_iso]   intermediate is ruled out — this is a genuine kernel-image" >&2
     echo "[build_iso]   regression. Inspect arch/x86/boot/header.S and the linker" >&2
-    echo "[build_iso]   script arch/x86/kernel/vmlinux.lds." >&2
+    echo "[build_iso]   script arch/x86/kernel/kernel.lds." >&2
     exit 1
 fi
 
@@ -342,7 +342,7 @@ mformat -i "$WIDE_ESP_IMG" -h 64 -s 32 -c 32 \
 mmd -i "$WIDE_ESP_IMG" "::/EFI"
 mmd -i "$WIDE_ESP_IMG" "::/EFI/BOOT"
 mcopy -o -i "$WIDE_ESP_IMG" "$HAMNIX_EFI_STUB" "::/EFI/BOOT/BOOTX64.EFI"
-mcopy -o -i "$WIDE_ESP_IMG" "$HAMNIX_KERNEL"   "::/hamnix-vmlinux.elf"
+mcopy -o -i "$WIDE_ESP_IMG" "$HAMNIX_KERNEL"   "::/hamnix-kernel.elf"
 echo "[build_iso] Wide ESP contents:"
 mdir -i "$WIDE_ESP_IMG" ::/          | sed 's/^/    /'
 mdir -i "$WIDE_ESP_IMG" ::/EFI/BOOT/ | sed 's/^/    /'
@@ -462,7 +462,7 @@ ESP_START_SECTOR=$(echo "$ESP_INFO" | awk '{print $2}' | tr -d 's')
 ESP_LENGTH_SECTORS=$(echo "$ESP_INFO" | awk '{print $4}' | tr -d 's')
 echo "[build_iso] ESP partition at sector $ESP_START_SECTOR, length $ESP_LENGTH_SECTORS"
 
-# 1) BOOTX64.EFI + hamnix-vmlinux.elf inside the GPT ESP partition.
+# 1) BOOTX64.EFI + hamnix-kernel.elf inside the GPT ESP partition.
 dd if="$HAMNIX_ISO_OUT" of="$VERIFY_TMP/esp.img" \
    bs=512 skip="$ESP_START_SECTOR" count="$ESP_LENGTH_SECTORS" \
    status=none
@@ -473,15 +473,15 @@ if [ "$EXPECTED_EFI_SHA" != "$GPT_SHA" ]; then
     echo "[build_iso] ERROR: GPT ESP \\EFI\\BOOT\\BOOTX64.EFI content mismatch" >&2
     exit 1
 fi
-mcopy -o -i "$VERIFY_TMP/esp.img" "::/hamnix-vmlinux.elf" \
+mcopy -o -i "$VERIFY_TMP/esp.img" "::/hamnix-kernel.elf" \
                                   "$VERIFY_TMP/esp_kernel.elf"
 ESP_KERNEL_SHA=$(sha256sum "$VERIFY_TMP/esp_kernel.elf" | awk '{print $1}')
 if [ "$EXPECTED_KERNEL_SHA" != "$ESP_KERNEL_SHA" ]; then
-    echo "[build_iso] ERROR: GPT ESP \\hamnix-vmlinux.elf content mismatch" >&2
+    echo "[build_iso] ERROR: GPT ESP \\hamnix-kernel.elf content mismatch" >&2
     exit 1
 fi
 echo "[build_iso]   GPT ESP \\EFI\\BOOT\\BOOTX64.EFI : $(stat -c%s "$VERIFY_TMP/esp_bootx64.efi") bytes, sha matches stub"
-echo "[build_iso]   GPT ESP \\hamnix-vmlinux.elf    : $(stat -c%s "$VERIFY_TMP/esp_kernel.elf") bytes, sha matches kernel"
+echo "[build_iso]   GPT ESP \\hamnix-kernel.elf    : $(stat -c%s "$VERIFY_TMP/esp_kernel.elf") bytes, sha matches kernel"
 
 ISO_BYTES=$(stat -c%s "$HAMNIX_ISO_OUT")
 echo "[build_iso] Done: $HAMNIX_ISO_OUT  ($ISO_BYTES bytes)"

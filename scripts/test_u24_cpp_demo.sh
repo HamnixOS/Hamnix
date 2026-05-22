@@ -36,7 +36,7 @@ UBIN=tests/u-binary/u_cpp_demo
 # failure (e.g. a genuine missing g++ / static libstdc++).
 ensure_ubin_or_skip test_u24_cpp_demo u_cpp_demo cpp_demo
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
 echo "[test_u24_cpp_demo] (1/4) Build userland (hamsh + helpers)"

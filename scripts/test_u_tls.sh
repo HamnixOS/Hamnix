@@ -48,7 +48,7 @@ set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 TLSTEST_ELF=build/user/u_tlstest.elf
 
 echo "[test_u_tls] (1/5) Generate Hamnix Test CA + leaf cert"

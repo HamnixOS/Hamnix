@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/run_x86_bare.sh - Boot the Hamnix bare-metal kernel under QEMU.
 #
-# Builds build/hamnix-vmlinux.elf from init/main.ad if needed, then runs it
+# Builds build/hamnix-kernel.elf from init/main.ad if needed, then runs it
 # via `qemu-system-x86_64 -kernel`. Serial output (the banner) goes to
 # stdout. Times out after a short window since the kernel halts after
 # printing — that's the success signal.
@@ -12,7 +12,7 @@ PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
 mkdir -p build
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 
 # Build the userland binaries and kernel modules before regenerating
 # the cpio archive — the archive embeds whatever sits in build/user/

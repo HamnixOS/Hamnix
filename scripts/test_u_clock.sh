@@ -34,7 +34,7 @@ cd "$PROJ_ROOT"
 # toolchain failure.
 ensure_ubin_or_skip test_u_clock u_musl_clock musl_clock
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
 echo "[test_u_clock] (1/4) Build userland"

@@ -1,5 +1,5 @@
 /*
- * arch/x86/kernel/vmlinux.lds - Hamnix bare-metal x86_64 kernel linker script.
+ * arch/x86/kernel/kernel.lds - Hamnix bare-metal x86_64 kernel linker script.
  *
  * HIGHER-HALF KERNEL: the kernel proper is LINKED at the canonical
  * x86_64 kernel virtual base 0xffffffff80000000 (PML4 entry 511, the

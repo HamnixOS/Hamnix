@@ -40,7 +40,7 @@ set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 
 # Find sfdisk wherever it lives — Debian ships it as /sbin/sfdisk
 # (root-only path component in $PATH on some setups).

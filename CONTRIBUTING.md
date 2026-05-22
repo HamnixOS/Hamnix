@@ -344,7 +344,7 @@ and the constraints kernel codegen has to honour.
 # Compile the bare-metal kernel
 python3 -m compiler.adder compile \
     --target=x86_64-bare-metal init/main.ad \
-    -o build/hamnix-vmlinux.elf
+    -o build/hamnix-kernel.elf
 
 # Build Adder userland (~60 coreutils + hamsh)
 bash scripts/build_user.sh

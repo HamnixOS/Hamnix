@@ -11,7 +11,7 @@
 #   OVMF firmware  ->  reads GPT, finds ESP partition (FAT12)
 #   ->  launches \EFI\BOOT\BOOTX64.EFI = our PE32+ stub
 #       (arch/x86/boot/efi_stub.S, built into build/hamnix-bootx64.efi)
-#   ->  stub SFSP-opens \hamnix-vmlinux.elf on the same ESP
+#   ->  stub SFSP-opens \hamnix-kernel.elf on the same ESP
 #   ->  parses program headers, copies PT_LOAD segments to their LMAs
 #   ->  scans for the multiboot1 magic, reads the Hamnix EFI handoff
 #       table, patches boot_via_efi = 1

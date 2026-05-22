@@ -35,7 +35,7 @@ cd "$PROJ_ROOT"
 UBIN=tests/u-binary/u_busybox_musl
 ensure_ubin_or_skip test_u34_syscalls u_busybox_musl musl_busybox
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
 echo "[test_u34_syscalls] (1/4) Build userland + modules"

@@ -68,7 +68,7 @@ python3 scripts/build_initramfs.py >/dev/null
 python3 -m compiler.adder compile \
     --target=x86_64-bare-metal \
     init/main.ad \
-    -o build/hamnix-vmlinux.elf >/dev/null
+    -o build/hamnix-kernel.elf >/dev/null
 # build_iso.sh is chatty but takes ~30s and we want a single
 # end-of-line confirmation in the test log. Capture its output to a
 # file and report just the success summary.

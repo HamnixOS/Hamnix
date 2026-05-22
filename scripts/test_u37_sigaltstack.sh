@@ -22,7 +22,7 @@ UBIN=tests/u-binary/u_musl_sigaltstack
 # real failure (e.g. a genuine missing musl-gcc).
 ensure_ubin_or_skip test_u37_sigaltstack u_musl_sigaltstack musl_sigaltstack
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
 echo "[test_u37_sigaltstack] (1/4) Build userland + modules"

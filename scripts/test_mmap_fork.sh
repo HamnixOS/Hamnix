@@ -31,7 +31,7 @@ cd "$PROJ_ROOT"
 UBIN=tests/u-binary/u_mmap_fork
 ensure_ubin_or_skip test_mmap_fork u_mmap_fork mmap_fork
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
 echo "[test_mmap_fork] (1/4) Build userland (hamsh + helpers)"

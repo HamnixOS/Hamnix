@@ -33,7 +33,7 @@ UBIN=tests/u-binary/u_mmap
 # build it from tests/u-binary/src/mmap; only SKIP on a real failure.
 ensure_ubin_or_skip test_u7_mmap u_mmap mmap
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
 echo "[test_u7_mmap] (1/4) Build userland (hamsh + helpers)"

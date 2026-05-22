@@ -70,7 +70,7 @@ fi
 EXPECTED_VER="$(head -c 64 "$ROOTFS/etc/debian_version" | tr -d '\n')"
 echo "[test_distro_debian] expected /etc/debian_version='$EXPECTED_VER'"
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
 echo "[test_distro_debian] (1/4) Build userland (hamsh + distrorun)"

@@ -3,7 +3,7 @@
 # WHY THIS EXISTS
 #
 # The Hamnix kernel is now a HIGHER-HALF kernel: a true elf64-x86-64
-# ELF linked at 0xffffffff80000000 (see arch/x86/kernel/vmlinux.lds).
+# ELF linked at 0xffffffff80000000 (see arch/x86/kernel/kernel.lds).
 # QEMU's built-in `-kernel` multiboot1 loader REJECTS 64-bit ELFs
 # outright ("Cannot load x86-64 image, give a 32bit one") — it only
 # accepts ELFCLASS32. GRUB's multiboot1 ELF loader, by contrast,
@@ -33,7 +33,7 @@
 # USAGE (the function form, for callers that want an ISO explicitly)
 #
 #   . "$(dirname "$0")/_kernel_iso.sh"
-#   iso=$(kernel_iso /path/to/hamnix-vmlinux.elf)
+#   iso=$(kernel_iso /path/to/hamnix-kernel.elf)
 #   qemu-system-x86_64 -cdrom "$iso" ...
 
 # kernel_iso <kernel-elf> [iso-out]

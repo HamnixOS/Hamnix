@@ -37,7 +37,7 @@
 #   HIGH_RAM_BOOT_MEM       qemu -m value             (default: 6G)
 #   HIGH_RAM_BOOT_TIMEOUT   seconds                   (default: 30)
 #   HIGH_RAM_BOOT_KERNEL    kernel ELF                (default:
-#                                                      build/hamnix-vmlinux.elf)
+#                                                      build/hamnix-kernel.elf)
 #   HIGH_RAM_PGTAB_RE       pgtable-extension marker  (default below)
 #   HIGH_RAM_USER_RE        hamsh-ready marker        (default below)
 
@@ -48,7 +48,7 @@ cd "$PROJ_ROOT"
 
 HIGH_RAM_BOOT_MEM="${HIGH_RAM_BOOT_MEM:-6G}"
 HIGH_RAM_BOOT_TIMEOUT="${HIGH_RAM_BOOT_TIMEOUT:-30}"
-HIGH_RAM_BOOT_KERNEL="${HIGH_RAM_BOOT_KERNEL:-build/hamnix-vmlinux.elf}"
+HIGH_RAM_BOOT_KERNEL="${HIGH_RAM_BOOT_KERNEL:-build/hamnix-kernel.elf}"
 HIGH_RAM_PGTAB_RE="${HIGH_RAM_PGTAB_RE:-\[pgtable\] extended identity map}"
 HIGH_RAM_USER_RE="${HIGH_RAM_USER_RE:-\[hamsh\] M16.35 shell ready}"
 

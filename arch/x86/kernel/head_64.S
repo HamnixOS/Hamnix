@@ -37,7 +37,7 @@
     .globl  start_kernel_asm_entry
 start_kernel_asm_entry:
     /* Zero the high-half kernel BSS: [__bss_start, __bss_end). Both
-     * symbols are higher-half VMAs defined by vmlinux.lds; we run in
+     * symbols are higher-half VMAs defined by kernel.lds; we run in
      * the higher half, so leaq RIP-relative reaches them directly.
      * `rep stosq` — the linker aligns both ends to 8. */
     leaq    __bss_start(%rip), %rdi

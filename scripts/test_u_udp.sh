@@ -42,7 +42,7 @@ if ! command -v musl-gcc >/dev/null 2>&1; then
     exit 0
 fi
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 UBIN=tests/u-binary/u_udptest
 

@@ -30,7 +30,7 @@ UBIN=tests/u-binary/u_glibc_demo
 # failure (e.g. a genuine missing static glibc).
 ensure_ubin_or_skip test_u22_glibc_demo u_glibc_demo glibc_demo
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
 echo "[test_u22_glibc_demo] (1/4) Build userland (hamsh + helpers)"

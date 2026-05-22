@@ -35,7 +35,7 @@ set -uo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 SSHD_ELF=build/user/sshd.elf
 
 # --- pick a free host port -------------------------------------------

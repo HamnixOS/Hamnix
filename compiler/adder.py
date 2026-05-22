@@ -6,7 +6,7 @@ Usage:
     adder compile source.py --target=<target> -o output.elf
 
 Targets:
-    x86_64-bare-metal           Standalone kernel image (vmlinux-equivalent)
+    x86_64-bare-metal           Standalone kernel image (hamnix-kernel.elf)
     x86_64-linux-kernel-module  Emits .S for kbuild → .ko
     x86_64-adder-user           CPL-3 userspace ELF for the bare-metal kernel
 
@@ -32,7 +32,7 @@ from .codegen_x86 import generate as generate_x86, CodeGenError
 TARGETS = {
     "x86_64-linux-kernel-module": {"codegen": "x86", "kbuild": True,
                                    "bare_metal": False},
-    # Standalone x86_64 kernel ELF (vmlinux-equivalent). The compiler owns
+    # Standalone x86_64 kernel ELF (hamnix-kernel.elf). The compiler owns
     # assembly + link itself (no kbuild), and the codegen skips the .modinfo
     # license stamp that's only meaningful for loadable modules.
     "x86_64-bare-metal": {"codegen": "x86", "kbuild": False,
@@ -506,7 +506,7 @@ def assemble_and_link_x86_bare(asm_file: Path, output: Path,
 
     Combines the compiler-emitted .S (Adder init/main.py et al.) with the
     hand-written boot stubs under arch/x86/boot/header.S and
-    arch/x86/kernel/head_64.S, then links with arch/x86/kernel/vmlinux.lds
+    arch/x86/kernel/head_64.S, then links with arch/x86/kernel/kernel.lds
     into an ELF that multiboot1-capable loaders (QEMU -kernel, GRUB) accept.
 
     HIGHER-HALF KERNEL: this now produces a true `elf64-x86-64` ELF
@@ -528,7 +528,7 @@ def assemble_and_link_x86_bare(asm_file: Path, output: Path,
 
     boot_s = project_root / "arch/x86/boot/header.S"
     head_s = project_root / "arch/x86/kernel/head_64.S"
-    lds = project_root / "arch/x86/kernel/vmlinux.lds"
+    lds = project_root / "arch/x86/kernel/kernel.lds"
     for required in (boot_s, head_s, lds):
         if not required.exists():
             print(f"Error: missing {required}", file=sys.stderr)

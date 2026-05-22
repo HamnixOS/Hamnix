@@ -32,7 +32,7 @@ UBIN=tests/u-binary/u_musl_env
 # failure (e.g. a genuine missing musl-gcc).
 ensure_ubin_or_skip test_u17_env u_musl_env musl_env
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
 echo "[test_u17_env] (1/4) Build userland (hamsh + helpers)"

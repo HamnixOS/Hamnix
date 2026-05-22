@@ -32,7 +32,7 @@ UBIN=tests/u-binary/u_glibc_system
 # failure (e.g. a genuine missing static glibc).
 ensure_ubin_or_skip test_u26_fork u_glibc_system glibc_system
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
 echo "[test_u26_fork] (1/4) Build userland (hamsh + helpers)"

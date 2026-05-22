@@ -30,7 +30,7 @@ set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 
 echo "[test_net_https_lechain] (1/5) Generate 3-deep RSA chain"
 TMPDIR=$(mktemp -d -t hamnix-lechain-XXXXXX)

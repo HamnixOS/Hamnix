@@ -35,7 +35,7 @@ UBIN=tests/u-binary/u_glibc_thread
 # failure (e.g. a genuine missing static-pie glibc + libpthread.a).
 ensure_ubin_or_skip test_u28_glibc_thread u_glibc_thread glibc_thread
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
 echo "[test_u28_glibc_thread] (1/4) Build userland (hamsh + helpers)"

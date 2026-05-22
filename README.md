@@ -220,7 +220,7 @@ also `ovmf`.
 ```
 
 Compiles `init/main.ad` (plus imports), assembles + links into
-`build/hamnix-vmlinux.elf` — an `elf64-x86-64` kernel relocated to the
+`build/hamnix-kernel.elf` — an `elf64-x86-64` kernel relocated to the
 higher half (`0xffffffff80000000`). QEMU's multiboot1 `-kernel` loader
 can't load a 64-bit ELF, so the harness boots it via a BIOS-GRUB ISO
 (`scripts/_kernel_iso.sh`). Serial shows the boot banner, memblock
@@ -280,7 +280,7 @@ compiler/  (CPython-hosted; adder.py CLI dispatches by --target)
    │     │
    │     ├──► x86_64-bare-metal              (M16+ kernel)
    │     │    as --32 + ld -m elf_i386
-   │     │    ──► hamnix-vmlinux.elf
+   │     │    ──► hamnix-kernel.elf
    │     │    ──► QEMU/SeaBIOS/OVMF ──► long mode ──► start_kernel()
    │     │
    │     ├──► x86_64-adder-user              (user binaries)

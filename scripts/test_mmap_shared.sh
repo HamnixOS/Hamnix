@@ -33,7 +33,7 @@ cd "$PROJ_ROOT"
 UBIN=tests/u-binary/u_mmap_shared
 ensure_ubin_or_skip test_mmap_shared u_mmap_shared mmap_shared
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
 echo "[test_mmap_shared] (1/4) Build userland (hamsh + helpers)"

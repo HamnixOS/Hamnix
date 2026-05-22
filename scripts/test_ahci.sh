@@ -24,7 +24,7 @@ set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 
 echo "[test_ahci] (1/4) Build userland + modules + initramfs"
 bash scripts/build_user.sh >/dev/null

@@ -39,7 +39,7 @@ UBIN=tests/u-binary/u_access
 # build it from tests/u-binary/src/access; only SKIP on a real failure.
 ensure_ubin_or_skip test_u9_access u_access access
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
 echo "[test_u9_access] (1/4) Build userland (hamsh + helpers)"

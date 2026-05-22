@@ -40,7 +40,7 @@ UBIN=tests/u-binary/u_musl_argv
 # failure (e.g. a genuine missing musl-gcc).
 ensure_ubin_or_skip test_u16_argv u_musl_argv musl_argv
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
 echo "[test_u16_argv] (1/4) Build userland (hamsh + helpers)"

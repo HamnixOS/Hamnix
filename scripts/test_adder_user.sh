@@ -7,7 +7,7 @@
 #   1. Compile user/hello.ad -> build/user/hello.elf via the new target.
 #   2. Regenerate fs/initramfs_blob.S with INIT_ELF pointing at hello.elf
 #      so the cpio archive's /init is the Hamnix-compiled binary.
-#   3. Rebuild the kernel image (init/main.ad -> build/hamnix-vmlinux.elf).
+#   3. Rebuild the kernel image (init/main.ad -> build/hamnix-kernel.elf).
 #   4. Boot it under QEMU and capture the serial output.
 #   5. Grep the serial log for the hello.ad banner.
 #
@@ -20,7 +20,7 @@ PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
 mkdir -p build/user
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 # Use a distinct stem (`pyhello.elf`) so we don't collide with the
 # hand-written user/hello.S that scripts/build_user.sh ships as the
 # hello cpio entry (referenced by /init's SYS_EXECVE path).

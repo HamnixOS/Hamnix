@@ -31,7 +31,7 @@ set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 
 echo "[test_tcp_fin_wait2] (1/4) Build userland + initramfs (with /etc/tcp-finwait2-test marker)"
 bash scripts/build_user.sh >/dev/null

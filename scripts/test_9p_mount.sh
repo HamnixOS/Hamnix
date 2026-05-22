@@ -22,7 +22,7 @@ cd "$PROJ_ROOT"
 . "$PROJ_ROOT/scripts/_kernel_iso.sh"
 
 mkdir -p build
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 
 echo "[test_9p_mount] (1/3) Build userland (so the cpio archive is sane)"
 bash scripts/build_user.sh >/dev/null

@@ -28,7 +28,7 @@ UBIN=tests/u-binary/u_glibc_idprobe
 # failure (e.g. a genuine missing static glibc).
 ensure_ubin_or_skip test_u21_glibc_idprobe u_glibc_idprobe glibc_idprobe
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
 echo "[test_u21_glibc_idprobe] (1/4) Build userland (hamsh + helpers)"

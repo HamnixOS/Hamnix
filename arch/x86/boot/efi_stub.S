@@ -24,7 +24,7 @@
  *      b. BootServices->HandleProtocol(DeviceHandle, &SfspGuid) to get
  *         the Simple File System Protocol on that device.
  *      c. SFSP->OpenVolume() to get the volume root EFI_FILE_PROTOCOL.
- *      d. root->Open(L"\\hamnix-vmlinux.elf", READ) to get the kernel
+ *      d. root->Open(L"\\hamnix-kernel.elf", READ) to get the kernel
  *         ELF file handle.
  *      e. BootServices->AllocatePool(32 MiB) for a scratch buffer.
  *      f. kernel_file->Read(buffer) — pulls the entire ELF into memory.
@@ -100,7 +100,7 @@
  *        runtime via SFSP — this commit (PATH A).
  *
  *   (B2) LMA/VMA SPLIT IN .ap_trampoline. The kernel's
- *        arch/x86/kernel/vmlinux.lds places .ap_trampoline at
+ *        arch/x86/kernel/kernel.lds places .ap_trampoline at
  *        VMA=0x8000 (SIPI delivery target) but LMA next to .data.
  *        ELF PT_LOAD's p_paddr vs p_vaddr cleanly expresses this;
  *        PE/COFF can't. PATH A preserves the ELF format and the
@@ -153,7 +153,7 @@
     .equ MULTIBOOT1_MAGIC,      0x1BADB002
 
     /* ELF constants (elf64-x86-64 layout — the Hamnix kernel is now a
-     * true 64-bit higher-half ELF; see arch/x86/kernel/vmlinux.lds). */
+     * true 64-bit higher-half ELF; see arch/x86/kernel/kernel.lds). */
     .equ EI_MAG0,           0
     .equ ELFMAG0,           0x7f
     .equ ELFMAG1,           0x45    /* 'E' */
@@ -254,7 +254,7 @@ efi_main:
     testq   %rax, %rax
     jnz     .Lefi_elfload_fail
 
-    /* ----- 4d. Root->Open(L"\\hamnix-vmlinux.elf", READ, 0, &File) -
+    /* ----- 4d. Root->Open(L"\\hamnix-kernel.elf", READ, 0, &File) -
      *
      * EFI_FILE_PROTOCOL.Open is at offset 8.
      * Signature:
@@ -426,7 +426,7 @@ efi_main:
      *
      * Why scan instead of hard-coding 0x100000+offset:
      *   - The kernel image's first PT_LOAD currently starts at
-     *     0x100000 (vmlinux.lds: `. = 0x100000;`). If that ever moves
+     *     0x100000 (kernel.lds: `. = 0x100000;`). If that ever moves
      *     (e.g. a future higher-half layout), or if the multiboot
      *     header gets repositioned within .head.text, a fixed offset
      *     silently breaks. The scan-for-magic idiom is exactly how
@@ -997,8 +997,8 @@ gop_guid:
      * the high half of the UCS-2 unit. */
 kernel_path_w:
     .short  '\\', 'h', 'a', 'm', 'n', 'i', 'x', '-'
-    .short  'v', 'm', 'l', 'i', 'n', 'u', 'x', '.'
-    .short  'e', 'l', 'f', 0
+    .short  'k', 'e', 'r', 'n', 'e', 'l', '.', 'e'
+    .short  'l', 'f', 0
 
     /* GDT (3 entries, mirrors arch/x86/boot/header.S's gdt64). The
      * GDT entries are all immediate constants so they need no PE

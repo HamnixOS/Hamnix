@@ -7,7 +7,7 @@
  * jump into the Hamnix-side `ap_main_64` landing function.
  *
  * The trampoline is linked with VMA=0x8000 but LMA inside the loaded
- * kernel image (see vmlinux.lds). The BSP memcpys the bytes to 0x8000
+ * kernel image (see kernel.lds). The BSP memcpys the bytes to 0x8000
  * before sending SIPI, so by the time the AP runs them the symbol
  * addresses (which the linker resolved against VMA=0x8000) actually
  * reach valid memory.

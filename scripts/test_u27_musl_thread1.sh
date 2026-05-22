@@ -12,7 +12,7 @@ UBIN=tests/u-binary/u_musl_thread1
 # build failure.
 ensure_ubin_or_skip test_u27_musl_thread1 u_musl_thread1 musl_thread1
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
 bash scripts/build_user.sh >/dev/null

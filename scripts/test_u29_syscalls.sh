@@ -24,7 +24,7 @@ UBIN=tests/u-binary/u_musl_syscalls
 # failure (e.g. a genuine missing musl-gcc).
 ensure_ubin_or_skip test_u29_syscalls u_musl_syscalls musl_syscalls
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
 echo "[test_u29_syscalls] (1/4) Build userland"

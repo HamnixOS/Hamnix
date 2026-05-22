@@ -50,7 +50,7 @@ PY
 )
 echo "[test_u_socket] using host port $PORT"
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 UBIN=tests/u-binary/u_socktest
 

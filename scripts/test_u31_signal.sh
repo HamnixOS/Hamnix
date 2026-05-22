@@ -22,7 +22,7 @@ UBIN=tests/u-binary/u_musl_signal
 # failure (e.g. a genuine missing musl-gcc).
 ensure_ubin_or_skip test_u31_signal u_musl_signal musl_signal
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
 echo "[test_u31_signal] (1/4) Build userland (hamsh + helpers)"

@@ -45,7 +45,7 @@ cd "$PROJ_ROOT"
 # shellcheck source=_build_lock.sh
 source "$PROJ_ROOT/scripts/_build_lock.sh"
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 
 # --- QEMU EHCI availability check ------------------------------------
 if ! qemu-system-x86_64 -device help 2>/dev/null | grep -q -i "usb-ehci"; then
