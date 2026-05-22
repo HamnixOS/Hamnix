@@ -300,47 +300,24 @@ sys_socketpair:
     .size sys_socketpair, .-sys_socketpair
 
 
-    /* --- sys_socket(domain, type, protocol) -> int32 ----------------
-     * U-socket: native-ABI entry point to the same socket(2) bridge
-     * the Linux ABI exposes at number 41. A native Adder user binary
-     * (built with this runtime.S) reaches the in-kernel TCP stack via
-     * SYS_SOCKET (41) -> _u_socket in arch/x86/kernel/syscall.ad. V0
-     * supports AF_INET + SOCK_STREAM only. SysV first three arg regs
-     * (%rdi/%rsi/%rdx) align with the syscall ABI's a0/a1/a2 — no
-     * shuffle needed. */
-    .globl sys_socket
-    .type sys_socket, @function
-sys_socket:
-    movq    $41, %rax               /* SYS_SOCKET */
-    syscall
-    ret
-    .size sys_socket, .-sys_socket
-
-
-    /* --- sys_connect(fd, addr, addrlen) -> int32 --------------------
-     * U-socket: native-ABI connect(2). Drives a real TCP active open
-     * through drivers/net/tcp.ad via SYS_CONNECT (42) -> _u_connect.
-     * `addr` points at a 16-byte struct sockaddr_in. Three args fit
-     * the SysV/syscall-ABI overlap directly. */
-    .globl sys_connect
-    .type sys_connect, @function
-sys_connect:
-    movq    $42, %rax               /* SYS_CONNECT */
-    syscall
-    ret
-    .size sys_connect, .-sys_connect
-
-
-    /* --- RETIRED: sys_sock_bind / sys_listen / sys_accept -----------
-     * ARCH §10: the native server-side socket syscalls SYS_BIND_SOCK
-     * (49) / SYS_LISTEN_SOCK (50) / SYS_ACCEPT_SOCK (43) are RETIRED.
-     * bind()/listen()/accept() are BSD/Linux concepts — Hamnix Layer 1
-     * is Plan-9-shaped, so networking is the /net file tree, NOT a
-     * socket syscall family. Native servers now announce + accept by
-     * open/read/write on /net/tcp via user/net9.ad's net_announce /
-     * net_accept (which use sys_open / sys_read / sys_write). The
-     * wrapper stubs that issued syscalls 49/50/43 are gone with them;
-     * those numbers are unassigned in the native dispatch table. */
+    /* --- RETIRED: sys_socket / sys_connect / sys_tls_connect --------
+     * --- and sys_sock_bind / sys_listen / sys_accept ----------------
+     * ARCH §10: ALL native BSD socket syscalls are RETIRED. Hamnix
+     * Layer 1 is Plan-9-shaped — networking is the /net file tree, NOT
+     * a socket() syscall family:
+     *   SYS_SOCKET (41), SYS_CONNECT (42)        — active open
+     *   SYS_ACCEPT_SOCK (43)                     — passive accept
+     *   SYS_BIND_SOCK (49), SYS_LISTEN_SOCK (50) — passive open
+     *   SYS_TLS_CONNECT                          — TLS handshake
+     * Native Adder binaries dial / announce / accept / TLS-upgrade by
+     * open/read/write on /net/tcp via user/net9.ad — net_dial /
+     * net_dial_tls / net_announce / net_accept (built on sys_open /
+     * sys_read / sys_write). A TLS connection is dialed by net_dial_tls,
+     * which writes a `connect` then a `tls <host>` ctl command; the
+     * latter runs the in-kernel TLS 1.3 handshake over the connection.
+     * The wrapper stubs that issued those syscall numbers are gone
+     * with them; the numbers are unassigned in the native dispatch
+     * table (arch/x86/kernel/syscall.ad). */
 
 
     /* --- sys_resolve(hostname, len) -> int64 ------------------------
@@ -360,25 +337,13 @@ sys_resolve:
     .size sys_resolve, .-sys_resolve
 
 
-    /* --- sys_tls_connect(fd, hostname, hostlen) -> int32 -------------
-     * U-TLS: native-ABI tls_connect(2). Takes a socket fd that has
-     * already been connect(2)'d and runs the in-kernel TLS 1.3
-     * handshake (drivers/net/tls.ad) over its TCP slot via
-     * SYS_TLS_CONNECT (277) -> _u_tls_connect. `hostname` (%rsi) is a
-     * NUL-terminated string used for SNI + the leaf-cert name check;
-     * `hostlen` (%rdx) is its byte length. On success the fd becomes
-     * TLS-active: subsequent sys_write / sys_read transparently route
-     * through the TLS record layer, and sys_close sends a close_notify
-     * alert. Returns 0 on success or a negative errno (-71 == EPROTO,
-     * the TLS handshake / certificate validation failed). The three
-     * args fit the SysV/syscall-ABI overlap directly — no shuffle. */
-    .globl sys_tls_connect
-    .type sys_tls_connect, @function
-sys_tls_connect:
-    movq    $277, %rax              /* SYS_TLS_CONNECT */
-    syscall
-    ret
-    .size sys_tls_connect, .-sys_tls_connect
+    /* --- RETIRED: sys_tls_connect -----------------------------------
+     * ARCH §10: SYS_TLS_CONNECT is RETIRED with the rest of the BSD
+     * socket syscalls — see the retirement note above sys_resolve.
+     * Native code does TLS the Plan 9 way: net_dial_tls (user/net9.ad)
+     * writes a `tls <host>` ctl command to a connected /net/tcp conn,
+     * which runs the in-kernel TLS 1.3 handshake over the connection.
+     * Syscall number 277 is unassigned in the dispatch table. */
 
 
     /* --- sys_kill(pid, sig) -> int32 ---------------------------------

@@ -1,20 +1,23 @@
 #!/usr/bin/env bash
-# scripts/test_u_tls.sh — U-TLS: first userland HTTPS request.
+# scripts/test_u_tls.sh — U-TLS: userland HTTPS over the /net file tree.
 #
 # Proves a native-Adder user binary can complete an HTTPS request end
-# to end — socket() / connect() / tls_connect() / write(an HTTPS GET) /
-# read(the decrypted response) / close() — with the TLS 1.3 handshake
-# (X25519 + server cert-chain validation against the kernel CA store +
+# to end the Plan-9 way — net_dial_tls (clone /net/tcp + a `connect`
+# then a `tls <host>` ctl command) / write(an HTTPS GET) / read(the
+# decrypted response) / close() — with the TLS 1.3 handshake (X25519 +
+# server cert-chain validation against the kernel CA store +
 # CertificateVerify transcript binding) and the record-layer encrypt /
-# decrypt all mediated by the kernel.
+# decrypt all mediated by the kernel. ARCH §10: Layer 1 exposes ZERO
+# BSD socket syscalls — there is no socket() / connect() / tls_connect().
 #
-# The new piece under test:
-#   * tls_connect(2) — SYS_TLS_CONNECT (277) -> _u_tls_connect in
-#     linux_abi/u_syscalls.ad. Takes a connected socket fd through the
-#     in-kernel TLS 1.3 handshake (drivers/net/tls.ad).
-#   * the per-fd TLS-active flag in fs/socket_state.ad.
-#   * the TLS-routing read/write/close arms in fs/vfs.ad — once the fd
-#     is TLS-active, write() encrypts and read() decrypts transparently.
+# The piece under test:
+#   * the `tls <host>` ctl command — devnet_ctl's `tls` arm in
+#     drivers/net/devnet.ad runs the in-kernel TLS 1.3 handshake
+#     (drivers/net/tls.ad) over a connected /net/tcp connection.
+#   * the per-conn netc_tls flag in drivers/net/devnet.ad.
+#   * the TLS-routing read/write/close arms in fs/vfs.ad's FD_NET_MARK
+#     dispatch — once the conn is TLS-active, write() encrypts and
+#     read() decrypts transparently.
 #
 # Strategy mirrors scripts/test_net_https.sh's TLS-server fixture:
 #
@@ -30,13 +33,12 @@
 #   4. Embed user/u_tlstest.ad as /init and boot QEMU with
 #      -netdev user,guestfwd=tcp:10.0.2.200:443-tcp:127.0.0.1:9444 so
 #      the guest's 10.0.2.200:443 routes to the host TLS server.
-#   5. u_tlstest does socket()->connect(10.0.2.200:443)->tls_connect()
-#      ->write(GET)->read(decrypted response)->close(). It prints
-#      markers; we assert them.
+#   5. u_tlstest does net_dial_tls(10.0.2.200:443)->write(GET)->read(
+#      decrypted response)->close(). It prints markers; we assert them.
 #
 # Required markers (all must appear):
-#   "[u_tlstest] connect rc=0"
-#   "[u_tlstest] tls_connect rc=0"
+#   "[u_tlstest] TLS connection up over /net"
+#   "[u_tlstest] encrypted GET sent"
 #   "[u_tlstest] body=HTTP/..."
 #   "[u_tlstest] PASS"
 # AND the in-kernel TLS stack must log "[tls] cert chain validated"
@@ -232,8 +234,8 @@ echo "[test_u_tls] --- end srv ---"
 
 fail=0
 for needle in \
-    "[u_tlstest] connect rc=0" \
-    "[u_tlstest] tls_connect rc=0" \
+    "[u_tlstest] TLS connection up over /net" \
+    "[u_tlstest] encrypted GET sent" \
     "[u_tlstest] PASS"
 do
     if grep -F -q "$needle" "$LOG"; then
@@ -285,4 +287,4 @@ if [ "$fail" -ne 0 ]; then
 fi
 
 echo "[test_u_tls] PASS — native user binary completed an HTTPS request" \
-     "via socket/connect/tls_connect/write/read/close"
+     "via net_dial_tls (TLS over the /net file tree) / write / read / close"
