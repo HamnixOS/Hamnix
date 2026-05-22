@@ -707,6 +707,21 @@ ps_pos:   uint64 = 0
 ps_error: int32 = 0
 ps_errmsg: Array[64, uint8]
 
+# Recursion-depth guard. The parser is recursive-descent; deeply
+# nested input (`{ { { ... } } }`, `(((...)))`, `[[[...]]]`) recurses
+# the C stack one frame per level — and every nesting level of an
+# expression burns the WHOLE precedence-climbing chain
+# (parse_expr -> or -> and -> cmp -> add -> mul -> unary -> postfix
+# -> primary), each frame carrying parse-state Array locals. On the
+# 256 KiB user stack that overflows past ~16 levels, and a parser
+# stack fault corrupts adjacent BSS arenas — so the guard MUST trip
+# well before then. parse_statement / parse_expr bump ps_depth on
+# entry; past PS_DEPTH_MAX they raise a clean "nested too deep" parse
+# error instead of recursing. 12 is proven non-corrupting and is far
+# deeper than any real interactive line or rc script nests.
+ps_depth:     int32 = 0
+PS_DEPTH_MAX: int32 = 12
+
 
 def ps_set_err(msg: Ptr[uint8]):
     if ps_error != 0:
@@ -869,7 +884,17 @@ def _is_continuation_keyword(idx: uint64) -> int32:
 #              | IDENT '(' args ')'
 
 def parse_expr() -> int32:
-    return parse_or()
+    # Depth-guarded entry to the expression grammar. Every nested
+    # sub-expression ( ( ) / [ ] / dict / call args ) re-enters here,
+    # so the guard here catches adversarial deep nesting before the C
+    # stack overflows.
+    if ps_depth >= PS_DEPTH_MAX:
+        ps_set_err("expression nested too deep")
+        return 0
+    ps_depth = ps_depth + 1
+    r: int32 = parse_or()
+    ps_depth = ps_depth - 1
+    return r
 
 
 def parse_or() -> int32:
@@ -1269,6 +1294,9 @@ def parse_pipeline() -> int32:
         pk_advance()
         st: int32 = parse_simple_command()
         nd_kid_push(pl, st)
+        if nd_kn[cast[uint64](pl)] > PIPE_STAGE_MAX:
+            ps_set_err("too many pipeline stages")
+            return pl
     return pl
 
 
@@ -1475,6 +1503,20 @@ def parse_assignment() -> int32:
 
 
 def parse_statement() -> int32:
+    # Depth-guarded entry. Blocks nest one parse_statement frame per
+    # `{`, so an adversarial `{ { { ... } } }` would recurse the C
+    # stack without bound — the guard turns that into a clean parse
+    # error well before a stack fault.
+    if ps_depth >= PS_DEPTH_MAX:
+        ps_set_err("statement nested too deep")
+        return 0
+    ps_depth = ps_depth + 1
+    r: int32 = _parse_statement_body()
+    ps_depth = ps_depth - 1
+    return r
+
+
+def _parse_statement_body() -> int32:
     # The load-bearing §2 dispatch. Decided DETERMINISTICALLY from the
     # first token — never by a heuristic.
     _skip_newlines()
@@ -1515,6 +1557,18 @@ def parse_statement() -> int32:
     # 2. assignment.
     if _looks_like_assignment() != 0:
         return parse_assignment()
+    # 2b. a bare function call as a statement — `name(args)`. A `def`'d
+    # function must be callable on its own line (an rc/init script
+    # calls helper functions for effect); `name(` glued is unambiguous
+    # — it is not an assignment and never a real command (command
+    # words don't carry a glued `(`). This parses the whole call
+    # expression so trailing `)` cannot leak into the next statement.
+    if k == TK_WORD and ps_pos + 1 < TOK_MAX \
+            and tok_kind[ps_pos + 1] == TK_OP \
+            and tok_int[ps_pos + 1] == cast[int64](OP_LPAREN):
+        es: int32 = nd_new(ND_EXPRSTMT)
+        nd_a[cast[uint64](es)] = parse_expr()
+        return es
     # 3. command (with && / || / pipeline chaining).
     lhs: int32 = parse_pipeline()
     while pk_is_op(OP_AND) != 0 or pk_is_op(OP_OR) != 0:
@@ -1527,6 +1581,17 @@ def parse_statement() -> int32:
         nd_a[cast[uint64](n)] = lhs
         nd_b[cast[uint64](n)] = rhs
         lhs = n
+    # A well-formed statement ends at a separator: TK_NEWLINE (the
+    # lexer emits it for both '\n' and ';'), TK_EOF, or a '}' closing
+    # the enclosing block. Anything else left at the cursor — a stray
+    # ')' / ']', a bare operator — is a malformed statement. Flag it
+    # HERE with a clean message rather than letting the leftover token
+    # cascade into a spurious "empty command" on the next statement.
+    if ps_error == 0:
+        lk: int32 = pk_kind()
+        if lk != TK_NEWLINE and lk != TK_EOF \
+                and pk_is_op(OP_RBRACE) == 0:
+            ps_set_err("unexpected token after command")
     return lhs
 
 
@@ -1535,6 +1600,7 @@ def parse_program() -> int32:
     ps_pos = 0
     ps_error = 0
     ps_errmsg[0] = 0
+    ps_depth = 0
     n: int32 = nd_new(ND_BLOCK)
     _skip_newlines()
     while pk_kind() != TK_EOF:
@@ -3089,9 +3155,13 @@ def run_one_command(cmdnode: int32, in_pipe: int32, out_pipe: int32,
     return run_one_command_x(cmdnode, in_pipe, out_pipe, do_wait, 0)
 
 
-# pipeline stage bookkeeping.
-pl_pids:  Array[8, int32]
-pl_pipe:  Array[8, int32]      # inter-stage pipe SLOT ids
+# pipeline stage bookkeeping. PIPE_STAGE_MAX caps how many `|`-joined
+# stages one pipeline may have; parse_pipeline rejects more with a
+# clean parse error, and run_pipeline clamps defensively so a stage
+# count past the arrays can never corrupt memory.
+PIPE_STAGE_MAX: uint64 = 64
+pl_pids:  Array[64, int32]
+pl_pipe:  Array[64, int32]     # inter-stage pipe SLOT ids
 
 
 def run_pipeline(plnode: int32) -> int32:
@@ -3105,6 +3175,11 @@ def run_pipeline(plnode: int32) -> int32:
         return 0
     if nstages == 1:
         return run_one_command(nd_kid_at(plnode, 0), -1, -1, 1)
+    # Defensive clamp: parse_pipeline already rejects an over-long
+    # pipeline, but never index pl_pipe / pl_pids past their bounds.
+    if nstages > PIPE_STAGE_MAX:
+        errstr_set("pipe: too many stages")
+        return 1
     # Create N-1 pipe Chans up front.
     npipes: uint64 = nstages - 1
     pi: uint64 = 0
@@ -3248,6 +3323,22 @@ def _run_and_capture(cmdnode: int32) -> uint64:
 # Statement execution
 # ====================================================================
 
+# Call-depth guard. A user `def` can call itself; an unbounded
+# recursion (`def f() { f() }`) would recurse the C stack and fault.
+# Each hamsh call level burns a DEEP chain of native frames
+# (call_user_fn -> exec_block -> exec_statement -> eval_call ->
+# call_user_fn ...), each carrying sizable Array locals — empirically
+# ~14 KiB of the 256 KiB user stack PER hamsh recursion level. Past
+# ~16 levels the stack faults, and a fault mid-recursion corrupts the
+# argv arena, which then feeds a garbage slot into a pipe syscall
+# (observed as a kernel slab bad-free). 12 keeps a wide safety margin
+# while still allowing real recursion; past it the call is refused
+# (nil + errstr) so the evaluator unwinds cleanly and the prompt
+# survives. A non-recursive evaluator would lift this — out of scope.
+call_depth:     int32 = 0
+CALL_DEPTH_MAX: int32 = 12
+
+
 def call_user_fn(nameref: uint64, callnode: int32) -> int32:
     # Look up a user-defined function; bind args into a fresh frame;
     # run the body; return its value.
@@ -3260,6 +3351,10 @@ def call_user_fn(nameref: uint64, callnode: int32) -> int32:
             break
         fi = fi + 1
     if found < 0:
+        return 0
+    if call_depth >= CALL_DEPTH_MAX:
+        errstr_set("call: recursion too deep")
+        eval_status = 1
         return 0
     defnode: int32 = fn_node[cast[uint64](found)]
     dnu: uint64 = cast[uint64](defnode)
@@ -3283,7 +3378,9 @@ def call_user_fn(nameref: uint64, callnode: int32) -> int32:
             scope_set(pname, 0)
         pi = pi + 1
     eval_retval = 0
+    call_depth = call_depth + 1
     ex: int32 = exec_block(nd_b[dnu])
+    call_depth = call_depth - 1
     rv: int32 = 0
     if ex == EX_RETURN:
         rv = eval_retval
@@ -4019,6 +4116,10 @@ def run_source(buf: Ptr[uint8], n: uint64) -> int32:
     # a silent no-op — skip lex/parse/exec entirely.
     if _line_is_blank(buf, n) != 0:
         return 0
+    # Each top-level line starts with the call-depth counter clear —
+    # a previous line that erred out mid-recursion must not leave the
+    # guard tripped for the next line.
+    call_depth = 0
     _maybe_recycle_arenas()
     if lex_line(buf, n) < 0:
         write_cstr1("hamsh: lexical error (unterminated quote)\n")
