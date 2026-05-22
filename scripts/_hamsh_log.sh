@@ -30,18 +30,23 @@
 
 # _ho_outlines <logfile> — emit just the command-output lines (drop any
 # line carrying a shell prompt, i.e. input being echoed back).
+#
+# `-a` forces text mode: a QEMU serial log carries raw terminal-control
+# bytes (ANSI escapes, the editor's CR repaints) that grep otherwise
+# samples as "binary", whereupon it suppresses ALL output — silently
+# turning every assertion into a false "absent". -a keeps it line-wise.
 _ho_outlines() {
-    grep -vE 'hamsh\$|\] > ' "$1" 2>/dev/null || true
+    grep -a -vE 'hamsh\$|\] > ' "$1" 2>/dev/null || true
 }
 
 # hamsh_ran <logfile> <marker> — succeeds iff <marker> appears in
 # genuine command output (not merely typed at the prompt).
 hamsh_ran() {
-    _ho_outlines "$1" | grep -F -q "$2"
+    _ho_outlines "$1" | grep -a -F -q "$2"
 }
 
 # hamsh_ran_count <logfile> <marker> — number of command-output lines
 # containing <marker>.
 hamsh_ran_count() {
-    _ho_outlines "$1" | grep -F -c "$2" || true
+    _ho_outlines "$1" | grep -a -F -c "$2" || true
 }
