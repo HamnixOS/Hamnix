@@ -28,7 +28,6 @@ FILES = [
     ("/motd",       b"Welcome to Hamnix from a real cpio initramfs!\n"
                     b"This file came out of a newc-formatted blob.\n"),
     ("/version",    b"Hamnix bare-metal kernel, M16.30 - ELF /init loader\n"),
-    ("/hello.txt",  b"Hello from a third file. cpio supports many.\n"),
 ]
 
 # Optional opt-in markers controlled by env vars. Used by per-test
