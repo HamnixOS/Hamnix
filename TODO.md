@@ -311,9 +311,13 @@ Everything in §5 is Layer-2-only per the boundary law.
   - [x] Full interactive line editor (`df27310`) — Left/Right/Home/
     End/Delete cursor editing, cursor-aware backspace, Up/Down history
     (48-entry ring), Ctrl-A/E/C, ANSI-escape state machine.
-  - Known follow-ups: nested `` `{ } `` command-substitution clobbers
-    (`&&`/`||` around `ns` blocks is being addressed in the namespace-
-    ergonomics pass).
+  - [x] `distrorun` retired (`1cdc34f`) — the Linux runtime is a
+    captured `ns {}` value in `/etc/rc.boot`; running a Linux binary is
+    `enter linuxruntime { … }`. `&&`/`||` now chains `ns`/`enter`/`spawn`.
+  - Known follow-up: nested `` `{ } `` command-substitution clobbers.
+  - [~] REGRESSION (being fixed): dynamic-ELF / glibc Linux binaries
+    fault the kernel (`vec=0xe` @ ~`0xffffffff801d06xx`) — `test_u26_fork`/
+    `test_u43`/glibc-thread; musl-static is fine. Blocks the §4 capstone.
 - CPython: trim the frozen stdlib set; PGO/LTO; C extensions (`_ssl`,
   `_socket`, ...) once a U-track `ld.so` exists.
 - busybox `ls` enumeration XFAIL (musl DIR-fd round-trip) — re-confirm
