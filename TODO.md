@@ -286,13 +286,15 @@ Everything in §5 is Layer-2-only per the boundary law.
   Remaining: run `apt install` itself under `nsrun`; ext4-backed
   distrofs for reboot persistence; streaming xz + larger `.deb`/index
   caps for big packages.
-- hamsh: superseded by the clean-sheet rewrite — see
-  `docs/HAMSH_SPEC.md` (two-mode command/expression shell, pipes-as-
-  Chans, `ns`/`enter`/`spawn` namespace verbs, errstr `try/catch`).
-  The line-editor / argv-tokenization polish is folded into that
-  rewrite. Open design point: the expression sublanguage should be a
-  small self-contained dynamically-typed evaluator with Adder-like
-  syntax, NOT embedded Adder semantics (pending user sign-off).
+- hamsh clean-sheet rewrite (`docs/HAMSH_SPEC.md`) — §18 stages 1–8
+  + 11 LANDED (`183fc4a`): single Python-flavored language; `/fd` (`#d`)
+  + `/env` devices; pipe/redirect/dup as the one `sys_fdbind` primitive;
+  `ns`/`enter`/`spawn`; errstr `try`/`except`.
+  **Maturation pending (do before init-in-hamsh, per user):**
+  empty/blank command line must be a no-op (currently a parse error);
+  fix the stale `test_apt_nsrun.sh` (its serial-drive was tuned to the
+  old shell); §18 stages 9 (view-vs-state) + 10 (mount handles / union
+  mounts); general hardening + polish.
 - CPython: trim the frozen stdlib set; PGO/LTO; C extensions (`_ssl`,
   `_socket`, ...) once a U-track `ld.so` exists.
 - busybox `ls` enumeration XFAIL (musl DIR-fd round-trip) — re-confirm
