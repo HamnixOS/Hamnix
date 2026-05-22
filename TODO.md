@@ -285,15 +285,18 @@ Everything in §5 is Layer-2-only per the boundary law.
   Remaining: run `apt install` itself under `nsrun`; ext4-backed
   distrofs for reboot persistence; streaming xz + larger `.deb`/index
   caps for big packages.
-- hamsh clean-sheet rewrite (`docs/HAMSH_SPEC.md`) — §18 stages 1–8,
-  10, 11 LANDED (`183fc4a`, `dcabf01`): single Python-flavored language;
-  `/fd` (`#d`) + `/env` devices; pipe/redirect/dup as the one
-  `sys_fdbind` primitive; `ns`/`enter`/`spawn`; errstr `try`/`except`;
-  mount handles + union mounts. Maturation done: blank-line no-op,
-  glued-`:` URL lexer fix, old-test triage, hardening.
-  **Remaining before init-in-hamsh (per user — shell must fully
-  mature):** §18 stage 9 (view-vs-state) — now unblocked by distrofs
-  persistence (`ea22407`); a final polish/robustness pass.
+- hamsh clean-sheet rewrite (`docs/HAMSH_SPEC.md`) — **§18 stages
+  1–11 all LANDED** (`183fc4a`, `dcabf01`, `72853f4`): single
+  Python-flavored language; `/fd` (`#d`) + `/env` devices;
+  pipe/redirect/dup as the one `sys_fdbind` primitive; `ns`/`enter`/
+  `spawn`; mount handles + union mounts; view-vs-state over a posted
+  distrofs daemon; errstr `try`/`except`. Maturation done: lexer fixes,
+  old-test triage, recursion/nesting guards, robustness pass. The
+  shell is matured — **init-in-hamsh is now unblocked.**
+  - Open: no interactive line editor (no arrow keys/history) — spec
+    has none; pending user decision whether to add one.
+  - Known follow-ups: `enter`/`ns`/`spawn` blocks don't chain with
+    `&&`/`||`; nested `` `{ } `` command-substitution clobbers.
 - CPython: trim the frozen stdlib set; PGO/LTO; C extensions (`_ssl`,
   `_socket`, ...) once a U-track `ld.so` exists.
 - busybox `ls` enumeration XFAIL (musl DIR-fd round-trip) — re-confirm
