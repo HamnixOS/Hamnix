@@ -292,9 +292,13 @@ Everything in §5 is Layer-2-only per the boundary law.
   `spawn`; mount handles + union mounts; view-vs-state over a posted
   distrofs daemon; errstr `try`/`except`. Maturation done: lexer fixes,
   old-test triage, recursion/nesting guards, robustness pass. The
-  shell is matured — **init-in-hamsh is now unblocked.**
-  - Open: no interactive line editor (no arrow keys/history) — spec
-    has none; pending user decision whether to add one.
+  shell is matured.
+  - [x] **init/rc in hamsh** (`341af32`): `/init` execs hamsh with
+    `/etc/rc.boot`; hamsh is PID 1, the boot namespace recipe + service
+    launch are declarative hamsh rc. Hard-coded `user/init.S`/`init2.ad`
+    deleted.
+  - [~] Full interactive line editor (user-approved) — Left/Right/
+    Delete cursor editing + Up/Down command history; in flight.
   - Known follow-ups: `enter`/`ns`/`spawn` blocks don't chain with
     `&&`/`||`; nested `` `{ } `` command-substitution clobbers.
 - CPython: trim the frozen stdlib set; PGO/LTO; C extensions (`_ssl`,
