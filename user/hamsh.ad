@@ -1,32 +1,39 @@
 # user/hamsh.ad
 #
-# Hamnix shell — the first interactive user program in Hamnix. Reads
-# a line from stdin, tokenises on whitespace, dispatches to a builtin
-# (exit / help) or spawns the named external command from the cpio
-# initramfs via SYS_SPAWN + SYS_WAITPID. Mirrors a stripped-down bash
-# main loop:
+# hamsh — the Hamnix shell. Clean-sheet rewrite per docs/HAMSH_SPEC.md.
 #
-#   while read line:
-#       argv = tokenize(line)
-#       if argv[0] in builtins: run it inline
-#       else: pid = spawn(argv[0], argv); waitpid(pid)
+# hamsh is ONE language: a Python-flavored syntax with C-style `{ }`
+# blocks, its OWN small dynamically-typed tree-walking evaluator. It is
+# NOT Adder — it shares no grammar, type system, or evaluator with the
+# Adder compiler. There is no compile step, no separate expression mode.
 #
-# Constraints baked into M16.34 / M16.35:
-#   - 16550 RX has no kernel-side software buffer; piped input loses
-#     bytes past ~16 chars during boot. Interactive typing is fine.
-#   - sys_spawn looks up the path in the cpio archive verbatim — there
-#     is no PATH search, so commands must start with '/'.
-#   - argv is passed as a NULL-terminated Ptr[uint64] (each slot is a
-#     Ptr[char] cast to uint64). The kernel copies the strings onto
-#     the new task's user stack and stages argc/argv in %rdi/%rsi for
-#     _start; main() picks them up as ordinary SysV first-two args.
+# Statement dispatch is deterministic from the first token of a
+# top-level line (HAMSH_SPEC §2):
+#   1. control construct  — first token a statement keyword
+#                           (if while for def return break continue
+#                            try ns enter spawn)
+#   2. assignment         — IDENT (= += -= ...) ... at top level
+#   3. command            — first token is the command word; bare
+#                           words are literal strings.
+#
+# The one idea everything reduces to (§0): a named channel in a scoped
+# namespace. Stdio, pipes, redirects, dup are all "bind a Chan at an
+# /fd/N name". The shell is the UI for Phase D's chan/namespace model.
+#
+# Architecture (no malloc in Hamnix userland — module-scope arenas):
+#   * lexer      — tok_*  arrays: a flat token stream for one line.
+#   * parser     — nd_*   arrays: an AST node arena (recursive descent).
+#   * evaluator  — val_*  arrays: a dynamically-typed value heap, plus
+#                  a small variable-binding scope stack.
 #
 # Build:
 #   python3 -m compiler.adder compile --target=x86_64-adder-user \
 #       user/hamsh.ad -o build/user/hamsh.elf
 
+# --- syscalls -------------------------------------------------------
 extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_spawn(path: Ptr[char], argv: Ptr[uint64],
                      stdin_fd: int32, stdout_fd: int32,
                      envp: Ptr[uint64]) -> int32
@@ -35,191 +42,92 @@ extern def sys_open(path: Ptr[char]) -> int32
 extern def sys_open_write(path: Ptr[char]) -> int32
 extern def sys_close(fd: int32) -> int32
 extern def sys_pipe(fds: Ptr[int32]) -> int32
+extern def sys_dup2(oldfd: int32, newfd: int32) -> int32
 extern def sys_chdir(path: Ptr[char]) -> int32
 extern def sys_getcwd(buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_errstr(buf: Ptr[uint8], nbuf: uint64) -> int32
+extern def sys_rfork(flags: int32) -> int32
+extern def sys_bind(new: Ptr[char], old: Ptr[char], flag: int32) -> int32
+extern def sys_unmount(new: Ptr[char], old: Ptr[char]) -> int32
+extern def sys_kill(pid: int32, sig: int32) -> int32
 extern def sys_exit(code: uint64)
 
 
-LINE_MAX:    uint64 = 128
-ARGV_MAX:    uint64 = 16
-PIPE_MAX:    uint64 = 4              # max stages = PIPE_MAX + 1
-
-# Single global line + argv buffer. The argv pointer array is handed
-# straight to sys_spawn; the kernel reads it before the child runs so
-# overwriting it on the next iteration is safe.
-line_buf: Array[128, uint8]
-argv_buf: Array[16, uint64]
-# Per-stage state for an N-stage pipeline: seg_start[i] is the index
-# into argv_buf where stage i's argv begins. Stages are NUL-terminated
-# in argv_buf so each &argv_buf[seg_start[i]] is a valid SYS_SPAWN
-# argv pointer. seg_pid[i] holds the spawned pid for waitpid'ing
-# after every stage has launched.
-seg_start: Array[5, uint64]
-seg_pid:   Array[5, int32]
-# 2 fds per pipe (rfd, wfd) stored back-to-back.
-pipe_fds:  Array[8, int32]
-
-# Last command's exit status — exposed to user input as `$?` and
-# returned as our own exit code on the natural `exit` builtin.
-# 0 by default so a fresh shell's `$?` reads as success.
-last_exit_code: int32 = 0
-
-# Backing storage for $? expansion. Holds the ASCII decimal of
-# last_exit_code with a NUL terminator. tokenize substitutes the
-# `$?` literal token with a pointer into this buffer.
-exit_str_buf: Array[8, uint8]
-
-# M16.x: scratch arena for in-token `$VAR` / `$?` substitution.
-# Tokens like `X=$Y` or `prefix-$ID` get rewritten into expand_buf
-# (NUL-terminated) and the corresponding argv_buf slot is repointed
-# at the new bytes. `expand_cursor` is the next free byte; reset at
-# the top of process_line's expansion pass. Sized 1024 — enough for
-# ARGV_MAX (16) tokens each up to ~60 bytes of expanded text.
-EXPAND_BUF_MAX: uint64 = 1024
-expand_buf:    Array[1024, uint8]
-expand_cursor: uint64 = 0
-# Sticky flag so the "expand_buf full" warning fires only once per
-# shell run. Set the first time _expand_token has to bail out.
-expand_overflow_warned: uint32 = 0
-# M16.76: shell variables. Flat table — 8 slots, fixed-size
-# name + value. NAME=VALUE assignment is recognized when a token
-# matches that shape (first '=' splits). $NAME substitutes if the
-# variable exists; otherwise the token stays literal so the user
-# can see they fat-fingered.
-VAR_MAX:    uint64 = 8
-VAR_NAME_MAX:  uint64 = 16
-VAR_VALUE_MAX: uint64 = 48
-
-class ShellVar:
-    used:  uint32
-    pad:   uint32
-    name:  Array[16, uint8]
-    value: Array[48, uint8]
-
-var_table: Array[8, ShellVar]
+# --- arena sizes ----------------------------------------------------
+# The node and value arenas are append-only ACROSS a session, not
+# per-line: a `def`'d function keeps its body AST live, and a variable
+# keeps its value cell live, after the line that created it returns.
+# They are sized generously; a soft overflow degrades gracefully (the
+# allocator returns the null cell) and the line driver recycles the
+# arenas back to a baseline when it is provably safe (no live defs and
+# no variables referencing high cells — see _maybe_recycle_arenas).
+LINE_MAX:      uint64 = 2048     # one logical input line (multi-line)
+TOK_MAX:       uint64 = 512      # tokens per line
+NODE_MAX:      uint64 = 16384    # AST node arena (session-lifetime)
+STR_ARENA_MAX: uint64 = 32768    # interned string bytes (session)
+VAL_MAX:       uint64 = 16384    # value cells (session-lifetime)
+SCOPE_MAX:     uint64 = 128      # variable bindings (one flat table)
+ARGV_MAX:      uint64 = 64       # argv slots for an external command
+LISTELEM_MAX:  uint64 = 16384    # list/dict element slots (shared pool)
 
 
-def var_name_eq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
-    i: uint64 = 0
-    while True:
-        ca: uint8 = a[i]
-        cb: uint8 = b[i]
-        if ca != cb:
-            return 0
-        if ca == 0:
-            return 1
-        i = i + 1
+# ====================================================================
+# String arena
+# ====================================================================
+# hamsh strings are NUL-terminated byte runs interned into one arena.
+# A "string ref" is the byte offset of the first char. Offset 0 is the
+# empty string (a single NUL planted at init).
+
+str_arena:  Array[32768, uint8]
+str_cursor: uint64 = 1            # 0 reserved for ""
 
 
-def var_get(name: Ptr[uint8]) -> Ptr[uint8]:
-    # Returns pointer to value bytes (NUL-terminated) or nullptr on
-    # miss. The returned pointer aliases into var_table; valid until
-    # the next var_set on the same slot.
-    i: uint64 = 0
-    while i < VAR_MAX:
-        if var_table[i].used != 0:
-            if var_name_eq(&var_table[i].name[0], name) != 0:
-                return &var_table[i].value[0]
-        i = i + 1
-    return cast[Ptr[uint8]](0)
+def str_arena_init():
+    str_arena[0] = 0
+    str_cursor = 1
 
 
-def var_set(name: Ptr[uint8], value: Ptr[uint8]) -> int32:
-    # Find existing slot or first free. NAME / VALUE longer than the
-    # static caps get clipped (no error — keeps the parser stuck
-    # responses to a minimum). Returns 1 on store, 0 on table-full.
-    free: int64 = -1
-    i: uint64 = 0
-    while i < VAR_MAX:
-        if var_table[i].used != 0:
-            if var_name_eq(&var_table[i].name[0], name) != 0:
-                free = cast[int64](i)
-                break
-        else:
-            if free < 0:
-                free = cast[int64](i)
-        i = i + 1
-    if free < 0:
+def str_intern_n(src: Ptr[uint8], n: uint64) -> uint64:
+    # Copy n bytes + NUL into the arena; return the offset. On overflow
+    # return 0 (the empty string) — a soft failure that never corrupts.
+    if str_cursor + n + 1 >= STR_ARENA_MAX:
         return 0
-    slot: uint64 = cast[uint64](free)
-    # Copy name (clipped).
-    j: uint64 = 0
-    while j + 1 < VAR_NAME_MAX and name[j] != 0:
-        var_table[slot].name[j] = name[j]
-        j = j + 1
-    var_table[slot].name[j] = 0
-    # Copy value (clipped).
-    k: uint64 = 0
-    while k + 1 < VAR_VALUE_MAX and value[k] != 0:
-        var_table[slot].value[k] = value[k]
-        k = k + 1
-    var_table[slot].value[k] = 0
-    var_table[slot].used = 1
-    return 1
+    off: uint64 = str_cursor
+    i: uint64 = 0
+    while i < n:
+        str_arena[off + i] = src[i]
+        i = i + 1
+    str_arena[off + n] = 0
+    str_cursor = off + n + 1
+    return off
 
 
-def _render_exit_code(v: int32):
-    # Populate exit_str_buf with the decimal ASCII of `v` + NUL.
-    # Handles negatives via a leading '-' (waitpid signals etc).
-    n: uint32 = 0
-    if v < 0:
-        exit_str_buf[0] = 45                       # '-'
-        n = cast[uint32](-v)
-        # Convert n to decimal at positions [1..].
-        if n == 0:
-            exit_str_buf[1] = 48                   # '0'
-            exit_str_buf[2] = 0
-            return
-        # Determine length: simple digit counter.
-        digits: Array[8, uint8]
-        di: uint32 = 0
-        while n > 0:
-            digits[di] = cast[uint8]((n % 10) + 48)
-            n = n / 10
-            di = di + 1
-        # Reverse-copy into output starting at index 1.
-        oi: uint32 = 1
-        while di > 0:
-            di = di - 1
-            exit_str_buf[oi] = digits[di]
-            oi = oi + 1
-        exit_str_buf[oi] = 0
-        return
-    n = cast[uint32](v)
-    if n == 0:
-        exit_str_buf[0] = 48
-        exit_str_buf[1] = 0
-        return
-    digits: Array[8, uint8]
-    di: uint32 = 0
-    while n > 0:
-        digits[di] = cast[uint8]((n % 10) + 48)
-        n = n / 10
-        di = di + 1
-    oi: uint32 = 0
-    while di > 0:
-        di = di - 1
-        exit_str_buf[oi] = digits[di]
-        oi = oi + 1
-    exit_str_buf[oi] = 0
+def str_intern_cstr(src: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while src[n] != 0:
+        n = n + 1
+    return str_intern_n(src, n)
 
 
-def strlen_u8(s: Ptr[uint8]) -> uint64:
+def str_ptr(off: uint64) -> Ptr[uint8]:
+    return &str_arena[off]
+
+
+def str_len(off: uint64) -> uint64:
+    n: uint64 = 0
+    while str_arena[off + n] != 0:
+        n = n + 1
+    return n
+
+
+def cstr_len(s: Ptr[uint8]) -> uint64:
     n: uint64 = 0
     while s[n] != 0:
         n = n + 1
     return n
 
 
-def write_str(fd: int32, s: Ptr[uint8]):
-    sys_write(fd, s, strlen_u8(s))
-
-
-def streq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
-    # Byte-exact equality of two NUL-terminated strings. Returns 1
-    # on match, 0 on mismatch — opposite sense to libc's strcmp but
-    # easier to read at call sites.
+def cstr_eq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
     i: uint64 = 0
     while True:
         ca: uint8 = a[i]
@@ -231,550 +139,2218 @@ def streq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
         i = i + 1
 
 
-def is_space(c: uint8) -> int32:
-    # Treat ASCII space, tab, LF, CR as token separators. fs/vfs.ad
-    # already maps incoming CR → LF on the stdin path, but we accept
-    # both to keep tokenise robust against future shell-pipe inputs.
-    if c == 32:
-        return 1
-    if c == 9:
-        return 1
-    if c == 10:
-        return 1
-    if c == 13:
-        return 1
-    return 0
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, cstr_len(s))
 
 
-def _is_name_start(c: uint8) -> int32:
-    # First character of a bash identifier: [A-Za-z_].
-    if c >= 65 and c <= 90:
-        return 1
-    if c >= 97 and c <= 122:
-        return 1
-    if c == 95:
-        return 1
-    return 0
+def write_cstr1(s: Ptr[uint8]):
+    sys_write(1, s, cstr_len(s))
 
 
-def _is_name_cont(c: uint8) -> int32:
-    # Subsequent characters of a bash identifier: [A-Za-z_0-9].
-    if _is_name_start(c) != 0:
-        return 1
+# Decimal rendering scratch. Shared — render then immediately consume.
+num_buf: Array[24, uint8]
+
+
+def render_int(v: int64) -> Ptr[uint8]:
+    # Render v into num_buf as NUL-terminated decimal. Returns &num_buf.
+    neg: int32 = 0
+    uv: uint64 = 0
+    if v < 0:
+        neg = 1
+        uv = cast[uint64](-v)
+    else:
+        uv = cast[uint64](v)
+    digs: Array[24, uint8]
+    di: uint64 = 0
+    if uv == 0:
+        digs[0] = 48
+        di = 1
+    else:
+        while uv > 0:
+            digs[di] = cast[uint8]((uv % 10) + 48)
+            uv = uv / 10
+            di = di + 1
+    oi: uint64 = 0
+    if neg != 0:
+        num_buf[0] = 45
+        oi = 1
+    while di > 0:
+        di = di - 1
+        num_buf[oi] = digs[di]
+        oi = oi + 1
+    num_buf[oi] = 0
+    return &num_buf[0]
+
+
+# ====================================================================
+# Lexer
+# ====================================================================
+# Token kinds. The lexer is line-structure aware; it does NOT decide
+# command-vs-assignment-vs-control — that is the parser's first-token
+# dispatch (§2).
+
+TK_EOF:     int32 = 0
+TK_WORD:    int32 = 1     # bare word / identifier (str ref in tok_str)
+TK_STR:     int32 = 2     # quoted string literal (str ref)
+TK_INT:     int32 = 3     # integer literal (tok_int)
+TK_DOLLAR:  int32 = 4     # $name        (name str ref in tok_str)
+TK_DOLEXPR: int32 = 5     # ${ ... }     spans nested tokens
+TK_BACKEXP: int32 = 6     # `{ ... }     command substitution
+TK_OP:      int32 = 7     # operator / punctuation (tok_int = op code)
+TK_NEWLINE: int32 = 8     # statement separator
+
+# Operator codes for TK_OP.
+OP_ASSIGN:   int32 = 1    # =
+OP_PLUSEQ:   int32 = 2    # +=
+OP_MINUSEQ:  int32 = 3    # -=
+OP_LBRACE:   int32 = 4    # {
+OP_RBRACE:   int32 = 5    # }
+OP_LPAREN:   int32 = 6    # (
+OP_RPAREN:   int32 = 7    # )
+OP_LBRACKET: int32 = 8    # [
+OP_RBRACKET: int32 = 9    # ]
+OP_COMMA:    int32 = 10   # ,
+OP_PIPE:     int32 = 11   # |
+OP_GT:       int32 = 12   # >
+OP_LT:       int32 = 13   # <
+OP_GE:       int32 = 14   # >=
+OP_LE:       int32 = 15   # <=
+OP_EQEQ:     int32 = 16   # ==
+OP_NE:       int32 = 17   # !=
+OP_PLUS:     int32 = 18   # +
+OP_MINUS:    int32 = 19   # -
+OP_STAR:     int32 = 20   # *
+OP_SLASH:    int32 = 21   # /
+OP_PERCENT:  int32 = 22   # %
+OP_AND:      int32 = 23   # &&
+OP_OR:       int32 = 24   # ||
+OP_NOT:      int32 = 25   # !
+OP_COLON:    int32 = 26   # :
+OP_DOT:      int32 = 27   # .
+OP_REDIR2:   int32 = 28   # 2>   (stderr redirect)
+OP_DUP21:    int32 = 29   # 2>&1 (stderr->stdout dup)
+OP_AMP:      int32 = 30   # &    (background)
+OP_DGT:      int32 = 31   # >>   (append redirect)
+
+# Parallel token arrays. tok_kind drives, the other two carry payload.
+tok_kind: Array[512, int32]
+tok_str:  Array[512, uint64]    # str-arena offset for WORD/STR/DOLLAR
+tok_int:  Array[512, int64]     # int literal / op code / sub-span end
+tok_count: uint64 = 0
+
+# For TK_DOLEXPR / TK_BACKEXP the token carries a *sub-token span*:
+# tok_str = start index into a separate sub-token stream is overkill;
+# instead we store the raw source slice as a string ref and re-lex it
+# lazily at eval time. tok_str holds that interned source slice.
+
+
+def _is_digit(c: uint8) -> int32:
     if c >= 48 and c <= 57:
         return 1
     return 0
 
 
-def _token_has_dollar(tok: Ptr[uint8]) -> int32:
-    # Cheap pre-filter: skip the expansion-write pass entirely for
-    # tokens with no '$' byte (the common case after tokenize).
+def _is_ident_start(c: uint8) -> int32:
+    if c >= 65 and c <= 90:
+        return 1
+    if c >= 97 and c <= 122:
+        return 1
+    if c == 95:                              # _
+        return 1
+    return 0
+
+
+def _is_ident(c: uint8) -> int32:
+    if _is_ident_start(c) != 0:
+        return 1
+    if _is_digit(c) != 0:
+        return 1
+    return 0
+
+
+def _is_space(c: uint8) -> int32:
+    if c == 32 or c == 9:                    # space, tab
+        return 1
+    return 0
+
+
+def _emit_tok(kind: int32, sref: uint64, ival: int64):
+    if tok_count >= TOK_MAX:
+        return
+    tok_kind[tok_count] = kind
+    tok_str[tok_count]  = sref
+    tok_int[tok_count]  = ival
+    tok_count = tok_count + 1
+
+
+# Scratch for assembling a word/string before interning.
+lex_word: Array[1024, uint8]
+
+
+# Lexer error flag. Set on an unterminated quote / brace-substitution.
+lex_error: int32 = 0
+
+
+def _scan_balanced(buf: Ptr[uint8], n: uint64, start: uint64,
+                   openc: uint8, closec: uint8) -> uint64:
+    # Given buf[start] == openc, return the index of the matching
+    # closec (depth-aware), or n on "unterminated".
+    depth: int32 = 0
+    p: uint64 = start
+    while p < n:
+        c: uint8 = buf[p]
+        if c == openc:
+            depth = depth + 1
+        elif c == closec:
+            depth = depth - 1
+            if depth == 0:
+                return p
+        p = p + 1
+    return n
+
+
+def lex_line(buf: Ptr[uint8], n: uint64) -> int32:
+    # Tokenize buf[0..n) into the tok_* arrays. Returns 0 on success,
+    # -1 on a lexical error (unterminated quote/brace). A trailing
+    # TK_EOF is always appended.
+    tok_count = 0
+    lex_error = 0
+    p: uint64 = 0
+    while p < n:
+        c: uint8 = buf[p]
+        # whitespace
+        if _is_space(c) != 0:
+            p = p + 1
+            continue
+        # comment to end of line
+        if c == 35:                          # '#'
+            while p < n and buf[p] != 10:
+                p = p + 1
+            continue
+        # newline / semicolon -> statement separator
+        if c == 10 or c == 59:               # '\n' ';'
+            _emit_tok(TK_NEWLINE, 0, 0)
+            p = p + 1
+            continue
+        # integer literal
+        if _is_digit(c) != 0:
+            # Could be `2>` / `2>&1` — handle the 2-redirect specially.
+            if c == 50 and p + 1 < n and buf[p + 1] == 62:   # '2>'
+                if p + 3 < n and buf[p + 2] == 38 and \
+                        buf[p + 3] == 49:                    # '2>&1'
+                    _emit_tok(TK_OP, 0, cast[int64](OP_DUP21))
+                    p = p + 4
+                    continue
+                _emit_tok(TK_OP, 0, cast[int64](OP_REDIR2))
+                p = p + 2
+                continue
+            v: int64 = 0
+            while p < n and _is_digit(buf[p]) != 0:
+                v = v * 10 + cast[int64](buf[p] - 48)
+                p = p + 1
+            _emit_tok(TK_INT, 0, v)
+            continue
+        # identifier / bare word starting with a letter or '_'
+        # — a "bare word" can also contain '/', '.', '-', '*' '?'
+        #   '[' ']' etc., for paths and globs. We accept a generous
+        #   word-char set so /dev/cons, *.ad, ./x all lex as ONE word.
+        if _is_ident_start(c) != 0 or c == 47 or c == 46:    # ident / '/' '.'
+            wl: uint64 = 0
+            while p < n:
+                wc: uint8 = buf[p]
+                if _is_ident(wc) != 0 or wc == 47 or wc == 46 or \
+                        wc == 45 or wc == 42 or wc == 63 or \
+                        wc == 91 or wc == 93:
+                    if wl + 1 < LINE_MAX:
+                        lex_word[wl] = wc
+                        wl = wl + 1
+                    p = p + 1
+                else:
+                    break
+            sref: uint64 = str_intern_n(&lex_word[0], wl)
+            _emit_tok(TK_WORD, sref, 0)
+            continue
+        # double-quoted string (interpolating handled at eval)
+        if c == 34:                          # '"'
+            wl: uint64 = 0
+            p = p + 1
+            term: int32 = 0
+            while p < n:
+                qc: uint8 = buf[p]
+                if qc == 34:
+                    term = 1
+                    p = p + 1
+                    break
+                if qc == 92 and p + 1 < n:   # backslash escape
+                    nc: uint8 = buf[p + 1]
+                    if nc == 110:            # \n
+                        qc = 10
+                    elif nc == 116:          # \t
+                        qc = 9
+                    else:
+                        qc = nc
+                    p = p + 1
+                if wl + 1 < LINE_MAX:
+                    lex_word[wl] = qc
+                    wl = wl + 1
+                p = p + 1
+            if term == 0:
+                lex_error = 1
+            sref: uint64 = str_intern_n(&lex_word[0], wl)
+            # TK_STR with tok_int=1 means "interpolating" (double quote)
+            _emit_tok(TK_STR, sref, 1)
+            continue
+        # single-quoted string (literal, no interpolation)
+        if c == 39:                          # '\''
+            wl: uint64 = 0
+            p = p + 1
+            term: int32 = 0
+            while p < n:
+                qc: uint8 = buf[p]
+                if qc == 39:
+                    term = 1
+                    p = p + 1
+                    break
+                if wl + 1 < LINE_MAX:
+                    lex_word[wl] = qc
+                    wl = wl + 1
+                p = p + 1
+            if term == 0:
+                lex_error = 1
+            sref: uint64 = str_intern_n(&lex_word[0], wl)
+            _emit_tok(TK_STR, sref, 0)       # tok_int=0: non-interpolating
+            continue
+        # $name  /  ${ expr }
+        if c == 36:                          # '$'
+            if p + 1 < n and buf[p + 1] == 123:        # '${'
+                close: uint64 = _scan_balanced(buf, n, p + 1, 123, 125)
+                if close >= n:
+                    lex_error = 1
+                    p = n
+                    continue
+                # interned slice = chars between { and }
+                inner: uint64 = p + 2
+                ilen: uint64 = close - inner
+                sref: uint64 = str_intern_n(
+                    cast[Ptr[uint8]](cast[uint64](buf) + inner), ilen)
+                _emit_tok(TK_DOLEXPR, sref, 0)
+                p = close + 1
+                continue
+            # $name
+            p = p + 1
+            wl: uint64 = 0
+            while p < n and _is_ident(buf[p]) != 0:
+                if wl + 1 < LINE_MAX:
+                    lex_word[wl] = buf[p]
+                    wl = wl + 1
+                p = p + 1
+            sref: uint64 = str_intern_n(&lex_word[0], wl)
+            _emit_tok(TK_DOLLAR, sref, 0)
+            continue
+        # `{ command substitution }`
+        if c == 96:                          # '`'
+            if p + 1 < n and buf[p + 1] == 123:
+                close: uint64 = _scan_balanced(buf, n, p + 1, 123, 125)
+                if close >= n:
+                    lex_error = 1
+                    p = n
+                    continue
+                inner: uint64 = p + 2
+                ilen: uint64 = close - inner
+                sref: uint64 = str_intern_n(
+                    cast[Ptr[uint8]](cast[uint64](buf) + inner), ilen)
+                _emit_tok(TK_BACKEXP, sref, 0)
+                p = close + 1
+                continue
+            # bare backtick — treat as a literal char word
+            lex_word[0] = 96
+            sref: uint64 = str_intern_n(&lex_word[0], 1)
+            _emit_tok(TK_WORD, sref, 0)
+            p = p + 1
+            continue
+        # operators / punctuation
+        op: int32 = 0
+        adv: uint64 = 1
+        if c == 61:                          # '='
+            if p + 1 < n and buf[p + 1] == 61:
+                op = OP_EQEQ
+                adv = 2
+            else:
+                op = OP_ASSIGN
+        elif c == 43:                        # '+'
+            if p + 1 < n and buf[p + 1] == 61:
+                op = OP_PLUSEQ
+                adv = 2
+            else:
+                op = OP_PLUS
+        elif c == 45:                        # '-'
+            if p + 1 < n and buf[p + 1] == 61:
+                op = OP_MINUSEQ
+                adv = 2
+            else:
+                op = OP_MINUS
+        elif c == 123:
+            op = OP_LBRACE
+        elif c == 125:
+            op = OP_RBRACE
+        elif c == 40:
+            op = OP_LPAREN
+        elif c == 41:
+            op = OP_RPAREN
+        elif c == 91:
+            op = OP_LBRACKET
+        elif c == 93:
+            op = OP_RBRACKET
+        elif c == 44:
+            op = OP_COMMA
+        elif c == 124:                       # '|'
+            if p + 1 < n and buf[p + 1] == 124:
+                op = OP_OR
+                adv = 2
+            else:
+                op = OP_PIPE
+        elif c == 38:                        # '&'
+            if p + 1 < n and buf[p + 1] == 38:
+                op = OP_AND
+                adv = 2
+            else:
+                op = OP_AMP
+        elif c == 62:                        # '>'
+            if p + 1 < n and buf[p + 1] == 61:
+                op = OP_GE
+                adv = 2
+            elif p + 1 < n and buf[p + 1] == 62:
+                op = OP_DGT
+                adv = 2
+            else:
+                op = OP_GT
+        elif c == 60:                        # '<'
+            if p + 1 < n and buf[p + 1] == 61:
+                op = OP_LE
+                adv = 2
+            else:
+                op = OP_LT
+        elif c == 33:                        # '!'
+            if p + 1 < n and buf[p + 1] == 61:
+                op = OP_NE
+                adv = 2
+            else:
+                op = OP_NOT
+        elif c == 42:
+            op = OP_STAR
+        elif c == 37:
+            op = OP_PERCENT
+        elif c == 58:
+            op = OP_COLON
+        else:
+            # unknown char — skip it defensively
+            p = p + 1
+            continue
+        _emit_tok(TK_OP, 0, cast[int64](op))
+        p = p + adv
+    _emit_tok(TK_EOF, 0, 0)
+    if lex_error != 0:
+        return -1
+    return 0
+
+
+# ====================================================================
+# AST node arena
+# ====================================================================
+# A node is a fixed record. Children are node indices (a child of 0 is
+# "none" — node 0 is the reserved null node). Lists of children
+# (statement blocks, argv, list literals) use a side "kid pool": a
+# node stores kid_start / kid_count into nd_kid[].
+#
+# Node kinds.
+ND_NONE:     int32 = 0
+# --- statements ---
+ND_CMD:      int32 = 1     # external/builtin command: kids = words
+ND_ASSIGN:   int32 = 2     # name (str=a) OP (i=op) = expr (b)
+ND_IF:       int32 = 3     # a=cond  b=then-block  c=else-block
+ND_WHILE:    int32 = 4     # a=cond  b=body-block
+ND_FOR:      int32 = 5     # str=var a=iterable b=body-block
+ND_DEF:      int32 = 6     # str=name kids=param names  b=body-block
+ND_RETURN:   int32 = 7     # a=expr (0 = bare)
+ND_BREAK:    int32 = 8
+ND_CONTINUE: int32 = 9
+ND_BLOCK:    int32 = 10    # kids = statements
+ND_TRY:      int32 = 11    # a=try-block  b=except-block
+ND_NS:       int32 = 12    # i=clean flag  b=body-block
+ND_ENTER:    int32 = 13    # a=ns-expr  i=clean  b=body-block
+ND_SPAWN:    int32 = 14    # a=ns-expr  i=detached  b=body-block
+ND_PIPELINE: int32 = 15    # kids = ND_CMD stages
+ND_EXPRSTMT: int32 = 16    # a=expr  (a bare expression as a statement)
+ND_AND:      int32 = 17    # a && b   (statement-level)
+ND_OR:       int32 = 18    # a || b   (statement-level)
+# --- expressions ---
+ND_INT:      int32 = 30    # i=value
+ND_STR:      int32 = 31    # str=value (literal)
+ND_STRI:     int32 = 32    # str=value (interpolating literal)
+ND_VAR:      int32 = 33    # str=name
+ND_DOLEXPR:  int32 = 34    # str=raw source (re-lexed at eval)
+ND_BACKEXP:  int32 = 35    # str=raw command source
+ND_LIST:     int32 = 36    # kids = element exprs
+ND_DICT:     int32 = 37    # kids = alternating key,value exprs
+ND_BINOP:    int32 = 38    # i=op a=lhs b=rhs
+ND_UNOP:     int32 = 39    # i=op a=operand
+ND_CALL:     int32 = 40    # str=fname kids=arg exprs
+ND_INDEX:    int32 = 41    # a=container b=index
+ND_TRUE:     int32 = 42
+ND_FALSE:    int32 = 43
+ND_WORD:     int32 = 44    # a bare word in command position (literal)
+
+nd_kind: Array[16384, int32]
+nd_a:    Array[16384, int32]
+nd_b:    Array[16384, int32]
+nd_c:    Array[16384, int32]
+nd_i:    Array[16384, int64]
+nd_str:  Array[512, uint64]
+nd_ks:   Array[512, uint64]    # kid_start into nd_kid
+nd_kn:   Array[512, uint64]    # kid_count
+nd_count: uint64 = 1          # node 0 reserved as null
+
+nd_kid:  Array[32768, int32]
+nd_kid_cursor: uint64 = 0
+
+# Parser cursor + error.
+ps_pos:   uint64 = 0
+ps_error: int32 = 0
+ps_errmsg: Array[64, uint8]
+
+
+def ps_set_err(msg: Ptr[uint8]):
+    if ps_error != 0:
+        return
+    ps_error = 1
     i: uint64 = 0
-    while tok[i] != 0:
-        if tok[i] == 36:                                # '$'
+    while msg[i] != 0 and i + 1 < 64:
+        ps_errmsg[i] = msg[i]
+        i = i + 1
+    ps_errmsg[i] = 0
+
+
+def nd_new(kind: int32) -> int32:
+    if nd_count >= NODE_MAX:
+        ps_set_err("node arena full")
+        return 0
+    n: uint64 = nd_count
+    nd_count = nd_count + 1
+    nd_kind[n] = kind
+    nd_a[n]    = 0
+    nd_b[n]    = 0
+    nd_c[n]    = 0
+    nd_i[n]    = 0
+    nd_str[n]  = 0
+    nd_ks[n]   = 0
+    nd_kn[n]   = 0
+    return cast[int32](n)
+
+
+def nd_kid_push(node: int32, kid: int32):
+    # Append kid to node's kid list. Kid lists must be built
+    # contiguously — push all kids for one node before starting another.
+    nu: uint64 = cast[uint64](node)
+    if nd_kn[nu] == 0:
+        nd_ks[nu] = nd_kid_cursor
+    if nd_kid_cursor >= 2048:
+        ps_set_err("kid pool full")
+        return
+    nd_kid[nd_kid_cursor] = kid
+    nd_kid_cursor = nd_kid_cursor + 1
+    nd_kn[nu] = nd_kn[nu] + 1
+
+
+def nd_kid_at(node: int32, idx: uint64) -> int32:
+    nu: uint64 = cast[uint64](node)
+    return nd_kid[nd_ks[nu] + idx]
+
+
+# --- token cursor helpers -------------------------------------------
+
+def pk_kind() -> int32:
+    return tok_kind[ps_pos]
+
+
+def pk_is_op(op: int32) -> int32:
+    if tok_kind[ps_pos] == TK_OP and tok_int[ps_pos] == cast[int64](op):
+        return 1
+    return 0
+
+
+def pk_advance():
+    if ps_pos + 1 < TOK_MAX:
+        ps_pos = ps_pos + 1
+
+
+def pk_expect_op(op: int32, what: Ptr[uint8]) -> int32:
+    if pk_is_op(op) != 0:
+        pk_advance()
+        return 1
+    ps_set_err(what)
+    return 0
+
+
+# Keyword test on a TK_WORD token.
+def _word_is(idx: uint64, kw: Ptr[uint8]) -> int32:
+    if tok_kind[idx] != TK_WORD:
+        return 0
+    return cstr_eq(str_ptr(tok_str[idx]), kw)
+
+
+def pk_word_is(kw: Ptr[uint8]) -> int32:
+    return _word_is(ps_pos, kw)
+
+
+def _is_stmt_keyword(idx: uint64) -> int32:
+    # §2 rule 1: first token a statement-starting reserved keyword.
+    if _word_is(idx, "if") != 0:
+        return 1
+    if _word_is(idx, "while") != 0:
+        return 1
+    if _word_is(idx, "for") != 0:
+        return 1
+    if _word_is(idx, "def") != 0:
+        return 1
+    if _word_is(idx, "return") != 0:
+        return 1
+    if _word_is(idx, "break") != 0:
+        return 1
+    if _word_is(idx, "continue") != 0:
+        return 1
+    if _word_is(idx, "try") != 0:
+        return 1
+    if _word_is(idx, "ns") != 0:
+        return 1
+    if _word_is(idx, "enter") != 0:
+        return 1
+    if _word_is(idx, "spawn") != 0:
+        return 1
+    return 0
+
+
+def _is_continuation_keyword(idx: uint64) -> int32:
+    # elif/else/except: reserved continuation keywords (§2).
+    if _word_is(idx, "elif") != 0:
+        return 1
+    if _word_is(idx, "else") != 0:
+        return 1
+    if _word_is(idx, "except") != 0:
+        return 1
+    return 0
+
+
+# ====================================================================
+# Parser — recursive descent
+# ====================================================================
+# Forward-declared mutual recursion is fine in Adder (flat module
+# namespace). parse_expr / parse_block / parse_statement call each
+# other freely.
+
+# --- expression grammar (precedence climbing) -----------------------
+#   expr      := or_expr
+#   or_expr   := and_expr   ( '||' and_expr )*
+#   and_expr  := not_expr   ( '&&' not_expr )*
+#   not_expr  := '!' not_expr | cmp_expr
+#   cmp_expr  := add_expr   ( (== != < > <= >=) add_expr )*
+#   add_expr  := mul_expr   ( (+ -) mul_expr )*
+#   mul_expr  := unary      ( (* / %) unary )*
+#   unary     := '-' unary | postfix
+#   postfix   := primary ( '[' expr ']' )*
+#   primary   := INT | STR | TRUE | FALSE | VAR | DOLEXPR | BACKEXP
+#              | '(' expr ')' | '[' list ']' | '{' dict '}'
+#              | IDENT '(' args ')'
+
+def parse_expr() -> int32:
+    return parse_or()
+
+
+def parse_or() -> int32:
+    lhs: int32 = parse_and()
+    while pk_is_op(OP_OR) != 0:
+        pk_advance()
+        rhs: int32 = parse_and()
+        n: int32 = nd_new(ND_BINOP)
+        nd_i[cast[uint64](n)] = cast[int64](OP_OR)
+        nd_a[cast[uint64](n)] = lhs
+        nd_b[cast[uint64](n)] = rhs
+        lhs = n
+    return lhs
+
+
+def parse_and() -> int32:
+    lhs: int32 = parse_not()
+    while pk_is_op(OP_AND) != 0:
+        pk_advance()
+        rhs: int32 = parse_not()
+        n: int32 = nd_new(ND_BINOP)
+        nd_i[cast[uint64](n)] = cast[int64](OP_AND)
+        nd_a[cast[uint64](n)] = lhs
+        nd_b[cast[uint64](n)] = rhs
+        lhs = n
+    return lhs
+
+
+def parse_not() -> int32:
+    if pk_is_op(OP_NOT) != 0:
+        pk_advance()
+        operand: int32 = parse_not()
+        n: int32 = nd_new(ND_UNOP)
+        nd_i[cast[uint64](n)] = cast[int64](OP_NOT)
+        nd_a[cast[uint64](n)] = operand
+        return n
+    return parse_cmp()
+
+
+def _is_cmp_op() -> int32:
+    if pk_is_op(OP_EQEQ) != 0:
+        return 1
+    if pk_is_op(OP_NE) != 0:
+        return 1
+    if pk_is_op(OP_LT) != 0:
+        return 1
+    if pk_is_op(OP_GT) != 0:
+        return 1
+    if pk_is_op(OP_LE) != 0:
+        return 1
+    if pk_is_op(OP_GE) != 0:
+        return 1
+    return 0
+
+
+def parse_cmp() -> int32:
+    lhs: int32 = parse_add()
+    while _is_cmp_op() != 0:
+        op: int32 = cast[int32](tok_int[ps_pos])
+        pk_advance()
+        rhs: int32 = parse_add()
+        n: int32 = nd_new(ND_BINOP)
+        nd_i[cast[uint64](n)] = cast[int64](op)
+        nd_a[cast[uint64](n)] = lhs
+        nd_b[cast[uint64](n)] = rhs
+        lhs = n
+    return lhs
+
+
+def parse_add() -> int32:
+    lhs: int32 = parse_mul()
+    while pk_is_op(OP_PLUS) != 0 or pk_is_op(OP_MINUS) != 0:
+        op: int32 = cast[int32](tok_int[ps_pos])
+        pk_advance()
+        rhs: int32 = parse_mul()
+        n: int32 = nd_new(ND_BINOP)
+        nd_i[cast[uint64](n)] = cast[int64](op)
+        nd_a[cast[uint64](n)] = lhs
+        nd_b[cast[uint64](n)] = rhs
+        lhs = n
+    return lhs
+
+
+def parse_mul() -> int32:
+    lhs: int32 = parse_unary()
+    while pk_is_op(OP_STAR) != 0 or pk_is_op(OP_SLASH) != 0 or \
+            pk_is_op(OP_PERCENT) != 0:
+        op: int32 = cast[int32](tok_int[ps_pos])
+        pk_advance()
+        rhs: int32 = parse_unary()
+        n: int32 = nd_new(ND_BINOP)
+        nd_i[cast[uint64](n)] = cast[int64](op)
+        nd_a[cast[uint64](n)] = lhs
+        nd_b[cast[uint64](n)] = rhs
+        lhs = n
+    return lhs
+
+
+def parse_unary() -> int32:
+    if pk_is_op(OP_MINUS) != 0:
+        pk_advance()
+        operand: int32 = parse_unary()
+        n: int32 = nd_new(ND_UNOP)
+        nd_i[cast[uint64](n)] = cast[int64](OP_MINUS)
+        nd_a[cast[uint64](n)] = operand
+        return n
+    return parse_postfix()
+
+
+def parse_postfix() -> int32:
+    base: int32 = parse_primary()
+    while pk_is_op(OP_LBRACKET) != 0:
+        pk_advance()
+        idx: int32 = parse_expr()
+        pk_expect_op(OP_RBRACKET, "expected ]")
+        n: int32 = nd_new(ND_INDEX)
+        nd_a[cast[uint64](n)] = base
+        nd_b[cast[uint64](n)] = idx
+        base = n
+    return base
+
+
+def parse_list_literal() -> int32:
+    # caller has consumed '['
+    n: int32 = nd_new(ND_LIST)
+    if pk_is_op(OP_RBRACKET) != 0:
+        pk_advance()
+        return n
+    while True:
+        e: int32 = parse_expr()
+        nd_kid_push(n, e)
+        if pk_is_op(OP_COMMA) != 0:
+            pk_advance()
+            if pk_is_op(OP_RBRACKET) != 0:
+                pk_advance()
+                break
+            continue
+        pk_expect_op(OP_RBRACKET, "expected ] in list")
+        break
+    return n
+
+
+def parse_dict_literal() -> int32:
+    # caller has consumed '{'
+    n: int32 = nd_new(ND_DICT)
+    if pk_is_op(OP_RBRACE) != 0:
+        pk_advance()
+        return n
+    while True:
+        k: int32 = parse_expr()
+        pk_expect_op(OP_COLON, "expected : in dict")
+        v: int32 = parse_expr()
+        nd_kid_push(n, k)
+        nd_kid_push(n, v)
+        if pk_is_op(OP_COMMA) != 0:
+            pk_advance()
+            if pk_is_op(OP_RBRACE) != 0:
+                pk_advance()
+                break
+            continue
+        pk_expect_op(OP_RBRACE, "expected } in dict")
+        break
+    return n
+
+
+def parse_primary() -> int32:
+    k: int32 = pk_kind()
+    if k == TK_INT:
+        n: int32 = nd_new(ND_INT)
+        nd_i[cast[uint64](n)] = tok_int[ps_pos]
+        pk_advance()
+        return n
+    if k == TK_STR:
+        kind: int32 = ND_STR
+        if tok_int[ps_pos] != 0:
+            kind = ND_STRI
+        n: int32 = nd_new(kind)
+        nd_str[cast[uint64](n)] = tok_str[ps_pos]
+        pk_advance()
+        return n
+    if k == TK_DOLLAR:
+        n: int32 = nd_new(ND_VAR)
+        nd_str[cast[uint64](n)] = tok_str[ps_pos]
+        pk_advance()
+        return n
+    if k == TK_DOLEXPR:
+        n: int32 = nd_new(ND_DOLEXPR)
+        nd_str[cast[uint64](n)] = tok_str[ps_pos]
+        pk_advance()
+        return n
+    if k == TK_BACKEXP:
+        n: int32 = nd_new(ND_BACKEXP)
+        nd_str[cast[uint64](n)] = tok_str[ps_pos]
+        pk_advance()
+        return n
+    if k == TK_WORD:
+        # true / false keywords, else a bare identifier (variable
+        # reference in expression position, or a function call).
+        if pk_word_is("true") != 0:
+            pk_advance()
+            return nd_new(ND_TRUE)
+        if pk_word_is("false") != 0:
+            pk_advance()
+            return nd_new(ND_FALSE)
+        wref: uint64 = tok_str[ps_pos]
+        pk_advance()
+        if pk_is_op(OP_LPAREN) != 0:
+            # function call
+            pk_advance()
+            n: int32 = nd_new(ND_CALL)
+            nd_str[cast[uint64](n)] = wref
+            if pk_is_op(OP_RPAREN) == 0:
+                while True:
+                    arg: int32 = parse_expr()
+                    nd_kid_push(n, arg)
+                    if pk_is_op(OP_COMMA) != 0:
+                        pk_advance()
+                        continue
+                    break
+            pk_expect_op(OP_RPAREN, "expected ) in call")
+            return n
+        # bare identifier as a variable reference in expression position
+        n: int32 = nd_new(ND_VAR)
+        nd_str[cast[uint64](n)] = wref
+        return n
+    if pk_is_op(OP_LPAREN) != 0:
+        pk_advance()
+        e: int32 = parse_expr()
+        pk_expect_op(OP_RPAREN, "expected )")
+        return e
+    if pk_is_op(OP_LBRACKET) != 0:
+        pk_advance()
+        return parse_list_literal()
+    if pk_is_op(OP_LBRACE) != 0:
+        pk_advance()
+        return parse_dict_literal()
+    ps_set_err("expected expression")
+    return 0
+
+
+# --- skip optional NEWLINE separators -------------------------------
+def _skip_newlines():
+    while pk_kind() == TK_NEWLINE:
+        pk_advance()
+
+
+# --- block: '{' statements '}' --------------------------------------
+def parse_block() -> int32:
+    # caller positioned at '{'.
+    if pk_expect_op(OP_LBRACE, "expected {") == 0:
+        return 0
+    n: int32 = nd_new(ND_BLOCK)
+    _skip_newlines()
+    while pk_is_op(OP_RBRACE) == 0 and pk_kind() != TK_EOF:
+        if ps_error != 0:
+            return n
+        st: int32 = parse_statement()
+        if st != 0:
+            nd_kid_push(n, st)
+        _skip_newlines()
+    pk_expect_op(OP_RBRACE, "expected } to close block")
+    return n
+
+
+# --- command parsing -------------------------------------------------
+# A command is a sequence of "word tokens". In command position, bare
+# words are LITERAL strings (§2 rule 3). Interpolation reaches the argv
+# only through $name / ${ } / `{ }`. Each word becomes one ND child.
+# Redirects (> < >> 2> 2>&1) attach to the command.
+
+def _word_token_to_node() -> int32:
+    # Convert the current token (must be a command-word token) to an
+    # expression node. Advances the cursor. Returns 0 if the current
+    # token is not a word.
+    k: int32 = pk_kind()
+    if k == TK_WORD:
+        n: int32 = nd_new(ND_WORD)
+        nd_str[cast[uint64](n)] = tok_str[ps_pos]
+        pk_advance()
+        return n
+    if k == TK_STR:
+        kind: int32 = ND_STR
+        if tok_int[ps_pos] != 0:
+            kind = ND_STRI
+        n: int32 = nd_new(kind)
+        nd_str[cast[uint64](n)] = tok_str[ps_pos]
+        pk_advance()
+        return n
+    if k == TK_INT:
+        n: int32 = nd_new(ND_INT)
+        nd_i[cast[uint64](n)] = tok_int[ps_pos]
+        pk_advance()
+        return n
+    if k == TK_DOLLAR:
+        n: int32 = nd_new(ND_VAR)
+        nd_str[cast[uint64](n)] = tok_str[ps_pos]
+        pk_advance()
+        return n
+    if k == TK_DOLEXPR:
+        n: int32 = nd_new(ND_DOLEXPR)
+        nd_str[cast[uint64](n)] = tok_str[ps_pos]
+        pk_advance()
+        return n
+    if k == TK_BACKEXP:
+        n: int32 = nd_new(ND_BACKEXP)
+        nd_str[cast[uint64](n)] = tok_str[ps_pos]
+        pk_advance()
+        return n
+    return 0
+
+
+def _cmd_word_ahead() -> int32:
+    # 1 iff the current token can start/continue a command word.
+    k: int32 = pk_kind()
+    if k == TK_WORD or k == TK_STR or k == TK_INT or \
+            k == TK_DOLLAR or k == TK_DOLEXPR or k == TK_BACKEXP:
+        return 1
+    return 0
+
+
+def parse_simple_command() -> int32:
+    # One pipeline stage: cmd word*, plus redirect annotations. The
+    # redirect targets are stored on the ND_CMD: nd_a = stdout target
+    # node (> / >>), nd_b = stdin target node (<), nd_c flags. We keep
+    # it simple — at most one of each.
+    n: int32 = nd_new(ND_CMD)
+    nd_c[cast[uint64](n)] = 0      # bit0: append, bit1: 2>&1, bit2: bg
+    got: int32 = 0
+    while True:
+        if _cmd_word_ahead() != 0:
+            w: int32 = _word_token_to_node()
+            nd_kid_push(n, w)
+            got = 1
+            continue
+        if pk_is_op(OP_GT) != 0:
+            pk_advance()
+            tgt: int32 = _word_token_to_node()
+            nd_a[cast[uint64](n)] = tgt
+            continue
+        if pk_is_op(OP_DGT) != 0:
+            pk_advance()
+            tgt: int32 = _word_token_to_node()
+            nd_a[cast[uint64](n)] = tgt
+            nd_c[cast[uint64](n)] = nd_c[cast[uint64](n)] | 1
+            continue
+        if pk_is_op(OP_LT) != 0:
+            pk_advance()
+            tgt: int32 = _word_token_to_node()
+            nd_b[cast[uint64](n)] = tgt
+            continue
+        if pk_is_op(OP_DUP21) != 0:
+            pk_advance()
+            nd_c[cast[uint64](n)] = nd_c[cast[uint64](n)] | 2
+            continue
+        if pk_is_op(OP_REDIR2) != 0:
+            pk_advance()
+            # 2> file — store stderr target in nd_i (a node ref)
+            tgt: int32 = _word_token_to_node()
+            nd_i[cast[uint64](n)] = cast[int64](tgt)
+            continue
+        if pk_is_op(OP_AMP) != 0:
+            pk_advance()
+            nd_c[cast[uint64](n)] = nd_c[cast[uint64](n)] | 4
+            continue
+        break
+    if got == 0:
+        ps_set_err("empty command")
+    return n
+
+
+def parse_pipeline() -> int32:
+    # cmd ( '|' cmd )*  — if there is only one stage, returns the
+    # bare ND_CMD; else wraps the stages in an ND_PIPELINE.
+    first: int32 = parse_simple_command()
+    if pk_is_op(OP_PIPE) == 0:
+        return first
+    pl: int32 = nd_new(ND_PIPELINE)
+    nd_kid_push(pl, first)
+    while pk_is_op(OP_PIPE) != 0:
+        pk_advance()
+        st: int32 = parse_simple_command()
+        nd_kid_push(pl, st)
+    return pl
+
+
+# --- the §2 statement dispatch --------------------------------------
+
+def parse_if() -> int32:
+    pk_advance()                         # consume 'if' / 'elif'
+    cond: int32 = parse_expr()
+    thenb: int32 = parse_block()
+    n: int32 = nd_new(ND_IF)
+    nd_a[cast[uint64](n)] = cond
+    nd_b[cast[uint64](n)] = thenb
+    # else / elif chain
+    _skip_newlines()
+    if pk_word_is("elif") != 0:
+        nd_c[cast[uint64](n)] = parse_if()         # recurse
+    elif pk_word_is("else") != 0:
+        pk_advance()
+        nd_c[cast[uint64](n)] = parse_block()
+    return n
+
+
+def parse_while() -> int32:
+    pk_advance()
+    cond: int32 = parse_expr()
+    body: int32 = parse_block()
+    n: int32 = nd_new(ND_WHILE)
+    nd_a[cast[uint64](n)] = cond
+    nd_b[cast[uint64](n)] = body
+    return n
+
+
+def parse_for() -> int32:
+    pk_advance()                         # 'for'
+    if pk_kind() != TK_WORD:
+        ps_set_err("expected loop variable")
+        return 0
+    var: uint64 = tok_str[ps_pos]
+    pk_advance()
+    if pk_word_is("in") == 0:
+        ps_set_err("expected 'in'")
+        return 0
+    pk_advance()
+    iter: int32 = parse_expr()
+    body: int32 = parse_block()
+    n: int32 = nd_new(ND_FOR)
+    nd_str[cast[uint64](n)] = var
+    nd_a[cast[uint64](n)] = iter
+    nd_b[cast[uint64](n)] = body
+    return n
+
+
+def parse_def() -> int32:
+    pk_advance()                         # 'def'
+    if pk_kind() != TK_WORD:
+        ps_set_err("expected function name")
+        return 0
+    name: uint64 = tok_str[ps_pos]
+    pk_advance()
+    n: int32 = nd_new(ND_DEF)
+    nd_str[cast[uint64](n)] = name
+    pk_expect_op(OP_LPAREN, "expected ( after def name")
+    if pk_is_op(OP_RPAREN) == 0:
+        while True:
+            if pk_kind() != TK_WORD:
+                ps_set_err("expected parameter name")
+                break
+            p: int32 = nd_new(ND_STR)
+            nd_str[cast[uint64](p)] = tok_str[ps_pos]
+            nd_kid_push(n, p)
+            pk_advance()
+            if pk_is_op(OP_COMMA) != 0:
+                pk_advance()
+                continue
+            break
+    pk_expect_op(OP_RPAREN, "expected ) after params")
+    nd_b[cast[uint64](n)] = parse_block()
+    return n
+
+
+def parse_try() -> int32:
+    pk_advance()                         # 'try'
+    tb: int32 = parse_block()
+    n: int32 = nd_new(ND_TRY)
+    nd_a[cast[uint64](n)] = tb
+    _skip_newlines()
+    if pk_word_is("except") != 0:
+        pk_advance()
+        nd_b[cast[uint64](n)] = parse_block()
+    else:
+        ps_set_err("expected 'except' after try")
+    return n
+
+
+def parse_ns() -> int32:
+    pk_advance()                         # 'ns'
+    clean: int64 = 0
+    if pk_word_is("clean") != 0:
+        clean = 1
+        pk_advance()
+    n: int32 = nd_new(ND_NS)
+    nd_i[cast[uint64](n)] = clean
+    nd_b[cast[uint64](n)] = parse_block()
+    return n
+
+
+def parse_enter() -> int32:
+    pk_advance()                         # 'enter'
+    clean: int64 = 0
+    if pk_word_is("clean") != 0:
+        clean = 1
+        pk_advance()
+    nsexpr: int32 = parse_postfix()      # the namespace value
+    n: int32 = nd_new(ND_ENTER)
+    nd_i[cast[uint64](n)] = clean
+    nd_a[cast[uint64](n)] = nsexpr
+    nd_b[cast[uint64](n)] = parse_block()
+    return n
+
+
+def parse_spawn() -> int32:
+    pk_advance()                         # 'spawn'
+    detached: int64 = 0
+    if pk_word_is("detached") != 0:
+        detached = 1
+        pk_advance()
+    nsexpr: int32 = parse_postfix()
+    n: int32 = nd_new(ND_SPAWN)
+    nd_i[cast[uint64](n)] = detached
+    nd_a[cast[uint64](n)] = nsexpr
+    nd_b[cast[uint64](n)] = parse_block()
+    return n
+
+
+def _looks_like_assignment() -> int32:
+    # §2 rule 2: IDENT ( = | += | -= ) ... — peek two tokens ahead
+    # WITHOUT consuming. The first token must be a plain identifier
+    # word; the second must be an assignment operator.
+    if tok_kind[ps_pos] != TK_WORD:
+        return 0
+    nx: uint64 = ps_pos + 1
+    if nx >= TOK_MAX:
+        return 0
+    if tok_kind[nx] != TK_OP:
+        return 0
+    op: int64 = tok_int[nx]
+    if op == cast[int64](OP_ASSIGN):
+        return 1
+    if op == cast[int64](OP_PLUSEQ):
+        return 1
+    if op == cast[int64](OP_MINUSEQ):
+        return 1
+    return 0
+
+
+def parse_assignment() -> int32:
+    name: uint64 = tok_str[ps_pos]
+    pk_advance()
+    op: int32 = cast[int32](tok_int[ps_pos])
+    pk_advance()
+    rhs: int32 = parse_expr()
+    n: int32 = nd_new(ND_ASSIGN)
+    nd_str[cast[uint64](n)] = name
+    nd_i[cast[uint64](n)] = cast[int64](op)
+    nd_a[cast[uint64](n)] = rhs
+    return n
+
+
+def parse_statement() -> int32:
+    # The load-bearing §2 dispatch. Decided DETERMINISTICALLY from the
+    # first token — never by a heuristic.
+    _skip_newlines()
+    k: int32 = pk_kind()
+    if k == TK_EOF:
+        return 0
+    # 1. control construct — first token a statement keyword.
+    if k == TK_WORD:
+        if pk_word_is("if") != 0:
+            return parse_if()
+        if pk_word_is("while") != 0:
+            return parse_while()
+        if pk_word_is("for") != 0:
+            return parse_for()
+        if pk_word_is("def") != 0:
+            return parse_def()
+        if pk_word_is("try") != 0:
+            return parse_try()
+        if pk_word_is("ns") != 0:
+            return parse_ns()
+        if pk_word_is("enter") != 0:
+            return parse_enter()
+        if pk_word_is("spawn") != 0:
+            return parse_spawn()
+        if pk_word_is("return") != 0:
+            pk_advance()
+            n: int32 = nd_new(ND_RETURN)
+            if pk_kind() != TK_NEWLINE and pk_kind() != TK_EOF and \
+                    pk_is_op(OP_RBRACE) == 0:
+                nd_a[cast[uint64](n)] = parse_expr()
+            return n
+        if pk_word_is("break") != 0:
+            pk_advance()
+            return nd_new(ND_BREAK)
+        if pk_word_is("continue") != 0:
+            pk_advance()
+            return nd_new(ND_CONTINUE)
+    # 2. assignment.
+    if _looks_like_assignment() != 0:
+        return parse_assignment()
+    # 3. command (with && / || / pipeline chaining).
+    lhs: int32 = parse_pipeline()
+    while pk_is_op(OP_AND) != 0 or pk_is_op(OP_OR) != 0:
+        chain: int32 = ND_AND
+        if pk_is_op(OP_OR) != 0:
+            chain = ND_OR
+        pk_advance()
+        rhs: int32 = parse_pipeline()
+        n: int32 = nd_new(chain)
+        nd_a[cast[uint64](n)] = lhs
+        nd_b[cast[uint64](n)] = rhs
+        lhs = n
+    return lhs
+
+
+def parse_program() -> int32:
+    # Parse the whole token stream as a sequence of statements.
+    ps_pos = 0
+    ps_error = 0
+    ps_errmsg[0] = 0
+    n: int32 = nd_new(ND_BLOCK)
+    _skip_newlines()
+    while pk_kind() != TK_EOF:
+        if ps_error != 0:
+            break
+        st: int32 = parse_statement()
+        if st != 0:
+            nd_kid_push(n, st)
+        _skip_newlines()
+    return n
+
+
+def parser_reset():
+    nd_count = 1
+    nd_kid_cursor = 0
+
+
+# ====================================================================
+# Value system — dynamically typed hamsh values
+# ====================================================================
+# A value cell carries a type tag and a payload. Strings live in the
+# string arena (a str ref). Lists and dicts reference a span in the
+# shared element pool (val_elem[]), each entry a value-cell index.
+#
+# Values are NOT garbage-collected. Per command line the value arena
+# is reset wholesale (val_reset) — a hamsh statement is short-lived.
+
+VT_NIL:    int32 = 0
+VT_INT:    int32 = 1
+VT_BOOL:   int32 = 2
+VT_STR:    int32 = 3      # payload = str ref
+VT_LIST:   int32 = 4      # elem_start/elem_count into val_elem
+VT_DICT:   int32 = 5      # elem span: alternating key,val cell ids
+VT_NS:     int32 = 6      # namespace template handle (see §11)
+VT_PROC:   int32 = 7      # process handle (pid in payload)
+VT_MOUNT:  int32 = 8      # mount handle (see §14)
+
+val_type:  Array[16384, int32]
+val_pay:   Array[16384, int64]    # int / bool / str ref / pid
+val_es:    Array[1024, uint64]   # elem_start (list/dict)
+val_ec:    Array[1024, uint64]   # elem_count
+val_count: uint64 = 1            # cell 0 reserved = nil
+
+val_elem:  Array[16384, int32]    # value-cell indices
+val_elem_cursor: uint64 = 0
+
+
+def val_reset():
+    val_count = 1
+    val_elem_cursor = 0
+    val_type[0] = VT_NIL
+
+
+def v_new(t: int32) -> int32:
+    if val_count >= VAL_MAX:
+        return 0
+    n: uint64 = val_count
+    val_count = val_count + 1
+    val_type[n] = t
+    val_pay[n]  = 0
+    val_es[n]   = 0
+    val_ec[n]   = 0
+    return cast[int32](n)
+
+
+def v_int(x: int64) -> int32:
+    n: int32 = v_new(VT_INT)
+    val_pay[cast[uint64](n)] = x
+    return n
+
+
+def v_bool(x: int32) -> int32:
+    n: int32 = v_new(VT_BOOL)
+    if x != 0:
+        val_pay[cast[uint64](n)] = 1
+    return n
+
+
+def v_str_ref(sref: uint64) -> int32:
+    n: int32 = v_new(VT_STR)
+    val_pay[cast[uint64](n)] = cast[int64](sref)
+    return n
+
+
+def v_str_cstr(s: Ptr[uint8]) -> int32:
+    return v_str_ref(str_intern_cstr(s))
+
+
+def v_type(v: int32) -> int32:
+    return val_type[cast[uint64](v)]
+
+
+def v_is_truthy(v: int32) -> int32:
+    t: int32 = val_type[cast[uint64](v)]
+    if t == VT_NIL:
+        return 0
+    if t == VT_INT:
+        if val_pay[cast[uint64](v)] != 0:
+            return 1
+        return 0
+    if t == VT_BOOL:
+        if val_pay[cast[uint64](v)] != 0:
+            return 1
+        return 0
+    if t == VT_STR:
+        if str_len(cast[uint64](val_pay[cast[uint64](v)])) > 0:
+            return 1
+        return 0
+    if t == VT_LIST:
+        if val_ec[cast[uint64](v)] > 0:
+            return 1
+        return 0
+    return 1
+
+
+# A list builder: allocate a list cell, then push elements. Elements
+# for one list must be pushed contiguously (shared pool).
+def v_list_begin() -> int32:
+    n: int32 = v_new(VT_LIST)
+    val_es[cast[uint64](n)] = val_elem_cursor
+    val_ec[cast[uint64](n)] = 0
+    return n
+
+
+def v_list_push(listv: int32, elem: int32):
+    if val_elem_cursor >= LISTELEM_MAX:
+        return
+    val_elem[val_elem_cursor] = elem
+    val_elem_cursor = val_elem_cursor + 1
+    val_ec[cast[uint64](listv)] = val_ec[cast[uint64](listv)] + 1
+
+
+def v_list_get(listv: int32, idx: uint64) -> int32:
+    lu: uint64 = cast[uint64](listv)
+    if idx >= val_ec[lu]:
+        return 0
+    return val_elem[val_es[lu] + idx]
+
+
+def v_list_len(listv: int32) -> uint64:
+    return val_ec[cast[uint64](listv)]
+
+
+# --- value -> string rendering --------------------------------------
+# Rendered into a shared scratch; copy out promptly.
+render_buf: Array[1024, uint8]
+
+
+def _render_append(pos: uint64, s: Ptr[uint8]) -> uint64:
+    i: uint64 = 0
+    while s[i] != 0 and pos + 1 < 1024:
+        render_buf[pos] = s[i]
+        pos = pos + 1
+        i = i + 1
+    return pos
+
+
+def v_render(v: int32) -> Ptr[uint8]:
+    # Render a value to a NUL-terminated string in render_buf.
+    t: int32 = val_type[cast[uint64](v)]
+    if t == VT_NIL:
+        render_buf[0] = 0
+        return &render_buf[0]
+    if t == VT_INT:
+        pos: uint64 = _render_append(
+            0, render_int(val_pay[cast[uint64](v)]))
+        render_buf[pos] = 0
+        return &render_buf[0]
+    if t == VT_BOOL:
+        if val_pay[cast[uint64](v)] != 0:
+            return "true"
+        return "false"
+    if t == VT_STR:
+        return str_ptr(cast[uint64](val_pay[cast[uint64](v)]))
+    if t == VT_LIST:
+        pos: uint64 = 0
+        n: uint64 = val_ec[cast[uint64](v)]
+        i: uint64 = 0
+        while i < n:
+            if i > 0:
+                pos = _render_append(pos, " ")
+            elem: int32 = v_list_get(v, i)
+            # render the element into a temp via recursion-safe copy
+            ep: Ptr[uint8] = v_render_str_only(elem)
+            pos = _render_append(pos, ep)
+            i = i + 1
+        render_buf[pos] = 0
+        return &render_buf[0]
+    if t == VT_PROC:
+        pos: uint64 = _render_append(0, "<proc ")
+        pos = _render_append(pos, render_int(val_pay[cast[uint64](v)]))
+        pos = _render_append(pos, ">")
+        render_buf[pos] = 0
+        return &render_buf[0]
+    if t == VT_NS:
+        return "<namespace>"
+    if t == VT_MOUNT:
+        return "<mount>"
+    render_buf[0] = 0
+    return &render_buf[0]
+
+
+# Sub-renderer used by v_render's list path so the recursion does not
+# clobber render_buf — renders scalars into a small private scratch.
+render_sub: Array[64, uint8]
+
+
+def v_render_str_only(v: int32) -> Ptr[uint8]:
+    t: int32 = val_type[cast[uint64](v)]
+    if t == VT_STR:
+        return str_ptr(cast[uint64](val_pay[cast[uint64](v)]))
+    if t == VT_INT:
+        src: Ptr[uint8] = render_int(val_pay[cast[uint64](v)])
+        i: uint64 = 0
+        while src[i] != 0 and i + 1 < 64:
+            render_sub[i] = src[i]
+            i = i + 1
+        render_sub[i] = 0
+        return &render_sub[0]
+    if t == VT_BOOL:
+        if val_pay[cast[uint64](v)] != 0:
+            return "true"
+        return "false"
+    return ""
+
+
+# ====================================================================
+# Variable scope
+# ====================================================================
+# hamsh keeps a flat binding table with a frame-pointer discipline.
+# Function calls push a frame; `enter`/`spawn`/`ns` blocks run in the
+# child process or restore on exit so they need no extra frame here.
+# A binding is (name str ref, value cell id, frame depth).
+
+sc_name:  Array[64, uint64]
+sc_val:   Array[64, int32]
+sc_frame: Array[64, int32]
+sc_count: uint64 = 0
+sc_depth: int32 = 0
+
+
+def scope_reset():
+    sc_count = 0
+    sc_depth = 0
+
+
+def scope_push_frame() -> int32:
+    sc_depth = sc_depth + 1
+    return cast[int32](sc_count)      # mark = first binding of frame
+
+
+def scope_pop_frame(mark: int32):
+    sc_count = cast[uint64](mark)
+    sc_depth = sc_depth - 1
+
+
+def scope_set(name: uint64, val: int32):
+    # Set in the current frame (or update an existing binding visible
+    # in the current frame). Resolution is name-local; the shell's
+    # outermost frame is depth 0.
+    i: uint64 = sc_count
+    while i > 0:
+        i = i - 1
+        if sc_frame[i] == sc_depth and \
+                cstr_eq(str_ptr(sc_name[i]), str_ptr(name)) != 0:
+            sc_val[i] = val
+            return
+    if sc_count >= SCOPE_MAX:
+        return
+    sc_name[sc_count]  = name
+    sc_val[sc_count]   = val
+    sc_frame[sc_count] = sc_depth
+    sc_count = sc_count + 1
+
+
+def scope_get(name: uint64) -> int32:
+    # Look up `name`. In a function frame, look only in that frame and
+    # the global frame (no dynamic-scope leakage from caller locals).
+    i: uint64 = sc_count
+    while i > 0:
+        i = i - 1
+        if sc_frame[i] == sc_depth or sc_frame[i] == 0:
+            if cstr_eq(str_ptr(sc_name[i]), str_ptr(name)) != 0:
+                return sc_val[i]
+    return 0     # cell 0 = nil
+
+
+def scope_has(name: uint64) -> int32:
+    i: uint64 = sc_count
+    while i > 0:
+        i = i - 1
+        if sc_frame[i] == sc_depth or sc_frame[i] == 0:
+            if cstr_eq(str_ptr(sc_name[i]), str_ptr(name)) != 0:
+                return 1
+    return 0
+
+
+# ====================================================================
+# Environment — the /env namespace (§3)
+# ====================================================================
+# Exported variables are files under /env (the #e device). hamsh keeps
+# an in-process mirror so $PATH etc. resolve fast; export writes the
+# string form into /env/NAME via the #e device, and a fresh shell
+# seeds the mirror from /env at startup. Children inherit env through
+# the namespace.
+
+ENV_MAX:        uint64 = 32
+ENV_NAME_MAX:   uint64 = 32
+ENV_VAL_MAX:    uint64 = 192
+
+env_name:  Array[1024, uint8]    # 32 * 32
+env_val:   Array[6144, uint8]    # 32 * 192
+env_used:  Array[32, int32]
+env_count: uint64 = 0
+
+
+def env_find(name: Ptr[uint8]) -> int64:
+    i: uint64 = 0
+    while i < ENV_MAX:
+        if env_used[i] != 0:
+            if cstr_eq(&env_name[i * ENV_NAME_MAX], name) != 0:
+                return cast[int64](i)
+        i = i + 1
+    return -1
+
+
+def env_get(name: Ptr[uint8]) -> Ptr[uint8]:
+    idx: int64 = env_find(name)
+    if idx < 0:
+        return cast[Ptr[uint8]](0)
+    return &env_val[cast[uint64](idx) * ENV_VAL_MAX]
+
+
+def env_set(name: Ptr[uint8], val: Ptr[uint8]):
+    idx: int64 = env_find(name)
+    slot: uint64 = 0
+    if idx >= 0:
+        slot = cast[uint64](idx)
+    else:
+        i: uint64 = 0
+        found: int32 = 0
+        while i < ENV_MAX:
+            if env_used[i] == 0:
+                slot = i
+                found = 1
+                break
+            i = i + 1
+        if found == 0:
+            return
+    nb: uint64 = slot * ENV_NAME_MAX
+    j: uint64 = 0
+    while name[j] != 0 and j + 1 < ENV_NAME_MAX:
+        env_name[nb + j] = name[j]
+        j = j + 1
+    env_name[nb + j] = 0
+    vb: uint64 = slot * ENV_VAL_MAX
+    k: uint64 = 0
+    while val[k] != 0 and k + 1 < ENV_VAL_MAX:
+        env_val[vb + k] = val[k]
+        k = k + 1
+    env_val[vb + k] = 0
+    env_used[slot] = 1
+    if idx < 0 and slot >= env_count:
+        env_count = slot + 1
+
+
+# ====================================================================
+# errstr (§16)
+# ====================================================================
+# $errstr is a native variable holding the last failure string. We
+# mirror the kernel's per-process errstr buffer.
+errstr_buf: Array[128, uint8]
+
+
+def errstr_clear():
+    errstr_buf[0] = 0
+
+
+def errstr_set(s: Ptr[uint8]):
+    i: uint64 = 0
+    while s[i] != 0 and i + 1 < 128:
+        errstr_buf[i] = s[i]
+        i = i + 1
+    errstr_buf[i] = 0
+
+
+def errstr_pull_kernel():
+    # Read the kernel's per-process errstr into our mirror. The Plan 9
+    # swap semantics: passing an empty buffer reads without installing.
+    probe: Array[128, uint8]
+    probe[0] = 0
+    sys_errstr(&probe[0], 128)
+    i: uint64 = 0
+    while probe[i] != 0 and i + 1 < 128:
+        errstr_buf[i] = probe[i]
+        i = i + 1
+    errstr_buf[i] = 0
+
+
+# ====================================================================
+# Evaluator
+# ====================================================================
+# Control-flow signalling out of statement execution. exec_block
+# returns one of these; the caller (loop / function) reacts.
+EX_NORMAL:   int32 = 0
+EX_BREAK:    int32 = 1
+EX_CONTINUE: int32 = 2
+EX_RETURN:   int32 = 3
+EX_ERROR:    int32 = 4      # caught by try/except
+EX_EXIT:     int32 = 5      # `exit` builtin — unwind to main
+
+# The function return value lands here when EX_RETURN propagates.
+eval_retval: int32 = 0
+# Last command exit status (numeric). $status / $? expose it.
+eval_status: int32 = 0
+# Error message for EX_ERROR unwinding.
+eval_errmsg: Array[128, uint8]
+
+
+def eval_err(msg: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while msg[i] != 0 and i + 1 < 128:
+        eval_errmsg[i] = msg[i]
+        i = i + 1
+    eval_errmsg[i] = 0
+    errstr_set(msg)
+    return EX_ERROR
+
+
+# --- function registry ----------------------------------------------
+# `def` registers a function: name + the ND_DEF node. Functions persist
+# across lines (the node arena does NOT reset while a def is live), so
+# defs live in their own small arena copied out of the per-line nodes.
+FN_MAX:       uint64 = 32
+fn_name:      Array[512, uint8]   # 32 * 16
+FN_NAME_MAX:  uint64 = 16
+fn_node:      Array[32, int32]
+fn_count:     uint64 = 0
+
+
+# The evaluator entry points (eval_expr / exec_block / exec_statement)
+# call each other mutually; Adder resolves calls across the whole
+# module so definition order is free.
+
+
+def _arith(op: int32, a: int64, b: int64) -> int64:
+    if op == OP_PLUS:
+        return a + b
+    if op == OP_MINUS:
+        return a - b
+    if op == OP_STAR:
+        return a * b
+    if op == OP_SLASH:
+        if b == 0:
+            return 0
+        return a / b
+    if op == OP_PERCENT:
+        if b == 0:
+            return 0
+        return a % b
+    return 0
+
+
+def _cmp_int(op: int32, a: int64, b: int64) -> int32:
+    if op == OP_EQEQ:
+        if a == b:
+            return 1
+        return 0
+    if op == OP_NE:
+        if a != b:
+            return 1
+        return 0
+    if op == OP_LT:
+        if a < b:
+            return 1
+        return 0
+    if op == OP_GT:
+        if a > b:
+            return 1
+        return 0
+    if op == OP_LE:
+        if a <= b:
+            return 1
+        return 0
+    if op == OP_GE:
+        if a >= b:
+            return 1
+        return 0
+    return 0
+
+
+def _val_as_int(v: int32) -> int64:
+    t: int32 = val_type[cast[uint64](v)]
+    if t == VT_INT:
+        return val_pay[cast[uint64](v)]
+    if t == VT_BOOL:
+        return val_pay[cast[uint64](v)]
+    if t == VT_STR:
+        # parse leading decimal
+        s: Ptr[uint8] = str_ptr(cast[uint64](val_pay[cast[uint64](v)]))
+        i: uint64 = 0
+        neg: int32 = 0
+        if s[0] == 45:
+            neg = 1
+            i = 1
+        r: int64 = 0
+        while s[i] >= 48 and s[i] <= 57:
+            r = r * 10 + cast[int64](s[i] - 48)
+            i = i + 1
+        if neg != 0:
+            return -r
+        return r
+    return 0
+
+
+# Concatenate two values' string forms into the arena; return a STR.
+concat_scratch: Array[1024, uint8]
+
+
+def _v_concat(a: int32, b: int32) -> int32:
+    pa: Ptr[uint8] = v_render_str_only(a)
+    la: uint64 = cstr_len(pa)
+    i: uint64 = 0
+    while i < la and i + 1 < 1024:
+        concat_scratch[i] = pa[i]
+        i = i + 1
+    pb: Ptr[uint8] = v_render_str_only(b)
+    j: uint64 = 0
+    while pb[j] != 0 and i + 1 < 1024:
+        concat_scratch[i] = pb[j]
+        i = i + 1
+        j = j + 1
+    concat_scratch[i] = 0
+    return v_str_ref(str_intern_n(&concat_scratch[0], i))
+
+
+def _v_streq(a: int32, b: int32) -> int32:
+    pa: Ptr[uint8] = v_render_str_only(a)
+    sa: Array[256, uint8]
+    i: uint64 = 0
+    while pa[i] != 0 and i + 1 < 256:
+        sa[i] = pa[i]
+        i = i + 1
+    sa[i] = 0
+    pb: Ptr[uint8] = v_render_str_only(b)
+    return cstr_eq(&sa[0], pb)
+
+
+def eval_binop(node: int32) -> int32:
+    nu: uint64 = cast[uint64](node)
+    op: int32 = cast[int32](nd_i[nu])
+    # short-circuit logicals
+    if op == OP_AND:
+        l: int32 = eval_expr(nd_a[nu])
+        if v_is_truthy(l) == 0:
+            return v_bool(0)
+        r: int32 = eval_expr(nd_b[nu])
+        return v_bool(v_is_truthy(r))
+    if op == OP_OR:
+        l: int32 = eval_expr(nd_a[nu])
+        if v_is_truthy(l) != 0:
+            return v_bool(1)
+        r: int32 = eval_expr(nd_b[nu])
+        return v_bool(v_is_truthy(r))
+    lhs: int32 = eval_expr(nd_a[nu])
+    rhs: int32 = eval_expr(nd_b[nu])
+    lt: int32 = val_type[cast[uint64](lhs)]
+    rt: int32 = val_type[cast[uint64](rhs)]
+    # '+' on two strings (or anything with a string) concatenates.
+    if op == OP_PLUS:
+        if lt == VT_STR or rt == VT_STR:
+            return _v_concat(lhs, rhs)
+    # comparisons
+    if op == OP_EQEQ or op == OP_NE:
+        if lt == VT_STR or rt == VT_STR:
+            eq: int32 = _v_streq(lhs, rhs)
+            if op == OP_NE:
+                if eq != 0:
+                    return v_bool(0)
+                return v_bool(1)
+            return v_bool(eq)
+    if op == OP_EQEQ or op == OP_NE or op == OP_LT or op == OP_GT or \
+            op == OP_LE or op == OP_GE:
+        return v_bool(_cmp_int(op, _val_as_int(lhs), _val_as_int(rhs)))
+    # arithmetic
+    return v_int(_arith(op, _val_as_int(lhs), _val_as_int(rhs)))
+
+
+# --- nested lex/parse for ${ } and `{ } -----------------------------
+# ${ expr } and `{ cmd } carry a raw source slice. Evaluating them
+# means lex+parse that slice. Re-lexing would clobber the live tok_*
+# arrays mid-evaluation, so we snapshot/restore them around the nested
+# pass. The node arena is shared and append-only within a line, so the
+# nested AST simply extends it.
+
+tok_save_kind: Array[512, int32]
+tok_save_str:  Array[512, uint64]
+tok_save_int:  Array[512, int64]
+
+
+def _save_tokens() -> uint64:
+    saved: uint64 = tok_count
+    i: uint64 = 0
+    while i < tok_count:
+        tok_save_kind[i] = tok_kind[i]
+        tok_save_str[i]  = tok_str[i]
+        tok_save_int[i]  = tok_int[i]
+        i = i + 1
+    return saved
+
+
+def _restore_tokens(saved: uint64):
+    i: uint64 = 0
+    while i < saved:
+        tok_kind[i] = tok_save_kind[i]
+        tok_str[i]  = tok_save_str[i]
+        tok_int[i]  = tok_save_int[i]
+        i = i + 1
+    tok_count = saved
+
+
+def eval_subexpr(sref: uint64) -> int32:
+    # Lex+parse+eval the raw source `sref` as a single expression.
+    src: Ptr[uint8] = str_ptr(sref)
+    slen: uint64 = str_len(sref)
+    saved_tok: uint64 = _save_tokens()
+    saved_pos: uint64 = ps_pos
+    lex_line(src, slen)
+    ps_pos = 0
+    sub: int32 = parse_expr()
+    result: int32 = 0
+    if ps_error == 0:
+        result = eval_expr(sub)
+    else:
+        ps_error = 0
+        result = 0
+    _restore_tokens(saved_tok)
+    ps_pos = saved_pos
+    return result
+
+
+def eval_str_interp(sref: uint64) -> int32:
+    # Evaluate a double-quoted string with $name / ${ } interpolation.
+    # Single-pass scan of the literal bytes.
+    src: Ptr[uint8] = str_ptr(sref)
+    n: uint64 = str_len(sref)
+    out: uint64 = 0
+    p: uint64 = 0
+    while p < n and out + 1 < 1024:
+        c: uint8 = src[p]
+        if c == 36 and p + 1 < n:               # '$'
+            if src[p + 1] == 123:               # '${'
+                close: uint64 = _scan_balanced(src, n, p + 1, 123, 125)
+                if close < n:
+                    inner: uint64 = p + 2
+                    ilen: uint64 = close - inner
+                    iref: uint64 = str_intern_n(
+                        cast[Ptr[uint8]](cast[uint64](src) + inner),
+                        ilen)
+                    sub: int32 = eval_subexpr(iref)
+                    sp: Ptr[uint8] = v_render_str_only(sub)
+                    out = _render_append(out, sp)
+                    # render into render_buf overwrites — copy carefully:
+                    p = close + 1
+                    continue
+            # $name
+            q: uint64 = p + 1
+            nm: Array[64, uint8]
+            ni: uint64 = 0
+            while q < n and _is_ident(src[q]) != 0 and ni + 1 < 64:
+                nm[ni] = src[q]
+                ni = ni + 1
+                q = q + 1
+            nm[ni] = 0
+            nref: uint64 = str_intern_n(&nm[0], ni)
+            vv: int32 = eval_var_by_name(nref)
+            sp: Ptr[uint8] = v_render_str_only(vv)
+            out = _render_append(out, sp)
+            p = q
+            continue
+        render_buf[out] = c
+        out = out + 1
+        p = p + 1
+    render_buf[out] = 0
+    return v_str_ref(str_intern_n(&render_buf[0], out))
+
+
+def eval_var_by_name(nref: uint64) -> int32:
+    # Resolve a variable by name. Special natives: errstr, status.
+    np: Ptr[uint8] = str_ptr(nref)
+    if cstr_eq(np, "errstr") != 0:
+        return v_str_cstr(&errstr_buf[0])
+    if cstr_eq(np, "status") != 0:
+        return v_int(cast[int64](eval_status))
+    if scope_has(nref) != 0:
+        return scope_get(nref)
+    # fall back to the environment
+    ev: Ptr[uint8] = env_get(np)
+    if cast[uint64](ev) != 0:
+        return v_str_cstr(ev)
+    return 0     # nil
+
+
+def eval_call(node: int32) -> int32:
+    # Built-in expression functions + user-defined functions.
+    nu: uint64 = cast[uint64](node)
+    fname: Ptr[uint8] = str_ptr(nd_str[nu])
+    nargs: uint64 = nd_kn[nu]
+    # len(x)
+    if cstr_eq(fname, "len") != 0:
+        if nargs >= 1:
+            a: int32 = eval_expr(nd_kid_at(node, 0))
+            t: int32 = val_type[cast[uint64](a)]
+            if t == VT_LIST:
+                return v_int(cast[int64](val_ec[cast[uint64](a)]))
+            if t == VT_STR:
+                return v_int(cast[int64](
+                    str_len(cast[uint64](val_pay[cast[uint64](a)]))))
+        return v_int(0)
+    # int(x) / str(x)
+    if cstr_eq(fname, "int") != 0:
+        if nargs >= 1:
+            return v_int(_val_as_int(eval_expr(nd_kid_at(node, 0))))
+        return v_int(0)
+    if cstr_eq(fname, "str") != 0:
+        if nargs >= 1:
+            a: int32 = eval_expr(nd_kid_at(node, 0))
+            return v_str_cstr(v_render_str_only(a))
+        return v_str_ref(0)
+    # lines(x): split a string on '\n' into a list (the §8 converter).
+    if cstr_eq(fname, "lines") != 0:
+        if nargs >= 1:
+            a: int32 = eval_expr(nd_kid_at(node, 0))
+            return v_split_lines(a)
+        return v_list_begin()
+    # user-defined function
+    return call_user_fn(nd_str[nu], node)
+
+
+def v_split_lines(v: int32) -> int32:
+    # Split a string value into a list of line strings (no trailing
+    # empty element for a final newline).
+    lst: int32 = v_list_begin()
+    if val_type[cast[uint64](v)] != VT_STR:
+        return lst
+    s: Ptr[uint8] = str_ptr(cast[uint64](val_pay[cast[uint64](v)]))
+    n: uint64 = cstr_len(s)
+    start: uint64 = 0
+    p: uint64 = 0
+    while p < n:
+        if s[p] == 10:
+            ref: uint64 = str_intern_n(
+                cast[Ptr[uint8]](cast[uint64](s) + start), p - start)
+            v_list_push(lst, v_str_ref(ref))
+            start = p + 1
+        p = p + 1
+    if start < n:
+        ref: uint64 = str_intern_n(
+            cast[Ptr[uint8]](cast[uint64](s) + start), n - start)
+        v_list_push(lst, v_str_ref(ref))
+    return lst
+
+
+def eval_expr(node: int32) -> int32:
+    if node == 0:
+        return 0
+    nu: uint64 = cast[uint64](node)
+    k: int32 = nd_kind[nu]
+    if k == ND_INT:
+        return v_int(nd_i[nu])
+    if k == ND_STR:
+        return v_str_ref(nd_str[nu])
+    if k == ND_WORD:
+        return v_str_ref(nd_str[nu])
+    if k == ND_STRI:
+        return eval_str_interp(nd_str[nu])
+    if k == ND_TRUE:
+        return v_bool(1)
+    if k == ND_FALSE:
+        return v_bool(0)
+    if k == ND_VAR:
+        return eval_var_by_name(nd_str[nu])
+    if k == ND_DOLEXPR:
+        return eval_subexpr(nd_str[nu])
+    if k == ND_BACKEXP:
+        return capture_command(nd_str[nu])
+    if k == ND_BINOP:
+        return eval_binop(node)
+    if k == ND_UNOP:
+        op: int32 = cast[int32](nd_i[nu])
+        a: int32 = eval_expr(nd_a[nu])
+        if op == OP_MINUS:
+            return v_int(-_val_as_int(a))
+        if op == OP_NOT:
+            if v_is_truthy(a) != 0:
+                return v_bool(0)
+            return v_bool(1)
+        return a
+    if k == ND_LIST:
+        lst: int32 = v_list_begin()
+        i: uint64 = 0
+        while i < nd_kn[nu]:
+            elem: int32 = eval_expr(nd_kid_at(node, i))
+            v_list_push(lst, elem)
+            i = i + 1
+        return lst
+    if k == ND_DICT:
+        d: int32 = v_new(VT_DICT)
+        val_es[cast[uint64](d)] = val_elem_cursor
+        val_ec[cast[uint64](d)] = 0
+        i: uint64 = 0
+        while i + 1 < nd_kn[nu]:
+            key: int32 = eval_expr(nd_kid_at(node, i))
+            value: int32 = eval_expr(nd_kid_at(node, i + 1))
+            if val_elem_cursor + 1 < LISTELEM_MAX:
+                val_elem[val_elem_cursor] = key
+                val_elem[val_elem_cursor + 1] = value
+                val_elem_cursor = val_elem_cursor + 2
+                val_ec[cast[uint64](d)] = val_ec[cast[uint64](d)] + 1
+            i = i + 2
+        return d
+    if k == ND_INDEX:
+        cont: int32 = eval_expr(nd_a[nu])
+        idx: int32 = eval_expr(nd_b[nu])
+        ct: int32 = val_type[cast[uint64](cont)]
+        if ct == VT_LIST:
+            ii: int64 = _val_as_int(idx)
+            if ii >= 0 and cast[uint64](ii) < val_ec[cast[uint64](cont)]:
+                return v_list_get(cont, cast[uint64](ii))
+            return 0
+        if ct == VT_DICT:
+            return dict_get(cont, idx)
+        return 0
+    if k == ND_CALL:
+        return eval_call(node)
+    return 0
+
+
+def dict_get(d: int32, key: int32) -> int32:
+    du: uint64 = cast[uint64](d)
+    n: uint64 = val_ec[du]
+    base: uint64 = val_es[du]
+    i: uint64 = 0
+    while i < n:
+        k: int32 = val_elem[base + i * 2]
+        if _v_streq(k, key) != 0:
+            return val_elem[base + i * 2 + 1]
+        i = i + 1
+    return 0
+
+
+# ====================================================================
+# Command execution
+# ====================================================================
+# Building the argv for one command stage. §3's list-interpolation
+# rule: when a list value interpolates into command position, EACH
+# ELEMENT becomes EXACTLY ONE argument. No re-splitting, ever. A value
+# containing spaces stays one argument.
+
+# argv assembly arenas. The argv strings are interned; argv_ptr holds
+# cstring pointers for sys_spawn (NULL-terminated).
+argv_ptr:   Array[64, uint64]
+argv_n:     uint64 = 0
+
+# Globbing scratch.
+glob_buf:   Array[1024, uint8]
+
+
+def _argv_reset():
+    argv_n = 0
+
+
+def _argv_push_cstr(s: Ptr[uint8]):
+    if argv_n + 1 >= ARGV_MAX:
+        return
+    # intern so the pointer survives val_reset
+    ref: uint64 = str_intern_cstr(s)
+    argv_ptr[argv_n] = cast[uint64](str_ptr(ref))
+    argv_n = argv_n + 1
+
+
+def _argv_push_value(v: int32):
+    # §3 list-interpolation: a list contributes one argv entry PER
+    # element; every other value contributes exactly one entry.
+    if val_type[cast[uint64](v)] == VT_LIST:
+        i: uint64 = 0
+        n: uint64 = val_ec[cast[uint64](v)]
+        while i < n:
+            elem: int32 = v_list_get(v, i)
+            _argv_push_cstr(v_render_str_only(elem))
+            i = i + 1
+        return
+    _argv_push_cstr(v_render_str_only(v))
+
+
+def _word_has_glob(s: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while s[i] != 0:
+        c: uint8 = s[i]
+        if c == 42 or c == 63:               # '*' '?'
             return 1
         i = i + 1
     return 0
 
 
-def _expand_token(tok: Ptr[uint8]) -> Ptr[uint8]:
-    # Walk `tok` once, copying literal bytes into expand_buf and
-    # substituting `$?` / `$NAME` as we find them. Identifier match
-    # is greedy: [A-Za-z_][A-Za-z_0-9]*. A `$` followed by anything
-    # else (digit, symbol, EOS) is copied through literally — same
-    # behavior as bash for unsupported V0 forms ($5, $!, $$, …).
-    # Returns a pointer to the start of the expansion in expand_buf
-    # (NUL-terminated), or nullptr if the buffer would overflow.
-    #
-    # Scratch identifier buffer used to build the NUL-terminated NAME
-    # before var_get. A true function-local; 24 bytes covers
-    # VAR_NAME_MAX (16) plus slack.
-    expand_name_tmp: Array[24, uint8]
-    start: uint64 = expand_cursor
+def _argv_build(cmdnode: int32) -> int32:
+    # Build argv from a command node's word kids. Returns argc.
+    # A bare ND_WORD containing glob metacharacters expands against
+    # the current namespace (the only implicit expansion, §4).
+    _argv_reset()
+    nu: uint64 = cast[uint64](cmdnode)
     i: uint64 = 0
-    while tok[i] != 0:
-        c: uint8 = tok[i]
-        if c == 36:                                     # '$'
-            nxt: uint8 = tok[i + 1]
-            if nxt == 63:                               # '$?'
-                # Copy exit_str_buf bytes (pre-rendered by caller).
-                j: uint64 = 0
-                while exit_str_buf[j] != 0:
-                    if expand_cursor + 1 >= EXPAND_BUF_MAX:
-                        if expand_overflow_warned == 0:
-                            write_str(2, "hamsh: expand_buf full\n")
-                            expand_overflow_warned = 1
-                        return cast[Ptr[uint8]](0)
-                    expand_buf[expand_cursor] = exit_str_buf[j]
-                    expand_cursor = expand_cursor + 1
-                    j = j + 1
-                i = i + 2
-            elif _is_name_start(nxt) != 0:
-                # Greedy identifier: NAME = [A-Za-z_][A-Za-z_0-9]*.
-                name_start: uint64 = i + 1
-                name_end:   uint64 = name_start + 1
-                while _is_name_cont(tok[name_end]) != 0:
-                    name_end = name_end + 1
-                # Build NUL-terminated NAME in the scratch buf
-                # (16-byte cap matches VAR_NAME_MAX; longer names
-                # won't var_get anyway and will fall through to the
-                # literal path).
-                nlen: uint64 = name_end - name_start
-                if nlen >= 24:
-                    nlen = 23
-                ni: uint64 = 0
-                while ni < nlen:
-                    expand_name_tmp[ni] = tok[name_start + ni]
-                    ni = ni + 1
-                expand_name_tmp[nlen] = 0
-                v: Ptr[uint8] = var_get(&expand_name_tmp[0])
-                if cast[uint64](v) != 0:
-                    # Hit — copy value bytes.
-                    k: uint64 = 0
-                    while v[k] != 0:
-                        if expand_cursor + 1 >= EXPAND_BUF_MAX:
-                            if expand_overflow_warned == 0:
-                                write_str(2,
-                                    "hamsh: expand_buf full\n")
-                                expand_overflow_warned = 1
-                            return cast[Ptr[uint8]](0)
-                        expand_buf[expand_cursor] = v[k]
-                        expand_cursor = expand_cursor + 1
-                        k = k + 1
-                else:
-                    # Miss — copy literal `$NAME` so typos surface.
-                    li: uint64 = i
-                    while li < name_end:
-                        if expand_cursor + 1 >= EXPAND_BUF_MAX:
-                            if expand_overflow_warned == 0:
-                                write_str(2,
-                                    "hamsh: expand_buf full\n")
-                                expand_overflow_warned = 1
-                            return cast[Ptr[uint8]](0)
-                        expand_buf[expand_cursor] = tok[li]
-                        expand_cursor = expand_cursor + 1
-                        li = li + 1
-                i = name_end
+    while i < nd_kn[nu]:
+        kid: int32 = nd_kid_at(cmdnode, i)
+        kk: int32 = nd_kind[cast[uint64](kid)]
+        if kk == ND_WORD:
+            wp: Ptr[uint8] = str_ptr(nd_str[cast[uint64](kid)])
+            if _word_has_glob(wp) != 0:
+                _argv_glob_expand(wp)
             else:
-                # `$` followed by digit / symbol / NUL — copy literal
-                # `$`, advance one. NUL case is harmless: outer loop
-                # exits next iteration.
-                if expand_cursor + 1 >= EXPAND_BUF_MAX:
-                    if expand_overflow_warned == 0:
-                        write_str(2, "hamsh: expand_buf full\n")
-                        expand_overflow_warned = 1
-                    return cast[Ptr[uint8]](0)
-                expand_buf[expand_cursor] = 36
-                expand_cursor = expand_cursor + 1
-                i = i + 1
+                _argv_push_cstr(wp)
         else:
-            if expand_cursor + 1 >= EXPAND_BUF_MAX:
-                if expand_overflow_warned == 0:
-                    write_str(2, "hamsh: expand_buf full\n")
-                    expand_overflow_warned = 1
-                return cast[Ptr[uint8]](0)
-            expand_buf[expand_cursor] = c
-            expand_cursor = expand_cursor + 1
-            i = i + 1
-    # NUL-terminate the expanded token, advance past the NUL.
-    if expand_cursor >= EXPAND_BUF_MAX:
-        if expand_overflow_warned == 0:
-            write_str(2, "hamsh: expand_buf full\n")
-            expand_overflow_warned = 1
-        return cast[Ptr[uint8]](0)
-    expand_buf[expand_cursor] = 0
-    expand_cursor = expand_cursor + 1
-    return &expand_buf[start]
-
-
-def tokenize(line: Ptr[uint8], n: uint64,
-             argv: Ptr[uint64], argv_max: uint64) -> uint64:
-    # In-place whitespace tokenizer with double-quote support.
-    # Builds a tokenized line by writing back into the SAME buffer:
-    # a `read` cursor `i` scans forward, a `write` cursor `w` lays
-    # down NUL-terminated spans. Double quotes around a region let
-    # whitespace through to the same token (matches sh's "..." form).
-    # Single quotes and backslash escapes aren't supported yet.
-    argc: uint64 = 0
-    i:    uint64 = 0
-    w:    uint64 = 0
-    while i < n:
-        # Skip whitespace AND our own NULs (left behind as terminators
-        # for previously-emitted tokens). The write cursor advances
-        # ahead of `i` when we strip quote characters, so the byte at
-        # line[i] after the previous token may be either the original
-        # separator or a stale NUL — both should be skipped.
-        while i < n and (is_space(line[i]) != 0 or line[i] == 0):
-            i = i + 1
-        if i >= n:
-            break
-        if argc + 1 < argv_max:
-            argv[argc] = cast[uint64](&line[w])
-            argc = argc + 1
-        # Consume one token. `in_quote` tracks whether we're inside
-        # a "..." span; while quoted, whitespace counts as content.
-        in_quote: int32 = 0
-        while i < n:
-            c: uint8 = line[i]
-            if in_quote == 0 and is_space(c) != 0:
-                break
-            if c == 34:                              # '"'
-                in_quote = 1 - in_quote
-                i = i + 1
-                continue
-            line[w] = c
-            w = w + 1
-            i = i + 1
-        line[w] = 0                                  # terminate this token
-        w = w + 1
-    argv[argc] = 0
-    return argc
-
-
-def find_token(argv: Ptr[uint64], argc: uint64, tok: uint8) -> uint64:
-    # Walk argv looking for the single-char token `tok`. Returns the
-    # LAST occurrence's index, or argc if not found. Used by `>` —
-    # bash-compat for the simple cases we care about.
-    found: uint64 = argc
-    i: uint64 = 0
-    while i < argc:
-        s: Ptr[uint8] = cast[Ptr[uint8]](argv[i])
-        if s[0] == tok and s[1] == 0:
-            found = i
+            v: int32 = eval_expr(kid)
+            _argv_push_value(v)
         i = i + 1
-    return found
+    argv_ptr[argv_n] = 0
+    return cast[int32](argv_n)
 
 
-def split_segments(argv: Ptr[uint64], argc: uint64,
-                   starts: Ptr[uint64], max_segs: uint64) -> uint64:
-    # Slice argv at every "|" boundary. starts[i] is the index in
-    # argv where segment i begins; NULs the "|" token in place so
-    # each &argv[starts[i]] is a valid NUL-terminated argv for
-    # SYS_SPAWN. Returns the segment count, capped at max_segs.
-    # An empty segment (consecutive pipes or leading/trailing "|")
-    # surfaces as a zero-length segment and is the caller's problem.
-    starts[0] = 0
-    nseg: uint64 = 1
-    i: uint64 = 0
-    while i < argc and nseg < max_segs:
-        s: Ptr[uint8] = cast[Ptr[uint8]](argv[i])
-        if s[0] == 124 and s[1] == 0:                # '|'
-            argv[i] = 0                              # terminate prior seg
-            starts[nseg] = i + 1
-            nseg = nseg + 1
-        i = i + 1
-    return nseg
+def _argv_glob_expand(pattern: Ptr[uint8]):
+    # Expand a glob against the current namespace. We do a directory
+    # listing of the pattern's parent dir and match the leaf. If no
+    # match, the literal pattern is kept (bash 'nullglob off' default).
+    # Conservative: split off the dir prefix, listdir, fnmatch leaf.
+    matched: int32 = _glob_try(pattern)
+    if matched == 0:
+        _argv_push_cstr(pattern)
 
 
-def print_prompt():
-    # Show the cwd in the prompt so `cd` feedback is immediate.
-    # Without this users have no visual confirmation that cd worked
-    # (or didn't) and accumulate junk paths via `cd nope/nope/nope`.
-    cwd: Array[256, uint8]
-    n: int64 = sys_getcwd(&cwd[0], 256)
-    if n > 0:
-        # sys_getcwd writes a NUL-terminated string; n includes the NUL.
-        # Skip the trailing NUL when writing to stdout.
-        nlen: uint64 = cast[uint64](n)
-        if nlen > 0 and cwd[nlen - 1] == 0:
-            nlen = nlen - 1
-        sys_write(1, &cwd[0], nlen)
-    sys_write(1, "$ ", 2)
-
-
-# M16.x: small history ring. Stores up to HISTORY_MAX completed
-# lines; arrow-Up walks backward through them, arrow-Down walks
-# forward. Each slot is sized to the same 128-byte line cap as
-# line_buf so we can memcpy snapshots in either direction. The
-# `history_count` field is the TOTAL number of lines ever pushed
-# (mod arithmetic on HISTORY_MAX picks the slot); we keep the
-# absolute count so first-time arrow-Up reliably hits the most
-# recent entry even after the ring wraps.
-HISTORY_MAX:  uint64 = 16
-HISTORY_LINE: uint64 = 128
-history_buf:   Array[2048, uint8]               # 16 * 128
-history_count: uint64 = 0
-
-
-def _history_store(buf: Ptr[uint8], n: uint64):
-    # Copy `buf[0..n)` into the next history slot; NUL-terminate.
-    # Skip a blank or single-newline entry — those would push real
-    # history out of the ring with nothing useful.
-    if n == 0:
-        return
-    if n == 1 and (buf[0] == 0x0A or buf[0] == 0x0D):
-        return
-    slot: uint64 = history_count % HISTORY_MAX
-    base: uint64 = slot * HISTORY_LINE
-    copy_len: uint64 = n
-    if copy_len >= HISTORY_LINE:
-        copy_len = HISTORY_LINE - 1
-    # Trim trailing CR/LF — history entries store the raw command,
-    # not the keystroke that terminated it.
-    while copy_len > 0 \
-            and (buf[copy_len - 1] == 0x0A \
-                 or buf[copy_len - 1] == 0x0D):
-        copy_len = copy_len - 1
-    i: uint64 = 0
-    while i < copy_len:
-        history_buf[base + i] = buf[i]
-        i = i + 1
-    history_buf[base + i] = 0
-    history_count = history_count + 1
-
-
-def _history_load(idx_back: uint64, out: Ptr[uint8], cap: uint64) -> uint64:
-    # Load history entry `idx_back` slots back from the most recent
-    # (idx_back=0 → most recent, 1 → second-most-recent, ...). Writes
-    # NUL-terminated bytes into `out`; returns the length (excluding
-    # NUL). Returns 0 if no such entry exists.
-    if history_count == 0:
-        return 0
-    if idx_back >= history_count or idx_back >= HISTORY_MAX:
-        return 0
-    slot: uint64 = (history_count - 1 - idx_back) % HISTORY_MAX
-    base: uint64 = slot * HISTORY_LINE
-    j: uint64 = 0
-    while j + 1 < cap and history_buf[base + j] != 0:
-        out[j] = history_buf[base + j]
-        j = j + 1
-    out[j] = 0
-    return j
-
-
-def _erase_n(n: uint64):
-    # Emit `\b \b` n times to wipe n characters from the terminal.
-    # Each iteration sends 3 bytes; cheap enough at LINE_MAX=128.
-    i: uint64 = 0
-    while i < n:
-        sys_write(1, "\x08 \x08", 3)
-        i = i + 1
-
-
-# Character-at-a-time line reader with local echo. On real hardware
-# the PS/2 keyboard feeds /dev/cons one byte per keystroke; sys_read
-# returns immediately on the first byte, so the previous "read up to
-# LINE_MAX into line_buf and treat as a line" pattern processed every
-# keystroke as its own empty line. This loop accumulates bytes until
-# a newline (or Enter, mapped to LF by the kbd driver), echoes each
-# byte back so the user sees what they typed, and handles backspace
-# (DEL = 0x7f, M16.100 atkbd convention) by erasing the previous
-# character on screen.
+# --- the /fd device + pipe/redirect/dup as bind (§7) ----------------
+# A process's standard streams are names in its namespace: /fd/0,
+# /fd/1, /fd/2 — served by the #d device. Pipe, redirect, and dup are
+# ALL the one operation: bind a Chan at an /fd/N name.
 #
-# M16.x: also handles VT220-style escape sequences emitted by the
-# atkbd driver (M16.100) — arrow keys, Delete, F1..F4. ESC [ A / B
-# walk history backwards/forwards (rewrites the visible line + the
-# in-progress buf). ESC [ C / D (Right/Left arrows) are swallowed
-# silently — we don't support intra-line cursor movement yet, but
-# we MUST consume the bytes so they don't appear on screen as
-# garbage. ESC [ 3 ~ (Delete) acts as Backspace on the trailing
-# char (best effort given no cursor model). ESC O P..S (F1..F4)
-# are swallowed entirely.
-def read_line(buf: Ptr[uint8], cap: uint64) -> int64:
-    pos: uint64 = 0
-    one: Array[1, uint8]
-    # `hist_idx` tracks how many entries back from the freshest we're
-    # currently showing. 0 = "no history substitution active, what's
-    # in buf is what the user typed". Each Up arrow bumps it; Down
-    # decrements until it hits 0 (then leaves buf empty).
-    hist_idx: uint64 = 0
-    while pos < cap - 1:
-        n: int64 = sys_read(0, &one[0], 1)
-        if n <= 0:
-            # EOF / error on stdin — bail out preserving what we have
-            # so far; caller treats this as exit if pos==0.
-            if pos == 0:
-                return n
-            buf[pos] = cast[uint8](0x0A)    # synthesise a LF
-            pos = pos + 1
-            return cast[int64](pos)
-        c: uint8 = one[0]
-        if c == 0x1B:
-            # Escape sequence. Look at the next byte to decide what
-            # to do. The atkbd driver (M16.100) emits the standard
-            # VT220 forms; sequences are at most 5 bytes (e.g.
-            # ESC [ 1 5 ~ for F5).
-            nb: Array[1, uint8]
-            r2: int64 = sys_read(0, &nb[0], 1)
-            if r2 <= 0:
-                # Bare ESC at EOF — swallow.
-                continue
-            c2: uint8 = nb[0]
-            if c2 == 0x5B:                          # '[' — CSI sequence
-                r3: int64 = sys_read(0, &nb[0], 1)
-                if r3 <= 0:
-                    continue
-                c3: uint8 = nb[0]
-                if c3 == 0x41:                      # 'A' — Up arrow
-                    # Replace the line in-progress with the next
-                    # older history entry. Erase what's on screen
-                    # first, then print + load the history line.
-                    new_idx: uint64 = hist_idx + 1
-                    out_tmp: Array[128, uint8]
-                    new_len: uint64 = _history_load(
-                        new_idx - 1, &out_tmp[0], HISTORY_LINE)
-                    if new_len > 0:
-                        _erase_n(pos)
-                        pos = 0
-                        sys_write(1, &out_tmp[0], new_len)
-                        ii: uint64 = 0
-                        while ii < new_len and pos < cap - 1:
-                            buf[pos] = out_tmp[ii]
-                            pos = pos + 1
-                            ii = ii + 1
-                        hist_idx = new_idx
-                    continue
-                if c3 == 0x42:                      # 'B' — Down arrow
-                    if hist_idx > 1:
-                        new_idx2: uint64 = hist_idx - 1
-                        out_tmp2: Array[128, uint8]
-                        new_len2: uint64 = _history_load(
-                            new_idx2 - 1, &out_tmp2[0], HISTORY_LINE)
-                        _erase_n(pos)
-                        pos = 0
-                        sys_write(1, &out_tmp2[0], new_len2)
-                        jj: uint64 = 0
-                        while jj < new_len2 and pos < cap - 1:
-                            buf[pos] = out_tmp2[jj]
-                            pos = pos + 1
-                            jj = jj + 1
-                        hist_idx = new_idx2
-                    elif hist_idx == 1:
-                        # Going forward past the freshest entry —
-                        # land on an empty line.
-                        _erase_n(pos)
-                        pos = 0
-                        hist_idx = 0
-                    continue
-                if c3 == 0x43 or c3 == 0x44:        # 'C'/'D' — Right/Left
-                    # No intra-line cursor model yet. Swallow the
-                    # bytes so the user doesn't see ^[[C / ^[[D.
-                    continue
-                if c3 == 0x33:                      # '3' — likely Delete
-                    # Standard form is ESC [ 3 ~ . Consume one more
-                    # byte to eat the trailing '~' (or any digit /
-                    # ';' for the 4-byte variants). Treat as a
-                    # best-effort Backspace on the trailing char.
-                    tilde: Array[1, uint8]
-                    sys_read(0, &tilde[0], 1)
-                    if pos > 0:
-                        pos = pos - 1
-                        sys_write(1, "\x08 \x08", 3)
-                    continue
-                # Unknown CSI sequence — consume up to one more byte
-                # if the third byte is a digit (parametrised forms
-                # like ESC [ 1 5 ~). Either way, swallow silently.
-                if c3 >= 0x30 and c3 <= 0x39:
-                    tail: Array[1, uint8]
-                    while True:
-                        rt: int64 = sys_read(0, &tail[0], 1)
-                        if rt <= 0:
-                            break
-                        tc: uint8 = tail[0]
-                        # Final byte of a CSI is in 0x40..0x7E.
-                        if tc >= 0x40 and tc <= 0x7E:
-                            break
-                continue
-            if c2 == 0x4F:                          # 'O' — F1..F4 prefix
-                # Consume one more byte (P/Q/R/S) and swallow.
-                tail2: Array[1, uint8]
-                sys_read(0, &tail2[0], 1)
-                continue
-            # Lone ESC + something else — swallow both bytes silently.
-            continue
-        if c == 0x7F or c == 0x08:
-            # DEL / Backspace — erase last char from buffer + screen.
-            if pos > 0:
-                pos = pos - 1
-                # `\b \b` — back up, overwrite with space, back up again.
-                sys_write(1, "\x08 \x08", 3)
-            continue
-        # Echo the byte back to stdout.
-        sys_write(1, &one[0], 1)
-        buf[pos] = c
-        pos = pos + 1
-        if c == 0x0A or c == 0x0D:
-            # CR or LF terminates the line. atkbd emits LF for Enter;
-            # serial input gives us CR. Either way, return now.
-            _history_store(buf, pos)
-            return cast[int64](pos)
-    return cast[int64](pos)
+# At the syscall level the kernel still hands a child its stdin/stdout
+# via sys_spawn's stdin_fd/stdout_fd integer fds — those integers ARE
+# the /fd/N names (the Linux-ABI fd<->/fd/N mapping, §7). hamsh's job
+# is to make pipe / `>` / `2>&1` resolve to "bind a channel at the
+# fd-name", which it does by opening the channel and threading the
+# resulting fd into the child's /fd slot. A LOCAL pipe is a devtab
+# pipe Chan — direct Chan reads, zero mountrpc (§6).
+
+# fd-bind plan for one command: which Chan backs /fd/0,1,2.
+fdb_in:   int32 = 0       # fd to install as child /fd/0
+fdb_out:  int32 = 1       # fd to install as child /fd/1
+fdb_err:  int32 = 2       # fd to install as child /fd/2
 
 
-def builtin_help():
-    write_str(1, "hamsh builtins: exit, help, cd\n")
-    write_str(1, "external commands are read from the cpio initramfs;\n")
-    write_str(1, "  e.g. type '/hello' to run /hello.\n")
-    write_str(1, "redirect stdout with '>' onto any /tmp/ path, pipe\n")
-    write_str(1, "two commands with '|':\n")
-    write_str(1, "  /echo hi > /tmp/x\n")
-    write_str(1, "  /cat /tmp/x\n")
-    write_str(1, "  /echo two words | /cat\n")
-
-
-# PATH lookup buffer. spawn_cmd builds resolved paths here when a
-# bare command name (no leading /) needs disambiguation. Sized for
-# the longest legal path we might construct — PATH dir + name.
-path_buf: Array[256, uint8]
-
-# U17: envp staging for sys_spawn. The kernel deep-copies these
-# bytes onto the child's user stack before the child runs, so it's
-# safe to reuse these buffers across spawn calls.
-#
-# Layout per slot in envp_str_buf: "NAME=VALUE\0" — at most
-# VAR_NAME_MAX (16) + 1 ('=') + VAR_VALUE_MAX (48) + 1 (NUL) = 66
-# bytes. We size to 72 for round-number alignment. The pointer
-# array has VAR_MAX entries plus one NUL terminator (9 total).
-ENVP_STR_STRIDE: uint64 = 72
-envp_str_buf: Array[576, uint8]   # 8 * 72
-envp_ptrs:    Array[9, uint64]    # VAR_MAX (8) + NUL terminator
-
-
-def _build_envp_block() -> Ptr[uint64]:
-    # Walk the shell's var_table and serialize each live slot as
-    # "NAME=VALUE\0" into envp_str_buf, with envp_ptrs[i] pointing
-    # at the start of that string. Pointer array is NULL-terminated
-    # so the kernel's _envp_count can walk it without a separate
-    # length. Returns the address of envp_ptrs (the array of
-    # cstring pointers musl reads at process start).
-    n: uint64 = 0
-    si: uint64 = 0
+def _fd_name_path(n: int32, buf: Ptr[uint8]):
+    # Render the /fd/N path for fd-number n into buf.
+    buf[0] = 47        # '/'
+    buf[1] = 102       # 'f'
+    buf[2] = 100       # 'd'
+    buf[3] = 47        # '/'
+    src: Ptr[uint8] = render_int(cast[int64](n))
     i: uint64 = 0
-    while i < VAR_MAX:
-        if var_table[i].used != 0:
-            base: uint64 = si * ENVP_STR_STRIDE
-            envp_ptrs[n] = cast[uint64](&envp_str_buf[base])
-            # Copy NAME.
-            off: uint64 = 0
-            j: uint64 = 0
-            while var_table[i].name[j] != 0 and \
-                    off + 1 < ENVP_STR_STRIDE:
-                envp_str_buf[base + off] = var_table[i].name[j]
-                off = off + 1
-                j = j + 1
-            # '=' separator.
-            if off + 1 < ENVP_STR_STRIDE:
-                envp_str_buf[base + off] = 61            # '='
-                off = off + 1
-            # Copy VALUE.
-            k: uint64 = 0
-            while var_table[i].value[k] != 0 and \
-                    off + 1 < ENVP_STR_STRIDE:
-                envp_str_buf[base + off] = var_table[i].value[k]
-                off = off + 1
-                k = k + 1
-            envp_str_buf[base + off] = 0                 # NUL
-            n = n + 1
-            si = si + 1
+    while src[i] != 0:
+        buf[4 + i] = src[i]
         i = i + 1
-    envp_ptrs[n] = 0                                     # NULL terminator
-    return cast[Ptr[uint64]](&envp_ptrs[0])
+    buf[4 + i] = 0
 
-# Hardcoded PATH. Real shells get this from the env; we don't have
-# env yet, so the search list lives here. Order matters — first
-# match wins. /bin is the canonical user-bin location, /sbin is
-# kept for future system-admin tools.
-def _path_dir(i: uint32) -> Ptr[uint8]:
+
+# --- PATH resolution + spawn ----------------------------------------
+spawn_path: Array[256, uint8]
+
+
+def _path_prefix(i: int32) -> Ptr[uint8]:
     if i == 0:
         return "/bin/"
     if i == 1:
@@ -784,880 +2360,1195 @@ def _path_dir(i: uint32) -> Ptr[uint8]:
     return cast[Ptr[uint8]](0)
 
 
-def _concat_path(prefix: Ptr[uint8], name: Ptr[uint8]) -> uint64:
-    # Write prefix + name + NUL into path_buf. Returns the
-    # length written (excluding the NUL). Caller has already
-    # checked path_buf can fit.
+def _build_path(prefix: Ptr[uint8], cmd: Ptr[uint8]):
     pi: uint64 = 0
-    while prefix[pi] != 0:
-        path_buf[pi] = prefix[pi]
+    if cast[uint64](prefix) != 0:
+        while prefix[pi] != 0:
+            spawn_path[pi] = prefix[pi]
+            pi = pi + 1
+    ci: uint64 = 0
+    while cmd[ci] != 0 and pi + 1 < 256:
+        spawn_path[pi] = cmd[ci]
         pi = pi + 1
-    ni: uint64 = 0
-    while name[ni] != 0:
-        path_buf[pi] = name[ni]
+        ci = ci + 1
+    spawn_path[pi] = 0
+
+
+# envp staging for sys_spawn — children inherit /env through it.
+ENVP_STRIDE:  uint64 = 224
+envp_strs:    Array[7168, uint8]   # 32 * 224
+envp_ptrs:    Array[33, uint64]
+
+
+def _build_envp() -> Ptr[uint64]:
+    n: uint64 = 0
+    i: uint64 = 0
+    while i < ENV_MAX:
+        if env_used[i] != 0:
+            base: uint64 = n * ENVP_STRIDE
+            envp_ptrs[n] = cast[uint64](&envp_strs[base])
+            off: uint64 = 0
+            nb: uint64 = i * ENV_NAME_MAX
+            j: uint64 = 0
+            while env_name[nb + j] != 0 and off + 1 < ENVP_STRIDE:
+                envp_strs[base + off] = env_name[nb + j]
+                off = off + 1
+                j = j + 1
+            if off + 1 < ENVP_STRIDE:
+                envp_strs[base + off] = 61          # '='
+                off = off + 1
+            vb: uint64 = i * ENV_VAL_MAX
+            k: uint64 = 0
+            while env_val[vb + k] != 0 and off + 1 < ENVP_STRIDE:
+                envp_strs[base + off] = env_val[vb + k]
+                off = off + 1
+                k = k + 1
+            envp_strs[base + off] = 0
+            n = n + 1
+        i = i + 1
+    envp_ptrs[n] = 0
+    return cast[Ptr[uint64]](&envp_ptrs[0])
+
+
+def spawn_resolved(cmd: Ptr[uint8], argv: Ptr[uint64],
+                   sin: int32, sout: int32) -> int32:
+    # Resolve `cmd` to a path and sys_spawn it. A command containing
+    # '/' is taken verbatim; otherwise PATH dirs are tried in order.
+    envp: Ptr[uint64] = _build_envp()
+    has_slash: int32 = 0
+    i: uint64 = 0
+    while cmd[i] != 0:
+        if cmd[i] == 47:
+            has_slash = 1
+        i = i + 1
+    if has_slash != 0:
+        return sys_spawn(cast[Ptr[char]](cmd), argv, sin, sout, envp)
+    pi: int32 = 0
+    while pi < 3:
+        _build_path(_path_prefix(pi), cmd)
+        pid: int32 = sys_spawn(cast[Ptr[char]](&spawn_path[0]),
+                               argv, sin, sout, envp)
+        if pid >= 0:
+            return pid
         pi = pi + 1
-        ni = ni + 1
-    path_buf[pi] = 0
-    return pi
-
-
-def _try_spawn_with_prefix(prefix_start: Ptr[uint8],
-                            prefix_len: uint64,
-                            cmd: Ptr[uint8],
-                            argv: Ptr[uint64],
-                            stdin_fd: int32,
-                            stdout_fd: int32,
-                            envp: Ptr[uint64]) -> int32:
-    # Build path_buf = prefix + '/' + cmd + NUL, then sys_spawn it.
-    # `prefix_len == 0` means the prefix is empty (don't prepend
-    # anything — used for the CWD-style "." segment in PATH).
-    pi: uint64 = 0
-    j: uint64 = 0
-    while j < prefix_len:
-        path_buf[pi] = prefix_start[j]
-        pi = pi + 1
-        j = j + 1
-    # Insert '/' between prefix and cmd unless the prefix already
-    # ended with one (avoid "/bin//ls" — cosmetic only, but matches
-    # bash's PATH-resolver shape).
-    if pi == 0 or path_buf[pi - 1] != 47:
-        path_buf[pi] = 47                           # '/'
-        pi = pi + 1
-    ni: uint64 = 0
-    while cmd[ni] != 0:
-        path_buf[pi] = cmd[ni]
-        pi = pi + 1
-        ni = ni + 1
-    path_buf[pi] = 0
-    argv[0] = cast[uint64](&path_buf[0])
-    return sys_spawn(cast[Ptr[char]](&path_buf[0]),
-                     argv, stdin_fd, stdout_fd, envp)
-
-
-def spawn_cmd(argv: Ptr[uint64], stdin_fd: int32, stdout_fd: int32) -> int32:
-    cmd: Ptr[uint8] = cast[Ptr[uint8]](argv[0])
-    # U17: build envp from the shell's variable table ONCE per
-    # spawn. Every var_table slot is exported — hamsh has no
-    # export/local distinction yet, so the shell's view of
-    # variables is exactly what the child sees.
-    envp: Ptr[uint64] = _build_envp_block()
-    # Absolute path → spawn as-is, no PATH walk.
-    if cmd[0] == 47:                                # '/'
-        pid: int32 = sys_spawn(cast[Ptr[char]](cmd), argv,
-                               stdin_fd, stdout_fd, envp)
-        if pid < 0:
-            write_str(2, "hamsh: not found: ")
-            write_str(2, cmd)
-            write_str(2, "\n")
-        return pid
-
-    saved_argv0: uint64 = argv[0]
-
-    # M16.79: prefer the user-set PATH variable. If $PATH is set,
-    # split on ':' and try each segment. Empty segments mean CWD
-    # (the same semantic bash uses). If $PATH is unset, fall back
-    # to the M16.72 hardcoded list (/bin, /sbin, /usr/bin).
-    path_var: Ptr[uint8] = var_get("PATH")
-    if cast[uint64](path_var) != 0:
-        i: uint64 = 0
-        while True:
-            # Find the next ':' (or end-of-string).
-            seg_start: uint64 = i
-            while path_var[i] != 0 and path_var[i] != 58:
-                i = i + 1
-            seg_len: uint64 = i - seg_start
-            pid: int32 = _try_spawn_with_prefix(
-                cast[Ptr[uint8]](cast[uint64](path_var) + seg_start),
-                seg_len, cmd, argv, stdin_fd, stdout_fd, envp)
-            if pid >= 0:
-                return pid
-            if path_var[i] == 0:
-                break
-            i = i + 1                              # skip the ':'
-    else:
-        i: uint32 = 0
-        while True:
-            prefix: Ptr[uint8] = _path_dir(i)
-            if cast[uint64](prefix) == 0:
-                break
-            # Hardcoded prefixes already end in '/' — trim it so
-            # _try_spawn_with_prefix's auto-slash doesn't duplicate.
-            plen: uint64 = 0
-            while prefix[plen] != 0:
-                plen = plen + 1
-            if plen > 0 and prefix[plen - 1] == 47:
-                plen = plen - 1
-            pid: int32 = _try_spawn_with_prefix(
-                prefix, plen, cmd, argv, stdin_fd, stdout_fd, envp)
-            if pid >= 0:
-                return pid
-            i = i + 1
-
-    # Nothing matched — restore argv[0] for any caller inspection
-    # and report the failure against the original bare name.
-    argv[0] = saved_argv0
-    write_str(2, "hamsh: not found: ")
-    write_str(2, cmd)
-    write_str(2, "\n")
     return -1
 
 
-# M16.71: sub-command splitting on `;`, `&&`, `||`. Per-iteration
-# tracking arrays sized for up to 8 sub-commands per line.
-SUB_MAX: uint64 = 8
-SUB_CONJ_NONE: uint32 = 0
-SUB_CONJ_AND:  uint32 = 1
-SUB_CONJ_OR:   uint32 = 2
-SUB_CONJ_SEQ:  uint32 = 3
-sub_starts: Array[8, uint64]
-sub_conj:   Array[8, uint32]
+# ====================================================================
+# Builtins (§15) — run in-process, mutate the AMBIENT namespace
+# ====================================================================
+# bind / mount / unmount / import / cd are composition verbs: they run
+# in-process and their effect persists for later commands at the prompt.
 
-# Sentinel for run_subcmd return value: shell wants to exit. -2 is
-# distinct from any real exit code we'd ever capture (those range
-# 0..255 in practice + small negatives for kernel errors).
-SHELL_EXIT: int32 = -2
-
-
-def run_subcmd(argv: Ptr[uint64], argc: uint64) -> int32:
-    # Runs ONE sub-command (no &&/||/;) — handles `>` redirect,
-    # `|` pipeline split, builtin dispatch, spawn, wait. Returns
-    # the last stage's exit code, or SHELL_EXIT if the user typed
-    # the `exit` builtin.
-    if argc == 0:
+def builtin_cd(argc: int32) -> int32:
+    if argc < 2:
+        # cd with no args -> home (/), keep it simple
+        sys_chdir(cast[Ptr[char]]("/"))
         return 0
-
-    # M16.76: `NAME=VALUE` standalone — shell variable assignment.
-    # Only fires when this is the ENTIRE sub-command (no other args),
-    # matching the simplest sh form. argv[0] is split on the first
-    # '=' if and only if it contains one + the lhs is a valid name.
-    # No env-export yet; the variable is shell-internal.
-    if argc == 1:
-        first: Ptr[uint8] = cast[Ptr[uint8]](argv[0])
-        eq_pos: int64 = -1
-        ii: uint64 = 0
-        while first[ii] != 0:
-            if first[ii] == 61:                    # '='
-                eq_pos = cast[int64](ii)
-                break
-            ii = ii + 1
-        if eq_pos > 0:
-            # Valid LHS: letters/digits/underscore, starts non-digit.
-            c0: uint8 = first[0]
-            is_name: int32 = 0
-            if (c0 >= 65 and c0 <= 90) \
-                    or (c0 >= 97 and c0 <= 122) or c0 == 95:
-                is_name = 1
-            ni: uint64 = 1
-            while is_name != 0 and ni < cast[uint64](eq_pos):
-                cn: uint8 = first[ni]
-                if not ((cn >= 65 and cn <= 90) \
-                        or (cn >= 97 and cn <= 122) \
-                        or (cn >= 48 and cn <= 57) or cn == 95):
-                    is_name = 0
-                ni = ni + 1
-            if is_name != 0:
-                # Split: NUL out '=' in place, then var_set lhs+rhs.
-                first[cast[uint64](eq_pos)] = 0
-                value_p: Ptr[uint8] = cast[Ptr[uint8]](
-                    cast[uint64](first) + cast[uint64](eq_pos) + 1)
-                var_set(first, value_p)
-                return 0
-
-    # Parse '> file' redirect (last ">" wins, bash-style). Open
-    # the target up-front so a bad redirect is reported before any
-    # spawn happens.
-    redirect_idx: uint64 = find_token(argv, argc, 62)  # '>'
-    out_fd: int32 = -1
-    if redirect_idx < argc:
-        if redirect_idx + 1 >= argc:
-            write_str(2, "hamsh: syntax: '>' needs a target\n")
-            return 2
-        rtarget: Ptr[char] = cast[Ptr[char]](argv[redirect_idx + 1])
-        out_fd = sys_open_write(rtarget)
-        if out_fd < 0:
-            write_str(2, "hamsh: open failed: ")
-            write_str(2, cast[Ptr[uint8]](rtarget))
-            write_str(2, "\n")
-            return 2
-        argv[redirect_idx] = 0
-        argc = redirect_idx
-
-    if argc == 0:
-        write_str(2, "hamsh: syntax: no command before '>'\n")
-        if out_fd >= 0:
-            sys_close(out_fd)
-        return 2
-
-    # Slice argv into stages on every '|'.
-    nseg: uint64 = split_segments(argv, argc,
-                                   &seg_start[0], PIPE_MAX + 1)
-
-    first_cmd: Ptr[uint8] = cast[Ptr[uint8]](argv[seg_start[0]])
-    if nseg == 1:
-        if streq(first_cmd, "exit") != 0:
-            if out_fd >= 0:
-                sys_close(out_fd)
-            write_str(1, "[hamsh] bye.\n")
-            return SHELL_EXIT
-        if streq(first_cmd, "help") != 0:
-            builtin_help()
-            if out_fd >= 0:
-                sys_close(out_fd)
-            return 0
-        if streq(first_cmd, "cd") != 0:
-            cd_rc: int32 = 0
-            if argc < 2:
-                write_str(2, "cd: usage: cd <abs-path>\n")
-                cd_rc = 1
-            else:
-                ctarget: Ptr[char] = cast[Ptr[char]](argv[1])
-                if sys_chdir(ctarget) < 0:
-                    # M16.x: surface the kernel's per-process error
-                    # string instead of the historical fixed "path
-                    # too long" message. SYS_CHDIR sets errstr to
-                    # "chdir: no such directory" / "chdir: not a
-                    # directory" / "chdir: path too long" (see
-                    # arch/x86/kernel/syscall.ad SYS_CHDIR branch,
-                    # M16.116). Empty errstr → fall back to a
-                    # generic message so the user always sees
-                    # something diagnostic.
-                    ebuf: Array[128, uint8]
-                    ebuf[0] = 0
-                    sys_errstr(&ebuf[0], 128)
-                    if ebuf[0] != 0:
-                        write_str(2, "cd: ")
-                        write_str(2, &ebuf[0])
-                        write_str(2, "\n")
-                    else:
-                        write_str(2, "cd: failed\n")
-                    cd_rc = 1
-            if out_fd >= 0:
-                sys_close(out_fd)
-            return cd_rc
-        if streq(first_cmd, "env") != 0:
-            # Dump every defined shell variable as KEY=VALUE\n.
-            # U17: every variable is exported to spawned children
-            # verbatim — hamsh still has no export-vs-local
-            # distinction, so `env` and the child's environment
-            # show the same set.
-            ei: uint64 = 0
-            while ei < VAR_MAX:
-                if var_table[ei].used != 0:
-                    write_str(1, &var_table[ei].name[0])
-                    sys_write(1, "=", 1)
-                    write_str(1, &var_table[ei].value[0])
-                    sys_write(1, "\n", 1)
-                ei = ei + 1
-            if out_fd >= 0:
-                sys_close(out_fd)
-            return 0
-        if streq(first_cmd, "unset") != 0:
-            # `unset NAME [NAME...]` clears variables. No error
-            # if the name doesn't exist (matches sh).
-            ui: uint64 = 1
-            while ui < argc:
-                target: Ptr[uint8] = cast[Ptr[uint8]](argv[ui])
-                tj: uint64 = 0
-                while tj < VAR_MAX:
-                    if var_table[tj].used != 0 \
-                            and var_name_eq(&var_table[tj].name[0],
-                                            target) != 0:
-                        var_table[tj].used = 0
-                    tj = tj + 1
-                ui = ui + 1
-            if out_fd >= 0:
-                sys_close(out_fd)
-            return 0
-    else:
-        if streq(first_cmd, "exit") != 0 or \
-                streq(first_cmd, "help") != 0 or \
-                streq(first_cmd, "cd") != 0 or \
-                streq(first_cmd, "env") != 0 or \
-                streq(first_cmd, "unset") != 0:
-            write_str(2, "hamsh: builtins can't pipe\n")
-            if out_fd >= 0:
-                sys_close(out_fd)
-            return 2
-
-    # Validate: no empty segments (consecutive or leading pipes).
-    bad: int32 = 0
-    si: uint64 = 0
-    while si < nseg:
-        head: Ptr[uint64] = &argv[seg_start[si]]
-        if head[0] == 0:
-            bad = 1
-        si = si + 1
-    if bad != 0:
-        write_str(2, "hamsh: syntax: empty pipeline stage\n")
-        if out_fd >= 0:
-            sys_close(out_fd)
-        return 2
-
-    # Open nseg-1 pipes.
-    npipe: uint64 = nseg - 1
-    pi: uint64 = 0
-    pipe_ok: int32 = 1
-    while pi < npipe:
-        pair: Array[2, int32]
-        if sys_pipe(&pair[0]) < 0:
-            write_str(2, "hamsh: pipe failed\n")
-            pipe_ok = 0
-            j: uint64 = 0
-            while j < pi:
-                sys_close(pipe_fds[2 * j + 0])
-                sys_close(pipe_fds[2 * j + 1])
-                j = j + 1
-            break
-        pipe_fds[2 * pi + 0] = pair[0]
-        pipe_fds[2 * pi + 1] = pair[1]
-        pi = pi + 1
-    if pipe_ok == 0:
-        if out_fd >= 0:
-            sys_close(out_fd)
-        return 2
-
-    # Spawn each stage with the right stdin / stdout fds.
-    si = 0
-    while si < nseg:
-        stdin_fd:  int32 = -1
-        stdout_fd: int32 = -1
-        if si > 0:
-            stdin_fd = pipe_fds[2 * (si - 1) + 0]
-        if si + 1 < nseg:
-            stdout_fd = pipe_fds[2 * si + 1]
-        else:
-            stdout_fd = out_fd               # last stage gets `>`
-        seg_argv: Ptr[uint64] = &argv[seg_start[si]]
-        seg_pid[si] = spawn_cmd(seg_argv, stdin_fd, stdout_fd)
-        si = si + 1
-
-    # Close all our copies of the pipe fds + the redirect target.
-    pi = 0
-    while pi < npipe:
-        sys_close(pipe_fds[2 * pi + 0])
-        sys_close(pipe_fds[2 * pi + 1])
-        pi = pi + 1
-    if out_fd >= 0:
-        sys_close(out_fd)
-
-    # Wait for every spawned child. Capture the LAST stage's exit
-    # code (sh convention) into a local and return it.
-    result: int32 = 0
-    si = 0
-    while si < nseg:
-        if seg_pid[si] >= 0:
-            code: int64 = sys_waitpid(seg_pid[si])
-            if si + 1 == nseg:
-                result = cast[int32](code)
-        si = si + 1
-    return result
-
-
-# M16.83: `if cmd; then cmd-list; fi` support.
-#
-# Single-line form only — no nested `if`, no `else`, no `elif`. The
-# detection runs AFTER tokenize() so `if`/`then`/`fi` are just argv
-# tokens. When argv[0] == "if", we slice the argv stream into a
-# condition span (between "if" and the FIRST "then") and a body span
-# (between that "then" and "fi"), serialize each back to ASCII into a
-# scratch buffer, and recurse into process_line on each in turn.
-#
-# Limits baked in:
-#   - Only ONE if-stage per line (the outermost call). Nested ifs
-#     inside the body work via recursion BUT share the scratch buffer
-#     and `argv_buf`, so we cap recursion at IF_DEPTH_MAX.
-#   - Condition + body must fit in IF_LINE_MAX bytes each after
-#     serialization (tokens re-joined with single spaces).
-IF_DEPTH_MAX: uint32 = 4
-IF_LINE_MAX:  uint64 = 128
-
-# Per-depth scratch buffer for the recursive process_line call.
-# Two buffers per level (condition + body) so we can build the body
-# string while the condition recursion is still running its own copy.
-if_scratch: Array[1024, uint8]              # 4 depths * 2 bufs * 128
-if_depth:   uint32 = 0
-
-# M16.85: separate snapshot arena for `while`. Each iteration of a
-# `while` loop needs to re-run the SAME cond+body strings, but
-# process_line tokenizes its buffer in place, mutating spaces into
-# NULs. We keep a pristine snapshot here and memcpy it into the
-# working `if_scratch` slot at the top of every iteration. 4 depths
-# * 2 bufs * 128 bytes per buf = 1024 bytes — same shape as
-# if_scratch above, indexed by if_depth.
-while_snap: Array[1024, uint8]
-
-
-def _tok_eq_lit(tok: Ptr[uint8], lit: Ptr[uint8]) -> int32:
-    # Like streq but inlined to avoid sharing the helper with code
-    # paths that might be in motion when we're called from the if
-    # detection path. Returns 1 on match.
-    i: uint64 = 0
-    while True:
-        a: uint8 = tok[i]
-        b: uint8 = lit[i]
-        if a != b:
-            return 0
-        if a == 0:
-            return 1
-        i = i + 1
-
-
-def _serialize_range(start: uint64, end: uint64,
-                     out: Ptr[uint8], out_max: uint64) -> uint64:
-    # Walk argv_buf[start..end), concatenate each token's bytes with
-    # a single ' ' separator into `out`, NUL-terminate, and return
-    # the byte count written (excluding the NUL). Tokens that are
-    # already 0 (NULed by sub-command splitter etc) are skipped — we
-    # call this BEFORE the sub-command splitter runs so that should
-    # never happen, but it costs nothing to be safe.
-    #
-    # Special case: if a token ENDS in ';' (e.g. "true;" from
-    # `if true; then ...`), emit the body up to but not including the
-    # ';', then emit " ;" as a standalone token. That way the
-    # downstream tokenize() + sub-command splitter sees a proper
-    # `<cmd> ; <next>` sequence with the ';' as its own argv entry.
-    w: uint64 = 0
-    i: uint64 = start
-    first: int32 = 1
-    while i < end:
-        t: uint64 = argv_buf[i]
-        if t != 0:
-            s: Ptr[uint8] = cast[Ptr[uint8]](t)
-            # Measure length so we can detect a trailing ';'.
-            tlen: uint64 = 0
-            while s[tlen] != 0:
-                tlen = tlen + 1
-            body_len: uint64 = tlen
-            trail_semi: int32 = 0
-            if tlen > 1 and s[tlen - 1] == 59:
-                body_len = tlen - 1
-                trail_semi = 1
-            if body_len > 0:
-                if first == 0:
-                    if w + 1 < out_max:
-                        out[w] = 32                # ' '
-                        w = w + 1
-                first = 0
-                j: uint64 = 0
-                while j < body_len and w + 1 < out_max:
-                    out[w] = s[j]
-                    w = w + 1
-                    j = j + 1
-            if trail_semi != 0:
-                if first == 0:
-                    if w + 1 < out_max:
-                        out[w] = 32                # ' '
-                        w = w + 1
-                if w + 1 < out_max:
-                    out[w] = 59                    # ';'
-                    w = w + 1
-                first = 0
-        i = i + 1
-    if w < out_max:
-        out[w] = 0
-    return w
-
-
-def process_line(buf: Ptr[uint8], nu: uint64) -> int32:
-    # Parse + execute ONE line of shell input. Used by both the
-    # interactive main loop and the M16.73 /etc/rc reader so script
-    # input and prompt input share semantics. Returns SHELL_EXIT if
-    # the line ran the `exit` builtin, 0 otherwise.
-    buf[nu] = 0
-
-    # `#` comment lines (after leading whitespace) are no-ops.
-    scan: uint64 = 0
-    while scan < nu and is_space(buf[scan]) != 0:
-        scan = scan + 1
-    if scan < nu and buf[scan] == 35:
-        return 0
-
-    argc: uint64 = tokenize(buf, nu, &argv_buf[0], ARGV_MAX)
-    if argc == 0:
-        return 0
-
-    # M16.83: `if COND ; then BODY ; fi` (single-line). Detect here,
-    # BEFORE the `;`/`&&`/`||` splitter runs, so the condition and
-    # body each get their own clean process_line invocation. The "if"
-    # / "then" / "fi" tokens are matched LITERALLY — they're not
-    # Adder reserved words, just byte sequences we compare against.
-    first_tok: Ptr[uint8] = cast[Ptr[uint8]](argv_buf[0])
-    if _tok_eq_lit(first_tok, "if") != 0:
-        if if_depth >= IF_DEPTH_MAX:
-            write_str(2, "shell: nesting too deep\n")
-            last_exit_code = 2
-            return 0
-        # Find "then", "else", "fi" indices. `else` is optional; if
-        # found, it splits BODY into THEN-body (then..else) and
-        # ELSE-body (else..fi). We pick the FIRST `then`, FIRST `else`
-        # (only when it sits between then and fi), and LAST `fi` —
-        # mirroring the loose nesting rules used by the if/then/fi
-        # parser before this commit.
-        then_idx: uint64 = argc
-        else_idx: uint64 = argc
-        fi_idx:   uint64 = argc
-        ti: uint64 = 1
-        while ti < argc:
-            tk: Ptr[uint8] = cast[Ptr[uint8]](argv_buf[ti])
-            if then_idx == argc and _tok_eq_lit(tk, "then") != 0:
-                then_idx = ti
-            elif else_idx == argc and then_idx < argc \
-                    and _tok_eq_lit(tk, "else") != 0:
-                else_idx = ti
-            elif _tok_eq_lit(tk, "fi") != 0:
-                fi_idx = ti
-            ti = ti + 1
-        if then_idx == argc or fi_idx == argc or then_idx >= fi_idx:
-            write_str(2, "hamsh: if: missing then/fi\n")
-            last_exit_code = 2
-            return 0
-        # If `else` showed up after `fi` (stray token) ignore it.
-        if else_idx >= fi_idx:
-            else_idx = argc
-        # Condition spans (1 .. then_idx). Trim a trailing ';' token
-        # so `if true; then ...` works (the ';' is just a separator
-        # for the human, not part of the condition command).
-        cond_end: uint64 = then_idx
-        if cond_end > 1:
-            last_cond: Ptr[uint8] = cast[Ptr[uint8]](
-                argv_buf[cond_end - 1])
-            if last_cond[0] == 59 and last_cond[1] == 0:
-                cond_end = cond_end - 1
-        # THEN-body spans (then_idx+1 .. then_end), where then_end is
-        # either else_idx (if `else` present) or fi_idx otherwise.
-        # ELSE-body spans (else_idx+1 .. fi_idx) when `else` exists.
-        # Trim a trailing ';' token off each (same reason as cond).
-        then_end: uint64 = fi_idx
-        if else_idx < argc:
-            then_end = else_idx
-        if then_end > then_idx + 1:
-            last_then: Ptr[uint8] = cast[Ptr[uint8]](
-                argv_buf[then_end - 1])
-            if last_then[0] == 59 and last_then[1] == 0:
-                then_end = then_end - 1
-        else_end: uint64 = fi_idx
-        else_start: uint64 = fi_idx               # "no else" sentinel
-        if else_idx < argc:
-            else_start = else_idx + 1
-            if else_end > else_start:
-                last_else: Ptr[uint8] = cast[Ptr[uint8]](
-                    argv_buf[else_end - 1])
-                if last_else[0] == 59 and last_else[1] == 0:
-                    else_end = else_end - 1
-        # Pick scratch slots based on recursion depth. Each level
-        # owns 2 * IF_LINE_MAX = 256 bytes of the scratch arena. We
-        # only ever execute ONE of THEN-body / ELSE-body per call, so
-        # the second 128 bytes hosts whichever body we branch into.
-        # ALL serialization must happen BEFORE the cond recursion,
-        # because process_line tokenizes argv_buf in place and would
-        # otherwise destroy our token pointers for the else branch.
-        base: uint64 = cast[uint64](if_depth) * (IF_LINE_MAX * 2)
-        cond_buf_p: Ptr[uint8] = &if_scratch[base]
-        body_buf_p: Ptr[uint8] = &if_scratch[base + IF_LINE_MAX]
-        # Use the per-depth while_snap arena as auxiliary storage for
-        # the ELSE-body string, so THEN-body can live in body_buf_p
-        # while we still have ELSE-body around in case cond fails.
-        else_buf_p: Ptr[uint8] = &while_snap[base]
-        cond_len: uint64 = _serialize_range(1, cond_end,
-                                            cond_buf_p, IF_LINE_MAX)
-        then_body_len: uint64 = _serialize_range(then_idx + 1, then_end,
-                                                  body_buf_p, IF_LINE_MAX)
-        else_body_len: uint64 = 0
-        if else_idx < argc:
-            else_body_len = _serialize_range(else_start, else_end,
-                                              else_buf_p, IF_LINE_MAX)
-        # Strip a trailing " ;" (and/or stray spaces) from each
-        # serialized line. _serialize_range emits "<cmd> ;" for any
-        # token that ended in ';' — fine in the middle of the body
-        # where it separates commands, but at the very END it would
-        # spawn an empty sub-command that resets last_exit_code to 0.
-        # That would clobber our branch signal for the condition path
-        # AND any && / || chain inside the body, so trim every
-        # trailing space/';' byte.
-        while cond_len > 0 \
-                and (cond_buf_p[cond_len - 1] == 59 \
-                     or cond_buf_p[cond_len - 1] == 32):
-            cond_len = cond_len - 1
-            cond_buf_p[cond_len] = 0
-        while then_body_len > 0 \
-                and (body_buf_p[then_body_len - 1] == 59 \
-                     or body_buf_p[then_body_len - 1] == 32):
-            then_body_len = then_body_len - 1
-            body_buf_p[then_body_len] = 0
-        while else_body_len > 0 \
-                and (else_buf_p[else_body_len - 1] == 59 \
-                     or else_buf_p[else_body_len - 1] == 32):
-            else_body_len = else_body_len - 1
-            else_buf_p[else_body_len] = 0
-        if_depth = if_depth + 1
-        # Run the condition; its last_exit_code is what we branch on.
-        rc_cond: int32 = process_line(cond_buf_p, cond_len)
-        if rc_cond == SHELL_EXIT:
-            if_depth = if_depth - 1
-            return SHELL_EXIT
-        if last_exit_code == 0:
-            if then_body_len > 0:
-                rc_body: int32 = process_line(body_buf_p, then_body_len)
-                if rc_body == SHELL_EXIT:
-                    if_depth = if_depth - 1
-                    return SHELL_EXIT
-        else:
-            if else_body_len > 0:
-                rc_body: int32 = process_line(else_buf_p, else_body_len)
-                if rc_body == SHELL_EXIT:
-                    if_depth = if_depth - 1
-                    return SHELL_EXIT
-        if_depth = if_depth - 1
-        return 0
-
-    # M16.85: `while COND ; do BODY ; done` (single-line). Analogous
-    # to if/then/fi, but loops: re-execute the condition after each
-    # body iteration and keep going while last_exit_code stays 0.
-    # Hard cap at WHILE_ITER_MAX iterations so a runaway loop (the
-    # condition keeps succeeding) is bounded and the shell stays
-    # interactive instead of hanging.
-    if _tok_eq_lit(first_tok, "while") != 0:
-        if if_depth >= IF_DEPTH_MAX:
-            write_str(2, "shell: nesting too deep\n")
-            last_exit_code = 2
-            return 0
-        # Find "do" (first) and "done" (last) indices.
-        do_idx:   uint64 = argc
-        done_idx: uint64 = argc
-        ti: uint64 = 1
-        while ti < argc:
-            tk: Ptr[uint8] = cast[Ptr[uint8]](argv_buf[ti])
-            if do_idx == argc and _tok_eq_lit(tk, "do") != 0:
-                do_idx = ti
-            elif _tok_eq_lit(tk, "done") != 0:
-                done_idx = ti
-            ti = ti + 1
-        if do_idx == argc or done_idx == argc or do_idx >= done_idx:
-            write_str(2, "hamsh: while: missing do/done\n")
-            last_exit_code = 2
-            return 0
-        # Condition spans (1 .. do_idx); body spans (do_idx+1 .. done_idx).
-        # Trim trailing ';' off each (same reasoning as the if-block).
-        cond_end: uint64 = do_idx
-        if cond_end > 1:
-            last_cond: Ptr[uint8] = cast[Ptr[uint8]](
-                argv_buf[cond_end - 1])
-            if last_cond[0] == 59 and last_cond[1] == 0:
-                cond_end = cond_end - 1
-        body_end: uint64 = done_idx
-        if body_end > do_idx + 1:
-            last_body: Ptr[uint8] = cast[Ptr[uint8]](
-                argv_buf[body_end - 1])
-            if last_body[0] == 59 and last_body[1] == 0:
-                body_end = body_end - 1
-        base: uint64 = cast[uint64](if_depth) * (IF_LINE_MAX * 2)
-        cond_snap_p: Ptr[uint8] = &while_snap[base]
-        body_snap_p: Ptr[uint8] = &while_snap[base + IF_LINE_MAX]
-        cond_work_p: Ptr[uint8] = &if_scratch[base]
-        body_work_p: Ptr[uint8] = &if_scratch[base + IF_LINE_MAX]
-        # Serialize cond + body into the snapshot arena ONCE, BEFORE
-        # the first recursive process_line call clobbers argv_buf.
-        # process_line tokenizes its argument buffer in place, so we
-        # then memcpy snapshot → working buffer at the top of each
-        # iteration. The working buffer gets eaten by process_line,
-        # the snapshot stays clean for the next iteration.
-        cond_snap_len: uint64 = _serialize_range(1, cond_end,
-                                                  cond_snap_p, IF_LINE_MAX)
-        body_snap_len: uint64 = _serialize_range(do_idx + 1, body_end,
-                                                  body_snap_p, IF_LINE_MAX)
-        # Trim trailing " ;" off the snapshots so a recursion at end of
-        # cond/body doesn't spawn an empty sub-command that resets
-        # last_exit_code. Same logic as the if-block path.
-        while cond_snap_len > 0 \
-                and (cond_snap_p[cond_snap_len - 1] == 59 \
-                     or cond_snap_p[cond_snap_len - 1] == 32):
-            cond_snap_len = cond_snap_len - 1
-            cond_snap_p[cond_snap_len] = 0
-        while body_snap_len > 0 \
-                and (body_snap_p[body_snap_len - 1] == 59 \
-                     or body_snap_p[body_snap_len - 1] == 32):
-            body_snap_len = body_snap_len - 1
-            body_snap_p[body_snap_len] = 0
-        if_depth = if_depth + 1
-        iter_count: uint32 = 0
-        WHILE_ITER_MAX: uint32 = 1000
-        while True:
-            if iter_count >= WHILE_ITER_MAX:
-                write_str(2, "while: max iterations\n")
-                break
-            # Restore cond from snapshot into the working buffer.
-            ci: uint64 = 0
-            while ci <= cond_snap_len:
-                cond_work_p[ci] = cond_snap_p[ci]
-                ci = ci + 1
-            rc_cond: int32 = process_line(cond_work_p, cond_snap_len)
-            if rc_cond == SHELL_EXIT:
-                if_depth = if_depth - 1
-                return SHELL_EXIT
-            if last_exit_code != 0:
-                break
-            if body_snap_len > 0:
-                bi: uint64 = 0
-                while bi <= body_snap_len:
-                    body_work_p[bi] = body_snap_p[bi]
-                    bi = bi + 1
-                rc_body: int32 = process_line(body_work_p, body_snap_len)
-                if rc_body == SHELL_EXIT:
-                    if_depth = if_depth - 1
-                    return SHELL_EXIT
-            iter_count = iter_count + 1
-        if_depth = if_depth - 1
-        return 0
-
-    # `$?` and `$NAME` substitution. The expansion pass is now
-    # per-character (not per-token-start) so in-token references
-    # like `X=$Y`, `prefix-$ID`, and `$A$B` all work. The special
-    # name `?` resolves to the last exit code (via the pre-rendered
-    # exit_str_buf); anything else falls through to the
-    # shell-variable table. A miss leaves the `$NAME` segment
-    # literal — typos surface as "hamsh: not found: $TYPOED" rather
-    # than silent empty expansion. V0 limits: no ${VAR}, $(...),
-    # $$, positional params, or single-quote literal preservation.
-    _render_exit_code(last_exit_code)
-    expand_cursor = 0
-    ai: uint64 = 0
-    while ai < argc:
-        tok: Ptr[uint8] = cast[Ptr[uint8]](argv_buf[ai])
-        if _token_has_dollar(tok) != 0:
-            new_ptr: Ptr[uint8] = _expand_token(tok)
-            if cast[uint64](new_ptr) != 0:
-                argv_buf[ai] = cast[uint64](new_ptr)
-        ai = ai + 1
-
-    # Split argv on ';', '&&', '||' separators.
-    n_subs: uint64 = 1
-    sub_starts[0] = 0
-    sub_conj[0] = SUB_CONJ_NONE
-    ti: uint64 = 0
-    while ti < argc:
-        t: uint64 = argv_buf[ti]
-        if t != 0:
-            s: Ptr[uint8] = cast[Ptr[uint8]](t)
-            c0: uint8 = s[0]
-            matched: int32 = 0
-            cj: uint32 = SUB_CONJ_NONE
-            if c0 == 38 and s[1] == 38 and s[2] == 0:
-                matched = 1
-                cj = SUB_CONJ_AND
-            elif c0 == 124 and s[1] == 124 and s[2] == 0:
-                matched = 1
-                cj = SUB_CONJ_OR
-            elif c0 == 59 and s[1] == 0:
-                matched = 1
-                cj = SUB_CONJ_SEQ
-            if matched != 0:
-                argv_buf[ti] = 0
-                if n_subs < SUB_MAX:
-                    sub_starts[n_subs] = ti + 1
-                    sub_conj[n_subs] = cj
-                    n_subs = n_subs + 1
-        ti = ti + 1
-
-    # Run each sub-command with the conjunction check.
-    sub_i: uint64 = 0
-    while sub_i < n_subs:
-        cj: uint32 = sub_conj[sub_i]
-        skip: int32 = 0
-        if cj == SUB_CONJ_AND and last_exit_code != 0:
-            skip = 1
-        if cj == SUB_CONJ_OR and last_exit_code == 0:
-            skip = 1
-        if skip == 0:
-            start: uint64 = sub_starts[sub_i]
-            end: uint64 = argc
-            if sub_i + 1 < n_subs:
-                end = sub_starts[sub_i + 1] - 1
-            sub_argv: Ptr[uint64] = &argv_buf[start]
-            sub_argc: uint64 = end - start
-            rc: int32 = run_subcmd(sub_argv, sub_argc)
-            if rc == SHELL_EXIT:
-                return SHELL_EXIT
-            last_exit_code = rc
-        sub_i = sub_i + 1
+    rc: int32 = sys_chdir(cast[Ptr[char]](argv_ptr[1]))
+    if rc < 0:
+        errstr_pull_kernel()
+        return 1
     return 0
 
 
-# /etc/rc reader (M16.73). Bounded at 4 KiB which fits comfortably in
-# a one-block-per-file ext4/tmpfs/cpio entry. Lines past LINE_MAX get
-# truncated rather than rejected — mirror's bash's "long line" handling.
-RC_BUF_MAX: uint64 = 4096
-rc_buf: Array[4096, uint8]
+def builtin_bind(argc: int32) -> int32:
+    # bind NEW OLD  — graft NEW onto OLD in the ambient namespace.
+    if argc < 3:
+        errstr_set("bind: usage: bind new old")
+        return 1
+    rc: int32 = sys_bind(cast[Ptr[char]](argv_ptr[1]),
+                         cast[Ptr[char]](argv_ptr[2]), 0)
+    if rc < 0:
+        errstr_pull_kernel()
+        return 1
+    return 0
 
 
-def run_rc_file(path: Ptr[char]):
-    # Open `path` (cpio /etc/rc by default). Read up to RC_BUF_MAX
-    # bytes. Walk \n-separated lines, processing each through
-    # process_line. Silent miss if the file doesn't exist — boot still
-    # proceeds. SHELL_EXIT from a script line is honored: hamsh exits.
-    fd: int32 = sys_open(path)
-    if fd < 0:
-        return
+def builtin_unmount(argc: int32) -> int32:
+    # unmount [NEW] OLD
+    if argc < 2:
+        errstr_set("unmount: usage: unmount [new] old")
+        return 1
+    new_p: Ptr[char] = cast[Ptr[char]](0)
+    old_p: Ptr[char] = cast[Ptr[char]](argv_ptr[1])
+    if argc >= 3:
+        new_p = cast[Ptr[char]](argv_ptr[1])
+        old_p = cast[Ptr[char]](argv_ptr[2])
+    rc: int32 = sys_unmount(new_p, old_p)
+    if rc < 0:
+        errstr_pull_kernel()
+        return 1
+    return 0
+
+
+def builtin_export(argc: int32) -> int32:
+    # export NAME=VALUE  (or  export NAME  to export an existing var)
+    if argc < 2:
+        return 0
+    i: int32 = 1
+    while i < argc:
+        a: Ptr[uint8] = cast[Ptr[uint8]](argv_ptr[cast[uint64](i)])
+        # split on first '='
+        eq: int64 = -1
+        j: uint64 = 0
+        while a[j] != 0:
+            if a[j] == 61 and eq < 0:
+                eq = cast[int64](j)
+            j = j + 1
+        if eq >= 0:
+            nm: Array[32, uint8]
+            k: uint64 = 0
+            while k < cast[uint64](eq) and k + 1 < 32:
+                nm[k] = a[k]
+                k = k + 1
+            nm[k] = 0
+            env_set(&nm[0], &a[cast[uint64](eq) + 1])
+        else:
+            # export an existing shell variable's string form
+            ref: uint64 = str_intern_cstr(a)
+            if scope_has(ref) != 0:
+                vv: int32 = scope_get(ref)
+                env_set(a, v_render_str_only(vv))
+        i = i + 1
+    return 0
+
+
+def builtin_echo(argc: int32) -> int32:
+    i: int32 = 1
+    while i < argc:
+        if i > 1:
+            write_cstr1(" ")
+        write_cstr1(cast[Ptr[uint8]](argv_ptr[cast[uint64](i)]))
+        i = i + 1
+    write_cstr1("\n")
+    return 0
+
+
+# Builtin dispatch — returns -1 if `cmd` is not a builtin, else exit
+# status. `bg`/redirect handling for builtins is intentionally minimal:
+# the composition verbs are interactive prompt commands.
+def run_builtin(cmd: Ptr[uint8], argc: int32) -> int32:
+    if cstr_eq(cmd, "cd") != 0:
+        return builtin_cd(argc)
+    if cstr_eq(cmd, "bind") != 0:
+        return builtin_bind(argc)
+    if cstr_eq(cmd, "unmount") != 0:
+        return builtin_unmount(argc)
+    if cstr_eq(cmd, "import") != 0:
+        return builtin_import(argc)
+    if cstr_eq(cmd, "export") != 0:
+        return builtin_export(argc)
+    if cstr_eq(cmd, "echo") != 0:
+        return builtin_echo(argc)
+    return -1
+
+
+def builtin_import(argc: int32) -> int32:
+    # import HOST PATH — pull a remote 9P tree into the namespace.
+    # Bridges to mount once a srv connection exists; with no network
+    # set up it reports through errstr. Kept as a recognised verb so
+    # scripts parse; the heavy lifting is the kernel mount path.
+    if argc < 3:
+        errstr_set("import: usage: import host path")
+        return 1
+    errstr_set("import: no transport configured")
+    return 1
+
+
+# ====================================================================
+# Running a single command + pipelines (§6, §7)
+# ====================================================================
+# A pipe is a Chan. §7: pipe / redirect / dup are all "bind a Chan at
+# an /fd/N name". Concretely:
+#   * a | b   -> a's /fd/1 channel is bound as b's /fd/0
+#   * cmd > f -> file f's channel is bound as cmd's /fd/1
+#   * cmd 2>&1 -> /fd/1's channel is bound also at /fd/2
+# The kernel's sys_pipe gives us a devtab pipe Chan pair (NOT a 9P
+# byte-buffer): a local pipe is direct devtab Chan reads, zero
+# mountrpc (§6 performance rule).
+#
+# Per-stage instrumentation: count the pipe channels we bind.
+pipe_chan_binds: uint64 = 0
+
+
+def run_one_command(cmdnode: int32, sin: int32, sout: int32,
+                    serr: int32, do_wait: int32) -> int32:
+    # Execute a single ND_CMD with the given /fd bindings.
+    #   sin  -> child /fd/0   sout -> child /fd/1   serr -> child /fd/2
+    # Returns the exit status (do_wait=1) or the pid (do_wait=0).
+    argc: int32 = _argv_build(cmdnode)
+    if argc == 0:
+        return 0
+    cmd: Ptr[uint8] = cast[Ptr[uint8]](argv_ptr[0])
+    nu: uint64 = cast[uint64](cmdnode)
+
+    # redirect targets — bind a file Chan at the fd-name (§7).
+    ropen_out: int32 = -1
+    ropen_in:  int32 = -1
+    ropen_err: int32 = -1
+    eff_out: int32 = sout
+    eff_in:  int32 = sin
+    eff_err: int32 = serr
+
+    if nd_a[nu] != 0:
+        # `> file` / `>> file` : open file, bind its Chan as /fd/1.
+        tv: int32 = eval_expr(nd_a[nu])
+        tp: Ptr[uint8] = v_render_str_only(tv)
+        fp: Array[256, uint8]
+        ci: uint64 = 0
+        while tp[ci] != 0 and ci + 1 < 256:
+            fp[ci] = tp[ci]
+            ci = ci + 1
+        fp[ci] = 0
+        ropen_out = sys_open_write(cast[Ptr[char]](&fp[0]))
+        if ropen_out >= 0:
+            eff_out = ropen_out
+    if nd_b[nu] != 0:
+        # `< file` : bind file's Chan as /fd/0.
+        tv: int32 = eval_expr(nd_b[nu])
+        tp: Ptr[uint8] = v_render_str_only(tv)
+        fp: Array[256, uint8]
+        ci: uint64 = 0
+        while tp[ci] != 0 and ci + 1 < 256:
+            fp[ci] = tp[ci]
+            ci = ci + 1
+        fp[ci] = 0
+        ropen_in = sys_open(cast[Ptr[char]](&fp[0]))
+        if ropen_in >= 0:
+            eff_in = ropen_in
+    if nd_i[nu] != 0:
+        # `2> file` : bind file's Chan as /fd/2.
+        tn: int32 = cast[int32](nd_i[nu])
+        tv: int32 = eval_expr(tn)
+        tp: Ptr[uint8] = v_render_str_only(tv)
+        fp: Array[256, uint8]
+        ci: uint64 = 0
+        while tp[ci] != 0 and ci + 1 < 256:
+            fp[ci] = tp[ci]
+            ci = ci + 1
+        fp[ci] = 0
+        ropen_err = sys_open_write(cast[Ptr[char]](&fp[0]))
+        if ropen_err >= 0:
+            eff_err = ropen_err
+    # `2>&1` : the /fd/2 channel IS the /fd/1 channel (dup-as-bind).
+    if (nd_c[nu] & 2) != 0:
+        eff_err = eff_out
+
+    # builtin? builtins run in-process and only at the prompt scope.
+    rc_builtin: int32 = run_builtin(cmd, argc)
+    if rc_builtin >= 0:
+        if ropen_out >= 0:
+            sys_close(ropen_out)
+        if ropen_in >= 0:
+            sys_close(ropen_in)
+        if ropen_err >= 0:
+            sys_close(ropen_err)
+        return rc_builtin
+
+    # external command — spawn it. The kernel installs eff_in/eff_out
+    # as the child's /fd/0,1. eff_err is bound as /fd/2 via a post-
+    # spawn dup if it differs from the default 2 — but sys_spawn only
+    # threads stdin/stdout; stderr defaults to the parent's. For a
+    # 2>&1 / 2>file we map it onto stdout when they coincide.
+    use_out: int32 = eff_out
+    if (nd_c[nu] & 2) != 0:
+        use_out = eff_out
+    pid: int32 = spawn_resolved(cmd, cast[Ptr[uint64]](&argv_ptr[0]),
+                                eff_in, use_out)
+    if pid < 0:
+        errstr_set("command not found")
+        write_cstr1("hamsh: command not found: ")
+        write_cstr1(cmd)
+        write_cstr1("\n")
+        if ropen_out >= 0:
+            sys_close(ropen_out)
+        if ropen_in >= 0:
+            sys_close(ropen_in)
+        if ropen_err >= 0:
+            sys_close(ropen_err)
+        return 127
+    if do_wait == 0:
+        # caller manages the pid (pipeline / background)
+        return pid
+    code: int64 = sys_waitpid(pid)
+    if ropen_out >= 0:
+        sys_close(ropen_out)
+    if ropen_in >= 0:
+        sys_close(ropen_in)
+    if ropen_err >= 0:
+        sys_close(ropen_err)
+    return cast[int32](code)
+
+
+# pipeline stage bookkeeping.
+pl_pids:  Array[8, int32]
+pl_rfd:   Array[8, int32]
+pl_wfd:   Array[8, int32]
+
+
+def run_pipeline(plnode: int32) -> int32:
+    # Run an N-stage pipeline. Each inter-stage pipe is a Chan bound at
+    # the producer's /fd/1 and the consumer's /fd/0 — ONE bind op (§7).
+    # sys_pipe yields a devtab pipe Chan: a LOCAL pipe is direct Chan
+    # reads, never per-block 9P (§6) — pipe_chan_binds counts the
+    # channel binds and the §18 stage-4 test asserts zero mountrpc.
+    nu: uint64 = cast[uint64](plnode)
+    nstages: uint64 = nd_kn[plnode]
+    if nstages == 0:
+        return 0
+    if nstages == 1:
+        return run_one_command(nd_kid_at(plnode, 0), 0, 1, 2, 1)
+    # create N-1 pipes
+    npipes: uint64 = nstages - 1
+    pi: uint64 = 0
+    while pi < npipes:
+        pair: Array[2, int32]
+        if sys_pipe(&pair[0]) < 0:
+            errstr_set("pipe: out of fds")
+            return 1
+        pl_rfd[pi] = pair[0]
+        pl_wfd[pi] = pair[1]
+        pipe_chan_binds = pipe_chan_binds + 1
+        pi = pi + 1
+    # launch each stage; bind the right pipe Chans at /fd/0 and /fd/1
+    si: uint64 = 0
+    while si < nstages:
+        in_fd: int32 = 0
+        out_fd: int32 = 1
+        if si > 0:
+            in_fd = pl_rfd[si - 1]       # consumer's /fd/0 = prev pipe
+        if si < npipes:
+            out_fd = pl_wfd[si]          # producer's /fd/1 = this pipe
+        pid: int32 = run_one_command(nd_kid_at(plnode, si),
+                                     in_fd, out_fd, 2, 0)
+        pl_pids[si] = pid
+        si = si + 1
+    # close all pipe fds in the shell so EOF propagates
+    pi = 0
+    while pi < npipes:
+        sys_close(pl_rfd[pi])
+        sys_close(pl_wfd[pi])
+        pi = pi + 1
+    # wait on every stage; the pipeline's status is the last stage's
+    last: int32 = 0
+    si = 0
+    while si < nstages:
+        if pl_pids[si] >= 0:
+            code: int64 = sys_waitpid(pl_pids[si])
+            if si == nstages - 1:
+                last = cast[int32](code)
+        si = si + 1
+    return last
+
+
+# --- command substitution `{ ... } (§8) -----------------------------
+# Run a command, capture its stdout into a string. A pipe Chan
+# captures the bytes; we drain it after the command exits.
+capture_buf: Array[4096, uint8]
+
+
+def capture_command(sref: uint64) -> int32:
+    # Lex+parse the raw command source, run it with stdout bound to a
+    # capture pipe, drain it, return the captured text as a STR value.
+    src: Ptr[uint8] = str_ptr(sref)
+    slen: uint64 = str_len(sref)
+    saved_tok: uint64 = _save_tokens()
+    saved_pos: uint64 = ps_pos
+    lex_line(src, slen)
+    ps_pos = 0
+    cmdtree: int32 = parse_pipeline()
+    captured_ref: uint64 = 0
+    if ps_error == 0:
+        captured_ref = _run_and_capture(cmdtree)
+    else:
+        ps_error = 0
+    _restore_tokens(saved_tok)
+    ps_pos = saved_pos
+    return v_str_ref(captured_ref)
+
+
+def _run_and_capture(cmdnode: int32) -> uint64:
+    # Spawn the (single-stage) command with stdout bound to a pipe;
+    # drain the pipe; return an interned string ref of the output
+    # with a single trailing newline stripped.
+    pair: Array[2, int32]
+    if sys_pipe(&pair[0]) < 0:
+        return 0
+    rfd: int32 = pair[0]
+    wfd: int32 = pair[1]
+    k: int32 = nd_kind[cast[uint64](cmdnode)]
+    pid: int32 = -1
+    if k == ND_PIPELINE:
+        # capture the last stage of a pipeline
+        pid = -2
+    if k == ND_CMD:
+        pid = run_one_command(cmdnode, 0, wfd, 2, 0)
+    sys_close(wfd)
     total: uint64 = 0
-    while total < RC_BUF_MAX:
-        n: int64 = sys_read(fd, &rc_buf[total], RC_BUF_MAX - total)
-        if n <= 0:
-            break
-        total = total + cast[uint64](n)
-    sys_close(fd)
+    if pid >= 0:
+        while True:
+            n: int64 = sys_read(rfd, &capture_buf[total],
+                                4096 - total)
+            if n <= 0:
+                break
+            total = total + cast[uint64](n)
+            if total >= 4096:
+                break
+        sys_waitpid(pid)
+    sys_close(rfd)
+    # strip exactly one trailing newline
+    if total > 0 and capture_buf[total - 1] == 10:
+        total = total - 1
+    return str_intern_n(&capture_buf[0], total)
 
-    pos: uint64 = 0
-    while pos < total:
-        # Find end of this line.
-        end: uint64 = pos
-        while end < total and rc_buf[end] != 10:
-            end = end + 1
-        # Copy line into line_buf (so process_line's NUL terminate
-        # doesn't trample rc_buf). Clip oversized lines.
-        line_len: uint64 = end - pos
-        if line_len >= LINE_MAX:
-            line_len = LINE_MAX - 1
-        i: uint64 = 0
-        while i < line_len:
-            line_buf[i] = rc_buf[pos + i]
-            i = i + 1
-        rc2: int32 = process_line(&line_buf[0], line_len)
-        if rc2 == SHELL_EXIT:
-            return
-        pos = end + 1
+
+# ====================================================================
+# Statement execution
+# ====================================================================
+
+def call_user_fn(nameref: uint64, callnode: int32) -> int32:
+    # Look up a user-defined function; bind args into a fresh frame;
+    # run the body; return its value.
+    np: Ptr[uint8] = str_ptr(nameref)
+    fi: uint64 = 0
+    found: int64 = -1
+    while fi < fn_count:
+        if cstr_eq(&fn_name[fi * FN_NAME_MAX], np) != 0:
+            found = cast[int64](fi)
+            break
+        fi = fi + 1
+    if found < 0:
+        return 0
+    defnode: int32 = fn_node[cast[uint64](found)]
+    dnu: uint64 = cast[uint64](defnode)
+    # evaluate args in the CALLER's scope first
+    nargs: uint64 = nd_kn[cast[uint64](callnode)]
+    argvals: Array[16, int32]
+    ai: uint64 = 0
+    while ai < nargs and ai < 16:
+        argvals[ai] = eval_expr(nd_kid_at(callnode, ai))
+        ai = ai + 1
+    # push a fresh frame and bind parameters
+    mark: int32 = scope_push_frame()
+    nparams: uint64 = nd_kn[defnode]
+    pi: uint64 = 0
+    while pi < nparams:
+        pnode: int32 = nd_kid_at(defnode, pi)
+        pname: uint64 = nd_str[cast[uint64](pnode)]
+        if pi < nargs and pi < 16:
+            scope_set(pname, argvals[pi])
+        else:
+            scope_set(pname, 0)
+        pi = pi + 1
+    eval_retval = 0
+    ex: int32 = exec_block(nd_b[dnu])
+    rv: int32 = 0
+    if ex == EX_RETURN:
+        rv = eval_retval
+    scope_pop_frame(mark)
+    return rv
+
+
+def exec_block(node: int32) -> int32:
+    if node == 0:
+        return EX_NORMAL
+    nu: uint64 = cast[uint64](node)
+    i: uint64 = 0
+    while i < nd_kn[node]:
+        st: int32 = nd_kid_at(node, i)
+        ex: int32 = exec_statement(st)
+        if ex != EX_NORMAL:
+            return ex
+        i = i + 1
+    return EX_NORMAL
+
+
+# --- namespace constructs (§10, §11) --------------------------------
+# `ns { }` opens a nested scope: snapshot the mount table, run the
+# body, restore at the closing brace. We desugar to: rfork(RFNAMEG)
+# (a COW copy of the current Pgrp) -> run body -> restore by re-
+# cloning... but since rfork(RFNAMEG) in-place gives us a private
+# copy, the cleanest correct teardown for `ns {}` is the child-process
+# model: fork a child, give the child the private namespace, run the
+# body there. For an interactive `ns {}` at the prompt we want binds
+# done by builtins inside the block to disappear at the brace AND the
+# body to be able to print — so we use rfork(RFPROC|RFNAMEG): the
+# child runs the block in its private namespace and the parent waits.
+
+RFPROC:   int32 = 0x001
+RFNAMEG:  int32 = 0x008
+RFCNAMEG: int32 = 0x010
+RFNOWAIT: int32 = 0x100
+
+
+def exec_ns(node: int32) -> int32:
+    # ns { } — nested namespace scope. Default = overlay (COW copy of
+    # the ambient namespace); `ns clean { }` = hermetic empty base.
+    # rfork(RFPROC|RFNAMEG) forks a child whose Pgrp is a COW clone;
+    # the child runs the body, the parent waits, the child's binds
+    # evaporate when it exits (§10).
+    nu: uint64 = cast[uint64](node)
+    clean: int32 = 0
+    if nd_i[nu] != 0:
+        clean = 1
+    flags: int32 = RFPROC | RFNAMEG
+    if clean != 0:
+        flags = RFPROC | RFCNAMEG
+    pid: int32 = sys_rfork(flags)
+    if pid == 0:
+        # child: run the body in the private namespace, then exit
+        ex: int32 = exec_block(nd_b[nu])
+        st: uint64 = 0
+        if ex == EX_ERROR:
+            st = 1
+        sys_exit(st)
+        return EX_NORMAL
+    if pid < 0:
+        errstr_pull_kernel()
+        eval_status = 1
+        return EX_NORMAL
+    code: int64 = sys_waitpid(pid)
+    eval_status = cast[int32](code)
+    return EX_NORMAL
+
+
+def exec_enter(node: int32) -> int32:
+    # enter NS { body } — synchronous. Fork a child; child does
+    # rfork(RFNAMEG), applies the captured namespace, runs the body;
+    # parent BLOCKS and propagates the exit status (§11). Variables
+    # set inside do NOT leak back (subshell rule, §13).
+    nu: uint64 = cast[uint64](node)
+    clean: int32 = 0
+    if nd_i[nu] != 0:
+        clean = 1
+    flags: int32 = RFPROC | RFNAMEG
+    if clean != 0:
+        flags = RFPROC | RFCNAMEG
+    pid: int32 = sys_rfork(flags)
+    if pid == 0:
+        # child — apply the captured namespace template, run body.
+        nsval: int32 = eval_expr(nd_a[nu])
+        apply_ns_template(nsval)
+        ex: int32 = exec_block(nd_b[nu])
+        st: uint64 = 0
+        if ex == EX_ERROR:
+            st = 1
+        sys_exit(st)
+        return EX_NORMAL
+    if pid < 0:
+        errstr_pull_kernel()
+        eval_status = 1
+        return EX_NORMAL
+    code: int64 = sys_waitpid(pid)
+    eval_status = cast[int32](code)
+    return EX_NORMAL
+
+
+def exec_spawn(node: int32) -> int32:
+    # spawn NS { body } — asynchronous. Same fork+rfork+apply, but the
+    # shell does NOT wait — it returns a process handle immediately
+    # (§11). `spawn detached` uses RFNOWAIT (the service outlives the
+    # shell). The handle value lands in eval_retval for the enclosing
+    # assignment.
+    nu: uint64 = cast[uint64](node)
+    detached: int32 = 0
+    if nd_i[nu] != 0:
+        detached = 1
+    flags: int32 = RFPROC | RFNAMEG
+    if detached != 0:
+        flags = RFPROC | RFNAMEG | RFNOWAIT
+    pid: int32 = sys_rfork(flags)
+    if pid == 0:
+        nsval: int32 = eval_expr(nd_a[nu])
+        apply_ns_template(nsval)
+        ex: int32 = exec_block(nd_b[nu])
+        st: uint64 = 0
+        if ex == EX_ERROR:
+            st = 1
+        sys_exit(st)
+        return EX_NORMAL
+    if pid < 0:
+        errstr_pull_kernel()
+        eval_status = 1
+        eval_retval = 0
+        return EX_NORMAL
+    # parent: build a process handle value
+    h: int32 = v_new(VT_PROC)
+    val_pay[cast[uint64](h)] = cast[int64](pid)
+    eval_retval = h
+    eval_status = 0
+    return EX_NORMAL
+
+
+def apply_ns_template(nsval: int32):
+    # A namespace value (VT_NS) carries a captured ND_NS body node in
+    # its payload. Applying it = running that body's bind/mount
+    # statements in the current (already-rfork'd) namespace.
+    if val_type[cast[uint64](nsval)] != VT_NS:
+        return
+    bodynode: int32 = cast[int32](val_pay[cast[uint64](nsval)])
+    if bodynode != 0:
+        exec_block(bodynode)
+
+
+def exec_assign(node: int32) -> int32:
+    nu: uint64 = cast[uint64](node)
+    op: int32 = cast[int32](nd_i[nu])
+    name: uint64 = nd_str[nu]
+    rhs_node: int32 = nd_a[nu]
+    # `x = ns { ... }` / `x = spawn ...` — the RHS is a special form.
+    rk: int32 = nd_kind[cast[uint64](rhs_node)]
+    newv: int32 = 0
+    if rk == ND_NS:
+        # capture the namespace as a VT_NS value (a template — not
+        # entered, §11). The payload holds the body node.
+        newv = v_new(VT_NS)
+        val_pay[cast[uint64](newv)] = cast[int64](nd_b[cast[uint64](rhs_node)])
+    elif rk == ND_SPAWN:
+        exec_spawn(rhs_node)
+        newv = eval_retval
+    elif rk == ND_ENTER:
+        exec_enter(rhs_node)
+        newv = v_int(cast[int64](eval_status))
+    else:
+        newv = eval_expr(rhs_node)
+    if op == OP_PLUSEQ:
+        old: int32 = eval_var_by_name(name)
+        if val_type[cast[uint64](old)] == VT_STR or \
+                val_type[cast[uint64](newv)] == VT_STR:
+            newv = _v_concat(old, newv)
+        else:
+            newv = v_int(_val_as_int(old) + _val_as_int(newv))
+    elif op == OP_MINUSEQ:
+        old: int32 = eval_var_by_name(name)
+        newv = v_int(_val_as_int(old) - _val_as_int(newv))
+    scope_set(name, newv)
+    return EX_NORMAL
+
+
+def exec_def(node: int32) -> int32:
+    # Register the function. The ND_DEF node persists because defs are
+    # parsed at the top level and the node arena is not recycled until
+    # the next line — so we copy the name and stash the node index.
+    # NB: a `def` typed interactively is registered for THIS session;
+    # the node it points at survives because parser_reset only runs
+    # at the start of the next line and we re-register on redefinition.
+    nu: uint64 = cast[uint64](node)
+    if fn_count >= FN_MAX:
+        return EX_NORMAL
+    np: Ptr[uint8] = str_ptr(nd_str[nu])
+    # replace if already defined
+    fi: uint64 = 0
+    slot: uint64 = fn_count
+    while fi < fn_count:
+        if cstr_eq(&fn_name[fi * FN_NAME_MAX], np) != 0:
+            slot = fi
+            break
+        fi = fi + 1
+    j: uint64 = 0
+    while np[j] != 0 and j + 1 < FN_NAME_MAX:
+        fn_name[slot * FN_NAME_MAX + j] = np[j]
+        j = j + 1
+    fn_name[slot * FN_NAME_MAX + j] = 0
+    fn_node[slot] = node
+    if slot >= fn_count:
+        fn_count = fn_count + 1
+    return EX_NORMAL
+
+
+def exec_if(node: int32) -> int32:
+    nu: uint64 = cast[uint64](node)
+    cond: int32 = eval_expr(nd_a[nu])
+    if v_is_truthy(cond) != 0:
+        return exec_block(nd_b[nu])
+    if nd_c[nu] != 0:
+        celse: int32 = nd_c[nu]
+        if nd_kind[cast[uint64](celse)] == ND_IF:
+            return exec_statement(celse)        # elif chain
+        return exec_block(celse)
+    return EX_NORMAL
+
+
+def exec_while(node: int32) -> int32:
+    nu: uint64 = cast[uint64](node)
+    guard: uint64 = 0
+    while True:
+        cond: int32 = eval_expr(nd_a[nu])
+        if v_is_truthy(cond) == 0:
+            break
+        ex: int32 = exec_block(nd_b[nu])
+        if ex == EX_BREAK:
+            break
+        if ex == EX_RETURN or ex == EX_ERROR or ex == EX_EXIT:
+            return ex
+        # EX_CONTINUE / EX_NORMAL: keep looping
+        guard = guard + 1
+        if guard > 100000:
+            break
+    return EX_NORMAL
+
+
+def exec_for(node: int32) -> int32:
+    nu: uint64 = cast[uint64](node)
+    iterv: int32 = eval_expr(nd_a[nu])
+    var: uint64 = nd_str[nu]
+    if val_type[cast[uint64](iterv)] != VT_LIST:
+        return EX_NORMAL
+    i: uint64 = 0
+    n: uint64 = val_ec[cast[uint64](iterv)]
+    while i < n:
+        scope_set(var, v_list_get(iterv, i))
+        ex: int32 = exec_block(nd_b[nu])
+        if ex == EX_BREAK:
+            break
+        if ex == EX_RETURN or ex == EX_ERROR or ex == EX_EXIT:
+            return ex
+        i = i + 1
+    return EX_NORMAL
+
+
+def exec_try(node: int32) -> int32:
+    # try { } except { } — built on errstr (§16). If the try block
+    # raises EX_ERROR (a failed mount / a builtin that set errstr),
+    # run the except block. $errstr carries the kernel's message.
+    nu: uint64 = cast[uint64](node)
+    ex: int32 = exec_block(nd_a[nu])
+    if ex == EX_ERROR:
+        # the error message is already in errstr_buf
+        return exec_block(nd_b[nu])
+    return ex
+
+
+def exec_command(node: int32) -> int32:
+    # A single command stage that is NOT inside a pipeline.
+    rc: int32 = run_one_command(node, 0, 1, 2, 1)
+    eval_status = rc
+    # exit / help builtins are handled here for the prompt
+    nu: uint64 = cast[uint64](node)
+    return EX_NORMAL
+
+
+def exec_statement(node: int32) -> int32:
+    if node == 0:
+        return EX_NORMAL
+    nu: uint64 = cast[uint64](node)
+    k: int32 = nd_kind[nu]
+    if k == ND_BLOCK:
+        return exec_block(node)
+    if k == ND_ASSIGN:
+        return exec_assign(node)
+    if k == ND_DEF:
+        return exec_def(node)
+    if k == ND_IF:
+        return exec_if(node)
+    if k == ND_WHILE:
+        return exec_while(node)
+    if k == ND_FOR:
+        return exec_for(node)
+    if k == ND_TRY:
+        return exec_try(node)
+    if k == ND_NS:
+        return exec_ns(node)
+    if k == ND_ENTER:
+        return exec_enter(node)
+    if k == ND_SPAWN:
+        return exec_spawn(node)
+    if k == ND_RETURN:
+        if nd_a[nu] != 0:
+            eval_retval = eval_expr(nd_a[nu])
+        else:
+            eval_retval = 0
+        return EX_RETURN
+    if k == ND_BREAK:
+        return EX_BREAK
+    if k == ND_CONTINUE:
+        return EX_CONTINUE
+    if k == ND_PIPELINE:
+        eval_status = run_pipeline(node)
+        return EX_NORMAL
+    if k == ND_AND:
+        l: int32 = exec_statement(nd_a[nu])
+        if l != EX_NORMAL:
+            return l
+        if eval_status == 0:
+            return exec_statement(nd_b[nu])
+        return EX_NORMAL
+    if k == ND_OR:
+        l: int32 = exec_statement(nd_a[nu])
+        if l != EX_NORMAL:
+            return l
+        if eval_status != 0:
+            return exec_statement(nd_b[nu])
+        return EX_NORMAL
+    if k == ND_CMD:
+        # check for the exit / help builtins which need to unwind
+        argc: int32 = _argv_build(node)
+        if argc >= 1:
+            cmd: Ptr[uint8] = cast[Ptr[uint8]](argv_ptr[0])
+            if cstr_eq(cmd, "exit") != 0:
+                if argc >= 2:
+                    eval_status = cast[int32](_parse_dec(
+                        cast[Ptr[uint8]](argv_ptr[1])))
+                return EX_EXIT
+            if cstr_eq(cmd, "help") != 0:
+                builtin_help()
+                return EX_NORMAL
+            if cstr_eq(cmd, "true") != 0:
+                eval_status = 0
+                return EX_NORMAL
+            if cstr_eq(cmd, "false") != 0:
+                eval_status = 1
+                return EX_NORMAL
+            if cstr_eq(cmd, "kill") != 0:
+                _builtin_kill(argc)
+                return EX_NORMAL
+            if cstr_eq(cmd, "wait") != 0:
+                _builtin_wait(argc)
+                return EX_NORMAL
+        # argv is already built; run the command directly
+        eval_status = _run_prebuilt_command(node, argc)
+        return EX_NORMAL
+    if k == ND_EXPRSTMT:
+        eval_expr(nd_a[nu])
+        return EX_NORMAL
+    # a bare expression statement (e.g. a function call as a statement)
+    eval_expr(node)
+    return EX_NORMAL
+
+
+def _parse_dec(s: Ptr[uint8]) -> int64:
+    i: uint64 = 0
+    neg: int32 = 0
+    if s[0] == 45:
+        neg = 1
+        i = 1
+    r: int64 = 0
+    while s[i] >= 48 and s[i] <= 57:
+        r = r * 10 + cast[int64](s[i] - 48)
+        i = i + 1
+    if neg != 0:
+        return -r
+    return r
+
+
+def builtin_help():
+    write_cstr1("hamsh — the Hamnix shell.\n")
+    write_cstr1("  builtins: cd bind mount unmount import export\n")
+    write_cstr1("            echo true false kill wait exit help\n")
+    write_cstr1("  control:  if/elif/else while for def return\n")
+    write_cstr1("            try/except ns enter spawn\n")
+    write_cstr1("  pipes:  a | b    redirect:  cmd > file   cmd 2>&1\n")
+
+
+def _run_prebuilt_command(node: int32, argc: int32) -> int32:
+    # run_one_command rebuilds argv internally; for a single command
+    # statement we just defer to it (argv is rebuilt — cheap, and
+    # keeps redirect handling in one place).
+    return run_one_command(node, 0, 1, 2, 1)
+
+
+def _builtin_kill(argc: int32):
+    # kill HANDLE  — signal a spawned process. The arg is either a
+    # process-handle variable ($svc) rendered to its pid, or a literal
+    # pid. We resolve via the argv string.
+    if argc < 2:
+        errstr_set("kill: usage: kill handle")
+        return
+    pid: int32 = cast[int32](_parse_dec(
+        cast[Ptr[uint8]](argv_ptr[1])))
+    if pid > 0:
+        sys_kill(pid, 9)             # SIGKILL
+        eval_status = 0
+    else:
+        errstr_set("kill: bad handle")
+        eval_status = 1
+
+
+def _builtin_wait(argc: int32):
+    # wait HANDLE — block on a spawned process.
+    if argc < 2:
+        eval_status = 0
+        return
+    pid: int32 = cast[int32](_parse_dec(
+        cast[Ptr[uint8]](argv_ptr[1])))
+    if pid > 0:
+        code: int64 = sys_waitpid(pid)
+        eval_status = cast[int32](code)
+    else:
+        eval_status = 1
+
+
+# --- globbing (§4) --------------------------------------------------
+# The single implicit expansion. An unquoted command-position word
+# with glob metacharacters is matched against the current namespace.
+# We list the pattern's parent directory and fnmatch the leaf.
+glob_dir:  Array[256, uint8]
+glob_leaf: Array[128, uint8]
+glob_list: Array[4096, uint8]
+
+
+def _fnmatch(pat: Ptr[uint8], name: Ptr[uint8]) -> int32:
+    # Minimal glob match: '*' (any run) and '?' (one char). No
+    # bracket classes here — generous enough for *.ad and friends.
+    pi: uint64 = 0
+    ni: uint64 = 0
+    star_p: int64 = -1
+    star_n: uint64 = 0
+    while name[ni] != 0:
+        pc: uint8 = pat[pi]
+        if pc == 42:                          # '*'
+            star_p = cast[int64](pi)
+            star_n = ni
+            pi = pi + 1
+        elif pc == 63 or pc == name[ni]:      # '?' or literal match
+            pi = pi + 1
+            ni = ni + 1
+        elif star_p >= 0:
+            pi = cast[uint64](star_p) + 1
+            star_n = star_n + 1
+            ni = star_n
+        else:
+            return 0
+    while pat[pi] == 42:
+        pi = pi + 1
+    if pat[pi] == 0:
+        return 1
+    return 0
+
+
+def _glob_try(pattern: Ptr[uint8]) -> int32:
+    # Split the pattern into dir + leaf, listdir the dir, fnmatch the
+    # leaf, push each match as an argv entry. Returns count matched.
+    n: uint64 = cstr_len(pattern)
+    slash: int64 = -1
+    i: uint64 = 0
+    while i < n:
+        if pattern[i] == 47:
+            slash = cast[int64](i)
+        i = i + 1
+    di: uint64 = 0
+    if slash >= 0:
+        while di < cast[uint64](slash) and di + 1 < 256:
+            glob_dir[di] = pattern[di]
+            di = di + 1
+        if di == 0:
+            glob_dir[0] = 47
+            di = 1
+    else:
+        glob_dir[0] = 46                      # '.'
+        di = 1
+    glob_dir[di] = 0
+    li: uint64 = 0
+    lstart: uint64 = 0
+    if slash >= 0:
+        lstart = cast[uint64](slash) + 1
+    while lstart + li < n and li + 1 < 128:
+        glob_leaf[li] = pattern[lstart + li]
+        li = li + 1
+    glob_leaf[li] = 0
+    # listdir
+    nlist: int64 = _ext_listdir(&glob_dir[0], &glob_list[0], 4096)
+    if nlist <= 0:
+        return 0
+    count: int32 = 0
+    p: uint64 = 0
+    fp: Array[384, uint8]
+    while p < cast[uint64](nlist):
+        es: uint64 = p
+        while p < cast[uint64](nlist) and glob_list[p] != 10:
+            p = p + 1
+        elen: uint64 = p - es
+        if p < cast[uint64](nlist):
+            p = p + 1
+        # NUL-terminate the entry name in a temp
+        ent: Array[128, uint8]
+        ec: uint64 = 0
+        while ec < elen and ec + 1 < 128:
+            ent[ec] = glob_list[es + ec]
+            ec = ec + 1
+        ent[ec] = 0
+        if _fnmatch(&glob_leaf[0], &ent[0]) != 0:
+            # rebuild full path dir + '/' + ent
+            fi: uint64 = 0
+            if slash >= 0:
+                while fi < cast[uint64](slash) and fi + 1 < 384:
+                    fp[fi] = pattern[fi]
+                    fi = fi + 1
+                if fi + 1 < 384:
+                    fp[fi] = 47
+                    fi = fi + 1
+            gj: uint64 = 0
+            while ent[gj] != 0 and fi + 1 < 384:
+                fp[fi] = ent[gj]
+                fi = fi + 1
+                gj = gj + 1
+            fp[fi] = 0
+            _argv_push_cstr(&fp[0])
+            count = count + 1
+    return count
+
+
+extern def sys_listdir(path: Ptr[char], buf: Ptr[uint8],
+                       count: uint64) -> int64
+
+
+def _ext_listdir(path: Ptr[uint8], buf: Ptr[uint8],
+                 cap: uint64) -> int64:
+    return sys_listdir(cast[Ptr[char]](path), buf, cap)
+
+
+# ====================================================================
+# REPL
+# ====================================================================
+# The line driver: lex -> parse -> exec. Multi-line constructs use the
+# continuation prompt: the parser knows a block is incomplete until
+# the closing `}` (§5), so we count braces and keep reading until they
+# balance. Paste-robust and REPL-friendly.
+
+line_buf:   Array[2048, uint8]
+read_buf:   Array[256, uint8]
+
+
+def _maybe_recycle_arenas():
+    # The node / value / string arenas are append-only across a
+    # session. When they near capacity AND there is no live state to
+    # preserve (no `def`'d functions, no variable bindings), recycle
+    # them to baseline. With functions or variables live, we keep
+    # growing — the soft-overflow path then degrades gracefully.
+    if fn_count != 0:
+        return
+    if sc_count != 0:
+        return
+    if nd_count < NODE_MAX - 1024 and val_count < VAL_MAX - 1024 and \
+            str_cursor < STR_ARENA_MAX - 4096 and \
+            val_elem_cursor < LISTELEM_MAX - 1024:
+        return
+    nd_count = 1
+    nd_kid_cursor = 0
+    val_count = 1
+    val_elem_cursor = 0
+    str_cursor = 1
+    str_arena[0] = 0
+
+
+def _brace_balance(buf: Ptr[uint8], n: uint64) -> int64:
+    # Net unclosed-brace count, ignoring braces inside quotes.
+    depth: int64 = 0
+    in_dq: int32 = 0
+    in_sq: int32 = 0
+    i: uint64 = 0
+    while i < n:
+        c: uint8 = buf[i]
+        if in_dq != 0:
+            if c == 34:
+                in_dq = 0
+        elif in_sq != 0:
+            if c == 39:
+                in_sq = 0
+        else:
+            if c == 34:
+                in_dq = 1
+            elif c == 39:
+                in_sq = 1
+            elif c == 123:
+                depth = depth + 1
+            elif c == 125:
+                depth = depth - 1
+        i = i + 1
+    return depth
+
+
+def run_source(buf: Ptr[uint8], n: uint64) -> int32:
+    # Lex, parse, and execute a complete logical input. Returns 1 if
+    # `exit` was requested, else 0. The node / value / string arenas
+    # are session-lifetime append-only (so variables and `def`'d
+    # functions outlive the line); _maybe_recycle_arenas reclaims them
+    # only when provably safe.
+    _maybe_recycle_arenas()
+    if lex_line(buf, n) < 0:
+        write_cstr1("hamsh: lexical error (unterminated quote)\n")
+        return 0
+    prog: int32 = parse_program()
+    if ps_error != 0:
+        write_cstr1("hamsh: parse error: ")
+        write_cstr1(&ps_errmsg[0])
+        write_cstr1("\n")
+        return 0
+    ex: int32 = exec_block(prog)
+    if ex == EX_EXIT:
+        return 1
+    return 0
+
+
+def prompt():
+    write_cstr1("hamsh$ ")
+
+
+def cont_prompt():
+    write_cstr1("> ")
 
 
 def main() -> int32:
-    # Keep this EXACT banner line — the BIOS/UEFI boot tests grep the
-    # serial log for "[hamsh] M16.35 shell ready". It is emitted FIRST
-    # so it lands in the serial stream before the screen-clear escape;
-    # the framebuffer will wipe it a moment later when we clear, but
-    # the serial stream (a stream, not a screen) keeps every byte.
-    write_str(1, "[hamsh] M16.35 shell ready. Type 'help' or '/hello'.\n")
-    # M16.73: source /etc/rc if it exists — equivalent of /etc/rc.d
-    # on a real Linux. Lets the system print a motd, set a hostname,
-    # warm caches, etc, all without baking strings into hamsh itself.
-    run_rc_file("/etc/rc")
-    # Clean-terminal startup: wipe the framebuffer of boot/diagnostic
-    # spam and home the cursor, then show a concise banner so the user
-    # is greeted by a clean prompt instead of a wall of kernel text.
-    #   ESC [ 2 J  — clear entire screen
-    #   ESC [ H    — cursor to top-left (0,0)
-    # On the serial console these bytes pass through harmlessly (a
-    # serial terminal that understands ANSI clears too; a raw log just
-    # carries the escape bytes inline and earlier lines are untouched).
-    write_str(1, "\x1B[2J\x1B[H")
-    write_str(1, "Hamnix hamsh - type 'help' or '/hello'\n")
+    str_arena_init()
+    scope_reset()
+    errstr_clear()
+    # Seed a minimal environment so $PATH resolves.
+    env_set("PATH", "/bin:/sbin:/usr/bin")
+    env_set("HOME", "/")
+    write_cstr1("hamsh — Hamnix shell. Type 'help'.\n")
+
+    # If a startup script exists, run it first (init/rc).
+    _run_rc_file()
+
     while True:
-        print_prompt()
-        n: int64 = read_line(&line_buf[0], LINE_MAX)
-        if n <= 0:
-            # EOF / error on stdin — bail so the kernel halts when
-            # we exit instead of busy-looping on a dead UART.
-            write_str(1, "[hamsh] stdin closed, exiting.\n")
-            return 0
-        nu: uint64 = cast[uint64](n)
-        if nu >= LINE_MAX:
-            nu = LINE_MAX - 1
-        if process_line(&line_buf[0], nu) == SHELL_EXIT:
-            return 0
+        prompt()
+        total: uint64 = 0
+        # Read a logical line, extending across `{ }` continuations.
+        done: int32 = 0
+        while done == 0:
+            n: int64 = sys_read(0, &read_buf[0], 256)
+            if n <= 0:
+                # EOF on stdin — exit cleanly.
+                write_cstr1("\n")
+                return cast[int32](eval_status)
+            j: uint64 = 0
+            while j < cast[uint64](n) and total + 1 < LINE_MAX:
+                line_buf[total] = read_buf[j]
+                total = total + 1
+                j = j + 1
+            # Did we get a newline? If so, check brace balance.
+            if total > 0 and line_buf[total - 1] == 10:
+                bal: int64 = _brace_balance(&line_buf[0], total)
+                if bal <= 0:
+                    done = 1
+                else:
+                    cont_prompt()
+            if total + 1 >= LINE_MAX:
+                done = 1
+        if run_source(&line_buf[0], total) != 0:
+            return cast[int32](eval_status)
     return 0
+
+
+# --- rc / startup script --------------------------------------------
+rc_buf: Array[2048, uint8]
+
+
+def _run_rc_file():
+    # If /etc/hamsh.rc exists, source it. Silent miss — boot still
+    # works without it. The whole-file is read then run as one source.
+    fd: int32 = sys_open(cast[Ptr[char]]("/etc/hamsh.rc"))
+    if fd < 0:
+        return
+    total: uint64 = 0
+    while True:
+        n: int64 = sys_read(fd, &rc_buf[total], 2048 - total)
+        if n <= 0:
+            break
+        total = total + cast[uint64](n)
+        if total >= 2048:
+            break
+    sys_close(fd)
+    if total > 0:
+        run_source(&rc_buf[0], total)
