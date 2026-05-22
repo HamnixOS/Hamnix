@@ -48,6 +48,19 @@ from drivers.net.udp import (
     udp_socket_connect, udp_socket_sendto, udp_socket_recvfrom,
     udp_socket_recv_pending, udp_socket_local_port,
 )
+# ARCH §10: TLS is a Plan-9-shaped upgrade of a /net connection. A
+# write of `tls <hostname>` to a connected /net/tcp conn's ctl file
+# runs the in-kernel TLS 1.3 handshake (drivers/net/tls.ad) over that
+# connection — there is NO socket() / SYS_TLS_CONNECT syscall. After
+# the handshake the conn is TLS-active: vfs routes its data file
+# read/write through the TLS record layer. tls.ad and devnet.ad
+# import each other (Adder's flat-merge symbol model resolves the
+# cycle); tls.ad's wire layer calls the RAW devnet_data_* helpers, so
+# the TLS-routing decision lives in vfs.ad, never re-entering here.
+from drivers.net.tls import (
+    tls_init, tls_handshake, tls_send, tls_recv,
+    tls_close_notify, tls_close,
+)
 
 
 # --- /net fd marker --------------------------------------------------
@@ -110,6 +123,13 @@ netc_refs:    Array[32, int32]
 # netc_accepted[listener] holds the accepted conn number; a read of the
 # listener's ctl file returns it (the clone-style discovery dance).
 netc_accepted: Array[32, int32]
+# TLS-active flag: 1 once a `tls <host>` ctl command has run the TLS
+# 1.3 handshake on this conn. vfs.ad consults devnet_conn_is_tls to
+# route the conn's data file read/write through the TLS record layer
+# (tls_recv / tls_send) and its last-close through tls_close_notify.
+# The in-kernel TLS stack is single-session, so at most one conn is
+# TLS-active at a time — the `tls` ctl handler enforces that.
+netc_tls: Array[32, uint8]
 
 netc_inited: int32 = 0
 
@@ -129,6 +149,7 @@ def devnet_init():
         netc_rport[i] = 0
         netc_refs[i]  = 0
         netc_accepted[i] = -1
+        netc_tls[i]   = 0
         i = i + 1
     netc_inited = 1
     printk0("[devnet] /net connection table initialised\n")
@@ -168,6 +189,7 @@ def devnet_clone(proto: int32) -> int32:
             netc_rport[i] = 0
             netc_refs[i]  = 1
             netc_accepted[i] = -1
+            netc_tls[i]   = 0
             return cast[int32](i)
         i = i + 1
     return -1
@@ -186,6 +208,16 @@ def _devnet_teardown(conn: int32):
     # by devnet_conn_unref on the last reference, and by the ctl
     # `hangup` command's caller path.
     cu: uint64 = cast[uint64](conn)
+    # ARCH §10: a TLS-active conn gets a graceful TLS shutdown first —
+    # send a close_notify alert (best-effort) under the application
+    # traffic key, then reset the in-kernel TLS session so a later
+    # `tls` ctl command can claim it again. This mirrors the old
+    # FD_SOCKET_MARK close path; it must run BEFORE tcp_close FINs the
+    # transport so the alert lands on the still-open stream.
+    if netc_tls[cu] != 0:
+        tls_close_notify(conn)
+        tls_close()
+        netc_tls[cu] = 0
     slot: int32 = netc_slot[cu]
     if slot >= 0:
         if netc_proto[cu] == NET_PROTO_TCP:
@@ -204,6 +236,7 @@ def _devnet_teardown(conn: int32):
     netc_rport[cu] = 0
     netc_refs[cu]  = 0
     netc_accepted[cu] = -1
+    netc_tls[cu]   = 0
 
 
 def devnet_conn_unref(conn: int32):
@@ -311,6 +344,17 @@ NET_CTL_ETIMEOUT:  int32 = -6     # connect/accept: timed out
 NET_CTL_EREFUSED:  int32 = -7     # connect: peer RST
 NET_CTL_ENOSLOT:   int32 = -8     # no stack slot free
 NET_CTL_EADDRINUSE: int32 = -9    # announce: port already taken
+NET_CTL_ETLS:      int32 = -10    # tls: handshake / cert validation failed
+NET_CTL_EBUSY:     int32 = -11    # tls: another TLS session already live
+
+# ARCH §10: scratch for the SNI hostname a `tls <host>` ctl command
+# carries. tls_handshake wants a NUL-terminated string (SNI extension
+# + leaf-cert subject/SAN name check); the ctl write buffer is neither
+# NUL-terminated at the hostname nor stable past the call, so the
+# hostname is copied here. 256 bytes covers any DNS name (RFC 1035
+# caps a hostname at 253 chars); a longer name is rejected.
+DEVNET_TLS_HOST_MAX: uint64 = 256
+devnet_tls_host: Array[256, uint8]
 
 # A connect / accept blocks up to this many jiffies (~5 s @ HZ=100).
 # Mirrors the budget the retired socket syscalls used.
@@ -452,6 +496,52 @@ def devnet_ctl(conn: int32, buf: Ptr[uint8], len: uint64) -> int32:
         netc_accepted[cu] = acc
         return NET_CTL_OK
 
+    # --- tls <hostname> --- upgrade the conn to TLS 1.3 --------------
+    # ARCH §10: the Plan-9-shaped replacement for the retired
+    # SYS_TLS_CONNECT syscall. On a CONNECTED /net/tcp conn, a write of
+    # `tls <hostname>` runs the in-kernel TLS 1.3 handshake over this
+    # connection's byte stream (drivers/net/tls.ad's tls_handshake,
+    # which reads/writes the conn's data file). `<hostname>` is the SNI
+    # / leaf-cert name-validation host. On success the conn is marked
+    # TLS-active: vfs routes the data file's read/write through the TLS
+    # record layer. The in-kernel TLS stack is single-session, so a
+    # second `tls` while a session is live is rejected with EBUSY.
+    if _word_eq(buf, pos, len, "tls") != 0:
+        if netc_proto[cu] != NET_PROTO_TCP:
+            return NET_CTL_EBADCMD
+        if netc_state[cu] != NETC_CONNECTED:
+            # TLS rides an ESTABLISHED connection — `connect` first.
+            return NET_CTL_ESTATE
+        if netc_tls[cu] != 0:
+            # Already handshaked on this conn — a double `tls`.
+            return NET_CTL_EBUSY
+        # Copy the SNI hostname (the rest of the command line, trimmed
+        # at the first separator) into devnet_tls_host, NUL-terminated.
+        pos = pos + 3
+        pos = _skip_spaces(buf, pos, len)
+        hi: uint64 = 0
+        while pos < len and hi + 1 < DEVNET_TLS_HOST_MAX:
+            hb: uint8 = buf[pos]
+            if hb == 32 or hb == 9 or hb == 10 or hb == 13 or hb == 0:
+                break
+            devnet_tls_host[hi] = hb
+            hi = hi + 1
+            pos = pos + 1
+        devnet_tls_host[hi] = 0
+        if hi == 0:
+            return NET_CTL_EBADCMD
+        # Run the handshake. tls_init is idempotent (clears scratch +
+        # loads SHA-256 K constants); tls_handshake validates the
+        # server cert chain against the kernel CA store and verifies
+        # the CertificateVerify transcript binding. The conn number is
+        # the transport tls_handshake reads/writes its records over.
+        tls_init()
+        hs: int32 = tls_handshake(conn, &devnet_tls_host[0])
+        if hs != 0:
+            return NET_CTL_ETLS
+        netc_tls[cu] = 1
+        return NET_CTL_OK
+
     # --- hangup --- tear the connection's transport down -------------
     if _word_eq(buf, pos, len, "hangup") != 0:
         slot: int32 = netc_slot[cu]
@@ -525,6 +615,32 @@ def devnet_data_read(conn: int32, buf: Ptr[uint8],
         return n
     # UDP: pull one datagram.
     ud: int64 = udp_socket_recvfrom(slot, buf, count, NET_BLOCK_JIFFIES,
+                                    cast[Ptr[uint32]](0),
+                                    cast[Ptr[uint16]](0))
+    if ud < 0:
+        return 0
+    return ud
+
+
+def devnet_data_read_to(conn: int32, buf: Ptr[uint8], count: uint64,
+                        timeout_ms: uint64) -> int64:
+    # Blocking read with a CALLER-supplied timeout (in jiffies). Same
+    # contract as devnet_data_read, but the TLS record layer rides this
+    # so a handshake / record read keeps its own per-record budget
+    # rather than the device-default NET_BLOCK_JIFFIES. RAW transport —
+    # never re-enters the TLS layer (tls.ad calls this as its wire).
+    if _netc_valid(conn) == 0:
+        return -1
+    cu: uint64 = cast[uint64](conn)
+    slot: int32 = netc_slot[cu]
+    if slot < 0:
+        return 0
+    if netc_proto[cu] == NET_PROTO_TCP:
+        n: int64 = tcp_recv(slot, buf, count, timeout_ms)
+        if n < 0:
+            netc_state[cu] = NETC_CLOSED
+        return n
+    ud: int64 = udp_socket_recvfrom(slot, buf, count, timeout_ms,
                                     cast[Ptr[uint32]](0),
                                     cast[Ptr[uint16]](0))
     if ud < 0:
@@ -712,6 +828,17 @@ def devnet_conn_proto(conn: int32) -> int32:
     if _netc_valid(conn) == 0:
         return -1
     return netc_proto[cast[uint64](conn)]
+
+
+def devnet_conn_is_tls(conn: int32) -> int32:
+    # 1 iff a `tls <host>` ctl command has TLS-upgraded this conn.
+    # vfs.ad's FD_NET_MARK read/write/close arms consult this to route
+    # a TLS-active conn's data file through the TLS record layer.
+    if _netc_valid(conn) == 0:
+        return 0
+    if netc_tls[cast[uint64](conn)] != 0:
+        return 1
+    return 0
 
 
 def devnet_accept_pending(conn: int32) -> int32:

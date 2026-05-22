@@ -219,6 +219,10 @@ from drivers.net.tls import tls_send, tls_recv, tls_close_notify, tls_close
 # a /net/<proto>/<N>/<file>; the read/write/close arms below dispatch
 # back into the devnet_* connection-table API. devnet.ad imports tcp.ad
 # + udp.ad (both import leaves) but never fs/vfs.ad — no import cycle.
+# ARCH §10: a /net conn TLS-upgraded by a `tls <host>` ctl command is
+# flagged by devnet_conn_is_tls; the FD_NET_MARK read/write/close arms
+# below route such a conn's data file through the TLS 1.3 record layer
+# (tls_send / tls_recv / tls_close_notify) instead of raw devnet I/O.
 from drivers.net.devnet import (
     FD_NET_MARK,
     NET_PROTO_TCP, NET_PROTO_UDP,
@@ -229,6 +233,7 @@ from drivers.net.devnet import (
     devnet_conn_unref, devnet_ctl,
     devnet_data_read, devnet_data_read_nb, devnet_data_write,
     devnet_data_pending, devnet_data_at_eof,
+    devnet_conn_is_tls,
     devnet_status_render, devnet_local_render, devnet_remote_render,
     devnet_pack, devnet_unpack_file, devnet_unpack_proto,
     devnet_unpack_conn, devnet_conn_proto,
@@ -2392,7 +2397,15 @@ def vfs_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         nf:  int32 = devnet_unpack_file(net_pk)
         nc:  int32 = devnet_unpack_conn(net_pk)
         if nf == NET_FILE_DATA:
-            # The connection byte stream — a blocking read.
+            # The connection byte stream — a blocking read. ARCH §10:
+            # if a `tls <host>` ctl command TLS-upgraded this conn,
+            # read(2) decrypts transparently through the TLS 1.3 record
+            # layer (tls_recv pulls the conn's data file + AEAD-opens).
+            if devnet_conn_is_tls(nc) != 0:
+                n_tls: int64 = tls_recv(nc, buf, count, 500)
+                if n_tls <= 0:
+                    return 0
+                return n_tls
             return devnet_data_read(nc, buf, count)
         # clone / status / local / remote: one-shot text snapshots. A
         # second read (fd_pos advanced) is EOF so `cat` terminates.
@@ -2464,13 +2477,15 @@ def vfs_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
             return 0
         # U-TLS: if tls_connect(2) ran a handshake on this fd, read(2)
         # pulls the next decrypted application_data record off the wire
-        # via the TLS record layer. tls_recv tcp_recv's + AEAD-decrypts
-        # internally; it returns >0 plaintext bytes, 0 on close_notify /
-        # clean EOF, or -1 on a hard decrypt / protocol error. We latch
-        # CLOSED on the EOF/error answers (an error there is genuinely
-        # un-recoverable for a stream socket).
+        # via the TLS record layer. ARCH §10: the TLS record layer's
+        # transport is the socket's /net connection (tls_recv reads the
+        # conn's data file + AEAD-decrypts), so it keys on the /net conn
+        # NUMBER, not the raw TCP slot. tls_recv returns >0 plaintext
+        # bytes, 0 on close_notify / clean EOF, or -1 on a hard decrypt
+        # / protocol error. We latch CLOSED on the EOF/error answers.
         if usock_is_tls(sk_rec) != 0:
-            n_tls: int64 = tls_recv(sk_tcp, buf, count, 500)
+            sk_netconn_r: int32 = usock_get_netconn(sk_rec)
+            n_tls: int64 = tls_recv(sk_netconn_r, buf, count, 500)
             if n_tls <= 0:
                 usock_set_state(sk_rec, USOCK_CLOSED)
             return n_tls
@@ -2839,6 +2854,30 @@ def vfs_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         nf: int32 = devnet_unpack_file(net_pk)
         nc: int32 = devnet_unpack_conn(net_pk)
         if nf == NET_FILE_DATA:
+            # ARCH §10: a `tls`-upgraded conn encrypts each write
+            # through the TLS 1.3 record layer before it hits the
+            # connection's byte stream. tls_send's plaintext scratch is
+            # a 2048-byte frame, so one record caps at ~2026 plaintext
+            # bytes; chunk the user buffer at 2000 bytes per call so a
+            # write(2) larger than one TLS record drains as a sequence
+            # of records — the exact shape the FD_SOCKET_MARK TLS path
+            # used before SYS_TLS_CONNECT retired.
+            if devnet_conn_is_tls(nc) != 0:
+                net_tls_sent: uint64 = 0
+                while net_tls_sent < count:
+                    net_tls_chunk: uint64 = count - net_tls_sent
+                    if net_tls_chunk > 2000:
+                        net_tls_chunk = 2000
+                    net_tls_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+                        cast[uint64](buf) + net_tls_sent)
+                    net_tls_rc: int64 = tls_send(nc, net_tls_ptr,
+                                                 net_tls_chunk)
+                    if net_tls_rc <= 0:
+                        if net_tls_sent > 0:
+                            return cast[int64](net_tls_sent)
+                        return -1
+                    net_tls_sent = net_tls_sent + cast[uint64](net_tls_rc)
+                return cast[int64](net_tls_sent)
             return devnet_data_write(nc, buf, count)
         if nf == NET_FILE_CTL:
             rc_ctl: int32 = devnet_ctl(nc, buf, count)
@@ -2950,13 +2989,16 @@ def vfs_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         if sk_tcp < 0:
             return cast[int64](EPIPE)
         # U-TLS: a TLS-active fd encrypts each write through the TLS
-        # record layer before tcp_send. tls_send's plaintext scratch is
-        # a 2048-byte frame (Array[2048]), so it caps one record at
-        # ~2026 plaintext bytes; we chunk the user buffer at 2000 bytes
-        # per call so a write(2) larger than one TLS record drains as a
+        # record layer before it hits the wire. ARCH §10: the TLS
+        # record layer's transport is the socket's /net connection, so
+        # tls_send keys on the /net conn NUMBER. tls_send's plaintext
+        # scratch is a 2048-byte frame, so one record caps at ~2026
+        # plaintext bytes; we chunk the user buffer at 2000 bytes per
+        # call so a write(2) larger than one TLS record drains as a
         # sequence of records. tls_send returns the byte count sealed
         # on success or -1 on a wire / AEAD error.
         if usock_is_tls(sk_rec) != 0:
+            sk_netconn_w: int32 = usock_get_netconn(sk_rec)
             tls_sent: uint64 = 0
             while tls_sent < count:
                 tls_chunk: uint64 = count - tls_sent
@@ -2964,7 +3006,7 @@ def vfs_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
                     tls_chunk = 2000
                 tls_ptr: Ptr[uint8] = cast[Ptr[uint8]](
                     cast[uint64](buf) + tls_sent)
-                tls_rc: int64 = tls_send(sk_tcp, tls_ptr, tls_chunk)
+                tls_rc: int64 = tls_send(sk_netconn_w, tls_ptr, tls_chunk)
                 if tls_rc <= 0:
                     # Encrypt / transport failure. Latch CLOSED; report
                     # a short count if earlier records made it, else
@@ -3254,12 +3296,14 @@ def vfs_close(fd: int32) -> int32:
                 # U-TLS: a TLS-active fd gets a graceful TLS shutdown
                 # first — send a close_notify alert (best-effort) and
                 # reset the in-kernel TLS session so a later
-                # tls_connect(2) can claim it again.
-                if sk_tcp >= 0:
-                    if usock_is_tls(sk_rec) != 0:
-                        tls_close_notify(sk_tcp)
-                        tls_close()
-                        usock_set_tls(sk_rec, 0)
+                # tls_connect(2) can claim it again. ARCH §10: the TLS
+                # record layer rides the socket's /net connection, so
+                # the close_notify alert is keyed on the /net conn.
+                if usock_is_tls(sk_rec) != 0:
+                    if sk_netconn >= 0:
+                        tls_close_notify(sk_netconn)
+                    tls_close()
+                    usock_set_tls(sk_rec, 0)
                 # ARCH §10: a TCP socket fd's connection is owned by the
                 # /net file tree (connect(2)/listen(2)/accept(2) cloned
                 # it). Dropping the /net reference FIN-tears the TCP
