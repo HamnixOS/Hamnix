@@ -364,7 +364,7 @@ shape.
 | `/dev/wctl` | r/w | Per-window control (resize/move/raise). Served by `rio`. |
 | `/dev/wsys` | r/w | System-wide window control; write spawns a window. Served by `rio`. |
 | `/net/tcp/clone` | r/w | Open then read to get a new TCP connection number N; further I/O on the per-conn `/net/tcp/<N>/{ctl,data,local,remote,status}`. Plan 9 idiom. Implemented by `drivers/net/devnet.ad`. |
-| `/net/tcp/<N>/ctl` | w | Write one text command: `connect <a.b.c.d>!<port>`, `announce <port>`, `accept`, `hangup`. After `accept`, read the ctl file to get the accepted connection number. |
+| `/net/tcp/<N>/ctl` | w | Write one text command: `connect <a.b.c.d>!<port>`, `announce <port>`, `accept`, `tls <hostname>`, `hangup`. After `accept`, read the ctl file to get the accepted connection number. The `tls` command runs the in-kernel TLS 1.3 handshake (X25519 + cert-chain validation + CertificateVerify) over a connected conn — afterwards reads/writes on the conn's data file are transparently TLS-decrypted/encrypted. |
 | `/net/tcp/<N>/data` | r/w | The connection's byte stream. |
 | `/net/tcp/<N>/{status,local,remote}` | r | Readable connection info. |
 | `/net/udp/*` | r/w | Same shape, UDP (datagram). |
@@ -492,18 +492,23 @@ moves break Linux ABI** (Layer 2 has its own dispatch table).
   networking by `open`/`read`/`write` on these files
   (`user/net9.ad`'s `net_dial` / `net_announce` / `net_accept`). The
   native server-side socket syscalls `SYS_BIND_SOCK` (49) /
-  `SYS_LISTEN_SOCK` (50) / `SYS_ACCEPT_SOCK` (43) are **retired** —
-  those numbers are unassigned in the native dispatch table. The
-  Linux-ABI `socket()`/`connect()`/`bind()`/`listen()`/`accept()`
+  every native BSD socket syscall is now **retired** —
+  `SYS_SOCKET` (41), `SYS_CONNECT` (42), `SYS_ACCEPT_SOCK` (43),
+  `SYS_BIND_SOCK` (49), `SYS_LISTEN_SOCK` (50) and `SYS_TLS_CONNECT`
+  (277) are unassigned in the native dispatch table. The Linux-ABI
+  `socket()`/`connect()`/`bind()`/`listen()`/`accept()`/`tls_connect`
   shims (`linux_abi/u_syscalls.ad`) are now Layer-2 *consumers* of
   `/net` — they drive `devnet_clone` + the `connect`/`announce`/
-  `accept` ctl protocol, not `tcp_connect` directly. `SYS_SOCKET`
-  (41) / `SYS_CONNECT` (42) survive only because `SYS_TLS_CONNECT`
-  (277) — a documented `/net` follow-up — still needs a socket fd to
-  run the TLS handshake on; native non-TLS clients use `/net`
-  directly. DNS (`SYS_RESOLVE` 269), TLS (`SYS_TLS_CONNECT` 277) and
-  the netcfg syscall (`SYS_NETCFG` 286) are related Layer-1-networking
-  calls left for a follow-up — they are *not* `/net`-shaped yet.
+  `accept`/`tls` ctl protocol, not `tcp_connect` directly. TLS is a
+  Plan-9-shaped upgrade of a `/net/tcp` conn: a `tls <hostname>` ctl
+  command on a connected conn runs the in-kernel TLS 1.3 handshake
+  (drivers/net/tls.ad's record layer rides the conn's `data` file)
+  and flags the conn TLS-active; vfs routes the conn's data file
+  through `tls_recv`/`tls_send`/`tls_close_notify`. Native clients
+  reach all of this via `user/net9.ad`'s `net_dial` / `net_dial_tls`
+  / `net_announce` / `net_accept`. Only DNS (`SYS_RESOLVE` 269) and
+  the netcfg syscall (`SYS_NETCFG` 286) remain as Layer-1-networking
+  syscalls — they are *not* `/net`-shaped yet.
 - **`epoll`, `select`, `poll`.** Plan 9 blocks on a single fd at
   a time; concurrency comes from rfork-shared-fd-table workers
   per blocked fd. Layer 2 emulates `select` with helper threads
