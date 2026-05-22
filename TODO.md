@@ -298,5 +298,6 @@ Everything in §5 is Layer-2-only per the boundary law.
   `_socket`, ...) once a U-track `ld.so` exists.
 - busybox `ls` enumeration XFAIL (musl DIR-fd round-trip) — re-confirm
   after the `%rdi` fix; busybox `sh -c "a|b"` internal-pipeline `#GP`.
-- `/bin` tool audit for cwd-relative defaults; SSH follow-ups (publickey
-  auth, generated host key, RFC 6979 nonce).
+- `/bin` tool audit for cwd-relative defaults.
+- [x] SSH follow-ups — publickey auth, generated+persisted host key,
+  RFC 6979 deterministic ECDSA nonce — `5cd02bb`.
