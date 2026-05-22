@@ -192,8 +192,22 @@ PY
 done
 
 set +e
+# Prompt-synced feed: wait for hamsh's stable readiness marker in $LOG
+# before sending the first command, instead of a blind fixed sleep. The
+# 16550 RX FIFO has no software buffer — a byte sent before hamsh has a
+# live SYS_READ on stdin is dropped, which is exactly how the old
+# fixed-`sleep` feed desynced against the rewritten shell.
 (
-    sleep 60
+    waited=0
+    while [ "$waited" -lt 120 ]; do
+        if [ -f "$LOG" ] && grep -F -q "[hamsh] M16.35 shell ready" "$LOG"; then
+            break
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    # A short settle so the prompt is printed and stdin is being read.
+    sleep 2
     printf '/bin/apt update http://10.0.2.2:%s stable\n' "$PORT"
     sleep 20
     printf 'echo APT_NSRUN_INSTALL_START\n'
