@@ -69,8 +69,15 @@ from drivers.net.tcp import (
 )
 from drivers.net.dns import dns_lookup
 from drivers.net.tls import (
-    tls_init, tls_handshake, tls_send, tls_recv, tls_close,
+    tls_send, tls_recv,
     TLS_DEFAULT_PORT,
+)
+# ARCH §10: the HTTPS path dials over the Plan-9-shaped /net file tree
+# — clone a /net/tcp conn, `connect` via its ctl, then TLS-upgrade it.
+# tls_handshake / tls_send / tls_recv ride the /net connection number.
+from drivers.net.devnet import (
+    NET_PROTO_TCP, NET_CTL_OK,
+    devnet_clone, devnet_ctl, devnet_conn_unref, devnet_conn_count,
 )
 # V6: transparent Content-Encoding: gzip decompression. Real Debian
 # mirrors compress Packages / Sources / Translation-en with gzip and
@@ -1679,6 +1686,101 @@ def _http_get_once(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
 # the "TLS-Unsafe; transport encryption only, no authentication" note.
 # ---------------------------------------------------------------------------
 
+# ARCH §10: HTTPS dial over /net. _https_net_dial clones a /net/tcp
+# connection, writes a `connect <a.b.c.d>!<port>` then a `tls <host>`
+# ctl command (the latter runs the in-kernel TLS 1.3 handshake over
+# the connection's byte stream), and returns the TLS-active /net
+# connection NUMBER. tls_send / tls_recv ride that number. On any
+# failure it tears the connection down and returns -1.
+#
+# _https_net_close resets the TLS session and drops the /net
+# connection's reference (which FIN-tears the transport down) — the
+# single teardown both the success and every early-return path use.
+
+# Scratch for the /net ctl command lines _https_net_dial writes. Not
+# reentrant — a single HTTPS GET runs at a time (top-level BSS; the
+# Hamnix idiom keeps scratch out of nested frames — U9 quirk).
+https_net_ctl: Array[320, uint8]
+
+
+def _https_put_dec(out: Ptr[uint8], pos: uint64, v: uint64) -> uint64:
+    if v == 0:
+        out[pos] = 48
+        return pos + 1
+    digs: Array[24, uint8]
+    n: uint64 = 0
+    while v != 0:
+        digs[n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    p: uint64 = pos
+    while n > 0:
+        n = n - 1
+        out[p] = digs[n]
+        p = p + 1
+    return p
+
+
+def _https_net_dial(ip0: uint8, ip1: uint8, ip2: uint8, ip3: uint8,
+                    port: uint64, host: Ptr[uint8]) -> int32:
+    # Clone a /net/tcp conn, connect to ip0.ip1.ip2.ip3:port, then TLS-
+    # upgrade it for `host` (SNI / leaf-cert name). Returns the TLS-
+    # active /net conn number, or -1 on any failure.
+    conn: int32 = devnet_clone(NET_PROTO_TCP)
+    if conn < 0:
+        printk0("[https] /net clone failed\n")
+        return -1
+    # connect <a.b.c.d>!<port>
+    cpfx: Ptr[uint8] = "connect "
+    cp: uint64 = 0
+    while cpfx[cp] != 0:
+        https_net_ctl[cp] = cpfx[cp]
+        cp = cp + 1
+    cp = _https_put_dec(&https_net_ctl[0], cp, cast[uint64](ip0))
+    https_net_ctl[cp] = 46
+    cp = cp + 1
+    cp = _https_put_dec(&https_net_ctl[0], cp, cast[uint64](ip1))
+    https_net_ctl[cp] = 46
+    cp = cp + 1
+    cp = _https_put_dec(&https_net_ctl[0], cp, cast[uint64](ip2))
+    https_net_ctl[cp] = 46
+    cp = cp + 1
+    cp = _https_put_dec(&https_net_ctl[0], cp, cast[uint64](ip3))
+    https_net_ctl[cp] = 33                                # '!'
+    cp = cp + 1
+    cp = _https_put_dec(&https_net_ctl[0], cp, port)
+    if devnet_ctl(conn, &https_net_ctl[0], cp) != NET_CTL_OK:
+        printk0("[https] /net connect failed\n")
+        devnet_conn_unref(conn)
+        return -1
+    # tls <hostname> — runs the TLS 1.3 handshake over the connection.
+    tpfx: Ptr[uint8] = "tls "
+    tp: uint64 = 0
+    while tpfx[tp] != 0:
+        https_net_ctl[tp] = tpfx[tp]
+        tp = tp + 1
+    hi: uint64 = 0
+    while host[hi] != 0 and tp + 1 < 320:
+        https_net_ctl[tp] = host[hi]
+        tp = tp + 1
+        hi = hi + 1
+    if devnet_ctl(conn, &https_net_ctl[0], tp) != NET_CTL_OK:
+        printk0("[https] TLS handshake failed\n")
+        devnet_conn_unref(conn)
+        return -1
+    return conn
+
+
+def _https_net_close(conn: int32):
+    # Drop the /net connection's reference. The last-reference teardown
+    # (devnet_conn_unref -> _devnet_teardown) sends the TLS close_notify
+    # alert and resets the TLS session itself — so a graceful shutdown
+    # happens without http.ad reaching into the TLS module directly.
+    if conn < 0:
+        return
+    devnet_conn_unref(conn)
+
+
 # Mirrors _http_parse_url but for the https:// scheme. We keep the
 # implementations separate so plaintext http_get callers never silently
 # downgrade through a unified parser.
@@ -1803,20 +1905,18 @@ def _https_get_once(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
     # _http_get_once and the function returns 0 body bytes so the
     # wrapper can chase the redirect.
     #
-    # End-to-end HTTPS/1.1 GET:
+    # End-to-end HTTPS/1.1 GET (ARCH §10 — dialed over /net):
     #   1. Parse the URL into (host, port, path).
     #   2. DNS lookup -> IPv4.
-    #   3. tcp_connect.
-    #   4. tls_handshake (full TLS 1.3 handshake: ClientHello +
-    #      ServerHello + X25519 ECDHE + HKDF + AEAD + server Finished
-    #      verify + client Finished. NO cert validation — see header.)
-    #   5. tls_send the HTTP request.
-    #   6. tls_recv chunks of the response, parse status line + headers
-    #      + body the same way http_get does — but talking to the TLS
-    #      slot instead of the raw TCP slot.
+    #   3. _https_net_dial: clone /net/tcp, `connect`, then `tls <host>`
+    #      (the ctl command runs the full TLS 1.3 handshake — ClientHello
+    #      + ServerHello + X25519 ECDHE + HKDF + AEAD + cert-chain
+    #      validation + CertificateVerify + Finished).
+    #   4. tls_send the HTTP request.
+    #   5. tls_recv chunks of the response, parse status line + headers
+    #      + body the same way http_get does — riding the /net conn.
     # Returns body bytes written on success, or -1 on any pre-body
     # failure. status_out carries the numeric HTTP status.
-    tls_init()
     status_out[0] = 0
     http_location_set = 0
     http_location_len = 0
@@ -1849,29 +1949,26 @@ def _https_get_once(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
         if dns_lookup(host_ptr, ip_ptr, 200) != 0:
             printk0("[https] DNS lookup failed\n")
             return -1
-    slot: int32 = tcp_connect(ip_out[0], ip_out[1], ip_out[2],
-                              ip_out[3], port_val, 200)
+    # ARCH §10: dial over /net — clone + connect + TLS-upgrade. `slot`
+    # is now a /net connection number; tls_send / tls_recv ride it.
+    slot: int32 = _https_net_dial(ip_out[0], ip_out[1], ip_out[2],
+                                  ip_out[3], cast[uint64](port_val),
+                                  host_ptr)
     if slot < 0:
-        printk0("[https] tcp_connect failed\n")
-        return -1
-    if tls_handshake(slot, host_ptr) != 0:
-        printk0("[https] TLS handshake failed\n")
-        tls_close()
         return -1
 
     # Build the HTTP request via the same helper http_get uses; the
-    # bytes go into http_req_buf, then we hand them to tls_send rather
-    # than tcp_send.
+    # bytes go into http_req_buf, then we hand them to tls_send.
     req_len_signed: int64 = _http_build_request(host_ptr, path_ptr)
     if req_len_signed < 0:
-        tls_close()
+        _https_net_close(slot)
         return -1
     req_len: uint64 = cast[uint64](req_len_signed)
     req_ptr: Ptr[uint8] = cast[Ptr[uint8]](&http_req_buf[0])
     ts: int64 = tls_send(slot, req_ptr, req_len)
     if ts < 0:
         printk0("[https] tls_send failed\n")
-        tls_close()
+        _https_net_close(slot)
         return -1
     printk1("[https] request sent (%d bytes encrypted)\n", req_len)
 
@@ -1894,7 +1991,7 @@ def _https_get_once(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
         n: int64 = tls_recv(slot, rx_ptr, HTTP_RX_BUF_BYTES, 400)
         if n < 0:
             printk0("[https] tls_recv error\n")
-            tls_close()
+            _https_net_close(slot)
             return -1
         if n == 0:
             break                              # clean EOF
@@ -1908,7 +2005,7 @@ def _https_get_once(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
                 so: int64 = _http_parse_status_line(
                     rx_ptr, chunk_n, status_out)
                 if so < 0:
-                    tls_close()
+                    _https_net_close(slot)
                     return -1
                 hdr_scan_start: uint64 = cast[uint64](so)
                 s_code: int32 = status_out[0]
@@ -1971,7 +2068,7 @@ def _https_get_once(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
                         loc_rc: int32 = _http_extract_location(
                             rx_ptr, hdr_scan_start, end_off)
                         if loc_rc < 0:
-                            tls_close()
+                            _https_net_close(slot)
                             return -1
                         if loc_rc == 1:
                             printk1("[https] %d redirect; Location captured\n",
@@ -1979,7 +2076,7 @@ def _https_get_once(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
                         else:
                             printk1("[https] %d redirect with no Location header\n",
                                     cast[uint64](rd_code))
-                        tls_close()
+                        _https_net_close(slot)
                         return 0
                     # V6: gzip detection lands before the chunked
                     # branch so the chunked decoder's inner data-copy
@@ -1987,7 +2084,7 @@ def _https_get_once(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
                     gz_rc: int32 = _http_extract_gzip_ce(
                         rx_ptr, hdr_scan_start, end_off)
                     if gz_rc < 0:
-                        tls_close()
+                        _https_net_close(slot)
                         return -1
                     if gz_rc == 1:
                         http_inflate_active = 1
@@ -2011,13 +2108,13 @@ def _https_get_once(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
                             carry_ptr, carry_len)
                         if dec_rc < 0:
                             http_inflate_active = 0
-                            tls_close()
+                            _https_net_close(slot)
                             return -1
                         if chunked_active_gz == 1:
                             printk2("[https] inflate complete (chunked): written=%d done=%d\n",
                                     cast[uint64](dec_rc),
                                     cast[uint64](http_inflate_done))
-                        tls_close()
+                        _https_net_close(slot)
                         if chunked_active_gz == 1:
                             if http_inflate_done == 0:
                                 printk0("[https] inflate: chunked body ended before gzip trailer (truncated)\n")
@@ -2042,11 +2139,11 @@ def _https_get_once(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
                     # truncation for V0 (example.com headers all fit
                     # in one TLS record).
                     printk0("[https] headers > 4KiB scratch; truncated\n")
-                    tls_close()
+                    _https_net_close(slot)
                     return cast[int64](body_written)
             else:
                 printk0("[https] headers span recv chunks; truncated\n")
-                tls_close()
+                _https_net_close(slot)
                 return cast[int64](body_written)
 
         if body_off < chunk_n:
@@ -2065,7 +2162,7 @@ def _https_get_once(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
                 body_p, &inflate_done_local)
             if rc_emit < 0:
                 http_inflate_active = 0
-                tls_close()
+                _https_net_close(slot)
                 return -1
             body_consumed_enc = body_consumed_enc + consume_n
             if inflate_done_local == 1:
@@ -2085,7 +2182,7 @@ def _https_get_once(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
         # the active-close stall.
         printk2("[https] inflate complete: written=%d done=%d\n",
                 body_written, cast[uint64](inflate_done_flag))
-    tls_close()
+    _https_net_close(slot)
     if head_done == 0:
         http_inflate_active = 0
         printk0("[https] no headers received\n")
