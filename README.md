@@ -282,6 +282,127 @@ asserts them and exits 0 on success.
 
 ---
 
+## Using hamsh
+
+`hamsh` is the shell you land in after boot, and also PID 1 — there is
+no separate init binary; the kernel `/init` shim is two lines that exec
+`/bin/hamsh /etc/rc.boot`. The language is Python-flavored with C-style
+`{ }` blocks, single grammar, deterministic statement dispatch by the
+first token. The 90% case fits on this page; see
+[`docs/HAMSH_SPEC.md`](docs/HAMSH_SPEC.md) for the full reference.
+
+### Running commands
+
+```
+hamsh$ ls /dev                      # native Adder binary on PATH
+hamsh$ echo hello                   # builtin
+hamsh$ uname                        # native /bin/uname
+hamsh$ ifconfig                     # current network info (DHCP lease)
+hamsh$ route                        # routing table
+hamsh$ cat /proc/cpuinfo            # Plan 9-shape cdev
+hamsh$ mount                        # current mount table
+```
+
+### Variables, control flow, functions
+
+Bare words are literal strings; computed values reach an argv only
+through explicit interpolation (`$name`, `${ expr }`, `` `{ … } ``).
+
+```
+hamsh$ name = "world"
+hamsh$ echo hello $name
+hamsh$ if test -f /etc/hosts { echo yes } else { echo no }
+hamsh$ for x in ["a", "b", "c"] { echo $x }
+hamsh$ def greet(who) { echo hello $who }
+hamsh$ greet alice
+```
+
+### Pipes, redirects, dup — one primitive
+
+`|` / `>` / `>>` / `<` / `2>&1` all reduce to one operation: bind an
+fd at `/fd/N`. A local pipe involves zero 9P traffic.
+
+```
+hamsh$ ls /usr/bin | wc -l
+hamsh$ echo data > /tmp/file
+hamsh$ cmd 2>&1 | tee log
+```
+
+### The Linux runtime — running unmodified Linux ELFs
+
+`/etc/rc.boot` defines `linuxruntime` as a `ns { }` template that grafts
+the conventional FHS paths (`/etc`, `/usr`, `/lib`, `/lib64`, `/var`)
+onto a Debian-shaped subtree under `/var/lib/distros/default/`. To run
+a Linux binary, `enter` that namespace:
+
+```
+hamsh$ enter linuxruntime { /bin/apt --version }     # synchronous
+hamsh$ enter linuxruntime { /bin/sh }                # interactive Linux sh; `exit` returns
+hamsh$ svc = spawn linuxruntime { /bin/postgres }    # detached service
+hamsh$ kill $svc                                     # tear it down
+```
+
+There is no `distrorun` command; running a Linux binary is plain
+namespace verbs. If the binary isn't in your distrofs yet, install it
+first — the native-Adder `apt` lands real Debian packages into the
+linuxruntime tree:
+
+```
+hamsh$ apt update
+hamsh$ apt install bash
+hamsh$ ls /var/lib/distros/default/usr/bin   # what's installed
+hamsh$ enter linuxruntime { /bin/bash --version }
+```
+
+### Errors via errstr — `try` / `except`
+
+Every command yields an exit status **and** an errstr (Plan 9 style).
+`try { } except { }` is built on top:
+
+```
+hamsh$ try { mount $srv /n/r } except { echo "mount failed: $errstr" }
+```
+
+### Namespaces — `ns` / `enter` / `spawn`
+
+A `ns { … }` is a *template* (configured, not entered). `enter` overlays
+it onto a COW copy of the ambient namespace and runs the body
+synchronously; `spawn` runs the body detached as a service. A bind
+inside a block is gone after the brace.
+
+```
+hamsh$ webns = ns {
+hamsh>     bind /www /var/www
+hamsh> }
+hamsh$ enter webns { ls /www }                       # /www visible only inside
+hamsh$ ls /www                                       # not visible at the prompt
+```
+
+### Line editor
+
+Interactive keys at the prompt:
+
+| Key                  | Action                                  |
+|----------------------|-----------------------------------------|
+| Left / Right         | Move cursor                             |
+| Home / End           | Jump to line start / end                |
+| Delete               | Delete char under cursor                |
+| Backspace            | Delete char before cursor               |
+| Up / Down            | Walk command history (48 entries)       |
+| Tab                  | Complete command name or path           |
+| Ctrl-A / Ctrl-E      | Beginning of line / end of line         |
+| Ctrl-C               | Discard current line; fresh prompt      |
+
+### Init / rc
+
+PID 1 is hamsh executing `/etc/rc.boot`. The rc is plain hamsh —
+applies the namespace recipe (`bind /srv '#s'`, `bind /proc '#p'`,
+`bind /n '#/'`), launches detached services with `spawn detached`,
+defines `linuxruntime`, then drops to the interactive prompt. Edit the
+file to change boot — no kernel recompile needed.
+
+---
+
 ## How it works
 
 ```
