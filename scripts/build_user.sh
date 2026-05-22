@@ -56,6 +56,7 @@ build_adder_user seq                  # M16.64: 1..N or M..N output
 build_adder_user uname                # M16.64: system identification
 build_adder_user true                 # M16.64: exit 0
 build_adder_user false                # M16.64: exit 1
+build_adder_user nsbindprobe          # HAMSH §18 stage-5: external-bind COW probe
 build_adder_user yes                  # M16.64: repeat-until-SIGINT
 build_adder_user sleep                # M16.64: jiffies-based delay
 build_adder_user sort                 # M16.64: insertion sort of stdin
