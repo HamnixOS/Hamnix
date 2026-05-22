@@ -152,10 +152,13 @@ knows which it holds.
   through the namespace bind (`6d9898e`, test_u43).
 
 ## §5 Modern async I/O  (**Layer 2 only**, depends on §2/§3)
-- [ ] `epoll` (`epoll_create1`/`ctl`/`wait`); `io_uring` SQ/CQ rings;
-  `eventfd`/`timerfd`/`signalfd`; `poll`/`select` fallback.
-- [ ] O_NONBLOCK end-to-end: stop masking `SOCK_NONBLOCK`, EAGAIN on
-  would-block across socket + file fds.
+- [x] `epoll` (`epoll_create1`/`ctl`/`wait`), `eventfd`, `timerfd`,
+  `signalfd`, real `poll`/`select` — `39b4001`, Layer-2 leaf module
+  `linux_abi/u_epoll.ad`. epoll-based Linux daemons can now run.
+- [x] O_NONBLOCK end-to-end — `SOCK_NONBLOCK`/`O_NONBLOCK`/`fcntl`,
+  EAGAIN on would-block across socket + pipe fds (`39b4001`).
+- [ ] `io_uring` SQ/CQ rings — deferred (separate, much larger; epoll
+  covers the overwhelming majority of real Linux daemons).
 
 ## §6 Timekeeping (vDSO)
 - [x] `clock_gettime` CLOCK_MONOTONIC/REALTIME; TSC high-res monotonic
@@ -297,10 +300,12 @@ Everything in §5 is Layer-2-only per the boundary law.
     `/etc/rc.boot`; hamsh is PID 1, the boot namespace recipe + service
     launch are declarative hamsh rc. Hard-coded `user/init.S`/`init2.ad`
     deleted.
-  - [~] Full interactive line editor (user-approved) — Left/Right/
-    Delete cursor editing + Up/Down command history; in flight.
-  - Known follow-ups: `enter`/`ns`/`spawn` blocks don't chain with
-    `&&`/`||`; nested `` `{ } `` command-substitution clobbers.
+  - [x] Full interactive line editor (`df27310`) — Left/Right/Home/
+    End/Delete cursor editing, cursor-aware backspace, Up/Down history
+    (48-entry ring), Ctrl-A/E/C, ANSI-escape state machine.
+  - Known follow-ups: nested `` `{ } `` command-substitution clobbers
+    (`&&`/`||` around `ns` blocks is being addressed in the namespace-
+    ergonomics pass).
 - CPython: trim the frozen stdlib set; PGO/LTO; C extensions (`_ssl`,
   `_socket`, ...) once a U-track `ld.so` exists.
 - busybox `ls` enumeration XFAIL (musl DIR-fd round-trip) — re-confirm
