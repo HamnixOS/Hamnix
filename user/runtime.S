@@ -647,6 +647,21 @@ sys_openchan:
     .size sys_openchan, .-sys_openchan
 
 
+    /* --- sys_nsid() -> uint64 ---------------------------------------
+     * HAMSH §13: an opaque, stable per-Pgrp namespace identity (the
+     * calling task's Pgrp pointer). Every `ns {}` / `enter` / `spawn`
+     * rforks a fresh Pgrp, hence a fresh nsid. A live handle records
+     * the nsid it was created under; using it where sys_nsid() now
+     * differs is the cross-namespace-handle error. */
+    .globl sys_nsid
+    .type sys_nsid, @function
+sys_nsid:
+    movq    $282, %rax              /* SYS_NSID */
+    syscall
+    ret
+    .size sys_nsid, .-sys_nsid
+
+
     /* --- sys_rfork(flags) -> int32 ----------------------------------
      * Phase C / M16.98: Plan 9-shape process / namespace primitive.
      * SysV passes `flags` in %rdi (also the syscall a0 slot). do_rfork
