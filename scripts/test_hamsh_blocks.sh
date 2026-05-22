@@ -11,6 +11,7 @@
 # both paste and the continuation prompt work.
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_hamsh_log.sh"
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -67,8 +68,12 @@ cat "$LOG"
 echo "[test_hamsh_blocks] --- end ---"
 
 fail=0
+# Assert on command OUTPUT only — hamsh's interactive line editor echoes
+# typed input, so a plain `grep` of the log would also match the command
+# being typed. hamsh_ran (scripts/_hamsh_log.sh) ignores the prompt-
+# prefixed input-echo lines.
 check() {
-    if grep -F -q "$1" "$LOG"; then
+    if hamsh_ran "$LOG" "$1"; then
         echo "[test_hamsh_blocks] OK: $2"
     else
         echo "[test_hamsh_blocks] MISS: $2"
@@ -86,7 +91,7 @@ check "DEF_RESULT 42"    "def function runs with a parameter"
 check "AFTER_BADBRACE"   "shell survives mismatched braces (no crash)"
 
 # the false branch must NOT run
-if grep -F -q "IF_FALSE_BRANCH" "$LOG"; then
+if hamsh_ran "$LOG" "IF_FALSE_BRANCH"; then
     echo "[test_hamsh_blocks] MISS: false branch leaked"
     fail=1
 else

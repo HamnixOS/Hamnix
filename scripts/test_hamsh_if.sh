@@ -14,6 +14,7 @@
 #   4. `echo POST_IF` → POST_IF appears (the shell survived).
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_hamsh_log.sh"
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -50,25 +51,29 @@ set +e
 set -e
 
 fail=0
-if grep -F -q "IF_TRUE_PATH" "$LOG"; then
+# Assert on command OUTPUT only — hamsh's interactive line editor echoes
+# typed input, so a plain `grep` of the log would also match the command
+# being typed. hamsh_ran (scripts/_hamsh_log.sh) ignores prompt-prefixed
+# (input-echo) lines.
+if hamsh_ran "$LOG" "IF_TRUE_PATH"; then
     echo "[test_hamsh_if] OK: if-true body executed"
 else
     echo "[test_hamsh_if] MISS: if-true body did not run"
     fail=1
 fi
-if grep -F -q "IF_FALSE_PATH" "$LOG"; then
+if hamsh_ran "$LOG" "IF_FALSE_PATH"; then
     echo "[test_hamsh_if] MISS: if-false body leaked (should be skipped)"
     fail=1
 else
     echo "[test_hamsh_if] OK: if-false body correctly skipped"
 fi
-if grep -F -q "IFE_ELSE" "$LOG" && ! grep -F -q "IFE_THEN" "$LOG"; then
+if hamsh_ran "$LOG" "IFE_ELSE" && ! hamsh_ran "$LOG" "IFE_THEN"; then
     echo "[test_hamsh_if] OK: false condition took the else branch"
 else
     echo "[test_hamsh_if] MISS: if/else branch selection wrong"
     fail=1
 fi
-if grep -F -q "POST_IF" "$LOG"; then
+if hamsh_ran "$LOG" "POST_IF"; then
     echo "[test_hamsh_if] OK: shell survived the if blocks"
 else
     echo "[test_hamsh_if] MISS: shell did not survive (POST_IF absent)"

@@ -17,6 +17,7 @@
 # integer fd is a Layer-2 mapping onto that name.
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_hamsh_log.sh"
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -71,8 +72,12 @@ cat "$LOG"
 echo "[test_hamsh_fdbind] --- end ---"
 
 fail=0
+# Assert on command OUTPUT only — hamsh's interactive line editor echoes
+# typed input, so a plain `grep` of the log would also match the command
+# being typed. hamsh_ran (scripts/_hamsh_log.sh) ignores the prompt-
+# prefixed input-echo lines.
 check() {
-    if grep -F -q "$1" "$LOG"; then
+    if hamsh_ran "$LOG" "$1"; then
         echo "[test_hamsh_fdbind] OK: $2"
     else
         echo "[test_hamsh_fdbind] MISS: $2"
@@ -91,9 +96,11 @@ check "DUP_LINE"             "cmd 2>&1 — dup is a bind over channels"
 # --- §6 CRITICAL: a local pipe does ZERO mountrpc -------------------
 # The serial log prefixes each line with a [NNNNNN] timestamp, so the
 # counter value is the field AFTER the MRPC_* label: pull the last
-# whitespace-separated token on the line.
-before=$(grep -F "MRPC_BEFORE " "$LOG" | head -1 | awk '{print $NF}')
-after=$(grep -F "MRPC_AFTER " "$LOG" | head -1 | awk '{print $NF}')
+# whitespace-separated token on the COMMAND-OUTPUT line. _ho_outlines
+# drops the prompt-prefixed input-echo line (whose last token would be
+# the typed `}` plus the line editor's cursor-redraw escape).
+before=$(_ho_outlines "$LOG" | grep -F "MRPC_BEFORE " | head -1 | awk '{print $NF}')
+after=$(_ho_outlines "$LOG" | grep -F "MRPC_AFTER " | head -1 | awk '{print $NF}')
 if [ -z "$before" ] || [ -z "$after" ]; then
     echo "[test_hamsh_fdbind] MISS: could not sample /dev/mountrpc counter"
     fail=1

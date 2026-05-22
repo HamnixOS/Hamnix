@@ -14,6 +14,7 @@
 # srvfd) is the canonical caught failure.
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_hamsh_log.sh"
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -61,8 +62,14 @@ echo "[test_hamsh_errstr] --- end ---"
 
 fail=0
 
+# Assert on command OUTPUT only — hamsh's interactive line editor echoes
+# typed input, so a plain `grep` of the log would also match the command
+# being typed (e.g. `echo SHOULD_NOT_RUN` typed inside an except block
+# that never runs). The _ho_outlines / hamsh_ran helpers in
+# scripts/_hamsh_log.sh ignore the prompt-prefixed input-echo lines.
+
 # The failing mount was caught — the except block ran.
-if grep -F -q "CAUGHT " "$LOG"; then
+if hamsh_ran "$LOG" "CAUGHT "; then
     echo "[test_hamsh_errstr] OK: failing command caught by try/except"
 else
     echo "[test_hamsh_errstr] MISS: try/except did not catch the failure"
@@ -71,7 +78,7 @@ fi
 
 # $errstr carried the kernel's message into the except block — the
 # CAUGHT line must have a non-empty errstr payload (kernel mount error).
-caught_line=$(grep -F "CAUGHT " "$LOG" | head -1)
+caught_line=$(_ho_outlines "$LOG" | grep -F "CAUGHT " | head -1)
 if echo "$caught_line" | grep -E -q "CAUGHT .*mount"; then
     echo "[test_hamsh_errstr] OK: \$errstr carries the kernel's failure message"
 else
@@ -81,7 +88,7 @@ else
 fi
 
 # A successful try body must NOT trigger the except block.
-if grep -F -q "TRY_OK_BODY" "$LOG" && ! grep -F -q "SHOULD_NOT_RUN" "$LOG"; then
+if hamsh_ran "$LOG" "TRY_OK_BODY" && ! hamsh_ran "$LOG" "SHOULD_NOT_RUN"; then
     echo "[test_hamsh_errstr] OK: successful try body skips the except block"
 else
     echo "[test_hamsh_errstr] MISS: except block ran for a successful try"
@@ -89,7 +96,7 @@ else
 fi
 
 # $errstr is a readable native variable after a failing command.
-if grep -E -q "ERRSTR_VAR .*mount" "$LOG"; then
+if _ho_outlines "$LOG" | grep -E -q "ERRSTR_VAR .*mount"; then
     echo "[test_hamsh_errstr] OK: \$errstr native variable holds the last failure"
 else
     echo "[test_hamsh_errstr] MISS: \$errstr native variable empty"

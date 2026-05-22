@@ -16,6 +16,7 @@
 #   4. `echo POST_WHILE I=${ i }`         → I=3, shell survived
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_hamsh_log.sh"
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -53,9 +54,12 @@ set -e
 
 fail=0
 
-# while: LOOP_BODY appears exactly three times.
-loop_count=$(grep -c -F "LOOP_BODY" "$LOG" || true)
-if [ "$loop_count" -eq 3 ]; then
+# Assert on command OUTPUT only — hamsh's interactive line editor echoes
+# typed input, so a plain `grep` of the log would also count the
+# `while ... { echo LOOP_BODY ... }` line as it is typed. hamsh_ran_count
+# (scripts/_hamsh_log.sh) ignores the prompt-prefixed input-echo lines.
+loop_count=$(hamsh_ran_count "$LOG" "LOOP_BODY")
+if [ "${loop_count:-0}" -eq 3 ]; then
     echo "[test_hamsh_while] OK: while body ran exactly three times"
 else
     echo "[test_hamsh_while] MISS: LOOP_BODY count=$loop_count (expected 3)"
@@ -63,7 +67,7 @@ else
 fi
 
 # while: counter has the post-loop value (shell survived the loop).
-if grep -F -q "POST_WHILE final 3" "$LOG"; then
+if hamsh_ran "$LOG" "POST_WHILE final 3"; then
     echo "[test_hamsh_while] OK: shell survived; counter ended at 3"
 else
     echo "[test_hamsh_while] MISS: POST_WHILE final 3 absent (loop hung/wrong count)"

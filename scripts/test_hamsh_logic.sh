@@ -12,6 +12,7 @@
 #   false ; echo AFTER_SEMI          → executes (`;` ignores prev exit)
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_hamsh_log.sh"
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -52,9 +53,13 @@ set +e
 set -e
 
 fail=0
+# Assert on command OUTPUT only — hamsh's interactive line editor echoes
+# typed input, so a plain `grep` of the log would also match the command
+# being typed (e.g. `echo AFTER_AND_FALSE` typed but never run). hamsh_ran
+# (scripts/_hamsh_log.sh) ignores the prompt-prefixed input-echo lines.
 check_present() {
     local needle="$1"
-    if grep -F -q "$needle" "$LOG"; then
+    if hamsh_ran "$LOG" "$needle"; then
         echo "[test_hamsh_logic] OK: $needle present"
     else
         echo "[test_hamsh_logic] MISS: $needle absent"
@@ -63,7 +68,7 @@ check_present() {
 }
 check_absent() {
     local needle="$1"
-    if grep -F -q "$needle" "$LOG"; then
+    if hamsh_ran "$LOG" "$needle"; then
         echo "[test_hamsh_logic] MISS: $needle leaked (should be skipped)"
         fail=1
     else

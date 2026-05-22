@@ -10,11 +10,10 @@
 #      reports cleanly, exactly as a failed external prints
 #      "command not found". KEPT and re-verified here.
 #
-#   2. (DROPPED) The old test also checked arrow-key history line
-#      editing. The rewritten shell deliberately has no line editor
-#      — it reads raw bytes and relies on paste-robust brace blocks
-#      (HAMSH_SPEC §5). A cooked-mode line editor is a feature beyond
-#      the spec; that half of the old test is not ported.
+#   2. (MOVED) The old test also checked arrow-key history line
+#      editing. The rewritten shell now has a full interactive line
+#      editor (cursor editing + history + ANSI escape handling); that
+#      coverage lives in scripts/test_hamsh_lineedit.sh, not here.
 #
 # Strategy: boot hamsh as /init, drive its serial, and assert the
 # failing `cd` surfaces the real kernel error and the shell survives.

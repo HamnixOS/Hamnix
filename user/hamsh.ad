@@ -4034,7 +4034,8 @@ def _ext_listdir(path: Ptr[uint8], buf: Ptr[uint8],
 # balance. Paste-robust and REPL-friendly.
 
 line_buf:   Array[2048, uint8]
-read_buf:   Array[256, uint8]
+# (Interactive input is collected by the line editor — see ed_readline
+#  below. The rc/init path reads its script into rc_buf directly.)
 
 
 def _maybe_recycle_arenas():
@@ -4144,6 +4145,342 @@ def cont_prompt():
     write_cstr1("> ")
 
 
+# ====================================================================
+# Interactive line editor
+# ====================================================================
+# A cursor-aware line editor for the interactive prompt ONLY. It is
+# driven entirely off fd 0, which the interactive shell binds to the
+# raw console (DEVFD_CONS — no kernel-side cooking, no echo). The
+# editor therefore owns echo, cursor motion, and redraw itself.
+#
+# SCOPE BOUNDARY: this code is reached ONLY from main()'s interactive
+# read loop. The rc / init path (_run_rc_path) reads its script with a
+# plain sys_read on a file fd and never touches the editor — sourcing
+# /etc/rc.boot or /etc/hamsh.rc is wholly unaffected.
+#
+# Keys handled:
+#   * printable bytes        — inserted at the cursor (mid-line insert
+#                              shifts the tail right)
+#   * Enter (CR / LF)        — terminate the physical line
+#   * Backspace (0x08/0x7f)  — delete the char BEFORE the cursor
+#   * ESC [ D / ESC [ C      — cursor Left / Right within the line
+#   * ESC [ A / ESC [ B      — history Up / Down
+#   * ESC [ 3~               — Delete the char AT the cursor
+#   * ESC [ H, ESC [ 1~,
+#     ESC O H                — Home (cursor to line start)
+#   * ESC [ F, ESC [ 4~,
+#     ESC O F                — End  (cursor to line end)
+#   * Ctrl-C (0x03)          — discard the current line, fresh prompt
+#
+# Escape sequences arrive a byte at a time over the console; a tiny
+# state machine reassembles them. The console RX path is interrupt-
+# driven (a recent kernel fix), so no input bytes are dropped.
+
+# --- physical-line edit buffer --------------------------------------
+# One physical input line, generously larger than any line a human
+# types interactively (and smaller than LINE_MAX so a full edited line
+# always fits into line_buf with room for the appended newline).
+ED_LINE_MAX: uint64 = 1024
+ed_buf:   Array[1024, uint8]    # the line being edited (no NUL needed)
+ed_len:   uint64 = 0            # number of live bytes in ed_buf
+ed_cur:   uint64 = 0            # cursor position, 0..ed_len
+
+# --- command history (ring buffer) ----------------------------------
+# Each slot is a fixed-width line image. A modest ring depth keeps the
+# static footprint small while covering a long interactive session.
+HIST_MAX:  uint64 = 48          # ring depth
+HIST_WID:  uint64 = 1024        # bytes per stored line (== ED_LINE_MAX)
+hist_buf:  Array[49152, uint8]  # HIST_MAX * HIST_WID, flattened
+hist_len:  Array[48, uint64]    # live byte count of each slot
+hist_count: uint64 = 0          # number of lines ever appended
+# hist_view: -1 == editing a fresh line; >=0 == browsing history,
+# counting back from the newest entry (0 = newest).
+hist_view: int64 = -1
+
+
+def _ed_putc(c: uint8):
+    # Emit one byte to the console (fd 1 == console for the shell).
+    one: Array[1, uint8]
+    one[0] = c
+    sys_write(1, &one[0], 1)
+
+
+def _ed_esc(s: Ptr[uint8]):
+    # Emit a NUL-terminated terminal control string.
+    write_cstr1(s)
+
+
+def hist_append(buf: Ptr[uint8], n: uint64):
+    # Append a completed line to the history ring. Empty lines and an
+    # exact repeat of the most recent entry are not stored — the usual
+    # interactive convenience.
+    if n == 0:
+        return
+    if hist_count > 0:
+        prev: uint64 = (hist_count - 1) % HIST_MAX
+        if hist_len[prev] == n:
+            same: int32 = 1
+            k: uint64 = 0
+            while k < n:
+                if hist_buf[prev * HIST_WID + k] != buf[k]:
+                    same = 0
+                    break
+                k = k + 1
+            if same != 0:
+                return
+    slot: uint64 = hist_count % HIST_MAX
+    copy_n: uint64 = n
+    if copy_n > HIST_WID:
+        copy_n = HIST_WID
+    i: uint64 = 0
+    while i < copy_n:
+        hist_buf[slot * HIST_WID + i] = buf[i]
+        i = i + 1
+    hist_len[slot] = copy_n
+    hist_count = hist_count + 1
+
+
+def _hist_depth() -> uint64:
+    # Number of distinct history entries currently retrievable.
+    if hist_count < HIST_MAX:
+        return hist_count
+    return HIST_MAX
+
+
+def _hist_load(back: uint64):
+    # Load history entry `back` (0 = newest) into the edit buffer and
+    # place the cursor at end. Caller guarantees back < _hist_depth().
+    slot: uint64 = (hist_count - 1 - back) % HIST_MAX
+    n: uint64 = hist_len[slot]
+    i: uint64 = 0
+    while i < n:
+        ed_buf[i] = hist_buf[slot * HIST_WID + i]
+        i = i + 1
+    ed_len = n
+    ed_cur = n
+
+
+# The prompt in effect for the current ed_readline call. The editor
+# re-emits it verbatim on every redraw so a CR-to-column-0 repaint
+# never clobbers the prompt text. ed_prompt_kind selects which prompt
+# to paint (0 == "hamsh$ ", 1 == continuation "> "); ed_prompt_len is
+# its visible column width. Both are set by main() before ed_readline.
+ed_prompt_kind: int32 = 0
+ed_prompt_len:  uint64 = 0
+
+
+def _ed_emit_prompt():
+    # Re-emit the active prompt verbatim (used by _ed_redraw).
+    if ed_prompt_kind == 0:
+        write_cstr1("hamsh$ ")
+    else:
+        write_cstr1("> ")
+
+
+def _ed_redraw():
+    # Repaint the editable line in place: carriage-return to column 0,
+    # re-emit the prompt verbatim, re-emit the edit buffer, clear any
+    # stale tail (ESC[K), then park the cursor at ed_cur with a fresh
+    # CR + cursor-forward over (prompt + ed_cur) columns.
+    _ed_putc(13)                          # CR — column 0
+    _ed_emit_prompt()                     # re-emit the prompt
+    if ed_len > 0:
+        sys_write(1, &ed_buf[0], ed_len)
+    _ed_esc(cast[Ptr[uint8]]("\x1b[K"))   # clear to end of line
+    # Park the cursor: CR back to column 0, then forward by the prompt
+    # width plus the in-line cursor offset.
+    _ed_putc(13)
+    target: uint64 = ed_prompt_len + ed_cur
+    if target > 0:
+        # ESC[<n>C — cursor forward n columns.
+        _ed_esc(cast[Ptr[uint8]]("\x1b["))
+        write_cstr1(render_int(cast[int64](target)))
+        _ed_putc(67)                      # 'C'
+
+
+# Escape-parser state. 0 = ground, 1 = saw ESC, 2 = saw ESC[ (CSI),
+# 3 = saw ESC O (SS3).
+ed_esc_state: int32 = 0
+ed_esc_param: uint64 = 0          # numeric parameter accumulated in CSI
+
+
+def ed_readline() -> int64:
+    # Read and edit ONE physical line interactively. Returns the line
+    # length in ed_buf (the trailing newline is NOT stored — the caller
+    # appends '\n' to line_buf). Returns -1 on EOF, -2 on Ctrl-C.
+    #
+    # On entry the prompt has already been printed; ed_prompt_kind /
+    # ed_prompt_len must be set by the caller so the editor can repaint
+    # the line and place the cursor.
+    ed_len = 0
+    ed_cur = 0
+    ed_esc_state = 0
+    ed_esc_param = 0
+    rb: Array[1, uint8]
+    while True:
+        n: int64 = sys_read(0, &rb[0], 1)
+        if n <= 0:
+            return -1
+        c: uint8 = rb[0]
+
+        if ed_esc_state == 1:
+            # Just saw ESC. Expect '[' (CSI) or 'O' (SS3).
+            if c == 91:                       # '['
+                ed_esc_state = 2
+                ed_esc_param = 0
+            elif c == 79:                     # 'O'
+                ed_esc_state = 3
+            else:
+                # Lone ESC or unrecognised — drop, back to ground.
+                ed_esc_state = 0
+            continue
+
+        if ed_esc_state == 2:
+            # Inside a CSI sequence. Accumulate digit parameters.
+            if c >= 48 and c <= 57:           # '0'..'9'
+                ed_esc_param = ed_esc_param * 10 + cast[uint64](c - 48)
+                continue
+            ed_esc_state = 0
+            if c == 68:                       # 'D' — Left
+                if ed_cur > 0:
+                    ed_cur = ed_cur - 1
+                    _ed_redraw()
+                continue
+            if c == 67:                       # 'C' — Right
+                if ed_cur < ed_len:
+                    ed_cur = ed_cur + 1
+                    _ed_redraw()
+                continue
+            if c == 65:                       # 'A' — Up (older)
+                _ed_hist_prev()
+                continue
+            if c == 66:                       # 'B' — Down (newer)
+                _ed_hist_next()
+                continue
+            if c == 72:                       # 'H' — Home
+                ed_cur = 0
+                _ed_redraw()
+                continue
+            if c == 70:                       # 'F' — End
+                ed_cur = ed_len
+                _ed_redraw()
+                continue
+            if c == 126:                      # '~' — terminated param key
+                if ed_esc_param == 3:         # ESC[3~ — Delete
+                    if ed_cur < ed_len:
+                        _ed_delete_at_cursor()
+                        _ed_redraw()
+                elif ed_esc_param == 1 or ed_esc_param == 7:   # Home
+                    ed_cur = 0
+                    _ed_redraw()
+                elif ed_esc_param == 4 or ed_esc_param == 8:   # End
+                    ed_cur = ed_len
+                    _ed_redraw()
+                continue
+            # Any other final byte: unrecognised CSI — ignore.
+            continue
+
+        if ed_esc_state == 3:
+            # SS3: ESC O H / ESC O F (Home / End on some terminals).
+            ed_esc_state = 0
+            if c == 72:                       # Home
+                ed_cur = 0
+                _ed_redraw()
+            elif c == 70:                     # End
+                ed_cur = ed_len
+                _ed_redraw()
+            continue
+
+        # --- ground state ---------------------------------------------
+        if c == 27:                           # ESC — start a sequence
+            ed_esc_state = 1
+            continue
+        if c == 10 or c == 13:                # Enter — line complete
+            _ed_putc(13)
+            _ed_putc(10)
+            return cast[int64](ed_len)
+        if c == 3:                            # Ctrl-C — abandon line
+            _ed_esc(cast[Ptr[uint8]]("^C\r\n"))
+            ed_len = 0
+            ed_cur = 0
+            return -2
+        if c == 8 or c == 127:                # Backspace — delete left
+            if ed_cur > 0:
+                ed_cur = ed_cur - 1
+                _ed_delete_at_cursor()
+                _ed_redraw()
+            continue
+        if c == 1:                            # Ctrl-A — Home
+            ed_cur = 0
+            _ed_redraw()
+            continue
+        if c == 5:                            # Ctrl-E — End
+            ed_cur = ed_len
+            _ed_redraw()
+            continue
+        if c < 32:
+            # Other control bytes are not editing keys — ignore.
+            continue
+        # Printable byte: insert at the cursor.
+        _ed_insert_at_cursor(c)
+        _ed_redraw()
+
+
+def _ed_insert_at_cursor(c: uint8):
+    # Insert one byte at ed_cur, shifting the tail right.
+    if ed_len + 1 >= ED_LINE_MAX:
+        return
+    i: uint64 = ed_len
+    while i > ed_cur:
+        ed_buf[i] = ed_buf[i - 1]
+        i = i - 1
+    ed_buf[ed_cur] = c
+    ed_len = ed_len + 1
+    ed_cur = ed_cur + 1
+
+
+def _ed_delete_at_cursor():
+    # Remove the byte at ed_cur, shifting the tail left. Cursor stays.
+    if ed_cur >= ed_len:
+        return
+    i: uint64 = ed_cur
+    while i + 1 < ed_len:
+        ed_buf[i] = ed_buf[i + 1]
+        i = i + 1
+    ed_len = ed_len - 1
+
+
+def _ed_hist_prev():
+    # Up arrow — recall an older history line.
+    depth: uint64 = _hist_depth()
+    if depth == 0:
+        return
+    if hist_view < 0:
+        hist_view = 0
+    elif cast[uint64](hist_view) + 1 < depth:
+        hist_view = hist_view + 1
+    else:
+        return
+    _hist_load(cast[uint64](hist_view))
+    _ed_redraw()
+
+
+def _ed_hist_next():
+    # Down arrow — walk toward newer history; past the newest entry the
+    # buffer goes empty (a fresh line).
+    if hist_view < 0:
+        return
+    if hist_view == 0:
+        hist_view = -1
+        ed_len = 0
+        ed_cur = 0
+        _ed_redraw()
+        return
+    hist_view = hist_view - 1
+    _hist_load(cast[uint64](hist_view))
+    _ed_redraw()
+
+
 def _setup_fd_namespace():
     # HAMSH §7: make /fd a name in the shell's namespace and seed the
     # standard streams. `bind '#d' /fd` grafts the fd device so opens
@@ -4200,30 +4537,56 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
         # If a per-user startup script exists, run it first (init/rc).
         _run_rc_path(cast[Ptr[char]]("/etc/hamsh.rc"))
 
+    # Interactive read-eval loop. Each logical line is built up from one
+    # or more physical lines (a `{ }` block continues across lines). Each
+    # physical line is read through the interactive line editor
+    # (ed_readline) — cursor editing, history, ANSI escape handling. This
+    # path is reached ONLY here; the rc/init path (_run_rc_path above)
+    # reads its script with a plain file sys_read and is untouched.
     while True:
-        prompt()
         total: uint64 = 0
         # Read a logical line, extending across `{ }` continuations.
         done: int32 = 0
+        first_line: int32 = 1
         while done == 0:
-            n: int64 = sys_read(0, &read_buf[0], 256)
-            if n <= 0:
+            # Print the prompt and tell the editor its visible width so
+            # it can place the cursor on redraw.
+            if first_line != 0:
+                prompt()
+                ed_prompt_kind = 0
+                ed_prompt_len = 7
+            else:
+                cont_prompt()
+                ed_prompt_kind = 1
+                ed_prompt_len = 2
+            el: int64 = ed_readline()
+            if el == -1:
                 # EOF on stdin — exit cleanly.
                 write_cstr1("\n")
                 return cast[int32](eval_status)
+            if el == -2:
+                # Ctrl-C — abandon the whole logical line, fresh prompt.
+                total = 0
+                first_line = 1
+                continue
+            first_line = 0
+            # Append the edited physical line + newline to line_buf.
             j: uint64 = 0
-            while j < cast[uint64](n) and total + 1 < LINE_MAX:
-                line_buf[total] = read_buf[j]
+            while j < cast[uint64](el) and total + 2 < LINE_MAX:
+                line_buf[total] = ed_buf[j]
                 total = total + 1
                 j = j + 1
-            # Did we get a newline? If so, check brace balance.
-            if total > 0 and line_buf[total - 1] == 10:
-                bal: int64 = _brace_balance(&line_buf[0], total)
-                if bal <= 0:
-                    done = 1
-                else:
-                    cont_prompt()
-            if total + 1 >= LINE_MAX:
+            # Record the physical line in history (skips blanks/repeats).
+            hist_append(&ed_buf[0], cast[uint64](el))
+            hist_view = -1
+            if total + 1 < LINE_MAX:
+                line_buf[total] = 10              # '\n'
+                total = total + 1
+            # Brace balance decides whether we continue onto more lines.
+            bal: int64 = _brace_balance(&line_buf[0], total)
+            if bal <= 0:
+                done = 1
+            if total + 2 >= LINE_MAX:
                 done = 1
         if run_source(&line_buf[0], total) != 0:
             return cast[int32](eval_status)
