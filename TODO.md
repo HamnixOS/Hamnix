@@ -101,12 +101,15 @@ knows which it holds.
 - [ ] `fd2path` exact open()-time path (per-fd path slot in `TaskStruct`).
 - [ ] `wstat`/`fwstat` fields: `length` (truncate), `mtime`, `gid`/`muid`,
   `mode` storage.
-- [ ] **distrofs migration capstone:** run `apt`/`dpkg`/`httpd` *under*
-  `nsrun` so `/var/lib/dpkg`, `/var/cache/apt`, `/var/www` resolve
-  through distrofs; then delete the global `/var` tmpfs (supersede
-  `86a13bd`). The largest open Namespace-law debt.
+- [~] **distrofs migration capstone:** `dpkg -i` of a real `.deb` now
+  lands all files into the distrofs namespace under `nsrun` (`463c3e8`,
+  verified with Debian `hello`). Remaining: run `apt install` itself
+  under `nsrun` (apt still spawns `dpkg` directly, so apt's own
+  extraction hits the read-only initramfs `/usr`); then delete the
+  global `/var` tmpfs.
 - [ ] distrofs persistent backing (ext4 partition / disk image) so an
-  installed package survives reboot.
+  installed package survives reboot — distrofs is RAM-backed today
+  (`463c3e8`); §12 ext4 write maturity makes ext4-backing viable.
 
 ## §1 Process model & address space  (gates threads, the loader, all real software)
 - [x] VMA deep-copy on fork; copy-on-write pages (COW fault handler +
@@ -277,11 +280,12 @@ Everything in §5 is Layer-2-only per the boundary law.
 
 # Userspace polish
 - `apt` against the live `deb.debian.org` mirror — DONE: `apt update`
-  verifies the real InRelease (`6d72a5d`) and `apt install hello`
-  installs the genuine Debian package end-to-end (`d2fe317`).
-  Remaining: `dpkg` extracting `data.tar` into a distrofs namespace
-  (flat tmpfs can't hold nested paths), and streaming xz + larger
-  `.deb`/index caps for big packages.
+  verifies the real InRelease (`6d72a5d`); `dpkg -i` of the genuine
+  Debian `hello` `.deb` lands all 49 files into the distrofs namespace
+  and they are readable there (`d2fe317` + `463c3e8`).
+  Remaining: run `apt install` itself under `nsrun`; ext4-backed
+  distrofs for reboot persistence; streaming xz + larger `.deb`/index
+  caps for big packages.
 - hamsh: superseded by the clean-sheet rewrite — see
   `docs/HAMSH_SPEC.md` (two-mode command/expression shell, pipes-as-
   Chans, `ns`/`enter`/`spawn` namespace verbs, errstr `try/catch`).
