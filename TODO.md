@@ -310,7 +310,8 @@ Everything in §5 is Layer-2-only per the boundary law.
     deleted.
   - [x] Full interactive line editor (`df27310`) — Left/Right/Home/
     End/Delete cursor editing, cursor-aware backspace, Up/Down history
-    (48-entry ring), Ctrl-A/E/C, ANSI-escape state machine.
+    (48-entry ring), Ctrl-A/E/C, ANSI-escape state machine; Tab
+    completion (command + path, `c2a062d`).
   - [x] `distrorun` retired (`1cdc34f`) — the Linux runtime is a
     captured `ns {}` value in `/etc/rc.boot`; running a Linux binary is
     `enter linuxruntime { … }`. `&&`/`||` now chains `ns`/`enter`/`spawn`.
