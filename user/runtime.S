@@ -662,6 +662,23 @@ sys_nsid:
     .size sys_nsid, .-sys_nsid
 
 
+    /* --- sys_nslabel(op, label, to_path, from_path) -> int32 --------
+     * HAMSH §14: mount handles. op=0 stamps `label` onto the mount
+     * at `to_path` (and `from_path` for a bind); op=1 unmounts the
+     * single entry carrying `label`. A label is a unique handle, so
+     * it names a union branch in /proc/self/ns and lets `unmount`
+     * peel exactly one branch. 4-arg syscall — %rcx (arg 4) must
+     * move to %r10 for the syscall ABI. Returns 0 / -1 + errstr. */
+    .globl sys_nslabel
+    .type sys_nslabel, @function
+sys_nslabel:
+    movq    %rcx, %r10              /* arg 4: from_path -> r10 */
+    movq    $285, %rax              /* SYS_NSLABEL */
+    syscall
+    ret
+    .size sys_nslabel, .-sys_nslabel
+
+
     /* --- sys_rfork(flags) -> int32 ----------------------------------
      * Phase C / M16.98: Plan 9-shape process / namespace primitive.
      * SysV passes `flags` in %rdi (also the syscall a0 slot). do_rfork
