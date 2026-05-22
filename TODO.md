@@ -10,10 +10,14 @@ maturity).
 > source of truth for what shipped. Large chunks already closed: real
 > hardware boot (BIOS + UEFI), the Plan 9 native-syscall surface,
 > per-process namespaces, `distrofs`/`nsrun`, TLS 1.3 + X.509 chain
-> validation, the `dpkg`/`apt`/`httpd` userland, userland sockets,
-> CPython + busybox as musl static-PIE, fork → copy-on-write, the
+> validation, the `dpkg`/`apt`/`httpd` userland, CPython + busybox as
+> musl static-PIE, fork → copy-on-write (incl. mmap VMAs), the
 > higher-half ELF64 kernel, preemptive scheduling, the SSH-2.0 server,
-> xz decompression, apt streaming + GPG verification.
+> xz decompression, apt streaming + GPG verification, `§5` Layer-2
+> async (epoll/eventfd/timerfd/signalfd/O_NONBLOCK), the `/net` 9P
+> file tree + TLS-over-`/net` (Layer 1 is now Plan-9-shaped end-to-end,
+> zero BSD socket syscalls), the hamsh clean-sheet rewrite with init/rc
+> + line editor + Tab completion.
 
 **Project-direction docs:** [`docs/architecture.md`](docs/architecture.md)
 (layered model, boundary rules, migration phases),
@@ -190,10 +194,12 @@ knows which it holds.
   native code uses `/net` files via `user/net9.ad`; Linux `socket(2)`
   is a Layer-2 consumer of `/net`. Native `BIND`/`LISTEN`/`ACCEPT`
   syscalls retired; `httpd`/`sshd`/`u_server`/apt-HTTP migrated.
-- [ ] **(ARCH) finish it: TLS over `/net`** — `SYS_SOCKET`/`SYS_CONNECT`
-  + `SYS_TLS_CONNECT` are still native only because TLS needs a socket
-  fd. Route TLS through a `/net` connection, migrate apt-HTTPS +
-  `u_tlstest`, then retire those last native socket syscalls.
+- [x] **(ARCH) TLS over `/net`** (`9402fc7`..`747844d`) — TLS 1.3
+  record layer runs over a `/net` connection via `_tls_wire_send`/
+  `_tls_wire_recv`; a `tls <hostname>` ctl on a `/net/tcp` conn
+  upgrades it. `apt-HTTPS`, in-kernel `http_get`, and `u_tlstest`
+  migrated. `SYS_SOCKET`/`SYS_CONNECT`/`SYS_TLS_CONNECT` retired:
+  **Layer 1 exposes zero BSD socket syscalls.**
 - [ ] Congestion control: slow-start + congestion-avoidance (RFC 5681),
   NewReno or CUBIC.
 - [ ] Multi-listener accept queue / wider TCB table; window scaling +
@@ -314,9 +320,6 @@ Everything in §5 is Layer-2-only per the boundary law.
     captured `ns {}` value in `/etc/rc.boot`; running a Linux binary is
     `enter linuxruntime { … }`. `&&`/`||` now chains `ns`/`enter`/`spawn`.
   - Known follow-up: nested `` `{ } `` command-substitution clobbers.
-  - [~] REGRESSION (being fixed): dynamic-ELF / glibc Linux binaries
-    fault the kernel (`vec=0xe` @ ~`0xffffffff801d06xx`) — `test_u26_fork`/
-    `test_u43`/glibc-thread; musl-static is fine. Blocks the §4 capstone.
 - CPython: trim the frozen stdlib set; PGO/LTO; C extensions (`_ssl`,
   `_socket`, ...) once a U-track `ld.so` exists.
 - busybox `ls` enumeration XFAIL (musl DIR-fd round-trip) — re-confirm

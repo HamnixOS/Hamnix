@@ -73,17 +73,24 @@ srvfds. See M16.135 + 9P V0..V4.1 in [STATUS.md](STATUS.md).
   MSI single-vector path; ARP/IP/UDP/TCP/ICMP/DHCP (with
   renew+rebind)/DNS/HTTP/TLS 1.3 client with HTTPS GET working
   end-to-end. HTTP follows 3xx redirects and inflates gzip responses.
+  **TCP/UDP/TLS are exposed as the `/net` 9P file tree** (Plan-9-shape):
+  native code dials via `/net/tcp/clone` → `connect` → `data`, a
+  `tls <host>` ctl upgrades a `/net` conn to TLS, and the BSD socket
+  syscalls (`SYS_SOCKET`/`SYS_CONNECT`/`SYS_BIND`/`SYS_LISTEN`/
+  `SYS_ACCEPT`/`SYS_TLS_CONNECT`) are retired from Layer 1 — they live
+  only in Layer 2 as consumers of `/net` for unmodified Linux ELFs.
 - **USB**: native-Adder EHCI (USB 2.0) host-controller driver — probe
   + port enumeration (V0), control transfers + HID boot keyboard (V1),
   and an interrupt-driven MSI/INTx path (V2; the IRQ path is
   code-inspection-verified only, since QEMU's `usb-ehci` exposes no
   PCI capability list — the keyboard runs off a poll fallback under
   QEMU). Sits beside the existing xHCI driver.
-- **Userland networking**: `socket`/`connect`/`read`/`write`/`close`
-  (client) and `bind`/`listen`/`accept` (server) bridged to the
-  in-kernel TCP stack for both native and Linux-ABI binaries; DNS
-  resolution via `sys_resolve`; `tls_connect(2)` gives userland HTTPS
-  through the in-kernel TLS 1.3 stack.
+- **Userland networking**: native binaries dial via the `/net` 9P file
+  tree (`user/net9.ad`: `net_dial`, `net_announce`, `net_accept`,
+  `net_dial_tls`). Unmodified Linux ELFs keep using `socket(2)`/
+  `connect(2)`/`bind(2)`/`listen(2)`/`accept(2)` — those land in Layer 2
+  and walk `/net` underneath. DNS via `sys_resolve`; HTTPS by writing
+  the `tls <host>` ctl to a connected `/net` conn.
 - **Package tooling** (all native Adder, verified in QEMU): a native
   `apt` — `apt update` / `apt show` / `apt pkgnames` / `apt install`
   with transitive `Depends:` resolution and SHA-256 verification, over
@@ -108,9 +115,16 @@ srvfds. See M16.135 + 9P V0..V4.1 in [STATUS.md](STATUS.md).
   tree; `nsrun` launches a program in a private namespace
   (`rfork(RFNAMEG)` + mount `distrofs`) so it sees that tree through
   9P, isolated from the parent.
-- **Userspace**: hamsh shell with control flow, `$?`, `$VAR`, PATH
-  walker; ~60 GNU-style binaries; per-process namespaces verified to
-  isolate.
+- **Userspace**: `hamsh` is now a clean-sheet Python-flavored shell
+  (single language, C-style `{ }` blocks, dynamically typed) and runs
+  as **PID 1 init** — `/etc/rc.boot` is hamsh script that assembles the
+  boot namespace and defines `linuxruntime` as a captured `ns {}` value
+  (no more hard-coded `distrorun`). Full interactive line editor:
+  Left/Right/Home/End/Delete cursor editing, cursor-aware backspace,
+  Up/Down history (48-entry ring), Tab completion (command + path),
+  Ctrl-A/E/C, ANSI-escape state machine. Plus ~60 GNU-style native
+  binaries; per-process namespaces verified to isolate. See
+  [`docs/HAMSH_SPEC.md`](docs/HAMSH_SPEC.md) for the language reference.
 
 For the full milestone log (140+ entries across M / L / U tracks), see
 **[STATUS.md](STATUS.md)**.
@@ -193,7 +207,7 @@ beyond MVP.
 | **TLS cert validation** | **Closed** — apt-over-HTTPS against LE-signed mirrors is MITM-resistant | Full chain validation V0..V7: ASN.1 parser, X.509 walker, RSA-PSS-SHA256 verify, ECDSA-P256 verify, PKCS#1 v1.5 verify, chain builder + CA store + validity window, CertificateVerify transcript binding per RFC 8446 §4.4.3, multi-record handshake stitching, TCP per-slot RX ring. V6 added the AES-256-GCM-SHA384 cipher suite (codepoint 0x1302) + SHA-384; V6.1/V7 fixed ISRG Root X1 / RSA-4096 chain validation (x509 SPKI buffer cap + bigint limb count). Remaining real-world fragilities: (a) no CRL/OCSP (intentional per RFC 5280 §6 — out of scope); (b) timing-channel hardening still pending in primitives; (c) `_tls_now_unix` falls back to a build epoch when RTC is unavailable, opening a clock-rolled-back attack on expired certs. |
 | **Real-hardware keyboard** | Open blocker | Hamnix boots to `hamsh` on the real Asus laptop, but the built-in keyboard produces nothing. The atkbd path got an i8042 controller bring-up handshake + IRQ 1 wiring + an ISA-edge IOAPIC redirect fix (`dbd40e6`), all confirmed under QEMU; on the real laptop the keyboard still does not respond. Leading hypothesis: the keyboard is on the EHCI USB 2.0 controller, not the i8042. A native-Adder EHCI driver has since landed (V0 probe/port-enum, V1 control transfers + HID boot keyboard, V2 interrupt-driven delivery) — all verified under QEMU `usb-ehci` + `usb-kbd`, but **not yet tested on the real Asus**. |
 | **UEFI real-hardware boot** | Not re-confirmed | UEFI direct boot reaches `hamsh` under QEMU+OVMF. Legacy/BIOS boot is confirmed on the real Asus; the UEFI path on that laptop has not been re-verified after the M16.151–156 wave. |
-| **`apt` against a live Debian mirror** | Streaming + xz + GPG-verify all in; live `deb.debian.org` run in progress | A native `apt` (`update`/`show`/`pkgnames`/`install` with transitive `Depends:` + SHA-256 verify, over HTTP **and HTTPS**) streams a real `main`-sized index with no fixed-buffer cap, decompresses gzip **and xz**, and verifies the `Release`/`InRelease` OpenPGP signature (RSA PKCS#1 v1.5, SHA-512, multi-key keyrings) against a baked Debian-archive key — a tampered or unsigned index is rejected. The end-to-end exercise against the genuine `deb.debian.org` `main` suite is the remaining step. |
+| **`apt` against a live Debian mirror** | Closed | `apt update`/`install` runs end-to-end against the genuine `deb.debian.org` `main` suite over HTTP **and HTTPS** (TLS over `/net`): streams a real `main`-sized index with no fixed-buffer cap, decompresses gzip **and xz**, verifies the `Release`/`InRelease` OpenPGP signature (RSA PKCS#1 v1.5, SHA-512, multi-key keyrings) against the baked Debian-archive key, fetches the `.deb`, SHA-256-verifies it, and `dpkg`-installs it — verified by `test_apt_real_deb` (Debian `hello` 2.10-5 installs and `dpkg -L` lists its files). |
 | **apt/dpkg/httpd under a namespace** | Open — global-path debt | The native `apt`/`dpkg`/`httpd` tools still write *global* paths (a global `/var` tmpfs, `/tmp/...`). Per the Namespace law they must run *under* `nsrun` so `/var/lib/dpkg`, `/var/cache/apt`, `/var/www` resolve through a private `distrofs` namespace. `distrofs` + `nsrun` exist; migrating the tools onto them is open work. |
 | **busybox `ls` enumeration** | Open XFAIL | CPython 3.11.10 and busybox 1.36 run as musl static-PIE binaries in QEMU; `python3 -c` and a multi-applet `busybox sh` pipeline pass. But `busybox ls` directory enumeration prints nothing — musl's `opendir`/`readdir` round-trip the directory fd incorrectly (a direct `getdents64` syscall enumerates fine). busybox `sh`'s *internal* pipeline (`sh -c "a \| b"`) also trips a `#GP`. Both are marked XFAIL in the U-track tests. |
 Compiler bugs that surfaced during development have landed proper

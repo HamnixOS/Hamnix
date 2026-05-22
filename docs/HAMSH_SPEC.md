@@ -1,22 +1,19 @@
-# hamsh — shell redesign spec
+# hamsh — language and shell reference
 
-**Status:** design locked, ready to implement. Phase D (chan layer, `namec`,
-`Mnt`/`mountrpc`, per-Pgrp namespaces, 9P over srvfd) is complete; this spec
-builds directly on those primitives.
-
-**Revised 2026-05-21:** hamsh is now a **single Python-flavored language** with
-C-style `{ }` blocks — the separate Adder "expression mode" was dropped. See
-§2 and §3.
+**Status:** reference documentation for hamsh as shipped. The shell is built,
+matured, and runs as PID 1 init (see `/etc/rc.boot`). Phase D (chan layer,
+`namec`, `Mnt`/`mountrpc`, per-Pgrp namespaces, 9P over srvfd) is the
+substrate it rides on.
 
 **Thesis:** the shell is the linchpin that gives the whole system gravity toward
 Plan 9. The kernel *has* the model; the shell is what makes that model the path
 of least resistance. hamsh is the UI for Phase D.
 
-This is a clean-sheet design derived from Hamnix's actual use cases. The
-*syntax* is deliberately Python-flavored with C-style `{ }` blocks — familiar,
-not novel — but the *semantics* are not inherited from bash/sh/rc, and the
-shell is **not Adder**. Where a decision had options, the choice is made here —
-implement the chosen one; do not re-litigate.
+hamsh is a clean-sheet design derived from Hamnix's actual use cases. The
+*syntax* is Python-flavored with C-style `{ }` blocks — familiar, not novel —
+but the *semantics* are not inherited from bash/sh/rc, and the shell is **not
+Adder**: hamsh has its own grammar, its own dynamically-typed value model, and
+its own tree-walking evaluator.
 
 ---
 
@@ -478,44 +475,16 @@ try {
 
 ---
 
-## 18. Suggested build order + acceptance tests
+## 18. Test coverage
 
-Each stage ships with a test before moving on. All run in QEMU.
-
-1. **Lexer/parser: statement dispatch.** Test: a corpus of lines classifies
-   deterministically as command / assignment / control by the §2 first-token
-   rule; `${ }` and `` `{ }`` nest correctly. No line is ambiguous.
-2. **Typed values + list interpolation.** Test: `args = ["-la","/dev"]; echo
-   $args` yields exactly two argv entries; a value containing spaces is one
-   argument (no splitting).
-3. **Brace blocks + control flow + `def`.** Test: multi-line `if`/`for`/`while`
-   parse from paste and from the continuation prompt; mismatched braces error
-   cleanly.
-4. **Stdio-as-/fd + pipe/redirect/dup as bind.** Test: `a | b`, `> file`, `2>&1`
-   all resolve to binds at `/fd/N`; **assert a local pipe does no `mountrpc`**
-   (counter stays zero — same shape as the Phase D FD_*_MARK tripwire test).
-5. **Ambient namespace + COW-for-externals.** Test: an external command's `bind`
-   does NOT appear in the shell's `/proc/self/ns`; a builtin `bind` at the prompt
-   DOES, and a subsequent command sees it.
-6. **`ns { }` scope + overlay default.** Test: a bind inside the block is gone
-   after the brace; nested `ns { ns { } }` inherits then narrows; `/env` is
-   present under default `ns {}` and absent under `ns clean {}`.
-7. **`enter` / `spawn` + handles.** Test: `enter s { false }` returns nonzero,
-   blocks to completion, and leaks no variables; `svc = spawn s { sleep }; kill
-   $svc` terminates it; view tears down on process exit.
-8. **Boundary scoping (§13).** Test: `x = "hi"; enter s { echo $x }` prints `hi`
-   (data crosses); a variable set inside `enter` is unset in the shell afterward
-   (no write-back); a mount handle created in the ambient namespace, used inside
-   `enter s { }`, raises the cross-namespace-handle error; `enter clean s { }`
-   has no `/env` while default `enter s { }` does.
-9. **View vs state.** Test: `enter s { touch /var/x }` against a persistent
-   distrofs backing — `/var/x` is visible on the next `enter s { }`, while the
-   *view's* transient binds are not.
-10. **mount handles + introspection.** Test: `m = mount $srv /n/r; unmount m`
-    removes the right mount under a union stack; `cat /proc/self/ns` shows the
-    label.
-11. **errstr / try-catch.** Test: a failing `mount` is caught and `$errstr`
-    carries the kernel's message.
-
-Critical path: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8. Stages 9–11 can follow once the
-core lands.
+Every section above is backed by an integration test under `scripts/test_hamsh_*.sh`
+exercising the behavior end-to-end through a real QEMU boot. The full set
+covers: statement dispatch (§2); typed values + list interpolation (§3);
+brace blocks + control flow + `def` (§4); stdio-as-`/fd` + pipe/redirect/dup
+as `bind` (§7), with a tripwire that a local pipe does zero `mountrpc` calls;
+ambient namespace + COW-for-externals (§9); `ns { }` scope + overlay default
+(§11); `enter` / `spawn` + handles (§11); boundary scoping (§13); view vs.
+state over a posted distrofs daemon (§13); mount handles + `/proc/self/ns`
+introspection (§14); errstr / try-catch (§16); interactive line editor with
+cursor editing + history + Tab completion (`scripts/test_hamsh_lineedit.sh`);
+PID-1 init via `/etc/rc.boot`.
