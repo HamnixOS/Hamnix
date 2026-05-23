@@ -204,6 +204,44 @@ elf_last_was_linux: int32 = 0
 elf_last_interp_base:    uint64 = 0
 elf_last_app_entry_user: uint64 = 0
 
+# M16.36: per-task PT-entry installation for ELF images.
+#
+# Historically a freshly-execve'd ET_DYN binary (and a native ELF32
+# image) ran on the BSP's 1 GiB identity stamp — its vaddr happened
+# to equal the phys address memblock_alloc returned, so the inherited
+# PML4[0]->PDPT[0..N] PS=1 1 GiB pages mapped the right bytes.
+#
+# This is fragile in two ways:
+#
+#   1. The mapping is shared with every other task and the kernel —
+#      no per-task isolation. A future change that scrubs PDPT[0..N]
+#      out of the user PML4 (proper Plan-9-shape lower-half) would
+#      silently break user execution.
+#   2. On real hardware (Asus i5-4210U) the memblock region can land
+#      anywhere the EFI memory map advertised — phys 0x100000000 + on
+#      a 5 GiB machine. The boot stub's 4 GiB identity map doesn't
+#      cover that; mm/pgtable.ad's _pgtable_force_stamp_1gb stamps
+#      all 512 PDPT entries on the EFI path so the identity still
+#      reaches there, but only as PS=1 1 GiB pages. The PML4-walk
+#      diagnostic on a real-hw Asus boot (M16.34) showed the user
+#      RIP resolving via PDPT[4] PS=1 — a 1 GiB page — instead of a
+#      4 KiB PTE specific to this task.
+#
+# Fix: track the full [region, region+span) for BOTH the application
+# and the interpreter so do_execve / SYS_SPAWN can explicitly install
+# 4 KiB PTEs (cracking the inherited 1 GiB PS=1 stamp) into the user
+# task's PML4. After this, the [execve-pml4] walk lands on a real
+# per-task PTE, no longer the kernel's identity stamp.
+#
+# These globals are zero for an image that wasn't loaded (or for an
+# image whose span is 0 — defensively skipped by the installer).
+elf_last_app_img_phys:    uint64 = 0
+elf_last_app_img_vlow:    uint64 = 0
+elf_last_app_img_vhigh:   uint64 = 0
+elf_last_interp_img_phys: uint64 = 0
+elf_last_interp_img_vlow: uint64 = 0
+elf_last_interp_img_vhigh:uint64 = 0
+
 # Recursion guard. Set to 1 while we're loading an interpreter, so the
 # nested _load_elf64 call doesn't itself try to recurse on a (hostile
 # or weird) PT_INTERP entry inside the interpreter binary. ld.so is a
@@ -390,6 +428,14 @@ def _load_elf64(blob: Ptr[uint8], blob_size: uint64) -> uint64:
     # copy. `span` is already 4 KiB-rounded above.
     app_img_lo: uint64 = 0
     app_img_hi: uint64 = 0
+    # M16.36: per-task PT-entry installation regardless of e_type.
+    # The PT_LOAD region must be wired into the user's PML4 explicitly
+    # so the user task no longer depends on the BSP's inherited 1 GiB
+    # identity stamp (which on real hardware can still resolve to the
+    # right bytes — vaddr=phys — but only because the boot-stub /
+    # _pgtable_force_stamp_1gb identity-stamped every PDPT entry; a
+    # future Plan-9 lower-half scrub will tear that out and we want
+    # the user binary to keep working).
     if e_type == cast[uint32](ELF_ET_EXEC):
         app_needs_map  = 1
         app_user_vlow  = lowest_v
@@ -404,10 +450,37 @@ def _load_elf64(blob: Ptr[uint8], blob_size: uint64) -> uint64:
     else:
         app_load_base  = region
         app_entry_user = region + (e_entry - lowest_v)
-        # ET_DYN runs identity-mapped at `region`; the image occupies
-        # [region, region + span).
+        # ET_DYN runs at the identity-mapped `region`; the image occupies
+        # [region, region + span). Treat this as a per-task user mapping
+        # too: vaddr==phys for the leaf PTE, but the PTE is private to
+        # this task instead of being aliased into the BSP identity stamp
+        # the whole system shares.
+        app_needs_map  = 1
+        app_user_vlow  = region
+        app_user_vhigh = region + span
+        app_user_phys  = region
         app_img_lo     = region
         app_img_hi     = region + span
+        printk2("elf64: ET_DYN user-map: [0x%x, 0x%x)\n",
+                region, region + span)
+    # M16.36: stash the app's PT_LOAD coords so do_execve / SYS_SPAWN
+    # can install per-task PT entries explicitly. These survive the
+    # PT_INTERP recursion (it touches the elf_last_user_* slots).
+    app_phys_capture: uint64 = region
+    app_vlow_capture: uint64 = app_user_vlow
+    app_vhigh_capture: uint64 = app_user_vhigh
+    if e_type == cast[uint32](ELF_ET_EXEC):
+        # ET_EXEC's PT_LOADs land at lowest_v..lowest_v+span; the
+        # underlying physical pages are at `region` (the memblock chunk
+        # the loader copied into).
+        app_phys_capture = region
+        app_vlow_capture = lowest_v
+        app_vhigh_capture = lowest_v + span
+    else:
+        # ET_DYN runs at vaddr==region.
+        app_phys_capture = region
+        app_vlow_capture = region
+        app_vhigh_capture = region + span
 
     # PT_INTERP: dynamic ELF. Recursively load the interpreter and
     # return its entry as the user-mode RIP. Only honoured at the
@@ -425,12 +498,21 @@ def _load_elf64(blob: Ptr[uint8], blob_size: uint64) -> uint64:
             printk0("elf64: PT_INTERP load failed\n")
             return 0
         # The recursion overwrote elf_last_* with the interpreter's
-        # values. Re-publish the APPLICATION's values so AT_PHDR /
-        # AT_PHNUM / AT_PHENT in the auxv reflect the app (which is
-        # what glibc's dl_main wants — it reads the app's headers to
-        # walk the app's PT_DYNAMIC). elf_last_interp_base remains
-        # set by _load_interp_elf — the auxv builder reads it for
-        # AT_BASE.
+        # values. Capture the interpreter's per-task-install coords
+        # (region/span) BEFORE re-publishing the application's, so the
+        # caller can install per-task PTEs for BOTH images. The
+        # interpreter was loaded as ET_DYN, so its [vlow, vhigh) was
+        # set to [region, region+span) by the static-path tail of the
+        # recursive call — elf_last_user_vlow / vhigh / phys_base hold
+        # those values right now.
+        interp_phys_capture:  uint64 = elf_last_user_phys_base
+        interp_vlow_capture:  uint64 = elf_last_user_vlow
+        interp_vhigh_capture: uint64 = elf_last_user_vhigh
+        # Re-publish the APPLICATION's values so AT_PHDR / AT_PHNUM /
+        # AT_PHENT in the auxv reflect the app (which is what glibc's
+        # dl_main wants — it reads the app's headers to walk the app's
+        # PT_DYNAMIC). elf_last_interp_base remains set by
+        # _load_interp_elf — the auxv builder reads it for AT_BASE.
         elf_last_phoff           = e_phoff
         elf_last_phnum           = e_phnum
         elf_last_load_base       = app_load_base
@@ -441,6 +523,13 @@ def _load_elf64(blob: Ptr[uint8], blob_size: uint64) -> uint64:
         elf_last_app_entry_user  = app_entry_user
         elf_last_img_lo          = app_img_lo
         elf_last_img_hi          = app_img_hi
+        # M16.36: publish per-task PT-install coords for BOTH images.
+        elf_last_app_img_phys    = app_phys_capture
+        elf_last_app_img_vlow    = app_vlow_capture
+        elf_last_app_img_vhigh   = app_vhigh_capture
+        elf_last_interp_img_phys = interp_phys_capture
+        elf_last_interp_img_vlow = interp_vlow_capture
+        elf_last_interp_img_vhigh = interp_vhigh_capture
         printk2("elf64: dynamic load: interp_base=0x%x interp_entry=0x%x\n",
                 elf_last_interp_base, interp_entry)
         return interp_entry
@@ -459,6 +548,23 @@ def _load_elf64(blob: Ptr[uint8], blob_size: uint64) -> uint64:
     elf_last_user_phys_base = app_user_phys
     elf_last_img_lo         = app_img_lo
     elf_last_img_hi         = app_img_hi
+    # M16.36: per-task PT-install coords for the app's PT_LOAD span.
+    # No interpreter on this path — leave the interp_img_* globals as
+    # the caller (or zero) left them. NOTE: when this _load_elf64 was
+    # called recursively from _load_interp_elf, _in_interp_load == 1
+    # — we still set elf_last_app_img_* here, but the OUTER call's
+    # PT_INTERP arm above will capture them as `interp_*` and then
+    # overwrite app_img_* with the real application's values. So a
+    # nested call's writes here are intentionally observable to the
+    # outer call and are not stale.
+    elf_last_app_img_phys   = app_phys_capture
+    elf_last_app_img_vlow   = app_vlow_capture
+    elf_last_app_img_vhigh  = app_vhigh_capture
+    if _in_interp_load == 0:
+        # Top-level static load: no interpreter to install.
+        elf_last_interp_img_phys  = 0
+        elf_last_interp_img_vlow  = 0
+        elf_last_interp_img_vhigh = 0
     return app_entry_user
 
 
@@ -666,6 +772,27 @@ def elf_load_blob(blob: Ptr[uint8], blob_size: uint64) -> uint64:
     # a global after fork() corrupted its parent. COW now covers it.
     elf_last_img_lo = region
     elf_last_img_hi = region + span
+
+    # M16.36: per-task PT-entry install for the native ELF32 image.
+    # ELF32 native binaries link at vaddr 0 (user/init.lds) and the
+    # loader rebases them to `region`. vaddr == phys after the rebase
+    # — the same identity-stamp shape ET_DYN ELF64 binaries use. As
+    # of M16.36 we install per-task PTEs for this span explicitly
+    # (cracking the BSP's inherited 1 GiB PS=1 stamp) so the user
+    # task no longer depends on the shared identity entry. See the
+    # elf_last_app_img_* globals' comment for the motivation.
+    elf_last_needs_user_map = 1
+    elf_last_user_vlow      = region
+    elf_last_user_vhigh     = region + span
+    elf_last_user_phys_base = region
+    elf_last_app_img_phys   = region
+    elf_last_app_img_vlow   = region
+    elf_last_app_img_vhigh  = region + span
+    # No PT_INTERP on ELF32 — clear the interpreter coords so a stale
+    # ELF64 dynamic-load's interp span doesn't get reinstalled.
+    elf_last_interp_img_phys  = 0
+    elf_last_interp_img_vlow  = 0
+    elf_last_interp_img_vhigh = 0
 
     # U3: Linux-ABI detection. We record whether this image is a Linux-
     # ABI binary in elf_last_was_linux; the caller (SYS_SPAWN or
@@ -922,7 +1049,25 @@ def elf_install_user_mapping(pml4_phys: uint64, vlow: uint64,
         return -1
 
     pml4: Ptr[uint64] = cast[Ptr[uint64]](pml4_phys)
-    bsp_pml4: Ptr[uint64] = cast[Ptr[uint64]](get_bsp_cr3())
+    # M16.36: compare against the PRISTINE BOOT page tables, NOT the
+    # live %cr3. The "is this entry still the shared boot mapping?"
+    # test needs the pre-task-creation snapshot — same reason
+    # _cow_resolve_pte_slot uses cow_boot_cr3() — because the live
+    # %cr3 belongs to WHATEVER task currently runs, which may have
+    # cracked its own PML4[0] long ago. Using its already-cracked
+    # PML4 as the comparison anchor mistakes a sibling task's
+    # PRIVATE PDPT for "shared" and ends up walking / mutating that
+    # sibling's per-task PDPT — corrupting an unrelated address
+    # space. Pre-M16.36 the only caller of this function that ran in
+    # a different task's CR3 context was vm_fork_copy_range (called
+    # from inside the parent on the CHILD's PML4), and the
+    # parent's identity-mapped PML4 wasn't yet cracked because no
+    # ELF mapping ever fired for native ELF32 / ET_DYN images —
+    # so the comparison happened to be right by accident. M16.36
+    # made the parent ALWAYS crack first (per-task PT entries for
+    # every loaded image and stack), exposing this bug.
+    bsp_pml4: Ptr[uint64] = cast[Ptr[uint64]](
+        cow_boot_cr3() & PT_ADDR_MASK)
 
     # --- Step 1: ensure PML4[pml4_idx_lo] points at a per-task PDPT.
     # The cloned PML4 entry currently shares its target PDPT with the
@@ -996,17 +1141,127 @@ def elf_install_user_mapping(pml4_phys: uint64, vlow: uint64,
     return 0
 
 
+def elf_install_user_range(pml4_phys: uint64, vlow: uint64,
+                           vhigh: uint64, phys_base: uint64,
+                           label: Ptr[uint8]) -> int32:
+    # M16.36: multi-1-GiB-aware wrapper around elf_install_user_mapping.
+    # The underlying installer refuses any range that crosses a 1 GiB
+    # PDPT boundary — a hard fail for binaries / heaps / stacks larger
+    # than the residual span inside a single PDPT entry. Split the
+    # range into per-1-GiB chunks and install each chunk separately so
+    # the leaf PTEs land in a (possibly different) per-task PD/PT tree
+    # under each PDPT entry.
+    #
+    # `label` is a NUL-terminated string used in the [elf-map]
+    # diagnostic so the boot log says "image" / "interp" / "stack" /
+    # "brk" rather than just an address pair.
+    if vlow >= vhigh:
+        return 0
+    # Page-align outward defensively.
+    vlo_a:  uint64 = vlow & ~cast[uint64](PAGE_SIZE_4K - 1)
+    vhi_a:  uint64 = (vhigh + PAGE_SIZE_4K - 1) \
+                     & ~cast[uint64](PAGE_SIZE_4K - 1)
+    phys_a: uint64 = phys_base - (vlow - vlo_a)
+    cur:    uint64 = vlo_a
+    while cur < vhi_a:
+        # Snap to the end of the current 1 GiB PDPT entry, so each
+        # call to elf_install_user_mapping stays inside one PDPT slot.
+        gib_end: uint64 = (cur + PAGE_SIZE_1G) \
+                          & ~cast[uint64](PAGE_SIZE_1G - 1)
+        chunk_end: uint64 = gib_end
+        if chunk_end > vhi_a:
+            chunk_end = vhi_a
+        chunk_phys: uint64 = phys_a + (cur - vlo_a)
+        # M16.36 diagnostic: one line per installed sub-range, tagged
+        # with `label`, so the boot log proves the per-task PT entries
+        # got laid down. The format is split into two printk lines
+        # because printk2 takes at most two numeric args and we want
+        # the label, vaddr range, AND phys base all visible.
+        printk1("[elf-map] %s\n", cast[uint64](label))
+        printk2("[elf-map]   vaddr=%p..%p\n", cur, chunk_end)
+        printk1("[elf-map]   phys=%p\n", chunk_phys)
+        rc: int32 = elf_install_user_mapping(pml4_phys, cur, chunk_end,
+                                             chunk_phys)
+        if rc < 0:
+            printk2("[elf-map] install FAILED @ vaddr=%p phys=%p\n",
+                    cur, chunk_phys)
+            return -1
+        cur = chunk_end
+    return 0
+
+
 def elf_apply_last_user_mapping(pml4_phys: uint64) -> int32:
     # Convenience wrapper used by SYS_SPAWN / SYS_EXECVE: install the
-    # user mapping recorded by the most recent _load_elf64 call. No-op
-    # (returns 0) if the last image was ET_DYN — those run at the
-    # identity-mapped region pointer and don't need the overlay.
+    # per-task PT entries for the most recently loaded ELF image.
+    #
+    # M16.36: this now ALWAYS installs PTEs for every loaded PT_LOAD
+    # span (app + optional PT_INTERP), regardless of ET_EXEC vs ET_DYN.
+    # The previous behaviour (only ET_EXEC installed; ET_DYN relied on
+    # the inherited BSP 1 GiB identity stamp) silently broke on real
+    # hardware whose memblock region landed in a PDPT slot the boot
+    # stub couldn't reach with a single 4 GiB PS=1 stamp — the
+    # _pgtable_force_stamp_1gb fallback covers the full 512 PDPT
+    # entries on the EFI path so reads still resolved, but the user
+    # task had no PT entry of its OWN for its code/data pages.
+    # Installing here means the [execve-pml4] walk lands on a real
+    # 4 KiB PTE rather than a 1 GiB PS=1 page belonging to the kernel
+    # identity map.
+    #
+    # elf_last_needs_user_map is set to 1 by every successful
+    # _load_elf64 / elf_load_blob call post-M16.36; the guard below is
+    # the legacy compatibility path for any future loader that DOESN'T
+    # want a per-task mapping (none in tree today).
     if elf_last_needs_user_map == 0:
         return 0
-    return elf_install_user_mapping(pml4_phys,
-                                    elf_last_user_vlow,
-                                    elf_last_user_vhigh,
-                                    elf_last_user_phys_base)
+    # App PT_LOAD span — the application binary's loaded segments.
+    # Always non-zero after a successful load.
+    if elf_last_app_img_vhigh > elf_last_app_img_vlow:
+        if elf_install_user_range(pml4_phys,
+                                  elf_last_app_img_vlow,
+                                  elf_last_app_img_vhigh,
+                                  elf_last_app_img_phys,
+                                  "image") < 0:
+            return -1
+    # Interpreter PT_LOAD span — non-zero only when the application
+    # was a dynamic ELF (PT_INTERP present). For static binaries the
+    # capture left these globals at 0 and we skip silently.
+    if elf_last_interp_img_vhigh > elf_last_interp_img_vlow:
+        if elf_install_user_range(pml4_phys,
+                                  elf_last_interp_img_vlow,
+                                  elf_last_interp_img_vhigh,
+                                  elf_last_interp_img_phys,
+                                  "interp") < 0:
+            return -1
+    return 0
+
+
+def elf_install_user_stack(pml4_phys: uint64, ustack_base: uint64,
+                           ustack_size: uint64) -> int32:
+    # M16.36: install per-task PT entries for [ustack_base,
+    # ustack_base + ustack_size). The user stack is allocated via
+    # alloc_pages and was previously reached through the BSP identity
+    # stamp (vaddr == phys via the 1 GiB PS=1 page). After this call
+    # the stack pages are mapped by a private 4 KiB PTE in the task's
+    # own PML4 — so a future Plan-9 lower-half scrub that removes the
+    # identity stamp still leaves the stack reachable from CPL=3.
+    if ustack_size == 0 or ustack_base == 0:
+        return 0
+    return elf_install_user_range(pml4_phys, ustack_base,
+                                  ustack_base + ustack_size,
+                                  ustack_base, "stack")
+
+
+def elf_install_user_heap(pml4_phys: uint64, brk_base: uint64,
+                          brk_size: uint64) -> int32:
+    # M16.36: install per-task PT entries for the brk heap. Called
+    # from u_syscalls._u_brk on the lazy initial reservation. Same
+    # shape as elf_install_user_stack: vaddr == phys (the reservation
+    # came from alloc_pages), but the PTE is now task-private.
+    if brk_size == 0 or brk_base == 0:
+        return 0
+    return elf_install_user_range(pml4_phys, brk_base,
+                                  brk_base + brk_size,
+                                  brk_base, "brk")
 
 
 def elf_last_needs_user_map_get() -> int32:
