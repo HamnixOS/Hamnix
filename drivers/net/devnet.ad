@@ -20,6 +20,13 @@
 #   /net/tcp/N/local        read: local  a.b.c.d!port
 #   /net/tcp/N/remote       read: remote a.b.c.d!port
 #   /net/udp/...            datagram analogue (clone/ctl/data/...).
+#   /net/icmp/...           Echo Request/Reply analogue. ctl takes
+#                            `connect <a.b.c.d>` or `connect
+#                            <a.b.c.d>!<id>` (the ICMP identifier,
+#                            RFC 792 demux key — NOT a port). data
+#                            write -> Echo Request payload; data read
+#                            -> next matching Echo Reply payload.
+#                            status carries peer/id/tx/rx/last RTT.
 #
 # This is exactly Plan 9's `#I` / `/net`. Native code does networking by
 # open/read/write on these files — no syscall family. The Linux ABI's
@@ -48,6 +55,19 @@ from drivers.net.udp import (
     udp_socket_connect, udp_socket_sendto, udp_socket_recvfrom,
     udp_socket_recv_pending, udp_socket_local_port,
 )
+# /net/icmp: ICMP echo conns. devnet.ad owns the file-tree-shaped
+# surface; the conn table + tx/rx primitives live in drivers/net/
+# icmp.ad alongside the existing wire-format code (so icmp_rx can
+# both reply to incoming Echo Requests AND deliver replies to a
+# matching userland conn without an import cycle).
+from drivers.net.icmp import (
+    icmp_conn_alloc, icmp_conn_free, icmp_conn_connect,
+    icmp_conn_send, icmp_conn_recv, icmp_conn_recv_pending,
+    icmp_conn_peer_ip, icmp_conn_ident,
+    icmp_conn_tx_count, icmp_conn_rx_count,
+    icmp_conn_last_seq, icmp_conn_last_ttl,
+    icmp_conn_last_rtt_jiffies,
+)
 # ARCH §10: TLS is a Plan-9-shaped upgrade of a /net connection. A
 # write of `tls <hostname>` to a connected /net/tcp conn's ctl file
 # runs the in-kernel TLS 1.3 handshake (drivers/net/tls.ad) over that
@@ -74,8 +94,9 @@ FD_NET_MARK: uint32 = 0xFFFFFFD8
 
 # --- protocol + file-kind tags --------------------------------------
 
-NET_PROTO_TCP: int32 = 0
-NET_PROTO_UDP: int32 = 1
+NET_PROTO_TCP:  int32 = 0
+NET_PROTO_UDP:  int32 = 1
+NET_PROTO_ICMP: int32 = 2
 
 # A /net fd points at one of these "files" within a connection dir, or
 # at the top-level clone file. The file-kind is packed into fd_buf so
@@ -225,8 +246,10 @@ def _devnet_teardown(conn: int32):
                 tcp_listen_close(slot)
             else:
                 tcp_close(slot)
-        else:
+        elif netc_proto[cu] == NET_PROTO_UDP:
             udp_socket_close(slot)
+        else:
+            icmp_conn_free(slot)
     netc_inuse[cu] = 0
     netc_proto[cu] = NET_PROTO_TCP
     netc_state[cu] = NETC_FREE
@@ -370,7 +393,9 @@ def devnet_ctl(conn: int32, buf: Ptr[uint8], len: uint64) -> int32:
     cu: uint64 = cast[uint64](conn)
     pos: uint64 = _skip_spaces(buf, 0, len)
 
-    # --- connect <a.b.c.d>!<port> ------------------------------------
+    # --- connect <a.b.c.d>!<port>  (TCP/UDP)            ------------------
+    # --- connect <a.b.c.d>         (ICMP, auto id)      ------------------
+    # --- connect <a.b.c.d>!<id>    (ICMP, explicit id)  ------------------
     if _word_eq(buf, pos, len, "connect") != 0:
         if netc_state[cu] != NETC_OPEN:
             return NET_CTL_ESTATE
@@ -381,6 +406,39 @@ def devnet_ctl(conn: int32, buf: Ptr[uint8], len: uint64) -> int32:
         if _parse_ipv4(buf, &ipp, len, &ip) != 0:
             return NET_CTL_EBADCMD
         pos = ipp
+        # ICMP forks here: the second field after '!' is the identifier
+        # (RFC 792), not a port — and it's optional. A bare
+        # `connect <a.b.c.d>` auto-assigns the identifier.
+        if netc_proto[cu] == NET_PROTO_ICMP:
+            ident_val: uint16 = 0
+            if pos < len and buf[pos] == 33:           # '!'
+                pos = pos + 1
+                ip_pp: uint64 = pos
+                idv: int64 = _parse_uint(buf, &ip_pp, len)
+                if idv < 0 or idv > 65535:
+                    return NET_CTL_EBADCMD
+                ident_val = cast[uint16](idv)
+                if ident_val == 0:
+                    # 0 means "auto" inside icmp_conn_connect — reserve
+                    # it for that signal. A caller-chosen identifier
+                    # must be in [1, 65535].
+                    return NET_CTL_EBADCMD
+            islot: int32 = netc_slot[cu]
+            if islot < 0:
+                islot = icmp_conn_alloc()
+                if islot < 0:
+                    return NET_CTL_ENOSLOT
+                netc_slot[cu] = islot
+            if icmp_conn_connect(islot, ip, ident_val) != 0:
+                return NET_CTL_ECONNECT
+            netc_state[cu] = NETC_CONNECTED
+            netc_rip[cu]   = ip
+            # Stash the auto-assigned (or caller-chosen) identifier in
+            # netc_rport so the /net/icmp/N/remote / status renderers
+            # can show it without a fresh round-trip through icmp.ad.
+            netc_rport[cu] = cast[uint32](icmp_conn_ident(islot))
+            return NET_CTL_OK
+        # TCP/UDP: a port MUST follow '!'.
         # The Plan 9 separator between host and service is '!'.
         if pos >= len or buf[pos] != 33:               # '!'
             return NET_CTL_EBADCMD
@@ -551,8 +609,10 @@ def devnet_ctl(conn: int32, buf: Ptr[uint8], len: uint64) -> int32:
                     tcp_listen_close(slot)
                 else:
                     tcp_close(slot)
-            else:
+            elif netc_proto[cu] == NET_PROTO_UDP:
                 udp_socket_close(slot)
+            else:
+                icmp_conn_free(slot)
         netc_slot[cu]  = -1
         netc_state[cu] = NETC_CLOSED
         return NET_CTL_OK
@@ -590,6 +650,11 @@ def devnet_data_write(conn: int32, buf: Ptr[uint8],
                 return -1
             sent = sent + cast[uint64](rc)
         return cast[int64](sent)
+    if netc_proto[cu] == NET_PROTO_ICMP:
+        # ICMP: take the bytes as the Echo Request payload; icmp_conn_send
+        # prepends the 8-byte ICMP header (type/code/checksum/id/seq).
+        # Returns bytes-of-payload sent or -1.
+        return icmp_conn_send(slot, buf, count)
     # UDP: send one datagram to the connected peer.
     if netc_rip[cu] == 0:
         return -1
@@ -613,6 +678,16 @@ def devnet_data_read(conn: int32, buf: Ptr[uint8],
         if n < 0:
             netc_state[cu] = NETC_CLOSED
         return n
+    if netc_proto[cu] == NET_PROTO_ICMP:
+        # ICMP: pull the next queued Echo Reply payload (header
+        # stripped). icmp_conn_recv blocks up to ICMP_BLOCK_JIFFIES
+        # (= the /net block budget), returns -11 on timeout — we
+        # surface that as 0 (a /net read of zero is "would-block,
+        # try again" for the userland ping loop).
+        ir: int64 = icmp_conn_recv(slot, buf, count, NET_BLOCK_JIFFIES)
+        if ir < 0:
+            return 0
+        return ir
     # UDP: pull one datagram.
     ud: int64 = udp_socket_recvfrom(slot, buf, count, NET_BLOCK_JIFFIES,
                                     cast[Ptr[uint32]](0),
@@ -640,6 +715,11 @@ def devnet_data_read_to(conn: int32, buf: Ptr[uint8], count: uint64,
         if n < 0:
             netc_state[cu] = NETC_CLOSED
         return n
+    if netc_proto[cu] == NET_PROTO_ICMP:
+        ir: int64 = icmp_conn_recv(slot, buf, count, timeout_ms)
+        if ir < 0:
+            return 0
+        return ir
     ud: int64 = udp_socket_recvfrom(slot, buf, count, timeout_ms,
                                     cast[Ptr[uint32]](0),
                                     cast[Ptr[uint16]](0))
@@ -662,6 +742,15 @@ def devnet_data_read_nb(conn: int32, buf: Ptr[uint8],
         if n < 0:
             netc_state[cu] = NETC_CLOSED
         return n
+    if netc_proto[cu] == NET_PROTO_ICMP:
+        if icmp_conn_recv_pending(slot) == 0:
+            return 0
+        # Non-blocking flavour: a 1-jiffy poll budget pulls a queued
+        # reply without spending real wall time waiting for one.
+        ir_nb: int64 = icmp_conn_recv(slot, buf, count, 1)
+        if ir_nb < 0:
+            return 0
+        return ir_nb
     if udp_socket_recv_pending(slot) == 0:
         return 0
     ud: int64 = udp_socket_recvfrom(slot, buf, count, 1,
@@ -685,6 +774,10 @@ def devnet_data_pending(conn: int32) -> int32:
         if tcp_recv_pending(slot) != 0:
             return 1
         if tcp_slot_at_eof(slot) != 0:
+            return 1
+        return 0
+    if netc_proto[cu] == NET_PROTO_ICMP:
+        if icmp_conn_recv_pending(slot) != 0:
             return 1
         return 0
     if udp_socket_recv_pending(slot) != 0:
@@ -752,16 +845,26 @@ def _put_ipv4(out: Ptr[uint8], pos: uint64, ip: uint32) -> uint64:
 
 def devnet_status_render(conn: int32, out: Ptr[uint8],
                          max: uint64) -> int64:
-    # Render a one-line status: "<proto> <state>\n". `out` must be at
-    # least 32 bytes. Returns bytes written.
+    # Render a one-line status. `out` should be sized for the longest
+    # case (ICMP, ~120 bytes). Returns bytes written.
+    #
+    # TCP/UDP: "<proto> <state>\n"
+    # ICMP:    "icmp <state> peer=A.B.C.D id=I tx=X rx=Y
+    #           last_seq=S last_ttl=T last_rtt_ms=R\n"
+    #
+    # The /net/icmp shape carries enough info that `ping` userland
+    # can render the standard `time=Nms ttl=N` line by reading the
+    # `data` file (one reply) then the `status` file (its RTT/TTL).
     if _netc_valid(conn) == 0:
         return 0
     cu: uint64 = cast[uint64](conn)
     p: uint64 = 0
     if netc_proto[cu] == NET_PROTO_TCP:
         p = _put_str(out, p, "tcp ")
-    else:
+    elif netc_proto[cu] == NET_PROTO_UDP:
         p = _put_str(out, p, "udp ")
+    else:
+        p = _put_str(out, p, "icmp ")
     st: uint32 = netc_state[cu]
     if st == NETC_OPEN:
         p = _put_str(out, p, "Open")
@@ -771,6 +874,38 @@ def devnet_status_render(conn: int32, out: Ptr[uint8],
         p = _put_str(out, p, "Announced")
     else:
         p = _put_str(out, p, "Closed")
+    if netc_proto[cu] == NET_PROTO_ICMP:
+        islot: int32 = netc_slot[cu]
+        peer: uint32 = 0
+        ident: uint64 = 0
+        tx: uint64 = 0
+        rx: uint64 = 0
+        last_seq: uint64 = 0
+        last_ttl: uint64 = 0
+        last_rtt_ms: uint64 = 0
+        if islot >= 0:
+            peer        = icmp_conn_peer_ip(islot)
+            ident       = cast[uint64](icmp_conn_ident(islot))
+            tx          = icmp_conn_tx_count(islot)
+            rx          = icmp_conn_rx_count(islot)
+            last_seq    = cast[uint64](icmp_conn_last_seq(islot))
+            last_ttl    = cast[uint64](icmp_conn_last_ttl(islot))
+            # 1 jiffy == 10 ms; the per-packet RTT is rounded to ms.
+            last_rtt_ms = icmp_conn_last_rtt_jiffies(islot) * 10
+        p = _put_str(out, p, " peer=")
+        p = _put_ipv4(out, p, peer)
+        p = _put_str(out, p, " id=")
+        p = _put_dec(out, p, ident)
+        p = _put_str(out, p, " tx=")
+        p = _put_dec(out, p, tx)
+        p = _put_str(out, p, " rx=")
+        p = _put_dec(out, p, rx)
+        p = _put_str(out, p, " last_seq=")
+        p = _put_dec(out, p, last_seq)
+        p = _put_str(out, p, " last_ttl=")
+        p = _put_dec(out, p, last_ttl)
+        p = _put_str(out, p, " last_rtt_ms=")
+        p = _put_dec(out, p, last_rtt_ms)
     out[p] = 10                                        # '\n'
     p = p + 1
     if p > max:
@@ -982,6 +1117,9 @@ def devnet_path_classify(path: Ptr[char], out_proto: Ptr[int32],
     elif _seg_eq(p, pos, "udp", 3) != 0:
         proto = NET_PROTO_UDP
         pos = pos + 3
+    elif _seg_eq(p, pos, "icmp", 4) != 0:
+        proto = NET_PROTO_ICMP
+        pos = pos + 4
     else:
         return NETPATH_MISS
     if p[pos] == 0:

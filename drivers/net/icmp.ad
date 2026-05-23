@@ -10,19 +10,64 @@
 # The checksum covers the entire ICMP message, computed with the 1's
 # complement algorithm used by IPv4 headers (RFC 1071).
 #
+# /net/icmp SCHEMA (Plan-9-shaped):
+#
+#   /net/icmp/clone           open -> allocate an icmp conn; read its
+#                                      decimal slot number.
+#   /net/icmp/N/ctl           write "connect <a.b.c.d>" — bind conn to
+#                                       peer, auto-assign identifier.
+#                             write "connect <a.b.c.d>!<id>" — same,
+#                                       with caller-chosen identifier
+#                                       (decimal; demux key per RFC 792
+#                                       so two pings don't steal each
+#                                       other's replies).
+#                             write "hangup" — tear conn down.
+#   /net/icmp/N/data          write payload -> kernel builds Echo
+#                                       Request (type=8, code=0,
+#                                       conn's id + auto-increment
+#                                       seq), checksums, transmits.
+#                             read -> next queued Echo Reply payload
+#                                       (header stripped). Blocks up
+#                                       to the read's timeout (~1 s
+#                                       default); returns -EAGAIN
+#                                       on timeout.
+#   /net/icmp/N/status        read one line:
+#                              "peer=A.B.C.D id=I tx=X rx=Y
+#                               last_seq=S last_ttl=T last_rtt_ms=R\n"
+#                             This is the RTT-reporting shape: userland
+#                             reads `status` after each `data` read to
+#                             pick up the most recent reply's RTT,
+#                             sequence, and TTL. A per-packet header
+#                             would let multiple writers/readers share
+#                             one conn, but `ping` is a single-stream
+#                             client and the status snapshot is enough.
+#   /net/icmp/N/local         read "0.0.0.0!<id>\n".
+#   /net/icmp/N/remote        read "<a.b.c.d>!<id>\n".
+#
+# RX dispatch: when an Echo Reply arrives, icmp_rx walks the conn
+# table for one whose identifier AND peer match the reply, and
+# queues the payload on that conn. With no userland conn open, the
+# reply just logs (the historic kernel-smoke behaviour is preserved).
+#
 # Entry points:
 #
-#   icmp_rx() — called from ip_rx with the L4 payload + source IP
-#               (the IPv4 layer has already stripped the IP header).
-#               Echo request (type 8) -> build an echo reply.
-#               Dest-unreachable (type 3) / time-exceeded (type 11)
-#               -> §10: decode the embedded datagram and, if it was a
-#               UDP datagram WE sent, surface the failure via
-#               udp_deliver_icmp_error so a connected UDP socket's
-#               SO_ERROR reports it.
+#   icmp_rx() — called from ip_rx with the L4 payload + source IP +
+#               IP TTL (the IPv4 layer has already stripped the IP
+#               header). Echo request (type 8) -> build an echo reply.
+#               Echo reply (type 0) -> log + deliver to a matching
+#               conn. Dest-unreachable (type 3) / time-exceeded
+#               (type 11) -> §10: decode the embedded datagram and, if
+#               it was a UDP datagram WE sent, surface the failure via
+#               udp_deliver_icmp_error.
+#
+#   icmp_conn_alloc / icmp_conn_connect / icmp_conn_send /
+#   icmp_conn_recv / icmp_conn_free — /net/icmp conn-table primitives;
+#               devnet.ad's `/net/icmp/...` arms call into these.
 #
 #   icmp_send_echo_request() — emit an unsolicited echo request to a
-#               chosen destination (SLIRP-gateway smoke test).
+#               chosen destination (SLIRP-gateway smoke test). Bypasses
+#               the conn table — only init/main.ad's kernel-side smoke
+#               uses it.
 #
 #   icmp_send_port_unreach() — §10: emit an ICMP destination-
 #               unreachable / port-unreachable for an inbound UDP
@@ -30,6 +75,8 @@
 
 from kernel.printk.printk import printk0, printk1, printk2
 from drivers.net.ip import ip_send, ip_csum16, IPPROTO_ICMP
+from arch.x86.kernel.time import get_jiffies, pit_monotonic_us
+from drivers.net.virtio_net import virtio_net_poll
 
 
 # ICMP types we handle.
@@ -71,6 +118,456 @@ icmp_out_unreach:    uint64 = 0          # port-unreachable sent
 # Identifier + sequence used for the kernel-driven echo request.
 ICMP_PING_ID:   uint16 = 0xCAFE
 icmp_ping_seq:  uint16 = 0
+
+
+# --- /net/icmp connection table -------------------------------------
+#
+# A connection here is what userland sees as one entry in the
+# /net/icmp file tree. Each conn carries a remote peer, an ICMP
+# identifier (the demux key), and a small queue of received Echo
+# Reply payloads matched on that identifier.
+#
+# RX dispatch: when an Echo Reply arrives, icmp_rx walks the table,
+# finds the conn whose identifier matches the reply's identifier
+# field, computes the RTT (now - tx jiffies for the matching seq if
+# we still have it; falls back to "since the conn's last tx" so the
+# user always sees *some* RTT), and queues the payload on that conn.
+#
+# Per-conn state is parallel arrays (Adder U9 quirk: never nest a
+# large Array in a per-row struct; flatten everything to top-level
+# BSS). Reply payloads share one flat byte arena indexed by
+# (conn * QUEUE_DEPTH + slot) * REPLY_MAX.
+
+ICMP_CONN_MAX:        uint64 = 8
+ICMP_REPLY_MAX:       uint64 = 512        # payload byte cap per reply
+ICMP_QUEUE_DEPTH:     uint64 = 4          # per-conn reply ring depth
+
+# Per-conn lifecycle.
+ICONN_FREE:      uint32 = 0
+ICONN_OPEN:      uint32 = 1               # allocated, no peer yet
+ICONN_CONNECTED: uint32 = 2               # peer bound via `connect <ip>`
+
+# Parallel-array backing store. Top-level BSS — Adder U9 quirk
+# bans nested-frame Arrays of any meaningful size.
+iconn_inuse:     Array[8, uint8]
+iconn_state:     Array[8, uint32]
+iconn_peer_ip:   Array[8, uint32]         # host order
+iconn_id:        Array[8, uint16]         # ICMP identifier (demux key)
+iconn_next_seq:  Array[8, uint16]         # next sequence to emit
+iconn_tx_pkts:   Array[8, uint64]
+iconn_rx_pkts:   Array[8, uint64]
+iconn_last_seq:  Array[8, uint16]         # seq of last delivered reply
+iconn_last_ttl:  Array[8, uint8]          # TTL of last delivered reply
+iconn_last_rtt:  Array[8, uint64]         # RTT of last reply (jiffies)
+# Per-conn last-tx jiffies — for an RTT fallback when the matching
+# seq isn't found in the per-seq tx-jiffies table (the table only
+# remembers the most recent N seqs). RTT then is "now - last tx".
+iconn_last_tx_j: Array[8, uint64]
+# Tx-jiffies ring: remember (seq, tx_jiffies) for the last few
+# emissions so the reply path can compute a precise RTT for the
+# matching sequence number. Single global ring — ping is low rate.
+# A miss falls back to iconn_last_tx_j for that conn.
+ICMP_TX_HIST: uint64 = 16
+itx_hist_conn:  Array[16, int32]          # -1 == empty slot
+itx_hist_seq:   Array[16, uint16]
+itx_hist_j:     Array[16, uint64]
+itx_hist_pos:   uint64 = 0                # ring write head
+
+# Reply queue. iconn_q_head/tail/count run a ring per conn. The
+# payload bytes live in one flat arena indexed by
+#   (conn * QUEUE_DEPTH + slot) * REPLY_MAX
+# (the same pack the udp.ad rx ring uses).
+iconn_q_head:    Array[8, uint64]
+iconn_q_tail:    Array[8, uint64]
+iconn_q_count:   Array[8, uint64]
+iconn_q_len:     Array[32, uint64]        # bytes in slot, 0 == empty
+# 8 conns * 4 depth * 512 byte payload = 16 KiB. Top-level BSS.
+iconn_q_data:    Array[16384, uint8]
+
+icmp_conn_inited: int32 = 0
+# Auto-generated identifier counter — used by `connect <ip>` when the
+# caller omits an explicit `!<id>`. Starts above 0xCAFE so the
+# in-kernel ping smoke's identifier doesn't collide with userland
+# pings on a slow boot.
+icmp_id_next: uint16 = 0xCAFF
+
+
+def _icmp_conn_init():
+    if icmp_conn_inited != 0:
+        return
+    i: uint64 = 0
+    while i < ICMP_CONN_MAX:
+        iconn_inuse[i]     = 0
+        iconn_state[i]     = ICONN_FREE
+        iconn_peer_ip[i]   = 0
+        iconn_id[i]        = 0
+        iconn_next_seq[i]  = 1
+        iconn_tx_pkts[i]   = 0
+        iconn_rx_pkts[i]   = 0
+        iconn_last_seq[i]  = 0
+        iconn_last_ttl[i]  = 0
+        iconn_last_rtt[i]  = 0
+        iconn_last_tx_j[i] = 0
+        iconn_q_head[i]    = 0
+        iconn_q_tail[i]    = 0
+        iconn_q_count[i]   = 0
+        j: uint64 = 0
+        while j < ICMP_QUEUE_DEPTH:
+            iconn_q_len[i * ICMP_QUEUE_DEPTH + j] = 0
+            j = j + 1
+        i = i + 1
+    k: uint64 = 0
+    while k < ICMP_TX_HIST:
+        itx_hist_conn[k] = -1
+        itx_hist_seq[k]  = 0
+        itx_hist_j[k]    = 0
+        k = k + 1
+    itx_hist_pos = 0
+    icmp_conn_inited = 1
+
+
+def icmp_conn_alloc() -> int32:
+    # Allocate a fresh /net/icmp conn slot. Returns the slot index,
+    # or -1 if every slot is in use. The slot starts in ICONN_OPEN
+    # with no peer bound — `icmp_conn_connect` wires that in.
+    _icmp_conn_init()
+    i: uint64 = 0
+    while i < ICMP_CONN_MAX:
+        if iconn_inuse[i] == 0:
+            iconn_inuse[i]     = 1
+            iconn_state[i]     = ICONN_OPEN
+            iconn_peer_ip[i]   = 0
+            iconn_id[i]        = 0
+            iconn_next_seq[i]  = 1
+            iconn_tx_pkts[i]   = 0
+            iconn_rx_pkts[i]   = 0
+            iconn_last_seq[i]  = 0
+            iconn_last_ttl[i]  = 0
+            iconn_last_rtt[i]  = 0
+            iconn_last_tx_j[i] = 0
+            iconn_q_head[i]    = 0
+            iconn_q_tail[i]    = 0
+            iconn_q_count[i]   = 0
+            j: uint64 = 0
+            while j < ICMP_QUEUE_DEPTH:
+                iconn_q_len[i * ICMP_QUEUE_DEPTH + j] = 0
+                j = j + 1
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def icmp_conn_free(slot: int32):
+    if slot < 0:
+        return
+    su: uint64 = cast[uint64](slot)
+    if su >= ICMP_CONN_MAX:
+        return
+    if iconn_inuse[su] == 0:
+        return
+    iconn_inuse[su] = 0
+    iconn_state[su] = ICONN_FREE
+    iconn_peer_ip[su] = 0
+    iconn_id[su] = 0
+    iconn_q_head[su]  = 0
+    iconn_q_tail[su]  = 0
+    iconn_q_count[su] = 0
+    j: uint64 = 0
+    while j < ICMP_QUEUE_DEPTH:
+        iconn_q_len[su * ICMP_QUEUE_DEPTH + j] = 0
+        j = j + 1
+    # Invalidate any tx-history slots that named this conn so a
+    # later slot reuse doesn't credit a stale RTT to a fresh peer.
+    k: uint64 = 0
+    while k < ICMP_TX_HIST:
+        if itx_hist_conn[k] == slot:
+            itx_hist_conn[k] = -1
+        k = k + 1
+
+
+def icmp_conn_connect(slot: int32, peer_ip: uint32,
+                      ident: uint16) -> int32:
+    # Bind `slot` to `peer_ip` (host order) with ICMP identifier
+    # `ident`. An `ident` of 0 means "auto-pick" — we hand out
+    # icmp_id_next and bump it. Returns 0 on success, -1 on a bad
+    # slot or one already connected.
+    if slot < 0:
+        return -1
+    su: uint64 = cast[uint64](slot)
+    if su >= ICMP_CONN_MAX:
+        return -1
+    if iconn_inuse[su] == 0:
+        return -1
+    if iconn_state[su] == ICONN_CONNECTED:
+        return -1
+    use_id: uint16 = ident
+    if use_id == 0:
+        use_id = icmp_id_next
+        icmp_id_next = icmp_id_next + 1
+        if icmp_id_next == 0:
+            icmp_id_next = 1
+    iconn_peer_ip[su] = peer_ip
+    iconn_id[su]      = use_id
+    iconn_state[su]   = ICONN_CONNECTED
+    return 0
+
+
+def icmp_conn_valid(slot: int32) -> int32:
+    if slot < 0:
+        return 0
+    su: uint64 = cast[uint64](slot)
+    if su >= ICMP_CONN_MAX:
+        return 0
+    if iconn_inuse[su] == 0:
+        return 0
+    return 1
+
+
+def icmp_conn_recv_pending(slot: int32) -> int32:
+    # 1 iff a reply is queued — backs the /net data poll path.
+    if icmp_conn_valid(slot) == 0:
+        return 0
+    su: uint64 = cast[uint64](slot)
+    if iconn_q_count[su] > 0:
+        return 1
+    return 0
+
+
+def _icmp_record_tx(slot: int32, seq: uint16, now_j: uint64):
+    # Stash (slot, seq, now_j) in the tx-history ring so the rx path
+    # can compute a precise RTT for this sequence number. A full ring
+    # overwrites the oldest entry; with ICMP_TX_HIST=16 and ping at
+    # 1 Hz that's 16 s of history — far longer than any real RTT.
+    pos: uint64 = itx_hist_pos
+    itx_hist_conn[pos] = slot
+    itx_hist_seq[pos]  = seq
+    itx_hist_j[pos]    = now_j
+    pos = pos + 1
+    if pos >= ICMP_TX_HIST:
+        pos = 0
+    itx_hist_pos = pos
+
+
+def _icmp_tx_jiffies_for(slot: int32, seq: uint16) -> uint64:
+    # Look up the tx jiffies for (slot, seq) in the history ring.
+    # Returns 0 on a miss (so the rx path can fall back to
+    # iconn_last_tx_j for an approximate RTT).
+    k: uint64 = 0
+    while k < ICMP_TX_HIST:
+        if itx_hist_conn[k] == slot:
+            if itx_hist_seq[k] == seq:
+                return itx_hist_j[k]
+        k = k + 1
+    return 0
+
+
+def icmp_conn_send(slot: int32, payload: Ptr[uint8],
+                   payload_len: uint64) -> int64:
+    # Build + transmit an ICMP Echo Request for `slot`'s peer using
+    # the conn's identifier and the next sequence number. `payload`
+    # is the user-supplied payload bytes (no ICMP header — that's our
+    # job). Returns bytes accepted on success, -1 on a bad slot, no
+    # peer, oversize payload, or ip_send failure.
+    if icmp_conn_valid(slot) == 0:
+        return -1
+    su: uint64 = cast[uint64](slot)
+    if iconn_state[su] != ICONN_CONNECTED:
+        return -1
+    if payload_len + ICMP_HDR_LEN > ICMP_BUF_BYTES:
+        return -1
+    total_len: uint64 = ICMP_HDR_LEN + payload_len
+    # Build header.
+    icmp_tx_buf[0] = ICMP_TYPE_ECHO_REQUEST
+    icmp_tx_buf[1] = 0
+    icmp_tx_buf[2] = 0
+    icmp_tx_buf[3] = 0
+    id: uint16 = iconn_id[su]
+    icmp_tx_buf[4] = cast[uint8]((cast[uint32](id) >> 8) & 0xFF)
+    icmp_tx_buf[5] = cast[uint8](cast[uint32](id) & 0xFF)
+    seq: uint16 = iconn_next_seq[su]
+    iconn_next_seq[su] = seq + 1
+    icmp_tx_buf[6] = cast[uint8]((cast[uint32](seq) >> 8) & 0xFF)
+    icmp_tx_buf[7] = cast[uint8](cast[uint32](seq) & 0xFF)
+    # Copy payload.
+    pi: uint64 = 0
+    while pi < payload_len:
+        icmp_tx_buf[ICMP_HDR_LEN + pi] = payload[pi]
+        pi = pi + 1
+    csum: uint16 = ip_csum16(
+        cast[Ptr[uint8]](&icmp_tx_buf[0]), total_len)
+    icmp_tx_buf[2] = cast[uint8]((cast[uint32](csum) >> 8) & 0xFF)
+    icmp_tx_buf[3] = cast[uint8](cast[uint32](csum) & 0xFF)
+    peer: uint32 = iconn_peer_ip[su]
+    db0: uint8 = cast[uint8]((peer >> 24) & 0xFF)
+    db1: uint8 = cast[uint8]((peer >> 16) & 0xFF)
+    db2: uint8 = cast[uint8]((peer >> 8) & 0xFF)
+    db3: uint8 = cast[uint8](peer & 0xFF)
+    now_j: uint64 = get_jiffies()
+    iconn_last_tx_j[su] = now_j
+    _icmp_record_tx(slot, seq, now_j)
+    iconn_tx_pkts[su] = iconn_tx_pkts[su] + 1
+    icmp_out_echo_req = icmp_out_echo_req + 1
+    printk2("[icmp] tx echo seq=%d to %d", cast[uint64](seq),
+            cast[uint64](db0))
+    printk2(".%d.%d", cast[uint64](db1), cast[uint64](db2))
+    printk1(".%d\n", cast[uint64](db3))
+    tx_ptr: Ptr[uint8] = cast[Ptr[uint8]](&icmp_tx_buf[0])
+    rc: int32 = ip_send(db0, db1, db2, db3,
+                        IPPROTO_ICMP, tx_ptr, total_len)
+    if rc != 0:
+        return -1
+    return cast[int64](payload_len)
+
+
+def icmp_conn_recv(slot: int32, buf: Ptr[uint8], max_len: uint64,
+                   timeout_jiffies: uint64) -> int64:
+    # Wait up to `timeout_jiffies` for a queued reply on `slot`, then
+    # copy its payload bytes (Echo Reply minus the 8-byte ICMP
+    # header) into `buf`. Returns bytes copied, or -11 (-EAGAIN) on
+    # timeout, or -9 (-EBADF) on a bad slot. Drives virtio_net_poll
+    # itself so the rx ring keeps draining while we wait — same
+    # discipline udp_socket_recvfrom uses.
+    if icmp_conn_valid(slot) == 0:
+        return -9
+    su: uint64 = cast[uint64](slot)
+    budget_us: uint64 = timeout_jiffies * 10000
+    if budget_us == 0:
+        budget_us = 1000000                          # 1 s default
+    start_us: uint64 = pit_monotonic_us()
+    while True:
+        virtio_net_poll()
+        if iconn_q_count[su] > 0:
+            head: uint64 = iconn_q_head[su]
+            meta: uint64 = su * ICMP_QUEUE_DEPTH + head
+            dlen: uint64 = iconn_q_len[meta]
+            n: uint64 = dlen
+            if n > max_len:
+                n = max_len
+            data_base: uint64 = meta * ICMP_REPLY_MAX
+            i: uint64 = 0
+            while i < n:
+                buf[i] = iconn_q_data[data_base + i]
+                i = i + 1
+            iconn_q_len[meta] = 0
+            head = head + 1
+            if head >= ICMP_QUEUE_DEPTH:
+                head = 0
+            iconn_q_head[su]  = head
+            iconn_q_count[su] = iconn_q_count[su] - 1
+            return cast[int64](n)
+        if pit_monotonic_us() - start_us >= budget_us:
+            return -11
+
+
+# Accessors for the /net/icmp status / local / remote info files.
+
+def icmp_conn_peer_ip(slot: int32) -> uint32:
+    if icmp_conn_valid(slot) == 0:
+        return 0
+    return iconn_peer_ip[cast[uint64](slot)]
+
+
+def icmp_conn_ident(slot: int32) -> uint16:
+    if icmp_conn_valid(slot) == 0:
+        return 0
+    return iconn_id[cast[uint64](slot)]
+
+
+def icmp_conn_tx_count(slot: int32) -> uint64:
+    if icmp_conn_valid(slot) == 0:
+        return 0
+    return iconn_tx_pkts[cast[uint64](slot)]
+
+
+def icmp_conn_rx_count(slot: int32) -> uint64:
+    if icmp_conn_valid(slot) == 0:
+        return 0
+    return iconn_rx_pkts[cast[uint64](slot)]
+
+
+def icmp_conn_last_seq(slot: int32) -> uint16:
+    if icmp_conn_valid(slot) == 0:
+        return 0
+    return iconn_last_seq[cast[uint64](slot)]
+
+
+def icmp_conn_last_ttl(slot: int32) -> uint8:
+    if icmp_conn_valid(slot) == 0:
+        return 0
+    return iconn_last_ttl[cast[uint64](slot)]
+
+
+def icmp_conn_last_rtt_jiffies(slot: int32) -> uint64:
+    # The last reply's RTT in jiffies (1 jiffy == 10 ms). 0 == no
+    # reply has landed yet.
+    if icmp_conn_valid(slot) == 0:
+        return 0
+    return iconn_last_rtt[cast[uint64](slot)]
+
+
+def _icmp_find_conn_for_id(ident: uint16, src_ip: uint32) -> int32:
+    # Find a CONNECTED conn whose identifier equals `ident` AND
+    # whose peer matches `src_ip`. The identifier alone is the
+    # demux key per RFC 792, but matching the peer too means two
+    # `ping`s with the same id targeting different hosts (a corner
+    # case) still don't steal each other's replies. Returns the
+    # slot, or -1 on a miss.
+    i: uint64 = 0
+    while i < ICMP_CONN_MAX:
+        if iconn_inuse[i] != 0:
+            if iconn_state[i] == ICONN_CONNECTED:
+                if iconn_id[i] == ident:
+                    if iconn_peer_ip[i] == src_ip:
+                        return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _icmp_deliver_reply(slot: int32, payload: Ptr[uint8],
+                        length: uint64, seq: uint16,
+                        ttl: uint8, now_j: uint64):
+    # Queue an Echo Reply on `slot` and record per-conn RTT/seq/ttl.
+    # `payload` points at the ICMP message; `length` is its full
+    # length (header + payload). We store the PAYLOAD only (header
+    # stripped) so userland sees the bytes it sent back.
+    if length < ICMP_HDR_LEN:
+        return
+    su: uint64 = cast[uint64](slot)
+    if iconn_q_count[su] >= ICMP_QUEUE_DEPTH:
+        # Drop the new reply (FIFO conservative). A `ping` userland
+        # reading at ~1 Hz keeps the ring drained; ring full means
+        # someone abandoned the conn.
+        return
+    body_len: uint64 = length - ICMP_HDR_LEN
+    if body_len > ICMP_REPLY_MAX:
+        body_len = ICMP_REPLY_MAX
+    tail: uint64 = iconn_q_tail[su]
+    meta: uint64 = su * ICMP_QUEUE_DEPTH + tail
+    iconn_q_len[meta] = body_len
+    data_base: uint64 = meta * ICMP_REPLY_MAX
+    i: uint64 = 0
+    while i < body_len:
+        iconn_q_data[data_base + i] = payload[ICMP_HDR_LEN + i]
+        i = i + 1
+    tail = tail + 1
+    if tail >= ICMP_QUEUE_DEPTH:
+        tail = 0
+    iconn_q_tail[su]  = tail
+    iconn_q_count[su] = iconn_q_count[su] + 1
+    # RTT: prefer the per-seq tx-jiffies, fall back to the conn's
+    # last-tx jiffies (the user can still see a sane "time=X ms"
+    # even when the seq missed the history ring). Clamp at 0.
+    tx_j: uint64 = _icmp_tx_jiffies_for(slot, seq)
+    if tx_j == 0:
+        tx_j = iconn_last_tx_j[su]
+    rtt: uint64 = 0
+    if tx_j != 0:
+        if now_j >= tx_j:
+            rtt = now_j - tx_j
+    iconn_last_rtt[su] = rtt
+    iconn_last_seq[su] = seq
+    iconn_last_ttl[su] = ttl
+    iconn_rx_pkts[su]  = iconn_rx_pkts[su] + 1
 
 
 def _icmp_handle_error(payload: Ptr[uint8], length: uint64):
@@ -139,7 +636,8 @@ def _icmp_handle_error(payload: Ptr[uint8], length: uint64):
 
 def icmp_rx(payload: Ptr[uint8], length: uint64,
             src_b0: uint8, src_b1: uint8,
-            src_b2: uint8, src_b3: uint8):
+            src_b2: uint8, src_b3: uint8,
+            ttl: uint8):
     # Parse the ICMP header. We don't validate the checksum on
     # ingress — any real peer already did on egress.
     if length < ICMP_HDR_LEN:
@@ -153,6 +651,27 @@ def icmp_rx(payload: Ptr[uint8], length: uint64,
                 cast[uint64](src_b1))
         printk2(".%d.%d\n", cast[uint64](src_b2),
                 cast[uint64](src_b3))
+        # ARCH §10 (`/net/icmp`): dispatch this reply to whichever
+        # conn owns the matching identifier so a userland `ping`
+        # reading /net/icmp/N/data sees it. The conn pool is empty
+        # before any userland opens /net/icmp/clone; until then this
+        # is a no-op and only the printk above appears (which is
+        # also what scripts/test_net_icmp.sh asserts).
+        src_ip: uint32 = (cast[uint32](src_b0) << 24) \
+                       | (cast[uint32](src_b1) << 16) \
+                       | (cast[uint32](src_b2) << 8) \
+                       | cast[uint32](src_b3)
+        rep_id: uint16 = cast[uint16](
+            (cast[uint32](payload[4]) << 8)
+            | cast[uint32](payload[5]))
+        rep_seq: uint16 = cast[uint16](
+            (cast[uint32](payload[6]) << 8)
+            | cast[uint32](payload[7]))
+        slot: int32 = _icmp_find_conn_for_id(rep_id, src_ip)
+        if slot >= 0:
+            now_j: uint64 = get_jiffies()
+            _icmp_deliver_reply(slot, payload, length,
+                                rep_seq, ttl, now_j)
         return
     if itype == ICMP_TYPE_ECHO_REQUEST:
         icmp_in_echo_req = icmp_in_echo_req + 1
