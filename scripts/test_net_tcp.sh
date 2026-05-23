@@ -36,7 +36,11 @@ ELF=build/hamnix-kernel.elf
 
 echo "[test_net_tcp] (1/3) Build userland + initramfs"
 bash scripts/build_user.sh >/dev/null
-INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null
+# tcp_smoke_test() is gated on /etc/tcp-smoke-test (init/main.ad). Plant
+# the marker only for this harness so default boots skip the smoke and
+# don't ARP-stall on an unreachable 10.0.2.100.
+INIT_ELF=build/user/init.elf ENABLE_TCP_SMOKE_TEST=1 \
+    python3 scripts/build_initramfs.py >/dev/null
 
 echo "[test_net_tcp] (2/3) Rebuild kernel image"
 python3 -m compiler.adder compile \

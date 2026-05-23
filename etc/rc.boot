@@ -56,6 +56,16 @@ motdsvc = spawn detached bootns {
     motd
 }
 
+# sshd — the in-tree SSH-2 server (user/sshd.ad → /bin/sshd). Long-
+# lived: it accepts up to a small bounded number of sessions and then
+# exits (the V1 server caps at 8 clients per process). Detached so it
+# survives this rc and the interactive prompt that comes after. With
+# this in place, a vanilla Hamnix ISO boots straight into "ready for
+# SSH on port 22" with no INIT_ELF override needed.
+sshdsvc = spawn detached bootns {
+    sshd
+}
+
 echo 'rc.boot: boot services launched'
 
 # --- the Linux runtime namespace ------------------------------------

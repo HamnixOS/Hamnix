@@ -61,6 +61,17 @@ if os.environ.get("ENABLE_TLS_GZIP_SMOKE") == "1":
     FILES.append(("/etc/tls-gzip-test", b"1\n"))
     FILES.append(("/etc/skip-https-internet-smoke", b"1\n"))
 
+# M16.102 TCP three-way-handshake smoke (10.0.2.100:7 echo via
+# SLIRP `guestfwd=tcp:10.0.2.100:7-cmd:cat`). Gated the same way as
+# /etc/tcp-ring-test below: without the matching guestfwd the connect
+# ARP-stalls and tcp_connect's jiffy deadline never expires (jiffies
+# aren't ticking yet at net_smoke_test time — time_init runs later in
+# start_kernel). Only scripts/test_net_tcp.sh sets this; the default
+# vanilla boot does NOT include it, so production / demo boots skip
+# the smoke and reach the interactive prompt cleanly.
+if os.environ.get("ENABLE_TCP_SMOKE_TEST") == "1":
+    FILES.append(("/etc/tcp-smoke-test", b"1\n"))
+
 # V5.3 TCP RX-ring multi-segment smoke. Gated the same way as
 # /etc/tls-test so the kernel doesn't try to ARP / SYN 10.0.2.201
 # during boot when the test_tcp_ring.sh harness isn't running —
