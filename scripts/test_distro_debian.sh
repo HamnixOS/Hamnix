@@ -2,9 +2,12 @@
 # scripts/test_distro_debian.sh - real Debian rootfs running inside a
 # Hamnix distro-shape namespace. The follow-on to
 # scripts/test_distro_namespace.sh (which proves the namespace bind
-# mechanism with the rc-defined `linuxruntime` ns value); this script
-# proves the same mechanism with a REAL debootstrap'd Debian rootfs
-# (tests/distros/debian-minbase/rootfs/).
+# mechanism with the rc-defined `linux` ns value); this script proves
+# the same mechanism with a REAL debootstrap'd Debian rootfs
+# (tests/distros/debian-minbase/rootfs/). Defines its OWN `debianns`
+# at the prompt rather than using the rc-defined `linux`/`debian`
+# templates because it targets the `debian-minbase` backing tree
+# rather than `default/`.
 #
 # The bespoke `distrorun` launcher is RETIRED (HAMSH_SPEC §0). A
 # distro-shape namespace is a captured `ns { }` value entered with

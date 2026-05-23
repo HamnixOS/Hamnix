@@ -64,33 +64,71 @@ echo 'rc.boot: boot services launched'
 # `enter`. This is the §0 ethos: one primitive (a Chan at a name in a
 # Pgrp), many skins; no special container launcher.
 #
-# `linuxruntime` is the distro-shape namespace recipe (docs/distro-
-# namespaces.md). It grafts the conventional FHS-Linux subtrees
-# (/etc, /usr, /lib, /lib64, /var) onto a distro backing tree under
-# /var/lib/distros/<name>/. The shared paths (/home, /net, /srv,
-# /dev, /proc, /env) are NOT rebound: `enter` overlays this template
-# onto a COW copy of the ambient namespace (HAMSH_SPEC §13 overlay
-# default), so they survive untouched — a Linux binary sees the same
-# /home/$user, /dev/cons, and PATH as a native process. That is the
-# whole job the retired `distrorun` binary used to hard-code.
+# `linux` is the distro-shape namespace recipe (docs/distro-
+# namespaces.md). It is `ns clean { }` — a HERMETIC base, NOT an
+# overlay of the ambient namespace (§13). The rationale: an apt-
+# installed package writes files into /bin, /sbin, /etc, /lib, /usr,
+# /var. If `enter linux` overlaid the ambient namespace, those paths
+# would resolve to the HOST's directories and apt would scatter
+# Debian binaries through Hamnix's own filesystem. Clean isolation
+# is the only safe default; the explicit `bind` list below is the
+# ENTIRE sharing surface between host and container.
+#
+# Root rebind: `bind / /var/lib/distros/default` points every path
+# that isn't covered by a longer (more specific) bind below at the
+# distro tree. /etc/debian_version resolves to
+# /var/lib/distros/default/etc/debian_version, and any path a package
+# writes to (/bin, /usr, /var, ...) lands inside the distro tree, not
+# on the host. (kernel chan.ad's chan_resolve_prefix picks the
+# longest matching prefix.)
+#
+# The share list below is deliberately minimal — only paths that are
+# safe to expose to a foreign-distro binary, where "safe" means
+# nothing a package manager writes to:
+#   /home  — user data files; the whole point of running a Linux
+#            tool is usually to operate on user files.
+#   /dev   — virtual devices (#c console + the rest); the only way
+#            a containerised binary can talk to the user.
+#   /proc  — process introspection (#p); useful for ps-style tools,
+#            and the kernel scopes its view per-task anyway.
+#   /srv   — 9P server registry (#s); Linux daemons can post and
+#            consume 9P services here without touching distro paths.
+#   /n     — Plan 9 mount-point parent (#/); conventional location
+#            for ad-hoc remote / per-task mounts.
+# NOT shared: /bin, /sbin, /lib, /lib64, /usr, /etc, /var, /opt,
+# /root, /tmp — every path a package would land in. Those stay
+# entirely inside the distro tree, so `apt install` cannot pollute
+# the host.
 #
 # A captured `ns {}` is a TEMPLATE — configured, not entered (§11).
 # Running a Linux binary is then plain namespace verbs:
 #
-#   enter linuxruntime { /bin/apt update }      # synchronous
-#   svc = spawn linuxruntime { /bin/postgres }  # service
+#   enter linux { /bin/apt update }       # synchronous
+#   svc = spawn linux { /bin/postgres }   # service
 #
-# The backing distro is the conventional `/var/lib/distros/default/`;
-# install another distro tree there (or edit this recipe) to retarget.
-# A `bind` whose backing subtree is absent records cleanly and simply
-# resolves to nothing — exactly as the old distrorun tolerated.
-linuxruntime = ns {
-    bind /etc /var/lib/distros/default/etc
-    bind /usr /var/lib/distros/default/usr
-    bind /lib /var/lib/distros/default/lib
-    bind /lib64 /var/lib/distros/default/lib64
-    bind /var /var/lib/distros/default/var
+# `debian` is an rc-defined ALIAS for the same template. Because
+# hamsh's `=` does NOT propagate captured ns-values through plain
+# variable reassignment (a captured ns carries a body-node pointer
+# in val_pay — `debian = linux` would copy the value cell but the
+# scope_set path goes through eval_expr-which-yields-a-fresh-cell,
+# so we duplicate the body under both names instead). This reads
+# naturally when the distro IS Debian: `enter debian { apt update }`.
+linux = ns clean {
+    bind / /var/lib/distros/default
+    bind /home /home
+    bind /dev '#c'
+    bind /proc '#p'
+    bind /srv '#s'
+    bind /n '#/'
 }
-echo 'rc.boot: linux runtime namespace defined (enter linuxruntime { ... })'
+debian = ns clean {
+    bind / /var/lib/distros/default
+    bind /home /home
+    bind /dev '#c'
+    bind /proc '#p'
+    bind /srv '#s'
+    bind /n '#/'
+}
+echo 'rc.boot: linux runtime namespace defined (enter linux { ... }, enter debian { ... })'
 
 echo 'rc.boot: init complete -- handing off to interactive shell'

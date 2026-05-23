@@ -125,9 +125,10 @@ build_adder_user passwd               # M16.87: stub (no shadow file)
 build_adder_user login                # M16.87: stub auth hint
 build_adder_user getty                # M16.87: announces + exec /bin/hamsh
 # distrorun RETIRED: the distro-shape namespace is no longer a bespoke
-# launcher binary. /etc/rc.boot defines it as a captured `ns {}` value
-# (`linuxruntime`); a Linux binary is run with plain namespace verbs —
-# `enter linuxruntime { ... }`. See HAMSH_SPEC §0/§11 and etc/rc.boot.
+# launcher binary. /etc/rc.boot defines it as a captured `ns clean {}`
+# value (`linux`, with a `debian` alias for the same body); a Linux
+# binary is run with plain namespace verbs — `enter linux { ... }`.
+# See HAMSH_SPEC §0/§11 and etc/rc.boot.
 build_adder_user hamwd                # Phase D: Hamnix Window Daemon (Layer 3 / 9P file server skeleton)
 build_adder_user p9srv_demo           # Phase D / V4: minimum-viable userspace 9P server (test fixture)
 build_adder_user distrofs             # Plan 9 distro: userland 9P file-server daemon for the distro /var tree

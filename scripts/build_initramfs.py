@@ -464,11 +464,11 @@ def build_archive() -> bytes:
     #   /var/lib/distros/testdistro/etc/debian_version
     # in the cpio archive, ready for `bind` to splice it under a
     # privatised namespace's /etc. The `default` fixture is the
-    # backing /etc/rc.boot's `linuxruntime` namespace recipe grafts —
-    # running a Linux binary is `enter linuxruntime { ... }`, no
-    # bespoke launcher. Real debootstrap-style trees are too large to
-    # commit here — these are the smoke-test fixtures for
-    # scripts/test_distro_namespace.sh.
+    # backing /etc/rc.boot's `linux` namespace recipe grafts —
+    # running a Linux binary is `enter linux { ... }` (or the
+    # `debian` alias), no bespoke launcher. Real debootstrap-style
+    # trees are too large to commit here — these are the smoke-test
+    # fixtures for scripts/test_distro_namespace.sh.
     #
     # SIZE GATE for real debootstrap'd backings:
     # `tests/distros/debian-minbase/rootfs/` is ~80-150 MB of real
