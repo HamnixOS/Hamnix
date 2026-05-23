@@ -141,12 +141,34 @@
 
     /* ---- Compile-time constants -------------------------------------
      *
-     * EFI_MMAP_BUF_SIZE: GetMemoryMap scratch buffer (16 KiB holds
-     * ~341 descriptors at 48 bytes each — far more than any plausible
-     * firmware).
+     * EFI_MMAP_BUF_SIZE: GetMemoryMap scratch buffer.
+     *
+     * Sizing math (UEFI 2.10 §7.2):
+     *   - OVMF returns ~30 descriptors at 48 B = ~1.5 KiB.
+     *   - Real laptop/desktop firmware (Insyde, AMI, Phoenix) routinely
+     *     returns 100..300 descriptors. At the spec-padded 48 B stride
+     *     that's 4.8..14.4 KiB; at the 96/128 B stride some firmware
+     *     uses (room for vendor extensions), 12..38 KiB.
+     *   - Server firmware (Dell, HP, Supermicro) with 1 TiB+ of RAM
+     *     can fan out to 600..1000 descriptors as it slices NUMA nodes
+     *     and persistent-memory regions: up to ~96 KiB at 96 B stride.
+     *
+     * 64 KiB gives ~1365 descriptors at 48 B / ~682 at 96 B / ~512 at
+     * 128 B — covers every laptop/desktop/workstation reasonably and
+     * leaves a healthy margin for future stride growth. The pre-M16.157
+     * 16 KiB sizing was tuned for OVMF (where 16 KiB is 10x what
+     * firmware actually returns) but is dangerously close to the
+     * real-hw ceiling: an Asus i5-4210U whose firmware returns ~200
+     * 96 B descriptors needs 19.2 KiB and immediately overflowed
+     * 16 KiB — GetMemoryMap returned EFI_BUFFER_TOO_SMALL, the stub
+     * (which didn't check the return code) called ExitBootServices
+     * with a stale MapKey, ExitBootServices failed, the retry loop
+     * exhausted, the stub halted. Without serial the user only saw
+     * firmware fall through to its post-boot-fail UI.
      *
      * EFI_EXIT_RETRY_MAX: Bounded retries on ExitBootServices for
-     * MapKey staleness.
+     * MapKey staleness (firmware may allocate between GetMemoryMap
+     * and ExitBootServices, invalidating MapKey — re-fetch and retry).
      *
      * KERNEL_ELF_BUF_SIZE: AllocatePool capacity for the kernel ELF.
      * Today's kernel.elf is ~3.6 MB; reserve 32 MiB to leave room for
@@ -156,12 +178,16 @@
      * HAMNIX_HANDOFF_MAGIC: "HAMX" little-endian, used as a sanity
      * check on the handoff table that arch/x86/boot/header.S plants
      * right after the multiboot1 header.
+     *
+     * EFI_STATUS_BUFFER_TOO_SMALL: UEFI 2.10 Appendix D — the high bit
+     * set in EFI_STATUS marks an error code; 5 is the BUFFER_TOO_SMALL
+     * tag. We only need the bit pattern for an immediate compare.
      */
-    .equ EFI_MMAP_BUF_SIZE,     16384
-    .equ EFI_EXIT_RETRY_MAX,    4
-    .equ KERNEL_ELF_BUF_SIZE,   (32 * 1024 * 1024)
-    .equ HAMNIX_HANDOFF_MAGIC,  0x484D4158      /* "HAMX" */
-    .equ MULTIBOOT1_MAGIC,      0x1BADB002
+    .equ EFI_MMAP_BUF_SIZE,         65536
+    .equ EFI_EXIT_RETRY_MAX,        4
+    .equ KERNEL_ELF_BUF_SIZE,       (32 * 1024 * 1024)
+    .equ HAMNIX_HANDOFF_MAGIC,      0x484D4158  /* "HAMX" */
+    .equ MULTIBOOT1_MAGIC,          0x1BADB002
 
     /* ELF constants (elf64-x86-64 layout — the Hamnix kernel is now a
      * true 64-bit higher-half ELF; see arch/x86/kernel/kernel.lds). */
@@ -640,12 +666,52 @@ efi_main:
 
     /* =================================================================
      * STEP 5+6: GetMemoryMap + ExitBootServices retry loop.
-     * (Unchanged from M16.111. Comments trimmed; see git history for
-     * the full annotation.)
+     *
+     * Hardened for real-hardware UEFI (M16.157):
+     *
+     *   - GetMemoryMap's return value is now CHECKED on every iteration.
+     *     Previously (M16.111..M16.156) the stub blindly called
+     *     ExitBootServices regardless of whether GetMemoryMap succeeded
+     *     — fine on OVMF (whose memory map fits in 1.5 KiB and GetMemoryMap
+     *     never failed) but catastrophic on the Asus i5-4210U whose
+     *     Insyde firmware overflows a 16 KiB buffer with its ~200 96 B
+     *     descriptors. EFI_BUFFER_TOO_SMALL leaves MapKey untouched, so
+     *     ExitBootServices then fails with EFI_INVALID_PARAMETER, the
+     *     retry loop exhausts, the stub halts — silently from a board
+     *     with no serial header.
+     *
+     *   - On GetMemoryMap failure we now print the EFI status code AND
+     *     the firmware-requested buffer size on COM1. This is the smoking
+     *     gun that turns a "ISO doesn't boot" bug-report into a one-line
+     *     "bump EFI_MMAP_BUF_SIZE past N KiB" fix.
+     *
+     *   - On GetMemoryMap failure we DO NOT proceed to ExitBootServices
+     *     with a stale MapKey (would burn through retries for no good
+     *     reason). Instead we tag the kernel handoff "map absent" and
+     *     halt with an explicit diagnostic.
+     *
+     *   - On GetMemoryMap success the in-buffer descriptor array is the
+     *     basis for both ExitBootServices (its MapKey) AND the kernel's
+     *     efi_mmap_info handoff (its descriptor data). The retry path
+     *     re-runs GetMemoryMap to get a fresh MapKey if ExitBootServices
+     *     rejected the prior one — that re-run also produces a fresh
+     *     descriptor array, so the handoff stash after .Lefi_exit_ok
+     *     always reflects the map that ExitBootServices accepted.
+     *
+     * %r15 carries "did the last GetMemoryMap call succeed" across the
+     * exit point so the memmap-handoff code below can gate on it. We
+     * use %r15 (callee-saved in the SysV ABI, and not clobbered by
+     * efi_serial_puts/puthex64) instead of a memory flag so the gate is
+     * cheap.
      * ================================================================= */
     movl    $0, %ebx                        /* retry counter */
+    xorq    %r15, %r15                      /* r15 = last-GetMemoryMap-OK */
 
 .Lefi_exit_retry:
+    /* Always reset the IN/OUT MemoryMapSize to our buffer capacity
+     * before each GetMemoryMap call — firmware overwrites it with
+     * either the bytes-written count (on success) or the required
+     * size (on EFI_BUFFER_TOO_SMALL). */
     movq    $EFI_MMAP_BUF_SIZE, efi_mmap_size(%rip)
 
     leaq    efi_mmap_size(%rip),     %rcx
@@ -660,6 +726,47 @@ efi_main:
     call    *%rax
     addq    $0x30, %rsp
 
+    /* Check GetMemoryMap return value. UEFI 2.10 §7.2.3:
+     *   EFI_SUCCESS               (0)  - MapKey + buffer populated
+     *   EFI_BUFFER_TOO_SMALL (0x...05) - efi_mmap_size = needed bytes;
+     *                                    MapKey UNDEFINED (untouched)
+     *   EFI_INVALID_PARAMETER (0x...02)- bogus pointer (we control the
+     *                                    pointers — should never happen)
+     *
+     * Stash success/failure in %r15: 1 = OK, 0 = failed (kernel handoff
+     * must be skipped + halt with diagnostic). */
+    testq   %rax, %rax
+    jnz     .Lefi_mmap_get_failed
+    movq    $1, %r15
+    jmp     .Lefi_mmap_get_done
+
+.Lefi_mmap_get_failed:
+    /* %rax = error EFI_STATUS. efi_mmap_size = firmware-requested size
+     * if EFI_BUFFER_TOO_SMALL, else stale. Print both — the size value
+     * is the actionable bit for a "bump the buffer" fix.
+     *
+     * %rax is live across efi_serial_puts (which trashes %rax/%rcx/
+     * %rdx/%rsi); stash it in %r14 first. */
+    movq    %rax, %r14                      /* save EFI_STATUS */
+
+    leaq    efi_msg_mmap_get_fail_a(%rip), %rsi
+    call    efi_serial_puts
+    movq    %r14, %rdi                      /* status code */
+    call    efi_serial_puthex64
+    leaq    efi_msg_mmap_get_fail_b(%rip), %rsi
+    call    efi_serial_puts
+    movq    efi_mmap_size(%rip), %rdi       /* firmware-needed size */
+    call    efi_serial_puthex64
+    leaq    efi_msg_mmap_get_fail_c(%rip), %rsi
+    call    efi_serial_puts
+
+    /* Cannot recover: without a valid MapKey ExitBootServices will fail.
+     * Halt with the diagnostic on serial so a hardware-bring-up bug
+     * report can quote the exact required size. The user must enlarge
+     * EFI_MMAP_BUF_SIZE past that value and rebuild. */
+    jmp     .Lefi_halt
+
+.Lefi_mmap_get_done:
     movq    efi_image_handle(%rip), %rcx
     movq    efi_mmap_key(%rip),     %rdx
     movq    efi_boot_services(%rip), %rax
@@ -671,6 +778,12 @@ efi_main:
     testq   %rax, %rax
     jz      .Lefi_exit_ok
 
+    /* ExitBootServices rejected the MapKey (typically because firmware
+     * allocated between GetMemoryMap and here, invalidating it). Bound
+     * the retry — on each iteration we re-call GetMemoryMap to grab a
+     * fresh MapKey (and a fresh descriptor array, which the kernel
+     * handoff downstream wants anyway). */
+    xorq    %r15, %r15                      /* clear: this iter's map is stale */
     incl    %ebx
     cmpl    $EFI_EXIT_RETRY_MAX, %ebx
     jb      .Lefi_exit_retry
@@ -718,10 +831,26 @@ efi_main:
      *
      * Write `present` LAST so a reader can never see a half-populated
      * record. The kernel is single-threaded at this point so the
-     * ordering is mostly self-documenting, but cheap and correct. */
+     * ordering is mostly self-documenting, but cheap and correct.
+     *
+     * Two skip-paths land at .Lefi_mmap_handoff_skip:
+     *   (a) kernel handoff table has no +68 slot (pre-M16.155 kernel).
+     *       efi_kernel_mmap_info_ptr is zero; %r10 == 0 after the load.
+     *   (b) the last GetMemoryMap before the successful ExitBootServices
+     *       did NOT succeed (only possible today via a path we explicitly
+     *       reject above, but the gate is cheap defence-in-depth and
+     *       documents the invariant: "present=1 implies efi_mmap_buf
+     *       contains the descriptor array ExitBootServices accepted").
+     *       %r15 == 0 on this path.
+     *
+     * In both skip cases the kernel's e820_init falls back to the
+     * conservative 2..240 MiB window (e820.ad EFI_FALLBACK_* — still
+     * enough to bring up hamsh, just no >240 MiB RAM unlock). */
     movq    efi_kernel_mmap_info_ptr(%rip), %r10
     testq   %r10, %r10
     jz      .Lefi_mmap_handoff_skip         /* old kernel, no +68 slot */
+    testq   %r15, %r15
+    jz      .Lefi_mmap_handoff_skip         /* last GetMemoryMap not OK */
 
     /* desc_size (u32) */
     movq    efi_mmap_descsize(%rip), %rax
@@ -1014,6 +1143,55 @@ efi_serial_puts:
     ret
 
 
+/* efi_serial_puthex64:
+ *   %rdi = 64-bit value to render as 16 ASCII hex digits ("0x" prefix
+ *          NOT emitted — caller is expected to print the literal "0x"
+ *          out of an .rdata string so the prefix can vary).
+ *   Trashes: %rax, %rcx, %rdx, %rsi, %rdi
+ *
+ * Used by the GetMemoryMap failure path to surface the EFI_STATUS code
+ * and the firmware-requested buffer size on the COM1 serial console.
+ * Sixteen always-fixed-width digits keeps the log line aligned across
+ * runs — easy to grep, easy to eyeball.
+ *
+ * Algorithm: walk the nibble shift count from 60 down to 0 in steps of
+ * 4 (most-significant first), mask off the low 4 bits, map 0..9 -> '0'..'9'
+ * and 10..15 -> 'a'..'f', then funnel through the per-byte UART
+ * THR-wait loop. */
+efi_serial_puthex64:
+    movl    $60, %ecx                       /* shift count: 60, 56, ..., 0 */
+.Lputhex_next:
+    movq    %rdi, %rax
+    shrq    %cl, %rax
+    andl    $0x0F, %eax                     /* nibble */
+    cmpl    $10, %eax
+    jb      .Lputhex_digit
+    addl    $('a' - '0' - 10), %eax
+.Lputhex_digit:
+    addl    $'0', %eax                      /* %al = ASCII hex char */
+
+    /* Stash the digit in %sil (low byte of %rsi — clobbered per the
+     * documented ABI of this helper) before the LSR-poll loop, because
+     * `inb` writes to %al and would otherwise overwrite the digit. */
+    movb    %al, %sil
+
+    /* Poll LSR bit 5 (THR empty) before writing the byte. */
+    movw    $0x3FD, %dx
+.Lputhex_wait:
+    inb     %dx, %al
+    testb   $0x20, %al
+    jz      .Lputhex_wait
+
+    /* THR empty — restore the digit from %sil and emit it on COM1. */
+    movb    %sil, %al
+    movw    $0x3F8, %dx
+    outb    %al, %dx
+
+    subl    $4, %ecx                        /* next nibble */
+    jns     .Lputhex_next                   /* until ecx underflows (-4) */
+    ret
+
+
 /* ---------- Read-only data --------------------------------------- *
  *
  * Note: PE/COFF object files written by `ld -m i386pep` group .rodata
@@ -1056,6 +1234,21 @@ efi_msg_mmap_ok:
     .asciz  "[hamnix] EFI: memory map handed off\r\n"
 efi_msg_mmap_skip:
     .asciz  "[hamnix] EFI: kernel has no efi_mmap_info slot (skipped)\r\n"
+    /* M16.157: dense diagnostic for the "Asus boots GRUB instead of
+     * Hamnix" bug. Printed as three glued fragments so we can splice
+     * the EFI_STATUS code and the firmware-requested byte count between
+     * them via efi_serial_puthex64. The full line ends up like
+     *
+     *   [hamnix] EFI: GetMemoryMap FAILED status=0x8000000000000005 needs=0x00000000000064b8 bytes; halt
+     *
+     * The "needs=" value is the actionable bit: if firmware wants more
+     * than EFI_MMAP_BUF_SIZE, bump the constant past it and rebuild. */
+efi_msg_mmap_get_fail_a:
+    .asciz  "[hamnix] EFI: GetMemoryMap FAILED status=0x"
+efi_msg_mmap_get_fail_b:
+    .asciz  " needs=0x"
+efi_msg_mmap_get_fail_c:
+    .asciz  " bytes; halt\r\n"
 
     /* UEFI protocol GUIDs (16-byte structures, little-endian on x86).
      *
