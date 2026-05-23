@@ -485,6 +485,75 @@ header is worth it. Otherwise: phone camera, every time.
 These are actively-tracked issues. If your box matches, comment on the
 existing issue rather than filing a new one.
 
+### xHCI live init is auto-skipped on bare metal (DEFAULT)
+
+- **Symptom on default build:** On bare-metal x86_64 (Intel NUC,
+  Asus i5-4210U, and any physical box without the explicit
+  force-init opt-in), the console prints
+  `[xhci] live init auto-skipped: bare-metal hardware (real-silicon
+  MMIO stall in _xhci_v1_bringup; see docs/REAL_HARDWARE.md). Force
+  with ENABLE_XHCI_FORCE_INIT=1.`
+  Boot then continues past `xhci_init`, runs `ehci_init`, reaches
+  `hamsh`. USB keyboards via xHCI do NOT work this boot — the
+  controller's BAR was never even mapped. PS/2 keyboard (atkbd via
+  i8042), serial-console input, the framebuffer console, and the
+  VGA text console all work unchanged.
+- **What gets auto-detected:** the kernel reads CPUID leaf
+  `0x40000000` — the conventional hypervisor information leaf. Every
+  commonly-deployed hypervisor (KVM, QEMU TCG, VMware, Hyper-V, Xen)
+  stashes a vendor signature in EBX/ECX/EDX there
+  (`KVMKVMKVM\0\0\0`, `TCGTCGTCGTCG`, `VMwareVMware`, `Microsoft Hv`,
+  `XenVMMXenVMM`). Real silicon leaves EBX = 0. Predicate: EBX == 0
+  means bare metal; auto-skip applies. (The companion signal,
+  CPUID.1:ECX bit 31 "hypervisor present", agrees in every case we
+  tested — we use EBX == 0 because it's strictly stronger.)
+- **Why the auto-skip exists:** on the Intel NUC tested 2026-05, the
+  HCH-clear MMIO poll inside `_xhci_v1_bringup` (drivers/usb/xhci.ad)
+  never returns — the `inq` of `USBSTS` parks the CPU because the
+  load instruction itself does not retire. No software-side spin
+  counter or timeout can help: control never returns from the `mov`
+  to the kernel. The Asus i5-4210U exhibits the same class of hang
+  at the halt+reset poll. Before this change the only way to boot
+  these machines was to rebuild the ISO with `ENABLE_XHCI_NO_INIT=1`;
+  now the default build boots them.
+- **How to force live xHCI on bare metal:** rebuild the ISO with
+  `ENABLE_XHCI_FORCE_INIT=1 bash scripts/build_iso.sh`. The marker
+  `/etc/xhci-force-init` is planted in the initramfs and
+  `xhci_init()` runs the live bringup path — including the BAR-MMIO
+  halt+reset poll. **You are accepting the risk that the box will
+  hang at `[boot:01.c] xhci halt + reset` if your controller behaves
+  like the NUC's.** Use only on silicon where you've already
+  validated the xHCI path works (or where you're actively
+  debugging xHCI on real hardware and want the hang to surface).
+- **How to skip xHCI entirely (existing escape hatch):** rebuild
+  with `ENABLE_XHCI_NO_INIT=1 bash scripts/build_iso.sh`. The marker
+  `/etc/xhci-no-init` is planted and `xhci_init()` returns
+  immediately after the safe PCI find / print, before any BAR
+  access. Functionally identical to the new bare-metal default for
+  the explicit-config case.
+- **Decision matrix** inside `xhci_init` (drivers/usb/xhci.ad):
+
+  | `/etc/xhci-no-init` | `/etc/xhci-force-init` | bare metal | Action                                    |
+  | ------------------- | ---------------------- | ---------- | ----------------------------------------- |
+  | present             | *                      | *          | skip (legacy `xhci-no-init` escape hatch) |
+  | absent              | present                | *          | run live xHCI (force-enable override)     |
+  | absent              | absent                 | yes        | skip (NEW auto-detect default)            |
+  | absent              | absent                 | no         | run live xHCI (QEMU / known-good path)    |
+
+- **What we lose by skipping:** USB HID keyboard via xHCI. The PS/2
+  atkbd path and serial-console input keep working. EHCI (USB 2.0)
+  is a separate driver and runs unconditionally after `xhci_init`
+  returns — if your laptop's built-in keyboard is routed through
+  EHCI (the leading hypothesis for the Asus i5-4210U), the EHCI
+  driver gets its shot. If EHCI also wedges on bare metal, that's
+  the next thing we fix.
+- **Long-term plan:** the real fix is a hardware-level diagnostic
+  pinpointing which specific MMIO operation in `_xhci_v1_bringup`
+  is stalling on the NUC's silicon, plus an alternative bringup
+  sequence that respects whatever BIOS-handoff state the NUC's
+  firmware leaves the controller in. Until then, the auto-skip is
+  the workaround.
+
 ### Asus i5-4210U — built-in keyboard does not work (OPEN)
 
 - **Symptom:** Hamnix boots all the way to the `hamsh` shell on this
