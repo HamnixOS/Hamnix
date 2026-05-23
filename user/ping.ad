@@ -1,0 +1,584 @@
+# user/ping.ad
+#
+# ICMP Echo client — the native Adder equivalent of POSIX `ping`. Done
+# the Plan 9 way: opens /net/icmp/clone, writes a `connect <a.b.c.d>`
+# ctl command, then loops over writes-of-payload + reads-of-reply on
+# the conn's `data` file. NO sys_ping / SYS_ICMP_* syscall — ICMP is
+# the third proto on the /net file tree (drivers/net/devnet.ad), same
+# shape /net/tcp and /net/udp have.
+#
+# Usage:
+#   ping [-c <count>] [-i <interval-ms>] <host>
+#
+#   -c <count>    stop after <count> requests. 0 (the default) is
+#                 "run forever — Ctrl-C to stop". The atkbd path
+#                 maps Ctrl-C to SIGINT now, so an interactive
+#                 ping terminates cleanly.
+#   -i <ms>       inter-request interval. Default 1000 ms.
+#   <host>        IPv4 dotted-quad OR a DNS name. A name goes through
+#                 sys_resolve (in-kernel resolver, drivers/net/dns.ad).
+#
+# RTT reporting (see /net/icmp schema in drivers/net/devnet.ad's
+# header): after each reply the userland reads the conn's `status`
+# file, parses `last_rtt_ms=` and `last_ttl=`, and renders the
+# customary line
+#
+#   64 bytes from 8.8.8.8: icmp_seq=1 ttl=N time=12 ms
+#
+# On `-c` exhaustion (or SIGINT / EOF), prints a summary:
+#
+#   --- 8.8.8.8 ping statistics ---
+#   3 packets transmitted, 3 received, 0% packet loss,
+#   rtt min/avg/max = 11/12/14 ms
+#
+# Compiler-quirk notes: all sizeable buffers are top-level BSS Arrays
+# (U9 nested-frame-Array miscompile); no adjacent string-literal
+# concatenation. Single-shot binary — not reentrant.
+
+from user.net9 import (
+    net_icmp_dial_data, net_icmp_open_status,
+)
+
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_close(fd: int32) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_get_jiffies() -> uint64
+# Native-ABI DNS resolver. Returns the IPv4 packed into the low 32
+# bits of the result (octet 0 in bits 31:24); negative on a lookup
+# failure / timeout. apt.ad uses the same primitive.
+extern def sys_resolve(hostname: Ptr[uint8], hlen: uint64) -> int64
+
+
+# -- top-level BSS buffers (Adder U9 quirk: never nest Arrays) -------
+
+# Echo Request payload sent each iteration. 32 bytes mirrors the
+# classic glibc ping payload size, kept under 56 bytes so the
+# /net/icmp 512-byte reply cap has plenty of headroom.
+PING_PAYLOAD: uint64 = 32
+ping_tx_buf: Array[32, uint8]
+# Reply scratch — a /net/icmp data read returns the bytes the peer
+# echoed (header stripped). 512 matches ICMP_REPLY_MAX in icmp.ad.
+ping_rx_buf: Array[512, uint8]
+# Status-line scratch — the /net/icmp status renderer fits in ~120
+# bytes; 256 gives headroom.
+ping_status_buf: Array[256, uint8]
+# Output-line scratch for the printed result line.
+ping_out_buf: Array[256, uint8]
+# Resolved hostname scratch (RFC 1035 caps a name at 253 chars + NUL).
+ping_host_buf: Array[256, uint8]
+
+
+def _strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, _strlen(s))
+
+
+def _emit_u64(out: Ptr[uint8], off: uint64, v: uint64) -> uint64:
+    if v == 0:
+        out[off] = 48                           # '0'
+        return off + 1
+    digs: Array[24, uint8]
+    n: uint64 = 0
+    x: uint64 = v
+    while x > 0:
+        digs[n] = cast[uint8](48 + (x % 10))
+        x = x / 10
+        n = n + 1
+    i: uint64 = n
+    while i > 0:
+        i = i - 1
+        out[off] = digs[i]
+        off = off + 1
+    return off
+
+
+def _emit_ip(out: Ptr[uint8], off: uint64,
+             b0: uint8, b1: uint8, b2: uint8, b3: uint8) -> uint64:
+    off = _emit_u64(out, off, cast[uint64](b0))
+    out[off] = 46                               # '.'
+    off = off + 1
+    off = _emit_u64(out, off, cast[uint64](b1))
+    out[off] = 46
+    off = off + 1
+    off = _emit_u64(out, off, cast[uint64](b2))
+    out[off] = 46
+    off = off + 1
+    off = _emit_u64(out, off, cast[uint64](b3))
+    return off
+
+
+def _parse_uint(s: Ptr[uint8]) -> int64:
+    # Returns -1 on a non-numeric / empty input.
+    if s[0] == 0:
+        return -1
+    v: uint64 = 0
+    i: uint64 = 0
+    while s[i] != 0:
+        c: uint8 = s[i]
+        if c < 48 or c > 57:
+            return -1
+        v = v * 10 + cast[uint64](c - 48)
+        i = i + 1
+    return cast[int64](v)
+
+
+def _try_parse_ipv4(s: Ptr[uint8], out: Ptr[uint8]) -> int32:
+    # Try to parse `s` as "a.b.c.d". Returns 0 on success (octets
+    # written into out[0..3]), -1 on any malformed input.
+    octet: uint64 = 0
+    seen_digit: int32 = 0
+    idx: uint64 = 0
+    i: uint64 = 0
+    while s[i] != 0:
+        c: uint8 = s[i]
+        if c == 46:                             # '.'
+            if seen_digit == 0:
+                return -1
+            if idx >= 3:
+                return -1
+            if octet > 255:
+                return -1
+            out[idx] = cast[uint8](octet)
+            idx = idx + 1
+            octet = 0
+            seen_digit = 0
+        elif c >= 48 and c <= 57:
+            octet = octet * 10 + cast[uint64](c - 48)
+            seen_digit = 1
+            if octet > 255:
+                return -1
+        else:
+            return -1
+        i = i + 1
+    if seen_digit == 0:
+        return -1
+    if idx != 3:
+        return -1
+    out[3] = cast[uint8](octet)
+    return 0
+
+
+def _resolve_host(host: Ptr[uint8], out_octets: Ptr[uint8]) -> int32:
+    # Resolve a string into 4 octets. Tries dotted-quad first; falls
+    # back to sys_resolve. Returns 0 on success, -1 on a lookup
+    # failure (timeout / NXDOMAIN / no network).
+    if _try_parse_ipv4(host, out_octets) == 0:
+        return 0
+    hlen: uint64 = _strlen(host)
+    # Copy into the BSS scratch — sys_resolve dereferences its arg.
+    i: uint64 = 0
+    while i < hlen and i + 1 < 256:
+        ping_host_buf[i] = host[i]
+        i = i + 1
+    ping_host_buf[i] = 0
+    rc: int64 = sys_resolve(&ping_host_buf[0], i)
+    if rc < 0:
+        return -1
+    ip32: uint32 = cast[uint32](rc & 0xFFFFFFFF)
+    out_octets[0] = cast[uint8]((ip32 >> 24) & 0xFF)
+    out_octets[1] = cast[uint8]((ip32 >> 16) & 0xFF)
+    out_octets[2] = cast[uint8]((ip32 >> 8) & 0xFF)
+    out_octets[3] = cast[uint8](ip32 & 0xFF)
+    return 0
+
+
+def _status_find(buf: Ptr[uint8], buf_len: uint64,
+                 key: Ptr[uint8]) -> int64:
+    # Look up "key=" in `buf` and return the decimal value that
+    # follows. Returns -1 on a miss. The status line is short and
+    # space-separated — a linear walk is fine.
+    klen: uint64 = _strlen(key)
+    i: uint64 = 0
+    while i + klen + 1 <= buf_len:
+        # Match key[..] then '='.
+        hit: int32 = 1
+        j: uint64 = 0
+        while j < klen:
+            if buf[i + j] != key[j]:
+                hit = 0
+                j = klen                        # break
+            else:
+                j = j + 1
+        if hit == 1:
+            if buf[i + klen] == 61:             # '='
+                p: uint64 = i + klen + 1
+                if p >= buf_len:
+                    return -1
+                if buf[p] < 48 or buf[p] > 57:
+                    return -1
+                v: uint64 = 0
+                while p < buf_len:
+                    c: uint8 = buf[p]
+                    if c < 48 or c > 57:
+                        break
+                    v = v * 10 + cast[uint64](c - 48)
+                    p = p + 1
+                return cast[int64](v)
+        i = i + 1
+    return -1
+
+
+def _read_status_metrics(status_fd: int32, out_seq: Ptr[uint64],
+                         out_ttl: Ptr[uint64],
+                         out_rtt_ms: Ptr[uint64]) -> int32:
+    # Read one snapshot of the status line + parse out the metrics.
+    # The kernel's status renderer is one line of ASCII; a single
+    # sys_read of up to 256 bytes captures it. Returns 0 on success.
+    n: int64 = sys_read(status_fd, &ping_status_buf[0], 256)
+    if n <= 0:
+        return -1
+    blen: uint64 = cast[uint64](n)
+    sv: int64 = _status_find(&ping_status_buf[0], blen, "last_seq")
+    tv: int64 = _status_find(&ping_status_buf[0], blen, "last_ttl")
+    rv: int64 = _status_find(&ping_status_buf[0], blen, "last_rtt_ms")
+    if sv < 0 or tv < 0 or rv < 0:
+        return -1
+    out_seq[0]    = cast[uint64](sv)
+    out_ttl[0]    = cast[uint64](tv)
+    out_rtt_ms[0] = cast[uint64](rv)
+    return 0
+
+
+# -- min / max / sum accumulators (top-level — reentrancy is fine for
+#    a single-shot binary) ---------------------------------------------
+ping_min_rtt: uint64 = 0
+ping_max_rtt: uint64 = 0
+ping_sum_rtt: uint64 = 0
+ping_have_rtt: int32 = 0
+
+
+def _record_rtt(rtt_ms: uint64):
+    if ping_have_rtt == 0:
+        ping_min_rtt = rtt_ms
+        ping_max_rtt = rtt_ms
+        ping_sum_rtt = rtt_ms
+        ping_have_rtt = 1
+        return
+    if rtt_ms < ping_min_rtt:
+        ping_min_rtt = rtt_ms
+    if rtt_ms > ping_max_rtt:
+        ping_max_rtt = rtt_ms
+    ping_sum_rtt = ping_sum_rtt + rtt_ms
+
+
+def _print_summary(b0: uint8, b1: uint8, b2: uint8, b3: uint8,
+                   tx_pkts: uint64, rx_pkts: uint64):
+    # "--- <host> ping statistics ---" + counts + rtt rollup.
+    off: uint64 = 0
+    pfx: Ptr[uint8] = "\n--- "
+    pi: uint64 = 0
+    while pfx[pi] != 0:
+        ping_out_buf[off] = pfx[pi]
+        off = off + 1
+        pi = pi + 1
+    off = _emit_ip(&ping_out_buf[0], off, b0, b1, b2, b3)
+    suf: Ptr[uint8] = " ping statistics ---\n"
+    si: uint64 = 0
+    while suf[si] != 0:
+        ping_out_buf[off] = suf[si]
+        off = off + 1
+        si = si + 1
+    off = _emit_u64(&ping_out_buf[0], off, tx_pkts)
+    s2: Ptr[uint8] = " packets transmitted, "
+    si = 0
+    while s2[si] != 0:
+        ping_out_buf[off] = s2[si]
+        off = off + 1
+        si = si + 1
+    off = _emit_u64(&ping_out_buf[0], off, rx_pkts)
+    s3: Ptr[uint8] = " received, "
+    si = 0
+    while s3[si] != 0:
+        ping_out_buf[off] = s3[si]
+        off = off + 1
+        si = si + 1
+    loss_pct: uint64 = 0
+    if tx_pkts > 0:
+        lost: uint64 = 0
+        if tx_pkts >= rx_pkts:
+            lost = tx_pkts - rx_pkts
+        loss_pct = (lost * 100) / tx_pkts
+    off = _emit_u64(&ping_out_buf[0], off, loss_pct)
+    s4: Ptr[uint8] = "% packet loss\n"
+    si = 0
+    while s4[si] != 0:
+        ping_out_buf[off] = s4[si]
+        off = off + 1
+        si = si + 1
+    if ping_have_rtt == 1 and rx_pkts > 0:
+        s5: Ptr[uint8] = "rtt min/avg/max = "
+        si = 0
+        while s5[si] != 0:
+            ping_out_buf[off] = s5[si]
+            off = off + 1
+            si = si + 1
+        off = _emit_u64(&ping_out_buf[0], off, ping_min_rtt)
+        ping_out_buf[off] = 47                  # '/'
+        off = off + 1
+        off = _emit_u64(&ping_out_buf[0], off, ping_sum_rtt / rx_pkts)
+        ping_out_buf[off] = 47
+        off = off + 1
+        off = _emit_u64(&ping_out_buf[0], off, ping_max_rtt)
+        s6: Ptr[uint8] = " ms\n"
+        si = 0
+        while s6[si] != 0:
+            ping_out_buf[off] = s6[si]
+            off = off + 1
+            si = si + 1
+    sys_write(1, &ping_out_buf[0], off)
+
+
+def _print_reply(b0: uint8, b1: uint8, b2: uint8, b3: uint8,
+                 payload_bytes: uint64, seq: uint64, ttl: uint64,
+                 rtt_ms: uint64):
+    # Render "<N> bytes from <ip>: icmp_seq=<N> ttl=<N> time=<N> ms\n".
+    off: uint64 = 0
+    off = _emit_u64(&ping_out_buf[0], off, payload_bytes)
+    pfx: Ptr[uint8] = " bytes from "
+    pi: uint64 = 0
+    while pfx[pi] != 0:
+        ping_out_buf[off] = pfx[pi]
+        off = off + 1
+        pi = pi + 1
+    off = _emit_ip(&ping_out_buf[0], off, b0, b1, b2, b3)
+    s2: Ptr[uint8] = ": icmp_seq="
+    si: uint64 = 0
+    while s2[si] != 0:
+        ping_out_buf[off] = s2[si]
+        off = off + 1
+        si = si + 1
+    off = _emit_u64(&ping_out_buf[0], off, seq)
+    s3: Ptr[uint8] = " ttl="
+    si = 0
+    while s3[si] != 0:
+        ping_out_buf[off] = s3[si]
+        off = off + 1
+        si = si + 1
+    off = _emit_u64(&ping_out_buf[0], off, ttl)
+    s4: Ptr[uint8] = " time="
+    si = 0
+    while s4[si] != 0:
+        ping_out_buf[off] = s4[si]
+        off = off + 1
+        si = si + 1
+    off = _emit_u64(&ping_out_buf[0], off, rtt_ms)
+    s5: Ptr[uint8] = " ms\n"
+    si = 0
+    while s5[si] != 0:
+        ping_out_buf[off] = s5[si]
+        off = off + 1
+        si = si + 1
+    sys_write(1, &ping_out_buf[0], off)
+
+
+def _print_timeout(b0: uint8, b1: uint8, b2: uint8, b3: uint8,
+                   seq: uint64):
+    off: uint64 = 0
+    pfx: Ptr[uint8] = "Request timeout for icmp_seq "
+    pi: uint64 = 0
+    while pfx[pi] != 0:
+        ping_out_buf[off] = pfx[pi]
+        off = off + 1
+        pi = pi + 1
+    off = _emit_u64(&ping_out_buf[0], off, seq)
+    s2: Ptr[uint8] = " (peer "
+    si: uint64 = 0
+    while s2[si] != 0:
+        ping_out_buf[off] = s2[si]
+        off = off + 1
+        si = si + 1
+    off = _emit_ip(&ping_out_buf[0], off, b0, b1, b2, b3)
+    s3: Ptr[uint8] = ")\n"
+    si = 0
+    while s3[si] != 0:
+        ping_out_buf[off] = s3[si]
+        off = off + 1
+        si = si + 1
+    sys_write(1, &ping_out_buf[0], off)
+
+
+def _usage() -> int32:
+    _write_str(2, "usage: ping [-c <count>] [-i <interval-ms>] <host>\n")
+    return 1
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    # argv parsing: simple two-flag-and-positional. No clever getopt;
+    # exactly enough for the documented usage.
+    count: uint64 = 0                            # 0 == run forever
+    interval_ms: uint64 = 1000
+    host_arg: Ptr[uint8] = cast[Ptr[uint8]](0)
+    i: int32 = 1
+    while i < argc:
+        a: Ptr[uint8] = cast[Ptr[uint8]](argv[cast[uint64](i)])
+        if a[0] == 45 and a[1] == 99 and a[2] == 0:    # "-c"
+            if i + 1 >= argc:
+                return _usage()
+            cv: int64 = _parse_uint(
+                cast[Ptr[uint8]](argv[cast[uint64](i + 1)]))
+            if cv < 0:
+                return _usage()
+            count = cast[uint64](cv)
+            i = i + 2
+        elif a[0] == 45 and a[1] == 105 and a[2] == 0: # "-i"
+            if i + 1 >= argc:
+                return _usage()
+            iv: int64 = _parse_uint(
+                cast[Ptr[uint8]](argv[cast[uint64](i + 1)]))
+            if iv < 0:
+                return _usage()
+            interval_ms = cast[uint64](iv)
+            i = i + 2
+        else:
+            if host_arg != cast[Ptr[uint8]](0):
+                return _usage()
+            host_arg = a
+            i = i + 1
+    if host_arg == cast[Ptr[uint8]](0):
+        return _usage()
+
+    # Resolve.
+    octets: Array[4, uint8]
+    if _resolve_host(host_arg, &octets[0]) != 0:
+        _write_str(2, "ping: cannot resolve ")
+        _write_str(2, host_arg)
+        _write_str(2, "\n")
+        return 1
+    b0: uint8 = octets[0]
+    b1: uint8 = octets[1]
+    b2: uint8 = octets[2]
+    b3: uint8 = octets[3]
+
+    # Banner: "PING <host> (<ip>): <N> data bytes".
+    off: uint64 = 0
+    p1: Ptr[uint8] = "PING "
+    pi: uint64 = 0
+    while p1[pi] != 0:
+        ping_out_buf[off] = p1[pi]
+        off = off + 1
+        pi = pi + 1
+    hl: uint64 = _strlen(host_arg)
+    hj: uint64 = 0
+    while hj < hl:
+        ping_out_buf[off] = host_arg[hj]
+        off = off + 1
+        hj = hj + 1
+    p2: Ptr[uint8] = " ("
+    pi = 0
+    while p2[pi] != 0:
+        ping_out_buf[off] = p2[pi]
+        off = off + 1
+        pi = pi + 1
+    off = _emit_ip(&ping_out_buf[0], off, b0, b1, b2, b3)
+    p3: Ptr[uint8] = "): "
+    pi = 0
+    while p3[pi] != 0:
+        ping_out_buf[off] = p3[pi]
+        off = off + 1
+        pi = pi + 1
+    off = _emit_u64(&ping_out_buf[0], off, PING_PAYLOAD)
+    p4: Ptr[uint8] = " data bytes\n"
+    pi = 0
+    while p4[pi] != 0:
+        ping_out_buf[off] = p4[pi]
+        off = off + 1
+        pi = pi + 1
+    sys_write(1, &ping_out_buf[0], off)
+
+    # Dial the conn. Identifier 0 = let the kernel auto-assign.
+    # net_icmp_dial_data opens clone + ctl, writes `connect <ip>`,
+    # opens data, returns the data fd. The data fd alone keeps the
+    # conn alive; closing it triggers teardown.
+    connN_box: Array[1, int64]
+    connN_box[0] = 0
+    data_fd: int32 = net_icmp_dial_data(b0, b1, b2, b3, 0,
+                                        &connN_box[0])
+    if data_fd < 0:
+        _write_str(2, "ping: cannot open /net/icmp conn\n")
+        return 1
+    cu: uint64 = cast[uint64](connN_box[0])
+    status_fd: int32 = net_icmp_open_status(cu)
+    if status_fd < 0:
+        _write_str(2, "ping: cannot open /net/icmp status file\n")
+        sys_close(data_fd)
+        return 1
+
+    # Fill the tx payload with a recognisable byte pattern (the
+    # classic 0x00..0x1f ramp glibc-ping uses; the kernel checksums
+    # the request, the peer echoes it verbatim).
+    bi: uint64 = 0
+    while bi < PING_PAYLOAD:
+        ping_tx_buf[bi] = cast[uint8](bi & 0xFF)
+        bi = bi + 1
+
+    # Per-request loop.
+    tx_pkts: uint64 = 0
+    rx_pkts: uint64 = 0
+    seq: uint64 = 0
+    while count == 0 or tx_pkts < count:
+        # Reopen the status fd before each cycle so its one-shot
+        # snapshot is fresh (fs/vfs.ad gates the second read on
+        # fd_pos > 0).
+        sys_close(status_fd)
+        status_fd = net_icmp_open_status(cu)
+        if status_fd < 0:
+            _write_str(2, "ping: status reopen failed\n")
+            sys_close(data_fd)
+            return 1
+        # Send one Echo Request.
+        seq = seq + 1
+        wr: int64 = sys_write(data_fd, &ping_tx_buf[0], PING_PAYLOAD)
+        if wr < 0:
+            _write_str(2, "ping: send failed\n")
+            sys_close(status_fd)
+            sys_close(data_fd)
+            return 1
+        tx_pkts = tx_pkts + 1
+        # Block on a reply. devnet_data_read blocks up to ~5 s on a
+        # /net data fd and returns 0 on a timeout — treat that as the
+        # standard ping "Request timeout" line and move on.
+        n: int64 = sys_read(data_fd, &ping_rx_buf[0], 512)
+        if n > 0:
+            rx_pkts = rx_pkts + 1
+            # Pull the reply's seq/ttl/rtt from the status snapshot.
+            sys_close(status_fd)
+            status_fd = net_icmp_open_status(cu)
+            rep_seq: uint64 = 0
+            rep_ttl: uint64 = 0
+            rep_rtt: uint64 = 0
+            if status_fd >= 0:
+                _read_status_metrics(status_fd, &rep_seq, &rep_ttl,
+                                     &rep_rtt)
+            if rep_seq == 0:
+                rep_seq = seq                    # status not ready yet
+            _record_rtt(rep_rtt)
+            _print_reply(b0, b1, b2, b3,
+                         cast[uint64](n), rep_seq, rep_ttl, rep_rtt)
+        else:
+            _print_timeout(b0, b1, b2, b3, seq)
+        # Inter-request delay. 100 Hz jiffies tick → 10 ms granularity.
+        # A delay of 0 (interval_ms == 0) flat-loops without sleeping.
+        if interval_ms > 0:
+            if count == 0 or tx_pkts < count:
+                target: uint64 = interval_ms / 10
+                if target == 0:
+                    target = 1
+                start: uint64 = sys_get_jiffies()
+                while sys_get_jiffies() - start < target:
+                    pass
+
+    _print_summary(b0, b1, b2, b3, tx_pkts, rx_pkts)
+    sys_close(status_fd)
+    # Closing data is the last reference into the conn; the kernel
+    # tears it down (frees the icmp slot).
+    sys_close(data_fd)
+    if rx_pkts == 0:
+        return 1
+    return 0

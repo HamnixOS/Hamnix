@@ -145,6 +145,15 @@ if os.environ.get("ENABLE_NETCFG_SMOKE") == "1":
 if os.environ.get("ENABLE_XHCI_SELFTEST") == "1":
     FILES.append(("/etc/xhci-selftest", b"1\n"))
 
+# Native `ping` smoke. scripts/test_ping.sh sets ENABLE_PING_SMOKE=1 to
+# plant /etc/ping-smoke-test in the initramfs. The marker is consumed
+# only by the test harness today (a future kernel-side autorun could
+# gate on it the way ENABLE_NETCFG_SMOKE does for /etc/netcfg-test).
+# Default boot omits the marker so unrelated test runs don't change
+# shape.
+if os.environ.get("ENABLE_PING_SMOKE") == "1":
+    FILES.append(("/etc/ping-smoke-test", b"1\n"))
+
 # HTTP 3xx redirect-follow smoke. Gated the same way as the markers
 # above. scripts/test_net_http_redirect.sh stands up a Python HTTP
 # server that 302s to a same-host /final endpoint serving "hello";
