@@ -293,6 +293,89 @@ sink_fd:           int32 = -1
 sink_written:      uint64 = 0
 sink_persist_full: int32 = 1
 
+# -- sharded persistence (whole-index cache) --------------------------
+#
+# The tmpfs per-file cap (PKG_CAP, 512 KiB) caps the leading-stanzas
+# /tmp/apt/Packages mirror at 512 KiB. A live Debian main/binary-amd64
+# index inflates to ~56 MiB across ~68k stanzas — alphabetically that
+# truncates somewhere around "and", so `apt show bash` / `apt install
+# nginx` against the live mirror would miss everything past the cap.
+#
+# Fix: ALONGSIDE the legacy single-file leading mirror, persist the
+# WHOLE inflated index as a sequence of shards `/tmp/apt/p/000`,
+# `/tmp/apt/p/001`, ... — each up to SHARD_CAP bytes (the same tmpfs
+# per-file cap). Shards cut on RFC822 stanza boundaries so each shard
+# is a self-contained run of stanzas; a single stanza never straddles
+# two shards. A tiny `/tmp/apt/Packages.idx` text file records the
+# count + the FIRST `Package:` name of each shard, sufficient for
+# `apt show` / `apt install` to binary-search the right shard in
+# O(log SHARDS) (~7 string compares for 128 shards) then linear-scan
+# that ONE shard for the stanza. Total RAM during a query: one shard
+# loaded into pkg_buf (512 KiB) + the few-KB index — no different from
+# the legacy single-file path.
+#
+# A real Debian Packages index is already sorted alphabetically by
+# Package name, so the shard-first-names form a sorted dispatch table
+# directly; we don't need to sort anything post-hoc.
+#
+# Bounds:
+#   SHARD_CAP        = 524288 (PKG_CAP — the tmpfs per-file cap)
+#   SHARD_MAX        = 128    (128 * 512 KiB = 64 MiB, fits real `main`)
+#   SHARD_NAME_CAP   = 64     (Debian Package: names are ≤32 chars in
+#                              practice; 64 leaves comfortable headroom)
+#   STANZA_BUF_CAP   = 131072 (one stanza accumulated before flushing
+#                              to a shard; avg Debian stanza is ~820 B
+#                              but the largest in stable/main runs
+#                              ~76 KiB after multiline wrapping of
+#                              `Description-md5` / long `Depends:`
+#                              chains. 128 KiB clears that with
+#                              headroom for future growth.)
+#
+# A stanza larger than STANZA_BUF_CAP is treated as "shard overflow"
+# (shard_overflow=1) — the rest of the stream is still counted but the
+# sharded cache is marked incomplete. With STANZA_BUF_CAP=128 KiB no
+# real Debian stanza reaches the cap; this is a defensive bound, not a
+# normal path.
+
+SHARD_CAP:       uint64 = 524288
+SHARD_MAX:       uint64 = 128
+SHARD_NAME_CAP:  uint64 = 64
+STANZA_BUF_CAP:  uint64 = 131072
+
+# Accumulating-one-stanza scratch. _sink_feed copies decompressed bytes
+# here until a blank-line stanza terminator is observed, then flushes
+# the whole stanza atomically to the current shard fd.
+shard_stanza_buf:    Array[131072, uint8]
+shard_stanza_len:    uint64 = 0
+
+# Per-shard sharded-writer state.
+shard_idx:           uint64 = 0     # current shard number (0..SHARD_MAX)
+shard_off:           uint64 = 0     # bytes written into current shard
+shard_fd:            int32  = -1    # open fd for current shard, or -1
+shard_count:         uint64 = 0     # shards persisted so far (== shard_idx + 1 once any bytes written)
+shard_overflow:      int32  = 0     # 1 if a stanza was too big OR we ran out of shards
+
+# Shard-index: per-shard, the FIRST `Package:` name observed in that
+# shard. Written to /tmp/apt/Packages.idx at end of `apt update`.
+shard_first_names:   Array[8192, uint8]   # SHARD_MAX * SHARD_NAME_CAP
+# The current shard's first-name slot is filled once, on the FIRST
+# stanza flushed into that shard; subsequent stanzas in the same shard
+# don't re-touch it.
+shard_first_seen:    int32  = 0     # 0 until current shard has a name
+
+# Scratch: the name extracted from the in-progress stanza's leading
+# `Package:` line, if present. Used to populate shard_first_names.
+shard_stanza_pkg:    Array[64, uint8]
+shard_stanza_pkg_ok: int32 = 0      # 1 if shard_stanza_pkg holds a valid name
+
+# Shard-path scratch. /tmp/apt/p/NNN — 13 chars + NUL is plenty.
+shard_path_buf:      Array[32, uint8]
+
+# Shard-index read state — populated by _shard_idx_load() from
+# /tmp/apt/Packages.idx for the show/install lookup path.
+shard_idx_count:     uint64 = 0
+shard_idx_first:     Array[8192, uint8]   # mirror of shard_first_names
+
 # Scratch: the HTTP request line/headers we send.
 req_buf:  Array[1024, uint8]
 
@@ -1262,17 +1345,28 @@ def _build_packages_path(suite: Ptr[uint8], ext: Ptr[uint8]):
 #
 # _sink_feed(buf, n) processes one chunk of decompressed Packages-index
 # bytes from the streaming `apt update` pass. It is called repeatedly
-# with successive chunks and keeps NO copy of the index — index size
-# is bounded by what apt keeps, which here is nothing (the counter) and
-# the persisted-file cap (a partial cache for a giant index).
+# with successive chunks and keeps:
+#   * NO copy of the WHOLE index — index size is bounded by what apt
+#     keeps, which here is one in-flight stanza (shard_stanza_buf,
+#     16 KiB) plus whatever has already landed in tmpfs shards on disk.
+#   * one-stanza-of-buffering so each tmpfs shard /tmp/apt/p/NNN ends
+#     cleanly on an RFC822 stanza boundary (a stanza never straddles
+#     two shards) — exactly what `apt show` / `apt install` need to
+#     linear-scan a single shard for the stanza they want.
 #
-# Two jobs per chunk:
+# Three jobs per chunk:
 #   1. Count blank-line-separated RFC822 stanzas exactly, carrying the
 #      line-state flags (sink_*) across chunk boundaries so a line or
 #      stanza split by a chunk edge still counts once.
-#   2. Append the bytes to the open persisted file (sink_fd) until the
-#      tmpfs per-file cap (PKG_CAP) would be exceeded; past that the
-#      persist stops (sink_persist_full -> 0) but counting continues.
+#   2. Append the bytes to the LEGACY single-file leading mirror
+#      /tmp/apt/Packages until PKG_CAP would be exceeded — the
+#      back-compat path every existing show/install code path
+#      consults first.
+#   3. Accumulate the in-progress stanza in shard_stanza_buf and, on
+#      every blank-line stanza terminator, flush it to the current
+#      /tmp/apt/p/NNN shard; roll over to the next shard when the
+#      current one would exceed SHARD_CAP. Record the FIRST stanza's
+#      `Package:` name into shard_first_names for the dispatch table.
 
 def _sink_reset():
     sink_count = 0
@@ -1281,30 +1375,285 @@ def _sink_reset():
     sink_line_started = 0
     sink_written = 0
     sink_persist_full = 1
+    shard_stanza_len = 0
+    shard_idx = 0
+    shard_off = 0
+    shard_fd = -1
+    shard_count = 0
+    shard_overflow = 0
+    shard_first_seen = 0
+    shard_stanza_pkg_ok = 0
+    shard_stanza_pkg[0] = 0
+    # Zero the names table: an unwritten shard slot must read as the
+    # empty string so the lookup binary-search never trips on stale
+    # bytes from a prior `apt update` (apt is reinvoked per command,
+    # so BSS is fresh — but be defensive in case a future change holds
+    # state across calls).
+    zi: uint64 = 0
+    while zi < 8192:
+        shard_first_names[zi] = 0
+        zi = zi + 1
+
+
+# Build the absolute path "/tmp/apt/p/NNN" for shard `idx` into
+# shard_path_buf, NUL-terminated. `idx` is at most SHARD_MAX (128); we
+# write three zero-padded digits so a directory listing sorts naturally.
+
+def _shard_path_build(idx: uint64):
+    prefix: Ptr[uint8] = "/tmp/apt/p/"
+    o: uint64 = 0
+    while prefix[o] != 0:
+        shard_path_buf[o] = prefix[o]
+        o = o + 1
+    # Three decimal digits, zero-padded.
+    d100: uint64 = (idx / 100) % 10
+    d10:  uint64 = (idx / 10) % 10
+    d1:   uint64 = idx % 10
+    shard_path_buf[o] = cast[uint8](d100) + 48
+    o = o + 1
+    shard_path_buf[o] = cast[uint8](d10) + 48
+    o = o + 1
+    shard_path_buf[o] = cast[uint8](d1) + 48
+    o = o + 1
+    shard_path_buf[o] = 0
+
+
+# Open (creating / truncating) the current shard fd for write. Closes
+# any previously-open shard fd first. Sets shard_off=0 and shard_first_
+# seen=0 for the new shard. Returns 0 on success, -1 on failure.
+
+def _shard_open_current() -> int32:
+    if shard_fd >= 0:
+        sys_close(shard_fd)
+        shard_fd = -1
+    if shard_idx >= 128:
+        shard_overflow = 1
+        return -1
+    _shard_path_build(shard_idx)
+    fd: int32 = sys_open_write(cast[Ptr[char]](&shard_path_buf[0]))
+    if fd < 0:
+        # tmpfs out of slots / name-too-long / etc. Treat as overflow:
+        # later shards stop persisting but the streaming count keeps
+        # going so `apt update` still reports the true package count.
+        shard_overflow = 1
+        return -1
+    shard_fd = fd
+    shard_off = 0
+    shard_first_seen = 0
+    return 0
+
+
+# Extract the `Package:` value from a buffered stanza (shard_stanza_buf
+# [0, slen)) into shard_stanza_pkg (NUL-terminated). Sets
+# shard_stanza_pkg_ok=1 on success, 0 if the stanza has no Package:
+# line. The stanza format is exactly the same RFC822 shape the
+# show/install paths parse: a `Package:` line in column 0, optional
+# blanks after the colon, name through end-of-line, '\r' trimmed.
+
+def _shard_extract_pkg_name(slen: uint64):
+    shard_stanza_pkg[0] = 0
+    shard_stanza_pkg_ok = 0
+    pos: uint64 = 0
+    while pos < slen:
+        lstart: uint64 = pos
+        lend: uint64 = pos
+        while lend < slen and shard_stanza_buf[lend] != 10:
+            lend = lend + 1
+        # Does this line begin with "Package:"?
+        is_pkg: int32 = 1
+        if lstart + 8 > lend:
+            is_pkg = 0
+        if is_pkg != 0:
+            name: Ptr[uint8] = "Package:"
+            k: uint64 = 0
+            while k < 8:
+                if shard_stanza_buf[lstart + k] != name[k]:
+                    is_pkg = 0
+                    break
+                k = k + 1
+        if is_pkg != 0:
+            v: uint64 = lstart + 8
+            vend: uint64 = lend
+            if vend > lstart and shard_stanza_buf[vend - 1] == 13:
+                vend = vend - 1
+            while v < vend and (shard_stanza_buf[v] == 32
+                                or shard_stanza_buf[v] == 9):
+                v = v + 1
+            o: uint64 = 0
+            while v < vend and o + 1 < 64:
+                shard_stanza_pkg[o] = shard_stanza_buf[v]
+                o = o + 1
+                v = v + 1
+            shard_stanza_pkg[o] = 0
+            shard_stanza_pkg_ok = 1
+            return
+        pos = lend
+        if pos < slen:
+            pos = pos + 1
+
+
+# Flush shard_stanza_buf[0, slen) into the current shard. Rolls over
+# to the next shard if it would not fit. Records the first stanza's
+# Package: name into shard_first_names. Returns 0 on success, -1 on a
+# write error (rare; treated as shard_overflow=1 and counting continues).
+
+def _shard_flush_stanza(slen: uint64) -> int32:
+    if shard_overflow != 0 or slen == 0:
+        return 0
+
+    # If no shard is open yet, open shard 0.
+    if shard_fd < 0:
+        if _shard_open_current() != 0:
+            return 0       # overflow already set; not an apt-update error
+
+    # Would this stanza overflow the current shard? Roll over.
+    if shard_off + slen > SHARD_CAP:
+        if shard_idx + 1 >= SHARD_MAX:
+            # Out of shards — stop persisting but keep counting.
+            shard_overflow = 1
+            sys_close(shard_fd)
+            shard_fd = -1
+            return 0
+        shard_idx = shard_idx + 1
+        if _shard_open_current() != 0:
+            return 0
+
+    # Write the stanza. On a short write treat as overflow.
+    wn: int64 = _write_full(shard_fd, &shard_stanza_buf[0], slen)
+    if wn < 0 or cast[uint64](wn) != slen:
+        shard_overflow = 1
+        sys_close(shard_fd)
+        shard_fd = -1
+        return 0
+
+    # Record the first-name for this shard if not done yet.
+    if shard_first_seen == 0:
+        _shard_extract_pkg_name(slen)
+        if shard_stanza_pkg_ok != 0:
+            base: uint64 = shard_idx * 64
+            ki: uint64 = 0
+            while shard_stanza_pkg[ki] != 0 and ki + 1 < 64:
+                shard_first_names[base + ki] = shard_stanza_pkg[ki]
+                ki = ki + 1
+            shard_first_names[base + ki] = 0
+        shard_first_seen = 1
+
+    shard_off = shard_off + slen
+    if shard_idx + 1 > shard_count:
+        shard_count = shard_idx + 1
+    return 0
 
 
 # Flush the line-state machine at end-of-stream: an index whose final
 # line is non-blank and carries no trailing '\n' still counts that last
-# stanza (matches the buffered _count_stanzas behaviour).
+# stanza (matches the buffered _count_stanzas behaviour). Also flush
+# the in-progress stanza buffer to the current shard so the LAST
+# stanza lands in the cache even if the stream ended without a final
+# blank line, and close the shard fd. Finally write the small
+# /tmp/apt/Packages.idx dispatch file.
 
 def _sink_flush():
     if sink_line_started != 0 and sink_line_blank == 0:
         if sink_in_stanza == 0:
             sink_count = sink_count + 1
             sink_in_stanza = 1
+    # A trailing partial stanza (no terminating blank line): synthesise
+    # a '\n' so the persisted shard is still parseable by the
+    # blank-line stanza splitter.
+    if shard_stanza_len > 0:
+        if shard_stanza_len < STANZA_BUF_CAP:
+            shard_stanza_buf[shard_stanza_len] = 10
+            shard_stanza_len = shard_stanza_len + 1
+        _shard_flush_stanza(shard_stanza_len)
+        shard_stanza_len = 0
+    if shard_fd >= 0:
+        sys_close(shard_fd)
+        shard_fd = -1
+    # Persist the dispatch table /tmp/apt/Packages.idx. Format:
+    #     <nshards>\n
+    #     <first_name_0>\n
+    #     <first_name_1>\n
+    #     ...
+    # A shard whose first_name slot is empty (rare — a shard with no
+    # `Package:` line at all, which should never happen for a real
+    # Debian index) writes an empty line; the lookup ignores empty
+    # slots when binary-searching.
+    ifd: int32 = sys_open_write(cast[Ptr[char]]("/tmp/apt/Packages.idx"))
+    if ifd < 0:
+        return
+    # nshards line.
+    nbuf: Array[24, uint8]
+    no: uint64 = 0
+    nv: uint64 = shard_count
+    if nv == 0:
+        nbuf[no] = 48                                  # '0'
+        no = no + 1
+    else:
+        digits: Array[24, uint8]
+        dn: uint64 = 0
+        while nv != 0:
+            digits[dn] = cast[uint8](nv % 10) + 48
+            nv = nv / 10
+            dn = dn + 1
+        while dn > 0:
+            dn = dn - 1
+            nbuf[no] = digits[dn]
+            no = no + 1
+    nbuf[no] = 10
+    no = no + 1
+    sys_write(ifd, &nbuf[0], no)
+    # Per-shard first-name lines.
+    si: uint64 = 0
+    while si < shard_count:
+        base: uint64 = si * 64
+        # Find the length of this slot.
+        ln: uint64 = 0
+        while ln < 64 and shard_first_names[base + ln] != 0:
+            ln = ln + 1
+        if ln > 0:
+            sys_write(ifd, &shard_first_names[base], ln)
+        sys_write(ifd, "\n", 1)
+        si = si + 1
+    sys_close(ifd)
 
 
 def _sink_feed(buf: Ptr[uint8], n: uint64) -> int64:
-    # --- 1. stanza counting (byte-at-a-time line state machine) ---
     i: uint64 = 0
     while i < n:
         c: uint8 = buf[i]
+
+        # --- 1. stanza counting (byte-at-a-time line state machine) ---
+        # --- 3. one-stanza accumulation for sharded persistence -------
+        # Both folded into a single per-byte pass so we walk the chunk
+        # exactly once.
+
+        # Buffer this byte into shard_stanza_buf, unless we've already
+        # blown the per-stanza cap. A stanza that exceeds STANZA_BUF_CAP
+        # is TRUNCATED in the sharded cache: the head fills the buffer,
+        # the tail bytes are dropped, and when this stanza terminates we
+        # flush whatever did fit. The blank-line state machine still
+        # counts the stanza, and the NEXT stanza re-uses the buffer
+        # cleanly — STANZA_BUF_CAP only ever loses tail bytes from one
+        # outsized stanza, never propagates to subsequent ones. A real
+        # Debian stable/main has stanzas up to ~76 KiB (long Depends:
+        # chains + multiline Description-md5); STANZA_BUF_CAP = 128 KiB
+        # clears that with headroom, so this path is purely defensive.
+        if shard_stanza_len < STANZA_BUF_CAP:
+            shard_stanza_buf[shard_stanza_len] = c
+            shard_stanza_len = shard_stanza_len + 1
+
         if c == 10:                                     # '\n' — end of line
             # A line counts as blank if every byte on it was a blank
             # or CR (sink_line_blank stays 1). The empty line (no bytes
             # at all) is blank too.
             if sink_line_blank != 0:
-                sink_in_stanza = 0                      # blank line
+                # Blank line — stanza terminator. Flush the buffered
+                # stanza (which includes the trailing blank '\n') to
+                # the current shard.
+                sink_in_stanza = 0
+                if shard_stanza_len > 0:
+                    _shard_flush_stanza(shard_stanza_len)
+                    shard_stanza_len = 0
             else:
                 if sink_in_stanza == 0:
                     sink_count = sink_count + 1
@@ -1320,7 +1669,9 @@ def _sink_feed(buf: Ptr[uint8], n: uint64) -> int64:
                 sink_line_blank = 0
         i = i + 1
 
-    # --- 2. persist to /tmp/apt/Packages until the cap ---
+    # --- 2. persist to the legacy single-file /tmp/apt/Packages until
+    #    the cap. Unchanged for back-compat: every existing show/install
+    #    path consults this file first.
     if sink_fd >= 0 and sink_persist_full != 0:
         room: uint64 = 0
         if sink_written < PKG_CAP:
@@ -1935,8 +2286,13 @@ def _do_update(base_url: Ptr[uint8], suite: Ptr[uint8],
     nstanzas: uint64 = 0
     persisted_full: int32 = 1
 
-    # mkdir /tmp/apt up front — both paths persist into it.
+    # mkdir /tmp/apt up front — both paths persist into it. Also
+    # mkdir /tmp/apt/p for the sharded whole-index cache (the streaming
+    # gz path persists into /tmp/apt/p/NNN; the xz fallback uses only
+    # the legacy single-file path, no shards). Both are idempotent —
+    # the second invocation of `apt update` re-creates files in place.
     sys_mkdir(cast[Ptr[char]]("/tmp/apt"))
+    sys_mkdir(cast[Ptr[char]]("/tmp/apt/p"))
 
     _build_packages_path(suite, cast[Ptr[uint8]]("gz"))
     # A quiet probe: does this mirror ship Packages.gz? We only need the
@@ -2016,24 +2372,44 @@ def _do_update(base_url: Ptr[uint8], suite: Ptr[uint8],
         return 1
 
     # 5. Summary. nstanzas is the TRUE full count from the streaming
-    #    (or single-shot) pass; if the persisted /tmp/apt/Packages cache
-    #    was truncated at the tmpfs file cap, say so — `apt update` still
-    #    succeeded, but later `show`/`install` only see the cached head.
+    #    (or single-shot) pass.
     write_str(1, "apt-get: fetched index, ")
     write_dec_u64(1, nstanzas)
     write_str(1, " packages\n")
+    # The streaming gz path persists the WHOLE inflated index across
+    # /tmp/apt/p/NNN shards (each up to SHARD_CAP), so show/install
+    # against a multi-MiB Debian `main` now resolve the entire index,
+    # not just the leading-stanzas mirror. Report the shard count + the
+    # cache shape so the cache shape is observable in the log; flag the
+    # overflow case (a stanza larger than STANZA_BUF_CAP, or running
+    # out of shards) loudly so a giant-stanza pathology is debuggable.
+    if shard_count > 0:
+        write_str(1, "apt-get: cached ")
+        write_dec_u64(1, shard_count)
+        write_str(1, " shards across /tmp/apt/p/NNN — show/install resolve")
+        write_str(1, " the whole index\n")
+    if shard_overflow != 0:
+        write_str(1, "apt-get: WARNING: sharded cache truncated (stanza > ")
+        write_dec_u64(1, STANZA_BUF_CAP)
+        write_str(1, " B, or shards > ")
+        write_dec_u64(1, SHARD_MAX)
+        write_str(1, ");\n")
+        write_str(1, "apt-get: queries beyond the truncated boundary will miss\n")
     if persisted_full == 0:
-        write_str(1, "apt-get: note: index larger than the /tmp/apt/Packages cache cap (")
+        write_str(1, "apt-get: note: leading /tmp/apt/Packages mirror capped at ")
         write_dec_u64(1, PKG_CAP)
-        write_str(1, " bytes);\n")
-        write_str(1, "apt-get: the cache holds the leading stanzas — show/install resolve those\n")
+        write_str(1, " bytes;\n")
+        write_str(1, "apt-get: the full index is in /tmp/apt/p/NNN shards\n")
     return 0
 
 
 # -- Packages-index queries (show / pkgnames) --------------------------
 #
-# Both readers slurp /tmp/apt/Packages into pkg_buf and walk it as a
-# run of RFC822 stanzas (same wire format dpkg.ad parses).
+# Both readers slurp a Packages source (the legacy leading-mirror
+# /tmp/apt/Packages, OR — for a multi-MiB Debian `main` — a single
+# /tmp/apt/p/NNN shard located via the dispatch table) into pkg_buf
+# and walk it as a run of RFC822 stanzas (same wire format dpkg.ad
+# parses).
 
 def _read_index() -> int64:
     fd: int32 = sys_open(cast[Ptr[char]]("/tmp/apt/Packages"))
@@ -2050,6 +2426,168 @@ def _read_index() -> int64:
         total = total + cast[uint64](n)
     sys_close(fd)
     return cast[int64](total)
+
+
+# Read one shard /tmp/apt/p/NNN into pkg_buf and return its length.
+# Returns -1 if the shard is missing / unreadable. Shard `idx` is
+# clamped at 0..SHARD_MAX so a corrupt index can't escape the path
+# buffer.
+
+def _read_shard(idx: uint64) -> int64:
+    if idx >= SHARD_MAX:
+        return -1
+    _shard_path_build(idx)
+    fd: int32 = sys_open(cast[Ptr[char]](&shard_path_buf[0]))
+    if fd < 0:
+        return -1
+    total: uint64 = 0
+    while total < PKG_CAP:
+        room: uint64 = PKG_CAP - total
+        ptr: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](&pkg_buf[0]) + total)
+        n: int64 = sys_read(fd, ptr, room)
+        if n <= 0:
+            break
+        total = total + cast[uint64](n)
+    sys_close(fd)
+    return cast[int64](total)
+
+
+# Load /tmp/apt/Packages.idx into shard_idx_count + shard_idx_first.
+# Returns 0 on success, -1 if the file is absent or malformed. The
+# file's format is text:
+#     <nshards>\n
+#     <first_name_0>\n
+#     <first_name_1>\n
+#     ...
+# Lines past nshards beyond the recorded count are ignored. A missing
+# file is the legacy-only case (no whole-index cache); callers fall
+# back to the leading-mirror /tmp/apt/Packages.
+
+def _shard_idx_load() -> int32:
+    fd: int32 = sys_open(cast[Ptr[char]]("/tmp/apt/Packages.idx"))
+    if fd < 0:
+        return -1
+    # Read into a scratch buffer; the idx file is tiny (~5 KiB worst
+    # case for 128 shards of <40-char names) so we reuse req_buf's
+    # 1 KiB neighbour pkg_stage as a one-shot read target. We need at
+    # most SHARD_MAX * (SHARD_NAME_CAP + 1) ≈ 8 KiB; use http_stage
+    # (64 KiB) for ample headroom — it is idle at query time.
+    total: uint64 = 0
+    while total + 1 < 65536:
+        room: uint64 = 65536 - 1 - total
+        ptr: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](&http_stage[0]) + total)
+        rn: int64 = sys_read(fd, ptr, room)
+        if rn <= 0:
+            break
+        total = total + cast[uint64](rn)
+    sys_close(fd)
+    if total == 0:
+        return -1
+    # Parse the leading <nshards>\n line.
+    pos: uint64 = 0
+    nv: uint64 = 0
+    seen_digit: int32 = 0
+    while pos < total and http_stage[pos] != 10:
+        c: uint8 = http_stage[pos]
+        if c >= 48 and c <= 57:
+            nv = nv * 10 + cast[uint64](c - 48)
+            seen_digit = 1
+        pos = pos + 1
+    if seen_digit == 0 or nv > SHARD_MAX:
+        return -1
+    shard_idx_count = nv
+    if pos < total:
+        pos = pos + 1                              # skip the newline
+    # Zero the names table so unread slots compare as empty.
+    zi: uint64 = 0
+    while zi < 8192:
+        shard_idx_first[zi] = 0
+        zi = zi + 1
+    # Read nv first-name lines.
+    si: uint64 = 0
+    while si < nv and pos < total:
+        base: uint64 = si * 64
+        ln: uint64 = 0
+        while pos < total and http_stage[pos] != 10:
+            if ln + 1 < 64:
+                shard_idx_first[base + ln] = http_stage[pos]
+                ln = ln + 1
+            pos = pos + 1
+        shard_idx_first[base + ln] = 0
+        if pos < total:
+            pos = pos + 1
+        si = si + 1
+    return 0
+
+
+# strcmp-style compare on two NUL-terminated buffers, lexicographic
+# byte order. Returns <0, 0, >0 in the strcmp convention. Kept around
+# for any future binary-search path, but the live `apt show` /
+# `apt install` lookups iterate shards LINEARLY (see below) because
+# Debian's `Packages.gz` is NOT alphabetically sorted — it is in some
+# stable but non-lexicographic order (loosely chunk-by-section /
+# upload-order). Binary-searching the per-shard first-names would
+# silently miss most packages.
+
+def _name_cmp(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while True:
+        ca: uint8 = a[i]
+        cb: uint8 = b[i]
+        if ca != cb:
+            if ca < cb:
+                return -1
+            return 1
+        if ca == 0:
+            return 0
+        i = i + 1
+
+
+# Find which shard contains `pkg`. With Debian's non-alphabetic
+# Packages.gz, we have to LINEAR-SCAN: load each shard in turn, scan it
+# for a `Package: <pkg>` stanza. The first shard that has the stanza
+# wins; we return its index. -1 means the dispatch table is empty or
+# the package is in no shard. Worst case = SHARD_MAX shard loads (each
+# a 512 KiB tmpfs read) for a missing package — ~50 ms in practice,
+# fast enough for an interactive `apt show`.
+#
+# This also makes the side-effect "pkg_buf now holds the matching
+# shard" — _read_index_for relies on that to avoid re-loading.
+
+def _shard_lookup(pkg: Ptr[uint8]) -> int64:
+    if shard_idx_count == 0:
+        return -1
+    si: uint64 = 0
+    while si < shard_idx_count:
+        ilen_i: int64 = _read_shard(si)
+        if ilen_i > 0:
+            ilen: uint64 = cast[uint64](ilen_i)
+            sstart: uint64 = 0
+            send: uint64 = 0
+            if _find_stanza(pkg, ilen, &sstart, &send) == 0:
+                return cast[int64](si)
+        si = si + 1
+    return -1
+
+
+# Load the right index buffer for `pkg`. Tries the sharded cache
+# first: if /tmp/apt/Packages.idx exists, linear-scan shards for
+# `pkg`'s stanza, leaving pkg_buf populated with the matching shard.
+# Otherwise fall back to the legacy leading-mirror /tmp/apt/Packages.
+# Returns the loaded length in pkg_buf, or -1 if no index source is
+# readable at all (printing the standard "no package index"
+# diagnostic in that case).
+
+def _read_index_for(pkg: Ptr[uint8]) -> int64:
+    if _shard_idx_load() == 0:
+        sid: int64 = _shard_lookup(pkg)
+        if sid >= 0:
+            # _shard_lookup left pkg_buf holding shard `sid`. Re-read
+            # it (cheap — same tmpfs file we just scanned) so we have
+            # the exact length the caller will scan.
+            return _read_shard(cast[uint64](sid))
+    return _read_index()
 
 
 # _line_is_package(lstart, lend): the line begins exactly with
@@ -2069,10 +2607,13 @@ def _line_is_package(lstart: uint64, lend: uint64) -> int32:
 
 # apt show <pkg>: print the stanza whose Package: value equals <pkg>.
 # Returns 0 on success, 1 if the index is unreadable or the package is
-# absent.
+# absent. Consults the sharded whole-index cache (/tmp/apt/p/NNN +
+# /tmp/apt/Packages.idx) first via _read_index_for; if no shard cache
+# is present, falls back to the legacy /tmp/apt/Packages leading
+# mirror.
 
 def _do_show(pkg: Ptr[uint8]) -> int32:
-    ilen_i: int64 = _read_index()
+    ilen_i: int64 = _read_index_for(pkg)
     if ilen_i < 0:
         return 1
     ilen: uint64 = cast[uint64](ilen_i)
@@ -2137,15 +2678,11 @@ def _do_show(pkg: Ptr[uint8]) -> int32:
     return 1
 
 
-# apt pkgnames: print every Package: value, one per line. Returns 0 on
-# success, 1 if the index is unreadable.
+# Walk pkg_buf[0, ilen) emitting every `Package:` value followed by
+# a newline. Shared between the legacy single-buffer pkgnames path and
+# the per-shard pkgnames loop.
 
-def _do_pkgnames() -> int32:
-    ilen_i: int64 = _read_index()
-    if ilen_i < 0:
-        return 1
-    ilen: uint64 = cast[uint64](ilen_i)
-
+def _emit_pkgnames(ilen: uint64):
     pos: uint64 = 0
     while pos < ilen:
         lstart: uint64 = pos
@@ -2165,6 +2702,27 @@ def _do_pkgnames() -> int32:
         pos = lend
         if pos < ilen:
             pos = pos + 1
+
+
+# apt pkgnames: print every Package: value, one per line. Returns 0 on
+# success, 1 if the index is unreadable. Walks every shard in the
+# whole-index cache when present; falls back to the leading mirror
+# /tmp/apt/Packages when no shard cache exists.
+
+def _do_pkgnames() -> int32:
+    if _shard_idx_load() == 0 and shard_idx_count > 0:
+        si: uint64 = 0
+        while si < shard_idx_count:
+            ilen_i: int64 = _read_shard(si)
+            if ilen_i > 0:
+                _emit_pkgnames(cast[uint64](ilen_i))
+            si = si + 1
+        return 0
+    # No shard cache — fall back to the legacy leading-mirror file.
+    ilen_i: int64 = _read_index()
+    if ilen_i < 0:
+        return 1
+    _emit_pkgnames(cast[uint64](ilen_i))
     return 0
 
 
@@ -2322,6 +2880,11 @@ def _find_stanza(pkg: Ptr[uint8], ilen: uint64,
 # Locate the stanza for <pkg> in pkg_buf[0, ilen) and pull Filename,
 # SHA256, Size and Version into the fld_* buffers. Returns 0 on
 # success, -1 if the package is absent or has no Filename field.
+#
+# `ilen` is the live Packages-index length in pkg_buf as loaded by the
+# caller (typically via _read_index_for(pkg)). With the sharded cache
+# the caller must have loaded the SHARD that contains pkg; passing the
+# legacy leading mirror works only for the first ~512 KiB of the index.
 
 def _lookup_install_fields(pkg: Ptr[uint8], ilen: uint64) -> int32:
     sstart: uint64 = 0
@@ -2631,13 +3194,20 @@ def _dep_namestack_at(d: uint64) -> Ptr[uint8]:
 # guard. Returns 0 on success, -1 on any error (table full, recursion
 # too deep, or a dependency name absent from the index — a hard abort).
 #
-# `ilen` is the live Packages-index length in pkg_buf. `depth` is the
-# recursion depth: _resolve copies <pkg> into dep_namestack[depth] on
-# entry so that a nested _resolve clobbering the shared dep_name_buf
-# (the buffer <pkg> typically points into) cannot corrupt this frame's
-# notion of which package it is resolving.
+# `depth` is the recursion depth: _resolve copies <pkg> into
+# dep_namestack[depth] on entry so that a nested _resolve clobbering
+# the shared dep_name_buf (the buffer <pkg> typically points into)
+# cannot corrupt this frame's notion of which package it is resolving.
+#
+# With the sharded whole-index cache, each call loads the right shard
+# for `me` into pkg_buf via _read_index_for(me). A nested recursion
+# walks a different package -> potentially a different shard -> the
+# parent's stanza span (sstart/send) in pkg_buf is invalidated when we
+# return. The post-recursion re-extract therefore re-loads THIS
+# package's shard and re-finds the stanza first; without that step the
+# remaining `Depends:` terms would be parsed against a child's shard.
 
-def _resolve(pkg: Ptr[uint8], ilen: uint64, depth: uint64) -> int32:
+def _resolve(pkg: Ptr[uint8], depth: uint64) -> int32:
     if depth >= 64:
         write_str(2, "apt: dependency chain exceeds 64 levels (V1 limit)\n")
         return -1
@@ -2666,6 +3236,14 @@ def _resolve(pkg: Ptr[uint8], ilen: uint64, depth: uint64) -> int32:
         write_str(1, me)
         write_str(1, " already installed, skipping\n")
         return 0
+
+    # Load the right shard (or the legacy mirror) for `me`. This sizes
+    # pkg_buf to a single 512 KiB shard; _find_stanza scans only that
+    # shard.
+    ilen_i: int64 = _read_index_for(me)
+    if ilen_i < 0:
+        return -1
+    ilen: uint64 = cast[uint64](ilen_i)
 
     # Find this package's stanza so we can read its `Depends:` field.
     sstart: uint64 = 0
@@ -2707,11 +3285,26 @@ def _resolve(pkg: Ptr[uint8], ilen: uint64, depth: uint64) -> int32:
                     # _dep_term_name wrote the dependency name into the
                     # shared dep_name_buf; recurse on it. The nested
                     # _resolve copies it into its own depth slot first.
-                    if _resolve(&dep_name_buf[0], ilen, depth + 1) != 0:
+                    if _resolve(&dep_name_buf[0], depth + 1) != 0:
                         return -1
-                    # A nested _resolve clobbered dep_field_buf with the
-                    # child's Depends — re-extract this stanza's Depends
-                    # for the remaining terms.
+                    # A nested _resolve loaded ITS package's shard into
+                    # pkg_buf AND clobbered dep_field_buf with the
+                    # child's Depends. Re-load THIS package's shard
+                    # AND re-find THIS stanza's span before re-extracting
+                    # the field for the remaining terms.
+                    ilen_i2: int64 = _read_index_for(me)
+                    if ilen_i2 < 0:
+                        return -1
+                    ilen = cast[uint64](ilen_i2)
+                    if _find_stanza(me, ilen, &sstart, &send) != 0:
+                        # Shouldn't happen — we successfully found this
+                        # stanza moments ago, the shard cache is stable
+                        # within a single apt invocation. Treat as a
+                        # hard error so the failure is loud.
+                        write_str(2, "apt: internal: lost stanza '")
+                        write_str(2, me)
+                        write_str(2, "' after recursion\n")
+                        return -1
                     _stanza_extract_field(sstart, send,
                                           cast[Ptr[uint8]]("Depends"), 7,
                                           &dep_field_buf[0], 1024)
@@ -2745,8 +3338,12 @@ def _resolve(pkg: Ptr[uint8], ilen: uint64, depth: uint64) -> int32:
 # socket connect.
 
 def _fetch_one(pkg: Ptr[uint8], port: int64) -> int32:
-    # Locate <pkg>'s stanza and pull the install fields.
-    ilen_i: int64 = _read_index()
+    # Locate <pkg>'s stanza and pull the install fields. Load the
+    # right SHARD for <pkg> from the sharded whole-index cache so
+    # _lookup_install_fields can find pkg even when it sits past the
+    # 512 KiB leading-mirror window (e.g. `nginx`, `python3`,
+    # everything alphabetically past ~"and" against live Debian main).
+    ilen_i: int64 = _read_index_for(pkg)
     if ilen_i < 0:
         return 1
     if _lookup_install_fields(pkg, cast[uint64](ilen_i)) != 0:
@@ -2899,9 +3496,11 @@ def _in_distro_namespace() -> int32:
 
 def _dpkg_one(pkg: Ptr[uint8]) -> int32:
     # Recover the Version field for the summary line (index re-read is
-    # local — /tmp/apt/Packages — and does not touch the network).
+    # local — /tmp/apt/Packages or /tmp/apt/p/NNN — and does not touch
+    # the network). _read_index_for() walks the shard cache when
+    # present so pkg may sit past the leading mirror cap.
     fld_version2[0] = 0
-    ilen_i: int64 = _read_index()
+    ilen_i: int64 = _read_index_for(pkg)
     if ilen_i >= 0:
         _lookup_install_fields(pkg, cast[uint64](ilen_i))
 
@@ -2972,13 +3571,13 @@ def _do_install(pkg: Ptr[uint8]) -> int32:
     if port < 0:
         return 1
 
-    # 2. Read the package index — the resolver walks it in pkg_buf.
-    ilen_i: int64 = _read_index()
+    # 2. Sanity-check: the named root package must exist in the index
+    #    before we resolve anything. _read_index_for loads the right
+    #    shard for pkg from the sharded whole-index cache.
+    ilen_i: int64 = _read_index_for(pkg)
     if ilen_i < 0:
         return 1
     ilen: uint64 = cast[uint64](ilen_i)
-
-    # The named root package must exist before we resolve anything.
     rs: uint64 = 0
     re: uint64 = 0
     if _find_stanza(pkg, ilen, &rs, &re) != 0:
@@ -2987,11 +3586,12 @@ def _do_install(pkg: Ptr[uint8]) -> int32:
         write_str(2, "' not found in index — run `apt update` first?\n")
         return 1
 
-    # 3. Resolve the dependency closure (post-order -> dep_order).
+    # 3. Resolve the dependency closure (post-order -> dep_order). The
+    #    resolver re-loads the right shard per package internally.
     dep_seen_n = 0
     dep_order_n = 0
     dep_missing_parent[0] = 0
-    if _resolve(pkg, ilen, 0) != 0:
+    if _resolve(pkg, 0) != 0:
         write_str(2, "apt: aborting — dependency resolution failed (no packages installed)\n")
         return 1
 

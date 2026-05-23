@@ -43,11 +43,18 @@ HAMSH_ELF=build/user/hamsh.elf
 # /tmp/apt/Packages cache cap too, so the cache-truncation path is
 # exercised as well.
 N_STANZAS=12000
-# A package we will `apt show` — it sits early in the index so it is
-# inside the persisted leading cache regardless of truncation.
+# Two packages we will `apt show`. The EARLY one is in the leading-
+# mirror region (the first 512 KiB of decompressed index) and was the
+# only thing the pre-sharding cache could resolve. The LATE one sits
+# well past the leading-mirror cap and ONLY the sharded /tmp/apt/p/NNN
+# cache can resolve it — that is the proof that the marquee
+# `apt show <late-package>` works.
 QUERY_IDX=7
 QUERY_PKG="hampkg-0000${QUERY_IDX}"
 QUERY_MARK="LARGEIDX_OK_MARKER"
+QUERY_LATE_IDX=11500
+QUERY_LATE_PKG="hampkg-${QUERY_LATE_IDX}"
+QUERY_LATE_MARK="LARGEIDX_LATE_MARKER"
 
 # --- pick a free host port -------------------------------------------
 PORT=$(python3 - <<'PY'
@@ -89,9 +96,15 @@ EOF
 # carries a unique Package name + Description so the file does not
 # compress away to nothing — a realistic shape for a real `main`.
 PACKAGES_PLAIN="$REPO_DIR/Packages.plain"
-python3 - "$PACKAGES_PLAIN" "$N_STANZAS" "$QUERY_IDX" "$QUERY_MARK" <<'PY'
+python3 - "$PACKAGES_PLAIN" "$N_STANZAS" "$QUERY_IDX" "$QUERY_MARK" \
+        "$QUERY_LATE_IDX" "$QUERY_LATE_MARK" <<'PY'
 import sys
-out_path, n, qidx, qmark = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+out_path = sys.argv[1]
+n = int(sys.argv[2])
+qidx = int(sys.argv[3])
+qmark = sys.argv[4]
+qlate_idx = int(sys.argv[5])
+qlate_mark = sys.argv[6]
 with open(out_path, "w") as f:
     for i in range(n):
         name = f"hampkg-{i:05d}"
@@ -100,6 +113,8 @@ with open(out_path, "w") as f:
                 f"with assorted unique filler text token-{i}-{i*7%100000}")
         if i == qidx:
             desc = f"{qmark} {desc}"
+        if i == qlate_idx:
+            desc = f"{qlate_mark} {desc}"
         f.write(f"Package: {name}\n")
         f.write(f"Version: {ver}\n")
         f.write("Architecture: amd64\n")
@@ -177,10 +192,13 @@ set +e
     printf 'echo APT_SHOW_START\n'
     printf '/bin/apt show %s\n' "$QUERY_PKG"
     sleep 8
+    printf 'echo APT_SHOW_LATE_START\n'
+    printf '/bin/apt show %s\n' "$QUERY_LATE_PKG"
+    sleep 8
     printf 'echo APT_DONE\n'
     printf 'exit\n'
     sleep 2
-) | timeout 360s qemu-system-x86_64 \
+) | timeout 400s qemu-system-x86_64 \
     -kernel "$ELF" \
     -netdev "user,id=n0,guestfwd=tcp:10.0.2.100:7-cmd:cat" \
     -device virtio-net-pci,netdev=n0,mac=52:54:00:12:34:56 \
@@ -216,14 +234,24 @@ check "apt-get: streamed gz index ("
 #     buffer could have held, so the size limit is genuinely gone.
 check "apt-get: fetched index, $N_STANZAS packages"
 
-# (c) the decompressed index is bigger than the /tmp/apt/Packages cache
-#     cap, so apt emitted the cache-truncation note (the design's
-#     "persisted leading stanzas" path).
-check "apt-get: note: index larger than the /tmp/apt/Packages cache cap"
+# (c) the decompressed index is bigger than the leading-mirror file
+#     cap, so apt sharded the WHOLE index across /tmp/apt/p/NNN.
+check "apt-get: cached "
+check " shards across /tmp/apt/p/NNN — show/install resolve"
+check "apt-get: note: leading /tmp/apt/Packages mirror capped at"
 
-# (d) `apt show` resolved an early package out of the persisted cache.
+# (d) `apt show` resolved an EARLY package — sits inside the leading
+#     mirror, the only case the pre-sharded cache could handle.
 check "Package: $QUERY_PKG"
 check "$QUERY_MARK"
+
+# (e) `apt show` resolved a LATE package — sits well past the
+#     leading mirror cap, ONLY the sharded cache can find it. This is
+#     the marquee bit: a real Debian main has ~68k packages spanning
+#     ~56 MiB; without the sharded cache the show/install paths could
+#     not resolve anything past the first ~512 KiB of the index.
+check "Package: $QUERY_LATE_PKG"
+check "$QUERY_LATE_MARK"
 
 if grep -F -q "TRAP: vector" "$LOG"; then
     echo "[test_apt_large] DIAG: kernel reported a CPU exception"
