@@ -145,6 +145,20 @@ if os.environ.get("ENABLE_NETCFG_SMOKE") == "1":
 if os.environ.get("ENABLE_XHCI_SELFTEST") == "1":
     FILES.append(("/etc/xhci-selftest", b"1\n"))
 
+# xHCI live-keyboard attach OPT-OUT. Mirrors ENABLE_XHCI_SELFTEST but
+# in the opposite direction: setting ENABLE_XHCI_NO_ATTACH=1 plants
+# /etc/xhci-no-attach so drivers/usb/xhci.ad's xhci_init() skips
+# _xhci_v1_attach_keyboard() entirely — the controller is still
+# brought up + reset + scanned, just no live SETUP / Address Device
+# / GET_DESCRIPTOR / Configure Endpoint walk on the connected port.
+# This is the real-hardware escape hatch for laptops where the live
+# attach wedges inside an MMIO/command-ring poll (Intel Nook boot
+# 2026-05 hung at [boot:01.f] xhci v1 transfer-engine bringup + attach).
+# Boot then continues normally; the box just has no USB keyboard but
+# the serial console / PS/2 keyboard / framebuffer prompt still work.
+if os.environ.get("ENABLE_XHCI_NO_ATTACH") == "1":
+    FILES.append(("/etc/xhci-no-attach", b"1\n"))
+
 # Native `ping` smoke. scripts/test_ping.sh sets ENABLE_PING_SMOKE=1 to
 # plant /etc/ping-smoke-test in the initramfs. The marker is consumed
 # only by the test harness today (a future kernel-side autorun could
