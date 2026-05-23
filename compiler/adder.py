@@ -601,7 +601,8 @@ def assemble_and_link_x86_bare(asm_file: Path, output: Path,
 
 
 def assemble_and_link_x86_user(asm_file: Path, output: Path,
-                                project_root: Path) -> bool:
+                                project_root: Path,
+                                progname: str = "unknown") -> bool:
     """Assemble + link a Adder source into a CPL-3 user-mode ELF.
 
     Same shape as assemble_and_link_x86_bare but a much smaller link:
@@ -614,6 +615,17 @@ def assemble_and_link_x86_user(asm_file: Path, output: Path,
     No kernel objects are linked in: a user binary lives in its own
     address space and reaches the kernel only via the `syscall`
     instruction.
+
+    TEMP_DEBUG_HAMSH_BRINGUP: `progname` selects the per-binary
+    marker string the runtime's `_start` prints to fd 2. We synthesize
+    a tiny progname.S on the fly carrying STRONG definitions of
+    __runtime_start_mark / __runtime_start_mark_end with the binary's
+    name baked in, and link it ahead of runtime.o so the linker picks
+    the strong defs over the weak fallback ("[runtime:unknown] _start")
+    that lives in user/runtime.S. Output per binary becomes a distinct
+    line, e.g. "[runtime:init] _start" vs "[runtime:hamsh] _start" —
+    so a real-hardware boot can tell us whether SYSRETQ out of hamsh's
+    execve actually reached hamsh's _start.
     """
     as_cmd = "as"
     ld_cmd = "ld"
@@ -631,10 +643,21 @@ def assemble_and_link_x86_user(asm_file: Path, output: Path,
             print(f"Error: missing {required}", file=sys.stderr)
             return False
 
+    # TEMP_DEBUG_HAMSH_BRINGUP: keep the marker string ASCII-safe and
+    # short — the linker script merges .rodata into the single PT_LOAD,
+    # so no extra alignment concerns, but the syscall pulls the length
+    # from `end - start` at link time so a stray non-ASCII byte would
+    # still emit cleanly. The basename comes from cmd_compile and is
+    # already a filesystem name, so it can't contain `"` or `\`.
+    progname_safe = "".join(
+        c if (c.isalnum() or c in "._-") else "_" for c in progname
+    )
+
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
-        runtime_o = tmpdir / "runtime.o"
-        main_o    = tmpdir / "main.o"
+        runtime_o  = tmpdir / "runtime.o"
+        progname_o = tmpdir / "progname.o"
+        main_o     = tmpdir / "main.o"
 
         # Same .code64 prepend trick the bare-metal kernel uses: the
         # Adder codegen is target-mode-agnostic, but we want 64-bit
@@ -643,7 +666,26 @@ def assemble_and_link_x86_user(asm_file: Path, output: Path,
         hamnix_s = tmpdir / "hamnix_main.S"
         hamnix_s.write_text(".code64\n" + asm_file.read_text())
 
-        for src, obj in [(runtime_s, runtime_o), (hamnix_s, main_o)]:
+        # TEMP_DEBUG_HAMSH_BRINGUP: per-binary marker override. Strong
+        # definitions of __runtime_start_mark / _end clobber the .weak
+        # fallback in user/runtime.S. .ascii (no trailing NUL) plus the
+        # bracketing labels means `_end - _start` is exactly the byte
+        # count we want passed as sys_write's count arg.
+        progname_s = tmpdir / "progname.S"
+        progname_s.write_text(
+            ".code64\n"
+            "    .section .rodata\n"
+            "    .align 8\n"
+            "    .globl __runtime_start_mark\n"
+            "    .globl __runtime_start_mark_end\n"
+            "__runtime_start_mark:\n"
+            f'    .ascii "[runtime:{progname_safe}] _start\\n"\n'
+            "__runtime_start_mark_end:\n"
+        )
+
+        for src, obj in [(runtime_s, runtime_o),
+                         (progname_s, progname_o),
+                         (hamnix_s, main_o)]:
             result = subprocess.run(
                 [as_cmd, "--32", "-o", str(obj), str(src)],
                 capture_output=True, text=True,
@@ -653,15 +695,17 @@ def assemble_and_link_x86_user(asm_file: Path, output: Path,
                       file=sys.stderr)
                 return False
 
-        # runtime.o first so _start (and the syscall stubs the user
-        # code calls into) sits at the very start of .text. The
-        # linker script doesn't strictly require this — _start is the
-        # ENTRY — but listing it first keeps the layout predictable
-        # when eyeballing `objdump -d`.
+        # progname.o BEFORE runtime.o so the linker sees the strong
+        # __runtime_start_mark first; runtime.o's same-named .weak
+        # symbols then quietly defer to it. runtime.o still has to
+        # come early so _start (and the syscall stubs the user code
+        # calls into) sits at the start of .text — the linker script
+        # doesn't strictly require this but it keeps `objdump -d`
+        # layout predictable.
         link_cmd = [
             ld_cmd, "-m", "elf_i386", "-nostdlib", "-static",
             "-T", str(lds), "-o", str(output),
-            str(runtime_o), str(main_o),
+            str(progname_o), str(runtime_o), str(main_o),
         ]
         result = subprocess.run(link_cmd, capture_output=True, text=True)
         if result.returncode != 0:
@@ -711,7 +755,13 @@ def cmd_compile(args: argparse.Namespace) -> int:
         if args.target == "x86_64-bare-metal":
             ok = assemble_and_link_x86_bare(asm_path, output, find_hamnix_root())
         elif args.target == "x86_64-adder-user":
-            ok = assemble_and_link_x86_user(asm_path, output, find_hamnix_root())
+            # TEMP_DEBUG_HAMSH_BRINGUP: pass the source-file stem as the
+            # progname so runtime.S's _start marker is per-binary
+            # distinguishable (e.g. "[runtime:init]" vs "[runtime:hamsh]").
+            ok = assemble_and_link_x86_user(
+                asm_path, output, find_hamnix_root(),
+                progname=source_file.stem,
+            )
         else:
             raise AssertionError(
                 f"x86_64-bare-metal / x86_64-adder-user are the only "

@@ -92,6 +92,17 @@ _start:
      * via sys_write(2, ...) reach the console — narrowing any silent
      * post-execve gap to "between _start and main()'s first print".
      *
+     * Per-binary distinguisher: __runtime_start_mark and
+     * __runtime_start_mark_end are .weak here with a fallback "unknown"
+     * payload, and overridden per-binary by progname.o (generated and
+     * linked by compiler/adder.py::assemble_and_link_x86_user). So
+     * /init's _start prints "[runtime:init] _start" while hamsh's
+     * _start prints "[runtime:hamsh] _start" — two distinct lines that
+     * tell us whether SYSRETQ out of hamsh's execve actually landed in
+     * hamsh's _start at all. If only "[runtime:init]" shows up on real
+     * hardware, the kernel bug is between execve_finish and the first
+     * user-mode instruction; if both show up, the wedge is later.
+     *
      * Calling convention: %rdi = argc, %rsi = argv on entry from the
      * kernel. The syscall clobbers %rax / %rcx / %r11; we use %rdi /
      * %rsi / %rdx as direct syscall arg regs (so we must save and
@@ -105,8 +116,8 @@ _start:
     pushq   %rsi                            /* save argv */
     movq    $8, %rax                        /* SYS_WRITE */
     movq    $2, %rdi                        /* fd 2 = stderr -> framebuffer */
-    leaq    _hamsh_runtime_start_mark(%rip), %rsi
-    movq    $_hamsh_runtime_start_mark_end - _hamsh_runtime_start_mark, %rdx
+    leaq    __runtime_start_mark(%rip), %rsi
+    movq    $__runtime_start_mark_end - __runtime_start_mark, %rdx
     syscall
     popq    %rsi                            /* restore argv */
     popq    %rdi                            /* restore argc */
@@ -131,12 +142,27 @@ _start:
      * string. Sits in .rodata which init.lds merges into the single
      * PT_LOAD .text segment, so it loads alongside _start with no
      * extra program header. RIP-relative leaq above resolves with a
-     * 32-bit displacement — fine within one PT_LOAD. */
+     * 32-bit displacement — fine within one PT_LOAD.
+     *
+     * Per-binary distinguisher: these symbols are .weak with a fallback
+     * "unknown" payload below. Every Adder-compiled user binary's link
+     * pulls in a tiny progname.o (synthesized by
+     * compiler/adder.py::assemble_and_link_x86_user from the source's
+     * basename) that supplies STRONG definitions of the same two
+     * symbols, with a `[runtime:<name>] _start\n` payload. The linker
+     * prefers the strong definitions, so each binary ships its own
+     * marker text. The hand-written .S binaries (hello, stdin_demo)
+     * don't go through assemble_and_link_x86_user and thus fall back
+     * to the weak "[runtime:unknown] _start" — that's fine, they're
+     * not part of the init/hamsh bring-up path.
+     */
     .section .rodata
     .align 8
-_hamsh_runtime_start_mark:
-    .ascii "[hamsh-runtime] _start\n"
-_hamsh_runtime_start_mark_end:
+    .weak __runtime_start_mark
+    .weak __runtime_start_mark_end
+__runtime_start_mark:
+    .ascii "[runtime:unknown] _start\n"
+__runtime_start_mark_end:
 
     .section .text, "ax"
 
