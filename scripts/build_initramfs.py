@@ -159,6 +159,20 @@ if os.environ.get("ENABLE_XHCI_SELFTEST") == "1":
 if os.environ.get("ENABLE_XHCI_NO_ATTACH") == "1":
     FILES.append(("/etc/xhci-no-attach", b"1\n"))
 
+# xHCI full-skip OPT-OUT. The bigger sibling of ENABLE_XHCI_NO_ATTACH:
+# setting ENABLE_XHCI_NO_INIT=1 plants /etc/xhci-no-init so
+# drivers/usb/xhci.ad's xhci_init() returns immediately AFTER the
+# safe PCI find/cap-read prints and BEFORE the first MMIO BAR access
+# (halt/reset poll). Use this on real silicon where the MMIO load
+# itself stalls the CPU — no software timeout helps because the load
+# instruction never retires. Intel Nook boot 2026-05 wedged at
+# [boot:01.c] xhci halt + reset; this marker lets the box boot past
+# the xHCI block entirely and continue into ehci_init / start_kernel.
+# Default boots do NOT ship the marker, so behavior is unchanged
+# unless the user explicitly sets ENABLE_XHCI_NO_INIT=1.
+if os.environ.get("ENABLE_XHCI_NO_INIT") == "1":
+    FILES.append(("/etc/xhci-no-init", b"1\n"))
+
 # Native `ping` smoke. scripts/test_ping.sh sets ENABLE_PING_SMOKE=1 to
 # plant /etc/ping-smoke-test in the initramfs. The marker is consumed
 # only by the test harness today (a future kernel-side autorun could
