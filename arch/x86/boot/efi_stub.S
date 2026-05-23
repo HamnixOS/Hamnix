@@ -44,11 +44,22 @@
  *         Patch *boot_via_efi_addr = 1 so e820_init() takes the EFI
  *         fallback branch.
  *   5. Call BootServices->GetMemoryMap() into a 16 KiB static buffer
- *      to obtain the current MapKey.
+ *      to obtain the current MapKey AND the firmware-reported memory
+ *      map. The descriptor array, total size, descriptor stride, and
+ *      revision tag are kept in efi_mmap_{buf,size,descsize,descver}
+ *      (.bss / .data of this stub's image — EfiLoaderCode/Data, NOT
+ *      reclaimed by firmware after ExitBootServices, so the buffer
+ *      stays live for the kernel to walk).
  *   6. Call BootServices->ExitBootServices(ImageHandle, MapKey). Retry
  *      up to EFI_EXIT_RETRY_MAX times on EFI_INVALID_PARAMETER (stale
  *      MapKey because firmware allocated between GetMemoryMap and
  *      ExitBootServices).
+ *   6b. Stash {buf_phys, size, desc_size, desc_version, present=1} into
+ *       the kernel's `efi_mmap_info` struct (.boot.data; address pulled
+ *       from handoff slot +68 in step 4i). arch/x86/kernel/e820.ad reads
+ *       this on the EFI path to feed memblock the largest free RAM
+ *       region the firmware advertised — unlocks > 240 MiB on UEFI
+ *       boots that previously hit the conservative fallback ceiling.
  *   7. Write "[hamnix] post-EFI handoff complete\r\n" to COM1.
  *   8. Build identity-mapped page tables in the stub's own .bss:
  *      PML4[0]->PDPT, PDPT[0..511]->1 GiB pages covering [0, 512 GiB).
@@ -476,6 +487,15 @@ efi_main:
     movl    64(%rsi), %eax                  /* efi_fb_info addr */
     movq    %rax, efi_kernel_fb_info_ptr(%rip)
 
+    /* EFI memory-map handoff: pull &efi_mmap_info out of the +68 slot.
+     * We populate this struct AFTER ExitBootServices succeeds (below),
+     * because the descriptor array contents in efi_mmap_buf are only
+     * known to be the FINAL map once ExitBootServices accepts that
+     * GetMemoryMap's MapKey. The struct itself lives in the kernel's
+     * LOW .boot.data, so a 32-bit address is the right shape. */
+    movl    68(%rsi), %eax                  /* efi_mmap_info addr */
+    movq    %rax, efi_kernel_mmap_info_ptr(%rip)
+
     /* Patch *boot_via_efi = 1 so e820_init() takes the EFI fallback. */
     movq    efi_boot_via_efi_ptr(%rip), %rax
     movl    $1, (%rax)
@@ -662,6 +682,75 @@ efi_main:
 .Lefi_exit_ok:
     leaq    efi_post_handoff_msg(%rip), %rsi
     call    efi_serial_puts
+
+    /* =================================================================
+     * Hand the EFI memory map to the kernel (M16.155).
+     *
+     * The last GetMemoryMap call above (the one whose MapKey
+     * ExitBootServices accepted) wrote the LIVE descriptor array into
+     * efi_mmap_buf with:
+     *   efi_mmap_size      = total bytes written
+     *   efi_mmap_descsize  = stride of one EFI_MEMORY_DESCRIPTOR
+     *   efi_mmap_descver   = revision tag (always 1 today)
+     *
+     * Stash the buffer's RUNTIME address + the three sizes into the
+     * kernel's efi_mmap_info struct. The kernel then walks the
+     * descriptors in e820_init() to unlock every byte of usable RAM
+     * the firmware advertised (replaces the conservative 2..240 MiB
+     * fallback that capped RAM on UEFI boots).
+     *
+     * The descriptor buffer lives in this stub's .bss — i.e. inside
+     * the EfiLoaderCode/Data region firmware allocated for our image.
+     * That memory is NOT reclaimed by firmware after ExitBootServices
+     * and is deliberately excluded from memblock's free pool by the
+     * walker (only EfiConventionalMemory + EfiBootServicesCode/Data
+     * are pulled in), so the pointer remains live for the kernel's
+     * lifetime — long enough to consume during e820_init().
+     *
+     * Layout (matches boot_info_asm.S efi_mmap_info):
+     *   off  0: present       (u32)
+     *   off  4: desc_size     (u32)
+     *   off  8: buf_phys      (u64)
+     *   off 16: size_bytes    (u64)
+     *   off 24: desc_version  (u32)
+     *   off 28: _reserved     (u32)
+     *   off 32: _reserved64   (u64)
+     *
+     * Write `present` LAST so a reader can never see a half-populated
+     * record. The kernel is single-threaded at this point so the
+     * ordering is mostly self-documenting, but cheap and correct. */
+    movq    efi_kernel_mmap_info_ptr(%rip), %r10
+    testq   %r10, %r10
+    jz      .Lefi_mmap_handoff_skip         /* old kernel, no +68 slot */
+
+    /* desc_size (u32) */
+    movq    efi_mmap_descsize(%rip), %rax
+    movl    %eax, 4(%r10)
+
+    /* buf_phys = runtime address of efi_mmap_buf (u64) */
+    leaq    efi_mmap_buf(%rip), %rax
+    movq    %rax, 8(%r10)
+
+    /* size_bytes (u64) */
+    movq    efi_mmap_size(%rip), %rax
+    movq    %rax, 16(%r10)
+
+    /* desc_version (u32) */
+    movq    efi_mmap_descver(%rip), %rax
+    movl    %eax, 24(%r10)
+
+    /* present = 1 — LAST. */
+    movl    $1, 0(%r10)
+
+    leaq    efi_msg_mmap_ok(%rip), %rsi
+    call    efi_serial_puts
+    jmp     .Lefi_mmap_handoff_done
+
+.Lefi_mmap_handoff_skip:
+    leaq    efi_msg_mmap_skip(%rip), %rsi
+    call    efi_serial_puts
+
+.Lefi_mmap_handoff_done:
 
     /* =================================================================
      * STEP 8: Build identity-mapped page tables (1 GiB pages, 512 GiB).
@@ -963,6 +1052,10 @@ efi_msg_gop_ok:
     .asciz  "[hamnix] EFI: GOP captured\r\n"
 efi_msg_gop_skip:
     .asciz  "[hamnix] EFI: GOP unavailable (skipped)\r\n"
+efi_msg_mmap_ok:
+    .asciz  "[hamnix] EFI: memory map handed off\r\n"
+efi_msg_mmap_skip:
+    .asciz  "[hamnix] EFI: kernel has no efi_mmap_info slot (skipped)\r\n"
 
     /* UEFI protocol GUIDs (16-byte structures, little-endian on x86).
      *
@@ -1120,6 +1213,13 @@ efi_boot_via_efi_ptr:       .quad 0
 efi_gop:                    .quad 0
     .globl efi_kernel_fb_info_ptr
 efi_kernel_fb_info_ptr:     .quad 0
+    /* M16.155: Address of the kernel's `efi_mmap_info` struct (in
+     * arch/x86/kernel/boot_info_asm.S .boot.data). Pulled from the +68
+     * handoff slot. After ExitBootServices the stub stashes the EFI
+     * memory-map descriptor pointer + sizes here so e820_init() can
+     * walk the descriptors and unlock RAM > 240 MiB on UEFI boots. */
+    .globl efi_kernel_mmap_info_ptr
+efi_kernel_mmap_info_ptr:   .quad 0
 
     /* GetMemoryMap scratch. */
     .align 8

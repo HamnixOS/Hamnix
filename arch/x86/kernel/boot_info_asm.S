@@ -147,6 +147,76 @@ get_efi_fb_size:
     movq    32(%rcx), %rax
     ret
 
+    /* ---- EFI memory-map accessors -------------------------------------
+     *
+     * efi_mmap_info is a kernel-side .boot.data record populated by the
+     * UEFI stub (arch/x86/boot/efi_stub.S) right BEFORE ExitBootServices.
+     * The stub locates this struct via handoff slot +68 in header.S's
+     * multiboot header. Once populated, the kernel can walk the firmware
+     * memory map (EFI_MEMORY_DESCRIPTOR records at buf_phys) to discover
+     * every byte of usable RAM the firmware advertised — instead of
+     * falling back to the conservative 2..240 MiB hardcoded window.
+     *
+     * Layout (40 bytes — keep wide for forward-compatibility):
+     *
+     *   off  0: uint32 present          (1 = populated, 0 = no EFI map)
+     *   off  4: uint32 desc_size        (EFI_MEMORY_DESCRIPTOR stride —
+     *                                    NOT necessarily 48; firmware
+     *                                    can pad it for future ABI
+     *                                    extensions)
+     *   off  8: uint64 buf_phys         (descriptor array, physical addr
+     *                                    inside the stub's loader image,
+     *                                    identity-mapped so the kernel
+     *                                    can deref directly)
+     *   off 16: uint64 size_bytes       (total descriptor-array size;
+     *                                    entry count = size_bytes /
+     *                                    desc_size)
+     *   off 24: uint32 desc_version     (revision tag from firmware;
+     *                                    currently always 1)
+     *   off 28: uint32 _reserved        (alignment + room for future
+     *                                    flags without churning the
+     *                                    handoff ABI)
+     *   off 32: uint64 _reserved64
+     *
+     * Zero on every BIOS / multiboot1 boot — boot.data starts zeroed and
+     * only the UEFI stub touches this region. get_efi_mmap_present()
+     * returning 0 is the well-defined "no EFI map" signal.
+     */
+    .align 16
+    .globl get_efi_mmap_present
+get_efi_mmap_present:
+    movabsq $efi_mmap_info, %rax
+    movl    0(%rax), %eax
+    ret
+
+    .align 16
+    .globl get_efi_mmap_desc_size
+get_efi_mmap_desc_size:
+    movabsq $efi_mmap_info, %rax
+    movl    4(%rax), %eax
+    ret
+
+    .align 16
+    .globl get_efi_mmap_buf_phys
+get_efi_mmap_buf_phys:
+    movabsq $efi_mmap_info, %rcx
+    movq    8(%rcx), %rax
+    ret
+
+    .align 16
+    .globl get_efi_mmap_size_bytes
+get_efi_mmap_size_bytes:
+    movabsq $efi_mmap_info, %rcx
+    movq    16(%rcx), %rax
+    ret
+
+    .align 16
+    .globl get_efi_mmap_desc_version
+get_efi_mmap_desc_version:
+    movabsq $efi_mmap_info, %rax
+    movl    24(%rax), %eax
+    ret
+
     /* ---- EFI GOP framebuffer storage ----------------------------------
      *
      * Lives in .boot.data (the LOW boot region) so the EFI handoff
@@ -168,3 +238,33 @@ efi_fb_info:
     .long 0     /* off 20 bpp           */
     .quad 0     /* off 24 base (uint64) */
     .quad 0     /* off 32 size (uint64) */
+
+    /* ---- EFI memory-map handoff storage --------------------------------
+     *
+     * Sibling of efi_fb_info: 40 bytes of kernel-side .boot.data populated
+     * by arch/x86/boot/efi_stub.S right before ExitBootServices. The stub
+     * locates this struct via handoff slot +68 in the multiboot header
+     * (arch/x86/boot/header.S) — a 32-bit address suffices because every
+     * symbol referenced from the handoff table lives in the LOW boot
+     * region (.boot.data).
+     *
+     * The actual descriptor array is NOT copied here. The stub points
+     * buf_phys at the descriptors as they sit in its own .bss
+     * (efi_mmap_buf, ~16 KiB). After ExitBootServices that memory is
+     * still allocated to the loaded EFI image (EfiLoaderCode/Data
+     * regions) — firmware will not reclaim it, and our identity map
+     * covers all 512 GiB, so the kernel can dereference buf_phys
+     * directly. We deliberately do NOT include EfiLoaderCode/Data in
+     * the memblock-free pool, so the stub's image (and its EFI mmap
+     * scratch) stays unreserved-from-overwrite.
+     */
+    .align 8
+    .globl efi_mmap_info
+efi_mmap_info:
+    .long 0     /* off  0 present              */
+    .long 0     /* off  4 desc_size (stride)   */
+    .quad 0     /* off  8 buf_phys             */
+    .quad 0     /* off 16 size_bytes           */
+    .long 0     /* off 24 desc_version         */
+    .long 0     /* off 28 _reserved            */
+    .quad 0     /* off 32 _reserved64          */

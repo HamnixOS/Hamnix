@@ -90,22 +90,32 @@ multiboot_header:
     /* ---- Hamnix EFI handoff table (fixed offset 48) -----------------
      *
      *   +48  uint32  HAMNIX_HANDOFF_MAGIC ("HAMX")
-     *   +52  uint32  efi_entry_addr   = &_x86_start_after_loader
-     *   +56  uint32  boot_via_efi_addr = &boot_via_efi
-     *   +60  uint32  gdt64_addr       = &gdt64
-     *   +64  uint32  efi_fb_info_addr = &efi_fb_info (GOP capture)
+     *   +52  uint32  efi_entry_addr     = &_x86_start_after_loader
+     *   +56  uint32  boot_via_efi_addr  = &boot_via_efi
+     *   +60  uint32  gdt64_addr         = &gdt64
+     *   +64  uint32  efi_fb_info_addr   = &efi_fb_info  (GOP capture)
+     *   +68  uint32  efi_mmap_info_addr = &efi_mmap_info (EFI memmap)
      *
      * EVERY symbol referenced here lives in the LOW boot region
      * (.head.text / .boot.text / .boot.data), so each .long resolves
      * to a real 32-bit address even though the kernel proper is now
      * linked in the higher half. The EFI stub patches/reads these by
      * their LOW physical address (= LMA = VMA for the boot region).
+     *
+     * Slot +68 (efi_mmap_info_addr) is the M16.155 "unlock RAM > 240 MiB
+     * on UEFI" wiring: the stub stashes a pointer + size for the
+     * EFI_MEMORY_DESCRIPTOR array it captured via GetMemoryMap right
+     * before ExitBootServices. e820_init() in arch/x86/kernel/e820.ad
+     * walks the descriptors to pick the largest free-RAM region — same
+     * shape as the multiboot1-mmap path, but driven by firmware truth
+     * rather than the conservative 2..240 MiB fallback.
      */
     .long   HAMNIX_HANDOFF_MAGIC    /* off 48 */
     .long   _x86_start_after_loader /* off 52 */
     .long   boot_via_efi            /* off 56 */
     .long   gdt64                   /* off 60 */
     .long   efi_fb_info             /* off 64 */
+    .long   efi_mmap_info           /* off 68 */
 
 /* ---------- 32-bit protected-mode entry ---------------------------- */
     .globl  _start
