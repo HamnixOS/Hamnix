@@ -53,11 +53,12 @@
 #
 # CAPS (top-level BSS — U9 nested-frame-Array quirk; tune here)
 # -------------------------------------------------------------
-#   NODE_CAP   =  384   nodes (dirs + files) total
-#   FID_CAP    =   64   concurrent fids
-#   FILE_CAP   =  65536 bytes per file (64 KiB)
-#   NAME_CAP   =   64   bytes per node name
-#   DATA_SLOT_CAP = 160 file-data slots
+#   NODE_CAP        =  384   nodes (dirs + files) total
+#   FID_CAP         =   64   concurrent fids
+#   SLOT_CAP        =  65536 bytes per data slot (64 KiB)
+#   CHAIN_LEN       =   64   slots per file (up to 4 MiB per file)
+#   NAME_CAP        =   64   bytes per node name
+#   DATA_SLOT_CAP   =  512   file-data slots (32 MiB total pool)
 #
 # A real Debian package is mostly DIRECTORIES plus many small files: the
 # canonical `hello` package has ~143 data.tar entries, roughly half of
@@ -65,14 +66,25 @@
 # chains). So NODE_CAP must be a few hundred, but the *file-data* pool
 # should NOT be NODE_CAP-wide — a directory node needs no data buffer.
 #
-# Hence file data is decoupled from the node index: a node's data
-# buffer is a DATA_SLOT_CAP-pooled 64 KiB slot, allocated lazily on the
-# node's first Twrite (node_dataslot[i], -1 until allocated). The pool
-# is DATA_SLOT_CAP * FILE_CAP = 160 * 64 KiB = 10 MiB of BSS — far less
-# than the old NODE_CAP-wide pool would cost at NODE_CAP=384, and it
-# comfortably holds every regular file a small package installs.
-# Still RAM-backed + volatile (the namespace VIEW is ephemeral; durable
-# persistence — ext4-backed distrofs — is the documented next step).
+# V2 (chunked file storage): file data is decoupled from the node
+# index, and EACH FILE may claim up to CHAIN_LEN slots from a shared
+# pool. node_slot_chain[i] is an array of CHAIN_LEN slot indices (-1
+# means "slot not yet allocated"); on every Twrite that lands past the
+# current chain a fresh slot is pulled from the pool. The pool is
+# DATA_SLOT_CAP * SLOT_CAP = 512 * 64 KiB = 32 MiB of BSS. libc6 is
+# the load-bearing test: 296 data.tar entries, ~13 MiB of file data,
+# but slot-counting is dominated by the 255 tiny gconv .so files
+# (each consumes one 64 KiB slot regardless of being only ~24 KiB) —
+# slot demand works out to ~390 even though raw bytes are 13 MiB.
+# 512 leaves headroom for two libc6-class packages in one snapshot.
+# Per-host BSS = 32 MiB; three daemons spawn on a distro-shape
+# namespace (96 MiB total) which fits inside QEMU's 512 MiB guest
+# (the apt install tests run with `-m 512M`). Pre-V2 (one slot per
+# node, 64 KiB per file) silently short-wrote any file past 64 KiB
+# and dpkg surfaced the short-write but kept going — the extracted
+# binary was unusable. Still RAM-backed + volatile (the namespace
+# VIEW is ephemeral; durable persistence — ext4-backed distrofs —
+# is the documented next step).
 #
 # 9P MESSAGE COVERAGE
 # -------------------
@@ -143,9 +155,11 @@ from lib.9p.9p import (
 
 NODE_CAP:      uint64 = 384
 FID_CAP:       uint64 = 64
-FILE_CAP:      uint64 = 65536        # 64 KiB per file
+SLOT_CAP:      uint64 = 65536        # 64 KiB per data slot
+CHAIN_LEN:     uint64 = 64           # max slots per file (4 MiB cap)
+FILE_CAP:      uint64 = 4194304      # = SLOT_CAP * CHAIN_LEN (4 MiB)
 NAME_CAP:      uint64 = 64
-DATA_SLOT_CAP: uint64 = 160          # pooled file-data slots
+DATA_SLOT_CAP: uint64 = 512          # pooled file-data slots (32 MiB total)
 
 # Node kinds.
 KIND_FREE: uint8 = 0
@@ -174,8 +188,13 @@ srv_buf: Array[8192, uint8]
 #   node_namelen[i]   basename length in bytes
 #   node_size[i]      file: data byte count; dir: unused (0)
 #   node_vers[i]      qid.vers — bumped on every write
-#   node_dataslot[i]  index into the file-data pool, or -1 (no data
-#                     buffer allocated yet — directories stay -1)
+#   node_slot_chain[i*CHAIN_LEN + k]
+#                     k'th 64 KiB chunk index for this file, or -1 if
+#                     that chunk hasn't been allocated yet. Directories
+#                     never claim any chunks.
+#   node_chain_len[i] number of slots in the chain that are actually
+#                     bound — chunks past this count have never been
+#                     written.
 #
 # A node's qid.path is just its index (+ 1 so root is path 1, matching
 # the p9srv_demo convention of "no file has path 0").
@@ -186,14 +205,20 @@ node_name:     Array[24576, uint8]    # NODE_CAP * NAME_CAP
 node_namelen:  Array[384, uint64]
 node_size:     Array[384, uint64]
 node_vers:     Array[384, uint32]
-node_dataslot: Array[384, int64]      # -1 until a data slot is bound
 
-# File-data pool: DATA_SLOT_CAP slots of FILE_CAP bytes = 160 * 64 KiB
-# = 10 MiB. Decoupled from the node index — directories never consume a
-# slot. dataslot_used[s] marks a slot live; a slot is bound to a node
-# lazily on that node's first Twrite (see _node_ensure_dataslot).
-node_data:      Array[10485760, uint8]
-dataslot_used:  Array[160, uint8]
+# V2 chunked file storage. Each file owns a chain of up to CHAIN_LEN
+# slot indices in node_slot_chain (flat NODE_CAP * CHAIN_LEN layout, -1
+# means "not yet allocated"). node_chain_len[i] tracks how many slots
+# are currently bound for that file. Slots are pulled lazily from the
+# shared pool on every Twrite that lands past the current chain end.
+node_slot_chain: Array[24576, int32]  # NODE_CAP * CHAIN_LEN = 384*64
+node_chain_len:  Array[384, uint64]   # slots in use per node
+
+# File-data pool: DATA_SLOT_CAP slots of SLOT_CAP bytes = 512 * 64 KiB
+# = 32 MiB. Decoupled from the node index — directories never consume
+# a slot. dataslot_used[s] marks a slot live.
+node_data:      Array[33554432, uint8]    # 32 MiB
+dataslot_used:  Array[512, uint8]
 
 # -- Fid table (top-level BSS) -----------------------------------------
 #
@@ -238,24 +263,34 @@ walk_qpaths: Array[16, uint64]
 # that was opened for write (so once per installed file, not once per
 # Twrite) and at clean EOF.
 #
-# SNAPSHOT FORMAT (little-endian, version 02)
-#   magic[8]              "DFSIMG02"
-#   node_kind[NODE_CAP]            u8   each
-#   node_parent[NODE_CAP]          u64  each
-#   node_name[NODE_CAP*NAME_CAP]   u8   each
-#   node_namelen[NODE_CAP]         u64  each
-#   node_size[NODE_CAP]            u64  each
-#   node_vers[NODE_CAP]            u32  each
-#   node_dataslot[NODE_CAP]        i64  each
-#   then, for every KIND_FILE node that has a bound data slot, in
-#   ascending node index order: node_size[i] bytes of that node's
-#   file data. Directories and never-written files contribute none.
+# SNAPSHOT FORMAT (little-endian, version 03 — chunked file storage)
+#   magic[8]              "DFSIMG03"
+#   node_kind[NODE_CAP]                       u8   each
+#   node_parent[NODE_CAP]                     u64  each
+#   node_name[NODE_CAP*NAME_CAP]              u8   each
+#   node_namelen[NODE_CAP]                    u64  each
+#   node_size[NODE_CAP]                       u64  each
+#   node_vers[NODE_CAP]                       u32  each
+#   node_chain_len[NODE_CAP]                  u64  each
+#   then, for every KIND_FILE node with chain_len > 0, in ascending
+#   node index order: node_size[i] bytes of that node's file data
+#   (the contents read out by walking the slot chain, so the bytes
+#   on disk are a flat linear copy of the file regardless of how
+#   the in-RAM chunks are stitched together).
 #
-# The fixed metadata block is NODE_CAP-derived and small (~38 KiB at
+# A snapshot from version 02 (single dataslot per file, 64 KiB cap)
+# is rejected — distrofs starts fresh on a 02-format image. Files
+# under 64 KiB would have round-tripped, but the existing fixtures
+# never persist across an installer change anyway.
+#
+# The fixed metadata block is NODE_CAP-derived and small (~41 KiB at
 # NODE_CAP=384); the data block is the sum of every written file's
-# size. SNAP_CAP bounds the whole image — 4 MiB comfortably holds a
-# small Debian package (the `hello` package's data is well under
-# 100 KiB) while staying a fraction of the 10 MiB data pool.
+# size. SNAP_CAP bounds the whole image — 20 MiB; a snapshot of
+# everything bigger than that is refused (the in-RAM data pool may
+# be up to 32 MiB). Persistence is opt-in (sys_dfs_save) and only
+# fires when the daemon is explicitly bound to a backing instance.
+# A future tick that streams the snapshot through ext4 incrementally
+# would let SNAP_CAP go away entirely.
 
 SNAP_MAGIC0: uint8 = 68      # 'D'
 SNAP_MAGIC1: uint8 = 70      # 'F'
@@ -264,10 +299,10 @@ SNAP_MAGIC3: uint8 = 73      # 'I'
 SNAP_MAGIC4: uint8 = 77      # 'M'
 SNAP_MAGIC5: uint8 = 71      # 'G'
 SNAP_MAGIC6: uint8 = 48      # '0'
-SNAP_MAGIC7: uint8 = 50      # '2'
+SNAP_MAGIC7: uint8 = 51      # '3'
 
-SNAP_CAP: uint64 = 4194304   # 4 MiB serialisation buffer
-snap_buf: Array[4194304, uint8]
+SNAP_CAP: uint64 = 20971520  # 20 MiB serialisation buffer
+snap_buf: Array[20971520, uint8]
 
 # Persistent-backing instance id (0..15). One Hamnix host can run
 # several distrofs daemons (nsrun spawns one each for /var, /usr,
@@ -382,23 +417,38 @@ def _dfs_serialize() -> uint64:
     while i < NODE_CAP:
         off = _snap_put_u32(off, node_vers[i])
         i = i + 1
-    # node_dataslot[].
+    # node_chain_len[].
     i = 0
     while i < NODE_CAP:
-        off = _snap_put_u64(off, cast[uint64](node_dataslot[i]))
+        off = _snap_put_u64(off, node_chain_len[i])
         i = i + 1
-    # File data: node_size bytes for every KIND_FILE node with a slot.
+    # File data: walk each file's chunk chain and emit its logical
+    # byte stream end to end. node_size bytes for every KIND_FILE node
+    # with chain_len > 0, in ascending node index order.
     i = 0
     while i < NODE_CAP:
-        if node_kind[i] == KIND_FILE and node_dataslot[i] >= cast[int64](0):
+        if node_kind[i] == KIND_FILE and node_chain_len[i] > 0:
             sz: uint64 = node_size[i]
             if off + sz > SNAP_CAP:
                 return 0                          # image too large
-            base: uint64 = cast[uint64](node_dataslot[i]) * FILE_CAP
-            j: uint64 = 0
-            while j < sz:
-                snap_buf[off + j] = node_data[base + j]
-                j = j + 1
+            written: uint64 = 0
+            while written < sz:
+                chunk_idx: uint64 = written / SLOT_CAP
+                in_chunk:  uint64 = written % SLOT_CAP
+                room: uint64 = SLOT_CAP - in_chunk
+                take: uint64 = sz - written
+                if take > room:
+                    take = room
+                chunk_base: uint64 = _node_get_chunk(i, chunk_idx, 0)
+                k: uint64 = 0
+                while k < take:
+                    if chunk_base == 0:
+                        snap_buf[off + written + k] = 0
+                    else:
+                        snap_buf[off + written + k] = \
+                            node_data[chunk_base + in_chunk + k]
+                    k = k + 1
+                written = written + take
             off = off + sz
         i = i + 1
     return off
@@ -460,35 +510,55 @@ def _dfs_deserialize(image_len: uint64) -> int32:
         node_vers[i] = _snap_get_u32(off)
         off = off + 4
         i = i + 1
-    i = 0
-    while i < NODE_CAP:
-        node_dataslot[i] = cast[int64](_snap_get_u64(off))
-        off = off + 8
-        i = i + 1
-    # Reset the data-slot allocator and rebuild it from the loaded
-    # node_dataslot bindings, copying each file's bytes back into its
-    # pool slot.
+    # Reset the chain table and data-slot allocator. The on-disk image
+    # carries chain_len[] but NOT the slot-index assignments — those
+    # are re-allocated on the fly as we re-stream each file's bytes
+    # back through _node_get_chunk(create=1). Slot 0 stays reserved
+    # (see init_tree's note).
     s: uint64 = 0
     while s < DATA_SLOT_CAP:
         dataslot_used[s] = 0
         s = s + 1
+    dataslot_used[0] = 1
+    i = 0
+    while i < NODE_CAP * CHAIN_LEN:
+        node_slot_chain[i] = cast[int32](-1)
+        i = i + 1
     i = 0
     while i < NODE_CAP:
-        if node_kind[i] == KIND_FILE and node_dataslot[i] >= cast[int64](0):
-            ds: uint64 = cast[uint64](node_dataslot[i])
-            if ds >= DATA_SLOT_CAP:
-                return 0                          # malformed slot index
-            dataslot_used[ds] = 1
+        node_chain_len[i] = _snap_get_u64(off)
+        off = off + 8
+        i = i + 1
+    # Re-stream each file's bytes back into freshly-allocated chunks.
+    i = 0
+    while i < NODE_CAP:
+        if node_kind[i] == KIND_FILE and node_chain_len[i] > 0:
             sz: uint64 = node_size[i]
             if sz > FILE_CAP:
                 return 0
             if off + sz > image_len:
                 return 0                          # data block truncated
-            base: uint64 = ds * FILE_CAP
-            j: uint64 = 0
-            while j < sz:
-                node_data[base + j] = snap_buf[off + j]
-                j = j + 1
+            # Pre-clear chain_len so _node_get_chunk re-counts as it
+            # allocates each chunk; otherwise the cap check would be
+            # off-by-{count of chunks restored}.
+            node_chain_len[i] = 0
+            written: uint64 = 0
+            while written < sz:
+                chunk_idx: uint64 = written / SLOT_CAP
+                in_chunk:  uint64 = written % SLOT_CAP
+                room: uint64 = SLOT_CAP - in_chunk
+                take: uint64 = sz - written
+                if take > room:
+                    take = room
+                chunk_base: uint64 = _node_get_chunk(i, chunk_idx, 1)
+                if chunk_base == 0:
+                    return 0                      # data-pool exhausted
+                k: uint64 = 0
+                while k < take:
+                    node_data[chunk_base + in_chunk + k] = \
+                        snap_buf[off + written + k]
+                    k = k + 1
+                written = written + take
             off = off + sz
         i = i + 1
     return 1
@@ -567,7 +637,11 @@ def node_alloc(kind: uint8, parent: uint64,
             node_namelen[i]  = namelen
             node_size[i]     = 0
             node_vers[i]     = 0
-            node_dataslot[i] = cast[int64](-1)   # no data buffer yet
+            node_chain_len[i] = 0
+            ci: uint64 = 0
+            while ci < CHAIN_LEN:
+                node_slot_chain[i * CHAIN_LEN + ci] = cast[int32](-1)
+                ci = ci + 1
             j: uint64 = 0
             while j < namelen:
                 node_name[i * NAME_CAP + j] = name[j]
@@ -580,20 +654,51 @@ def node_alloc(kind: uint8, parent: uint64,
     return cast[int64](-1)
 
 
-# Bind a file-data pool slot to node `idx` if it does not have one yet.
-# Returns the slot index (>= 0) on success, -1 if the data pool is
-# exhausted. Directories never call this — only a Twrite to a file.
+# Bind a file-data pool slot for chunk `chunk_idx` (0..CHAIN_LEN-1) of
+# node `idx` if it does not have one yet. Returns the absolute byte
+# address of the 64 KiB chunk in node_data, or 0 if the pool is
+# exhausted or chunk_idx is out of range. Directories never call this —
+# only a Twrite to a file does, lazily on each chunk index touched.
 
-def _node_ensure_dataslot(idx: uint64) -> int64:
-    if node_dataslot[idx] >= cast[int64](0):
-        return node_dataslot[idx]
-    s: uint64 = 0
+def _node_get_chunk(idx: uint64, chunk_idx: uint64,
+                    create: int32) -> uint64:
+    # Returns the byte address of chunk `chunk_idx` for node `idx`
+    # within node_data, or 0 if not allocated / unable to allocate.
+    # NOTE: slot 0 of the pool is RESERVED (dataslot_used[0]=1 at
+    # init); we never hand out slot 0, so a byte address of 0 in
+    # node_data unambiguously means "no chunk". Otherwise a freshly-
+    # allocated slot 0 would look identical to "no chunk".
+    if chunk_idx >= CHAIN_LEN:
+        return 0
+    cell: uint64 = idx * CHAIN_LEN + chunk_idx
+    cur: int32 = node_slot_chain[cell]
+    if cur >= 0:
+        return cast[uint64](cur) * SLOT_CAP
+    if create == 0:
+        return 0
+    # Pull a fresh slot from the pool. Start at 1 — slot 0 is reserved
+    # so that "byte address 0" can stay the unambiguous "no chunk"
+    # sentinel.
+    s: uint64 = 1
     while s < DATA_SLOT_CAP:
         if dataslot_used[s] == 0:
             dataslot_used[s] = 1
-            node_dataslot[idx] = cast[int64](s)
-            return cast[int64](s)
+            node_slot_chain[cell] = cast[int32](s)
+            if chunk_idx + 1 > node_chain_len[idx]:
+                node_chain_len[idx] = chunk_idx + 1
+            return s * SLOT_CAP
         s = s + 1
+    return 0
+
+
+# Compatibility shim: lazily allocate CHUNK 0 for `idx`. Returns 0 on
+# success, -1 if the pool is exhausted. Pre-V2 callers used this to
+# guarantee that `node_size` could grow at all — chained writes still
+# need that guarantee, just chunk-by-chunk.
+
+def _node_ensure_dataslot(idx: uint64) -> int64:
+    if _node_get_chunk(idx, 0, 1) != 0:
+        return cast[int64](node_slot_chain[idx * CHAIN_LEN])
     return cast[int64](-1)
 
 
@@ -673,8 +778,17 @@ def init_tree():
     node_namelen[0]  = 0
     node_size[0]     = 0
     node_vers[0]     = 0
-    node_dataslot[0] = cast[int64](-1)
+    node_chain_len[0] = 0
+    ci0: uint64 = 0
+    while ci0 < CHAIN_LEN:
+        node_slot_chain[ci0] = cast[int32](-1)
+        ci0 = ci0 + 1
     node_name[0]     = 0
+    # Reserve data slot 0 so "byte address 0" remains the unambiguous
+    # "no chunk allocated" sentinel for _node_get_chunk. Without this
+    # an allocator that handed out slot 0 first would have callers
+    # mistake a real chunk for an unallocated hole.
+    dataslot_used[0] = 1
     # Distro-shaped skeleton. String literals are materialised inline by
     # the compiler; we pass their addresses straight to add_dir.
     var_i:  int64 = add_dir(0, "var")
@@ -963,12 +1077,24 @@ def _serve_topen(in_len: uint64) -> int32:
     if node_kind[node] == KIND_DIR:
         if acc != P9_OREAD:
             return _emit_rerror(tg, "distrofs: directory is read-only")
-    # OTRUNC on a writable file resets it to empty.
+    # OTRUNC on a writable file resets it to empty AND releases every
+    # chunk slot back to the shared data pool (a re-install of the
+    # same file would otherwise leak the old chain).
     if node_kind[node] == KIND_FILE:
         truncbit: uint64 = cast[uint64](mode) & cast[uint64](P9_OTRUNC)
         if truncbit != 0:
             if acc == P9_OREAD:
                 return _emit_rerror(tg, "distrofs: OTRUNC needs write")
+            if node_chain_len[node] > 0:
+                cii: uint64 = 0
+                while cii < CHAIN_LEN:
+                    slt: int32 = node_slot_chain[node * CHAIN_LEN + cii]
+                    if slt >= 0:
+                        dataslot_used[cast[uint64](slt)] = 0
+                        node_slot_chain[node * CHAIN_LEN + cii] = \
+                            cast[int32](-1)
+                    cii = cii + 1
+                node_chain_len[node] = 0
             node_size[node] = 0
             node_vers[node] = node_vers[node] + 1
     fid_open[slot] = 1
@@ -1123,16 +1249,20 @@ def _serve_tread(in_len: uint64) -> int32:
     # Cap to what fits inside one msize reply (header + count[4] = 11).
     if cast[uint64](available) > SRV_BUF_CAP - 16:
         available = cast[uint32](SRV_BUF_CAP - 16)
-    # A file with no data slot yet (never written) reads as empty.
-    ds: int64 = node_dataslot[node]
-    if ds < cast[int64](0):
+    # Single-shot Rread must come from contiguous bytes in node_data,
+    # so we also cap the response at the run remaining in the chunk
+    # `offset` lives in. The 9P client loops on partial Rreads (one
+    # per chunk crossing) just as it does for any small msize.
+    chunk_idx: uint64 = offset / SLOT_CAP
+    in_chunk:  uint64 = offset % SLOT_CAP
+    room_in_chunk: uint64 = SLOT_CAP - in_chunk
+    if cast[uint64](available) > room_in_chunk:
+        available = cast[uint32](room_in_chunk)
+    chunk_base: uint64 = _node_get_chunk(node, chunk_idx, 0)
+    if chunk_base == 0:
+        # Hole / never-written chunk: surface zeroes.
         available = 0
-    base: uint64 = 0
-    if ds >= cast[int64](0):
-        base = cast[uint64](ds) * FILE_CAP
-    data_ptr: Ptr[uint8] = &node_data[base]
-    if offset > 0:
-        data_ptr = &node_data[base + offset]
+    data_ptr: Ptr[uint8] = &node_data[chunk_base + in_chunk]
     c: P9Cursor
     p9_cursor_init(&c, &srv_buf[0], SRV_BUF_CAP)
     n: int32 = p9_emit_rread(&c, tg, data_ptr, available)
@@ -1165,22 +1295,39 @@ def _serve_twrite(in_len: uint64) -> int32:
     node: uint64 = fid_node[slot]
     if node_kind[node] != KIND_FILE:
         return _emit_rerror(tg, "distrofs: cannot write a directory")
-    # Bind a file-data pool slot lazily on the first write.
-    ds: int64 = _node_ensure_dataslot(node)
-    if ds < cast[int64](0):
-        return _emit_rerror(tg, "distrofs: file-data pool exhausted")
-    # Clamp the write window to the per-file cap.
+    # V2 chunked write: walk the chunk chain, allocating each chunk
+    # lazily as the write straddles 64 KiB boundaries. The per-file
+    # cap (FILE_CAP) is the chain length * slot size; the per-host
+    # cap is the shared data-slot pool (DATA_SLOT_CAP slots).
     end: uint64 = offset + cast[uint64](count)
     if end > FILE_CAP:
         end = FILE_CAP
-    written: uint64 = 0
+    take: uint64 = 0
     if end > offset:
-        written = end - offset
-    base: uint64 = cast[uint64](ds) * FILE_CAP
-    i: uint64 = 0
-    while i < written:
-        node_data[base + offset + i] = data_p[i]
-        i = i + 1
+        take = end - offset
+    written: uint64 = 0
+    while written < take:
+        cur_off: uint64 = offset + written
+        chunk_idx: uint64 = cur_off / SLOT_CAP
+        in_chunk:  uint64 = cur_off % SLOT_CAP
+        room: uint64 = SLOT_CAP - in_chunk
+        copy: uint64 = take - written
+        if copy > room:
+            copy = room
+        chunk_base: uint64 = _node_get_chunk(node, chunk_idx, 1)
+        if chunk_base == 0:
+            # File-data pool exhausted OR chain_idx out of range —
+            # short-write whatever we've already landed so the
+            # client loop surfaces the error rather than silently
+            # truncating later.
+            break
+        i: uint64 = 0
+        while i < copy:
+            node_data[chunk_base + in_chunk + i] = data_p[written + i]
+            i = i + 1
+        written = written + copy
+    if written == 0 and take > 0:
+        return _emit_rerror(tg, "distrofs: file-data pool exhausted")
     # Writing past EOF grows the file; sparse gap (if offset > size) is
     # zero-filled because the BSS pool starts zeroed.
     if offset + written > node_size[node]:
@@ -1293,10 +1440,18 @@ def _serve_tremove(in_len: uint64) -> int32:
         if node_has_children(node) != 0:
             return _emit_rerror(tg, "distrofs: directory not empty")
     parent: uint64 = node_parent[node]
-    # Release the file-data pool slot, if one was bound.
-    if node_dataslot[node] >= cast[int64](0):
-        dataslot_used[cast[uint64](node_dataslot[node])] = 0
-        node_dataslot[node] = cast[int64](-1)
+    # Release every chunk slot bound by this node's chain back to the
+    # shared data pool. With V2 chunked storage a file can hold
+    # multiple slots; releasing only the first one would leak the rest.
+    if node_chain_len[node] > 0:
+        cii: uint64 = 0
+        while cii < CHAIN_LEN:
+            sl: int32 = node_slot_chain[node * CHAIN_LEN + cii]
+            if sl >= 0:
+                dataslot_used[cast[uint64](sl)] = 0
+                node_slot_chain[node * CHAIN_LEN + cii] = cast[int32](-1)
+            cii = cii + 1
+        node_chain_len[node] = 0
     node_kind[node] = KIND_FREE
     node_size[node] = 0
     node_namelen[node] = 0

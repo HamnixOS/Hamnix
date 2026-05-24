@@ -8,32 +8,42 @@
 # without this `apt` could only ever read the smaller gz `contrib`
 # component as a workaround.
 #
-# DESIGN: caller-driven SINGLE-SHOT (not streaming).
+# DESIGN: two entry points — buffered single-shot and chunk-streaming.
 #
-#   The whole compressed stream is handed in as one buffer; the whole
-#   decompressed output is written into one caller-owned buffer. This
-#   mirrors how `apt` already uses the inflater for fixture-sized
-#   indices (it slurps the whole HTTP body, then decompresses it) and
-#   keeps the (already substantial) LZMA core free of the resumable
-#   bit-walk machinery the gzip inflater needs. A real multi-MB index
-#   streamed straight to a file is a future concern.
+#   xz_decompress(src, src_len, dst, dst_cap) -> int64
+#     Buffered single-shot: the whole compressed stream is in `src`,
+#     the whole decompressed output is written into one caller-owned
+#     buffer `dst`. dst_cap insufficient is XZ_ERR_DST_FULL. Used for
+#     fixture-sized Packages.xz indices that apt slurps whole.
 #
-#   Entry point:
-#       xz_decompress(src, src_len, dst, dst_cap) -> int64
-#   Returns the number of decompressed bytes on success (>= 0), or a
-#   negative error code (see XZ_ERR_* below). dst_cap insufficient is
-#   a hard error (XZ_ERR_DST_FULL) — we never silently truncate.
+#   xz_decompress_streaming(src, src_len, drain) -> int64
+#     Output streaming: decompressed bytes are handed to `drain` in
+#     chunks of up to XZ_OUT_STAGE_CAP (64 KiB). `drain(buf, n)` is a
+#     first-class function pointer; it returns 0 on success or a
+#     negative error code that propagates back through this function.
+#     Memory footprint is BOUNDED — the LZMA dictionary (64 KiB) plus
+#     one drain-staging window (64 KiB) plus the probability model
+#     (~28 KiB), regardless of how much output the stream produces.
+#     This is the path dpkg/apt use for real-Debian-package members
+#     (libc6 data.tar.xz uncompresses to 13 MiB).
+#
+#   Both entry points share the same LZMA core. The match-copy
+#   ALWAYS reads history out of the xz_dict[] ring (the 64 KiB sliding
+#   dictionary), so the streaming path can drain its output window
+#   without losing the back-reference history. Per-block CRC32 over
+#   the uncompressed output is computed INCREMENTALLY per byte
+#   (xz_block_crc_running), so neither path needs to buffer the whole
+#   block to verify the check field.
 #
 # NO HEAP. The LZMA sliding dictionary is a 64 KiB module-scope BSS
-# array (xz_dict[]); the LZMA probability model (~14 KiB of uint16
-# counters) is likewise module-scope. Decompressed output ALSO lands
-# directly in the caller's dst buffer, and the match-copy reads back
-# out of dst (dst doubles as the dictionary history) — so the 64 KiB
-# xz_dict[] is only used when a back-reference reaches further than
-# the current dst output (which, for a dst sized to hold the whole
-# expected output, never happens). We keep xz_dict[] anyway as a
-# spec-faithful ring buffer fallback and because LZMA2's dictionary
-# reset is defined in terms of it.
+# array (xz_dict[]); the streaming output staging window is another
+# 64 KiB BSS array (xz_out_stage[]); the LZMA probability model
+# (~14 KiB of uint16 counters) is likewise module-scope. In the
+# buffered path xz_dict[] is the canonical history; in the streaming
+# path it is BOTH the history and the source of bytes for the drain
+# call (drain reads from xz_out_stage, which is fed every byte as it
+# is produced). Mirroring into xz_dict keeps `_hist_byte` simple —
+# match-copies always read from one place.
 #
 # SCOPE — V0 caveats:
 #   - **LZMA2 filter only.** xz blocks may chain a BCJ/delta filter
@@ -168,14 +178,28 @@ XZ_LEN_LOW:    int32 = 2          # offset of Low table inside len coder
 XZ_LEN_MID:    int32 = 130        # offset of Mid table
 XZ_LEN_HIGH:   int32 = 258        # offset of High table
 
-# Sliding-dictionary ring buffer. 64 KiB is plenty for a Debian
-# Packages.xz LZMA2 stream (which Debian builds with a 64 KiB-ish
-# dict via `xz --lzma2=preset=...`); a stream declaring a larger
-# dict size still works as long as no back-reference actually reaches
-# past 64 KiB — and for an index whose whole decompressed form fits
-# in dst, the match-copy reads out of dst directly, so xz_dict[] is
-# effectively a safety net. Module-scope BSS — never a stack frame.
-XZ_DICT_SIZE:  uint64 = 65536
+# Sliding-dictionary ring buffer. The LZMA dictionary size declared
+# in the xz block's LZMA2 props byte determines how far back match-
+# copies can reach: Debian's `xz --lzma2=preset=6` (the default for
+# the toolchain that builds .deb members) sets dict=8 MiB, so we
+# size for that. A stream declaring a SMALLER dict still works — the
+# decoder just never reaches into the unused tail; a stream declaring
+# a LARGER dict (preset 9 = 64 MiB) is currently unsupported (we'd
+# need to grow this and find another way to keep the BSS bound).
+#
+# 8 MiB BSS per process that imports lib.xz (apt, dpkg, dpkg-deb,
+# test_xz) — fits comfortably inside QEMU's 256 MiB default, and the
+# dictionary is the load-bearing piece for streaming .deb members
+# whose data.tar is hundreds of KiB into one LZMA2 stream.
+XZ_DICT_SIZE:  uint64 = 8388608
+
+# Streaming output staging window. Bytes produced by the LZMA decoder
+# in streaming mode accumulate here in chunks of up to this many bytes;
+# when the staging fills the drain callback is invoked, the window is
+# reset to empty, and decoding continues. 64 KiB matches the LZMA2
+# per-chunk output cap so a single chunk's output never exceeds one
+# staging window, and the drain is invoked at most once per chunk.
+XZ_OUT_STAGE_CAP: uint64 = 65536
 
 
 # -- module-scope decoder state ---------------------------------------
@@ -185,7 +209,15 @@ XZ_DICT_SIZE:  uint64 = 65536
 # guidance — big buffers belong in BSS).
 
 xz_probs:  Array[14134, uint16]      # LZMA adaptive probability model
-xz_dict:   Array[65536, uint8]       # sliding-dictionary ring buffer
+xz_dict:   Array[8388608, uint8]     # 8 MiB sliding-dictionary ring buffer
+
+# Streaming-mode output staging. xz_out_stage holds the bytes that
+# will be handed to the drain callback on the next flush; out_pos
+# advances inside this window in streaming mode and resets to 0 on
+# every drain. In buffered (single-shot) mode out_buf points at the
+# caller's dst and out_pos advances through it monotonically — these
+# arrays are unused.
+xz_out_stage: Array[65536, uint8]
 
 # Range decoder live state.
 rc_range:  uint32
@@ -208,10 +240,37 @@ lz_lc:     int32                     # literal context bits
 lz_lp:     int32                     # literal position bits
 lz_pb:     int32                     # position bits
 
-# Output cursor: decompressed bytes are appended to dst[].
+# Output cursor.
+#   Buffered (single-shot) mode:  out_buf = caller's dst, out_cap =
+#     dst_cap, out_pos increments monotonically through dst[0..out_cap).
+#     out_pos == out_cap is a hard error (XZ_ERR_DST_FULL).
+#   Streaming mode:               out_buf = &xz_out_stage[0],
+#     out_cap = XZ_OUT_STAGE_CAP. When out_pos reaches out_cap the
+#     contents are handed to the drain callback and out_pos is reset
+#     to 0; total_pos still advances globally.
 out_buf:   Ptr[uint8]
-out_pos:   uint64                    # next write index into dst
-out_cap:   uint64                    # dst capacity
+out_pos:   uint64                    # next write index into out_buf
+out_cap:   uint64                    # out_buf capacity
+
+# Streaming-mode state (zero / null in buffered mode).
+#   xz_drain_fn       : caller-supplied drain. NULL in buffered mode.
+#   xz_drain_rc       : sticky negative result from drain (so the
+#                       per-byte _out_byte loop can bail without
+#                       checking on every byte — _decode_block /
+#                       _lzma_run examine it at safe yield points).
+#   xz_stream_mode    : 1 if streaming, 0 if buffered.
+#   xz_block_crc_run  : running per-byte CRC32 over the current xz
+#                       block's uncompressed output. Updated only
+#                       when the stream's check id is CRC32; Debian
+#                       .deb members use CRC64 (which we length-skip,
+#                       not verify), so skipping the per-byte CRC32
+#                       in the common case saves a function call per
+#                       output byte across millions of bytes.
+xz_drain_fn:      Fn[int32, Ptr[uint8], uint64]
+xz_drain_rc:      int64 = 0
+xz_stream_mode:   int32 = 0
+xz_block_crc_run: uint32 = 0xFFFFFFFF
+xz_check_is_crc32: int32 = 0      # 1 if the stream's check is CRC32
 # total_pos tracks the global decompressed position (== out_pos for a
 # single-shot decode; kept distinct so pos-state masking is explicit).
 total_pos: uint64
@@ -426,20 +485,65 @@ def _dist_decode(len_val: int32) -> uint32:
 
 # -- dictionary / output ----------------------------------------------
 #
-# Decompressed bytes are appended to the caller's dst[] AND mirrored
-# into the xz_dict[] ring. A match-copy reads history out of dst[]
-# when the distance is within the bytes already written this run, and
-# falls back to xz_dict[] otherwise (only relevant if dst were sized
-# smaller than the decompressed output — which we reject anyway).
+# Every decompressed byte is mirrored into the xz_dict[] ring AND
+# appended to out_buf (the caller's dst in buffered mode, xz_out_stage
+# in streaming mode). The per-byte running CRC32 over the current
+# xz block is updated here too so neither code path needs to revisit
+# the produced bytes after the fact. `_hist_byte` reads back through
+# the dictionary ring; in streaming mode the ring is the only place
+# the history reliably lives (the staging window resets on every
+# drain), and in buffered mode the ring is byte-identical to dst so
+# the same code path works for both.
+
+def _xz_crc32_update(b: uint8):
+    # Fold one output byte into the running per-block CRC32. The
+    # 0xFFFFFFFF init/finalize XOR is done at block boundaries.
+    idx: uint32 = (xz_block_crc_run ^ cast[uint32](b)) & 0xFF
+    xz_block_crc_run = (xz_block_crc_run >> 8) ^ xz_crc32_table[idx]
+
+
+def _xz_flush_stage() -> int32:
+    # Hand the current xz_out_stage[0, out_pos) contents to the drain
+    # callback and reset the window. Streaming-mode only; in buffered
+    # mode this is never called. Returns 0 on success, -1 on drain
+    # failure (xz_drain_rc has been set to the drain's negative
+    # return code, so the caller can surface it).
+    if out_pos == 0:
+        return 0
+    fn: Fn[int32, Ptr[uint8], uint64] = xz_drain_fn
+    rc: int32 = fn(&xz_out_stage[0], out_pos)
+    if rc < 0:
+        xz_drain_rc = cast[int64](rc)
+        out_pos = 0
+        return -1
+    out_pos = 0
+    return 0
+
 
 def _out_byte(b: uint8) -> int32:
-    # Append one decompressed byte. Returns 0 on dst overflow.
+    # Append one decompressed byte. Returns 0 on dst overflow (buffered
+    # mode dst exhausted) OR on a drain-callback failure (streaming
+    # mode). The caller treats both as XZ_ERR_DST_FULL — the drain
+    # rc is preserved in xz_drain_rc so the streaming entry point can
+    # surface it verbatim instead of XZ_ERR_DST_FULL.
     if out_pos >= out_cap:
-        return 0
+        if xz_stream_mode != 0:
+            # Flush and continue. A drain failure becomes a hard error.
+            if _xz_flush_stage() != 0:
+                return 0
+        else:
+            return 0
     out_buf[out_pos] = b
-    # Mirror into the dictionary ring.
+    # Mirror into the dictionary ring — match-copies always read from
+    # here.
     di: uint64 = total_pos % XZ_DICT_SIZE
     xz_dict[di] = b
+    # Running block CRC32 — only when the stream actually carries a
+    # CRC32 check. Debian's .deb members ship CRC64 (length-skipped,
+    # not currently verified), and the per-byte CRC32 fold is the
+    # single biggest per-byte cost in the decoder loop.
+    if xz_check_is_crc32 != 0:
+        _xz_crc32_update(b)
     out_pos = out_pos + 1
     total_pos = total_pos + 1
     return 1
@@ -449,11 +553,19 @@ def _hist_byte(dist: uint32) -> uint8:
     # Byte `dist+1` positions back from the current output cursor
     # (LZMA distances are stored as distance-1; the caller passes the
     # raw rep value, so the actual back-distance is dist+1).
+    #
+    # In BUFFERED mode `out_buf` is the caller's dst, which holds
+    # every byte we've produced this run — back-refs within out_pos
+    # read directly from dst (no ring-wrap math). In STREAMING mode
+    # out_pos is the cursor inside the 64 KiB staging window and
+    # resets to 0 on every drain, so we cannot rely on it for history.
+    # The xz_dict[] ring (sized to XZ_DICT_SIZE = 8 MiB) carries the
+    # full sliding-dictionary history in BOTH modes — mirrored by
+    # _out_byte on every produced byte — so it is the trustworthy
+    # fallback (and the only path in streaming mode).
     back: uint64 = cast[uint64](dist) + 1
-    if back <= out_pos:
+    if xz_stream_mode == 0 and back <= out_pos:
         return out_buf[out_pos - back]
-    # Fall back to the dictionary ring (history older than dst start —
-    # only reachable across an LZMA2 chunk that did not reset dict).
     d: uint64 = back % XZ_DICT_SIZE
     cur: uint64 = total_pos % XZ_DICT_SIZE
     if cur >= d:
@@ -959,7 +1071,7 @@ def _decode_block(src: Ptr[uint8], pos: Ptr[uint64], src_len: uint64,
     # comp_size is absent we hand the LZMA2 decoder the whole rest of
     # the stream and let its terminator stop it.
     data_start: uint64 = block_start + header_size
-    out_before: uint64 = out_pos
+    total_before: uint64 = total_pos
 
     data_len: uint64 = 0
     if has_comp_size != 0:
@@ -969,11 +1081,15 @@ def _decode_block(src: Ptr[uint8], pos: Ptr[uint64], src_len: uint64,
     else:
         data_len = src_len - data_start
 
+    # Reset the running per-block CRC32. _out_byte folds every produced
+    # byte into this; at block end we finalize and compare.
+    xz_block_crc_run = 0xFFFFFFFF
+
     rc: int64 = _lzma2_decode(src, data_start, data_len)
     if rc != 0:
         return rc
 
-    produced: uint64 = out_pos - out_before
+    produced: uint64 = total_pos - total_before
     if has_uncomp_size != 0:
         if produced != uncomp_size:
             return XZ_ERR_CORRUPT
@@ -998,6 +1114,8 @@ def _decode_block(src: Ptr[uint8], pos: Ptr[uint64], src_len: uint64,
     end_of_block: uint64 = padded + cs
 
     # Verify CRC32 check field over the block's uncompressed output.
+    # The running CRC32 (xz_block_crc_run) was updated per-byte in
+    # _out_byte; the standard finalize is the trailing XOR.
     if check_id == XZ_CHECK_CRC32:
         if padded + 4 > src_len:
             return XZ_ERR_TRUNCATED
@@ -1005,7 +1123,7 @@ def _decode_block(src: Ptr[uint8], pos: Ptr[uint64], src_len: uint64,
             | (cast[uint32](src[padded + 1]) << 8)
             | (cast[uint32](src[padded + 2]) << 16)
             | (cast[uint32](src[padded + 3]) << 24))
-        calc: uint32 = _xz_crc32(out_buf, out_before, produced)
+        calc: uint32 = xz_block_crc_run ^ 0xFFFFFFFF
         if stored != calc:
             return XZ_ERR_CRC
 
@@ -1015,14 +1133,15 @@ def _decode_block(src: Ptr[uint8], pos: Ptr[uint64], src_len: uint64,
     return 0
 
 
-# -- public entry point ------------------------------------------------
+# -- shared decode core (used by both entry points) --------------------
 #
-# Decompress the whole `.xz` stream in src[0, src_len) into dst[0,
-# dst_cap). Returns the decompressed byte count (>= 0) on success, or
-# a negative XZ_ERR_*.
+# Walks the xz stream header / blocks / index / footer; decoding into
+# whatever sink the caller already set up (out_buf + out_cap, plus
+# xz_stream_mode + xz_drain_fn in streaming mode). Returns the total
+# number of decompressed bytes (>= 0) on success or a negative
+# XZ_ERR_*.
 
-def xz_decompress(src: Ptr[uint8], src_len: uint64,
-                  dst: Ptr[uint8], dst_cap: uint64) -> int64:
+def _xz_decode_stream(src: Ptr[uint8], src_len: uint64) -> int64:
     _xz_init_crc32()
     xz_dbg_site = 0
     xz_dbg_a = 0
@@ -1032,18 +1151,19 @@ def xz_decompress(src: Ptr[uint8], src_len: uint64,
         return XZ_ERR_TRUNCATED
 
     # ---- Stream Header (12 bytes) ----
-    # Magic: FD 37 7A 58 5A 00.
     if src[0] != 0xFD or src[1] != 0x37 or src[2] != 0x7A:
         return XZ_ERR_MAGIC
     if src[3] != 0x58 or src[4] != 0x5A or src[5] != 0x00:
         return XZ_ERR_MAGIC
-    # Stream flags: byte 6 must be 0; byte 7 low nibble = check id.
     if src[6] != 0:
         return XZ_ERR_HEADER
     check_id: int32 = cast[int32](src[7]) & 0x0F
     if (cast[int32](src[7]) & 0xF0) != 0:
         return XZ_ERR_HEADER
-    # Header CRC32 over the 2 flag bytes.
+    if check_id == XZ_CHECK_CRC32:
+        xz_check_is_crc32 = 1
+    else:
+        xz_check_is_crc32 = 0
     hdr_crc: uint32 = (cast[uint32](src[8])
         | (cast[uint32](src[9]) << 8)
         | (cast[uint32](src[10]) << 16)
@@ -1051,36 +1171,36 @@ def xz_decompress(src: Ptr[uint8], src_len: uint64,
     if _xz_crc32(src, 6, 2) != hdr_crc:
         return XZ_ERR_HEADER
 
-    # ---- decoder live state ----
-    out_buf = dst
-    out_pos = 0
-    out_cap = dst_cap
     total_pos = 0
     dict_start = 0
     _lzma_reset_state()
 
     # ---- Blocks ----
-    # Blocks run until the index indicator (a 0x00 byte where a block
-    # header-size byte would be).
     pos: uint64 = 12
     while True:
         if pos >= src_len:
             return XZ_ERR_TRUNCATED
         first: uint32 = cast[uint32](src[pos])
         if first == 0:
-            # Index indicator — end of the block list.
             break
         brc: int64 = _decode_block(src, &pos, src_len, check_id)
         if brc != 0:
+            # If we bailed because of a drain failure surface the
+            # drain's negative return code instead of the generic
+            # XZ_ERR_DST_FULL the buffered overflow path uses.
+            if xz_stream_mode != 0 and xz_drain_rc < 0:
+                return xz_drain_rc
             return brc
 
+    # Flush any bytes still sitting in the streaming staging window
+    # before we walk the index / footer.
+    if xz_stream_mode != 0:
+        if _xz_flush_stage() != 0:
+            return xz_drain_rc
+
     # ---- Index ----
-    # The index starts at `pos` with a 0x00 indicator byte, then a VLI
-    # record count, then per-record (unpadded-size VLI, uncomp-size
-    # VLI), then padding to 4-byte alignment, then a 4-byte CRC32. We
-    # parse it for framing but only verify its CRC32.
     index_start: uint64 = pos
-    ip: uint64 = pos + 1                       # skip the 0x00 indicator
+    ip: uint64 = pos + 1
     rec_count: uint64 = 0
     if _decode_vli(src, &ip, src_len, &rec_count) != 0:
         return XZ_ERR_FOOTER
@@ -1093,12 +1213,10 @@ def xz_decompress(src: Ptr[uint8], src_len: uint64,
         if _decode_vli(src, &ip, src_len, &usz) != 0:
             return XZ_ERR_FOOTER
         r = r + 1
-    # Index padding to a 4-byte boundary, relative to the stream start.
     while (ip & 3) != 0:
         if ip >= src_len:
             return XZ_ERR_FOOTER
         ip = ip + 1
-    # 4-byte index CRC32 over everything from the indicator to here.
     if ip + 4 > src_len:
         return XZ_ERR_FOOTER
     idx_crc_stored: uint32 = (cast[uint32](src[ip])
@@ -1113,11 +1231,56 @@ def xz_decompress(src: Ptr[uint8], src_len: uint64,
     # ---- Stream Footer (12 bytes) ----
     if ip + 12 > src_len:
         return XZ_ERR_TRUNCATED
-    # Footer: 4-byte CRC32, 4-byte backward-size, 2-byte flags, magic.
     if src[ip + 10] != 0x59 or src[ip + 11] != 0x5A:
         return XZ_ERR_FOOTER
-    # Footer flags must echo the stream-header flags.
     if (cast[int32](src[ip + 9]) & 0x0F) != check_id:
         return XZ_ERR_FOOTER
 
-    return cast[int64](out_pos)
+    return cast[int64](total_pos)
+
+
+# -- public entry points -----------------------------------------------
+
+# Buffered single-shot: decompress src[0, src_len) into dst[0, dst_cap).
+# Returns the decompressed byte count (>= 0) on success, or a negative
+# XZ_ERR_*. dst_cap insufficient is XZ_ERR_DST_FULL.
+
+def xz_decompress(src: Ptr[uint8], src_len: uint64,
+                  dst: Ptr[uint8], dst_cap: uint64) -> int64:
+    xz_stream_mode = 0
+    xz_drain_rc = 0
+    out_buf = dst
+    out_pos = 0
+    out_cap = dst_cap
+    return _xz_decode_stream(src, src_len)
+
+
+# Streaming: decompress src[0, src_len) and hand each output chunk
+# (up to XZ_OUT_STAGE_CAP bytes) to `drain`. drain(buf, n) returns 0
+# on success or a negative error code which propagates back through
+# this function verbatim. Memory footprint is bounded — see the
+# module-level DESIGN note. Returns the total decompressed byte count
+# (>= 0) on success, or a negative XZ_ERR_* / drain-error.
+#
+# The drain is called BOTH on intermediate window fills AND once at
+# end-of-stream to flush whatever's left in the staging window. A
+# drain callback that wants per-byte counts should keep its own
+# running total — this entry point promises only that every output
+# byte will be handed to it exactly once, in order.
+
+def xz_decompress_streaming(
+    src: Ptr[uint8], src_len: uint64,
+    drain: Fn[int32, Ptr[uint8], uint64]
+) -> int64:
+    xz_stream_mode = 1
+    xz_drain_fn = drain
+    xz_drain_rc = 0
+    out_buf = &xz_out_stage[0]
+    out_pos = 0
+    out_cap = XZ_OUT_STAGE_CAP
+    rc: int64 = _xz_decode_stream(src, src_len)
+    # Belt-and-suspenders: clear the stream-mode flag on exit so a
+    # subsequent buffered call cannot accidentally run through the
+    # drain path with a stale callback.
+    xz_stream_mode = 0
+    return rc

@@ -130,14 +130,21 @@ from lib.zlib.inflate import (
 
 # xz/LZMA2 decompressor. Modern Debian compresses a `.deb`'s
 # `control.tar` and `data.tar` members with xz (LZMA2) — `data.tar.xz`
-# is the near-universal default. V3 routes a `.tar.xz` member through
-# xz_decompress() the same single-shot way the gzip `.gz` path uses
-# inflate_feed; see `_decompress_tar`. A real small package
-# (debian's `hello`: data.tar.xz decompresses to ~256 KiB) sits inside
-# the 512 KiB tar_buf, so the single-shot xz path suffices — no
-# streaming-xz rewrite is needed for this milestone.
+# is the near-universal default.
+#
+#   control.tar.xz  →  buffered single-shot xz_decompress() into the
+#                       small tar_buf (control archives are tiny;
+#                       just the RFC822 stanza + maintainer scripts).
+#   data.tar.xz     →  xz_decompress_streaming(): every output chunk
+#                       (up to 64 KiB) is handed to _tar_chunk_drain,
+#                       which threads the bytes through a streaming
+#                       ustar parser that writes per-file bytes
+#                       straight to disk (no full-tar buffer). This
+#                       is what lets libc6's 13 MiB data.tar install
+#                       without a 13 MiB BSS arena.
 from lib.xz.xz import (
     xz_decompress,
+    xz_decompress_streaming,
 )
 
 extern def sys_open(path: Ptr[char]) -> int32
@@ -152,11 +159,28 @@ extern def sys_mkdir(path: Ptr[char]) -> int32
 # -- bounded BSS buffers (Hamnix idiom: never park large Arrays in a
 #    nested frame — memory/feedback_compiler_quirks.md U9) -------------
 
-DEB_CAP:  uint64 = 262144      # 256 KiB raw .deb image cap
-TAR_CAP:  uint64 = 524288      # 512 KiB inflated-tar cap
+# The .deb is slurped into deb_buf once (apt has already streamed it
+# to /tmp/apt/<pkg>.deb on a chunked tmpfs file). DEB_CAP must hold
+# the whole compressed .deb — a real libc6 .deb is ~2.8 MiB; the
+# headroom past that swallows mid-size packages (nginx etc.) without
+# bumping the cap per ship. The next architectural step (streaming
+# the .deb INPUT through pread instead of slurping) would lift this
+# entirely; deferred until a >16 MiB .deb actually shows up.
+DEB_CAP:  uint64 = 16777216    # 16 MiB raw .deb image cap
 
-deb_buf: Array[262144, uint8]
-tar_buf: Array[524288, uint8]
+# tar_buf now holds ONLY the decompressed control.tar (small — the
+# control archive is the RFC822 stanza + maintainer scripts).
+# libc6's control.tar uncompresses to ~310 KiB (it ships several
+# maintainer scripts + a 200 KiB shlibs file), so 1 MiB is the
+# pragmatic floor for "real Debian package" control archives.
+# data.tar is processed via xz_decompress_streaming, so its size is
+# bounded only by however many bytes the installed-files manifest
+# occupies and however large each on-disk file is — neither of which
+# lives in tar_buf.
+TAR_CAP:  uint64 = 1048576     # 1 MiB control-tar buffer
+
+deb_buf: Array[16777216, uint8]
+tar_buf: Array[1048576, uint8]
 
 # Inflater state (~40 KiB).
 inf_state: InflateState
@@ -185,7 +209,10 @@ fld_desc:     Array[2048, uint8]
 # status DB grows by one stanza per installed package, so it is sized
 # for a modest set of installed packages.
 STATUS_CAP: uint64 = 65536     # in-RAM status-DB cap
-LIST_CAP:   uint64 = 65536     # in-RAM per-package .list manifest cap
+LIST_CAP:   uint64 = 524288    # 512 KiB per-package .list manifest cap
+                               # (libc6 ships ~2000 files = ~100 KiB
+                               #  manifest; a typical Debian package
+                               #  sits well inside 512 KiB)
 
 # The Debian stanza we assemble before writing it to the status DB.
 stanza_buf: Array[4096, uint8]
@@ -198,7 +225,7 @@ status_buf: Array[65536, uint8]
 # Composed file-list path ( /tmp/dpkg.<pkg>.list ) and the manifest
 # body ( one path per line ). Capped at LIST_CAP.
 list_path:  Array[64, uint8]
-list_buf:   Array[65536, uint8]
+list_buf:   Array[524288, uint8]
 
 # Scratch absolute-path buffer for the data.tar extraction step. A
 # data.tar entry name ("./usr/share/doc/hello/changelog.Debian.gz")
@@ -211,6 +238,50 @@ extract_path: Array[512, uint8]
 # a status stanza. RFC822 field values are short; the longest a `-l`
 # row prints is the Description first line.
 qf_buf: Array[512, uint8]
+
+# -- streaming-tar parser state (data.tar.xz extraction) --------------
+#
+# data.tar is consumed CHUNK-AT-A-TIME via _tar_chunk_drain (the
+# callback handed to xz_decompress_streaming). The whole tar is never
+# resident in RAM: only one 512-byte header at a time, and per-file
+# writes go straight through the destination fd. The state machine
+# alternates between three phases (header / body / padding); a 1024-
+# byte all-zero header sequence terminates the archive.
+#
+# Why a state machine rather than a "fed one byte at a time" loop:
+# tar entries can be megabytes long (libc6 ships .so files in the
+# 1-3 MiB range), so the body phase consumes whole drain chunks at
+# once before crossing into the next phase. Header bytes, by
+# contrast, may straddle a chunk boundary — hence the 512-byte
+# accumulator (tar_hdr_buf).
+#
+# tar_phase values:
+#   0  accumulating a 512-byte header into tar_hdr_buf
+#   1  consuming tar_body_remain bytes of the current entry's body
+#   2  consuming tar_pad_remain bytes of trailing zero pad
+#   3  archive terminated (two consecutive zero headers seen)
+#  -1  parse error — set sticky on bad checksum or short body
+#
+# tar_cur_wfd is the fd open for the current regular-file body, or
+# -1 if the current entry is not a regular-file ("." head, dir,
+# symlink, refused-as-unsafe path). tar_files_landed counts every
+# regular-file body that completed end-to-end (the same definition
+# the buffered _extract_data_tar used).
+tar_hdr_buf:       Array[512, uint8]
+tar_hdr_n:         uint64 = 0
+tar_phase:         int32  = 0
+tar_body_remain:   uint64 = 0
+tar_pad_remain:    uint64 = 0
+tar_cur_size:      uint64 = 0
+tar_cur_typeflag:  uint8  = 0
+tar_cur_name:      Array[256, uint8]
+tar_cur_wfd:       int32  = -1
+tar_zero_hdr_seen: int32  = 0
+tar_drain_err:     int32  = 0     # sticky non-zero on any parse / IO fault
+tar_files_landed:  uint64 = 0
+tar_entries_seen:  uint64 = 0     # entries recorded into list_buf (manifest)
+tar_list_n:        uint64 = 0     # bytes used in list_buf so far (running)
+tar_drain_calls:   uint64 = 0     # drain invocations (debug progress)
 
 
 # -- tiny stdio helpers (mirrors dpkg_deb.ad / cat.ad) -----------------
@@ -432,24 +503,23 @@ def _name_copy_nul(dst: Ptr[uint8], src: Ptr[uint8], maxlen: uint64) -> uint64:
     return i
 
 
-# -- decompress the located tar member into tar_buf --------------------
+# -- decompress the CONTROL tar member into tar_buf (buffered) --------
 #
-# Dispatches on the compression code _ar_find_tar reported: COMP_GZ
-# routes through the gzip inflater (lib/zlib/inflate.ad), COMP_XZ
-# through the single-shot xz/LZMA2 decompressor (lib/xz/xz.ad). Both
-# write the decompressed ustar bytes into tar_buf and return the
-# decompressed byte count, or -1 on a decompression error.
+# Used for control.tar only — it's tiny (RFC822 stanza + maintainer
+# scripts). data.tar is processed via _stream_data_tar (no tar_buf
+# allocation). Dispatches on the compression code _ar_find_tar
+# reported: COMP_GZ routes through the gzip inflater
+# (lib/zlib/inflate.ad), COMP_XZ through the buffered xz/LZMA2
+# entry point (lib/xz/xz.ad). Returns the decompressed byte count,
+# or -1 on a decompression error.
 
 def _decompress_tar(in_ptr: Ptr[uint8], in_len: uint64,
                     comp: int32) -> int64:
     if comp == COMP_XZ:
-        # Single-shot xz: the whole compressed member is in RAM and the
-        # whole decompressed tar fits tar_buf (a small real package's
-        # data.tar decompresses well inside 512 KiB).
         drc: int64 = xz_decompress(in_ptr, in_len, &tar_buf[0], TAR_CAP)
         if drc < 0:
             if drc == -4:
-                write_str(2, "dpkg: data/control.tar.xz exceeds 512 KiB cap (V3 limit)\n")
+                write_str(2, "dpkg: control.tar.xz exceeds the in-RAM control-tar buffer\n")
             else:
                 write_str(2, "dpkg: xz decompress failed (corrupt or truncated)\n")
             return -1
@@ -491,7 +561,7 @@ def _slurp_file(path: Ptr[char], cap: uint64) -> int64:
         write_str(2, "dpkg: empty input\n")
         return -1
     if total >= cap:
-        write_str(2, "dpkg: .deb exceeds 256 KiB cap (V1 limit)\n")
+        write_str(2, "dpkg: .deb exceeds the in-RAM .deb cap (16 MiB)\n")
         return -1
     return cast[int64](total)
 
@@ -964,81 +1034,6 @@ def _compose_list_path() -> uint64:
     return _compose_list_path_for(&fld_package[0])
 
 
-# -- walk data.tar, build the file manifest, write the .list file ------
-#
-# Returns the number of file/dir entries recorded, or -1 on a tar
-# error. The manifest body is one tar path per line — exactly the
-# bytes `dpkg -L <pkg>` would print.
-
-def _write_file_list(data_tar_len: uint64) -> int64:
-    off: uint64 = 0
-    mlen: uint64 = 0
-    count: uint64 = 0
-    while off + 512 <= data_tar_len:
-        hdr: Ptr[uint8] = &tar_buf[off]
-        if _tar_header_is_zero(hdr) != 0:
-            break
-        if _tar_chksum_ok(hdr) == 0:
-            write_str(2, "dpkg: data tar header checksum mismatch at offset ")
-            write_dec_u64(2, off)
-            write_str(2, "\n")
-            return -1
-
-        size: uint64 = _tar_parse_octal(&hdr[124], 12)
-        typeflag: uint8 = hdr[156]
-        nlen: uint64 = _name_copy_nul(&warn_buf[0], &hdr[0], 100)
-        body_blocks: uint64 = (size + 511) / 512
-
-        if nlen == 0:
-            off = off + 512
-            off = off + body_blocks * 512
-            continue
-
-        # Record regular files ('0'/NUL), directories ('5') and
-        # symlinks ('2') — everything that lands in a real package's
-        # .list. Skip the bare "./" head record and pax/GNU extension
-        # headers.
-        record: int32 = 0
-        if typeflag == 0 or typeflag == 48 or typeflag == 53 or typeflag == 50:
-            record = 1
-        # The "./" head entry (name is exactly "./") is noise.
-        if warn_buf[0] == 46 and warn_buf[1] == 47 and warn_buf[2] == 0:
-            record = 0
-
-        if record != 0:
-            i: uint64 = 0
-            while warn_buf[i] != 0 and mlen + 1 < LIST_CAP:
-                list_buf[mlen] = warn_buf[i]
-                mlen = mlen + 1
-                i = i + 1
-            if mlen + 1 < LIST_CAP:
-                list_buf[mlen] = 10                     # '\n'
-                mlen = mlen + 1
-            count = count + 1
-
-        off = off + 512
-        off = off + body_blocks * 512
-
-    list_buf[mlen] = 0
-
-    # Write the manifest to /tmp/dpkg.<pkg>.list.
-    _compose_list_path()
-    wfd: int32 = sys_open_write(cast[Ptr[char]](&list_path[0]))
-    if wfd < 0:
-        write_str(2, "dpkg: cannot open file list for write: ")
-        write_str(2, &list_path[0])
-        write_str(2, "\n")
-        return -1
-    if mlen > 0:
-        wn: int64 = _write_full(wfd, &list_buf[0], mlen)
-        if wn < 0 or cast[uint64](wn) != mlen:
-            sys_close(wfd)
-            write_str(2, "dpkg: short write updating file list\n")
-            return -1
-    sys_close(wfd)
-    return cast[int64](count)
-
-
 # -- land data.tar files into the distro namespace ---------------------
 #
 # This is the step that makes `dpkg -i` a *real* install: it places
@@ -1126,107 +1121,327 @@ def _compose_extract_path(entry: Ptr[uint8]) -> uint64:
     return o
 
 
-# Walk data.tar (already decompressed into tar_buf) and land every
-# directory + regular file onto the namespace filesystem.
+# -- streaming data.tar extraction (callback fed by xz output) ---------
+#
+# `_tar_chunk_drain(buf, n)` is the Fn[int32, Ptr[uint8], uint64] handed
+# to xz_decompress_streaming(). Every output chunk from the LZMA2
+# decoder (up to 64 KiB at a time) is threaded through the tar state
+# machine: the 512-byte header is reassembled if it straddles a chunk
+# boundary, then per-entry body bytes flow CHUNK-AT-A-TIME straight
+# from the drain input through sys_write() to the destination fd. No
+# full-tar buffer is ever allocated — libc6's 13 MiB data.tar peaks at
+# the xz 64 KiB output staging window plus one 512-byte tar header
+# plus whatever the kernel keeps for its in-flight sys_write to the
+# distrofs daemon.
+#
+# Manifest building happens in the SAME pass: each accepted entry's
+# path is appended to list_buf as we see its header. After the
+# streaming xz call returns, _do_install writes list_buf to
+# /tmp/dpkg.<pkg>.list. This collapses the two former buffered
+# passes (`_write_file_list` + `_extract_data_tar`, each walking
+# tar_buf) into one streaming pass.
 
-def _extract_data_tar(data_tar_len: uint64) -> int64:
-    off: uint64 = 0
-    nfiles: uint64 = 0
-    while off + 512 <= data_tar_len:
-        hdr: Ptr[uint8] = &tar_buf[off]
-        if _tar_header_is_zero(hdr) != 0:
-            break
-        if _tar_chksum_ok(hdr) == 0:
-            write_str(2, "dpkg: data tar header checksum mismatch at offset ")
-            write_dec_u64(2, off)
-            write_str(2, "\n")
+def _tar_reset_for_data():
+    # Reset the streaming-tar state at the start of a new data.tar.
+    tar_hdr_n = 0
+    tar_phase = 0
+    tar_body_remain = 0
+    tar_pad_remain = 0
+    tar_cur_size = 0
+    tar_cur_typeflag = 0
+    tar_cur_name[0] = 0
+    tar_cur_wfd = -1
+    tar_zero_hdr_seen = 0
+    tar_drain_err = 0
+    tar_files_landed = 0
+    tar_entries_seen = 0
+    tar_list_n = 0
+    tar_drain_calls = 0
+    list_buf[0] = 0
+
+
+# Process one fully-assembled 512-byte tar header (currently sitting
+# in tar_hdr_buf). Sets up the body/padding phase machinery; opens
+# the destination fd for a regular-file entry; appends the entry's
+# path to list_buf if it should be recorded. Returns 0 on success,
+# -1 on a hard error (sets tar_drain_err sticky).
+
+def _tar_open_dest_for_entry() -> int32:
+    # Strip a leading "./" for the safety check; an absolute path
+    # ("/...") stays absolute (and thus unsafe). pax/GNU long-name
+    # headers (typeflag 'L' / 'x') are skipped by the caller — a
+    # small package's paths fit ustar's 100.
+    entry: Ptr[uint8] = &tar_cur_name[0]
+    if tar_cur_name[0] == 46 and tar_cur_name[1] == 47:
+        entry = cast[Ptr[uint8]](cast[uint64](&tar_cur_name[0]) + 2)
+    unsafe: int32 = _entry_unsafe(entry)
+    if tar_cur_name[0] == 47:
+        unsafe = 1
+    if unsafe != 0:
+        write_str(2, "dpkg: refusing unsafe path: ")
+        write_str(2, &tar_cur_name[0])
+        write_str(2, "\n")
+        return 0
+    if _compose_extract_path(&tar_cur_name[0]) == 0:
+        write_str(2, "dpkg: path too long, skipping: ")
+        write_str(2, &tar_cur_name[0])
+        write_str(2, "\n")
+        return 0
+    wfd: int32 = sys_open_write(cast[Ptr[char]](&extract_path[0]))
+    if wfd < 0:
+        # Outside a distrofs namespace /usr is read-only; report and
+        # keep going (the body bytes still need to be consumed from
+        # the tar stream — tar_cur_wfd stays -1 so they're dropped).
+        write_str(2, "dpkg: warning: could not create ")
+        write_str(2, &extract_path[0])
+        write_str(2, " (not in a writable distro namespace?)\n")
+        return 0
+    tar_cur_wfd = wfd
+    return 0
+
+
+def _tar_record_manifest():
+    # Append the current entry's path to list_buf as one '\n'-terminated
+    # line. Mirrors the buffered _write_file_list's exact record
+    # criteria: regular files, directories and symlinks; skip the bare
+    # "./" head record.
+    if tar_cur_name[0] == 0:
+        return
+    if tar_cur_name[0] == 46 and tar_cur_name[1] == 47 \
+            and tar_cur_name[2] == 0:
+        return
+    rec: int32 = 0
+    if tar_cur_typeflag == 0 or tar_cur_typeflag == 48 \
+            or tar_cur_typeflag == 53 or tar_cur_typeflag == 50:
+        rec = 1
+    if rec == 0:
+        return
+    # `tar_list_n` is the running tail offset — no per-entry strlen scan
+    # (which would make the manifest build O(N^2) for libc6's ~2000
+    # entries).
+    mlen: uint64 = tar_list_n
+    i: uint64 = 0
+    while tar_cur_name[i] != 0 and mlen + 1 < LIST_CAP:
+        list_buf[mlen] = tar_cur_name[i]
+        mlen = mlen + 1
+        i = i + 1
+    if mlen + 1 < LIST_CAP:
+        list_buf[mlen] = 10                              # '\n'
+        mlen = mlen + 1
+    list_buf[mlen] = 0
+    tar_list_n = mlen
+    tar_entries_seen = tar_entries_seen + 1
+
+
+def _tar_handle_header() -> int32:
+    if _tar_header_is_zero(&tar_hdr_buf[0]) != 0:
+        if tar_zero_hdr_seen != 0:
+            tar_phase = 3
+            return 0
+        tar_zero_hdr_seen = 1
+        # Loop back for the second zero header / done.
+        tar_hdr_n = 0
+        tar_phase = 0
+        return 0
+    tar_zero_hdr_seen = 0
+    if _tar_chksum_ok(&tar_hdr_buf[0]) == 0:
+        write_str(2, "dpkg: data tar header checksum mismatch\n")
+        tar_drain_err = 1
+        return -1
+    tar_cur_size = _tar_parse_octal(&tar_hdr_buf[124], 12)
+    tar_cur_typeflag = tar_hdr_buf[156]
+    _name_copy_nul(&tar_cur_name[0], &tar_hdr_buf[0], 100)
+    body_blocks: uint64 = (tar_cur_size + 511) / 512
+
+    # Record in the manifest (irrespective of whether we'll be able to
+    # write the file — the manifest reflects what the package SAYS it
+    # contains, matching real dpkg).
+    _tar_record_manifest()
+
+    # Set up destination based on entry kind.
+    tar_cur_wfd = -1
+    if tar_cur_typeflag == 53:                           # '5' directory
+        if _compose_extract_path(&tar_cur_name[0]) > 0:
+            sys_mkdir(cast[Ptr[char]](&extract_path[0]))
+    elif tar_cur_typeflag == 50:                         # '2' symlink
+        write_str(2, "dpkg: note: symlink not materialised: ")
+        write_str(2, &tar_cur_name[0])
+        write_str(2, "\n")
+    elif tar_cur_typeflag == 0 or tar_cur_typeflag == 48:
+        # Regular file. Open destination; if the name is the "./" head
+        # record (size==0 anyway) or unsafe, _tar_open_dest_for_entry
+        # leaves tar_cur_wfd at -1 and body bytes get dropped.
+        if tar_cur_name[0] == 46 and tar_cur_name[1] == 47 \
+                and tar_cur_name[2] == 0:
+            pass
+        else:
+            _tar_open_dest_for_entry()
+    # else: hardlink / device / fifo / GNU long header — skipped.
+
+    # Transition: body bytes if any, otherwise straight to padding.
+    tar_hdr_n = 0
+    if tar_cur_size > 0:
+        tar_phase = 1
+        tar_body_remain = tar_cur_size
+        # Pad rounds the body up to a multiple of 512.
+        rem: uint64 = tar_cur_size % 512
+        if rem == 0:
+            tar_pad_remain = 0
+        else:
+            tar_pad_remain = 512 - rem
+    else:
+        tar_phase = 2
+        tar_pad_remain = 0
+    return 0
+
+
+def _tar_finish_body() -> int32:
+    # Body fully consumed. Close fd if we opened one. Count the file.
+    if tar_cur_wfd >= 0:
+        sys_close(tar_cur_wfd)
+        tar_cur_wfd = -1
+        if tar_cur_typeflag == 0 or tar_cur_typeflag == 48:
+            tar_files_landed = tar_files_landed + 1
+    tar_phase = 2
+    return 0
+
+
+def _tar_chunk_drain(buf: Ptr[uint8], n: uint64) -> int32:
+    # The Fn[int32, Ptr[uint8], uint64] callback xz_decompress_streaming
+    # invokes per output chunk. We thread `n` bytes through the tar
+    # state machine; partial-feeds (where a header straddles two
+    # chunks or a body run is shorter than the remaining body) are
+    # all handled by phase-driven dispatch.
+    if tar_drain_err != 0:
+        return -1
+    # Progress trace: emit a dot every 16 chunks drained (~1 MiB of
+    # decompressed tar data) so a slow / hung extract is visible in
+    # the serial log rather than mysteriously silent. The dot goes to
+    # stderr (fd 2) so it interleaves with diagnostics, not stdout.
+    tar_drain_calls = tar_drain_calls + 1
+    if (tar_drain_calls & 15) == 0:
+        sys_write(2, ".", 1)
+    pos: uint64 = 0
+    while pos < n:
+        if tar_phase == 3:
+            # Archive ended — drop any trailing bytes. (xz wraps the
+            # tar inside an LZMA2 stream that always has its own
+            # terminator, so this branch typically doesn't fire.)
+            return 0
+        if tar_phase == 0:
+            # Accumulating a 512-byte header.
+            take: uint64 = 512 - tar_hdr_n
+            avail: uint64 = n - pos
+            if take > avail:
+                take = avail
+            j: uint64 = 0
+            while j < take:
+                tar_hdr_buf[tar_hdr_n + j] = buf[pos + j]
+                j = j + 1
+            tar_hdr_n = tar_hdr_n + take
+            pos = pos + take
+            if tar_hdr_n == 512:
+                if _tar_handle_header() != 0:
+                    return -1
+        elif tar_phase == 1:
+            # Consuming entry body bytes.
+            take: uint64 = tar_body_remain
+            avail: uint64 = n - pos
+            if take > avail:
+                take = avail
+            if tar_cur_wfd >= 0 and take > 0:
+                src: Ptr[uint8] = cast[Ptr[uint8]](
+                    cast[uint64](buf) + pos)
+                wn: int64 = _write_full(tar_cur_wfd, src, take)
+                if wn < 0 or cast[uint64](wn) != take:
+                    write_str(2, "dpkg: short write landing ")
+                    write_str(2, &extract_path[0])
+                    write_str(2, "\n")
+                    # Don't abort the whole install on a per-file
+                    # short-write — close the fd, drop subsequent
+                    # body bytes for this entry, and proceed (matches
+                    # the buffered _extract_data_tar's behavior).
+                    sys_close(tar_cur_wfd)
+                    tar_cur_wfd = -1
+            tar_body_remain = tar_body_remain - take
+            pos = pos + take
+            if tar_body_remain == 0:
+                _tar_finish_body()
+        elif tar_phase == 2:
+            # Consuming zero padding.
+            take: uint64 = tar_pad_remain
+            avail: uint64 = n - pos
+            if take > avail:
+                take = avail
+            tar_pad_remain = tar_pad_remain - take
+            pos = pos + take
+            if tar_pad_remain == 0:
+                tar_phase = 0
+                tar_hdr_n = 0
+    return 0
+
+
+def _stream_data_tar(in_ptr: Ptr[uint8], in_len: uint64,
+                     comp: int32) -> int64:
+    # Driver: feed the data.tar.<comp> compressed bytes through the
+    # streaming decoder, with _tar_chunk_drain installed as the
+    # output sink. Returns the number of regular files landed on
+    # success, or -1 on error.
+    write_str(2, "dpkg: streaming data.tar (")
+    write_dec_u64(2, in_len)
+    write_str(2, " bytes compressed)\n")
+    _tar_reset_for_data()
+    if comp == COMP_XZ:
+        drc: int64 = xz_decompress_streaming(in_ptr, in_len,
+                                             _tar_chunk_drain)
+        if drc < 0:
+            if tar_drain_err != 0:
+                # The tar parser flagged the failure; the diagnostic
+                # was already printed inside _tar_chunk_drain.
+                return -1
+            write_str(2, "dpkg: streaming xz decompress failed (")
+            write_dec_u64(2, cast[uint64](-drc))
+            write_str(2, ")\n")
             return -1
-        size: uint64 = _tar_parse_octal(&hdr[124], 12)
-        typeflag: uint8 = hdr[156]
-        nlen: uint64 = _name_copy_nul(&warn_buf[0], &hdr[0], 100)
-        body_blocks: uint64 = (size + 511) / 512
-        body_off: uint64 = off + 512
+    else:
+        # COMP_GZ: streaming gzip is not (yet) wired. Real Debian
+        # packages use xz; this path exists only for completeness.
+        write_str(2, "dpkg: streaming data.tar.gz unsupported in this build\n")
+        return -1
+    if tar_drain_err != 0:
+        return -1
+    # If a body fd is still open here data.tar was truncated mid-entry.
+    if tar_cur_wfd >= 0:
+        sys_close(tar_cur_wfd)
+        tar_cur_wfd = -1
+        write_str(2, "dpkg: data.tar truncated mid-body\n")
+        return -1
+    return cast[int64](tar_files_landed)
 
-        if nlen == 0:
-            off = body_off + body_blocks * 512
-            continue
 
-        # The bare "./" head record is noise.
-        if warn_buf[0] == 46 and warn_buf[1] == 47 and warn_buf[2] == 0:
-            off = body_off + body_blocks * 512
-            continue
-
-        # Strip "./" for the safety check; "/etc/..." stays absolute
-        # (and thus unsafe). pax/GNU long-name headers (typeflag 'L'/
-        # 'x') are skipped — a small package's paths fit ustar's 100.
-        entry: Ptr[uint8] = &warn_buf[0]
-        if warn_buf[0] == 46 and warn_buf[1] == 47:
-            entry = cast[Ptr[uint8]](cast[uint64](&warn_buf[0]) + 2)
-        unsafe: int32 = _entry_unsafe(entry)
-        if warn_buf[0] == 47:
-            unsafe = 1
-        if unsafe != 0:
-            write_str(2, "dpkg: refusing unsafe path: ")
-            write_str(2, &warn_buf[0])
-            write_str(2, "\n")
-            off = body_off + body_blocks * 512
-            continue
-
-        if typeflag == 53:                              # '5' directory
-            if _compose_extract_path(&warn_buf[0]) > 0:
-                # sys_mkdir routes a 9P-mounted path through the
-                # kernel's namec_mkdir (mkdir -p). A failure (path is
-                # not under a distrofs mount, parent unwritable) is a
-                # warning — file entries below still try their own
-                # parent-mkdir via namec_create.
-                sys_mkdir(cast[Ptr[char]](&extract_path[0]))
-            off = body_off + body_blocks * 512
-            continue
-
-        if typeflag == 50:                              # '2' symlink
-            # distrofs has no symlink node kind; record nothing on
-            # disk for it. The .list manifest still carries the name.
-            write_str(2, "dpkg: note: symlink not materialised: ")
-            write_str(2, &warn_buf[0])
-            write_str(2, "\n")
-            off = body_off + body_blocks * 512
-            continue
-
-        if typeflag != 0 and typeflag != 48:            # not a regular file
-            # Hardlink / device / fifo / GNU long headers — skipped.
-            off = body_off + body_blocks * 512
-            continue
-
-        # Regular file. Land its bytes at the absolute distro path.
-        if body_off + size > data_tar_len:
-            write_str(2, "dpkg: data body overflows archive\n")
+def _write_data_manifest() -> int64:
+    # Persist list_buf to /tmp/dpkg.<pkg>.list. Called by _do_install
+    # AFTER _stream_data_tar completes (list_buf has been populated
+    # inline by _tar_record_manifest as the stream was consumed,
+    # tar_list_n tracking the running tail).
+    # Returns the count of recorded entries (tar_entries_seen) on
+    # success, or -1 on a write fault.
+    mlen: uint64 = tar_list_n
+    _compose_list_path()
+    wfd: int32 = sys_open_write(cast[Ptr[char]](&list_path[0]))
+    if wfd < 0:
+        write_str(2, "dpkg: cannot open file list for write: ")
+        write_str(2, &list_path[0])
+        write_str(2, "\n")
+        return -1
+    if mlen > 0:
+        wn: int64 = _write_full(wfd, &list_buf[0], mlen)
+        if wn < 0 or cast[uint64](wn) != mlen:
+            sys_close(wfd)
+            write_str(2, "dpkg: short write updating file list\n")
             return -1
-        if _compose_extract_path(&warn_buf[0]) == 0:
-            write_str(2, "dpkg: path too long, skipping: ")
-            write_str(2, &warn_buf[0])
-            write_str(2, "\n")
-            off = body_off + body_blocks * 512
-            continue
-        wfd: int32 = sys_open_write(cast[Ptr[char]](&extract_path[0]))
-        if wfd < 0:
-            # Not fatal: outside a distrofs namespace /usr is read-only
-            # so this is expected; report it and keep going.
-            write_str(2, "dpkg: warning: could not create ")
-            write_str(2, &extract_path[0])
-            write_str(2, " (not in a writable distro namespace?)\n")
-            off = body_off + body_blocks * 512
-            continue
-        if size > 0:
-            wn: int64 = _write_full(wfd, &tar_buf[body_off], size)
-            if wn < 0 or cast[uint64](wn) != size:
-                write_str(2, "dpkg: short write landing ")
-                write_str(2, &extract_path[0])
-                write_str(2, "\n")
-        sys_close(wfd)
-        nfiles = nfiles + 1
-
-        off = body_off + body_blocks * 512
-    return cast[int64](nfiles)
+    sys_close(wfd)
+    return cast[int64](tar_entries_seen)
 
 
 # -- query sub-commands: -l / -s / -L ----------------------------------
@@ -1539,10 +1754,14 @@ def _usage(progname: Ptr[uint8]) -> int32:
 
 def _do_install(deb_path: Ptr[char]) -> int32:
     # 1. Slurp the .deb into deb_buf.
+    write_str(2, "dpkg: slurping .deb\n")
     deb_len_i: int64 = _slurp_file(deb_path, DEB_CAP)
     if deb_len_i < 0:
         return 1
     deb_len: uint64 = cast[uint64](deb_len_i)
+    write_str(2, "dpkg: slurped ")
+    write_dec_u64(2, deb_len)
+    write_str(2, " bytes\n")
 
     # 2. Locate + decompress control.tar.{gz,xz}, parse the control
     #    file. _ar_find_tar reports the compression code so
@@ -1553,10 +1772,12 @@ def _do_install(deb_path: Ptr[char]) -> int32:
                                     deb_len, &ctl_member_size, &ctl_comp)
     if ctl_off_i < 0:
         return 1
+    write_str(2, "dpkg: decompressing control.tar\n")
     ctl_tar_i: int64 = _decompress_tar(&deb_buf[cast[uint64](ctl_off_i)],
                                        ctl_member_size, ctl_comp)
     if ctl_tar_i < 0:
         return 1
+    write_str(2, "dpkg: control.tar OK\n")
     ctl_body_len: uint64 = 0
     ctl_body_off_i: int64 = _find_control_body(cast[uint64](ctl_tar_i),
                                                &ctl_body_len)
@@ -1573,10 +1794,13 @@ def _do_install(deb_path: Ptr[char]) -> int32:
     if _write_status(stanza_len) != 0:
         return 1
 
-    # 4. Locate + decompress data.tar.{gz,xz}, write the per-package
-    #    file list. NOTE: this re-decompresses into the SAME tar_buf,
-    #    clobbering the control tar — fine, because _parse_control
-    #    already copied the five fields we need into the fld_* buffers.
+    # 4. Locate data.tar.{gz,xz} and stream it through the LZMA2 →
+    #    tar parser → per-file fd pipeline. The whole decompressed
+    #    data.tar never lands in RAM: _tar_chunk_drain processes
+    #    each 64 KiB xz output chunk on the fly, opening / writing /
+    #    closing the destination fd as each entry's body flows
+    #    through. The .list manifest is built inline during the same
+    #    pass and persisted afterward.
     data_member_size: uint64 = 0
     data_comp: int32 = COMP_GZ
     data_off_i: int64 = _ar_find_tar(cast[Ptr[uint8]]("data"), 4,
@@ -1584,24 +1808,16 @@ def _do_install(deb_path: Ptr[char]) -> int32:
                                      &data_comp)
     if data_off_i < 0:
         return 1
-    data_tar_i: int64 = _decompress_tar(&deb_buf[cast[uint64](data_off_i)],
-                                        data_member_size, data_comp)
-    if data_tar_i < 0:
-        return 1
-    nfiles_i: int64 = _write_file_list(cast[uint64](data_tar_i))
-    if nfiles_i < 0:
+    extracted_i: int64 = _stream_data_tar(
+        &deb_buf[cast[uint64](data_off_i)],
+        data_member_size, data_comp)
+    if extracted_i < 0:
         return 1
 
-    # 5. Land the package's files. This is the step that makes the
-    #    install REAL: every regular file + directory in data.tar is
-    #    written to its nested absolute distro path. Run inside an
-    #    nsrun/distrorun distro-shape namespace those paths route to a
-    #    distrofs 9P daemon; run outside one the writes are refused +
-    #    reported, never landing on a global path. _extract_data_tar
-    #    re-walks the SAME tar_buf _write_file_list just walked (read-
-    #    only — neither mutates it), so no re-decompress is needed.
-    extracted_i: int64 = _extract_data_tar(cast[uint64](data_tar_i))
-    if extracted_i < 0:
+    # 5. Persist the manifest list_buf has been accumulating to
+    #    /tmp/dpkg.<pkg>.list.
+    nfiles_i: int64 = _write_data_manifest()
+    if nfiles_i < 0:
         return 1
 
     # 6. Summary line: report both the recorded manifest count and the

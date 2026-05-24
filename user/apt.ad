@@ -405,12 +405,14 @@ comp_buf: Array[64, uint8]       # NUL-terminated component name
 
 # -- apt install scratch ----------------------------------------------
 #
-# The .deb download lands in `deb_buf`. Same 256 KiB cap as the HTTP
-# response — a fixture-sized .deb sits far inside it; a larger .deb is
-# a hard error (streaming straight to a file is a V1 concern). It is a
-# separate top-level BSS arena (the U9 nested-frame-Array quirk) so the
-# raw binary body never has to share http_buf with the inflate state.
-DEB_CAP:  uint64 = 262144      # 256 KiB raw downloaded .deb
+# The .deb is no longer buffered in RAM — _http_stream_to_file streams
+# every body byte straight to /tmp/apt/<pkg>.deb (a chunked tmpfs file
+# capped at 16 MiB) while incrementally SHA-256-ing the bytes, so this
+# arena no longer caps the .deb size. It is now JUST scratch for the
+# tmpfs-backed dpkg status DB (_is_installed reads /tmp/dpkg-status
+# into here) and for the one-shot _sha256_hash(buf, n) back-compat
+# entry point used by the InRelease verifier.
+DEB_CAP:  uint64 = 262144      # 256 KiB scratch for /tmp/dpkg-status reads
 deb_buf:  Array[262144, uint8]
 
 # Fields lifted out of the matched Packages stanza for `apt install`.
@@ -475,13 +477,20 @@ dep_field_buf: Array[1024, uint8]
 # so the abort diagnostic can name the dependent.
 dep_missing_parent: Array[64, uint8]
 
-# SHA-256 working state for the download-verification path.
-sha_state:   Array[8, uint32]      # 8 working hash words
-sha_k:       Array[64, uint32]     # round constants
-sha_w:       Array[64, uint32]     # message schedule scratch
-sha_block:   Array[64, uint8]      # one 64-byte input block
-sha_digest:  Array[32, uint8]      # 32-byte final digest
-sha_hex:     Array[80, uint8]      # digest as 64 lowercase hex chars + NUL
+# SHA-256 working state for the download-verification path. Used both
+# by the one-shot `_sha256_hash` (deb_buf[0,n)) and by the incremental
+# reset/update/final API (`_sha256_reset` / `_sha256_update` /
+# `_sha256_final`), which is what the streaming-.deb-to-disk path
+# uses so it never holds the whole .deb in RAM.
+sha_state:    Array[8, uint32]      # 8 working hash words
+sha_k:        Array[64, uint32]     # round constants
+sha_w:        Array[64, uint32]     # message schedule scratch
+sha_block:    Array[64, uint8]      # one 64-byte input block (also the
+                                    # incremental running buffer)
+sha_block_n:  uint64 = 0            # bytes currently buffered in sha_block
+sha_total:    uint64 = 0            # bytes streamed since last reset
+sha_digest:   Array[32, uint8]      # 32-byte final digest
+sha_hex:      Array[80, uint8]      # digest as 64 lowercase hex chars + NUL
 
 # -- InRelease signature verification (V1: chain of trust) ------------
 #
@@ -1252,6 +1261,193 @@ def _http_stream_gz_index(port: int64) -> int64:
     return total_out
 
 
+# -- streaming .deb fetch (the lifted-DEB_CAP install path) ------------
+#
+# _http_stream_to_file fetches url_path_buf and streams the body
+# *directly to an already-open tmpfs file* in 64 KiB chunks, while
+# simultaneously feeding every body byte through the incremental
+# SHA-256 (running sha_* state). Nothing in this function holds the
+# whole body in RAM — the staging is one HTTP_STAGE chunk (64 KiB)
+# off the socket, and the hash is updated incrementally. This is the
+# fix that lets `apt install` handle real-world Debian package sizes
+# (libc6 is ~3 MB; the old DEB_CAP path capped at 256 KiB).
+#
+# Flow (same retry-on-read==0 + 24-attempt-idle-budget shape as
+# _http_stream_gz_index):
+#   1. connect + send GET.
+#   2. drain socket into http_stage one chunk at a time.
+#   3. accumulate the first chunks as headers until CRLFCRLF; validate
+#      "HTTP/1.x 200 ...".
+#   4. for every body byte: write it to wfd AND feed it through
+#      _sha256_update. Stop when Content-Length bytes have arrived
+#      (mirrors _http_get's exit condition — avoids the trailing
+#      read past the body that wedges on TLS close_notify).
+#
+# Caller has already _sha256_reset()'d and opened wfd. Returns total
+# body bytes streamed (>= 0) on success, -1 on any error.
+
+def _http_stream_to_file(port: int64, wfd: int32) -> int64:
+    fd: int32 = _http_connect(port)
+    if fd < 0:
+        return -1
+    if _http_send_request(fd) != 0:
+        sys_close(fd)
+        return -1
+
+    hdr_len: uint64 = 0
+    headers_done: int32 = 0
+    status_ok: int32 = 0
+    content_length: uint64 = 0
+    have_clen: int32 = 0
+    body_total: uint64 = 0
+    idle: int32 = 0
+
+    while True:
+        # While accumulating headers, read past the buffered header
+        # bytes. Once headers are parsed every read lands at offset 0.
+        dst_off: uint64 = 0
+        if headers_done == 0:
+            dst_off = hdr_len
+        room: uint64 = HTTP_STAGE - dst_off
+        if room == 0:
+            write_str(2, "apt: HTTP headers exceed staging buffer\n")
+            sys_close(fd)
+            return -1
+        rp: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](&http_stage[0]) + dst_off)
+        n: int64 = sys_read(fd, rp, room)
+        if n < 0:
+            write_str(2, "apt: read() error streaming the .deb\n")
+            sys_close(fd)
+            return -1
+        if n == 0:
+            # Peer FIN or 5 s timeout. If we already have all the
+            # body bytes, stop. Otherwise retry up to ~2 min total
+            # silence before declaring the peer dead (same idle
+            # budget as _http_stream_gz_index).
+            if have_clen != 0 and body_total >= content_length:
+                break
+            if headers_done != 0 and have_clen == 0:
+                # No Content-Length advertised; FIN is the only EOF
+                # signal. Treat read==0 here as end-of-stream.
+                break
+            idle = idle + 1
+            if idle > 24:
+                break
+            continue
+        idle = 0
+
+        if headers_done == 0:
+            hdr_len = hdr_len + cast[uint64](n)
+            # Hunt for CRLFCRLF.
+            term: uint64 = 0
+            found: int32 = 0
+            p: uint64 = 0
+            while p + 3 < hdr_len:
+                if http_stage[p] == 13 and http_stage[p + 1] == 10 \
+                        and http_stage[p + 2] == 13 \
+                        and http_stage[p + 3] == 10:
+                    term = p + 4
+                    found = 1
+                    break
+                p = p + 1
+            if found == 0:
+                if hdr_len > _HDR_MAX:
+                    write_str(2, "apt: HTTP header block too large\n")
+                    sys_close(fd)
+                    return -1
+                continue                                # need more header
+            # Validate the status line.
+            if hdr_len < 12 or http_stage[0] != 72 or http_stage[1] != 84 \
+                    or http_stage[2] != 84 or http_stage[3] != 80:
+                write_str(2, "apt: malformed HTTP status line\n")
+                sys_close(fd)
+                return -1
+            if http_stage[9] != 50 or http_stage[10] != 48 \
+                    or http_stage[11] != 48:            # "200"
+                write_str(2, "apt: HTTP request for .deb did not return 200 OK\n")
+                sys_close(fd)
+                return -1
+            status_ok = 1
+            # Parse Content-Length (case-insensitive, RFC 7230 §3.2).
+            cl_name: Ptr[uint8] = "content-length"
+            cl_name_len: uint64 = 14
+            line: uint64 = 0
+            while line < term:
+                # Does this line start with "content-length"?
+                m_n: int32 = 1
+                j: uint64 = 0
+                while j < cl_name_len:
+                    c: uint8 = http_stage[line + j]
+                    if c >= 65 and c <= 90:
+                        c = c + 32
+                    if c != cl_name[j]:
+                        m_n = 0
+                        break
+                    j = j + 1
+                if m_n != 0 and http_stage[line + cl_name_len] == 58:
+                    v: uint64 = line + cl_name_len + 1
+                    while v < term and http_stage[v] == 32:
+                        v = v + 1
+                    clen: uint64 = 0
+                    has_d: int32 = 0
+                    while v < term and http_stage[v] >= 48 \
+                            and http_stage[v] <= 57:
+                        clen = clen * 10 + cast[uint64](http_stage[v] - 48)
+                        has_d = 1
+                        v = v + 1
+                    if has_d != 0:
+                        content_length = clen
+                        have_clen = 1
+                    break
+                nl: uint64 = line
+                while nl < term and http_stage[nl] != 10:
+                    nl = nl + 1
+                line = nl + 1
+            headers_done = 1
+            # Forward the body bytes that arrived in the header chunk.
+            if term < hdr_len:
+                bo: uint64 = term
+                blen: uint64 = hdr_len - term
+                if have_clen != 0 and body_total + blen > content_length:
+                    blen = content_length - body_total
+                bptr: Ptr[uint8] = cast[Ptr[uint8]](
+                    cast[uint64](&http_stage[0]) + bo)
+                wn: int64 = _write_full(wfd, bptr, blen)
+                if wn < 0 or cast[uint64](wn) != blen:
+                    write_str(2, "apt: short write streaming .deb to /tmp\n")
+                    sys_close(fd)
+                    return -1
+                _sha256_update(bptr, blen)
+                body_total = body_total + blen
+            if have_clen != 0 and body_total >= content_length:
+                break
+        else:
+            # Pure body chunk.
+            blen2: uint64 = cast[uint64](n)
+            if have_clen != 0 and body_total + blen2 > content_length:
+                blen2 = content_length - body_total
+            wn2: int64 = _write_full(wfd, &http_stage[0], blen2)
+            if wn2 < 0 or cast[uint64](wn2) != blen2:
+                write_str(2, "apt: short write streaming .deb to /tmp\n")
+                sys_close(fd)
+                return -1
+            _sha256_update(&http_stage[0], blen2)
+            body_total = body_total + blen2
+            if have_clen != 0 and body_total >= content_length:
+                break
+
+    sys_close(fd)
+
+    if status_ok == 0:
+        write_str(2, "apt: HTTP response had no complete header block\n")
+        return -1
+    if have_clen != 0 and body_total < content_length:
+        write_str(2, "apt: .deb stream truncated before Content-Length\n")
+        return -1
+    return cast[int64](body_total)
+
+
 # -- compose "<base-path>/dists/<suite>/<tail>" into url_path_buf ------
 #
 # `tail` is the suffix below the suite directory (e.g. "Release" or
@@ -1890,10 +2086,17 @@ def _sha256_compress():
     sha_state[7] = cast[uint32](sum_7 & 0xFFFFFFFF)
 
 
-# _sha256_hash(n): one-shot SHA-256 of deb_buf[0, n). Writes the
-# 64-char lowercase-hex digest (NUL-terminated) into sha_hex.
+# -- incremental SHA-256 API ------------------------------------------
+#
+# _sha256_reset / _sha256_update / _sha256_final form the running-hash
+# API the streaming-.deb-to-disk path uses: bytes off the socket are
+# fed to _sha256_update in 64 KiB chunks AS they are written to the
+# .deb file, so the verifier never holds the whole .deb in RAM. After
+# the stream closes _sha256_final emits the 64-char lowercase-hex
+# digest into sha_hex. Shape mirrors lib/sha2/sha2.ad's SHA-512
+# reset/update/finish trio.
 
-def _sha256_hash(n: uint64):
+def _sha256_reset():
     _sha256_init_k()
     sha_state[0] = 0x6A09E667
     sha_state[1] = 0xBB67AE85
@@ -1903,26 +2106,36 @@ def _sha256_hash(n: uint64):
     sha_state[5] = 0x9B05688C
     sha_state[6] = 0x1F83D9AB
     sha_state[7] = 0x5BE0CD19
+    sha_block_n = 0
+    sha_total = 0
 
-    # Compress every full 64-byte block of the input.
-    off: uint64 = 0
-    while off + 64 <= n:
+
+def _sha256_update(data: Ptr[uint8], n: uint64):
+    # Stream `n` bytes from `data` into the running hash. The running
+    # tail is buffered in sha_block (max 64 bytes); on every full
+    # block we compress and start fresh. n=0 is a no-op.
+    pos: uint64 = 0
+    while pos < n:
+        room: uint64 = 64 - sha_block_n
+        take: uint64 = n - pos
+        if take > room:
+            take = room
         i: uint64 = 0
-        while i < 64:
-            sha_block[i] = deb_buf[off + i]
+        while i < take:
+            sha_block[sha_block_n + i] = data[pos + i]
             i = i + 1
-        _sha256_compress()
-        off = off + 64
+        sha_block_n = sha_block_n + take
+        pos = pos + take
+        if sha_block_n == 64:
+            _sha256_compress()
+            sha_block_n = 0
+    sha_total = sha_total + n
 
-    # Final block(s): the tail bytes + 0x80 + zero-pad + 64-bit BE
-    # message length in bits.
-    rem: uint64 = n - off
-    buflen: uint64 = 0
-    i: uint64 = 0
-    while i < rem:
-        sha_block[buflen] = deb_buf[off + i]
-        buflen = buflen + 1
-        i = i + 1
+
+def _sha256_final():
+    # Pad the trailing partial block per FIPS 180-4 and emit the digest
+    # as 64 lowercase hex chars (NUL-terminated) into sha_hex.
+    buflen: uint64 = sha_block_n
     sha_block[buflen] = 0x80
     buflen = buflen + 1
     if buflen > 56:
@@ -1934,7 +2147,7 @@ def _sha256_hash(n: uint64):
     while buflen < 56:
         sha_block[buflen] = 0
         buflen = buflen + 1
-    total_bits: uint64 = n * 8
+    total_bits: uint64 = sha_total * 8
     j: uint64 = 0
     while j < 8:
         shift: uint64 = (7 - j) * 8
@@ -1959,6 +2172,18 @@ def _sha256_hash(n: uint64):
         sha_hex[m * 2 + 1] = hexd[cast[uint64](byte_v & 0x0F)]
         m = m + 1
     sha_hex[64] = 0
+
+
+# _sha256_hash(n): one-shot SHA-256 of deb_buf[0, n). Writes the
+# 64-char lowercase-hex digest (NUL-terminated) into sha_hex. Kept as
+# a back-compat wrapper for the buffered code-path (the InRelease
+# verifier still uses a one-shot through deb_buf via the same global
+# state machine).
+
+def _sha256_hash(n: uint64):
+    _sha256_reset()
+    _sha256_update(&deb_buf[0], n)
+    _sha256_final()
 
 
 # -- InRelease OpenPGP signature verification --------------------------
@@ -3349,16 +3574,28 @@ def _fetch_one(pkg: Ptr[uint8], port: int64) -> int32:
     if _lookup_install_fields(pkg, cast[uint64](ilen_i)) != 0:
         return 1
 
-    # HTTP GET <base-url>/<Filename> — the .deb is binary, the body
-    # bytes are captured raw (no text processing). _http_get drains
-    # into http_buf; we then copy the body span verbatim into deb_buf
-    # so the SHA-256 path sees a clean image.
+    # HTTP GET <base-url>/<Filename> — stream the .deb body directly
+    # to /tmp/apt/<pkg>.deb in 64 KiB chunks while incrementally
+    # SHA-256-ing the bytes. The OLD path buffered the whole .deb in
+    # a fixed 256 KiB BSS arena (DEB_CAP) — real Debian packages
+    # routinely exceed that (libc6 ~3 MB, nginx ~600 KB), so the cap
+    # broke `apt install` for the marquee scenario. Streaming to a
+    # chunked-tmpfs file removes the cap (tmpfs files now hold up to
+    # 16 MiB per file).
     _build_deb_path()
+    _build_debpath(pkg)
     write_str(1, "apt: fetching ")
     write_str(1, &fld_filename[0])
     write_str(1, "\n")
-    body_off: uint64 = 0
-    body_len_i: int64 = _http_get(port, &body_off, 0)
+    wfd: int32 = sys_open_write(cast[Ptr[char]](&debpath_buf[0]))
+    if wfd < 0:
+        write_str(2, "apt: cannot open ")
+        write_str(2, &debpath_buf[0])
+        write_str(2, " for write\n")
+        return 1
+    _sha256_reset()
+    body_len_i: int64 = _http_stream_to_file(port, wfd)
+    sys_close(wfd)
     if body_len_i < 0:
         write_str(2, "apt: failed to download the .deb\n")
         return 1
@@ -3366,34 +3603,25 @@ def _fetch_one(pkg: Ptr[uint8], port: int64) -> int32:
         write_str(2, "apt: downloaded .deb is empty\n")
         return 1
     deb_len: uint64 = cast[uint64](body_len_i)
-    if deb_len > DEB_CAP:
-        write_str(2, "apt: .deb exceeds 256 KiB cap (V0 limit)\n")
-        return 1
-    ci: uint64 = 0
-    while ci < deb_len:
-        deb_buf[ci] = http_buf[body_off + ci]
-        ci = ci + 1
 
-    # Optional Size cross-check: a Size mismatch means the wrong /
-    # truncated file — bail before the (more expensive) hash.
+    # Optional Size cross-check.
     want_size: int64 = _parse_size()
     if want_size >= 0 and cast[uint64](want_size) != deb_len:
-        write_str(2, "apt: downloaded size mismatch — expected ")
+        write_str(2, "apt: downloaded size mismatch - expected ")
         write_dec_u64(2, cast[uint64](want_size))
         write_str(2, " bytes, got ")
         write_dec_u64(2, deb_len)
         write_str(2, "\n")
         return 1
 
-    # SHA-256 verification. The index's SHA256 field is the trust
-    # anchor: hash the bytes we downloaded and compare. A mismatch
-    # aborts the install — the corrupt/wrong .deb is NEVER handed to
-    # dpkg. If the index carries no SHA256 we proceed with a loud
-    # warning (documented V0.1 backlog: require it).
+    # SHA-256 verification. The hash is already running over every
+    # streamed body byte; finalize it and compare to the index's
+    # SHA256 field. A mismatch aborts the install — the corrupt /
+    # wrong .deb is NEVER handed to dpkg.
     if fld_sha256[0] == 0:
         write_str(2, "apt: WARNING: SHA256 not verified (index stanza has no SHA256 field)\n")
     else:
-        _sha256_hash(deb_len)
+        _sha256_final()
         # Compare lowercase-hex digests. The index field is normalised
         # to lowercase as we compare so an uppercase index value still
         # matches.
@@ -3424,20 +3652,6 @@ def _fetch_one(pkg: Ptr[uint8], port: int64) -> int32:
         write_str(1, "apt: SHA256 OK (")
         write_dec_u64(1, deb_len)
         write_str(1, " bytes)\n")
-
-    # Save the verified .deb to /tmp/apt/<pkg>.deb for the dpkg step.
-    _build_debpath(pkg)
-    wfd: int32 = sys_open_write(cast[Ptr[char]](&debpath_buf[0]))
-    if wfd < 0:
-        write_str(2, "apt: cannot open ")
-        write_str(2, &debpath_buf[0])
-        write_str(2, " for write\n")
-        return 1
-    wn: int64 = _write_full(wfd, &deb_buf[0], deb_len)
-    sys_close(wfd)
-    if wn < 0 or cast[uint64](wn) != deb_len:
-        write_str(2, "apt: short write saving the downloaded .deb\n")
-        return 1
     return 0
 
 
