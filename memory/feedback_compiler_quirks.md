@@ -94,7 +94,8 @@ place (correctness-neutral) — removing them is queued repo-wide cleanup.
 Adder reserves these as keywords or built-in identifiers and will fail
 to parse if used as variable/parameter names:
 - `bytes` (L50, 2026-05-16 — surfaced renaming `chacha_crypt_generic`'s `bytes` param to `nbytes`)
-- `match`, `case` (standard Python keywords)
+- `match`, `case` (reserved; parser accepts the construct, codegen
+  rejects it — see *Features deliberately not in Adder* below)
 - `char`, `bool`, `int8`/`int16`/`int32`/`int64`, `uint8`/`uint16`/`uint32`/`uint64` (built-in types)
 
 **How to apply:** when porting C/Linux code, rename collision params to `n`, `nbytes`, `n_bytes`, etc.
@@ -184,6 +185,41 @@ The stable workaround in `drivers/net/arp.ad:arp_lookup`:
 Same trick fixes any other `&Array[N, Array[M, T]]` index-then-take-
 address site. Real fix lives in compiler/adder.py's address-of
 emitter for nested LValues — defer to a compiler milestone.
+
+## Features deliberately not in Adder (2026-05-23 audit)
+
+`LANGUAGE.md` was audited against the actual compiler and pruned. The
+features below show up in Python and the parser accepts most of them
+(so error messages stay readable), but the **codegen rejects every
+one with `x86: <Node> not yet supported`**. They are deliberately
+absent from the language; `LANGUAGE.md`'s "Features deliberately not
+in Adder" table documents each with the systems-language idiom to
+use instead. Guarded by `scripts/test_compiler_unsupported_rejected.sh`.
+
+| Feature | Why not | Systems-language alternative |
+|---|---|---|
+| `List[T]`, `Dict[K, V]`, `Tuple[A, B]`, `Optional[T]` | Imply hidden heap | `Array[N, T]` or `Ptr[T]` + `kmalloc` |
+| Dict / list literals (`{1: 10}`, list comprehensions) | Hidden allocation | Explicit loop + `Array[N, KV]` |
+| Lambdas / closures | Captured environment = hidden heap | Named `def` + `Fn[R, A...]` |
+| F-strings `f"x={x}"` | Per-call format buffer | `printk1(fmt, x)` family |
+| String slicing `s[2:5]` | New string OR a slice type with no users | Walk bytes by index; pass `(Ptr[char], length)` |
+| `try`/`except`/`raise`/`finally` | Exceptions break flow control, don't compose with IRQ context | `int32` error returns (`-EINVAL`, ...) |
+| `with X as y:` context managers | Non-obvious cleanup paths | Explicit cleanup before each return |
+| `match`/`case` | Parser accepts; codegen rejects; zero production users | `if`/`elif` chain; `Array[N, Fn[...]]` jump table for wide dispatch |
+| Class methods (`def m(self):`) | Methods imply vtables / mangling | Free function with `Ptr[T]` first arg |
+| Class inheritance | Implies vtable / common base layout | Composition (embed "base" as field) |
+| Class decorators (`@packed`) | Codegen ignores all decorators | Layout fields C-ABI style |
+| `union` declarations | Parser-accepted but no production user | Type-pun through `Ptr[T]` cast |
+| `print()`, `len()`, `input()`, `abs()`, `min()`, `max()`, `ord()`, `chr()`, `sizeof()` | None wired up as builtins | `printk*` family; module-level `SIZEOF_FOO: uint64 = N` |
+| Default-valued params `def f(x=0)` | Parser allows; codegen does not honor | Pass explicitly at every call site |
+| `assert`, `defer`, `yield` | Reserved; no users; no codegen | Manual checks; explicit cleanup; iterative state machine |
+| `volatile T` type modifier | Parsed but unused | `asm_volatile` for fences; `Ptr[T]` MMIO + explicit barriers |
+| Qualified `lib.X.symbol` access | Adder import is a flat merge | `from lib.X import symbol` |
+
+**How to apply:** if you're writing `.ad` and reach for one of these,
+the answer is to (a) write the equivalent explicit code, or (b) bring
+a real proposal to extend the compiler — not to silently work around
+the parser/codegen mismatch.
 
 ## ~~`cast[uint64](arr[i])` for `Array[N, uint32]` doesn't zero-extend cleanly~~ NOT REAL (verified 2026-05-18)
 

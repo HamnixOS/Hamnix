@@ -1,26 +1,56 @@
 # Adder Language Reference
 
-Adder is a Python-syntax systems programming language that compiles
-directly to x86_64 assembly via a hand-written backend (no LLVM).
-It's the language Hamnix is written in — the bare-metal kernel
+Adder is a Python-syntax **systems** programming language that compiles
+directly to x86_64 assembly via a hand-written backend (no LLVM). It's
+the language Hamnix is written in — the bare-metal kernel
 (`init/main.ad` and everything under `arch/`, `mm/`, `kernel/`,
-`drivers/`, `fs/`, `sys/`), the Linux ABI shims (`linux_abi/`),
-and userland binaries (`user/*.ad` and `tests/test_*.ad`). See
+`drivers/`, `fs/`, `sys/`), the Linux ABI shims (`linux_abi/`), and
+userland binaries (`user/*.ad` and `tests/test_*.ad`). See
 `docs/architecture.md` for how those pieces fit together.
+
+## Design principles
+
+Adder uses Python's surface syntax to keep code readable, but is a
+**systems language** at heart. That means:
+
+- **No hidden allocation.** Heap memory comes from explicit
+  `kmalloc(size) -> uint64` calls into `mm/slab.ad`. The language has
+  no garbage collector and no implicit `new`.
+- **No hidden control flow.** Functions return error codes (Linux's
+  `-EINVAL` / `-ENOMEM` convention) — there are no exceptions, no
+  `try`/`except`, no unwinding.
+- **No runtime-typed values.** Every variable has a declared type. The
+  compiler does not synthesise `Any` / `Object` / a `repr()` machinery.
+  Comparisons, prints, and conversions are all explicit.
+- **Every cycle should be inspectable in the generated assembly.**
+  Each Adder construct maps to a handful of x86_64 instructions you can
+  reasonably predict, which is why dispatch tables use `Fn[R, A...]`
+  (one `call *%r11`) rather than virtual methods or duck typing.
+
+This document is a **reference for what the compiler actually
+implements**, not a wishlist. If a section is here, you can rely on
+it; if a Python feature you'd expect is missing, it's deliberate (see
+*Features deliberately not in Adder* at the bottom).
 
 ## Table of Contents
 - [Lexical Grammar](#lexical-grammar)
 - [Types](#types)
 - [Variables](#variables)
 - [Functions](#functions)
+- [Function Pointers](#function-pointers)
 - [Control Flow](#control-flow)
-- [Classes and Structs](#classes-and-structs)
-- [Unions](#unions)
+- [Classes (used as structs)](#classes-used-as-structs)
 - [Pointers and Memory](#pointers-and-memory)
-- [Built-in Functions](#built-in-functions)
+- [Type Casting](#type-casting)
+- [Heap Allocation](#heap-allocation)
+- [Per-CPU Storage](#per-cpu-storage)
 - [Hardware Intrinsics](#hardware-intrinsics)
 - [Inline Assembly](#inline-assembly)
-- [Decorators](#decorators)
+- [External Functions](#external-functions)
+- [Import System](#import-system)
+- [`container_of`](#container_of)
+- [Target Selection](#target-selection)
+- [Features deliberately not in Adder](#features-deliberately-not-in-adder)
 
 ---
 
@@ -59,18 +89,26 @@ stop short of `1.5e-3`).
 | anything else with a digit prefix | `9P2000`    | `IDENT`     |
 | `0x` followed by non-hex          | `0xZZ`      | `IDENT`     |
 
-Underscores act as digit separators inside numeric literals (matching
-the existing pre-2026-05 behavior) and are stripped before value
-parsing — `1_000_000` evaluates to `1000000`.
+Underscores act as digit separators inside numeric literals and are
+stripped before value parsing — `1_000_000` evaluates to `1000000`.
 
 Examples:
 
 ```python
 9P2000: int32 = 100        # IDENT: 9P2000 is a digit-leading identifier
 mode: uint32 = 0o755       # NUMBER: octal literal
-shift: float64 = 1.5e-3    # NUMBER: float with signed exponent
 x = 9.foo                  # NUMBER(9), DOT, IDENT(foo) — three tokens
 ```
+
+### Strings
+
+Adder accepts `"..."` and `'...'` strings. They lower to a
+NUL-terminated byte sequence in `.rodata` and are referenced through
+RIP-relative `leaq`. Triple-quoted strings are supported. Escapes:
+`\n`, `\t`, `\r`, `\b`, `\\`, `\'`, `\"`, `\0`, `\xNN`.
+
+Adjacent string-literal concatenation (`"foo " "bar"`) is **not**
+supported — use a single literal or build the string at runtime.
 
 ---
 
@@ -82,46 +120,48 @@ x = 9.foo                  # NUMBER(9), DOT, IDENT(foo) — three tokens
 |------|------|-------------|
 | `int8` | 1 byte | Signed 8-bit integer |
 | `int16` | 2 bytes | Signed 16-bit integer |
-| `int32` | 4 bytes | Signed 32-bit integer (default) |
+| `int32` | 4 bytes | Signed 32-bit integer |
 | `int64` | 8 bytes | Signed 64-bit integer |
 | `uint8` | 1 byte | Unsigned 8-bit integer |
 | `uint16` | 2 bytes | Unsigned 16-bit integer |
 | `uint32` | 4 bytes | Unsigned 32-bit integer |
 | `uint64` | 8 bytes | Unsigned 64-bit integer |
-| `float32` | 4 bytes | Single precision float |
-| `float64` | 8 bytes | Double precision float |
-| `bool` | 1 byte | Boolean (True/False) |
-| `char` | 1 byte | Character |
-| `str` | pointer | String (null-terminated) |
+| `bool` | 1 byte | Boolean (`True`/`False`) |
+| `char` | 1 byte | 8-bit character; idiomatic for `Ptr[char]` (C-style strings) |
+
+All integers occupy a 64-bit slot in the SysV AMD64 ABI: `%rax` for
+return values, the 6 argument registers for parameters. Sub-8-byte
+loads/stores use the sized form (`movb`/`movw`/`movl`); reads
+zero-extend or sign-extend per the type's signedness.
+
+Signedness drives the codegen for `<`, `<=`, `>`, `>=`, `>>`, `/`,
+`//`, and `%`. If either operand is `uint*`, the codegen emits the
+unsigned variant (`setb`/`setbe`/`seta`/`setae`, `shrq`, `divq`); if
+both are signed, the signed variant (`setl`/`setle`/`setg`/`setge`,
+`sarq`, `idivq`). Equality (`==` / `!=`) is sign-agnostic.
 
 ### Compound Types
 
 ```python
-# Pointer
-ptr: Ptr[int32]
+# Pointer to T
+p: Ptr[uint32]
 
-# Fixed-size array (stack allocated)
-arr: Array[10, int32]
+# Fixed-size array. N must be a numeric literal. Stored inline:
+# in a local frame, on the stack; as a global, in .bss (zero-init)
+# or .data (string-initialised). NO heap involvement.
+buf: Array[16, uint8]
+matrix: Array[8, Array[6, uint8]]    # 2-D works; indexes nest
 
-# Dynamic list (heap allocated)
-items: List[int32]
+# Function pointer (see "Function Pointers" below).
+handler: Fn[int32, Ptr[uint8], uint64]
 
-# Dictionary
-table: Dict[str, int32]
-
-# Tuple
-pair: Tuple[int32, str]
-
-# Optional
-maybe: Optional[int32]
+# Per-CPU storage (see "Per-CPU Storage" below).
+ticks: Percpu[uint64]
 ```
 
-### Type Modifiers
-
-```python
-# Volatile (prevents optimizer removing reads)
-mmio_reg: volatile uint32
-```
+Production .ad files use `Ptr[T]`, `Array[N, T]`, `Fn[R, A...]`, and
+`Percpu[T]`. These are the only compound types the codegen
+implements.
 
 ---
 
@@ -129,69 +169,79 @@ mmio_reg: volatile uint32
 
 ### Declaration and Assignment
 
-```python
-# With type annotation
-x: int32 = 42
-name: str = "hello"
+Every variable has a declared type:
 
-# Multiple assignment
+```python
+x: int32 = 42
+flags: uint64 = 0xCAFEBABE
+buf: Array[8, uint8]                 # zero-init for arrays / structs
+
+# Re-assignment
+x = x + 1
+```
+
+### Multiple assignment / swap
+
+Multi-target assignment is supported — the RHS is fully evaluated
+before any target is written, so `a, b = b, a` is a safe swap:
+
+```python
 a: int32 = 1
 b: int32 = 2
-a, b = b, a  # Swap
-
-# Constants
-PI: float32 = 3.14159
+a, b = b, a                          # swap; uses TupleUnpackAssign codegen
 ```
 
-### Global Variables
+### Globals
+
+A top-level `name: type = value` declares a global. With an initialiser
+that's a literal, it lands in `.data`; without one (or with `0`), it
+lands in `.bss`. String-literal initialisers populate
+`Array[N, uint8]` globals via `.ascii` + `.zero` padding.
 
 ```python
-counter: int32 = 0
+counter: int64 = 0                   # .bss
+prompt:  Array[8, uint8] = "hamsh$ " # .data, NUL-padded to length 8
 
-def increment() -> int32:
-    global counter
-    counter = counter + 1
+def bump() -> int64:
+    counter = counter + 1            # ordinary store to counter(%rip)
     return counter
 ```
+
+Adder does not require Python's `global` keyword inside functions —
+any unqualified name that wasn't declared as a local resolves to the
+matching top-level declaration.
 
 ---
 
 ## Functions
 
-### Basic Functions
-
 ```python
 def add(a: int32, b: int32) -> int32:
     return a + b
 
-def greet(name: str) -> None:
-    print(f"Hello, {name}!")
+# Void return: omit the arrow entirely
+def panic_print(msg: Ptr[char]):
+    printk0(msg)
 ```
 
-### Default Arguments
+The codegen uses SysV AMD64: integer/pointer args in
+`%rdi`, `%rsi`, `%rdx`, `%rcx`, `%r8`, `%r9` for the first six; result
+in `%rax`. Functions emit `endbr64` at entry (IBT-ready), frame with
+`%rbp`, and never use the red zone (invalid in kernel context).
 
-```python
-def power(base: int32, exp: int32 = 2) -> int32:
-    result: int32 = 1
-    for i in range(exp):
-        result = result * base
-    return result
-```
+There are no default-argument values, no keyword-only parameters, no
+`*args`/`**kwargs`, and no nested/closure-capturing function
+definitions. Every parameter and return type must be declared.
 
-### Lambda Functions
+---
 
-```python
-square: Ptr[int32] = lambda x: x * x
-result: int32 = square(5)  # 25
-```
-
-### Function Pointers
+## Function Pointers
 
 Adder has **first-class function pointers** as a real type. The syntax
-is `Fn[R, A...]` where `R` is the return type and `A...` are the argument
-types. Function pointers are typed, can be stored in globals, passed as
-parameters, returned, and called indirectly. SysV AMD64 indirect-call
-codegen lands the call through `call *%rax`.
+is `Fn[R, A...]` where `R` is the return type and `A...` are the
+argument types. Function pointers are typed, can be stored in globals,
+passed as parameters, returned, and called indirectly. SysV AMD64
+indirect-call codegen lands the call through `call *%r11`.
 
 ```python
 # Declare a function-pointer type. This signature says:
@@ -223,10 +273,14 @@ if on_packet != cast[Fn[int32, Ptr[uint8], uint64]](0):
 ```
 
 Production uses include: `drivers/net/eth.ad`'s `eth_register_tx_hook`
-(every NIC driver registers its TX path this way), `kernel/sched/core.ad`'s
-`cleartid_wake_hook`, the IRQ handler table, the block-device vtable,
-netfilter hooks, and timer callbacks. Reach for `Fn[R, A...]` whenever you
-want a callback — do NOT introduce a global mode-flag enum to dispatch on.
+(every NIC driver registers its TX path this way),
+`kernel/sched/core.ad`'s `cleartid_wake_hook`, the IRQ handler table,
+the block-device vtable, netfilter hooks, and timer callbacks. Reach
+for `Fn[R, A...]` whenever you want a callback — do NOT introduce a
+global mode-flag enum to dispatch on.
+
+Regression fixture: `tests/test_compiler_fnptr.ad` +
+`scripts/test_compiler_fnptr.sh`.
 
 ---
 
@@ -236,11 +290,11 @@ want a callback — do NOT introduce a global mode-flag enum to dispatch on.
 
 ```python
 if x > 0:
-    print("positive")
+    printk0("positive\n")
 elif x < 0:
-    print("negative")
+    printk0("negative\n")
 else:
-    print("zero")
+    printk0("zero\n")
 
 # Ternary expression
 sign: int32 = 1 if x > 0 else -1
@@ -256,24 +310,19 @@ while x > 0:
 # Do-while loop — run body at least once, then test condition.
 # Unique to Adder among Python-syntax languages; ships in the
 # `do:`/`while` form (no trailing colon on the `while` line).
+# Used by 9+ production sites — e.g. fs/elf.ad's PHDR walker.
 do:
     x = x - 1
 while x > 0
 
-# For loop with range
+# For loop with range (range(stop), range(start, stop),
+# range(start, stop, step)). Lowers to an integer counter and
+# a compare/jump — no iterator object is created.
 for i in range(10):
-    print(i)
+    sum = sum + i
 
-for i in range(0, 100, 2):  # Start, end, step
-    print(i)
-
-# For loop with collection
-for item in items:
-    process(item)
-
-# Tuple unpacking in loop
-for key, value in pairs:
-    print(key, value)
+for i in range(0, 100, 2):
+    flags = flags | (1 << i)
 
 # Break and continue
 for i in range(100):
@@ -281,113 +330,68 @@ for i in range(100):
         break
     if i % 2 == 0:
         continue
-    print(i)
+    accumulate(i)
 ```
 
-### Match Statement
+There is no `for x in collection:` iteration over a general container
+(Adder has no general containers). For walking an array, use an index
+counter:
 
 ```python
-match value:
-    case Some(x):
-        print(x)
-    case None:
-        print("nothing")
-    case _:
-        print("wildcard")
-```
-
-### Exception Handling
-
-```python
-try:
-    result = risky_operation()
-except ValueError as e:
-    print("value error")
-except:
-    print("unknown error")
-else:
-    print("success")
-finally:
-    cleanup()
-
-raise ValueError("invalid input")
-```
-
-### Context Managers
-
-```python
-with open_file("/data.txt") as f:
-    data = f.read()
-# File automatically closed
+i: int32 = 0
+while i < n:
+    process(arr[i])
+    i = i + 1
 ```
 
 ---
 
-## Classes and Structs
+## Classes (used as structs)
 
-### Basic Class
-
-```python
-class Point:
-    x: int32
-    y: int32
-
-# Struct-style initialization
-p: Point = Point{x=10, y=20}
-
-# Access fields
-total: int32 = p.x + p.y
-```
-
-### Methods
+A `class` in Adder is a **C-ABI-compatible struct**. Fields are laid
+out in declaration order, each aligned to its natural alignment
+(capped at 8), and the total size is rounded up to 8 bytes. There are
+**no methods, no inheritance, no constructors, and no destructors** —
+classes carry data, not behaviour.
 
 ```python
-class Counter:
-    value: int32
-
-    def increment(self) -> int32:
-        self.value = self.value + 1
-        return self.value
-
-    def reset(self) -> None:
-        self.value = 0
+class VmaNode:
+    start:       uint64
+    end:         uint64
+    file_offset: uint64
+    backing:     uint64
+    next:        uint64
+    chunks:      uint64
+    prot:        int32
+    flags:       int32
+    file_fd:     int32
+    order:       int32
+    nchunks:     int32
+    is_cow:      int32
 ```
 
-### Inheritance
+You typically allocate a struct on the heap and operate on it through
+a `Ptr[VmaNode]`. Field access through a pointer uses **`ptr[0].field`**
+— the `[0]` does the explicit dereference, and `.field` then names the
+field. (This is the production idiom; `kernel/list.ad`'s linked-list
+operations are the canonical example.)
 
 ```python
-class Animal:
-    name: str
-
-class Dog(Animal):
-    breed: str
+node: Ptr[VmaNode] = cast[Ptr[VmaNode]](kmalloc(SIZEOF_VMA_NODE))
+node[0].start = base
+node[0].end   = base + len
+node[0].flags = 0
 ```
 
-### Decorators
+To take a field's address, use `&ptr[0].field` (or compute the offset
+manually).
 
-```python
-@packed
-class HardwareReg:
-    status: uint8
-    data: uint16
-    flags: uint8
-```
+A struct can also be embedded in an `Array[N, T]` (intrusive freelist
+pools) or be a local variable (stored directly on the stack). The
+compiler picks the storage based on how the variable is declared.
 
----
-
-## Unions
-
-Unions allow multiple fields to share the same memory location (useful for type punning):
-
-```python
-union Register:
-    raw: uint32
-    low_byte: uint8
-    high_word: uint16
-
-r: Register = Register{raw=0x12345678}
-print(r.low_byte)  # Access low byte
-```
+`container_of(ptr, Type, field)` is the inverse — see
+[*`container_of`*](#container_of).
 
 ---
 
@@ -397,63 +401,120 @@ print(r.low_byte)  # Access low byte
 
 ```python
 x: int32 = 42
-ptr: Ptr[int32] = &x  # Address of x
-val: int32 = *ptr     # Dereference
+ptr: Ptr[int32] = &x         # Address of local x
+val: int32 = *ptr            # Dereference (returns int32)
 
-# Pointer arithmetic
-next_ptr: Ptr[int32] = ptr + 1
+# Pointer arithmetic — scaled by sizeof(T), like in C
+next_ptr: Ptr[int32] = ptr + 1   # +4 bytes, not +1
 ```
 
-### Type Casting
+### Indexing through a pointer
+
+`ptr[i]` is sugar for `*(ptr + i)` — the index is scaled by the
+pointee size:
 
 ```python
-raw: uint32 = 0x40004000
-uart: Ptr[uint32] = cast[Ptr[uint32]](raw)
+buf: Ptr[uint8] = cast[Ptr[uint8]](kmalloc(N))
+buf[0] = 0xAA                # writes one byte
+buf[1] = 0xBB
 ```
 
-### sizeof
+### Pointer NULL / numeric pointer
+
+`Ptr[T]` and `uint64` are freely castable in both directions (the
+production heap allocator returns a `uint64` precisely so the caller
+chooses the pointee type explicitly):
 
 ```python
-size: int32 = sizeof(Point)
+raw: uint64 = kmalloc(64)
+buf: Ptr[uint32] = cast[Ptr[uint32]](raw)
+if buf == cast[Ptr[uint32]](0):
+    return -1                # -ENOMEM
 ```
 
 ---
 
-## Built-in Functions
+## Type Casting
 
-### I/O Functions
-
-```python
-print("Hello")              # Print with newline
-print("a", "b", sep=", ")   # Custom separator
-print("no newline", end="") # No newline
-
-len(string)                 # String length
-len(list)                   # List length
-
-input("prompt: ")           # Read line from stdin
-```
-
-### Math Functions
+Adder requires casts to be explicit. The generic form is `cast[T](x)`:
 
 ```python
-abs(-5)        # Absolute value: 5
-min(a, b)      # Minimum
-max(a, b)      # Maximum
+raw: uint32 = 0x40004000
+uart: Ptr[uint32] = cast[Ptr[uint32]](raw)
+n8:   uint8  = cast[uint8](n32 & 0xFF)
 ```
 
-### Type Conversion
+Integer ↔ integer casts are a no-op at the assembly level (everything
+occupies a 64-bit slot; the compiler trusts the programmer to mask
+when narrowing matters). Integer ↔ pointer casts are also a no-op
+— `Ptr[T]` is just a 64-bit value.
+
+`cast[T](x)` is the **only** form that performs a conversion. There
+is no implicit promotion / coercion path.
+
+---
+
+## Heap Allocation
+
+There is no `new` keyword. Heap memory comes from `mm/slab.ad`:
 
 ```python
-ord('A')       # Character to int: 65
-chr(65)        # Int to character: 'A'
+from mm.slab import kmalloc, kfree, kzalloc
+
+def make_pgrp() -> Ptr[Pgrp]:
+    raw: uint64 = kzalloc(sizeof_Pgrp)
+    if raw == 0:
+        return cast[Ptr[Pgrp]](0)    # caller checks for NULL
+    return cast[Ptr[Pgrp]](raw)
+
+def drop_pgrp(p: Ptr[Pgrp]):
+    if p == cast[Ptr[Pgrp]](0):
+        return
+    kfree(cast[uint64](p))
 ```
+
+The slab allocator dispatches small (≤2 KiB) requests to per-size
+slab caches and large requests through `alloc_pages`. It returns
+**`uint64`** rather than `Ptr[T]` so the caller is forced to declare
+which type they're allocating — there is no "void pointer" in Adder
+and no implicit conversion from `uint64` to `Ptr[T]`. Use `cast[]`.
+
+This is the idiomatic Hamnix pattern. Prefer real heap allocation;
+use a fixed `Array[N, T]` pool only when you have a concrete reason
+(interrupt-context alloc, OOM-must-succeed guarantee, very tight
+count bound that makes the simpler pool code win).
+
+---
+
+## Per-CPU Storage
+
+`Percpu[T]` declares a global whose storage is replicated per CPU.
+Reads and writes go through the `%gs:offset` segment override; the
+codegen handles the relocations and the `.data..percpu` section
+layout.
+
+```python
+# arch/x86/kernel/setup_percpu.ad
+cpu_id_pcpu: Percpu[uint64]
+
+# arch/x86/kernel/time.ad
+local_timer_ticks: Percpu[uint64]
+
+def on_timer_tick():
+    local_timer_ticks = local_timer_ticks + 1   # %gs:offset read+write
+```
+
+Each per-CPU global gets one slot per CPU in `.data..percpu`; the
+`%gs` base is set up per CPU at boot in `setup_percpu_asm.S`. Reading
+or writing a `Percpu[T]` global from inside an Adder function emits
+the `%gs:`-prefixed `movq`/`movl`/etc. directly — no helper call,
+no relocation surprises.
 
 ---
 
 ## Hardware Intrinsics
 
-The x86_64 backend recognizes a small set of names as **inline
+The x86_64 backend recognises a small set of names as **inline
 intrinsics** — calls that lower to bare machine instructions instead
 of a `call`. Anything not on this list is an ordinary function call.
 
@@ -464,11 +525,11 @@ hardware (PIC, PIT, serial UART, CMOS, ...). Each is emitted inline —
 there is no exported symbol behind them.
 
 ```python
-outb(value, port)            # 8-bit  write   (out  %al,  %dx)
+outb(value, port)             # 8-bit  write   (out  %al,  %dx)
 v8:  uint8  = inb(port)       # 8-bit  read    (in   %dx,  %al)
-outw(value, port)            # 16-bit write   (out  %ax,  %dx)
+outw(value, port)             # 16-bit write   (out  %ax,  %dx)
 v16: uint16 = inw(port)       # 16-bit read    (in   %dx,  %ax)
-outl(value, port)            # 32-bit write   (out  %eax, %dx)
+outl(value, port)             # 32-bit write   (out  %eax, %dx)
 v32: uint32 = inl(port)       # 32-bit read    (in   %dx,  %eax)
 ```
 
@@ -489,23 +550,23 @@ argument and has no operand-substitution: it is for zero-operand (or
 fully self-contained) instructions only.
 
 ```python
-asm_volatile("cli")          # disable interrupts
-asm_volatile("hlt")          # halt the CPU until the next interrupt
-asm_volatile("pause")        # spin-loop hint
-asm_volatile("mfence")       # full memory fence
+asm_volatile("cli")           # disable interrupts
+asm_volatile("hlt")           # halt the CPU until the next interrupt
+asm_volatile("pause")         # spin-loop hint
+asm_volatile("mfence")        # full memory fence
 ```
 
 A memory **barrier** on x86_64 is just the matching fence instruction
 via `asm_volatile` (`mfence` / `lfence` / `sfence`); there are no
 `dmb`/`dsb`/`isb` builtins (those were ARM mnemonics). There are no
-`atomic_*` builtins and no `LDREX`/`STREX` — x86 atomicity is achieved
-with `lock`-prefixed instructions emitted through `asm_volatile`, or
-by calling into the kernel's own helpers.
+`atomic_*` builtins and no `LDREX`/`STREX` — x86 atomicity is
+achieved with `lock`-prefixed instructions emitted through
+`asm_volatile`, or by calling into the kernel's own helpers.
 
-A multi-instruction string passed to `asm_volatile` is emitted line by
-line (each non-blank line is one instruction), but for any non-trivial
+A multi-line string passed to `asm_volatile` is emitted line by line
+(each non-blank line is one instruction), but for any non-trivial
 assembly the kernel keeps a hand-written `.S` file and reaches it via
-`extern def` (see *Inline Assembly* below) — that is the preferred
+`extern def` — see *Inline Assembly* below — that is the preferred
 pattern.
 
 ---
@@ -543,83 +604,19 @@ AMD64 calling convention — arguments arrive in `%rdi`, `%rsi`, `%rdx`,
 
 ---
 
-## Decorators
-
-The x86_64 backend does not generate any special prologue/epilogue
-from a decorator. Decorators are parsed and carried on the AST, but
-the codegen treats a decorated `def` as an ordinary function.
-
-There is **no `@interrupt` decorator**. Interrupt and exception
-handling is wired up explicitly:
-
-- The CPU-facing trap stubs (the actual IDT entry points, with the
-  hardware-defined register/error-code stack frame) are hand-written
-  assembly in `arch/x86/kernel/idt_asm.S` (`trap_stub_0` ..
-  `trap_stub_31`, `common_trap`).
-- `idt_set_gate(vector, handler)` in `arch/x86/kernel/idt.ad` fills
-  the 256-entry IDT, and `idt_load` installs it.
-- The C-level handler is a *plain* `def` — e.g. `do_trap` in
-  `arch/x86/kernel/traps.ad` — called by the asm stub after it has
-  saved state. It is an ordinary Adder function with no decorator.
-
-So an interrupt handler in Adder is just a normal function that the
-assembly stub calls; the save/restore lives in the `.S` stub, not in
-a compiler-generated wrapper.
-
----
-
-## List Comprehensions
-
-```python
-# Basic comprehension
-squares: List[int32] = [x * x for x in range(10)]
-
-# With filter
-evens: List[int32] = [x for x in range(20) if x % 2 == 0]
-```
-
----
-
-## String Operations
-
-### F-strings
-
-```python
-name: str = "world"
-count: int32 = 42
-print(f"Hello {name}, count is {count}")
-```
-
-### String Slicing
-
-```python
-s: str = "Hello World"
-hello: str = s[0:5]    # "Hello"
-world: str = s[6:]     # "World"
-last3: str = s[-3:]    # "rld"
-every2: str = s[::2]   # "HloWrd"
-```
-
----
-
-## Dictionary Operations
-
-```python
-d: Dict[int32, int32] = {1: 10, 2: 20, 3: 30}
-val: int32 = d[2]  # 20
-d[4] = 40          # Insert
-```
-
----
-
 ## External Functions
 
-Declare functions implemented in assembly:
+Declare functions implemented in another `.ad` file, in a hand-written
+`.S` file, or in C (kernel-module targets) with `extern def`:
 
 ```python
-extern def uart_putc(c: int32) -> None
-extern def uart_getc() -> int32
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_exit(code: int32)
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
 ```
+
+`extern def` emits `.extern <name>` in the generated assembly; the
+caller's `call <name>` is resolved by the linker.
 
 ---
 
@@ -627,47 +624,49 @@ extern def uart_getc() -> int32
 
 ```python
 from lib.io import print_str, print_int
-from lib.memory import malloc, free
-import lib.string as string
+from mm.slab import kmalloc, kfree, kzalloc
+from kernel.list import ListHead, list_add, list_del
 ```
+
+Imports are a **flat module merge**: the named symbols are looked up
+in the imported module's compile output and resolved as if they had
+been declared locally. There is no module-qualified access (no
+`lib.io.print_str(...)` after `from lib.io import print_str` — and no
+`import lib.io` form that would create such a qualified name). Name
+collisions across modules are caught by the linker.
+
+A symbol declared in a module but not imported by any other module
+remains module-private (no other module can link against it). See
+`scripts/test_compiler_module_private.sh` for the regression
+fixture.
 
 ---
 
-## Example: Complete Program
+## `container_of`
+
+`container_of(ptr, Type, field)` is a compile-time expression: given
+a pointer to a struct field, it returns a pointer to the enclosing
+struct. The codegen resolves the field's byte offset within `Type` at
+compile time and emits a single `subq $offset, %rax`.
 
 ```python
-from lib.io import print_str, print_int, uart_init
+# Generic intrusive-list pattern.
+class Task:
+    pid:  int32
+    pad:  int32
+    link: ListHead              # embedded list node
 
-# UART registers
-UART_BASE: uint32 = 0x40004000
-UART_DATA: Ptr[volatile uint32] = cast[Ptr[volatile uint32]](UART_BASE)
-UART_STATUS: Ptr[volatile uint32] = cast[Ptr[volatile uint32]](UART_BASE + 4)
-
-class Counter:
-    value: int32
-
-    def increment(self) -> int32:
-        state: int32 = critical_enter()
-        self.value = self.value + 1
-        result: int32 = self.value
-        critical_exit(state)
-        return result
-
-def main() -> int32:
-    uart_init()
-
-    counter: Counter = Counter{value=0}
-
-    for i in range(10):
-        val: int32 = counter.increment()
-        print(f"Count: {val}")
-
-    return 0
+def task_from_link(p: Ptr[ListHead]) -> Ptr[Task]:
+    return container_of(p, Task, link)
 ```
+
+`Type` and `field` must be plain identifiers (not expressions); the
+expression has to be syntactically recognisable as the
+`container_of(ptr, T, f)` shape.
 
 ---
 
-## Target: x86_64
+## Target Selection
 
 Three sub-targets via `python3 -m compiler.adder compile --target=<X>`:
 
@@ -679,9 +678,93 @@ Three sub-targets via `python3 -m compiler.adder compile --target=<X>`:
   `tests/test_*.ad`). Calls into the native syscall ABI documented in
   `docs/native-api.md`. SysV AMD64 ABI, static binaries, runtime in
   `user/runtime.S`.
-- **`x86_64-linux-kernel-module`** — emits a `.S` file the stock
-  Linux kbuild system compiles into a regulation `.ko` (M1..M15
-  regression baseline; the `kernel-modules/` tree).
+- **`x86_64-linux-kernel-module`** — emits a `.S` file the stock Linux
+  kbuild system compiles into a regulation `.ko` (M1..M15 regression
+  baseline; the `kernel-modules/` tree).
 
-Common to all three: SysV AMD64 calling convention (`rdi/rsi/rdx/rcx/
-r8/r9` for first six args, `rax` for return).
+Common to all three: SysV AMD64 calling convention
+(`rdi/rsi/rdx/rcx/r8/r9` for first six args, `rax` for return).
+
+---
+
+## Example: complete program (production-style)
+
+```python
+# Heap-allocated growable byte buffer, in the production style:
+# kmalloc returns uint64, every cast is explicit, no methods, error
+# codes flow back as int32 returns, no exceptions.
+
+from mm.slab import kmalloc, kzalloc, kfree
+
+class ByteBuf:
+    data:     uint64             # cast to Ptr[uint8] at use site
+    capacity: uint64
+    length:   uint64
+
+SIZEOF_BYTEBUF: uint64 = 24
+
+def bytebuf_alloc(cap: uint64) -> Ptr[ByteBuf]:
+    bb_raw: uint64 = kzalloc(SIZEOF_BYTEBUF)
+    if bb_raw == 0:
+        return cast[Ptr[ByteBuf]](0)
+    data_raw: uint64 = kmalloc(cap)
+    if data_raw == 0:
+        kfree(bb_raw)
+        return cast[Ptr[ByteBuf]](0)
+    bb: Ptr[ByteBuf] = cast[Ptr[ByteBuf]](bb_raw)
+    bb[0].data     = data_raw
+    bb[0].capacity = cap
+    bb[0].length   = 0
+    return bb
+
+def bytebuf_push(bb: Ptr[ByteBuf], b: uint8) -> int32:
+    if bb[0].length >= bb[0].capacity:
+        return -28               # -ENOSPC
+    p: Ptr[uint8] = cast[Ptr[uint8]](bb[0].data)
+    p[bb[0].length] = b
+    bb[0].length = bb[0].length + 1
+    return 0
+
+def bytebuf_free(bb: Ptr[ByteBuf]):
+    if bb == cast[Ptr[ByteBuf]](0):
+        return
+    kfree(bb[0].data)
+    kfree(cast[uint64](bb))
+```
+
+---
+
+## Features deliberately not in Adder
+
+These show up in Python and are intentionally absent from Adder. If
+an agent tries to write code using one of them, the parser may accept
+it (the AST node exists) but the **codegen will reject it with
+`x86: <Node> not yet supported`** — that's by design.
+
+| Feature | Why not | Use instead |
+|---|---|---|
+| `List[T]`, `Dict[K, V]`, `Tuple[A, B]`, `Optional[T]` types | Imply hidden heap. Adder has no general-purpose dynamic container. | `Array[N, T]` for fixed pools; `Ptr[T]` + `kmalloc` for growable storage. |
+| Dict literals `{1: 10}` and dict indexing | No `Dict` type. | A flat `Array[N, KV]` of `class KV { key, value }` plus a linear scan; or a slab-backed hash table built in `.ad`. |
+| List comprehensions `[x*2 for x in r]` | Imply allocation; hide the loop. | Write the `while`/`for` loop explicitly. |
+| Lambdas / closures | Closures need a captured environment, which is a hidden heap object. | A named `def` plus a `Fn[R, A...]` typed callback. |
+| F-strings `f"x={x}"` | Each `f"..."` would need a per-call format buffer; hides allocation. | `printk1(fmt, x)` / `printk2(fmt, x, y)` family in `kernel/printk/printk.ad` (kernel-side), or `snprintf`-style formatting helpers in `linux_abi/api_strings.ad` (userland). |
+| String slicing `s[2:5]` | Either it returns a new string (hidden alloc) or a (ptr, len) slice value (a new type with no production users). | Walk the bytes by index; pass `(Ptr[char], length)` pairs. |
+| `try`/`except`/`raise`/`finally` | Exceptions break flow control, hide failure modes, don't compose with interrupt context. The hamsh shell language has them — Adder does not. | Return `int32` error codes (`-EINVAL`, `-ENOMEM`, `-ENOENT`, ...) — the Linux/Plan-9 convention. |
+| `with X as y:` context managers | RAII-ish but adds non-obvious cleanup paths. | Explicit cleanup before each return; or a single `defer`-style "goto fail" tail. |
+| `match`/`case` statements | The parser accepts the syntax, but codegen does not implement it. No production site uses it. | A chained `if`/`elif`. For wide dispatch on enum/syscall numbers, an `Array[N, Fn[...]]` jump table indexed by the value. |
+| Class methods (`def m(self):`) | Methods imply vtables or per-method name-mangling. The codegen does not implement them. | A free function that takes a `Ptr[T]` as its first argument: `def my_method(self: Ptr[T], ...) -> R`. |
+| Class inheritance `class Dog(Animal)` | Implies a vtable / common base layout, which we don't emit. | Composition: embed the "base" class as a field. |
+| Class decorators (`@packed`, etc.) | The codegen ignores all decorators. There is no `@packed`-driven layout. | Define the class fields in the order and size you want; the codegen lays them out C-ABI style (natural alignment, capped at 8). |
+| `union` declarations | The parser accepts them but no production code defines a union; codegen support is partial. | Type-pun through a `Ptr[T]` cast: `cast[Ptr[uint32]](&u8_array[0])[0]`. |
+| Tuple literals / tuple types as values | `Tuple[A, B]` is not a real codegen type. | Return values by writing through caller-supplied `Ptr[T]` out-parameters, or pack into a struct. |
+| `print()`, `len()`, `input()`, `abs()`, `min()`, `max()`, `ord()`, `chr()`, `sizeof()` | None of these are wired up in codegen as builtins. | `printk0`/`printk1`/... family for printing. For lengths and sizes, hardcode the constant or compute it from the declaration; if a real `sizeof` is needed, expose it as a module-level `SIZEOF_FOO: uint64 = N`. |
+| Default-valued parameters `def f(x=0)` | The parser allows the syntax for forwards compat, but codegen does not honor the default — the caller MUST pass every argument. | Pass the default explicitly at each call site, or use overload-by-name (`alloc_default()` vs `alloc_sized(n)`). |
+| `assert`, `defer`, `yield` | Reserved keywords in the lexer; no production usage; codegen does not implement them. | Manual checks (`if !cond: return -EINVAL`); explicit cleanup; iterative state machines instead of generators. |
+| `volatile T` type modifier | Parsed but unused in codegen. (`asm_volatile` is a different beast — see *Hardware Intrinsics*.) | Read MMIO through a `Ptr[T]` and rely on the existing barrier intrinsics; for genuinely volatile hardware registers, do the access through `asm_volatile`. |
+| `import lib.X as Y` and `lib.X.symbol` qualified access | Adder's import is a flat merge — see *Import System*. | `from lib.X import symbol`; rename on collision. |
+
+If you find yourself reaching for any of these, the answer is almost
+always to (a) write the loop / cleanup / error-code path explicitly,
+or (b) extend the language at the compiler layer (after talking to
+the rest of the team — `feedback_compiler_quirks.md` is the trail of
+how those calls have gone historically).
