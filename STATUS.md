@@ -515,4 +515,36 @@ serve it" — is one chunked-apt-cache fix away from `apt install
 <large-pkg>` working end-to-end against the real Debian archive; agent
 `a747ba7f` is in flight on that piece.
 
+## Wave — 2026-05-23 (late): streaming pipeline + libc6 + sshd round-trip + LANGUAGE.md audit
+
+Closes the install-over-SSH loop end-to-end on a real multi-MiB Debian
+package. Two structural fixes — a streaming xz/dpkg/apt/tmpfs/distrofs
+pipeline and a 16× msize bump across 9P/pipe/sockpair — bring `libc6`
+(13 MiB unpacked) under the QEMU test budget. A small kernel-side
+spawn-path fix lands the SSH TIER-3 round-trip: `ssh user@vm 'uname'`
+returns the output over the encrypted channel.
+
+| Item | Description | Status |
+|------|-------------|--------|
+| **LANGUAGE.md audit** | Audited every section of `LANGUAGE.md` against `compiler/codegen_x86.py` + grep across all 387 `.ad` files. ~14 documented-but-fictional features deleted (lambdas, `try`/`except`, list comprehensions, f-strings, `match`/`case`, class methods, `sizeof` builtin, default args, `with`-statements, decorators, dict/list/tuple/optional types, unions, `volatile T`, qualified imports). 4 missing real features added (Heap Allocation with `kmalloc`/`kfree`/`kzalloc`, Per-CPU Storage, `container_of`, design-principles preamble). Classes section rewritten — production uses `ptr[0].field`, not `.field` (the old doc claim would not have compiled). New host-side fixture `scripts/test_compiler_unsupported_rejected.sh` compiles one snippet per deleted feature and asserts codegen rejects each — permanent backstop against silent re-introduction. (`b385a4b`) | Done |
+| **Streaming xz/dpkg/apt/tmpfs/distrofs pipeline** | `lib/xz/xz.ad` now ships two entry points sharing one LZMA core: the existing buffered `xz_decompress(src, len, dst, dst_cap)` plus a new `xz_decompress_streaming(src, len, drain: Fn[int32, Ptr[uint8], uint64])` that hands decompressed bytes to a first-class callback in 64 KiB chunks. Per-block CRC32 streams incrementally. xz dict bumped to 8 MiB to match Debian's `lzma2 preset=6`. `dpkg` / `dpkg_deb` / `apt` switched from "slurp whole `data.tar.xz`, then unpack from one giant buffer" to drain-callback streaming. `fs/tmpfs.ad` uses a page-chain inode storage scheme instead of the previous 512 KiB-per-file cap. `distrofs` RAM cache sizing re-derived from observed inode count. Plus a small xz inner-loop speedup: ring-modulo replaced with bitmask-AND (`fface2c` / cherry-pick `10f0748`). (`ebce787`, `10f0748`) | Done |
+| **9P / pipe / sockpair msize 8 KiB → 128 KiB** | `apt install libc6` was correctness-correct after the streaming refactor but timed out at QEMU's 600 s budget. Root cause: every `sys_write` from dpkg's tar drain into `/usr/...` traverses the kernel 9P client to the `distrofs` daemon, and `P9_MSIZE_DEFAULT=8192` split each 64 KiB tar chunk into ~8 Twrite round-trips. `SOCKPAIR_CAP=1024` and `PIPE_CAP=1024` forced wake-cycle churn on each round-trip. Bumped `P9_MSIZE_DEFAULT` / `P9C_MSIZE` / `SRV_BUF_CAP` / `PIPE_CAP` / `SOCKPAIR_CAP` to 131072 across `lib/9p/9p.ad`, `sys/src/9/port/9p_client.ad`, `user/distrofs.ad`, `user/p9srv_demo.ad`, `init/p9_smoke.ad`, `fs/pipe.ad`, `fs/socketpair.ad` — both sides of every 9P/pipe link must agree, and the userland scratch buffers must hold one msize, so the bumps are interdependent. Also replaced `distrofs::_serve_twrite`'s byte-by-byte payload copy with an 8-byte-word `_bcopy` helper. (`4191250`) | Done |
+| **libc6 installs end-to-end** | `scripts/test_apt_install_libc6.sh` now PASSES on a clean build. The test boots a QEMU guest, runs `apt update` against a local Debian-shaped mirror, then `apt install libc6` (the real Debian package — 13 MiB unpacked, 49 files, including `/usr/lib/x86_64-linux-gnu/libc.so.6`). The full pipeline (HTTP fetch → SHA-256-verify `.deb` → ar-stream → xz-stream `data.tar.xz` → tar-stream → write into distrofs over 9P) runs under the 600 s budget. The 13 MiB threshold is the first concrete demonstration that the streaming pipeline scales past fixture-sized inputs. (`4191250`) | Done |
+| **SSH TIER-3 fd binding** | The native sshd was authenticating + opening channels + bridging hamsh's own prompt + line-edit escapes through to the OpenSSH client cleanly, but when hamsh then `spawn`ed an external command (`uname`) the child wrote to its `/fd/1`, which still resolved to the **inherited PID-1 console binding** rather than sshd's `pipe_out[1]`. Two-layer fix: (1) kernel-side, the legacy integer-fd `SYS_SPAWN` path now gives the child a private Pgrp (deep-copied from parent — mtab is preserved, so nsrun/apt/dpkg still see parent mounts) and walks `fd 0/1/2` on the child `TaskStruct`, calling `devfd_bind_pipe_r/w` or `devfd_bind_cons` to mirror those backings into `/fd/0,1,2` in the child's Pgrp. New `SYS_FDSLOT_KIND` (287) syscall lets userland query whether an `/fd/N` slot is bound. (2) userland-side, hamsh's `_setup_fd_namespace` checks `sys_fdslot_kind` before binding cons, so it doesn't clobber a kernel-seeded pipe binding. `scripts/test_sshd.sh` PASSES through TIER 3: full SSH round-trip with `uname` output coming back over the encrypted channel. (`525d333`, `a64b2b1`) | Done |
+| **Orchestrator lesson: grep before brief** | The sshd-TIER-3 work surfaced a meta-learning: `user/sshd.ad` (2078 lines + `lib/ssh/sshcrypto.ad` + `lib/ssh/sshsign.ad`) already shipped at `03a3a18` and was wired into `/etc/rc.boot` at `0f30263`. Half an agent slot was spent re-discovering this. Saved to orchestrator memory as `feedback_grep_before_brief.md` — before any "build X" brief, grep `user/<x>.ad lib/<x>/ drivers/*/${x}*.ad` and `git log -- user/<x>*` for existing implementations and shift the brief to "finish/debug" if anything's there. | Done |
+
+**Headline of this wave:** the streaming-pipeline + 16× msize bump
+brings a real-world Debian package (`libc6`, 13 MiB) all the way
+through `apt install`, and the kernel-side spawn-path fd-binding fix
+makes `ssh user@vm 'uname'` return its output over the encrypted
+channel. Combined with the prior install-over-SSH demo, the full
+marquee scenario — **boot ISO → SSH in → `apt install <multi-MiB
+Debian package>` → run a remote command → see its output** — works
+end-to-end on a vanilla ISO with no env-var overrides. `LANGUAGE.md`
+is now a doc agents can trust 100% and a permanent backstop fixture
+prevents silent re-introduction of deleted features. The end-game
+demo target ("`apt install nginx` and `curl` from the host") is now a
+matter of letting the existing pipeline ride a daemon launch — no
+new architecture needed.
+
 

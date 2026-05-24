@@ -216,9 +216,12 @@ Concretely this means closing four named gates:
    real FIN and a 5-second `tcp_recv` timeout — `user/apt.ad`'s
    streaming gzip path treated any zero as FIN, killing large
    transfers; `1eeabb1` mirrors the sshd retry-on-timeout idiom.
-   Remaining gap to `apt install <large-pkg>`: the 512 KiB
-   `/tmp/apt/Packages` cache cap (alphabetically only resolves
-   `0ad..and`) — being addressed in flight.
+   `apt install` on a multi-MiB real Debian package — `libc6`
+   (13 MiB unpacked) — runs end-to-end inside QEMU's 600 s budget
+   as of `4191250`, on the back of an xz/dpkg/apt/tmpfs streaming
+   refactor (`ebce787`) and a 9P/pipe/sockpair msize bump from
+   8 KiB → 128 KiB. `scripts/test_apt_install_libc6.sh` PASSES on
+   a clean build.
 
 Stack-canary compiler hardening (`-fstack-protector-strong` equivalent)
 has landed (`f9d8d2f`) — it catches the class of stack-local overflow
@@ -249,7 +252,13 @@ fixes — do not work around them: the U9 nested-frame `Array` spill,
 signed-only integer comparison. Language quirks land in
 `tests/test_compiler_*.ad` as guarded regressions the moment they're
 surfaced — see [`scripts/run_compiler_tests.sh`](scripts/run_compiler_tests.sh)
-(9 fixtures, all green).
+(13 fixtures, all green). `LANGUAGE.md` was audited against
+`compiler/codegen_x86.py` in `b385a4b` — ~14 documented-but-fictional
+features (lambdas, `try`/`except`, list comprehensions, f-strings,
+`match`/`case`, class methods, `sizeof` builtin, default args,
+`with`-statements, decorators, dict/list/tuple/optional types,
+unions) were deleted and `scripts/test_compiler_unsupported_rejected.sh`
+guards each as a permanent codegen-rejects backstop.
 
 ---
 
