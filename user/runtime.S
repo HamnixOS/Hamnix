@@ -611,6 +611,22 @@ sys_fdbind:
     .size sys_fdbind, .-sys_fdbind
 
 
+    /* --- sys_fdslot_kind(pid, fdnum) -> int32 -----------------------
+     * HAMSH §7: read-only query for the DEVFD_* kind currently bound at
+     * /fd/<fdnum> in pid's Pgrp (pid 0 = self). Returns DEVFD_NONE (0)
+     * for unbound slot, bad pid, or out-of-range fdnum. hamsh uses this
+     * before its default cons-bind so it can detect that the kernel-
+     * side legacy-fd SYS_SPAWN path has already pre-baked /fd/0,1,2 to
+     * pipe ends (the sshd → hamsh case) and leave them alone. */
+    .globl sys_fdslot_kind
+    .type sys_fdslot_kind, @function
+sys_fdslot_kind:
+    movq    $287, %rax              /* SYS_FDSLOT_KIND */
+    syscall
+    ret
+    .size sys_fdslot_kind, .-sys_fdslot_kind
+
+
     /* --- sys_pipechan() -> int32 ------------------------------------
      * HAMSH §7: create a local pipe Chan pair; returns the pipe SLOT
      * id (NOT fds). The shell threads the slot into two sys_fdbind
