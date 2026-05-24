@@ -353,6 +353,25 @@ E1000_TIPG_DEFAULT:  uint32 = 0x00702008
 # (HTHRESH), bits[18..20]=0, bits[21..23]=0, bits[24..28]=0,
 # bits[16..20]=0x01, bits[8..13]=0x14 (= WTHRESH 4 packed at
 # bit 16 + GRAN bit 24).
+# ME PCIm-to-PCI arbiter workaround (FLAG2_PCIM2PCI_ARBITER_WA in
+# Linux). On I217/I218/I219 chips the on-die Management Engine
+# holds the chip's PCI-config arbiter for tens of microseconds at a
+# time. Writes to TDT/RDT during ME ownership are SILENTLY DROPPED,
+# leaving the chip's RX/TX engines with stale descriptor-ring tail
+# pointers — chip walks the ring perpetually using its last-known
+# tail value, transmitting whatever descriptors it finds.
+#
+# Linux's __ew32_prepare polls FWSM.PCIM2PCI for up to 100 ms
+# (2000 iters × 50 us each). After this returns the chip is
+# guaranteed to be in a state where MMIO writes will stick.
+#
+# Plus: the writer should READ THE REGISTER BACK after the write
+# to confirm it took effect. If the read doesn't match the value
+# we wrote, the workaround failed.
+E1000_FWSM:                    uint64 = 0x05B54
+E1000_ICH_FWSM_PCIM2PCI:       uint32 = 0x01000000
+E1000_ICH_FWSM_PCIM2PCI_COUNT: uint64 = 2000
+
 E1000_TXDCTL:           uint64 = 0x03828
 E1000_TXDCTL_Q1:        uint64 = 0x03928   # TXDCTL(1) — erratum mirror
 # Per Linux e1000_configure_tx for FLAG2_DMA_BURST (I217/I218/I219):
@@ -516,6 +535,51 @@ def _e1000e_mmio_r32(addr: uint64) -> uint32:
 
 def _e1000e_mmio_w32(addr: uint64, value: uint32):
     cast[Ptr[uint32]](addr)[0] = value
+
+
+def _e1000e_ew32_prepare(bar0: uint64):
+    # Wait for the on-die ME to release the PCI-arbiter so subsequent
+    # MMIO writes stick. Mirrors Linux's __ew32_prepare. 2000 iters
+    # of ~50 us busy-wait = up to 100 ms before we give up and write
+    # anyway. On a typical bring-up the loop returns immediately
+    # (ME idle) — this guards the worst case where ME is actively
+    # arbitrating PCI access.
+    i: uint64 = 0
+    while i < E1000_ICH_FWSM_PCIM2PCI_COUNT:
+        fwsm: uint32 = _e1000e_mmio_r32(bar0 + E1000_FWSM)
+        if (fwsm & E1000_ICH_FWSM_PCIM2PCI) == 0:
+            return
+        # ~50 us busy-wait via tight inc-loop. On 3 GHz x86 a uint
+        # increment retires in ~1 cycle, so 150 K iterations ≈ 50 us.
+        j: uint64 = 0
+        while j < 150000:
+            j = j + 1
+        i = i + 1
+
+
+def _e1000e_mmio_w32_wa(addr: uint64, value: uint32):
+    # ME-aware MMIO write. Polls the FWSM PCIm-to-PCI arbiter bit
+    # before writing, then verifies the value landed by reading
+    # back. Use for ANY write whose effect must be visible to the
+    # chip's DMA engine — specifically TDT and RDT, the descriptor-
+    # ring tail pointers that drive TX/RX. A silently-dropped
+    # TDT/RDT write on I219 leaves the chip walking the ring with
+    # stale state.
+    bar0: uint64 = e1000e_state.bar0
+    _e1000e_ew32_prepare(bar0)
+    _e1000e_mmio_w32(addr, value)
+    # Readback verification — if the write didn't stick, log it.
+    # We retry once (re-prepare + re-write) on mismatch.
+    readback: uint32 = _e1000e_mmio_r32(addr)
+    if readback != value:
+        printk2("[e1000e] MMIO_WA write mismatch: wrote=%x readback=%x — retrying\n",
+                cast[uint64](value), cast[uint64](readback))
+        _e1000e_ew32_prepare(bar0)
+        _e1000e_mmio_w32(addr, value)
+        readback = _e1000e_mmio_r32(addr)
+        if readback != value:
+            printk2("[e1000e] MMIO_WA retry FAILED: wrote=%x readback=%x\n",
+                    cast[uint64](value), cast[uint64](readback))
 
 
 # --- Class+vendor+id PCI scan --------------------------------------
@@ -791,9 +855,11 @@ def _e1000e_setup_rx(state: Ptr[E1000e]) -> int32:
 
     # Kick the DMA engine by writing RDT AFTER RCTL.EN is set. Linux
     # does this in e1000e_alloc_rx_buffers; we mirror the pattern.
-    # Tail = NR_RX_DESCS - 1 marks all descriptors available.
-    _e1000e_mmio_w32(bar0 + E1000_RDT,
-                     cast[uint32](NR_RX_DESCS - 1))
+    # Tail = NR_RX_DESCS - 1 marks all descriptors available. Use
+    # the ME-arbiter-aware writer — RDT writes during ME ownership
+    # are silently dropped on I219 silicon.
+    _e1000e_mmio_w32_wa(bar0 + E1000_RDT,
+                        cast[uint32](NR_RX_DESCS - 1))
     # Diagnostic readback: confirm what the chip thinks it has.
     rctl_back: uint32 = _e1000e_mmio_r32(bar0 + E1000_RCTL)
     rxdctl_back: uint32 = _e1000e_mmio_r32(bar0 + E1000_RXDCTL)
@@ -955,9 +1021,11 @@ def _e1000e_setup_tx(state: Ptr[E1000e]) -> int32:
     # Length is in BYTES, must be a multiple of 128.
     _e1000e_mmio_w32(bar0 + E1000_TDLEN,
                      cast[uint32](TX_RING_BYTES))
-    # Head = Tail = 0 — no pending TX work.
-    _e1000e_mmio_w32(bar0 + E1000_TDH, 0)
-    _e1000e_mmio_w32(bar0 + E1000_TDT, 0)
+    # Head = Tail = 0 — no pending TX work. ME-arbiter-aware writers
+    # so the values stick (TDT in particular drives the chip's TX
+    # state machine).
+    _e1000e_mmio_w32_wa(bar0 + E1000_TDH, 0)
+    _e1000e_mmio_w32_wa(bar0 + E1000_TDT, 0)
 
     # TIPG — 8/8/6 to match Linux's PCH-family default (matters on
     # I217/I218/I219 real silicon; QEMU ignores TIPG).
@@ -1493,8 +1561,8 @@ def e1000e_poll():
     # leave RDT alone.
     if last_done >= 0:
         e1000e_state.rx_tail = cast[uint16](cast[uint64](last_done) & 0xFFFF)
-        _e1000e_mmio_w32(bar0 + E1000_RDT,
-                         cast[uint32](cast[uint64](last_done) & 0xFFFFFFFF))
+        _e1000e_mmio_w32_wa(bar0 + E1000_RDT,
+                            cast[uint32](cast[uint64](last_done) & 0xFFFFFFFF))
 
 
 def e1000e_rx_packets() -> uint64:
@@ -1679,10 +1747,13 @@ def e1000e_tx(buf: Ptr[uint8], length: uint64) -> int32:
 
     # Advance TDT to one past the descriptor we just submitted —
     # that's what tells the device "drain up to (but not including)
-    # this slot". Wraps modulo NR_TX_DESCS.
+    # this slot". Wraps modulo NR_TX_DESCS. Use ME-arbiter-aware
+    # writer: TDT writes during ME ownership are silently dropped on
+    # I219, leaving the chip walking the ring with stale tail.
     next_idx: uint64 = (idx + 1) % NR_TX_DESCS
     e1000e_state.tx_tail = cast[uint16](next_idx & 0xFFFF)
-    _e1000e_mmio_w32(bar0 + E1000_TDT, cast[uint32](next_idx & 0xFFFFFFFF))
+    _e1000e_mmio_w32_wa(bar0 + E1000_TDT,
+                        cast[uint32](next_idx & 0xFFFFFFFF))
 
     # Spin-wait for DD on this descriptor. Bounded — on QEMU this
     # fires within a few iterations, on real hardware a slow link
