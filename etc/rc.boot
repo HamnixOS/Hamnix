@@ -68,6 +68,15 @@ sshdsvc = spawn detached bootns {
 
 echo 'rc.boot: boot services launched'
 
+# Print the live network config (IPv4 address + netmask + gw + DNS,
+# with source tag — "(dhcp)" or "(static)") so a real-hardware box
+# with no working keyboard can be SSH'd into off the framebuffer. If
+# DHCP hasn't landed yet the line still prints with whatever the IP
+# stack has — the user can re-run `ifconfig` from any later session.
+echo '----- network info (ssh in with the address below) -----'
+ifconfig
+echo '---------------------------------------------------------'
+
 # --- the Linux runtime namespace ------------------------------------
 # HAMSH_SPEC §0 + §11: running a Linux binary is NOT a bespoke
 # `distrorun` command — it is a captured `ns { }` value plus an
