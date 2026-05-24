@@ -225,9 +225,11 @@ if grep -E -q "SSH2_MSG_NEWKEYS|NEWKEYS received|kex: .* MAC" "$SSHLOG" 2>/dev/n
     echo "[test_sshd] TIER 1 corroborated by ssh client (-v shows NEWKEYS)"
 fi
 
-# TIER 2: authentication.
-if grep -F -q "[sshd] authentication succeeded" "$LOG"; then
-    echo "[test_sshd] TIER 2 OK: password authentication succeeded"
+# TIER 2: authentication. sshd logs either "[sshd] password
+# authentication succeeded" or "[sshd] publickey authentication
+# succeeded" depending on which method the client used — accept either.
+if grep -E -q "\[sshd\] (password|publickey) authentication succeeded" "$LOG"; then
+    echo "[test_sshd] TIER 2 OK: authentication succeeded"
     tier=2
 fi
 
