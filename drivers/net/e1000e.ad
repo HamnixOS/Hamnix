@@ -405,6 +405,39 @@ E1000_FEXTNVM3_PHY_CFG_COUNTER_50MSEC:  uint32 = 0x08000000
 E1000_FEXTNVM4:                         uint64 = 0x00024
 E1000_FEXTNVM4_BEACON_DURATION_MASK:    uint32 = 0x00000007
 E1000_FEXTNVM4_BEACON_DURATION_8USEC:   uint32 = 0x00000007
+
+# --- MDIC + EMI infrastructure ------------------------------------
+#
+# MDIC (Management Data Interface Control) is the MMIO register
+# through which the host accesses PHY registers. Each access is one
+# 32-bit MDIC write encoding (data, register addr, PHY addr, opcode)
+# followed by polling MDIC for the READY bit set + ERROR bit clear.
+#
+# Constants from drivers/net/ethernet/intel/e1000e/defines.h.
+#
+# PHY address: I219 (PCH-integrated) lives at MDIO PHY address 2.
+# Linux's e1000_get_phy_id_ich8lan probes multiple addresses; we
+# hard-code 2 for I219 since that's the documented value.
+#
+# EMI registers are a second indirection level on top of PHY
+# registers: write the EMI register addr to PHY register
+# I82579_EMI_ADDR (= 0x10), then read/write data through PHY
+# register I82579_EMI_DATA (= 0x11). The PHY semaphore should
+# be held during the two-step access; we skip the semaphore for
+# now (no FW concurrency at this point in our bring-up).
+E1000_MDIC:               uint64 = 0x00020
+E1000_MDIC_REG_SHIFT:     uint32 = 16
+E1000_MDIC_PHY_SHIFT:     uint32 = 21
+E1000_MDIC_OP_WRITE:      uint32 = 0x04000000
+E1000_MDIC_OP_READ:       uint32 = 0x08000000
+E1000_MDIC_READY:         uint32 = 0x10000000
+E1000_MDIC_ERROR:         uint32 = 0x40000000
+
+I219_PHY_ADDR:            uint32 = 2
+
+I82579_EMI_ADDR:          uint32 = 0x10
+I82579_EMI_DATA:          uint32 = 0x11
+I217_RX_CONFIG:           uint32 = 0xB20C
 E1000_CTRL_LANPHYPC_OVERRIDE:           uint32 = 0x00010000
 E1000_CTRL_LANPHYPC_VALUE:              uint32 = 0x00020000
 E1000_CTRL_EXT_LPCD:                    uint32 = 0x00000004
@@ -1020,6 +1053,41 @@ def _e1000e_is_pch_family(device_id: uint32) -> int32:
     return 0
 
 
+def _e1000e_phy_write(bar0: uint64, phy_addr: uint32, reg: uint32,
+                      data: uint32) -> int32:
+    # Raw PHY register write via MDIC. Returns 0 on success, -1 on
+    # error, -2 on timeout (READY never set).
+    val: uint32 = (data & 0xFFFF) \
+                | ((reg & 0x1F) << E1000_MDIC_REG_SHIFT) \
+                | ((phy_addr & 0x1F) << E1000_MDIC_PHY_SHIFT) \
+                | E1000_MDIC_OP_WRITE
+    _e1000e_mmio_w32(bar0 + E1000_MDIC, val)
+    # Poll READY for ~50 ms (1000 iters × ~50 us busy-wait).
+    i: uint64 = 0
+    while i < 1000:
+        m: uint32 = _e1000e_mmio_r32(bar0 + E1000_MDIC)
+        if (m & E1000_MDIC_READY) != 0:
+            if (m & E1000_MDIC_ERROR) != 0:
+                return -1
+            return 0
+        _e1000e_busy_wait_cycles(150000)
+        i = i + 1
+    return -2
+
+
+def _e1000e_emi_write(bar0: uint64, emi_addr: uint32,
+                      emi_data: uint32) -> int32:
+    # Write an EMI register via the I82579 two-step trampoline. Both
+    # writes go through MDIC.
+    rc: int32 = _e1000e_phy_write(bar0, I219_PHY_ADDR,
+                                  I82579_EMI_ADDR, emi_addr)
+    if rc != 0:
+        return rc
+    rc = _e1000e_phy_write(bar0, I219_PHY_ADDR,
+                           I82579_EMI_DATA, emi_data)
+    return rc
+
+
 def _e1000e_busy_wait_cycles(n: uint64):
     # Cycle-counted busy-wait. Used between MMIO writes in the
     # LANPHYPC PHY-toggle sequence where Linux uses udelay/msleep.
@@ -1101,6 +1169,31 @@ def _e1000e_pch_workarounds(bar0: uint64, device_id: uint32):
     fextnvm4 = fextnvm4 & (~E1000_FEXTNVM4_BEACON_DURATION_MASK)
     fextnvm4 = fextnvm4 | E1000_FEXTNVM4_BEACON_DURATION_8USEC
     _e1000e_mmio_w32(bar0 + E1000_FEXTNVM4, fextnvm4)
+    # 4. EMI RX_CONFIG = 1. Linux's
+    #    e1000_check_for_copper_link_ich8lan unconditionally writes
+    #    this on every link-up event for PCH-LPT+ chips. Without it
+    #    the RX engine doesn't actually receive frames into our
+    #    descriptor ring even though the PHY is up and BAM is set.
+    #    EMI access uses MDIC indirection: we write the EMI register
+    #    address to PHY register I82579_EMI_ADDR (0x10), then the
+    #    data to I82579_EMI_DATA (0x11), all through MDIC at PHY
+    #    address 2 (I219's documented MDIO address).
+    emi_rc: int32 = _e1000e_emi_write(bar0, I217_RX_CONFIG,
+                                      cast[uint32](1))
+    if emi_rc != 0:
+        printk1("[e1000e] EMI RX_CONFIG write failed rc=%d\n",
+                cast[uint64](emi_rc))
+    else:
+        printk0("[e1000e] EMI RX_CONFIG = 1 (RX engine kicked)\n")
+    # 5. Re-write RAR[0] with AV=1 — belt-and-suspenders. The
+    #    firmware-loaded MAC should survive CTRL.RST per spec but
+    #    we've seen RX behave as if the unicast filter wasn't valid.
+    #    Explicit write guarantees AV is set.
+    ral_now: uint32 = _e1000e_mmio_r32(bar0 + E1000_RAL0)
+    rah_now: uint32 = _e1000e_mmio_r32(bar0 + E1000_RAH0)
+    rah_with_av: uint32 = (rah_now & 0xFFFF) | E1000_RAH_AV
+    _e1000e_mmio_w32(bar0 + E1000_RAL0, ral_now)
+    _e1000e_mmio_w32(bar0 + E1000_RAH0, rah_with_av)
     printk1("[e1000e] PCH workarounds applied (device=0x%x)\n",
             cast[uint64](device_id))
 
