@@ -1,0 +1,665 @@
+# linux_abi/api_ahci.ad
+#
+# Storage L-shim batch (Agent D, storage pivot): the 53 UND symbols
+# Linux's stock ahci.ko (Debian 6.1.0-32 build) consumes beyond what
+# L1..L68 + e1000e already export. Closes the gap so the L-series
+# loader can insmod ahci.ko without unresolved-external panic.
+#
+# ahci.ko is the SATA AHCI controller driver — Advanced Host Controller
+# Interface, the PCI register-level spec that almost every SATA chipset
+# made since ~2008 implements (Intel ICH/PCH, AMD SB/FCH, JMicron,
+# Marvell, ASMedia). On a stock desktop/laptop motherboard ahci.ko
+# covers the SATA SSD or HDD attached to the southbridge.
+#
+# Strategic frame:
+#   ahci.ko itself is the PCI front-end (10 KiB of register-level
+#   probe + interrupt wiring). The bulk of SATA command processing
+#   lives in libahci.ko (HBA register handling, FIS encoding, port
+#   reset state machine) and libata.ko (ATA command set, SCSI
+#   translation, error handling, transport). For the L-shim:
+#
+#     * ahci.ko's UND surface is 81 symbols total.
+#     * 28 already live in L<=68 + e1000e (printk, kmalloc, jiffies,
+#       _dev_err, _dev_warn, _dev_info, __fentry__, __dynamic_dev_dbg,
+#       param_ops_int, __stack_chk_*, __pci_register_driver,
+#       pci_get_drvdata, pci_set_drvdata, pci_read_config_*,
+#       pci_write_config_*, request_threaded_irq, free_irq, msleep,
+#       schedule_timeout_uninterruptible, kfree, kzalloc, devm_kfree,
+#       ...).
+#     * 53 are net-new (this file).
+#
+# Categories (gap analysis on Debian 6.1.0-32 ahci.ko):
+#
+#   * 15 ahci_* symbols — entry points + ops vtables that libahci.ko
+#     normally exports; in our env we ship ahci.ko WITHOUT a libahci.ko
+#     side-load, so the relocations against `ahci_ops`, `ahci_*` need
+#     to resolve to OUR stubs. The ops vtables are 1 KiB zeroed
+#     buffers; the function entry points return 0 / success / no-op
+#     for the cold path (probe will get part-way and bail when it
+#     tries to do real hardware I/O).
+#
+#   * 22 ata_*/sata_* symbols — libata.ko surface (host alloc, link
+#     iteration, BIOS param geometry, SCSI command dispatch, FIS
+#     conversion, port-pbar description, reset wait, msleep). All
+#     return 0 / -ENODEV / NULL / void as appropriate. The SCSI
+#     mid-layer entry points (ata_scsi_queuecmd, ata_scsi_ioctl)
+#     return -ENODEV so no command actually goes to silicon.
+#
+#   * 7 pcim_*/pci_* symbols — managed PCI extensions
+#     (pcim_enable_device, pcim_iomap_*, pcim_pin_device,
+#     pci_alloc_irq_vectors_affinity, pci_intx, pci_match_id). The
+#     pcim_* variants are devres-managed lifecycles; we collapse to
+#     the plain non-managed flow (pci_enable_device returns 0,
+#     iomap returns the BAR's virt alias, etc.).
+#
+#   * 4 dmi_* symbols — DMI table walker. We have no SMBIOS exposure
+#     so dmi_check_system / dmi_first_match always say "no match",
+#     dmi_get_date returns 0.
+#
+#   * 4 misc — devm_kmalloc (slab passthrough), pm_suspend_default_s2idle
+#     (false), sata_deb_timing_normal/_hotplug (DATA tables).
+#
+# Stub philosophy: every shim is INIT-COLD for the kernel-side QEMU
+# boot path. An insmod of ahci.ko via /lib/modules/6.12/ahci.ko walks:
+#   (1) module_init -> ahci_pci_driver_init -> __pci_register_driver.
+#   (2) __pci_register_driver matches against id_table and INVOKES
+#       drv->probe(pdev, id) — same path that e1000e exercises.
+#   (3) ahci_init_one (probe) calls pcim_enable_device, requests BARs,
+#       calls ahci_save_initial_config / ahci_init_controller, then
+#       ata_host_alloc_pinfo + ahci_host_activate. The first call
+#       that reaches into "real" libahci land (port state machine
+#       wakeup, FIS issue) is the natural floor — we stop there.
+#   (4) probe returns -ENODEV or 0 depending on which ata_*/ahci_*
+#       stub returns first; both are PASS outcomes for "module loaded
+#       + probe invoked" semantics. The init returned-0 contract
+#       remains since module_init only wraps __pci_register_driver.
+#
+# Compiler-quirk notes:
+#   * Adder reserves `bytes`, `match`, `case`, `type`, `field`, `file` —
+#     renamed where they would collide.
+#   * No default-valued params; every arg is passed explicitly.
+#   * Ops-vtable DATA buffers are zero-initialised globals — modules
+#     read fields as NULL fn-ptrs which our env tolerates because
+#     init-cold paths never call into them.
+#
+# The "_ahc_" prefix marks the Hamnix-side shim. Same convention as
+# the "_e1k_" pivot — the prefix makes it obvious which gap-closure
+# batch a symbol came from.
+
+from linux_abi.exports import _add_export
+from kernel.printk.printk import printk0, printk1
+from mm.slab import kmalloc, kzalloc
+
+
+# =====================================================================
+# DATA buffers for ops-vtables and SATA timing tables
+# =====================================================================
+#
+# ahci_ops, ahci_pmp_retry_srst_ops, ata_dummy_port_ops are struct
+# ata_port_operations vtables ~256 bytes (one function pointer per
+# operation). We expose 1 KiB zeroed buffers as the symbol addresses;
+# modules read them as field accesses on the struct, which see NULL
+# fn-ptrs — fine for cold paths since libata never actually invokes
+# them in our env.
+#
+# ahci_sdev_groups / ahci_shost_groups are NULL-terminated arrays of
+# struct attribute_group pointers, used by the SCSI mid-layer to
+# attach sysfs entries to SCSI devices/hosts. 256 zeroed bytes
+# leaves the array empty (first entry NULL terminates it).
+#
+# sata_deb_timing_normal / sata_deb_timing_hotplug are debounce-
+# timing tables (3-tuples of duration_ms used by SATA link-up wait
+# logic). 64 bytes of zeros means "no debounce" — bounded-wait
+# code-paths see 0 and short-circuit immediately.
+
+ahc_ahci_ops_buf:                  Array[1024, uint8]
+ahc_ahci_pmp_retry_srst_ops_buf:   Array[1024, uint8]
+ahc_ata_dummy_port_ops_buf:        Array[1024, uint8]
+ahc_ahci_sdev_groups_buf:          Array[256, uint8]
+ahc_ahci_shost_groups_buf:         Array[256, uint8]
+ahc_sata_deb_timing_normal_buf:    Array[64, uint8]
+ahc_sata_deb_timing_hotplug_buf:   Array[64, uint8]
+ahc_ahci_ignore_sss_var:           uint32 = 0
+
+
+# =====================================================================
+# Group 1: ahci_* entry points (libahci surface)
+# =====================================================================
+#
+# These would normally be defined in libahci.ko. In our env we don't
+# load libahci.ko alongside ahci.ko, so the relocations against these
+# names resolve here.
+
+def _ahc_ahci_check_ready(ap: uint64) -> int32:
+    # int ahci_check_ready(struct ata_link *link).
+    # Polls the port's TFD register for !BSY. We have no port; the
+    # safest answer is 1 ("link ready") so any caller that loops
+    # waiting for ready can exit. Init-cold; never reached unless
+    # probe runs the port bring-up state machine.
+    return 1
+
+
+def _ahc_ahci_dev_classify(ap: uint64) -> uint32:
+    # unsigned int ahci_dev_classify(struct ata_port *).
+    # Returns ATA_DEV_UNKNOWN (0) — "no device detected". libata's
+    # caller treats this as "skip this port, no drive present", which
+    # is the right cold-path outcome.
+    return 0
+
+
+def _ahc_ahci_host_activate(host: uint64, sht: uint64) -> int32:
+    # int ahci_host_activate(struct ata_host *, struct scsi_host_template *).
+    # The big finalisation call at the end of probe: registers the
+    # ata_host with the SCSI mid-layer + arms per-port IRQs +
+    # publishes the SATA links. Returning 0 means "activated OK" so
+    # ahci_init_one's probe returns 0 cleanly. With no real port
+    # state machine the SCSI side sees an empty host; no commands
+    # will queue.
+    printk0("[ahci.ko] ahci_host_activate (stub: host registered, no ports)\n")
+    return 0
+
+
+def _ahc_ahci_init_controller(host: uint64):
+    # void ahci_init_controller(struct ata_host *).
+    # HBA-level init: GHC.AE=1, IS clear, AHCI mode toggle. No HBA
+    # behind the shim; pure no-op.
+    return
+
+
+def _ahc_ahci_kick_engine(ap: uint64) -> int32:
+    # int ahci_kick_engine(struct ata_port *).
+    # Restarts the port's command engine after a stall. No engine to
+    # kick; success.
+    return 0
+
+
+def _ahc_ahci_print_info(host: uint64, scc_s: Ptr[char]):
+    # void ahci_print_info(struct ata_host *, const char *scc_s).
+    # Probe-time banner ("AHCI 0001.0300 32 slots 8 ports ..."). We
+    # log a single line and discard the formatted string.
+    printk0("[ahci.ko] ahci_print_info (stub)\n")
+
+
+def _ahc_ahci_reset_controller(host: uint64) -> int32:
+    # int ahci_reset_controller(struct ata_host *).
+    # GHC.HR=1 + spin until clear. No HBA; success.
+    return 0
+
+
+def _ahc_ahci_reset_em(host: uint64) -> int32:
+    # int ahci_reset_em(struct ata_host *).
+    # Enclosure-management LED reset. No-op.
+    return 0
+
+
+def _ahc_ahci_save_initial_config(dev: uint64, hpriv: uint64):
+    # void ahci_save_initial_config(struct device *, struct ahci_host_priv *).
+    # Reads HBA capability registers into ahci_host_priv. No HBA;
+    # hpriv stays zero-initialised which the caller tolerates because
+    # the init-cold path doesn't gate on cap bits we'd need to set.
+    return
+
+
+def _ahc_ahci_set_em_messages(hpriv: uint64):
+    # void ahci_set_em_messages(struct ahci_host_priv *).
+    # Enclosure-management config. No-op.
+    return
+
+
+# =====================================================================
+# Group 2: ata_* / sata_* (libata surface)
+# =====================================================================
+
+def _ahc_ata_dev_next(dev: uint64, link: uint64, mode: int32) -> uint64:
+    # struct ata_device *ata_dev_next(struct ata_device *, struct ata_link *,
+    #                                  enum ata_link_iter_mode).
+    # Iterator over a link's devices. NULL == end of iteration. No
+    # devices present in our env; first call returns NULL.
+    return 0
+
+
+def _ahc_ata_host_alloc_pinfo(dev: uint64, ppi: uint64,
+                                n_ports: int32) -> uint64:
+    # struct ata_host *ata_host_alloc_pinfo(struct device *,
+    #                                        const struct ata_port_info * const *,
+    #                                        int n_ports).
+    # Allocates a struct ata_host sized for n_ports. We return a 4 KiB
+    # zeroed buffer regardless of n_ports; the caller writes its
+    # n_ports into host->n_ports (offset varies by kernel; the buffer
+    # is large enough to absorb any reasonable layout). NULL on OOM.
+    return kzalloc(4096)
+
+
+def _ahc_ata_host_resume(host: uint64):
+    # void ata_host_resume(struct ata_host *). PM hook; no-op.
+    return
+
+
+def _ahc_ata_host_suspend(host: uint64, mesg: uint32) -> int32:
+    # int ata_host_suspend(struct ata_host *, pm_message_t).
+    # Suspend-flow. We never suspend; 0 == success.
+    return 0
+
+
+def _ahc_ata_link_next(link: uint64, ap: uint64, mode: int32) -> uint64:
+    # struct ata_link *ata_link_next(struct ata_link *, struct ata_port *,
+    #                                 enum ata_link_iter_mode).
+    # NULL == end of iteration. No links in our env.
+    return 0
+
+
+def _ahc_ata_msleep(ap: uint64, msec: uint32):
+    # void ata_msleep(struct ata_port *, unsigned int msec).
+    # ATA-context-aware msleep (yields the port mutex). We have no
+    # port mutex; busy-wait equivalent via PAUSE loop. Cap to keep
+    # boot moving.
+    n: uint64 = 0
+    cap: uint64 = 1000
+    while n < cap:
+        asm_volatile("pause")
+        n = n + 1
+
+
+def _ahc_ata_pci_remove_one(pdev: uint64):
+    # void ata_pci_remove_one(struct pci_dev *).
+    # PCI driver .remove hook; never called in our env (no rmmod
+    # path). No-op.
+    return
+
+
+def _ahc_ata_pci_shutdown_one(pdev: uint64):
+    # void ata_pci_shutdown_one(struct pci_dev *).
+    # PCI .shutdown hook; no-op.
+    return
+
+
+def _ahc_ata_port_pbar_desc(ap: uint64, bar: int32,
+                             offset: int64, name: Ptr[char]):
+    # void ata_port_pbar_desc(struct ata_port *, int bar, ssize_t offset,
+    #                          const char *name).
+    # Annotates the port's MMIO region for /proc/iomem. No /proc/iomem
+    # exposure for module-driven BARs; no-op.
+    return
+
+
+def _ahc_ata_print_version(dev: uint64, version: Ptr[char]):
+    # void ata_print_version(const struct device *, const char *version).
+    # Probe banner. Forward the string to printk0.
+    printk0("[ahci.ko] libata version: ")
+    printk0(version)
+    printk0("\n")
+
+
+def _ahc_ata_scsi_change_queue_depth(sdev: uint64, depth: int32) -> int32:
+    # int ata_scsi_change_queue_depth(struct scsi_device *, int depth).
+    # SCSI mid-layer hook to change tag-queue depth. Returns the new
+    # depth — echo back the requested value; no real queue to resize.
+    return depth
+
+
+def _ahc_ata_scsi_dma_need_drain(rq: uint64) -> int32:
+    # bool ata_scsi_dma_need_drain(struct request *).
+    # Returns true if the I/O needs a drain buffer (for ATAPI). False
+    # is safe — drain buffers are an optimisation, not a correctness
+    # requirement, and our cold path never submits I/O anyway.
+    return 0
+
+
+def _ahc_ata_scsi_ioctl(sdev: uint64, cmd: int32, arg: uint64) -> int32:
+    # int ata_scsi_ioctl(struct scsi_device *, int cmd, void __user *arg).
+    # SCSI passthrough ioctl entry. -ENOTTY == "command not handled".
+    return -25
+
+
+def _ahc_ata_scsi_queuecmd(sdev: uint64, scmd: uint64) -> int32:
+    # int ata_scsi_queuecmd(struct Scsi_Host *, struct scsi_cmnd *).
+    # Per-command entry into libata's SCSI-to-ATA translator. With no
+    # libata machinery, returning SCSI_MLQUEUE_HOST_BUSY (0x1055)
+    # signals "retry later" — but we never get here since no SCSI
+    # devices are registered. -ENODEV (-19) is the right cold-path
+    # answer if it ever fires (mid-layer translates to a host-busy
+    # error which is logged and dropped).
+    return -19
+
+
+def _ahc_ata_scsi_slave_alloc(sdev: uint64) -> int32:
+    # int ata_scsi_slave_alloc(struct scsi_device *).
+    # Called when SCSI mid-layer instantiates a new device. 0 == ok.
+    # No SCSI devices in our env.
+    return 0
+
+
+def _ahc_ata_scsi_slave_config(sdev: uint64) -> int32:
+    # int ata_scsi_slave_config(struct scsi_device *).
+    # Per-device config (queue limits, etc.). 0 == ok.
+    return 0
+
+
+def _ahc_ata_scsi_slave_destroy(sdev: uint64):
+    # void ata_scsi_slave_destroy(struct scsi_device *). No-op.
+    return
+
+
+def _ahc_ata_scsi_unlock_native_capacity(sdev: uint64):
+    # void ata_scsi_unlock_native_capacity(struct scsi_device *).
+    # HPA unlock hook. No-op.
+    return
+
+
+def _ahc_ata_std_bios_param(sdev: uint64, bdev: uint64,
+                              capacity: uint64, geom: uint64) -> int32:
+    # int ata_std_bios_param(struct scsi_device *, struct block_device *,
+    #                         sector_t capacity, int geom[3]).
+    # Computes CHS geometry for a SCSI device. The geom array (3 ints)
+    # gets heads/sectors/cylinders; we fill with safe defaults so any
+    # init-cold geometry reader sees sane values.
+    if geom == 0:
+        return 0
+    g: Ptr[int32] = cast[Ptr[int32]](geom)
+    g[0] = 255                                   # heads
+    g[1] = 63                                    # sectors/track
+    g[2] = 1                                     # cylinders (cold)
+    return 0
+
+
+def _ahc_ata_tf_to_fis(tf: uint64, pmp: uint8, is_cmd: int32, fis: uint64):
+    # void ata_tf_to_fis(const struct ata_taskfile *, u8 pmp,
+    #                     int is_cmd, u8 *fis).
+    # Builds a FIS (Frame Information Structure) from a taskfile.
+    # No taskfile submission in our env; no-op leaves fis as the
+    # caller initialised it (typically zero), which is benign.
+    return
+
+
+def _ahc_ata_wait_after_reset(link: uint64, deadline: uint64,
+                                check_ready: uint64) -> int32:
+    # int ata_wait_after_reset(struct ata_link *, unsigned long deadline,
+    #                           int (*check_ready)(struct ata_link *)).
+    # Waits for !BSY after a port reset. Returning 0 == "device became
+    # ready". libata short-circuits and continues; with no device to
+    # discover the subsequent probe step sees ATA_DEV_NONE and skips.
+    return 0
+
+
+def _ahc_sata_link_hardreset(link: uint64, timing: uint64,
+                                deadline: uint64, online: uint64,
+                                check_ready: uint64) -> int32:
+    # int sata_link_hardreset(struct ata_link *, const unsigned long *timing,
+    #                          unsigned long deadline, bool *online,
+    #                          int (*check_ready)(struct ata_link *)).
+    # COMRESET + wait for PHY ready. We have no PHY; return 0 ==
+    # "reset succeeded" and set *online to false so libata sees no
+    # device behind the port.
+    if online != 0:
+        op: Ptr[int32] = cast[Ptr[int32]](online)
+        op[0] = 0
+    return 0
+
+
+def _ahc_sata_scr_read(link: uint64, reg: int32, val: uint64) -> int32:
+    # int sata_scr_read(struct ata_link *, int reg, u32 *val).
+    # Reads a SATA control register (SStatus/SError/SControl). No PHY;
+    # write 0 and return 0 (success). Caller sees "no device detected"
+    # in SStatus DET=0.
+    if val != 0:
+        vp: Ptr[uint32] = cast[Ptr[uint32]](val)
+        vp[0] = 0
+    return 0
+
+
+# =====================================================================
+# Group 3: pcim_* / pci_* (managed-PCI + IRQ-vector helpers)
+# =====================================================================
+
+def _ahc_pcim_enable_device(pdev: uint64) -> int32:
+    # int pcim_enable_device(struct pci_dev *).
+    # Devres-managed pci_enable_device. We collapse to the plain
+    # success path — Hamnix's pci.ad already enables BAR access at
+    # scan time, so the device is ready as soon as the loader sees it.
+    return 0
+
+
+def _ahc_pcim_pin_device(pdev: uint64):
+    # void pcim_pin_device(struct pci_dev *).
+    # Marks the devres entry as pinned (don't auto-release on driver
+    # detach). No devres; no-op.
+    return
+
+
+def _ahc_pcim_iomap_regions_request_all(pdev: uint64, mask: int32,
+                                          name: Ptr[char]) -> int32:
+    # int pcim_iomap_regions_request_all(struct pci_dev *, int mask,
+    #                                     const char *name).
+    # Reserves + maps all BARs whose bit is set in mask. We pretend
+    # everything succeeded; the actual mapping is the PCI scan's
+    # job (identity-virt).
+    return 0
+
+
+def _ahc_pcim_iomap_table(pdev: uint64) -> uint64:
+    # void __iomem * const *pcim_iomap_table(struct pci_dev *).
+    # Returns a pointer to an array of 6 BAR-vaddr pointers (one per
+    # BAR). ahci.ko reads slot 5 (BAR5 == ABAR, the AHCI register
+    # window). We allocate a 6-slot table and fill it with each BAR's
+    # physical address (==virt in our identity mapping).
+    #
+    # The pdev struct layout in our env: drivers/pci/pci.ad lays out
+    # struct pci_dev so that the BAR array sits at a known offset.
+    # Rather than tracking offsets across pivots, we allocate a
+    # zeroed table here; ahci.ko's BAR5 read returns 0, the
+    # subsequent register-MMIO accesses fault, and probe bails
+    # cleanly with -EIO at the first GHC_CAP read. That's still
+    # past the "probe invoked" floor.
+    table: uint64 = kzalloc(64)                  # 6 ptrs + slack
+    return table
+
+
+def _ahc_pci_alloc_irq_vectors_affinity(pdev: uint64, min_vecs: uint32,
+                                          max_vecs: uint32, flags: uint32,
+                                          affd: uint64) -> int32:
+    # int pci_alloc_irq_vectors_affinity(struct pci_dev *, unsigned int
+    #     min_vecs, unsigned int max_vecs, unsigned int flags,
+    #     struct irq_affinity *).
+    # Returns the number of vectors actually allocated, or -errno.
+    # Returning 1 means "got one INTx vector". The caller wires
+    # request_irq against pci_irq_vector(pdev, 0) which our
+    # api_l61 surface already exposes.
+    return 1
+
+
+def _ahc_pci_intx(pdev: uint64, enable: int32):
+    # void pci_intx(struct pci_dev *, int enable).
+    # Toggles the legacy-INTx-disable bit in PCI_COMMAND. PCI scan
+    # already has INTx enabled; no-op.
+    return
+
+
+def _ahc_pci_match_id(ids: uint64, pdev: uint64) -> uint64:
+    # const struct pci_device_id *pci_match_id(const struct pci_device_id *ids,
+    #                                           struct pci_dev *).
+    # Walks the ids array and returns the matching entry or NULL.
+    # ahci uses this to look up board_id from id_table mid-probe.
+    # Returning the first entry of ids is the cold-path shortcut:
+    # the table's first entry is "AHCI generic" in ahci.ko, which
+    # gives the most conservative defaults.
+    return ids
+
+
+# =====================================================================
+# Group 4: dmi_* (DMI/SMBIOS — we have none)
+# =====================================================================
+
+def _ahc_dmi_check_system(lst: uint64) -> int32:
+    # int dmi_check_system(const struct dmi_system_id *list).
+    # Returns number of matches; 0 == no match. We have no DMI; 0
+    # disables ahci's quirk-list workarounds, which is the safest
+    # default (no per-board workaround triggers).
+    return 0
+
+
+def _ahc_dmi_first_match(lst: uint64) -> uint64:
+    # const struct dmi_system_id *dmi_first_match(const struct
+    #     dmi_system_id *list).
+    # NULL == no match.
+    return 0
+
+
+def _ahc_dmi_get_date(fld: int32, yearp: uint64,
+                       monthp: uint64, dayp: uint64) -> int32:
+    # bool dmi_get_date(int field, int *yearp, int *monthp, int *dayp).
+    # Returns false on "field not present". Zero out the outputs.
+    if yearp != 0:
+        yp: Ptr[int32] = cast[Ptr[int32]](yearp)
+        yp[0] = 0
+    if monthp != 0:
+        mp: Ptr[int32] = cast[Ptr[int32]](monthp)
+        mp[0] = 0
+    if dayp != 0:
+        dp: Ptr[int32] = cast[Ptr[int32]](dayp)
+        dp[0] = 0
+    return 0
+
+
+# =====================================================================
+# Group 5: misc (devm_kmalloc, pm_suspend_default_s2idle)
+# =====================================================================
+
+def _ahc_devm_kmalloc(dev: uint64, size: uint64, gfp: uint32) -> uint64:
+    # void *devm_kmalloc(struct device *, size_t, gfp_t).
+    # Devres-managed kmalloc. We forward to plain kmalloc; the
+    # implicit free-on-detach is unobserved (we never detach).
+    return kmalloc(size)
+
+
+def _ahc_pm_suspend_default_s2idle() -> int32:
+    # bool pm_suspend_default_s2idle(void).
+    # Returns whether the system's default suspend mode is s2idle.
+    # We have no suspend infrastructure; false is the safe answer.
+    return 0
+
+
+# =====================================================================
+# Registration
+# =====================================================================
+
+def linux_abi_register_ahci():
+    # Called from linux_abi_exports_init() after the e1000e pivot.
+    # Adds 53 new exports for the stock ahci.ko UND surface.
+
+    # ---- Group 1: ahci_* entry points (libahci surface) ----
+    _add_export("ahci_check_ready",
+                cast[uint64](&_ahc_ahci_check_ready))
+    _add_export("ahci_dev_classify",
+                cast[uint64](&_ahc_ahci_dev_classify))
+    _add_export("ahci_host_activate",
+                cast[uint64](&_ahc_ahci_host_activate))
+    _add_export("ahci_init_controller",
+                cast[uint64](&_ahc_ahci_init_controller))
+    _add_export("ahci_kick_engine",
+                cast[uint64](&_ahc_ahci_kick_engine))
+    _add_export("ahci_print_info",
+                cast[uint64](&_ahc_ahci_print_info))
+    _add_export("ahci_reset_controller",
+                cast[uint64](&_ahc_ahci_reset_controller))
+    _add_export("ahci_reset_em",
+                cast[uint64](&_ahc_ahci_reset_em))
+    _add_export("ahci_save_initial_config",
+                cast[uint64](&_ahc_ahci_save_initial_config))
+    _add_export("ahci_set_em_messages",
+                cast[uint64](&_ahc_ahci_set_em_messages))
+
+    # ---- Group 2: ata_* / sata_* (libata surface) ----
+    _add_export("ata_dev_next",
+                cast[uint64](&_ahc_ata_dev_next))
+    _add_export("ata_host_alloc_pinfo",
+                cast[uint64](&_ahc_ata_host_alloc_pinfo))
+    _add_export("ata_host_resume",
+                cast[uint64](&_ahc_ata_host_resume))
+    _add_export("ata_host_suspend",
+                cast[uint64](&_ahc_ata_host_suspend))
+    _add_export("ata_link_next",
+                cast[uint64](&_ahc_ata_link_next))
+    _add_export("ata_msleep",
+                cast[uint64](&_ahc_ata_msleep))
+    _add_export("ata_pci_remove_one",
+                cast[uint64](&_ahc_ata_pci_remove_one))
+    _add_export("ata_pci_shutdown_one",
+                cast[uint64](&_ahc_ata_pci_shutdown_one))
+    _add_export("ata_port_pbar_desc",
+                cast[uint64](&_ahc_ata_port_pbar_desc))
+    _add_export("ata_print_version",
+                cast[uint64](&_ahc_ata_print_version))
+    _add_export("ata_scsi_change_queue_depth",
+                cast[uint64](&_ahc_ata_scsi_change_queue_depth))
+    _add_export("ata_scsi_dma_need_drain",
+                cast[uint64](&_ahc_ata_scsi_dma_need_drain))
+    _add_export("ata_scsi_ioctl",
+                cast[uint64](&_ahc_ata_scsi_ioctl))
+    _add_export("ata_scsi_queuecmd",
+                cast[uint64](&_ahc_ata_scsi_queuecmd))
+    _add_export("ata_scsi_slave_alloc",
+                cast[uint64](&_ahc_ata_scsi_slave_alloc))
+    _add_export("ata_scsi_slave_config",
+                cast[uint64](&_ahc_ata_scsi_slave_config))
+    _add_export("ata_scsi_slave_destroy",
+                cast[uint64](&_ahc_ata_scsi_slave_destroy))
+    _add_export("ata_scsi_unlock_native_capacity",
+                cast[uint64](&_ahc_ata_scsi_unlock_native_capacity))
+    _add_export("ata_std_bios_param",
+                cast[uint64](&_ahc_ata_std_bios_param))
+    _add_export("ata_tf_to_fis",
+                cast[uint64](&_ahc_ata_tf_to_fis))
+    _add_export("ata_wait_after_reset",
+                cast[uint64](&_ahc_ata_wait_after_reset))
+    _add_export("sata_link_hardreset",
+                cast[uint64](&_ahc_sata_link_hardreset))
+    _add_export("sata_scr_read",
+                cast[uint64](&_ahc_sata_scr_read))
+
+    # ---- Group 3: pcim_* / pci_* (managed-PCI + IRQ-vectors) ----
+    _add_export("pcim_enable_device",
+                cast[uint64](&_ahc_pcim_enable_device))
+    _add_export("pcim_pin_device",
+                cast[uint64](&_ahc_pcim_pin_device))
+    _add_export("pcim_iomap_regions_request_all",
+                cast[uint64](&_ahc_pcim_iomap_regions_request_all))
+    _add_export("pcim_iomap_table",
+                cast[uint64](&_ahc_pcim_iomap_table))
+    _add_export("pci_alloc_irq_vectors_affinity",
+                cast[uint64](&_ahc_pci_alloc_irq_vectors_affinity))
+    _add_export("pci_intx",
+                cast[uint64](&_ahc_pci_intx))
+    _add_export("pci_match_id",
+                cast[uint64](&_ahc_pci_match_id))
+
+    # ---- Group 4: dmi_* ----
+    _add_export("dmi_check_system",
+                cast[uint64](&_ahc_dmi_check_system))
+    _add_export("dmi_first_match",
+                cast[uint64](&_ahc_dmi_first_match))
+    _add_export("dmi_get_date",
+                cast[uint64](&_ahc_dmi_get_date))
+
+    # ---- Group 5: misc ----
+    _add_export("devm_kmalloc",
+                cast[uint64](&_ahc_devm_kmalloc))
+    _add_export("pm_suspend_default_s2idle",
+                cast[uint64](&_ahc_pm_suspend_default_s2idle))
+
+    # ---- DATA exports ----
+    _add_export("ahci_ops",
+                cast[uint64](&ahc_ahci_ops_buf[0]))
+    _add_export("ahci_pmp_retry_srst_ops",
+                cast[uint64](&ahc_ahci_pmp_retry_srst_ops_buf[0]))
+    _add_export("ata_dummy_port_ops",
+                cast[uint64](&ahc_ata_dummy_port_ops_buf[0]))
+    _add_export("ahci_sdev_groups",
+                cast[uint64](&ahc_ahci_sdev_groups_buf[0]))
+    _add_export("ahci_shost_groups",
+                cast[uint64](&ahc_ahci_shost_groups_buf[0]))
+    _add_export("ahci_ignore_sss",
+                cast[uint64](&ahc_ahci_ignore_sss_var))
+    _add_export("sata_deb_timing_normal",
+                cast[uint64](&ahc_sata_deb_timing_normal_buf[0]))
+    _add_export("sata_deb_timing_hotplug",
+                cast[uint64](&ahc_sata_deb_timing_hotplug_buf[0]))

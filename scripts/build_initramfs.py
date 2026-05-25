@@ -211,6 +211,25 @@ if os.environ.get("ENABLE_XHCI_FORCE_INIT") == "1":
 if os.environ.get("ENABLE_E1000E_KO") == "1":
     FILES.append(("/etc/e1000e-ko", b"1\n"))
 
+# Storage pivot (Agent D): mirror the ENABLE_E1000E_KO pattern for
+# ahci.ko (SATA AHCI controller — covers most stock desktop/laptop
+# SATA silicon). scripts/test_ahci_ko.sh sets ENABLE_AHCI_KO=1 to
+# plant /etc/ahci-ko in the initramfs. A kernel-side autoloader
+# (Agent B's modprobe.ad / init/main.ad wiring) can gate on this
+# marker the same way init/main.ad already gates on /etc/e1000e-ko.
+# In the meantime the test exercises the load path via userspace
+# `insmod /lib/modules/6.12/ahci.ko` (the L-track test pattern).
+if os.environ.get("ENABLE_AHCI_KO") == "1":
+    FILES.append(("/etc/ahci-ko", b"1\n"))
+
+# Storage pivot (Agent D): mirror the ENABLE_E1000E_KO pattern for
+# nvme.ko (PCIe NVM Express SSD driver — every modern NVMe device).
+# scripts/test_nvme_ko.sh sets ENABLE_NVME_KO=1 to plant /etc/nvme-ko.
+# Same userspace-insmod fallback as the ahci block above until a
+# kernel-side autoloader honours the marker.
+if os.environ.get("ENABLE_NVME_KO") == "1":
+    FILES.append(("/etc/nvme-ko", b"1\n"))
+
 # Native `ping` smoke. scripts/test_ping.sh sets ENABLE_PING_SMOKE=1 to
 # plant /etc/ping-smoke-test in the initramfs. The marker is consumed
 # only by the test harness today (a future kernel-side autorun could
@@ -883,6 +902,30 @@ def build_archive() -> bytes:
         blob += cpio_entry(name, data)
         print(f"  embedded {name} ({len(data)} bytes from "
               f"kernel-modules/igb/igb.ko)")
+
+    # Storage pivot (Agent D): ahci.ko (SATA AHCI controller —
+    # Debian 6.1.0-32 build, ~117 KiB). Planted at /lib/modules/ahci.ko
+    # AND at /lib/modules/6.12/ahci.ko so the userspace `insmod` path
+    # the L-track tests use can find it.
+    ahci_ko = here / "kernel-modules" / "ahci" / "ahci.ko"
+    if ahci_ko.is_file():
+        data = ahci_ko.read_bytes()
+        for name in ("/lib/modules/ahci.ko",
+                     "/lib/modules/6.12/ahci.ko"):
+            blob += cpio_entry(name, data)
+            print(f"  embedded {name} ({len(data)} bytes from "
+                  f"kernel-modules/ahci/ahci.ko)")
+
+    # Storage pivot (Agent D): nvme.ko (PCIe NVM Express SSD driver —
+    # Debian 6.1.0-32 build, ~128 KiB). Same dual-path planting.
+    nvme_ko = here / "kernel-modules" / "nvme" / "nvme.ko"
+    if nvme_ko.is_file():
+        data = nvme_ko.read_bytes()
+        for name in ("/lib/modules/nvme.ko",
+                     "/lib/modules/6.12/nvme.ko"):
+            blob += cpio_entry(name, data)
+            print(f"  embedded {name} ({len(data)} bytes from "
+                  f"kernel-modules/nvme/nvme.ko)")
 
     # U5: host-built Linux ELF test binaries. Anything staged under
     # tests/u-binary/ (built by tests/u-binary/src/*/Makefile via
