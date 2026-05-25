@@ -61,8 +61,18 @@ grep -E 'kmod_linux|\[e1000e\.ko\]|\[e1000e\]|\[eth\]|\[netdev|\[boot:35' "$LOG"
 echo "[test_e1000e_tx] --- end ---"
 
 fail=0
+# Assertions: the .ko was found in cpio, the L-series loader walked
+# the ET_REL header successfully, applied every relocation without
+# leaving any unresolved-external skipped, called init_module and
+# init_module returned 0. The module is now bound and ready for the
+# QEMU e1000e device. Real TX/RX/DHCP wiring is a follow-on commit
+# (the driver's probe registers a struct pci_driver but our
+# __pci_register_driver shim doesn't yet walk our PCI device table
+# to invoke driver->probe(pdev) — that's the next milestone).
 for needle in \
     "[e1000e.ko] loading" \
+    "kmod_linux: relocations applied=" \
+    "kmod_linux: init_module @" \
     "[e1000e.ko] kmod_linux_load OK"
 do
     if grep -F -q "$needle" "$LOG"; then
@@ -73,6 +83,14 @@ do
     fi
 done
 
+# Also assert no skipped relocations — every UND must have resolved.
+if grep -E -q "kmod_linux: relocations applied=[0-9]+ skipped=0" "$LOG"; then
+    echo "[test_e1000e_tx] OK: 'all relocations resolved (0 skipped)'"
+else
+    echo "[test_e1000e_tx] MISS: 'all relocations resolved (0 skipped)'"
+    fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "[test_e1000e_tx] FAIL (qemu rc=$rc)"
     echo "[test_e1000e_tx] --- full log ---"
@@ -80,4 +98,4 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
-echo "[test_e1000e_tx] PASS"
+echo "[test_e1000e_tx] PASS (.ko loaded; init_module returned 0)"
