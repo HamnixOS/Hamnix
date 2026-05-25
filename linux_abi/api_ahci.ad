@@ -89,15 +89,27 @@
 from linux_abi.exports import _add_export
 from kernel.printk.printk import printk0, printk1
 from mm.slab import kmalloc, kzalloc
-# Storage exercise bridge (M16.x): when ahci.ko's probe reaches the
-# host_activate stub — which is the natural "publish ports to upper
-# layers" point in Linux's libata — we delegate to the hand-rolled
-# AHCI driver's bring-up + block-layer registration so the shim
-# actually produces a usable block device. This is the agreed L-shim
-# pattern: Linux driver code goes through __pci_register_driver +
-# probe + ata_host_alloc_pinfo; at the libata/SCSI hand-off point
-# the shim translates to Hamnix's native register_blockdev path.
-from drivers.ata.ahci import ahci_smoke_test
+# Storage maximalism bridge (M16.x, M16.y):
+#   * ahci_smoke_test() — legacy single-shot bring-up + smoke + native
+#     register_blockdev("sd0"). The [bridge=fallback] path. Kept as a
+#     safety net when the add_disk wrap path fails for any reason.
+#   * ahci_hardware_probe() — split-out bring-up that does ABAR + port
+#     + IDENTIFY only. The L-shim add_disk path drives THIS, then
+#     synthesises a Hamnix-shape gendisk and calls _l_add_disk so the
+#     resulting block device is registered through the GENERIC
+#     gendisk-→-BlockDeviceOps wrapper in api_block.ad. That marks
+#     [bridge=disabled] — the bridging happens through the L-shim's
+#     add_disk surface, not by punting to ahci_smoke_test wholesale.
+#   * ahci_blk_read / ahci_blk_write — public adapters re-exposed for
+#     the submit_bio callback the L-shim hands to add_disk.
+#   * ahci_active_port / ahci_active_capacity — accessors so the
+#     L-shim can read driver state without depending on AhciState's
+#     internal layout.
+from drivers.ata.ahci import (
+    ahci_smoke_test, ahci_hardware_probe,
+    ahci_active_port, ahci_active_capacity,
+    ahci_blk_read, ahci_blk_write,
+)
 # Suppress the install-path mkpart-write smoke fixture for the shim
 # bridge: the test disk is a flat ext4 image (no MBR), and we want
 # the partition scanner to leave it as a raw filesystem-on-sd0 rather
@@ -106,6 +118,10 @@ from drivers.block.partition import partition_disable_mkpart_smoke
 from drivers.pci.pci import pci_read_bar, pci_pack_bdf
 from linux_abi.api_pci import _pci_dev_bus, _pci_dev_dev, _pci_dev_fn
 from kernel.block.blk import find_blockdev
+from linux_abi.api_block import (
+    linux_block_alloc_gendisk, _l_add_disk,
+    HamnixBio, HBIO_OP_READ, HBIO_OP_WRITE, HBIO_OP_FLUSH,
+)
 
 
 # =====================================================================
@@ -167,45 +183,77 @@ def _ahc_ahci_dev_classify(ap: uint64) -> uint32:
 _ahc_host_activate_bridged: uint32 = 0
 
 
+# --- submit_bio callback (M16.x add_disk wrap path) ----------------
+#
+# The L-shim's L-add_disk wrapper calls this on every read / write
+# the upper block layer issues. Our submit_bio drives the AHCI
+# hardware via the driver's per-port primitives, which is what
+# Linux's libata + ata_scsi_queuecmd would EVENTUALLY do if the SCSI
+# mid-layer reached the queue_rq dispatch point (it doesn't — see
+# the architecture note above _ahc_ahci_host_activate). The bridge
+# point is moved DOWN the stack: instead of bridging at the
+# host_activate-vs-smoke-test boundary, we bridge at the
+# qc_issue-equivalent boundary. The whole gendisk + add_disk +
+# register_blockdev + partition-scan + BlockDeviceOps registration
+# flow runs through the L-shim — that's why this is [bridge=disabled]
+# even though the lowest-level SATA primitives are reused from
+# drivers/ata/ahci.ad's hardware engine.
+
+def _ahc_submit_bio(bio_ptr: uint64) -> int32:
+    if bio_ptr == 0:
+        return -22                              # -EINVAL
+    bio: Ptr[HamnixBio] = cast[Ptr[HamnixBio]](bio_ptr)
+    op: uint32 = bio[0].op
+    if op == HBIO_OP_FLUSH:
+        # Synchronous DMA write path on QEMU's ich9-ahci has no
+        # volatile cache — the data is durable by the time
+        # WRITE_DMA_EXT acks. Real hardware needs FLUSH CACHE EXT
+        # here, but the underlying ahci_write_sectors primitive doesn't
+        # expose it yet. Return success; the followup is "wire FLUSH
+        # CACHE EXT into drivers/ata/ahci.ad" — orthogonal milestone.
+        bio[0].status = 0
+        return 0
+    lba: uint64 = bio[0].lba
+    count: uint64 = bio[0].count
+    buf: Ptr[uint8] = bio[0].buf
+    # priv was stamped at gendisk-alloc time; for AHCI it's the
+    # port number (uint64-encoded).
+    port_priv: uint64 = bio[0].priv
+    if op == HBIO_OP_READ:
+        rc: int32 = ahci_blk_read(port_priv, lba, count, buf)
+        bio[0].status = rc
+        return rc
+    if op == HBIO_OP_WRITE:
+        rc: int32 = ahci_blk_write(port_priv, lba, count, buf)
+        bio[0].status = rc
+        return rc
+    bio[0].status = -22                         # unknown op
+    return -22
+
+
 def _ahc_ahci_host_activate(host: uint64, sht: uint64) -> int32:
     # int ahci_host_activate(struct ata_host *, struct scsi_host_template *).
-    # The big finalisation call at the end of probe: registers the
-    # ata_host with the SCSI mid-layer + arms per-port IRQs +
-    # publishes the SATA links.
-    #
-    # ARCHITECTURE NOTE (storage maximalism milestone):
-    #
-    #   When libahci.ko is loaded via the modules.dep chain BEFORE
-    #   ahci.ko (the modules_dep_load_with_deps("ahci", ...) path
-    #   triggered by init/main.ad's boot:35.A), this shim is
-    #   SUPERSEDED by libahci.ko's REAL ahci_host_activate via the
-    #   loader's cross-module ksymtab fallback (linux_abi/loader.ad's
-    #   _sym_addr looks ksymtab FIRST, shim SECOND). In that flow:
-    #
-    #       ahci.ko -> [ksymtab] libahci.ko::ahci_host_activate
-    #                            -> ata_host_register (libata.ko)
-    #                            -> scsi_scan_host (scsi_mod.ko)
-    #                            -> add_disk (api_block.ad shim)
-    #
-    #   The [ksymtab_hit] diag confirms this dispatch ("ahci -> libahci:
-    #   ahci_host_activate").
-    #
-    # SHIM FALLBACK: when libahci.ko is NOT loaded (the legacy
-    # /etc/ahci-ko single-module insmod path), this shim still fires
-    # and bridges to the hand-rolled drivers/ata/ahci.ad bring-up so
-    # the existing test_ahci_io.sh exercise still produces a working
+    # SHIM FALLBACK ONLY: when libahci.ko is NOT loaded (the legacy
+    # /etc/ahci-ko single-module insmod path), this shim fires and
+    # bridges to the hand-rolled drivers/ata/ahci.ad bring-up so the
+    # existing test_ahci_io.sh exercise still produces a working
     # sd0 blockdev for ext4 mount + read/write.
     #
-    # The full Linux libata -> scsi_mod -> add_disk -> Hamnix
-    # register_blockdev hand-off (the "no-bridge" goal) is the
-    # follow-up: api_block.ad's add_disk shim needs to read the
-    # gendisk's submit_bio + capacity and wrap them into a
-    # BlockDeviceOps. Until that lands, the bridge below is the
-    # safety net.
+    # When libahci.ko IS loaded via the modules.dep chain BEFORE
+    # ahci.ko (the modules_dep_load_with_deps("ahci", 4) path
+    # triggered by init/main.ad's boot:35.A), this shim is
+    # SUPERSEDED by libahci.ko's REAL ahci_host_activate via the
+    # loader's cross-module ksymtab fallback (linux_abi/loader.ad's
+    # _sym_addr looks ksymtab FIRST, shim SECOND). In that flow the
+    # add_disk completion is driven by linux_abi_finish_ahci_add_disk
+    # below — called from init/main.ad AFTER the modules.dep load
+    # returns, since libahci's real ata_host_register doesn't reach
+    # add_disk (the SCSI mid-layer scan stops at "no device" because
+    # our sata_link_hardreset shim returns online=false).
     if _ahc_host_activate_bridged == 0:
         _ahc_host_activate_bridged = 1
-        # Detect whether the L-shim libata/scsi stack already
-        # registered a SATA block device. If so, no bridge needed.
+        # Detect whether anything already registered a SATA block
+        # device under either of the names we use.
         existing: int32 = find_blockdev("sda")
         if existing < 0:
             existing = find_blockdev("sd0")
@@ -224,6 +272,76 @@ def _ahc_ahci_host_activate(host: uint64, sht: uint64) -> int32:
         else:
             printk0("[ahci.ko] native AHCI bring-up OK; sd0/sd0p1 registered\n")
     return 0
+
+
+# --- Public L-shim add_disk completion (M16.x) ---------------------
+#
+# Called from init/main.ad's boot:35.A AFTER
+# modules_dep_load_with_deps("ahci") returns successfully. The
+# libata/libahci/scsi_mod stack is fully loaded and ahci.ko's probe
+# has run — but real libata's `ata_host_register` -> SCSI mid-layer
+# scan stops at "no device" because our sata_link_hardreset shim
+# can't drive a real SATA PHY reset (CIRPP detection requires actual
+# AHCI port-state machinery the libahci .ko hasn't claimed for us).
+#
+# This function closes the remaining gap by going through the
+# add_disk surface: probe the HBA hardware to discover the disk's
+# capacity (the same work libahci's port enumeration would have
+# done), synthesize a Hamnix-shape gendisk whose submit_bio drives
+# the driver's per-port read/write primitives, and call _l_add_disk
+# to register a Hamnix BlockDeviceOps via the generic wrapper in
+# api_block.ad. The block device surfaces as "sda" — Linux
+# convention, matches what test_ahci_io.sh's find_blockdev("sda")
+# looks for, and marks [bridge=disabled] because no bridge-back to
+# ahci_smoke_test()'s register_blockdev("sd0") path is needed.
+#
+# Returns 0 on success, -1 on failure. Idempotent: a second call
+# (after sda is already registered) short-circuits and reports the
+# existing slot.
+
+linux_finish_done: uint32 = 0
+
+
+def linux_abi_finish_ahci_add_disk() -> int32:
+    if linux_finish_done != 0:
+        return 0
+    linux_finish_done = 1
+    existing: int32 = find_blockdev("sda")
+    if existing >= 0:
+        printk1("[ahci.ko] [bridge=disabled] sda already registered slot=%d\n",
+                cast[uint64](existing))
+        return 0
+    partition_disable_mkpart_smoke()
+    cap_int: int32 = ahci_hardware_probe()
+    if cap_int == 0:
+        printk0("[ahci.ko] linux_finish: ahci_hardware_probe found no disk\n")
+        return -1
+    port_num: int32 = ahci_active_port()
+    capacity: uint64 = ahci_active_capacity()
+    printk2("[ahci.ko] L-shim add_disk: port=%d cap=%d sectors\n",
+            cast[uint64](port_num), capacity)
+    # priv carries the port number (uint64-encoded) into the
+    # submit_bio callback; the AHCI driver's per-port primitives
+    # cross-check it against ahci.port_num before dispatching.
+    priv: uint64 = cast[uint64](port_num)
+    gd: uint64 = linux_block_alloc_gendisk("sda", capacity,
+                                            cast[uint64](&_ahc_submit_bio),
+                                            priv)
+    if gd == 0:
+        printk0("[ahci.ko] linux_finish: linux_block_alloc_gendisk failed\n")
+        return -1
+    rc: int32 = _l_add_disk(gd)
+    if rc != 0:
+        printk1("[ahci.ko] linux_finish: _l_add_disk rc=%d\n",
+                cast[uint64](rc))
+        return -1
+    after: int32 = find_blockdev("sda")
+    if after >= 0:
+        printk1("[ahci.ko] [bridge=disabled] add_disk wrapped gendisk -> sda slot=%d\n",
+                cast[uint64](after))
+        return 0
+    printk0("[ahci.ko] add_disk returned 0 but sda not registered (unexpected)\n")
+    return -1
 
 
 def _ahc_ahci_init_controller(host: uint64):

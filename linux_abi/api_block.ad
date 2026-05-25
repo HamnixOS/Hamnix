@@ -42,13 +42,15 @@
 #       doesn't reach that code path.
 #
 # Hamnix already has a real block layer in kernel/block/blk.ad
-# (register_blockdev / blk_read_sectors / etc.) — but that surface
-# is the Hamnix-internal vtable shape used by FAT/EXT4, NOT the
-# Linux gendisk+blk_mq surface. They will be bridged by a future
-# milestone (an "L24-bridge" that translates Linux's gendisk into
-# Hamnix's BlockDevice); until then, this file keeps the two block
-# APIs cleanly separate. The M-style fixture only exercises the
-# Linux surface and never tries to read sectors.
+# (register_blockdev / blk_read_sectors / etc.). M16.x closes the
+# bridge: add_disk now wraps a gendisk into a Hamnix BlockDeviceOps
+# via a "submit_bio" callback the gendisk owner stamps into the
+# slot table. The wrapper builds a HamnixBio descriptor, hands it
+# to submit_bio, and surfaces the result on blk_read_sectors /
+# blk_write_sectors. This is the generic seam every Linux storage
+# driver (sd_mod, sr_mod, virtio_scsi, ...) can ride once the SCSI
+# mid-layer reaches add_disk — and api_ahci.ad already drives this
+# path today via its hardware-probe + synthesize-gendisk shim.
 #
 # Struct sizes (Linux 6.12 ballpark):
 #   struct gendisk          ~ 600 B  (we track 16 of them, 16 KiB total)
@@ -57,7 +59,11 @@
 #   struct bio              ~ 100 B  (not modelled — bio_endio is no-op)
 
 from linux_abi.exports import _add_export
-from kernel.printk.printk import printk0, printk1
+from kernel.printk.printk import printk0, printk1, printk2
+from kernel.block.blk import (
+    BlockDeviceOps, register_blockdev, find_blockdev,
+    blk_scan_partitions, blk_register_partitions,
+)
 
 
 # --- Opaque struct sizes (informational) ----------------------------
@@ -98,6 +104,70 @@ gendisk_live:    Array[16, uint64]
 gendisk_cap:     Array[16, uint64]
 gendisk_tagset:  Array[16, uint64]
 gendisk_qdata:   Array[16, uint64]
+
+# --- M16.x add_disk-→-BlockDeviceOps wrapper state ------------------
+#
+# Per-gendisk-slot fields that turn a gendisk's submit_bio callback
+# into a Hamnix BlockDeviceOps. Parallel arrays (same Ptr-in-struct
+# pitfall the existing tables work around):
+#
+#   gendisk_name      16-byte NUL-padded disk_name ("sda\0...").
+#   gendisk_submit_fn function pointer the gendisk owner stamped at
+#                     alloc time. Signature:
+#                       int32 (*submit_bio)(uint64 bio_ptr)
+#                     where bio_ptr is a Ptr[HamnixBio]. The callback
+#                     issues the I/O synchronously and writes
+#                     bio.status before returning. Linux's real
+#                     submit_bio is async + bio_endio-driven; we
+#                     collapse to sync since our underlying block
+#                     layer (blk_read_sectors / blk_write_sectors)
+#                     is also sync. A future async path would set
+#                     status=-EINPROGRESS and let bio_endio close.
+#   gendisk_priv      Cookie the gendisk owner gave us; threaded
+#                     unchanged into bio.priv on every submit.
+#   gendisk_blkslot   Hamnix block-layer slot index allocated when
+#                     add_disk runs.
+
+GENDISK_NAME_LEN: uint64 = 16
+
+gendisk_name:      Array[16, Array[16, uint8]]
+gendisk_submit_fn: Array[16, uint64]
+gendisk_priv:      Array[16, uint64]
+gendisk_blkslot:   Array[16, int32]
+
+
+# Shared BlockDeviceOps vtable installed for every gendisk we wrap.
+# read_sectors / write_sectors / flush all route through a per-slot
+# submit_bio dispatcher.
+gendisk_blk_ops: BlockDeviceOps
+
+
+# --- HamnixBio ------------------------------------------------------
+#
+# Minimum-scope bio descriptor for the synchronous add_disk wrapper.
+# Linux's real `struct bio` is ~100 bytes and carries a bvec list +
+# bi_end_io chain; we only need the four fields a real driver needs
+# to issue the I/O against its hardware. Layout-stable: drivers may
+# read/write any field directly via offsetof.
+#
+# Lifetime: stack-allocated by _gendisk_*_blkop, so the submit_bio
+# callback must complete synchronously and write back `status`
+# before returning.
+
+class HamnixBio:
+    op:      uint32          # 0 = read, 1 = write, 2 = flush
+    pad:     uint32
+    lba:     uint64          # 512-byte sector offset
+    count:   uint64          # number of 512-byte sectors
+    buf:     Ptr[uint8]      # data buffer (kernel virt)
+    priv:    uint64          # gendisk_priv[slot]
+    status:  int32           # filled in by submit_bio: 0 ok, -errno
+    pad2:    uint32
+
+
+HBIO_OP_READ:  uint32 = 0
+HBIO_OP_WRITE: uint32 = 1
+HBIO_OP_FLUSH: uint32 = 2
 
 
 # --- tag_set slot table ---------------------------------------------
@@ -153,6 +223,58 @@ def _tagset_find(set_ptr: uint64) -> int32:
     return -1
 
 
+# --- BlockDeviceOps adapter: gendisk submit_bio wrapper ------------
+#
+# Every gendisk we register surfaces as a Hamnix block device whose
+# read_sectors / write_sectors / flush entries all funnel into the
+# gendisk's stored submit_bio function pointer. priv carries the
+# gendisk slot index so we can look up submit_fn + gendisk_priv at
+# dispatch time. This is the architectural seam the task description
+# asks for: "BlockDeviceOps whose read_sectors / write_sectors
+# schedules a bio against the gendisk's submit_bio."
+
+def _gendisk_dispatch(slot_u64: uint64, op: uint32, lba: uint64,
+                      count: uint64, buf: Ptr[uint8]) -> int32:
+    # Common path. Look up the submit_bio fn, build a HamnixBio on
+    # the stack, dispatch, return status.
+    if slot_u64 >= MAX_GENDISK_SLOTS:
+        return -22                              # -EINVAL
+    if gendisk_used[slot_u64] == 0 or gendisk_live[slot_u64] == 0:
+        return -22                              # -EINVAL
+    submit_addr: uint64 = gendisk_submit_fn[slot_u64]
+    if submit_addr == 0:
+        return -19                              # -ENODEV
+    bio: HamnixBio
+    bio.op     = op
+    bio.lba    = lba
+    bio.count  = count
+    bio.buf    = buf
+    bio.priv   = gendisk_priv[slot_u64]
+    bio.status = 0
+    fn: Fn[int32, uint64] = cast[Fn[int32, uint64]](submit_addr)
+    rc: int32 = fn(cast[uint64](&bio))
+    if rc != 0:
+        return rc
+    return bio.status
+
+
+def _gendisk_read_blkop(priv: uint64, lba: uint64, count: uint64,
+                        buf: Ptr[uint8]) -> int32:
+    return _gendisk_dispatch(priv, HBIO_OP_READ, lba, count, buf)
+
+
+def _gendisk_write_blkop(priv: uint64, lba: uint64, count: uint64,
+                         buf: Ptr[uint8]) -> int32:
+    return _gendisk_dispatch(priv, HBIO_OP_WRITE, lba, count, buf)
+
+
+def _gendisk_flush_blkop(priv: uint64) -> int32:
+    # Flush carries no LBA / count / buf. The submit_bio callback
+    # gets a HamnixBio with op=FLUSH and the rest zeroed.
+    return _gendisk_dispatch(priv, HBIO_OP_FLUSH, 0, 0,
+                             cast[Ptr[uint8]](0))
+
+
 # --- gendisk shims --------------------------------------------------
 
 def _l_blk_alloc_disk(node_id: int32) -> uint64:
@@ -175,13 +297,72 @@ def _l_blk_alloc_disk(node_id: int32) -> uint64:
     gendisk_cap[s]     = 0
     gendisk_tagset[s]  = 0
     gendisk_qdata[s]   = 0
+    gendisk_submit_fn[s] = 0
+    gendisk_priv[s]    = 0
+    gendisk_blkslot[s] = -1
+    j: uint64 = 0
+    while j < GENDISK_NAME_LEN:
+        gendisk_name[s][j] = 0
+        j = j + 1
+    return cast[uint64](&gendisk_storage[s])
+
+
+# --- linux_block_alloc_gendisk (Hamnix internal helper) -------------
+#
+# Companion to _l_blk_alloc_disk for callers that ALREADY have a
+# (name, capacity, submit_bio, priv) tuple and want to skip the
+# multi-step Linux dance (alloc + set_capacity + set name + set
+# fops). Used by linux_abi/api_ahci.ad's L-shim host_activate hook
+# to mint a "sda" gendisk after ahci_hardware_probe brings up the
+# port. The returned pointer is the gendisk's storage anchor — the
+# same value _l_add_disk expects in its `disk` arg.
+#
+# Returns 0 on OOM (table full) or bad input.
+
+def linux_block_alloc_gendisk(name: Ptr[char], capacity: uint64,
+                               submit_bio_fn: uint64,
+                               priv: uint64) -> uint64:
+    if name == 0 or submit_bio_fn == 0:
+        return 0
+    slot: int32 = _gendisk_find_free()
+    if slot < 0:
+        printk0("blk: linux_block_alloc_gendisk: table full\n")
+        return 0
+    s: uint64 = cast[uint64](slot)
+    gendisk_storage[s]   = 0
+    gendisk_used[s]      = 1
+    gendisk_live[s]      = 0
+    gendisk_cap[s]       = capacity
+    gendisk_tagset[s]    = 0
+    gendisk_qdata[s]     = 0
+    gendisk_submit_fn[s] = submit_bio_fn
+    gendisk_priv[s]      = priv
+    gendisk_blkslot[s]   = -1
+    # Copy name: stop at NUL or at 15 bytes; zero-pad the rest.
+    j: uint64 = 0
+    seen_nul: int32 = 0
+    while j < (GENDISK_NAME_LEN - 1):
+        if seen_nul == 0:
+            c: int32 = name[j]
+            if c == 0:
+                seen_nul = 1
+                gendisk_name[s][j] = 0
+            else:
+                gendisk_name[s][j] = cast[uint8](c & 0xFF)
+        else:
+            gendisk_name[s][j] = 0
+        j = j + 1
+    gendisk_name[s][GENDISK_NAME_LEN - 1] = 0
     return cast[uint64](&gendisk_storage[s])
 
 
 def _l_add_disk(disk: uint64) -> int32:
-    # Linux: int add_disk(struct gendisk *disk). Walks the partition
-    # table, creates /dev nodes, registers with udev. None of that
-    # exists at L24 — we just flip the live flag and return 0.
+    # Linux: int add_disk(struct gendisk *disk). The L-shim wraps the
+    # gendisk's submit_bio callback into a Hamnix BlockDeviceOps and
+    # registers it via register_blockdev so file systems (ext4 / FAT)
+    # can mount the disk through blk_read_sectors / blk_write_sectors.
+    # Then scans the partition table so siblings (sda1 / sda2 / ...)
+    # also become reachable.
     if disk == 0:
         return -22                              # -EINVAL
     slot: int32 = _gendisk_slot_of(disk)
@@ -193,6 +374,33 @@ def _l_add_disk(disk: uint64) -> int32:
         return -22                              # -EINVAL
     gendisk_live[s] = 1
     printk1("L24: gendisk live capacity=%d sectors\n", gendisk_cap[s])
+
+    # Wrap into a BlockDeviceOps if the gendisk has a submit_bio
+    # callback. The non-wrapping path remains for the simpler
+    # blk_alloc_disk-only flow (M-style fixtures that never read).
+    if gendisk_submit_fn[s] != 0 and gendisk_cap[s] > 0:
+        # Lazily install the shared vtable; idempotent.
+        gendisk_blk_ops.read_sectors  = _gendisk_read_blkop
+        gendisk_blk_ops.write_sectors = _gendisk_write_blkop
+        gendisk_blk_ops.flush         = _gendisk_flush_blkop
+        # Register under the gendisk's stamped disk_name. priv is the
+        # slot index so the BlockDeviceOps adapter can recover
+        # submit_fn + gendisk_priv on each request.
+        name_ptr: Ptr[char] = cast[Ptr[char]](&gendisk_name[s][0])
+        bslot: int32 = register_blockdev(name_ptr, gendisk_cap[s],
+                                          &gendisk_blk_ops,
+                                          s)
+        if bslot < 0:
+            printk0("blk: add_disk: register_blockdev failed\n")
+            return -16                          # -EBUSY
+        gendisk_blkslot[s] = bslot
+        printk2("[blockdev] registered %s slot=%d\n",
+                cast[uint64](name_ptr), cast[uint64](bslot))
+        # Walk the disk's partition table so siblings (<name>p1, ...)
+        # become reachable. Failure here is non-fatal — the raw disk
+        # still works for whole-disk reads.
+        blk_scan_partitions(bslot)
+        blk_register_partitions(bslot, name_ptr)
     return 0
 
 
@@ -208,11 +416,18 @@ def _l_del_gendisk(disk: uint64):
     if slot < 0:
         return
     s: uint64 = cast[uint64](slot)
-    gendisk_used[s]    = 0
-    gendisk_live[s]    = 0
-    gendisk_cap[s]     = 0
-    gendisk_tagset[s]  = 0
-    gendisk_qdata[s]   = 0
+    gendisk_used[s]      = 0
+    gendisk_live[s]      = 0
+    gendisk_cap[s]       = 0
+    gendisk_tagset[s]    = 0
+    gendisk_qdata[s]     = 0
+    gendisk_submit_fn[s] = 0
+    gendisk_priv[s]      = 0
+    gendisk_blkslot[s]   = -1
+    j: uint64 = 0
+    while j < GENDISK_NAME_LEN:
+        gendisk_name[s][j] = 0
+        j = j + 1
 
 
 def _l_set_capacity(disk: uint64, size: uint64):
@@ -277,12 +492,19 @@ def _l_blk_mq_alloc_disk(set_ptr: uint64, queuedata: uint64) -> uint64:
         printk0("blk: blk_mq_alloc_disk: gendisk table full\n")
         return 0
     s: uint64 = cast[uint64](slot)
-    gendisk_storage[s] = 0
-    gendisk_used[s]    = 1
-    gendisk_live[s]    = 0
-    gendisk_cap[s]     = 0
-    gendisk_tagset[s]  = set_ptr
-    gendisk_qdata[s]   = queuedata
+    gendisk_storage[s]   = 0
+    gendisk_used[s]      = 1
+    gendisk_live[s]      = 0
+    gendisk_cap[s]       = 0
+    gendisk_tagset[s]    = set_ptr
+    gendisk_qdata[s]     = queuedata
+    gendisk_submit_fn[s] = 0
+    gendisk_priv[s]      = 0
+    gendisk_blkslot[s]   = -1
+    j: uint64 = 0
+    while j < GENDISK_NAME_LEN:
+        gendisk_name[s][j] = 0
+        j = j + 1
     return cast[uint64](&gendisk_storage[s])
 
 
