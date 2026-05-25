@@ -72,10 +72,15 @@
 from linux_abi.exports import _add_export
 from drivers.pci.pci import pci_config_read_dword, pci_config_write_dword
 from drivers.pci.pci import pci_read_bar, pci_pack_bdf
+from drivers.pci.pci import pci_find_capability, pci_msix_table_size, \
+    pci_msix_table_addr, pci_msix_program_vector, pci_msix_enable, \
+    pci_msix_mask_vector, pci_enable_mem_and_master
 from kernel.printk.printk import printk0, printk1, printk2
 from mm.slab import kzalloc, kfree
 from linux_abi.api_netdev import dev_open_registered, \
     linux_tx_bridge_arm, netdev_first_registered
+from linux_abi.api_irq import _l_irq_alloc_msix_vector, \
+    _l_irq_free_msix_vector, MSIX_POOL_BASE_VECTOR, MSIX_POOL_SIZE
 
 
 # --- struct pci_dev field offsets (Linux 6.12 ballpark) -------------
@@ -591,6 +596,283 @@ def _l_pci_program_msi(bdf: uint32, vector: uint32) -> int32:
     return 0
 
 
+# --- Per-device MSI-X vector allocation tracking --------------------
+#
+# pci_alloc_irq_vectors_affinity(pdev, min, max, flags, affd) returns
+# the number of vectors allocated; the driver then calls
+# pci_irq_vector(pdev, n) to translate the n-th vector to a Linux
+# IRQ number it can request_irq against. We back this with a
+# per-device table that records the device pointer plus the list of
+# IDT vectors we allocated for it.
+#
+# 8 devices is enough for the storage + net mix we expect (nvme +
+# ahci + e1000e + r8169 + headroom). Each device has up to
+# MSIX_POOL_SIZE = 16 vectors, matching the pool depth.
+#
+# pdev_msix_dev[i]    : struct pci_dev * (0 == free slot)
+# pdev_msix_count[i]  : number of vectors allocated (0..16)
+# pdev_msix_vecs[i][j]: j-th allocated IDT vector (0x50..0x5F)
+#                       — laid out as a flat 8x16 = 128-entry array
+#                       since Adder doesn't currently parse
+#                       Array[8, Array[16, uint32]] reliably.
+# pdev_msix_table[i]  : cached MSI-X table base address (so free
+#                       can re-mask cleanly without re-walking caps).
+
+MAX_PDEV_MSIX_TRACK: uint64 = 8
+PDEV_MSIX_VEC_STRIDE: uint64 = 16
+
+pdev_msix_dev:   Array[8, uint64]
+pdev_msix_count: Array[8, uint32]
+pdev_msix_vecs:  Array[128, uint32]     # 8 * 16 flat
+pdev_msix_table: Array[8, uint64]
+pdev_msix_cap:   Array[8, uint32]
+
+
+def _l_pdev_msix_find_slot(pdev: uint64) -> int32:
+    if pdev == 0:
+        return -1
+    i: uint64 = 0
+    while i < MAX_PDEV_MSIX_TRACK:
+        if pdev_msix_dev[i] == pdev:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _l_pdev_msix_find_free() -> int32:
+    i: uint64 = 0
+    while i < MAX_PDEV_MSIX_TRACK:
+        if pdev_msix_dev[i] == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _l_pdev_msix_set_vec(slot: uint64, idx: uint64, vector: uint32):
+    pdev_msix_vecs[slot * PDEV_MSIX_VEC_STRIDE + idx] = vector
+
+
+def _l_pdev_msix_get_vec(slot: uint64, idx: uint64) -> uint32:
+    return pdev_msix_vecs[slot * PDEV_MSIX_VEC_STRIDE + idx]
+
+
+def _l_pci_dev_bdf(pdev: uint64) -> uint32:
+    # Compose a packed BDF in Hamnix's format (bus<<16 | dev<<11 |
+    # fn<<8) from the shim pci_dev. Uses the cached bus + the devfn
+    # we populated at _l_pci_alloc_shim_dev time. Matches what
+    # pci_pack_bdf in drivers/pci/pci.ad emits — the existing PCI
+    # capability walkers (pci_find_capability, pci_msix_*) decode
+    # back via pci_bdf_bus / pci_bdf_dev / pci_bdf_fn.
+    bus: uint32 = _pci_dev_bus(pdev)
+    dev: uint32 = _pci_dev_dev(pdev)
+    fn:  uint32 = _pci_dev_fn(pdev)
+    return pci_pack_bdf(bus, dev, fn)
+
+
+def _l_pci_alloc_msix_vectors(pdev: uint64, min_vecs: uint32,
+                               max_vecs: uint32) -> int32:
+    # Walk the device's MSI-X capability, allocate up to max_vecs IDT
+    # vectors from the pool, program the MSI-X table entries to
+    # deliver to LAPIC 0 at the allocated vectors, enable MSI-X, and
+    # return the count actually allocated. Returns negative errno on
+    # failure (specifically -ENOSPC -28 if min_vecs can't be met).
+    #
+    # Pre-conditions: pdev's MEM Space Enable + Bus Master are
+    # asserted (pci_enable_mem_and_master is called inside; idempotent
+    # if a previous pci_enable_device already set them).
+    if pdev == 0:
+        return -22                                # -EINVAL
+    bdf: uint32 = _l_pci_dev_bdf(pdev)
+    cap_off: uint32 = pci_find_capability(bdf, _l_PCI_CAP_ID_MSIX)
+    if cap_off == 0:
+        printk0("[msix] device has no MSI-X capability\n")
+        return -28                                # -ENOSPC
+    # Cap our request at both max_vecs and the device's table size
+    # AND the pool depth. Linux docs let us return any value in
+    # [min_vecs, max_vecs] (caller adapts).
+    tbl_size: uint32 = pci_msix_table_size(bdf, cap_off)
+    want: uint32 = max_vecs
+    if tbl_size < want:
+        want = tbl_size
+    if cast[uint32](MSIX_POOL_SIZE) < want:
+        want = cast[uint32](MSIX_POOL_SIZE)
+    if want < min_vecs:
+        printk2("[msix] device can supply only %d vectors, min=%d\n",
+                cast[uint64](want), cast[uint64](min_vecs))
+        return -28                                # -ENOSPC
+    # Get the table BAR address; bail if BAR resolution failed.
+    pci_enable_mem_and_master(bdf)
+    tbl_addr: uint64 = pci_msix_table_addr(bdf, cap_off)
+    if tbl_addr == 0:
+        printk0("[msix] table BAR unresolved (BAR base=0)\n")
+        return -22
+    # Reserve a tracking slot for this pdev.
+    slot: int32 = _l_pdev_msix_find_slot(pdev)
+    if slot < 0:
+        slot = _l_pdev_msix_find_free()
+    if slot < 0:
+        printk0("[msix] per-device tracking table full (8 / 8)\n")
+        return -12                                # -ENOMEM
+    s: uint64 = cast[uint64](slot)
+    pdev_msix_dev[s]   = pdev
+    pdev_msix_table[s] = tbl_addr
+    pdev_msix_cap[s]   = cap_off
+    # Allocate `want` vectors from the pool. If any allocation fails
+    # we back out the ones we've already taken so the pool is
+    # consistent on the -ENOSPC return.
+    got: uint32 = 0
+    while got < want:
+        v: int32 = _l_irq_alloc_msix_vector(pdev_msix_dev[s])
+        if v < 0:
+            # Back out everything we've already taken.
+            j: uint64 = 0
+            while j < cast[uint64](got):
+                _l_irq_free_msix_vector(_l_pdev_msix_get_vec(s, j))
+                _l_pdev_msix_set_vec(s, j, 0)
+                j = j + 1
+            pdev_msix_dev[s]   = 0
+            pdev_msix_count[s] = 0
+            pdev_msix_table[s] = 0
+            pdev_msix_cap[s]   = 0
+            return -28
+        _l_pdev_msix_set_vec(s, cast[uint64](got), cast[uint32](v))
+        # Program MSI-X table entry `got` to deliver `v` to LAPIC 0.
+        # pci_msix_program_vector writes address_lo / address_hi /
+        # data / vector_control (unmasks).
+        pci_msix_program_vector(tbl_addr, got, cast[uint32](v), 0)
+        got = got + 1
+    pdev_msix_count[s] = got
+    # Flip the MSI-X enable bit + clear function mask. After this
+    # point any cause the driver-unmasks in the device's per-cause
+    # register fires an MSI-X message.
+    pci_msix_enable(bdf, cap_off)
+    printk2("[msix] pdev=%p allocated %d vectors\n",
+            pdev, cast[uint64](got))
+    return cast[int32](got)
+
+
+def _l_pci_alloc_irq_vectors_real(pdev: uint64, min_vecs: uint32,
+                                    max_vecs: uint32, flags: uint32) -> int32:
+    # int pci_alloc_irq_vectors(struct pci_dev *, unsigned int,
+    #                            unsigned int, unsigned int);
+    # flags is a bitmask of PCI_IRQ_LEGACY|MSI|MSIX|ALL_TYPES. We try
+    # MSI-X first when allowed; future work could fall back to MSI /
+    # legacy here. For min_vecs==1 with MSI-X absent we return 1
+    # (the legacy INTx fallback all our shims previously returned).
+    if pdev == 0:
+        return -22
+    # PCI_IRQ_MSIX = 0x4 in include/linux/pci.h. flags == 0 (or
+    # PCI_IRQ_ALL_TYPES = 0xF) implies MSI-X is permitted.
+    msix_ok: int32 = 0
+    if flags == 0:
+        msix_ok = 1
+    if (flags & 0x4) != 0:
+        msix_ok = 1
+    if (flags & 0xF) == 0xF:
+        msix_ok = 1
+    if msix_ok != 0:
+        rc: int32 = _l_pci_alloc_msix_vectors(pdev, min_vecs, max_vecs)
+        if rc > 0:
+            return rc
+        # MSI-X unavailable; fall through to legacy fallback if the
+        # caller's min_vecs permits.
+    # Legacy / no-MSI-X fallback: emulate the historical 1-vector
+    # behaviour (which works for INTx + single-MSI devices like
+    # ahci). We don't claim an IDT vector here because the legacy
+    # path is consumed via pdev->irq (already set up at
+    # _l_pci_alloc_shim_dev time).
+    if min_vecs > 1:
+        return -28
+    return 1
+
+
+def _l_pci_alloc_irq_vectors_affinity_real(pdev: uint64, min_vecs: uint32,
+                                              max_vecs: uint32, flags: uint32,
+                                              affd: uint64) -> int32:
+    # The affinity-aware variant. We ignore the irq_affinity hint —
+    # uniprocessor box, all vectors land on LAPIC 0 by definition.
+    return _l_pci_alloc_irq_vectors_real(pdev, min_vecs, max_vecs, flags)
+
+
+def _l_pci_irq_vector_real(pdev: uint64, nr: uint32) -> int32:
+    # int pci_irq_vector(struct pci_dev *, unsigned int nr);
+    # Returns the IDT vector for the n-th allocated MSI-X entry, or
+    # the legacy pdev->irq if MSI-X wasn't allocated for this pdev.
+    # Linux drivers use this return value as the irq number for
+    # request_irq / request_threaded_irq.
+    if pdev == 0:
+        return -22
+    slot: int32 = _l_pdev_msix_find_slot(pdev)
+    if slot >= 0:
+        s: uint64 = cast[uint64](slot)
+        if nr < pdev_msix_count[s]:
+            return cast[int32](_l_pdev_msix_get_vec(s, cast[uint64](nr)))
+        return -22
+    # No MSI-X allocation for this pdev — return pdev->irq (which
+    # _l_pci_alloc_shim_dev seeded with 0x47 for the e1000e single-
+    # vector path; ahci / r8169 also use it as their INTx vector).
+    irq_p: Ptr[uint32] = cast[Ptr[uint32]](pdev + SHIM_PCI_DEV_IRQ_OFF)
+    return cast[int32](irq_p[0])
+
+
+def _l_pci_msix_cap_disable(bdf: uint32, cap_off: uint32):
+    # Clear the MSI-X Enable bit + assert the Function Mask. The
+    # device-wide MSI-X capability returns to its post-reset state
+    # (no MSI messages emitted). Used by free_irq_vectors so a
+    # smoke-test (or a Linux .ko's module-remove) leaves the device
+    # ready to be probed/enabled again from scratch.
+    bus: uint32 = (bdf >> 16) & 0xFF
+    devnr: uint32 = (bdf >> 11) & 0x1F
+    fn: uint32 = (bdf >> 8) & 0x7
+    dword_off: uint32 = (cap_off + 2) & 0xFC      # Message Control
+    dword: uint32 = pci_config_read_dword(bus, devnr, fn, dword_off)
+    ctrl: uint32 = (dword >> 16) & 0xFFFF
+    # Clear MSIX_CTRL_ENABLE (bit 15 = 0x8000), set function mask
+    # (bit 14 = 0x4000) for good measure so any in-flight delivery
+    # is suppressed during teardown.
+    ctrl = ctrl & (~cast[uint32](0x8000))
+    ctrl = ctrl | 0x4000
+    dword = (dword & 0x0000FFFF) | ((ctrl & 0xFFFF) << 16)
+    pci_config_write_dword(bus, devnr, fn, dword_off, dword)
+
+
+def _l_pci_free_irq_vectors_real(pdev: uint64):
+    # void pci_free_irq_vectors(struct pci_dev *);
+    # Release every vector we allocated for this pdev. After the
+    # last vector is released we also clear the MSI-X Enable bit
+    # on the device — otherwise a later re-probe (or a Linux .ko
+    # taking over after a smoke test) sees a half-enabled MSI-X
+    # state and mis-handles its own bring-up. Mirrors what Linux's
+    # __pci_disable_msix does on the module-remove path.
+    if pdev == 0:
+        return
+    slot: int32 = _l_pdev_msix_find_slot(pdev)
+    if slot < 0:
+        return
+    s: uint64 = cast[uint64](slot)
+    tbl_addr: uint64 = pdev_msix_table[s]
+    cap_off: uint32 = pdev_msix_cap[s]
+    count: uint32 = pdev_msix_count[s]
+    i: uint32 = 0
+    while i < count:
+        v: uint32 = _l_pdev_msix_get_vec(s, cast[uint64](i))
+        if tbl_addr != 0:
+            pci_msix_mask_vector(tbl_addr, i)
+        _l_irq_free_msix_vector(v)
+        _l_pdev_msix_set_vec(s, cast[uint64](i), 0)
+        i = i + 1
+    # Disable the MSI-X capability on the device so the next
+    # consumer (a Linux .ko's probe, a re-allocation, etc.) starts
+    # from a clean post-reset MSI-X state.
+    if cap_off != 0:
+        bdf: uint32 = _l_pci_dev_bdf(pdev)
+        _l_pci_msix_cap_disable(bdf, cap_off)
+    pdev_msix_dev[s]   = 0
+    pdev_msix_count[s] = 0
+    pdev_msix_table[s] = 0
+    pdev_msix_cap[s]   = 0
+
+
 def _l_pci_walk_and_match(drv: uint64):
     # Walk PCI bus 0 (Hamnix's pci_scan only enumerates bus 0; multi-
     # bus support needs bridge-secondary-bus reads we don't have).
@@ -1004,3 +1286,25 @@ def linux_abi_register_pci():
                 cast[uint64](&_l_pci_iomap))
     _add_export("pci_iounmap",
                 cast[uint64](&_l_pci_iounmap))
+
+    # MSI-X vector allocation (the real, multi-vector implementation).
+    # These ship from api_pci.ad — which registers BEFORE api_l61,
+    # api_e1000e, api_ahci, api_r8169 — so the linear-scan export
+    # lookup picks the real impl over the stubs each per-driver shim
+    # file ships. The duplicate _add_export entries downstream are
+    # silently shadowed by the linear scan (first-match wins, see
+    # linux_abi_lookup in exports.ad). Symbols covered:
+    #   * pci_alloc_irq_vectors / pci_alloc_irq_vectors_affinity:
+    #     walks the device's MSI-X cap, allocates N IDT vectors from
+    #     the api_irq.ad pool, programs the table entries.
+    #   * pci_irq_vector: returns the n-th allocated IDT vector.
+    #   * pci_free_irq_vectors: re-masks each MSI-X entry and
+    #     releases vectors back to the pool.
+    _add_export("pci_alloc_irq_vectors",
+                cast[uint64](&_l_pci_alloc_irq_vectors_real))
+    _add_export("pci_alloc_irq_vectors_affinity",
+                cast[uint64](&_l_pci_alloc_irq_vectors_affinity_real))
+    _add_export("pci_irq_vector",
+                cast[uint64](&_l_pci_irq_vector_real))
+    _add_export("pci_free_irq_vectors",
+                cast[uint64](&_l_pci_free_irq_vectors_real))

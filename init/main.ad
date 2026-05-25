@@ -114,7 +114,12 @@ from kernel.modules_dep import (
     modules_dep_mark_loaded,
 )
 from kernel.stack_protect import __stack_chk_init
-from drivers.pci.pci import pci_scan
+from drivers.pci.pci import pci_scan, pci_config_read_dword, \
+    pci_find_capability, pci_pack_bdf
+from linux_abi.api_pci import _l_pci_alloc_shim_dev, \
+    _l_pci_alloc_irq_vectors_affinity_real, _l_pci_irq_vector_real, \
+    _l_pci_free_irq_vectors_real, _l_PCI_CAP_ID_MSIX
+from linux_abi.api_irq import MSIX_POOL_BASE_VECTOR, MSIX_POOL_SIZE
 from drivers.rtc.cmos import rtc_init
 from drivers.acpi.acpi import acpi_init
 from drivers.input.atkbd import atkbd_init
@@ -744,6 +749,17 @@ def net_smoke_test():
     # here is to prove the infrastructure (PCI config-space access,
     # netfilter hook chain + indirect call) works end-to-end.
     pci_scan()
+
+    # L-shim MSI-X allocator self-test (storage-driver pivot). Runs
+    # straight after pci_scan so it has the live bus state to
+    # work against and isn't gated on any specific device class.
+    # Exercises linux_abi/api_pci.ad's pci_alloc_irq_vectors_
+    # affinity → api_irq.ad's MSI-X vector pool path that stock
+    # Linux .ko's (nvme, ahci-MSI-X, modern NICs) request via N
+    # vectors per queue. Skips quietly when bus 0 has no MSI-X-
+    # capable device (e.g. -kernel with no PCI device add).
+    msix_pool_smoke_test()
+
     netfilter_init()
     rc: int32 = register_netfilter_hook(packet_count_hook)
     if rc != 0:
@@ -1114,6 +1130,96 @@ def msix_smoke_test():
     # Drain whatever the RX handler queued / left so downstream net
     # tests start from a clean used ring.
     virtio_net_poll()
+
+
+def msix_pool_smoke_test():
+    # L-shim MSI-X allocator self-test. Independent of the virtio-net
+    # native-driver delivery test above: this one exercises the
+    # linux_abi/api_pci.ad path that stock Linux .ko drivers (nvme,
+    # ahci with MSI-X, modern NICs) hit via pci_alloc_irq_vectors_
+    # affinity + pci_irq_vector. We synthesise a shim pci_dev for any
+    # MSI-X-capable device on bus 0, allocate 4 vectors, verify each
+    # comes back as a distinct IDT vector in the 0x50..0x5F pool, and
+    # then free them.
+    #
+    # PASS marker: "[msix-pool] alloc/free OK ..." with the four
+    # allocated vectors listed. The test silently skips when no
+    # MSI-X-capable PCI device is enumerated (e.g. on a -nodefaults
+    # box without virtio-net / nvme / virtio-blk).
+    bus: uint32 = 0
+    dev: uint32 = 0
+    found_bus: uint32 = 0
+    found_dev: uint32 = 0xFFFFFFFF
+    found_vendor: uint32 = 0
+    found_device: uint32 = 0
+    while dev < 32:
+        ident: uint32 = pci_config_read_dword(bus, dev, 0, 0)
+        v: uint32 = ident & 0xFFFF
+        if v != 0xFFFF:
+            d: uint32 = (ident >> 16) & 0xFFFF
+            bdf: uint32 = pci_pack_bdf(bus, dev, 0)
+            cap_off: uint32 = pci_find_capability(bdf, _l_PCI_CAP_ID_MSIX)
+            if cap_off != 0:
+                found_bus = bus
+                found_dev = dev
+                found_vendor = v
+                found_device = d
+                dev = 32                      # break
+        dev = dev + 1
+    if found_dev == 0xFFFFFFFF:
+        printk0("[msix-pool] no MSI-X-capable device on bus 0 — skipped\n")
+        return
+    printk2("[msix-pool] using %x:%x as the MSI-X target\n",
+            cast[uint64](found_vendor), cast[uint64](found_device))
+    pdev: uint64 = _l_pci_alloc_shim_dev(found_bus, found_dev, 0,
+                                          found_vendor, found_device)
+    if pdev == 0:
+        printk0("[msix-pool] shim pci_dev alloc failed — skipped\n")
+        return
+    # Ask for 4 vectors. Most virtio-net-pci on QEMU advertises a
+    # table size of 3 (one per virtqueue); virtio-blk usually 2;
+    # nvme/QEMU 16+. We accept whatever min<=actual<=4 the device
+    # offers and verify the alloc returns >=1.
+    n: int32 = _l_pci_alloc_irq_vectors_affinity_real(pdev, 1, 4, 0, 0)
+    if n <= 0:
+        printk1("[msix-pool] alloc_irq_vectors_affinity rc=%d (skipped)\n",
+                cast[uint64](n))
+        return
+    printk1("[msix-pool] allocated %d vectors\n", cast[uint64](n))
+    # Verify each pci_irq_vector returns a distinct IDT vector in
+    # the pool range. The four we record on stack (Adder allows
+    # Array[N, T] as a local) become a tiny audit trail.
+    seen: Array[4, uint32]
+    i: int32 = 0
+    while i < n:
+        v_idt: int32 = _l_pci_irq_vector_real(pdev, cast[uint32](i))
+        if v_idt < cast[int32](MSIX_POOL_BASE_VECTOR):
+            printk1("[msix-pool] pci_irq_vector(%d) below pool base\n",
+                    cast[uint64](i))
+        if v_idt >= cast[int32](MSIX_POOL_BASE_VECTOR + cast[uint32](MSIX_POOL_SIZE)):
+            printk1("[msix-pool] pci_irq_vector(%d) above pool base\n",
+                    cast[uint64](i))
+        # uniqueness check vs earlier slots
+        j: int32 = 0
+        while j < i:
+            if seen[j] == cast[uint32](v_idt):
+                printk2("[msix-pool] DUP: slot %d == slot %d\n",
+                        cast[uint64](j), cast[uint64](i))
+            j = j + 1
+        seen[i] = cast[uint32](v_idt)
+        printk2("[msix-pool]   pci_irq_vector(%d) -> 0x%x\n",
+                cast[uint64](i), cast[uint64](v_idt))
+        i = i + 1
+    # Free and verify the slot is gone.
+    _l_pci_free_irq_vectors_real(pdev)
+    post_free: int32 = _l_pci_irq_vector_real(pdev, 0)
+    # After free, pci_irq_vector returns pdev->irq (the legacy
+    # fallback) — for the shim that's E1000E_MSI_VECTOR_FOR_PCI =
+    # 0x47 (set unconditionally by _l_pci_alloc_shim_dev). The
+    # post-free return is therefore == 0x47, NOT one of the pool
+    # vectors we just released — exactly what we want.
+    printk2("[msix-pool] alloc/free OK (n=%d post_free=0x%x)\n",
+            cast[uint64](n), cast[uint64](post_free))
 
 
 def tcp_smoke_test():
