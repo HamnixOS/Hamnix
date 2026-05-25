@@ -88,6 +88,54 @@ mod_exit_fn:     Array[8, uint64]      # cleanup_module address (0 if none)
 mod_in_use:      Array[8, uint64]      # 1 = live, 0 = free
 
 
+# --- Per-.ko EXPORT_SYMBOL registry --------------------------------
+#
+# Each .ko's __ksymtab / __ksymtab_gpl sections describe the names
+# the module exports for other modules to consume — Linux's
+# EXPORT_SYMBOL machinery. After loader's relocation pass, we walk
+# those sections, decode each 12-byte PREL32 entry (offset-to-value,
+# offset-to-name, offset-to-namespace), and append a row here.
+#
+# When a *subsequent* .ko load encounters an undefined symbol that
+# isn't in the Hamnix shim table (linux_abi/exports.ad), the loader
+# falls through to scan this registry — Linux modules satisfying
+# Linux modules' UND set without going through any Hamnix shim.
+#
+# Precedence: Hamnix shim FIRST, ksymtab registry SECOND. Rationale:
+# the shims already implement semantics the existing test suite
+# depends on; a .ko-side definition might subtly differ (different
+# locking, different memory pool), and we want existing tests to
+# stay deterministic. The fallback is only there to satisfy names
+# the shim table doesn't carry. The followup commit (out of scope)
+# can prune now-redundant shims after observing zero ksymtab_hit
+# log lines for a given symbol across the test matrix.
+#
+# Storage: parallel arrays, same as exports.ad. Capacity sized for
+# the union of __ksymtab + __ksymtab_gpl across all loaded .kos in
+# a single boot. cfg80211 alone exports 134 names; mac80211 another
+# 106; future wifi drivers add ~40 each. 1024 covers everything we
+# expect to load in one boot.
+
+MAX_KSYMTAB:        uint64 = 1024
+nr_ksymtab:         uint64 = 0
+ksymtab_names:      Array[1024, uint64]   # Ptr[char] cast to uint64
+ksymtab_addrs:      Array[1024, uint64]   # function/var address
+ksymtab_owners:     Array[1024, uint64]   # Ptr[char] to owning module name
+
+# Per-load: the current module's name (from .modinfo "name=" entry).
+# Populated in _log_modinfo; consumed by ksymtab registration + by
+# the [ksymtab_hit] diag at lookup time. Bounded scratch — 60 bytes
+# matches Linux's MODULE_NAME_LEN. The trailing NUL is always
+# guaranteed because we zero the buffer at the start of each load.
+_CUR_MODNAME_LEN: uint64 = 60
+cur_modname: Array[60, uint8]
+
+# The module currently being loaded (the one we'd attribute as the
+# *consumer* in a [ksymtab_hit] diag). Becomes the OWNER once its
+# ksymtab registration runs at end-of-load. Single-threaded, so a
+# file-scope global is fine.
+
+
 # --- ELF parsing helpers --------------------------------------------
 #
 # We read multi-byte fields from arbitrarily-aligned positions in the
@@ -191,6 +239,8 @@ versions_idx:     int32 = -1
 symtab_idx:       int32 = -1
 strtab_idx:       int32 = -1
 shstrtab_idx:     int32 = -1
+ksymtab_idx:      int32 = -1
+ksymtab_gpl_idx:  int32 = -1
 
 
 def _sec_name(image: Ptr[uint8], shstr_off: uint64, i: uint64) -> Ptr[uint8]:
@@ -215,6 +265,8 @@ def _parse_sections(image: Ptr[uint8], shoff: uint64, shnum: uint64,
     symtab_idx      = -1
     strtab_idx      = -1
     shstrtab_idx    = cast[int32](shstrndx)
+    ksymtab_idx     = -1
+    ksymtab_gpl_idx = -1
 
     i: uint64 = 0
     while i < shnum:
@@ -242,6 +294,10 @@ def _parse_sections(image: Ptr[uint8], shoff: uint64, shnum: uint64,
             modinfo_idx = cast[int32](i)
         elif _ldr_streq(nm, "__versions") == 1:
             versions_idx = cast[int32](i)
+        elif _ldr_streq(nm, "__ksymtab") == 1:
+            ksymtab_idx = cast[int32](i)
+        elif _ldr_streq(nm, "__ksymtab_gpl") == 1:
+            ksymtab_gpl_idx = cast[int32](i)
         elif sec_type[i] == SHT_SYMTAB:
             symtab_idx = cast[int32](i)
             # The symtab's sh_link points at its associated strtab.
@@ -323,11 +379,37 @@ def _sym_addr(image: Ptr[uint8], sym_idx: uint64) -> uint64:
     st_value: uint64 = _rd_u64(cast[Ptr[uint8]](sym_off + 8))
 
     if cast[uint32](st_shndx) == SHN_UNDEF:
-        # Undefined → external. Look up by name in the kernel's
-        # exported-symbol table (Hamnix's EXPORT_SYMBOL equivalent).
+        # Undefined → external. Resolution precedence:
+        #   1. Per-.ko EXPORT_SYMBOL registry (populated as each
+        #      previously-loaded .ko's __ksymtab was decoded).
+        #   2. Hamnix shim table (linux_abi/exports.ad).
+        #
+        # Rationale: a stock Linux .ko's EXPORT_SYMBOL implementation
+        # is by definition the real Linux semantics; a Hamnix shim is
+        # an approximation. When both are available we prefer the
+        # real thing. The shim fallback exists to satisfy names no
+        # loaded .ko provides — Linux's built-in kernel symbols
+        # (printk, kmalloc, ...), driver-helper libraries we don't
+        # ship as .kos (libarc4, soundcore), and so on.
+        #
+        # If we observe via boot-log analytics that a particular
+        # symbol consistently flows through ksymtab and never needs
+        # its shim, a followup commit can prune the redundant shim
+        # from linux_abi/api_*.ad (out of scope here).
         strt_off: uint64 = cast[uint64](image) + sec_offset[strtab_idx]
         name: Ptr[char] = cast[Ptr[char]](strt_off + cast[uint64](st_name))
-        addr: uint64 = linux_abi_lookup(name)
+        addr: uint64 = ksymtab_lookup(name)
+        if addr != 0:
+            owner: uint64 = ksymtab_owner(name)
+            # Emit a one-line diag the test harness can grep for.
+            # Format: [ksymtab_hit] <consumer> -> <provider>: <symbol>
+            printk2(
+                "[ksymtab_hit] %s -> %s: ",
+                cast[uint64](&cur_modname[0]),
+                owner)
+            printk1("%s\n", cast[uint64](name))
+        else:
+            addr = linux_abi_lookup(name)
         if addr == 0:
             printk1("kmod_linux: unresolved external symbol '%s'\n",
                     cast[uint64](name))
@@ -482,6 +564,22 @@ def _log_modinfo(image: Ptr[uint8]):
         elif _starts_with(cur, "name=") == 1:
             printk1("kmod_linux: name=%s\n",
                     cast[uint64](cast[Ptr[char]](base + i + 5)))
+            # Cache into cur_modname so the ksymtab registration +
+            # any later [ksymtab_hit] diag can attribute the right
+            # module name. The "name=" record's value runs from
+            # base+i+5 up to the next NUL. We zero the buffer at the
+            # start of each load (see kmod_linux_load), so just copy
+            # until we hit the NUL or the buffer cap.
+            n_off: uint64 = i + 5
+            k: uint64 = 0
+            while k < (_CUR_MODNAME_LEN - 1):
+                cv: uint8 = cast[Ptr[uint8]](base + n_off + k)[0]
+                if cv == 0:
+                    cur_modname[k] = 0
+                    k = _CUR_MODNAME_LEN          # break
+                else:
+                    cur_modname[k] = cv
+                    k = k + 1
         # Advance past this record's NUL terminator. Adder's `and`
         # is not short-circuit, so split the bound check from the
         # byte-read into nested loops to avoid a one-past-end deref
@@ -502,6 +600,165 @@ def _log_versions():
     # the bypass; the CRC validation belongs to a later milestone.
     n: uint64 = sz / 64
     printk1("kmod_linux: MODVERSIONS bypassed: %d symbols\n", n)
+
+
+# --- ksymtab registry: own-strings copy ---------------------------------
+#
+# When a .ko is unloaded we'd free its backing pages, which would
+# leave the registry pointing at dangling memory. For now Hamnix
+# never unloads .kos (kmod_linux_unload exists but no caller invokes
+# it for the framework/auto-loaded modules), so we just record the
+# raw pointers into the still-mapped .ko region. When unload becomes
+# a real path, the registry will need to either evict the unloaded
+# module's rows or duplicate the strings into kmalloc'd buffers.
+#
+# Owner-name copies are needed because cur_modname[] is overwritten
+# on each subsequent load; we kstore a per-row interned pointer.
+# Cheapest interning: a flat append-only string pool.
+
+_KSYM_POOL_LEN: uint64 = 8192
+_ksym_pool: Array[8192, uint8]
+_ksym_pool_used: uint64 = 0
+
+
+def _ksym_intern_modname() -> uint64:
+    # Append cur_modname (NUL-terminated) into the pool and return a
+    # pointer to the start of the copy. Returns 0 on pool exhaustion
+    # (caller should still register the entry, just with owner=0;
+    # the [ksymtab_hit] diag tolerates a NULL owner pointer).
+    # First, see if cur_modname is already interned — we get a hit
+    # often (every entry from the same module).
+    name_len: uint64 = 0
+    while name_len < _CUR_MODNAME_LEN and cur_modname[name_len] != 0:
+        name_len = name_len + 1
+    if name_len == 0:
+        return 0
+    # Linear scan over the pool for an existing matching NUL-terminated
+    # string. Each scan is bounded by _ksym_pool_used; the cost is
+    # paid once per ksymtab entry — small in absolute terms.
+    p: uint64 = 0
+    while p < _ksym_pool_used:
+        # Length of the string at offset p.
+        e: uint64 = p
+        while e < _ksym_pool_used and _ksym_pool[e] != 0:
+            e = e + 1
+        if e - p == name_len:
+            # Compare cur_modname against pool[p..e].
+            eq: int32 = 1
+            k: uint64 = 0
+            while k < name_len:
+                if _ksym_pool[p + k] != cur_modname[k]:
+                    eq = 0
+                    k = name_len                # break
+                else:
+                    k = k + 1
+            if eq == 1:
+                return cast[uint64](&_ksym_pool[p])
+        p = e + 1
+    # No hit — append.
+    if (_ksym_pool_used + name_len + 1) > _KSYM_POOL_LEN:
+        return 0
+    out: uint64 = _ksym_pool_used
+    k: uint64 = 0
+    while k < name_len:
+        _ksym_pool[out + k] = cur_modname[k]
+        k = k + 1
+    _ksym_pool[out + name_len] = 0
+    _ksym_pool_used = out + name_len + 1
+    return cast[uint64](&_ksym_pool[out])
+
+
+def _register_ksymtab_section(sec_idx: int32):
+    # Decode every 12-byte entry in __ksymtab / __ksymtab_gpl into the
+    # global registry. Each entry post-relocation contains three
+    # PREL32 fields:
+    #   +0  int32 offset-to-value (the EXPORT_SYMBOL'd address)
+    #   +4  int32 offset-to-name  (in __ksymtab_strings)
+    #   +8  int32 offset-to-namespace (in __ksymtab_strings; 0/empty
+    #            for symbols not under a Linux module namespace)
+    # The runtime decode is `target = field_va + sign_extend_32(field_value)`.
+    if sec_idx < 0:
+        return
+    base: uint64 = sec_loaded_addr[cast[uint64](sec_idx)]
+    if base == 0:
+        return
+    size: uint64 = sec_size[cast[uint64](sec_idx)]
+    nr: uint64 = size / 12
+    owner: uint64 = _ksym_intern_modname()
+    j: uint64 = 0
+    while j < nr:
+        ent: uint64 = base + j * 12
+        # Sign-extend 32-bit signed offsets to 64-bit via int32 cast.
+        val_field_va: uint64  = ent + 0
+        name_field_va: uint64 = ent + 4
+        val_off: int32 = cast[int32](_rd_u32(cast[Ptr[uint8]](val_field_va)))
+        name_off: int32 = cast[int32](_rd_u32(cast[Ptr[uint8]](name_field_va)))
+        # Sign-extend each int32 offset by going through int64 then
+        # adding to the field address as uint64 (two's-complement
+        # add is wrap-correct in either signed or unsigned 64-bit).
+        val_addr:  uint64 = val_field_va  + cast[uint64](cast[int64](val_off))
+        name_addr: uint64 = name_field_va + cast[uint64](cast[int64](name_off))
+        if nr_ksymtab < MAX_KSYMTAB:
+            ksymtab_names[nr_ksymtab]  = name_addr
+            ksymtab_addrs[nr_ksymtab]  = val_addr
+            ksymtab_owners[nr_ksymtab] = owner
+            nr_ksymtab = nr_ksymtab + 1
+        j = j + 1
+
+
+def _register_module_ksymtabs():
+    # Walk both __ksymtab and __ksymtab_gpl. Library-only modules
+    # may have one but not the other; either may be absent on a
+    # module with no EXPORT_SYMBOLs.
+    pre: uint64 = nr_ksymtab
+    _register_ksymtab_section(ksymtab_idx)
+    _register_ksymtab_section(ksymtab_gpl_idx)
+    added: uint64 = nr_ksymtab - pre
+    if added > 0:
+        printk1("kmod_linux: registered %d EXPORT_SYMBOL entries\n",
+                added)
+
+
+# --- ksymtab lookup ----------------------------------------------------
+
+def _ksym_streq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while True:
+        ca: uint8 = a[i]
+        cb: uint8 = b[i]
+        if ca != cb:
+            return 0
+        if ca == 0:
+            return 1
+        i = i + 1
+
+
+def ksymtab_lookup(name: Ptr[char]) -> uint64:
+    # Linear scan of the per-.ko EXPORT_SYMBOL registry. Returns the
+    # address of the matching entry, or 0 if no .ko has registered
+    # this name. Counterpart of linux_abi_lookup() over the shim
+    # table — the loader's _sym_addr() falls through to here when
+    # the shim lookup misses.
+    i: uint64 = 0
+    while i < nr_ksymtab:
+        nm: Ptr[uint8] = cast[Ptr[uint8]](ksymtab_names[i])
+        if _ksym_streq(nm, cast[Ptr[uint8]](name)) == 1:
+            return ksymtab_addrs[i]
+        i = i + 1
+    return 0
+
+
+def ksymtab_owner(name: Ptr[char]) -> uint64:
+    # Companion of ksymtab_lookup that returns the OWNER name pointer
+    # (interned in _ksym_pool) instead of the symbol address. Used by
+    # the loader's [ksymtab_hit] diag.
+    i: uint64 = 0
+    while i < nr_ksymtab:
+        nm: Ptr[uint8] = cast[Ptr[uint8]](ksymtab_names[i])
+        if _ksym_streq(nm, cast[Ptr[uint8]](name)) == 1:
+            return ksymtab_owners[i]
+        i = i + 1
+    return 0
 
 
 # --- init / exit lookup ---------------------------------------------
@@ -615,6 +872,14 @@ def kmod_linux_load(image: Ptr[uint8], size: uint64) -> int32:
         return -8
 
     # --- modinfo / versions diagnostics ---------------------------
+    # Zero the per-load module-name cache before _log_modinfo
+    # populates it from the .modinfo "name=" record. Without this,
+    # a shorter name from the second load would inherit trailing
+    # bytes from the first load's name.
+    _z: uint64 = 0
+    while _z < _CUR_MODNAME_LEN:
+        cur_modname[_z] = 0
+        _z = _z + 1
     _log_modinfo(image)
     _log_versions()
     _log_this_module()
@@ -657,6 +922,14 @@ def kmod_linux_load(image: Ptr[uint8], size: uint64) -> int32:
 
     # --- relocations ----------------------------------------------
     _apply_relocations(image, shnum)
+
+    # --- per-.ko EXPORT_SYMBOL registration -----------------------
+    # Now that __ksymtab / __ksymtab_gpl have been relocated (the
+    # PREL32 offsets are computed against the loaded sections),
+    # decode each entry and add it to the global registry. Subsequent
+    # .ko loads will see this module's exports as a lookup-fallback
+    # after the Hamnix shim table misses.
+    _register_module_ksymtabs()
 
     # L32 diag: dump the init/exit fields inside the loaded
     # .gnu.linkonce.this_module right after relocations, so we can

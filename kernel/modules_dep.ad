@@ -1,0 +1,372 @@
+# kernel/modules_dep.ad
+#
+# Linux-shape modules.dep parser + dependency-aware module loader.
+#
+# Each line in /lib/modules/modules.dep is:
+#
+#     <module>: <dep1> <dep2> ...
+#
+# (One module per line; an empty dep list is allowed and means "no
+# direct deps".) Lines starting with '#' are comments; blank lines
+# are skipped.
+#
+# Public entry points:
+#
+#   modules_dep_init()
+#       Idempotently load /lib/modules/modules.dep from the initramfs
+#       into an in-memory pointer + size pair. Subsequent lookups walk
+#       this blob directly — no per-call file lookups.
+#
+#   modules_dep_load_with_deps(name, name_len) -> int32
+#       Load `name`'s declared deps first (recursively, in left-to-
+#       right order), then load `name` itself via kmod_linux_load.
+#       Returns: 1 on success (any module that wasn't already loaded
+#       was successfully loaded), 0 on partial / no-op (e.g. table
+#       not present), -1 on hard failure of the target module.
+#
+# A dep entry that has no .ko in the initramfs is logged and skipped.
+# That matches Linux's modprobe --ignore-missing semantics in spirit:
+# small library deps like "libarc4" are satisfied by the Hamnix shim
+# table (linux_abi/exports.ad), so the lookup falls through to the
+# shim path naturally — we don't need a separate .ko for them.
+#
+# Module-name normalization: Linux's depmod uses underscores; modinfo
+# may print either underscores or dashes. We normalize '-' to '_' for
+# comparison (both `mac80211: cfg80211 libarc4` and
+# `mac_80211: cfg-80211 libarc4` would match the same `mac80211`
+# request — this matches Linux's `request_module` behavior).
+
+from kernel.printk.printk import printk0, printk1, printk2
+from fs.cpio import (
+    cpio_init,
+    initramfs_entry_count, initramfs_entry_name,
+    initramfs_entry_data, initramfs_entry_size,
+)
+from linux_abi.loader import kmod_linux_load
+
+
+# --- module-name normalization ---------------------------------------
+
+def _md_norm(c: uint8) -> uint8:
+    # '-' (0x2D) -> '_' (0x5F). Case-sensitive otherwise.
+    if c == 45:
+        return 95
+    return c
+
+
+def _md_name_eq(a: Ptr[uint8], a_len: uint64,
+                b: Ptr[uint8], b_len: uint64) -> int32:
+    if a_len != b_len:
+        return 0
+    i: uint64 = 0
+    while i < a_len:
+        if _md_norm(a[i]) != _md_norm(b[i]):
+            return 0
+        i = i + 1
+    return 1
+
+
+# --- modules.dep blob state ------------------------------------------
+#
+# Loaded once at first use. We keep the blob pointer + size and walk
+# it on every query. Lookups are O(table_size) per call, but the
+# table is tiny (~600 bytes for 17 modules) and lookups are rare
+# (only at module-load time), so a hash isn't worth it.
+
+_md_blob: uint64 = 0
+_md_size: uint64 = 0
+_md_inited: int32 = 0
+
+
+def _md_find_initramfs_entry(target: Ptr[uint8],
+                             target_len: uint64) -> int64:
+    # Mirror of kernel/modprobe.ad's _find_initramfs_entry; the
+    # function-local copy keeps modules_dep self-contained.
+    count: uint64 = initramfs_entry_count()
+    i: uint64 = 0
+    while i < count:
+        nm: Ptr[char] = initramfs_entry_name(i)
+        np: Ptr[uint8] = cast[Ptr[uint8]](nm)
+        ok: int32 = 1
+        j: uint64 = 0
+        while j < target_len:
+            if np[j] != target[j]:
+                ok = 0
+                j = target_len
+            else:
+                j = j + 1
+        if ok == 1 and np[target_len] == 0:
+            return cast[int64](i)
+        i = i + 1
+    return -1
+
+
+def modules_dep_init():
+    # Idempotent. Looks up /lib/modules/modules.dep in the initramfs
+    # and caches the (ptr, size) pair. If the file is absent, the
+    # state stays at (0, 0) and modules_dep_load_with_deps() returns
+    # a "no table" result.
+    if _md_inited == 1:
+        return
+    _md_inited = 1
+    cpio_init()                                  # idempotent
+    target: Ptr[uint8] = "/lib/modules/modules.dep"
+    target_len: uint64 = 25
+    idx: int64 = _md_find_initramfs_entry(target, target_len)
+    if idx < 0:
+        printk0("[modules_dep] /lib/modules/modules.dep not in initramfs\n")
+        _md_blob = 0
+        _md_size = 0
+        return
+    _md_blob = cast[uint64](initramfs_entry_data(cast[uint64](idx)))
+    _md_size = initramfs_entry_size(cast[uint64](idx))
+    printk1("[modules_dep] table loaded: %d bytes\n", _md_size)
+
+
+# --- text-blob walkers -----------------------------------------------
+#
+# The blob is a flat NL-separated text region. We scan once per query.
+
+def _md_line_end(blob: Ptr[uint8], start: uint64, size: uint64) -> uint64:
+    i: uint64 = start
+    while i < size:
+        if blob[i] == 10:                        # '\n'
+            return i
+        i = i + 1
+    return size
+
+
+def _md_find_line(name: Ptr[uint8], name_len: uint64) -> int64:
+    # Locate the line whose pre-colon token matches `name` (after
+    # underscore normalization). Returns the START offset of the line
+    # in the blob (the byte after the previous '\n'), or -1 on miss.
+    if _md_blob == 0 or _md_size == 0:
+        return -1
+    blob: Ptr[uint8] = cast[Ptr[uint8]](_md_blob)
+    pos: uint64 = 0
+    while pos < _md_size:
+        le: uint64 = _md_line_end(blob, pos, _md_size)
+        # Skip blank + comment lines.
+        if le == pos or blob[pos] == 35:         # '#'
+            pos = le + 1
+            continue
+        # Find the colon. The token before it is the module name.
+        c: uint64 = pos
+        while c < le and blob[c] != 58:          # ':'
+            c = c + 1
+        if c == le:
+            # Malformed line — no colon. Skip.
+            pos = le + 1
+            continue
+        if _md_name_eq(
+                cast[Ptr[uint8]](cast[uint64](blob) + pos),
+                c - pos, name, name_len) == 1:
+            return cast[int64](pos)
+        pos = le + 1
+    return -1
+
+
+# --- already-loaded fingerprint table --------------------------------
+#
+# Each successful kmod_linux_load of a Linux .ko is fingerprinted here
+# so the dep walker doesn't re-load the same module if two dependents
+# both name it (cfg80211 is named by both mac80211 directly and by
+# any future wifi driver that depends on cfg80211 + mac80211). We
+# match by module name (the symbolic name modules.dep uses, not the
+# file path) under the same normalization rules as the parser.
+
+_MD_MAX_LOADED: uint64 = 32
+_md_loaded_fp: Array[32, uint64]
+_md_n_loaded: uint64 = 0
+
+
+def _md_fingerprint(s: Ptr[uint8], n: uint64) -> uint64:
+    # FNV-1a 64-bit on the normalized byte stream. Same hash family
+    # kernel/modprobe.ad uses for its dedup; we keep a separate table
+    # because modprobe's table is keyed by the post-match module name
+    # (the alias-line tail) while modules_dep walks the dep list.
+    h: uint64 = 0xcbf29ce484222325
+    i: uint64 = 0
+    while i < n:
+        h = h ^ cast[uint64](_md_norm(s[i]))
+        h = h * 0x100000001b3
+        i = i + 1
+    return h
+
+
+def _md_is_loaded(name: Ptr[uint8], name_len: uint64) -> int32:
+    fp: uint64 = _md_fingerprint(name, name_len)
+    i: uint64 = 0
+    while i < _md_n_loaded:
+        if _md_loaded_fp[i] == fp:
+            return 1
+        i = i + 1
+    return 0
+
+
+def _md_mark_loaded(name: Ptr[uint8], name_len: uint64):
+    if _md_n_loaded >= _MD_MAX_LOADED:
+        return
+    _md_loaded_fp[_md_n_loaded] = _md_fingerprint(name, name_len)
+    _md_n_loaded = _md_n_loaded + 1
+
+
+def modules_dep_mark_loaded(name: Ptr[char], name_len: uint64):
+    # Public seam for init/main.ad and kernel/modprobe.ad to register
+    # a load that happened OUTSIDE the dep walker (the framework-
+    # modules path's explicit cfg80211/mac80211 loads, or the legacy
+    # ENABLE_E1000E_KO marker). Without this seam, a subsequent
+    # auto-loaded driver that lists cfg80211 as a dep would try to
+    # load cfg80211 again.
+    _md_mark_loaded(cast[Ptr[uint8]](name), name_len)
+
+
+# --- .ko bytes lookup ------------------------------------------------
+#
+# Two possible cpio paths to try, in order:
+#   /lib/modules/<name>.ko        (framework + manual layout)
+#   /lib/modules/auto/<name>.ko   (ENABLE_AUTO_MODULES layout)
+#
+# We try the framework path first — it's the canonical location for
+# the foundational modules (cfg80211, mac80211) and for the legacy
+# single-marker .kos. Auto/ is the fallback for the modprobe-baked
+# .ko set. The two layouts cohabit in builds that set both env vars.
+
+_MD_PATH_LEN: uint64 = 128
+_md_path_buf: Array[128, uint8]
+
+
+def _md_build_path(prefix: Ptr[uint8], pfx_len: uint64,
+                   name: Ptr[uint8], name_len: uint64) -> uint64:
+    # Compose "<prefix><name>.ko\0" into _md_path_buf. Returns the
+    # path length (excluding NUL). Caps mod_len so the trailing
+    # ".ko\0" still fits.
+    i: uint64 = 0
+    while i < pfx_len and i < (_MD_PATH_LEN - 4):
+        _md_path_buf[i] = prefix[i]
+        i = i + 1
+    j: uint64 = 0
+    while j < name_len and (i + j) < (_MD_PATH_LEN - 4):
+        _md_path_buf[i + j] = name[j]
+        j = j + 1
+    pos: uint64 = i + j
+    _md_path_buf[pos + 0] = 46                   # '.'
+    _md_path_buf[pos + 1] = 107                  # 'k'
+    _md_path_buf[pos + 2] = 111                  # 'o'
+    _md_path_buf[pos + 3] = 0                    # NUL
+    return pos + 3
+
+
+def _md_find_ko(name: Ptr[uint8], name_len: uint64) -> int64:
+    # Try the framework path first, then auto/.
+    fw_prefix: Ptr[uint8] = "/lib/modules/"
+    fw_len: uint64 = 13
+    auto_prefix: Ptr[uint8] = "/lib/modules/auto/"
+    auto_len: uint64 = 18
+
+    path_len: uint64 = _md_build_path(
+        fw_prefix, fw_len, name, name_len)
+    idx: int64 = _md_find_initramfs_entry(
+        cast[Ptr[uint8]](&_md_path_buf[0]), path_len)
+    if idx >= 0:
+        return idx
+
+    path_len = _md_build_path(
+        auto_prefix, auto_len, name, name_len)
+    idx = _md_find_initramfs_entry(
+        cast[Ptr[uint8]](&_md_path_buf[0]), path_len)
+    return idx
+
+
+# --- single-module loader (recursive entry point) --------------------
+
+def _md_load_single(name: Ptr[uint8], name_len: uint64) -> int32:
+    # Resolve `name` -> .ko bytes in initramfs, then kmod_linux_load.
+    # Returns 1 on success, 0 on "no .ko (assume shim-satisfied)",
+    # -1 on hard load failure.
+    if _md_is_loaded(name, name_len) == 1:
+        return 1
+    ko_idx: int64 = _md_find_ko(name, name_len)
+    if ko_idx < 0:
+        # No .ko available — the dep is likely satisfied by a Hamnix
+        # shim (libarc4, soundcore, etc.). Mark "loaded" so we don't
+        # keep retrying; loader.ad's lookup will resolve the symbol
+        # against the shim table.
+        printk1("[modules_dep] dep .ko not in initramfs (shim?): name_len=%d\n",
+                name_len)
+        _md_mark_loaded(name, name_len)
+        return 0
+    ko_blob: Ptr[uint8] = initramfs_entry_data(cast[uint64](ko_idx))
+    ko_size: uint64 = initramfs_entry_size(cast[uint64](ko_idx))
+    printk1("[modules_dep] kmod_linux_load %d bytes\n", ko_size)
+    rc: int32 = kmod_linux_load(ko_blob, ko_size)
+    if rc < 0:
+        printk1("[modules_dep] kmod_linux_load failed: rc=%d\n",
+                cast[uint64](rc))
+        return -1
+    _md_mark_loaded(name, name_len)
+    return 1
+
+
+# --- dep-list walker -------------------------------------------------
+
+def _md_walk_deps(name: Ptr[uint8], name_len: uint64,
+                  depth: int32) -> int32:
+    # Find the modules.dep line for `name`, then recursively
+    # _md_walk_deps() each dep token, finally _md_load_single() the
+    # target. Returns 1 on success, -1 on hard failure of `name`.
+    # A failure of a dep that isn't `name` itself only emits a
+    # diagnostic — we still try to load `name` (matches Linux's
+    # modprobe behavior of best-effort dep loading).
+    if depth > 8:
+        # Cyclic / pathological dep graph. Linux's depmod rejects
+        # cycles at depmod time; defensive cap here.
+        printk0("[modules_dep] dep chain too deep — aborting\n")
+        return -1
+
+    if _md_is_loaded(name, name_len) == 1:
+        return 1
+
+    modules_dep_init()                           # idempotent
+
+    line_off: int64 = _md_find_line(name, name_len)
+    if line_off >= 0 and _md_blob != 0:
+        blob: Ptr[uint8] = cast[Ptr[uint8]](_md_blob)
+        pos: uint64 = cast[uint64](line_off)
+        le: uint64 = _md_line_end(blob, pos, _md_size)
+        # Advance past the colon.
+        c: uint64 = pos
+        while c < le and blob[c] != 58:
+            c = c + 1
+        # Now c points at ':' (verified by _md_find_line). Skip ':' +
+        # any whitespace before the first dep token.
+        c = c + 1
+        # Walk tokens.
+        while c < le:
+            # Skip leading whitespace.
+            while c < le and (blob[c] == 32 or blob[c] == 9):
+                c = c + 1
+            if c >= le:
+                break
+            tok_start: uint64 = c
+            while c < le and blob[c] != 32 and blob[c] != 9:
+                c = c + 1
+            tok_end: uint64 = c
+            if tok_end > tok_start:
+                # Recurse into this dep.
+                _md_walk_deps(
+                    cast[Ptr[uint8]](cast[uint64](blob) + tok_start),
+                    tok_end - tok_start, depth + 1)
+    # All deps walked (best-effort). Load the target.
+    rc: int32 = _md_load_single(name, name_len)
+    return rc
+
+
+# --- public API ------------------------------------------------------
+
+def modules_dep_load_with_deps(name: Ptr[char], name_len: uint64) -> int32:
+    # Top-level entry. Lazily initializes the table on first call.
+    # Returns 1 on success (target module loaded or was already loaded),
+    # 0 on "no table / nothing loaded", -1 on target load failure.
+    modules_dep_init()
+    return _md_walk_deps(cast[Ptr[uint8]](name), name_len, 0)

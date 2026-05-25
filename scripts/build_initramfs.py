@@ -236,6 +236,23 @@ if os.environ.get("ENABLE_NVME_KO") == "1":
 if os.environ.get("ENABLE_FRAMEWORK_MODULES") == "1":
     FILES.append(("/etc/framework-modules", b"1\n"))
 
+# modules.dep regression test marker. scripts/test_loader_modulesdep.sh
+# sets this to exercise the in-kernel modules_dep parser: boot without
+# the framework-modules pre-load, dispatch mac80211 directly, and let
+# the dep walker auto-load cfg80211 first. Mutually exclusive with
+# ENABLE_FRAMEWORK_MODULES (which would pre-load both, bypassing the
+# dep walker).
+if os.environ.get("ENABLE_MODULESDEP_TEST") == "1":
+    FILES.append(("/etc/modulesdep-test", b"1\n"))
+
+# Cross-module EXPORT_SYMBOL regression test marker. Loads cfg80211.ko
+# then mac80211.ko; the loader's ksymtab fallback path resolves
+# mac80211's cfg80211_* UND set against cfg80211's __ksymtab and emits
+# a [ksymtab_hit] diag for each resolved name. scripts/
+# test_loader_cross_module_export.sh sets this env var.
+if os.environ.get("ENABLE_CROSS_MODULE_EXPORT_TEST") == "1":
+    FILES.append(("/etc/cross-module-export-test", b"1\n"))
+
 # Native `ping` smoke. scripts/test_ping.sh sets ENABLE_PING_SMOKE=1 to
 # plant /etc/ping-smoke-test in the initramfs. The marker is consumed
 # only by the test harness today (a future kernel-side autorun could
@@ -882,6 +899,36 @@ def build_archive() -> bytes:
         # Runtime gate marker. init/main.ad's modprobe_auto_load()
         # block only fires when this file is present in the initramfs.
         FILES.append(("/etc/auto-modules", b"1\n"))
+
+    # modules.dep — Linux-shape dependency table for the in-kernel
+    # modules_dep parser (kernel/modules_dep.ad). Planted unconditionally
+    # whenever kernel-modules/ has any .ko files, because both the
+    # framework-modules path (cfg80211 + mac80211) and the auto-modules
+    # PCI walk use it to topologically load deps before a target module.
+    # The cost is small (a few hundred bytes — one short line per .ko).
+    # When the table is absent the in-kernel parser just falls back to
+    # the legacy "load only the requested module, no deps" behavior.
+    _kmods_root_for_dep = here / "kernel-modules"
+    if _kmods_root_for_dep.is_dir() and any(
+            _kmods_root_for_dep.glob("*/*.ko")):
+        import importlib.util as _ilu_dep
+        _mod_dep_path = here / "scripts" / "build_modules_dep.py"
+        _spec_dep = _ilu_dep.spec_from_file_location(
+            "build_modules_dep", _mod_dep_path)
+        if _spec_dep is None or _spec_dep.loader is None:
+            raise SystemExit(
+                f"build_initramfs: cannot import {_mod_dep_path}")
+        _mod_dep = _ilu_dep.module_from_spec(_spec_dep)
+        _spec_dep.loader.exec_module(_mod_dep)
+        dep_text = _mod_dep.build_dep_table(_kmods_root_for_dep)
+        dep_bytes = dep_text.encode()
+        blob += cpio_entry("/lib/modules/modules.dep", dep_bytes)
+        # Count the data lines (those not starting with '#') for the log.
+        _dep_lines_n = sum(
+            1 for ln in dep_text.splitlines()
+            if ln and not ln.startswith("#"))
+        print(f"  embedded /lib/modules/modules.dep "
+              f"({len(dep_bytes)} bytes, {_dep_lines_n} module rows)")
 
     # Multi-NIC scale-out: r8169.ko (Realtek consumer GbE) and igb.ko
     # (Intel server/workstation). Same plant-unconditional shape as
