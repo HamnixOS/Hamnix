@@ -136,14 +136,41 @@ def main() -> int32:
     f: Foo
     return f.m()
 "
-"class_inherit_field|class Animal:
-    legs: int32
-class Dog(Animal):
-    bark: int32
+"list_type|def main() -> int32:
+    xs: List[int32] = cast[List[int32]](0)
+    return 0
+"
+"dict_type|def main() -> int32:
+    d: Dict[int32, int32] = cast[Dict[int32, int32]](0)
+    return 0
+"
+"optional_type|def main() -> int32:
+    o: Optional[int32] = cast[Optional[int32]](0)
+    return 0
+"
+"tuple_type|def main() -> int32:
+    t: Tuple[int32, int32] = cast[Tuple[int32, int32]](0)
+    return 0
+"
+"fn_decorator|@inline
+def add(a: int32, b: int32) -> int32:
+    return a + b
+
 def main() -> int32:
-    d: Dog
-    d.legs = 4
-    return d.legs
+    return 0
+"
+"class_decorator|@frozen
+class Dog:
+    legs: int32
+
+def main() -> int32:
+    return 0
+"
+"default_param|def add(a: int32, b: int32 = 1) -> int32:
+    return a + b
+
+def main() -> int32:
+    return add(2, 3)
 "
 "print_builtin|def main() -> int32:
     print(\"hi\")
@@ -171,7 +198,7 @@ for entry in "${CASES[@]}"; do
         echo "  --- emitted asm ---"
         head -20 "$TMP/case_${name}.s"
         fail=1
-    elif grep -q "not yet supported\|Unexpected\|Expected\|CodeGenError\|ParseError" \
+    elif grep -q "not yet supported\|not supported\|is not implemented\|Unexpected\|Expected\|CodeGenError\|ParseError\|unknown identifier" \
             "$TMP/case_${name}.log"; then
         echo "  [$name] OK: rejected"
     else

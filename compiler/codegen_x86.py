@@ -46,6 +46,7 @@ from .ast_nodes import (
     IndexExpr, MemberExpr, CastExpr, ContainerOfExpr,
     ConditionalExpr,
     Type, PointerType, ArrayType, FunctionPointerType, PercpuType,
+    ListType, DictType, TupleType, OptionalType,
 )
 
 
@@ -99,6 +100,79 @@ STACK_PROTECTOR_SKIP_PREFIXES = (
 class CodeGenError(Exception):
     """Error during code generation."""
     pass
+
+
+def _span_location(span) -> str:
+    """Format a Span as 'file:line' or '<unknown>' for error messages.
+
+    Centralised so the "x86: <feature> not yet supported at file:line"
+    rejection messages all look the same.
+    """
+    if span is None:
+        return "<unknown location>"
+    fn = getattr(span, "filename", None) or "<unknown>"
+    ln = getattr(span, "start_line", None)
+    if ln is None:
+        return fn
+    return f"{fn}:{ln}"
+
+
+def _reject_unsupported_type(t, where: str) -> None:
+    """Raise CodeGenError if `t` is one of the deliberately-not-supported
+    parametric type annotations (List/Dict/Tuple/Optional). Recurses into
+    Ptr[T] / Array[N, T] / Fn[...] so the offending nested type still
+    gets caught at its actual location.
+
+    These types parse cleanly (LANGUAGE.md keeps the AST nodes so error
+    messages stay readable) but they imply hidden heap allocation or a
+    slice-pair value that has no codegen. The audit at commit `10d6f7c`
+    found the silent-degenerate-to-8-byte-slot behaviour — this is the
+    explicit rejection that locks the doc to the codegen.
+    """
+    if t is None:
+        return
+    if isinstance(t, ListType):
+        raise CodeGenError(
+            f"x86: List[T] type is not implemented at "
+            f"{_span_location(t.span)} ({where}); "
+            f"use Array[N, T] or Ptr[T] + kmalloc instead"
+        )
+    if isinstance(t, DictType):
+        raise CodeGenError(
+            f"x86: Dict[K, V] type is not implemented at "
+            f"{_span_location(t.span)} ({where}); "
+            f"use a flat Array[N, KV] + linear scan, or a slab-backed "
+            f"hash table"
+        )
+    if isinstance(t, TupleType):
+        raise CodeGenError(
+            f"x86: Tuple[A, B, ...] type is not implemented at "
+            f"{_span_location(t.span)} ({where}); "
+            f"return via Ptr[T] out-parameters or pack into a struct"
+        )
+    if isinstance(t, OptionalType):
+        raise CodeGenError(
+            f"x86: Optional[T] type is not implemented at "
+            f"{_span_location(t.span)} ({where}); "
+            f"use a sentinel (0 / -1 / NULL) or pass a Ptr[T] that "
+            f"the callee can leave NULL"
+        )
+    # Recurse into composite types so the offending leaf type is caught
+    # wherever it appears (e.g. `Ptr[List[int32]]`, `Array[8, Dict[K,V]]`).
+    if isinstance(t, PointerType):
+        _reject_unsupported_type(t.base_type, where)
+        return
+    if isinstance(t, ArrayType):
+        _reject_unsupported_type(t.element_type, where)
+        return
+    if isinstance(t, FunctionPointerType):
+        _reject_unsupported_type(t.return_type, where)
+        for pt in t.param_types:
+            _reject_unsupported_type(pt, where)
+        return
+    if isinstance(t, PercpuType):
+        _reject_unsupported_type(t.base_type, where)
+        return
 
 
 @dataclass
@@ -466,11 +540,20 @@ class X86CodeGen:
         self.emit("# Target: x86_64-linux-kernel-module (System V AMD64)")
         self.emit()
 
+        # Pass 0: reject deliberately-unsupported declarations up front.
+        # The LANGUAGE audit at commit 10d6f7c identified five silent-
+        # failure modes — class methods silently dropped, decorators
+        # silently ignored, default-valued params accepted then ignored,
+        # List/Dict/Tuple/Optional types silently treated as 8-byte
+        # slots. Each is now caught here with an actionable error at
+        # the source location instead of producing garbage asm.
+        self._validate_program_supported(program)
+
         # Pass 1: collect structs first (later passes consult them for type
         # sizes), then symbol kinds for call classification + globals.
         for decl in program.declarations:
             if isinstance(decl, ClassDef):
-                self.layout_struct(decl)
+                self.layout_struct(decl, program)
         for decl in program.declarations:
             match decl:
                 case ExternDecl(name=name):
@@ -519,20 +602,202 @@ class X86CodeGen:
             self.gen_modinfo()
         return "\n".join(self.output) + "\n"
 
-    def layout_struct(self, cls: ClassDef) -> None:
+    def layout_struct(self, cls: ClassDef,
+                      program: Optional[Program] = None) -> None:
         """Compute a C-ABI-compatible field layout. Each field is aligned to
         its natural alignment (capped at 8); the total is rounded up to 8
         bytes so the struct can be placed in `.bss` without sub-8-byte
-        padding surprises."""
+        padding surprises.
+
+        Inheritance: `class Dog(Animal):` prepends Animal's fields to
+        Dog's. Multiple bases are walked left-to-right, each base's
+        fields concatenated before the child's. The parent's `bases`
+        chain is followed transitively (so a Dog(Animal) where Animal
+        inherits from Mammal gets Mammal's fields first, then Animal's,
+        then Dog's). A duplicate field name (child redeclares a parent
+        field) is an error — Adder classes are flat structs, there are
+        no virtual slots / overrides to redirect to.
+        """
         fields: list[tuple[str, Type, int]] = []
         offset = 0
+        seen_names: set[str] = set()
+
+        # Walk the bases first (left-to-right), prepending their fields.
+        # We accept either: (a) the parent already laid out in
+        # self.structs (declared earlier in the program), or (b) found
+        # by name in `program.declarations` (declared later — we recurse
+        # so out-of-order definitions still work). A missing parent is
+        # a hard error.
+        def _collect_inherited(parent_name: str) -> list[ClassField]:
+            # Walk the parent's chain depth-first to flatten grandparent
+            # fields into the result.
+            parent_cls = None
+            if program is not None:
+                for d in program.declarations:
+                    if isinstance(d, ClassDef) and d.name == parent_name:
+                        parent_cls = d
+                        break
+            if parent_cls is None:
+                raise CodeGenError(
+                    f"x86: class '{cls.name}' inherits from unknown class "
+                    f"'{parent_name}' at {_span_location(cls.span)}"
+                )
+            # Methods/decorators on the parent are still rejected by
+            # _validate_program_supported — we only care about fields here.
+            out: list[ClassField] = []
+            for gp in parent_cls.bases:
+                out.extend(_collect_inherited(gp))
+            out.extend(parent_cls.fields)
+            return out
+
+        for base in cls.bases:
+            for pf in _collect_inherited(base):
+                if pf.name in seen_names:
+                    raise CodeGenError(
+                        f"x86: class '{cls.name}' inherits duplicate "
+                        f"field '{pf.name}' from base '{base}' at "
+                        f"{_span_location(cls.span)}"
+                    )
+                seen_names.add(pf.name)
+                align = self.natural_align(pf.field_type)
+                offset = (offset + align - 1) & ~(align - 1)
+                fields.append((pf.name, pf.field_type, offset))
+                offset += self.get_type_size(pf.field_type)
+
         for f in cls.fields:
+            if f.name in seen_names:
+                raise CodeGenError(
+                    f"x86: class '{cls.name}' redeclares inherited "
+                    f"field '{f.name}' at {_span_location(cls.span)}; "
+                    f"Adder classes are flat structs — no overrides"
+                )
+            seen_names.add(f.name)
             align = self.natural_align(f.field_type)
             offset = (offset + align - 1) & ~(align - 1)
             fields.append((f.name, f.field_type, offset))
             offset += self.get_type_size(f.field_type)
         total = (offset + 7) & ~7
         self.structs[cls.name] = StructInfo(cls.name, fields, total)
+
+    def _validate_program_supported(self, program: Program) -> None:
+        """Pre-codegen sweep: reject declarations LANGUAGE.md marks as
+        deliberately not in Adder. Each rejection cites the source
+        location and points at the supported alternative — see
+        memory/feedback_compiler_quirks.md "Features deliberately not
+        in Adder".
+
+        These rejections used to be silent failures (the audit at
+        commit 10d6f7c surfaced them):
+
+          - `def m(self):` inside a class body was DROPPED, then
+            `obj.m()` failed with "MethodCallExpr not yet supported".
+          - Top-level `@decorator` was DROPPED.
+          - `def f(x=0)` default value was DROPPED, then the call site
+            emitted with %esi holding garbage.
+          - `List[T]` / `Dict[K, V]` / `Tuple[A, B]` / `Optional[T]`
+            were silently treated as 8-byte slots (`get_type_size`
+            falls back to 8 for unknown type names).
+
+        Each is now an explicit error at the source location.
+        """
+        for decl in program.declarations:
+            if isinstance(decl, ClassDef):
+                if decl.methods:
+                    m = decl.methods[0]
+                    raise CodeGenError(
+                        f"x86: methods in class body are not supported "
+                        f"(class '{decl.name}', method '{m.name}' at "
+                        f"{_span_location(m.span)}); rewrite as a free "
+                        f"function with a Ptr[{decl.name}] first arg"
+                    )
+                if decl.decorators:
+                    raise CodeGenError(
+                        f"x86: decorators are not supported "
+                        f"(class '{decl.name}', got @{decl.decorators[0]} "
+                        f"at {_span_location(decl.span)}); define fields "
+                        f"in C-ABI order — no @packed-driven layout"
+                    )
+                for f in decl.fields:
+                    _reject_unsupported_type(
+                        f.field_type,
+                        f"class '{decl.name}' field '{f.name}'",
+                    )
+            elif isinstance(decl, FunctionDef):
+                if decl.decorators:
+                    raise CodeGenError(
+                        f"x86: decorators are not supported "
+                        f"(function '{decl.name}', got "
+                        f"@{decl.decorators[0]} at "
+                        f"{_span_location(decl.span)})"
+                    )
+                for p in decl.params:
+                    if p.default is not None:
+                        raise CodeGenError(
+                            f"x86: default-valued parameters are not "
+                            f"supported (function '{decl.name}', "
+                            f"parameter '{p.name}' at "
+                            f"{_span_location(p.span)}); pass the "
+                            f"default explicitly at every call site"
+                        )
+                    _reject_unsupported_type(
+                        p.param_type,
+                        f"function '{decl.name}' parameter '{p.name}'",
+                    )
+                _reject_unsupported_type(
+                    decl.return_type, f"function '{decl.name}' return type"
+                )
+                # Function body locals — walk VarDecls to catch
+                # `xs: List[int32] = ...` inside a function.
+                self._validate_stmts_supported(decl.body,
+                                               f"function '{decl.name}'")
+            elif isinstance(decl, ExternDecl):
+                for p in decl.params:
+                    if p.default is not None:
+                        raise CodeGenError(
+                            f"x86: default-valued parameters are not "
+                            f"supported (extern '{decl.name}', "
+                            f"parameter '{p.name}' at "
+                            f"{_span_location(p.span)})"
+                        )
+                    _reject_unsupported_type(
+                        p.param_type,
+                        f"extern '{decl.name}' parameter '{p.name}'",
+                    )
+                _reject_unsupported_type(
+                    decl.return_type, f"extern '{decl.name}' return type"
+                )
+            elif isinstance(decl, VarDecl):
+                _reject_unsupported_type(
+                    decl.var_type, f"global '{decl.name}'"
+                )
+
+    def _validate_stmts_supported(self, stmts, where: str) -> None:
+        """Walk a list of statements and reject any local VarDecl with
+        a deliberately-unsupported type annotation. Imported lazily
+        because the AST node names are stringly used."""
+        from .ast_nodes import (
+            VarDecl as _VarDecl,
+            IfStmt as _IfStmt,
+            WhileStmt as _WhileStmt,
+            DoWhileStmt as _DoWhileStmt,
+            ForStmt as _ForStmt,
+            ForUnpackStmt as _ForUnpackStmt,
+        )
+        for s in stmts:
+            if isinstance(s, _VarDecl):
+                _reject_unsupported_type(
+                    s.var_type, f"{where} local '{s.name}'"
+                )
+            elif isinstance(s, _IfStmt):
+                self._validate_stmts_supported(s.then_body, where)
+                for _cond, body in s.elif_branches:
+                    self._validate_stmts_supported(body, where)
+                if s.else_body is not None:
+                    self._validate_stmts_supported(s.else_body, where)
+            elif isinstance(s, (_WhileStmt, _ForStmt, _ForUnpackStmt)):
+                self._validate_stmts_supported(s.body, where)
+            elif isinstance(s, _DoWhileStmt):
+                self._validate_stmts_supported(s.body, where)
 
     def gen_data(self, program: Program) -> None:
         """Emit `.data` / `.bss` / `.data..percpu` for top-level VarDecls.
@@ -1332,6 +1597,19 @@ class X86CodeGen:
                     self.emit(f"    subq ${off}, %rax")
 
             case _:
+                # MethodCallExpr deserves an actionable diagnostic: the
+                # silent-class-method-drop bug (audit 10d6f7c) is now
+                # rejected at class-def time, but a stray `obj.m()` with
+                # no class declaration in scope still routes here.
+                from .ast_nodes import MethodCallExpr as _MethodCallExpr
+                if isinstance(expr, _MethodCallExpr):
+                    span = getattr(expr, "span", None)
+                    raise CodeGenError(
+                        f"x86: method calls (`obj.{expr.method}(...)`) "
+                        f"are not supported at {_span_location(span)}; "
+                        f"call as a free function: "
+                        f"{expr.method}(&obj, ...)"
+                    )
                 raise CodeGenError(
                     f"x86: expression {type(expr).__name__} not yet supported"
                 )

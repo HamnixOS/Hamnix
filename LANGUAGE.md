@@ -407,8 +407,14 @@ while i < n:
 A `class` in Adder is a **C-ABI-compatible struct**. Fields are laid
 out in declaration order, each aligned to its natural alignment
 (capped at 8), and the total size is rounded up to 8 bytes. There are
-**no methods, no inheritance, no constructors, and no destructors** —
-classes carry data, not behaviour.
+**no methods, no constructors, and no destructors** — classes carry
+data, not behaviour. Single and multi-base **inheritance is supported
+purely as field flattening**: `class Dog(Animal):` prepends each base
+class's fields (recursively) before the child's, in declaration order.
+No vtable, no virtual dispatch — `d.legs` on a `Dog(Animal)` resolves
+to the same byte offset as `a.legs` on a bare `Animal`. A child that
+redeclares an inherited field name is a compile error (the codegen
+has no override slot to redirect to).
 
 ```python
 class VmaNode:
@@ -448,6 +454,26 @@ compiler picks the storage based on how the variable is declared.
 
 `container_of(ptr, Type, field)` is the inverse — see
 [*`container_of`*](#container_of).
+
+### Inheritance (flat field flattening)
+
+```python
+class Animal:
+    legs: int32
+    age:  int32
+
+class Dog(Animal):
+    breed: int32
+```
+
+`Dog` lays out as `legs` (offset 0), `age` (offset 4), `breed`
+(offset 8) — the parent fields come first in declaration order, then
+the child's own. Multiple bases (`class C(A, B):`) and multi-level
+chains (`Dog(Animal)` where `Animal(Mammal)`) are flattened
+recursively in left-to-right, depth-first order. There is **no
+vtable, no virtual dispatch, no upcast pointer** — the inheritance is
+purely a layout convenience so common headers stay in one place.
+Redeclaring an inherited field name in the child is a compile error.
 
 ---
 
@@ -820,8 +846,9 @@ def bytebuf_free(bb: Ptr[ByteBuf]):
 
 These show up in Python and are intentionally absent from Adder. If
 an agent tries to write code using one of them, the parser may accept
-the syntax (so error messages stay readable) but the **codegen will
-reject it with `x86: <Node> not yet supported`** — that's by design.
+it (the AST node exists) but the **codegen will reject it with a
+`CodeGenError` citing the source location** — that's by design.
+`scripts/test_compiler_unsupported_rejected.sh` guards each one.
 
 A subset is guarded by `scripts/test_compiler_unsupported_rejected.sh`,
 which compiles a one-liner per feature and verifies the codegen
@@ -829,13 +856,13 @@ rejects it.
 
 | Feature | Status | Use instead |
 |---|---|---|
-| `for x in range(...)` / any `for ... in ...` | Parser accepts; codegen rejects `ForStmt`. There is also no `range()` builtin. | `while` loop with an explicit counter. See *Control Flow → Loops*. |
-| Tuple-unpacking assignment (`a, b = b, a`) | Parser accepts; codegen rejects `TupleUnpackAssign`. | Use a temporary: `tmp = a; a = b; b = tmp`. |
-| Compound assignment (`+=`, `-=`, `*=`, `\|=`, `&=`, `^=`, `<<=`, `>>=`) | Parser accepts; codegen rejects with `x86: compound assignment '+=' not yet supported`. | Spell out the assignment: `x = x + 1`. |
-| `global x` / `nonlocal x` statements | Parser accepts; codegen rejects `GlobalStmt`. Not needed anyway — bare names that aren't locals resolve to globals automatically. | Just write `counter = counter + 1` without a `global` declaration. |
-| `is` / `is not` operators | Parser accepts; codegen rejects `BinOp.IS` / `BinOp.IS_NOT`. | `==` / `!=`. |
+| `for x in range(...)` / any `for ... in ...` | Codegen rejects `ForStmt`. No `range()` builtin. | `while` loop with an explicit counter. See *Control Flow → Loops*. |
+| Tuple-unpacking assignment (`a, b = b, a`) | Codegen rejects `TupleUnpackAssign`. | Use a temporary: `tmp = a; a = b; b = tmp`. |
+| Compound assignment (`+=`, `-=`, `*=`, `\|=`, `&=`, `^=`, `<<=`, `>>=`) | Codegen rejects with `x86: compound assignment '+=' not yet supported`. | Spell out: `x = x + 1`. |
+| `global x` / `nonlocal x` statements | Codegen rejects `GlobalStmt`. Not needed anyway — bare names that aren't locals resolve to globals automatically. | Write `counter = counter + 1` without a `global` declaration. |
+| `is` / `is not` operators | Codegen rejects `BinOp.IS` / `BinOp.IS_NOT`. | `==` / `!=`. |
 | `in` operator (membership test) | Parser accepts inside `for ... in`; the binary-op form rejects. | Walk the container by index and compare. |
-| `List[T]`, `Dict[K, V]`, `Tuple[A, B]`, `Optional[T]` types | Imply hidden heap. The parser accepts them in a type annotation and silently treats them as a generic 8-byte slot — there is no real container behind the type. | `Array[N, T]` for fixed pools; `Ptr[T]` + `kmalloc` for growable storage. |
+| `List[T]`, `Dict[K, V]`, `Tuple[A, B]`, `Optional[T]` types | Imply hidden heap. Adder has no general-purpose dynamic container. Each is rejected explicitly at the source location citing the offending var/param/field (commit 25e6657). | `Array[N, T]` for fixed pools; `Ptr[T]` + `kmalloc` for growable storage. |
 | Dict literals `{1: 10}` and dict indexing | No `Dict` type. | A flat `Array[N, KV]` of `class KV { key, value }` plus a linear scan; or a slab-backed hash table built in `.ad`. |
 | List literals / list comprehensions (`[x*2 for x in r]`) | Codegen rejects `ListLiteral` / `ListComprehension`. | Write the `while` loop explicitly into an `Array[N, T]`. |
 | Lambdas / closures | Closures would need a captured environment (a hidden heap object). Codegen rejects `LambdaExpr`. | A named `def` plus a `Fn[R, A...]` typed callback. |
@@ -844,17 +871,16 @@ rejects it.
 | `try`/`except`/`raise`/`finally` | Exceptions break flow control, hide failure modes, don't compose with interrupt context. The hamsh shell language has them — Adder does not. | Return `int32` error codes (`-EINVAL`, `-ENOMEM`, `-ENOENT`, ...) — the Linux/Plan-9 convention. |
 | `with X as y:` context managers | RAII-ish but adds non-obvious cleanup paths. | Explicit cleanup before each return; or a single `defer`-style "goto fail" tail. |
 | `match`/`case` statements | The parser accepts the syntax, but codegen does not implement it. No production site uses it. | A chained `if`/`elif`. For wide dispatch on enum/syscall numbers, an `Array[N, Fn[...]]` jump table indexed by the value. |
-| Class methods (`def m(self):` inside a class body) | The parser accepts them and the codegen silently DROPS the method — no machine code is emitted for the body, and a `f.m()` call fails with `x86: expression MethodCallExpr not yet supported`. Methods imply vtables or per-method name-mangling. | A free function that takes a `Ptr[T]` as its first argument: `def my_method(self: Ptr[T], ...) -> R`. |
-| Class inheritance `class Dog(Animal)` | Parser accepts the `(Animal)` superclass clause but does **not** copy fields into the subclass — `d.legs` on a `Dog` instance fails with `x86: struct 'Dog' has no field 'legs'`. | Composition: embed the "base" class as a field. |
-| Decorators (`@packed`, `@some_name`, ...) on top-level `def` / `class` | The lexer/parser accept a `@name` line before a top-level declaration but the codegen **silently ignores** the decorator. There is no `@packed`-driven layout, no decorator-rewrite pass. | Define the class fields in the order and size you want; the codegen lays them out C-ABI style (natural alignment, capped at 8). Don't write a `@decorator` line at all. |
-| `union` declarations | Parser accepts the `union Foo:` form but codegen rejects with `x86: top-level UnionDef not yet supported`. | Type-pun through a `Ptr[T]` cast: `cast[Ptr[uint32]](&u8_array[0])[0]`. |
+| Class methods (`def m(self):`) | Methods imply vtables or per-method name-mangling. Rejected at class-def time with an actionable error (commit 25e6657: used to be silently dropped). | A free function that takes a `Ptr[T]` as its first argument: `def my_method(self: Ptr[T], ...) -> R`. |
+| Decorators on `def` / `class` (`@inline`, `@packed`, ...) | The codegen does not implement any decorator semantics. Rejected at codegen time with an actionable error (commit 25e6657: used to be silently dropped). | Define the class fields in the order and size you want; the codegen lays them out C-ABI style. For `@inline`-style hints there's no replacement — the compiler decides. |
+| `union` declarations | The parser accepts them but no production code defines a union; codegen support is partial. | Type-pun through a `Ptr[T]` cast: `cast[Ptr[uint32]](&u8_array[0])[0]`. |
 | Tuple literals / tuple types as values | `Tuple[A, B]` is not a real codegen type. | Return values by writing through caller-supplied `Ptr[T]` out-parameters, or pack into a struct. |
-| `print()`, `len()`, `input()`, `abs()`, `min()`, `max()`, `ord()`, `chr()`, `sizeof()`, `range()` | None of these are wired up in codegen as builtins; calling one produces `x86: unknown identifier 'X'`. | `printk0`/`printk1`/... family for printing. For lengths and sizes, hardcode the constant or compute it from the declaration; if a real `sizeof` is needed, expose it as a module-level `SIZEOF_FOO: uint64 = N`. |
-| Default-valued parameters `def f(x=0)` | The parser allows the syntax for forwards compat, but the codegen does NOT supply the default at the call site — `f(1)` will leave the parameter register holding garbage. The caller MUST pass every argument. | Pass the value explicitly at each call site, or define two functions: `alloc_default()` vs `alloc_sized(n)`. |
-| `assert`, `defer`, `yield` | Reserved keywords; codegen rejects each as `x86: statement AssertStmt / DeferStmt / YieldStmt not yet supported`. | Manual checks (`if not cond: return -EINVAL`); explicit cleanup; iterative state machines instead of generators. |
-| `volatile T` type modifier | Parser accepts it, codegen silently ignores it. (`asm_volatile` is unrelated — see *Hardware Intrinsics*.) | Read MMIO through a `Ptr[T]` and use barriers via `asm_volatile`; for genuinely volatile hardware registers, do the access through `asm_volatile`. |
-| `from M import X as Y` (rename-on-import) | Parser accepts; the alias `Y` is silently lost and only `X` resolves. | Import under the real name: `from M import X` then refer to `X` everywhere. |
-| `import lib.X` / `import lib.X as Y` (whole-module import) | Parser accepts; the qualified-access form `lib.X.symbol` then parses as a `MethodCallExpr` and codegen rejects. | `from lib.X import symbol`; rename on local collision. |
+| `print()`, `len()`, `input()`, `abs()`, `min()`, `max()`, `ord()`, `chr()`, `sizeof()` | None of these are wired up in codegen as builtins. | `printk0`/`printk1`/... family for printing. For lengths and sizes, hardcode the constant or compute it from the declaration; if a real `sizeof` is needed, expose it as a module-level `SIZEOF_FOO: uint64 = N`. |
+| Default-valued parameters `def f(x=0)` | Rejected at codegen time with an actionable error (commit 25e6657: parser used to accept the default but the call site emitted with %esi holding garbage). | Pass the default explicitly at each call site, or use overload-by-name (`alloc_default()` vs `alloc_sized(n)`). |
+| `assert`, `defer`, `yield` | Reserved keywords in the lexer; no production usage; codegen does not implement them. | Manual checks; explicit cleanup; iterative state machines. |
+| `volatile T` type modifier | Parsed but unused in codegen. | Read MMIO through `Ptr[T]` with barriers via `asm_volatile`. |
+| `from M import X as Y` (rename-on-import) | Parser accepts; alias silently lost and only `X` resolves. | Import under the real name: `from M import X`. |
+| `import lib.X as Y` and `lib.X.symbol` qualified access | Adder's import is a flat merge — see *Import System*. | `from lib.X import symbol`; rename on collision. |
 
 If you find yourself reaching for any of these, the answer is almost
 always to (a) write the loop / cleanup / error-code path explicitly,
