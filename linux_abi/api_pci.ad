@@ -342,6 +342,43 @@ SHIM_PCI_DEV_RESOURCE_OFF:  uint64 = 0x3c0
 SHIM_PCI_DEV_RESOURCE_STRIDE: uint64 = 64
 SHIM_PCI_DEV_IRQ_OFF:       uint64 = 0x3bc           # unsigned int irq
 
+# M16-pivot.c: MSI vector we'll program the chip to deliver to.
+# 0x47 matches the hand-rolled driver's E1000E_IRQ_VECTOR; reusing
+# it keeps any future inspection of /proc/interrupts / vector maps
+# consistent across the .ko-vs-hand-rolled bring-up. The Linux
+# driver reads pdev->irq with this value, hands it to request_irq,
+# and we install a trampoline at irq_handlers[0x47] in api_irq.ad's
+# request_irq shim.
+E1000E_MSI_VECTOR_FOR_PCI: uint32 = 0x47
+
+# LAPIC MSI address — the canonical x86 message-write target. Each
+# MSI is a 32-bit write to 0xFEE0_xxxx with (lapic_id << 12); LAPIC
+# id 0 (the BSP) lands at exactly 0xFEE00000. Same constants as the
+# hand-rolled driver's E1000E_LAPIC_MSI_BASE.
+PCI_LAPIC_MSI_BASE_LO:   uint32 = 0xFEE00000
+PCI_LAPIC_MSI_BASE_HI:   uint32 = 0
+PCI_MSI_DATA_VECTOR_MASK: uint32 = 0xFF
+
+# PCI capability list IDs.
+_l_PCI_CAP_ID_MSI:  uint32 = 0x05
+_l_PCI_CAP_ID_MSIX: uint32 = 0x11
+
+# MSI capability layout (offset from cap_off):
+#   +0:  cap ID (8 bits) | next ptr (8 bits)
+#   +2:  message control (16 bits)
+#   +4:  message address (32 bits, low)
+#   +8:  message address (32 bits, high) [if 64-bit cap]
+#   +8 or +12:  message data (16 bits)
+PCI_MSI_CTRL_ENABLE:    uint32 = 0x0001
+PCI_MSI_CTRL_64BIT:     uint32 = 0x0080
+PCI_MSI_CTRL_MME_MASK:  uint32 = 0x0070
+
+# Tracker: BDF of the most recently probed device, so post-probe
+# infrastructure (MSI programming, post-open hooks) can address
+# the chip without re-walking the bus. V0 assumes one Linux-driven
+# NIC per system; multi-NIC bring-up needs a per-pci_dev table.
+_l_last_probed_bdf: uint32 = 0xFFFFFFFF
+
 
 def _l_pci_alloc_shim_dev(bus: uint32, devnr: uint32, fn: uint32,
                           vendor: uint32, device: uint32) -> uint64:
@@ -408,11 +445,17 @@ def _l_pci_alloc_shim_dev(bus: uint32, devnr: uint32, fn: uint32,
     # 82574 spec is 128 KiB BAR0 + 4 KiB BAR1 flash).
     _l_pci_populate_resources(blob, bus, devnr, fn)
 
-    # pdev->irq: e1000e's probe stores netdev->irq = pdev->irq, so
-    # the field must be live. We leave it at 0 for V1 — the
-    # request_threaded_irq path resolves IRQ through other means
-    # (the driver isn't using netdev->irq for delivery either, it
-    # routes through MSI / MSI-X / pci_intx).
+    # pdev->irq: e1000e's probe stores netdev->irq = pdev->irq, and
+    # e1000_open's request_irq(adapter->pdev->irq, e1000_intr, ...)
+    # reads this field to claim its vector. M16-pivot.c parks the
+    # MSI vector we'll program (E1000E_MSI_VECTOR_FOR_PCI = 0x47, the
+    # same vector the hand-rolled driver used so existing IDT plumbing
+    # / LAPIC EOI path are reusable). The actual MSI message-address /
+    # message-data programming lives in _l_pci_program_msi (called
+    # post-dev_open), and the request_irq shim installs a trampoline
+    # that bridges Linux's irq_handler_t to Hamnix's Fn[None] IDT entry.
+    irq_p: Ptr[uint32] = cast[Ptr[uint32]](blob + SHIM_PCI_DEV_IRQ_OFF)
+    irq_p[0] = E1000E_MSI_VECTOR_FOR_PCI
     return blob
 
 
@@ -473,6 +516,78 @@ def _l_pci_populate_resources(blob: uint64, bus: uint32,
                     else:
                         fp[0] = 0x200
         i = i + 1
+
+
+def _l_pci_find_msi_cap(bus: uint32, devnr: uint32, fn: uint32) -> uint32:
+    # Walk the PCI capability list looking for an MSI capability
+    # (ID 0x05). Returns the byte offset within config space, or 0
+    # if no MSI cap is present. Mirrors the hand-rolled driver's
+    # _e1000e_msi_find_cap but is generic — usable for any device.
+    cmd_status: uint32 = pci_config_read_dword(bus, devnr, fn, 0x04)
+    status: uint32 = (cmd_status >> 16) & 0xFFFF
+    if (status & 0x10) == 0:                          # cap-list bit
+        return 0
+    # Capability pointer at config offset 0x34; mask low 2 bits per spec.
+    cap_dword: uint32 = pci_config_read_dword(bus, devnr, fn, 0x34)
+    cap_ptr: uint32 = cap_dword & 0xFC
+    steps: uint32 = 0
+    while cap_ptr != 0 and steps < 64:
+        hdr_dword: uint32 = pci_config_read_dword(bus, devnr, fn,
+                                                  cap_ptr & 0xFC)
+        cap_id: uint32 = hdr_dword & 0xFF
+        next_ptr: uint32 = (hdr_dword >> 8) & 0xFC
+        if cap_id == _l_PCI_CAP_ID_MSI:
+            return cap_ptr
+        cap_ptr = next_ptr
+        steps = steps + 1
+    return 0
+
+
+def _l_pci_program_msi(bdf: uint32, vector: uint32) -> int32:
+    # Program the device's MSI capability to deliver to the BSP LAPIC
+    # at `vector`. Returns 0 on success, -1 if no MSI cap is exposed.
+    # The chip then fires an MSI write to 0xFEE00000 with message
+    # data == vector whenever a (driver-unmasked) cause bit asserts in
+    # ICR. Once apic_init has run and IF is set in EFLAGS, do_irq()
+    # gets called against `vector` and our trampoline forwards into
+    # the Linux driver's irq_handler_t.
+    bus: uint32 = (bdf >> 16) & 0xFF
+    devnr: uint32 = (bdf >> 8) & 0xFF
+    fn:  uint32 = bdf & 0xFF
+    cap_off: uint32 = _l_pci_find_msi_cap(bus, devnr, fn)
+    if cap_off == 0:
+        printk0("[pci_msi] no MSI capability on this device\n")
+        return -1
+    ctrl_dw_off: uint32 = cap_off & 0xFC
+    ctrl_dword: uint32 = pci_config_read_dword(bus, devnr, fn, ctrl_dw_off)
+    ctrl: uint32 = (ctrl_dword >> 16) & 0xFFFF
+    is_64: uint32 = 0
+    if (ctrl & PCI_MSI_CTRL_64BIT) != 0:
+        is_64 = 1
+    # Message Address Low at cap_off+4.
+    pci_config_write_dword(bus, devnr, fn, cap_off + 4,
+                           PCI_LAPIC_MSI_BASE_LO)
+    # Message Address High at cap_off+8 (64-bit only); Message Data
+    # at cap_off+8 (32-bit) or cap_off+12 (64-bit).
+    data_off: uint32 = cap_off + 8
+    if is_64 != 0:
+        pci_config_write_dword(bus, devnr, fn, cap_off + 8,
+                               PCI_LAPIC_MSI_BASE_HI)
+        data_off = cap_off + 12
+    data_dw_off: uint32 = data_off & 0xFC
+    data_dword: uint32 = pci_config_read_dword(bus, devnr, fn, data_dw_off)
+    # Preserve the high 16 bits (reserved-but-non-zero on some silicon).
+    data_low: uint32 = vector & PCI_MSI_DATA_VECTOR_MASK
+    data_dword = (data_dword & 0xFFFF0000) | data_low
+    pci_config_write_dword(bus, devnr, fn, data_dw_off, data_dword)
+    # Set MSI Enable + clear MME (advertise 1 vector).
+    new_ctrl: uint32 = (ctrl | PCI_MSI_CTRL_ENABLE) & 0xFFFF
+    new_ctrl = new_ctrl & (~PCI_MSI_CTRL_MME_MASK)
+    new_dword: uint32 = (ctrl_dword & 0x0000FFFF) | (new_ctrl << 16)
+    pci_config_write_dword(bus, devnr, fn, ctrl_dw_off, new_dword)
+    printk2("[pci_msi] vector=0x%x enabled (cap_off=0x%x)\n",
+            cast[uint64](vector), cast[uint64](cap_off))
+    return 0
 
 
 def _l_pci_walk_and_match(drv: uint64):
@@ -539,10 +654,27 @@ def _l_pci_walk_and_match(drv: uint64):
                             # e1000e that drives the chip's real
                             # bring-up (rings, request_irq, napi_enable,
                             # netif_start_queue, RCTL/TCTL.EN writes).
+                            #
+                            # Remember the BDF first so post-open MSI
+                            # programming can address the right device.
+                            _l_last_probed_bdf = (bus << 16) | (dev << 8) | 0
                             printk0("[pci_register_driver] probe OK; triggering dev_open\n")
                             n_opened: int32 = dev_open_registered()
                             printk1("[pci_register_driver] dev_open: %d netdev(s) opened\n",
                                     cast[uint64](n_opened))
+                            # After ndo_open has run, the driver has
+                            # written IMS to unmask its causes and
+                            # called request_irq (which installed our
+                            # trampoline at vector 0x47). Program the
+                            # device's MSI capability so the LAPIC sees
+                            # a real interrupt when the chip raises a
+                            # cause. With _e1k_pci_enable_msi stubbed
+                            # to return -1, the driver itself wouldn't
+                            # have programmed MSI; we do it on its
+                            # behalf so RX/TX completions deliver.
+                            if n_opened > 0:
+                                _l_pci_program_msi(_l_last_probed_bdf,
+                                                    E1000E_MSI_VECTOR_FOR_PCI)
         dev = dev + 1
 
 
