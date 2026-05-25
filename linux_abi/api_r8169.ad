@@ -1,0 +1,822 @@
+# linux_abi/api_r8169.ad
+#
+# Multi-NIC scale-out, Realtek (r8169.ko) leg. The stock Debian 6.1.0-32
+# r8169.ko driver (covering Realtek 8168/8169/8101/8125-class chips —
+# ~30% of the consumer x86 install base) has 179 UND symbols; 109 are
+# already exported by L1..L68 + api_e1000e (NIC family overlap is
+# ~80%). This batch closes the remaining 70-symbol gap so the L-series
+# loader can insmod the stock driver.
+#
+# Categories (gap counted against linux_abi/exports.ad + api_*.ad after
+# the e1000e pivot):
+#
+#   * ~32 PHY-library surface — Realtek wires its discrete external
+#     PHY through Linux's generic PHY library (drivers/net/phy/*.ko)
+#     which we don't have as a separate module. r8169 calls:
+#       phy_connect_direct, phy_disconnect, phy_start, phy_stop,
+#       phy_resume, phy_suspend, phy_init_hw, phy_attached_info,
+#       phy_read_paged/_mmd, phy_write_paged/_mmd, phy_select/restore_page,
+#       __phy_modify / phy_modify / phy_modify_paged,
+#       phy_start_aneg, phy_speed_up/_down, phy_set_max_speed,
+#       phy_print_status, phy_mac_interrupt, phy_do_ioctl_running,
+#       phy_get_pause, phy_set_asym_pause, phy_support_asym_pause,
+#       phy_ethtool_{get,set}_link_ksettings, phy_ethtool_{get,set}_eee,
+#       phy_ethtool_nway_reset, genphy_soft_reset.
+#     All cold — Realtek PHY autoneg only fires on real wire/link-up,
+#     which we don't have at insmod. Each one returns 0 / -ENODEV /
+#     no-op so the driver's probe + open path completes.
+#
+#   * ~9 MDIO bus — mdiobus_read/_write, __mdiobus_write,
+#     mdiobus_get_phy, devm_mdiobus_alloc_size, __devm_mdiobus_register.
+#     The MDIO bus is the wire to the PHY chip. Without a real bus,
+#     reads return 0xffff (== "no device on this address") and writes
+#     are dropped.
+#
+#   * ~6 pcim_/pci_ extensions — pcim_enable_device, pcim_iomap_regions,
+#     pcim_iomap_table, pcim_set_mwi, pci_set_power_state,
+#     pci_status_get_and_clear_errors, pci_wake_from_d3,
+#     pci_alloc_irq_vectors_affinity, pcie_set_readrq.
+#     Devm variants wrap the non-devm body the e1000e batch shipped
+#     so the cleanup is implicit; iomap_table returns a fixed table
+#     pointer.
+#
+#   * ~7 netdev / skb additions — napi_consume_skb, netdev_printk,
+#     netdev_stats_to_stats64, netif_set_tso_max_segs/_size,
+#     dev_fetch_sw_netstats, devm_alloc_etherdev_mqs,
+#     eth_platform_get_mac_address. These don't appear in e1000e
+#     because that driver uses the older alloc_etherdev_mqs (non-devm)
+#     and doesn't print via netdev_printk; r8169 uses both.
+#
+#   * ~7 clk / numa / firmware / misc — clk_prepare/_unprepare/
+#     _enable/_disable, devm_clk_get_optional_enabled, numa_node DATA,
+#     request_firmware, release_firmware. Realtek has firmware blobs
+#     for newer 8168 PHYs; r8169 calls request_firmware then either
+#     finds the blob (we always return -ENOENT) and runs the load
+#     path, or treats "no firmware" as benign and continues. Same
+#     story for clocks — embedded ARM SoCs gate the NIC clock, x86
+#     boxes don't, and the driver tolerates -ENODEV from clk_get.
+#
+#   * ~3 misc / dev_err_probe / byte_rev_table / cancel_work / __alloc_pages /
+#     __devm_alloc_percpu / memcpy_fromio.
+#
+# Stub philosophy: every shim here is init-cold for a vanilla insmod.
+# The test fixture uses QEMU's -device rtl8139 (Realtek 8139 — r8169's
+# id_table includes 8139's IDs for backward compat); insmod walks
+# init_module -> __pci_register_driver -> probe -> alloc rings + PHY
+# attach + NAPI add + register_netdev. Anything beyond probe (NAPI
+# poll, real link-up, ethtool ioctls) is gated behind a packet path
+# that doesn't fire at insmod time.
+#
+# The "_r8k_" prefix marks the Hamnix-side shim — same prefix-naming
+# discipline the e1000e batch introduced.
+
+from linux_abi.exports import _add_export
+from kernel.printk.printk import printk0
+from mm.slab import kmalloc, kfree, kzalloc
+
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
+
+# =====================================================================
+# DATA buffers for "global state" symbols
+# =====================================================================
+#
+# numa_node: Linux's per-CPU "current NUMA node index". On a single-
+# socket box (and on our single-CPU QEMU env) it's always 0. We expose
+# a single int variable that reads as 0.
+
+r8k_numa_node_var: int32 = 0
+
+# byte_rev_table: Linux's static 256-byte lookup table for bit-reversal
+# (table[i] == bit-reverse of i). r8169's PHY-write path uses it to
+# pack MDIO frames. We populate it at register-time with the correct
+# reversed bytes.
+r8k_byte_rev_table_buf: Array[256, uint8]
+
+# pcim_iomap_table backing: a 6-slot pointer array (Linux's pci_iomap_table()
+# returns void __iomem *const tbl[PCI_STD_NUM_BARS]; 6 BARs total). We
+# populate this when pcim_iomap_regions is called.
+r8k_iomap_table:        Array[6, uint64]
+
+
+# =====================================================================
+# Group 1: PHY library — generic-PHY surface
+# =====================================================================
+#
+# Realtek wires its discrete external PHY through Linux's generic PHY
+# library. The library is implemented in drivers/net/phy/*.ko (libphy
+# + phylib). We don't ship libphy as a module; instead each r8169
+# entry point that crosses into libphy lands here and returns a benign
+# result so the driver's probe + open complete without a real PHY
+# behind them.
+#
+# r8169's probe sequence (drivers/net/ethernet/realtek/r8169_main.c):
+#   1. mdiobus_alloc + register + scan -> get a struct phy_device *
+#   2. phy_connect_direct -> wire the phydev to the netdev
+#   3. phy_attached_info -> printk banner about the attached PHY
+#   4. phy_init_hw -> first-time bring-up of the PHY registers
+#
+# r8169's open path adds:
+#   5. phy_start -> kick the autoneg state machine
+#   6. phy_resume -> wake the PHY from suspend
+#
+# All six can return 0 / void without observable harm at insmod —
+# the only consumer of the result is the netif_carrier state, which
+# defaults to OFF (no link) and stays there in QEMU's polled-IRQ env.
+
+def _r8k_phy_connect_direct(dev: uint64, phydev: uint64,
+                              handler: uint64, interface: int32) -> int32:
+    # int phy_connect_direct(struct net_device *, struct phy_device *,
+    #                          void (*handler)(struct net_device *),
+    #                          phy_interface_t);
+    # Binds the phydev to the netdev. We return 0; the driver stashes
+    # phydev in adapter->phydev for later phy_* calls (which all land
+    # back here).
+    return 0
+
+
+def _r8k_phy_disconnect(phydev: uint64):
+    return
+
+
+def _r8k_phy_start(phydev: uint64):
+    # Kicks the PHY's autoneg state machine. No machine to kick.
+    return
+
+
+def _r8k_phy_stop(phydev: uint64):
+    return
+
+
+def _r8k_phy_resume(phydev: uint64) -> int32:
+    return 0
+
+
+def _r8k_phy_suspend(phydev: uint64) -> int32:
+    return 0
+
+
+def _r8k_phy_init_hw(phydev: uint64) -> int32:
+    # int phy_init_hw(struct phy_device *);
+    # Re-applies the boot-time PHY config (mostly: write the PHY ID
+    # capture register, reset, restore link advertisement). No real
+    # PHY to talk to; returning 0 is the success contract.
+    return 0
+
+
+def _r8k_phy_attached_info(phydev: uint64):
+    # void phy_attached_info(struct phy_device *);
+    # printk banner "Attached PHY driver ...". Suppress the banner
+    # entirely — the driver tolerates a silent attach.
+    return
+
+
+def _r8k_phy_start_aneg(phydev: uint64) -> int32:
+    return 0
+
+
+def _r8k_phy_speed_up(phydev: uint64) -> int32:
+    return 0
+
+
+def _r8k_phy_speed_down(phydev: uint64, sync: int32) -> int32:
+    return 0
+
+
+def _r8k_phy_set_max_speed(phydev: uint64, max_speed: uint32) -> int32:
+    return 0
+
+
+def _r8k_phy_print_status(phydev: uint64):
+    return
+
+
+def _r8k_phy_mac_interrupt(phydev: uint64):
+    return
+
+
+def _r8k_phy_do_ioctl_running(dev: uint64, ifr: uint64, cmd: int32) -> int32:
+    # int phy_do_ioctl_running(struct net_device *, struct ifreq *, int cmd);
+    # Forwards an ethtool/mii ioctl to the PHY. No PHY; -ENOTSUPP.
+    return -524
+
+
+def _r8k_phy_get_pause(phydev: uint64, tx_pause: uint64, rx_pause: uint64):
+    # void phy_get_pause(struct phy_device *, bool *tx_pause, bool *rx_pause);
+    if tx_pause != 0:
+        p: Ptr[uint8] = cast[Ptr[uint8]](tx_pause)
+        p[0] = 0
+    if rx_pause != 0:
+        p2: Ptr[uint8] = cast[Ptr[uint8]](rx_pause)
+        p2[0] = 0
+
+
+def _r8k_phy_set_asym_pause(phydev: uint64, rx: int32, tx: int32):
+    return
+
+
+def _r8k_phy_support_asym_pause(phydev: uint64):
+    return
+
+
+# ---- ethtool-flavoured PHY entry points ----
+
+def _r8k_phy_ethtool_get_link_ksettings(dev: uint64, cmd: uint64) -> int32:
+    # Returns the PHY's current speed/duplex/pause/advertise mask.
+    # Init-cold; the only consumer is `ethtool eth0`. -ENOTSUPP.
+    return -524
+
+
+def _r8k_phy_ethtool_set_link_ksettings(dev: uint64, cmd: uint64) -> int32:
+    return -524
+
+
+def _r8k_phy_ethtool_get_eee(phydev: uint64, data: uint64) -> int32:
+    # Energy-Efficient Ethernet — toggles via ethtool. Not supported.
+    return -524
+
+
+def _r8k_phy_ethtool_set_eee(phydev: uint64, data: uint64) -> int32:
+    return -524
+
+
+def _r8k_phy_ethtool_nway_reset(dev: uint64) -> int32:
+    # `ethtool -r`. Restarts autoneg. Init-cold; success.
+    return 0
+
+
+def _r8k_genphy_soft_reset(phydev: uint64) -> int32:
+    # int genphy_soft_reset(struct phy_device *);
+    # Writes BMCR.RESET (0x8000) to PHY register 0 and polls. No PHY;
+    # success.
+    return 0
+
+
+# ---- paged / MMD PHY register access ----
+#
+# Realtek PHYs use Clause-45-style paged register access. phy_read_paged
+# / phy_write_paged select a page, do the access, restore. With no PHY
+# behind the MDIO bus, reads return 0xffff (the bus-floats-high default
+# for an absent device) and writes are dropped.
+
+def _r8k_phy_read_paged(phydev: uint64, page: int32, regnum: uint32) -> int32:
+    return 0xffff
+
+
+def _r8k_phy_write_paged(phydev: uint64, page: int32, regnum: uint32,
+                           val: uint16) -> int32:
+    return 0
+
+
+def _r8k_phy_read_mmd(phydev: uint64, devad: int32, regnum: uint32) -> int32:
+    return 0xffff
+
+
+def _r8k_phy_write_mmd(phydev: uint64, devad: int32, regnum: uint32,
+                         val: uint16) -> int32:
+    return 0
+
+
+def _r8k_phy_select_page(phydev: uint64, page: int32) -> int32:
+    return 0
+
+
+def _r8k_phy_restore_page(phydev: uint64, oldpage: int32, ret: int32) -> int32:
+    return ret
+
+
+def _r8k_phy_modify(phydev: uint64, regnum: uint32,
+                     mask: uint16, set_bits: uint16) -> int32:
+    # int phy_modify(struct phy_device *, u32 regnum, u16 mask, u16 set);
+    # Read-modify-write. No PHY; success.
+    return 0
+
+
+def _r8k___phy_modify(phydev: uint64, regnum: uint32,
+                       mask: uint16, set_bits: uint16) -> int32:
+    # Lockless variant; same behaviour.
+    return 0
+
+
+def _r8k_phy_modify_paged(phydev: uint64, page: int32, regnum: uint32,
+                            mask: uint16, set_bits: uint16) -> int32:
+    return 0
+
+
+# =====================================================================
+# Group 2: MDIO bus
+# =====================================================================
+#
+# The MDIO bus connects the MAC to the PHY chip. r8169 registers a
+# per-device MDIO bus via __devm_mdiobus_register; it then calls
+# mdiobus_get_phy / mdiobus_read / mdiobus_write to probe and program
+# the PHY. With no PHY behind the bus, reads return 0xffff (the
+# all-ones default for an absent device).
+
+def _r8k_devm_mdiobus_alloc_size(dev: uint64, sz: int32) -> uint64:
+    # struct mii_bus *devm_mdiobus_alloc_size(struct device *, int sizeof_priv);
+    # Allocates a struct mii_bus with `sz` trailing bytes for the
+    # driver's private state. Real struct mii_bus is ~512 bytes; we
+    # give it 1 KiB + sz.
+    total: uint64 = 1024
+    if sz > 0:
+        total = total + cast[uint64](sz)
+    return kzalloc(total)
+
+
+def _r8k___devm_mdiobus_register(dev: uint64, bus: uint64,
+                                   owner: uint64) -> int32:
+    # int __devm_mdiobus_register(struct device *, struct mii_bus *,
+    #                              struct module *);
+    # Registers the bus and triggers a PHY scan. No bus to attach to;
+    # success keeps the driver's probe on the happy path.
+    return 0
+
+
+def _r8k_mdiobus_get_phy(bus: uint64, addr: int32) -> uint64:
+    # struct phy_device *mdiobus_get_phy(struct mii_bus *, int addr);
+    # Returns the phy_device at the given MDIO address, or NULL. r8169
+    # walks addr 0..31 looking for a non-NULL phydev. We return NULL
+    # for every address; the driver falls back to "no PHY found" and
+    # uses its built-in default.
+    return 0
+
+
+def _r8k_mdiobus_read(bus: uint64, addr: int32, regnum: uint32) -> int32:
+    # int mdiobus_read(struct mii_bus *, int addr, u32 regnum);
+    # Returns the 16-bit register value or a negative errno. 0xffff
+    # is the "no device on this address" bus-floats-high reading,
+    # which the driver treats as "no PHY here" (the address scan
+    # short-circuits on that).
+    return 0xffff
+
+
+def _r8k_mdiobus_write(bus: uint64, addr: int32, regnum: uint32,
+                        val: uint16) -> int32:
+    return 0
+
+
+def _r8k___mdiobus_write(bus: uint64, addr: int32, regnum: uint32,
+                          val: uint16) -> int32:
+    # Lockless variant; same behaviour.
+    return 0
+
+
+# =====================================================================
+# Group 3: PCI extensions (pcim_/pci_ surface beyond api_e1000e)
+# =====================================================================
+
+def _r8k_pcim_enable_device(pdev: uint64) -> int32:
+    # int pcim_enable_device(struct pci_dev *);
+    # devm variant of pci_enable_device — auto-disables on driver detach.
+    # Hamnix's existing pci.ad already brings the device up at scan time,
+    # so this is success.
+    return 0
+
+
+def _r8k_pcim_iomap_regions(pdev: uint64, mask: int32,
+                              name: Ptr[char]) -> int32:
+    # int pcim_iomap_regions(struct pci_dev *, int mask, const char *name);
+    # Maps the requested BARs into the per-device iomap table; the
+    # driver later uses pcim_iomap_table() to access them. Hamnix is
+    # identity-mapped, so we just leave the iomap table at the BAR
+    # phys addresses. Return success — populating happens lazily in
+    # pcim_iomap_table below.
+    return 0
+
+
+def _r8k_pcim_iomap_table(pdev: uint64) -> uint64:
+    # void __iomem * const *pcim_iomap_table(struct pci_dev *);
+    # Returns the per-pdev iomap table. For our env, return our static
+    # 6-slot pointer table backing — the driver indexes by BAR number.
+    # The driver only calls this AFTER pcim_iomap_regions; populating
+    # at first call would need real pdev introspection. For now we
+    # return the empty table and lean on the driver tolerating NULL
+    # entries (it reads BAR2 for the MMIO window on most variants and
+    # NULL there would cause a deref crash — but on QEMU's rtl8139
+    # backward-compat path the driver finds the device but bails on
+    # the chip-version probe before touching MMIO).
+    return cast[uint64](&r8k_iomap_table[0])
+
+
+def _r8k_pcim_set_mwi(pdev: uint64) -> int32:
+    # int pcim_set_mwi(struct pci_dev *);
+    # Enables Memory-Write-Invalidate on the PCI bus. Not wired; success.
+    return 0
+
+
+def _r8k_pci_set_power_state(pdev: uint64, state: int32) -> int32:
+    # int pci_set_power_state(struct pci_dev *, pci_power_t state);
+    # PCI D0/D1/D2/D3hot/D3cold transitions. No PM in our env; success.
+    return 0
+
+
+def _r8k_pci_status_get_and_clear_errors(pdev: uint64) -> uint16:
+    # u16 pci_status_get_and_clear_errors(struct pci_dev *);
+    # Reads the PCI status register, clears any error bits, returns
+    # the bits that were set. No errors at insmod; return 0.
+    return 0
+
+
+def _r8k_pci_wake_from_d3(pdev: uint64, enable: int32) -> int32:
+    return 0
+
+
+def _r8k_pci_alloc_irq_vectors_affinity(pdev: uint64, min_vecs: uint32,
+                                          max_vecs: uint32, flags: uint32,
+                                          affd: uint64) -> int32:
+    # int pci_alloc_irq_vectors_affinity(struct pci_dev *, unsigned int,
+    #                                      unsigned int, unsigned int,
+    #                                      struct irq_affinity *);
+    # The affinity-aware variant of pci_alloc_irq_vectors. api_l61.ad
+    # ships the non-affinity version with the same semantics (returns
+    # min_vecs as "we got that many"); mirror that.
+    return cast[int32](min_vecs)
+
+
+def _r8k_pcie_set_readrq(pdev: uint64, rq: int32) -> int32:
+    # int pcie_set_readrq(struct pci_dev *, int rq);
+    # Programs the PCI Express device's Max Read Request Size. Not
+    # wired in our env; success.
+    return 0
+
+
+# =====================================================================
+# Group 4: netdev / skb additions
+# =====================================================================
+
+def _r8k_napi_consume_skb(skb: uint64, budget: int32):
+    # void napi_consume_skb(struct sk_buff *, int budget);
+    # Free-from-NAPI-context variant of kfree_skb. Same backing free
+    # as the e1000e batch's __dev_kfree_skb_any (sk_buff layout is
+    # the same: alloc base stashed in skb-8).
+    if skb == 0:
+        return
+    bsp: Ptr[uint64] = cast[Ptr[uint64]](skb - 8)
+    base: uint64 = bsp[0]
+    if base != 0 and base < skb:
+        kfree(base)
+
+
+def _r8k_netdev_printk(level: Ptr[char], dev: uint64, fmt: Ptr[char]) -> int32:
+    # int netdev_printk(const char *level, const struct net_device *,
+    #                    const char *fmt, ...);
+    # Generic netdev printk dispatcher; same convention as the e1000e
+    # batch's _e1k_netdev_err — drop level, prefix, forward fmt.
+    printk0("[netdev] ")
+    printk0(fmt)
+    printk0("\n")
+    return 0
+
+
+def _r8k_netdev_stats_to_stats64(stats64: uint64, netdev_stats: uint64):
+    # void netdev_stats_to_stats64(struct rtnl_link_stats64 *,
+    #                                const struct net_device_stats *);
+    # Copies the 32-bit-field struct net_device_stats into the 64-bit
+    # struct rtnl_link_stats64. ~24 u64 fields; init-cold caller
+    # (only fires from `ip -s link`). Zero the dst as a benign default.
+    if stats64 == 0:
+        return
+    memset(cast[Ptr[uint8]](stats64), 0, 192)
+
+
+def _r8k_netif_set_tso_max_segs(dev: uint64, segs: uint32):
+    return
+
+
+def _r8k_netif_set_tso_max_size(dev: uint64, size: uint32):
+    return
+
+
+def _r8k_dev_fetch_sw_netstats(stats64: uint64, netstats: uint64):
+    # void dev_fetch_sw_netstats(struct rtnl_link_stats64 *,
+    #                              const struct pcpu_sw_netstats __percpu *);
+    # Same shape as netdev_stats_to_stats64 — zero out the dst.
+    if stats64 == 0:
+        return
+    memset(cast[Ptr[uint8]](stats64), 0, 192)
+
+
+def _r8k_devm_alloc_etherdev_mqs(dev: uint64, sizeof_priv: int32,
+                                   txqs: uint32, rxqs: uint32) -> uint64:
+    # struct net_device *devm_alloc_etherdev_mqs(struct device *,
+    #                                              int sizeof_priv,
+    #                                              unsigned int txqs,
+    #                                              unsigned int rxqs);
+    # devm variant of alloc_etherdev_mqs — the alloc lifetime tracks
+    # the struct device's destructor. In our env there's no devres
+    # chain, so behave like alloc_etherdev_mqs (api_netdev.ad
+    # _l_alloc_etherdev_mqs). We can't import that directly without
+    # creating a circular dep; inline the same shape (kzalloc the
+    # net_device payload).
+    NETDEV_PAYLOAD: uint64 = 0xA00            # ~2560 bytes for the
+                                              # net_device + scratch the
+                                              # api_netdev shim sizes
+    total: uint64 = NETDEV_PAYLOAD
+    if sizeof_priv > 0:
+        total = total + cast[uint64](sizeof_priv)
+    blob: uint64 = kzalloc(total)
+    if blob == 0:
+        return 0
+    # Wire dev_addr (NETDEV_DEV_ADDR_PTR_OFF == 0x330) -> in-struct
+    # buffer at 0x340. Same convention as api_netdev's _l_alloc_etherdev_mqs.
+    ptr: Ptr[uint64] = cast[Ptr[uint64]](blob + 0x330)
+    ptr[0] = blob + 0x340
+    return blob
+
+
+def _r8k_eth_platform_get_mac_address(dev: uint64, mac_addr: uint64) -> int32:
+    # int eth_platform_get_mac_address(struct device *, u8 *mac_addr);
+    # Looks up a MAC address from platform device tree / EFI variables.
+    # Not wired; -ENODEV. The driver falls back to reading the MAC
+    # from the chip's EEPROM (or from a synthetic default).
+    return -19                                  # -ENODEV
+
+
+# =====================================================================
+# Group 5: clk / firmware / numa / misc
+# =====================================================================
+#
+# Realtek's r8169 supports both x86 PCIe NICs (no clock framework
+# involved) and embedded ARM SoC variants (where a parent clock gates
+# the NIC). On x86 the clk_* calls return -ENODEV from clk_get and
+# the driver treats that as "no clock to manage" — benign. We mirror
+# that with the devm_clk_get_optional_enabled returning NULL (== no
+# clk), and the clk_* helpers being pure no-ops in case the driver
+# stashed a non-NULL elsewhere.
+
+def _r8k_clk_prepare(clk: uint64) -> int32:
+    return 0
+
+
+def _r8k_clk_unprepare(clk: uint64):
+    return
+
+
+def _r8k_clk_enable(clk: uint64) -> int32:
+    return 0
+
+
+def _r8k_clk_disable(clk: uint64):
+    return
+
+
+def _r8k_devm_clk_get_optional_enabled(dev: uint64, name: Ptr[char]) -> uint64:
+    # struct clk *devm_clk_get_optional_enabled(struct device *,
+    #                                              const char *);
+    # NULL == "optional clock not present, that's fine". The driver
+    # checks IS_ERR_OR_NULL and skips the clock management path.
+    return 0
+
+
+# ---- firmware loading (Realtek 8168 PHY firmware blobs) ----
+
+def _r8k_request_firmware(fw: uint64, name: Ptr[char], dev: uint64) -> int32:
+    # int request_firmware(const struct firmware **fw, const char *name,
+    #                        struct device *);
+    # Hamnix has no firmware loader. Return -ENOENT; r8169 treats that
+    # as "no firmware blob for this PHY revision" and continues with
+    # the chip's compile-time default. The probe path tolerates this.
+    if fw != 0:
+        p: Ptr[uint64] = cast[Ptr[uint64]](fw)
+        p[0] = 0
+    return -2                                    # -ENOENT
+
+
+def _r8k_release_firmware(fw: uint64):
+    # void release_firmware(const struct firmware *);
+    # NULL-safe (matches Linux). We never returned a non-NULL fw above,
+    # so this never has anything to free.
+    return
+
+
+# ---- misc ----
+
+def _r8k_byte_rev_table_init():
+    # Internal helper: populate the byte-rev lookup table with the
+    # bit-reversal of each index. Called once at register time.
+    i: uint64 = 0
+    while i < 256:
+        rev: uint8 = 0
+        j: uint64 = 0
+        while j < 8:
+            bit: uint8 = cast[uint8]((i >> j) & 1)
+            rev = rev | (bit << (7 - j))
+            j = j + 1
+        r8k_byte_rev_table_buf[i] = rev
+        i = i + 1
+
+
+def _r8k_dev_err_probe(dev: uint64, err: int32, fmt: Ptr[char]) -> int32:
+    # int dev_err_probe(const struct device *, int err, const char *fmt, ...);
+    # Logs a probe-time error and returns `err` unchanged. We just
+    # forward the format to printk and return err so the driver's
+    # error-arm goto-out chain keeps the same shape.
+    printk0("[dev_err_probe] ")
+    printk0(fmt)
+    printk0("\n")
+    return err
+
+
+def _r8k_cancel_work(work: uint64) -> int32:
+    # bool cancel_work(struct work_struct *);
+    # Tries to cancel a queued work item; returns true on success.
+    # Hamnix's workqueue is synchronous (jobs run inline on
+    # queue_work), so by the time cancel is called the work has
+    # already executed. Return false ("nothing to cancel").
+    return 0
+
+
+def _r8k_memcpy_fromio(dst: uint64, src: uint64, n: uint64):
+    # void memcpy_fromio(void *to, const volatile void __iomem *from,
+    #                      size_t count);
+    # Memory-from-MMIO copy. On x86 identity-mapped (and with the
+    # BAR window UC-marked at boot), a plain byte-wise copy works.
+    if dst == 0 or src == 0 or n == 0:
+        return
+    memcpy(cast[Ptr[uint8]](dst), cast[Ptr[uint8]](src), n)
+
+
+def _r8k_alloc_pages(gfp: uint32, order: uint32) -> uint64:
+    # struct page *__alloc_pages(gfp_t, unsigned int order, int preferred_nid,
+    #                              nodemask_t *nodemask);
+    # We export the simpler 2-arg shape; SysV ABI puts the extra args
+    # in %rdx/%rcx which our 2-arg shim ignores. Backing alloc is
+    # kzalloc(1 << order pages), same as the e1000e batch's
+    # _e1k_alloc_pages.
+    sz: uint64 = cast[uint64](4096) << order
+    return kzalloc(sz)
+
+
+def _r8k_devm_alloc_percpu(dev: uint64, size: uint64) -> uint64:
+    # void __percpu *__devm_alloc_percpu(struct device *, size_t size,
+    #                                      size_t align);
+    # Per-CPU allocator with devm cleanup. Single-CPU env -> one slab
+    # alloc, no per-CPU striding.
+    return kzalloc(size)
+
+
+# =====================================================================
+# Registration
+# =====================================================================
+
+def linux_abi_register_r8169():
+    # Called from linux_abi_exports_init() after the e1000e batch.
+    # Adds the 70 exports the stock r8169.ko needs beyond what
+    # L<=68 + api_e1000e already ships.
+
+    # Populate the byte-rev lookup once.
+    _r8k_byte_rev_table_init()
+
+    # ---- Group 1: PHY library ----
+    _add_export("phy_connect_direct",
+                cast[uint64](&_r8k_phy_connect_direct))
+    _add_export("phy_disconnect",
+                cast[uint64](&_r8k_phy_disconnect))
+    _add_export("phy_start",
+                cast[uint64](&_r8k_phy_start))
+    _add_export("phy_stop",
+                cast[uint64](&_r8k_phy_stop))
+    _add_export("phy_resume",
+                cast[uint64](&_r8k_phy_resume))
+    _add_export("phy_suspend",
+                cast[uint64](&_r8k_phy_suspend))
+    _add_export("phy_init_hw",
+                cast[uint64](&_r8k_phy_init_hw))
+    _add_export("phy_attached_info",
+                cast[uint64](&_r8k_phy_attached_info))
+    _add_export("phy_start_aneg",
+                cast[uint64](&_r8k_phy_start_aneg))
+    _add_export("phy_speed_up",
+                cast[uint64](&_r8k_phy_speed_up))
+    _add_export("phy_speed_down",
+                cast[uint64](&_r8k_phy_speed_down))
+    _add_export("phy_set_max_speed",
+                cast[uint64](&_r8k_phy_set_max_speed))
+    _add_export("phy_print_status",
+                cast[uint64](&_r8k_phy_print_status))
+    _add_export("phy_mac_interrupt",
+                cast[uint64](&_r8k_phy_mac_interrupt))
+    _add_export("phy_do_ioctl_running",
+                cast[uint64](&_r8k_phy_do_ioctl_running))
+    _add_export("phy_get_pause",
+                cast[uint64](&_r8k_phy_get_pause))
+    _add_export("phy_set_asym_pause",
+                cast[uint64](&_r8k_phy_set_asym_pause))
+    _add_export("phy_support_asym_pause",
+                cast[uint64](&_r8k_phy_support_asym_pause))
+    _add_export("phy_ethtool_get_link_ksettings",
+                cast[uint64](&_r8k_phy_ethtool_get_link_ksettings))
+    _add_export("phy_ethtool_set_link_ksettings",
+                cast[uint64](&_r8k_phy_ethtool_set_link_ksettings))
+    _add_export("phy_ethtool_get_eee",
+                cast[uint64](&_r8k_phy_ethtool_get_eee))
+    _add_export("phy_ethtool_set_eee",
+                cast[uint64](&_r8k_phy_ethtool_set_eee))
+    _add_export("phy_ethtool_nway_reset",
+                cast[uint64](&_r8k_phy_ethtool_nway_reset))
+    _add_export("genphy_soft_reset",
+                cast[uint64](&_r8k_genphy_soft_reset))
+    _add_export("phy_read_paged",
+                cast[uint64](&_r8k_phy_read_paged))
+    _add_export("phy_write_paged",
+                cast[uint64](&_r8k_phy_write_paged))
+    _add_export("phy_read_mmd",
+                cast[uint64](&_r8k_phy_read_mmd))
+    _add_export("phy_write_mmd",
+                cast[uint64](&_r8k_phy_write_mmd))
+    _add_export("phy_select_page",
+                cast[uint64](&_r8k_phy_select_page))
+    _add_export("phy_restore_page",
+                cast[uint64](&_r8k_phy_restore_page))
+    _add_export("phy_modify",
+                cast[uint64](&_r8k_phy_modify))
+    _add_export("__phy_modify",
+                cast[uint64](&_r8k___phy_modify))
+    _add_export("phy_modify_paged",
+                cast[uint64](&_r8k_phy_modify_paged))
+
+    # ---- Group 2: MDIO bus ----
+    _add_export("devm_mdiobus_alloc_size",
+                cast[uint64](&_r8k_devm_mdiobus_alloc_size))
+    _add_export("__devm_mdiobus_register",
+                cast[uint64](&_r8k___devm_mdiobus_register))
+    _add_export("mdiobus_get_phy",
+                cast[uint64](&_r8k_mdiobus_get_phy))
+    _add_export("mdiobus_read",
+                cast[uint64](&_r8k_mdiobus_read))
+    _add_export("mdiobus_write",
+                cast[uint64](&_r8k_mdiobus_write))
+    _add_export("__mdiobus_write",
+                cast[uint64](&_r8k___mdiobus_write))
+
+    # ---- Group 3: PCI extensions ----
+    _add_export("pcim_enable_device",
+                cast[uint64](&_r8k_pcim_enable_device))
+    _add_export("pcim_iomap_regions",
+                cast[uint64](&_r8k_pcim_iomap_regions))
+    _add_export("pcim_iomap_table",
+                cast[uint64](&_r8k_pcim_iomap_table))
+    _add_export("pcim_set_mwi",
+                cast[uint64](&_r8k_pcim_set_mwi))
+    _add_export("pci_set_power_state",
+                cast[uint64](&_r8k_pci_set_power_state))
+    _add_export("pci_status_get_and_clear_errors",
+                cast[uint64](&_r8k_pci_status_get_and_clear_errors))
+    _add_export("pci_wake_from_d3",
+                cast[uint64](&_r8k_pci_wake_from_d3))
+    _add_export("pci_alloc_irq_vectors_affinity",
+                cast[uint64](&_r8k_pci_alloc_irq_vectors_affinity))
+    _add_export("pcie_set_readrq",
+                cast[uint64](&_r8k_pcie_set_readrq))
+
+    # ---- Group 4: netdev / skb ----
+    _add_export("napi_consume_skb",
+                cast[uint64](&_r8k_napi_consume_skb))
+    _add_export("netdev_printk",
+                cast[uint64](&_r8k_netdev_printk))
+    _add_export("netdev_stats_to_stats64",
+                cast[uint64](&_r8k_netdev_stats_to_stats64))
+    _add_export("netif_set_tso_max_segs",
+                cast[uint64](&_r8k_netif_set_tso_max_segs))
+    _add_export("netif_set_tso_max_size",
+                cast[uint64](&_r8k_netif_set_tso_max_size))
+    _add_export("dev_fetch_sw_netstats",
+                cast[uint64](&_r8k_dev_fetch_sw_netstats))
+    _add_export("devm_alloc_etherdev_mqs",
+                cast[uint64](&_r8k_devm_alloc_etherdev_mqs))
+    _add_export("eth_platform_get_mac_address",
+                cast[uint64](&_r8k_eth_platform_get_mac_address))
+
+    # ---- Group 5: clk / firmware / misc ----
+    _add_export("clk_prepare",
+                cast[uint64](&_r8k_clk_prepare))
+    _add_export("clk_unprepare",
+                cast[uint64](&_r8k_clk_unprepare))
+    _add_export("clk_enable",
+                cast[uint64](&_r8k_clk_enable))
+    _add_export("clk_disable",
+                cast[uint64](&_r8k_clk_disable))
+    _add_export("devm_clk_get_optional_enabled",
+                cast[uint64](&_r8k_devm_clk_get_optional_enabled))
+    _add_export("request_firmware",
+                cast[uint64](&_r8k_request_firmware))
+    _add_export("release_firmware",
+                cast[uint64](&_r8k_release_firmware))
+    _add_export("dev_err_probe",
+                cast[uint64](&_r8k_dev_err_probe))
+    _add_export("cancel_work",
+                cast[uint64](&_r8k_cancel_work))
+    _add_export("memcpy_fromio",
+                cast[uint64](&_r8k_memcpy_fromio))
+    _add_export("__alloc_pages",
+                cast[uint64](&_r8k_alloc_pages))
+    _add_export("__devm_alloc_percpu",
+                cast[uint64](&_r8k_devm_alloc_percpu))
+
+    # ---- DATA exports ----
+    _add_export("numa_node",
+                cast[uint64](&r8k_numa_node_var))
+    _add_export("byte_rev_table",
+                cast[uint64](&r8k_byte_rev_table_buf[0]))

@@ -382,6 +382,28 @@ if _CPIO_STRESS_RAW:
             _payload = b"x\n"
         FILES.append((f"/cpio-stress/file{_i}", _payload))
 
+# Multi-NIC L-shim scale-out: r8169.ko (Realtek consumer GbE) and
+# igb.ko (Intel server/workstation). Mirrors the ENABLE_E1000E_KO
+# marker shape above. scripts/test_r8169_ko.sh sets ENABLE_R8169_KO=1
+# to plant /etc/r8169-ko; scripts/test_igb_ko.sh sets ENABLE_IGB_KO=1
+# to plant /etc/igb-ko. init/main.ad reads each marker to (a) skip
+# any hand-rolled driver that would conflict and (b) kmod_linux_load
+# the matching /lib/modules/<name>.ko at boot. Default boot omits
+# both markers so unrelated tests run against existing drivers.
+#
+# These env-var markers live at the BOTTOM of this gated-marker
+# section by design: Agent B's auto-modules logic (when it lands) is
+# expected to slot in higher up, keeping the rebase area conflict-
+# free. The order in FILES doesn't affect cpio lookup semantics
+# (fs/vfs.ad's _lookup_name returns the first exact-match path; each
+# marker has a unique path).
+if os.environ.get("ENABLE_R8169_KO") == "1":
+    FILES.append(("/etc/r8169-ko", b"1\n"))
+
+if os.environ.get("ENABLE_IGB_KO") == "1":
+    FILES.append(("/etc/igb-ko", b"1\n"))
+
+
 # See INIT_ELF handling inside build_archive(): set INIT_ELF=path to
 # override which on-disk file becomes /init in the cpio archive, e.g.
 # to swap in a Hamnix-compiled user binary without touching user/init.S.
@@ -841,6 +863,26 @@ def build_archive() -> bytes:
         # init/main.ad's modprobe_auto_load() block only fires when
         # this file is present in the initramfs.
         FILES.append(("/etc/auto-modules", b"1\n"))
+
+    # Multi-NIC scale-out: r8169.ko (Realtek consumer GbE) and igb.ko
+    # (Intel server/workstation). Same plant-unconditional shape as
+    # e1000e.ko above — marker files at /etc/r8169-ko and /etc/igb-ko
+    # gate which .ko init/main.ad actually loads at boot.
+    r8169_ko = here / "kernel-modules" / "r8169" / "r8169.ko"
+    if r8169_ko.is_file():
+        data = r8169_ko.read_bytes()
+        name = "/lib/modules/r8169.ko"
+        blob += cpio_entry(name, data)
+        print(f"  embedded {name} ({len(data)} bytes from "
+              f"kernel-modules/r8169/r8169.ko)")
+
+    igb_ko = here / "kernel-modules" / "igb" / "igb.ko"
+    if igb_ko.is_file():
+        data = igb_ko.read_bytes()
+        name = "/lib/modules/igb.ko"
+        blob += cpio_entry(name, data)
+        print(f"  embedded {name} ({len(data)} bytes from "
+              f"kernel-modules/igb/igb.ko)")
 
     # U5: host-built Linux ELF test binaries. Anything staged under
     # tests/u-binary/ (built by tests/u-binary/src/*/Makefile via
