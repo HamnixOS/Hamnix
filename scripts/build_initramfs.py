@@ -445,6 +445,24 @@ if os.environ.get("ENABLE_R8169_KO") == "1":
 if os.environ.get("ENABLE_IGB_KO") == "1":
     FILES.append(("/etc/igb-ko", b"1\n"))
 
+# Multi-NIC L-shim scale-out (round 2): atlantic (Aquantia 10G), alx
+# (Qualcomm Atheros), sky2 (Marvell Yukon 2), tg3 (Broadcom NetXtreme).
+# Same marker shape as the round-1 trio above. The per-NIC test
+# scripts (scripts/test_<name>_ko.sh) flip the matching env var to
+# plant the /etc/<name>-ko marker the init/main.ad framework-modules
+# reader will eventually honor.
+if os.environ.get("ENABLE_ATLANTIC_KO") == "1":
+    FILES.append(("/etc/atlantic-ko", b"1\n"))
+
+if os.environ.get("ENABLE_ALX_KO") == "1":
+    FILES.append(("/etc/alx-ko", b"1\n"))
+
+if os.environ.get("ENABLE_SKY2_KO") == "1":
+    FILES.append(("/etc/sky2-ko", b"1\n"))
+
+if os.environ.get("ENABLE_TG3_KO") == "1":
+    FILES.append(("/etc/tg3-ko", b"1\n"))
+
 
 # See INIT_ELF handling inside build_archive(): set INIT_ELF=path to
 # override which on-disk file becomes /init in the cpio archive, e.g.
@@ -949,6 +967,46 @@ def build_archive() -> bytes:
         blob += cpio_entry(name, data)
         print(f"  embedded {name} ({len(data)} bytes from "
               f"kernel-modules/igb/igb.ko)")
+
+    # Multi-NIC L-shim scale-out (round 2): atlantic.ko (Aquantia 10G),
+    # alx.ko (Qualcomm Atheros AR816x), sky2.ko (Marvell Yukon 2),
+    # tg3.ko (Broadcom NetXtreme). Each is a coverage-probe load —
+    # success criterion is `init returned 0` with zero skipped
+    # relocations. Same unconditional-bake shape as the round-1 trio
+    # above; the gating /etc/<name>-ko marker controls whether
+    # init/main.ad's framework-modules path actually insmods the
+    # binary at boot.
+    atlantic_ko = here / "kernel-modules" / "atlantic" / "atlantic.ko"
+    if atlantic_ko.is_file():
+        data = atlantic_ko.read_bytes()
+        name = "/lib/modules/atlantic.ko"
+        blob += cpio_entry(name, data)
+        print(f"  embedded {name} ({len(data)} bytes from "
+              f"kernel-modules/atlantic/atlantic.ko)")
+
+    alx_ko = here / "kernel-modules" / "alx" / "alx.ko"
+    if alx_ko.is_file():
+        data = alx_ko.read_bytes()
+        name = "/lib/modules/alx.ko"
+        blob += cpio_entry(name, data)
+        print(f"  embedded {name} ({len(data)} bytes from "
+              f"kernel-modules/alx/alx.ko)")
+
+    sky2_ko = here / "kernel-modules" / "sky2" / "sky2.ko"
+    if sky2_ko.is_file():
+        data = sky2_ko.read_bytes()
+        name = "/lib/modules/sky2.ko"
+        blob += cpio_entry(name, data)
+        print(f"  embedded {name} ({len(data)} bytes from "
+              f"kernel-modules/sky2/sky2.ko)")
+
+    tg3_ko = here / "kernel-modules" / "tg3" / "tg3.ko"
+    if tg3_ko.is_file():
+        data = tg3_ko.read_bytes()
+        name = "/lib/modules/tg3.ko"
+        blob += cpio_entry(name, data)
+        print(f"  embedded {name} ({len(data)} bytes from "
+              f"kernel-modules/tg3/tg3.ko)")
 
     # Storage pivot (Agent D): ahci.ko (SATA AHCI controller —
     # Debian 6.1.0-32 build, ~117 KiB). Planted at /lib/modules/ahci.ko
