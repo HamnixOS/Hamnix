@@ -57,7 +57,7 @@ rc=$?
 set -e
 
 echo "[test_e1000e_tx] --- captured (kmod / e1000e / eth / pci_register_driver) ---"
-grep -E 'kmod_linux|\[e1000e\.ko\]|\[e1000e\]|\[eth\]|\[netdev|\[boot:35|\[pci_register_driver\]|\[dev_open\]|\[linux_tx_bridge\]|\[pci_msi\]|\[request_(irq|threaded_irq)\]' "$LOG" || true
+grep -E 'kmod_linux|\[e1000e\.ko\]|\[e1000e\]|\[eth\]|\[netdev|\[boot:35|\[pci_register_driver\]|\[dev_open\]|\[linux_tx_bridge\]|\[pci_msi\]|\[request_(irq|threaded_irq)\]|\[dhcp\]|\[napi_gro_receive\]' "$LOG" || true
 echo "[test_e1000e_tx] --- end ---"
 
 fail=0

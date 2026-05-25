@@ -64,7 +64,7 @@
 from linux_abi.exports import _add_export
 from mm.slab import kmalloc, kfree, kzalloc
 from kernel.printk.printk import printk0, printk1, printk2
-from drivers.net.eth import eth_register_tx_hook, eth_rx
+from drivers.net.eth import eth_register_tx_hook, eth_rx, eth_set_mac
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
@@ -402,29 +402,92 @@ NETDEV_STATE_OPEN:       uint64 = 3
 # --- struct sk_buff offsets (Linux 6.1) ----------------------------
 #
 # Verified by disassembling e1000_xmit_frame in the Debian e1000e.ko:
-#   movzwl 0xb4(%rdi),%ebx   -> skb->protocol  (u16, big-endian)
-#   mov    0x70(%rdi),%ebp   -> skb->len       (u32)
-#   mov    0x74(%rdi),%r14d  -> skb->data_len  (u32)
-#   mov    0xd0(%r9),%rsi    -> skb->data      (Ptr[u8], 8 bytes)
-#   mov    0xc8(%r9),%rax    -> skb->head      (Ptr[u8], 8 bytes)
-# These are the bare-minimum fields the e1000e xmit path reads. A
-# real driver in production would also touch protocol_offset,
-# transport_header, mac_header, end, tail, etc. — we leave those
-# zeroed (kzalloc), which works for the no-checksum / no-frag
-# Ethernet frames Hamnix's eth_tx() builds.
-SKB_LEN_OFF:        uint64 = 0x70
-SKB_DATA_LEN_OFF:   uint64 = 0x74
-SKB_PROTOCOL_OFF:   uint64 = 0xb4
-SKB_HEAD_OFF:       uint64 = 0xc8
-SKB_DATA_OFF:       uint64 = 0xd0
+#   movzwl 0xb4(%rdi),%ebx   -> skb->protocol         (u16, big-endian)
+#   mov    0x70(%rdi),%ebp   -> skb->len              (u32)
+#   mov    0x74(%rdi),%r14d  -> skb->data_len         (u32)
+#   movzbl 0x80(%r9),%eax    -> skb->__pkt_type_offset bits (csum-related)
+#   movzbl 0x7e(%r9),...     -> skb->ip_summed / vlan flags
+#   testb  $0x1,0x82(%r9)    -> skb->vlan flags
+#   mov    0xc0(%r9),%esi    -> skb->transport_header (u16)
+#   movzwl 0xb6(%r9),%ecx    -> skb->network_header   (u16)
+#   movzwl 0xb8(%r9),%edx    -> skb->mac_header       (u16)
+#   mov    0xc8(%r9),%rax    -> skb->head             (Ptr[u8], 8 bytes)
+#   mov    0xd0(%r9),%rsi    -> skb->data             (Ptr[u8], 8 bytes)
+#
+# The e1000e xmit path uses head+transport_header / head+mac_header to
+# locate the IP and L2 headers for descriptor-fill purposes. If those
+# 16-bit offsets are uninitialized / garbage, head+offset lands in
+# random memory and the bytes the driver reads back (proto, csum,
+# vlan_tci) drive it down the wrong control-flow branch — most
+# spectacularly into a BUG()/UD2 inside e1000_maybe_stop_tx where the
+# computed descriptor-count exceeds tx_ring->count.
+#
+# Hamnix's eth_tx() hands us a wire-shaped Ethernet frame:
+#     [ dst MAC | src MAC | ethertype | L3 payload (IP, ARP, ...) ]
+#       0      6        12          14
+# We point head==data at the frame start, set mac_header=0,
+# network_header=14, and transport_header=14 (IP header start; for
+# UDP/TCP the driver computes the transport offset itself once it
+# parses the IP header — and the e1000e path that reads transport_header
+# only takes the no-TSO no-checksum-offload branches for our case).
+SKB_LEN_OFF:                uint64 = 0x70
+SKB_DATA_LEN_OFF:           uint64 = 0x74
+SKB_HDR_LEN_OFF:            uint64 = 0x7c    # u16
+SKB_IP_SUMMED_OFF:          uint64 = 0x80    # u8 bitfield
+SKB_VLAN_FLAGS_OFF:         uint64 = 0x82    # u8 vlan_present etc.
+SKB_PROTOCOL_OFF:           uint64 = 0xb4    # __be16
+SKB_NETWORK_HEADER_OFF:     uint64 = 0xc2    # u16 (relative to head)
+SKB_MAC_HEADER_OFF:         uint64 = 0xc4    # u16 (relative to head)
+SKB_TRANSPORT_HEADER_OFF:   uint64 = 0xc0    # u16 (relative to head)
+SKB_HEAD_OFF:               uint64 = 0xc8    # u8*
+SKB_DATA_OFF:               uint64 = 0xd0    # u8*
+SKB_TRUESIZE_OFF:           uint64 = 0xd8    # u32
+SKB_USERS_OFF:              uint64 = 0xdc    # refcount_t (u32)
 
 # sizeof(struct sk_buff) in 6.1 with default config is around 232
-# bytes. We allocate a generous 256-byte control region followed by
+# bytes. We allocate a generous 512-byte control region followed by
 # the data buffer, so any field offset within the upstream sk_buff
 # lands inside our alloc. Anything we don't explicitly populate is
-# zero — same default as the slab cache Linux kfree_skb-aware code
-# expects.
-SKB_CONTROL_SIZE:   uint64 = 256
+# zero (kzalloc). Doubled from the original 256 to give the driver's
+# offset-driven reads room past the documented Linux 6.1 layout.
+SKB_CONTROL_SIZE:           uint64 = 512
+
+
+# --- struct net_device fields the e1000e xmit path reads ----------
+#
+# Verified by disassembling e1000_xmit_frame and e1000_maybe_stop_tx:
+#   mov    0xc80(%rsi),%r15    -> netdev[0xc80] = adapter->tx_ring (ptr)
+#   mov    0xc88(%r12),%edi    -> netdev[0xc88] = adapter->tx_fifo_limit
+#                                 (max bytes per Tx descriptor; used as
+#                                  divisor in the per-frag descriptor
+#                                  count formula `ceil(head_len/limit)`)
+#   mov    0xc50(%r12),%rax    -> netdev[0xc50] = adapter->state flags;
+#                                 bit 3 == __E1000_DOWN; xmit bails on
+#                                 NETDEV_TX_OK if set.
+#
+# The driver writes a default `tx_fifo_limit` during e1000e_reset (which
+# fires from probe), but the calculation depends on hardware-FIFO PBA
+# state we don't fully model — so on the QEMU emulated e1000e the
+# field can be left at 0 or 1 by the reset path, which would BUG the
+# xmit path when the divisor is used. We seed the field to 8192
+# (E1000_MAX_PER_TXD) defensively from linux_tx_bridge_arm — same
+# value Linux uses as the upper ceiling when its computation overflows.
+NETDEV_TX_RING_OFF:         uint64 = 0xc80
+NETDEV_TX_FIFO_LIMIT_OFF:   uint64 = 0xc88
+NETDEV_STATE_FLAGS_OFF:     uint64 = 0xc50
+
+# struct e1000_ring fields the driver reads in the xmit fast path:
+#   mov    (%rdi),%rbp        -> ring->adapter (back-ptr; set in probe)
+#   mov    0x1c(%rdi),%edi    -> ring->count (descriptor-array length)
+# If ring->count == 0 the BUG fires unconditionally. Probe writes the
+# count via `mov %edx,0x1c(%rax)` from netdev[0x387c] (=256 default),
+# but we backstop here in case the path was missed.
+RING_COUNT_OFF:             uint64 = 0x1c
+
+# E1000 max bytes per Tx descriptor (8 KiB). Drives the per-frag
+# descriptor-count divisor. With a 300-byte DHCP DISCOVER frame and
+# limit=8192, descriptors needed = ceil(300/8192) = 1.
+E1000_MAX_PER_TXD:          uint64 = 8192
 
 
 # --- TX bridge: eth_tx_hook -> netdev_ops->ndo_start_xmit ----------
@@ -458,6 +521,27 @@ def _l_linux_tx_bridge(buf: Ptr[uint8], length: uint64) -> int32:
     if xmit_addr == 0:
         printk0("[linux_tx_bridge] netdev has no ndo_start_xmit\n")
         return -1
+
+    # --- Safety net: ensure the netdev fields the xmit path reads are
+    # populated even if the driver's probe/reset path skipped them. The
+    # divisor at NETDEV_TX_FIFO_LIMIT_OFF is the most consequential —
+    # if 0 -> #DE, if 1 -> descriptors-needed becomes head_len which
+    # exceeds tx_ring->count and BUGs the maybe_stop_tx check.
+    fifo_limit_p: Ptr[uint32] = cast[Ptr[uint32]](
+        _l_linux_netdev_for_tx + NETDEV_TX_FIFO_LIMIT_OFF)
+    if fifo_limit_p[0] == 0 or fifo_limit_p[0] == 1:
+        fifo_limit_p[0] = cast[uint32](E1000_MAX_PER_TXD)
+    # Backstop ring->count too — if the descriptor count is unset, the
+    # very first read inside e1000_maybe_stop_tx (`mov 0x1c(%rdi),%edi`)
+    # returns 0 and `count < size` is true unconditionally -> BUG.
+    ring_pp: Ptr[uint64] = cast[Ptr[uint64]](
+        _l_linux_netdev_for_tx + NETDEV_TX_RING_OFF)
+    ring: uint64 = ring_pp[0]
+    if ring != 0:
+        rcount_p: Ptr[uint32] = cast[Ptr[uint32]](ring + RING_COUNT_OFF)
+        if rcount_p[0] == 0:
+            rcount_p[0] = 256
+
     skb: uint64 = kzalloc(SKB_CONTROL_SIZE + length)
     if skb == 0:
         printk0("[linux_tx_bridge] kzalloc(skb) failed\n")
@@ -470,10 +554,33 @@ def _l_linux_tx_bridge(buf: Ptr[uint8], length: uint64) -> int32:
     len_p[0] = cast[uint32](length)
     dl_p: Ptr[uint32] = cast[Ptr[uint32]](skb + SKB_DATA_LEN_OFF)
     dl_p[0] = 0
+    hl_p: Ptr[uint16] = cast[Ptr[uint16]](skb + SKB_HDR_LEN_OFF)
+    hl_p[0] = 0
     head_p: Ptr[uint64] = cast[Ptr[uint64]](skb + SKB_HEAD_OFF)
     head_p[0] = data_p
     data_pp: Ptr[uint64] = cast[Ptr[uint64]](skb + SKB_DATA_OFF)
     data_pp[0] = data_p
+
+    # Header offsets are u16 byte-offsets RELATIVE to skb->head. For
+    # our Ethernet+IP frame:
+    #   mac_header       = 0   (Ethernet hdr at start of frame)
+    #   network_header   = 14  (IP/ARP starts after the 14-byte ethhdr)
+    #   transport_header = 14  (driver computes the UDP/TCP offset
+    #                           from the IP header in the slow path
+    #                           we never take; pointing at the IP
+    #                           header is benign for ARP/ICMP/DHCP)
+    mac_p:   Ptr[uint16] = cast[Ptr[uint16]](skb + SKB_MAC_HEADER_OFF)
+    mac_p[0] = 0
+    net_p:   Ptr[uint16] = cast[Ptr[uint16]](skb + SKB_NETWORK_HEADER_OFF)
+    net_p[0] = 14
+    trans_p: Ptr[uint16] = cast[Ptr[uint16]](skb + SKB_TRANSPORT_HEADER_OFF)
+    trans_p[0] = 14
+
+    truesize_p: Ptr[uint32] = cast[Ptr[uint32]](skb + SKB_TRUESIZE_OFF)
+    truesize_p[0] = cast[uint32](SKB_CONTROL_SIZE + length)
+    users_p: Ptr[uint32] = cast[Ptr[uint32]](skb + SKB_USERS_OFF)
+    users_p[0] = 1
+
     # protocol: ethertype lives at offset 12..13 of an Ethernet frame
     # (big-endian on wire). The driver reads __be16 — store as host
     # u16 with bytes reversed so the wire-order read returns the
@@ -510,9 +617,38 @@ def linux_tx_bridge_arm(netdev: uint64):
     # driver as the bound TX endpoint. Hamnix's eth_tx() then routes
     # every frame through ndo_start_xmit. Idempotent — re-arming
     # with a different netdev just updates the binding.
+    #
+    # We ALSO seed netdev[0xc88] (adapter->tx_fifo_limit) to a sane
+    # ceiling here — the BUG-fix runs in the per-frame fast path
+    # too, but arming-time is where we have the netdev pointer and
+    # can log it once. The driver's e1000e_reset normally writes this
+    # field with a PBA-derived value, but on the QEMU emulated chip
+    # the reset path leaves it at 0/1 in some flows, and a 0 would
+    # divide-by-zero in e1000_xmit_frame.
     _l_linux_netdev_for_tx = netdev
+    fifo_limit_p: Ptr[uint32] = cast[Ptr[uint32]](
+        netdev + NETDEV_TX_FIFO_LIMIT_OFF)
+    cur_limit: uint32 = fifo_limit_p[0]
+    if cur_limit == 0 or cur_limit == 1:
+        fifo_limit_p[0] = cast[uint32](E1000_MAX_PER_TXD)
+
+    # M16-pivot.d: copy the driver-set MAC from netdev[0x340..0x346]
+    # (where dev_addr_mod parked the EEPROM bytes during probe) into
+    # Hamnix's eth.ad nd_mac so the source-MAC field of every frame
+    # built by ip_send / arp_send is the real hardware address. With
+    # nd_mac stuck at all-zero, the chip happily transmits but the
+    # peer's DHCP server (SLIRP, dnsmasq) drops the request because
+    # the chaddr field doesn't match the source MAC, and the OFFER
+    # never comes back.
+    dap: Ptr[uint64] = cast[Ptr[uint64]](netdev + NETDEV_DEV_ADDR_PTR_OFF)
+    mac_buf_addr: uint64 = dap[0]
+    if mac_buf_addr != 0:
+        mac_ptr: Ptr[uint8] = cast[Ptr[uint8]](mac_buf_addr)
+        eth_set_mac(mac_ptr)
+
     eth_register_tx_hook(_l_linux_tx_bridge)
-    printk1("[linux_tx_bridge] armed for netdev=%p\n", netdev)
+    printk2("[linux_tx_bridge] armed for netdev=%p tx_fifo_limit=%d\n",
+            netdev, cast[uint64](fifo_limit_p[0]))
 
 
 def netdev_get_ndo_open(dev: uint64) -> uint64:
