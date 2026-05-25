@@ -8,20 +8,17 @@
 # kmod_linux_load /lib/modules/e1000e.ko and pci_scan's hand-rolled
 # e1000e_init is skipped (would conflict on MMIO BARs).
 #
-# Assertions (V0 — module load succeeds):
-#   1. "[e1000e.ko] loading"           — the .ko bytes were found in
-#      the cpio archive (planted by build_initramfs.py when the
-#      ENABLE_E1000E_KO env var is set).
-#   2. "[e1000e.ko] kmod_linux_load OK" — the L-series loader walked
-#      the ET_REL ELF, applied all relocations, and ran the module's
-#      init_module without unresolved-external panic.
-#
-# DHCP / TX / RX assertions are NOT yet enforced in V0 — the stock
-# driver's probe path does PCI enable + alloc rings + NAPI setup;
-# real TX/RX requires an IOAPIC IRQ wiring (not yet plumbed) and
-# the driver's eth_tx hook integration with our upper stack
-# (deferred to a follow-up commit). The loaded-but-quiet state
-# is the first milestone; building real I/O on top is the next.
+# Assertions:
+#   1. "[e1000e.ko] loading"            — bytes from cpio archive.
+#   2. "[e1000e.ko] kmod_linux_load OK" — loader applied all relocations
+#      and ran init_module without unresolved-external panic.
+#   3. probe + dev_open + MSI@0x47 + tx_bridge — chain wiring works.
+#   4. "[e1000e.ko] force TCTL.EN"      — chip TX gate flipped to live.
+#   5. "[napi_gro_receive] rx skb="     — RX bridge delivered a frame.
+#   6. "[dhcp] OFFER ip=10.0.2.15"      — QEMU SLIRP responded.
+#   7. "[dhcp] got ip=10.0.2.15"        — STRATEGIC MILESTONE: full DHCP
+#      DISCOVER/OFFER/REQUEST/ACK round trip via the Linux e1000e.ko —
+#      no hand-rolled drivers/net/e1000e.ad on the QEMU path.
 
 . "$(dirname "$0")/_build_lock.sh"
 
@@ -57,7 +54,7 @@ rc=$?
 set -e
 
 echo "[test_e1000e_tx] --- captured (kmod / e1000e / eth / pci_register_driver) ---"
-grep -E 'kmod_linux|\[e1000e\.ko\]|\[e1000e\]|\[eth\]|\[netdev|\[boot:35|\[pci_register_driver\]|\[dev_open\]|\[linux_tx_bridge\]|\[pci_msi\]|\[request_(irq|threaded_irq)\]|\[dhcp\]|\[napi_gro_receive\]' "$LOG" || true
+grep -E 'kmod_linux|\[e1000e\.ko\]|\[e1000e\]|\[eth\]|\[netdev|\[boot:35|\[pci_register_driver\]|\[dev_open\]|\[linux_tx_bridge\]|\[pci_msi\]|\[request_(irq|threaded_irq)\]|\[dhcp\]|\[napi_gro_receive\]|\[chipdump\]' "$LOG" || true
 echo "[test_e1000e_tx] --- end ---"
 
 fail=0
@@ -99,7 +96,11 @@ for needle in \
     "[dev_open] ndo_open returned rc=0" \
     "[pci_register_driver] dev_open: 1 netdev(s) opened" \
     "[pci_msi] vector=0x47 enabled" \
-    "[linux_tx_bridge] armed for netdev="
+    "[linux_tx_bridge] armed for netdev=" \
+    "[e1000e.ko] force TCTL.EN" \
+    "[napi_gro_receive] rx skb=" \
+    "[dhcp] OFFER ip=10.0.2.15" \
+    "[dhcp] got ip=10.0.2.15"
 do
     if grep -F -q "$needle" "$LOG"; then
         echo "[test_e1000e_tx] OK: '$needle'"
@@ -124,4 +125,4 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
-echo "[test_e1000e_tx] PASS (.ko loaded; probe invoked; ndo_open OK; MSI@0x47; TX bridge armed)"
+echo "[test_e1000e_tx] PASS (.ko loaded; probe invoked; ndo_open OK; MSI@0x47; TX bridge armed; DHCP got ip=10.0.2.15)"

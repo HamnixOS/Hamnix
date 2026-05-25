@@ -77,7 +77,7 @@ from linux_abi.exports import _add_export
 from linux_abi.api_pci import _pci_dev_bus, _pci_dev_dev, _pci_dev_fn
 from kernel.printk.printk import printk0, printk1, printk2
 from mm.slab import kmalloc, kfree, kzalloc
-from drivers.pci.pci import pci_config_read_dword, pci_config_write_dword
+from drivers.pci.pci import pci_config_read_dword, pci_config_write_dword, pci_read_bar
 from drivers.net.eth import eth_rx
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
@@ -580,9 +580,21 @@ def _e1k_pci_disable_msi(pdev: uint64):
 
 
 def _e1k_pci_enable_msi(pdev: uint64) -> int32:
-    # Return -1 (-EPERM-ish, any negative). e1000e falls back to
-    # legacy INTx, which is what our polled-IRQ path can handle.
-    return -1
+    # Return 0 (success) so e1000e takes the MSI handler path
+    # (e1000_intr_msi) instead of the legacy INTx handler (e1000_intr).
+    # The legacy handler bails with IRQ_NONE when ICR's INT_ASSERTED
+    # bit (31) is not set — and MSI delivery does NOT set that bit
+    # (it's a legacy-INTx-only sentinel). So if we say "MSI failed",
+    # the driver registers e1000_intr which silently drops every
+    # interrupt because INT_ASSERTED is clear in MSI mode (which we've
+    # set up by programming the chip's MSI capability ourselves in
+    # api_pci.ad::_l_pci_program_msi).
+    #
+    # The handler we want is e1000_intr_msi — it skips the
+    # INT_ASSERTED check entirely. Returning 0 here is enough for the
+    # driver to set FLAG_MSI_ENABLED and pick the MSI handler at
+    # request_irq time.
+    return 0
 
 
 def _e1k_pci_disable_msix(pdev: uint64):
@@ -985,6 +997,194 @@ def _e1k_timecounter_cyc2time(tc: uint64, cycles: uint64) -> uint64:
     # Converts a cycle reading to an ns timestamp anchored at the
     # timecounter's init point. Linear identity is sufficient.
     return cycles
+
+
+# =====================================================================
+# Chip-state diagnostic — read MMIO regs directly via PCI BAR0
+# =====================================================================
+#
+# When the .ko-driven boot path stalls, we need to know whether the
+# chip's TX / RX engines were ever programmed. Linux's e1000e_open
+# → e1000_configure → e1000e_setup_tctl / setup_rctl writes the
+# ring-base / ring-len / TCTL.EN / RCTL.EN registers. If any of
+# those didn't run, the chip is silently quiescent — ndo_start_xmit
+# happily descriptor-writes-and-bumps-TDT but TDH never advances
+# because TCTL.EN is clear and the chip never DMA's the descriptor.
+#
+# The accessor below reads BAR0 from PCI config space (independent of
+# whatever the .ko's hand-set adapter->hw.hw_addr value is) and dumps
+# the registers Linux's setup_tctl / setup_rctl write. Designed to be
+# called once post-open from init/main.ad.
+
+_E1K_BAR0_BUS:  uint32 = 0
+_E1K_BAR0_DEV:  uint32 = 3
+_E1K_BAR0_FN:   uint32 = 0
+
+# Register offsets we care about (subset of drivers/net/e1000e.ad's
+# constants — duplicated here so api_e1000e.ad doesn't import the
+# hand-rolled driver, which is the parallel path we're trying to
+# supersede).
+_E1K_STATUS:  uint64 = 0x00008
+_E1K_ICR:     uint64 = 0x000c0
+_E1K_ICS:     uint64 = 0x000c8
+_E1K_IMS:     uint64 = 0x000d0
+_E1K_IMC:     uint64 = 0x000d8
+_E1K_RCTL:    uint64 = 0x00100
+_E1K_TCTL:    uint64 = 0x00400
+_E1K_TIPG:    uint64 = 0x00410
+_E1K_TDBAL:   uint64 = 0x03800
+_E1K_TDBAH:   uint64 = 0x03804
+_E1K_TDLEN:   uint64 = 0x03808
+_E1K_TDH:     uint64 = 0x03810
+_E1K_TDT:     uint64 = 0x03818
+_E1K_TXDCTL:  uint64 = 0x03828
+_E1K_RDBAL:   uint64 = 0x02800
+_E1K_RDBAH:   uint64 = 0x02804
+_E1K_RDLEN:   uint64 = 0x02808
+_E1K_RDH:     uint64 = 0x02810
+_E1K_RDT:     uint64 = 0x02818
+
+
+def _e1k_get_bar0() -> uint64:
+    raw: uint32 = pci_config_read_dword(_E1K_BAR0_BUS, _E1K_BAR0_DEV,
+                                         _E1K_BAR0_FN, 0x10)
+    if raw == 0 or raw == 0xFFFFFFFF:
+        return 0
+    return cast[uint64](raw & 0xFFFFFFF0)
+
+
+def _e1k_mmio_r32(addr: uint64) -> uint32:
+    return cast[Ptr[uint32]](addr)[0]
+
+
+def _e1k_mmio_w32(addr: uint64, val: uint32):
+    cast[Ptr[uint32]](addr)[0] = val
+
+
+# E1000_TCTL_EN bit (Transmit Enable). Linux's e1000_watchdog_task
+# is responsible for OR'ing this bit into TCTL once it observes the
+# LSC (Link Status Change) cause asserting "link is up" — see
+# drivers/net/ethernet/intel/e1000e/netdev.c::e1000_watchdog_task
+# around line 5300 ("enable transmits in the hardware, need to do
+# this after setting TARC(0)"). In a real Linux boot, the watchdog
+# delayed_work runs every 2 seconds via mod_timer; the e1000_intr
+# LSC path also schedules it immediately on the actual link-up
+# interrupt.
+#
+# Hamnix has no delayed_work / workqueue scheduler wired through to
+# the Linux module's `schedule_work(&adapter->watchdog_task)`. We
+# COULD wire up workqueues — but that's a wide L-series milestone
+# of its own. The pragmatic alternative used here: set TCTL.EN
+# directly from the post-open path. This is exactly the "force link
+# state into the state Linux's watchdog would have reached" pattern.
+# Once workqueues land we can drop this and let watchdog_task do
+# its own thing.
+#
+# QEMU's e1000e_start_xmit (hw/net/e1000e_core.c::e1000e_start_xmit)
+# bails early when TCTL.EN is clear (`return; /* trace tx_disabled */`),
+# which is exactly the failure mode the chip dump revealed: TCTL =
+# 0x103f0f8 (PSP | CT | COLD | RTLC — no EN). With this fix the chip
+# sees TCTL = 0x103f0fa and start_xmit DMA-reads the descriptor.
+E1000_TCTL_EN_BIT: uint32 = 0x00000002
+
+
+def e1000e_ko_force_tx_enable():
+    # Set TCTL.EN on the chip's TCTL register, mirroring what
+    # Linux's e1000_watchdog_task would do on link-up. Idempotent —
+    # if EN is already set we re-write the same value.
+    bar0: uint64 = _e1k_get_bar0()
+    if bar0 == 0:
+        return
+    tctl: uint32 = _e1k_mmio_r32(bar0 + _E1K_TCTL)
+    if (tctl & E1000_TCTL_EN_BIT) != 0:
+        return
+    new_tctl: uint32 = tctl | E1000_TCTL_EN_BIT
+    _e1k_mmio_w32(bar0 + _E1K_TCTL, new_tctl)
+    printk2("[e1000e.ko] force TCTL.EN: %x -> %x\n",
+            cast[uint64](tctl), cast[uint64](new_tctl))
+
+
+def e1000e_ko_chip_dump():
+    # Dump every register Linux's setup_tctl / setup_rctl writes so
+    # we can verify the .ko's e1000_configure path actually ran.
+    bar0: uint64 = _e1k_get_bar0()
+    if bar0 == 0:
+        printk0("[chipdump] BAR0 unreadable\n")
+        return
+    printk1("[chipdump] BAR0=%p\n", bar0)
+    status: uint32 = _e1k_mmio_r32(bar0 + _E1K_STATUS)
+    printk1("[chipdump] STATUS=%x (bit1=LU bit0=FD)\n",
+            cast[uint64](status))
+    rctl: uint32 = _e1k_mmio_r32(bar0 + _E1K_RCTL)
+    tctl: uint32 = _e1k_mmio_r32(bar0 + _E1K_TCTL)
+    tipg: uint32 = _e1k_mmio_r32(bar0 + _E1K_TIPG)
+    printk2("[chipdump] RCTL=%x TCTL=%x\n",
+            cast[uint64](rctl), cast[uint64](tctl))
+    printk1("[chipdump] TIPG=%x\n", cast[uint64](tipg))
+    tdbal: uint32 = _e1k_mmio_r32(bar0 + _E1K_TDBAL)
+    tdbah: uint32 = _e1k_mmio_r32(bar0 + _E1K_TDBAH)
+    tdlen: uint32 = _e1k_mmio_r32(bar0 + _E1K_TDLEN)
+    tdh: uint32 = _e1k_mmio_r32(bar0 + _E1K_TDH)
+    tdt: uint32 = _e1k_mmio_r32(bar0 + _E1K_TDT)
+    txdctl: uint32 = _e1k_mmio_r32(bar0 + _E1K_TXDCTL)
+    printk2("[chipdump] TDBAL=%x TDBAH=%x\n",
+            cast[uint64](tdbal), cast[uint64](tdbah))
+    printk2("[chipdump] TDLEN=%x TDH=%d\n",
+            cast[uint64](tdlen), cast[uint64](tdh))
+    printk2("[chipdump] TDT=%d TXDCTL=%x\n",
+            cast[uint64](tdt), cast[uint64](txdctl))
+    rdbal: uint32 = _e1k_mmio_r32(bar0 + _E1K_RDBAL)
+    rdbah: uint32 = _e1k_mmio_r32(bar0 + _E1K_RDBAH)
+    rdlen: uint32 = _e1k_mmio_r32(bar0 + _E1K_RDLEN)
+    rdh: uint32 = _e1k_mmio_r32(bar0 + _E1K_RDH)
+    rdt: uint32 = _e1k_mmio_r32(bar0 + _E1K_RDT)
+    printk2("[chipdump] RDBAL=%x RDBAH=%x\n",
+            cast[uint64](rdbal), cast[uint64](rdbah))
+    printk2("[chipdump] RDLEN=%x RDH=%d\n",
+            cast[uint64](rdlen), cast[uint64](rdh))
+    printk1("[chipdump] RDT=%d\n", cast[uint64](rdt))
+    # IMS / ICR — interrupt mask + cause. Reading ICR doesn't clear
+    # it (the read-to-clear semantics need a different access). IMS
+    # tells us which causes the driver unmasked.
+    ims: uint32 = _e1k_mmio_r32(bar0 + _E1K_IMS)
+    icr: uint32 = _e1k_mmio_r32(bar0 + _E1K_ICR)
+    printk2("[chipdump] IMS=%x ICR=%x\n",
+            cast[uint64](ims), cast[uint64](icr))
+    # RAR[0] — the unicast match address. If RAH[0].AV bit (31) is
+    # not set, the chip ignores incoming unicast traffic.
+    ral0: uint32 = _e1k_mmio_r32(bar0 + 0x5400)
+    rah0: uint32 = _e1k_mmio_r32(bar0 + 0x5404)
+    printk2("[chipdump] RAL0=%x RAH0=%x (bit31=AV)\n",
+            cast[uint64](ral0), cast[uint64](rah0))
+    # TPR / GPRC / TPT — packet counters
+    tpr: uint32 = _e1k_mmio_r32(bar0 + 0x40d0)
+    gprc: uint32 = _e1k_mmio_r32(bar0 + 0x4074)
+    tpt: uint32 = _e1k_mmio_r32(bar0 + 0x40d4)
+    printk2("[chipdump] TPR=%d GPRC=%d ", cast[uint64](tpr), cast[uint64](gprc))
+    printk1("TPT=%d\n", cast[uint64](tpt))
+    # Dump descriptor 0 — it's at TDBAL (low 32 bits since TDBAH=0).
+    # Each TX desc is 16 bytes: buffer_addr (8), lower (4), upper (4).
+    if tdbal != 0:
+        d0_p: Ptr[uint32] = cast[Ptr[uint32]](cast[uint64](tdbal))
+        bufl: uint32 = d0_p[0]
+        bufh: uint32 = d0_p[1]
+        lower: uint32 = d0_p[2]
+        upper: uint32 = d0_p[3]
+        printk2("[chipdump] desc0 bufL=%x bufH=%x\n",
+                cast[uint64](bufl), cast[uint64](bufh))
+        printk2("[chipdump] desc0 lower=%x upper=%x\n",
+                cast[uint64](lower), cast[uint64](upper))
+    # Dump RX desc 0 and 1 — RX descriptor: buffer_addr(8) + status(8)
+    if rdbal != 0:
+        r0_p: Ptr[uint32] = cast[Ptr[uint32]](cast[uint64](rdbal))
+        rbufl0: uint32 = r0_p[0]
+        rbufh0: uint32 = r0_p[1]
+        rstatlen0: uint32 = r0_p[2]
+        rstaterr0: uint32 = r0_p[3]
+        printk2("[chipdump] rxd0 bufL=%x bufH=%x\n",
+                cast[uint64](rbufl0), cast[uint64](rbufh0))
+        printk2("[chipdump] rxd0 lenstat=%x errvlan=%x\n",
+                cast[uint64](rstatlen0), cast[uint64](rstaterr0))
 
 
 # =====================================================================
