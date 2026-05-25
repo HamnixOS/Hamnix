@@ -1,45 +1,21 @@
 ---
 name: feedback-fix-the-language-layer
-description: When agents keep hitting the same Adder/compiler hiccup, fix it in the language layer (the compiler) — don't let workarounds accrue. Make Adder as simple as possible for agents.
-metadata:
+description: "Recurring agent hiccups get fixed in the Adder compiler, not papered over in user code. Keep Adder simple for agents."
+metadata: 
   node_type: memory
   type: feedback
   originSessionId: 87369342-5631-4e0b-b8bd-c6f8925641a7
 ---
 
-Stated by the user 2026-05-20: "when there's a common hiccup that the
-agents keep hitting, you solve it in the language layer. Making the
-language as simple as possible for agents to use."
+User (2026-05-20): *"When there's a common hiccup that agents keep hitting, you solve it in the language layer. Making the language as simple as possible for agents to use."*
 
-**Why:** Hamnix is written in Adder, whose compiler is hand-written
-(`compiler/`). Every Adder codegen bug or missing feature forces every
-agent that hits it to write an ugly workaround — and those workarounds
-multiply and rot. Fixing the compiler once removes the hiccup for every
-agent forever. This is the highest-leverage form of [[feedback-fix-dont-catalogue]].
-The track record bears it out: the U9 nested-frame-`Array` bug, the
-sized-store `Ptr` bug, `&arr[i][j]`, signed-only compares, and
-string-literal globals were all recurring hiccups — each fixed in
-`compiler/codegen_x86.py` once, then the scattered workarounds removed.
+Fixing the compiler once removes the hiccup for every agent forever. Track record: U9 nested-Array, sized-store Ptr, `&arr[i][j]`, signed-only compares, string-literal globals — all recurring hiccups, all fixed in `compiler/codegen_x86.py`, workarounds removed.
 
-**How to apply:**
-- When triaging compiler/language limitations, ask "do agents keep
-  tripping on this?" If yes, prioritise a compiler fix over tolerating
-  the workaround.
-- A compiler-codegen fix is verifiable: `scripts/run_compiler_tests.sh`
-  (the fixture suite) plus the full boot+userland surface catch
-  miscompiles. Every compiler fix lands a new `tests/test_compiler_*.ad`
-  fixture.
-- Bias toward making Adder SIMPLER for agents — fewer reserved-word
-  traps, fewer "declare it this exact way or it miscompiles" rules,
-  natural code that just works.
-- Keep [[feedback-compiler-quirks]] current as the canonical
-  workaround→fix→workaround-removed paper trail.
+**How to apply:** when triaging a limitation, ask "do agents keep tripping on this?" If yes, fix the compiler before tolerating the workaround. Add `tests/test_compiler_*.ad` fixture for every fix. Bias Adder toward fewer reserved-word traps and natural code that just works.
 
-Known still-open compiler issues worth fixing (2026-05-20): unsigned
-`>>` emits arithmetic `sarq` (needs `shrq`); unsigned `/`/`%` emit
-signed `idivq` (need `divq`); flat global symbol namespace across
-merged modules forces helper-rename collisions; no first-class
-function-pointer type; no adjacent string-literal concatenation.
+**Known still-open** (2026-05-20): unsigned `>>` emits arithmetic `sarq` (needs `shrq`); unsigned `/`/`%` emit `idivq` (need `divq`); flat global symbol namespace forces helper-rename; no first-class function-pointer type; no adjacent string-literal concat.
 
-Related: [[feedback-fix-dont-catalogue]], [[feedback-compiler-quirks]],
-[[project-core-stabilization]].
+Verification: `scripts/run_compiler_tests.sh` catches miscompiles. Keep [[feedback-compiler-quirks]] as the canonical paper trail.
+
+## Related
+[[feedback-fix-dont-catalogue]], [[feedback-compiler-quirks]], [[project-core-stabilization]]

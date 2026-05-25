@@ -1,97 +1,29 @@
 ---
 name: project-fork-broken
-description: RESOLVED 2026-05-20 — fork() gives the child a real private per-process address space, now copy-on-write (landed b8e0398 then d6a34a7). History below.
-metadata:
+description: "RESOLVED 2026-05-22 — fork() gives child a real private per-process address space, fully COW including mmap VMAs and MAP_SHARED."
+metadata: 
   node_type: memory
   type: project
   originSessionId: 87369342-5631-4e0b-b8bd-c6f8925641a7
 ---
 
-**STATUS: RESOLVED 2026-05-20.** fork() works and is copy-on-write.
-- `e021700` (`feat(mm): real per-process address space`) gave the child
-  a fully private address space (stack + ELF image + brk heap + TLS/TCB
-  + mmap VMAs), initially by eager-copy. The `%rdi` ABI fix (`633dad2`)
-  shipped alongside, verified NOT to regress native-Adder code.
-- `d6a34a7` (`feat(mm): convert fork() from eager-copy to copy-on-write`)
-  replaced the ~33 MiB/fork eager copy with COW: PTE bit-9 marker, a
-  per-PFN refcount table (`mm/cow.ad`), and a productive `#PF` handler
-  that resolves COW write faults. ELF image + brk heap + user stack are
-  COW-shared on fork; CLONE_VM threads stay distinct (shared PML4, never
-  enter COW). `test_cow_fork` / `test_u26_fork` / `test_rfork` PASS.
-- ONE piece left: mmap VMAs still eager-copy on fork — COW-sharing them
-  needs `mm/vma.ad::_vma_node_free` routed through the page refcounts.
-  A clean, bounded follow-up; the bulk of the win is already COW.
+## Status: FULLY RESOLVED 2026-05-22
 
-The rest of this file is the diagnostic history, kept for context.
+fork() works, every private region is copy-on-write, MAP_SHARED stays genuinely shared.
 
----
+**Resolution path:**
+- `e021700` real per-process address space (eager-copy: stack + ELF + brk + TLS/TCB + mmap VMAs). `%rdi` ABI fix in `633dad2`.
+- `d6a34a7` eager-copy → COW for ELF + brk heap + user stack. PTE bit-9 marker, per-PFN refcount in `mm/cow.ad`, productive `#PF` handler. CLONE_VM threads share PML4, never enter COW.
+- `ea58371` extended COW to mmap VMAs via `vm_cow_share_range`; buddy free routed through `cow_drop_page` so frames return only at refcount 0.
+- `e32ec28` MAP_SHARED branch in `vma_fork_copy`: shared VMAs map same frames RW in both procs via `vm_share_range` (no COW bit).
 
-Diagnosed 2026-05-20 while chasing the `busybox sh -c "echo a | grep a"`
-kernel #GP (one-shot trap, halts the box).
+`test_cow_fork`, `test_u26_fork`, `test_rfork`, `test_mmap_fork`, `test_mmap_shared` all PASS.
 
-**Root cause — `fork()` does not give the child a private address
-space.** U38 (commit `bdd5e87`) implements the `do_clone` fork path by
-copying the parent's top stack *page* onto a fresh page at a *different*
-virtual address and running the child there. Every absolute pointer in
-that page — saved `%rbp` chain, return addresses, `setjmp`/pthread
-internals — still points at the PARENT's addresses, so the child
-tramples the parent. A real `fork()` child also *returns from* `fork()`,
-unwinding up through frames shared with the parent. The single 4 KiB
-copy is also far too small.
+## Original root cause (kept for archeology)
 
-Additional hazards a forked child corrupts in the parent: the `%r12`
-syscall-entry spill slot (`syscall_64.S` parks it at `[user_rsp-8]`),
-and the musl TCB (`struct pthread` at `fs_base`, shared because the
-child shares `fs_base`). The Linux user stack is also undersized —
-`do_execve`/`SYS_SPAWN` give only 16 KiB; busybox ash driving a
-pipeline needs ~18 KiB.
+U38 (`bdd5e87`) implemented `do_clone` by copying only the parent's top stack PAGE to a different vaddr in the child. Saved `%rbp`/return addrs / pthread TCB pointers in that page still pointed at PARENT addrs → child trampled parent. `fs_base` shared, so child's musl TCB writes corrupted the parent's TCB. Linux user stack 16 KiB undersized for busybox-ash pipelines.
 
-**Progress 2026-05-20.** A solo fork agent shipped ONE correct piece:
-the `%rdi`-preservation fix to `syscall_64.S` — commit `633dad2` on
-**local `main`, NOT yet pushed**. It restores `%rdi` on syscall exit
-(old code zeroed it, an ABI violation that broke musl `open(O_CLOEXEC)`
-→ `busybox ls` enumerated nothing). This is the held `64173ec` fix,
-now folded in. The fenced-file fence on `syscall_64.S` was lifted by
-the user for the fork work.
+Fix required: child needs a PRIVATE copy of ALL writable memory (stack + .data/.bss + brk + TLS/TCB) at the SAME vaddr as the parent.
 
-The same agent built the full per-process address-space rework but
-**reverted it** — forked parent AND child crashed inside glibc
-(`_IO_puts` reading a garbage `stdout->_lock`). Its conclusion: a
-correct static-PIE-glibc `fork()` needs the child to have a private
-copy of **ALL writable memory** — stack + ELF `.data`/`.bss` + brk
-heap + TLS/TCB — not just the stack (`fs_base` is shared, so the
-child's post-fork bookkeeping corrupts the *shared* TCB; both procs
-race the shared `_IO_2_1_stdout_`).
-
-**The proper fix — V1 eager-copy (per-process address space):**
-- Fixed user-stack virtual window; child gets a private physical stack
-  at the SAME vaddr as the parent.
-- `fs/elf.ad::_load_elf64` records the ELF writable range; ET_DYN
-  writable data relocated to a virtual window clear of the kernel image.
-- On `fork`: eager-copy stack + `.data`/`.bss` + brk heap + TLS/TCB
-  into private physical pages, each remapped at the SAME vaddr in the
-  child's PML4. Heap+`.data` likely need a high virtual window too.
-- COW is a later optimization; bump Linux user stack to ≥256 KiB.
-
-**Redeployed 2026-05-20** as solo agent `ac638ee4526cf9ccf` with full
-worktree authority, tasked to: answer 3 triangulation questions first
-(parent-vs-child crash; `stdout->_lock` parent-vs-child post-fork;
-8 KiB-vs-256 KiB private copy), then implement V1 eager-copy, then fix
-the broken `test_u26_fork` harness.
-
-**Test harness gotcha discovered 2026-05-20:** `test_u26_fork` fails
-NOT from a fork regression but because (a) `drivers/input/atkbd.ad`'s
-`atkbd_diag_tick()` floods every QEMU boot with `[atkbd-diag]` lines,
-slowing boot, and (b) the harness uses a fixed `sleep 3` before piping
-input — boot now overruns it so `u_glibc_system` is sent before hamsh
-is ready and lost. Both fixes folded into the fork agent's mandate.
-
-**How to apply:**
-- `busybox sh -c "echo X | grep X"` (ash-internal pipeline) may stay a
-  marked XFAIL in `test_u37`; the hamsh-orchestrated 3-process pipeline
-  is what `test_u37` actually asserts.
-- Don't ship a bare "bump the Linux user stack" change in isolation —
-  it perturbs allocator layout and surfaces this bug elsewhere.
-
-Related: [[project-real-hw-boot]], [[feedback-fix-dont-catalogue]],
-[[project-endgame]].
+## Related
+[[project-real-hw-boot]], [[feedback-fix-dont-catalogue]], [[project-endgame]]
