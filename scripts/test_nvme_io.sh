@@ -10,35 +10,42 @@
 # is just probing against an already-enabled controller.
 #
 # This script is the EXERCISE: gate the hand-rolled NVMe driver
-# OFF via /etc/nvme-io-ko, kmod_linux_load nvme.ko, then run
-# nvme_io_exercise() in init/main.ad which tries to find a block
-# device that the .ko-shim path produced and read /hello.txt off
-# it through fs/ext4.ad.
+# OFF via /etc/nvme-io-ko, then dep-load nvme-core.ko + nvme.ko via
+# modules_dep_load_with_deps("nvme") so the cross-module ksymtab
+# replaces api_nvme.ad's cold-path stubs with nvme-core's REAL
+# EXPORT_SYMBOL impls, and finally run nvme_io_exercise() in
+# init/main.ad which tries to find a block device that the .ko-shim
+# path produced and read /hello.txt off it through fs/ext4.ad.
 #
 # Critical difference from test_ahci_io.sh: NO BRIDGE. The AHCI
 # exercise routes _ahc_ahci_host_activate back to the hand-rolled
 # drivers/ata/ahci.ad bring-up so the L-shim "completes" what the
 # Linux .ko's probe started. The NVMe exercise does NOT do that.
-# If nvme.ko's UND-stub surface (api_nvme.ad's -ENODEV-returning
-# nvme_submit_sync_cmd and friends) can't carry namespace scan,
-# blk_mq_alloc_disk, and the I/O queue setup, that's a finding,
-# not a thing to paper over.
+# If nvme.ko + nvme-core.ko can't carry namespace scan + add_disk
+# end-to-end on the L-shim, that's a finding, not a thing to paper
+# over.
 #
-# Expected outcome on the current shim:
+# Strict assertions (added with the nvme-core side-load milestone):
 #   * Hand-rolled SKIPPED marker fires.
-#   * nvme.ko load + probe succeed (cold-path stubs, same as
-#     test_nvme_ko.sh).
-#   * nvme_io_exercise() emits [bridge=disabled] so the test
-#     harness can definitively assert no fallback path is active.
-#   * nvme_io_exercise() reports a SPECIFIC failure mode (most
-#     likely "no NVMe block device registered" — because
-#     nvme_submit_sync_cmd returns -ENODEV, namespace scan never
-#     completes, blk_mq_alloc_disk + add_disk never run, no
-#     gendisk lands in the block layer).
+#   * boot:35.N modules_dep_load_with_deps marker fires.
+#   * BOTH nvme-core.ko AND nvme.ko load (loader emits name=X for
+#     each in its .modinfo pass).
+#   * Cross-module ksymtab dispatches: [ksymtab_hit] nvme ->
+#     nvme_core: nvme_submit_sync_cmd MUST fire — that's the
+#     entire reason for the side-load.
+#   * [bridge=disabled] fires (no hand-rolled fallback).
 #
-# That FAIL is informative output. A PASS would mean the L-shim
-# alone carried real NVMe I/O end to end — a major milestone.
-# Either way the test SCRIPT exits 0 only on PASS so CI is honest.
+# PASS path: nvme_io_exercise mounts ext4 from a real block device
+# the .ko-shim path registered, reads + writes + verifies /hello.txt.
+#
+# FAIL path (current state, fully informative): nvme.ko's nvme_probe
+# schedules nvme_reset_work via async_schedule_node — our shim
+# DROPS the work because we have no async-kthread worker, so the
+# controller is never CC.EN'd, no IDENTIFY runs, no namespace scan,
+# no add_disk. The exercise emits "no NVMe block device registered"
+# and exits FAIL. The fix is to wire MSI-X IRQ delivery (or a
+# polled-completion path) and uncomment the sync-dispatch block in
+# api_nvme.ad's _nvm_async_schedule_node.
 #
 # The PASS / FAIL channel is the [nvme_io_test] marker line
 # emitted from nvme_io_exercise(). [bridge=disabled] is always
@@ -98,8 +105,8 @@ timeout 30s qemu-system-x86_64 \
 rc=$?
 set -e
 
-echo "[test_nvme_io] --- captured (nvme / nvme_io_test / ext4 / kmod / bridge) ---"
-grep -aE 'kmod_linux|\[nvme\.ko\]|\[nvme_io_test\]|\[nvme\]|\[boot:35\.N\]|\[bridge=|ext4: mounted|ext4: bad magic|ext4: failed' "$LOG" | head -80 || true
+echo "[test_nvme_io] --- captured (nvme / nvme_io_test / ext4 / kmod / bridge / ksymtab) ---"
+grep -aE 'kmod_linux: name=|\[nvme\.ko\]|\[nvme_io_test\]|\[nvme\]|\[nvme_core\]|\[boot:35\.N\]|\[bridge=|\[ksymtab_hit\] nvme |ext4: mounted|ext4: bad magic|ext4: failed' "$LOG" | head -120 || true
 echo "[test_nvme_io] --- end ---"
 
 # Panic / TRAP / BUG is unambiguously a regression.
@@ -111,14 +118,47 @@ if grep -aE -q "PANIC|panic:|TRAP:|BUG:" "$LOG"; then
 fi
 
 # Did the gating fire? boot:35.N is the marker we emit just before
-# kmod_linux_load. If that's missing the marker plumbing itself is
-# broken (the cpio entry didn't land, or the .ad gate is wrong).
-if ! grep -aF -q "[boot:35.N] kmod_linux_load /lib/modules/6.12/nvme.ko" "$LOG"; then
+# the dep-aware loader walks nvme's deps (nvme-core then nvme). If
+# that's missing the marker plumbing itself is broken (the cpio
+# entry didn't land, or the .ko-shim gate is wrong).
+if ! grep -aF -q "[boot:35.N] modules_dep_load_with_deps nvme" "$LOG"; then
     echo "[test_nvme_io] FAIL: /etc/nvme-io-ko marker not honoured"
     echo "[test_nvme_io] --- full log ---"
     tail -n 80 "$LOG"
     exit 1
 fi
+
+# Storage-maximalism shape: BOTH nvme-core AND nvme must load via
+# the dep walker. The loader announces each module's name= line just
+# after parsing .modinfo. Missing either means the chain broke.
+if ! grep -aF -q "kmod_linux: name=nvme_core" "$LOG"; then
+    echo "[test_nvme_io] FAIL: nvme-core.ko did not load (chain broke before nvme)"
+    echo "[test_nvme_io] --- full log tail ---"
+    tail -n 80 "$LOG"
+    exit 1
+fi
+if ! grep -aE -q "kmod_linux: name=nvme$" "$LOG"; then
+    echo "[test_nvme_io] FAIL: nvme.ko did not load"
+    echo "[test_nvme_io] --- full log tail ---"
+    tail -n 80 "$LOG"
+    exit 1
+fi
+echo "[test_nvme_io] OK: nvme-core.ko + nvme.ko both loaded via dep walker"
+
+# Cross-module ksymtab resolution proof: nvme.ko's relocations must
+# dispatch through nvme-core's EXPORT_SYMBOL entries. The critical
+# symbol is nvme_submit_sync_cmd — the entire reason for the
+# side-load. If we don't see [ksymtab_hit] nvme -> nvme_core:
+# nvme_submit_sync_cmd then the api_nvme.ad cold-path -ENODEV stub
+# is still in play.
+if ! grep -aF -q "[ksymtab_hit] nvme -> nvme_core: nvme_submit_sync_cmd" "$LOG"; then
+    echo "[test_nvme_io] FAIL: cross-module ksymtab did NOT resolve nvme_submit_sync_cmd"
+    echo "  (api_nvme.ad cold-path stub still in play; nvme-core side-load not effective)"
+    echo "[test_nvme_io] --- full log tail ---"
+    tail -n 80 "$LOG"
+    exit 1
+fi
+echo "[test_nvme_io] OK: cross-module ksymtab dispatch confirmed (nvme -> nvme_core: nvme_submit_sync_cmd)"
 
 # Did the hand-rolled NVMe skip fire?
 if ! grep -aF -q "[nvme] hand-rolled smoke-test SKIPPED" "$LOG"; then

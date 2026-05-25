@@ -1092,21 +1092,10 @@ def build_archive() -> bytes:
             print(f"  embedded {name} ({len(data)} bytes from "
                   f"kernel-modules/nvme/nvme.ko)")
 
-    # Storage maximalism: SCSI mid-layer + libata + libahci +
-    # scsi_common. These four Debian 6.1.0-32 modules are the
-    # Linux storage stack ahci.ko's modules.dep chain pulls in:
-    #
-    #   ahci -> libahci -> libata -> scsi_mod -> scsi_common
-    #
-    # Once these load, EVERY Linux SCSI driver (sd_mod, sr_mod,
-    # st_mod, mpt3sas, megaraid_sas, qla2xxx, virtio_scsi, ...)
-    # becomes loadable on the same plumbing — not just ahci. The
-    # in-kernel modules_dep walker (kernel/modules_dep.ad) auto-
-    # loads the dep chain in topological order before ahci.ko's
-    # init_module runs, and the loader's cross-module ksymtab
-    # registry (loader-unify commit deb21cc) lets each upstream
-    # module's EXPORT_SYMBOL surface satisfy the next module's
-    # UND symbols without going through the linux_abi shim table.
+    # Storage maximalism: SCSI mid-layer chain ahci.ko depends on,
+    # plus nvme-core.ko that nvme.ko depends on. Both go through the
+    # in-kernel modules_dep walker + cross-module ksymtab so each
+    # upstream module's EXPORT_SYMBOL satisfies the next module's UND.
     for ko_dir, ko_name in (
             ("scsi_common", "scsi_common.ko"),
             ("scsi_mod",    "scsi_mod.ko"),
@@ -1121,6 +1110,15 @@ def build_archive() -> bytes:
                 blob += cpio_entry(name, data)
                 print(f"  embedded {name} ({len(data)} bytes from "
                       f"kernel-modules/{ko_dir}/{ko_name})")
+
+    nvme_core_ko = here / "kernel-modules" / "nvme_core" / "nvme-core.ko"
+    if nvme_core_ko.is_file():
+        data = nvme_core_ko.read_bytes()
+        for name in ("/lib/modules/nvme-core.ko",
+                     "/lib/modules/6.12/nvme-core.ko"):
+            blob += cpio_entry(name, data)
+            print(f"  embedded {name} ({len(data)} bytes from "
+                  f"kernel-modules/nvme_core/nvme-core.ko)")
 
     # WiFi pivot: cfg80211.ko (configuration/admin layer, ~2.3 MiB)
     # and mac80211.ko (soft-MAC stack, ~2.4 MiB) — Debian 6.1.0-32
