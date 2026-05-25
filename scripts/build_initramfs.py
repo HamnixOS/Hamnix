@@ -505,6 +505,25 @@ if os.environ.get("ENABLE_E1000E_TRAFFIC_TEST") == "1":
     FILES.append(("/etc/e1000e-traffic-test", b"1\n"))
 
 
+# Storage L-shim NVMe exercise: scripts/test_nvme_io.sh sets
+# ENABLE_NVME_IO_TEST=1 to plant /etc/nvme-io-ko in the initramfs. This
+# marker is consumed by init/main.ad in TWO places:
+#   * Early (block_smoke_test sibling): SKIP the hand-rolled
+#     drivers/nvme/nvme.ad smoke test so the NVMe controller is left
+#     for Linux's stock nvme.ko to claim.
+#   * Late (boot:35.N): kmod_linux_load /lib/modules/6.12/nvme.ko and
+#     run nvme_io_exercise() — try to mount ext4 off the block device
+#     the shim-driven path produces and read+write a known file.
+# Distinct from ENABLE_NVME_KO (loader-only test): that one keeps the
+# hand-rolled driver active and runs `insmod` from hamsh; this one
+# forces the .ko shim to own the device end to end. Placed at the END
+# of the FILES-append section (last gated marker before the helpers)
+# to minimise merge cost with the in-flight SCSI mid-layer agent
+# (a48f) which is touching the AHCI gating block above.
+if os.environ.get("ENABLE_NVME_IO_TEST") == "1":
+    FILES.append(("/etc/nvme-io-ko", b"1\n"))
+
+
 # See INIT_ELF handling inside build_archive(): set INIT_ELF=path to
 # override which on-disk file becomes /init in the cpio archive, e.g.
 # to swap in a Hamnix-compiled user binary without touching user/init.S.
