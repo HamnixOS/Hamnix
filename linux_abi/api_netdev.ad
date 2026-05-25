@@ -64,6 +64,9 @@
 from linux_abi.exports import _add_export
 from mm.slab import kmalloc, kfree, kzalloc
 from kernel.printk.printk import printk0, printk1, printk2
+from drivers.net.eth import eth_register_tx_hook, eth_rx
+
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
 
 # --- Sizing constants -----------------------------------------------
@@ -394,6 +397,122 @@ NETDEV_STATE_FREE:       uint64 = 0
 NETDEV_STATE_ALLOCATED:  uint64 = 1
 NETDEV_STATE_REGISTERED: uint64 = 2
 NETDEV_STATE_OPEN:       uint64 = 3
+
+
+# --- struct sk_buff offsets (Linux 6.1) ----------------------------
+#
+# Verified by disassembling e1000_xmit_frame in the Debian e1000e.ko:
+#   movzwl 0xb4(%rdi),%ebx   -> skb->protocol  (u16, big-endian)
+#   mov    0x70(%rdi),%ebp   -> skb->len       (u32)
+#   mov    0x74(%rdi),%r14d  -> skb->data_len  (u32)
+#   mov    0xd0(%r9),%rsi    -> skb->data      (Ptr[u8], 8 bytes)
+#   mov    0xc8(%r9),%rax    -> skb->head      (Ptr[u8], 8 bytes)
+# These are the bare-minimum fields the e1000e xmit path reads. A
+# real driver in production would also touch protocol_offset,
+# transport_header, mac_header, end, tail, etc. — we leave those
+# zeroed (kzalloc), which works for the no-checksum / no-frag
+# Ethernet frames Hamnix's eth_tx() builds.
+SKB_LEN_OFF:        uint64 = 0x70
+SKB_DATA_LEN_OFF:   uint64 = 0x74
+SKB_PROTOCOL_OFF:   uint64 = 0xb4
+SKB_HEAD_OFF:       uint64 = 0xc8
+SKB_DATA_OFF:       uint64 = 0xd0
+
+# sizeof(struct sk_buff) in 6.1 with default config is around 232
+# bytes. We allocate a generous 256-byte control region followed by
+# the data buffer, so any field offset within the upstream sk_buff
+# lands inside our alloc. Anything we don't explicitly populate is
+# zero — same default as the slab cache Linux kfree_skb-aware code
+# expects.
+SKB_CONTROL_SIZE:   uint64 = 256
+
+
+# --- TX bridge: eth_tx_hook -> netdev_ops->ndo_start_xmit ----------
+#
+# Hamnix's existing networking calls eth_tx(buf, len) when it wants
+# to transmit; eth_tx forwards through eth_tx_hook to whichever
+# driver registered itself. With the Linux e1000e.ko in charge, the
+# hook needs to convert (buf, len) into Linux's (skb, dev) shape and
+# call netdev_ops->ndo_start_xmit. Allocation layout:
+#
+#   [ skb control struct (256 bytes, kzalloc'd) ][ data (len bytes) ]
+#                                                ^
+#                                                head == data
+#
+# The driver consumes the skb on NETDEV_TX_OK — we MUST NOT free
+# after a successful ndo_start_xmit. On error (non-zero return) the
+# Linux contract is the driver returned without consuming, so the
+# caller frees. We surface the return value as a non-zero rc when
+# things went wrong, and zero (success) otherwise.
+
+_l_linux_netdev_for_tx: uint64 = 0    # set when the TX bridge is armed
+
+
+def _l_linux_tx_bridge(buf: Ptr[uint8], length: uint64) -> int32:
+    # Called from eth_tx() once the bridge has been installed via
+    # eth_register_tx_hook. Construct a minimal skb and dispatch.
+    if _l_linux_netdev_for_tx == 0:
+        printk0("[linux_tx_bridge] no netdev bound\n")
+        return -1
+    xmit_addr: uint64 = netdev_get_ndo_start_xmit(_l_linux_netdev_for_tx)
+    if xmit_addr == 0:
+        printk0("[linux_tx_bridge] netdev has no ndo_start_xmit\n")
+        return -1
+    skb: uint64 = kzalloc(SKB_CONTROL_SIZE + length)
+    if skb == 0:
+        printk0("[linux_tx_bridge] kzalloc(skb) failed\n")
+        return -1
+    data_p: uint64 = skb + SKB_CONTROL_SIZE
+    # Copy the frame in.
+    memcpy(cast[Ptr[uint8]](data_p), buf, length)
+    # Populate the fields the e1000e xmit path reads.
+    len_p: Ptr[uint32] = cast[Ptr[uint32]](skb + SKB_LEN_OFF)
+    len_p[0] = cast[uint32](length)
+    dl_p: Ptr[uint32] = cast[Ptr[uint32]](skb + SKB_DATA_LEN_OFF)
+    dl_p[0] = 0
+    head_p: Ptr[uint64] = cast[Ptr[uint64]](skb + SKB_HEAD_OFF)
+    head_p[0] = data_p
+    data_pp: Ptr[uint64] = cast[Ptr[uint64]](skb + SKB_DATA_OFF)
+    data_pp[0] = data_p
+    # protocol: ethertype lives at offset 12..13 of an Ethernet frame
+    # (big-endian on wire). The driver reads __be16 — store as host
+    # u16 with bytes reversed so the wire-order read returns the
+    # correct value.
+    proto_be: uint16 = 0
+    if length >= 14:
+        hi: uint16 = cast[uint16](buf[12])
+        lo: uint16 = cast[uint16](buf[13])
+        # Linux's __be16 stores bytes in big-endian; on x86 little-
+        # endian the in-memory layout is (lo, hi), so we OR them as
+        # (hi << 8) | lo to match.
+        proto_be = (hi << 8) | lo
+    proto_p: Ptr[uint16] = cast[Ptr[uint16]](skb + SKB_PROTOCOL_OFF)
+    proto_p[0] = proto_be
+
+    # Dispatch. Linux's netdev_tx_t is a typedef for int — 0 ==
+    # NETDEV_TX_OK; non-zero == NETDEV_TX_BUSY (driver couldn't
+    # accept; caller should re-queue).
+    xmit_fn: Fn[int32, uint64, uint64] = \
+        cast[Fn[int32, uint64, uint64]](xmit_addr)
+    rc: int32 = xmit_fn(skb, _l_linux_netdev_for_tx)
+    if rc != 0:
+        # NETDEV_TX_BUSY or worse — driver didn't consume; we free.
+        printk1("[linux_tx_bridge] ndo_start_xmit returned %d (BUSY)\n",
+                cast[uint64](rc))
+        kfree(skb)
+        return -1
+    # NETDEV_TX_OK — driver consumed the skb. Don't free.
+    return 0
+
+
+def linux_tx_bridge_arm(netdev: uint64):
+    # Call from the pci shim post-dev_open to install the Linux
+    # driver as the bound TX endpoint. Hamnix's eth_tx() then routes
+    # every frame through ndo_start_xmit. Idempotent — re-arming
+    # with a different netdev just updates the binding.
+    _l_linux_netdev_for_tx = netdev
+    eth_register_tx_hook(_l_linux_tx_bridge)
+    printk1("[linux_tx_bridge] armed for netdev=%p\n", netdev)
 
 
 def netdev_get_ndo_open(dev: uint64) -> uint64:
