@@ -8,17 +8,17 @@ It **extends** [`BOOT.md`](BOOT.md) — that doc covers QEMU and the ISO
 build pipeline; this one covers the steps and expectations specific to
 physical machines.
 
-> **Real-hardware status (2026-05, M16.156).** Hamnix boots all the
-> way to the `hamsh` shell on a real **Asus i5-4210U (Haswell ULT)**
-> laptop in **Legacy/BIOS mode**. This is the first confirmed boot on
-> physical silicon. Two things are NOT yet confirmed on that machine:
-> the **built-in keyboard does not work** (leading hypothesis: it is
-> routed through the EHCI USB 2.0 controller, not the i8042 — see §7),
-> and the **UEFI direct-boot path** has not been re-verified on metal
-> since the M16.151–156 debugging wave. Other machine classes below
-> are what *should* work given the drivers shipped; "should" is not
-> "tested" — filing an issue with what you tried is how we turn
-> "should" into "tested".
+> **Real-hardware status (2026-05-25).** Hamnix boots end-to-end on
+> the **Intel Skull Canyon NUC** (primary bring-up target): kernel
+> → hamsh shell → USB keyboard input via the L-shim USB-HC bridge
+> (`f426aee`) → native binaries on PATH → `enter linux { /bin/sh }`
+> → `ping 127.0.0.1`. The **Asus i5-4210U (Haswell ULT)** booted to
+> hamsh in M16.156 (Legacy/BIOS), but currently **crashes during
+> boot** — preserved for regression observation, not a current
+> bring-up target. Other machine classes below are what *should*
+> work given the drivers shipped; "should" is not "tested" —
+> filing an issue with what you tried is how we turn "should"
+> into "tested".
 
 ## The 5-minute test
 
@@ -62,22 +62,29 @@ supported.
 
 ### Confirmed real-hardware boots
 
-- **Intel NUC** (2026-05-23, default ISO, UEFI + Legacy/BIOS): boots
+- **Intel Skull Canyon NUC** (2026-05-25, default ISO): boots
   end-to-end. Kernel banner → boot checkpoints → hamsh interactive
-  prompt → atkbd keyboard input → native binaries on PATH (`ls`,
-  `cat`, `echo`) → `enter linux { /bin/sh }` (busybox baked into
-  default distrofs) → `ping 127.0.0.1` (loopback shortcut, no NIC
-  needed). The bare-metal xHCI auto-skip (§7) is what keeps boot
-  moving past the silicon-MMIO stall in `_xhci_v1_bringup`.
-- **Asus i5-4210U (Haswell ULT)** (2026-05-23, default ISO, UEFI +
-  Legacy/BIOS): boots end-to-end. The per-task ELF mapping landing
-  (`61e2b24`) closed the previous UEFI silent-execve issue — the
-  CPU was SYSRET'ing to ring-3 fine but the first instruction fetch
-  read garbage because PT_LOAD pages relied on the kernel's 1 GiB
-  identity-map stamp instead of explicit per-task PTE chains. Built-
-  in keyboard still doesn't respond (leading hypothesis: EHCI-
-  routed; native EHCI driver is QEMU-verified, not yet exercised on
-  this metal).
+  prompt → **USB keyboard input via the L-shim USB-HC bridge**
+  (`f426aee` carries `xhci_pci_probe` end-to-end) → native binaries
+  on PATH (`ls`, `cat`, `echo`) → `enter linux { /bin/sh }` (real
+  Debian busybox served from the rootfs partition mounted as
+  `#distro`) → `ping 127.0.0.1` (loopback shortcut, no NIC needed).
+  The `_xhci_v1_bringup` bare-metal sub-skip (§7) keeps the
+  hand-rolled driver out of the MMIO stall. The xhci.ko load-chain
+  global skip (`c444044`) was reverted in `2888b7c` —
+  `kernel_cond_resched` (`b08853e`) made syscall-context busy-polls
+  preemptive, so the L-shim probe no longer wedges the CPU.
+
+### Recently regressed
+
+- **Asus i5-4210U (Haswell ULT)**: booted to hamsh in M16.156
+  (Legacy/BIOS). **Currently crashes during boot.** Preserved for
+  regression observation, NOT a current bring-up target. The
+  built-in keyboard separately never responded (leading hypothesis:
+  EHCI-routed) but the box doesn't reach the keyboard layer at
+  present. The per-task ELF mapping landing (`61e2b24`) closed the
+  earlier UEFI silent-execve issue; the new crash is in a different
+  layer that hasn't been root-caused yet.
 
 ### CPU
 
@@ -205,20 +212,16 @@ supported.
 
 ## 2. What does NOT work today (the real-hardware caveats)
 
-These are the real-hardware risks. One physical box (an Asus i5-4210U)
-has booted to `hamsh` in Legacy/BIOS mode — but most of the surface
-below is still QEMU + OVMF verification only, and the Asus boot
-surfaced a still-open keyboard blocker.
+These are the real-hardware risks. Two physical boxes have been
+exercised — an Intel NUC boots end-to-end as of 2026-05-25, and an
+Asus i5-4210U booted in M16.156 but has since regressed. Most of
+the surface below is still QEMU + OVMF verification only.
 
-- **Built-in keyboard is dead on the Asus i5-4210U.** Hamnix boots to
-  the shell but the laptop's keyboard produces nothing — atkbd's
-  i8042 RESET/IDENTIFY probes return nothing on metal. Leading
-  hypothesis: the keyboard is on the EHCI USB 2.0 controller, not the
-  i8042. An EHCI driver is in flight. See §7. Serial-console input
-  works for diagnostics.
-- **UEFI on the real Asus is not re-confirmed.** Legacy/BIOS boot is
-  confirmed; the UEFI direct-boot path on that laptop has not been
-  re-verified since the M16.151–156 wave.
+- **Asus i5-4210U currently crashes during boot.** Booted to hamsh
+  in Legacy/BIOS mode for M16.156; a later wave introduced a crash
+  that hasn't been root-caused yet. Preserved for regression
+  observation. The built-in keyboard separately never responded
+  (leading hypothesis: EHCI-routed). See §7.
 - **Most "works" claims above are QEMU-only** — verified on
   QEMU + KVM + OVMF + GNOME Boxes. Real silicon has edge cases
   firmware emulators flatten.
