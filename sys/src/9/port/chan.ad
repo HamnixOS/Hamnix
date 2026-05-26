@@ -98,6 +98,9 @@ from sys.src.port9.port.9p_client import (
 # gone — so the device must be told at both lifecycle points. These
 # are the only two hooks; devfd.ad does not otherwise touch chan.ad.
 from sys.src.port9.port.devfd import devfd_clone_row, devfd_free_row
+# Named file-server stack uses printk for "reject loudly on overflow"
+# per docs/rootfs_partition.md "Future direction — Stack semantics".
+from kernel.printk.printk import printk0, printk1
 
 
 # Chan kind discriminator. CHAN_KIND_NONE marks an unused chan
@@ -188,6 +191,315 @@ pgrp_root_addr: uint64 = 0
 # bug remains diagnosable. Same shape as Linux's pin_user_pages refcount
 # saturation trick.
 PGRP_ROOT_REF_PIN: int32 = 0x7FFFFFFF
+
+
+# --- named file-server stack (docs/rootfs_partition.md Future ---
+# direction — Allocation models / Stack semantics). System-global
+# table indexed by full sentinel-declared name (NOT first-char
+# derivation; the WORD is the device name). Per the design:
+#
+#   * One stack per distinct name. Two physical disks both shipping
+#     `home` in their sentinels share a stack of depth 2.
+#   * Push on mount (init/main.ad's discovery walk, Phase 5).
+#   * Pop on unmount (block layer hot-unplug — Phase 4+ wiring; the
+#     entry point is here so the path exists even before the block
+#     layer detects the unplug event).
+#   * LIFO. `name_lookup(word)` returns the top; `name_lookup_at(word,
+#     pos)` returns position `pos` (1 = top, 2 = second, ...).
+#   * Depth cap 9 — past that, reject loudly, do NOT evict bottom.
+#     Eviction would orphan a name while the underlying Chan stays
+#     alive in any already-bound namespace.
+#
+# Storage: a fixed Array[NAME_TABLE_MAX, NameSlot] of stacks. Each
+# NameSlot carries the word (max 32 bytes including NUL) and a
+# fixed-size Array of stack entries. We never grow the table — the
+# slot count is sized for "the boot-time discovery walk plus any
+# hot-plug headroom"; collisions on the slot count are rejected with
+# the same loud-printk treatment as depth overflow.
+#
+# Adder quirks:
+#   * No string heap; words are inlined Array[32, uint8].
+#   * No `sizeof`, so we never allocate from kmalloc here — the
+#     whole table is BSS-resident at module load.
+
+NAME_WORD_MAX: uint64 = 32           # incl. NUL
+NAME_DIR_MAX:  uint64 = 256          # relpath inside the partition
+NAME_PARTUUID_MAX: uint64 = 40       # canonical "xxxxxxxx-xxxx-...."
+NAME_STACK_DEPTH:  uint64 = 9        # docs: "depth cap 9"
+NAME_TABLE_MAX:    uint64 = 32       # max distinct sentinel words system-wide
+
+
+class NameEntry:
+    in_use:        int32                          # 0 = vacant
+    pad:           int32
+    chan_ref:      uint64                         # opaque chan-like (Phase 6 uses)
+    partuuid:      Array[40, uint8]               # NUL-terminated
+    sentinel_word: Array[32, uint8]               # NUL-terminated; matches NameSlot.word
+    dir:           Array[256, uint8]              # sentinel relpath
+    mount_order:   uint64                         # boot-time monotonic counter
+
+
+class NameSlot:
+    in_use:    int32                              # 0 = vacant slot
+    depth:     int32                              # live stack entries (0..9)
+    word:      Array[32, uint8]                   # NUL-terminated key
+    # Stack[0] is bottom of stack, Stack[depth-1] is top. (LIFO with
+    # an array — push appends, pop drops the last.)
+    stack:     Array[9, NameEntry]
+
+
+name_table: Array[32, NameSlot]
+name_mount_seq: uint64 = 0                        # monotonic for mount_order
+
+
+def _name_str_eq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    # NUL-terminated equality on small buffers. Local copy to avoid
+    # pulling fs/vfs's helpers into chan.ad.
+    i: uint64 = 0
+    while True:
+        ca: uint8 = a[i]
+        cb: uint8 = b[i]
+        if ca != cb:
+            return 0
+        if ca == 0:
+            return 1
+        i = i + 1
+
+
+def _name_str_copy(dst: Ptr[uint8], src: Ptr[uint8], cap: uint64):
+    # Copy NUL-terminated src into dst, NUL-terminating at cap-1.
+    i: uint64 = 0
+    while i + 1 < cap:
+        c: uint8 = src[i]
+        dst[i] = c
+        if c == 0:
+            return
+        i = i + 1
+    dst[i] = 0
+
+
+def _name_find_slot(word: Ptr[uint8]) -> int32:
+    # Linear scan for a slot whose key matches `word`. Returns slot
+    # index on hit, -1 on miss.
+    s: uint64 = 0
+    while s < NAME_TABLE_MAX:
+        if name_table[s].in_use != 0:
+            if _name_str_eq(&name_table[s].word[0], word) != 0:
+                return cast[int32](s)
+        s = s + 1
+    return -1
+
+
+def _name_alloc_slot(word: Ptr[uint8]) -> int32:
+    # Allocate a fresh slot for `word`. Returns slot index, or -1 if
+    # the table is full (loud-printk per the doc).
+    s: uint64 = 0
+    while s < NAME_TABLE_MAX:
+        if name_table[s].in_use == 0:
+            name_table[s].in_use = 1
+            name_table[s].depth = 0
+            _name_str_copy(&name_table[s].word[0], word, NAME_WORD_MAX)
+            return cast[int32](s)
+        s = s + 1
+    return -1
+
+
+def name_push(word: Ptr[uint8], chan_ref: uint64,
+              partuuid: Ptr[uint8], dir: Ptr[uint8]) -> int32:
+    # Push a new entry onto the LIFO for `word`. Returns 0 on
+    # success, -1 on overflow (depth cap 9) or table-full.
+    # Per the doc, overflow on push is REJECTED LOUDLY and the
+    # bottom is NOT evicted. The caller can choose what to do; the
+    # by-id alias table (chan_byid_*) still gets populated so the
+    # partition remains addressable.
+    if word == cast[Ptr[uint8]](0) or word[0] == 0:
+        return -1
+    idx: int32 = _name_find_slot(word)
+    if idx < 0:
+        idx = _name_alloc_slot(word)
+        if idx < 0:
+            # Table full. Loud, so misconfigurations are visible in
+            # dmesg.
+            printk0("[name-stack] REJECTED push: word table full\n")
+            return -1
+    iu: uint64 = cast[uint64](idx)
+    if cast[uint64](name_table[iu].depth) >= NAME_STACK_DEPTH:
+        printk1("[name-stack] REJECTED push: depth cap %d reached\n",
+                NAME_STACK_DEPTH)
+        return -1
+    d: uint64 = cast[uint64](name_table[iu].depth)
+    name_table[iu].stack[d].in_use = 1
+    name_table[iu].stack[d].chan_ref = chan_ref
+    if partuuid != cast[Ptr[uint8]](0):
+        _name_str_copy(&name_table[iu].stack[d].partuuid[0],
+                       partuuid, NAME_PARTUUID_MAX)
+    else:
+        name_table[iu].stack[d].partuuid[0] = 0
+    _name_str_copy(&name_table[iu].stack[d].sentinel_word[0],
+                   word, NAME_WORD_MAX)
+    if dir != cast[Ptr[uint8]](0):
+        _name_str_copy(&name_table[iu].stack[d].dir[0], dir, NAME_DIR_MAX)
+    else:
+        name_table[iu].stack[d].dir[0] = 0
+    name_mount_seq = name_mount_seq + 1
+    name_table[iu].stack[d].mount_order = name_mount_seq
+    name_table[iu].depth = name_table[iu].depth + 1
+    return 0
+
+
+def name_pop(word: Ptr[uint8], chan_ref: uint64) -> int32:
+    # Pop the entry matching `chan_ref` from `word`'s stack. We pop
+    # by chan-ref rather than blindly popping the top because hot-
+    # unplug events are not necessarily for the most-recently-pushed
+    # device (a USB plugged before boot can be yanked while a later-
+    # pushed disk stays). Returns 0 if an entry was removed, -1 if
+    # no match found.
+    if word == cast[Ptr[uint8]](0) or word[0] == 0:
+        return -1
+    idx: int32 = _name_find_slot(word)
+    if idx < 0:
+        return -1
+    iu: uint64 = cast[uint64](idx)
+    d: uint64 = cast[uint64](name_table[iu].depth)
+    # Find the matching entry (linear; depth is tiny).
+    found: int32 = -1
+    j: uint64 = 0
+    while j < d:
+        if name_table[iu].stack[j].chan_ref == chan_ref:
+            found = cast[int32](j)
+        j = j + 1
+    if found < 0:
+        return -1
+    # Shift entries above `found` down one slot to preserve LIFO
+    # order for the remaining stack. Stack is small (max 9) so the
+    # shift cost is irrelevant.
+    fu: uint64 = cast[uint64](found)
+    while fu + 1 < d:
+        # Field-copy NameEntry (Adder has no struct-assign through
+        # array indices in all positions; do it field-by-field).
+        name_table[iu].stack[fu].in_use     = name_table[iu].stack[fu + 1].in_use
+        name_table[iu].stack[fu].chan_ref   = name_table[iu].stack[fu + 1].chan_ref
+        name_table[iu].stack[fu].mount_order= name_table[iu].stack[fu + 1].mount_order
+        k: uint64 = 0
+        while k < NAME_PARTUUID_MAX:
+            name_table[iu].stack[fu].partuuid[k] = \
+                name_table[iu].stack[fu + 1].partuuid[k]
+            k = k + 1
+        k = 0
+        while k < NAME_WORD_MAX:
+            name_table[iu].stack[fu].sentinel_word[k] = \
+                name_table[iu].stack[fu + 1].sentinel_word[k]
+            k = k + 1
+        k = 0
+        while k < NAME_DIR_MAX:
+            name_table[iu].stack[fu].dir[k] = \
+                name_table[iu].stack[fu + 1].dir[k]
+            k = k + 1
+        fu = fu + 1
+    # Clear the now-vacant top slot.
+    name_table[iu].stack[fu].in_use = 0
+    name_table[iu].stack[fu].chan_ref = 0
+    name_table[iu].stack[fu].partuuid[0] = 0
+    name_table[iu].stack[fu].sentinel_word[0] = 0
+    name_table[iu].stack[fu].dir[0] = 0
+    name_table[iu].depth = name_table[iu].depth - 1
+    if name_table[iu].depth == 0:
+        # Slot is empty — leave the in_use=1 marker so re-pushes go
+        # back into the same slot index. (Reclaiming slots is fine
+        # too; we choose stable index for simpler /proc/fs rendering.)
+        pass
+    return 0
+
+
+def name_lookup(word: Ptr[uint8]) -> uint64:
+    # Resolve `word` to the TOP-of-stack chan_ref. Returns 0 if no
+    # entry exists for this word. Caller decides what 0 means in
+    # context (typically "fall through to the dev table" for
+    # single-char names, or "ENOENT" for multi-char).
+    idx: int32 = _name_find_slot(word)
+    if idx < 0:
+        return 0
+    iu: uint64 = cast[uint64](idx)
+    d: int32 = name_table[iu].depth
+    if d <= 0:
+        return 0
+    return name_table[iu].stack[cast[uint64](d - 1)].chan_ref
+
+
+def name_lookup_at(word: Ptr[uint8], pos: int32) -> uint64:
+    # Resolve `word` at position `pos` (1 = top, 2 = second-from-top,
+    # ... up to NAME_STACK_DEPTH). Returns 0 if no entry at that
+    # position. `#home` is name_lookup_at(word="home", pos=1);
+    # `#home2` is name_lookup_at(word="home", pos=2); etc.
+    if pos < 1:
+        return 0
+    if cast[uint64](pos) > NAME_STACK_DEPTH:
+        return 0
+    idx: int32 = _name_find_slot(word)
+    if idx < 0:
+        return 0
+    iu: uint64 = cast[uint64](idx)
+    d: int32 = name_table[iu].depth
+    if pos > d:
+        return 0
+    # pos=1 -> stack[d-1] (top); pos=2 -> stack[d-2]; ...
+    j: int32 = d - pos
+    return name_table[iu].stack[cast[uint64](j)].chan_ref
+
+
+def name_lookup_partuuid(word: Ptr[uint8], pos: int32,
+                          out_buf: Ptr[uint8], cap: uint64) -> int32:
+    # Companion to name_lookup_at: copy the partuuid string for the
+    # entry at position `pos` (1 = top) into out_buf. Returns 0 on
+    # hit, -1 on miss. Used by /proc/fs/by-name/<word> rendering.
+    if pos < 1 or cap == 0:
+        return -1
+    idx: int32 = _name_find_slot(word)
+    if idx < 0:
+        return -1
+    iu: uint64 = cast[uint64](idx)
+    d: int32 = name_table[iu].depth
+    if pos > d:
+        return -1
+    j: int32 = d - pos
+    _name_str_copy(out_buf, &name_table[iu].stack[cast[uint64](j)].partuuid[0], cap)
+    return 0
+
+
+def name_stack_depth(word: Ptr[uint8]) -> int32:
+    # Public depth query — useful for /proc/fs/by-name/<word> tail
+    # rendering. Returns 0 if no slot exists; up to NAME_STACK_DEPTH
+    # otherwise.
+    idx: int32 = _name_find_slot(word)
+    if idx < 0:
+        return 0
+    return name_table[cast[uint64](idx)].depth
+
+
+def name_table_slot_count() -> uint64:
+    # Count of in-use slots — for /proc/fs/by-name directory listing.
+    n: uint64 = 0
+    s: uint64 = 0
+    while s < NAME_TABLE_MAX:
+        if name_table[s].in_use != 0:
+            n = n + 1
+        s = s + 1
+    return n
+
+
+def name_table_slot_word(slot_idx: uint64) -> Ptr[uint8]:
+    # Return a pointer to the word string at slot `slot_idx` (raw
+    # iteration: caller passes 0..NAME_TABLE_MAX-1 and skips slots
+    # whose first byte is 0 / in_use == 0). NULL on out-of-range.
+    if slot_idx >= NAME_TABLE_MAX:
+        return cast[Ptr[uint8]](0)
+    return &name_table[slot_idx].word[0]
+
+
+def name_table_slot_in_use(slot_idx: uint64) -> int32:
+    if slot_idx >= NAME_TABLE_MAX:
+        return 0
+    return name_table[slot_idx].in_use
 
 
 # --- string helpers -------------------------------------------------
