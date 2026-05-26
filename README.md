@@ -74,7 +74,8 @@ srvfds. See M16.135 + 9P V0..V4.1 in [STATUS.md](STATUS.md).
 - **UEFI direct boot**: PE/COFF stub uses SFSP to load the kernel ELF
   off the ESP, runs ExitBootServices, jumps to long mode. Reaches the
   hamsh prompt end-to-end on the UEFI path under QEMU+OVMF (M16.126,
-  M16.138). UEFI on the real Asus is not yet re-confirmed.
+  M16.138). UEFI on the real Asus is not currently re-confirmed
+  (Asus crashes during boot — see Known blockers).
 - **Linux ABI**: ~250 syscall numbers wired; 24 stock Debian `.ko`
   modules load cleanly. CPython 3.11.10 and busybox 1.36 both run as
   musl static-PIE ELF binaries — `python3 -c "print(...)"` and a
@@ -161,27 +162,29 @@ Hamnix is a wide project. The minimum-viable shape we're converging on:
 
 Concretely this means closing four named gates:
 
-1. **L40 — boot on real hardware. Closed.** The default
-   `bash scripts/build_iso.sh` ISO boots both an Intel NUC and an
-   Asus i5-4210U (Haswell ULT) end-to-end on **both Legacy/BIOS and
-   UEFI**: kernel → hamsh shell → interactive keyboard input → native
-   binaries → `enter linux { /bin/sh }` → `ping 127.0.0.1`. Confirmed
-   2026-05-23.
-   Enabling work that landed in this wave: dense `[boot:NN]`
-   checkpoints from `xhci_init` onward; an EFI memory-map walker
-   (`83f8de8 + 2fb1eb6`) that unlocked RAM > 240 MiB on UEFI
-   (935 MiB free at `-m 1G`); the EFI stub now bullet-proofs
-   `GetMemoryMap` with a 64 KiB buffer + return-value check
-   (`7365746`) instead of silently aborting; **bare-metal auto-skip
-   of xHCI live init** (`71961b3`) — CPUID 0x40000000 detects bare
-   metal and skips `_xhci_v1_bringup`'s MMIO-stall path, with
-   `ENABLE_XHCI_FORCE_INIT=1` / `ENABLE_XHCI_NO_INIT=1` overrides;
-   and the per-task ELF mapping fix (`61e2b24`) that closed a
-   silent-on-bare-metal class of bugs where loaded PT_LOAD pages
-   relied on the kernel's 1 GiB identity-map stamp instead of
-   explicit per-task PTE chains. `docs/REAL_HARDWARE.md` has the
-   USB-stick recipe + firmware checklist + the auto-skip decision
-   matrix.
+1. **L40 — boot on real hardware. Closed on the Intel NUC.** The
+   default `bash scripts/build_iso.sh` ISO boots the **Intel Skull
+   Canyon NUC** end-to-end on **both Legacy/BIOS and UEFI**:
+   kernel → hamsh shell → USB keyboard input via the L-shim USB-HC
+   bridge → native binaries → `enter linux { /bin/sh }` →
+   `ping 127.0.0.1`. Confirmed 2026-05-25. The Asus i5-4210U
+   (Haswell ULT) **currently crashes during boot** and is not a
+   primary bring-up target right now — preserved for regression
+   observation. Enabling work that landed across this wave: dense
+   `[boot:NN]` checkpoints from `xhci_init` onward; an EFI
+   memory-map walker (`83f8de8 + 2fb1eb6`) that unlocked RAM > 240
+   MiB on UEFI (935 MiB free at `-m 1G`); the EFI stub now
+   bullet-proofs `GetMemoryMap` with a 64 KiB buffer + return-value
+   check (`7365746`) instead of silently aborting; cooperative-
+   kernel-poll preemption via `kernel_cond_resched` (`b08853e`) so
+   busy-polls inside syscall context yield to the LAPIC timer; a
+   USB host-controller shim (`f426aee`) that wires
+   `xhci_pci_probe` end-to-end; and the per-task ELF mapping fix
+   (`61e2b24`) that closed a silent-on-bare-metal class of bugs
+   where loaded PT_LOAD pages relied on the kernel's 1 GiB
+   identity-map stamp instead of explicit per-task PTE chains.
+   `docs/REAL_HARDWARE.md` has the USB-stick recipe + firmware
+   checklist.
 2. **TLS-CERT — X.509 + RSA-PSS / ECDSA verify with a baked CA store.**
    **Closed.** V0..V7 + V5.1/V5.2/V5.3/V5.4 (commits `f47449e` →
    `dc7676c`, `7bc0ddd`, `f0b26b2`).
@@ -209,8 +212,10 @@ Concretely this means closing four named gates:
    added (V0 probe/port-enum, V1 control transfers + HID boot
    keyboard, V2 interrupt-driven MSI/INTx) — a live `sendkey`
    keystroke reaches the kbd FIFO through EHCI under QEMU `usb-ehci` +
-   `usb-kbd`. Not yet exercised on the real Asus, where the built-in
-   keyboard remains the open hardware blocker.
+   `usb-kbd`. The Linux L-shim USB-HC bridge (`f426aee`) carries
+   xhci_pci_probe end-to-end on the NUC. The Asus i5-4210U built-in
+   keyboard remains an open question because the box currently
+   crashes during boot before reaching the input layer.
 4. **Inbound SSH.** Shipped + wired into the boot rc. The
    native-Adder SSH-2.0 server (`user/sshd.ad`) uses curve25519-sha256
    KEX, an ECDSA-P256 host key (self-generated + persisted), the
@@ -218,28 +223,31 @@ Concretely this means closing four named gates:
    authentication** (`HAMNIX_SSH_AUTHKEYS=<pubkey> bash scripts/build_iso.sh`
    bakes the key into the cpio). `/etc/rc.boot` auto-spawns sshd as a
    detached service on a vanilla ISO. The end-game demo runs:
-   `ssh -p 22221 -i <key> root@127.0.0.1 'apt install hello'` against
-   a vanilla ISO — sshd authenticates, hamsh spawns inline as the
-   session shell, apt fetches over HTTP, SHA-256-verifies the .deb,
-   and dpkg unpacks 49 files into the distrofs. 5+ back-to-back SSH
-   sessions per boot without leaks (after `0f30263`'s pipe-leak fix).
-   "Useful server OS" is functionally demonstrated.
+   `ssh -p 22221 -i <key> root@127.0.0.1 'enter linux { apt install hello }'`
+   against a vanilla ISO — sshd authenticates, hamsh spawns inline
+   as the session shell, the `enter linux { ... }` step crosses into
+   the Debian rootfs partition, and real Debian apt/dpkg install the
+   package. 5+ back-to-back SSH sessions per boot without leaks
+   (after `0f30263`'s pipe-leak fix). "Useful server OS" is
+   functionally demonstrated.
 
-5. **Live `deb.debian.org` archive.** Closed. `apt update` against
-   `http://deb.debian.org/debian stable main` streams the real
-   Packages.gz end-to-end — **56,547,292 bytes decompressed, 68,755
-   packages** ingested, with the `InRelease` OpenPGP signature
-   verified against the baked Debian-archive key. Diagnosis behind
-   the fix: `sys_read() == 0` on TCP sockets was ambiguous between
-   real FIN and a 5-second `tcp_recv` timeout — `user/apt.ad`'s
-   streaming gzip path treated any zero as FIN, killing large
-   transfers; `1eeabb1` mirrors the sshd retry-on-timeout idiom.
-   `apt install` on a multi-MiB real Debian package — `libc6`
-   (13 MiB unpacked) — runs end-to-end inside QEMU's 600 s budget
-   as of `4191250`, on the back of an xz/dpkg/apt/tmpfs streaming
-   refactor (`ebce787`) and a 9P/pipe/sockpair msize bump from
-   8 KiB → 128 KiB. `scripts/test_apt_install_libc6.sh` PASSES on
-   a clean build.
+5. **Real Debian apt/dpkg.** Closed by *retirement* of the hand-
+   rolled Adder reimplementations. The Adder `user/apt.ad`,
+   `user/dpkg.ad`, and `user/dpkg_deb.ad` (combined ~6800 lines)
+   were removed 2026-05-26 (commits `0de1c63`..`3ff5bfc`) once
+   real Debian binaries running inside `enter linux { ... }`
+   demonstrated the wrong-architecture diagnosis: apt/dpkg are
+   Debian userland, and they should run as real Debian binaries
+   inside the Linux namespace rather than be re-shimmed in Adder.
+   The ISO now stages a curated apt/dpkg closure plus busybox onto
+   a separate ext4 partition (`scripts/build_rootfs_img.py`,
+   `scripts/build_initramfs.py` with `HAMNIX_DEFAULT_REAL_DEBIAN=1`
+   by default); the kernel auto-discovers the partition via a
+   `.hamnix-roots` sentinel and the linux ns recipe binds
+   `'#distro'` at `/` so `enter linux { /usr/bin/apt install hello }`
+   runs real Debian apt against real Debian dpkg.
+   `scripts/test_linux_apt_install.sh` asserts both binaries
+   actually run.
 
 Stack-canary compiler hardening (`-fstack-protector-strong` equivalent)
 has landed (`f9d8d2f`) — it catches the class of stack-local overflow
@@ -257,11 +265,10 @@ beyond MVP.
 | Gate | Status | Impact |
 |--|--|--|
 | **TLS cert validation** | **Closed** — apt-over-HTTPS against LE-signed mirrors is MITM-resistant | Full chain validation V0..V7: ASN.1 parser, X.509 walker, RSA-PSS-SHA256 verify, ECDSA-P256 verify, PKCS#1 v1.5 verify, chain builder + CA store + validity window, CertificateVerify transcript binding per RFC 8446 §4.4.3, multi-record handshake stitching, TCP per-slot RX ring. V6 added the AES-256-GCM-SHA384 cipher suite (codepoint 0x1302) + SHA-384; V6.1/V7 fixed ISRG Root X1 / RSA-4096 chain validation (x509 SPKI buffer cap + bigint limb count). Remaining real-world fragilities: (a) no CRL/OCSP (intentional per RFC 5280 §6 — out of scope); (b) timing-channel hardening still pending in primitives; (c) `_tls_now_unix` falls back to a build epoch when RTC is unavailable, opening a clock-rolled-back attack on expired certs. |
-| **Real-hardware keyboard** | **Closed on NUC, open on Asus** | Intel NUC accepts atkbd input end-to-end as of 2026-05-23. Asus i5-4210U built-in keyboard still doesn't respond under Legacy/BIOS; the atkbd-SIGINT path landed (`adce616`); leading hypothesis is the Asus keyboard is on EHCI, not the i8042, and a native-Adder EHCI driver is verified under QEMU `usb-ehci` + `usb-kbd` but not yet exercised on metal. |
-| **UEFI real-hardware boot** | **Closed** — UEFI and Legacy/BIOS both confirmed on the Asus and NUC | UEFI direct boot via the native PE/COFF stub reaches `hamsh` on both real laptops AND under QEMU+OVMF. Supporting landings: EFI memory-map walker (`83f8de8 + 2fb1eb6`) unlocks RAM > 240 MiB on UEFI (935 MiB free at `-m 1G`); `7365746` made `GetMemoryMap` robust against real-firmware buffer sizes; bare-metal auto-skip (`71961b3`) keeps `xhci_init` from wedging on real silicon; the per-task ELF mapping (`61e2b24`) closed a silent-on-bare-metal class of bugs where PT_LOAD pages relied on the 1 GiB identity-map stamp. |
-| **Bare-metal xHCI MMIO stall** | **Auto-skipped by default** | `_xhci_v1_bringup`'s HCH-clear MMIO poll stalls the CPU on real NUC silicon (the load instruction itself never retires; no software-side timeout helps). The default boot detects bare metal via CPUID 0x40000000 and skips `xhci_init` entirely; PS/2 + serial + framebuffer + EHCI keep working. Force-enable with `ENABLE_XHCI_FORCE_INIT=1` if your hardware handles live xHCI bringup. Real fix (alternative bringup respecting BIOS handoff state) is deferred. |
-| **`apt` against a live Debian mirror** | Closed | `apt update`/`install` runs end-to-end against the genuine `deb.debian.org` `main` suite over HTTP **and HTTPS** (TLS over `/net`): streams a real `main`-sized index with no fixed-buffer cap, decompresses gzip **and xz**, verifies the `Release`/`InRelease` OpenPGP signature (RSA PKCS#1 v1.5, SHA-512, multi-key keyrings) against the baked Debian-archive key, fetches the `.deb`, SHA-256-verifies it, and `dpkg`-installs it — verified by `test_apt_real_deb` (Debian `hello` 2.10-5 installs and `dpkg -L` lists its files). |
-| **apt/dpkg/httpd under a namespace** | Open — global-path debt | The native `apt`/`dpkg`/`httpd` tools still write *global* paths (a global `/var` tmpfs, `/tmp/...`). Per the Namespace law they must run *under* `nsrun` so `/var/lib/dpkg`, `/var/cache/apt`, `/var/www` resolve through a private `distrofs` namespace. `distrofs` + `nsrun` exist; migrating the tools onto them is open work. |
+| **Real-hardware keyboard** | **Closed on NUC, open on Asus (Asus crashes earlier)** | Intel NUC accepts USB keyboard input end-to-end as of 2026-05-25 via the L-shim USB-HC bridge (`f426aee`). Asus i5-4210U currently crashes during boot before keyboard input is reachable — see `docs/REAL_HARDWARE.md`. The atkbd-SIGINT path landed (`adce616`); a native-Adder EHCI driver is verified under QEMU `usb-ehci` + `usb-kbd` but not yet exercised on metal. |
+| **UEFI real-hardware boot** | **Confirmed on NUC under QEMU+OVMF; Asus UEFI not currently re-confirmed** | UEFI direct boot via the native PE/COFF stub reaches `hamsh` under QEMU+OVMF and on the NUC. Supporting landings: EFI memory-map walker (`83f8de8 + 2fb1eb6`) unlocks RAM > 240 MiB on UEFI (935 MiB free at `-m 1G`); `7365746` made `GetMemoryMap` robust against real-firmware buffer sizes; the per-task ELF mapping (`61e2b24`) closed a silent-on-bare-metal class of bugs where PT_LOAD pages relied on the 1 GiB identity-map stamp. |
+| **xHCI live-bringup MMIO stall** | **Mitigated by `_xhci_v1_bringup` bare-metal sub-skip + cond_resched** | The hand-rolled `drivers/usb/xhci.ad::_xhci_v1_bringup`'s HCH-clear MMIO poll has historically stalled the CPU on real NUC silicon (the load instruction itself never retires; no software-side timeout helps). The handler still detects bare metal via CPUID 0x40000000 and skips `_xhci_v1_bringup`; PS/2 + serial + framebuffer keep working. Force-enable with `ENABLE_XHCI_FORCE_INIT=1` if your hardware handles live xHCI bringup. The earlier global xhci.ko load-chain skip (`c444044`) was **reverted in `2888b7c`** — `kernel_cond_resched` (`b08853e`) made syscall-context busy-polls preemptive, and the L-shim USB-HC bridge (`f426aee`) wires `xhci_pci_probe` end-to-end. |
+| **Real Debian apt/dpkg** | Closed — runs as REAL binaries inside `enter linux { ... }` | Hand-rolled Adder `user/apt.ad`/`user/dpkg.ad`/`user/dpkg_deb.ad` were retired 2026-05-26 (`0de1c63`..`3ff5bfc`). The build now stages a curated apt/dpkg closure (plus their `ldd` closures + busybox) onto a separate ext4 rootfs partition (`scripts/build_rootfs_img.py`, default `HAMNIX_DEFAULT_REAL_DEBIAN=1`). `enter linux { /usr/bin/apt install hello }` invokes real Debian `apt 3.0.3 (amd64)` against real Debian `dpkg 1.22.22 (amd64)`. Verified by `scripts/test_linux_apt_install.sh`. |
 | **busybox `ls` enumeration** | Open XFAIL | CPython 3.11.10 and busybox 1.36 run as musl static-PIE binaries in QEMU; `python3 -c` and a multi-applet `busybox sh` pipeline pass. But `busybox ls` directory enumeration prints nothing — musl's `opendir`/`readdir` round-trip the directory fd incorrectly (a direct `getdents64` syscall enumerates fine). busybox `sh`'s *internal* pipeline (`sh -c "a \| b"`) also trips a `#GP`. Both are marked XFAIL in the U-track tests. |
 Compiler bugs that surfaced during development have landed proper
 fixes — do not work around them: the U9 nested-frame `Array` spill,
@@ -270,7 +277,7 @@ fixes — do not work around them: the U9 nested-frame `Array` spill,
 signed-only integer comparison. Language quirks land in
 `tests/test_compiler_*.ad` as guarded regressions the moment they're
 surfaced — see [`scripts/run_compiler_tests.sh`](scripts/run_compiler_tests.sh)
-(13 fixtures, all green). `LANGUAGE.md` was audited against
+(14 fixtures, all green). `LANGUAGE.md` was audited against
 `compiler/codegen_x86.py` in `b385a4b` — ~14 documented-but-fictional
 features (lambdas, `try`/`except`, list comprehensions, f-strings,
 `match`/`case`, class methods, `sizeof` builtin, default args,
@@ -325,9 +332,9 @@ targets > 64 GiB by default, and prompts for explicit confirmation.
 See [`docs/REAL_HARDWARE.md`](docs/REAL_HARDWARE.md) for the full
 real-hardware boot procedure — firmware setup per vendor, expected
 serial-console marker sequence, diagnostic-dump cheat-sheet for boxes
-without a serial cable, and the current real-hardware status (Legacy
-boot confirmed on an Asus i5-4210U; built-in keyboard still an open
-issue).
+without a serial cable, and the current real-hardware status (Intel
+NUC confirmed end-to-end 2026-05-25; Asus i5-4210U currently crashes
+during boot, preserved for regression observation).
 
 ### Run the M1..M15 stock-Linux .ko regression suite
 
@@ -390,34 +397,36 @@ hamsh$ cmd 2>&1 | tee log
 ### The Linux runtime — running unmodified Linux ELFs
 
 `/etc/rc.boot` defines `linux` as a `ns clean { }` template that
-grafts the distro tree at `/var/lib/distros/default/` onto `/` (so
-anywhere a Debian package writes is INSIDE the container, not on the
-host) and explicitly re-shares only `/home`, `/dev`, `/proc`, `/srv`,
-`/n`. `debian` is a duplicate-body alias for the same template.
+binds the auto-discovered Debian rootfs partition (`'#distro'`) at
+`/`, and explicitly re-shares `/home`, `/dev`, `/proc`, `/srv`,
+`/n`, `/tmp`. `debian` is a duplicate-body alias for the same
+template.
 
 The `clean` modifier means `enter linux { … }` does NOT inherit the
 ambient namespace — the only paths visible inside are the ones the
 template binds. An `apt install` does not contaminate the host's
-`/bin`, `/etc`, `/usr`, `/lib`, `/lib64`, `/var`, `/opt`, `/root`, or
-`/tmp`; all of those resolve into the distro tree.
+`/bin`, `/etc`, `/usr`, `/lib`, `/lib64`, `/var`, `/opt`, `/root`;
+all of those resolve into the distro partition. The shell still
+sees the partition at `/n/distros/`, so `ls /n/distros/usr/bin`
+shows what `apt install` wrote.
 
 ```
-hamsh$ enter linux { /bin/apt --version }     # synchronous
+hamsh$ enter linux { /usr/bin/apt --version } # synchronous
 hamsh$ enter linux { /bin/sh }                # interactive Linux sh; `exit` returns
 hamsh$ enter debian { /bin/cat /etc/debian_version }
-hamsh$ svc = spawn linux { /bin/postgres }    # detached service
+hamsh$ svc = spawn linux { /usr/bin/postgres } # detached service
 hamsh$ kill $svc                              # tear it down
 ```
 
 There is no `distrorun` command; running a Linux binary is plain
-namespace verbs. If the binary isn't in your distrofs yet, install it
-first — the native-Adder `apt` lands real Debian packages into the
-linux tree:
+namespace verbs. If the binary isn't in your distro tree yet,
+install it first — `apt`/`dpkg` are real Debian binaries; they run
+INSIDE `enter linux { ... }` against the distro rootfs partition:
 
 ```
-hamsh$ apt update
-hamsh$ apt install bash
-hamsh$ ls /var/lib/distros/default/usr/bin   # what's installed
+hamsh$ enter linux { /usr/bin/apt update }
+hamsh$ enter linux { /usr/bin/apt install bash }
+hamsh$ ls /n/distros/usr/bin                # what's on the partition
 hamsh$ enter linux { /bin/bash --version }
 ```
 
@@ -439,7 +448,7 @@ inside a block is gone after the brace.
 
 ```
 hamsh$ webns = ns {
-hamsh>     bind /www /var/www
+hamsh>     bind /var/www /www      # source-first: graft /var/www at /www
 hamsh> }
 hamsh$ enter webns { ls /www }                       # /www visible only inside
 hamsh$ ls /www                                       # not visible at the prompt
@@ -463,10 +472,11 @@ Interactive keys at the prompt:
 ### Init / rc
 
 PID 1 is hamsh executing `/etc/rc.boot`. The rc is plain hamsh —
-applies the namespace recipe (`bind /srv '#s'`, `bind /proc '#p'`,
-`bind /n '#/'`), launches detached services with `spawn detached`,
-defines `linux`, then drops to the interactive prompt. Edit the
-file to change boot — no kernel recompile needed.
+applies the namespace recipe (`bind '#s' /srv`, `bind '#p' /proc`,
+`bind '#/' /n`, `bind '#distro' /n/distros`), launches detached
+services with `spawn detached`, defines `linux`, then drops to the
+interactive prompt. Edit the file to change boot — no kernel
+recompile needed.
 
 ---
 
