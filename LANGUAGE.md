@@ -110,29 +110,66 @@ RIP-relative `leaq`. Triple-quoted strings are supported. Escapes:
 Adjacent string-literal concatenation (`"foo " "bar"`) is **not**
 supported — use a single literal or build the string at runtime.
 
-### Reserved identifiers
+### Reserved words
 
-The lexer claims the following names as keywords / built-in tokens
-even though many are not implemented in codegen. Using one of these
-as a variable, parameter, field, or function name is a parse error
-(or in a few cases produces a confusing downstream error). When
-porting C/Linux code that uses one of these as a parameter name,
-rename it (the canonical rename is `bytes` → `nbytes`):
+The lexer in `compiler/lexer.py` claims the following names as
+keywords / built-in tokens. Using one of these as a variable,
+parameter, field, or function name is a **parse error** (or in a
+few cases produces a confusing downstream codegen error, because
+the parser still produces a typed token that the codegen can't
+demote back to an identifier). When porting C/Linux code that uses
+one of these as a parameter name, rename it (the canonical rename
+is `bytes` → `nbytes`, `match` → `m_match`, `field` → `fld`).
 
-| Group | Names |
+Source of truth: `compiler/lexer.py`'s `KEYWORDS` dict — every name
+below is a key there. If the lexer's `KEYWORDS` grows, this list
+must grow with it.
+
+#### Full reserved-words list (alphabetical)
+
+Every entry below is a key in `compiler/lexer.py::KEYWORDS` and
+becomes a typed token rather than an `IDENT`.
+
+```
+Array       Dict        Enum        False       Fn          List
+None        Optional    Ptr         Ref         True        Tuple
+and         as          asm         assert      async       auto
+await       bool        break       bytes       case        cast
+char        class       classmethod continue    dataclass   def
+defer       del         do          elif        else        except
+extern      field       finally     float       float32     float64
+for         from        global      if          import      in
+int         int16       int32       int64       int8        interrupt
+is          isinstance  lambda      match       nonlocal    not
+or          packed      pass        property    raise       return
+self        staticmethod str        try         uint16      uint32
+uint64      uint8       union       volatile    while       with
+yield
+```
+
+One *additional* name — `Percpu` — is not in the lexer's
+`KEYWORDS` dict (the lexer emits it as a plain `IDENT`), but the
+**parser** recognises `Percpu[T]` specifically as the per-CPU
+storage type. Using `Percpu` as an ordinary name confuses
+downstream codegen. Treat it as effectively reserved.
+
+#### Reserved words by category
+
+| Category | Names |
 |---|---|
 | Control flow | `if`, `elif`, `else`, `while`, `do`, `for`, `in`, `break`, `continue`, `pass`, `return`, `with`, `raise`, `try`, `except`, `finally`, `match`, `case`, `assert`, `defer`, `yield`, `lambda`, `async`, `await` |
 | Boolean / null | `True`, `False`, `None`, `and`, `or`, `not`, `is` |
 | Definition | `def`, `class`, `from`, `import`, `as`, `extern`, `union`, `interrupt`, `global`, `nonlocal`, `del` |
 | Scalar types | `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float32`, `float64`, `bool`, `char`, `int`, `float`, `str`, `bytes` |
 | Compound type heads | `Ptr`, `Fn`, `Array`, `Ref`, `List`, `Dict`, `Tuple`, `Optional`, `Enum` |
-| Magic identifier | `Percpu` (an ordinary `IDENT` to the lexer, but the parser recognises `Percpu[T]` specifically as the per-CPU storage type — don't use `Percpu` as a name) |
+| Magic identifier | `Percpu` — an ordinary `IDENT` to the lexer, but the parser recognises `Percpu[T]` specifically as the per-CPU storage type. Don't use `Percpu` as a name. |
 | Casts / type-ish | `cast`, `auto` |
-| Other Python noise | `dataclass`, `isinstance`, `field`, `property`, `staticmethod`, `classmethod`, `self`, `volatile`, `packed`, `asm` |
+| Python noise | `dataclass`, `isinstance`, `field`, `property`, `staticmethod`, `classmethod`, `self`, `volatile`, `packed`, `asm` |
 
 Names like `bytes`, `match`, `case`, `int`, `str`, `self`, `asm`, and
 `field` come up especially often when porting code — rename them on
-the way in.
+the way in. (`field` is the surprise — Adder reserves it because
+Python's `dataclasses.field()` builtin would shadow it.)
 
 ---
 
