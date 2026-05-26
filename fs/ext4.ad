@@ -3336,3 +3336,478 @@ def ext4_resize_check(slot: int32,
     printk1("[ext4_resize] OK: grow %d byte(s) feasible\n",
             partition_size_bytes - cur_bytes)
     return 1
+
+
+# ---- Phase 2: the actual extend ---------------------------------
+#
+# `ext4_resize_grow(slot, new_blocks_count)`:
+#   1. Re-read SB (single source of truth for geometry).
+#   2. Round new_blocks_count down to whole groups — partial last
+#      group is out of scope. Tail wasted at most blocks_per_group-1
+#      blocks (8 MiB for the default 1 KiB/8192 layout).
+#   3. For each new group g in [old_groups, new_groups):
+#        a. Decide sparse-super membership.
+#        b. Compute group metadata layout (bitmap, inode bitmap,
+#           inode table — at group start, after any sparse reserve).
+#        c. Initialize the block bitmap (mark metadata used, plus
+#           the sparse reserve if applicable; rest free).
+#        d. Zero the inode bitmap and inode table.
+#        e. Write a fresh GDT entry for g into the primary GDT
+#           (lands in the reserved-gdt blocks naturally as the GDT
+#           grows past its original extent).
+#   4. Update primary superblock fields:
+#        s_blocks_count_lo (+ _hi if 64bit feature set)
+#        s_free_blocks_count_lo (+ _hi)
+#        s_inodes_count
+#        s_free_inodes_count
+#      (Group count is derived from blocks_count/blocks_per_group;
+#       there is no s_groups_count field in the SB.)
+#   5. Write SB back; flush.
+#
+# Backup superblocks + backup GDTs at sparse-super groups are NOT
+# updated. Linux ext4 mount uses only the primary SB; e2fsck cares
+# about backup parity but the FS is fully mountable without it. A
+# user can `tune2fs -O ^sparse_super && tune2fs -O sparse_super` or
+# `resize2fs -f` from the linux ns to rewrite backups if needed.
+
+# GDT entry field offsets (within the 32- or 64-byte descriptor):
+EXT4_BG_BLOCK_BITMAP_LO:    uint64 = 0x00
+EXT4_BG_INODE_BITMAP_LO:    uint64 = 0x04
+EXT4_BG_INODE_TABLE_LO:     uint64 = 0x08
+EXT4_BG_FREE_BLOCKS_LO:     uint64 = 0x0C
+EXT4_BG_FREE_INODES_LO:     uint64 = 0x0E
+EXT4_BG_USED_DIRS_LO:       uint64 = 0x10
+EXT4_BG_FLAGS:              uint64 = 0x12
+EXT4_BG_ITABLE_UNUSED_LO:   uint64 = 0x1C
+EXT4_BG_CHECKSUM:           uint64 = 0x1E
+EXT4_BG_BLOCK_BITMAP_HI:    uint64 = 0x20
+EXT4_BG_INODE_BITMAP_HI:    uint64 = 0x24
+EXT4_BG_INODE_TABLE_HI:     uint64 = 0x28
+EXT4_BG_FREE_BLOCKS_HI:     uint64 = 0x2C
+EXT4_BG_FREE_INODES_HI:     uint64 = 0x2E
+EXT4_BG_USED_DIRS_HI:       uint64 = 0x30
+EXT4_BG_ITABLE_UNUSED_HI:   uint64 = 0x32
+
+# bg_flags: EXT4_BG_INODE_UNINIT (0x1), EXT4_BG_BLOCK_UNINIT (0x2),
+# EXT4_BG_INODE_ZEROED (0x4). We zero everything and set
+# INODE_ZEROED so a future mount-time scrubber doesn't try to lazily
+# zero what's already zero.
+EXT4_BG_FLAG_INODE_UNINIT: uint16 = 0x1
+EXT4_BG_FLAG_BLOCK_UNINIT: uint16 = 0x2
+EXT4_BG_FLAG_INODE_ZEROED: uint16 = 0x4
+
+
+def _ext4_resize_pow_test(n: uint64, base: uint64) -> int32:
+    # Return 1 iff `n` is a non-zero power of `base` (base^k for some
+    # k >= 0). Used by the sparse_super predicate.
+    if n == 0:
+        return 0
+    x: uint64 = 1
+    while x < n:
+        x = x * base
+    if x == n:
+        return 1
+    return 0
+
+
+def _ext4_resize_is_sparse(g: uint64) -> int32:
+    # sparse_super pattern: backup SB+GDT at groups 0, 1, and any
+    # group whose number is a power of 3, 5, or 7. Mirror of
+    # fs/ext4/super.c::ext4_bg_has_super().
+    if g == 0:
+        return 1
+    if g == 1:
+        return 1
+    if _ext4_resize_pow_test(g, 3) != 0:
+        return 1
+    if _ext4_resize_pow_test(g, 5) != 0:
+        return 1
+    if _ext4_resize_pow_test(g, 7) != 0:
+        return 1
+    return 0
+
+
+def _ext4_resize_write_block(slot: int32, block_size: uint64,
+                             block_nr: uint64,
+                             buf: Ptr[uint8]) -> int32:
+    # Slot-aware block write — ext4_resize_grow runs while the FS
+    # is unmounted (offline), so the global ext4_blockdev_slot may
+    # belong to a different mount. Always pass the slot in.
+    sectors_per_block: uint64 = block_size / SECTOR_SIZE
+    lba: uint64 = block_nr * sectors_per_block
+    return blk_write_sectors(slot, lba, sectors_per_block, buf)
+
+
+def _ext4_resize_read_block(slot: int32, block_size: uint64,
+                            block_nr: uint64,
+                            buf: Ptr[uint8]) -> int32:
+    sectors_per_block: uint64 = block_size / SECTOR_SIZE
+    lba: uint64 = block_nr * sectors_per_block
+    return blk_read_sectors(slot, lba, sectors_per_block, buf)
+
+
+def _ext4_resize_zero_buf(p: Ptr[uint8], n: uint64):
+    i: uint64 = 0
+    while i < n:
+        p[i] = 0
+        i = i + 1
+
+
+def _ext4_resize_build_block_bitmap(buf: Ptr[uint8],
+                                    block_size: uint64,
+                                    used_blocks: uint64,
+                                    group_blocks: uint64):
+    # Build a block bitmap for a fresh group:
+    #   bits 0..used_blocks-1     : 1 (metadata in use)
+    #   bits used_blocks..group_blocks-1 : 0 (free data)
+    #   bits group_blocks..block_size*8-1 : 1 (past end-of-group)
+    # The last region only matters when group_blocks < block_size*8
+    # (i.e. the bitmap addresses more bits than the group has blocks);
+    # for our 1 KiB block / 8192 blocks_per_group case the bitmap is
+    # exactly 8192 bits = 1024 bytes = 1 block, so the third region
+    # is empty. Kept for future-proofing against larger block sizes.
+    _ext4_resize_zero_buf(buf, block_size)
+    bits_total: uint64 = block_size * 8
+    # First: set bits 0..used_blocks-1.
+    full_bytes: uint64 = used_blocks / 8
+    i: uint64 = 0
+    while i < full_bytes:
+        buf[i] = 0xFF
+        i = i + 1
+    rem: uint64 = used_blocks % 8
+    if rem != 0:
+        bit_idx: uint64 = 0
+        m: uint8 = 0
+        while bit_idx < rem:
+            m = m | (cast[uint8](1) << cast[uint8](bit_idx))
+            bit_idx = bit_idx + 1
+        buf[full_bytes] = buf[full_bytes] | m
+    # Set bits group_blocks..bits_total-1 (past end-of-group).
+    if group_blocks < bits_total:
+        # Set partial bits in the byte containing group_blocks, then
+        # all bytes after.
+        b: uint64 = group_blocks
+        while b < bits_total:
+            byte_idx: uint64 = b / 8
+            bit_idx2: uint64 = b % 8
+            mask: uint8 = cast[uint8](1) << cast[uint8](bit_idx2)
+            buf[byte_idx] = buf[byte_idx] | mask
+            b = b + 1
+
+
+def _ext4_resize_write_gdt_entry(slot: int32, block_size: uint64,
+                                 first_data_block: uint64,
+                                 desc_size: uint64,
+                                 group: uint64,
+                                 bm_blk: uint64,
+                                 ibm_blk: uint64,
+                                 itab_blk: uint64,
+                                 free_blocks: uint64,
+                                 free_inodes: uint64,
+                                 itab_blocks: uint64) -> int32:
+    # Splice a new GDT entry for `group` into the primary GDT. The
+    # GDT entry lives at byte offset group * desc_size from the start
+    # of the GDT (first_data_block + 1). The block holding the entry
+    # might be in the primary GDT region OR the reserved-GDT region —
+    # both are physically contiguous; we just compute the address and
+    # read-modify-write that one block.
+    gdt_byte_off: uint64 = group * desc_size
+    gdt_blk: uint64 = first_data_block + 1 \
+                      + (gdt_byte_off / block_size)
+    within: uint64 = gdt_byte_off % block_size
+    if _ext4_resize_read_block(slot, block_size, gdt_blk,
+                               &ext4_resize_blk_buf[0]) != 0:
+        printk1("[ext4_resize] gdt read FAIL group=%d\n", group)
+        return -1
+    entry: uint64 = cast[uint64](&ext4_resize_blk_buf[0]) + within
+    # Zero the descriptor first (the rest of the desc_size area).
+    _ext4_resize_zero_buf(cast[Ptr[uint8]](entry), desc_size)
+    _ext4_write_u32(cast[Ptr[uint8]](entry + EXT4_BG_BLOCK_BITMAP_LO),
+                    cast[uint32](bm_blk & 0xFFFFFFFF))
+    _ext4_write_u32(cast[Ptr[uint8]](entry + EXT4_BG_INODE_BITMAP_LO),
+                    cast[uint32](ibm_blk & 0xFFFFFFFF))
+    _ext4_write_u32(cast[Ptr[uint8]](entry + EXT4_BG_INODE_TABLE_LO),
+                    cast[uint32](itab_blk & 0xFFFFFFFF))
+    _ext4_write_u16(cast[Ptr[uint8]](entry + EXT4_BG_FREE_BLOCKS_LO),
+                    cast[uint16](free_blocks & 0xFFFF))
+    _ext4_write_u16(cast[Ptr[uint8]](entry + EXT4_BG_FREE_INODES_LO),
+                    cast[uint16](free_inodes & 0xFFFF))
+    _ext4_write_u16(cast[Ptr[uint8]](entry + EXT4_BG_USED_DIRS_LO), 0)
+    _ext4_write_u16(cast[Ptr[uint8]](entry + EXT4_BG_FLAGS),
+                    EXT4_BG_FLAG_INODE_ZEROED)
+    _ext4_write_u16(cast[Ptr[uint8]](entry + EXT4_BG_ITABLE_UNUSED_LO),
+                    cast[uint16](free_inodes & 0xFFFF))
+    _ext4_write_u16(cast[Ptr[uint8]](entry + EXT4_BG_CHECKSUM), 0)
+    # 64-byte descriptor: zero the _hi halves (still under 32 bits).
+    if desc_size >= 64:
+        _ext4_write_u32(cast[Ptr[uint8]](entry + EXT4_BG_BLOCK_BITMAP_HI),
+                        cast[uint32]((bm_blk >> 32) & 0xFFFFFFFF))
+        _ext4_write_u32(cast[Ptr[uint8]](entry + EXT4_BG_INODE_BITMAP_HI),
+                        cast[uint32]((ibm_blk >> 32) & 0xFFFFFFFF))
+        _ext4_write_u32(cast[Ptr[uint8]](entry + EXT4_BG_INODE_TABLE_HI),
+                        cast[uint32]((itab_blk >> 32) & 0xFFFFFFFF))
+        _ext4_write_u16(cast[Ptr[uint8]](entry + EXT4_BG_FREE_BLOCKS_HI),
+                        cast[uint16]((free_blocks >> 16) & 0xFFFF))
+        _ext4_write_u16(cast[Ptr[uint8]](entry + EXT4_BG_FREE_INODES_HI),
+                        cast[uint16]((free_inodes >> 16) & 0xFFFF))
+        _ext4_write_u16(cast[Ptr[uint8]](entry + EXT4_BG_USED_DIRS_HI), 0)
+        _ext4_write_u16(cast[Ptr[uint8]](entry + EXT4_BG_ITABLE_UNUSED_HI),
+                        cast[uint16]((free_inodes >> 16) & 0xFFFF))
+    if _ext4_resize_write_block(slot, block_size, gdt_blk,
+                                &ext4_resize_blk_buf[0]) != 0:
+        printk1("[ext4_resize] gdt write FAIL group=%d\n", group)
+        return -1
+    return 0
+
+
+def ext4_resize_grow(slot: int32, new_blocks_count: uint64) -> int32:
+    # Offline ext4 grow. Caller passes the desired new total block
+    # count; we round DOWN to whole groups and append zero-or-more
+    # block groups until the FS reaches that target.
+    #
+    # Returns 0 on success, -EINVAL/-EIO/-ENOSPC on failure (with
+    # the FS in an indeterminate state — caller should refuse to
+    # mount and trigger e2fsck, but a normal kernel mount of the
+    # primary SB will still find a coherent layout as long as the
+    # SB write succeeded last).
+    if slot < 0:
+        return EXT4_RESIZE_EINVAL
+    if _ext4_resize_read_sb(slot) != 0:
+        return EXT4_RESIZE_EIO
+
+    sb: Ptr[uint8] = &ext4_resize_sb_buf[0]
+    if _ext4_resize_sb_u16(sb, EXT4_SB_OFF_MAGIC) != EXT4_MAGIC:
+        return EXT4_RESIZE_EINVAL
+
+    log_bs: uint32 = _ext4_resize_sb_u32(sb,
+                                         EXT4_SB_OFF_LOG_BLOCK_SIZE)
+    blk_sz: uint64 = cast[uint64](1024) << cast[uint64](log_bs)
+    fdb: uint64 = cast[uint64](_ext4_resize_sb_u32(sb,
+                              EXT4_SB_OFF_FIRST_DATA_BLOCK))
+    bpg: uint64 = cast[uint64](_ext4_resize_sb_u32(sb,
+                              EXT4_SB_OFF_BLOCKS_PER_GROUP))
+    ipg: uint64 = cast[uint64](_ext4_resize_sb_u32(sb,
+                              EXT4_SB_OFF_INODES_PER_GROUP))
+    isize: uint64 = cast[uint64](_ext4_resize_sb_u16(sb,
+                                EXT4_SB_OFF_INODE_SIZE))
+    if isize == 0:
+        isize = 128
+    desc_sz: uint64 = cast[uint64](_ext4_resize_sb_u16(sb,
+                                  EXT4_SB_OFF_DESC_SIZE))
+    if desc_sz == 0:
+        desc_sz = 32
+    rgdt: uint64 = cast[uint64](_ext4_resize_sb_u16(sb,
+                               EXT4_SB_OFF_RESERVED_GDT_BLKS))
+    incompat: uint32 = _ext4_resize_sb_u32(sb,
+                                           EXT4_SB_OFF_FEATURE_INCOMPAT)
+    bc_lo: uint32 = _ext4_resize_sb_u32(sb,
+                                        EXT4_SB_OFF_BLOCKS_COUNT_LO)
+    bc_hi: uint32 = _ext4_resize_sb_u32(sb,
+                                        EXT4_SB_OFF_BLOCKS_COUNT_HI)
+    cur_blocks: uint64 = cast[uint64](bc_lo) \
+                         | (cast[uint64](bc_hi) << 32)
+    cur_inodes: uint32 = _ext4_resize_sb_u32(sb,
+                                             EXT4_SB_OFF_INODES_COUNT)
+    fb_lo: uint32 = _ext4_resize_sb_u32(sb,
+                                        EXT4_SB_OFF_FREE_BLOCKS_LO)
+    fb_hi: uint32 = _ext4_resize_sb_u32(sb,
+                                        EXT4_SB_OFF_FREE_BLOCKS_HI)
+    cur_free_blocks: uint64 = cast[uint64](fb_lo) \
+                              | (cast[uint64](fb_hi) << 32)
+    cur_free_inodes: uint32 = _ext4_resize_sb_u32(sb,
+                                                  EXT4_SB_OFF_FREE_INODES)
+
+    # Round new_blocks_count down to whole groups. Partial tail
+    # discarded — at most bpg-1 blocks (= 8 MiB for the default
+    # layout). The first group's first_data_block offset is
+    # carried by the geometry, so we round in terms of group count.
+    old_groups: uint64 = (cur_blocks - fdb + bpg - 1) / bpg
+    # Block count covered when blocks 0..fdb-1 are pre-data + then
+    # group 0 covers fdb..fdb+bpg-1 and so on, so:
+    #   blocks_count = fdb + groups * bpg  (full groups)
+    # The current FS already obeys cur_blocks = fdb + old_groups*bpg
+    # for a non-partial last group (true of the rootfs).
+    if new_blocks_count <= fdb:
+        printk0("[ext4_resize] grow target <= first_data_block; nop\n")
+        return EXT4_RESIZE_OK
+    new_groups_raw: uint64 = (new_blocks_count - fdb) / bpg
+    new_blocks: uint64 = fdb + new_groups_raw * bpg
+    if new_blocks <= cur_blocks:
+        printk0("[ext4_resize] post-round target <= current; nop\n")
+        return EXT4_RESIZE_OK
+    new_groups: uint64 = new_groups_raw
+
+    # Sanity-check GDT capacity (mirror ext4_resize_check; cheap).
+    primary_gdt_blocks_new: uint64 = \
+        (new_groups * desc_sz + blk_sz - 1) / blk_sz
+    primary_gdt_blocks_old: uint64 = \
+        (old_groups * desc_sz + blk_sz - 1) / blk_sz
+    if primary_gdt_blocks_new > primary_gdt_blocks_old + rgdt:
+        printk2("[ext4_resize] grow ENOSPC: need %d GDT blocks, have %d\n",
+                primary_gdt_blocks_new,
+                primary_gdt_blocks_old + rgdt)
+        return EXT4_RESIZE_ENOSPC
+
+    inode_table_blocks: uint64 = (ipg * isize + blk_sz - 1) / blk_sz
+    printk2("[ext4_resize_grow] slot=%d new_blocks=%d\n",
+            cast[uint64](slot), new_blocks)
+    printk2("[ext4_resize_grow]   groups %d -> %d\n",
+            old_groups, new_groups)
+    printk1("[ext4_resize_grow]   inode_table_blocks=%d per group\n",
+            inode_table_blocks)
+
+    # Accumulators for SB summary fields.
+    added_blocks: uint64 = 0
+    added_inodes: uint64 = 0
+    added_free_blocks: uint64 = 0
+    added_free_inodes: uint64 = 0
+
+    g: uint64 = old_groups
+    while g < new_groups:
+        gs: uint64 = fdb + g * bpg                  # absolute block of group start
+        group_blocks: uint64 = bpg                  # whole groups only
+
+        is_sparse: int32 = _ext4_resize_is_sparse(g)
+        # Layout: front of the group is the sparse SB+GDT+reserved
+        # GDT area (if applicable), then bitmap, inode bitmap,
+        # inode table, then free data.
+        front_reserve: uint64 = 0
+        if is_sparse != 0:
+            # Backup SB block + N primary-sized GDT blocks +
+            # reserved-GDT-blocks. We don't physically write the
+            # backup SB/GDT (primary-only resize); the bitmap just
+            # records the convention so a future tune2fs / resize2fs
+            # -f can populate them without colliding with our data.
+            front_reserve = 1 + primary_gdt_blocks_new + rgdt
+        bm_offset:   uint64 = front_reserve
+        ibm_offset:  uint64 = front_reserve + 1
+        itab_offset: uint64 = front_reserve + 2
+        used_blocks_in_group: uint64 = front_reserve + 2 \
+                                       + inode_table_blocks
+
+        bm_blk:   uint64 = gs + bm_offset
+        ibm_blk:  uint64 = gs + ibm_offset
+        itab_blk: uint64 = gs + itab_offset
+
+        free_blocks_this_group: uint64 = group_blocks \
+                                         - used_blocks_in_group
+        free_inodes_this_group: uint64 = ipg
+        # All inodes free — no reserved inodes in non-zero groups.
+
+        # 1) Zero the inode table.
+        _ext4_resize_zero_buf(&ext4_resize_blk_buf[0], blk_sz)
+        zb: uint64 = 0
+        while zb < inode_table_blocks:
+            if _ext4_resize_write_block(slot, blk_sz,
+                                        itab_blk + zb,
+                                        &ext4_resize_blk_buf[0]) != 0:
+                printk2("[ext4_resize] itab zero FAIL group=%d blk=%d\n",
+                        g, itab_blk + zb)
+                return EXT4_RESIZE_EIO
+            zb = zb + 1
+
+        # 2) Zero the inode bitmap (all inodes free).
+        _ext4_resize_zero_buf(&ext4_resize_blk_buf[0], blk_sz)
+        # ext4 inode bitmaps mark bits >= inodes_per_group as
+        # "in-use" (the bitmap block addresses block_size*8 bits but
+        # only ipg of them are real). Set tail bits used.
+        bits_total: uint64 = blk_sz * 8
+        if ipg < bits_total:
+            tb: uint64 = ipg
+            while tb < bits_total:
+                byte_i: uint64 = tb / 8
+                bit_i:  uint64 = tb % 8
+                mask: uint8 = cast[uint8](1) << cast[uint8](bit_i)
+                ext4_resize_blk_buf[byte_i] = \
+                    ext4_resize_blk_buf[byte_i] | mask
+                tb = tb + 1
+        if _ext4_resize_write_block(slot, blk_sz, ibm_blk,
+                                    &ext4_resize_blk_buf[0]) != 0:
+            printk1("[ext4_resize] ibm write FAIL group=%d\n", g)
+            return EXT4_RESIZE_EIO
+
+        # 3) Build + write the block bitmap.
+        _ext4_resize_build_block_bitmap(&ext4_resize_blk_buf[0],
+                                        blk_sz,
+                                        used_blocks_in_group,
+                                        group_blocks)
+        if _ext4_resize_write_block(slot, blk_sz, bm_blk,
+                                    &ext4_resize_blk_buf[0]) != 0:
+            printk1("[ext4_resize] bm write FAIL group=%d\n", g)
+            return EXT4_RESIZE_EIO
+
+        # 4) Write GDT entry for this group.
+        if _ext4_resize_write_gdt_entry(slot, blk_sz, fdb, desc_sz,
+                                        g, bm_blk, ibm_blk, itab_blk,
+                                        free_blocks_this_group,
+                                        free_inodes_this_group,
+                                        inode_table_blocks) != 0:
+            return EXT4_RESIZE_EIO
+
+        added_blocks = added_blocks + group_blocks
+        added_inodes = added_inodes + ipg
+        added_free_blocks = added_free_blocks + free_blocks_this_group
+        added_free_inodes = added_free_inodes + free_inodes_this_group
+        if is_sparse != 0:
+            printk2("[ext4_resize_grow]   group %d (sparse) +%d free\n",
+                    g, free_blocks_this_group)
+        else:
+            printk2("[ext4_resize_grow]   group %d        +%d free\n",
+                    g, free_blocks_this_group)
+        g = g + 1
+
+    # 5) Update primary SB and write it back.
+    new_total_blocks: uint64 = cur_blocks + added_blocks
+    new_total_inodes: uint64 = cast[uint64](cur_inodes) + added_inodes
+    new_free_blocks: uint64 = cur_free_blocks + added_free_blocks
+    new_free_inodes: uint64 = cast[uint64](cur_free_inodes) \
+                              + added_free_inodes
+
+    _ext4_write_u32(
+        cast[Ptr[uint8]](cast[uint64](sb)
+                         + EXT4_SB_OFF_BLOCKS_COUNT_LO),
+        cast[uint32](new_total_blocks & 0xFFFFFFFF))
+    if (incompat & EXT4_FEATURE_INCOMPAT_64BIT) != 0:
+        _ext4_write_u32(
+            cast[Ptr[uint8]](cast[uint64](sb)
+                             + EXT4_SB_OFF_BLOCKS_COUNT_HI),
+            cast[uint32]((new_total_blocks >> 32) & 0xFFFFFFFF))
+    _ext4_write_u32(
+        cast[Ptr[uint8]](cast[uint64](sb)
+                         + EXT4_SB_OFF_FREE_BLOCKS_LO),
+        cast[uint32](new_free_blocks & 0xFFFFFFFF))
+    if (incompat & EXT4_FEATURE_INCOMPAT_64BIT) != 0:
+        _ext4_write_u32(
+            cast[Ptr[uint8]](cast[uint64](sb)
+                             + EXT4_SB_OFF_FREE_BLOCKS_HI),
+            cast[uint32]((new_free_blocks >> 32) & 0xFFFFFFFF))
+    _ext4_write_u32(
+        cast[Ptr[uint8]](cast[uint64](sb)
+                         + EXT4_SB_OFF_INODES_COUNT),
+        cast[uint32](new_total_inodes & 0xFFFFFFFF))
+    _ext4_write_u32(
+        cast[Ptr[uint8]](cast[uint64](sb)
+                         + EXT4_SB_OFF_FREE_INODES),
+        cast[uint32](new_free_inodes & 0xFFFFFFFF))
+
+    # Superblock lives at byte offset 1024 (= sectors 2..3). Our
+    # scratch buffer holds the 1 KiB SB at offset 0; write_sectors
+    # takes a 1024-byte chunk = 2 sectors.
+    if blk_write_sectors(slot, 2, 2,
+                         &ext4_resize_sb_buf[0]) != 0:
+        printk0("[ext4_resize] SB write-back FAIL\n")
+        return EXT4_RESIZE_EIO
+
+    if blk_flush(slot) != 0:
+        printk0("[ext4_resize] flush FAIL (best-effort)\n")
+        # Not fatal — the data may sit in a write-cache the device
+        # flushes on its own schedule. The next mount will pick up
+        # whatever made it to disk.
+
+    printk2("[ext4_resize_grow] DONE: blocks %d -> %d\n",
+            cur_blocks, new_total_blocks)
+    printk2("[ext4_resize_grow]       free_blocks %d -> %d\n",
+            cur_free_blocks, new_free_blocks)
+    printk2("[ext4_resize_grow]       inodes %d -> %d\n",
+            cast[uint64](cur_inodes), new_total_inodes)
+    return EXT4_RESIZE_OK
