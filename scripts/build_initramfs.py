@@ -659,6 +659,17 @@ def build_archive() -> bytes:
         "sshd.elf",
         "ed.elf",
         "ifconfig.elf",
+        # Installer binaries — used by /etc/install.hamsh when the
+        # live ISO is running. The installer formats + copies onto
+        # a blank disk BEFORE any rootfs partition is mounted, so
+        # they must live in the cpio (not in rootfs.img). `cat` is
+        # used by the installer to probe /dev/blk/<dev>/size, so
+        # it also needs to be present in the lean cpio.
+        "cat.elf",
+        "dd_blk.elf",
+        "hamnix_partition.elf",
+        "mkfs_ext4.elf",
+        "mkfs_fat.elf",
     }
     user_dir = here / "build" / "user"
     if user_dir.is_dir():

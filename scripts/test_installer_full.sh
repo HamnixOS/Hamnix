@@ -72,7 +72,7 @@ set +e
     printf 'exit\n'
     sleep 1
 ) | timeout "${BOOT_TIMEOUT}s" qemu-system-x86_64 \
-    -cdrom "$HAMNIX_ISO" \
+    -drive "file=$HAMNIX_ISO,if=virtio,format=raw,readonly=on" \
     -drive "file=$TARGET_IMG,if=virtio,format=qcow2" \
     -smp 2 -m 512M -nographic -no-reboot -monitor none -serial stdio \
     > "$STAGE_B_LOG" 2>&1
