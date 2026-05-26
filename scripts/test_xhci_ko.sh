@@ -191,6 +191,58 @@ if grep -E -q "kmod_linux: relocations applied=[0-9]+ skipped=[1-9]" "$LOG"; the
     fail=1
 fi
 
+# Tier-4 (M16-pivot — probe invocation): the L-shim USB-HC milestone
+# is "xhci_pci's probe ran end-to-end without crashing." Previously
+# the PCI walker SKIPPED probe for USB-HC class devices to avoid a
+# NULL-fn-pointer #GP inside the .ko's xhci_pci_probe; with the
+# linux_abi/api_usb_hcd.ad bridge in place the probe now runs through
+# OUR usb_hcd_pci_probe shim which (a) writes pdev->driver_data
+# correctly and (b) bridges to drivers/usb/xhci.ad::xhci_init() for
+# the real MMIO bring-up. Assert the new markers fire.
+if grep -aF -q "[pci_register_driver] calling probe(" "$LOG"; then
+    echo "[test_xhci_ko] OK: xhci_pci probe invoked (skip removed)"
+else
+    echo "[test_xhci_ko] FAIL: xhci_pci probe was NOT invoked"
+    fail=1
+fi
+if grep -aF -q "[usb_hcd_pci_probe] bridging to xhci_init" "$LOG"; then
+    echo "[test_xhci_ko] OK: usb_hcd_pci_probe bridge to xhci_init fired"
+else
+    echo "[test_xhci_ko] FAIL: usb_hcd_pci_probe bridge did not fire — force-shim override may be missing"
+    fail=1
+fi
+if grep -aF -q "[boot:01.a] xhci_init enter" "$LOG"; then
+    echo "[test_xhci_ko] OK: drivers/usb/xhci.ad::xhci_init() entered via shim bridge"
+else
+    echo "[test_xhci_ko] FAIL: xhci_init body did not run (bridge wired but body skipped?)"
+    fail=1
+fi
+# xhci_init completes (root-hub published or bare-metal auto-skip).
+# In QEMU CI is_bare_metal returns 0 so the controller reset poll
+# (xhci_handshake equivalent) runs and completes; on bare metal the
+# auto-skip kicks in unless ENABLE_XHCI_FORCE_INIT=1 was planted.
+if grep -aF -q "[boot:01.g] xhci_init done" "$LOG"; then
+    echo "[test_xhci_ko] OK: xhci_init body completed (HCRST handshake + port scan ran)"
+elif grep -aF -q "[xhci] live init auto-skipped: bare-metal" "$LOG"; then
+    echo "[test_xhci_ko] OK: xhci_init bare-metal auto-skip honoured (no real silicon in QEMU? unexpected)"
+else
+    echo "[test_xhci_ko] FAIL: xhci_init body did not complete"
+    fail=1
+fi
+# Post-probe: the PCI walker emits the USB-HC-class success marker.
+if grep -aF -q "[pci_register_driver] USB-HC probe OK; xhci_init bridge ran" "$LOG"; then
+    echo "[test_xhci_ko] OK: pci_register_driver USB-HC post-probe marker fired"
+else
+    echo "[test_xhci_ko] FAIL: pci_register_driver USB-HC post-probe marker missing"
+    fail=1
+fi
+# No #GP / #UD trap during the probe path.
+if grep -aE -q "TRAP: vector 0x0d|TRAP: vector 0x06" "$LOG"; then
+    echo "[test_xhci_ko] FAIL: TRAP during USB-HC probe — probe path crashed"
+    grep -aE "TRAP:" "$LOG" | head -5
+    fail=1
+fi
+
 # Tier-4 (post-preemption): once xhci_pci.ko + xhci_hcd.ko + usbcore.ko
 # have loaded, the kernel must STILL be able to make forward progress.
 # The c444044 bare-metal skip was justified by an alleged "USBSTS HCH

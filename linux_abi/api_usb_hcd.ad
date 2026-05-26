@@ -1,0 +1,601 @@
+# linux_abi/api_usb_hcd.ad
+#
+# struct usb_hcd / struct hc_driver shim layer — the "next milestone"
+# named in api_pci.ad's USB-HC skip comment. This file owns the
+# byte-compatible layouts of Linux 6.1's struct usb_hcd, struct
+# hc_driver, and struct xhci_hcd (overlaid at usb_hcd's hcd_priv[]
+# tail) — at least to the depth the compiled-in xhci_pci.ko /
+# ehci_pci.ko / usbcore.ko field-derefs traverse.
+#
+# Before this file existed, the L-shim usbcore_pci_probe stub returned
+# 0 without populating pdev->dev.driver_data. xhci_pci_probe (the .ko's
+# real probe entry point) reads `pdev->driver_data` at offset 0x148
+# right after usb_hcd_pci_probe returns, then does:
+#
+#   r15 = hcd                       # via usb_hcd_is_primary_hcd()
+#   *(uint64*)(hcd + 0x2e0) = reset # xhci->reset = ...
+#   shared = usb_create_shared_hcd(...)
+#   *(uint64*)(hcd + 0x268) = shared
+#   xhci_ext_cap_init(hcd + 0x260)
+#   usb_add_hcd(shared, irq, flags)
+#   testb $0x8, 0xc1a(hcd)          # xhci_hcd flag check
+#
+# Every one of those reads / writes needs a writable backing buffer
+# that survives the probe call. The previous milestone had a 4 KiB
+# static `_uc_hcd_buf` but no one populated driver_data with it, so
+# `mov 0x148(%rbx), %rbp` loaded 0 and the very next access at
+# 0x228(%rbp) #PF'd. api_pci.ad consequently shipped a SKIP that
+# returned BEFORE invoking probe; this file unblocks that.
+#
+# Strategy:
+#   - allocate one usb_hcd-shaped 16 KiB blob per probe (kzalloc'd so
+#     all unread fields are 0 — Linux's default for new hcds).
+#   - populate the FEW fields the .ko derefs at probe time:
+#         hcd->self.controller = &pdev->dev   (offset 0x00 of usb_hcd)
+#         pdev->dev.driver_data = hcd         (offset 0x148 of pdev)
+#         hcd->driver = caller's hc_driver*   (used for some accessors)
+#   - return non-NULL from usb_create_hcd / usb_create_shared_hcd so
+#     xhci_pci_probe's null-check arms don't fire.
+#   - return 0 from usb_add_hcd (success — the .ko thinks the hcd is
+#     registered; we don't actually drive the bus).
+#   - BRIDGE the real controller bring-up into drivers/usb/xhci.ad's
+#     hand-rolled xhci_init(): from usb_hcd_pci_probe we call
+#     xhci_init() to run the real HCRST handshake + port scan + HID
+#     attach against the QEMU/xhci silicon. This is the "one of them
+#     wins at a time" architecture: drivers/usb/xhci.ad does the real
+#     MMIO work, the .ko's xhci_pci_probe rides along through the shim
+#     layer so its compiled-in code path is exercised but doesn't
+#     duplicate hardware control.
+#
+# Why bridge through xhci_init() rather than try to invoke xhci_hcd.ko's
+# .reset / .start function pointers:
+#   - xhci_hcd.ko's exports are populated by xhci_init_driver() at
+#     init_module time — that's the .text+.data dance that copies the
+#     xhci_hc_driver template into the per-class hc_driver. Our
+#     _xc_xhci_init_driver shim is a no-op (it would need to know the
+#     full hc_driver layout AND inject working function pointers).
+#   - Even if we did get the function pointers, .reset/.start dereference
+#     hcd->regs / hcd->primary_hcd / hcd->driver — fields we haven't
+#     fully populated. The MMIO bring-up would then read from an
+#     unmapped BAR address (because the shim never called pci_iomap).
+#   - drivers/usb/xhci.ad already does ALL of that correctly (PCI BAR
+#     decode, halt + reset, capability register decode, port scan, HID
+#     attach). It just needs to RUN — gated on /etc/xhci-ko being
+#     present, the orchestrator init/main.ad skips calling it at
+#     boot:01, and the L-shim path is supposed to drive it. This
+#     bridge IS that drive.
+#
+# When this whole shim layer goes away — and a future "real .ko cross-
+# module symbol resolution" milestone hooks xhci_pci.ko -> xhci_hcd.ko's
+# actual EXPORT_SYMBOL functions — this file becomes dead code. Until
+# then it's the load-bearing layer that lets boot:35.X's
+# modules_dep_load_with_deps("xhci_pci") chain actually exercise the
+# .ko's probe path on real hardware.
+#
+# Layout references:
+#   Linux 6.1 / 6.12: include/linux/usb/hcd.h struct usb_hcd, struct
+#     hc_driver. Field offsets confirmed by disassembling
+#     kernel-modules/xhci_pci/xhci_pci.ko's xhci_pci_probe (objdump -dr).
+#   linux-6.12.90/drivers/usb/host/xhci.h — hcd_to_xhci macro:
+#     returns (struct xhci_hcd *)(primary_hcd->hcd_priv).
+#     => xhci_hcd is OVERLAID inside the usb_hcd alloc, starting at
+#        offset sizeof(struct usb_hcd). Computed at ~0x280 from
+#        disassembly (the FIRST xhci_hcd field write `*(hcd+0x2e0)`
+#        targets xhci_hcd->reset at offset 0x60 of xhci_hcd, so
+#        sizeof(usb_hcd) ~= 0x2e0 - 0x60 = 0x280).
+#
+# The "_uh_" prefix marks the Hamnix-side shim for usb_hcd-related
+# helpers ("uh" = usb-hcd, distinct from "uc"/"xc"/"eh" elsewhere).
+
+from linux_abi.exports import _add_export
+from linux_abi.api_pci import _l_pci_get_usb_hc_last_bdf
+from kernel.printk.printk import printk0, printk1, printk2
+from mm.slab import kmalloc, kfree, kzalloc
+from drivers.usb.xhci import xhci_init
+
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
+
+# =====================================================================
+# struct usb_hcd byte-compatible layout (Linux 6.1, x86_64)
+# =====================================================================
+#
+# Sizes:
+#   sizeof(struct usb_hcd)  ~  0x280 (decoded from xhci_pci_probe
+#                                disassembly: the first xhci_hcd field
+#                                write is at +0x2e0 — that's xhci->reset
+#                                which is at +0x60 inside xhci_hcd; so
+#                                xhci_hcd starts at hcd+0x280 == end of
+#                                usb_hcd).
+#   sizeof(struct xhci_hcd) ~  0xA00 (largest accessed offset is
+#                                0xc1c — three bytes into a flags word
+#                                near the end of the struct).
+#   total alloc per hcd     =  16 KiB (4 pages — well over the sum,
+#                                guaranteed contiguous from kzalloc).
+#
+# Field offsets within usb_hcd that the .ko reads/writes at probe:
+#   offset 0x00:  struct usb_bus self
+#       └─ first field of usb_bus is `struct device *controller`.
+#          xhci_pci_setup reads (%rdi) and does `lea -0xd0(%r13), %r14`
+#          to recover pdev from controller, so `hcd->self.controller`
+#          MUST point at the embedded `pdev->dev` (i.e. pdev + 0xd0).
+#
+#   offset 0xc8:  const struct hc_driver *driver
+#       └─ used by hcd_uses_dma() and other accessors. We populate it
+#          with the caller's hc_driver pointer in usb_hcd_pci_probe
+#          (it's the second arg the .ko passes in). 0xc8 is a Linux
+#          6.1 offset; the exact value isn't load-bearing in this V0
+#          (no .ko code reads hcd->driver before the probe returns).
+#
+#   offset 0x228: struct usb_hcd *shared_hcd
+#       └─ written by usb_create_shared_hcd to point at the secondary
+#          (USB2) hcd when the controller is USB3. xhci_pci_probe DOES
+#          read this (via the non-primary fallback arm) but since our
+#          usb_hcd_is_primary_hcd returns 1, the read is bypassed.
+#
+#   offset 0x268: struct usb_hcd *primary_hcd
+#       └─ xhci_pci_probe writes the usb_create_shared_hcd result
+#          here. WAIT — re-reading the disassembly, `0x268(%r15)` was
+#          where the .ko stored the result of usb_create_shared_hcd
+#          for the USB2 companion. So at offset 0x268 in the primary
+#          hcd, the secondary hcd ptr lives. The Linux 6.12 struct
+#          source has `shared_hcd` before `primary_hcd` so the names
+#          are arguably swapped in 6.1 vs 6.12; doesn't matter for
+#          us — what matters is the offset is writable memory.
+
+SHIM_USB_HCD_SIZE:          uint64 = 16384
+
+# Within usb_hcd, the embedded struct usb_bus's `controller` ptr is
+# the first member. We MUST populate this for xhci_pci_setup's recovery
+# of the pci_dev pointer (`mov (%rdi), %r13; lea -0xd0(%r13), %r14`).
+SHIM_USB_HCD_CONTROLLER_OFF: uint64 = 0
+
+# The hc_driver pointer field within usb_hcd. Real Linux 6.1 puts this
+# after the embedded usb_bus + kref + product_desc + speed + irq_descr +
+# rh_timer + status_urb + work_struct(s) — roughly 0xc8. None of the
+# probe-path code reads this BEFORE our shim returns from
+# usb_hcd_pci_probe, so the exact offset isn't observable from the .ko.
+# We populate it anyway so any future drv->driver read finds a sane
+# pointer (the caller's hc_driver template).
+SHIM_USB_HCD_DRIVER_OFF:    uint64 = 0xc8
+
+
+# =====================================================================
+# struct hc_driver byte-compatible layout (Linux 6.1, x86_64)
+# =====================================================================
+#
+# struct hc_driver {
+#     const char *description;          // +0x00
+#     const char *product_desc;         // +0x08
+#     size_t      hcd_priv_size;        // +0x10  — size of xhci_hcd
+#                                                   tail (~0x1000)
+#     irqreturn_t (*irq)(struct usb_hcd *);   // +0x18
+#     int         flags;                // +0x20
+#     int         (*reset)(struct usb_hcd *); // +0x28
+#     int         (*start)(struct usb_hcd *); // +0x30
+#     ...
+# };
+#
+# xhci_pci.ko's xhci_pci_hc_driver is a static .data.read_mostly
+# instance. xhci_init_driver() COPIES xhci_hc_driver (defined in
+# xhci_hcd.ko) into it and patches a few function pointers from the
+# xhci_pci_overrides table. Our _xc_xhci_init_driver no-ops that copy,
+# so the .data.read_mostly hc_driver instance the loader points at
+# stays mostly zero — `flags` defaults to 0 (no HCD_USB3, no HCD_MEMORY,
+# no HCD_DMA). usb_hcd_pci_probe in real Linux branches off `flags &
+# HCD_MASK >= HCD_USB3` to skip pci_alloc_irq_vectors; with flags == 0
+# we'd take the "alloc IRQ" arm. Our shim usb_hcd_pci_probe doesn't run
+# that branch at all (just returns 0), so this doesn't matter in V0.
+#
+# We don't need to allocate a struct hc_driver ourselves — the .ko
+# carries its own template in .data and our shim function pointers
+# (xhci_init_driver, ehci_init_driver) don't have to populate it.
+# This file documents the layout for completeness so a future agent
+# wiring real .reset / .start dispatch knows where to look.
+
+SHIM_HC_DRIVER_FLAGS_OFF:   uint64 = 0x20
+SHIM_HC_DRIVER_RESET_OFF:   uint64 = 0x28
+SHIM_HC_DRIVER_START_OFF:   uint64 = 0x30
+
+
+# =====================================================================
+# pci_dev driver_data offset (Linux 6.1)
+# =====================================================================
+#
+# struct pci_dev embeds struct device at offset 0xd0. struct device's
+# driver_data field is at offset 0x78 within the embedded device. So
+# pdev->dev.driver_data lives at pdev + 0xd0 + 0x78 = pdev + 0x148.
+#
+# xhci_pci_probe reads this directly: `mov 0x148(%rbx), %rbp`. Our
+# usb_hcd_pci_probe shim MUST write the hcd pointer here, mirroring
+# Linux's dev_set_drvdata(&pdev->dev, hcd) at line 257 of
+# drivers/usb/core/hcd-pci.c.
+SHIM_PCI_DEV_DEV_OFF:       uint64 = 0xd0
+SHIM_DEV_DRIVER_DATA_OFF:   uint64 = 0x78
+SHIM_PCI_DEV_DRVDATA_OFF:   uint64 = 0x148   # 0xd0 + 0x78
+
+
+# =====================================================================
+# Per-probe state — at most one xhci + one ehci controller at V0.
+# =====================================================================
+#
+# Two slots so the QEMU "qemu-xhci + usb-ehci" combo (which scripts/
+# test_ehci_ko.sh exercises) gets independent hcd buffers per probe.
+# A third "shared hcd" slot covers usb_create_shared_hcd's USB2
+# companion that xhci_pci_probe creates inside the USB3 primary.
+# Indices are not load-bearing — the shim just hands out slots in
+# first-free order.
+
+MAX_HCD_SHIMS:              uint64 = 4
+
+_uh_hcd_slots:              Array[4, uint64]    # heap pointers per slot
+_uh_hcd_pdev_slots:         Array[4, uint64]    # the pdev that owns it
+_uh_bridge_already_ran:     int32 = 0
+_uh_probe_call_depth:       int32 = 0
+
+
+def _uh_alloc_hcd_blob(pdev: uint64) -> uint64:
+    # Allocate a fresh 16 KiB usb_hcd buffer and record it in the slot
+    # table so usb_put_hcd / usb_remove_hcd can free it on the way
+    # back out (probe-error rewind). Returns the buffer ptr, or 0 on
+    # alloc failure / table-full.
+    blob: uint64 = kzalloc(SHIM_USB_HCD_SIZE)
+    if blob == 0:
+        return 0
+    # Record the (slot, pdev) pair.
+    i: uint64 = 0
+    while i < MAX_HCD_SHIMS:
+        if _uh_hcd_slots[i] == 0:
+            _uh_hcd_slots[i] = blob
+            _uh_hcd_pdev_slots[i] = pdev
+            return blob
+        i = i + 1
+    # Table full — leak the alloc rather than fail (probe path needs
+    # non-NULL). 4 slots covers any 2026-era board's USB topology.
+    return blob
+
+
+def _uh_free_hcd_blob(hcd: uint64):
+    if hcd == 0:
+        return
+    i: uint64 = 0
+    while i < MAX_HCD_SHIMS:
+        if _uh_hcd_slots[i] == hcd:
+            _uh_hcd_slots[i] = 0
+            _uh_hcd_pdev_slots[i] = 0
+            kfree(hcd)
+            return
+        i = i + 1
+    # Not in table — caller passed a foreign pointer. Free anyway so
+    # any leaked-by-overflow alloc still cleans up; alternative is to
+    # silently drop, which leaks. We choose the safer free here.
+    kfree(hcd)
+
+
+# =====================================================================
+# struct usb_hcd allocators
+# =====================================================================
+#
+# Linux:
+#   struct usb_hcd *usb_create_hcd(const struct hc_driver *driver,
+#                                  struct device *dev,
+#                                  const char *bus_name);
+#   struct usb_hcd *usb_create_shared_hcd(const struct hc_driver *driver,
+#                                          struct device *dev,
+#                                          const char *bus_name,
+#                                          struct usb_hcd *primary_hcd);
+#
+# Both allocate a usb_hcd + hcd_priv tail sized by driver->hcd_priv_size.
+# We use a fixed 16 KiB alloc that covers any current HCD's priv tail
+# (xhci_hcd is the biggest at ~0xa00 bytes).
+
+def _uh_usb_create_hcd(driver: uint64, dev_ptr: uint64,
+                       bus_name: Ptr[char]) -> uint64:
+    # The shim allocates a fresh usb_hcd buffer per call. dev_ptr is
+    # the &pdev->dev passed in by usb_hcd_pci_probe; we don't have a
+    # robust way to look up the parent pci_dev from a struct device
+    # pointer without walking the slot table, so we cache it in slot[0]
+    # under the assumption that usb_hcd_pci_probe stores it there
+    # right before / right after this call. The pdev recovery in
+    # usb_hcd_pci_probe is what actually matters — by the time
+    # xhci_pci_setup needs to walk back from controller to pdev, the
+    # controller pointer we write here at offset 0 of the hcd handles
+    # the round trip via (%rdi); lea -0xd0(%r13).
+    blob: uint64 = _uh_alloc_hcd_blob(0)
+    if blob == 0:
+        printk0("[usb_create_hcd] kzalloc failed\n")
+        return 0
+    # Populate self.controller = dev_ptr at offset 0 of usb_hcd.
+    ctrl_p: Ptr[uint64] = cast[Ptr[uint64]](blob + SHIM_USB_HCD_CONTROLLER_OFF)
+    ctrl_p[0] = dev_ptr
+    # Populate driver pointer.
+    drv_p: Ptr[uint64] = cast[Ptr[uint64]](blob + SHIM_USB_HCD_DRIVER_OFF)
+    drv_p[0] = driver
+    printk2("[usb_create_hcd] hcd=%p controller=%p\n", blob, dev_ptr)
+    return blob
+
+
+def _uh_usb_create_shared_hcd(driver: uint64, dev_ptr: uint64,
+                              bus_name: Ptr[char],
+                              primary_hcd: uint64) -> uint64:
+    # Same as usb_create_hcd but caller already has a primary hcd.
+    # xhci_pci_probe creates the USB2 companion this way; the result
+    # is written back into the primary hcd at offset 0x268 (Linux
+    # 6.1's hcd->primary_hcd / hcd->shared_hcd slot). We just need to
+    # return a NON-NULL fresh buffer.
+    blob: uint64 = _uh_alloc_hcd_blob(0)
+    if blob == 0:
+        printk0("[usb_create_shared_hcd] kzalloc failed\n")
+        return 0
+    ctrl_p: Ptr[uint64] = cast[Ptr[uint64]](blob + SHIM_USB_HCD_CONTROLLER_OFF)
+    ctrl_p[0] = dev_ptr
+    drv_p: Ptr[uint64] = cast[Ptr[uint64]](blob + SHIM_USB_HCD_DRIVER_OFF)
+    drv_p[0] = driver
+    printk2("[usb_create_shared_hcd] hcd=%p primary=%p\n", blob, primary_hcd)
+    return blob
+
+
+def _uh_usb_put_hcd(hcd: uint64):
+    # Refcount-aware free in real Linux. Our shim has no refcount;
+    # we just free the alloc.
+    _uh_free_hcd_blob(hcd)
+
+
+# =====================================================================
+# usb_add_hcd / usb_remove_hcd
+# =====================================================================
+#
+# Linux:
+#   int  usb_add_hcd(struct usb_hcd *hcd, unsigned int irqnum,
+#                     unsigned long irqflags);
+#   void usb_remove_hcd(struct usb_hcd *hcd);
+#
+# usb_add_hcd is the real workhorse on a Linux system — it sets up
+# request_irq, calls hcd->driver->reset, hcd->driver->start, registers
+# the root hub via usb_alloc_dev + usb_new_device, and gets the bus
+# polling. In our shim we DO NOT run any of that — drivers/usb/xhci.ad
+# handles the controller bring-up and root-hub publish on its own
+# (called from usb_hcd_pci_probe via the bridge below). Returning 0
+# tells xhci_pci_probe the registration succeeded so it doesn't unwind.
+
+def _uh_usb_add_hcd(hcd: uint64, irqnum: uint32, irqflags: uint64) -> int32:
+    printk2("[usb_add_hcd] hcd=%p irq=%d (shim returns 0; xhci_init bridge owns HW)\n",
+            hcd, cast[uint64](irqnum))
+    return 0
+
+
+def _uh_usb_remove_hcd(hcd: uint64):
+    printk1("[usb_remove_hcd] hcd=%p (shim no-op)\n", hcd)
+    return
+
+
+# =====================================================================
+# usb_hcd_pci_probe / usb_hcd_pci_remove
+# =====================================================================
+#
+# This is the load-bearing function for the .ko's xhci_pci_probe /
+# ehci_pci_probe — it allocates the hcd, stores it in pdev->driver_data
+# at the offset xhci_pci_probe reads back, and BRIDGES to the
+# hand-rolled drivers/usb/xhci.ad::xhci_init() so real MMIO bring-up
+# happens (HCRST handshake, USBSTS HCH poll, port scan, HID attach).
+#
+# Without the bridge, this shim would return 0 but no USB controller
+# state machine would actually run — the .ko would think it owned a
+# host controller that nothing was driving. The "xhci_handshake runs
+# and EVENTUALLY completes on bare metal" requirement from the
+# agent brief lands here: when QEMU CI invokes this, xhci_init() runs,
+# inside which _xhci_reset polls USBCMD.HCRST clearing and then
+# _xhci_wait_cnr_clear polls USBSTS.CNR clearing — both bounded loops
+# that eventually return 0 because the (kernel_cond_resched-cooperative)
+# busy-poll lets the timer tick. The hand-rolled driver's existing
+# bare-metal auto-skip (drivers/usb/xhci.ad:580) still applies if the
+# CPUID hypervisor leaf is empty — bare-metal NUC users planting
+# ENABLE_XHCI_FORCE_INIT=1 opt back into the live path there.
+
+def _uh_usb_hcd_pci_probe(pdev: uint64, driver: uint64) -> int32:
+    # Step 1: alloc the hcd buffer, attach controller pointer.
+    dev_ptr: uint64 = pdev + SHIM_PCI_DEV_DEV_OFF
+    hcd: uint64 = _uh_usb_create_hcd(driver, dev_ptr, cast[Ptr[char]](0))
+    if hcd == 0:
+        printk0("[usb_hcd_pci_probe] hcd alloc failed; returning -ENOMEM\n")
+        return -12        # -ENOMEM
+
+    # Step 2: dev_set_drvdata(&pdev->dev, hcd). xhci_pci_probe reads
+    # this right after our return to recover the hcd pointer.
+    drvdata_p: Ptr[uint64] = cast[Ptr[uint64]](pdev + SHIM_PCI_DEV_DRVDATA_OFF)
+    drvdata_p[0] = hcd
+    printk2("[usb_hcd_pci_probe] pdev=%p hcd=%p (driver_data written)\n",
+            pdev, hcd)
+
+    # Step 3: bridge into drivers/usb/xhci.ad::xhci_init(). The
+    # hand-rolled driver re-scans the PCI bus (its _xhci_pci_find_class
+    # walks bus 0 for class 0x0C subclass 0x03 progif 0x30), so it
+    # doesn't need our cached BDF — but we log it for diagnostics so
+    # a regression where the .ko probe sees a different controller
+    # than the hand-rolled driver is detectable.
+    #
+    # Bridge runs ONCE per boot — even if the .ko walk dispatches
+    # probe a second time (e.g. ehci_pci_probe for a USB2 companion
+    # controller), the controller MMIO is owned by xhci_init's first
+    # invocation. EHCI co-bringup is handled inside the hand-rolled
+    # driver's ehci_init / xhci_init chain.
+    if _uh_bridge_already_ran == 0:
+        bdf: uint32 = _l_pci_get_usb_hc_last_bdf()
+        printk1("[usb_hcd_pci_probe] bridging to xhci_init (cached usb-hc bdf=%x)\n",
+                cast[uint64](bdf))
+        # Detect re-entry — xhci_init's own PCI walk allocates pages
+        # and locks the slab, and our shim runs during the .ko
+        # probe path which is itself already on the slab path.
+        # _uh_probe_call_depth is a single-CPU re-entry guard.
+        if _uh_probe_call_depth == 0:
+            _uh_probe_call_depth = 1
+            _uh_bridge_already_ran = 1
+            rc: int32 = xhci_init()
+            printk1("[usb_hcd_pci_probe] xhci_init returned rc=%d\n",
+                    cast[uint64](rc))
+            _uh_probe_call_depth = 0
+        else:
+            printk0("[usb_hcd_pci_probe] re-entry detected; bridge skipped\n")
+    else:
+        printk0("[usb_hcd_pci_probe] bridge already ran this boot; .ko-side init continues\n")
+
+    return 0
+
+
+def _uh_usb_hcd_pci_remove(pdev: uint64):
+    # Free the hcd we recorded against this pdev.
+    drvdata_p: Ptr[uint64] = cast[Ptr[uint64]](pdev + SHIM_PCI_DEV_DRVDATA_OFF)
+    hcd: uint64 = drvdata_p[0]
+    if hcd != 0:
+        _uh_free_hcd_blob(hcd)
+        drvdata_p[0] = 0
+    printk1("[usb_hcd_pci_remove] pdev=%p\n", pdev)
+
+
+def _uh_usb_hcd_pci_shutdown(pdev: uint64):
+    # Same body as remove for V0 — no PM transitions to worry about.
+    return
+
+
+def _uh_usb_hcd_irq(irqnum: int32, hcd: uint64) -> int32:
+    # The shared HCD IRQ handler. usbcore-defined, xhci_hcd / ehci_hcd
+    # reference it for their request_irq() call. With xhci_init() owning
+    # the live IRQ path (its MSI-X setup in _xhci_v1_bringup),
+    # any spurious entry here returns IRQ_NONE (0) so it doesn't claim
+    # an interrupt that wasn't ours.
+    return 0
+
+
+# =====================================================================
+# pci_match_id — quirks-table lookup
+# =====================================================================
+#
+# Linux:
+#   const struct pci_device_id *pci_match_id(const struct pci_device_id *ids,
+#                                              struct pci_dev *dev);
+#
+# Walks the ids table and returns the matching entry or NULL. Called
+# from xhci_pci_quirks() with the xhci-specific quirks id_table; a
+# non-matching return MUST be NULL (the caller dereferences the
+# matched entry's driver_data at offset 0x18). The previous
+# api_ahci.ad shortcut returned `ids` unconditionally — fine for
+# ahci's quirks table (whose first entry is a generic fallback) but
+# unsafe for xhci's table where the "no quirks for this controller"
+# answer is genuinely NULL.
+#
+# This shim does the real walk (matches vendor/device against the
+# pdev's vendor/device fields at offset 0x3c/0x3e of our shim pdev),
+# returning the matching entry pointer or NULL.
+
+_uh_PCI_DEV_VENDOR_OFF:     uint64 = 60     # uint16 vendor (matches SHIM_PCI_DEV_VENDOR_OFF in api_pci.ad)
+_uh_PCI_DEV_DEVICE_OFF:     uint64 = 62     # uint16 device
+
+_uh_PCI_DEVICE_ID_SIZE:     uint64 = 40
+_uh_PCI_DEVICE_ID_VENDOR_OFF: uint64 = 0
+_uh_PCI_DEVICE_ID_DEVICE_OFF: uint64 = 4
+_uh_PCI_ANY_ID:             uint32 = 0xFFFFFFFF
+
+
+def _uh_pci_match_id(ids: uint64, pdev: uint64) -> uint64:
+    # NULL ids or NULL pdev: return NULL.
+    if ids == 0 or pdev == 0:
+        return 0
+    v_p: Ptr[uint16] = cast[Ptr[uint16]](pdev + _uh_PCI_DEV_VENDOR_OFF)
+    d_p: Ptr[uint16] = cast[Ptr[uint16]](pdev + _uh_PCI_DEV_DEVICE_OFF)
+    pdev_vendor: uint32 = cast[uint32](v_p[0])
+    pdev_device: uint32 = cast[uint32](d_p[0])
+
+    cursor: uint64 = ids
+    # Bounded walk to avoid runaway on a malformed table.
+    steps: uint64 = 0
+    while steps < 256:
+        ev_p: Ptr[uint32] = cast[Ptr[uint32]](cursor + _uh_PCI_DEVICE_ID_VENDOR_OFF)
+        ed_p: Ptr[uint32] = cast[Ptr[uint32]](cursor + _uh_PCI_DEVICE_ID_DEVICE_OFF)
+        ev: uint32 = ev_p[0]
+        ed: uint32 = ed_p[0]
+        # Terminator: vendor==0 (Linux's kbuild convention).
+        if ev == 0:
+            return 0
+        v_match: int32 = 0
+        if ev == _uh_PCI_ANY_ID or ev == pdev_vendor:
+            v_match = 1
+        d_match: int32 = 0
+        if ed == _uh_PCI_ANY_ID or ed == pdev_device:
+            d_match = 1
+        if v_match == 1 and d_match == 1:
+            return cursor
+        cursor = cursor + _uh_PCI_DEVICE_ID_SIZE
+        steps = steps + 1
+    return 0
+
+
+# =====================================================================
+# usb_hcd_is_primary_hcd
+# =====================================================================
+#
+# Linux:
+#   int usb_hcd_is_primary_hcd(struct usb_hcd *hcd);
+#
+# Returns 1 if the hcd is the primary (USB3 side of an xhci, or the
+# sole hcd of an ehci/ohci/uhci). xhci_pci_probe branches on this:
+# returning 1 means r15 stays = hcd, returning 0 means
+# r15 = hcd->shared_hcd. We always return 1 — every hcd we hand out
+# IS the primary for its slot in the table.
+#
+# This was previously in api_l63.ad; we re-export it here so the new
+# struct usb_hcd layout machinery is self-contained. The l63 version
+# is kept as a backwards compatibility alias.
+
+def _uh_usb_hcd_is_primary_hcd(hcd: uint64) -> int32:
+    return 1
+
+
+# =====================================================================
+# Registration
+# =====================================================================
+#
+# These names were previously stubbed in api_usbcore.ad (returning 0 /
+# the static _uc_hcd_buf pointer). The L-shim export table is a single
+# name -> address map; later registrations OVERWRITE earlier ones, so
+# linux_abi_register_usb_hcd() runs AFTER linux_abi_register_usbcore()
+# and replaces the cold stubs with the real-bridged shim functions.
+
+def linux_abi_register_usb_hcd():
+    # ---- struct usb_hcd allocators ----
+    _add_export("usb_create_hcd",
+                cast[uint64](&_uh_usb_create_hcd))
+    _add_export("usb_create_shared_hcd",
+                cast[uint64](&_uh_usb_create_shared_hcd))
+    _add_export("usb_put_hcd",
+                cast[uint64](&_uh_usb_put_hcd))
+
+    # ---- usb_add_hcd / usb_remove_hcd ----
+    _add_export("usb_add_hcd",
+                cast[uint64](&_uh_usb_add_hcd))
+    _add_export("usb_remove_hcd",
+                cast[uint64](&_uh_usb_remove_hcd))
+
+    # ---- usb_hcd_pci_* — the load-bearing PCI bridge ----
+    _add_export("usb_hcd_pci_probe",
+                cast[uint64](&_uh_usb_hcd_pci_probe))
+    _add_export("usb_hcd_pci_remove",
+                cast[uint64](&_uh_usb_hcd_pci_remove))
+    _add_export("usb_hcd_pci_shutdown",
+                cast[uint64](&_uh_usb_hcd_pci_shutdown))
+    _add_export("usb_hcd_irq",
+                cast[uint64](&_uh_usb_hcd_irq))
+
+    # ---- usb_hcd_is_primary_hcd (replaces api_l63's cold stub) ----
+    _add_export("usb_hcd_is_primary_hcd",
+                cast[uint64](&_uh_usb_hcd_is_primary_hcd))
+
+    # ---- pci_match_id (replaces api_ahci's "return first entry"
+    #      shortcut with a real walk-and-match implementation). The
+    #      ahci shortcut was load-bearing for ahci itself (its table's
+    #      first entry IS the generic fallback) and harmless for
+    #      callers that don't deref the result; xhci_pci_quirks DOES
+    #      deref so we need a NULL-when-no-match impl here. The
+    #      linux_abi_lookup last-match-wins change in exports.ad
+    #      makes this registration take precedence over ahci's. ----
+    _add_export("pci_match_id",
+                cast[uint64](&_uh_pci_match_id))
