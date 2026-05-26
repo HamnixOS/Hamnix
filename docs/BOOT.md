@@ -314,8 +314,9 @@ Tested-on / known-working list (extend as we verify on more machines):
 | --------------------- | ---- | ------ | -------------------- |
 | QEMU (SeaBIOS, 10.0)  | BIOS | works  | scripts/test_bios_boot.sh PASS |
 | QEMU (OVMF, edk2)     | UEFI | works  | scripts/test_uefi_boot.sh PASS — direct PE/COFF stub, SFSP-loads `\hamnix-kernel.elf` from the ESP, reaches `start_kernel()` and beyond (M16.125 PATH A) |
-| Asus i5-4210U (Haswell ULT) | BIOS | boots to `hamsh` | First confirmed real-hardware boot (M16.156). Built-in keyboard does NOT work — see [`REAL_HARDWARE.md`](REAL_HARDWARE.md) §7. |
-| Asus i5-4210U         | UEFI | not re-confirmed | UEFI boot on this laptop has not been re-verified since the M16.151–156 wave |
+| Intel Skull Canyon NUC | BIOS/UEFI | boots to `hamsh`, USB keyboard works | Primary real-hardware bring-up target as of 2026-05-25 (M16.139 + L-shim USB-HC bridge `f426aee`). |
+| Asus i5-4210U (Haswell ULT) | BIOS | **currently crashes during boot** | Was confirmed earlier (M16.156); regressed in a subsequent wave. Preserved for regression observation, not a current bring-up target. See [`REAL_HARDWARE.md`](REAL_HARDWARE.md). |
+| Asus i5-4210U         | UEFI | not currently re-confirmed | The Asus crashes earlier in boot than the UEFI/BIOS divergence point. |
 
 When testing on real hardware:
 
@@ -338,15 +339,16 @@ When testing on real hardware:
   shape GDT, and `jmp _x86_start_after_loader`. Verified end-to-end
   by `scripts/test_iso_qemu.sh`: BIOS and UEFI both reach
   `cpio: registered N files from initramfs`.
-- **EFI memory-map memblock window is still a fallback.** The stub
-  saves the UEFI memory map in `efi_mmap_buf` (16 KiB) with descsize
-  at `efi_mmap_descsize`, but `e820_init()` doesn't yet walk it for
-  the memblock allocator window — it installs the hardcoded
-  2..240 MiB window. A descsize-stride walker classifying
-  `EfiConventionalMemory` (Type=7) entries is a one-screen follow-up.
-  (Note: the >4 GiB *identity-map* gap is closed — `arch/x86/mm/pgtable.ad`
-  re-walks the memory map and extends the identity map per 1 GiB
-  RAM page. This remaining item is only the memblock window.)
+- **EFI memory-map memblock window walker landed.** The stub saves
+  the UEFI memory map in `efi_mmap_buf` (16 KiB) with descsize at
+  `efi_mmap_descsize`, and `e820_init()` now walks it as the primary
+  path on UEFI boots, picking the largest `EfiConventionalMemory`
+  (Type=7) region above the kernel image end and feeding it to
+  memblock (see `arch/x86/kernel/e820.ad::_efi_mmap_walk`). The
+  hardcoded 2..240 MiB window remains as a last-resort fallback for
+  older stubs / pathological firmware. The >4 GiB identity-map gap
+  is also closed — `arch/x86/mm/pgtable.ad` re-walks the memory map
+  and extends the identity map per 1 GiB RAM page.
 - **Real EFI Runtime Services aren't exposed yet.** The stub
   stashes the SystemTable pointer in `efi_system_table` but kernel
   code doesn't yet call back into RuntimeServices (e.g.
