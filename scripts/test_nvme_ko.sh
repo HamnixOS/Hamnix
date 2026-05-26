@@ -119,12 +119,43 @@ echo "[test_nvme_ko] --- captured (kmod / nvme / pci_register_driver) ---"
 grep -aE 'kmod_linux|\[nvme\.ko\]|\[pci_register_driver\]|nvme0n1' "$LOG" | head -40 || true
 echo "[test_nvme_ko] --- end ---"
 
-if grep -aE -q "PANIC|panic:" "$LOG"; then
-    echo "[test_nvme_ko] FAIL: kernel panic"
-    echo "[test_nvme_ko] --- full log tail ---"
-    tail -n 60 "$LOG"
-    exit 1
+# Stash the full raw log for post-mortem.
+cp "$LOG" /tmp/test_nvme_ko.last.log || true
+
+fail=0
+
+# 1. No traps / panics / page faults — post-preemption (b08853e) the
+#    .ko load path is supposed to be IF-clear-safe end-to-end.
+n_traps=$(grep -acE "TRAP: vector|#UD|#GP fault|Page Fault|kernel panic|PANIC|panic:" "$LOG" || true)
+if [ "${n_traps:-0}" -ne 0 ]; then
+    echo "[test_nvme_ko] FAIL: ${n_traps} trap/panic line(s) in boot log"
+    grep -aE "TRAP: vector|#UD|#GP fault|Page Fault|kernel panic|PANIC|panic:" "$LOG" | head -10
+    fail=1
+else
+    echo "[test_nvme_ko] OK: no traps/panics in boot log"
 fi
+
+# 2. Post-load forward-progress check (wedge guard). After the .ko
+#    finishes loading, hamsh must still be alive and able to fork its
+#    next child (dmesg). Wedge during the .ko load would block hamsh
+#    from ever reaching the next exec, so this asserts end-to-end
+#    scheduler liveness across the load path. See test_ahci_ko.sh.
+INSMOD_LINE=$(grep -anE "kmod_linux: name=nvme$" "$LOG" | head -1 | cut -d: -f1)
+INSMOD_LINE=${INSMOD_LINE:-0}
+POST_LOAD_FORK=0
+if [ "$INSMOD_LINE" -gt 0 ]; then
+    POST_LOAD_FORK=$(tail -n +"$INSMOD_LINE" "$LOG" | grep -acE "\[runtime:dmesg\] _start|task: pid [0-9]+ exited" || true)
+    POST_LOAD_FORK=${POST_LOAD_FORK:-0}
+fi
+if [ "$POST_LOAD_FORK" -ge 1 ]; then
+    echo "[test_nvme_ko] OK: hamsh forked+exited dmesg AFTER .ko load (no scheduler wedge)"
+else
+    echo "[test_nvme_ko] FAIL: no post-load fork progress — scheduler may be wedged"
+    fail=1
+fi
+TICKS_TOTAL=$(grep -acE "\[hamsh-alive\] tick=" "$LOG" || true)
+TICKS_TOTAL=${TICKS_TOTAL:-0}
+echo "[test_nvme_ko] heartbeat ticks observed: $TICKS_TOTAL (informational)"
 
 INIT_OK=$(grep -acE "kmod_linux: init returned 0" "$LOG" || true)
 INIT_OK=${INIT_OK:-0}
@@ -139,23 +170,41 @@ RELOC_OK=${RELOC_OK:-0}
 NVME0N1=$(grep -acE "nvme0n1" "$LOG" || true)
 NVME0N1=${NVME0N1:-0}
 
+# 3. Every relocation pass that fired must report skipped=0.
+n_bad_skipped=$( { grep -aE "kmod_linux: relocations applied=" "$LOG" || true; } \
+                | { grep -vE 'skipped=0' || true; } | wc -l)
+if [ "$n_bad_skipped" -ne 0 ]; then
+    echo "[test_nvme_ko] FAIL: $n_bad_skipped relocation pass(es) had skipped>0"
+    grep -aE "kmod_linux: relocations applied=" "$LOG" | grep -vE 'skipped=0' | head
+    fail=1
+else
+    echo "[test_nvme_ko] OK: every relocation pass resolved (skipped=0)"
+fi
+
 echo "[test_nvme_ko] init_ok=$INIT_OK lib_only=$LIB_ONLY insmod_fail=$INSMOD_FAIL probe_hit=$PROBE_HIT reloc_clean=$RELOC_OK nvme0n1_seen=$NVME0N1"
 
 if [ "$INSMOD_FAIL" -ge 1 ]; then
     echo "[test_nvme_ko] FAIL: insmod reported init_module failure"
-    exit 1
+    fail=1
 fi
 
 if [ "$RELOC_OK" -ge 1 ] && \
    { [ "$INIT_OK" -ge 1 ] || [ "$LIB_ONLY" -ge 1 ] || [ "$PROBE_HIT" -ge 1 ]; }; then
-    echo "[test_nvme_ko] PASS: nvme.ko loaded; relocations clean; probe path exercised"
-    if [ "$NVME0N1" -ge 1 ]; then
-        echo "[test_nvme_ko] BONUS: nvme0n1 mention observed in log"
-    fi
-    exit 0
+    :
+else
+    echo "[test_nvme_ko] FAIL: no PASS markers (qemu rc=$rc)"
+    fail=1
 fi
 
-echo "[test_nvme_ko] FAIL: no PASS markers (qemu rc=$rc)"
-echo "[test_nvme_ko] --- full log tail ---"
-tail -n 100 "$LOG"
-exit 1
+if [ "$fail" -ne 0 ]; then
+    echo "[test_nvme_ko] FAIL — see /tmp/test_nvme_ko.last.log for full output"
+    echo "[test_nvme_ko] --- full log tail ---"
+    tail -n 100 "$LOG"
+    exit 1
+fi
+
+echo "[test_nvme_ko] PASS: nvme.ko loaded; relocations clean; probe path exercised; no traps; post-load fork OK"
+if [ "$NVME0N1" -ge 1 ]; then
+    echo "[test_nvme_ko] BONUS: nvme0n1 mention observed in log"
+fi
+exit 0

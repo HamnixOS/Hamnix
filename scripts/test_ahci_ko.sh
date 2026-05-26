@@ -126,12 +126,53 @@ echo "[test_ahci_ko] --- captured (kmod / ahci / pci_register_driver) ---"
 grep -aE 'kmod_linux|\[ahci\.ko\]|\[pci_register_driver\]|ahci_|libata' "$LOG" | head -40 || true
 echo "[test_ahci_ko] --- end ---"
 
-if grep -aE -q "PANIC|panic:" "$LOG"; then
-    echo "[test_ahci_ko] FAIL: kernel panic"
-    echo "[test_ahci_ko] --- full log tail ---"
-    tail -n 60 "$LOG"
-    exit 1
+# Stash the full raw log for post-mortem so cherry-picks have something
+# to read if a regression surfaces after merge.
+cp "$LOG" /tmp/test_ahci_ko.last.log || true
+
+# Hard fails — any of these are unambiguous regressions.
+fail=0
+
+# 1. No traps / panics / page faults. Post-preemption (b08853e), the
+#    .ko load path is supposed to be IF-clear-safe end-to-end; a #UD or
+#    #GP here means a busy-poll site or shim entry inverted EFLAGS the
+#    wrong way (see the tcp.ad / sound-stack precedent).
+n_traps=$(grep -acE "TRAP: vector|#UD|#GP fault|Page Fault|kernel panic|PANIC|panic:" "$LOG" || true)
+if [ "${n_traps:-0}" -ne 0 ]; then
+    echo "[test_ahci_ko] FAIL: ${n_traps} trap/panic line(s) in boot log"
+    grep -aE "TRAP: vector|#UD|#GP fault|Page Fault|kernel panic|PANIC|panic:" "$LOG" | head -10
+    fail=1
+else
+    echo "[test_ahci_ko] OK: no traps/panics in boot log"
 fi
+
+# 2. Post-load forward-progress check (wedge guard). After the .ko
+#    finishes loading, hamsh must still be alive and able to fork its
+#    next child (dmesg). If the .ko load wedged the scheduler — e.g. a
+#    polled probe holding the CPU with IF=0 — hamsh would never reach
+#    the dmesg fork+exec path. The `[runtime:dmesg] _start` marker
+#    fires from u_syscalls's elf-loader entry, post-fork, AFTER the
+#    insmod child already returned to hamsh. Its presence proves
+#    end-to-end scheduler liveness across the .ko load.
+INSMOD_LINE=$(grep -anE "kmod_linux: name=ahci$" "$LOG" | head -1 | cut -d: -f1)
+INSMOD_LINE=${INSMOD_LINE:-0}
+POST_LOAD_FORK=0
+if [ "$INSMOD_LINE" -gt 0 ]; then
+    POST_LOAD_FORK=$(tail -n +"$INSMOD_LINE" "$LOG" | grep -acE "\[runtime:dmesg\] _start|task: pid [0-9]+ exited" || true)
+    POST_LOAD_FORK=${POST_LOAD_FORK:-0}
+fi
+if [ "$POST_LOAD_FORK" -ge 1 ]; then
+    echo "[test_ahci_ko] OK: hamsh forked+exited dmesg AFTER .ko load (no scheduler wedge)"
+else
+    echo "[test_ahci_ko] FAIL: no post-load fork progress — scheduler may be wedged"
+    fail=1
+fi
+# Also surface heartbeat ticks if any (informational; the .ko test's
+# stdin-pipe shape rarely yields the 3s of idle hamsh needs for one
+# heartbeat to fire, so we don't gate PASS on it).
+TICKS_TOTAL=$(grep -acE "\[hamsh-alive\] tick=" "$LOG" || true)
+TICKS_TOTAL=${TICKS_TOTAL:-0}
+echo "[test_ahci_ko] heartbeat ticks observed: $TICKS_TOTAL (informational)"
 
 INIT_OK=$(grep -acE "kmod_linux: init returned 0" "$LOG" || true)
 INIT_OK=${INIT_OK:-0}
@@ -144,11 +185,24 @@ PROBE_HIT=${PROBE_HIT:-0}
 RELOC_OK=$(grep -acE "kmod_linux: relocations applied=[0-9]+ skipped=0" "$LOG" || true)
 RELOC_OK=${RELOC_OK:-0}
 
+# 3. Every relocation pass that fired must report skipped=0 — no UND
+#    silently left unresolved. Counter-test: if any `applied=N` line
+#    has skipped!=0, we'd have a quietly broken module.
+n_bad_skipped=$( { grep -aE "kmod_linux: relocations applied=" "$LOG" || true; } \
+                | { grep -vE 'skipped=0' || true; } | wc -l)
+if [ "$n_bad_skipped" -ne 0 ]; then
+    echo "[test_ahci_ko] FAIL: $n_bad_skipped relocation pass(es) had skipped>0"
+    grep -aE "kmod_linux: relocations applied=" "$LOG" | grep -vE 'skipped=0' | head
+    fail=1
+else
+    echo "[test_ahci_ko] OK: every relocation pass resolved (skipped=0)"
+fi
+
 echo "[test_ahci_ko] init_ok=$INIT_OK lib_only=$LIB_ONLY insmod_fail=$INSMOD_FAIL probe_hit=$PROBE_HIT reloc_clean=$RELOC_OK"
 
 if [ "$INSMOD_FAIL" -ge 1 ]; then
     echo "[test_ahci_ko] FAIL: insmod reported init_module failure"
-    exit 1
+    fail=1
 fi
 
 # PASS criteria:
@@ -158,11 +212,18 @@ fi
 #     probe — the "L-shim works for STORAGE" assertion).
 if [ "$RELOC_OK" -ge 1 ] && \
    { [ "$INIT_OK" -ge 1 ] || [ "$LIB_ONLY" -ge 1 ] || [ "$PROBE_HIT" -ge 1 ]; }; then
-    echo "[test_ahci_ko] PASS: ahci.ko loaded; relocations clean; probe path exercised"
-    exit 0
+    :
+else
+    echo "[test_ahci_ko] FAIL: no PASS markers (qemu rc=$rc)"
+    fail=1
 fi
 
-echo "[test_ahci_ko] FAIL: no PASS markers (qemu rc=$rc)"
-echo "[test_ahci_ko] --- full log tail ---"
-tail -n 100 "$LOG"
-exit 1
+if [ "$fail" -ne 0 ]; then
+    echo "[test_ahci_ko] FAIL — see /tmp/test_ahci_ko.last.log for full output"
+    echo "[test_ahci_ko] --- full log tail ---"
+    tail -n 100 "$LOG"
+    exit 1
+fi
+
+echo "[test_ahci_ko] PASS: ahci.ko loaded; relocations clean; probe path exercised; no traps; post-load fork OK"
+exit 0
