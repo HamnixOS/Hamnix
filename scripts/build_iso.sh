@@ -92,7 +92,13 @@ bash scripts/build_modules.sh
 # booting user to an interactive shell. This is the user-facing
 # real-hardware boot path. Test scripts that need a different first
 # task override /init with their own INIT_ELF fixture.
-python3 scripts/build_initramfs.py
+# HAMNIX_CPIO_LEAN=1: the ISO build pairs a small cpio (boot
+# essentials only) with the rootfs partition (where distro content
+# lives). Without this, the cpio would also embed the full real
+# Debian tree, pushing the kernel ELF past 86 MB and overflowing the
+# 32 MB FAT12 ESP. Direct -kernel ELF tests that don't attach a
+# rootfs partition leave HAMNIX_CPIO_LEAN unset and get a fat cpio.
+HAMNIX_CPIO_LEAN=1 python3 scripts/build_initramfs.py
 
 # Build the ext4 rootfs image that will become partition 3 of the
 # ISO (live-USB-style layout, see docs/rootfs_partition.md). The
