@@ -685,6 +685,28 @@ def build_archive() -> bytes:
             print(f"  embedded {bin_name} ({len(data)} bytes from "
                   f"build/user/{elf.name})")
 
+    # HAMNIX_HAMSH_RC=<path>: when set, replace etc/hamsh.rc (or plant
+    # one if absent) with the file at <path>. Used by tests that drive
+    # hamsh as /init (INIT_ELF=hamsh.elf) and want their own startup
+    # script — the default boot path uses /etc/rc.boot (argv[1]) instead,
+    # so /etc/hamsh.rc is normally empty/absent. Override applies before
+    # the etc/ glob so the test's rc isn't shadowed by a committed file.
+    hamsh_rc_override = os.environ.get("HAMNIX_HAMSH_RC")
+    hamsh_rc_override_real: Path | None = None
+    if hamsh_rc_override:
+        p = Path(hamsh_rc_override)
+        if not p.is_absolute():
+            p = here / p
+        if not p.exists():
+            raise SystemExit(f"HAMNIX_HAMSH_RC={hamsh_rc_override}: "
+                             f"file not found")
+        hamsh_rc_override_real = p.resolve()
+        data = p.read_bytes()
+        blob += cpio_entry("/etc/hamsh.rc", data)
+        print(f"  embedded /etc/hamsh.rc ({len(data)} bytes from "
+              f"{p.relative_to(here) if p.is_relative_to(here) else p}) "
+              f"[HAMNIX_HAMSH_RC override]")
+
     # Baseline /etc files: anything in etc/ gets embedded as /etc/<name>
     # so userland (motd, hostname, future login/init scripts) can read
     # config from a Linux-conventional path without baking strings into
@@ -693,6 +715,12 @@ def build_archive() -> bytes:
     if etc_dir.is_dir():
         for ef in sorted(etc_dir.iterdir()):
             if ef.is_file():
+                # Skip etc/hamsh.rc if a HAMNIX_HAMSH_RC override already
+                # planted one — the first cpio entry wins in _lookup_name,
+                # but listing both is wasteful and confusing.
+                if hamsh_rc_override_real is not None \
+                        and ef.name == "hamsh.rc":
+                    continue
                 data = ef.read_bytes()
                 name = "/etc/" + ef.name
                 blob += cpio_entry(name, data)

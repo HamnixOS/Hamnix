@@ -1,84 +1,91 @@
 #!/usr/bin/env bash
-# scripts/test_hamsh_heartbeat.sh — assert hamsh (PID 1) gets CPU time.
+# scripts/test_hamsh_heartbeat.sh - the hamsh idle heartbeat lives.
 #
-# Boots build/hamnix.iso headless under QEMU, captures the serial console
-# for ~30 s, and looks for the "[hamsh-alive] tick=1" line that hamsh's
-# interactive idle loop emits every ~3 s (HB_PERIOD_JIFFIES = 300 ticks
-# @ HZ=100).
+# The interactive shell emits a periodic "[hamsh-alive] tick=N
+# uptime=Ns" line from ed_readline's idle poll loop (see
+# user/hamsh.ad's _hb_check_and_emit / _hb_emit_to_stderr). It is the
+# canary for "shell is being scheduled at all" — without it, a
+# regression where a kernel-mode syscall busy-loops without yielding
+# (or a userland service hogs cycles) starves the shell, the user
+# stops getting heartbeats, AND every test that drives input via the
+# serial port stalls because the shell never reads anything.
 #
-# This is a load-bearing scheduler-liveness test (per feedback_-
-# regression_prone_needs_test.md). The heartbeat line silently regressed
-# across 100+ commits because no CI grep checked it. If hamsh-as-PID-1
-# never runs (because a kernel busy-poll wedged the CPU with IF=0, or a
-# greedy userland task starved the scheduler), this test catches it.
+# This silently regressed once already (per project memory's
+# "regression-prone needs a test" rule), so it gets a dedicated CI
+# test that boots the production rc.boot path (sshd + motd + ifconfig
+# all running, which is the realistic load) and asserts at least
+# three heartbeats reach the serial console within the boot window.
 #
-# Exit codes:
-#   0  — heartbeat tick=1 observed.
-#   1  — boot succeeded but no heartbeat tick in the window OR build/boot
-#         failed.
-#
-# Env overrides:
-#   HAMNIX_ISO        iso path           (default: build/hamnix.iso)
-#   HEARTBEAT_TIMEOUT seconds to capture (default: 30)
-#   HAMNIX_SKIP_BUILD if 1, reuse existing build/hamnix.iso
+# Three rather than one because tick=0 fires almost instantly (the
+# first ed_readline call seeds hb_inited), so the meaningful signal
+# is that successive ticks (tick=1 at ~3 s, tick=2 at ~6 s, ...) DO
+# follow — i.e. the idle loop keeps getting CPU.
+
+. "$(dirname "$0")/_build_lock.sh"
 
 set -euo pipefail
-
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
-# shellcheck source=_build_lock.sh
-source "$PROJ_ROOT/scripts/_build_lock.sh"
+ELF=build/hamnix-kernel.elf
 
-HAMNIX_ISO="${HAMNIX_ISO:-build/hamnix.iso}"
-HEARTBEAT_TIMEOUT="${HEARTBEAT_TIMEOUT:-30}"
-HEARTBEAT_RE='\[hamsh-alive\] tick=1'
+echo "[test_hamsh_heartbeat] (1/3) Build"
+bash scripts/build_user.sh >/dev/null
+bash scripts/build_modules.sh >/dev/null
+python3 scripts/build_initramfs.py >/dev/null
+python3 -m compiler.adder compile --target=x86_64-bare-metal \
+    init/main.ad -o "$ELF" >/dev/null
 
-if [ "${HAMNIX_SKIP_BUILD:-0}" != "1" ]; then
-    echo "[test_hamsh_heartbeat] rebuilding ISO (clean) via scripts/build_iso.sh"
-    rm -rf build
-    bash "$PROJ_ROOT/scripts/build_iso.sh"
-fi
-if [ ! -f "$HAMNIX_ISO" ]; then
-    echo "[test_hamsh_heartbeat] FAIL: $HAMNIX_ISO missing after build_iso.sh." >&2
-    exit 1
-fi
-
-LOG=$(mktemp --tmpdir hamnix-heartbeat.XXXXXX.log)
+echo "[test_hamsh_heartbeat] (2/3) Boot QEMU"
+LOG=$(mktemp /tmp/hamsh-heartbeat.XXXXXX.log)
 trap 'rm -f "$LOG"' EXIT
 
-echo "[test_hamsh_heartbeat] booting QEMU headless (timeout ${HEARTBEAT_TIMEOUT}s)"
 set +e
-timeout "${HEARTBEAT_TIMEOUT}s" qemu-system-x86_64 \
-    -cdrom "$HAMNIX_ISO" \
-    -m 256M \
-    -display none \
-    -no-reboot \
-    -monitor none \
-    -serial stdio \
-    > "$LOG" 2>&1 < /dev/null
+# 90 seconds of pure observation — production boot path with all
+# services running. No input piped in: a fully idle interactive
+# shell MUST still emit heartbeats. If it doesn't, a kernel busy-
+# loop or a userland CPU hog is starving the prompt.
+timeout 90s qemu-system-x86_64 \
+    -kernel "$ELF" -smp 2 -nographic -no-reboot -m 256M \
+    -monitor none -serial stdio < /dev/null > "$LOG" 2>&1
 rc=$?
 set -e
 
-# rc=124 means timeout fired — expected. rc=0 means qemu exited cleanly.
-# Anything else is a qemu-side problem.
-if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
-    echo "[test_hamsh_heartbeat] FAIL: qemu exited rc=$rc" >&2
-    echo "[test_hamsh_heartbeat] --- tail of log ---"
-    tail -50 "$LOG" || true
+echo "[test_hamsh_heartbeat] (3/3) Assertions"
+
+# Sanity: the prompt actually came up.
+if ! grep -F -q "[hamsh:stage-07] loop-enter" "$LOG"; then
+    echo "[test_hamsh_heartbeat] FAIL: hamsh never reached the interactive" \
+         "loop (stage-07 marker absent — boot wedged before the prompt)"
+    tail -50 "$LOG" | strings
     exit 1
 fi
 
-if grep -a -q -E "$HEARTBEAT_RE" "$LOG"; then
-    line=$(grep -a -E "$HEARTBEAT_RE" "$LOG" | head -1)
-    echo "[test_hamsh_heartbeat] PASS: heartbeat observed -> $line"
-    exit 0
+# Count distinct heartbeat ticks. We use grep with -c to count lines,
+# and require >= 3 (covers boot-banner-tick + at least two periodic
+# ticks at ~3 s cadence).
+tick_count=$(grep -F -c "[hamsh-alive] tick=" "$LOG" || true)
+echo "[test_hamsh_heartbeat] observed $tick_count heartbeat lines"
+
+if [ "$tick_count" -lt 3 ]; then
+    echo "[test_hamsh_heartbeat] FAIL: only $tick_count heartbeat lines" \
+         "(need >= 3 within the 90 s window). Something is starving the" \
+         "shell — check for kernel busy-loops and userland service hogs."
+    echo "[test_hamsh_heartbeat] --- tail ---"
+    tail -50 "$LOG" | strings
+    exit 1
 fi
 
-echo "[test_hamsh_heartbeat] FAIL: no '[hamsh-alive] tick=1' line in ${HEARTBEAT_TIMEOUT}s of serial output." >&2
-echo "[test_hamsh_heartbeat] This means hamsh (PID 1) never reached its interactive idle loop," >&2
-echo "[test_hamsh_heartbeat] OR a kernel busy-poll wedged the CPU (e.g. tcp_accept's while-jiffies" >&2
-echo "[test_hamsh_heartbeat] loop running under SYSCALL IF=0)." >&2
-echo "[test_hamsh_heartbeat] --- tail of log ---"
-tail -80 "$LOG" || true
-exit 1
+# Also assert we see at least tick=1 and tick=2 specifically — if
+# only tick=0 fires N times that's a different bug (corruption /
+# loop without rearming) but still a regression.
+if ! grep -F -q "[hamsh-alive] tick=1 " "$LOG"; then
+    echo "[test_hamsh_heartbeat] FAIL: tick=1 never observed"
+    exit 1
+fi
+if ! grep -F -q "[hamsh-alive] tick=2 " "$LOG"; then
+    echo "[test_hamsh_heartbeat] FAIL: tick=2 never observed"
+    exit 1
+fi
+
+echo "[test_hamsh_heartbeat] PASS (qemu rc=$rc, $tick_count ticks)"
