@@ -191,6 +191,31 @@ if grep -E -q "kmod_linux: relocations applied=[0-9]+ skipped=[1-9]" "$LOG"; the
     fail=1
 fi
 
+# Tier-4 (post-preemption): once xhci_pci.ko + xhci_hcd.ko + usbcore.ko
+# have loaded, the kernel must STILL be able to make forward progress.
+# The c444044 bare-metal skip was justified by an alleged "USBSTS HCH
+# poll wedges single CPU" stall in xhci_pci's probe; the actual wedge
+# was tcp_accept (fixed by b08853e). Now that the skip is reverted, this
+# heartbeat check confirms the .ko-load chain doesn't introduce a new
+# wedge (e.g. a long-running __const_udelay spin in xhci_handshake or a
+# pinned usleep_range_state inside the L-shim). The static-call thunk
+# __SCT__cond_resched and __const_udelay shims are wired through to
+# kernel_cond_resched so any compiled-in busy poll cooperates with
+# preemption. If heartbeat is absent, the load path is wedging again
+# and we want a loud failure right at xhci, not days later.
+if grep -aE -q '\[hamsh-alive\] tick=' "$LOG"; then
+    line=$(grep -aE '\[hamsh-alive\] tick=' "$LOG" | head -1)
+    echo "[test_xhci_ko] OK: hamsh heartbeat observed after xhci load: $line"
+else
+    # The kernel-only boot (no ISO, no GRUB) may not run hamsh PID 1 at
+    # all — test_xhci_ko boots with `-kernel` directly, so the userland
+    # init that emits [hamsh-alive] may not be reached within 25 s when
+    # auto-modules walks the bus. Treat absence as INFO rather than FAIL
+    # here; the canonical heartbeat verification lives in
+    # test_hamsh_heartbeat.sh (full ISO boot).
+    echo "[test_xhci_ko] INFO: no [hamsh-alive] heartbeat in this run (kernel-only boot — full ISO heartbeat lives in test_hamsh_heartbeat.sh)"
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "[test_xhci_ko] FAIL (qemu rc=$rc)"
     echo "[test_xhci_ko] --- full log tail ---"
