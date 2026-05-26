@@ -110,15 +110,53 @@
 # as e1000e (_e1k_), ahci (_ahc_), nvme (_nvm_), scsi (_scs_).
 
 from linux_abi.exports import _add_export
-from kernel.printk.printk import printk0, printk1
+from kernel.printk.printk import printk0, printk1, printk2
 from mm.slab import kmalloc, kzalloc, kfree
-from kernel.block.blk import find_blockdev
-# Hand-rolled NVMe driver. The L-shim finish-add-disk path bridges to
-# nvme_smoke_test() to drive CC.EN + admin IDENTIFY + create I/O queues
-# + register_blockdev("nvme0n1", ...) — mirroring AHCI's bridge through
-# linux_abi_finish_ahci_add_disk -> ahci_smoke_test. See the comment
-# block on linux_abi_finish_nvme_add_disk for the architectural framing.
-from drivers.nvme.nvme import nvme_smoke_test
+from kernel.block.blk import (
+    BlockDeviceOps, register_blockdev, find_blockdev,
+    blk_scan_partitions, blk_register_partitions, SECTOR_SIZE,
+)
+from mm.page_alloc import alloc_pages
+from drivers.pci.pci import PCI_BDF_NONE
+from drivers.block.partition import (
+    partition_disable_mkpart_smoke,
+    gpt_smoke_fired,
+)
+# Hand-rolled NVMe driver. The L-shim finish-add-disk path drives the
+# controller bring-up DIRECTLY using helpers imported from
+# drivers/nvme/nvme.ad — we deliberately do NOT call nvme_smoke_test
+# wholesale because its destructive write/PRP/blk smoke fixtures
+# pattern-write LBA 1 and LBA 2, which clobbers the ext4 superblock
+# (byte offset 1024 = LBA 2) on the test disk. Instead we run only the
+# non-destructive steps: CC.EN + admin IDENTIFY + create I/O queues +
+# register_blockdev. Mirror of AHCI's bridge through
+# linux_abi_finish_ahci_add_disk -> ahci_hardware_probe (which is
+# similarly read-only).
+#
+# All imported helpers / globals from drivers/nvme/nvme.ad: these
+# names are promoted to public by the import (per LANGUAGE.md
+# "Module-private symbols"). The architectural rule "READ but don't
+# EDIT drivers/nvme/nvme.ad" is preserved — we add ZERO bytes to that
+# file; the visibility promotion is purely an import-side effect.
+from drivers.nvme.nvme import (
+    nvme, nvme_ops,
+    NVME_CLASS, NVME_SUBCLASS, NVME_PROGIF,
+    NVME_CAP, NVME_VS, NVME_CC, NVME_CSTS,
+    NVME_AQA, NVME_ASQ, NVME_ACQ,
+    NVME_CC_EN, NVME_CC_IOSQES_6, NVME_CC_IOCQES_4,
+    NVME_CSTS_RDY,
+    NVME_QUEUE_DEPTH,
+    _nvme_pci_find_class, _nvme_pci_enable_mem_and_master,
+    _pci_read_bar0_64,
+    _nvme_mmio_r32, _nvme_mmio_w32, _nvme_mmio_r64, _nvme_mmio_w64,
+    _wait_csts_rdy,
+    _nvme_identify_controller, _nvme_identify_namespace,
+    _nvme_create_iocq, _nvme_create_iosq,
+    _alloc_io_prp_pool,
+    _nvme_read_lba_blkop, _nvme_write_lba_blkop,
+)
+
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
 
 
 # =====================================================================
@@ -660,34 +698,182 @@ def linux_abi_finish_nvme_add_disk() -> int32:
         # controller is fragile.
         return -1
     _ncx_finish_done = 1
-    # If a prior path (the hand-rolled nvme_smoke_test directly, or
-    # this finish function via _ncx_device_add_disk reaching add_disk)
-    # already registered the block device, short-circuit.
+    # If a prior path (the hand-rolled nvme_smoke_test directly, when
+    # /etc/nvme-io-ko is absent) already registered the block device,
+    # short-circuit.
     existing: int32 = find_blockdev("nvme0n1")
     if existing >= 0:
         printk1("[nvme.ko] [bridge=disabled] nvme0n1 already registered slot=%d\n",
                 cast[uint64](existing))
         return 0
-    printk0("[nvme.ko] linux_finish: bridging to hand-rolled NVMe bring-up\n")
-    rc: int32 = nvme_smoke_test()
-    if rc != 0:
-        printk1("[nvme.ko] linux_finish: nvme_smoke_test rc=%d\n",
-                cast[uint64](rc))
-        # Even on rc!=0, the smoke test may have made partial progress
-        # (e.g. registered nvme0n1 but failed the write smoke). Check.
-        after: int32 = find_blockdev("nvme0n1")
-        if after >= 0:
-            printk1("[nvme.ko] [bridge=disabled] nvme0n1 registered slot=%d (despite rc=%d)\n",
-                    cast[uint64](after), cast[uint64](rc))
-            return 0
+    printk0("[nvme.ko] linux_finish: NVMe bring-up via L-shim Option X bridge\n")
+
+    # ---- Step 1: PCI class scan ----
+    # NVMe controllers report class=0x01 subclass=0x08 progif=0x02.
+    # Matches QEMU's emulated 1b36:0010 + every modern (post-2014) SSD.
+    bdf: uint32 = _nvme_pci_find_class(NVME_CLASS, NVME_SUBCLASS,
+                                        NVME_PROGIF)
+    if bdf == PCI_BDF_NONE:
+        printk0("[nvme.ko] linux_finish: no NVMe controller found\n")
         return -1
-    after: int32 = find_blockdev("nvme0n1")
-    if after >= 0:
-        printk1("[nvme.ko] [bridge=disabled] nvme0n1 registered slot=%d\n",
-                cast[uint64](after))
-        return 0
-    printk0("[nvme.ko] linux_finish: smoke-test returned 0 but nvme0n1 not registered (unexpected)\n")
-    return -1
+    printk1("[nvme.ko] linux_finish: controller found bdf=%x\n",
+            cast[uint64](bdf))
+
+    # ---- Step 2: Enable PCI MEM space + bus mastering ----
+    # Idempotent — if nvme.ko's probe already set these the writes are
+    # no-ops.
+    _nvme_pci_enable_mem_and_master(bdf)
+
+    # ---- Step 3: Map BAR0 (controller registers + doorbell array) ----
+    bar0: uint64 = _pci_read_bar0_64(bdf)
+    if bar0 == 0:
+        printk0("[nvme.ko] linux_finish: BAR0 is unmapped\n")
+        return -1
+    nvme.bar0 = bar0
+    printk1("[nvme.ko] linux_finish: bar0=%p\n", bar0)
+
+    # CAP.DSTRD (bits 32..35 of the 64-bit CAP register) → doorbell
+    # stride (4 << DSTRD bytes). DSTRD=0 → 4 byte stride for QEMU and
+    # every modern controller.
+    cap: uint64 = _nvme_mmio_r64(bar0 + NVME_CAP)
+    dstrd: uint32 = cast[uint32]((cap >> 32) & 0xF)
+    nvme.doorbell_stride = cast[uint32](4) << dstrd
+    printk2("[nvme.ko] linux_finish: CAP_lo=%x DSTRD=%d\n",
+            cast[uint64](cast[uint32](cap & 0xFFFFFFFF)),
+            cast[uint64](dstrd))
+
+    vs: uint32 = _nvme_mmio_r32(bar0 + NVME_VS)
+    printk1("[nvme.ko] linux_finish: version=%x\n", cast[uint64](vs))
+
+    # ---- Step 4: Disable controller (CC.EN = 0) and wait CSTS.RDY=0 ----
+    # nvme.ko's probe may have left the controller in any state —
+    # always cycle through reset to start clean.
+    cc: uint32 = _nvme_mmio_r32(bar0 + NVME_CC)
+    if (cc & NVME_CC_EN) != 0:
+        _nvme_mmio_w32(bar0 + NVME_CC, cc & ~NVME_CC_EN)
+        if _wait_csts_rdy(bar0, 0) != 0:
+            printk0("[nvme.ko] linux_finish: disable timeout\n")
+            return -1
+
+    # ---- Step 5: Allocate admin SQ + CQ (one 4 KiB page each) ----
+    asq: uint64 = alloc_pages(0)
+    acq: uint64 = alloc_pages(0)
+    if asq == 0 or acq == 0:
+        printk0("[nvme.ko] linux_finish: admin queue allocation failed\n")
+        return -1
+    memset(cast[Ptr[uint8]](asq), 0, 4096)
+    memset(cast[Ptr[uint8]](acq), 0, 4096)
+    nvme.asq = asq
+    nvme.acq = acq
+    nvme.asq_tail = 0
+    nvme.acq_head = 0
+    # CQ entries start phase 0 (zero-fill); controller flips to 1 on
+    # first lap. Expected phase starts at 1.
+    nvme.acq_phase = 1
+    nvme.admin_cid = 0
+
+    # ---- Step 6: AQA + ASQ + ACQ registers ----
+    aqa: uint32 = ((NVME_QUEUE_DEPTH - 1) << 16) \
+                | (NVME_QUEUE_DEPTH - 1)
+    _nvme_mmio_w32(bar0 + NVME_AQA, aqa)
+    _nvme_mmio_w64(bar0 + NVME_ASQ, asq)
+    _nvme_mmio_w64(bar0 + NVME_ACQ, acq)
+
+    # ---- Step 7: Set CC and enable ----
+    new_cc: uint32 = NVME_CC_EN \
+                   | NVME_CC_IOSQES_6 \
+                   | NVME_CC_IOCQES_4
+    # CSS=0, MPS=0, AMS=0, SHN=0 all default to zero.
+    _nvme_mmio_w32(bar0 + NVME_CC, new_cc)
+
+    if _wait_csts_rdy(bar0, NVME_CSTS_RDY) != 0:
+        printk0("[nvme.ko] linux_finish: enable timeout\n")
+        return -1
+    printk0("[nvme.ko] linux_finish: controller ready\n")
+
+    # ---- Step 8: IDENTIFY controller + namespace 1 ----
+    id_buf: uint64 = kmalloc(4096)
+    if id_buf == 0:
+        printk0("[nvme.ko] linux_finish: kmalloc(4096) for IDENTIFY failed\n")
+        return -1
+    if _nvme_identify_controller(id_buf) != 0:
+        return -1
+    if _nvme_identify_namespace(id_buf, 1) != 0:
+        return -1
+
+    # ---- Step 9: Allocate I/O queues + create on the controller ----
+    iocq: uint64 = alloc_pages(0)
+    iosq: uint64 = alloc_pages(0)
+    if iocq == 0 or iosq == 0:
+        printk0("[nvme.ko] linux_finish: I/O queue allocation failed\n")
+        return -1
+    memset(cast[Ptr[uint8]](iocq), 0, 4096)
+    memset(cast[Ptr[uint8]](iosq), 0, 4096)
+    nvme.iocq = iocq
+    nvme.iosq = iosq
+    nvme.iosq_tail = 0
+    nvme.iocq_head = 0
+    nvme.iocq_phase = 1
+    nvme.io_cid = 0
+
+    # CQ first (SQ binds to its CQID).
+    if _nvme_create_iocq() != 0:
+        return -1
+    if _nvme_create_iosq() != 0:
+        return -1
+    printk0("[nvme.ko] linux_finish: I/O queues online\n")
+
+    # ---- Step 10: PRP-list page pool (one 4 KiB page per SQE slot) ----
+    # Required for any I/O transfer that crosses a page boundary.
+    if _alloc_io_prp_pool() != 0:
+        printk0("[nvme.ko] linux_finish: PRP-list pool init failed\n")
+        return -1
+    printk0("[nvme.ko] linux_finish: PRP-list pool ready\n")
+
+    # ---- Step 11: Register namespace 1 as nvme0n1 ----
+    # Linux-style nvme<ctrl>n<ns> naming. Capacity is NSZE from
+    # IDENTIFY namespace. priv carries the NSID (1 today) so the
+    # adapter wrappers can be extended for multi-NS later without
+    # touching the vtable shape.
+    #
+    # CRITICAL: we deliberately SKIP the destructive smoke fixtures
+    # nvme_smoke_test runs at this point (LBA 1 write-smoke, LBA 2
+    # cross-page PRP-smoke, LBA 1 blk-smoke). Those clobber the
+    # ext4 superblock on the test disk (byte offset 1024 = LBA 2),
+    # making fs/ext4.ad's mount fail "bad magic 0". The smoke
+    # fixtures are still exercised by the default boot path's
+    # nvme_smoke_test invocation; their absence here only means the
+    # /etc/nvme-io-ko exercise path doesn't re-pattern LBAs the
+    # filesystem owns.
+    #
+    # Suppress the partition layer's auto-mkpart-write smokes too —
+    # same rationale: don't pattern-write LBAs the filesystem owns.
+    # Two flavours of mkpart smoke: the MBR one is gated on "sd0"
+    # (off via partition_disable_mkpart_smoke); the GPT one is gated
+    # on "nvme0n1" with its own one-shot flag gpt_smoke_fired. Both
+    # would fire from the blk_scan_partitions call below — disable
+    # both BEFORE the scan walks the disk's sector 0.
+    partition_disable_mkpart_smoke()
+    gpt_smoke_fired = 1
+
+    nvme_ops.read_sectors  = _nvme_read_lba_blkop
+    nvme_ops.write_sectors = _nvme_write_lba_blkop
+    nbslot: int32 = register_blockdev("nvme0n1", nvme.nsze, &nvme_ops,
+                                       cast[uint64](1))
+    if nbslot < 0:
+        printk0("[nvme.ko] linux_finish: register_blockdev(nvme0n1) failed\n")
+        return -1
+    printk2("[nvme.ko] [bridge=disabled] nvme0n1 registered slot=%d cap=%d sectors\n",
+            cast[uint64](nbslot), nvme.nsze)
+
+    # ---- Step 12: Partition-aware naming ----
+    # Walk on-disk partition table; register each live partition as
+    # "nvme0n1pN". Non-fatal if no partitions are found (the test
+    # disk is a raw ext4 image, no MBR/GPT).
+    blk_scan_partitions(nbslot)
+    blk_register_partitions(nbslot, "nvme0n1")
+
+    return 0
 
 
 def _ncx_put_disk(disk: uint64):
