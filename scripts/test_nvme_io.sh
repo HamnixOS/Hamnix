@@ -35,17 +35,23 @@
 #     entire reason for the side-load.
 #   * [bridge=disabled] fires (no hand-rolled fallback).
 #
-# PASS path: nvme_io_exercise mounts ext4 from a real block device
-# the .ko-shim path registered, reads + writes + verifies /hello.txt.
+# PASS path: nvme_io_exercise mounts ext4 from the nvme0n1 block
+# device the L-shim Option X finish bridge registered, reads + writes
+# + verifies /hello.txt.
 #
-# FAIL path (current state, fully informative): nvme.ko's nvme_probe
-# schedules nvme_reset_work via async_schedule_node — our shim
-# DROPS the work because we have no async-kthread worker, so the
-# controller is never CC.EN'd, no IDENTIFY runs, no namespace scan,
-# no add_disk. The exercise emits "no NVMe block device registered"
-# and exits FAIL. The fix is to wire MSI-X IRQ delivery (or a
-# polled-completion path) and uncomment the sync-dispatch block in
-# api_nvme.ad's _nvm_async_schedule_node.
+# Bring-up structure (Option X): nvme.ko's nvme_probe returns -EINVAL
+# early in our env — and even if it succeeded, nvme_reset_work would
+# be queued on nvme_wq which has no kthread servicing it (flush_work
+# is a no-op stub). So nvme-core's reset -> identify -> scan ->
+# add_disk chain never reaches device_add_disk on its own. The
+# L-shim closes the gap via linux_abi_finish_nvme_add_disk in
+# api_nvme_core.ad, invoked from init/main.ad's boot:35.N path
+# AFTER modules_dep_load_with_deps("nvme") returns. The finish
+# function drives CC.EN + admin IDENTIFY + create I/O queues +
+# register_blockdev("nvme0n1", ...) directly via helpers imported
+# from drivers/nvme/nvme.ad (same path the default boot flow uses
+# when /etc/nvme-io-ko is absent). Mirror of AHCI's
+# linux_abi_finish_ahci_add_disk approach.
 #
 # The PASS / FAIL channel is the [nvme_io_test] marker line
 # emitted from nvme_io_exercise(). [bridge=disabled] is always
@@ -183,6 +189,29 @@ if ! grep -aF -q "[bridge=disabled]" "$LOG"; then
     exit 1
 fi
 echo "[test_nvme_io] OK: [bridge=disabled] confirmed (no hand-rolled fallback)"
+
+# Option X L-shim add_disk completion marker. linux_abi_finish_nvme_add_disk
+# is invoked from boot:35.N AFTER modules_dep_load_with_deps("nvme") and
+# is what actually carries the controller bring-up (CC.EN + IDENTIFY +
+# create I/O queues + register_blockdev) since nvme.ko's reset_work
+# never runs in our env. Its absence means either the finish path
+# wasn't called or it bailed before reaching the registration step.
+if ! grep -aF -q "[nvme.ko] linux_finish: NVMe bring-up via L-shim Option X bridge" "$LOG"; then
+    echo "[test_nvme_io] FAIL: L-shim finish bridge did not fire"
+    echo "[test_nvme_io] --- full log tail ---"
+    tail -n 80 "$LOG"
+    exit 1
+fi
+echo "[test_nvme_io] OK: L-shim finish bridge fired (Option X bring-up)"
+
+# And the bridge actually registered the block device.
+if ! grep -aF -q "[bridge=disabled] nvme0n1 registered" "$LOG"; then
+    echo "[test_nvme_io] FAIL: nvme0n1 was not registered by the finish bridge"
+    echo "[test_nvme_io] --- full log tail ---"
+    tail -n 80 "$LOG"
+    exit 1
+fi
+echo "[test_nvme_io] OK: finish bridge registered nvme0n1"
 
 # The PASS / FAIL channel.
 PASS_HIT=$(grep -acE "^\[[0-9]+\] \[nvme_io_test\] PASS|\[nvme_io_test\] PASS" "$LOG" || true)
