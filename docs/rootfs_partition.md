@@ -5,11 +5,12 @@
 Hamnix's ISO carries the kernel ELF on a small ESP and a separate
 ext4 partition (`/dev/...p3` on the live medium) for the bulk of
 distro content (real Debian apt/dpkg, busybox, future user data).
-At boot the kernel auto-discovers the ext4 partition and exposes it
-through the existing `/ext` device-letter dispatch in `fs/vfs.ad`.
-Userspace `etc/rc.boot` then `bind`s the rootfs at `/n/distros` in
-the init namespace and at `/` inside the `linux = ns clean { ... }`
-recipe — so:
+At boot the kernel auto-discovers the ext4 partition, reads its
+`.hamnix-roots` sentinel for the name (today: `distro`), and
+registers it in the named file-server stack as `#distro`.
+Userspace `etc/rc.boot` then `bind`s `'#distro'` at `/n/distros`
+in the init namespace and at `/` inside the
+`linux = ns clean { ... }` recipe — so:
 
 - The shell sees the rootfs at **`/n/distros/`** (read/write).
 - The Linux namespace sees the rootfs at **`/`** (read/write).
@@ -57,51 +58,57 @@ filesystem with no journal (read-mostly), built via `mkfs.ext4 -d
 At boot, `init/main.ad`'s `start_kernel()` calls
 `mount_rootfs_partition()` after `block_smoke_test()`. The function
 walks every registered block device (vda from virtio-blk; sd0pN from
-AHCI; etc.) and reads its ext4 superblock area (sectors 2..3). The
-first device whose bytes 0x438..0x439 are `53 EF` (little-endian
-0xEF53) is mounted via `ext4_init(slot)` and lights up the `/ext`
-path dispatch in `fs/vfs.ad`.
+AHCI; etc.) and reads its ext4 superblock area. Any device whose
+bytes 0x438..0x439 are `53 EF` (little-endian 0xEF53) is mounted via
+`ext4_init(slot)`. The kernel then reads the `.hamnix-roots`
+sentinel from the partition root (planted by
+`scripts/build_rootfs_img.py`) for the named-stack registration —
+today that file names the partition `distro`, so it lands as
+`#distro` in the per-name file-server stack (also as
+`#by-id/<partuuid>` in the persistent alias table).
 
 ```text
 [rootfs] scanning block devices for ext4 magic
 [rootfs] ext4 magic on slot 1 (vda3)
-[rootfs] mounted ext4 rootfs at /ext (slot=1, exposed to namespaces as #/distrofs via etc/rc.boot's linux ns recipe)
+[rootfs] mounted ext4 rootfs (slot=1, registered as #distro via .hamnix-roots sentinel)
 ```
 
-If no ext4 partition is found (e.g. `-kernel ELF` boot with no rootfs
-disk attached), the kernel logs `[rootfs] no ext4 partition found`
-and continues. The init namespace falls back to cpio-only; the
-`linux = ns clean { ... }` recipe will see `/ext` resolve to nothing
-and `enter linux { ... }` will fail with `-ENOENT` (use
-`HAMNIX_CPIO_LEAN=0` to ship the full cpio fallback).
+If no ext4 partition is found (e.g. `-kernel ELF` boot with no
+rootfs disk attached), the kernel logs `[rootfs] no ext4 partition
+found` and continues. The init namespace falls back to cpio-only;
+the `linux = ns clean { bind '#distro' / ; ... }` recipe will see
+`'#distro'` resolve to nothing and `enter linux { ... }` will fail
+with `-ENOENT` (use `HAMNIX_CPIO_LEAN=0` to ship the full cpio
+fallback).
 
 ## How userspace exposes it (etc/rc.boot)
 
-The init namespace `bind`s the rootfs at `/n/distros` so the **shell
-has read/write access** to the partition's free space:
+The init namespace `bind`s `'#distro'` at `/n/distros` so the
+**shell has read/write access** to the partition's free space:
 
 ```hamsh
-bind /n/distros /ext
+bind '#distro' /n/distros
 ```
 
 The shell can:
 - `cat /n/distros/usr/bin/dpkg` — read the real Debian dpkg
 - `cat > /n/distros/home/me/myfile` — write user files to the partition
 
-The Linux namespace recipe `bind`s the rootfs at `/` inside the
+The Linux namespace recipe `bind`s `'#distro'` at `/` inside the
 **isolated linux ns** (it's `ns clean`, a fresh empty Pgrp):
 
 ```hamsh
 linux = ns clean {
-    bind / /ext
+    bind '#distro' /
     bind /home /home
-    bind /dev '#c'
+    bind '#c' /dev
     ...
 }
 ```
 
 Inside `enter linux { /usr/bin/dpkg }`, the path `/usr/bin/dpkg`
-resolves via the linux ns mtab → `/ext/usr/bin/dpkg` → ext4 lookup.
+resolves through the linux ns mtab to the rootfs partition's ext4
+lookup.
 
 ## The isolation guarantee (user direction 2026-05-26)
 
@@ -192,19 +199,26 @@ does the same.
 
 ### Don't auto-mount via chan_resolve_prefix chaining
 `chan_resolve_prefix` does ONE prefix rewrite per `vfs_open` call.
-Chaining `bind /usr /n/distros/usr` + `bind /n/distros /ext` won't
-double-resolve to `/ext/usr` — the first call only resolves the
-outer-most match. Either resolve directly in one bind
-(`bind / /ext` is what the linux ns uses) or add an explicit
-re-entry loop to `chan_resolve_prefix` (deferred; risky due to cycle
-potential).
+A bind chain like `bind /usr /n/distros/usr` + `bind '#distro' /n/distros`
+won't double-resolve — the first call only resolves the outer-most
+match. Either resolve directly in one bind (`bind '#distro' /` is
+what the linux ns uses) or add an explicit re-entry loop to
+`chan_resolve_prefix` (deferred; risky due to cycle potential).
 
-## Future direction — per-letter file servers (user direction 2026-05-26)
+## Per-name file servers — shipped 2026-05-26
 
-Stub status; tracking work. The current implementation exposes each
-discovered ext4 partition as ONE 9P file server reachable via the
-`/ext` path-prefix dispatch (kernel-side, fs/vfs.ad). The user
-clarified the eventual shape:
+The original sketch in this section was "exposing each discovered
+ext4 partition as ONE 9P file server reachable via the `/ext`
+path-prefix dispatch." That earlier shape is preserved for legacy
+paths in `fs/vfs.ad` (`/ext/HELLO.TXT` continues to resolve via
+`is_ext_path`), but the **primary path is now per-named file
+servers in `sys/src/9/port/chan.ad`**: each ext4 partition declares
+its name in a `.hamnix-roots` sentinel and lands in the
+per-name stack as `#<word>` (today: `#distro`), plus the persistent
+`#by-id/<partuuid>` alias. The sections below were written as the
+design and have shipped.
+
+The user's original direction:
 
 > "you plug in a thumb drive and it shows up as a single letter. It
 > allows us to split up the default EXT4 file system in logical
@@ -357,39 +371,41 @@ hamsh's `bind` builtin warns LOUDLY if arg2 starts with `#` AND
 arg1 does NOT — catches muscle-memory inversions before they
 silently graft a path onto a device name.
 
-### Migration impact
+### Migration impact (shipped, 2026-05-26 wave)
 
-This design touches:
+This design touched, all shipped:
 - Hamsh `bind` wrapper (arg order flip + multi-char `#<word>` parser
-  + inversion warning)
-- Hamsh `#` lexer (accept multi-char names, not just single chars)
+  + inversion warning) — `6f2c3cb`
+- Hamsh `#` lexer (accept multi-char names, not just single chars) —
+  same wave
 - `sys/src/9/port/chan.ad` (named-stack table; by-id alias table;
-  bind-freeze semantics affirmation if not already present)
-- `sys/src/9/port/dev.ad` (reserved-word query)
-- `init/main.ad` (`mount_rootfs_partition()` generalises to walk
-  sentinels and register named or anonymous mounts)
-- `fs/ext4.ad` (read a small file at root by name — the sentinel)
-- `etc/rc.boot` (use `bind '#home' /n/home` etc., tree-wide flip)
-- `scripts/build_rootfs_img.py` (plant `.hamnix-roots` with
-  `distro <relpath>`)
-- `#p` (proc) (add the `/proc/fs/` subtree)
-- Every test that uses `bind` (syntax flip + name changes from
-  `/ext` placeholder to `#distro` etc.)
-
-Same blast radius as the bind-order fix; do both in one sweeping
-agent run.
+  bind-freeze of named sources via `_freeze_named_source`) —
+  `5e9c086`, `98ea65a`, `bc1000e`, `5a40d60`
+- `sys/src/9/port/dev.ad` (reserved-word query `is_reserved_word`) —
+  `a46dc4b`
+- `init/main.ad` (`mount_rootfs_partition()` walks sentinels and
+  registers named or anonymous mounts) — `8e5a712`
+- `fs/ext4.ad` (sentinel reader from the partition root) — same wave
+- `etc/rc.boot` (`bind '#distro' /n/distros` etc., tree-wide flip) —
+  `aa8c684`
+- `scripts/build_rootfs_img.py` (plants `.hamnix-roots` with
+  `distro <relpath>`) — `bea976c`
+- `#p` (proc) `/proc/fs/{by-name,by-id,anonymous}` introspection —
+  `5182d03`
 
 ## Files involved
 
-- `scripts/build_rootfs_img.py` — stage + mkfs.ext4 the rootfs image
+- `scripts/build_rootfs_img.py` — stage + mkfs.ext4 the rootfs image,
+                                 plant `.hamnix-roots`
 - `scripts/build_iso.sh` — build ISO, append rootfs as partition 3
 - `scripts/build_initramfs.py` — `HAMNIX_CPIO_LEAN=1` strips the
                                  cpio's redundant debian copy
 - `kernel/block/blk.ad` — `blk_max_slots`, `blk_slot_in_use`,
                           `blk_slot_name` enumeration API
 - `init/main.ad` — `mount_rootfs_partition()` autodiscover hook
-- `etc/rc.boot` — `bind /n/distros /ext` + `linux = ns clean { bind / /ext; ... }`
+- `etc/rc.boot` — `bind '#distro' /n/distros` + `linux = ns clean { bind '#distro' / ; ... }`
 - `fs/ext4.ad` — existing reader (already supports extent walks,
                  directories, symlinks, file_create, ftruncate)
-- `fs/vfs.ad` — existing `/ext` device-letter dispatch
+- `fs/vfs.ad` — legacy `/ext` device-letter dispatch (kept for older
+                tests); the primary path is now `chan.ad`'s named stack
 - `docs/rootfs_partition.md` — this file
