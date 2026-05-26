@@ -160,12 +160,16 @@ paths. Two discovery shapes:
 Sentinel file format (`.hamnix-roots` at partition root):
 
 ```
-home    home/
-distro  debian-bookworm/
-cache   var/cache/apt/
+home      home/
+distro    debian-bookworm/
+apt-cache var/cache/apt/
 ```
 
-→ kernel posts `#h`, `#d`, `#c` as separate file servers.
+→ kernel posts `#h`, `#d`, `#a` as separate file servers. Reserved
+built-in letters (`c p s /` today; see `sys/src/9/port/dev.ad`)
+cannot be claimed by sentinel words; the parser rejects such entries
+loudly. Anonymous partitions (no sentinel) get uppercase letters
+(`#A`, `#B`, …) — visually distinct from sentinel-named lowercase.
 
 **Collision rule — stack semantics**: each letter is a NAME that
 resolves to the top of a per-letter stack of file servers. Plug-in
@@ -174,8 +178,14 @@ use → stack becomes `[home_disk, usb_home]`, `#h` resolves to
 usb_home (top), `#hh` resolves to home_disk. Unplug the USB → stack
 pops, `#h` is back to home_disk, `#hh` no longer exists. Already-open
 fds keep working (they hold direct Chan refs); only new path lookups
-route through the current stack top. See
-[`rootfs_partition.md`](rootfs_partition.md) for full semantics.
+route through the current stack top. Stack depth capped at 8.
+
+**Inspection**: `/proc/fs/<letter>` files dump the stack (top → bottom)
+with the source partition identifier for each entry — load-bearing
+for "what is `#h` actually right now" debugging.
+
+See [`rootfs_partition.md`](rootfs_partition.md) for full semantics
+(sentinel format, parse rules, hamsh-bind safety warning).
 
 **Bind syntax is source-first, target-second**: `bind SRC DST`. The
 underlying `SYS_BIND(src, dst, flag)` syscall (see

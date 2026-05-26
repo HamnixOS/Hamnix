@@ -222,62 +222,128 @@ The target design (not yet implemented):
    disk devices). The current single-partition path effectively uses
    `/ext` as that letter; this generalises.
 
-2. **Single-server mode** (no sentinel file at partition root):
-   the kernel serves the WHOLE partition as one anonymous file
-   server, assigned the next free letter (`#A`, `#B`, ...). hamsh
-   binds it as `bind '#A' /n/mydisk` (source first, then target).
+### Letter case convention
 
-3. **Multi-server mode** (sentinel file at partition root): the
-   partition's root carries a file `.hamnix-roots` listing one or
-   more named servers. Each line is `<word> <relative-dir>`:
+- **Lowercase** (`#a`..`#z`): used by both **sentinel-derived** servers
+  (letter = first char of word) AND built-in kernel devices. Current
+  built-in reserved set (verified against `etc/rc.boot`): `#c` console,
+  `#p` proc, `#s` srv, `#/` mount-parent. A sentinel entry whose first
+  char collides with a reserved letter is REJECTED at parse time.
+  When new built-in devices are added, their letters join the reserved
+  set — the source of truth is `sys/src/9/port/dev.ad`.
+- **Uppercase** (`#A`..`#Z`): reserved for **anonymous** partition
+  servers (no sentinel found). Auto-assigned in mount order.
 
-       home    home/
-       distro  debian-bookworm/
-       cache   var/cache/apt/
+This split eliminates any chance of a sentinel collision with the
+built-in kernel device namespace, and gives the user a visual cue at
+a glance: `#A` is "the kernel found a partition with no name preference,"
+`#h` is "someone deliberately declared this is `home`."
 
-   The kernel reads the sentinel, derives each server's letter from
-   the FIRST CHARACTER of `<word>` (lowercase), and posts each as
-   a separate file server: `#h`, `#d`, `#c` in the example. hamsh
-   binds each independently:
+### Single-server mode (no sentinel)
 
-       bind '#h' /n/home
-       bind '#d' /n/distros
-       bind '#c' /var/cache/apt
+The partition's root has no `.hamnix-roots`. Kernel serves the WHOLE
+partition as one anonymous file server, assigned the next free
+uppercase letter (`#A`, `#B`, ...). hamsh binds it source-first:
 
-4. **Collision handling — stack semantics**: a letter like `h` is
-   a NAME that resolves to the top of a per-letter stack of file
-   servers. Plug-in pushes; unplug pops. Concretely:
+    bind '#A' /n/mydisk
 
-   - Boot with on-disk `home` server → stack `[home_disk]`,
-     `#h` resolves to home_disk.
-   - Plug USB stick declaring `home` → stack `[home_disk, usb_home]`,
-     `#h` resolves to usb_home (top), `#hh` resolves to home_disk
-     (one below top). The user-visible home directory just switched
-     to the USB stick.
-   - Unplug the USB stick → stack pops to `[home_disk]`,
-     `#h` resolves to home_disk again, `#hh` no longer exists.
-     The home directory is back to the on-disk server.
+### Multi-server mode (sentinel present)
 
-   A third concurrent collision yields `#h`, `#hh`, `#hhh` (top to
-   bottom). Pop the top → all letters slide up.
+Partition root carries `.hamnix-roots` listing one or more named
+servers. Each line is `<word> <relative-dir>`:
 
-   Already-open fds hold direct `Chan` references; they're unaffected
-   by letter-stack changes. Only NEW lookups (`open("#h/foo")`)
-   resolve through the current stack top. A process that was reading
-   from the USB's `/home/me/notes.txt` keeps reading it even after a
-   newer USB takes the `#h` letter — only freshly-opened paths route
-   to the new top.
+    home    home/
+    distro  debian-bookworm/
+    cache   var/cache/apt/
 
-5. **No marker-character magic in filenames.** This was the prior
-   design (`#a/` prefix dirs); abandoned because `#` collides with
-   the device-letter namespace and other characters were ugly. The
-   sentinel file is explicit and declarative.
+Kernel reads the sentinel, derives each server's letter from the
+FIRST CHARACTER of `<word>` (lowercase), posts each as a separate
+file server: `#h`, `#d`, `#c` in the example… **except** that `#c`
+is the built-in console device. The sentinel parser REJECTS the
+`cache` entry with a loud kernel log line, accepts `home` (`#h`) and
+`distro` (`#d`). To use the cache mount the user picks a non-reserved
+first char: `pkgcache` → `#p`? Also reserved (proc). Try `apt-cache`
+→ `#a`. Fine.
 
-6. **hamsh bind syntax is source-first**: `bind SRC DST`. This
-   matches the underlying `SYS_BIND(src, dst, flag)` syscall (and
-   Linux's `mount source target`). Earlier rc.boot snippets used
-   the inverted Plan 9-style `bind DST SRC` — that's been corrected
-   tree-wide (commit TBD by the sentinel-discovery agent).
+Reserved letters today (per `etc/rc.boot` + `sys/src/9/port/dev.ad`):
+`c p s /`. Everything else is fair game.
+
+hamsh binds each independently (source-first):
+
+    bind '#h' /n/home
+    bind '#d' /n/distros
+    bind '#a' /var/cache/apt
+
+### Stack semantics on collision
+
+A letter is a NAME that resolves to the top of a per-letter stack of
+file servers. Mount pushes; unmount pops.
+
+- Boot with on-disk `home` server → stack `[home_disk]`,
+  `#h` resolves to home_disk.
+- Hot-plug a USB declaring `home` → stack `[home_disk, usb_home]`,
+  `#h` resolves to usb_home (top), `#hh` resolves to home_disk
+  (one below top). The user-visible home just switched to the USB.
+- Unplug the USB → stack pops to `[home_disk]`, `#h` is home_disk
+  again, `#hh` no longer exists. Home is restored.
+
+Three concurrent collisions yield `#h`, `#hh`, `#hhh` (top to bottom).
+Pop the top → all letters slide up.
+
+**Stack depth cap: 8** (`#h` through `#hhhhhhhh`). Past that, mount
+is refused with a loud kernel log line. 8 is well past any reasonable
+hot-plug scenario; the cap is a footgun limit, not a feature limit.
+
+**Already-open fds are unaffected.** They hold direct `Chan`
+references. Only NEW lookups (`open("#h/foo")`) resolve through the
+current stack top. A process reading from the USB's `/home/me/notes.txt`
+keeps reading it even after a NEWER USB takes the `#h` letter — only
+freshly-opened paths route to the new top.
+
+### Inspection: `/proc/fs`
+
+Built-in `#p` (proc) exposes a `/proc/fs/` directory. Each letter in
+use is a file: `/proc/fs/h`, `/proc/fs/d`, `/proc/fs/A`, etc. Reading
+the file dumps the stack, top → bottom, with the source partition
+identifier for each entry. Example:
+
+    $ cat /proc/fs/h
+    top (#h):  usb stick at /dev/vdb1, sentinel-word `home`, dir `home/`
+    `#hh`:     boot rootfs at /dev/vda3, sentinel-word `home`, dir `home/`
+
+This is the only way to answer "what is `#h` actually pointing at
+right now" — load-bearing for debugging.
+
+### Sentinel file format (strict)
+
+- Line format: `<word> <relpath>` (single space; trailing newline)
+- `<word>`: matches `[a-z][a-z0-9-]{0,31}` (lowercase ASCII; max 32
+  chars; first char must be a lowercase letter)
+- `<relpath>`: relative to the partition root; must NOT contain `..`;
+  must NOT start with `/`; must resolve to a directory inside the
+  partition; max 256 chars
+- Duplicate `<word>` in the same sentinel: REJECTED (whole sentinel
+  refused; log loud)
+- First-char collisions between two words on the same partition
+  (e.g. `home` + `host`): REJECTED (same reason — ambiguous letter
+  assignment within one partition is a bug to fix in the data)
+- First-char collides with built-in reserved letter (`c d p s f /`):
+  that ENTRY rejected; sibling entries still considered
+- Parse error (malformed line, missing column, unknown char):
+  reject the WHOLE sentinel, do NOT fall back to single-server mode
+  (avoids "silently degraded" mounts)
+
+### hamsh `bind` syntax — source first
+
+The wrapper matches the underlying `SYS_BIND(src, dst, flag)` syscall
+and Linux's `mount source target` order. Old `etc/rc.boot` snippets
+used the inverted Plan 9-flavored `bind DST SRC`; that's a bug, fixed
+tree-wide by the sentinel-discovery agent.
+
+hamsh's `bind` builtin warns LOUDLY if arg2 looks like a device-letter
+(`#[a-zA-Z]` or `#[a-zA-Z][a-zA-Z]+`) AND arg1 doesn't — catches
+muscle-memory inversions before they silently graft a path onto a
+device letter.
 
 ## Files involved
 
