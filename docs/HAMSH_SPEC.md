@@ -329,8 +329,9 @@ it.** `enter`/`spawn` instantiate a fresh, cheap COW copy of the *view* and
 discard it. But `apt update` writes into distrofs's *backing store*, which
 persists independently of any view. So: the view is ephemeral, the install is
 permanent. Assemble a view once, enter it a hundred times — each entry is a clean
-cheap snapshot while accumulated state lives safely in the server. (Requires a
-persistent distrofs backing — on the FS roadmap.)
+cheap snapshot while accumulated state lives safely in the server. (Persistent
+distrofs backing is shipped — RAM cache over ext4, snapshot on dirty
+clunk/remove/EOF; `ea22407`.)
 
 ---
 
