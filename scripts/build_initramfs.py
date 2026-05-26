@@ -534,7 +534,12 @@ if os.environ.get("ENABLE_NVME_IO_TEST") == "1":
 # we got at least to usb_add_hcd (root hub registration) before the
 # follow-up URB-submission milestone takes over the actual key-event
 # injection.
-if os.environ.get("ENABLE_XHCI_KO") == "1":
+# ENABLE_XHCI_KO defaults to 1 (Linux USB stack ON, hand-rolled
+# drivers/usb/{xhci,usb,hid}.ad SKIPPED at boot:01/02). User direction:
+# the hand-rolled USB stack never fully worked; the whole point of the
+# L-shim pivot is to use Linux's drivers. Set ENABLE_XHCI_KO=0 to opt
+# back into the hand-rolled path (legacy only).
+if os.environ.get("ENABLE_XHCI_KO", "1") == "1":
     FILES.append(("/etc/xhci-ko", b"1\n"))
 
 
