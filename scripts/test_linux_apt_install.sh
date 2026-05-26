@@ -99,8 +99,11 @@ HAMNIX_DEFAULT_REAL_DEBIAN=1 HAMNIX_HAMSH_RC="$RC_TMP" \
     python3 scripts/build_initramfs.py >/dev/null
 
 LOG=$(mktemp /tmp/test-linux-apt.XXXXXX.log)
+# Preserve LOG on failure so the captured QEMU output is debuggable;
+# only clean up on PASS. Re-running this test would otherwise discard
+# the only diagnostic.
 cleanup() {
-    rm -f "$LOG" "$RC_TMP"
+    rm -f "$RC_TMP"
     INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py \
         >/dev/null
 }
@@ -114,23 +117,35 @@ echo "[test_linux_apt_install] (5/5) Boot QEMU + drive dpkg/apt-get --version"
 set +e
 (
     # Wait for hamsh to source /etc/hamsh.rc + reach interactive prompt.
-    sleep 6
+    sleep 8
+
+    # PROBE 0: list the distro tree contents from inside the ns so we
+    # can tell whether the bind grafted /var/lib/distros/default at /
+    # vs. whether sys_spawn just couldn't find dpkg's blob. Tries the
+    # standalone ls path that test_linux_namespace.sh proves works
+    # (busybox applet symlinks under /var/lib/distros/default/bin).
+    # If the cpio has /var/lib/distros/default/usr/bin/dpkg present
+    # this `ls /usr/bin` should print "dpkg" + friends inside the ns.
+    printf 'echo BANNER_PROBE_LS_USRBIN_START\n'; sleep 1
+    printf 'enter linux { /bin/ls /usr/bin }\n'; sleep 3
+    printf 'echo BANNER_PROBE_LS_USRBIN_END\n'; sleep 1
 
     # dpkg --version: the smaller binary; smoke test for "any real
-    # Debian binary runs at all inside the ns".
+    # Debian binary runs at all inside the ns". 10 s for the dynamic
+    # linker to mmap ld + libc + libmd + libselinux + libpcre2-8 +
+    # apply RELA + JUMP_SLOT relocs before main() runs.
     printf 'echo BANNER_DPKG_VERSION_START\n'; sleep 1
-    printf 'enter linux { /usr/bin/dpkg --version }\n'; sleep 5
+    printf 'enter linux { /usr/bin/dpkg --version }\n'; sleep 10
     printf 'echo BANNER_DPKG_VERSION_END\n'; sleep 1
 
-    # apt-get --version: bigger binary, fatter .so closure; proves
-    # the closure is complete.
+    # apt-get --version: bigger binary, fatter .so closure.
     printf 'echo BANNER_APT_VERSION_START\n'; sleep 1
-    printf 'enter linux { /usr/bin/apt-get --version }\n'; sleep 5
+    printf 'enter linux { /usr/bin/apt-get --version }\n'; sleep 15
     printf 'echo BANNER_APT_VERSION_END\n'; sleep 1
 
     printf 'echo BANNER_DONE\n'; sleep 1
     printf 'exit\n'; sleep 1
-) | timeout 90s qemu-system-x86_64 \
+) | timeout 120s qemu-system-x86_64 \
     -kernel "$ELF" \
     -smp 2 \
     -nographic \

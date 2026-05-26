@@ -986,17 +986,39 @@ def build_archive() -> bytes:
                 "usr/share/keyrings/debian-archive-keyring.gpg",
                 "etc/apt/trusted.gpg.d/debian-archive-keyring.gpg",
             ]
-            # /bin -> usr/bin, /lib -> usr/lib, /lib64 -> usr/lib64,
-            # /sbin -> usr/sbin: real Debian uses the usrmerge layout
-            # via these four top-level symlinks. Without them,
-            # PT_INTERP=/lib64/ld-linux-x86-64.so.2 won't resolve into
-            # the staged usr/lib64/ld-linux-x86-64.so.2 file.
-            REAL_DEBIAN_SYMLINKS = [
-                ("bin", "usr/bin"),
-                ("sbin", "usr/sbin"),
-                ("lib", "usr/lib"),
-                ("lib64", "usr/lib64"),
-            ]
+            # Usrmerge expansion: Debian binaries internally reference
+            # `/lib64/ld-linux-x86-64.so.2`, `/lib/x86_64-linux-gnu/
+            # libc.so.6`, `/bin/sh`, etc. — paths under the four
+            # usrmerge symlinks (/bin /sbin /lib /lib64 -> usr/*).
+            # Hamnix's fs/vfs.ad `_lookup_name` follows whole-path
+            # symlink entries but does NOT walk symlinks that sit in
+            # the MIDDLE of a path (no path-component traversal — the
+            # cpio is a flat name table). So a directory-symlink at
+            # /var/lib/distros/default/lib64 -> usr/lib64 cannot route
+            # a lookup of /var/lib/distros/default/lib64/ld-linux-
+            # x86-64.so.2 into the staged usr/lib64 entry.
+            #
+            # Fix: when a file lands under `usr/<x>`, ALSO plant it at
+            # the corresponding non-usrmerge alias `<x>`. So
+            #   usr/lib64/ld-linux-x86-64.so.2 -> ALSO at lib64/...
+            #   usr/lib/x86_64-linux-gnu/libc.so.6 -> ALSO at lib/...
+            #   usr/bin/dpkg -> ALSO at bin/dpkg
+            # Both PT_INTERP and DT_NEEDED resolution see the file
+            # without depending on directory-component symlink walking.
+            # The duplicate cpio entries are HEADER-only overhead — the
+            # actual data bytes are emitted once (the second header
+            # points into the cpio's contiguous bytes? no — newc cpio
+            # is one header+data block per entry, so we DO duplicate
+            # the data bytes too. ~20 MB raw -> ~40 MB raw with the
+            # alias). Acceptable: still well under the GitHub push
+            # limit on fs/initramfs_blob.S, and still smaller than a
+            # full debootstrap rootfs at 214 MB.
+            USRMERGE_ALIASES = {
+                "usr/bin/":  "bin/",
+                "usr/sbin/": "sbin/",
+                "usr/lib/":  "lib/",
+                "usr/lib64/": "lib64/",
+            }
             staged_files = 0
             staged_bytes = 0
             missing: list[str] = []
@@ -1013,24 +1035,26 @@ def build_archive() -> bytes:
                 except (OSError, PermissionError):
                     missing.append(f"{rel} (unreadable)")
                     continue
-                name = "/var/lib/distros/default/" + rel
-                blob += cpio_entry(name, data, mode=0o100755
-                                   if src.stat().st_mode & 0o111
-                                   else 0o100644)
+                mode = (0o100755
+                        if src.stat().st_mode & 0o111
+                        else 0o100644)
+                # Primary: the canonical /var/lib/distros/default/<rel>
+                # path (matches the source tree layout 1:1).
+                primary_name = "/var/lib/distros/default/" + rel
+                blob += cpio_entry(primary_name, data, mode=mode)
                 staged_files += 1
                 staged_bytes += len(data)
-            # Also follow symlinks that point inside the rootfs and
-            # stage them as cpio symlink entries — most importantly the
-            # usrmerge bin/sbin/lib/lib64 -> usr/* symlinks at the
-            # distro tree root.
-            for link_name, link_target in REAL_DEBIAN_SYMLINKS:
-                link_path = ("/var/lib/distros/default/" + link_name)
-                # The target is RELATIVE to the directory containing
-                # the link (so /var/lib/distros/default/bin -> usr/bin
-                # means: same dir, into usr/bin). Real Debian uses
-                # relative symlinks here.
-                blob += cpio_symlink(link_path, link_target)
-                staged_files += 1
+                # Usrmerge alias: also plant at the non-usr equivalent
+                # so /bin/X and /lib/X paths resolve directly.
+                for prefix, alias_prefix in USRMERGE_ALIASES.items():
+                    if rel.startswith(prefix):
+                        alias_rel = alias_prefix + rel[len(prefix):]
+                        alias_name = ("/var/lib/distros/default/"
+                                      + alias_rel)
+                        blob += cpio_entry(alias_name, data, mode=mode)
+                        staged_files += 1
+                        staged_bytes += len(data)
+                        break
             print(f"  staged real Debian apt/dpkg slice: {staged_files} "
                   f"entries ({staged_bytes} bytes) under "
                   f"/var/lib/distros/default/ "
