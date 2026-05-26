@@ -515,7 +515,49 @@ serve it" — is one chunked-apt-cache fix away from `apt install
 <large-pkg>` working end-to-end against the real Debian archive; agent
 `a747ba7f` is in flight on that piece.
 
-## Wave — 2026-05-23 (late): streaming pipeline + libc6 + sshd round-trip + LANGUAGE.md audit
+## Wave — 2026-05-24..26: preemption + L-shim hardening + real-Debian-apt migration + FS-discovery
+
+This wave delivers the structural fix that unblocked everything since,
+then sweeps across the .ko shim catalog hardening it, then makes the
+biggest architectural correction since the kernel-relocation:
+hand-rolled `user/apt.ad` + `user/dpkg.ad` + `user/dpkg_deb.ad` are
+DELETED in favor of running real Debian apt/dpkg inside the linux
+namespace, and the rootfs moves out of the kernel ELF cpio onto a
+separate ext4 partition (live-USB-style layout) so distro content
+isn't capped by the FAT12 ~250 MB ceiling. The wave closes with a
+clean FS-discovery surface (named file servers via sentinel, by-id
+alias for persistent references, `/proc/fs/by-name` inspection).
+
+| Item | Description | Status |
+|------|-------------|--------|
+| **Preemption (`kernel_cond_resched`)** | NUC boot was wedging after sshd "listening on port 22" — no heartbeat, no SSH, frozen. Bisect agent identified `0f30263` (`spawn detached bootns { sshd }`) as the trigger and `drivers/net/tcp.ad`'s `tcp_accept` busy-poll as the structural root: SYSCALL entry clears `EFLAGS.IF`, the LAPIC timer can't fire mid-syscall, `jiffies` is frozen, the `while get_jiffies() < deadline` loop degenerates to `while True`, CPU pinned. Strategic fix: `kernel_cond_resched()` (sti + hlt + cli + schedule-if-ready), wired into all 5 `tcp.ad` busy-poll sites + `dns.ad` + `e1000e_traffic.ad` ARP-prime + `icmp.ad` + `udp.ad`. Also rejects the previous "no preemption like NetWare" cooperative model — *"We don't want a cooperative scheduler like freaking NetWare"* — by wiring `kernel_cond_resched` per spec. `scripts/test_hamsh_heartbeat.sh` catches future regressions. (`b08853e`, `c94eabd`) | Done |
+| **xhci re-enabled on bare metal** | The c444044 "auto-skip xHCI on bare metal" was a same-day MISDIAGNOSIS — the NUC wedge that motivated it was actually the `tcp_accept` busy-poll fixed two hours later by preemption. Reverted the skip; wired `__SCT__cond_resched` + `__const_udelay` to `kernel_cond_resched()` so any future xHCI handshake busy-spin on real silicon cooperates with preemption. (`2888b7c`) | Done |
+| **USB hc_driver / usb_hcd shim + HID class probe** | `xhci_pci_probe → usb_hcd_pci_probe → xhci_init` runs end-to-end via a force-shim override list in the L-shim loader (10 USB entry points routed to Hamnix before stock-`.ko` ksymtab lookup). `usb_hcd` is a 16 KiB kzalloc'd struct, byte-compatible with stock Linux. `hid.ko` + `usbhid.ko` load with `skipped=0`; data path still flows through the pre-existing hand-rolled `xhci_poll → hid_kbd_report → kbd_rx_push` (URB-completion-via-L-shim is a follow-up). On NUC real silicon (2026-05-25): boot to interactive shell + USB keyboard input works. (`f426aee`, `9404fa2`) | Done |
+| **sound stack — snd_hda load + init** | All 5 snd modules (`snd`, `snd_pcm`, `snd_hda_core`, `snd_hda_codec`, `snd_hda_intel`) now load with `skipped=0` and `init_module=0`. Two infrastructure fixes the sweep surfaced: `kernel/modules_dep.ad` normalizes `-` → `_` in dep tokens to match on-disk underscore filenames (matches Linux `request_module()`); `linux_abi/loader.ad` handles size-0 `.bss` sections (lockdep `__key.N` symbols) and `MAX_LINUX_MODULES` bumped 8 → 16. snd_hda_intel probe reaches 67 cross-module ksymtab calls; codec attach needs real HW. (`63e2d9e`, `92462db`, `0c99126`, `cd075dd`) | Done |
+| **NIC harvest validation** | atlantic, alx, sky2, igb, r8169 all LOAD + probe cleanly via the L-shim — no new exports needed (prior `b8b5236` / `7591e64` / `25aaca3` already closed the surface). New `docs/loading_vs_working.md` documents the matrix. igb additionally MATCHES PCI ID 8086:10c9 on QEMU's `-device igb` and runs `ndo_open` → 1 netdev opened; proves the shim is truly generic. (`9b0bb81`) | Done |
+| **Block stack post-preempt validation** | All 10 ahci + nvme tests audited; native drivers' busy-poll loops use bounded counter shapes (NOT `while get_jiffies() < deadline`), so no preemption-related fixes needed. Test assertions strengthened to match `test_snd_hda_ko.sh`. `test_nvme_io.sh` failure surfaced as the async-work probe gap (separate item). (`2669088`) | Done |
+| **nvme async-work probe gap-closing** | Closed 3 gaps in the nvme.ko probe path: `modules.dep` walker now resolves `nvme_core.ko` (was looking for `nvme-core.ko`), `_l_dev_set_name` accepts heap-allocated ctrl_device pointers (was returning -EINVAL), `async_schedule_node` sync-dispatches inline (was a no-op). Result: nvme-core loads, probe returns 0, 77+ cross-module ksymtab dispatches succeed. Full `add_disk` requires `flush_work` + `blk_mq_alloc_tag_set` integration — escalated as Option X (minimal NVMe bring-up in the L-shim, like AHCI's bridge approach) vs Option Y (full Linux blk-mq integration). (`a8dfd12`) | Done |
+| **Linux namespace `enter linux {ls /}` works end-to-end** | `chan_resolve_prefix` had a trailing-slash bug for root rebinds — `bind / /var/lib/distros/default` + open `/` produced `/var/lib/distros/default/` which `_is_initramfs_dir` rejected. Strip the redundant slash. Also added `HAMNIX_HAMSH_RC` env hook for tests that drive hamsh as `/init` without rc.boot. New `scripts/test_linux_namespace.sh` is the regression backstop. (`1765db2`) | Done |
+| **Real Debian apt/dpkg migration** | RETIRED `user/apt.ad` (3960 lines), `user/dpkg.ad` (1891 lines), `user/dpkg_deb.ad` (971 lines) + 20 driver test scripts. They were Adder reimplementations of tools that should run as real Debian binaries inside `enter linux { ... }`. New: `build_initramfs.py` stages a curated apt/dpkg closure (~30 files + their `ldd` closure) from `tests/distros/debian-minbase/rootfs/`. Solves the cpio "follow path-component symlinks" issue via usrmerge duplicate planting. `scripts/test_linux_apt_install.sh` asserts real `Debian dpkg 1.22.22 (amd64)` + `apt 3.0.3 (amd64)` actually run. (`0de1c63`, `bcc4a78`, `3ff5bfc`, `40484d4`) | Done |
+| **BSS shrink (256 MiB-guest fit)** | distrofs DATA_SLOT_CAP 512 → 64 (32 MiB → 4 MiB pool), dpkg DEB_CAP 16 MiB → 4 MiB + TAR_CAP 1 MiB → 384 KiB, apt PKG_CAP / HTTP_CAP 512 KiB → 256 KiB each. ~42 MiB per-instance BSS savings. Defensive shrink (not heap conversion) because userland has no `SYS_BRK` / `SYS_MMAP_ANON`; documented in [[feedback-compiler-quirks]]. (`32292d3`) | Done |
+| **Rootfs partition (live-USB-style layout)** | The kernel ELF embedded a ~60 MiB initramfs cpio of real Debian content; OVMF's FAT12 driver chokes reading it and FAT12 caps the ESP at ~250 MiB. New: separate ext4 partition (`scripts/build_rootfs_img.py` builds via `mkfs.ext4 -d`); `xorriso -append_partition 3 0x83` adds it to the ISO. Kernel `init/main.ad::mount_rootfs_partition()` scans block devices for ext4 magic, mounts at `/ext` (placeholder). ESP back to 32 MiB; UEFI boot < 30 s. (`f136f4b`, `a85ef44`, ...) | Done |
+| **FS-discovery: bind src-first + sentinel file-server + named stacks + by-id alias** | The hamsh `bind` wrapper had inverted Plan-9-flavored arg order (`bind /srv '#s'`); flipped to source-first (`bind '#s' /srv`) to match `SYS_BIND(src, dst)` + Linux `mount`. The `#` parser accepts both single-char built-ins (`#c`/`#p`/`#s`/`#/`) and multi-char role names (`#home`/`#distro`/`#apt-cache`). Sentinel file `.hamnix-roots` at each ext4 partition root maps `<word> <relpath>` lines; absent sentinel → anonymous `#partN`. Stack semantics on collision (depth cap 9, reject on overflow). `#by-id/<partuuid>` stable persistent reference. `/proc/fs/by-name/<word>` + `/proc/fs/by-id/<partuuid>` + `/proc/fs/anonymous` inspection. Bind-freeze: already-open Chans are immune to hot-plug yanks (partial — `#<word>` binds still walk the stack at open time; a future refactor will resolve to `#by-id` at bind time). (`4f3a74b` .. `4c8c10b`) | Done |
+| **Compiler quirks audit (LANGUAGE.md sequel)** | LANGUAGE.md re-audit found 2 new real bugs: `Ptr[T] + N` codegen is UNSCALED (production callers all use byte arithmetic via cast); `Percpu[Array]` / `Percpu[struct]` aggregates silently lose the `%gs:` per-CPU base (zero production users today; trap is latent). Both flagged with `TODO(adder)` in the doc body, captured in [[feedback-compiler-quirks]]. (`f676865`) | Done |
+
+**Headline of this wave:** Hamnix completes the structural fix
+("kernel preemption, no more cooperative wedge class"), drops months
+of hand-rolled apt/dpkg reimplementation in favor of running real
+Debian binaries inside the Linux namespace, and moves the distro
+content onto a separate ext4 partition with a clean Plan-9-shape
+file-server discovery (named stacks, by-id aliases, `/proc/fs`
+inspection). Real-hardware boot on the NUC confirmed working end-to-
+end with USB keyboard via the L-shim USB-HC bridge. Outstanding gaps
+are scope items, not architecture: NUC's network silent on real I219,
+nvme.ko needs Option X bring-up wiring, hamsh installer needs to
+actually install + boot from the installed disk, an in-init service
+supervisor (`svc status sshd` style) is desired.
+
+
 
 Closes the install-over-SSH loop end-to-end on a real multi-MiB Debian
 package. Two structural fixes — a streaming xz/dpkg/apt/tmpfs/distrofs

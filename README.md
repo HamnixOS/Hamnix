@@ -55,15 +55,18 @@ srvfds. See M16.135 + 9P V0..V4.1 in [STATUS.md](STATUS.md).
 ## What it boots into today
 
 - **Real hardware** — **Hamnix boots end-to-end on real x86_64
-  hardware in both UEFI and Legacy/BIOS modes.** Confirmed
-  2026-05-23 on an Intel NUC and an Asus i5-4210U (Haswell ULT):
-  kernel → hamsh interactive prompt → keyboard input → native
-  binaries on PATH → the linux runtime (`enter linux { /bin/sh }`,
-  busybox baked in) → `ping 127.0.0.1`. The default ISO **auto-skips
-  xHCI live init on bare metal** (CPUID 0x40000000 hypervisor-leaf
-  check) so the NUC's silicon-MMIO-stall in `_xhci_v1_bringup`
-  doesn't wedge boot; force-enable with `ENABLE_XHCI_FORCE_INIT=1`
-  if your hardware handles it. See `docs/REAL_HARDWARE.md`.
+  hardware in both UEFI and Legacy/BIOS modes.** Confirmed 2026-05-25
+  on an Intel Skull Canyon NUC (USB keyboard input working via the
+  L-shim USB-HC bridge) and 2026-05-20 on an Asus i5-4210U (Haswell
+  ULT). Boot flow: kernel → hamsh interactive prompt → keyboard input
+  → native binaries on PATH → the linux runtime (`enter linux
+  { /bin/sh }`, real Debian apt/dpkg on a separate ext4 partition) →
+  `ping 127.0.0.1`. The earlier bare-metal xHCI auto-skip was a
+  misdiagnosis (the real bug was the cooperative-scheduler wedge in
+  `tcp_accept`, fixed in `b08853e` by `kernel_cond_resched`); xHCI now
+  loads on bare metal cleanly. Outstanding NUC gap: network `send
+  failed` on real I219 silicon (works in QEMU). See
+  `docs/REAL_HARDWARE.md`.
 - **Hybrid BIOS+UEFI ISO** built by `scripts/build_iso.sh` — boots under
   SeaBIOS, OVMF UEFI, and GNOME Boxes.
 - **UEFI direct boot**: PE/COFF stub uses SFSP to load the kernel ELF
@@ -98,20 +101,29 @@ srvfds. See M16.135 + 9P V0..V4.1 in [STATUS.md](STATUS.md).
   `connect(2)`/`bind(2)`/`listen(2)`/`accept(2)` — those land in Layer 2
   and walk `/net` underneath. DNS via `sys_resolve`; HTTPS by writing
   the `tls <host>` ctl to a connected `/net` conn.
-- **Package tooling** (all native Adder, verified in QEMU): a native
-  `apt` — `apt update` / `apt show` / `apt pkgnames` / `apt install`
-  with transitive `Depends:` resolution and SHA-256 verification, over
-  **HTTP and HTTPS**; `dpkg` (`-i`/`-l`/`-s`/`-L`/`-r`) and `dpkg-deb`
-  (`-x`/`-I`/`-c`); an `httpd` static-file HTTP server.
+- **Package tooling** = **real Debian apt/dpkg running inside `enter
+  linux { ... }`**. The hand-rolled `user/apt.ad` + `user/dpkg.ad` +
+  `user/dpkg_deb.ad` Adder reimplementations were RETIRED 2026-05-26
+  (commits `0de1c63`..`3ff5bfc`) because that's the wrong architecture:
+  apt/dpkg are Debian userland; they should run as the real Debian
+  binaries inside the Linux namespace, not be re-shimmed in Adder.
+  The boot ISO now stages a curated apt/dpkg closure + busybox into a
+  separate ext4 partition (`scripts/build_rootfs_img.py`), the kernel
+  auto-discovers the partition via a `.hamnix-roots` sentinel, and
+  `etc/rc.boot`'s `linux = ns clean { bind '#distro' / ; ... }`
+  exposes it inside the linux namespace. `enter linux { /usr/bin/apt
+  install hello }` runs real Debian apt against real Debian dpkg. See
+  `docs/rootfs_partition.md` for the FS-discovery design (named
+  file-server stacks, `#by-id/<partuuid>` stable aliases,
+  `/proc/fs/by-name/<word>` inspection).
 - **Block stack**: AHCI + NVMe, MBR + GPT read+write, FAT32 read,
   EXT4 read+write, partition-aware block-device naming (`sd0p1`,
   `nvme0n1p2`).
-- **Package userland**: `dpkg-deb` (`-x`/`-I`/`-c`); a `dpkg` tool with
-  `-i` (control parse + status database + file manifest, stanza dedup),
-  the query subcommands `-l`/`-s`/`-L`, and `-r` (remove); a native
-  `apt` (`update`/`show`/`pkgnames`/`install`) with transitive
-  `Depends:` resolution + SHA-256 verification over HTTP and HTTPS;
-  an `httpd` static-file server. All verified in QEMU.
+- **Aspirational**: a Hamnix-native package manager (working name
+  `hpm`) would manage Hamnix-side state — services, kernel modules,
+  the rootfs partition layout — in init's DEFAULT namespace. It is
+  NOT a substitute for apt; apt stays in the Linux namespace for
+  Debian packages. See `docs/architecture.md` § "What runs where".
 - **Plan 9 base**: codec + spec, kernel 9P client (V4.1 — `create`
   over a real fd; connection table released on unmount + task exit),
   per-process Pgrps (heap-allocated), `/srv` / `/n` / `/proc/<pid>/ns`
