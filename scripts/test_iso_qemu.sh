@@ -70,7 +70,7 @@ cd "$PROJ_ROOT"
 source "$PROJ_ROOT/scripts/_build_lock.sh"
 
 HAMNIX_ISO="${HAMNIX_ISO:-build/hamnix.iso}"
-ISO_BOOT_TIMEOUT="${ISO_BOOT_TIMEOUT:-60}"
+ISO_BOOT_TIMEOUT="${ISO_BOOT_TIMEOUT:-30}"
 BANNER_RE="${BANNER_RE:-Hamnix kernel booting}"
 UEFI_BANNER_RE="${UEFI_BANNER_RE:-\[hamnix\] EFI entry reached}"
 UEFI_HANDOFF_RE="${UEFI_HANDOFF_RE:-\[hamnix\] post-EFI handoff complete}"

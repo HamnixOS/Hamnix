@@ -345,23 +345,22 @@ WIDE_ESP_IMG="$PATCH_TMP/efi_wide.img"
 #   Therefore the true ESP ceiling under FAT12 is ~250 MB (4084 * 64 KB).
 #   OVMF rejects FAT16/FAT32 so we can't escape that bound — see the
 #   rootfs-on-separate-partition note below.
-# WHY 128 MB (was 64): the kernel grew to ~86 MB after real Debian
-#   apt/dpkg staging landed default-on (HAMNIX_DEFAULT_REAL_DEBIAN
-#   defaults to 1 per user direction 2026-05-26). 128 MB ESP holds
-#   the current kernel ELF (~86 MB) with ~40 MB headroom.
-# ROOTFS-ON-SEPARATE-PARTITION (future): the kernel ELF embedding the
-#   whole initramfs hits the FAT12 ~250 MB ceiling fast as we add more
-#   distro content. Linux live USBs solve this by laying a tiny EFI
-#   partition (kernel only) plus a large rootfs partition (ext4 or
-#   squashfs) on the same medium; the kernel mounts the rootfs at boot.
-#   When Hamnix wants 1 GB+ of Debian inside the namespace, that's the
-#   right next move — not bigger ESPs.
-WIDE_ESP_SIZE_MB=128
+# WHY 32 MB (was 128 during the "rootfs in cpio" era): with the
+#   rootfs migrated to its own ext4 partition (docs/rootfs_partition.md)
+#   the kernel ELF no longer carries the full distro tree — it's back
+#   to ~15-20 MB. A 32 MB ESP holds the kernel + EFI stub with
+#   comfortable headroom. The 128 MB bridge bump is no longer needed.
+# ROOTFS-ON-SEPARATE-PARTITION (active): partition 3 of this ISO is
+#   the ext4 rootfs image. The kernel auto-discovers it at boot and
+#   reads `.hamnix-roots` for sentinel-declared names; userspace
+#   `bind '#distro' /n/distros` lights it up. See
+#   scripts/build_rootfs_img.py.
+WIDE_ESP_SIZE_MB=32
 WIDE_ESP_SECTORS=$(( WIDE_ESP_SIZE_MB * 1024 * 1024 / 512 ))
 dd if=/dev/zero of="$WIDE_ESP_IMG" bs=1M count="$WIDE_ESP_SIZE_MB" status=none
 # Geometry: -h 64 -s 32 -t <tracks>. Each track = 32*512 = 16 KB.
-# For 128 MB total: 128*1024*1024 / 16384 = 8192 tracks.
-mformat -i "$WIDE_ESP_IMG" -h 64 -s 32 -c 128 \
+# For 32 MB total: 32*1024*1024 / 16384 = 2048 tracks.
+mformat -i "$WIDE_ESP_IMG" -h 64 -s 32 -c 32 \
         -t $(( WIDE_ESP_SIZE_MB * 64 )) -v HAMNIX ::
 mmd -i "$WIDE_ESP_IMG" "::/EFI"
 mmd -i "$WIDE_ESP_IMG" "::/EFI/BOOT"
