@@ -919,6 +919,167 @@ def build_archive() -> bytes:
                 print(f"  embedded {n_embedded} files ({n_bytes} bytes) "
                       f"from tests/distros/{distro_root.name}/")
 
+    # HAMNIX_DEFAULT_REAL_DEBIAN=1 — stage REAL Debian apt/dpkg into the
+    # `default` distro tree. The orchestrator's V0 of "real package
+    # management" runs `enter linux { /usr/bin/apt-get install hello }`,
+    # which needs the genuine Debian apt + dpkg binaries (and their
+    # dynamic-link closure) at /var/lib/distros/default/usr/bin/apt-get
+    # etc. — the linux/debian namespaces in etc/rc.boot bind / to
+    # /var/lib/distros/default, so /usr/bin/apt-get inside an
+    # `enter linux { }` block resolves to that cpio path.
+    #
+    # Source: tests/distros/debian-minbase/rootfs/ (debootstrap'd by
+    # tests/distros/debian-minbase/BUILD.sh; gitignored). When that
+    # tree is absent the env var is a no-op + warning, exactly like
+    # u_busybox_musl: tests that need real apt skip themselves.
+    #
+    # CURATED file list (not full rootfs) — the goal is to ship
+    # `apt-get --version`, `dpkg --version`, and a fork-exec'd
+    # `apt-get install hello` end-to-end. Walking the full ~4500-file
+    # rootfs would inflate fs/initramfs_blob.S past GitHub's 100 MB
+    # push limit and burn most of fs/cpio.ad's NR_FILES (8192) on
+    # files apt/dpkg never touch. The list below is the closure of
+    # `ldd /usr/bin/{apt-get,dpkg,dpkg-deb}` plus the /etc files apt
+    # reads at startup, plus the ld.so + libc pair every dynamic
+    # binary needs.
+    real_debian_raw = os.environ.get("HAMNIX_DEFAULT_REAL_DEBIAN", "0")
+    if real_debian_raw not in ("0", "", "off", "no"):
+        minbase_rootfs = (here / "tests" / "distros" / "debian-minbase"
+                          / "rootfs")
+        if not minbase_rootfs.is_dir():
+            print(f"  WARN: HAMNIX_DEFAULT_REAL_DEBIAN={real_debian_raw}"
+                  f" but {minbase_rootfs.relative_to(here)} absent — "
+                  f"run tests/distros/debian-minbase/BUILD.sh first")
+        else:
+            # Curated closure for `apt-get install hello` end-to-end.
+            # All paths are RELATIVE to minbase_rootfs/.
+            REAL_DEBIAN_FILES = [
+                # Package managers proper.
+                "usr/bin/apt",
+                "usr/bin/apt-get",
+                "usr/bin/apt-cache",
+                "usr/bin/apt-config",
+                "usr/bin/apt-mark",
+                "usr/bin/dpkg",
+                "usr/bin/dpkg-deb",
+                "usr/bin/dpkg-query",
+                "usr/bin/dpkg-split",
+                # Dynamic linker + libc (every dynamic binary needs them).
+                "usr/lib64/ld-linux-x86-64.so.2",
+                "usr/lib/x86_64-linux-gnu/libc.so.6",
+                "usr/lib/x86_64-linux-gnu/libm.so.6",
+                "usr/lib/x86_64-linux-gnu/libpthread.so.0",
+                "usr/lib/x86_64-linux-gnu/libdl.so.2",
+                "usr/lib/x86_64-linux-gnu/libresolv.so.2",
+                "usr/lib/x86_64-linux-gnu/librt.so.1",
+                # apt's .so closure.
+                "usr/lib/x86_64-linux-gnu/libapt-pkg.so.7.0",
+                "usr/lib/x86_64-linux-gnu/libapt-pkg.so.7.0.0",
+                "usr/lib/x86_64-linux-gnu/libapt-private.so.0.0",
+                "usr/lib/x86_64-linux-gnu/libapt-private.so.0.0.0",
+                "usr/lib/x86_64-linux-gnu/libstdc++.so.6",
+                "usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.33",
+                "usr/lib/x86_64-linux-gnu/libgcc_s.so.1",
+                "usr/lib/x86_64-linux-gnu/libz.so.1",
+                "usr/lib/x86_64-linux-gnu/libz.so.1.3.1",
+                "usr/lib/x86_64-linux-gnu/libbz2.so.1.0",
+                "usr/lib/x86_64-linux-gnu/libbz2.so.1.0.4",
+                "usr/lib/x86_64-linux-gnu/liblzma.so.5",
+                "usr/lib/x86_64-linux-gnu/liblzma.so.5.8.1",
+                "usr/lib/x86_64-linux-gnu/liblz4.so.1",
+                "usr/lib/x86_64-linux-gnu/liblz4.so.1.10.0",
+                "usr/lib/x86_64-linux-gnu/libzstd.so.1",
+                "usr/lib/x86_64-linux-gnu/libzstd.so.1.5.7",
+                "usr/lib/x86_64-linux-gnu/libudev.so.1",
+                "usr/lib/x86_64-linux-gnu/libudev.so.1.7.10",
+                "usr/lib/x86_64-linux-gnu/libsystemd.so.0",
+                "usr/lib/x86_64-linux-gnu/libsystemd.so.0.40.0",
+                "usr/lib/x86_64-linux-gnu/libcrypto.so.3",
+                "usr/lib/x86_64-linux-gnu/libxxhash.so.0",
+                "usr/lib/x86_64-linux-gnu/libxxhash.so.0.8.3",
+                "usr/lib/x86_64-linux-gnu/libcap.so.2",
+                "usr/lib/x86_64-linux-gnu/libcap.so.2.75",
+                # dpkg's .so closure.
+                "usr/lib/x86_64-linux-gnu/libmd.so.0",
+                "usr/lib/x86_64-linux-gnu/libmd.so.0.1.0",
+                "usr/lib/x86_64-linux-gnu/libselinux.so.1",
+                "usr/lib/x86_64-linux-gnu/libpcre2-8.so.0",
+                "usr/lib/x86_64-linux-gnu/libpcre2-8.so.0.14.0",
+                # /etc essentials — apt reads these at startup, dpkg
+                # reads admindir status / available.
+                "etc/debian_version",
+                "etc/os-release",
+                "etc/passwd",
+                "etc/group",
+                "etc/hostname",
+                "etc/apt/sources.list",
+                "etc/apt/apt.conf",
+                # dpkg's admindir scaffolding (status starts empty;
+                # available may be absent — both files are looked up
+                # by dpkg but missing-is-OK after a fresh debootstrap).
+                "var/lib/dpkg/status",
+                "var/lib/dpkg/available",
+                "var/lib/dpkg/diversions",
+                "var/lib/dpkg/statoverride",
+                # Trusted GPG keyring (apt needs an anchor; the
+                # Debian-shipped one is the canonical source).
+                "usr/share/keyrings/debian-archive-keyring.gpg",
+                "etc/apt/trusted.gpg.d/debian-archive-keyring.gpg",
+            ]
+            # /bin -> usr/bin, /lib -> usr/lib, /lib64 -> usr/lib64,
+            # /sbin -> usr/sbin: real Debian uses the usrmerge layout
+            # via these four top-level symlinks. Without them,
+            # PT_INTERP=/lib64/ld-linux-x86-64.so.2 won't resolve into
+            # the staged usr/lib64/ld-linux-x86-64.so.2 file.
+            REAL_DEBIAN_SYMLINKS = [
+                ("bin", "usr/bin"),
+                ("sbin", "usr/sbin"),
+                ("lib", "usr/lib"),
+                ("lib64", "usr/lib64"),
+            ]
+            staged_files = 0
+            staged_bytes = 0
+            missing: list[str] = []
+            for rel in REAL_DEBIAN_FILES:
+                src = minbase_rootfs / rel
+                if not src.is_file():
+                    # Some paths (apt.conf, available, ...) are
+                    # genuinely optional in a minbase debootstrap;
+                    # skip them silently.
+                    missing.append(rel)
+                    continue
+                try:
+                    data = src.read_bytes()
+                except (OSError, PermissionError):
+                    missing.append(f"{rel} (unreadable)")
+                    continue
+                name = "/var/lib/distros/default/" + rel
+                blob += cpio_entry(name, data, mode=0o100755
+                                   if src.stat().st_mode & 0o111
+                                   else 0o100644)
+                staged_files += 1
+                staged_bytes += len(data)
+            # Also follow symlinks that point inside the rootfs and
+            # stage them as cpio symlink entries — most importantly the
+            # usrmerge bin/sbin/lib/lib64 -> usr/* symlinks at the
+            # distro tree root.
+            for link_name, link_target in REAL_DEBIAN_SYMLINKS:
+                link_path = ("/var/lib/distros/default/" + link_name)
+                # The target is RELATIVE to the directory containing
+                # the link (so /var/lib/distros/default/bin -> usr/bin
+                # means: same dir, into usr/bin). Real Debian uses
+                # relative symlinks here.
+                blob += cpio_symlink(link_path, link_target)
+                staged_files += 1
+            print(f"  staged real Debian apt/dpkg slice: {staged_files} "
+                  f"entries ({staged_bytes} bytes) under "
+                  f"/var/lib/distros/default/ "
+                  f"[HAMNIX_DEFAULT_REAL_DEBIAN={real_debian_raw}]")
+            if missing:
+                print(f"  (skipped {len(missing)} optional files: "
+                      f"{', '.join(missing[:5])}"
+                      f"{'…' if len(missing) > 5 else ''})")
+
     # Kernel modules: anything in build/mod/ gets embedded as /<stem>
     # so module_load() can fetch by path. Convention is to start the
     # binary names with "kmod_" so the cpio entries read /kmod_X.
