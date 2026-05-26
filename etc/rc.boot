@@ -157,6 +157,7 @@ linux = ns clean {
     bind /proc '#p'
     bind /srv '#s'
     bind /n '#/'
+    bind /tmp /tmp
 }
 echo 'rc.boot:STEP-3 captured linux ns; capturing debian ns'
 debian = ns clean {
@@ -166,6 +167,7 @@ debian = ns clean {
     bind /proc '#p'
     bind /srv '#s'
     bind /n '#/'
+    bind /tmp /tmp
 }
 echo 'rc.boot:STEP-4 captured debian ns'
 echo 'rc.boot: linux runtime namespace defined (enter linux { ... }, enter debian { ... })'
