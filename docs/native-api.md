@@ -346,9 +346,9 @@ libraries that want to layer their own message.
 ### Notes (Plan 9 signals)
 
 Plan 9 calls signals "notes". Each process has a per-process
-note-handler registered via `notify(handler_ptr)` (sysnumber 270,
-not in Phase C scope). Other processes post notes by writing to
-`/proc/<pid>/note`:
+note-handler registered via `notify(handler_ptr)` (sysnumber 270;
+body in `sys/src/9/port/sysnote.ad`). Other processes post notes by
+writing to `/proc/<pid>/note`:
 
 ```
 fd = open("/proc/42/note", OWRITE)
@@ -486,8 +486,8 @@ moves break Linux ABI** (Layer 2 has its own dispatch table).
 | 266 | `wstat` (shipped: name + mode honoured; length/mtime/gid/muid sentinel-only) |
 | 267 | `fwstat` (shipped: tmpfs fds only; other backends report `errstr("fwstat: backend not supported")`) |
 | 268 | `fauth` (reserved; Phase G — needed for `mount` with auth) |
-| 270 | `notify` (reserved; Phase G — note handler) |
-| 271 | `noted` (reserved; Phase G — return from note handler) |
+| 270 | `notify` (shipped — note handler in `sys/src/9/port/sysnote.ad`) |
+| 271 | `noted` (shipped — return from note handler) |
 | 272 | `awake` (reserved) |
 | 273 | `segattach` (reserved) |
 | 274 | `segdetach` (reserved) |
