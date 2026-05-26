@@ -4024,6 +4024,226 @@ def _run_prebuilt_command(node: int32, argc: int32) -> int32:
     return run_one_command_x(node, -1, -1, 1, 1)
 
 
+# --- service supervisor (§11) ---------------------------------------
+# A small init-side service supervisor. hamsh-as-PID-1 owns a fixed-
+# size table of "known services" — each entry is a name, a namespace
+# selector (init / linux / ...), an exec command line, and a restart
+# policy. The `svc` builtin (see further below) drives status / start /
+# stop / restart / reload against this table, and a periodic
+# supervisor tick (called from the idle poll loop in ed_readline)
+# reaps exited supervised children and applies the restart policy.
+#
+# WHY THIS LIVES IN HAMSH
+# -----------------------
+# /init is a 2-line shim that execs /bin/hamsh /etc/rc.boot — so
+# hamsh IS PID 1, and a "supervisor in init's default namespace" is
+# straightforwardly a hamsh module with module-scope state. A managed
+# service is just a child of PID 1, spawned WITHOUT RFNOWAIT so the
+# parent (the supervisor) can reap it. Compare `spawn detached` which
+# uses RFNOWAIT and self-reaps — that path is fire-and-forget; the
+# supervisor needs the opposite (reap-and-restart).
+#
+# CROSS-NAMESPACE START (§11)
+# ---------------------------
+# `ns: linux` in /etc/svc/<name>.hamsh dispatches via the same
+# captured-template + sys_rfork(RFPROC|RFCNAMEG) + apply_ns_template
+# path that `enter linux { … }` and `spawn linux { … }` use. The
+# template is looked up by name in the hamsh scope (set in rc.boot:
+# `linux = ns clean { … }`), so the supervisor itself doesn't need
+# to know what `linux` binds — it consumes the same captured ns
+# value as the regular `enter`/`spawn` verbs.
+
+SVC_MAX:        uint64 = 32
+SVC_NAME_MAX:   uint64 = 32
+SVC_CMD_MAX:    uint64 = 256
+SVC_NS_MAX:     uint64 = 16
+SVC_DESC_MAX:   uint64 = 96
+
+# Service states. Plain integers; svc_render_status maps to text.
+SVC_STATE_STOPPED:    int32 = 0   # never started, or stopped cleanly
+SVC_STATE_RUNNING:    int32 = 1   # child alive
+SVC_STATE_FAILED:     int32 = 2   # exited with non-zero, no auto-restart
+SVC_STATE_RESTARTING: int32 = 3   # waiting on backoff before next start
+
+# Restart policies.
+SVC_RESTART_NEVER:     int32 = 0
+SVC_RESTART_ON_FAIL:   int32 = 1
+SVC_RESTART_ALWAYS:    int32 = 2
+
+# Service table — parallel arrays in the existing hamsh idiom. Each
+# index i in [0, svc_count) is one service. svc_in_use[i] != 0 makes
+# the slot "occupied" (we don't compact on removal — a removed slot is
+# just marked free so its name can be re-registered later).
+svc_in_use:        Array[32, int32]
+svc_name:          Array[1024, uint8]      # 32 * 32 bytes, NUL-terminated
+svc_ns:            Array[512, uint8]       # 32 * 16 bytes, NUL-terminated
+svc_cmd:           Array[8192, uint8]      # 32 * 256 bytes, NUL-terminated
+svc_desc:          Array[3072, uint8]      # 32 * 96 bytes, NUL-terminated
+svc_state:         Array[32, int32]
+svc_restart_pol:   Array[32, int32]
+svc_pid:           Array[32, int32]        # 0 when not running
+svc_last_exit:     Array[32, int32]
+svc_restarts:      Array[32, int32]        # restarts in this session
+svc_backoff_ms:    Array[32, int64]        # current backoff (ms)
+svc_backoff_init:  Array[32, int64]        # configured initial
+svc_backoff_max:   Array[32, int64]        # configured ceiling
+svc_last_start_j:  Array[32, uint64]       # jiffies at last start
+svc_next_start_j:  Array[32, uint64]       # jiffies at which to start
+
+svc_count:         uint64 = 0              # high-water mark (slots seen)
+
+
+def _svc_name_at(idx: uint64) -> Ptr[uint8]:
+    return &svc_name[idx * SVC_NAME_MAX]
+
+
+def _svc_ns_at(idx: uint64) -> Ptr[uint8]:
+    return &svc_ns[idx * SVC_NS_MAX]
+
+
+def _svc_cmd_at(idx: uint64) -> Ptr[uint8]:
+    return &svc_cmd[idx * SVC_CMD_MAX]
+
+
+def _svc_desc_at(idx: uint64) -> Ptr[uint8]:
+    return &svc_desc[idx * SVC_DESC_MAX]
+
+
+def _svc_copy_in(dst: Ptr[uint8], src: Ptr[uint8], cap: uint64):
+    # NUL-terminated bounded copy. Truncates rather than overflowing.
+    i: uint64 = 0
+    while src[i] != 0 and i + 1 < cap:
+        dst[i] = src[i]
+        i = i + 1
+    dst[i] = 0
+
+
+def svc_lookup(name: Ptr[uint8]) -> int32:
+    # Return the slot index for `name`, or -1 if not registered.
+    i: uint64 = 0
+    while i < svc_count:
+        if svc_in_use[i] != 0:
+            if cstr_eq(_svc_name_at(i), name) != 0:
+                return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _svc_alloc_slot() -> int32:
+    # Find an unused slot. Returns -1 if the table is full.
+    i: uint64 = 0
+    while i < SVC_MAX:
+        if svc_in_use[i] == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def svc_register(name: Ptr[uint8], ns: Ptr[uint8], cmdline: Ptr[uint8],
+                 restart_pol: int32, backoff_ms: int64,
+                 backoff_max_ms: int64, desc: Ptr[uint8]) -> int32:
+    # Register a service (or refresh an existing entry's static fields).
+    # Returns the slot index, or -1 on overflow. Does NOT start the
+    # service — that's svc_start (Phase 3).
+    idx: int32 = svc_lookup(name)
+    if idx < 0:
+        idx = _svc_alloc_slot()
+        if idx < 0:
+            errstr_set("svc: table full")
+            return -1
+        u: uint64 = cast[uint64](idx)
+        svc_in_use[u] = 1
+        svc_state[u] = SVC_STATE_STOPPED
+        svc_pid[u] = 0
+        svc_last_exit[u] = 0
+        svc_restarts[u] = 0
+        svc_last_start_j[u] = 0
+        svc_next_start_j[u] = 0
+        if u >= svc_count:
+            svc_count = u + 1
+    u: uint64 = cast[uint64](idx)
+    _svc_copy_in(_svc_name_at(u), name, SVC_NAME_MAX)
+    _svc_copy_in(_svc_ns_at(u), ns, SVC_NS_MAX)
+    _svc_copy_in(_svc_cmd_at(u), cmdline, SVC_CMD_MAX)
+    _svc_copy_in(_svc_desc_at(u), desc, SVC_DESC_MAX)
+    svc_restart_pol[u] = restart_pol
+    svc_backoff_init[u] = backoff_ms
+    svc_backoff_max[u]  = backoff_max_ms
+    svc_backoff_ms[u]   = backoff_ms
+    return idx
+
+
+def svc_state_set(idx: int32, st: int32):
+    if idx < 0:
+        return
+    u: uint64 = cast[uint64](idx)
+    if u >= SVC_MAX:
+        return
+    svc_state[u] = st
+
+
+def _svc_state_label(st: int32) -> Ptr[uint8]:
+    if st == SVC_STATE_RUNNING:
+        return "running"
+    if st == SVC_STATE_FAILED:
+        return "failed"
+    if st == SVC_STATE_RESTARTING:
+        return "restarting"
+    return "stopped"
+
+
+def _svc_restart_label(p: int32) -> Ptr[uint8]:
+    if p == SVC_RESTART_ALWAYS:
+        return "always"
+    if p == SVC_RESTART_ON_FAIL:
+        return "on-failure"
+    return "never"
+
+
+def svc_render_one(idx: int32):
+    # Render one service's status to fd 1. Used by `svc status <name>`.
+    if idx < 0:
+        return
+    u: uint64 = cast[uint64](idx)
+    write_cstr1(_svc_name_at(u))
+    write_cstr1("  state=")
+    write_cstr1(_svc_state_label(svc_state[u]))
+    write_cstr1("  ns=")
+    write_cstr1(_svc_ns_at(u))
+    write_cstr1("  pid=")
+    write_cstr1(render_int(cast[int64](svc_pid[u])))
+    write_cstr1("  restart=")
+    write_cstr1(_svc_restart_label(svc_restart_pol[u]))
+    write_cstr1("  restarts=")
+    write_cstr1(render_int(cast[int64](svc_restarts[u])))
+    # Uptime in seconds (only meaningful when running).
+    if svc_state[u] == SVC_STATE_RUNNING and svc_last_start_j[u] != 0:
+        now: uint64 = sys_get_jiffies()
+        if now >= svc_last_start_j[u]:
+            up_j: uint64 = now - svc_last_start_j[u]
+            write_cstr1("  uptime=")
+            write_cstr1(render_int(cast[int64](up_j / 100)))
+            write_cstr1("s")
+    write_cstr1("  exec=")
+    write_cstr1(_svc_cmd_at(u))
+    if _svc_desc_at(u)[0] != 0:
+        write_cstr1("  desc=")
+        write_cstr1(_svc_desc_at(u))
+    write_cstr1("\n")
+
+
+def svc_render_status():
+    # `svc status` (no name): dump every registered service.
+    if svc_count == 0:
+        write_cstr1("svc: no services registered\n")
+        return
+    i: uint64 = 0
+    while i < svc_count:
+        if svc_in_use[i] != 0:
+            svc_render_one(cast[int32](i))
+        i = i + 1
+
+
 # --- §13 live-handle resolution -------------------------------------
 # A live handle (VT_PROC / VT_MOUNT) is valid ONLY in the namespace
 # that created it. The handle value carries its creating-namespace id
