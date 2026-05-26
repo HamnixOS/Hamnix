@@ -217,133 +217,167 @@ clarified the eventual shape:
 
 The target design (not yet implemented):
 
-1. **Each discovered ext4 partition = a Plan 9 device letter.** First
-   partition is `#A`, second is `#B`, etc. (mirroring how Plan 9 names
-   disk devices). The current single-partition path effectively uses
-   `/ext` as that letter; this generalises.
+### Bind freeze semantics (gates everything below)
 
-### Letter case convention
+**`bind '#home' /n/home` snapshots the Chan at bind time. Future
+walks through `/n/home` use the stored Chan directly; they do NOT
+re-resolve `#home` per walk.** This is plain Plan 9 chan.c behavior
+and applies whether the source is a built-in (`#c`) or sentinel-
+derived (`#home`). Consequence: a running namespace's home directory
+cannot be yanked out from under it by a USB plug-in. The stack
+machinery below is therefore **debug-introspection only** —
+visible at `/proc/fs/` but never the persistent route for a bound
+path. Only fresh `bind '#home' ...` calls (at boot, in rc.boot, or
+typed at the shell) re-consult the stack.
 
-- **Lowercase** (`#a`..`#z`): used by both **sentinel-derived** servers
-  (letter = first char of word) AND built-in kernel devices. Current
-  built-in reserved set (verified against `etc/rc.boot`): `#c` console,
-  `#p` proc, `#s` srv, `#/` mount-parent. A sentinel entry whose first
-  char collides with a reserved letter is REJECTED at parse time.
-  When new built-in devices are added, their letters join the reserved
-  set — the source of truth is `sys/src/9/port/dev.ad`.
-- **Uppercase** (`#A`..`#Z`): reserved for **anonymous** partition
-  servers (no sentinel found). Auto-assigned in mount order.
+### Allocation models (two, explicit, no case-as-marker)
 
-This split eliminates any chance of a sentinel collision with the
-built-in kernel device namespace, and gives the user a visual cue at
-a glance: `#A` is "the kernel found a partition with no name preference,"
-`#h` is "someone deliberately declared this is `home`."
+| Model | Trigger | Naming scheme | Stack behavior |
+|-------|---------|---------------|----------------|
+| **Anonymous** | partition has no `.hamnix-roots` sentinel | `#part0`, `#part1`, `#part2`, … (sequential by discovery order) | none — sequential names never collide |
+| **Named** | partition has a sentinel | `#<word>` per sentinel entry (e.g. `#home`, `#distro`, `#apt-cache`) | LIFO stack on collision between partitions; depth cap 9 |
 
-### Single-server mode (no sentinel)
+The `#` parser MUST accept both single-char built-in letters (`#c`,
+`#p`, `#s`, `#/`) and multi-char role names (`#home`, `#distro`,
+`#part0`). Disambiguation is by lookup: built-ins live in
+`sys/src/9/port/dev.ad`; named/anonymous mounts live in the
+per-name stack table.
 
-The partition's root has no `.hamnix-roots`. Kernel serves the WHOLE
-partition as one anonymous file server, assigned the next free
-uppercase letter (`#A`, `#B`, ...). hamsh binds it source-first:
+No case-as-channel-class convention. The shape of the name (single
+char vs word; built-in vs registered) does the discrimination
+without relying on case.
 
-    bind '#A' /n/mydisk
+### Sentinel file (`.hamnix-roots`)
 
-### Multi-server mode (sentinel present)
-
-Partition root carries `.hamnix-roots` listing one or more named
-servers. Each line is `<word> <relative-dir>`:
+Plain text, one entry per line, `<word> <relpath>`:
 
     home    home/
     distro  debian-bookworm/
-    cache   var/cache/apt/
+    apt-cache var/cache/apt/
 
-Kernel reads the sentinel, derives each server's letter from the
-FIRST CHARACTER of `<word>` (lowercase), posts each as a separate
-file server: `#h`, `#d`, `#c` in the example… **except** that `#c`
-is the built-in console device. The sentinel parser REJECTS the
-`cache` entry with a loud kernel log line, accepts `home` (`#h`) and
-`distro` (`#d`). To use the cache mount the user picks a non-reserved
-first char: `pkgcache` → `#p`? Also reserved (proc). Try `apt-cache`
-→ `#a`. Fine.
+Kernel parses, registers each as `#<word>` in the named stack. No
+first-char derivation; the FULL word is the device name. Three
+distinct roles → three distinct names → no shared stack between
+them. The previous design where `home` and `host` would both want
+`#h` simply cannot arise.
 
-Reserved letters today (per `etc/rc.boot` + `sys/src/9/port/dev.ad`):
-`c p s /`. Everything else is fair game.
+**Reserved words** = the built-in device-letter set today: `c`, `p`,
+`s`, `/`. A sentinel entry naming one of these is rejected at parse
+time (the entry, not the whole sentinel). Long-form built-ins added
+later (e.g. `#console` as a verbose alias) join the reserved set
+in `sys/src/9/port/dev.ad`.
 
-hamsh binds each independently (source-first):
-
-    bind '#h' /n/home
-    bind '#d' /n/distros
-    bind '#a' /var/cache/apt
-
-### Stack semantics on collision
-
-A letter is a NAME that resolves to the top of a per-letter stack of
-file servers. Mount pushes; unmount pops.
-
-- Boot with on-disk `home` server → stack `[home_disk]`,
-  `#h` resolves to home_disk.
-- Hot-plug a USB declaring `home` → stack `[home_disk, usb_home]`,
-  `#h` resolves to usb_home (top), `#hh` resolves to home_disk
-  (one below top). The user-visible home just switched to the USB.
-- Unplug the USB → stack pops to `[home_disk]`, `#h` is home_disk
-  again, `#hh` no longer exists. Home is restored.
-
-Three concurrent collisions yield `#h`, `#hh`, `#hhh` (top to bottom).
-Pop the top → all letters slide up.
-
-**Stack depth cap: 8** (`#h` through `#hhhhhhhh`). Past that, mount
-is refused with a loud kernel log line. 8 is well past any reasonable
-hot-plug scenario; the cap is a footgun limit, not a feature limit.
-
-**Already-open fds are unaffected.** They hold direct `Chan`
-references. Only NEW lookups (`open("#h/foo")`) resolve through the
-current stack top. A process reading from the USB's `/home/me/notes.txt`
-keeps reading it even after a NEWER USB takes the `#h` letter — only
-freshly-opened paths route to the new top.
-
-### Inspection: `/proc/fs`
-
-Built-in `#p` (proc) exposes a `/proc/fs/` directory. Each letter in
-use is a file: `/proc/fs/h`, `/proc/fs/d`, `/proc/fs/A`, etc. Reading
-the file dumps the stack, top → bottom, with the source partition
-identifier for each entry. Example:
-
-    $ cat /proc/fs/h
-    top (#h):  usb stick at /dev/vdb1, sentinel-word `home`, dir `home/`
-    `#hh`:     boot rootfs at /dev/vda3, sentinel-word `home`, dir `home/`
-
-This is the only way to answer "what is `#h` actually pointing at
-right now" — load-bearing for debugging.
-
-### Sentinel file format (strict)
-
-- Line format: `<word> <relpath>` (single space; trailing newline)
-- `<word>`: matches `[a-z][a-z0-9-]{0,31}` (lowercase ASCII; max 32
-  chars; first char must be a lowercase letter)
+**Sentinel format (strict):**
+- Line format: `<word>` `WS` `<relpath>` (any whitespace; trailing newline)
+- `<word>`: matches `[a-z][a-z0-9-]{0,31}` (lowercase ASCII; max 32 chars)
 - `<relpath>`: relative to the partition root; must NOT contain `..`;
   must NOT start with `/`; must resolve to a directory inside the
   partition; max 256 chars
 - Duplicate `<word>` in the same sentinel: REJECTED (whole sentinel
   refused; log loud)
-- First-char collisions between two words on the same partition
-  (e.g. `home` + `host`): REJECTED (same reason — ambiguous letter
-  assignment within one partition is a bug to fix in the data)
-- First-char collides with built-in reserved letter (`c d p s f /`):
-  that ENTRY rejected; sibling entries still considered
+- `<word>` collides with a built-in reserved word: that ENTRY rejected;
+  sibling entries still considered
 - Parse error (malformed line, missing column, unknown char):
-  reject the WHOLE sentinel, do NOT fall back to single-server mode
+  reject the WHOLE sentinel, do NOT fall back to anonymous mode
   (avoids "silently degraded" mounts)
+
+### Stack semantics — true duplicates only
+
+After full-word names, the only stack collision is two physical
+devices both shipping `home` in their sentinels. Behavior:
+
+- Boot with on-disk `home` server → stack `[home_disk]`,
+  `#home` resolves to home_disk at bind time.
+- Hot-plug USB also declaring `home` → stack `[home_disk, usb_home]`,
+  `#home` resolves to usb_home on NEXT bind. **Existing `bind '#home' ...`
+  bindings DO NOT MOVE.** Frozen at bind time, per the freeze rule above.
+- A FRESH `bind '#home' /n/usb-home` after the push picks the new top.
+- Unplug the USB → stack pops to `[home_disk]`, future fresh binds
+  pick home_disk again.
+
+**Positional names** for the deeper-than-top entries: `#home`, `#home2`,
+`#home3`, …, up to `#home9`. Suffix is the position from top (1 is
+implicit at the bare name; 2 is the second-from-top; etc.). **These
+names are LIFO and unstable** — they slide as the stack changes.
+They exist for `/proc/fs/` introspection and explicit `bind` of a
+non-top entry. They are NOT the recommended persistent reference.
+
+**Stack depth cap: 9** (top + 8 deeper). Past that: reject loudly,
+log the refusal, do NOT evict the bottom. Eviction would orphan a
+name while the underlying Chan stays alive in any already-bound
+namespace — a silent-data-corruption category footgun.
+
+### Stable instance identity — `#by-id/<partuuid>`
+
+Persistent references use a stable alias. Every discovered partition
+is also addressable as `#by-id/<GPT-partition-UUID>`, mirroring
+Linux's `/dev/disk/by-id/`. This name NEVER moves: it's bound to the
+on-disk identifier, not the discovery order or the sentinel word.
+
+Persistent recipes (e.g. an installed system's `/etc/fstab`-shape
+config, a script that always wants a specific disk) SHOULD use the
+by-id alias:
+
+    bind '#by-id/12345-abcdef' /n/mydisk
+
+Positional names (`#home`, `#part0`) are for INTERACTIVE / NEW
+mounts where the user means "whatever the current top is." Scripts
+and configs that need stability use by-id.
+
+### Inspection: `/proc/fs`
+
+Built-in `#p` (proc) exposes `/proc/fs/`. Files:
+
+- `/proc/fs/by-name/<word>` — dumps the stack for that named slot
+  (top → bottom; each line = position, partuuid, sentinel word, dir)
+- `/proc/fs/by-id/<partuuid>` — dumps the partition identity record
+  (which named slots it occupies, which position in each)
+- `/proc/fs/anonymous` — lists `#partN` → partuuid mappings
+
+Example:
+
+    $ cat /proc/fs/by-name/home
+    1 (#home):   partuuid=ABCD-EFGH  sentinel=`home`  dir=`home/`
+    2 (#home2):  partuuid=1234-5678  sentinel=`home`  dir=`home/`
+
+    $ cat /proc/fs/by-id/ABCD-EFGH
+    partition=ABCD-EFGH  device=/dev/vdb1
+    serves: home (position 1 = #home)
 
 ### hamsh `bind` syntax — source first
 
-The wrapper matches the underlying `SYS_BIND(src, dst, flag)` syscall
-and Linux's `mount source target` order. Old `etc/rc.boot` snippets
-used the inverted Plan 9-flavored `bind DST SRC`; that's a bug, fixed
-tree-wide by the sentinel-discovery agent.
+The wrapper matches the underlying `SYS_BIND(src, dst, flag)`
+syscall. **Both Linux's `mount source target` AND Plan 9's
+`bind new old` are source→target** — so there is no "Plan 9 style"
+inversion to apologise for; old `etc/rc.boot` snippets like
+`bind /srv '#s'` were just a plain bug in the hamsh wrapper that
+fed args to the syscall in the wrong order.
 
-hamsh's `bind` builtin warns LOUDLY if arg2 looks like a device-letter
-(`#[a-zA-Z]` or `#[a-zA-Z][a-zA-Z]+`) AND arg1 doesn't — catches
-muscle-memory inversions before they silently graft a path onto a
-device letter.
+hamsh's `bind` builtin warns LOUDLY if arg2 starts with `#` AND
+arg1 does NOT — catches muscle-memory inversions before they
+silently graft a path onto a device name.
+
+### Migration impact
+
+This design touches:
+- Hamsh `bind` wrapper (arg order flip + multi-char `#<word>` parser
+  + inversion warning)
+- Hamsh `#` lexer (accept multi-char names, not just single chars)
+- `sys/src/9/port/chan.ad` (named-stack table; by-id alias table;
+  bind-freeze semantics affirmation if not already present)
+- `sys/src/9/port/dev.ad` (reserved-word query)
+- `init/main.ad` (`mount_rootfs_partition()` generalises to walk
+  sentinels and register named or anonymous mounts)
+- `fs/ext4.ad` (read a small file at root by name — the sentinel)
+- `etc/rc.boot` (use `bind '#home' /n/home` etc., tree-wide flip)
+- `scripts/build_rootfs_img.py` (plant `.hamnix-roots` with
+  `distro <relpath>`)
+- `#p` (proc) (add the `/proc/fs/` subtree)
+- Every test that uses `bind` (syntax flip + name changes from
+  `/ext` placeholder to `#distro` etc.)
+
+Same blast radius as the bind-order fix; do both in one sweeping
+agent run.
 
 ## Files involved
 
