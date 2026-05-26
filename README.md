@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.svg" alt="Hamnix logo" width="240"/>
+</p>
+
 # Hamnix
 
 **A from-scratch x86_64 server OS, written in Adder — a Python-syntax
