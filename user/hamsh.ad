@@ -4244,6 +4244,277 @@ def svc_render_status():
         i = i + 1
 
 
+# --- service supervisor: argv build + start path -------------------
+# argv staging for the supervisor's own sys_spawn calls. Kept separate
+# from the shell's main argv_ptr/argv_strs arenas so a supervisor tick
+# firing mid-command doesn't trample the in-flight argv.
+SVC_SPAWN_ARGV_MAX:    uint64 = 16
+SVC_SPAWN_ARGV_BYTES:  uint64 = 1024
+svc_spawn_argv_buf:    Array[1024, uint8]
+svc_spawn_argv_ptr:    Array[16, uint64]
+svc_spawn_argv_n:      uint64 = 0
+svc_spawn_argv_cursor: uint64 = 0
+
+
+def _svc_argv_tokenize(cmd: Ptr[uint8]) -> int32:
+    # Tokenize a command line into svc_spawn_argv_buf + svc_spawn_argv_ptr.
+    # Plain whitespace split — sufficient for the typical service
+    # exec= line (`/bin/sshd`, `/usr/sbin/nginx -g 'daemon off;'` is
+    # left for a future quote-aware tokenizer; the brief's accept-set
+    # is `exec: /bin/sshd` and similar simple lines).
+    svc_spawn_argv_n = 0
+    svc_spawn_argv_cursor = 0
+    i: uint64 = 0
+    while cmd[i] != 0:
+        # Skip leading whitespace.
+        while cmd[i] != 0 and (cmd[i] == 32 or cmd[i] == 9):
+            i = i + 1
+        if cmd[i] == 0:
+            break
+        if svc_spawn_argv_n >= SVC_SPAWN_ARGV_MAX:
+            return -1
+        # Record pointer at current cursor.
+        svc_spawn_argv_ptr[svc_spawn_argv_n] = \
+            cast[uint64](&svc_spawn_argv_buf[svc_spawn_argv_cursor])
+        # Copy bytes until whitespace, with cap check.
+        while cmd[i] != 0 and cmd[i] != 32 and cmd[i] != 9:
+            if svc_spawn_argv_cursor + 1 >= SVC_SPAWN_ARGV_BYTES:
+                return -1
+            svc_spawn_argv_buf[svc_spawn_argv_cursor] = cmd[i]
+            svc_spawn_argv_cursor = svc_spawn_argv_cursor + 1
+            i = i + 1
+        # NUL-terminate this argv slot.
+        if svc_spawn_argv_cursor + 1 >= SVC_SPAWN_ARGV_BYTES:
+            return -1
+        svc_spawn_argv_buf[svc_spawn_argv_cursor] = 0
+        svc_spawn_argv_cursor = svc_spawn_argv_cursor + 1
+        svc_spawn_argv_n = svc_spawn_argv_n + 1
+    # NULL-terminate argv array.
+    if svc_spawn_argv_n >= SVC_SPAWN_ARGV_MAX:
+        return -1
+    svc_spawn_argv_ptr[svc_spawn_argv_n] = 0
+    return cast[int32](svc_spawn_argv_n)
+
+
+def _svc_spawn_into_ns(idx: int32) -> int32:
+    # Launch the service's command. Returns the child pid (>0) or -1.
+    #
+    # For ns: init  — sys_spawn directly. Child inherits PID 1's ambient
+    #                 namespace (the boot rc's bind set), which is what
+    #                 a "Hamnix-native service" wants.
+    # For ns: <other> — look up the captured ns template by name in
+    #                 hamsh's scope, then rfork(RFPROC|<base>) + apply
+    #                 template in child + sys_spawn the target binary
+    #                 from inside the child + sys_exit(child's exit).
+    #                 The child becomes a tiny wrapper whose lifetime
+    #                 mirrors the real service's; the supervisor tracks
+    #                 the wrapper as svc_pid. This is the same shape
+    #                 exec_spawn uses for `spawn linux { /bin/nginx }`.
+    u: uint64 = cast[uint64](idx)
+    ns_name: Ptr[uint8] = _svc_ns_at(u)
+    cmd: Ptr[uint8] = _svc_cmd_at(u)
+    rc: int32 = _svc_argv_tokenize(cmd)
+    if rc <= 0:
+        errstr_set("svc: empty or invalid exec line")
+        return -1
+    argv: Ptr[uint64] = cast[Ptr[uint64]](&svc_spawn_argv_ptr[0])
+    path: Ptr[char] = cast[Ptr[char]](svc_spawn_argv_ptr[0])
+    envp: Ptr[uint64] = _build_envp()
+    if cstr_eq(ns_name, "init") != 0:
+        # Plain spawn in PID 1's namespace. SPAWN_STDIO_NS so the
+        # child's /fd/0,1,2 default to the console (PID 1's view).
+        pid: int32 = sys_spawn(path, argv,
+                               SPAWN_STDIO_NS, SPAWN_STDIO_NS, envp)
+        return pid
+    # Non-init namespace: look up the captured `ns clean { … }` template
+    # by name in the hamsh scope and apply it in a fresh child.
+    nsval: int32 = eval_var_by_name(str_intern_cstr(ns_name))
+    if val_type[cast[uint64](nsval)] != VT_NS:
+        errstr_set("svc: namespace template not defined")
+        return -1
+    clean: int32 = 0
+    if val_aux[cast[uint64](nsval)] != 0:
+        clean = 1
+    base_flag: int32 = RFNAMEG
+    if clean != 0:
+        base_flag = RFCNAMEG
+    flags: int32 = RFPROC | base_flag
+    pid: int32 = sys_rfork(flags)
+    if pid == 0:
+        # Child: clean namespace shape, apply template, exec the binary
+        # via sys_spawn (which forks again then execs) and propagate the
+        # service's exit code. A failed spawn surfaces as exit 127 —
+        # the standard "command not found" code.
+        _ns_child_ensure_stdio(clean)
+        apply_ns_template(nsval)
+        cpid: int32 = sys_spawn(path, argv,
+                                SPAWN_STDIO_NS, SPAWN_STDIO_NS, envp)
+        if cpid < 0:
+            sys_exit(127)
+            return EX_NORMAL
+        code: int64 = sys_waitpid(cpid)
+        sys_exit(cast[uint64](code))
+        return EX_NORMAL
+    if pid < 0:
+        errstr_pull_kernel()
+        return -1
+    return pid
+
+
+def svc_start(idx: int32) -> int32:
+    # Public starter. Returns 0 on success, -1 on a failure that has
+    # set errstr. Idempotent: a service already running is left alone.
+    if idx < 0:
+        errstr_set("svc: bad slot")
+        return -1
+    u: uint64 = cast[uint64](idx)
+    if u >= SVC_MAX or svc_in_use[u] == 0:
+        errstr_set("svc: not registered")
+        return -1
+    if svc_state[u] == SVC_STATE_RUNNING:
+        return 0
+    pid: int32 = _svc_spawn_into_ns(idx)
+    if pid < 0:
+        svc_state[u] = SVC_STATE_FAILED
+        return -1
+    svc_pid[u] = pid
+    svc_state[u] = SVC_STATE_RUNNING
+    svc_last_start_j[u] = sys_get_jiffies()
+    svc_next_start_j[u] = 0
+    return 0
+
+
+def svc_stop(idx: int32) -> int32:
+    # Signal a managed service to terminate. We send SIGTERM (15);
+    # the supervisor reaper will see the exit on its next tick and
+    # set state STOPPED. If the policy is `always`, the user typed
+    # `svc stop` so they don't want it restarted: we additionally
+    # flip the in-table policy to NEVER for this run, mirroring
+    # systemd's `systemctl stop` (use start / restart to bring it
+    # back). A reload (re-reading the .hamsh file) reverts that.
+    if idx < 0:
+        errstr_set("svc: bad slot")
+        return -1
+    u: uint64 = cast[uint64](idx)
+    if u >= SVC_MAX or svc_in_use[u] == 0:
+        errstr_set("svc: not registered")
+        return -1
+    if svc_state[u] != SVC_STATE_RUNNING:
+        # Not running — fine, just clear restart-on-schedule.
+        svc_state[u] = SVC_STATE_STOPPED
+        svc_next_start_j[u] = 0
+        return 0
+    # Mark stop-requested by stashing policy = NEVER for this session.
+    svc_restart_pol[u] = SVC_RESTART_NEVER
+    sys_kill(svc_pid[u], 15)        # SIGTERM
+    return 0
+
+
+# Supervisor loop -- called from the interactive idle poll. Two
+# responsibilities:
+#   1. REAP exited supervised children. Calls sys_waitpid(pid, WNOHANG)
+#      on each svc_pid; -EAGAIN means still alive (cheap, doesn't
+#      block), >=0 means the child has exited and was reaped here.
+#      Updates svc_state per restart policy + svc_last_exit.
+#   2. RESTART scheduled. For each SVC_STATE_RESTARTING, fire when
+#      sys_get_jiffies() >= svc_next_start_j; apply exponential
+#      backoff up to svc_backoff_max for the NEXT restart.
+WAITPID_WNOHANG: int64 = 1
+
+
+def _svc_reap_one(idx: uint64):
+    if svc_state[idx] != SVC_STATE_RUNNING:
+        return
+    pid: int32 = svc_pid[idx]
+    if pid <= 0:
+        return
+    # Cast +1 sentinel: WNOHANG path returns -11 if still alive.
+    code: int64 = sys_waitpid_nb(pid)
+    if code == cast[int64](-11):
+        # Still running.
+        return
+    # Child has been reaped (or was never reapable). Either way mark
+    # it as exited and apply the restart policy.
+    svc_pid[idx] = 0
+    svc_last_exit[idx] = cast[int32](code)
+    # Reset backoff if the service ran cleanly for at least 60 s —
+    # the brief's heuristic for "actually working".
+    now: uint64 = sys_get_jiffies()
+    ran_long: int32 = 0
+    if svc_last_start_j[idx] != 0 and \
+            now >= svc_last_start_j[idx] + 6000:    # 60 s
+        ran_long = 1
+    failed: int32 = 0
+    if code != 0:
+        failed = 1
+    # Decide restart.
+    pol: int32 = svc_restart_pol[idx]
+    do_restart: int32 = 0
+    if pol == SVC_RESTART_ALWAYS:
+        do_restart = 1
+    elif pol == SVC_RESTART_ON_FAIL and failed != 0:
+        do_restart = 1
+    if do_restart == 0:
+        if failed != 0:
+            svc_state[idx] = SVC_STATE_FAILED
+        else:
+            svc_state[idx] = SVC_STATE_STOPPED
+        return
+    # Restart-scheduled. Apply backoff: reset to initial if the last
+    # run was long enough; else double up to ceiling.
+    if ran_long != 0:
+        svc_backoff_ms[idx] = svc_backoff_init[idx]
+    else:
+        svc_backoff_ms[idx] = svc_backoff_ms[idx] * 2
+        if svc_backoff_ms[idx] > svc_backoff_max[idx]:
+            svc_backoff_ms[idx] = svc_backoff_max[idx]
+    backoff_j: uint64 = cast[uint64](svc_backoff_ms[idx] / 10)  # ms->jiffies
+    svc_state[idx] = SVC_STATE_RESTARTING
+    svc_next_start_j[idx] = now + backoff_j
+    svc_restarts[idx] = svc_restarts[idx] + 1
+
+
+def _svc_restart_due(idx: uint64):
+    if svc_state[idx] != SVC_STATE_RESTARTING:
+        return
+    now: uint64 = sys_get_jiffies()
+    if now < svc_next_start_j[idx]:
+        return
+    # Time's up — try to start. svc_start updates state on success
+    # (RUNNING) or sets FAILED on a hard failure (e.g. unknown ns).
+    svc_start(cast[int32](idx))
+
+
+def svc_supervisor_tick():
+    # Cheap when no service has churned: O(N) over a 32-slot table,
+    # one sys_waitpid_nb per running service + one jiffies compare per
+    # restarting one. Safe to call from the interactive idle loop.
+    if svc_count == 0:
+        return
+    i: uint64 = 0
+    while i < svc_count:
+        if svc_in_use[i] != 0:
+            _svc_reap_one(i)
+            _svc_restart_due(i)
+        i = i + 1
+
+
+# Native non-blocking waitpid wrapper. SYS_WAITPID with a1 bit 0 set
+# returns -EAGAIN (-11) instead of yielding-to-others when the child
+# is still alive. See arch/x86/kernel/syscall.ad's SYS_WAITPID arm.
+extern def sys_waitpid_nb_raw(pid: int32, flags: int64) -> int64
+
+
+def sys_waitpid_nb(pid: int32) -> int64:
+    # Hamsh has only `extern def sys_waitpid(pid: int32) -> int64` (one
+    # arg) wired through the user/runtime.S shim. The flagged variant
+    # is exposed as sys_waitpid_nb_raw(pid, flags), which is the same
+    # SYS_WAITPID number with bit 0 of a1 set so the kernel returns
+    # -EAGAIN (-11) instead of yielding-to-others. This wrapper just
+    # pins the flag so callers say `sys_waitpid_nb(pid)` and forget.
+    return sys_waitpid_nb_raw(pid, WAITPID_WNOHANG)
+
+
 # --- §13 live-handle resolution -------------------------------------
 # A live handle (VT_PROC / VT_MOUNT) is valid ONLY in the namespace
 # that created it. The handle value carries its creating-namespace id
@@ -4806,6 +5077,10 @@ def ed_readline() -> int64:
         if n == 0:
             # Stdin idle — fire the heartbeat if it's due, then yield.
             _hb_check_and_emit()
+            # Service supervisor: reap any exited supervised children
+            # and fire any restart-due transitions. Non-blocking; cheap
+            # when the table is empty (zero-svc_count fast-path).
+            svc_supervisor_tick()
             sys_yield()
             continue
         c: uint8 = rb[0]

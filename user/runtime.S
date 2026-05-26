@@ -337,6 +337,25 @@ sys_waitpid:
     .size sys_waitpid, .-sys_waitpid
 
 
+    /* --- sys_waitpid_nb_raw(pid, flags) -> int64 ---------------------
+     * Flagged variant of SYS_WAITPID. Same syscall number (12); the
+     * kernel reads a1 = flags and honours bit 0 (WNOHANG) by returning
+     * -EAGAIN (-11) instead of looping in yield_to_others. Used by
+     * the init-side service supervisor to reap supervised children
+     * without blocking PID 1's interactive prompt.
+     *
+     * Arg layout per System-V x86_64: pid in %edi, flags in %rsi —
+     * already the right registers for SYSCALL's (a0,a1) ABI, no
+     * rearrangement needed. */
+    .globl sys_waitpid_nb_raw
+    .type sys_waitpid_nb_raw, @function
+sys_waitpid_nb_raw:
+    movq    $12, %rax               /* SYS_WAITPID */
+    syscall
+    ret
+    .size sys_waitpid_nb_raw, .-sys_waitpid_nb_raw
+
+
     /* --- sys_pipe(int fds[2]) -> int32 -------------------------------
      * Returns 0 on success; fds[0] = read end, fds[1] = write end. */
     .globl sys_pipe
