@@ -276,17 +276,16 @@ stays. New: `SYS_RFORK`, `SYS_BIND`, `SYS_MOUNT`, `SYS_ERRSTR`.
 Linux ABI uses `do_clone` directly; native code can start using
 `rfork`. **All L+U tests keep passing.**
 
-### Phase C.5 — Distro-shape namespaces
+### Phase C.5 — Distro-shape namespaces (shipped)
 
 A *convention* on top of Phase C's primitives — no new kernel work.
-A userland `distrorun` binary calls `rfork(RFNAMEG)` + `mount` of a
-per-distro file server at the namespace's `/` + `bind` of shared
-servers (/home, /net, /srv, /dev, /proc) back in, then `exec`. From
-inside the namespace, paths resolve to a Debian / Ubuntu / SUSE file
-server (the distro backing store). Init's namespace is unaffected
-because nothing in the new namespace binds anything to it — there
-is no "the real /" at the kernel level for either namespace to be
-a view of.
+`etc/rc.boot` defines `linux = ns clean { bind '#distro' / ; bind
+/home /home; bind '#c' /dev ; … }` (and `debian` as a duplicate-body
+alias). `enter linux { /usr/bin/apt … }` then runs real Debian
+binaries inside that namespace; the rootfs partition's file server
+(`#distro`) is what `/` resolves to. Init's namespace is unaffected
+because the linux ns is `ns clean` — a fresh empty Pgrp with only
+the binds the recipe declares.
 
 This is the architectural answer to "how do we run Linux binaries
 without polluting the OS identity." Linux compat is a namespace
@@ -296,9 +295,8 @@ privileged global FS.
 See [`docs/distro-namespaces.md`](distro-namespaces.md) for the
 full spec — including the layout comparison between init's
 namespace and a Debian-shape namespace, boundary rules, why this
-is NOT schroot (the kernel has no global /), backing store choices
-(disk-backed via debootstrap first; `debfs` 9P server later), and
-the `distrorun` entry point.
+is NOT schroot (the kernel has no global /), and backing store
+choices.
 
 ### Phase D — Stand up `rio` (Layer 3), one-window skeleton
 
@@ -341,9 +339,10 @@ tests keep passing** — orthogonal to syscall ABI.
 
 ### Test discipline
 
-Every phase must end with green `bash scripts/test_l_track.sh` and
-green `bash scripts/test_u_track.sh` (the U-track aggregator). A
-phase that breaks either reverts before merge.
+Every phase must end with green `bash scripts/test_l_track.sh` (the
+.ko regression suite) and the U-series tests under `scripts/test_u*.sh`
+(the individual ELF tests; no single aggregator script). A phase that
+breaks either reverts before merge.
 
 ## File/directory retention vs re-homing
 
