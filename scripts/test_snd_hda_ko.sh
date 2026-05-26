@@ -195,6 +195,82 @@ else
     fail=1
 fi
 
+# Tier 3 — assert every snd-stack .ko got loaded by name (post the
+# dep-walker hyphen-normalization fix, modules.dep's `snd-pcm /
+# snd-hda-core / snd-hda-codec` entries resolve to the on-disk
+# snd_pcm.ko / snd_hda_core.ko / snd_hda_codec.ko, so the full
+# chain runs through the L-shim rather than getting silently
+# treated as "shim-satisfied no .ko").
+for mod_name in snd snd_pcm snd_hda_core snd_hda_codec snd_hda_intel; do
+    if grep -aE -q "^\[[0-9]+\] kmod_linux: name=${mod_name}\$" "$LOG"; then
+        echo "[test_snd_hda_ko] OK: kmod_linux loaded ${mod_name}.ko"
+    else
+        echo "[test_snd_hda_ko] FAIL: kmod_linux never saw ${mod_name}.ko"
+        echo "[test_snd_hda_ko] --- modules the loader saw ---"
+        grep -aE "kmod_linux: name=" "$LOG" | head -20 || true
+        fail=1
+    fi
+done
+
+# Tier 3 — assert init_module succeeded (returned 0) for every
+# module that exposes one. snd_hda_codec.ko has no init_module
+# (it's a library), so it doesn't get a "init returned" line —
+# pre-filter the names we expect a real init for.
+for mod_name in snd snd_pcm snd_hda_core snd_hda_intel; do
+    # The init-trace lines aren't tagged with the module name, but
+    # the loader emits "name=X" / ... / "init returned N; slot=M"
+    # in order. Pull the section between the name= line and the
+    # next name= line, and assert the init returned 0 within it.
+    if awk -v name="$mod_name" '
+        $0 ~ "kmod_linux: name="name"$"      {hit=1; next}
+        hit && / kmod_linux: name=/          {exit}
+        hit && / init returned 0;/           {print "OK"; exit}
+        hit && / init returned [^0]/         {print "BAD"; exit}
+    ' "$LOG" | grep -qE 'OK'; then
+        echo "[test_snd_hda_ko] OK: ${mod_name}.ko init_module returned 0"
+    else
+        echo "[test_snd_hda_ko] FAIL: ${mod_name}.ko init_module did not return 0"
+        awk -v name="$mod_name" '
+            $0 ~ "kmod_linux: name="name"$"  {hit=1}
+            hit && / kmod_linux: name=/ && !($0 ~ "name="name"$") {exit}
+            hit                              {print}
+        ' "$LOG" | tail -30
+        fail=1
+    fi
+done
+
+# Tier 3 — assert snd_hda_intel.ko probe reached a recognizable
+# milestone. With QEMU's -device intel-hda + -device hda-output,
+# the controller probe runs through azx_bus_init -> azx_probe_codecs
+# and the cross-module ksymtab fan-out resolves snd_hda_codec ->
+# snd_hda_core. The [ksymtab_hit] events from snd_hda_intel are
+# the probe-reached milestone: at least one cross-module call from
+# snd_hda_intel into a real loaded snd_*.ko proves the probe path
+# is exercising the wired-up bus topology, not just a no-op stub.
+if grep -aE -q "\[ksymtab_hit\] snd_hda_intel -> snd" "$LOG"; then
+    n_hits=$(grep -acE "\[ksymtab_hit\] snd_hda_intel -> snd" "$LOG" || true)
+    echo "[test_snd_hda_ko] OK: snd_hda_intel probe reached cross-module calls (${n_hits} ksymtab hits into snd*)"
+else
+    echo "[test_snd_hda_ko] FAIL: snd_hda_intel never called into snd*/snd_pcm*/snd_hda_*"
+    echo "[test_snd_hda_ko] --- ksymtab hits seen ---"
+    grep -aE "\[ksymtab_hit\]" "$LOG" | head -20 || true
+    fail=1
+fi
+
+# Tier 3 — no #UD / #GP traps in the boot log. The loader-side
+# preemption work landed across early-2026 boot:35.X, and the snd
+# stack post-preempt cycle is exactly what this milestone signs
+# off. A trap during snd init means the L-shim disabled IRQs the
+# wrong way or a stub returned an unexpected shape.
+n_traps=$(grep -acE "TRAP: vector|#UD|#GP fault|Page Fault|kernel panic" "$LOG" || true)
+if [ "${n_traps:-0}" -eq 0 ]; then
+    echo "[test_snd_hda_ko] OK: no traps in boot log"
+else
+    echo "[test_snd_hda_ko] FAIL: ${n_traps} trap line(s) in boot log"
+    grep -aE "TRAP: vector|#UD|#GP fault|Page Fault|kernel panic" "$LOG" | head -10
+    fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "[test_snd_hda_ko] FAIL (qemu rc=$rc)"
     echo "[test_snd_hda_ko] --- full log tail ---"
@@ -202,4 +278,4 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
-echo "[test_snd_hda_ko] PASS (snd_hda_intel.ko + deps loaded via L-shim)"
+echo "[test_snd_hda_ko] PASS (all 5 snd .ko's loaded; init_module=0; probe reached cross-module calls)"
