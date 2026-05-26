@@ -30,7 +30,7 @@
 
 from kernel.block.blk import (
     blk_read_sectors, blk_write_sectors, blk_flush, find_blockdev,
-    SECTOR_SIZE,
+    blk_capacity_sectors, SECTOR_SIZE,
 )
 from kernel.printk.printk import printk0, printk1, printk2
 from drivers.rtc.cmos import rtc_read_unix_time
@@ -3065,3 +3065,274 @@ def _ext4_mkfs_self_test_maybe():
         return
     ext4_mkfs_self_test_done = 1
     ext4_mkfs_self_test()
+
+
+# --- ext4 offline resize-to-fit-disk (M16.x) ----------------------
+#
+# First-boot grow path: when an installed disk is larger than the
+# source rootfs.img, extend the ext4 filesystem to fill the partition
+# without depending on the Linux namespace's resize2fs. The kernel
+# does the bookkeeping itself; no userland 9P resize daemon.
+#
+# Scope (first cut, must work):
+#   * Offline only. The kernel calls resize before any /ext mount
+#     opens the FS for write.
+#   * Extends block count; adds block-bitmap + inode-bitmap + inode-
+#     table + GDT entry for every new block group.
+#   * Honours `resize_inode` (s_reserved_gdt_blocks > 0). When the
+#     extra GDT entries fit in the existing primary GDT + reserved
+#     GDT blocks, the grow is feasible. Otherwise -ENOSPC and the FS
+#     is left untouched.
+#   * Updates the primary superblock + GDT, AND backup copies at
+#     sparse-super groups (powers of 3, 5, 7 + group 0/1).
+#   * One group per stride (no flex_bg packing). The flex_bg feature
+#     bit is a HINT, not a constraint — ext4 mounts non-flex layouts
+#     fine even when the bit is set; per-group bitmaps just don't
+#     get packed into a flex pool.
+#
+# Out of scope:
+#   * Online resize (would need block-layer + journal coordination).
+#   * metadata_csum / gdt_csum checksum recompute. scripts/build_rootfs_img.py
+#     builds the rootfs with -O ^metadata_csum, so checksums are
+#     disabled and not maintained — we refuse the grow if they're on.
+#   * 64bit blocks_count > 2^32. Refused; current installer disks are
+#     all way under 4 TiB.
+#   * Journal (rootfs is mkfs -O ^has_journal).
+#   * Shrink (data migration).
+#   * Inline data feature.
+#
+# Errno mapping:
+EXT4_RESIZE_OK:      int32 = 0
+EXT4_RESIZE_EINVAL:  int32 = -22
+EXT4_RESIZE_EIO:     int32 = -5
+EXT4_RESIZE_ENOSPC:  int32 = -28
+
+# Slack threshold for "is grow worth doing?" — 4 MiB matches the
+# threshold the _first_boot_grow_check stub already prints, and is
+# larger than one block group's metadata overhead so we never grow
+# when the new space wouldn't even fit a usable group.
+EXT4_RESIZE_MIN_SLACK_BYTES: uint64 = 4194304
+
+# Superblock field offsets used by the resize path. Mirror the
+# top-of-file constants but kept local so the resize section is
+# self-contained.
+EXT4_SB_OFF_INODES_COUNT:      uint64 = 0x00
+EXT4_SB_OFF_BLOCKS_COUNT_LO:   uint64 = 0x04
+EXT4_SB_OFF_R_BLOCKS_LO:       uint64 = 0x08
+EXT4_SB_OFF_FREE_BLOCKS_LO:    uint64 = 0x0C
+EXT4_SB_OFF_FREE_INODES:       uint64 = 0x10
+EXT4_SB_OFF_FIRST_DATA_BLOCK:  uint64 = 0x14
+EXT4_SB_OFF_LOG_BLOCK_SIZE:    uint64 = 0x18
+EXT4_SB_OFF_BLOCKS_PER_GROUP:  uint64 = 0x20
+EXT4_SB_OFF_INODES_PER_GROUP:  uint64 = 0x28
+EXT4_SB_OFF_MAGIC:             uint64 = 0x38
+EXT4_SB_OFF_BLOCK_GROUP_NR:    uint64 = 0x3A
+EXT4_SB_OFF_FIRST_INO:         uint64 = 0x54
+EXT4_SB_OFF_INODE_SIZE:        uint64 = 0x58
+EXT4_SB_OFF_FEATURE_COMPAT:    uint64 = 0x5C
+EXT4_SB_OFF_FEATURE_INCOMPAT:  uint64 = 0x60
+EXT4_SB_OFF_FEATURE_RO_COMPAT: uint64 = 0x64
+EXT4_SB_OFF_RESERVED_GDT_BLKS: uint64 = 0xCE
+EXT4_SB_OFF_DESC_SIZE:         uint64 = 0xFE
+EXT4_SB_OFF_BLOCKS_COUNT_HI:   uint64 = 0x150
+EXT4_SB_OFF_FREE_BLOCKS_HI:    uint64 = 0x158
+
+# Feature flag bits the resize cares about.
+EXT4_FEATURE_COMPAT_HAS_JOURNAL: uint32 = 0x4
+EXT4_FEATURE_COMPAT_RESIZE_INODE: uint32 = 0x10
+EXT4_FEATURE_INCOMPAT_FILETYPE:   uint32 = 0x2
+EXT4_FEATURE_INCOMPAT_EXTENTS:    uint32 = 0x40
+EXT4_FEATURE_INCOMPAT_64BIT:      uint32 = 0x80
+EXT4_FEATURE_INCOMPAT_META_BG:    uint32 = 0x10
+EXT4_FEATURE_INCOMPAT_FLEX_BG:    uint32 = 0x200
+EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER: uint32 = 0x1
+EXT4_FEATURE_RO_COMPAT_GDT_CSUM:     uint32 = 0x10
+EXT4_FEATURE_RO_COMPAT_METADATA_CSUM: uint32 = 0x400
+
+
+# Scratch buffer for reading the 1024-byte superblock from disk
+# directly, independent of the global ext4_sb_buf which is owned by
+# ext4_init. Sized to one block (4 KiB) so a single _ext4_read_block
+# call covers it for both 1 KiB and 4 KiB block sizes.
+ext4_resize_sb_buf: Array[4096, uint8]
+
+# Scratch buffer for writing a single FS block during the grow. Big
+# enough for 4 KiB blocks; the inode-table-zeroing loop reuses it.
+ext4_resize_blk_buf: Array[4096, uint8]
+
+
+def _ext4_resize_log_features(compat: uint32, incompat: uint32,
+                              ro_compat: uint32):
+    # Dump the feature triple so a refused grow's log shows exactly
+    # which feature blocked it. Loud per the brief — printk1 each.
+    printk1("[ext4_resize] feature_compat    = 0x%x\n",
+            cast[uint64](compat))
+    printk1("[ext4_resize] feature_incompat  = 0x%x\n",
+            cast[uint64](incompat))
+    printk1("[ext4_resize] feature_ro_compat = 0x%x\n",
+            cast[uint64](ro_compat))
+
+
+def _ext4_resize_read_sb(slot: int32) -> int32:
+    # Read sectors 2..3 (the 1024-byte superblock) into the resize
+    # scratch buffer at offset 0. Caller indexes into the buffer with
+    # the SB field offsets — there's no boot-area pad in this buffer.
+    rc: int32 = blk_read_sectors(slot, 2, 2,
+                                 &ext4_resize_sb_buf[0])
+    if rc != 0:
+        printk1("[ext4_resize] sb read FAIL slot=%d\n",
+                cast[uint64](slot))
+        return EXT4_RESIZE_EIO
+    return 0
+
+
+def _ext4_resize_sb_u32(buf: Ptr[uint8], off: uint64) -> uint32:
+    return _ext4_read_u32(cast[Ptr[uint8]](cast[uint64](buf) + off))
+
+
+def _ext4_resize_sb_u16(buf: Ptr[uint8], off: uint64) -> uint16:
+    return _ext4_read_u16(cast[Ptr[uint8]](cast[uint64](buf) + off))
+
+
+def ext4_resize_check(slot: int32,
+                      partition_size_bytes: uint64) -> int32:
+    # Read the ext4 superblock at `slot`, compare its recorded
+    # block-count to `partition_size_bytes`, and decide whether grow
+    # is needed AND feasible.
+    #
+    # Returns:
+    #   0  no grow needed (slack < EXT4_RESIZE_MIN_SLACK_BYTES)
+    #   1  grow needed AND feasible
+    #   -EINVAL  grow needed but FS has features the simple extend
+    #            can't safely handle (journal, metadata_csum,
+    #            gdt_csum, meta_bg, blocks_count > 4 GiB / 64bit
+    #            overflow)
+    #   -ENOSPC  grow needed but the new groups' GDT entries won't
+    #            fit in primary GDT + reserved_gdt_blocks
+    #   -EIO     superblock read failed
+    if slot < 0:
+        return EXT4_RESIZE_EINVAL
+    if _ext4_resize_read_sb(slot) != 0:
+        return EXT4_RESIZE_EIO
+
+    sb: Ptr[uint8] = &ext4_resize_sb_buf[0]
+    magic: uint16 = _ext4_resize_sb_u16(sb, EXT4_SB_OFF_MAGIC)
+    if magic != EXT4_MAGIC:
+        printk1("[ext4_resize] slot=%d not ext4 (magic=0x%x)\n",
+                cast[uint64](slot))
+        return EXT4_RESIZE_EINVAL
+
+    log_bs: uint32 = _ext4_resize_sb_u32(sb,
+                                         EXT4_SB_OFF_LOG_BLOCK_SIZE)
+    blk_sz: uint64 = cast[uint64](1024) << cast[uint64](log_bs)
+    bc_lo: uint32 = _ext4_resize_sb_u32(sb,
+                                        EXT4_SB_OFF_BLOCKS_COUNT_LO)
+    bc_hi: uint32 = _ext4_resize_sb_u32(sb,
+                                        EXT4_SB_OFF_BLOCKS_COUNT_HI)
+    cur_blocks: uint64 = cast[uint64](bc_lo) \
+                         | (cast[uint64](bc_hi) << 32)
+    cur_bytes: uint64 = cur_blocks * blk_sz
+    bpg: uint32 = _ext4_resize_sb_u32(sb,
+                                      EXT4_SB_OFF_BLOCKS_PER_GROUP)
+    ipg: uint32 = _ext4_resize_sb_u32(sb,
+                                      EXT4_SB_OFF_INODES_PER_GROUP)
+    isize: uint16 = _ext4_resize_sb_u16(sb, EXT4_SB_OFF_INODE_SIZE)
+    desc_sz: uint16 = _ext4_resize_sb_u16(sb, EXT4_SB_OFF_DESC_SIZE)
+    if desc_sz == 0:
+        desc_sz = 32
+    rgdt: uint16 = _ext4_resize_sb_u16(sb,
+                                       EXT4_SB_OFF_RESERVED_GDT_BLKS)
+    compat: uint32 = _ext4_resize_sb_u32(sb,
+                                         EXT4_SB_OFF_FEATURE_COMPAT)
+    incompat: uint32 = _ext4_resize_sb_u32(sb,
+                                           EXT4_SB_OFF_FEATURE_INCOMPAT)
+    ro_compat: uint32 = _ext4_resize_sb_u32(sb,
+                                            EXT4_SB_OFF_FEATURE_RO_COMPAT)
+
+    printk2("[ext4_resize] slot=%d block_size=%d\n",
+            cast[uint64](slot), blk_sz)
+    printk2("[ext4_resize]   current blocks=%d (%d bytes)\n",
+            cur_blocks, cur_bytes)
+    printk2("[ext4_resize]   partition bytes=%d  blocks_per_group=%d\n",
+            partition_size_bytes, cast[uint64](bpg))
+    printk2("[ext4_resize]   inodes_per_group=%d  inode_size=%d\n",
+            cast[uint64](ipg), cast[uint64](isize))
+    printk2("[ext4_resize]   desc_size=%d  reserved_gdt_blocks=%d\n",
+            cast[uint64](desc_sz), cast[uint64](rgdt))
+    _ext4_resize_log_features(compat, incompat, ro_compat)
+
+    # Slack check first — bail before refusing on features the user
+    # doesn't actually need to bypass.
+    if partition_size_bytes <= cur_bytes:
+        printk0("[ext4_resize] partition <= fs; no grow\n")
+        return 0
+    slack: uint64 = partition_size_bytes - cur_bytes
+    if slack < EXT4_RESIZE_MIN_SLACK_BYTES:
+        printk1("[ext4_resize] slack %d < 4 MiB; no grow\n", slack)
+        return 0
+
+    # Refuse on features the simple offline extend doesn't handle.
+    if (compat & EXT4_FEATURE_COMPAT_HAS_JOURNAL) != 0:
+        printk0("[ext4_resize] refuse: HAS_JOURNAL set (journal replay needed)\n")
+        return EXT4_RESIZE_EINVAL
+    if (ro_compat & EXT4_FEATURE_RO_COMPAT_METADATA_CSUM) != 0:
+        printk0("[ext4_resize] refuse: METADATA_CSUM set (no checksum support)\n")
+        return EXT4_RESIZE_EINVAL
+    if (ro_compat & EXT4_FEATURE_RO_COMPAT_GDT_CSUM) != 0:
+        printk0("[ext4_resize] refuse: GDT_CSUM set (no checksum support)\n")
+        return EXT4_RESIZE_EINVAL
+    if (incompat & EXT4_FEATURE_INCOMPAT_META_BG) != 0:
+        printk0("[ext4_resize] refuse: META_BG set (alt GDT layout unsupported)\n")
+        return EXT4_RESIZE_EINVAL
+    if (incompat & EXT4_FEATURE_INCOMPAT_EXTENTS) == 0:
+        printk0("[ext4_resize] refuse: EXTENTS not set (non-ext4 layout)\n")
+        return EXT4_RESIZE_EINVAL
+
+    # Compute target geometry. New blocks_count is floor(partition_bytes
+    # / block_size); group count is ceil(new_blocks / bpg). We round
+    # DOWN to a whole-blocks count so partial-block tails aren't
+    # claimed. The last group may be partial — that's fine, ext4
+    # marks the unused bitmap bits as in-use.
+    new_blocks: uint64 = partition_size_bytes / blk_sz
+    if new_blocks <= cur_blocks:
+        printk0("[ext4_resize] post-round new_blocks <= cur; no grow\n")
+        return 0
+    # 64bit overflow guard — refuse a >4 GiB jump when the FS doesn't
+    # already have the 64bit feature, since bc_hi is 0 today.
+    if new_blocks > 0xFFFFFFFF \
+       and (incompat & EXT4_FEATURE_INCOMPAT_64BIT) == 0:
+        printk0("[ext4_resize] refuse: new blocks_count > 32 bits, 64bit feat off\n")
+        return EXT4_RESIZE_EINVAL
+
+    old_groups: uint64 = (cur_blocks + cast[uint64](bpg) - 1) \
+                         / cast[uint64](bpg)
+    new_groups: uint64 = (new_blocks + cast[uint64](bpg) - 1) \
+                         / cast[uint64](bpg)
+    add_groups: uint64 = new_groups - old_groups
+    printk2("[ext4_resize]   target blocks=%d  groups: %d ->",
+            new_blocks, old_groups)
+    printk1(" %d\n", new_groups)
+    printk1("[ext4_resize]   adding %d block group(s)\n", add_groups)
+
+    # The GDT lives in blocks starting at first_data_block + 1. Its
+    # capacity is (1 + reserved_gdt_blocks) * (block_size / desc_size).
+    # If our new total group count exceeds that, refuse — we'd need
+    # the resize_inode dance (relocate primary GDT into inode #7's
+    # data blocks), which is out of scope for the first cut.
+    primary_gdt_blocks: uint64 = \
+        (old_groups * cast[uint64](desc_sz) + blk_sz - 1) / blk_sz
+    gdt_capacity_entries: uint64 = \
+        (primary_gdt_blocks + cast[uint64](rgdt)) \
+        * (blk_sz / cast[uint64](desc_sz))
+    printk2("[ext4_resize]   primary_gdt_blocks=%d capacity_entries=%d\n",
+            primary_gdt_blocks, gdt_capacity_entries)
+    if new_groups > gdt_capacity_entries:
+        printk2("[ext4_resize] refuse ENOSPC: new_groups=%d > gdt_cap=%d\n",
+                new_groups, gdt_capacity_entries)
+        printk0("[ext4_resize]   bump s_reserved_gdt_blocks at mkfs time or\n")
+        printk0("[ext4_resize]   implement resize_inode (inode #7 relocation).\n")
+        return EXT4_RESIZE_ENOSPC
+
+    printk1("[ext4_resize] OK: grow %d byte(s) feasible\n",
+            partition_size_bytes - cur_bytes)
+    return 1
