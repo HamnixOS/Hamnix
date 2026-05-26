@@ -9,11 +9,12 @@ systems language with a hand-written x86_64 compiler (no LLVM).**
 Hamnix is the OS; Adder is the language and compiler used to write it.
 Boots on BIOS + UEFI; reaches a real userspace shell.
 
-**As of M16.156, Hamnix boots on real hardware** — an Asus i5-4210U
-(Haswell ULT) laptop reaches the `hamsh` shell in Legacy/BIOS mode.
-Earlier the project only ran under QEMU/KVM + OVMF. See the "Known
-blockers" section for what is *not* yet confirmed on metal (the
-built-in keyboard, UEFI real-hardware boot).
+**Hamnix boots end-to-end on the Intel Skull Canyon NUC** as of
+2026-05-25: USB keyboard input works (via the L-shim USB-HC bridge)
+and the system reaches an interactive `hamsh` prompt. The Asus
+i5-4210U laptop currently crashes during boot and is NOT a primary
+bring-up target right now — preserved for regression observation
+only. See `docs/REAL_HARDWARE.md` and the "Known blockers" section.
 
 The novel claim is the **layered architecture**: native Plan 9-shape
 syscalls underneath, with a Linux ABI shim sitting on top so unmodified
@@ -54,18 +55,19 @@ srvfds. See M16.135 + 9P V0..V4.1 in [STATUS.md](STATUS.md).
 
 ## What it boots into today
 
-- **Real hardware** — **Hamnix boots end-to-end on real x86_64
-  hardware in both UEFI and Legacy/BIOS modes.** Confirmed 2026-05-25
-  on an Intel Skull Canyon NUC (USB keyboard input working via the
-  L-shim USB-HC bridge) and 2026-05-20 on an Asus i5-4210U (Haswell
-  ULT). Boot flow: kernel → hamsh interactive prompt → keyboard input
-  → native binaries on PATH → the linux runtime (`enter linux
-  { /bin/sh }`, real Debian apt/dpkg on a separate ext4 partition) →
-  `ping 127.0.0.1`. The earlier bare-metal xHCI auto-skip was a
-  misdiagnosis (the real bug was the cooperative-scheduler wedge in
-  `tcp_accept`, fixed in `b08853e` by `kernel_cond_resched`); xHCI now
-  loads on bare metal cleanly. Outstanding NUC gap: network `send
-  failed` on real I219 silicon (works in QEMU). See
+- **Real hardware** — **Hamnix boots end-to-end on the Intel Skull
+  Canyon NUC** (primary bring-up target). Confirmed 2026-05-25:
+  kernel → hamsh interactive prompt → USB keyboard input working via
+  the L-shim USB-HC bridge → native binaries on PATH → the linux
+  runtime (`enter linux { /bin/sh }`, real Debian apt/dpkg on a
+  separate ext4 partition) → `ping 127.0.0.1`. The earlier bare-
+  metal xHCI auto-skip was a misdiagnosis (the real bug was the
+  cooperative-scheduler wedge in `tcp_accept`, fixed in `b08853e` by
+  `kernel_cond_resched`); xHCI now loads on bare metal cleanly.
+  Outstanding NUC gap: network `send failed` on real I219 silicon
+  (works in QEMU). **The Asus i5-4210U laptop currently crashes**
+  during boot and is NOT a primary bring-up target — keep it around
+  for regression observation but don't optimise for it. See
   `docs/REAL_HARDWARE.md`.
 - **Hybrid BIOS+UEFI ISO** built by `scripts/build_iso.sh` — boots under
   SeaBIOS, OVMF UEFI, and GNOME Boxes.
