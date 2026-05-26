@@ -26,7 +26,7 @@ from kernel.block.blk import (
     BlockDeviceOps, register_blockdev, SECTOR_SIZE,
 )
 from drivers.pci.pci import (
-    pci_find, pci_bdf_bus, pci_bdf_dev, pci_bdf_fn,
+    pci_find, pci_find_from, pci_bdf_bus, pci_bdf_dev, pci_bdf_fn,
     pci_read_bar, pci_enable_io_and_master, PCI_BDF_NONE,
     pci_config_read_byte,
 )
@@ -70,8 +70,14 @@ VBLK_IRQ_VECTOR: uint32 = 0x43
 VBLK_LAPIC_ID:   uint32 = 0
 
 
-# Per-device state. Single instance for now; we don't have a way
-# to enumerate multiple virtio-blk PCI devices yet.
+# Per-device state. We support up to VBLK_MAX disks so the installer
+# can use a second disk: the first virtio-blk on the bus registers as
+# "vda", the second as "vdb", and so on. The block layer's per-slot
+# `priv` cookie is the index into this array; that lets the shared
+# read/write functions reach the right device without a global.
+VBLK_MAX: uint64 = 4
+
+
 class VirtioBlk:
     iobase:    uint32       # PCI BAR0 IO base (BAR low bit cleared)
     qsize:     uint32
@@ -81,7 +87,7 @@ class VirtioBlk:
     irq_count: uint64       # IRQs serviced by virtio_blk_irq_handler
 
 
-# Single in-flight request scratch:
+# Per-device in-flight request scratch:
 #   outhdr (16 bytes) | status (1 byte; padded to 8 for alignment).
 # The DATA buffer is the caller-supplied page-aligned target. The
 # header + status are global so the request doesn't malloc; size
@@ -94,48 +100,57 @@ class VirtioBlkReq:
     pad:            Array[7, uint8]   # 17..24
 
 
-vblk_state: VirtioBlk
-vblk_req:   VirtioBlkReq
-vblk_ops:   BlockDeviceOps
-# Buffer descriptors live in .bss so we don't re-init per request.
-vblk_bufs:  Array[3, VirtBuf]
+vblk_states: Array[4, VirtioBlk]
+vblk_reqs:   Array[4, VirtioBlkReq]
+vblk_ops:    BlockDeviceOps
+# Per-device buffer descriptors live in .bss so we don't re-init
+# per request. Three descriptors per disk (outhdr, data, status).
+vblk_bufs:   Array[12, VirtBuf]
+vblk_count:  uint64 = 0
 
 
 def virtio_blk_read_sectors(priv: uint64, lba: uint64,
                             count: uint64, buf: Ptr[uint8]) -> int32:
     # Build a single 3-descriptor request: outhdr (RO), data (WO),
-    # status (WO). priv unused — we route through the global
-    # vblk_state since there's only one device for now.
+    # status (WO). `priv` indexes into vblk_states; the block layer
+    # passes back whatever cookie we handed to register_blockdev.
     if count == 0:
         return 0
-    vblk_req.outhdr_type   = VIRTIO_BLK_T_IN
-    vblk_req.outhdr_ioprio = 0
-    vblk_req.outhdr_sector = lba
-    vblk_req.status        = 0xFF
+    if priv >= VBLK_MAX:
+        return -1
+    buf_base: uint64 = priv * 3
+    vblk_reqs[priv].outhdr_type   = VIRTIO_BLK_T_IN
+    vblk_reqs[priv].outhdr_ioprio = 0
+    vblk_reqs[priv].outhdr_sector = lba
+    vblk_reqs[priv].status        = 0xFF
 
-    vblk_bufs[0].addr   = cast[uint64](&vblk_req.outhdr_type)
-    vblk_bufs[0].length = 16
-    vblk_bufs[0].write  = 0
-    vblk_bufs[1].addr   = cast[uint64](buf)
-    vblk_bufs[1].length = cast[uint32](count * SECTOR_SIZE)
-    vblk_bufs[1].write  = 1
-    vblk_bufs[2].addr   = cast[uint64](&vblk_req.status)
-    vblk_bufs[2].length = 1
-    vblk_bufs[2].write  = 1
+    vblk_bufs[buf_base + 0].addr   = cast[uint64](
+        &vblk_reqs[priv].outhdr_type)
+    vblk_bufs[buf_base + 0].length = 16
+    vblk_bufs[buf_base + 0].write  = 0
+    vblk_bufs[buf_base + 1].addr   = cast[uint64](buf)
+    vblk_bufs[buf_base + 1].length = cast[uint32](count * SECTOR_SIZE)
+    vblk_bufs[buf_base + 1].write  = 1
+    vblk_bufs[buf_base + 2].addr   = cast[uint64](
+        &vblk_reqs[priv].status)
+    vblk_bufs[buf_base + 2].length = 1
+    vblk_bufs[buf_base + 2].write  = 1
 
-    head: uint16 = virtq_add_chain3(&vblk_state.vq, &vblk_bufs[0])
+    head: uint16 = virtq_add_chain3(&vblk_states[priv].vq,
+                                    &vblk_bufs[buf_base])
     if head == 0xFFFF:
         return -1
-    rc: int32 = virtq_kick_and_wait(vblk_state.iobase, 0, &vblk_state.vq)
+    rc: int32 = virtq_kick_and_wait(vblk_states[priv].iobase, 0,
+                                    &vblk_states[priv].vq)
     if rc != 0:
         return rc
     # Reset the free list head to 0 after each completed request —
     # we only have one in flight at a time, so the previous chain
     # is now free again.
-    vblk_state.vq.free_head = 0
-    if vblk_req.status != 0:
+    vblk_states[priv].vq.free_head = 0
+    if vblk_reqs[priv].status != 0:
         printk1("virtio-blk: read failed status=%d\n",
-                cast[uint64](vblk_req.status))
+                cast[uint64](vblk_reqs[priv].status))
         return -1
     return 0
 
@@ -149,44 +164,48 @@ def virtio_blk_write_sectors(priv: uint64, lba: uint64,
     # VIRTIO_BLK_T_FLUSH explicitly later if we ever care.
     if count == 0:
         return 0
-    vblk_req.outhdr_type   = VIRTIO_BLK_T_OUT
-    vblk_req.outhdr_ioprio = 0
-    vblk_req.outhdr_sector = lba
-    vblk_req.status        = 0xFF
+    if priv >= VBLK_MAX:
+        return -1
+    buf_base: uint64 = priv * 3
+    vblk_reqs[priv].outhdr_type   = VIRTIO_BLK_T_OUT
+    vblk_reqs[priv].outhdr_ioprio = 0
+    vblk_reqs[priv].outhdr_sector = lba
+    vblk_reqs[priv].status        = 0xFF
 
-    vblk_bufs[0].addr   = cast[uint64](&vblk_req.outhdr_type)
-    vblk_bufs[0].length = 16
-    vblk_bufs[0].write  = 0
-    vblk_bufs[1].addr   = cast[uint64](buf)
-    vblk_bufs[1].length = cast[uint32](count * SECTOR_SIZE)
-    vblk_bufs[1].write  = 0                        # device READS our buf
-    vblk_bufs[2].addr   = cast[uint64](&vblk_req.status)
-    vblk_bufs[2].length = 1
-    vblk_bufs[2].write  = 1
+    vblk_bufs[buf_base + 0].addr   = cast[uint64](
+        &vblk_reqs[priv].outhdr_type)
+    vblk_bufs[buf_base + 0].length = 16
+    vblk_bufs[buf_base + 0].write  = 0
+    vblk_bufs[buf_base + 1].addr   = cast[uint64](buf)
+    vblk_bufs[buf_base + 1].length = cast[uint32](count * SECTOR_SIZE)
+    vblk_bufs[buf_base + 1].write  = 0             # device READS our buf
+    vblk_bufs[buf_base + 2].addr   = cast[uint64](
+        &vblk_reqs[priv].status)
+    vblk_bufs[buf_base + 2].length = 1
+    vblk_bufs[buf_base + 2].write  = 1
 
-    head: uint16 = virtq_add_chain3(&vblk_state.vq, &vblk_bufs[0])
+    head: uint16 = virtq_add_chain3(&vblk_states[priv].vq,
+                                    &vblk_bufs[buf_base])
     if head == 0xFFFF:
         return -1
-    rc: int32 = virtq_kick_and_wait(vblk_state.iobase, 0, &vblk_state.vq)
+    rc: int32 = virtq_kick_and_wait(vblk_states[priv].iobase, 0,
+                                    &vblk_states[priv].vq)
     if rc != 0:
         return rc
-    vblk_state.vq.free_head = 0
-    if vblk_req.status != 0:
+    vblk_states[priv].vq.free_head = 0
+    if vblk_reqs[priv].status != 0:
         printk1("virtio-blk: write failed status=%d\n",
-                cast[uint64](vblk_req.status))
+                cast[uint64](vblk_reqs[priv].status))
         return -1
     return 0
 
 
-def virtio_blk_init() -> int32:
-    # Probe, init, register. Returns 0 on success, -1 on miss /
-    # failure. Caller (init/main.ad) treats a miss as "no
-    # virtio-blk attached" — falls back to brd's /dev/ram0.
-    bdf: uint32 = pci_find(VIRTIO_VENDOR, VIRTIO_BLK_LEGACY)
-    if bdf == PCI_BDF_NONE:
-        printk0("virtio-blk: no PCI device found\n")
-        return -1
-
+def _virtio_blk_init_one(bdf: uint32, idx: uint64,
+                         name: Ptr[char]) -> int32:
+    # Probe + init a single virtio-blk PCI device and register it as
+    # `name` (vda, vdb, ...). idx is the index into vblk_states /
+    # vblk_reqs / vblk_bufs and is also passed back as the block
+    # layer's `priv` cookie. Returns 0 on success, -1 on failure.
     pci_enable_io_and_master(bdf)
     bar0_raw: uint32 = pci_read_bar(bdf, 0)
     # Legacy virtio uses an IO-space BAR (low bit set); mask to
@@ -195,7 +214,7 @@ def virtio_blk_init() -> int32:
         printk0("virtio-blk: BAR0 is not IO-space (modern virtio?)\n")
         return -1
     iobase: uint32 = bar0_raw & 0xFFFFFFFC
-    vblk_state.iobase = iobase
+    vblk_states[idx].iobase = iobase
     printk2("virtio-blk: bdf=%x iobase=%p\n",
             cast[uint64](bdf), cast[uint64](iobase))
 
@@ -208,20 +227,19 @@ def virtio_blk_init() -> int32:
     printk1("virtio-blk: host features=%x\n", cast[uint64](host_features))
     virtio_write_guest_features(iobase, 0)        # take nothing extra
 
-    if virtq_setup(iobase, 0, &vblk_state.vq) < 0:
+    if virtq_setup(iobase, 0, &vblk_states[idx].vq) < 0:
         return -1
 
     # Read capacity from the device-specific config window.
     cap: uint64 = virtio_dev_config_read_u64(iobase,
                                              VIRTIO_BLK_CFG_CAPACITY)
-    vblk_state.capacity = cap
-    printk1("virtio-blk: capacity=%d sectors\n", cap)
+    vblk_states[idx].capacity = cap
+    printk2("virtio-blk: %s capacity=%d sectors\n",
+            cast[uint64](name), cap)
 
     virtio_driver_ok(iobase)
 
-    vblk_ops.read_sectors  = virtio_blk_read_sectors
-    vblk_ops.write_sectors = virtio_blk_write_sectors
-    rc: int32 = register_blockdev("vda", cap, &vblk_ops, 0)
+    rc: int32 = register_blockdev(name, cap, &vblk_ops, idx)
     if rc < 0:
         return -1
 
@@ -257,13 +275,62 @@ def virtio_blk_init() -> int32:
         ioapic_pin = 11
         printk1("virtio-blk: PCI INTx line unreliable; using IOAPIC pin %d\n",
                 cast[uint64](ioapic_pin))
-    vblk_state.irq_pin   = ioapic_pin
-    vblk_state.irq_count = 0
+    vblk_states[idx].irq_pin   = ioapic_pin
+    vblk_states[idx].irq_count = 0
+    return 0
+
+
+def virtio_blk_init() -> int32:
+    # Enumerate every virtio-blk PCI device on bus 0 and register
+    # them in order as vda, vdb, vdc, ... up to VBLK_MAX. Returns 0
+    # if at least one disk was registered, -1 otherwise. Caller
+    # (init/main.ad) treats -1 as "no virtio-blk attached" — falls
+    # back to brd's /dev/ram0.
+    vblk_ops.read_sectors  = virtio_blk_read_sectors
+    vblk_ops.write_sectors = virtio_blk_write_sectors
+
+    # Single shared IRQ handler — every virtio-blk disk we registered
+    # raises the same vector and we scan all initialised slots for
+    # device-level ISR bits. Wired once, before the per-device probes.
     register_irq_handler(cast[uint64](VBLK_IRQ_VECTOR),
                          cast[uint64](&virtio_blk_irq_handler))
-    ioapic_redirect(ioapic_pin, VBLK_IRQ_VECTOR, VBLK_LAPIC_ID)
-    printk2("virtio-blk: irq pin=%d vec=0x%x\n",
-            cast[uint64](ioapic_pin), cast[uint64](VBLK_IRQ_VECTOR))
+
+    vblk_count = 0
+    start: uint32 = 0
+    nm_a: Ptr[char] = "vda"
+    nm_b: Ptr[char] = "vdb"
+    nm_c: Ptr[char] = "vdc"
+    nm_d: Ptr[char] = "vdd"
+    while vblk_count < VBLK_MAX:
+        bdf: uint32 = pci_find_from(VIRTIO_VENDOR,
+                                    VIRTIO_BLK_LEGACY, start)
+        if bdf == PCI_BDF_NONE:
+            break
+        nm: Ptr[char] = nm_a
+        if vblk_count == 1:
+            nm = nm_b
+        elif vblk_count == 2:
+            nm = nm_c
+        elif vblk_count == 3:
+            nm = nm_d
+        if _virtio_blk_init_one(bdf, vblk_count, nm) == 0:
+            # Route this disk's INTx pin to the shared vector. The
+            # IOAPIC pin we computed is whatever firmware assigned;
+            # multiple disks can share the same pin (PCI INTx is a
+            # bus-shared line), and the IRQ handler iterates all
+            # initialised disks to deassert each ISR.
+            ioapic_redirect(vblk_states[vblk_count].irq_pin,
+                            VBLK_IRQ_VECTOR, VBLK_LAPIC_ID)
+            printk2("virtio-blk: %s irq pin=%d\n",
+                    cast[uint64](nm),
+                    cast[uint64](vblk_states[vblk_count].irq_pin))
+            vblk_count = vblk_count + 1
+        # Continue scanning past this device's slot.
+        start = pci_bdf_dev(bdf) + 1
+    if vblk_count == 0:
+        printk0("virtio-blk: no PCI device found\n")
+        return -1
+    printk1("virtio-blk: %d disk(s) registered\n", vblk_count)
     return 0
 
 
@@ -277,20 +344,39 @@ def virtio_blk_irq_handler():
     # it is therefore mandatory even though the synchronous
     # virtq_kick_and_wait() poll is what actually retires the request
     # — skipping the ISR read would wedge the INTx line asserted.
-    if vblk_state.iobase == 0:
-        return
-    isr: int32 = inb(cast[int32](vblk_state.iobase
-                                 + cast[uint32](VIRTIO_PCI_ISR)))
-    vblk_state.irq_count = vblk_state.irq_count + 1
-    # isr bit 0 set => at least one virtqueue advanced (a block
-    # request completed). The completed request's data is retired by
-    # the in-flight virtq_kick_and_wait() caller; nothing else to do
-    # here for the current synchronous block API.
+    #
+    # With multiple disks on a shared INTx vector we MUST poll every
+    # registered device's ISR, because we cannot tell which one
+    # asserted the line. Reading a non-asserting device's ISR is a
+    # no-op (returns 0), so the scan is safe.
+    i: uint64 = 0
+    while i < vblk_count:
+        if vblk_states[i].iobase != 0:
+            isr: int32 = inb(cast[int32](vblk_states[i].iobase
+                                         + cast[uint32](VIRTIO_PCI_ISR)))
+            # isr bit 0 set => at least one virtqueue advanced (a
+            # block request completed). The synchronous block API
+            # retires the request via the kick_and_wait poll; nothing
+            # more to do here.
+            vblk_states[i].irq_count = vblk_states[i].irq_count + 1
+        i = i + 1
 
 
 def virtio_blk_irq_count() -> uint64:
-    return vblk_state.irq_count
+    # Sum IRQs serviced across every registered disk. Test rigs that
+    # asserted on the singleton irq_count keep seeing a monotonic
+    # counter, just summed across vda + vdb + ...
+    total: uint64 = 0
+    i: uint64 = 0
+    while i < vblk_count:
+        total = total + vblk_states[i].irq_count
+        i = i + 1
+    return total
 
 
 def virtio_blk_irq_pin() -> uint32:
-    return vblk_state.irq_pin
+    # Return the first registered disk's IRQ pin. Multi-disk setups
+    # share the line, so any one of them is the same answer.
+    if vblk_count == 0:
+        return 0
+    return vblk_states[0].irq_pin
