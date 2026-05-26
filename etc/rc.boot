@@ -37,7 +37,28 @@ echo 'rc.boot: hamnix boot rc starting'
 bind /srv '#s'
 bind /proc '#p'
 bind /n '#/'
-echo 'rc.boot: namespace recipe applied'
+
+# Rootfs partition (Plan 9 shape, docs/rootfs_partition.md). The
+# kernel auto-discovered an ext4 partition at boot via
+# mount_rootfs_partition() and exposed it through the `/ext` path-
+# prefix dispatch (see fs/vfs.ad's is_ext_path). Plan 9 convention:
+# mount file servers at conventional names under /n. We `bind` (not
+# `mount` — `/ext` is a kernel-side dispatch hook, not a 9P srvfd
+# yet) it at /n/distros so the SHELL has read/write access to the
+# rootfs partition's free space. The shell sees:
+#
+#   /n/distros/usr/bin/dpkg       — read the real Debian dpkg
+#   /n/distros/home/me/myfile     — write user files to the partition
+#
+# Anything `apt install` writes from inside `enter linux { ... }`
+# lands at /n/distros/usr/bin/<X> (because the linux ns rebinds
+# / -> /n/distros) — which means the writes ARE visible to the
+# shell, but at /n/distros/usr/bin/<X> rather than /usr/bin/<X>.
+# The shell's own /usr/bin/ stays Hamnix-native (cpio-served);
+# apt cannot shadow Hamnix paths. This is the "different mounts
+# for the linux ns vs the init system" guarantee the user wants.
+bind /n/distros /ext
+echo 'rc.boot: namespace recipe applied (rootfs at /n/distros)'
 
 # --- boot services --------------------------------------------------
 # A boot service is a namespace template (HAMSH_SPEC §11) plus a
@@ -110,13 +131,23 @@ echo 'rc.boot:STEP-1 past ifconfig dump'
 # is the only safe default; the explicit `bind` list below is the
 # ENTIRE sharing surface between host and container.
 #
-# Root rebind: `bind / /var/lib/distros/default` points every path
-# that isn't covered by a longer (more specific) bind below at the
-# distro tree. /etc/debian_version resolves to
-# /var/lib/distros/default/etc/debian_version, and any path a package
-# writes to (/bin, /usr, /var, ...) lands inside the distro tree, not
-# on the host. (kernel chan.ad's chan_resolve_prefix picks the
-# longest matching prefix.)
+# Plan 9 shape (2026-05-26 pivot, docs/rootfs_partition.md): the
+# distro tree lives on a SEPARATE ext4 partition the kernel auto-
+# discovers at boot and exposes via the existing `/ext` device-letter
+# alias. `bind / /ext` reaches the rootfs partition WITHOUT mounting
+# it in the init namespace (the shell's normal view) — only this
+# linux ns recipe sees the distro tree. Anything `apt install` writes
+# lands on the rootfs partition's ext4 filesystem, but is reachable
+# only from inside the linux ns. The init namespace stays Hamnix-
+# native; the shell's /, /etc, /bin, ... are NEVER shadowed by the
+# Debian tree.
+#
+# Fallback: if the kernel didn't find an ext4 rootfs (e.g. `-kernel
+# ELF` boot with no rootfs.img attached), `/ext` resolves to nothing
+# and `enter linux { ... }` calls fail with -ENOENT. The legacy in-
+# cpio /var/lib/distros/default path is also still bound below for
+# backward compat with the rich-cpio test fixtures that bake the
+# distro tree into the kernel ELF (set HAMNIX_CPIO_LEAN=0).
 #
 # The share list below is deliberately minimal — only paths that are
 # safe to expose to a foreign-distro binary, where "safe" means
@@ -151,7 +182,7 @@ echo 'rc.boot:STEP-1 past ifconfig dump'
 # naturally when the distro IS Debian: `enter debian { apt update }`.
 echo 'rc.boot:STEP-2 about to capture linux ns template'
 linux = ns clean {
-    bind / /var/lib/distros/default
+    bind / /ext
     bind /home /home
     bind /dev '#c'
     bind /proc '#p'
@@ -161,7 +192,7 @@ linux = ns clean {
 }
 echo 'rc.boot:STEP-3 captured linux ns; capturing debian ns'
 debian = ns clean {
-    bind / /var/lib/distros/default
+    bind / /ext
     bind /home /home
     bind /dev '#c'
     bind /proc '#p'

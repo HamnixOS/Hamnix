@@ -4,12 +4,24 @@
 
 > **Status:** the architectural design described here is shipped. The
 > live recipe is in [`/etc/rc.boot`](../etc/rc.boot) — `linux = ns clean
-> { bind / /var/lib/distros/default; bind /home /home; bind /dev '#c'
-> … }` (plus a duplicate-body `debian` alias). The `ns clean { … }`
-> modifier (see [`HAMSH_SPEC.md`](HAMSH_SPEC.md) §13) is what makes
+> { bind / /ext; bind /home /home; bind /dev '#c' … }` (plus a
+> duplicate-body `debian` alias). The `ns clean { … }` modifier (see
+> [`HAMSH_SPEC.md`](HAMSH_SPEC.md) §13) is what makes
 > `enter linux { … }` hermetic. This doc captures the design
 > rationale; the shipped recipe is the source of truth for the
 > binding list.
+>
+> **2026-05-26 update — rootfs migration to a separate partition.**
+> The distro backing store is no longer baked into the kernel ELF's
+> cpio. It lives on a separate ext4 partition (`/dev/...p3` on the
+> ISO; vda on the QEMU `-drive` path), which the kernel auto-
+> discovers at boot and exposes via the `/ext` device-letter
+> dispatch. The init namespace `bind /n/distros /ext` so the shell
+> sees the partition at `/n/distros/`. The linux ns recipe uses
+> `bind / /ext` so the linux ns sees it as `/`. apt writes are
+> visible to the shell at `/n/distros/usr/bin/...`, NOT at
+> `/usr/bin/...` (which stays Hamnix-native cpio). See
+> [`rootfs_partition.md`](rootfs_partition.md).
 
 In Hamnix, as in Plan 9, there is no global root. The kernel knows
 about file servers — disk filesystem drivers, kernel device drivers,
