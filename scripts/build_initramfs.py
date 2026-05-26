@@ -725,6 +725,13 @@ def build_archive() -> bytes:
     # so userland (motd, hostname, future login/init scripts) can read
     # config from a Linux-conventional path without baking strings into
     # binaries. Edit etc/* and re-run this script to refresh.
+    #
+    # Sub-directories under etc/ are walked one level deep and their
+    # files land at /etc/<subdir>/<file>. This is how /etc/svc/<name>.hamsh
+    # (init-side service-supervisor definition files) reach userland:
+    # hamsh's `svc start <name>` builtin opens /etc/svc/<name>.hamsh and
+    # parses the key:value lines. Symlinks and nested sub-dirs are
+    # intentionally not followed — the cpio layout is one shallow level.
     etc_dir = here / "etc"
     if etc_dir.is_dir():
         for ef in sorted(etc_dir.iterdir()):
@@ -740,6 +747,14 @@ def build_archive() -> bytes:
                 blob += cpio_entry(name, data)
                 print(f"  embedded {name} ({len(data)} bytes from "
                       f"etc/{ef.name})")
+            elif ef.is_dir():
+                for sub in sorted(ef.iterdir()):
+                    if sub.is_file():
+                        data = sub.read_bytes()
+                        name = "/etc/" + ef.name + "/" + sub.name
+                        blob += cpio_entry(name, data)
+                        print(f"  embedded {name} ({len(data)} bytes "
+                              f"from etc/{ef.name}/{sub.name})")
 
     # Linux runtime shell: plant a busybox-static binary + applet
     # symlinks into the default distro tree so `enter linux { /bin/sh }`

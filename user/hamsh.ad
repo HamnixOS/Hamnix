@@ -3165,6 +3165,8 @@ def _builtin_dispatch(cmd: Ptr[uint8], argc: int32) -> int32:
         return builtin_export(argc)
     if cstr_eq(cmd, "echo") != 0:
         return builtin_echo(argc)
+    if cstr_eq(cmd, "svc") != 0:
+        return builtin_svc(argc)
     return -1
 
 
@@ -4513,6 +4515,320 @@ def sys_waitpid_nb(pid: int32) -> int64:
     # -EAGAIN (-11) instead of yielding-to-others. This wrapper just
     # pins the flag so callers say `sys_waitpid_nb(pid)` and forget.
     return sys_waitpid_nb_raw(pid, WAITPID_WNOHANG)
+
+
+# --- /etc/svc/<name>.hamsh parser -----------------------------------
+# A service-definition file is plain text in a tiny `key: value` DSL.
+# We deliberately don't use hamsh's own parser: a service definition
+# is data, not code (no spawn/bind side effects from the file itself),
+# and a typo in a file would otherwise raise an evaluator error
+# instead of a clean "missing exec= line" diagnostic.
+#
+# Grammar (per the brief's design block):
+#   - '#' to end-of-line is a comment.
+#   - Blank / whitespace-only lines are skipped.
+#   - Other lines split on the FIRST ':' into (key, value); the key
+#     is trimmed; the value is trimmed of leading/trailing whitespace.
+#   - Required keys: name, ns, exec.
+#   - Optional keys: restart (always|on-failure|never), backoff_ms,
+#     backoff_max_ms, description.
+
+# Read buffer for the def file. 4 KiB is well above the brief's
+# example (~7 short lines); if a file overflows, the parser truncates
+# it and svc_def_load errs out with "file too long".
+SVC_DEF_BUF_MAX:  uint64 = 4096
+svc_def_buf:      Array[4096, uint8]
+
+# Per-parse scratch fields. Each entry is NUL-terminated; an empty
+# string for a required field surfaces as the validation error.
+svc_pf_name:      Array[64, uint8]
+svc_pf_ns:        Array[32, uint8]
+svc_pf_exec:      Array[512, uint8]
+svc_pf_desc:      Array[128, uint8]
+svc_pf_restart:   int32 = 0
+svc_pf_backoff:   int64 = 0
+svc_pf_backoff_x: int64 = 0
+
+
+def _svc_pf_reset():
+    svc_pf_name[0] = 0
+    svc_pf_ns[0] = 0
+    svc_pf_exec[0] = 0
+    svc_pf_desc[0] = 0
+    svc_pf_restart = SVC_RESTART_ON_FAIL
+    svc_pf_backoff = 1000              # 1 s default initial
+    svc_pf_backoff_x = 30000           # 30 s default ceiling
+
+
+def _svc_trim_copy(dst: Ptr[uint8], cap: uint64,
+                   src: Ptr[uint8], lo: uint64, hi: uint64):
+    # Copy src[lo..hi) trimmed of leading/trailing space, NUL-terminated.
+    while lo < hi and (src[lo] == 32 or src[lo] == 9):
+        lo = lo + 1
+    while hi > lo and (src[hi - 1] == 32 or src[hi - 1] == 9 \
+                       or src[hi - 1] == 13 or src[hi - 1] == 10):
+        hi = hi - 1
+    o: uint64 = 0
+    while lo < hi and o + 1 < cap:
+        dst[o] = src[lo]
+        o = o + 1
+        lo = lo + 1
+    dst[o] = 0
+
+
+def _svc_key_eq(src: Ptr[uint8], lo: uint64, hi: uint64,
+                kw: Ptr[uint8]) -> int32:
+    # Compare a trimmed slice of src to a NUL-terminated keyword.
+    while lo < hi and (src[lo] == 32 or src[lo] == 9):
+        lo = lo + 1
+    while hi > lo and (src[hi - 1] == 32 or src[hi - 1] == 9):
+        hi = hi - 1
+    j: uint64 = 0
+    while lo < hi:
+        if kw[j] == 0:
+            return 0
+        if src[lo] != kw[j]:
+            return 0
+        lo = lo + 1
+        j = j + 1
+    if kw[j] != 0:
+        return 0
+    return 1
+
+
+def _svc_parse_int(buf: Ptr[uint8], lo: uint64, hi: uint64) -> int64:
+    while lo < hi and (buf[lo] == 32 or buf[lo] == 9):
+        lo = lo + 1
+    sign: int64 = 1
+    if lo < hi and buf[lo] == 45:        # '-'
+        sign = -1
+        lo = lo + 1
+    n: int64 = 0
+    while lo < hi:
+        c: uint8 = buf[lo]
+        if c < 48 or c > 57:
+            break
+        n = n * 10 + cast[int64](c - 48)
+        lo = lo + 1
+    return n * sign
+
+
+def _svc_apply_restart(buf: Ptr[uint8], lo: uint64, hi: uint64):
+    if _svc_key_eq(buf, lo, hi, "always") != 0:
+        svc_pf_restart = SVC_RESTART_ALWAYS
+        return
+    if _svc_key_eq(buf, lo, hi, "on-failure") != 0:
+        svc_pf_restart = SVC_RESTART_ON_FAIL
+        return
+    if _svc_key_eq(buf, lo, hi, "never") != 0:
+        svc_pf_restart = SVC_RESTART_NEVER
+        return
+    # Unknown — keep the default (on-failure).
+
+
+def _svc_parse_buf(n: uint64) -> int32:
+    # Walk svc_def_buf[0..n), one line at a time. Returns 0 on success
+    # (required fields present), -1 on a missing-required diagnostic
+    # (errstr set).
+    _svc_pf_reset()
+    p: uint64 = 0
+    while p < n:
+        # Find end of line.
+        e: uint64 = p
+        while e < n and svc_def_buf[e] != 10:
+            e = e + 1
+        # Trim a trailing CR if present.
+        line_hi: uint64 = e
+        # Strip a leading '#' comment by treating it as line end.
+        scan: uint64 = p
+        while scan < e:
+            if svc_def_buf[scan] == 35:    # '#'
+                line_hi = scan
+                break
+            scan = scan + 1
+        # Find the ':' separator.
+        col: int64 = -1
+        scan = p
+        while scan < line_hi:
+            if svc_def_buf[scan] == 58:    # ':'
+                col = cast[int64](scan)
+                break
+            scan = scan + 1
+        if col >= 0:
+            key_lo: uint64 = p
+            key_hi: uint64 = cast[uint64](col)
+            val_lo: uint64 = cast[uint64](col) + 1
+            val_hi: uint64 = line_hi
+            base: Ptr[uint8] = &svc_def_buf[0]
+            if _svc_key_eq(base, key_lo, key_hi, "name") != 0:
+                _svc_trim_copy(&svc_pf_name[0], 64, base, val_lo, val_hi)
+            elif _svc_key_eq(base, key_lo, key_hi, "ns") != 0:
+                _svc_trim_copy(&svc_pf_ns[0], 32, base, val_lo, val_hi)
+            elif _svc_key_eq(base, key_lo, key_hi, "exec") != 0:
+                _svc_trim_copy(&svc_pf_exec[0], 512, base, val_lo, val_hi)
+            elif _svc_key_eq(base, key_lo, key_hi, "description") != 0:
+                _svc_trim_copy(&svc_pf_desc[0], 128, base, val_lo, val_hi)
+            elif _svc_key_eq(base, key_lo, key_hi, "restart") != 0:
+                _svc_apply_restart(base, val_lo, val_hi)
+            elif _svc_key_eq(base, key_lo, key_hi, "backoff_ms") != 0:
+                svc_pf_backoff = _svc_parse_int(base, val_lo, val_hi)
+            elif _svc_key_eq(base, key_lo, key_hi, "backoff_max_ms") != 0:
+                svc_pf_backoff_x = _svc_parse_int(base, val_lo, val_hi)
+            # Unknown keys are silently ignored (forward-compat).
+        p = e + 1
+    # Validation.
+    if svc_pf_name[0] == 0:
+        errstr_set("svc: definition missing required key 'name'")
+        return -1
+    if svc_pf_ns[0] == 0:
+        errstr_set("svc: definition missing required key 'ns'")
+        return -1
+    if svc_pf_exec[0] == 0:
+        errstr_set("svc: definition missing required key 'exec'")
+        return -1
+    return 0
+
+
+def _svc_def_path_build(name: Ptr[uint8], out: Ptr[uint8], cap: uint64):
+    # Compose "/etc/svc/<name>.hamsh" in `out`.
+    prefix: Ptr[uint8] = "/etc/svc/"
+    suffix: Ptr[uint8] = ".hamsh"
+    i: uint64 = 0
+    while prefix[i] != 0 and i + 1 < cap:
+        out[i] = prefix[i]
+        i = i + 1
+    j: uint64 = 0
+    while name[j] != 0 and i + 1 < cap:
+        out[i] = name[j]
+        i = i + 1
+        j = j + 1
+    k: uint64 = 0
+    while suffix[k] != 0 and i + 1 < cap:
+        out[i] = suffix[k]
+        i = i + 1
+        k = k + 1
+    out[i] = 0
+
+
+def svc_def_load(name: Ptr[uint8]) -> int32:
+    # Read /etc/svc/<name>.hamsh into svc_def_buf and register the
+    # parsed entry (creating or updating the table slot). Returns the
+    # slot index on success, -1 on file-not-found / parse error
+    # (errstr set).
+    path_buf: Array[128, uint8]
+    _svc_def_path_build(name, &path_buf[0], 128)
+    fd: int32 = sys_open(cast[Ptr[char]](&path_buf[0]))
+    if fd < 0:
+        errstr_set("svc: no such service definition")
+        return -1
+    total: uint64 = 0
+    while True:
+        n: int64 = sys_read(fd, &svc_def_buf[total],
+                            SVC_DEF_BUF_MAX - total)
+        if n <= 0:
+            break
+        total = total + cast[uint64](n)
+        if total >= SVC_DEF_BUF_MAX:
+            break
+    sys_close(fd)
+    if total == 0:
+        errstr_set("svc: empty definition file")
+        return -1
+    if _svc_parse_buf(total) < 0:
+        return -1
+    return svc_register(&svc_pf_name[0], &svc_pf_ns[0],
+                        &svc_pf_exec[0], svc_pf_restart,
+                        svc_pf_backoff, svc_pf_backoff_x,
+                        &svc_pf_desc[0])
+
+
+# --- svc builtin ----------------------------------------------------
+# Subcommands: status [<name>] | start <name> | stop <name>
+#              restart <name> | reload <name>
+def builtin_svc(argc: int32) -> int32:
+    if argc < 2:
+        # `svc` with no args: same as `svc status`.
+        svc_render_status()
+        return 0
+    verb: Ptr[uint8] = cast[Ptr[uint8]](argv_ptr[1])
+    if cstr_eq(verb, "status") != 0:
+        if argc >= 3:
+            name: Ptr[uint8] = cast[Ptr[uint8]](argv_ptr[2])
+            idx: int32 = svc_lookup(name)
+            if idx < 0:
+                errstr_set("svc: not registered")
+                return 1
+            svc_render_one(idx)
+            return 0
+        svc_render_status()
+        return 0
+    if cstr_eq(verb, "start") != 0:
+        if argc < 3:
+            errstr_set("svc start: missing service name")
+            return 1
+        name: Ptr[uint8] = cast[Ptr[uint8]](argv_ptr[2])
+        idx: int32 = svc_lookup(name)
+        if idx < 0:
+            # Auto-load the def the first time the user references it.
+            idx = svc_def_load(name)
+            if idx < 0:
+                return 1
+        if svc_start(idx) < 0:
+            return 1
+        return 0
+    if cstr_eq(verb, "stop") != 0:
+        if argc < 3:
+            errstr_set("svc stop: missing service name")
+            return 1
+        name: Ptr[uint8] = cast[Ptr[uint8]](argv_ptr[2])
+        idx: int32 = svc_lookup(name)
+        if idx < 0:
+            errstr_set("svc: not registered")
+            return 1
+        if svc_stop(idx) < 0:
+            return 1
+        return 0
+    if cstr_eq(verb, "restart") != 0:
+        if argc < 3:
+            errstr_set("svc restart: missing service name")
+            return 1
+        name: Ptr[uint8] = cast[Ptr[uint8]](argv_ptr[2])
+        idx: int32 = svc_lookup(name)
+        if idx < 0:
+            idx = svc_def_load(name)
+            if idx < 0:
+                return 1
+        u: uint64 = cast[uint64](idx)
+        # If it's currently running, signal it and wait one cooperative
+        # cycle for the reaper to update state. Even without the wait,
+        # the supervisor tick will catch the exit and start a fresh
+        # one when policy permits — but a user typing `svc restart`
+        # wants the new instance up before the prompt returns.
+        if svc_state[u] == SVC_STATE_RUNNING:
+            old_pid: int32 = svc_pid[u]
+            # Don't flip policy to NEVER like svc_stop — we want the
+            # supervisor to bring it back. Direct kill + manual reap.
+            sys_kill(old_pid, 15)              # SIGTERM
+            # Reap synchronously so the next svc_start sees a clean
+            # SVC_STATE_STOPPED. sys_waitpid blocks here — acceptable
+            # at an interactive `svc restart` (the user typed it).
+            sys_waitpid(old_pid)
+            svc_pid[u] = 0
+            svc_state[u] = SVC_STATE_STOPPED
+        if svc_start(idx) < 0:
+            return 1
+        return 0
+    if cstr_eq(verb, "reload") != 0:
+        if argc < 3:
+            errstr_set("svc reload: missing service name")
+            return 1
+        name: Ptr[uint8] = cast[Ptr[uint8]](argv_ptr[2])
+        idx: int32 = svc_def_load(name)
+        if idx < 0:
+            return 1
+        return 0
+    errstr_set("svc: unknown verb (status/start/stop/restart/reload)")
+    return 1
 
 
 # --- §13 live-handle resolution -------------------------------------
