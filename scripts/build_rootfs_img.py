@@ -4,11 +4,26 @@ scripts/build_rootfs_img.py — stage the Hamnix "distrofs" file-server
 image into an ext4 partition (default build/hamnix-rootfs.img).
 
 Plan 9-shape: this is NOT a global rootfs. The kernel discovers the
-ext4 partition at boot and posts a 9P-shape file server entry at
-`#s/distrofs`. The init namespace (the shell's normal view) does NOT
-mount it; only the `linux = ns clean { mount '#s/distrofs' / ... }`
-namespace recipe attaches the server, isolating any apt-installed
-state to the Linux namespace's private view. See docs/rootfs_partition.md.
+ext4 partition at boot, reads the `.hamnix-roots` sentinel file
+planted at the partition root, and posts a named file server for
+each declared sentinel entry. The init namespace (the shell's normal
+view) does NOT mount it; only the `linux = ns clean { bind '#distro'
+/ ... }` namespace recipe attaches the server, isolating any
+apt-installed state to the Linux namespace's private view. See
+docs/rootfs_partition.md.
+
+Sentinel: a single text file at the partition root, planted by this
+script, named `.hamnix-roots`. Format is `<word> <relpath>` per line.
+For the boot rootfs we declare one entry — the whole partition IS
+the distro tree:
+
+    distro    .
+
+The kernel's init/main.ad::mount_rootfs_partition() walks this file
+and calls name_push("distro", chan_ref, partuuid, ".") so userspace
+`bind '#distro' /n/distros` succeeds. Adding more entries (e.g.
+`apt-cache var/cache/apt/`) carves out subdirectories as their own
+named file servers without changing the partition layout.
 
 Sizing target: minimal Debian — just the apt/dpkg closure + busybox.
 Goal is ~60-80 MiB image, NOT a full 200+ MiB debootstrap tree.
@@ -237,6 +252,23 @@ def _stage_directory(staging: Path):
               flush=True)
 
     _stage_busybox(staging)
+    _stage_hamnix_roots(staging)
+
+
+def _stage_hamnix_roots(staging: Path) -> None:
+    """Plant `.hamnix-roots` at the partition root.
+
+    The boot rootfs is the whole partition — one sentinel entry,
+    `distro .` (relpath `.` means "partition root"). The kernel's
+    init/main.ad::mount_rootfs_partition() parses this file and
+    registers `#distro` in the named file-server stack so userspace
+    `bind '#distro' /n/distros` and the linux ns `bind '#distro' /`
+    resolve to the partition.
+    """
+    sentinel = staging / ".hamnix-roots"
+    sentinel.write_text("distro    .\n", encoding="ascii")
+    print(f"[build_rootfs_img] planted .hamnix-roots sentinel "
+          f"(declares #distro -> partition root)", flush=True)
 
 
 def _du_bytes(path: Path) -> int:
