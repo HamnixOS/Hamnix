@@ -4,6 +4,17 @@
 
 # Hamnix
 
+> **Repo split (2026-05-26):** the Adder compiler and language reference
+> now live in their own repository, [HamnixOS/adder](https://github.com/HamnixOS/adder),
+> and are consumed here as a git submodule at `adder/` pinned to a
+> specific commit. The top-level `compiler/` and `LANGUAGE.md` paths are
+> forwarding symlinks into the submodule, so every build script keeps
+> working unchanged. Clone with `--recurse-submodules` (or run
+> `git submodule update --init` after cloning), and `scripts/test_adder_pin.sh`
+> enforces in CI that the pin is a real upstream Adder commit. See
+> [HamnixOS/adder](https://github.com/HamnixOS/adder) if you want Adder
+> on its own outside Hamnix.
+
 **A from-scratch x86_64 server OS, written in Adder — a Python-syntax
 systems language with a hand-written x86_64 compiler (no LLVM).**
 Hamnix is the OS; Adder is the language and compiler used to write it.
@@ -562,7 +573,11 @@ for the canonical example.
 ## Project structure
 
 ```
-compiler/        Adder compiler (CPython-hosted)
+adder/           Adder compiler + LANGUAGE.md — git submodule pinned to
+                 a specific HamnixOS/adder commit. The top-level
+                 `compiler` and `LANGUAGE.md` paths below are forwarding
+                 symlinks into this submodule so callers don't change.
+compiler -> adder/compiler   (symlink)
   adder.py        CLI: --target= x86_64-{bare-metal,adder-user,linux-kernel-module}
   lexer.py        Tokenizer (digit-leading idents per M16.135)
   parser.py       Recursive-descent parser → AST

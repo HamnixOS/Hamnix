@@ -244,7 +244,7 @@ namespace recipe uses these primitives.
 | Linux ELF userland | `tests/u-binary/u_*` | 5 (running) → Layer 2 | Stays |
 | rio display server | not yet built | 3 | New Layer 3 service — file-based window system (see `rio.md`) |
 | ipd net daemon | not yet built | 3 | Owns the IP stack as a /net 9P server |
-| Compiler | `compiler/*.py` | host tool | Not part of the OS — runs on the build host |
+| Compiler | `adder/compiler/*.py` (submodule; top-level `compiler/` is a symlink) | host tool | Not part of the OS — runs on the build host. Lives in its own repo, [HamnixOS/adder](https://github.com/HamnixOS/adder); Hamnix consumes it as a git submodule pinned to a specific commit (`scripts/test_adder_pin.sh` enforces the pin in CI). |
 
 ## Migration plan
 
