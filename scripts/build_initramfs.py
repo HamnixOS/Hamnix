@@ -523,6 +523,20 @@ if os.environ.get("ENABLE_E1000E_TRAFFIC_TEST") == "1":
 if os.environ.get("ENABLE_NVME_IO_TEST") == "1":
     FILES.append(("/etc/nvme-io-ko", b"1\n"))
 
+# USB host-controller class L-shim exercise marker. scripts/test_xhci_io.sh
+# sets ENABLE_XHCI_KO=1 to plant /etc/xhci-ko in the initramfs. This
+# is the USB equivalent of the ahci-io / nvme-io markers: with the marker
+# present init/main.ad SKIPs the hand-rolled drivers/usb/xhci.ad +
+# drivers/usb/ehci.ad init paths and instead drives the controller via
+# Linux's stock usbcore + xhci_pci + xhci_hcd .ko dep chain through
+# kmod_linux_load + modules_dep_load_with_deps. The chain owns the
+# controller end to end; the in-kernel xhci_io_exercise() then asserts
+# we got at least to usb_add_hcd (root hub registration) before the
+# follow-up URB-submission milestone takes over the actual key-event
+# injection.
+if os.environ.get("ENABLE_XHCI_KO") == "1":
+    FILES.append(("/etc/xhci-ko", b"1\n"))
+
 
 # See INIT_ELF handling inside build_archive(): set INIT_ELF=path to
 # override which on-disk file becomes /init in the cpio archive, e.g.
@@ -1119,6 +1133,53 @@ def build_archive() -> bytes:
             blob += cpio_entry(name, data)
             print(f"  embedded {name} ({len(data)} bytes from "
                   f"kernel-modules/nvme_core/nvme-core.ko)")
+
+    # USB host-controller class L-shim chain: usbcore (the USB stack
+    # core library) + xhci_pci (PCI attachment shim for xHCI) +
+    # xhci_hcd (xHCI host-controller driver proper) + ehci_pci +
+    # ehci_hcd. Planted at the framework path so the in-kernel
+    # modules_dep parser finds each module via _md_find_ko() — the
+    # walker dispatches xhci_pci's declared deps (xhci-hcd, usbcore)
+    # and recursively loads them before xhci_pci's init_module fires.
+    # Same dual-path planting (/lib/modules + /lib/modules/6.12) as
+    # the storage class above so userspace `insmod` tests can find
+    # the .kos at the conventional Debian path too.
+    #
+    # IMPORTANT: `modinfo -F depends xhci_pci.ko` returns `xhci-hcd,
+    # usbcore` — with a DASH in xhci-hcd. The in-kernel modules_dep
+    # parser walks dep tokens VERBATIM to build the cpio lookup path,
+    # so /lib/modules/xhci-hcd.ko is what the dep walker tries first.
+    # Therefore plant the cpio entries using the dash-form filename
+    # (mirroring nvme-core.ko which has the same dash-vs-underscore
+    # split). Name normalization in _md_name_eq only handles the
+    # already-loaded fingerprint table.
+    for ko_dir, ko_name, dep_filename in (
+            ("usbcore",  "usbcore.ko",  "usbcore.ko"),
+            ("xhci_pci", "xhci_pci.ko", "xhci_pci.ko"),
+            ("xhci_hcd", "xhci_hcd.ko", "xhci-hcd.ko"),
+            ("ehci_pci", "ehci_pci.ko", "ehci_pci.ko"),
+            ("ehci_hcd", "ehci_hcd.ko", "ehci-hcd.ko"),
+    ):
+        ko_path = here / "kernel-modules" / ko_dir / ko_name
+        if ko_path.is_file():
+            data = ko_path.read_bytes()
+            paths = [
+                f"/lib/modules/{dep_filename}",
+                f"/lib/modules/6.12/{dep_filename}",
+            ]
+            # Also plant the underscore-form filename if it differs from
+            # the dep-form — userspace `insmod` users habitually type
+            # xhci_hcd.ko (with underscore) since that's the modinfo
+            # -F name output.
+            if dep_filename != ko_name:
+                paths += [
+                    f"/lib/modules/{ko_name}",
+                    f"/lib/modules/6.12/{ko_name}",
+                ]
+            for name in paths:
+                blob += cpio_entry(name, data)
+                print(f"  embedded {name} ({len(data)} bytes from "
+                      f"kernel-modules/{ko_dir}/{ko_name})")
 
     # WiFi pivot: cfg80211.ko (configuration/admin layer, ~2.3 MiB)
     # and mac80211.ko (soft-MAC stack, ~2.4 MiB) — Debian 6.1.0-32
