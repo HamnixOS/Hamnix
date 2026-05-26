@@ -32,9 +32,23 @@ not an escape from anything.
 
 Imported Linux binaries (apt, dpkg, postgresql, python3) run inside
 distro-shape namespaces because that's the namespace shape they
-expect. Native Adder binaries (hamsh, ls, the coreutils) run inside
-init's default namespace because that's the namespace shape *they*
-expect. Neither is the "real" /; they're peer namespaces.
+expect. Native Adder binaries (hamsh, the init system, sshd-as-init,
+the future Hamnix-native package manager) run inside init's default
+namespace because that's the namespace shape *they* expect. Neither
+is the "real" /; they're peer namespaces.
+
+**Anti-pattern alert (load-bearing):** if a tool's job is
+"manage Debian packages" or "extract a .deb" or "fetch with curl,"
+**it is a Linux userland tool — run real Debian from inside the
+Linux namespace. Do NOT write an Adder reimplementation of it.**
+We did this once with `user/apt.ad` + `user/dpkg.ad` + `user/
+dpkg_deb.ad`, spent months, and deleted all three (2026-05-26,
+commits `0de1c63`..`3ff5bfc`) once `enter linux { /usr/bin/apt }`
+worked. See [`architecture.md` § "What runs where"](architecture.md)
+for the full rule and the aspirational placement of a future
+native Hamnix package manager (which would NOT be a substitute for
+apt — it would manage Hamnix-side services in the DEFAULT
+namespace, not distro packages).
 
 ## Layout
 
@@ -177,6 +191,11 @@ for server workloads.
   in init's namespace because that's the one they're built against.
   Running them inside a Debian-shape namespace would just hide them
   behind FHS noise.
+- **No Adder reimplementations of Linux userland tools.** apt, dpkg,
+  bash, curl, wget, tar, gzip, xz, gpg, etc. all exist in Debian and
+  run inside the Linux namespace. We don't ship Adder ports of them.
+  When a Linux tool needs to talk to a Hamnix concept (a `/srv` 9P
+  service, a `/net` socket), shim the bridge layer, not the tool.
 - **No automatic path translation between namespaces.** A
   Debian-namespace process referring to /home/david sees the same
   file-server response as a native-namespace process referring to

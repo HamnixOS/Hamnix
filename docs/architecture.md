@@ -69,6 +69,56 @@ turns the OS into a Frankenstein. If you find yourself wanting Linux
 shape at Layer 1, write a Layer 3 service instead. If you find
 yourself wanting Plan 9 at Layer 2, you have a bug.
 
+## What runs where: native tools vs distro tools
+
+This distinction is load-bearing. Get it wrong and you reimplement
+Linux userland in Adder.
+
+| Category | Where it runs | Examples |
+|----------|---------------|----------|
+| **Distro userland** (apt, dpkg, bash, coreutils, postgresql, nginx, python3, ...) | **Inside a Linux namespace** — `enter linux { /usr/bin/apt install … }`. Real Debian binaries served from the distro backing store. | `apt`, `dpkg`, `dpkg-deb`, `bash`, `apt-get`, `dpkg-query` |
+| **Native Hamnix tools** (the shell, the editor, the init system, the system service supervisor) | **In init's default namespace.** Adder binaries. They speak the Layer-1 Plan-9 syscall surface, never wrap distro binaries. | `hamsh`, `ed`, `motd`, `sshd` (currently — see [`HAMSH_SPEC.md`](HAMSH_SPEC.md)) |
+
+### Anti-pattern: don't reimplement Linux userland in Adder
+
+If a tool's job is "manage Debian packages" or "extract a .deb" or
+"run apt-get update," it is a **Linux userland tool**. Run real
+Debian inside the Linux namespace. **Do not write an Adder
+implementation of it.**
+
+The reflex to add `user/apt.ad`, `user/dpkg.ad`, `user/wget.ad`,
+`user/curl.ad`, `user/tar.ad` is the Frankenstein mistake. We did it
+once with `user/apt.ad` + `user/dpkg.ad` + `user/dpkg_deb.ad`, spent
+months on it, then deleted all three (commits `0de1c63`..`3ff5bfc`,
+2026-05-26) and replaced them with `enter linux { /usr/bin/apt … }`
+plus real Debian binaries staged at `/var/lib/distros/default`. Don't
+make that mistake twice.
+
+Heuristic: if the tool exists in Debian, run it from Debian. If you
+need it to interoperate with Hamnix-native concepts (Plan 9 file
+servers at `/srv`, `/net`, `/proc`), shim THAT layer — not the tool
+itself.
+
+### Aspirational: native Hamnix package manager (default-namespace tool)
+
+A future native package manager — call it `hpm` — would manage
+**Hamnix-side** state: native services, kernel modules, the rootfs
+ext4 image's contents, the L-shim shape, framework `.ko` registry.
+It is NOT a replacement for apt; it does not install Debian packages.
+It runs in init's default namespace alongside hamsh, configures
+Hamnix itself, and never enters a Linux namespace.
+
+The contract:
+- `apt` (Linux ns) manages `/var/lib/distros/<distro>/` content
+- `hpm` (default ns, future) manages Hamnix's own services and
+  kernel-side state — `etc/rc.boot`, the framework module set,
+  the rootfs image layout
+
+If both ever need to coordinate (e.g. "user wants a service that's
+in Debian, install via apt, then register with init"), that's
+a Layer 5 application-level workflow — not a `hpm`-calls-apt
+shim. The two managers stay in their own namespaces.
+
 ## What each layer is for
 
 | Layer | Purpose | Source-tree home |
