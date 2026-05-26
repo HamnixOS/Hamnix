@@ -222,37 +222,62 @@ The target design (not yet implemented):
    disk devices). The current single-partition path effectively uses
    `/ext` as that letter; this generalises.
 
-2. **Single-server mode**: if the partition's root directory contains
-   conventional directory names (`usr/`, `bin/`, `etc/`, …), the
-   kernel serves the whole partition as ONE file server. The shell
-   binds it as `bind /n/mydisk '#A'`.
+2. **Single-server mode** (no sentinel file at partition root):
+   the kernel serves the WHOLE partition as one anonymous file
+   server, assigned the next free letter (`#A`, `#B`, ...). hamsh
+   binds it as `bind '#A' /n/mydisk` (source first, then target).
 
-3. **Multi-server mode**: if the partition's root contains
-   marker-prefixed directories (`#a/`, `#b/`, `#c/` — final marker
-   syntax TBD; "perhaps it's not a hashtag" per user), each such
-   subdir becomes its OWN file server, addressable as `#A/a/`,
-   `#A/b/`, `#A/c/`. A thumb drive could carry `_distrofs/`,
-   `_userdata/`, `_apt-cache/` and have each bound independently:
-       bind /n/distros  '#A/distrofs'
-       bind /home       '#A/userdata'
-       bind /var/cache  '#A/apt-cache'
+3. **Multi-server mode** (sentinel file at partition root): the
+   partition's root carries a file `.hamnix-roots` listing one or
+   more named servers. Each line is `<word> <relative-dir>`:
 
-Open design questions for the next iteration:
-  - Marker character (`#`? `_`? all-numeric? sentinel file at root?).
-    `#letter` on-disk is awkward because shell tools quote it, but
-    it's the most Plan 9-native shape.
-  - Does the kernel auto-bind any of these into the init namespace,
-    or only post them in `#s` for userspace `bind`?
-  - Per-server access controls (the partition is one ext4 fs; can a
-    process unmount `#A/distrofs` while keeping `#A/userdata`?). The
-    cleanest semantics: each per-letter server is its own Chan and
-    mtab entry; unmounting one doesn't touch the others.
+       home    home/
+       distro  debian-bookworm/
+       cache   var/cache/apt/
 
-This shape isolates concerns nicely: apt-installed state lives on
-`#A/distrofs`; user home data on `#A/userdata`; the apt download
-cache on `#A/apt-cache`. Each is mountable into different namespaces
-independently. Future work; the current single-server shape is the
-foundation.
+   The kernel reads the sentinel, derives each server's letter from
+   the FIRST CHARACTER of `<word>` (lowercase), and posts each as
+   a separate file server: `#h`, `#d`, `#c` in the example. hamsh
+   binds each independently:
+
+       bind '#h' /n/home
+       bind '#d' /n/distros
+       bind '#c' /var/cache/apt
+
+4. **Collision handling — stack semantics**: a letter like `h` is
+   a NAME that resolves to the top of a per-letter stack of file
+   servers. Plug-in pushes; unplug pops. Concretely:
+
+   - Boot with on-disk `home` server → stack `[home_disk]`,
+     `#h` resolves to home_disk.
+   - Plug USB stick declaring `home` → stack `[home_disk, usb_home]`,
+     `#h` resolves to usb_home (top), `#hh` resolves to home_disk
+     (one below top). The user-visible home directory just switched
+     to the USB stick.
+   - Unplug the USB stick → stack pops to `[home_disk]`,
+     `#h` resolves to home_disk again, `#hh` no longer exists.
+     The home directory is back to the on-disk server.
+
+   A third concurrent collision yields `#h`, `#hh`, `#hhh` (top to
+   bottom). Pop the top → all letters slide up.
+
+   Already-open fds hold direct `Chan` references; they're unaffected
+   by letter-stack changes. Only NEW lookups (`open("#h/foo")`)
+   resolve through the current stack top. A process that was reading
+   from the USB's `/home/me/notes.txt` keeps reading it even after a
+   newer USB takes the `#h` letter — only freshly-opened paths route
+   to the new top.
+
+5. **No marker-character magic in filenames.** This was the prior
+   design (`#a/` prefix dirs); abandoned because `#` collides with
+   the device-letter namespace and other characters were ugly. The
+   sentinel file is explicit and declarative.
+
+6. **hamsh bind syntax is source-first**: `bind SRC DST`. This
+   matches the underlying `SYS_BIND(src, dst, flag)` syscall (and
+   Linux's `mount source target`). Earlier rc.boot snippets used
+   the inverted Plan 9-style `bind DST SRC` — that's been corrected
+   tree-wide (commit TBD by the sentinel-discovery agent).
 
 ## Files involved
 

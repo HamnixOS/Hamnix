@@ -146,6 +146,52 @@ shim. The two managers stay in their own namespaces.
    bytes to/from the device file and owns the raw framebuffer +
    input devices.
 
+## Filesystem layout and discovery
+
+Per Plan 9 there is **no global rootfs**. Block devices found by the
+kernel become **file servers** that namespaces bind at their chosen
+paths. Two discovery shapes:
+
+| Shape | Trigger | Result |
+|-------|---------|--------|
+| **Single-server** | partition has NO `.hamnix-roots` sentinel | whole partition served as ONE anonymous file server, kernel auto-assigns next free letter (`#A`, `#B`, …) |
+| **Multi-server** | partition root carries `.hamnix-roots` sentinel | each `<word> <relative-dir>` line in the sentinel becomes its own file server; letter derived from first char of `<word>` (lowercase) |
+
+Sentinel file format (`.hamnix-roots` at partition root):
+
+```
+home    home/
+distro  debian-bookworm/
+cache   var/cache/apt/
+```
+
+→ kernel posts `#h`, `#d`, `#c` as separate file servers.
+
+**Collision rule — stack semantics**: each letter is a NAME that
+resolves to the top of a per-letter stack of file servers. Plug-in
+pushes; unplug pops. Plug a USB declaring `home` while `#h` is in
+use → stack becomes `[home_disk, usb_home]`, `#h` resolves to
+usb_home (top), `#hh` resolves to home_disk. Unplug the USB → stack
+pops, `#h` is back to home_disk, `#hh` no longer exists. Already-open
+fds keep working (they hold direct Chan refs); only new path lookups
+route through the current stack top. See
+[`rootfs_partition.md`](rootfs_partition.md) for full semantics.
+
+**Bind syntax is source-first, target-second**: `bind SRC DST`. The
+underlying `SYS_BIND(src, dst, flag)` syscall (see
+[`native-api.md`](native-api.md#bind)) matches Linux's `mount source
+target` order. Earlier hamsh recipes had an inverted Plan-9-style
+`bind DST SRC`; that's a bug, corrected tree-wide. To graft `#h` at
+`/n/home`:
+
+```
+bind '#h' /n/home
+```
+
+See [`rootfs_partition.md`](rootfs_partition.md) for the live design
+and [`distro-namespaces.md`](distro-namespaces.md) for how the linux
+namespace recipe uses these primitives.
+
 ## Layer-of-record for each existing subsystem
 
 | Subsystem | Current location | Layer | Notes |

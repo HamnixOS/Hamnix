@@ -205,11 +205,26 @@ Layer 2 doesn't have to open a file per Linux `getpid()`.
 
 ## Namespace operations
 
-### `bind(new: Ptr[uint8], old: Ptr[uint8], flag: int32) -> int32`
+### `bind(src: Ptr[uint8], dst: Ptr[uint8], flag: int32) -> int32`
 
-**New, number 257.** Graft `new` onto `old` in the calling
-process's namespace. After `bind("/proc/self/fd", "/fd", MREPL)`,
-opens of `/fd/0` find `/proc/self/fd/0`.
+**New, number 257.** Graft `src` (the source file server / path)
+at `dst` (the lookup path in the calling process's namespace).
+After `bind("/proc/self/fd", "/fd", MREPL)`, opens of `/fd/0` find
+`/proc/self/fd/0`.
+
+**Argument order is source-first, target-second** — same as Linux
+`mount(source, target)`. The hamsh wrapper `bind SRC DST` matches:
+
+```
+bind '#s' /srv      # graft the srv device-letter at /srv
+bind '#p' /proc     # graft the proc device-letter at /proc
+bind '#h' /n/home   # graft an auto-discovered home server at /n/home
+```
+
+Plan 9's `bind(2)` uses confusing argument names (`new`/`old`); the
+Hamnix syscall uses `src`/`dst` to avoid the ambiguity. The
+semantics are identical to Plan 9's bind: same NEW=source,
+OLD=target/lookup-path meaning, just clearer names.
 
 `flag`:
 
