@@ -96,21 +96,24 @@ Hamnix/
 
 ### Prerequisites
 
-- Python 3.8 or later
-- ARM toolchain (optional, for hardware testing)
+- Python 3.10 or later (the compiler uses match/case syntax)
+- GCC + binutils (assembler + linker for the kernel ELF)
+- `qemu-system-x86_64` (for the integration tests)
+- For the ISO build: `xorriso`, `mtools`, `parted`,
+  `grub-pc-bin`, `grub-efi-amd64-bin`, `ovmf`
 - Git
 
 ### Getting Started
 
 ```bash
-git clone https://github.com/your-org/hamnix.git
-cd hamnix
+git clone https://github.com/ruapotato/Hamnix.git
+cd Hamnix
 
-# Run the build to verify setup
-./build.sh
+# Compiler regression suite (host-side, fast):
+bash scripts/run_compiler_tests.sh
 
-# Run compiler unit tests
-python3 tests/test_compiler.py
+# Boot the bare-metal kernel under QEMU:
+bash scripts/run_x86_bare.sh
 ```
 
 ## Language Syntax
@@ -432,10 +435,15 @@ def test_lexer_feature():
 
 ### Before Submitting
 
-1. **Run the build**: `./build.sh` must complete without errors
-2. **Run tests**: All existing tests must pass
-3. **Add tests**: New features should have tests
-4. **Update docs**: Add API documentation for new features
+1. **Run the build**: `bash scripts/run_x86_bare.sh` (or
+   `bash scripts/build_iso.sh`) must complete without errors.
+2. **Run the compiler regression suite**:
+   `bash scripts/run_compiler_tests.sh` — every fixture must pass.
+3. **Run the relevant integration test**: each feature should have a
+   `scripts/test_*.sh` that exercises it under QEMU.
+4. **Add tests**: New features should have tests.
+5. **Update docs**: Update `LANGUAGE.md`, `docs/architecture.md`, or
+   the relevant subsystem doc when behaviour changes.
 
 ### Pull Request Guidelines
 
@@ -467,32 +475,37 @@ Types:
 
 ## Architecture Notes
 
+For deeper architecture documentation see
+[`docs/architecture.md`](docs/architecture.md) (the layered model
+and migration plan) and [`docs/native-api.md`](docs/native-api.md)
+(the Plan 9-shape native syscall surface).
+
 ### Memory Model
 
-- Stack grows downward from 0x20008000
-- Heap starts at end of BSS section
-- No garbage collection (manual memory management)
+- Higher-half kernel ELF (linked at `0xffffffff80000000`).
+- `mm/memblock.ad` → `mm/page_alloc.ad` → `mm/slab.ad`/`kmalloc`.
+- Per-task PML4 with explicit PTE chains for user mappings; the
+  kernel's 1 GiB identity stamp covers low RAM but is not relied on
+  for user pages (see `arch/x86/mm/pgtable.ad`).
+- No garbage collection (manual memory management — Adder has no
+  GC; see `LANGUAGE.md`).
 
 ### Calling Convention
 
-- Arguments in R0-R3, then stack
-- Return value in R0
-- R4-R11 callee-saved
-- R12 (IP) scratch register
-- LR (R14) return address
-- SP (R13) stack pointer
+SysV AMD64. Integer/pointer args in `%rdi`, `%rsi`, `%rdx`, `%rcx`,
+`%r8`, `%r9` for the first six; result in `%rax`. Functions emit
+`endbr64` at entry (IBT-ready), frame with `%rbp`, and never use the
+red zone (invalid in kernel context). See
+[`LANGUAGE.md`](LANGUAGE.md) § Functions for the full constraints.
 
 ### Hardware Abstraction
 
-All hardware access goes through devfs:
-
-```python
-# Read from device
-value: Ptr[char] = devfs_read(DEV_ADC, 0)
-
-# Write to device
-devfs_write(DEV_GPIO, 0, "1")
-```
+There is no separate "devfs" API — every device is a file in the
+VFS, opened with `vfs_open` / `vfs_read` / `vfs_write` (or the Plan
+9-shape `open`/`read`/`write` syscalls). Examples:
+`/dev/cons` (console), `/dev/random`, `/dev/cpuinfo`, `/net/tcp/clone`.
+See `docs/native-api.md` § "Reserved well-known paths" for the full
+list.
 
 ## Getting Help
 
