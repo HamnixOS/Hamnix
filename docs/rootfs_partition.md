@@ -199,6 +199,61 @@ outer-most match. Either resolve directly in one bind
 re-entry loop to `chan_resolve_prefix` (deferred; risky due to cycle
 potential).
 
+## Future direction — per-letter file servers (user direction 2026-05-26)
+
+Stub status; tracking work. The current implementation exposes each
+discovered ext4 partition as ONE 9P file server reachable via the
+`/ext` path-prefix dispatch (kernel-side, fs/vfs.ad). The user
+clarified the eventual shape:
+
+> "you plug in a thumb drive and it shows up as a single letter. It
+> allows us to split up the default EXT4 file system in logical
+> separated ways."
+>
+> "Let's do it split so that a FS found by the kernel without top
+> level #X letters is just a single File server, but if the root
+> contains #X hashtag<letter> then it's serves each folder as it's
+> own fileserver."
+
+The target design (not yet implemented):
+
+1. **Each discovered ext4 partition = a Plan 9 device letter.** First
+   partition is `#A`, second is `#B`, etc. (mirroring how Plan 9 names
+   disk devices). The current single-partition path effectively uses
+   `/ext` as that letter; this generalises.
+
+2. **Single-server mode**: if the partition's root directory contains
+   conventional directory names (`usr/`, `bin/`, `etc/`, …), the
+   kernel serves the whole partition as ONE file server. The shell
+   binds it as `bind /n/mydisk '#A'`.
+
+3. **Multi-server mode**: if the partition's root contains
+   marker-prefixed directories (`#a/`, `#b/`, `#c/` — final marker
+   syntax TBD; "perhaps it's not a hashtag" per user), each such
+   subdir becomes its OWN file server, addressable as `#A/a/`,
+   `#A/b/`, `#A/c/`. A thumb drive could carry `_distrofs/`,
+   `_userdata/`, `_apt-cache/` and have each bound independently:
+       bind /n/distros  '#A/distrofs'
+       bind /home       '#A/userdata'
+       bind /var/cache  '#A/apt-cache'
+
+Open design questions for the next iteration:
+  - Marker character (`#`? `_`? all-numeric? sentinel file at root?).
+    `#letter` on-disk is awkward because shell tools quote it, but
+    it's the most Plan 9-native shape.
+  - Does the kernel auto-bind any of these into the init namespace,
+    or only post them in `#s` for userspace `bind`?
+  - Per-server access controls (the partition is one ext4 fs; can a
+    process unmount `#A/distrofs` while keeping `#A/userdata`?). The
+    cleanest semantics: each per-letter server is its own Chan and
+    mtab entry; unmounting one doesn't touch the others.
+
+This shape isolates concerns nicely: apt-installed state lives on
+`#A/distrofs`; user home data on `#A/userdata`; the apt download
+cache on `#A/apt-cache`. Each is mountable into different namespaces
+independently. Future work; the current single-server shape is the
+foundation.
+
 ## Files involved
 
 - `scripts/build_rootfs_img.py` — stage + mkfs.ext4 the rootfs image
