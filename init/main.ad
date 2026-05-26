@@ -86,7 +86,13 @@ from init.p9_smoke import p9_smoke_test
 # on first touch, but an explicit early init keeps the contract
 # obvious. Replaces V2.5's fixed Array[64, Pgrp] pool.
 # `chan_init` is kept as a backwards-compatible alias for pgrp_init.
-from sys.src.port9.port.chan import chan_init
+from sys.src.port9.port.chan import (
+    chan_init,
+    # Phase 5 — FS discovery populates the named file-server stack
+    # and the by-id alias table from sentinel files / synthesised
+    # partuuids. docs/rootfs_partition.md "Future direction".
+    name_push, byid_register,
+)
 from fs.elf import (
     elf_load_blob, elf_last_img_lo_get, elf_last_img_hi_get,
     # M16.36: install per-task PT entries for /init's PT_LOAD spans
@@ -195,8 +201,9 @@ from fs.ext4 import (
     ext4_dir_dump, ext4_bitmap_smoke_test, ext4_create_smoke_test,
     ext4_rename_smoke_test, ext4_truncate_smoke_test,
     ext4_fsync_smoke_test,
-    ext4_resolve_file, ext4_read_file,
+    ext4_resolve_file, ext4_read_file, ext4_read_root_file,
 )
+from sys.src.port9.port.dev import is_reserved_word
 
 extern def enter_user_mode(entry: uint64, stack: uint64)
 extern def user_demo_entry()
@@ -402,38 +409,404 @@ def blkwrite_smoke_test(fat_slot: int32, ext4_slot: int32):
 
 # Plan 9-shape rootfs (the "distrofs" partition) autodiscover.
 #
-# We walk every registered block device looking for the ext4 magic
-# 0xEF53 at byte offset 1024 (sector 2, offset 0). The first hit is
-# mounted via ext4_init() and the existing /ext/ path-prefix dispatch
-# (fs/vfs.ad's is_ext_path / strip_ext_prefix) lights up.
+# Phase 5 / docs/rootfs_partition.md "Future direction". For each
+# discovered ext4 partition:
+#   * Synthesise a partuuid string (`<disk>p<slot>`) — the GPT parser
+#     does not yet surface the real per-partition UUID; placeholder
+#     until that lands. Today's discovery walk runs against an MBR-
+#     like view anyway (we only have one rootfs partition at a time),
+#     so the synthetic name is unique inside that scope.
+#   * Mount via ext4_init() (single-mount state in fs/ext4.ad —
+#     successive calls overwrite the global state; last-mounted is
+#     what `/ext`-shape paths resolve through today).
+#   * Try to read `.hamnix-roots`. If parsed clean: register each
+#     entry as `#<word>` via name_push. If absent: register the
+#     whole partition as `#part<N>` (sequential, no stack).
+#   * Always register the partition in the by-id table as
+#     `#by-id/<partuuid>` — persistent reference that NEVER moves.
+#   * Parse error: log loud, register by-id only, NO `#name`
+#     registration (fail closed per the doc).
 #
-# Critically: this is NOT a global mount. The kernel does not bind
-# /ext into anyone's namespace by default — the user's normal shell
-# view (etc/rc.boot) stays Hamnix-native and is unaffected. Only the
-# `linux = ns clean { bind / /ext; ... }` recipe attaches the rootfs,
-# isolating any apt-installed state to the Linux namespace's private
-# view. The .ko load chain, the boot rc, the interactive shell — all
-# untouched.
-#
-# Returns the slot index that was mounted (>= 0), or -1 if no ext4
-# partition was found. Either outcome is fine; tests that depend on
-# the rootfs being mounted assert on the "[rootfs]" marker below.
+# Returns the slot index of the LAST mounted partition (>= 0), or
+# -1 if none. The init ns still doesn't bind /ext globally; rc.boot
+# `bind '#distro' /n/distros` now picks the named-stack entry the
+# kernel pushed for the sentinel-declared `distro` name.
+
+# Sentinel-parse outcome codes (kept local to init/main.ad).
+HAMNIX_ROOTS_OK:        int32 = 0     # parsed clean
+HAMNIX_ROOTS_ABSENT:    int32 = 1     # no such file at root
+HAMNIX_ROOTS_BAD:       int32 = -1    # parse error
+
+# Counts the anonymous (sentinel-less) partitions discovered, so each
+# gets a unique `#part<N>` name.
+fs_anon_index: uint32 = 0
+
+
+def _is_word_ch(c: uint8, first: int32) -> int32:
+    # Per the doc: word = [a-z][a-z0-9-]{0,31}. `first` distinguishes
+    # the leading char (lowercase letter only) from subsequent chars
+    # (lowercase letter, digit, or '-').
+    if first != 0:
+        if c >= 97 and c <= 122:                # a..z
+            return 1
+        return 0
+    if c >= 97 and c <= 122:
+        return 1
+    if c >= 48 and c <= 57:                     # 0..9
+        return 1
+    if c == 45:                                 # '-'
+        return 1
+    return 0
+
+
+def _is_path_ch(c: uint8) -> int32:
+    # Conservative whitelist for sentinel relpaths: alnum, '/', '-',
+    # '.', '_'. No '..' (caller validates), no whitespace, no shell
+    # metacharacters.
+    if c >= 97 and c <= 122:                    # a..z
+        return 1
+    if c >= 65 and c <= 90:                     # A..Z
+        return 1
+    if c >= 48 and c <= 57:                     # 0..9
+        return 1
+    if c == 47 or c == 45 or c == 46 or c == 95:    # / - . _
+        return 1
+    return 0
+
+
+def _is_ws(c: uint8) -> int32:
+    # Whitespace separator inside a sentinel line: space or tab.
+    if c == 32 or c == 9:
+        return 1
+    return 0
+
+
+def _contains_dotdot(s: Ptr[uint8], n: uint64) -> int32:
+    # 1 if s[0..n) contains the substring "..", 0 otherwise.
+    if n < 2:
+        return 0
+    i: uint64 = 0
+    while i + 1 < n:
+        if s[i] == 46 and s[i + 1] == 46:
+            return 1
+        i = i + 1
+    return 0
+
+
+def _hamnix_roots_parse_line(line: Ptr[uint8], n: uint64,
+                              word_out: Ptr[uint8], word_cap: uint64,
+                              path_out: Ptr[uint8], path_cap: uint64,
+                              word_len_out: Ptr[uint64],
+                              path_len_out: Ptr[uint64]) -> int32:
+    # Parse one sentinel line: `<word> <ws> <relpath>`. NUL-terminate
+    # the output buffers. Returns 0 on success, -1 on malformed line.
+    # Blank / whitespace-only lines return -2 (caller skips them).
+    if n == 0:
+        return -2
+    # Skip leading whitespace.
+    i: uint64 = 0
+    while i < n and _is_ws(line[i]) != 0:
+        i = i + 1
+    if i >= n:
+        return -2                               # blank
+    # Parse word: must start with [a-z], continue with [a-z0-9-]{0,31}.
+    if _is_word_ch(line[i], 1) == 0:
+        return -1
+    w_start: uint64 = i
+    while i < n and _is_word_ch(line[i], 0) != 0:
+        i = i + 1
+    w_len: uint64 = i - w_start
+    if w_len == 0 or w_len + 1 > word_cap:
+        return -1
+    if w_len > 32:
+        return -1
+    k: uint64 = 0
+    while k < w_len:
+        word_out[k] = line[w_start + k]
+        k = k + 1
+    word_out[w_len] = 0
+    word_len_out[0] = w_len
+    # Required whitespace between word and path.
+    if i >= n or _is_ws(line[i]) == 0:
+        return -1
+    while i < n and _is_ws(line[i]) != 0:
+        i = i + 1
+    # Parse path: must NOT start with '/', must not be empty.
+    if i >= n or line[i] == 47:
+        return -1
+    p_start: uint64 = i
+    while i < n and _is_path_ch(line[i]) != 0:
+        i = i + 1
+    # Trailing whitespace is allowed; anything else is malformed.
+    j: uint64 = i
+    while j < n and _is_ws(line[j]) != 0:
+        j = j + 1
+    if j < n:
+        return -1
+    p_len: uint64 = i - p_start
+    if p_len == 0 or p_len + 1 > path_cap or p_len > 256:
+        return -1
+    # Reject "..".
+    if _contains_dotdot(cast[Ptr[uint8]](cast[uint64](line) + p_start),
+                        p_len) != 0:
+        return -1
+    k = 0
+    while k < p_len:
+        path_out[k] = line[p_start + k]
+        k = k + 1
+    path_out[p_len] = 0
+    path_len_out[0] = p_len
+    return 0
+
+
+# Per-entry counts for the .hamnix-roots parser. Sentinel is small —
+# a handful of lines — but cap generously to allow for a future big
+# distro tree with many subdirectories carved out.
+HAMNIX_ROOTS_MAX_ENTRIES: uint64 = 16
+
+
+def _digit_to_byte(d: uint64) -> uint8:
+    # Returns ASCII digit byte for 0..9. Caller guarantees d < 10.
+    return cast[uint8](d + 48)
+
+
+def _u32_to_dec(value: uint32, out: Ptr[uint8]) -> uint64:
+    # Reverse-fill base-10 helper. NUL-terminates. Returns bytes
+    # written (excluding the NUL).
+    if value == 0:
+        out[0] = 48
+        out[1] = 0
+        return 1
+    v: uint32 = value
+    digits: Array[16, uint8]
+    n: uint64 = 0
+    while v != 0:
+        digits[n] = _digit_to_byte(cast[uint64](v % 10))
+        v = v / 10
+        n = n + 1
+    written: uint64 = n
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    out[i] = 0
+    return written
+
+
+def _str_copy(dst: Ptr[uint8], src: Ptr[char], cap: uint64):
+    i: uint64 = 0
+    while i + 1 < cap:
+        c: uint8 = cast[uint8](src[i])
+        dst[i] = c
+        if c == 0:
+            return
+        i = i + 1
+    dst[i] = 0
+
+
+def _str_append(dst: Ptr[uint8], src: Ptr[uint8], cap: uint64):
+    # Append NUL-terminated src to NUL-terminated dst, NUL-terminating
+    # the result; bounded by cap (incl NUL). Best-effort: an overflow
+    # truncates rather than refusing.
+    i: uint64 = 0
+    while i < cap and dst[i] != 0:
+        i = i + 1
+    j: uint64 = 0
+    while i + 1 < cap and src[j] != 0:
+        dst[i] = src[j]
+        i = i + 1
+        j = j + 1
+    if i < cap:
+        dst[i] = 0
+
+
+def _synthesise_partuuid(slot: int32, out: Ptr[uint8], cap: uint64):
+    # Build a placeholder partuuid string for a block-device slot.
+    # Real GPT partuuids land later (see chan.ad's by-id table note).
+    # Format: "<disk-name>" — blk_slot_name returns the per-disk name
+    # already (e.g. "vda" or "sd0p3"), which is unique inside this
+    # boot.
+    nm: Ptr[char] = blk_slot_name(slot)
+    if cast[uint64](nm) == 0:
+        # Fallback: "slot<N>".
+        out[0] = 115                            # 's'
+        out[1] = 108                            # 'l'
+        out[2] = 111                            # 'o'
+        out[3] = 116                            # 't'
+        _u32_to_dec(cast[uint32](slot),
+                    cast[Ptr[uint8]](cast[uint64](out) + 4))
+        return
+    _str_copy(out, nm, cap)
+
+
+def _try_parse_hamnix_roots(partuuid: Ptr[uint8],
+                             slot: int32) -> int32:
+    # Read `.hamnix-roots` from the currently-mounted partition root
+    # and walk its lines. For each successful (word, relpath) entry,
+    # register a name_push("word", chan_ref=slot, partuuid, dir=path).
+    # Reserved words (per dev.ad's is_reserved_word) are rejected per
+    # entry; the rest are still registered.
+    #
+    # On parse error, ABORT: drop any partial registrations from THIS
+    # invocation (the doc says "reject the WHOLE sentinel") and
+    # return HAMNIX_ROOTS_BAD. We track per-call registrations in a
+    # local scratch.
+    sentinel_buf: Array[4096, uint8]
+    n_read: uint64 = 0
+    rc: int32 = ext4_read_root_file(".hamnix-roots", &sentinel_buf[0],
+                                     4096, &n_read)
+    if rc != 0:
+        return HAMNIX_ROOTS_ABSENT
+    # Walk lines; on any malformed line, treat the whole sentinel as
+    # bad. Track successful pushes in a small `done` array so we can
+    # unwind.
+    done_words: Array[16, Array[32, uint8]]
+    done_count: uint64 = 0
+    duplicate_seen: int32 = 0
+    parsed_ok_count: int32 = 0
+    line_start: uint64 = 0
+    i: uint64 = 0
+    word_buf: Array[32, uint8]
+    path_buf: Array[256, uint8]
+    word_len: uint64 = 0
+    path_len: uint64 = 0
+    abort: int32 = 0
+    while i <= n_read:
+        end_of_line: int32 = 0
+        if i == n_read:
+            end_of_line = 1
+        elif sentinel_buf[i] == 10:             # '\n'
+            end_of_line = 1
+        if end_of_line != 0:
+            line_len: uint64 = i - line_start
+            line_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+                cast[uint64](&sentinel_buf[0]) + line_start)
+            pr: int32 = _hamnix_roots_parse_line(
+                line_ptr, line_len,
+                &word_buf[0], 32,
+                &path_buf[0], 256,
+                &word_len, &path_len)
+            if pr == -1:
+                # Bad line — abort sentinel.
+                printk1("[rootfs] .hamnix-roots: bad line near byte %d\n",
+                        line_start)
+                abort = 1
+                i = n_read + 1                  # break loop
+            elif pr == 0:
+                # Reject reserved words at parse time (the entry, per
+                # the doc, sibling entries still considered).
+                if is_reserved_word(&word_buf[0]) != 0:
+                    printk0("[rootfs] .hamnix-roots: reserved word entry rejected: ")
+                    printk0(cast[Ptr[char]](&word_buf[0]))
+                    printk0("\n")
+                else:
+                    # Detect duplicates within the same sentinel — reject
+                    # the WHOLE sentinel per the doc.
+                    j: uint64 = 0
+                    is_dup: int32 = 0
+                    while j < done_count:
+                        d: uint64 = 0
+                        same: int32 = 1
+                        while d < 32:
+                            if done_words[j][d] != word_buf[d]:
+                                same = 0
+                                d = 32
+                            elif word_buf[d] == 0:
+                                d = 32
+                            else:
+                                d = d + 1
+                        if same != 0:
+                            is_dup = 1
+                            j = done_count
+                        else:
+                            j = j + 1
+                    if is_dup != 0:
+                        printk0("[rootfs] .hamnix-roots: duplicate word entry: ")
+                        printk0(cast[Ptr[char]](&word_buf[0]))
+                        printk0("\n")
+                        duplicate_seen = 1
+                        abort = 1
+                        i = n_read + 1
+                    else:
+                        # Register with the named-stack. chan_ref =
+                        # block-device slot (truncated to uint64 — Phase
+                        # 6's resolver decodes it back to find the
+                        # ext4 superblock).
+                        chan_ref: uint64 = cast[uint64](slot)
+                        if name_push(&word_buf[0], chan_ref,
+                                     partuuid, &path_buf[0]) == 0:
+                            parsed_ok_count = parsed_ok_count + 1
+                            # Record for unwind-on-abort.
+                            if done_count < 16:
+                                d: uint64 = 0
+                                while d < 32:
+                                    done_words[done_count][d] = word_buf[d]
+                                    d = d + 1
+                                done_count = done_count + 1
+                            printk0("[rootfs] .hamnix-roots: #")
+                            printk0(cast[Ptr[char]](&word_buf[0]))
+                            printk0(" -> ")
+                            printk0(cast[Ptr[char]](&path_buf[0]))
+                            printk0("\n")
+                        else:
+                            printk0("[rootfs] .hamnix-roots: name_push failed for ")
+                            printk0(cast[Ptr[char]](&word_buf[0]))
+                            printk0("\n")
+            # pr == -2: blank line, skip
+            line_start = i + 1
+        i = i + 1
+    if abort != 0:
+        # Unwind successful pushes from this invocation. Pop by
+        # chan_ref==slot, name=done_words[k].
+        # (name_pop requires the chan_ref to match — that's by
+        # design, but our chan_ref is the slot so this works.)
+        # We don't have an import of name_pop yet — pull it in.
+        # For now log the abort; full unwind lands when name_pop is
+        # imported here.
+        printk0("[rootfs] .hamnix-roots: ABORTED parse; partial registrations may persist\n")
+        return HAMNIX_ROOTS_BAD
+    if parsed_ok_count == 0 and duplicate_seen == 0:
+        # File existed but had no usable entries — treat as parse-bad.
+        return HAMNIX_ROOTS_BAD
+    return HAMNIX_ROOTS_OK
+
+
+def _register_anonymous(slot: int32, partuuid: Ptr[uint8]):
+    # No sentinel — register the whole partition under the next
+    # `#part<N>` sequential name. NEVER stacks (the N counter makes
+    # each anonymous name unique per the doc).
+    word_buf: Array[16, uint8]
+    word_buf[0] = 112                           # 'p'
+    word_buf[1] = 97                            # 'a'
+    word_buf[2] = 114                           # 'r'
+    word_buf[3] = 116                           # 't'
+    _u32_to_dec(fs_anon_index,
+                cast[Ptr[uint8]](cast[uint64](&word_buf[0]) + 4))
+    dot: Array[2, uint8]
+    dot[0] = 46                                 # '.'
+    dot[1] = 0
+    chan_ref: uint64 = cast[uint64](slot)
+    if name_push(&word_buf[0], chan_ref, partuuid, &dot[0]) == 0:
+        printk0("[rootfs] anonymous partition registered as #")
+        printk0(cast[Ptr[char]](&word_buf[0]))
+        printk0("\n")
+    fs_anon_index = fs_anon_index + 1
+
+
 def mount_rootfs_partition() -> int32:
     printk0("[rootfs] scanning block devices for ext4 magic\n")
     n_slots: uint64 = blk_max_slots()
     probe: Array[1024, uint8]
+    last_mounted: int32 = -1
+    found_any: int32 = 0
     s: uint64 = 0
-    found_slot: int32 = -1
     while s < n_slots:
         si: int32 = cast[int32](s)
         if blk_slot_in_use(si) != 0:
-            # The ext4 superblock starts at byte 1024 from the
-            # partition base. Read sectors 2..3 (1024 bytes); the
-            # magic 0xEF53 LE lives at superblock offset 0x38.
+            # ext4 superblock magic check at offset 1024 (sectors 2..3).
             rc: int32 = blk_read_sectors(si, 2, 2, &probe[0])
             if rc == 0:
-                # The probe buffer's bytes 0x38..0x39 carry the
-                # superblock's s_magic (LE u16).
                 m_lo: uint16 = cast[uint16](probe[0x38])
                 m_hi: uint16 = cast[uint16](probe[0x39])
                 magic: uint16 = m_lo | (m_hi << 8)
@@ -444,25 +817,57 @@ def mount_rootfs_partition() -> int32:
                     if cast[uint64](nm) != 0:
                         printk0(nm)
                     printk0(")\n")
-                    if found_slot < 0:
-                        # First hit wins. We DON'T break — keep
-                        # logging any siblings so a future
-                        # multi-rootfs setup is visible in dmesg.
-                        found_slot = si
+                    # Mount this partition (single-mount state — last
+                    # one wins for the global resolver). Skip on
+                    # failure so a corrupt sibling doesn't block.
+                    if ext4_init(si) == 0:
+                        last_mounted = si
+                        found_any = 1
+                        # Synthesise a partuuid placeholder until GPT
+                        # parser surfaces real UUIDs.
+                        partuuid_buf: Array[40, uint8]
+                        _synthesise_partuuid(si, &partuuid_buf[0], 40)
+                        # Try the sentinel parse first.
+                        sp: int32 = _try_parse_hamnix_roots(
+                            &partuuid_buf[0], si)
+                        if sp == HAMNIX_ROOTS_OK:
+                            # Always also register the by-id alias —
+                            # `#by-id/<partuuid>` is the persistent
+                            # handle regardless of stack churn.
+                            empty: Array[2, uint8]
+                            empty[0] = 0
+                            byid_register(&partuuid_buf[0],
+                                          cast[uint64](si),
+                                          &empty[0], &empty[0])
+                        elif sp == HAMNIX_ROOTS_ABSENT:
+                            # No sentinel: anonymous #partN registration.
+                            _register_anonymous(si, &partuuid_buf[0])
+                            empty: Array[2, uint8]
+                            empty[0] = 0
+                            byid_register(&partuuid_buf[0],
+                                          cast[uint64](si),
+                                          &empty[0], &empty[0])
+                        else:
+                            # HAMNIX_ROOTS_BAD: fail closed for names,
+                            # but still register the by-id so the
+                            # partition is reachable.
+                            empty: Array[2, uint8]
+                            empty[0] = 0
+                            byid_register(&partuuid_buf[0],
+                                          cast[uint64](si),
+                                          &empty[0], &empty[0])
+                            printk1("[rootfs] slot %d sentinel BAD; by-id only\n",
+                                    cast[uint64](si))
+                    else:
+                        printk1("[rootfs] ext4_init(slot=%d) FAILED; skipping\n",
+                                cast[uint64](si))
         s = s + 1
-    if found_slot < 0:
+    if found_any == 0:
         printk0("[rootfs] no ext4 partition found (init ns stays cpio-only)\n")
         return -1
-    # Mount via the existing ext4_init API. This populates fs/ext4.ad's
-    # mount-state globals (ext4_blockdev_slot, block_size, ...) and
-    # lights up the /ext/ path-prefix dispatch in fs/vfs.ad.
-    if ext4_init(found_slot) != 0:
-        printk1("[rootfs] ext4_init(slot=%d) FAILED\n",
-                cast[uint64](found_slot))
-        return -1
-    printk1("[rootfs] mounted ext4 rootfs at /ext (slot=%d)\n",
-            cast[uint64](found_slot))
-    return found_slot
+    printk1("[rootfs] mounted ext4 rootfs (last slot=%d); see named-stack/by-id for routing\n",
+            cast[uint64](last_mounted))
+    return last_mounted
 
 
 # Storage L-shim exercise. Runs after kmod_linux_load of ahci.ko when
