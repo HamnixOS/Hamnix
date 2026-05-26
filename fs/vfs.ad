@@ -82,6 +82,14 @@ from sys.src.port9.port.devmounts import (
 from sys.src.port9.port.devdiskstats import (
     devdiskstats_read, devdiskstats_write, FD_DISKSTATS_MARK,
 )
+# M16.x: /dev/blk/<name> block-device cdev. FD_BLK_MARK fds carry
+# (slot, mode) in fd_buf and a byte offset in fd_pos. Dispatch arms
+# below route reads/writes to blk_read_sectors/blk_write_sectors.
+from sys.src.port9.port.devblk import (
+    devblk_read, devblk_write, devblk_path_match,
+    devblk_capacity_bytes,
+    FD_BLK_MARK,
+)
 from sys.src.port9.port.devproc import (
     devproc_open, devproc_read, devproc_write, devproc_close,
     devproc_is_proc_fd, devproc_path_match,
@@ -630,6 +638,19 @@ def vfs_open(name: Ptr[char]) -> int32:
     chan_fd: int32 = _namec_open(name, 0)              # OREAD
     if chan_fd != P9_NO_MOUNT:
         return chan_fd
+    # /dev/blk/<name>{,/size,/ctl} — block-device cdev. devblk owns
+    # every registered block-device's raw byte stream (read+write into
+    # the underlying driver) plus a /size text file and a /ctl command
+    # channel (mkfs_ext4 / mkfs_fat / gpt_init / gpt_mkpart / rescan).
+    # See sys/src/9/port/devblk.ad for the FD packing. Routed BEFORE
+    # /net so a future /net path collision can't shadow a block dev.
+    bp_packed: uint64 = 0
+    bp_rc: int32 = devblk_path_match(name, &bp_packed)
+    if bp_rc == 1:
+        return _open_blk_marked(bp_packed)
+    if bp_rc < 0:
+        set_current_errstr("blk: no such device")
+        return ENOENT
     # ARCH §10: the /net 9P file tree. /net/tcp/clone, /net/udp/clone
     # and the per-connection /net/<proto>/<N>/{ctl,data,status,local,
     # remote} files are the Plan-9-shaped networking surface — open
@@ -1232,6 +1253,16 @@ def vfs_open_write(name: Ptr[char]) -> int32:
         return _open_dev_marked(FD_DEVNULL_MARK)
     if _path_eq_const(name, "/dev/zero", 9) != 0:
         return _open_dev_marked(FD_DEVZERO_MARK)
+    # /dev/blk/<name>{,/size,/ctl} OWRITE side. The installer opens
+    # the block-device cdev with SYS_OPEN_WRITE and streams raw bytes
+    # (or sends a CTL command); same fd shape as the OREAD path.
+    bwp_packed: uint64 = 0
+    bwp_rc: int32 = devblk_path_match(name, &bwp_packed)
+    if bwp_rc == 1:
+        return _open_blk_marked(bwp_packed)
+    if bwp_rc < 0:
+        set_current_errstr("blk: no such device")
+        return ENOENT
     # Phase D: the universal namec open path, OWRITE side. The same
     # probe vfs_open uses for reads — namec() walks the Pgrp mount
     # table, produces a local-device Chan for a /dev/<name> cdev or a
@@ -2204,6 +2235,23 @@ def _open_dev_marked(mark: uint32) -> int32:
     return fd
 
 
+def _open_blk_marked(pack: uint64) -> int32:
+    # /dev/blk/<name>{,/size,/ctl} open. `pack` already encodes the
+    # block-device slot (low 32 bits) + mode (RAW / SIZE / CTL, shifted
+    # into bits 32..). Plant it in fd_buf so vfs_read / vfs_write can
+    # dispatch through devblk_read / devblk_write without re-resolving
+    # the name. fd_pos is the byte cursor (only meaningful in RAW mode).
+    task: Ptr[TaskStruct] = current_task()
+    fd: int32 = _alloc_fd(task)
+    if fd < 0:
+        return EMFILE
+    fdu: uint64 = cast[uint64](fd)
+    task[0].fd_idx[fdu] = FD_BLK_MARK
+    task[0].fd_pos[fdu] = 0
+    task[0].fd_buf[fdu] = pack
+    return fd
+
+
 # --- ARCH §10: the /net 9P file-tree open path ----------------------
 #
 # An open of a /net path produces an FD_NET_MARK fd. The fd_buf packs
@@ -2890,6 +2938,17 @@ def vfs_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         # blockdev_table slot. Counter columns are 0 placeholders
         # until the block layer grows per-slot stats (see TODO.md).
         return devdiskstats_read(buf, count)
+    if file_idx == FD_BLK_MARK:
+        # /dev/blk/<name>{,/size} read side. fd_buf packs (slot, mode);
+        # fd_pos is the byte cursor (RAW only). devblk_read advances
+        # nothing — vfs.ad updates fd_pos here after a successful read
+        # so the next read continues where this one left off.
+        bp_pos: uint64 = task[0].fd_pos[fdu]
+        bp_pack: uint64 = task[0].fd_buf[fdu]
+        bp_n: int64 = devblk_read(bp_pack, bp_pos, buf, count)
+        if bp_n > 0:
+            task[0].fd_pos[fdu] = bp_pos + cast[uint64](bp_n)
+        return bp_n
     if devproc_is_proc_fd(file_idx) != 0:
         # /proc/<pid>/{status,cwd,ns,...} read side. The marker carries
         # pid + file_kind in its low 24 bits; devproc_read decodes
@@ -3242,6 +3301,17 @@ def vfs_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         # M16.135: /dev/diskstats is read-only; devdiskstats_write
         # returns -1.
         return devdiskstats_write(buf, count)
+    if file_idx == FD_BLK_MARK:
+        # /dev/blk/<name>{,/ctl} write side. RAW writes go to
+        # blk_write_sectors at fd_pos; CTL writes parse a command and
+        # trigger an in-kernel formatter. SIZE writes return -EINVAL
+        # (devblk_write rejects them).
+        bw_pos:  uint64 = task[0].fd_pos[fdu]
+        bw_pack: uint64 = task[0].fd_buf[fdu]
+        bw_n: int64 = devblk_write(bw_pack, bw_pos, buf, count)
+        if bw_n > 0:
+            task[0].fd_pos[fdu] = bw_pos + cast[uint64](bw_n)
+        return bw_n
     if devproc_is_proc_fd(file_idx) != 0:
         # /proc/<pid>/<file> write side. devproc_write currently
         # rejects every write (returns -1 + errstr) because the only
@@ -3664,6 +3734,29 @@ def vfs_lseek(fd: int32, offset: int64, whence: int32) -> int64:
     file_idx: uint32 = task[0].fd_idx[fdu]
     if file_idx == FD_CLOSED_MARK:
         return cast[int64](EBADF)
+    if file_idx == FD_BLK_MARK:
+        # /dev/blk/<name> RAW mode is seekable — the device is a flat
+        # byte array of known capacity. SIZE/CTL fds also accept seek
+        # (e.g. cat re-reads /size after a write); we treat them as
+        # zero-length so SEEK_END pins to 0.
+        pack: uint64 = task[0].fd_buf[fdu]
+        mode: uint64 = (pack >> 32) & 0xFFFF
+        size: uint64 = 0
+        if mode == 0:
+            size = devblk_capacity_bytes(pack)
+        new_pos: int64 = 0
+        if whence == SEEK_SET:
+            new_pos = offset
+        elif whence == SEEK_CUR:
+            new_pos = cast[int64](task[0].fd_pos[fdu]) + offset
+        elif whence == SEEK_END:
+            new_pos = cast[int64](size) + offset
+        else:
+            return cast[int64](EINVAL)
+        if new_pos < 0:
+            return cast[int64](EINVAL)
+        task[0].fd_pos[fdu] = cast[uint64](new_pos)
+        return new_pos
     if file_idx == FD_STDIN_MARK or file_idx == FD_STDOUT_MARK \
             or file_idx == FD_STDERR_MARK or file_idx == FD_BUFFER_MARK \
             or file_idx == FD_PIPE_MARK_R or file_idx == FD_PIPE_MARK_W \

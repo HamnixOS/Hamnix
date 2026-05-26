@@ -1,0 +1,466 @@
+# sys/src/9/port/devblk.ad
+#
+# Layer 1 (Plan 9-shape) block-device cdev — exposes every registered
+# block device under /dev/blk/<name> as a writable byte stream. Mirrors
+# 9front's /sys/src/9/port/devsd.c at minimum scope: one cdev per
+# registered block (vda, sd0, sd0p1, nvme0n1, ram0, ...) routing
+# user reads + writes to kernel/block/blk.ad's blk_read_sectors /
+# blk_write_sectors.
+#
+# This is the userland-visible primitive that lets the installer
+# (etc/install.hamsh) write a partition table, an ESP, and a rootfs
+# onto a freshly-attached disk without any new syscalls — `cat`-style
+# byte writes into /dev/blk/<dev> land directly on the underlying
+# driver (virtio-blk, AHCI, NVMe, brd).
+#
+# Naming:
+#   /dev/blk/<name>          read/write the raw device bytes
+#   /dev/blk/<name>/size     ASCII total byte count (sectors × 512)
+#   /dev/blk/<name>/ctl      write-only control channel — accepts
+#                            text commands ("mkfs_ext4\n",
+#                            "mkfs_fat <size_mb>\n",
+#                            "gpt_init\n", "gpt_mkpart <idx> <start>
+#                            <end> <esp|linux>\n", "rescan\n") so
+#                            userland can trigger in-kernel formatters
+#                            that would otherwise need a new syscall.
+#
+# Why a /ctl file rather than a SYS_BLK_* syscall: the formatters
+# already exist (fs/ext4.ad::ext4_mkfs, fs/fat_mkfs.ad::fat_mkfs,
+# drivers/block/partition.ad::gpt_init/gpt_mkpart) and operate on
+# block-device slot indices. Routing them through a write to a
+# cdev keeps the syscall surface unchanged and matches Plan 9's
+# /dev/<thing>/ctl pattern (e.g. /dev/sdN/ctl in 9front). One cdev,
+# many verbs.
+#
+# FD packing (FD_BLK_MARK fds):
+#   fd_buf   = ((mode_bits) << 32) | (slot_index)
+#              mode_bits: 0 = raw bytes (read+write to sectors)
+#                         1 = size text (read-only)
+#                         2 = ctl (write-only, commands)
+#   fd_pos   = current byte offset within the device (raw mode only)
+#   fd_buflen = unused
+#
+# Block-aligned writes are required (sector size = 512). A misaligned
+# offset or non-multiple-of-512 count is rejected with -EINVAL. The
+# installer always writes in sector-multiple chunks, so this is fine.
+#
+# See:
+#   kernel/block/blk.ad — blk_read_sectors / blk_write_sectors /
+#                         blk_capacity_sectors / blk_slot_in_use /
+#                         blk_slot_name / blk_max_slots
+#   fs/ext4.ad         — ext4_mkfs(slot, total_sectors)
+#   fs/fat_mkfs.ad     — fat_mkfs(slot, size_mb)
+#   drivers/block/partition.ad — gpt_init / gpt_mkpart / partition_rescan
+#
+# As with every other dev*.ad in this directory, the FD_BLK_MARK
+# constant lives HERE (not in kernel/sched/core.ad) so a single
+# additive commit doesn't have to touch core.ad. fs/vfs.ad imports
+# FD_BLK_MARK from this file alongside the dispatch entry points.
+
+from kernel.printk.printk import printk0, printk1, printk2
+from kernel.block.blk import (
+    blk_read_sectors, blk_write_sectors,
+    blk_capacity_sectors,
+    blk_slot_in_use, blk_slot_name, blk_max_slots,
+    blk_register_partitions,
+    SECTOR_SIZE,
+)
+from fs.ext4 import ext4_mkfs
+from fs.fat_mkfs import fat_mkfs
+from drivers.block.partition import (
+    gpt_init, gpt_mkpart, partition_rescan,
+    GPT_GUID_LINUX_FS_LOW, GPT_GUID_LINUX_FS_HIGH,
+    GPT_GUID_EFI_SYSTEM_LOW, GPT_GUID_EFI_SYSTEM_HIGH,
+)
+
+
+# FD marker. Sits one below FD_DISKSTATS_MARK (0xFFFFFFE4) so the
+# cdev range stays contiguous; clear of the FD_CHAN_MARK band
+# (0xFFFFFFE0).
+FD_BLK_MARK: uint32 = 0xFFFFFFE3
+
+
+# fd_buf encoding helpers. We pack a 2-bit "mode" in bits 32..33 and
+# the slot index in bits 0..31. Plenty of headroom on both sides.
+BLK_MODE_RAW:  uint64 = 0
+BLK_MODE_SIZE: uint64 = 1
+BLK_MODE_CTL:  uint64 = 2
+
+
+def devblk_pack(slot: int32, mode: uint64) -> uint64:
+    return (mode << 32) | (cast[uint64](slot) & 0xFFFFFFFF)
+
+
+def devblk_unpack_slot(pkd: uint64) -> int32:
+    return cast[int32](pkd & 0xFFFFFFFF)
+
+
+def devblk_unpack_mode(pkd: uint64) -> uint64:
+    return (pkd >> 32) & 0xFFFF
+
+
+# --- path matching --------------------------------------------------
+#
+# devblk_path_match recognises the three /dev/blk/<name>{,/size,/ctl}
+# spellings and returns a pkd (slot, mode) cookie ready to stuff
+# into fd_buf. Returns -1 if `path` is not a /dev/blk/* path or if
+# the named device is not registered.
+
+DEVBLK_PREFIX_LEN: uint64 = 9            # length of "/dev/blk/"
+DEVBLK_NAME_MAX:   uint64 = 16
+
+
+def _devblk_prefix_match(path: Ptr[char]) -> int32:
+    # Returns 1 if path starts with "/dev/blk/", 0 otherwise.
+    if path[0] != 47:                                  # '/'
+        return 0
+    if path[1] != 100:                                 # 'd'
+        return 0
+    if path[2] != 101:                                 # 'e'
+        return 0
+    if path[3] != 118:                                 # 'v'
+        return 0
+    if path[4] != 47:                                  # '/'
+        return 0
+    if path[5] != 98:                                  # 'b'
+        return 0
+    if path[6] != 108:                                 # 'l'
+        return 0
+    if path[7] != 107:                                 # 'k'
+        return 0
+    if path[8] != 47:                                  # '/'
+        return 0
+    return 1
+
+
+def _name_eq(a: Ptr[char], an: uint64, b: Ptr[char]) -> int32:
+    # Compare the first `an` chars of `a` with the NUL-terminated `b`.
+    # Returns 1 on a full match (b also ends at `an`), 0 otherwise.
+    i: uint64 = 0
+    while i < an:
+        ca: int32 = a[i]
+        cb: int32 = b[i]
+        if cb == 0:
+            return 0
+        if ca != cb:
+            return 0
+        i = i + 1
+    # `a` end: require b to also end here.
+    if b[an] != 0:
+        return 0
+    return 1
+
+
+def _find_slot_by_name(name: Ptr[char], name_len: uint64) -> int32:
+    # Walk the kernel's block-device table and find the slot whose
+    # NUL-terminated name matches `name[0..name_len]`. Returns -1 on
+    # no match.
+    if name_len == 0:
+        return -1
+    cap: uint64 = blk_max_slots()
+    s: uint64 = 0
+    while s < cap:
+        slot_i: int32 = cast[int32](s)
+        if blk_slot_in_use(slot_i) != 0:
+            bname: Ptr[char] = blk_slot_name(slot_i)
+            if cast[uint64](bname) != 0:
+                if _name_eq(name, name_len, bname) != 0:
+                    return slot_i
+        s = s + 1
+    return -1
+
+
+def devblk_path_match(path: Ptr[char], out_packed: Ptr[uint64]) -> int32:
+    # Returns 1 + plants the pkd (slot, mode) cookie in *out_packed
+    # on a successful match. Returns 0 if the path is not /dev/blk/*.
+    # Returns -1 if the path IS /dev/blk/* but names an unregistered
+    # device (so the caller can surface -ENOENT).
+    if _devblk_prefix_match(path) == 0:
+        return 0
+    # Find the end of <name> (first '/' or NUL after the prefix).
+    tail: Ptr[char] = cast[Ptr[char]](
+        cast[uint64](path) + DEVBLK_PREFIX_LEN)
+    name_len: uint64 = 0
+    while name_len < DEVBLK_NAME_MAX:
+        c: int32 = tail[name_len]
+        if c == 0 or c == 47:
+            break
+        name_len = name_len + 1
+    if name_len == 0 or name_len >= DEVBLK_NAME_MAX:
+        return -1
+    slot: int32 = _find_slot_by_name(tail, name_len)
+    if slot < 0:
+        return -1
+    # Decide mode based on what follows <name>.
+    after: int32 = tail[name_len]
+    mode: uint64 = BLK_MODE_RAW
+    if after == 0:
+        mode = BLK_MODE_RAW
+    elif after == 47:                                  # '/'
+        sub: Ptr[char] = cast[Ptr[char]](
+            cast[uint64](tail) + name_len + 1)
+        # match "size" or "ctl"
+        if sub[0] == 115 and sub[1] == 105 and sub[2] == 122 \
+                and sub[3] == 101 and sub[4] == 0:
+            mode = BLK_MODE_SIZE
+        elif sub[0] == 99 and sub[1] == 116 and sub[2] == 108 \
+                and sub[3] == 0:
+            mode = BLK_MODE_CTL
+        else:
+            return -1
+    else:
+        return -1
+    out_packed[0] = devblk_pack(slot, mode)
+    return 1
+
+
+# --- size text rendering --------------------------------------------
+
+def _u64_to_dec(v: uint64, out: Ptr[uint8]) -> uint64:
+    if v == 0:
+        out[0] = 48
+        return 1
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    while v != 0:
+        digits[n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    written: uint64 = n
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    return written
+
+
+def devblk_capacity_bytes(pkd: uint64) -> uint64:
+    # Total byte capacity of the device referenced by `pkd`. Used
+    # by fs/vfs.ad's FD_BLK_MARK seek arm (SEEK_END needs the device
+    # size). Returns 0 for an invalid or unregistered slot.
+    slot: int32 = devblk_unpack_slot(pkd)
+    return blk_capacity_sectors(slot) * SECTOR_SIZE
+
+
+# --- public read/write --------------------------------------------------
+
+def devblk_read(pkd: uint64, fd_pos: uint64,
+                buf: Ptr[uint8], count: uint64) -> int64:
+    # Read from the device.
+    #   RAW : sector-aligned, blk_read_sectors. EOF at capacity.
+    #   SIZE: render ASCII decimal size in bytes (one-shot).
+    #   CTL : returns 0 (not readable).
+    slot: int32 = devblk_unpack_slot(pkd)
+    mode: uint64 = devblk_unpack_mode(pkd)
+    if mode == BLK_MODE_SIZE:
+        if fd_pos > 0:
+            return 0
+        cap: uint64 = blk_capacity_sectors(slot)
+        total_bytes: uint64 = cap * SECTOR_SIZE
+        scratch: Array[32, uint8]
+        n: uint64 = _u64_to_dec(total_bytes, &scratch[0])
+        scratch[n] = 10                                # '\n'
+        n = n + 1
+        take: uint64 = count
+        if take > n:
+            take = n
+        i: uint64 = 0
+        while i < take:
+            buf[i] = scratch[i]
+            i = i + 1
+        return cast[int64](take)
+    if mode == BLK_MODE_CTL:
+        return 0
+    # RAW
+    if (fd_pos % SECTOR_SIZE) != 0:
+        printk1("devblk: unaligned read pos=%d\n", fd_pos)
+        return -22                                     # -EINVAL
+    if (count % SECTOR_SIZE) != 0:
+        printk1("devblk: unaligned read count=%d\n", count)
+        return -22
+    if count == 0:
+        return 0
+    cap: uint64 = blk_capacity_sectors(slot)
+    lba: uint64 = fd_pos / SECTOR_SIZE
+    nsec: uint64 = count / SECTOR_SIZE
+    if lba >= cap:
+        return 0                                       # EOF
+    if lba + nsec > cap:
+        nsec = cap - lba
+    rc: int32 = blk_read_sectors(slot, lba, nsec, buf)
+    if rc != 0:
+        return -5                                      # -EIO
+    return cast[int64](nsec * SECTOR_SIZE)
+
+
+# --- CTL command parser ---------------------------------------------
+#
+# Commands are short ASCII lines. We accept up to 255 bytes per write
+# and parse the leading verb. The terminator is '\n' or end-of-buffer.
+
+devblk_ctl_buf: Array[256, uint8]
+
+
+def _ctl_starts_with(buf: Ptr[uint8], n: uint64, s: Ptr[uint8]) -> int32:
+    # 1 if buf[0..] starts with the NUL-terminated `s`.
+    i: uint64 = 0
+    while s[i] != 0:
+        if i >= n:
+            return 0
+        if buf[i] != s[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def _ctl_skip_ws(buf: Ptr[uint8], n: uint64, pos: uint64) -> uint64:
+    while pos < n:
+        c: uint8 = buf[pos]
+        if c != 32 and c != 9:                         # ' ' / '\t'
+            return pos
+        pos = pos + 1
+    return pos
+
+
+def _ctl_parse_u64(buf: Ptr[uint8], n: uint64, pos: uint64,
+                   out: Ptr[uint64]) -> uint64:
+    # Parse a decimal u64 starting at `pos`. Returns the new position.
+    # Stops at the first non-digit. Sets *out to the parsed value.
+    pos = _ctl_skip_ws(buf, n, pos)
+    v: uint64 = 0
+    while pos < n:
+        c: uint8 = buf[pos]
+        if c < 48 or c > 57:
+            break
+        v = v * 10 + cast[uint64](c - 48)
+        pos = pos + 1
+    out[0] = v
+    return pos
+
+
+def devblk_write(pkd: uint64, fd_pos: uint64,
+                 buf: Ptr[uint8], count: uint64) -> int64:
+    # Write to the device.
+    #   RAW : sector-aligned, blk_write_sectors. -EFBIG past capacity.
+    #   SIZE: -EINVAL (read-only).
+    #   CTL : parse a text command, dispatch to in-kernel formatter.
+    slot: int32 = devblk_unpack_slot(pkd)
+    mode: uint64 = devblk_unpack_mode(pkd)
+    if mode == BLK_MODE_SIZE:
+        return -22                                     # -EINVAL — RO
+    if mode == BLK_MODE_CTL:
+        return _devblk_ctl_write(slot, buf, count)
+    # RAW
+    if (fd_pos % SECTOR_SIZE) != 0:
+        printk1("devblk: unaligned write pos=%d\n", fd_pos)
+        return -22
+    if (count % SECTOR_SIZE) != 0:
+        printk1("devblk: unaligned write count=%d\n", count)
+        return -22
+    if count == 0:
+        return 0
+    cap: uint64 = blk_capacity_sectors(slot)
+    lba: uint64 = fd_pos / SECTOR_SIZE
+    nsec: uint64 = count / SECTOR_SIZE
+    if lba >= cap:
+        return -27                                     # -EFBIG
+    if lba + nsec > cap:
+        nsec = cap - lba
+    rc: int32 = blk_write_sectors(slot, lba, nsec, buf)
+    if rc != 0:
+        return -5                                      # -EIO
+    return cast[int64](nsec * SECTOR_SIZE)
+
+
+def _devblk_ctl_write(slot: int32, buf: Ptr[uint8],
+                      count: uint64) -> int64:
+    # Buffer the command into devblk_ctl_buf (capped at 255 bytes),
+    # then parse + dispatch.
+    n: uint64 = count
+    if n > 255:
+        n = 255
+    i: uint64 = 0
+    while i < n:
+        devblk_ctl_buf[i] = buf[i]
+        i = i + 1
+    devblk_ctl_buf[n] = 0
+    # Trim trailing newline.
+    if n > 0 and devblk_ctl_buf[n - 1] == 10:
+        devblk_ctl_buf[n - 1] = 0
+        n = n - 1
+    bp: Ptr[uint8] = &devblk_ctl_buf[0]
+
+    if _ctl_starts_with(bp, n, "mkfs_ext4") != 0:
+        # mkfs_ext4 — format the WHOLE device as a single ext4 FS.
+        # Caller is expected to have opened a PARTITION cdev
+        # (/dev/blk/vdaN), so the kernel sees the partition's capacity
+        # as the device capacity.
+        cap: uint64 = blk_capacity_sectors(slot)
+        rc: int32 = ext4_mkfs(slot, cap)
+        if rc != 0:
+            return -5
+        printk2("[devblk] mkfs_ext4 slot=%d cap=%d sectors OK\n",
+                cast[uint64](slot), cap)
+        return cast[int64](count)
+    if _ctl_starts_with(bp, n, "mkfs_fat") != 0:
+        # mkfs_fat [<size_mb>] — format the WHOLE device as FAT12.
+        # 0 means "use device capacity".
+        pos: uint64 = 8                                # past "mkfs_fat"
+        size_mb: uint64 = 0
+        pos = _ctl_skip_ws(bp, n, pos)
+        if pos < n:
+            pos = _ctl_parse_u64(bp, n, pos, &size_mb)
+        rc: int32 = fat_mkfs(slot, size_mb)
+        if rc != 0:
+            return -5
+        printk2("[devblk] mkfs_fat slot=%d size_mb=%d OK\n",
+                cast[uint64](slot), size_mb)
+        return cast[int64](count)
+    if _ctl_starts_with(bp, n, "gpt_init") != 0:
+        # gpt_init — lay down a fresh GPT + protective MBR on the
+        # WHOLE device. Caller must hold an fd onto the disk cdev
+        # (NOT a partition cdev).
+        cap: uint64 = blk_capacity_sectors(slot)
+        rc: int32 = gpt_init(slot, cap)
+        if rc != 0:
+            return -5
+        printk2("[devblk] gpt_init slot=%d cap=%d OK\n",
+                cast[uint64](slot), cap)
+        return cast[int64](count)
+    if _ctl_starts_with(bp, n, "gpt_mkpart") != 0:
+        # gpt_mkpart <idx> <start_lba> <end_lba> <type>
+        # type ∈ {esp, linux}.
+        pos: uint64 = 10                               # past "gpt_mkpart"
+        idx: uint64 = 0
+        st:  uint64 = 0
+        en:  uint64 = 0
+        pos = _ctl_parse_u64(bp, n, pos, &idx)
+        pos = _ctl_parse_u64(bp, n, pos, &st)
+        pos = _ctl_parse_u64(bp, n, pos, &en)
+        pos = _ctl_skip_ws(bp, n, pos)
+        # Type tag: "esp" or "linux".
+        guid_high: uint64 = GPT_GUID_LINUX_FS_HIGH
+        guid_low:  uint64 = GPT_GUID_LINUX_FS_LOW
+        if pos < n and bp[pos] == 101 and bp[pos + 1] == 115 \
+                and bp[pos + 2] == 112:                # "esp"
+            guid_high = GPT_GUID_EFI_SYSTEM_HIGH
+            guid_low  = GPT_GUID_EFI_SYSTEM_LOW
+        rc: int32 = gpt_mkpart(slot, cast[int32](idx), st, en,
+                               guid_high, guid_low)
+        if rc != 0:
+            return -5
+        printk2("[devblk] gpt_mkpart slot=%d idx=%d OK\n",
+                cast[uint64](slot), idx)
+        return cast[int64](count)
+    if _ctl_starts_with(bp, n, "rescan") != 0:
+        # Rescan partitions. Useful after gpt_mkpart so the partition
+        # siblings (/dev/blk/vdaN) appear without a reboot.
+        partition_rescan(slot)
+        nm2: Ptr[char] = blk_slot_name(slot)
+        if cast[uint64](nm2) != 0:
+            blk_register_partitions(slot, nm2)
+        printk1("[devblk] rescan slot=%d OK\n", cast[uint64](slot))
+        return cast[int64](count)
+    printk0("[devblk] ctl: unknown command\n")
+    return -22
