@@ -4,7 +4,7 @@
 
 > **Status:** the architectural design described here is shipped. The
 > live recipe is in [`/etc/rc.boot`](../etc/rc.boot) — `linux = ns clean
-> { bind / /ext; bind /home /home; bind /dev '#c' … }` (plus a
+> { bind '#distro' / ; bind /home /home; bind '#c' /dev ; … }` (plus a
 > duplicate-body `debian` alias). The `ns clean { … }` modifier (see
 > [`HAMSH_SPEC.md`](HAMSH_SPEC.md) §13) is what makes
 > `enter linux { … }` hermetic. This doc captures the design
@@ -15,12 +15,13 @@
 > The distro backing store is no longer baked into the kernel ELF's
 > cpio. It lives on a separate ext4 partition (`/dev/...p3` on the
 > ISO; vda on the QEMU `-drive` path), which the kernel auto-
-> discovers at boot and exposes via the `/ext` device-letter
-> dispatch. The init namespace `bind /n/distros /ext` so the shell
-> sees the partition at `/n/distros/`. The linux ns recipe uses
-> `bind / /ext` so the linux ns sees it as `/`. apt writes are
-> visible to the shell at `/n/distros/usr/bin/...`, NOT at
-> `/usr/bin/...` (which stays Hamnix-native cpio). See
+> discovers at boot via a `.hamnix-roots` sentinel and registers in
+> the per-name file-server stack as `#distro`. The init namespace
+> `bind '#distro' /n/distros` so the shell sees the partition at
+> `/n/distros/`. The linux ns recipe uses `bind '#distro' /` so the
+> linux ns sees it as `/`. apt writes are visible to the shell at
+> `/n/distros/usr/bin/...`, NOT at `/usr/bin/...` (which stays
+> Hamnix-native cpio). See
 > [`rootfs_partition.md`](rootfs_partition.md).
 
 In Hamnix, as in Plan 9, there is no global root. The kernel knows
@@ -137,39 +138,41 @@ Two implementations, in order of expected build:
 
 ## Entry point
 
-A userland binary at `/bin/distrorun`, with convenience aliases at
-`/bin/deb`, `/bin/ubuntu`, `/bin/suse` for common distros:
+There is no dedicated `distrorun` / `deb` / `ubuntu` binary —
+running a Linux binary is plain hamsh namespace verbs against a
+captured `ns clean { ... }` template. The historical `distrorun`
+proposal in the early drafts of this doc was retired before any
+binary was shipped; `etc/rc.boot` defines `linux` (and `debian`
+as a duplicate body) as `ns clean { ... }` templates and the
+shell `enter`s them:
 
 ```
-distrorun <distro-name> <command> [args...]
-# convenience aliases:
-deb bash                       # → distrorun debian-trixie bash
-deb apt install postgresql
-ubuntu apt install nginx
+hamsh$ enter linux { /usr/bin/apt --version }
+hamsh$ enter debian { /bin/cat /etc/debian_version }
+hamsh$ svc = spawn linux { /usr/bin/postgres }   # detached
 ```
 
-Reference implementation (pseudocode):
+The current live recipe (from `etc/rc.boot`):
 
-```
-distrorun(distro, argv):
-    backing = "/var/lib/distros/" + distro
-    if not exists(backing):
-        error("unknown distro: " + distro)
-    rfork(RFNAMEG)                          # private namespace copy
-    mount(backing, "/", MREPL, "")          # rebind / to the distro server
-    bind("/home", "/home", MREPL)           # keep the shared servers
-    bind("/net",  "/net",  MREPL)
-    bind("/srv",  "/srv",  MREPL)
-    bind("/dev",  "/dev",  MREPL)
-    bind("/proc", "/proc", MREPL)
-    exec(argv[0], argv)
+```hamsh
+linux = ns clean {
+    bind '#distro' /        # rootfs partition becomes /
+    bind /home /home        # keep user files
+    bind '#c' /dev          # console + cdev family
+    bind '#p' /proc         # per-task proc
+    bind '#s' /srv          # 9P registry
+    bind '#/' /n            # mount-point parent
+    bind /tmp /tmp          # scratch
+}
 ```
 
-The five `bind` calls are what re-expose the shared file servers
-inside the new namespace. Without them, `/dev/cons` (the console),
-`/net/tcp` (sockets), and `/home/david` (the user's files) would
-all resolve to whatever the distro backing happens to ship for
-those paths — typically nothing useful.
+The first bind grafts the rootfs partition's file server (registered
+as `#distro` via the `.hamnix-roots` sentinel — see
+[`rootfs_partition.md`](rootfs_partition.md)) at `/`. The remaining
+binds re-expose the shared file servers inside the new namespace
+(without them, `/dev/cons`, `/srv/...`, `/home/david` would all
+resolve to whatever the distro backing happens to ship for those
+paths — typically nothing useful).
 
 ## Phase placement
 
@@ -232,44 +235,34 @@ arrange for a binary to see a different `/`. They differ in **what
   of "the real /". There IS a real /, the kernel knows it, and the
   chrooted process is restricted to a view of it. Escape is a
   meaningful concept (CVE-able).
-- **Hamnix distrorun** binds the namespace's / to a different file
-  server. There is no "the real /" at the kernel level. The new
-  namespace isn't restricted; it just has different file servers
-  serving different paths. There's nothing to escape from.
+- **Hamnix `enter linux { ... }`** binds the namespace's / to a
+  different file server. There is no "the real /" at the kernel
+  level. The new namespace isn't restricted; it just has different
+  file servers serving different paths. There's nothing to escape
+  from.
 
 The distinction matters: if you internalise schroot's framing,
-distrorun looks like a weaker container. If you internalise Plan 9's
-framing, distrorun looks like a configuration choice. The latter is
-what Hamnix actually does.
+`enter linux` looks like a weaker container. If you internalise
+Plan 9's framing, it looks like a configuration choice. The latter
+is what Hamnix actually does.
 
 ## Test discipline
 
-Phase C.5 lands green when all of the following pass:
+This phase lands green when all of the following pass:
 
 1. `bash scripts/test_l_track.sh` — existing .ko regression suite.
-2. `bash scripts/test_u_track.sh` — existing ELF-userland regression
-   suite.
-3. `bash scripts/test_distro_namespace.sh` (new):
-   - `deb /bin/true` exits 0
-   - `deb /bin/bash -c 'echo hi'` prints "hi"
-   - `deb cat /etc/debian_version` reads from the distro backing
-     store (a process in init's namespace and a process in the
-     debian-shape namespace observe different file-server responses
-     at the path /etc/debian_version)
-   - `cat /etc/os-release` from init's namespace still shows
-     Hamnix's os-release — because nothing in init's namespace has
-     rebound /etc to anything else
-   - `deb stat /home/$USER` and `stat /home/$USER` show the same
-     inode — both /home binds resolve to the same file server
-   - Two concurrent `deb bash` sessions don't see each other's
-     namespace bindings — each got its own copy via rfork RFNAMEG
+2. `bash scripts/test_distro_namespace.sh` — the namespace primitive
+   smoke test.
+3. `bash scripts/test_linux_apt_install.sh` — real Debian apt/dpkg
+   running inside `enter linux { ... }` against the rootfs partition.
 
 ## References
 
-- `docs/architecture.md` — layered model. This doc is the Phase C.5
-  addendum to the migration plan.
+- `docs/architecture.md` — layered model.
 - `docs/native-api.md` — `rfork`, `bind`, `mount` contracts (Layer 1).
+- `docs/HAMSH_SPEC.md` §11/§13 — `ns clean { … }` and `enter` semantics.
+- `docs/rootfs_partition.md` — the `#distro` file-server backing.
 - Plan 9 4th edition `intro(2)`, `bind(2)`, `namespace(4)`. The
-  shape of distrorun follows directly from these.
+  shape follows directly from these.
 - 9front `none(1)` + `auth/none` — drop-into-a-different-namespace
   patterns from the canonical Plan 9 lineage.
