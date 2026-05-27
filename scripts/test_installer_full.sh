@@ -442,20 +442,26 @@ stage_d_install_and_boot() {
 echo "[test_installer_full] Stage D: ext4 resize-to-fit verification"
 
 # 1 GiB disk = 1073741824 bytes. After GPT (1 MiB) + ESP (32 MiB) +
-# partition alignment, the rootfs partition is ~1037 MiB.  Round
-# DOWN to whole-group: at 8 MiB/group that's 129 groups * 8192 blk
-# = 1056768 blocks. Allow some slack for filesystem overhead /
-# reserved-area accounting → require AT LEAST 800,000 blocks
-# (~780 MiB final ext4 capacity).
-stage_d_install_and_boot 1G 800000 "1G" || {
+# partition alignment, the rootfs partition is ~1037 MiB = 253692
+# blocks at 4 KiB. Kernel mkfs is whole-group only (32768 blk/group);
+# (253692 / 32768) floors to 7 groups → 7 * 32768 = 229376 blocks.
+# Allow ~5K slack for s_reserved_gdt_blocks bookkeeping cliff cases.
+#
+# Block-size note: the kernel-side mkfs_ext4 always emits 4 KiB
+# blocks (s_log_block_size = 2). The legacy dd_blk-of-rootfs.img
+# path used host mkfs.ext4 which defaults to 1 KiB blocks for
+# sub-512-MiB FSes — that's where the OLD 800,000-block threshold
+# came from. The new manifest-installer path uses 4 KiB
+# consistently, so the threshold drops 4x.
+stage_d_install_and_boot 1G 225000 "1G" || {
     echo "[test_installer_full] Stage D-1G: FAILED" >&2
     exit 1
 }
 
 # 5 GiB disk = 5368709120 bytes. Rootfs partition ~5128 MiB →
-# ~5252608 blocks worth of whole groups. Require AT LEAST 4,500,000
-# blocks (~4.39 GiB final capacity).
-stage_d_install_and_boot 5G 4500000 "5G" || {
+# ~1312768 blocks at 4 KiB → (/ 32768) = 40 groups → 1310720 blocks.
+# Require AT LEAST 1,280,000 blocks (~5 GiB final capacity).
+stage_d_install_and_boot 5G 1280000 "5G" || {
     echo "[test_installer_full] Stage D-5G: FAILED" >&2
     exit 1
 }
