@@ -321,10 +321,17 @@ stage_d_install_and_boot() {
     set -e
 
     # Assert: resize ran, sentinel got written.
+    # Preserve the boot log to a stable path on any failure so diagnosis
+    # doesn't require KEEP_LOGS=1 + temp-file scraping.
+    local fail_log_dir="/tmp/hamnix-installer-stageD-fail"
     if ! grep -aE -q '\[ext4_resize_grow\] DONE: blocks' "$boot_log"; then
         echo "[test_installer_full] Stage D ($label) FAIL: no ext4_resize_grow DONE marker" >&2
         echo "  --- last 40 lines of boot log: ---" >&2
         tail -40 "$boot_log" >&2
+        mkdir -p "$fail_log_dir"
+        cp "$boot_log" "$fail_log_dir/${label}-boot.log"
+        cp "$install_log" "$fail_log_dir/${label}-install.log"
+        echo "[test_installer_full] Stage D ($label) FAIL logs preserved: $fail_log_dir/${label}-{boot,install}.log" >&2
         if [ "${KEEP_LOGS:-0}" != "1" ]; then
             rm -f "$img_path" "$install_log" "$boot_log" "$boot2_log"
         else
@@ -335,6 +342,10 @@ stage_d_install_and_boot() {
     if ! grep -aE -q '\[firstboot\] sentinel \.hamnix-grown inum=' "$boot_log"; then
         echo "[test_installer_full] Stage D ($label) FAIL: sentinel marker missing" >&2
         tail -40 "$boot_log" >&2
+        mkdir -p "$fail_log_dir"
+        cp "$boot_log" "$fail_log_dir/${label}-boot.log"
+        cp "$install_log" "$fail_log_dir/${label}-install.log"
+        echo "[test_installer_full] Stage D ($label) FAIL logs preserved: $fail_log_dir/${label}-{boot,install}.log" >&2
         if [ "${KEEP_LOGS:-0}" != "1" ]; then
             rm -f "$img_path" "$install_log" "$boot_log" "$boot2_log"
         else
