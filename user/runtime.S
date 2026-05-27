@@ -682,6 +682,21 @@ sys_setuid:
     .size sys_setuid, .-sys_setuid
 
 
+    /* --- sys_svc_publish(name, payload) -> int32 --------------------
+     * /proc/svc Phase 6: ship one service-registry slot into the
+     * kernel-side mirror in fs/procfs.ad. name = NUL-terminated
+     * service name, payload = 400-byte packed struct (or NULL/0 to
+     * unpublish). Hostowner-only at the kernel side; hamsh IS PID 1
+     * so the gate never bites the legitimate path. */
+    .globl sys_svc_publish
+    .type sys_svc_publish, @function
+sys_svc_publish:
+    movq    $291, %rax              /* SYS_SVC_PUBLISH */
+    syscall
+    ret
+    .size sys_svc_publish, .-sys_svc_publish
+
+
     /* --- sys_pipechan() -> int32 ------------------------------------
      * HAMSH §7: create a local pipe Chan pair; returns the pipe SLOT
      * id (NOT fds). The shell threads the slot into two sys_fdbind
