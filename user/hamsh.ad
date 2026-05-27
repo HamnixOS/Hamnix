@@ -119,6 +119,18 @@ DEVFD_PIPE_R: int32 = 2     # a pipe read end (arg = pipe slot)
 DEVFD_PIPE_W: int32 = 3     # a pipe write end (arg = pipe slot)
 DEVFD_FILE:   int32 = 4     # an on-disk file (arg = kernel fd)
 DEVFD_DUP:    int32 = 5     # the Chan at /fd/<arg> (dup-as-bind)
+# DEVFD_FILE_APPEND — same as DEVFD_FILE but every write lands at
+# the file's current EOF (write-at-EOF, POSIX O_APPEND-shape). The
+# svc supervisor binds this kind to /fd/1 + /fd/2 of each managed
+# service so /var/log/svc/<name>.log captures both streams without
+# either overwriting the other and so `svc restart` appends rather
+# than truncating the boot's accumulated output.
+DEVFD_FILE_APPEND: int32 = 6
+
+# sys_openchan mode selectors, matching OPENCHAN_* in syschan.ad.
+OPENCHAN_READ:   int32 = 0
+OPENCHAN_TRUNC:  int32 = 1
+OPENCHAN_APPEND: int32 = 2
 
 # sys_spawn stdio sentinel: the child's standard streams are NAMES in
 # its namespace (/fd/0,1,2 via `#d`), wired by the shell with
@@ -4723,6 +4735,172 @@ def _svc_argv_tokenize(cmd: Ptr[uint8]) -> int32:
     return cast[int32](svc_spawn_argv_n)
 
 
+# --- per-service log capture (Phase 12) -----------------------------
+# Every managed service has its stdout (fd 1) AND stderr (fd 2)
+# redirected to /var/log/svc/<name>.log via a single DEVFD_FILE_APPEND
+# tmpfs slot. The kernel-side primitive (devfd_bind_file_append, write
+# arm always lands at tmpfs_size) makes BOTH binds safe against each
+# other (no cursor collisions) AND across `svc restart` (the file is
+# re-opened with tmpfs_open_for_append which preserves size). The
+# /var/log/svc directory is pre-created by tmpfs_var_skeleton_init at
+# kernel boot.
+#
+# The supervisor also writes a `--- restart at uptime=Nms ---` line
+# before EVERY start (the first one too — it doubles as a per-boot
+# header so a log that survives reboots-of-a-persistent-tmpfs would
+# still group runs visibly). The supervisor writes via a scratch /fd
+# slot in its OWN namespace bound to the same DEVFD_FILE_APPEND
+# backing, so the separator and the child's output both land at EOF
+# without coordination.
+SVC_LOG_PATH_MAX: uint64 = 64
+svc_log_path_buf: Array[64, uint8]
+# Supervisor-side scratch /fd slot for separator writes. DEVFD_SLOTS
+# is 16; 0/1/2 are stdio, 9 is CAPTURE_FD. 10 is well clear of both
+# and not used by any pipeline path.
+SVC_LOG_SCRATCH_FD: int32 = 10
+
+
+def _svc_build_log_path(idx: int32):
+    # Stamp svc_log_path_buf with `/var/log/svc/<name>.log`. The name
+    # is bounded by SVC_NAME_MAX (32), the prefix is 13 bytes, the
+    # suffix is 4 — well within the 64-byte buffer.
+    if idx < 0:
+        svc_log_path_buf[0] = 0
+        return
+    u: uint64 = cast[uint64](idx)
+    prefix: Ptr[uint8] = "/var/log/svc/"
+    suffix: Ptr[uint8] = ".log"
+    name: Ptr[uint8] = _svc_name_at(u)
+    pi: uint64 = 0
+    while prefix[pi] != 0:
+        svc_log_path_buf[pi] = prefix[pi]
+        pi = pi + 1
+    ni: uint64 = 0
+    while name[ni] != 0 and pi + 1 < SVC_LOG_PATH_MAX:
+        svc_log_path_buf[pi] = name[ni]
+        pi = pi + 1
+        ni = ni + 1
+    si: uint64 = 0
+    while suffix[si] != 0 and pi + 1 < SVC_LOG_PATH_MAX:
+        svc_log_path_buf[pi] = suffix[si]
+        pi = pi + 1
+        si = si + 1
+    svc_log_path_buf[pi] = 0
+
+
+def _svc_open_log_chan(idx: int32) -> int32:
+    # Open /var/log/svc/<name>.log as an OPENCHAN_APPEND tmpfs slot.
+    # Returns the slot id (>= 0) or -1. The slot is global (tmpfs
+    # entries are task-independent), so binding it into both the
+    # supervisor's /fd table (for the separator write) and a child's
+    # /fd table (for stdout+stderr) addresses the same backing.
+    _svc_build_log_path(idx)
+    if svc_log_path_buf[0] == 0:
+        return -1
+    return sys_openchan(cast[Ptr[char]](&svc_log_path_buf[0]),
+                        OPENCHAN_APPEND)
+
+
+SVC_LOG_DEVFD_PATH:  Array[8, uint8]   # "/fd/10\0", filled lazily
+svc_log_devfd_inited: int32 = 0
+
+
+def _svc_log_devfd_path() -> Ptr[char]:
+    # Lazy-init "/fd/<SVC_LOG_SCRATCH_FD>\0" once. /fd/10 in the
+    # supervisor's namespace is the route the separator write takes;
+    # opening this path through vfs_open_write installs a kernel
+    # integer fd whose vfs_write arm routes through devfd_write at
+    # the SVC_LOG_SCRATCH_FD name. Without this kfd, sys_write(10, …)
+    # would simply EBADF — the supervisor has no integer fd 10 open
+    # at task start, only the /fd/N NAME side of the substrate.
+    if svc_log_devfd_inited == 0:
+        SVC_LOG_DEVFD_PATH[0] = 47     # '/'
+        SVC_LOG_DEVFD_PATH[1] = 102    # 'f'
+        SVC_LOG_DEVFD_PATH[2] = 100    # 'd'
+        SVC_LOG_DEVFD_PATH[3] = 47     # '/'
+        SVC_LOG_DEVFD_PATH[4] = 49     # '1'
+        SVC_LOG_DEVFD_PATH[5] = 48     # '0'
+        SVC_LOG_DEVFD_PATH[6] = 0
+        svc_log_devfd_inited = 1
+    return cast[Ptr[char]](&SVC_LOG_DEVFD_PATH[0])
+
+
+def _svc_write_restart_separator(idx: int32, slot: int32):
+    # Emit a one-line marker into /var/log/svc/<name>.log BEFORE the
+    # next child writes its first byte. The supervisor doesn't have a
+    # writable kernel fd to the log channel yet — it has the tmpfs
+    # SLOT (returned by sys_openchan) and the supervisor's own /fd
+    # table. We bridge them in three steps:
+    #
+    #   1. sys_fdbind(0, SCRATCH, DEVFD_FILE_APPEND, slot) — install
+    #      the channel at the NAME /fd/<SCRATCH> in the supervisor's
+    #      Pgrp.
+    #   2. sys_open_write("/fd/<SCRATCH>") — Layer-2 mapping: a real
+    #      integer kfd whose vfs_write arm routes through devfd_write
+    #      at the SCRATCH name in the calling Pgrp.
+    #   3. sys_write(kfd, ...) — bytes land at tmpfs_size every write
+    #      because the bound kind is DEVFD_FILE_APPEND.
+    #
+    # Then sys_close + restore the SCRATCH name to console so the
+    # supervisor's view of /fd is in a known state for the next
+    # invocation. Format:
+    #     `--- start <name> uptime=<Nms> restarts=<R> ---\n`
+    # `uptime` is jiffies*10 (each jiffy is 10 ms today; see
+    # arch/x86/kernel/time.ad). `restarts` is the cumulative count
+    # for this slot in this session — 0 on the first start, then
+    # bumped by the supervisor reap path. A grep-friendly fixed
+    # prefix lets log readers split runs without ambiguity.
+    if slot < 0:
+        return
+    rc: int32 = sys_fdbind(0, SVC_LOG_SCRATCH_FD, DEVFD_FILE_APPEND, slot)
+    if rc < 0:
+        return
+    kfd: int32 = sys_open_write(_svc_log_devfd_path())
+    if kfd < 0:
+        # The /fd substrate isn't there (e.g. _setup_fd_namespace
+        # didn't run for some reason). Quietly unbind and bail —
+        # the redirect of the CHILD's stdio is the load-bearing
+        # piece; the separator is a nice-to-have. Restore the
+        # supervisor's /fd/<SCRATCH> to console all the same.
+        sys_fdbind(0, SVC_LOG_SCRATCH_FD, DEVFD_CONS, 0)
+        return
+    write_str(kfd, "--- start ")
+    u: uint64 = cast[uint64](idx)
+    write_str(kfd, _svc_name_at(u))
+    write_str(kfd, " uptime=")
+    jif: uint64 = sys_get_jiffies()
+    ms: int64 = cast[int64](jif * 10)
+    write_str(kfd, render_int(ms))
+    write_str(kfd, "ms restarts=")
+    write_str(kfd, render_int(cast[int64](svc_restarts[u])))
+    write_str(kfd, " ---\n")
+    sys_close(kfd)
+    # Re-bind the scratch slot back to the console so the supervisor's
+    # own /fd/10 is in a known state. The DEVFD_FILE_APPEND slot itself
+    # remains live (tmpfs slots are not refcounted); the next service's
+    # _svc_redirect_child_log will bind the same kind onto a different
+    # /fd in its child's namespace, addressing the same or a new slot.
+    sys_fdbind(0, SVC_LOG_SCRATCH_FD, DEVFD_CONS, 0)
+
+
+def _svc_redirect_child_log(pid: int32, slot: int32) -> int32:
+    # Bind the log slot to the child's /fd/1 and /fd/2 as
+    # DEVFD_FILE_APPEND. The first bind installs the kind; the second
+    # uses DEVFD_DUP from /fd/1, which devfd_dup propagates as
+    # DEVFD_FILE_APPEND so both stream writes land at EOF safely.
+    # Returns 0 on success, -1 if either bind failed (the child still
+    # runs — its output just stays on the inherited console).
+    if pid < 0 or slot < 0:
+        return -1
+    r1: int32 = sys_fdbind(pid, 1, DEVFD_FILE_APPEND, slot)
+    if r1 < 0:
+        return -1
+    r2: int32 = sys_fdbind(pid, 2, DEVFD_DUP, 1)
+    if r2 < 0:
+        return -1
+    return 0
+
+
 def _svc_spawn_into_ns(idx: int32) -> int32:
     # Launch the service's command. Returns the child pid (>0) or -1.
     #
@@ -4755,12 +4933,24 @@ def _svc_spawn_into_ns(idx: int32) -> int32:
     argv: Ptr[uint64] = cast[Ptr[uint64]](&svc_spawn_argv_ptr[0])
     path: Ptr[char] = cast[Ptr[char]](svc_spawn_argv_ptr[0])
     envp: Ptr[uint64] = _build_envp()
+    # Open the per-service log channel ONCE per start. The slot is the
+    # same DEVFD_FILE_APPEND backing the supervisor's separator write
+    # and the child's /fd/1+/fd/2 will all bind. -1 here just means
+    # the log is unavailable (out of slots, parent dir missing) —
+    # service still launches; output stays on the inherited console.
+    log_slot: int32 = _svc_open_log_chan(idx)
+    if log_slot >= 0:
+        _svc_write_restart_separator(idx, log_slot)
     # Fast path: ns=init AND uid=1 (hostowner). No identity change, no
     # ns template to apply — direct sys_spawn (the supervisor stays
     # the visible parent in the process tree).
     if cstr_eq(ns_name, "init") != 0 and target_uid == 1:
         pid: int32 = sys_spawn(path, argv,
                                SPAWN_STDIO_NS, SPAWN_STDIO_NS, envp)
+        if pid >= 0:
+            # Cooperative scheduler: child is still STATE_READY here,
+            # so the bind lands before its first instruction runs.
+            _svc_redirect_child_log(pid, log_slot)
         return pid
     # uid switching path (still ns=init): rfork a wrapper so we can
     # call sys_setuid between fork and exec. The wrapper runs as the
@@ -4779,6 +4969,13 @@ def _svc_spawn_into_ns(idx: int32) -> int32:
                 write_str(2, "svc: setuid failed for uid-switched service\n")
                 sys_exit(126)
                 return EX_NORMAL
+            # Redirect the wrapper's OWN /fd/1+/fd/2 (the rfork gave
+            # us a private Pgrp via RFNAMEG, so this bind is invisible
+            # to the supervisor). The subsequent sys_spawn hands a COW
+            # copy of this /fd table to the real service binary, so
+            # the binary's stdout+stderr land at /var/log/svc/<name>.log
+            # without a second bind from the supervisor side.
+            _svc_redirect_child_log(0, log_slot)
             cpid_i: int32 = sys_spawn(path, argv,
                                       SPAWN_STDIO_NS, SPAWN_STDIO_NS,
                                       envp)
@@ -4817,6 +5014,9 @@ def _svc_spawn_into_ns(idx: int32) -> int32:
             if rs2 < 0:
                 sys_exit(127)
                 return EX_NORMAL
+        # Same shape as the uid-switch wrapper: rebind OUR /fd/1+/fd/2
+        # so the inner sys_spawn COW-inherits the log redirection.
+        _svc_redirect_child_log(0, log_slot)
         cpid: int32 = sys_spawn(path, argv,
                                 SPAWN_STDIO_NS, SPAWN_STDIO_NS, envp)
         if cpid < 0:
