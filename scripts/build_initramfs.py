@@ -391,6 +391,41 @@ if _TLS_CA_DER_PATH:
 # so the kernel-side check can assert a file PAST index 192 was
 # registered and is readable. Off-default: an unset env var leaves the
 # initramfs alone, exactly like every other gated marker above.
+# hpm repo fixture: scripts/test_hpm.sh sets HAMNIX_HPM_TEST_REPO=<path>
+# to plant the contents of <path> at /test-hpm-repo/ inside the cpio
+# initramfs. The test boots vanilla Hamnix and runs
+# `hpm --repo=file:///test-hpm-repo/ <cmd>` against the planted fixture
+# (a tiny index.json + one packages/<name>-<ver>.tar.gz). A second var
+# HAMNIX_HPM_TEST_REPO_CONFLICT=<path> plants a parallel
+# /test-hpm-repo-conflict/ used for the negative conflict test.
+_HPM_TEST_REPO = os.environ.get("HAMNIX_HPM_TEST_REPO", "")
+if _HPM_TEST_REPO:
+    _repo_root = Path(_HPM_TEST_REPO)
+    if not _repo_root.is_dir():
+        raise SystemExit(
+            f"HAMNIX_HPM_TEST_REPO={_HPM_TEST_REPO!r}: not a directory")
+    for _f in sorted(_repo_root.rglob("*")):
+        if not _f.is_file():
+            continue
+        _rel = _f.relative_to(_repo_root)
+        with _f.open("rb") as _fh:
+            FILES.append((f"/test-hpm-repo/{_rel.as_posix()}",
+                          _fh.read()))
+
+_HPM_TEST_REPO_C = os.environ.get("HAMNIX_HPM_TEST_REPO_CONFLICT", "")
+if _HPM_TEST_REPO_C:
+    _repo_root_c = Path(_HPM_TEST_REPO_C)
+    if not _repo_root_c.is_dir():
+        raise SystemExit(
+            f"HAMNIX_HPM_TEST_REPO_CONFLICT={_HPM_TEST_REPO_C!r}: not a directory")
+    for _f in sorted(_repo_root_c.rglob("*")):
+        if not _f.is_file():
+            continue
+        _rel = _f.relative_to(_repo_root_c)
+        with _f.open("rb") as _fh:
+            FILES.append((f"/test-hpm-repo-conflict/{_rel.as_posix()}",
+                          _fh.read()))
+
 _CPIO_STRESS_RAW = os.environ.get("HAMNIX_CPIO_STRESS_FILES", "")
 if _CPIO_STRESS_RAW:
     try:
