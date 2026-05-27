@@ -743,6 +743,7 @@ def build_archive() -> bytes:
         # it also needs to be present in the lean cpio.
         "cat.elf",
         "dd_blk.elf",
+        "install_file_to_slot.elf",
         "hamnix_partition.elf",
         "mkfs_ext4.elf",
         "mkfs_fat.elf",
