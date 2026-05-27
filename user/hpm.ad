@@ -127,6 +127,28 @@ url_port:    int64 = 80
 # it back); the parsed pieces live in host_buf / path_buf / url_scheme.
 repo_url_buf: Array[1024, uint8]
 
+# Channel state. The repo URL is the BASE (e.g. https://255.one/);
+# each enabled channel is a sub-path under the base. /etc/hpm/channels
+# is the persisted subscription list (one channel per line, # comments
+# allowed). On a fresh install the default contents subscribe to
+# `main` only — see memory/project_nonfree_repo.md for the design.
+#
+# channel_names_buf packs every channel name back-to-back, NUL-
+# terminated. channel_names_off/len[ci] index it. _current_channel
+# tracks which channel the JSON parser is currently appending pkgs
+# for (so each pkg's "channel" field is stamped at parse time).
+CHANNEL_MAX: uint64 = 32
+channel_names_buf: Array[4096, uint8]
+channel_names_off: Array[32, uint64]
+channel_names_len: Array[32, uint64]
+channel_buf_n:     uint64 = 0
+n_channels:        uint64 = 0
+# Saved base URL — distinct from repo_url_buf so the per-channel
+# fetch can rebuild "<base>/<channel>/" on every fetch without losing
+# what the user (or --repo flag) configured as the base.
+repo_base_buf: Array[1024, uint8]
+
+
 
 # -- tiny stdio helpers (mirrors apt.ad/dpkg_deb.ad) ------------------
 
@@ -775,6 +797,228 @@ def _apply_repo() -> int32:
     return _parse_url(&repo_url_buf[0])
 
 
+# -- channel state ----------------------------------------------------
+#
+# Channels are subdirectories under the repo base. /etc/hpm/channels
+# holds the subscription list (one name per line, # comments ok). On
+# `hpm refresh` we walk every enabled channel, fetch its index.json,
+# and merge the entries into a single in-memory database keyed by
+# pkg_*[] arrays — each package carries a pkg_channel_off/len span
+# pointing at its source channel name inside idx_buf.
+
+# /etc/hpm/channels is the channel-subscription file path. The
+# x86_64 backend rejects string-literal globals, so callers below
+# materialise this string inline at each call site.
+# Read-buffer cap on /etc/hpm/channels (one channel per line, <100
+# channels in any plausible deployment).
+CHANNELS_READ_CAP: uint64 = 16384
+channels_read_buf: Array[16384, uint8]
+
+
+def _channels_reset():
+    n_channels = 0
+    channel_buf_n = 0
+
+
+def _channel_add_name(name: Ptr[uint8], nlen: uint64) -> int32:
+    # Append a channel name to channel_names_*[]. Returns 0 on
+    # success, -1 if a duplicate (already present), -2 if full /
+    # overflow.
+    if nlen == 0:
+        return -2
+    # Reject duplicates so `hpm enable main` twice is a no-op.
+    ci: uint64 = 0
+    while ci < n_channels:
+        if channel_names_len[ci] == nlen:
+            same: int32 = 1
+            ki: uint64 = 0
+            while ki < nlen:
+                if channel_names_buf[channel_names_off[ci] + ki] != name[ki]:
+                    same = 0
+                    break
+                ki = ki + 1
+            if same != 0:
+                return -1
+        ci = ci + 1
+    if n_channels >= CHANNEL_MAX:
+        return -2
+    if channel_buf_n + nlen + 1 > 4096:
+        return -2
+    channel_names_off[n_channels] = channel_buf_n
+    channel_names_len[n_channels] = nlen
+    i: uint64 = 0
+    while i < nlen:
+        channel_names_buf[channel_buf_n + i] = name[i]
+        i = i + 1
+    channel_names_buf[channel_buf_n + nlen] = 0
+    channel_buf_n = channel_buf_n + nlen + 1
+    n_channels = n_channels + 1
+    return 0
+
+
+def _channel_find(name: Ptr[uint8], nlen: uint64) -> int64:
+    ci: uint64 = 0
+    while ci < n_channels:
+        if channel_names_len[ci] == nlen:
+            same: int32 = 1
+            ki: uint64 = 0
+            while ki < nlen:
+                if channel_names_buf[channel_names_off[ci] + ki] != name[ki]:
+                    same = 0
+                    break
+                ki = ki + 1
+            if same != 0:
+                return cast[int64](ci)
+        ci = ci + 1
+    return cast[int64](-1)
+
+
+def _channels_load() -> int32:
+    # Read /etc/hpm/channels. Populate channel_names_*[] / n_channels.
+    # If the file is missing or empty, default to a single `main`
+    # channel (matches the installer-time default).
+    _channels_reset()
+    fd: int32 = sys_open(cast[Ptr[char]]("/etc/hpm/channels"))
+    if fd < 0:
+        # Missing file → default to `main`.
+        _channel_add_name(cast[Ptr[uint8]]("main"), 4)
+        return 0
+    total: uint64 = 0
+    while total < CHANNELS_READ_CAP:
+        room: uint64 = CHANNELS_READ_CAP - total
+        n: int64 = sys_read(fd, cast[Ptr[uint8]](
+            cast[uint64](&channels_read_buf[0]) + total), room)
+        if n < 0:
+            sys_close(fd)
+            return -1
+        if n == 0:
+            break
+        total = total + cast[uint64](n)
+    sys_close(fd)
+    # Parse line by line. Skip leading whitespace, skip lines whose
+    # first non-whitespace char is `#`, trim trailing CR/LF/WS, accept
+    # the resulting non-empty token as a channel name. Names must be
+    # [A-Za-z0-9_.-]+ (matches Debian component-name convention).
+    i: uint64 = 0
+    name_scratch: Array[128, uint8]
+    while i < total:
+        # Skip leading WS (SP, TAB).
+        while i < total:
+            c: uint8 = channels_read_buf[i]
+            if c == 32 or c == 9:
+                i = i + 1
+            else:
+                break
+        if i >= total:
+            break
+        c0: uint8 = channels_read_buf[i]
+        if c0 == 10 or c0 == 13:
+            # Blank line.
+            i = i + 1
+            continue
+        if c0 == 35:
+            # Comment — skip to EOL.
+            while i < total and channels_read_buf[i] != 10:
+                i = i + 1
+            if i < total:
+                i = i + 1
+            continue
+        # Accumulate the channel-name token.
+        no: uint64 = 0
+        while i < total and no + 1 < 128:
+            c: uint8 = channels_read_buf[i]
+            if c == 10 or c == 13 or c == 32 or c == 9 or c == 35:
+                break
+            # Validate: allow letters / digits / -/_/.
+            ok: int32 = 0
+            if c >= 65 and c <= 90:
+                ok = 1
+            elif c >= 97 and c <= 122:
+                ok = 1
+            elif c >= 48 and c <= 57:
+                ok = 1
+            elif c == 45 or c == 46 or c == 95:
+                ok = 1
+            if ok == 0:
+                # Invalid char — skip the rest of the line.
+                no = 0
+                while i < total and channels_read_buf[i] != 10:
+                    i = i + 1
+                break
+            name_scratch[no] = c
+            no = no + 1
+            i = i + 1
+        name_scratch[no] = 0
+        if no > 0:
+            _channel_add_name(&name_scratch[0], no)
+        # Skip to next line.
+        while i < total and channels_read_buf[i] != 10:
+            i = i + 1
+        if i < total:
+            i = i + 1
+    if n_channels == 0:
+        # File present but no usable channels — back-fill `main` so
+        # hpm doesn't sit in a no-channel state.
+        _channel_add_name(cast[Ptr[uint8]]("main"), 4)
+    return 0
+
+
+def _channels_save() -> int32:
+    # Persist channel_names_*[] to /etc/hpm/channels with a brief
+    # header so a human editor sees a real comment block.
+    sys_mkdir("/etc/hpm")
+    fd: int32 = sys_open_write(cast[Ptr[char]]("/etc/hpm/channels"))
+    if fd < 0:
+        write_str(2, "hpm: cannot open /etc/hpm/channels for write\n")
+        return -1
+    hdr: Ptr[uint8] = "# /etc/hpm/channels - one channel per line. Comments start with #.\n"
+    sys_write(fd, hdr, strlen_u8(hdr))
+    ci: uint64 = 0
+    while ci < n_channels:
+        sys_write(fd, &channel_names_buf[channel_names_off[ci]],
+                  channel_names_len[ci])
+        sys_write(fd, "\n", 1)
+        ci = ci + 1
+    sys_close(fd)
+    return 0
+
+
+def _save_repo_base():
+    # Snapshot repo_url_buf into repo_base_buf so per-channel URL
+    # construction can refer back to the user-configured base.
+    _strcopy_cstr(&repo_base_buf[0], &repo_url_buf[0], 1024)
+
+
+def _set_channel_url(ci: uint64) -> int32:
+    # Build "<base>/<channel-name>/" into repo_url_buf, then reparse.
+    # The base lives in repo_base_buf (snapshotted at main() entry).
+    o: uint64 = 0
+    bi: uint64 = 0
+    while repo_base_buf[bi] != 0 and o + 1 < 1024:
+        repo_url_buf[o] = repo_base_buf[bi]
+        o = o + 1
+        bi = bi + 1
+    # Ensure a trailing '/' before appending the channel name.
+    if o == 0 or repo_url_buf[o - 1] != 47:
+        if o + 1 < 1024:
+            repo_url_buf[o] = 47
+            o = o + 1
+    # Append channel name.
+    nlen: uint64 = channel_names_len[ci]
+    noff: uint64 = channel_names_off[ci]
+    ki: uint64 = 0
+    while ki < nlen and o + 1 < 1024:
+        repo_url_buf[o] = channel_names_buf[noff + ki]
+        o = o + 1
+        ki = ki + 1
+    # Trailing '/' (so _build_url_path's join produces clean paths).
+    if o + 1 < 1024:
+        repo_url_buf[o] = 47
+        o = o + 1
+    repo_url_buf[o] = 0
+    return _apply_repo()
+
+
 # -- minimal JSON parser ----------------------------------------------
 #
 # The Hamnix-side library does NOT have a JSON parser today (apt
@@ -816,6 +1060,17 @@ pkg_desc_off:        Array[1024, uint64]
 pkg_desc_len:        Array[1024, uint64]
 pkg_target_off:      Array[1024, uint64]
 pkg_target_len:      Array[1024, uint64]
+# pkg_channel_off/len: span of the "channel" field's string value
+# (inside idx_buf) for this package. Mirrors how every other field
+# is stored — offset+length into the JSON cache. Used by the install
+# path to build "<base>/<channel>/<pkg-url>" before fetching.
+# pkg_channel_idx_arr[pi] is the index into channel_names_*[]; set
+# to a sentinel (uint64 max) for packages with no channel field
+# (e.g. legacy index, ISO-mini-repo fixtures using the bare layout).
+pkg_channel_off:     Array[1024, uint64]
+pkg_channel_len:     Array[1024, uint64]
+pkg_channel_idx_arr: Array[1024, uint64]
+CHANNEL_IDX_NONE:    uint64 = 65535
 
 # Dependency / conflicts / provides arrays. Each package owns a slice
 # of a flat string table; per-entry offset+len is recorded.
@@ -1069,6 +1324,8 @@ def _json_parse_pkg(pi: uint64) -> int32:
     pkg_desc_len[pi] = 0
     pkg_target_off[pi] = 0
     pkg_target_len[pi] = 0
+    pkg_channel_off[pi] = 0
+    pkg_channel_len[pi] = 0
     pkg_dep_start[pi] = 0
     pkg_dep_count[pi] = 0
     pkg_conf_start[pi] = 0
@@ -1112,6 +1369,9 @@ def _json_parse_pkg(pi: uint64) -> int32:
                 return -1
         elif klen == 6 and _streq_n(kp, cast[Ptr[uint8]]("target"), 6) != 0:
             if _json_parse_string(&pkg_target_off[pi], &pkg_target_len[pi]) != 0:
+                return -1
+        elif klen == 7 and _streq_n(kp, cast[Ptr[uint8]]("channel"), 7) != 0:
+            if _json_parse_string(&pkg_channel_off[pi], &pkg_channel_len[pi]) != 0:
                 return -1
         elif klen == 7 and _streq_n(kp, cast[Ptr[uint8]]("depends"), 7) != 0:
             if _json_parse_strarr(&dep_entry_off[0], &dep_entry_len[0],
@@ -1225,6 +1485,49 @@ def _json_parse_index() -> int32:
         return -1
 
 
+# -- post-parse: stamp pkg_channel_idx_arr[] from "channel" spans -----
+#
+# After _json_parse_index() fills pkg_channel_off/len[], walk every
+# package and look up its channel name in channel_names_*[]. Packages
+# without a channel field (legacy fixtures) get the sentinel
+# CHANNEL_IDX_NONE; install paths fall back to the bare repo for
+# those.
+
+def _index_channels():
+    pi: uint64 = 0
+    while pi < pkg_count:
+        if pkg_channel_len[pi] == 0:
+            pkg_channel_idx_arr[pi] = CHANNEL_IDX_NONE
+        else:
+            ci: int64 = _channel_find(&idx_buf[pkg_channel_off[pi]],
+                                      pkg_channel_len[pi])
+            if ci < 0:
+                # Channel referenced by the index isn't subscribed;
+                # this happens if we cache a multi-channel index and
+                # later the user `hpm disable`s the channel. The
+                # entry is dead — flag with sentinel.
+                pkg_channel_idx_arr[pi] = CHANNEL_IDX_NONE
+            else:
+                pkg_channel_idx_arr[pi] = cast[uint64](ci)
+        pi = pi + 1
+
+
+def _pkg_set_channel_url(pi: uint64) -> int32:
+    # Before fetching a package's tarball, switch repo_url_buf from
+    # the bare base to the package's channel URL. If the package has
+    # no channel (CHANNEL_IDX_NONE), fall back to the bare base —
+    # supports the ISO mini-repo's pre-channel-pivot file:// layout
+    # where iso-packages/main/ is structurally identical to a v1
+    # flat repo (channel name == "main" / lives at <base>/main/ if
+    # the tail "main" is in the iso-packages base path already; or
+    # at <base>/ if not).
+    ci: uint64 = pkg_channel_idx_arr[pi]
+    if ci == CHANNEL_IDX_NONE:
+        _strcopy_cstr(&repo_url_buf[0], &repo_base_buf[0], 1024)
+        return _apply_repo()
+    return _set_channel_url(ci)
+
+
 # -- index cache: load + refresh --------------------------------------
 
 def _ensure_hpm_tmpdir():
@@ -1266,31 +1569,355 @@ def _load_index_cache() -> int32:
     idx_len = total
     if _json_parse_index() != 0:
         return -1
+    # Channel state needs to be loaded so the per-pkg channel-name
+    # spans (pkg_channel_off/len) can be mapped to subscription
+    # indices. Reading /etc/hpm/channels is cheap + idempotent.
+    if n_channels == 0:
+        _channels_load()
+    _index_channels()
+    return 0
+
+
+# -- merged-index synthesis ------------------------------------------
+#
+# `hpm refresh` builds ONE merged index in idx_buf by walking every
+# enabled channel, fetching its index.json, and splicing each package
+# object into a unified `{"schema":1,"packages":[ ... ]}` envelope.
+# Every spliced object gets a `"channel":"<name>"` field injected
+# right after its opening `{` so the parser can stamp pkg_channel_*[]
+# spans into idx_buf for downstream install operations.
+#
+# The synthesised text lives in idx_buf so the existing index parser
+# + index cache path (_save_index_cache → /tmp/hpm/index.json) work
+# unchanged.
+
+# Scratch: per-channel raw fetch lands here, then gets spliced into
+# idx_buf. http_buf is the existing 256 KiB BSS arena (declared
+# above, otherwise unused) — reusing it avoids growing the binary.
+# A single channel's index is capped at 256 KiB.
+
+def _idx_emit(s: Ptr[uint8]) -> int32:
+    # Append a NUL-terminated string to idx_buf at idx_len. Returns 0
+    # on success, -1 on overflow.
+    si: uint64 = 0
+    while s[si] != 0:
+        if idx_len + 1 >= INDEX_CAP:
+            return -1
+        idx_buf[idx_len] = s[si]
+        idx_len = idx_len + 1
+        si = si + 1
+    return 0
+
+
+def _idx_emit_byte(c: uint8) -> int32:
+    if idx_len + 1 >= INDEX_CAP:
+        return -1
+    idx_buf[idx_len] = c
+    idx_len = idx_len + 1
+    return 0
+
+
+def _idx_emit_quoted(s: Ptr[uint8], slen: uint64) -> int32:
+    # Emit a JSON string literal "<s>" with no escaping (channel
+    # names are restricted to [A-Za-z0-9_.-] per _channels_load's
+    # validator, so JSON escapes aren't needed).
+    if _idx_emit_byte(34) != 0:
+        return -1
+    i: uint64 = 0
+    while i < slen:
+        if _idx_emit_byte(s[i]) != 0:
+            return -1
+        i = i + 1
+    if _idx_emit_byte(34) != 0:
+        return -1
+    return 0
+
+
+# Scratch buffer for one channel's raw index fetch. Distinct from
+# idx_buf so the splice can read source bytes + write dest bytes
+# without aliasing.
+ch_fetch_buf: Array[262144, uint8]
+
+
+def _splice_channel_into_idx(ci: uint64, fbuf_len: uint64,
+                             out_n_pkgs: Ptr[uint64]) -> int32:
+    # Walk ch_fetch_buf[0..fbuf_len) — a fetched per-channel index
+    # JSON — and append each package object (with a synthesised
+    # "channel":"<name>" field) into idx_buf at idx_len.
+    #
+    # Approach: simple state machine over the raw bytes. We're not
+    # validating the per-channel JSON for full correctness here; we
+    # rely on the downstream _json_parse_index() pass to catch any
+    # malformed combined output.
+    #
+    # 1. Find `"packages"` in the source.
+    # 2. Find the `[` after it.
+    # 3. Walk objects: skip ws/commas; on `{` start an object, copy
+    #    bytes through the matching `}` (string-aware bracket
+    #    counting), but right after the opening `{` inject
+    #    `"channel":"<channel-name>"`.
+    # 4. Stop when we hit `]` at top-of-array depth.
+    out_n_pkgs[0] = 0
+    needle: Ptr[uint8] = "\"packages\""
+    nlen: uint64 = 10
+    pi: uint64 = 0
+    found: int32 = 0
+    if fbuf_len >= nlen:
+        while pi + nlen <= fbuf_len:
+            ok: int32 = 1
+            kj: uint64 = 0
+            while kj < nlen:
+                if ch_fetch_buf[pi + kj] != needle[kj]:
+                    ok = 0
+                    break
+                kj = kj + 1
+            if ok != 0:
+                found = 1
+                pi = pi + nlen
+                break
+            pi = pi + 1
+    if found == 0:
+        # No packages array — channel is empty / malformed.
+        return 0
+    # Skip whitespace + colon.
+    while pi < fbuf_len:
+        c: uint8 = ch_fetch_buf[pi]
+        if c == 32 or c == 9 or c == 10 or c == 13:
+            pi = pi + 1
+        elif c == 58:                                    # ':'
+            pi = pi + 1
+            break
+        else:
+            # Unexpected.
+            return -1
+    while pi < fbuf_len:
+        c: uint8 = ch_fetch_buf[pi]
+        if c == 32 or c == 9 or c == 10 or c == 13:
+            pi = pi + 1
+        else:
+            break
+    if pi >= fbuf_len or ch_fetch_buf[pi] != 91:         # '['
+        return -1
+    pi = pi + 1
+    chname: Ptr[uint8] = &channel_names_buf[channel_names_off[ci]]
+    chlen: uint64 = channel_names_len[ci]
+    n_pkgs: uint64 = 0
+    while pi < fbuf_len:
+        c: uint8 = ch_fetch_buf[pi]
+        if c == 32 or c == 9 or c == 10 or c == 13 or c == 44:
+            pi = pi + 1
+            continue
+        if c == 93:                                       # ']'
+            pi = pi + 1
+            break
+        if c != 123:                                      # not '{'
+            return -1
+        # Inter-object separator if this isn't the first.
+        if n_pkgs > 0:
+            if _idx_emit_byte(44) != 0:                  # ','
+                return -1
+        # Emit `{"channel":"<name>"` then copy rest.
+        if _idx_emit_byte(123) != 0:                     # '{'
+            return -1
+        ch_key: Ptr[uint8] = "\"channel\":"
+        if _idx_emit(ch_key) != 0:
+            return -1
+        if _idx_emit_quoted(chname, chlen) != 0:
+            return -1
+        # Copy the rest of the object, tracking nesting + strings,
+        # until matching `}` at depth 0.
+        pi = pi + 1                                       # past '{'
+        # If the source object has any keys, the first byte after
+        # the injected channel must be a comma so the object stays
+        # syntactically valid. Peek to see if the object is empty.
+        peek: uint64 = pi
+        while peek < fbuf_len:
+            pc: uint8 = ch_fetch_buf[peek]
+            if pc == 32 or pc == 9 or pc == 10 or pc == 13:
+                peek = peek + 1
+            else:
+                break
+        nonempty: int32 = 1
+        if peek >= fbuf_len:
+            nonempty = 0
+        elif ch_fetch_buf[peek] == 125:
+            nonempty = 0
+        if nonempty != 0:
+            if _idx_emit_byte(44) != 0:
+                return -1
+        depth: int32 = 1
+        in_str: int32 = 0
+        in_esc: int32 = 0
+        while pi < fbuf_len and depth > 0:
+            c2: uint8 = ch_fetch_buf[pi]
+            if _idx_emit_byte(c2) != 0:
+                return -1
+            if in_esc != 0:
+                in_esc = 0
+                pi = pi + 1
+                continue
+            if in_str != 0:
+                if c2 == 92:
+                    in_esc = 1
+                elif c2 == 34:
+                    in_str = 0
+                pi = pi + 1
+                continue
+            if c2 == 34:
+                in_str = 1
+            elif c2 == 123:
+                depth = depth + 1
+            elif c2 == 125:
+                depth = depth - 1
+            pi = pi + 1
+        if depth != 0:
+            return -1
+        n_pkgs = n_pkgs + 1
+    out_n_pkgs[0] = n_pkgs
     return 0
 
 
 def cmd_refresh() -> int32:
-    # Fetch <repo>/index.json into idx_buf, parse it, persist to
-    # /tmp/hpm/index.json. The repo URL has already been parsed into
-    # url_scheme + host_buf + path_buf by main().
-    n: int64 = fetch_to_buf(cast[Ptr[uint8]]("index.json"),
-                            &idx_buf[0], INDEX_CAP)
-    if n < 0:
-        write_str(2, "hpm: refresh failed\n")
+    # Read enabled channels from /etc/hpm/channels (or default to
+    # `main`), then fetch + merge every channel's index.json. The
+    # merged form lives in idx_buf and is persisted to /tmp/hpm/
+    # index.json so subsequent list/search/show commands have the
+    # whole package universe cached.
+    if _channels_load() != 0:
+        write_str(2, "hpm: failed to read /etc/hpm/channels\n")
         return 1
-    idx_len = cast[uint64](n)
+    if n_channels == 0:
+        write_str(2, "hpm: no channels enabled — see /etc/hpm/channels\n")
+        return 1
+
+    # Build the merged envelope into idx_buf. Reset the parser/db.
+    idx_len = 0
+    pkg_count = 0
+    dep_entry_n = 0
+    conf_entry_n = 0
+    prov_entry_n = 0
+
+    head: Ptr[uint8] = "{\"schema\":1,\"packages\":["
+    if _idx_emit(head) != 0:
+        write_str(2, "hpm: refresh: idx_buf overflow (head)\n")
+        return 1
+
+    total_pkgs: uint64 = 0
+    ci: uint64 = 0
+    n_failed: uint64 = 0
+    while ci < n_channels:
+        if _set_channel_url(ci) != 0:
+            write_str(2, "hpm: refresh: bad channel URL for ")
+            sys_write(2, &channel_names_buf[channel_names_off[ci]],
+                      channel_names_len[ci])
+            write_str(2, "\n")
+            return 1
+        write_str(1, "hpm: fetching channel ")
+        sys_write(1, &channel_names_buf[channel_names_off[ci]],
+                  channel_names_len[ci])
+        write_str(1, " from ")
+        write_str(1, &repo_url_buf[0])
+        write_str(1, "\n")
+        n: int64 = fetch_to_buf(cast[Ptr[uint8]]("index.json"),
+                                &ch_fetch_buf[0], 262144)
+        if n < 0:
+            write_str(2, "hpm: refresh: cannot fetch channel ")
+            sys_write(2, &channel_names_buf[channel_names_off[ci]],
+                      channel_names_len[ci])
+            write_str(2, "\n")
+            n_failed = n_failed + 1
+            ci = ci + 1
+            continue
+        # Splice into idx_buf. Need a leading ',' separator if any
+        # previous channel already contributed packages.
+        if total_pkgs > 0:
+            # Inject a separator BEFORE this channel's objects — but
+            # _splice_channel_into_idx also injects ',' between
+            # objects within its own batch. We pre-inject by writing
+            # a comma here ONLY if the splice will produce >=1 obj.
+            # Simpler: have the splicer remember whether it's the
+            # first call. We pass a sentinel via total_pkgs and let
+            # the splicer's per-object separator handle it.
+            pass
+        added: uint64 = 0
+        # Pre-add comma if total_pkgs > 0 (because the splicer's
+        # first object won't add one for its own first emission).
+        # We patch this by adjusting the splicer's local n_pkgs
+        # start. Easiest: emit the comma here, then have the splicer
+        # treat its first emit as "not first".
+        # Re-implement: pass an inout cursor so the splicer behaves
+        # uniformly.
+        if total_pkgs > 0:
+            if _idx_emit_byte(44) != 0:                   # ','
+                write_str(2, "hpm: refresh: idx_buf overflow\n")
+                return 1
+            # Force the splicer to NOT emit a leading comma for its
+            # first object — we already did. Set total_pkgs lower
+            # bound trick: bump n_pkgs starting value inside splicer.
+        # NB: _splice_channel_into_idx emits ',' BEFORE each object
+        # after its first (its local n_pkgs counter starts at 0).
+        # That means we've already emitted exactly one leading ','
+        # above, and the splicer will emit ',' before its 2nd, 3rd,
+        # ... objects. Net: the joined output has one ',' between
+        # every two adjacent objects across channels. Correct.
+        sp_rc: int32 = _splice_channel_into_idx(ci,
+                                                cast[uint64](n),
+                                                &added)
+        if sp_rc != 0:
+            write_str(2, "hpm: refresh: malformed index for channel ")
+            sys_write(2, &channel_names_buf[channel_names_off[ci]],
+                      channel_names_len[ci])
+            write_str(2, "\n")
+            return 1
+        write_str(1, "hpm:   (")
+        write_dec_u64(1, added)
+        write_str(1, " packages)\n")
+        # If the channel was empty (no objects), the comma we injected
+        # is a stray. Strip it back off.
+        if added == 0 and total_pkgs > 0:
+            idx_len = idx_len - 1
+        total_pkgs = total_pkgs + added
+        ci = ci + 1
+
+    tail: Ptr[uint8] = "]}\n"
+    if _idx_emit(tail) != 0:
+        write_str(2, "hpm: refresh: idx_buf overflow (tail)\n")
+        return 1
+    # Drop the trailing '\n' from idx_len so the parser sees clean
+    # `]}` at EOF (it accepts trailing WS, but the cache file gets a
+    # newline written below).
+    if idx_len > 0 and idx_buf[idx_len - 1] == 10:
+        idx_len = idx_len - 1
+
     if _json_parse_index() != 0:
-        write_str(2, "hpm: refresh: index.json parse failed\n")
+        write_str(2, "hpm: refresh: merged index.json parse failed\n")
         return 1
+    _index_channels()
+    # Re-append the newline for the on-disk cache.
+    if idx_len + 1 < INDEX_CAP:
+        idx_buf[idx_len] = 10
+        idx_len = idx_len + 1
     if _save_index_cache() != 0:
         return 1
+    # Restore the user-configured base URL (repo_url_buf was clobbered
+    # per-channel; subsequent install operations re-derive channel
+    # URLs from repo_base_buf, but we keep repo_url_buf in sync for
+    # any diagnostic that echoes the current "repo").
+    _strcopy_cstr(&repo_url_buf[0], &repo_base_buf[0], 1024)
+    _apply_repo()
     write_str(1, "hpm: refreshed index from ")
     write_str(1, &repo_url_buf[0])
     write_str(1, " (")
     write_dec_u64(1, pkg_count)
-    write_str(1, " packages, ")
+    write_str(1, " packages across ")
+    write_dec_u64(1, n_channels)
+    write_str(1, " channels, ")
     write_dec_u64(1, idx_len)
     write_str(1, " bytes)\n")
+    if n_failed > 0:
+        write_str(2, "hpm: warning: ")
+        write_dec_u64(2, n_failed)
+        write_str(2, " channel(s) failed to fetch — partial index loaded\n")
     return 0
 
 
@@ -3316,6 +3943,13 @@ def cmd_install(spec: Ptr[uint8]) -> int32:
                 return 1
         di = di + 1
 
+    # Channel-aware fetch: switch repo_url_buf to <base>/<channel>/
+    # so the package's URL (which is relative to the channel root)
+    # resolves correctly. _pkg_set_channel_url falls back to the
+    # bare base for legacy (no-channel-field) indices.
+    if _pkg_set_channel_url(pi) != 0:
+        return 1
+
     # 1. Fetch the tarball.
     n: int64 = fetch_to_buf(&url_cstr[0], &deb_buf[0], TARBALL_CAP)
     if n < 0:
@@ -3847,6 +4481,10 @@ def cmd_install_v3(spec: Ptr[uint8]) -> int32:
                 write_str(2, " is already installed\n")
                 return 1
         di = di + 1
+
+    # Channel-aware fetch.
+    if _pkg_set_channel_url(pi) != 0:
+        return 1
 
     # Fetch.
     n: int64 = fetch_to_buf(&url_cstr[0], &deb_buf[0], TARBALL_CAP)
@@ -4918,6 +5556,10 @@ def _install_one_by_repo_idx(pi: uint64, pinned: int32) -> int32:
     write_str(1, &v_cstr[0])
     write_str(1, "\n")
 
+    # Channel-aware fetch.
+    if _pkg_set_channel_url(pi) != 0:
+        return 1
+
     n: int64 = fetch_to_buf(&url_cstr[0], &deb_buf[0], TARBALL_CAP)
     if n < 0:
         return 1
@@ -5320,12 +5962,105 @@ def cmd_unpin(name: Ptr[uint8]) -> int32:
     return 0
 
 
+# -- channel subcommands ----------------------------------------------
+
+def cmd_channels() -> int32:
+    if _channels_load() != 0:
+        write_str(2, "hpm: failed to read /etc/hpm/channels\n")
+        return 1
+    if n_channels == 0:
+        write_str(1, "hpm: no channels subscribed. Use `hpm enable <name>`.\n")
+        return 0
+    ci: uint64 = 0
+    while ci < n_channels:
+        sys_write(1, &channel_names_buf[channel_names_off[ci]],
+                  channel_names_len[ci])
+        sys_write(1, "\n", 1)
+        ci = ci + 1
+    write_str(1, "(edit /etc/hpm/channels to customise; one channel per line)\n")
+    return 0
+
+
+def cmd_enable(name: Ptr[uint8]) -> int32:
+    nlen: uint64 = strlen_u8(name)
+    if nlen == 0:
+        write_str(2, "hpm: enable requires a channel name\n")
+        return 1
+    # Validate the same charset _channels_load enforces.
+    vi: uint64 = 0
+    while vi < nlen:
+        c: uint8 = name[vi]
+        ok: int32 = 0
+        if c >= 65 and c <= 90:
+            ok = 1
+        elif c >= 97 and c <= 122:
+            ok = 1
+        elif c >= 48 and c <= 57:
+            ok = 1
+        elif c == 45 or c == 46 or c == 95:
+            ok = 1
+        if ok == 0:
+            write_str(2, "hpm: enable: invalid channel name (allow [A-Za-z0-9_.-])\n")
+            return 1
+        vi = vi + 1
+    if _channels_load() != 0:
+        return 1
+    rc: int32 = _channel_add_name(name, nlen)
+    if rc == -1:
+        write_str(1, "hpm: ")
+        write_str(1, name)
+        write_str(1, " already enabled\n")
+        return 0
+    if rc == -2:
+        write_str(2, "hpm: too many channels (cap=")
+        write_dec_u64(2, CHANNEL_MAX)
+        write_str(2, ")\n")
+        return 1
+    if _channels_save() != 0:
+        return 1
+    write_str(1, "hpm: enabled channel ")
+    write_str(1, name)
+    write_str(1, " (run `hpm refresh` to fetch its index)\n")
+    return 0
+
+
+def cmd_disable(name: Ptr[uint8]) -> int32:
+    nlen: uint64 = strlen_u8(name)
+    if nlen == 0:
+        write_str(2, "hpm: disable requires a channel name\n")
+        return 1
+    if _channels_load() != 0:
+        return 1
+    ci: int64 = _channel_find(name, nlen)
+    if ci < 0:
+        write_str(1, "hpm: ")
+        write_str(1, name)
+        write_str(1, " was not enabled (no change)\n")
+        return 0
+    # Remove channel at index ci by sliding the tail forward. Names
+    # in channel_names_buf stay where they are; only the index table
+    # contracts. (Buffer slop is fine — _channels_save iterates only
+    # n_channels.)
+    cu: uint64 = cast[uint64](ci)
+    while cu + 1 < n_channels:
+        channel_names_off[cu] = channel_names_off[cu + 1]
+        channel_names_len[cu] = channel_names_len[cu + 1]
+        cu = cu + 1
+    n_channels = n_channels - 1
+    if _channels_save() != 0:
+        return 1
+    write_str(1, "hpm: disabled channel ")
+    write_str(1, name)
+    write_str(1, "\n")
+    return 0
+
+
 # -- usage + main -----------------------------------------------------
 
 def _usage() -> int32:
     s: Ptr[uint8] = "Usage: hpm [--repo=<url>] [--target-prefix=<path>] <command> [args]\n\
 Commands:\n\
-  refresh                 fetch repo index\n\
+  refresh                 fetch repo index (every enabled channel)\n\
   list                    show installed packages\n\
   search <pattern>        substring match against repo names\n\
   show <name>[@<ver>]     print package metadata\n\
@@ -5334,6 +6069,9 @@ Commands:\n\
   update                  refresh + upgrade non-pinned installs\n\
   pin <name>[@<ver>]      pin existing install or install pinned\n\
   unpin <name>            remove pin\n\
+  channels                list enabled channels (/etc/hpm/channels)\n\
+  enable <name>           subscribe to channel <name>\n\
+  disable <name>          unsubscribe from channel <name>\n\
 \n\
 Flags:\n\
   --repo=<url>            file:// or https:// repo (default https://255.one/)\n\
@@ -5390,12 +6128,34 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
 
     if _apply_repo() != 0:
         return 1
+    # Snapshot the base for later per-channel URL composition. Every
+    # path that fetches a tarball reads from repo_base_buf and appends
+    # the package's channel to derive the real URL.
+    _save_repo_base()
 
     cmd: Ptr[uint8] = cast[Ptr[uint8]](argv[cast[uint64](ai)])
     ai = ai + 1
 
     if _streq(cmd, cast[Ptr[uint8]]("refresh")) != 0:
         return cmd_refresh()
+    if _streq(cmd, cast[Ptr[uint8]]("channels")) != 0:
+        return cmd_channels()
+    if _streq(cmd, cast[Ptr[uint8]]("enable")) != 0:
+        if sys_getuid() != 1:
+            write_str(2, "hpm: enabling channels requires hostowner. Try `newshell hostowner`.\n")
+            return 1
+        if ai >= argc:
+            write_str(2, "hpm: enable requires a channel name\n")
+            return 1
+        return cmd_enable(cast[Ptr[uint8]](argv[cast[uint64](ai)]))
+    if _streq(cmd, cast[Ptr[uint8]]("disable")) != 0:
+        if sys_getuid() != 1:
+            write_str(2, "hpm: disabling channels requires hostowner. Try `newshell hostowner`.\n")
+            return 1
+        if ai >= argc:
+            write_str(2, "hpm: disable requires a channel name\n")
+            return 1
+        return cmd_disable(cast[Ptr[uint8]](argv[cast[uint64](ai)]))
     if _streq(cmd, cast[Ptr[uint8]]("list")) != 0:
         return cmd_list()
     if _streq(cmd, cast[Ptr[uint8]]("search")) != 0:

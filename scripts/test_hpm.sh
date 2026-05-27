@@ -43,8 +43,11 @@ FIXDIR="$(mktemp -d /tmp/test-hpm-fixtures.XXXXXX)"
 trap 'rm -rf "$FIXDIR"' EXIT
 
 # -- Fixture 1: the happy-path repo (one package, hpm-hello@1.0). -----
+# Channel layout (2026-05-27 pivot): top-level dirs under the repo
+# root are channels. Default install subscribes to `main` only, so
+# the fixture's only channel-subdir is `main/`.
 REPO="$FIXDIR/repo"
-mkdir -p "$REPO/packages"
+mkdir -p "$REPO/main/packages"
 
 PKG_BUILD="$FIXDIR/build/hpm-hello-1.0"
 mkdir -p "$PKG_BUILD/files/var/lib"
@@ -65,24 +68,26 @@ printf 'hello from hpm-hello\n' > "$PKG_BUILD/files/var/lib/hpm-hello-greet"
 cat > "$PKG_BUILD/install.hamsh" <<'EOF'
 echo HOOK_INSTALL_RAN
 EOF
-(cd "$FIXDIR/build" && tar czf "$REPO/packages/hpm-hello-1.0.tar.gz" hpm-hello-1.0)
+(cd "$FIXDIR/build" && tar czf "$REPO/main/packages/hpm-hello-1.0.tar.gz" hpm-hello-1.0)
 
-PKG_SHA=$(sha256sum "$REPO/packages/hpm-hello-1.0.tar.gz" \
+PKG_SHA=$(sha256sum "$REPO/main/packages/hpm-hello-1.0.tar.gz" \
             | awk '{print $1}')
-PKG_SIZE=$(stat -c%s "$REPO/packages/hpm-hello-1.0.tar.gz")
+PKG_SIZE=$(stat -c%s "$REPO/main/packages/hpm-hello-1.0.tar.gz")
 
-cat > "$REPO/index.json" <<EOF
+cat > "$REPO/main/index.json" <<EOF
 {
   "schema": 1,
   "repo": "test/hpm",
-  "url": "file:///test-hpm-repo/",
+  "channel": "main",
+  "url": "file:///test-hpm-repo/main/",
   "updated": "2026-05-26",
-  "description": "hpm Phase 6 test fixture",
+  "description": "hpm Phase 6 test fixture (main channel)",
   "packages": [
     {
       "name": "hpm-hello",
       "version": "1.0",
       "arch": "any",
+      "channel": "main",
       "url": "packages/hpm-hello-1.0.tar.gz",
       "sha256": "$PKG_SHA",
       "size": $PKG_SIZE,
@@ -97,7 +102,7 @@ EOF
 # -- Fixture 2: a conflict repo (two packages that declare each other
 # as conflicts).  Install pkg-a first, then pkg-b MUST fail loudly. ---
 REPO_C="$FIXDIR/repo-conflict"
-mkdir -p "$REPO_C/packages"
+mkdir -p "$REPO_C/main/packages"
 
 PKG_A="$FIXDIR/build-c/pkg-a-1.0"
 mkdir -p "$PKG_A/files/var/lib"
@@ -109,7 +114,7 @@ arch: any
 description: conflict-test A
 conflicts: pkg-b
 EOF
-(cd "$FIXDIR/build-c" && tar czf "$REPO_C/packages/pkg-a-1.0.tar.gz" pkg-a-1.0)
+(cd "$FIXDIR/build-c" && tar czf "$REPO_C/main/packages/pkg-a-1.0.tar.gz" pkg-a-1.0)
 
 PKG_B="$FIXDIR/build-c/pkg-b-1.0"
 mkdir -p "$PKG_B/files/var/lib"
@@ -121,25 +126,27 @@ arch: any
 description: conflict-test B
 conflicts: pkg-a
 EOF
-(cd "$FIXDIR/build-c" && tar czf "$REPO_C/packages/pkg-b-1.0.tar.gz" pkg-b-1.0)
+(cd "$FIXDIR/build-c" && tar czf "$REPO_C/main/packages/pkg-b-1.0.tar.gz" pkg-b-1.0)
 
-PKG_A_SHA=$(sha256sum "$REPO_C/packages/pkg-a-1.0.tar.gz" | awk '{print $1}')
-PKG_A_SZ=$(stat -c%s "$REPO_C/packages/pkg-a-1.0.tar.gz")
-PKG_B_SHA=$(sha256sum "$REPO_C/packages/pkg-b-1.0.tar.gz" | awk '{print $1}')
-PKG_B_SZ=$(stat -c%s "$REPO_C/packages/pkg-b-1.0.tar.gz")
+PKG_A_SHA=$(sha256sum "$REPO_C/main/packages/pkg-a-1.0.tar.gz" | awk '{print $1}')
+PKG_A_SZ=$(stat -c%s "$REPO_C/main/packages/pkg-a-1.0.tar.gz")
+PKG_B_SHA=$(sha256sum "$REPO_C/main/packages/pkg-b-1.0.tar.gz" | awk '{print $1}')
+PKG_B_SZ=$(stat -c%s "$REPO_C/main/packages/pkg-b-1.0.tar.gz")
 
-cat > "$REPO_C/index.json" <<EOF
+cat > "$REPO_C/main/index.json" <<EOF
 {
   "schema": 1,
   "repo": "test/hpm-conflict",
-  "url": "file:///test-hpm-repo-conflict/",
+  "channel": "main",
+  "url": "file:///test-hpm-repo-conflict/main/",
   "updated": "2026-05-26",
-  "description": "hpm Phase 6 conflict-detect fixture",
+  "description": "hpm Phase 6 conflict-detect fixture (main channel)",
   "packages": [
     {
       "name": "pkg-a",
       "version": "1.0",
       "arch": "any",
+      "channel": "main",
       "url": "packages/pkg-a-1.0.tar.gz",
       "sha256": "$PKG_A_SHA",
       "size": $PKG_A_SZ,
@@ -150,6 +157,7 @@ cat > "$REPO_C/index.json" <<EOF
       "name": "pkg-b",
       "version": "1.0",
       "arch": "any",
+      "channel": "main",
       "url": "packages/pkg-b-1.0.tar.gz",
       "sha256": "$PKG_B_SHA",
       "size": $PKG_B_SZ,

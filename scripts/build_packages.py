@@ -10,9 +10,20 @@ subset (e.g. `{ hamnix-kernel, hamnix-init, hamnix-hamsh, hpm,
 hamnix-drivers-net-e1000e, hamnix-fs-ext4 }` for an embedded build)
 and skip everything else.
 
+Channel layout (2026-05-27 pivot, per memory/project_nonfree_repo.md):
+top-level directories under build/packages/ are *channels* mirroring
+Debian's main / contrib / non-free / non-free-firmware split. Today
+this script writes every package into `main/` (free + first-party
+software). Placeholder `non-free/` and `non-free-firmware/` channels
+exist as empty channels with a `{schema:1, packages:[]}` index so a
+fresh `hpm refresh` against an enabled channel returns cleanly
+instead of 404. The contrib channel is reserved (not auto-created).
+
 Outputs (under build/packages/):
 
-  * hamnix-base-<v>.tar.gz             — metapackage (zero files,
+  * main/index.json                    — main-channel index. Each
+                                          entry carries `channel: "main"`.
+  * main/packages/hamnix-base-<v>.tar.gz   — metapackage (zero files,
                                           depends on all component pkgs).
                                           target: #hamnix-system
   * hamnix-init-<v>.tar.gz             — /init + /etc/rc.boot etc.
@@ -39,12 +50,17 @@ USB+NVMe doesn't need ahci/snd-hda; an embedded headless build doesn't
 need linux-debian-12; a kiosk box might want only hamnix-{kernel,init,
 hamsh}.
 
-After this script runs the ISO builder stages build/packages/ at
+After this script runs the ISO builder stages build/packages/main/ at
 /iso-packages/ on the cpio (build_initramfs.py) and the installer
 runs
 
     hpm --repo=file:///iso-packages --target-prefix=/tmp/newroot \\
         install hamnix-base
+
+The ISO mini-repo only carries the `main` channel — the installer
+default subscribes to `main` only, and an ISO-time install never
+needs non-free firmware (that's an opt-in `hpm enable
+non-free-firmware` post-install).
 
 which (per docs/packages.md and the hpm v3 dep solver) pulls the
 entire closure transitively. Alternatively install.hamsh can name
@@ -236,6 +252,10 @@ def _files_init() -> list[tuple[Path, str]]:
                  "resolv.conf", "services", "timezone", "users",
                  "debian_version"):
         _add_etc_file(f, name)
+    # /etc/hpm/channels — channel-subscription file. Default contents
+    # subscribe to `main` only (the free / first-party channel).
+    # `hpm enable non-free-firmware` appends entries post-install.
+    _add_etc_file(f, "channels", subdir="hpm")
     return f
 
 
@@ -570,7 +590,7 @@ def _build_spec(spec: dict) -> dict | None:
 
     _write_pkginfo(staging, pkginfo)
 
-    out_tar = PACKAGES_OUT / "packages" / f"{pkg_dirname}.tar.gz"
+    out_tar = PACKAGES_OUT / "main" / "packages" / f"{pkg_dirname}.tar.gz"
     sha, size = _tar_gz(staging, out_tar)
     _say(f"built {out_tar.name}: {n_files} files, "
          f"{total_bytes} src bytes, {size} tar bytes, sha={sha[:16]}…")
@@ -579,6 +599,7 @@ def _build_spec(spec: dict) -> dict | None:
         "name": pkg_name,
         "version": PKG_VERSION,
         "arch": "x86_64",
+        "channel": "main",
         "url": f"packages/{pkg_dirname}.tar.gz",
         "sha256": sha,
         "size": size,
@@ -629,7 +650,7 @@ def build_hamnix_base() -> dict:
         "homepage": "https://255.one/",
     })
 
-    out_tar = PACKAGES_OUT / "packages" / f"{pkg_dirname}.tar.gz"
+    out_tar = PACKAGES_OUT / "main" / "packages" / f"{pkg_dirname}.tar.gz"
     sha, size = _tar_gz(staging, out_tar)
     _say(f"built {out_tar.name}: METAPACKAGE (0 files, "
          f"{len(depends)} depends), {size} tar bytes, sha={sha[:16]}…")
@@ -637,6 +658,7 @@ def build_hamnix_base() -> dict:
         "name": pkg_name,
         "version": PKG_VERSION,
         "arch": "x86_64",
+        "channel": "main",
         "url": f"packages/{pkg_dirname}.tar.gz",
         "sha256": sha,
         "size": size,
@@ -708,7 +730,7 @@ def build_hamnix_bootloader() -> dict:
         "license": "ISC",
         "homepage": "https://255.one/",
     })
-    out_tar = PACKAGES_OUT / "packages" / f"{pkg_dirname}.tar.gz"
+    out_tar = PACKAGES_OUT / "main" / "packages" / f"{pkg_dirname}.tar.gz"
     sha, size = _tar_gz(staging, out_tar)
     _say(f"built {out_tar.name}: {n_files} files, "
          f"{total_bytes} src bytes, {size} tar bytes, sha={sha[:16]}…")
@@ -716,6 +738,7 @@ def build_hamnix_bootloader() -> dict:
         "name": pkg_name,
         "version": PKG_VERSION,
         "arch": "x86_64",
+        "channel": "main",
         "url": f"packages/{pkg_dirname}.tar.gz",
         "sha256": sha,
         "size": size,
@@ -867,7 +890,7 @@ def build_linux_debian_12() -> dict | None:
         "homepage": "https://debian.org/",
     })
 
-    out_tar = PACKAGES_OUT / "packages" / f"{pkg_dirname}.tar.gz"
+    out_tar = PACKAGES_OUT / "main" / "packages" / f"{pkg_dirname}.tar.gz"
     sha, size = _tar_gz(staging, out_tar)
     _say(f"built {out_tar.name}: {n_files} files"
          f"{' (SLIM)' if slim else ''}, "
@@ -876,6 +899,7 @@ def build_linux_debian_12() -> dict | None:
         "name": pkg_name,
         "version": PKG_VERSION,
         "arch": "x86_64",
+        "channel": "main",
         "url": f"packages/{pkg_dirname}.tar.gz",
         "sha256": sha,
         "size": size,
@@ -896,13 +920,34 @@ def main() -> int:
             "[build_packages] build/ missing — run scripts/build_iso.sh "
             "first to produce the artifacts this script repackages.")
     PACKAGES_OUT.mkdir(parents=True, exist_ok=True)
-    (PACKAGES_OUT / "packages").mkdir(parents=True, exist_ok=True)
+    # Channel subdirs: main/ holds every first-party / free package;
+    # non-free/ and non-free-firmware/ exist as placeholders so `hpm
+    # refresh` against an opt-in enabled channel returns an empty list
+    # cleanly (no 404 from GitHub Pages). The contrib channel is
+    # reserved (created on-demand when a package needs it).
+    main_dir = PACKAGES_OUT / "main"
+    main_pkgs = main_dir / "packages"
+    main_pkgs.mkdir(parents=True, exist_ok=True)
+    (PACKAGES_OUT / "non-free").mkdir(parents=True, exist_ok=True)
+    (PACKAGES_OUT / "non-free-firmware").mkdir(parents=True, exist_ok=True)
+
+    # Clean stale outputs (both the old flat shape AND any prior
+    # channel-dir build artefacts).
     for old in PACKAGES_OUT.glob("*.tar.gz"):
         old.unlink()
-    for old in (PACKAGES_OUT / "packages").glob("*.tar.gz"):
+    if (PACKAGES_OUT / "packages").is_dir():
+        # Legacy flat layout: remove the bare `packages/` dir if it
+        # exists (we now write under main/packages/).
+        for old in (PACKAGES_OUT / "packages").glob("*.tar.gz"):
+            old.unlink()
+    for old in main_pkgs.glob("*.tar.gz"):
         old.unlink()
-    if (PACKAGES_OUT / "index.json").exists():
-        (PACKAGES_OUT / "index.json").unlink()
+    for stale in (PACKAGES_OUT / "index.json",
+                  main_dir / "index.json",
+                  PACKAGES_OUT / "non-free" / "index.json",
+                  PACKAGES_OUT / "non-free-firmware" / "index.json"):
+        if stale.exists():
+            stale.unlink()
 
     entries: list[dict] = []
 
@@ -927,20 +972,47 @@ def main() -> int:
     if stage_root.is_dir() and os.environ.get("HAMNIX_KEEP_STAGE") != "1":
         shutil.rmtree(stage_root)
 
-    index = {
+    updated = os.environ.get("HAMNIX_PKG_DATE", "2026-05-27")
+    main_index = {
         "schema": 1,
         "repo": "HamnixOS/packages",
-        "url": "https://255.one/",
-        "updated": os.environ.get("HAMNIX_PKG_DATE", "2026-05-27"),
-        "description": ("Hamnix package repository — component split "
-                        "(hamnix-base metapackage + ~16 components + "
-                        "bootloader + linux-debian-12)"),
+        "channel": "main",
+        "url": "https://255.one/main/",
+        "updated": updated,
+        "description": ("Hamnix main channel — first-party free "
+                        "software (hamnix-base metapackage + ~16 "
+                        "components + bootloader + linux-debian-12)"),
         "packages": entries,
     }
-    (PACKAGES_OUT / "index.json").write_text(
-        json.dumps(index, indent=2) + "\n", encoding="utf-8")
-    _say(f"wrote {PACKAGES_OUT / 'index.json'} "
+    (main_dir / "index.json").write_text(
+        json.dumps(main_index, indent=2) + "\n", encoding="utf-8")
+    _say(f"wrote {main_dir / 'index.json'} "
          f"({len(entries)} package entries)")
+
+    # Empty channel indexes. Each opt-in channel has a stub index so
+    # `hpm refresh` returns `0 packages` cleanly when subscribed but
+    # the channel has no contents yet. The day a non-free-firmware
+    # package lands the build pipeline replaces this stub.
+    for ch_name, ch_desc in (
+        ("non-free",
+         "Hamnix non-free channel — placeholder (no packages yet)"),
+        ("non-free-firmware",
+         "Hamnix non-free firmware channel — placeholder"),
+    ):
+        stub = {
+            "schema": 1,
+            "repo": "HamnixOS/packages",
+            "channel": ch_name,
+            "url": f"https://255.one/{ch_name}/",
+            "updated": updated,
+            "description": ch_desc,
+            "packages": [],
+        }
+        (PACKAGES_OUT / ch_name / "index.json").write_text(
+            json.dumps(stub, indent=2) + "\n", encoding="utf-8")
+        _say(f"wrote {PACKAGES_OUT / ch_name / 'index.json'} "
+             f"(0 package entries — empty channel)")
+
     return 0
 
 
