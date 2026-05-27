@@ -1,5 +1,12 @@
 # Hamnix security model — Plan 9-shape, namespace-as-authority
 
+> **Status:** v1 is shipped across `b40e874`..`ae15032`
+> (2026-05-26..27). Every phase below has a "Shipped at" line citing
+> the landing commit. The Plan-9-shape model is the live model;
+> `/dev/auth`, `newshell`, the hpm uid==1 gate, the live ISO
+> `live:hamnix` credentials, and the installer credential prompts
+> all work in `scripts/test_security.sh` (13 phases).
+
 ## TL;DR
 
 Hamnix's native security model is **Plan 9**'s, not POSIX's. There is
@@ -87,7 +94,8 @@ code without changing the threat model materially for v1.
 ### The `auth` cdev
 
 Authentication goes through a kernel-side `#auth` device (mounted at
-`/dev/auth` per init's recipe). Userland never reads `/etc/shadow`
+`/dev/auth` per init's recipe; shipped at `f5e9982` as
+`sys/src/9/port/devauth.ad`). Userland never reads `/etc/shadow`
 directly. Pattern:
 
 ```
@@ -298,31 +306,33 @@ Hamnix's privileged paths).
 - **Containers / cgroups**. Plan 9 namespaces are the substitute;
   per-process namespace is the only isolation surface.
 
-## Implementation surface (one sweeping agent, after hpm + installer)
+## Implementation surface — shipped phases
 
-Phases:
-1. `uid`/`gid` fields on TaskStruct; inherit on fork; passed through
-   `rfork`.
-2. `/etc/passwd` + `/etc/shadow` formats; parser library in `lib/`.
-3. SHA-512-crypt (`lib/crypt/sha512_crypt.ad`) — re-use existing
-   `lib/sha2/sha512.ad`.
-4. `#auth` cdev (`sys/src/9/cdev/auth.ad`) — credential check; never
-   exposes hashes to userland.
-5. VFS permission check on `open`/`create`/`exec`.
-6. ext4 + cdev owner/group/mode on write paths.
-7. `newshell` hamsh builtin.
-8. hpm uid==1 gate.
-9. `svc` uid switching before exec.
-10. `/etc/users/<name>.ns` recipe loading at login.
-11. Live ISO bakes `live:hamnix`.
-12. Installer prompts.
+All phases below landed across the 2026-05-26..27 wave. The
+`scripts/test_security.sh` regression covers the boundary in 13 phases.
 
-Test coverage:
+| Phase | Description | Shipped at |
+|------:|-------------|-----------|
+| 1 | `uid`/`gid` fields on TaskStruct; inherited on fork; passed through `rfork`. New `SYS_GETUID=288` / `SYS_GETGID=289` / `SYS_SETUID=290` (hostowner-only). | `cf041e5` |
+| 2 | `/etc/passwd` (`name:uid:gid:home:shell`) + `/etc/shadow` (`name:$6$<salt>$<hash>:<days>`) formats; parser library at `lib/passwd/{passwd,shadow}.ad`. | `75214c1` |
+| 3 | SHA-512-crypt (`lib/crypt/sha512_crypt.ad`) — glibc-compatible `$6$` (5000-iteration Linux default); built on `lib/sha2/sha512.ad`. | `0bb5f3c` |
+| 4 | `#auth` cdev at `/dev/auth` (`sys/src/9/port/devauth.ad`) — kernel-side credential check via `/etc/shadow` + rate limit; userland never sees hashes. | `f5e9982` |
+| 5 | VFS permission check on `open`/`create`/`exec` (owner/group/other rwx). | `931bf0d` |
+| 6 | ext4 stamps owner/group/mode on inode create; `ext4_mkfs` lays down the root as hostowner. | `b42c243` |
+| 7 | `newshell <user> [-c <cmd>]` + `read [-s] VAR` hamsh builtins (Plan-9-shape elevation; `read -s` mutes echo for password prompts). | `deb8bb1`, `43d7499` |
+| 8 | hpm write commands gate on uid==1; read-only commands (`list`, `search`, `show`) are unrestricted. | `8721866` |
+| 9 | `svc` switches uid before `exec` per `/etc/svc/<name>.hamsh`'s `uid:` field; sshd runs as system uid 2. | `363263d` |
+| 10 | `/etc/users/<name>.ns` per-user namespace recipe loaded at `newshell`-spawned interactive shell; falls back to `/etc/users/default.ns`. | `43d7499`, `ac0bf0d` |
+| 11 | Live ISO bakes `live:hamnix` as the single hostowner; system users `sshd` (uid 2) + `hamsh-svc` (uid 3) baked in `/etc/passwd`. | `ac0bf0d` |
+| 12 | Installer prompts (`etc/install.hamsh`) for hostowner credentials; non-interactive overrides via `HAMNIX_HOSTOWNER_USER` / `HAMNIX_HOSTOWNER_PASSWORD`. | `ac0bf0d` |
+| polish | Boot-time uid fallback; svc setuid error codes. | `0212f17` |
+
+Test coverage (`scripts/test_security.sh`, 13 phases, header at `ae15032`):
 - A regular user can't open `/dev/blk/vda`.
 - A regular user can't open `/var/lib/hpm/installed.json`.
-- A regular user can run `hpm list` (read-only commands? probably
-  permit; but `hpm install` is denied).
-- `newshell hostowner` with right password succeeds; wrong password
+- A regular user running `hpm install` is rejected with the
+  hostowner-required message.
+- `newshell hostowner` (correct password) succeeds; wrong password
   fails; rate-limited (1 attempt/second to thwart brute force).
 - Service running as uid 50 can't read another service's state dir.
 
