@@ -97,21 +97,37 @@ svc start sshd
 
 echo 'rc.boot: boot services launched'
 
-# Static-IP fallback. On the Skull Canyon NUC the e1000e I219 PHY/MAC
-# init isn't yet complete enough to drive DHCP (TX timeouts, RX
-# descriptor ring frozen — being worked) so the box has no
-# dynamically-assigned address. Bake a static config so the box at
-# least has an identity on the LAN, sshd binds to it, and the user
-# can attempt SSH-in once the chip's TX engine starts working.
+# Static-IP fallback (DISABLED by default).
 #
-# 10.250.10.99/24 with gateway 10.250.10.1 — adjust for your LAN
-# if different. This call is unconditional: if DHCP DID succeed
-# earlier in boot, this overrides it with the static IP (which is
-# fine on the development box, but if you want to keep a DHCP-bound
-# address comment these three lines out).
-ifconfig eth0 10.250.10.99 netmask 255.255.255.0
-ifconfig gw 10.250.10.1
-ifconfig dns 10.250.10.1
+# Earlier revisions of this rc UNCONDITIONALLY overrode the kernel's
+# DHCP-bound config with a hard-coded 10.250.10.99 / 10.250.10.1.
+# That was useful for ONE specific edge case — a Skull Canyon NUC
+# whose e1000e I219 PHY/MAC init wasn't yet driving DHCP cleanly —
+# but it broke DNS / connectivity in every OTHER environment where
+# DHCP DOES work: QEMU/SLIRP user-mode networking (10.0.2.x),
+# GNOME Boxes, and almost every home / office LAN. The override
+# pointed the system's DNS at 10.250.10.1 which isn't reachable
+# from a normal SLIRP guest, so `hpm refresh` would print
+# "cannot resolve 255.one" and bail.
+#
+# Default policy: let DHCP win. The kernel runs the DHCP discover/
+# offer/request/ack handshake during early init (see init/main.ad
+# around the dhcp_discover() call) and latches cfg_src=dhcp on
+# success. We do nothing here — the kernel state is the source of
+# truth. If DHCP failed, `ifconfig` below prints "(none)" and the
+# operator can pin a static config by hand:
+#
+#   ifconfig eth0 10.250.10.99 netmask 255.255.255.0
+#   ifconfig gw   10.250.10.1
+#   ifconfig dns  1.1.1.1
+#
+# Or, for the NUC-style "DHCP not yet driving on this chip" case,
+# uncomment the block below (or the future opt-in path: a marker
+# file like /etc/static-ip.conf naming the address triplet).
+#
+# ifconfig eth0 10.250.10.99 netmask 255.255.255.0
+# ifconfig gw 10.250.10.1
+# ifconfig dns 10.250.10.1
 
 # Print the live network config (IPv4 address + netmask + gw + DNS,
 # with source tag — "(dhcp)" or "(static)") so a real-hardware box
