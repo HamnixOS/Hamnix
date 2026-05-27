@@ -120,7 +120,7 @@ python3 -m compiler.adder compile \
     --target=x86_64-bare-metal init/main.ad -o "$ELF" >/dev/null
 
 LOG=$(mktemp /tmp/test-hpm-channels.XXXXXX.log)
-trap 'rm -f "$LOG"; rm -rf "$FIXDIR"' EXIT
+trap '[ "${HPM_CHANNELS_KEEP_LOG:-0}" = 1 ] || rm -f "$LOG"; rm -rf "$FIXDIR"' EXIT
 
 echo "[test_hpm_channels] (3/3) Boot QEMU + drive hpm channel CLI"
 set +e
@@ -170,13 +170,13 @@ fi
 
 # 1. Default `hpm channels` shows just `main`.
 list1_block=$(sed -n '/CHAN_STAGE_START/,/CHAN_STAGE_LIST_DEFAULT/p' "$LOG")
-if echo "$list1_block" | grep -E -q "^main$"; then
+if echo "$list1_block" | grep -F -q "- main"; then
     echo "[test_hpm_channels] OK: default channels list contains main"
 else
     echo "[test_hpm_channels] FAIL: default channels list does not contain main"
     fail=1
 fi
-if echo "$list1_block" | grep -E -q "^extra-channel$"; then
+if echo "$list1_block" | grep -F -q "extra-channel"; then
     echo "[test_hpm_channels] FAIL: extra-channel listed before enable"
     fail=1
 fi
@@ -204,8 +204,12 @@ fi
 
 # 3. enable widens to two channels.
 list2_block=$(sed -n '/CHAN_STAGE_ENABLE_EXTRA/,/CHAN_STAGE_LIST_AFTER_ENABLE/p' "$LOG")
-if echo "$list2_block" | grep -E -q "^main$" && \
-   echo "$list2_block" | grep -E -q "^extra-channel$"; then
+# Only grep the lines `hpm channels` itself emitted (not the
+# echo CHAN_STAGE_* boilerplate that mentions the strings too).
+# `hpm channels` emits "  - <name>" lines after the diagnostic
+# n=<count> header. Both names must appear in the post-enable block.
+if echo "$list2_block" | grep -F -q "- main" && \
+   echo "$list2_block" | grep -F -q "- extra-channel"; then
     echo "[test_hpm_channels] OK: channels list contains both main + extra-channel"
 else
     echo "[test_hpm_channels] FAIL: post-enable list missing main or extra-channel"
@@ -242,8 +246,10 @@ fi
 
 # 7. disable restores single-channel state.
 list3_block=$(sed -n '/CHAN_STAGE_DISABLE_EXTRA/,/CHAN_STAGE_LIST_AFTER_DISABLE/p' "$LOG")
-if echo "$list3_block" | grep -E -q "^main$" && \
-   ! echo "$list3_block" | grep -E -q "^extra-channel$"; then
+# Same filter as list2: only `hpm channels` output, not the
+# CHAN_STAGE_DISABLE_EXTRA echo boilerplate.
+if echo "$list3_block" | grep -F -q "- main" && \
+   ! echo "$list3_block" | grep -F -q "- extra-channel"; then
     echo "[test_hpm_channels] OK: disable removed extra-channel; only main remains"
 else
     echo "[test_hpm_channels] FAIL: disable did not restore single-channel state"
