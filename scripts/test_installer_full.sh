@@ -458,10 +458,13 @@ stage_d_install_and_boot 1G 225000 "1G" || {
     exit 1
 }
 
-# 5 GiB disk = 5368709120 bytes. Rootfs partition ~5128 MiB →
-# ~1312768 blocks at 4 KiB → (/ 32768) = 40 groups → 1310720 blocks.
-# Require AT LEAST 1,280,000 blocks (~5 GiB final capacity).
-stage_d_install_and_boot 5G 1280000 "5G" || {
+# 5 GiB disk = 5368709120 bytes. After GPT (2048 + 34 sectors) + ESP
+# (32 MiB = 65536 sectors), the rootfs partition is 10418143 sectors
+# = 5086 MiB → ~1302267 blocks at 4 KiB → floor to 32768/group = 39
+# groups → 39 * 32768 = 1277952 blocks. Threshold 1,250,000 (~5%
+# slack) so a future kernel-side group-overhead tweak doesn't trip
+# the test on a single missing group.
+stage_d_install_and_boot 5G 1250000 "5G" || {
     echo "[test_installer_full] Stage D-5G: FAILED" >&2
     exit 1
 }
