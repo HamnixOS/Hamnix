@@ -65,13 +65,11 @@ Linux ABI.
 
 ```
 Hamnix/
-├── compiler/             # Adder compiler (CPython-hosted)
-│   ├── adder.py          # CLI: --target=x86_64-{bare-metal,adder-user,linux-kernel-module}
-│   ├── lexer.py          # Tokenizer
-│   ├── parser.py         # Recursive-descent parser
-│   ├── ast_nodes.py      # AST node definitions
-│   ├── codegen_x86.py    # x86_64 backend (hand-written, no LLVM)
-│   └── optimizer.py      # AST-level passes
+├── adder/                # Adder compiler + LANGUAGE.md — git submodule
+│                         # pinned to a specific HamnixOS/adder commit.
+│                         # Clone with --recurse-submodules.
+├── compiler -> adder/compiler   (symlink into the submodule)
+├── LANGUAGE.md -> adder/LANGUAGE.md   (symlink into the submodule)
 ├── arch/x86/             # Bare-metal kernel entry, traps, IRQs, syscalls
 ├── mm/                   # Memory allocators (memblock, page_alloc, slab)
 ├── kernel/sched/         # Scheduler, TaskStruct, signals
@@ -79,17 +77,24 @@ Hamnix/
 ├── drivers/              # Device drivers (PCI, virtio-net, AHCI, NVMe,
 │                         # e1000e, atkbd, vga/fb console, UART, …)
 ├── fs/                   # VFS + cpio + ELF loader + ext4 + FAT
-├── sys/src/9/port/       # Plan 9 Layer 1 syscall bodies
-│                         # (errstr, devcons, devtime, sysproc/rfork, …)
+├── sys/src/9/port/       # Plan 9 Layer 1 syscall bodies + cdevs
+│                         # (errstr, devcons, devtime, devauth, …)
 ├── linux_abi/            # Linux ABI shims (Layer 2): api_*.ad for .ko
 │                         # modules, u_*.ad for user ELFs.
-├── user/                 # Adder userland binaries (hamsh, coreutils)
+├── lib/                  # Adder library code (9p, crypt, passwd, sha2,
+│                         # rsa, ec, pgp, ssh, xz, zlib, asn1, x509, ...)
+├── user/                 # Adder userland binaries (hamsh, hpm,
+│                         # sshd, coreutils, …)
+├── etc/                  # On-disk config (rc.boot, install.hamsh,
+│                         # svc/*.hamsh, users/*.ns, passwd, shadow)
 ├── tests/                # Integration tests + u-binary host fixtures
 ├── kernel-modules/       # Legacy M1..M15 .ko regression baseline
 ├── init/main.ad          # Kernel entry
-├── scripts/              # build_user.sh, test_*.sh, build_iso.sh, …
+├── scripts/              # build_user.sh, test_*.sh, build_iso.sh,
+│                         # build_packages.py, test_adder_pin.sh, …
 └── docs/                 # architecture.md, native-api.md, rio.md,
-                          # x86-backend.md, BOOT.md, L_TRACK_HOWTO.md
+                          # security.md, packages.md, BOOT.md,
+                          # rootfs_partition.md, HAMSH_SPEC.md, …
 ```
 
 ## Development Setup
@@ -124,15 +129,18 @@ Hamnix uses Python-like syntax with explicit type annotations:
 
 | Type | Size | Description |
 |------|------|-------------|
-| `int32` | 4 bytes | Signed 32-bit integer |
-| `uint32` | 4 bytes | Unsigned 32-bit integer |
-| `int8` | 1 byte | Signed 8-bit integer |
-| `uint8` | 1 byte | Unsigned 8-bit integer |
+| `int8` / `uint8` | 1 byte | 8-bit integer |
+| `int16` / `uint16` | 2 bytes | 16-bit integer |
+| `int32` / `uint32` | 4 bytes | 32-bit integer |
+| `int64` / `uint64` | 8 bytes | 64-bit integer |
 | `bool` | 1 byte | Boolean |
-| `float32` | 4 bytes | 32-bit float |
-| `Ptr[T]` | 4 bytes | Pointer to type T |
+| `char` | 1 byte | C-style char (alias for uint8 in contexts) |
+| `Ptr[T]` | 8 bytes | Pointer to type T (x86_64) |
 | `Array[N, T]` | N * sizeof(T) | Fixed-size array |
-| `Fn[R, A...]` | 4 bytes | Function pointer |
+| `Fn[R, A...]` | 8 bytes | Function pointer (x86_64) |
+| `Percpu[T]` | sizeof(T) | Per-CPU storage (accessed via `%gs:`) |
+
+See `LANGUAGE.md` (in the adder submodule) for the canonical reference.
 
 ### Functions
 
@@ -232,13 +240,14 @@ def calculate_checksum(data: Ptr[uint8], length: int32) -> uint8:
 
 ### 1. Create the Library File
 
-Create a new file in `lib/` with the appropriate name:
+Create a new file in `lib/` with the appropriate name (Adder source
+ends in `.ad`):
 
 ```python
-# lib/mylib.py
+# lib/mylib.ad
 
 # Imports from other libraries
-from lib.io import print_str
+from lib.printk import printk0
 from lib.memory import memset
 
 # Constants
@@ -256,56 +265,61 @@ def my_function(param: int32) -> int32:
 
 ### 2. Document the API
 
-Add documentation to `docs/API.md`:
-
-```markdown
-## lib/mylib
-
-### my_function
-
-```python
-def my_function(param: int32) -> int32
-```
-
-Description of what the function does.
-```
+There is no central `docs/API.md`. Document the library in its own
+file's header comment block, then cross-reference from the relevant
+subsystem doc (`docs/architecture.md`, `docs/native-api.md`, etc.) if
+it surfaces a new public concept. Recent libraries (`lib/passwd/`,
+`lib/crypt/`, `lib/ssh/`, `lib/pgp/`) all follow this pattern.
 
 ### 3. Write Tests
 
-Create a test file in `tests/`:
+Create a test in `tests/` (Adder source `.ad` for compile-and-run
+fixtures) plus a `scripts/test_<name>.sh` driver that boots the
+fixture under QEMU and asserts on serial output:
 
 ```python
-# tests/test_mylib.py
+# tests/test_mylib.ad
 
 from lib.mylib import my_function
 
-def test_my_function():
+def main() -> int32:
     result: int32 = my_function(10)
-    if result == expected:
-        test_pass("my_function")
-    else:
-        test_fail("my_function")
+    if result == 100:
+        printk0("[mylib] PASS")
+        return 0
+    printk0("[mylib] FAIL")
+    return 1
+```
+
+```bash
+# scripts/test_mylib.sh
+source "$(dirname "$0")/_build_lock.sh"
+# ... compile + boot + assert "[mylib] PASS"
 ```
 
 ## Adding Kernel Features
 
-### Process/IPC Features
+### Process / scheduling
 
-Edit `kernel/process.py`:
+Edit `kernel/sched/core.ad`:
 
 1. Add constants at the top of the file
 2. Add state arrays if needed
-3. Implement the syscall function
-4. Add cleanup in `proc_cleanup()` if needed
+3. Implement the syscall body
+4. Wire dispatch in `arch/x86/kernel/syscall.ad`
 
-### Device Drivers
+### Device drivers / cdevs
 
-Edit `kernel/devfs.py`:
+Every device is a file (Plan-9-shape). New cdevs land in
+`sys/src/9/port/dev*.ad` (e.g. `devauth.ad`, `devnet.ad`):
 
-1. Add device type constant (DEV_XXX)
-2. Add read/write handler functions
-3. Register in `devfs_read()`/`devfs_write()` dispatch
-4. Initialize default devices in `devfs_init()`
+1. Define the device's name letter or word (registered in
+   `sys/src/9/port/dev.ad`'s table).
+2. Implement `attach` / `walk` / `open` / `read` / `write` / `close`.
+3. Wire dispatch in the relevant chan path.
+
+Bytes-on-the-wire drivers (storage / NIC / USB-HC) live in
+`drivers/{ata,nvme,net,usb,...}/`.
 
 ## Compiler Development
 
@@ -363,22 +377,28 @@ bash scripts/test_net_dhcp.sh
 
 ### Compiler regression suite
 
-Every known Adder compiler quirk lives as one fixture under
-`tests/test_compiler_<short_name>.ad` driven by a same-named script
-`scripts/test_compiler_<short_name>.sh`. The canonical "did the
-compiler regress?" check is:
+The Adder compiler and its regression fixtures now live in their own
+repository, **[HamnixOS/adder](https://github.com/HamnixOS/adder)**,
+and are consumed in Hamnix as a git submodule at `adder/`. The
+top-level `compiler/` and `LANGUAGE.md` paths in Hamnix are forwarding
+symlinks into the submodule.
+
+To run the Adder compiler regression suite, work inside the submodule:
 
 ```bash
-bash scripts/run_compiler_tests.sh
+cd adder && bash scripts/run_compiler_tests.sh
 ```
 
 This runs every `scripts/test_compiler_*.sh` + `scripts/test_lex_*.sh`
-+ `python3 compiler/lexer_test.py` serially and prints a per-test
-PASS/FAIL summary. It exits 0 iff every fixture is green. Run it
-before submitting any change to `compiler/codegen_x86.py`,
-`compiler/lexer.py`, or `compiler/parser.py`.
+serially and prints a per-test PASS/FAIL summary. Run it before
+submitting any change that affects the compiler.
 
-**Conventions for new quirk fixtures:**
+On the Hamnix side, CI runs `scripts/test_adder_pin.sh` (a drift check
+ensuring the submodule HEAD is a real upstream `HamnixOS/adder`
+commit). When you need a compiler fix, land it in the adder repo,
+then bump the submodule pin in a separate Hamnix commit.
+
+**Conventions for new quirk fixtures** (in the adder repo):
 
 - File names: `tests/test_compiler_<short_name>.ad` +
   `scripts/test_compiler_<short_name>.sh`.
@@ -386,11 +406,11 @@ before submitting any change to `compiler/codegen_x86.py`,
   citing the bug, the fix commit (if any), and the failure mode.
 - Each script emits `[<short_name>] PASS` on success, non-zero exit
   on failure.
-- Kernel-level (QEMU-boot) fixtures source `scripts/_build_lock.sh`
-  as their first action; pure host-side compile-and-asm-inspection
-  fixtures don't need the lock.
+- Pure host-side compile-and-asm-inspection fixtures don't need a
+  build lock; kernel-boot fixtures source `scripts/_build_lock.sh`
+  as their first action.
 - Add the new fixture to the `TESTS=(...)` array in
-  `scripts/run_compiler_tests.sh`.
+  `scripts/run_compiler_tests.sh` (in the adder repo).
 
 **XFAIL fixtures** (a known-active bug with no fix yet):
 
@@ -398,8 +418,7 @@ before submitting any change to `compiler/codegen_x86.py`,
   failure happens, exits 1 when the bug appears fixed (a regression
   in the xfail status — the fixture should then be flipped to a
   normal PASS-expected test).
-- Document the xfail convention in the fixture's `.ad` header. See
-  `tests/test_compiler_nested_frame_array.ad` for the reference shape.
+- Document the xfail convention in the fixture's `.ad` header.
 
 ### Writing Tests
 
@@ -437,13 +456,17 @@ def test_lexer_feature():
 
 1. **Run the build**: `bash scripts/run_x86_bare.sh` (or
    `bash scripts/build_iso.sh`) must complete without errors.
-2. **Run the compiler regression suite**:
-   `bash scripts/run_compiler_tests.sh` — every fixture must pass.
-3. **Run the relevant integration test**: each feature should have a
+2. **Run the relevant integration test**: each feature should have a
    `scripts/test_*.sh` that exercises it under QEMU.
+3. **If you touched the compiler**: land the fix in the
+   [`HamnixOS/adder`](https://github.com/HamnixOS/adder) submodule
+   first (run its `scripts/run_compiler_tests.sh` — every fixture
+   must pass), then bump the submodule pin in a separate Hamnix
+   commit.
 4. **Add tests**: New features should have tests.
-5. **Update docs**: Update `LANGUAGE.md`, `docs/architecture.md`, or
-   the relevant subsystem doc when behaviour changes.
+5. **Update docs**: Update `docs/architecture.md`, the relevant
+   subsystem doc, or `LANGUAGE.md` (in the adder repo) when
+   behaviour changes.
 
 ### Pull Request Guidelines
 
