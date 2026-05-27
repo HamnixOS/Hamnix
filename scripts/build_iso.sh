@@ -133,7 +133,15 @@ if [ ! -f "$HAMNIX_EFI_STUB" ] && [ -f "$EFI_STUB_SRC" ]; then
 fi
 
 echo "[build_iso] Building v1 hpm packages (build/packages/) for installer mini-repo"
-python3 scripts/build_packages.py
+# HAMNIX_BOOTLOADER_SLIM=1: emit a metadata-only hamnix-bootloader
+# tarball. The full one would embed kernel.elf + BOOTX64.EFI inside a
+# cpio that itself is embedded in kernel.elf — a 73 MB recursion bomb
+# that overflows the 32 MB ESP. The installer copies BOOTX64.EFI +
+# kernel.elf onto the target ESP via dd_blk of the source ESP, so the
+# tarball payload isn't needed at install time. The full-payload
+# tarball at https://255.one/ is unchanged.
+HAMNIX_BOOTLOADER_SLIM=1 HAMNIX_LINUX_DEBIAN_SLIM=1 \
+    python3 scripts/build_packages.py
 
 # HAMNIX_CPIO_LEAN=1: the ISO build pairs a small cpio (boot
 # essentials only) with the rootfs partition (where distro content

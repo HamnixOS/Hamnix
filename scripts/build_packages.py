@@ -291,13 +291,43 @@ def build_hamnix_bootloader() -> dict:
             f"[build_packages] {EFI_STUB.relative_to(HERE)} missing — "
             f"run scripts/build_iso.sh first to produce the EFI stub")
 
-    total_bytes += _copy_file(EFI_STUB, files_root / "BOOTX64.EFI",
-                              mode=0o755)
-    n_files += 1
-    total_bytes += _copy_file(KERNEL_ELF,
-                              files_root / "hamnix-kernel.elf",
-                              mode=0o755)
-    n_files += 1
+    # The full-fat bootloader payload (BOOTX64.EFI + the kernel ELF)
+    # lives in upstream HamnixOS/packages so a fresh-install user can
+    # `hpm install hamnix-bootloader` and get a real kernel. But ON THE
+    # ISO mini-repo (which is what build_iso.sh stages at
+    # /mnt/iso-packages), we cannot embed the kernel.elf inside the
+    # cpio that lives inside the kernel.elf — that's a 73 MB recursion
+    # bomb. The installer copies BOOTX64.EFI + kernel.elf onto the
+    # target ESP via dd_blk from the live ISO's source ESP (which is
+    # byte-equivalent), so hpm doesn't need the tarball's payload to
+    # complete the install.
+    #
+    # HAMNIX_BOOTLOADER_SLIM=1 — emit a metadata-only tarball (PKGINFO
+    # only, no files/). build_iso.sh sets this when assembling the
+    # mini-repo. The upstream HamnixOS/packages build (no env var)
+    # produces the full tarball so direct https://255.one/ downloads
+    # have a complete payload.
+    slim = os.environ.get("HAMNIX_BOOTLOADER_SLIM") == "1"
+    if not slim:
+        total_bytes += _copy_file(EFI_STUB, files_root / "BOOTX64.EFI",
+                                  mode=0o755)
+        n_files += 1
+        total_bytes += _copy_file(KERNEL_ELF,
+                                  files_root / "hamnix-kernel.elf",
+                                  mode=0o755)
+        n_files += 1
+    else:
+        _say("hamnix-bootloader: HAMNIX_BOOTLOADER_SLIM=1 — emitting "
+             "metadata-only package (no files/)")
+        # Plant a README so the empty files/ tree is non-empty.
+        (files_root / "README").write_text(
+            "This is the ISO mini-repo slim build of hamnix-bootloader. "
+            "The real BOOTX64.EFI + kernel.elf payload lives in the live "
+            "ISO's source ESP partition and is copied onto the target "
+            "ESP by /etc/install.hamsh via dd_blk. The full-payload "
+            "package is published at https://255.one/.\n",
+            encoding="ascii")
+        n_files += 1
 
     out_tar = PACKAGES_OUT / f"{pkg_dirname}.tar.gz"
     _write_pkginfo(staging, {
@@ -493,11 +523,61 @@ def build_linux_debian_12() -> dict | None:
     total_bytes = 0
     n_files = 0
 
-    if not DEBIAN_MINBASE.is_dir():
+    # Slim mode for the ISO mini-repo: emit metadata-only, no files/.
+    # The full Debian closure (~24 MB) is in the live ISO's source
+    # rootfs partition and gets dd_blk'd onto the target rootfs.
+    # Embedding the tarball in the cpio inside kernel.elf would blow
+    # past the 32 MB FAT12 ESP ceiling. The upstream
+    # HamnixOS/packages build (no env var) produces the full payload.
+    slim = os.environ.get("HAMNIX_LINUX_DEBIAN_SLIM") == "1"
+
+    if not DEBIAN_MINBASE.is_dir() and not slim:
         _say(f"WARN: {DEBIAN_MINBASE.relative_to(HERE)} absent — "
              f"linux-debian-12 will be SKIPPED. Run "
              f"tests/distros/debian-minbase/BUILD.sh first.")
         return None
+    if slim:
+        _say("linux-debian-12: HAMNIX_LINUX_DEBIAN_SLIM=1 — emitting "
+             "metadata-only package (no files/)")
+        (files_root / "README").write_text(
+            "ISO mini-repo slim build of linux-debian-12. The real "
+            "Debian closure lives in the live ISO's source rootfs "
+            "partition and is copied onto the target rootfs by "
+            "/etc/install.hamsh via dd_blk. The full payload is at "
+            "https://255.one/.\n", encoding="ascii")
+        (files_root / ".hamnix-roots").write_text("distro    .\n",
+                                                  encoding="ascii")
+        n_files = 2
+        out_tar = PACKAGES_OUT / f"{pkg_dirname}.tar.gz"
+        _write_pkginfo(staging, {
+            "name": pkg_name,
+            "version": PKG_VERSION,
+            "arch": "x86_64",
+            "description": ("Debian 12 (bookworm) rootfs for the Linux "
+                            "namespace"),
+            "target": "#distro",
+            "depends": "hamnix-base>=1",
+            "provides": "linux-distro",
+            "maintainer": "HamnixOS",
+            "license": "various (Debian)",
+            "homepage": "https://debian.org/",
+        })
+        sha, size = _tar_gz(staging, out_tar)
+        _say(f"built {out_tar.name}: {n_files} files (SLIM), "
+             f"{size} tar bytes, sha={sha[:16]}…")
+        return {
+            "name": pkg_name,
+            "version": PKG_VERSION,
+            "arch": "x86_64",
+            "url": f"packages/{pkg_dirname}.tar.gz",
+            "sha256": sha,
+            "size": size,
+            "description": ("Debian 12 (bookworm) rootfs for the Linux "
+                            "namespace"),
+            "depends": ["hamnix-base>=1"],
+            "provides": ["linux-distro"],
+            "target": "#distro",
+        }
 
     missing: list[str] = []
     for rel in LINUX_DEBIAN_FILES:
