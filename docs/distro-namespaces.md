@@ -45,8 +45,8 @@ not an escape from anything.
 
 Imported Linux binaries (apt, dpkg, postgresql, python3) run inside
 distro-shape namespaces because that's the namespace shape they
-expect. Native Adder binaries (hamsh, the init system, sshd-as-init,
-the future Hamnix-native package manager) run inside init's default
+expect. Native Adder binaries (hamsh, the init system, sshd, the
+Hamnix-native package manager `hpm`) run inside init's default
 namespace because that's the namespace shape *they* expect. Neither
 is the "real" /; they're peer namespaces.
 
@@ -58,10 +58,10 @@ We did this once with `user/apt.ad` + `user/dpkg.ad` + `user/
 dpkg_deb.ad`, spent months, and deleted all three (2026-05-26,
 commits `0de1c63`..`3ff5bfc`) once `enter linux { /usr/bin/apt }`
 worked. See [`architecture.md` § "What runs where"](architecture.md)
-for the full rule and the aspirational placement of a future
-native Hamnix package manager (which would NOT be a substitute for
-apt — it would manage Hamnix-side services in the DEFAULT
-namespace, not distro packages).
+for the full rule. The native Hamnix package manager (`hpm`,
+shipped) is NOT a substitute for apt — it manages **Hamnix-side**
+services and state in the DEFAULT namespace, not distro packages.
+See [`packages.md`](packages.md) for the `hpm` spec.
 
 ## Layout
 
