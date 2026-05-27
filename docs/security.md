@@ -5,7 +5,9 @@
 > the landing commit. The Plan-9-shape model is the live model;
 > `/dev/auth`, `newshell`, the hpm uid==1 gate, the live ISO
 > `live:hamnix` credentials, and the installer credential prompts
-> all work in `scripts/test_security.sh` (13 phases).
+> all work in `scripts/test_security.sh` (covers Phases 1/4/5/6/7/8/9
+> — the kernel-plumbing + /dev/auth + VFS perm + ext4 owner-stamp +
+> newshell + hpm gate + per-user .ns recipe boundary).
 
 ## TL;DR
 
@@ -327,7 +329,7 @@ All phases below landed across the 2026-05-26..27 wave. The
 | 12 | Installer prompts (`etc/install.hamsh`) for hostowner credentials; non-interactive overrides via `HAMNIX_HOSTOWNER_USER` / `HAMNIX_HOSTOWNER_PASSWORD`. | `ac0bf0d` |
 | polish | Boot-time uid fallback; svc setuid error codes. | `0212f17` |
 
-Test coverage (`scripts/test_security.sh`, 13 phases, header at `ae15032`):
+Test coverage (`scripts/test_security.sh`, covers Phases 1/4/5/6/7/8/9, expanded header at `ae15032`):
 - A regular user can't open `/dev/blk/vda`.
 - A regular user can't open `/var/lib/hpm/installed.json`.
 - A regular user running `hpm install` is rejected with the
