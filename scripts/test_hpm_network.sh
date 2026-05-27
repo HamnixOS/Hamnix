@@ -87,7 +87,9 @@ python3 -m compiler.adder compile \
 
 echo "[test_hpm_network] (3/3) Boot QEMU + drive hpm refresh"
 LOG=$(mktemp /tmp/test-hpm-network.XXXXXX.log)
-trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null 2>&1 || true' EXIT
+# Keep the log on PASS too (HPM_KEEP_LOG=1) — debugging this test is
+# painful without it. The init.elf restore still runs unconditionally.
+trap '[ "${HPM_KEEP_LOG:-0}" = 1 ] || rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null 2>&1 || true' EXIT
 
 # virtio-net + SLIRP: gateway 10.0.2.2, DHCP server 10.0.2.2,
 # DNS server 10.0.2.3 (emulated, forwards to the host's resolver),
@@ -188,13 +190,27 @@ fi
 
 # 7. hpm refresh — the user-visible goal. The block runs against
 # https://255.one/ (the hpm default). Looking for the success message
-# or for the index dump that follows on a healthy refresh.
+# or for the index dump that follows on a healthy refresh. The repo
+# ships 5 packages today (hpm-hello + the hamnix-* base set) — that's
+# the manual-test acceptance criterion the brief calls out, so we
+# also confirm a 5-package payload landed when the success line
+# carries a package count.
 refresh_block=$(sed -n '/HPM_NET_PING_INTERNET_DONE/,/HPM_NET_REFRESH_DONE/p' "$LOG")
 refresh_ok=0
 if echo "$refresh_block" | grep -E -q "refreshed index from https://255\.one/?"; then
     refresh_ok=1
 elif echo "$refresh_block" | grep -E -q "hpm: refresh OK"; then
     refresh_ok=1
+fi
+# Soft check: the repo today carries 5 packages. The exact count
+# may change as 255.one grows; we ONLY report a mismatch as a NOTE
+# so this test doesn't false-fail when packages are legitimately
+# added or removed upstream.
+if echo "$refresh_block" | grep -E -q "5 packages"; then
+    echo "[test_hpm_network] OK: hpm reports 5 packages from https://255.one/"
+elif echo "$refresh_block" | grep -E -q "[0-9]+ packages"; then
+    actual_n=$(echo "$refresh_block" | grep -oE "[0-9]+ packages" | head -1)
+    echo "[test_hpm_network] NOTE: hpm reports '$actual_n' (brief expects 5)"
 fi
 refresh_resolved=0
 if echo "$refresh_block" | grep -F -q "cannot resolve 255.one"; then
