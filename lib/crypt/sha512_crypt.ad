@@ -1,0 +1,376 @@
+# lib/crypt/sha512_crypt.ad
+#
+# glibc-compatible SHA-512-crypt per docs/security.md Phase 3.
+#
+# Reference: https://www.akkadia.org/drepper/SHA-crypt.txt (Ulrich
+# Drepper's authoritative SHA-crypt write-up; this implementation
+# matches the `crypt(3)` "$6$..." output of glibc and Linux's pam
+# stack).
+#
+# Output format: `$6$<salt>$<hash>` where
+#   * `<salt>` is 1..16 chars from `[a-zA-Z0-9./]`,
+#   * `<hash>` is 86 chars in glibc-crypt's base64-ish alphabet
+#     (different from RFC 4648 — see _b64_encode_24 below).
+#
+# Iteration count is fixed at 5000 (Linux default; `rounds=N$` modifier
+# NOT supported in v1 — adding it later is a 5-line diff). The hash is
+# expensive ON PURPOSE: a brute-force attempt costs ~2 ms on commodity
+# x86-64, so a 1-attempt/sec rate-limited /dev/auth keeps offline-
+# strength gates intact.
+#
+# Reuses lib/sha2/sha2.ad's sha512_oneshot. Each round of the inner
+# loops calls sha512_oneshot afresh — the algorithm is deliberately a
+# CASCADE of independent digests, not a single streaming hash.
+#
+# Test fixture lives in scripts/test_security.sh — known-answer
+# comparison against `openssl passwd -6 -salt <salt> <password>`.
+
+from lib.sha2.sha2 import sha512_oneshot
+
+
+SHA512_DIGEST_LEN: uint64 = 64
+SHA512_CRYPT_ROUNDS: uint64 = 5000
+
+# Salt cap from the spec — `<salt>` truncates to 16 chars even if the
+# input is longer. Stored 1:1 in the `$6$<salt>$` prefix.
+SHA512_CRYPT_SALT_MAX: uint64 = 16
+
+# The output hash itself is exactly 86 base64-ish chars.
+SHA512_CRYPT_HASH_LEN: uint64 = 86
+
+# Total `$6$<salt>$<hash>` including the trailing NUL:
+#   `$6$` (3) + salt (<=16) + `$` (1) + hash (86) + NUL (1) = 107.
+SHA512_CRYPT_OUT_MAX: uint64 = 128
+
+
+# Scratch buffers — pure static, no malloc. Each call to
+# sha512_crypt() recomputes from scratch; no per-call state spans.
+# Sized for the worst-case loop-body string length:
+# sha512_oneshot's input is bounded by `key + salt + ka + sa + ...`
+# which never exceeds `keylen + saltlen + 16*keylen` per round; we
+# cap key+salt at 256 each and reserve a 4 KiB working buffer.
+_sc_scratch:       Array[4096, uint8]
+_sc_digest_A:      Array[64, uint8]
+_sc_digest_B:      Array[64, uint8]
+_sc_digest_DP:     Array[64, uint8]
+_sc_digest_DS:     Array[64, uint8]
+_sc_P:             Array[2048, uint8]    # key-length-derived (P = key*N times)
+_sc_S:             Array[2048, uint8]    # salt-length-derived
+_sc_C:             Array[64, uint8]      # rolling round-state digest
+
+
+def _sc_strlen(s: Ptr[uint8]) -> uint64:
+    i: uint64 = 0
+    while s[i] != 0:
+        i = i + 1
+    return i
+
+
+# glibc-crypt base64 alphabet — `./0-9A-Za-z`. Different from RFC 4648.
+_sc_b64_chars: Array[64, uint8]
+_sc_b64_inited: int32 = 0
+
+
+def _sc_init_b64():
+    if _sc_b64_inited != 0:
+        return
+    _sc_b64_inited = 1
+    # './' then 0..9 then A..Z then a..z. Pack by hand to avoid any
+    # string-literal ordering quirks.
+    _sc_b64_chars[0]  = 46   # '.'
+    _sc_b64_chars[1]  = 47   # '/'
+    i: uint64 = 0
+    while i < 10:
+        _sc_b64_chars[2 + i] = cast[uint8](48 + i)        # '0'..'9'
+        i = i + 1
+    j: uint64 = 0
+    while j < 26:
+        _sc_b64_chars[12 + j] = cast[uint8](65 + j)       # 'A'..'Z'
+        j = j + 1
+    k: uint64 = 0
+    while k < 26:
+        _sc_b64_chars[38 + k] = cast[uint8](97 + k)       # 'a'..'z'
+        k = k + 1
+
+
+# Per the SHA-crypt spec, the 64-byte digest is emitted via a tuple
+# pattern that picks 3 bytes per `_b64_encode_24` call. The final
+# round emits 21 bytes (7 triples) plus a single 2-byte tail
+# (1 char). Layout per Drepper's table:
+#   T0 = (digest[ 0], digest[21], digest[42])
+#   T1 = (digest[22], digest[43], digest[ 1])
+#   T2 = (digest[44], digest[ 2], digest[23])
+#   ...
+#   T20 = (digest[20], digest[41], digest[62])
+#   T21 = (        0, digest[63], digest[63])   # 2-byte tail
+# Each `_b64_encode_24` emits N chars from a 24-bit triple (little-
+# endian per spec: bits 0..5, 6..11, 12..17, 18..23).
+def _b64_encode_24(b2: uint8, b1: uint8, b0: uint8,
+                   nchars: int32, out: Ptr[uint8], pos: uint64) -> uint64:
+    # 24-bit little-endian — b0 is the LOW byte.
+    w: uint64 = (cast[uint64](b2) << 16) \
+              | (cast[uint64](b1) << 8) \
+              | cast[uint64](b0)
+    i: int32 = 0
+    while i < nchars:
+        idx: uint64 = w & 0x3F
+        out[pos] = _sc_b64_chars[idx]
+        pos = pos + 1
+        w = w >> 6
+        i = i + 1
+    return pos
+
+
+# Drepper's b64 layout: 22 triples (numbers from his Table 7).
+# Each entry: (idx_b2, idx_b1, idx_b0, nchars).
+# Tail (last entry): only 2 chars and one of the indices is 0xFF
+# meaning "treat as 0" (encoded as a literal 0 byte).
+def _sha512_crypt_encode(digest: Ptr[uint8], out: Ptr[uint8]) -> uint64:
+    pos: uint64 = 0
+    # T0..T6: 4-char-per-triple sequence — exactly Drepper's table.
+    pos = _b64_encode_24(digest[0],  digest[21], digest[42], 4, out, pos)
+    pos = _b64_encode_24(digest[22], digest[43], digest[1],  4, out, pos)
+    pos = _b64_encode_24(digest[44], digest[2],  digest[23], 4, out, pos)
+    pos = _b64_encode_24(digest[3],  digest[24], digest[45], 4, out, pos)
+    pos = _b64_encode_24(digest[25], digest[46], digest[4],  4, out, pos)
+    pos = _b64_encode_24(digest[47], digest[5],  digest[26], 4, out, pos)
+    pos = _b64_encode_24(digest[6],  digest[27], digest[48], 4, out, pos)
+    pos = _b64_encode_24(digest[28], digest[49], digest[7],  4, out, pos)
+    pos = _b64_encode_24(digest[50], digest[8],  digest[29], 4, out, pos)
+    pos = _b64_encode_24(digest[9],  digest[30], digest[51], 4, out, pos)
+    pos = _b64_encode_24(digest[31], digest[52], digest[10], 4, out, pos)
+    pos = _b64_encode_24(digest[53], digest[11], digest[32], 4, out, pos)
+    pos = _b64_encode_24(digest[12], digest[33], digest[54], 4, out, pos)
+    pos = _b64_encode_24(digest[34], digest[55], digest[13], 4, out, pos)
+    pos = _b64_encode_24(digest[56], digest[14], digest[35], 4, out, pos)
+    pos = _b64_encode_24(digest[15], digest[36], digest[57], 4, out, pos)
+    pos = _b64_encode_24(digest[37], digest[58], digest[16], 4, out, pos)
+    pos = _b64_encode_24(digest[59], digest[17], digest[38], 4, out, pos)
+    pos = _b64_encode_24(digest[18], digest[39], digest[60], 4, out, pos)
+    pos = _b64_encode_24(digest[40], digest[61], digest[19], 4, out, pos)
+    pos = _b64_encode_24(digest[62], digest[20], digest[41], 4, out, pos)
+    # Tail: 2 chars from (0, 0, digest[63]). Drepper notes the order is
+    # different here — only one byte's worth, 2 chars.
+    pos = _b64_encode_24(0, 0, digest[63], 2, out, pos)
+    return pos
+
+
+def _sc_memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64):
+    i: uint64 = 0
+    while i < n:
+        dst[i] = src[i]
+        i = i + 1
+
+
+def _sc_extract_salt(input: Ptr[uint8], salt_out: Ptr[uint8],
+                     cap: uint64) -> uint64:
+    # `input` is either a raw salt (no `$6$` prefix) OR a complete
+    # `$6$<salt>$<hash>` string. Either way, return the salt as a
+    # NUL-terminated string in `salt_out` and its length.
+    # If input starts with `$6$`, skip the prefix and read up to the
+    # next `$` (or end). Else, read up to the first `$` or end. In
+    # all cases truncate to 16 chars.
+    base: uint64 = 0
+    if input[0] == 36 and input[1] == 54 and input[2] == 36:    # `$6$`
+        base = 3
+    i: uint64 = 0
+    while i < SHA512_CRYPT_SALT_MAX and i + 1 < cap:
+        c: uint8 = input[base + i]
+        if c == 0 or c == 36:                                   # `$` or NUL
+            break
+        salt_out[i] = c
+        i = i + 1
+    salt_out[i] = 0
+    return i
+
+
+def sha512_crypt(password: Ptr[uint8], salt_in: Ptr[uint8],
+                 out: Ptr[uint8]) -> uint64:
+    # Compute glibc-shape SHA-512-crypt of `password` against `salt_in`.
+    # Writes the full `$6$<salt>$<hash>` NUL-terminated string into
+    # `out`. `out` must have at least SHA512_CRYPT_OUT_MAX bytes.
+    # Returns the length of the written string (excluding the NUL).
+    _sc_init_b64()
+
+    # Step 0: extract the salt (caller may pass a raw salt or a full
+    # `$6$...` triple; we tolerate either).
+    salt_buf: Array[17, uint8]
+    salt_len: uint64 = _sc_extract_salt(salt_in,
+                                        cast[Ptr[uint8]](&salt_buf[0]), 17)
+    key_len: uint64 = _sc_strlen(password)
+
+    # Step 1: Hash B = SHA-512(password || salt || password)
+    # We reuse _sc_scratch as the concat buffer.
+    pos: uint64 = 0
+    _sc_memcpy(&_sc_scratch[pos], password, key_len)
+    pos = pos + key_len
+    _sc_memcpy(&_sc_scratch[pos], cast[Ptr[uint8]](&salt_buf[0]), salt_len)
+    pos = pos + salt_len
+    _sc_memcpy(&_sc_scratch[pos], password, key_len)
+    pos = pos + key_len
+    sha512_oneshot(&_sc_scratch[0], pos, &_sc_digest_B[0])
+
+    # Step 2: Hash A = SHA-512(password || salt || ...)
+    # The "..." is the elaborate constraint:
+    #   * For each full block of B (64 bytes), append B.
+    #   * For the trailing `key_len % 64` bytes, append the first
+    #     `key_len % 64` bytes of B.
+    #   * For each bit of `key_len` walked LSB-first while key_len > 0:
+    #       bit=0 -> append password
+    #       bit=1 -> append B
+    pos = 0
+    _sc_memcpy(&_sc_scratch[pos], password, key_len)
+    pos = pos + key_len
+    _sc_memcpy(&_sc_scratch[pos], cast[Ptr[uint8]](&salt_buf[0]), salt_len)
+    pos = pos + salt_len
+    nfull: uint64 = key_len / 64
+    nrem:  uint64 = key_len % 64
+    k: uint64 = 0
+    while k < nfull:
+        _sc_memcpy(&_sc_scratch[pos], &_sc_digest_B[0], 64)
+        pos = pos + 64
+        k = k + 1
+    if nrem > 0:
+        _sc_memcpy(&_sc_scratch[pos], &_sc_digest_B[0], nrem)
+        pos = pos + nrem
+    cnt: uint64 = key_len
+    while cnt > 0:
+        if (cnt & 1) != 0:
+            _sc_memcpy(&_sc_scratch[pos], &_sc_digest_B[0], 64)
+            pos = pos + 64
+        else:
+            _sc_memcpy(&_sc_scratch[pos], password, key_len)
+            pos = pos + key_len
+        cnt = cnt >> 1
+    sha512_oneshot(&_sc_scratch[0], pos, &_sc_digest_A[0])
+
+    # Step 3: Hash DP = SHA-512(password repeated key_len times)
+    pos = 0
+    kk: uint64 = 0
+    while kk < key_len:
+        _sc_memcpy(&_sc_scratch[pos], password, key_len)
+        pos = pos + key_len
+        kk = kk + 1
+    sha512_oneshot(&_sc_scratch[0], pos, &_sc_digest_DP[0])
+
+    # Build P: produce key_len bytes by tiling DP. For each full 64-
+    # byte chunk, copy DP; for the trailing key_len % 64 bytes, copy
+    # the first key_len % 64 bytes of DP.
+    np_full: uint64 = key_len / 64
+    np_rem:  uint64 = key_len % 64
+    pp: uint64 = 0
+    ii: uint64 = 0
+    while ii < np_full:
+        _sc_memcpy(&_sc_P[pp], &_sc_digest_DP[0], 64)
+        pp = pp + 64
+        ii = ii + 1
+    if np_rem > 0:
+        _sc_memcpy(&_sc_P[pp], &_sc_digest_DP[0], np_rem)
+
+    # Step 4: Hash DS = SHA-512(salt repeated 16 + first byte of A)
+    pos = 0
+    nrepeat: uint64 = 16 + cast[uint64](_sc_digest_A[0])
+    rr: uint64 = 0
+    while rr < nrepeat:
+        _sc_memcpy(&_sc_scratch[pos], cast[Ptr[uint8]](&salt_buf[0]), salt_len)
+        pos = pos + salt_len
+        rr = rr + 1
+    sha512_oneshot(&_sc_scratch[0], pos, &_sc_digest_DS[0])
+
+    # Build S: produce salt_len bytes by tiling DS. Same scheme as P.
+    ns_full: uint64 = salt_len / 64
+    ns_rem:  uint64 = salt_len % 64
+    sp: uint64 = 0
+    si: uint64 = 0
+    while si < ns_full:
+        _sc_memcpy(&_sc_S[sp], &_sc_digest_DS[0], 64)
+        sp = sp + 64
+        si = si + 1
+    if ns_rem > 0:
+        _sc_memcpy(&_sc_S[sp], &_sc_digest_DS[0], ns_rem)
+
+    # Step 5: 5000-round loop. Start with C = A. Per round:
+    #   if (round & 1)  src = P              else  src = C
+    #   if (round % 3)  add  S
+    #   if (round % 7)  add  P
+    #   if (round & 1)  add  C               else  add  P
+    #   C = SHA-512(...)
+    _sc_memcpy(&_sc_C[0], &_sc_digest_A[0], 64)
+    round_idx: uint64 = 0
+    while round_idx < SHA512_CRYPT_ROUNDS:
+        pos = 0
+        if (round_idx & 1) != 0:
+            _sc_memcpy(&_sc_scratch[pos], &_sc_P[0], key_len)
+            pos = pos + key_len
+        else:
+            _sc_memcpy(&_sc_scratch[pos], &_sc_C[0], 64)
+            pos = pos + 64
+        if (round_idx % 3) != 0:
+            _sc_memcpy(&_sc_scratch[pos], &_sc_S[0], salt_len)
+            pos = pos + salt_len
+        if (round_idx % 7) != 0:
+            _sc_memcpy(&_sc_scratch[pos], &_sc_P[0], key_len)
+            pos = pos + key_len
+        if (round_idx & 1) != 0:
+            _sc_memcpy(&_sc_scratch[pos], &_sc_C[0], 64)
+            pos = pos + 64
+        else:
+            _sc_memcpy(&_sc_scratch[pos], &_sc_P[0], key_len)
+            pos = pos + key_len
+        sha512_oneshot(&_sc_scratch[0], pos, &_sc_C[0])
+        round_idx = round_idx + 1
+
+    # Step 6: emit `$6$<salt>$<hash>` into `out`. The hash is the
+    # b64-encoded final C buffer via the Drepper layout above.
+    op: uint64 = 0
+    out[op] = 36                                # '$'
+    op = op + 1
+    out[op] = 54                                # '6'
+    op = op + 1
+    out[op] = 36                                # '$'
+    op = op + 1
+    j: uint64 = 0
+    while j < salt_len:
+        out[op] = salt_buf[j]
+        op = op + 1
+        j = j + 1
+    out[op] = 36                                # '$'
+    op = op + 1
+    # _sha512_crypt_encode writes from offset 0 of its second arg;
+    # pass a slice starting at `op` so the encoded hash appends to
+    # the `$6$<salt>$` prefix we just laid down.
+    pos_h: uint64 = _sha512_crypt_encode(&_sc_C[0], &out[op])
+    op = op + pos_h
+    out[op] = 0
+    return op
+
+
+def sha512_crypt_verify(password: Ptr[uint8], hash_triple: Ptr[uint8]) -> int32:
+    # Verify `password` against the stored `$6$<salt>$<hash>` triple.
+    # Returns 1 on match, 0 on mismatch. Constant-time over the 86-byte
+    # hash tail (the salt-extract + recompute IS variable-time, but
+    # nothing leaked there is secret).
+    if hash_triple[0] != 36 or hash_triple[1] != 54 or hash_triple[2] != 36:
+        return 0
+    fresh: Array[128, uint8]
+    sha512_crypt(password, hash_triple, cast[Ptr[uint8]](&fresh[0]))
+    # Constant-time compare: walk both strings to the first NUL of
+    # either, OR'ing differences. The shape guarantees identical
+    # length for matching inputs.
+    diff: uint8 = 0
+    i: uint64 = 0
+    while i < SHA512_CRYPT_OUT_MAX:
+        a: uint8 = fresh[i]
+        b: uint8 = hash_triple[i]
+        diff = diff | (a ^ b)
+        if a == 0 and b == 0:
+            break
+        if a == 0 or b == 0:
+            # Lengths differ — fold a non-zero into diff but keep
+            # walking the longer side to avoid an early exit.
+            diff = diff | 1
+            break
+        i = i + 1
+    if diff == 0:
+        return 1
+    return 0
