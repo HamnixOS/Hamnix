@@ -439,6 +439,55 @@ ns {
 That is the CPU-server idiom and the "useful in 2026, not archaic Unix" payoff,
 expressed entirely in the shell.
 
+### Authentication / elevation builtins — `newshell`, `read`
+
+Two builtins exist because the Plan-9-shape security model
+(`docs/security.md`) needs them and they must NOT live as setuid
+binaries.
+
+**`read [-s] VAR`** reads one line from stdin into the shell variable
+`VAR`. `-s` mutes echo so passwords don't appear on the terminal. Used
+by `etc/install.hamsh` for credential prompts and by `newshell` for the
+password prompt. Implementation: `user/hamsh.ad::builtin_read`.
+
+```
+hamsh$ read name
+alice
+hamsh$ echo Hello, $name
+Hello, alice
+hamsh$ read -s pw
+********              # echo muted
+```
+
+**`newshell <user> [-c <cmd>]`** is the Plan-9-shape elevation idiom —
+factotum-style re-auth into a new shell session AS the target user,
+with their full namespace. It is **not** "elevate this command's
+authority" (POSIX `sudo`); it is "open a new shell as that user."
+
+```
+$ newshell hostowner
+password: ********
+[hostowner@hamnix ~]$ hpm install linux-debian-12
+[hostowner@hamnix ~]$ exit
+$ # back to your regular-user shell
+```
+
+Implementation (`user/hamsh.ad::builtin_newshell`):
+
+1. Read target uid from `/etc/passwd`.
+2. Prompt password.
+3. Write to `/dev/auth`: `user <name>\npass <plaintext>\n`. Read `ok`/`denied`.
+4. On success: `rfork(RFPROC|RFNAMEG)`, in the child call `SYS_SETUID(target_uid)`,
+   stamp `HAMNIX_NEWSHELL_USER=<name>` in env, `exec /bin/hamsh`.
+5. The newly spawned hamsh recognises the env var, sources
+   `/etc/users/<name>.ns` (or `/etc/users/default.ns`) before the
+   interactive prompt — the per-user namespace restriction.
+
+No setuid binary. No environment leak. No setuid path-search game.
+Authority is granted by the kernel after password auth, not stolen from
+a binary's setuid bit. `newshell hostowner -c '<command>'` runs one
+command as hostowner and exits.
+
 ---
 
 ## 16. Errors via errstr
