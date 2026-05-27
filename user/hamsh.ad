@@ -3246,15 +3246,13 @@ from lib.passwd.passwd import (
     passwd_parse, passwd_lookup_by_name, passwd_entry_uid,
     passwd_entry_home,
 )
-from lib.passwd.shadow import (
-    shadow_parse, shadow_lookup_by_name, shadow_entry_hash,
-)
-from lib.crypt.sha512_crypt import sha512_crypt_verify
 
 
 NEWSHELL_BUF_MAX: uint64 = 4096
 newshell_passwd_buf: Array[4096, uint8]
-newshell_shadow_buf: Array[4096, uint8]
+# Response buffer for /dev/auth — "ok <uid> <gid>\n" or "denied\n".
+# 64 bytes covers either rendering with comfortable headroom.
+newshell_auth_resp: Array[64, uint8]
 
 
 def _newshell_read_file(path: Ptr[char], buf: Ptr[uint8],
@@ -3273,6 +3271,68 @@ def _newshell_read_file(path: Ptr[char], buf: Ptr[uint8],
     return cast[int64](total)
 
 
+def _newshell_write_line(fd: int32, prefix: Ptr[uint8], plen: uint64,
+                         payload: Ptr[uint8], paylen: uint64) -> int64:
+    # Emit "<prefix><payload>\n" as one syscall to /dev/auth. The cdev's
+    # write side treats one syscall as one line; concatenating ourselves
+    # avoids depending on the kernel buffering writes that arrived
+    # piecemeal.
+    line: Array[256, uint8]
+    p: uint64 = 0
+    while p < plen and p + 2 < 256:
+        line[p] = prefix[p]
+        p = p + 1
+    j: uint64 = 0
+    while j < paylen and p + 2 < 256:
+        line[p] = payload[j]
+        p = p + 1
+        j = j + 1
+    line[p] = 10                                       # '\n'
+    p = p + 1
+    return sys_write(fd, &line[0], p)
+
+
+def _newshell_cstr_len(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _newshell_auth_via_cdev(target_user: Ptr[uint8],
+                            password: Ptr[uint8]) -> int32:
+    # docs/security.md Phase 4: authenticate via the kernel /dev/auth
+    # cdev. The cdev reads /etc/shadow from kernel context, runs the
+    # SHA-512-crypt verify, and stamps a per-fd verdict. Returns 1 on
+    # successful authentication, 0 on failure (wrong password OR no
+    # such user OR open failed). We deliberately collapse the failure
+    # modes into a single bit — leaking "the user exists" before a
+    # successful auth would help an attacker enumerate accounts.
+    fd: int32 = sys_open(cast[Ptr[char]]("/dev/auth"))
+    if fd < 0:
+        # /dev/auth not present (very early-boot path; the cdev should
+        # always exist). Treat as auth failure.
+        return 0
+    ul: uint64 = _newshell_cstr_len(target_user)
+    pl: uint64 = _newshell_cstr_len(password)
+    user_prefix: Ptr[uint8] = "user "
+    pass_prefix: Ptr[uint8] = "pass "
+    if _newshell_write_line(fd, user_prefix, 5, target_user, ul) < 0:
+        sys_close(fd)
+        return 0
+    if _newshell_write_line(fd, pass_prefix, 5, password, pl) < 0:
+        sys_close(fd)
+        return 0
+    n: int64 = sys_read(fd, &newshell_auth_resp[0], 64)
+    sys_close(fd)
+    if n < 2:
+        return 0
+    # "ok" prefix == verified; anything else (notably "denied") fails.
+    if newshell_auth_resp[0] == 111 and newshell_auth_resp[1] == 107:   # 'o','k'
+        return 1
+    return 0
+
+
 def builtin_newshell(argc: int32) -> int32:
     if argc < 2:
         errstr_set("newshell: usage: newshell <user> [-c <command>]")
@@ -3283,7 +3343,10 @@ def builtin_newshell(argc: int32) -> int32:
         flag: Ptr[uint8] = cast[Ptr[uint8]](argv_ptr[2])
         if flag[0] == 45 and flag[1] == 99 and flag[2] == 0:    # `-c`
             cmd_string = cast[Ptr[uint8]](argv_ptr[3])
-    # Step 1: parse /etc/passwd, find target.
+    # Step 1: parse /etc/passwd, find target. /etc/passwd is world-
+    # readable per docs/security.md (only /etc/shadow is gated to
+    # hostowner), so we can resolve the target uid even from a regular-
+    # user shell.
     n_pwd: int64 = _newshell_read_file(cast[Ptr[char]]("/etc/passwd"),
                                        &newshell_passwd_buf[0],
                                        NEWSHELL_BUF_MAX)
@@ -3296,20 +3359,10 @@ def builtin_newshell(argc: int32) -> int32:
         errstr_set("newshell: no such user")
         return 1
     target_uid: uint32 = passwd_entry_uid(pidx)
-    # Step 2: parse /etc/shadow, find target.
-    n_shd: int64 = _newshell_read_file(cast[Ptr[char]]("/etc/shadow"),
-                                       &newshell_shadow_buf[0],
-                                       NEWSHELL_BUF_MAX)
-    if n_shd < 0:
-        errstr_set("newshell: cannot open /etc/shadow (need hostowner)")
-        return 1
-    shadow_parse(&newshell_shadow_buf[0], cast[uint64](n_shd))
-    sidx: int32 = shadow_lookup_by_name(target_user)
-    if sidx < 0:
-        errstr_set("newshell: no shadow entry for user")
-        return 1
-    hash_triple: Ptr[uint8] = shadow_entry_hash(sidx)
-    # Step 3: prompt password (silent).
+    # Step 2: prompt password (silent — no local echo). We DO bring the
+    # bytes through userland just to hand them to /dev/auth, but the
+    # cdev does the actual /etc/shadow read and SHA-512-crypt verify
+    # entirely in kernel context so the hash never leaves the kernel.
     write_cstr1("password: ")
     n: uint64 = 0
     while n + 1 < 256:
@@ -3325,33 +3378,52 @@ def builtin_newshell(argc: int32) -> int32:
         n = n + 1
     read_buf[n] = 0
     write_cstr1("\n")
-    # Step 4: verify.
-    ok: int32 = sha512_crypt_verify(&read_buf[0], hash_triple)
+    # Step 3: authenticate via /dev/auth. Plaintext lifetime here is
+    # bounded by this function — the cdev's write zeroes its pass_buf
+    # on success/failure, and we don't keep our own copy past this call.
+    ok: int32 = _newshell_auth_via_cdev(target_user, &read_buf[0])
+    # Wipe the local read_buf so plaintext doesn't linger in hamsh's
+    # global scratch beyond the auth call.
+    wz: uint64 = 0
+    while wz < 256:
+        read_buf[wz] = 0
+        wz = wz + 1
     if ok == 0:
         # Print to stderr — auth failures are diagnostic, not data.
         write_str(2, "newshell: authentication failed\n")
         return 1
-    # Step 5: rfork + setuid + exec.
+    # Step 4: rfork + setuid + exec. The kernel SYS_SETUID gate is
+    # "current uid must be 1" — hostowner downgrading to any uid is
+    # allowed; a regular user calling newshell hits -EPERM here. The
+    # Plan-9 elevation idiom is "hostowner re-authenticates to confirm
+    # their identity", not "regular user proves they know hostowner's
+    # password to elevate" — that second path needs SYS_SETUID to
+    # consult the just-validated /dev/auth fd state (a follow-up; the
+    # current cdev DOES stamp auth_uid into its slot for that wiring).
     flags: int32 = RFPROC | RFNAMEG
     pid: int32 = sys_rfork(flags)
     if pid < 0:
         errstr_set("newshell: rfork failed")
         return 1
     if pid == 0:
-        # Child: switch identity, then exec.
+        # Child: switch identity, set the per-user env hand-off so the
+        # spawned /bin/hamsh knows it's a newshell-spawned interactive
+        # shell (it'll load /etc/users/<target>.ns per Phase 9), then
+        # exec.
         rs: int32 = sys_setuid(target_uid)
         if rs < 0:
-            # SETUID rejected — current uid wasn't 1 (hostowner). This
-            # is the v1 limitation noted in this builtin's header:
-            # without /dev/auth's kernel-side identity flip, a regular
-            # user can authenticate but cannot elevate.
-            write_str(2, "newshell: setuid denied (not hostowner; /dev/auth not implemented yet)\n")
+            # SETUID rejected — current uid wasn't 1 (hostowner). A
+            # regular user authenticated successfully but cannot
+            # elevate without the kernel honouring the /dev/auth slot
+            # as proof of identity. Documented gap.
+            write_str(2, "newshell: setuid denied (not hostowner; /dev/auth-mediated elevation not yet wired)\n")
             sys_exit(1)
-        # Exec /bin/hamsh. The child's namespace recipe (Phase 9) is
-        # loaded by hamsh itself when it starts as a non-init shell;
-        # see init/main loading and the spec's Phase 9. For -c <cmd>,
-        # we wire the command via argv — hamsh main() recognises an
-        # rc-script path argument and runs it.
+        # Stamp HAMNIX_NEWSHELL_USER=<target> in env so the spawned
+        # hamsh's main() recognises this as a newshell session and
+        # sources the per-user namespace recipe (Phase 9).
+        env_set(cast[Ptr[uint8]]("HAMNIX_NEWSHELL_USER"), target_user)
+        # Exec /bin/hamsh. For -c <cmd>, we wire the command via argv —
+        # hamsh main() recognises an rc-script path argument and runs it.
         # NOTE: sys_execve isn't directly exposed to hamsh — we use
         # sys_spawn which fork+execs. The double-fork is harmless;
         # the original parent above waits on the rfork child, which

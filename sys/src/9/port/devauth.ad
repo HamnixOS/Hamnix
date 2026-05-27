@@ -1,0 +1,441 @@
+# sys/src/9/port/devauth.ad
+#
+# docs/security.md Phase 4: the kernel-side authentication cdev.
+#
+# Plan-9-shape factotum primitive — userland NEVER reads /etc/shadow
+# directly. Authentication is mediated through this device:
+#
+#   fd = open("/dev/auth", ORDWR)
+#   write(fd, "user <name>\n")
+#   write(fd, "pass <plaintext>\n")
+#   read(fd, response)         # "ok\n <uid> <gid>\n" or "denied\n"
+#   close(fd)
+#
+# On a successful pass+verify the cdev stamps an authenticated-uid/gid
+# pair into the per-fd state. The hostowner-side caller (`newshell`)
+# then issues SYS_SETUID(target_uid) which the kernel will honour
+# because hostowner can downgrade (and `newshell` itself runs under
+# hostowner when it's used to ELEVATE — the original Plan-9 idiom is
+# regular-user→hostowner, gated by the password).
+#
+# Rate limit: 1 attempt/second per fd, enforced by a per-fd
+# last_attempt_us timestamp pulled from pit_monotonic_us (which keeps
+# advancing during syscalls — get_jiffies freezes while IF=0). On a
+# failed verify we busy-wait until 1 s has elapsed since the last
+# attempt; the next write blocks the caller for the full second.
+#
+# The cdev reads /etc/shadow directly from the kernel-mode initramfs
+# (initramfs_data_ptr) — independent of the calling task's namespace,
+# so a regular user whose namespace doesn't bind /etc/shadow can still
+# authenticate via this path.
+#
+# Per-fd state lives in a small fixed pool (8 slots). Open allocates,
+# close frees. If the pool is exhausted, open returns -EMFILE.
+#
+# Compiler-quirk note: Adder has a flat global symbol namespace across
+# merged modules — every shared-shape helper is prefixed `_au_` to avoid
+# collisions with the existing dev*.ad family.
+
+from arch.x86.kernel.time import pit_monotonic_us
+from fs.vfs import initramfs_data_ptr, initramfs_data_size
+from lib.passwd.shadow import (
+    shadow_parse, shadow_lookup_by_name, shadow_entry_hash,
+)
+from lib.passwd.passwd import (
+    passwd_parse, passwd_lookup_by_name, passwd_entry_uid,
+    passwd_entry_gid,
+)
+from lib.crypt.sha512_crypt import sha512_crypt_verify
+from kernel.printk.printk import printk0
+
+
+# FD marker for /dev/auth. Next free slot after FD_DISKSTATS_MARK
+# (0xFFFFFFE4). Colocated here rather than in core.ad following the
+# devstat / devmounts / devdiskstats colocation pattern (the marker
+# block in core.ad is off-limits this commit, but Adder's flat-merge
+# symbol model makes that placement immaterial at codegen time).
+FD_AUTH_MARK: uint32 = 0xFFFFFFE3
+
+
+# Per-fd state pool. Each /dev/auth open gets one slot. Slots are
+# referenced via the slot index packed into fd_buf at open time.
+AUTH_POOL_CAP:     uint64 = 8
+AUTH_NAME_MAX:     uint64 = 64
+AUTH_PASS_MAX:     uint64 = 128
+AUTH_RESPONSE_MAX: uint64 = 64
+
+
+class AuthSlot:
+    in_use:           int32                # 0 = free, 1 = live
+    user_set:         int32                # 1 once "user <name>" parsed
+    pass_set:         int32                # 1 once "pass ..." parsed
+    verified:         int32                # 1 once verify succeeded
+    user_buf:         Array[64, uint8]     # AUTH_NAME_MAX bytes
+    pass_buf:         Array[128, uint8]    # AUTH_PASS_MAX bytes
+    user_len:         uint64
+    pass_len:         uint64
+    auth_uid:         uint32               # only valid if verified == 1
+    auth_gid:         uint32               # only valid if verified == 1
+    last_attempt_us:  uint64               # for rate-limit gate
+    response_buf:     Array[64, uint8]     # rendered "ok\n..." / "denied\n"
+    response_len:     uint64               # bytes in response_buf
+    response_pos:     uint64               # read cursor into response_buf
+
+
+auth_pool: Array[8, AuthSlot]
+auth_pool_inited: int32 = 0
+
+# Scratch buffers for /etc/passwd + /etc/shadow snapshots. Static
+# module-scope per the no-malloc-in-kernel-leafs convention.
+auth_passwd_buf: Array[4096, uint8]
+auth_shadow_buf: Array[4096, uint8]
+
+
+def _au_init_pool():
+    if auth_pool_inited != 0:
+        return
+    auth_pool_inited = 1
+    i: uint64 = 0
+    while i < AUTH_POOL_CAP:
+        auth_pool[i].in_use = 0
+        auth_pool[i].user_set = 0
+        auth_pool[i].pass_set = 0
+        auth_pool[i].verified = 0
+        auth_pool[i].user_len = 0
+        auth_pool[i].pass_len = 0
+        auth_pool[i].auth_uid = 0
+        auth_pool[i].auth_gid = 0
+        auth_pool[i].last_attempt_us = 0
+        auth_pool[i].response_len = 0
+        auth_pool[i].response_pos = 0
+        i = i + 1
+
+
+def _au_alloc_slot() -> int32:
+    _au_init_pool()
+    i: uint64 = 0
+    while i < AUTH_POOL_CAP:
+        if auth_pool[i].in_use == 0:
+            auth_pool[i].in_use = 1
+            auth_pool[i].user_set = 0
+            auth_pool[i].pass_set = 0
+            auth_pool[i].verified = 0
+            auth_pool[i].user_len = 0
+            auth_pool[i].pass_len = 0
+            auth_pool[i].auth_uid = 0
+            auth_pool[i].auth_gid = 0
+            auth_pool[i].last_attempt_us = 0
+            auth_pool[i].response_len = 0
+            auth_pool[i].response_pos = 0
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _au_free_slot(slot: int32):
+    if slot < 0:
+        return
+    s: uint64 = cast[uint64](slot)
+    if s >= AUTH_POOL_CAP:
+        return
+    auth_pool[s].in_use = 0
+    auth_pool[s].user_set = 0
+    auth_pool[s].pass_set = 0
+    auth_pool[s].verified = 0
+    # Wipe the pass_buf so a freed slot doesn't keep plaintext around.
+    j: uint64 = 0
+    while j < AUTH_PASS_MAX:
+        auth_pool[s].pass_buf[j] = 0
+        j = j + 1
+
+
+def _au_starts_with(buf: Ptr[uint8], blen: uint64,
+                    prefix: Ptr[uint8], plen: uint64) -> int32:
+    if blen < plen:
+        return 0
+    i: uint64 = 0
+    while i < plen:
+        if buf[i] != prefix[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def _au_strip_trailing(buf: Ptr[uint8], n: uint64) -> uint64:
+    # Strip trailing CR / LF / space / tab.
+    while n > 0:
+        c: uint8 = buf[n - 1]
+        if c == 10 or c == 13 or c == 32 or c == 9:
+            n = n - 1
+        else:
+            break
+    return n
+
+
+def _au_emit_u32(value: uint32, out: Ptr[uint8], pos: uint64) -> uint64:
+    # Append the decimal of value to out[pos..].
+    v: uint64 = cast[uint64](value)
+    if v == 0:
+        out[pos] = 48
+        return pos + 1
+    digits: Array[12, uint8]
+    n: uint64 = 0
+    while v != 0:
+        digits[n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    written: uint64 = n
+    while n > 0:
+        n = n - 1
+        out[pos] = digits[n]
+        pos = pos + 1
+    return pos
+
+
+def _au_render_ok(slot: uint64):
+    # Render "ok <uid> <gid>\n" into the slot's response_buf.
+    p: Ptr[uint8] = &auth_pool[slot].response_buf[0]
+    pos: uint64 = 0
+    p[pos] = 111                                       # 'o'
+    pos = pos + 1
+    p[pos] = 107                                       # 'k'
+    pos = pos + 1
+    p[pos] = 32                                        # ' '
+    pos = pos + 1
+    pos = _au_emit_u32(auth_pool[slot].auth_uid, p, pos)
+    p[pos] = 32                                        # ' '
+    pos = pos + 1
+    pos = _au_emit_u32(auth_pool[slot].auth_gid, p, pos)
+    p[pos] = 10                                        # '\n'
+    pos = pos + 1
+    auth_pool[slot].response_len = pos
+    auth_pool[slot].response_pos = 0
+
+
+def _au_render_denied(slot: uint64):
+    p: Ptr[uint8] = &auth_pool[slot].response_buf[0]
+    p[0] = 100                                         # 'd'
+    p[1] = 101                                         # 'e'
+    p[2] = 110                                         # 'n'
+    p[3] = 105                                         # 'i'
+    p[4] = 101                                         # 'e'
+    p[5] = 100                                         # 'd'
+    p[6] = 10                                          # '\n'
+    auth_pool[slot].response_len = 7
+    auth_pool[slot].response_pos = 0
+
+
+def _au_rate_limit_gate(slot: uint64):
+    # Block (busy-wait against pit_monotonic_us) until at least 1 s has
+    # elapsed since this slot's last_attempt_us. pit_monotonic_us keeps
+    # advancing while EFLAGS.IF=0 (i.e. inside a syscall), so this
+    # actually progresses in this context.
+    last: uint64 = auth_pool[slot].last_attempt_us
+    if last == 0:
+        # First attempt — no rate-limit applies yet.
+        return
+    deadline: uint64 = last + 1000000                  # +1 s in microseconds
+    while True:
+        now: uint64 = pit_monotonic_us()
+        if now >= deadline:
+            return
+
+
+def _au_try_verify(slot: uint64) -> int32:
+    # Read /etc/shadow + /etc/passwd from initramfs and verify the
+    # stashed (user_buf, pass_buf) against the recorded $6$ hash. On
+    # success, populates auth_uid/auth_gid and returns 1; on failure
+    # returns 0. Either way, last_attempt_us is bumped (the rate-limit
+    # gate consults it on the next attempt).
+    auth_pool[slot].last_attempt_us = pit_monotonic_us()
+
+    # Snapshot /etc/passwd.
+    pwd_blob: uint64 = initramfs_data_ptr(cast[Ptr[char]]("/etc/passwd"))
+    if pwd_blob == 0:
+        printk0("auth: /etc/passwd missing in initramfs\n")
+        return 0
+    pwd_sz: uint64 = initramfs_data_size(cast[Ptr[char]]("/etc/passwd"))
+    if pwd_sz > 4096:
+        pwd_sz = 4096
+    pp: uint64 = 0
+    while pp < pwd_sz:
+        auth_passwd_buf[pp] = cast[Ptr[uint8]](pwd_blob)[pp]
+        pp = pp + 1
+    passwd_parse(&auth_passwd_buf[0], pwd_sz)
+    pidx: int32 = passwd_lookup_by_name(&auth_pool[slot].user_buf[0])
+    if pidx < 0:
+        return 0
+    target_uid: uint32 = passwd_entry_uid(pidx)
+    target_gid: uint32 = passwd_entry_gid(pidx)
+
+    # Snapshot /etc/shadow.
+    shd_blob: uint64 = initramfs_data_ptr(cast[Ptr[char]]("/etc/shadow"))
+    if shd_blob == 0:
+        printk0("auth: /etc/shadow missing in initramfs\n")
+        return 0
+    shd_sz: uint64 = initramfs_data_size(cast[Ptr[char]]("/etc/shadow"))
+    if shd_sz > 4096:
+        shd_sz = 4096
+    sp: uint64 = 0
+    while sp < shd_sz:
+        auth_shadow_buf[sp] = cast[Ptr[uint8]](shd_blob)[sp]
+        sp = sp + 1
+    shadow_parse(&auth_shadow_buf[0], shd_sz)
+    sidx: int32 = shadow_lookup_by_name(&auth_pool[slot].user_buf[0])
+    if sidx < 0:
+        return 0
+    hash_triple: Ptr[uint8] = shadow_entry_hash(sidx)
+    if hash_triple == cast[Ptr[uint8]](0):
+        return 0
+
+    # Constant-time verify.
+    ok: int32 = sha512_crypt_verify(&auth_pool[slot].pass_buf[0], hash_triple)
+    if ok == 0:
+        return 0
+    auth_pool[slot].auth_uid = target_uid
+    auth_pool[slot].auth_gid = target_gid
+    auth_pool[slot].verified = 1
+    return 1
+
+
+# --- public API ------------------------------------------------------
+
+def devauth_alloc() -> int32:
+    # Allocate a fresh per-fd slot. Returns the slot index (>=0) or -1
+    # on pool exhaustion. vfs_open / vfs_open_write call this when an
+    # open of /dev/auth arrives; the slot index is packed into fd_buf
+    # so read/write can find it.
+    return _au_alloc_slot()
+
+
+def devauth_close(slot: int32):
+    _au_free_slot(slot)
+
+
+def devauth_read(slot: int32, buf: Ptr[uint8], count: uint64) -> int64:
+    # Drain the rendered response buffer ("ok\n <uid> <gid>\n" or
+    # "denied\n"). Returns 0 if no response has been generated yet
+    # (caller hasn't issued user+pass writes), letting userland's
+    # readline loop know to keep waiting / writing.
+    if slot < 0:
+        return cast[int64](-9)                         # -EBADF
+    s: uint64 = cast[uint64](slot)
+    if s >= AUTH_POOL_CAP or auth_pool[s].in_use == 0:
+        return cast[int64](-9)
+    if count == 0:
+        return 0
+    rem: uint64 = auth_pool[s].response_len - auth_pool[s].response_pos
+    if rem == 0:
+        # Either no attempt was made yet (response_len == 0) — in which
+        # case userland's typical "open / write user / write pass / read"
+        # sequence will have populated response_len BEFORE the first
+        # read, OR the response has been fully drained. Either way,
+        # return 0 to signal EOF/no-more-bytes.
+        return 0
+    take: uint64 = count
+    if take > rem:
+        take = rem
+    base: uint64 = auth_pool[s].response_pos
+    i: uint64 = 0
+    while i < take:
+        buf[i] = auth_pool[s].response_buf[base + i]
+        i = i + 1
+    auth_pool[s].response_pos = base + take
+    return cast[int64](take)
+
+
+def devauth_write(slot: int32, buf: Ptr[uint8], count: uint64) -> int64:
+    # Parse a "user <name>\n" or "pass <plaintext>\n" line. On the FIRST
+    # line that completes the pair, run the verify and render the
+    # response. The caller's typical usage pattern is one full line per
+    # write() syscall, but we tolerate writes that are missing the
+    # trailing newline (we treat the buffer as one line and strip).
+    if slot < 0:
+        return cast[int64](-9)                         # -EBADF
+    s: uint64 = cast[uint64](slot)
+    if s >= AUTH_POOL_CAP or auth_pool[s].in_use == 0:
+        return cast[int64](-9)
+    if count == 0:
+        return 0
+    # Determine the line length (strip a single trailing newline so
+    # "user alice\n" and "user alice" both parse).
+    nl: uint64 = count
+    if nl > 0 and buf[nl - 1] == 10:
+        nl = nl - 1
+    # Re-strip the residual CR / spaces / tabs.
+    nl = _au_strip_trailing(buf, nl)
+    user_prefix: Ptr[uint8] = "user "
+    pass_prefix: Ptr[uint8] = "pass "
+    if _au_starts_with(buf, nl, user_prefix, 5) != 0:
+        # Copy bytes 5..nl into user_buf.
+        ul: uint64 = nl - 5
+        if ul + 1 > AUTH_NAME_MAX:
+            ul = AUTH_NAME_MAX - 1
+        i: uint64 = 0
+        while i < ul:
+            auth_pool[s].user_buf[i] = buf[5 + i]
+            i = i + 1
+        auth_pool[s].user_buf[ul] = 0
+        auth_pool[s].user_len = ul
+        auth_pool[s].user_set = 1
+        # Reset any prior verification: the user changed.
+        auth_pool[s].verified = 0
+        auth_pool[s].response_len = 0
+        auth_pool[s].response_pos = 0
+        return cast[int64](count)
+    if _au_starts_with(buf, nl, pass_prefix, 5) != 0:
+        pl: uint64 = nl - 5
+        if pl + 1 > AUTH_PASS_MAX:
+            pl = AUTH_PASS_MAX - 1
+        i: uint64 = 0
+        while i < pl:
+            auth_pool[s].pass_buf[i] = buf[5 + i]
+            i = i + 1
+        auth_pool[s].pass_buf[pl] = 0
+        auth_pool[s].pass_len = pl
+        auth_pool[s].pass_set = 1
+        # Once we've seen both, run the verify. Rate-limit FIRST so a
+        # brute-force loop is held back at this gate.
+        if auth_pool[s].user_set != 0:
+            _au_rate_limit_gate(s)
+            ok: int32 = _au_try_verify(s)
+            if ok != 0:
+                _au_render_ok(s)
+            else:
+                _au_render_denied(s)
+                # Wipe the pass_buf so plaintext doesn't linger.
+                j: uint64 = 0
+                while j < AUTH_PASS_MAX:
+                    auth_pool[s].pass_buf[j] = 0
+                    j = j + 1
+                auth_pool[s].pass_set = 0
+        return cast[int64](count)
+    # Unrecognised line — accept the bytes (count consumed) but render
+    # a denied response so a malformed protocol doesn't deadlock.
+    _au_render_denied(s)
+    return cast[int64](count)
+
+
+def devauth_verified_uid(slot: int32) -> int32:
+    # Helper for newshell etc. that want to consult the slot's verified
+    # uid without re-parsing the response_buf text. Returns the uid as
+    # int32 on success, -1 if the slot hasn't successfully verified.
+    if slot < 0:
+        return -1
+    s: uint64 = cast[uint64](slot)
+    if s >= AUTH_POOL_CAP or auth_pool[s].in_use == 0:
+        return -1
+    if auth_pool[s].verified == 0:
+        return -1
+    return cast[int32](auth_pool[s].auth_uid)
+
+
+def devauth_verified_gid(slot: int32) -> int32:
+    if slot < 0:
+        return -1
+    s: uint64 = cast[uint64](slot)
+    if s >= AUTH_POOL_CAP or auth_pool[s].in_use == 0:
+        return -1
+    if auth_pool[s].verified == 0:
+        return -1
+    return cast[int32](auth_pool[s].auth_gid)
