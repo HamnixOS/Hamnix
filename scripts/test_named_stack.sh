@@ -25,8 +25,19 @@
 # kernel-side debug hook (sysfile that calls name_push with caller-
 # supplied args) which is not in scope for the FS-discovery pass.
 # This test asserts the visible part of the contract.
+#
+# DRIVER: uses the shared _qemu_drive.sh harness — waits for hamsh's
+# readiness marker before feeding commands. The previous fixed-sleep
+# subshell driver was flaky on slower hosts: hamsh's input editor
+# could still be in the rc.boot tail when the first `printf` arrived,
+# so the early commands' characters were echoed but the trailing
+# newline was eaten by a state transition and the command never ran.
+# qemu_drive blocks on the `[hamsh] M16.35 shell ready` banner before
+# sending a single byte, which makes the test deterministic regardless
+# of host CPU load.
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_qemu_drive.sh"
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -48,42 +59,30 @@ python3 -m compiler.adder compile \
 python3 scripts/build_rootfs_img.py >/dev/null
 
 LOG=$(mktemp /tmp/test-named-stack.XXXXXX.log)
+# Preserve LOG on failure for post-mortem; clean up only on PASS.
+# (Trap below is re-armed after we know the outcome.)
 trap 'rm -f "$LOG"' EXIT
 
 set +e
-(
-    sleep 3
-    printf "echo NS_DISTRO_BEGIN\n"
-    sleep 1
-    printf "cat /proc/fs/by-name/distro\n"
-    sleep 1
-    printf "echo NS_DISTRO_END\n"
-    sleep 1
-    # /proc/fs/by-name/<unknown-word> must return a graceful empty
-    # readout, not ENOENT.
-    printf "echo NS_UNKNOWN_BEGIN\n"
-    sleep 1
-    printf "cat /proc/fs/by-name/nopartition\n"
-    sleep 1
-    printf "echo NS_UNKNOWN_END\n"
-    sleep 1
-    # bind-freeze: rc.boot already did `bind '#distro' /n/distros`.
-    # Verify the binding is in /proc/self/ns.
-    printf "echo NS_FREEZE_BEGIN\n"
-    sleep 1
-    printf "cat /proc/self/ns\n"
-    sleep 1
-    printf "echo NS_FREEZE_END\n"
-    sleep 1
-    printf "echo NS_DONE\n"
-    sleep 1
-    printf "exit\n"
-    sleep 1
-) | timeout 60s qemu-system-x86_64 \
-    -kernel "$ELF" -smp 2 -nographic -no-reboot -m 256M \
-    -monitor none -serial stdio \
-    -drive file="$ROOTFS_IMG",if=virtio,format=raw \
-    > "$LOG" 2>&1
+# The rootfs image is mounted via the virtio disk; the kernel's
+# rootfs-autodiscover walk runs early in init and (per the captured
+# boot log) registers `#distro` long before hamsh prints its banner,
+# so by the time qemu_drive is allowed to send `cat /proc/fs/by-name/
+# distro` the named-stack already has the entry we want to read.
+QEMU_EXTRA_ARGS="-drive file=$ROOTFS_IMG,if=virtio,format=raw" \
+qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 90 \
+    -- "echo NS_DISTRO_BEGIN"                      2 \
+       "cat /proc/fs/by-name/distro"               3 \
+       "echo NS_DISTRO_END"                        2 \
+       "echo NS_UNKNOWN_BEGIN"                     2 \
+       "cat /proc/fs/by-name/nopartition"          3 \
+       "echo NS_UNKNOWN_END"                       2 \
+       "echo NS_FREEZE_BEGIN"                      2 \
+       "cat /proc/self/ns"                         3 \
+       "echo NS_FREEZE_END"                        2 \
+       "echo NS_DONE"                              2 \
+       "exit"                                      1
+rc="$QEMU_DRIVE_RC"
 set -e
 
 echo "[test_named_stack] --- captured ---"
@@ -92,9 +91,18 @@ echo "[test_named_stack] --- end ---"
 
 fail=0
 
+# The shell came up at all.
+if ! grep -F -q "[hamsh:stage-07] loop-enter" "$LOG"; then
+    echo "[test_named_stack] FAIL: hamsh never reached the interactive loop"
+    # Preserve LOG for post-mortem.
+    trap - EXIT
+    echo "[test_named_stack] preserved log: $LOG"
+    exit 1
+fi
+
 # /proc/fs/by-name/distro must include the partuuid + sentinel + dir
 # fields. The sentinel value should be `distro` (from build_rootfs_img.py).
-distro_block=$(awk '/NS_DISTRO_BEGIN/,/NS_DISTRO_END/' "$LOG")
+distro_block=$(sed -n '/NS_DISTRO_BEGIN/,/NS_DISTRO_END/p' "$LOG")
 if echo "$distro_block" | grep -E -q 'partuuid='; then
     echo "[test_named_stack] OK: /proc/fs/by-name/distro renders partuuid"
 else
@@ -109,7 +117,7 @@ else
 fi
 
 # /proc/fs/by-name/<unknown> renders a graceful "(no stack ...)" line.
-unknown_block=$(awk '/NS_UNKNOWN_BEGIN/,/NS_UNKNOWN_END/' "$LOG")
+unknown_block=$(sed -n '/NS_UNKNOWN_BEGIN/,/NS_UNKNOWN_END/p' "$LOG")
 if echo "$unknown_block" | grep -F -q "no stack"; then
     echo "[test_named_stack] OK: unknown name produces graceful readout"
 else
@@ -122,7 +130,7 @@ fi
 # the path is now reachable; the LIFO-stack-mutation aspect of the
 # freeze contract gates on the multi-partition fixture mentioned in
 # the header).
-freeze_block=$(awk '/NS_FREEZE_BEGIN/,/NS_FREEZE_END/' "$LOG")
+freeze_block=$(sed -n '/NS_FREEZE_BEGIN/,/NS_FREEZE_END/p' "$LOG")
 if echo "$freeze_block" | grep -F -q "/n/distros"; then
     echo "[test_named_stack] OK: bind '#distro' /n/distros visible in ns"
 else
@@ -131,7 +139,10 @@ else
 fi
 
 if [ $fail -ne 0 ]; then
-    echo "[test_named_stack] FAIL"
+    echo "[test_named_stack] FAIL (qemu rc=$rc)"
+    # Preserve LOG for post-mortem.
+    trap - EXIT
+    echo "[test_named_stack] preserved log: $LOG"
     exit 1
 fi
-echo "[test_named_stack] PASS"
+echo "[test_named_stack] PASS (qemu rc=$rc)"
