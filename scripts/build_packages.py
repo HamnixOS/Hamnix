@@ -985,7 +985,8 @@ def main() -> int:
         "packages": entries,
     }
     (main_dir / "index.json").write_text(
-        json.dumps(main_index, indent=2) + "\n", encoding="utf-8")
+        json.dumps(main_index, indent=2,
+                   ensure_ascii=False) + "\n", encoding="utf-8")
     _say(f"wrote {main_dir / 'index.json'} "
          f"({len(entries)} package entries)")
 
@@ -1009,7 +1010,8 @@ def main() -> int:
             "packages": [],
         }
         (PACKAGES_OUT / ch_name / "index.json").write_text(
-            json.dumps(stub, indent=2) + "\n", encoding="utf-8")
+            json.dumps(stub, indent=2,
+                   ensure_ascii=False) + "\n", encoding="utf-8")
         _say(f"wrote {PACKAGES_OUT / ch_name / 'index.json'} "
              f"(0 package entries — empty channel)")
 
