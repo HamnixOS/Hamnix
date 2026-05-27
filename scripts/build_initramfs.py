@@ -455,11 +455,16 @@ if _HPM_ISO_PACKAGES:
         _rel = _f.relative_to(_iso_pkgs_root)
         with _f.open("rb") as _fh:
             _bytes = _fh.read()
-        FILES.append((f"/mnt/iso-packages/{_rel.as_posix()}", _bytes))
+        # NOTE: the brief specified /mnt/iso-packages/, but the kernel
+        # auto-mounts vda's FAT volume at /mnt (init/main.ad:313 area)
+        # which shadows cpio entries under /mnt/. Stage at
+        # /iso-packages/ instead — install.hamsh + the
+        # docs/packages.md "Bootstrap" example match this path.
+        FILES.append((f"/iso-packages/{_rel.as_posix()}", _bytes))
         _n_iso_pkg_files += 1
         _n_iso_pkg_bytes += len(_bytes)
     print(f"  [iso-packages] staged {_n_iso_pkg_files} files "
-          f"({_n_iso_pkg_bytes} bytes) at /mnt/iso-packages/ from "
+          f"({_n_iso_pkg_bytes} bytes) at /iso-packages/ from "
           f"{_iso_pkgs_root}")
 
 _CPIO_STRESS_RAW = os.environ.get("HAMNIX_CPIO_STRESS_FILES", "")
@@ -741,6 +746,10 @@ def build_archive() -> bytes:
         "hamnix_partition.elf",
         "mkfs_ext4.elf",
         "mkfs_fat.elf",
+        # hpm itself — the installer drives `hpm install` against the
+        # /mnt/iso-packages/ mini-repo as the core of the new install
+        # flow (Debian-installer pattern).
+        "hpm.elf",
     }
     user_dir = here / "build" / "user"
     if user_dir.is_dir():

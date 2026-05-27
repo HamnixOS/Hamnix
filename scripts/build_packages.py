@@ -235,7 +235,7 @@ def build_hamnix_base() -> dict:
                                   mode=0o644)
         n_files += 1
 
-    out_tar = PACKAGES_OUT / f"{pkg_dirname}.tar.gz"
+    out_tar = PACKAGES_OUT / "packages" / f"{pkg_dirname}.tar.gz"
     _write_pkginfo(staging, {
         "name": pkg_name,
         "version": PKG_VERSION,
@@ -329,7 +329,7 @@ def build_hamnix_bootloader() -> dict:
             encoding="ascii")
         n_files += 1
 
-    out_tar = PACKAGES_OUT / f"{pkg_dirname}.tar.gz"
+    out_tar = PACKAGES_OUT / "packages" / f"{pkg_dirname}.tar.gz"
     _write_pkginfo(staging, {
         "name": pkg_name,
         "version": PKG_VERSION,
@@ -396,7 +396,7 @@ def build_hamnix_installer_tools() -> dict:
         total_bytes += _copy_file(src, files_root / dst_rel, mode=0o755)
         n_files += 1
 
-    out_tar = PACKAGES_OUT / f"{pkg_dirname}.tar.gz"
+    out_tar = PACKAGES_OUT / "packages" / f"{pkg_dirname}.tar.gz"
     _write_pkginfo(staging, {
         "name": pkg_name,
         "version": PKG_VERSION,
@@ -548,7 +548,7 @@ def build_linux_debian_12() -> dict | None:
         (files_root / ".hamnix-roots").write_text("distro    .\n",
                                                   encoding="ascii")
         n_files = 2
-        out_tar = PACKAGES_OUT / f"{pkg_dirname}.tar.gz"
+        out_tar = PACKAGES_OUT / "packages" / f"{pkg_dirname}.tar.gz"
         _write_pkginfo(staging, {
             "name": pkg_name,
             "version": PKG_VERSION,
@@ -620,7 +620,7 @@ def build_linux_debian_12() -> dict | None:
                                               encoding="ascii")
     n_files += 1
 
-    out_tar = PACKAGES_OUT / f"{pkg_dirname}.tar.gz"
+    out_tar = PACKAGES_OUT / "packages" / f"{pkg_dirname}.tar.gz"
     _write_pkginfo(staging, {
         "name": pkg_name,
         "version": PKG_VERSION,
@@ -662,8 +662,14 @@ def main() -> int:
             "[build_packages] build/ missing — run scripts/build_iso.sh "
             "first to produce the artifacts this script repackages.")
     PACKAGES_OUT.mkdir(parents=True, exist_ok=True)
+    # tarballs land under packages/ to match index.json's `url:
+    # packages/<name>-<v>.tar.gz` paths (and the upstream repo layout
+    # at https://255.one/).
+    (PACKAGES_OUT / "packages").mkdir(parents=True, exist_ok=True)
     # Wipe stale tarballs but keep _stage so we can inspect on failure.
     for old in PACKAGES_OUT.glob("*.tar.gz"):
+        old.unlink()
+    for old in (PACKAGES_OUT / "packages").glob("*.tar.gz"):
         old.unlink()
     if (PACKAGES_OUT / "index.json").exists():
         (PACKAGES_OUT / "index.json").unlink()
