@@ -40,6 +40,306 @@ from sys.src.port9.port.chan import (
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
 
+# -------------------------------------------------------------------
+# /proc/svc — service-supervisor mirror
+#
+# The supervisor itself lives in userland (user/hamsh.ad — hamsh IS
+# PID 1). Its in-memory registry holds runtime state (pid, state,
+# uptime, restarts, exec line, ...). To make that state visible via
+# `cat /proc/svc/<name>` we keep a parallel kernel-side mirror that
+# hamsh updates whenever it changes a service's state, via a tiny
+# publish syscall (SYS_SVC_PUBLISH, arch/x86/kernel/syscall.ad).
+#
+# The mirror is intentionally a flat fixed-size table (no allocation,
+# no locking — single-writer hamsh, single-reader procfs render at
+# /proc open time). One slot per service, name as the key.
+#
+# Phase 6 of the service-supervisor work: `cat /proc/svc/sshd |
+# grep ...`-style introspection without the shell builtin.
+SVC_PROC_MAX:        uint64 = 32
+SVC_PROC_NAME_MAX:   uint64 = 32
+SVC_PROC_NS_MAX:     uint64 = 16
+SVC_PROC_EXEC_MAX:   uint64 = 256
+SVC_PROC_DESC_MAX:   uint64 = 96
+
+# State / restart-policy constants must match user/hamsh.ad's
+# SVC_STATE_* / SVC_RESTART_*. Duplicated here because Adder doesn't
+# (today) share constants between the kernel and userland builds.
+SVC_PROC_STATE_STOPPED:    int32 = 0
+SVC_PROC_STATE_RUNNING:    int32 = 1
+SVC_PROC_STATE_FAILED:     int32 = 2
+SVC_PROC_STATE_RESTARTING: int32 = 3
+SVC_PROC_RESTART_NEVER:    int32 = 0
+SVC_PROC_RESTART_ON_FAIL:  int32 = 1
+SVC_PROC_RESTART_ALWAYS:   int32 = 2
+
+# Per-slot mirror state. Parallel arrays in the same idiom as
+# user/hamsh.ad's svc_* tables.
+svc_proc_in_use:        Array[32, int32]
+svc_proc_name:          Array[1024, uint8]      # 32 * 32
+svc_proc_ns:            Array[512, uint8]       # 32 * 16
+svc_proc_exec:          Array[8192, uint8]      # 32 * 256
+svc_proc_desc:          Array[3072, uint8]      # 32 * 96
+svc_proc_state:         Array[32, int32]
+svc_proc_pid:           Array[32, int32]
+svc_proc_restart_pol:   Array[32, int32]
+svc_proc_restarts:      Array[32, int32]
+svc_proc_uid:           Array[32, uint32]
+svc_proc_last_start_j:  Array[32, uint64]
+svc_proc_count:         uint64 = 0              # high-water mark
+
+
+def _svc_proc_name_at(idx: uint64) -> Ptr[uint8]:
+    return &svc_proc_name[idx * SVC_PROC_NAME_MAX]
+
+
+def _svc_proc_ns_at(idx: uint64) -> Ptr[uint8]:
+    return &svc_proc_ns[idx * SVC_PROC_NS_MAX]
+
+
+def _svc_proc_exec_at(idx: uint64) -> Ptr[uint8]:
+    return &svc_proc_exec[idx * SVC_PROC_EXEC_MAX]
+
+
+def _svc_proc_desc_at(idx: uint64) -> Ptr[uint8]:
+    return &svc_proc_desc[idx * SVC_PROC_DESC_MAX]
+
+
+def _svc_proc_cstr_eq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    # NUL-terminated equality, byte-for-byte. Returns 1 iff equal.
+    i: uint64 = 0
+    while True:
+        ca: uint8 = a[i]
+        cb: uint8 = b[i]
+        if ca != cb:
+            return 0
+        if ca == 0:
+            return 1
+        i = i + 1
+
+
+def _svc_proc_copy_in(dst: Ptr[uint8], src: Ptr[uint8], cap: uint64):
+    # NUL-terminated bounded copy; truncates rather than overflowing.
+    i: uint64 = 0
+    while src[i] != 0 and i + 1 < cap:
+        dst[i] = src[i]
+        i = i + 1
+    dst[i] = 0
+
+
+def _svc_proc_lookup(name: Ptr[uint8]) -> int64:
+    # Find the slot whose name matches; -1 if not present.
+    i: uint64 = 0
+    while i < svc_proc_count:
+        if svc_proc_in_use[i] != 0:
+            if _svc_proc_cstr_eq(_svc_proc_name_at(i), name) != 0:
+                return cast[int64](i)
+        i = i + 1
+    return -1
+
+
+def _svc_proc_alloc() -> int64:
+    # First-fit allocation across the fixed slot table.
+    i: uint64 = 0
+    while i < SVC_PROC_MAX:
+        if svc_proc_in_use[i] == 0:
+            return cast[int64](i)
+        i = i + 1
+    return -1
+
+
+# Publish payload layout. Must match user/hamsh.ad's sys_svc_publish
+# builder. Bytes (little-endian, packed):
+#   off  size  field
+#     0    4   state          (int32)
+#     4    4   pid            (int32)
+#     8    4   restart_pol    (int32)
+#    12    4   restarts       (int32)
+#    16    4   uid            (uint32)
+#    20    4   _pad
+#    24    8   last_start_j   (uint64)
+#    32   16   ns             (NUL-terminated)
+#    48  256   exec           (NUL-terminated)
+#   304   96   desc           (NUL-terminated)
+# Total: 400 bytes.
+SVC_PROC_PAYLOAD_BYTES: uint64 = 400
+
+
+def _payload_i32(payload: Ptr[uint8], off: uint64) -> int32:
+    # Little-endian 4-byte read as signed int32.
+    b0: uint32 = cast[uint32](payload[off])
+    b1: uint32 = cast[uint32](payload[off + 1])
+    b2: uint32 = cast[uint32](payload[off + 2])
+    b3: uint32 = cast[uint32](payload[off + 3])
+    v: uint32 = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+    return cast[int32](v)
+
+
+def _payload_u32(payload: Ptr[uint8], off: uint64) -> uint32:
+    b0: uint32 = cast[uint32](payload[off])
+    b1: uint32 = cast[uint32](payload[off + 1])
+    b2: uint32 = cast[uint32](payload[off + 2])
+    b3: uint32 = cast[uint32](payload[off + 3])
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+
+
+def _payload_u64(payload: Ptr[uint8], off: uint64) -> uint64:
+    lo: uint64 = cast[uint64](_payload_u32(payload, off))
+    hi: uint64 = cast[uint64](_payload_u32(payload, off + 4))
+    return lo | (hi << 32)
+
+
+def svc_proc_publish(name: Ptr[uint8], payload: Ptr[uint8]) -> int32:
+    # Insert-or-update the mirror entry for `name` from a 400-byte
+    # binary payload. Returns 0 on success, -1 if the slot table is
+    # full and the name isn't already present.
+    idx: int64 = _svc_proc_lookup(name)
+    if idx < 0:
+        idx = _svc_proc_alloc()
+        if idx < 0:
+            return -1
+        u_new: uint64 = cast[uint64](idx)
+        svc_proc_in_use[u_new] = 1
+        _svc_proc_copy_in(_svc_proc_name_at(u_new), name, SVC_PROC_NAME_MAX)
+        if u_new >= svc_proc_count:
+            svc_proc_count = u_new + 1
+    u: uint64 = cast[uint64](idx)
+    svc_proc_state[u]        = _payload_i32(payload, 0)
+    svc_proc_pid[u]          = _payload_i32(payload, 4)
+    svc_proc_restart_pol[u]  = _payload_i32(payload, 8)
+    svc_proc_restarts[u]     = _payload_i32(payload, 12)
+    svc_proc_uid[u]          = _payload_u32(payload, 16)
+    svc_proc_last_start_j[u] = _payload_u64(payload, 24)
+    _svc_proc_copy_in(_svc_proc_ns_at(u),
+                      cast[Ptr[uint8]](cast[uint64](payload) + 32),
+                      SVC_PROC_NS_MAX)
+    _svc_proc_copy_in(_svc_proc_exec_at(u),
+                      cast[Ptr[uint8]](cast[uint64](payload) + 48),
+                      SVC_PROC_EXEC_MAX)
+    _svc_proc_copy_in(_svc_proc_desc_at(u),
+                      cast[Ptr[uint8]](cast[uint64](payload) + 304),
+                      SVC_PROC_DESC_MAX)
+    return 0
+
+
+def svc_proc_unpublish(name: Ptr[uint8]) -> int32:
+    # Drop the mirror entry for `name`. Returns 0 if removed, -1 if
+    # the name wasn't registered (idempotent caller can ignore).
+    idx: int64 = _svc_proc_lookup(name)
+    if idx < 0:
+        return -1
+    u: uint64 = cast[uint64](idx)
+    svc_proc_in_use[u] = 0
+    svc_proc_name[u * SVC_PROC_NAME_MAX] = 0
+    return 0
+
+
+def _svc_proc_state_label(st: int32) -> Ptr[uint8]:
+    if st == SVC_PROC_STATE_RUNNING:
+        return "running"
+    if st == SVC_PROC_STATE_FAILED:
+        return "failed"
+    if st == SVC_PROC_STATE_RESTARTING:
+        return "restarting"
+    return "stopped"
+
+
+def _svc_proc_restart_label(p: int32) -> Ptr[uint8]:
+    if p == SVC_PROC_RESTART_ALWAYS:
+        return "always"
+    if p == SVC_PROC_RESTART_ON_FAIL:
+        return "on-failure"
+    return "never"
+
+
+def _svc_proc_render_one(buf: Ptr[uint8], pos: uint64, u: uint64) -> uint64:
+    # Render one service's status line. Mirrors user/hamsh.ad's
+    # svc_render_one shape so `cat /proc/svc/sshd` matches the
+    # `svc status sshd` output field-for-field:
+    #   <name>  state=<s>  ns=<ns>  pid=<n>  restart=<p>
+    #   restarts=<n>  [uptime=<s>s]  exec=<cmd>  [desc=<text>]
+    pos = _buf_put_str(buf, pos, _svc_proc_name_at(u))
+    pos = _buf_put_str(buf, pos, "  state=")
+    pos = _buf_put_str(buf, pos, _svc_proc_state_label(svc_proc_state[u]))
+    pos = _buf_put_str(buf, pos, "  ns=")
+    pos = _buf_put_str(buf, pos, _svc_proc_ns_at(u))
+    pos = _buf_put_str(buf, pos, "  pid=")
+    if svc_proc_pid[u] >= 0:
+        pos = _buf_put_dec(buf, pos, cast[uint64](svc_proc_pid[u]))
+    else:
+        pos = _buf_put_str(buf, pos, "0")
+    pos = _buf_put_str(buf, pos, "  restart=")
+    pos = _buf_put_str(buf, pos,
+                       _svc_proc_restart_label(svc_proc_restart_pol[u]))
+    pos = _buf_put_str(buf, pos, "  restarts=")
+    if svc_proc_restarts[u] >= 0:
+        pos = _buf_put_dec(buf, pos, cast[uint64](svc_proc_restarts[u]))
+    else:
+        pos = _buf_put_str(buf, pos, "0")
+    # Uptime (seconds) — only meaningful when running and last-start
+    # was recorded. jiffies tick at 100 Hz (M16.22 LAPIC + PIT).
+    if svc_proc_state[u] == SVC_PROC_STATE_RUNNING \
+            and svc_proc_last_start_j[u] != 0:
+        now: uint64 = get_jiffies()
+        if now >= svc_proc_last_start_j[u]:
+            up_j: uint64 = now - svc_proc_last_start_j[u]
+            pos = _buf_put_str(buf, pos, "  uptime=")
+            pos = _buf_put_dec(buf, pos, up_j / 100)
+            pos = _buf_put_str(buf, pos, "s")
+    pos = _buf_put_str(buf, pos, "  exec=")
+    pos = _buf_put_str(buf, pos, _svc_proc_exec_at(u))
+    desc_p: Ptr[uint8] = _svc_proc_desc_at(u)
+    if desc_p[0] != 0:
+        pos = _buf_put_str(buf, pos, "  desc=")
+        pos = _buf_put_str(buf, pos, desc_p)
+    buf[pos] = 10                               # '\n'
+    pos = pos + 1
+    return pos
+
+
+def render_svc_list(buf: Ptr[uint8]) -> uint64:
+    # `cat /proc/svc` (directory readout) — one line per registered
+    # service. Matches `svc status` (no name) output, so existing
+    # shell pipelines stay drop-in compatible.
+    pos: uint64 = 0
+    if svc_proc_count == 0:
+        pos = _buf_put_str(buf, pos, "svc: no services registered\n")
+        return pos
+    i: uint64 = 0
+    while i < svc_proc_count:
+        if svc_proc_in_use[i] != 0:
+            pos = _svc_proc_render_one(buf, pos, i)
+        i = i + 1
+    return pos
+
+
+def render_svc_one(name: Ptr[char], buf: Ptr[uint8]) -> uint64:
+    # `cat /proc/svc/<name>` — one-service rendering. Matches
+    # `svc status <name>` byte-for-byte (same field set, same
+    # separators) per the brief: "`cat /proc/svc/sshd` shows
+    # `state=running` + `pid=N`".
+    pos: uint64 = 0
+    # Materialise `name` (Ptr[char]) as a uint8 view for the lookup
+    # helper. We copy at most SVC_PROC_NAME_MAX bytes into a scratch
+    # buffer to bound the work.
+    scratch: Array[64, uint8]
+    j: uint64 = 0
+    while j + 1 < 64 and name[j] != 0:
+        scratch[j] = cast[uint8](name[j] & 0xFF)
+        j = j + 1
+    scratch[j] = 0
+    idx: int64 = _svc_proc_lookup(&scratch[0])
+    if idx < 0:
+        pos = _buf_put_str(buf, pos, "svc: not registered: ")
+        pos = _buf_put_str(buf, pos, &scratch[0])
+        buf[pos] = 10
+        pos = pos + 1
+        return pos
+    u: uint64 = cast[uint64](idx)
+    pos = _svc_proc_render_one(buf, pos, u)
+    return pos
+
+
 def _str_len(s: Ptr[uint8]) -> uint64:
     n: uint64 = 0
     while s[n] != 0:
@@ -265,6 +565,18 @@ def proc_render(path: Ptr[char], buf: Ptr[uint8]) -> int64:
     if _path_starts_with(path, "/proc/fs/by-id/") != 0:
         uuid_p: Ptr[char] = cast[Ptr[char]](cast[uint64](path) + 15)
         return cast[int64](render_fs_by_id(uuid_p, buf))
+    # /proc/svc family — service supervisor mirror. The bare "/proc/svc"
+    # (and the directory form "/proc/svc/") dumps every registered
+    # service; "/proc/svc/<name>" dumps just one. The check order
+    # matters — the prefix match would also fire on bare "/proc/svc/"
+    # but no name remains, so we explicitly handle both first.
+    if _path_eq(path, "/proc/svc") != 0:
+        return cast[int64](render_svc_list(buf))
+    if _path_eq(path, "/proc/svc/") != 0:
+        return cast[int64](render_svc_list(buf))
+    if _path_starts_with(path, "/proc/svc/") != 0:
+        name_p: Ptr[char] = cast[Ptr[char]](cast[uint64](path) + 10)
+        return cast[int64](render_svc_one(name_p, buf))
     return -1
 
 
