@@ -299,11 +299,13 @@ edk2-stable + ~22 MB higher-half ELF kernel, `HAMNIX_CPIO_LEAN=1`,
 | `[hamsh] M16.35 shell ready`                                | 36.3 s | +31.6 s         |
 
 The three EFI-stub markers the test asserts on all land inside the
-first ~5 seconds. The 30 s default for `ISO_BOOT_TIMEOUT` therefore
-has roughly 6× margin against the slowest asserted marker; under
-host-load variance even a 15 s timeout passes locally. The bulk of
-"boot to interactive shell" time (~31 s) is the post-cpio kernel
-selftest battery + userland init, not anything the EFI stub does.
+first ~5 seconds. The default for `ISO_BOOT_TIMEOUT` is **20 s**
+(dropped 30→20 in `1b3bdc2` after the measurement above) with
+roughly 4× host-load headroom against the slowest asserted marker
+(`cpio: registered N files`, ~4.7 s); under host-load variance even
+a 15 s timeout passes locally. The bulk of "boot to interactive
+shell" time (~31 s) is the post-cpio kernel selftest battery +
+userland init, not anything the EFI stub does.
 
 The 22 MB SFSP read off FAT12 in OVMF runs at roughly ~16 MB/s; the
 stub already issues a single `EFI_FILE_PROTOCOL.Read` over the whole
@@ -392,10 +394,18 @@ When testing on real hardware:
   legacy assumptions (PCI bus 0, no PCIe ECAM). Real-hardware systems
   will need MCFG-based config space access — already implemented in
   the kernel but only smoke-tested under QEMU.
-- **No persistence**: the ISO is read-only. There is no install path
-  yet that puts Hamnix on local disk and boots from there. The ext4
-  read/write driver + block-write paths exist; we still need a
-  partitioning / `install` script.
+- **Install path shipped**: the ISO carries `etc/install.hamsh`, a
+  7-step Debian-installer-shape script driven by `hpm install`
+  against an ISO-local mini-repo at `/iso-packages/`. It lays down
+  GPT + partitions on the target, mkfs's ESP + rootfs, runs
+  `hpm install hamnix-base hamnix-bootloader hamnix-installer-tools
+  linux-debian-12`, prompts for hostowner credentials, and plants
+  `/etc/passwd` + `/etc/shadow` on the installed disk. The rootfs
+  ext4 partition is created small and grown to fit the target disk
+  on first boot. `scripts/test_installer_full.sh` exercises the
+  full loop (build ISO → install → reboot from disk → first-boot
+  grow + idempotent second boot) and PASSES end-to-end as of
+  2026-05-27.
 - **GRUB is still on the ISO for BIOS**: shipping GRUB is fine for
   now. Once the EFI stub does real kernel handoff and a separate
   BIOS-mode 16-bit MBR loader is in place, GRUB can be dropped
