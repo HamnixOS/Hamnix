@@ -137,6 +137,15 @@ echo "[build_iso] Building v1 hpm packages (build/packages/) for installer mini-
 HAMNIX_BOOTLOADER_SLIM=1 HAMNIX_LINUX_DEBIAN_SLIM=1 \
     python3 scripts/build_packages.py
 
+# Generate etc/install/rootfs.manifest from the curated Debian closure
+# (mirrors REAL_DEBIAN_FILES in scripts/build_rootfs_img.py). The
+# installer's per-file install path reads this manifest at install time
+# and pushes each source file onto the target ext4 via the kernel's
+# install_file ctl verb. Replaces the old `dd_blk vdap4 vdbp2` byte-
+# copy line in etc/install.hamsh.
+echo "[build_iso] Generating etc/install/rootfs.manifest"
+python3 scripts/gen_install_manifest.py
+
 # HAMNIX_CPIO_LEAN=1: the ISO build pairs a small cpio (boot
 # essentials only) with the rootfs partition (where distro content
 # lives). Without this, the cpio would also embed the full real

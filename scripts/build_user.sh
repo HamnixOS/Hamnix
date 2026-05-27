@@ -150,3 +150,4 @@ build_adder_user mkfs_fat             # installer: format a /dev/blk/<dev> as FA
 build_adder_user hamnix_partition     # installer: GPT init + ESP + rootfs mkpart on /dev/blk/<dev>
 build_adder_user dd_blk               # installer: sector-aligned /dev/blk/SRC -> /dev/blk/DST copy
 build_adder_user install_file_to_slot # installer: copy one local file → target ext4 partition (via /ctl install_file verb)
+build_adder_user install_rootfs_from_manifest  # installer: walk manifest, install_file_to_slot each (target_path source_path) pair

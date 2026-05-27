@@ -3204,33 +3204,438 @@ def _ext4_mkfs_self_test_maybe():
     ext4_mkfs_self_test()
 
 
+# --- ext4 directory create + path-aware writes --------------------
+#
+# Per-component dir create + path-walking. The installer's production
+# path lays down files at /bin/<x>, /etc/<x>, /usr/lib/<x>/, etc. —
+# none of those parent dirs exist on a freshly-mkfs'd target. These
+# helpers let ext4_install_file_to_slot accept arbitrary paths with
+# mkdir -p semantics so a multi-package install can write
+#
+#     install_file_to_slot /dev/blk/vdbp2 usr/bin/apt /n/distros/usr/bin/apt
+#
+# without pre-creating every parent dir in userland.
+
+# Scratch inode buffer for fresh-dir-create. Sized for the largest
+# inode_size we'd see (256 bytes). Same shape as ext4_new_inode_buf
+# but kept separate so a path-walk that creates several dirs en route
+# to a file doesn't clobber the buffer ext4_blob_save uses for the
+# regular-file inode.
+ext4_mkdir_inode_buf: Array[256, uint8]
+
+
+def _ext4_build_dir_inode(buf: Ptr[uint8], data_blk: uint64,
+                          parent_inum: uint64):
+    # Build a fresh directory inode in `buf`: i_mode = S_IFDIR|0755
+    # (0x41ED), one extent pointing at `data_blk`, i_size = block_size,
+    # i_links_count = 2 (the dir itself + its own ".").
+    p: uint64 = cast[uint64](buf)
+    _ext4_zero(buf, ext4_inode_size)
+    _ext4_write_u16(cast[Ptr[uint8]](p + 0x00), 0x41ED)     # i_mode
+    # uid/gid: stamp the calling task. Installer runs as hostowner
+    # (uid 1); _ext4_inode_stamp_creator covers the no-task-context
+    # fallback path.
+    _ext4_inode_stamp_creator(buf)
+    _ext4_write_u32(cast[Ptr[uint8]](p + 0x04),
+                    cast[uint32](ext4_block_size))          # i_size_lo
+    _ext4_write_u16(cast[Ptr[uint8]](p + 0x1A), 2)          # i_links_count
+    sectors_per_block: uint64 = ext4_block_size / SECTOR_SIZE
+    _ext4_write_u32(cast[Ptr[uint8]](p + 0x1C),
+                    cast[uint32](sectors_per_block))        # i_blocks_lo
+    _ext4_write_u32(cast[Ptr[uint8]](p + 0x20), 0x80000)    # EXT4_EXTENTS_FL
+    # i_block: depth-0 extent leaf with one extent → data_blk.
+    eh: uint64 = p + INODE_I_BLOCK_OFFSET
+    _ext4_write_u16(cast[Ptr[uint8]](eh + 0), EXT4_EXTENT_MAGIC)
+    _ext4_write_u16(cast[Ptr[uint8]](eh + 2), 1)            # eh_entries
+    _ext4_write_u16(cast[Ptr[uint8]](eh + 4), 4)            # eh_max
+    _ext4_write_u16(cast[Ptr[uint8]](eh + 6), 0)            # eh_depth (leaf)
+    _ext4_write_u32(cast[Ptr[uint8]](eh + 8), 0)            # eh_generation
+    _ext4_write_u32(cast[Ptr[uint8]](eh + 12), 0)           # ee_block=0
+    _ext4_write_u16(cast[Ptr[uint8]](eh + 16), 1)           # ee_len=1
+    _ext4_write_u16(cast[Ptr[uint8]](eh + 18), 0)           # ee_start_hi
+    _ext4_write_u32(cast[Ptr[uint8]](eh + 20),
+                    cast[uint32](data_blk))                 # ee_start_lo
+    _ext4_stamp_all_times(buf)
+
+
+def _ext4_write_dot_dotdot(blk_buf: Ptr[uint8], self_inum: uint32,
+                           parent_inum: uint32):
+    # Lay down the canonical "." + ".." dirents for a fresh dir block.
+    # Layout (mirroring _ext4_mkfs_build_root_dirblock):
+    #   "."  : inum=self,   rec_len=12, name_len=1, file_type=2
+    #   ".." : inum=parent, rec_len=(block_size-12), name_len=2,
+    #          file_type=2, name="..", padded with zeros.
+    _ext4_zero(blk_buf, ext4_block_size)
+    p: uint64 = cast[uint64](blk_buf)
+    _ext4_write_u32(cast[Ptr[uint8]](p + 0), self_inum)
+    _ext4_write_u16(cast[Ptr[uint8]](p + 4), 12)
+    cast[Ptr[uint8]](p + 6)[0] = 1                          # name_len = 1
+    cast[Ptr[uint8]](p + 7)[0] = 2                          # EXT4_FT_DIR
+    cast[Ptr[uint8]](p + 8)[0] = 0x2E                       # '.'
+    rest: uint64 = ext4_block_size - 12
+    _ext4_write_u32(cast[Ptr[uint8]](p + 12), parent_inum)
+    _ext4_write_u16(cast[Ptr[uint8]](p + 16),
+                    cast[uint16](rest))
+    cast[Ptr[uint8]](p + 18)[0] = 2                         # name_len = 2
+    cast[Ptr[uint8]](p + 19)[0] = 2                         # EXT4_FT_DIR
+    cast[Ptr[uint8]](p + 20)[0] = 0x2E                      # '.'
+    cast[Ptr[uint8]](p + 21)[0] = 0x2E                      # '.'
+
+
+def _ext4_dir_create_child(parent_inum: uint64,
+                           name: Ptr[char]) -> uint32:
+    # Allocate a new directory inode + one data block for ". .." dirents,
+    # write everything, splice a dirent into `parent_inum` pointing at
+    # the new dir. Returns the new dir's inum (0 on failure with best-
+    # effort rollback of any partial allocs).
+    if parent_inum == 0:
+        return 0
+    new_inum: uint32 = ext4_alloc_inode()
+    if new_inum == 0:
+        printk0("[ext4_mkdir] alloc_inode FAIL\n")
+        return 0
+    new_blk: uint64 = ext4_alloc_block()
+    if new_blk == 0:
+        printk0("[ext4_mkdir] alloc_block FAIL\n")
+        ext4_free_inode(new_inum)
+        return 0
+    # Lay down the . / .. dirents into ext4_blk_buf, write to disk.
+    _ext4_write_dot_dotdot(&ext4_blk_buf[0], new_inum,
+                           cast[uint32](parent_inum))
+    if _ext4_write_block(new_blk, &ext4_blk_buf[0]) != 0:
+        printk0("[ext4_mkdir] write data block FAIL\n")
+        ext4_free_block(new_blk)
+        ext4_free_inode(new_inum)
+        return 0
+    # Build + write the dir inode.
+    _ext4_build_dir_inode(&ext4_mkdir_inode_buf[0], new_blk, parent_inum)
+    if ext4_write_inode(cast[uint64](new_inum),
+                        &ext4_mkdir_inode_buf[0]) != 0:
+        printk0("[ext4_mkdir] write inode FAIL\n")
+        ext4_free_block(new_blk)
+        ext4_free_inode(new_inum)
+        return 0
+    # Insert the dirent (type=EXT4_FT_DIR=2) into the parent.
+    if ext4_dir_insert(parent_inum, name, new_inum, 2) != 0:
+        printk0("[ext4_mkdir] dir_insert into parent FAIL\n")
+        ext4_free_block(new_blk)
+        ext4_free_inode(new_inum)
+        return 0
+    # Bump the parent's i_links_count: a fresh subdir's ".." raises
+    # the parent's link count by 1 (every dir increments its parent
+    # via the "..\0" backreference). The parent's i_size doesn't
+    # change (ext4_dir_insert split an existing dirent's slack).
+    parent_inode: Array[256, uint8]
+    if ext4_read_inode(parent_inum, &parent_inode[0]) == 0:
+        cur_links: uint16 = _ext4_read_u16(
+            cast[Ptr[uint8]](
+                cast[uint64](&parent_inode[0]) + 0x1A))
+        _ext4_write_u16(
+            cast[Ptr[uint8]](cast[uint64](&parent_inode[0]) + 0x1A),
+            cast[uint16](cast[uint64](cur_links) + 1))
+        _ext4_stamp_mtime(&parent_inode[0])
+        ext4_write_inode(parent_inum, &parent_inode[0])
+    return new_inum
+
+
+# Scratch path-walk buffers — kept module-scoped so a recursive path
+# install doesn't blow the kernel stack. _ext4_walk_path_mkdir_p and
+# ext4_blob_save_at_path share these because both run inside the
+# bracketed save/restore in ext4_install_file_to_slot; no nesting.
+ext4_walk_comp_buf: Array[256, uint8]                       # component scratch
+
+
+def _ext4_walk_path_mkdir_p(path: Ptr[char],
+                            leaf_off_out: Ptr[uint64],
+                            leaf_len_out: Ptr[uint64]) -> uint32:
+    # Walk `path` left-to-right, creating any missing INTERMEDIATE dir
+    # components (mkdir -p semantics). The LAST component is left as
+    # the basename — leaf_off_out is its offset within `path`,
+    # leaf_len_out is its length. Returns the inum of the parent
+    # directory that should receive the leaf, or 0 on any error.
+    #
+    # Path normalisation:
+    #   * Leading '/' is skipped (paths are partition-relative).
+    #   * Trailing '/' is rejected (we can't tell whether the caller
+    #     wants a file or a dir at that slot).
+    #   * Empty path / "/" — returns 0 (no leaf).
+    #   * "//" runs collapse to single '/'.
+    n: uint64 = _ext4_strlen(path)
+    if n == 0:
+        return 0
+    # Skip leading slash(es).
+    s: uint64 = 0
+    while s < n and path[s] == 47:
+        s = s + 1
+    if s >= n:
+        return 0                                            # bare "/" or empty
+    if path[n - 1] == 47:
+        printk0("[ext4_mkdir_p] trailing slash unsupported\n")
+        return 0
+
+    cur_parent: uint64 = 2                                  # ext4 root
+    i: uint64 = s
+    while i < n:
+        # Find next '/' (or end-of-string).
+        j: uint64 = i
+        while j < n and path[j] != 47:
+            j = j + 1
+        # Component span: [i, j).
+        comp_len: uint64 = j - i
+        if comp_len == 0:
+            # "//" collision in the middle; advance past extra slashes.
+            i = j + 1
+            continue
+        if comp_len > 255:
+            printk0("[ext4_mkdir_p] component too long\n")
+            return 0
+        # If this is the LAST component, return; the caller writes
+        # the file (or dir) here.
+        if j >= n:
+            leaf_off_out[0] = i
+            leaf_len_out[0] = comp_len
+            return cast[uint32](cur_parent)
+        # Intermediate component — look up; mkdir if missing.
+        # Copy into a NUL-terminated cstring for the helper.
+        k: uint64 = 0
+        while k < comp_len:
+            ext4_walk_comp_buf[k] = cast[uint8](path[i + k] & 0xFF)
+            k = k + 1
+        ext4_walk_comp_buf[comp_len] = 0
+
+        child_inum:  uint32 = 0
+        child_ftype: uint8  = 0
+        r: int32 = _ext4_dir_find_entry(
+            cur_parent, cast[Ptr[char]](&ext4_walk_comp_buf[0]),
+            &child_inum, &child_ftype)
+        if r < 0:
+            printk0("[ext4_mkdir_p] find_entry error\n")
+            return 0
+        if r == 0:
+            # Missing — create it.
+            new_inum: uint32 = _ext4_dir_create_child(
+                cur_parent,
+                cast[Ptr[char]](&ext4_walk_comp_buf[0]))
+            if new_inum == 0:
+                return 0
+            cur_parent = cast[uint64](new_inum)
+        else:
+            # Existing — must be a directory.
+            if child_ftype != 2:
+                printk0("[ext4_mkdir_p] component is not a dir\n")
+                return 0
+            cur_parent = cast[uint64](child_inum)
+        # Advance past the '/'.
+        i = j + 1
+    # Should have returned via the leaf branch.
+    return 0
+
+
+# ext4_blob_save_at_path: like ext4_blob_save but the file lands at
+# an arbitrary path. Reuses the same on-disk write shape (depth-0
+# extent leaf, EXT4_FT_REG_FILE dirent) — the only difference is the
+# parent directory, which is now whatever _ext4_walk_path_mkdir_p
+# resolves to.
+
+# Per-leaf scratch (shared with the file-install path; not nested).
+ext4_blob_leaf_buf: Array[256, uint8]
+
+
+def _ext4_dir_unlink_in_dir(parent_inum: uint64,
+                            name_buf: Ptr[uint8],
+                            name_len: uint64) -> uint32:
+    # Walk parent_inum's data blocks looking for `name_buf[0..name_len)`;
+    # if found, tombstone the dirent (inum=0) and write the block back.
+    # Returns the previous inum on hit, 0 on miss. Multi-block-aware
+    # symmetric with _ext4_dir_unlink_in_root.
+    if parent_inum == 0:
+        return 0
+    parent_inode: Array[256, uint8]
+    if ext4_read_inode(parent_inum, &parent_inode[0]) != 0:
+        return 0
+    dir_size: uint64 = cast[uint64](
+        ext4_inode_size_lo(&parent_inode[0]))
+    if dir_size == 0:
+        return 0
+    nblocks: uint64 = (dir_size + ext4_block_size - 1) \
+                    / ext4_block_size
+    lb: uint64 = 0
+    while lb < nblocks:
+        phys: uint64 = _ext4_logical_to_physical(
+            &parent_inode[0], lb)
+        if phys == 0:
+            return 0
+        if _ext4_read_block(phys, &ext4_blk_buf[0]) != 0:
+            return 0
+        pos: uint64 = 0
+        while pos < ext4_block_size:
+            e: uint64 = cast[uint64](&ext4_blk_buf[0]) + pos
+            e_inum:    uint32 = _ext4_read_u32(cast[Ptr[uint8]](e + 0))
+            e_rec_len: uint16 = _ext4_read_u16(cast[Ptr[uint8]](e + 4))
+            if e_rec_len == 0:
+                break
+            if e_inum != 0:
+                e_name_len: uint64 = cast[uint64](
+                    cast[Ptr[uint8]](e + 6)[0])
+                if e_name_len == name_len \
+                        and _name_eq_with_len(
+                            cast[Ptr[uint8]](e + 8),
+                            name_buf, name_len) != 0:
+                    _ext4_write_u32(cast[Ptr[uint8]](e + 0), 0)
+                    _ext4_write_block(phys, &ext4_blk_buf[0])
+                    return e_inum
+            pos = pos + cast[uint64](e_rec_len)
+        lb = lb + 1
+    return 0
+
+
+def ext4_blob_save_at_path(path: Ptr[char], src: Ptr[uint8],
+                           length: uint64) -> int64:
+    # Create-or-overwrite the file at `path` so it holds exactly
+    # `length` bytes from `src`. Intermediate parent dirs are created
+    # mkdir -p style. Returns the byte count on success, -1 on any
+    # failure. The path is partition-relative; a leading '/' is
+    # accepted and stripped.
+    if ext4_blockdev_slot < 0:
+        return cast[int64](-1)
+    leaf_off: uint64 = 0
+    leaf_len: uint64 = 0
+    parent_inum: uint32 = _ext4_walk_path_mkdir_p(path,
+                                                  &leaf_off,
+                                                  &leaf_len)
+    if parent_inum == 0:
+        return cast[int64](-1)
+    if leaf_len == 0 or leaf_len > 255:
+        return cast[int64](-1)
+    # Copy the leaf basename into ext4_blob_leaf_buf as a NUL-terminated
+    # cstring. ext4_dir_insert + _ext4_dir_unlink_in_dir read raw bytes;
+    # the NUL is for printk debug paths only.
+    i: uint64 = 0
+    while i < leaf_len:
+        ext4_blob_leaf_buf[i] = cast[uint8](path[leaf_off + i] & 0xFF)
+        i = i + 1
+    ext4_blob_leaf_buf[leaf_len] = 0
+    leaf_name: Ptr[char] = cast[Ptr[char]](&ext4_blob_leaf_buf[0])
+
+    # If a file by this name exists already, unlink it first so we
+    # can create-or-replace (idempotent install).
+    old_inum: uint32 = _ext4_dir_unlink_in_dir(
+        cast[uint64](parent_inum),
+        &ext4_blob_leaf_buf[0], leaf_len)
+    if old_inum != 0:
+        if ext4_read_inode(cast[uint64](old_inum),
+                           &ext4_blob_inode[0]) == 0:
+            _ext4_extent_trim_to(&ext4_blob_inode[0], 0)
+        ext4_free_inode(old_inum)
+
+    # Allocate a new inode, build an empty leaf, grow block-by-block.
+    new_inum: uint32 = ext4_alloc_inode()
+    if new_inum == 0:
+        printk0("ext4: blob_save_at_path FAIL (alloc_inode)\n")
+        return cast[int64](-1)
+    p: Ptr[uint8] = &ext4_blob_inode[0]
+    _ext4_zero(p, ext4_inode_size)
+    _ext4_write_u16(p, 0x81B4)                              # IFREG|0664
+    _ext4_inode_stamp_creator(p)
+    _ext4_write_u16(cast[Ptr[uint8]](cast[uint64](p) + 26), 1)  # i_links
+    _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](p) + 32),
+                    0x80000)                                # EXT4_EXTENTS_FL
+    eh: uint64 = cast[uint64](p) + INODE_I_BLOCK_OFFSET
+    _ext4_write_u16(cast[Ptr[uint8]](eh + 0), EXT4_EXTENT_MAGIC)
+    _ext4_write_u16(cast[Ptr[uint8]](eh + 2), 0)            # eh_entries
+    _ext4_write_u16(cast[Ptr[uint8]](eh + 4), 4)            # eh_max
+    _ext4_write_u16(cast[Ptr[uint8]](eh + 6), 0)            # eh_depth
+    _ext4_write_u32(cast[Ptr[uint8]](eh + 8), 0)            # eh_generation
+    _ext4_stamp_all_times(p)
+    # Grow block-by-block via the inline depth-0 leaf.
+    nblocks: uint64 = (length + ext4_block_size - 1) / ext4_block_size
+    sectors_per_block: uint64 = ext4_block_size / SECTOR_SIZE
+    lb: uint64 = 0
+    while lb < nblocks:
+        nb: uint64 = ext4_alloc_block()
+        if nb == 0:
+            printk0("ext4: blob_save_at_path FAIL (out of blocks)\n")
+            _ext4_extent_trim_to(&ext4_blob_inode[0], lb)
+            ext4_free_inode(new_inum)
+            return cast[int64](-1)
+        _ext4_zero(&ext4_blob_buf[0], ext4_block_size)
+        off: uint64 = lb * ext4_block_size
+        chunk: uint64 = length - off
+        if chunk > ext4_block_size:
+            chunk = ext4_block_size
+        if chunk > 0:
+            memcpy(&ext4_blob_buf[0],
+                   cast[Ptr[uint8]](cast[uint64](src) + off), chunk)
+        if _ext4_write_block(nb, &ext4_blob_buf[0]) != 0:
+            printk0("ext4: blob_save_at_path FAIL (write data)\n")
+            ext4_free_block(nb)
+            _ext4_extent_trim_to(&ext4_blob_inode[0], lb)
+            ext4_free_inode(new_inum)
+            return cast[int64](-1)
+        if _ext4_extent_append_block(&ext4_blob_inode[0], lb, nb) != 0:
+            printk0("ext4: blob_save_at_path FAIL (extent leaf full)\n")
+            # Depth-0 leaf has 4 extent slots; with the multi-group
+            # alloc_block walking groups in order, a freshly-mkfs'd
+            # target hands out contiguous blocks that coalesce into a
+            # single extent. A 4-slot fail here means the target FS
+            # was fragmented before the install — escalate, don't
+            # paper over with index-extent-nodes (M16.66 follow-up).
+            ext4_free_block(nb)
+            _ext4_extent_trim_to(&ext4_blob_inode[0], lb)
+            ext4_free_inode(new_inum)
+            return cast[int64](-1)
+        lb = lb + 1
+    _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](p) + 4),
+                    cast[uint32](length))                   # i_size_lo
+    _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](p) + 28),
+                    cast[uint32](nblocks * sectors_per_block))
+    _ext4_stamp_mtime(p)
+    if ext4_write_inode(cast[uint64](new_inum),
+                        &ext4_blob_inode[0]) != 0:
+        printk0("ext4: blob_save_at_path FAIL (write inode)\n")
+        _ext4_extent_trim_to(&ext4_blob_inode[0], 0)
+        ext4_free_inode(new_inum)
+        return cast[int64](-1)
+    # Splice the dirent (EXT4_FT_REG_FILE = 1) into the parent.
+    if ext4_dir_insert(cast[uint64](parent_inum), leaf_name,
+                       new_inum, 1) != 0:
+        printk0("ext4: blob_save_at_path FAIL (dir_insert)\n")
+        _ext4_extent_trim_to(&ext4_blob_inode[0], 0)
+        ext4_free_inode(new_inum)
+        return cast[int64](-1)
+    blk_flush(ext4_blockdev_slot)
+    return cast[int64](length)
+
+
 # --- ext4 install file to an alternate slot -----------------------
 #
 # The installer needs to write package files into a freshly-formatted
 # TARGET partition that is NOT the live ext4 mount the kernel booted
 # from. Approach B per the brief (2026-05-27): save the singleton
-# mount state, ext4_init the target, ext4_blob_save the file at the
-# target's root, then restore the singleton so the live FS stays
-# functional. Bracketed save+restore so the live mount survives a
-# failure mid-install — every error path lands on the restore stub.
+# mount state, ext4_init the target, ext4_blob_save_at_path at the
+# target's resolved-or-created parent dir, then restore the singleton
+# so the live FS stays functional. Bracketed save+restore so the live
+# mount survives a failure mid-install — every error path lands on
+# the restore stub.
 #
-# Scope: root-directory regular files. ext4_blob_save handles
-# arbitrary file size within a depth-0 extent leaf (~50 KiB to a few
-# MiB depending on block_size + contiguity), and create-or-truncates
-# on collision, so the same install path can be invoked repeatedly
-# from a multi-package installer loop. Nested directories on the
-# target are not supported in this iteration — the target ext4
-# accepts root-level files only. The orchestrator's followup
-# (mkdir on target ext4) lifts that restriction.
+# Scope: regular files at any path. ext4_blob_save_at_path creates
+# missing intermediate directories on the fly (mkdir -p) and handles
+# multi-block bodies via the depth-0 extent leaf (~50 KiB to a few
+# MiB depending on block_size + contiguity). Files >4 non-contiguous
+# extents would need index-extent-node support — not in scope for v1,
+# since multi-group alloc_block hands out contiguous blocks on a
+# freshly-mkfs'd target and the production payload tops out at
+# ~2.6 MiB per file (libstdc++.so.6.0.33).
 
-def ext4_install_file_to_slot(slot: int32, name: Ptr[char],
+def ext4_install_file_to_slot(slot: int32, path: Ptr[char],
                               data: Ptr[uint8],
                               data_len: uint64) -> int32:
-    # Write `data[0..data_len)` to the file `/<name>` on the freshly-
-    # formatted ext4 partition at `slot`. The currently-mounted ext4
-    # (if any) is bracketed by a save+restore so its globals survive
-    # the call regardless of whether the install succeeds. Returns 0
-    # on success, -1 on any failure.
+    # Write `data[0..data_len)` to the file `<path>` on the freshly-
+    # formatted ext4 partition at `slot`. `path` may include slashes —
+    # missing parent dirs are created on the fly. The currently-mounted
+    # ext4 (if any) is bracketed by a save+restore so its globals
+    # survive the call regardless of whether the install succeeds.
+    # Returns 0 on success, -1 on any failure.
     if slot < 0:
         return -1
     # Snapshot the current mount.
@@ -3254,10 +3659,8 @@ def ext4_install_file_to_slot(slot: int32, name: Ptr[char],
                                  s_bc, s_fdb, s_isz, s_ds, s_gdt)
         return -1
 
-    # Write the file. ext4_blob_save is the multi-block writer the
-    # distrofs persistent snapshot uses; it handles create-or-truncate
-    # at root + multi-block bodies via the depth-0 extent leaf.
-    rc: int64 = ext4_blob_save(name, data, data_len)
+    # Write the file (path-aware: mkdir-p the parent if needed).
+    rc: int64 = ext4_blob_save_at_path(path, data, data_len)
 
     # Restore the previous mount UNCONDITIONALLY so the live FS keeps
     # serving even if the install failed.
@@ -3271,6 +3674,84 @@ def ext4_install_file_to_slot(slot: int32, name: Ptr[char],
     printk2("[ext4_install_file] slot=%d wrote %d bytes OK\n",
             cast[uint64](slot), cast[uint64](rc))
     return 0
+
+
+def ext4_mkdir_at_slot(slot: int32, path: Ptr[char]) -> int32:
+    # mkdir -p the path on a freshly-formatted ext4 partition at
+    # `slot`. Same save/restore bracket as ext4_install_file_to_slot,
+    # so the live mount survives. Returns 0 on success (every component
+    # exists or was created), -1 on any failure. Idempotent — calling
+    # twice with the same path is a no-op the second time.
+    if slot < 0:
+        return -1
+    if path[0] == 0:
+        return -1
+    s_slot:  int32  = ext4_blockdev_slot
+    s_bs:    uint64 = ext4_block_size
+    s_bpg:   uint64 = ext4_blocks_per_grp
+    s_ipg:   uint64 = ext4_inodes_per_grp
+    s_ic:    uint64 = ext4_inodes_count
+    s_bc:    uint64 = ext4_blocks_count
+    s_fdb:   uint64 = ext4_first_data_blk
+    s_isz:   uint64 = ext4_inode_size
+    s_ds:    uint64 = ext4_desc_size
+    s_gdt:   uint64 = ext4_gdt_block
+
+    if ext4_init(slot) != 0:
+        printk1("[ext4_mkdir] init target slot=%d FAIL\n",
+                cast[uint64](slot))
+        _ext4_mkfs_restore_state(s_slot, s_bs, s_bpg, s_ipg, s_ic,
+                                 s_bc, s_fdb, s_isz, s_ds, s_gdt)
+        return -1
+
+    # Walk every component, creating missing ones. We feed the LEAF
+    # component back through _ext4_dir_create_child since
+    # _ext4_walk_path_mkdir_p only ensures INTERMEDIATE dirs exist.
+    rc: int32 = 0
+    leaf_off: uint64 = 0
+    leaf_len: uint64 = 0
+    parent_inum: uint32 = _ext4_walk_path_mkdir_p(path,
+                                                  &leaf_off,
+                                                  &leaf_len)
+    if parent_inum == 0 or leaf_len == 0 or leaf_len > 255:
+        rc = -1
+    else:
+        # Copy leaf into scratch, NUL-terminate, lookup-or-create.
+        i: uint64 = 0
+        while i < leaf_len:
+            ext4_walk_comp_buf[i] = cast[uint8](path[leaf_off + i] & 0xFF)
+            i = i + 1
+        ext4_walk_comp_buf[leaf_len] = 0
+        leaf_name: Ptr[char] = cast[Ptr[char]](&ext4_walk_comp_buf[0])
+
+        child_inum:  uint32 = 0
+        child_ftype: uint8  = 0
+        r: int32 = _ext4_dir_find_entry(
+            cast[uint64](parent_inum), leaf_name,
+            &child_inum, &child_ftype)
+        if r < 0:
+            rc = -1
+        elif r == 0:
+            # Missing — create it.
+            new_inum: uint32 = _ext4_dir_create_child(
+                cast[uint64](parent_inum), leaf_name)
+            if new_inum == 0:
+                rc = -1
+        else:
+            # Existing — must be a dir.
+            if child_ftype != 2:
+                printk0("[ext4_mkdir] leaf exists but not a dir\n")
+                rc = -1
+    if rc == 0:
+        blk_flush(ext4_blockdev_slot)
+
+    _ext4_mkfs_restore_state(s_slot, s_bs, s_bpg, s_ipg, s_ic,
+                             s_bc, s_fdb, s_isz, s_ds, s_gdt)
+    if rc == 0:
+        printk1("[ext4_mkdir] slot=%d OK\n", cast[uint64](slot))
+    else:
+        printk1("[ext4_mkdir] slot=%d FAIL\n", cast[uint64](slot))
+    return rc
 
 
 # --- ext4 offline resize-to-fit-disk (M16.x) ----------------------

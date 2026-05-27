@@ -1,0 +1,363 @@
+# user/install_rootfs_from_manifest.ad
+#
+# Drive install_file_to_slot's kernel verb in a loop, reading the file
+# list from a manifest. This is what /etc/install.hamsh runs in place
+# of the old `dd_blk /dev/blk/vdap4 /dev/blk/vdbp2` line: instead of
+# byte-copying the whole source rootfs partition onto the target, the
+# installer walks a manifest of (source_path → target_path) pairs and
+# pushes each file individually via the install_file ctl verb.
+#
+# Why a manifest instead of a recursive walk?
+#   * The source partition is mounted at /n/distros (Plan 9 bind in
+#     /etc/rc.boot). The exact file list that lands on the target is
+#     determined by scripts/build_rootfs_img.py's REAL_DEBIAN_FILES
+#     + USRMERGE_ALIASES — not by "everything under /n/distros". A
+#     manifest keeps the file list as the single source of truth.
+#   * sys_listdir is already exposed for `ls`, but full recursive
+#     directory traversal in Adder is fiddly. A one-line-per-path
+#     manifest is the simplest thing that works.
+#
+# Manifest format (one entry per line):
+#
+#     <target_path> <source_path>
+#
+# Lines beginning with '#' are comments. Blank lines are skipped.
+# <target_path> is partition-relative (no leading /); <source_path>
+# is absolute (e.g. /n/distros/usr/bin/apt). Both paths must not
+# contain whitespace. The kernel-side install_file ctl verb walks
+# the target_path and mkdir -p's any missing parent dirs.
+#
+# Usage:
+#   install_rootfs_from_manifest <devpath> <manifest_path>
+#
+# Arguments:
+#   argv[1]   target partition cdev (e.g. /dev/blk/vdbp2)
+#   argv[2]   manifest file (e.g. /etc/install/rootfs.manifest)
+#
+# Exit status:
+#   0  every manifest entry was either installed OK or absent at
+#      source (logged + skipped). The installed file count is logged
+#      to stdout so the test harness can grep it.
+#   1  unrecoverable error (cannot open manifest, cannot open ctl,
+#      malformed line, kernel rejected an install).
+
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+
+# Buffers sized to match the kernel's install_file ctl handler:
+#   * Body cap = 4 MiB (the ext4 depth-0 extent leaf comfortably
+#     holds a contiguous 4 MiB body on a freshly-mkfs'd target).
+#   * Header cap = 1.5 KiB (path up to 1023 bytes + small fixed
+#     overhead per the install_file_to_slot wire format).
+MAX_BODY: uint64 = 4194304
+body_buf: Array[4194304, uint8]
+
+HDR_MAX:   uint64 = 1536
+WRITE_MAX: uint64 = 4195840
+write_buf: Array[4195840, uint8]
+
+# Manifest read buffer. 64 KiB is plenty for ~150 entries of ~80
+# chars each. If the manifest outgrows this, bump or stream.
+MANIFEST_MAX: uint64 = 65536
+manifest_buf: Array[65536, uint8]
+
+# Scratch for the path tokens parsed per line. Each is NUL-terminated.
+target_path_buf: Array[1024, uint8]
+source_path_buf: Array[1024, uint8]
+ctl_path_buf:    Array[128,  uint8]
+
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+def strcpy(dst: Ptr[uint8], src: Ptr[uint8]) -> uint64:
+    i: uint64 = 0
+    while src[i] != 0:
+        dst[i] = src[i]
+        i = i + 1
+    dst[i] = 0
+    return i
+
+
+def render_u64(v: uint64, out: Ptr[uint8]) -> uint64:
+    if v == 0:
+        out[0] = 48
+        return 1
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    while v != 0:
+        digits[n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    written: uint64 = n
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    return written
+
+
+def read_full(fd: int32, buf: Ptr[uint8], cap: uint64) -> int64:
+    total: uint64 = 0
+    while total < cap:
+        n: int64 = sys_read(fd, cast[Ptr[uint8]](
+            cast[uint64](buf) + total), cap - total)
+        if n < 0:
+            return cast[int64](-1)
+        if n == 0:
+            break
+        total = total + cast[uint64](n)
+    return cast[int64](total)
+
+
+def slurp_file(path: Ptr[char], dst: Ptr[uint8],
+               cap: uint64, out_len: Ptr[uint64]) -> int32:
+    # Open `path`, drain up to `cap` bytes into dst, close. Returns 0
+    # on success (out_len receives the byte count), -1 on open / read
+    # error (caller distinguishes "no such file" via the trailing
+    # printk in the manifest loop).
+    fd: int32 = sys_open(path)
+    if fd < 0:
+        return -1
+    n: int64 = read_full(fd, dst, cap)
+    sys_close(fd)
+    if n < 0:
+        return -1
+    out_len[0] = cast[uint64](n)
+    if cast[uint64](n) >= cap:
+        # File was at or above the cap. We can't tell if it was
+        # truncated vs exactly-cap. Warn and let the caller decide.
+        write_str(2,
+            "install_rootfs_from_manifest: warning: hit body cap on ")
+        write_str(2, cast[Ptr[uint8]](path))
+        write_str(2, "\n")
+    return 0
+
+
+def open_ctl_for(devpath: Ptr[uint8]) -> int32:
+    # Compose <devpath>/ctl, open for write.
+    dp_n: uint64 = strcpy(&ctl_path_buf[0], devpath)
+    suffix: Ptr[uint8] = "/ctl"
+    sj: uint64 = 0
+    while suffix[sj] != 0 and dp_n + sj < 127:
+        ctl_path_buf[dp_n + sj] = suffix[sj]
+        sj = sj + 1
+    ctl_path_buf[dp_n + sj] = 0
+    return sys_open_write(cast[Ptr[char]](&ctl_path_buf[0]))
+
+
+def install_one(ctl_fd: int32, target_path: Ptr[uint8],
+                body_len: uint64) -> int32:
+    # Compose the install_file wire message at write_buf[0..pos] and
+    # write it to ctl_fd. body_buf must already hold body_len bytes.
+    name_len: uint64 = strlen_u8(target_path)
+    if name_len == 0 or name_len > 1023:
+        write_str(2,
+            "install_rootfs_from_manifest: bad target path length\n")
+        return -1
+    cmd_lit: Ptr[uint8] = "install_file "
+    cmd_len: uint64 = 13
+    pos: uint64 = 0
+    i: uint64 = 0
+    while i < cmd_len:
+        write_buf[pos] = cmd_lit[i]
+        pos = pos + 1
+        i = i + 1
+    j: uint64 = 0
+    while j < name_len:
+        write_buf[pos] = target_path[j]
+        pos = pos + 1
+        j = j + 1
+    write_buf[pos] = 32                           # ' '
+    pos = pos + 1
+    sd: uint64 = render_u64(body_len,
+                            cast[Ptr[uint8]](
+                                cast[uint64](&write_buf[0]) + pos))
+    pos = pos + sd
+    write_buf[pos] = 10                           # '\n'
+    pos = pos + 1
+    k: uint64 = 0
+    while k < body_len:
+        write_buf[pos + k] = body_buf[k]
+        k = k + 1
+    pos = pos + body_len
+
+    wn: int64 = sys_write(ctl_fd, &write_buf[0], pos)
+    if wn < 0:
+        write_str(2,
+            "install_rootfs_from_manifest: kernel rejected install of ")
+        write_str(2, target_path)
+        write_str(2, "\n")
+        return -1
+    return 0
+
+
+# parse one manifest line into target_path_buf + source_path_buf.
+# Returns:
+#   1   parsed an entry — caller proceeds to install.
+#   0   blank line or comment — caller skips.
+#  -1   malformed line.
+def parse_line(line: Ptr[uint8], llen: uint64) -> int32:
+    # Strip leading whitespace.
+    p: uint64 = 0
+    while p < llen and (line[p] == 32 or line[p] == 9):
+        p = p + 1
+    if p >= llen:
+        return 0
+    if line[p] == 35:                             # '#' comment
+        return 0
+    # Token 1: target_path (non-whitespace).
+    t0: uint64 = p
+    while p < llen and line[p] != 32 and line[p] != 9:
+        p = p + 1
+    t_len: uint64 = p - t0
+    if t_len == 0 or t_len >= 1024:
+        return -1
+    # Copy + NUL-terminate.
+    ci: uint64 = 0
+    while ci < t_len:
+        target_path_buf[ci] = line[t0 + ci]
+        ci = ci + 1
+    target_path_buf[t_len] = 0
+    # Skip whitespace.
+    while p < llen and (line[p] == 32 or line[p] == 9):
+        p = p + 1
+    if p >= llen:
+        return -1
+    # Token 2: source_path.
+    s0: uint64 = p
+    while p < llen and line[p] != 32 and line[p] != 9:
+        p = p + 1
+    s_len: uint64 = p - s0
+    if s_len == 0 or s_len >= 1024:
+        return -1
+    cj: uint64 = 0
+    while cj < s_len:
+        source_path_buf[cj] = line[s0 + cj]
+        cj = cj + 1
+    source_path_buf[s_len] = 0
+    return 1
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    if argc < 3:
+        write_str(2,
+            "usage: install_rootfs_from_manifest <devpath> <manifest>\n")
+        return 1
+    devpath:       Ptr[uint8] = cast[Ptr[uint8]](argv[1])
+    manifest_path: Ptr[uint8] = cast[Ptr[uint8]](argv[2])
+
+    write_str(1,
+        "install_rootfs_from_manifest: target=")
+    write_str(1, devpath)
+    write_str(1, " manifest=")
+    write_str(1, manifest_path)
+    write_str(1, "\n")
+
+    # Read the manifest into manifest_buf.
+    mfd: int32 = sys_open(cast[Ptr[char]](manifest_path))
+    if mfd < 0:
+        write_str(2,
+            "install_rootfs_from_manifest: cannot open manifest ")
+        write_str(2, manifest_path)
+        write_str(2, "\n")
+        return 1
+    mn: int64 = read_full(mfd, &manifest_buf[0], MANIFEST_MAX)
+    sys_close(mfd)
+    if mn < 0:
+        write_str(2,
+            "install_rootfs_from_manifest: manifest read FAIL\n")
+        return 1
+    mlen: uint64 = cast[uint64](mn)
+
+    ctl_fd: int32 = open_ctl_for(devpath)
+    if ctl_fd < 0:
+        write_str(2,
+            "install_rootfs_from_manifest: cannot open ctl for ")
+        write_str(2, devpath)
+        write_str(2, "\n")
+        return 1
+
+    # Walk the manifest line by line.
+    installed: uint64 = 0
+    missing:   uint64 = 0
+    failed:    uint64 = 0
+    p: uint64 = 0
+    while p < mlen:
+        # Find end-of-line.
+        q: uint64 = p
+        while q < mlen and manifest_buf[q] != 10:
+            q = q + 1
+        # Trim trailing CR.
+        e: uint64 = q
+        if e > p and manifest_buf[e - 1] == 13:
+            e = e - 1
+        # Parse this line.
+        pr: int32 = parse_line(&manifest_buf[p], e - p)
+        if pr < 0:
+            write_str(2,
+                "install_rootfs_from_manifest: malformed line — abort\n")
+            sys_close(ctl_fd)
+            return 1
+        if pr == 1:
+            # Try to read the source file.
+            body_len: uint64 = 0
+            rc: int32 = slurp_file(
+                cast[Ptr[char]](&source_path_buf[0]),
+                &body_buf[0], MAX_BODY, &body_len)
+            if rc != 0:
+                # Missing source — skip (the build planted a manifest
+                # entry but the source isn't present on this image,
+                # e.g. an optional Debian closure file).
+                missing = missing + 1
+                write_str(1, "  skip (missing source): ")
+                write_str(1, &source_path_buf[0])
+                write_str(1, "\n")
+            else:
+                ic: int32 = install_one(
+                    ctl_fd, &target_path_buf[0], body_len)
+                if ic != 0:
+                    failed = failed + 1
+                else:
+                    installed = installed + 1
+                    write_str(1, "  install: ")
+                    write_str(1, &target_path_buf[0])
+                    write_str(1, " (")
+                    sizebuf: Array[24, uint8]
+                    sb_n: uint64 = render_u64(body_len, &sizebuf[0])
+                    sys_write(1, &sizebuf[0], sb_n)
+                    write_str(1, " bytes)\n")
+        # Advance past this line (including the '\n' if present).
+        p = q
+        if p < mlen and manifest_buf[p] == 10:
+            p = p + 1
+
+    sys_close(ctl_fd)
+
+    write_str(1, "install_rootfs_from_manifest: ")
+    summary_buf: Array[64, uint8]
+    sn: uint64 = render_u64(installed, &summary_buf[0])
+    sys_write(1, &summary_buf[0], sn)
+    write_str(1, " installed, ")
+    sn = render_u64(missing, &summary_buf[0])
+    sys_write(1, &summary_buf[0], sn)
+    write_str(1, " missing, ")
+    sn = render_u64(failed, &summary_buf[0])
+    sys_write(1, &summary_buf[0], sn)
+    if failed != 0:
+        write_str(1, " FAILED\n")
+        return 1
+    write_str(1, " failed — OK\n")
+    return 0

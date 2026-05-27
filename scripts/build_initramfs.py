@@ -744,6 +744,7 @@ def build_archive() -> bytes:
         "cat.elf",
         "dd_blk.elf",
         "install_file_to_slot.elf",
+        "install_rootfs_from_manifest.elf",
         "hamnix_partition.elf",
         "mkfs_ext4.elf",
         "mkfs_fat.elf",

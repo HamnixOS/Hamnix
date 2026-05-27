@@ -121,17 +121,29 @@ check_marker 'hpm: installed hamnix-base'             "hpm install hamnix-base"
 check_marker 'hpm: installed hamnix-installer-tools'  "hpm install hamnix-installer-tools"
 check_marker 'hpm: installed hamnix-bootloader'       "hpm install hamnix-bootloader"
 check_marker 'hpm: installed linux-debian-12'         "hpm install linux-debian-12"
-# Underlying byte transfer (dd_blk of pre-populated source partitions)
-# still happens until userland can mount a freshly-formatted ext4 — see
-# etc/install.hamsh's step 6 banner-comment. We keep the assertion lax:
-# at least one dd_blk has to succeed (ESP + rootfs are both copied).
+# Byte transfer onto target:
+#   * ESP (FAT12) still uses dd_blk — exactly one occurrence.
+#   * rootfs (ext4) now uses install_rootfs_from_manifest, which
+#     pushes each curated Debian file individually via the kernel's
+#     install_file ctl verb. Assert the manifest runner's success
+#     banner is present AND that the manifest-driven path moved a
+#     non-trivial number of files onto the target (rejecting the
+#     silent zero-install regression).
 ddok=$(grep -aE -c 'dd_blk: OK' "$STAGE_B_LOG" || true)
-if [ "$ddok" -ge 2 ]; then
-    echo "[test_installer_full]   OK : dd_blk: OK ×$ddok (ESP + rootfs byte-transfer)"
+if [ "$ddok" -ge 1 ]; then
+    echo "[test_installer_full]   OK : dd_blk: OK ×$ddok (ESP byte-transfer)"
 else
-    echo "[test_installer_full]   MISS: dd_blk: OK appeared $ddok times (need 2)" >&2
+    echo "[test_installer_full]   MISS: dd_blk: OK appeared $ddok times (need 1 for ESP)" >&2
     stage_b_fail=1
 fi
+# install_rootfs_from_manifest emits one "  install: <path>" line per
+# successful file install + a final "OK" summary line. The .hamnix-roots
+# entry MUST always be present (the kernel's mount_rootfs_partition
+# can't register #distro without it); assert at least that one
+# installed cleanly.
+check_marker '\[install\] \(6/7\) install rootfs files' "manifest install banner"
+check_marker 'install_rootfs_from_manifest: .* installed' "manifest summary line"
+check_marker '  install: \.hamnix-roots' ".hamnix-roots installed on target"
 # etc/install.hamsh layout (post-ac0bf0d):
 #   step (7/7) header is "hostowner credentials" (the prompt step),
 #   and the final banner is the unadorned "[install] install complete".
