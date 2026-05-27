@@ -191,10 +191,11 @@ fi
 # 7. hpm refresh — the user-visible goal. The block runs against
 # https://255.one/ (the hpm default). Looking for the success message
 # or for the index dump that follows on a healthy refresh. The repo
-# ships 5 packages today (hpm-hello + the hamnix-* base set) — that's
-# the manual-test acceptance criterion the brief calls out, so we
-# also confirm a 5-package payload landed when the success line
-# carries a package count.
+# ships 17 packages today after the v1 → component split + channel-
+# layout pivot (hamnix-base metapackage + ~16 component leaves under
+# the `main` channel). The exact count may grow; we ONLY report a
+# mismatch as a NOTE so this test doesn't false-fail when packages
+# are legitimately added or removed upstream.
 refresh_block=$(sed -n '/HPM_NET_PING_INTERNET_DONE/,/HPM_NET_REFRESH_DONE/p' "$LOG")
 refresh_ok=0
 if echo "$refresh_block" | grep -E -q "refreshed index from https://255\.one/?"; then
@@ -202,15 +203,15 @@ if echo "$refresh_block" | grep -E -q "refreshed index from https://255\.one/?";
 elif echo "$refresh_block" | grep -E -q "hpm: refresh OK"; then
     refresh_ok=1
 fi
-# Soft check: the repo today carries 5 packages. The exact count
-# may change as 255.one grows; we ONLY report a mismatch as a NOTE
-# so this test doesn't false-fail when packages are legitimately
-# added or removed upstream.
-if echo "$refresh_block" | grep -E -q "5 packages"; then
-    echo "[test_hpm_network] OK: hpm reports 5 packages from https://255.one/"
+# Soft check: the repo today carries 17 packages across the `main`
+# channel (post-split + channel-layout pivot). Only the count is
+# checked softly — channel routing itself is asserted by the
+# dedicated test_hpm_channels.sh fixture.
+if echo "$refresh_block" | grep -E -q "17 packages"; then
+    echo "[test_hpm_network] OK: hpm reports 17 packages from https://255.one/"
 elif echo "$refresh_block" | grep -E -q "[0-9]+ packages"; then
     actual_n=$(echo "$refresh_block" | grep -oE "[0-9]+ packages" | head -1)
-    echo "[test_hpm_network] NOTE: hpm reports '$actual_n' (brief expects 5)"
+    echo "[test_hpm_network] NOTE: hpm reports '$actual_n' (brief expects 17)"
 fi
 refresh_resolved=0
 if echo "$refresh_block" | grep -F -q "cannot resolve 255.one"; then
