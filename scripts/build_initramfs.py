@@ -830,6 +830,22 @@ def build_archive() -> bytes:
                 print(f"  embedded {name} ({len(data)} bytes from "
                       f"etc/{ef.name})")
             elif ef.is_dir():
+                # etc/man/ is staged at the conventional Unix manpage
+                # path /usr/share/man/<topic>.<N>.md. Source-of-truth
+                # for the page bytes lives at etc/man/ in the tree (so
+                # gen_install_manifest.py and rc.boot can find it
+                # without a separate copy step), but every consumer
+                # looks under /usr/share/man/ at runtime — that's
+                # where `man <topic>` reads from.
+                if ef.name == "man":
+                    for sub in sorted(ef.iterdir()):
+                        if sub.is_file():
+                            data = sub.read_bytes()
+                            name = "/usr/share/man/" + sub.name
+                            blob += cpio_entry(name, data)
+                            print(f"  embedded {name} ({len(data)} bytes "
+                                  f"from etc/man/{sub.name})")
+                    continue
                 for sub in sorted(ef.iterdir()):
                     if sub.is_file():
                         data = sub.read_bytes()
