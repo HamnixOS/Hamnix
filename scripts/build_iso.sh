@@ -92,13 +92,60 @@ bash scripts/build_modules.sh
 # booting user to an interactive shell. This is the user-facing
 # real-hardware boot path. Test scripts that need a different first
 # task override /init with their own INIT_ELF fixture.
+# Build the v1 hpm packages from the freshly-rebuilt outputs. The
+# installer (etc/install.hamsh) drives `hpm install` against this
+# mini-repo at /mnt/iso-packages/ in the cpio, instead of dd_blk'ing
+# whole partitions onto the target.
+#
+# Build-order note (Debian-installer pattern): we package the
+# CURRENT kernel ELF / EFI stub (which are the OUTPUTS of the
+# previous build_iso.sh run, or freshly built below on the first
+# clean build). The hamnix-bootloader package therefore ships the
+# kernel from the previous build pass. On steady-state incremental
+# builds this is identical; on a brand-new checkout it's whatever
+# fs/initramfs_blob.S was committed with. The final kernel ELF (built
+# AFTER the cpio is staged below) is what gets booted from the LIVE
+# ISO; the package's kernel ELF is what `hpm install hamnix-bootloader`
+# copies onto an installed system's ESP. Both are valid bootable
+# kernels — the only difference is the embedded /mnt/iso-packages
+# cpio entries, which don't matter on an installed system that
+# already has its packages on disk.
+#
+# On a clean build with no prior kernel ELF, we build one preemptively
+# so the package isn't empty.
+if [ ! -f "$HAMNIX_KERNEL" ]; then
+    echo "[build_iso] No prior kernel ELF — bootstrapping for the bootloader package"
+    python3 -m compiler.adder compile \
+        --target=x86_64-bare-metal \
+        init/main.ad \
+        -o "$HAMNIX_KERNEL"
+fi
+# Same for the EFI stub.
+EFI_STUB_SRC="arch/x86/boot/efi_stub.S"
+if [ ! -f "$HAMNIX_EFI_STUB" ] && [ -f "$EFI_STUB_SRC" ]; then
+    echo "[build_iso] No prior EFI stub — bootstrapping for the bootloader package"
+    _PRE_EFI_TMP=$(mktemp -d)
+    as --64 -o "$_PRE_EFI_TMP/efi_stub.o" "$EFI_STUB_SRC"
+    ld -m i386pep --subsystem 10 -e efi_main --image-base 0 \
+       --no-dynamic-linker -nostdlib \
+       -o "$HAMNIX_EFI_STUB" "$_PRE_EFI_TMP/efi_stub.o"
+    rm -rf "$_PRE_EFI_TMP"
+fi
+
+echo "[build_iso] Building v1 hpm packages (build/packages/) for installer mini-repo"
+python3 scripts/build_packages.py
+
 # HAMNIX_CPIO_LEAN=1: the ISO build pairs a small cpio (boot
 # essentials only) with the rootfs partition (where distro content
 # lives). Without this, the cpio would also embed the full real
 # Debian tree, pushing the kernel ELF past 86 MB and overflowing the
 # 32 MB FAT12 ESP. Direct -kernel ELF tests that don't attach a
 # rootfs partition leave HAMNIX_CPIO_LEAN unset and get a fat cpio.
-HAMNIX_CPIO_LEAN=1 python3 scripts/build_initramfs.py
+# HAMNIX_ISO_PACKAGES: stage build/packages/ at /mnt/iso-packages/
+# in the cpio so the installer can `hpm --repo=file:///mnt/iso-packages
+# install ...` offline. Mirrors Debian's installer.
+HAMNIX_CPIO_LEAN=1 HAMNIX_ISO_PACKAGES="$(pwd)/build/packages" \
+    python3 scripts/build_initramfs.py
 
 # Build the ext4 rootfs image that will become partition 3 of the
 # ISO (live-USB-style layout, see docs/rootfs_partition.md). The

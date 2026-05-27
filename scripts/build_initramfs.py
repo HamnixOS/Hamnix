@@ -426,6 +426,42 @@ if _HPM_TEST_REPO_C:
             FILES.append((f"/test-hpm-repo-conflict/{_rel.as_posix()}",
                           _fh.read()))
 
+# ISO mini-repo for the hpm-driven installer. scripts/build_iso.sh
+# builds the v1 packages via scripts/build_packages.py (kernel ELF +
+# userland are by then already current) and stages the resulting
+# build/packages/ tree into the cpio at /mnt/iso-packages/. The
+# installer then runs
+#
+#   hpm --repo=file:///mnt/iso-packages --target-prefix=/mnt/newroot \
+#       install hamnix-base hamnix-installer-tools linux-debian-12
+#
+# to populate a freshly-formatted target rootfs WITHOUT a network
+# round-trip and WITHOUT dd_blk'ing whole partitions. The mirror is
+# the Debian-installer pattern.
+#
+# Off by default: every test that doesn't drive the installer skips
+# the (~30 MB) staging cost. scripts/build_iso.sh sets the env var.
+_HPM_ISO_PACKAGES = os.environ.get("HAMNIX_ISO_PACKAGES", "")
+if _HPM_ISO_PACKAGES:
+    _iso_pkgs_root = Path(_HPM_ISO_PACKAGES)
+    if not _iso_pkgs_root.is_dir():
+        raise SystemExit(
+            f"HAMNIX_ISO_PACKAGES={_HPM_ISO_PACKAGES!r}: not a directory")
+    _n_iso_pkg_files = 0
+    _n_iso_pkg_bytes = 0
+    for _f in sorted(_iso_pkgs_root.rglob("*")):
+        if not _f.is_file():
+            continue
+        _rel = _f.relative_to(_iso_pkgs_root)
+        with _f.open("rb") as _fh:
+            _bytes = _fh.read()
+        FILES.append((f"/mnt/iso-packages/{_rel.as_posix()}", _bytes))
+        _n_iso_pkg_files += 1
+        _n_iso_pkg_bytes += len(_bytes)
+    print(f"  [iso-packages] staged {_n_iso_pkg_files} files "
+          f"({_n_iso_pkg_bytes} bytes) at /mnt/iso-packages/ from "
+          f"{_iso_pkgs_root}")
+
 _CPIO_STRESS_RAW = os.environ.get("HAMNIX_CPIO_STRESS_FILES", "")
 if _CPIO_STRESS_RAW:
     try:
