@@ -284,6 +284,34 @@ If you only have OVMF locally, set `SKIP_UEFI=1` to skip the UEFI pass
 of `test_iso_qemu.sh`. `test_uefi_boot.sh` auto-detects the missing
 firmware and prints `[test_uefi_boot] SKIP`.
 
+#### UEFI boot timing (measured)
+
+Per-marker wall-clock latencies from a clean QEMU-launch start (OVMF
+edk2-stable + ~22 MB higher-half ELF kernel, `HAMNIX_CPIO_LEAN=1`,
+32 MB FAT12 ESP, host = developer workstation under no other load):
+
+| Marker                                                      | Time   | Delta from prev |
+| ----------------------------------------------------------- | ------ | --------------- |
+| `[hamnix] EFI entry reached`                                | 1.9 s  | (firmware + PE) |
+| `[hamnix] EFI: kernel ELF read OK` (SFSP read of 22 MB)     | 3.3 s  | +1.4 s          |
+| `[hamnix] post-EFI handoff complete` (ExitBootServices ret) | 3.5 s  | +0.2 s          |
+| `cpio: registered N files from initramfs` (start_kernel)    | 4.7 s  | +1.2 s          |
+| `[hamsh] M16.35 shell ready`                                | 36.3 s | +31.6 s         |
+
+The three EFI-stub markers the test asserts on all land inside the
+first ~5 seconds. The 30 s default for `ISO_BOOT_TIMEOUT` therefore
+has roughly 6× margin against the slowest asserted marker; under
+host-load variance even a 15 s timeout passes locally. The bulk of
+"boot to interactive shell" time (~31 s) is the post-cpio kernel
+selftest battery + userland init, not anything the EFI stub does.
+
+The 22 MB SFSP read off FAT12 in OVMF runs at roughly ~16 MB/s; the
+stub already issues a single `EFI_FILE_PROTOCOL.Read` over the whole
+buffer (no chunking, no per-cluster ping-pong) so there's nothing
+obvious left to optimise on our side. FAT12 cluster size is already
+at 16 KiB (mformat `-c 32`); larger clusters would not measurably
+help a single-file linear read at this scale.
+
 ### Write to a USB stick
 
 The ISO is *isohybrid*: writing it raw to a block device produces a

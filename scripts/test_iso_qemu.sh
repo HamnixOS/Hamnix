@@ -40,14 +40,23 @@
 #         - jumped to _x86_start_after_loader,
 #      AND start_kernel() then ran far enough to call cpio_init().
 #
-# Each pass runs for up to ISO_BOOT_TIMEOUT seconds (default 30). The
+# Each pass runs for up to ISO_BOOT_TIMEOUT seconds (default 20). The
 # kernel (BIOS) or the EFI stub (UEFI) both halt the CPU after printing
 # their banner, so "qemu killed by timeout" is the expected success
 # signal — same convention as run_x86_bare.sh.
 #
+# Why 20 s: a clean UEFI boot reaches the deepest asserted marker
+# (`cpio: registered N files from initramfs`) in ~5 s on a developer
+# workstation under no other load — see docs/BOOT.md "UEFI boot timing
+# (measured)". 20 s gives ~4× host-load headroom against that marker
+# while still failing fast when a regression hangs the EFI stub. The
+# bridge value of 60 (from the now-reverted "embedded cpio + 128 MB
+# ESP" era) was overkill once HAMNIX_CPIO_LEAN + rootfs-on-its-own-
+# partition shrank the kernel ELF back to ~22 MB.
+#
 # Env overrides:
 #   HAMNIX_ISO         iso path                  (default: build/hamnix.iso)
-#   ISO_BOOT_TIMEOUT   seconds per qemu run      (default: 30)
+#   ISO_BOOT_TIMEOUT   seconds per qemu run      (default: 20)
 #   BANNER_RE          BIOS-pass banner regex    (default: kernel banner —
 #                                                  not just "Hamnix", which
 #                                                  also appears in GRUB's
@@ -70,7 +79,7 @@ cd "$PROJ_ROOT"
 source "$PROJ_ROOT/scripts/_build_lock.sh"
 
 HAMNIX_ISO="${HAMNIX_ISO:-build/hamnix.iso}"
-ISO_BOOT_TIMEOUT="${ISO_BOOT_TIMEOUT:-30}"
+ISO_BOOT_TIMEOUT="${ISO_BOOT_TIMEOUT:-20}"
 BANNER_RE="${BANNER_RE:-Hamnix kernel booting}"
 UEFI_BANNER_RE="${UEFI_BANNER_RE:-\[hamnix\] EFI entry reached}"
 UEFI_HANDOFF_RE="${UEFI_HANDOFF_RE:-\[hamnix\] post-EFI handoff complete}"
