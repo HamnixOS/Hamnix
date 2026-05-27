@@ -493,6 +493,11 @@ moves break Linux ABI** (Layer 2 has its own dispatch table).
 | 274 | `segdetach` (reserved) |
 | 275 | `srv_post` (shipped: V4 — userspace publishes srvfd at `/srv/<name>`) |
 | 276 | `srv_open` (shipped: V4 — opener dups poster's srvfd into its own fd table) |
+| 287 | `fdslot_kind` (shipped: hamsh /fd-binding kernel-vs-userland coordination) |
+| 288 | `getuid` (shipped: Plan-9-shape uid accessor per `docs/security.md`) |
+| 289 | `getgid` (shipped: Plan-9-shape gid accessor per `docs/security.md`) |
+| 290 | `setuid` (shipped: hostowner-only — uid==1 caller may set its uid+gid to argument; used by `newshell` post-`/dev/auth` and by `svc` to drop privs before exec) |
+| 291 | `svc_publish` (shipped: hostowner-only — supervisor mirrors svc registry into `/proc/svc/<name>` for shell-grep inspection) |
 
 ## Things deliberately left out
 
@@ -534,9 +539,15 @@ moves break Linux ABI** (Layer 2 has its own dispatch table).
   Layer 2; Layer 1 has no mmap.
 - **`mmap` (file).** Plan 9 does not have it. Memory-mapped I/O
   patterns are translated to read/write by Layer 2 when needed.
-- **`setuid`/`setgid` family.** Plan 9 has no privilege levels in
-  the Unix sense; security is namespace-based (`bind` what the
-  process can see). Phase deferred.
+- **`setuid`/`setgid` family (Linux shape).** Plan 9 has no
+  privilege levels in the Unix sense; security is namespace-based
+  (`bind` what the process can see). Hamnix's own
+  `SYS_GETUID`/`SYS_GETGID`/`SYS_SETUID` (288/289/290) **exist**
+  but are deliberately **hostowner-only** — the `newshell` builtin
+  is the one legitimate userland path that calls `SYS_SETUID`,
+  after `/dev/auth` has authenticated the target user. There is
+  no setuid bit, no setgid bit, no setresuid family. The
+  Plan-9-shape model is documented in `docs/security.md`.
 - **Threading primitives** (`futex`, condition variables). Layer 2
   implements `futex` on top of `rendezvous` (`SYS_RENDEZVOUS`,
   9front `/sys/src/9/port/sysproc.c::sysrendezvous`) once that
