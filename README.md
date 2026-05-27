@@ -673,6 +673,16 @@ memory/          Orchestrator session memory (not in repo)
   (Layer 0..5), migration plan, per-subsystem layer assignment.
 - [`docs/native-api.md`](docs/native-api.md) — Plan 9-shape syscall
   reference + migration table.
+- [`docs/security.md`](docs/security.md) — Plan-9-shape security
+  model: hostowner, `/dev/auth` cdev, namespace-as-authority,
+  `newshell`, no setuid.
+- [`docs/packages.md`](docs/packages.md) — `hpm` (Hamnix package
+  manager) format spec; v1 shipped.
+- [`docs/rootfs_partition.md`](docs/rootfs_partition.md) — ext4
+  rootfs partition discovery, `.hamnix-roots` sentinel, named
+  file-server stacks, `#by-id/<partuuid>` aliases.
+- [`docs/HAMSH_SPEC.md`](docs/HAMSH_SPEC.md) — hamsh language +
+  shell reference.
 - [`docs/9p.md`](docs/9p.md) — 9P2000 wire spec.
 - [`docs/rio.md`](docs/rio.md) — file-based window system spec
   (Plan 9 rio shape).
@@ -686,7 +696,9 @@ memory/          Orchestrator session memory (not in repo)
   Debian `.ko` to the L-track.
 - [`docs/distro-namespaces.md`](docs/distro-namespaces.md) — Phase C.5
   distro-shape namespace design.
-- [`LANGUAGE.md`](LANGUAGE.md) — Adder language reference.
+- [`LANGUAGE.md`](LANGUAGE.md) — Adder language reference (symlink
+  into the [`HamnixOS/adder`](https://github.com/HamnixOS/adder)
+  submodule).
 - [`TODO.md`](TODO.md) — open work items, organised by layer.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — agent + human workflow.
 
