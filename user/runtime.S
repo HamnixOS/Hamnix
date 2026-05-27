@@ -646,6 +646,42 @@ sys_fdslot_kind:
     .size sys_fdslot_kind, .-sys_fdslot_kind
 
 
+    /* --- sys_getuid() -> uint32 --------------------------------------
+     * docs/security.md: Plan-9-shape uid. Returns the current task's
+     * uid widened to a 64-bit return (always fits in uint32). */
+    .globl sys_getuid
+    .type sys_getuid, @function
+sys_getuid:
+    movq    $288, %rax              /* SYS_GETUID */
+    syscall
+    ret
+    .size sys_getuid, .-sys_getuid
+
+
+    /* --- sys_getgid() -> uint32 -------------------------------------- */
+    .globl sys_getgid
+    .type sys_getgid, @function
+sys_getgid:
+    movq    $289, %rax              /* SYS_GETGID */
+    syscall
+    ret
+    .size sys_getgid, .-sys_getgid
+
+
+    /* --- sys_setuid(uid) -> int32 ------------------------------------
+     * Privileged: only the hostowner (uid 1) can call. The kernel
+     * gates with -EPERM otherwise. The only legitimate userland caller
+     * is hamsh's `newshell` builtin after authenticating against
+     * /etc/shadow. */
+    .globl sys_setuid
+    .type sys_setuid, @function
+sys_setuid:
+    movq    $290, %rax              /* SYS_SETUID */
+    syscall
+    ret
+    .size sys_setuid, .-sys_setuid
+
+
     /* --- sys_pipechan() -> int32 ------------------------------------
      * HAMSH §7: create a local pipe Chan pair; returns the pipe SLOT
      * id (NOT fds). The shell threads the slot into two sys_fdbind

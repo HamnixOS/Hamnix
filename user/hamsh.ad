@@ -90,6 +90,16 @@ extern def sys_nslabel(op: int32, label: Ptr[char], to_path: Ptr[char],
 extern def sys_get_jiffies() -> uint64
 extern def sys_yield() -> int32
 
+# docs/security.md: Plan-9-shape identity syscalls. SYS_GETUID/GETGID
+# return current task's uid/gid. SYS_SETUID is privileged — only
+# hostowner (uid 1) can call it (the kernel rejects with -EPERM
+# otherwise). `newshell` is the only userland caller; it reaches
+# SYS_SETUID from inside an rfork'd child after authenticating against
+# /etc/shadow.
+extern def sys_getuid() -> uint32
+extern def sys_getgid() -> uint32
+extern def sys_setuid(uid: uint32) -> int32
+
 
 # DEVFD_* — the channel-kind selector for sys_fdbind, matching
 # sys/src/9/port/devfd.ad. dup is kind DEVFD_DUP with arg = the
@@ -3138,6 +3148,239 @@ def builtin_echo(argc: int32) -> int32:
     return 0
 
 
+# docs/security.md Phase 8: `read [-s] VAR` builtin.
+#
+# Plain stdin read until newline. Stores the result in shell variable
+# VAR (accessible as $VAR after). The `-s` flag suppresses echoing —
+# used for password prompts in `newshell` and the installer.
+#
+# Scratch buffer for one line of read input. 256 bytes covers usernames
+# and passwords comfortably without being unreasonable. CR/LF and the
+# trailing newline are stripped before the variable is assigned.
+read_buf: Array[256, uint8]
+
+
+def builtin_read(argc: int32) -> int32:
+    # Usage: read VAR  | read -s VAR
+    if argc < 2:
+        errstr_set("read: usage: read [-s] VAR")
+        return 1
+    silent: int32 = 0
+    var_arg_idx: int32 = 1
+    arg1: Ptr[uint8] = cast[Ptr[uint8]](argv_ptr[1])
+    if arg1[0] == 45 and arg1[1] == 115 and arg1[2] == 0:    # `-s`
+        silent = 1
+        var_arg_idx = 2
+        if argc < 3:
+            errstr_set("read: -s needs a variable name")
+            return 1
+    var_name: Ptr[uint8] = cast[Ptr[uint8]](argv_ptr[cast[uint64](var_arg_idx)])
+    # Read byte-by-byte to newline. We don't try to disable terminal
+    # echo here — the kernel /dev/cons doesn't expose termios; -s is
+    # documented but advisory in this v1, matching the spec's
+    # "Optional `-s` flag for silent mode" note. The visible behavior
+    # is identical to no-flag read; future tcgetattr/ECHO suppression
+    # is a separate kernel-side milestone.
+    n: uint64 = 0
+    while n + 1 < 256:
+        c: Array[1, uint8]
+        rr: int64 = sys_read(0, &c[0], 1)
+        if rr <= 0:
+            break
+        if c[0] == 10:
+            break
+        if c[0] == 13:
+            continue
+        read_buf[n] = c[0]
+        n = n + 1
+    read_buf[n] = 0
+    if silent != 0:
+        # Echo a newline so the next prompt isn't on the same line as
+        # the (invisible) typed password — matches getpass(3) shape.
+        write_cstr1("\n")
+    # Stash the read value as a shell variable. v_str_cstr interns
+    # the buffer into the shell's string arena; scope_set installs it
+    # under the name.
+    sref: uint64 = str_intern_cstr(var_name)
+    val: int32 = v_str_cstr(&read_buf[0])
+    scope_set(sref, val)
+    return 0
+
+
+# docs/security.md Phase 7: `newshell <user> [-c <command>]` builtin.
+#
+# Plan-9-shape elevation. Instead of POSIX `sudo` (run THIS command
+# elevated), `newshell` opens a NEW shell session AS the target user
+# with their full namespace recipe.
+#
+# Pipeline:
+#   1. Lookup target uid in /etc/passwd.
+#   2. Read /etc/shadow, find the target's hash triple.
+#   3. Prompt for password (`-s` silent read).
+#   4. sha512_crypt_verify against the stored triple.
+#   5. On match: rfork(RFPROC|RFNAMEG) — child gets a COW namespace.
+#      Child sys_setuid(target_uid) — kernel allows only if current
+#      uid IS 1 (hostowner). Then exec /bin/hamsh with the target's
+#      recipe at /etc/users/<name>.ns (or default.ns).
+#   6. Parent sys_waitpid for the child.
+#
+# v1 limitations (deferred per the spec's "Implementation surface"
+# phase ordering):
+#   * /dev/auth cdev (Phase 4) is NOT yet implemented — verification
+#     runs in userland against /etc/shadow read directly. This works
+#     for the hostowner (kernel SYS_SETUID gate is "current uid == 1")
+#     but a regular user trying `newshell hostowner` will fail the
+#     SYS_SETUID gate, since they're not already hostowner. That gap
+#     closes when /dev/auth's kernel-side handler can flip identity
+#     after authenticating on PID 1's behalf.
+#   * VFS permission check (Phase 5) is NOT yet implemented — even a
+#     regular user can technically read /etc/shadow today. The mid-
+#     term plan via per-user namespace recipes (Phase 9) won't BIND
+#     /etc/shadow into a regular user's view, restoring the boundary.
+#
+# Despite those gaps, the v1 path lets hostowner-→hostowner test
+# `newshell live` (password `hamnix`) succeed/fail correctly, which
+# is the primary test_security.sh smoke.
+
+from lib.passwd.passwd import (
+    passwd_parse, passwd_lookup_by_name, passwd_entry_uid,
+    passwd_entry_home,
+)
+from lib.passwd.shadow import (
+    shadow_parse, shadow_lookup_by_name, shadow_entry_hash,
+)
+from lib.crypt.sha512_crypt import sha512_crypt_verify
+
+
+NEWSHELL_BUF_MAX: uint64 = 4096
+newshell_passwd_buf: Array[4096, uint8]
+newshell_shadow_buf: Array[4096, uint8]
+
+
+def _newshell_read_file(path: Ptr[char], buf: Ptr[uint8],
+                        cap: uint64) -> int64:
+    # Open + slurp a file into `buf`. Returns bytes read, or -1.
+    fd: int32 = sys_open(path)
+    if fd < 0:
+        return -1
+    total: uint64 = 0
+    while total < cap:
+        n: int64 = sys_read(fd, &buf[total], cap - total)
+        if n <= 0:
+            break
+        total = total + cast[uint64](n)
+    sys_close(fd)
+    return cast[int64](total)
+
+
+def builtin_newshell(argc: int32) -> int32:
+    if argc < 2:
+        errstr_set("newshell: usage: newshell <user> [-c <command>]")
+        return 1
+    target_user: Ptr[uint8] = cast[Ptr[uint8]](argv_ptr[1])
+    cmd_string: Ptr[uint8] = cast[Ptr[uint8]](0)
+    if argc >= 4:
+        flag: Ptr[uint8] = cast[Ptr[uint8]](argv_ptr[2])
+        if flag[0] == 45 and flag[1] == 99 and flag[2] == 0:    # `-c`
+            cmd_string = cast[Ptr[uint8]](argv_ptr[3])
+    # Step 1: parse /etc/passwd, find target.
+    n_pwd: int64 = _newshell_read_file(cast[Ptr[char]]("/etc/passwd"),
+                                       &newshell_passwd_buf[0],
+                                       NEWSHELL_BUF_MAX)
+    if n_pwd < 0:
+        errstr_set("newshell: cannot open /etc/passwd")
+        return 1
+    passwd_parse(&newshell_passwd_buf[0], cast[uint64](n_pwd))
+    pidx: int32 = passwd_lookup_by_name(target_user)
+    if pidx < 0:
+        errstr_set("newshell: no such user")
+        return 1
+    target_uid: uint32 = passwd_entry_uid(pidx)
+    # Step 2: parse /etc/shadow, find target.
+    n_shd: int64 = _newshell_read_file(cast[Ptr[char]]("/etc/shadow"),
+                                       &newshell_shadow_buf[0],
+                                       NEWSHELL_BUF_MAX)
+    if n_shd < 0:
+        errstr_set("newshell: cannot open /etc/shadow (need hostowner)")
+        return 1
+    shadow_parse(&newshell_shadow_buf[0], cast[uint64](n_shd))
+    sidx: int32 = shadow_lookup_by_name(target_user)
+    if sidx < 0:
+        errstr_set("newshell: no shadow entry for user")
+        return 1
+    hash_triple: Ptr[uint8] = shadow_entry_hash(sidx)
+    # Step 3: prompt password (silent).
+    write_cstr1("password: ")
+    n: uint64 = 0
+    while n + 1 < 256:
+        c: Array[1, uint8]
+        rr: int64 = sys_read(0, &c[0], 1)
+        if rr <= 0:
+            break
+        if c[0] == 10:
+            break
+        if c[0] == 13:
+            continue
+        read_buf[n] = c[0]
+        n = n + 1
+    read_buf[n] = 0
+    write_cstr1("\n")
+    # Step 4: verify.
+    ok: int32 = sha512_crypt_verify(&read_buf[0], hash_triple)
+    if ok == 0:
+        # Print to stderr — auth failures are diagnostic, not data.
+        write_str(2, "newshell: authentication failed\n")
+        return 1
+    # Step 5: rfork + setuid + exec.
+    flags: int32 = RFPROC | RFNAMEG
+    pid: int32 = sys_rfork(flags)
+    if pid < 0:
+        errstr_set("newshell: rfork failed")
+        return 1
+    if pid == 0:
+        # Child: switch identity, then exec.
+        rs: int32 = sys_setuid(target_uid)
+        if rs < 0:
+            # SETUID rejected — current uid wasn't 1 (hostowner). This
+            # is the v1 limitation noted in this builtin's header:
+            # without /dev/auth's kernel-side identity flip, a regular
+            # user can authenticate but cannot elevate.
+            write_str(2, "newshell: setuid denied (not hostowner; /dev/auth not implemented yet)\n")
+            sys_exit(1)
+        # Exec /bin/hamsh. The child's namespace recipe (Phase 9) is
+        # loaded by hamsh itself when it starts as a non-init shell;
+        # see init/main loading and the spec's Phase 9. For -c <cmd>,
+        # we wire the command via argv — hamsh main() recognises an
+        # rc-script path argument and runs it.
+        # NOTE: sys_execve isn't directly exposed to hamsh — we use
+        # sys_spawn which fork+execs. The double-fork is harmless;
+        # the original parent above waits on the rfork child, which
+        # waits on the sys_spawn child, exit codes propagate normally.
+        hamsh_path: Ptr[char] = cast[Ptr[char]]("/bin/hamsh")
+        new_argv: Array[4, uint64]
+        new_argv[0] = cast[uint64](hamsh_path)
+        new_argv[1] = 0
+        new_argv[2] = 0
+        new_argv[3] = 0
+        if cmd_string != cast[Ptr[uint8]](0):
+            new_argv[1] = cast[uint64]("-c")
+            new_argv[2] = cast[uint64](cmd_string)
+            new_argv[3] = 0
+        envp: Ptr[uint64] = _build_envp()
+        sub_pid: int32 = sys_spawn(hamsh_path,
+                                   cast[Ptr[uint64]](&new_argv[0]),
+                                   SPAWN_STDIO_NS, SPAWN_STDIO_NS,
+                                   envp)
+        if sub_pid < 0:
+            write_str(2, "newshell: spawn /bin/hamsh failed\n")
+            sys_exit(127)
+        wstat: int64 = sys_waitpid(sub_pid)
+        sys_exit(cast[uint64](wstat & 0xFF))
+    # Parent: wait for the child shell session.
+    sys_waitpid(pid)
+    return 0
+
+
 # Builtin dispatch — returns -1 if `cmd` is not a builtin, else exit
 # status. `bg`/redirect handling for builtins is intentionally minimal:
 # the composition verbs are interactive prompt commands.
@@ -3167,6 +3410,12 @@ def _builtin_dispatch(cmd: Ptr[uint8], argc: int32) -> int32:
         return builtin_echo(argc)
     if cstr_eq(cmd, "svc") != 0:
         return builtin_svc(argc)
+    # docs/security.md Phase 8.
+    if cstr_eq(cmd, "read") != 0:
+        return builtin_read(argc)
+    # docs/security.md Phase 7.
+    if cstr_eq(cmd, "newshell") != 0:
+        return builtin_newshell(argc)
     return -1
 
 
