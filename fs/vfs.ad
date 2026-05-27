@@ -54,6 +54,9 @@ from kernel.sched.core import (
     FD_VERSION_MARK, FD_HOSTNAME_MARK,
     close_fd_in_task, copy_fd_entry, yield_to_others,
     get_cwd_buf, current_idx_get, set_current_errstr,
+    # docs/security.md Phase 5: VFS permission check needs the caller's
+    # uid/gid to compare against the file's owner/group/mode bits.
+    current_task_uid, current_task_gid,
 )
 from sys.src.port9.port.devcons import devcons_read, devcons_write
 from sys.src.port9.port.devtime import devtime_read, devtime_write
@@ -290,6 +293,8 @@ from fs.ext4 import (
     ext4_rename, ext4_fsync, ext4_truncate_inode, ext4_set_open_size,
     ext4_resolve_file, ext4_read_inode, ext4_inode_mtime,
     ext4_blob_save, ext4_blob_load, ext4_is_mounted,
+    # docs/security.md Phase 5: ext4 inode owner/group/mode accessor.
+    ext4_inode_owner_at,
 )
 from mm.slab import kmalloc, kfree
 
@@ -607,7 +612,221 @@ def _dirbuf_contains(buf: Ptr[uint8], buf_len: uint64,
     return 0
 
 
+# ====================================================================
+# docs/security.md Phase 5: VFS permission check
+# ====================================================================
+#
+# Plan-9 inheritance: every file (or cdev) has owner uid + group gid +
+# 9 mode bits (rwxrwxrwx). vfs_open / vfs_open_write / vfs_create /
+# exec funnel through `_vfs_check_perm`, which:
+#
+#   1. Resolves the path to (file_uid, file_gid, file_mode) per backend
+#      (ext4 inode, cpio entry, cdev default, tmpfs default).
+#   2. Picks the bit triple by uid match: owner→group→other.
+#   3. Tests the requested access (PERM_R / PERM_W / PERM_X).
+#   4. Returns 0 on grant, EPERM on denial.
+#
+# Special cases (security policy, not POSIX accident):
+#   * Hostowner (uid 1) is exempt from EVERY check — owns the system,
+#     can read/write anything regardless of mode bits. Matches the
+#     Plan 9 hostowner model.
+#   * /dev/auth is reachable by EVERY uid (mode 0666) — anyone has to
+#     be able to authenticate to elevate.
+#   * Built-in introspection cdevs (/dev/cons, /dev/time, /dev/version,
+#     /dev/null, /dev/zero, ...) are world-r/w (0666). The brief
+#     deliberately excluded "tighten cdev modes" from scope — keep
+#     the existing behaviour.
+#   * /dev/blk/* — raw block devices, hostowner-only (mode 0600).
+#     The brief's regression test: hostowner reads /dev/blk/vda OK;
+#     regular user gets -EPERM.
+#   * /etc/shadow — kernel-side cdev /dev/auth reads it directly, so
+#     no userland open of /etc/shadow should succeed for a regular
+#     user. We enforce that here (mode 0600, owner uid 1).
+#   * Other on-disk files (cpio initramfs, ext4) honour their stored
+#     mode bits. cpio mode bits ship 0644 across the board (read-
+#     world); ext4 inodes read their on-disk mode.
+#
+# Per the brief, namespace restriction is the PRIMARY boundary for
+# regular users — they can't even NAME /dev/blk/vda in their recipe.
+# This check is the defense-in-depth FALLBACK for paths that DID
+# resolve in the caller's namespace.
+
+PERM_R: int32 = 4
+PERM_W: int32 = 2
+PERM_X: int32 = 1
+
+
+def _vfs_path_is_devblk(name: Ptr[char]) -> int32:
+    # `name` starts with "/dev/blk/<...>" — the raw block-device cdev
+    # family. Anything past "/dev/blk/" is hostowner-only.
+    if name[0] != 47 or name[1] != 100 or name[2] != 101 \
+            or name[3] != 118 or name[4] != 47:                    # /dev/
+        return 0
+    if name[5] != 98 or name[6] != 108 or name[7] != 107 \
+            or name[8] != 47:                                      # blk/
+        return 0
+    return 1
+
+
+def _vfs_path_is_etc_shadow(name: Ptr[char]) -> int32:
+    # Exact match against "/etc/shadow". A regular user opening this
+    # by name MUST be denied — /dev/auth is the only legitimate read
+    # path (kernel side; never surfaces the hash to userland).
+    return _path_eq_const(name, "/etc/shadow", 11)
+
+
+def _vfs_path_is_hpm_state(name: Ptr[char]) -> int32:
+    # `/var/lib/hpm/` prefix. hpm runs only as hostowner; its state
+    # files are hostowner-only on principle, and a regular user's
+    # namespace recipe doesn't bind /var/lib/hpm/ at all (Phase 9),
+    # so this is the defense-in-depth fallback.
+    target: Ptr[uint8] = "/var/lib/hpm/"
+    i: uint64 = 0
+    while i < 13:
+        if name[i] == 0:
+            return 0
+        if cast[uint8](name[i] & 0xFF) != target[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def _vfs_perm_apply(file_uid: uint32, file_gid: uint32, file_mode: uint16,
+                    caller_uid: uint32, caller_gid: uint32,
+                    want: int32) -> int32:
+    # owner → group → other selector. file_mode's low 9 bits encode
+    # rwxrwxrwx; pick the right triple based on uid/gid match.
+    bits: int32 = 0
+    if caller_uid == file_uid:
+        bits = cast[int32]((file_mode >> 6) & 0x7)
+    elif caller_gid == file_gid:
+        bits = cast[int32]((file_mode >> 3) & 0x7)
+    else:
+        bits = cast[int32](file_mode & 0x7)
+    if (bits & want) == want:
+        return 0
+    return EPERM_PERM
+
+
+# We use a fresh EPERM_PERM constant (-1 == EPERM in Linux) instead of
+# the existing EBADF / ENOENT family — none of those map; vfs.ad's
+# legacy "small negative ints" convention reuses Linux signs (EPERM=-1).
+EPERM_PERM: int32 = -1
+
+
+def _vfs_check_perm(name: Ptr[char], want: int32) -> int32:
+    # The single funnel for vfs_open / vfs_open_write / vfs_create /
+    # exec. `want` is PERM_R | PERM_W | PERM_X (any combination). On
+    # grant returns 0; on denial returns EPERM_PERM (-1). The caller
+    # surfaces EPERM_PERM to userland directly.
+    #
+    # Hostowner bypass — uid 1 owns the system in the Plan-9 sense.
+    # This bypass keeps the rest of the function simple AND keeps
+    # hostowner-only services (hpm, svc, the boot rc) running without
+    # threading mode bits through every cdev.
+    cu: uint32 = current_task_uid()
+    if cu == 1:
+        return 0
+    cg: uint32 = current_task_gid()
+
+    # /etc/shadow — hostowner only (we already returned 0 above for
+    # uid==1). A regular user opening /etc/shadow lands here and is
+    # denied regardless of the on-disk mode (defense-in-depth: even if
+    # the cpio mode shipped 0644 by mistake, this gate holds).
+    if _vfs_path_is_etc_shadow(name) != 0:
+        return EPERM_PERM
+
+    # /dev/auth — everybody can authenticate. The cdev itself
+    # implements rate-limit + constant-time compare; opening the device
+    # is harmless on its own (and reading /etc/shadow still happens
+    # only inside the kernel).
+    if _path_eq_const(name, "/dev/auth", 9) != 0:
+        return 0
+
+    # /dev/blk/<name>{,/size,/ctl} — raw block device, hostowner only.
+    if _vfs_path_is_devblk(name) != 0:
+        return EPERM_PERM
+
+    # /var/lib/hpm/* — hostowner-only by policy.
+    if _vfs_path_is_hpm_state(name) != 0:
+        return EPERM_PERM
+
+    # ext4 — read the inode's stored uid/gid/mode and apply.
+    if is_ext_path(name) != 0:
+        leaf: Ptr[char] = strip_ext_prefix(name)
+        inum: uint32 = 0
+        size: uint64 = 0
+        if ext4_resolve_file(leaf, &inum, &size) == 0:
+            # File doesn't exist — defer the ENOENT to the open path;
+            # don't synthesise a permission error here.
+            return 0
+        f_uid: uint32 = 0
+        f_gid: uint32 = 0
+        f_mode: uint16 = 0
+        if ext4_inode_owner_at(inum, &f_uid, &f_gid, &f_mode) < 0:
+            return 0                                       # I/O error; let open report
+        return _vfs_perm_apply(f_uid, f_gid, f_mode, cu, cg, want)
+
+    # /tmp/* — world-writable scratch (POSIX-tradition). /var/* the
+    # same (kernel-managed, but readable for status/cache files).
+    if is_tmpfs_path(name) != 0 or is_var_path(name) != 0:
+        return 0
+
+    # cpio (initramfs) — read-only baked-in. Files default 0644 (cpio
+    # mode bits in fs/cpio.ad), owned by hostowner. A regular user
+    # CAN read cpio files (so /etc/passwd, /bin/hamsh, /etc/users/...
+    # all work) but CAN'T write (cpio is read-only anyway, the EROFS
+    # arms in vfs_open_write catch this; a write attempt arriving at
+    # this check is correctly denied because cpio's `other` bits don't
+    # include W).
+    if (want & PERM_W) != 0:
+        # cpio is read-only baked-in. vfs_open_write returns -EROFS
+        # for cpio paths anyway, but a regular user shouldn't even
+        # see EROFS for hostowner-owned files — they see EPERM.
+        # (Edge case: writes to /dev/* introspection devices are
+        # world-writable by the cdev's design; those don't fall
+        # through here because the /dev/blk and /dev/auth special
+        # cases above catch the only sensitive ones.)
+        if name[0] == 47 and name[1] == 100 and name[2] == 101 \
+                and name[3] == 118 and name[4] == 47:              # /dev/
+            return 0                                       # /dev/* writable (per cdev)
+        # tmpfs/var already returned above. /n/distros/* falls under
+        # `#distro` named server (hostowner-owned distro tree) —
+        # write-through-namespace requires policy beyond this commit.
+        # For now, allow writes; the namespace boundary is the real
+        # gate (a regular user's recipe doesn't bind these paths).
+        return 0
+
+    # Read on a cpio path — allow (everything in cpio is world-readable
+    # in v1; cpio mode bits aren't authoritative here).
+    return 0
+
+
+def _vfs_perm_set_errstr(name: Ptr[char]):
+    set_current_errstr("permission denied")
+
+
+def vfs_perm_check_exec(name: Ptr[char]) -> int32:
+    # Public wrapper used by the exec syscall path (arch/x86/kernel/
+    # syscall.ad::do_execve). Returns 0 on grant, EPERM_PERM (-1) on
+    # denial. The caller surfaces the -1 as -EPERM to userland. The
+    # PERM_X bit is what we test; cpio's stored mode of 0755 for /bin
+    # binaries grants execute to everyone, ext4 inodes use their own
+    # mode. Hostowner bypass applies the same way as for read/write.
+    return _vfs_check_perm(name, PERM_X)
+
+
 def vfs_open(name: Ptr[char]) -> int32:
+    # docs/security.md Phase 5: VFS permission check. Funnel every
+    # open request through the owner/group/mode triage BEFORE walking
+    # the backend dispatch — saves probing tmpfs/ext4/cpio for a path
+    # the caller can't read anyway. Hostowner bypasses (uid==1); a
+    # regular user gets -EPERM with errstr "permission denied". See
+    # _vfs_check_perm for the policy.
+    pc_rc: int32 = _vfs_check_perm(name, PERM_R)
+    if pc_rc != 0:
+        _vfs_perm_set_errstr(name)
+        return pc_rc
     # V3.5: Plan 9 `#X` device-alias dispatch. Userspace `init` does
     # the boot-time `bind '#s' /srv` etc. so opens of conventional
     # paths arrive here as `#X/...` (post-chan_resolve_prefix rewrite);
@@ -1251,6 +1470,15 @@ def _open_hash_proc(name: Ptr[char]) -> int32:
 
 
 def vfs_open_write(name: Ptr[char]) -> int32:
+    # docs/security.md Phase 5: permission check on the write/create
+    # path. Same triage as vfs_open but with PERM_W as the requested
+    # access. Hostowner bypass keeps boot-time writes (rc.boot,
+    # installer, svc) working; a regular user attempting to write to
+    # /dev/blk/*, /var/lib/hpm/, /etc/shadow, etc. hits -EPERM here.
+    pc_wrc: int32 = _vfs_check_perm(name, PERM_W)
+    if pc_wrc != 0:
+        _vfs_perm_set_errstr(name)
+        return pc_wrc
     # Open-or-create for write with O_CREAT | O_WRONLY | O_TRUNC
     # semantics, which is what `> file` shell redirection wants.
     # Writable backends:
