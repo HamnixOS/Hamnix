@@ -1,0 +1,209 @@
+# user/install_file_to_slot.ad
+#
+# Push a regular file from the local filesystem onto a NOT-currently-
+# mounted ext4 partition via the /dev/blk/<dev>/ctl "install_file"
+# verb. This is the multi-package installer's replacement for dd_blk:
+# each `hpm install` extracts to a staging dir, then this tool copies
+# each extracted file onto the freshly-formatted target partition WITHOUT
+# clobbering anything previously installed (which is what a dd_blk
+# of one full ESP-or-rootfs partition would do).
+#
+# The kernel side (fs/ext4.ad::ext4_install_file_to_slot + the new
+# "install_file" ctl verb in sys/src/9/port/devblk.ad) save/restores
+# the live ext4 singleton state around the call, so the running FS
+# is unaffected even mid-multi-package-install.
+#
+# Usage:
+#   /bin/install_file_to_slot /dev/blk/vdbp2 from_a.txt /tmp/from_a.txt
+#
+# Arguments:
+#   argv[1]   target partition cdev (e.g. /dev/blk/vdbp2)
+#   argv[2]   file name AT THE TARGET'S ROOT (no leading '/'; the
+#             ext4 root dir is the only supported placement in v1)
+#   argv[3]   local-namespace source path to read the body from
+#
+# Exit status: 0 on success, 1 on any error.
+
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+
+
+# 4 MiB ceiling on the body. The kernel-side writer (ext4_blob_save)
+# packs the file into an inline depth-0 extent leaf (eh_max=4) and
+# coalesces contiguous runs into a single extent; on a freshly-
+# formatted target the alloc_block walk hands back consecutive blocks,
+# so 4 MiB is well inside the leaf's capacity. v1 packages are all
+# orders of magnitude smaller.
+MAX_BODY: uint64 = 4194304
+body_buf: Array[4194304, uint8]
+
+# Header + body composing scratch. Sized to MAX_BODY + a generous
+# 256-byte header.
+HDR_MAX: uint64 = 256
+WRITE_MAX: uint64 = 4194560                       # MAX_BODY + HDR_MAX
+write_buf: Array[4194560, uint8]
+
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+def strcpy(dst: Ptr[uint8], src: Ptr[uint8]) -> uint64:
+    i: uint64 = 0
+    while src[i] != 0:
+        dst[i] = src[i]
+        i = i + 1
+    dst[i] = 0
+    return i
+
+
+def render_u64(v: uint64, out: Ptr[uint8]) -> uint64:
+    # Decimal render of `v` at `out`; no NUL terminator. Returns the
+    # number of bytes written.
+    if v == 0:
+        out[0] = 48
+        return 1
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    while v != 0:
+        digits[n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    written: uint64 = n
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    return written
+
+
+def read_full(fd: int32, buf: Ptr[uint8], cap: uint64) -> int64:
+    # Read up to `cap` bytes from `fd` into `buf`. Returns the total
+    # bytes read on EOF, -1 on read error. Loops on short reads.
+    total: uint64 = 0
+    while total < cap:
+        n: int64 = sys_read(fd, cast[Ptr[uint8]](
+            cast[uint64](buf) + total), cap - total)
+        if n < 0:
+            return cast[int64](-1)
+        if n == 0:
+            break
+        total = total + cast[uint64](n)
+    return cast[int64](total)
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    if argc < 4:
+        write_str(2, "usage: install_file_to_slot <devpath> <target_name> <local_file>\n")
+        return 1
+    devpath:     Ptr[uint8] = cast[Ptr[uint8]](argv[1])
+    target_name: Ptr[uint8] = cast[Ptr[uint8]](argv[2])
+    src_path:    Ptr[uint8] = cast[Ptr[uint8]](argv[3])
+
+    # Validate target name: non-empty, no slashes (root-dir scope).
+    name_len: uint64 = strlen_u8(target_name)
+    if name_len == 0 or name_len > 255:
+        write_str(2, "install_file_to_slot: bad target name length\n")
+        return 1
+    nci: uint64 = 0
+    while nci < name_len:
+        if target_name[nci] == 47:                # '/'
+            write_str(2, "install_file_to_slot: target name must not contain '/' (root-dir scope only)\n")
+            return 1
+        nci = nci + 1
+
+    # Slurp the source file into body_buf.
+    src_fd: int32 = sys_open(cast[Ptr[char]](src_path))
+    if src_fd < 0:
+        write_str(2, "install_file_to_slot: cannot open ")
+        write_str(2, src_path)
+        write_str(2, "\n")
+        return 1
+    body_n: int64 = read_full(src_fd, &body_buf[0], MAX_BODY)
+    sys_close(src_fd)
+    if body_n < 0:
+        write_str(2, "install_file_to_slot: read failed on ")
+        write_str(2, src_path)
+        write_str(2, "\n")
+        return 1
+    body_len: uint64 = cast[uint64](body_n)
+    if body_len == MAX_BODY:
+        # Likely truncated — sys_read returned a full buffer. v1
+        # bounds at 4 MiB per file; bigger packages must split.
+        # We accept the truncation case as "file is exactly 4 MiB"
+        # but warn so a regression isn't silent.
+        write_str(2, "install_file_to_slot: warning: file size at or above 4 MiB cap; install may be truncated\n")
+
+    # Build the install_file ctl message at write_buf[0..]:
+    #   "install_file <name> <size>\n<body>"
+    cmd_lit: Ptr[uint8] = "install_file "
+    cmd_len: uint64 = 13
+    pos: uint64 = 0
+    i: uint64 = 0
+    while i < cmd_len:
+        write_buf[pos] = cmd_lit[i]
+        pos = pos + 1
+        i = i + 1
+    # Name.
+    j: uint64 = 0
+    while j < name_len:
+        write_buf[pos] = target_name[j]
+        pos = pos + 1
+        j = j + 1
+    write_buf[pos] = 32                           # ' '
+    pos = pos + 1
+    # Size (decimal).
+    sd: uint64 = render_u64(body_len,
+                            cast[Ptr[uint8]](
+                                cast[uint64](&write_buf[0]) + pos))
+    pos = pos + sd
+    write_buf[pos] = 10                           # '\n'
+    pos = pos + 1
+    # Body.
+    k: uint64 = 0
+    while k < body_len:
+        write_buf[pos + k] = body_buf[k]
+        k = k + 1
+    pos = pos + body_len
+
+    # Open <devpath>/ctl, single write, close.
+    ctl_path: Array[64, uint8]
+    dp_n: uint64 = strcpy(&ctl_path[0], devpath)
+    suffix: Ptr[uint8] = "/ctl"
+    sj: uint64 = 0
+    while suffix[sj] != 0 and dp_n + sj < 63:
+        ctl_path[dp_n + sj] = suffix[sj]
+        sj = sj + 1
+    ctl_path[dp_n + sj] = 0
+    ctl_fd: int32 = sys_open_write(cast[Ptr[char]](&ctl_path[0]))
+    if ctl_fd < 0:
+        write_str(2, "install_file_to_slot: cannot open ")
+        write_str(2, &ctl_path[0])
+        write_str(2, "\n")
+        return 1
+    wn: int64 = sys_write(ctl_fd, &write_buf[0], pos)
+    sys_close(ctl_fd)
+    if wn < 0:
+        write_str(2, "install_file_to_slot: kernel install_file rejected the install\n")
+        return 1
+    write_str(1, "install_file_to_slot: ")
+    write_str(1, devpath)
+    write_str(1, " <- ")
+    write_str(1, target_name)
+    write_str(1, " (")
+    sizebuf: Array[24, uint8]
+    sb_n: uint64 = render_u64(body_len, &sizebuf[0])
+    sys_write(1, &sizebuf[0], sb_n)
+    write_str(1, " bytes) OK\n")
+    return 0
