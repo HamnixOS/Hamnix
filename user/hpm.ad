@@ -1,0 +1,2010 @@
+# user/hpm.ad
+#
+# Hamnix package manager (hpm) — v1, binary-only.
+#
+# Spec: docs/packages.md. Live repo: https://255.one/index.json.
+#
+# Phase 1 (this commit): the read-only commands.
+#   hpm refresh                — fetch repo index, cache it locally
+#   hpm list                   — print every installed package (from
+#                                /var/lib/hpm/installed.json)
+#   hpm search <pattern>       — substring match against repo names
+#   hpm show <name>[@<ver>]    — print the package's index metadata
+#
+# Later phases add install / hooks / remove / dep solver / update.
+#
+# Repo URLs supported:
+#   https://host[:port][/path]  — TLS via the /net file tree
+#   http://host[:port][/path]   — plain TCP via /net
+#   file:///abs/path/           — local-filesystem repo (read via sys_open)
+#
+# The default is the canonical hosted repo `https://255.one/`. Override
+# with `--repo=<url>` (or `HPM_REPO=...` env). The installer ISO uses a
+# `file:///mnt/iso-packages/` repo (see docs/packages.md "Bootstrap").
+#
+# Files this binary touches:
+#   /tmp/hpm/index.json        — refreshed index cache (volatile, tmpfs)
+#   /tmp/hpm/<tarball>         — staging .tar.gz downloads (Phase 2)
+#   /var/lib/hpm/installed.json — installed-package DB (persistent /var)
+#
+# Compiler-quirk discipline (memory/feedback_compiler_quirks.md U9):
+# every large buffer is a top-level BSS Array — never a frame local.
+# String literals are materialised inline at the call site (the x86_64
+# backend rejects string-literal globals).
+#
+# Build: scripts/build_user.sh -> build/user/hpm.elf -> /bin/hpm.
+# Test:  scripts/test_hpm.sh (Phase 6).
+
+# Reuse the Plan-9-shaped /net dialing helpers from user/net9.ad — the
+# same shape user/apt.ad used before retirement.
+from user.net9 import net_dial, net_dial_tls
+
+
+# -- syscalls ----------------------------------------------------------
+#
+# Plain file + spawn syscalls; networking goes through net_dial / the
+# returned fd (sys_read / sys_write on a /net data fd is transparent
+# TCP or TLS).
+
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_mkdir(path: Ptr[char]) -> int32
+extern def sys_unlink(path: Ptr[char]) -> int32
+# U-resolve: native-ABI hostname -> IPv4 via the in-kernel DNS resolver
+# (drivers/net/dns.ad, syscall 269). Returns the IPv4 packed big-endian
+# in the low 32 bits (octet 0 in bits 31:24), or negative errno.
+extern def sys_resolve(hostname: Ptr[uint8], hlen: uint64) -> int64
+# Hooks are spawned as `/bin/hamsh <hook-script>` — hamsh's argv[1] is
+# a script path (see user/hamsh.ad main()).
+extern def sys_spawn(path: Ptr[char], argv: Ptr[uint64],
+                     stdin_fd: int32, stdout_fd: int32,
+                     envp: Ptr[uint64]) -> int32
+extern def sys_waitpid(pid: int32) -> int64
+
+
+# -- bounded BSS arenas -----------------------------------------------
+#
+# All large buffers MUST be top-level BSS (the U9 nested-frame-Array
+# miscompile). Sizes chosen to fit a small fixture repo AND the live
+# https://255.one/index.json (~800 bytes today; capped at 256 KiB so a
+# growing index has room).
+
+INDEX_CAP:   uint64 = 262144     # 256 KiB cap on a fetched index.json
+HTTP_STAGE:  uint64 = 65536      # 64 KiB socket-drain chunk
+TARBALL_CAP: uint64 = 4194304    # 4 MiB cap on a single package tarball
+TAR_CAP:     uint64 = 8388608    # 8 MiB cap on the inflated tar
+INSTALLED_CAP: uint64 = 131072   # 128 KiB cap on installed.json
+
+# Raw bytes off the socket / file when fetching a body (index.json or
+# a tarball). Used in both _http_get and _file_read paths.
+http_buf:    Array[262144, uint8]
+http_stage:  Array[65536, uint8]
+
+# Index cache. Loaded on every `hpm` invocation from /tmp/hpm/index.json
+# (or freshly fetched on `hpm refresh`). The JSON parser indexes ONTO
+# this buffer — package fields are pointers + lengths into idx_buf.
+idx_buf:     Array[262144, uint8]
+idx_len:     uint64 = 0
+
+# installed.json buffer.
+inst_buf:    Array[131072, uint8]
+inst_len:    uint64 = 0
+
+# Tarball download + inflate buffers (Phase 2).
+deb_buf:     Array[4194304, uint8]
+tar_buf:     Array[8388608, uint8]
+
+
+# -- URL / path scratch -----------------------------------------------
+
+host_buf:    Array[256, uint8]           # NUL-terminated hostname
+path_buf:    Array[1024, uint8]          # base path (no trailing /)
+url_path_buf: Array[1536, uint8]         # composed absolute path for GET
+req_buf:     Array[1024, uint8]          # HTTP request line + headers
+# url_scheme: 0 == http, 1 == https, 2 == file
+url_scheme:  int32 = 0
+url_port:    int64 = 80
+
+# Repo base URL — set by _set_repo_default or `--repo=<url>` flag. This
+# is a NUL-terminated copy of the canonical form (so messages can echo
+# it back); the parsed pieces live in host_buf / path_buf / url_scheme.
+repo_url_buf: Array[1024, uint8]
+
+
+# -- tiny stdio helpers (mirrors apt.ad/dpkg_deb.ad) ------------------
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+def write_dec_u64(fd: int32, value: uint64):
+    if value == 0:
+        sys_write(fd, "0", 1)
+        return
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    v: uint64 = value
+    while v != 0:
+        digits[n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    out: Array[24, uint8]
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    sys_write(fd, &out[0], i)
+
+
+def _write_full(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
+    written: uint64 = 0
+    while written < count:
+        room: uint64 = count - written
+        ptr: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](buf) + written)
+        rc: int64 = sys_write(fd, ptr, room)
+        if rc < 0:
+            return rc
+        if rc == 0:
+            return cast[int64](written)
+        written = written + cast[uint64](rc)
+    return cast[int64](written)
+
+
+def _streq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while a[i] != 0 and b[i] != 0:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    if a[i] == 0 and b[i] == 0:
+        return 1
+    return 0
+
+
+def _streq_n(a: Ptr[uint8], b: Ptr[uint8], n: uint64) -> int32:
+    # Compare exactly n bytes (treats embedded NULs as bytes, not
+    # terminators) — used by the JSON parser to compare a span in
+    # idx_buf to a literal field name like "name" / "version".
+    i: uint64 = 0
+    while i < n:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def _strcontains(hay: Ptr[uint8], needle: Ptr[uint8]) -> int32:
+    # Substring match for `hpm search` — true if needle appears anywhere
+    # in hay. Both NUL-terminated, case-sensitive (mirrors apt-cache).
+    hl: uint64 = strlen_u8(hay)
+    nl: uint64 = strlen_u8(needle)
+    if nl == 0:
+        return 1
+    if nl > hl:
+        return 0
+    i: uint64 = 0
+    while i + nl <= hl:
+        j: uint64 = 0
+        ok: int32 = 1
+        while j < nl:
+            if hay[i + j] != needle[j]:
+                ok = 0
+                break
+            j = j + 1
+        if ok != 0:
+            return 1
+        i = i + 1
+    return 0
+
+
+def _strcopy_n(dst: Ptr[uint8], src: Ptr[uint8], n: uint64, cap: uint64):
+    # Copy exactly n bytes (or until cap-1 reached), NUL-terminate.
+    take: uint64 = n
+    if take >= cap:
+        take = cap - 1
+    i: uint64 = 0
+    while i < take:
+        dst[i] = src[i]
+        i = i + 1
+    dst[take] = 0
+
+
+def _strcopy_cstr(dst: Ptr[uint8], src: Ptr[uint8], cap: uint64):
+    # Copy a NUL-terminated string, capping at cap-1 bytes.
+    i: uint64 = 0
+    while src[i] != 0 and i + 1 < cap:
+        dst[i] = src[i]
+        i = i + 1
+    dst[i] = 0
+
+
+# -- URL parsing -------------------------------------------------------
+#
+# Same shape as apt's _parse_url, extended with the file:// scheme.
+# Sets url_scheme, url_port, host_buf, path_buf. Returns 0 on success,
+# -1 on a malformed URL (diagnostic printed).
+
+def _parse_url(url: Ptr[uint8]) -> int32:
+    https_pfx: Ptr[uint8] = "https://"
+    http_pfx:  Ptr[uint8] = "http://"
+    file_pfx:  Ptr[uint8] = "file://"
+
+    # Probe longest-first.
+    a: uint64 = 0
+    is_https: int32 = 1
+    i: uint64 = 0
+    while i < 8:
+        if url[i] != https_pfx[i]:
+            is_https = 0
+            break
+        i = i + 1
+    if is_https != 0:
+        url_scheme = 1
+        a = 8
+    else:
+        is_file: int32 = 1
+        i = 0
+        while i < 7:
+            if url[i] != file_pfx[i]:
+                is_file = 0
+                break
+            i = i + 1
+        if is_file != 0:
+            url_scheme = 2
+            a = 7
+            # For file://, treat the rest as path_buf directly (no host).
+            host_buf[0] = 0
+            po: uint64 = 0
+            m: uint64 = a
+            while url[m] != 0 and po + 1 < 1024:
+                path_buf[po] = url[m]
+                po = po + 1
+                m = m + 1
+            # Trim trailing slash so joins yield clean "<path>/foo".
+            while po > 0 and path_buf[po - 1] == 47:
+                po = po - 1
+            path_buf[po] = 0
+            url_port = 0
+            return 0
+        # Plain http://
+        is_http: int32 = 1
+        i = 0
+        while i < 7:
+            if url[i] != http_pfx[i]:
+                is_http = 0
+                break
+            i = i + 1
+        if is_http == 0:
+            write_str(2, "hpm: only https://, http://, file:// URLs supported\n")
+            return -1
+        url_scheme = 0
+        a = 7
+
+    # Authority spans from `a` up to the first '/' or NUL.
+    auth_end: uint64 = a
+    while url[auth_end] != 0 and url[auth_end] != 47:
+        auth_end = auth_end + 1
+
+    colon: uint64 = a
+    have_colon: int32 = 0
+    j: uint64 = a
+    while j < auth_end:
+        if url[j] == 58:                                 # ':'
+            colon = j
+            have_colon = 1
+            break
+        j = j + 1
+
+    host_end: uint64 = auth_end
+    if have_colon != 0:
+        host_end = colon
+    if host_end <= a:
+        write_str(2, "hpm: malformed URL (empty host)\n")
+        return -1
+
+    ho: uint64 = 0
+    k: uint64 = a
+    while k < host_end and ho + 1 < 256:
+        host_buf[ho] = url[k]
+        ho = ho + 1
+        k = k + 1
+    host_buf[ho] = 0
+
+    port: int64 = 80
+    if url_scheme != 0:
+        port = 443
+    if have_colon != 0:
+        port = 0
+        p: uint64 = colon + 1
+        if p >= auth_end:
+            write_str(2, "hpm: malformed URL (empty port)\n")
+            return -1
+        while p < auth_end:
+            c: uint8 = url[p]
+            if c < 48 or c > 57:
+                write_str(2, "hpm: malformed URL (non-numeric port)\n")
+                return -1
+            port = port * 10 + cast[int64](c - 48)
+            if port > 65535:
+                write_str(2, "hpm: malformed URL (port out of range)\n")
+                return -1
+            p = p + 1
+    url_port = port
+
+    po: uint64 = 0
+    m: uint64 = auth_end
+    while url[m] != 0 and po + 1 < 1024:
+        path_buf[po] = url[m]
+        po = po + 1
+        m = m + 1
+    while po > 0 and path_buf[po - 1] == 47:
+        po = po - 1
+    path_buf[po] = 0
+
+    return 0
+
+
+# -- DNS / IPv4 literal resolution -------------------------------------
+#
+# Lifted from user/apt.ad — dotted-quad fast path, fall through to
+# sys_resolve for DNS names.
+
+def _parse_ipv4(out0: Ptr[uint8], out1: Ptr[uint8],
+                out2: Ptr[uint8], out3: Ptr[uint8]) -> int32:
+    octet: uint32 = 0
+    have_digit: int32 = 0
+    idx: uint32 = 0
+    i: uint64 = 0
+    while True:
+        c: uint8 = host_buf[i]
+        if c == 46 or c == 0:
+            if have_digit == 0:
+                return -1
+            if octet > 255:
+                return -1
+            if idx == 0:
+                out0[0] = cast[uint8](octet)
+            elif idx == 1:
+                out1[0] = cast[uint8](octet)
+            elif idx == 2:
+                out2[0] = cast[uint8](octet)
+            else:
+                out3[0] = cast[uint8](octet)
+            if c == 0:
+                if idx != 3:
+                    return -1
+                return 0
+            idx = idx + 1
+            if idx > 3:
+                return -1
+            octet = 0
+            have_digit = 0
+        elif c >= 48 and c <= 57:
+            octet = octet * 10 + cast[uint32](c - 48)
+            have_digit = 1
+        else:
+            return -1
+        i = i + 1
+
+
+def _resolve_host(out0: Ptr[uint8], out1: Ptr[uint8],
+                  out2: Ptr[uint8], out3: Ptr[uint8]) -> int32:
+    if _parse_ipv4(out0, out1, out2, out3) == 0:
+        return 0
+    resolved_ip: int64 = sys_resolve(&host_buf[0], strlen_u8(&host_buf[0]))
+    if resolved_ip < 0:
+        write_str(2, "hpm: cannot resolve ")
+        write_str(2, &host_buf[0])
+        write_str(2, "\n")
+        return -1
+    u: uint64 = cast[uint64](resolved_ip)
+    out0[0] = cast[uint8]((u >> 24) & 0xFF)
+    out1[0] = cast[uint8]((u >> 16) & 0xFF)
+    out2[0] = cast[uint8]((u >> 8) & 0xFF)
+    out3[0] = cast[uint8](u & 0xFF)
+    return 0
+
+
+# -- HTTP fetch (buffered single-shot) --------------------------------
+#
+# Mirrors user/apt.ad's _http_get shape but lives here so hpm has no
+# build-time dep on the retired apt source. Connects via the Plan-9
+# /net file tree, sends an HTTP/1.0 GET for url_path_buf, drains the
+# response into `dst` (capped at `dst_cap`), and returns the BODY
+# length. Writes the body start offset (== response_size - body_size)
+# through *body_off. Returns -1 on any socket / HTTP error.
+#
+# The drain stops as soon as the whole response is in hand: once the
+# headers + a Content-Length worth of body bytes have arrived, we
+# must NOT issue another read() — on the https path a trailing read
+# past the body wedges on TLS close_notify (the kernel socket-read's
+# bounded poll never fires under syscall context).
+
+def _http_expected_len(dst: Ptr[uint8], total: uint64) -> uint64:
+    # Returns the expected total response length once both the header
+    # terminator AND a Content-Length header have been observed; else 0.
+    hdr_end: uint64 = 0
+    found: int32 = 0
+    p: uint64 = 0
+    while p + 3 < total:
+        if dst[p] == 13 and dst[p + 1] == 10 \
+                and dst[p + 2] == 13 and dst[p + 3] == 10:
+            hdr_end = p + 4
+            found = 1
+            break
+        p = p + 1
+    if found == 0:
+        return 0
+
+    name: Ptr[uint8] = "content-length"
+    name_len: uint64 = 14
+    line: uint64 = 0
+    while line < hdr_end:
+        match_n: int32 = 1
+        j: uint64 = 0
+        while j < name_len:
+            c: uint8 = dst[line + j]
+            if c >= 65 and c <= 90:
+                c = c + 32
+            if c != name[j]:
+                match_n = 0
+                break
+            j = j + 1
+        if match_n != 0 and dst[line + name_len] == 58:    # ':'
+            v: uint64 = line + name_len + 1
+            while v < hdr_end and dst[v] == 32:
+                v = v + 1
+            clen: uint64 = 0
+            have_digit: int32 = 0
+            while v < hdr_end and dst[v] >= 48 and dst[v] <= 57:
+                clen = clen * 10 + cast[uint64](dst[v] - 48)
+                have_digit = 1
+                v = v + 1
+            if have_digit != 0:
+                return hdr_end + clen
+            return 0
+        nl: uint64 = line
+        while nl < hdr_end and dst[nl] != 10:
+            nl = nl + 1
+        line = nl + 1
+    return 0
+
+
+def _http_connect() -> int32:
+    ip0: uint8 = 0
+    ip1: uint8 = 0
+    ip2: uint8 = 0
+    ip3: uint8 = 0
+    if _resolve_host(&ip0, &ip1, &ip2, &ip3) != 0:
+        return -1
+    if url_scheme == 0:
+        nfd: int32 = net_dial(ip0, ip1, ip2, ip3, cast[uint64](url_port))
+        if nfd < 0:
+            write_str(2, "hpm: net_dial() failed (mirror unreachable?)\n")
+            return -1
+        return nfd
+    nfd_tls: int32 = net_dial_tls(ip0, ip1, ip2, ip3,
+                                  cast[uint64](url_port), &host_buf[0])
+    if nfd_tls < 0:
+        write_str(2, "hpm: TLS connect failed for ")
+        write_str(2, &host_buf[0])
+        write_str(2, "\n")
+        return -1
+    return nfd_tls
+
+
+def _http_send_request(fd: int32) -> int32:
+    ro: uint64 = 0
+    g: Ptr[uint8] = "GET "
+    gi: uint64 = 0
+    while g[gi] != 0:
+        req_buf[ro] = g[gi]
+        ro = ro + 1
+        gi = gi + 1
+    pi: uint64 = 0
+    while url_path_buf[pi] != 0 and ro < 1000:
+        req_buf[ro] = url_path_buf[pi]
+        ro = ro + 1
+        pi = pi + 1
+    tail1: Ptr[uint8] = " HTTP/1.0\r\nHost: "
+    ti: uint64 = 0
+    while tail1[ti] != 0:
+        req_buf[ro] = tail1[ti]
+        ro = ro + 1
+        ti = ti + 1
+    hi: uint64 = 0
+    while host_buf[hi] != 0 and ro < 1000:
+        req_buf[ro] = host_buf[hi]
+        ro = ro + 1
+        hi = hi + 1
+    tail2: Ptr[uint8] = "\r\nUser-Agent: hamnix-hpm/1\r\nConnection: close\r\n\r\n"
+    si: uint64 = 0
+    while tail2[si] != 0:
+        req_buf[ro] = tail2[si]
+        ro = ro + 1
+        si = si + 1
+
+    wn: int64 = _write_full(fd, &req_buf[0], ro)
+    if wn < 0 or cast[uint64](wn) != ro:
+        write_str(2, "hpm: short write sending HTTP request\n")
+        return -1
+    return 0
+
+
+def _http_get(dst: Ptr[uint8], dst_cap: uint64,
+              body_off: Ptr[uint64]) -> int64:
+    # url_scheme + url_port + host_buf + url_path_buf are already set.
+    fd: int32 = _http_connect()
+    if fd < 0:
+        return -1
+    if _http_send_request(fd) != 0:
+        sys_close(fd)
+        return -1
+
+    total: uint64 = 0
+    while total < dst_cap:
+        want: uint64 = _http_expected_len(dst, total)
+        if want != 0 and total >= want:
+            break
+        room: uint64 = dst_cap - total
+        n: int64 = sys_read(fd, cast[Ptr[uint8]](
+            cast[uint64](dst) + total), room)
+        if n < 0:
+            write_str(2, "hpm: read() error on HTTP response\n")
+            sys_close(fd)
+            return -1
+        if n == 0:
+            break
+        total = total + cast[uint64](n)
+    sys_close(fd)
+
+    exact: uint64 = _http_expected_len(dst, total)
+    if exact != 0 and total > exact:
+        total = exact
+
+    if total == 0:
+        write_str(2, "hpm: empty HTTP response\n")
+        return -1
+    if total >= dst_cap:
+        write_str(2, "hpm: HTTP response exceeds buffer cap\n")
+        return -1
+
+    if total < 12:
+        write_str(2, "hpm: truncated HTTP status line\n")
+        return -1
+    if dst[0] != 72 or dst[1] != 84 or dst[2] != 84 or dst[3] != 80:
+        write_str(2, "hpm: malformed HTTP status line\n")
+        return -1
+    if dst[9] != 50 or dst[10] != 48 or dst[11] != 48:
+        write_str(2, "hpm: HTTP request did not return 200 OK\n")
+        return -1
+
+    bo: uint64 = 0
+    found: int32 = 0
+    p: uint64 = 0
+    while p + 3 < total:
+        if dst[p] == 13 and dst[p + 1] == 10 \
+                and dst[p + 2] == 13 and dst[p + 3] == 10:
+            bo = p + 4
+            found = 1
+            break
+        p = p + 1
+    if found == 0:
+        write_str(2, "hpm: HTTP response has no header terminator\n")
+        return -1
+
+    body_off[0] = bo
+    return cast[int64](total - bo)
+
+
+# -- file:// fetch -----------------------------------------------------
+#
+# Slurp <path_buf>/<tail> into dst[0..dst_cap), returning the byte count
+# read. dst_cap is the maximum bytes to accept; an over-cap file is a
+# hard error.
+
+def _file_read_path(file_path: Ptr[char],
+                    dst: Ptr[uint8], dst_cap: uint64) -> int64:
+    fd: int32 = sys_open(file_path)
+    if fd < 0:
+        write_str(2, "hpm: cannot open ")
+        write_str(2, cast[Ptr[uint8]](file_path))
+        write_str(2, "\n")
+        return -1
+    total: uint64 = 0
+    while total < dst_cap:
+        room: uint64 = dst_cap - total
+        n: int64 = sys_read(fd, cast[Ptr[uint8]](
+            cast[uint64](dst) + total), room)
+        if n < 0:
+            sys_close(fd)
+            return -1
+        if n == 0:
+            break
+        total = total + cast[uint64](n)
+    sys_close(fd)
+    if total >= dst_cap:
+        write_str(2, "hpm: file exceeds buffer cap\n")
+        return -1
+    return cast[int64](total)
+
+
+# -- compose path under the repo base ---------------------------------
+#
+# Builds the absolute target for a GET / file-open: "<base>/<tail>".
+# For HTTP-shaped schemes the result goes into url_path_buf (used by
+# the GET). For file://, the result goes into a caller-supplied buffer
+# (so the file_open path can use it as a Ptr[char]).
+
+def _build_url_path(tail: Ptr[uint8]):
+    o: uint64 = 0
+    bi: uint64 = 0
+    while path_buf[bi] != 0 and o + 1 < 1536:
+        url_path_buf[o] = path_buf[bi]
+        o = o + 1
+        bi = bi + 1
+    # Ensure a leading '/' so a base of "" (bare host) still yields a
+    # path that starts with '/'.
+    if o == 0 or url_path_buf[0] != 47:
+        # Shift right by 1 to insert leading '/'. The fixture cases where
+        # path_buf is empty want url_path_buf = "/<tail>".
+        s: uint64 = o
+        while s > 0:
+            url_path_buf[s] = url_path_buf[s - 1]
+            s = s - 1
+        url_path_buf[0] = 47
+        o = o + 1
+    # Separator '/' if base doesn't already end in one.
+    if o == 0 or url_path_buf[o - 1] != 47:
+        if o + 1 < 1536:
+            url_path_buf[o] = 47
+            o = o + 1
+    ti: uint64 = 0
+    while tail[ti] != 0 and o + 1 < 1536:
+        url_path_buf[o] = tail[ti]
+        o = o + 1
+        ti = ti + 1
+    url_path_buf[o] = 0
+
+
+def _build_file_path(out: Ptr[uint8], cap: uint64, tail: Ptr[uint8]) -> int32:
+    # path_buf is the file:// path (NO leading file://). Compose
+    # "<path_buf>/<tail>" into out (NUL-terminated). Returns 0 on
+    # success, -1 on overflow.
+    o: uint64 = 0
+    bi: uint64 = 0
+    while path_buf[bi] != 0:
+        if o + 1 >= cap:
+            return -1
+        out[o] = path_buf[bi]
+        o = o + 1
+        bi = bi + 1
+    if o == 0 or out[o - 1] != 47:
+        if o + 1 >= cap:
+            return -1
+        out[o] = 47
+        o = o + 1
+    ti: uint64 = 0
+    while tail[ti] != 0:
+        if o + 1 >= cap:
+            return -1
+        out[o] = tail[ti]
+        o = o + 1
+        ti = ti + 1
+    out[o] = 0
+    return 0
+
+
+# -- repo-aware fetch wrapper -----------------------------------------
+#
+# fetch_to_buf(tail, dst, dst_cap) — fetch the resource at <repo>/<tail>
+# into dst, returning the byte count. Routes on url_scheme:
+#   http / https  -> _http_get
+#   file          -> _file_read_path
+#
+# For HTTP the body lands at dst[body_off..body_off+len); the caller
+# typically moves it down via a memcpy after the call. We keep this
+# simple by copying body bytes down to dst[0..len) here so the caller
+# gets a clean buffer that starts with the resource.
+
+fetch_path_scratch: Array[1536, uint8]
+
+
+def fetch_to_buf(tail: Ptr[uint8], dst: Ptr[uint8],
+                 dst_cap: uint64) -> int64:
+    if url_scheme == 2:
+        if _build_file_path(&fetch_path_scratch[0], 1536, tail) != 0:
+            write_str(2, "hpm: file path overflow\n")
+            return -1
+        return _file_read_path(cast[Ptr[char]](&fetch_path_scratch[0]),
+                               dst, dst_cap)
+    _build_url_path(tail)
+    body_off: uint64 = 0
+    blen: int64 = _http_get(dst, dst_cap, &body_off)
+    if blen < 0:
+        return -1
+    # Slide body bytes to the front of dst so callers see a clean buffer.
+    if body_off > 0:
+        bl: uint64 = cast[uint64](blen)
+        i: uint64 = 0
+        while i < bl:
+            dst[i] = dst[body_off + i]
+            i = i + 1
+    return blen
+
+
+# -- repo default + flag handling -------------------------------------
+
+def _set_repo_default():
+    # The canonical hosted repo. Override via `--repo=<url>` flag.
+    s: Ptr[uint8] = "https://255.one/"
+    _strcopy_cstr(&repo_url_buf[0], s, 1024)
+
+
+def _set_repo(url: Ptr[uint8]):
+    _strcopy_cstr(&repo_url_buf[0], url, 1024)
+
+
+def _apply_repo() -> int32:
+    # Parse repo_url_buf into url_scheme + host_buf + path_buf.
+    return _parse_url(&repo_url_buf[0])
+
+
+# -- minimal JSON parser ----------------------------------------------
+#
+# The Hamnix-side library does NOT have a JSON parser today (apt
+# parsed RFC822 stanzas, not JSON). hpm needs *just enough* to walk
+# the schema-1 index.json — strings, numbers, arrays, objects. This
+# is a small recursive-descent parser specialised to that subset:
+#
+#   - No floating point (numbers are integers; we only need size:int).
+#   - String escape support: \" \\ \/ \n \r \t \b \f, and \uHHHH
+#     decoded to UTF-8 (one BMP code point). \uHHHH surrogate pairs
+#     NOT handled (an extremely rare case for our schema; field
+#     values are ASCII names/URLs/hashes/descriptions).
+#   - Whitespace = SP TAB LF CR per RFC 8259.
+#
+# The parse PASS records pointer + length spans into idx_buf for each
+# package's fields, so the caller never copies the bytes out — fields
+# are read directly from the cache via field-by-name lookup. The cache
+# is bytewise stable until the next `hpm refresh`.
+
+# Per-package field-span tables. PKG_MAX is generous so the live repo
+# can grow; field count per package is the schema's documented set.
+PKG_MAX:    uint64 = 1024
+
+# Each package gets these spans (offset + length into idx_buf, or
+# 0/0 if absent). 0 is a sentinel "absent" since idx_buf[0] is the
+# opening '{' of the top-level object, never the start of a string.
+pkg_name_off:        Array[1024, uint64]
+pkg_name_len:        Array[1024, uint64]
+pkg_version_off:     Array[1024, uint64]
+pkg_version_len:     Array[1024, uint64]
+pkg_arch_off:        Array[1024, uint64]
+pkg_arch_len:        Array[1024, uint64]
+pkg_url_off:         Array[1024, uint64]
+pkg_url_len:         Array[1024, uint64]
+pkg_sha256_off:      Array[1024, uint64]
+pkg_sha256_len:      Array[1024, uint64]
+pkg_size:            Array[1024, uint64]    # numeric (parsed)
+pkg_desc_off:        Array[1024, uint64]
+pkg_desc_len:        Array[1024, uint64]
+pkg_target_off:      Array[1024, uint64]
+pkg_target_len:      Array[1024, uint64]
+
+# Dependency / conflicts / provides arrays. Each package owns a slice
+# of a flat string table; per-entry offset+len is recorded.
+DEP_ENTRIES_MAX: uint64 = 8192      # total dep entries across all pkgs
+pkg_dep_start:       Array[1024, uint64]
+pkg_dep_count:       Array[1024, uint64]
+pkg_conf_start:      Array[1024, uint64]
+pkg_conf_count:      Array[1024, uint64]
+pkg_prov_start:      Array[1024, uint64]
+pkg_prov_count:      Array[1024, uint64]
+
+dep_entry_off:       Array[8192, uint64]
+dep_entry_len:       Array[8192, uint64]
+dep_entry_n:         uint64 = 0
+
+conf_entry_off:      Array[8192, uint64]
+conf_entry_len:      Array[8192, uint64]
+conf_entry_n:        uint64 = 0
+
+prov_entry_off:      Array[8192, uint64]
+prov_entry_len:      Array[8192, uint64]
+prov_entry_n:        uint64 = 0
+
+pkg_count:           uint64 = 0
+
+# Parser cursor (byte offset into idx_buf).
+jp:    uint64 = 0
+jend:  uint64 = 0
+
+
+def _json_skip_ws():
+    while jp < jend:
+        c: uint8 = idx_buf[jp]
+        if c == 32 or c == 9 or c == 10 or c == 13:
+            jp = jp + 1
+        else:
+            return
+
+
+def _json_expect(c: uint8) -> int32:
+    _json_skip_ws()
+    if jp >= jend or idx_buf[jp] != c:
+        return -1
+    jp = jp + 1
+    return 0
+
+
+def _json_peek() -> int32:
+    _json_skip_ws()
+    if jp >= jend:
+        return -1
+    return cast[int32](idx_buf[jp])
+
+
+# Parse a JSON string. Returns 0 on success and writes the
+# string-content span (excluding the surrounding quotes, with escape
+# sequences left in their raw form — the consumer is content to read
+# escaped backslashes verbatim for our schema's ASCII-only fields)
+# to *out_off / *out_len. Skips past the closing quote.
+
+def _json_parse_string(out_off: Ptr[uint64], out_len: Ptr[uint64]) -> int32:
+    _json_skip_ws()
+    if jp >= jend or idx_buf[jp] != 34:                  # '"'
+        return -1
+    jp = jp + 1
+    start: uint64 = jp
+    while jp < jend:
+        c: uint8 = idx_buf[jp]
+        if c == 92:                                      # '\'
+            # Skip the escape introducer + one char. (\uHHHH is 5 more
+            # chars; we still skip past them for span-end purposes —
+            # the raw escape lives in the span. That's fine: every
+            # field hpm reads is plain ASCII in practice.)
+            jp = jp + 1
+            if jp >= jend:
+                return -1
+            esc: uint8 = idx_buf[jp]
+            jp = jp + 1
+            if esc == 117:                               # 'u'
+                jp = jp + 4
+            continue
+        if c == 34:                                      # '"'
+            out_off[0] = start
+            out_len[0] = jp - start
+            jp = jp + 1
+            return 0
+        jp = jp + 1
+    return -1
+
+
+# Parse an integer. Negative numbers are not in our schema (size is
+# always >= 0) — but accept '-' defensively. Returns 0 on success,
+# stores the value through *out.
+
+def _json_parse_int(out: Ptr[uint64]) -> int32:
+    _json_skip_ws()
+    if jp >= jend:
+        return -1
+    neg: int32 = 0
+    if idx_buf[jp] == 45:                                # '-'
+        neg = 1
+        jp = jp + 1
+    if jp >= jend or idx_buf[jp] < 48 or idx_buf[jp] > 57:
+        return -1
+    v: uint64 = 0
+    while jp < jend and idx_buf[jp] >= 48 and idx_buf[jp] <= 57:
+        v = v * 10 + cast[uint64](idx_buf[jp] - 48)
+        jp = jp + 1
+    out[0] = v
+    return 0
+
+
+# Skip over a JSON value (string / number / object / array / true /
+# false / null). Used to discard fields the parser doesn't care about
+# (top-level "repo", "url", "updated", "description"; package fields
+# not in our schema). Returns 0 on success, -1 on a parse error.
+
+def _json_skip_value() -> int32:
+    _json_skip_ws()
+    if jp >= jend:
+        return -1
+    c: uint8 = idx_buf[jp]
+    if c == 34:                                          # '"'
+        off: uint64 = 0
+        ln: uint64 = 0
+        return _json_parse_string(&off, &ln)
+    if c == 45 or (c >= 48 and c <= 57):
+        v: uint64 = 0
+        return _json_parse_int(&v)
+    if c == 116 or c == 102 or c == 110:                 # t / f / n
+        # true / false / null — skip the literal.
+        while jp < jend:
+            cc: uint8 = idx_buf[jp]
+            if cc >= 97 and cc <= 122:
+                jp = jp + 1
+            else:
+                break
+        return 0
+    if c == 91:                                          # '['
+        jp = jp + 1
+        _json_skip_ws()
+        if jp < jend and idx_buf[jp] == 93:
+            jp = jp + 1
+            return 0
+        while True:
+            if _json_skip_value() != 0:
+                return -1
+            _json_skip_ws()
+            if jp >= jend:
+                return -1
+            d: uint8 = idx_buf[jp]
+            if d == 44:                                  # ','
+                jp = jp + 1
+                continue
+            if d == 93:                                  # ']'
+                jp = jp + 1
+                return 0
+            return -1
+    if c == 123:                                         # '{'
+        jp = jp + 1
+        _json_skip_ws()
+        if jp < jend and idx_buf[jp] == 125:
+            jp = jp + 1
+            return 0
+        while True:
+            koff: uint64 = 0
+            klen: uint64 = 0
+            if _json_parse_string(&koff, &klen) != 0:
+                return -1
+            if _json_expect(58) != 0:                    # ':'
+                return -1
+            if _json_skip_value() != 0:
+                return -1
+            _json_skip_ws()
+            if jp >= jend:
+                return -1
+            d2: uint8 = idx_buf[jp]
+            if d2 == 44:
+                jp = jp + 1
+                continue
+            if d2 == 125:                                # '}'
+                jp = jp + 1
+                return 0
+            return -1
+    return -1
+
+
+# Parse a string-array into entry_off[start..start+count) / entry_len[..]
+# at the given append cursor. Returns 0 on success and writes the
+# count through *out_count. cap_check guards against overflow.
+
+def _json_parse_strarr(entry_off: Ptr[uint64], entry_len: Ptr[uint64],
+                       cursor_p: Ptr[uint64], cap: uint64,
+                       out_start: Ptr[uint64],
+                       out_count: Ptr[uint64]) -> int32:
+    _json_skip_ws()
+    if jp >= jend or idx_buf[jp] != 91:                  # '['
+        return -1
+    jp = jp + 1
+    out_start[0] = cursor_p[0]
+    n: uint64 = 0
+    _json_skip_ws()
+    if jp < jend and idx_buf[jp] == 93:
+        jp = jp + 1
+        out_count[0] = 0
+        return 0
+    while True:
+        if cursor_p[0] >= cap:
+            write_str(2, "hpm: dep-entry table overflow\n")
+            return -1
+        soff: uint64 = 0
+        slen: uint64 = 0
+        if _json_parse_string(&soff, &slen) != 0:
+            return -1
+        entry_off[cursor_p[0]] = soff
+        entry_len[cursor_p[0]] = slen
+        cursor_p[0] = cursor_p[0] + 1
+        n = n + 1
+        _json_skip_ws()
+        if jp >= jend:
+            return -1
+        d: uint8 = idx_buf[jp]
+        if d == 44:
+            jp = jp + 1
+            continue
+        if d == 93:
+            jp = jp + 1
+            out_count[0] = n
+            return 0
+        return -1
+
+
+# Parse one package object into pkg_*[pi] slots.
+
+def _json_parse_pkg(pi: uint64) -> int32:
+    if _json_expect(123) != 0:                           # '{'
+        return -1
+    # Initialise spans/counts to 0.
+    pkg_name_off[pi] = 0
+    pkg_name_len[pi] = 0
+    pkg_version_off[pi] = 0
+    pkg_version_len[pi] = 0
+    pkg_arch_off[pi] = 0
+    pkg_arch_len[pi] = 0
+    pkg_url_off[pi] = 0
+    pkg_url_len[pi] = 0
+    pkg_sha256_off[pi] = 0
+    pkg_sha256_len[pi] = 0
+    pkg_size[pi] = 0
+    pkg_desc_off[pi] = 0
+    pkg_desc_len[pi] = 0
+    pkg_target_off[pi] = 0
+    pkg_target_len[pi] = 0
+    pkg_dep_start[pi] = 0
+    pkg_dep_count[pi] = 0
+    pkg_conf_start[pi] = 0
+    pkg_conf_count[pi] = 0
+    pkg_prov_start[pi] = 0
+    pkg_prov_count[pi] = 0
+
+    _json_skip_ws()
+    if jp < jend and idx_buf[jp] == 125:                 # empty {}
+        jp = jp + 1
+        return 0
+    while True:
+        koff: uint64 = 0
+        klen: uint64 = 0
+        if _json_parse_string(&koff, &klen) != 0:
+            return -1
+        if _json_expect(58) != 0:
+            return -1
+
+        kp: Ptr[uint8] = &idx_buf[koff]
+        if klen == 4 and _streq_n(kp, cast[Ptr[uint8]]("name"), 4) != 0:
+            if _json_parse_string(&pkg_name_off[pi], &pkg_name_len[pi]) != 0:
+                return -1
+        elif klen == 7 and _streq_n(kp, cast[Ptr[uint8]]("version"), 7) != 0:
+            if _json_parse_string(&pkg_version_off[pi], &pkg_version_len[pi]) != 0:
+                return -1
+        elif klen == 4 and _streq_n(kp, cast[Ptr[uint8]]("arch"), 4) != 0:
+            if _json_parse_string(&pkg_arch_off[pi], &pkg_arch_len[pi]) != 0:
+                return -1
+        elif klen == 3 and _streq_n(kp, cast[Ptr[uint8]]("url"), 3) != 0:
+            if _json_parse_string(&pkg_url_off[pi], &pkg_url_len[pi]) != 0:
+                return -1
+        elif klen == 6 and _streq_n(kp, cast[Ptr[uint8]]("sha256"), 6) != 0:
+            if _json_parse_string(&pkg_sha256_off[pi], &pkg_sha256_len[pi]) != 0:
+                return -1
+        elif klen == 4 and _streq_n(kp, cast[Ptr[uint8]]("size"), 4) != 0:
+            if _json_parse_int(&pkg_size[pi]) != 0:
+                return -1
+        elif klen == 11 and _streq_n(kp, cast[Ptr[uint8]]("description"), 11) != 0:
+            if _json_parse_string(&pkg_desc_off[pi], &pkg_desc_len[pi]) != 0:
+                return -1
+        elif klen == 6 and _streq_n(kp, cast[Ptr[uint8]]("target"), 6) != 0:
+            if _json_parse_string(&pkg_target_off[pi], &pkg_target_len[pi]) != 0:
+                return -1
+        elif klen == 7 and _streq_n(kp, cast[Ptr[uint8]]("depends"), 7) != 0:
+            if _json_parse_strarr(&dep_entry_off[0], &dep_entry_len[0],
+                                  &dep_entry_n, 8192,
+                                  &pkg_dep_start[pi],
+                                  &pkg_dep_count[pi]) != 0:
+                return -1
+        elif klen == 9 and _streq_n(kp, cast[Ptr[uint8]]("conflicts"), 9) != 0:
+            if _json_parse_strarr(&conf_entry_off[0], &conf_entry_len[0],
+                                  &conf_entry_n, 8192,
+                                  &pkg_conf_start[pi],
+                                  &pkg_conf_count[pi]) != 0:
+                return -1
+        elif klen == 8 and _streq_n(kp, cast[Ptr[uint8]]("provides"), 8) != 0:
+            if _json_parse_strarr(&prov_entry_off[0], &prov_entry_len[0],
+                                  &prov_entry_n, 8192,
+                                  &pkg_prov_start[pi],
+                                  &pkg_prov_count[pi]) != 0:
+                return -1
+        else:
+            # Unknown key — skip its value defensively.
+            if _json_skip_value() != 0:
+                return -1
+
+        _json_skip_ws()
+        if jp >= jend:
+            return -1
+        d: uint8 = idx_buf[jp]
+        if d == 44:
+            jp = jp + 1
+            continue
+        if d == 125:
+            jp = jp + 1
+            return 0
+        return -1
+
+
+def _json_parse_index() -> int32:
+    # Parse idx_buf[0..idx_len) as a schema-1 index. Walks the top-
+    # level object, recognises "packages" (the only field we keep),
+    # skips everything else. Fills pkg_*[0..pkg_count).
+    jp = 0
+    jend = idx_len
+    pkg_count = 0
+    dep_entry_n = 0
+    conf_entry_n = 0
+    prov_entry_n = 0
+
+    if _json_expect(123) != 0:
+        write_str(2, "hpm: index: top-level is not a JSON object\n")
+        return -1
+    _json_skip_ws()
+    if jp < jend and idx_buf[jp] == 125:
+        jp = jp + 1
+        return 0
+    while True:
+        koff: uint64 = 0
+        klen: uint64 = 0
+        if _json_parse_string(&koff, &klen) != 0:
+            write_str(2, "hpm: index: malformed key\n")
+            return -1
+        if _json_expect(58) != 0:
+            write_str(2, "hpm: index: expected ':'\n")
+            return -1
+        kp: Ptr[uint8] = &idx_buf[koff]
+        if klen == 8 and _streq_n(kp, cast[Ptr[uint8]]("packages"), 8) != 0:
+            _json_skip_ws()
+            if jp >= jend or idx_buf[jp] != 91:          # '['
+                write_str(2, "hpm: index: packages is not an array\n")
+                return -1
+            jp = jp + 1
+            _json_skip_ws()
+            if jp < jend and idx_buf[jp] == 93:
+                jp = jp + 1
+            else:
+                while True:
+                    if pkg_count >= 1024:
+                        write_str(2, "hpm: index: too many packages (>1024)\n")
+                        return -1
+                    if _json_parse_pkg(pkg_count) != 0:
+                        write_str(2, "hpm: index: malformed package object\n")
+                        return -1
+                    pkg_count = pkg_count + 1
+                    _json_skip_ws()
+                    if jp >= jend:
+                        return -1
+                    d: uint8 = idx_buf[jp]
+                    if d == 44:
+                        jp = jp + 1
+                        continue
+                    if d == 93:
+                        jp = jp + 1
+                        break
+                    write_str(2, "hpm: index: malformed packages array\n")
+                    return -1
+        else:
+            if _json_skip_value() != 0:
+                return -1
+
+        _json_skip_ws()
+        if jp >= jend:
+            return -1
+        d2: uint8 = idx_buf[jp]
+        if d2 == 44:
+            jp = jp + 1
+            continue
+        if d2 == 125:
+            jp = jp + 1
+            return 0
+        write_str(2, "hpm: index: malformed top-level object\n")
+        return -1
+
+
+# -- index cache: load + refresh --------------------------------------
+
+def _ensure_hpm_tmpdir():
+    # /tmp is tmpfs-owned; mkdir is idempotent (returns -EEXIST on retry).
+    sys_mkdir("/tmp/hpm")
+
+
+def _save_index_cache() -> int32:
+    _ensure_hpm_tmpdir()
+    fd: int32 = sys_open_write("/tmp/hpm/index.json")
+    if fd < 0:
+        write_str(2, "hpm: cannot open /tmp/hpm/index.json for write\n")
+        return -1
+    wn: int64 = _write_full(fd, &idx_buf[0], idx_len)
+    sys_close(fd)
+    if wn < 0 or cast[uint64](wn) != idx_len:
+        write_str(2, "hpm: short write on /tmp/hpm/index.json\n")
+        return -1
+    return 0
+
+
+def _load_index_cache() -> int32:
+    # Try the tmpfs cache. If absent, hpm requires a `refresh` first.
+    fd: int32 = sys_open("/tmp/hpm/index.json")
+    if fd < 0:
+        return -1
+    total: uint64 = 0
+    while total < INDEX_CAP:
+        room: uint64 = INDEX_CAP - total
+        n: int64 = sys_read(fd, cast[Ptr[uint8]](
+            cast[uint64](&idx_buf[0]) + total), room)
+        if n < 0:
+            sys_close(fd)
+            return -1
+        if n == 0:
+            break
+        total = total + cast[uint64](n)
+    sys_close(fd)
+    idx_len = total
+    if _json_parse_index() != 0:
+        return -1
+    return 0
+
+
+def cmd_refresh() -> int32:
+    # Fetch <repo>/index.json into idx_buf, parse it, persist to
+    # /tmp/hpm/index.json. The repo URL has already been parsed into
+    # url_scheme + host_buf + path_buf by main().
+    n: int64 = fetch_to_buf(cast[Ptr[uint8]]("index.json"),
+                            &idx_buf[0], INDEX_CAP)
+    if n < 0:
+        write_str(2, "hpm: refresh failed\n")
+        return 1
+    idx_len = cast[uint64](n)
+    if _json_parse_index() != 0:
+        write_str(2, "hpm: refresh: index.json parse failed\n")
+        return 1
+    if _save_index_cache() != 0:
+        return 1
+    write_str(1, "hpm: refreshed index from ")
+    write_str(1, &repo_url_buf[0])
+    write_str(1, " (")
+    write_dec_u64(1, pkg_count)
+    write_str(1, " packages, ")
+    write_dec_u64(1, idx_len)
+    write_str(1, " bytes)\n")
+    return 0
+
+
+# -- installed.json -- read + parse + write ---------------------------
+#
+# Installed DB schema (per docs/packages.md):
+#   { "schema": 1,
+#     "packages": [ { "name": "...", "version": "...",
+#                     "installed_at": "...", "pinned": false,
+#                     "target": "#hamnix-system",
+#                     "files": ["bin/foo", ...] }, ... ] }
+#
+# Phase 1 only needs to READ this to print `hpm list`. Phase 2/3 will
+# write to it as well.
+
+INST_MAX:        uint64 = 256
+inst_name_off:   Array[256, uint64]
+inst_name_len:   Array[256, uint64]
+inst_ver_off:    Array[256, uint64]
+inst_ver_len:    Array[256, uint64]
+inst_pinned:     Array[256, int32]
+inst_target_off: Array[256, uint64]
+inst_target_len: Array[256, uint64]
+inst_at_off:     Array[256, uint64]
+inst_at_len:     Array[256, uint64]
+# Files: per-installed-pkg slice of a flat (offset, length) table.
+INST_FILES_MAX:  uint64 = 8192
+inst_file_start: Array[256, uint64]
+inst_file_count: Array[256, uint64]
+inst_file_off:   Array[8192, uint64]
+inst_file_len:   Array[8192, uint64]
+inst_file_n:     uint64 = 0
+inst_count:      uint64 = 0
+
+# Parser cursor for inst_buf (parallel to idx_buf's jp/jend).
+ip:   uint64 = 0
+iend: uint64 = 0
+
+
+def _inst_skip_ws():
+    while ip < iend:
+        c: uint8 = inst_buf[ip]
+        if c == 32 or c == 9 or c == 10 or c == 13:
+            ip = ip + 1
+        else:
+            return
+
+
+def _inst_expect(c: uint8) -> int32:
+    _inst_skip_ws()
+    if ip >= iend or inst_buf[ip] != c:
+        return -1
+    ip = ip + 1
+    return 0
+
+
+def _inst_parse_string(out_off: Ptr[uint64], out_len: Ptr[uint64]) -> int32:
+    _inst_skip_ws()
+    if ip >= iend or inst_buf[ip] != 34:
+        return -1
+    ip = ip + 1
+    start: uint64 = ip
+    while ip < iend:
+        c: uint8 = inst_buf[ip]
+        if c == 92:
+            ip = ip + 1
+            if ip >= iend:
+                return -1
+            esc: uint8 = inst_buf[ip]
+            ip = ip + 1
+            if esc == 117:
+                ip = ip + 4
+            continue
+        if c == 34:
+            out_off[0] = start
+            out_len[0] = ip - start
+            ip = ip + 1
+            return 0
+        ip = ip + 1
+    return -1
+
+
+def _inst_parse_int(out: Ptr[uint64]) -> int32:
+    _inst_skip_ws()
+    if ip >= iend:
+        return -1
+    if inst_buf[ip] == 45:
+        ip = ip + 1
+    if ip >= iend or inst_buf[ip] < 48 or inst_buf[ip] > 57:
+        return -1
+    v: uint64 = 0
+    while ip < iend and inst_buf[ip] >= 48 and inst_buf[ip] <= 57:
+        v = v * 10 + cast[uint64](inst_buf[ip] - 48)
+        ip = ip + 1
+    out[0] = v
+    return 0
+
+
+def _inst_skip_value() -> int32:
+    _inst_skip_ws()
+    if ip >= iend:
+        return -1
+    c: uint8 = inst_buf[ip]
+    if c == 34:
+        off: uint64 = 0
+        ln: uint64 = 0
+        return _inst_parse_string(&off, &ln)
+    if c == 45 or (c >= 48 and c <= 57):
+        v: uint64 = 0
+        return _inst_parse_int(&v)
+    if c == 116 or c == 102 or c == 110:
+        while ip < iend:
+            cc: uint8 = inst_buf[ip]
+            if cc >= 97 and cc <= 122:
+                ip = ip + 1
+            else:
+                break
+        return 0
+    if c == 91:                                          # '['
+        ip = ip + 1
+        _inst_skip_ws()
+        if ip < iend and inst_buf[ip] == 93:
+            ip = ip + 1
+            return 0
+        while True:
+            if _inst_skip_value() != 0:
+                return -1
+            _inst_skip_ws()
+            if ip >= iend:
+                return -1
+            d: uint8 = inst_buf[ip]
+            if d == 44:
+                ip = ip + 1
+                continue
+            if d == 93:
+                ip = ip + 1
+                return 0
+            return -1
+    if c == 123:                                         # '{'
+        ip = ip + 1
+        _inst_skip_ws()
+        if ip < iend and inst_buf[ip] == 125:
+            ip = ip + 1
+            return 0
+        while True:
+            koff: uint64 = 0
+            klen: uint64 = 0
+            if _inst_parse_string(&koff, &klen) != 0:
+                return -1
+            if _inst_expect(58) != 0:
+                return -1
+            if _inst_skip_value() != 0:
+                return -1
+            _inst_skip_ws()
+            if ip >= iend:
+                return -1
+            d2: uint8 = inst_buf[ip]
+            if d2 == 44:
+                ip = ip + 1
+                continue
+            if d2 == 125:
+                ip = ip + 1
+                return 0
+            return -1
+    return -1
+
+
+def _inst_parse_strarr_files(idx_i: uint64) -> int32:
+    _inst_skip_ws()
+    if ip >= iend or inst_buf[ip] != 91:
+        return -1
+    ip = ip + 1
+    inst_file_start[idx_i] = inst_file_n
+    n: uint64 = 0
+    _inst_skip_ws()
+    if ip < iend and inst_buf[ip] == 93:
+        ip = ip + 1
+        inst_file_count[idx_i] = 0
+        return 0
+    while True:
+        if inst_file_n >= 8192:
+            write_str(2, "hpm: installed: file table overflow\n")
+            return -1
+        soff: uint64 = 0
+        slen: uint64 = 0
+        if _inst_parse_string(&soff, &slen) != 0:
+            return -1
+        inst_file_off[inst_file_n] = soff
+        inst_file_len[inst_file_n] = slen
+        inst_file_n = inst_file_n + 1
+        n = n + 1
+        _inst_skip_ws()
+        if ip >= iend:
+            return -1
+        d: uint8 = inst_buf[ip]
+        if d == 44:
+            ip = ip + 1
+            continue
+        if d == 93:
+            ip = ip + 1
+            inst_file_count[idx_i] = n
+            return 0
+        return -1
+
+
+def _inst_parse_pkg(i: uint64) -> int32:
+    if _inst_expect(123) != 0:
+        return -1
+    inst_name_off[i] = 0
+    inst_name_len[i] = 0
+    inst_ver_off[i] = 0
+    inst_ver_len[i] = 0
+    inst_pinned[i] = 0
+    inst_target_off[i] = 0
+    inst_target_len[i] = 0
+    inst_at_off[i] = 0
+    inst_at_len[i] = 0
+    inst_file_start[i] = 0
+    inst_file_count[i] = 0
+
+    _inst_skip_ws()
+    if ip < iend and inst_buf[ip] == 125:
+        ip = ip + 1
+        return 0
+    while True:
+        koff: uint64 = 0
+        klen: uint64 = 0
+        if _inst_parse_string(&koff, &klen) != 0:
+            return -1
+        if _inst_expect(58) != 0:
+            return -1
+        kp: Ptr[uint8] = &inst_buf[koff]
+        if klen == 4 and _streq_n(kp, cast[Ptr[uint8]]("name"), 4) != 0:
+            if _inst_parse_string(&inst_name_off[i], &inst_name_len[i]) != 0:
+                return -1
+        elif klen == 7 and _streq_n(kp, cast[Ptr[uint8]]("version"), 7) != 0:
+            if _inst_parse_string(&inst_ver_off[i], &inst_ver_len[i]) != 0:
+                return -1
+        elif klen == 6 and _streq_n(kp, cast[Ptr[uint8]]("pinned"), 6) != 0:
+            # true / false literal — peek first char.
+            _inst_skip_ws()
+            if ip < iend and inst_buf[ip] == 116:        # 't'
+                inst_pinned[i] = 1
+            else:
+                inst_pinned[i] = 0
+            if _inst_skip_value() != 0:
+                return -1
+        elif klen == 6 and _streq_n(kp, cast[Ptr[uint8]]("target"), 6) != 0:
+            if _inst_parse_string(&inst_target_off[i], &inst_target_len[i]) != 0:
+                return -1
+        elif klen == 12 and _streq_n(kp, cast[Ptr[uint8]]("installed_at"), 12) != 0:
+            if _inst_parse_string(&inst_at_off[i], &inst_at_len[i]) != 0:
+                return -1
+        elif klen == 5 and _streq_n(kp, cast[Ptr[uint8]]("files"), 5) != 0:
+            if _inst_parse_strarr_files(i) != 0:
+                return -1
+        else:
+            if _inst_skip_value() != 0:
+                return -1
+
+        _inst_skip_ws()
+        if ip >= iend:
+            return -1
+        d: uint8 = inst_buf[ip]
+        if d == 44:
+            ip = ip + 1
+            continue
+        if d == 125:
+            ip = ip + 1
+            return 0
+        return -1
+
+
+def _load_installed() -> int32:
+    # Returns 0 on a parsed DB (which may be empty),
+    # 1 on absent file (treated as "no packages installed yet").
+    inst_count = 0
+    inst_file_n = 0
+    fd: int32 = sys_open("/var/lib/hpm/installed.json")
+    if fd < 0:
+        return 1
+    total: uint64 = 0
+    while total < INSTALLED_CAP:
+        room: uint64 = INSTALLED_CAP - total
+        n: int64 = sys_read(fd, cast[Ptr[uint8]](
+            cast[uint64](&inst_buf[0]) + total), room)
+        if n < 0:
+            sys_close(fd)
+            return -1
+        if n == 0:
+            break
+        total = total + cast[uint64](n)
+    sys_close(fd)
+    inst_len = total
+    if total == 0:
+        return 1                                          # empty DB
+
+    ip = 0
+    iend = inst_len
+    if _inst_expect(123) != 0:
+        write_str(2, "hpm: installed.json: top-level is not an object\n")
+        return -1
+    _inst_skip_ws()
+    if ip < iend and inst_buf[ip] == 125:
+        ip = ip + 1
+        return 0
+    while True:
+        koff: uint64 = 0
+        klen: uint64 = 0
+        if _inst_parse_string(&koff, &klen) != 0:
+            write_str(2, "hpm: installed.json: malformed key\n")
+            return -1
+        if _inst_expect(58) != 0:
+            return -1
+        kp: Ptr[uint8] = &inst_buf[koff]
+        if klen == 8 and _streq_n(kp, cast[Ptr[uint8]]("packages"), 8) != 0:
+            _inst_skip_ws()
+            if ip >= iend or inst_buf[ip] != 91:
+                write_str(2, "hpm: installed.json: packages is not array\n")
+                return -1
+            ip = ip + 1
+            _inst_skip_ws()
+            if ip < iend and inst_buf[ip] == 93:
+                ip = ip + 1
+            else:
+                while True:
+                    if inst_count >= 256:
+                        write_str(2, "hpm: installed.json: too many packages\n")
+                        return -1
+                    if _inst_parse_pkg(inst_count) != 0:
+                        return -1
+                    inst_count = inst_count + 1
+                    _inst_skip_ws()
+                    if ip >= iend:
+                        return -1
+                    d: uint8 = inst_buf[ip]
+                    if d == 44:
+                        ip = ip + 1
+                        continue
+                    if d == 93:
+                        ip = ip + 1
+                        break
+                    return -1
+        else:
+            if _inst_skip_value() != 0:
+                return -1
+
+        _inst_skip_ws()
+        if ip >= iend:
+            return -1
+        d2: uint8 = inst_buf[ip]
+        if d2 == 44:
+            ip = ip + 1
+            continue
+        if d2 == 125:
+            ip = ip + 1
+            return 0
+        return -1
+
+
+# -- pretty-print helpers (write a span from idx_buf or inst_buf) -----
+
+def _write_span(fd: int32, base: Ptr[uint8], off: uint64, ln: uint64):
+    if ln == 0:
+        return
+    sys_write(fd, cast[Ptr[uint8]](cast[uint64](base) + off), ln)
+
+
+# -- commands: list / search / show -----------------------------------
+
+def cmd_list() -> int32:
+    rc: int32 = _load_installed()
+    if rc < 0:
+        return 1
+    if rc == 1 or inst_count == 0:
+        write_str(1, "hpm: no packages installed\n")
+        return 0
+    i: uint64 = 0
+    while i < inst_count:
+        # "<name>  <version>  [pinned]  <target>"
+        _write_span(1, &inst_buf[0], inst_name_off[i], inst_name_len[i])
+        sys_write(1, "  ", 2)
+        _write_span(1, &inst_buf[0], inst_ver_off[i], inst_ver_len[i])
+        sys_write(1, "  ", 2)
+        if inst_pinned[i] != 0:
+            sys_write(1, "[pinned]  ", 10)
+        if inst_target_len[i] > 0:
+            _write_span(1, &inst_buf[0], inst_target_off[i],
+                        inst_target_len[i])
+        else:
+            sys_write(1, "#hamnix-system", 14)
+        sys_write(1, "\n", 1)
+        i = i + 1
+    return 0
+
+
+def cmd_search(pattern: Ptr[uint8]) -> int32:
+    # Substring match against pkg_name spans. Requires a refreshed cache.
+    if _load_index_cache() != 0:
+        write_str(2, "hpm: no cached index; run `hpm refresh` first\n")
+        return 1
+    # Materialise the pattern as a NUL-terminated cstring already (it
+    # came from argv). For each package, copy name to a scratch cstring
+    # and substring-match. We use a scratch buf.
+    matched: uint64 = 0
+    namescratch: Array[128, uint8]
+    i: uint64 = 0
+    while i < pkg_count:
+        ln: uint64 = pkg_name_len[i]
+        _strcopy_n(&namescratch[0],
+                   cast[Ptr[uint8]](
+                       cast[uint64](&idx_buf[0]) + pkg_name_off[i]),
+                   ln, 128)
+        if _strcontains(&namescratch[0], pattern) != 0:
+            _write_span(1, &idx_buf[0], pkg_name_off[i], pkg_name_len[i])
+            sys_write(1, "  ", 2)
+            _write_span(1, &idx_buf[0], pkg_version_off[i], pkg_version_len[i])
+            sys_write(1, "  -  ", 5)
+            _write_span(1, &idx_buf[0], pkg_desc_off[i], pkg_desc_len[i])
+            sys_write(1, "\n", 1)
+            matched = matched + 1
+        i = i + 1
+    if matched == 0:
+        write_str(2, "hpm: no packages match \"")
+        write_str(2, pattern)
+        write_str(2, "\"\n")
+        return 1
+    return 0
+
+
+def _name_eq_span(off: uint64, ln: uint64, want: Ptr[uint8],
+                  want_len: uint64) -> int32:
+    if ln != want_len:
+        return 0
+    i: uint64 = 0
+    while i < ln:
+        if idx_buf[off + i] != want[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def _ver_eq_span(off: uint64, ln: uint64, want: Ptr[uint8],
+                 want_len: uint64) -> int32:
+    if ln != want_len:
+        return 0
+    i: uint64 = 0
+    while i < ln:
+        if idx_buf[off + i] != want[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+# -- version comparison (per docs/packages.md) ------------------------
+#
+# Dotted-decimal tuples; each component compared as an integer; missing
+# components treated as zero. Optional `+<tag>` is build metadata and
+# IGNORED for ordering. Returns: -1 if a<b, 0 if a==b, 1 if a>b.
+
+def _vcomp_at(s: Ptr[uint8], n: uint64, p: Ptr[uint64]) -> uint64:
+    # Parse one decimal component starting at *p (advances past it).
+    # Stops at '.', '+', or end. Returns the integer value.
+    v: uint64 = 0
+    while p[0] < n:
+        c: uint8 = s[p[0]]
+        if c == 46 or c == 43:                           # '.' or '+'
+            return v
+        if c < 48 or c > 57:
+            return v
+        v = v * 10 + cast[uint64](c - 48)
+        p[0] = p[0] + 1
+    return v
+
+
+def _version_compare(a: Ptr[uint8], an: uint64,
+                     b: Ptr[uint8], bn: uint64) -> int32:
+    # Strip everything from '+' on (build metadata).
+    ae: uint64 = 0
+    while ae < an and a[ae] != 43:
+        ae = ae + 1
+    be: uint64 = 0
+    while be < bn and b[be] != 43:
+        be = be + 1
+    ap: uint64 = 0
+    bp: uint64 = 0
+    while ap < ae or bp < be:
+        av: uint64 = 0
+        bv: uint64 = 0
+        if ap < ae:
+            av = _vcomp_at(a, ae, &ap)
+        if bp < be:
+            bv = _vcomp_at(b, be, &bp)
+        if av < bv:
+            return -1
+        if av > bv:
+            return 1
+        # Skip the separator '.'.
+        if ap < ae and a[ap] == 46:
+            ap = ap + 1
+        if bp < be and b[bp] == 46:
+            bp = bp + 1
+    return 0
+
+
+# Return the index of the best (highest version) package whose name
+# equals `want`. Returns -1 if no such package.
+def _pkg_find_best(want: Ptr[uint8], want_len: uint64) -> int64:
+    best: int64 = -1
+    i: uint64 = 0
+    while i < pkg_count:
+        if _name_eq_span(pkg_name_off[i], pkg_name_len[i],
+                         want, want_len) != 0:
+            if best < 0:
+                best = cast[int64](i)
+            else:
+                bi: uint64 = cast[uint64](best)
+                cmp: int32 = _version_compare(
+                    cast[Ptr[uint8]](
+                        cast[uint64](&idx_buf[0]) + pkg_version_off[i]),
+                    pkg_version_len[i],
+                    cast[Ptr[uint8]](
+                        cast[uint64](&idx_buf[0]) + pkg_version_off[bi]),
+                    pkg_version_len[bi])
+                if cmp > 0:
+                    best = cast[int64](i)
+        i = i + 1
+    return best
+
+
+# Find a package by exact name+version. Returns -1 if not found.
+def _pkg_find_exact(want: Ptr[uint8], want_len: uint64,
+                    wver: Ptr[uint8], wver_len: uint64) -> int64:
+    i: uint64 = 0
+    while i < pkg_count:
+        if _name_eq_span(pkg_name_off[i], pkg_name_len[i],
+                         want, want_len) != 0:
+            if _ver_eq_span(pkg_version_off[i], pkg_version_len[i],
+                            wver, wver_len) != 0:
+                return cast[int64](i)
+        i = i + 1
+    return -1
+
+
+# -- show <name>[@<version>] ------------------------------------------
+
+def _split_nameversion(spec: Ptr[uint8],
+                       name_out: Ptr[uint8], name_cap: uint64,
+                       ver_out: Ptr[uint8], ver_cap: uint64,
+                       has_ver: Ptr[int32]):
+    # Split on '@'. spec is a NUL-terminated cstring.
+    has_ver[0] = 0
+    name_out[0] = 0
+    ver_out[0] = 0
+    no: uint64 = 0
+    i: uint64 = 0
+    while spec[i] != 0 and spec[i] != 64 and no + 1 < name_cap:    # '@'
+        name_out[no] = spec[i]
+        no = no + 1
+        i = i + 1
+    name_out[no] = 0
+    if spec[i] == 64:
+        has_ver[0] = 1
+        i = i + 1
+        vo: uint64 = 0
+        while spec[i] != 0 and vo + 1 < ver_cap:
+            ver_out[vo] = spec[i]
+            vo = vo + 1
+            i = i + 1
+        ver_out[vo] = 0
+
+
+def cmd_show(spec: Ptr[uint8]) -> int32:
+    if _load_index_cache() != 0:
+        write_str(2, "hpm: no cached index; run `hpm refresh` first\n")
+        return 1
+    name_buf: Array[128, uint8]
+    ver_buf:  Array[64, uint8]
+    has_ver:  int32 = 0
+    _split_nameversion(spec, &name_buf[0], 128, &ver_buf[0], 64, &has_ver)
+
+    idx: int64 = -1
+    if has_ver != 0:
+        idx = _pkg_find_exact(&name_buf[0], strlen_u8(&name_buf[0]),
+                              &ver_buf[0], strlen_u8(&ver_buf[0]))
+    else:
+        idx = _pkg_find_best(&name_buf[0], strlen_u8(&name_buf[0]))
+    if idx < 0:
+        write_str(2, "hpm: no package matches \"")
+        write_str(2, spec)
+        write_str(2, "\"\n")
+        return 1
+    pi: uint64 = cast[uint64](idx)
+
+    write_str(1, "name: ")
+    _write_span(1, &idx_buf[0], pkg_name_off[pi], pkg_name_len[pi])
+    write_str(1, "\nversion: ")
+    _write_span(1, &idx_buf[0], pkg_version_off[pi], pkg_version_len[pi])
+    write_str(1, "\narch: ")
+    _write_span(1, &idx_buf[0], pkg_arch_off[pi], pkg_arch_len[pi])
+    write_str(1, "\ntarget: ")
+    if pkg_target_len[pi] > 0:
+        _write_span(1, &idx_buf[0], pkg_target_off[pi], pkg_target_len[pi])
+    else:
+        sys_write(1, "#hamnix-system", 14)
+    write_str(1, "\ndescription: ")
+    _write_span(1, &idx_buf[0], pkg_desc_off[pi], pkg_desc_len[pi])
+    write_str(1, "\nurl: ")
+    _write_span(1, &idx_buf[0], pkg_url_off[pi], pkg_url_len[pi])
+    write_str(1, "\nsha256: ")
+    _write_span(1, &idx_buf[0], pkg_sha256_off[pi], pkg_sha256_len[pi])
+    write_str(1, "\nsize: ")
+    write_dec_u64(1, pkg_size[pi])
+    write_str(1, " bytes\n")
+    if pkg_dep_count[pi] > 0:
+        write_str(1, "depends:")
+        di: uint64 = 0
+        while di < pkg_dep_count[pi]:
+            sys_write(1, " ", 1)
+            slot: uint64 = pkg_dep_start[pi] + di
+            _write_span(1, &idx_buf[0],
+                        dep_entry_off[slot], dep_entry_len[slot])
+            di = di + 1
+        sys_write(1, "\n", 1)
+    if pkg_conf_count[pi] > 0:
+        write_str(1, "conflicts:")
+        ci: uint64 = 0
+        while ci < pkg_conf_count[pi]:
+            sys_write(1, " ", 1)
+            slot: uint64 = pkg_conf_start[pi] + ci
+            _write_span(1, &idx_buf[0],
+                        conf_entry_off[slot], conf_entry_len[slot])
+            ci = ci + 1
+        sys_write(1, "\n", 1)
+    if pkg_prov_count[pi] > 0:
+        write_str(1, "provides:")
+        ri: uint64 = 0
+        while ri < pkg_prov_count[pi]:
+            sys_write(1, " ", 1)
+            slot: uint64 = pkg_prov_start[pi] + ri
+            _write_span(1, &idx_buf[0],
+                        prov_entry_off[slot], prov_entry_len[slot])
+            ri = ri + 1
+        sys_write(1, "\n", 1)
+    return 0
+
+
+# -- usage + main -----------------------------------------------------
+
+def _usage() -> int32:
+    s: Ptr[uint8] = "Usage: hpm [--repo=<url>] <command> [args]\n\
+Commands:\n\
+  refresh                 fetch repo index\n\
+  list                    show installed packages\n\
+  search <pattern>        substring match against repo names\n\
+  show <name>[@<ver>]     print package metadata\n\
+  install <name>[@<ver>]  (Phase 2+)\n\
+  remove <name>           (Phase 3+)\n\
+  update                  (Phase 5+)\n\
+  pin <name>[@<ver>]      (Phase 5+)\n\
+  unpin <name>            (Phase 5+)\n"
+    write_str(2, s)
+    return 2
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    _set_repo_default()
+
+    # Optional leading flag(s): --repo=<url>. Stops at the first non-flag.
+    ai: int32 = 1
+    while ai < argc:
+        a: Ptr[uint8] = cast[Ptr[uint8]](argv[cast[uint64](ai)])
+        # Match "--repo=" prefix.
+        pfx: Ptr[uint8] = "--repo="
+        is_repo: int32 = 1
+        i: uint64 = 0
+        while i < 7:
+            if a[i] != pfx[i]:
+                is_repo = 0
+                break
+            i = i + 1
+        if is_repo != 0:
+            rest: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](a) + 7)
+            _set_repo(rest)
+            ai = ai + 1
+            continue
+        break
+
+    if ai >= argc:
+        return _usage()
+
+    if _apply_repo() != 0:
+        return 1
+
+    cmd: Ptr[uint8] = cast[Ptr[uint8]](argv[cast[uint64](ai)])
+    ai = ai + 1
+
+    if _streq(cmd, cast[Ptr[uint8]]("refresh")) != 0:
+        return cmd_refresh()
+    if _streq(cmd, cast[Ptr[uint8]]("list")) != 0:
+        return cmd_list()
+    if _streq(cmd, cast[Ptr[uint8]]("search")) != 0:
+        if ai >= argc:
+            write_str(2, "hpm: search requires a pattern\n")
+            return 1
+        return cmd_search(cast[Ptr[uint8]](argv[cast[uint64](ai)]))
+    if _streq(cmd, cast[Ptr[uint8]]("show")) != 0:
+        if ai >= argc:
+            write_str(2, "hpm: show requires a package name\n")
+            return 1
+        return cmd_show(cast[Ptr[uint8]](argv[cast[uint64](ai)]))
+    if _streq(cmd, cast[Ptr[uint8]]("install")) != 0:
+        write_str(2, "hpm: install is implemented in Phase 2\n")
+        return 1
+    if _streq(cmd, cast[Ptr[uint8]]("remove")) != 0:
+        write_str(2, "hpm: remove is implemented in Phase 3\n")
+        return 1
+    if _streq(cmd, cast[Ptr[uint8]]("update")) != 0:
+        write_str(2, "hpm: update is implemented in Phase 5\n")
+        return 1
+    if _streq(cmd, cast[Ptr[uint8]]("pin")) != 0:
+        write_str(2, "hpm: pin is implemented in Phase 5\n")
+        return 1
+    if _streq(cmd, cast[Ptr[uint8]]("unpin")) != 0:
+        write_str(2, "hpm: unpin is implemented in Phase 5\n")
+        return 1
+
+    write_str(2, "hpm: unknown command: ")
+    write_str(2, cmd)
+    sys_write(2, "\n", 1)
+    return _usage()
