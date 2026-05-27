@@ -141,6 +141,35 @@ fi
 check_marker '\[install\] \(7/7\) hostowner credentials' "step 7 reached"
 check_marker '^\[install\] install complete' "install complete"
 
+# Disk-layout assertion: after the install banner says "complete",
+# the target qcow2 MUST carry a GPT (signature "EFI PART" at byte
+# 0x200 = sector 1) and an MBR signature (0x55AA at byte 0x1FE).
+# Without these, Stage C's UEFI boot has nothing to load and fails
+# with "BdsDxe: failed to load Boot0001 ... Not Found" — the symptom
+# that previously fooled diagnosis into thinking the sentinel write
+# was broken when the actual fault was upstream in the install
+# pipeline (e.g. an mkfs_ext4 call that clobbered the GPT). Catch
+# this BEFORE the UEFI boot so the failure mode points at the
+# actual cause.
+TARGET_RAW=$(mktemp --tmpdir hamnix-installer-stageB-raw.XXXXXX.img)
+if qemu-img convert -O raw "$TARGET_IMG" "$TARGET_RAW" 2>/dev/null; then
+    mbr_sig=$(od -An -N2 -tx1 -j 0x1FE "$TARGET_RAW" | tr -d ' \n')
+    gpt_sig=$(od -An -N8 -c -j 0x200 "$TARGET_RAW" | tr -d ' \n')
+    if [ "$mbr_sig" = "55aa" ]; then
+        echo "[test_installer_full]   OK : MBR signature 0x55AA present"
+    else
+        echo "[test_installer_full]   MISS: MBR signature 0x55AA absent (got 0x$mbr_sig) — install clobbered the partition table" >&2
+        stage_b_fail=1
+    fi
+    if echo "$gpt_sig" | grep -q "EFIPART"; then
+        echo "[test_installer_full]   OK : GPT signature 'EFI PART' present at LBA 1"
+    else
+        echo "[test_installer_full]   MISS: GPT signature 'EFI PART' absent at LBA 1 (got '$gpt_sig')" >&2
+        stage_b_fail=1
+    fi
+fi
+rm -f "$TARGET_RAW"
+
 if [ "$stage_b_fail" -ne 0 ]; then
     echo "[test_installer_full] Stage B FAILED — last 80 lines of log:" >&2
     tail -80 "$STAGE_B_LOG" >&2
