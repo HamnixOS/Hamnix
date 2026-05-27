@@ -1,5 +1,18 @@
 # Hamnix package manager (`hpm`) — format spec
 
+> **Status:** v1 is **shipped**. `user/hpm.ad` (~5,400 lines)
+> implements every command in this spec across `0b4b75d`..`414243a`
+> (2026-05-26..27): `refresh` / `list` / `search` / `show` /
+> `install` (with hooks, BFS dep solver, conflict detection) /
+> `remove` / `update` / `pin` / `unpin`. Verified by
+> `scripts/test_hpm.sh` (refresh/install/list/remove + conflict
+> negative test). Five v1 packages live at the canonical repo
+> `https://255.one/`: `hamnix-hello`, `hamnix-base`,
+> `hamnix-bootloader`, `hamnix-installer-tools`, `linux-debian-12`
+> (built by `scripts/build_packages.py`). The installer
+> (`etc/install.hamsh`) drives `hpm install` against an
+> ISO-local mini-repo at `/iso-packages/`.
+
 `hpm` is the Hamnix-native package manager. It installs **Hamnix-side
 state**: kernel modules, native userland binaries, services, drivers,
 **distro-namespace populations** (e.g. `linux-debian-12`'s rootfs tree),
