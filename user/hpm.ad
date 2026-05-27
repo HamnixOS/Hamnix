@@ -3993,6 +3993,941 @@ def cmd_remove(name: Ptr[uint8]) -> int32:
     return 0
 
 
+# =====================================================================
+# Phase 4: dependency solver + conflict detection (greedy BFS)
+# =====================================================================
+#
+# docs/packages.md says: greedy breadth-first, no backtracking.
+# Algorithm:
+#
+#   1. Push the user's requested package onto a queue.
+#   2. While queue non-empty:
+#      a. Pop a requirement (name + constraint).
+#      b. If already in `resolved` or `installed`, verify the existing
+#         version satisfies the constraint; on conflict FAIL.
+#      c. Find the best (highest-version) repo entry matching the
+#         constraint. If none, FAIL.
+#      d. Check declared conflicts against resolved + installed. FAIL
+#         on any match.
+#      e. Add to `resolved`; enqueue every `depends:` entry.
+#   3. Topological order: enqueue order is roots-first BFS, but we
+#      want deps-first (so a child's install runs after its parents).
+#      Reverse-resolve order = enqueue order is the topo order if we
+#      treat "resolved" as a stack post-walk. Simpler: enqueue in BFS,
+#      then return the resolved set REVERSED — deepest deps first.
+#
+#      Actually the cleanest invariant per spec is post-order:
+#      enqueue means "I depend on these"; the BFS DOES NOT produce
+#      proper topological order on its own. We collect resolved
+#      packages into res_*, build an adjacency-list pass to determine
+#      a topo order, then return that.
+
+# Constraint operators:
+CMP_ANY:  int32 = 0     # name (no constraint)
+CMP_GE:   int32 = 1     # name>=ver
+CMP_GT:   int32 = 2     # name>ver
+CMP_EQ:   int32 = 3     # name==ver
+CMP_LE:   int32 = 4     # name<=ver
+CMP_LT:   int32 = 5     # name<ver
+
+# Resolved set: per-resolved-package, the (idx_buf) repo index + the
+# computed install order rank. Bounded at RES_MAX.
+RES_MAX:   uint64 = 64
+res_count: uint64 = 0
+res_pkg_idx:   Array[64, uint64]    # repo index into pkg_*[i]
+res_topo_rank: Array[64, uint64]    # 0 = deepest dep, last = the root
+
+# BFS queue of pending requirements. Each entry: (name_off into idx_buf
+# or scratch, name_len, op, ver_off, ver_len). For requirements that
+# came from the user CLI (the root), name lives in res_root_name_buf.
+QUEUE_MAX: uint64 = 256
+q_name_ptr:   Array[256, uint64]      # Ptr[uint8] to the name (or 0)
+q_name_len:   Array[256, uint64]
+q_op:         Array[256, int32]
+q_ver_ptr:    Array[256, uint64]
+q_ver_len:    Array[256, uint64]
+q_parent:     Array[256, uint64]      # res index of the package that
+                                       # enqueued this req (used for
+                                       # topo edges); 0xffff = root
+q_head:       uint64 = 0
+q_tail:       uint64 = 0
+
+# Adjacency lists (for topo sort). For each resolved package, the
+# resolved packages that depend on IT. Bounded by RES_MAX^2.
+adj_count:  Array[64, uint64]
+adj_to:     Array[4096, uint64]       # flat (from, to) edges
+adj_n:      uint64 = 0
+
+# Buffer for the user-supplied root requirement's name.
+root_name_buf: Array[128, uint8]
+root_ver_buf:  Array[64, uint8]
+
+# Dep-term parsing scratch.
+term_name_buf: Array[128, uint8]
+term_ver_buf:  Array[64, uint8]
+
+
+# Parse "name", "name>=1.0", "name>2", "name==1.0", etc. Writes the
+# name into name_out (cap-bounded, NUL-terminated), the version into
+# ver_out (NUL-terminated; empty if no operator), and the operator
+# into *op_out. Returns 0 on success, -1 on a malformed term.
+
+def _parse_constraint(spec: Ptr[uint8], spec_len: uint64,
+                      name_out: Ptr[uint8], name_cap: uint64,
+                      ver_out: Ptr[uint8], ver_cap: uint64,
+                      op_out: Ptr[int32]) -> int32:
+    op_out[0] = CMP_ANY
+    name_out[0] = 0
+    ver_out[0] = 0
+
+    # Find the operator boundary. The operators are '>=' '<=' '==' '>' '<'.
+    i: uint64 = 0
+    op_start: int64 = -1
+    op_kind: int32 = CMP_ANY
+    while i < spec_len:
+        c: uint8 = spec[i]
+        if c == 62:                                      # '>'
+            if i + 1 < spec_len and spec[i + 1] == 61:   # '>='
+                op_kind = CMP_GE
+                op_start = cast[int64](i)
+                i = i + 2
+                break
+            op_kind = CMP_GT
+            op_start = cast[int64](i)
+            i = i + 1
+            break
+        if c == 60:                                      # '<'
+            if i + 1 < spec_len and spec[i + 1] == 61:   # '<='
+                op_kind = CMP_LE
+                op_start = cast[int64](i)
+                i = i + 2
+                break
+            op_kind = CMP_LT
+            op_start = cast[int64](i)
+            i = i + 1
+            break
+        if c == 61:                                      # '='
+            if i + 1 < spec_len and spec[i + 1] == 61:   # '=='
+                op_kind = CMP_EQ
+                op_start = cast[int64](i)
+                i = i + 2
+                break
+            return -1
+        if c == 32 or c == 9 or c == 44:                 # ws / ','
+            break
+        i = i + 1
+
+    if op_start < 0:
+        # No operator — copy the whole spec as name.
+        no: uint64 = 0
+        j: uint64 = 0
+        while j < spec_len:
+            c2: uint8 = spec[j]
+            if c2 == 32 or c2 == 9 or c2 == 44:
+                break
+            if no + 1 >= name_cap:
+                break
+            name_out[no] = c2
+            no = no + 1
+            j = j + 1
+        name_out[no] = 0
+        return 0
+
+    # Name = spec[0..op_start); version = spec[i..spec_len).
+    no: uint64 = 0
+    jj: uint64 = 0
+    while jj < cast[uint64](op_start):
+        if no + 1 >= name_cap:
+            break
+        name_out[no] = spec[jj]
+        no = no + 1
+        jj = jj + 1
+    name_out[no] = 0
+    vo: uint64 = 0
+    while i < spec_len:
+        c3: uint8 = spec[i]
+        if c3 == 32 or c3 == 9 or c3 == 44:
+            break
+        if vo + 1 >= ver_cap:
+            break
+        ver_out[vo] = c3
+        vo = vo + 1
+        i = i + 1
+    ver_out[vo] = 0
+    op_out[0] = op_kind
+    return 0
+
+
+# Check whether `have_ver` satisfies `op want_ver`.
+def _version_satisfies(have_ptr: Ptr[uint8], have_len: uint64,
+                       op: int32,
+                       want_ptr: Ptr[uint8], want_len: uint64) -> int32:
+    if op == CMP_ANY:
+        return 1
+    c: int32 = _version_compare(have_ptr, have_len, want_ptr, want_len)
+    if op == CMP_GE:
+        if c >= 0:
+            return 1
+        return 0
+    if op == CMP_GT:
+        if c > 0:
+            return 1
+        return 0
+    if op == CMP_EQ:
+        if c == 0:
+            return 1
+        return 0
+    if op == CMP_LE:
+        if c <= 0:
+            return 1
+        return 0
+    if op == CMP_LT:
+        if c < 0:
+            return 1
+        return 0
+    return 0
+
+
+# Find the best repo entry whose name matches `want` AND whose version
+# satisfies (op, want_ver). Returns the repo idx, or -1 if none.
+
+def _pkg_find_best_constrained(want: Ptr[uint8], want_len: uint64,
+                               op: int32,
+                               want_ver: Ptr[uint8],
+                               want_ver_len: uint64) -> int64:
+    best: int64 = -1
+    i: uint64 = 0
+    while i < pkg_count:
+        if _name_eq_span(pkg_name_off[i], pkg_name_len[i],
+                         want, want_len) != 0:
+            ver_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+                cast[uint64](&idx_buf[0]) + pkg_version_off[i])
+            if _version_satisfies(ver_ptr, pkg_version_len[i],
+                                  op, want_ver, want_ver_len) != 0:
+                if best < 0:
+                    best = cast[int64](i)
+                else:
+                    bi: uint64 = cast[uint64](best)
+                    bver_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+                        cast[uint64](&idx_buf[0]) + pkg_version_off[bi])
+                    cmp: int32 = _version_compare(ver_ptr,
+                                                  pkg_version_len[i],
+                                                  bver_ptr,
+                                                  pkg_version_len[bi])
+                    if cmp > 0:
+                        best = cast[int64](i)
+        i = i + 1
+    return best
+
+
+# Check whether `cand` conflicts with anything in `resolved` (via the
+# cand's conflicts: list, OR any resolved's conflicts: targeting cand).
+# Also checks resolved+installed for the same name with a different
+# version (same-name version conflict). Returns 0 = no conflict, 1 =
+# conflict (diagnostic printed).
+
+def _check_conflicts(cand_idx: uint64) -> int32:
+    cand_name_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+        cast[uint64](&idx_buf[0]) + pkg_name_off[cand_idx])
+    cand_name_len: uint64 = pkg_name_len[cand_idx]
+    cand_ver_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+        cast[uint64](&idx_buf[0]) + pkg_version_off[cand_idx])
+    cand_ver_len: uint64 = pkg_version_len[cand_idx]
+
+    # 1. Same-name conflict in resolved (different version).
+    r: uint64 = 0
+    while r < res_count:
+        ri: uint64 = res_pkg_idx[r]
+        if pkg_name_len[ri] == cand_name_len:
+            same: int32 = 1
+            k: uint64 = 0
+            while k < cand_name_len:
+                if idx_buf[pkg_name_off[ri] + k] != cand_name_ptr[k]:
+                    same = 0
+                    break
+                k = k + 1
+            if same != 0:
+                # Same name — version must match.
+                rver_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+                    cast[uint64](&idx_buf[0]) + pkg_version_off[ri])
+                if _version_compare(rver_ptr, pkg_version_len[ri],
+                                    cand_ver_ptr, cand_ver_len) != 0:
+                    write_str(2, "hpm: same-name version conflict in solve: ")
+                    sys_write(2, cand_name_ptr, cand_name_len)
+                    write_str(2, "\n")
+                    return 1
+        r = r + 1
+
+    # 2. Same-name conflict in installed (different version).
+    ii: uint64 = 0
+    while ii < inst_count:
+        if inst_name_len[ii] == cand_name_len:
+            same2: int32 = 1
+            k: uint64 = 0
+            while k < cand_name_len:
+                if inst_buf[inst_name_off[ii] + k] != cand_name_ptr[k]:
+                    same2 = 0
+                    break
+                k = k + 1
+            if same2 != 0:
+                # Compare versions.
+                if _version_compare(&inst_buf[inst_ver_off[ii]],
+                                    inst_ver_len[ii],
+                                    cand_ver_ptr, cand_ver_len) != 0:
+                    write_str(2, "hpm: ")
+                    sys_write(2, cand_name_ptr, cand_name_len)
+                    write_str(2, " is already installed at a different version (use `hpm remove` first)\n")
+                    return 1
+        ii = ii + 1
+
+    # 3. Cand's declared conflicts target a resolved/installed pkg.
+    cc: uint64 = 0
+    while cc < pkg_conf_count[cand_idx]:
+        slot: uint64 = pkg_conf_start[cand_idx] + cc
+        cn_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](&idx_buf[0]) + conf_entry_off[slot])
+        cn_len: uint64 = conf_entry_len[slot]
+        # vs resolved
+        rr: uint64 = 0
+        while rr < res_count:
+            ri2: uint64 = res_pkg_idx[rr]
+            if pkg_name_len[ri2] == cn_len:
+                eq: int32 = 1
+                k2: uint64 = 0
+                while k2 < cn_len:
+                    if idx_buf[pkg_name_off[ri2] + k2] != cn_ptr[k2]:
+                        eq = 0
+                        break
+                    k2 = k2 + 1
+                if eq != 0:
+                    write_str(2, "hpm: declared-conflict: ")
+                    sys_write(2, cand_name_ptr, cand_name_len)
+                    write_str(2, " conflicts with ")
+                    sys_write(2, cn_ptr, cn_len)
+                    write_str(2, "\n")
+                    return 1
+            rr = rr + 1
+        # vs installed
+        ii2: uint64 = 0
+        while ii2 < inst_count:
+            if inst_name_len[ii2] == cn_len:
+                eq2: int32 = 1
+                k3: uint64 = 0
+                while k3 < cn_len:
+                    if inst_buf[inst_name_off[ii2] + k3] != cn_ptr[k3]:
+                        eq2 = 0
+                        break
+                    k3 = k3 + 1
+                if eq2 != 0:
+                    write_str(2, "hpm: declared-conflict: ")
+                    sys_write(2, cand_name_ptr, cand_name_len)
+                    write_str(2, " conflicts with installed ")
+                    sys_write(2, cn_ptr, cn_len)
+                    write_str(2, "\n")
+                    return 1
+            ii2 = ii2 + 1
+        cc = cc + 1
+
+    # 4. Any resolved/installed pkg's conflicts: targets cand.
+    rr2: uint64 = 0
+    while rr2 < res_count:
+        ri3: uint64 = res_pkg_idx[rr2]
+        cc2: uint64 = 0
+        while cc2 < pkg_conf_count[ri3]:
+            slot2: uint64 = pkg_conf_start[ri3] + cc2
+            cn2_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+                cast[uint64](&idx_buf[0]) + conf_entry_off[slot2])
+            cn2_len: uint64 = conf_entry_len[slot2]
+            if cn2_len == cand_name_len:
+                eq3: int32 = 1
+                k4: uint64 = 0
+                while k4 < cn2_len:
+                    if cn2_ptr[k4] != cand_name_ptr[k4]:
+                        eq3 = 0
+                        break
+                    k4 = k4 + 1
+                if eq3 != 0:
+                    write_str(2, "hpm: declared-conflict (resolved->cand): ")
+                    sys_write(2, &idx_buf[pkg_name_off[ri3]],
+                              pkg_name_len[ri3])
+                    write_str(2, " conflicts with ")
+                    sys_write(2, cand_name_ptr, cand_name_len)
+                    write_str(2, "\n")
+                    return 1
+            cc2 = cc2 + 1
+        rr2 = rr2 + 1
+
+    return 0
+
+
+# Is `cand_name` already in res_*? Returns -1 if no, else the res idx.
+def _find_in_resolved(cand_name: Ptr[uint8], cand_name_len: uint64) -> int64:
+    r: uint64 = 0
+    while r < res_count:
+        ri: uint64 = res_pkg_idx[r]
+        if pkg_name_len[ri] == cand_name_len:
+            eq: int32 = 1
+            k: uint64 = 0
+            while k < cand_name_len:
+                if idx_buf[pkg_name_off[ri] + k] != cand_name[k]:
+                    eq = 0
+                    break
+                k = k + 1
+            if eq != 0:
+                return cast[int64](r)
+        r = r + 1
+    return -1
+
+
+# Is `cand_name` already installed? Returns -1 if no, else the inst idx.
+def _find_in_installed(cand_name: Ptr[uint8], cand_name_len: uint64) -> int64:
+    i: uint64 = 0
+    while i < inst_count:
+        if inst_name_len[i] == cand_name_len:
+            eq: int32 = 1
+            k: uint64 = 0
+            while k < cand_name_len:
+                if inst_buf[inst_name_off[i] + k] != cand_name[k]:
+                    eq = 0
+                    break
+                k = k + 1
+            if eq != 0:
+                return cast[int64](i)
+        i = i + 1
+    return -1
+
+
+def _queue_push(name_ptr: Ptr[uint8], name_len: uint64,
+                op: int32, ver_ptr: Ptr[uint8], ver_len: uint64,
+                parent: uint64) -> int32:
+    if q_tail >= 256:
+        write_str(2, "hpm: solve queue overflow\n")
+        return -1
+    q_name_ptr[q_tail] = cast[uint64](name_ptr)
+    q_name_len[q_tail] = name_len
+    q_op[q_tail] = op
+    q_ver_ptr[q_tail] = cast[uint64](ver_ptr)
+    q_ver_len[q_tail] = ver_len
+    q_parent[q_tail] = parent
+    q_tail = q_tail + 1
+    return 0
+
+
+# Topologically sort res_pkg_idx[] using the adjacency table built
+# during solve. Writes the post-order rank into res_topo_rank[].
+# Simple iterative DFS — RES_MAX is 64.
+
+topo_visited: Array[64, int32]
+topo_order:   Array[64, uint64]
+topo_n:       uint64 = 0
+
+
+def _topo_visit(node: uint64):
+    if topo_visited[node] != 0:
+        return
+    topo_visited[node] = 1
+    # Visit children (packages that depend on this one — no wait, we
+    # want post-order so the package itself comes AFTER its deps).
+    # Edges: adj_to[i] for the resolved set — we recorded edge (parent
+    # -> child) where child is a dep, so a topo install order is
+    # children first.
+    j: uint64 = 0
+    while j < adj_n:
+        if cast[uint64](adj_to[j] >> 32) == node:
+            child: uint64 = adj_to[j] & 0xFFFFFFFF
+            _topo_visit(child)
+        j = j + 1
+    topo_order[topo_n] = node
+    topo_n = topo_n + 1
+
+
+def _topo_sort():
+    i: uint64 = 0
+    while i < 64:
+        topo_visited[i] = 0
+        i = i + 1
+    topo_n = 0
+    j: uint64 = 0
+    while j < res_count:
+        _topo_visit(j)
+        j = j + 1
+    # topo_order is now [deps..., root] which is the install order.
+
+
+# Solve: build res_* by BFS from the user's root spec. Returns 0 on
+# success, -1 on failure.
+
+def _solve(root_spec: Ptr[uint8]) -> int32:
+    res_count = 0
+    q_head = 0
+    q_tail = 0
+    adj_n = 0
+    # zero counts
+    az: uint64 = 0
+    while az < 64:
+        adj_count[az] = 0
+        az = az + 1
+
+    # Parse the root spec into name/op/ver.
+    spec_len: uint64 = strlen_u8(root_spec)
+    # Pre-process: spec is either "<name>" or "<name>@<ver>" (CLI),
+    # not the dependency-list form. Translate '@' to '==' for the
+    # parser — '@' means pin (== exactly).
+    norm_buf: Array[256, uint8]
+    no: uint64 = 0
+    at_seen: int32 = 0
+    si: uint64 = 0
+    while si < spec_len and no + 2 < 256:
+        c: uint8 = root_spec[si]
+        if c == 64 and at_seen == 0:                     # '@'
+            norm_buf[no] = 61                            # '='
+            no = no + 1
+            norm_buf[no] = 61                            # '='
+            no = no + 1
+            at_seen = 1
+        else:
+            norm_buf[no] = c
+            no = no + 1
+        si = si + 1
+    norm_buf[no] = 0
+    norm_len: uint64 = no
+
+    root_op: int32 = CMP_ANY
+    if _parse_constraint(&norm_buf[0], norm_len,
+                         &root_name_buf[0], 128,
+                         &root_ver_buf[0], 64, &root_op) != 0:
+        write_str(2, "hpm: malformed package spec\n")
+        return -1
+
+    rn_len: uint64 = strlen_u8(&root_name_buf[0])
+    rv_len: uint64 = strlen_u8(&root_ver_buf[0])
+    if _queue_push(&root_name_buf[0], rn_len, root_op,
+                   &root_ver_buf[0], rv_len, 0xffff) != 0:
+        return -1
+
+    while q_head < q_tail:
+        # Pop one req.
+        np: Ptr[uint8] = cast[Ptr[uint8]](q_name_ptr[q_head])
+        nl: uint64 = q_name_len[q_head]
+        op: int32 = q_op[q_head]
+        vp: Ptr[uint8] = cast[Ptr[uint8]](q_ver_ptr[q_head])
+        vl: uint64 = q_ver_len[q_head]
+        parent: uint64 = q_parent[q_head]
+        q_head = q_head + 1
+
+        # Already in resolved?
+        ridx_i: int64 = _find_in_resolved(np, nl)
+        if ridx_i >= 0:
+            ridx: uint64 = cast[uint64](ridx_i)
+            # Verify the existing version satisfies the new constraint.
+            pi: uint64 = res_pkg_idx[ridx]
+            rv_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+                cast[uint64](&idx_buf[0]) + pkg_version_off[pi])
+            if _version_satisfies(rv_ptr, pkg_version_len[pi],
+                                  op, vp, vl) == 0:
+                write_str(2, "hpm: unsatisfiable: resolved ")
+                sys_write(2, np, nl)
+                write_str(2, " does not satisfy constraint\n")
+                return -1
+            # Add edge parent -> ridx (parent depends on ridx).
+            if parent != 0xffff:
+                if adj_n < 4096:
+                    adj_to[adj_n] = (parent << 32) | ridx
+                    adj_n = adj_n + 1
+            continue
+
+        # Already installed?
+        iidx_i: int64 = _find_in_installed(np, nl)
+        if iidx_i >= 0:
+            iidx: uint64 = cast[uint64](iidx_i)
+            if _version_satisfies(&inst_buf[inst_ver_off[iidx]],
+                                  inst_ver_len[iidx],
+                                  op, vp, vl) == 0:
+                write_str(2, "hpm: unsatisfiable: installed ")
+                sys_write(2, np, nl)
+                write_str(2, " does not satisfy constraint\n")
+                return -1
+            # Installed pkgs aren't re-added; no edge.
+            continue
+
+        # Find the best repo candidate.
+        cand_i: int64 = _pkg_find_best_constrained(np, nl, op, vp, vl)
+        if cand_i < 0:
+            write_str(2, "hpm: no candidate for ")
+            sys_write(2, np, nl)
+            write_str(2, "\n")
+            return -1
+        cand: uint64 = cast[uint64](cand_i)
+
+        # Conflicts?
+        if _check_conflicts(cand) != 0:
+            return -1
+
+        # Add to resolved.
+        if res_count >= 64:
+            write_str(2, "hpm: dep closure too large (>64)\n")
+            return -1
+        new_ridx: uint64 = res_count
+        res_pkg_idx[res_count] = cand
+        res_count = res_count + 1
+
+        # Edge parent -> new_ridx.
+        if parent != 0xffff:
+            if adj_n < 4096:
+                adj_to[adj_n] = (parent << 32) | new_ridx
+                adj_n = adj_n + 1
+
+        # Enqueue this pkg's deps.
+        dc: uint64 = pkg_dep_count[cand]
+        ds: uint64 = pkg_dep_start[cand]
+        di: uint64 = 0
+        while di < dc:
+            slot: uint64 = ds + di
+            # Each dep entry is "name" or "name>=ver" etc. — parse it.
+            dn_buf: Array[128, uint8]
+            dv_buf: Array[64, uint8]
+            dop: int32 = CMP_ANY
+            if _parse_constraint(
+                    cast[Ptr[uint8]](
+                        cast[uint64](&idx_buf[0]) + dep_entry_off[slot]),
+                    dep_entry_len[slot],
+                    &dn_buf[0], 128, &dv_buf[0], 64, &dop) != 0:
+                write_str(2, "hpm: malformed dep entry\n")
+                return -1
+            # We need stable pointers — copy into per-queue-entry
+            # scratch. To avoid 256 separate buffers we cheat: each
+            # dep name+ver is a small substring of idx_buf, so push
+            # idx_buf pointers directly. The dep entry IS in idx_buf
+            # already — but version-constraint operators split it. We
+            # work around by using a flat name/ver scratch table per
+            # queue slot.
+            if _push_dep_with_scratch(&dn_buf[0], &dv_buf[0],
+                                      dop, new_ridx) != 0:
+                return -1
+            di = di + 1
+
+    _topo_sort()
+    return 0
+
+
+# Per-queue scratch backing for dep names + versions. Each pushed
+# dep gets its own slot in q_scratch_strs; the queue's name_ptr /
+# ver_ptr point into it.
+q_scratch_strs: Array[16384, uint8]
+q_scratch_n:    uint64 = 0
+
+
+def _push_dep_with_scratch(name: Ptr[uint8], ver: Ptr[uint8],
+                           op: int32, parent: uint64) -> int32:
+    nlen: uint64 = strlen_u8(name)
+    vlen: uint64 = strlen_u8(ver)
+    if q_scratch_n + nlen + vlen + 2 > 16384:
+        write_str(2, "hpm: dep scratch overflow\n")
+        return -1
+    name_off: uint64 = q_scratch_n
+    i: uint64 = 0
+    while i < nlen:
+        q_scratch_strs[q_scratch_n] = name[i]
+        q_scratch_n = q_scratch_n + 1
+        i = i + 1
+    q_scratch_strs[q_scratch_n] = 0
+    q_scratch_n = q_scratch_n + 1
+    ver_off: uint64 = q_scratch_n
+    j: uint64 = 0
+    while j < vlen:
+        q_scratch_strs[q_scratch_n] = ver[j]
+        q_scratch_n = q_scratch_n + 1
+        j = j + 1
+    q_scratch_strs[q_scratch_n] = 0
+    q_scratch_n = q_scratch_n + 1
+    return _queue_push(&q_scratch_strs[name_off], nlen,
+                       op, &q_scratch_strs[ver_off], vlen, parent)
+
+
+# -- file-conflict check (third conflict flavour) ---------------------
+#
+# Walks the staged tarball's files/ entries and checks each against
+# every installed package's `files` list — if any path overlaps with
+# a different package's files (different name), FAIL the install.
+
+def _check_file_conflicts(tar_len: uint64,
+                          installing_name: Ptr[uint8]) -> int32:
+    in_name_len: uint64 = strlen_u8(installing_name)
+    off: uint64 = 0
+    files_pfx: Ptr[uint8] = "files/"
+    files_pfx_len: uint64 = 6
+
+    while off + 512 <= tar_len:
+        hdr: Ptr[uint8] = &tar_buf[off]
+        if _tar_header_is_zero(hdr) != 0:
+            return 0
+        if _tar_chksum_ok(hdr) == 0:
+            return -1
+        size: uint64 = _tar_parse_octal(&hdr[124], 12)
+        typeflag: uint8 = hdr[156]
+        body_blocks: uint64 = (size + 511) / 512
+
+        nlen: uint64 = _name_copy_nul(&warn_buf[0], &hdr[0], 100)
+        if nlen <= pkg_prefix_len:
+            off = off + 512 + body_blocks * 512
+            continue
+        prefix_ok: int32 = 1
+        i: uint64 = 0
+        while i < pkg_prefix_len:
+            if warn_buf[i] != pkg_prefix_buf[i]:
+                prefix_ok = 0
+                break
+            i = i + 1
+        if prefix_ok == 0:
+            off = off + 512 + body_blocks * 512
+            continue
+        tail_start: uint64 = pkg_prefix_len
+        tail_len: uint64 = nlen - tail_start
+        if tail_len < files_pfx_len:
+            off = off + 512 + body_blocks * 512
+            continue
+        ok: int32 = 1
+        j: uint64 = 0
+        while j < files_pfx_len:
+            if warn_buf[tail_start + j] != files_pfx[j]:
+                ok = 0
+                break
+            j = j + 1
+        if ok == 0:
+            off = off + 512 + body_blocks * 512
+            continue
+        rel_start: uint64 = tail_start + files_pfx_len
+        rel_len: uint64 = tail_len - files_pfx_len
+        if rel_len == 0:
+            off = off + 512 + body_blocks * 512
+            continue
+        # Regular file? (Directories don't conflict.)
+        if typeflag != 0 and typeflag != 48:
+            off = off + 512 + body_blocks * 512
+            continue
+        # Check against every installed package's files.
+        ip: uint64 = 0
+        while ip < inst_count:
+            # Skip same-name (we already block reinstall earlier).
+            if inst_name_len[ip] == in_name_len:
+                samep: int32 = 1
+                k: uint64 = 0
+                while k < in_name_len:
+                    if inst_buf[inst_name_off[ip] + k] != installing_name[k]:
+                        samep = 0
+                        break
+                    k = k + 1
+                if samep != 0:
+                    ip = ip + 1
+                    continue
+            # Walk this installed pkg's files.
+            fc: uint64 = inst_file_count[ip]
+            fs: uint64 = inst_file_start[ip]
+            fi: uint64 = 0
+            while fi < fc:
+                slot: uint64 = fs + fi
+                if inst_file_len[slot] == rel_len:
+                    eq: int32 = 1
+                    kk: uint64 = 0
+                    while kk < rel_len:
+                        if inst_buf[inst_file_off[slot] + kk] != \
+                                warn_buf[rel_start + kk]:
+                            eq = 0
+                            break
+                        kk = kk + 1
+                    if eq != 0:
+                        write_str(2, "hpm: file conflict: ")
+                        sys_write(2, &warn_buf[rel_start], rel_len)
+                        write_str(2, " is owned by ")
+                        sys_write(2, &inst_buf[inst_name_off[ip]],
+                                  inst_name_len[ip])
+                        write_str(2, "\n")
+                        return -1
+                fi = fi + 1
+            ip = ip + 1
+
+        off = off + 512 + body_blocks * 512
+    return 0
+
+
+# Install one resolved package by repo index. Reuses the Phase 3
+# install flow but takes the repo idx directly (rather than parsing
+# a name@ver spec). Returns 0 on success.
+
+def _install_one_by_repo_idx(pi: uint64, pinned: int32) -> int32:
+    name_buf: Array[128, uint8]
+    _strcopy_n(&name_buf[0], &idx_buf[pkg_name_off[pi]],
+               pkg_name_len[pi], 128)
+    name_len: uint64 = strlen_u8(&name_buf[0])
+
+    v_cstr: Array[64, uint8]
+    _strcopy_n(&v_cstr[0], &idx_buf[pkg_version_off[pi]],
+               pkg_version_len[pi], 64)
+    url_cstr: Array[512, uint8]
+    _strcopy_n(&url_cstr[0], &idx_buf[pkg_url_off[pi]],
+               pkg_url_len[pi], 512)
+    sha_cstr: Array[80, uint8]
+    _strcopy_n(&sha_cstr[0], &idx_buf[pkg_sha256_off[pi]],
+               pkg_sha256_len[pi], 80)
+    target_cstr: Array[128, uint8]
+    if pkg_target_len[pi] > 0:
+        _strcopy_n(&target_cstr[0], &idx_buf[pkg_target_off[pi]],
+                   pkg_target_len[pi], 128)
+    else:
+        _strcopy_cstr(&target_cstr[0],
+                      cast[Ptr[uint8]]("#hamnix-system"), 128)
+
+    write_str(1, "hpm:   installing ")
+    sys_write(1, &name_buf[0], name_len)
+    write_str(1, "@")
+    write_str(1, &v_cstr[0])
+    write_str(1, "\n")
+
+    n: int64 = fetch_to_buf(&url_cstr[0], &deb_buf[0], TARBALL_CAP)
+    if n < 0:
+        return 1
+    deb_len: uint64 = cast[uint64](n)
+
+    _sha256_hash_buf(&deb_buf[0], deb_len)
+    expected_len: uint64 = strlen_u8(&sha_cstr[0])
+    if expected_len != 64:
+        write_str(2, "hpm: index sha256 is not 64 hex chars\n")
+        return 1
+    mi: uint64 = 0
+    while mi < 64:
+        ec: uint8 = sha_cstr[mi]
+        if ec >= 65 and ec <= 70:
+            ec = ec + 32
+        if sha_hex[mi] != ec:
+            write_str(2, "hpm: SHA-256 mismatch — refusing to install\n")
+            return 1
+        mi = mi + 1
+
+    tar_len_i: int64 = _inflate_tarball(deb_len)
+    if tar_len_i < 0:
+        return 1
+    tar_len: uint64 = cast[uint64](tar_len_i)
+
+    pp: uint64 = 0
+    ni: uint64 = 0
+    while ni < name_len and pp + 1 < 128:
+        pkg_prefix_buf[pp] = name_buf[ni]
+        pp = pp + 1
+        ni = ni + 1
+    pkg_prefix_buf[pp] = 45
+    pp = pp + 1
+    vi: uint64 = 0
+    vl: uint64 = strlen_u8(&v_cstr[0])
+    while vi < vl and pp + 1 < 128:
+        pkg_prefix_buf[pp] = v_cstr[vi]
+        pp = pp + 1
+        vi = vi + 1
+    pkg_prefix_buf[pp] = 47
+    pp = pp + 1
+    pkg_prefix_buf[pp] = 0
+    pkg_prefix_len = pp
+
+    if _read_pkginfo_from_tar(tar_len) != 0:
+        return 1
+    pi_t_len: uint64 = strlen_u8(&pi_target[0])
+    if pi_t_len > 0:
+        _strcopy_cstr(&target_cstr[0], &pi_target[0], 128)
+    target_len_eff: uint64 = strlen_u8(&target_cstr[0])
+
+    if _set_target_prefix(&target_cstr[0], target_len_eff) != 0:
+        return 1
+    if target_prefix_buf[0] != 0:
+        _mkdir_p(&target_prefix_buf[0])
+        sys_mkdir(cast[Ptr[char]](&target_prefix_buf[0]))
+
+    # File conflict check (third conflict flavour) BEFORE staging.
+    if _check_file_conflicts(tar_len, &name_buf[0]) != 0:
+        return 1
+
+    if _stage_tarball(tar_len) != 0:
+        write_str(2, "hpm: tarball staging failed\n")
+        return 1
+    if _run_hook(&staging_root_buf[0],
+                 cast[Ptr[uint8]]("pre-install.hamsh"),
+                 &name_buf[0], &v_cstr[0], &target_cstr[0]) != 0:
+        return 1
+
+    _new_files_reset()
+    if _stage_extract_files(tar_len, &target_prefix_buf[0]) != 0:
+        return 1
+
+    if _run_hook(&staging_root_buf[0],
+                 cast[Ptr[uint8]]("install.hamsh"),
+                 &name_buf[0], &v_cstr[0], &target_cstr[0]) != 0:
+        return 1
+
+    if _installed_rewrite_with_added(&name_buf[0], &v_cstr[0],
+                                     &target_cstr[0], pinned) != 0:
+        return 1
+    # Reload installed.json so subsequent in-loop conflict checks see
+    # the just-added package's file list.
+    if _load_installed() < 0:
+        return 1
+    return 0
+
+
+# Solver-driven install: resolve the whole closure, then install in
+# topological order.
+def cmd_install_solved(spec: Ptr[uint8]) -> int32:
+    if _load_index_cache() != 0:
+        write_str(2, "hpm: no cached index; run `hpm refresh` first\n")
+        return 1
+    lrc: int32 = _load_installed()
+    if lrc < 0:
+        return 1
+
+    if _solve(spec) != 0:
+        return 1
+
+    write_str(1, "hpm: resolved ")
+    write_dec_u64(1, res_count)
+    write_str(1, " package(s):\n")
+    ti: uint64 = 0
+    while ti < topo_n:
+        ri: uint64 = topo_order[ti]
+        pi: uint64 = res_pkg_idx[ri]
+        write_str(1, "  ")
+        sys_write(1, &idx_buf[pkg_name_off[pi]], pkg_name_len[pi])
+        write_str(1, "@")
+        sys_write(1, &idx_buf[pkg_version_off[pi]], pkg_version_len[pi])
+        write_str(1, "\n")
+        ti = ti + 1
+
+    # Determine if the root was @-pinned.
+    pinned_root: int32 = 0
+    si: uint64 = 0
+    while spec[si] != 0:
+        if spec[si] == 64:
+            pinned_root = 1
+            break
+        si = si + 1
+
+    # Install in topological order. Root is the LAST entry. Pinning
+    # only applies to the root (per spec — `@<ver>` on root pins root).
+    ii: uint64 = 0
+    while ii < topo_n:
+        ri: uint64 = topo_order[ii]
+        pi: uint64 = res_pkg_idx[ri]
+        is_root: int32 = 0
+        if ii + 1 == topo_n:
+            is_root = 1
+        pin_v: int32 = 0
+        if is_root != 0 and pinned_root != 0:
+            pin_v = 1
+        if _install_one_by_repo_idx(pi, pin_v) != 0:
+            write_str(2, "hpm: install of ")
+            sys_write(2, &idx_buf[pkg_name_off[pi]], pkg_name_len[pi])
+            write_str(2, " failed; closure aborted (previously installed packages remain)\n")
+            return 1
+        ii = ii + 1
+    return 0
+
+
 # -- usage + main -----------------------------------------------------
 
 def _usage() -> int32:
@@ -4061,7 +4996,7 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
         if ai >= argc:
             write_str(2, "hpm: install requires a package name\n")
             return 1
-        return cmd_install_v3(cast[Ptr[uint8]](argv[cast[uint64](ai)]))
+        return cmd_install_solved(cast[Ptr[uint8]](argv[cast[uint64](ai)]))
     if _streq(cmd, cast[Ptr[uint8]]("remove")) != 0:
         if ai >= argc:
             write_str(2, "hpm: remove requires a package name\n")
