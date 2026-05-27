@@ -99,25 +99,61 @@ need it to interoperate with Hamnix-native concepts (Plan 9 file
 servers at `/srv`, `/net`, `/proc`), shim THAT layer — not the tool
 itself.
 
-### Aspirational: native Hamnix package manager (default-namespace tool)
+### Native Hamnix package manager (`hpm`) — shipped
 
-A future native package manager — call it `hpm` — would manage
-**Hamnix-side** state: native services, kernel modules, the rootfs
-ext4 image's contents, the L-shim shape, framework `.ko` registry.
-It is NOT a replacement for apt; it does not install Debian packages.
-It runs in init's default namespace alongside hamsh, configures
-Hamnix itself, and never enters a Linux namespace.
+`hpm` (`user/hpm.ad`, `/bin/hpm`) is the Hamnix-native package manager
+in init's default namespace. It manages **Hamnix-side** state: native
+services, kernel modules, the rootfs ext4 image's contents, the L-shim
+shape, framework `.ko` registry, distro-namespace populations
+(`linux-debian-12`'s rootfs tree), and the OS itself. It is **NOT** a
+replacement for apt and does not install Debian packages.
 
 The contract:
 - `apt` (Linux ns) manages `/var/lib/distros/<distro>/` content
-- `hpm` (default ns, future) manages Hamnix's own services and
-  kernel-side state — `etc/rc.boot`, the framework module set,
-  the rootfs image layout
+- `hpm` (default ns) manages Hamnix's own services and kernel-side
+  state — `etc/rc.boot`, the framework module set, the rootfs image
+  layout, the live system's `/var/lib/hpm/installed.json` DB
 
 If both ever need to coordinate (e.g. "user wants a service that's
 in Debian, install via apt, then register with init"), that's
 a Layer 5 application-level workflow — not a `hpm`-calls-apt
 shim. The two managers stay in their own namespaces.
+
+v1 is binary-only with a greedy BFS dependency solver + conflict
+detection; write commands gate on uid==1 (hostowner). Five v1
+packages live at the canonical repo `https://255.one/`:
+`hamnix-hello`, `hamnix-base`, `hamnix-bootloader`,
+`hamnix-installer-tools`, `linux-debian-12`. See
+[`packages.md`](packages.md) for the format spec.
+
+### Security model — Plan-9-shape
+
+The native security model is **Plan 9's**, not POSIX's: a single
+**hostowner** (uid 1) per installed system owns everything privileged
+and runs `hpm`; regular users (uid >= 1000) get a restricted namespace
+at login (`/etc/users/<name>.ns`) and literally can't address the
+dangerous file servers / partitions. **No setuid binaries, no `sudo`,
+no `su`.** Elevation is `newshell hostowner` (a hamsh builtin —
+factotum-shape re-auth via the kernel-side `#auth` cdev at `/dev/auth`,
+which is the only userland path that consults `/etc/shadow`).
+
+Implementation surface (all shipped):
+- `uid`/`gid` fields on `TaskStruct`; inherited on fork; new
+  syscalls `SYS_GETUID=288`, `SYS_GETGID=289`, `SYS_SETUID=290`
+  (hostowner-only).
+- `/etc/passwd` + `/etc/shadow` formats parsed by `lib/passwd/`;
+  password hashes are SHA-512-crypt (`$6$<salt>$<hash>`) via
+  `lib/crypt/sha512_crypt.ad`.
+- VFS permission check on `open`/`create`/`exec` (owner/group/other
+  rwx); ext4 stamps owner/group/mode on inode-create.
+- `svc` switches uid before exec (sshd runs as system uid 2).
+- The live ISO bakes `live:hamnix` as hostowner; the installer
+  replaces it with the user's choice.
+
+POSIX-shape security (real `sudo`, `/etc/sudoers`, setuid bits) lives
+**inside the Linux namespace** where Debian's own machinery runs
+unmodified. The two worlds don't borrow each other's idioms. See
+[`security.md`](security.md) for the full spec.
 
 ## What each layer is for
 
@@ -421,10 +457,13 @@ breaks either reverts before merge.
 
 1. This document.
 2. `native-api.md` — the syscall surface and the migration table.
-3. `rio.md` — the file-based window system and its draw protocol.
-4. `README.md` — current state of the implementation against this
+3. `security.md` — the Plan-9-shape security model
+   (hostowner / namespace-as-authority / `#auth` cdev).
+4. `packages.md` — the `hpm` package format.
+5. `rio.md` — the file-based window system and its draw protocol.
+6. `README.md` — current state of the implementation against this
    architecture.
-5. `linux_abi/TARGET_ABI.md` — the pinned Linux ABI we translate
+7. `linux_abi/TARGET_ABI.md` — the pinned Linux ABI we translate
    into.
 
 ## References
