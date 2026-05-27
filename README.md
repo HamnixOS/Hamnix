@@ -152,11 +152,33 @@ and discovery".
 - **Block stack**: AHCI + NVMe, MBR + GPT read+write, FAT32 read,
   EXT4 read+write, partition-aware block-device naming (`sd0p1`,
   `nvme0n1p2`).
-- **Aspirational**: a Hamnix-native package manager (working name
-  `hpm`) would manage Hamnix-side state — services, kernel modules,
-  the rootfs partition layout — in init's DEFAULT namespace. It is
-  NOT a substitute for apt; apt stays in the Linux namespace for
-  Debian packages. See `docs/architecture.md` § "What runs where".
+- **Package manager (`hpm`)**: the Hamnix-native package manager
+  ships as `/bin/hpm`. `hpm` manages **Hamnix-side state** —
+  services, kernel modules, the rootfs partition layout — in init's
+  DEFAULT namespace. It is NOT a substitute for apt; apt stays in
+  the Linux namespace for Debian packages. v1 is binary-only with a
+  greedy BFS dep solver + conflict detection; write commands gate
+  on uid==1 (hostowner). Five packages live at the canonical repo
+  `https://255.one/`: `hamnix-hello`, `hamnix-base`,
+  `hamnix-bootloader`, `hamnix-installer-tools`, `linux-debian-12`.
+  The installer (`etc/install.hamsh`) is now `hpm install`-driven
+  against an ISO-local mini-repo. See `docs/packages.md`,
+  `docs/architecture.md` § "What runs where".
+- **Security (Plan-9-shape)**: a single hostowner (uid 1) per
+  installed system owns everything privileged; regular users
+  (uid >= 1000) get a restricted namespace at login and literally
+  can't address the dangerous file servers / partitions. **No
+  setuid binaries, no `sudo`, no `su`.** Elevation is `newshell
+  hostowner` (a hamsh builtin, not a binary). Passwords live in
+  `/etc/shadow` as `$6$<salt>$<sha-512-crypt>`; authentication
+  goes through a kernel-side `#auth` cdev at `/dev/auth` (the only
+  userland path that consults `/etc/shadow`). VFS open/create/exec
+  permission-check against owner/group/other rwx; ext4 stamps
+  owner/group/mode on inode-create. Services run with declared
+  system uids (sshd as uid 2); init switches uid before exec.
+  See `docs/security.md`. The Linux namespace keeps real Debian
+  POSIX (`sudo` + setuid bits inside `enter linux { ... }`); the
+  two worlds don't borrow each other's idioms.
 - **Plan 9 base**: codec + spec, kernel 9P client (V4.1 — `create`
   over a real fd; connection table released on unmount + task exit),
   per-process Pgrps (heap-allocated), `/srv` / `/n` / `/proc/<pid>/ns`
@@ -174,9 +196,28 @@ and discovery".
   (no more hard-coded `distrorun`). Full interactive line editor:
   Left/Right/Home/End/Delete cursor editing, cursor-aware backspace,
   Up/Down history (48-entry ring), Tab completion (command + path),
-  Ctrl-A/E/C, ANSI-escape state machine. Plus ~60 GNU-style native
-  binaries; per-process namespaces verified to isolate. See
-  [`docs/HAMSH_SPEC.md`](docs/HAMSH_SPEC.md) for the language reference.
+  Ctrl-A/E/C, ANSI-escape state machine. Builtins include `read
+  [-s] VAR` (interactive prompting, used by installer + `newshell`)
+  and `newshell <user> [-c <cmd>]` (Plan-9-shape factotum-style
+  re-auth — `newshell` reads `/etc/passwd`, prompts password, drives
+  `/dev/auth` for credential check, `rfork`s + switches uid + execs
+  hamsh which loads `/etc/users/<name>.ns`). The in-init service
+  supervisor exposes `svc start/stop/status/restart`; live state is
+  mirrored to `/proc/svc/<name>` for shell-grep inspection (via
+  `SYS_SVC_PUBLISH`). Plus ~60 GNU-style native binaries
+  (including `/bin/hpm`); per-process namespaces verified to
+  isolate. See [`docs/HAMSH_SPEC.md`](docs/HAMSH_SPEC.md) for the
+  language reference.
+- **Installer**: `etc/install.hamsh` is the Hamnix installer —
+  7-step Debian-installer-shape script driven by `hpm install`
+  against an ISO-local mini-repo at `/iso-packages/`. Prompts for
+  hostowner username/password (or runs non-interactively under
+  `HAMNIX_HOSTOWNER_USER` / `HAMNIX_HOSTOWNER_PASSWORD`); plants
+  `/etc/passwd` + `/etc/shadow` on the installed disk; the rootfs
+  ext4 partition is created small and grown to fit the target disk
+  on first boot. `scripts/test_installer_full.sh` exercises the
+  full loop (build ISO → install → reboot from disk → first-boot
+  grow + idempotent second boot) and PASSES end-to-end.
 
 For the full milestone log (140+ entries across M / L / U tracks), see
 **[STATUS.md](STATUS.md)**.
@@ -303,17 +344,21 @@ beyond MVP.
 Compiler bugs that surfaced during development have landed proper
 fixes — do not work around them: the U9 nested-frame `Array` spill,
 `Ptr[T]` writes to `&local` sub-8-byte scalars, `&arr[i][j]` on 2-D
-`Array` globals, string-literal-initialised globals, and the
-signed-only integer comparison. Language quirks land in
-`tests/test_compiler_*.ad` as guarded regressions the moment they're
-surfaced — see [`scripts/run_compiler_tests.sh`](scripts/run_compiler_tests.sh)
-(14 fixtures, all green). `LANGUAGE.md` was audited against
-`compiler/codegen_x86.py` in `b385a4b` — ~14 documented-but-fictional
-features (lambdas, `try`/`except`, list comprehensions, f-strings,
-`match`/`case`, class methods, `sizeof` builtin, default args,
+`Array` globals, string-literal-initialised globals, the
+signed-only integer comparison, `Ptr[T] + N` byte-vs-element
+scaling, and `Percpu[Array]`/`Percpu[struct]` aggregate `%gs:`
+addressing. Language quirks and their regression fixtures (plus
+`LANGUAGE.md` itself) **now live in the
+[`HamnixOS/adder`](https://github.com/HamnixOS/adder) submodule** —
+the adder repo's `scripts/run_compiler_tests.sh` runs every
+fixture, and `scripts/test_compiler_unsupported_rejected.sh` guards
+~14 documented-but-fictional features (lambdas, `try`/`except`,
+list comprehensions, f-strings, `match`/`case`, class methods (now
+shipped as real methods), `sizeof` builtin, default args,
 `with`-statements, decorators, dict/list/tuple/optional types,
-unions) were deleted and `scripts/test_compiler_unsupported_rejected.sh`
-guards each as a permanent codegen-rejects backstop.
+unions) as a permanent codegen-rejects backstop. Hamnix CI runs
+`scripts/test_adder_pin.sh` to enforce that the submodule HEAD is a
+real upstream Adder commit.
 
 ---
 
