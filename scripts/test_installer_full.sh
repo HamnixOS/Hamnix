@@ -26,7 +26,8 @@
 #   "hpm: installed hamnix-installer-tools"
 #   "hpm: installed hamnix-bootloader"
 #   "hpm: installed linux-debian-12"
-#   "[install] (7/7) install complete"
+#   "[install] (7/7) hostowner credentials"  (Phase 12 prompt step)
+#   "[install] install complete"             (final banner)
 #
 # Markers asserted on Stage C (boot from disk alone):
 #   "Hamnix kernel booting"             (kernel banner)
@@ -131,7 +132,14 @@ else
     echo "[test_installer_full]   MISS: dd_blk: OK appeared $ddok times (need 2)" >&2
     stage_b_fail=1
 fi
-check_marker '\[install\] \(7/7\) install complete' "install complete"
+# etc/install.hamsh layout (post-ac0bf0d):
+#   step (7/7) header is "hostowner credentials" (the prompt step),
+#   and the final banner is the unadorned "[install] install complete".
+# Assert BOTH — the prompt step must have run, AND the run must have
+# reached the install-complete banner. Strengthens the previous
+# single-line check that conflated the two.
+check_marker '\[install\] \(7/7\) hostowner credentials' "step 7 reached"
+check_marker '^\[install\] install complete' "install complete"
 
 if [ "$stage_b_fail" -ne 0 ]; then
     echo "[test_installer_full] Stage B FAILED — last 80 lines of log:" >&2
@@ -252,7 +260,11 @@ stage_d_install_and_boot() {
         > "$install_log" 2>&1
     set -e
 
-    if ! grep -aE -q '\[install\] \(7/7\) install complete' "$install_log"; then
+    # See Stage B above re: the install.hamsh banner layout. Two
+    # markers: (7/7) hostowner credentials must have run, AND the
+    # final "install complete" line must be present.
+    if ! grep -aE -q '\[install\] \(7/7\) hostowner credentials' "$install_log" \
+       || ! grep -aE -q '^\[install\] install complete' "$install_log"; then
         echo "[test_installer_full] Stage D ($label) FAIL: install did not complete" >&2
         tail -40 "$install_log" >&2
         if [ "${KEEP_LOGS:-0}" != "1" ]; then
