@@ -170,20 +170,20 @@ fi
 
 # 1. Default `hpm channels` shows just `main`.
 list1_block=$(sed -n '/CHAN_STAGE_START/,/CHAN_STAGE_LIST_DEFAULT/p' "$LOG")
-if echo "$list1_block" | grep -F -q "- main"; then
+if echo "$list1_block" | grep -aF -q -- "- main"; then
     echo "[test_hpm_channels] OK: default channels list contains main"
 else
     echo "[test_hpm_channels] FAIL: default channels list does not contain main"
     fail=1
 fi
-if echo "$list1_block" | grep -F -q "extra-channel"; then
+if echo "$list1_block" | grep -aF -q -- "- extra-channel"; then
     echo "[test_hpm_channels] FAIL: extra-channel listed before enable"
     fail=1
 fi
 
 # 2. Refresh against default channels picks up ONLY main-channel pkg.
 refresh1_block=$(sed -n '/CHAN_STAGE_LIST_DEFAULT/,/CHAN_STAGE_REFRESH_DEFAULT/p' "$LOG")
-if echo "$refresh1_block" | grep -q "refreshed index"; then
+if echo "$refresh1_block" | grep -aq "refreshed index"; then
     echo "[test_hpm_channels] OK: default-channel refresh reported success"
 else
     echo "[test_hpm_channels] FAIL: default refresh did not report success"
@@ -191,13 +191,13 @@ else
 fi
 
 search1_block=$(sed -n '/CHAN_STAGE_REFRESH_DEFAULT/,/CHAN_STAGE_SEARCH_DEFAULT/p' "$LOG")
-if echo "$search1_block" | grep -q "chan-main-hello"; then
+if echo "$search1_block" | grep -aq "chan-main-hello"; then
     echo "[test_hpm_channels] OK: search finds chan-main-hello after default refresh"
 else
     echo "[test_hpm_channels] FAIL: chan-main-hello missing from default-refresh search"
     fail=1
 fi
-if echo "$search1_block" | grep -q "chan-extra-hello"; then
+if echo "$search1_block" | grep -aq "chan-extra-hello"; then
     echo "[test_hpm_channels] FAIL: chan-extra-hello visible before enable"
     fail=1
 fi
@@ -208,8 +208,8 @@ list2_block=$(sed -n '/CHAN_STAGE_ENABLE_EXTRA/,/CHAN_STAGE_LIST_AFTER_ENABLE/p'
 # echo CHAN_STAGE_* boilerplate that mentions the strings too).
 # `hpm channels` emits "  - <name>" lines after the diagnostic
 # n=<count> header. Both names must appear in the post-enable block.
-if echo "$list2_block" | grep -F -q "- main" && \
-   echo "$list2_block" | grep -F -q "- extra-channel"; then
+if echo "$list2_block" | grep -aF -q -- "- main" && \
+   echo "$list2_block" | grep -aF -q -- "- extra-channel"; then
     echo "[test_hpm_channels] OK: channels list contains both main + extra-channel"
 else
     echo "[test_hpm_channels] FAIL: post-enable list missing main or extra-channel"
@@ -218,8 +218,8 @@ fi
 
 # 4. Refresh with both channels surfaces both packages.
 search2_block=$(sed -n '/CHAN_STAGE_REFRESH_TWO/,/CHAN_STAGE_SEARCH_TWO/p' "$LOG")
-if echo "$search2_block" | grep -q "chan-main-hello" && \
-   echo "$search2_block" | grep -q "chan-extra-hello"; then
+if echo "$search2_block" | grep -aq "chan-main-hello" && \
+   echo "$search2_block" | grep -aq "chan-extra-hello"; then
     echo "[test_hpm_channels] OK: search after two-channel refresh sees both pkgs"
 else
     echo "[test_hpm_channels] FAIL: two-channel search missing one of the pkgs"
@@ -228,7 +228,7 @@ fi
 
 # 5. Install of extra-channel pkg resolves to the right channel-subdir.
 install_block=$(sed -n '/CHAN_STAGE_SEARCH_TWO/,/CHAN_STAGE_INSTALL_EXTRA/p' "$LOG")
-if echo "$install_block" | grep -q "installed chan-extra-hello@1.0"; then
+if echo "$install_block" | grep -aq "installed chan-extra-hello@1.0"; then
     echo "[test_hpm_channels] OK: chan-extra-hello installed from extra-channel"
 else
     echo "[test_hpm_channels] FAIL: chan-extra-hello did NOT install"
@@ -237,7 +237,7 @@ fi
 
 # 6. File from extra-channel package is on disk.
 cat_block=$(sed -n '/CHAN_STAGE_INSTALL_EXTRA/,/CHAN_STAGE_CAT_EXTRA/p' "$LOG")
-if echo "$cat_block" | grep -q "hello from chan-extra-hello"; then
+if echo "$cat_block" | grep -aq "hello from chan-extra-hello"; then
     echo "[test_hpm_channels] OK: extra-channel pkg file landed on disk"
 else
     echo "[test_hpm_channels] FAIL: extra-channel pkg file MISSING"
@@ -248,8 +248,8 @@ fi
 list3_block=$(sed -n '/CHAN_STAGE_DISABLE_EXTRA/,/CHAN_STAGE_LIST_AFTER_DISABLE/p' "$LOG")
 # Same filter as list2: only `hpm channels` output, not the
 # CHAN_STAGE_DISABLE_EXTRA echo boilerplate.
-if echo "$list3_block" | grep -F -q "- main" && \
-   ! echo "$list3_block" | grep -F -q "- extra-channel"; then
+if echo "$list3_block" | grep -aF -q -- "- main" && \
+   ! echo "$list3_block" | grep -aF -q -- "- extra-channel"; then
     echo "[test_hpm_channels] OK: disable removed extra-channel; only main remains"
 else
     echo "[test_hpm_channels] FAIL: disable did not restore single-channel state"
