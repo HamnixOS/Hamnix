@@ -3348,6 +3348,651 @@ def cmd_install(spec: Ptr[uint8]) -> int32:
     return 0
 
 
+# =====================================================================
+# Phase 3: hooks + remove
+# =====================================================================
+#
+# Hooks: docs/packages.md defines four hook points:
+#   pre-install.hamsh   — runs BEFORE files are staged
+#   install.hamsh       — runs AFTER files are staged
+#   remove.hamsh        — runs BEFORE files are deleted
+#   post-remove.hamsh   — runs AFTER files are deleted
+#
+# All hooks are plain hamsh scripts, run in init's namespace via
+# sys_spawn /bin/hamsh <hookpath>. Env vars per spec:
+#   HPM_PKG_NAME       — the package's name
+#   HPM_PKG_VERSION    — the version being installed
+#   HPM_PKG_DIR        — path to the extracted staging dir
+#   HPM_TARGET         — the resolved target tag
+#
+# For Phase 3 we stage the WHOLE tarball to /tmp/hpm/staging/<pkg>-<ver>/
+# so HPM_PKG_DIR points at a real, complete tree (the tests can poke
+# into it) and so multi-file hooks (md5sums, conffiles, ...) have
+# something to read. The staging dir lives on tmpfs (volatile), so a
+# successful install leaves the cleanup-or-not call to the caller —
+# v1 leaves staged trees in place for inspection.
+
+# Staging path scratch.
+staging_root_buf: Array[256, uint8]    # "/tmp/hpm/staging/<pkg>-<ver>"
+hook_path_buf:    Array[512, uint8]    # full path to a hook script
+hook_env_strs:    Array[2048, uint8]   # backing for env strings
+hook_env_ptrs:    Array[8, uint64]     # NULL-terminated env array
+hook_argv_buf:    Array[3, uint64]
+
+
+def _stage_tarball(tar_len: uint64) -> int32:
+    # Extract the WHOLE tarball (PKGINFO, files/, hooks, ...) under
+    # /tmp/hpm/staging/<pkg>-<ver>/. Phase 3 needs this so hooks can
+    # read PKGINFO + files/ as a real tree.
+    sys_mkdir("/tmp/hpm/staging")
+    # Build staging_root_buf = "/tmp/hpm/staging/<pkg>-<ver>"
+    pfx: Ptr[uint8] = "/tmp/hpm/staging/"
+    so: uint64 = 0
+    while pfx[so] != 0:
+        staging_root_buf[so] = pfx[so]
+        so = so + 1
+    # The pkg_prefix_buf already holds "<pkg>-<ver>/" — strip the
+    # trailing slash for staging_root_buf.
+    pp: uint64 = 0
+    while pp + 1 < pkg_prefix_len:                       # exclude trailing '/'
+        staging_root_buf[so] = pkg_prefix_buf[pp]
+        so = so + 1
+        pp = pp + 1
+    staging_root_buf[so] = 0
+    sys_mkdir(cast[Ptr[char]](&staging_root_buf[0]))
+
+    # Walk the tar; write every entry under staging_root.
+    off: uint64 = 0
+    while off + 512 <= tar_len:
+        hdr: Ptr[uint8] = &tar_buf[off]
+        if _tar_header_is_zero(hdr) != 0:
+            return 0
+        if _tar_chksum_ok(hdr) == 0:
+            return -1
+        size: uint64 = _tar_parse_octal(&hdr[124], 12)
+        typeflag: uint8 = hdr[156]
+        body_blocks: uint64 = (size + 511) / 512
+
+        nlen: uint64 = _name_copy_nul(&warn_buf[0], &hdr[0], 100)
+        if nlen <= pkg_prefix_len:
+            off = off + 512 + body_blocks * 512
+            continue
+        prefix_ok: int32 = 1
+        i: uint64 = 0
+        while i < pkg_prefix_len:
+            if warn_buf[i] != pkg_prefix_buf[i]:
+                prefix_ok = 0
+                break
+            i = i + 1
+        if prefix_ok == 0:
+            off = off + 512 + body_blocks * 512
+            continue
+        tail_start: uint64 = pkg_prefix_len
+        tail_len: uint64 = nlen - tail_start
+        if tail_len == 0:
+            off = off + 512 + body_blocks * 512
+            continue
+        # Path safety on the tail.
+        safe_buf: Array[256, uint8]
+        sl: uint64 = tail_len
+        if sl >= 256:
+            sl = 255
+        kk: uint64 = 0
+        while kk < sl:
+            safe_buf[kk] = warn_buf[tail_start + kk]
+            kk = kk + 1
+        safe_buf[sl] = 0
+        if _entry_name_is_unsafe(&safe_buf[0]) != 0:
+            off = off + 512 + body_blocks * 512
+            continue
+        # Compose <staging_root>/<tail>.
+        po: uint64 = 0
+        ri: uint64 = 0
+        while staging_root_buf[ri] != 0 and po + 1 < 512:
+            extract_path_buf[po] = staging_root_buf[ri]
+            po = po + 1
+            ri = ri + 1
+        extract_path_buf[po] = 47
+        po = po + 1
+        ti: uint64 = 0
+        while ti < tail_len and po + 1 < 1024:
+            extract_path_buf[po] = warn_buf[tail_start + ti]
+            po = po + 1
+            ti = ti + 1
+        extract_path_buf[po] = 0
+
+        if typeflag == 53:
+            _mkdir_p(&extract_path_buf[0])
+            sys_mkdir(cast[Ptr[char]](&extract_path_buf[0]))
+            off = off + 512 + body_blocks * 512
+            continue
+        if typeflag != 0 and typeflag != 48:
+            off = off + 512 + body_blocks * 512
+            continue
+
+        _dirname_mkdir_p(&extract_path_buf[0])
+        body_off: uint64 = off + 512
+        if body_off + size > tar_len:
+            return -1
+        fd: int32 = sys_open_write(cast[Ptr[char]](&extract_path_buf[0]))
+        if fd < 0:
+            off = off + 512 + body_blocks * 512
+            continue
+        if size > 0:
+            _write_full(fd, &tar_buf[body_off], size)
+        sys_close(fd)
+        off = off + 512 + body_blocks * 512
+    return 0
+
+
+# Build the env block for a hook spawn:
+#   HPM_PKG_NAME=...
+#   HPM_PKG_VERSION=...
+#   HPM_PKG_DIR=...
+#   HPM_TARGET=...
+# Returns the env-ptr (caller passes to sys_spawn). NUL-terminated
+# strings live in hook_env_strs.
+
+def _build_hook_env(name: Ptr[uint8], version: Ptr[uint8],
+                    pkgdir: Ptr[uint8], target: Ptr[uint8]) -> Ptr[uint64]:
+    pos: uint64 = 0
+    idx: uint64 = 0
+
+    # HPM_PKG_NAME=<name>
+    hook_env_ptrs[idx] = cast[uint64](&hook_env_strs[pos])
+    pfx1: Ptr[uint8] = "HPM_PKG_NAME="
+    p: uint64 = 0
+    while pfx1[p] != 0:
+        hook_env_strs[pos] = pfx1[p]
+        pos = pos + 1
+        p = p + 1
+    np: uint64 = 0
+    while name[np] != 0 and pos + 1 < 2048:
+        hook_env_strs[pos] = name[np]
+        pos = pos + 1
+        np = np + 1
+    hook_env_strs[pos] = 0
+    pos = pos + 1
+    idx = idx + 1
+
+    # HPM_PKG_VERSION=<version>
+    hook_env_ptrs[idx] = cast[uint64](&hook_env_strs[pos])
+    pfx2: Ptr[uint8] = "HPM_PKG_VERSION="
+    p = 0
+    while pfx2[p] != 0:
+        hook_env_strs[pos] = pfx2[p]
+        pos = pos + 1
+        p = p + 1
+    vp: uint64 = 0
+    while version[vp] != 0 and pos + 1 < 2048:
+        hook_env_strs[pos] = version[vp]
+        pos = pos + 1
+        vp = vp + 1
+    hook_env_strs[pos] = 0
+    pos = pos + 1
+    idx = idx + 1
+
+    # HPM_PKG_DIR=<pkgdir>
+    hook_env_ptrs[idx] = cast[uint64](&hook_env_strs[pos])
+    pfx3: Ptr[uint8] = "HPM_PKG_DIR="
+    p = 0
+    while pfx3[p] != 0:
+        hook_env_strs[pos] = pfx3[p]
+        pos = pos + 1
+        p = p + 1
+    dp: uint64 = 0
+    while pkgdir[dp] != 0 and pos + 1 < 2048:
+        hook_env_strs[pos] = pkgdir[dp]
+        pos = pos + 1
+        dp = dp + 1
+    hook_env_strs[pos] = 0
+    pos = pos + 1
+    idx = idx + 1
+
+    # HPM_TARGET=<target>
+    hook_env_ptrs[idx] = cast[uint64](&hook_env_strs[pos])
+    pfx4: Ptr[uint8] = "HPM_TARGET="
+    p = 0
+    while pfx4[p] != 0:
+        hook_env_strs[pos] = pfx4[p]
+        pos = pos + 1
+        p = p + 1
+    tp: uint64 = 0
+    while target[tp] != 0 and pos + 1 < 2048:
+        hook_env_strs[pos] = target[tp]
+        pos = pos + 1
+        tp = tp + 1
+    hook_env_strs[pos] = 0
+    pos = pos + 1
+    idx = idx + 1
+
+    hook_env_ptrs[idx] = 0
+    return &hook_env_ptrs[0]
+
+
+# Run a hook if it exists. Returns 0 on success, non-zero on hook
+# failure (we exit-out the install / remove). If the hook script
+# isn't present, returns 0 (no-op).
+#
+# `hook_name` is the bare leaf (e.g. "install.hamsh") — we form
+# "<staging_root>/<hook_name>" and check the on-disk file.
+
+def _run_hook(staging_root: Ptr[uint8], hook_name: Ptr[uint8],
+              pkg_name: Ptr[uint8], pkg_version: Ptr[uint8],
+              target: Ptr[uint8]) -> int32:
+    # Compose hook_path_buf = "<staging_root>/<hook_name>".
+    po: uint64 = 0
+    ri: uint64 = 0
+    while staging_root[ri] != 0 and po + 1 < 512:
+        hook_path_buf[po] = staging_root[ri]
+        po = po + 1
+        ri = ri + 1
+    hook_path_buf[po] = 47
+    po = po + 1
+    hi: uint64 = 0
+    while hook_name[hi] != 0 and po + 1 < 512:
+        hook_path_buf[po] = hook_name[hi]
+        po = po + 1
+        hi = hi + 1
+    hook_path_buf[po] = 0
+    # Existence check via open.
+    test_fd: int32 = sys_open(cast[Ptr[char]](&hook_path_buf[0]))
+    if test_fd < 0:
+        return 0                                          # no-op
+    sys_close(test_fd)
+
+    write_str(1, "hpm: running hook ")
+    write_str(1, hook_name)
+    write_str(1, "\n")
+
+    envp: Ptr[uint64] = _build_hook_env(pkg_name, pkg_version,
+                                        staging_root, target)
+    # argv = ["/bin/hamsh", "<hookpath>", NULL]
+    hook_argv_buf[0] = cast[uint64](cast[Ptr[uint8]]("/bin/hamsh"))
+    hook_argv_buf[1] = cast[uint64](&hook_path_buf[0])
+    hook_argv_buf[2] = 0
+    pid: int32 = sys_spawn(cast[Ptr[char]]("/bin/hamsh"),
+                           &hook_argv_buf[0], 0, 1, envp)
+    if pid < 0:
+        write_str(2, "hpm: hook spawn failed\n")
+        return -1
+    code: int64 = sys_waitpid(pid)
+    if code != 0:
+        write_str(2, "hpm: hook ")
+        write_str(2, hook_name)
+        write_str(2, " exited non-zero (")
+        write_dec_u64(2, cast[uint64](code))
+        write_str(2, ")\n")
+        return -1
+    return 0
+
+
+# -- updated install path with real hook execution -------------------
+#
+# Phase 3 overrides the install command to: stage the tarball,
+# run pre-install, extract files, run install. The stub-message
+# replaces real spawning.
+
+def cmd_install_v3(spec: Ptr[uint8]) -> int32:
+    if _load_index_cache() != 0:
+        write_str(2, "hpm: no cached index; run `hpm refresh` first\n")
+        return 1
+    lrc: int32 = _load_installed()
+    if lrc < 0:
+        return 1
+
+    name_buf: Array[128, uint8]
+    ver_buf:  Array[64, uint8]
+    has_ver:  int32 = 0
+    _split_nameversion(spec, &name_buf[0], 128, &ver_buf[0], 64, &has_ver)
+    name_len: uint64 = strlen_u8(&name_buf[0])
+    if name_len == 0:
+        write_str(2, "hpm: install: empty package name\n")
+        return 1
+
+    idx: int64 = -1
+    if has_ver != 0:
+        idx = _pkg_find_exact(&name_buf[0], name_len,
+                              &ver_buf[0], strlen_u8(&ver_buf[0]))
+    else:
+        idx = _pkg_find_best(&name_buf[0], name_len)
+    if idx < 0:
+        write_str(2, "hpm: no candidate for ")
+        write_str(2, spec)
+        write_str(2, "\n")
+        return 1
+    pi: uint64 = cast[uint64](idx)
+
+    v_cstr: Array[64, uint8]
+    _strcopy_n(&v_cstr[0],
+               cast[Ptr[uint8]](
+                   cast[uint64](&idx_buf[0]) + pkg_version_off[pi]),
+               pkg_version_len[pi], 64)
+    url_cstr: Array[512, uint8]
+    _strcopy_n(&url_cstr[0],
+               cast[Ptr[uint8]](
+                   cast[uint64](&idx_buf[0]) + pkg_url_off[pi]),
+               pkg_url_len[pi], 512)
+    sha_cstr: Array[80, uint8]
+    _strcopy_n(&sha_cstr[0],
+               cast[Ptr[uint8]](
+                   cast[uint64](&idx_buf[0]) + pkg_sha256_off[pi]),
+               pkg_sha256_len[pi], 80)
+    target_cstr: Array[128, uint8]
+    if pkg_target_len[pi] > 0:
+        _strcopy_n(&target_cstr[0],
+                   cast[Ptr[uint8]](
+                       cast[uint64](&idx_buf[0]) + pkg_target_off[pi]),
+                   pkg_target_len[pi], 128)
+    else:
+        _strcopy_cstr(&target_cstr[0],
+                      cast[Ptr[uint8]]("#hamnix-system"), 128)
+
+    write_str(1, "hpm: installing ")
+    sys_write(1, &name_buf[0], name_len)
+    write_str(1, "@")
+    write_str(1, &v_cstr[0])
+    write_str(1, " (target=")
+    write_str(1, &target_cstr[0])
+    write_str(1, ")\n")
+
+    di: uint64 = 0
+    while di < inst_count:
+        if inst_name_len[di] == name_len:
+            same: int32 = 1
+            ki: uint64 = 0
+            while ki < name_len:
+                if inst_buf[inst_name_off[di] + ki] != name_buf[ki]:
+                    same = 0
+                    break
+                ki = ki + 1
+            if same != 0:
+                write_str(2, "hpm: package ")
+                sys_write(2, &name_buf[0], name_len)
+                write_str(2, " is already installed\n")
+                return 1
+        di = di + 1
+
+    # Fetch.
+    n: int64 = fetch_to_buf(&url_cstr[0], &deb_buf[0], TARBALL_CAP)
+    if n < 0:
+        write_str(2, "hpm: failed to fetch ")
+        write_str(2, &url_cstr[0])
+        write_str(2, "\n")
+        return 1
+    deb_len: uint64 = cast[uint64](n)
+
+    # SHA-256.
+    _sha256_hash_buf(&deb_buf[0], deb_len)
+    expected_len: uint64 = strlen_u8(&sha_cstr[0])
+    if expected_len != 64:
+        write_str(2, "hpm: index sha256 is not 64 hex chars\n")
+        return 1
+    mi: uint64 = 0
+    while mi < 64:
+        ec: uint8 = sha_cstr[mi]
+        if ec >= 65 and ec <= 70:
+            ec = ec + 32
+        if sha_hex[mi] != ec:
+            write_str(2, "hpm: SHA-256 mismatch — refusing to install\n")
+            return 1
+        mi = mi + 1
+    write_str(1, "hpm: SHA-256 verified\n")
+
+    # Inflate.
+    tar_len_i: int64 = _inflate_tarball(deb_len)
+    if tar_len_i < 0:
+        return 1
+    tar_len: uint64 = cast[uint64](tar_len_i)
+
+    # Build pkg_prefix.
+    pp: uint64 = 0
+    ni: uint64 = 0
+    while ni < name_len and pp + 1 < 128:
+        pkg_prefix_buf[pp] = name_buf[ni]
+        pp = pp + 1
+        ni = ni + 1
+    pkg_prefix_buf[pp] = 45
+    pp = pp + 1
+    vi: uint64 = 0
+    vl: uint64 = strlen_u8(&v_cstr[0])
+    while vi < vl and pp + 1 < 128:
+        pkg_prefix_buf[pp] = v_cstr[vi]
+        pp = pp + 1
+        vi = vi + 1
+    pkg_prefix_buf[pp] = 47
+    pp = pp + 1
+    pkg_prefix_buf[pp] = 0
+    pkg_prefix_len = pp
+
+    # Read PKGINFO; arch check.
+    if _read_pkginfo_from_tar(tar_len) != 0:
+        return 1
+    arch_len: uint64 = strlen_u8(&pi_arch[0])
+    if arch_len > 0:
+        if _streq(&pi_arch[0], cast[Ptr[uint8]]("x86_64")) == 0 \
+                and _streq(&pi_arch[0], cast[Ptr[uint8]]("any")) == 0:
+            write_str(2, "hpm: package arch incompatible\n")
+            return 1
+    pi_t_len: uint64 = strlen_u8(&pi_target[0])
+    if pi_t_len > 0:
+        _strcopy_cstr(&target_cstr[0], &pi_target[0], 128)
+    target_len_eff: uint64 = strlen_u8(&target_cstr[0])
+
+    # Target prefix.
+    if _set_target_prefix(&target_cstr[0], target_len_eff) != 0:
+        return 1
+    if target_prefix_buf[0] != 0:
+        _mkdir_p(&target_prefix_buf[0])
+        sys_mkdir(cast[Ptr[char]](&target_prefix_buf[0]))
+
+    # Stage the tarball to disk so hooks can read it.
+    if _stage_tarball(tar_len) != 0:
+        write_str(2, "hpm: tarball staging failed\n")
+        return 1
+
+    # pre-install.hamsh runs BEFORE files are staged at target.
+    if _run_hook(&staging_root_buf[0],
+                 cast[Ptr[uint8]]("pre-install.hamsh"),
+                 &name_buf[0], &v_cstr[0], &target_cstr[0]) != 0:
+        write_str(2, "hpm: pre-install hook failed; aborting install\n")
+        return 1
+
+    # Extract files/.
+    _new_files_reset()
+    if _stage_extract_files(tar_len, &target_prefix_buf[0]) != 0:
+        return 1
+    write_str(1, "hpm: extracted ")
+    write_dec_u64(1, new_files_n)
+    write_str(1, " files\n")
+
+    # install.hamsh runs AFTER files are staged at target.
+    if _run_hook(&staging_root_buf[0],
+                 cast[Ptr[uint8]]("install.hamsh"),
+                 &name_buf[0], &v_cstr[0], &target_cstr[0]) != 0:
+        write_str(2, "hpm: install hook failed; package files were placed but the hook errored\n")
+        return 1
+
+    # installed.json.
+    pinned: int32 = 0
+    if has_ver != 0:
+        pinned = 1
+    if _installed_rewrite_with_added(&name_buf[0], &v_cstr[0],
+                                     &target_cstr[0], pinned) != 0:
+        return 1
+
+    write_str(1, "hpm: installed ")
+    sys_write(1, &name_buf[0], name_len)
+    write_str(1, "@")
+    write_str(1, &v_cstr[0])
+    sys_write(1, "\n", 1)
+    return 0
+
+
+# -- remove command (Phase 3) -----------------------------------------
+#
+# `hpm remove <name>`:
+#   1. Load installed.json; find the entry for <name>.
+#   2. Re-stage the tarball (via the cache at /tmp/hpm/staging/) IF
+#      we have it; for v1 we accept that the staging dir from install
+#      might still be around. If not, hooks are SKIPPED (the test only
+#      checks the file-removal path; hooks-on-remove from a fresh-boot
+#      no-cache state needs a refetch which is a Phase 5+ concern).
+#   3. Run remove.hamsh (if present, if staging is around).
+#   4. sys_unlink each recorded file in REVERSE install order.
+#   5. Run post-remove.hamsh (if present).
+#   6. Rewrite installed.json with the package removed.
+
+def cmd_remove(name: Ptr[uint8]) -> int32:
+    lrc: int32 = _load_installed()
+    if lrc < 0:
+        return 1
+    if lrc == 1 or inst_count == 0:
+        write_str(2, "hpm: no packages installed\n")
+        return 1
+
+    name_len: uint64 = strlen_u8(name)
+    # Find the matching installed entry.
+    found: int64 = -1
+    i: uint64 = 0
+    while i < inst_count:
+        if inst_name_len[i] == name_len:
+            same: int32 = 1
+            k: uint64 = 0
+            while k < name_len:
+                if inst_buf[inst_name_off[i] + k] != name[k]:
+                    same = 0
+                    break
+                k = k + 1
+            if same != 0:
+                found = cast[int64](i)
+                break
+        i = i + 1
+    if found < 0:
+        write_str(2, "hpm: package ")
+        write_str(2, name)
+        write_str(2, " not installed\n")
+        return 1
+    fi: uint64 = cast[uint64](found)
+
+    # Resolve target prefix.
+    target_cstr: Array[128, uint8]
+    if inst_target_len[fi] > 0:
+        _strcopy_n(&target_cstr[0], &inst_buf[inst_target_off[fi]],
+                   inst_target_len[fi], 128)
+    else:
+        _strcopy_cstr(&target_cstr[0],
+                      cast[Ptr[uint8]]("#hamnix-system"), 128)
+    if _set_target_prefix(&target_cstr[0],
+                          strlen_u8(&target_cstr[0])) != 0:
+        return 1
+
+    # Version cstr (for the hook env).
+    v_cstr: Array[64, uint8]
+    _strcopy_n(&v_cstr[0], &inst_buf[inst_ver_off[fi]],
+               inst_ver_len[fi], 64)
+
+    # Compose the staging root we'd have used at install time, in case
+    # it still exists. /tmp is tmpfs, so a reboot wipes it — that's
+    # fine; remove just skips hooks in that case.
+    sg: uint64 = 0
+    sp_pfx: Ptr[uint8] = "/tmp/hpm/staging/"
+    while sp_pfx[sg] != 0:
+        staging_root_buf[sg] = sp_pfx[sg]
+        sg = sg + 1
+    ni2: uint64 = 0
+    while ni2 < name_len:
+        staging_root_buf[sg] = name[ni2]
+        sg = sg + 1
+        ni2 = ni2 + 1
+    staging_root_buf[sg] = 45                            # '-'
+    sg = sg + 1
+    vi2: uint64 = 0
+    vl2: uint64 = strlen_u8(&v_cstr[0])
+    while vi2 < vl2:
+        staging_root_buf[sg] = v_cstr[vi2]
+        sg = sg + 1
+        vi2 = vi2 + 1
+    staging_root_buf[sg] = 0
+
+    # Check whether staging is present (open the PKGINFO inside it).
+    sting_pkginfo_buf: Array[512, uint8]
+    so: uint64 = 0
+    while staging_root_buf[so] != 0 and so + 1 < 512:
+        sting_pkginfo_buf[so] = staging_root_buf[so]
+        so = so + 1
+    pkginfo_tail: Ptr[uint8] = "/PKGINFO"
+    pi_i: uint64 = 0
+    while pkginfo_tail[pi_i] != 0 and so + 1 < 512:
+        sting_pkginfo_buf[so] = pkginfo_tail[pi_i]
+        so = so + 1
+        pi_i = pi_i + 1
+    sting_pkginfo_buf[so] = 0
+    has_staging: int32 = 0
+    test_fd: int32 = sys_open(cast[Ptr[char]](&sting_pkginfo_buf[0]))
+    if test_fd >= 0:
+        has_staging = 1
+        sys_close(test_fd)
+
+    write_str(1, "hpm: removing ")
+    sys_write(1, name, name_len)
+    write_str(1, "@")
+    write_str(1, &v_cstr[0])
+    sys_write(1, "\n", 1)
+
+    if has_staging != 0:
+        # remove.hamsh runs BEFORE files are deleted.
+        rc: int32 = _run_hook(&staging_root_buf[0],
+                              cast[Ptr[uint8]]("remove.hamsh"),
+                              name, &v_cstr[0], &target_cstr[0])
+        if rc != 0:
+            write_str(2, "hpm: remove hook aborted; nothing deleted\n")
+            return 1
+    else:
+        write_str(1, "hpm: (staging tree absent — pre/post-remove hooks skipped)\n")
+
+    # Delete files in REVERSE install order.
+    fc: uint64 = inst_file_count[fi]
+    fs: uint64 = inst_file_start[fi]
+    if fc > 0:
+        ri: uint64 = fc
+        while ri > 0:
+            ri = ri - 1
+            slot: uint64 = fs + ri
+            # Compose <target_prefix><rel> into extract_path_buf.
+            po: uint64 = 0
+            tp: uint64 = 0
+            while target_prefix_buf[tp] != 0 and po + 1 < 1024:
+                extract_path_buf[po] = target_prefix_buf[tp]
+                po = po + 1
+                tp = tp + 1
+            rl: uint64 = inst_file_len[slot]
+            rj: uint64 = 0
+            while rj < rl and po + 1 < 1024:
+                extract_path_buf[po] = inst_buf[inst_file_off[slot] + rj]
+                po = po + 1
+                rj = rj + 1
+            extract_path_buf[po] = 0
+            sys_unlink(cast[Ptr[char]](&extract_path_buf[0]))
+    write_str(1, "hpm: deleted ")
+    write_dec_u64(1, fc)
+    write_str(1, " files\n")
+
+    if has_staging != 0:
+        # post-remove.hamsh runs AFTER files are deleted.
+        _run_hook(&staging_root_buf[0],
+                  cast[Ptr[uint8]]("post-remove.hamsh"),
+                  name, &v_cstr[0], &target_cstr[0])
+
+    if _installed_rewrite_with_removed(name) != 0:
+        return 1
+
+    write_str(1, "hpm: removed ")
+    sys_write(1, name, name_len)
+    sys_write(1, "\n", 1)
+    return 0
+
+
 # -- usage + main -----------------------------------------------------
 
 def _usage() -> int32:
@@ -3416,10 +4061,12 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
         if ai >= argc:
             write_str(2, "hpm: install requires a package name\n")
             return 1
-        return cmd_install(cast[Ptr[uint8]](argv[cast[uint64](ai)]))
+        return cmd_install_v3(cast[Ptr[uint8]](argv[cast[uint64](ai)]))
     if _streq(cmd, cast[Ptr[uint8]]("remove")) != 0:
-        write_str(2, "hpm: remove is implemented in Phase 3\n")
-        return 1
+        if ai >= argc:
+            write_str(2, "hpm: remove requires a package name\n")
+            return 1
+        return cmd_remove(cast[Ptr[uint8]](argv[cast[uint64](ai)]))
     if _streq(cmd, cast[Ptr[uint8]]("update")) != 0:
         write_str(2, "hpm: update is implemented in Phase 5\n")
         return 1
