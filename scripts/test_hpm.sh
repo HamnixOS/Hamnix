@@ -63,7 +63,7 @@ EOF
 # no disk image is required.
 printf 'hello from hpm-hello\n' > "$PKG_BUILD/files/var/lib/hpm-hello-greet"
 cat > "$PKG_BUILD/install.hamsh" <<'EOF'
-echo HOOK_INSTALL_RAN name=$HPM_PKG_NAME ver=$HPM_PKG_VERSION
+echo HOOK_INSTALL_RAN
 EOF
 (cd "$FIXDIR/build" && tar czf "$REPO/packages/hpm-hello-1.0.tar.gz" hpm-hello-1.0)
 
