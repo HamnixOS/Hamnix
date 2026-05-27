@@ -188,6 +188,24 @@ def main() -> int:
                 break
 
     lines.append("")
+    lines.append("# --- man pages (discovery system) ---")
+    lines.append("# Source bytes live in etc/man/ in the Hamnix tree;")
+    lines.append("# scripts/build_initramfs.py stages them into the cpio")
+    lines.append("# at /usr/share/man/. The live ISO therefore exposes")
+    lines.append("# every page at that path (the kernel cpio is mounted")
+    lines.append("# as the root tmpfs name lookup), so the manifest can")
+    lines.append("# source them from /usr/share/man/<topic>.<N>.md and")
+    lines.append("# write them to the target ext4 at the same path.")
+    man_dir = HERE / "etc" / "man"
+    if man_dir.is_dir():
+        for mp in sorted(man_dir.iterdir()):
+            if mp.is_file() and mp.suffix == ".md":
+                rel = f"usr/share/man/{mp.name}"
+                # Source: live-cpio path (not /n/distros — man pages
+                # are in the cpio, not the rootfs partition).
+                lines.append(f"{rel}    /usr/share/man/{mp.name}")
+
+    lines.append("")
     lines.append("# --- busybox + applets (the Linux-ns shell) ---")
     lines.append("# Source paths under /n/distros/bin/. Applet entries")
     lines.append("# install the busybox binary at each applet name.")
