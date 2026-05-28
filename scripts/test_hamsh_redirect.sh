@@ -73,7 +73,7 @@ qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 120 \
        "echo REDIR_EXT_BEGIN"                                    2 \
        "cat /ext/redir.txt"                                      2 \
        "echo REDIR_EXT_END"                                      2 \
-       "export REDIR_PROBE=42"                                   2 \
+       "REDIR_PROBE=42"                                          2 \
        "echo \$REDIR_PROBE > /tmp/redir-var.txt"                 2 \
        "echo REDIR_VAR_BEGIN"                                    2 \
        "cat /tmp/redir-var.txt"                                  2 \
