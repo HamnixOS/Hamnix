@@ -80,9 +80,15 @@ LOG="$(mktemp)"
 trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null 2>&1 || true' EXIT
 
 echo "[test_usbms] (5/5) Boot QEMU with qemu-xhci + usb-storage"
+# The kernel is a true elf64-x86-64 higher-half image; QEMU's -kernel
+# multiboot1 loader rejects 64-bit ELFs ("Cannot load x86-64 image").
+# Wrap it in a GRUB BIOS ISO and boot -cdrom. `-boot d` forces CD boot
+# ahead of the usb-storage drive (which SeaBIOS would otherwise pick).
+source "$PROJ_ROOT/scripts/_kernel_iso.sh"
+KISO="$(kernel_iso "$ELF")"
 set +e
 timeout "${USBMS_TIMEOUT}s" qemu-system-x86_64 \
-    -kernel "$ELF" \
+    -boot d -cdrom "$KISO" \
     -device qemu-xhci,id=xhci0 \
     -drive if=none,id=stick,file="$IMG",format=raw \
     -device usb-storage,bus=xhci0.0,drive=stick \

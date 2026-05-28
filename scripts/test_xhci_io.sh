@@ -118,9 +118,13 @@ LOG="$(mktemp)"
 trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null 2>&1 || true' EXIT
 
 echo "[test_xhci_io] (4/5) Boot QEMU with $XHCI_DEVICE + usb-kbd"
+# 64-bit higher-half kernel — wrap in a GRUB BIOS ISO (QEMU's -kernel
+# multiboot1 loader rejects ELFCLASS64). See scripts/run_x86_bare.sh.
+source "$PROJ_ROOT/scripts/_kernel_iso.sh"
+KISO="$(kernel_iso "$ELF")"
 set +e
 timeout "${XHCI_IO_TIMEOUT}s" qemu-system-x86_64 \
-    -kernel "$ELF" \
+    -boot d -cdrom "$KISO" \
     -device "$XHCI_DEVICE,id=xhci0" \
     -device "usb-kbd,bus=xhci0.0" \
     -smp 2 -nographic -no-reboot -m 256M \
