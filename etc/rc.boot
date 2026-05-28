@@ -139,6 +139,21 @@ ifconfig
 echo '---------------------------------------------------------'
 echo 'rc.boot:STEP-1 past ifconfig dump'
 
+# --- NTP one-shot ---------------------------------------------------
+# The CMOS RTC the kernel snapshots at boot is accurate to whatever the
+# host BIOS / VM emulator gave us — minutes off on a long-uninitialised
+# box, hours off on a freshly-flashed laptop. TLS cert validity and
+# build-system mtimes need accurate time.
+#
+# We run ntpd once. If DNS / DHCP isn't up yet (the kernel does DHCP in
+# parallel with the rc, so a fast boot may reach this line before DHCP
+# completes), ntpd fails fast with a diagnostic and rc.boot continues —
+# the operator can re-run `ntpd` from the interactive prompt or trigger
+# it from a later script. Re-run-on-drift / cron-style scheduling is a
+# follow-up; one anchor at boot is enough for v1.
+ntpd
+echo 'rc.boot:STEP-1b ntpd attempted'
+
 # --- the Linux runtime namespace ------------------------------------
 # HAMSH_SPEC §0 + §11: running a Linux binary is NOT a bespoke
 # `distrorun` command — it is a captured `ns { }` value plus an
