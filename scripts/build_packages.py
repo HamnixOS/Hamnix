@@ -4,11 +4,21 @@ scripts/build_packages.py — build the v1 Hamnix package tarballs.
 
 The Debian-installer-shape pivot: each install step is a `hpm install
 <pkg>`. To make that scale beyond the monolithic v1 set, this script
-now emits ~17 *component* packages plus a `hamnix-base` METAPACKAGE
-that pulls them all in via `depends:`. A future install can pick a
-subset (e.g. `{ hamnix-kernel, hamnix-init, hamnix-hamsh, hpm,
-hamnix-drivers-net-e1000e, hamnix-fs-ext4 }` for an embedded build)
-and skip everything else.
+emits one package PER command-line app plus a handful of
+component/driver packages, and two metapackages (`hamnix-coreutils`
+and `hamnix-base`) that pull groups of them in via `depends:`. A
+future install can pick a subset (e.g. `{ hamnix-init, hamnix-hamsh,
+hpm, hamnix-cat, hamnix-ls, hamnix-drivers-net-e1000e, hamnix-fs-ext4
+}` for an embedded build) and skip everything else.
+
+Per-command split (2026-05-28): each `user/<cmd>.ad` ships as its own
+`hamnix-<cmd>` package (one binary, minimal `depends:`). Underscored
+command stems map to hyphenated package names (the PKGINFO `name`
+grammar is `[a-z][a-z0-9-]*` — NO underscores), while the installed
+BINARY keeps its underscored filename. E.g. `env_show` →
+package `hamnix-env-show`, binary `bin/env_show`. `hamnix-coreutils`
+is now a METAPACKAGE depending on every `hamnix-<cmd>`, so anything
+that pulled `hamnix-coreutils` still gets the whole command set.
 
 Channel layout (2026-05-27 pivot, per memory/project_nonfree_repo.md):
 top-level directories under build/packages/ are *channels* mirroring
@@ -28,7 +38,11 @@ Outputs (under build/packages/):
                                           target: #hamnix-system
   * hamnix-init-<v>.tar.gz             — /init + /etc/rc.boot etc.
   * hamnix-hamsh-<v>.tar.gz            — /bin/hamsh + /etc/profile etc.
-  * hamnix-coreutils-<v>.tar.gz        — cat, ls, echo, etc. (~80 utils)
+  * hamnix-<cmd>-<v>.tar.gz            — one package PER command
+                                          (~83: cat, ls, echo, ps, ...)
+  * hamnix-coreutils-<v>.tar.gz        — METAPACKAGE depending on every
+                                          hamnix-<cmd> (preserves the
+                                          old "install all utils" path)
   * hamnix-net-<v>.tar.gz              — ifconfig, ping, route, httpd
   * hamnix-svc-sshd-<v>.tar.gz         — sshd + /etc/svc/sshd.hamsh
   * hpm-<v>.tar.gz                     — /bin/hpm + var dirs
@@ -97,6 +111,7 @@ USER_DIR = BUILD / "user"
 MOD_DIR = BUILD / "mod"
 PACKAGES_OUT = BUILD / "packages"
 ETC_DIR = HERE / "etc"
+MAN_DIR = ETC_DIR / "man"
 KMODS_DIR = HERE / "kernel-modules"
 KERNEL_ELF = BUILD / "hamnix-kernel.elf"
 EFI_STUB = BUILD / "hamnix-bootx64.efi"
@@ -274,9 +289,14 @@ def _files_hamsh() -> list[tuple[Path, str]]:
     return f
 
 
-# ---- hamnix-coreutils ----------------------------------------------
-# The large bag of small commands the shell expects. Everything that
-# isn't init/hamsh/net/sshd/hpm/fs-mkfs/installer/drivers ends up here.
+# ---- per-command packages (was: hamnix-coreutils) ------------------
+# Every small command the shell expects ships as its OWN package
+# (`hamnix-<cmd>`), generated programmatically from COREUTILS_BINS
+# below. `hamnix-coreutils` is now a METAPACKAGE that depends on every
+# one of them, so anything that pulled `hamnix-coreutils` still gets
+# the whole set. Each leaf depends only on the init runtime
+# (`hamnix-init`) — a standalone binary needs the ELF loader + PID-1
+# runtime, not the shell.
 
 COREUTILS_BINS = (
     "ascii", "awk", "base64", "basename", "cal", "cat", "clear", "cmp",
@@ -294,11 +314,96 @@ COREUTILS_BINS = (
 )
 
 
-def _files_coreutils() -> list[tuple[Path, str]]:
-    f: list[tuple[Path, str]] = []
-    for stem in COREUTILS_BINS:
+def _cmd_pkg_name(stem: str) -> str:
+    """Map a command stem to its package name.
+
+    PKGINFO `name` grammar is `[a-z][a-z0-9-]*` (lowercase, hyphens OK,
+    NO underscores), so underscored stems get their underscores
+    rewritten to hyphens. The installed binary keeps the underscored
+    stem; only the PACKAGE name is hyphenated.
+
+        cat       -> hamnix-cat
+        env_show  -> hamnix-env-show
+        u_server  -> hamnix-u-server
+    """
+    return "hamnix-" + stem.replace("_", "-")
+
+
+def _man_one_liner(stem: str) -> str | None:
+    """Pull a one-line description from etc/man/<stem>.1.md if present.
+
+    Man pages are markdown. The H1 title line is `# <cmd> - <summary>`
+    and the NAME section repeats `<cmd> - <summary>`. Prefer the NAME
+    section (canonical whatis source); fall back to the H1. Returns the
+    `<summary>` portion, or None if no man page / no parseable line.
+    """
+    man = MAN_DIR / f"{stem}.1.md"
+    if not man.is_file():
+        return None
+    try:
+        lines = man.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+
+    def _summary(line: str) -> str | None:
+        # Accept `cmd - summary` or `cmd — summary`.
+        for sep in (" - ", " — "):
+            if sep in line:
+                return line.split(sep, 1)[1].strip()
+        return None
+
+    # NAME section: the first non-blank line after a `## NAME` header.
+    for i, raw in enumerate(lines):
+        if raw.strip().lower() == "## name":
+            for follow in lines[i + 1:]:
+                if follow.strip():
+                    s = _summary(follow.strip())
+                    if s:
+                        return s
+                    break
+            break
+    # Fall back to the H1 title (`# cmd - summary`).
+    for raw in lines:
+        stripped = raw.strip()
+        if stripped.startswith("# "):
+            return _summary(stripped[2:].strip())
+    return None
+
+
+def _cmd_description(stem: str) -> str:
+    """One-line package description for command `stem`.
+
+    Pulls the real summary from etc/man/<stem>.1.md when available;
+    otherwise a sensible default. Don't over-invest — the default is
+    fine for the long tail of demo/utility commands.
+    """
+    man = _man_one_liner(stem)
+    if man:
+        return f"Hamnix {stem} — {man}"
+    return f"Hamnix {stem} command"
+
+
+def _make_cmd_files_fn(stem: str):
+    """Return a files_fn that stages just `build/user/<stem>.elf`."""
+    def _files() -> list[tuple[Path, str]]:
+        f: list[tuple[Path, str]] = []
         _add_user_bin(f, stem)
-    return f
+        return f
+    return _files
+
+
+def _cmd_specs() -> list[dict]:
+    """Generate one PACKAGE_SPEC per command in COREUTILS_BINS."""
+    specs: list[dict] = []
+    for stem in COREUTILS_BINS:
+        specs.append({
+            "name": _cmd_pkg_name(stem),
+            "files_fn": _make_cmd_files_fn(stem),
+            "depends": ["hamnix-init>=1"],
+            "description": _cmd_description(stem),
+            "target": "#hamnix-system",
+        })
+    return specs
 
 
 # ---- hamnix-net -----------------------------------------------------
@@ -445,12 +550,21 @@ PACKAGE_SPECS: list[dict] = [
         "description": "Hamnix shell — /bin/hamsh + motd/banner",
         "target": "#hamnix-system",
     },
+    # hamnix-coreutils is now a METAPACKAGE: zero files, depends on
+    # every per-command hamnix-<cmd> package. The per-command leaf
+    # specs are spliced in below via _cmd_specs() (after this literal
+    # list is defined), and this entry's depends is populated to name
+    # all of them. Anything that pulled `hamnix-coreutils` before the
+    # split still gets the full command set transitively.
     {
         "name": "hamnix-coreutils",
-        "files_fn": _files_coreutils,
-        "depends": ["hamnix-hamsh>=1"],
-        "description": ("Hamnix core userland — coreutils-shaped tools "
-                        "(cat/ls/echo/ps/...)"),
+        "files_fn": lambda: [],
+        # depends filled in below from COREUTILS_BINS.
+        "depends": ["hamnix-hamsh>=1"]
+                   + [f"{_cmd_pkg_name(s)}>={PKG_VERSION}"
+                      for s in COREUTILS_BINS],
+        "description": ("Hamnix core userland metapackage — pulls in "
+                        "every per-command package (cat/ls/echo/ps/...)"),
         "target": "#hamnix-system",
     },
     {
@@ -531,6 +645,14 @@ PACKAGE_SPECS: list[dict] = [
         "target": "#hamnix-system",
     },
 ]
+
+# Splice in one leaf package per command. Generated programmatically
+# from COREUTILS_BINS so the table stays maintainable (no hand-written
+# 80-odd dict literals). Each leaf is `hamnix-<cmd>` (underscores→
+# hyphens), stages just that one binary, and depends only on the init
+# runtime. The hamnix-coreutils metapackage above already names them
+# all in its depends.
+PACKAGE_SPECS.extend(_cmd_specs())
 
 
 # ---------------------------------------------------------------------
@@ -625,13 +747,20 @@ def build_hamnix_base() -> dict:
     files_root = staging / "files"
     files_root.mkdir()
 
-    # Metapackage = `hamnix-base` pulls in every component listed in
-    # PACKAGE_SPECS via depends. hpm's dep solver does the rest.
+    # Metapackage = `hamnix-base` pulls in every COMPONENT package via
+    # depends; hpm's BFS solver pulls the rest transitively. We depend
+    # on the hamnix-coreutils metapackage (which fans out to all ~83
+    # per-command hamnix-<cmd> leaves) rather than naming every leaf
+    # directly — that keeps hamnix-base's depends list to the dozen-ish
+    # top-level components and avoids a 100-entry depends string while
+    # still resolving the full closure.
     # hamnix-bootloader is also pulled in so a `hpm install hamnix-base`
     # against an ISO mini-repo gets the full OS shape on disk; the
     # installer copies BOOTX64.EFI separately because the ESP isn't a
     # Hamnix-file-server target.
-    depends = [f"{s['name']}>={PKG_VERSION}" for s in PACKAGE_SPECS]
+    leaf_names = {_cmd_pkg_name(s) for s in COREUTILS_BINS}
+    depends = [f"{s['name']}>={PKG_VERSION}" for s in PACKAGE_SPECS
+               if s["name"] not in leaf_names]
     depends.append(f"hamnix-bootloader>={PKG_VERSION}")
 
     description = ("Hamnix base — metapackage pulling in every "
@@ -980,8 +1109,10 @@ def main() -> int:
         "url": "https://255.one/main/",
         "updated": updated,
         "description": ("Hamnix main channel — first-party free "
-                        "software (hamnix-base metapackage + ~16 "
-                        "components + bootloader + linux-debian-12)"),
+                        "software (hamnix-base + hamnix-coreutils "
+                        "metapackages + one hamnix-<cmd> package per "
+                        "command + components + bootloader + "
+                        "linux-debian-12)"),
         "packages": entries,
     }
     (main_dir / "index.json").write_text(

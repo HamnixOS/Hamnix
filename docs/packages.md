@@ -7,15 +7,57 @@
 > `remove` / `update` / `pin` / `unpin`. Verified by
 > `scripts/test_hpm.sh` (refresh/install/list/remove + conflict
 > negative test). The canonical repo `https://255.one/` ships
-> ~17 component packages plus the `hamnix-base` METAPACKAGE that
-> pulls them all in via `depends:`: `hamnix-init`, `hamnix-hamsh`,
-> `hamnix-coreutils`, `hamnix-net`, `hamnix-svc-sshd`, `hpm`,
-> `hamnix-fs-ext4`, `hamnix-fs-fat`, the `hamnix-drivers-*` set
-> (e1000e/ahci/nvme/xhci/snd-hda), `hamnix-installer-tools`,
-> `hamnix-bootloader`, and `linux-debian-12` (built by
-> `scripts/build_packages.py`). The installer (`etc/install.hamsh`)
-> drives `hpm install hamnix-base` against an ISO-local mini-repo
-> at `/iso-packages/`; the solver pulls the entire dep closure.
+> **one package per command-line app** (`hamnix-cat`, `hamnix-ls`,
+> `hamnix-ps`, … ~83 of them) plus a handful of component/driver
+> packages: `hamnix-init`, `hamnix-hamsh`, `hamnix-net`,
+> `hamnix-svc-sshd`, `hpm`, `hamnix-fs-ext4`, `hamnix-fs-fat`, the
+> `hamnix-drivers-*` set (e1000e/ahci/nvme/xhci/snd-hda),
+> `hamnix-installer-tools`, `hamnix-bootloader`, and
+> `linux-debian-12`. Two METAPACKAGES tie groups together:
+> `hamnix-coreutils` depends on every per-command `hamnix-<cmd>`
+> package, and `hamnix-base` depends on the components +
+> `hamnix-coreutils` + `hamnix-bootloader` (so it resolves the whole
+> OS closure). All built by `scripts/build_packages.py`. The
+> installer (`etc/install.hamsh`) drives `hpm install hamnix-base`
+> against an ISO-local mini-repo at `/iso-packages/`; the solver
+> pulls the entire dep closure (~100 packages).
+
+## Per-command packaging
+
+Each command-line app is its own package — clean separation, so a
+slim install can pull exactly the commands it wants
+(`hpm install hamnix-cat hamnix-ls hamnix-grep`) instead of a
+monolithic coreutils bundle.
+
+**Naming rule.** A command stem `<cmd>` (the `user/<cmd>.ad` source)
+maps to package name `hamnix-<cmd>`, with **underscores rewritten to
+hyphens** because the PKGINFO `name` grammar is `[a-z][a-z0-9-]*`
+(lowercase + hyphens, NO underscores). The *installed binary* keeps
+its original underscored filename — only the package name is
+hyphenated:
+
+| Command stem | Package name        | Installed binary |
+|--------------|---------------------|------------------|
+| `cat`        | `hamnix-cat`        | `bin/cat`        |
+| `ls`         | `hamnix-ls`         | `bin/ls`         |
+| `env_show`   | `hamnix-env-show`   | `bin/env_show`   |
+| `u_server`   | `hamnix-u-server`   | `bin/u_server`   |
+| `p9srv_demo` | `hamnix-p9srv-demo` | `bin/p9srv_demo` |
+
+Each per-command package `depends: hamnix-init>=1` (a standalone
+binary needs the ELF loader + PID-1 runtime, not the whole shell) and
+ships exactly one file. Descriptions are pulled from
+`etc/man/<cmd>.1.md`'s NAME line when a man page exists, else a
+sensible `Hamnix <cmd> command` default.
+
+**`hamnix-coreutils` is a METAPACKAGE.** It carries zero files and
+`depends:` on every `hamnix-<cmd>` package, so anything that pulled
+`hamnix-coreutils` before the split still gets the full command set
+transitively. `hamnix-base` depends on `hamnix-coreutils` (not on each
+leaf directly), keeping its depends list to the dozen top-level
+components. After the split the `hamnix-base` closure is ~100
+packages; `user/hpm.ad`'s solver caps (`RES_MAX`, `QUEUE_MAX`,
+`adj_to`) were raised from 64/256/4096 to 256/512/16384 to fit it.
 
 `hpm` is the Hamnix-native package manager. It installs **Hamnix-side
 state**: kernel modules, native userland binaries, services, drivers,
