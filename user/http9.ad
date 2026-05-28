@@ -1,0 +1,565 @@
+# user/http9.ad — shared HTTP/HTTPS client over the Plan-9 /net tree.
+#
+# ARCH §10: Hamnix Layer 1 is Plan-9-shaped — networking is the /net
+# FILE TREE, not a socket() syscall family. This module is the single
+# reusable HTTP/1.0 client that BOTH user/hpm.ad and the user/curl.ad /
+# user/wget.ad front-ends consume. It wraps:
+#
+#   * URL parsing (scheme / host / port / path; http + https)
+#   * IPv4-literal fast path + sys_resolve(2) DNS fallback
+#   * connect via user/net9.ad's net_dial / net_dial_tls
+#   * an HTTP/1.0 GET with `Connection: close`
+#   * a bounded response drain that honours Content-Length and stops
+#     as soon as the whole response is in hand (a trailing read past
+#     the body wedges on TLS close_notify — see the drain loop note)
+#
+# Entry point:
+#   http_get(url, dst, dst_cap, *out_status, *out_body_off, *out_body_len)
+#     -> 0 on a completed transport (HTTP status in *out_status, even
+#        for 4xx/5xx), or negative on a transport / parse failure.
+#
+# The body lands at dst[*out_body_off .. *out_body_off+*out_body_len);
+# callers that want a clean buffer slide it down themselves (hpm does).
+#
+# Compiler-quirk discipline (memory/feedback_compiler_quirks.md U9):
+# every large buffer is a top-level BSS Array — never a frame local.
+# String literals are materialised inline at the call site (the x86_64
+# backend rejects string-literal globals); no adjacent string concat.
+
+# Reuse the Plan-9-shaped /net dialing helpers from user/net9.ad.
+from user.net9 import net_dial, net_dial_tls
+
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+# U-resolve: native-ABI hostname -> IPv4 via the in-kernel DNS resolver
+# (drivers/net/dns.ad, syscall 269). Returns the IPv4 packed big-endian
+# in the low 32 bits (octet 0 in bits 31:24), or negative errno.
+extern def sys_resolve(hostname: Ptr[uint8], hlen: uint64) -> int64
+
+
+# -- parsed-URL state (module-global, single-threaded native userland)-
+#
+# http_get parses into these before connecting. NOT reentrant; a caller
+# that interleaves two http_get calls must serialise them (same scope
+# rule as net9.ad's path scratch).
+#
+# h9_scheme: 0 == http, 1 == https
+h9_scheme:   int32 = 0
+h9_port:     int64 = 80
+h9_host:     Array[256, uint8]       # NUL-terminated hostname
+h9_path:     Array[1536, uint8]      # request path (always starts '/')
+h9_req:      Array[2048, uint8]      # composed request line + headers
+
+
+def _h9_strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _h9_write_full(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
+    written: uint64 = 0
+    while written < count:
+        room: uint64 = count - written
+        ptr: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](buf) + written)
+        rc: int64 = sys_write(fd, ptr, room)
+        if rc < 0:
+            return rc
+        if rc == 0:
+            return cast[int64](written)
+        written = written + cast[uint64](rc)
+    return cast[int64](written)
+
+
+# -- URL parsing -------------------------------------------------------
+#
+# Parses "http://host[:port][/path]" / "https://host[:port][/path]" into
+# h9_scheme / h9_port / h9_host / h9_path. The path always begins with
+# '/' (an empty URL path yields "/"). Returns 0 on success, -1 on a
+# malformed URL.
+
+def http_parse_url(url: Ptr[uint8]) -> int32:
+    https_pfx: Ptr[uint8] = "https://"
+    http_pfx:  Ptr[uint8] = "http://"
+
+    a: uint64 = 0
+    is_https: int32 = 1
+    i: uint64 = 0
+    while i < 8:
+        if url[i] != https_pfx[i]:
+            is_https = 0
+            break
+        i = i + 1
+    if is_https != 0:
+        h9_scheme = 1
+        a = 8
+    else:
+        is_http: int32 = 1
+        i = 0
+        while i < 7:
+            if url[i] != http_pfx[i]:
+                is_http = 0
+                break
+            i = i + 1
+        if is_http == 0:
+            return -1
+        h9_scheme = 0
+        a = 7
+
+    # Authority spans from `a` up to the first '/' or NUL.
+    auth_end: uint64 = a
+    while url[auth_end] != 0 and url[auth_end] != 47:
+        auth_end = auth_end + 1
+
+    colon: uint64 = a
+    have_colon: int32 = 0
+    j: uint64 = a
+    while j < auth_end:
+        if url[j] == 58:                                 # ':'
+            colon = j
+            have_colon = 1
+            break
+        j = j + 1
+
+    host_end: uint64 = auth_end
+    if have_colon != 0:
+        host_end = colon
+    if host_end <= a:
+        return -1
+
+    ho: uint64 = 0
+    k: uint64 = a
+    while k < host_end and ho + 1 < 256:
+        h9_host[ho] = url[k]
+        ho = ho + 1
+        k = k + 1
+    h9_host[ho] = 0
+
+    port: int64 = 80
+    if h9_scheme != 0:
+        port = 443
+    if have_colon != 0:
+        port = 0
+        p: uint64 = colon + 1
+        if p >= auth_end:
+            return -1
+        while p < auth_end:
+            c: uint8 = url[p]
+            if c < 48 or c > 57:
+                return -1
+            port = port * 10 + cast[int64](c - 48)
+            if port > 65535:
+                return -1
+            p = p + 1
+    h9_port = port
+
+    # Request path — the rest of the URL after the authority. An empty
+    # path becomes "/".
+    po: uint64 = 0
+    if url[auth_end] != 47:
+        h9_path[po] = 47
+        po = po + 1
+    m: uint64 = auth_end
+    while url[m] != 0 and po + 1 < 1536:
+        h9_path[po] = url[m]
+        po = po + 1
+        m = m + 1
+    h9_path[po] = 0
+    return 0
+
+
+# -- DNS / IPv4 literal resolution -------------------------------------
+
+def _h9_parse_ipv4(out0: Ptr[uint8], out1: Ptr[uint8],
+                   out2: Ptr[uint8], out3: Ptr[uint8]) -> int32:
+    octet: uint32 = 0
+    have_digit: int32 = 0
+    idx: uint32 = 0
+    i: uint64 = 0
+    while True:
+        c: uint8 = h9_host[i]
+        if c == 46 or c == 0:
+            if have_digit == 0:
+                return -1
+            if octet > 255:
+                return -1
+            if idx == 0:
+                out0[0] = cast[uint8](octet)
+            elif idx == 1:
+                out1[0] = cast[uint8](octet)
+            elif idx == 2:
+                out2[0] = cast[uint8](octet)
+            else:
+                out3[0] = cast[uint8](octet)
+            if c == 0:
+                if idx != 3:
+                    return -1
+                return 0
+            idx = idx + 1
+            if idx > 3:
+                return -1
+            octet = 0
+            have_digit = 0
+        elif c >= 48 and c <= 57:
+            octet = octet * 10 + cast[uint32](c - 48)
+            have_digit = 1
+        else:
+            return -1
+        i = i + 1
+
+
+def _h9_resolve(out0: Ptr[uint8], out1: Ptr[uint8],
+                out2: Ptr[uint8], out3: Ptr[uint8]) -> int32:
+    if _h9_parse_ipv4(out0, out1, out2, out3) == 0:
+        return 0
+    resolved_ip: int64 = sys_resolve(&h9_host[0], _h9_strlen(&h9_host[0]))
+    if resolved_ip < 0:
+        return -1
+    u: uint64 = cast[uint64](resolved_ip)
+    out0[0] = cast[uint8]((u >> 24) & 0xFF)
+    out1[0] = cast[uint8]((u >> 16) & 0xFF)
+    out2[0] = cast[uint8]((u >> 8) & 0xFF)
+    out3[0] = cast[uint8](u & 0xFF)
+    return 0
+
+
+# -- connect (tcp or tls) ---------------------------------------------
+
+def _h9_connect() -> int32:
+    ip0: uint8 = 0
+    ip1: uint8 = 0
+    ip2: uint8 = 0
+    ip3: uint8 = 0
+    if _h9_resolve(&ip0, &ip1, &ip2, &ip3) != 0:
+        return -1
+    if h9_scheme == 0:
+        return net_dial(ip0, ip1, ip2, ip3, cast[uint64](h9_port))
+    return net_dial_tls(ip0, ip1, ip2, ip3,
+                        cast[uint64](h9_port), &h9_host[0])
+
+
+# -- send request ------------------------------------------------------
+
+def _h9_send_request(fd: int32) -> int32:
+    ro: uint64 = 0
+    g: Ptr[uint8] = "GET "
+    gi: uint64 = 0
+    while g[gi] != 0:
+        h9_req[ro] = g[gi]
+        ro = ro + 1
+        gi = gi + 1
+    pi: uint64 = 0
+    while h9_path[pi] != 0 and ro < 2000:
+        h9_req[ro] = h9_path[pi]
+        ro = ro + 1
+        pi = pi + 1
+    tail1: Ptr[uint8] = " HTTP/1.0\r\nHost: "
+    ti: uint64 = 0
+    while tail1[ti] != 0:
+        h9_req[ro] = tail1[ti]
+        ro = ro + 1
+        ti = ti + 1
+    hi: uint64 = 0
+    while h9_host[hi] != 0 and ro < 2000:
+        h9_req[ro] = h9_host[hi]
+        ro = ro + 1
+        hi = hi + 1
+    tail2: Ptr[uint8] = "\r\nUser-Agent: hamnix-http9/1\r\nConnection: close\r\n\r\n"
+    si: uint64 = 0
+    while tail2[si] != 0:
+        h9_req[ro] = tail2[si]
+        ro = ro + 1
+        si = si + 1
+    wn: int64 = _h9_write_full(fd, &h9_req[0], ro)
+    if wn < 0 or cast[uint64](wn) != ro:
+        return -1
+    return 0
+
+
+# -- response length probe --------------------------------------------
+#
+# Returns the expected total response length once both the header
+# terminator AND a Content-Length header have been observed; else 0.
+
+def _h9_expected_len(dst: Ptr[uint8], total: uint64) -> uint64:
+    hdr_end: uint64 = 0
+    found: int32 = 0
+    p: uint64 = 0
+    while p + 3 < total:
+        if dst[p] == 13 and dst[p + 1] == 10 \
+                and dst[p + 2] == 13 and dst[p + 3] == 10:
+            hdr_end = p + 4
+            found = 1
+            break
+        p = p + 1
+    if found == 0:
+        return 0
+
+    name: Ptr[uint8] = "content-length"
+    name_len: uint64 = 14
+    line: uint64 = 0
+    while line < hdr_end:
+        match_n: int32 = 1
+        j: uint64 = 0
+        while j < name_len:
+            c: uint8 = dst[line + j]
+            if c >= 65 and c <= 90:
+                c = c + 32
+            if c != name[j]:
+                match_n = 0
+                break
+            j = j + 1
+        if match_n != 0 and dst[line + name_len] == 58:    # ':'
+            v: uint64 = line + name_len + 1
+            while v < hdr_end and dst[v] == 32:
+                v = v + 1
+            clen: uint64 = 0
+            have_digit: int32 = 0
+            while v < hdr_end and dst[v] >= 48 and dst[v] <= 57:
+                clen = clen * 10 + cast[uint64](dst[v] - 48)
+                have_digit = 1
+                v = v + 1
+            if have_digit != 0:
+                return hdr_end + clen
+            return 0
+        nl: uint64 = line
+        while nl < hdr_end and dst[nl] != 10:
+            nl = nl + 1
+        line = nl + 1
+    return 0
+
+
+# -- chunked detection -------------------------------------------------
+#
+# Returns 1 if the response carries `Transfer-Encoding: chunked`. We do
+# NOT decode chunked bodies — callers detect this and fail cleanly
+# rather than returning garbage (the chunk framing would otherwise leak
+# into the body). `total` must cover at least the header block.
+
+def http_is_chunked(dst: Ptr[uint8], total: uint64) -> int32:
+    hdr_end: uint64 = 0
+    found: int32 = 0
+    p: uint64 = 0
+    while p + 3 < total:
+        if dst[p] == 13 and dst[p + 1] == 10 \
+                and dst[p + 2] == 13 and dst[p + 3] == 10:
+            hdr_end = p + 4
+            found = 1
+            break
+        p = p + 1
+    if found == 0:
+        return 0
+    name: Ptr[uint8] = "transfer-encoding"
+    name_len: uint64 = 17
+    chunked: Ptr[uint8] = "chunked"
+    line: uint64 = 0
+    while line < hdr_end:
+        match_n: int32 = 1
+        j: uint64 = 0
+        while j < name_len:
+            c: uint8 = dst[line + j]
+            if c >= 65 and c <= 90:
+                c = c + 32
+            if c != name[j]:
+                match_n = 0
+                break
+            j = j + 1
+        if match_n != 0 and dst[line + name_len] == 58:    # ':'
+            # Look for "chunked" anywhere in the value up to EOL.
+            v: uint64 = line + name_len + 1
+            le: uint64 = v
+            while le < hdr_end and dst[le] != 10:
+                le = le + 1
+            while v + 7 <= le:
+                ck: int32 = 1
+                kk: uint64 = 0
+                while kk < 7:
+                    cc: uint8 = dst[v + kk]
+                    if cc >= 65 and cc <= 90:
+                        cc = cc + 32
+                    if cc != chunked[kk]:
+                        ck = 0
+                        break
+                    kk = kk + 1
+                if ck != 0:
+                    return 1
+                v = v + 1
+            return 0
+        nl: uint64 = line
+        while nl < hdr_end and dst[nl] != 10:
+            nl = nl + 1
+        line = nl + 1
+    return 0
+
+
+# -- HTTP status-code parse -------------------------------------------
+#
+# Parses the 3-digit status out of "HTTP/1.x NNN ...". Returns the code,
+# or -1 if the status line is malformed.
+
+def http_parse_status(dst: Ptr[uint8], total: uint64) -> int64:
+    if total < 12:
+        return -1
+    if dst[0] != 72 or dst[1] != 84 or dst[2] != 84 or dst[3] != 80:
+        return -1
+    # Skip to the first space, then the digits after it.
+    i: uint64 = 4
+    while i < total and dst[i] != 32:
+        i = i + 1
+    while i < total and dst[i] == 32:
+        i = i + 1
+    code: int64 = 0
+    have: int32 = 0
+    while i < total and dst[i] >= 48 and dst[i] <= 57:
+        code = code * 10 + cast[int64](dst[i] - 48)
+        have = 1
+        i = i + 1
+    if have == 0:
+        return -1
+    return code
+
+
+# -- header-block extraction ------------------------------------------
+#
+# Locates a named header's value (case-insensitive). Writes the value
+# (trimmed, NUL-terminated) into out[0..out_cap). Returns 1 if found,
+# 0 if absent. `name` is the header name WITHOUT the trailing colon.
+
+def http_find_header(dst: Ptr[uint8], total: uint64,
+                     name: Ptr[uint8], out: Ptr[uint8],
+                     out_cap: uint64) -> int32:
+    hdr_end: uint64 = 0
+    found: int32 = 0
+    p: uint64 = 0
+    while p + 3 < total:
+        if dst[p] == 13 and dst[p + 1] == 10 \
+                and dst[p + 2] == 13 and dst[p + 3] == 10:
+            hdr_end = p + 4
+            found = 1
+            break
+        p = p + 1
+    if found == 0:
+        return 0
+    name_len: uint64 = _h9_strlen(name)
+    line: uint64 = 0
+    while line < hdr_end:
+        match_n: int32 = 1
+        j: uint64 = 0
+        while j < name_len:
+            c: uint8 = dst[line + j]
+            nc: uint8 = name[j]
+            if c >= 65 and c <= 90:
+                c = c + 32
+            if nc >= 65 and nc <= 90:
+                nc = nc + 32
+            if c != nc:
+                match_n = 0
+                break
+            j = j + 1
+        if match_n != 0 and dst[line + name_len] == 58:    # ':'
+            v: uint64 = line + name_len + 1
+            while v < hdr_end and (dst[v] == 32 or dst[v] == 9):
+                v = v + 1
+            le: uint64 = v
+            while le < hdr_end and dst[le] != 13 and dst[le] != 10:
+                le = le + 1
+            o: uint64 = 0
+            while v < le and o + 1 < out_cap:
+                out[o] = dst[v]
+                o = o + 1
+                v = v + 1
+            out[o] = 0
+            return 1
+        nl: uint64 = line
+        while nl < hdr_end and dst[nl] != 10:
+            nl = nl + 1
+        line = nl + 1
+    return 0
+
+
+# -- the full request/response loop -----------------------------------
+#
+# http_get parses `url`, connects, sends the GET, drains the response
+# into dst (capped at dst_cap), and reports the HTTP status + body
+# span. Returns 0 on a completed transport (even for a 4xx/5xx status,
+# which the caller inspects via *out_status), or a negative transport /
+# parse error:
+#   -1  malformed URL
+#   -2  connect / TLS failed
+#   -3  short write sending the request
+#   -4  read error on the response
+#   -5  empty / truncated / non-HTTP response
+#   -6  response exceeds dst_cap
+#   -7  Transfer-Encoding: chunked (unsupported — fail clean)
+
+def http_get(url: Ptr[uint8], dst: Ptr[uint8], dst_cap: uint64,
+             out_status: Ptr[int64], out_body_off: Ptr[uint64],
+             out_body_len: Ptr[uint64]) -> int64:
+    out_status[0] = 0
+    out_body_off[0] = 0
+    out_body_len[0] = 0
+
+    if http_parse_url(url) != 0:
+        return -1
+    fd: int32 = _h9_connect()
+    if fd < 0:
+        return -2
+    if _h9_send_request(fd) != 0:
+        sys_close(fd)
+        return -3
+
+    total: uint64 = 0
+    while total < dst_cap:
+        want: uint64 = _h9_expected_len(dst, total)
+        if want != 0 and total >= want:
+            break
+        room: uint64 = dst_cap - total
+        n: int64 = sys_read(fd, cast[Ptr[uint8]](
+            cast[uint64](dst) + total), room)
+        if n < 0:
+            sys_close(fd)
+            return -4
+        if n == 0:
+            break
+        total = total + cast[uint64](n)
+    sys_close(fd)
+
+    exact: uint64 = _h9_expected_len(dst, total)
+    if exact != 0 and total > exact:
+        total = exact
+
+    if total == 0:
+        return -5
+    if total >= dst_cap:
+        return -6
+
+    status: int64 = http_parse_status(dst, total)
+    if status < 0:
+        return -5
+    out_status[0] = status
+
+    # Locate the header terminator -> body offset.
+    bo: uint64 = 0
+    found: int32 = 0
+    p: uint64 = 0
+    while p + 3 < total:
+        if dst[p] == 13 and dst[p + 1] == 10 \
+                and dst[p + 2] == 13 and dst[p + 3] == 10:
+            bo = p + 4
+            found = 1
+            break
+        p = p + 1
+    if found == 0:
+        return -5
+
+    # Chunked bodies would leak chunk framing into the body — refuse
+    # rather than hand back garbage. (Content-Length responses, which
+    # 255.one and the hpm fixtures use, are the supported shape.)
+    if _h9_expected_len(dst, total) == 0 and http_is_chunked(dst, total) != 0:
+        return -7
+
+    out_body_off[0] = bo
+    out_body_len[0] = total - bo
+    return 0
