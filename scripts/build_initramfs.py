@@ -790,9 +790,18 @@ def build_archive() -> bytes:
                 print(f"  embedded /init ({len(data)} bytes from "
                       f"build/user/{elf.name})")
                 continue
-            if cpio_lean and elf.name not in CPIO_LEAN_USER_KEEP:
-                skipped_lean += 1
-                continue
+            # NOTE: native Adder userland tools (ls, cp, mv, rm, mkdir,
+            # pwd, ...) are ALWAYS kept in the cpio, even in lean mode.
+            # The earlier lean filter (CPIO_LEAN_USER_KEEP) stripped
+            # ~90 of them on the claim they'd be "staged into rootfs.img
+            # instead" — but build_rootfs_img.py only stages busybox +
+            # the Debian apt/dpkg closure, never the Adder tools, so they
+            # were simply lost. The whole Adder toolset is ~1.8 MB; the
+            # real lean savings come from omitting the Debian closure +
+            # in-cpio busybox (handled separately below), which is what
+            # would overflow the 32 MB ESP. CPIO_LEAN_USER_KEEP is now
+            # vestigial for the tool glob (the proper sysroot-on-rootfs
+            # design that supersedes this lives in build_rootfs_img.py).
             bin_name = "/bin/" + elf.stem
             blob += cpio_entry(bin_name, data)
             print(f"  embedded {bin_name} ({len(data)} bytes from "
