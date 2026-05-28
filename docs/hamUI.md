@@ -156,12 +156,226 @@ AI can fully debug while you're still on a serial console.
 - **Q2: multiplexed keyboard.** Symmetric with mouse; more code but
   better composition with the `kbdin` AI-debug feature.
 - **Q3: defer acme.** Hamsh + ported Unix programs first.
-- **Q4: strict Plan 9 draw protocol.** Ecosystem compat over cleaner
-  encoding.
+- **Q4: strict Plan 9 draw protocol.** **SUPERSEDED** by H-§G — we go
+  text-readable hamML + framebuffer hybrid instead of the binary
+  /dev/draw op stream. See H-§G for rationale.
 
----
+## H-§G. Native draw protocol — layered markup + framebuffer hybrid
 
-## Plan 9 rio lineage — design baseline (everything below)
+The Plan 9 draw protocol is opaque binary ops on `/dev/draw`. The
+framebuffer (Phase 4 in earlier revisions of H-§E) was opaque pixels.
+Both choices fight the AI-debug story. H-§G replaces them with a
+**layered, text-readable draw model** so an AI agent can `cat
+/dev/wsys/<wid>/draw/chrome/markup` and read what's drawn the same
+way it reads `text` and `cmd`.
+
+### File layout
+
+```
+/dev/wsys/<wid>/draw/
+├── ctl                 # mklayer / rmlayer / clear / setz / ls
+├── chrome/             # named layer; layer name is the directory
+│   ├── kind            # "markup" or "fb"
+│   ├── z               # explicit integer z-height (higher = on top)
+│   ├── opacity         # 0..255 layer-wide alpha (multiplies per-pixel)
+│   ├── geometry        # "x y w h" — layer can be smaller than window
+│   ├── markup          # hamML text  (if kind=markup)
+│   └── fb              # mmap pixel buffer RGBA8888 (if kind=fb)
+├── content/
+│   └── ...
+├── cursor/
+│   └── ...
+└── (any other named layer the app wants)
+```
+
+Layers are addressed by name, not number. `chrome`, `content`,
+`tooltip`, `floppy-dialog` — whatever the app chooses. Z-height lives
+in each layer's `z` file as an explicit integer; the compositor walks
+layers ordered by z ascending. Two layers at the same z are an
+undefined order (don't); use ctl `setz <layer> <n>` to nudge.
+
+`/dev/wsys/<wid>/draw/ctl` accepts:
+```
+mklayer <name> markup [w h]      # create markup layer; geometry defaults to window
+mklayer <name> fb w h [bpp]      # create framebuffer layer; w/h required
+rmlayer <name>                   # remove
+clear <name>                     # zero the layer's content
+setz <name> <n>                  # set z-height
+ls                               # write the listing back; readers see active layers
+```
+
+`/dev/wsys/<wid>/draw` (read, no slash) returns ordered listing:
+```
+chrome     z=100  kind=markup  10x10..630x40    opacity=255
+content    z=200  kind=fb      0x40..640x440    opacity=255
+cursor     z=900  kind=markup  120x80..136x96   opacity=255
+```
+
+### Arbitrary layer count
+
+No hard cap. Rule of thumb: **fewer well-defined layers > a horde of
+tiny layers.** A file manager wants ~4 (chrome, file-list, selection,
+drag-preview), not 50. The compositor cost is per-pixel-covered, not
+per-layer, but cache pressure grows with layer count.
+
+### hamML (markup grammar — minimal v1)
+
+```xml
+<window title="Files" w="640" h="480">
+  <rect x="0" y="0" w="640" h="40" fill="#222"/>
+  <text x="48" y="28" fill="#fff" font="sans" size="14">Documents</text>
+  <image x="8" y="8" w="32" h="32" src="/usr/share/icons/folder.png"/>
+  <image x="0" y="120" w="640" h="360" src="fb:content"/>
+  <button x="540" y="450" w="80" h="20" id="close">Close</button>
+  <group transform="translate(20,200)">
+    <line x1="0" y1="0" x2="100" y2="0" stroke="#888" width="1"/>
+    <text x="0" y="-4" fill="#fff" size="10">section</text>
+  </group>
+</window>
+```
+
+Tags v1:
+- `<rect>` `<line>` `<text>` `<image>` `<group transform=...>` — shapes
+- `<button id=...>` `<input id=... placeholder=...>` — widgets (emit
+  events to `/events`)
+- `<window ...>` — top-of-layer metadata only on markup layers
+
+Attributes: `x`, `y`, `w`, `h`, `fill` (CSS-shape `#rrggbb` or
+`rgba(r,g,b,a)`), `stroke`, `width`, `opacity` (0..1 per-element),
+`font` (`mono`/`sans`/`serif` v1), `size` (px), `anchor`
+(`start`/`middle`/`end` for text alignment), `transform` (translate
+only v1; rotate/scale later).
+
+**No flow layout.** Every element has explicit position. Matches
+acme aesthetic + makes AI reasoning trivial.
+
+`<image src="fb:<layername>">` composites another layer's framebuffer
+inside a markup layer — that's how an X11 fb layer gets a markup
+chrome wrapped around it (see "X11 as a layer" below).
+
+### Framebuffer layers (kind=fb)
+
+`/dev/wsys/<wid>/draw/<layer>/fb` is a mmap'd RGBA8888 buffer
+(W×H×4 bytes). Apps that want raw pixel access write here. Xvfb
+points its screen 0 framebuffer at this file (Phase 5). A direct-
+pixel native app does the same.
+
+### Per-pixel alpha + per-layer opacity
+
+Both. Each pixel in an fb layer carries its own A channel (RGBA8888,
+premultiplied). Each layer also has a single `opacity` 0..255 that
+the compositor multiplies in. So a tooltip can be a markup layer at
+opacity=200 with text that itself has rgba(255,255,255,255) — the
+layer-wide opacity wins.
+
+Markup layers rasterise to RGBA internally; the compositor treats
+them identically to fb layers post-rasterise.
+
+### Dirty rectangles (efficient repaint, zero AI overhead)
+
+**Apps write whole-layer markup or whole-layer pixels.** Simple write
+semantics; no app-side dirty tracking.
+
+**The compositor diffs.** A userland renderer daemon (see below)
+keeps the previous rastered RGBA bitmap of every layer in memory.
+On a layer-file write, it rasterises the new content, runs a coarse
+diff against the cached previous rastered bitmap (16×16 tile
+comparison), and re-composites only dirty tiles.
+
+Cost: one RGBA bitmap per layer in renderer RAM (~4 bytes per pixel
+covered). Bounded by total covered area, not layer count. v1 can
+skip the diff entirely and full-composite on any change — adequate
+for 60 FPS at 800×600 on this hardware; add the diff path later if
+it bottlenecks.
+
+### Event stream
+
+`/dev/wsys/<wid>/events` — text-shape, one event per line:
+
+```
+click x=545 y=455 layer=chrome id=close
+key A meta=ctrl
+key BACKSPACE
+resize w=800 h=600
+focus
+blur
+mousemove x=120 y=80
+scroll dy=-3
+```
+
+`layer=` tells the app which layer the pointer hit (so an X11 fb
+layer gets X11-shape coords; a chrome markup layer gets widget-id
+semantics). `id=` is the markup element's `id` attribute. Hit-
+testing happens in the compositor since it owns the rasterised
+layer tree.
+
+### X11 (Phase 5) as a layer
+
+`hamUI new -kind x11 -cmd '/usr/bin/firefox'` becomes:
+
+1. Create `chrome` layer (kind=markup, z=200) — title bar, close
+   button, scrollbar gutter
+2. Create `content` layer (kind=fb, z=100, 640×400) — Xvfb mmaps
+   `draw/content/fb` as its screen 0 framebuffer
+3. Xvfb runs inside the linux ns, draws into `content/fb`
+4. `chrome/markup` references the X11 content with
+   `<image src="fb:content"/>`
+5. Compositor blits content layer with chrome layer on top
+6. Mouse events with `layer=content` route to Xvfb (translate to X11
+   events sent to Xvfb's unix socket); events with `layer=chrome`
+   route to the chrome's widget IDs
+
+No special X11 path in the compositor. X11 is just a fb layer with
+an app that's listening to the X11 wire protocol on the side. Same
+machinery serves any advanced native app that wants raw pixels.
+
+### Renderer lives in userland (hamUId daemon)
+
+`hamUId` is a userland daemon launched at boot, owns:
+- The rastered-layer cache (one RGBA per active layer)
+- The hamML parser + rasteriser (bitmap-font text, shape primitives)
+- The compositor (final blit to the physical framebuffer)
+- The hit-test machinery (translates mouse/touch coords to
+  `layer=` + `id=` events back to `/events`)
+- The font store (loads `/usr/share/fonts/<name>.bdf` on demand)
+
+The **kernel** owns just the cdev plumbing — `/dev/wsys/<wid>/draw/*`
+is a glorified tmpfs subtree with notification on write. Heavy
+graphics logic stays out of ring 0.
+
+Bonus: `hamUId` can be swapped (alternate renderer impls), restarted
+on crash without dropping the kernel, even rewritten in a different
+language someday.
+
+### Fonts
+
+v1 ships three bitmap fonts:
+- `mono` — 8×16 VGA-style (terminal default)
+- `sans` — 12pt clean sans-serif (UI default)
+- `serif` — 12pt serif (reading)
+
+Format: BDF or PCF (text-shape, AI-readable, parser is small). Lives
+at `/usr/share/fonts/<name>-<size>.bdf`. Fallback: missing font →
+`mono`. TTF rasterising is a later addition (`hamUId` can swap in a
+TTF backend without protocol change).
+
+### Phasing update (replaces H-§E item 4)
+
+H-§E's Phase 4 ("framebuffer-backed pixel windows + drag-to-create
+gesture") becomes:
+
+4a. **Draw protocol primitives** — kernel cdev plumbing for
+    `/dev/wsys/<wid>/draw/<layer>/*`; `ctl` verbs; tmpfs-shape
+    storage. No rasterisation yet; just the file surface.
+4b. **`hamUId` renderer daemon** — userland; parses hamML, rasters,
+    composites to a single fb (could be VGA text-mode emulation for
+    bring-up, then real fb).
+4c. **Framebuffer driver** + drag-to-create gesture.
+4d. **Bitmap-font store** + the three v1 fonts.
+
+5. **X11 (Phase 5)** — Xvfb points at a kind=fb layer; mouse/kbd
+   translation. As described above.
+6. **Snarf, wctl resize/move, focus.**
 
 The rest of this document is the design lineage from Plan 9 rio. The
 sections above (H-§A through H-§F) are the Hamnix-specific overlay.
