@@ -1,0 +1,162 @@
+# arch/x86/kernel/power.ad
+#
+# Real machine power control: poweroff / reboot / halt. The single
+# kernel-side core that BOTH power surfaces funnel through:
+#
+#   * the Plan-9-native /dev/reboot cdev (sys/src/9/port/namec.ad),
+#     written with an ASCII verb ("poweroff" / "reboot" / "halt"); and
+#   * the Linux-ABI reboot(2) syscall (number 169) decoded in
+#     arch/x86/kernel/syscall.ad.
+#
+# Both decode their request to one of the POWER_* actions below and
+# call power_action(). There is exactly one place that touches the
+# hardware power vectors, so the two identities can never drift.
+#
+# SEQUENCE (the whole point of a CLEAN shutdown):
+#   1. Flush filesystems FIRST so ext4's write-through journal + any
+#      device volatile cache hit durable media before the CPU stops.
+#      vfs_fsync_all() drives the ext4 fsync path (fs/vfs.ad); then we
+#      walk every live block device and issue blk_flush() so a device
+#      with a volatile cache drains it. This reuses the EXISTING block
+#      / fsync plumbing — no new FS API is invented here.
+#   2. Then the power action proper (S5-ish emulator ports for
+#      poweroff, i8042 pulse / triple-fault for reboot, cli;hlt for
+#      halt).
+#
+# PORT I/O: outw/outb are Adder x86 intrinsics (see codegen_x86.py
+# X86_INTRINSICS) — the same primitives drivers/i8259.ad / time.ad use.
+# No new language primitive is needed.
+
+from kernel.printk.printk import printk0, printk_set_level
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
+from fs.vfs import vfs_fsync_all
+from kernel.block.blk import blk_flush, blk_max_slots, blk_slot_in_use
+
+extern def local_irq_disable()
+
+
+# --- power actions --------------------------------------------------
+#
+# The single decoded request shape. The two front ends (the /dev/reboot
+# verb parser and reboot(2)'s cmd decode) both translate down to one of
+# these and call power_action().
+POWER_HALT:     int32 = 0
+POWER_REBOOT:   int32 = 1
+POWER_POWEROFF: int32 = 2
+
+# Linux reboot(2) magics + command codes — the real Linux constants, so
+# a stock Linux binary's reboot()/poweroff() lands on the right shape.
+# Declared here (the one power module) and imported by both the native
+# do_syscall(SYS_REBOOT) arm and the Linux-ABI _u_reboot handler, so
+# there is a single source of truth and no duplicate-definition clash
+# across the merged kernel namespace.
+LINUX_REBOOT_MAGIC1:        uint64 = 0xfee1dead
+LINUX_REBOOT_MAGIC2:        uint64 = 0x28121969
+LINUX_REBOOT_CMD_RESTART:   uint64 = 0x01234567
+LINUX_REBOOT_CMD_HALT:      uint64 = 0xcdef0123
+LINUX_REBOOT_CMD_POWER_OFF: uint64 = 0x4321fedc
+
+
+def _flush_all_storage():
+    # Step 1: make the shutdown CLEAN. Drive the filesystem sync path
+    # (ext4 fsync; tmpfs/procfs are RAM-backed no-ops) then push every
+    # live block device's volatile cache so acknowledged writes are
+    # durable on the platter before we cut power.
+    vfs_fsync_all()
+    n: uint64 = blk_max_slots()
+    s: uint64 = 0
+    while s < n:
+        si: int32 = cast[int32](s)
+        if blk_slot_in_use(si) != 0:
+            blk_flush(si)
+        s = s + 1
+
+
+def _hlt_forever():
+    # CPU stopped with interrupts masked: HLT parks the core until an
+    # interrupt that (with IF=0) can never arrive. Mirrors panic.ad's
+    # _hang_forever — the canonical "this CPU does nothing more" idiom.
+    local_irq_disable()
+    while True:
+        asm_volatile("hlt")
+
+
+def _do_poweroff():
+    # Emulator / firmware ACPI-S5 shortcut ports. We don't yet parse
+    # ACPI AML to find the real FADT PM1a_CNT_BLK + \_S5 SLP_TYPa, so
+    # the pragmatic must-work path is the well-known device ports each
+    # hypervisor watches for an S5 transition. Issuing all three is
+    # harmless — only the matching emulator reacts; the rest are
+    # unmapped writes. After this the VM exits; on real ACPI hardware
+    # these are no-ops and we fall through to the HLT loop.
+    #
+    #   0x604 <- 0x2000   QEMU >= 2.0 ACPI PM control (isa-debug/ACPI)
+    #   0xB004 <- 0x2000  Bochs / old QEMU PM control
+    #   0x4004 <- 0x3400  VirtualBox ACPI PM control
+    outw(0x2000, 0x604)
+    outw(0x2000, 0xB004)
+    outw(0x3400, 0x4004)
+    # If nothing reacted (bare ACPI hardware without these debug ports)
+    # the best we can do without an AML interpreter is stop the CPU.
+    _hlt_forever()
+
+
+# Zero-length IDT descriptor (limit=0, base=0) for the triple-fault
+# reboot fallback. A fault with this IDT loaded has nowhere to vector
+# and triple-faults the CPU into a reset. Module-scope so the inline
+# asm can name it RIP-relative. Declared BEFORE _do_reboot so the
+# symbol is in scope when the asm references it.
+power_null_idt: Array[10, uint8]
+
+
+def _do_reboot():
+    # Reset via the i8042 keyboard controller: pulse the CPU-reset line
+    # by writing 0xFE to the command port 0x64. This is the classic
+    # PC reset that QEMU, Bochs and most real chipsets honour. With
+    # QEMU's -no-reboot the reset makes QEMU exit (which the test
+    # asserts); on real hardware it reboots.
+    #
+    # Drain the i8042 input buffer first (bit 1 of status port 0x64
+    # clear) so the controller accepts the command, then pulse reset.
+    guard: uint64 = 0
+    while guard < 100000:
+        st: int32 = inb(0x64)
+        if (st & 0x02) == 0:
+            break
+        guard = guard + 1
+    outb(0xFE, 0x64)
+    # Fallback: if the i8042 pulse didn't take, force a triple fault by
+    # loading a zero-length IDT and raising an interrupt — the CPU can
+    # find no handler, no double-fault handler, and resets.
+    asm_volatile("""
+        lidt power_null_idt(%rip)
+        int3
+    """)
+    _hlt_forever()
+
+
+def power_action(action: int32):
+    # THE shared core. Flush storage, announce, then take the action.
+    # Never returns (each leg ends in a reset or an HLT loop).
+    #
+    # Each banner stamps EMERG (severity 0) so it survives the post-
+    # interactive console-loglevel gate — same one-shot latch panic.ad
+    # uses. printk_set_level is consumed by the next printk, so we
+    # re-stamp before every line. Without this the shutdown is silent
+    # on the serial console (the gate drops INFO-level lines once the
+    # shell goes interactive).
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0("\n--- Hamnix power: flushing filesystems ---\n")
+    _flush_all_storage()
+    if action == POWER_POWEROFF:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("--- Hamnix: powering off ---\n")
+        _do_poweroff()
+    if action == POWER_REBOOT:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("--- Hamnix: rebooting ---\n")
+        _do_reboot()
+    # POWER_HALT (and any unknown action) — stop the CPU, leave power on.
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0("--- Hamnix: system halted ---\n")
+    _hlt_forever()
