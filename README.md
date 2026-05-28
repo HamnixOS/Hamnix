@@ -64,7 +64,8 @@ loop through userspace-posted srvfds. See
   TCP / ICMP / DHCP / DNS / HTTP / TLS 1.3 end-to-end. **TCP / UDP /
   TLS exposed as the `/net` 9P file tree** (Plan-9-shape, zero BSD
   socket syscalls at Layer 1). `sshd` ships and auto-spawns at boot.
-  NTP client syncs the wall clock via `/net/udp`.
+  NTP client syncs the wall clock via `/net/udp`. `curl` + `wget`
+  dial out over HTTP/HTTPS via the shared `user/http9.ad` client.
 - **Filesystem** — ext4 read + write (files up to 512 MiB, multi-block
   extent leaves), FAT32, MBR + GPT, partition-aware block-device names
   (`sd0p1`, `nvme0n1p2`).

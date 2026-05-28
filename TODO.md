@@ -60,9 +60,9 @@ retrofitted backwards.
    no third tier.
 7. [ ] **hamsh `use hamui`** — bindings on top of #6. May require
    hamsh extensions for closures + event loop + persistent state.
-8. [~] **Outgoing `ssh` client + `curl`/`wget`** — `sshd` ships but
-   nothing dials out. `hpm`'s HTTPS fetcher exists; `user/net9.ad`
-   already has `net_dial_tls`; expose it. (curl/wget agent in flight)
+8. [ ] **Outgoing `ssh` client** — `sshd` ships but nothing dials out.
+   `curl`/`wget` now exist (shared `user/http9.ad`); an SSH *client*
+   is a separate protocol/crypto lift still to do.
 9. [ ] **Pipes + job control in hamsh** — audit `|`; add `&`
     background, `bg`/`fg`/`jobs`, process groups + SIGTSTP/SIGCONT.
 10. [ ] **Real editor** — vi-shape or acme-shape. `ed` is too minimal.
