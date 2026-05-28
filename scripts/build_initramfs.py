@@ -1403,6 +1403,30 @@ def build_archive() -> bytes:
         print(f"  embedded /lib/modules/modules.dep "
               f"({len(dep_bytes)} bytes, {_dep_lines_n} module rows)")
 
+    # Userland modprobe test fixture. scripts/test_modprobe.sh sets
+    # ENABLE_MODPROBE_USERLAND_TEST=1 to plant a synthetic Linux-shape
+    # modules.dep at /lib/modules/6.12/modprobe-test.dep. libcrc32c's
+    # line lists crc32c_generic as its (flattened, transitive)
+    # dependency, so the native user/modprobe.ad must load
+    # crc32c_generic BEFORE libcrc32c. The .ko paths are relative to
+    # the dep file's own directory (/lib/modules/6.12/), where the test
+    # stages crc32c_generic.ko + libcrc32c.ko into tests/linux-modules/
+    # (embedded by the *.ko glob above at /lib/modules/6.12/<name>.ko).
+    # Emitted here via blob += cpio_entry() (alongside the real
+    # modules.dep) so it lands in the same cpio region the userland VFS
+    # root sees — the FILES[] list is laid down separately and was not
+    # openable from userland sys_open(). These two .ko's are tiny
+    # (~10 KiB), so the userland read-whole-file path stays cheap.
+    if os.environ.get("ENABLE_MODPROBE_USERLAND_TEST") == "1":
+        _modprobe_dep_bytes = (
+            b"# synthetic modules.dep for scripts/test_modprobe.sh\n"
+            b"crc32c_generic.ko:\n"
+            b"libcrc32c.ko: crc32c_generic.ko\n")
+        blob += cpio_entry(
+            "/lib/modules/6.12/modprobe-test.dep", _modprobe_dep_bytes)
+        print(f"  embedded /lib/modules/6.12/modprobe-test.dep "
+              f"({len(_modprobe_dep_bytes)} bytes, synthetic fixture)")
+
     # Multi-NIC scale-out: r8169.ko (Realtek consumer GbE) and igb.ko
     # (Intel server/workstation). Same plant-unconditional shape as
     # e1000e.ko above — marker files at /etc/r8169-ko and /etc/igb-ko

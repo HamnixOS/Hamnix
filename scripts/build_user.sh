@@ -101,6 +101,7 @@ build_adder_user halt                 # M16.82: graceful exit / future ACPI halt
 build_adder_user poweroff             # M16.82: same as halt for now
 build_adder_user reboot               # M16.82: future i8042 0xFE pulse
 build_adder_user insmod               # L1: load stock Linux 6.12 .ko
+build_adder_user modprobe             # L1: resolve modules.dep + load deps
 build_adder_user rmmod                # L1: unload by slot id
 build_adder_user pgrep                # /proc/tasks comm-substring -> PIDs
 build_adder_user kill                 # sys_kill(pid, sig); -SIG flag

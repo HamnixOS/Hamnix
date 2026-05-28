@@ -1,0 +1,509 @@
+# user/modprobe.ad
+#
+# Hamnix `modprobe NAME` — a native modprobe that resolves a module's
+# dependency chain from `modules.dep` and loads every module in the
+# computed order via SYS_INIT_MODULE (175).
+#
+# Where `insmod PATH.ko` loads exactly one self-contained module,
+# modprobe is what you reach for when a driver depends on others
+# (e.g. a wifi driver -> mac80211 -> cfg80211). It reads modules.dep,
+# walks the requested module's flattened dependency list, and loads
+# the deps before the target — exactly like Linux's modprobe.
+#
+# Usage:
+#   modprobe NAME           # load NAME and its deps (no .ko / no path)
+#   modprobe -v NAME        # verbose: print each module as it loads
+#   modprobe -d FILE NAME   # use FILE as modules.dep (default below)
+#
+# Default modules.dep path follows Linux convention:
+#   /lib/modules/<release>/modules.dep
+# Hamnix has no <release> resolved natively, so the default is the
+# release-less /lib/modules/modules.dep and an explicit -d FILE
+# override is provided (the test uses -d).
+#
+# modules.dep format (one line per module, depmod pre-flattens the
+# full transitive dep set onto each line):
+#
+#   kernel/net/wireless/cfg80211.ko:
+#   kernel/net/mac80211/mac80211.ko: kernel/net/wireless/cfg80211.ko
+#   .../foo.ko: .../mac80211.ko .../cfg80211.ko
+#
+# The token before ':' is the module's path; tokens after ':' are its
+# (already-transitive) dependencies, listed most-dependent-FIRST. The
+# conventional load order is therefore: load the listed deps RIGHT-TO-
+# LEFT (last-listed = leaf-most = first), then finally the target
+# module itself. (Verified against the host's stock Linux 6.12
+# modules.dep: e.g. `serpent-avx2: serpent-avx-x86_64 serpent_generic
+# crypto_simd cryptd` — cryptd/crypto_simd are leaves and appear last,
+# serpent-avx-x86_64 depends on them and appears first, so right-to-
+# left satisfies the kernel.)
+#
+# .ko files live relative to the directory containing modules.dep
+# (Linux stores them under that same /lib/modules/<release>/ tree, with
+# the modules.dep paths being relative to it).
+#
+# We do the SYS_INIT_MODULE syscall inline (copied verbatim from
+# user/insmod.ad) rather than going through user/runtime.S, which is
+# shared with every other user binary.
+
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+
+
+# --- fixed-size buffers (documented caps) ----------------------------
+#
+# modules.dep: up to 64 KiB of text.
+# .ko read buffer: 4 MiB. insmod.ad uses 1 MiB; we bump it because the
+#   foundational wifi framework modules Hamnix ships (cfg80211.ko,
+#   mac80211.ko) are ~2.4 MiB each — the largest .ko's in the tree.
+#   Bumping this cap is a single constant change; the kernel's
+#   kmod_linux_load happily takes any size it can alloc_pages for.
+# Up to 256 modules tracked as "loaded this invocation" (basenames).
+# Up to 32 dep tokens per modules.dep line (depmod flattens, so even a
+#   deep wifi driver lists well under this many).
+# Module basenames capped at 64 bytes; full paths capped at 256 bytes.
+DEP_CAP:      uint64 = 65536
+KO_CAP:       uint64 = 4194304
+MAX_LOADED:   uint64 = 256
+MAX_DEPS:     uint64 = 32
+NAME_CAP:     uint64 = 64
+PATH_CAP:     uint64 = 256
+
+dep_buf:  Array[65536, uint8]            # modules.dep text
+dep_len:  uint64 = 0
+ko_data:  Array[4194304, uint8]          # one .ko at a time
+
+# Directory containing modules.dep, NUL-terminated, WITH a trailing
+# '/' (or empty if modules.dep had no directory component). The .ko
+# relative paths from modules.dep are appended onto this.
+dep_dir:     Array[256, uint8]
+dep_dir_len: uint64 = 0
+
+# Loaded-this-invocation set: a flat array of NUL-terminated basenames.
+# Linear scan; MAX_LOADED is small.
+loaded_names: Array[16384, uint8]        # 256 * 64
+n_loaded:     uint64 = 0
+
+# Scratch for the path we hand to sys_open.
+open_path: Array[256, uint8]
+
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+def write_dec(fd: int32, v: uint64):
+    if v == 0:
+        sys_write(fd, "0", 1)
+        return
+    digits: Array[20, uint8]
+    di: uint64 = 0
+    while v > 0:
+        digits[di] = cast[uint8]((v % 10) + 48)
+        v = v / 10
+        di = di + 1
+    while di > 0:
+        di = di - 1
+        sys_write(fd, &digits[di], 1)
+
+
+# Print a signed errno (the negative return from SYS_INIT_MODULE).
+def write_errno(fd: int32, rc: int32):
+    if rc < 0:
+        sys_write(fd, "-", 1)
+        write_dec(fd, cast[uint64](cast[int64](0) - cast[int64](rc)))
+    else:
+        write_dec(fd, cast[uint64](rc))
+
+
+def sys_init_module(image: Ptr[uint8], size: uint64,
+                    params: Ptr[char]) -> int32:
+    # SYS_INIT_MODULE = 175. The codegen spills our three params into
+    # -8(%rbp), -16(%rbp), -24(%rbp); reload them into the syscall
+    # arg regs (rdi/rsi/rdx — same positions as SysV, so no shuffle
+    # needed beyond loading from the stack). %rax = 175, syscall.
+    # rax then holds the return value, and the function's implicit
+    # epilogue (leave/ret) preserves it.
+    asm_volatile("""
+        movq -8(%rbp), %rdi
+        movq -16(%rbp), %rsi
+        movq -24(%rbp), %rdx
+        movq $175, %rax
+        syscall
+    """)
+    # Deliberately no `return` statement — the codegen's implicit
+    # epilogue (leave; ret) preserves %rax, which holds the syscall
+    # return value. An explicit `return 0` would clobber it.
+
+
+# --- basename / loaded-set helpers -----------------------------------
+
+# Copy the basename of a slice [s, s+n) — everything after the last
+# '/', and with a trailing ".ko" stripped — into `out` (NUL-terminated,
+# capped at NAME_CAP-1). Returns the basename length. e.g.
+# "kernel/net/mac80211/mac80211.ko" -> "mac80211".
+def slice_basename(s: Ptr[uint8], n: uint64, out: Ptr[uint8]) -> uint64:
+    start: uint64 = 0
+    i: uint64 = 0
+    while i < n:
+        if s[i] == 47:                           # '/'
+            start = i + 1
+        i = i + 1
+    end: uint64 = n
+    # Strip a trailing ".ko".
+    if end - start >= 3:
+        if s[end - 3] == 46 and s[end - 2] == 107 and s[end - 1] == 111:
+            end = end - 3
+    bl: uint64 = end - start
+    if bl > NAME_CAP - 1:
+        bl = NAME_CAP - 1
+    j: uint64 = 0
+    while j < bl:
+        out[j] = s[start + j]
+        j = j + 1
+    out[bl] = 0
+    return bl
+
+
+def names_eq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while a[i] != 0 and b[i] != 0:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    if a[i] == b[i]:
+        return 1
+    return 0
+
+
+def is_loaded(name: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while i < n_loaded:
+        slot: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](&loaded_names[0]) + i * NAME_CAP)
+        if names_eq(slot, name) == 1:
+            return 1
+        i = i + 1
+    return 0
+
+
+def mark_loaded(name: Ptr[uint8]):
+    if n_loaded >= MAX_LOADED:
+        return
+    slot: Ptr[uint8] = cast[Ptr[uint8]](
+        cast[uint64](&loaded_names[0]) + n_loaded * NAME_CAP)
+    i: uint64 = 0
+    while name[i] != 0 and i < NAME_CAP - 1:
+        slot[i] = name[i]
+        i = i + 1
+    slot[i] = 0
+    n_loaded = n_loaded + 1
+
+
+# --- modules.dep load + parse ----------------------------------------
+
+def read_dep_file(path: Ptr[char]) -> int32:
+    # Slurp the whole modules.dep into dep_buf. Returns 0 on success,
+    # -1 on open failure or empty file.
+    fd: int32 = sys_open(path)
+    if fd < 0:
+        return -1
+    total: uint64 = 0
+    while total < DEP_CAP:
+        room: uint64 = DEP_CAP - total
+        n: int64 = sys_read(fd,
+            cast[Ptr[uint8]](cast[uint64](&dep_buf[0]) + total), room)
+        if n <= 0:
+            break
+        total = total + cast[uint64](n)
+    sys_close(fd)
+    dep_len = total
+    if total == 0:
+        return -1
+    return 0
+
+
+# Record the directory component of the modules.dep path (everything up
+# to and including the last '/') into dep_dir. .ko relative paths are
+# appended onto this. If `path` has no '/', dep_dir is empty.
+def set_dep_dir(path: Ptr[char]):
+    p: Ptr[uint8] = cast[Ptr[uint8]](path)
+    plen: uint64 = strlen_u8(p)
+    last_slash: uint64 = 0
+    has_slash: int32 = 0
+    i: uint64 = 0
+    while i < plen:
+        if p[i] == 47:
+            last_slash = i
+            has_slash = 1
+        i = i + 1
+    if has_slash == 0:
+        dep_dir[0] = 0
+        dep_dir_len = 0
+        return
+    keep: uint64 = last_slash + 1                # include the '/'
+    if keep > PATH_CAP - 1:
+        keep = PATH_CAP - 1
+    j: uint64 = 0
+    while j < keep:
+        dep_dir[j] = p[j]
+        j = j + 1
+    dep_dir[keep] = 0
+    dep_dir_len = keep
+
+
+# Find the modules.dep line whose module path basename matches `name`.
+# A line is "<path>: <dep> <dep> ...". We match by basename (NAME_CAP
+# normalized, ".ko" stripped). Returns the byte offset of the line
+# start, or -1 if not found.
+def find_line(name: Ptr[uint8]) -> int64:
+    line_bn: Array[64, uint8]
+    pos: uint64 = 0
+    while pos < dep_len:
+        # Line start.
+        ls: uint64 = pos
+        # Find end of line.
+        le: uint64 = pos
+        while le < dep_len and dep_buf[le] != 10:
+            le = le + 1
+        # Advance pos for next iteration.
+        pos = le + 1
+        # Skip blank / comment lines.
+        if ls >= le:
+            continue
+        if dep_buf[ls] == 35:                    # '#'
+            continue
+        # Find the ':' within the line.
+        colon: uint64 = ls
+        while colon < le and dep_buf[colon] != 58:
+            colon = colon + 1
+        if colon >= le:
+            continue                             # no ':' — malformed
+        # Module path slice is [ls, colon). Basename it and compare.
+        bl: uint64 = slice_basename(
+            cast[Ptr[uint8]](cast[uint64](&dep_buf[0]) + ls),
+            colon - ls, &line_bn[0])
+        if names_eq(&line_bn[0], name) == 1:
+            return cast[int64](ls)
+    return -1
+
+
+# --- .ko open + init -------------------------------------------------
+
+# Build dep_dir + relative-path into open_path (NUL-terminated).
+def build_open_path(rel: Ptr[uint8], rel_len: uint64):
+    i: uint64 = 0
+    while i < dep_dir_len and i < PATH_CAP - 1:
+        open_path[i] = dep_dir[i]
+        i = i + 1
+    j: uint64 = 0
+    while j < rel_len and (i + j) < PATH_CAP - 1:
+        open_path[i + j] = rel[j]
+        j = j + 1
+    open_path[i + j] = 0
+
+
+# Load one module given its relative .ko path slice [rel, rel+rel_len)
+# from modules.dep. The path is joined onto dep_dir, the file slurped,
+# and SYS_INIT_MODULE invoked. Tracks the basename in the loaded set.
+# verbose: print as we load. Returns:
+#    1  loaded OK (or skipped: already loaded this invocation)
+#   -1  hard init failure (a genuine dependency failure — fatal)
+# An "already loaded"-style errno from the kernel (EEXIST = -17) is
+# treated as BENIGN: a previous command loaded it; we print a note and
+# return 1 rather than aborting the stack.
+def load_one(rel: Ptr[uint8], rel_len: uint64, verbose: int32) -> int32:
+    bn: Array[64, uint8]
+    slice_basename(rel, rel_len, &bn[0])
+
+    if is_loaded(&bn[0]) == 1:
+        if verbose != 0:
+            write_str(1, "modprobe: already loaded this run: ")
+            write_str(1, &bn[0])
+            write_str(1, "\n")
+        return 1
+
+    build_open_path(rel, rel_len)
+    fd: int32 = sys_open(cast[Ptr[char]](&open_path[0]))
+    if fd < 0:
+        write_str(2, "modprobe: cannot open ")
+        write_str(2, &open_path[0])
+        write_str(2, "\n")
+        return -1
+
+    total: uint64 = 0
+    while total < KO_CAP:
+        room: uint64 = KO_CAP - total
+        n: int64 = sys_read(fd,
+            cast[Ptr[uint8]](cast[uint64](&ko_data[0]) + total), room)
+        if n <= 0:
+            break
+        total = total + cast[uint64](n)
+    sys_close(fd)
+
+    if total == 0:
+        write_str(2, "modprobe: empty .ko ")
+        write_str(2, &open_path[0])
+        write_str(2, "\n")
+        return -1
+    if total >= KO_CAP:
+        write_str(2, "modprobe: .ko exceeds buffer: ")
+        write_str(2, &open_path[0])
+        write_str(2, "\n")
+        return -1
+
+    if verbose != 0:
+        write_str(1, "modprobe: loading ")
+        write_str(1, &bn[0])
+        write_str(1, "\n")
+
+    rc: int32 = sys_init_module(&ko_data[0], total, "")
+    if rc < 0:
+        # EEXIST (-17): the kernel already has this module loaded from a
+        # previous command. Benign — note and continue (mark loaded so
+        # the rest of the stack treats it as satisfied).
+        if rc == -17:
+            write_str(1, "modprobe: already loaded (kernel): ")
+            write_str(1, &bn[0])
+            write_str(1, "\n")
+            mark_loaded(&bn[0])
+            return 1
+        # Any other error on a real dependency is fatal.
+        write_str(2, "modprobe: init_module failed for ")
+        write_str(2, &bn[0])
+        write_str(2, " (errno=")
+        write_errno(2, rc)
+        write_str(2, ")\n")
+        return -1
+
+    mark_loaded(&bn[0])
+    if verbose != 0:
+        # rc is the kernel module slot id (>= 1) on success. Reported so
+        # the load is verifiable from userland even where the kernel's
+        # own kmod_linux printk doesn't surface on this serial console
+        # (boot-time loads log; userland-syscall-context loads may not).
+        write_str(1, "modprobe: loaded ")
+        write_str(1, &bn[0])
+        write_str(1, " (slot ")
+        write_dec(1, cast[uint64](rc))
+        write_str(1, ")\n")
+    return 1
+
+
+# --- dependency-ordered load -----------------------------------------
+
+# Resolve and load `name` and all its dependencies. Uses the flattened
+# dep list from `name`'s modules.dep line: load the listed deps RIGHT-
+# TO-LEFT (leaf-most first), then the target last. Each module is
+# deduped by basename through the loaded set, so a dep named by several
+# entries loads once.
+#
+# Returns 0 on success, 1 if `name` has no modules.dep line, -1 on a
+# fatal load failure.
+def load_with_deps(name: Ptr[uint8], verbose: int32) -> int32:
+    off: int64 = find_line(name)
+    if off < 0:
+        write_str(2, "modprobe: module not found in modules.dep: ")
+        write_str(2, name)
+        write_str(2, "\n")
+        return 1
+
+    ls: uint64 = cast[uint64](off)
+    le: uint64 = ls
+    while le < dep_len and dep_buf[le] != 10:
+        le = le + 1
+    # Locate ':'.
+    colon: uint64 = ls
+    while colon < le and dep_buf[colon] != 58:
+        colon = colon + 1
+
+    # Collect the dep tokens (offset + length) after the colon.
+    dep_off: Array[32, uint64]
+    dep_ln:  Array[32, uint64]
+    n_dep: uint64 = 0
+    c: uint64 = colon + 1
+    while c < le and n_dep < MAX_DEPS:
+        # Skip whitespace.
+        while c < le and (dep_buf[c] == 32 or dep_buf[c] == 9):
+            c = c + 1
+        if c >= le:
+            break
+        ts: uint64 = c
+        while c < le and dep_buf[c] != 32 and dep_buf[c] != 9:
+            c = c + 1
+        if c > ts:
+            dep_off[n_dep] = ts
+            dep_ln[n_dep] = c - ts
+            n_dep = n_dep + 1
+
+    # Load deps RIGHT-TO-LEFT (last-listed = leaf-most = first).
+    k: uint64 = n_dep
+    while k > 0:
+        k = k - 1
+        rc: int32 = load_one(
+            cast[Ptr[uint8]](cast[uint64](&dep_buf[0]) + dep_off[k]),
+            dep_ln[k], verbose)
+        if rc < 0:
+            return -1
+
+    # Finally, load the target module itself (its path is [ls, colon)).
+    rc2: int32 = load_one(
+        cast[Ptr[uint8]](cast[uint64](&dep_buf[0]) + ls),
+        colon - ls, verbose)
+    if rc2 < 0:
+        return -1
+    return 0
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    # Default modules.dep path (Linux convention, release-less since
+    # Hamnix has no <release> resolved natively).
+    default_dep: Ptr[char] = "/lib/modules/modules.dep"
+    dep_path: Ptr[char] = default_dep
+    verbose: int32 = 0
+    name: Ptr[char] = cast[Ptr[char]](0)
+
+    # Parse args: -v, -d FILE, then the module NAME.
+    i: int32 = 1
+    while i < argc:
+        a: Ptr[uint8] = cast[Ptr[uint8]](argv[cast[uint64](i)])
+        if a[0] == 45 and a[1] == 118 and a[2] == 0:           # "-v"
+            verbose = 1
+            i = i + 1
+        elif a[0] == 45 and a[1] == 100 and a[2] == 0:         # "-d"
+            if i + 1 >= argc:
+                write_str(2, "modprobe: -d requires a path\n")
+                return 1
+            dep_path = cast[Ptr[char]](argv[cast[uint64](i + 1)])
+            i = i + 2
+        else:
+            name = cast[Ptr[char]](argv[cast[uint64](i)])
+            i = i + 1
+
+    if cast[uint64](name) == 0:
+        write_str(2, "modprobe: usage: modprobe [-v] [-d FILE] NAME\n")
+        return 1
+
+    if read_dep_file(dep_path) != 0:
+        write_str(2, "modprobe: cannot read modules.dep at ")
+        write_str(2, cast[Ptr[uint8]](dep_path))
+        write_str(2, "\n")
+        return 1
+    set_dep_dir(dep_path)
+
+    rc: int32 = load_with_deps(cast[Ptr[uint8]](name), verbose)
+    if rc < 0:
+        return 1
+    if rc == 1:
+        # Module not found in modules.dep.
+        return 1
+    return 0
