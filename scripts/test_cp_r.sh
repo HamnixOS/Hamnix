@@ -80,16 +80,21 @@ trap 'rm -f "$LOG"' EXIT
 echo "[test_cp_r] (B1) Boot QEMU + drive recursive cp scenarios"
 set +e
 # Notes on the command sequence:
-#   * `echo X > FILE` -> hamsh redirects stdout via sys_open_write,
+#   * `echo X > FILE` -> the BUILTIN echo runs the in-process sys_dup2
+#     redirect dance (see _wire_redirects_self in user/hamsh.ad),
 #     plants "X\n" in the file. (8 chars per file, well below 8 KiB.)
+#     Pre-the-builtin-redirect-fix this had to spell out `/bin/echo`
+#     to force the external resolution, which got its redirect via
+#     _wire_redirects at spawn time. The builtin path now works too,
+#     so the bare `echo X > FILE` is the natural form to assert.
 #   * We bracket each `cat` output with echo markers so the test can
 #     extract just the file content from the noisy boot log.
 QEMU_EXTRA_ARGS="-drive file=$ROOTFS_IMG,if=virtio,format=raw" \
 qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 120 \
     -- "mkdir /tmp/src"                                       2 \
        "mkdir /tmp/src/sub"                                   2 \
-       "/bin/echo hello-a > /tmp/src/a.txt"                   2 \
-       "/bin/echo hello-b > /tmp/src/sub/b.txt"               2 \
+       "echo hello-a > /tmp/src/a.txt"                        2 \
+       "echo hello-b > /tmp/src/sub/b.txt"                    2 \
        "cp -r /tmp/src /tmp/dst"                              3 \
        "echo TMPFS_A_BEGIN"                                   2 \
        "cat /tmp/dst/a.txt"                                   2 \
