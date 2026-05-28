@@ -40,7 +40,7 @@ if [ ! -f build/user/init.elf ]; then
     bash scripts/build_user.sh >/dev/null
     bash scripts/build_modules.sh >/dev/null
 fi
-INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null
+ENABLE_MKPART_SMOKE=1 INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null
 
 echo "[test_gpt_mkpart] (2/4) Rebuild kernel image"
 python3 -m compiler.adder compile \

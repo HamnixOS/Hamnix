@@ -213,6 +213,16 @@ if os.environ.get("ENABLE_XHCI_SELFTEST") == "1":
 if os.environ.get("ENABLE_USBMS_TEST") == "1":
     FILES.append(("/etc/usbms-test", b"1\n"))
 
+# Partition write-smoke fixtures (mkpart MBR on sd0, gpt on nvme0n1).
+# These WRITE a partition table onto a freshly-registered disk that has
+# no MBR, so they must NEVER run on production media. Set
+# ENABLE_MKPART_SMOKE=1 to plant /etc/mkpart-smoke; init/main.ad calls
+# partition_enable_mkpart_smoke() when it sees the marker, before any
+# disk registers. Only scripts/test_mkpart.sh / test_gpt_mkpart.sh set
+# it; default boots leave the scan path strictly read-only.
+if os.environ.get("ENABLE_MKPART_SMOKE") == "1":
+    FILES.append(("/etc/mkpart-smoke", b"1\n"))
+
 # xHCI live-keyboard attach OPT-OUT. Mirrors ENABLE_XHCI_SELFTEST but
 # in the opposite direction: setting ENABLE_XHCI_NO_ATTACH=1 plants
 # /etc/xhci-no-attach so drivers/usb/xhci.ad's xhci_init() skips
