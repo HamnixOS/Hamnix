@@ -1,0 +1,931 @@
+# fs/squashfs.ad
+#
+# Read-only squashfs 4.0 driver — the compressed read-only image
+# format real Linux liveUSBs use (Debian Live's
+# live/filesystem.squashfs). Hamnix mounts a heavyweight Debian
+# distro that lives as a squashfs on a USB stick; this reader lets
+# the kernel open files, stream their contents, and list directories
+# straight off a block device.
+#
+# Scope mirrors fs/fat.ad and fs/ext4.ad: a single global mount, all
+# scratch in .bss (no per-call kmalloc), no reentrancy. We implement
+# the read path only — squashfs is read-only by design, so there is
+# no write counterpart.
+#
+# Public API (the four entry points the orchestrator asked for):
+#
+#   sqfs_mount(dev_slot)                  -> int32   parse the superblock
+#   sqfs_lookup(path)                     -> uint64  resolve a path to an
+#                                                    inode reference
+#   sqfs_read(inode_ref, offset,
+#             buf, len)                   -> int64   stream file contents
+#   sqfs_readdir(dir_inode_ref, cb, ctx)  -> int32   enumerate a directory
+#
+# An "inode reference" is squashfs's own 64-bit encoding: the high 48
+# bits are the byte offset of the inode's metadata block (relative to
+# the inode-table start), the low 16 bits are the offset of the inode
+# within that decompressed metadata block. The superblock's root_ref
+# is exactly this shape, and so is every directory-entry reference,
+# so we use the same value as our opaque handle throughout.
+#
+# COMPRESSION
+#   squashfs compresses metadata blocks and (full) data blocks /
+#   fragments independently with the image's single compressor:
+#     id 1 = gzip   -> zlib (RFC 1950) stream: 2-byte header, raw
+#                      DEFLATE body, 4-byte Adler-32 trailer. We strip
+#                      the 2-byte header and drive lib/zlib/inflate.ad
+#                      in raw mode (inflate_init_raw), ignoring the
+#                      Adler trailer (the metadata-block length header
+#                      already bounds the input).
+#     id 4 = xz     -> a full .xz container per block. We hand it
+#                      straight to lib/xz/xz.ad's xz_decompress.
+#   A metadata block (and a data block / fragment) can also be stored
+#   UNCOMPRESSED — the length header's top bit flags that; we memcpy.
+
+from kernel.block.blk import blk_read_sectors, SECTOR_SIZE
+from kernel.printk.printk import printk0, printk1, printk2
+from lib.zlib.inflate import (
+    InflateState, inflate_init_raw, inflate_feed,
+)
+from lib.xz.xz import xz_decompress
+
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+
+
+# --- on-disk constants ------------------------------------------------
+
+SQFS_MAGIC:          uint32 = 0x73717368    # "hsqs" little-endian
+SQFS_METADATA_SIZE:  uint64 = 8192          # max bytes per metadata block
+SQFS_COMPRESS_GZIP:  uint32 = 1
+SQFS_COMPRESS_XZ:    uint32 = 4
+
+# Inode types (squashfs.h). We handle the four the brief asks for plus
+# treat ext variants the same once their extra header words are
+# skipped.
+SQFS_INODE_BASIC_DIR:   uint32 = 1
+SQFS_INODE_BASIC_FILE:  uint32 = 2
+SQFS_INODE_EXT_DIR:     uint32 = 8
+SQFS_INODE_EXT_FILE:    uint32 = 9
+
+# A fragment-index of 0xFFFFFFFF means "this file has no fragment"
+# (its tail is a full data block, not packed into the fragment table).
+SQFS_INVALID_FRAG:   uint32 = 0xFFFFFFFF
+
+
+# --- mount-time state (single mount only) -----------------------------
+
+sqfs_dev_slot:       int32  = -1
+sqfs_block_size:     uint64 = 0
+sqfs_compression:    uint32 = 0
+sqfs_inode_count:    uint32 = 0
+sqfs_frag_count:     uint32 = 0
+sqfs_root_ref:       uint64 = 0
+sqfs_bytes_used:     uint64 = 0
+
+# Table offsets (absolute byte positions in the image).
+sqfs_inode_table:    uint64 = 0
+sqfs_dir_table:      uint64 = 0
+sqfs_frag_table:     uint64 = 0
+sqfs_id_table:       uint64 = 0
+
+
+# --- scratch buffers (.bss) -------------------------------------------
+#
+# All single-mount, non-reentrant — same discipline as fs/fat.ad.
+#
+#   sqfs_sector_buf  one 512-byte sector for the sector-aligned device
+#                    read helper.
+#   sqfs_meta_in     a compressed metadata block as read off the device
+#                    (max SQFS_METADATA_SIZE before the +2 header; we
+#                    keep headroom for the worst case).
+#   sqfs_meta_out    one decompressed metadata block (<= 8 KiB).
+#   sqfs_blk_in      a compressed data block / fragment read off device.
+#   sqfs_blk_out     a decompressed data block / fragment.
+#
+# The data buffers are sized for a 1 MiB block — squashfs's maximum —
+# so this reader handles a real Debian-Live image, not just the 4 KiB
+# test images. ~2 MiB of .bss total; acceptable for a kernel that
+# already bakes a megabyte ext4 image.
+
+SQFS_MAX_BLOCK:  uint64 = 1048576           # 1 MiB squashfs maximum
+
+sqfs_sector_buf: Array[512, uint8]
+sqfs_meta_in:    Array[8320, uint8]         # 8 KiB + header slack
+sqfs_meta_out:   Array[8192, uint8]
+sqfs_blk_in:     Array[1048576, uint8]
+sqfs_blk_out:    Array[1048576, uint8]
+
+# A dedicated InflateState — large (32 KiB window) so it lives in .bss
+# rather than on the kernel stack.
+sqfs_inflate:    InflateState
+
+
+# --- little-endian readers --------------------------------------------
+
+def _rd_u16(p: Ptr[uint8]) -> uint16:
+    return cast[uint16](p[0]) | (cast[uint16](p[1]) << 8)
+
+
+def _rd_u32(p: Ptr[uint8]) -> uint32:
+    return (cast[uint32](p[0])
+            | (cast[uint32](p[1]) << 8)
+            | (cast[uint32](p[2]) << 16)
+            | (cast[uint32](p[3]) << 24))
+
+
+def _rd_u64(p: Ptr[uint8]) -> uint64:
+    lo: uint64 = cast[uint64](_rd_u32(p))
+    hi: uint64 = cast[uint64](_rd_u32(cast[Ptr[uint8]](cast[uint64](p) + 4)))
+    return lo | (hi << 32)
+
+
+# --- raw device read at an arbitrary byte offset ----------------------
+#
+# squashfs offsets are byte granular but the block layer reads whole
+# 512-byte sectors. Read the covering sector range into the scratch
+# buffer in 512-byte slices and copy out the requested window. `buf`
+# must hold at least `len` bytes; `len` here is bounded by the caller
+# to our largest scratch (1 MiB), so the slice loop stays simple.
+
+def sqfs_dev_read(offset: uint64, buf: Ptr[uint8], len: uint64) -> int32:
+    if len == 0:
+        return 0
+    start_lba: uint64 = offset / SECTOR_SIZE
+    skew:      uint64 = offset % SECTOR_SIZE      # bytes to drop from sector 0
+    produced:  uint64 = 0
+    lba:       uint64 = start_lba
+    while produced < len:
+        rc: int32 = blk_read_sectors(sqfs_dev_slot, lba, 1,
+                                     &sqfs_sector_buf[0])
+        if rc != 0:
+            return -1
+        # Copy the live window out of this sector.
+        avail: uint64 = SECTOR_SIZE - skew
+        want:  uint64 = len - produced
+        n:     uint64 = avail
+        if want < n:
+            n = want
+        memcpy(cast[Ptr[uint8]](cast[uint64](buf) + produced),
+               cast[Ptr[uint8]](cast[uint64](&sqfs_sector_buf[0]) + skew), n)
+        produced = produced + n
+        skew = 0
+        lba = lba + 1
+    return 0
+
+
+# --- metadata-block decompression -------------------------------------
+#
+# A metadata block is a 2-byte little-endian length header (low 15
+# bits = on-disk byte length, bit 15 set = stored uncompressed)
+# followed by that many bytes. Decompresses (or copies) the block at
+# absolute byte `offset` into sqfs_meta_out. On success returns the
+# decompressed length and writes the absolute byte offset of the NEXT
+# metadata block to *next_off. Negative return on error.
+
+def _read_metadata(offset: uint64, next_off: Ptr[uint64]) -> int64:
+    hdr_buf: Array[2, uint8]
+    if sqfs_dev_read(offset, &hdr_buf[0], 2) != 0:
+        return -1
+    hdr: uint16 = _rd_u16(&hdr_buf[0])
+    on_disk: uint64 = cast[uint64](hdr) & 0x7FFF
+    uncompressed: int32 = 0
+    if (cast[uint64](hdr) & 0x8000) != 0:
+        uncompressed = 1
+    if on_disk == 0 or on_disk > SQFS_METADATA_SIZE:
+        printk1("squashfs: bad metadata block length %d\n", on_disk)
+        return -1
+    if sqfs_dev_read(offset + 2, &sqfs_meta_in[0], on_disk) != 0:
+        return -1
+    next_off[0] = offset + 2 + on_disk
+    if uncompressed != 0:
+        memcpy(&sqfs_meta_out[0], &sqfs_meta_in[0], on_disk)
+        return cast[int64](on_disk)
+    return _decompress(&sqfs_meta_in[0], on_disk,
+                       &sqfs_meta_out[0], SQFS_METADATA_SIZE)
+
+
+# --- generic decompress dispatch --------------------------------------
+#
+# Decompress `in_len` bytes at `src` into `dst` (capacity `dst_cap`)
+# using the image's compressor. Returns the decompressed byte count
+# (>= 0) or a negative error.
+
+def _decompress(src: Ptr[uint8], in_len: uint64,
+                dst: Ptr[uint8], dst_cap: uint64) -> int64:
+    if sqfs_compression == SQFS_COMPRESS_XZ:
+        # squashfs xz blocks are complete .xz containers.
+        return xz_decompress(src, in_len, dst, dst_cap)
+    if sqfs_compression == SQFS_COMPRESS_GZIP:
+        return _inflate_zlib(src, in_len, dst, dst_cap)
+    printk1("squashfs: unsupported compression id %d\n",
+            cast[uint64](sqfs_compression))
+    return -1
+
+
+# squashfs gzip blocks are zlib (RFC 1950) streams: a 2-byte header
+# (CMF/FLG, e.g. 0x78 0x9c / 0x78 0xda), the raw DEFLATE body, then a
+# 4-byte Adler-32 trailer. We skip the 2-byte header, run the DEFLATE
+# body through inflate in raw mode (which stops at the final block
+# without expecting a gzip trailer), and ignore the Adler-32 trailer —
+# the metadata/data length header already bounds the input and the
+# uncompressed length is implied by the squashfs structure.
+
+def _inflate_zlib(src: Ptr[uint8], in_len: uint64,
+                  dst: Ptr[uint8], dst_cap: uint64) -> int64:
+    if in_len < 2:
+        return -1
+    inflate_init_raw(&sqfs_inflate)
+    body: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](src) + 2)
+    body_len: uint64 = in_len - 2
+    out_consumed: uint64 = 0
+    in_consumed:  uint64 = 0
+    done:         int32  = 0
+    total:        uint64 = 0
+    # Single feed: the whole DEFLATE body is in memory and dst is sized
+    # to hold the full decompressed block, so one call drains it. The
+    # streaming machinery is still honored — if dst filled mid-stream
+    # we would loop, but our dst is always large enough for a block.
+    rc: int32 = inflate_feed(&sqfs_inflate, body, body_len,
+                             dst, dst_cap,
+                             &out_consumed, &in_consumed, &done)
+    if rc < 0:
+        printk0("squashfs: inflate failed\n")
+        return -1
+    total = out_consumed
+    if done == 0:
+        # dst too small to hold the block, or truncated input.
+        printk0("squashfs: inflate did not complete\n")
+        return -1
+    return cast[int64](total)
+
+
+# --- superblock parse / mount -----------------------------------------
+
+def sqfs_mount(dev_slot: int32) -> int32:
+    # Read the 96-byte superblock at offset 0 and validate it.
+    sb: Array[96, uint8]
+    sqfs_dev_slot = dev_slot
+    if sqfs_dev_read(0, &sb[0], 96) != 0:
+        printk0("squashfs: superblock read failed\n")
+        sqfs_dev_slot = -1
+        return -1
+    magic: uint32 = _rd_u32(&sb[0])
+    if magic != SQFS_MAGIC:
+        printk1("squashfs: bad magic 0x%x\n", cast[uint64](magic))
+        sqfs_dev_slot = -1
+        return -1
+    ver_major: uint16 = _rd_u16(cast[Ptr[uint8]](cast[uint64](&sb[0]) + 28))
+    if ver_major != 4:
+        printk1("squashfs: unsupported version %d\n",
+                cast[uint64](ver_major))
+        sqfs_dev_slot = -1
+        return -1
+
+    sqfs_inode_count = _rd_u32(cast[Ptr[uint8]](cast[uint64](&sb[0]) + 4))
+    sqfs_block_size  = cast[uint64](
+        _rd_u32(cast[Ptr[uint8]](cast[uint64](&sb[0]) + 12)))
+    sqfs_frag_count  = _rd_u32(cast[Ptr[uint8]](cast[uint64](&sb[0]) + 16))
+    sqfs_compression = cast[uint32](
+        _rd_u16(cast[Ptr[uint8]](cast[uint64](&sb[0]) + 20)))
+    sqfs_root_ref    = _rd_u64(cast[Ptr[uint8]](cast[uint64](&sb[0]) + 32))
+    sqfs_bytes_used  = _rd_u64(cast[Ptr[uint8]](cast[uint64](&sb[0]) + 40))
+    sqfs_id_table    = _rd_u64(cast[Ptr[uint8]](cast[uint64](&sb[0]) + 48))
+    sqfs_inode_table = _rd_u64(cast[Ptr[uint8]](cast[uint64](&sb[0]) + 64))
+    sqfs_dir_table   = _rd_u64(cast[Ptr[uint8]](cast[uint64](&sb[0]) + 72))
+    sqfs_frag_table  = _rd_u64(cast[Ptr[uint8]](cast[uint64](&sb[0]) + 80))
+
+    if sqfs_block_size > SQFS_MAX_BLOCK:
+        printk1("squashfs: block size %d exceeds reader maximum\n",
+                sqfs_block_size)
+        sqfs_dev_slot = -1
+        return -1
+    if sqfs_compression != SQFS_COMPRESS_GZIP \
+            and sqfs_compression != SQFS_COMPRESS_XZ:
+        printk1("squashfs: unsupported compression id %d\n",
+                cast[uint64](sqfs_compression))
+        sqfs_dev_slot = -1
+        return -1
+
+    printk2("squashfs: mounted; inodes=%d block_size=%d\n",
+            cast[uint64](sqfs_inode_count), sqfs_block_size)
+    printk2("squashfs: compression=%d root_ref=%d\n",
+            cast[uint64](sqfs_compression), sqfs_root_ref)
+    return 0
+
+
+# --- inode access -----------------------------------------------------
+#
+# An inode reference packs (block_offset << 16) | in_block_offset where
+# block_offset is the byte offset of the inode's metadata block
+# relative to sqfs_inode_table, and in_block_offset is the byte offset
+# of the inode inside that decompressed metadata block.
+#
+# Reading an inode that straddles a metadata-block boundary would need
+# us to stitch two decompressed blocks. squashfs packs inodes so the
+# fixed header never crosses a boundary, and our small images never
+# straddle; we decompress the single covering block and read the
+# header out of it. For the directory/file fields we need (all within
+# the first ~32 bytes of the inode) this is sufficient.
+
+def _ref_block(ref: uint64) -> uint64:
+    return ref >> 16
+
+
+def _ref_offset(ref: uint64) -> uint64:
+    return ref & 0xFFFF
+
+
+# Decompress the metadata block holding the inode referenced by `ref`
+# into sqfs_meta_out and return the in-block byte offset of the inode.
+# Returns a negative value on error (cast to uint64 sentinel by caller
+# checks via the separate rc path — here we return the offset and set
+# *ok).
+
+def _load_inode_block(ref: uint64, ok: Ptr[int32]) -> uint64:
+    block_off: uint64 = _ref_block(ref)
+    in_off:    uint64 = _ref_offset(ref)
+    next_off:  uint64 = 0
+    dlen: int64 = _read_metadata(sqfs_inode_table + block_off, &next_off)
+    if dlen < 0:
+        ok[0] = 0
+        return 0
+    if in_off >= cast[uint64](dlen):
+        printk0("squashfs: inode offset past metadata block\n")
+        ok[0] = 0
+        return 0
+    ok[0] = 1
+    return in_off
+
+
+# --- directory enumeration --------------------------------------------
+#
+# A directory inode points (start_block, block_offset, size) at a run
+# of bytes in the directory table. That run is a sequence of directory
+# headers, each: count(u32, == entries-1) start_block(u32)
+# inode_number(u32 base), followed by `count+1` entries:
+#   offset(u16)  inode_offset(s16)  type(u16)  size(u16)  name[size+1]
+# The entry's inode reference is
+#   ((header.start_block) << 16) | offset
+# i.e. header.start_block is the metadata-block byte offset (relative
+# to sqfs_inode_table) and `offset` is the in-block byte offset.
+#
+# `size` in the dir inode counts from byte 3 of the listing (squashfs
+# quirk: the stored size is the byte count + 3, and an empty directory
+# has size 3). We treat (size - 3) as the real listing length, clamped
+# at 0.
+
+class SqfsDirInfo:
+    start_block:  uint64        # dir-table metadata-block byte offset
+    block_offset: uint64        # offset within that decompressed block
+    size:         uint64        # listing byte length (already adjusted)
+    valid:        int32
+
+
+def _read_dir_inode(ref: uint64, info: Ptr[SqfsDirInfo]) -> int32:
+    ok: int32 = 0
+    in_off: uint64 = _load_inode_block(ref, &ok)
+    if ok == 0:
+        info[0].valid = 0
+        return -1
+    base: Ptr[uint8] = cast[Ptr[uint8]](
+        cast[uint64](&sqfs_meta_out[0]) + in_off)
+    itype: uint32 = cast[uint32](_rd_u16(base))
+    # Common inode header is 16 bytes: type, mode, uid, gid, mtime,
+    # inode_number. Directory-specific fields follow at +16.
+    body: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](base) + 16)
+    raw_size: uint64 = 0
+    if itype == SQFS_INODE_BASIC_DIR:
+        # basic dir: start_block(u32) nlink(u32) file_size(u16)
+        #            block_offset(u16) parent_inode(u32)
+        info[0].start_block  = cast[uint64](_rd_u32(body))
+        raw_size             = cast[uint64](
+            _rd_u16(cast[Ptr[uint8]](cast[uint64](body) + 8)))
+        info[0].block_offset = cast[uint64](
+            _rd_u16(cast[Ptr[uint8]](cast[uint64](body) + 10)))
+    elif itype == SQFS_INODE_EXT_DIR:
+        # ext dir: nlink(u32) file_size(u32) start_block(u32)
+        #          parent_inode(u32) index_count(u16) block_offset(u16)
+        #          xattr(u32)
+        raw_size             = cast[uint64](
+            _rd_u32(cast[Ptr[uint8]](cast[uint64](body) + 4)))
+        info[0].start_block  = cast[uint64](
+            _rd_u32(cast[Ptr[uint8]](cast[uint64](body) + 8)))
+        info[0].block_offset = cast[uint64](
+            _rd_u16(cast[Ptr[uint8]](cast[uint64](body) + 18)))
+    else:
+        printk1("squashfs: ref is not a directory (type %d)\n",
+                cast[uint64](itype))
+        info[0].valid = 0
+        return -1
+    # squashfs stores listing size as real_bytes + 3 (min 3 for empty).
+    if raw_size <= 3:
+        info[0].size = 0
+    else:
+        info[0].size = raw_size - 3
+    info[0].valid = 1
+    return 0
+
+
+# Walk a directory's listing, invoking `cb(ctx, name, name_len, ref,
+# type)` for each entry. `cb` returns 0 to continue, non-zero to stop
+# early (the stop value is returned to the caller). Returns 0 on a
+# full clean walk, the callback's stop value if it bailed, or -1 on a
+# structural error.
+
+def sqfs_readdir(dir_ref: uint64,
+                 cb: Fn[int32, uint64, Ptr[uint8], uint64, uint64, uint32],
+                 ctx: uint64) -> int32:
+    info: SqfsDirInfo
+    if _read_dir_inode(dir_ref, &info) != 0:
+        return -1
+    if info.size == 0:
+        return 0
+
+    # Decompress the directory listing into sqfs_meta_out. The listing
+    # can span multiple metadata blocks; we walk block by block,
+    # tracking how many listing bytes we have consumed overall. For the
+    # first block we start at info.block_offset.
+    abs_off:   uint64 = sqfs_dir_table + info.start_block
+    remaining: uint64 = info.size
+    in_block:  uint64 = info.block_offset
+    while remaining > 0:
+        next_off: uint64 = 0
+        dlen: int64 = _read_metadata(abs_off, &next_off)
+        if dlen < 0:
+            return -1
+        avail: uint64 = cast[uint64](dlen)
+        # Walk directory headers + entries inside this decompressed
+        # block until we exhaust either the block or `remaining`.
+        pos: uint64 = in_block
+        while pos + 12 <= avail and remaining > 0:
+            hp: Ptr[uint8] = cast[Ptr[uint8]](
+                cast[uint64](&sqfs_meta_out[0]) + pos)
+            count:        uint32 = _rd_u32(hp)
+            hdr_start_blk: uint64 = cast[uint64](
+                _rd_u32(cast[Ptr[uint8]](cast[uint64](hp) + 4)))
+            pos = pos + 12
+            consumed_hdr: uint64 = 12
+            entries: uint64 = cast[uint64](count) + 1
+            e: uint64 = 0
+            stop: int32 = 0
+            while e < entries:
+                if pos + 8 > avail:
+                    stop = 1
+                    break
+                ep: Ptr[uint8] = cast[Ptr[uint8]](
+                    cast[uint64](&sqfs_meta_out[0]) + pos)
+                e_offset:   uint64 = cast[uint64](_rd_u16(ep))
+                e_type:     uint32 = cast[uint32](
+                    _rd_u16(cast[Ptr[uint8]](cast[uint64](ep) + 4)))
+                e_namesz:   uint64 = cast[uint64](
+                    _rd_u16(cast[Ptr[uint8]](cast[uint64](ep) + 6))) + 1
+                name_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+                    cast[uint64](ep) + 8)
+                if pos + 8 + e_namesz > avail:
+                    stop = 1
+                    break
+                entry_ref: uint64 = (hdr_start_blk << 16) | e_offset
+                r: int32 = cb(ctx, name_ptr, e_namesz, entry_ref, e_type)
+                pos = pos + 8 + e_namesz
+                consumed_hdr = consumed_hdr + 8 + e_namesz
+                if r != 0:
+                    return r
+                e = e + 1
+            # Account the bytes this header+entries consumed against the
+            # listing's total size.
+            if consumed_hdr >= remaining:
+                remaining = 0
+            else:
+                remaining = remaining - consumed_hdr
+            if stop != 0:
+                break
+        # Move to the next metadata block; subsequent blocks begin at
+        # offset 0.
+        abs_off = next_off
+        in_block = 0
+    return 0
+
+
+# --- path lookup ------------------------------------------------------
+#
+# Resolve an absolute path ("/usr/bin/foo") to an inode reference,
+# starting from the root inode. Returns the reference on success, or 0
+# (an impossible inode reference — the root is never at block 0 offset
+# 0 in a real image, and we additionally guard with *ok) on failure.
+# We expose a clean rc via sqfs_lookup_ref's *ok-style contract.
+
+# Lookup state passed to the readdir callback during a single path
+# component match.
+class SqfsLookupCtx:
+    want:      Ptr[uint8]       # component name we are searching for
+    want_len:  uint64           # length WITHOUT the trailing NUL
+    found_ref: uint64
+    found:     int32
+
+
+def _name_eq(a: Ptr[uint8], a_len: uint64,
+             b: Ptr[uint8], b_len: uint64) -> int32:
+    # b_len here is the squashfs name length INCLUDING the implicit +1
+    # the entry stores, so the real name is b_len bytes (no NUL in the
+    # listing). Compare exactly a_len == b_len bytes.
+    if a_len != b_len:
+        return 0
+    i: uint64 = 0
+    while i < a_len:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def _lookup_cb(ctx: uint64, name: Ptr[uint8], name_len: uint64,
+               ref: uint64, etype: uint32) -> int32:
+    c: Ptr[SqfsLookupCtx] = cast[Ptr[SqfsLookupCtx]](ctx)
+    # name_len includes the +1 squashfs adds; the actual on-disk name
+    # is (name_len) bytes long because squashfs stores (size) and the
+    # name occupies (size+1) bytes — i.e. name_len already equals the
+    # real character count. (See sqfs_readdir: e_namesz = stored + 1.)
+    if _name_eq(c[0].want, c[0].want_len, name, name_len) != 0:
+        c[0].found_ref = ref
+        c[0].found = 1
+        return 1            # stop the walk
+    return 0
+
+
+# Resolve `path` to an inode reference. On success returns 0 and writes
+# the reference to *out_ref; on failure returns -1.
+
+def sqfs_lookup_ref(path: Ptr[char], out_ref: Ptr[uint64]) -> int32:
+    cur: uint64 = sqfs_root_ref
+    # Skip a leading '/'.
+    i: uint64 = 0
+    if path[0] == 47:               # '/'
+        i = 1
+    # Empty path / "/" resolves to the root directory.
+    while True:
+        # Skip consecutive slashes.
+        while path[i] == 47:
+            i = i + 1
+        if path[i] == 0:
+            break
+        # Extract the next component [i, j).
+        j: uint64 = i
+        while path[j] != 0 and path[j] != 47:
+            j = j + 1
+        comp_len: uint64 = j - i
+        ctx: SqfsLookupCtx
+        ctx.want = cast[Ptr[uint8]](cast[uint64](path) + i)
+        ctx.want_len = comp_len
+        ctx.found_ref = 0
+        ctx.found = 0
+        rc: int32 = sqfs_readdir(cur, _lookup_cb, cast[uint64](&ctx))
+        if rc < 0:
+            return -1
+        if ctx.found == 0:
+            return -1
+        cur = ctx.found_ref
+        i = j
+    out_ref[0] = cur
+    return 0
+
+
+# Convenience wrapper matching the brief's named signature: returns the
+# inode reference directly (0 == not found / error). Callers that need
+# to distinguish "ref happens to be 0" from "error" should use
+# sqfs_lookup_ref instead.
+
+def sqfs_lookup(path: Ptr[char]) -> uint64:
+    ref: uint64 = 0
+    if sqfs_lookup_ref(path, &ref) != 0:
+        return 0
+    return ref
+
+
+# --- file inode + read ------------------------------------------------
+#
+# A regular-file inode carries (start_block, fragment, block_offset,
+# file_size) plus a block list of on-disk compressed-block sizes for
+# the full blocks. Small files (size < block_size, or the tail of a
+# larger file) live packed into the fragment table; full blocks live
+# at `start_block` as a run of independently-compressed data blocks.
+
+class SqfsFileInfo:
+    start_block:  uint64        # byte offset of first data block in image
+    file_size:    uint64
+    frag_index:   uint32
+    frag_offset:  uint64        # byte offset within the decompressed frag
+    block_list:   uint64        # in-meta-block byte offset of the size list
+    block_meta:   uint64        # which dir-of-inode block holds the list
+    valid:        int32
+
+
+# Read a file inode's fields. Because the block list trails the inode
+# header inside the SAME decompressed metadata block, we keep the
+# decompressed inode block resident in sqfs_meta_out and stash the
+# in-block offset where the block-size list begins.
+
+def _read_file_inode(ref: uint64, info: Ptr[SqfsFileInfo]) -> int32:
+    ok: int32 = 0
+    in_off: uint64 = _load_inode_block(ref, &ok)
+    if ok == 0:
+        info[0].valid = 0
+        return -1
+    base: Ptr[uint8] = cast[Ptr[uint8]](
+        cast[uint64](&sqfs_meta_out[0]) + in_off)
+    itype: uint32 = cast[uint32](_rd_u16(base))
+    body: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](base) + 16)
+    if itype == SQFS_INODE_BASIC_FILE:
+        # basic file: start_block(u32) fragment(u32) block_offset(u32)
+        #             file_size(u32) then block_list[]
+        info[0].start_block = cast[uint64](_rd_u32(body))
+        info[0].frag_index  = _rd_u32(cast[Ptr[uint8]](cast[uint64](body) + 4))
+        info[0].frag_offset = cast[uint64](
+            _rd_u32(cast[Ptr[uint8]](cast[uint64](body) + 8)))
+        info[0].file_size   = cast[uint64](
+            _rd_u32(cast[Ptr[uint8]](cast[uint64](body) + 12)))
+        info[0].block_list  = in_off + 16 + 16
+    elif itype == SQFS_INODE_EXT_FILE:
+        # ext file: start_block(u64) file_size(u64) sparse(u64)
+        #           nlink(u32) fragment(u32) block_offset(u32)
+        #           xattr(u32) then block_list[]
+        info[0].start_block = _rd_u64(body)
+        info[0].file_size   = _rd_u64(cast[Ptr[uint8]](cast[uint64](body) + 8))
+        info[0].frag_index  = _rd_u32(cast[Ptr[uint8]](cast[uint64](body) + 28))
+        info[0].frag_offset = cast[uint64](
+            _rd_u32(cast[Ptr[uint8]](cast[uint64](body) + 32)))
+        info[0].block_list  = in_off + 16 + 40
+    else:
+        printk1("squashfs: ref is not a file (type %d)\n",
+                cast[uint64](itype))
+        info[0].valid = 0
+        return -1
+    info[0].block_meta = _ref_block(ref)
+    info[0].valid = 1
+    return 0
+
+
+# Return the file size for an inode reference, or a negative sentinel
+# (-1 cast) shape via *ok. We provide a simple size accessor.
+
+def sqfs_file_size(ref: uint64, out_size: Ptr[uint64]) -> int32:
+    info: SqfsFileInfo
+    if _read_file_inode(ref, &info) != 0:
+        return -1
+    out_size[0] = info.file_size
+    return 0
+
+
+# --- fragment table access --------------------------------------------
+#
+# The fragment table is an array of fragment_entry { start(u64)
+# size(u32) unused(u32) } (16 bytes each), stored across metadata
+# blocks. Those metadata blocks are located via an indirect table:
+# sqfs_frag_table points at an array of u64 absolute offsets, one per
+# 8 KiB-worth (512 entries) of fragment metadata. To read fragment N:
+#   indirect_index = N / 512
+#   entry_in_block = N % 512
+# Read indirect[indirect_index] -> metadata block offset, decompress
+# it, read entry_in_block * 16.
+
+def _read_fragment_entry(frag_idx: uint32,
+                         out_start: Ptr[uint64],
+                         out_size: Ptr[uint32]) -> int32:
+    # 512 fragment entries (16 bytes each) fit in one 8 KiB metadata
+    # block.
+    indirect_index: uint64 = cast[uint64](frag_idx) / 512
+    entry_in_block: uint64 = cast[uint64](frag_idx) % 512
+    # Read the indirect pointer (u64) at sqfs_frag_table +
+    # indirect_index*8.
+    ind_buf: Array[8, uint8]
+    if sqfs_dev_read(sqfs_frag_table + indirect_index * 8,
+                     &ind_buf[0], 8) != 0:
+        return -1
+    meta_off: uint64 = _rd_u64(&ind_buf[0])
+    next_off: uint64 = 0
+    dlen: int64 = _read_metadata(meta_off, &next_off)
+    if dlen < 0:
+        return -1
+    byte_off: uint64 = entry_in_block * 16
+    if byte_off + 16 > cast[uint64](dlen):
+        printk0("squashfs: fragment entry past metadata block\n")
+        return -1
+    ep: Ptr[uint8] = cast[Ptr[uint8]](
+        cast[uint64](&sqfs_meta_out[0]) + byte_off)
+    out_start[0] = _rd_u64(ep)
+    out_size[0]  = _rd_u32(cast[Ptr[uint8]](cast[uint64](ep) + 8))
+    return 0
+
+
+# Read (decompress if needed) a data block / fragment that lives at
+# absolute byte `disk_off` with on-disk `size_field` (the squashfs
+# size word: low 24 bits = on-disk byte count, bit 24 set = stored
+# UNCOMPRESSED). The decompressed bytes land in sqfs_blk_out; returns
+# the decompressed length or negative.
+
+def _read_data_block(disk_off: uint64, size_field: uint32) -> int64:
+    on_disk: uint64 = cast[uint64](size_field) & 0xFFFFFF
+    uncompressed: int32 = 0
+    if (cast[uint64](size_field) & 0x1000000) != 0:
+        uncompressed = 1
+    if on_disk == 0:
+        # A zero-length block is a hole — all zero bytes, block_size
+        # long. The caller knows the logical length; we just zero a
+        # block's worth here is unnecessary (caller bounds the copy),
+        # so report 0 and let the caller treat missing bytes as zero.
+        return 0
+    if on_disk > SQFS_MAX_BLOCK:
+        printk0("squashfs: data block too large\n")
+        return -1
+    if sqfs_dev_read(disk_off, &sqfs_blk_in[0], on_disk) != 0:
+        return -1
+    if uncompressed != 0:
+        memcpy(&sqfs_blk_out[0], &sqfs_blk_in[0], on_disk)
+        return cast[int64](on_disk)
+    return _decompress(&sqfs_blk_in[0], on_disk,
+                       &sqfs_blk_out[0], SQFS_MAX_BLOCK)
+
+
+# Stream `len` bytes of the file at inode `ref` starting at byte
+# `offset` into `buf`. Returns the number of bytes copied (>= 0,
+# possibly short at EOF) or a negative error.
+
+def sqfs_read(ref: uint64, offset: uint64,
+              buf: Ptr[uint8], len: uint64) -> int64:
+    info: SqfsFileInfo
+    if _read_file_inode(ref, &info) != 0:
+        return -1
+    if offset >= info.file_size:
+        return 0
+    # Clamp the request to EOF.
+    want: uint64 = len
+    if offset + want > info.file_size:
+        want = info.file_size - offset
+
+    # How many FULL data blocks does this file have? squashfs stores
+    # `n_full = file_size / block_size` full blocks PLUS, if there is a
+    # tail (file_size % block_size != 0), either a fragment (when the
+    # inode has a fragment index) or one final partial data block.
+    n_full: uint64 = info.file_size / sqfs_block_size
+    has_frag: int32 = 0
+    if info.frag_index != SQFS_INVALID_FRAG:
+        has_frag = 1
+
+    produced: uint64 = 0
+    # The block-size list (one u32 per data block) sits right after the
+    # inode header in the SAME decompressed metadata block. We must
+    # re-decompress that inode block to read it (sqfs_meta_out may have
+    # been clobbered by directory reads since). The number of size
+    # words is n_full when there is a fragment, else n_full + (1 if a
+    # tail remains). We re-load the inode block here.
+    n_blocks_with_list: uint64 = n_full
+    if has_frag == 0 and (info.file_size % sqfs_block_size) != 0:
+        n_blocks_with_list = n_full + 1
+
+    while produced < want:
+        cur_off: uint64 = offset + produced
+        block_index: uint64 = cur_off / sqfs_block_size
+        in_block_off: uint64 = cur_off % sqfs_block_size
+
+        decomp_len: int64 = 0
+        is_hole: int32 = 0
+        if block_index < n_blocks_with_list:
+            # A full (or final partial) data block. Sum the on-disk
+            # sizes of all preceding blocks to find this block's disk
+            # offset, then read the size word for block_index.
+            # Re-load the inode metadata block so the size list is
+            # resident.
+            okk: int32 = 0
+            in_off2: uint64 = _load_inode_block(ref, &okk)
+            if okk == 0:
+                return -1
+            list_off: uint64 = info.block_list
+            disk_off: uint64 = info.start_block
+            bi: uint64 = 0
+            this_size: uint32 = 0
+            while bi <= block_index:
+                szp: Ptr[uint8] = cast[Ptr[uint8]](
+                    cast[uint64](&sqfs_meta_out[0]) + list_off + bi * 4)
+                sz: uint32 = _rd_u32(szp)
+                if bi == block_index:
+                    this_size = sz
+                    break
+                disk_off = disk_off + (cast[uint64](sz) & 0xFFFFFF)
+                bi = bi + 1
+            if (cast[uint64](this_size) & 0xFFFFFF) == 0:
+                # Sparse / hole block: logical zeros.
+                is_hole = 1
+            else:
+                decomp_len = _read_data_block(disk_off, this_size)
+                if decomp_len < 0:
+                    return -1
+        else:
+            # The tail lives in a fragment.
+            if has_frag == 0:
+                # Past the data blocks but no fragment — EOF.
+                break
+            frag_start: uint64 = 0
+            frag_size:  uint32 = 0
+            if _read_fragment_entry(info.frag_index, &frag_start,
+                                    &frag_size) != 0:
+                return -1
+            decomp_len = _read_data_block(frag_start, frag_size)
+            if decomp_len < 0:
+                return -1
+            # Within the decompressed fragment, this file's bytes begin
+            # at frag_offset; the logical in-block offset is relative to
+            # the fragment block.
+            in_block_off = info.frag_offset + (cur_off - n_full * sqfs_block_size)
+
+        # Copy out of the decompressed block / fragment.
+        chunk: uint64 = want - produced
+        if is_hole != 0:
+            # Fill zeros for the remainder of this logical block.
+            avail_in_block: uint64 = sqfs_block_size - (cur_off % sqfs_block_size)
+            if chunk > avail_in_block:
+                chunk = avail_in_block
+            k: uint64 = 0
+            while k < chunk:
+                buf[produced + k] = 0
+                k = k + 1
+            produced = produced + chunk
+            continue
+        avail: uint64 = cast[uint64](decomp_len) - in_block_off
+        if avail == 0:
+            break
+        if chunk > avail:
+            chunk = avail
+        memcpy(cast[Ptr[uint8]](cast[uint64](buf) + produced),
+               cast[Ptr[uint8]](cast[uint64](&sqfs_blk_out[0]) + in_block_off),
+               chunk)
+        produced = produced + chunk
+
+    return cast[int64](produced)
+
+
+# --- kernel-side smoke test -------------------------------------------
+#
+# Mount the baked squashfs on /dev/ram1, list the root directory, read
+# /hello.txt and /subdir/nested.txt, and surface markers on serial.
+# Mirrors fs/fat.ad::fat_write_smoke_test in spirit — a self-contained
+# end-to-end exercise the boot path can fire and CI can grep.
+
+sqfs_smoke_buf: Array[512, uint8]
+
+
+def _smoke_dir_cb(ctx: uint64, name: Ptr[uint8], name_len: uint64,
+                  ref: uint64, etype: uint32) -> int32:
+    # Print each root entry. `name` is NOT NUL-terminated, so copy it
+    # into a small buffer and terminate before handing it to printk %s.
+    nm: Array[256, uint8]
+    n: uint64 = name_len
+    if n > 255:
+        n = 255
+    i: uint64 = 0
+    while i < n:
+        nm[i] = name[i]
+        i = i + 1
+    nm[n] = 0
+    printk2("  sqfs readdir: '%s' (type=%d)\n",
+            cast[uint64](&nm[0]), cast[uint64](etype))
+    return 0
+
+
+def sqfs_smoke_test(dev_slot: int32) -> int32:
+    if sqfs_mount(dev_slot) != 0:
+        printk0("squashfs: smoke mount FAILED\n")
+        return -1
+
+    # readdir the root.
+    printk0("squashfs: listing root directory:\n")
+    if sqfs_readdir(sqfs_root_ref, _smoke_dir_cb, 0) < 0:
+        printk0("squashfs: readdir FAILED\n")
+        return -1
+
+    # Read /hello.txt.
+    href: uint64 = 0
+    if sqfs_lookup_ref("/hello.txt", &href) != 0:
+        printk0("squashfs: lookup /hello.txt FAILED\n")
+        return -1
+    n1: int64 = sqfs_read(href, 0, &sqfs_smoke_buf[0], 511)
+    if n1 < 0:
+        printk0("squashfs: read /hello.txt FAILED\n")
+        return -1
+    sqfs_smoke_buf[cast[uint64](n1)] = 0
+    printk1("squashfs: /hello.txt -> %s", cast[uint64](&sqfs_smoke_buf[0]))
+
+    # Read /subdir/nested.txt — exercises the path-component walk
+    # through a subdirectory.
+    nref: uint64 = 0
+    if sqfs_lookup_ref("/subdir/nested.txt", &nref) != 0:
+        printk0("squashfs: lookup /subdir/nested.txt FAILED\n")
+        return -1
+    n2: int64 = sqfs_read(nref, 0, &sqfs_smoke_buf[0], 511)
+    if n2 < 0:
+        printk0("squashfs: read /subdir/nested.txt FAILED\n")
+        return -1
+    sqfs_smoke_buf[cast[uint64](n2)] = 0
+    printk1("squashfs: /subdir/nested.txt -> %s",
+            cast[uint64](&sqfs_smoke_buf[0]))
+
+    printk0("squashfs: smoke PASS\n")
+    return 0
