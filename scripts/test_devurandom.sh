@@ -54,15 +54,19 @@ LOG=$(mktemp)
 trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
 
 set +e
+# Bumped from 3s/2s/1s to 8s/4s/2s — orchestrator hosts under load
+# sometimes don't reach hamsh stage-08 (ed-readline-first) in 3s,
+# so the first keystrokes get dropped. Same pattern as test_man.sh
+# (cef5b15) and test_hamUI_phase1.sh.
 (
-    sleep 3
+    sleep 8
     printf '/bin/test_devurandom\n'
-    sleep 2
+    sleep 4
     printf 'echo POST_URANDOM_OK\n'
-    sleep 1
+    sleep 2
     printf 'exit\n'
-    sleep 1
-) | timeout 15s qemu-system-x86_64 \
+    sleep 2
+) | timeout 30s qemu-system-x86_64 \
     -kernel "$ELF" \
     -smp 2 \
     -nographic \
