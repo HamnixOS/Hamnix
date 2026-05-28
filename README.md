@@ -41,7 +41,7 @@ from scratch. Hamnix picks both, layered:
 | Layer | Shape | What lives there |
 |--|--|--|
 | **5** | Apps | Stock Debian packages (apt-installed) + Hamnix-native binaries |
-| **4** | Wire protocols | 9P (kernel↔userspace), [rio](docs/rio.md) (window system, planned) |
+| **4** | Wire protocols | 9P (kernel↔userspace), [hamUI](docs/hamUI.md) (file-server-per-window — Phase 1 LANDED 2026-05-28: AI-debuggable `/dev/wsys/<wid>/{text,output,cmd,ns,pid,uid,kind,geometry}` in text mode) |
 | **3** | Userspace services | 9P file servers (hamwd-like) — Hamnix programs |
 | **2** | Linux ABI shims | `linux_abi/` — translates Linux syscalls onto Layer 1 |
 | **1** | Native syscalls | **Plan 9-shape** — ~25 calls including `rfork`, `bind`, `mount`, `errstr`. See [`docs/native-api.md`](docs/native-api.md) |
@@ -159,16 +159,24 @@ and discovery".
   the Linux namespace for Debian packages. v1 is binary-only with a
   greedy BFS dep solver + conflict detection; write commands gate
   on uid==1 (hostowner). The canonical repo `https://255.one/`
-  ships ~17 component packages plus the `hamnix-base` METAPACKAGE
-  that pulls them all in via `depends:` (`hamnix-init`,
-  `hamnix-hamsh`, `hamnix-coreutils`, `hamnix-net`, `hamnix-svc-sshd`,
-  `hpm`, `hamnix-fs-ext4`, `hamnix-fs-fat`, the `hamnix-drivers-*`
-  set, `hamnix-installer-tools`, `hamnix-bootloader`, and
-  `linux-debian-12`). The installer (`etc/install.hamsh`) is now
-  `hpm install hamnix-base`-driven against an ISO-local mini-repo;
-  the dep solver pulls the entire closure. A trimmed install can
-  pick a subset of components (e.g. embedded headless boards skip
-  the audio + USB driver packages). See `docs/packages.md`,
+  ships **Debian-shape subdirectory channels** — `/main/`,
+  `/non-free/`, `/non-free-firmware/`. Subscription is per-channel
+  (`hpm channels` / `hpm enable <name>` / `hpm disable <name>`;
+  `/etc/hpm/channels` is the seed, `/var/lib/hpm/channels` the
+  writable state). Default subscription: `main` only.
+  `https://255.one/main/` ships **17 component packages** plus the
+  `hamnix-base` METAPACKAGE that pulls them all in via `depends:`
+  (`hamnix-init`, `hamnix-hamsh`, `hamnix-coreutils`, `hamnix-net`,
+  `hamnix-svc-sshd`, `hpm`, `hamnix-fs-ext4`, `hamnix-fs-fat`, the
+  `hamnix-drivers-*` set, `hamnix-installer-tools`,
+  `hamnix-bootloader`, and `linux-debian-12`). The installer
+  (`etc/install.hamsh`) is now `hpm install hamnix-base`-driven
+  against an ISO-local mini-repo; the dep solver pulls the entire
+  closure. A trimmed install can pick a subset of components (e.g.
+  embedded headless boards skip the audio + USB driver packages).
+  Future binary-firmware drivers (iwlwifi, ath11k, GPU microcode)
+  will ship in the `non-free-firmware` channel, opt-in via
+  `hpm enable non-free-firmware`. See `docs/packages.md`,
   `docs/architecture.md` § "What runs where".
 - **Security (Plan-9-shape)**: a single hostowner (uid 1) per
   installed system owns everything privileged; regular users
@@ -690,8 +698,10 @@ memory/          Orchestrator session memory (not in repo)
 - [`docs/HAMSH_SPEC.md`](docs/HAMSH_SPEC.md) — hamsh language +
   shell reference.
 - [`docs/9p.md`](docs/9p.md) — 9P2000 wire spec.
-- [`docs/rio.md`](docs/rio.md) — file-based window system spec
-  (Plan 9 rio shape).
+- [`docs/hamUI.md`](docs/hamUI.md) — file-server-per-window UI
+  spec (Plan 9 rio shape + Hamnix overlay: AI-debug file tree,
+  per-window admin elevation, X11/Xvfb plan, drag-to-create
+  gesture). Phase 1 LANDED 2026-05-28.
 - [`docs/BOOT.md`](docs/BOOT.md) — building + booting the ISO,
   real-hardware notes.
 - [`docs/REAL_HARDWARE.md`](docs/REAL_HARDWARE.md) — how to test on

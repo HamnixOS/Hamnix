@@ -48,7 +48,8 @@ maturity).
 **Project-direction docs:** [`docs/architecture.md`](docs/architecture.md)
 (layered model, boundary rules, migration phases),
 [`docs/native-api.md`](docs/native-api.md) (Layer 1 Plan 9 syscalls),
-[`docs/rio.md`](docs/rio.md) (window system), [`README.md`](README.md)
+[`docs/hamUI.md`](docs/hamUI.md) (window system; renamed from rio.md
+2026-05-27), [`README.md`](README.md)
 (current snapshot).
 
 ---
@@ -440,49 +441,92 @@ Everything in §5 is Layer-2-only per the boundary law.
 - `/bin` tool audit for cwd-relative defaults.
 - [x] SSH follow-ups — publickey auth, generated+persisted host key,
   RFC 6979 deterministic ECDSA nonce — `5cd02bb`.
-## Userland polish queue — post-installer-loop (2026-05-27)
+## Userland polish queue — post-installer-loop (2026-05-27/28) ✅ DONE
 
-Serial dispatch per user direction *"don't do it in parallel, too wide
-on each issue. Take them one at a time."*
+**Serial-dispatch sweep** per user direction *"don't do it in parallel,
+too wide on each issue. Take them one at a time."* All landed and
+pushed; see git log between `4964a6b` and `df962fe`.
 
-### Queued — order locked
+- [x] **A** — hpm-from-network: dropped unconditional static IP in
+  `etc/rc.boot`; DHCP wins; `hpm refresh` reaches
+  `https://255.one/`. `user/ping.ad` already existed. (`94f57ea`,
+  `ea14914`, `0bdb550`)
+- [x] **A1** — `ext4_alloc_block` + `ext4_free_block` now scan ALL
+  block groups (was group 0 only — the long-standing M16.61 followup).
+  Unblocks every multi-group write. (`3448ce0`)
+- [x] **B** — `ext4_install_file_to_slot` primitive + userland helper
+  that writes a single file into an UN-mounted ext4 partition with
+  save/restore of the singleton mount state. (`a2b84c5`, `3df8013`,
+  `b046cb6`, `1a1b97b`)
+- [x] **B2** — converted `etc/install.hamsh` step 6 from `dd_blk` to
+  `install_rootfs_from_manifest` (manifest-driven per-file install).
+  Added `ext4_mkdir_at_slot`, `ext4_blob_save_at_path`,
+  `_ext4_walk_path_mkdir_p`. ESP/FAT12 still uses dd_blk (separate
+  followup). (`e643062`, `aecb48e`, `56335a2`, `5e61106`)
+- [x] **C** — `hamnix-base` split into 17 component packages
+  (kernel/init/hamsh/coreutils/net/sshd/hpm/fs-ext4/fs-fat/
+  drivers-{e1000e,ahci,nvme,xhci,snd-hda}/installer-tools/bootloader
+  + `hamnix-base` metapackage + `linux-debian-12`). hpm metapackage
+  solver re-used (no new code). Bumped `TMPFS_MAX_FILES` 256→1024
+  to fit the install closure. (`70ed290`)
+- [x] **E1** *(side quest)* — subdirectory channels at `255.one/`.
+  `hpm channels` / `enable` / `disable` subcommands; per-pkg
+  `channel` field routes installs. Default subscription `main` only.
+  Live: `https://255.one/main/index.json` (17 pkgs),
+  `non-free/index.json` + `non-free-firmware/index.json`
+  placeholders. HamnixOS/packages commit `38f2c33` + `0a640ea` (the
+  latter strips `\u`-escapes from descriptions via
+  `ensure_ascii=False`; build_packages.py mirror at `db00cb3`).
+  (`fcc1641`, `cff568a`, `bf6179a`, `7f25aac`, `b06c8e7`)
 
-**A** (in flight) — hpm-from-network. `etc/rc.boot` sets a static IP
-`10.250.10.99` unconditionally, clobbering DHCP. In QEMU/GNOME Boxes
-user-mode networking the real DHCP is `10.0.2.15` / gw `10.0.2.2` —
-the static override misconfigures DNS and `hpm refresh` fails to
-resolve `255.one`. Fix: drop the unconditional static (gate on
-`HAMNIX_STATIC_IP=...`); let DHCP win. Also add `user/ping.ad` for
-net diagnosis.
+### Small-commands batch ✅ done
 
-**B** (gated on A) — dd_blk → 9P userland mount. Installer byte-copies
-at steps 6+ because hpm extracts into the LIVE system then we dd onto
-the target. Double handling AND incompatible with multi-package
-installs (you'd dd-clobber). Real fix: userland `mount(2)`-equivalent
-mounting a freshly-formatted ext4 partition as a 9P file server
-mid-session; `hpm --target-prefix=/mnt/newroot install ...` extracts
-directly. Touches `sys/src/9/port/chan.ad`, `fs/ext4.ad`, plus a new
-mount/attach primitive.
+- [x] `dmesg`, `ps`, `df`, `du`, `top` — already existed as
+  `user/{ps,df,du,dmesg,top}.ad` (audit at 2026-05-27).
+- [x] **D1** — persistent svc logs at `/var/log/svc/<name>.log`.
+  New `DEVFD_FILE_APPEND` cdev kind + `OPENCHAN_APPEND` mode +
+  `tmpfs_open_for_append`. Plan-9-shape `/fd/1`+`/fd/2` namespace
+  bind, NOT Linux dup2. Append across `svc restart`. (`2264e92`,
+  `4f8b794`)
+- [x] First-login MOTD — already wired via `etc/rc.boot` spawning
+  `motd` at boot (audit at 2026-05-27).
+- [x] **D2** — `man` + `help` discovery system. ~20 markdown pages
+  at `/usr/share/man/`; `user/man.ad` reads
+  `/usr/share/man/<topic>.<N>.md`; `user/help.ad` walks the directory
+  + extracts H1 summaries. In-shell `help` builtin deleted in favour
+  of `/bin/help` (so it can take args). (`8503b1e`, `1cf57b8`,
+  `cb44aa5`, `0f3fbe8`, `5f1a7ff`, `eb73777`, `0d53243`, `0ca6a9f`,
+  `cef5b15`)
+- [x] **D3** — RTC + real-time `date`. RTC driver already existed
+  in `drivers/rtc/cmos.ad`; added `/proc/realtime` procfs endpoint
+  (ISO-8601 + epoch + monotonic uptime) and rewrote `user/date.ad`
+  to print real UTC. (`e5eb459`, `ebd8c24`, `10cc8f1`, `a54c03c`)
+- [x] **D4** — `cp -r` recursive mode + ext4 live mkdir wire.
+  `vfs_mkdir` for `/ext/*` now goes to `ext4_mkdir_live` (was
+  EROFS). Bonus: `ext4_open_create_or_trunc` rewritten subdir-aware
+  (was hardcoded `parent_inum=2`). (`b358cb1`, `674c248`, `69d08df`,
+  `f42c9d3`, `85678dd`)
+- [x] **D5** — kernel ext4 multi-block writer. Removed the
+  M16.64 single-block cap on `vfs_open_write`. Streaming-extent
+  strategy; files now up to **512 MiB** (was `ext4_block_size`,
+  i.e. 4 KiB). Bonus: fixed extent-leak in `ext4_open_create_or_trunc`
+  O_TRUNC + `ext4_unlink` (only block 0 was being freed). `cp`/`mv`
+  stream through 4 KiB buffers. (`a9b74dd`, `a7bd236`, `11d4b06`,
+  `d2ed204`, `4f2def0`, `2abaf4b`)
+- [x] **D6** — hamsh builtin redirects. `echo "foo" > /tmp/x`
+  works now (was silently dropping the redirect). Option B chosen
+  (in-process `sys_dup2` save/restore, no fork). 10 builtins
+  covered. Bonus: fixed latent external `>>` bug (was
+  `OPENCHAN_TRUNC` silently truncating). (`18d0f51`, `bdb23ec`,
+  `c8d1b72`, `34457b6`, `abd9107`)
 
-**C** (gated on B) — component-package split. `hamnix-base` is a
-30-file monolith; split into `hamnix-kernel`, `hamnix-init`,
-`hamnix-hamsh`, `hamnix-svc-sshd`, `hamnix-framework-modules`,
-`hamnix-cdev-base`, `hamnix-fs-ext4`, `hamnix-fs-fat`, `hamnix-net`,
-`hamnix-drivers-{usb-xhci, block-ahci, block-nvme, net-e1000e,
-snd-hda}`. `hamnix-base` becomes a metapackage that `depends:` all.
+### Still pending from the original batch
 
-### Small-commands batch (after C)
+- [ ] `tar` + `gzip`/`gunzip`
+- [ ] Audio playback (`snd_hda_intel.ko` loads; need `aplay`-shape
+  userland)
 
-Each a small focused agent:
-- `dmesg` (`/proc/kmsg`), `ps` (`/proc/<pid>/status`), `df`/`du`
-- Persistent svc logs at `/var/log/svc/<name>.log`
-- First-login MOTD + welcome guidance
-- `man` / `help` per-command markdown viewer
-- `ls`, `find`, `du`, `cp -r`, `tar` — hamsh native coreutils polish
-- Time / timezone / RTC (`date`; load-bearing for TLS validity)
-- Audio playback (`snd_hda_intel.ko` loads; needs userland tool)
-
-## `hamUI` window system — design locked 2026-05-27
+## `hamUI` window system — Phase 1 ✅ LANDED 2026-05-27/28
 
 (Was rio.md; renamed to avoid Plan 9 name collision. Full spec at
 [`docs/hamUI.md`](docs/hamUI.md).) Same per-window-namespace invariant
@@ -538,13 +582,28 @@ built in the past."*
 
 ### Phasing — AI-debug FIRST
 
-1. Phase 1: hamUI skeleton — one window, ALL AI-debug files in text
-   mode. No framebuffer yet. Unlocks AI collaboration before graphics.
-2. Phase 2: multi-window via `/dev/wsys`.
-3. Phase 3: per-window elevation visible in `uid` / `ns` files.
-4. Phase 4: framebuffer-backed pixel windows + drag-to-create.
-5. Phase 5: X11 bridge (Xvfb + event translation).
-6. Phase 6: snarf, wctl, focus policies.
+1. [x] **Phase 1 ✅ LANDED** — hamUI skeleton; `/dev/wsys/1/` with
+   `text` / `output` / `cmd` / `ns` / `pid` / `uid` / `kind` /
+   `geometry` files. Kernel-tee strategy on `devcons_write`/`_read`;
+   ZERO hamsh refactor. AI cmd-injection round-trip works
+   (`echo cmd > /dev/wsys/1/cmd` → hamsh readline pop). 12/12
+   assertions PASS. (`cda060e`, `abae723`, `025c7b1`, `32bb867`,
+   `8f833cd`, `425486a`, `df962fe`)
+2. [~] **Phase 2** (in flight 2026-05-28) — multi-window via
+   `/dev/wsys/<N>`. Background hamsh instances with per-wid AI-debug
+   surface; serial console stays on wid 1; bg windows only readable
+   via `/dev/wsys/N/text`. `hamUI new` / `hamUI list` /
+   `hamUI close <wid>` userland tool.
+3. [ ] **Phase 3** — per-window elevation visible in `uid` / `ns`
+   files. `newshell hostowner` inside swaps the window's uid;
+   `hamUI new -as hostowner` spawns a fresh elevated window.
+4. [ ] **Phase 4** — framebuffer-backed pixel windows + drag-to-create
+   gesture. Requires real framebuffer rendering past the current
+   text-mode VGA.
+5. [ ] **Phase 5** — X11 bridge (Xvfb in linux ns + mouse/kbd event
+   translation). Path to Firefox/Chromium.
+6. [ ] **Phase 6** — snarf (clipboard), wctl resize/move, focus
+   policies.
 
 ### Retired open questions
 
@@ -554,7 +613,84 @@ Daemon-mode (not PID 1); multiplexed keyboard; defer acme; strict Plan
 ## Bigger lifts — no immediate plan
 
 - NUC network silent on real I219 (needs hardware time).
-- iwlwifi — non-free pool firmware policy decision.
-- Browser (Firefox/Chromium) in hamUI window — gated on X11 bridge.
+- iwlwifi & other firmware-blob drivers — ship via the planned
+  `non-free-firmware` channel at `https://255.one/non-free-firmware/`
+  (placeholder already deployed 2026-05-27). Not blocked, just deferred.
+- Browser (Firefox/Chromium) in hamUI window — gated on X11 bridge
+  (hamUI Phase 5).
 - Suspend / power management.
+
+---
+
+## Next-up: useful-system gap fill (2026-05-28)
+
+Discussed with user 2026-05-28 — order locked. Dispatch one or two
+agents at a time, only two if scopes don't touch.
+
+### Priority queue
+
+1. [~] **hamUI Phase 2** — multi-window (`a1e35482b1aa02a94` in
+   flight). See `### Phasing` block above. Strategic continuation
+   of Phase 1.
+2. [~] **/dev/urandom + NTP client** (`aa25fbbb1ef512e17` in
+   flight). New `sys/src/9/port/devrandom.ad` cdev seeded from
+   RDRAND (xorshift fallback). NTP via kernel UDP primitives
+   (Plan-9-shape, no sockets); sets kernel realtime epoch; wired
+   into `etc/rc.boot` after DHCP. Test gates host-vs-guest within
+   24h.
+3. [ ] **shutdown / reboot / halt / poweroff** — basic system
+   management. ACPI shutdown vector or 0x604 / 0xB004 magic write;
+   reboot via triple-fault or KBC. Userland `/bin/{shutdown,reboot,
+   halt,poweroff}` + clean unmount sequence.
+4. [ ] **Outgoing SSH client + curl/wget**. We ship `sshd`, no
+   `ssh` out. Hpm has the HTTPS fetcher internally — expose as
+   `/bin/curl` (or wget shape). SSH client is bigger (full TLS-shape
+   for ssh transport — share code with sshd where possible).
+5. [ ] **Pipes + job control in hamsh**. Audit current pipe
+   support (`a | b`); add `&` background; `bg`/`fg`/`jobs` builtins;
+   process groups + SIGTSTP/SIGCONT.
+6. [ ] **Real editor** (vi-shape or acme-shape). `ed` is too
+   minimal for daily use. acme is more Plan-9-pure but bigger; vi
+   is smaller scope. Pick when reached.
+7. [ ] **tar + gzip/gunzip**. Share/backup workflows. tar single-
+   stream first; archive walks D4's recursive copy shape.
+8. [ ] **Audio** (`aplay`-shape). `snd_hda_intel.ko` loads; need
+   the userland tool that pushes PCM to the cdev.
+9. [ ] **`hpm update` + rollback**. Install works; in-place
+   upgrade does not. Rollback / snapshot before upgrade.
+
+### Inventory of remaining gaps (uncategorized)
+
+Tools / shell ecosystem:
+- `grep -r` recursive
+- `sed`-shape (or hamsh-native equivalent)
+- `diff`, `patch`
+- `xargs`, `kill`, `pkill`, `killall`
+- `tab-completion` audit; persistent command history
+- `which`, `whereis`, `type`, `env`, `printenv`
+
+Network surface:
+- `netstat` / `ss` — what's listening / connected
+- `traceroute`, `arp`
+- IPv6
+- `scp` / `rsync` (gated on `ssh` client + tar)
+
+Kernel / system:
+- VT switching (Ctrl+Alt+F1..F6) — likely superseded by hamUI
+  multi-window in text mode
+- Hot-plug (USB mouse/keyboard discover-on-insert)
+- Suspend / power management
+- Watchdog + kernel-panic capture to flash / serial
+- inotify-shape file watch
+- Signal depth (SIGWINCH, SIGCHLD wired everywhere it should be)
+
+Reliability / observability:
+- Kernel oops capture (svc logs cover userland only)
+- `strace`-shape syscall trace
+- Memory-pressure visibility (`/proc/meminfo` polish; OOM kill log)
+
+Distribution / updates:
+- Signed indexes (`sha256` covers tarballs; index itself is
+  unsigned today)
+- Multi-arch (ARM64) — currently x86_64 only
 
