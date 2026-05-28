@@ -1,0 +1,497 @@
+# sys/src/9/port/devwsys.ad
+#
+# Layer 1 (Plan 9-shape) hamUI window-system device — Phase 1 backend
+# for `/dev/wsys/<wid>/*`. See docs/hamUI.md H-§A and H-§E for the
+# design.
+#
+# THE PHASE 1 PROMISE
+# -------------------
+# A single text-mode "window" — the running hamsh — exposed as a tree
+# of files under /dev/wsys/1/. From any other shell / agent / cat
+# context, you can:
+#
+#   * `cat /dev/wsys/1/text`      — last 64 KiB of console output
+#   * `cat /dev/wsys/1/output`    — live tail since the last cmd
+#   * `echo "ls /etc" > /dev/wsys/1/cmd`   — inject as if typed
+#   * `cat /dev/wsys/1/ns`        — plain-text mtab dump
+#   * `cat /dev/wsys/1/pid`       — root pid of the windowed shell
+#   * `cat /dev/wsys/1/uid`       — effective uid
+#   * `cat /dev/wsys/1/kind`      — "text" (Phase 1 constant)
+#   * `cat /dev/wsys/1/geometry`  — "0 0 80 24" (Phase 1 constant)
+#
+# No graphics in Phase 1. No multi-window. The full Plan 9 multi-window
+# story (Phase 2+) is deferred; this file's job is to land the
+# AI-debug surface that unlocks every subsequent collaboration.
+#
+# THE I/O TEE
+# -----------
+# Every byte that crosses devcons_write also lands in this module's
+# text + output rings. devcons.ad invokes wsys_text_push / wsys_output_push
+# from its write loop. The window is "really just hamsh" — hamsh's
+# stdout is bound to /fd/1 -> DEVFD_CONS -> devcons_write, so every
+# prompt line and every command output byte is mirrored.
+#
+# The cmd-injection side is symmetric: devcons_read consults
+# wsys_cmd_pop FIRST. When an outside agent does
+# `echo "ls /etc" > /dev/wsys/1/cmd`, those bytes get queued; the next
+# devcons_read pops them, hamsh's readline sees them indistinguishably
+# from keyboard input. Cmd injection also resets the output ring so
+# `cat /dev/wsys/1/output` after the cmd shows JUST that cmd's output.
+#
+# BOUNDARY LAW
+# ------------
+# Layer 1 (native): pure Plan 9 surface. No io_uring / epoll / futex.
+# Snapshot-once read semantics for finite-content files (text, output,
+# ns, pid, uid, kind, geometry) so `cat` terminates instead of
+# regenerating forever. Implemented by the per-fd off cursor that
+# namec.ad threads through _devtab_read.
+#
+# ADDER QUIRKS HONOURED
+# ---------------------
+#   * Top-level Array storage only — every ring + queue lives at
+#     module scope.
+#   * No sizeof; ring sizes are hand-numbered constants.
+#   * Leading-underscore top-level names are module-private.
+#   * Every shared-shape helper carries a `_wsys_` prefix to dodge the
+#     flat-namespace `_emit_str` collision class documented across the
+#     devcpuinfo / devmeminfo / devuptime / devhostname siblings.
+
+from kernel.sched.core import (
+    current_task_pid, current_task_uid,
+)
+from sys.src.port9.port.chan import (
+    MountEntry, Pgrp, MNT_CAP,
+    pgrp_current, CHAN_KIND_SRV,
+)
+
+
+# --- text ring -------------------------------------------------------
+#
+# 64 KiB UTF-8 byte ring. devcons_write tees every byte here via
+# wsys_text_push. Reads return the most-recent min(count, max) bytes
+# in oldest-first order — exactly the shape kernel/printk/printk_log.ad
+# uses for the printk ring. The two are intentionally independent so a
+# kernel printk doesn't show up in /dev/wsys/1/text (which is meant
+# to mirror what the USER sees in the window).
+
+WSYS_TEXT_SIZE: uint64 = 65536
+
+wsys_text_buf:   Array[65536, uint8]
+wsys_text_head:  uint64 = 0       # next write position
+wsys_text_count: uint64 = 0       # total bytes ever pushed (no modulo)
+
+
+def wsys_text_push(c: uint8):
+    # Single-byte append. devcons.ad calls this from its write loop
+    # so the tee is unconditional — every console byte mirrors here.
+    wsys_text_buf[wsys_text_head] = c
+    wsys_text_head = (wsys_text_head + 1) % WSYS_TEXT_SIZE
+    wsys_text_count = wsys_text_count + 1
+
+
+def _wsys_text_snapshot(buf: Ptr[uint8], max: uint64) -> uint64:
+    # Copy up to `max` of the most-recent bytes into `buf`, oldest
+    # first. Returns the number of bytes actually written. Same
+    # algorithm as printk_log_snapshot — see that file for the case
+    # analysis.
+    avail: uint64 = wsys_text_count
+    if avail > WSYS_TEXT_SIZE:
+        avail = WSYS_TEXT_SIZE
+    want: uint64 = avail
+    if want > max:
+        want = max
+    if want == 0:
+        return 0
+    start: uint64 = 0
+    if wsys_text_count <= WSYS_TEXT_SIZE:
+        start = wsys_text_count - want
+    else:
+        start = (wsys_text_head + WSYS_TEXT_SIZE - want) % WSYS_TEXT_SIZE
+    i: uint64 = 0
+    while i < want:
+        buf[i] = wsys_text_buf[(start + i) % WSYS_TEXT_SIZE]
+        i = i + 1
+    return want
+
+
+# --- output ring -----------------------------------------------------
+#
+# A second, smaller ring. devcons_write also tees here. The
+# distinguishing semantic vs. `text` is the RESET-PER-COMMAND behaviour:
+# every time an outside agent injects a command via /dev/wsys/1/cmd,
+# the output ring is cleared so the subsequent `cat /dev/wsys/1/output`
+# shows EXACTLY that cmd's output (plus the echoed prompt+cmd line).
+#
+# 16 KiB is more than enough for one command's typical output; if a
+# command floods more than that the oldest bytes wrap (same as text).
+
+WSYS_OUTPUT_SIZE: uint64 = 16384
+
+wsys_output_buf:   Array[16384, uint8]
+wsys_output_head:  uint64 = 0
+wsys_output_count: uint64 = 0
+
+
+def wsys_output_push(c: uint8):
+    # devcons.ad fans every console byte here too. The reset (when a
+    # cmd is injected) lives in wsys_cmd_push below, so this push is
+    # also unconditional.
+    wsys_output_buf[wsys_output_head] = c
+    wsys_output_head = (wsys_output_head + 1) % WSYS_OUTPUT_SIZE
+    wsys_output_count = wsys_output_count + 1
+
+
+def _wsys_output_reset():
+    # Zero the cursors. The backing bytes don't need clearing — the
+    # snapshot reader uses `count` to determine the live window.
+    wsys_output_head  = 0
+    wsys_output_count = 0
+
+
+def _wsys_output_snapshot(buf: Ptr[uint8], max: uint64) -> uint64:
+    avail: uint64 = wsys_output_count
+    if avail > WSYS_OUTPUT_SIZE:
+        avail = WSYS_OUTPUT_SIZE
+    want: uint64 = avail
+    if want > max:
+        want = max
+    if want == 0:
+        return 0
+    start: uint64 = 0
+    if wsys_output_count <= WSYS_OUTPUT_SIZE:
+        start = wsys_output_count - want
+    else:
+        start = (wsys_output_head + WSYS_OUTPUT_SIZE - want) % WSYS_OUTPUT_SIZE
+    i: uint64 = 0
+    while i < want:
+        buf[i] = wsys_output_buf[(start + i) % WSYS_OUTPUT_SIZE]
+        i = i + 1
+    return want
+
+
+# --- cmd injection queue ---------------------------------------------
+#
+# 4 KiB linear queue. A write to /dev/wsys/1/cmd appends bytes here;
+# devcons_read pops one byte per call BEFORE consulting kbd / UART
+# rings. Result: an outside-driven `echo "ls /etc" > /dev/wsys/1/cmd`
+# arrives at hamsh's readline as if a very fast typist had hit the
+# keys, complete with the trailing newline.
+#
+# A linear queue (not a ring) is intentional — Phase 1 commands are
+# small and the queue starves to empty as soon as hamsh consumes
+# them. If we overflow (a script dumping > 4 KiB at once), additional
+# bytes are silently dropped to avoid clobbering the half-typed
+# in-flight command. A future revision can grow this to a ring once
+# we know multi-line injection is a real use case.
+
+WSYS_CMD_SIZE: uint64 = 4096
+
+wsys_cmd_buf:    Array[4096, uint8]
+wsys_cmd_tail:   uint64 = 0       # next byte to pop
+wsys_cmd_head:   uint64 = 0       # next byte to append
+
+
+def _wsys_cmd_compact():
+    # When the queue has drained (tail == head) reset both cursors so
+    # the next batch starts at offset 0. Cheap; avoids the ring
+    # complexity for the typical "burst-injected, fully consumed" case.
+    if wsys_cmd_tail == wsys_cmd_head:
+        wsys_cmd_tail = 0
+        wsys_cmd_head = 0
+
+
+def wsys_cmd_push(c: uint8) -> int32:
+    # Append one byte. Returns 1 on success, 0 if the queue is full
+    # and the byte was dropped. The output ring is reset on the FIRST
+    # byte of a new burst — that way a burst doing
+    # `echo "ls /etc\n"` clears the output window so the subsequent
+    # `cat /dev/wsys/1/output` shows just that command's results.
+    _wsys_cmd_compact()
+    if wsys_cmd_head >= WSYS_CMD_SIZE:
+        return 0                                    # full
+    if wsys_cmd_head == 0 and wsys_cmd_tail == 0:
+        _wsys_output_reset()
+    wsys_cmd_buf[wsys_cmd_head] = c
+    wsys_cmd_head = wsys_cmd_head + 1
+    return 1
+
+
+def wsys_cmd_pop() -> int32:
+    # Pop one byte. Returns the byte value (0..255) on success, -1 if
+    # the queue is empty. devcons_read calls this first; on -1 it
+    # falls back to kbd/UART pops.
+    if wsys_cmd_tail >= wsys_cmd_head:
+        return -1
+    c: uint8 = wsys_cmd_buf[wsys_cmd_tail]
+    wsys_cmd_tail = wsys_cmd_tail + 1
+    _wsys_cmd_compact()
+    return cast[int32](c) & 0xFF
+
+
+# --- ASCII formatting helpers ----------------------------------------
+#
+# Reverse-fill stack scratch then copy out top-down. Same shape every
+# sibling cdev uses; prefixed `_wsys_` to dodge the flat-namespace
+# `_emit_str` collision.
+
+def _wsys_u64_to_dec(value: uint64, out: Ptr[uint8]) -> uint64:
+    if value == 0:
+        out[0] = 48                                 # '0'
+        return 1
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    while value != 0:
+        digits[n] = cast[uint8](value % 10) + 48
+        value = value / 10
+        n = n + 1
+    written: uint64 = n
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    return written
+
+
+def _wsys_emit_str(out: Ptr[uint8], pos: uint64, s: Ptr[uint8]) -> uint64:
+    # Append NUL-terminated string. Returns new pos.
+    i: uint64 = 0
+    while s[i] != 0:
+        out[pos + i] = s[i]
+        i = i + 1
+    return pos + i
+
+
+def _wsys_emit_path(out: Ptr[uint8], pos: uint64, cap: uint64,
+                    path: Ptr[uint8]) -> uint64:
+    # Copy a NUL-terminated path buffer. Defensive cap.
+    i: uint64 = 0
+    while i < cap:
+        c: uint8 = path[i]
+        if c == 0:
+            return pos + i
+        out[pos + i] = c
+        i = i + 1
+    return pos + i
+
+
+# --- snapshot rendering ---------------------------------------------
+
+def _wsys_render_pid(out: Ptr[uint8]) -> uint64:
+    # "<pid>\n". Snapshot of the calling task's pid — i.e. the reader's
+    # pid, NOT the window's shell pid. Phase 1 has one window (hamsh)
+    # and the typical reader IS hamsh, so this conveniently matches the
+    # design-doc semantics. Phase 2's multi-window story will need the
+    # kernel to record the "root pid of window N's shell" separately.
+    pid: uint64 = current_task_pid()
+    n: uint64 = _wsys_u64_to_dec(pid, out)
+    out[n] = 10                                     # '\n'
+    return n + 1
+
+
+def _wsys_render_uid(out: Ptr[uint8]) -> uint64:
+    # "<uid>\n". Effective uid of the caller. After `newshell hostowner`
+    # this returns 1; before, it returns the calling user's uid.
+    uid: uint64 = cast[uint64](current_task_uid())
+    n: uint64 = _wsys_u64_to_dec(uid, out)
+    out[n] = 10
+    return n + 1
+
+
+def _wsys_render_kind(out: Ptr[uint8]) -> uint64:
+    # Phase 1 constant: "text\n". Phase 4+ will set this to "x11" or
+    # "framebuffer" when the window's `kind` flips on first GUI cmd.
+    out[0] = 116                                    # 't'
+    out[1] = 101                                    # 'e'
+    out[2] = 120                                    # 'x'
+    out[3] = 116                                    # 't'
+    out[4] = 10                                     # '\n'
+    return 5
+
+
+def _wsys_render_geometry(out: Ptr[uint8]) -> uint64:
+    # Phase 1 constant: "0 0 80 24\n" (text-mode 80x24). The shape
+    # matches Plan 9 rio's `<minx> <miny> <maxx> <maxy>` wctl
+    # geometry rendering so a ported tool consumes it unchanged.
+    s: Ptr[uint8] = "0 0 80 24\n"
+    i: uint64 = 0
+    while s[i] != 0:
+        out[i] = s[i]
+        i = i + 1
+    return i
+
+
+def _wsys_render_listing(out: Ptr[uint8]) -> uint64:
+    # /dev/wsys directory listing. Phase 1: only "1" (the lone
+    # window). Newline-terminated so `cat /dev/wsys` looks like a
+    # tiny one-line file.
+    out[0] = 49                                     # '1'
+    out[1] = 10
+    return 2
+
+
+def _wsys_render_ns(out: Ptr[uint8], cap: uint64) -> uint64:
+    # Plain-text mtab dump for the CALLING TASK's Pgrp. Format:
+    #
+    #   bind: <from_path> <to_path>
+    #   mount: <from_path> 9p
+    #
+    # One line per live MountEntry. The kind distinguishes a plain
+    # `bind` (CHAN_KIND_SRV not set) from a 9P-server mount. Matches
+    # the spirit of /proc/self/mounts but with the simpler "what is
+    # this window's namespace" shape an AI debugger wants.
+    pos: uint64 = 0
+    p: uint64 = pgrp_current()
+    if p == 0:
+        return pos
+    g: Ptr[Pgrp] = cast[Ptr[Pgrp]](p)
+    i: uint64 = 0
+    while i < MNT_CAP:
+        if g[0].mtab[i].in_use != 0:
+            # ~300 bytes worst case per row (label prefix +
+            # 2x128-byte paths + spaces + newline). Leave a 64-byte
+            # cushion before we'd run off the end of `out`.
+            if pos + 320 >= cap:
+                break
+            if g[0].mtab[i].chan.kind == CHAN_KIND_SRV:
+                pos = _wsys_emit_str(out, pos, "mount: ")
+                pos = _wsys_emit_path(out, pos, 128,
+                                      &g[0].mtab[i].from_path[0])
+                out[pos] = 32                       # ' '
+                pos = pos + 1
+                pos = _wsys_emit_str(out, pos, "9p\n")
+            else:
+                pos = _wsys_emit_str(out, pos, "bind: ")
+                pos = _wsys_emit_path(out, pos, 128,
+                                      &g[0].mtab[i].from_path[0])
+                out[pos] = 32
+                pos = pos + 1
+                pos = _wsys_emit_path(out, pos, 128,
+                                      &g[0].mtab[i].to_path[0])
+                out[pos] = 10                       # '\n'
+                pos = pos + 1
+        i = i + 1
+    return pos
+
+
+# --- public read/write entry points ----------------------------------
+#
+# namec.ad dispatches into these per DEV_WSYS_* slot. The `off` cursor
+# (namec passes fd_pos) gives us snapshot-once semantics for the
+# finite-content files: an `off > 0` read on text / output / ns /
+# pid / uid / kind / geometry / wsys returns 0 (EOF) so `cat`
+# terminates instead of regenerating forever.
+
+WSYS_SCRATCH_CAP: uint64 = 65536
+
+
+def _wsys_copy_out(scratch: Ptr[uint8], n: uint64,
+                   off: uint64, buf: Ptr[uint8], count: uint64) -> int64:
+    # Copy a sub-window [off, off+count) of `scratch[0..n)` into
+    # `buf`, honouring EOF semantics. Returns bytes copied or 0 at EOF.
+    if off >= n:
+        return 0
+    remaining: uint64 = n - off
+    take: uint64 = count
+    if take > remaining:
+        take = remaining
+    i: uint64 = 0
+    while i < take:
+        buf[i] = scratch[off + i]
+        i = i + 1
+    return cast[int64](take)
+
+
+def devwsys_text_read(off: uint64, buf: Ptr[uint8],
+                      count: uint64) -> int64:
+    # Snapshot the full text ring (up to 64 KiB) into a scratch, then
+    # serve a windowed sub-read. `off > 0` after the ring is fully
+    # drained returns 0 so `cat` terminates.
+    if count == 0:
+        return 0
+    scratch: Array[65536, uint8]
+    n: uint64 = _wsys_text_snapshot(&scratch[0], WSYS_TEXT_SIZE)
+    return _wsys_copy_out(&scratch[0], n, off, buf, count)
+
+
+def devwsys_output_read(off: uint64, buf: Ptr[uint8],
+                        count: uint64) -> int64:
+    if count == 0:
+        return 0
+    scratch: Array[16384, uint8]
+    n: uint64 = _wsys_output_snapshot(&scratch[0], WSYS_OUTPUT_SIZE)
+    return _wsys_copy_out(&scratch[0], n, off, buf, count)
+
+
+def devwsys_ns_read(off: uint64, buf: Ptr[uint8],
+                    count: uint64) -> int64:
+    if count == 0:
+        return 0
+    scratch: Array[8192, uint8]
+    n: uint64 = _wsys_render_ns(&scratch[0], 8192)
+    return _wsys_copy_out(&scratch[0], n, off, buf, count)
+
+
+def devwsys_pid_read(off: uint64, buf: Ptr[uint8],
+                     count: uint64) -> int64:
+    if count == 0:
+        return 0
+    scratch: Array[32, uint8]
+    n: uint64 = _wsys_render_pid(&scratch[0])
+    return _wsys_copy_out(&scratch[0], n, off, buf, count)
+
+
+def devwsys_uid_read(off: uint64, buf: Ptr[uint8],
+                     count: uint64) -> int64:
+    if count == 0:
+        return 0
+    scratch: Array[32, uint8]
+    n: uint64 = _wsys_render_uid(&scratch[0])
+    return _wsys_copy_out(&scratch[0], n, off, buf, count)
+
+
+def devwsys_kind_read(off: uint64, buf: Ptr[uint8],
+                      count: uint64) -> int64:
+    if count == 0:
+        return 0
+    scratch: Array[16, uint8]
+    n: uint64 = _wsys_render_kind(&scratch[0])
+    return _wsys_copy_out(&scratch[0], n, off, buf, count)
+
+
+def devwsys_geometry_read(off: uint64, buf: Ptr[uint8],
+                          count: uint64) -> int64:
+    if count == 0:
+        return 0
+    scratch: Array[32, uint8]
+    n: uint64 = _wsys_render_geometry(&scratch[0])
+    return _wsys_copy_out(&scratch[0], n, off, buf, count)
+
+
+def devwsys_listing_read(off: uint64, buf: Ptr[uint8],
+                         count: uint64) -> int64:
+    # Read of /dev/wsys itself — the active-windows list. Phase 1: "1\n".
+    if count == 0:
+        return 0
+    scratch: Array[16, uint8]
+    n: uint64 = _wsys_render_listing(&scratch[0])
+    return _wsys_copy_out(&scratch[0], n, off, buf, count)
+
+
+def devwsys_cmd_write(buf: Ptr[uint8], count: uint64) -> int64:
+    # Append `count` bytes to the cmd queue. devcons_read will dequeue
+    # them on subsequent reads as if they came from the keyboard.
+    # Bytes dropped on a full queue still count as "written" — the
+    # writer's loop terminates and the kernel printk'd no warning;
+    # this matches the Plan 9 8.5 / rio kbd FIFO drop behaviour.
+    i: uint64 = 0
+    while i < count:
+        wsys_cmd_push(buf[i])
+        i = i + 1
+    return cast[int64](count)
+
+
+def devwsys_readonly_write(buf: Ptr[uint8], count: uint64) -> int64:
+    # text / output / ns / pid / uid / kind / geometry / wsys are
+    # read-only. Mirrors the rest of the introspection cdev family.
+    return -1
