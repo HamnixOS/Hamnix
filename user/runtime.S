@@ -697,6 +697,23 @@ sys_svc_publish:
     .size sys_svc_publish, .-sys_svc_publish
 
 
+    /* --- sys_set_realtime(epoch) -> int32 ---------------------------
+     * Anchor the kernel-side wall clock on `epoch` (Unix seconds).
+     * The kernel re-bases rtc_boot_epoch so that base + TSC-delta ==
+     * epoch from this instant forward. user/ntpd.ad calls this after
+     * parsing an NTP response. Hostowner-only; ntpd runs from
+     * /etc/rc.boot which is PID 1's interpreter — the gate never
+     * bites the legitimate boot path. Returns 0 on success or -1 with
+     * errstr set ("set_realtime: bad epoch" / "permission denied"). */
+    .globl sys_set_realtime
+    .type sys_set_realtime, @function
+sys_set_realtime:
+    movq    $292, %rax              /* SYS_SET_REALTIME */
+    syscall
+    ret
+    .size sys_set_realtime, .-sys_set_realtime
+
+
     /* --- sys_pipechan() -> int32 ------------------------------------
      * HAMSH §7: create a local pipe Chan pair; returns the pipe SLOT
      * id (NOT fds). The shell threads the slot into two sys_fdbind
