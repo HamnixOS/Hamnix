@@ -24,6 +24,16 @@
 #     cat /ext/dst-on-disk/a.txt      -> "hello-a"
 #     cat /ext/dst-on-disk/sub/b.txt  -> "hello-b"
 #
+#   Big-file copy (exercises the multi-block ext4 write path):
+#     seq 1 5000 > /tmp/big.bin       # ~24 KiB of "<line>\n" text
+#     cp /tmp/big.bin /ext/big.bin
+#     wc < /tmp/big.bin -> "<lines> <words> <bytes>"
+#     wc < /ext/big.bin -> identical triple
+#   The pre-multi-block kernel write capped the destination at one
+#   ext4 block (1 KiB / 4 KiB depending on mkfs), so the byte count
+#   on ext would have been much lower than tmpfs's. With the
+#   ext4_write_open_file streaming writer, both numbers match.
+#
 # Uses the readiness-marker driver from _qemu_drive.sh so the test
 # is stable across orchestrator host loads.
 
@@ -75,7 +85,7 @@ set +e
 #   * We bracket each `cat` output with echo markers so the test can
 #     extract just the file content from the noisy boot log.
 QEMU_EXTRA_ARGS="-drive file=$ROOTFS_IMG,if=virtio,format=raw" \
-qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 90 \
+qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 120 \
     -- "mkdir /tmp/src"                                       2 \
        "mkdir /tmp/src/sub"                                   2 \
        "/bin/echo hello-a > /tmp/src/a.txt"                   2 \
@@ -94,6 +104,14 @@ qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 90 \
        "echo EXT_B_BEGIN"                                     2 \
        "cat /ext/dst-on-disk/sub/b.txt"                       2 \
        "echo EXT_B_END"                                       2 \
+       "seq 1 5000 > /tmp/big.bin"                            5 \
+       "echo BIG_TMPFS_WC_BEGIN"                              2 \
+       "wc < /tmp/big.bin"                                    3 \
+       "echo BIG_TMPFS_WC_END"                                2 \
+       "cp /tmp/big.bin /ext/big.bin"                         6 \
+       "echo BIG_EXT_WC_BEGIN"                                2 \
+       "wc < /ext/big.bin"                                    4 \
+       "echo BIG_EXT_WC_END"                                  2 \
        "echo CP_R_DONE"                                       2 \
        "exit"                                                 1
 rc="$QEMU_DRIVE_RC"
@@ -145,6 +163,58 @@ check_block_has TMPFS_A hello-a
 check_block_has TMPFS_B hello-b
 check_block_has EXT_A   hello-a
 check_block_has EXT_B   hello-b
+
+# Multi-block writer assertions. `wc` writes "<lines> <words> <bytes>\n";
+# the source is `seq 1 5000`, which produces 5000 newlines and bytes
+# = 9*2 + 90*3 + 900*4 + 4001*5 = 18 + 270 + 3600 + 20005 = 23893.
+# Extract the byte_ct (third field) from each wc block and assert
+# (a) tmpfs reports >8192 bytes, (b) ext4 byte_ct == tmpfs byte_ct.
+#
+# Heuristic: wc's "<lines> <words> <bytes>\n" line in the log is
+# prefixed with printk-frame garbage like "<binary><binary>[" before
+# the digits. We grep for any line containing "5000 5000 <num>" (the
+# line + word counts are deterministic from `seq 1 5000`), strip
+# everything up to "5000 5000 ", and read the byte count off the
+# remainder.
+extract_wc_bytes() {
+    local tag="$1"
+    local block
+    block=$(extract_block "$tag")
+    # Run awk in the C locale so it doesn't choke on the binary
+    # printk-frame prefix that sometimes precedes the digits. Match
+    # "5000 5000 <num>" anywhere in a line, return the third number.
+    printf '%s\n' "$block" \
+        | LANG=C awk '
+            match($0, /5000 5000 [0-9]+/) {
+                m = substr($0, RSTART+10, RLENGTH-10);
+                print m;
+                exit
+            }
+        '
+}
+
+big_tmpfs_bytes=$(extract_wc_bytes BIG_TMPFS_WC)
+big_ext_bytes=$(extract_wc_bytes BIG_EXT_WC)
+
+if [ -z "$big_tmpfs_bytes" ]; then
+    echo "[test_cp_r] MISS: could not extract tmpfs big.bin byte count"
+    fail=1
+elif [ "$big_tmpfs_bytes" -lt 8193 ]; then
+    echo "[test_cp_r] MISS: tmpfs big.bin only $big_tmpfs_bytes bytes (expected >8 KiB)"
+    fail=1
+else
+    echo "[test_cp_r] OK: tmpfs big.bin = $big_tmpfs_bytes bytes (>8 KiB)"
+fi
+
+if [ -z "$big_ext_bytes" ]; then
+    echo "[test_cp_r] MISS: could not extract ext4 big.bin byte count"
+    fail=1
+elif [ "$big_ext_bytes" != "$big_tmpfs_bytes" ]; then
+    echo "[test_cp_r] MISS: ext4 big.bin = $big_ext_bytes bytes, tmpfs = $big_tmpfs_bytes (multi-block write cap?)"
+    fail=1
+else
+    echo "[test_cp_r] OK: ext4 big.bin = $big_ext_bytes bytes (matches tmpfs)"
+fi
 
 if [ "$fail" -ne 0 ]; then
     echo "[test_cp_r] FAIL (qemu rc=$rc)"
