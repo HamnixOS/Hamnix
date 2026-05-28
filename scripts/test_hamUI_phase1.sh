@@ -59,34 +59,36 @@ trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs
 
 set +e
 (
-    # Same pacing as test_devcons / test_errstr — let the kernel
-    # finish its smoke tests before hamsh starts SYS_READ'ing stdin.
-    sleep 3
+    # Bumped from 3s/2s/1s to 8s/4s/3s — orchestrator hosts under load
+    # need hamsh past stage-08 (ed-readline-first) before keystrokes
+    # land or they get dropped, same pattern as test_man.sh's bump
+    # at commit cef5b15.
+    sleep 8
     # Phase A — read snapshots, write to cmd queue, verify text tee.
     printf '/bin/test_hamUI_phase1\n'
-    sleep 2
+    sleep 6
     # Phase B — end-to-end cmd-injection round-trip. The fixture
     # already pushed "echo HAMUI_CMD_OK\n" into the cmd queue (step 6
     # in the fixture). Hamsh's NEXT readline call will pop those
     # bytes and run that line. We give hamsh a moment to drain the
     # queue and emit INJECT_OK, then prove hamsh is still alive
     # with a separate echo.
-    sleep 1
+    sleep 3
     printf 'echo POST_HAMUI_OK\n'
-    sleep 1
+    sleep 3
     # Phase C — verify that AFTER hamsh has been driving things, the
     # text ring still contains the test banner (the ring is now
     # bigger so this also doubles as "the ring didn't get clobbered
     # by the readline echo path").
     printf 'cat /dev/wsys/1/kind\n'
-    sleep 1
+    sleep 3
     printf 'cat /dev/wsys/1/geometry\n'
-    sleep 1
+    sleep 3
     printf 'cat /dev/wsys\n'
-    sleep 1
+    sleep 3
     printf 'exit\n'
-    sleep 1
-) | timeout 25s qemu-system-x86_64 \
+    sleep 2
+) | timeout 60s qemu-system-x86_64 \
     -kernel "$ELF" \
     -smp 2 \
     -nographic \
