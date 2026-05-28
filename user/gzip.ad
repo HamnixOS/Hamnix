@@ -1,0 +1,387 @@
+# user/gzip.ad
+#
+# Hamnix native `gzip` / `gunzip` (via `-d`). A survival primitive for
+# the native namespace — SEPARATE from any Debian/Linux gzip.
+#
+# Usage:
+#   gzip FILE          # compress FILE -> FILE.gz, remove FILE (GNU-style)
+#   gzip -k FILE       # keep FILE
+#   gzip -c FILE       # write to stdout (implies keep)
+#   gzip -d FILE.gz    # decompress (same as gunzip)
+#   gzip -dk FILE.gz   # decompress and keep
+#   gzip -dc FILE.gz   # decompress to stdout
+#
+# COMPRESSION (v1): we emit a valid gzip member whose DEFLATE payload is
+# STORED (uncompressed) blocks, BTYPE=00 (RFC 1951 §3.2.4). This is a
+# legal gzip stream that any conformant `gunzip` (GNU, zlib, our own)
+# reads back identically — correctness first, ratio later. A stored
+# block carries at most 65535 payload bytes; we chunk the input into
+# 65535-byte blocks, the last one flagged BFINAL.
+#
+# gzip framing (RFC 1952): 10-byte header
+#   ID1=0x1f ID2=0x8b CM=8 FLG=0 MTIME=0 XFL=0 OS=0xff
+# then the DEFLATE stream, then 8-byte trailer:
+#   CRC32(little-endian) + ISIZE(little-endian, original size mod 2^32).
+#
+# DECOMPRESSION (-d) reuses lib/zlib/inflate.ad's full INFLATE (stored,
+# fixed-Huffman AND dynamic-Huffman + LZ77 32 KiB window + CRC32/ISIZE
+# validation), so `gzip -d` reads any real-world .gz, not just our own
+# stored output.
+
+from lib.zlib.inflate import (
+    InflateState,
+    inflate_init,
+    inflate_feed,
+)
+
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_unlink(path: Ptr[char]) -> int32
+
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+# ---- CRC32 (IEEE 0xEDB88320, gzip/PNG reflected) --------------------
+
+_gz_crc32_tbl:        Array[256, uint32]
+_gz_crc32_tbl_inited: int32 = 0
+
+
+def _gz_crc32_init():
+    if _gz_crc32_tbl_inited != 0:
+        return
+    i: uint32 = 0
+    while i < 256:
+        c: uint32 = i
+        j: int32 = 0
+        while j < 8:
+            if (c & 1) != 0:
+                c = (c >> 1) ^ 0xEDB88320
+            else:
+                c = c >> 1
+            j = j + 1
+        _gz_crc32_tbl[i] = c
+        i = i + 1
+    _gz_crc32_tbl_inited = 1
+
+
+def _gz_crc32_update(crc: uint32, buf: Ptr[uint8], len: uint64) -> uint32:
+    c: uint32 = crc
+    i: uint64 = 0
+    while i < len:
+        idx: uint32 = (c ^ cast[uint32](buf[i])) & 0xFF
+        c = (c >> 8) ^ _gz_crc32_tbl[idx]
+        i = i + 1
+    return c
+
+
+# ---- I/O buffers -----------------------------------------------------
+#
+# Compression reads the input in 65535-byte windows (one DEFLATE stored
+# block each), so one buffer of that size covers a whole block. The
+# 5-byte stored-block header (BFINAL+BTYPE byte then LEN/NLEN) is built
+# in a tiny stack array.
+
+STORED_MAX: uint64 = 65535
+in_blk:  Array[65535, uint8]
+
+# Decompression staging: a feed-input buffer and a drain-output buffer.
+INF_IN:  uint64 = 65536
+INF_OUT: uint64 = 65536
+gz_in:   Array[65536, uint8]
+gz_out:  Array[65536, uint8]
+inf_state: InflateState
+
+
+def write_all(fd: int32, buf: Ptr[uint8], len: uint64) -> int32:
+    wrote: uint64 = 0
+    while wrote < len:
+        wr: int64 = sys_write(fd,
+                              cast[Ptr[uint8]](cast[uint64](buf) + wrote),
+                              len - wrote)
+        if wr <= 0:
+            return -1
+        wrote = wrote + cast[uint64](wr)
+    return 0
+
+
+# ---- compression -----------------------------------------------------
+
+def write_gzip_header(out_fd: int32) -> int32:
+    h: Array[10, uint8]
+    h[0] = 0x1F
+    h[1] = 0x8B
+    h[2] = 8            # CM = DEFLATE
+    h[3] = 0            # FLG
+    h[4] = 0            # MTIME
+    h[5] = 0
+    h[6] = 0
+    h[7] = 0
+    h[8] = 0            # XFL
+    h[9] = 0xFF         # OS = unknown
+    return write_all(out_fd, &h[0], 10)
+
+
+def compress(in_fd: int32, out_fd: int32) -> int32:
+    _gz_crc32_init()
+    if write_gzip_header(out_fd) != 0:
+        return -1
+    crc: uint32 = 0xFFFFFFFF
+    isize: uint64 = 0
+    # We emit one DEFLATE stored block per <= 65535-byte input chunk.
+    # BFINAL must be known before a block's header is written, so we
+    # carry a single look-ahead byte across block boundaries: after
+    # filling a block to STORED_MAX we read ONE more byte. If it
+    # arrives, more input follows (this block is NOT final) and the
+    # byte seeds the next block; otherwise the block is final.
+    have:   uint64 = 0        # payload bytes buffered in in_blk
+    carried: int32 = 0        # 1 == in_blk[0] holds a carried look-ahead
+    wrote_any: int32 = 0      # 1 once at least one block was emitted
+    probe: Array[1, uint8]
+    while True:
+        # Fill in_blk up to STORED_MAX, preserving any carried byte at [0].
+        if carried != 0:
+            have = 1
+            carried = 0
+        else:
+            have = 0
+        while have < STORED_MAX:
+            n: int64 = sys_read(in_fd,
+                                cast[Ptr[uint8]](cast[uint64](&in_blk[0]) + have),
+                                STORED_MAX - have)
+            if n < 0:
+                return -1
+            if n == 0:
+                break
+            have = have + cast[uint64](n)
+        if have == 0:
+            # Clean EOF with nothing buffered. If we never wrote a block
+            # (empty input), emit one empty BFINAL stored block.
+            if wrote_any == 0:
+                bh0: Array[5, uint8]
+                bh0[0] = 1
+                bh0[1] = 0
+                bh0[2] = 0
+                bh0[3] = 0xFF
+                bh0[4] = 0xFF
+                if write_all(out_fd, &bh0[0], 5) != 0:
+                    return -1
+            break
+        # One-byte look-ahead to decide BFINAL.
+        is_final: int32 = 1
+        if have == STORED_MAX:
+            pn: int64 = sys_read(in_fd, &probe[0], 1)
+            if pn > 0:
+                is_final = 0
+        bh: Array[5, uint8]
+        if is_final != 0:
+            bh[0] = 1
+        else:
+            bh[0] = 0
+        ln: uint64 = have
+        bh[1] = cast[uint8](ln & 0xFF)
+        bh[2] = cast[uint8]((ln >> 8) & 0xFF)
+        nlen: uint64 = (~ln) & 0xFFFF
+        bh[3] = cast[uint8](nlen & 0xFF)
+        bh[4] = cast[uint8]((nlen >> 8) & 0xFF)
+        if write_all(out_fd, &bh[0], 5) != 0:
+            return -1
+        if write_all(out_fd, &in_blk[0], have) != 0:
+            return -1
+        crc = _gz_crc32_update(crc, &in_blk[0], have)
+        isize = isize + have
+        wrote_any = 1
+        if is_final != 0:
+            break
+        # Seed the next block with the carried look-ahead byte.
+        in_blk[0] = probe[0]
+        carried = 1
+    # Trailer: CRC32 (final = crc ^ 0xFFFFFFFF) + ISIZE, little-endian.
+    final_crc: uint32 = crc ^ 0xFFFFFFFF
+    tr: Array[8, uint8]
+    tr[0] = cast[uint8](final_crc & 0xFF)
+    tr[1] = cast[uint8]((final_crc >> 8) & 0xFF)
+    tr[2] = cast[uint8]((final_crc >> 16) & 0xFF)
+    tr[3] = cast[uint8]((final_crc >> 24) & 0xFF)
+    is32: uint32 = cast[uint32](isize & 0xFFFFFFFF)
+    tr[4] = cast[uint8](is32 & 0xFF)
+    tr[5] = cast[uint8]((is32 >> 8) & 0xFF)
+    tr[6] = cast[uint8]((is32 >> 16) & 0xFF)
+    tr[7] = cast[uint8]((is32 >> 24) & 0xFF)
+    return write_all(out_fd, &tr[0], 8)
+
+
+# ---- decompression (shared with gunzip) ------------------------------
+
+def decompress(in_fd: int32, out_fd: int32) -> int32:
+    inflate_init(&inf_state)
+    in_have: uint64 = 0          # valid bytes in gz_in
+    in_pos:  uint64 = 0          # bytes of gz_in already consumed
+    eof_in:  int32 = 0
+    done:    int32 = 0
+    while done == 0:
+        # Refill input if drained and not at EOF.
+        if in_pos >= in_have and eof_in == 0:
+            n: int64 = sys_read(in_fd, &gz_in[0], INF_IN)
+            if n < 0:
+                write_str(2, "gzip: read error\n")
+                return -1
+            if n == 0:
+                eof_in = 1
+                in_have = 0
+                in_pos = 0
+            else:
+                in_have = cast[uint64](n)
+                in_pos = 0
+        avail: uint64 = in_have - in_pos
+        out_consumed: uint64 = 0
+        in_consumed: uint64 = 0
+        rc: int32 = inflate_feed(&inf_state,
+                                 cast[Ptr[uint8]](cast[uint64](&gz_in[0]) + in_pos),
+                                 avail,
+                                 &gz_out[0], INF_OUT,
+                                 &out_consumed, &in_consumed, &done)
+        if rc < 0:
+            write_str(2, "gzip: invalid or corrupt gzip stream\n")
+            return -1
+        if out_consumed > 0:
+            if write_all(out_fd, &gz_out[0], out_consumed) != 0:
+                return -1
+        in_pos = in_pos + in_consumed
+        if rc == 1:
+            break
+        # rc == 0: either input starved or out_buf filled. If we made no
+        # progress AND input is exhausted at EOF, the stream is truncated.
+        if in_consumed == 0 and out_consumed == 0:
+            if eof_in != 0 and in_pos >= in_have:
+                write_str(2, "gzip: unexpected end of file\n")
+                return -1
+    return 0
+
+
+# Strip a trailing ".gz" from `name` into `out` (NUL-terminated). Returns
+# 1 if the suffix was present and stripped, 0 otherwise.
+def strip_gz(name: Ptr[uint8], out: Ptr[uint8]) -> int32:
+    n: uint64 = strlen_u8(name)
+    if n > 3 and name[n - 3] == 46 and name[n - 2] == 103 and name[n - 1] == 122:
+        i: uint64 = 0
+        while i < n - 3:
+            out[i] = name[i]
+            i = i + 1
+        out[n - 3] = 0
+        return 1
+    # No .gz suffix — copy verbatim and append ".out" so we never
+    # clobber the input.
+    i2: uint64 = 0
+    while i2 < n:
+        out[i2] = name[i2]
+        i2 = i2 + 1
+    out[n] = 46      # '.'
+    out[n + 1] = 111 # 'o'
+    out[n + 2] = 117 # 'u'
+    out[n + 3] = 116 # 't'
+    out[n + 4] = 0
+    return 0
+
+
+# Append ".gz" to `name` into `out` (NUL-terminated).
+def add_gz(name: Ptr[uint8], out: Ptr[uint8]):
+    n: uint64 = strlen_u8(name)
+    i: uint64 = 0
+    while i < n:
+        out[i] = name[i]
+        i = i + 1
+    out[n] = 46      # '.'
+    out[n + 1] = 103 # 'g'
+    out[n + 2] = 122 # 'z'
+    out[n + 3] = 0
+
+
+out_name: Array[300, uint8]
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    decompress_mode: int32 = 0
+    keep: int32 = 0
+    to_stdout: int32 = 0
+    file_idx: int32 = -1
+
+    i: int32 = 1
+    while i < argc:
+        a: Ptr[uint8] = cast[Ptr[uint8]](argv[cast[uint64](i)])
+        if a[0] == 45 and a[1] != 0:
+            j: uint64 = 1
+            while a[j] != 0:
+                c: uint8 = a[j]
+                if c == 100:                     # 'd'
+                    decompress_mode = 1
+                elif c == 107:                   # 'k'
+                    keep = 1
+                elif c == 99:                    # 'c'
+                    to_stdout = 1
+                    keep = 1
+                else:
+                    write_str(2, "gzip: unknown flag\n")
+                    return 1
+                j = j + 1
+            i = i + 1
+            continue
+        file_idx = i
+        break
+
+    if file_idx < 0:
+        write_str(2, "gzip: usage: gzip [-d] [-k] [-c] FILE\n")
+        return 1
+
+    in_name: Ptr[char] = cast[Ptr[char]](argv[cast[uint64](file_idx)])
+    in_fd: int32 = sys_open(in_name)
+    if in_fd < 0:
+        write_str(2, "gzip: cannot open ")
+        write_str(2, cast[Ptr[uint8]](in_name))
+        write_str(2, "\n")
+        return 1
+
+    if decompress_mode != 0:
+        strip_gz(cast[Ptr[uint8]](in_name), &out_name[0])
+    else:
+        add_gz(cast[Ptr[uint8]](in_name), &out_name[0])
+
+    out_fd: int32 = 1
+    if to_stdout == 0:
+        out_fd = sys_open_write(cast[Ptr[char]](&out_name[0]))
+        if out_fd < 0:
+            write_str(2, "gzip: cannot create ")
+            write_str(2, &out_name[0])
+            write_str(2, "\n")
+            sys_close(in_fd)
+            return 1
+
+    rc: int32 = 0
+    if decompress_mode != 0:
+        rc = decompress(in_fd, out_fd)
+    else:
+        rc = compress(in_fd, out_fd)
+
+    sys_close(in_fd)
+    if to_stdout == 0:
+        sys_close(out_fd)
+
+    if rc != 0:
+        return 1
+
+    # GNU gzip removes the source unless -k / -c.
+    if keep == 0 and to_stdout == 0:
+        sys_unlink(in_name)
+    return 0

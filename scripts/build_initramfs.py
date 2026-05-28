@@ -89,6 +89,26 @@ if os.environ.get("ENABLE_TLS_GZIP_SMOKE") == "1":
     FILES.append(("/etc/tls-gzip-test", b"1\n"))
     FILES.append(("/etc/skip-https-internet-smoke", b"1\n"))
 
+# Native tar/gzip/gunzip fixture. scripts/test_tar_gzip.sh sets
+# ENABLE_TAR_GZIP_FIXTURE=1 to bake a REAL host-gzip-produced .gz (with
+# known plaintext) into the cpio at /tests/realgz/. The .gz is produced
+# by Python's gzip module over highly compressible text, so zlib emits
+# dynamic-Huffman DEFLATE blocks — proving our `gunzip` INFLATE handles
+# real Huffman streams, not merely our own stored-block output. The
+# matching plaintext is staged alongside so the test can diff against it.
+if os.environ.get("ENABLE_TAR_GZIP_FIXTURE") == "1":
+    import gzip as _gzip_mod
+    # Repetitive, compressible plaintext: zlib chooses dynamic Huffman
+    # (BTYPE=10) with LZ77 back-references for this, the exact path our
+    # gunzip must decode (not the trivial stored path our gzip emits).
+    _realgz_plain = (
+        b"The quick brown fox jumps over the lazy dog.\n"
+        b"Hamnix native gunzip decodes real-world gzip Huffman streams.\n"
+    ) * 64
+    _realgz_bytes = _gzip_mod.compress(_realgz_plain, compresslevel=9)
+    FILES.append(("/tests/realgz/known.txt", _realgz_plain))
+    FILES.append(("/tests/realgz/known.txt.gz", _realgz_bytes))
+
 # M16.102 TCP three-way-handshake smoke (10.0.2.100:7 echo via
 # SLIRP `guestfwd=tcp:10.0.2.100:7-cmd:cat`). Gated the same way as
 # /etc/tcp-ring-test below: without the matching guestfwd the connect

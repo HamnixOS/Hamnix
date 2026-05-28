@@ -1,0 +1,646 @@
+# user/tar.ad
+#
+# Hamnix native `tar`: POSIX ustar archiver. A survival primitive for
+# the native namespace's share/backup workflows — SEPARATE from any
+# Debian/Linux tar that runs in a distro namespace.
+#
+# Usage:
+#   tar -c -f ARCHIVE FILE...     # create  (also: tar -cf ARCHIVE ...)
+#   tar -x -f ARCHIVE             # extract
+#   tar -t -f ARCHIVE             # list
+#   add -v for verbose (print file names)
+#
+# WIRE FORMAT — ustar (POSIX.1-1988), 512-byte blocks:
+#   name[100] mode[8] uid[8] gid[8] size[12 octal] mtime[12 octal]
+#   chksum[8] typeflag[1] linkname[100] magic[6]="ustar\0" version[2]="00"
+#   uname[32] gname[32] devmajor[8] devminor[8] prefix[155] pad[12]
+#   Two all-zero blocks terminate the archive.
+#   chksum = octal of the sum of all 512 header bytes with the 8-byte
+#   chksum field itself treated as ASCII spaces (0x20).
+#
+# SCOPE (v1): regular files and directories. Recurses into directories
+# the same way user/cp.ad's -r walk does (sys_listdir depth-first).
+# An explicit `-f ARCHIVE` is required — no stdin/stdout streaming.
+# We do NOT preserve mode/owner/mtime (header carries fixed 0644/0755,
+# uid/gid 0, mtime 0) and we don't handle symlinks or hardlinks.
+
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_mkdir(path: Ptr[char]) -> int32
+extern def sys_lseek(fd: int32, offset: int64, whence: int32) -> int64
+extern def sys_listdir(path: Ptr[char], buf: Ptr[uint8],
+                       count: uint64) -> int64
+
+
+SEEK_SET: int32 = 0
+SEEK_END: int32 = 2
+
+PATH_CAP:  uint64 = 256
+LIST_CAP:  uint64 = 1024
+MAX_DEPTH: int32  = 8
+BLOCK:     uint64 = 512
+
+# Per-syscall transfer buffer for streaming file bodies.
+io_buf:  Array[4096, uint8]
+
+# One 512-byte ustar header block (read or write).
+hdr:     Array[512, uint8]
+
+# An all-zero block used both as the terminator and as a comparison
+# probe when reading.
+zero_blk: Array[512, uint8]
+
+# Per-level listdir scratch for the create-side recursive walk; one
+# LIST_CAP slice per recursion level so a parent's cursor survives a
+# child recurse (mirrors user/cp.ad's `levels`).
+levels:  Array[8192, uint8]
+
+# Path scratch for the create-side walker (the member name we write
+# into the header) and for the extract-side path being created.
+member_path: Array[256, uint8]
+
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+# Probe: a path is a directory iff sys_listdir succeeds on it.
+def path_is_dir(path: Ptr[char]) -> int32:
+    probe: Array[4, uint8]
+    r: int64 = sys_listdir(path, &probe[0], 4)
+    if r >= 0:
+        return 1
+    return 0
+
+
+# Append "/<seg>" (seg_len bytes, no NUL) onto path at path_len.
+# Returns new length (NUL-terminated) or 0 on overflow. A leading
+# empty path takes seg verbatim with no separator.
+def path_append(path: Ptr[uint8], path_len: uint64,
+                seg: Ptr[uint8], seg_len: uint64) -> uint64:
+    need_slash: int32 = 1
+    if path_len == 0:
+        need_slash = 0
+    elif path_len == 1 and path[0] == 47:
+        need_slash = 0
+    extra: uint64 = seg_len
+    if need_slash != 0:
+        extra = extra + 1
+    if path_len + extra + 1 > PATH_CAP:
+        return 0
+    p: uint64 = path_len
+    if need_slash != 0:
+        path[p] = 47
+        p = p + 1
+    k: uint64 = 0
+    while k < seg_len:
+        path[p + k] = seg[k]
+        k = k + 1
+    path[p + seg_len] = 0
+    return p + seg_len
+
+
+# ---- octal field formatting -----------------------------------------
+#
+# ustar numeric fields are NUL-terminated (or space-padded) octal ASCII.
+# Conventionally an n-byte field carries (n-1) octal digits + a NUL.
+# We right-justify zero-padded digits and write a trailing NUL.
+
+def write_octal(fld: Ptr[uint8], width: uint64, value: uint64):
+    # width includes the trailing NUL slot. Fill (width-1) octal digits
+    # right-justified, zero-padded, then NUL the last byte.
+    digits: uint64 = width - 1
+    v: uint64 = value
+    i: uint64 = digits
+    while i > 0:
+        i = i - 1
+        d: uint64 = v & 7
+        fld[i] = cast[uint8](48 + d)
+        v = v >> 3
+    fld[digits] = 0
+
+
+# Parse a ustar octal field of `width` bytes. Leading spaces / NULs are
+# skipped; parsing stops at the first space or NUL after digits begin.
+def parse_octal(fld: Ptr[uint8], width: uint64) -> uint64:
+    v: uint64 = 0
+    i: uint64 = 0
+    # Skip leading spaces / NULs.
+    while i < width and (fld[i] == 32 or fld[i] == 0):
+        i = i + 1
+    while i < width:
+        c: uint8 = fld[i]
+        if c < 48 or c > 55:
+            break
+        v = (v << 3) + cast[uint64](c - 48)
+        i = i + 1
+    return v
+
+
+# ---- header construction --------------------------------------------
+
+def zero_hdr():
+    i: uint64 = 0
+    while i < BLOCK:
+        hdr[i] = 0
+        i = i + 1
+
+
+def hdr_set_name(name: Ptr[uint8], name_len: uint64) -> int32:
+    # name field is hdr[0..100). Names longer than 100 don't fit the
+    # ustar `name` field (prefix splitting is unimplemented in v1).
+    if name_len >= 100:
+        return -1
+    i: uint64 = 0
+    while i < name_len:
+        hdr[i] = name[i]
+        i = i + 1
+    return 0
+
+
+def hdr_finalize(typeflag: uint8, size: uint64, mode: uint64):
+    # mode/uid/gid/mtime + magic/version + checksum.
+    write_octal(&hdr[100], 8, mode)        # mode
+    write_octal(&hdr[108], 8, 0)           # uid
+    write_octal(&hdr[116], 8, 0)           # gid
+    write_octal(&hdr[124], 12, size)       # size
+    write_octal(&hdr[136], 12, 0)          # mtime
+    hdr[156] = typeflag
+    # magic[6] = "ustar\0", version[2] = "00".
+    hdr[257] = 117   # u
+    hdr[258] = 115   # s
+    hdr[259] = 116   # t
+    hdr[260] = 97    # a
+    hdr[261] = 114   # r
+    hdr[262] = 0
+    hdr[263] = 48    # '0'
+    hdr[264] = 48    # '0'
+    # Checksum: sum of all 512 bytes with chksum[148..156) as 8 spaces.
+    # Set the chksum field to spaces first, then sum.
+    j: uint64 = 148
+    while j < 156:
+        hdr[j] = 32
+        j = j + 1
+    sum: uint64 = 0
+    k: uint64 = 0
+    while k < BLOCK:
+        sum = sum + cast[uint64](hdr[k])
+        k = k + 1
+    # chksum stored as 6 octal digits, a NUL, then a space (the GNU
+    # convention). write_octal handles 6 digits + NUL into [148..155);
+    # byte [155] becomes a space.
+    write_octal(&hdr[148], 7, sum)
+    hdr[155] = 32
+
+
+# Write a single block (512 bytes) to out_fd. Returns 0 / -1.
+def write_block(out_fd: int32, blk: Ptr[uint8]) -> int32:
+    wrote: uint64 = 0
+    while wrote < BLOCK:
+        wr: int64 = sys_write(out_fd,
+                              cast[Ptr[uint8]](cast[uint64](blk) + wrote),
+                              BLOCK - wrote)
+        if wr <= 0:
+            return -1
+        wrote = wrote + cast[uint64](wr)
+    return 0
+
+
+# Read exactly `count` bytes (<=512) into buf. Returns the byte count
+# actually read (0 = clean EOF), or -1 on error.
+def read_full(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
+    got: uint64 = 0
+    while got < count:
+        n: int64 = sys_read(fd,
+                            cast[Ptr[uint8]](cast[uint64](buf) + got),
+                            count - got)
+        if n < 0:
+            return -1
+        if n == 0:
+            break
+        got = got + cast[uint64](n)
+    return cast[int64](got)
+
+
+# Stream the file at `src` into the archive: header already written,
+# now copy `size` bytes followed by zero padding to the next 512-byte
+# boundary. Returns 0 / -1.
+def emit_file_body(out_fd: int32, src: Ptr[char], size: uint64) -> int32:
+    in_fd: int32 = sys_open(src)
+    if in_fd < 0:
+        write_str(2, "tar: cannot open ")
+        write_str(2, cast[Ptr[uint8]](src))
+        write_str(2, "\n")
+        return -1
+    remaining: uint64 = size
+    while remaining > 0:
+        chunk: uint64 = 4096
+        if chunk > remaining:
+            chunk = remaining
+        n: int64 = sys_read(in_fd, &io_buf[0], chunk)
+        if n <= 0:
+            break
+        nu: uint64 = cast[uint64](n)
+        wrote: uint64 = 0
+        while wrote < nu:
+            wr: int64 = sys_write(out_fd,
+                                  cast[Ptr[uint8]](cast[uint64](&io_buf[0]) + wrote),
+                                  nu - wrote)
+            if wr <= 0:
+                sys_close(in_fd)
+                return -1
+            wrote = wrote + cast[uint64](wr)
+        remaining = remaining - nu
+    sys_close(in_fd)
+    # Pad to the next 512-byte boundary: write exactly (512 - size%512)
+    # zero bytes when size isn't already block-aligned.
+    rem: uint64 = size & 511
+    if rem != 0:
+        padn: uint64 = BLOCK - rem
+        wrote2: uint64 = 0
+        while wrote2 < padn:
+            wr2: int64 = sys_write(out_fd,
+                                   cast[Ptr[uint8]](cast[uint64](&zero_blk[0]) + wrote2),
+                                   padn - wrote2)
+            if wr2 <= 0:
+                return -1
+            wrote2 = wrote2 + cast[uint64](wr2)
+    return 0
+
+
+# Determine a regular file's size via lseek(SEEK_END).
+def file_size(path: Ptr[char]) -> int64:
+    fd: int32 = sys_open(path)
+    if fd < 0:
+        return -1
+    sz: int64 = sys_lseek(fd, 0, SEEK_END)
+    sys_close(fd)
+    return sz
+
+
+# Append one regular-file member named `name` (sourced from `src`).
+def add_regular(out_fd: int32, src: Ptr[char], name: Ptr[uint8],
+                name_len: uint64, verbose: int32) -> int32:
+    sz: int64 = file_size(src)
+    if sz < 0:
+        write_str(2, "tar: cannot stat ")
+        write_str(2, cast[Ptr[uint8]](src))
+        write_str(2, "\n")
+        return -1
+    zero_hdr()
+    if hdr_set_name(name, name_len) != 0:
+        write_str(2, "tar: name too long: ")
+        write_str(2, name)
+        write_str(2, "\n")
+        return -1
+    hdr_finalize(48, cast[uint64](sz), 420)      # typeflag '0', mode 0644
+    if write_block(out_fd, &hdr[0]) != 0:
+        return -1
+    if verbose != 0:
+        write_str(1, name)
+        write_str(1, "\n")
+    return emit_file_body(out_fd, src, cast[uint64](sz))
+
+
+# Append one directory member (header only, name ends with '/').
+def add_dir(out_fd: int32, name: Ptr[uint8], name_len: uint64,
+            verbose: int32) -> int32:
+    zero_hdr()
+    # ustar dir names conventionally carry a trailing '/'.
+    if name_len + 1 >= 100:
+        write_str(2, "tar: dir name too long\n")
+        return -1
+    i: uint64 = 0
+    while i < name_len:
+        hdr[i] = name[i]
+        i = i + 1
+    hdr[name_len] = 47
+    hdr_finalize(53, 0, 493)                      # typeflag '5', mode 0755
+    if write_block(out_fd, &hdr[0]) != 0:
+        return -1
+    if verbose != 0:
+        write_str(1, name)
+        write_str(1, "/\n")
+    return 0
+
+
+# Recursive create walk. `src_path` (the on-disk path) and `arc_path`
+# (the archive member name) both currently hold `*_len` bytes. We list
+# src_path and for each entry recurse (dir) or emit (file). The archive
+# member name tracks the same relative structure as the on-disk path.
+src_walk: Array[256, uint8]
+arc_walk: Array[256, uint8]
+
+
+def create_walk(out_fd: int32, src_len: uint64, arc_len: uint64,
+                depth: int32, verbose: int32) -> int32:
+    if depth >= MAX_DEPTH:
+        write_str(2, "tar: max recursion depth, skipping\n")
+        return 0
+    lbuf: Ptr[uint8] = cast[Ptr[uint8]](
+        cast[uint64](&levels[0]) + cast[uint64](depth) * LIST_CAP)
+    n: int64 = sys_listdir(cast[Ptr[char]](&src_walk[0]), lbuf, LIST_CAP)
+    if n < 0:
+        return 0
+    nu: uint64 = cast[uint64](n)
+    i: uint64 = 0
+    while i < nu:
+        j: uint64 = i
+        while j < nu and lbuf[j] != 10:
+            j = j + 1
+        ent_len: uint64 = j - i
+        skip: int32 = 0
+        if ent_len == 0:
+            skip = 1
+        if ent_len == 1 and lbuf[i] == 46:
+            skip = 1
+        if ent_len == 2 and lbuf[i] == 46 and lbuf[i + 1] == 46:
+            skip = 1
+        if skip == 0:
+            entp: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](lbuf) + i)
+            new_src: uint64 = path_append(&src_walk[0], src_len,
+                                          entp, ent_len)
+            new_arc: uint64 = path_append(&arc_walk[0], arc_len,
+                                          entp, ent_len)
+            if new_src != 0 and new_arc != 0:
+                if path_is_dir(cast[Ptr[char]](&src_walk[0])) != 0:
+                    add_dir(out_fd, &arc_walk[0], new_arc, verbose)
+                    create_walk(out_fd, new_src, new_arc,
+                                depth + 1, verbose)
+                else:
+                    add_regular(out_fd,
+                                cast[Ptr[char]](&src_walk[0]),
+                                &arc_walk[0], new_arc, verbose)
+            src_walk[src_len] = 0
+            arc_walk[arc_len] = 0
+        i = j + 1
+    return 0
+
+
+# Add one top-level FILE argument (file or directory tree).
+def add_arg(out_fd: int32, arg: Ptr[char], verbose: int32) -> int32:
+    alen: uint64 = strlen_u8(cast[Ptr[uint8]](arg))
+    if alen == 0 or alen >= PATH_CAP:
+        return -1
+    # Strip a trailing '/' (except bare "/").
+    while alen > 1 and cast[Ptr[uint8]](arg)[alen - 1] == 47:
+        alen = alen - 1
+    if path_is_dir(arg) == 0:
+        return add_regular(out_fd, arg, cast[Ptr[uint8]](arg), alen, verbose)
+    # Directory: emit the dir header, then recurse. The on-disk path and
+    # the archive member name both start as the argument string.
+    i: uint64 = 0
+    while i < alen:
+        src_walk[i] = cast[Ptr[uint8]](arg)[i]
+        arc_walk[i] = cast[Ptr[uint8]](arg)[i]
+        i = i + 1
+    src_walk[alen] = 0
+    arc_walk[alen] = 0
+    add_dir(out_fd, &arc_walk[0], alen, verbose)
+    return create_walk(out_fd, alen, alen, 0, verbose)
+
+
+# ---- create driver ---------------------------------------------------
+
+def do_create(archive: Ptr[char], files: Ptr[uint64], first: int32,
+              argc: int32, verbose: int32) -> int32:
+    out_fd: int32 = sys_open_write(archive)
+    if out_fd < 0:
+        write_str(2, "tar: cannot create ")
+        write_str(2, cast[Ptr[uint8]](archive))
+        write_str(2, "\n")
+        return 1
+    i: int32 = first
+    while i < argc:
+        arg: Ptr[char] = cast[Ptr[char]](files[cast[uint64](i)])
+        add_arg(out_fd, arg, verbose)
+        i = i + 1
+    # Two zero blocks terminate.
+    write_block(out_fd, &zero_blk[0])
+    write_block(out_fd, &zero_blk[0])
+    sys_close(out_fd)
+    return 0
+
+
+# ---- list / extract drivers ------------------------------------------
+#
+# Walk the archive header-by-header. For each non-terminator header,
+# the size field (rounded up to a 512 multiple) is the number of body
+# bytes to consume / extract before the next header.
+
+def is_zero_block() -> int32:
+    i: uint64 = 0
+    while i < BLOCK:
+        if hdr[i] != 0:
+            return 0
+        i = i + 1
+    return 1
+
+
+# Skip `size` body bytes (already on a 512 boundary going in); returns
+# 0 / -1. Used by list mode.
+def skip_body(in_fd: int32, size: uint64) -> int32:
+    padded: uint64 = ((size + 511) / 512) * 512
+    remaining: uint64 = padded
+    while remaining > 0:
+        chunk: uint64 = 4096
+        if chunk > remaining:
+            chunk = remaining
+        got: int64 = read_full(in_fd, &io_buf[0], chunk)
+        if got <= 0:
+            return -1
+        remaining = remaining - cast[uint64](got)
+    return 0
+
+
+# Extract `size` body bytes into the file at `dst` (already created),
+# discarding the trailing pad. Returns 0 / -1.
+def extract_body(in_fd: int32, dst: Ptr[char], size: uint64) -> int32:
+    out_fd: int32 = sys_open_write(dst)
+    if out_fd < 0:
+        write_str(2, "tar: cannot create ")
+        write_str(2, cast[Ptr[uint8]](dst))
+        write_str(2, "\n")
+        # Still consume the body so the stream stays aligned.
+        skip_body(in_fd, size)
+        return -1
+    remaining: uint64 = size
+    while remaining > 0:
+        chunk: uint64 = 4096
+        if chunk > remaining:
+            chunk = remaining
+        got: int64 = read_full(in_fd, &io_buf[0], chunk)
+        if got <= 0:
+            sys_close(out_fd)
+            return -1
+        gu: uint64 = cast[uint64](got)
+        wrote: uint64 = 0
+        while wrote < gu:
+            wr: int64 = sys_write(out_fd,
+                                  cast[Ptr[uint8]](cast[uint64](&io_buf[0]) + wrote),
+                                  gu - wrote)
+            if wr <= 0:
+                sys_close(out_fd)
+                return -1
+            wrote = wrote + cast[uint64](wr)
+        remaining = remaining - gu
+    sys_close(out_fd)
+    # Discard the pad to the next 512 boundary.
+    pad: uint64 = size & 511
+    if pad != 0:
+        read_full(in_fd, &io_buf[0], BLOCK - pad)
+    return 0
+
+
+# Create any leading directory components of `path` (mkdir -p style).
+# `path` is NUL-terminated. Trailing component is NOT created here.
+def make_parents(path: Ptr[uint8]):
+    n: uint64 = strlen_u8(path)
+    i: uint64 = 0
+    while i < n:
+        if path[i] == 47 and i > 0:
+            path[i] = 0
+            sys_mkdir(cast[Ptr[char]](path))
+            path[i] = 47
+        i = i + 1
+
+
+def do_list_or_extract(archive: Ptr[char], extract: int32,
+                       verbose: int32) -> int32:
+    in_fd: int32 = sys_open(archive)
+    if in_fd < 0:
+        write_str(2, "tar: cannot open ")
+        write_str(2, cast[Ptr[uint8]](archive))
+        write_str(2, "\n")
+        return 1
+    while True:
+        got: int64 = read_full(in_fd, &hdr[0], BLOCK)
+        if got <= 0:
+            break
+        if cast[uint64](got) < BLOCK:
+            break
+        if is_zero_block() != 0:
+            break
+        # Name is hdr[0..100), NUL-terminated within the field.
+        nlen: uint64 = 0
+        while nlen < 100 and hdr[nlen] != 0:
+            nlen = nlen + 1
+        # Copy into member_path so it's a clean NUL-terminated string.
+        k: uint64 = 0
+        while k < nlen:
+            member_path[k] = hdr[k]
+            k = k + 1
+        member_path[nlen] = 0
+        typeflag: uint8 = hdr[156]
+        size: uint64 = parse_octal(&hdr[124], 12)
+        is_dir: int32 = 0
+        if typeflag == 53:                       # '5'
+            is_dir = 1
+        # A name ending in '/' is also a directory (typeflag '0' from
+        # some writers).
+        if nlen > 0 and member_path[nlen - 1] == 47:
+            is_dir = 1
+        if extract == 0:
+            # List mode.
+            write_str(1, &member_path[0])
+            write_str(1, "\n")
+            skip_body(in_fd, size)
+        else:
+            if is_dir != 0:
+                # Strip a trailing '/' for the mkdir call.
+                if nlen > 0 and member_path[nlen - 1] == 47:
+                    member_path[nlen - 1] = 0
+                make_parents(&member_path[0])
+                sys_mkdir(cast[Ptr[char]](&member_path[0]))
+                if verbose != 0:
+                    write_str(1, &member_path[0])
+                    write_str(1, "/\n")
+                # Dir headers carry no body, but be defensive.
+                skip_body(in_fd, size)
+            else:
+                make_parents(&member_path[0])
+                if verbose != 0:
+                    write_str(1, &member_path[0])
+                    write_str(1, "\n")
+                extract_body(in_fd,
+                             cast[Ptr[char]](&member_path[0]), size)
+    sys_close(in_fd)
+    return 0
+
+
+# ---- argument parsing -------------------------------------------------
+#
+# Accepts both clustered (`-cvf`) and separated (`-c -v -f`) flags.
+# Exactly one of c/x/t must be present. `-f` consumes the NEXT argv as
+# the archive path. Remaining args (create mode) are the input files.
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    if argc < 2:
+        write_str(2, "tar: usage: tar -c|-x|-t [-v] -f ARCHIVE [FILE...]\n")
+        return 1
+    mode: int32 = 0          # 'c' | 'x' | 't' as ASCII, 0 = unset
+    verbose: int32 = 0
+    want_f: int32 = 0        # 1 once -f is seen, awaiting the path arg
+    archive_idx: int32 = -1
+    first_file: int32 = argc # index of the first FILE operand (create)
+
+    i: int32 = 1
+    while i < argc:
+        a: Ptr[uint8] = cast[Ptr[uint8]](argv[cast[uint64](i)])
+        if want_f != 0:
+            # This argument is the archive path.
+            archive_idx = i
+            want_f = 0
+            i = i + 1
+            continue
+        if a[0] == 45:                           # leading '-'
+            j: uint64 = 1
+            while a[j] != 0:
+                c: uint8 = a[j]
+                if c == 99:                      # 'c'
+                    mode = 99
+                elif c == 120:                   # 'x'
+                    mode = 120
+                elif c == 116:                   # 't'
+                    mode = 116
+                elif c == 118:                   # 'v'
+                    verbose = 1
+                elif c == 102:                   # 'f'
+                    want_f = 1
+                else:
+                    write_str(2, "tar: unknown flag\n")
+                    return 1
+                j = j + 1
+            i = i + 1
+            continue
+        # First non-flag, non-archive argument: start of FILE operands.
+        first_file = i
+        break
+
+    if mode == 0:
+        write_str(2, "tar: must specify one of -c, -x, -t\n")
+        return 1
+    if archive_idx < 0:
+        write_str(2, "tar: -f ARCHIVE is required\n")
+        return 1
+
+    archive: Ptr[char] = cast[Ptr[char]](argv[cast[uint64](archive_idx)])
+
+    if mode == 99:
+        if first_file >= argc:
+            write_str(2, "tar: -c needs at least one FILE\n")
+            return 1
+        return do_create(archive, argv, first_file, argc, verbose)
+    if mode == 116:
+        return do_list_or_extract(archive, 0, verbose)
+    return do_list_or_extract(archive, 1, verbose)
