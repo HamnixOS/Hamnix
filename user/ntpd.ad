@@ -1,0 +1,395 @@
+# user/ntpd.ad
+#
+# Native Adder NTP client. Mirrors user/ping.ad's shape — Plan-9-style
+# dial through the /net/udp file tree, no socket() involved (per
+# feedback_no_sockets.md / docs/native-api.md §10).
+#
+#   open /net/udp/clone        -> connN echoed as ASCII decimal
+#   open /net/udp/N/ctl        -> write "connect <a.b.c.d>!123"
+#   open /net/udp/N/data       -> write the 48-byte NTPv3 request
+#                                  -> read the 48-byte response
+#
+# Wire format (RFC 5905, 48 bytes — we send v3/v4-compatible client):
+#
+#   byte 0   : flags = LI(2) | VN(3) | Mode(3)
+#              we send 0x1B = 00 011 011 (LI=0, VN=3, Mode=3 client)
+#   bytes 1..39 : zero
+#   bytes 40..43: Transmit Timestamp seconds (NTP epoch, big-endian)
+#   bytes 44..47: Transmit Timestamp fraction (big-endian, ignored)
+#
+# Response: same 48-byte layout. The interesting field is bytes 40..43
+# (Transmit Timestamp seconds, the server's "now"). NTP epoch is
+# 1900-01-01 00:00:00 UTC; Unix epoch is 1970-01-01. Delta is
+# 2208988800 seconds (70 years incl. 17 leap days). So:
+#
+#   unix_epoch = ntp_seconds - 2208988800
+#
+# After parsing, we call sys_set_realtime(unix_epoch) to anchor the
+# kernel-side wall clock. From the next read forward,
+# time_realtime_seconds() / CLOCK_REALTIME / TLS cert validity all see
+# the corrected time.
+#
+# Usage:
+#   ntpd [-s <server>]
+#   default <server> = pool.ntp.org (resolved via sys_resolve).
+#
+# Exit codes: 0 on success, 1 on resolution / network / set-realtime
+# failure.
+#
+# Compiler-quirk notes: every buffer is a top-level BSS Array (U9
+# nested-frame-Array miscompile); no adjacent string-literal concat.
+# Single-shot binary — not reentrant.
+
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_resolve(hostname: Ptr[uint8], hlen: uint64) -> int64
+extern def sys_set_realtime(epoch: uint64) -> int32
+extern def sys_get_jiffies() -> uint64
+
+
+# -- top-level BSS buffers (U9 quirk: no nested Arrays) ---------------
+
+# "/net/udp/<conn>/<leaf>" — well under 48 bytes; 64 gives headroom.
+ntpd_path_buf: Array[64, uint8]
+# "connect <a.b.c.d>!123" — under 32 bytes; 64 gives headroom.
+ntpd_cmd_buf:  Array[64, uint8]
+# Clone fd readback scratch.
+ntpd_num_buf:  Array[24, uint8]
+# 48-byte NTP request / response.
+ntpd_tx_buf:   Array[48, uint8]
+ntpd_rx_buf:   Array[48, uint8]
+# Resolved hostname scratch.
+ntpd_host_buf: Array[256, uint8]
+# Output line scratch.
+ntpd_out_buf:  Array[256, uint8]
+
+
+def _ntpd_strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _ntpd_write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, _ntpd_strlen(s))
+
+
+def _ntpd_put_dec(out: Ptr[uint8], pos: uint64, v: uint64) -> uint64:
+    if v == 0:
+        out[pos] = 48                              # '0'
+        return pos + 1
+    digs: Array[24, uint8]
+    n: uint64 = 0
+    while v != 0:
+        digs[n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    p: uint64 = pos
+    while n > 0:
+        n = n - 1
+        out[p] = digs[n]
+        p = p + 1
+    return p
+
+
+def _ntpd_build_path(connN: uint64, leaf: Ptr[uint8]):
+    # Build "/net/udp/<connN>/<leaf>" into ntpd_path_buf, NUL-terminated.
+    pfx: Ptr[uint8] = "/net/udp/"
+    p: uint64 = 0
+    while pfx[p] != 0:
+        ntpd_path_buf[p] = pfx[p]
+        p = p + 1
+    p = _ntpd_put_dec(&ntpd_path_buf[0], p, connN)
+    ntpd_path_buf[p] = 47                          # '/'
+    p = p + 1
+    li: uint64 = 0
+    while leaf[li] != 0:
+        ntpd_path_buf[p] = leaf[li]
+        p = p + 1
+        li = li + 1
+    ntpd_path_buf[p] = 0
+
+
+def _ntpd_read_conn(clone_fd: int32) -> int64:
+    # Parse the ASCII decimal connection number echoed on /net/udp/clone.
+    n: int64 = sys_read(clone_fd, &ntpd_num_buf[0], 16)
+    if n <= 0:
+        return -1
+    v: uint64 = 0
+    seen: int32 = 0
+    i: uint64 = 0
+    while i < cast[uint64](n):
+        b: uint8 = ntpd_num_buf[i]
+        if b >= 48 and b <= 57:
+            v = v * 10 + cast[uint64](b - 48)
+            seen = 1
+        i = i + 1
+    if seen == 0:
+        return -1
+    return cast[int64](v)
+
+
+def _try_parse_ipv4(s: Ptr[uint8], out: Ptr[uint8]) -> int32:
+    # Try to parse `s` as "a.b.c.d". 0 on success, -1 otherwise.
+    octet: uint64 = 0
+    seen: int32 = 0
+    idx: uint64 = 0
+    i: uint64 = 0
+    while s[i] != 0:
+        c: uint8 = s[i]
+        if c == 46:                                # '.'
+            if seen == 0:
+                return -1
+            if idx >= 3:
+                return -1
+            if octet > 255:
+                return -1
+            out[idx] = cast[uint8](octet)
+            idx = idx + 1
+            octet = 0
+            seen = 0
+        elif c >= 48 and c <= 57:
+            octet = octet * 10 + cast[uint64](c - 48)
+            seen = 1
+            if octet > 255:
+                return -1
+        else:
+            return -1
+        i = i + 1
+    if seen == 0:
+        return -1
+    if idx != 3:
+        return -1
+    out[3] = cast[uint8](octet)
+    return 0
+
+
+def _resolve_host(host: Ptr[uint8], out_octets: Ptr[uint8]) -> int32:
+    # Resolve a hostname (or dotted-quad literal) to 4 octets. 0 on
+    # success, -1 on lookup failure.
+    if _try_parse_ipv4(host, out_octets) == 0:
+        return 0
+    hlen: uint64 = _ntpd_strlen(host)
+    i: uint64 = 0
+    while i < hlen and i + 1 < 256:
+        ntpd_host_buf[i] = host[i]
+        i = i + 1
+    ntpd_host_buf[i] = 0
+    rc: int64 = sys_resolve(&ntpd_host_buf[0], i)
+    if rc < 0:
+        return -1
+    ip32: uint32 = cast[uint32](rc & 0xFFFFFFFF)
+    out_octets[0] = cast[uint8]((ip32 >> 24) & 0xFF)
+    out_octets[1] = cast[uint8]((ip32 >> 16) & 0xFF)
+    out_octets[2] = cast[uint8]((ip32 >> 8) & 0xFF)
+    out_octets[3] = cast[uint8](ip32 & 0xFF)
+    return 0
+
+
+def _emit_ip(out: Ptr[uint8], off: uint64,
+             b0: uint8, b1: uint8, b2: uint8, b3: uint8) -> uint64:
+    off = _ntpd_put_dec(out, off, cast[uint64](b0))
+    out[off] = 46
+    off = off + 1
+    off = _ntpd_put_dec(out, off, cast[uint64](b1))
+    out[off] = 46
+    off = off + 1
+    off = _ntpd_put_dec(out, off, cast[uint64](b2))
+    out[off] = 46
+    off = off + 1
+    off = _ntpd_put_dec(out, off, cast[uint64](b3))
+    return off
+
+
+def _ntpd_dial(b0: uint8, b1: uint8, b2: uint8, b3: uint8,
+               out_conn: Ptr[int64]) -> int32:
+    # /net/udp clone + ctl + data. Returns the data fd, or -1.
+    # Mirrors user/net9.ad::net_dial — but for UDP, which lives on the
+    # /net/udp tree and uses a `connect <ip>!<port>` ctl command that
+    # records a fixed peer (UDP has no handshake — the kernel just
+    # latches the peer into the conn's netc_rip / netc_rport so a
+    # subsequent data write resolves to a single sendto).
+    clone_fd: int32 = sys_open("/net/udp/clone")
+    if clone_fd < 0:
+        return -1
+    connN: int64 = _ntpd_read_conn(clone_fd)
+    if connN < 0:
+        sys_close(clone_fd)
+        return -1
+    cu: uint64 = cast[uint64](connN)
+    _ntpd_build_path(cu, "ctl")
+    ctl_fd: int32 = sys_open_write(cast[Ptr[char]](&ntpd_path_buf[0]))
+    if ctl_fd < 0:
+        sys_close(clone_fd)
+        return -1
+    # "connect <a.b.c.d>!123"
+    cpfx: Ptr[uint8] = "connect "
+    cp: uint64 = 0
+    while cpfx[cp] != 0:
+        ntpd_cmd_buf[cp] = cpfx[cp]
+        cp = cp + 1
+    cp = _emit_ip(&ntpd_cmd_buf[0], cp, b0, b1, b2, b3)
+    ntpd_cmd_buf[cp] = 33                          # '!'
+    cp = cp + 1
+    cp = _ntpd_put_dec(&ntpd_cmd_buf[0], cp, 123)
+    cwn: int64 = sys_write(ctl_fd, &ntpd_cmd_buf[0], cp)
+    if cwn < 0:
+        sys_close(ctl_fd)
+        sys_close(clone_fd)
+        return -1
+    _ntpd_build_path(cu, "data")
+    data_fd: int32 = sys_open_write(cast[Ptr[char]](&ntpd_path_buf[0]))
+    sys_close(ctl_fd)
+    sys_close(clone_fd)
+    if data_fd < 0:
+        return -1
+    out_conn[0] = connN
+    return data_fd
+
+
+def _build_request():
+    # 48-byte NTPv3/v4 client request: first byte is 0x1B (LI=0, VN=3,
+    # Mode=3), every other byte zero. RFC 5905 §7.3.
+    i: uint64 = 0
+    while i < 48:
+        ntpd_tx_buf[i] = 0
+        i = i + 1
+    ntpd_tx_buf[0] = 0x1B
+
+
+def _parse_response() -> int64:
+    # Pull the transmit-timestamp seconds field (bytes 40..43, big-endian
+    # uint32) and convert to Unix epoch. Returns the Unix epoch on
+    # success, -1 on a malformed response.
+    #
+    # NTP "seconds since 1900" minus 2208988800 = "seconds since 1970".
+    # We only consume the high 32 bits; the low 32 (fraction) are
+    # discarded since we're anchoring on whole seconds anyway.
+    s0: uint64 = cast[uint64](ntpd_rx_buf[40])
+    s1: uint64 = cast[uint64](ntpd_rx_buf[41])
+    s2: uint64 = cast[uint64](ntpd_rx_buf[42])
+    s3: uint64 = cast[uint64](ntpd_rx_buf[43])
+    ntp_secs: uint64 = (s0 << 24) | (s1 << 16) | (s2 << 8) | s3
+    # The classic 1900->1970 offset is 2208988800. An all-zero
+    # transmit timestamp means the server refused to answer (KoD
+    # packets land here too) — surface as an error.
+    NTP_TO_UNIX: uint64 = 2208988800
+    if ntp_secs == 0:
+        return -1
+    if ntp_secs < NTP_TO_UNIX:
+        # Server clock is somehow before 1970 — clearly bogus.
+        return -1
+    return cast[int64](ntp_secs - NTP_TO_UNIX)
+
+
+def _emit_dec(fd: int32, v: uint64):
+    scratch: Array[32, uint8]
+    n: uint64 = _ntpd_put_dec(&scratch[0], 0, v)
+    sys_write(fd, &scratch[0], n)
+
+
+def _usage() -> int32:
+    _ntpd_write_str(2, "usage: ntpd [-s <server>]\n")
+    return 1
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    # Argv parsing — single optional `-s <server>`.
+    server_arg: Ptr[uint8] = "pool.ntp.org"
+    i: int32 = 1
+    while i < argc:
+        a: Ptr[uint8] = cast[Ptr[uint8]](argv[cast[uint64](i)])
+        if a[0] == 45 and a[1] == 115 and a[2] == 0:           # "-s"
+            if i + 1 >= argc:
+                return _usage()
+            server_arg = cast[Ptr[uint8]](argv[cast[uint64](i + 1)])
+            i = i + 2
+        else:
+            return _usage()
+
+    # Banner: "ntpd: syncing time from <server>".
+    _ntpd_write_str(1, "ntpd: syncing time from ")
+    _ntpd_write_str(1, server_arg)
+    _ntpd_write_str(1, "\n")
+
+    # Resolve.
+    octets: Array[4, uint8]
+    if _resolve_host(server_arg, &octets[0]) != 0:
+        _ntpd_write_str(2, "ntpd: cannot resolve ")
+        _ntpd_write_str(2, server_arg)
+        _ntpd_write_str(2, "\n")
+        return 1
+    b0: uint8 = octets[0]
+    b1: uint8 = octets[1]
+    b2: uint8 = octets[2]
+    b3: uint8 = octets[3]
+
+    # Print the resolved IPv4 so an operator watching the boot log can
+    # confirm the route.
+    off: uint64 = 0
+    pfx: Ptr[uint8] = "ntpd: resolved to "
+    pi: uint64 = 0
+    while pfx[pi] != 0:
+        ntpd_out_buf[off] = pfx[pi]
+        off = off + 1
+        pi = pi + 1
+    off = _emit_ip(&ntpd_out_buf[0], off, b0, b1, b2, b3)
+    ntpd_out_buf[off] = 10                                     # '\n'
+    off = off + 1
+    sys_write(1, &ntpd_out_buf[0], off)
+
+    # Dial UDP/123.
+    conn_box: Array[1, int64]
+    conn_box[0] = 0
+    data_fd: int32 = _ntpd_dial(b0, b1, b2, b3, &conn_box[0])
+    if data_fd < 0:
+        _ntpd_write_str(2, "ntpd: cannot open /net/udp conn\n")
+        return 1
+
+    # Build and send the 48-byte request.
+    _build_request()
+    wr: int64 = sys_write(data_fd, &ntpd_tx_buf[0], 48)
+    if wr != 48:
+        _ntpd_write_str(2, "ntpd: send failed\n")
+        sys_close(data_fd)
+        return 1
+
+    # Blocking read with the kernel-default /net read budget (~5 s, the
+    # NET_BLOCK_JIFFIES the UDP recv path uses internally). devnet's
+    # data-read returns 0 on a timeout / would-block, the real datagram
+    # length on success.
+    rd: int64 = sys_read(data_fd, &ntpd_rx_buf[0], 48)
+    sys_close(data_fd)
+    if rd <= 0:
+        _ntpd_write_str(2, "ntpd: timeout / no reply\n")
+        return 1
+    if rd < 48:
+        _ntpd_write_str(2, "ntpd: short reply (truncated NTP packet)\n")
+        return 1
+
+    # Parse the transmit timestamp.
+    epoch64: int64 = _parse_response()
+    if epoch64 < 0:
+        _ntpd_write_str(2, "ntpd: bogus / KoD reply\n")
+        return 1
+    epoch: uint64 = cast[uint64](epoch64)
+
+    # Anchor the kernel-side wall clock. Hostowner-only on the kernel
+    # side; we are running from rc.boot as PID 1's interpreter so the
+    # uid==1 gate doesn't bite. Print before AND after so a debugger
+    # can see what we asked for.
+    _ntpd_write_str(1, "ntpd: server reports unix epoch=")
+    _emit_dec(1, epoch)
+    _ntpd_write_str(1, "\n")
+
+    src: int32 = sys_set_realtime(epoch)
+    if src != 0:
+        _ntpd_write_str(2, "ntpd: sys_set_realtime failed\n")
+        return 1
+
+    _ntpd_write_str(1, "ntpd: wall clock anchored\n")
+    return 0

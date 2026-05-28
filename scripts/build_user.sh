@@ -119,6 +119,7 @@ build_adder_user help                 # discovery: man-page index + `help <topic
 build_adder_user top                  # M16.87: one-shot /proc dashboard
 build_adder_user ifconfig             # M16.87: stub lo 127.0.0.1/8
 build_adder_user ping                 # native Adder ping: Plan-9-shaped /net/icmp client
+build_adder_user ntpd                 # native Adder NTP client: anchors rtc_boot_epoch via /net/udp
 build_adder_user route                # M16.87: stub loopback routing row
 build_adder_user lsmod                # M16.87: stub module table
 build_adder_user dmesg                # M16.87: placeholder until kernel ring buf
