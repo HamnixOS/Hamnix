@@ -6,8 +6,9 @@
 
 **A from-scratch x86_64 OS, written in Adder — a Python-syntax systems
 language with a hand-written x86_64 compiler (no LLVM).** Hamnix is the
-OS; Adder is the language and compiler used to write it. Boots on BIOS
-and UEFI; reaches an interactive shell on real hardware.
+OS; Adder is the language and compiler used to write it. UEFI-only;
+boots off a GPT disk image and reaches an interactive shell on real
+hardware.
 
 The novel claim is the **layered architecture**: native Plan 9-shape
 syscalls underneath, with a Linux ABI shim sitting on top so unmodified
@@ -50,16 +51,22 @@ loop through userspace-posted srvfds. See
 ## What it boots into today
 
 - **Real hardware** — boots end-to-end on the Intel Skull Canyon NUC
-  (BIOS + UEFI, USB keyboard input via the L-shim USB-HC bridge, reaches
+  (UEFI, USB keyboard input via the L-shim USB-HC bridge, reaches
   hamsh prompt, runs `enter linux { /bin/sh }` against real Debian
   apt/dpkg). Asus i5-4210U crashes during boot (regression observation
   only). See [`docs/REAL_HARDWARE.md`](docs/REAL_HARDWARE.md).
-- **Hybrid BIOS+UEFI ISO** via `scripts/build_iso.sh` — SeaBIOS,
-  OVMF, GNOME Boxes all boot. UEFI direct boot via a native PE/COFF stub.
+- **UEFI-only GPT disk image** (`build/hamnix.img`) via
+  `scripts/build_img.sh` — a raw, installed-system-shaped disk: a FAT
+  EFI System Partition (the native PE/COFF stub + kernel ELF) plus a
+  512 MiB ext4 root. UEFI firmware launches the stub, which SFSP-loads
+  the kernel off the ESP; the kernel then boots entirely off the ext4
+  root (no embedded cpio). BIOS/legacy boot is dropped; Hamnix is
+  UEFI-only by design.
 - **Linux ABI** — ~250 syscalls; 24 stock Debian `.ko` modules load
   cleanly. CPython 3.11.10 and busybox 1.36 run as musl static-PIE
   binaries. Real Debian `apt 3.0.3` + `dpkg 1.22.22` install packages
-  inside `enter linux { … }` against a separate ext4 rootfs partition.
+  inside `enter linux { … }` against the `#distro` root served off the
+  ext4 partition.
 - **Network** — virtio-net / e1000e / r8169 drivers; ARP / IP / UDP /
   TCP / ICMP / DHCP / DNS / HTTP / TLS 1.3 end-to-end. **TCP / UDP /
   TLS exposed as the `/net` 9P file tree** (Plan-9-shape, zero BSD
@@ -84,10 +91,11 @@ loop through userspace-posted srvfds. See
   `main` only.
 - **Installer** — `etc/install.hamsh`: `hpm install`-driven Debian-
   installer-shape script. Partitions disk, mkfs ESP + ext4 rootfs,
-  installs from the ISO mini-repo, plants `/etc/passwd` + `/etc/shadow`,
-  ext4 grow-to-fit on first boot. `scripts/test_installer_full.sh`
-  PASSES end-to-end (build ISO → install → reboot from disk → grow +
-  idempotent re-boot).
+  installs from a local mini-repo, plants `/etc/passwd` + `/etc/shadow`,
+  ext4 grow-to-fit on first boot. (The shipped `build/hamnix.img` is
+  itself already an installed-system-shaped GPT image; on a real disk
+  the ext4 root grows to fill the disk and every named root draws from
+  that one shared pool.)
 - **Security** — Plan-9-shape: single hostowner (uid 1) per installed
   system; regular users (uid ≥ 1000) get a restricted namespace and
   literally can't address dangerous file servers; no setuid bits, no
@@ -123,26 +131,32 @@ For what's still open, **[TODO.md](TODO.md)**.
 ## Quick start
 
 Requirements: `gcc`, `make`, `qemu-system-x86_64`, `flex`, `bison`,
-`libelf-dev`, `xorriso`, `mtools`, Python 3.10+. For UEFI testing also
-`ovmf`.
+`libelf-dev`, `mtools`, `parted`, `e2fsprogs`, Python 3.10+. For UEFI
+testing also `ovmf`.
 
 ```bash
 git clone --recurse-submodules https://github.com/HamnixOS/Hamnix
 cd Hamnix
 
-./scripts/build_iso.sh                 # produces build/hamnix.iso
-./scripts/test_bios_boot.sh            # SeaBIOS
-./scripts/test_uefi_boot.sh            # OVMF (apt install ovmf)
+./scripts/build_img.sh                 # produces build/hamnix.img (UEFI GPT disk)
+./scripts/test_img_uefi_boot.sh        # boots hamnix.img under OVMF (apt install ovmf)
 ```
+
+`build/hamnix.img` is a raw, installed-system-shaped GPT disk image
+(UEFI-only): a FAT EFI System Partition carrying the PE/COFF stub +
+kernel ELF, and an ext4 root the kernel boots off directly. Hamnix is
+UEFI-only; there is no BIOS/GRUB path. (`scripts/build_iso.sh` is now a
+thin deprecation shim that delegates to `build_img.sh`.)
 
 Flash to USB and boot on real hardware:
 
 ```bash
-bash scripts/write_iso_to_usb.sh /dev/sdX     # guard-railed sudo dd wrapper
+sudo dd if=build/hamnix.img of=/dev/sdX bs=4M conv=fsync status=progress   # confirm /dev/sdX first!
+sync
 ```
 
-`write_iso_to_usb.sh` refuses `/dev/sda`, refuses targets > 64 GiB, and
-prompts for explicit confirmation. See
+**`dd` will silently overwrite whichever device you point it at — confirm
+the device with `lsblk` first.** See
 [`docs/REAL_HARDWARE.md`](docs/REAL_HARDWARE.md) for the full procedure.
 
 ---
@@ -233,7 +247,7 @@ init/            start_kernel(), /init shim, boot smoke tests
 
 kernel-modules/  M1..M15 stock-Linux .ko regression baseline
 tests/           Integration tests + compiler regression fixtures
-scripts/         build_iso.sh, test_*.sh, build_packages.py, gen_install_manifest.py
+scripts/         build_img.sh, test_*.sh, build_packages.py, gen_install_manifest.py
 docs/            Project documentation (see index below)
 memory/          Orchestrator session memory (not in repo)
 ```
@@ -261,7 +275,8 @@ memory/          Orchestrator session memory (not in repo)
 - [`docs/9p.md`](docs/9p.md) — 9P2000 wire spec.
 - [`docs/distro-namespaces.md`](docs/distro-namespaces.md) — Phase C.5
   distro-shape namespace design.
-- [`docs/BOOT.md`](docs/BOOT.md) — building + booting the ISO.
+- [`docs/BOOT.md`](docs/BOOT.md) — building + booting the UEFI GPT
+  disk image (`hamnix.img`).
 - [`docs/REAL_HARDWARE.md`](docs/REAL_HARDWARE.md) — physical-hardware
   procedure + per-vendor firmware checklist.
 - [`docs/x86-backend.md`](docs/x86-backend.md) — hand-written backend

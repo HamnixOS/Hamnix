@@ -1,19 +1,28 @@
 # Booting Hamnix
 
-This document covers the three ways to boot the Hamnix kernel today:
+Hamnix is **UEFI-only**. The user-facing, installable artifact is a raw
+GPT disk image shaped exactly like an installed system,
+`build/hamnix.img`, built by `scripts/build_img.sh`. There is no
+BIOS/GRUB/El-Torito/hybrid-MBR path anymore; legacy boot was dropped.
 
-1. **Developer dev loop** via `scripts/run_x86_bare.sh` (GRUB-ISO shim).
-2. **Hybrid ISO** (`build/hamnix.iso`) — boots under BIOS legacy *or* UEFI.
-3. **USB stick** — same hybrid ISO, written byte-for-byte to a USB device.
+This document covers the two ways to boot Hamnix today:
 
-The hybrid ISO is the priority boot path: it's the foundation for booting
-Hamnix on real server hardware.
+1. **Installed-system disk image** (`build/hamnix.img`) — the shipped
+   artifact. UEFI firmware boots it the way a real install boots; the
+   kernel then runs entirely off the image's ext4 root (no embedded
+   cpio). This is the priority path.
+2. **Developer dev loop** via `scripts/run_x86_bare.sh` — boots the
+   kernel ELF directly under QEMU `-kernel` (through a small GRUB-ISO
+   PATH shim). This developer/test path STILL boots from an embedded
+   cpio root, so the in-kernel cpio machinery is retained for it; the
+   shipped `hamnix.img` does not use cpio.
 
 The Hamnix kernel is a true **`elf64-x86-64`** ELF, linked into the
 **higher half** at `0xffffffff80000000` (see `arch/x86/kernel/kernel.lds`).
-It is loaded by multiboot1 (GRUB) on BIOS and by a native PE/COFF EFI stub
-on UEFI; both honour the 64-bit `p_paddr` program-header fields the
-kernel's VMA/LMA split needs.
+On the disk-image path it is loaded by a native PE/COFF EFI stub off the
+ESP; on the developer `-kernel` path it is loaded by GRUB's multiboot1
+loader via the shim. Both honour the 64-bit `p_paddr` program-header
+fields the kernel's VMA/LMA split needs.
 
 ## 1. Developer dev loop
 
@@ -37,93 +46,117 @@ boots it in QEMU.
 > QEMU's) happily loads ELFCLASS64. No ISO mastering is visible to the
 > caller — much faster turnaround than building the full hybrid ISO.
 
-## 2. Hybrid bootable ISO
+## 2. The installed-system disk image (`build/hamnix.img`)
 
 ### Build
 
 ```sh
-bash scripts/build_iso.sh
+bash scripts/build_img.sh
 ```
 
-This produces `build/hamnix.iso`, a hybrid CD/USB image that:
+This produces `build/hamnix.img`, a raw GPT disk image (~546 MiB) laid
+out exactly like an installed system:
 
-- Carries a `boot_hybrid.img` MBR so legacy BIOS systems treat it as a
-  bootable disk.
-- Embeds an EFI system partition (GPT partition 2) with
-  `\EFI\BOOT\BOOTX64.EFI` so UEFI firmware can find and execute it directly.
-- For BIOS: wraps a GRUB2 install whose `grub.cfg` does
-  `multiboot /boot/hamnix.elf` then `boot`.
+```
+GPT disk
+├── Partition 1: ESP (FAT, ~32 MiB)
+│     \EFI\BOOT\BOOTX64.EFI   (the native PE/COFF stub, efi_stub.S)
+│     \hamnix-kernel.elf      (the elf64 higher-half kernel)
+└── Partition 2: ext4 (~512 MiB)
+      .hamnix-roots           (sentinel: #sysroot -> sysroot/, #distro -> distro/)
+      sysroot/                (native Adder tools + libs + /init + /etc)
+      distro/                 (minimal Debian: apt/dpkg/busybox closure)
+```
 
-### Two boot paths, two binaries
+`sysroot/`, `distro/`, and future per-user home roots are SUBTREES of
+the **single** ext4 filesystem — they share its free space; they are
+NOT separate partitions. On install to a real disk the ext4 grows to
+fill the disk and every root draws from one common pool. (See
+[`rootfs_partition.md`](rootfs_partition.md).)
 
-As of M16.70 the BIOS and UEFI paths run **different code on the way in**:
+`scripts/build_iso.sh` is now a ~44-line deprecation shim that just
+delegates to `build_img.sh`; `build/hamnix.iso` is no longer the
+primary artifact.
 
-- **BIOS path (unchanged)**: SeaBIOS → GRUB (via grub-pc-bin) → multiboot1 →
-  `build/hamnix-kernel.elf` → `start_kernel()`. Same as before.
+### Boot flow
 
-- **UEFI path**: OVMF / firmware → **native Hamnix PE/COFF stub**
-  (`build/hamnix-bootx64.efi`, built from `arch/x86/boot/efi_stub.S`).
-  No GRUB-EFI in the boot path. The stub does the FULL handoff
-  from firmware to `start_kernel()` end-to-end (M16.125 — PATH A
-  from the M16.124 diagnosis):
-    1. Stash EFI ImageHandle + SystemTable.
-    2. Print `[hamnix] EFI entry reached` over COM1.
-    3. Locate the Simple File System Protocol on our load device
-       (via `HandleProtocol(ImageHandle, LoadedImageGuid) ->
+UEFI-only, end-to-end:
+
+1. UEFI firmware reads the GPT, finds the ESP (partition 1, FAT), and
+   launches `\EFI\BOOT\BOOTX64.EFI` — the native Hamnix PE/COFF stub
+   (`arch/x86/boot/efi_stub.S`). No GRUB-EFI middleman.
+2. The stub (PATH A — see the historical note below) does the FULL
+   handoff from firmware to `_x86_start_after_loader`:
+    1. Stash EFI ImageHandle + SystemTable; print
+       `[hamnix] EFI entry reached` over COM1.
+    2. Locate the Simple File System Protocol on the load device
+       (`HandleProtocol(ImageHandle, LoadedImageGuid) ->
        HandleProtocol(DeviceHandle, SfspGuid) -> OpenVolume`).
-    4. Open `\hamnix-kernel.elf` on the ESP, AllocatePool 32 MiB
-       and read the entire ELF in.
-    5. Parse the elf64-x86-64 header + program headers; for each
+    3. Open `\hamnix-kernel.elf` on the ESP, AllocatePool and read the
+       whole ELF in.
+    4. Parse the elf64-x86-64 header + program headers; for each
        PT_LOAD, memcpy `p_filesz` bytes from the file buffer to
-       `p_paddr`, then memset `p_memsz - p_filesz` trailing bytes
-       to zero (BSS-within-segment).
-    6. Scan the loaded image for the multiboot1 magic and read the
-       Hamnix EFI handoff table planted right after the multiboot
-       header (`arch/x86/boot/header.S`) — extracts the address of
-       `_x86_start_after_loader` and the address of the
-       `boot_via_efi` flag.
-    7. Patch `boot_via_efi = 1` so `e820_init()` takes the EFI
-       fallback branch instead of the multiboot1 mmap parser.
-    8. `GetMemoryMap` + `ExitBootServices` (retry on stale MapKey).
-       Print `[hamnix] post-EFI handoff complete`.
-    9. Build identity-mapped page tables (1 GiB pages, 4 GiB span,
-       mirrors `arch/x86/boot/header.S`).
-   10. Load a kernel-shape GDT (CS=0x08, DS=0x10).
-   11. Set CR3, far-jump to flush CS, reload data segments,
-       `jmp *_x86_start_after_loader`. The kernel runs.
+       `p_paddr`, then zero the trailing `p_memsz - p_filesz` bytes.
+    5. Read the Hamnix EFI handoff table planted after the multiboot
+       header (`arch/x86/boot/header.S`) — extracts
+       `_x86_start_after_loader`, the `boot_via_efi` flag, and `&gdt64`.
+    6. Patch `boot_via_efi = 1` so `e820_init()` takes the EFI branch.
+    7. `GetMemoryMap` + `ExitBootServices` (retry on stale MapKey);
+       print `[hamnix] post-EFI handoff complete`.
+    8. Build identity-mapped page tables, `lgdt` the kernel's own
+       `gdt64`, set CR3, far-jump, `jmp *_x86_start_after_loader`.
+3. The kernel probes block devices (virtio-blk / AHCI / USB), scans
+   the GPT, and finds the ext4 root partition by its 0xEF53 superblock
+   magic. `mount_rootfs_partition()` reads `.hamnix-roots` and posts a
+   named file server for each subtree (`#sysroot`, `#distro`).
+4. The kernel binds `#sysroot` at `/`, then ELF-loads `/init` directly
+   off ext4 (a fd-less ext4 read path, `_ns_ext4_slurp_by_id` in
+   `fs/vfs.ad`, because `/init` loads before any user fd table exists).
+5. `/init` execs `/bin/hamsh /etc/rc.boot`; both resolve off `sysroot/`
+   through the inherited bind. hamsh-as-PID-1 runs the rc and drops to
+   an interactive shell.
 
-  Verified by the UEFI half of `scripts/test_iso_qemu.sh`: three
-  markers in order — `[hamnix] EFI entry reached`, `[hamnix] post-EFI
-  handoff complete`, and the kernel-side `cpio: registered N files
-  from initramfs` (proves we got past e820 → memblock → cpio_init,
-  i.e. the EFI handoff is end-to-end functional).
+There is **no embedded cpio root** in the shipped image: the kernel
+links against the cpio symbol (`initramfs_cpio_base`) but `build_img.sh`
+fills it with a TRAILER-ONLY (empty) cpio (`HAMNIX_CPIO_EMPTY=1` in
+`scripts/build_initramfs.py`). The live system boots entirely off the
+ext4 root. (The cpio machinery is retained only for the developer
+`-kernel` path of §1.)
 
-### Why two binaries instead of one hybrid file
+Verified end-to-end by `scripts/test_img_uefi_boot.sh` — see §"Test
+under QEMU" below.
 
-Linux's bzImage starts with an MZ stub at file offset 0 and is recognised
-as BOTH a multiboot kernel (by GRUB) AND a PE/COFF EFI application (by
-firmware). That works because **bzImage is a flat blob, not an ELF** —
-Linux's vmlinux (the ELF) is wrapped inside bzImage, but vmlinux itself
-is not what UEFI loads.
+### Why two separate binaries (stub + kernel) instead of one hybrid file
+
+The stub and the kernel are two separate files on the ESP
+(`\EFI\BOOT\BOOTX64.EFI` + `\hamnix-kernel.elf`), and the stub loads the
+kernel at runtime. The alternative — merging them into one hybrid binary
+the way Linux's bzImage is both a multiboot kernel and a PE/COFF EFI
+application — was investigated and abandoned. bzImage works because it
+is a **flat blob, not an ELF**: Linux's vmlinux (the ELF) is wrapped
+inside bzImage, and vmlinux itself is not what UEFI loads.
 
 The Hamnix kernel binary is an ELF (compiled with `--target=x86_64-bare-metal`
 through the Adder compiler + `ld -m elf_x86_64`). An ELF starts with
 `\x7fELF` at file offset 0; a PE/COFF starts with `MZ`. The same first
-four bytes can't be both magic numbers, so Hamnix takes the simpler
-split-output approach:
+bytes can't be both magic numbers, so Hamnix keeps two outputs:
 
 - `build/hamnix-kernel.elf` — true `elf64-x86-64` higher-half kernel
-  ELF (linked at `0xffffffff80000000`), multiboot1-loaded by GRUB.
+  ELF (linked at `0xffffffff80000000`), loaded by the stub at runtime
+  (and, on the developer `-kernel` path, by GRUB's multiboot1 loader
+  via the shim in §1).
 - `build/hamnix-bootx64.efi` — true PE32+ EFI_APPLICATION, x86-64,
-  subsystem 10.
+  subsystem 10 (the stub).
 
-Both are placed in the ISO; the BIOS / UEFI firmware pick the right
-one. When the EFI stub grows the ability to chain-load the kernel ELF
-from the ISO9660 filesystem, it'll do so the same way GRUB-EFI does
-today (UEFI Simple File System Protocol → read ELF → copy PT_LOADs →
-jump to entry), but without a 200 KiB GRUB-EFI dependency.
+Both are copied onto the ESP by `build_img.sh`; UEFI launches the stub,
+which SFSP-loads the kernel ELF off the same ESP.
 
-#### Why the "merge them into one hybrid" plan was abandoned
+#### Historical: why the "merge them into one hybrid" plan was abandoned
+
+> The following records the M16.124 diagnosis. It is HISTORICAL design
+> rationale, not current behaviour — the two-file (stub + kernel) split
+> above is what ships.
+
 
 The M16.111 + M16.120 wave was structured around an explicit followup:
 merge `efi_stub.S` and the kernel ELF into a single hybrid binary so
@@ -167,14 +200,16 @@ PATH A from the M16.124 diagnosis is now the production UEFI path:
 
 **Implementation notes worth recording (the B5 we discovered):**
 
-- **B5 (file-system limit):** OVMF on optical media only accepts a
-  FAT12 El Torito UEFI alt-platform image. A FAT16 or FAT32 ESP at
-  the same LBA range fails BdsDxe loading with "Not Found", even
-  when the image is otherwise valid and `BOOTX64.EFI` is present.
-  `scripts/build_iso.sh` therefore formats the wide ESP with
-  explicit `mformat -h 64 -s 32 -t <tracks>` geometry (FAT12 by
-  default, no `-F`) — FAT12 caps the volume at 32 MiB, comfortably
-  enough for our `~3.8 MB` kernel + `~8 KB` stub plus headroom.
+- **FAT ESP geometry:** `scripts/build_img.sh` formats the GPT
+  ESP (partition 1) with explicit `mformat -h 64 -s 32 -c 32`
+  geometry (FAT12) — comfortably enough for our `~3.8 MB` kernel +
+  `~8 KB` stub plus headroom in the 32 MiB ESP. *(Historical: the
+  retired optical-media ISO path required FAT12 specifically because
+  OVMF on optical media only accepted a FAT12 El Torito UEFI
+  alt-platform image — a FAT16/FAT32 ESP at the same LBA range failed
+  BdsDxe loading with "Not Found". That constraint no longer applies
+  to the GPT disk image, which is read as an `if=virtio` block
+  device, not optical media.)*
 - **PE32+ image-base relocation:** the stub has no `.reloc` table,
   so UEFI relocates the image but DOES NOT fix up address-typed
   data in `.rdata`. The GDT-descriptor base AND the far-jump
@@ -188,13 +223,15 @@ PATH A from the M16.124 diagnosis is now the production UEFI path:
   16:32 far jump (offset is 4 bytes, not 8). To get a 16:64 far
   jump we use the `rex.w ljmp *mem` form, encoding REX.W as a
   prefix byte. GAS rejects the more obvious `ljmpq` spelling.
-- **Wide-ESP packaging:** the grub-mkrescue ISO is a polyglot — the
-  same byte ranges are simultaneously ISO9660 file data AND GPT
-  partition contents AND El Torito boot images. The shipped recipe
-  builds the ISO from scratch via `xorriso -as mkisofs` (mimicking
-  grub-mkrescue's argument shape) with a pre-built FAT12 wide
-  efi.img staged upfront — both the El Torito UEFI record AND the
-  GPT ESP then reference the same wide image from the start.
+- **Disk-image packaging (current):** `scripts/build_img.sh` builds a
+  raw GPT disk image (`build/hamnix.img`) with `parted` — partition 1
+  is the FAT ESP (esp flag, carrying the stub + kernel ELF), partition
+  2 is the ext4 root. There is no ISO polyglot anymore. *(Historical:
+  the retired ISO recipe built a grub-mkrescue-shape polyglot via
+  `xorriso -as mkisofs`, where the same byte ranges were
+  simultaneously ISO9660 file data, GPT partition contents, and El
+  Torito boot images, all referencing one pre-built FAT12 wide
+  efi.img.)*
 
 #### Alternative path (not shipped)
 
@@ -208,83 +245,70 @@ PATH A from the M16.124 diagnosis is now the production UEFI path:
   signed-EFI / Secure-Boot push needs a sb-signable single-file
   image.
 
-### What the build script does to make UEFI direct
+### What the build script assembles
 
-`scripts/build_iso.sh` post-processes the grub-mkrescue ISO to swap out
-the GRUB-EFI BOOTX64.EFI for our stub in all three places grub-mkrescue
-exposes it:
+`scripts/build_img.sh`:
 
-1. The ESP partition (GPT partition 2) bytes are rewritten in place via
-   `dd` — most UEFI firmware reads the ESP via GPT, not El Torito.
-2. The ISO9660 file `/efi/boot/bootx64.efi` is replaced with `xorriso
-   -update` for firmware that reads the ISO9660 tree directly.
-3. The `/efi.img` file (a copy of the ESP exposed as a regular ISO file,
-   used by some El Torito implementations) inherits the in-place rewrite
-   because its sectors overlap the GPT partition's sectors.
-
-A pair of SHA-256 checks at the end of the script confirms both visible
-copies of BOOTX64.EFI match our stub byte-for-byte.
+1. Rebuilds userland + modules, then builds the ext4 rootfs partition
+   image (`scripts/build_rootfs_img.py`, staging `sysroot/` + `distro/`
+   + `.hamnix-roots`).
+2. Builds a TRAILER-ONLY (empty) cpio so the kernel still links against
+   the `initramfs_cpio_base` symbol but carries no embedded userland
+   (`HAMNIX_CPIO_EMPTY=1`).
+3. Compiles the kernel ELF and assembles the native PE/COFF stub from
+   `arch/x86/boot/efi_stub.S`.
+4. Builds a FAT12 ESP image holding `\EFI\BOOT\BOOTX64.EFI` (the stub)
+   + `\hamnix-kernel.elf`. FAT12 with explicit geometry because OVMF on
+   Debian rejects FAT16/FAT32 ESPs.
+5. Lays out a GPT disk with `parted` (ESP partition 1 with the `esp`
+   flag, ext4 partition 2), `dd`s both filesystem images into their
+   partition offsets, and verifies the ext4 0xEF53 magic landed at the
+   right byte offset.
 
 ### Required Debian packages
 
 ```sh
-sudo apt-get install grub-pc-bin grub-efi-amd64-bin xorriso mtools \
-    parted dosfstools binutils ovmf
+sudo apt-get install mtools binutils e2fsprogs parted ovmf
 ```
 
-`ovmf` is only needed for testing the UEFI path under QEMU.
+`ovmf` is only needed for testing the boot under QEMU.
 
 ### Test under QEMU
 
-Three test scripts cover the hybrid ISO:
+`scripts/test_img_uefi_boot.sh` is the acceptance gate. It boots
+`build/hamnix.img` under OVMF attached as a **disk** (`if=virtio`),
+exactly the way a shipped install boots:
 
 ```sh
-# Combined: runs BOTH paths, prints a final summary table.
-bash scripts/test_iso_qemu.sh
-
-# Dedicated: runs just the BIOS path and prints `[test_bios_boot] PASS`.
-bash scripts/test_bios_boot.sh
-
-# Dedicated: runs just the UEFI path and prints `[test_uefi_boot] PASS`.
-bash scripts/test_uefi_boot.sh
+bash scripts/test_img_uefi_boot.sh
 ```
 
-The dedicated scripts are the preferred entry points for CI: they have
-predictable PASS markers (`[test_bios_boot] PASS` / `[test_uefi_boot] PASS`)
-that scale easily across cron jobs that want one pass-or-fail line per
-boot path, and they skip cleanly when the relevant prerequisite is
-missing (`test_uefi_boot.sh` prints `SKIP` when OVMF isn't installed).
+It asserts, in order:
 
-What each path actually does:
+- `Hamnix kernel booting` — kernel banner; proves the EFI stub
+  SFSP-loaded the kernel ELF and jumped into it.
+- `handing off to interactive shell` — shell-ready marker.
+- Typed commands resolve OFF EXT4: `ls /bin` lists the native toolset
+  and there is **zero** `command not found` (the keystone assertion —
+  proves the kernel-bound `#sysroot` at `/` is serving `/bin` off the
+  ext4 partition).
 
-- **BIOS pass**: `qemu-system-x86_64 -cdrom build/hamnix.iso` — SeaBIOS
-  picks up the MBR, hands off to GRUB, which loads the multiboot kernel.
-  Banner check: `Hamnix kernel booting`.
-- **UEFI pass**: `qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd
-  -cdrom build/hamnix.iso` — OVMF reads the ESP, launches
-  `BOOTX64.EFI` directly (= our stub).
-  Banner checks (in order):
-  - `[hamnix] EFI entry reached`        — PE/COFF entry reached.
-  - `[hamnix] post-EFI handoff complete` — `ExitBootServices()`
-    returned `EFI_SUCCESS`; firmware is out of the boot path.
-  - `Hamnix kernel booting`             — kernel banner; proves the
-    EFI ELF loader handed off cleanly into start_kernel().
+It skips cleanly (exit 0) when `/dev/kvm` or OVMF firmware is
+unavailable.
 
-The combined `test_iso_qemu.sh` script additionally asserts the deeper
-marker `cpio: registered N files from initramfs` (proves start_kernel
-ran past e820 -> memblock -> cpio_init); the dedicated `test_uefi_boot.sh`
-stops at the kernel banner so a kernel-side regression past the banner
-shows up in unrelated tests, not in the boot test.
+> **Legacy / BIOS boot is dropped.** There is no GRUB, grub-mkrescue,
+> El-Torito, hybrid-MBR, or SeaBIOS path. `scripts/test_bios_boot.sh`
+> now SKIPs unconditionally. The older `scripts/test_iso_qemu.sh` /
+> `test_uefi_boot.sh` ISO tests target the deprecated ISO shim; the
+> disk-image gate above is the path to use.
 
-As of M16.125, the UEFI pass reaches the same depth as the BIOS
-pass: PATH A (UEFI-side ELF loader baked into `efi_stub.S`) is the
-shipped UEFI boot path.
+#### UEFI boot timing (measured — HISTORICAL, ISO path)
 
-If you only have OVMF locally, set `SKIP_UEFI=1` to skip the UEFI pass
-of `test_iso_qemu.sh`. `test_uefi_boot.sh` auto-detects the missing
-firmware and prints `[test_uefi_boot] SKIP`.
-
-#### UEFI boot timing (measured)
+> These numbers were measured on the now-deprecated ISO path (which
+> still booted from an embedded cpio, hence the `cpio: registered N
+> files` marker). The EFI-stub portion (markers 1–4) is unchanged on
+> the disk-image path; the disk image asserts on the
+> `handing off to interactive shell` marker instead of the cpio one.
 
 Per-marker wall-clock latencies from a clean QEMU-launch start (OVMF
 edk2-stable + ~22 MB higher-half ELF kernel, `HAMNIX_CPIO_LEAN=1`,
@@ -316,20 +340,20 @@ help a single-file linear read at this scale.
 
 ### Write to a USB stick
 
-The ISO is *isohybrid*: writing it raw to a block device produces a
-bootable USB stick.
+`build/hamnix.img` is a raw GPT disk image: writing it byte-for-byte to a
+block device produces a bootable USB stick.
 
 ```sh
-sudo dd if=build/hamnix.iso of=/dev/sdX bs=4M status=progress conv=fsync
+sudo dd if=build/hamnix.img of=/dev/sdX bs=4M status=progress conv=fsync
 sync
 ```
 
 Replace `/dev/sdX` with your actual USB device. **Confirm with `lsblk`
 first.** `dd if=... of=/dev/sda` will happily overwrite your system disk.
 
-A USB stick written this way is bootable both from legacy BIOS (via the
-MBR boot code) and from UEFI firmware (which sees the EFI system
-partition).
+A USB stick written this way is bootable from **UEFI firmware only**
+(which reads the GPT and launches `\EFI\BOOT\BOOTX64.EFI` off the ESP).
+There is no legacy/BIOS MBR boot path — enable UEFI in firmware setup.
 
 ## 3. Real-hardware boot
 
@@ -338,37 +362,35 @@ write, firmware boot menus per vendor, expected hardware coverage,
 known limitations, and how to report issues), see
 [`REAL_HARDWARE.md`](REAL_HARDWARE.md).
 
-Tested-on / known-working list (extend as we verify on more machines):
+Tested-on / known-working list (extend as we verify on more machines).
+Hamnix is UEFI-only; all current boots are UEFI:
 
 | Vendor / Model        | Mode | Result | Notes                |
 | --------------------- | ---- | ------ | -------------------- |
-| QEMU (SeaBIOS, 10.0)  | BIOS | works  | scripts/test_bios_boot.sh PASS |
-| QEMU (OVMF, edk2)     | UEFI | works  | scripts/test_uefi_boot.sh PASS — direct PE/COFF stub, SFSP-loads `\hamnix-kernel.elf` from the ESP, reaches `start_kernel()` and beyond (M16.125 PATH A) |
-| Intel Skull Canyon NUC | BIOS/UEFI | boots to `hamsh`, USB keyboard works | Primary real-hardware bring-up target as of 2026-05-25 (M16.139 + L-shim USB-HC bridge `f426aee`). |
-| Asus i5-4210U (Haswell ULT) | BIOS | **currently crashes during boot** | Was confirmed earlier (M16.156); regressed in a subsequent wave. Preserved for regression observation, not a current bring-up target. See [`REAL_HARDWARE.md`](REAL_HARDWARE.md). |
-| Asus i5-4210U         | UEFI | not currently re-confirmed | The Asus crashes earlier in boot than the UEFI/BIOS divergence point. |
+| QEMU (OVMF, edk2)     | UEFI | works  | scripts/test_img_uefi_boot.sh PASS — boots `build/hamnix.img` as a virtio disk; PE/COFF stub SFSP-loads `\hamnix-kernel.elf`, kernel boots off the ext4 root |
+| Intel Skull Canyon NUC | UEFI | boots to `hamsh`, USB keyboard works | Primary real-hardware bring-up target as of 2026-05-25 (M16.139 + L-shim USB-HC bridge `f426aee`). |
+| Asus i5-4210U (Haswell ULT) | UEFI | **currently crashes during boot** | Booted to `hamsh` earlier in Legacy/BIOS (M16.156, HISTORICAL — that path is now retired); regressed in a subsequent wave. Preserved for regression observation, not a current bring-up target. See [`REAL_HARDWARE.md`](REAL_HARDWARE.md). |
 
 When testing on real hardware:
 
 1. Plug in a serial cable. The kernel currently only outputs to the
    16550A UART at COM1 (0x3F8); there's no VGA console output for
-   diagnostics past the framebuffer smoke test. The new EFI stub also
+   diagnostics past the framebuffer smoke test. The EFI stub also
    writes its marker to COM1, so the same cable works for the UEFI
    bringup check.
-2. Enable "legacy BIOS" / "CSM" mode on the firmware if you want the
-   BIOS path. Otherwise the UEFI path is preferred (no GRUB needed).
-3. Disable Secure Boot — the EFI stub is not signed (and GRUB-EFI on
-   the BIOS-fallback path isn't signed either).
+2. Boot in UEFI mode. Hamnix is UEFI-only — there is no BIOS/CSM path.
+3. Disable Secure Boot — the EFI stub is not signed.
 
 ## 4. Known limitations / next steps
 
-- **UEFI direct boot reaches `start_kernel()`** — M16.125 shipped
-  PATH A. The PE/COFF stub now SFSP-loads `\hamnix-kernel.elf`
-  from the ESP, parses its program headers, copies PT_LOAD segments
-  to their LMAs, installs identity-mapped page tables + a kernel-
-  shape GDT, and `jmp _x86_start_after_loader`. Verified end-to-end
-  by `scripts/test_iso_qemu.sh`: BIOS and UEFI both reach
-  `cpio: registered N files from initramfs`.
+- **UEFI direct boot reaches `start_kernel()` and beyond** — the
+  PE/COFF stub SFSP-loads `\hamnix-kernel.elf` from the ESP, parses
+  its program headers, copies PT_LOAD segments to their LMAs, installs
+  identity-mapped page tables + the kernel's `gdt64`, and
+  `jmp _x86_start_after_loader`. Verified end-to-end by
+  `scripts/test_img_uefi_boot.sh`, which boots `build/hamnix.img` as a
+  virtio disk all the way to the interactive shell with commands
+  resolving off the ext4 root.
 - **EFI memory-map memblock window walker landed.** The stub saves
   the UEFI memory map in `efi_mmap_buf` (16 KiB) with descsize at
   `efi_mmap_descsize`, and `e820_init()` now walks it as the primary
@@ -394,22 +416,15 @@ When testing on real hardware:
   legacy assumptions (PCI bus 0, no PCIe ECAM). Real-hardware systems
   will need MCFG-based config space access — already implemented in
   the kernel but only smoke-tested under QEMU.
-- **Install path shipped**: the ISO carries `etc/install.hamsh`, a
-  7-step Debian-installer-shape script driven by `hpm install`
-  against an ISO-local mini-repo at `/iso-packages/`. It lays down
-  GPT + partitions on the target, mkfs's ESP + rootfs, then runs
-  `hpm install hamnix-base` (a METAPACKAGE that pulls in every
-  component — init, hamsh, coreutils, net, sshd, hpm, fs tools,
-  drivers, installer-tools, bootloader — via `depends:`), followed
-  by `hpm install linux-debian-12` for the Debian runtime, prompts
-  for hostowner credentials, and plants `/etc/passwd` +
-  `/etc/shadow` on the installed disk. The rootfs
-  ext4 partition is created small and grown to fit the target disk
-  on first boot. `scripts/test_installer_full.sh` exercises the
-  full loop (build ISO → install → reboot from disk → first-boot
-  grow + idempotent second boot) and PASSES end-to-end as of
-  2026-05-27.
-- **GRUB is still on the ISO for BIOS**: shipping GRUB is fine for
-  now. Once the EFI stub does real kernel handoff and a separate
-  BIOS-mode 16-bit MBR loader is in place, GRUB can be dropped
-  entirely — the ISO will carry only Hamnix binaries.
+- **Installed-system image shipped**: `build/hamnix.img` is already
+  shaped like an installed system (ESP + ext4 root with `#sysroot` +
+  `#distro` subtrees of one filesystem), so the common case is "write
+  the image to a disk and boot." `etc/install.hamsh` remains an
+  `hpm install`-driven Debian-installer-shape script for laying a
+  fresh system down onto a target disk (GPT + partitions, mkfs ESP +
+  ext4 rootfs, `hpm install hamnix-base` + `linux-debian-12`, hostowner
+  credentials, ext4 grow-to-fit on first boot).
+- **No GRUB / no BIOS**: the native PE/COFF stub is the first Hamnix
+  code that runs under UEFI; there is no GRUB anywhere in the boot
+  path, and no legacy BIOS path at all. The image carries only Hamnix
+  binaries.

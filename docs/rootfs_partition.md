@@ -1,40 +1,57 @@
-# Rootfs partition — Plan 9-shape, two-medium layout
+# Rootfs partition — Plan 9-shape, named roots on one ext4
 
 ## TL;DR
 
-Hamnix's ISO carries the kernel ELF on a small ESP and a separate
-ext4 partition (`/dev/...p3` on the live medium) for the bulk of
-distro content (real Debian apt/dpkg, busybox, future user data).
-At boot the kernel auto-discovers the ext4 partition, reads its
-`.hamnix-roots` sentinel for the name (today: `distro`), and
-registers it in the named file-server stack as `#distro`.
-Userspace `etc/rc.boot` then `bind`s `'#distro'` at `/n/distros`
-in the init namespace and at `/` inside the
-`linux = ns clean { ... }` recipe — so:
+Hamnix ships a UEFI-only GPT disk image, `build/hamnix.img`, built by
+`scripts/build_img.sh`. It has a small FAT ESP (the PE/COFF stub +
+kernel ELF) and **one** ext4 partition that holds the entire live
+system. That single ext4 carries a `.hamnix-roots` sentinel at its
+root with one `<word> <relpath>` line per **named root**:
 
-- The shell sees the rootfs at **`/n/distros/`** (read/write).
-- The Linux namespace sees the rootfs at **`/`** (read/write).
-- The shell's own `/`, `/etc`, `/bin`, … stay Hamnix-native (cpio).
-- `apt install foo` from inside `enter linux { ... }` lands at
-  `/usr/bin/foo` in the Linux ns → on the partition → visible to
-  the shell at `/n/distros/usr/bin/foo`. **The shell's `/usr/bin/`
-  is unaffected.**
+```
+sysroot   sysroot
+distro    distro
+```
 
-This is the "1 GB+ live USB" model the user asked for (2026-05-26):
-no FAT12 ceiling on the rootfs, the shell can write to the partition,
-and Linux-ns writes can't shadow Hamnix paths.
+Each line registers a named file server: `#sysroot` (the native Adder
+userland) and `#distro` (a minimal Debian). These are **subtrees of
+the one ext4** — they share its free space; they are NOT separate
+partitions. (Future per-user home roots join the same sentinel and
+draw from the same pool.) On install to a real disk the ext4 grows to
+fill the disk and every root draws from one common pool. Isolation
+between roots comes from the namespace / file-server layer, not from
+partitioning.
 
-> **Install loop status (2026-05-27).** The full install loop is
-> now exercised end-to-end by `scripts/test_installer_full.sh` —
-> build ISO → boot ISO → run `etc/install.hamsh` against `vdb` →
-> reboot from the installed disk → first-boot ext4 grow-to-fit
-> (`ext4_resize_grow`, `f12b33a`+`1c19819`+`780bdd4`) → second
-> boot idempotent. The installer is now `hpm install`-driven
-> against an ISO-local mini-repo (`etc/install.hamsh` step 4-5),
-> not raw `dd`. See [`packages.md`](packages.md) for the package
-> format and the 5 v1 packages live at `https://255.one/`.
+At boot the kernel auto-discovers the ext4 partition by its 0xEF53
+superblock magic, reads `.hamnix-roots`, posts `#sysroot` + `#distro`,
+**binds `#sysroot` at `/`**, and ELF-loads `/init` directly off ext4.
+The native shell's `/`, `/bin`, `/etc` are therefore served from
+`sysroot/` on the partition. The `linux = ns clean { ... }` recipe in
+`etc/rc.boot` then binds `#distro` at `/` inside its hermetic
+namespace — so:
 
-## Why this exists (the FAT12 ceiling)
+- The native shell sees `/`, `/bin`, `/etc` served from `sysroot/`.
+- The Linux namespace sees `/` served from `distro/`.
+- `apt install foo` from inside `enter linux { ... }` lands in the
+  `distro/` subtree, NOT in the shell's `sysroot/`-backed paths.
+
+> **Note (in flight, not yet landed).** A separate change to fully
+> sandbox/confine apt writes within the `#distro` root is still being
+> worked. This doc describes the root MODEL (named servers as
+> shared-space subtrees of one ext4); it does NOT claim apt writes are
+> sandboxed today.
+
+> **No cpio in the live root.** The shipped image carries a
+> trailer-only (empty) cpio (`HAMNIX_CPIO_EMPTY=1`); the live system
+> boots entirely off the ext4 root. The in-kernel cpio machinery is
+> retained only for the developer `-kernel` test path, which still
+> boots from an embedded cpio.
+
+## Historical: why this layout exists (the FAT12 ceiling)
+
+> HISTORICAL background — the original two-medium (ESP + ext4)
+> rationale. The current image is a GPT disk (not a hybrid ISO), but
+> the reason for keeping the bulk content off the FAT ESP is the same.
 
 Pre-2026-05-26, the kernel ELF embedded a `cpio` initramfs containing
 EVERYTHING — userland binaries, real Debian apt/dpkg, busybox, the
@@ -45,64 +62,65 @@ the ELF, and the FAT12 spec's 4084-cluster maximum capped the ESP at
 There was no way to grow past 250 MiB without leaving the ESP.
 
 Linux live USBs solve this with two partitions: a small ESP holding
-just the kernel + initramfs + bootloader, and a separate ext4/squashfs
-partition the kernel mounts at boot. Hamnix now does the same.
+just the kernel + bootloader, and a separate ext4 partition the
+kernel mounts at boot. Hamnix does the same.
 
-## Partition layout (ISO)
+## Partition layout (`build/hamnix.img`)
 
-The ISO emitted by `scripts/build_iso.sh` is a GPT-partitioned hybrid
-image:
+The GPT disk image emitted by `scripts/build_img.sh`:
 
 | # | Type | Contents                                                  |
 |---|------|-----------------------------------------------------------|
-| 1 | BIOS boot   | GRUB i386-pc core + hybrid MBR boot code           |
-| 2 | EFI System (ESP, FAT12) | kernel ELF + native PE/COFF stub @ `\EFI\BOOT\BOOTX64.EFI` |
-| 3 | Linux filesystem (0x83) | ext4 image staged by `scripts/build_rootfs_img.py` |
+| 1 | EFI System (ESP, FAT12, ~32 MiB) | native PE/COFF stub @ `\EFI\BOOT\BOOTX64.EFI` + `\hamnix-kernel.elf` |
+| 2 | Linux filesystem (ext4, ~512 MiB) | the whole live system, staged by `scripts/build_rootfs_img.py` |
 
-Partition 3 is the "rootfs" / "distrofs" partition. It's an ext4
-filesystem with no journal (read-mostly), built via `mkfs.ext4 -d
-<staging-dir>` so all bytes are baked at build time.
+Partition 2 is the single ext4 that backs every named root. It's an
+ext4 filesystem with no journal (read-mostly), built via `mkfs.ext4 -d
+<staging-dir>` so all bytes are baked at build time. Its top level is:
+
+```text
+ext4 partition root
+├── .hamnix-roots        (sentinel: sysroot -> sysroot/, distro -> distro/)
+├── sysroot/             (native Adder tools + /init + /etc; #sysroot)
+└── distro/              (minimal Debian apt/dpkg/busybox closure; #distro)
+```
 
 ## How the kernel discovers it
 
 At boot, `init/main.ad`'s `start_kernel()` calls
 `mount_rootfs_partition()` after `block_smoke_test()`. The function
 walks every registered block device (vda from virtio-blk; sd0pN from
-AHCI; etc.) and reads its ext4 superblock area. Any device whose
+AHCI; USB; etc.) and reads its ext4 superblock area. Any device whose
 bytes 0x438..0x439 are `53 EF` (little-endian 0xEF53) is mounted via
 `ext4_init(slot)`. The kernel then reads the `.hamnix-roots`
 sentinel from the partition root (planted by
-`scripts/build_rootfs_img.py`) for the named-stack registration —
-today that file names the partition `distro`, so it lands as
-`#distro` in the per-name file-server stack (also as
-`#by-id/<partuuid>` in the persistent alias table).
+`scripts/build_rootfs_img.py`) and registers **each** declared entry
+in the per-name file-server stack — today `#sysroot` and `#distro`
+(also each as `#by-id/<partuuid>` in the persistent alias table).
 
 ```text
 [rootfs] scanning block devices for ext4 magic
-[rootfs] ext4 magic on slot 1 (vda3)
-[rootfs] mounted ext4 rootfs (slot=1, registered as #distro via .hamnix-roots sentinel)
+[rootfs] ext4 magic on slot 1 (vda2)
+[rootfs] .hamnix-roots: registered #sysroot -> sysroot/
+[rootfs] .hamnix-roots: registered #distro -> distro/
 ```
 
-If no ext4 partition is found (e.g. `-kernel ELF` boot with no
-rootfs disk attached), the kernel logs `[rootfs] no ext4 partition
-found` and continues. The init namespace falls back to cpio-only;
-the `linux = ns clean { bind '#distro' / ; ... }` recipe will see
-`'#distro'` resolve to nothing and `enter linux { ... }` will fail
-with `-ENOENT` (use `HAMNIX_CPIO_LEAN=0` to ship the full cpio
-fallback).
+The kernel then **binds `#sysroot` at `/`** and ELF-loads `/init`
+directly off ext4 via a fd-less read path (`_ns_ext4_slurp_by_id` in
+`fs/vfs.ad`) — `/init` loads before any user fd table exists. `/init`
+execs `/bin/hamsh /etc/rc.boot`, which resolve through the inherited
+`#sysroot` bind to `sysroot/` on the partition.
+
+On the developer `-kernel` test path (no disk attached), the kernel
+logs `[rootfs] no ext4 partition found` and continues; that path boots
+from the embedded cpio root instead (the shipped image never does).
 
 ## How userspace exposes it (etc/rc.boot)
 
-The init namespace `bind`s `'#distro'` at `/n/distros` so the
-**shell has read/write access** to the partition's free space:
-
-```hamsh
-bind '#distro' /n/distros
-```
-
-The shell can:
-- `cat /n/distros/usr/bin/dpkg` — read the real Debian dpkg
-- `cat > /n/distros/home/me/myfile` — write user files to the partition
+The kernel already binds `#sysroot` at `/`, so the native shell's
+`/`, `/bin`, `/etc` come from `sysroot/` on the partition. The
+bootstrap rc re-asserts that bind (idempotent) and `source`s the full
+boot rc off the partition.
 
 The Linux namespace recipe `bind`s `'#distro'` at `/` inside the
 **isolated linux ns** (it's `ns clean`, a fresh empty Pgrp):
@@ -120,7 +138,7 @@ Inside `enter linux { /usr/bin/dpkg }`, the path `/usr/bin/dpkg`
 resolves through the linux ns mtab to the rootfs partition's ext4
 lookup.
 
-## The isolation guarantee (user direction 2026-05-26)
+## The isolation model (user direction 2026-05-26)
 
 > "the mounts a linuxname space uses is just diffrent mounts from
 > the init system on a clean ns. isolating the software int he
@@ -128,22 +146,33 @@ lookup.
 > installing via apt only lands in the linux ns/file servers and the
 > shells root view is uneffected."
 
-**What apt sees**: a `/` that's the rootfs partition. Writes go to
-`/usr/bin/<X>` etc.
+**What apt sees**: a `/` served from the `distro/` subtree (`#distro`)
+of the ext4. Writes go to `/usr/bin/<X>` etc. within that subtree.
 
-**What the shell sees**: its own Hamnix-native `/` (cpio), with the
-rootfs partition available at `/n/distros/`. apt's writes ARE visible
-— at `/n/distros/usr/bin/<X>` — but they DON'T shadow the shell's
-`/usr/bin/` (which is cpio-served from Hamnix's own binaries).
+**What the native shell sees**: a `/` served from the `sysroot/`
+subtree (`#sysroot`) of the same ext4. The Debian tree is a *different
+named root* on the same partition; the linux ns binds it at `/` only
+inside its `ns clean` recipe, so it doesn't appear in the shell's `/`.
 
-This is exactly Plan 9's namespace model: shared mounts visible at
-shared paths, per-namespace overlays for divergent views, and clean
-isolation when you start with `ns clean { ... }`.
+This is Plan 9's namespace model: two named file servers (`#sysroot`,
+`#distro`) backed by subtrees of one ext4, bound at different paths in
+different namespaces, with clean isolation when you start with
+`ns clean { ... }`.
+
+> Both subtrees share the one ext4's free space — they are not
+> separate partitions. **Filesystem-level confinement of apt's writes
+> to within `#distro` is a separate in-flight change and is NOT yet
+> landed**; what's described here is the namespace shape, not a
+> sandboxing guarantee.
 
 ## How to grow the rootfs
 
-The image's size is auto-picked by `scripts/build_rootfs_img.py`
-(staging bytes + ~96 MiB headroom). To force a specific size:
+`scripts/build_img.sh` ships ~512 MiB of ext4
+(`HAMNIX_ROOTFS_SIZE_MB`, default 512); the first-boot resize hook
+grows it to fill the disk on a real install. When building the rootfs
+image directly, the size is auto-picked by
+`scripts/build_rootfs_img.py` (staging bytes + ~96 MiB headroom). To
+force a specific size:
 
 ```bash
 HAMNIX_ROOTFS_SIZE_MB=512 python3 scripts/build_rootfs_img.py
@@ -159,19 +188,22 @@ MiB of free blocks at the end. `apt install foo` from inside the
 linux ns writes there; the kernel's ext4 write path already handles
 extent allocation + bitmap updates (see `fs/ext4.ad`).
 
-## How to skip it (tests booting without a rootfs disk)
+## How to skip it (the developer `-kernel` test path)
 
-Most kernel test scripts use QEMU's `-kernel ELF` mode, which loads
-the kernel ELF directly without attaching the ISO or rootfs disk.
-For those:
+The ~380 kernel test scripts use QEMU's `-kernel ELF` mode (via the
+`scripts/_kernel_iso.sh` / `scripts/run_x86_bare.sh` shim), which loads
+the kernel ELF directly without attaching a disk. That path STILL boots
+from an embedded cpio root (the cpio machinery is retained for exactly
+this reason). For those:
 
-1. Build the cpio with full debian closure (default): no env var needed.
+1. Build the cpio with the full debian closure (the `-kernel` path
+   default): no env var needed. (`build_img.sh` instead sets
+   `HAMNIX_CPIO_EMPTY=1` for the shipped image.)
 2. The kernel's `mount_rootfs_partition()` walk finds no ext4 partition
-   and logs the skip. The linux ns inside `etc/rc.boot` will have
-   `/ext` resolve to nothing.
+   and logs the skip; the namespace falls back to the cpio root.
 3. Tests that need apt/dpkg either (a) attach the rootfs.img as
-   `-drive file=build/hamnix-rootfs.img,if=virtio,format=raw` so
-   vda is the ext4 directly, OR (b) keep using the in-cpio fallback
+   `-drive file=build/hamnix-rootfs.img,if=virtio,format=raw` so the
+   ext4 is present, OR (b) keep using the in-cpio fallback
    (the default-on `HAMNIX_DEFAULT_REAL_DEBIAN=1` path).
 
 ## Common pitfalls (so we don't make these mistakes again)
@@ -191,14 +223,17 @@ crowds out the kernel build cache and risks OOM. The script stages
 to `build/.rootfs-stage/` (on the project disk, which is many TiB)
 and tears it down on exit.
 
-### Don't make the rootfs a global init-ns mount
-The init namespace must stay Hamnix-native. If the kernel binds
-the rootfs at `/` or `/usr/bin/` in the init Pgrp, the shell's own
-binaries get shadowed by the Debian tree's binaries. `apt install`
-would then overwrite Hamnix paths. The Plan 9 shape — mount the
-rootfs at `/n/distros` (shell-visible at a different path) and only
-overlay it at `/` inside the linux ns — is what preserves the
-isolation guarantee.
+### Don't bind the `distro/` subtree into the init namespace's `/`
+The init namespace's `/` is served from `#sysroot` (the native Adder
+userland). The `distro/` Debian subtree (`#distro`) must only be bound
+at `/` inside the `ns clean { ... }` linux recipe — NOT in the init
+Pgrp. If `#distro` were bound at `/` or `/usr/bin/` in the init Pgrp,
+the shell's own binaries would be shadowed by the Debian tree's
+binaries. Keeping `#sysroot` as the init `/` and overlaying `#distro`
+only inside the linux ns is what keeps the two roots separated.
+(Note: both are subtrees of one ext4 sharing free space; this is
+namespace separation, not filesystem-level confinement — the latter
+is a separate in-flight change.)
 
 ### Don't try to put the rootfs on the FAT12 ESP
 The whole point of this design is that the ESP stays SMALL (just
@@ -424,17 +459,27 @@ This design touched, all shipped:
 
 ## Files involved
 
-- `scripts/build_rootfs_img.py` — stage + mkfs.ext4 the rootfs image,
-                                 plant `.hamnix-roots`
-- `scripts/build_iso.sh` — build ISO, append rootfs as partition 3
-- `scripts/build_initramfs.py` — `HAMNIX_CPIO_LEAN=1` strips the
-                                 cpio's redundant debian copy
+- `scripts/build_rootfs_img.py` — stage `sysroot/` + `distro/` and
+                                 mkfs.ext4 the rootfs image; plant
+                                 `.hamnix-roots` (`sysroot` + `distro`)
+- `scripts/build_img.sh` — assemble the GPT disk image (FAT ESP +
+                          ext4 partition) → `build/hamnix.img`
+- `scripts/build_iso.sh` — DEPRECATED thin shim; delegates to
+                          `build_img.sh`
+- `scripts/build_initramfs.py` — `HAMNIX_CPIO_EMPTY=1` emits a
+                                 trailer-only cpio for the shipped image
+                                 (the kernel still links the cpio symbol)
+- `scripts/test_img_uefi_boot.sh` — OVMF acceptance gate: boots
+                                 `build/hamnix.img` as a disk
 - `kernel/block/blk.ad` — `blk_max_slots`, `blk_slot_in_use`,
                           `blk_slot_name` enumeration API
-- `init/main.ad` — `mount_rootfs_partition()` autodiscover hook
-- `etc/rc.boot` — `bind '#distro' /n/distros` + `linux = ns clean { bind '#distro' / ; ... }`
-- `fs/ext4.ad` — existing reader (already supports extent walks,
-                 directories, symlinks, file_create, ftruncate)
-- `fs/vfs.ad` — legacy `/ext` device-letter dispatch (kept for older
-                tests); the primary path is now `chan.ad`'s named stack
+- `init/main.ad` — `mount_rootfs_partition()` autodiscover hook; binds
+                  `#sysroot` at `/` and ELF-loads `/init` off ext4
+- `etc/rc.boot` — re-asserts `bind '#sysroot' /` (idempotent) +
+                  `linux = ns clean { bind '#distro' / ; ... }`
+- `fs/vfs.ad` — `_ns_ext4_slurp_by_id` (fd-less ext4 read for `/init`);
+                legacy `/ext` device-letter dispatch (kept for older
+                tests); the primary path is `chan.ad`'s named stack
+- `fs/ext4.ad` — reader (extent walks, directories, symlinks,
+                 file_create, ftruncate)
 - `docs/rootfs_partition.md` — this file

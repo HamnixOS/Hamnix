@@ -14,6 +14,22 @@ For the current end-state plus open blockers, see [README.md](README.md).
 For docs/architecture spec, see [docs/architecture.md](docs/architecture.md).
 For agent-orchestrated development workflow, see [README.md§Agent-orchestrated development](README.md#agent-orchestrated-development).
 
+> **Current boot model (read this before the milestone log below).** The
+> shipped artifact is now `build/hamnix.img` — a raw **UEFI-only** GPT
+> disk image (~546 MiB: a 32 MiB FAT ESP + a 512 MiB ext4 root
+> partition), built by `scripts/build_img.sh`. UEFI firmware launches
+> the native PE/COFF stub at `\EFI\BOOT\BOOTX64.EFI`, which ELF-loads
+> `\hamnix-kernel.elf` off the ESP; the kernel then finds the ext4 root
+> partition via its `.hamnix-roots` sentinel, binds `#sysroot` at `/`,
+> and ELF-loads `/init` directly off ext4. **There is no BIOS/legacy/CSM
+> path, no GRUB, and no bootable ISO** — `scripts/build_iso.sh` is now a
+> deprecation shim that delegates to `build_img.sh`. The in-kernel cpio
+> initramfs is retained **only** for the developer `-kernel` test path
+> (the shipped image carries an empty trailer-only cpio,
+> `HAMNIX_CPIO_EMPTY=1`). Many milestone rows below are date-stamped
+> historical records of the earlier hybrid-ISO / BIOS+UEFI model and are
+> preserved as history, not current state.
+
 ---
 
 ## Status

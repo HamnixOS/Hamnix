@@ -193,8 +193,10 @@ STATUS.md). What remains, off the critical path and parallelisable:
   names into the block tag; `mount /dev/sd0p1 /mnt` path-to-slot
   resolver.
 - [ ] ext4 mkfs multi-block-group layout; journal (jbd2). Installer
-  plumbing already has the ext4 write path; GRUB-install + MBR-write
-  still missing.
+  plumbing already has the ext4 write path; an on-target installer that
+  lays down a fresh `build/hamnix.img`-shape GPT disk (FAT ESP +
+  UEFI stub + ext4 root) is still missing. (No GRUB / MBR — the boot
+  path is the native UEFI stub.)
 
 ## Input
 

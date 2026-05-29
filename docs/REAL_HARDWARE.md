@@ -1,24 +1,28 @@
 # Installing and booting Hamnix on real x86_64 hardware
 
-This document is the practical, mechanical guide for putting a Hamnix
-install ISO on a USB stick, booting it on real x86_64 hardware, and
+This document is the practical, mechanical guide for putting the Hamnix
+disk image on a USB stick, booting it on real x86_64 hardware, and
 reporting what worked + what didn't.
 
-It **extends** [`BOOT.md`](BOOT.md) — that doc covers QEMU and the ISO
-build pipeline; this one covers the steps and expectations specific to
-physical machines.
+Hamnix is **UEFI-only**. The installable artifact is `build/hamnix.img`,
+a raw GPT disk image shaped like an installed system (built by
+`scripts/build_img.sh`). There is no BIOS/legacy/CSM boot path.
+
+It **extends** [`BOOT.md`](BOOT.md) — that doc covers QEMU and the
+disk-image build pipeline; this one covers the steps and expectations
+specific to physical machines.
 
 > **Real-hardware status (2026-05-25).** Hamnix boots end-to-end on
 > the **Intel Skull Canyon NUC** (primary bring-up target): kernel
 > → hamsh shell → USB keyboard input via the L-shim USB-HC bridge
 > (`f426aee`) → native binaries on PATH → `enter linux { /bin/sh }`
 > → `ping 127.0.0.1`. The **Asus i5-4210U (Haswell ULT)** booted to
-> hamsh in M16.156 (Legacy/BIOS), but currently **crashes during
-> boot** — preserved for regression observation, not a current
-> bring-up target. Other machine classes below are what *should*
-> work given the drivers shipped; "should" is not "tested" —
-> filing an issue with what you tried is how we turn "should"
-> into "tested".
+> hamsh in M16.156 over the (now-retired) Legacy/BIOS path, but
+> currently **crashes during boot** — preserved for regression
+> observation, not a current bring-up target. Other machine classes
+> below are what *should* work given the drivers shipped; "should" is
+> not "tested" — filing an issue with what you tried is how we turn
+> "should" into "tested".
 
 ## The 5-minute test
 
@@ -27,15 +31,15 @@ a target box you can power-cycle:
 
 ```sh
 # On the build host:
-bash scripts/build_iso.sh                           # ~30s if cached, ~3 min cold
-bash scripts/write_iso_to_usb.sh /dev/sdX           # confirm /dev/sdX first!
-# (the wrapper prompts for an explicit "yes" before any write)
+bash scripts/build_img.sh                           # ~30s if cached, ~3 min cold
+sudo dd if=build/hamnix.img of=/dev/sdX bs=4M conv=fsync status=progress  # confirm /dev/sdX first!
+sync
 ```
 
-Then plug the stick into the target box, enter the firmware boot menu
-(see vendor key table in §4), pick the USB device, and watch the
+Then plug the stick into the target box, enter the UEFI firmware boot
+menu (see vendor key table in §4), pick the USB device, and watch the
 serial console — or screen, if no serial cable. You're looking for
-the marker sequence in §5. Total time after the first ISO build is
+the marker sequence in §5. Total time after the first image build is
 < 5 min per attempt; report results to the GitHub issue tracker (§8).
 
 The rest of this doc unpacks each step.
@@ -62,13 +66,14 @@ supported.
 
 ### Confirmed real-hardware boots
 
-- **Intel Skull Canyon NUC** (2026-05-25, default ISO): boots
+- **Intel Skull Canyon NUC** (2026-05-25, default image): boots
   end-to-end. Kernel banner → boot checkpoints → hamsh interactive
   prompt → **USB keyboard input via the L-shim USB-HC bridge**
   (`f426aee` carries `xhci_pci_probe` end-to-end) → native binaries
   on PATH (`ls`, `cat`, `echo`) → `enter linux { /bin/sh }` (real
-  Debian busybox served from the rootfs partition mounted as
-  `#distro`) → `ping 127.0.0.1` (loopback shortcut, no NIC needed).
+  Debian busybox served from the `#distro` named root, the `distro/`
+  subtree of the ext4 partition) → `ping 127.0.0.1` (loopback
+  shortcut, no NIC needed).
   The `_xhci_v1_bringup` bare-metal sub-skip (§7) keeps the
   hand-rolled driver out of the MMIO stall. The xhci.ko load-chain
   global skip (`c444044`) was reverted in `2888b7c` —
@@ -98,26 +103,33 @@ supported.
 
 ### Boot path
 
-- **Legacy BIOS** — hybrid ISO MBR + GRUB legacy → multiboot1 →
-  `start_kernel()`. Covers most pre-2015 machines and any modern board
-  with CSM/legacy enabled.
-- **UEFI (no Secure Boot)** — hybrid ISO ESP carries the Hamnix
-  PE/COFF stub as `\EFI\BOOT\BOOTX64.EFI` (PE32+ subsystem 10). Firmware
-  launches it directly; no GRUB-EFI in the path. The stub SFSP-loads
-  `\hamnix-kernel.elf` from the ESP, copies PT_LOADs to their LMAs,
-  installs kernel page tables + GDT, calls `ExitBootServices`, and
-  jumps into `_x86_start_after_loader`. End-to-end verified through
-  the hamsh prompt (M16.126 PATH A; M16.138 GDT-handoff fix).
+- **UEFI (no Secure Boot)** — the only supported boot path. The
+  `build/hamnix.img` GPT disk image carries a FAT ESP (partition 1)
+  with the Hamnix PE/COFF stub as `\EFI\BOOT\BOOTX64.EFI` (PE32+
+  subsystem 10). Firmware launches it directly; there is no GRUB in
+  the path. The stub SFSP-loads `\hamnix-kernel.elf` from the ESP,
+  copies PT_LOADs to their LMAs, installs kernel page tables + GDT,
+  calls `ExitBootServices`, and jumps into `_x86_start_after_loader`.
+  The kernel then probes block devices, finds the ext4 root partition
+  (partition 2) via its `.hamnix-roots` sentinel, binds `#sysroot` at
+  `/`, and ELF-loads `/init` directly off ext4. End-to-end verified
+  through the hamsh prompt (M16.126 PATH A; M16.138 GDT-handoff fix).
+- **BIOS / legacy / CSM — dropped.** There is no GRUB, no El-Torito
+  ISO, no hybrid MBR, no multiboot1 handoff. Hamnix boots only via the
+  native UEFI stub. *(Historical: the Asus i5-4210U was first brought
+  up over a now-retired Legacy/BIOS GRUB path in M16.156.)*
 
 ### Display console
 
-- **VGA text mode** at 0xB8000 — works under BIOS boot. 80×25
-  characters (M16.18).
-- **EFI GOP framebuffer** — works under UEFI boot. Pixel framebuffer
-  parsed from the EFI system table at handoff, 8×16 bitmap glyphs
-  rendered into linear memory (M16.91).
+- **EFI GOP framebuffer** — the console on the UEFI boot path. Pixel
+  framebuffer parsed from the EFI system table at handoff, 8×16 bitmap
+  glyphs rendered into linear memory (M16.91).
+- **VGA text mode** at 0xB8000 — 80×25 characters (M16.18). Retained
+  for the developer `-kernel` test path; the shipped UEFI image uses
+  the GOP framebuffer, since UEFI firmware hands off in a graphics
+  mode, not VGA text.
 - **Serial console** at COM1 (16550A, 115200 8N1, no flow control) —
-  always on, regardless of boot path or video state. The kernel writes
+  always on, regardless of video state. The kernel writes
   the boot banner there before it touches video. Plug a serial cable
   in if anything goes wrong (`drivers/tty/serial/early_8250.ad`).
 
@@ -172,9 +184,13 @@ supported.
   to 32768 blocks (M16.51..M16.67, M16.137).
 - **FAT12 / FAT16 / FAT32 read** (`fs/fat.ad`) — BPB parse, FAT-chain
   walk, multi-component path lookup (M16.43..M16.46).
-- **isofs (ISO 9660)** — read-only; the install ISO itself uses it.
-- **initramfs cpio** (`fs/cpio.ad`) — populated from
-  `build/initramfs.cpio` at boot.
+- **isofs (ISO 9660)** — read-only; used by the developer `-kernel`
+  test path's ISO shim, not by the installed disk image.
+- **initramfs cpio** (`fs/cpio.ad`) — retained only for the developer
+  `-kernel` test path, where it is populated from
+  `build/initramfs.cpio` at boot. The shipped `build/hamnix.img`
+  carries an empty (trailer-only) cpio (`HAMNIX_CPIO_EMPTY=1`); its
+  userland lives on the ext4 root partition instead.
 - **/dev cdevs**: cons, time, pid, random, proc, mouse, cpuinfo,
   meminfo, uptime, loadavg, version, hostname (M16.131..M16.133).
   `/proc/<name>` paths translate to `/dev/<name>` for Linux-ABI
@@ -252,8 +268,8 @@ the surface below is still QEMU + OVMF verification only.
   under QEMU. Real ECAM hole at `0xE000_0000`-ish may be at a different
   address on real firmware.
 - **NIC ROM expansion / iPXE chaining** — Hamnix expects to be loaded
-  by GRUB directly or by the EFI stub. Netboot via PXE / iPXE chainload
-  is not implemented.
+  by the UEFI stub off the GPT disk image. Netboot via PXE / iPXE
+  chainload is not implemented.
 - **Secure Boot must be disabled in firmware setup.** The kernel image
   and EFI stub are unsigned; no Microsoft UEFI CA signature. Signed-EFI
   is a deferred milestone.
@@ -263,27 +279,32 @@ the surface below is still QEMU + OVMF verification only.
 
 ## 3. Producing a bootable USB stick
 
-### Build the ISO
+### Build the disk image
 
 From a Linux build host:
 
 ```sh
 git clone https://github.com/ruapotato/Hamnix.git
 cd Hamnix
-bash scripts/build_iso.sh          # produces build/hamnix.iso (~32 MB)
-file build/hamnix.iso              # should report:
-                                   #   DOS/MBR boot sector ... ISO 9660 ...
+bash scripts/build_img.sh          # produces build/hamnix.img (~546 MB)
+file build/hamnix.img              # should report:
+                                   #   DOS/MBR boot sector ... GPT ...
 ```
+
+`build/hamnix.img` is a raw GPT disk image: a 32 MiB FAT ESP
+(partition 1, carrying the UEFI stub + `hamnix-kernel.elf`) followed
+by a 512 MiB ext4 root partition (partition 2, carrying the userland
+and the `.hamnix-roots` sentinel). The total is ~546 MiB.
 
 Required Debian/Ubuntu packages:
 
 ```sh
-sudo apt-get install grub-pc-bin grub-efi-amd64-bin xorriso mtools \
-    parted dosfstools binutils ovmf
+sudo apt-get install mtools parted e2fsprogs dosfstools binutils ovmf
 ```
 
-(`ovmf` is only required if you want to smoke-test the ISO under QEMU
-via `bash scripts/test_uefi_boot.sh` before writing it to a stick.)
+(`ovmf` is only required if you want to smoke-test the image under
+QEMU via `bash scripts/test_img_uefi_boot.sh` before writing it to a
+stick.)
 
 ### Identify the USB device
 
@@ -300,68 +321,47 @@ your USB stick. The device path is `/dev/<NAME>` (typically `/dev/sdb`
 or `/dev/sdc` — **rarely `/dev/sda`**, since that's usually the system
 disk).
 
-### Write the ISO — recommended (Linux, with guard-rails)
+### Write the image — Linux
 
-```sh
-bash scripts/write_iso_to_usb.sh /dev/sdX           # replace sdX with the letter from lsblk
-```
-
-`scripts/write_iso_to_usb.sh` is a thin wrapper around `sudo dd` that:
-
-- refuses to run if `build/hamnix.iso` doesn't exist (and tells you to
-  run `bash scripts/build_iso.sh`),
-- refuses `/dev/sda` unless you also pass `--really-i-mean-sda`,
-- refuses targets bigger than 64 GiB unless you also pass `--force`
-  (HD-sized targets look more like an internal disk than a USB stick),
-- prints the device size + model + current partition table,
-- prompts for an explicit `yes` before doing anything destructive,
-- runs `sudo dd if=build/hamnix.iso of=/dev/sdX bs=4M conv=fsync
-  status=progress` followed by `sync`.
-
-It always uses `sudo`. Don't try to disable that — raw block-device
-writes need root. Run `bash scripts/write_iso_to_usb.sh --help` for the
-full flag list.
-
-### Write the ISO — manual (one-liners, copy-pastable)
-
-If you'd rather call `dd` directly:
-
-**Linux:**
+`build/hamnix.img` is a raw disk image — write it byte-for-byte to the
+USB stick with `dd`. **Confirm the target device first** (see above);
+`dd` will silently destroy whichever device you point it at.
 
 ```sh
 USB=/dev/sdX                       # replace X with the letter you confirmed above
 sudo umount ${USB}?* 2>/dev/null   # unmount any auto-mounted partitions
-sudo dd if=build/hamnix.iso of=$USB bs=4M conv=fsync status=progress
+sudo dd if=build/hamnix.img of=$USB bs=4M conv=fsync status=progress
 sync
 ```
+
+### Write the image — other operating systems
 
 **macOS:**
 
 ```sh
 diskutil list                                          # find the USB diskN
 diskutil unmountDisk /dev/diskN
-sudo dd if=build/hamnix.iso of=/dev/rdiskN bs=4m       # lowercase 4m on BSD/Darwin;
+sudo dd if=build/hamnix.img of=/dev/rdiskN bs=4m       # lowercase 4m on BSD/Darwin;
                                                        # /dev/rdiskN is the raw node (faster)
 sync
 diskutil eject /dev/diskN
 ```
 
-**Windows:** use **Rufus** in **DD Image mode** (NOT "ISO mode" — that
-treats `hamnix.iso` as a Windows installer image, which it isn't).
+**Windows:** use **Rufus** in **DD Image mode** (NOT "ISO mode").
 [balenaEtcher](https://etcher.balena.io/) also works. Power users:
 `dd for Windows` (from the [chrysocome.net distribution](http://www.chrysocome.net/dd))
 takes the same one-liner shape:
 
 ```bat
 :: list devices: dd --list
-dd if=build\hamnix.iso of=\\.\PhysicalDrive2 bs=4M --progress
+dd if=build\hamnix.img of=\\.\PhysicalDrive2 bs=4M --progress
 ```
 
 **FreeBSD / OpenBSD:** the GNU-style `bs=4M` flag is supported by the
 shipped `dd(1)`; the device node is `/dev/da0` etc., not `/dev/sd*`:
 
 ```sh
-doas dd if=build/hamnix.iso of=/dev/da0 bs=4M conv=fsync status=progress
+doas dd if=build/hamnix.img of=/dev/da0 bs=4M conv=fsync status=progress
 ```
 
 
@@ -389,11 +389,12 @@ Common keys by vendor:
    kernel image is unsigned; signed firmware will refuse to launch
    `BOOTX64.EFI`.
 2. **Set USB above the internal SSD/HDD** in boot priority.
-3. **UEFI mode** is preferred — set to "UEFI only" or to "UEFI + Legacy"
-   with UEFI first.
-4. **Legacy / BIOS / CSM mode** also works (and is what to fall back to
-   if UEFI hangs). Set to "Legacy only" or enable CSM.
-5. **AHCI mode for SATA** (not RAID). Some Dell / Lenovo boards ship
+3. **UEFI mode is required.** Set to "UEFI only". Hamnix has no
+   BIOS/legacy/CSM boot path — if the firmware boots the stick in CSM
+   mode it will not find a bootable device. If you only see "UEFI +
+   Legacy", make sure UEFI is preferred and the USB device is listed
+   under its UEFI entry in the boot menu.
+4. **AHCI mode for SATA** (not RAID). Some Dell / Lenovo boards ship
    in "RAID" mode and the AHCI driver won't match it. Look under
    "Storage" or "SATA Configuration".
 
@@ -409,9 +410,9 @@ fastest signal-of-life check is to plug in a USB-to-serial adapter and
 watch with `minicom -D /dev/ttyUSB0 -b 115200` (or `screen
 /dev/ttyUSB0 115200`).
 
-If you have NO serial cable: the same markers appear on the VGA text
-console (BIOS path) or the EFI GOP framebuffer (UEFI path) once the
-kernel reaches `vga_smoke_test()`. The earliest EFI-stub markers
+If you have NO serial cable: the same markers appear on the EFI GOP
+framebuffer once the kernel reaches `vga_smoke_test()`. The earliest
+EFI-stub markers
 (`[hamnix] EFI entry reached` etc.) are serial-only — without a cable
 you'll see the screen jump from firmware splash straight to
 `Hamnix kernel booting`. See §6 for the no-serial-cable photo workflow.
@@ -422,17 +423,17 @@ These markers are emitted in this order on every successful boot. If
 the box hangs at marker `N`, the next marker `N+1` points at the next
 thing to look at.
 
-**UEFI path** (the more common modern path):
+**UEFI path** (the only supported path):
 
 | # | Marker                                                  | What it means                                                              |
 | - | ------------------------------------------------------- | -------------------------------------------------------------------------- |
 | 1 | `[hamnix] EFI entry reached`                            | PE/COFF stub got control from firmware. ESP + BOOTX64.EFI are intact.      |
 | 2 | `[hamnix] post-EFI handoff complete`                    | `ExitBootServices()` returned success; firmware is out of the boot path.   |
-| 3 | `Hamnix kernel booting...`                              | start_kernel() reached; multiboot info or EFI memory map parsed.           |
+| 3 | `Hamnix kernel booting...`                              | start_kernel() reached; EFI memory map parsed.                             |
 | 4 | `Hamnix: trap_init done`                                | IDT installed; #PF / #GP / #DF handlers armed.                             |
 | 5 | smoke tests (`memblock_smoke_test`, `slab`, `ahci`, …)  | Core allocators + drivers self-checked.                                    |
 | 6 | `Hamnix: smp_processor_id() = 0`                        | per-CPU areas + LAPIC up; one CPU online (SMP is open work).               |
-| 7 | `cpio: registered N files from initramfs`               | initramfs unpacked; `/init` is visible.                                    |
+| 7 | block-device probe + `#sysroot` bound at `/`            | ext4 root partition found via `.hamnix-roots`; `/init` is visible off ext4.|
 | 8 | `syscall MSRs armed` / `[sched]` markers                | TSS + GDT loaded, ring-3 transition is about to fire.                      |
 | 9 | `[hamsh] M16.35 shell ready. Type 'help' or '/hello'.`  | Ring 3 reached, userspace runs. **You are booted.**                        |
 
@@ -443,18 +444,9 @@ ring-3-transition triple-fault and **removed in M16.157** once the
 bug was fixed (M16.156). A current kernel goes straight from the
 syscall-MSR markers to the hamsh prompt.
 
-**BIOS / legacy path** is the same from marker 3 onwards; markers 1 and
-2 are replaced with GRUB's own output:
-
-```
-SeaBIOS / vendor BIOS POST
-GRUB menu (2-second timeout)
-Loading Hamnix...
-[multiboot1 handoff — no Hamnix-specific marker until #3]
-Hamnix kernel booting...
-... (same as UEFI from #3 onward)
-[hamsh] M16.35 shell ready
-```
+On the developer `-kernel` test path (not the shipped image) the
+userland comes from the embedded initramfs instead, so marker 7 reads
+`cpio: registered N files from initramfs`.
 
 ### What it looks like when it freezes
 
@@ -464,13 +456,12 @@ likely causes:
 
 | Last line seen                              | Likely cause                                       |
 | ------------------------------------------- | -------------------------------------------------- |
-| (firmware splash, no Hamnix output at all)  | Wrong boot mode / Secure Boot still on / USB not in boot order |
-| GRUB menu, "Hamnix" entry highlighted but stuck | GRUB on legacy can't read the ISO9660 tree — try UEFI mode |
+| (firmware splash, no Hamnix output at all)  | Booted in CSM/legacy mode (unsupported) / Secure Boot still on / USB not in boot order — set firmware to UEFI only |
 | `[hamnix] EFI entry reached` then silence   | EFI stub reached but SFSP can't find `\hamnix-kernel.elf`. ESP corruption — re-dd the USB |
 | `[hamnix] post-EFI handoff complete` then silence | EFI memory map / page-table handoff failed on real silicon. New territory; capture the FULL serial log |
 | `Hamnix kernel booting` then triple-fault   | Almost certainly the M16.138 GDT path — should be fixed; if not, this is a regression |
 | `syscall MSRs armed` then silence / triple-fault | Ring-3-transition fault. M16.156 fixed the known Asus case (`fninit` + `CR4.OSXSAVE` + cleared `RFLAGS.IF`); a fresh occurrence on other silicon is new territory — capture the full serial log. See §7. |
-| `cpio: registered N files from initramfs` then silence | Userland init failed to find `/init`. Check the initramfs build |
+| `#sysroot` bound but no `/init` runs        | ext4 root partition mounted but `/init` missing or unreadable. Re-dd the USB; check the `build_img.sh` output |
 | `[xhci] HCRST timed out`                    | Likely SMM-owned controller. Try a USB 2.0 port; otherwise use PS/2 |
 | `[ahci] no port with ATA signature found`   | SATA controller is in RAID mode — flip to AHCI in firmware setup |
 | Kernel banner OK but no keystrokes echo     | PS/2 controller absent + xHCI HID didn't enumerate. Try a USB 2.0 port; serial-console input works for diagnostics |
@@ -536,10 +527,10 @@ existing issue rather than filing a new one.
   counter or timeout can help: control never returns from the `mov`
   to the kernel. The Asus i5-4210U exhibits the same class of hang
   at the halt+reset poll. Before this change the only way to boot
-  these machines was to rebuild the ISO with `ENABLE_XHCI_NO_INIT=1`;
+  these machines was to rebuild the image with `ENABLE_XHCI_NO_INIT=1`;
   now the default build boots them.
-- **How to force live xHCI on bare metal:** rebuild the ISO with
-  `ENABLE_XHCI_FORCE_INIT=1 bash scripts/build_iso.sh`. The marker
+- **How to force live xHCI on bare metal:** rebuild the image with
+  `ENABLE_XHCI_FORCE_INIT=1 bash scripts/build_img.sh`. The marker
   `/etc/xhci-force-init` is planted in the initramfs and
   `xhci_init()` runs the live bringup path — including the BAR-MMIO
   halt+reset poll. **You are accepting the risk that the box will
@@ -548,7 +539,7 @@ existing issue rather than filing a new one.
   validated the xHCI path works (or where you're actively
   debugging xHCI on real hardware and want the hang to surface).
 - **How to skip xHCI entirely (existing escape hatch):** rebuild
-  with `ENABLE_XHCI_NO_INIT=1 bash scripts/build_iso.sh`. The marker
+  with `ENABLE_XHCI_NO_INIT=1 bash scripts/build_img.sh`. The marker
   `/etc/xhci-no-init` is planted and `xhci_init()` returns
   immediately after the safe PCI find / print, before any BAR
   access. Functionally identical to the new bare-metal default for
@@ -578,10 +569,12 @@ existing issue rather than filing a new one.
 
 ### Asus i5-4210U — built-in keyboard does not work (OPEN)
 
-- **Symptom:** Hamnix boots all the way to the `hamsh` shell on this
-  Asus i5-4210U (Haswell ULT) laptop in Legacy/BIOS mode, but the
-  built-in keyboard produces nothing — Caps Lock doesn't toggle, no
-  keystroke reaches the shell.
+- **Symptom (historical, M16.156):** Hamnix booted all the way to the
+  `hamsh` shell on this Asus i5-4210U (Haswell ULT) laptop over the
+  now-retired Legacy/BIOS path, but the built-in keyboard produced
+  nothing — Caps Lock didn't toggle, no keystroke reached the shell.
+  (The box now crashes during boot under the UEFI-only path; see the
+  "Recently regressed" note in §1.)
 - **Diagnosis so far:** the atkbd path got an i8042 controller
   bring-up handshake, IRQ 1 wiring, and an ISA-edge IOAPIC redirect
   fix (`dbd40e6`) — all confirmed working under QEMU. On the real
@@ -608,12 +601,13 @@ existing issue rather than filing a new one.
   diagnostic scaffolding was stripped in M16.157. The Asus now boots
   to `hamsh`.
 
-### UEFI on the real Asus — not re-confirmed
+### UEFI on the real Asus — currently crashing
 
-UEFI direct boot reaches `hamsh` under QEMU+OVMF. On the real Asus,
-Legacy/BIOS boot is confirmed; the UEFI path has not been re-verified
-since the M16.151–156 wave. If you have this laptop, a UEFI boot
-report is welcome.
+UEFI direct boot reaches `hamsh` under QEMU+OVMF. The real Asus first
+came up over the now-retired Legacy/BIOS path in M16.156; since the
+boot path is now UEFI-only and a later wave introduced a crash, this
+box currently does not reach `hamsh` (see §1 "Recently regressed").
+If you have this laptop, a fresh UEFI boot report is welcome.
 
 ### Anything in §2 still applies
 
@@ -639,7 +633,7 @@ be flipped in firmware); any NVMe SSD with a PCIe class match.
 
 | Class                                                        | Expected                  | Notes                                                                   |
 | ------------------------------------------------------------ | ------------------------- | ----------------------------------------------------------------------- |
-| Dell PowerEdge / HP ProLiant / Supermicro 1U/2U servers      | should boot               | Intel E5/E3, I217/I219 NIC, AHCI or NVMe; UEFI direct or BIOS legacy   |
+| Dell PowerEdge / HP ProLiant / Supermicro 1U/2U servers      | should boot               | Intel E5/E3, I217/I219 NIC, AHCI or NVMe; UEFI only (no BIOS/CSM)      |
 | ThinkPad T-series T440 .. T480 (last gen with PS/2)          | should boot fully         | Intel chipset + PS/2 keyboard + e1000e NIC + AHCI; RX-only network      |
 | ThinkPad T490+ / Latitude 5xx+ / EliteBook 8xx+              | boot, USB keyboard        | No PS/2; keyboard via xHCI V0+V1, V2 polling in flight                  |
 | Consumer ASUS / Gigabyte / MSI desktops, Realtek RTL8168     | boot OK, network partial  | RTL8168 probes but no traffic until Gigabit MMIO follow-up              |
@@ -654,8 +648,8 @@ be flipped in firmware); any NVMe SSD with a PCIe class match.
 After the box reaches the hamsh prompt, run through this sequence and
 note which step fails first:
 
-1. **Banner reached.** Either VGA text (BIOS) or GOP framebuffer (UEFI)
-   shows the kernel banner. Serial mirrors it.
+1. **Banner reached.** The GOP framebuffer shows the kernel banner.
+   Serial mirrors it.
 2. **Console is responsive.** Type at the keyboard. Characters echo.
    On a USB-HID-only laptop this currently requires the xHCI V2 polling
    commit; if it doesn't echo and you have a serial cable, use that.
@@ -687,7 +681,7 @@ log is usually enough to pin a bug to a single driver.
 Examples:
 - `Lenovo T480 UEFI — hangs after EFI entry`
 - `Dell Latitude 7430 UEFI — boots, no USB keyboard`
-- `MSI B450 desktop BIOS — boots, RTL8168 no traffic`
+- `MSI B450 desktop UEFI — boots, RTL8168 no traffic`
 
 ### Issue body
 
@@ -697,7 +691,7 @@ Firmware: BIOS version (or UEFI version) — read from firmware setup
 CPU: Intel i5-8350U / AMD Ryzen 5 5600 / ...
 Storage controller: AHCI / NVMe / both — and capacity
 NIC: Intel I219-V / Realtek RTL8168 / ... — PCI ID if known
-Boot mode used: BIOS legacy / UEFI
+Boot mode used: UEFI (the only supported mode)
 Secure Boot: disabled (confirmed)
 Last serial line seen: <verbatim>
 Got to: <kernel banner / hamsh prompt / froze at step N from §9>
@@ -717,13 +711,13 @@ screen at the point of failure is the next-best thing.
 
 ## 11. Cross-references
 
-- [`BOOT.md`](BOOT.md) — boot pipeline (QEMU + ISO build + UEFI stub
-  internals).
+- [`BOOT.md`](BOOT.md) — boot pipeline (QEMU + disk-image build +
+  UEFI stub internals).
 - [`x86-backend.md`](x86-backend.md) — codegen + ABI details.
-- [`../scripts/write_iso_to_usb.sh`](../scripts/write_iso_to_usb.sh)
-  — guard-railed `dd` wrapper (§3 calls this).
-- [`../scripts/build_iso.sh`](../scripts/build_iso.sh) — produces
-  `build/hamnix.iso`.
+- [`../scripts/build_img.sh`](../scripts/build_img.sh) — produces
+  `build/hamnix.img` (the GPT disk image written to the USB stick).
+- [`../scripts/test_img_uefi_boot.sh`](../scripts/test_img_uefi_boot.sh)
+  — boots `build/hamnix.img` under QEMU + OVMF as the boot gate.
 - [`../README.md`](../README.md) — top-level project status, MVP gates.
 - [`../STATUS.md`](../STATUS.md) — full milestone log (M16.x entries
   referenced throughout this document).

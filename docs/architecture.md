@@ -91,8 +91,9 @@ The reflex to add `user/apt.ad`, `user/dpkg.ad`, `user/wget.ad`,
 once with `user/apt.ad` + `user/dpkg.ad` + `user/dpkg_deb.ad`, spent
 months on it, then deleted all three (commits `0de1c63`..`3ff5bfc`,
 2026-05-26) and replaced them with `enter linux { /usr/bin/apt … }`
-plus real Debian binaries staged at `/var/lib/distros/default`. Don't
-make that mistake twice.
+plus real Debian binaries served from the `#distro` named root (the
+`distro/` subtree of the ext4 root partition). Don't make that mistake
+twice.
 
 Heuristic: if the tool exists in Debian, run it from Debian. If you
 need it to interoperate with Hamnix-native concepts (Plan 9 file
@@ -109,7 +110,8 @@ shape, framework `.ko` registry, distro-namespace populations
 replacement for apt and does not install Debian packages.
 
 The contract:
-- `apt` (Linux ns) manages `/var/lib/distros/<distro>/` content
+- `apt` (Linux ns) manages the `#distro` named root's content (the
+  `distro/` subtree of the ext4 root partition)
 - `hpm` (default ns) manages Hamnix's own services and kernel-side
   state — `etc/rc.boot`, the framework module set, the rootfs image
   layout, the live system's `/var/lib/hpm/installed.json` DB
@@ -150,7 +152,7 @@ Implementation surface (all shipped):
 - VFS permission check on `open`/`create`/`exec` (owner/group/other
   rwx); ext4 stamps owner/group/mode on inode-create.
 - `svc` switches uid before exec (sshd runs as system uid 2).
-- The live ISO bakes `live:hamnix` as hostowner; the installer
+- The shipped image bakes `live:hamnix` as hostowner; the installer
   replaces it with the user's choice.
 
 POSIX-shape security (real `sudo`, `/etc/sudoers`, setuid bits) lives
