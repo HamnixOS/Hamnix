@@ -51,7 +51,7 @@
 from kernel.printk.printk import printk0, printk1, printk2
 from kernel.block.blk import (
     BlockDeviceOps, register_blockdev, blk_scan_partitions,
-    SECTOR_SIZE,
+    blk_register_partitions, SECTOR_SIZE,
 )
 from mm.page_alloc import alloc_pages
 from drivers.usb.xhci import (
@@ -105,6 +105,9 @@ class UsbmsDevice:
     csw_buf:     uint64       # 13-byte CSW staging (page)
     data_buf:    uint64       # bulk data DMA buffer (page, 4 KiB)
     tag:         uint32       # rolling CBW tag
+    busy:        uint32       # BOT-transfer serialization latch (0=free)
+    registered:  uint32       # 1 once /dev/blk/sd0 is registered (idempotency)
+    blk_slot:    int32        # cached register_blockdev slot for re-init
 
 
 usbms: UsbmsDevice
@@ -149,6 +152,39 @@ def usbms_bot_xfer(cdb: Ptr[uint8], cdb_len: uint8,
     # optional data phase on the matching bulk endpoint, then read +
     # validate the CSW on bulk-IN. Returns the number of data bytes
     # transferred (>=0) on a GOOD CSW, or -1 on any failure.
+    #
+    # ROOT-ON-USB CONCURRENCY: the driver has a SINGLE set of DMA
+    # staging buffers (cbw_buf / csw_buf / data_buf), a SINGLE rolling
+    # CBW tag, and a SINGLE pair of xHCI bulk endpoints — exactly one
+    # BOT command may be in flight at a time. A syscall normally runs
+    # with IF cleared (IA32_FMASK clears EFLAGS.IF on SYSCALL), so a
+    # block read driven by one syscall is naturally atomic against
+    # other tasks: the timer cannot preempt mid-transfer. We do NOT add
+    # a cooperative yield here precisely BECAUSE enabling interrupts
+    # mid-BOT-transfer would let a peer task switch in, issue its own
+    # block read, and trample the shared CBW/CSW/data buffers (and
+    # consume our CSW off the single bulk-IN cursor) — corrupting BOTH
+    # transfers. The xHCI bulk poll is already a finite IF=0 busy-spin;
+    # keeping IF=0 for the (sub-millisecond) command is the
+    # serialization. The `busy` latch below is a cheap reentrancy guard
+    # that turns any unexpected re-entry (e.g. a future IRQ-context
+    # caller) into a clean -1 rather than silent buffer corruption.
+    if usbms.busy != 0:
+        return -1
+    usbms.busy = 1
+    rc: int32 = _usbms_bot_xfer_inner(cdb, cdb_len, data_pa,
+                                      data_len, dir_in)
+    usbms.busy = 0
+    return rc
+
+
+def _usbms_bot_xfer_inner(cdb: Ptr[uint8], cdb_len: uint8,
+                          data_pa: uint64, data_len: uint32,
+                          dir_in: int32) -> int32:
+    # Body of one BOT command. MUST run with usbms.busy held (set by
+    # usbms_bot_xfer) — it touches the shared CBW/CSW/data buffers and
+    # the single bulk endpoint pair, which only one caller may drive at
+    # a time.
     #
     # `cdb` points at the SCSI command bytes (up to 16); `cdb_len` is
     # its length. `data_pa` / `data_len` describe the data phase (0
@@ -403,6 +439,20 @@ def usbms_probe(slot: uint32, in_ep: uint32, out_ep: uint32) -> int32:
     # CAPACITY), and registers /dev/sd0 backed by the SCSI READ(10)/
     # WRITE(10) paths. Returns the block-device slot index (>=0) on
     # success, -1 on failure.
+    # Idempotency: root-on-USB calls usbms_init() from the boot rootfs
+    # path BEFORE the ext4 scan, and the gated usbms_exercise() test hook
+    # may call it AGAIN later. A second register_blockdev("sd0") would
+    # fail ("name already registered"), so once we've registered the
+    # device just re-confirm the live endpoint ids and return the cached
+    # block-device slot. This keeps both the boot path and the gated test
+    # (scripts/test_usbms.sh) working without a spurious failure.
+    if usbms.registered != 0:
+        usbms.slot   = slot
+        usbms.in_ep  = in_ep
+        usbms.out_ep = out_ep
+        printk1("[usbms] already registered; reusing sd0 slot=%d\n",
+                cast[uint64](usbms.blk_slot))
+        return usbms.blk_slot
     printk2("[usbms] probe: slot=%d bulk-in-ep=%d ...\n",
             cast[uint64](slot), cast[uint64](in_ep))
     printk1("[usbms] ... bulk-out-ep=%d\n", cast[uint64](out_ep))
@@ -410,6 +460,7 @@ def usbms_probe(slot: uint32, in_ep: uint32, out_ep: uint32) -> int32:
     usbms.in_ep  = in_ep
     usbms.out_ep = out_ep
     usbms.tag    = 0
+    usbms.busy   = 0
     usbms.block_size = 512
 
     usbms.cbw_buf  = alloc_pages(0)
@@ -453,9 +504,19 @@ def usbms_probe(slot: uint32, in_ep: uint32, out_ep: uint32) -> int32:
         return -1
     printk1("[usbms] /dev/blk/sd0 ready (%d sectors)\n",
             usbms.capacity_sectors)
-    # Scan for a partition table so /dev/blk/sd0pN siblings appear if
-    # the stick is partitioned (the squashfs may live on a partition).
+    # Scan for a partition table, then register each partition as its
+    # own /dev/blk/sd0pN sibling block device — exactly as the AHCI and
+    # NVMe drivers do (drivers/ata/ahci.ad, drivers/nvme/nvme.ad). This
+    # is load-bearing for root-on-USB: a Hamnix .img flashed to a stick
+    # is a GPT disk whose ext4 root lives in partition 2, so the
+    # boot-time ext4-magic scan must see /dev/blk/sd0p2 as its own slot
+    # (the whole-disk sd0 has the GPT at offset 1024, not ext4 magic).
+    # Without the register step the scan would only ever see the raw
+    # disk and miss the partition — the "no ext4 partition found" bug.
     blk_scan_partitions(rc)
+    blk_register_partitions(rc, "sd0")
+    usbms.blk_slot   = rc
+    usbms.registered = 1
     return rc
 
 

@@ -64,7 +64,8 @@ python3 -m compiler.adder compile \
 
 echo "[test_mkfs] (3/6) Regenerate disk images + plant /init = hamsh + /bin/test_mkfs"
 python3 scripts/build_diskimg.py >/dev/null 2>&1 || python3 scripts/build_diskimg.py
-INIT_ELF="$HAMSH_ELF" python3 scripts/build_initramfs.py >/dev/null
+ENABLE_MKFS_SELFTEST=1 INIT_ELF="$HAMSH_ELF" \
+    python3 scripts/build_initramfs.py >/dev/null
 
 echo "[test_mkfs] (4/6) Rebuild kernel image"
 python3 -m compiler.adder compile \

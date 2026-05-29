@@ -237,6 +237,15 @@ if os.environ.get("ENABLE_USBMS_TEST") == "1":
 if os.environ.get("ENABLE_MKPART_SMOKE") == "1":
     FILES.append(("/etc/mkpart-smoke", b"1\n"))
 
+# ext4 mkfs self-test arming. The lazy ext4_mkfs_self_test (fs/ext4.ad)
+# FORMATS sd0p1/nvme0n1p1, so it is a developer fixture that must NEVER
+# run on real media (a shipped .img's sd0p1 is the live ESP). Setting
+# ENABLE_MKFS_SELFTEST=1 plants /etc/mkfs-selftest; init/main.ad calls
+# ext4_enable_mkfs_selftest() when it sees the marker. Only
+# scripts/test_mkfs.sh sets it; default boots never format a disk.
+if os.environ.get("ENABLE_MKFS_SELFTEST") == "1":
+    FILES.append(("/etc/mkfs-selftest", b"1\n"))
+
 # xHCI live-keyboard attach OPT-OUT. Mirrors ENABLE_XHCI_SELFTEST but
 # in the opposite direction: setting ENABLE_XHCI_NO_ATTACH=1 plants
 # /etc/xhci-no-attach so drivers/usb/xhci.ad's xhci_init() skips
