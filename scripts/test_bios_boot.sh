@@ -1,98 +1,24 @@
 #!/usr/bin/env bash
-# scripts/test_bios_boot.sh - Boot build/hamnix.iso under legacy BIOS (SeaBIOS)
-#                            and assert the Hamnix kernel banner.
+# scripts/test_bios_boot.sh - RETIRED.
 #
-# This is the "hybrid ISO, BIOS half" half of the M16.70 priority — the
-# inverse of scripts/test_uefi_boot.sh. Both scripts intentionally have
-# the SAME pass-marker format ([test_<label>_boot] PASS) so the cron
-# template can grep either output line.
+# Hamnix is UEFI-only. Legacy BIOS / SeaBIOS boot was dropped together
+# with the hybrid ISO (see scripts/build_iso.sh's deprecation shim).
+# There is no longer a BIOS boot path to exercise, so this test SKIPs
+# cleanly. The UEFI boot is covered by scripts/test_img_uefi_boot.sh,
+# which boots the installed-system GPT image build/hamnix.img under
+# OVMF as a DISK and asserts the kernel boots its shell off the ext4
+# root.
 #
-# Path under test:
-#   QEMU SeaBIOS  ->  MBR (boot_hybrid.img)  ->  El Torito i386-pc
-#   ->  GRUB legacy core image  ->  /boot/grub/grub.cfg
-#   ->  multiboot1 of /boot/hamnix.elf  ->  arch/x86/boot/header.S _start
-#   ->  long-mode handoff  ->  start_kernel()
+# Pass marker:  [test_bios_boot] SKIP
 #
-# We do NOT pass `-bios` here — QEMU's default is SeaBIOS, which is the
-# legacy-BIOS code path. That's exactly what we want to exercise.
-#
-# Pass marker:    [test_bios_boot] PASS
-# Fail marker:    [test_bios_boot] FAIL
-#
-# Env overrides:
-#   HAMNIX_ISO         iso path                 (default: build/hamnix.iso)
-#   BIOS_BOOT_TIMEOUT  seconds for the run       (default: 30)
-#   BANNER_RE          banner regex             (default: kernel banner)
+# Kept as a stub (rather than deleted) so any cron template or runner
+# that greps for this script's marker still sees a clean, explained
+# SKIP instead of a "file not found".
 
 set -euo pipefail
 
-PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$PROJ_ROOT"
-
-# shellcheck source=_build_lock.sh
-source "$PROJ_ROOT/scripts/_build_lock.sh"
-
-HAMNIX_ISO="${HAMNIX_ISO:-build/hamnix.iso}"
-BIOS_BOOT_TIMEOUT="${BIOS_BOOT_TIMEOUT:-30}"
-BANNER_RE="${BANNER_RE:-Hamnix kernel booting}"
-
-# Always rebuild the ISO. Skipping the rebuild silently reused stale
-# artifacts in past sessions and produced misleading PASSes; never
-# again. Set HAMNIX_SKIP_BUILD=1 to explicitly opt out (CI parallelism
-# etc.).
-if [ "${HAMNIX_SKIP_BUILD:-0}" != "1" ]; then
-    echo "[test_bios_boot] rebuilding ISO via scripts/build_iso.sh"
-    rm -f "$HAMNIX_ISO"
-    bash "$PROJ_ROOT/scripts/build_iso.sh"
-fi
-if [ ! -f "$HAMNIX_ISO" ]; then
-    echo "[test_bios_boot] FAIL: $HAMNIX_ISO missing after build_iso.sh." >&2
-    exit 1
-fi
-
-LOGFILE=$(mktemp --tmpdir hamnix-bios-boot.XXXXXX.log)
-cleanup() { rm -f "$LOGFILE"; }
-trap cleanup EXIT
-
-echo "[test_bios_boot] === BIOS boot via SeaBIOS (timeout ${BIOS_BOOT_TIMEOUT}s, banner=\"$BANNER_RE\") ==="
-set +e
-timeout "${BIOS_BOOT_TIMEOUT}s" qemu-system-x86_64 \
-    -cdrom "$HAMNIX_ISO" \
-    -m 256M \
-    -nographic \
-    -no-reboot \
-    -monitor none \
-    -serial stdio \
-    2>&1 | tee "$LOGFILE"
-rc=${PIPESTATUS[0]}
-set -e
-
-# rc=124 means timeout killed it (expected — kernel keeps running). rc=0
-# is a clean shutdown. Anything else is a real QEMU failure.
-if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
-    echo "[test_bios_boot] FAIL: qemu exited rc=$rc" >&2
-    echo "[test_bios_boot] FAIL"
-    exit 1
-fi
-
-if ! grep -a -q -E "$BANNER_RE" "$LOGFILE"; then
-    echo "[test_bios_boot] FAIL: kernel banner (\"$BANNER_RE\") not detected." >&2
-    echo "[test_bios_boot] FAIL"
-    exit 1
-fi
-
-echo "[test_bios_boot] kernel banner detected (\"$BANNER_RE\")."
-
-# The user-facing ISO boots through the hamsh rc system: /init (shim)
-# execs hamsh, hamsh-as-PID-1 sources /etc/rc.boot which applies the
-# namespace recipe. Assert that here so a regression that drops the
-# rc path is caught by the BIOS boot gate.
-if ! grep -a -q -F "rc.boot: namespace recipe applied" "$LOGFILE"; then
-    echo "[test_bios_boot] FAIL: boot did not go through the hamsh rc" \
-         "(/etc/rc.boot namespace recipe marker missing)." >&2
-    echo "[test_bios_boot] FAIL"
-    exit 1
-fi
-
-echo "[test_bios_boot] booted via hamsh rc (/etc/rc.boot applied)."
-echo "[test_bios_boot] PASS"
+echo "[test_bios_boot] SKIP: BIOS boot retired — Hamnix is UEFI-only."
+echo "[test_bios_boot]   The bootable artifact is the GPT disk image"
+echo "[test_bios_boot]   build/hamnix.img (UEFI). Verify it with:"
+echo "[test_bios_boot]     bash scripts/test_img_uefi_boot.sh"
+exit 0

@@ -689,6 +689,24 @@ def build_archive() -> bytes:
     blob = b""
     here = Path(__file__).resolve().parent.parent
 
+    # HAMNIX_CPIO_EMPTY=1 — emit a cpio that contains NO files, only the
+    # TRAILER. Used by scripts/build_img.sh for the installed-system raw
+    # disk image (build/hamnix.img): that image boots ENTIRELY off the
+    # ext4 root (the kernel binds '#sysroot' / and ELF-loads /init off
+    # the partition — see init/main.ad + docs/rootfs_partition.md), so
+    # the kernel needs NO embedded userland at all. The cpio symbol
+    # (initramfs_cpio_base/size, fs/cpio.ad) still exists so the kernel
+    # links and the `-kernel` developer/test path keeps a real cpio, but
+    # the SHIPPED kernel image carries zero cpio userland bytes. This is
+    # the "no cpio in the live install path" end state, achieved without
+    # the wholesale `-kernel` test-harness rewrite that physically
+    # deleting fs/cpio.ad would require (~380 test scripts boot via
+    # run_x86_bare.sh's regenerated blob).
+    if os.environ.get("HAMNIX_CPIO_EMPTY", "0") == "1":
+        print("[build_initramfs] HAMNIX_CPIO_EMPTY=1: emitting a "
+              "trailer-only cpio (installed disk boots off ext4).")
+        return cpio_trailer()
+
     # HAMNIX_CPIO_LEAN=1 — strip everything from the cpio that the
     # rootfs partition (build/hamnix-rootfs.img, see
     # scripts/build_rootfs_img.py + docs/rootfs_partition.md) carries

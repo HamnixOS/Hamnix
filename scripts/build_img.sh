@@ -112,12 +112,16 @@ bash scripts/build_user.sh
 bash scripts/build_modules.sh
 
 # The kernel image still `.incbin`s fs/initramfs_blob.S (the cpio symbol
-# initramfs_cpio_base is referenced at link time). Build a LEAN cpio so
-# the kernel links and the `-kernel` developer path stays bootable as a
-# fallback; the installed disk boots entirely off ext4 (the cpio is the
-# fallback the kernel only uses when no ext4 partition is present).
-echo "[build_img] Building lean initramfs (kernel link dependency)."
-HAMNIX_CPIO_LEAN=1 python3 scripts/build_initramfs.py
+# initramfs_cpio_base is referenced at link time by fs/cpio.ad). Build a
+# TRAILER-ONLY (empty) cpio: the kernel links, but the SHIPPED image
+# carries NO embedded userland — the installed disk boots ENTIRELY off
+# the ext4 root (kernel binds '#sysroot' / and ELF-loads /init off the
+# partition; verified by scripts/test_img_uefi_boot.sh's
+# HAMNIX_PARTITION_RC_SOURCED_OK assertion). This is the "no cpio in the
+# live install path" end state. The `-kernel` developer/test path keeps
+# its own full cpio via run_x86_bare.sh.
+echo "[build_img] Building empty initramfs (kernel boots off ext4; cpio symbol kept for link)."
+HAMNIX_CPIO_EMPTY=1 python3 scripts/build_initramfs.py
 
 echo "[build_img] Building ext4 rootfs partition (~${HAMNIX_ROOTFS_SIZE_MB} MiB shipped)."
 HAMNIX_ROOTFS_OUT="$HAMNIX_ROOTFS_IMG" python3 scripts/build_rootfs_img.py
