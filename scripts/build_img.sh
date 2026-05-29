@@ -199,6 +199,25 @@ dd if=/dev/zero of="$ESP_IMG" bs=1M count="$ESP_SIZE_MB" status=none
 # up to ~64 MiB.
 mformat -i "$ESP_IMG" -h 64 -s 32 -c 32 \
         -t $(( ESP_SIZE_MB * 64 )) -v HAMNIX ::
+
+# --- Boot-log persistence file (docs: kernel/printk/esp_log.ad) -------
+#
+# Preallocate a fixed-size, zero-filled LOG.TXT on the ESP *FIRST*,
+# before any other file, so its data extent is the first contiguous run
+# of clusters in the freshly-formatted volume (deterministic, never
+# fragmented). The kernel locates this extent at boot and overwrites it
+# in place via raw blk_write_sectors to persist the printk ring — so a
+# bad real-hardware boot (NUC, no serial) leaves its log on the stick.
+#
+# HAMNIX_ESP_LOG_SIZE MUST match ESP_LOG_BYTES in kernel/printk/
+# esp_log.ad (default 262144 = 256 KiB = 512 sectors).
+HAMNIX_ESP_LOG_SIZE="${HAMNIX_ESP_LOG_SIZE:-262144}"
+ESP_LOG_SRC="$EFI_STUB_TMP/log.txt"
+dd if=/dev/zero of="$ESP_LOG_SRC" bs=1 count="$HAMNIX_ESP_LOG_SIZE" \
+   status=none
+mcopy -o -i "$ESP_IMG" "$ESP_LOG_SRC" "::/LOG.TXT"
+echo "[build_img] Preallocated \\LOG.TXT (${HAMNIX_ESP_LOG_SIZE} B) for boot-log persistence."
+
 mmd -i "$ESP_IMG" "::/EFI"
 mmd -i "$ESP_IMG" "::/EFI/BOOT"
 mcopy -o -i "$ESP_IMG" "$HAMNIX_EFI_STUB" "::/EFI/BOOT/BOOTX64.EFI"

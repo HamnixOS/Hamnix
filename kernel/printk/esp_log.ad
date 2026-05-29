@@ -1,0 +1,355 @@
+# kernel/printk/esp_log.ad
+#
+# Persist the kernel boot log to the FAT ESP so it survives a power
+# cycle and can be read off the boot USB stick on any PC.
+#
+# THE PROBLEM THIS SOLVES
+# -----------------------
+# The real-hardware target (an Intel NUC) has no serial port. On a bad
+# boot it either hangs or power-cycles instantly with zero output, so
+# the only forensic trail today is a phone photo of the screen — which
+# captures just the last few lines. There is no way to see the early
+# boot phases that actually failed.
+#
+# This module flushes the in-RAM printk ring buffer (kernel/printk/
+# printk_log.ad) into a PREALLOCATED, FIXED-SIZE, CONTIGUOUS file —
+# LOG.TXT — on the FAT ESP. Because LOG.TXT is created at image-build
+# time before any other file (scripts/build_img.sh), its data extent
+# is a deterministic contiguous run of clusters. We locate that extent
+# once at boot and thereafter overwrite it in place with raw
+# blk_write_sectors — bypassing VFS / ext4 entirely. The VFS layer may
+# itself be the broken thing at failure time; raw sector writes to a
+# pre-resolved LBA are the most failure-proof path available.
+#
+# After a crash the user pulls the stick, mounts the FAT ESP on any
+# PC, and reads \LOG.TXT.
+#
+# DEVICE SELECTION
+# ----------------
+# We must write to the SAME physical disk the system booted from. On
+# QEMU that's virtio-blk; on the NUC it's USB-MSC. Rather than try to
+# divine which disk that is, we are deliberately UN-clever: at init we
+# scan EVERY registered block device, and for each one that presents a
+# FAT volume carrying a file named LOG.TXT we remember (slot, extent
+# LBA, sector count). A flush writes the ring to every remembered
+# target. Writing the log to a few extra disks that happen to have a
+# LOG.TXT is harmless; missing the real boot disk is not. Robust beats
+# clever.
+#
+# FAT12 vs the fs/fat.ad reader
+# -----------------------------
+# fs/fat.ad parses FAT32-shaped BPB fields (32-bit sectors-per-fat at
+# offset 36, cluster-chained root at offset 44). The ESP that
+# scripts/build_img.sh emits via mformat is FAT12 with a FIXED-SIZE
+# root directory region (the classic DOS layout): reserved sectors,
+# then N FAT copies, then a root-dir region of root_entries*32 bytes,
+# then the data area. This module parses THAT shape independently and
+# keeps its own state so it never disturbs the live fs/fat.ad mount or
+# its single global scratch buffer.
+
+from kernel.block.blk import (
+    blk_read_sectors, blk_write_sectors,
+    blk_max_slots, blk_slot_in_use, blk_slot_name,
+    SECTOR_SIZE,
+)
+from kernel.printk.printk_log import printk_log_snapshot, PRINTK_LOG_SIZE
+from kernel.printk.printk import printk0, printk1, printk2
+
+
+# --- tunables ------------------------------------------------------
+#
+# How big the on-ESP LOG.TXT is. MUST match the size scripts/
+# build_img.sh preallocates (HAMNIX_ESP_LOG_SIZE). 256 KiB = 512
+# sectors covers a full verbose boot with margin.
+ESP_LOG_BYTES:    uint64 = 262144
+ESP_LOG_SECTORS:  uint64 = 512                  # ESP_LOG_BYTES / SECTOR_SIZE
+
+# We remember up to this many (disk, extent) targets — one per block
+# device that turned out to carry a LOG.TXT.
+ESP_LOG_MAX_TARGETS: uint64 = 8
+
+
+# --- per-target extent state ---------------------------------------
+#
+# A flush target is the resolved on-disk location of LOG.TXT's data on
+# one block device, expressed in that device's OWN LBA space (the
+# minted partition devices — "vdap1", "sd0p1", ... — present
+# partition-relative LBAs starting at 0, exactly what the FAT geometry
+# below computes).
+class EspLogTarget:
+    slot:        int32
+    pad:         int32
+    data_lba:    uint64                         # first LBA of LOG.TXT's data
+    sectors:     uint64                         # min(file size, ring) in sectors
+
+
+esp_log_targets:    Array[8, EspLogTarget]
+esp_log_target_cnt: uint64 = 0
+esp_log_ready:      int32  = 0                  # 1 once init found >=1 target
+
+# A SECTOR_SIZE scratch buffer for BPB/root-dir reads and for the
+# flush write loop. The kernel never calls esp_log routines
+# reentrantly (init runs once; flushes are sequential), so a single
+# .bss scratch is safe — same pattern fs/fat.ad uses.
+esp_scratch: Array[512, uint8]
+
+
+def _rd_u16_le(p: Ptr[uint8]) -> uint16:
+    return cast[uint16](p[0]) | (cast[uint16](p[1]) << 8)
+
+
+def _rd_u32_le(p: Ptr[uint8]) -> uint32:
+    return (cast[uint32](p[0])
+            | (cast[uint32](p[1]) << 8)
+            | (cast[uint32](p[2]) << 16)
+            | (cast[uint32](p[3]) << 24))
+
+
+def _to_upper(c: uint8) -> uint8:
+    if c >= 97 and c <= 122:                     # 'a'..'z'
+        return c - 32
+    return c
+
+
+# The 8.3 name we hunt for in the root directory: "LOG     TXT".
+def _fill_logtxt_83(out: Ptr[uint8]):
+    name: Ptr[char] = "LOG"
+    ext:  Ptr[char] = "TXT"
+    i: uint64 = 0
+    while i < 11:
+        out[i] = 32                              # space pad
+        i = i + 1
+    j: uint64 = 0
+    while name[j] != 0:
+        out[j] = _to_upper(cast[uint8](name[j] & 0xFF))
+        j = j + 1
+    k: uint64 = 0
+    while ext[k] != 0:
+        out[8 + k] = _to_upper(cast[uint8](ext[k] & 0xFF))
+        k = k + 1
+
+
+def _name_match(entry: Ptr[uint8], target83: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while i < 11:
+        if entry[i] != target83[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+# --- FAT12/16 geometry probe + LOG.TXT lookup on one device --------
+#
+# Reads LBA 0 of `slot`, validates a FAT BPB, then scans the
+# fixed-size root directory region for LOG.TXT. On a hit, fills
+# out_data_lba (the partition-relative LBA of the file's first data
+# sector) + out_size (the file's byte size from the dir entry) and
+# returns 1. Returns 0 on any read failure / not-FAT / no-LOG.TXT.
+#
+# Scope: we assume LOG.TXT is contiguous starting at its first
+# cluster. scripts/build_img.sh guarantees this by mcopy'ing LOG.TXT
+# FIRST into a freshly-formatted ESP, so it occupies clusters
+# 2..(2+N-1) with no fragmentation. We therefore never walk the FAT
+# chain — the data extent is data_lba .. data_lba + sectors.
+def _probe_device_for_logtxt(slot: int32, out_data_lba: Ptr[uint64],
+                             out_size: Ptr[uint64]) -> int32:
+    if blk_read_sectors(slot, 0, 1, &esp_scratch[0]) != 0:
+        return 0
+    p: Ptr[uint8] = &esp_scratch[0]
+    # Boot signature 0x55 0xAA.
+    if p[510] != 0x55 or p[511] != 0xAA:
+        return 0
+    bytes_per_sector: uint64 = cast[uint64](_rd_u16_le(
+        cast[Ptr[uint8]](cast[uint64](p) + 11)))
+    if bytes_per_sector != SECTOR_SIZE:
+        return 0
+    sectors_per_clu:  uint64 = cast[uint64](p[13])
+    if sectors_per_clu == 0:
+        return 0
+    reserved_sectors: uint64 = cast[uint64](_rd_u16_le(
+        cast[Ptr[uint8]](cast[uint64](p) + 14)))
+    num_fats:         uint64 = cast[uint64](p[16])
+    root_entries:     uint64 = cast[uint64](_rd_u16_le(
+        cast[Ptr[uint8]](cast[uint64](p) + 17)))
+    # FAT12/16 store sectors-per-fat in the 16-bit field at offset 22.
+    # (FAT32 zeroes that and uses the 32-bit field at 36; an ESP that
+    # used FAT32 would have root_entries == 0, which we reject below.)
+    sectors_per_fat:  uint64 = cast[uint64](_rd_u16_le(
+        cast[Ptr[uint8]](cast[uint64](p) + 22)))
+    if root_entries == 0 or sectors_per_fat == 0 or num_fats == 0:
+        # Not the fixed-root FAT12/16 shape we build. Bail rather than
+        # guess — a wrong geometry would write the log to the wrong
+        # sectors and could corrupt the volume.
+        return 0
+
+    root_dir_start: uint64 = reserved_sectors + num_fats * sectors_per_fat
+    root_dir_sectors: uint64 = (root_entries * 32 + SECTOR_SIZE - 1) \
+                             / SECTOR_SIZE
+    data_start_lba: uint64 = root_dir_start + root_dir_sectors
+
+    target83: Array[11, uint8]
+    _fill_logtxt_83(&target83[0])
+
+    # Walk the fixed-size root directory region sector by sector.
+    s: uint64 = 0
+    while s < root_dir_sectors:
+        lba: uint64 = root_dir_start + s
+        if blk_read_sectors(slot, lba, 1, &esp_scratch[0]) != 0:
+            return 0
+        ei: uint64 = 0
+        n: uint64 = SECTOR_SIZE / 32             # 16 entries / sector
+        while ei < n:
+            entry: Ptr[uint8] = cast[Ptr[uint8]](
+                cast[uint64](&esp_scratch[0]) + ei * 32)
+            first_byte: uint8 = entry[0]
+            if first_byte == 0:
+                return 0                         # end-of-directory
+            attr: uint8 = entry[11]
+            # Skip deleted (0xE5), LFN (0x0F), and volume-label (0x08)
+            # entries. The volume label shares the data-cluster fields
+            # with a real file but has cluster 0 — guarded below too.
+            if first_byte != 0xE5 and attr != 0x0F \
+                    and (attr & 0x08) == 0:
+                if _name_match(entry, &target83[0]) != 0:
+                    hi: uint16 = _rd_u16_le(
+                        cast[Ptr[uint8]](cast[uint64](entry) + 20))
+                    lo: uint16 = _rd_u16_le(
+                        cast[Ptr[uint8]](cast[uint64](entry) + 26))
+                    cluster: uint64 = (cast[uint64](hi) << 16) \
+                                    | cast[uint64](lo)
+                    size: uint64 = cast[uint64](_rd_u32_le(
+                        cast[Ptr[uint8]](cast[uint64](entry) + 28)))
+                    if cluster < 2:
+                        return 0                 # malformed / label
+                    out_data_lba[0] = data_start_lba \
+                                    + (cluster - 2) * sectors_per_clu
+                    out_size[0] = size
+                    return 1
+            ei = ei + 1
+        s = s + 1
+    return 0
+
+
+# --- public init ---------------------------------------------------
+
+def esp_log_init():
+    # Scan every registered block device for a FAT volume carrying
+    # LOG.TXT and remember each hit's extent. Called once during boot
+    # (init/main.ad), after the block layer + partition devices are up.
+    esp_log_target_cnt = 0
+    esp_log_ready = 0
+    max: uint64 = blk_max_slots()
+    si: uint64 = 0
+    while si < max:
+        slot: int32 = cast[int32](si)
+        if blk_slot_in_use(slot) != 0:
+            data_lba: uint64 = 0
+            fsize:    uint64 = 0
+            if _probe_device_for_logtxt(slot, &data_lba, &fsize) != 0:
+                if esp_log_target_cnt < ESP_LOG_MAX_TARGETS:
+                    # Cap the writable window to min(file size, our ring
+                    # capacity), rounded up to whole sectors, and never
+                    # past the preallocated file. The flush only ever
+                    # writes within LOG.TXT's own data extent.
+                    cap_bytes: uint64 = fsize
+                    if cap_bytes > ESP_LOG_BYTES:
+                        cap_bytes = ESP_LOG_BYTES
+                    sectors: uint64 = (cap_bytes + SECTOR_SIZE - 1) \
+                                    / SECTOR_SIZE
+                    ti: uint64 = esp_log_target_cnt
+                    esp_log_targets[ti].slot     = slot
+                    esp_log_targets[ti].data_lba = data_lba
+                    esp_log_targets[ti].sectors  = sectors
+                    esp_log_target_cnt = esp_log_target_cnt + 1
+                    esp_log_ready = 1
+                    nm: Ptr[char] = blk_slot_name(slot)
+                    printk2("esp_log: LOG.TXT on '%s' data_lba=%d\n",
+                            cast[uint64](nm), data_lba)
+        si = si + 1
+    if esp_log_ready == 0:
+        printk0("esp_log: no LOG.TXT found (boot-log persist off)\n")
+    else:
+        printk1("esp_log: armed on %d block device(s)\n",
+                esp_log_target_cnt)
+
+
+# --- the flush -----------------------------------------------------
+#
+# Snapshot the printk ring (oldest-first) into LOG.TXT's data extent
+# on every armed target. Called after each major boot phase and from
+# the panic / halt paths. Idempotent and self-contained: it takes no
+# locks, calls only blk_*, and is safe to invoke from a trap handler.
+#
+# We snapshot in SECTOR_SIZE chunks straight into esp_scratch and
+# write each filled sector — no large intermediate buffer, so the
+# stack/.bss footprint stays tiny. The ring snapshot for a given
+# absolute byte window is reproduced by re-snapshotting the whole ring
+# once into a known order; to keep this allocation-free we instead pull
+# the full snapshot a sector at a time using printk_log_snapshot's
+# "last N bytes" semantics is awkward, so we snapshot the entire ring
+# into the per-sector buffer by offset. See _flush_one for the loop.
+esp_log_flushing: int32 = 0                      # reentrancy guard
+
+
+def _flush_one(t: Ptr[EspLogTarget], snap: Ptr[uint8], snap_len: uint64):
+    # Write `snap_len` bytes of `snap` into target `t`'s extent,
+    # zero-padding the final partial sector, capped at the target's
+    # sector budget. snap points at a full-ring snapshot buffer.
+    slot: int32 = t[0].slot
+    base: uint64 = t[0].data_lba
+    budget: uint64 = t[0].sectors
+    written_sectors: uint64 = 0
+    off: uint64 = 0
+    while written_sectors < budget:
+        # Fill esp_scratch with up to one sector of snapshot bytes,
+        # zero-padding any tail.
+        i: uint64 = 0
+        while i < SECTOR_SIZE:
+            if off + i < snap_len:
+                esp_scratch[i] = snap[off + i]
+            else:
+                esp_scratch[i] = 0
+            i = i + 1
+        if blk_write_sectors(slot, base + written_sectors, 1,
+                             &esp_scratch[0]) != 0:
+            return
+        written_sectors = written_sectors + 1
+        off = off + SECTOR_SIZE
+        if off >= snap_len:
+            # Wrote the last data sector; everything past here would be
+            # all-zero padding. Stop early — leaving the rest of the
+            # preallocated file as whatever it last held is fine (the
+            # reader truncates at the first NUL run / uses strings).
+            return
+
+
+# Full-ring snapshot buffer. Sized to the ring so a single
+# printk_log_snapshot() call reproduces the whole log in oldest-first
+# order; _flush_one then slices it per target. 64 KiB of .bss — the
+# same magnitude as the ring itself, and only touched at flush time.
+esp_snap_buf: Array[65536, uint8]
+
+
+def esp_log_flush():
+    # Flush the current printk ring to every armed LOG.TXT extent.
+    # No-op (cheap early return) when init found no targets.
+    if esp_log_ready == 0:
+        return
+    if esp_log_flushing != 0:
+        # A flush re-entered from within a flush (e.g. blk_write_sectors
+        # itself printk'd and we somehow recursed) — bail to avoid
+        # clobbering esp_scratch mid-write.
+        return
+    esp_log_flushing = 1
+    # Snapshot the most-recent min(count, ring) bytes, oldest-first.
+    snap_len: uint64 = printk_log_snapshot(&esp_snap_buf[0],
+                                           PRINTK_LOG_SIZE)
+    ti: uint64 = 0
+    while ti < esp_log_target_cnt:
+        _flush_one(&esp_log_targets[ti], &esp_snap_buf[0], snap_len)
+        ti = ti + 1
+    esp_log_flushing = 0
+
+
+def esp_log_is_ready() -> int32:
+    return esp_log_ready
