@@ -53,6 +53,7 @@ extern def sys_spawn(path: Ptr[char], argv: Ptr[uint64],
                      envp: Ptr[uint64]) -> int32
 extern def sys_kill(pid: int32, sig: int32) -> int32
 extern def sys_wsys_alloc(pid: uint64) -> int32
+extern def sys_pipe(fds: Ptr[int32]) -> int32
 
 
 # ---- window + layer caps (mirror the kernel cdev surface) ----------
@@ -1834,6 +1835,38 @@ DWIN_H: Array[8, int64]
 DWIN_WID: Array[8, int32]
 DWIN_COUNT: uint64 = 0
 
+# ---- per-window terminal (in-daemon emulator) ----------------------
+# Each window dragged out runs an interactive hamsh whose stdin/stdout
+# are kernel pipes. The daemon owns the PARENT ends:
+#   DWIN_IN_FD  — write end of the child's stdin pipe (keystrokes -> shell)
+#   DWIN_OUT_FD — read  end of the child's stdout pipe (shell -> grid)
+# and emulates a tiny VT into a per-window character GRID rendered into
+# the window body by daemon_pixel. The grid is a flat DMAX*GRID_CELLS
+# byte array; each cell holds one printable ASCII byte (0 == blank).
+DWIN_IN_FD:  Array[8, int32]
+DWIN_OUT_FD: Array[8, int32]
+DWIN_PID:    Array[8, int32]
+DWIN_COLS:   Array[8, int64]      # body_w / GLYPH_W
+DWIN_ROWS:   Array[8, int64]      # body_h / GLYPH_H
+DWIN_CUR_C:  Array[8, int64]      # cursor column
+DWIN_CUR_R:  Array[8, int64]      # cursor row
+# VT parser state per window: 0 = ground, 1 = saw ESC, 2 = in CSI.
+DWIN_VT:     Array[8, int32]
+
+GLYPH_W: int64 = 8
+GLYPH_H: int64 = 16
+# Grid cap per window: 128 cols * 64 rows. 8192 cells * 8 windows = 64 KiB.
+GRID_COLS_MAX: int64 = 128
+GRID_ROWS_MAX: int64 = 64
+GRID_CELLS:    uint64 = 8192      # GRID_COLS_MAX * GRID_ROWS_MAX
+term_grid: Array[65536, uint8]    # DMAX * GRID_CELLS
+
+# Small scratch buffer for draining a child's stdout pipe each frame.
+term_rx: Array[1024, uint8]
+# Small scratch buffer for draining /dev/cons keystrokes each frame.
+cons_rx: Array[256, uint8]
+cons_fd: int32 = -1
+
 # ---- cursor + drag state -------------------------------------------
 CUR_X: int64 = 0
 CUR_Y: int64 = 0
@@ -1864,6 +1897,127 @@ def imax(a: int64, b: int64) -> int64:
     if a > b:
         return a
     return b
+
+
+# ---- per-window terminal emulator ----------------------------------
+# Cell index for window `slot` at (col,row) into the flat term_grid.
+def term_cell(slot: uint64, col: int64, row: int64) -> uint64:
+    return slot * GRID_CELLS + cast[uint64](row * GRID_COLS_MAX + col)
+
+
+# Clear a window's whole grid to blanks (0) and home the cursor.
+def term_clear(slot: uint64):
+    base: uint64 = slot * GRID_CELLS
+    i: uint64 = 0
+    while i < GRID_CELLS:
+        term_grid[base + i] = 0
+        i = i + 1
+    DWIN_CUR_C[slot] = 0
+    DWIN_CUR_R[slot] = 0
+    DWIN_VT[slot] = 0
+
+
+# Scroll the grid up one row (drop the top row, blank the new bottom).
+def term_scroll(slot: uint64):
+    rows: int64 = DWIN_ROWS[slot]
+    cols: int64 = DWIN_COLS[slot]
+    r: int64 = 0
+    while r < rows - 1:
+        c: int64 = 0
+        while c < cols:
+            src: uint64 = term_cell(slot, c, r + 1)
+            dst: uint64 = term_cell(slot, c, r)
+            term_grid[dst] = term_grid[src]
+            c = c + 1
+        r = r + 1
+    # blank the last row
+    c2: int64 = 0
+    while c2 < cols:
+        term_grid[term_cell(slot, c2, rows - 1)] = 0
+        c2 = c2 + 1
+
+
+def term_newline(slot: uint64):
+    DWIN_CUR_R[slot] = DWIN_CUR_R[slot] + 1
+    if DWIN_CUR_R[slot] >= DWIN_ROWS[slot]:
+        term_scroll(slot)
+        DWIN_CUR_R[slot] = DWIN_ROWS[slot] - 1
+
+
+# Emit one printable byte into the grid at the cursor, advancing it
+# (wrapping + scrolling as needed).
+def term_putc(slot: uint64, ch: uint8):
+    cols: int64 = DWIN_COLS[slot]
+    if cols <= 0 or DWIN_ROWS[slot] <= 0:
+        return
+    if DWIN_CUR_C[slot] >= cols:
+        DWIN_CUR_C[slot] = 0
+        term_newline(slot)
+    term_grid[term_cell(slot, DWIN_CUR_C[slot], DWIN_CUR_R[slot])] = ch
+    DWIN_CUR_C[slot] = DWIN_CUR_C[slot] + 1
+
+
+# Feed `n` bytes from buf into window slot's terminal, honouring a
+# minimal control set + swallowing CSI escape sequences so they don't
+# corrupt the grid.
+def term_feed(slot: uint64, buf: Ptr[uint8], n: int64):
+    i: int64 = 0
+    while i < n:
+        c: uint8 = buf[cast[uint64](i)]
+        st: int32 = DWIN_VT[slot]
+        if st == 1:
+            # saw ESC: '[' begins a CSI; anything else aborts to ground.
+            if c == 91:                          # '['
+                DWIN_VT[slot] = 2
+            else:
+                DWIN_VT[slot] = 0
+            i = i + 1
+        elif st == 2:
+            # in CSI: consume parameter/intermediate bytes until a final
+            # byte in 0x40..0x7E ends the sequence (we ignore its effect).
+            if c >= 64 and c <= 126:
+                DWIN_VT[slot] = 0
+            i = i + 1
+        else:
+            if c == 27:                          # ESC
+                DWIN_VT[slot] = 1
+            elif c == 10:                        # '\n' -> newline + CR
+                DWIN_CUR_C[slot] = 0
+                term_newline(slot)
+            elif c == 13:                        # '\r' -> carriage return
+                DWIN_CUR_C[slot] = 0
+            elif c == 8:                         # backspace
+                if DWIN_CUR_C[slot] > 0:
+                    DWIN_CUR_C[slot] = DWIN_CUR_C[slot] - 1
+                    term_grid[term_cell(slot, DWIN_CUR_C[slot],
+                                        DWIN_CUR_R[slot])] = 0
+            elif c == 9:                         # tab -> advance to next 8
+                nc: int64 = (DWIN_CUR_C[slot] / 8 + 1) * 8
+                if nc >= DWIN_COLS[slot]:
+                    nc = DWIN_COLS[slot] - 1
+                DWIN_CUR_C[slot] = nc
+            elif c >= 32 and c <= 126:           # printable ASCII
+                term_putc(slot, c)
+            # everything else (other control bytes): drop silently
+            i = i + 1
+
+
+# Drain a window's stdout pipe (non-blocking) into its grid. Returns 1
+# if any bytes were consumed (the screen needs a re-present), else 0.
+def term_pump(slot: uint64) -> int32:
+    fd: int32 = DWIN_OUT_FD[slot]
+    if fd < 0:
+        return 0
+    got: int32 = 0
+    iters: int32 = 0
+    while iters < 16:
+        n: int64 = sys_read_nb(fd, &term_rx[0], 1024)
+        iters = iters + 1
+        if n <= 0:
+            break
+        term_feed(slot, &term_rx[0], n)
+        got = 1
+    return got
 
 
 # Pixel-model query: what colour is screen pixel (x,y)? Writes r/g/b.
@@ -1900,6 +2054,46 @@ def daemon_pixel(x: int64, y: int64,
                     r = WIN_BODY_R
                     g = WIN_BODY_G
                     b = WIN_BODY_B
+                    # --- terminal text rendered into the body ---
+                    bx0: int64 = wx + 2
+                    by0: int64 = wy + TITLE_H
+                    lx: int64 = x - bx0           # pixel within body
+                    ly: int64 = y - by0
+                    if lx >= 0 and ly >= 0:
+                        col: int64 = lx / GLYPH_W
+                        row: int64 = ly / GLYPH_H
+                        if col < DWIN_COLS[wi] and row < DWIN_ROWS[wi]:
+                            gx: int64 = lx - col * GLYPH_W   # 0..7
+                            gy: int64 = ly - row * GLYPH_H   # 0..15
+                            # Cursor block (inverse) at the cell cursor.
+                            is_cur: int32 = 0
+                            if col == DWIN_CUR_C[wi] and row == DWIN_CUR_R[wi]:
+                                is_cur = 1
+                            ce: uint64 = term_cell(cast[uint64](wi), col, row)
+                            ch: uint8 = term_grid[ce]
+                            on: int32 = 0
+                            if ch >= 32 and ch <= 126:
+                                gi: uint64 = cast[uint64](ch) - 32
+                                bits: uint8 = font_glyphs[gi * 16
+                                                          + cast[uint64](gy)]
+                                mask: uint8 = cast[uint8](128 >> gx)
+                                if (bits & mask) != 0:
+                                    on = 1
+                            if is_cur != 0:
+                                # Solid dark cursor block; glyph ink on it
+                                # flips to body colour for legibility.
+                                if on != 0:
+                                    r = WIN_BODY_R
+                                    g = WIN_BODY_G
+                                    b = WIN_BODY_B
+                                else:
+                                    r = 24
+                                    g = 24
+                                    b = 24
+                            elif on != 0:
+                                r = 24
+                                g = 24
+                                b = 24
         wi = wi + 1
     # --- rubber band (1px outline of the in-progress drag rect) ---
     if DRAG_ACTIVE != 0:
@@ -1973,25 +2167,77 @@ def daemon_present() -> int32:
 # Returns the wid (>=2) on success, -1 on failure (still records the
 # rectangle as a chrome-only window so the gesture is visibly honoured).
 arg_buf_d: Array[2, uint64]
+in_pipe_d:  Array[2, int32]              # child stdin  pipe [r, w]
+out_pipe_d: Array[2, int32]             # child stdout pipe [r, w]
 def daemon_spawn_window(rx: int64, ry: int64, rw: int64, rh: int64):
     if DWIN_COUNT >= DMAX:
         return
+    slot: uint64 = DWIN_COUNT
+    # Two kernel pipes wire the child's stdio to this daemon:
+    #   in_pipe:  parent writes [1], child reads  [0]  (keystrokes)
+    #   out_pipe: child writes  [1], parent reads [0]  (shell output)
+    in_ok:  int32 = sys_pipe(&in_pipe_d[0])
+    out_ok: int32 = sys_pipe(&out_pipe_d[0])
+    child_in:  int32 = -1
+    child_out: int32 = -1
+    parent_in_w:  int32 = -1
+    parent_out_r: int32 = -1
+    if in_ok == 0 and out_ok == 0:
+        child_in     = in_pipe_d[0]      # child stdin  = read end
+        parent_in_w  = in_pipe_d[1]      # parent keeps write end
+        child_out    = out_pipe_d[1]     # child stdout = write end
+        parent_out_r = out_pipe_d[0]     # parent keeps read end
     wid: int32 = -1
     arg_buf_d[0] = cast[uint64](cast[Ptr[char]]("/bin/hamsh"))
     arg_buf_d[1] = 0
-    pid: int32 = sys_spawn("/bin/hamsh", &arg_buf_d[0],
-                           -2, -2, cast[Ptr[uint64]](0))
+    pid: int32 = -1
+    if child_in >= 0 and child_out >= 0:
+        # Real pipe fds -> the legacy integer-fd spawn path dups them into
+        # the child's fd 0/1 (and binds /fd/0,1,2 on its private namespace),
+        # so the spawned hamsh talks to OUR pipes, not the serial console.
+        pid = sys_spawn("/bin/hamsh", &arg_buf_d[0],
+                        child_in, child_out, cast[Ptr[uint64]](0))
+    else:
+        # Pipe allocation failed — fall back to the detached spawn so the
+        # gesture still produces a (headless) window.
+        pid = sys_spawn("/bin/hamsh", &arg_buf_d[0],
+                        -2, -2, cast[Ptr[uint64]](0))
     if pid >= 0:
         wid = sys_wsys_alloc(cast[uint64](pid))
         if wid < 0:
             # Table full / dup — reap the child so we don't leak it.
             sys_kill(pid, SIGTERM_D)
-    slot: uint64 = DWIN_COUNT
+    # The child has its own dup'd copies now; close OUR copies of the
+    # child ends so the pipe EOF/refcounts stay correct.
+    if child_in >= 0:
+        sys_close(child_in)
+    if child_out >= 0:
+        sys_close(child_out)
+    # Record the window + its terminal state.
     DWIN_X[slot] = rx
     DWIN_Y[slot] = ry
     DWIN_W[slot] = rw
     DWIN_H[slot] = rh
     DWIN_WID[slot] = wid
+    DWIN_PID[slot] = pid
+    DWIN_IN_FD[slot]  = parent_in_w
+    DWIN_OUT_FD[slot] = parent_out_r
+    # Grid geometry from the body region (window minus 2px border + title).
+    body_w: int64 = rw - 4
+    body_h: int64 = rh - TITLE_H - 2
+    cols: int64 = body_w / GLYPH_W
+    rows: int64 = body_h / GLYPH_H
+    if cols > GRID_COLS_MAX:
+        cols = GRID_COLS_MAX
+    if rows > GRID_ROWS_MAX:
+        rows = GRID_ROWS_MAX
+    if cols < 0:
+        cols = 0
+    if rows < 0:
+        rows = 0
+    DWIN_COLS[slot] = cols
+    DWIN_ROWS[slot] = rows
+    term_clear(slot)
     DWIN_COUNT = DWIN_COUNT + 1
     # If we got a real wid, plant a chrome layer on its draw surface so
     # the window is real on the wsys side too (best-effort).
@@ -2090,7 +2336,51 @@ def next_signed(buf: Ptr[uint8], pos: Ptr[uint64], total: uint64) -> int64:
     return v
 
 
-def cmd_daemon() -> int32:
+# Focused window = the most-recently-created one (topmost). Returns its
+# slot index, or -1 if there are no windows.
+def daemon_focus_slot() -> int64:
+    if DWIN_COUNT == 0:
+        return -1
+    return cast[int64](DWIN_COUNT) - 1
+
+
+# Drain /dev/cons (non-blocking) and route each keystroke byte to the
+# focused window's child-stdin pipe. Bytes are dropped when there is no
+# window (no background REPL competes for them — the daemon owns the
+# physical keyboard while it runs). Returns 1 if bytes were routed.
+def daemon_pump_keys() -> int32:
+    if cons_fd < 0:
+        return 0
+    fslot: int64 = daemon_focus_slot()
+    routed: int32 = 0
+    iters: int32 = 0
+    while iters < 16:
+        n: int64 = sys_read_nb(cons_fd, &cons_rx[0], 256)
+        iters = iters + 1
+        if n <= 0:
+            break
+        if fslot >= 0:
+            wfd: int32 = DWIN_IN_FD[cast[uint64](fslot)]
+            if wfd >= 0:
+                sys_write(wfd, &cons_rx[0], cast[uint64](n))
+                routed = 1
+        # else: no window — drop the bytes.
+    return routed
+
+
+# Drain every window's stdout pipe into its grid. Returns 1 if any
+# window produced output (the screen needs a re-present).
+def daemon_pump_terms() -> int32:
+    changed: int32 = 0
+    wi: uint64 = 0
+    while wi < DWIN_COUNT:
+        if term_pump(wi) != 0:
+            changed = 1
+        wi = wi + 1
+    return changed
+
+
+def cmd_daemon_auto(autoflag: int32) -> int32:
     if read_fb_geometry() == 0:
         write_str(2, "hamUId: daemon: cannot read /dev/fb geometry\n")
         return 1
@@ -2100,6 +2390,11 @@ def cmd_daemon() -> int32:
         write_str(2, "hamUId: daemon: cannot open /dev/mouse\n")
         return 1
     mouse_fd = mfd
+    # Open /dev/cons for keystroke polling (best-effort: if it fails the
+    # daemon still composites + spawns shells, just without key routing).
+    font_init()
+    cp: Ptr[uint8] = "/dev/cons"
+    cons_fd = sys_open(cast[Ptr[char]](cp))
     scr_w: int64 = cast[int64](FBG_W)
     scr_h: int64 = cast[int64](FBG_H)
     # Cursor starts at screen centre.
@@ -2123,19 +2418,46 @@ def cmd_daemon() -> int32:
     sys_write(1, &line[0], p)
     # First frame (backdrop + cursor at centre).
     daemon_present()
+    # Optional auto-window: create one terminal window programmatically
+    # (mouse-free) so a test can exercise the in-window shell. The rect
+    # is a fixed 480x320 box on the RIGHT half of the screen — clear of
+    # the kernel framebuffer text console, which renders an 80-column
+    # (~640px-wide) region anchored at the top-left and would otherwise
+    # repaint over a left-side window between the daemon's frames.
+    if autoflag != 0:
+        daemon_spawn_window(720, 80, 480, 320)
+        write_str(1, "DAEMON autowin created\n")
     # Main loop. Cooperative: yield every idle iteration so we never
     # monopolise the CPU and the spawned hamsh tasks still run.
     prev_wins: uint64 = DWIN_COUNT
+    idle_ctr: uint64 = 0
     while True:
         ch: int32 = daemon_pump_mouse(scr_w, scr_h)
+        # Route keystrokes to the focused window's shell, then drain
+        # every shell's stdout into its terminal grid.
+        daemon_pump_keys()
+        tch: int32 = daemon_pump_terms()
         # Re-present when the mouse moved/clicked, a drag is in progress
-        # (rubber band must track), or a window was just created.
+        # (rubber band must track), a window was created, or any shell
+        # emitted output (prompt / command echo).
         need: int32 = ch
+        if tch != 0:
+            need = 1
         if DRAG_ACTIVE != 0:
             need = 1
         if DWIN_COUNT != prev_wins:
             need = 1
             prev_wins = DWIN_COUNT
+        # The kernel framebuffer console (the foreground hamsh's
+        # heartbeat / log chatter) shares /dev/fb and repaints over the
+        # desktop. As the screen owner, the daemon periodically forces a
+        # full re-present so its desktop reasserts ownership even when
+        # nothing in the model changed — keeping windows continuously
+        # visible. (~once every 64 idle iterations.)
+        idle_ctr = idle_ctr + 1
+        if idle_ctr >= 64:
+            need = 1
+            idle_ctr = 0
         if need != 0:
             daemon_present()
         sys_yield()
@@ -2170,6 +2492,14 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
             return 1
         return cmd_present(pwid)
     if cstr_eq(verb, "daemon") != 0:
-        return cmd_daemon()
+        # Optional `autowin` arg: immediately drag-create one terminal
+        # window (mouse-free) so a non-interactive test can exercise the
+        # in-window shell without driving QEMU mouse events.
+        autoflag: int32 = 0
+        if argc >= 3:
+            a2: Ptr[uint8] = cast[Ptr[uint8]](argv[2])
+            if cstr_eq(a2, "autowin") != 0:
+                autoflag = 1
+        return cmd_daemon_auto(autoflag)
     usage(2)
     return 1
