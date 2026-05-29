@@ -126,16 +126,53 @@ bash scripts/build_modules.sh
 # without HAMNIX_BOOTLOADER_SLIM); that step expects build outputs
 # already present from a prior successful build_iso.sh run.
 
-echo "[build_iso] Building v1 hpm packages (build/packages/) for installer mini-repo"
-# HAMNIX_BOOTLOADER_SLIM=1: emit a metadata-only hamnix-bootloader
-# tarball. The full one would embed kernel.elf + BOOTX64.EFI inside a
-# cpio that itself is embedded in kernel.elf — a 73 MB recursion bomb
-# that overflows the 32 MB ESP. The installer copies BOOTX64.EFI +
-# kernel.elf onto the target ESP via dd_blk of the source ESP, so the
-# tarball payload isn't needed at install time. The full-payload
-# tarball at https://255.one/ is unchanged.
+echo "[build_iso] Deriving installer mirror from the packages submodule"
+# The ISO's installer mirror DERIVES FROM the canonical packages
+# submodule (HamnixOS/packages == https://255.one/), which is the
+# single source of truth for all packages. We regenerate the tree into
+# build/iso-packages/ with SLIM variants of the two packages that
+# physically cannot live inside the cpio:
+#   * hamnix-bootloader full = kernel.elf + BOOTX64.EFI embedded in a
+#     cpio that is itself embedded in kernel.elf — a recursion bomb.
+#     The installer copies BOOTX64.EFI + kernel.elf onto the target ESP
+#     via dd_blk of the source ESP, so the payload isn't needed here.
+#   * linux-debian-12 full = a 24 MB tarball that would overflow the
+#     32 MB ESP. The distro layer is delivered via the rootfs image /
+#     squashfs, not the cpio mirror.
+# The full-payload variants of BOTH live on 255.one unchanged.
+ISO_MIRROR="$(pwd)/build/iso-packages"
+rm -rf "$ISO_MIRROR"
 HAMNIX_BOOTLOADER_SLIM=1 HAMNIX_LINUX_DEBIAN_SLIM=1 \
-    python3 scripts/build_packages.py
+    HAMNIX_PACKAGES_OUT="$ISO_MIRROR" python3 scripts/build_packages.py
+
+# Drift gate: the canonical submodule MUST publish every package the
+# build produces. The per-command split regression was exactly this —
+# packages generated locally but never pushed to HamnixOS/packages, so
+# 255.one (and any fresh `hpm refresh`) stayed stale. Fail the ISO build
+# loudly if the submodule is missing any package name the build emits,
+# rather than silently embedding a mirror that diverges from the repo.
+SUBMODULE_PKGS="$(pwd)/packages"
+if [ -f "$SUBMODULE_PKGS/main/index.json" ]; then
+    python3 - "$ISO_MIRROR/main/index.json" "$SUBMODULE_PKGS/main/index.json" <<'PYEOF' || exit 1
+import json, sys
+built = {p["name"] for p in json.load(open(sys.argv[1]))["packages"]}
+repo  = {p["name"] for p in json.load(open(sys.argv[2]))["packages"]}
+missing = sorted(built - repo)
+if missing:
+    print(f"[build_iso] ERROR: the packages submodule is STALE — it does not "
+          f"publish {len(missing)} package(s) this build produces:", file=sys.stderr)
+    for m in missing:
+        print(f"  - {m}", file=sys.stderr)
+    print("[build_iso] Republish first:  cd packages && "
+          "HAMNIX_PACKAGES_OUT=\"$PWD\" python3 ../scripts/build_packages.py && "
+          "git add -A && git commit && git push", file=sys.stderr)
+    sys.exit(1)
+print(f"[build_iso] drift gate OK: submodule publishes all "
+      f"{len(built)} built packages.")
+PYEOF
+else
+    echo "[build_iso] WARNING: packages submodule not checked out — skipping drift gate (run: git submodule update --init packages)" >&2
+fi
 
 # Generate etc/install/rootfs.manifest from the curated Debian closure
 # (mirrors REAL_DEBIAN_FILES in scripts/build_rootfs_img.py). The
@@ -152,10 +189,14 @@ python3 scripts/gen_install_manifest.py
 # Debian tree, pushing the kernel ELF past 86 MB and overflowing the
 # 32 MB FAT12 ESP. Direct -kernel ELF tests that don't attach a
 # rootfs partition leave HAMNIX_CPIO_LEAN unset and get a fat cpio.
-# HAMNIX_ISO_PACKAGES: stage build/packages/ at /mnt/iso-packages/
-# in the cpio so the installer can `hpm --repo=file:///mnt/iso-packages
-# install ...` offline. Mirrors Debian's installer.
-HAMNIX_CPIO_LEAN=1 HAMNIX_ISO_PACKAGES="$(pwd)/build/packages" \
+# HAMNIX_ISO_PACKAGES: stage the derived ISO mirror ($ISO_MIRROR =
+# build/iso-packages) at /mnt/iso-packages/ in the cpio so the installer
+# can `hpm --repo=file:///mnt/iso-packages install ...` offline. That
+# mirror is the canonical submodule's package set with slim-swaps for
+# the two packages that can't live in the ESP (hamnix-bootloader,
+# linux-debian-12), and the drift gate above guarantees it doesn't
+# diverge from what 255.one publishes. Mirrors Debian's installer.
+HAMNIX_CPIO_LEAN=1 HAMNIX_ISO_PACKAGES="$ISO_MIRROR" \
     python3 scripts/build_initramfs.py
 
 # Build the ext4 rootfs image that will become partition 3 of the
