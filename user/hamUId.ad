@@ -1,0 +1,1569 @@
+# user/hamUId.ad
+#
+# hamUI Phase 4b — the userland renderer.
+#
+# Consumes the Phase 4a kernel draw FILE SURFACE under
+# /dev/wsys/<wid>/draw/ (docs/hamUI.md H-§G) and produces a composited
+# frame. The kernel side is complete and load-bearing; this tool only
+# reads/writes the cdev via open/read/write syscalls — it touches NO
+# kernel code.
+#
+# CLI shape
+# ---------
+#   hamUId render <wid>
+#       1. Read /dev/wsys/<wid>/draw       -> z-ascending layer listing.
+#       2. For each layer read its kind/z/opacity/geometry and, per kind,
+#          its markup or fb body.
+#       3. Markup layers: parse hamML v1, rasterise into a per-layer
+#          RGBA8888 buffer (rect fill, Bresenham line, embedded 8x16 mono
+#          bitmap text, <image src="fb:LAYER"> blits).
+#       4. Composite all layers in ascending z into a window-sized RGBA
+#          target, alpha-blending per-pixel alpha * per-layer opacity.
+#       5. Emit an AI-READABLE TEXT DUMP to stdout:
+#            - "DUMP wid=<w> win=<W>x<H> layers=<n>"
+#            - "PIX <x> <y> #rrggbb"  lines for a grid of probe coords
+#            - a low-res ASCII-art view ("ART" lines), '#' where a pixel
+#              is non-background, ' ' where background.
+#          A CI grep can assert "the rect fill colour appears at the
+#          rect's pixels" and "text-region probes are non-background".
+#       6. Also writes the composited bytes into an fb layer named
+#          "_screen" (created if absent) so the frame round-trips through
+#          the cdev too — best-effort; the stdout dump is the test hook.
+#
+# There is NO physical framebuffer yet (Phase 4c) and NO BDF font store
+# yet (Phase 4d), so this is a ONE-SHOT renderer with a compact built-in
+# 8x16 mono font. sans/serif fall back to mono (per spec). A persistent
+# boot daemon loop, dirty-rect diffing, hit-testing and the event stream
+# are deliberately deferred to later phases.
+#
+# Adder quirks honoured (feedback_compiler_quirks.md U9): big buffers at
+# module scope; string literals kept as call-site Ptr[uint8]; no adjacent
+# string-literal concatenation.
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_close(fd: int32) -> int32
+extern def sys_exit(code: uint64)
+
+
+# ---- window + layer caps (mirror the kernel cdev surface) ----------
+WIN_W: uint64 = 640
+WIN_H: uint64 = 480
+MAX_LAYERS: uint64 = 16          # WSYS_DRAW_MAX_LAYERS
+FB_DIM: uint64 = 256             # fb layers cap at 256x256 (256 KiB)
+
+# Background colour (opaque). 0x00 in the RGB channels, alpha 255.
+BG_R: uint8 = 0
+BG_G: uint8 = 0
+BG_B: uint8 = 0
+
+
+# ---- module-scope buffers ------------------------------------------
+# Compositor target: WIN_W * WIN_H * 4 = 640*480*4 = 1,228,800 bytes.
+target: Array[1228800, uint8]
+# One scratch RGBA layer buffer, also window-sized, reused per layer.
+layerbuf: Array[1228800, uint8]
+# Raw markup / fb read buffer (markup cap is 8192; fb cap is 256 KiB).
+markup_buf: Array[8192, uint8]
+fb_read_buf: Array[262144, uint8]
+
+# Decoded font: 95 glyphs * 16 rows = 1520 bytes, ASCII 0x20..0x7E.
+font_glyphs: Array[1520, uint8]
+font_ready: int32 = 0
+
+# Layer table parsed from the draw listing.
+LT_NAME: Array[512, uint8]       # MAX_LAYERS * 32 (WSYS_DRAW_NAME_CAP)
+LT_KIND: Array[16, int32]        # 0 = markup, 1 = fb
+LT_X: Array[16, int64]
+LT_Y: Array[16, int64]
+LT_W: Array[16, int64]
+LT_H: Array[16, int64]
+LT_OPAC: Array[16, int64]
+LT_COUNT: uint64 = 0
+
+# Scratch path builder.
+path_buf: Array[256, uint8]
+# Listing read buffer.
+list_buf: Array[4096, uint8]
+# Generic small line / number scratch.
+num_buf: Array[64, uint8]
+
+
+# ====================================================================
+# String / number helpers (mirrors user/hamUI.ad idioms)
+# ====================================================================
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+def cstr_eq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while a[i] != 0 and b[i] != 0:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    if a[i] != b[i]:
+        return 0
+    return 1
+
+
+def parse_uint(s: Ptr[uint8]) -> int32:
+    if s[0] == 0:
+        return -1
+    n: int32 = 0
+    i: uint64 = 0
+    while s[i] != 0:
+        c: uint8 = s[i]
+        if c < 48 or c > 57:
+            return -1
+        n = n * 10 + cast[int32](c) - 48
+        i = i + 1
+    return n
+
+
+def u64_to_dec(value: uint64, out: Ptr[uint8]) -> uint64:
+    # Decimal, NO trailing newline. Returns the digit count.
+    if value == 0:
+        out[0] = 48
+        return 1
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    v: uint64 = value
+    while v != 0:
+        digits[n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    nw: uint64 = n
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    return nw
+
+
+def hex_nibble(c: uint8) -> int32:
+    # ASCII hex digit -> 0..15, or -1.
+    if c >= 48 and c <= 57:
+        return cast[int32](c) - 48
+    if c >= 97 and c <= 102:
+        return cast[int32](c) - 97 + 10
+    if c >= 65 and c <= 70:
+        return cast[int32](c) - 65 + 10
+    return -1
+
+
+# Parse a (possibly signed) decimal integer from buf[start..end). Stops
+# at the first non-digit. Returns the value; *consumed via end pointer
+# is not needed by callers here.
+def parse_i64_span(buf: Ptr[uint8], start: uint64, end: uint64) -> int64:
+    i: uint64 = start
+    neg: int32 = 0
+    if i < end and buf[i] == 45:                # '-'
+        neg = 1
+        i = i + 1
+    v: int64 = 0
+    while i < end:
+        c: uint8 = buf[i]
+        if c < 48 or c > 57:
+            break
+        v = v * 10 + cast[int64](cast[int32](c) - 48)
+        i = i + 1
+    if neg != 0:
+        return 0 - v
+    return v
+
+
+# ====================================================================
+# Embedded 8x16 mono font (ASCII 0x20..0x7E)
+# Derived from drivers/video/console/fb_font_8x16.S (Linux VGA ROM
+# font, GPL-2.0; a verbatim hardware font dump). Each glyph is 16 rows;
+# row byte MSB = leftmost pixel.
+# ====================================================================
+
+def _font_hex(i: uint64) -> Ptr[uint8]:
+    if i == 0:
+        return "00000000000000000000000000000000"
+    if i == 1:
+        return "0000183c3c3c18181800181800000000"
+    if i == 2:
+        return "00666666240000000000000000000000"
+    if i == 3:
+        return "0000006c6cfe6c6c6cfe6c6c00000000"
+    if i == 4:
+        return "18187cc6c2c07c060686c67c18180000"
+    if i == 5:
+        return "00000000c2c60c183060c68600000000"
+    if i == 6:
+        return "0000386c6c3876dccccccc7600000000"
+    if i == 7:
+        return "00303030600000000000000000000000"
+    if i == 8:
+        return "00000c18303030303030180c00000000"
+    if i == 9:
+        return "000030180c0c0c0c0c0c183000000000"
+    if i == 10:
+        return "0000000000663cff3c66000000000000"
+    if i == 11:
+        return "000000000018187e1818000000000000"
+    if i == 12:
+        return "00000000000000000018181830000000"
+    if i == 13:
+        return "00000000000000fe0000000000000000"
+    if i == 14:
+        return "00000000000000000000181800000000"
+    if i == 15:
+        return "0000000002060c183060c08000000000"
+    if i == 16:
+        return "0000386cc6c6d6d6c6c66c3800000000"
+    if i == 17:
+        return "00001838781818181818187e00000000"
+    if i == 18:
+        return "00007cc6060c183060c0c6fe00000000"
+    if i == 19:
+        return "00007cc606063c060606c67c00000000"
+    if i == 20:
+        return "00000c1c3c6cccfe0c0c0c1e00000000"
+    if i == 21:
+        return "0000fec0c0c0fc060606c67c00000000"
+    if i == 22:
+        return "00003860c0c0fcc6c6c6c67c00000000"
+    if i == 23:
+        return "0000fec606060c183030303000000000"
+    if i == 24:
+        return "00007cc6c6c67cc6c6c6c67c00000000"
+    if i == 25:
+        return "00007cc6c6c67e0606060c7800000000"
+    if i == 26:
+        return "00000000181800000018180000000000"
+    if i == 27:
+        return "00000000181800000018183000000000"
+    if i == 28:
+        return "000000060c18306030180c0600000000"
+    if i == 29:
+        return "00000000007e00007e00000000000000"
+    if i == 30:
+        return "0000006030180c060c18306000000000"
+    if i == 31:
+        return "00007cc6c60c18181800181800000000"
+    if i == 32:
+        return "0000007cc6c6dedededcc07c00000000"
+    if i == 33:
+        return "000010386cc6c6fec6c6c6c600000000"
+    if i == 34:
+        return "0000fc6666667c66666666fc00000000"
+    if i == 35:
+        return "00003c66c2c0c0c0c0c2663c00000000"
+    if i == 36:
+        return "0000f86c6666666666666cf800000000"
+    if i == 37:
+        return "0000fe6662687868606266fe00000000"
+    if i == 38:
+        return "0000fe6662687868606060f000000000"
+    if i == 39:
+        return "00003c66c2c0c0dec6c6663a00000000"
+    if i == 40:
+        return "0000c6c6c6c6fec6c6c6c6c600000000"
+    if i == 41:
+        return "00003c18181818181818183c00000000"
+    if i == 42:
+        return "00001e0c0c0c0c0ccccccc7800000000"
+    if i == 43:
+        return "0000e666666c78786c6666e600000000"
+    if i == 44:
+        return "0000f06060606060606266fe00000000"
+    if i == 45:
+        return "0000c6eefefed6c6c6c6c6c600000000"
+    if i == 46:
+        return "0000c6e6f6fedecec6c6c6c600000000"
+    if i == 47:
+        return "00007cc6c6c6c6c6c6c6c67c00000000"
+    if i == 48:
+        return "0000fc6666667c60606060f000000000"
+    if i == 49:
+        return "00007cc6c6c6c6c6c6d6de7c0c0e0000"
+    if i == 50:
+        return "0000fc6666667c6c666666e600000000"
+    if i == 51:
+        return "00007cc6c660380c06c6c67c00000000"
+    if i == 52:
+        return "00007e7e5a1818181818183c00000000"
+    if i == 53:
+        return "0000c6c6c6c6c6c6c6c6c67c00000000"
+    if i == 54:
+        return "0000c6c6c6c6c6c6c66c381000000000"
+    if i == 55:
+        return "0000c6c6c6c6d6d6d6feee6c00000000"
+    if i == 56:
+        return "0000c6c66c7c38387c6cc6c600000000"
+    if i == 57:
+        return "0000666666663c181818183c00000000"
+    if i == 58:
+        return "0000fec6860c183060c2c6fe00000000"
+    if i == 59:
+        return "00003c30303030303030303c00000000"
+    if i == 60:
+        return "00000080c0e070381c0e060200000000"
+    if i == 61:
+        return "00003c0c0c0c0c0c0c0c0c3c00000000"
+    if i == 62:
+        return "10386cc6000000000000000000000000"
+    if i == 63:
+        return "00000000000000000000000000ff0000"
+    if i == 64:
+        return "0030180c000000000000000000000000"
+    if i == 65:
+        return "0000000000780c7ccccccc7600000000"
+    if i == 66:
+        return "0000e06060786c666666667c00000000"
+    if i == 67:
+        return "00000000007cc6c0c0c0c67c00000000"
+    if i == 68:
+        return "00001c0c0c3c6ccccccccc7600000000"
+    if i == 69:
+        return "00000000007cc6fec0c0c67c00000000"
+    if i == 70:
+        return "00001c36323078303030307800000000"
+    if i == 71:
+        return "000000000076cccccccccc7c0ccc7800"
+    if i == 72:
+        return "0000e060606c7666666666e600000000"
+    if i == 73:
+        return "00001818003818181818183c00000000"
+    if i == 74:
+        return "00000606000e06060606060666663c00"
+    if i == 75:
+        return "0000e06060666c78786c66e600000000"
+    if i == 76:
+        return "00003818181818181818183c00000000"
+    if i == 77:
+        return "0000000000ecfed6d6d6d6c600000000"
+    if i == 78:
+        return "0000000000dc66666666666600000000"
+    if i == 79:
+        return "00000000007cc6c6c6c6c67c00000000"
+    if i == 80:
+        return "0000000000dc66666666667c6060f000"
+    if i == 81:
+        return "000000000076cccccccccc7c0c0c1e00"
+    if i == 82:
+        return "0000000000dc7666606060f000000000"
+    if i == 83:
+        return "00000000007cc660380cc67c00000000"
+    if i == 84:
+        return "0000103030fc30303030361c00000000"
+    if i == 85:
+        return "0000000000cccccccccccc7600000000"
+    if i == 86:
+        return "0000000000c6c6c6c6c66c3800000000"
+    if i == 87:
+        return "0000000000c6c6d6d6d6fe6c00000000"
+    if i == 88:
+        return "0000000000c66c3838386cc600000000"
+    if i == 89:
+        return "0000000000c6c6c6c6c6c67e060cf800"
+    if i == 90:
+        return "0000000000fecc183060c6fe00000000"
+    if i == 91:
+        return "00000e18181870181818180e00000000"
+    if i == 92:
+        return "00001818181818181818181800000000"
+    if i == 93:
+        return "0000701818180e181818187000000000"
+    if i == 94:
+        return "0076dc00000000000000000000000000"
+    return "00000000000000000000000000000000"
+
+
+def font_init():
+    if font_ready != 0:
+        return
+    g: uint64 = 0
+    while g < 95:
+        hexs: Ptr[uint8] = _font_hex(g)
+        r: uint64 = 0
+        while r < 16:
+            hi: int32 = hex_nibble(hexs[r * 2])
+            lo: int32 = hex_nibble(hexs[r * 2 + 1])
+            font_glyphs[g * 16 + r] = cast[uint8]((hi * 16) + lo)
+            r = r + 1
+        g = g + 1
+    font_ready = 1
+
+
+# ====================================================================
+# Compositor target helpers
+# ====================================================================
+
+def target_clear():
+    # Fill the window-sized target with the opaque background colour.
+    y: uint64 = 0
+    while y < WIN_H:
+        x: uint64 = 0
+        while x < WIN_W:
+            o: uint64 = (y * WIN_W + x) * 4
+            target[o] = BG_R
+            target[o + 1] = BG_G
+            target[o + 2] = BG_B
+            target[o + 3] = 255
+            x = x + 1
+        y = y + 1
+
+
+def layerbuf_clear():
+    # Zero (transparent) the per-layer RGBA scratch. Premultiplied: all
+    # channels 0 = fully transparent.
+    i: uint64 = 0
+    n: uint64 = WIN_W * WIN_H * 4
+    while i < n:
+        layerbuf[i] = 0
+        i = i + 1
+
+
+# Set a layer-buffer pixel (premultiplied RGBA) with src-over blend onto
+# whatever is already in the layer buffer. (r,g,b,a) are straight 0..255
+# component values for the incoming colour; we premultiply on store.
+def layer_put(x: int64, y: int64, r: uint8, g: uint8, b: uint8, a: uint8):
+    if x < 0 or y < 0:
+        return
+    xu: uint64 = cast[uint64](x)
+    yu: uint64 = cast[uint64](y)
+    if xu >= WIN_W or yu >= WIN_H:
+        return
+    if a == 0:
+        return
+    o: uint64 = (yu * WIN_W + xu) * 4
+    av: uint64 = cast[uint64](a)
+    inv: uint64 = 255 - av
+    # Premultiply the incoming colour by its own alpha, then src-over
+    # against the existing premultiplied destination.
+    sr: uint64 = (cast[uint64](r) * av) / 255
+    sg: uint64 = (cast[uint64](g) * av) / 255
+    sb: uint64 = (cast[uint64](b) * av) / 255
+    dr: uint64 = cast[uint64](layerbuf[o])
+    dg: uint64 = cast[uint64](layerbuf[o + 1])
+    db: uint64 = cast[uint64](layerbuf[o + 2])
+    da: uint64 = cast[uint64](layerbuf[o + 3])
+    layerbuf[o] = cast[uint8](sr + (dr * inv) / 255)
+    layerbuf[o + 1] = cast[uint8](sg + (dg * inv) / 255)
+    layerbuf[o + 2] = cast[uint8](sb + (db * inv) / 255)
+    layerbuf[o + 3] = cast[uint8](av + (da * inv) / 255)
+
+
+# ====================================================================
+# hamML colour parsing
+# ====================================================================
+# A parsed colour is returned via four out-bytes + a "present" flag.
+
+def parse_color(buf: Ptr[uint8], start: uint64, end: uint64,
+                out_r: Ptr[uint8], out_g: Ptr[uint8],
+                out_b: Ptr[uint8], out_a: Ptr[uint8]) -> int32:
+    # Supports "#rrggbb", "#rgb" and "rgba(r,g,b,a)" (a = 0..255).
+    # Returns 1 on success.
+    i: uint64 = start
+    while i < end and (buf[i] == 32 or buf[i] == 9):
+        i = i + 1
+    if i >= end:
+        return 0
+    if buf[i] == 35:                                 # '#'
+        i = i + 1
+        # count hex digits available
+        h0: uint64 = i
+        while i < end and hex_nibble(buf[i]) >= 0:
+            i = i + 1
+        ndig: uint64 = i - h0
+        if ndig >= 6:
+            out_r[0] = cast[uint8]((hex_nibble(buf[h0]) * 16) + hex_nibble(buf[h0 + 1]))
+            out_g[0] = cast[uint8]((hex_nibble(buf[h0 + 2]) * 16) + hex_nibble(buf[h0 + 3]))
+            out_b[0] = cast[uint8]((hex_nibble(buf[h0 + 4]) * 16) + hex_nibble(buf[h0 + 5]))
+            out_a[0] = 255
+            return 1
+        if ndig >= 3:
+            # #rgb -> #rrggbb
+            rr: int32 = hex_nibble(buf[h0])
+            gg: int32 = hex_nibble(buf[h0 + 1])
+            bb: int32 = hex_nibble(buf[h0 + 2])
+            out_r[0] = cast[uint8](rr * 16 + rr)
+            out_g[0] = cast[uint8](gg * 16 + gg)
+            out_b[0] = cast[uint8](bb * 16 + bb)
+            out_a[0] = 255
+            return 1
+        return 0
+    # rgba( / rgb(
+    if buf[i] == 114:                                # 'r'
+        # skip to '('
+        while i < end and buf[i] != 40:
+            i = i + 1
+        if i >= end:
+            return 0
+        i = i + 1
+        comp: Array[4, int64]
+        comp[0] = 0
+        comp[1] = 0
+        comp[2] = 0
+        comp[3] = 255
+        ci: uint64 = 0
+        while i < end and buf[i] != 41 and ci < 4:
+            while i < end and (buf[i] == 32 or buf[i] == 9):
+                i = i + 1
+            v: int64 = 0
+            got: int32 = 0
+            while i < end and buf[i] >= 48 and buf[i] <= 57:
+                v = v * 10 + cast[int64](cast[int32](buf[i]) - 48)
+                got = 1
+                i = i + 1
+            if got != 0:
+                comp[ci] = v
+                ci = ci + 1
+            while i < end and buf[i] != 44 and buf[i] != 41:
+                i = i + 1
+            if i < end and buf[i] == 44:
+                i = i + 1
+        out_r[0] = cast[uint8](comp[0])
+        out_g[0] = cast[uint8](comp[1])
+        out_b[0] = cast[uint8](comp[2])
+        out_a[0] = cast[uint8](comp[3])
+        return 1
+    return 0
+
+
+# ====================================================================
+# hamML attribute extraction
+# ====================================================================
+# Given a tag's attribute span [astart, aend) inside markup_buf, find an
+# attribute named `name` and return its raw VALUE span via out_vs/out_ve.
+# Returns 1 if found. Values may be unquoted (x=10) or quoted (fill="#f00").
+
+def find_attr(astart: uint64, aend: uint64, name: Ptr[uint8],
+              out_vs: Ptr[uint64], out_ve: Ptr[uint64]) -> int32:
+    nlen: uint64 = strlen_u8(name)
+    i: uint64 = astart
+    while i < aend:
+        # skip whitespace
+        while i < aend and (markup_buf[i] == 32 or markup_buf[i] == 9 or
+                            markup_buf[i] == 10 or markup_buf[i] == 13):
+            i = i + 1
+        # read an attribute name
+        ns: uint64 = i
+        while i < aend and markup_buf[i] != 61 and markup_buf[i] != 32 and \
+              markup_buf[i] != 9 and markup_buf[i] != 10 and \
+              markup_buf[i] != 13 and markup_buf[i] != 47 and \
+              markup_buf[i] != 62:
+            i = i + 1
+        ne: uint64 = i
+        # skip whitespace before '='
+        while i < aend and (markup_buf[i] == 32 or markup_buf[i] == 9):
+            i = i + 1
+        if i < aend and markup_buf[i] == 61:           # '='
+            i = i + 1
+            while i < aend and (markup_buf[i] == 32 or markup_buf[i] == 9):
+                i = i + 1
+            vs: uint64 = 0
+            ve: uint64 = 0
+            if i < aend and (markup_buf[i] == 34 or markup_buf[i] == 39):
+                q: uint8 = markup_buf[i]
+                i = i + 1
+                vs = i
+                while i < aend and markup_buf[i] != q:
+                    i = i + 1
+                ve = i
+                if i < aend:
+                    i = i + 1
+            else:
+                vs = i
+                while i < aend and markup_buf[i] != 32 and markup_buf[i] != 9 and \
+                      markup_buf[i] != 10 and markup_buf[i] != 13 and \
+                      markup_buf[i] != 47 and markup_buf[i] != 62:
+                    i = i + 1
+                ve = i
+            # name match?
+            if (ne - ns) == nlen:
+                k: uint64 = 0
+                matched: int32 = 1
+                while k < nlen:
+                    if markup_buf[ns + k] != name[k]:
+                        matched = 0
+                        k = nlen
+                    else:
+                        k = k + 1
+                if matched != 0:
+                    out_vs[0] = vs
+                    out_ve[0] = ve
+                    return 1
+        else:
+            # attribute with no value (rare); skip on
+            i = ne + 1
+    return 0
+
+
+def attr_i64(astart: uint64, aend: uint64, name: Ptr[uint8],
+             dflt: int64) -> int64:
+    vs: Array[1, uint64]
+    ve: Array[1, uint64]
+    if find_attr(astart, aend, name, &vs[0], &ve[0]) == 0:
+        return dflt
+    return parse_i64_span(&markup_buf[0], vs[0], ve[0])
+
+
+# ====================================================================
+# Rasterising primitives into the current layer buffer
+# ====================================================================
+
+def raster_rect(x: int64, y: int64, w: int64, h: int64,
+                r: uint8, g: uint8, b: uint8, a: uint8):
+    yy: int64 = y
+    ymax: int64 = y + h
+    while yy < ymax:
+        xx: int64 = x
+        xmax: int64 = x + w
+        while xx < xmax:
+            layer_put(xx, yy, r, g, b, a)
+            xx = xx + 1
+        yy = yy + 1
+
+
+def iabs(v: int64) -> int64:
+    if v < 0:
+        return 0 - v
+    return v
+
+
+def raster_line(x0: int64, y0: int64, x1: int64, y1: int64, width: int64,
+                r: uint8, g: uint8, b: uint8, a: uint8):
+    # Bresenham. `width` thickens by stamping a (width x width) block.
+    dx: int64 = iabs(x1 - x0)
+    dy: int64 = 0 - iabs(y1 - y0)
+    sx: int64 = -1
+    if x0 < x1:
+        sx = 1
+    sy: int64 = -1
+    if y0 < y1:
+        sy = 1
+    err: int64 = dx + dy
+    cx: int64 = x0
+    cy: int64 = y0
+    half: int64 = width / 2
+    while True:
+        # stamp a width x width block centred on (cx,cy)
+        oy: int64 = 0 - half
+        while oy <= half:
+            ox: int64 = 0 - half
+            while ox <= half:
+                layer_put(cx + ox, cy + oy, r, g, b, a)
+                ox = ox + 1
+            oy = oy + 1
+        if cx == x1 and cy == y1:
+            break
+        e2: int64 = err * 2
+        if e2 >= dy:
+            err = err + dy
+            cx = cx + sx
+        if e2 <= dx:
+            err = err + dx
+            cy = cy + sy
+
+
+def raster_glyph(ch: uint8, x: int64, y: int64,
+                 r: uint8, g: uint8, b: uint8, a: uint8):
+    # 8x16 mono glyph; (x,y) is the TOP-LEFT of the cell.
+    if ch < 32 or ch > 126:
+        return
+    gi: uint64 = cast[uint64](ch) - 32
+    row: uint64 = 0
+    while row < 16:
+        bits: uint8 = font_glyphs[gi * 16 + row]
+        col: uint64 = 0
+        while col < 8:
+            mask: uint8 = cast[uint8](128 >> col)
+            if (bits & mask) != 0:
+                layer_put(x + cast[int64](col), y + cast[int64](row), r, g, b, a)
+            col = col + 1
+        row = row + 1
+
+
+def raster_text(text_s: uint64, text_e: uint64, x: int64, y: int64,
+                r: uint8, g: uint8, b: uint8, a: uint8):
+    # Render markup_buf[text_s..text_e) as 8x16 mono. The hamML `y` is
+    # the text BASELINE-ish anchor; we treat it as the cell top for the
+    # mono font (good enough for v1 / AI-debug). Advance 8 px per glyph.
+    cx: int64 = x
+    i: uint64 = text_s
+    while i < text_e:
+        c: uint8 = markup_buf[i]
+        if c == 10 or c == 13:
+            i = i + 1
+        else:
+            raster_glyph(c, cx, y, r, g, b, a)
+            cx = cx + 8
+            i = i + 1
+
+
+# Blit a referenced fb LAYER's buffer into the current layer at (dx,dy).
+# `src_slot` is the layer-table index of the referenced layer.
+def raster_image_fb(src_slot: uint64, dx: int64, dy: int64,
+                    dw: int64, dh: int64):
+    # Read the source layer's fb body into fb_read_buf.
+    nread: int64 = read_layer_fb(src_slot)
+    if nread <= 0:
+        return
+    sw: int64 = LT_W[src_slot]
+    sh: int64 = LT_H[src_slot]
+    if sw > cast[int64](FB_DIM):
+        sw = cast[int64](FB_DIM)
+    if sh > cast[int64](FB_DIM):
+        sh = cast[int64](FB_DIM)
+    # default destination size = source size
+    tw: int64 = dw
+    th: int64 = dh
+    if tw <= 0:
+        tw = sw
+    if th <= 0:
+        th = sh
+    yy: int64 = 0
+    while yy < th:
+        xx: int64 = 0
+        while xx < tw:
+            # nearest-neighbour sample
+            srx: int64 = (xx * sw) / tw
+            sry: int64 = (yy * sh) / th
+            if srx < sw and sry < sh:
+                so: uint64 = cast[uint64](sry * sw + srx) * 4
+                if so + 3 < cast[uint64](nread):
+                    pr: uint8 = fb_read_buf[so]
+                    pg: uint8 = fb_read_buf[so + 1]
+                    pb: uint8 = fb_read_buf[so + 2]
+                    pa: uint8 = fb_read_buf[so + 3]
+                    # fb is premultiplied; un-premultiply is unnecessary
+                    # because layer_put premultiplies by `a` again. For a
+                    # faithful blit we treat stored RGB as straight and
+                    # pass alpha through.
+                    layer_put(dx + xx, dy + yy, pr, pg, pb, pa)
+            xx = xx + 1
+        yy = yy + 1
+
+
+# ====================================================================
+# Path building + cdev reads
+# ====================================================================
+
+def build_path(wid: int32, layer: Ptr[uint8], leaf: Ptr[uint8]):
+    # Compose "/dev/wsys/<wid>/draw[/<layer>][/<leaf>]" into path_buf.
+    # layer NULL/empty -> ".../draw"; leaf NULL/empty -> no trailing leaf.
+    p: Ptr[uint8] = "/dev/wsys/"
+    i: uint64 = 0
+    j: uint64 = 0
+    while p[j] != 0:
+        path_buf[i] = p[j]
+        i = i + 1
+        j = j + 1
+    nb: uint64 = u64_to_dec(cast[uint64](wid), &path_buf[i])
+    i = i + nb
+    d: Ptr[uint8] = "/draw"
+    j = 0
+    while d[j] != 0:
+        path_buf[i] = d[j]
+        i = i + 1
+        j = j + 1
+    if layer != cast[Ptr[uint8]](0) and layer[0] != 0:
+        path_buf[i] = 47                              # '/'
+        i = i + 1
+        j = 0
+        while layer[j] != 0:
+            path_buf[i] = layer[j]
+            i = i + 1
+            j = j + 1
+        if leaf != cast[Ptr[uint8]](0) and leaf[0] != 0:
+            path_buf[i] = 47
+            i = i + 1
+            j = 0
+            while leaf[j] != 0:
+                path_buf[i] = leaf[j]
+                i = i + 1
+                j = j + 1
+    path_buf[i] = 0
+
+
+def read_whole(fd: int32, buf: Ptr[uint8], cap: uint64) -> int64:
+    total: uint64 = 0
+    while total < cap:
+        n: int64 = sys_read(fd, &buf[total], cap - total)
+        if n <= 0:
+            break
+        total = total + cast[uint64](n)
+    return cast[int64](total)
+
+
+def layer_name_ptr(slot: uint64) -> Ptr[uint8]:
+    return &LT_NAME[slot * 32]
+
+
+def read_layer_markup(wid: int32, slot: uint64) -> int64:
+    build_path(wid, layer_name_ptr(slot), "markup")
+    fd: int32 = sys_open(cast[Ptr[char]](&path_buf[0]))
+    if fd < 0:
+        return -1
+    n: int64 = read_whole(fd, &markup_buf[0], 8192)
+    sys_close(fd)
+    return n
+
+
+# read_layer_fb reads the layer at table-index `slot` into fb_read_buf.
+# Returns bytes read.
+read_fb_wid: int32 = 1
+def read_layer_fb(slot: uint64) -> int64:
+    build_path(read_fb_wid, layer_name_ptr(slot), "fb")
+    fd: int32 = sys_open(cast[Ptr[char]](&path_buf[0]))
+    if fd < 0:
+        return -1
+    n: int64 = read_whole(fd, &fb_read_buf[0], 262144)
+    sys_close(fd)
+    return n
+
+
+def read_layer_opacity(wid: int32, slot: uint64) -> int64:
+    build_path(wid, layer_name_ptr(slot), "opacity")
+    fd: int32 = sys_open(cast[Ptr[char]](&path_buf[0]))
+    if fd < 0:
+        return 255
+    n: int64 = read_whole(fd, &num_buf[0], 64)
+    sys_close(fd)
+    if n <= 0:
+        return 255
+    return parse_i64_span(&num_buf[0], 0, cast[uint64](n))
+
+
+# ====================================================================
+# Parse the draw listing into the layer table
+# ====================================================================
+# Each listing line:
+#   "<name>  z=<z>  kind=<markup|fb>  <x>x<y>..<x2>x<y2>  opacity=<o>"
+
+def parse_listing(wid: int32) -> int32:
+    build_path(wid, cast[Ptr[uint8]](0), cast[Ptr[uint8]](0))
+    fd: int32 = sys_open(cast[Ptr[char]](&path_buf[0]))
+    if fd < 0:
+        return -1
+    n: int64 = read_whole(fd, &list_buf[0], 4096)
+    sys_close(fd)
+    if n < 0:
+        return -1
+    total: uint64 = cast[uint64](n)
+    LT_COUNT = 0
+    i: uint64 = 0
+    while i < total and LT_COUNT < MAX_LAYERS:
+        ls: uint64 = i
+        while i < total and list_buf[i] != 10:
+            i = i + 1
+        le: uint64 = i
+        if i < total:
+            i = i + 1
+        if le > ls:
+            parse_listing_line(ls, le)
+    return 0
+
+
+def parse_listing_line(ls: uint64, le: uint64):
+    slot: uint64 = LT_COUNT
+    # name = run up to first space
+    p: uint64 = ls
+    while p < le and list_buf[p] != 32:
+        p = p + 1
+    nlen: uint64 = p - ls
+    if nlen >= 32:
+        nlen = 31
+    k: uint64 = 0
+    while k < nlen:
+        LT_NAME[slot * 32 + k] = list_buf[ls + k]
+        k = k + 1
+    LT_NAME[slot * 32 + nlen] = 0
+    # find "kind=" -> markup/fb
+    LT_KIND[slot] = 0
+    kk: uint64 = find_substr(ls, le, "kind=")
+    if kk < le:
+        c: uint8 = list_buf[kk + 5]
+        if c == 102:                                  # 'f' (fb)
+            LT_KIND[slot] = 1
+    # geometry "<x>x<y>..<x2>x<y2>": parse the two corner pairs.
+    gg: uint64 = find_geom(ls, le)
+    x0: int64 = 0
+    y0: int64 = 0
+    x1: int64 = 0
+    y1: int64 = 0
+    if gg < le:
+        q: uint64 = gg
+        x0 = parse_i64_span(&list_buf[0], q, le)
+        while q < le and list_buf[q] != 120:          # 'x'
+            q = q + 1
+        if q < le:
+            q = q + 1
+        y0 = parse_i64_span(&list_buf[0], q, le)
+        while q < le and list_buf[q] != 46:           # '.'
+            q = q + 1
+        while q < le and list_buf[q] == 46:
+            q = q + 1
+        x1 = parse_i64_span(&list_buf[0], q, le)
+        while q < le and list_buf[q] != 120:
+            q = q + 1
+        if q < le:
+            q = q + 1
+        y1 = parse_i64_span(&list_buf[0], q, le)
+    LT_X[slot] = x0
+    LT_Y[slot] = y0
+    LT_W[slot] = x1 - x0
+    LT_H[slot] = y1 - y0
+    # opacity
+    oo: uint64 = find_substr(ls, le, "opacity=")
+    if oo < le:
+        LT_OPAC[slot] = parse_i64_span(&list_buf[0], oo + 8, le)
+    else:
+        LT_OPAC[slot] = 255
+    LT_COUNT = LT_COUNT + 1
+
+
+def find_substr(ls: uint64, le: uint64, needle: Ptr[uint8]) -> uint64:
+    nlen: uint64 = strlen_u8(needle)
+    i: uint64 = ls
+    while i + nlen <= le:
+        k: uint64 = 0
+        ok: int32 = 1
+        while k < nlen:
+            if list_buf[i + k] != needle[k]:
+                ok = 0
+                k = nlen
+            else:
+                k = k + 1
+        if ok != 0:
+            return i
+        i = i + 1
+    return le
+
+
+# Find the geometry field: the first run of digits that is FOLLOWED by an
+# 'x' then digits then ".." . We locate it after the "kind=..." token by
+# scanning for the ".." separator and backing up to its number start.
+def find_geom(ls: uint64, le: uint64) -> uint64:
+    # Find the ".." then walk backward to the start of <x>.
+    dd: uint64 = le
+    i: uint64 = ls
+    while i + 1 < le:
+        if list_buf[i] == 46 and list_buf[i + 1] == 46:
+            dd = i
+            i = le
+        else:
+            i = i + 1
+    if dd >= le:
+        return le
+    # back up over "<x>x<y>" — find the start: skip back over digits,
+    # one 'x', digits, to a leading space.
+    j: uint64 = dd
+    # j currently at first '.'; the char before is the last digit of y0.
+    while j > ls and list_buf[j - 1] != 32:
+        j = j - 1
+    return j
+
+
+# ====================================================================
+# Layer rasterisation: parse hamML and draw into layerbuf
+# ====================================================================
+
+def slot_for_fbref(name_s: uint64, name_e: uint64) -> int64:
+    # Match markup_buf[name_s..name_e) against a layer name in the table.
+    si: uint64 = 0
+    while si < LT_COUNT:
+        lp: Ptr[uint8] = layer_name_ptr(si)
+        ll: uint64 = strlen_u8(lp)
+        if ll == (name_e - name_s):
+            k: uint64 = 0
+            ok: int32 = 1
+            while k < ll:
+                if lp[k] != markup_buf[name_s + k]:
+                    ok = 0
+                    k = ll
+                else:
+                    k = k + 1
+            if ok != 0:
+                return cast[int64](si)
+        si = si + 1
+    return -1
+
+
+def rasterise_markup(wid: int32, slot: uint64):
+    n: int64 = read_layer_markup(wid, slot)
+    if n <= 0:
+        return
+    total: uint64 = cast[uint64](n)
+    # group translate accumulator (translate-only v1)
+    gtx: int64 = 0
+    gty: int64 = 0
+    i: uint64 = 0
+    while i < total:
+        if markup_buf[i] != 60:                        # '<'
+            i = i + 1
+        else:
+            ts: uint64 = i + 1
+            # closing tag?
+            if ts < total and markup_buf[ts] == 47:    # '</'
+                # check for </group>
+                if tag_is(ts + 1, total, "group"):
+                    gtx = 0
+                    gty = 0
+                # skip to '>'
+                while i < total and markup_buf[i] != 62:
+                    i = i + 1
+                i = i + 1
+            else:
+                # read tag name
+                ne: uint64 = ts
+                while ne < total and markup_buf[ne] != 32 and \
+                      markup_buf[ne] != 9 and markup_buf[ne] != 10 and \
+                      markup_buf[ne] != 13 and markup_buf[ne] != 62 and \
+                      markup_buf[ne] != 47:
+                    ne = ne + 1
+                astart: uint64 = ne
+                # find end of tag '>'
+                te: uint64 = ne
+                while te < total and markup_buf[te] != 62:
+                    te = te + 1
+                aend: uint64 = te
+                # self-closing? trailing '/'
+                # (we don't special-case; attrs parse the same)
+                handle_tag(wid, ts, ne, astart, aend, gtx, gty,
+                           &gtx, &gty, total)
+                i = te + 1
+    return
+
+
+def tag_is(s: uint64, total: uint64, name: Ptr[uint8]) -> int32:
+    nlen: uint64 = strlen_u8(name)
+    k: uint64 = 0
+    while k < nlen:
+        if s + k >= total:
+            return 0
+        if markup_buf[s + k] != name[k]:
+            return 0
+        k = k + 1
+    return 1
+
+
+def handle_tag(wid: int32, ns: uint64, ne: uint64,
+               astart: uint64, aend: uint64,
+               gtx: int64, gty: int64,
+               gtx_out: Ptr[int64], gty_out: Ptr[int64],
+               total: uint64):
+    # default colours
+    r: Array[1, uint8]
+    g: Array[1, uint8]
+    b: Array[1, uint8]
+    a: Array[1, uint8]
+    if tag_is(ns, total, "rect") != 0 and (ne - ns) == 4:
+        x: int64 = attr_i64(astart, aend, "x", 0) + gtx
+        y: int64 = attr_i64(astart, aend, "y", 0) + gty
+        w: int64 = attr_i64(astart, aend, "w", 0)
+        h: int64 = attr_i64(astart, aend, "h", 0)
+        r[0] = 255
+        g[0] = 255
+        b[0] = 255
+        a[0] = 255
+        get_fill(astart, aend, &r[0], &g[0], &b[0], &a[0])
+        raster_rect(x, y, w, h, r[0], g[0], b[0], a[0])
+        return
+    if tag_is(ns, total, "line") != 0 and (ne - ns) == 4:
+        x1: int64 = attr_i64(astart, aend, "x1", 0) + gtx
+        y1: int64 = attr_i64(astart, aend, "y1", 0) + gty
+        x2: int64 = attr_i64(astart, aend, "x2", 0) + gtx
+        y2: int64 = attr_i64(astart, aend, "y2", 0) + gty
+        wd: int64 = attr_i64(astart, aend, "width", 1)
+        if wd < 1:
+            wd = 1
+        r[0] = 200
+        g[0] = 200
+        b[0] = 200
+        a[0] = 255
+        get_stroke(astart, aend, &r[0], &g[0], &b[0], &a[0])
+        raster_line(x1, y1, x2, y2, wd, r[0], g[0], b[0], a[0])
+        return
+    if tag_is(ns, total, "text") != 0 and (ne - ns) == 4:
+        x: int64 = attr_i64(astart, aend, "x", 0) + gtx
+        y: int64 = attr_i64(astart, aend, "y", 0) + gty
+        r[0] = 255
+        g[0] = 255
+        b[0] = 255
+        a[0] = 255
+        get_fill(astart, aend, &r[0], &g[0], &b[0], &a[0])
+        # text content is between aend+1 ('>') and the next '<'
+        cs: uint64 = aend + 1
+        ce: uint64 = cs
+        while ce < total and markup_buf[ce] != 60:
+            ce = ce + 1
+        raster_text(cs, ce, x, y, r[0], g[0], b[0], a[0])
+        return
+    if tag_is(ns, total, "button") != 0 and (ne - ns) == 6:
+        # draw a filled box + label text
+        x: int64 = attr_i64(astart, aend, "x", 0) + gtx
+        y: int64 = attr_i64(astart, aend, "y", 0) + gty
+        w: int64 = attr_i64(astart, aend, "w", 64)
+        h: int64 = attr_i64(astart, aend, "h", 20)
+        r[0] = 80
+        g[0] = 80
+        b[0] = 80
+        a[0] = 255
+        get_fill(astart, aend, &r[0], &g[0], &b[0], &a[0])
+        raster_rect(x, y, w, h, r[0], g[0], b[0], a[0])
+        cs: uint64 = aend + 1
+        ce: uint64 = cs
+        while ce < total and markup_buf[ce] != 60:
+            ce = ce + 1
+        raster_text(cs, ce, x + 4, y + 2, 255, 255, 255, 255)
+        return
+    if tag_is(ns, total, "input") != 0 and (ne - ns) == 5:
+        x: int64 = attr_i64(astart, aend, "x", 0) + gtx
+        y: int64 = attr_i64(astart, aend, "y", 0) + gty
+        w: int64 = attr_i64(astart, aend, "w", 100)
+        h: int64 = attr_i64(astart, aend, "h", 18)
+        raster_rect(x, y, w, h, 40, 40, 40, 255)
+        # placeholder text
+        vs: Array[1, uint64]
+        ve: Array[1, uint64]
+        if find_attr(astart, aend, "placeholder", &vs[0], &ve[0]) != 0:
+            raster_text(vs[0], ve[0], x + 3, y + 1, 160, 160, 160, 255)
+        return
+    if tag_is(ns, total, "image") != 0 and (ne - ns) == 5:
+        x: int64 = attr_i64(astart, aend, "x", 0) + gtx
+        y: int64 = attr_i64(astart, aend, "y", 0) + gty
+        w: int64 = attr_i64(astart, aend, "w", 0)
+        h: int64 = attr_i64(astart, aend, "h", 0)
+        vs: Array[1, uint64]
+        ve: Array[1, uint64]
+        if find_attr(astart, aend, "src", &vs[0], &ve[0]) != 0:
+            # only "fb:<layer>" supported in v1
+            s0: uint64 = vs[0]
+            if (ve[0] - s0) > 3 and markup_buf[s0] == 102 and \
+               markup_buf[s0 + 1] == 98 and markup_buf[s0 + 2] == 58:
+                src_slot: int64 = slot_for_fbref(s0 + 3, ve[0])
+                if src_slot >= 0:
+                    raster_image_fb(cast[uint64](src_slot), x, y, w, h)
+        return
+    if tag_is(ns, total, "group") != 0 and (ne - ns) == 5:
+        # transform="translate(dx,dy)"
+        vs: Array[1, uint64]
+        ve: Array[1, uint64]
+        if find_attr(astart, aend, "transform", &vs[0], &ve[0]) != 0:
+            tdx: Array[1, int64]
+            tdy: Array[1, int64]
+            tdx[0] = 0
+            tdy[0] = 0
+            parse_translate(vs[0], ve[0], &tdx[0], &tdy[0])
+            gtx_out[0] = gtx + tdx[0]
+            gty_out[0] = gty + tdy[0]
+        return
+    # <window ...> and unknown tags: ignore (metadata only).
+    return
+
+
+def get_fill(astart: uint64, aend: uint64, r: Ptr[uint8], g: Ptr[uint8],
+             b: Ptr[uint8], a: Ptr[uint8]):
+    vs: Array[1, uint64]
+    ve: Array[1, uint64]
+    if find_attr(astart, aend, "fill", &vs[0], &ve[0]) != 0:
+        parse_color(&markup_buf[0], vs[0], ve[0], r, g, b, a)
+    apply_opacity(astart, aend, a)
+
+
+def get_stroke(astart: uint64, aend: uint64, r: Ptr[uint8], g: Ptr[uint8],
+               b: Ptr[uint8], a: Ptr[uint8]):
+    vs: Array[1, uint64]
+    ve: Array[1, uint64]
+    if find_attr(astart, aend, "stroke", &vs[0], &ve[0]) != 0:
+        parse_color(&markup_buf[0], vs[0], ve[0], r, g, b, a)
+    apply_opacity(astart, aend, a)
+
+
+def apply_opacity(astart: uint64, aend: uint64, a: Ptr[uint8]):
+    # per-element opacity 0..1 (float-shape) -> scale alpha. We accept
+    # an integer 0..255 too (if value > 1). v1 keeps it simple: a value
+    # "0".."1" with a dot is read as tenths/hundredths via the first two
+    # fractional digits; otherwise treated as 0..255.
+    vs: Array[1, uint64]
+    ve: Array[1, uint64]
+    if find_attr(astart, aend, "opacity", &vs[0], &ve[0]) == 0:
+        return
+    s: uint64 = vs[0]
+    e: uint64 = ve[0]
+    # whole part
+    whole: int64 = parse_i64_span(&markup_buf[0], s, e)
+    # fractional?
+    di: uint64 = s
+    while di < e and markup_buf[di] != 46:
+        di = di + 1
+    if di < e:
+        # has a dot -> treat as 0..1 float; scale to 0..255
+        # read up to two fractional digits
+        f1: int64 = 0
+        f2: int64 = 0
+        if di + 1 < e and markup_buf[di + 1] >= 48 and markup_buf[di + 1] <= 57:
+            f1 = cast[int64](cast[int32](markup_buf[di + 1]) - 48)
+        if di + 2 < e and markup_buf[di + 2] >= 48 and markup_buf[di + 2] <= 57:
+            f2 = cast[int64](cast[int32](markup_buf[di + 2]) - 48)
+        frac: int64 = whole * 100 + f1 * 10 + f2     # 0..100 (clamp)
+        if frac > 100:
+            frac = 100
+        a[0] = cast[uint8]((cast[uint64](a[0]) * cast[uint64](frac)) / 100)
+    else:
+        if whole >= 0 and whole <= 255:
+            a[0] = cast[uint8]((cast[uint64](a[0]) * cast[uint64](whole)) / 255)
+
+
+def parse_translate(s: uint64, e: uint64, dx: Ptr[int64], dy: Ptr[int64]):
+    # "translate(DX,DY)"
+    i: uint64 = s
+    while i < e and markup_buf[i] != 40:               # '('
+        i = i + 1
+    if i >= e:
+        return
+    i = i + 1
+    dx[0] = parse_i64_span(&markup_buf[0], i, e)
+    while i < e and markup_buf[i] != 44:               # ','
+        i = i + 1
+    if i < e:
+        i = i + 1
+    dy[0] = parse_i64_span(&markup_buf[0], i, e)
+
+
+# ====================================================================
+# Composite the current layer buffer into the target with per-layer
+# opacity. Both buffers are premultiplied RGBA.
+# ====================================================================
+
+def composite_layer(opac: int64):
+    op: uint64 = cast[uint64](opac)
+    if op > 255:
+        op = 255
+    y: uint64 = 0
+    while y < WIN_H:
+        x: uint64 = 0
+        while x < WIN_W:
+            o: uint64 = (y * WIN_W + x) * 4
+            sa: uint64 = (cast[uint64](layerbuf[o + 3]) * op) / 255
+            if sa != 0:
+                sr: uint64 = (cast[uint64](layerbuf[o]) * op) / 255
+                sg: uint64 = (cast[uint64](layerbuf[o + 1]) * op) / 255
+                sb: uint64 = (cast[uint64](layerbuf[o + 2]) * op) / 255
+                inv: uint64 = 255 - sa
+                dr: uint64 = cast[uint64](target[o])
+                dg: uint64 = cast[uint64](target[o + 1])
+                db: uint64 = cast[uint64](target[o + 2])
+                target[o] = cast[uint8](sr + (dr * inv) / 255)
+                target[o + 1] = cast[uint8](sg + (dg * inv) / 255)
+                target[o + 2] = cast[uint8](sb + (db * inv) / 255)
+                target[o + 3] = 255
+            x = x + 1
+        y = y + 1
+
+
+# ====================================================================
+# Output: AI-readable text dump
+# ====================================================================
+
+def emit_hex_byte(v: uint8, out: Ptr[uint8]):
+    hi: uint8 = cast[uint8]((cast[uint64](v) >> 4) & 15)
+    lo: uint8 = cast[uint8](cast[uint64](v) & 15)
+    if hi < 10:
+        out[0] = 48 + hi
+    else:
+        out[0] = 97 + (hi - 10)
+    if lo < 10:
+        out[1] = 48 + lo
+    else:
+        out[1] = 97 + (lo - 10)
+
+
+def emit_pix(x: uint64, y: uint64):
+    # "PIX <x> <y> #rrggbb\n"
+    o: uint64 = (y * WIN_W + x) * 4
+    line: Array[40, uint8]
+    p: uint64 = 0
+    pfx: Ptr[uint8] = "PIX "
+    k: uint64 = 0
+    while pfx[k] != 0:
+        line[p] = pfx[k]
+        p = p + 1
+        k = k + 1
+    p = p + u64_to_dec(x, &line[p])
+    line[p] = 32
+    p = p + 1
+    p = p + u64_to_dec(y, &line[p])
+    line[p] = 32
+    p = p + 1
+    line[p] = 35                                       # '#'
+    p = p + 1
+    emit_hex_byte(target[o], &line[p])
+    p = p + 2
+    emit_hex_byte(target[o + 1], &line[p])
+    p = p + 2
+    emit_hex_byte(target[o + 2], &line[p])
+    p = p + 2
+    line[p] = 10
+    p = p + 1
+    sys_write(1, &line[0], p)
+
+
+def is_bg(x: uint64, y: uint64) -> int32:
+    o: uint64 = (y * WIN_W + x) * 4
+    if target[o] == BG_R and target[o + 1] == BG_G and target[o + 2] == BG_B:
+        return 1
+    return 0
+
+
+def count_nonbg_region(rx: uint64, ry: uint64, rw: uint64, rh: uint64) -> uint64:
+    cnt: uint64 = 0
+    y: uint64 = ry
+    ymax: uint64 = ry + rh
+    while y < ymax and y < WIN_H:
+        x: uint64 = rx
+        xmax: uint64 = rx + rw
+        while x < xmax and x < WIN_W:
+            if is_bg(x, y) == 0:
+                cnt = cnt + 1
+            x = x + 1
+        y = y + 1
+    return cnt
+
+
+def emit_region(name: Ptr[uint8], rx: uint64, ry: uint64,
+                rw: uint64, rh: uint64):
+    # "REGION <name> <x> <y> <w> <h> nonbg=<count>\n" — a deterministic
+    # test hook: lets a CI grep assert "the text band has >0 non-bg
+    # pixels" without depending on the coarse probe grid landing on a
+    # glyph stroke.
+    cnt: uint64 = count_nonbg_region(rx, ry, rw, rh)
+    line: Array[128, uint8]
+    p: uint64 = 0
+    pfx: Ptr[uint8] = "REGION "
+    k: uint64 = 0
+    while pfx[k] != 0:
+        line[p] = pfx[k]
+        p = p + 1
+        k = k + 1
+    k = 0
+    while name[k] != 0:
+        line[p] = name[k]
+        p = p + 1
+        k = k + 1
+    line[p] = 32
+    p = p + 1
+    p = p + u64_to_dec(rx, &line[p])
+    line[p] = 32
+    p = p + 1
+    p = p + u64_to_dec(ry, &line[p])
+    line[p] = 32
+    p = p + 1
+    p = p + u64_to_dec(rw, &line[p])
+    line[p] = 32
+    p = p + 1
+    p = p + u64_to_dec(rh, &line[p])
+    sfx: Ptr[uint8] = " nonbg="
+    k = 0
+    while sfx[k] != 0:
+        line[p] = sfx[k]
+        p = p + 1
+        k = k + 1
+    p = p + u64_to_dec(cnt, &line[p])
+    line[p] = 10
+    p = p + 1
+    sys_write(1, &line[0], p)
+
+
+def emit_ascii_art():
+    # Downscale to ART_W x ART_H by sampling. '#' = non-background.
+    ART_W: uint64 = 80
+    ART_H: uint64 = 30
+    line: Array[96, uint8]
+    ry: uint64 = 0
+    while ry < ART_H:
+        p: uint64 = 0
+        pfx: Ptr[uint8] = "ART "
+        k: uint64 = 0
+        while pfx[k] != 0:
+            line[p] = pfx[k]
+            p = p + 1
+            k = k + 1
+        rx: uint64 = 0
+        while rx < ART_W:
+            sx: uint64 = (rx * WIN_W) / ART_W
+            sy: uint64 = (ry * WIN_H) / ART_H
+            if is_bg(sx, sy) != 0:
+                line[p] = 32                           # ' '
+            else:
+                line[p] = 35                           # '#'
+            p = p + 1
+            rx = rx + 1
+        line[p] = 10
+        p = p + 1
+        sys_write(1, &line[0], p)
+        ry = ry + 1
+
+
+def emit_probe_grid():
+    # A regular grid of probe pixels so a CI grep can assert colours at
+    # known coordinates.
+    PY: uint64 = 0
+    while PY < WIN_H:
+        PX: uint64 = 0
+        while PX < WIN_W:
+            emit_pix(PX, PY)
+            PX = PX + 40
+        PY = PY + 40
+
+
+# ====================================================================
+# Optional: write the composited frame into a "_screen" fb layer so the
+# bytes round-trip through the cdev. Best-effort.
+# ====================================================================
+
+def write_screen_layer(wid: int32):
+    # Ensure a "_screen" fb layer exists (256x256 max), then write a
+    # downscaled copy of the target into its fb. ctl create is via
+    # /dev/wsys/<wid>/draw/ctl.
+    build_path(wid, cast[Ptr[uint8]](0), "ctl")
+    cf: int32 = sys_open_write(cast[Ptr[char]](&path_buf[0]))
+    if cf >= 0:
+        cmd: Ptr[uint8] = "mklayer _screen fb 256 256\n"
+        sys_write(cf, cmd, strlen_u8(cmd))
+        sys_close(cf)
+    # write fb: downscale target -> 256x256 into fb_read_buf, then write.
+    yy: uint64 = 0
+    while yy < FB_DIM:
+        xx: uint64 = 0
+        while xx < FB_DIM:
+            sx: uint64 = (xx * WIN_W) / FB_DIM
+            sy: uint64 = (yy * WIN_H) / FB_DIM
+            so: uint64 = (sy * WIN_W + sx) * 4
+            dout: uint64 = (yy * FB_DIM + xx) * 4
+            fb_read_buf[dout] = target[so]
+            fb_read_buf[dout + 1] = target[so + 1]
+            fb_read_buf[dout + 2] = target[so + 2]
+            fb_read_buf[dout + 3] = target[so + 3]
+            xx = xx + 1
+        yy = yy + 1
+    build_path(wid, "_screen", "fb")
+    wf: int32 = sys_open_write(cast[Ptr[char]](&path_buf[0]))
+    if wf >= 0:
+        sys_write(wf, &fb_read_buf[0], FB_DIM * FB_DIM * 4)
+        sys_close(wf)
+
+
+# ====================================================================
+# render <wid>
+# ====================================================================
+
+def cmd_render(wid: int32) -> int32:
+    font_init()
+    read_fb_wid = wid
+    if parse_listing(wid) < 0:
+        write_str(2, "hamUId: cannot read /dev/wsys/<wid>/draw (no such wid?)\n")
+        return 1
+    target_clear()
+    # Composite layers in listing order (kernel emits z-ascending).
+    si: uint64 = 0
+    while si < LT_COUNT:
+        # Skip the synthetic _screen layer if present (avoid feedback).
+        lp: Ptr[uint8] = layer_name_ptr(si)
+        if cstr_eq(lp, "_screen") == 0:
+            layerbuf_clear()
+            if LT_KIND[si] == 1:
+                # fb layer: read its pixels straight into the layer buf
+                composite_fb_layer(wid, si)
+            else:
+                rasterise_markup(wid, si)
+            composite_layer(LT_OPAC[si])
+        si = si + 1
+    # --- emit the AI-readable dump ---
+    hdr: Array[96, uint8]
+    p: uint64 = 0
+    h0: Ptr[uint8] = "DUMP wid="
+    k: uint64 = 0
+    while h0[k] != 0:
+        hdr[p] = h0[k]
+        p = p + 1
+        k = k + 1
+    p = p + u64_to_dec(cast[uint64](wid), &hdr[p])
+    h1: Ptr[uint8] = " win=640x480 layers="
+    k = 0
+    while h1[k] != 0:
+        hdr[p] = h1[k]
+        p = p + 1
+        k = k + 1
+    p = p + u64_to_dec(LT_COUNT, &hdr[p])
+    hdr[p] = 10
+    p = p + 1
+    sys_write(1, &hdr[0], p)
+    emit_probe_grid()
+    # Deterministic region summaries (test hooks that don't depend on the
+    # coarse probe grid landing on a specific glyph stroke). The "text"
+    # band is to the RIGHT of any rect a chrome layer typically draws, so
+    # a non-zero count there proves GLYPHS rasterised, not a rect.
+    emit_region("text", 192, 32, 160, 32)
+    emit_ascii_art()
+    write_str(1, "DUMP END\n")
+    # round-trip into _screen fb (best-effort; ignore errors)
+    write_screen_layer(wid)
+    return 0
+
+
+def composite_fb_layer(wid: int32, slot: uint64):
+    # Read the fb body and blit (with the layer geometry offset) into
+    # the layer buffer.
+    n: int64 = read_layer_fb(slot)
+    if n <= 0:
+        return
+    sw: int64 = LT_W[slot]
+    sh: int64 = LT_H[slot]
+    if sw > cast[int64](FB_DIM):
+        sw = cast[int64](FB_DIM)
+    if sh > cast[int64](FB_DIM):
+        sh = cast[int64](FB_DIM)
+    ox: int64 = LT_X[slot]
+    oy: int64 = LT_Y[slot]
+    yy: int64 = 0
+    while yy < sh:
+        xx: int64 = 0
+        while xx < sw:
+            so: uint64 = cast[uint64](yy * sw + xx) * 4
+            if so + 3 < cast[uint64](n):
+                layer_put(ox + xx, oy + yy, fb_read_buf[so],
+                          fb_read_buf[so + 1], fb_read_buf[so + 2],
+                          fb_read_buf[so + 3])
+            xx = xx + 1
+        yy = yy + 1
+
+
+def usage(fd: int32):
+    write_str(fd, "Usage: hamUId render <wid>\n")
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    if argc < 2:
+        usage(2)
+        return 1
+    verb: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
+    if cstr_eq(verb, "render") != 0:
+        if argc < 3:
+            write_str(2, "hamUId: render: missing wid\n")
+            return 1
+        wid: int32 = parse_uint(cast[Ptr[uint8]](argv[2]))
+        if wid < 1:
+            write_str(2, "hamUId: render: bad wid\n")
+            return 1
+        return cmd_render(wid)
+    usage(2)
+    return 1
