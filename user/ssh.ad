@@ -1,0 +1,1416 @@
+# user/ssh.ad — Hamnix native SSH-2.0 OUTBOUND client.
+#
+# The client side of Hamnix's SSH stack: `ssh [user@]host [command]`.
+# It opens a TCP connection to a remote SSH server, runs the SSH-2.0
+# handshake as the CLIENT, authenticates, opens a session channel, and
+# then either runs a single remote command (`ssh host cmd`) or bridges
+# an interactive shell (`ssh host`). It can ssh into the box itself —
+# `ssh 127.0.0.1` reaches Hamnix's own user/sshd.ad over loopback — as
+# well as to other machines.
+#
+# It is the exact transport mirror of user/sshd.ad (read that first):
+#
+#   * Transport layer (RFC 4253): version-string exchange, the binary
+#     packet protocol, SSH_MSG_KEXINIT algorithm negotiation.
+#   * Key exchange: curve25519-sha256 — X25519 ECDH + SHA-256. The
+#     client generates the ephemeral keypair, sends KEX_ECDH_INIT,
+#     receives KEX_ECDH_REPLY, computes the exchange hash H and derives
+#     the session keys, then SSH_MSG_NEWKEYS.
+#   * Host key: ecdsa-sha2-nistp256. The server's signature over H is
+#     verified against the host key it presents (TOFU — no known-hosts
+#     store in V1, so a good signature over H is accepted; a BAD
+#     signature is reported and the session aborts).
+#   * Cipher: chacha20-poly1305@openssh.com once NEWKEYS crosses. The
+#     client SENDS with the c2s key (KDF letter 'C') and RECEIVES with
+#     the s2c key (KDF letter 'D') — the mirror of the server.
+#   * User auth (RFC 4252): the `password` method. The fixed Hamnix
+#     credential is user "root", password "hamnix" (overridable on the
+#     command line as `ssh user@host`). password matches what
+#     user/sshd.ad accepts as its fallback method.
+#   * Connection layer (RFC 4254): one `session` channel; `exec` for a
+#     one-shot command, or `shell` for interactive use; the channel's
+#     data is bridged to stdin(0)/stdout(1).
+#
+# NET API — ARCH §10: outbound TCP is the Plan-9 /net dance, NOT a
+# socket() syscall. net_dial(ip0,ip1,ip2,ip3,port) (user/net9.ad)
+# opens /net/tcp/clone, writes a `connect <a.b.c.d>!<port>` ctl line
+# and returns the connection's `data` fd — the same primitive
+# user/curl.ad / user/apt.ad use. We sys_read / sys_write / sys_close
+# that fd exactly like sshd does its accepted connection.
+#
+# Build:
+#   python3 -m compiler.adder compile --target=x86_64-adder-user \
+#       user/ssh.ad -o build/user/ssh.elf
+#
+# SELF-TEST — when run with no host argument (e.g. embedded as /init by
+# scripts/test_ssh_client.sh), the client spawns /bin/sshd, waits for
+# it to announce port 22, then loops back to 127.0.0.1 and runs a
+# command, asserting the output round-trips. See scripts/test_ssh_client.sh.
+#
+# Compiler-quirk notes (memory/feedback_compiler_quirks.md):
+#  * Every sizable buffer is a top-level-BSS Array — flat byte arrays
+#    at module scope dodge the U9 nested-frame-Array miscompile.
+#  * No string concat — literals are copied byte by byte.
+
+from lib.ssh.sshcrypto import (
+    ssh_chacha20_xor, ssh_chacha20_keystream, ssh_poly1305,
+    ssh_x25519, ssh_x25519_base,
+)
+from lib.ec.p256 import (
+    P256Point, P256_GX, P256_GY, P256_N,
+    p256_init, p256_copy, p256_be_to_limbs, p256_scalar_mul_g,
+    p256_is_zero, p256_ge,
+)
+from lib.ecdsa.ecdsa import (
+    EcdsaPubkey, ecdsa_sha256, ecdsa_init,
+    ecdsa_parse_pubkey, ecdsa_p256_verify_rs,
+)
+
+# ARCH §10: outbound TCP over the Plan-9 /net file tree — net_dial a
+# host:port and read/write the returned data fd — NOT a socket() syscall.
+from user.net9 import net_dial
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_exit(code: uint64)
+extern def sys_spawn(path: Ptr[char], argv: Ptr[uint64],
+                     stdin_fd: int32, stdout_fd: int32,
+                     envp: Ptr[uint64]) -> int32
+extern def sys_get_jiffies() -> uint64
+extern def sys_getpid() -> int32
+extern def sys_yield() -> int32
+
+
+# Default SSH port.
+SSH_PORT: uint64 = 22
+
+# SSH packet message-type codes (RFC 4253 / 4252 / 4254).
+SSH_MSG_DISCONNECT:       uint8 = 1
+SSH_MSG_IGNORE:           uint8 = 2
+SSH_MSG_UNIMPLEMENTED:    uint8 = 3
+SSH_MSG_DEBUG:            uint8 = 4
+SSH_MSG_SERVICE_REQUEST:  uint8 = 5
+SSH_MSG_SERVICE_ACCEPT:   uint8 = 6
+SSH_MSG_KEXINIT:          uint8 = 20
+SSH_MSG_NEWKEYS:          uint8 = 21
+SSH_MSG_KEX_ECDH_INIT:    uint8 = 30
+SSH_MSG_KEX_ECDH_REPLY:   uint8 = 31
+SSH_MSG_USERAUTH_REQUEST: uint8 = 50
+SSH_MSG_USERAUTH_FAILURE: uint8 = 51
+SSH_MSG_USERAUTH_SUCCESS: uint8 = 52
+SSH_MSG_USERAUTH_BANNER:  uint8 = 53
+SSH_MSG_USERAUTH_PK_OK:   uint8 = 60
+SSH_MSG_GLOBAL_REQUEST:   uint8 = 80
+SSH_MSG_CHANNEL_OPEN:              uint8 = 90
+SSH_MSG_CHANNEL_OPEN_CONFIRMATION: uint8 = 91
+SSH_MSG_CHANNEL_OPEN_FAILURE:      uint8 = 92
+SSH_MSG_CHANNEL_WINDOW_ADJUST:     uint8 = 93
+SSH_MSG_CHANNEL_DATA:              uint8 = 94
+SSH_MSG_CHANNEL_EXTENDED_DATA:     uint8 = 95
+SSH_MSG_CHANNEL_EOF:               uint8 = 96
+SSH_MSG_CHANNEL_CLOSE:             uint8 = 97
+SSH_MSG_CHANNEL_REQUEST:           uint8 = 98
+SSH_MSG_CHANNEL_SUCCESS:           uint8 = 99
+SSH_MSG_CHANNEL_FAILURE:           uint8 = 100
+
+
+# --- module-global state -------------------------------------------------
+
+# Connection fd (the dialled TCP `data` file).
+conn_fd: Array[1, int32]
+
+# Version strings. V_C is ours; V_S is the server's. Stored WITHOUT the
+# trailing CR/LF (the exchange-hash input excludes them).
+v_c_buf: Array[64, uint8]
+v_c_len: Array[1, uint64]
+v_s_buf: Array[256, uint8]
+v_s_len: Array[1, uint64]
+
+# A decoded inbound packet payload (after length/padding stripped, and
+# after decryption once keys are live).
+pkt_in: Array[8192, uint8]
+pkt_in_len: Array[1, uint64]
+
+# An outbound packet payload being assembled, plus the framed bytes.
+pkt_out: Array[8192, uint8]
+frame_out: Array[8260, uint8]
+
+# KEXINIT payloads — the exact bytes of our KEXINIT (I_C) and the
+# server's KEXINIT (I_S), needed verbatim for the exchange hash.
+i_c_buf: Array[2048, uint8]
+i_c_len: Array[1, uint64]
+i_s_buf: Array[2048, uint8]
+i_s_len: Array[1, uint64]
+
+# X25519 key-exchange material.
+cx_priv: Array[32, uint8]        # client ephemeral private key
+q_c: Array[32, uint8]            # client ephemeral public key
+q_s: Array[32, uint8]            # server ephemeral public key
+kex_k: Array[32, uint8]          # shared secret (raw 32 bytes)
+
+# The host key blob (K_S) and the server signature blob (verbatim).
+ks_blob: Array[256, uint8]
+ks_blob_len: Array[1, uint64]
+srv_sig: Array[256, uint8]
+srv_sig_len: Array[1, uint64]
+
+# Exchange hash H and session id (== H for the first/only KEX).
+exch_h: Array[32, uint8]
+session_id: Array[32, uint8]
+
+# The big SHA-256 input buffer for the exchange hash.
+hash_in: Array[4096, uint8]
+
+# Derived cipher keys: 64 bytes each direction for
+# chacha20-poly1305@openssh.com. As the CLIENT we SEND with key_c2s
+# and RECEIVE with key_s2c (the mirror of sshd).
+key_c2s: Array[64, uint8]        # client->server (our outbound) keys
+key_s2c: Array[64, uint8]        # server->client (our inbound) keys
+
+# KDF scratch.
+kdf_in: Array[256, uint8]
+kdf_k1: Array[32, uint8]
+
+# Send/receive packet sequence numbers (RFC 4253 §6.4).
+seq_in: Array[1, uint64]
+seq_out: Array[1, uint64]
+
+# Encryption-active flags per direction.
+enc_in: Array[1, int32]
+enc_out: Array[1, int32]
+
+# The single session channel.
+chan_local_id: Array[1, uint32]  # our channel number (we use 0)
+chan_remote_id: Array[1, uint32] # the server's channel number
+chan_remote_win: Array[1, uint64]    # bytes we may still send the server
+chan_local_win: Array[1, uint64]     # bytes the server may still send us
+
+# Scratch for the per-packet ChaCha20-Poly1305 work.
+poly_key: Array[64, uint8]       # 32 used; ChaCha block is 64
+seq_nonce: Array[8, uint8]
+mac_calc: Array[16, uint8]
+enc_len_buf: Array[4, uint8]
+
+# Channel-data staging.
+chan_data: Array[2048, uint8]
+
+# Connection target + auth credential (filled from argv).
+target_ip: Array[4, uint8]
+login_user: Array[64, uint8]
+login_user_len: Array[1, uint64]
+login_pass: Array[64, uint8]
+login_pass_len: Array[1, uint64]
+remote_cmd: Array[1024, uint8]
+remote_cmd_len: Array[1, uint64]
+has_remote_cmd: Array[1, int32]
+
+# Host-key signature verify scratch.
+hk_q: Array[65, uint8]
+hk_sig_r: Array[32, uint8]
+hk_sig_s: Array[32, uint8]
+
+# Self-test child argv.
+sshd_argv: Array[2, uint64]
+
+# One peeked socket byte (so the packet reader can be fed a byte it
+# already consumed from the kernel) for the non-blocking bridge.
+sock_peek: Array[1, uint8]
+sock_peek_valid: Array[1, int32]
+
+
+# === tiny helpers ========================================================
+
+def _slen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _wstr(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, _slen(s))
+
+
+def _log(s: Ptr[uint8]):
+    # Diagnostic line to the kernel console via stderr (fd 2 ->
+    # FD_STDERR_MARK reaches the console). Keeping diagnostics on fd 2
+    # leaves stdout (fd 1) carrying ONLY the remote command's output —
+    # the correct shape for `ssh host cmd | ...`. The self-test greps
+    # both streams off the same QEMU console.
+    _wstr(2, s)
+
+
+def _memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64):
+    i: uint64 = 0
+    while i < n:
+        dst[i] = src[i]
+        i = i + 1
+
+
+def _memeq(a: Ptr[uint8], b: Ptr[uint8], n: uint64) -> int32:
+    i: uint64 = 0
+    while i < n:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+# Store a uint32 big-endian.
+def _put_u32(buf: Ptr[uint8], off: uint64, v: uint32):
+    buf[off + 0] = cast[uint8]((v >> 24) & 0xFF)
+    buf[off + 1] = cast[uint8]((v >> 16) & 0xFF)
+    buf[off + 2] = cast[uint8]((v >> 8) & 0xFF)
+    buf[off + 3] = cast[uint8](v & 0xFF)
+
+
+def _get_u32(buf: Ptr[uint8], off: uint64) -> uint32:
+    b0: uint32 = cast[uint32](buf[off + 0])
+    b1: uint32 = cast[uint32](buf[off + 1])
+    b2: uint32 = cast[uint32](buf[off + 2])
+    b3: uint32 = cast[uint32](buf[off + 3])
+    return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+
+
+# === blocking socket I/O over the dialled connection ====================
+
+def _send_all(buf: Ptr[uint8], n: uint64) -> int32:
+    fd: int32 = conn_fd[0]
+    pos: uint64 = 0
+    while pos < n:
+        w: int64 = sys_write(fd, cast[Ptr[uint8]](cast[uint64](buf) + pos),
+                             n - pos)
+        if w <= 0:
+            return -1
+        pos = pos + cast[uint64](w)
+    return 0
+
+
+def _recv_exact(buf: Ptr[uint8], n: uint64) -> int32:
+    # Block until exactly n bytes have been read off the socket. The
+    # kernel socket read returns 0 on a benign ~5 s timeout WITHOUT
+    # latching EOF (see sshd's _recv_exact note), so a 0 is retried;
+    # we bound the retry count to avoid spinning against a dead peer.
+    fd: int32 = conn_fd[0]
+    pos: uint64 = 0
+    idle: uint32 = 0
+    while pos < n:
+        r: int64 = sys_read(fd, cast[Ptr[uint8]](cast[uint64](buf) + pos),
+                             n - pos)
+        if r < 0:
+            return -1
+        if r == 0:
+            idle = idle + 1
+            if idle > 24:
+                return -1
+        else:
+            idle = 0
+            pos = pos + cast[uint64](r)
+    return 0
+
+
+# === version-string exchange (RFC 4253 §4.2) =============================
+
+def _do_version_exchange() -> int32:
+    # Send our identification string, then read the server's. Both end
+    # with CR LF. We store the strings without the CR LF for the
+    # exchange hash.
+    src: Ptr[uint8] = "SSH-2.0-Hamnix_client_1.0"
+    i: uint64 = 0
+    while src[i] != 0:
+        v_c_buf[i] = src[i]
+        i = i + 1
+    v_c_len[0] = i
+    line: Array[64, uint8]
+    j: uint64 = 0
+    while j < i:
+        line[j] = v_c_buf[j]
+        j = j + 1
+    line[i] = 13                                  # CR
+    line[i + 1] = 10                              # LF
+    if _send_all(&line[0], i + 2) != 0:
+        return -1
+    _log("[ssh] sent version string\n")
+
+    # Read the server's identification line. The server MAY send banner
+    # lines before its SSH- line; accept the first SSH- prefixed one.
+    while True:
+        ll: uint64 = 0
+        while ll < 255:
+            c: Array[1, uint8]
+            if _recv_exact(&c[0], 1) != 0:
+                return -1
+            if c[0] == 13:                        # CR
+                continue
+            if c[0] == 10:                        # LF
+                break
+            v_s_buf[ll] = c[0]
+            ll = ll + 1
+        v_s_buf[ll] = 0
+        if ll >= 4:
+            if v_s_buf[0] == 83:                  # 'S'
+                if v_s_buf[1] == 83:              # 'S'
+                    if v_s_buf[2] == 72:          # 'H'
+                        if v_s_buf[3] == 45:      # '-'
+                            v_s_len[0] = ll
+                            _log("[ssh] received server version\n")
+                            return 0
+        # Not an SSH- line — keep reading (banner lines).
+
+
+# === binary packet protocol (RFC 4253 §6) ===============================
+
+def _send_packet_plain(payload: Ptr[uint8], plen: uint64) -> int32:
+    block: uint64 = 8
+    min_total: uint64 = 4 + 1 + plen
+    pad: uint64 = block - (min_total % block)
+    if pad < 4:
+        pad = pad + block
+    pkt_len: uint64 = 1 + plen + pad
+    _put_u32(&frame_out[0], 0, cast[uint32](pkt_len))
+    frame_out[4] = cast[uint8](pad)
+    _memcpy(cast[Ptr[uint8]](&frame_out[5]), payload, plen)
+    i: uint64 = 0
+    while i < pad:
+        frame_out[5 + plen + i] = 0
+        i = i + 1
+    total: uint64 = 4 + pkt_len
+    rc: int32 = _send_all(&frame_out[0], total)
+    seq_out[0] = seq_out[0] + 1
+    return rc
+
+
+def _recv_packet_plain() -> int32:
+    lb: Array[4, uint8]
+    if _recv_exact(&lb[0], 4) != 0:
+        return -1
+    pkt_len: uint32 = _get_u32(&lb[0], 0)
+    if pkt_len < 8 or pkt_len > 8192:
+        _log("[ssh] bad packet length\n")
+        return -1
+    body: Array[8200, uint8]
+    if _recv_exact(&body[0], cast[uint64](pkt_len)) != 0:
+        return -1
+    pad: uint64 = cast[uint64](body[0])
+    if pad + 1 > cast[uint64](pkt_len):
+        return -1
+    plen: uint64 = cast[uint64](pkt_len) - 1 - pad
+    _memcpy(&pkt_in[0], cast[Ptr[uint8]](&body[1]), plen)
+    pkt_in_len[0] = plen
+    seq_in[0] = seq_in[0] + 1
+    return 0
+
+
+# === chacha20-poly1305@openssh.com encrypted packet I/O ==================
+#
+# As the CLIENT, our SEND key is key_c2s (K_2 = key_c2s[0..31] body,
+# K_1 = key_c2s[32..63] length) and our RECEIVE key is key_s2c — the
+# exact mirror of user/sshd.ad.
+
+def _seq_to_nonce(seq: uint64):
+    i: uint64 = 0
+    while i < 8:
+        shift: uint64 = (7 - i) * 8
+        seq_nonce[i] = cast[uint8]((seq >> shift) & 0xFF)
+        i = i + 1
+
+
+def _send_packet_enc(payload: Ptr[uint8], plen: uint64) -> int32:
+    block: uint64 = 8
+    min_total: uint64 = 1 + plen
+    pad: uint64 = block - (min_total % block)
+    if pad < 4:
+        pad = pad + block
+    pkt_len: uint64 = 1 + plen + pad
+    plain: Array[8260, uint8]
+    plain[0] = cast[uint8](pad)
+    _memcpy(cast[Ptr[uint8]](&plain[1]), payload, plen)
+    i: uint64 = 0
+    while i < pad:
+        plain[1 + plen + i] = 0
+        i = i + 1
+    _seq_to_nonce(seq_out[0])
+    lenbuf: Array[4, uint8]
+    _put_u32(&lenbuf[0], 0, cast[uint32](pkt_len))
+    ssh_chacha20_xor(cast[Ptr[uint8]](&key_c2s[32]), cast[uint64](0),
+                     &seq_nonce[0], &frame_out[0], &lenbuf[0],
+                     cast[uint64](4))
+    ssh_chacha20_keystream(cast[Ptr[uint8]](&key_c2s[0]), cast[uint64](0),
+                           &seq_nonce[0], &poly_key[0], cast[uint64](64))
+    ssh_chacha20_xor(cast[Ptr[uint8]](&key_c2s[0]), cast[uint64](1),
+                     &seq_nonce[0],
+                     cast[Ptr[uint8]](&frame_out[4]),
+                     &plain[0], pkt_len)
+    total_ct: uint64 = 4 + pkt_len
+    ssh_poly1305(cast[Ptr[uint8]](&frame_out[total_ct]),
+                 &poly_key[0], &frame_out[0], total_ct)
+    rc: int32 = _send_all(&frame_out[0], total_ct + 16)
+    seq_out[0] = seq_out[0] + 1
+    return rc
+
+
+def _recv_packet_enc() -> int32:
+    if _recv_exact(&enc_len_buf[0], 4) != 0:
+        return -1
+    return _decrypt_after_len()
+
+
+# Shared tail of the encrypted reader: enc_len_buf already holds the
+# 4-byte encrypted length. Decrypts the length, reads ct + MAC, verifies
+# and decrypts the body into pkt_in / pkt_in_len.
+def _decrypt_after_len() -> int32:
+    _seq_to_nonce(seq_in[0])
+    declen: Array[4, uint8]
+    ssh_chacha20_xor(cast[Ptr[uint8]](&key_s2c[32]), cast[uint64](0),
+                     &seq_nonce[0], &declen[0], &enc_len_buf[0],
+                     cast[uint64](4))
+    pkt_len: uint32 = _get_u32(&declen[0], 0)
+    if pkt_len < 8 or pkt_len > 8192:
+        _log("[ssh] bad encrypted packet length\n")
+        return -1
+    ct: Array[8260, uint8]
+    if _recv_exact(&ct[0], cast[uint64](pkt_len)) != 0:
+        return -1
+    rxmac: Array[16, uint8]
+    if _recv_exact(&rxmac[0], cast[uint64](16)) != 0:
+        return -1
+    ssh_chacha20_keystream(cast[Ptr[uint8]](&key_s2c[0]), cast[uint64](0),
+                           &seq_nonce[0], &poly_key[0], cast[uint64](64))
+    macbuf: Array[8264, uint8]
+    _memcpy(&macbuf[0], &enc_len_buf[0], cast[uint64](4))
+    _memcpy(cast[Ptr[uint8]](&macbuf[4]), &ct[0], cast[uint64](pkt_len))
+    ssh_poly1305(&mac_calc[0], &poly_key[0], &macbuf[0],
+                 4 + cast[uint64](pkt_len))
+    if _memeq(&mac_calc[0], &rxmac[0], cast[uint64](16)) == 0:
+        _log("[ssh] MAC verify failed\n")
+        return -1
+    plain: Array[8260, uint8]
+    ssh_chacha20_xor(cast[Ptr[uint8]](&key_s2c[0]), cast[uint64](1),
+                     &seq_nonce[0], &plain[0], &ct[0],
+                     cast[uint64](pkt_len))
+    pad: uint64 = cast[uint64](plain[0])
+    if pad + 1 > cast[uint64](pkt_len):
+        return -1
+    plen: uint64 = cast[uint64](pkt_len) - 1 - pad
+    _memcpy(&pkt_in[0], cast[Ptr[uint8]](&plain[1]), plen)
+    pkt_in_len[0] = plen
+    seq_in[0] = seq_in[0] + 1
+    return 0
+
+
+def _send_packet(payload: Ptr[uint8], plen: uint64) -> int32:
+    if enc_out[0] != 0:
+        return _send_packet_enc(payload, plen)
+    return _send_packet_plain(payload, plen)
+
+
+def _recv_packet() -> int32:
+    if enc_in[0] != 0:
+        return _recv_packet_enc()
+    return _recv_packet_plain()
+
+
+# === KEXINIT (RFC 4253 §7.1) =============================================
+
+def _put_string(buf: Ptr[uint8], off: uint64,
+                s: Ptr[uint8], slen: uint64) -> uint64:
+    _put_u32(buf, off, cast[uint32](slen))
+    _memcpy(cast[Ptr[uint8]](cast[uint64](buf) + off + 4), s, slen)
+    return off + 4 + slen
+
+
+def _put_cstr(buf: Ptr[uint8], off: uint64, s: Ptr[uint8]) -> uint64:
+    return _put_string(buf, off, s, _slen(s))
+
+
+def _build_kexinit():
+    # Assemble our KEXINIT payload into i_c_buf — exactly the one
+    # algorithm of each kind user/sshd.ad implements, so negotiation
+    # is unambiguous.
+    o: uint64 = 0
+    i_c_buf[o] = SSH_MSG_KEXINIT
+    o = o + 1
+    seed: uint64 = sys_get_jiffies() ^ (cast[uint64](sys_getpid()) << 32)
+    ci: uint64 = 0
+    while ci < 16:
+        seed = seed * 6364136223846793005 + 1442695040888963407
+        i_c_buf[o + ci] = cast[uint8]((seed >> 33) & 0xFF)
+        ci = ci + 1
+    o = o + 16
+    o = _put_cstr(&i_c_buf[0], o, "curve25519-sha256")
+    o = _put_cstr(&i_c_buf[0], o, "ecdsa-sha2-nistp256")
+    o = _put_cstr(&i_c_buf[0], o, "chacha20-poly1305@openssh.com")
+    o = _put_cstr(&i_c_buf[0], o, "chacha20-poly1305@openssh.com")
+    o = _put_cstr(&i_c_buf[0], o, "none")
+    o = _put_cstr(&i_c_buf[0], o, "none")
+    o = _put_cstr(&i_c_buf[0], o, "none")
+    o = _put_cstr(&i_c_buf[0], o, "none")
+    o = _put_cstr(&i_c_buf[0], o, "")
+    o = _put_cstr(&i_c_buf[0], o, "")
+    i_c_buf[o] = 0                                # first_kex_packet_follows
+    o = o + 1
+    _put_u32(&i_c_buf[0], o, cast[uint32](0))     # reserved
+    o = o + 4
+    i_c_len[0] = o
+
+
+# Encode a 32-byte big-endian integer as an SSH `mpint` (RFC 4251 §5).
+def _put_mpint(buf: Ptr[uint8], off: uint64, be32: Ptr[uint8]) -> uint64:
+    start: uint64 = 0
+    while start < 32:
+        if be32[start] != 0:
+            break
+        start = start + 1
+    if start == 32:
+        _put_u32(buf, off, cast[uint32](0))
+        return off + 4
+    siglen: uint64 = 32 - start
+    need_pad: int32 = 0
+    if (be32[start] & 0x80) != 0:
+        need_pad = 1
+    total: uint64 = siglen
+    if need_pad != 0:
+        total = total + 1
+    _put_u32(buf, off, cast[uint32](total))
+    o: uint64 = off + 4
+    if need_pad != 0:
+        buf[o] = 0
+        o = o + 1
+    _memcpy(cast[Ptr[uint8]](cast[uint64](buf) + o),
+            cast[Ptr[uint8]](cast[uint64](be32) + start), siglen)
+    return o + siglen
+
+
+# === exchange hash + key exchange =======================================
+
+def _compute_exchange_hash():
+    # H = SHA-256( string(V_C) || string(V_S) || string(I_C) ||
+    #              string(I_S) || string(K_S) || string(Q_C) ||
+    #              string(Q_S) || mpint(K) )
+    # NOTE: V_C/I_C come first regardless of role — this is identical
+    # to the server's computation so both sides derive the same H.
+    o: uint64 = 0
+    o = _put_string(&hash_in[0], o, &v_c_buf[0], v_c_len[0])
+    o = _put_string(&hash_in[0], o, &v_s_buf[0], v_s_len[0])
+    o = _put_string(&hash_in[0], o, &i_c_buf[0], i_c_len[0])
+    o = _put_string(&hash_in[0], o, &i_s_buf[0], i_s_len[0])
+    o = _put_string(&hash_in[0], o, &ks_blob[0], ks_blob_len[0])
+    o = _put_string(&hash_in[0], o, &q_c[0], cast[uint64](32))
+    o = _put_string(&hash_in[0], o, &q_s[0], cast[uint64](32))
+    o = _put_mpint(&hash_in[0], o, &kex_k[0])
+    ecdsa_sha256(&hash_in[0], o, &exch_h[0])
+
+
+# Parse the ecdsa-sha2-nistp256 host-key blob K_S into the 65-byte SEC1
+# point hk_q. Layout: string "ecdsa-sha2-nistp256" || string "nistp256"
+# || string Q. Returns 0 on success, -1 on a malformed blob.
+def _parse_hostkey_blob() -> int32:
+    blob: Ptr[uint8] = &ks_blob[0]
+    blob_len: uint64 = ks_blob_len[0]
+    if blob_len < 4:
+        return -1
+    p: uint64 = 0
+    alg_len: uint32 = _get_u32(blob, p)
+    p = p + 4
+    if cast[uint64](alg_len) != 19:
+        return -1
+    if p + 19 > blob_len:
+        return -1
+    if _memeq(cast[Ptr[uint8]](cast[uint64](blob) + p),
+              cast[Ptr[uint8]]("ecdsa-sha2-nistp256"),
+              cast[uint64](19)) == 0:
+        return -1
+    p = p + 19
+    if p + 4 > blob_len:
+        return -1
+    crv_len: uint32 = _get_u32(blob, p)
+    p = p + 4
+    if cast[uint64](crv_len) != 8:
+        return -1
+    p = p + 8
+    if p + 4 > blob_len:
+        return -1
+    q_len: uint32 = _get_u32(blob, p)
+    p = p + 4
+    if cast[uint64](q_len) != 65:
+        return -1
+    if p + 65 > blob_len:
+        return -1
+    if blob[p] != 0x04:
+        return -1
+    _memcpy(&hk_q[0], cast[Ptr[uint8]](cast[uint64](blob) + p),
+            cast[uint64](65))
+    return 0
+
+
+# Read one SSH mpint at *pos, right-aligned into a 32-byte BE buffer.
+def _read_mpint_be32(buf: Ptr[uint8], pos: Ptr[uint64], endp: uint64,
+                     out_be32: Ptr[uint8]) -> int32:
+    p: uint64 = pos[0]
+    if p + 4 > endp:
+        return -1
+    mlen: uint32 = _get_u32(buf, p)
+    p = p + 4
+    ml: uint64 = cast[uint64](mlen)
+    if p + ml > endp:
+        return -1
+    start: uint64 = 0
+    if ml > 1:
+        if buf[p] == 0:
+            start = 1
+    sig: uint64 = ml - start
+    if sig > 32:
+        return -1
+    i: uint64 = 0
+    while i < 32:
+        out_be32[i] = 0
+        i = i + 1
+    i = 0
+    while i < sig:
+        out_be32[32 - sig + i] = buf[p + start + i]
+        i = i + 1
+    pos[0] = p + ml
+    return 0
+
+
+# Parse the server signature blob (ecdsa-sha2-nistp256):
+#   string "ecdsa-sha2-nistp256" || string ( mpint r || mpint s )
+# into hk_sig_r / hk_sig_s. Returns 0 / -1.
+def _parse_hostkey_sig() -> int32:
+    sig: Ptr[uint8] = &srv_sig[0]
+    sig_len: uint64 = srv_sig_len[0]
+    if sig_len < 4:
+        return -1
+    p: uint64 = 0
+    alg_len: uint32 = _get_u32(sig, p)
+    p = p + 4
+    if cast[uint64](alg_len) != 19:
+        return -1
+    if p + 19 > sig_len:
+        return -1
+    if _memeq(cast[Ptr[uint8]](cast[uint64](sig) + p),
+              cast[Ptr[uint8]]("ecdsa-sha2-nistp256"),
+              cast[uint64](19)) == 0:
+        return -1
+    p = p + 19
+    if p + 4 > sig_len:
+        return -1
+    inner_len: uint32 = _get_u32(sig, p)
+    p = p + 4
+    if p + cast[uint64](inner_len) > sig_len:
+        return -1
+    ip: uint64 = p
+    iend: uint64 = p + cast[uint64](inner_len)
+    if _read_mpint_be32(sig, &ip, iend, &hk_sig_r[0]) != 0:
+        return -1
+    if _read_mpint_be32(sig, &ip, iend, &hk_sig_s[0]) != 0:
+        return -1
+    return 0
+
+
+# Verify the server's host-key signature over the exchange hash H.
+# Returns 1 on a good signature, 0 on a bad one, -1 on a malformed
+# blob. V1 has no known_hosts store, so the caller treats a good
+# signature as authenticating the host (TOFU) and a bad one as fatal.
+def _verify_host_signature() -> int32:
+    if _parse_hostkey_blob() != 0:
+        return -1
+    if _parse_hostkey_sig() != 0:
+        return -1
+    pub: EcdsaPubkey
+    if ecdsa_parse_pubkey(&hk_q[0], cast[uint64](65), &pub) != 0:
+        return -1
+    # ecdsa-sha2-nistp256 signs SHA-256(H); ecdsa_p256_verify_rs hashes
+    # its message argument internally, so we hand it the raw 32-byte H.
+    rc: int32 = ecdsa_p256_verify_rs(&pub, &exch_h[0], cast[uint64](32),
+                                     &hk_sig_r[0], &hk_sig_s[0])
+    if rc == 1:
+        return 1
+    return 0
+
+
+def _kdf_one(letter: uint8, out: Ptr[uint8], want: uint64):
+    # SSH key-derivation (RFC 4253 §7.2) — identical to the server's.
+    base: uint64 = 0
+    base = _put_mpint(&kdf_in[0], base, &kex_k[0])
+    _memcpy(cast[Ptr[uint8]](cast[uint64](&kdf_in[0]) + base),
+            &exch_h[0], cast[uint64](32))
+    base = base + 32
+    blk1len: uint64 = base + 1 + 32
+    kdf_in[base] = letter
+    _memcpy(cast[Ptr[uint8]](cast[uint64](&kdf_in[0]) + base + 1),
+            &session_id[0], cast[uint64](32))
+    ecdsa_sha256(&kdf_in[0], blk1len, &kdf_k1[0])
+    _memcpy(out, &kdf_k1[0], cast[uint64](32))
+    produced: uint64 = 32
+    while produced < want:
+        nb: uint64 = base
+        _memcpy(cast[Ptr[uint8]](cast[uint64](&kdf_in[0]) + nb),
+                out, produced)
+        nb = nb + produced
+        nxt: Array[32, uint8]
+        ecdsa_sha256(&kdf_in[0], nb, &nxt[0])
+        take: uint64 = 32
+        if want - produced < take:
+            take = want - produced
+        _memcpy(cast[Ptr[uint8]](cast[uint64](out) + produced),
+                &nxt[0], take)
+        produced = produced + take
+
+
+def _derive_keys():
+    # 'C' = client->server (our outbound), 'D' = server->client (inbound).
+    _kdf_one(cast[uint8](67), &key_c2s[0], cast[uint64](64))   # 'C'
+    _kdf_one(cast[uint8](68), &key_s2c[0], cast[uint64](64))   # 'D'
+
+
+def _do_kex() -> int32:
+    # Drive curve25519-sha256 as the client. KEXINIT has already been
+    # exchanged. Generate the ephemeral keypair and send KEX_ECDH_INIT.
+    seed: uint64 = sys_get_jiffies()
+    seed = seed ^ (cast[uint64](sys_getpid()) << 24)
+    si: uint64 = 0
+    while si < 32:
+        seed = seed * 6364136223846793005 + 1442695040888963407
+        cx_priv[si] = cast[uint8]((seed >> 31) & 0xFF)
+        si = si + 1
+    ssh_x25519_base(&q_c[0], &cx_priv[0])
+
+    # KEX_ECDH_INIT = byte 30 || string Q_C.
+    o: uint64 = 0
+    pkt_out[o] = SSH_MSG_KEX_ECDH_INIT
+    o = o + 1
+    o = _put_string(&pkt_out[0], o, &q_c[0], cast[uint64](32))
+    if _send_packet(&pkt_out[0], o) != 0:
+        return -1
+    _log("[ssh] sent KEX_ECDH_INIT\n")
+
+    # Expect KEX_ECDH_REPLY = byte 31 || string K_S || string Q_S
+    #   || string signature.
+    if _recv_packet() != 0:
+        return -1
+    if pkt_in_len[0] < 1 or pkt_in[0] != SSH_MSG_KEX_ECDH_REPLY:
+        _log("[ssh] expected KEX_ECDH_REPLY\n")
+        return -1
+    p: uint64 = 1
+    kslen: uint32 = _get_u32(&pkt_in[0], p)
+    p = p + 4
+    if cast[uint64](kslen) > 256:
+        _log("[ssh] host key blob too large\n")
+        return -1
+    _memcpy(&ks_blob[0], cast[Ptr[uint8]](&pkt_in[p]), cast[uint64](kslen))
+    ks_blob_len[0] = cast[uint64](kslen)
+    p = p + cast[uint64](kslen)
+    qslen: uint32 = _get_u32(&pkt_in[0], p)
+    p = p + 4
+    if qslen != 32:
+        _log("[ssh] bad Q_S length\n")
+        return -1
+    _memcpy(&q_s[0], cast[Ptr[uint8]](&pkt_in[p]), cast[uint64](32))
+    p = p + 32
+    siglen: uint32 = _get_u32(&pkt_in[0], p)
+    p = p + 4
+    if cast[uint64](siglen) > 256:
+        _log("[ssh] signature blob too large\n")
+        return -1
+    _memcpy(&srv_sig[0], cast[Ptr[uint8]](&pkt_in[p]), cast[uint64](siglen))
+    srv_sig_len[0] = cast[uint64](siglen)
+    _log("[ssh] received KEX_ECDH_REPLY\n")
+
+    # Shared secret K = X25519(client_priv, Q_S).
+    ssh_x25519(&kex_k[0], &cx_priv[0], &q_s[0])
+
+    # Exchange hash + session id.
+    _compute_exchange_hash()
+    _memcpy(&session_id[0], &exch_h[0], cast[uint64](32))
+
+    # Verify the host-key signature over H (TOFU — accept on a good
+    # signature, abort on a bad one).
+    vr: int32 = _verify_host_signature()
+    if vr == 1:
+        _log("[ssh] host key signature verified\n")
+    elif vr == 0:
+        _log("[ssh] FATAL: host key signature INVALID\n")
+        return -1
+    else:
+        _log("[ssh] WARN: could not parse host key signature\n")
+
+    # Derive the session keys (the secrets are all known now).
+    _derive_keys()
+
+    # Send NEWKEYS, then expect the server's NEWKEYS.
+    nk: Array[1, uint8]
+    nk[0] = SSH_MSG_NEWKEYS
+    if _send_packet(&nk[0], cast[uint64](1)) != 0:
+        return -1
+    enc_out[0] = 1                  # our send side is now encrypted
+    _log("[ssh] sent NEWKEYS\n")
+
+    if _recv_packet() != 0:
+        return -1
+    if pkt_in_len[0] < 1 or pkt_in[0] != SSH_MSG_NEWKEYS:
+        _log("[ssh] expected server NEWKEYS\n")
+        return -1
+    enc_in[0] = 1                   # server send side is now encrypted
+    _log("[ssh] key exchange complete (encryption active)\n")
+    return 0
+
+
+# === user authentication (RFC 4252) — password method ===================
+
+def _do_userauth() -> int32:
+    # Request the ssh-userauth service.
+    o: uint64 = 0
+    pkt_out[o] = SSH_MSG_SERVICE_REQUEST
+    o = o + 1
+    o = _put_cstr(&pkt_out[0], o, "ssh-userauth")
+    if _send_packet(&pkt_out[0], o) != 0:
+        return -1
+    _log("[ssh] sent SERVICE_REQUEST\n")
+    if _recv_packet() != 0:
+        return -1
+    if pkt_in_len[0] < 1 or pkt_in[0] != SSH_MSG_SERVICE_ACCEPT:
+        _log("[ssh] expected SERVICE_ACCEPT\n")
+        return -1
+
+    # USERAUTH_REQUEST password (RFC 4252 §8):
+    #   byte 50 || string user || string "ssh-connection"
+    #     || string "password" || boolean FALSE || string password.
+    o2: uint64 = 0
+    pkt_out[o2] = SSH_MSG_USERAUTH_REQUEST
+    o2 = o2 + 1
+    o2 = _put_string(&pkt_out[0], o2, &login_user[0], login_user_len[0])
+    o2 = _put_cstr(&pkt_out[0], o2, "ssh-connection")
+    o2 = _put_cstr(&pkt_out[0], o2, "password")
+    pkt_out[o2] = 0                              # boolean FALSE
+    o2 = o2 + 1
+    o2 = _put_string(&pkt_out[0], o2, &login_pass[0], login_pass_len[0])
+    if _send_packet(&pkt_out[0], o2) != 0:
+        return -1
+    _log("[ssh] sent password USERAUTH_REQUEST\n")
+
+    # Read auth replies. Skip BANNER/IGNORE/DEBUG; expect SUCCESS.
+    tries: uint32 = 0
+    while tries < 8:
+        tries = tries + 1
+        if _recv_packet() != 0:
+            return -1
+        if pkt_in_len[0] < 1:
+            return -1
+        mt: uint8 = pkt_in[0]
+        if mt == SSH_MSG_USERAUTH_SUCCESS:
+            _log("[ssh] authentication succeeded\n")
+            return 0
+        if mt == SSH_MSG_USERAUTH_BANNER or mt == SSH_MSG_IGNORE \
+           or mt == SSH_MSG_DEBUG:
+            continue
+        if mt == SSH_MSG_USERAUTH_FAILURE:
+            _log("[ssh] authentication failed (server rejected password)\n")
+            return -1
+        _log("[ssh] unexpected message during auth\n")
+        return -1
+    return -1
+
+
+# === connection layer (RFC 4254) ========================================
+
+def _open_session() -> int32:
+    # CHANNEL_OPEN "session" || sender=0 || window || max_packet.
+    chan_local_id[0] = 0
+    chan_local_win[0] = 1048576
+    o: uint64 = 0
+    pkt_out[o] = SSH_MSG_CHANNEL_OPEN
+    o = o + 1
+    o = _put_cstr(&pkt_out[0], o, "session")
+    _put_u32(&pkt_out[0], o, chan_local_id[0])
+    o = o + 4
+    _put_u32(&pkt_out[0], o, cast[uint32](chan_local_win[0]))
+    o = o + 4
+    _put_u32(&pkt_out[0], o, cast[uint32](2048))      # max packet
+    o = o + 4
+    if _send_packet(&pkt_out[0], o) != 0:
+        return -1
+    _log("[ssh] sent CHANNEL_OPEN\n")
+
+    # Expect OPEN_CONFIRMATION = byte 91 || uint32 recipient
+    #   || uint32 sender || uint32 window || uint32 max_packet.
+    while True:
+        if _recv_packet() != 0:
+            return -1
+        if pkt_in_len[0] < 1:
+            return -1
+        mt: uint8 = pkt_in[0]
+        if mt == SSH_MSG_IGNORE or mt == SSH_MSG_DEBUG \
+           or mt == SSH_MSG_GLOBAL_REQUEST:
+            continue
+        if mt == SSH_MSG_CHANNEL_OPEN_CONFIRMATION:
+            chan_remote_id[0] = _get_u32(&pkt_in[0], 5)
+            chan_remote_win[0] = cast[uint64](_get_u32(&pkt_in[0], 9))
+            _log("[ssh] session channel open\n")
+            return 0
+        if mt == SSH_MSG_CHANNEL_OPEN_FAILURE:
+            _log("[ssh] CHANNEL_OPEN refused\n")
+            return -1
+        _log("[ssh] unexpected message during channel open\n")
+        return -1
+
+
+def _request_exec_or_shell() -> int32:
+    # exec a single command, or a shell for interactive use.
+    o: uint64 = 0
+    pkt_out[o] = SSH_MSG_CHANNEL_REQUEST
+    o = o + 1
+    _put_u32(&pkt_out[0], o, chan_remote_id[0])
+    o = o + 4
+    if has_remote_cmd[0] != 0:
+        o = _put_cstr(&pkt_out[0], o, "exec")
+        pkt_out[o] = 1                            # want_reply = TRUE
+        o = o + 1
+        o = _put_string(&pkt_out[0], o, &remote_cmd[0], remote_cmd_len[0])
+    else:
+        o = _put_cstr(&pkt_out[0], o, "shell")
+        pkt_out[o] = 1                            # want_reply = TRUE
+        o = o + 1
+    if _send_packet(&pkt_out[0], o) != 0:
+        return -1
+    _log("[ssh] sent channel request\n")
+
+    # Expect CHANNEL_SUCCESS (the server confirms before output flows).
+    while True:
+        if _recv_packet() != 0:
+            return -1
+        if pkt_in_len[0] < 1:
+            return -1
+        mt: uint8 = pkt_in[0]
+        if mt == SSH_MSG_CHANNEL_SUCCESS:
+            _log("[ssh] channel request confirmed\n")
+            return 0
+        if mt == SSH_MSG_CHANNEL_FAILURE:
+            _log("[ssh] channel request refused\n")
+            return -1
+        if mt == SSH_MSG_IGNORE or mt == SSH_MSG_DEBUG \
+           or mt == SSH_MSG_CHANNEL_WINDOW_ADJUST:
+            continue
+        # Some servers stream data before the reply — handle it in the
+        # bridge instead. Push it back by treating it there: bail to the
+        # bridge which re-reads. For simplicity require the SUCCESS first.
+        _log("[ssh] unexpected message awaiting channel confirm\n")
+        return -1
+
+
+def _send_window_adjust(amount: uint32) -> int32:
+    o: uint64 = 0
+    pkt_out[o] = SSH_MSG_CHANNEL_WINDOW_ADJUST
+    o = o + 1
+    _put_u32(&pkt_out[0], o, chan_remote_id[0])
+    o = o + 4
+    _put_u32(&pkt_out[0], o, amount)
+    o = o + 4
+    return _send_packet(&pkt_out[0], o)
+
+
+def _send_channel_data(buf: Ptr[uint8], n: uint64) -> int32:
+    o: uint64 = 0
+    pkt_out[o] = SSH_MSG_CHANNEL_DATA
+    o = o + 1
+    _put_u32(&pkt_out[0], o, chan_remote_id[0])
+    o = o + 4
+    o = _put_string(&pkt_out[0], o, buf, n)
+    return _send_packet(&pkt_out[0], o)
+
+
+def _send_channel_eof() -> int32:
+    o: uint64 = 0
+    pkt_out[o] = SSH_MSG_CHANNEL_EOF
+    o = o + 1
+    _put_u32(&pkt_out[0], o, chan_remote_id[0])
+    o = o + 4
+    return _send_packet(&pkt_out[0], o)
+
+
+def _send_channel_close() -> int32:
+    o: uint64 = 0
+    pkt_out[o] = SSH_MSG_CHANNEL_CLOSE
+    o = o + 1
+    _put_u32(&pkt_out[0], o, chan_remote_id[0])
+    o = o + 4
+    return _send_packet(&pkt_out[0], o)
+
+
+# === the interactive / exec bridge ======================================
+#
+# Every loop iteration:
+#   1. Non-blocking probe of the socket. If a packet is arriving, read it
+#      fully and route CHANNEL_DATA -> stdout (fd 1), handle window
+#      adjust / EOF / CLOSE / exit-status.
+#   2. Non-blocking read of our stdin (fd 0); whatever arrives is wrapped
+#      as CHANNEL_DATA to the server. EOF on stdin sends CHANNEL_EOF.
+# A small cooperative yield keeps the loop from busy-spinning.
+
+def _peek_socket_has_data() -> int32:
+    n: int64 = sys_read_nb(conn_fd[0], &sock_peek[0], cast[uint64](1))
+    if n < 0:
+        return -1
+    if n == 0:
+        return 0
+    sock_peek_valid[0] = 1
+    return 1
+
+
+def _recv_exact_peek(buf: Ptr[uint8], n: uint64) -> int32:
+    pos: uint64 = 0
+    if sock_peek_valid[0] != 0:
+        buf[0] = sock_peek[0]
+        sock_peek_valid[0] = 0
+        pos = 1
+    if pos >= n:
+        return 0
+    return _recv_exact(cast[Ptr[uint8]](cast[uint64](buf) + pos), n - pos)
+
+
+# Encrypted reader that honours an already-peeked socket byte.
+def _recv_packet_enc_peek() -> int32:
+    if _recv_exact_peek(&enc_len_buf[0], 4) != 0:
+        return -1
+    return _decrypt_after_len()
+
+
+def _short_sleep():
+    # Cooperative yield — Hamnix multitasks cooperatively, so the bridge
+    # must give up the CPU between non-blocking polls or it starves the
+    # peer (sshd + its hamsh) and no output ever comes back.
+    i: uint64 = 0
+    while i < 4:
+        sys_yield()
+        i = i + 1
+
+
+def _bridge_session(want_status: Ptr[int32]) -> int32:
+    _log("[ssh] bridging channel <-> stdin/stdout\n")
+    sock_peek_valid[0] = 0
+    stdin_eof: int32 = 0
+    got_status: int32 = 0
+    exit_code: uint32 = 0
+    idle_loops: uint32 = 0
+    while True:
+        did_work: int32 = 0
+
+        # --- 1. socket -> stdout -------------------------------------
+        probe: int32 = _peek_socket_has_data()
+        if probe < 0:
+            _log("[ssh] server disconnected\n")
+            break
+        if probe > 0:
+            if _recv_packet_enc_peek() != 0:
+                _log("[ssh] packet read error / close\n")
+                break
+            did_work = 1
+            mt: uint8 = pkt_in[0]
+            if mt == SSH_MSG_CHANNEL_DATA:
+                dlen: uint32 = _get_u32(&pkt_in[0], 5)
+                sys_write(1, cast[Ptr[uint8]](&pkt_in[9]),
+                          cast[uint64](dlen))
+                chan_local_win[0] = chan_local_win[0] - cast[uint64](dlen)
+                if chan_local_win[0] < 32768:
+                    _send_window_adjust(cast[uint32](1048576))
+                    chan_local_win[0] = chan_local_win[0] + 1048576
+            elif mt == SSH_MSG_CHANNEL_EXTENDED_DATA:
+                # stderr (data_type_code uint32 then string). Route to
+                # our stderr (fd 2).
+                edlen: uint32 = _get_u32(&pkt_in[0], 9)
+                sys_write(2, cast[Ptr[uint8]](&pkt_in[13]),
+                          cast[uint64](edlen))
+            elif mt == SSH_MSG_CHANNEL_WINDOW_ADJUST:
+                add: uint32 = _get_u32(&pkt_in[0], 5)
+                chan_remote_win[0] = chan_remote_win[0] + cast[uint64](add)
+            elif mt == SSH_MSG_CHANNEL_REQUEST:
+                # uint32 recipient || string request_type || ...
+                rtoff: uint64 = 1 + 4
+                rtlen: uint32 = _get_u32(&pkt_in[0], rtoff)
+                rtp: Ptr[uint8] = cast[Ptr[uint8]](&pkt_in[rtoff + 4])
+                if rtlen == 11:
+                    if _memeq(rtp, cast[Ptr[uint8]]("exit-status"),
+                              cast[uint64](11)) != 0:
+                        # want_reply(1) then uint32 code.
+                        coff: uint64 = rtoff + 4 + 11 + 1
+                        exit_code = _get_u32(&pkt_in[0], coff)
+                        got_status = 1
+            elif mt == SSH_MSG_CHANNEL_EOF:
+                pass
+            elif mt == SSH_MSG_CHANNEL_CLOSE or mt == SSH_MSG_DISCONNECT:
+                _log("[ssh] server closed the channel\n")
+                _send_channel_close()
+                break
+
+        # --- 2. stdin -> socket --------------------------------------
+        if stdin_eof == 0:
+            n: int64 = sys_read_nb(0, &chan_data[0], cast[uint64](2048))
+            if n > 0:
+                if _send_channel_data(&chan_data[0], cast[uint64](n)) != 0:
+                    break
+                did_work = 1
+            elif n < 0:
+                # stdin EOF — signal CHANNEL_EOF so the remote shell ends.
+                _send_channel_eof()
+                stdin_eof = 1
+
+        if did_work != 0:
+            idle_loops = 0
+        else:
+            idle_loops = idle_loops + 1
+            _short_sleep()
+            if idle_loops > 60000:
+                break
+
+    want_status[0] = 0
+    if got_status != 0:
+        want_status[0] = cast[int32](exit_code)
+    return 0
+
+
+# === argument parsing ====================================================
+
+# Parse "a.b.c.d" into target_ip. Returns 0 on success, -1 otherwise.
+# (V1 takes a dotted-quad host; DNS resolution is a future extension —
+# loopback / direct-IP covers the self-ssh and direct-host cases.)
+def _parse_ipv4(s: Ptr[uint8]) -> int32:
+    octet: uint64 = 0
+    part: uint64 = 0
+    have_digit: int32 = 0
+    i: uint64 = 0
+    while True:
+        c: uint8 = s[i]
+        if c >= 48 and c <= 57:
+            octet = octet * 10 + cast[uint64](c - 48)
+            if octet > 255:
+                return -1
+            have_digit = 1
+        elif c == 46 or c == 0:                   # '.' or NUL
+            if have_digit == 0:
+                return -1
+            if part > 3:
+                return -1
+            target_ip[part] = cast[uint8](octet)
+            part = part + 1
+            octet = 0
+            have_digit = 0
+            if c == 0:
+                break
+        else:
+            return -1
+        i = i + 1
+    if part != 4:
+        return -1
+    return 0
+
+
+# Split "user@host" — fill login_user from the part before '@' (if
+# present) and copy the host part into host_out. Returns the host length.
+def _split_userhost(arg: Ptr[uint8], host_out: Ptr[uint8]) -> uint64:
+    # Find '@'.
+    at: int64 = -1
+    n: uint64 = 0
+    while arg[n] != 0:
+        if arg[n] == 64:                          # '@'
+            at = cast[int64](n)
+        n = n + 1
+    hstart: uint64 = 0
+    if at >= 0:
+        u: uint64 = 0
+        while u < cast[uint64](at) and u < 63:
+            login_user[u] = arg[u]
+            u = u + 1
+        login_user_len[0] = u
+        hstart = cast[uint64](at) + 1
+    ho: uint64 = 0
+    while arg[hstart] != 0:
+        host_out[ho] = arg[hstart]
+        ho = ho + 1
+        hstart = hstart + 1
+    host_out[ho] = 0
+    return ho
+
+
+def _set_default_creds():
+    # Default Hamnix credential matches user/sshd.ad's fallback.
+    if login_user_len[0] == 0:
+        login_user[0] = 114                       # 'r'
+        login_user[1] = 111                       # 'o'
+        login_user[2] = 111                       # 'o'
+        login_user[3] = 116                       # 't'
+        login_user_len[0] = 4
+    login_pass[0] = 104                           # 'h'
+    login_pass[1] = 97                            # 'a'
+    login_pass[2] = 109                           # 'm'
+    login_pass[3] = 110                           # 'n'
+    login_pass[4] = 105                           # 'i'
+    login_pass[5] = 120                           # 'x'
+    login_pass_len[0] = 6
+
+
+# === a full client session: connect -> auth -> channel -> bridge ========
+
+def _run_client() -> int32:
+    fd: int32 = net_dial(target_ip[0], target_ip[1], target_ip[2],
+                         target_ip[3], SSH_PORT)
+    if fd < 0:
+        _log("[ssh] connect failed\n")
+        return -1
+    conn_fd[0] = fd
+    _log("[ssh] TCP connected\n")
+
+    seq_in[0] = 0
+    seq_out[0] = 0
+    enc_in[0] = 0
+    enc_out[0] = 0
+
+    if _do_version_exchange() != 0:
+        sys_close(fd)
+        return -1
+
+    _build_kexinit()
+    if _send_packet(&i_c_buf[0], i_c_len[0]) != 0:
+        sys_close(fd)
+        return -1
+    _log("[ssh] sent KEXINIT\n")
+    if _recv_packet() != 0:
+        sys_close(fd)
+        return -1
+    if pkt_in_len[0] < 1 or pkt_in[0] != SSH_MSG_KEXINIT:
+        _log("[ssh] expected KEXINIT\n")
+        sys_close(fd)
+        return -1
+    _memcpy(&i_s_buf[0], &pkt_in[0], pkt_in_len[0])
+    i_s_len[0] = pkt_in_len[0]
+    _log("[ssh] received KEXINIT\n")
+
+    if _do_kex() != 0:
+        sys_close(fd)
+        return -1
+    if _do_userauth() != 0:
+        sys_close(fd)
+        return -1
+    if _open_session() != 0:
+        sys_close(fd)
+        return -1
+    if _request_exec_or_shell() != 0:
+        sys_close(fd)
+        return -1
+
+    status: Array[1, int32]
+    status[0] = 0
+    _bridge_session(&status[0])
+    sys_close(fd)
+    _log("[ssh] session ended\n")
+    return status[0]
+
+
+# === self-test: spawn sshd, loop back to 127.0.0.1, run a command =======
+
+def _selftest() -> int32:
+    _log("[ssh-selftest] spawning /bin/sshd\n")
+    sshd_argv[0] = cast[uint64](&"/bin/sshd"[0])
+    sshd_argv[1] = 0
+    # sshd inherits this task's stdin/stdout (fd 0/1) — its [sshd] logs
+    # land on the same console so the test can grep both sides.
+    pid: int32 = sys_spawn(cast[Ptr[char]]("/bin/sshd"),
+                           &sshd_argv[0], 0, 1, cast[Ptr[uint64]](0))
+    if pid < 0:
+        _log("[ssh-selftest] FAIL: could not spawn sshd\n")
+        return 1
+    # Yield a bounded number of times so sshd gets CPU to bring up its
+    # host key + net_announce(22) before we dial. Each yield may hand
+    # the CPU to sshd for a full (bounded) net_accept poll, so a small
+    # count is plenty of wall-clock head start; the connect-retry loop
+    # below covers any remaining race.
+    y: uint64 = 0
+    while y < 200:
+        sys_yield()
+        y = y + 1
+    _log("[ssh-selftest] dialling 127.0.0.1:22\n")
+
+    # Target = loopback; command = a marker echo whose output we expect
+    # to round-trip back over the channel.
+    target_ip[0] = 127
+    target_ip[1] = 0
+    target_ip[2] = 0
+    target_ip[3] = 1
+    login_user_len[0] = 0
+    _set_default_creds()
+    src: Ptr[uint8] = "echo SSH_CLIENT_RTT_OK"
+    ci: uint64 = 0
+    while src[ci] != 0:
+        remote_cmd[ci] = src[ci]
+        ci = ci + 1
+    remote_cmd_len[0] = ci
+    has_remote_cmd[0] = 1
+
+    # The connect may race sshd's announce; retry a few times.
+    attempt: uint32 = 0
+    rc: int32 = -1
+    while attempt < 5:
+        attempt = attempt + 1
+        rc = _run_client()
+        if rc >= 0:
+            break
+        _log("[ssh-selftest] retrying connect\n")
+        ry: uint64 = 0
+        while ry < 4000:
+            sys_yield()
+            ry = ry + 1
+    if rc < 0:
+        _log("[ssh-selftest] FAIL\n")
+        return 1
+    _log("[ssh-selftest] PASS\n")
+    return 0
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    # Bring up the crypto constant tables.
+    p256_init()
+    ecdsa_init()
+
+    if argc < 2:
+        # No host argument — self-test mode (used when embedded as /init
+        # by scripts/test_ssh_client.sh).
+        return _selftest()
+
+    # `ssh [user@]host [command...]`
+    host: Array[256, uint8]
+    arg1: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
+    login_user_len[0] = 0
+    _split_userhost(arg1, &host[0])
+    if _parse_ipv4(&host[0]) != 0:
+        _log("[ssh] usage: ssh [user@]<a.b.c.d> [command]\n")
+        _log("[ssh] (V1 takes a dotted-quad host; DNS is future work)\n")
+        return 2
+    _set_default_creds()
+
+    # Remaining argv joined by spaces = the remote command. No args =
+    # an interactive shell.
+    has_remote_cmd[0] = 0
+    remote_cmd_len[0] = 0
+    if argc > 2:
+        o: uint64 = 0
+        i: int32 = 2
+        while i < argc:
+            if i > 2:
+                if o < 1023:
+                    remote_cmd[o] = 32            # ' '
+                    o = o + 1
+            s: Ptr[uint8] = cast[Ptr[uint8]](argv[cast[uint64](i)])
+            k: uint64 = 0
+            while s[k] != 0 and o < 1023:
+                remote_cmd[o] = s[k]
+                o = o + 1
+                k = k + 1
+            i = i + 1
+        remote_cmd_len[0] = o
+        has_remote_cmd[0] = 1
+
+    rc: int32 = _run_client()
+    if rc < 0:
+        return 1
+    return rc
