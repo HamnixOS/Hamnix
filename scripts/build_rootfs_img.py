@@ -230,8 +230,19 @@ def _stage_busybox(staging: Path) -> bool:
         if link.exists() or link.is_symlink():
             link.unlink()
         link.symlink_to("busybox")
+    # Debian-shape skeleton dirs. When the curated REAL_DEBIAN closure is
+    # present these get populated for real; when it is absent (host
+    # without tests/distros/debian-minbase/rootfs/) they still give the
+    # distro root top-level entries — sbin/, lib64/, var/ — that the
+    # native sysroot/ does NOT carry. That asymmetry is what
+    # scripts/test_img_distro_isolation.sh keys on to prove the two `/`s
+    # are distinct file servers, so the isolation gate does not depend on
+    # a host-only Debian tree being available.
+    for skel in ("sbin", "lib", "lib64", "var/lib/dpkg", "usr/bin"):
+        (staging / skel).mkdir(parents=True, exist_ok=True)
     print(f"[build_rootfs_img] staged busybox ({bb_target.stat().st_size} "
-          f"bytes) + {len(bb_applets)} applets at /bin/", flush=True)
+          f"bytes) + {len(bb_applets)} applets at /bin/ "
+          f"(+ Debian-shape skeleton dirs)", flush=True)
     return True
 
 
