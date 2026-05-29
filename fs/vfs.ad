@@ -299,7 +299,7 @@ from fs.ext4 import (
     ext4_rename, ext4_fsync, ext4_truncate_inode, ext4_set_open_size,
     ext4_resolve_file, ext4_read_inode, ext4_inode_mtime,
     ext4_blob_save, ext4_blob_load, ext4_is_mounted,
-    ext4_mkdir_live,
+    ext4_mkdir_live, ext4_resolve_dir,
     # docs/security.md Phase 5: ext4 inode owner/group/mode accessor.
     ext4_inode_owner_at,
 )
@@ -1483,12 +1483,110 @@ def _open_named_subpath(dir_prefix: Ptr[uint8], name: Ptr[char],
     if _compose_ext_path(dir_prefix, name, rest_start,
                          &scratch[0], 512) < 0:
         return ENOENT
-    # For p == 4 (just "/ext" with no remainder, no dir), this is
-    # the partition root. is_ext_path / _open_ext4_read handle the
-    # bare "/ext" case via _open_dir_ext (not done here; we route
-    # to the normal _open_ext4_read which will return ENOENT for
-    # a bare directory in the current code path). Best-effort.
-    return _open_ext4_read(cast[Ptr[char]](&scratch[0]))
+    # Try the file reader first. Most named-root opens are file reads
+    # (exec, cat) and that path is the cheapest.
+    fd: int32 = _open_ext4_read(cast[Ptr[char]](&scratch[0]))
+    if fd >= 0:
+        return fd
+    # NAMED-ROOT DIRECTORY OPEN (the `enter debian { /bin/ls / }` fix).
+    # A Linux binary doing open("/", O_DIRECTORY)+getdents — busybox ls,
+    # or any libc opendir — arrives here after `bind '#distro' /`
+    # rewrote "/" to `#by-id/<uuid>/distro`, i.e. the composed path is
+    # `/ext/distro` (a DIRECTORY, not a file). _open_ext4_read returns
+    # ENOENT for a directory, so without this arm the open failed and
+    # `ls /` reported "No such file or directory" / a write to "/foo"
+    # reported "nonexistent directory" — the native-vs-Debian root
+    # isolation looked broken because the Debian root was simply
+    # unopenable. sys_listdir (the native Adder `ls`) sidestepped this
+    # via vfs_listdir's `#`-arm, hence the asymmetry. Mirror that here:
+    # if the composed path resolves to an ext4 directory, open it as a
+    # readdir FD so getdents works. strip the "/ext" prefix the same
+    # way ext4_resolve_dir expects (post-/ext/-strip tail; "" = root).
+    rel: Ptr[char] = strip_ext_prefix(cast[Ptr[char]](&scratch[0]))
+    if ext4_resolve_dir(rel) != 0:
+        return _open_dir_ext(cast[Ptr[char]](&scratch[0]))
+    return ENOENT
+
+
+def _create_named_subpath(dir_prefix: Ptr[uint8], name: Ptr[char],
+                          rest_start: uint64) -> int32:
+    # WRITE-side analog of _open_named_subpath: compose the synthetic
+    # `/ext/<dir_prefix>/<rest>` path for a named-root reference and
+    # open-or-create it on ext4. This is what makes a write INSIDE the
+    # Debian subsystem (`enter debian { sh -c 'echo x > /foo' }`, or
+    # apt/dpkg laying down package files) land in the partition's
+    # `distro/` subtree — `bind '#distro' /` rewrote "/foo" to
+    # `#by-id/<uuid>/distro/foo`, which composes to `/ext/distro/foo`.
+    # Without this, vfs_open_write's `#`-arm fell through to the
+    # READ-only _open_hash_alias path, so a distro-side create reported
+    # "nonexistent directory" and apt could not install anything.
+    # Routing the create here (NOT to the native root) is also what
+    # keeps the write OUT of sysroot: the composed path carries the
+    # frozen `distro` dir prefix, so the bytes can only land under
+    # distro/.
+    scratch: Array[512, uint8]
+    if _compose_ext_path(dir_prefix, name, rest_start,
+                         &scratch[0], 512) < 0:
+        return ENOENT
+    eslot: int32 = ext4_open_create_or_trunc(
+        strip_ext_prefix(cast[Ptr[char]](&scratch[0])))
+    if eslot < 0:
+        return ENOSPC
+    task: Ptr[TaskStruct] = current_task()
+    fd: int32 = _alloc_fd(task)
+    if fd < 0:
+        ext4_close(eslot)
+        return EMFILE
+    fdu: uint64 = cast[uint64](fd)
+    task[0].fd_idx[fdu] = FD_EXT4_MARK
+    task[0].fd_pos[fdu] = 0
+    task[0].fd_buf[fdu] = cast[uint64](eslot)
+    return fd
+
+
+def _open_hash_named_write(name: Ptr[char]) -> int32:
+    # WRITE-side dispatch for a LONG-FORM named-root path
+    # (`#by-id/<partuuid>/<dir>/<rest>` or `#<word>[<N>]/<rest>`).
+    # Mirrors _open_hash_long's resolution but routes to the ext4
+    # create path instead of the read path. Returns a positive fd, or
+    # a negative errno (incl. P9_NO_MOUNT when this is NOT a long-form
+    # named root, so the caller can fall through to the device-letter
+    # _open_hash_alias path).
+    word_buf: Array[40, uint8]
+    pos: int32 = 0
+    word_end: uint64 = 0
+    if _hash_word_extract(name, &word_buf[0], 40, &pos, &word_end) < 0:
+        return P9_NO_MOUNT
+    if _hash_is_by_id(&word_buf[0]) != 0:
+        if name[word_end] != 47:
+            return P9_NO_MOUNT
+        # Parse the partuuid up to the next '/'.
+        pu_buf: Array[40, uint8]
+        i: uint64 = word_end + 1
+        o: uint64 = 0
+        while name[i] != 0 and name[i] != 47 and o + 1 < 40:
+            pu_buf[o] = cast[uint8](name[i])
+            o = o + 1
+            i = i + 1
+        pu_buf[o] = 0
+        if o == 0:
+            return P9_NO_MOUNT
+        if byid_lookup(&pu_buf[0]) == 0:
+            return P9_NO_MOUNT
+        dir_buf: Array[256, uint8]
+        dir_buf[0] = 0
+        byid_lookup_dir(&pu_buf[0], &dir_buf[0], 256)
+        return _create_named_subpath(&dir_buf[0], name, i)
+    # Bare `#<word>[<N>]/<rest>` (unfrozen named-root reference).
+    sel: int32 = pos
+    if sel == 0:
+        sel = 1
+    if name_lookup_at(&word_buf[0], sel) == 0:
+        return P9_NO_MOUNT
+    dir_buf2: Array[256, uint8]
+    if name_lookup_dir(&word_buf[0], sel, &dir_buf2[0], 256) < 0:
+        return P9_NO_MOUNT
+    return _create_named_subpath(&dir_buf2[0], name, word_end)
 
 
 def _ns_ext4_slurp_by_id(name: Ptr[char], buf_out: Ptr[uint64],
@@ -1768,6 +1866,13 @@ def vfs_open_write(name: Ptr[char]) -> int32:
     # not file-write), but routing through one place keeps the
     # dispatch logic in lockstep when V4 adds writable srv/proc nodes.
     if name[0] == 35:                                  # '#'
+        # Named-root write-create first (e.g. apt/dpkg in `enter debian`
+        # writing under #distro). Returns P9_NO_MOUNT when NOT a
+        # long-form named root, so device-letter writes (#c cons etc.)
+        # fall through to _open_hash_alias unchanged.
+        wfd: int32 = _open_hash_named_write(name)
+        if wfd != P9_NO_MOUNT:
+            return wfd
         return _open_hash_alias(name)
     if _path_eq_const(name, "/dev/null", 9) != 0:
         return _open_dev_marked(FD_DEVNULL_MARK)

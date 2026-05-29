@@ -22,9 +22,12 @@ The file list mirrors scripts/build_rootfs_img.py:
                                           source paths)
 
 Source paths point at /n/distros/<rel>: at install time the live ISO
-has the source rootfs partition mounted there (per etc/rc.boot's
-`bind '#distro' /n/distros`), so the installer reads bytes from the
-live mount rather than re-extracting a SLIM-mode package payload.
+has the source rootfs partition mounted there. The installer
+(etc/install.hamsh) binds '#distro' /n/distros ITSELF at startup —
+NOT the boot rc, which deliberately keeps the distro tree out of the
+ambient namespace for isolation (see etc/rc.boot.full). So the
+installer reads bytes from the live mount rather than re-extracting a
+SLIM-mode package payload.
 
 Manifest format (one entry per line; '#' comments allowed):
 
@@ -139,10 +142,10 @@ BUSYBOX_APPLETS = [
 
 
 def main() -> int:
-    # Source root the installer reads from. The live ISO mounts the
-    # source rootfs partition at /n/distros via etc/rc.boot's
-    # `bind '#distro' /n/distros`. Manifests reference absolute paths
-    # under that mount.
+    # Source root the installer reads from. The installer
+    # (etc/install.hamsh) binds '#distro' /n/distros itself at startup
+    # (the boot rc no longer does — isolation invariant). Manifests
+    # reference absolute paths under that mount.
     src_root = os.environ.get("HAMNIX_MANIFEST_SRC_ROOT", "/n/distros")
 
     # Target output (defaults to etc/install/rootfs.manifest under the
