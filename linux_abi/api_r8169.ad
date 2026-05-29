@@ -57,6 +57,8 @@
 from linux_abi.exports import _add_export
 from kernel.printk.printk import printk0
 from mm.slab import kmalloc, kfree, kzalloc
+from drivers.pci.pci import pci_read_bar, pci_pack_bdf, pci_enable_mem_and_master
+from linux_abi.api_pci import _pci_dev_bus, _pci_dev_dev, _pci_dev_fn
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
@@ -102,36 +104,92 @@ r8k_iomap_table:        Array[6, uint64]
 # Group 3: PCI extensions (pcim_/pci_ surface beyond api_e1000e)
 # =====================================================================
 
+# --- iomap table backing: populate from the live PCI BARs -----------
+#
+# pcim_iomap_regions() in real Linux reserves the requested BARs and
+# maps them into a per-device iomap table that pcim_iomap_table() then
+# returns. On Hamnix the PCI MMIO window is identity-mapped (phys==virt
+# for the first 4 GiB), so the "mapped" address IS the raw BAR base —
+# the same uint64 doubles as the void __iomem * the .ko dereferences
+# via inline readl/writel. We populate r8k_iomap_table with the real
+# BAR bases for every BAR whose bit is set in `mask`.
+#
+# This is the load-bearing fix for the Intel HDA stack: snd_hda_intel's
+# azx_probe_continue does pcim_iomap_regions(pdev, 1<<0, ...) then reads
+# pcim_iomap_table(pdev)[0] and stores it as bus->remap_addr. With a
+# NULL slot the real azx_init_chip read STATESTS at NULL and got
+# codec_mask=0 → azx_probe_codecs found no codec → -ENXIO. With the
+# real BAR base, the stock azx code drives QEMU's live HDA controller
+# MMIO (RESET, CORB/RIRB rings, STATESTS) for real.
+
+def _r8k_iomap_populate(pdev: uint64, mask: int32):
+    # Clear all slots first, then fill the BARs requested in `mask`.
+    i: uint64 = 0
+    while i < 6:
+        r8k_iomap_table[i] = 0
+        i = i + 1
+    if pdev == 0:
+        return
+    bus: uint32 = _pci_dev_bus(pdev)
+    devnr: uint32 = _pci_dev_dev(pdev)
+    fn:  uint32 = _pci_dev_fn(pdev)
+    bdf: uint32 = pci_pack_bdf(bus, devnr, fn)
+    b: uint64 = 0
+    while b < 6:
+        if (cast[uint32](mask) & (cast[uint32](1) << b)) != 0:
+            raw: uint32 = pci_read_bar(bdf, cast[uint32](b))
+            addr: uint64 = 0
+            if raw != 0:
+                if (raw & 0x01) == 1:
+                    addr = cast[uint64](raw & (~cast[uint32](0x03)))
+                else:
+                    addr = cast[uint64](raw & (~cast[uint32](0x0F)))
+            r8k_iomap_table[b] = addr
+        b = b + 1
+
+
 def _r8k_pcim_enable_device(pdev: uint64) -> int32:
     # int pcim_enable_device(struct pci_dev *);
     # devm variant of pci_enable_device — auto-disables on driver detach.
-    # Hamnix's existing pci.ad already brings the device up at scan time,
-    # so this is success.
+    # Real Linux flips Memory + IO space enable here; we MUST do the
+    # same so the device's BARs decode before the driver dereferences
+    # the mapped MMIO. (The PCI scan does NOT auto-enable MEM for every
+    # device.) Bus-master comes along for the ride so ring-buffer DMA
+    # works the moment the driver programs the descriptor bases.
+    if pdev == 0:
+        return -22
+    bus: uint32 = _pci_dev_bus(pdev)
+    devnr: uint32 = _pci_dev_dev(pdev)
+    fn:  uint32 = _pci_dev_fn(pdev)
+    bdf: uint32 = pci_pack_bdf(bus, devnr, fn)
+    pci_enable_mem_and_master(bdf)
     return 0
 
 
 def _r8k_pcim_iomap_regions(pdev: uint64, mask: int32,
                               name: Ptr[char]) -> int32:
     # int pcim_iomap_regions(struct pci_dev *, int mask, const char *name);
-    # Maps the requested BARs into the per-device iomap table; the
-    # driver later uses pcim_iomap_table() to access them. Hamnix is
-    # identity-mapped, so we just leave the iomap table at the BAR
-    # phys addresses. Return success — populating happens lazily in
-    # pcim_iomap_table below.
+    # Reserves + maps the requested BARs into the per-device iomap
+    # table. We ensure MEM+master is enabled (idempotent with
+    # pcim_enable_device) and populate the table with the live BAR
+    # bases so pcim_iomap_table() below hands back real MMIO pointers.
+    if pdev != 0:
+        bus: uint32 = _pci_dev_bus(pdev)
+        devnr: uint32 = _pci_dev_dev(pdev)
+        fn:  uint32 = _pci_dev_fn(pdev)
+        bdf: uint32 = pci_pack_bdf(bus, devnr, fn)
+        pci_enable_mem_and_master(bdf)
+    _r8k_iomap_populate(pdev, mask)
     return 0
 
 
 def _r8k_pcim_iomap_table(pdev: uint64) -> uint64:
     # void __iomem * const *pcim_iomap_table(struct pci_dev *);
-    # Returns the per-pdev iomap table. For our env, return our static
-    # 6-slot pointer table backing — the driver indexes by BAR number.
-    # The driver only calls this AFTER pcim_iomap_regions; populating
-    # at first call would need real pdev introspection. For now we
-    # return the empty table and lean on the driver tolerating NULL
-    # entries (it reads BAR2 for the MMIO window on most variants and
-    # NULL there would cause a deref crash — but on QEMU's rtl8139
-    # backward-compat path the driver finds the device but bails on
-    # the chip-version probe before touching MMIO).
+    # Returns the per-pdev iomap table populated by pcim_iomap_regions.
+    # The table holds the live BAR bases (identity-mapped == directly
+    # dereferenceable). snd_hda_intel reads slot 0 (HDA register
+    # window); rtl8169/rtl8139 read slot 2 (their MMIO window). A BAR
+    # the driver didn't request stays NULL.
     return cast[uint64](&r8k_iomap_table[0])
 
 
