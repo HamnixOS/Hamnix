@@ -42,10 +42,17 @@
 
 extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_open(path: Ptr[char]) -> int32
 extern def sys_open_write(path: Ptr[char]) -> int32
 extern def sys_close(fd: int32) -> int32
 extern def sys_exit(code: uint64)
+extern def sys_yield() -> int32
+extern def sys_spawn(path: Ptr[char], argv: Ptr[uint64],
+                     stdin_fd: int32, stdout_fd: int32,
+                     envp: Ptr[uint64]) -> int32
+extern def sys_kill(pid: int32, sig: int32) -> int32
+extern def sys_wsys_alloc(pid: uint64) -> int32
 
 
 # ---- window + layer caps (mirror the kernel cdev surface) ----------
@@ -1762,8 +1769,378 @@ def emit_present_summary(wid: int32, sw: uint64, sh: uint64,
     sys_write(1, &line[0], p)
 
 
+# ====================================================================
+# Phase 4c-interactive — the persistent daemon
+# ====================================================================
+#
+#   hamUId daemon
+#       A persistent present-loop that owns the physical framebuffer:
+#         * opens /dev/fb (geometry once) and /dev/mouse,
+#         * maintains a cursor position (starts at screen centre) driven
+#           by the mouse dx/dy each iteration, clamped to screen bounds,
+#         * composites a flat root backdrop + every window created by the
+#           drag gesture + the cursor (a small arrow), and PRESENTS the
+#           result to /dev/fb whenever anything changed,
+#         * implements the canonical rio DRAG-TO-CREATE gesture: a
+#           left-button-down at (x0,y0) begins a drag; while held a
+#           rubber-band outline rectangle tracks the cursor; a
+#           left-button-up at (x1,y1), if the swept rectangle exceeds a
+#           small threshold, allocates a new wid (sys_spawn detached
+#           hamsh + sys_wsys_alloc, mirroring user/hamUI.ad's cmd_new)
+#           and records the rectangle as a window so its chrome paints
+#           where it was dragged.
+#
+#       It does NOT auto-start at boot — it is launched explicitly (by a
+#       user or a test). It yields the CPU every idle iteration so it
+#       never spins at 100%.
+#
+# The daemon owns the WHOLE physical screen (unlike `present`, which
+# scales one 640x480 window). It composites directly at screen
+# resolution one ROW at a time into screen_row (reused from `present`),
+# computing each pixel from a tiny model — backdrop, the window table,
+# the rubber band, and the cursor — so userland memory stays bounded
+# regardless of screen size.
+
+# Root backdrop colour (a calm slate so window chrome and the cursor
+# stand out for screendump assertions).
+ROOT_R: uint8 = 32
+ROOT_G: uint8 = 48
+ROOT_B: uint8 = 72
+
+# Window chrome colours.
+WIN_TITLE_R: uint8 = 64
+WIN_TITLE_G: uint8 = 110
+WIN_TITLE_B: uint8 = 200
+WIN_BODY_R: uint8 = 200
+WIN_BODY_G: uint8 = 200
+WIN_BODY_B: uint8 = 210
+WIN_BORDER_R: uint8 = 240
+WIN_BORDER_G: uint8 = 240
+WIN_BORDER_B: uint8 = 250
+
+TITLE_H: int64 = 18                      # window title-bar height (px)
+DRAG_MIN: int64 = 12                     # min swept extent to spawn a win
+
+SIGTERM_D: int32 = 15
+
+# ---- daemon window model -------------------------------------------
+# Up to DMAX windows the daemon paints as chrome rectangles. We mirror
+# the wsys cap (MAX_WINDOWS - 2 spawnable slots) but keep our own count.
+DMAX: uint64 = 8
+DWIN_X: Array[8, int64]
+DWIN_Y: Array[8, int64]
+DWIN_W: Array[8, int64]
+DWIN_H: Array[8, int64]
+DWIN_WID: Array[8, int32]
+DWIN_COUNT: uint64 = 0
+
+# ---- cursor + drag state -------------------------------------------
+CUR_X: int64 = 0
+CUR_Y: int64 = 0
+DRAG_ACTIVE: int32 = 0
+DRAG_X0: int64 = 0
+DRAG_Y0: int64 = 0
+PREV_BTN_L: int32 = 0                     # previous-iteration left button
+
+# Small mouse read buffer ("<dx> <dy> <buttons>\n" lines).
+mouse_buf: Array[256, uint8]
+
+
+def iclamp(v: int64, lo: int64, hi: int64) -> int64:
+    if v < lo:
+        return lo
+    if v > hi:
+        return hi
+    return v
+
+
+def imin(a: int64, b: int64) -> int64:
+    if a < b:
+        return a
+    return b
+
+
+def imax(a: int64, b: int64) -> int64:
+    if a > b:
+        return a
+    return b
+
+
+# Pixel-model query: what colour is screen pixel (x,y)? Writes r/g/b.
+# Order (back to front): backdrop -> windows (in creation order) ->
+# rubber band outline -> cursor. The cursor wins last so it's always
+# visible.
+def daemon_pixel(x: int64, y: int64,
+                 outr: Ptr[uint8], outg: Ptr[uint8], outb: Ptr[uint8]):
+    r: uint8 = ROOT_R
+    g: uint8 = ROOT_G
+    b: uint8 = ROOT_B
+    # --- windows (back to front) ---
+    wi: uint64 = 0
+    while wi < DWIN_COUNT:
+        wx: int64 = DWIN_X[wi]
+        wy: int64 = DWIN_Y[wi]
+        ww: int64 = DWIN_W[wi]
+        wh: int64 = DWIN_H[wi]
+        if x >= wx and x < wx + ww and y >= wy and y < wy + wh:
+            # border (2px), title bar, or body.
+            on_border: int32 = 0
+            if x < wx + 2 or x >= wx + ww - 2 or y < wy + 2 or y >= wy + wh - 2:
+                on_border = 1
+            if on_border != 0:
+                r = WIN_BORDER_R
+                g = WIN_BORDER_G
+                b = WIN_BORDER_B
+            else:
+                if y < wy + TITLE_H:
+                    r = WIN_TITLE_R
+                    g = WIN_TITLE_G
+                    b = WIN_TITLE_B
+                else:
+                    r = WIN_BODY_R
+                    g = WIN_BODY_G
+                    b = WIN_BODY_B
+        wi = wi + 1
+    # --- rubber band (1px outline of the in-progress drag rect) ---
+    if DRAG_ACTIVE != 0:
+        rx0: int64 = imin(DRAG_X0, CUR_X)
+        ry0: int64 = imin(DRAG_Y0, CUR_Y)
+        rx1: int64 = imax(DRAG_X0, CUR_X)
+        ry1: int64 = imax(DRAG_Y0, CUR_Y)
+        if x >= rx0 and x <= rx1 and y >= ry0 and y <= ry1:
+            on_edge: int32 = 0
+            if x == rx0 or x == rx1 or y == ry0 or y == ry1:
+                on_edge = 1
+            if on_edge != 0:
+                r = 255
+                g = 255
+                b = 0
+    # --- cursor (a small filled arrow / triangle) ---
+    dx: int64 = x - CUR_X
+    dy: int64 = y - CUR_Y
+    if dx >= 0 and dy >= 0 and dx < 12 and dy < 12:
+        # Triangle mask: the pixel is part of the cursor if dx <= dy.
+        # That paints a downward-right pointer anchored at the hotspot.
+        if dx <= dy:
+            # 1px white outline at the hypotenuse-ish edge, black fill.
+            if dx == dy or dy == 11 or dx == 0:
+                r = 255
+                g = 255
+                b = 255
+            else:
+                r = 0
+                g = 0
+                b = 0
+    outr[0] = r
+    outg[0] = g
+    outb[0] = b
+
+
+# Composite one screen frame from the daemon model and present it to
+# /dev/fb, one row at a time (bounded userland memory). Returns 0 / 1.
+def daemon_present() -> int32:
+    sw: uint64 = FBG_W
+    sh: uint64 = FBG_H
+    if sw > SCREEN_ROW_MAXW:
+        sw = SCREEN_ROW_MAXW
+    pw: Ptr[uint8] = "/dev/fb"
+    wf: int32 = sys_open_write(cast[Ptr[char]](pw))
+    if wf < 0:
+        return 1
+    rr: Array[1, uint8]
+    gg: Array[1, uint8]
+    bb: Array[1, uint8]
+    sy: uint64 = 0
+    while sy < sh:
+        sx: uint64 = 0
+        while sx < sw:
+            daemon_pixel(cast[int64](sx), cast[int64](sy),
+                         &rr[0], &gg[0], &bb[0])
+            o: uint64 = sx * 4
+            screen_row[o] = rr[0]
+            screen_row[o + 1] = gg[0]
+            screen_row[o + 2] = bb[0]
+            screen_row[o + 3] = 255
+            sx = sx + 1
+        sys_write(wf, &screen_row[0], sw * 4)
+        sy = sy + 1
+    sys_close(wf)
+    return 0
+
+
+# Spawn a detached hamsh + bind it to a fresh wid, then record the
+# dragged rectangle as a daemon window. Mirrors user/hamUI.ad::cmd_new.
+# Returns the wid (>=2) on success, -1 on failure (still records the
+# rectangle as a chrome-only window so the gesture is visibly honoured).
+arg_buf_d: Array[2, uint64]
+def daemon_spawn_window(rx: int64, ry: int64, rw: int64, rh: int64):
+    if DWIN_COUNT >= DMAX:
+        return
+    wid: int32 = -1
+    arg_buf_d[0] = cast[uint64](cast[Ptr[char]]("/bin/hamsh"))
+    arg_buf_d[1] = 0
+    pid: int32 = sys_spawn("/bin/hamsh", &arg_buf_d[0],
+                           -2, -2, cast[Ptr[uint64]](0))
+    if pid >= 0:
+        wid = sys_wsys_alloc(cast[uint64](pid))
+        if wid < 0:
+            # Table full / dup — reap the child so we don't leak it.
+            sys_kill(pid, SIGTERM_D)
+    slot: uint64 = DWIN_COUNT
+    DWIN_X[slot] = rx
+    DWIN_Y[slot] = ry
+    DWIN_W[slot] = rw
+    DWIN_H[slot] = rh
+    DWIN_WID[slot] = wid
+    DWIN_COUNT = DWIN_COUNT + 1
+    # If we got a real wid, plant a chrome layer on its draw surface so
+    # the window is real on the wsys side too (best-effort).
+    if wid >= 2:
+        build_path(wid, cast[Ptr[uint8]](0), "ctl")
+        cf: int32 = sys_open_write(cast[Ptr[char]](&path_buf[0]))
+        if cf >= 0:
+            cmd: Ptr[uint8] = "mklayer chrome markup\n"
+            sys_write(cf, cmd, strlen_u8(cmd))
+            sys_close(cf)
+
+
+# Consume all currently-available mouse packets, updating CUR_X/CUR_Y
+# and tracking the left-button edge for the drag gesture. Returns 1 if
+# anything changed (cursor moved or button edge), else 0. The /dev/mouse
+# fd is held in the mouse_fd global (opened once in cmd_daemon).
+mouse_fd: int32 = -1
+def daemon_pump_mouse(scr_w: int64, scr_h: int64) -> int32:
+    changed: int32 = 0
+    iters: int32 = 0
+    while iters < 64:
+        n: int64 = sys_read_nb(mouse_fd, &mouse_buf[0], 256)
+        iters = iters + 1
+        if n <= 0:
+            break
+        i: uint64 = 0
+        total: uint64 = cast[uint64](n)
+        while i < total:
+            ls: uint64 = i
+            while i < total and mouse_buf[i] != 10:
+                i = i + 1
+            le: uint64 = i
+            if i < total:
+                i = i + 1
+            if le > ls:
+                changed = daemon_apply_packet(ls, le, scr_w, scr_h) | changed
+    return changed
+
+
+def daemon_apply_packet(ls: uint64, le: uint64,
+                        scr_w: int64, scr_h: int64) -> int32:
+    # Parse "<dx> <dy> <buttons>" (space-separated, possibly signed).
+    pos: Array[1, uint64]
+    pos[0] = ls
+    dx: int64 = next_signed(&mouse_buf[0], &pos[0], le)
+    dy: int64 = next_signed(&mouse_buf[0], &pos[0], le)
+    btn: int64 = next_signed(&mouse_buf[0], &pos[0], le)
+    # PS/2 dy is screen-up-positive; framebuffer y grows downward, so
+    # invert dy for natural cursor motion.
+    CUR_X = iclamp(CUR_X + dx, 0, scr_w - 1)
+    CUR_Y = iclamp(CUR_Y - dy, 0, scr_h - 1)
+    lbtn: int32 = 0
+    if (btn & 1) != 0:
+        lbtn = 1
+    # Edge detection for the drag gesture.
+    if lbtn != 0 and PREV_BTN_L == 0:
+        # left-button DOWN -> begin a drag at the cursor.
+        DRAG_ACTIVE = 1
+        DRAG_X0 = CUR_X
+        DRAG_Y0 = CUR_Y
+    if lbtn == 0 and PREV_BTN_L != 0:
+        # left-button UP -> end the drag; maybe create a window.
+        if DRAG_ACTIVE != 0:
+            rx0: int64 = imin(DRAG_X0, CUR_X)
+            ry0: int64 = imin(DRAG_Y0, CUR_Y)
+            rx1: int64 = imax(DRAG_X0, CUR_X)
+            ry1: int64 = imax(DRAG_Y0, CUR_Y)
+            rw: int64 = rx1 - rx0
+            rh: int64 = ry1 - ry0
+            if rw >= DRAG_MIN and rh >= DRAG_MIN:
+                daemon_spawn_window(rx0, ry0, rw, rh)
+        DRAG_ACTIVE = 0
+    PREV_BTN_L = lbtn
+    return 1
+
+
+def next_signed(buf: Ptr[uint8], pos: Ptr[uint64], total: uint64) -> int64:
+    # Skip up to a sign or digit, parse a (possibly signed) decimal.
+    i: uint64 = pos[0]
+    while i < total and buf[i] != 45 and (buf[i] < 48 or buf[i] > 57):
+        i = i + 1
+    neg: int32 = 0
+    if i < total and buf[i] == 45:
+        neg = 1
+        i = i + 1
+    v: int64 = 0
+    while i < total and buf[i] >= 48 and buf[i] <= 57:
+        v = v * 10 + cast[int64](cast[int32](buf[i]) - 48)
+        i = i + 1
+    pos[0] = i
+    if neg != 0:
+        return 0 - v
+    return v
+
+
+def cmd_daemon() -> int32:
+    if read_fb_geometry() == 0:
+        write_str(2, "hamUId: daemon: cannot read /dev/fb geometry\n")
+        return 1
+    mp: Ptr[uint8] = "/dev/mouse"
+    mfd: int32 = sys_open(cast[Ptr[char]](mp))
+    if mfd < 0:
+        write_str(2, "hamUId: daemon: cannot open /dev/mouse\n")
+        return 1
+    mouse_fd = mfd
+    scr_w: int64 = cast[int64](FBG_W)
+    scr_h: int64 = cast[int64](FBG_H)
+    # Cursor starts at screen centre.
+    CUR_X = scr_w / 2
+    CUR_Y = scr_h / 2
+    # Announce so a test can detect the daemon came up and parse geometry.
+    line: Array[96, uint8]
+    p: uint64 = 0
+    pfx: Ptr[uint8] = "DAEMON up screen="
+    k: uint64 = 0
+    while pfx[k] != 0:
+        line[p] = pfx[k]
+        p = p + 1
+        k = k + 1
+    p = p + u64_to_dec(FBG_W, &line[p])
+    line[p] = 120                                    # 'x'
+    p = p + 1
+    p = p + u64_to_dec(FBG_H, &line[p])
+    line[p] = 10
+    p = p + 1
+    sys_write(1, &line[0], p)
+    # First frame (backdrop + cursor at centre).
+    daemon_present()
+    # Main loop. Cooperative: yield every idle iteration so we never
+    # monopolise the CPU and the spawned hamsh tasks still run.
+    prev_wins: uint64 = DWIN_COUNT
+    while True:
+        ch: int32 = daemon_pump_mouse(scr_w, scr_h)
+        # Re-present when the mouse moved/clicked, a drag is in progress
+        # (rubber band must track), or a window was just created.
+        need: int32 = ch
+        if DRAG_ACTIVE != 0:
+            need = 1
+        if DWIN_COUNT != prev_wins:
+            need = 1
+            prev_wins = DWIN_COUNT
+        if need != 0:
+            daemon_present()
+        sys_yield()
+    return 0
+
+
 def usage(fd: int32):
-    write_str(fd, "Usage: hamUId render <wid> | hamUId present <wid>\n")
+    write_str(fd, "Usage: hamUId render <wid> | hamUId present <wid> | hamUId daemon\n")
 
 
 def main(argc: int32, argv: Ptr[uint64]) -> int32:
@@ -1789,5 +2166,7 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
             write_str(2, "hamUId: present: bad wid\n")
             return 1
         return cmd_present(pwid)
+    if cstr_eq(verb, "daemon") != 0:
+        return cmd_daemon()
     usage(2)
     return 1
