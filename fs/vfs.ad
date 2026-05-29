@@ -123,7 +123,7 @@ from sys.src.port9.port.chan import (
     # Phase 6: long-form `#<word>` device names route through the
     # named-stack and by-id alias tables.
     name_lookup, name_lookup_at, name_lookup_dir,
-    byid_lookup,
+    byid_lookup, byid_lookup_dir,
 )
 # HAMSH §7: the `#d` fd device. /fd/N is a name in the calling
 # process's Pgrp namespace; an `#d/N` open installs an FD_DEVFD_MARK
@@ -394,27 +394,176 @@ def initramfs_data_size(name: Ptr[char]) -> uint64:
 # instead — but the resolve_path() seam here is already namespace-
 # correct, so that change is localised to this function pair.
 
+# --- exec/interp blob cache (partition-backed binaries) -------------
+#
+# THE KEYSTONE (P2). The cpio is memory-resident, so the original
+# ns_blob_ptr just returned the cpio entry's in-RAM address. A binary
+# that lives ONLY on the ext4 rootfs partition (reached via `bind
+# '#sysroot' /`) has NO cpio entry — resolve_path() correctly rewrites
+# `/bin/ls` to `#by-id/<partuuid>/sysroot/bin/ls` (the named-root bind),
+# but initramfs_data_ptr() then misses and exec fails with -ENOENT even
+# though userspace can `cat` the very same path (vfs_open routes the
+# `#by-id` form through ext4). The fix: when the cpio misses, READ the
+# resolved file off its backing FS into a kmalloc'd kernel buffer and
+# hand the ELF loader that pointer.
+#
+# vfs_open already handles every backend (`#by-id`/ext4/tmpfs/cpio)
+# uniformly, so we reuse it: open the resolved path, slurp the whole
+# file with vfs_read, close. The bytes are cached in a single-entry
+# slot keyed by the ORIGINAL (pre-resolve) name so the consecutive
+# ns_blob_ptr()+ns_blob_size() calls every exec/interp site makes for
+# the same path share one read instead of opening the partition twice.
+# A fresh load frees the previous slot (exec is one-at-a-time at this
+# scale; the loaded ELF image is copied out by elf_load_blob before the
+# next exec, so the buffer can be recycled).
+_ns_blob_cache_ptr:   uint64 = 0
+_ns_blob_cache_size:  uint64 = 0
+_ns_blob_cache_owned: uint64 = 0
+_ns_blob_load_last_size: uint64 = 0
+_ns_blob_cache_key:  Array[256, uint8]
+
+
+def _ns_blob_key_matches(name: Ptr[char]) -> int32:
+    if _ns_blob_cache_ptr == 0:
+        return 0
+    i: uint64 = 0
+    while i < 255:
+        a: uint8 = cast[uint8](name[i] & 0xFF)
+        b: uint8 = _ns_blob_cache_key[i]
+        if a != b:
+            return 0
+        if a == 0:
+            return 1
+        i = i + 1
+    return 1
+
+
+# Upper bound on a partition-served binary the exec fallback will slurp
+# into a single contiguous kmalloc buffer. Generous (busybox-static is
+# ~2 MiB, glibc DSOs a few hundred KiB); guards against a pathological
+# size pinning all of kmalloc.
+_NS_BLOB_MAX: uint64 = 67108864
+
+
+def _ns_blob_partition_load(resolved: Ptr[char]) -> uint64:
+    # Open the resolved path through the full vfs_open backend dispatch
+    # (so a `#by-id/<uuid>/sysroot/...` named-root path lands on ext4)
+    # and read the whole file into a kmalloc'd buffer. Returns the
+    # buffer pointer (size left in _ns_blob_load_last_size) or 0 on
+    # failure. Caller owns caching/freeing.
+    fd: int32 = vfs_open(resolved)
+    if fd < 0:
+        return 0
+    # Discover the size. ext4/cpio/tmpfs opens stash the file length in
+    # the fd's fd_buflen; fall back to a bounded read loop if it's 0.
+    task: Ptr[TaskStruct] = current_task()
+    fdu: uint64 = cast[uint64](fd)
+    size: uint64 = task[0].fd_buflen[fdu]
+    if size == 0 or size > _NS_BLOB_MAX:
+        # Either an unsized backend or an implausible size — read in a
+        # loop up to the cap, growing the read window as we go is
+        # overkill; allocate the cap-bounded buffer and read into it.
+        if size > _NS_BLOB_MAX:
+            vfs_close(fd)
+            return 0
+        size = _NS_BLOB_MAX
+    buf: uint64 = kmalloc(size)
+    if buf == 0:
+        vfs_close(fd)
+        return 0
+    total: uint64 = 0
+    while total < size:
+        n: int64 = vfs_read(fd, cast[Ptr[uint8]](buf + total),
+                            size - total)
+        if n <= 0:
+            break
+        total = total + cast[uint64](n)
+    vfs_close(fd)
+    if total == 0:
+        kfree(buf)
+        return 0
+    _ns_blob_load_last_size = total
+    return buf
+
+
+def _ns_blob_load(name: Ptr[char]) -> uint64:
+    # Resolve `name` through the calling task's namespace, then return
+    # an in-memory blob pointer (cpio entry address, or a kmalloc'd copy
+    # of a partition file). 0 on miss. _ns_blob_cache_size carries the
+    # matching length. Single-entry cache keyed on the original name so
+    # the paired ns_blob_ptr/ns_blob_size calls share one read.
+    if _ns_blob_key_matches(name) != 0:
+        return _ns_blob_cache_ptr
+    resolved: Array[256, uint8]
+    rc: int32 = resolve_path(name, &resolved[0], 256)
+    target: Ptr[char] = name
+    if rc == 0:
+        target = cast[Ptr[char]](&resolved[0])
+    # 1. cpio (memory-resident): return the entry address directly,
+    #    matching the historical fast path. NOT cached (it isn't a
+    #    kmalloc'd buffer we own) — but we DO record size/key so the
+    #    follow-up ns_blob_size hits without re-resolving.
+    cpio_ptr: uint64 = initramfs_data_ptr(target)
+    if cpio_ptr != 0:
+        # Free a previously-cached PARTITION buffer (owned==1) before we
+        # repoint the slot at the cpio entry. A cpio entry is NOT
+        # heap-owned, so we must NOT kfree it — _ns_blob_cache_owned
+        # records which kind the slot currently holds.
+        if _ns_blob_cache_ptr != 0 and _ns_blob_cache_owned != 0:
+            kfree(_ns_blob_cache_ptr)
+        _ns_blob_cache_ptr = cpio_ptr
+        _ns_blob_cache_size = initramfs_data_size(target)
+        _ns_blob_cache_owned = 0
+        i: uint64 = 0
+        while i < 255:
+            c: uint8 = cast[uint8](name[i] & 0xFF)
+            _ns_blob_cache_key[i] = c
+            if c == 0:
+                break
+            i = i + 1
+        _ns_blob_cache_key[255] = 0
+        return cpio_ptr
+    # 2. partition fallback (THE keystone): slurp the file off its
+    #    backing FS (ext4 via the `#by-id` named-root route) into a
+    #    kmalloc'd buffer.
+    buf: uint64 = _ns_blob_partition_load(target)
+    if buf == 0:
+        return 0
+    # store + mark heap-owned so the next store/clear frees it.
+    if _ns_blob_cache_ptr != 0 and _ns_blob_cache_owned != 0:
+        kfree(_ns_blob_cache_ptr)
+    _ns_blob_cache_ptr = buf
+    _ns_blob_cache_size = _ns_blob_load_last_size
+    _ns_blob_cache_owned = 1
+    i: uint64 = 0
+    while i < 255:
+        c: uint8 = cast[uint8](name[i] & 0xFF)
+        _ns_blob_cache_key[i] = c
+        if c == 0:
+            break
+        i = i + 1
+    _ns_blob_cache_key[255] = 0
+    return buf
+
+
 def ns_blob_ptr(name: Ptr[char]) -> uint64:
     # Namespace-aware counterpart of initramfs_data_ptr. Returns the
     # in-memory blob pointer for `name` resolved through the calling
-    # task's namespace, or 0 on miss.
-    resolved: Array[256, uint8]
-    rc: int32 = resolve_path(name, &resolved[0], 256)
-    if rc != 0:
-        # resolve_path failed (path too long) — fall back to the raw
-        # verbatim lookup so a pathological long path still has a
-        # chance rather than hard-failing the exec.
-        return initramfs_data_ptr(name)
-    return initramfs_data_ptr(cast[Ptr[char]](&resolved[0]))
+    # task's namespace (cpio entry OR a kmalloc'd copy of a partition
+    # file reached via a named-root bind), or 0 on miss.
+    return _ns_blob_load(name)
 
 
 def ns_blob_size(name: Ptr[char]) -> uint64:
-    # Namespace-aware counterpart of initramfs_data_size.
-    resolved: Array[256, uint8]
-    rc: int32 = resolve_path(name, &resolved[0], 256)
-    if rc != 0:
-        return initramfs_data_size(name)
-    return initramfs_data_size(cast[Ptr[char]](&resolved[0]))
+    # Namespace-aware counterpart of initramfs_data_size. Resolves the
+    # same way as ns_blob_ptr; returns the cached length when the
+    # immediately-preceding ns_blob_ptr loaded this same name.
+    if _ns_blob_key_matches(name) != 0:
+        return _ns_blob_cache_size
+    # No cache hit (e.g. called standalone) — re-resolve and load.
+    if _ns_blob_load(name) == 0:
+        return 0
+    return _ns_blob_cache_size
 
 
 def _strcmp_cstr(a: Ptr[char], b: Ptr[char]) -> int32:
@@ -1244,11 +1393,22 @@ def _open_hash_by_id(name: Ptr[char], partuuid_start: uint64) -> int32:
         return ENOENT
     if byid_lookup(&pu_buf[0]) == 0:
         return ENOENT
-    # The by-id table doesn't carry a sentinel-derived dir prefix
-    # (it's the WHOLE partition). The remainder starts at `i`.
-    empty: Array[2, uint8]
-    empty[0] = 0
-    return _open_named_subpath(&empty[0], name, i)
+    # Honor the by-id entry's stored sentinel relpath. With the multi-
+    # root partition layout (`sysroot sysroot`, `distro distro`) a
+    # frozen `bind '#sysroot' /` arrives here as
+    # `#by-id/<partuuid>/sysroot/<rest>` — _freeze_named_source
+    # (chan.ad) already baked the dir prefix into the path, so the
+    # remainder from `i` is `/sysroot/<rest>` and an empty dir_prefix
+    # composes the correct `/ext/sysroot/<rest>`. For a BARE
+    # `#by-id/<partuuid>/<rest>` reference (not frozen-with-dir) we
+    # fall back to the entry's stored dir so the partition's sentinel
+    # relpath is still respected instead of resolving against the
+    # partition root. (The whole-partition case stores "." / "" which
+    # _open_named_subpath treats as no prefix.)
+    dir_buf: Array[256, uint8]
+    dir_buf[0] = 0
+    byid_lookup_dir(&pu_buf[0], &dir_buf[0], 256)
+    return _open_named_subpath(&dir_buf[0], name, i)
 
 
 def _open_named_subpath(dir_prefix: Ptr[uint8], name: Ptr[char],
@@ -1791,6 +1951,99 @@ def _path_eq_const(name: Ptr[char], expected: Ptr[uint8],
     return 1
 
 
+def _listdir_named_subpath(dir_prefix: Ptr[uint8], name: Ptr[char],
+                           rest_start: uint64, buf: Ptr[uint8],
+                           count: uint64) -> int64:
+    # listdir analog of _open_named_subpath: compose a synthetic
+    # `/ext/<dir_prefix>/<rest>` path and route to ext4_listdir. After
+    # `bind '#sysroot' /`, `ls /bin` resolves (in resolve_path via
+    # chan_resolve_prefix) to `#by-id/<uuid>/sysroot/bin`; vfs_listdir's
+    # `#` arm dispatches here so the partition directory actually lists.
+    # Without this the `#by-id`/named-root arm fell through to -EINVAL —
+    # the asymmetry that made exec-through-bind work but `ls` hang/fail.
+    scratch: Array[512, uint8]
+    p: uint64 = 0
+    scratch[0] = 47                              # '/'
+    scratch[1] = 101                             # 'e'
+    scratch[2] = 120                             # 'x'
+    scratch[3] = 116                             # 't'
+    p = 4
+    if dir_prefix[0] != 0 and dir_prefix[0] != 46:
+        scratch[p] = 47                          # '/'
+        p = p + 1
+        k: uint64 = 0
+        while dir_prefix[k] != 0 and p + 1 < 512:
+            scratch[p] = dir_prefix[k]
+            p = p + 1
+            k = k + 1
+        if scratch[p - 1] == 47:
+            p = p - 1
+    if name[rest_start] == 47:
+        pass
+    elif name[rest_start] != 0:
+        scratch[p] = 47
+        p = p + 1
+    j: uint64 = rest_start
+    while name[j] != 0 and p + 1 < 512:
+        scratch[p] = cast[uint8](name[j])
+        p = p + 1
+        j = j + 1
+    scratch[p] = 0
+    # ext4_listdir wants the post-/ext/-strip tail. The composed path
+    # always begins "/ext"; strip exactly that prefix. For the bare
+    # "/ext" case (p == 4, partition root) the tail is the empty string,
+    # which ext4_listdir resolves to the partition root directory.
+    tail: Ptr[char] = cast[Ptr[char]](&scratch[0])
+    if scratch[4] == 47:                          # "/ext/<...>"
+        tail = cast[Ptr[char]](cast[uint64](&scratch[0]) + 5)
+    else:                                          # bare "/ext"
+        tail = cast[Ptr[char]](&_empty_str[0])
+    return ext4_listdir(tail, buf, count)
+
+
+def _listdir_hash_long(name: Ptr[char], buf: Ptr[uint8],
+                       count: uint64) -> int64:
+    # listdir analog of _open_hash_long: resolve a `#<word>[/<rest>]`
+    # or `#by-id/<partuuid>[/<rest>]` named-root path to the partition
+    # directory it aliases and list it. Mirrors the open-side dispatch
+    # so `ls` through a bind sees exactly what `cat`/exec see.
+    word_buf: Array[40, uint8]
+    pos: int32 = 0
+    word_end: uint64 = 0
+    if _hash_word_extract(name, &word_buf[0], 40, &pos, &word_end) < 0:
+        return cast[int64](EINVAL)
+    if _hash_is_by_id(&word_buf[0]) != 0:
+        if name[word_end] != 47:
+            return cast[int64](EINVAL)
+        # Parse the partuuid up to the next '/' (or NUL).
+        pu_buf: Array[40, uint8]
+        i: uint64 = word_end + 1
+        o: uint64 = 0
+        while name[i] != 0 and name[i] != 47 and o + 1 < 40:
+            pu_buf[o] = cast[uint8](name[i])
+            o = o + 1
+            i = i + 1
+        pu_buf[o] = 0
+        if o == 0:
+            return cast[int64](EINVAL)
+        if byid_lookup(&pu_buf[0]) == 0:
+            return cast[int64](EINVAL)
+        dir_buf: Array[256, uint8]
+        dir_buf[0] = 0
+        byid_lookup_dir(&pu_buf[0], &dir_buf[0], 256)
+        return _listdir_named_subpath(&dir_buf[0], name, i, buf, count)
+    sel: int32 = pos
+    if sel == 0:
+        sel = 1
+    if name_lookup_at(&word_buf[0], sel) == 0:
+        return cast[int64](EINVAL)
+    dir_buf2: Array[256, uint8]
+    if name_lookup_dir(&word_buf[0], sel, &dir_buf2[0], 256) < 0:
+        return cast[int64](EINVAL)
+    return _listdir_named_subpath(&dir_buf2[0], name, word_end,
+                                  buf, count)
+
+
 def vfs_listdir(name: Ptr[char], buf: Ptr[uint8],
                 count: uint64) -> int64:
     # Path-resolution wrapper. Routes the calling listdir to the
@@ -1843,6 +2096,14 @@ def vfs_listdir(name: Ptr[char], buf: Ptr[uint8],
             return devsrv_list(buf, count)
         if name[1] == 47 and name[2] == 0:             # '#/'
             return 0
+        # Long-form named-root aliases: `#by-id/<uuid>/sysroot/bin`
+        # (the frozen `bind '#sysroot' /` form) and bare `#<word>/...`
+        # both list the partition directory they alias. Mirrors
+        # vfs_open's _open_hash_long dispatch so `ls` follows a bind
+        # exactly as exec/cat do. Anything with more than two chars
+        # after '#' that isn't '#s'/'#/' is a long-form alias.
+        if name[1] != 0 and name[2] != 0:
+            return _listdir_hash_long(name, buf, count)
         return cast[int64](EINVAL)
     if _is_initramfs_dir(name) != 0:
         return _cpio_listdir(name, buf, count)

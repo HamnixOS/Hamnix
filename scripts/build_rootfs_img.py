@@ -235,8 +235,130 @@ def _stage_busybox(staging: Path) -> bool:
     return True
 
 
+# Names under build/user/ that must NOT be staged into sysroot/bin —
+# init.elf is the kernel's boot entrypoint (lands at /init in the cpio,
+# not /bin), never a PATH-resolved tool.
+SYSROOT_BIN_SKIP = {
+    "init.elf",
+}
+
+# etc/ files that are CPIO-bootstrap-only and must NOT be staged onto
+# the partition's sysroot/etc. rc.boot is the tiny cpio bootstrap; the
+# partition carries rc.boot.full (the real rc) instead, and the
+# bootstrap `source`s it after binding #sysroot at /.
+SYSROOT_ETC_SKIP = {
+    "rc.boot",
+}
+
+
+def _stage_adder_tools(sysroot: Path) -> tuple[int, int]:
+    """Stage every build/user/*.elf as sysroot/bin/<name>.
+
+    These are the ~110 native Adder userland tools (ls, cp, cat, ...).
+    On the ISO path the lean cpio omits them; the kernel binds
+    `#sysroot` at `/` so /bin/<name> resolves to this subtree on the
+    partition. Returns (files, bytes).
+    """
+    user_dir = HERE / "build" / "user"
+    if not user_dir.is_dir():
+        print(f"[build_rootfs_img] WARN: {user_dir.relative_to(HERE)} "
+              f"absent — sysroot/bin will be empty (run build_user.sh)",
+              flush=True)
+        return 0, 0
+    bindir = sysroot / "bin"
+    bindir.mkdir(parents=True, exist_ok=True)
+    n_files = 0
+    n_bytes = 0
+    for elf in sorted(user_dir.glob("*.elf")):
+        if elf.name in SYSROOT_BIN_SKIP:
+            continue
+        data = elf.read_bytes()
+        dst = bindir / elf.stem
+        dst.write_bytes(data)
+        dst.chmod(0o755)
+        n_files += 1
+        n_bytes += len(data)
+    return n_files, n_bytes
+
+
+def _stage_sysroot_etc(sysroot: Path) -> int:
+    """Mirror the source-tree etc/ into sysroot/etc on the partition.
+
+    Admins persist /etc edits across boots because /etc lives on the
+    sysroot partition (not the read-only cpio). The full boot rc is
+    staged as sysroot/etc/rc.boot.full; the cpio bootstrap rc `source`s
+    it once `#sysroot` is bound at /. Sub-directories (svc/, man/) are
+    walked one level deep, matching the cpio layout.
+    """
+    etc_src = HERE / "etc"
+    if not etc_src.is_dir():
+        return 0
+    etc_dst = sysroot / "etc"
+    etc_dst.mkdir(parents=True, exist_ok=True)
+    n = 0
+    for ef in sorted(etc_src.iterdir()):
+        if ef.is_file():
+            if ef.name in SYSROOT_ETC_SKIP:
+                continue
+            data = ef.read_bytes()
+            if ef.name == "rc.boot.full":
+                # PARTITION-EXEC KEYSTONE PROOF. The source-tree
+                # etc/rc.boot.full is ALSO embedded in the (lean) cpio,
+                # so its own banners cannot distinguish "sourced from the
+                # partition through bind '#sysroot' /" from "sourced from
+                # the cpio fallback". Append a sentinel echo HERE — only
+                # to the partition copy — whose text exists nowhere in
+                # the cpio. If this line lands on the console, the
+                # bootstrap rc's `source /etc/rc.boot.full` MUST have
+                # resolved through the named-root bind to ext4. A cpio
+                # fallback physically cannot emit it. scripts/
+                # test_iso_shell.sh asserts exactly this marker as the
+                # keystone. (Appended at the very top so it prints even
+                # if a later line in the rc later faults.)
+                sentinel = b"echo 'HAMNIX_PARTITION_RC_SOURCED_OK'\n"
+                data = sentinel + data
+            (etc_dst / ef.name).write_bytes(data)
+            n += 1
+        elif ef.is_dir():
+            if ef.name == "man":
+                # Manpages are consumed at /usr/share/man/<topic> (same
+                # convention the cpio uses); stage them there too.
+                man_dst = sysroot / "usr" / "share" / "man"
+                man_dst.mkdir(parents=True, exist_ok=True)
+                for sub in sorted(ef.iterdir()):
+                    if sub.is_file():
+                        (man_dst / sub.name).write_bytes(sub.read_bytes())
+                        n += 1
+                continue
+            sub_dst = etc_dst / ef.name
+            sub_dst.mkdir(parents=True, exist_ok=True)
+            for sub in sorted(ef.iterdir()):
+                if sub.is_file():
+                    (sub_dst / sub.name).write_bytes(sub.read_bytes())
+                    n += 1
+    return n
+
+
 def _stage_directory(staging: Path):
-    """Mirror the file-server contents into `staging`."""
+    """Mirror the multi-root file-server contents into `staging`.
+
+    The partition's TOP LEVEL is a set of named subtree roots (Plan 9
+    shape, docs/rootfs_partition.md), each declared in .hamnix-roots:
+
+        sysroot/   native Hamnix admin filesystem (bin/, etc/, usr/)
+        distro/    the real Debian tree (apt/dpkg/busybox closure)
+        .hamnix-roots
+
+    The kernel posts each subtree as a named file server (#sysroot,
+    #distro). The bootstrap rc binds #sysroot at /, and the linux ns
+    binds #distro at / inside its hermetic recipe.
+    """
+    sysroot = staging / "sysroot"
+    distro = staging / "distro"
+    sysroot.mkdir(parents=True, exist_ok=True)
+    distro.mkdir(parents=True, exist_ok=True)
+
+    # --- distro/ subtree: the real Debian closure + busybox ----------
     minbase = HERE / "tests" / "distros" / "debian-minbase" / "rootfs"
     real_debian_raw = os.environ.get("HAMNIX_DEFAULT_REAL_DEBIAN", "1")
     if real_debian_raw in ("0", "", "off", "no"):
@@ -244,31 +366,80 @@ def _stage_directory(staging: Path):
               f"skipping real Debian closure", flush=True)
     elif not minbase.is_dir():
         print(f"[build_rootfs_img] WARN: {minbase.relative_to(HERE)} "
-              f"absent — image will contain only busybox", flush=True)
-    else:
-        n, b = _stage_real_debian(staging, minbase)
-        print(f"[build_rootfs_img] staged {n} Debian apt/dpkg files "
-              f"({b/(1<<20):.1f} MiB) from {minbase.relative_to(HERE)}",
+              f"absent — distro/ subtree will contain only busybox",
               flush=True)
+    else:
+        n, b = _stage_real_debian(distro, minbase)
+        print(f"[build_rootfs_img] staged {n} Debian apt/dpkg files "
+              f"({b/(1<<20):.1f} MiB) into distro/ from "
+              f"{minbase.relative_to(HERE)}", flush=True)
+    _stage_busybox(distro)
 
-    _stage_busybox(staging)
+    # --- sysroot/ subtree: native Adder tools + /etc -----------------
+    tn, tb = _stage_adder_tools(sysroot)
+    print(f"[build_rootfs_img] staged {tn} Adder tools "
+          f"({tb/(1<<20):.1f} MiB) into sysroot/bin/", flush=True)
+    en = _stage_sysroot_etc(sysroot)
+    print(f"[build_rootfs_img] staged {en} sysroot/etc files "
+          f"(incl. rc.boot.full)", flush=True)
+
     _stage_hamnix_roots(staging)
 
 
 def _stage_hamnix_roots(staging: Path) -> None:
-    """Plant `.hamnix-roots` at the partition root.
+    """Plant `.hamnix-roots` at the partition root (multi-root layout).
 
-    The boot rootfs is the whole partition — one sentinel entry,
-    `distro .` (relpath `.` means "partition root"). The kernel's
-    init/main.ad::mount_rootfs_partition() parses this file and
-    registers `#distro` in the named file-server stack so userspace
-    `bind '#distro' /n/distros` and the linux ns `bind '#distro' /`
-    resolve to the partition.
+    Two named subtree roots, one `<name> <relpath>` line each:
+
+        sysroot   sysroot
+        distro    distro
+
+    The kernel's init/main.ad::mount_rootfs_partition() parses this and
+    calls name_push() for each, posting #sysroot and #distro in the
+    named file-server stack. The bootstrap rc then binds #sysroot at /
+    (so /bin/<tool> resolves to sysroot/bin/<tool> on the partition) and
+    the linux ns binds #distro at / inside its hermetic recipe.
+
+    Per-user homes (GROUNDWORK — not yet emitted here): when adduser
+    creates a top-level <username>/ folder it appends a
+    `<username>  <username>` line to this sentinel and the kernel
+    name_push()es a #<username> root, which that user's session binds as
+    their home. See init/main.ad::_register_user_root() and the
+    docstring in scripts/build_rootfs_img.py near _stage_user_home().
     """
     sentinel = staging / ".hamnix-roots"
-    sentinel.write_text("distro    .\n", encoding="ascii")
+    sentinel.write_text("sysroot   sysroot\ndistro    distro\n",
+                        encoding="ascii")
     print(f"[build_rootfs_img] planted .hamnix-roots sentinel "
-          f"(declares #distro -> partition root)", flush=True)
+          f"(declares #sysroot -> sysroot/, #distro -> distro/)",
+          flush=True)
+
+
+def _stage_user_home(staging: Path, username: str) -> None:
+    """GROUNDWORK: create a top-level per-user home subtree + sentinel
+    entry.
+
+    Each non-hostowner user's home is its own TOP-LEVEL partition folder
+    named by username, registered as its own named root (#<username>)
+    and bound as that user's home in their session — giving them the
+    partition's free space. The HOSTOWNER's home stays in sysroot/.
+
+    This helper lays the build-time groundwork: it creates the folder
+    and appends a `<username>  <username>` line to .hamnix-roots. The
+    matching RUNTIME path — a top-level folder becoming a #<username>
+    named root via name_push at adduser time — is stubbed in
+    init/main.ad::_register_user_root(). Full dynamic adduser is a
+    documented follow-up; nothing calls this yet (the load-bearing
+    deliverable is sysroot + distro).
+    """
+    home = staging / username
+    home.mkdir(parents=True, exist_ok=True)
+    sentinel = staging / ".hamnix-roots"
+    line = f"{username}   {username}\n"
+    with open(sentinel, "a", encoding="ascii") as f:
+        f.write(line)
+    print(f"[build_rootfs_img] staged per-user home subtree "
+          f"{username}/ (+ sentinel entry #{username})", flush=True)
 
 
 def _du_bytes(path: Path) -> int:
