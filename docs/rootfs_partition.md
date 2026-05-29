@@ -35,11 +35,17 @@ namespace — so:
 - `apt install foo` from inside `enter linux { ... }` lands in the
   `distro/` subtree, NOT in the shell's `sysroot/`-backed paths.
 
-> **Note (in flight, not yet landed).** A separate change to fully
-> sandbox/confine apt writes within the `#distro` root is still being
-> worked. This doc describes the root MODEL (named servers as
-> shared-space subtrees of one ext4); it does NOT claim apt writes are
-> sandboxed today.
+> **Isolation enforced (landed 2026-05-29, commit 7ac3e14).** The
+> native (`sysroot/`) and Debian (`distro/`) roots are genuinely
+> isolated at the namespace/file-server layer: `enter debian { ... }`
+> forks a child with an empty namespace and binds `#distro` at `/`, so
+> the Debian subsystem cannot see `sysroot`, and every distro-side
+> write composes through the frozen `distro` dir prefix so the bytes
+> can only land under `distro/`. The PID-1 boot shell no longer binds
+> the distro tree ambiently. Regression-gated by
+> `scripts/test_img_distro_isolation.sh` (boots `build/hamnix.img`
+> under OVMF and asserts the two roots stay separate across a
+> distro-side write).
 
 > **No cpio in the live root.** The shipped image carries a
 > trailer-only (empty) cpio (`HAMNIX_CPIO_EMPTY=1`); the live system
@@ -160,10 +166,11 @@ different namespaces, with clean isolation when you start with
 `ns clean { ... }`.
 
 > Both subtrees share the one ext4's free space — they are not
-> separate partitions. **Filesystem-level confinement of apt's writes
-> to within `#distro` is a separate in-flight change and is NOT yet
-> landed**; what's described here is the namespace shape, not a
-> sandboxing guarantee.
+> separate partitions. **Confinement of distro-side writes (apt/dpkg)
+> to within `#distro` is enforced** as of commit 7ac3e14: every write
+> composes through the frozen `distro` dir prefix, so it can only land
+> under `distro/` and never touches `sysroot/`. See
+> `scripts/test_img_distro_isolation.sh`.
 
 ## How to grow the rootfs
 
