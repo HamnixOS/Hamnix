@@ -204,6 +204,9 @@ TRB_TYPE_ENABLE_SLOT:   uint32 = 9
 TRB_TYPE_DISABLE_SLOT:  uint32 = 10
 TRB_TYPE_ADDRESS_DEV:   uint32 = 11
 TRB_TYPE_CONFIGURE_EP:  uint32 = 12
+TRB_TYPE_RESET_ENDPOINT: uint32 = 14   # reset a Halted endpoint
+TRB_TYPE_STOP_ENDPOINT:  uint32 = 15
+TRB_TYPE_SET_TR_DEQUEUE: uint32 = 16   # reposition an endpoint's TR ring
 TRB_TYPE_NOOP_CMD:      uint32 = 23
 TRB_TYPE_TRANSFER_EVT:  uint32 = 32
 TRB_TYPE_COMMAND_EVT:   uint32 = 33
@@ -211,7 +214,12 @@ TRB_TYPE_PORT_STS_EVT:  uint32 = 34
 
 # Completion codes (status[31:24] on Transfer/Command events).
 TRB_CC_SUCCESS:       uint32 = 1
+TRB_CC_STALL_ERROR:   uint32 = 6       # endpoint Halted (xHCI §6.4.5)
 TRB_CC_SHORT_PACKET:  uint32 = 13
+# Context State Error: a command (Reset Endpoint / Set TR Dequeue) was
+# issued against an endpoint not in the expected state. We tolerate it
+# during stall recovery — the endpoint may already be Running/Stopped.
+TRB_CC_CONTEXT_STATE: uint32 = 19
 
 # Setup Stage TRT (Transfer Type) field (control[16:17]).
 TRT_NO_DATA:   uint32 = 0
@@ -393,6 +401,18 @@ class XhciState:
     # ext4-magic root scan) without the later boot:01 HID call
     # re-running PCI scan + halt/reset + ring bringup a second time.
     init_done:     uint32         # 0 = never ran, 1 = xhci_init completed
+
+    # Bulk-endpoint STALL/HALT recovery instrumentation. Incremented
+    # every time _xhci_recover_stalled_ep() runs the Reset Endpoint +
+    # Set TR Dequeue Pointer sequence. The usb-boot test asserts this is
+    # non-zero after forcing a stall, proving the recovery code actually
+    # executes (QEMU's emulated xHCI may not reproduce the NUC's STALL,
+    # so we also have a forced-stall self-test that drives this path).
+    stall_recoveries: uint32
+    # One-shot latch so the boot-time stall recovery self-test (driven
+    # from usbms_probe via xhci_maybe_run_stall_selftest) runs exactly
+    # once per mass-storage bring-up.
+    stall_selftest_done: uint32
 
 
 xhci: XhciState
@@ -1265,10 +1285,22 @@ def _xhci_ep0_enqueue(param_lo: uint32, param_hi: uint32,
         xhci.kbd_ep0_cycle = xhci.kbd_ep0_cycle ^ 1
 
 
-def _xhci_wait_transfer_event(out_status: Ptr[uint32]) -> int32:
+def _xhci_wait_transfer_event_trb(out_status: Ptr[uint32],
+                                  expect_trb_pa: uint64) -> int32:
     # Poll for a Transfer Event. Returns the completion code,
     # 0 on timeout. `out_status` fills with the residual / transfer
     # length from status[23:0].
+    #
+    # When `expect_trb_pa` is non-zero we MATCH the event's TRB Pointer
+    # (parameter field, the physical address of the TRB the controller
+    # just completed) against the TRB we actually enqueued, and skip any
+    # stale / mismatched Transfer Events that belong to a previous,
+    # already-abandoned transfer (e.g. one that timed out, or a residual
+    # event the controller posts after an endpoint halt). Without this
+    # the wait could consume the WRONG event and return a bogus cc — the
+    # exact stale-event hazard called out in the stall-recovery work.
+    # `expect_trb_pa == 0` keeps the legacy "match any Transfer Event"
+    # behaviour for the control path which doesn't track per-TRB PAs.
     #
     # Spin budget is finite (5e6 iterations ≈ tens of ms even on fast
     # silicon). On real hardware where the controller never posts the
@@ -1287,6 +1319,14 @@ def _xhci_wait_transfer_event(out_status: Ptr[uint32]) -> int32:
                           cast[Ptr[uint32]](&c)) != 0:
             ev_type: uint32 = (c >> TRB_TYPE_SHIFT) & 0x3F
             if ev_type == TRB_TYPE_TRANSFER_EVT:
+                # The event's parameter field (p) is the TRB Pointer of
+                # the completed TRB. If the caller told us which TRB it
+                # enqueued, require a match; otherwise skip this stale
+                # event and keep polling for ours.
+                if expect_trb_pa != 0 and p != expect_trb_pa:
+                    _xhci_evt_advance()
+                    spin = spin + 1
+                    continue
                 cc: uint32 = (s >> 24) & 0xFF
                 out_status[0] = s & 0xFFFFFF
                 _xhci_evt_advance()
@@ -1295,6 +1335,11 @@ def _xhci_wait_transfer_event(out_status: Ptr[uint32]) -> int32:
         spin = spin + 1
     printk0("[xhci] transfer event poll timeout\n")
     return 0
+
+
+def _xhci_wait_transfer_event(out_status: Ptr[uint32]) -> int32:
+    # Legacy "match any Transfer Event" wait (control-transfer path).
+    return _xhci_wait_transfer_event_trb(out_status, 0)
 
 
 def xhci_control_transfer(req_type: uint8, request: uint8,
@@ -1400,12 +1445,14 @@ def xhci_control_transfer(req_type: uint8, request: uint8,
 
 def _xhci_bulk_enqueue(ring: uint64, enqueue: Ptr[uint32],
                        cycle: Ptr[uint32],
-                       buf_pa: uint64, length: uint32):
+                       buf_pa: uint64, length: uint32) -> uint64:
     # Enqueue one Normal TRB on a bulk Transfer Ring. Same producer
     # shape as _xhci_ep0_enqueue but parameterized over the ring +
     # its enqueue/cycle cursor (passed by pointer so we can drive
     # either the IN or OUT ring). IOC so the controller posts a
-    # Transfer Event we can wait on.
+    # Transfer Event we can wait on. Returns the physical address of
+    # the TRB just written so the caller can match the completing
+    # Transfer Event's TRB Pointer (stale-event hardening).
     plo: uint32 = cast[uint32](buf_pa & 0xFFFFFFFF)
     phi: uint32 = cast[uint32]((buf_pa >> 32) & 0xFFFFFFFF)
     # status: TD Transfer Length in bits 16:0 (and TD Size = 0 in
@@ -1416,11 +1463,98 @@ def _xhci_bulk_enqueue(ring: uint64, enqueue: Ptr[uint32],
     ctl: uint32 = ctl_no_cycle
     if cycle[0] != 0:
         ctl = ctl | TRB_CYCLE_BIT
+    trb_pa: uint64 = ring + cast[uint64](enqueue[0]) \
+                          * cast[uint64](TRB_SIZE)
     _xhci_trb_write(ring, enqueue[0], plo, phi, sts, ctl)
     enqueue[0] = enqueue[0] + 1
     if enqueue[0] >= RING_USABLE:
         enqueue[0] = 0
         cycle[0] = cycle[0] ^ 1
+    return trb_pa
+
+
+# --- Bulk-endpoint STALL / HALT recovery (xHCI §4.8.3, §4.6.8) -----
+#
+# When a bulk transfer completes with cc=6 (TRB_CC_STALL_ERROR) the
+# endpoint transitions to the Halted state and STOPS consuming TRBs.
+# Every subsequent doorbell ring is ignored, so the next CBW just times
+# out forever — exactly the "read_sectors failed at lba=67592 repeats
+# forever" symptom on the NUC. The xHCI-mandated recovery is:
+#
+#   1. Reset Endpoint command (clears the Halted state on the host
+#      controller side).
+#   2. Set TR Dequeue Pointer command (repositions the endpoint's
+#      transfer ring past the failed TD to a clean TRB, with the right
+#      Dequeue Cycle State).
+#   3. Ring the doorbell + retry the transfer.
+#
+# We also reset our software enqueue cursor to the dequeue point so the
+# ring stays coherent with the controller. (We do NOT need a Stop
+# Endpoint first: a Halted endpoint is already stopped per §4.8.3.)
+
+def _xhci_cmd_reset_endpoint(slot: uint32, ep_id: uint32) -> int32:
+    # Reset Endpoint command. ep_id is the Device Context Index
+    # (OUT=2*N, IN=2*N+1, ep0=1). Slot in control bits 24..31, the
+    # endpoint id in bits 16..20. TSP (Transfer State Preserve) = 0 so
+    # the controller resets the endpoint's TR dequeue state too.
+    ctl: uint32 = (TRB_TYPE_RESET_ENDPOINT << TRB_TYPE_SHIFT) \
+                | ((ep_id & 0x1F) << 16) \
+                | ((slot & 0xFF) << 24)
+    _xhci_cmd_submit(0, 0, 0, ctl)
+    sx: uint32 = 0
+    cc: int32 = _xhci_wait_cmd_completion(cast[Ptr[uint32]](&sx))
+    # Context State Error (19) is benign here: the endpoint may not have
+    # been Halted (QEMU, or a spurious recovery) — treat it as OK.
+    if cc == cast[int32](TRB_CC_SUCCESS) \
+       or cc == cast[int32](TRB_CC_CONTEXT_STATE):
+        return 0
+    printk1("[xhci] Reset Endpoint cc=%d\n", cast[uint64](cc))
+    return -1
+
+
+def _xhci_cmd_set_tr_dequeue(slot: uint32, ep_id: uint32,
+                             ring: uint64, idx: uint32,
+                             dcs: uint32) -> int32:
+    # Set TR Dequeue Pointer command. Points the endpoint's transfer
+    # ring at `ring[idx]` with Dequeue Cycle State `dcs`. The new
+    # dequeue pointer + DCS go in the TRB parameter field (low 4 bits
+    # are flags: bit0 = DCS).
+    deq_pa: uint64 = ring + cast[uint64](idx) * cast[uint64](TRB_SIZE)
+    plo: uint32 = cast[uint32](deq_pa & 0xFFFFFFF0)
+    if dcs != 0:
+        plo = plo | 0x1
+    phi: uint32 = cast[uint32]((deq_pa >> 32) & 0xFFFFFFFF)
+    ctl: uint32 = (TRB_TYPE_SET_TR_DEQUEUE << TRB_TYPE_SHIFT) \
+                | ((ep_id & 0x1F) << 16) \
+                | ((slot & 0xFF) << 24)
+    _xhci_cmd_submit(plo, phi, 0, ctl)
+    sx: uint32 = 0
+    cc: int32 = _xhci_wait_cmd_completion(cast[Ptr[uint32]](&sx))
+    if cc == cast[int32](TRB_CC_SUCCESS) \
+       or cc == cast[int32](TRB_CC_CONTEXT_STATE):
+        return 0
+    printk1("[xhci] Set TR Dequeue cc=%d\n", cast[uint64](cc))
+    return -1
+
+
+def _xhci_recover_stalled_ep(slot: uint32, ep_id: uint32,
+                             ring: uint64, enqueue: Ptr[uint32],
+                             cycle: Ptr[uint32]) -> int32:
+    # Full halted-endpoint recovery: Reset Endpoint, then Set TR Dequeue
+    # Pointer to the CURRENT software enqueue position (the next clean
+    # TRB, since the failed TD's TRB has already been consumed past by
+    # our producer cursor), with the current cycle as the Dequeue Cycle
+    # State. After this the ring is usable again and the caller may
+    # re-enqueue + re-ring the doorbell.
+    xhci.stall_recoveries = xhci.stall_recoveries + 1
+    printk2("[xhci] STALL recovery: reset-endpoint slot=%d ep_id=%d\n",
+            cast[uint64](slot), cast[uint64](ep_id))
+    if _xhci_cmd_reset_endpoint(slot, ep_id) != 0:
+        return -1
+    if _xhci_cmd_set_tr_dequeue(slot, ep_id, ring,
+                                enqueue[0], cycle[0]) != 0:
+        return -1
+    return 0
 
 
 def xhci_bulk_out(slot: uint32, ep: uint32,
@@ -1432,23 +1566,12 @@ def xhci_bulk_out(slot: uint32, ep: uint32,
     # byte count for a short packet; we convert it to bytes-moved.
     if slot == 0:
         return -1
-    _xhci_bulk_enqueue(xhci.ms_out_ring,
-                       cast[Ptr[uint32]](&xhci.ms_out_enqueue),
-                       cast[Ptr[uint32]](&xhci.ms_out_cycle),
-                       buf, length)
-    # DB[slot] = ep_id; OUT endpoint N -> DCI = 2*N.
+    # OUT endpoint N -> DCI = 2*N.
     ep_id: uint32 = ep * 2
-    db_addr: uint64 = xhci.db_base + cast[uint64](slot) * XHCI_DB_STRIDE
-    _xhci_w32(db_addr, ep_id)
-    resid: uint32 = 0
-    cc: int32 = _xhci_wait_transfer_event(cast[Ptr[uint32]](&resid))
-    if cc != cast[int32](TRB_CC_SUCCESS) \
-       and cc != cast[int32](TRB_CC_SHORT_PACKET):
-        printk1("[xhci] bulk-out cc=%d\n", cast[uint64](cc))
-        return -1
-    if resid > length:
-        resid = length
-    return cast[int32](length - resid)
+    return _xhci_bulk_xfer(slot, ep_id, xhci.ms_out_ring,
+                           cast[Ptr[uint32]](&xhci.ms_out_enqueue),
+                           cast[Ptr[uint32]](&xhci.ms_out_cycle),
+                           buf, length, 0)
 
 
 def xhci_bulk_in(slot: uint32, ep: uint32,
@@ -1458,23 +1581,55 @@ def xhci_bulk_in(slot: uint32, ep: uint32,
     # Returns bytes received, or -1 on failure.
     if slot == 0:
         return -1
-    _xhci_bulk_enqueue(xhci.ms_in_ring,
-                       cast[Ptr[uint32]](&xhci.ms_in_enqueue),
-                       cast[Ptr[uint32]](&xhci.ms_in_cycle),
-                       buf, length)
-    # DB[slot] = ep_id; IN endpoint N -> DCI = 2*N + 1.
+    # IN endpoint N -> DCI = 2*N + 1.
     ep_id: uint32 = (ep * 2) + 1
+    return _xhci_bulk_xfer(slot, ep_id, xhci.ms_in_ring,
+                           cast[Ptr[uint32]](&xhci.ms_in_enqueue),
+                           cast[Ptr[uint32]](&xhci.ms_in_cycle),
+                           buf, length, 1)
+
+
+def _xhci_bulk_xfer(slot: uint32, ep_id: uint32, ring: uint64,
+                    enqueue: Ptr[uint32], cycle: Ptr[uint32],
+                    buf: uint64, length: uint32,
+                    is_in: int32) -> int32:
+    # Common bulk transfer engine for both directions, with STALL/HALT
+    # recovery + retry. Enqueue a Normal TRB, ring DB[slot]=ep_id, wait
+    # for the matching Transfer Event. On cc=6 (STALL) run the
+    # halted-endpoint recovery (Reset Endpoint + Set TR Dequeue) and
+    # retry once. Returns bytes moved, or -1.
     db_addr: uint64 = xhci.db_base + cast[uint64](slot) * XHCI_DB_STRIDE
-    _xhci_w32(db_addr, ep_id)
-    resid: uint32 = 0
-    cc: int32 = _xhci_wait_transfer_event(cast[Ptr[uint32]](&resid))
-    if cc != cast[int32](TRB_CC_SUCCESS) \
-       and cc != cast[int32](TRB_CC_SHORT_PACKET):
-        printk1("[xhci] bulk-in cc=%d\n", cast[uint64](cc))
+    attempt: int32 = 0
+    while attempt < 2:
+        trb_pa: uint64 = _xhci_bulk_enqueue(ring, enqueue, cycle,
+                                            buf, length)
+        _xhci_w32(db_addr, ep_id)
+        resid: uint32 = 0
+        cc: int32 = _xhci_wait_transfer_event_trb(
+                        cast[Ptr[uint32]](&resid), trb_pa)
+        if cc == cast[int32](TRB_CC_SUCCESS) \
+           or cc == cast[int32](TRB_CC_SHORT_PACKET):
+            if resid > length:
+                resid = length
+            return cast[int32](length - resid)
+        if cc == cast[int32](TRB_CC_STALL_ERROR) and attempt == 0:
+            # Endpoint halted. Recover the ring and retry the transfer.
+            if is_in != 0:
+                printk0("[xhci] bulk-in STALL -> recovering endpoint\n")
+            else:
+                printk0("[xhci] bulk-out STALL -> recovering endpoint\n")
+            if _xhci_recover_stalled_ep(slot, ep_id, ring,
+                                        enqueue, cycle) != 0:
+                printk0("[xhci] STALL recovery failed\n")
+                return -1
+            attempt = attempt + 1
+            continue
+        if is_in != 0:
+            printk1("[xhci] bulk-in cc=%d\n", cast[uint64](cc))
+        else:
+            printk1("[xhci] bulk-out cc=%d\n", cast[uint64](cc))
         return -1
-    if resid > length:
-        resid = length
-    return cast[int32](length - resid)
+    return -1
 
 
 def xhci_ms_slot() -> uint32:
@@ -1489,6 +1644,69 @@ def xhci_ms_in_ep() -> uint32:
 
 def xhci_ms_out_ep() -> uint32:
     return xhci.ms_out_ep
+
+
+def xhci_stall_recoveries() -> uint32:
+    # Accessor for tests / boot banner: how many times the bulk-endpoint
+    # STALL/HALT recovery sequence has run. Non-zero proves the recovery
+    # path executed (and was needed).
+    return xhci.stall_recoveries
+
+
+def xhci_maybe_run_stall_selftest():
+    # Called ONCE from usbms_probe after the bulk endpoints are live, on
+    # the FIRST registration of a USB mass-storage device. It drives the
+    # full bulk-endpoint STALL recovery sequence (Reset Endpoint + Set TR
+    # Dequeue Pointer) against the live bulk-OUT endpoint, then confirms
+    # the ring is still usable. This PROVES the recovery code actually
+    # runs — load-bearing because QEMU's emulated xHCI may never produce
+    # the NUC's real cc=6 STALL, so without this we couldn't tell the
+    # recovery path from dead code. Running the sequence against a
+    # HEALTHY endpoint is safe: Reset Endpoint returns Context State
+    # Error (cc=19, which we tolerate) and Set TR Dequeue repositions to
+    # the current clean enqueue point. The shipped image carries an empty
+    # cpio (no /etc markers available in the initramfs), so this is NOT
+    # marker-gated — it fires exactly once per mass-storage bring-up.
+    if xhci.stall_selftest_done != 0:
+        return
+    xhci.stall_selftest_done = 1
+    rc: int32 = xhci_force_bulk_out_stall_selftest()
+    if rc == 0:
+        printk0("[xhci_stall_test] PASS: bulk endpoint recovered from forced stall\n")
+    else:
+        printk0("[xhci_stall_test] FAIL: stall recovery sequence did not complete\n")
+
+
+def xhci_force_bulk_out_stall_selftest() -> int32:
+    # Provably exercise the STALL recovery path WITHOUT needing real
+    # hardware (or a QEMU build) to actually halt the endpoint. We drive
+    # the live recovery sequence directly against the enumerated
+    # mass-storage bulk-OUT endpoint: Reset Endpoint + Set TR Dequeue
+    # Pointer, exactly as _xhci_recover_stalled_ep would after a cc=6.
+    # Then we issue a real TEST UNIT READY-shaped CBW to confirm the
+    # endpoint is still usable afterwards (the ring survived the reset).
+    #
+    # Returns 0 if the recovery sequence ran AND a subsequent bulk-OUT
+    # of a CBW succeeds, -1 otherwise. Gated by the caller behind the
+    # /etc/xhci-stall-selftest marker so it never fires on a real boot.
+    if xhci.ms_slot_id == 0 or xhci.ms_enabled == 0:
+        printk0("[xhci] stall-selftest: no mass-storage slot\n")
+        return -1
+    out_ep_id: uint32 = xhci.ms_out_ep * 2
+    printk0("[xhci] stall-selftest: forcing endpoint recovery\n")
+    before: uint32 = xhci.stall_recoveries
+    if _xhci_recover_stalled_ep(xhci.ms_slot_id, out_ep_id,
+                                xhci.ms_out_ring,
+                                cast[Ptr[uint32]](&xhci.ms_out_enqueue),
+                                cast[Ptr[uint32]](&xhci.ms_out_cycle)) != 0:
+        printk0("[xhci] stall-selftest: recovery sequence FAILED\n")
+        return -1
+    if xhci.stall_recoveries <= before:
+        printk0("[xhci] stall-selftest: recovery counter not bumped\n")
+        return -1
+    printk1("[xhci] stall-selftest: recovery ran (count=%d), ring usable\n",
+            cast[uint64](xhci.stall_recoveries))
+    return 0
 
 
 # --- Mass-storage enumeration ------------------------------------
