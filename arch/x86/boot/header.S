@@ -134,7 +134,7 @@ _start:
 
     /* ----- Build 4-level page tables -------------------------------- *
      * Layout:
-     *   PML4[0]   -> pdpt_low   : 4 GiB low identity (PS=1, 4× 1 GiB)
+     *   PML4[0]   -> pdpt_low   : 512 GiB low identity (PS=1, 512× 1 GiB)
      *   PML4[511] -> pdpt_high  : the higher half. Within pdpt_high,
      *                entry 510 maps 0xffffffff80000000 and entry 511
      *                maps 0xffffffffc0000000, both to physical 0 / 1
@@ -164,18 +164,30 @@ _start:
     movl    %eax, (%edi)
     movl    $0, 4(%edi)
 
-    /* pdpt_low: 4 entries, each a 1 GiB identity page (PS=1).
-     *   bit 0 P, bit 1 RW, bit 2 US, bit 7 PS (1 GiB terminal). */
+    /* pdpt_low: ALL 512 entries, each a 1 GiB identity page (PS=1),
+     * covering the low 512 GiB (512 × 1 GiB) so RAM above 4 GiB is
+     * reachable without any extra page-table pages.
+     *   bit 0 P, bit 1 RW, bit 2 US, bit 7 PS (1 GiB terminal).
+     *
+     * This runs in 32-bit protected mode (paging off) so only 32-bit
+     * GPRs are available. The 1 GiB physical base of entry i is
+     * i * 0x40000000, which crosses 2^32 at entry 4 — so the base must
+     * be maintained as TWO 32-bit halves: %eax = low dword (carries the
+     * 0x87 flag bits), %edx = high dword. Each step adds 0x40000000 to
+     * the low half; when that wraps past 2^32 the carry is propagated
+     * into the high half so entries >= 4 get the correct high bits. */
     movl    $pdpt_low, %edi
     movl    $0, %ecx
-    movl    $0x87, %eax             /* PS | US | RW | P; phys base = 0 */
+    movl    $0x87, %eax             /* low dword: PS|US|RW|P; phys[31:0]=0 */
+    movl    $0, %edx               /* high dword: phys[63:32]=0 */
 1:
-    movl    %eax, (%edi)
-    movl    $0, 4(%edi)
-    addl    $0x40000000, %eax       /* next 1 GiB */
+    movl    %eax, (%edi)            /* low dword (flags + phys[31:30]) */
+    movl    %edx, 4(%edi)           /* high dword (phys[63:32]) */
+    addl    $0x40000000, %eax       /* next 1 GiB in the low half */
+    adcl    $0, %edx                /* propagate the carry into the high half */
     addl    $8, %edi
     incl    %ecx
-    cmpl    $4, %ecx
+    cmpl    $512, %ecx
     jne     1b
 
     /* pdpt_high[510] -> 1 GiB page @ phys 0   (0xffffffff80000000)
@@ -330,7 +342,7 @@ boot_via_efi: .long 0
  * the active CR3-rooted tree. Each table is 4 KiB aligned.
  *
  *   pml4       PML4[0] -> pdpt_low, PML4[511] -> pdpt_high
- *   pdpt_low   4 GiB low identity (4× 1 GiB pages)
+ *   pdpt_low   512 GiB low identity (512× 1 GiB pages)
  *   pdpt_high  the higher half (entries 510, 511 -> phys 0 / 1 GiB)
  */
     .section .pgtables, "aw", @nobits
