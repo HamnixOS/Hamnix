@@ -75,6 +75,7 @@ from drivers.usb.usb import (
     USB_SPEED_HIGH, USB_SPEED_SUPER,
     USB_RT_GET_DESCRIPTOR, USB_REQ_GET_DESCRIPTOR,
     USB_RT_SET_CONFIGURATION, USB_REQ_SET_CONFIGURATION,
+    USB_REQ_CLEAR_FEATURE,
     USB_RT_SET_PROTOCOL, HID_REQ_SET_PROTOCOL, HID_PROTOCOL_BOOT,
     USB_RT_SET_IDLE, HID_REQ_SET_IDLE,
     USB_DT_DEVICE, USB_DT_CONFIG,
@@ -921,6 +922,36 @@ def _xhci_ring_init(ring: uint64, cycle: uint32):
     _xhci_trb_write(ring, link_idx, addr_lo, addr_hi, 0, ctl)
 
 
+def _xhci_ring_set_link_cycle(ring: uint64, cycle: uint32):
+    # Rewrite ONLY the cycle bit of the Link TRB that sits at the tail of
+    # `ring` (index RING_USABLE), preserving its type + Toggle-Cycle bit.
+    #
+    # WHY THIS IS LOAD-BEARING: a Link TRB is consumed by the controller
+    # like any other TRB — it only takes effect (and toggles the
+    # controller's Consumer Cycle State) when its cycle bit MATCHES the
+    # controller's current CCS. The Link TRB is laid down once at init
+    # with the producer's initial cycle. The FIRST time the producer ring
+    # wraps, that matches and the controller follows the Link, toggling
+    # its CCS. But on EVERY subsequent wrap the producer's cycle has
+    # flipped again, while the Link TRB still carries its stale initial
+    # value — so the controller's CCS no longer matches, it parks on the
+    # Link TRB, and the next transfer TRB (sitting past the Link at index
+    # 0 with the new cycle) is NEVER fetched. The transfer's completion
+    # event never posts and the wait times out (cc=0), wedging the
+    # endpoint for good. This is the exact root cause of "root-on-USB
+    # works for ~127 transfers then every block read fails forever": the
+    # bulk rings cross their Link the SECOND time partway through reading
+    # the first larger binary. Refreshing the Link cycle on each wrap so
+    # it always equals the producer cycle of the TRBs preceding it keeps
+    # the controller flowing across the wrap.
+    p: Ptr[uint32] = cast[Ptr[uint32]](ring \
+        + cast[uint64](RING_USABLE) * cast[uint64](TRB_SIZE))
+    ctl: uint32 = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC_BIT
+    if cycle != 0:
+        ctl = ctl | TRB_CYCLE_BIT
+    p[3] = ctl
+
+
 def _xhci_cmd_submit(param_lo: uint32, param_hi: uint32,
                      status: uint32, ctl_no_cycle: uint32):
     # Enqueue a command TRB at cmd_enqueue with the current cmd_cycle,
@@ -934,7 +965,10 @@ def _xhci_cmd_submit(param_lo: uint32, param_hi: uint32,
                     param_lo, param_hi, status, ctl)
     xhci.cmd_enqueue = xhci.cmd_enqueue + 1
     if xhci.cmd_enqueue >= RING_USABLE:
-        # Crossed the Link. Toggle our cycle and reset to slot 0.
+        # Crossed the Link. Refresh the Link TRB's cycle to the pre-toggle
+        # cycle (so the controller follows it across every wrap, not just
+        # the first), THEN toggle our cycle and reset to slot 0.
+        _xhci_ring_set_link_cycle(xhci.cmd_ring, xhci.cmd_cycle)
         xhci.cmd_enqueue = 0
         xhci.cmd_cycle = xhci.cmd_cycle ^ 1
     # Ring DB[0] with value 0.
@@ -1281,6 +1315,9 @@ def _xhci_ep0_enqueue(param_lo: uint32, param_hi: uint32,
                     param_lo, param_hi, status, ctl)
     xhci.kbd_ep0_enqueue = xhci.kbd_ep0_enqueue + 1
     if xhci.kbd_ep0_enqueue >= RING_USABLE:
+        # Refresh the Link TRB cycle on wrap (pre-toggle cycle) so the
+        # controller follows the Link across every wrap, then toggle.
+        _xhci_ring_set_link_cycle(xhci.kbd_ep0_ring, xhci.kbd_ep0_cycle)
         xhci.kbd_ep0_enqueue = 0
         xhci.kbd_ep0_cycle = xhci.kbd_ep0_cycle ^ 1
 
@@ -1468,6 +1505,13 @@ def _xhci_bulk_enqueue(ring: uint64, enqueue: Ptr[uint32],
     _xhci_trb_write(ring, enqueue[0], plo, phi, sts, ctl)
     enqueue[0] = enqueue[0] + 1
     if enqueue[0] >= RING_USABLE:
+        # Crossed the Link TRB. Refresh its cycle bit to the cycle of the
+        # TRBs we just wrote (the CURRENT, pre-toggle cycle) so the
+        # controller's CCS matches and it follows the Link across the
+        # wrap. THEN toggle our producer cycle and reset to slot 0. (See
+        # _xhci_ring_set_link_cycle for why skipping this wedges the ring
+        # on its second wrap.)
+        _xhci_ring_set_link_cycle(ring, cycle[0])
         enqueue[0] = 0
         cycle[0] = cycle[0] ^ 1
     return trb_pa
@@ -1537,18 +1581,57 @@ def _xhci_cmd_set_tr_dequeue(slot: uint32, ep_id: uint32,
     return -1
 
 
+def _xhci_clear_endpoint_halt(ep_id: uint32) -> int32:
+    # Issue a standard Clear-Feature(ENDPOINT_HALT) control request to
+    # the DEVICE for the endpoint identified by xHCI Device Context Index
+    # `ep_id`. This is the USB-spec / Bulk-Only-Transport-mandated DEVICE
+    # side of stall recovery: a STALL handshake halts the endpoint on
+    # BOTH the host controller AND inside the device. _xhci_cmd_reset_
+    # endpoint + Set TR Dequeue only clear the host-controller half; the
+    # device's endpoint stays halted and NAKs/never-completes every
+    # subsequent transfer (observed as cc=0 timeouts on the next CBW
+    # bulk-OUT, wedging the BOT state machine forever). Sending
+    # Clear-Feature(HALT) here resets the device's data toggle and
+    # un-halts its endpoint so the next CBW is accepted.
+    #
+    # DCI -> device endpoint address: DCI = 2*N (OUT) or 2*N+1 (IN); the
+    # device endpoint address is (0x80 if IN else 0x00) | N. ep0 (DCI 1)
+    # has no HALT feature, so callers never pass it here.
+    ep_num: uint32 = ep_id / 2
+    ep_addr: uint32 = ep_num
+    if (ep_id & 1) != 0:                          # odd DCI -> IN endpoint
+        ep_addr = ep_addr | 0x80
+    # bmRequestType 0x02 = host-to-device | standard | recipient=endpoint.
+    # wValue 0 = FEATURE_ENDPOINT_HALT; wIndex = endpoint address.
+    return xhci_control_transfer(0x02, USB_REQ_CLEAR_FEATURE,
+                                 0, cast[uint16](ep_addr), 0, 0)
+
+
 def _xhci_recover_stalled_ep(slot: uint32, ep_id: uint32,
                              ring: uint64, enqueue: Ptr[uint32],
                              cycle: Ptr[uint32]) -> int32:
-    # Full halted-endpoint recovery: Reset Endpoint, then Set TR Dequeue
-    # Pointer to the CURRENT software enqueue position (the next clean
-    # TRB, since the failed TD's TRB has already been consumed past by
-    # our producer cursor), with the current cycle as the Dequeue Cycle
-    # State. After this the ring is usable again and the caller may
-    # re-enqueue + re-ring the doorbell.
+    # Full halted-endpoint recovery, in the order the USB / BOT specs
+    # require:
+    #   1. Clear-Feature(ENDPOINT_HALT) to the DEVICE (un-halts the
+    #      device-side endpoint + resets its data toggle).
+    #   2. Reset Endpoint command (clears the host controller's Halted
+    #      state for this endpoint).
+    #   3. Set TR Dequeue Pointer to the CURRENT software enqueue
+    #      position (the next clean TRB, since the failed TD's TRB has
+    #      already been consumed past by our producer cursor), with the
+    #      current cycle as the Dequeue Cycle State.
+    # After this the ring is usable again and the caller may re-enqueue +
+    # re-ring the doorbell. Skipping step 1 (the original bug) left the
+    # device endpoint halted, so the very next CBW timed out and every
+    # block read afterward failed — wedging root-on-USB after the first
+    # transfer that ever stalled.
     xhci.stall_recoveries = xhci.stall_recoveries + 1
-    printk2("[xhci] STALL recovery: reset-endpoint slot=%d ep_id=%d\n",
-            cast[uint64](slot), cast[uint64](ep_id))
+    # Device-side un-halt first. Best-effort: a controller that already
+    # auto-cleared the device toggle (or QEMU, which may not model the
+    # halt) can answer with a benign error; the host-side reset below is
+    # what makes the ring usable regardless, so we don't abort on a
+    # non-zero return here.
+    _xhci_clear_endpoint_halt(ep_id)
     if _xhci_cmd_reset_endpoint(slot, ep_id) != 0:
         return -1
     if _xhci_cmd_set_tr_dequeue(slot, ep_id, ring,
@@ -1943,6 +2026,9 @@ def _xhci_int_arm_one():
                     plo, phi, sts, ctl)
     xhci.kbd_int_enqueue = xhci.kbd_int_enqueue + 1
     if xhci.kbd_int_enqueue >= RING_USABLE:
+        # Refresh the Link TRB cycle on wrap (pre-toggle) so the
+        # controller follows the Link across every wrap, then toggle.
+        _xhci_ring_set_link_cycle(xhci.kbd_int_ring, xhci.kbd_int_cycle)
         xhci.kbd_int_enqueue = 0
         xhci.kbd_int_cycle = xhci.kbd_int_cycle ^ 1
     # Ring DB[slot] with endpoint ID 3 (ep1 IN).

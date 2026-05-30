@@ -266,15 +266,19 @@ fi
 #     this change set delivers, and it MUST hold.
 #
 #   * REPL/SPAWN stage (assertions 5a..5c): typing external commands at
-#     the live shell. This is currently BLOCKED by a fork/COW bug that is
-#     NOT in the USB path: repeated rfork() of the shell under the
-#     USB-boot config produces children that fault before running their
-#     first instruction (exit 127), so external binaries appear as
-#     "command not found". The SAME image over virtio-blk
-#     (scripts/test_img_uefi_boot.sh) resolves every command 6/6 and
-#     round-trips echo — proving the image + ext4 toolset are correct and
-#     the defect is medium-independent fork machinery, not block I/O.
-#     See the "USB rfork blocker" section in the commit message.
+#     the live shell. Both historical USB-only failures here are now FIXED:
+#       - "command not found" for EVERY command was an xHCI Link-TRB
+#         cycle-bit bug (the Link TRB's cycle was set once at ring init and
+#         never refreshed on producer wrap, so the controller parked on the
+#         Link the SECOND time a bulk ring wrapped — wedging every block
+#         read past ~127 transfers, which only USB hit because its rings are
+#         busier). Fixed in drivers/usb/xhci.ad (_xhci_ring_set_link_cycle).
+#       - a stray leading byte on the FIRST command ("aecho ...") was
+#         pre-prompt serial input (firmware/line noise) still draining into
+#         the kernel RX FIFO as the REPL opened. Fixed by a getty-style
+#         session-start input flush (drivers/tty/serial/early_8250.ad
+#         uart_rx_flush_stale + a short bounded drain in hamsh ed_readline).
+#     This block is now dead unless a regression reopens one of those.
 if grep -a -q "$KERNEL_BANNER" "$LOG" \
    && grep -a -q -F "$SD0_MARKER" "$LOG" \
    && grep -a -q -F "$EXT4_SCAN_MARKER" "$LOG" \
