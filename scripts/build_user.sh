@@ -130,6 +130,7 @@ build_adder_user hamUId               # hamUI Phase 4b: userland renderer (rende
 build_adder_user top                  # M16.87: one-shot /proc dashboard
 build_adder_user ifconfig             # M16.87: stub lo 127.0.0.1/8
 build_adder_user ping                 # native Adder ping: Plan-9-shaped /net/icmp client
+build_adder_user host                 # native Adder DNS resolver: forward (A) + reverse (PTR) via SYS_RESOLVE/SYS_RESOLVE_PTR
 build_adder_user curl                 # native Adder HTTP/HTTPS fetch (body to stdout/-o FILE) over user/http9.ad
 build_adder_user wget                 # native Adder HTTP/HTTPS fetch saved to a file over user/http9.ad
 build_adder_user ntpd                 # native Adder NTP client: anchors rtc_boot_epoch via /net/udp

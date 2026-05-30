@@ -448,6 +448,24 @@ sys_resolve:
     .size sys_resolve, .-sys_resolve
 
 
+    /* --- sys_resolve_ptr(ip, buf, cap) -> int64 ---------------------
+     * U-resolve-reverse: native-ABI IPv4 -> hostname. Hands the target
+     * IPv4 packed big-endian in the low 32 bits of %rdi (octet 0 in
+     * bits 31:24, the same packing sys_resolve returns), an out buffer
+     * (%rsi) and its capacity (%rdx) to the in-kernel reverse resolver
+     * via SYS_RESOLVE_PTR (301) -> dns_lookup_ptr. On success %rax is 0
+     * and the NUL-terminated PTR name is written into the buffer; on
+     * failure %rax is a negative errno (-2 == cannot resolve). Three
+     * args fit the SysV/syscall-ABI overlap directly — no shuffle. */
+    .globl sys_resolve_ptr
+    .type sys_resolve_ptr, @function
+sys_resolve_ptr:
+    movq    $301, %rax              /* SYS_RESOLVE_PTR */
+    syscall
+    ret
+    .size sys_resolve_ptr, .-sys_resolve_ptr
+
+
     /* --- RETIRED: sys_tls_connect -----------------------------------
      * ARCH §10: SYS_TLS_CONNECT is RETIRED with the rest of the BSD
      * socket syscalls — see the retirement note above sys_resolve.
