@@ -44,7 +44,7 @@ from .ast_nodes import (
     CallExpr, Identifier, StringLiteral, IntLiteral, CharLiteral, BoolLiteral,
     BinaryExpr, UnaryExpr, BinOp, UnaryOp,
     IndexExpr, MemberExpr, CastExpr, ContainerOfExpr,
-    ConditionalExpr,
+    ConditionalExpr, SizeOfExpr,
     Type, PointerType, ArrayType, FunctionPointerType, PercpuType,
     ListType, DictType, TupleType, OptionalType,
 )
@@ -2238,6 +2238,18 @@ class X86CodeGen:
                 if off:
                     self.emit(f"    subq ${off}, %rax")
 
+            case SizeOfExpr(target_type=t, span=span):
+                # Compile-time constant: fold sizeof(T) to an immediate.
+                # No runtime call, no heap involvement — pure constant fold.
+                try:
+                    sz = self.get_type_size(t)
+                except Exception as e:
+                    raise CodeGenError(
+                        f"x86: sizeof({t!r}): cannot determine size at "
+                        f"{_span_location(span)}: {e}"
+                    ) from e
+                self.emit(f"    movq ${sz}, %rax")
+
             case _:
                 from .ast_nodes import MethodCallExpr as _MethodCallExpr
                 if isinstance(expr, _MethodCallExpr):
@@ -2363,8 +2375,164 @@ class X86CodeGen:
                     f"compound assignment"
                 )
 
+    # Set of relational comparison operators that can form a Python-style
+    # chained comparison: `a < b < c` means `(a < b) and (b < c)`.
+    _RELATIONAL_OPS = frozenset({
+        BinOp.LT, BinOp.LTE, BinOp.GT, BinOp.GTE, BinOp.EQ, BinOp.NEQ,
+    })
+
+    def _unwrap_comparison_chain(
+        self, op: BinOp, left: Expr, right: Expr
+    ) -> Optional[list]:
+        """If (op, left, right) is a chained comparison, return the flat list
+        [(expr0, op0, expr1), (expr1, op1, expr2), ...] sharing middle operands.
+        Returns None when there is no chain (just a simple two-operand compare).
+
+        The parser builds `a OP1 b OP2 c` as BinaryExpr(OP2, BinaryExpr(OP1,a,b), c).
+        A chain is detected when OP2 (outer op) is relational AND the left
+        operand is itself a BinaryExpr with a relational op.
+        """
+        if op not in self._RELATIONAL_OPS:
+            return None
+        if not isinstance(left, BinaryExpr):
+            return None
+        if left.op not in self._RELATIONAL_OPS:
+            return None
+        # Recursively unwrap the left side.
+        inner = self._unwrap_comparison_chain(left.op, left.left, left.right)
+        if inner is None:
+            # Simple two-operand compare on the left: (a OP1 b) OP2 c
+            return [(left.left, left.op, left.right),
+                    (left.right, op, right)]
+        else:
+            # Deeper chain: inner already contains [..., (?, OPn, last)].
+            # Append the new link (last, op, right).
+            last_expr = inner[-1][2]
+            return inner + [(last_expr, op, right)]
+
+    def gen_chained_compare(
+        self, chain: list
+    ) -> None:
+        """Lower a Python-style chained comparison chain to correct x86_64 asm.
+
+        `chain` is the list produced by _unwrap_comparison_chain:
+            [(expr0, op0, expr1), (expr1, op1, expr2), ...]
+
+        Correct semantics: (expr0 op0 expr1) and (expr1 op1 expr2) and ...
+        Each middle operand is evaluated ONCE and saved on the stack for
+        the two comparisons that reference it.
+
+        Short-circuit: if any comparison is false (0), jump immediately to
+        the false label (skip remaining comparisons).
+
+        Layout emitted:
+            # evaluate expr0
+            pushq %rax            ; save expr0
+            # evaluate expr1
+            movq %rax, %rcx      ; rcx = expr1
+            popq %rax            ; rax = expr0
+            cmpq / setcc         ; rax = (expr0 op0 expr1) → 0 or 1
+            testq %rax, %rax
+            jz .Lchain_false_N
+            pushq %rcx           ; save expr1 (middle value) for next pair
+            # ... repeat for each subsequent pair ...
+            popq %rcx            ; restore middle value
+            # evaluate expr2 → rax; rcx already holds expr1
+            [swap so rax=left, rcx=right for cmpq]
+            cmpq / setcc → rax
+            testq %rax, %rax
+            jz .Lchain_false_N
+            movq $1, %rax
+            jmp .Lchain_end_N
+        .Lchain_false_N:
+            xorq %rax, %rax
+        .Lchain_end_N:
+        """
+        false_label = self.ctx.new_label("chain_false")
+        end_label   = self.ctx.new_label("chain_end")
+
+        # Evaluate first pair: (expr0 op0 expr1)
+        expr0, op0, expr1 = chain[0]
+        # Standard gen_binary setup: eval right (expr1) first, push; eval left
+        self.gen_expr(expr1)
+        self.emit("    pushq %rax")          # stack: [expr1_val]
+        self.gen_expr(expr0)
+        self.emit("    popq %rcx")           # rax=expr0, rcx=expr1
+        self._emit_compare_rax_rcx(op0, expr0, expr1)
+        # rax = 0/1 result of first comparison
+        self.emit("    testq %rax, %rax")
+        self.emit(f"    jz {false_label}")
+
+        # For each subsequent pair, the LHS is the RHS of the previous pair.
+        # We saved the previous RHS (expr1) in %rcx; now push it for reuse.
+        # But after _emit_compare_rax_rcx, %rcx is the previous RHS — save it.
+        # However, _emit_compare_rax_rcx uses cmpq %rcx,%rax which leaves
+        # %rcx intact.  So %rcx still holds expr1_val here.
+        for i, (left_expr, op_i, right_expr) in enumerate(chain[1:]):
+            # %rcx holds left_expr's value (from previous pair's RHS).
+            # We need: rax = right_expr, rcx = left_expr.
+            # Save %rcx (left_expr value) on stack, eval right_expr, then restore.
+            self.emit("    pushq %rcx")      # stack: [left_val]
+            self.gen_expr(right_expr)        # rax = right_expr value
+            self.emit("    movq %rax, %rdx") # rdx = right_expr value (preserve)
+            self.emit("    popq %rcx")       # rcx = left_val (restored)
+            # Now rax = left_val? No. We need rax = left_val, rcx = right_val
+            # for cmpq %rcx, %rax (which computes rax - rcx and sets flags).
+            # At this point: rcx = left_val, rdx = right_val.
+            self.emit("    movq %rcx, %rax") # rax = left_val
+            self.emit("    movq %rdx, %rcx") # rcx = right_val
+            self._emit_compare_rax_rcx(op_i, left_expr, right_expr)
+            # rax = 0/1; %rcx still holds right_val (for next iteration).
+            self.emit("    testq %rax, %rax")
+            if i < len(chain) - 2:          # more pairs after this one
+                self.emit(f"    jz {false_label}")
+            else:
+                self.emit(f"    jz {false_label}")
+
+        # All comparisons true → rax = 1
+        self.emit("    movq $1, %rax")
+        self.emit(f"    jmp {end_label}")
+        self.emit(f"{false_label}:")
+        self.emit("    xorq %rax, %rax")
+        self.emit(f"{end_label}:")
+
+    def _emit_compare_rax_rcx(
+        self, op: BinOp, left_expr: Expr, right_expr: Expr
+    ) -> None:
+        """Emit a compare+setcc sequence assuming %rax=LHS, %rcx=RHS.
+        Result (0 or 1) lands in %rax. Mirrors the BinOp.{LT,...} cases
+        in gen_binary but extracted for reuse by gen_chained_compare."""
+        match op:
+            case BinOp.EQ:
+                self._cmp_set("e")
+            case BinOp.NEQ:
+                self._cmp_set("ne")
+            case BinOp.LT:
+                self._cmp_set(self._rel_cc("l", left_expr, right_expr))
+            case BinOp.LTE:
+                self._cmp_set(self._rel_cc("le", left_expr, right_expr))
+            case BinOp.GT:
+                self._cmp_set(self._rel_cc("g", left_expr, right_expr))
+            case BinOp.GTE:
+                self._cmp_set(self._rel_cc("ge", left_expr, right_expr))
+            case _:
+                raise CodeGenError(
+                    f"x86: _emit_compare_rax_rcx: unexpected op {op}"
+                )
+
     def gen_binary(self, op: BinOp, left: Expr, right: Expr) -> None:
         """Generate a binary op. Result in %rax."""
+        # Chained comparison: `a OP1 b OP2 c` is parsed left-associatively as
+        # BinaryExpr(OP2, BinaryExpr(OP1, a, b), c).  The naive lowering
+        # `(a OP1 b) OP2 c` compares the boolean 0/1 result of the inner
+        # compare against `c`, which is wrong.  Python semantics require
+        # `(a OP1 b) and (b OP2 c)`, evaluating `b` only once.  Detect the
+        # pattern and delegate to gen_chained_compare before the standard path.
+        chain = self._unwrap_comparison_chain(op, left, right)
+        if chain is not None:
+            self.gen_chained_compare(chain)
+            return
+
         # Evaluate right first, push, then left. After pop, %rax = left,
         # %rcx = right. This mirrors codegen_arm's stack-machine style.
         self.gen_expr(right)
@@ -2951,6 +3119,55 @@ class X86CodeGen:
                 self.emit_load_sized(size, "%rax", "%rax")
                 return
 
+    def _gen_min_max_inline(self, which: str, a: Expr, b: Expr) -> None:
+        """Inline min(a, b) / max(a, b) using cmpq + cmovl/cmovg.
+
+        Emits (for signed operands):
+            <eval b> → push
+            <eval a> → rax; pop rcx   (rax=a, rcx=b)
+            cmpq %rcx, %rax           (sets flags for a vs b)
+            cmovl %rcx, %rax          (min: if a < b, take b? no: take smaller)
+
+        Precise lowering:
+            min(a,b): if a ≤ b return a, else return b
+                      after `cmpq %rcx, %rax` (a - b):
+                        cmovg %rcx, %rax   — if a > b, replace rax with rcx(b)
+            max(a,b): if a ≥ b return a, else return b
+                        cmovl %rcx, %rax   — if a < b, replace rax with rcx(b)
+
+        Signedness defaults to signed (like the rest of our integer math).
+        Result lands in %rax.  No branch, no call, no heap.
+        """
+        # Eval b first, push; eval a, pop rcx → rax=a, rcx=b
+        self.gen_expr(b)
+        self.emit("    pushq %rax")
+        self.gen_expr(a)
+        self.emit("    popq %rcx")
+        self.emit("    cmpq %rcx, %rax")   # a - b sets SF/OF/ZF
+        if which == "min":
+            # If a > b (rax > rcx), take b (rcx)
+            self.emit("    cmovg %rcx, %rax")
+        else:  # max
+            # If a < b (rax < rcx), take b (rcx)
+            self.emit("    cmovl %rcx, %rax")
+
+    def _gen_abs_inline(self, x: Expr) -> None:
+        """Inline abs(x) using negq + cmovl.
+
+        Emits:
+            <eval x> → rax
+            movq %rax, %rcx     ; copy
+            negq %rax           ; rax = -x
+            testq %rcx, %rcx    ; check sign of original
+            cmovns %rcx, %rax   ; if x was non-negative, restore original
+        Result lands in %rax.  No branch, no call, no heap.
+        """
+        self.gen_expr(x)
+        self.emit("    movq %rax, %rcx")   # rcx = x (original)
+        self.emit("    negq %rax")         # rax = -x
+        self.emit("    testq %rcx, %rcx")  # SF = sign bit of x
+        self.emit("    cmovns %rcx, %rax") # if x >= 0, use original
+
     def gen_call(self, call: CallExpr) -> None:
         if call.kwargs:
             fname = (call.func.name if isinstance(call.func, Identifier)
@@ -2977,6 +3194,25 @@ class X86CodeGen:
         # standard arg-regs, and emit a bare instruction instead of `call`.
         if name is not None and name in X86_INTRINSICS:
             self.gen_io_intrinsic(name, call.args)
+            return
+
+        # ---- compile-time min / max / abs builtins -------------------------
+        # min(a, b), max(a, b), abs(x) are lowered inline to cmp + cmov —
+        # zero hidden control flow, zero heap, no call instruction.  They
+        # are only intercepted when the name is NOT shadowed by a local or
+        # user-defined function, so user code that defines its own `min` /
+        # `max` / `abs` function is not affected.
+        #
+        # Guard: these builtins are NOT defined by the user, NOT in a local
+        # scope, and their argument counts match the expected shape.
+        _user_defined = (name in self.defined_funcs or
+                         name in self.extern_funcs or
+                         (self.ctx is not None and name in self.ctx.locals))
+        if name in ("min", "max") and not _user_defined and len(call.args) == 2:
+            self._gen_min_max_inline(name, call.args[0], call.args[1])
+            return
+        if name == "abs" and not _user_defined and len(call.args) == 1:
+            self._gen_abs_inline(call.args[0])
             return
 
         is_direct = (

@@ -421,6 +421,39 @@ else:
 sign: int32 = 1 if x > 0 else -1
 ```
 
+### Chained comparisons
+
+Adder implements Python's chained-comparison semantics. An expression like
+`a OP1 b OP2 c` means `(a OP1 b) and (b OP2 c)` — **not** `(a OP1 b) OP2 c`
+(which would compare the boolean 0/1 result of the first comparison against
+`c`). All six relational operators may be chained: `<`, `<=`, `>`, `>=`,
+`==`, `!=`.
+
+```python
+lo: int32 = 10
+x:  int32 = 15
+hi: int32 = 20
+
+if lo <= x < hi:          # True: 10 <= 15 and 15 < 20
+    do_work()
+
+# 3-way chain:
+if 0 < idx < arr_len:     # idx strictly inside [1, arr_len-1]
+    arr[idx] = val
+
+# Middle operand is evaluated ONCE, even if it is a function call:
+if lo <= f() < hi:        # f() is called exactly once
+    ...
+```
+
+The codegen lowers an N-link chain to an AND of adjacent pairs with
+short-circuit evaluation: the first false pair immediately produces 0,
+skipping the remaining comparisons. Middle operands are saved in a
+register across the short-circuit test so they are evaluated exactly once.
+
+Regression fixture: `tests/test_compiler_chained_compare.ad` +
+`scripts/test_compiler_chained_compare.sh`.
+
 ### Loops
 
 ```python
@@ -1127,6 +1160,63 @@ def bytebuf_free(bb: Ptr[ByteBuf]):
 
 ---
 
+## Compile-time builtins
+
+These are **pure compile-time** operations: they expand to an immediate
+constant or a short inline sequence with no hidden heap allocation and no
+hidden control flow. They are intercepted by the codegen before the normal
+call path, so no user-visible `def` is needed in any library.
+
+### `sizeof(T)` — type size constant
+
+```python
+n: uint64 = sizeof(int32)           # 4
+m: uint64 = sizeof(Array[8, uint8]) # 8
+s: uint64 = sizeof(MyStruct)        # ABI layout size of the struct
+
+# Use in pointer arithmetic / allocation sizing
+buf_raw: uint64 = kmalloc(sizeof(Entry) * count)
+```
+
+`sizeof(T)` folds to `movq $N, %rax` — a compile-time constant. Supported
+for all scalar types, `Ptr[T]` (always 8), `Array[N, T]` (N × sizeof(T)),
+and struct/class types (ABI layout size). Previously you had to hand-roll
+`SIZEOF_FOO: uint64 = N` module constants; `sizeof` replaces them.
+
+Regression fixture: `tests/test_compiler_sizeof.ad` +
+`scripts/test_compiler_sizeof.sh`.
+
+### `min(a, b)` / `max(a, b)` — inline integer extremum
+
+```python
+lo: int32 = min(x, y)   # smaller of x, y
+hi: int32 = max(x, y)   # larger of x, y
+```
+
+Lowered to `cmpq %rcx, %rax` + `cmovg/cmovl %rcx, %rax` — one compare
+and one conditional move. No branch, no call, no heap. Works for any
+integer type; uses signed comparison (same default as `<`/`>`).
+
+These are only intercepted when `min`/`max` are NOT shadowed by a
+user-defined function or local variable — existing code that defines its
+own `imin`, `imax`, etc. is unaffected.
+
+### `abs(x)` — inline absolute value
+
+```python
+distance: int64 = abs(delta)
+```
+
+Lowered to `negq %rax` + `testq + cmovns` — no branch, no call, no heap.
+Works for signed integer types. For unsigned integers `abs` is a no-op
+(the value is already non-negative), but the codegen still emits the
+branchless form harmlessly.
+
+Regression fixture: `tests/test_compiler_minmax_abs.ad` +
+`scripts/test_compiler_minmax_abs.sh`.
+
+---
+
 ## Features deliberately not in Adder
 
 These show up in Python and are intentionally absent from Adder. If
@@ -1159,7 +1249,10 @@ rejects it.
 | Decorators on `def` / `class` (`@inline`, `@packed`, ...) | The codegen does not implement any decorator semantics. Rejected at codegen time with an actionable error (commit 25e6657: used to be silently dropped). | Define the class fields in the order and size you want; the codegen lays them out C-ABI style. For `@inline`-style hints there's no replacement — the compiler decides. |
 | `union` declarations | Parser accepts; codegen rejects at the source location with `x86: top-level UnionDef not yet supported`. Zero production usage. | Type-pun through a `Ptr[T]` cast: `cast[Ptr[uint32]](&u8_array[0])[0]`. |
 | Tuple literals / tuple types as values | `Tuple[A, B]` is not a real codegen type. | Return values by writing through caller-supplied `Ptr[T]` out-parameters, or pack into a struct. |
-| `print()`, `len()`, `input()`, `abs()`, `min()`, `max()`, `ord()`, `chr()`, `sizeof()` | None of these are wired up in codegen as builtins. | `printk0`/`printk1`/... family for printing. For lengths and sizes, hardcode the constant or compute it from the declaration; if a real `sizeof` is needed, expose it as a module-level `SIZEOF_FOO: uint64 = N`. |
+| `print()`, `len()`, `input()`, `ord()`, `chr()` | Not wired up as builtins. | `printk0`/`printk1`/... family for printing. For string lengths, track a length variable explicitly. |
+| `sizeof(T)` | **IMPLEMENTED** — folds to a compile-time constant (`movq $N, %rax`). No runtime call, no heap. | `sizeof(int32)` → 4, `sizeof(Array[8, uint8])` → 8, `sizeof(MyStruct)` → ABI layout size. See *Compile-time builtins* below. |
+| `min(a, b)` / `max(a, b)` | **IMPLEMENTED** — lowered inline to `cmpq` + `cmovg/cmovl`. No branch, no call, no heap. | Returns the smaller / larger of two integer values. See *Compile-time builtins* below. |
+| `abs(x)` | **IMPLEMENTED** — lowered inline to `negq` + `cmovns`. No branch, no call, no heap. | Returns the absolute value of an integer. See *Compile-time builtins* below. |
 | Default-valued parameters `def f(x=0)` | Rejected at codegen time with an actionable error (commit 25e6657: parser used to accept the default but the call site emitted with %esi holding garbage). | Pass the default explicitly at each call site, or use overload-by-name (`alloc_default()` vs `alloc_sized(n)`). |
 | `assert`, `defer`, `yield` | Reserved keywords in the lexer; no production usage; codegen does not implement them. | Manual checks; explicit cleanup; iterative state machines. |
 | `volatile T` type modifier | Parsed but unused in codegen. | Read MMIO through `Ptr[T]` with barriers via `asm_volatile`. |

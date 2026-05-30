@@ -558,6 +558,12 @@ class Parser:
         # Identifier or type cast
         if self.check(TokenType.IDENT):
             name = self.advance().value
+            # sizeof(Type) — compile-time size constant
+            if name == "sizeof":
+                self.expect(TokenType.LPAREN)
+                target_type = self.parse_type()
+                self.expect(TokenType.RPAREN)
+                return SizeOfExpr(target_type, self.make_span(tok))
             # Check for type cast: int32(x)
             if name in ("int8", "int16", "int32", "int64", "uint8", "uint16",
                         "uint32", "uint64", "float32", "float64", "bool", "char"):

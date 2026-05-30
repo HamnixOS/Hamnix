@@ -76,10 +76,8 @@ CASES=(
     d: int32 = cast[int32]({1: 10, 2: 20})
     return 0
 "
-"sizeof|def main() -> int32:
-    n: int32 = cast[int32](sizeof(int64))
-    return 0
-"
+# NOTE: sizeof(T) IS now implemented — it folds to a compile-time constant
+# integer (movq $N, %rax). See scripts/test_compiler_sizeof.sh.
 # NOTE: `for ... in range(...)` / `for x in arr` ARE now implemented in
 # the x86_64 codegen — see scripts/test_compiler_for_loop.sh and
 # tests/test_compiler_for_loop.ad. They are intentionally NOT in this
