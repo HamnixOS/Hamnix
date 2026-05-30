@@ -202,21 +202,32 @@ mformat -i "$ESP_IMG" -h 64 -s 32 -c 32 \
 
 # --- Boot-log persistence file (docs: kernel/printk/esp_log.ad) -------
 #
-# Preallocate a fixed-size, zero-filled LOG.TXT on the ESP *FIRST*,
-# before any other file, so its data extent is the first contiguous run
-# of clusters in the freshly-formatted volume (deterministic, never
-# fragmented). The kernel locates this extent at boot and overwrites it
-# in place via raw blk_write_sectors to persist the printk ring — so a
-# bad real-hardware boot (NUC, no serial) leaves its log on the stick.
+# Preallocate a fixed-size LOG.TXT on the ESP *FIRST*, before any other
+# file, so its data extent is the first contiguous run of clusters in the
+# freshly-formatted volume (deterministic, never fragmented). The kernel
+# locates this extent at boot and overwrites it in place via raw
+# blk_write_sectors to persist the printk ring — so a bad real-hardware
+# boot (NUC, no serial) leaves its log on the stick.
+#
+# Fill with NEWLINES (0x0A), not NULs. The kernel only overwrites the
+# leading sectors it actually has log+marker content for (a flush on a
+# flaky USB bus is expensive, so it does NOT rewrite the whole 256 KiB);
+# whatever tail it leaves untouched is this build-time fill. Newlines keep
+# the file clean, printable text from byte 0 to EOF — opening \LOG.TXT in
+# any editor shows the real log, the "==== END OF HAMNIX LOG ====" marker,
+# then blank lines, instead of the old sea of NUL "weird symbols".
 #
 # HAMNIX_ESP_LOG_SIZE MUST match ESP_LOG_BYTES in kernel/printk/
 # esp_log.ad (default 262144 = 256 KiB = 512 sectors).
 HAMNIX_ESP_LOG_SIZE="${HAMNIX_ESP_LOG_SIZE:-262144}"
 ESP_LOG_SRC="$EFI_STUB_TMP/log.txt"
-dd if=/dev/zero of="$ESP_LOG_SRC" bs=1 count="$HAMNIX_ESP_LOG_SIZE" \
-   status=none
+# `head -c N` reads exactly N zero bytes then closes; `tr` (the final
+# pipeline stage) translates each NUL to a newline. Putting `tr` last
+# avoids the SIGPIPE that would trip `set -o pipefail` if it were feeding
+# a `dd count=...` that closed the pipe early.
+head -c "$HAMNIX_ESP_LOG_SIZE" /dev/zero | tr '\0' '\n' > "$ESP_LOG_SRC"
 mcopy -o -i "$ESP_IMG" "$ESP_LOG_SRC" "::/LOG.TXT"
-echo "[build_img] Preallocated \\LOG.TXT (${HAMNIX_ESP_LOG_SIZE} B) for boot-log persistence."
+echo "[build_img] Preallocated \\LOG.TXT (${HAMNIX_ESP_LOG_SIZE} B, newline-filled) for boot-log persistence."
 
 mmd -i "$ESP_IMG" "::/EFI"
 mmd -i "$ESP_IMG" "::/EFI/BOOT"

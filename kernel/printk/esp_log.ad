@@ -291,36 +291,91 @@ def esp_log_init():
 esp_log_flushing: int32 = 0                      # reentrancy guard
 
 
+# The end-of-log marker line ("==== END OF HAMNIX LOG ====") is written
+# right after the captured log text so the file reads cleanly in any text
+# editor and the reader can see exactly where the real log ends. It is a
+# local Ptr[char] string literal in _flush_one (the x86 backend only
+# accepts string initializers on Array[N,uint8] globals, not on a
+# Ptr[char] global), measured with _str_len below.
+
+
+def _str_len(p: Ptr[char]) -> uint64:
+    n: uint64 = 0
+    while p[n] != 0:
+        n = n + 1
+    return n
+
+
 def _flush_one(t: Ptr[EspLogTarget], snap: Ptr[uint8], snap_len: uint64):
-    # Write `snap_len` bytes of `snap` into target `t`'s extent,
-    # zero-padding the final partial sector, capped at the target's
-    # sector budget. snap points at a full-ring snapshot buffer.
+    # Write `snap_len` bytes of `snap` into target `t`'s extent, followed
+    # by an end-of-log marker line. snap points at a full-ring snapshot
+    # buffer.
+    #
+    # FILE FORMAT (the end-of-log marker + why we DON'T NUL-pad)
+    # ---------------------------------------------------------
+    # LOG.TXT is a PREALLOCATED fixed-size file (256 KiB) that
+    # scripts/build_img.sh fills with NEWLINES (not NULs) at build time.
+    # The live log is almost always shorter than the file, so the tail is
+    # build-time newline filler — clean, printable text. We write the
+    # captured log, then a "==== END OF HAMNIX LOG ====" line so a reader
+    # can see exactly where the real log ends, and stop. The sectors past
+    # the marker keep their newline fill, so opening \LOG.TXT in any editor
+    # shows the log, the marker, then blank lines — no NUL "weird symbols".
+    #
+    # We deliberately write ONLY the content sectors (log + marker), NOT
+    # the whole 256 KiB budget: a flush on a flaky USB bulk-OUT is
+    # expensive, and the build-time newline fill already keeps the
+    # untouched tail clean. The last content sector's own tail is
+    # newline-padded below so the marker is cleanly terminated even when it
+    # lands mid-sector.
+    marker: Ptr[char] = "\n==== END OF HAMNIX LOG ====\n"
+    marker_len: uint64 = _str_len(marker)
+    # Total bytes of meaningful content = log + marker.
+    content_len: uint64 = snap_len + marker_len
+    # Sectors to write = ceil(content_len / SECTOR_SIZE), capped at the
+    # target's sector budget (the preallocated file size).
+    budget: uint64 = t[0].sectors
+    content_sectors: uint64 = (content_len + SECTOR_SIZE - 1) / SECTOR_SIZE
+    if content_sectors > budget:
+        content_sectors = budget
     slot: int32 = t[0].slot
     base: uint64 = t[0].data_lba
-    budget: uint64 = t[0].sectors
     written_sectors: uint64 = 0
     off: uint64 = 0
-    while written_sectors < budget:
-        # Fill esp_scratch with up to one sector of snapshot bytes,
-        # zero-padding any tail.
+    while written_sectors < content_sectors:
+        # Fill esp_scratch with one sector. For each absolute byte
+        # position `pos` in the file:
+        #   pos <  snap_len                 -> log byte
+        #   snap_len <= pos < content_len   -> marker byte
+        #   pos >= content_len              -> '\n' padding (final sector
+        #                                       tail past the marker)
         i: uint64 = 0
         while i < SECTOR_SIZE:
-            if off + i < snap_len:
-                esp_scratch[i] = snap[off + i]
+            pos: uint64 = off + i
+            if pos < snap_len:
+                esp_scratch[i] = snap[pos]
+            elif pos < content_len:
+                esp_scratch[i] = cast[uint8](marker[pos - snap_len] & 0xFF)
             else:
-                esp_scratch[i] = 0
+                esp_scratch[i] = 10              # '\n'
             i = i + 1
-        if blk_write_sectors(slot, base + written_sectors, 1,
-                             &esp_scratch[0]) != 0:
-            return
+        # Write this sector, retrying a transient failure a few times. On
+        # real USB media (and QEMU's emulated xHCI) a bulk-OUT can
+        # intermittently time out; abandoning the WHOLE flush on the first
+        # hiccup would truncate the on-disk log mid-boot. Retry, then — if
+        # it still won't take — move on to the next sector so the rest of
+        # the log (including the later, more valuable boot phases) still
+        # lands. Best-effort persistence beats an all-or-nothing flush that
+        # loses everything past a single glitch.
+        attempt: int32 = 0
+        while attempt < 3:
+            if blk_write_sectors(slot, base + written_sectors, 1,
+                                 &esp_scratch[0]) == 0:
+                attempt = 3                         # success: stop retrying
+            else:
+                attempt = attempt + 1
         written_sectors = written_sectors + 1
         off = off + SECTOR_SIZE
-        if off >= snap_len:
-            # Wrote the last data sector; everything past here would be
-            # all-zero padding. Stop early — leaving the rest of the
-            # preallocated file as whatever it last held is fine (the
-            # reader truncates at the first NUL run / uses strings).
-            return
 
 
 # Full-ring snapshot buffer. Sized to the ring so a single
@@ -349,6 +404,33 @@ def esp_log_flush():
         _flush_one(&esp_log_targets[ti], &esp_snap_buf[0], snap_len)
         ti = ti + 1
     esp_log_flushing = 0
+
+
+def esp_log_rescan():
+    # Re-run the block-device scan to (re)arm flush targets after a bus
+    # that was not yet up at first esp_log_init() time has registered its
+    # partitions.
+    #
+    # WHY THIS EXISTS (the root-on-USB bug)
+    # -------------------------------------
+    # esp_log_init() runs early in boot, right after the block layer's
+    # virtio/AHCI/NVMe partition devices are registered, so it arms the
+    # ESP on those buses. But a Hamnix .img flashed to a USB stick boots
+    # off the USB ESP, and the USB mass-storage stack (xHCI + BOT) is
+    # brought up LATER — only then does the FAT ESP partition (sd0p1)
+    # become a registered block device. The first esp_log_init() scan ran
+    # before sd0p1 existed, so it never found LOG.TXT on the USB stick and
+    # every flush wrote to nothing on USB media (the user saw an all-zero
+    # \LOG.TXT after a USB boot).
+    #
+    # Calling this once after usbms_init() re-scans every block device,
+    # which now includes sd0p1, and arms the USB ESP's LOG.TXT extent so
+    # all subsequent flushes land on the stick. esp_log_init() rebuilds
+    # the target list from scratch (it zeroes esp_log_target_cnt /
+    # esp_log_ready up front), so re-running it is idempotent: targets
+    # already found on other buses are simply re-discovered, and the
+    # newly-registered USB ESP is added.
+    esp_log_init()
 
 
 def esp_log_is_ready() -> int32:
