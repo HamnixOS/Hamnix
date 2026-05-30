@@ -385,6 +385,23 @@ class TaskStruct:
     # explicit per-task value gets planted by /dev/auth on `newshell`.
     uid:            uint32            # offset 2184
     gid:            uint32            # offset 2188
+    # Job control: the NUMERIC process-group id used by hamsh job
+    # control (kill(-pgid), fg/bg, terminal-foreground tracking). This
+    # is DELIBERATELY separate from `pgrp` above — that field is the
+    # Plan-9 namespace Pgrp heap pointer (chan bindings), a different
+    # concept that happens to share the name. A new task's job_pgid is
+    # seeded to its own pid (it leads its own group) unless SYS_SETPGID
+    # moves it. 0 here means "not yet assigned → resolves to pid".
+    # Placed at the END of TaskStruct so it shifts no earlier offset.
+    job_pgid:       uint64            # offset 2192
+    # Job control: STATE_STOPPED bookkeeping. stop_sig records the
+    # signal that stopped the task (SIGTSTP/SIGSTOP/SIGTTIN/SIGTTOU) so
+    # wait-status reporting can distinguish causes; 0 when running.
+    stop_sig:       uint64            # offset 2200
+    # Set to 1 when a SIGCONT continued a previously-stopped task and
+    # the parent has not yet observed it via the wait path. wait-status
+    # decoding turns this into a "Continued" report. Cleared on read.
+    cont_pending:   uint64            # offset 2208
 
 
 # State constants (mirror Linux's task->state space at a tiny scope).
@@ -392,6 +409,10 @@ STATE_FREE:    uint64 = 0
 STATE_READY:   uint64 = 1
 STATE_RUNNING: uint64 = 2
 STATE_EXITED:  uint64 = 3
+# Job control: the task is stopped (SIGTSTP/SIGSTOP). It is NOT on the
+# runqueue — _pick_next skips it — until a SIGCONT moves it back to
+# STATE_READY. Distinct from STATE_EXITED (which is terminal).
+STATE_STOPPED: uint64 = 4
 
 # Per-task kernel stack. 16 KiB (4 pages, buddy order 2) — a single
 # 4 KiB page is NOT enough for the deepest in-kernel call chain, the
@@ -644,6 +665,13 @@ def kthread_create(entry: uint64, name0: uint64) -> int32:
     s: uint64 = cast[uint64](slot)
     task_table[s].sp          = sp
     task_table[s].pid         = next_pid
+    # Job control: a fresh task leads its own process group (job_pgid ==
+    # pid) until SYS_SETPGID moves it. SYS_SPAWN's child-pgid plumbing
+    # overrides this right after create returns when the shell asked for
+    # a backgrounded pipeline in a new group.
+    task_table[s].job_pgid    = next_pid
+    task_table[s].stop_sig    = 0
+    task_table[s].cont_pending = 0
     task_table[s].kstack_base = kstack
     task_table[s].kstack_top  = kstack_top
     task_table[s].ustack_base = 0
@@ -812,6 +840,13 @@ def create_user_thread(entry: uint64, name0: uint64,
     s: uint64 = cast[uint64](slot)
     task_table[s].sp          = sp
     task_table[s].pid         = next_pid
+    # Job control: a fresh task leads its own process group (job_pgid ==
+    # pid) until SYS_SETPGID moves it. SYS_SPAWN's child-pgid plumbing
+    # overrides this right after create returns when the shell asked for
+    # a backgrounded pipeline in a new group.
+    task_table[s].job_pgid    = next_pid
+    task_table[s].stop_sig    = 0
+    task_table[s].cont_pending = 0
     task_table[s].kstack_base = kstack
     task_table[s].kstack_top  = kstack_top
     task_table[s].ustack_base = ustack
@@ -1523,6 +1558,29 @@ def task_state(slot: int32) -> uint64:
     return task_table[cast[uint64](slot)].state
 
 
+# Job control: is the task stopped, and which signal stopped it?
+def task_is_stopped(slot: int32) -> int32:
+    if task_table[cast[uint64](slot)].state == STATE_STOPPED:
+        return 1
+    return 0
+
+
+def task_stop_sig(slot: int32) -> uint64:
+    return task_table[cast[uint64](slot)].stop_sig
+
+
+# Job control: read-and-clear the "I was continued and the parent
+# hasn't seen it yet" flag. SYS_WAITPID's status encoder uses this to
+# emit a WIFCONTINUED-shape report exactly once per resume.
+def task_take_cont_pending(slot: int32) -> int32:
+    su: uint64 = cast[uint64](slot)
+    v: uint64 = task_table[su].cont_pending
+    task_table[su].cont_pending = 0
+    if v != 0:
+        return 1
+    return 0
+
+
 def task_exit_code(slot: int32) -> int64:
     return task_table[cast[uint64](slot)].exit_code
 
@@ -1924,7 +1982,17 @@ SIGSEGV: uint64 = 11
 SIGPIPE: uint64 = 13
 SIGTERM: uint64 = 15
 SIGCHLD: uint64 = 17
+# Job-control signals (x86_64 / asm-generic numbering). SIGCONT (18)
+# resumes a stopped task; SIGSTOP (19) is the uncatchable stop;
+# SIGTSTP (20) is the terminal stop from Ctrl-Z (catchable, but the
+# default disposition is the same STOP machinery as SIGSTOP); SIGTTIN
+# (21) / SIGTTOU (22) stop a background-group task that touches the
+# terminal. All four share STATE_STOPPED bookkeeping.
+SIGCONT: uint64 = 18
 SIGSTOP: uint64 = 19
+SIGTSTP: uint64 = 20
+SIGTTIN: uint64 = 21
+SIGTTOU: uint64 = 22
 
 # sa_flags bits we recognise (asm-generic / x86_64 <asm/signal.h>).
 SA_SIGINFO:  uint64 = 0x00000004
@@ -1936,6 +2004,37 @@ def signal_post(slot: uint64, sig: uint64):
     if sig == 0 or sig >= 64:
         return
     bit: uint64 = cast[uint64](1) << sig
+    # Job control: SIGCONT resumes a STOPPED task. A stopped task is OFF
+    # the runqueue and will never run its own signal_dispatch, so the
+    # wake MUST happen here, at post time. POSIX: SIGCONT also discards
+    # any pending stop signals, and a continued task notifies its
+    # parent (cont_pending → the wait path reports "Continued").
+    if sig == SIGCONT:
+        stop_mask: uint64 = (cast[uint64](1) << SIGSTOP) \
+                          | (cast[uint64](1) << SIGTSTP) \
+                          | (cast[uint64](1) << SIGTTIN) \
+                          | (cast[uint64](1) << SIGTTOU)
+        task_table[slot].sig_pending = task_table[slot].sig_pending & ~stop_mask
+        if task_table[slot].state == STATE_STOPPED:
+            task_table[slot].state        = STATE_READY
+            task_table[slot].stop_sig     = 0
+            task_table[slot].cont_pending = 1
+        # SIGCONT's default disposition is "continue + ignore" — there is
+        # nothing more for signal_dispatch to do, so don't latch the bit
+        # unless the task installed a real handler for it.
+        if task_table[slot].sig_handlers[SIGCONT] <= 1:
+            return
+    # Job control: a stop signal aimed at an already-STOPPED task is a
+    # no-op (it stays stopped); latching it would resolve spuriously on
+    # the next continue. Drop it.
+    if task_table[slot].state == STATE_STOPPED:
+        if sig == SIGSTOP or sig == SIGTSTP or sig == SIGTTIN \
+                or sig == SIGTTOU:
+            return
+    # Posting a stop signal cancels any not-yet-observed SIGCONT — POSIX.
+    if sig == SIGSTOP or sig == SIGTSTP or sig == SIGTTIN or sig == SIGTTOU:
+        task_table[slot].sig_pending = \
+            task_table[slot].sig_pending & ~(cast[uint64](1) << SIGCONT)
     task_table[slot].sig_pending = task_table[slot].sig_pending | bit
 
 
@@ -2349,6 +2448,53 @@ def signal_dispatch(syscall_rc: uint64, allow_handler: int32):
                         # SIG_IGN: drop silently, keep scanning.
                         s = s + 1
                         continue
+                    # Job control: SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU default
+                    # disposition is STOP, not terminate. Park the task in
+                    # STATE_STOPPED (off the runqueue) and schedule away.
+                    # When a SIGCONT later arrives signal_post flips it
+                    # back to STATE_READY. PID 1 (the shell) is exempt —
+                    # stopping the shell would wedge the console — so a
+                    # stop signal that somehow reaches pid 1 is dropped.
+                    if s == SIGSTOP or s == SIGTSTP or s == SIGTTIN \
+                            or s == SIGTTOU:
+                        if task_table[cur].pid <= 1:
+                            s = s + 1
+                            continue
+                        task_table[cur].stop_sig = s
+                        task_table[cur].state    = STATE_STOPPED
+                        # Tell the parent a child stopped (job-control
+                        # wait path reports "Stopped"). SIGCHLD is the
+                        # POSIX carrier — but ONLY raise it when the parent
+                        # actually installed a SIGCHLD handler. Default
+                        # SIGCHLD disposition is SIG_IGN-equivalent (Linux
+                        # semantics); posting it to a handler-less parent
+                        # would latch a bit that signal_dispatch then
+                        # resolves as the SIG_DFL "terminate 128+17"
+                        # action — which would kill PID 1 (the shell) with
+                        # exit code 145 the instant it next yields. The
+                        # job-control wait path uses sys_waitpid_jc polling,
+                        # not SIGCHLD, so suppressing the unhandled signal
+                        # loses nothing. Mirrors the exit-side guard in
+                        # task_exit_current().
+                        ppid_s: uint64 = task_table[cur].parent_pid
+                        pslot_s: int32 = task_lookup_by_pid(ppid_s)
+                        if pslot_s >= 0:
+                            psu_s: uint64 = cast[uint64](pslot_s)
+                            chld_hs: uint64 = \
+                                task_table[psu_s].sig_handlers[SIGCHLD]
+                            if chld_hs > 1:
+                                signal_post(psu_s, SIGCHLD)
+                        # Yield the CPU; we are no longer runnable.
+                        schedule()
+                        # Resumed (SIGCONT made us READY and the scheduler
+                        # picked us). Keep scanning for further pending.
+                        s = s + 1
+                        continue
+                    # SIGCONT with no real handler: nothing to do here
+                    # (the resume already happened in signal_post). Skip.
+                    if s == SIGCONT:
+                        s = s + 1
+                        continue
                     task_table[cur].term_sig = s
                     task_exit_current(cast[int64](128) + cast[int64](s))
                     return                            # not reached
@@ -2395,13 +2541,72 @@ def signal_deliver_on_return(syscall_rc: uint64) -> uint64:
     return syscall_rc
 
 
+# --- job control: process-group + terminal-foreground tracking ----
+#
+# The console/terminal has exactly one FOREGROUND process group at a
+# time. hamsh (PID 1) owns the terminal at the prompt; when it puts a
+# pipeline in the foreground it sets terminal_fg_pgid to that pipeline's
+# pgid via SYS_TCSETPGRP, and restores its own pgid (1) when the job
+# exits/stops. Ctrl-C / Ctrl-Z deliver their signal to terminal_fg_pgid
+# ONLY — background jobs are insulated, exactly like Unix.
+#
+# 0 means "no job in the foreground" (the shell itself is reading): a
+# terminal signal at the bare prompt is then dropped, matching what a
+# serial-console user expects.
+terminal_fg_pgid: uint64 = 0
+
+
+def set_terminal_fg_pgid(pgid: uint64):
+    terminal_fg_pgid = pgid
+
+
+def get_terminal_fg_pgid() -> uint64:
+    return terminal_fg_pgid
+
+
+def task_set_job_pgid(slot: uint64, pgid: uint64):
+    task_table[slot].job_pgid = pgid
+
+
+def task_get_job_pgid(slot: uint64) -> uint64:
+    p: uint64 = task_table[slot].job_pgid
+    if p == 0:
+        return task_table[slot].pid
+    return p
+
+
+def signal_post_to_pgid(pgid: uint64, sig: uint64) -> int32:
+    # Deliver `sig` to every alive member of process group `pgid`.
+    # PID 1 is NEVER signalled here even if it shares the pgid — a
+    # terminal stop/interrupt must never wedge the shell. Returns the
+    # number of tasks the signal was posted to.
+    if pgid == 0:
+        return 0
+    n: uint64 = NTASKS
+    i: uint64 = 0
+    hit: int32 = 0
+    while i < n:
+        if task_table[i].pid > 1:
+            st: uint64 = task_table[i].state
+            if st != STATE_FREE and st != STATE_EXITED:
+                if task_get_job_pgid(i) == pgid:
+                    signal_post(i, sig)
+                    hit = hit + 1
+        i = i + 1
+    return hit
+
+
 def signal_post_to_foreground(sig: uint64):
-    # Deliver `sig` to every alive task whose pid > 1. pid 1 is
-    # always hamsh (the shell); we don't want a Ctrl-C from the
-    # terminal to nuke the shell itself, only the foreground
-    # child(ren). If no children are alive — typing at the bare
-    # prompt — the signal is dropped on the floor, which matches
-    # what users expect from a serial console.
+    # Terminal-generated signal (Ctrl-C → SIGINT, Ctrl-Z → SIGTSTP).
+    # Route it to the terminal's CURRENT foreground process group only,
+    # so background jobs are insulated. If a foreground job is set,
+    # deliver there; otherwise fall back to the historical "every
+    # pid>1 task" broadcast (covers the no-job-table boot path and any
+    # caller that hasn't set a foreground pgid yet).
+    fg: uint64 = terminal_fg_pgid
+    if fg != 0:
+        signal_post_to_pgid(fg, sig)
+        return
     n: uint64 = NTASKS
     i: uint64 = 0
     while i < n:

@@ -55,6 +55,17 @@ extern def sys_rfork(flags: int32) -> int32
 extern def sys_bind(new: Ptr[char], old: Ptr[char], flag: int32) -> int32
 extern def sys_unmount(new: Ptr[char], old: Ptr[char]) -> int32
 extern def sys_kill(pid: int32, sig: int32) -> int32
+# Job control. sys_setpgid places a child in a process group (the shell
+# uses it to start a backgrounded pipeline in its own group). A NEGATIVE
+# pid to sys_kill targets a whole process group (kill(-pgid, sig)).
+# sys_tcsetpgrp installs the terminal's foreground group so Ctrl-C /
+# Ctrl-Z route only to the foreground job. sys_waitpid_jc is a
+# non-blocking job-control wait: it returns the pid and writes a status
+# word distinguishing EXITED / STOPPED / CONTINUED (see the job-control
+# section below for the encoding), or 0 when there is nothing new.
+extern def sys_setpgid(pid: int32, pgid: int32) -> int32
+extern def sys_tcsetpgrp(pgid: int32) -> int32
+extern def sys_waitpid_jc(pid: int32, status: Ptr[int64]) -> int64
 extern def sys_exit(code: uint64)
 # HAMSH §7: the `#d`-fd-device namespace primitives. /fd/N is a NAME
 # in a process's Pgrp; pipe / redirect / dup all reduce to "bind a
@@ -4060,6 +4071,323 @@ def run_pipeline(plnode: int32) -> int32:
     return last
 
 
+# ====================================================================
+# Job control (§ Tier-1): &, jobs, fg, bg, Ctrl-Z (SIGTSTP) / SIGCONT
+# ====================================================================
+# hamsh is PID 1 and owns the console. A pipeline launched with `&`
+# becomes its own process group (pgid == leader pid); `jobs` lists the
+# table, `fg`/`bg` resume + reattach the terminal, and Ctrl-Z stops the
+# foreground job. The kernel pieces: SYS_SETPGID (new group), SYS_KILL
+# with a negative pgid (signal a whole group), SYS_TCSETPGRP (terminal
+# foreground group → routes Ctrl-C/Ctrl-Z), and SYS_WAITPID_JC (non-
+# blocking wait reporting EXITED / STOPPED / CONTINUED).
+#
+# sys_waitpid_jc status word (low byte = kind, status>>8 & 0xFF = data):
+#   0 RUNNING     — alive, nothing new (returns 0)
+#   1 EXITED      — data = exit code; slot reaped
+#   2 STOPPED     — data = stop signal (SIGTSTP=20 / SIGSTOP=19)
+#   3 CONTINUED   — resumed since last poll
+WAITJC_RUNNING:   int64 = 0
+WAITJC_EXITED:    int64 = 1
+WAITJC_STOPPED:   int64 = 2
+WAITJC_CONTINUED: int64 = 3
+
+# Signal numbers the shell sends (mirror kernel/sched/core.ad).
+JC_SIGCONT: int32 = 18
+JC_SIGTERM: int32 = 15
+JC_SIGKILL: int32 = 9
+
+# Job-table states.
+JOB_FREE:    int32 = 0
+JOB_RUNNING: int32 = 1
+JOB_STOPPED: int32 = 2
+JOB_DONE:    int32 = 3      # exited, not yet reported to the user
+
+JOBS_MAX:    uint64 = 32
+JOB_CMD_MAX: uint64 = 128
+
+job_state:  Array[32, int32]            # JOB_*
+job_pgid:   Array[32, int32]            # process-group id (== leader pid)
+job_pid:    Array[32, int32]            # leader pid (single-stage = the cmd)
+job_id:     Array[32, int32]            # human job number [%n]
+job_code:   Array[32, int32]            # exit code once JOB_DONE
+job_cmd:    Array[4096, uint8]          # 32 jobs * 128 bytes, NUL-terminated
+job_next_id: int32 = 1                  # monotonically increasing %n
+job_current: int32 = 0                  # the "+" job (last touched), 0=none
+
+
+def _job_find_free() -> int32:
+    j: uint64 = 0
+    while j < JOBS_MAX:
+        if job_state[j] == JOB_FREE:
+            return cast[int32](j)
+        j = j + 1
+    return -1
+
+
+def _job_by_id(id: int32) -> int32:
+    j: uint64 = 0
+    while j < JOBS_MAX:
+        if job_state[j] != JOB_FREE and job_id[j] == id:
+            return cast[int32](j)
+        j = j + 1
+    return -1
+
+
+def _job_by_pid(pid: int32) -> int32:
+    j: uint64 = 0
+    while j < JOBS_MAX:
+        if job_state[j] != JOB_FREE and job_pid[j] == pid:
+            return cast[int32](j)
+        j = j + 1
+    return -1
+
+
+def _job_set_cmd(slot: uint64):
+    # Reconstruct the command text from the current argv arena into the
+    # job's command buffer (space-joined argv). argv_ptr/argv_n still
+    # reflect the command being launched.
+    base: uint64 = slot * JOB_CMD_MAX
+    o: uint64 = 0
+    ai: uint64 = 0
+    while ai < argv_n:
+        if ai > 0 and o + 1 < JOB_CMD_MAX:
+            job_cmd[base + o] = 32              # ' '
+            o = o + 1
+        s: Ptr[uint8] = cast[Ptr[uint8]](argv_ptr[ai])
+        k: uint64 = 0
+        while s[k] != 0 and o + 1 < JOB_CMD_MAX:
+            job_cmd[base + o] = s[k]
+            o = o + 1
+            k = k + 1
+        ai = ai + 1
+    job_cmd[base + o] = 0
+
+
+def _job_register(pid: int32, pgid: int32) -> int32:
+    # Allocate a job-table entry for a backgrounded/stopped pipeline.
+    # Returns the table slot or -1 if the table is full.
+    slot: int32 = _job_find_free()
+    if slot < 0:
+        return -1
+    su: uint64 = cast[uint64](slot)
+    job_state[su] = JOB_RUNNING
+    job_pid[su]   = pid
+    job_pgid[su]  = pgid
+    job_id[su]    = job_next_id
+    job_code[su]  = 0
+    job_next_id   = job_next_id + 1
+    _job_set_cmd(su)
+    job_current   = job_id[su]
+    return slot
+
+
+def _job_print_cmd(slot: uint64):
+    write_cstr1(&job_cmd[slot * JOB_CMD_MAX])
+
+
+def _job_report_line(slot: uint64, tag: Ptr[uint8]):
+    # `[<id>]<+/-> <tag> <cmd>` — the shell's job-status notice line.
+    write_cstr1("[")
+    write_cstr1(render_int(cast[int64](job_id[slot])))
+    write_cstr1("]")
+    if job_id[slot] == job_current:
+        write_cstr1("+ ")
+    else:
+        write_cstr1("  ")
+    write_cstr1(tag)
+    write_cstr1(" ")
+    _job_print_cmd(slot)
+    write_cstr1("\n")
+
+
+def jobs_reap_and_report():
+    # Called at every prompt: poll each live job non-blockingly, fold in
+    # EXITED → JOB_DONE, and print Done/Stopped notices. A reaped DONE
+    # job is then freed.
+    st_word: Array[1, int64]
+    j: uint64 = 0
+    while j < JOBS_MAX:
+        if job_state[j] == JOB_RUNNING:
+            r: int64 = sys_waitpid_jc(job_pid[j], &st_word[0])
+            if r > 0:
+                kind: int64 = st_word[0] & 0xFF
+                if kind == WAITJC_EXITED:
+                    job_code[j]  = cast[int32]((st_word[0] >> 8) & 0xFF)
+                    job_state[j] = JOB_DONE
+                elif kind == WAITJC_STOPPED:
+                    job_state[j] = JOB_STOPPED
+        if job_state[j] == JOB_DONE:
+            _job_report_line(j, "Done")
+            job_state[j] = JOB_FREE
+        j = j + 1
+
+
+def _job_wait_foreground(slot: uint64) -> int32:
+    # Give the terminal to the EXISTING job's group, then poll it to
+    # completion OR until it stops (Ctrl-Z → SIGTSTP). Returns the exit
+    # code on exit; on stop, prints the `Stopped` notice and returns -1.
+    # Used by `fg` (the job is already in the table). The shell reclaims
+    # the terminal (pgid 1) before returning either way.
+    st_word: Array[1, int64]
+    sys_tcsetpgrp(job_pgid[slot])
+    rc: int32 = 0
+    while True:
+        r: int64 = sys_waitpid_jc(job_pid[slot], &st_word[0])
+        if r > 0:
+            kind: int64 = st_word[0] & 0xFF
+            if kind == WAITJC_EXITED:
+                rc = cast[int32]((st_word[0] >> 8) & 0xFF)
+                break
+            if kind == WAITJC_STOPPED:
+                job_state[slot] = JOB_STOPPED
+                job_current = job_id[slot]
+                rc = -1
+                write_cstr1("\n")
+                _job_report_line(slot, "Stopped")
+                break
+        sys_yield()
+    # Reclaim the controlling terminal for the shell (pgid 1).
+    sys_tcsetpgrp(1)
+    return rc
+
+
+def launch_background(pid: int32):
+    # `cmd &` already spawned `pid` (do_wait=0). Put it in its OWN
+    # process group (pgid == pid), register the job, and print the
+    # standard `[<id>] <pgid>` announce line. The shell does NOT wait —
+    # it returns to the prompt immediately.
+    if pid <= 0:
+        return
+    sys_setpgid(pid, pid)
+    slot: int32 = _job_register(pid, pid)
+    if slot < 0:
+        # Table full — leave the child running, just no job control.
+        return
+    su: uint64 = cast[uint64](slot)
+    write_cstr1("[")
+    write_cstr1(render_int(cast[int64](job_id[su])))
+    write_cstr1("] ")
+    write_cstr1(render_int(cast[int64](pid)))
+    write_cstr1("\n")
+
+
+def launch_foreground_pid(pid: int32) -> int32:
+    # A non-`&` external command: spawned at `pid`. Put it in its own
+    # process group, hand it the terminal, and poll it. On normal exit
+    # it consumes NO job number (foreground commands aren't "jobs"). On
+    # Ctrl-Z it is registered as a STOPPED job so fg/bg can resume it.
+    # Returns the exit code (or 0 after a stop).
+    if pid <= 0:
+        return 127
+    sys_setpgid(pid, pid)
+    sys_tcsetpgrp(pid)
+    st_word: Array[1, int64]
+    rc: int32 = 0
+    while True:
+        r: int64 = sys_waitpid_jc(pid, &st_word[0])
+        if r > 0:
+            kind: int64 = st_word[0] & 0xFF
+            if kind == WAITJC_EXITED:
+                rc = cast[int32]((st_word[0] >> 8) & 0xFF)
+                break
+            if kind == WAITJC_STOPPED:
+                # Promote to a tracked job ONLY now (allocates a %n).
+                slot: int32 = _job_register(pid, pid)
+                if slot >= 0:
+                    su: uint64 = cast[uint64](slot)
+                    job_state[su] = JOB_STOPPED
+                    job_current = job_id[su]
+                    write_cstr1("\n")
+                    _job_report_line(su, "Stopped")
+                rc = 0
+                break
+        sys_yield()
+    sys_tcsetpgrp(1)
+    return rc
+
+
+def _builtin_jobs(argc: int32):
+    # `jobs` — list every tracked job with its state. Reap first so the
+    # listing reflects freshly-finished work.
+    jobs_reap_and_report()
+    any: int32 = 0
+    j: uint64 = 0
+    while j < JOBS_MAX:
+        if job_state[j] == JOB_RUNNING:
+            _job_report_line(j, "Running")
+            any = 1
+        elif job_state[j] == JOB_STOPPED:
+            _job_report_line(j, "Stopped")
+            any = 1
+        j = j + 1
+    eval_status = 0
+
+
+def _jobspec_to_slot(argc: int32) -> int32:
+    # Resolve an optional `%n` job spec (argv[1]) to a table slot. With
+    # no argument, use the current ("+") job. Returns -1 on miss.
+    if argc >= 2:
+        spec: Ptr[uint8] = cast[Ptr[uint8]](argv_ptr[1])
+        i: uint64 = 0
+        if spec[0] == 37:                  # '%'
+            i = 1
+        id: int32 = cast[int32](_parse_dec(&spec[i]))
+        return _job_by_id(id)
+    if job_current != 0:
+        return _job_by_id(job_current)
+    return -1
+
+
+def _builtin_fg(argc: int32):
+    # `fg [%n]` — bring a job to the foreground: SIGCONT it if stopped,
+    # give it the terminal, and wait for it to exit or stop again.
+    jobs_reap_and_report()
+    slot: int32 = _jobspec_to_slot(argc)
+    if slot < 0:
+        errstr_set("fg: no such job")
+        eval_status = 1
+        return
+    su: uint64 = cast[uint64](slot)
+    # Echo the command, mimicking bash's `fg` (which prints the cmd).
+    _job_print_cmd(su)
+    write_cstr1("\n")
+    if job_state[su] == JOB_STOPPED:
+        sys_kill(-job_pgid[su], JC_SIGCONT)
+        job_state[su] = JOB_RUNNING
+    rc: int32 = _job_wait_foreground(su)
+    if rc >= 0:
+        job_state[su] = JOB_FREE
+        eval_status = rc
+    else:
+        eval_status = 0
+
+
+def _builtin_bg(argc: int32):
+    # `bg [%n]` — resume a stopped job in the background (SIGCONT, no
+    # terminal hand-off). Prints `[<id>]+ <cmd> &`.
+    jobs_reap_and_report()
+    slot: int32 = _jobspec_to_slot(argc)
+    if slot < 0:
+        errstr_set("bg: no such job")
+        eval_status = 1
+        return
+    su: uint64 = cast[uint64](slot)
+    if job_state[su] != JOB_STOPPED:
+        errstr_set("bg: job already running")
+        eval_status = 1
+        return
+    sys_kill(-job_pgid[su], JC_SIGCONT)
+    job_state[su] = JOB_RUNNING
+    job_current = job_id[su]
+    write_cstr1("[")
+    write_cstr1(render_int(cast[int64](job_id[su])))
+    write_cstr1("]+ ")
+    _job_print_cmd(su)
+    write_cstr1(" &\n")
+    eval_status = 0
+
+
 # --- command substitution `{ ... } (§8) -----------------------------
 # Run a command, capture its stdout into a string. A pipe Chan
 # captures the bytes; we drain it after the command exits.
@@ -4669,6 +4997,18 @@ def exec_statement(node: int32) -> int32:
             if cstr_eq(cmd, "wait") != 0:
                 _builtin_wait(node, argc)
                 return EX_NORMAL
+            # Job-control builtins MUST run in PID 1 (they hand off the
+            # controlling terminal and wait on jobs), so they dispatch
+            # here, not through the external-spawn path.
+            if cstr_eq(cmd, "jobs") != 0:
+                _builtin_jobs(argc)
+                return EX_NORMAL
+            if cstr_eq(cmd, "fg") != 0:
+                _builtin_fg(argc)
+                return EX_NORMAL
+            if cstr_eq(cmd, "bg") != 0:
+                _builtin_bg(argc)
+                return EX_NORMAL
         # argv is already built; run the command directly
         eval_status = _run_prebuilt_command(node, argc)
         return EX_NORMAL
@@ -4701,12 +5041,37 @@ def _run_prebuilt_command(node: int32, argc: int32) -> int32:
     # Pass prebuilt=1 so run_one_command_x does NOT rebuild — a rebuild
     # would re-RUN any `{ … }` command substitution in the argv. No
     # pipe Chans for a single command statement (-1, -1).
-    # A trailing `&` (nd_c bit2) backgrounds the command: do_wait=0, so
-    # the shell does not block — e.g. `p9srv_demo post name &` leaves
-    # the 9P daemon running for a subsequent `mount /srv/name …`.
+    # A trailing `&` (nd_c bit2) backgrounds the command: spawn without
+    # waiting (do_wait=0), drop the child into its own process group,
+    # register a job, and print `[<id>] <pgid>`. The shell returns to
+    # the prompt immediately. The builtin-dispatch fast path inside
+    # run_one_command_x means a builtin with `&` just runs synchronously
+    # (returns a status, not a pid) — there's no child to background, so
+    # launch_background's pid<=0 guard makes that a harmless no-op.
+    # Is this an external command (vs an in-process builtin)? Only
+    # externals are real spawned children that job control applies to.
+    argc_pb: int32 = cast[int32](argv_n)
+    is_external: int32 = 0
+    if argc_pb >= 1:
+        cmd_pb: Ptr[uint8] = cast[Ptr[uint8]](argv_ptr[0])
+        if _builtin_dispatch_kind_check(cmd_pb) == 0:
+            is_external = 1
     if (nd_c[cast[uint64](node)] & 4) != 0:
-        run_one_command_x(node, -1, -1, 0, 1)
-        return 0
+        # `&`: a builtin with `&` just runs synchronously (no child to
+        # background); an external spawns into its own group as a job.
+        if is_external != 0:
+            bgpid: int32 = run_one_command_x(node, -1, -1, 0, 1)
+            launch_background(bgpid)
+            return 0
+        return run_one_command_x(node, -1, -1, 1, 1)
+    # Foreground: an external spawns do_wait=0 (we get the pid) then
+    # job-control-waits so Ctrl-Z can suspend it; a builtin runs in
+    # process as before.
+    if is_external != 0:
+        fgpid: int32 = run_one_command_x(node, -1, -1, 0, 1)
+        if fgpid < 0:
+            return 127
+        return launch_foreground_pid(fgpid)
     return run_one_command_x(node, -1, -1, 1, 1)
 
 
@@ -7707,6 +8072,11 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
             # Print the prompt and tell the editor its visible width so
             # it can place the cursor on redraw.
             if first_line != 0:
+                # Job control: before each fresh prompt, reap finished
+                # background jobs and print their `[<id>]+ Done <cmd>` /
+                # `Stopped` notices — POSIX shells report job status at
+                # the prompt, not asynchronously.
+                jobs_reap_and_report()
                 prompt()
                 ed_prompt_kind = 0
                 ed_prompt_len = 7

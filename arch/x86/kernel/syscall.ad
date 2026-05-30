@@ -34,6 +34,10 @@ from kernel.sched.core import (
     task_pid_at, task_reap, yield_to_others, STATE_EXITED,
     get_task_term_sig, copy_sig_state_to_child,
     dup_fd_to_child,
+    # Job control: process-group + stop/continue plumbing.
+    task_set_job_pgid, task_get_job_pgid, signal_post_to_pgid,
+    task_is_stopped, task_stop_sig, task_take_cont_pending,
+    set_terminal_fg_pgid, get_terminal_fg_pgid, STATE_STOPPED,
     signal_post, signal_check_and_handle, signal_deliver_on_return,
     get_cwd_buf, set_task_cwd, current_idx_get,
     set_linux_userspace_mode,
@@ -462,6 +466,24 @@ SYS_USERADD_ROOT: uint64 = 295  # a0=username; hostowner-only; returns 0/-errno
 #       enforces policy when it acts. Poll/read-out (0/7) are gated to
 #       hostowner (uid 1) since only PID 1 should drain the queue.
 SYS_SVC_CTL:      uint64 = 296  # a0=verb, a1=name, a2=cap; see above
+# Job control (hamsh fg/bg/jobs/Ctrl-Z). Three native primitives:
+#  SYS_SETPGID    — a0=pid (0=self), a1=pgid (0=use pid). Place the
+#                   task in process group a1; the shell calls it to put
+#                   a backgrounded pipeline in its own group. Returns 0
+#                   or -ESRCH.
+#  SYS_TCSETPGRP  — a0=pgid. Make a1 the terminal's FOREGROUND group:
+#                   Ctrl-C/Ctrl-Z then signal only that group. The
+#                   shell sets it to a job's pgid on fg, back to 1 when
+#                   the job exits/stops. pgid 0 → "no foreground job"
+#                   (bare-prompt; terminal signals are dropped). 0.
+#  SYS_WAITPID_JC — a0=pid, a1=&status (Ptr[int64]). Non-blocking
+#                   job-control wait: returns the pid and writes a
+#                   status word distinguishing EXITED / STOPPED /
+#                   CONTINUED; returns 0 when nothing to report. The
+#                   status encoding lives in the SYS_WAITPID_JC arm.
+SYS_SETPGID:     uint64 = 297  # a0=pid(0=self), a1=pgid(0=pid); returns 0/-ESRCH
+SYS_TCSETPGRP:   uint64 = 298  # a0=pgid; sets terminal foreground group; returns 0
+SYS_WAITPID_JC:  uint64 = 299  # a0=pid, a1=&status; non-blocking; returns pid/0
 # HAMSH §7: sys_spawn's stdin_fd / stdout_fd sentinel. When the caller
 # passes SPAWN_STDIO_NS, the child's standard streams are NAMES in its
 # namespace (/fd/0,1,2 via the `#d` device), not dup'd integer fds —
@@ -1988,14 +2010,104 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
             set_current_errstr("socketpair: out of fds")
         return cast[uint64](rc)
     if nr == SYS_KILL:
-        # a0 = target pid, a1 = signal number. Post into the target's
+        # a0 = target, a1 = signal number. Post into the target's
         # sig_pending bitmap; delivery happens on the target's next
-        # syscall return or yield. Returns 0 or -ESRCH if no such pid.
+        # syscall return or yield. Returns 0 or -ESRCH if no such target.
+        #
+        # Job control: a0 interpreted as a SIGNED value. A NEGATIVE a0
+        # is -pgid: deliver to EVERY member of process group |a0| —
+        # standard Unix kill(-pgid, sig). The shell uses this to
+        # SIGCONT/SIGTERM/SIGKILL a whole pipeline at once. PID 1 is
+        # never signalled by the group path (signal_post_to_pgid guards
+        # it). A positive a0 is a single pid as before.
+        a0_signed: int64 = cast[int64](a0)
+        if a0_signed < 0:
+            kpgid: uint64 = cast[uint64](-a0_signed)
+            khit: int32 = signal_post_to_pgid(kpgid, a1)
+            if khit == 0:
+                set_current_errstr("kill: no such process group")
+                return cast[uint64](-3)        # -ESRCH
+            return 0
         tgt: int32 = task_lookup_by_pid(a0)
         if tgt < 0:
             set_current_errstr("kill: no such pid")
             return cast[uint64](-3)            # -ESRCH
         signal_post(cast[uint64](tgt), a1)
+        return 0
+    if nr == SYS_SETPGID:
+        # a0 = pid (0 = self), a1 = pgid (0 = use the target's pid, i.e.
+        # the task becomes its own group leader). Job control: the shell
+        # calls this on a freshly-spawned child to drop it into a new
+        # process group before wiring the terminal foreground. Returns 0
+        # or -ESRCH.
+        sp_pid: uint64 = a0
+        if sp_pid == 0:
+            sp_pid = current_task_pid()
+        sp_slot: int32 = task_lookup_by_pid(sp_pid)
+        if sp_slot < 0:
+            set_current_errstr("setpgid: no such pid")
+            return cast[uint64](-3)            # -ESRCH
+        sp_pgid: uint64 = a1
+        if sp_pgid == 0:
+            sp_pgid = sp_pid
+        task_set_job_pgid(cast[uint64](sp_slot), sp_pgid)
+        return 0
+    if nr == SYS_TCSETPGRP:
+        # a0 = pgid to install as the terminal's foreground process
+        # group. Ctrl-C/Ctrl-Z (signal_post_to_foreground) then route
+        # only to this group. The shell sets it to a job's pgid when it
+        # foregrounds the job and back to its own pgid (1) when the job
+        # exits/stops. pgid 0 = "no foreground job" (terminal signals
+        # dropped at the bare prompt). Always succeeds.
+        set_terminal_fg_pgid(a0)
+        return 0
+    if nr == SYS_WAITPID_JC:
+        # Non-blocking job-control wait. a0 = pid, a1 = Ptr[int64]
+        # status. Returns the pid (>0) when there is something to
+        # report and writes a status word; returns 0 when the child is
+        # still running with nothing new; returns -ECHILD (-10) if the
+        # pid is unknown.
+        #
+        # Status word encoding (low byte = kind, high bytes = detail):
+        #   kind 0  WAITJC_RUNNING  — alive, nothing new (also rc 0)
+        #   kind 1  WAITJC_EXITED   — status>>8 & 0xFF = exit code; slot
+        #                             is REAPED here (freed).
+        #   kind 2  WAITJC_STOPPED  — status>>8 & 0xFF = stop signal
+        #                             (SIGTSTP/SIGSTOP/...); slot stays.
+        #   kind 3  WAITJC_CONTINUED— resumed since last report; slot
+        #                             stays. Reported once per resume.
+        jc_slot: int32 = task_lookup_by_pid(a0)
+        if jc_slot < 0:
+            set_current_errstr("waitjc: no such child")
+            return cast[uint64](-10)           # -ECHILD
+        jc_status_ptr: Ptr[int64] = cast[Ptr[int64]](a1)
+        jc_st: uint64 = task_state(jc_slot)
+        if jc_st == STATE_EXITED:
+            jc_code: int64 = task_exit_code(jc_slot)
+            task_reap(jc_slot)
+            if a1 != 0:
+                jc_status_ptr[0] = (cast[int64](jc_code & 0xFF) << 8) \
+                                 | cast[int64](1)        # WAITJC_EXITED
+            return a0
+        if jc_st == STATE_STOPPED:
+            # Report the stop exactly once: clear cont_pending so a
+            # later resume re-reports, but the STOPPED state itself is
+            # idempotent here — the shell already printed "Stopped" on
+            # the Ctrl-Z that set it, then polls; re-reporting STOPPED
+            # is harmless and the shell de-dups by job state.
+            jc_ssig: uint64 = task_stop_sig(jc_slot)
+            if a1 != 0:
+                jc_status_ptr[0] = (cast[int64](jc_ssig) << 8) \
+                                 | cast[int64](2)        # WAITJC_STOPPED
+            return a0
+        # Running. Surface a one-shot CONTINUED report if a SIGCONT
+        # resumed it since the shell last looked.
+        if task_take_cont_pending(jc_slot) != 0:
+            if a1 != 0:
+                jc_status_ptr[0] = cast[int64](3)        # WAITJC_CONTINUED
+            return a0
+        if a1 != 0:
+            jc_status_ptr[0] = cast[int64](0)            # WAITJC_RUNNING
         return 0
     if nr == SYS_DUP:
         rc: int32 = vfs_dup(cast[int32](a0))

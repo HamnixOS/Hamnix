@@ -454,6 +454,46 @@ sys_kill:
     .size sys_kill, .-sys_kill
 
 
+    /* --- sys_setpgid(pid, pgid) -> int32 -----------------------------
+     * Job control: place `pid` (0 = self) in process group `pgid`
+     * (0 = use pid). pid in %edi, pgid in %esi — already the right
+     * (a0,a1) registers, no shuffle. Returns 0 or -ESRCH. */
+    .globl sys_setpgid
+    .type sys_setpgid, @function
+sys_setpgid:
+    movq    $297, %rax              /* SYS_SETPGID */
+    syscall
+    ret
+    .size sys_setpgid, .-sys_setpgid
+
+
+    /* --- sys_tcsetpgrp(pgid) -> int32 --------------------------------
+     * Job control: make `pgid` the terminal's foreground process
+     * group, so Ctrl-C/Ctrl-Z route only there. pgid in %edi = a0.
+     * Always returns 0. */
+    .globl sys_tcsetpgrp
+    .type sys_tcsetpgrp, @function
+sys_tcsetpgrp:
+    movq    $298, %rax              /* SYS_TCSETPGRP */
+    syscall
+    ret
+    .size sys_tcsetpgrp, .-sys_tcsetpgrp
+
+
+    /* --- sys_waitpid_jc(pid, status) -> int64 ------------------------
+     * Job control: non-blocking wait reporting EXITED / STOPPED /
+     * CONTINUED. pid in %edi = a0, &status (int64*) in %rsi = a1 —
+     * already the right registers. Returns the pid (>0) when there is
+     * something to report, 0 when nothing new, -ECHILD on bad pid. */
+    .globl sys_waitpid_jc
+    .type sys_waitpid_jc, @function
+sys_waitpid_jc:
+    movq    $299, %rax              /* SYS_WAITPID_JC */
+    syscall
+    ret
+    .size sys_waitpid_jc, .-sys_waitpid_jc
+
+
     /* --- sys_dup(oldfd) -> int32 -------------------------------------
      * Allocate the smallest free fd; copy oldfd's backing into it.
      * Pipe refcounts get bumped so closing oldfd later doesn't
