@@ -22,7 +22,7 @@
 # the CPU to a sibling when the current task tears down.
 
 from mm.memblock import memblock_alloc
-from mm.page_alloc import alloc_page, alloc_pages
+from mm.page_alloc import alloc_page, alloc_pages, free_page, free_pages, region_free
 from mm.slab import kfree
 from mm.cow import cow_boot_cr3
 from kernel.printk.printk import printk0, printk1, printk2, printk_set_level
@@ -402,6 +402,26 @@ class TaskStruct:
     # the parent has not yet observed it via the wait path. wait-status
     # decoding turns this into a "Continued" report. Cleared on read.
     cont_pending:   uint64            # offset 2208
+    # Resource-reclaim bookkeeping (task_reap). image_phys / image_phys_sz
+    # record the PHYSICAL backing region the ELF loader carved for this
+    # task's binary image (via region_alloc) and its byte size, so
+    # task_reap can hand the region back via region_free. Distinct from
+    # image_lo/image_hi above, which are the VIRTUAL span — for an ET_EXEC
+    # binary the physical region != the virtual address, so we must track
+    # the physical base separately to free it. 0 ⇒ no reclaimable image
+    # (kernel thread, or a slot that never loaded an ELF). Set by
+    # SYS_SPAWN / do_execve right after create_user_task_argv returns.
+    # Placed at the END of TaskStruct so it shifts no earlier offset.
+    image_phys:     uint64            # offset 2216
+    image_phys_sz:  uint64            # offset 2224
+    # Owner-only user-stack reclaim. Like image_phys, set ONLY on the
+    # task that actually alloc_pages'd the stack (SYS_SPAWN / do_execve)
+    # and DELIBERATELY left 0 on fork children — a fork child COW-shares
+    # the parent's ustack_lo/sz region, so freeing it from the child
+    # would double-free the live parent stack. task_reap frees the stack
+    # only via this owner field, never via the COW-shared ustack_lo/sz.
+    ustack_phys:    uint64            # offset 2232
+    ustack_phys_sz: uint64            # offset 2240
 
 
 # State constants (mirror Linux's task->state space at a tiny scope).
@@ -745,6 +765,10 @@ def kthread_create(entry: uint64, name0: uint64) -> int32:
     task_table[s].image_hi  = 0
     task_table[s].ustack_lo = 0
     task_table[s].ustack_sz = 0
+    task_table[s].image_phys     = 0
+    task_table[s].image_phys_sz  = 0
+    task_table[s].ustack_phys    = 0
+    task_table[s].ustack_phys_sz = 0
     # §1 / rfork RFNOWAIT: every fresh task starts attached (reapable).
     task_table[s].detached  = 0
     # M16.109: Plan 9 note state. Kernel threads never call notify(2)
@@ -982,6 +1006,17 @@ def create_user_thread(entry: uint64, name0: uint64,
     # default. do_rfork sets detached=1 after this returns when the
     # RFNOWAIT bit asked to sever the parent link.
     task_table[s].detached = 0
+    # Resource-reclaim owner fields (task_reap). Always 0 on a fresh
+    # slot — a STATE_FREE slot reused from a prior tenant must NOT carry
+    # the previous occupant's image/ustack physical bases (task_reap
+    # already freed those), or the next reap would double-free. The
+    # allocating syscall (SYS_SPAWN / do_execve) sets them after this
+    # returns; fork children DELIBERATELY leave them 0 (they COW-share,
+    # they don't own).
+    task_table[s].image_phys     = 0
+    task_table[s].image_phys_sz  = 0
+    task_table[s].ustack_phys    = 0
+    task_table[s].ustack_phys_sz = 0
     # M16.109: Plan 9 note state — every fresh user task starts with
     # NO handler installed (note_handler_rip=0). notify(2) installs
     # the handler at first use. Forking does NOT inherit the parent's
@@ -1585,13 +1620,124 @@ def task_exit_code(slot: int32) -> int64:
     return task_table[cast[uint64](slot)].exit_code
 
 
+def _free_task_user_pagetables(su: uint64):
+    # Free the PRIVATE lower-level page tables this task cracked into
+    # its per-task PML4 (the PDPT/PD/PT pages elf_install_user_mapping
+    # allocated). We walk only the USER half (PML4 indices 0..255) and
+    # free a sub-table page ONLY when this task's PML4 entry differs
+    # from the pristine boot PML4's entry at that index — i.e. it is a
+    # private clone, not the still-shared boot table. The leaf data
+    # pages (the ELF image region + the user stack) are freed
+    # separately via region_free / free_pages, so here we free table
+    # pages only, never leaf frames.
+    cr3: uint64 = task_table[su].cr3
+    if cr3 == 0:
+        return
+    boot_cr3: uint64 = cow_boot_cr3()
+    if boot_cr3 == 0:
+        return
+    PT_ADDR: uint64 = 0x000FFFFFFFFFF000
+    PT_PS:   uint64 = 0x80
+    PT_P:    uint64 = 0x1
+    pml4: Ptr[uint64] = cast[Ptr[uint64]](cr3 & PT_ADDR)
+    bpml4: Ptr[uint64] = cast[Ptr[uint64]](boot_cr3 & PT_ADDR)
+    li: uint64 = 0
+    while li < 256:
+        e: uint64 = pml4[li]
+        be: uint64 = bpml4[li]
+        # Private PDPT for this task? (present, and not the shared boot
+        # entry at this index)
+        if (e & PT_P) != 0 and e != be:
+            pdpt_phys: uint64 = e & PT_ADDR
+            bpdpt_phys: uint64 = be & PT_ADDR
+            pdpt: Ptr[uint64] = cast[Ptr[uint64]](pdpt_phys)
+            bpdpt: Ptr[uint64] = cast[Ptr[uint64]](bpdpt_phys)
+            pi: uint64 = 0
+            while pi < 512:
+                pe: uint64 = pdpt[pi]
+                bpe: uint64 = 0
+                if (be & PT_P) != 0:
+                    bpe = bpdpt[pi]
+                # A private, present, non-1GiB PD page?
+                if (pe & PT_P) != 0 and (pe & PT_PS) == 0 and pe != bpe:
+                    pd_phys: uint64 = pe & PT_ADDR
+                    pd: Ptr[uint64] = cast[Ptr[uint64]](pd_phys)
+                    di: uint64 = 0
+                    while di < 512:
+                        de: uint64 = pd[di]
+                        # A private, present, non-2MiB PT page?
+                        if (de & PT_P) != 0 and (de & PT_PS) == 0:
+                            free_page(de & PT_ADDR)
+                        di = di + 1
+                    free_page(pd_phys)
+                pi = pi + 1
+            free_page(pdpt_phys)
+        li = li + 1
+
+
 def task_reap(slot: int32):
-    # Caller has consumed the exit code; mark the slot FREE so a
-    # future create_user_task can claim it. Stacks are still leaked
-    # (no kfree path for kstack/ustack yet — separate slab work),
-    # but the slot is reusable.
+    # Caller has consumed the exit code; mark the slot FREE so a future
+    # create_user_task can claim it AND reclaim the dead task's private
+    # memory so the spawn pool doesn't bleed.
+    #
+    # RECLAIM (root-cause fix for the "command not found after ~6 hpm
+    # spawns" leak): every foreground spawn carved a per-task ELF image
+    # region (region_alloc, up to ~14.7 MiB for a big native binary), a
+    # 256 KiB user stack, a 16 KiB kernel stack, a 4 KiB PML4, and the
+    # private lower-level page tables that mapped them. None of these
+    # were ever freed; after a handful of large spawns the 240 MiB pool
+    # was exhausted and the next sys_spawn's region alloc returned 0 ->
+    # ENOEXEC -> hamsh reported "command not found". task_reap is the
+    # single chokepoint EVERY normal reap funnels through (do_wait4 /
+    # SYS_WAITPID / SYS_WAITPID_JC / the spawn-failure cleanups), and it
+    # runs in the PARENT's context with the child fully STATE_EXITED —
+    # never on the child's own stack — so freeing the child's stacks
+    # here is safe.
     su: uint64 = cast[uint64](slot)
+    # 1. ELF image region (physical) — back to the region pool.
+    if task_table[su].image_phys != 0:
+        region_free(task_table[su].image_phys,
+                    task_table[su].image_phys_sz)
+        task_table[su].image_phys    = 0
+        task_table[su].image_phys_sz = 0
+    # 2. User stack — owner-only. ustack_phys is set ONLY on the task
+    #    that allocated the stack (SYS_SPAWN / do_execve); a fork child
+    #    COW-shares the region (ustack_lo/sz) but has ustack_phys == 0,
+    #    so it never double-frees the parent's live stack. A native
+    #    create_user_thread that allocated its own 4 KiB page records it
+    #    in ustack_base; free that too (threads don't COW-share it).
+    if task_table[su].ustack_phys != 0:
+        free_pages(task_table[su].ustack_phys,
+                   _order_for_bytes(task_table[su].ustack_phys_sz))
+        task_table[su].ustack_phys    = 0
+        task_table[su].ustack_phys_sz = 0
+    elif task_table[su].ustack_base != 0:
+        free_page(task_table[su].ustack_base)
+        task_table[su].ustack_base = 0
+    # 3. Private user-half page tables (PDPT/PD/PT), then the PML4 page.
+    if task_table[su].cr3 != 0:
+        _free_task_user_pagetables(su)
+        free_page(task_table[su].cr3 & 0x000FFFFFFFFFF000)
+        task_table[su].cr3 = 0
+    # 4. Kernel stack (user-task kstacks come from alloc_pages; kthread
+    #    kstacks come from memblock and have is_user==0 — skip those).
+    if task_table[su].is_user != 0 and task_table[su].kstack_base != 0:
+        free_pages(task_table[su].kstack_base, KSTACK_ORDER)
+        task_table[su].kstack_base = 0
     task_table[su].state = STATE_FREE
+
+
+def _order_for_bytes(nbytes: uint64) -> int32:
+    # Smallest buddy order whose run (2^order pages) covers nbytes.
+    # Matches how the allocation was sized (alloc_pages(order)). For the
+    # 256 KiB SYS_SPAWN stack this returns 6; a 4 KiB page returns 0.
+    pages: uint64 = (nbytes + 4095) >> 12
+    order: int32 = 0
+    cap: uint64 = 1
+    while cap < pages:
+        cap = cap << 1
+        order = order + 1
+    return order
 
 
 def task_pid_at(slot: int32) -> uint64:
@@ -2874,6 +3020,22 @@ def task_ustack_sz(slot: uint64) -> uint64:
 def set_task_ustack_range(slot: uint64, lo: uint64, sz: uint64):
     task_table[slot].ustack_lo = lo
     task_table[slot].ustack_sz = sz
+
+
+# Resource-reclaim OWNER accessors. The allocating syscall (SYS_SPAWN /
+# do_execve) calls these to record the physical ELF image region and
+# physical user-stack region it allocated so task_reap can hand them
+# back. NOT propagated by do_clone — a fork child COW-shares both and
+# must keep these 0 so it never double-frees the live parent regions.
+
+def set_task_image_phys(slot: uint64, phys: uint64, sz: uint64):
+    task_table[slot].image_phys    = phys
+    task_table[slot].image_phys_sz = sz
+
+
+def set_task_ustack_phys(slot: uint64, phys: uint64, sz: uint64):
+    task_table[slot].ustack_phys    = phys
+    task_table[slot].ustack_phys_sz = sz
 
 
 # §1 / rfork RFNOWAIT: detach accessors. set_task_detached(slot, 1)
