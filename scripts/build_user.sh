@@ -142,7 +142,8 @@ build_adder_user su                   # switch user: /dev/auth verify + SYS_SETU
 build_adder_user passwd               # set password via hostowner-gated /dev/auth setpass
 build_adder_user useradd              # per-user home FILE SERVER on the shared ext4 root (docs/security.md)
 build_adder_user login                # real login: /dev/auth verify + identity change + exec shell
-build_adder_user getty                # M16.87: announces + exec /bin/hamsh
+build_adder_user getty                # M16.87: VT-aware getty: opens /dev/vt/N then exec /bin/hamsh
+build_adder_user chvt                 # VT: switch active virtual terminal (writes to /dev/vt/ctl)
 # distrorun RETIRED: the distro-shape namespace is no longer a bespoke
 # launcher binary. /etc/rc.boot defines it as a captured `ns clean {}`
 # value (`linux`, with a `debian` alias for the same body); a Linux
