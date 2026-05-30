@@ -128,7 +128,7 @@ qemu-system-x86_64 \
     -device qemu-xhci,id=xhci \
     -drive if=none,format=raw,file="$IMG_RW",id=usbstick \
     -device usb-storage,bus=xhci.0,drive=usbstick \
-    -m 1G \
+    -m "${HAMNIX_QEMU_MEM:-1G}" \
     -nographic -no-reboot -monitor none \
     -serial stdio \
     <&4 > "$LOG" 2>&1 &
