@@ -95,11 +95,9 @@ CASES=(
     a, b = b, a
     return a
 "
-"compound_assign|def main() -> int32:
-    x: int32 = 0
-    x += 1
-    return x
-"
+# NOTE: compound assignment (+=, -=, *=, |=, &=, ^=, <<=, >>=) IS
+# now implemented in the x86_64 codegen — see
+# scripts/test_compiler_augmented_assign.sh.
 "global_stmt|counter: int64 = 0
 def main() -> int32:
     global counter

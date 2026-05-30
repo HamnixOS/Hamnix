@@ -51,6 +51,8 @@ TESTS=(
     "ptr_arith_scaled:bash scripts/test_compiler_ptr_arith_scaled.sh"
     "percpu_aggregate:bash scripts/test_compiler_percpu_aggregate.sh"
     "unsupported_rejected:bash scripts/test_compiler_unsupported_rejected.sh"
+    "string_concat:bash scripts/test_compiler_string_concat.sh"
+    "augmented_assign:bash scripts/test_compiler_augmented_assign.sh"
 )
 
 results=()

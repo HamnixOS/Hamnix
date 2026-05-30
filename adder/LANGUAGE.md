@@ -107,8 +107,9 @@ NUL-terminated byte sequence in `.rodata` and are referenced through
 RIP-relative `leaq`. Triple-quoted strings are supported. Escapes:
 `\n`, `\t`, `\r`, `\b`, `\\`, `\'`, `\"`, `\0`, `\xNN`.
 
-Adjacent string-literal concatenation (`"foo " "bar"`) is **not**
-supported — use a single literal or build the string at runtime.
+Adjacent string-literal concatenation works: `"foo " "bar"` is exactly
+the same as `"foo bar"`. Any number of adjacent `STRING` tokens are
+joined into one literal at parse time, just like C and Python.
 
 ### Reserved words
 
@@ -256,14 +257,55 @@ a = b
 b = tmp
 ```
 
-Compound assignment operators (`+=`, `-=`, `*=`, `|=`, ...) are also
-not supported — the codegen rejects them with
-`x86: compound assignment '+=' not yet supported`. Spell it out:
+### Compound / augmented assignment operators
+
+All ten compound-assignment operators are supported and desugar to a
+read-modify-write at codegen time:
+
+| Operator | Meaning          |
+|----------|------------------|
+| `+=`     | add              |
+| `-=`     | subtract         |
+| `*=`     | multiply         |
+| `/=`     | divide (signed)  |
+| `%=`     | modulo (signed)  |
+| `&=`     | bitwise AND      |
+| `\|=`    | bitwise OR       |
+| `^=`     | bitwise XOR      |
+| `<<=`    | left shift       |
+| `>>=`    | arithmetic right shift |
+
+They work on `Identifier`, `MemberExpr` (struct-field), and `IndexExpr`
+(array/pointer-index) targets. For non-identifier targets the address is
+computed once (avoiding double-evaluation of the index expression).
 
 ```python
-x = x + 1                            # NOT x += 1
-flags = flags | MASK                 # NOT flags |= MASK
+x: int32 = 0
+x += 5              # x = x + 5 = 5
+flags: uint32 = 0
+flags |= 0xFF       # flags = 0xFF
+flags &= 0x0F       # flags = 0x0F
+flags ^= 0x05       # flags = 0x0A
+n: int32 = 8
+n >>= 1             # n = 4
+n <<= 2             # n = 16
+
+# Struct field compound assignment
+p: Point
+p.x = 10
+p.x += 5            # p.x = 15
+
+# Array index compound assignment
+arr: Array[4, int32]
+arr[2] = 3
+arr[2] *= 7         # arr[2] = 21
 ```
+
+Note: `/=`, `%=`, and `>>=` use signed arithmetic internally. For
+unsigned right-shift on unsigned types write `x = cast[uint32](x) >> n`.
+
+Regression fixture: `tests/test_compiler_augmented_assign.ad` +
+`scripts/test_compiler_augmented_assign.sh`.
 
 ### Globals
 
@@ -1100,7 +1142,6 @@ rejects it.
 | Feature | Status | Use instead |
 |---|---|---|
 | Tuple-unpacking assignment (`a, b = b, a`) | Codegen rejects `TupleUnpackAssign`. | Use a temporary: `tmp = a; a = b; b = tmp`. |
-| Compound assignment (`+=`, `-=`, `*=`, `\|=`, `&=`, `^=`, `<<=`, `>>=`) | Codegen rejects with `x86: compound assignment '+=' not yet supported`. | Spell out: `x = x + 1`. |
 | `global x` / `nonlocal x` statements | Codegen rejects `GlobalStmt`. Not needed anyway — bare names that aren't locals resolve to globals automatically. | Write `counter = counter + 1` without a `global` declaration. |
 | `is` / `is not` operators | Codegen rejects with `binary op BinOp.IS not yet supported` / `BinOp.IS_NOT not yet supported`. | `==` / `!=`. |
 | `in` / `not in` operators (membership test) | Parser accepts inside `for ... in`; the binary-op form rejects (codegen errors with `binary op BinOp.IN not yet supported` / `BinOp.NOT_IN not yet supported`). | Walk the container by index and compare. |

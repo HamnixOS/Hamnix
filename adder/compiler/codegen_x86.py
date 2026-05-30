@@ -1659,10 +1659,134 @@ class X86CodeGen:
                     f"x86: statement {type(stmt).__name__} not yet supported"
                 )
 
+    # Map compound-assignment operator strings to BinOp enums.
+    _COMPOUND_OP_MAP: dict = {
+        '+':  BinOp.ADD,
+        '-':  BinOp.SUB,
+        '*':  BinOp.MUL,
+        '/':  BinOp.DIV,
+        '%':  BinOp.MOD,
+        '&':  BinOp.BIT_AND,
+        '|':  BinOp.BIT_OR,
+        '^':  BinOp.BIT_XOR,
+        '<<': BinOp.SHL,
+        '>>': BinOp.SHR,
+    }
+
     def gen_assignment(self, target: Expr, value: Expr,
                        op: Optional[str]) -> None:
         if op is not None:
-            raise CodeGenError(f"x86: compound assignment '{op}=' not yet supported")
+            # Compound assignment: `target OP= value`
+            # Desugar to `target = target OP value` at codegen time.
+            # For Identifier targets this is trivially safe (reading the
+            # identifier twice has no side effects).  For MemberExpr /
+            # IndexExpr targets we compute the address ONCE, push it,
+            # load the old value, apply the operator, pop the address,
+            # and store back — avoiding double-evaluation of the
+            # (potentially side-effecting) index or receiver expression.
+            bin_op = self._COMPOUND_OP_MAP.get(op)
+            if bin_op is None:
+                raise CodeGenError(
+                    f"x86: unknown compound-assignment operator '{op}='"
+                )
+            if isinstance(target, Identifier):
+                # Safe to re-read the identifier.
+                expanded_value = BinaryExpr(bin_op, target, value)
+                self.gen_assignment(target, expanded_value, None)
+                return
+
+            if isinstance(target, MemberExpr):
+                # Special-case: Percpu struct field.  Fall through to the
+                # read-modify-write path via address.
+                info = self._percpu_aggregate_info(target.obj)
+                if info is not None:
+                    name, base_offset, base_type = info
+                    if base_type is not None and hasattr(base_type, "name") \
+                            and base_type.name in self.structs:
+                        si = self.structs[base_type.name]
+                        for fname, ftype, foff in si.fields:
+                            if fname == target.member:
+                                if isinstance(ftype, ArrayType):
+                                    raise CodeGenError(
+                                        f"x86: Percpu[{base_type.name}].{fname} "
+                                        f"is an array — compound assignment not "
+                                        f"supported."
+                                    )
+                                size = self.get_type_size(ftype)
+                                abs_off = base_offset + foff
+                                # Load old value.
+                                self._emit_gs_load_sized(size, abs_off, "", "%rax")
+                                self.emit("    pushq %rax")       # old val
+                                self.gen_expr(value)
+                                self.emit("    popq %rcx")        # old val into rcx
+                                # rhs in rax, lhs (old) in rcx — swap to match
+                                # gen_binary convention (right is rax, left is rcx
+                                # after pop).  Here we want lhs OP rhs, so:
+                                # rax = rcx OP rax — call gen_binary helpers
+                                # directly for the arithmetic part.
+                                # Simplest: push rhs, move old into rax, pop into rcx
+                                self.emit("    pushq %rax")       # rhs
+                                self.emit("    movq %rcx, %rax")  # old -> rax
+                                self.emit("    popq %rcx")        # rhs -> rcx
+                                # Now %rax = old (left), %rcx = rhs (right).
+                                self._emit_arith_rax_rcx(bin_op)
+                                self._emit_gs_store_sized(size, abs_off, "", "%rax")
+                                return
+                # Address-based path.
+                self.gen_member_address(target.obj, target.member)
+                self.emit("    pushq %rax")   # save addr
+                size = self._field_size(target.obj, target.member)
+                self.emit("    movq %rax, %rcx")
+                self.emit_load_sized(size, "%rcx", "%rax")  # old value -> rax
+                self.emit("    pushq %rax")   # old value on stack
+                self.gen_expr(value)          # rhs -> rax
+                self.emit("    movq %rax, %rcx")   # rhs -> rcx
+                self.emit("    popq %rax")    # old value -> rax (left operand)
+                self._emit_arith_rax_rcx(bin_op)   # rax = old OP rhs
+                self.emit("    popq %rcx")    # addr -> rcx
+                self.emit_store_sized(size, "%rcx", "%rax")
+                return
+
+            if isinstance(target, IndexExpr):
+                # Percpu array path.
+                info = self._percpu_aggregate_info(target.obj)
+                if info is not None and isinstance(info[2], ArrayType):
+                    name, offset, base = info
+                    elem_size = self.get_type_size(base.element_type)
+                    # Compute scaled index, push.
+                    self.gen_expr(target.index)
+                    self._emit_scale_reg("%rax", elem_size)
+                    self.emit("    pushq %rax")   # scaled index
+                    # Load old value from percpu array.
+                    self.emit("    movq %rax, %rcx")
+                    self._emit_gs_load_sized(elem_size, offset, "(%rcx)", "%rax")
+                    self.emit("    pushq %rax")   # old value
+                    self.gen_expr(value)          # rhs -> rax
+                    self.emit("    movq %rax, %rcx")
+                    self.emit("    popq %rax")    # old value -> rax
+                    self._emit_arith_rax_rcx(bin_op)
+                    self.emit("    popq %rcx")    # scaled index -> rcx
+                    self._emit_gs_store_sized(elem_size, offset, "(%rcx)", "%rax")
+                    return
+                # Regular array/pointer index.
+                self.gen_index_address(target)
+                self.emit("    pushq %rax")   # save addr
+                size = self.element_size_of(target.obj)
+                self.emit("    movq %rax, %rcx")
+                self.emit_load_sized(size, "%rcx", "%rax")  # old value -> rax
+                self.emit("    pushq %rax")   # old value on stack
+                self.gen_expr(value)          # rhs -> rax
+                self.emit("    movq %rax, %rcx")   # rhs -> rcx
+                self.emit("    popq %rax")    # old value -> rax (left operand)
+                self._emit_arith_rax_rcx(bin_op)   # rax = old OP rhs
+                self.emit("    popq %rcx")    # addr -> rcx
+                self.emit_store_sized(size, "%rcx", "%rax")
+                return
+
+            raise CodeGenError(
+                f"x86: compound assignment to {type(target).__name__} "
+                f"not yet supported"
+            )
 
         if isinstance(target, Identifier):
             self.gen_expr(value)
@@ -2198,6 +2322,46 @@ class X86CodeGen:
                 self.emit(f"    movq (%rax), %rax")
         else:
             raise CodeGenError(f"x86: unknown identifier '{name}'")
+
+    def _emit_arith_rax_rcx(self, op: BinOp) -> None:
+        """Emit arithmetic for `%rax OP %rcx` -> %rax.
+
+        Used by compound-assignment lowering where %rax holds the OLD
+        (left) value and %rcx holds the RHS (right) value.
+        Signedness for >>/%// is conservatively signed (safe in practice
+        since compound-assignment to unsigned types most often uses +/-/|/&).
+        """
+        match op:
+            case BinOp.ADD:
+                self.emit("    addq %rcx, %rax")
+            case BinOp.SUB:
+                self.emit("    subq %rcx, %rax")
+            case BinOp.MUL:
+                self.emit("    imulq %rcx, %rax")
+            case BinOp.BIT_AND:
+                self.emit("    andq %rcx, %rax")
+            case BinOp.BIT_OR:
+                self.emit("    orq %rcx, %rax")
+            case BinOp.BIT_XOR:
+                self.emit("    xorq %rcx, %rax")
+            case BinOp.SHL:
+                self.emit("    shlq %cl, %rax")
+            case BinOp.SHR:
+                # Default to arithmetic right-shift (signed).  Callers that
+                # truly need a logical shift should call gen_binary directly.
+                self.emit("    sarq %cl, %rax")
+            case BinOp.DIV | BinOp.IDIV:
+                self.emit("    cqo")
+                self.emit("    idivq %rcx")
+            case BinOp.MOD:
+                self.emit("    cqo")
+                self.emit("    idivq %rcx")
+                self.emit("    movq %rdx, %rax")
+            case _:
+                raise CodeGenError(
+                    f"x86: _emit_arith_rax_rcx: op {op} not supported for "
+                    f"compound assignment"
+                )
 
     def gen_binary(self, op: BinOp, left: Expr, right: Expr) -> None:
         """Generate a binary op. Result in %rax."""

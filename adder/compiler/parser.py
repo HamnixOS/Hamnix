@@ -527,7 +527,14 @@ class Parser:
             return IntLiteral(tok.value, self.make_span(tok))
 
         if self.match(TokenType.STRING):
-            return StringLiteral(tok.value, self.make_span(tok))
+            # Adjacent string literal concatenation: "foo" "bar" -> "foobar"
+            # Consume as many immediately-following STRING tokens as exist and
+            # join their values — the same rule as C and Python.
+            combined = tok.value
+            while self.check(TokenType.STRING):
+                combined = combined + self.current().value
+                self.advance()
+            return StringLiteral(combined, self.make_span(tok))
 
         if self.match(TokenType.FSTRING):
             return FStringLiteral(tok.value, self.make_span(tok))
