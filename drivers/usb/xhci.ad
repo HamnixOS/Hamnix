@@ -198,6 +198,10 @@ XHCI_PORTSC_W1C_MASK: uint32 = 0x00FE0000
 # 3=HighSpeed, 4=SuperSpeed.
 XHCI_PORTSC_SPEED_SHIFT: uint32 = 10
 XHCI_PORTSC_SPEED_MASK:  uint32 = 0xF
+# Port Link State lives in bits 8..5 (4 bits). PLS=0 is U0/Enabled,
+# PLS=7 is Polling. Only meaningful for diagnostics here.
+XHCI_PORTSC_PLS_SHIFT:   uint32 = 5
+XHCI_PORTSC_PLS_MASK:    uint32 = 0xF
 
 
 # --- Runtime / interrupter register block (RTSOFF) ----------------
@@ -1316,27 +1320,87 @@ def _xhci_v1_bringup() -> int32:
 # --- Slot + endpoint lifecycle -----------------------------------
 
 def _xhci_port_reset(port: uint32) -> int32:
-    # PR bit triggers a USB-bus-level reset on a port. After reset
-    # PED (Port Enabled) becomes 1 for USB 2.x devices. SuperSpeed
-    # ports auto-enable on link training and don't need PR.
+    # Drive a root-hub port through the connect -> reset -> enable
+    # handshake. On a real xHC the device may sit with the link parked
+    # at PLS=Polling and the Connect-Status-Change (CSC) bit latched;
+    # the controller will NOT enable the port (PED stays 0) until we
+    # acknowledge the change and explicitly assert Port Reset (PR).
+    # QEMU's emulated xHC effectively presents the USB2 port enabled on
+    # attach, which is why this path is a no-op-equivalent there but is
+    # mandatory on real silicon. After a successful reset PED becomes 1
+    # for USB 2.x and the link trains to U0 (PLS=0).
     port_addr: uint64 = xhci.op_base + XHCI_PORT_BASE \
                       + cast[uint64](port - 1) * XHCI_PORT_STRIDE \
                       + XHCI_PORT_PORTSC
-    portsc: uint32 = _xhci_r32(port_addr) & ~XHCI_PORTSC_W1C_MASK
-    _xhci_w32(port_addr, portsc | XHCI_PORTSC_PR)
-    # Wait for PRC (Port Reset Change) to set, indicating the reset
-    # completed. Budget: ~50 ms equivalent in spin cycles.
+    pre: uint32 = _xhci_r32(port_addr)
+    printk2("[xhci] port %d reset start PORTSC=%x\n",
+            cast[uint64](port), cast[uint64](pre))
+
+    # If the port is already enabled (PED=1) — e.g. QEMU's USB2 port
+    # that came up enabled on attach — we still acknowledge any latched
+    # change bits but skip asserting PR: re-resetting an already-usable
+    # port is unnecessary, and on some controllers a redundant reset
+    # bounces the link. This keeps the emulated boot path identical.
+    if (pre & XHCI_PORTSC_PED) != 0:
+        if (pre & XHCI_PORTSC_W1C_MASK) != 0:
+            keep0: uint32 = pre & ~XHCI_PORTSC_W1C_MASK
+            _xhci_w32(port_addr, keep0 | (pre & XHCI_PORTSC_W1C_MASK))
+        post0: uint32 = _xhci_r32(port_addr)
+        _xhci_port_reset_report(port, post0)
+        return 0
+
+    # Acknowledge ALL latched change bits (CSC, PRC, etc.) by writing
+    # them back set, while preserving the non-W1C bits. Without this the
+    # latched CSC on real HW keeps the port-change machinery from
+    # advancing the reset.
+    if (pre & XHCI_PORTSC_W1C_MASK) != 0:
+        keep1: uint32 = pre & ~XHCI_PORTSC_W1C_MASK
+        _xhci_w32(port_addr, keep1 | (pre & XHCI_PORTSC_W1C_MASK))
+
+    # Assert Port Reset. Re-read so we don't carry stale W1C bits, mask
+    # them off, then set PR.
+    base: uint32 = _xhci_r32(port_addr) & ~XHCI_PORTSC_W1C_MASK
+    _xhci_w32(port_addr, base | XHCI_PORTSC_PR)
+
+    # Wait for the reset to complete: hardware clears PR and sets PRC
+    # (Port Reset Change). Real silicon can take a while to train; budget
+    # ~50 ms equivalent in spin cycles. Exit on PRC set AND PR clear.
     spin: uint64 = 0
     while spin < 5000000:
         p2: uint32 = _xhci_r32(port_addr)
-        if (p2 & XHCI_PORTSC_PRC) != 0:
+        if (p2 & XHCI_PORTSC_PRC) != 0 and (p2 & XHCI_PORTSC_PR) == 0:
             # Clear PRC (RW1C) without disturbing other bits.
-            keep: uint32 = p2 & ~XHCI_PORTSC_W1C_MASK
-            _xhci_w32(port_addr, keep | XHCI_PORTSC_PRC)
+            keep2: uint32 = p2 & ~XHCI_PORTSC_W1C_MASK
+            _xhci_w32(port_addr, keep2 | XHCI_PORTSC_PRC)
+            post: uint32 = _xhci_r32(port_addr)
+            _xhci_port_reset_report(port, post)
+            if (post & XHCI_PORTSC_PED) == 0:
+                # Reset completed but the port did not enable. Treat as a
+                # failure so the caller skips this port (e.g. a bare hub
+                # downstream port with nothing addressable behind it).
+                printk1("[xhci] port %d reset done but PED=0\n",
+                        cast[uint64](port))
+                return -1
             return 0
         spin = spin + 1
+    fail: uint32 = _xhci_r32(port_addr)
+    _xhci_port_reset_report(port, fail)
     printk1("[xhci] port %d reset timeout\n", cast[uint64](port))
     return -1
+
+
+def _xhci_port_reset_report(port: uint32, portsc: uint32):
+    # Compact post-reset telemetry so the next real-HW photo is
+    # decisive: PED/PLS/speed plus the raw PORTSC. Split across two
+    # printk2 calls (printk takes at most two args).
+    ped:   uint32 = (portsc & XHCI_PORTSC_PED) >> 1
+    pls:   uint32 = (portsc >> XHCI_PORTSC_PLS_SHIFT) & XHCI_PORTSC_PLS_MASK
+    speed: uint32 = (portsc >> XHCI_PORTSC_SPEED_SHIFT) \
+                  & XHCI_PORTSC_SPEED_MASK
+    printk2("[xhci] port %d reset -> PED=%d", cast[uint64](port),
+            cast[uint64](ped))
+    printk2(" PLS=%d speed=%d", cast[uint64](pls), cast[uint64](speed))
+    printk1(" PORTSC=%x\n", cast[uint64](portsc))
 
 
 def _xhci_speed_to_psi(speed: uint32) -> uint32:
@@ -2038,12 +2102,32 @@ def _xhci_attach_mass_storage_locked(target_port: uint32,
                                      target_speed: uint32) -> uint32:
     printk2("[usbms] attaching storage at port=%d speed=%d\n",
             cast[uint64](target_port), cast[uint64](target_speed))
+    # Clear any partial state left by a prior port that reset OK but
+    # turned out not to be the mass-storage device, so a failed earlier
+    # attempt can't make us report a dead slot.
+    xhci.ms_slot_id = 0
+    xhci.ms_enabled = 0
     xhci.ms_port  = target_port
     xhci.ms_speed = target_speed
 
     if _xhci_port_reset(target_port) != 0:
         printk0("[usbms] port reset failed\n")
         return 0
+
+    # The PORTSC speed field is only valid AFTER reset (before reset a
+    # real-HW USB2 port sits at PLS=Polling with a meaningless speed).
+    # Re-read it now and use the post-reset speed for Address Device /
+    # max packet sizing. QEMU reports the same value pre/post, so this
+    # is a safe refinement, not a behavioural change there.
+    reset_addr: uint64 = xhci.op_base + XHCI_PORT_BASE \
+                       + cast[uint64](target_port - 1) * XHCI_PORT_STRIDE \
+                       + XHCI_PORT_PORTSC
+    reset_portsc: uint32 = _xhci_r32(reset_addr)
+    post_speed: uint32 = (reset_portsc >> XHCI_PORTSC_SPEED_SHIFT) \
+                       & XHCI_PORTSC_SPEED_MASK
+    if post_speed != 0:
+        target_speed  = post_speed
+        xhci.ms_speed = post_speed
 
     # Allocate per-slot scratch.
     xhci.ms_input_ctx  = _xhci_alloc_slot_context()
@@ -2208,7 +2292,10 @@ def xhci_attach_mass_storage() -> uint32:
     # (USB 3.0). We accept any connected, enabled port — unlike the
     # keyboard path we don't gate on USB-2-only speeds, because the
     # bulk path is speed-agnostic once the slot is addressed.
-    if xhci.ms_slot_id != 0:
+    # Only short-circuit on a FULLY enumerated device (ms_enabled==1).
+    # A partial attach can leave ms_slot_id set on a failed port, and we
+    # must keep scanning the other connected ports for the real stick.
+    if xhci.ms_enabled != 0 and xhci.ms_slot_id != 0:
         return xhci.ms_slot_id
     n: uint32 = 0
     while n < xhci.max_ports:
