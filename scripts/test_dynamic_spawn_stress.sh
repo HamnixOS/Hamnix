@@ -207,17 +207,26 @@ else
     echo "[test_dynamic_spawn_stress] OK: region pool never exhausted (no elf OOM / ENOEXEC)"
 fi
 
-# 4. The dynamic binary reached main() at least once — proves the
-#    PT_INTERP load path actually ran ld.so end-to-end (not a no-op
-#    skip). NOTE: a SEPARATE pre-existing leak in glibc ld.so's
-#    libc.so.6 split-VMA mapping (mm/vma.ad, out of scope here) caps how
-#    many of the SPAWNS runs print this marker, so we do NOT require all
-#    of them — the region-pool invariants (2/3) + shell survival (5) are
-#    what the interp reclaim guarantees.
+# 4. EVERY dynamic spawn reached main() and printed its own stdout.
+#    This used to be capped at ~6/16: the per-task brk heap reserve
+#    (LINUX_BRK_RESERVE, 32 MiB, lazily alloc_pages'd by glibc-malloc's
+#    first brk()) was NEVER freed on task exit, so each glibc spawn
+#    permanently leaked its whole 32 MiB heap window — the dominant
+#    page-pool drain. After ~6 spawns the pool starved and ld.so failed
+#    to map libc.so.6 ("failed to map segment from shared object"), so
+#    the binary never reached main(). task_reap (+ do_execve replace)
+#    now reclaim the brk reserve OWNER-SAFELY through cow_drop_page
+#    (mm/vma.ad::vma_free_reserved_range), so the pool stays flat and
+#    ALL ${SPAWNS} spawns run to completion. We assert the full count to
+#    lock in the fix — a regression that re-leaks the brk reserve would
+#    drop this back toward ~6 and trip here.
 runs=$(outlines | grep -a -c "U42 dynamic hello")
 echo "[test_dynamic_spawn_stress] u_dynamic_hello reached main() ${runs} times"
-if [ "${runs:-0}" -ge 1 ]; then
-    echo "[test_dynamic_spawn_stress] OK: PT_INTERP (ld.so) dynamic-load path exercised"
+if [ "${runs:-0}" -ge "$SPAWNS" ]; then
+    echo "[test_dynamic_spawn_stress] OK: all ${SPAWNS} dynamic spawns reached main() (brk reserve reclaimed)"
+elif [ "${runs:-0}" -ge 1 ]; then
+    echo "[test_dynamic_spawn_stress] FAIL: only ${runs}/${SPAWNS} dynamic spawns reached main() — brk/page-pool leak regressed"
+    fail=1
 else
     echo "[test_dynamic_spawn_stress] FAIL: dynamic binary never reached main() — interp path broken"
     fail=1
