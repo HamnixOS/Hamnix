@@ -175,6 +175,15 @@ if os.environ.get("ENABLE_TCP_RECONNECT_SMOKE") == "1":
 if os.environ.get("ENABLE_TCP_THROUGHPUT_SMOKE") == "1":
     FILES.append(("/etc/tcp-throughput-test", b"1\n"))
 
+# TCP loopback smoke: in-kernel single-process loopback round-trip.
+# scripts/test_tcp_loopback.sh sets ENABLE_TCP_LOOPBACK_SMOKE=1 to plant
+# /etc/tcp-loopback-test; init/main.ad gates tcp_loopback_smoke_test() on
+# this marker. No SLIRP guestfwd is needed — 127.0.0.1 is handled purely
+# in ip_send's loopback shortcut. Default boots skip this so net tests that
+# don't need loopback aren't affected.
+if os.environ.get("ENABLE_TCP_LOOPBACK_SMOKE") == "1":
+    FILES.append(("/etc/tcp-loopback-test", b"1\n"))
+
 # DHCP renew/rebind/expiry smoke. Gated the same way as the TLS / TCP
 # ring markers above. The renew smoke leaves DHCP state at IDLE on
 # exit, which breaks any downstream test that requires state == BOUND
