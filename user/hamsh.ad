@@ -109,6 +109,11 @@ extern def sys_setuid(uid: uint32) -> int32
 # (mirror full / not hostowner). See fs/procfs.ad for the payload
 # layout and arch/x86/kernel/syscall.ad's SYS_SVC_PUBLISH arm.
 extern def sys_svc_publish(name: Ptr[uint8], payload: Ptr[uint8]) -> int32
+# Service-control mailbox RPC. verb 1..6 enqueue a request from any
+# process (start/stop/restart/enable/disable/runlevel); the PID-1
+# supervisor drains it with verb 0 (poll -> returns the request verb)
+# and verb 7 (read-out the dequeued name). See arch/x86/kernel/syscall.ad.
+extern def sys_svc_ctl(verb: int32, name: Ptr[uint8], cap: uint64) -> int64
 
 
 # DEVFD_* — the channel-kind selector for sys_fdbind, matching
@@ -3515,6 +3520,12 @@ def _builtin_dispatch(cmd: Ptr[uint8], argc: int32) -> int32:
         return builtin_echo(argc)
     if cstr_eq(cmd, "svc") != 0:
         return builtin_svc(argc)
+    if cstr_eq(cmd, "service") != 0:
+        return builtin_service(argc)
+    if cstr_eq(cmd, "init") != 0:
+        return builtin_init(argc)
+    if cstr_eq(cmd, "telinit") != 0:
+        return builtin_init(argc)
     # docs/security.md Phase 8.
     if cstr_eq(cmd, "read") != 0:
         return builtin_read(argc)
@@ -3548,6 +3559,12 @@ def _builtin_dispatch_kind_check(cmd: Ptr[uint8]) -> int32:
     if cstr_eq(cmd, "echo") != 0:
         return 1
     if cstr_eq(cmd, "svc") != 0:
+        return 1
+    if cstr_eq(cmd, "service") != 0:
+        return 1
+    if cstr_eq(cmd, "init") != 0:
+        return 1
+    if cstr_eq(cmd, "telinit") != 0:
         return 1
     if cstr_eq(cmd, "read") != 0:
         return 1
@@ -4764,8 +4781,29 @@ svc_backoff_init:  Array[32, int64]        # configured initial
 svc_backoff_max:   Array[32, int64]        # configured ceiling
 svc_last_start_j:  Array[32, uint64]       # jiffies at last start
 svc_next_start_j:  Array[32, uint64]       # jiffies at which to start
+# Stop-requested latch. svc_stop() sets this when an operator (or a
+# runlevel 0/6 stop-all) deliberately SIGTERMs a service. The reaper
+# consults it: a deliberately-stopped service that exits — even with
+# the non-zero SIGTERM exit code (143) — is STOPPED, not FAILED. Reset
+# to 0 on every (re)start so a later unexpected crash still reads
+# FAILED. Without this, `service NAME stop` left the service `failed`.
+svc_stop_req:      Array[32, int32]
+# Runlevel / autostart (init-system layer). svc_enabled[i] != 0 means
+# the service autostarts when its runlevel is entered. svc_runlevel[i]
+# is a bitmask of runlevels the service belongs to: bit N = runlevel N
+# (so a service in runlevels 3 and 5 has mask (1<<3)|(1<<5)). The
+# declarative .svc file sets these via `enabled: yes` and
+# `runlevel: 3 5`. The default multi-user level is 3.
+svc_enabled:       Array[32, int32]
+svc_runlevel:      Array[32, int32]        # bitmask of runlevels
 
 svc_count:         uint64 = 0              # high-water mark (slots seen)
+
+# Current runlevel. -1 = "not yet entered" (boot). The default
+# multi-user runlevel is 3. Runlevel 0 = halt/poweroff, 6 = reboot,
+# 5 = graphical (hamUI) bringup.
+SVC_DEFAULT_RUNLEVEL: int32 = 3
+svc_current_runlevel: int32 = -1
 
 
 def _svc_name_at(idx: uint64) -> Ptr[uint8]:
@@ -4817,10 +4855,11 @@ def _svc_alloc_slot() -> int32:
 def svc_register(name: Ptr[uint8], ns: Ptr[uint8], cmdline: Ptr[uint8],
                  restart_pol: int32, backoff_ms: int64,
                  backoff_max_ms: int64, desc: Ptr[uint8],
-                 uid: uint32) -> int32:
+                 uid: uint32, enabled: int32, runlevel: int32) -> int32:
     # Register a service (or refresh an existing entry's static fields).
     # Returns the slot index, or -1 on overflow. Does NOT start the
-    # service — that's svc_start (Phase 3).
+    # service — that's svc_start (Phase 3). `enabled`/`runlevel` come
+    # from the declarative .svc file: `enabled: yes` and `runlevel: 3 5`.
     idx: int32 = svc_lookup(name)
     if idx < 0:
         idx = _svc_alloc_slot()
@@ -4846,6 +4885,8 @@ def svc_register(name: Ptr[uint8], ns: Ptr[uint8], cmdline: Ptr[uint8],
     svc_backoff_init[u] = backoff_ms
     svc_backoff_max[u]  = backoff_max_ms
     svc_backoff_ms[u]   = backoff_ms
+    svc_enabled[u] = enabled
+    svc_runlevel[u] = runlevel
     # docs/security.md Phase 11: stash the parsed uid. The spawn-into-
     # ns path reads it back and calls sys_setuid in the rfork'd child
     # before exec — service compromise then doesn't grant hostowner
@@ -5378,6 +5419,9 @@ def svc_start(idx: int32) -> int32:
     svc_state[u] = SVC_STATE_RUNNING
     svc_last_start_j[u] = sys_get_jiffies()
     svc_next_start_j[u] = 0
+    # Fresh run: clear any prior stop-request latch so a future crash
+    # of THIS run is recorded as FAILED, not silently STOPPED.
+    svc_stop_req[u] = 0
     # /proc/svc Phase 6: publish the new pid + RUNNING state.
     _svc_publish_to_kernel(idx)
     return 0
@@ -5405,12 +5449,344 @@ def svc_stop(idx: int32) -> int32:
         _svc_publish_to_kernel(idx)
         return 0
     # Mark stop-requested by stashing policy = NEVER for this session.
+    # Also latch svc_stop_req so the reaper records the SIGTERM exit as
+    # a clean STOP (state=stopped), not a FAILED crash.
     svc_restart_pol[u] = SVC_RESTART_NEVER
+    svc_stop_req[u] = 1
     sys_kill(svc_pid[u], 15)        # SIGTERM
     # /proc/svc Phase 6: publish the policy change immediately; the
     # supervisor tick will publish the eventual STOPPED transition.
     _svc_publish_to_kernel(idx)
     return 0
+
+
+# --- enable / disable + runlevels (init-system layer) ---------------
+# `enable`/`disable` flip a service's autostart flag. A service whose
+# slot has svc_enabled != 0 and whose runlevel mask includes the
+# current runlevel is (re)started when that runlevel is entered. The
+# flag is persisted, best-effort, by rewriting the `enabled:` line in
+# the declarative /etc/services.d/<name>.svc file so the choice
+# survives a reboot when the root is writable (a no-op on a read-only
+# cpio root — the in-memory flag still takes effect this session).
+
+def _svc_persist_enabled(idx: int32):
+    # Best-effort rewrite of /etc/services.d/<name>.svc with the
+    # current svc_enabled flag stamped into an `enabled:` line. We
+    # re-read the existing file, drop any existing enabled: line, and
+    # append the new one. Silent on any failure (read-only root, etc.).
+    if idx < 0:
+        return
+    u: uint64 = cast[uint64](idx)
+    path_buf: Array[128, uint8]
+    _svc_path_compose(_svc_name_at(u), "/etc/services.d/", ".svc",
+                      &path_buf[0], 128)
+    total: int64 = _svc_read_def_file(cast[Ptr[char]](&path_buf[0]))
+    if total < 0:
+        # Not a .svc-managed service (e.g. legacy /etc/svc/*.hamsh) —
+        # nothing to persist. The in-memory flag still applies.
+        return
+    wfd: int32 = sys_open_write(cast[Ptr[char]](&path_buf[0]))
+    if wfd < 0:
+        return
+    # Re-emit every line except a prior `enabled:` line.
+    p: uint64 = 0
+    n: uint64 = cast[uint64](total)
+    while p < n:
+        e: uint64 = p
+        while e < n and svc_def_buf[e] != 10:
+            e = e + 1
+        # Detect a leading `enabled` key (skip leading whitespace).
+        s: uint64 = p
+        while s < e and (svc_def_buf[s] == 32 or svc_def_buf[s] == 9):
+            s = s + 1
+        is_enabled_line: int32 = _svc_key_eq(&svc_def_buf[0], s, e, "enabled")
+        # _svc_key_eq compares the whole slice; the value part defeats
+        # it, so instead check just the key token up to ':'.
+        col: int64 = -1
+        cs: uint64 = s
+        while cs < e:
+            if svc_def_buf[cs] == 58:        # ':'
+                col = cast[int64](cs)
+                break
+            cs = cs + 1
+        is_enabled_line = 0
+        if col >= 0:
+            is_enabled_line = _svc_key_eq(&svc_def_buf[0], s,
+                                          cast[uint64](col), "enabled")
+        if is_enabled_line == 0:
+            sys_write(wfd, &svc_def_buf[p], e - p + 1)   # incl newline
+        if e < n:
+            p = e + 1
+        else:
+            p = e
+    # Append the fresh enabled line.
+    if svc_enabled[u] != 0:
+        sys_write(wfd, "enabled: yes\n", 13)
+    else:
+        sys_write(wfd, "enabled: no\n", 12)
+    sys_close(wfd)
+
+
+def svc_enable(idx: int32, on: int32) -> int32:
+    if idx < 0:
+        errstr_set("svc: not registered")
+        return -1
+    u: uint64 = cast[uint64](idx)
+    if u >= SVC_MAX or svc_in_use[u] == 0:
+        errstr_set("svc: not registered")
+        return -1
+    svc_enabled[u] = on
+    _svc_persist_enabled(idx)
+    return 0
+
+
+# --- runlevel rc scripts --------------------------------------------
+# A runlevel transition sources /etc/rc.d/rc.<N> in PID 1's namespace.
+# rc.0 / rc.6 drive the existing poweroff / reboot primitives; rc.5
+# brings up the hamUI stack; rc.<default> (rc.3) is the multi-user
+# level that starts all enabled services. The source runs in THIS
+# (PID 1) process so its binds/spawns persist, exactly like rc.boot.
+
+svc_rl_path: Array[32, uint8]
+
+
+def _svc_rl_path_build(level: int32):
+    # Compose "/etc/rc.d/rc.<level>" into svc_rl_path.
+    prefix: Ptr[uint8] = "/etc/rc.d/rc."
+    i: uint64 = 0
+    while prefix[i] != 0:
+        svc_rl_path[i] = prefix[i]
+        i = i + 1
+    # Single decimal digit (runlevels are 0..9).
+    d: int32 = level
+    if d < 0:
+        d = 0
+    svc_rl_path[i] = cast[uint8](48 + (d % 10))
+    i = i + 1
+    svc_rl_path[i] = 0
+
+
+def _svc_source_path(path: Ptr[char]) -> int32:
+    # Read `path` into src_buf and run it as hamsh statements in THIS
+    # process. Returns 0 if sourced, -1 if the file was absent.
+    fd: int32 = sys_open(path)
+    if fd < 0:
+        return -1
+    total: uint64 = 0
+    while True:
+        n: int64 = sys_read(fd, &src_buf[total], 16384 - total)
+        if n <= 0:
+            break
+        total = total + cast[uint64](n)
+        if total >= 16384:
+            break
+    sys_close(fd)
+    if total > 0:
+        run_source(&src_buf[0], total)
+    return 0
+
+
+# Scratch buffer for listing /etc/services.d/.
+svc_defs_list: Array[2048, uint8]
+
+
+def svc_load_all_defs():
+    # Discover every declarative service definition under
+    # /etc/services.d/ and register it (without starting). This makes
+    # the user-addable layer real: dropping a .svc file is enough for
+    # the service to appear in `service status` and to autostart at its
+    # runlevel — no edit to any rc script. Each entry whose name ends in
+    # ".svc" is loaded by its base name (svc_def_load strips nothing, so
+    # we pass the leading name; svc_def_load rebuilds the full path).
+    nlist: int64 = _ext_listdir("/etc/services.d", &svc_defs_list[0], 2048)
+    if nlist <= 0:
+        return
+    p: uint64 = 0
+    nm: Array[64, uint8]
+    while p < cast[uint64](nlist):
+        es: uint64 = p
+        while p < cast[uint64](nlist) and svc_defs_list[p] != 10:
+            p = p + 1
+        elen: uint64 = p - es
+        if p < cast[uint64](nlist):
+            p = p + 1
+        # Only consider entries ending in ".svc"; strip that suffix to
+        # get the service name svc_def_load expects.
+        if elen > 4:
+            tail_ok: int32 = 1
+            if svc_defs_list[es + elen - 4] != 46:    # '.'
+                tail_ok = 0
+            if svc_defs_list[es + elen - 3] != 115:   # 's'
+                tail_ok = 0
+            if svc_defs_list[es + elen - 2] != 118:   # 'v'
+                tail_ok = 0
+            if svc_defs_list[es + elen - 1] != 99:    # 'c'
+                tail_ok = 0
+            if tail_ok != 0:
+                base_len: uint64 = elen - 4
+                c: uint64 = 0
+                while c < base_len and c + 1 < 64:
+                    nm[c] = svc_defs_list[es + c]
+                    c = c + 1
+                nm[c] = 0
+                svc_def_load(&nm[0])
+
+
+def svc_start_enabled_for_level(level: int32):
+    # Start every enabled service whose runlevel mask includes `level`.
+    # Used by the default multi-user rc and by `init <N>`. First load
+    # any not-yet-seen declarative definitions so a freshly-dropped
+    # .svc file is picked up on the next runlevel entry.
+    if level < 0:
+        return
+    svc_load_all_defs()
+    bit: int32 = 1 << level
+    i: uint64 = 0
+    while i < svc_count:
+        if svc_in_use[i] != 0:
+            if svc_enabled[i] != 0 and (svc_runlevel[i] & bit) != 0:
+                if svc_state[i] != SVC_STATE_RUNNING:
+                    svc_start(cast[int32](i))
+        i = i + 1
+
+
+svc_in_runlevel_xition: int32 = 0
+
+
+def svc_enter_runlevel(level: int32):
+    # Transition to runlevel `level`. Two parts, in order:
+    #   1. The BUILT-IN action for the level (so a transition works with
+    #      no rc files at all): runlevel 0 -> stop-all + poweroff,
+    #      runlevel 6 -> stop-all + reboot, any other level -> start
+    #      every enabled service whose runlevel mask includes `level`.
+    #   2. A best-effort `source /etc/rc.d/rc.<level>` for operator
+    #      customisation (extra commands, custom service order). The rc
+    #      script runs in THIS (PID 1) process so its binds/spawns
+    #      persist. rc scripts must NOT re-invoke `init`/`svc runlevel`
+    #      (that would recurse) — they layer extra work on top.
+    # A re-entrancy guard makes an accidental recursive transition a
+    # no-op rather than an infinite loop.
+    if svc_in_runlevel_xition != 0:
+        return
+    svc_in_runlevel_xition = 1
+    svc_current_runlevel = level
+    write_cstr1("[init] entering runlevel ")
+    write_cstr1(render_int(cast[int64](level)))
+    write_cstr1("\n")
+    # 1. Operator customisation via the rc script (optional). Runs
+    #    FIRST so a runlevel 0/6 hook (flush, sync, notify) fires before
+    #    the irreversible poweroff/reboot below.
+    _svc_rl_path_build(level)
+    _svc_source_path(cast[Ptr[char]](&svc_rl_path[0]))
+    # 2. Built-in action for the level.
+    if level == 0:
+        svc_runlevel_halt()
+    elif level == 6:
+        svc_runlevel_reboot()
+    else:
+        svc_start_enabled_for_level(level)
+    svc_in_runlevel_xition = 0
+
+
+def svc_runlevel_halt():
+    # init 0 — stop services, then poweroff via the existing primitive
+    # (/dev/reboot <- "poweroff"). We print a grep-able marker first so
+    # a test can assert the shutdown path was taken without the VM
+    # actually having to power off.
+    write_cstr1("[init] runlevel 0: shutdown -- stopping services\n")
+    _svc_stop_all()
+    write_cstr1("[init] runlevel 0: powering off\n")
+    pfd: int32 = sys_open_write("/dev/reboot")
+    if pfd >= 0:
+        sys_write(pfd, "poweroff\n", 9)
+        sys_close(pfd)
+
+
+def svc_runlevel_reboot():
+    # init 6 — stop services, then reboot via /dev/reboot <- "reboot".
+    write_cstr1("[init] runlevel 6: reboot -- stopping services\n")
+    _svc_stop_all()
+    write_cstr1("[init] runlevel 6: rebooting\n")
+    rfd: int32 = sys_open_write("/dev/reboot")
+    if rfd >= 0:
+        sys_write(rfd, "reboot\n", 7)
+        sys_close(rfd)
+
+
+def _svc_stop_all():
+    # SIGTERM every running supervised service (used by runlevel 0/6).
+    i: uint64 = 0
+    while i < svc_count:
+        if svc_in_use[i] != 0 and svc_state[i] == SVC_STATE_RUNNING:
+            svc_restart_pol[i] = SVC_RESTART_NEVER
+            svc_stop_req[i] = 1
+            if svc_pid[i] > 0:
+                sys_kill(svc_pid[i], 15)
+            svc_state[i] = SVC_STATE_STOPPED
+            _svc_publish_to_kernel(cast[int32](i))
+        i = i + 1
+
+
+# --- control-mailbox drain (native service/init -> supervisor) ------
+# Native `service` / `init` commands enqueue a request via SYS_SVC_CTL;
+# PID 1's supervisor drains the queue each tick and dispatches. This is
+# the reverse channel of the /proc/svc publish path: publish lets any
+# process READ supervisor state, the mailbox lets any process ASK the
+# supervisor to act.
+svc_ctl_name_buf: Array[32, uint8]
+
+
+def _svc_ctl_drain():
+    # Pop and dispatch every pending control request. Bounded by the
+    # kernel queue depth so this can't spin.
+    guard: int32 = 0
+    while guard < 64:
+        guard = guard + 1
+        verb: int64 = sys_svc_ctl(0, cast[Ptr[uint8]](0), 0)   # poll
+        if verb <= 0:
+            return
+        # Read out the request's name argument.
+        sys_svc_ctl(7, &svc_ctl_name_buf[0], 32)
+        v: int32 = cast[int32](verb)
+        if v == 6:
+            # runlevel: name buffer holds the level digit as text.
+            lvl: int32 = cast[int32](_parse_dec(&svc_ctl_name_buf[0]))
+            svc_enter_runlevel(lvl)
+            continue
+        # All other verbs take a service name. Resolve (auto-loading
+        # the definition the first time it's referenced).
+        idx: int32 = svc_lookup(&svc_ctl_name_buf[0])
+        if idx < 0 and (v == 1 or v == 3 or v == 4 or v == 5):
+            idx = svc_def_load(&svc_ctl_name_buf[0])
+        if idx < 0:
+            continue
+        if v == 1:
+            svc_start(idx)
+        elif v == 2:
+            svc_stop(idx)
+        elif v == 3:
+            _svc_restart_now(idx)
+        elif v == 4:
+            svc_enable(idx, 1)
+        elif v == 5:
+            svc_enable(idx, 0)
+
+
+def _svc_restart_now(idx: int32):
+    # Stop (if running) then start — used by the `restart` control verb
+    # and `svc restart`. Non-blocking-friendly: SIGTERM the old pid and
+    # let the next tick reap it, then start fresh.
+    if idx < 0:
+        return
+    u: uint64 = cast[uint64](idx)
+    if svc_state[u] == SVC_STATE_RUNNING and svc_pid[u] > 0:
+        old_pid: int32 = svc_pid[u]
+        sys_kill(old_pid, 15)
+        sys_waitpid(old_pid)
+        svc_pid[u] = 0
+        svc_state[u] = SVC_STATE_STOPPED
+        _svc_publish_to_kernel(idx)
+    svc_start(idx)
 
 
 # Supervisor loop -- called from the interactive idle poll. Two
@@ -5458,10 +5834,14 @@ def _svc_reap_one(idx: uint64):
     elif pol == SVC_RESTART_ON_FAIL and failed != 0:
         do_restart = 1
     if do_restart == 0:
-        if failed != 0:
+        # A deliberately-stopped service (svc_stop latched svc_stop_req)
+        # is STOPPED even though the SIGTERM exit code is non-zero (143);
+        # only an UNREQUESTED non-zero exit is FAILED.
+        if failed != 0 and svc_stop_req[idx] == 0:
             svc_state[idx] = SVC_STATE_FAILED
         else:
             svc_state[idx] = SVC_STATE_STOPPED
+        svc_stop_req[idx] = 0
         # /proc/svc Phase 6: publish the terminal state.
         _svc_publish_to_kernel(cast[int32](idx))
         return
@@ -5498,6 +5878,13 @@ def svc_supervisor_tick():
     # Cheap when no service has churned: O(N) over a 32-slot table,
     # one sys_waitpid_nb per running service + one jiffies compare per
     # restarting one. Safe to call from the interactive idle loop.
+    #
+    # FIRST drain the native-command control mailbox (service/init ->
+    # supervisor RPC). This must run even when svc_count == 0 so an
+    # `init <N>` runlevel request or a `service <name> start` that
+    # auto-loads the first service is honoured on a freshly-booted
+    # system with no services yet registered.
+    _svc_ctl_drain()
     if svc_count == 0:
         return
     i: uint64 = 0
@@ -5558,6 +5945,11 @@ svc_pf_backoff_x: int64 = 0
 # docs/security.md Phase 11: parsed `uid:` field from the service
 # definition. Default 1 (hostowner) when omitted.
 svc_pf_uid:       uint32 = 1
+# init-system layer: parsed `enabled:` (yes/no) and `runlevel:` (a
+# space-separated list of digits) fields. Default: enabled, default
+# multi-user runlevel (3).
+svc_pf_enabled:   int32 = 1
+svc_pf_runlevel:  int32 = 0
 
 
 def _svc_pf_reset():
@@ -5569,6 +5961,8 @@ def _svc_pf_reset():
     svc_pf_backoff = 1000              # 1 s default initial
     svc_pf_backoff_x = 30000           # 30 s default ceiling
     svc_pf_uid = 1                     # default hostowner
+    svc_pf_enabled = 1                 # default enabled
+    svc_pf_runlevel = 1 << SVC_DEFAULT_RUNLEVEL   # default multi-user (3)
 
 
 def _svc_trim_copy(dst: Ptr[uint8], cap: uint64,
@@ -5637,6 +6031,39 @@ def _svc_apply_restart(buf: Ptr[uint8], lo: uint64, hi: uint64):
     # Unknown — keep the default (on-failure).
 
 
+def _svc_apply_enabled(buf: Ptr[uint8], lo: uint64, hi: uint64):
+    # `enabled: yes|no|true|false|1|0`. Anything truthy enables.
+    if _svc_key_eq(buf, lo, hi, "yes") != 0 \
+            or _svc_key_eq(buf, lo, hi, "true") != 0 \
+            or _svc_key_eq(buf, lo, hi, "1") != 0:
+        svc_pf_enabled = 1
+        return
+    if _svc_key_eq(buf, lo, hi, "no") != 0 \
+            or _svc_key_eq(buf, lo, hi, "false") != 0 \
+            or _svc_key_eq(buf, lo, hi, "0") != 0:
+        svc_pf_enabled = 0
+        return
+    # Unknown — keep the default (enabled).
+
+
+def _svc_apply_runlevel(buf: Ptr[uint8], lo: uint64, hi: uint64):
+    # `runlevel: 3 5` — a space/comma-separated list of single digits
+    # 0..9. Builds a bitmask (bit N = runlevel N). An empty value leaves
+    # the default mask in place.
+    mask: int32 = 0
+    any: int32 = 0
+    i: uint64 = lo
+    while i < hi:
+        c: uint8 = buf[i]
+        if c >= 48 and c <= 57:                # '0'..'9'
+            d: int32 = cast[int32](c - 48)
+            mask = mask | (1 << d)
+            any = 1
+        i = i + 1
+    if any != 0:
+        svc_pf_runlevel = mask
+
+
 def _svc_parse_buf(n: uint64) -> int32:
     # Walk svc_def_buf[0..n), one line at a time. Returns 0 on success
     # (required fields present), -1 on a missing-required diagnostic
@@ -5689,6 +6116,10 @@ def _svc_parse_buf(n: uint64) -> int32:
                 # docs/security.md Phase 11: per-service uid. The
                 # supervisor switches to this identity before exec.
                 svc_pf_uid = cast[uint32](_svc_parse_int(base, val_lo, val_hi) & 0xFFFFFFFF)
+            elif _svc_key_eq(base, key_lo, key_hi, "enabled") != 0:
+                _svc_apply_enabled(base, val_lo, val_hi)
+            elif _svc_key_eq(base, key_lo, key_hi, "runlevel") != 0:
+                _svc_apply_runlevel(base, val_lo, val_hi)
             # Unknown keys are silently ignored (forward-compat).
         p = e + 1
     # Validation.
@@ -5704,10 +6135,9 @@ def _svc_parse_buf(n: uint64) -> int32:
     return 0
 
 
-def _svc_def_path_build(name: Ptr[uint8], out: Ptr[uint8], cap: uint64):
-    # Compose "/etc/svc/<name>.hamsh" in `out`.
-    prefix: Ptr[uint8] = "/etc/svc/"
-    suffix: Ptr[uint8] = ".hamsh"
+def _svc_path_compose(name: Ptr[uint8], prefix: Ptr[uint8],
+                      suffix: Ptr[uint8], out: Ptr[uint8], cap: uint64):
+    # Compose "<prefix><name><suffix>" into `out`, NUL-terminated.
     i: uint64 = 0
     while prefix[i] != 0 and i + 1 < cap:
         out[i] = prefix[i]
@@ -5725,16 +6155,12 @@ def _svc_def_path_build(name: Ptr[uint8], out: Ptr[uint8], cap: uint64):
     out[i] = 0
 
 
-def svc_def_load(name: Ptr[uint8]) -> int32:
-    # Read /etc/svc/<name>.hamsh into svc_def_buf and register the
-    # parsed entry (creating or updating the table slot). Returns the
-    # slot index on success, -1 on file-not-found / parse error
-    # (errstr set).
-    path_buf: Array[128, uint8]
-    _svc_def_path_build(name, &path_buf[0], 128)
-    fd: int32 = sys_open(cast[Ptr[char]](&path_buf[0]))
+def _svc_read_def_file(path: Ptr[char]) -> int64:
+    # Read a definition file into svc_def_buf. Returns the byte count on
+    # success, -1 if the file can't be opened. The caller validates a
+    # zero-length read separately.
+    fd: int32 = sys_open(path)
     if fd < 0:
-        errstr_set("svc: no such service definition")
         return -1
     total: uint64 = 0
     while True:
@@ -5746,15 +6172,39 @@ def svc_def_load(name: Ptr[uint8]) -> int32:
         if total >= SVC_DEF_BUF_MAX:
             break
     sys_close(fd)
+    return cast[int64](total)
+
+
+def svc_def_load(name: Ptr[uint8]) -> int32:
+    # Locate and parse a service definition, then register it. Two
+    # search locations, in order:
+    #   1. /etc/services.d/<name>.svc — the user-addable declarative
+    #      format (the init-system layer; drop a file here to add a
+    #      service without recompiling anything).
+    #   2. /etc/svc/<name>.hamsh — the legacy in-tree location (sshd).
+    # Both share the same key:value grammar; the .svc form additionally
+    # honours `enabled:` and `runlevel:`. Returns the slot index on
+    # success, -1 on not-found / parse error (errstr set).
+    path_buf: Array[128, uint8]
+    _svc_path_compose(name, "/etc/services.d/", ".svc", &path_buf[0], 128)
+    total: int64 = _svc_read_def_file(cast[Ptr[char]](&path_buf[0]))
+    if total < 0:
+        # Fall back to the legacy /etc/svc/<name>.hamsh location.
+        _svc_path_compose(name, "/etc/svc/", ".hamsh", &path_buf[0], 128)
+        total = _svc_read_def_file(cast[Ptr[char]](&path_buf[0]))
+        if total < 0:
+            errstr_set("svc: no such service definition")
+            return -1
     if total == 0:
         errstr_set("svc: empty definition file")
         return -1
-    if _svc_parse_buf(total) < 0:
+    if _svc_parse_buf(cast[uint64](total)) < 0:
         return -1
     return svc_register(&svc_pf_name[0], &svc_pf_ns[0],
                         &svc_pf_exec[0], svc_pf_restart,
                         svc_pf_backoff, svc_pf_backoff_x,
-                        &svc_pf_desc[0], svc_pf_uid)
+                        &svc_pf_desc[0], svc_pf_uid,
+                        svc_pf_enabled, svc_pf_runlevel)
 
 
 # --- svc builtin ----------------------------------------------------
@@ -5846,8 +6296,118 @@ def builtin_svc(argc: int32) -> int32:
         if idx < 0:
             return 1
         return 0
-    errstr_set("svc: unknown verb (status/start/stop/restart/reload)")
+    if cstr_eq(verb, "enable") != 0 or cstr_eq(verb, "disable") != 0:
+        if argc < 3:
+            errstr_set("svc enable/disable: missing service name")
+            return 1
+        name: Ptr[uint8] = cast[Ptr[uint8]](argv_ptr[2])
+        idx: int32 = svc_lookup(name)
+        if idx < 0:
+            idx = svc_def_load(name)
+            if idx < 0:
+                return 1
+        on: int32 = 0
+        if cstr_eq(verb, "enable") != 0:
+            on = 1
+        if svc_enable(idx, on) < 0:
+            return 1
+        return 0
+    if cstr_eq(verb, "runlevel") != 0:
+        if argc < 3:
+            # Report the current runlevel.
+            write_cstr1("runlevel ")
+            write_cstr1(render_int(cast[int64](svc_current_runlevel)))
+            write_cstr1("\n")
+            return 0
+        lvl: int32 = cast[int32](_parse_dec(cast[Ptr[uint8]](argv_ptr[2])))
+        svc_enter_runlevel(lvl)
+        return 0
+    errstr_set("svc: unknown verb (status/start/stop/restart/reload/enable/disable/runlevel)")
     return 1
+
+
+# --- service / init builtins (sysadmin-shaped front ends) -----------
+# `service <name> <verb>` and `init <N>` are the Linux-sysadmin
+# spellings. When typed at the PID-1 prompt they run IN-PROCESS against
+# the live supervisor table (no mailbox round-trip needed — the shell
+# IS the supervisor). The standalone /bin/service and /bin/initctl
+# binaries cover the same verbs from a non-PID-1 process via the
+# SYS_SVC_CTL mailbox. Argument order is `service NAME VERB` (matching
+# Debian's `service nginx restart`), the reverse of `svc VERB NAME`.
+def builtin_service(argc: int32) -> int32:
+    if argc < 2:
+        svc_render_status()
+        return 0
+    a1: Ptr[uint8] = cast[Ptr[uint8]](argv_ptr[1])
+    if cstr_eq(a1, "status") != 0 or cstr_eq(a1, "list") != 0:
+        if argc >= 3:
+            idx: int32 = svc_lookup(cast[Ptr[uint8]](argv_ptr[2]))
+            if idx < 0:
+                errstr_set("service: not registered")
+                return 1
+            svc_render_one(idx)
+            return 0
+        svc_render_status()
+        return 0
+    name: Ptr[uint8] = a1
+    if argc < 3:
+        # `service <name>` -> status of that service.
+        idx: int32 = svc_lookup(name)
+        if idx < 0:
+            errstr_set("service: not registered")
+            return 1
+        svc_render_one(idx)
+        return 0
+    verb: Ptr[uint8] = cast[Ptr[uint8]](argv_ptr[2])
+    if cstr_eq(verb, "status") != 0:
+        idx: int32 = svc_lookup(name)
+        if idx < 0:
+            errstr_set("service: not registered")
+            return 1
+        svc_render_one(idx)
+        return 0
+    idx: int32 = svc_lookup(name)
+    if idx < 0:
+        idx = svc_def_load(name)
+        if idx < 0:
+            return 1
+    if cstr_eq(verb, "start") != 0:
+        if svc_start(idx) < 0:
+            return 1
+        return 0
+    if cstr_eq(verb, "stop") != 0:
+        if svc_stop(idx) < 0:
+            return 1
+        return 0
+    if cstr_eq(verb, "restart") != 0:
+        _svc_restart_now(idx)
+        return 0
+    if cstr_eq(verb, "enable") != 0:
+        if svc_enable(idx, 1) < 0:
+            return 1
+        return 0
+    if cstr_eq(verb, "disable") != 0:
+        if svc_enable(idx, 0) < 0:
+            return 1
+        return 0
+    errstr_set("service: unknown verb (start/stop/restart/status/enable/disable)")
+    return 1
+
+
+def builtin_init(argc: int32) -> int32:
+    # `init <N>` / `telinit <N>` — change runlevel. Runs the transition
+    # in THIS (PID 1) process so the runlevel rc's binds/spawns persist.
+    if argc < 2:
+        write_cstr1("runlevel ")
+        write_cstr1(render_int(cast[int64](svc_current_runlevel)))
+        write_cstr1("\n")
+        return 0
+    lvl: int32 = cast[int32](_parse_dec(cast[Ptr[uint8]](argv_ptr[1])))
+    if lvl < 0 or lvl > 9:
+        errstr_set("init: runlevel must be 0..9")
+        return 1
+    svc_enter_runlevel(lvl)
+    return 0
 
 
 # --- §13 live-handle resolution -------------------------------------

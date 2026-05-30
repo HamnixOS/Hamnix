@@ -708,6 +708,23 @@ sys_svc_publish:
     .size sys_svc_publish, .-sys_svc_publish
 
 
+    /* --- sys_svc_ctl(verb, name, cap) -> int64 ----------------------
+     * Service-control mailbox RPC to PID-1's supervisor. verb 1..6 =
+     * start/stop/restart/enable/disable/runlevel (name = service or
+     * runlevel digit) — enqueue, returns 0. verb 0 = poll (PID-1 only):
+     * dequeue the next request, returns the request's verb (0 = queue
+     * empty). verb 7 = read out the last-dequeued name into the buffer
+     * at `name` (cap bytes). The native `service` / `init` commands use
+     * verbs 1..6; hamsh's supervisor uses 0 + 7. */
+    .globl sys_svc_ctl
+    .type sys_svc_ctl, @function
+sys_svc_ctl:
+    movq    $296, %rax              /* SYS_SVC_CTL */
+    syscall
+    ret
+    .size sys_svc_ctl, .-sys_svc_ctl
+
+
     /* --- sys_set_realtime(epoch) -> int32 ---------------------------
      * Anchor the kernel-side wall clock on `epoch` (Unix seconds).
      * The kernel re-bases rtc_boot_epoch so that base + TSC-delta ==
