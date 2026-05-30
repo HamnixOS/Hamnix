@@ -117,6 +117,43 @@ XHCI_CAP_DBOFF:       uint64 = 0x14    # u32  doorbell array offset
 XHCI_CAP_RTSOFF:      uint64 = 0x18    # u32  runtime regs offset
 
 
+# --- Extended capabilities + BIOS->OS handoff (xHCI §7) -----------
+#
+# HCCPARAMS1 bits [31:16] = xECP, a DWORD offset (from BAR0) to the
+# first extended-capability structure (0 = no extended caps). Each
+# cap DWORD is:  [7:0]=Capability ID, [15:8]=Next pointer (DWORDs,
+# relative to the CURRENT cap; 0 = end of list).
+#
+# Cap ID 1 = USB Legacy Support (USBLEGSUP). Its first DWORD carries
+# the BIOS-Owned (bit 16) / OS-Owned (bit 24) semaphores; the OS
+# claims the controller from SMM by setting bit 24 then polling for
+# bit 16 to clear. The next DWORD (USBLEGCTLSTS, +4) holds the SMI
+# enable/status bits we disable so firmware SMIs stop fighting us.
+XHCI_HCCPARAMS1_XECP_SHIFT: uint32 = 16
+XHCI_XECP_ID_MASK:          uint32 = 0xFF
+XHCI_XECP_NEXT_SHIFT:       uint32 = 8
+XHCI_XECP_NEXT_MASK:        uint32 = 0xFF
+XHCI_XECP_ID_LEGACY:        uint32 = 1     # USB Legacy Support
+
+XHCI_USBLEGSUP_BIOS_OWNED:  uint32 = 0x00010000   # bit 16
+XHCI_USBLEGSUP_OS_OWNED:    uint32 = 0x01000000   # bit 24
+XHCI_USBLEGSUP_CTLSTS:      uint64 = 0x04          # USBLEGCTLSTS offset
+
+# USBLEGCTLSTS (xHCI §7.1.2): SMI-enable bits we clear so the OS owns
+# the controller cleanly. Bit 0 = USB SMI Enable, bit 4 = SMI on Host
+# System Error Enable, bit 13 = SMI on OS Ownership Enable, bit 14 =
+# SMI on PCI Command Enable, bit 15 = SMI on BAR Enable, bit 16 = SMI
+# on Event Interrupt (status, RW1C). We zero the enable bits and
+# write-1-to-clear the RW1C status bits in the upper half (bits
+# 29..31 / 16..20 are status). Conservative mask below.
+XHCI_USBLEGCTLSTS_SMI_EN_MASK: uint32 = 0x0000E007  # bits 0,1,2,13,14,15
+XHCI_USBLEGCTLSTS_RW1C_MASK:   uint32 = 0xE0000000  # bits 29,30,31 (SMI status)
+
+# Bounded spin budget waiting for BIOS to drop its ownership semaphore.
+# There is no sleep primitive; this is a generous busy-poll ceiling.
+XHCI_HANDOFF_SPIN_MAX: uint64 = 2000000
+
+
 # --- Operational register offsets (relative to BAR0+CAPLENGTH) ---
 #
 # We list what we'd touch at full enable; V0 only reads CMD/STS and
@@ -618,6 +655,113 @@ def _xhci_reset(op_base: uint64) -> int32:
     return -1
 
 
+# --- BIOS->OS handoff (extended-capability walk, xHCI §7.1) -------
+#
+# Real UEFI firmware leaves the xHCI controller under SMM-based USB
+# Legacy Support ownership until the OS explicitly claims it via the
+# USBLEGSUP extended capability. QEMU exposes no legacy-support cap,
+# so this walk finds nothing and returns immediately — zero behavior
+# change under emulation. On real silicon, NOT doing this handoff is
+# the #1 reason a from-scratch xHCI driver never enumerates the boot
+# stick even though UEFI's own xHCI driver did. Must run while the
+# controller is halted, BEFORE the HCRST reset / run sequence.
+def _xhci_bios_handoff(bar0: uint64):
+    hccparams1: uint32 = _xhci_r32(bar0 + XHCI_CAP_HCCPARAMS1)
+    xecp: uint32 = (hccparams1 >> XHCI_HCCPARAMS1_XECP_SHIFT) & 0xFFFF
+    if xecp == 0:
+        printk0("[xhci] no extended caps (xECP=0) — no BIOS handoff needed (QEMU path)\n")
+        return
+
+    # Walk the singly-linked extended-capability list looking for the
+    # USB Legacy Support cap (ID 1). cap_addr is a BYTE address; the
+    # pointers are in DWORDs. Bounded by a sane hop count so a
+    # corrupt/looping next-pointer on bad silicon can't wedge us.
+    cap_addr: uint64 = bar0 + cast[uint64](xecp) * 4
+    hops: uint32 = 0
+    legacy_addr: uint64 = 0
+    while hops < 64:
+        capreg: uint32 = _xhci_r32(cap_addr)
+        cap_id: uint32 = capreg & XHCI_XECP_ID_MASK
+        if cap_id == XHCI_XECP_ID_LEGACY:
+            legacy_addr = cap_addr
+            hops = 64                       # break
+        else:
+            nxt: uint32 = (capreg >> XHCI_XECP_NEXT_SHIFT) \
+                        & XHCI_XECP_NEXT_MASK
+            if nxt == 0:
+                hops = 64                   # break — end of list
+            else:
+                cap_addr = cap_addr + cast[uint64](nxt) * 4
+                hops = hops + 1
+
+    if legacy_addr == 0:
+        printk0("[xhci] extended caps present but no USB Legacy Support cap — no BIOS handoff needed\n")
+        return
+
+    before: uint32 = _xhci_r32(legacy_addr)
+    printk1("[xhci] USBLEGSUP found, value=%x (bit16=BIOS-owned, bit24=OS-owned)\n",
+            cast[uint64](before))
+
+    # Claim OS ownership: set bit 24, then poll for BIOS to drop bit 16.
+    _xhci_w32(legacy_addr, before | XHCI_USBLEGSUP_OS_OWNED)
+    spin: uint64 = 0
+    bios_released: int32 = 0
+    while spin < XHCI_HANDOFF_SPIN_MAX:
+        v: uint32 = _xhci_r32(legacy_addr)
+        if (v & XHCI_USBLEGSUP_BIOS_OWNED) == 0:
+            bios_released = 1
+            spin = XHCI_HANDOFF_SPIN_MAX    # break
+        else:
+            spin = spin + 1
+
+    after: uint32 = _xhci_r32(legacy_addr)
+    if bios_released != 0:
+        printk1("[xhci] BIOS->OS handoff PASS, USBLEGSUP=%x\n",
+                cast[uint64](after))
+    else:
+        printk1("[xhci] BIOS->OS handoff TIMEOUT (BIOS never released), USBLEGSUP=%x — forcing OS ownership\n",
+                cast[uint64](after))
+
+    # Quiet firmware SMIs: clear the SMI-enable bits and write-1-to-
+    # clear the RW1C SMI-status bits in USBLEGCTLSTS, so SMM stops
+    # contending for the controller now that the OS owns it.
+    ctlsts: uint32 = _xhci_r32(legacy_addr + XHCI_USBLEGSUP_CTLSTS)
+    newcs: uint32 = (ctlsts & ~XHCI_USBLEGCTLSTS_SMI_EN_MASK) \
+                  | (ctlsts & XHCI_USBLEGCTLSTS_RW1C_MASK)
+    _xhci_w32(legacy_addr + XHCI_USBLEGSUP_CTLSTS, newcs)
+    printk2("[xhci] USBLEGCTLSTS %x -> %x (SMIs disabled)\n",
+            cast[uint64](ctlsts), cast[uint64](newcs))
+
+
+# --- Port connect-status report (late-boot telemetry) -------------
+#
+# Walk every root-hub PORTSC and print the raw value + CCS bit, plus
+# a ports_connected summary. Surfaced late (init/main.ad, right before
+# start_first_task) so it lands in a real-HW crash photo: if the
+# BIOS->OS handoff alone doesn't make sd0 enumerate, this tells us
+# whether the root-hub port even SEES the device (CCS=1) on real
+# silicon — the next diagnostic fork. Safe to call after init: if the
+# BAR was never mapped (auto-skip / no controller), op_base is 0 and
+# max_ports is 0, so the loop simply prints the summary and returns.
+def xhci_port_report():
+    if xhci.op_base == 0 or xhci.max_ports == 0:
+        printk0("[xhci-ports] controller not mapped (no port scan)\n")
+        return
+    n: uint32 = 0
+    while n < xhci.max_ports:
+        port_addr: uint64 = xhci.op_base + XHCI_PORT_BASE \
+                          + cast[uint64](n) * XHCI_PORT_STRIDE \
+                          + XHCI_PORT_PORTSC
+        portsc: uint32 = _xhci_r32(port_addr)
+        ccs: uint32 = portsc & XHCI_PORTSC_CCS
+        printk2("[xhci-ports] port%d PORTSC=%x",
+                cast[uint64](n + 1), cast[uint64](portsc))
+        printk1(" CCS=%d\n", cast[uint64](ccs))
+        n = n + 1
+    printk1("[xhci-ports] ports_connected=%d\n",
+            cast[uint64](xhci.ports_connected))
+
+
 # --- Public entry point -------------------------------------------
 
 def xhci_init() -> int32:
@@ -756,6 +900,14 @@ def xhci_init_ex(force_bare_metal: int32) -> int32:
     xhci.ac64 = ac64
     printk2("[xhci] HCCPARAMS1=%x AC64=%d (1=64-bit DMA ok, 0=32-bit only)\n",
             cast[uint64](hccparams1), cast[uint64](ac64))
+
+    # BIOS->OS ownership handoff (xHCI §7.1). MUST run before the
+    # controller reset / run sequence while the controller is still
+    # halted, otherwise SMM-based USB Legacy Support keeps the
+    # controller on real firmware and the native driver never
+    # enumerates the boot stick. No-op under QEMU (no legacy cap).
+    printk0("[boot:01.b.1] xhci BIOS->OS handoff\n")
+    _xhci_bios_handoff(bar0)
 
     # Halt + reset the controller. After this the operational state
     # is the spec-defined power-on default — port-status reads are
