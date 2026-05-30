@@ -51,12 +51,18 @@ set +e
     # --- Part 1: create a new file with INSERT-mode typing -----------
     # Open a brand-new file; vi starts in NORMAL on an empty buffer.
     printf '/bin/vi /tmp/vitest.txt\n'
-    sleep 2
-    # i -> INSERT, type line 1, Enter (split), type line 2, Esc -> NORMAL
+    # Generous settle: vi must fully take over the raw console from hamsh
+    # before the mode-switching 'i' arrives, or hamsh eats it and the
+    # whole INSERT sequence is mis-parsed as NORMAL-mode commands. On a
+    # loaded host spawn+startup can exceed a couple seconds.
+    sleep 5
+    # i -> INSERT, type line 1, Enter (split), type line 2, Esc -> NORMAL.
+    # vi repaints the status line on the mode switch; give that paint time
+    # to finish before the first burst so no typed byte lands mid-repaint.
     printf 'i'
-    sleep 1
+    sleep 4
     printf 'hello world'
-    sleep 1
+    sleep 2
     printf '\n'
     sleep 1
     printf 'second line'
@@ -74,7 +80,7 @@ set +e
     # --- Part 2: NORMAL-mode edits on the saved file -----------------
     # Re-open. Buffer is line0="hello world", line1="second line".
     printf '/bin/vi /tmp/vitest.txt\n'
-    sleep 2
+    sleep 5
     # On line0 col0 ('h'): x deletes 'h' -> "ello world".
     printf 'x'
     sleep 1
@@ -91,9 +97,9 @@ set +e
 
     # --- Part 3: :q! discards unsaved changes ------------------------
     printf '/bin/vi /tmp/vitest.txt\n'
-    sleep 2
+    sleep 5
     printf 'i'
-    sleep 1
+    sleep 2
     printf 'GARBAGE'
     sleep 1
     printf '\033'
@@ -113,7 +119,7 @@ set +e
 
     printf 'exit\n'
     sleep 1
-) | timeout 60s qemu-system-x86_64 \
+) | timeout 120s qemu-system-x86_64 \
     -kernel "$ELF" \
     -smp 2 \
     -nographic \
