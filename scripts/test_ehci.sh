@@ -60,8 +60,14 @@ echo "[test_ehci] (1/3) Build userland (init.elf must exist for cpio)"
 bash scripts/build_user.sh >/dev/null
 bash scripts/build_modules.sh >/dev/null
 
-echo "[test_ehci] (2/3) Build default initramfs"
-INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null
+echo "[test_ehci] (2/3) Build initramfs (hand-rolled EHCI path + selftest marker)"
+# This test exercises the HAND-ROLLED drivers/usb/ehci.ad path, so it must
+# opt OUT of the Linux-USB L-shim (ENABLE_XHCI_KO defaults to 1, which would
+# plant /etc/xhci-ko and make init/main.ad SKIP ehci_init() entirely). It
+# also plants /etc/xhci-selftest so the gated EHCI V1 synthetic
+# transfer-engine self-test ([ehci_v1] transfer-engine PASS) fires under QEMU.
+INIT_ELF=build/user/init.elf ENABLE_XHCI_KO=0 ENABLE_XHCI_SELFTEST=1 \
+    python3 scripts/build_initramfs.py >/dev/null
 
 echo "[test_ehci] (3/3) Rebuild kernel + boot QEMU with usb-ehci + usb-kbd"
 python3 -m compiler.adder compile \
