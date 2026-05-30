@@ -3168,6 +3168,74 @@ class X86CodeGen:
         self.emit("    testq %rcx, %rcx")  # SF = sign bit of x
         self.emit("    cmovns %rcx, %rax") # if x >= 0, use original
 
+    def _gen_strlen_inline(self, s: Expr) -> None:
+        """Inline strlen(s) using repne scasb.
+
+        Counts bytes until the first NUL byte in the string pointed to by s.
+        Equivalent to the C `strlen` function but emitted inline — no call,
+        no hidden allocation.
+
+        Emits:
+            <eval s> → rax
+            movq %rax, %rdi     ; rdi = pointer to string
+            xorq %rcx, %rcx     ; clear rcx
+            notq %rcx           ; rcx = 0xffffffffffffffff (max scan count)
+            xorb %al, %al       ; al = 0 (byte to search for — NUL)
+            cld                 ; ensure DF=0 (forward scan)
+            repne scasb         ; scan: rdi++, rcx-- while *rdi != 0
+            notq %rcx           ; rcx = bytes consumed (incl. NUL)
+            decq %rcx           ; subtract 1 for the NUL byte itself
+            movq %rcx, %rax     ; return length
+
+        Registers clobbered: rax, rcx, rdi (all caller-saved in SysV AMD64).
+        Result (string length, not counting NUL) lands in %rax.
+        """
+        # Need a unique label in case ctx is None (global init — unlikely but
+        # guard it). If ctx is available use ctx.new_label to prevent clashes
+        # when multiple strlen() calls appear in the same function.
+        self.gen_expr(s)                       # pointer → %rax
+        self.emit("    movq %rax, %rdi")       # rdi = s
+        self.emit("    xorq %rcx, %rcx")       # rcx = 0
+        self.emit("    notq %rcx")             # rcx = 0xffff...
+        self.emit("    xorb %al, %al")         # al = NUL terminator
+        self.emit("    cld")                   # DF = 0 (forward)
+        self.emit("    repne scasb")           # scan forward for NUL
+        self.emit("    notq %rcx")             # rcx = bytes scanned (incl. NUL)
+        self.emit("    decq %rcx")             # subtract NUL byte
+        self.emit("    movq %rcx, %rax")       # result → rax
+
+    def _gen_clamp_inline(self, x: Expr, lo: Expr, hi: Expr) -> None:
+        """Inline clamp(x, lo, hi) — ensures lo <= result <= hi.
+
+        Equivalent to min(max(x, lo), hi) but computed in a single
+        3-register sequence without a nested call.
+
+        Emits:
+            <eval hi> → push
+            <eval lo> → push
+            <eval x>  → rax
+            pop rcx           (rcx = lo)
+            cmpq %rcx, %rax   (x vs lo)
+            cmovl %rcx, %rax  (if x < lo, use lo)
+            pop rcx           (rcx = hi)
+            cmpq %rcx, %rax   (result vs hi)
+            cmovg %rcx, %rax  (if result > hi, use hi)
+
+        Result lands in %rax.  No branch, no call, no heap.
+        """
+        # Evaluate hi first so lo is on top of the stack when we need it.
+        self.gen_expr(hi)
+        self.emit("    pushq %rax")            # save hi
+        self.gen_expr(lo)
+        self.emit("    pushq %rax")            # save lo
+        self.gen_expr(x)                       # rax = x
+        self.emit("    popq %rcx")             # rcx = lo
+        self.emit("    cmpq %rcx, %rax")       # x vs lo
+        self.emit("    cmovl %rcx, %rax")      # if x < lo: rax = lo
+        self.emit("    popq %rcx")             # rcx = hi
+        self.emit("    cmpq %rcx, %rax")       # result vs hi
+        self.emit("    cmovg %rcx, %rax")      # if result > hi: rax = hi
+
     def gen_call(self, call: CallExpr) -> None:
         if call.kwargs:
             fname = (call.func.name if isinstance(call.func, Identifier)
@@ -3213,6 +3281,12 @@ class X86CodeGen:
             return
         if name == "abs" and not _user_defined and len(call.args) == 1:
             self._gen_abs_inline(call.args[0])
+            return
+        if name == "strlen" and not _user_defined and len(call.args) == 1:
+            self._gen_strlen_inline(call.args[0])
+            return
+        if name == "clamp" and not _user_defined and len(call.args) == 3:
+            self._gen_clamp_inline(call.args[0], call.args[1], call.args[2])
             return
 
         is_direct = (

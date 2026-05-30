@@ -1215,6 +1215,77 @@ branchless form harmlessly.
 Regression fixture: `tests/test_compiler_minmax_abs.ad` +
 `scripts/test_compiler_minmax_abs.sh`.
 
+### `strlen(s)` — inline NUL-terminated string length
+
+```python
+n: uint64 = strlen(s)    # s is Ptr[uint8] or Ptr[char]
+```
+
+Returns the number of bytes before the first NUL terminator — the same
+semantics as C's `strlen`. Lowered inline via `repne scasb` (x86's
+"scan string" instruction), which is approximately:
+
+```asm
+movq %rax, %rdi    ; rdi = pointer
+xorq %rcx, %rcx
+notq %rcx          ; rcx = max scan count (0xffffffff...)
+xorb %al, %al      ; al = NUL byte to search for
+cld
+repne scasb        ; scan forward, decrement rcx each byte
+notq %rcx
+decq %rcx          ; rcx = bytes before NUL = length
+movq %rcx, %rax
+```
+
+No call, no heap, no loop labels. Registers clobbered: `%rdi`, `%rcx`,
+`%al` (all caller-saved in SysV AMD64).
+
+**Why it matters.** Before this builtin, every file that needed a string
+length had to copy-paste an identical 3-line `while s[n] != 0: n += 1`
+loop under a private name (`strlen_u8`, `cstr_len`, `_slen`, …). More
+than 30 production `.ad` files carry that duplicate. Now they can call
+the builtin directly and delete the copy.
+
+As with `min`/`max`/`abs`: if you define your own `def strlen(...)` in
+the same compilation unit, the user-defined version takes precedence and
+the builtin is not intercepted. This lets existing code that already
+defines a private `strlen` keep working unmodified — the upgrade path
+is to delete the local definition and rely on the builtin.
+
+Regression fixture: `tests/test_compiler_strlen_clamp.ad` +
+`scripts/test_compiler_strlen_clamp.sh`.
+
+### `clamp(x, lo, hi)` — inline range clamp
+
+```python
+safe: int32 = clamp(raw_val, 0, 255)   # ensure 0 ≤ safe ≤ 255
+```
+
+Returns `lo` if `x < lo`, `hi` if `x > hi`, otherwise `x`. Equivalent
+to `min(max(x, lo), hi)` but computed in a single 6-instruction inline
+sequence using signed comparisons:
+
+```asm
+<eval hi> → push
+<eval lo> → push
+<eval x>  → rax
+popq %rcx          ; rcx = lo
+cmpq %rcx, %rax    ; x vs lo
+cmovl %rcx, %rax   ; if x < lo: rax = lo
+popq %rcx          ; rcx = hi
+cmpq %rcx, %rax    ; result vs hi
+cmovg %rcx, %rax   ; if result > hi: rax = hi
+```
+
+No call, no branch, no heap. Works for any integer type; uses signed
+comparison (same convention as `<`/`>`).
+
+Same shadowing rule as all other builtins: a user-defined `def clamp`
+takes precedence if it appears in the same compilation unit.
+
+Regression fixture: `tests/test_compiler_strlen_clamp.ad` +
+`scripts/test_compiler_strlen_clamp.sh`.
+
 ---
 
 ## Features deliberately not in Adder
@@ -1249,10 +1320,12 @@ rejects it.
 | Decorators on `def` / `class` (`@inline`, `@packed`, ...) | The codegen does not implement any decorator semantics. Rejected at codegen time with an actionable error (commit 25e6657: used to be silently dropped). | Define the class fields in the order and size you want; the codegen lays them out C-ABI style. For `@inline`-style hints there's no replacement — the compiler decides. |
 | `union` declarations | Parser accepts; codegen rejects at the source location with `x86: top-level UnionDef not yet supported`. Zero production usage. | Type-pun through a `Ptr[T]` cast: `cast[Ptr[uint32]](&u8_array[0])[0]`. |
 | Tuple literals / tuple types as values | `Tuple[A, B]` is not a real codegen type. | Return values by writing through caller-supplied `Ptr[T]` out-parameters, or pack into a struct. |
-| `print()`, `len()`, `input()`, `ord()`, `chr()` | Not wired up as builtins. | `printk0`/`printk1`/... family for printing. For string lengths, track a length variable explicitly. |
+| `print()`, `len()`, `input()`, `ord()`, `chr()` | Not wired up as builtins. | `printk0`/`printk1`/... family for printing. For NUL-terminated string lengths use `strlen(s)` (see *Compile-time builtins*). |
 | `sizeof(T)` | **IMPLEMENTED** — folds to a compile-time constant (`movq $N, %rax`). No runtime call, no heap. | `sizeof(int32)` → 4, `sizeof(Array[8, uint8])` → 8, `sizeof(MyStruct)` → ABI layout size. See *Compile-time builtins* below. |
 | `min(a, b)` / `max(a, b)` | **IMPLEMENTED** — lowered inline to `cmpq` + `cmovg/cmovl`. No branch, no call, no heap. | Returns the smaller / larger of two integer values. See *Compile-time builtins* below. |
 | `abs(x)` | **IMPLEMENTED** — lowered inline to `negq` + `cmovns`. No branch, no call, no heap. | Returns the absolute value of an integer. See *Compile-time builtins* below. |
+| `strlen(s)` | **IMPLEMENTED** — lowered inline to `repne scasb`. No call, no heap, no loop labels. | Returns the length of a NUL-terminated `Ptr[uint8]` / `Ptr[char]` string. See *Compile-time builtins* below. |
+| `clamp(x, lo, hi)` | **IMPLEMENTED** — lowered inline to two `cmpq` + `cmovl`/`cmovg` pairs. No call, no branch, no heap. | Constrains `x` to the range `[lo, hi]`. See *Compile-time builtins* below. |
 | Default-valued parameters `def f(x=0)` | Rejected at codegen time with an actionable error (commit 25e6657: parser used to accept the default but the call site emitted with %esi holding garbage). | Pass the default explicitly at each call site, or use overload-by-name (`alloc_default()` vs `alloc_sized(n)`). |
 | `assert`, `defer`, `yield` | Reserved keywords in the lexer; no production usage; codegen does not implement them. | Manual checks; explicit cleanup; iterative state machines. |
 | `volatile T` type modifier | Parsed but unused in codegen. | Read MMIO through `Ptr[T]` with barriers via `asm_volatile`. |
