@@ -285,7 +285,7 @@ namespace recipe uses these primitives.
 | Linux ELF userland | `tests/u-binary/u_*` | 5 (running) → Layer 2 | Stays |
 | rio display server | not yet built | 3 | New Layer 3 service — file-based window system (see `rio.md`) |
 | ipd net daemon | not yet built | 3 | Owns the IP stack as a /net 9P server |
-| Compiler | `adder/compiler/*.py` (submodule; top-level `compiler/` is a symlink) | host tool | Not part of the OS — runs on the build host. Lives in its own repo, [HamnixOS/adder](https://github.com/HamnixOS/adder); Hamnix consumes it as a git submodule pinned to a specific commit (`scripts/test_adder_pin.sh` enforces the pin in CI). |
+| Compiler | `adder/compiler/*.py` (inlined in-tree; top-level `compiler/` is a symlink) | host tool | Not part of the OS — runs on the build host. The Adder compiler lives in-tree under `adder/` (the formerly-separate HamnixOS/adder repo was folded in 2026-05-30, so drift is impossible by construction). `scripts/test_adder_pin.sh` now just functionally checks the compiler still compiles a trivial program through the `python3 -m compiler.adder` path. |
 
 ## Migration plan
 

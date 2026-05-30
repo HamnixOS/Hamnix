@@ -65,11 +65,11 @@ Linux ABI.
 
 ```
 Hamnix/
-├── adder/                # Adder compiler + LANGUAGE.md — git submodule
-│                         # pinned to a specific HamnixOS/adder commit.
-│                         # Clone with --recurse-submodules.
-├── compiler -> adder/compiler   (symlink into the submodule)
-├── LANGUAGE.md -> adder/LANGUAGE.md   (symlink into the submodule)
+├── adder/                # Adder compiler + LANGUAGE.md — inlined in-tree
+│                         # (was the HamnixOS/adder submodule; folded in
+│                         # 2026-05-30). Plain tracked files now.
+├── compiler -> adder/compiler   (symlink into adder/)
+├── LANGUAGE.md -> adder/LANGUAGE.md   (symlink into adder/)
 ├── arch/x86/             # Bare-metal kernel entry, traps, IRQs, syscalls
 ├── mm/                   # Memory allocators (memblock, page_alloc, slab)
 ├── kernel/sched/         # Scheduler, TaskStruct, signals
@@ -140,7 +140,7 @@ Hamnix uses Python-like syntax with explicit type annotations:
 | `Fn[R, A...]` | 8 bytes | Function pointer (x86_64) |
 | `Percpu[T]` | sizeof(T) | Per-CPU storage (accessed via `%gs:`) |
 
-See `LANGUAGE.md` (in the adder submodule) for the canonical reference.
+See `LANGUAGE.md` (symlinked from `adder/LANGUAGE.md`) for the canonical reference.
 
 ### Functions
 
@@ -377,13 +377,12 @@ bash scripts/test_net_dhcp.sh
 
 ### Compiler regression suite
 
-The Adder compiler and its regression fixtures now live in their own
-repository, **[HamnixOS/adder](https://github.com/HamnixOS/adder)**,
-and are consumed in Hamnix as a git submodule at `adder/`. The
-top-level `compiler/` and `LANGUAGE.md` paths in Hamnix are forwarding
-symlinks into the submodule.
+The Adder compiler and its regression fixtures live in-tree under
+`adder/` (folded in from the former HamnixOS/adder repo on 2026-05-30).
+The top-level `compiler/` and `LANGUAGE.md` paths in Hamnix are
+forwarding symlinks into `adder/`.
 
-To run the Adder compiler regression suite, work inside the submodule:
+To run the Adder compiler regression suite, work inside `adder/`:
 
 ```bash
 cd adder && bash scripts/run_compiler_tests.sh
@@ -393,12 +392,12 @@ This runs every `scripts/test_compiler_*.sh` + `scripts/test_lex_*.sh`
 serially and prints a per-test PASS/FAIL summary. Run it before
 submitting any change that affects the compiler.
 
-On the Hamnix side, CI runs `scripts/test_adder_pin.sh` (a drift check
-ensuring the submodule HEAD is a real upstream `HamnixOS/adder`
-commit). When you need a compiler fix, land it in the adder repo,
-then bump the submodule pin in a separate Hamnix commit.
+On the Hamnix side, CI runs `scripts/test_adder_pin.sh` (now a fast
+functional check that the in-tree compiler still compiles a trivial
+program through `python3 -m compiler.adder`). Compiler fixes land
+directly in `adder/` as part of the normal Hamnix commit flow.
 
-**Conventions for new quirk fixtures** (in the adder repo):
+**Conventions for new quirk fixtures** (under `adder/`):
 
 - File names: `tests/test_compiler_<short_name>.ad` +
   `scripts/test_compiler_<short_name>.sh`.
