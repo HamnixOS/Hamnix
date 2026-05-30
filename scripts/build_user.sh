@@ -173,3 +173,21 @@ build_adder_user hamnix_partition     # installer: GPT init + ESP + rootfs mkpar
 build_adder_user dd_blk               # installer: sector-aligned /dev/blk/SRC -> /dev/blk/DST copy
 build_adder_user install_file_to_slot # installer: copy one local file → target ext4 partition (via /ctl install_file verb)
 build_adder_user install_rootfs_from_manifest  # installer: walk manifest, install_file_to_slot each (target_path source_path) pair
+
+# --- X11 server + client (user/x11/ subdirectory) -------------------
+# The source lives in user/x11/<name>.ad but the ELF goes into
+# build/user/<name>.elf so build_initramfs.py's *.elf glob picks it up
+# and installs it at /bin/<name>.
+build_adder_x11() {
+    local name="$1"
+    echo "[build_user] compiling user/x11/${name}.ad -> build/user/${name}.elf"
+    python3 -m compiler.adder compile \
+        --target=x86_64-adder-user \
+        "user/x11/${name}.ad" \
+        -o "build/user/${name}.elf"
+    file "build/user/${name}.elf"
+}
+
+build_adder_x11 x11srv    # X11 core-protocol server: listens on :6000, renders into wsys fb layer
+build_adder_x11 xfill     # X11 demo client: CreateWindow + CreateGC + PolyFillRectangle round-trip
+build_adder_x11 x11test   # X11 self-test driver: spawns x11srv + xfill, asserts both PASS

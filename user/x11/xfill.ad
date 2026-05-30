@@ -1,0 +1,423 @@
+# user/x11/xfill.ad — minimal X11 demo client.
+#
+# This is the in-tree "reference client" that proves the x11srv round-trip.
+# It does NOT use Xlib — it speaks the raw X11 wire protocol over a TCP
+# connection to localhost:6000 (DISPLAY=:0).
+#
+# Sequence of X11 operations:
+#   1. Connect to 127.0.0.1:6000 via /net/tcp (Plan 9 style).
+#   2. Send the Connection Setup request.
+#   3. Read and parse the ConnSetupReply to extract resource-id-base.
+#   4. CreateWindow — allocate a 320x240 window at (10, 10).
+#   5. MapWindow — request the window to be shown.
+#   6. Wait for the Expose event the server sends.
+#   7. CreateGC — allocate a graphics context with fg=0xff4400 (orange).
+#   8. PolyFillRectangle — fill a 200x150 rectangle at (50, 40).
+#   9. CreateGC #2 — fg=0x0044ff (blue).
+#  10. PolyFillRectangle — fill a 100x80 rectangle at (180, 120).
+#  11. InternAtom "X11SRV_DONE" — signals the server to flush & exit.
+#
+# Log sentinels emitted to stdout that the test script greps for:
+#   "[xfill] connected"
+#   "[xfill] setup done resource_base=0x..."
+#   "[xfill] CreateWindow sent"
+#   "[xfill] MapWindow sent"
+#   "[xfill] Expose received"
+#   "[xfill] fill1 sent"
+#   "[xfill] fill2 sent"
+#   "[xfill] done sentinel sent"
+#   "[xfill] PASS"
+#
+# Adder quirks: big buffers at module scope; no adjacent string-concat.
+
+from user.net9 import net_dial
+from user.x11.x11proto import (
+    x11_put16, x11_put32, x11_get16_le, x11_get32_le,
+    X_ROOT_WINDOW_ID, X_ROOT_VISUAL_ID, X_RESOURCE_BASE,
+    X_CreateWindow, X_MapWindow, X_CreateGC, X_PolyFillRectangle,
+    X_GetGeometry, X_InternAtom, X_QueryExtension,
+    X_Reply, X_Error, X_Expose,
+    ExposureMask,
+)
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_exit(code: uint64)
+
+
+# -------------------------------------------------------------------
+# Module-scope buffers
+# -------------------------------------------------------------------
+
+# Request build buffer.
+req_buf: Array[512, uint8]
+# Reply / event receive buffer.
+rep_buf: Array[512, uint8]
+# Scratch for number formatting.
+scratch: Array[64, uint8]
+
+# Resource IDs allocated from resource_base + resource_mask.
+resource_base: uint32 = 0
+resource_mask: uint32 = 0
+next_id: uint32 = 1       # monotonic counter, OR'd into resource_base
+
+
+# -------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+def u64_to_hex8(v: uint32, out: Ptr[uint8]):
+    # Write 8 hex digits (no "0x") into out[0..7].
+    i: int32 = 7
+    while i >= 0:
+        nibble: uint8 = cast[uint8](v & 15)
+        if nibble < 10:
+            out[cast[uint64](i)] = nibble + 48
+        else:
+            out[cast[uint64](i)] = nibble - 10 + 97
+        v = v >> 4
+        i = i - 1
+
+
+def new_id() -> uint32:
+    # Allocate the next resource ID in the server's resource range.
+    id: uint32 = resource_base | next_id
+    next_id = next_id + 1
+    return id
+
+
+def read_exact(fd: int32, buf: Ptr[uint8], count: uint64) -> int32:
+    got: uint64 = 0
+    while got < count:
+        n: int64 = sys_read(fd, &buf[got], count - got)
+        if n <= 0:
+            return 0
+        got = got + cast[uint64](n)
+    return 1
+
+
+def send_all(fd: int32, buf: Ptr[uint8], count: uint64) -> int32:
+    sent: uint64 = 0
+    while sent < count:
+        n: int64 = sys_write(fd, &buf[sent], count - sent)
+        if n <= 0:
+            return 0
+        sent = sent + cast[uint64](n)
+    return 1
+
+
+# -------------------------------------------------------------------
+# Connection Setup (§8)
+# -------------------------------------------------------------------
+
+def send_setup(fd: int32) -> int32:
+    # Connection setup request:
+    #   byte-order ('l' = 0x6c), unused(1), major=11, minor=0,
+    #   auth-name-len=0, auth-data-len=0, unused(2)
+    # Total: 12 bytes.
+    i: uint64 = 0
+    while i < 12:
+        req_buf[i] = 0
+        i = i + 1
+    req_buf[0] = 108    # 'l' = LSBFirst
+    x11_put16(&req_buf[0], 2, 11)   # major
+    x11_put16(&req_buf[0], 4, 0)    # minor
+    return send_all(fd, &req_buf[0], 12)
+
+
+def recv_setup(fd: int32) -> int32:
+    # Read the 8-byte fixed prefix.
+    if read_exact(fd, &rep_buf[0], 8) == 0:
+        write_str(2, "[xfill] setup: failed to read prefix\n")
+        return 0
+    status: uint8 = rep_buf[0]
+    if status != 1:
+        write_str(2, "[xfill] setup: server refused connection\n")
+        return 0
+
+    # additional-data length (in 4-byte units) is at bytes 6-7.
+    add_units: uint32 = x11_get16_le(&rep_buf[0], 6)
+    add_bytes: uint64 = cast[uint64](add_units) * 4
+
+    # Read additional data (cap at 512 bytes for safety).
+    if add_bytes > 504:
+        add_bytes = 504
+    if read_exact(fd, &rep_buf[8], add_bytes) == 0:
+        write_str(2, "[xfill] setup: failed to read body\n")
+        return 0
+
+    # resource-id-base is at offset 12 from the start of the body
+    # (bytes 8..11 in our combined rep_buf).
+    resource_base = x11_get32_le(&rep_buf[0], 8 + 4)    # offset 12
+    resource_mask = x11_get32_le(&rep_buf[0], 8 + 8)    # offset 16
+
+    write_str(1, "[xfill] setup done resource_base=0x")
+    hex8: Array[8, uint8]
+    u64_to_hex8(resource_base, &hex8[0])
+    sys_write(1, &hex8[0], 8)
+    write_str(1, "\n")
+    return 1
+
+
+# -------------------------------------------------------------------
+# CreateWindow
+# Request: opcode(1), depth(1), length(2), window-id(4), parent-id(4),
+#   x(2), y(2), width(2), height(2), border-width(2), class(2),
+#   visual(4), value-mask(4)
+# Total = 32 bytes (no value-list).
+# -------------------------------------------------------------------
+
+def send_create_window(fd: int32, wid: uint32,
+                       x: uint16, y: uint16,
+                       w: uint16, h: uint16) -> int32:
+    i: uint64 = 0
+    while i < 32:
+        req_buf[i] = 0
+        i = i + 1
+    req_buf[0] = 1              # CreateWindow opcode
+    req_buf[1] = 24             # depth = 24
+    x11_put16(&req_buf[0], 2, 8)   # length = 32/4 = 8
+    x11_put32(&req_buf[0], 4, wid)
+    x11_put32(&req_buf[0], 8, X_ROOT_WINDOW_ID)   # parent = root
+    x11_put16(&req_buf[0], 12, x)
+    x11_put16(&req_buf[0], 14, y)
+    x11_put16(&req_buf[0], 16, w)
+    x11_put16(&req_buf[0], 18, h)
+    x11_put16(&req_buf[0], 20, 0)    # border-width = 0
+    x11_put16(&req_buf[0], 22, 1)    # class = InputOutput
+    x11_put32(&req_buf[0], 24, X_ROOT_VISUAL_ID)
+    x11_put32(&req_buf[0], 28, 0)    # value-mask = 0
+    return send_all(fd, &req_buf[0], 32)
+
+
+# -------------------------------------------------------------------
+# MapWindow
+# Request: opcode(1), unused(1), length(2), window-id(4) = 8 bytes.
+# -------------------------------------------------------------------
+
+def send_map_window(fd: int32, wid: uint32) -> int32:
+    i: uint64 = 0
+    while i < 8:
+        req_buf[i] = 0
+        i = i + 1
+    req_buf[0] = 8          # MapWindow
+    req_buf[1] = 0
+    x11_put16(&req_buf[0], 2, 2)   # length = 8/4 = 2
+    x11_put32(&req_buf[0], 4, wid)
+    return send_all(fd, &req_buf[0], 8)
+
+
+# -------------------------------------------------------------------
+# Wait for Expose event (type byte = 12).
+# X11 events are 32 bytes. We may receive other events first (e.g.
+# replies); keep reading 32-byte chunks until we see an Expose or error.
+# -------------------------------------------------------------------
+
+def wait_expose(fd: int32) -> int32:
+    # Try up to 16 events.
+    attempts: int32 = 0
+    while attempts < 16:
+        if read_exact(fd, &rep_buf[0], 32) == 0:
+            write_str(2, "[xfill] wait_expose: read failed\n")
+            return 0
+        ev_type: uint8 = rep_buf[0]
+        if ev_type == 12:    # Expose
+            write_str(1, "[xfill] Expose received\n")
+            return 1
+        if ev_type == 0:     # Error
+            write_str(2, "[xfill] wait_expose: got error event\n")
+            # Continue anyway — maybe it was for a previous request.
+        attempts = attempts + 1
+    write_str(2, "[xfill] wait_expose: no Expose after 16 events\n")
+    return 0
+
+
+# -------------------------------------------------------------------
+# CreateGC
+# Request: opcode(1), unused(1), length(2), gc-id(4), drawable(4),
+#   value-mask(4), value-list...
+# For GCForeground (bit 2 = 4), one 4-byte value follows.
+# Total: 16 bytes.
+# -------------------------------------------------------------------
+
+def send_create_gc(fd: int32, gid: uint32, drawable: uint32,
+                   fg: uint32) -> int32:
+    i: uint64 = 0
+    while i < 16:
+        req_buf[i] = 0
+        i = i + 1
+    req_buf[0] = 55         # CreateGC
+    req_buf[1] = 0
+    x11_put16(&req_buf[0], 2, 4)   # length = 16/4 = 4
+    x11_put32(&req_buf[0], 4, gid)
+    x11_put32(&req_buf[0], 8, drawable)
+    x11_put32(&req_buf[0], 12, 4)  # value-mask = GCForeground
+    # value-list: one entry for GCForeground = fg colour
+    # Reuse req_buf[16..19]
+    x11_put32(&req_buf[0], 16, fg)
+    # Actually need length = 20/4 = 5. Fix length field.
+    x11_put16(&req_buf[0], 2, 5)
+    return send_all(fd, &req_buf[0], 20)
+
+
+# -------------------------------------------------------------------
+# PolyFillRectangle
+# Request: opcode(1), unused(1), length(2), drawable(4), gc(4),
+#   n * { x(2) y(2) w(2) h(2) }
+# For one rectangle: 12 + 8 = 20 bytes.
+# -------------------------------------------------------------------
+
+def send_poly_fill_rect(fd: int32, drawable: uint32, gc: uint32,
+                        x: uint16, y: uint16,
+                        w: uint16, h: uint16) -> int32:
+    i: uint64 = 0
+    while i < 20:
+        req_buf[i] = 0
+        i = i + 1
+    req_buf[0] = 70          # PolyFillRectangle
+    req_buf[1] = 0
+    x11_put16(&req_buf[0], 2, 5)   # length = 20/4 = 5
+    x11_put32(&req_buf[0], 4, drawable)
+    x11_put32(&req_buf[0], 8, gc)
+    x11_put16(&req_buf[0], 12, x)
+    x11_put16(&req_buf[0], 14, y)
+    x11_put16(&req_buf[0], 16, w)
+    x11_put16(&req_buf[0], 18, h)
+    return send_all(fd, &req_buf[0], 20)
+
+
+# -------------------------------------------------------------------
+# InternAtom — used to send the "done" sentinel to the server.
+# Request: opcode(1), only-if-exists(1), length(2), name-len(2),
+#   unused(2), name (padded to 4n).
+# "X11SRV_DONE" = 11 bytes, padded to 12 (next multiple of 4).
+# Total: 8 + 12 = 20 bytes.
+# -------------------------------------------------------------------
+
+def send_intern_atom_done(fd: int32) -> int32:
+    # "X11SRV_DONE" bytes: X=88, 1=49, 1=49, S=83, R=82, V=86,
+    #   _=95, D=68, O=79, N=78, E=69  (11 bytes, pad 1 to reach 12).
+    name: Ptr[uint8] = "X11SRV_DONE"
+    name_len: uint64 = 11
+    name_padded: uint64 = 12
+
+    total: uint64 = 8 + name_padded
+    i: uint64 = 0
+    while i < total:
+        req_buf[i] = 0
+        i = i + 1
+    req_buf[0] = 16          # InternAtom
+    req_buf[1] = 0           # only-if-exists = False
+    x11_put16(&req_buf[0], 2, cast[uint16](total / 4))
+    x11_put16(&req_buf[0], 4, cast[uint16](name_len))
+    i = 0
+    while i < name_len:
+        req_buf[8 + i] = name[i]
+        i = i + 1
+    return send_all(fd, &req_buf[0], total)
+
+
+# -------------------------------------------------------------------
+# Main
+# -------------------------------------------------------------------
+
+def main() -> int32:
+    write_str(1, "[xfill] connecting to 127.0.0.1:6000\n")
+
+    # Connect to the X11 server on localhost.
+    fd: int32 = net_dial(127, 0, 0, 1, 6000)
+    if fd < 0:
+        write_str(2, "[xfill] net_dial failed\n")
+        return 1
+
+    write_str(1, "[xfill] connected\n")
+
+    # Connection setup.
+    if send_setup(fd) == 0:
+        write_str(2, "[xfill] send_setup failed\n")
+        sys_close(fd)
+        return 1
+
+    if recv_setup(fd) == 0:
+        write_str(2, "[xfill] recv_setup failed\n")
+        sys_close(fd)
+        return 1
+
+    # Allocate a window ID and a GC ID.
+    win_id: uint32 = new_id()
+    gc1_id: uint32 = new_id()
+    gc2_id: uint32 = new_id()
+
+    # CreateWindow: 320x240 at (10, 10).
+    if send_create_window(fd, win_id, 10, 10, 320, 240) == 0:
+        write_str(2, "[xfill] CreateWindow failed\n")
+        sys_close(fd)
+        return 1
+    write_str(1, "[xfill] CreateWindow sent\n")
+
+    # MapWindow.
+    if send_map_window(fd, win_id) == 0:
+        write_str(2, "[xfill] MapWindow failed\n")
+        sys_close(fd)
+        return 1
+    write_str(1, "[xfill] MapWindow sent\n")
+
+    # Wait for Expose event.
+    if wait_expose(fd) == 0:
+        write_str(2, "[xfill] no Expose event\n")
+        sys_close(fd)
+        return 1
+
+    # CreateGC #1: orange fg=0xff4400.
+    if send_create_gc(fd, gc1_id, win_id, 16728064) == 0:
+        write_str(2, "[xfill] CreateGC1 failed\n")
+        sys_close(fd)
+        return 1
+    write_str(1, "[xfill] CreateGC1 sent\n")
+
+    # PolyFillRectangle #1: 200x150 at (50, 40) — orange.
+    if send_poly_fill_rect(fd, win_id, gc1_id, 50, 40, 200, 150) == 0:
+        write_str(2, "[xfill] fill1 failed\n")
+        sys_close(fd)
+        return 1
+    write_str(1, "[xfill] fill1 sent\n")
+
+    # CreateGC #2: blue fg=0x0044ff.
+    if send_create_gc(fd, gc2_id, win_id, 17663) == 0:
+        write_str(2, "[xfill] CreateGC2 failed\n")
+        sys_close(fd)
+        return 1
+    write_str(1, "[xfill] CreateGC2 sent\n")
+
+    # PolyFillRectangle #2: 100x80 at (180, 120) — blue.
+    if send_poly_fill_rect(fd, win_id, gc2_id, 180, 120, 100, 80) == 0:
+        write_str(2, "[xfill] fill2 failed\n")
+        sys_close(fd)
+        return 1
+    write_str(1, "[xfill] fill2 sent\n")
+
+    # Done sentinel — tells the server to flush and exit.
+    if send_intern_atom_done(fd) == 0:
+        write_str(2, "[xfill] done sentinel failed\n")
+        sys_close(fd)
+        return 1
+    write_str(1, "[xfill] done sentinel sent\n")
+
+    # Read the InternAtom reply (32 bytes).
+    read_exact(fd, &rep_buf[0], 32)
+
+    sys_close(fd)
+    write_str(1, "[xfill] PASS\n")
+    return 0

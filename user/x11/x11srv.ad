@@ -1,0 +1,708 @@
+# user/x11/x11srv.ad — Hamnix native X11 server (minimal core-protocol slice).
+#
+# SCOPE (this first slice):
+#   Implemented X requests:
+#     CreateWindow       — allocates a client window ID; records geometry
+#     MapWindow          — marks window as mapped; sends Expose event
+#     CreateGC           — allocates a GC; records foreground colour
+#     PolyFillRectangle  — fills rectangles into the wsys fb draw layer
+#     GetGeometry        — returns window geometry (root/window)
+#     InternAtom         — returns a dummy atom id (enough for WM_DELETE_WINDOW etc.)
+#     QueryExtension     — returns "not present" for all extensions
+#
+#   Protocol behaviour:
+#     • Listens on TCP port 6000 (DISPLAY=:0, X11 standard).
+#     • Handles one client connection then exits.
+#     • Sends a well-formed ConnSetupReply on connect.
+#     • Sends an Expose event after MapWindow so the client knows to draw.
+#     • Sends error replies for unsupported opcodes rather than hanging.
+#
+#   Rendering target:
+#     • PolyFillRectangle paints RGBA pixels into module-scope fb_buf[].
+#     • After the session ends (client closes or sends a "done" sentinel
+#       the xfill client writes), the server flushes fb_buf into a wsys
+#       draw layer "x11fb" on wid 1 via /dev/wsys/1/draw/ctl + /fb, and
+#       logs sentinels to stdout.
+#
+# Architecture note: Hamnix has no sockets — networking is the Plan 9
+# /net file tree. The server opens /net/tcp/clone, announces port 6000,
+# and accepts one inbound connection via net_announce/net_accept.
+#
+# Adder quirks: all large buffers at module scope (U9 nested-frame-Array
+# miscompile); no adjacent string-literal concatenation.
+
+from user.net9 import net_announce, net_accept
+from user.x11.x11proto import (
+    x11_put16, x11_put32, x11_get16_le, x11_get32_le,
+    x11_build_setup_reply, x11_setup_buf,
+    X_ROOT_WINDOW_ID, X_ROOT_VISUAL_ID, X_RESOURCE_BASE,
+    X_SCREEN_W, X_SCREEN_H,
+    X_CreateWindow, X_MapWindow, X_CreateGC, X_PolyFillRectangle,
+    X_GetGeometry, X_InternAtom, X_QueryExtension,
+    X_Reply, X_Error, X_Expose,
+    BadRequest, BadImplementation,
+    ExposureMask,
+    TrueColor,
+)
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_close(fd: int32) -> int32
+extern def sys_exit(code: uint64)
+
+
+# -------------------------------------------------------------------
+# Constants
+# -------------------------------------------------------------------
+
+X11_PORT:       uint64 = 6000
+WIN_W:          uint64 = 640
+WIN_H:          uint64 = 480
+FB_SIZE:        uint64 = 1228800   # 640 * 480 * 4
+
+# Sentinel the client writes as a "done" signal. The server watches
+# for this during the request loop and flushes the fb after seeing it.
+# We use InternAtom with a name that encodes our sentinel: "X11SRV_DONE".
+SENTINEL_ATOM_LEN:  uint64 = 11
+
+# -------------------------------------------------------------------
+# Module-scope state
+# -------------------------------------------------------------------
+
+# Framebuffer for rendering (RGBA8888, 640x480).
+fb_buf: Array[1228800, uint8]
+
+# Request receive buffer — max X11 request is 65535 * 4 bytes, but
+# for our slice nothing needs more than a few hundred bytes. 4096 is
+# safe for all implemented requests.
+req_buf: Array[4096, uint8]
+
+# Reply scratch buffer.
+rep_buf: Array[1024, uint8]
+
+# Path scratch for /dev/wsys operations.
+wsys_path: Array[128, uint8]
+
+# Generic small scratch (number formatting, etc.)
+scratch: Array[64, uint8]
+
+# Client-allocated window table: up to 8 client windows.
+# We store: in_use, win_id, x, y, width, height, border, depth.
+WIN_MAX: uint64 = 8
+win_in_use: Array[8, int32]
+win_id:     Array[8, uint32]
+win_x:      Array[8, uint16]
+win_y:      Array[8, uint16]
+win_w:      Array[8, uint16]
+win_h:      Array[8, uint16]
+
+# Client-allocated GC table: up to 8 GCs.
+GC_MAX: uint64 = 8
+gc_in_use:  Array[8, int32]
+gc_id:      Array[8, uint32]
+gc_fg:      Array[8, uint32]   # foreground colour (ARGB)
+gc_bg:      Array[8, uint32]   # background colour
+
+# Sequence number for replies (X11 protocol).
+seq_num: uint32 = 0
+
+# Whether we have seen the done sentinel.
+got_sentinel: int32 = 0
+
+# -------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+def u64_to_dec(v: uint64, out: Ptr[uint8]) -> uint64:
+    if v == 0:
+        out[0] = 48
+        return 1
+    digs: Array[24, uint8]
+    n: uint64 = 0
+    while v != 0:
+        digs[n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    nw: uint64 = n
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digs[n]
+        i = i + 1
+    return nw
+
+
+def cstr_eq_n(a: Ptr[uint8], b: Ptr[uint8], n: uint64) -> int32:
+    i: uint64 = 0
+    while i < n:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+# Fully drain `count` bytes from `fd` into `buf`.
+# Returns 1 on success, 0 on connection close / error.
+def read_exact(fd: int32, buf: Ptr[uint8], count: uint64) -> int32:
+    got: uint64 = 0
+    while got < count:
+        n: int64 = sys_read(fd, &buf[got], count - got)
+        if n <= 0:
+            return 0
+        got = got + cast[uint64](n)
+    return 1
+
+
+# Send all `count` bytes from `buf` to `fd`.
+# Returns 1 on success, 0 on error.
+def send_all(fd: int32, buf: Ptr[uint8], count: uint64) -> int32:
+    sent: uint64 = 0
+    while sent < count:
+        n: int64 = sys_write(fd, &buf[sent], count - sent)
+        if n <= 0:
+            return 0
+        sent = sent + cast[uint64](n)
+    return 1
+
+
+# -------------------------------------------------------------------
+# Window table helpers
+# -------------------------------------------------------------------
+
+def win_alloc(wid: uint32, x: uint16, y: uint16,
+              w: uint16, h: uint16) -> int32:
+    i: uint64 = 0
+    while i < WIN_MAX:
+        if win_in_use[i] == 0:
+            win_in_use[i] = 1
+            win_id[i]     = wid
+            win_x[i]      = x
+            win_y[i]      = y
+            win_w[i]      = w
+            win_h[i]      = h
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def win_find(wid: uint32) -> int32:
+    i: uint64 = 0
+    while i < WIN_MAX:
+        if win_in_use[i] != 0 and win_id[i] == wid:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+# -------------------------------------------------------------------
+# GC table helpers
+# -------------------------------------------------------------------
+
+def gc_alloc(gid: uint32, fg: uint32, bg: uint32) -> int32:
+    i: uint64 = 0
+    while i < GC_MAX:
+        if gc_in_use[i] == 0:
+            gc_in_use[i] = 1
+            gc_id[i]     = gid
+            gc_fg[i]     = fg
+            gc_bg[i]     = bg
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def gc_find(gid: uint32) -> int32:
+    i: uint64 = 0
+    while i < GC_MAX:
+        if gc_in_use[i] != 0 and gc_id[i] == gid:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+# -------------------------------------------------------------------
+# Framebuffer operations
+# -------------------------------------------------------------------
+
+def fb_fill_rect(x: uint64, y: uint64, w: uint64, h: uint64,
+                 r: uint8, g: uint8, b: uint8):
+    # Paint a solid rectangle into fb_buf (RGBA8888).
+    ry: uint64 = 0
+    while ry < h:
+        yp: uint64 = y + ry
+        if yp >= WIN_H:
+            break
+        rx: uint64 = 0
+        while rx < w:
+            xp: uint64 = x + rx
+            if xp >= WIN_W:
+                break
+            off: uint64 = (yp * WIN_W + xp) * 4
+            fb_buf[off]     = r
+            fb_buf[off + 1] = g
+            fb_buf[off + 2] = b
+            fb_buf[off + 3] = 255    # opaque
+            rx = rx + 1
+        ry = ry + 1
+
+
+# -------------------------------------------------------------------
+# Send an X11 error reply to the client.
+# Error reply is always 32 bytes (§8 Error reply).
+# -------------------------------------------------------------------
+
+def send_error(fd: int32, code: uint8, seq: uint32, bad_value: uint32,
+               minor_op: uint16, major_op: uint8):
+    i: uint64 = 0
+    while i < 32:
+        rep_buf[i] = 0
+        i = i + 1
+    rep_buf[0] = 0               # error type
+    rep_buf[1] = code
+    x11_put16(&rep_buf[0], 2, cast[uint16](seq & 65535))
+    x11_put32(&rep_buf[0], 4, bad_value)
+    x11_put16(&rep_buf[0], 8, minor_op)
+    rep_buf[10] = major_op
+    send_all(fd, &rep_buf[0], 32)
+
+
+# -------------------------------------------------------------------
+# Handle one X11 request from the client.
+# Returns 1 to continue loop, 0 to break (session done or error).
+# -------------------------------------------------------------------
+
+def handle_request(fd: int32) -> int32:
+    # Read first byte to determine opcode (or connection close).
+    hdr: Array[32, uint8]
+    n: int64 = sys_read(fd, &hdr[0], 1)
+    if n <= 0:
+        return 0
+    opcode: uint8 = hdr[0]
+
+    # All requests have a 4-byte header: opcode, detail, length (u16).
+    # Read the remaining 3 bytes of the fixed header.
+    if read_exact(fd, &hdr[1], 3) == 0:
+        return 0
+
+    # Request length in 4-byte units (including the header itself).
+    req_len_units: uint32 = x11_get16_le(&hdr[0], 2)
+    # Total bytes in request = req_len_units * 4; we already have 4.
+    total_bytes: uint64 = cast[uint64](req_len_units) * 4
+    body_bytes: uint64 = 0
+    if total_bytes > 4:
+        body_bytes = total_bytes - 4
+    if body_bytes > 4092:
+        body_bytes = 4092      # cap to our buffer
+    if body_bytes > 0:
+        if read_exact(fd, &req_buf[0], body_bytes) == 0:
+            return 0
+
+    seq_num = seq_num + 1
+
+    # --- CreateWindow (opcode 1) ---
+    # Body layout (after 4-byte hdr):
+    #   depth (1 from hdr[1]), window-id (4), parent-id (4),
+    #   x (2), y (2), width (2), height (2), border-width (2),
+    #   class (2), visual (4), value-mask (4), value-list...
+    if opcode == 1:
+        if body_bytes < 24:
+            send_error(fd, BadRequest, seq_num, 0, 0, opcode)
+            return 1
+        wid: uint32 = x11_get32_le(&req_buf[0], 0)
+        # parent = req_buf[4..7] — skip (accept any parent)
+        cx: uint16 = cast[uint16](x11_get16_le(&req_buf[0], 8))
+        cy: uint16 = cast[uint16](x11_get16_le(&req_buf[0], 10))
+        cw: uint16 = cast[uint16](x11_get16_le(&req_buf[0], 12))
+        ch: uint16 = cast[uint16](x11_get16_le(&req_buf[0], 14))
+        win_alloc(wid, cx, cy, cw, ch)
+        write_str(1, "[x11srv] CreateWindow id=")
+        nd: uint64 = u64_to_dec(cast[uint64](wid), &scratch[0])
+        sys_write(1, &scratch[0], nd)
+        write_str(1, "\n")
+        return 1
+
+    # --- MapWindow (opcode 8) ---
+    # Body: window-id (4)
+    if opcode == 8:
+        if body_bytes < 4:
+            send_error(fd, BadRequest, seq_num, 0, 0, opcode)
+            return 1
+        mwid: uint32 = x11_get32_le(&req_buf[0], 0)
+        write_str(1, "[x11srv] MapWindow id=")
+        nd2: uint64 = u64_to_dec(cast[uint64](mwid), &scratch[0])
+        sys_write(1, &scratch[0], nd2)
+        write_str(1, "\n")
+        # Send an Expose event so the client knows to draw.
+        # Expose event: type=12, detail=0, seq=u16, window=u32,
+        #   x=u16, y=u16, w=u16, h=u16, count=u16, pad=14
+        # Total = 32 bytes.
+        i: uint64 = 0
+        while i < 32:
+            rep_buf[i] = 0
+            i = i + 1
+        rep_buf[0] = 12          # Expose event code
+        rep_buf[1] = 0
+        x11_put16(&rep_buf[0], 2, cast[uint16](seq_num & 65535))
+        x11_put32(&rep_buf[0], 4, mwid)
+        x11_put16(&rep_buf[0], 8, 0)      # x
+        x11_put16(&rep_buf[0], 10, 0)     # y
+        x11_put16(&rep_buf[0], 12, X_SCREEN_W)   # width
+        x11_put16(&rep_buf[0], 14, X_SCREEN_H)   # height
+        x11_put16(&rep_buf[0], 16, 0)     # count=0 (no more Expose)
+        send_all(fd, &rep_buf[0], 32)
+        return 1
+
+    # --- CreateGC (opcode 55) ---
+    # Body: gc-id (4), drawable (4), value-mask (4), value-list...
+    if opcode == 55:
+        if body_bytes < 12:
+            send_error(fd, BadRequest, seq_num, 0, 0, opcode)
+            return 1
+        gid: uint32 = x11_get32_le(&req_buf[0], 0)
+        vmask: uint32 = x11_get32_le(&req_buf[0], 8)
+        fg: uint32 = 0
+        bg: uint32 = 0
+        vp: uint64 = 12
+        # GCForeground bit = 4, GCBackground bit = 8
+        if (vmask & 4) != 0:
+            fg = x11_get32_le(&req_buf[0], vp)
+            vp = vp + 4
+        if (vmask & 8) != 0:
+            bg = x11_get32_le(&req_buf[0], vp)
+            vp = vp + 4
+        gc_alloc(gid, fg, bg)
+        write_str(1, "[x11srv] CreateGC id=")
+        nd3: uint64 = u64_to_dec(cast[uint64](gid), &scratch[0])
+        sys_write(1, &scratch[0], nd3)
+        write_str(1, " fg=0x")
+        # Print fg as hex
+        fgv: uint32 = fg
+        hx: Array[8, uint8]
+        hi: int32 = 7
+        while hi >= 0:
+            nibble: uint8 = cast[uint8](fgv & 15)
+            if nibble < 10:
+                hx[cast[uint64](hi)] = nibble + 48
+            else:
+                hx[cast[uint64](hi)] = nibble - 10 + 97
+            fgv = fgv >> 4
+            hi = hi - 1
+        sys_write(1, &hx[0], 8)
+        write_str(1, "\n")
+        return 1
+
+    # --- PolyFillRectangle (opcode 70) ---
+    # Body: drawable (4), gc-id (4), then n * { x(2) y(2) w(2) h(2) } = 8 bytes each.
+    if opcode == 70:
+        if body_bytes < 8:
+            return 1
+        # drawable = req_buf[0..3] — skip
+        gid2: uint32 = x11_get32_le(&req_buf[0], 4)
+        gi: int32 = gc_find(gid2)
+        r_col: uint8 = 0
+        g_col: uint8 = 0
+        b_col: uint8 = 0
+        if gi >= 0:
+            colour: uint32 = gc_fg[cast[uint64](gi)]
+            r_col = cast[uint8]((colour >> 16) & 255)
+            g_col = cast[uint8]((colour >> 8) & 255)
+            b_col = cast[uint8](colour & 255)
+        # Parse rectangle list (body_bytes - 8 must be multiple of 8).
+        rp: uint64 = 8
+        while rp + 8 <= body_bytes:
+            rx: uint64 = cast[uint64](x11_get16_le(&req_buf[0], rp))
+            ry: uint64 = cast[uint64](x11_get16_le(&req_buf[0], rp + 2))
+            rw: uint64 = cast[uint64](x11_get16_le(&req_buf[0], rp + 4))
+            rh: uint64 = cast[uint64](x11_get16_le(&req_buf[0], rp + 6))
+            fb_fill_rect(rx, ry, rw, rh, r_col, g_col, b_col)
+            write_str(1, "[x11srv] PolyFillRectangle x=")
+            nrx: uint64 = u64_to_dec(rx, &scratch[0])
+            sys_write(1, &scratch[0], nrx)
+            write_str(1, " y=")
+            nry: uint64 = u64_to_dec(ry, &scratch[0])
+            sys_write(1, &scratch[0], nry)
+            write_str(1, " w=")
+            nrw: uint64 = u64_to_dec(rw, &scratch[0])
+            sys_write(1, &scratch[0], nrw)
+            write_str(1, " h=")
+            nrh: uint64 = u64_to_dec(rh, &scratch[0])
+            sys_write(1, &scratch[0], nrh)
+            write_str(1, "\n")
+            rp = rp + 8
+        return 1
+
+    # --- GetGeometry (opcode 14) ---
+    # Body: drawable (4).
+    # Reply (32 bytes): reply=1, depth, seq, length=0, root=u32,
+    #   x=i16, y=i16, width=u16, height=u16, border-width=u16, pad=10
+    if opcode == 14:
+        if body_bytes < 4:
+            send_error(fd, BadRequest, seq_num, 0, 0, opcode)
+            return 1
+        drawable: uint32 = x11_get32_le(&req_buf[0], 0)
+        i2: uint64 = 0
+        while i2 < 32:
+            rep_buf[i2] = 0
+            i2 = i2 + 1
+        rep_buf[0] = X_Reply
+        rep_buf[1] = 24          # root depth = 24
+        x11_put16(&rep_buf[0], 2, cast[uint16](seq_num & 65535))
+        x11_put32(&rep_buf[0], 4, 0)     # additional data length = 0
+        x11_put32(&rep_buf[0], 8, X_ROOT_WINDOW_ID)   # root
+        # x, y, width, height for the drawable
+        wi3: int32 = win_find(drawable)
+        if wi3 >= 0:
+            wu: uint64 = cast[uint64](wi3)
+            x11_put16(&rep_buf[0], 12, 0)    # x (signed, treat as unsigned)
+            x11_put16(&rep_buf[0], 14, 0)    # y
+            x11_put16(&rep_buf[0], 16, win_w[wu])
+            x11_put16(&rep_buf[0], 18, win_h[wu])
+            x11_put16(&rep_buf[0], 20, 0)    # border-width
+        else:
+            x11_put16(&rep_buf[0], 16, X_SCREEN_W)
+            x11_put16(&rep_buf[0], 18, X_SCREEN_H)
+        send_all(fd, &rep_buf[0], 32)
+        return 1
+
+    # --- InternAtom (opcode 16) ---
+    # Body: only-if-exists (1 from hdr[1]), pad (1), name-length (u16),
+    #       then name (padded to 4n).
+    # Reply: reply=1, pad, seq, length=0, atom=u32, pad*20
+    if opcode == 16:
+        if body_bytes < 4:
+            send_error(fd, BadRequest, seq_num, 0, 0, opcode)
+            return 1
+        name_len: uint32 = x11_get16_le(&req_buf[0], 2)
+        name_ptr: Ptr[uint8] = &req_buf[4]
+
+        # Check if this is our done sentinel "X11SRV_DONE".
+        sentinel: Ptr[uint8] = "X11SRV_DONE"
+        if cast[uint64](name_len) == SENTINEL_ATOM_LEN:
+            if cstr_eq_n(name_ptr, sentinel, SENTINEL_ATOM_LEN) != 0:
+                got_sentinel = 1
+                write_str(1, "[x11srv] got done sentinel\n")
+
+        # Return atom id = 100 (arbitrary, non-zero).
+        i4: uint64 = 0
+        while i4 < 32:
+            rep_buf[i4] = 0
+            i4 = i4 + 1
+        rep_buf[0] = X_Reply
+        rep_buf[1] = 0
+        x11_put16(&rep_buf[0], 2, cast[uint16](seq_num & 65535))
+        x11_put32(&rep_buf[0], 4, 0)     # additional length = 0
+        x11_put32(&rep_buf[0], 8, 100)   # atom
+        send_all(fd, &rep_buf[0], 32)
+
+        if got_sentinel != 0:
+            return 0    # break — session done
+        return 1
+
+    # --- QueryExtension (opcode 98) ---
+    # Reply: reply=1, pad, seq, length=0, present=0, major/minor=0, pad*20
+    if opcode == 98:
+        i5: uint64 = 0
+        while i5 < 32:
+            rep_buf[i5] = 0
+            i5 = i5 + 1
+        rep_buf[0] = X_Reply
+        x11_put16(&rep_buf[0], 2, cast[uint16](seq_num & 65535))
+        rep_buf[8] = 0       # present = False
+        send_all(fd, &rep_buf[0], 32)
+        return 1
+
+    # Unknown opcode — send a BadRequest error and keep going.
+    send_error(fd, BadRequest, seq_num, 0, 0, opcode)
+    write_str(1, "[x11srv] unknown opcode=")
+    nop: uint64 = u64_to_dec(cast[uint64](opcode), &scratch[0])
+    sys_write(1, &scratch[0], nop)
+    write_str(1, "\n")
+    return 1
+
+
+# -------------------------------------------------------------------
+# Flush the framebuffer to the wsys draw layer.
+# -------------------------------------------------------------------
+
+def build_wsys_path(leaf: Ptr[uint8]):
+    # Build "/dev/wsys/1/draw/<leaf>" into wsys_path[].
+    pfx: Ptr[uint8] = "/dev/wsys/1/draw/"
+    p: uint64 = 0
+    while pfx[p] != 0:
+        wsys_path[p] = pfx[p]
+        p = p + 1
+    l: uint64 = 0
+    while leaf[l] != 0:
+        wsys_path[p] = leaf[l]
+        p = p + 1
+        l = l + 1
+    wsys_path[p] = 0
+
+
+def flush_fb_to_wsys():
+    # Create the "x11fb" layer if it doesn't exist.
+    build_wsys_path("ctl")
+    cf: int32 = sys_open_write(cast[Ptr[char]](&wsys_path[0]))
+    if cf >= 0:
+        cmd: Ptr[uint8] = "mklayer x11fb fb 640 480\n"
+        sys_write(cf, cmd, strlen_u8(cmd))
+        sys_close(cf)
+    else:
+        write_str(1, "[x11srv] warn: cannot open wsys ctl\n")
+
+    # Write the fb bytes.
+    build_wsys_path("x11fb/fb")
+    wf: int32 = sys_open_write(cast[Ptr[char]](&wsys_path[0]))
+    if wf >= 0:
+        # Write in 4096-byte chunks (sys_write may not write everything at once).
+        sent: uint64 = 0
+        while sent < FB_SIZE:
+            chunk: uint64 = 4096
+            if chunk > FB_SIZE - sent:
+                chunk = FB_SIZE - sent
+            n: int64 = sys_write(wf, &fb_buf[sent], chunk)
+            if n <= 0:
+                break
+            sent = sent + cast[uint64](n)
+        sys_close(wf)
+        write_str(1, "[x11srv] fb flushed to wsys layer\n")
+    else:
+        write_str(1, "[x11srv] warn: cannot open wsys fb\n")
+
+
+# -------------------------------------------------------------------
+# Handle the X11 connection setup handshake (§8 Connection Setup).
+#
+# The client sends:
+#   Byte 0:  byte-order ('l' = LSBFirst = 0x6c, 'B' = MSBFirst = 0x42)
+#   Byte 1:  unused
+#   Bytes 2-3:  protocol-major-version
+#   Bytes 4-5:  protocol-minor-version
+#   Bytes 6-7:  n (auth-proto-name length)
+#   Bytes 8-9:  d (auth-proto-data length)
+#   Bytes 10-11: unused
+#   Then auth-proto-name (n bytes, padded to 4n)
+#   Then auth-proto-data (d bytes, padded to 4n)
+# -------------------------------------------------------------------
+
+def handle_connection(fd: int32) -> int32:
+    # Read the 12-byte fixed header.
+    setup: Array[12, uint8]
+    if read_exact(fd, &setup[0], 12) == 0:
+        write_str(2, "[x11srv] setup read failed\n")
+        return 0
+    # byte-order byte: 0x6c = LSBFirst, 0x42 = MSBFirst
+    # We only support LSBFirst for simplicity; if client sends MSB
+    # we proceed anyway (just log it).
+    bo: uint8 = setup[0]
+    if bo != 108:     # 0x6c = 'l'
+        write_str(1, "[x11srv] warn: client sent MSBFirst byte-order\n")
+
+    # Read and discard auth-proto-name + auth-proto-data.
+    n_len: uint32 = x11_get16_le(&setup[0], 6)
+    d_len: uint32 = x11_get16_le(&setup[0], 8)
+    # Pad each to next 4-byte boundary.
+    n_pad: uint64 = cast[uint64](n_len)
+    n_rem: uint64 = n_pad % 4
+    if n_rem != 0:
+        n_pad = n_pad + 4 - n_rem
+    d_pad: uint64 = cast[uint64](d_len)
+    d_rem: uint64 = d_pad % 4
+    if d_rem != 0:
+        d_pad = d_pad + 4 - d_rem
+    auth_total: uint64 = n_pad + d_pad
+    # Read and discard (up to 256 bytes).
+    auth_buf: Array[256, uint8]
+    if auth_total > 0 and auth_total <= 256:
+        if read_exact(fd, &auth_buf[0], auth_total) == 0:
+            write_str(2, "[x11srv] setup auth read failed\n")
+            return 0
+    elif auth_total > 256:
+        # Drain excess in 256-byte chunks (unusual but safe).
+        remaining: uint64 = auth_total
+        while remaining > 0:
+            chunk: uint64 = 256
+            if chunk > remaining:
+                chunk = remaining
+            n2: int64 = sys_read(fd, &auth_buf[0], chunk)
+            if n2 <= 0:
+                return 0
+            remaining = remaining - cast[uint64](n2)
+
+    # Build and send the setup reply.
+    reply_len: uint64 = x11_build_setup_reply()
+    write_str(1, "[x11srv] sending setup reply (")
+    nd: uint64 = u64_to_dec(reply_len, &scratch[0])
+    sys_write(1, &scratch[0], nd)
+    write_str(1, " bytes)\n")
+    return send_all(fd, &x11_setup_buf[0], reply_len)
+
+
+# -------------------------------------------------------------------
+# Main
+# -------------------------------------------------------------------
+
+def main() -> int32:
+    write_str(1, "[x11srv] starting on port 6000\n")
+
+    lfd: int32 = net_announce(X11_PORT)
+    if lfd < 0:
+        write_str(2, "[x11srv] net_announce failed\n")
+        return 1
+
+    write_str(1, "[x11srv] listening\n")
+
+    # The client is spawned by x11test after this server, so the first
+    # net_accept can time out before the peer dials in. The listener stays
+    # announced across timeouts; retry until a client connects.
+    cfd: int32 = -1
+    tries: int32 = 0
+    while tries < 200:
+        cfd = net_accept(lfd)
+        if cfd >= 0:
+            break
+        tries = tries + 1
+    if cfd < 0:
+        write_str(2, "[x11srv] net_accept failed\n")
+        sys_close(lfd)
+        return 1
+
+    write_str(1, "[x11srv] client connected\n")
+
+    # X11 connection setup handshake.
+    if handle_connection(cfd) == 0:
+        write_str(2, "[x11srv] connection setup failed\n")
+        sys_close(cfd)
+        sys_close(lfd)
+        return 1
+
+    write_str(1, "[x11srv] setup complete, entering request loop\n")
+
+    # Request loop: process X11 requests until done or error.
+    while True:
+        if handle_request(cfd) == 0:
+            break
+
+    write_str(1, "[x11srv] request loop done\n")
+
+    # Flush framebuffer to wsys.
+    flush_fb_to_wsys()
+
+    sys_close(cfd)
+    sys_close(lfd)
+
+    write_str(1, "[x11srv] PASS\n")
+    return 0
