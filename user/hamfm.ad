@@ -1,0 +1,481 @@
+# user/hamfm.ad
+#
+# Hamnix `hamfm` — a full-screen TUI file manager, modelled on user/vi.ad.
+#
+#   hamfm [DIR]       # browse DIR (or the current working directory)
+#
+# INPUT MODEL
+#   hamfm owns the raw console exactly like vi: when hamsh (or the hamUId
+#   desktop daemon) spawns it, fd 0/1/2 are bound to the raw console with
+#   NO kernel line-cooking and NO echo. It reads one keystroke at a time
+#   off fd 0 with sys_read_nb + sys_yield and repaints the whole screen
+#   with ANSI escapes on every state change. Arrow keys arrive a byte at
+#   a time (ESC '[' A/B) and are reassembled by a tiny state machine.
+#
+# MODES
+#   LIST  — a navigable directory listing with a highlighted cursor row.
+#   VIEW  — the contents of the selected regular file, shown inline.
+#
+# LIST keys
+#   j / down      move the cursor down
+#   k / up        move the cursor up
+#   Enter         open the selected entry:
+#                   directory -> descend (re-list)
+#                   file      -> VIEW its contents inline
+#   u / Backspace go to the parent directory
+#   q             quit
+#
+# VIEW keys
+#   any key       return to the LIST
+#   q             quit
+#
+# DIRECTORY DETECTION
+#   Hamnix has no stat(2). Following user/find.ad, the directory test IS
+#   sys_listdir on the full path: it succeeds (>= 0) on a directory and
+#   fails (< 0) on a regular file. File viewing is done in-process with
+#   sys_open + sys_read (NEVER by spawning a child — a detached rfork from
+#   inside a windowed child hits a known-buggy path).
+
+extern def sys_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_yield() -> int32
+extern def sys_listdir(path: Ptr[char], buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_getcwd(buf: Ptr[uint8], count: uint64) -> int64
+
+
+# --- capacity --------------------------------------------------------
+MAX_ENTRIES: uint64 = 1024          # directory entries we can hold
+NAME_CAP:    uint64 = 64            # bytes stored per entry name
+PATH_CAP:    uint64 = 1024          # max byte length of the current path
+LIST_CAP:    uint64 = 65536         # raw listdir buffer size
+SCREEN_ROWS: uint64 = 22            # visible listing rows (status is +2)
+VIEW_ROWS:   uint64 = 23            # visible file rows in VIEW mode
+
+# Current directory path, NUL-terminated.
+cur_path: Array[1024, uint8]
+cur_path_len: uint64 = 0
+
+# Raw listdir output + the parsed entry table. Each entry's name is
+# stored NUL-terminated in a fixed-width slot of the names pool.
+list_buf: Array[65536, uint8]
+names: Array[65536, uint8]          # MAX_ENTRIES * NAME_CAP
+name_len: Array[1024, uint64]       # live byte count of each entry name
+num_entries: uint64 = 0
+
+# Cursor + viewport for the LIST.
+cursor: uint64 = 0                  # selected entry index
+top: uint64 = 0                    # first entry shown on screen
+
+# A scratch full path (current path + "/" + a name), NUL-terminated.
+full_path: Array[1088, uint8]
+
+# State.
+MODE_LIST: int32 = 0
+MODE_VIEW: int32 = 1
+mode: int32 = 0
+running: int32 = 1
+
+# A short status message for the bottom bar.
+status_msg: Array[128, uint8]
+status_len: uint64 = 0
+
+# Escape-parser state: 0 ground, 1 saw ESC, 2 saw ESC[ (CSI).
+esc_state: int32 = 0
+
+# File-view scratch: read the whole (capped) file into one buffer.
+view_buf: Array[65536, uint8]
+view_len: uint64 = 0
+VIEW_CAP: uint64 = 65536
+
+
+# ====================================================================
+# Small string helpers
+# ====================================================================
+def cstr_len(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_cstr(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, cstr_len(s))
+
+
+# Pointer to the first byte of entry `i`'s name slot.
+def name_ptr(i: uint64) -> Ptr[uint8]:
+    return cast[Ptr[uint8]](cast[uint64](&names[0]) + i * NAME_CAP)
+
+
+def set_status(s: Ptr[uint8]):
+    n: uint64 = cstr_len(s)
+    if n > 127:
+        n = 127
+    i: uint64 = 0
+    while i < n:
+        status_msg[i] = s[i]
+        i = i + 1
+    status_len = n
+
+
+# ====================================================================
+# Path construction
+# ====================================================================
+# Build full_path = cur_path + "/" + name(i), NUL-terminated. Avoids a
+# double slash when cur_path is exactly "/".
+def build_full_path(i: uint64):
+    j: uint64 = 0
+    while j < cur_path_len and j < PATH_CAP:
+        full_path[j] = cur_path[j]
+        j = j + 1
+    # Add a separator unless cur_path already ends in '/'.
+    if j == 0 or full_path[j - 1] != 47:
+        full_path[j] = 47
+        j = j + 1
+    nl: uint64 = name_len[i]
+    p: Ptr[uint8] = name_ptr(i)
+    k: uint64 = 0
+    while k < nl and j < 1087:
+        full_path[j] = p[k]
+        j = j + 1
+        k = k + 1
+    full_path[j] = 0
+
+
+# Replace cur_path with its parent directory. Root ("/") stays root.
+def go_parent():
+    if cur_path_len <= 1:
+        cur_path[0] = 47
+        cur_path[1] = 0
+        cur_path_len = 1
+        return
+    # Drop a trailing slash (other than the root slash).
+    n: uint64 = cur_path_len
+    if cur_path[n - 1] == 47:
+        n = n - 1
+    # Walk back to the previous '/'.
+    while n > 1 and cur_path[n - 1] != 47:
+        n = n - 1
+    # n now points just after the last '/'. Keep that '/' unless it's the
+    # leading root slash with content after it.
+    if n > 1:
+        n = n - 1                       # drop the trailing slash too
+    if n == 0:
+        n = 1                           # never empty: collapse to root
+    cur_path[n] = 0
+    cur_path_len = n
+
+
+# Set cur_path to a NUL-terminated string.
+def set_cur_path(s: Ptr[uint8]):
+    i: uint64 = 0
+    while s[i] != 0 and i < PATH_CAP - 1:
+        cur_path[i] = s[i]
+        i = i + 1
+    if i == 0:
+        cur_path[0] = 47
+        i = 1
+    cur_path[i] = 0
+    cur_path_len = i
+
+
+# ====================================================================
+# Directory listing
+# ====================================================================
+# Re-read cur_path into the entry table. The listdir buffer is a packed
+# run of NUL-or-newline-separated 8.3-ish names; we split on '\n' (FAT
+# path) and on '\0' defensively, dropping "." and "..".
+def load_dir():
+    num_entries = 0
+    cursor = 0
+    top = 0
+    n: int64 = sys_listdir(cast[Ptr[char]](&cur_path[0]), &list_buf[0], LIST_CAP)
+    if n < 0:
+        set_status(cast[Ptr[uint8]]("listdir failed"))
+        return
+    nu: uint64 = cast[uint64](n)
+    i: uint64 = 0
+    while i < nu:
+        # Skip separators.
+        c: uint8 = list_buf[i]
+        if c == 10 or c == 0:
+            i = i + 1
+            continue
+        # Collect one name [i, j).
+        j: uint64 = i
+        while j < nu:
+            d: uint8 = list_buf[j]
+            if d == 10 or d == 0:
+                break
+            j = j + 1
+        nl: uint64 = j - i
+        # Drop "." / "..".
+        keep: int32 = 1
+        if nl == 1 and list_buf[i] == 46:
+            keep = 0
+        if nl == 2 and list_buf[i] == 46 and list_buf[i + 1] == 46:
+            keep = 0
+        if keep != 0 and num_entries < MAX_ENTRIES:
+            store: uint64 = nl
+            if store > NAME_CAP - 1:
+                store = NAME_CAP - 1
+            dst: Ptr[uint8] = name_ptr(num_entries)
+            k: uint64 = 0
+            while k < store:
+                dst[k] = list_buf[i + k]
+                k = k + 1
+            dst[store] = 0
+            name_len[num_entries] = store
+            num_entries = num_entries + 1
+        i = j + 1
+
+
+# 1 if the full path for entry `i` is itself a directory. Mirrors
+# user/find.ad: a successful sys_listdir means a directory.
+def entry_is_dir(i: uint64) -> int32:
+    build_full_path(i)
+    probe: Array[16, uint8]
+    n: int64 = sys_listdir(cast[Ptr[char]](&full_path[0]), &probe[0], 16)
+    if n >= 0:
+        return 1
+    return 0
+
+
+# ====================================================================
+# File viewing (in-process — never spawn a child)
+# ====================================================================
+def load_view(i: uint64):
+    build_full_path(i)
+    view_len = 0
+    fd: int32 = sys_open(cast[Ptr[char]](&full_path[0]))
+    if fd < 0:
+        set_status(cast[Ptr[uint8]]("open failed"))
+        return
+    while view_len < VIEW_CAP:
+        want: uint64 = VIEW_CAP - view_len
+        if want > 4096:
+            want = 4096
+        got: int64 = sys_read(fd, cast[Ptr[uint8]](cast[uint64](&view_buf[0]) + view_len), want)
+        if got <= 0:
+            break
+        view_len = view_len + cast[uint64](got)
+    sys_close(fd)
+
+
+# ====================================================================
+# Rendering
+# ====================================================================
+def redraw():
+    write_cstr(1, cast[Ptr[uint8]]("\x1b[?25l\x1b[H"))
+    if mode == MODE_VIEW:
+        redraw_view()
+    else:
+        redraw_list()
+    write_cstr(1, cast[Ptr[uint8]]("\x1b[?25h"))
+
+
+def scroll_to_cursor():
+    if cursor < top:
+        top = cursor
+    else:
+        if cursor >= top + SCREEN_ROWS:
+            top = cursor - SCREEN_ROWS + 1
+
+
+def redraw_list():
+    scroll_to_cursor()
+    # Header: the current path, in reverse video.
+    write_cstr(1, cast[Ptr[uint8]]("\r\x1b[K\x1b[7m hamfm  "))
+    sys_write(1, &cur_path[0], cur_path_len)
+    write_cstr(1, cast[Ptr[uint8]]("\x1b[0m\r\n"))
+    r: uint64 = 0
+    while r < SCREEN_ROWS:
+        idx: uint64 = top + r
+        write_cstr(1, cast[Ptr[uint8]]("\r\x1b[K"))
+        if idx < num_entries:
+            sel: int32 = 0
+            if idx == cursor:
+                sel = 1
+            if sel != 0:
+                write_cstr(1, cast[Ptr[uint8]]("\x1b[7m> "))
+            else:
+                write_cstr(1, cast[Ptr[uint8]]("  "))
+            sys_write(1, name_ptr(idx), name_len[idx])
+            # Trailing '/' marks directories.
+            if entry_is_dir(idx) != 0:
+                write_cstr(1, cast[Ptr[uint8]]("/"))
+            if sel != 0:
+                write_cstr(1, cast[Ptr[uint8]]("\x1b[0m"))
+        write_cstr(1, cast[Ptr[uint8]]("\r\n"))
+        r = r + 1
+    # Status / help bar.
+    write_cstr(1, cast[Ptr[uint8]]("\r\x1b[K\x1b[7m j/k move  Enter open  u up  q quit "))
+    if status_len > 0:
+        write_cstr(1, cast[Ptr[uint8]](" | "))
+        sys_write(1, &status_msg[0], status_len)
+    write_cstr(1, cast[Ptr[uint8]]("\x1b[0m"))
+    write_cstr(1, cast[Ptr[uint8]]("\x1b[H"))
+
+
+def redraw_view():
+    # Header line: the file path.
+    write_cstr(1, cast[Ptr[uint8]]("\r\x1b[K\x1b[7m view: "))
+    write_cstr(1, cast[Ptr[uint8]](&full_path[0]))
+    write_cstr(1, cast[Ptr[uint8]]("  (any key returns) \x1b[0m\r\n"))
+    # Body: print the captured bytes, one screen row per source line,
+    # capped to VIEW_ROWS rows so we never scroll off the status bar.
+    rows: uint64 = 0
+    i: uint64 = 0
+    write_cstr(1, cast[Ptr[uint8]]("\r\x1b[K"))
+    while i < view_len and rows < VIEW_ROWS:
+        c: uint8 = view_buf[i]
+        if c == 10:
+            write_cstr(1, cast[Ptr[uint8]]("\r\n\x1b[K"))
+            rows = rows + 1
+        else:
+            if c >= 32 or c == 9:
+                sys_write(1, cast[Ptr[uint8]](cast[uint64](&view_buf[0]) + i), 1)
+        i = i + 1
+    write_cstr(1, cast[Ptr[uint8]]("\x1b[H"))
+
+
+# ====================================================================
+# Actions
+# ====================================================================
+def open_selected():
+    if num_entries == 0:
+        return
+    if cursor >= num_entries:
+        return
+    if entry_is_dir(cursor) != 0:
+        # Descend: cur_path becomes full_path of the selected dir.
+        build_full_path(cursor)
+        set_cur_path(cast[Ptr[uint8]](&full_path[0]))
+        status_len = 0
+        load_dir()
+    else:
+        load_view(cursor)
+        mode = MODE_VIEW
+
+
+def cursor_down():
+    if num_entries == 0:
+        return
+    if cursor + 1 < num_entries:
+        cursor = cursor + 1
+
+
+def cursor_up():
+    if cursor > 0:
+        cursor = cursor - 1
+
+
+# ====================================================================
+# Key dispatch
+# ====================================================================
+def handle_list(c: uint8):
+    if c == 113:                        # 'q' — quit
+        running = 0
+    elif c == 106:                      # 'j' — down
+        cursor_down()
+    elif c == 107:                      # 'k' — up
+        cursor_up()
+    elif c == 13 or c == 10:            # Enter — open
+        open_selected()
+    elif c == 117:                      # 'u' — parent
+        go_parent()
+        status_len = 0
+        load_dir()
+    elif c == 8 or c == 127:            # Backspace — parent
+        go_parent()
+        status_len = 0
+        load_dir()
+
+
+def handle_view(c: uint8):
+    if c == 113:                        # 'q' — quit straight out of VIEW
+        running = 0
+        return
+    # Any other key returns to the listing.
+    mode = MODE_LIST
+
+
+def dispatch(c: uint8):
+    if mode == MODE_VIEW:
+        handle_view(c)
+    else:
+        handle_list(c)
+
+
+# Arrow keys -> j/k in LIST; treated as "return" in VIEW.
+def feed_movement_key(jk: uint8):
+    if mode == MODE_VIEW:
+        mode = MODE_LIST
+        return
+    if jk == 106:
+        cursor_down()
+    elif jk == 107:
+        cursor_up()
+
+
+def feed_byte(c: uint8):
+    if esc_state == 1:
+        if c == 91:                     # '[' — CSI
+            esc_state = 2
+            return
+        esc_state = 0
+        dispatch(27)
+        dispatch(c)
+        return
+    if esc_state == 2:
+        esc_state = 0
+        if c == 65:                     # Up
+            feed_movement_key(107)
+        elif c == 66:                   # Down
+            feed_movement_key(106)
+        # Left/Right and other CSI finals are ignored.
+        return
+    if c == 27:
+        esc_state = 1
+        return
+    dispatch(c)
+
+
+# ====================================================================
+# Main loop
+# ====================================================================
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    # Starting directory: argv[1] if given, else the cwd.
+    if argc >= 2:
+        set_cur_path(cast[Ptr[uint8]](argv[1]))
+    else:
+        cwd: Array[1024, uint8]
+        cn: int64 = sys_getcwd(&cwd[0], 1024)
+        if cn > 0:
+            set_cur_path(cast[Ptr[uint8]](&cwd[0]))
+        else:
+            set_cur_path(cast[Ptr[uint8]]("/"))
+
+    load_dir()
+    mode = MODE_LIST
+
+    write_cstr(1, cast[Ptr[uint8]]("\x1b[2J\x1b[H"))
+    redraw()
+
+    rb: Array[1, uint8]
+    while running != 0:
+        n: int64 = sys_read_nb(0, &rb[0], 1)
+        if n < 0:
+            break
+        if n == 0:
+            sys_yield()
+            continue
+        feed_byte(rb[0])
+        if running != 0:
+            redraw()
+
+    write_cstr(1, cast[Ptr[uint8]]("\x1b[2J\x1b[H\x1b[?25h"))
+    return 0
