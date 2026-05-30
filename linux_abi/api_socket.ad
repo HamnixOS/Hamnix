@@ -63,6 +63,16 @@
 #   IPPROTO_TCP=6, IPPROTO_UDP=17
 
 from linux_abi.exports import _add_export
+from drivers.net.tcp import (
+    tcp_connect, tcp_send, tcp_recv, tcp_close,
+    tcp_listen, tcp_accept,
+    TCP_ERR_NOSLOT, TCP_ERR_ARP, TCP_ERR_REFUSED, TCP_ERR_TIMEOUT
+)
+from drivers.net.udp import (
+    udp_socket_open, udp_socket_close,
+    udp_socket_bind, udp_socket_connect,
+    udp_socket_sendto, udp_socket_recvfrom
+)
 
 
 # --- Slot table -----------------------------------------------------
@@ -76,19 +86,25 @@ from linux_abi.exports import _add_export
 # warns about, and that the rest of linux_abi/ applies the same way.
 #
 # Slot layout:
-#   sock_in_use   : 0 = free, 1 = allocated.
-#   sock_family   : AF_* value passed to sock_create_kern.
-#   sock_type     : SOCK_* value.
-#   sock_protocol : IPPROTO_* value (or 0 for "default").
-#   sock_bound    : 1 if kernel_bind was called against this slot.
+#   sock_in_use    : 0 = free, 1 = allocated.
+#   sock_family    : AF_* value passed to sock_create_kern.
+#   sock_type      : SOCK_* value.
+#   sock_protocol  : IPPROTO_* value (or 0 for "default").
+#   sock_bound     : 1 if kernel_bind was called against this slot.
+#   sock_tcp_slot  : TCP TCB slot index (int32); -1 = not connected.
+#   sock_udp_slot  : UDP socket slot index (int32); -1 = not open.
+#   sock_peer_ip   : IPv4 peer address (host order), 0 = not connected.
+#   sock_peer_port : peer port (host order), 0 = not connected.
 
 MAX_SOCK_SLOTS: uint64 = 16
 
-sock_in_use:   Array[16, uint64]
-sock_family:   Array[16, int32]
-sock_type:     Array[16, int32]
-sock_protocol: Array[16, int32]
-sock_bound:    Array[16, uint64]
+sock_in_use:    Array[16, uint64]
+sock_family:    Array[16, int32]
+sock_type:      Array[16, int32]
+sock_protocol:  Array[16, int32]
+sock_bound:     Array[16, uint64]
+sock_tcp_slot:  Array[16, int32]   # -1 = no TCP connection
+sock_udp_slot:  Array[16, int32]   # -1 = no UDP socket
 
 
 def _sock_alloc_slot() -> int32:
@@ -141,11 +157,13 @@ def _l_sock_create_kern(net: uint64, family: int32, type_: int32,
     if slot < 0:
         return -23                                  # -ENFILE (no free slot)
     s: uint64 = cast[uint64](slot)
-    sock_in_use[s]   = 1
-    sock_family[s]   = family
-    sock_type[s]     = type_
-    sock_protocol[s] = protocol
-    sock_bound[s]    = 0
+    sock_in_use[s]    = 1
+    sock_family[s]    = family
+    sock_type[s]      = type_
+    sock_protocol[s]  = protocol
+    sock_bound[s]     = 0
+    sock_tcp_slot[s]  = -1
+    sock_udp_slot[s]  = -1
     # Cookie is (slot + 1) so a NULL-check on *res still works for the
     # caller. Same convention as api_kthread's task_struct handle.
     cookie: uint64 = s + 1
@@ -156,71 +174,232 @@ def _l_sock_create_kern(net: uint64, family: int32, type_: int32,
 
 def _l_sock_release(sock: uint64):
     # Linux's sock_release: drops the socket's ref, fires its ->release
-    # op, frees the struct socket. At L28 we just free the slot.
+    # op, frees the struct socket. Closes any underlying TCP/UDP layer
+    # slot before freeing our table entry.
     # Tolerate NULL (Linux warns but doesn't oops) and stale cookies
     # (defensive — see _sock_cookie_to_slot).
     slot: int32 = _sock_cookie_to_slot(sock)
     if slot < 0:
         return
     s: uint64 = cast[uint64](slot)
-    sock_in_use[s]   = 0
-    sock_family[s]   = 0
-    sock_type[s]     = 0
-    sock_protocol[s] = 0
-    sock_bound[s]    = 0
+    # Close the underlying protocol-layer socket.
+    if sock_type[s] == 1:
+        # SOCK_STREAM — close TCP connection if open.
+        tslot: int32 = sock_tcp_slot[s]
+        if tslot >= 0:
+            tcp_close(tslot)
+            sock_tcp_slot[s] = -1
+    elif sock_type[s] == 2:
+        # SOCK_DGRAM — close UDP socket if open.
+        uslot: int32 = sock_udp_slot[s]
+        if uslot >= 0:
+            udp_socket_close(uslot)
+            sock_udp_slot[s] = -1
+    sock_in_use[s]    = 0
+    sock_family[s]    = 0
+    sock_type[s]      = 0
+    sock_protocol[s]  = 0
+    sock_bound[s]     = 0
+    sock_tcp_slot[s]  = -1
+    sock_udp_slot[s]  = -1
 
 
 # --- Shims: kernel_bind / kernel_sendto / kernel_recvfrom -----------
 
 def _l_kernel_bind(sock: uint64, addr: uint64, addrlen: int32) -> int32:
-    # Linux: forwards to sock->ops->bind. We just RECORD the bind so
-    # the slot reflects "this socket would route incoming traffic to
-    # the bound address if the stack existed."
+    # Linux: forwards to sock->ops->bind. For AF_INET SOCK_STREAM,
+    # start a TCP listener on the bound port. For AF_INET SOCK_DGRAM,
+    # bind the UDP socket to the local port from the sockaddr_in.
+    # For other families we just record the bind flag.
+    #
+    # struct sockaddr_in layout:
+    #   offset 0  : uint16 sin_family (host order)
+    #   offset 2  : uint16 sin_port   (BIG-endian)
+    #   offset 4  : uint32 sin_addr   (BIG-endian)
     slot: int32 = _sock_cookie_to_slot(sock)
     if slot < 0:
         return -88                                  # -ENOTSOCK
     if addr == 0 or addrlen <= 0:
         return -22                                  # -EINVAL
     s: uint64 = cast[uint64](slot)
+    if sock_family[s] == 2:
+        # AF_INET: parse the port from sockaddr_in[2..4) (big-endian).
+        ap: Ptr[uint8] = cast[Ptr[uint8]](addr)
+        port_be: uint16 = (cast[uint16](ap[2]) << 8) | cast[uint16](ap[3])
+        if sock_type[s] == 1:
+            # SOCK_STREAM — open a TCP listener on this port.
+            tslot: int32 = tcp_listen(port_be)
+            if tslot < 0:
+                return -98                          # -EADDRINUSE
+            sock_tcp_slot[s] = tslot
+        elif sock_type[s] == 2:
+            # SOCK_DGRAM — open a UDP socket and bind it.
+            uslot: int32 = udp_socket_open()
+            if uslot < 0:
+                return -23                          # -ENFILE
+            rc: int32 = udp_socket_bind(uslot, port_be)
+            if rc != 0:
+                udp_socket_close(uslot)
+                return -98                          # -EADDRINUSE
+            sock_udp_slot[s] = uslot
     sock_bound[s] = 1
     return 0
 
 
+def _l_kernel_connect(sock: uint64, addr: uint64, addrlen: int32,
+                       flags: int32) -> int32:
+    # Linux kernel_connect: perform an active TCP connect or a UDP
+    # pseudo-connect (records peer address only). For AF_INET SOCK_STREAM
+    # this drives a real TCP 3-way handshake via tcp_connect(). Returns 0
+    # on success or a negative errno on failure.
+    #
+    # struct sockaddr_in layout (same as kernel_bind):
+    #   offset 0 : uint16 sin_family  (host order)
+    #   offset 2 : uint16 sin_port    (BIG-endian)
+    #   offset 4 : uint32 sin_addr    (BIG-endian)
+    slot: int32 = _sock_cookie_to_slot(sock)
+    if slot < 0:
+        return -88                                  # -ENOTSOCK
+    if addr == 0 or addrlen < 16:
+        return -22                                  # -EINVAL
+    s: uint64 = cast[uint64](slot)
+    if sock_family[s] != 2:
+        return -97                                  # -EAFNOSUPPORT
+    ap: Ptr[uint8] = cast[Ptr[uint8]](addr)
+    port_be: uint16 = (cast[uint16](ap[2]) << 8) | cast[uint16](ap[3])
+    # IPv4 address at offset 4 is big-endian on wire: byte 4=b0, 7=b3.
+    b0: uint8 = ap[4]
+    b1: uint8 = ap[5]
+    b2: uint8 = ap[6]
+    b3: uint8 = ap[7]
+    if sock_type[s] == 1:
+        # SOCK_STREAM: TCP active-open. 300 jiffies = 3 s timeout.
+        tslot: int32 = tcp_connect(b0, b1, b2, b3, port_be, 300)
+        if tslot == TCP_ERR_REFUSED:
+            return -111                             # -ECONNREFUSED
+        if tslot == TCP_ERR_TIMEOUT:
+            return -110                             # -ETIMEDOUT
+        if tslot == TCP_ERR_ARP:
+            return -101                             # -ENETUNREACH
+        if tslot < 0:
+            return -111                             # -ECONNREFUSED generic
+        sock_tcp_slot[s] = tslot
+        return 0
+    elif sock_type[s] == 2:
+        # SOCK_DGRAM: UDP pseudo-connect. Open a socket if not already
+        # open, then record the peer.
+        uslot: int32 = sock_udp_slot[s]
+        if uslot < 0:
+            uslot = udp_socket_open()
+            if uslot < 0:
+                return -23                          # -ENFILE
+            sock_udp_slot[s] = uslot
+        # peer_ip in host order: reconstruct from big-endian bytes.
+        peer_ip: uint32 = (cast[uint32](b0) << 24) | (cast[uint32](b1) << 16) \
+            | (cast[uint32](b2) << 8) | cast[uint32](b3)
+        udp_socket_connect(uslot, peer_ip, port_be)
+        return 0
+    return -93                                      # -EPROTONOSUPPORT
+
+
 def _l_kernel_sendto(sock: uint64, buf: uint64, len_: uint64,
                       flags: int32, addr: uint64, addrlen: int32) -> int32:
-    # Linux: returns the number of bytes actually sent, or a negative
-    # errno. With no network stack we report "all bytes accepted" —
-    # the truthful answer would be 0 (nothing left this machine), but
-    # 0 from sendto signals "peer closed" in many module idioms, and
-    # we'd rather not surface a spurious EOF. Returning `len_` lets
-    # the caller's "did we write everything?" check pass.
+    # Linux kernel_sendto: route through real TCP (for SOCK_STREAM) or
+    # UDP (for SOCK_DGRAM). For a connected TCP socket `addr` is ignored.
+    # For UDP, `addr` is parsed for the destination if non-NULL;
+    # otherwise the connected peer is used.
     slot: int32 = _sock_cookie_to_slot(sock)
     if slot < 0:
         return -88                                  # -ENOTSOCK
     if buf == 0 or len_ == 0:
         return 0
-    # len_ is uint64 but the return type is int32 — kernel modules
-    # never send more than INT_MAX in one call (the syscall layer
-    # caps it at MAX_RW_COUNT). Clamp defensively.
-    if len_ > 0x7FFFFFFF:
-        return 0x7FFFFFFF
-    return cast[int32](len_)
+    s: uint64 = cast[uint64](slot)
+    if sock_type[s] == 1:
+        # SOCK_STREAM (TCP). Must be connected.
+        tslot: int32 = sock_tcp_slot[s]
+        if tslot < 0:
+            return -107                             # -ENOTCONN
+        payload: Ptr[uint8] = cast[Ptr[uint8]](buf)
+        # tcp_send handles at most TCP_MSS per call; for larger payloads
+        # the kernel module is responsible for looping. We pass what we
+        # have capped at 0x7FFFFFFF (the int32 return ceiling).
+        send_len: uint64 = len_
+        if send_len > 0x7FFFFFFF:
+            send_len = 0x7FFFFFFF
+        rc64: int64 = tcp_send(tslot, payload, send_len)
+        if rc64 < 0:
+            return -32                              # -EPIPE
+        return cast[int32](rc64)
+    elif sock_type[s] == 2:
+        # SOCK_DGRAM (UDP).
+        uslot: int32 = sock_udp_slot[s]
+        if uslot < 0:
+            # Auto-open a UDP slot on first send (Linux semantics).
+            uslot = udp_socket_open()
+            if uslot < 0:
+                return -23                          # -ENFILE
+            sock_udp_slot[s] = uslot
+        payload2: Ptr[uint8] = cast[Ptr[uint8]](buf)
+        send_len2: uint64 = len_
+        if send_len2 > 0x7FFFFFFF:
+            send_len2 = 0x7FFFFFFF
+        dst_ip:   uint32 = 0
+        dst_port: uint16 = 0
+        if addr != 0 and addrlen >= 16:
+            # Parse the sockaddr_in destination.
+            ap2: Ptr[uint8] = cast[Ptr[uint8]](addr)
+            dst_port = (cast[uint16](ap2[2]) << 8) | cast[uint16](ap2[3])
+            dst_ip = (cast[uint32](ap2[4]) << 24) | (cast[uint32](ap2[5]) << 16) \
+                | (cast[uint32](ap2[6]) << 8) | cast[uint32](ap2[7])
+        # udp_socket_sendto: dst_ip host order.
+        rc64_2: int64 = udp_socket_sendto(uslot, dst_ip, dst_port,
+                                           payload2, send_len2)
+        if rc64_2 < 0:
+            return cast[int32](rc64_2)
+        return cast[int32](rc64_2)
+    return -88                                      # -ENOTSOCK (unsupported type)
 
 
 def _l_kernel_recvfrom(sock: uint64, buf: uint64, len_: uint64,
                         flags: int32, addr: uint64, addrlen: uint64) -> int32:
-    # Linux: returns the number of bytes received, 0 on orderly shutdown,
-    # or a negative errno. With no network stack we have nothing to
-    # deliver — return -EAGAIN (-11) so a non-blocking caller treats
-    # the socket as "no data right now" and loops; a blocking caller
-    # would loop forever in real Linux, but at L28 nothing actually
-    # calls recvfrom (the fixture stops at sock_release).
+    # Linux kernel_recvfrom: route through real TCP or UDP. Returns bytes
+    # received, 0 on orderly shutdown (TCP FIN), or a negative errno.
     slot: int32 = _sock_cookie_to_slot(sock)
     if slot < 0:
         return -88                                  # -ENOTSOCK
     if buf == 0 or len_ == 0:
         return -22                                  # -EINVAL
-    return -11                                      # -EAGAIN (no data)
+    s: uint64 = cast[uint64](slot)
+    if sock_type[s] == 1:
+        # SOCK_STREAM (TCP). Must be connected.
+        tslot: int32 = sock_tcp_slot[s]
+        if tslot < 0:
+            return -107                             # -ENOTCONN
+        payload3: Ptr[uint8] = cast[Ptr[uint8]](buf)
+        recv_len: uint64 = len_
+        if recv_len > 0x7FFFFFFF:
+            recv_len = 0x7FFFFFFF
+        # Use 500 jiffies (5 s) as the blocking timeout.
+        rc64_3: int64 = tcp_recv(tslot, payload3, recv_len, 500)
+        if rc64_3 < 0:
+            return -104                             # -ECONNRESET
+        return cast[int32](rc64_3)
+    elif sock_type[s] == 2:
+        # SOCK_DGRAM (UDP).
+        uslot2: int32 = sock_udp_slot[s]
+        if uslot2 < 0:
+            return -11                              # -EAGAIN (no socket bound)
+        payload4: Ptr[uint8] = cast[Ptr[uint8]](buf)
+        recv_len2: uint64 = len_
+        if recv_len2 > 0x7FFFFFFF:
+            recv_len2 = 0x7FFFFFFF
+        rc64_4: int64 = udp_socket_recvfrom(uslot2, payload4, recv_len2, 500,
+                                             cast[Ptr[uint32]](0),
+                                             cast[Ptr[uint16]](0))
+        if rc64_4 < 0:
+            return -11                              # -EAGAIN
+        return cast[int32](rc64_4)
+    return -11                                      # -EAGAIN (unsupported type)
 
 
 # --- Export-table registration --------------------------------------
@@ -233,6 +412,8 @@ def linux_abi_register_socket():
                 cast[uint64](&_l_sock_create_kern))
     _add_export("kernel_bind",
                 cast[uint64](&_l_kernel_bind))
+    _add_export("kernel_connect",
+                cast[uint64](&_l_kernel_connect))
     _add_export("kernel_sendto",
                 cast[uint64](&_l_kernel_sendto))
     _add_export("kernel_recvfrom",
