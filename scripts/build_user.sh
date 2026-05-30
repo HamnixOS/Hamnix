@@ -74,7 +74,7 @@ build_adder_user tr                   # M16.66: SRC->DST byte translate
 build_adder_user od                   # M16.66: -An -tx1 hex dump
 build_adder_user printf               # M16.66: %s/%d + \n/\t/\\ escapes
 build_adder_user cp                   # M16.66: SRC->DST file copy (<=8 KiB)
-build_adder_user whoami               # M16.67: prints "root"
+build_adder_user whoami               # current uid -> name via /etc/passwd
 build_adder_user id                   # M16.67: hard-wired uid=0(root) line
 build_adder_user clear                # M16.67: ANSI clear-screen + home
 build_adder_user hostname             # M16.67: /etc/hostname with fallback
@@ -136,10 +136,10 @@ build_adder_user ntpd                 # native Adder NTP client: anchors rtc_boo
 build_adder_user route                # M16.87: stub loopback routing row
 build_adder_user lsmod                # M16.87: stub module table
 build_adder_user dmesg                # M16.87: placeholder until kernel ring buf
-build_adder_user su                   # M16.87: stub (single-user)
-build_adder_user passwd               # M16.87: stub (no shadow file)
+build_adder_user su                   # switch user: /dev/auth verify + SYS_SETUID_AUTH
+build_adder_user passwd               # set password via hostowner-gated /dev/auth setpass
 build_adder_user useradd              # per-user home FILE SERVER on the shared ext4 root (docs/security.md)
-build_adder_user login                # M16.87: stub auth hint
+build_adder_user login                # real login: /dev/auth verify + identity change + exec shell
 build_adder_user getty                # M16.87: announces + exec /bin/hamsh
 # distrorun RETIRED: the distro-shape namespace is no longer a bespoke
 # launcher binary. /etc/rc.boot defines it as a captured `ns clean {}`

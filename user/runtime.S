@@ -310,6 +310,22 @@ sys_execve:
     .size sys_execve, .-sys_execve
 
 
+    /* --- sys_execve_env(path, argv, envp) — never returns on success -
+     * 3-arg form of execve: a0=path (%rdi), a1=argv (%rsi), a2=envp
+     * (%rdx). SysV already places these in exactly the syscall ABI's
+     * a0/a1/a2 registers, so no shuffle is needed. envp is a
+     * NULL-terminated Ptr[uint64] array of "NAME=VALUE\0" cstrings (or
+     * 0 for empty env). login/su use this to stamp HAMNIX_NEWSHELL_USER
+     * so the exec'd /bin/hamsh sources the per-user namespace recipe. */
+    .globl sys_execve_env
+    .type sys_execve_env, @function
+sys_execve_env:
+    movq    $10, %rax               /* SYS_EXECVE */
+    syscall
+    ret                             /* only reached on failure */
+    .size sys_execve_env, .-sys_execve_env
+
+
     /* --- sys_spawn(path, argv, stdin_fd, stdout_fd, envp) -> int32 --
      * 5-arg syscall. SysV places arg 4 in %rcx and arg 5 in %r8,
      * but the syscall ABI reserves %rcx for the user RIP and uses
@@ -1034,6 +1050,25 @@ sys_useradd_root:
     syscall
     ret
     .size sys_useradd_root, .-sys_useradd_root
+
+
+    /* --- sys_setuid_auth(auth_fd) -> int32 --------------------------
+     * docs/security.md Phase 4: /dev/auth-mediated identity change.
+     * auth_fd = an open /dev/auth fd that has SUCCESSFULLY verified a
+     * (user, pass) pair. The kernel recovers the fd's devauth slot,
+     * confirms it verified, and sets the calling task's uid+gid to the
+     * slot's verified pair. Returns the new uid on success, -1 if the
+     * fd isn't an /dev/auth fd or hasn't authenticated. This is the
+     * honest "prove the password, the kernel changes you" primitive
+     * login/su use to drop a fresh process into the authenticated
+     * identity even from a non-hostowner context. Number 300. */
+    .globl sys_setuid_auth
+    .type sys_setuid_auth, @function
+sys_setuid_auth:
+    movq    $300, %rax              /* SYS_SETUID_AUTH */
+    syscall
+    ret
+    .size sys_setuid_auth, .-sys_setuid_auth
 
 
     /* --- syscall6(nr, a0, a1, a2, a3, a4, a5) -> int64 ---------------
