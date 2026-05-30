@@ -101,6 +101,13 @@ set +e
     printf ':q!\n'                      # force-quit WITHOUT saving
     sleep 2
 
+    # Print a sentinel, THEN cat the file. The Part-3 assertion only
+    # inspects bytes AFTER the sentinel so it sees the on-disk file
+    # content alone — never vi's full-screen rendering of the typed
+    # (but unsaved) "GARBAGE", which is painted to the terminal in
+    # INSERT mode and would otherwise be in the log regardless of save.
+    printf '/bin/echo VI_PART3_FILE_BEGIN\n'
+    sleep 1
     printf '/bin/cat /tmp/vitest.txt\n'
     sleep 2
 
@@ -148,8 +155,13 @@ else
     fail=1
 fi
 
-# Part 3: :q! must NOT have written GARBAGE to the file.
-if grep -F -q "GARBAGE" "$LOG"; then
+# Part 3: :q! must NOT have written GARBAGE to the file. Only inspect
+# the file content emitted AFTER the VI_PART3_FILE_BEGIN sentinel — vi
+# echoes typed INSERT-mode bytes to the screen, so "GARBAGE" appears in
+# the raw terminal log even when the save is correctly skipped. The
+# sentinel anchors us to the third `cat`'s actual on-disk bytes.
+PART3=$(awk '/VI_PART3_FILE_BEGIN/{f=1; next} f' "$LOG")
+if printf '%s' "$PART3" | grep -F -q "GARBAGE"; then
     echo "[test_vi] MISS: :q! leaked unsaved 'GARBAGE' into the file"
     fail=1
 else
