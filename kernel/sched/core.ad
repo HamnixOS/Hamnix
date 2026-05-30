@@ -422,6 +422,17 @@ class TaskStruct:
     # only via this owner field, never via the COW-shared ustack_lo/sz.
     ustack_phys:    uint64            # offset 2232
     ustack_phys_sz: uint64            # offset 2240
+    # Owner-only dynamic-linker interpreter (ld-linux) reclaim. A dynamic
+    # ELF spawn loads its PT_INTERP as a SEPARATE region_alloc'd image;
+    # without this it leaked permanently (never per-task, never reaped).
+    # Set ONLY on the task that allocated the interp region (SYS_SPAWN /
+    # do_execve) and DELIBERATELY 0 on fork children — like image_phys, a
+    # fork child COW-shares the parent's interp image and must not free
+    # it. task_reap region_free's it under a != 0 guard. 0 on a static
+    # binary (no PT_INTERP). Placed at the END of TaskStruct so it shifts
+    # no earlier offset.
+    interp_phys:    uint64            # offset 2248
+    interp_phys_sz: uint64            # offset 2256
 
 
 # State constants (mirror Linux's task->state space at a tiny scope).
@@ -769,6 +780,8 @@ def kthread_create(entry: uint64, name0: uint64) -> int32:
     task_table[s].image_phys_sz  = 0
     task_table[s].ustack_phys    = 0
     task_table[s].ustack_phys_sz = 0
+    task_table[s].interp_phys    = 0
+    task_table[s].interp_phys_sz = 0
     # §1 / rfork RFNOWAIT: every fresh task starts attached (reapable).
     task_table[s].detached  = 0
     # M16.109: Plan 9 note state. Kernel threads never call notify(2)
@@ -1017,6 +1030,8 @@ def create_user_thread(entry: uint64, name0: uint64,
     task_table[s].image_phys_sz  = 0
     task_table[s].ustack_phys    = 0
     task_table[s].ustack_phys_sz = 0
+    task_table[s].interp_phys    = 0
+    task_table[s].interp_phys_sz = 0
     # M16.109: Plan 9 note state — every fresh user task starts with
     # NO handler installed (note_handler_rip=0). notify(2) installs
     # the handler at first use. Forking does NOT inherit the parent's
@@ -1697,6 +1712,26 @@ def task_reap(slot: int32):
     # never on the child's own stack — so freeing the child's stacks
     # here is safe.
     su: uint64 = cast[uint64](slot)
+    # 0. mmap-backed VMAs (anonymous + file-backed). A DYNAMIC binary's
+    #    ld.so mmaps each DT_NEEDED DSO (libc.so.6 ~2 MiB, etc.) via
+    #    SYS_mmap -> vma_alloc, which EAGERLY alloc_pages the backing.
+    #    Until now those pages were freed ONLY on execve (vma_clear in
+    #    do_execve) — never on a plain spawn+wait+reap exit. So every
+    #    dynamic-binary spawn leaked its whole DSO-mapping set; after ~6
+    #    the page pool starved and ld.so failed the 7th map with "failed
+    #    to map segment from shared object" (exit 127). Free them here at
+    #    the single reap chokepoint, BEFORE the page tables are torn down
+    #    (step 3) so vma_clear can still walk this task's PML4.
+    #
+    #    OWNER-SAFE for COW fork: vma_clear -> _vma_node_free walks THIS
+    #    task's own PML4 and releases each page through its COW refcount
+    #    (cow_drop_page) — a page still COW-shared by a forked relative is
+    #    left mapped for that holder, never freed out from under it. So a
+    #    reaped fork child correctly drops only its own references and the
+    #    live parent's shared mmap pages survive. Cross-module call into
+    #    mm/vma.ad (Adder merges all modules into one symbol table).
+    if task_table[su].is_user != 0:
+        vma_clear(su)
     # 1. ELF image region (physical) — back to the region pool.
     if task_table[su].image_phys != 0:
         region_free(task_table[su].image_phys,
@@ -1717,6 +1752,17 @@ def task_reap(slot: int32):
     elif task_table[su].ustack_base != 0:
         free_page(task_table[su].ustack_base)
         task_table[su].ustack_base = 0
+    # 2b. Dynamic-linker interpreter image (ld-linux) — back to the
+    #     region pool. Owner-only, exactly like image_phys: set only on
+    #     the task that region_alloc'd the interp (SYS_SPAWN / do_execve);
+    #     a fork child COW-shares it and has interp_phys == 0, so it
+    #     never double-frees the parent's live interp. Static binaries
+    #     (no PT_INTERP) also leave this 0 and skip the free.
+    if task_table[su].interp_phys != 0:
+        region_free(task_table[su].interp_phys,
+                    task_table[su].interp_phys_sz)
+        task_table[su].interp_phys    = 0
+        task_table[su].interp_phys_sz = 0
     # 3. Private user-half page tables (PDPT/PD/PT), then the PML4 page.
     if task_table[su].cr3 != 0:
         _free_task_user_pagetables(su)
@@ -3039,6 +3085,43 @@ def set_task_image_phys(slot: uint64, phys: uint64, sz: uint64):
 def set_task_ustack_phys(slot: uint64, phys: uint64, sz: uint64):
     task_table[slot].ustack_phys    = phys
     task_table[slot].ustack_phys_sz = sz
+
+
+def set_task_interp_phys(slot: uint64, phys: uint64, sz: uint64):
+    # Owner-only dynamic-linker interpreter region. Set by the allocating
+    # syscall (SYS_SPAWN / do_execve) so task_reap returns the interp
+    # image to the region pool. 0 on a static binary; NOT propagated to
+    # fork children (they COW-share the interp and must not free it).
+    task_table[slot].interp_phys    = phys
+    task_table[slot].interp_phys_sz = sz
+
+
+def task_free_owner_regions(slot: uint64):
+    # execve-replace teardown (leak 2). do_execve installs a NEW image
+    # over a task that may have OWNED a prior image / interp / user stack
+    # (the direct-spawn-then-execve path: SYS_SPAWN gave this task its own
+    # region, then it execve'd). Free the OUTGOING owner-only regions
+    # here, BEFORE do_execve overwrites the owner fields with the new
+    # image's coords — otherwise the old spans leak for the rest of the
+    # boot. This mirrors task_reap's image/interp/ustack arms exactly,
+    # inlined at the replace point. OWNER-ONLY is preserved: a field that
+    # is 0 (a COW fork child, or a task whose prior image it never owned)
+    # is left untouched — we only ever free what THIS task allocated.
+    if task_table[slot].image_phys != 0:
+        region_free(task_table[slot].image_phys,
+                    task_table[slot].image_phys_sz)
+        task_table[slot].image_phys    = 0
+        task_table[slot].image_phys_sz = 0
+    if task_table[slot].interp_phys != 0:
+        region_free(task_table[slot].interp_phys,
+                    task_table[slot].interp_phys_sz)
+        task_table[slot].interp_phys    = 0
+        task_table[slot].interp_phys_sz = 0
+    if task_table[slot].ustack_phys != 0:
+        free_pages(task_table[slot].ustack_phys,
+                   _order_for_bytes(task_table[slot].ustack_phys_sz))
+        task_table[slot].ustack_phys    = 0
+        task_table[slot].ustack_phys_sz = 0
 
 
 # §1 / rfork RFNOWAIT: detach accessors. set_task_detached(slot, 1)
