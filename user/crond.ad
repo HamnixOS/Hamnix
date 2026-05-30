@@ -1,0 +1,432 @@
+# user/crond.ad
+#
+# Hamnix `crond` — a native cron daemon. No scheduled-task facility
+# existed before this; crond fills that Tier-2 "real system" gap.
+#
+# CRONTAB PATH
+#
+#   /var/cron/crontab
+#
+# /var is the single RAM-backed writable tmpfs subtree (fs/tmpfs.ad),
+# the same namespace dir convention sshd uses for /var/lib/ssh state.
+# There is NO global mutable /etc in this OS, so cron state lives under
+# /var like every other daemon's runtime state. The directory is
+# created on demand by the `crontab` CLI (user/crontab.ad) — crond just
+# reads the file each scan and treats "missing/empty" as "no jobs".
+#
+# CRONTAB FORMAT (one job per line)
+#
+#   min hour dom mon dow  command [args...]
+#
+# Each of the 5 time fields supports:
+#   *        — match any value
+#   N        — exact numeric match
+#   */N      — step: match when (value % N) == 0
+# Field ranges: min 0-59, hour 0-23, dom 1-31, mon 1-12, dow 0-6 (Sun=0).
+# A leading '#' or a blank line is ignored. A `@reboot command` line runs
+# its command once, when crond starts.
+#
+# SCHEDULING MODEL
+#
+# crond reads /proc/realtime (see user/date.ad for the ISO-8601 parse)
+# and extracts the current minute/hour/day/month from line 1. It polls
+# every few seconds via sys_get_jiffies (100 Hz, see user/watch.ad) and
+# fires on the MINUTE EDGE: when the wall-clock minute differs from the
+# minute it last evaluated, it re-reads the crontab and evaluates every
+# job against the new minute. This guarantees each job fires at most once
+# per matching minute even though we poll faster than once a minute.
+#
+# Each fire is logged to stdout:
+#
+#   crond: fired <command> at <YYYY-MM-DDTHH:MM:SSZ>
+#
+# so a test can assert the line. Jobs are spawned fire-and-forget
+# (sys_spawn, no waitpid) so a long-running job never stalls the
+# scheduler.
+#
+# Day-of-week is NOT computed from the calendar yet (no weekday in
+# /proc/realtime); a numeric/`*/N` dow field is matched against 0 as a
+# placeholder, and `*` (the common case) always matches. This is the one
+# documented limitation.
+
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_spawn(path: Ptr[char], argv: Ptr[uint64],
+                     stdin_fd: int32, stdout_fd: int32,
+                     envp: Ptr[uint64]) -> int32
+extern def sys_get_jiffies() -> uint64
+
+
+# --- small string helpers -------------------------------------------
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+# --- crontab buffer -------------------------------------------------
+#
+# The whole crontab is read into one buffer each scan. 4 KiB holds a
+# generous number of jobs; a longer file is truncated (documented).
+
+CRON_BUF_CAP: uint64 = 4096
+cron_buf: Array[4096, uint8]
+cron_len: uint64 = 0
+
+
+def crontab_path() -> Ptr[char]:
+    # Function-local literal: string-literal module globals are not
+    # supported by the Adder compiler (same quirk sshd works around).
+    return cast[Ptr[char]]("/var/cron/crontab")
+
+
+# Read the crontab into cron_buf. Returns the byte length (0 if the file
+# is missing or empty).
+def load_crontab() -> uint64:
+    fd: int32 = sys_open(crontab_path())
+    if fd < 0:
+        return 0
+    got: uint64 = 0
+    while got < CRON_BUF_CAP:
+        r: int64 = sys_read(fd, cast[Ptr[uint8]](
+                            cast[uint64](&cron_buf[0]) + got),
+                            CRON_BUF_CAP - got)
+        if r <= 0:
+            break
+        got = got + cast[uint64](r)
+    sys_close(fd)
+    return got
+
+
+# --- field parsing --------------------------------------------------
+#
+# A line is tokenized into whitespace-separated tokens. The first 5 are
+# the time fields; the rest is the command (re-joined with single
+# spaces). Tokens are sliced out of cron_buf in place (start offset +
+# length) so no copying is needed for matching.
+
+# Parse a small unsigned decimal starting at buf[off], up to but not
+# including end. Returns the value; sets *ok=1 on success, 0 if the span
+# is empty or has a non-digit.
+def parse_dec(buf: Ptr[uint8], off: uint64, end: uint64,
+              ok: Ptr[int32]) -> uint64:
+    ok[0] = 0
+    if off >= end:
+        return 0
+    v: uint64 = 0
+    i: uint64 = off
+    while i < end:
+        c: uint8 = buf[i]
+        if c < 48 or c > 57:
+            return 0
+        v = v * 10 + cast[uint64](c - 48)
+        i = i + 1
+    ok[0] = 1
+    return v
+
+
+# Match a single cron time-field against the current value.
+#   field = buf[off..end)  (one whitespace-delimited token)
+# Supports '*', exact N, and '*/N'. Returns 1 on match, 0 on no-match
+# (a malformed field is treated as no-match so a typo never fires
+# everything).
+def field_matches(buf: Ptr[uint8], off: uint64, end: uint64,
+                  cur: uint64) -> int32:
+    flen: uint64 = end - off
+    # bare '*'
+    if flen == 1 and buf[off] == 42:
+        return 1
+    # '*/N' step
+    if flen >= 3 and buf[off] == 42 and buf[off + 1] == 47:
+        ok: int32 = 0
+        step: uint64 = parse_dec(buf, off + 2, end, &ok)
+        if ok == 0 or step == 0:
+            return 0
+        if (cur % step) == 0:
+            return 1
+        return 0
+    # exact N
+    ok2: int32 = 0
+    n: uint64 = parse_dec(buf, off, end, &ok2)
+    if ok2 == 0:
+        return 0
+    if n == cur:
+        return 1
+    return 0
+
+
+# --- /proc/realtime time extraction ---------------------------------
+#
+# Line 1 layout (byte-exact from fs/procfs.ad::render_realtime, see
+# user/date.ad):
+#
+#   YYYY-MM-DDTHH:MM:SSZ SP epoch LF
+#   0123456789012345678901
+#
+# Offsets: month 5-6, day 8-9, hour 11-12, minute 14-15.
+
+rt_buf: Array[128, uint8]
+
+# Snapshot fields decoded from the last /proc/realtime read.
+rt_minute: uint64 = 0
+rt_hour:   uint64 = 0
+rt_day:    uint64 = 0
+rt_month:  uint64 = 0
+rt_ok:     int32  = 0
+
+
+def two_digits(p: Ptr[uint8], off: uint64) -> uint64:
+    hi: uint8 = p[off]
+    lo: uint8 = p[off + 1]
+    return cast[uint64](hi - 48) * 10 + cast[uint64](lo - 48)
+
+
+# Read /proc/realtime and populate the rt_* globals. Sets rt_ok=1 on a
+# well-formed line, 0 otherwise.
+def read_realtime():
+    rt_ok = 0
+    fd: int32 = sys_open("/proc/realtime")
+    if fd < 0:
+        return
+    n: int64 = sys_read(fd, &rt_buf[0], 128)
+    sys_close(fd)
+    if n < 20:
+        return
+    # 'u' => "unavailable" sentinel; 'T' must sit at offset 10.
+    if rt_buf[0] == 117:
+        return
+    if rt_buf[10] != 84:
+        return
+    rt_month  = two_digits(&rt_buf[0], 5)
+    rt_day    = two_digits(&rt_buf[0], 8)
+    rt_hour   = two_digits(&rt_buf[0], 11)
+    rt_minute = two_digits(&rt_buf[0], 14)
+    rt_ok = 1
+
+
+# --- job spawn ------------------------------------------------------
+#
+# A matched command is spawned fire-and-forget. The command token span
+# is copied out into a NUL-terminated path; any extra args become argv
+# slots. argv is built into a fixed table terminated by a NULL pointer
+# (same shape as user/watch.ad::run_once).
+
+CMD_CAP: uint64 = 256
+MAX_ARGS: uint64 = 16
+
+# One argv staging buffer reused per fire. Each slot points into
+# arg_store; slot 0 is the command path.
+cmd_argv: Array[16, uint64]
+arg_store: Array[256, uint8]
+
+
+# Build cmd_argv from the command portion of the line: buf[cmd_off..end).
+# Splits on spaces into NUL-terminated tokens copied into arg_store.
+# Returns the number of argv slots filled (0 = nothing to run).
+def build_argv(buf: Ptr[uint8], cmd_off: uint64, end: uint64) -> uint64:
+    nargs: uint64 = 0
+    store_o: uint64 = 0
+    i: uint64 = cmd_off
+    while i < end and nargs < MAX_ARGS:
+        # skip leading spaces
+        while i < end and buf[i] == 32:
+            i = i + 1
+        if i >= end:
+            break
+        tok_start: uint64 = store_o
+        cmd_argv[nargs] = cast[uint64](&arg_store[0]) + store_o
+        while i < end and buf[i] != 32 and store_o < CMD_CAP - 1:
+            arg_store[store_o] = buf[i]
+            store_o = store_o + 1
+            i = i + 1
+        arg_store[store_o] = 0
+        store_o = store_o + 1
+        # A non-empty token contributes one argv slot.
+        if store_o > tok_start + 1:
+            nargs = nargs + 1
+    if nargs < MAX_ARGS:
+        cmd_argv[nargs] = 0
+    return nargs
+
+
+def log_fire(buf: Ptr[uint8], cmd_off: uint64, end: uint64):
+    write_str(1, "crond: fired ")
+    sys_write(1, cast[Ptr[uint8]](
+        cast[uint64](buf) + cmd_off), end - cmd_off)
+    write_str(1, " at ")
+    # rt_buf holds the ISO-8601 line; print its first 20 bytes
+    # (YYYY-MM-DDTHH:MM:SSZ).
+    sys_write(1, &rt_buf[0], 20)
+    write_str(1, "\n")
+
+
+def spawn_command(buf: Ptr[uint8], cmd_off: uint64, end: uint64):
+    nargs: uint64 = build_argv(buf, cmd_off, end)
+    if nargs == 0:
+        return
+    path: Ptr[char] = cast[Ptr[char]](cmd_argv[0])
+    # Fire-and-forget: inherit fds 0/1/2 onto the child so its output
+    # reaches the same console, and never waitpid (a long job must not
+    # stall the scheduler).
+    sys_spawn(path, &cmd_argv[0], 0, 1, cast[Ptr[uint64]](0))
+
+
+# --- line evaluation ------------------------------------------------
+#
+# Given one line span buf[ls..le), evaluate it against the current
+# rt_* time and fire if it matches. `reboot_pass` selects @reboot
+# handling: when 1, ONLY @reboot lines fire (and time lines are
+# skipped); when 0, @reboot lines are skipped and time lines are matched.
+
+# Find the next token: starting at *cur, skip spaces, then return the
+# token end. Writes the token start through *tok_off. Returns 0 if no
+# token remains (cur reached le).
+def next_token(buf: Ptr[uint8], le: uint64, cur: Ptr[uint64],
+               tok_off: Ptr[uint64]) -> int32:
+    i: uint64 = cur[0]
+    while i < le and buf[i] == 32:
+        i = i + 1
+    if i >= le:
+        cur[0] = i
+        return 0
+    tok_off[0] = i
+    while i < le and buf[i] != 32:
+        i = i + 1
+    cur[0] = i
+    return 1
+
+
+def eval_line(buf: Ptr[uint8], ls: uint64, le: uint64, reboot_pass: int32):
+    # Trim a trailing CR (\r) so CRLF crontabs still parse.
+    if le > ls and buf[le - 1] == 13:
+        le = le - 1
+    # Skip leading spaces to find first non-space.
+    s: uint64 = ls
+    while s < le and buf[s] == 32:
+        s = s + 1
+    if s >= le:
+        return                              # blank line
+    if buf[s] == 35:
+        return                              # comment
+
+    # @reboot handling: a line starting with '@reboot'.
+    if buf[s] == 64:                        # '@'
+        # token must be exactly "@reboot"
+        if le - s >= 7 and buf[s + 1] == 114 and buf[s + 2] == 101 \
+                and buf[s + 3] == 98 and buf[s + 4] == 111 \
+                and buf[s + 5] == 111 and buf[s + 6] == 116:
+            if reboot_pass == 0:
+                return
+            # command starts after "@reboot" + spaces
+            c: uint64 = s + 7
+            while c < le and buf[c] == 32:
+                c = c + 1
+            if c < le:
+                log_fire(buf, c, le)
+                spawn_command(buf, c, le)
+        return
+
+    if reboot_pass != 0:
+        return                              # reboot pass: skip time jobs
+
+    # Five time fields.
+    cur: uint64 = s
+    f_off: Array[5, uint64]
+    f_end: Array[5, uint64]
+    fi: uint64 = 0
+    while fi < 5:
+        toff: uint64 = 0
+        if next_token(buf, le, &cur, &toff) == 0:
+            return                          # too few fields — ignore
+        f_off[fi] = toff
+        f_end[fi] = cur
+        fi = fi + 1
+
+    # The command is the remainder after field 5 (skip the spaces).
+    cmd_off: uint64 = cur
+    while cmd_off < le and buf[cmd_off] == 32:
+        cmd_off = cmd_off + 1
+    if cmd_off >= le:
+        return                              # no command
+
+    # Match all five fields: min hour dom mon dow.
+    if field_matches(buf, f_off[0], f_end[0], rt_minute) == 0:
+        return
+    if field_matches(buf, f_off[1], f_end[1], rt_hour) == 0:
+        return
+    if field_matches(buf, f_off[2], f_end[2], rt_day) == 0:
+        return
+    if field_matches(buf, f_off[3], f_end[3], rt_month) == 0:
+        return
+    # dow: no weekday source yet; '*' always matches, numeric/step
+    # matched against 0 (documented limitation).
+    if field_matches(buf, f_off[4], f_end[4], 0) == 0:
+        return
+
+    log_fire(buf, cmd_off, le)
+    spawn_command(buf, cmd_off, le)
+
+
+# Walk the loaded crontab line by line and evaluate each.
+def scan_crontab(reboot_pass: int32):
+    if cron_len == 0:
+        return
+    i: uint64 = 0
+    while i < cron_len:
+        ls: uint64 = i
+        while i < cron_len and cron_buf[i] != 10:
+            i = i + 1
+        eval_line(&cron_buf[0], ls, i, reboot_pass)
+        i = i + 1                           # step past the '\n'
+
+
+# --- main loop ------------------------------------------------------
+
+POLL_JIFFIES: uint64 = 300                  # ~3 s at 100 Hz
+
+
+def main() -> int32:
+    write_str(1, "crond: started\n")
+
+    # @reboot pass — run once at startup against whatever's installed.
+    cron_len = load_crontab()
+    read_realtime()
+    scan_crontab(1)
+
+    # Establish the starting minute so we don't double-fire the minute
+    # crond happened to launch in.
+    last_minute: uint64 = 0
+    have_last: int32 = 0
+    if rt_ok != 0:
+        last_minute = rt_minute
+        have_last = 1
+
+    while True:
+        # Sleep ~POLL_JIFFIES then re-check the wall clock.
+        start: uint64 = sys_get_jiffies()
+        while sys_get_jiffies() - start < POLL_JIFFIES:
+            pass
+
+        read_realtime()
+        if rt_ok == 0:
+            continue
+        if have_last == 0:
+            last_minute = rt_minute
+            have_last = 1
+            continue
+        if rt_minute == last_minute:
+            continue                        # same minute — nothing to do
+        # Minute edge: re-read the crontab (cheap) and evaluate.
+        last_minute = rt_minute
+        cron_len = load_crontab()
+        scan_crontab(0)
+
+    return 0

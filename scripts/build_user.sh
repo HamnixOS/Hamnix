@@ -120,6 +120,8 @@ build_adder_user gunzip               # native gunzip: full INFLATE (stored/fixe
 build_adder_user md5sum               # M16.86: fixed-hash stub (real MD5 deferred)
 build_adder_user env_show             # M16.86: hint about hamsh's `env` builtin
 build_adder_user watch                # M16.86: -n N CMD, runs CMD twice w/ delay
+build_adder_user crond                # cron daemon: /var/cron/crontab, minute-edge scheduler
+build_adder_user crontab              # cron CLI: install FILE / -l list / -r remove
 build_adder_user whatis               # M16.86: one-line description table
 build_adder_user man                  # discovery: read /usr/share/man/<topic>.<N>.md
 build_adder_user help                 # discovery: man-page index + `help <topic>` sugar

@@ -307,7 +307,8 @@ def _files_hamsh() -> list[tuple[Path, str]]:
 
 COREUTILS_BINS = (
     "ascii", "awk", "base64", "basename", "cal", "cat", "clear", "cmp",
-    "cp", "cut", "date", "df", "diff", "dirname", "distrofs", "dmesg",
+    "cp", "crond", "crontab", "cut", "date", "df", "diff", "dirname",
+    "distrofs", "dmesg",
     "du", "echo", "ed", "env_show", "expr", "false", "find", "free",
     "getty", "grep", "halt", "hamwd", "head", "hostname", "id",
     "insmod", "kill", "less", "ln", "login", "ls", "lsmod", "md5sum",
