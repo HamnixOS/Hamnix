@@ -189,9 +189,11 @@ build_adder_x11() {
     file "build/user/${name}.elf"
 }
 
-build_adder_x11 x11srv    # X11 core-protocol server: listens on :6000, renders into wsys fb layer
-build_adder_x11 xfill     # X11 demo client: CreateWindow + CreateGC + PolyFillRectangle round-trip
-build_adder_x11 x11test   # X11 self-test driver: spawns x11srv + xfill, asserts both PASS
+build_adder_x11 x11srv        # X11 core-protocol server: listens on :6000, renders into wsys fb layer
+build_adder_x11 xfill         # X11 demo client: CreateWindow + CreateGC + PolyFillRectangle round-trip
+build_adder_x11 x11test       # X11 self-test driver: spawns x11srv + xfill, asserts both PASS
+build_adder_x11 xclient_demo  # Standalone X11 app client: purple/cyan fill, used by test_x11_app.sh
+build_adder_x11 x11apptest    # X11 app-in-desktop test: spawns x11srv + xclient_demo, checks wsys flush
 
 # --- Self-hosting milestone: Adder-in-Adder lexer --------------------
 echo "[build_user] compiling adder/compiler/lex_selftest.ad -> build/user/lex_selftest.elf"
