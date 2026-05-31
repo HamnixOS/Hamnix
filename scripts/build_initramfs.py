@@ -340,6 +340,18 @@ if os.environ.get("ENABLE_AHCI_KO") == "1":
 if os.environ.get("ENABLE_LIBATA_KO") == "1":
     FILES.append(("/etc/libata-ko", b"1\n"))
 
+# DRM/KMS (graphics) core harvest. scripts/test_drm_ko.sh sets
+# ENABLE_DRM_KO=1 to plant /etc/drm-ko. The kernel-side boot:35.DRM
+# path (init/main.ad) gates on this marker and kmod_linux_loads the
+# stock Debian drm.ko (the DRM core framework — drm_drv/drm_ioctl/
+# drm_gem/atomic-modeset). Load-only exercise (the L-series coverage
+# bar): under QEMU's emulated VGA there is no real GPU, so drm.ko's
+# init registers its chrdev/debugfs scaffolding and returns — proving
+# the loader + linux_abi shims absorb the DRM core (links skipped=0 +
+# init_module returns), the last un-probed subsystem class.
+if os.environ.get("ENABLE_DRM_KO") == "1":
+    FILES.append(("/etc/drm-ko", b"1\n"))
+
 # Storage pivot (Agent D): nvme.ko (PCIe NVM Express SSD driver —
 # every modern NVMe device).
 # scripts/test_nvme_ko.sh sets ENABLE_NVME_KO=1 to plant /etc/nvme-ko.
@@ -1635,6 +1647,27 @@ def build_archive() -> bytes:
             ("scsi_mod",    "scsi_mod.ko"),
             ("libata",      "libata.ko"),
             ("libahci",     "libahci.ko"),
+    ):
+        ko_path = here / "kernel-modules" / ko_dir / ko_name
+        if ko_path.is_file():
+            data = ko_path.read_bytes()
+            for name in (f"/lib/modules/{ko_name}",
+                         f"/lib/modules/6.12/{ko_name}"):
+                blob += cpio_entry(name, data)
+                print(f"  embedded {name} ({len(data)} bytes from "
+                      f"kernel-modules/{ko_dir}/{ko_name})")
+
+    # DRM/KMS (graphics) core: drm.ko (Debian 6.1.0-32 build, ~1.2 MiB)
+    # planted at /lib/modules/drm.ko. init/main.ad's boot:35.DRM path
+    # kmod_linux_loads it when /etc/drm-ko is present (ENABLE_DRM_KO=1).
+    # The drm_kms_helper.ko (depends: drm) is staged too so a future
+    # follow-up can load the helper after the core; i915.ko is staged
+    # for the same reason but is NOT loaded by the current boot exercise
+    # (its UND gap is large — see scripts/test_drm_ko.sh notes).
+    for ko_dir, ko_name in (
+            ("drm",            "drm.ko"),
+            ("drm_kms_helper", "drm_kms_helper.ko"),
+            ("i915",           "i915.ko"),
     ):
         ko_path = here / "kernel-modules" / ko_dir / ko_name
         if ko_path.is_file():
