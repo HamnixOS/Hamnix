@@ -192,3 +192,11 @@ build_adder_x11() {
 build_adder_x11 x11srv    # X11 core-protocol server: listens on :6000, renders into wsys fb layer
 build_adder_x11 xfill     # X11 demo client: CreateWindow + CreateGC + PolyFillRectangle round-trip
 build_adder_x11 x11test   # X11 self-test driver: spawns x11srv + xfill, asserts both PASS
+
+# --- Self-hosting milestone: Adder-in-Adder lexer --------------------
+echo "[build_user] compiling adder/compiler/lex_selftest.ad -> build/user/lex_selftest.elf"
+python3 -m compiler.adder compile \
+    --target=x86_64-adder-user \
+    adder/compiler/lex_selftest.ad \
+    -o build/user/lex_selftest.elf
+file build/user/lex_selftest.elf
