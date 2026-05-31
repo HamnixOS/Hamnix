@@ -1089,6 +1089,63 @@ sys_setuid_auth:
     .size sys_setuid_auth, .-sys_setuid_auth
 
 
+    /* --- sys_mmap(addr, len, prot, flags, fd, offset) -> int64 --------
+     * §142: native mmap syscall (SYS_MMAP = 302). 6-arg call — the
+     * SysV ABI passes arg 4 (flags) in %rcx and arg 5 (fd) in %r8,
+     * arg 6 (offset) on the stack. The syscall ABI reserves %rcx for
+     * the user RIP and uses %r10 for arg 4; arg 5 (%r8) and arg 6
+     * (%r9) align between the two ABIs when the caller shuffles arg 6
+     * from the stack into %r9. Same pattern as the generic syscall6
+     * trampoline below but specialised for mmap to document the arg map.
+     *
+     * System V argument registers for sys_mmap:
+     *   %rdi = addr (a0)       → stays %rdi
+     *   %rsi = len  (a1)       → stays %rsi
+     *   %rdx = prot (a2)       → stays %rdx
+     *   %rcx = flags (a3)      → %r10 (syscall ABI a3)
+     *   %r8  = fd    (a4)      → stays %r8
+     *   8(%rsp) = offset (a5)  → %r9  (syscall ABI a5)
+     *   %rax = 302 (SYS_MMAP)
+     *
+     * Returns the mapped address (positive) or a negative errno.
+     */
+    .globl sys_mmap
+    .type sys_mmap, @function
+sys_mmap:
+    movq    %rcx, %r10              /* flags (a3): rcx -> r10 */
+    movq    8(%rsp), %r9            /* offset (a5): stack -> r9 */
+    movq    $302, %rax              /* SYS_MMAP */
+    syscall
+    ret
+    .size sys_mmap, .-sys_mmap
+
+
+    /* --- sys_mprotect(addr, len, prot) -> int32 -----------------------
+     * §142: native mprotect syscall (SYS_MPROTECT = 303). 3-arg call;
+     * SysV registers align directly with syscall ABI a0..a2 — no
+     * shuffle. Returns 0 on success or a negative errno. */
+    .globl sys_mprotect
+    .type sys_mprotect, @function
+sys_mprotect:
+    movq    $303, %rax              /* SYS_MPROTECT */
+    syscall
+    ret
+    .size sys_mprotect, .-sys_mprotect
+
+
+    /* --- sys_munmap(addr, len) -> int32 --------------------------------
+     * §142: native munmap syscall (SYS_MUNMAP = 304). 2-arg call;
+     * SysV registers align directly with syscall ABI a0..a1 — no
+     * shuffle. Returns 0 on success or a negative errno. */
+    .globl sys_munmap
+    .type sys_munmap, @function
+sys_munmap:
+    movq    $304, %rax              /* SYS_MUNMAP */
+    syscall
+    ret
+    .size sys_munmap, .-sys_munmap
+
+
     /* --- syscall6(nr, a0, a1, a2, a3, a4, a5) -> int64 ---------------
      * Generic 6-arg syscall trampoline. SysV passes nr in %rdi, a0..a5
      * in %rsi/%rdx/%rcx/%r8/%r9/[stack]; the kernel syscall ABI wants
