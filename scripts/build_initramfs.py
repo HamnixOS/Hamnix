@@ -236,6 +236,15 @@ if os.environ.get("ENABLE_XHCI_KBD_LIVE") == "1":
 if os.environ.get("ENABLE_USBMS_TEST") == "1":
     FILES.append(("/etc/usbms-test", b"1\n"))
 
+# SMP kthread-churn soak. scripts/test_smp_soak.sh sets ENABLE_SMP_SOAK=1
+# to plant /etc/smp-soak in the initramfs. init/main.ad at boot:37 detects
+# the marker and calls smp_kthread_soak_run() (kernel/sched/core.ad) which
+# hammers kthread create/exit/reap cycles under -smp 2, stressing rq_lock
+# contention, AP idle-loop dispatch, and per-CPU current_idx_pcpu mutations.
+# Default boots omit the marker so the soak never fires unintentionally.
+if os.environ.get("ENABLE_SMP_SOAK") == "1":
+    FILES.append(("/etc/smp-soak", b"1\n"))
+
 # Partition write-smoke fixtures (mkpart MBR on sd0, gpt on nvme0n1).
 # These WRITE a partition table onto a freshly-registered disk that has
 # no MBR, so they must NEVER run on production media. Set

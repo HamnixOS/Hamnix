@@ -728,6 +728,13 @@ def sched_init():
     # sched_mark_boot_task_running() call) so the create_user_task path
     # below always sees a live current task.
     task_table[0].state = STATE_RUNNING
+    # CR3 for the boot task (slot 0) must be the live BSP PML4 so that
+    # schedule()'s load_cr3 guard (task_table[nxt].cr3 != task_table[prev].cr3)
+    # correctly skips the CR3 reload when switching back to slot 0 from a
+    # kthread (which also uses the BSP CR3). Without this, slot 0's cr3=0
+    # triggers load_cr3(0) → invalid PML4 → triple fault on the first
+    # context-switch back to the boot task (e.g. from a soak kthread exit).
+    task_table[0].cr3 = get_bsp_cr3()
 
 
 # --- public: task construction ------------------------------------
@@ -1173,7 +1180,11 @@ def _pick_next() -> int32:
         st: uint64 = task_table[i].state
         if st == STATE_READY:
             if on_bsp != 0 or task_table[i].is_user == 0:
-                return cast[int32](i)
+                # Slot 0 is the BSP boot task and must only run on the BSP.
+                # An AP picking up slot 0 would execute the boot task on the
+                # wrong CPU, corrupting per-CPU state (current_idx_pcpu, TSS).
+                if on_bsp != 0 or i != 0:
+                    return cast[int32](i)
         i = i + 1
         tried = tried + 1
     return -1
@@ -1464,10 +1475,15 @@ def sched_ap_idle_loop():
         scan: uint64 = 0
         while scan < NTASKS:
             if scan != my_idle_slot:
-                if task_table[scan].state == STATE_READY:
-                    if task_table[scan].is_user == 0:
-                        found_slot = cast[int32](scan)
-                        scan = NTASKS  # break
+                # Slot 0 is the BSP boot task — never dispatch it on an AP.
+                # The BSP's schedule() manages slot 0's execution context;
+                # an AP picking it up would cause split-brain dual-CPU execution
+                # of the same task's stack frame.
+                if scan != 0:
+                    if task_table[scan].state == STATE_READY:
+                        if task_table[scan].is_user == 0:
+                            found_slot = cast[int32](scan)
+                            scan = NTASKS  # break
             scan = scan + 1
 
         if found_slot >= 0:
@@ -3455,3 +3471,147 @@ def set_task_parent_pid(slot: int32, v: uint64):
     # rfork(RFNOWAIT) zeroes this so a `wait for any child` scan never
     # treats the detached task as a reapable child of its old parent.
     task_table[cast[uint64](slot)].parent_pid = v
+
+
+# --- SMP kthread churn soak ------------------------------------------
+#
+# smp_kthread_soak_run() is gated by /etc/smp-soak in the initramfs
+# (planted by build_initramfs.py when ENABLE_SMP_SOAK=1) and called
+# once from init/main.ad's boot sequence, BEFORE start_first_task().
+# It exercises the most concurrency-sensitive paths:
+#
+#   1. rq_lock: kthread_create / task_exit_current race the BSP timer
+#      ISR's schedule() on every tick.
+#   2. per-CPU current_idx_pcpu: the AP (sched_ap_idle_loop) picks up
+#      each batch kthread, runs it, and returns to idle.
+#   3. AP-idle re-establish path (the __switch_to_asm return in
+#      sched_ap_idle_loop) is exercised once per batch kthread.
+#   4. Lock contention between BSP (timer ISR) and AP (idle loop) on
+#      the same rq_lock.
+#   5. State churn: STATE_PARKED -> STATE_RUNNING (AP idle) ->
+#      STATE_READY -> STATE_RUNNING (kthread) -> STATE_FREE (self-reap).
+#
+# Design: create kthreads in batches of BATCH_SIZE, wait for all to
+# complete (poll smp_soak_done), repeat for ROUNDS rounds.  Each
+# kthread is DETACHED (self-reaps to STATE_FREE) so no slot leak.
+#
+# Completion tracking: smp_soak_done is a shared counter incremented
+# (under rq_lock) by each kthread just before calling task_exit_current.
+# The driver loop spins on smp_soak_done with cpu_relax.
+#
+# BATCH_SIZE * ROUNDS must be well above NTASKS (16) to guarantee
+# slot recycling and lock contention across rounds.
+#
+# IMPORTANT: this runs BEFORE start_first_task(), so interrupts ARE
+# enabled (local_irq_enable was called earlier in boot), the LAPIC
+# timer fires, and preempt_tick() fires on every 10 ms tick.  This
+# means the BSP timer ISR's schedule() can race the AP's idle loop on
+# rq_lock — exactly the contention we want to stress.
+
+SMP_SOAK_BATCH:  uint64 = 4    # kthreads per batch (stay < NTASKS-3)
+SMP_SOAK_ROUNDS: uint64 = 20   # batches; total = 80 kthread create/reap cycles
+
+# Shared completion counter. Incremented by each soak kthread under
+# rq_lock before it calls task_exit_current.
+smp_soak_done: uint64 = 0
+
+# Heartbeat counter for the driver loop (printed every ~5 rounds).
+smp_soak_heartbeat: uint64 = 0
+
+
+def _smp_soak_kthread():
+    # Body of each short-lived soak kthread. Increment the completion
+    # counter (under rq_lock to avoid a torn 64-bit read-modify-write
+    # on the shared counter), then exit.  The task is marked detached
+    # before this runs so task_exit_current self-reaps it (STATE_FREE).
+    spinlock_lock(&rq_lock)
+    smp_soak_done = smp_soak_done + 1
+    spinlock_unlock(&rq_lock)
+    task_exit_current(0)
+
+
+def smp_kthread_soak_run():
+    # Called from init/main.ad when /etc/smp-soak is present.
+    # Runs a sustained kthread create/exit/reap soak under -smp 2.
+    #
+    # IMPORTANT: this runs before start_first_task(), on the BSP's boot
+    # task (slot 0, STATE_RUNNING).  The AP is running sched_ap_idle_loop().
+    #
+    # YIELD STRATEGY: the BSP calls schedule() cooperatively after each
+    # batch of kthreads is created.  On TCG, this lets the kthreads run on
+    # the BSP itself (the AP's HLT in sched_ap_idle_loop has no wakeup
+    # trigger since the AP's LAPIC timer is not armed).  On real hardware
+    # / KVM, kthreads can also be picked up by the AP idle loop.
+    #
+    # Each kthread runs _smp_soak_kthread() which:
+    #   1. Acquires rq_lock, increments smp_soak_done, releases rq_lock.
+    #   2. Calls task_exit_current(0) which self-reaps (detached) and
+    #      switches back to the next READY task (ultimately the boot task).
+    #
+    # The BSP schedule() loop: create BATCH kthreads, then call schedule()
+    # BATCH times to run each one to completion, then repeat for ROUNDS.
+    printk0("[smp_soak] starting SMP kthread churn soak\n")
+    printk2("[smp_soak] %d rounds x %d kthreads/batch\n",
+            SMP_SOAK_ROUNDS, SMP_SOAK_BATCH)
+
+    smp_soak_done = 0
+    total_launched: uint64 = 0
+    round_idx: uint64 = 0
+
+    while round_idx < SMP_SOAK_ROUNDS:
+        # Launch BATCH kthreads.  Use irq-disable + rq_lock around create
+        # (mirrors sched_prepare_ap_idle's locking discipline) to prevent
+        # the timer ISR from seeing a half-initialized slot.
+        batch_start: uint64 = smp_soak_done
+        b: uint64 = 0
+        while b < SMP_SOAK_BATCH:
+            local_irq_disable()
+            spinlock_lock(&rq_lock)
+            slot: int32 = kthread_create(
+                cast[uint64](&_smp_soak_kthread), 0)
+            if slot >= 0:
+                # Mark detached: kthread self-reaps without a parent wait.
+                task_table[cast[uint64](slot)].detached = 1
+                total_launched = total_launched + 1
+                spinlock_unlock(&rq_lock)
+                local_irq_enable()
+            else:
+                # Slot exhaustion (NTASKS=16, BATCH=4 — should not happen).
+                # Re-enable IRQs, schedule() to let pending kthreads run
+                # and free their slots, then retry this iteration.
+                spinlock_unlock(&rq_lock)
+                local_irq_enable()
+                schedule()
+                b = b - 1    # retry this slot
+            b = b + 1
+
+        # Drive each kthread to completion via cooperative schedule() calls.
+        # The BSP is the boot task (slot 0, STATE_RUNNING); each schedule()
+        # call rotates to the next READY kthread, which runs to completion
+        # and exits back via schedule().  We poll smp_soak_done until the
+        # batch is done, yielding after each unsuccessful check.
+        target: uint64 = batch_start + SMP_SOAK_BATCH
+        sched_iters: uint64 = 0
+        MAX_SCHED: uint64 = 200   # upper bound on schedule() calls per batch
+        while smp_soak_done < target and sched_iters < MAX_SCHED:
+            schedule()
+            sched_iters = sched_iters + 1
+        if smp_soak_done < target:
+            local_irq_disable()
+            printk2("[smp_soak] TIMEOUT: batch %d stuck (done=%d)\n",
+                    round_idx, smp_soak_done)
+            printk0("[smp_soak] FAIL: batch timeout\n")
+            return
+
+        # Heartbeat every 5 rounds.
+        smp_soak_heartbeat = smp_soak_heartbeat + 1
+        if smp_soak_heartbeat % 5 == 0:
+            printk2("[smp_soak] heartbeat: round %d done=%d\n",
+                    round_idx, smp_soak_done)
+
+        round_idx = round_idx + 1
+
+    local_irq_disable()
+    printk2("[smp_soak] PASS: %d kthreads launched, %d completed\n",
+            total_launched, smp_soak_done)
+    printk0("[smp_soak] cpus_online check below\n")
