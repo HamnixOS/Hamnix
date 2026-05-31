@@ -202,6 +202,12 @@ if os.environ.get("ENABLE_DHCP_RENEW_SMOKE") == "1":
 if os.environ.get("ENABLE_NETCFG_SMOKE") == "1":
     FILES.append(("/etc/netcfg-test", b"1\n"))
 
+# IPv6 link-local + ND + ICMPv6 echo self-test (task #156). Gated like
+# the markers above so the vanilla boot stays quiet; only
+# scripts/test_net_ipv6.sh plants the marker to run ipv6_selftest().
+if os.environ.get("ENABLE_IPV6_SELFTEST") == "1":
+    FILES.append(("/etc/ipv6-test", b"1\n"))
+
 # xHCI V1/V2 synthetic transfer-engine selftests. Gated the same way as
 # the markers above — see init/main.ad's xhci_marker_found gate. The
 # selftests forge Event-Ring state that real silicon won't agree with

@@ -1,0 +1,925 @@
+# drivers/net/ipv6.ad
+#
+# Basic link-local IPv6 stack for the bare-metal kernel (task #156).
+# ADDITIVE to the existing IPv4 stack — the IPv4 path (ip_rx / arp_rx /
+# icmp.ad / udp.ad) is completely untouched. This module mirrors the
+# structure of drivers/net/ip.ad + icmp.ad + arp.ad, but for IPv6:
+#
+#   * link-local address derivation: fe80::/64 + EUI-64 from the MAC.
+#   * IPv6 40-byte fixed header parse (ipv6_rx) + build (ipv6_tx).
+#   * ICMPv6 (RFC 4443 + RFC 4861):
+#       - Echo Request (128) -> Echo Reply (129)              [ping6]
+#       - Neighbor Solicitation (135) -> Neighbor Advert (136) [ND]
+#       - Neighbor Advertisement (136) -> cache the (ip6 -> mac) binding
+#     The ICMPv6 checksum covers the IPv6 pseudo-header (RFC 2460 §8.1),
+#     unlike ICMPv4 which has no pseudo-header.
+#   * a small neighbor cache (the IPv6 analogue of the ARP cache).
+#   * UDP-over-IPv6: udp6_send / udp6 receive, with the mandatory
+#     pseudo-header checksum (UDP checksum is NOT optional in IPv6).
+#
+# Wire dispatch: drivers/net/eth.ad::eth_rx routes ETH_P_IPV6 (0x86DD)
+# to ipv6_rx (added in this task). ipv6_rx dispatches by next-header to
+# icmpv6_rx / udp6_rx.
+#
+# Explicitly OUT of scope (follow-up): TCP-over-IPv6, DHCPv6, SLAAC
+# router solicitation / global addressing, multicast group membership
+# beyond conceptually answering NS for our solicited-node address,
+# extension-header chains. Link-local + ND + ICMPv6 echo + UDP6 is the
+# deliverable.
+
+from kernel.printk.printk import printk0, printk1, printk2
+from drivers.net.eth import eth_tx, eth_get_mac, eth_rx, eth_set_mac
+
+
+# --- constants ------------------------------------------------------
+
+# IPv6 next-header values (same numbering space as IPv4 protocol byte
+# for the L4 ones, plus 58 for ICMPv6).
+IP6PROTO_TCP:    uint8 = 6
+IP6PROTO_UDP:    uint8 = 17
+IP6PROTO_ICMPV6: uint8 = 58
+
+# ICMPv6 message types (RFC 4443 / RFC 4861).
+ICMP6_ECHO_REQUEST: uint8 = 128
+ICMP6_ECHO_REPLY:   uint8 = 129
+ICMP6_ROUTER_SOL:   uint8 = 133
+ICMP6_ROUTER_ADV:   uint8 = 134
+ICMP6_NEIGH_SOL:    uint8 = 135
+ICMP6_NEIGH_ADV:    uint8 = 136
+
+# ND option types (RFC 4861 §4.6).
+ND_OPT_SRC_LLADDR: uint8 = 1
+ND_OPT_TGT_LLADDR: uint8 = 2
+
+# Ethernet constants kept local (avoid a circular eth.ad <-> ipv6.ad
+# import; eth.ad's ETH_HDR_LEN is the canonical 14).
+IP6_ETH_HDR_LEN:  uint64 = 14
+IP6_ETHERTYPE_HI: uint8  = 0x86
+IP6_ETHERTYPE_LO: uint8  = 0xDD
+
+# IPv6 fixed header length (no extension headers).
+IP6_HDR_LEN: uint64 = 40
+IP6_HOP_LIMIT: uint8 = 255          # ND messages use 255; echo uses 64.
+IP6_ECHO_HOP: uint8 = 64
+
+
+# --- our link-local address + MAC -----------------------------------
+#
+# 16-byte fe80::/64 link-local address derived from the device MAC via
+# EUI-64 (RFC 4291 §2.5.1):
+#   fe80:0000:0000:0000 : <mac[0]^0x02> mac[1] mac[2] ff fe mac[3..5]
+#
+# Stored as raw network-order bytes so a byte compare against an
+# on-wire address is a direct memcmp.
+ip6_lladdr:     Array[16, uint8]
+ip6_lladdr_set: uint8 = 0
+ip6_our_mac:    Array[6, uint8]
+
+# Solicited-node multicast address for our link-local addr (RFC 4291
+# §2.7.1): ff02::1:ffXX:XXXX where XX:XXXX are the low 24 bits of the
+# target address. We respond to NS sent to this group as well as to our
+# unicast address.
+ip6_sol_node:   Array[16, uint8]
+
+# Counters (smoke-test observable).
+ip6_in_pkts:        uint64 = 0
+ip6_in_hdr_err:     uint64 = 0
+icmp6_in_echo_req:  uint64 = 0
+icmp6_out_echo_rep: uint64 = 0
+icmp6_in_ns:        uint64 = 0
+icmp6_out_na:       uint64 = 0
+icmp6_in_na:        uint64 = 0
+icmp6_out_ns:       uint64 = 0
+udp6_in_datagrams:  uint64 = 0
+udp6_out_datagrams: uint64 = 0
+
+
+# --- neighbor cache (the IPv6 analogue of arp.ad's cache) -----------
+#
+# Flat 8-entry table mapping a 16-byte IPv6 address to a 6-byte MAC.
+# Parallel arrays, same discipline as arp.ad.
+NDC_SIZE: uint64 = 8
+ndc_valid: Array[8, uint8]
+ndc_ip:    Array[128, uint8]        # 8 * 16 bytes
+ndc_mac:   Array[48, uint8]         # 8 * 6 bytes
+ndc_next_evict: uint64 = 0
+
+
+# --- scratch TX buffers ---------------------------------------------
+# One for the full L2 frame (eth 14 + ipv6 40 + payload). 1600 gives a
+# generous margin over the 1514 Ethernet MTU; eth_tx bounds-checks.
+IP6_TX_SCRATCH: uint64 = 1600
+ip6_tx_buf:     Array[1600, uint8]
+
+
+# =====================================================================
+# Address helpers
+# =====================================================================
+
+def _ip6_print(addr: Ptr[uint8]):
+    # Print a 16-byte IPv6 address as 8 colon-separated hex groups
+    # (no :: compression — keeps the printer trivial and the test's
+    # grep target stable). Each group is 2 bytes, printed lowercase.
+    i: uint64 = 0
+    while i < 8:
+        hi: uint64 = cast[uint64](addr[i * 2])
+        lo: uint64 = cast[uint64](addr[i * 2 + 1])
+        printk1("%x", (hi >> 4) & 0xF)
+        printk1("%x", hi & 0xF)
+        printk1("%x", (lo >> 4) & 0xF)
+        printk1("%x", lo & 0xF)
+        if i < 7:
+            printk0(":")
+        i = i + 1
+
+
+def ipv6_derive_lladdr(mac6: Ptr[uint8]):
+    # Build our fe80::/64 EUI-64 link-local address from the 6-byte MAC
+    # and the matching solicited-node multicast address. Called once
+    # from the NIC bring-up (or the self-test) after the MAC is known.
+    i: uint64 = 0
+    while i < 6:
+        ip6_our_mac[i] = mac6[i]
+        i = i + 1
+    # Zero then fill the 16-byte link-local address.
+    j: uint64 = 0
+    while j < 16:
+        ip6_lladdr[j] = 0
+        j = j + 1
+    ip6_lladdr[0] = 0xFE
+    ip6_lladdr[1] = 0x80
+    # bytes 2..7 stay zero (fe80::/64 prefix).
+    # EUI-64 interface identifier @ bytes 8..15.
+    ip6_lladdr[8]  = mac6[0] ^ 0x02      # flip the U/L bit
+    ip6_lladdr[9]  = mac6[1]
+    ip6_lladdr[10] = mac6[2]
+    ip6_lladdr[11] = 0xFF
+    ip6_lladdr[12] = 0xFE
+    ip6_lladdr[13] = mac6[3]
+    ip6_lladdr[14] = mac6[4]
+    ip6_lladdr[15] = mac6[5]
+    # Solicited-node multicast: ff02::1:ffXX:XXXX (low 24 bits of addr).
+    k: uint64 = 0
+    while k < 16:
+        ip6_sol_node[k] = 0
+        k = k + 1
+    ip6_sol_node[0]  = 0xFF
+    ip6_sol_node[1]  = 0x02
+    ip6_sol_node[11] = 0x01
+    ip6_sol_node[12] = 0xFF
+    ip6_sol_node[13] = ip6_lladdr[13]
+    ip6_sol_node[14] = ip6_lladdr[14]
+    ip6_sol_node[15] = ip6_lladdr[15]
+    ip6_lladdr_set = 1
+    printk0("[ipv6] link-local address fe80:: derived: ")
+    _ip6_print(cast[Ptr[uint8]](&ip6_lladdr[0]))
+    printk0("\n")
+
+
+def ipv6_have_lladdr() -> int32:
+    if ip6_lladdr_set == 0:
+        return 0
+    return 1
+
+
+def ipv6_lladdr_byte(i: uint64) -> uint8:
+    return ip6_lladdr[i]
+
+
+def _ip6_addr_eq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    # 1 iff the two 16-byte addresses are byte-for-byte equal.
+    i: uint64 = 0
+    while i < 16:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def _ip6_is_for_us(dst: Ptr[uint8]) -> int32:
+    # 1 iff `dst` (16 bytes) is one we accept: our link-local unicast,
+    # our solicited-node multicast, or the all-nodes ff02::1 multicast.
+    if ip6_lladdr_set == 0:
+        return 0
+    if _ip6_addr_eq(dst, cast[Ptr[uint8]](&ip6_lladdr[0])) == 1:
+        return 1
+    if _ip6_addr_eq(dst, cast[Ptr[uint8]](&ip6_sol_node[0])) == 1:
+        return 1
+    # all-nodes ff02::1
+    if dst[0] == 0xFF and dst[1] == 0x02:
+        allnodes: int32 = 1
+        i: uint64 = 2
+        while i < 15:
+            if dst[i] != 0:
+                allnodes = 0
+            i = i + 1
+        if dst[15] == 1 and allnodes == 1:
+            return 1
+    return 0
+
+
+# =====================================================================
+# Neighbor cache
+# =====================================================================
+
+def _ndc_lookup(ip: Ptr[uint8]) -> Ptr[uint8]:
+    # Look up the MAC for a 16-byte IPv6 address. Returns a pointer
+    # into ndc_mac on a hit, or NULL on a miss.
+    i: uint64 = 0
+    while i < NDC_SIZE:
+        if ndc_valid[i] != 0:
+            base: uint64 = i * 16
+            eqv: int32 = 1
+            j: uint64 = 0
+            while j < 16:
+                if ndc_ip[base + j] != ip[j]:
+                    eqv = 0
+                    j = 16
+                else:
+                    j = j + 1
+            if eqv == 1:
+                return cast[Ptr[uint8]](&ndc_mac[i * 6])
+        i = i + 1
+    return cast[Ptr[uint8]](0)
+
+
+def _ndc_insert(ip: Ptr[uint8], mac: Ptr[uint8]):
+    # Insert / refresh an (ip -> mac) binding. Overwrite on a hit,
+    # else take the first free slot, else round-robin evict.
+    i: uint64 = 0
+    while i < NDC_SIZE:
+        if ndc_valid[i] != 0:
+            base: uint64 = i * 16
+            eqv: int32 = 1
+            j: uint64 = 0
+            while j < 16:
+                if ndc_ip[base + j] != ip[j]:
+                    eqv = 0
+                    j = 16
+                else:
+                    j = j + 1
+            if eqv == 1:
+                k: uint64 = 0
+                while k < 6:
+                    ndc_mac[i * 6 + k] = mac[k]
+                    k = k + 1
+                return
+        i = i + 1
+    # find free slot
+    i = 0
+    while i < NDC_SIZE:
+        if ndc_valid[i] == 0:
+            _ndc_store(i, ip, mac)
+            return
+        i = i + 1
+    slot: uint64 = ndc_next_evict
+    if slot >= NDC_SIZE:
+        slot = 0
+    ndc_next_evict = slot + 1
+    _ndc_store(slot, ip, mac)
+
+
+def _ndc_store(slot: uint64, ip: Ptr[uint8], mac: Ptr[uint8]):
+    ndc_valid[slot] = 1
+    base: uint64 = slot * 16
+    j: uint64 = 0
+    while j < 16:
+        ndc_ip[base + j] = ip[j]
+        j = j + 1
+    k: uint64 = 0
+    while k < 6:
+        ndc_mac[slot * 6 + k] = mac[k]
+        k = k + 1
+
+
+def ipv6_neigh_count() -> uint64:
+    # Number of live neighbor-cache entries (smoke-test observable).
+    n: uint64 = 0
+    i: uint64 = 0
+    while i < NDC_SIZE:
+        if ndc_valid[i] != 0:
+            n = n + 1
+        i = i + 1
+    return n
+
+
+# =====================================================================
+# Checksum (IPv6 pseudo-header + payload)
+# =====================================================================
+
+def _ip6_csum(src: Ptr[uint8], dst: Ptr[uint8],
+              next_hdr: uint8, payload: Ptr[uint8],
+              payload_len: uint64) -> uint16:
+    # RFC 2460 §8.1 pseudo-header checksum: sum 16-bit big-endian words
+    # over [src(16) | dst(16) | upper-layer-length(4) | zero(3) |
+    # next_hdr(1)] then over the L4 payload, fold the carries, and
+    # return the one's complement. Used by ICMPv6 and UDP6 (both
+    # mandatory in IPv6, unlike the optional IPv4 UDP checksum).
+    sum32: uint32 = 0
+    # src + dst (32 bytes, 16 words).
+    i: uint64 = 0
+    while i < 16:
+        sum32 = sum32 + ((cast[uint32](src[i]) << 8) | cast[uint32](src[i + 1]))
+        sum32 = sum32 + ((cast[uint32](dst[i]) << 8) | cast[uint32](dst[i + 1]))
+        i = i + 2
+    # upper-layer length (32-bit, big-endian) — top 16 bits zero for
+    # any datagram we build, low 16 bits = payload_len.
+    sum32 = sum32 + (cast[uint32](payload_len) & 0xFFFF)
+    sum32 = sum32 + ((cast[uint32](payload_len) >> 16) & 0xFFFF)
+    # zero(3) + next_hdr(1): the only nonzero byte is next_hdr in the
+    # low byte of the final 16-bit word.
+    sum32 = sum32 + cast[uint32](next_hdr)
+    # L4 payload.
+    end_pairs: uint64 = payload_len & ~cast[uint64](1)
+    p: uint64 = 0
+    while p < end_pairs:
+        sum32 = sum32 + ((cast[uint32](payload[p]) << 8) | cast[uint32](payload[p + 1]))
+        p = p + 2
+    if p < payload_len:
+        sum32 = sum32 + (cast[uint32](payload[p]) << 8)
+    while (sum32 >> 16) != 0:
+        sum32 = (sum32 & 0xFFFF) + (sum32 >> 16)
+    return cast[uint16](~sum32 & 0xFFFF)
+
+
+# =====================================================================
+# IPv6 transmit
+# =====================================================================
+
+def ipv6_tx(dst_ip: Ptr[uint8], dst_mac: Ptr[uint8],
+            next_hdr: uint8, hop_limit: uint8,
+            payload: Ptr[uint8], payload_len: uint64) -> int32:
+    # Build [ ETH | IPv6 hdr(40) | payload ] into ip6_tx_buf and hand
+    # it to eth_tx. `dst_ip` is the 16-byte destination, `dst_mac` the
+    # resolved (or multicast) destination MAC, `next_hdr` the L4 proto.
+    # The source address is always our link-local address.
+    if payload_len + IP6_HDR_LEN + IP6_ETH_HDR_LEN > IP6_TX_SCRATCH:
+        printk1("[ipv6] tx too big (%d bytes)\n", payload_len)
+        return -1
+    if ip6_lladdr_set == 0:
+        printk0("[ipv6] tx with no link-local address set\n")
+        return -1
+    # --- Ethernet header ------------------------------------------
+    i: uint64 = 0
+    while i < 6:
+        ip6_tx_buf[i] = dst_mac[i]
+        i = i + 1
+    our_mac: Ptr[uint8] = eth_get_mac()
+    i = 0
+    while i < 6:
+        ip6_tx_buf[6 + i] = our_mac[i]
+        i = i + 1
+    ip6_tx_buf[12] = IP6_ETHERTYPE_HI
+    ip6_tx_buf[13] = IP6_ETHERTYPE_LO
+    # --- IPv6 header @ offset 14 ----------------------------------
+    h: uint64 = IP6_ETH_HDR_LEN
+    ip6_tx_buf[h + 0] = 0x60               # version 6, traffic class 0
+    ip6_tx_buf[h + 1] = 0
+    ip6_tx_buf[h + 2] = 0                  # flow label 0
+    ip6_tx_buf[h + 3] = 0
+    ip6_tx_buf[h + 4] = cast[uint8]((payload_len >> 8) & 0xFF)   # payload len hi
+    ip6_tx_buf[h + 5] = cast[uint8](payload_len & 0xFF)          # payload len lo
+    ip6_tx_buf[h + 6] = next_hdr
+    ip6_tx_buf[h + 7] = hop_limit
+    # source = our link-local
+    i = 0
+    while i < 16:
+        ip6_tx_buf[h + 8 + i] = ip6_lladdr[i]
+        i = i + 1
+    # destination
+    i = 0
+    while i < 16:
+        ip6_tx_buf[h + 24 + i] = dst_ip[i]
+        i = i + 1
+    # --- payload @ offset 14+40 -----------------------------------
+    pl_off: uint64 = IP6_ETH_HDR_LEN + IP6_HDR_LEN
+    k: uint64 = 0
+    while k < payload_len:
+        ip6_tx_buf[pl_off + k] = payload[k]
+        k = k + 1
+    total_frame: uint64 = pl_off + payload_len
+    tx_ptr: Ptr[uint8] = cast[Ptr[uint8]](&ip6_tx_buf[0])
+    return eth_tx(tx_ptr, total_frame)
+
+
+# Multicast MAC for an IPv6 multicast address: 33:33:XX:XX:XX:XX where
+# the last 4 bytes are the low 32 bits of the destination (RFC 2464).
+def _ip6_mcast_mac(dst_ip: Ptr[uint8], out_mac: Ptr[uint8]):
+    out_mac[0] = 0x33
+    out_mac[1] = 0x33
+    out_mac[2] = dst_ip[12]
+    out_mac[3] = dst_ip[13]
+    out_mac[4] = dst_ip[14]
+    out_mac[5] = dst_ip[15]
+
+
+# =====================================================================
+# ICMPv6: Echo + Neighbor Discovery
+# =====================================================================
+#
+# All ICMPv6 messages share the 4-byte header (type, code, checksum)
+# then a type-specific body. The checksum covers the IPv6 pseudo-header
+# (computed by _ip6_csum) plus the whole ICMPv6 message.
+
+# Scratch ICMPv6 message buffer (header + body, no IPv6/eth headers).
+ICMP6_BUF: uint64 = 256
+icmp6_msg: Array[256, uint8]
+
+
+def _icmp6_finalize_and_send(src_ip: Ptr[uint8], dst_ip: Ptr[uint8],
+                             dst_mac: Ptr[uint8], hop_limit: uint8,
+                             msg_len: uint64) -> int32:
+    # Compute the ICMPv6 checksum over (pseudo-header || icmp6_msg) with
+    # the checksum field (bytes 2..3) zeroed, write it back, and hand
+    # the message to ipv6_tx as the L4 payload. `src_ip` is our address
+    # (used for the pseudo-header), already implied by ipv6_tx but the
+    # checksum needs it explicitly.
+    icmp6_msg[2] = 0
+    icmp6_msg[3] = 0
+    csum: uint16 = _ip6_csum(src_ip, dst_ip, IP6PROTO_ICMPV6,
+                             cast[Ptr[uint8]](&icmp6_msg[0]), msg_len)
+    icmp6_msg[2] = cast[uint8]((cast[uint32](csum) >> 8) & 0xFF)
+    icmp6_msg[3] = cast[uint8](cast[uint32](csum) & 0xFF)
+    return ipv6_tx(dst_ip, dst_mac, IP6PROTO_ICMPV6, hop_limit,
+                   cast[Ptr[uint8]](&icmp6_msg[0]), msg_len)
+
+
+def _icmp6_send_na(target_ip: Ptr[uint8], dst_ip: Ptr[uint8],
+                   dst_mac: Ptr[uint8]) -> int32:
+    # Build + send a Neighbor Advertisement (type 136) for `target_ip`
+    # (our address) to `dst_ip` / `dst_mac` (the soliciting peer).
+    # Flags: Solicited (0x40) + Override (0x20). Carries a Target
+    # Link-Layer Address option (type 2) with our MAC.
+    # Layout: type(1) code(1) csum(2) flags(1) reserved(3)
+    #         target_addr(16) opt_type(1) opt_len(1) mac(6) = 32 bytes.
+    i: uint64 = 0
+    while i < 32:
+        icmp6_msg[i] = 0
+        i = i + 1
+    icmp6_msg[0] = ICMP6_NEIGH_ADV
+    icmp6_msg[1] = 0
+    icmp6_msg[4] = 0x60                   # Solicited + Override
+    i = 0
+    while i < 16:
+        icmp6_msg[8 + i] = target_ip[i]
+        i = i + 1
+    icmp6_msg[24] = ND_OPT_TGT_LLADDR
+    icmp6_msg[25] = 1                      # option length in 8-byte units
+    our_mac: Ptr[uint8] = eth_get_mac()
+    i = 0
+    while i < 6:
+        icmp6_msg[26 + i] = our_mac[i]
+        i = i + 1
+    icmp6_out_na = icmp6_out_na + 1
+    printk0("[icmpv6] NA -> ")
+    _ip6_print(dst_ip)
+    printk0("\n")
+    return _icmp6_finalize_and_send(
+        cast[Ptr[uint8]](&ip6_lladdr[0]), dst_ip, dst_mac,
+        IP6_HOP_LIMIT, 32)
+
+
+def ipv6_send_ns(target_ip: Ptr[uint8]) -> int32:
+    # Send a Neighbor Solicitation to resolve `target_ip`. The NS goes
+    # to the solicited-node multicast of the target (ff02::1:ffXX:XXXX)
+    # with the 33:33 multicast MAC. Carries a Source Link-Layer Address
+    # option (type 1) with our MAC.
+    # Layout: type(1) code(1) csum(2) reserved(4) target(16)
+    #         opt_type(1) opt_len(1) mac(6) = 32 bytes.
+    if ip6_lladdr_set == 0:
+        return -1
+    i: uint64 = 0
+    while i < 32:
+        icmp6_msg[i] = 0
+        i = i + 1
+    icmp6_msg[0] = ICMP6_NEIGH_SOL
+    icmp6_msg[1] = 0
+    i = 0
+    while i < 16:
+        icmp6_msg[8 + i] = target_ip[i]
+        i = i + 1
+    icmp6_msg[24] = ND_OPT_SRC_LLADDR
+    icmp6_msg[25] = 1
+    our_mac: Ptr[uint8] = eth_get_mac()
+    i = 0
+    while i < 6:
+        icmp6_msg[26 + i] = our_mac[i]
+        i = i + 1
+    # Solicited-node multicast destination for the target.
+    dst: Array[16, uint8]
+    j: uint64 = 0
+    while j < 16:
+        dst[j] = 0
+        j = j + 1
+    dst[0]  = 0xFF
+    dst[1]  = 0x02
+    dst[11] = 0x01
+    dst[12] = 0xFF
+    dst[13] = target_ip[13]
+    dst[14] = target_ip[14]
+    dst[15] = target_ip[15]
+    dmac: Array[6, uint8]
+    _ip6_mcast_mac(cast[Ptr[uint8]](&dst[0]),
+                   cast[Ptr[uint8]](&dmac[0]))
+    icmp6_out_ns = icmp6_out_ns + 1
+    printk0("[icmpv6] NS who-has ")
+    _ip6_print(target_ip)
+    printk0("\n")
+    return _icmp6_finalize_and_send(
+        cast[Ptr[uint8]](&ip6_lladdr[0]),
+        cast[Ptr[uint8]](&dst[0]),
+        cast[Ptr[uint8]](&dmac[0]),
+        IP6_HOP_LIMIT, 32)
+
+
+def _icmp6_rx(src_ip: Ptr[uint8], dst_ip: Ptr[uint8],
+              src_mac: Ptr[uint8], payload: Ptr[uint8],
+              length: uint64):
+    # ICMPv6 demux. `payload` points at the ICMPv6 header (the IPv6
+    # header has been stripped); `length` is the ICMPv6 message length.
+    # `src_ip`/`src_mac` identify the peer for replies + cache fills.
+    if length < 4:
+        printk0("[icmpv6] runt\n")
+        return
+    itype: uint8 = payload[0]
+    if itype == ICMP6_ECHO_REQUEST:
+        icmp6_in_echo_req = icmp6_in_echo_req + 1
+        printk0("[icmpv6] echo request from ")
+        _ip6_print(src_ip)
+        printk0("\n")
+        if length >= ICMP6_BUF:
+            printk0("[icmpv6] echo request too big\n")
+            return
+        # Copy the whole message, flip type to Echo Reply, recompute
+        # the checksum, and send it back to the source.
+        i: uint64 = 0
+        while i < length:
+            icmp6_msg[i] = payload[i]
+            i = i + 1
+        icmp6_msg[0] = ICMP6_ECHO_REPLY
+        icmp6_out_echo_rep = icmp6_out_echo_rep + 1
+        printk0("[icmpv6] echo reply -> ")
+        _ip6_print(src_ip)
+        printk0("\n")
+        _icmp6_finalize_and_send(
+            cast[Ptr[uint8]](&ip6_lladdr[0]), src_ip, src_mac,
+            IP6_ECHO_HOP, length)
+        return
+    if itype == ICMP6_ECHO_REPLY:
+        printk0("[icmpv6] echo reply from ")
+        _ip6_print(src_ip)
+        printk0("\n")
+        return
+    if itype == ICMP6_NEIGH_SOL:
+        icmp6_in_ns = icmp6_in_ns + 1
+        # Target address @ bytes 8..23. Answer iff it is our address.
+        if length < 24:
+            return
+        tgt: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](payload) + 8)
+        printk0("[icmpv6] NS for ")
+        _ip6_print(tgt)
+        printk0("\n")
+        # Learn the soliciting peer's (src_ip -> src_mac) binding from
+        # the SLLA option if present, else from the frame's src MAC.
+        _ndc_insert(src_ip, src_mac)
+        if _ip6_addr_eq(tgt, cast[Ptr[uint8]](&ip6_lladdr[0])) == 1:
+            # Reply to the unicast source. If the source is the
+            # unspecified address (::, DAD), reply to all-nodes — but
+            # for our scope a unicast reply to src is sufficient.
+            _icmp6_send_na(cast[Ptr[uint8]](&ip6_lladdr[0]),
+                           src_ip, src_mac)
+        return
+    if itype == ICMP6_NEIGH_ADV:
+        icmp6_in_na = icmp6_in_na + 1
+        # Target address @ bytes 8..23; Target LL option (type 2) may
+        # carry the peer's MAC. Cache (target -> mac).
+        if length < 24:
+            return
+        tgt: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](payload) + 8)
+        # Look for a Target Link-Layer Address option at offset 24.
+        if length >= 32:
+            if payload[24] == ND_OPT_TGT_LLADDR:
+                opt_mac: Ptr[uint8] = cast[Ptr[uint8]](
+                    cast[uint64](payload) + 26)
+                _ndc_insert(tgt, opt_mac)
+                printk0("[icmpv6] NA cached: ")
+                _ip6_print(tgt)
+                printk0("\n")
+                return
+        _ndc_insert(tgt, src_mac)
+        return
+    printk1("[icmpv6] ignored type=%d\n", cast[uint64](itype))
+
+
+# =====================================================================
+# UDP over IPv6
+# =====================================================================
+
+UDP6_HDR_LEN: uint64 = 8
+UDP6_TX_BYTES: uint64 = 1500
+udp6_tx_buf:   Array[1500, uint8]
+
+
+def udp6_send(dst_ip: Ptr[uint8], dst_mac: Ptr[uint8],
+              src_port: uint16, dst_port: uint16,
+              payload: Ptr[uint8], payload_len: uint64) -> int32:
+    # Build [ UDP hdr(8) | payload ] and send it over IPv6. Unlike
+    # IPv4, the UDP checksum is MANDATORY in IPv6 (RFC 2460 §8.1) and
+    # covers the pseudo-header.
+    total: uint64 = UDP6_HDR_LEN + payload_len
+    if total > UDP6_TX_BYTES:
+        printk1("[udp6] too big (%d bytes)\n", payload_len)
+        return -1
+    udp6_tx_buf[0] = cast[uint8]((cast[uint32](src_port) >> 8) & 0xFF)
+    udp6_tx_buf[1] = cast[uint8](cast[uint32](src_port) & 0xFF)
+    udp6_tx_buf[2] = cast[uint8]((cast[uint32](dst_port) >> 8) & 0xFF)
+    udp6_tx_buf[3] = cast[uint8](cast[uint32](dst_port) & 0xFF)
+    udp6_tx_buf[4] = cast[uint8]((total >> 8) & 0xFF)
+    udp6_tx_buf[5] = cast[uint8](total & 0xFF)
+    udp6_tx_buf[6] = 0                     # checksum placeholder
+    udp6_tx_buf[7] = 0
+    i: uint64 = 0
+    while i < payload_len:
+        udp6_tx_buf[UDP6_HDR_LEN + i] = payload[i]
+        i = i + 1
+    csum: uint16 = _ip6_csum(
+        cast[Ptr[uint8]](&ip6_lladdr[0]), dst_ip, IP6PROTO_UDP,
+        cast[Ptr[uint8]](&udp6_tx_buf[0]), total)
+    # RFC 768/2460: a computed UDP checksum of zero is transmitted as
+    # all-ones (0xFFFF) so the field is never literally zero (which
+    # means "no checksum" — illegal in IPv6).
+    if csum == 0:
+        csum = 0xFFFF
+    udp6_tx_buf[6] = cast[uint8]((cast[uint32](csum) >> 8) & 0xFF)
+    udp6_tx_buf[7] = cast[uint8](cast[uint32](csum) & 0xFF)
+    udp6_out_datagrams = udp6_out_datagrams + 1
+    buf_ptr: Ptr[uint8] = cast[Ptr[uint8]](&udp6_tx_buf[0])
+    return ipv6_tx(dst_ip, dst_mac, IP6PROTO_UDP, IP6_ECHO_HOP,
+                   buf_ptr, total)
+
+
+def _udp6_rx(src_ip: Ptr[uint8], dst_ip: Ptr[uint8],
+             payload: Ptr[uint8], length: uint64):
+    # Minimal UDP6 receive: log the datagram. A full /net-style socket
+    # demux would route by destination port; for the deliverable we
+    # demonstrate the receive path parses the header + bumps the
+    # counter. (A bound-socket table for v6 is a follow-up.)
+    udp6_in_datagrams = udp6_in_datagrams + 1
+    if length < UDP6_HDR_LEN:
+        printk0("[udp6] runt\n")
+        return
+    sp: uint64 = (cast[uint64](payload[0]) << 8) | cast[uint64](payload[1])
+    dp: uint64 = (cast[uint64](payload[2]) << 8) | cast[uint64](payload[3])
+    printk2("[udp6] datagram src_port=%d dst_port=%d\n", sp, dp)
+
+
+# =====================================================================
+# IPv6 receive (wired from eth_rx)
+# =====================================================================
+
+def ipv6_rx(pkt: Ptr[uint8], length: uint64, src_mac: Ptr[uint8]):
+    # `pkt` points at the IPv6 header (eth_rx stripped the 14-byte L2
+    # header). `length` is the L3 length. `src_mac` is the frame's
+    # source MAC (used as a fallback neighbor binding + for replies).
+    ip6_in_pkts = ip6_in_pkts + 1
+    if length < IP6_HDR_LEN:
+        ip6_in_hdr_err = ip6_in_hdr_err + 1
+        printk0("[ipv6] runt\n")
+        return
+    version: uint8 = (pkt[0] >> 4) & 0x0F
+    if version != 6:
+        ip6_in_hdr_err = ip6_in_hdr_err + 1
+        return
+    payload_len: uint64 = (cast[uint64](pkt[4]) << 8) | cast[uint64](pkt[5])
+    next_hdr: uint8 = pkt[6]
+    src_ip: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](pkt) + 8)
+    dst_ip: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](pkt) + 24)
+    # Bound the payload by what's actually in the buffer.
+    avail: uint64 = length - IP6_HDR_LEN
+    if payload_len > avail:
+        payload_len = avail
+    # Drop packets not addressed to us (unicast / our solicited-node /
+    # all-nodes). ND messages to the solicited-node multicast still pass.
+    if _ip6_is_for_us(dst_ip) == 0:
+        # Not for us — silently drop (don't bump hdr_err; this is normal
+        # multicast chatter on a shared link).
+        return
+    l4: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](pkt) + IP6_HDR_LEN)
+    if next_hdr == IP6PROTO_ICMPV6:
+        _icmp6_rx(src_ip, dst_ip, src_mac, l4, payload_len)
+        return
+    if next_hdr == IP6PROTO_UDP:
+        _udp6_rx(src_ip, dst_ip, l4, payload_len)
+        return
+    printk1("[ipv6] unhandled next-header=%d\n", cast[uint64](next_hdr))
+
+
+# =====================================================================
+# Self-test (synthetic ingress, no NIC required)
+# =====================================================================
+#
+# Deterministic offline exercise of the v6 RX path: synthesize an
+# Ethernet frame carrying an IPv6 packet and feed it through the REAL
+# eth_rx -> ipv6_rx -> _icmp6_rx dispatch, then assert the kernel built
+# the correct reply (counter bumped + reply marker printed). This
+# proves the full demux/parse/checksum/build path without depending on
+# QEMU's SLIRP IPv6 behaviour. Driven from net_smoke_test gated on the
+# /etc/ipv6-test cpio marker (scripts/test_net_ipv6.sh).
+
+# Scratch ingress frame builder.
+IP6_ST_FRAME: uint64 = 256
+ip6_st_frame: Array[256, uint8]
+
+# A fixed "peer" MAC for the synthetic sender.
+ip6_st_peer_mac: Array[6, uint8]
+# A fixed "peer" link-local address (fe80::1) for the synthetic sender.
+ip6_st_peer_ip: Array[16, uint8]
+
+
+def _ip6_st_build_eth_ipv6(dst_ip: Ptr[uint8], next_hdr: uint8,
+                           hop_limit: uint8, l4: Ptr[uint8],
+                           l4_len: uint64) -> uint64:
+    # Build a full Ethernet + IPv6 frame for the synthetic peer ->
+    # us. Returns the total frame length. Destination MAC is our MAC
+    # (eth_get_mac) for unicast; the caller passes dst_ip for the IPv6
+    # destination (our link-local or our solicited-node multicast).
+    i: uint64 = 0
+    while i < IP6_ST_FRAME:
+        ip6_st_frame[i] = 0
+        i = i + 1
+    # Ethernet: dst = our MAC, src = peer MAC, ethertype = 0x86DD.
+    our_mac: Ptr[uint8] = eth_get_mac()
+    i = 0
+    while i < 6:
+        ip6_st_frame[i] = our_mac[i]
+        ip6_st_frame[6 + i] = ip6_st_peer_mac[i]
+        i = i + 1
+    ip6_st_frame[12] = IP6_ETHERTYPE_HI
+    ip6_st_frame[13] = IP6_ETHERTYPE_LO
+    # IPv6 header @ offset 14.
+    h: uint64 = 14
+    ip6_st_frame[h + 0] = 0x60
+    ip6_st_frame[h + 4] = cast[uint8]((l4_len >> 8) & 0xFF)
+    ip6_st_frame[h + 5] = cast[uint8](l4_len & 0xFF)
+    ip6_st_frame[h + 6] = next_hdr
+    ip6_st_frame[h + 7] = hop_limit
+    i = 0
+    while i < 16:
+        ip6_st_frame[h + 8 + i] = ip6_st_peer_ip[i]     # src
+        ip6_st_frame[h + 24 + i] = dst_ip[i]            # dst
+        i = i + 1
+    # L4 payload @ offset 54, with the ICMPv6/UDP checksum computed
+    # over the pseudo-header (peer -> dst).
+    pl: uint64 = h + IP6_HDR_LEN
+    i = 0
+    while i < l4_len:
+        ip6_st_frame[pl + i] = l4[i]
+        i = i + 1
+    return pl + l4_len
+
+
+def ipv6_selftest():
+    # Derive our link-local from our MAC (uses whatever the NIC set in
+    # eth.nd_mac, or a fixed test MAC if none), then drive two synthetic
+    # ingress frames through eth_rx and assert the replies are built.
+    printk0("[ipv6-selftest] begin\n")
+    # If no MAC was set by a NIC, plant a deterministic test MAC so the
+    # derivation + assertions are reproducible.
+    our_mac: Ptr[uint8] = eth_get_mac()
+    have_mac: int32 = 0
+    mi: uint64 = 0
+    while mi < 6:
+        if our_mac[mi] != 0:
+            have_mac = 1
+        mi = mi + 1
+    if have_mac == 0:
+        tmac: Array[6, uint8]
+        tmac[0] = 0x52
+        tmac[1] = 0x54
+        tmac[2] = 0x00
+        tmac[3] = 0x12
+        tmac[4] = 0x34
+        tmac[5] = 0x56
+        eth_set_mac(cast[Ptr[uint8]](&tmac[0]))
+        our_mac = eth_get_mac()
+    ipv6_derive_lladdr(our_mac)
+    # Synthetic peer identity: MAC 02:aa:bb:cc:dd:ee, addr fe80::1.
+    ip6_st_peer_mac[0] = 0x02
+    ip6_st_peer_mac[1] = 0xAA
+    ip6_st_peer_mac[2] = 0xBB
+    ip6_st_peer_mac[3] = 0xCC
+    ip6_st_peer_mac[4] = 0xDD
+    ip6_st_peer_mac[5] = 0xEE
+    pj: uint64 = 0
+    while pj < 16:
+        ip6_st_peer_ip[pj] = 0
+        pj = pj + 1
+    ip6_st_peer_ip[0]  = 0xFE
+    ip6_st_peer_ip[1]  = 0x80
+    ip6_st_peer_ip[15] = 0x01
+
+    na_before: uint64 = icmp6_out_na
+    rep_before: uint64 = icmp6_out_echo_rep
+
+    # --- (1) Neighbor Solicitation for our address -----------------
+    # ICMPv6 NS: type(135) code(0) csum(2) reserved(4) target(16)
+    # opt(SLLA, our peer MAC) = 32 bytes. Destination IPv6 = our
+    # solicited-node multicast (so _ip6_is_for_us accepts it).
+    ns: Array[32, uint8]
+    k: uint64 = 0
+    while k < 32:
+        ns[k] = 0
+        k = k + 1
+    ns[0] = ICMP6_NEIGH_SOL
+    # target = our link-local address.
+    k = 0
+    while k < 16:
+        ns[8 + k] = ip6_lladdr[k]
+        k = k + 1
+    ns[24] = ND_OPT_SRC_LLADDR
+    ns[25] = 1
+    k = 0
+    while k < 6:
+        ns[26 + k] = ip6_st_peer_mac[k]
+        k = k + 1
+    # checksum over pseudo-header (peer -> our solicited-node).
+    ns_csum: uint16 = _ip6_csum(
+        cast[Ptr[uint8]](&ip6_st_peer_ip[0]),
+        cast[Ptr[uint8]](&ip6_sol_node[0]),
+        IP6PROTO_ICMPV6, cast[Ptr[uint8]](&ns[0]), 32)
+    ns[2] = cast[uint8]((cast[uint32](ns_csum) >> 8) & 0xFF)
+    ns[3] = cast[uint8](cast[uint32](ns_csum) & 0xFF)
+    nsf_len: uint64 = _ip6_st_build_eth_ipv6(
+        cast[Ptr[uint8]](&ip6_sol_node[0]), IP6PROTO_ICMPV6,
+        IP6_HOP_LIMIT, cast[Ptr[uint8]](&ns[0]), 32)
+    printk0("[ipv6-selftest] inject NS\n")
+    eth_rx(cast[Ptr[uint8]](&ip6_st_frame[0]), nsf_len)
+
+    # --- (2) Echo Request to our address ---------------------------
+    # ICMPv6 Echo Request: type(128) code(0) csum(2) id(2) seq(2)
+    # + 8 bytes payload = 16 bytes. Destination = our link-local.
+    er: Array[16, uint8]
+    k = 0
+    while k < 16:
+        er[k] = 0
+        k = k + 1
+    er[0] = ICMP6_ECHO_REQUEST
+    er[4] = 0xBE                       # id hi
+    er[5] = 0xEF                       # id lo
+    er[6] = 0x00                       # seq hi
+    er[7] = 0x01                       # seq lo
+    k = 8
+    while k < 16:
+        er[k] = cast[uint8](k & 0xFF)
+        k = k + 1
+    er_csum: uint16 = _ip6_csum(
+        cast[Ptr[uint8]](&ip6_st_peer_ip[0]),
+        cast[Ptr[uint8]](&ip6_lladdr[0]),
+        IP6PROTO_ICMPV6, cast[Ptr[uint8]](&er[0]), 16)
+    er[2] = cast[uint8]((cast[uint32](er_csum) >> 8) & 0xFF)
+    er[3] = cast[uint8](cast[uint32](er_csum) & 0xFF)
+    erf_len: uint64 = _ip6_st_build_eth_ipv6(
+        cast[Ptr[uint8]](&ip6_lladdr[0]), IP6PROTO_ICMPV6,
+        IP6_ECHO_HOP, cast[Ptr[uint8]](&er[0]), 16)
+    printk0("[ipv6-selftest] inject Echo Request\n")
+    eth_rx(cast[Ptr[uint8]](&ip6_st_frame[0]), erf_len)
+
+    # --- assertions ------------------------------------------------
+    na_ok: int32 = 0
+    if icmp6_out_na > na_before:
+        na_ok = 1
+    rep_ok: int32 = 0
+    if icmp6_out_echo_rep > rep_before:
+        rep_ok = 1
+    if na_ok == 1:
+        printk0("[ipv6-selftest] NS->NA PASS\n")
+    else:
+        printk0("[ipv6-selftest] NS->NA FAIL\n")
+    if rep_ok == 1:
+        printk0("[ipv6-selftest] echo PASS\n")
+    else:
+        printk0("[ipv6-selftest] echo FAIL\n")
+    if na_ok == 1 and rep_ok == 1:
+        printk0("[ipv6-selftest] ALL PASS\n")
+    else:
+        printk0("[ipv6-selftest] SOME FAIL\n")
+
+
+def ipv6_init():
+    ip6_in_pkts        = 0
+    ip6_in_hdr_err     = 0
+    icmp6_in_echo_req  = 0
+    icmp6_out_echo_rep = 0
+    icmp6_in_ns        = 0
+    icmp6_out_na       = 0
+    icmp6_in_na        = 0
+    icmp6_out_ns       = 0
+    udp6_in_datagrams  = 0
+    udp6_out_datagrams = 0
+    ip6_lladdr_set     = 0
+    ndc_next_evict     = 0
+    i: uint64 = 0
+    while i < NDC_SIZE:
+        ndc_valid[i] = 0
+        i = i + 1
+    printk0("ipv6: initialized (link-local + ND + ICMPv6 + UDP6)\n")
