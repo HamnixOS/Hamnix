@@ -24,7 +24,7 @@ Plan 9 from scratch. Hamnix picks both, layered:
 | Layer | Shape | What lives there |
 |--|--|--|
 | **5** | Apps | Stock Debian packages (apt-installed) + Hamnix-native binaries |
-| **4** | Wire protocols | 9P (kernel↔userspace), [hamUI](docs/hamUI.md) (file-server-per-window UI; Phase 1+2 landed 2026-05-28) |
+| **4** | Wire protocols | 9P (kernel↔userspace), [hamUI](docs/hamUI.md) (file-server-per-window UI; Phases 1+2+4a+4b+4c landed) |
 | **3** | Userspace services | 9P file servers (hamwd, distrofs, ...) — Hamnix programs |
 | **2** | Linux ABI shims | `linux_abi/` — translates Linux syscalls onto Layer 1 |
 | **1** | Native syscalls | **Plan 9-shape** — ~25 calls including `rfork`, `bind`, `mount`, `errstr`. See [`docs/native-api.md`](docs/native-api.md) |
@@ -53,8 +53,9 @@ loop through userspace-posted srvfds. See
 - **Real hardware** — boots end-to-end on the Intel Skull Canyon NUC
   (UEFI, USB keyboard input via the L-shim USB-HC bridge, reaches
   hamsh prompt, runs `enter linux { /bin/sh }` against real Debian
-  apt/dpkg). Asus i5-4210U crashes during boot (regression observation
-  only). See [`docs/REAL_HARDWARE.md`](docs/REAL_HARDWARE.md).
+  apt/dpkg). Asus i5-4210U boots to hamsh prompt in Legacy/BIOS mode
+  (built-in keyboard unresponsive — leading hypothesis: EHCI-routed,
+  not i8042). See [`docs/REAL_HARDWARE.md`](docs/REAL_HARDWARE.md).
 - **UEFI-only GPT disk image** (`build/hamnix.img`) via
   `scripts/build_img.sh` — a raw, installed-system-shaped disk: a FAT
   EFI System Partition (the native PE/COFF stub + kernel ELF) plus a
@@ -82,7 +83,10 @@ loop through userspace-posted srvfds. See
   Tab completion + history; in-init service supervisor (`svc start /
   status / restart`, restart-on-crash, persistent logs at
   `/var/log/svc/<name>.log`); rc-in-hamsh at `/etc/rc.boot`. Builtins
-  honour `>`/`>>`/`<`/`2>` redirects.
+  honour `>`/`>>`/`<`/`2>` redirects. **Job control** (`&` background,
+  `jobs` / `fg` / `bg`, Ctrl-Z → SIGTSTP / SIGCONT). **Native
+  runlevels** — `service` + `initctl` CLI; `runlevel: N` bitmask in
+  service declarations; default multi-user runlevel 3.
 - **Package manager (`hpm`)** — Hamnix-native, binary-only, BFS dep
   solver, `hpm install hamnix-base` metapackage pulls 17 component
   packages. Debian-shape subdirectory channels at `https://255.one/`
@@ -96,18 +100,28 @@ loop through userspace-posted srvfds. See
   itself already an installed-system-shaped GPT image; on a real disk
   the ext4 root grows to fill the disk and every named root draws from
   that one shared pool.)
+- **Multi-user auth** — `useradd` / `passwd` / `login` / `su` /
+  `whoami` real end-to-end; `/dev/auth` cdev with `setpass` verb;
+  `SYS_SETUID_AUTH` (300) syscall; SHA-512 shadow hashes (rate-limited).
 - **Security** — Plan-9-shape: single hostowner (uid 1) per installed
   system; regular users (uid ≥ 1000) get a restricted namespace and
   literally can't address dangerous file servers; no setuid bits, no
-  `sudo`. Elevation is `newshell hostowner` (a hamsh builtin). SHA-512
-  shadow hashes via `/dev/auth` cdev (rate-limited). See
-  [`docs/security.md`](docs/security.md).
-- **hamUI** — file-server-per-window UI. Phase 1+2 landed: `/dev/wsys/
-  <N>/{text,output,cmd,ns,pid,uid,kind,geometry}` for each window; an
-  AI agent can `cat /dev/wsys/N/text` to see what's on the screen and
-  `echo cmd > /dev/wsys/N/cmd` to drive it. Multi-window background
-  hamsh instances supported. Phase 4+ (draw protocol + framebuffer +
-  X11 bridge) queued. See [`docs/hamUI.md`](docs/hamUI.md).
+  `sudo`. Elevation is `newshell hostowner` (a hamsh builtin).
+  Syscall-boundary `access_ok` pointer/length validator rejects
+  kernel-address userland pointers on every native write/read path.
+  See [`docs/security.md`](docs/security.md).
+- **hamUI** — file-server-per-window UI. Phases 1, 2, 4a, 4b, 4c
+  landed: `/dev/wsys/<N>/{text,output,cmd,ns,pid,uid,kind,geometry}`
+  per window; layered draw protocol under `/dev/wsys/<N>/draw/`;
+  `hamUId` userland renderer daemon with GNOME2/MATE-style panel,
+  taskbar (window-list buttons), minimize, and live clock; drag-title-
+  to-move + click-to-close window management; `/dev/fb` framebuffer
+  cdev; interactive windowed hamsh terminal. An AI agent can
+  `cat /dev/wsys/N/text` to see screen content and
+  `echo cmd > /dev/wsys/N/cmd` to drive it. **X11 first slice**: native
+  X11 server in `user/x11/` over `/net/tcp` (core-protocol subset).
+  Phase 3 (per-window namespace elevation) and Phase 5 (full X11/Xvfb
+  bridge) remain open. See [`docs/hamUI.md`](docs/hamUI.md).
 - **AI agents** — `/dev/wsys/N/*` + svc logs + persistent `man` pages
   at `/usr/share/man/` make Hamnix the OS an AI can fully debug from
   a serial console.
@@ -119,9 +133,26 @@ loop through userspace-posted srvfds. See
   Plan-9-native `/dev/reboot` cdev and the Linux `reboot(2)` syscall
   share one kernel routine that flushes filesystems, then ACPI-S5
   poweroff / i8042 reset / triple-fault reboot.
-- ~60 native userland binaries (`ls`, `cat`, `cp -r`, `find`, `du`,
+- **SMP** — MADT-driven N-AP bringup; per-CPU `%gs`, per-CPU
+  `current_task`; APs participate in the shared runqueue (single
+  runqueue with spinlock; per-CPU runqueues + load balancing are a
+  follow-up).
+- **Virtual terminals** — VT1..VT4 (`/dev/vt/1`..`/dev/vt/4` +
+  `/dev/vt/ctl`); `chvt <N>` switches the active console; Alt+F1..F4
+  keyboard shortcuts.
+- **Native cron daemon** — `crond` + `crontab` CLI; standard 5-field
+  crontab syntax; spawns jobs in the background.
+- **Native HTTP server** — `httpd` concurrent web server; per-connection
+  worker processes; name-based virtual hosts; static files; CGI.
+- **`vi`** — native Adder `vi` modal text editor.
+- **`hamfm`** — TUI file manager with an Applications menu entry in
+  the hamUId panel.
+- **`tar` + `gzip` / `gunzip`** — native ustar archiver and DEFLATE
+  compressor; survival primitives for the native namespace.
+- ~80 native userland binaries (`ls`, `cat`, `cp -r`, `find`, `du`,
   `df`, `ps`, `dmesg`, `top`, `man`, `help`, `ping`, `ifconfig`,
-  `route`, `hpm`, `hamUI`, `date`, `ntpd`, ...).
+  `route`, `hpm`, `hamUI`, `date`, `ntpd`, `vi`, `tar`, `gzip`,
+  `crond`, `httpd`, `dpkg-deb`, ...).
 
 For the full milestone log (140+ entries) see **[STATUS.md](STATUS.md)**.
 For what's still open, **[TODO.md](TODO.md)**.
@@ -135,7 +166,7 @@ Requirements: `gcc`, `make`, `qemu-system-x86_64`, `flex`, `bison`,
 testing also `ovmf`.
 
 ```bash
-git clone --recurse-submodules https://github.com/HamnixOS/Hamnix
+git clone https://github.com/HamnixOS/Hamnix
 cd Hamnix
 
 ./scripts/build_img.sh                 # produces build/hamnix.img (UEFI GPT disk)
@@ -195,8 +226,8 @@ it to change boot; no kernel rebuild.
 Adder source (.ad — Python syntax, static types)
    │
    ▼
-adder/ (submodule)  ──►  codegen_x86.py (hand-written, no LLVM)
-   │
+adder/  ──►  codegen_x86.py (hand-written, no LLVM)
+   │         (inlined in-tree since commit 9a8801e; no longer a submodule)
    ├──►  x86_64-bare-metal       → hamnix-kernel.elf  (M16+ kernel)
    ├──►  x86_64-adder-user       → CPL-3 ELF          (user binaries)
    └──►  x86_64-linux-kernel-module → .ko             (stock-Linux .ko regression)
@@ -231,8 +262,8 @@ is the canonical example of how compiler quirks get tracked and fixed.
 ## Project structure
 
 ```
-adder/           Adder compiler + LANGUAGE.md — git submodule
-compiler -> adder/compiler              (symlink into submodule)
+adder/           Adder compiler + LANGUAGE.md — inlined in-tree (was a submodule)
+compiler -> adder/compiler              (symlink)
 
 arch/x86/        Kernel architecture-specific (boot, kernel, mm, realmode)
 drivers/         Native Adder drivers (ata/nvme/net/block/input/usb/tty/video/pci/rtc)
@@ -284,8 +315,7 @@ memory/          Orchestrator session memory (not in repo)
 - [`docs/L_TRACK_HOWTO.md`](docs/L_TRACK_HOWTO.md) — adding a stock-
   Debian `.ko` to the L-track.
 - [`LANGUAGE.md`](LANGUAGE.md) — Adder language reference (symlink
-  into the [`HamnixOS/adder`](https://github.com/HamnixOS/adder)
-  submodule).
+  into `adder/LANGUAGE.md`; the compiler is inlined in-tree).
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — agent + human workflow.
 
 ---
@@ -296,8 +326,8 @@ memory/          Orchestrator session memory (not in repo)
   features.
 - When a kernel idiom is awkward, propose a minimal language extension
   before working around it. Compiler bugs get **real fixes in the
-  Adder submodule + a regression fixture in `tests/`**, never per-site
-  workarounds.
+  Adder compiler (in `adder/`) + a regression fixture in `tests/`**,
+  never per-site workarounds.
 - Naming: the language and compiler are **Adder**. The OS is **Hamnix**.
   Source files end in `.ad`.
 

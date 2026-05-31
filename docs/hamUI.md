@@ -1,10 +1,27 @@
 # hamUI — Hamnix's file-based window system
 
-**Status:** design spec. **Renamed from `rio` 2026-05-27** (Plan 9
-name collision). The bulk of this doc inherits its shape from Plan 9
-rio (the design lineage); citations to Plan 9's `rio(1)` / `rio(4)`
-etc. remain unchanged because they reference the canonical upstream.
-Our system is `hamUI`.
+**Status:** Phases 1, 2, 4a, 4b, 4c landed. **Renamed from `rio`
+2026-05-27** (Plan 9 name collision). The bulk of this doc inherits
+its shape from Plan 9 rio (the design lineage); citations to Plan 9's
+`rio(1)` / `rio(4)` etc. remain unchanged because they reference the
+canonical upstream. Our system is `hamUI`.
+
+**Phase landing summary:**
+- **Phase 1** (2026-05-28): `sys/src/9/port/devwsys.ad` — one window,
+  AI-debug files (`text`/`output`/`cmd`/`ns`/`pid`/`uid`/`kind`/
+  `geometry`), text-mode.
+- **Phase 2** (2026-05-28): multi-window via `/dev/wsys/<N>/`; wids
+  1..8; background hamsh routing; `SYS_WSYS_ALLOC`/`SYS_WSYS_FREE`.
+- **Phase 4a**: layered draw protocol — `/dev/wsys/<N>/draw/<layer>/
+  {kind,z,opacity,geometry,markup,fb}` + `ctl` verbs.
+- **Phase 4b**: `hamUId` userland renderer daemon — hamML parser,
+  bitmap rasteriser, compositor (`user/hamUId.ad`).
+- **Phase 4c**: `/dev/fb` framebuffer cdev; drag-title-to-move +
+  click-to-close WM; drag-to-create gesture; GNOME2/MATE-style panel
+  with Applications menu, taskbar, minimize, live clock.
+- **Phase 3** (per-window namespace elevation) and **Phase 5** (X11/
+  Xvfb bridge) remain open. See [`TODO.md`](../TODO.md) `hamUI later
+  phases`.
 
 Tagline: **"every window is a debug scope onto a namespace."** The
 killer feature is AI-debuggability — every window's text content,
@@ -108,8 +125,9 @@ window — by default a hamsh prompt. When a GUI command runs inside
 (e.g. `firefox`), the window's `kind` field flips and it becomes
 that app's window.
 
-No right-click menus, no taskbar, no "new window" toolbar. The drag
-IS window creation. User direction 2026-05-27:
+The drag IS window creation (the primary gesture). A panel bar with
+Applications menu, window-list taskbar, and clock was added by Phase
+4c as a secondary launcher. User direction 2026-05-27:
 
 > "left click and drag out a rectangle, that rectangle is the shell,
 > once you run a GUI command inside it, just like in plan 9, the
@@ -154,9 +172,14 @@ come BEFORE the graphical work:
    (devcons_read gates kbd/uart fallthrough symmetrically so bg
    shells don't steal keystrokes from the foreground).
 3. Per-window namespace + elevation visible in `uid` / `ns` files.
-4. Framebuffer-backed pixel windows + drag-to-create gesture.
-5. X11 bridge (Xvfb + event translation).
-6. Snarf, wctl resize/move, focus policies.
+   **Open** (Phase 3).
+4. **LANDED (Phase 4a+4b+4c)** — layered draw protocol cdev; `hamUId`
+   renderer with hamML + bitmap font + compositor; `/dev/fb` framebuffer
+   cdev; drag-title-to-move + click-to-close WM; drag-to-create gesture;
+   GNOME2/MATE panel with Applications menu, taskbar, minimize, clock;
+   interactive windowed hamsh terminal.
+5. X11 bridge (Xvfb + event translation). **Open** (Phase 5).
+6. Snarf, wctl resize/move, focus policies. **Open** (Phase 6).
 
 Phase 1 alone is strategically significant: Hamnix becomes the OS an
 AI can fully debug while you're still on a serial console.

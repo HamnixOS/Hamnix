@@ -699,3 +699,44 @@ disjointness rather than a fixed priority order. Agents run on
 | **Latent: `load_cr3+0x3` #DF (follow-up)** | A double-fault fires on the `ret` after `mov %rdi,%cr3` when a freshly-allocated CR3's kernel half is unmapped (stale/uninitialised PML4 entry; trap rsp is low memory). Pre-existing, surfaces in both ntpd/non-ntpd runs but **after** test success, so the suite passes. Recorded for a dedicated fix. | **Open** |
 | **Native ↔ Debian root isolation** | The `sysroot/` (native) and `distro/` (Debian) roots — both subtrees of the one ext4 — are now genuinely isolated at the namespace layer, not just by convention. `etc/rc.boot.full` dropped its ambient `bind '#distro' /n/distros` leak (the distro tree is reachable ONLY inside the hermetic `enter linux`/`enter debian` namespaces); `etc/install.hamsh` re-binds it scoped to its own session. The deeper kernel fix is in `fs/vfs.ad`: a directory-open arm in `_open_named_subpath` (via `ext4_resolve_dir`/`_open_dir_ext`) so `ls /` inside `enter debian` works, plus write-side `_create_named_subpath`/`_open_hash_named_write` wired into `vfs_open_write`'s `#`-arm so distro writes (apt/dpkg) compose through the frozen `distro` prefix and can only land under `distro/`. New gate `scripts/test_img_distro_isolation.sh` boots `build/hamnix.img` under OVMF and asserts roots A/B/C/D/D' stay separate across a distro-side write — all PASS. (`7ac3e14`, `81e5316`) | **Done** |
 
+## Wave — 2026-05-29..30: hamUI graphics + SMP + security hardening + compiler fixes
+
+A high-tempo parallel-agent wave delivering the first graphical desktop
+(hamUI Phases 4a–4c), real SMP with APs wired into the scheduler,
+multi-user auth, syscall security hardening, virtual terminals, X11
+prototype, and a batch of Adder compiler correctness fixes.
+
+| Item | What | Status |
+|------|------|--------|
+| **Adder inlined in-tree** | `HamnixOS/adder` submodule replaced with a direct in-tree copy at `adder/`. The `compiler/` symlink and `LANGUAGE.md` symlink continue to point into `adder/`. `git clone` no longer requires `--recurse-submodules`; the `packages` submodule at `packages/` remains. (`9a8801e`) | **Done** |
+| **Adder compiler: adjacent string concat, compound assignment, chained-compare fix, sizeof/min/max/abs/strlen/clamp builtins** | Several batch compiler improvements: `"a" "b"` concatenates adjacent string literals; `+=`/`-=`/`*=`/`&=`/`\|=`/`^=` compound-assignment operators; chained-compare (`a < b < c`) was miscompiled (each leg compared the original left operand, not the intermediate result); `sizeof`, `min`, `max`, `abs`, `strlen`, `clamp` added as compile-time builtins. (`ac389fd`, `02c8f1b`, `360bc0b`) | **Done** |
+| **hamUI Phase 4a — layered draw protocol** | `/dev/wsys/<wid>/draw/<layer>/{kind,z,opacity,geometry,markup,fb}` + `ctl` verbs (`mklayer`/`rmlayer`/`setz`/`ls`) under `sys/src/9/port/devwsys.ad`. No rasterisation — just the file surface. (`b5ff553`) | **Done** |
+| **hamUI Phase 4b — `hamUId` userland renderer** | `user/hamUId.ad` daemon: hamML parser, bitmap-font rasteriser, compositor, non-blocking `/dev/cons` integration. (`2e5ac90`, `af9ec01`) | **Done** |
+| **hamUI Phase 4c — framebuffer + WM + drag-to-create + panel** | `/dev/fb` framebuffer presentation cdev; `hamUId present` compositor; drag-title-to-move + click-to-close window management; drag-to-create gesture; persistent `hamUId` daemon mode. GNOME2/MATE-style panel with Applications menu, window-list taskbar (buttons per open window, minimized shown dimmed), minimize-box, and live clock (HH:MM, updated per second from `/proc/realtime`). Interactive windowed hamsh terminal with VT-sequence emulation per window. (`7fe663b`, `f530ec0`, `d31a9ea`, `dc8a3c9`, `e9e2ef8`, `e1ba08d`, `89d699d`, `3db6e56`) | **Done** |
+| **hamfm — TUI file manager** | `user/hamfm.ad`: two-pane TUI file manager with directory browsing, file open/copy/move/delete, and an entry in the hamUId Applications menu. (`89d699d`) | **Done** |
+| **Multi-user auth — end-to-end** | `useradd` / `passwd` / `login` / `su` / `whoami` real implementations. `/dev/auth` gains `setpass` verb. New `SYS_SETUID_AUTH=300` syscall lets login/su atomically verify password and change uid without a window. `scripts/test_multiuser_auth.sh` covers all five binaries. (`57e0892`) | **Done** |
+| **hamsh job control** | `&` background operator, `jobs` / `fg` / `bg` builtins, Ctrl-Z → `SIGTSTP` / `SIGCONT`. Process groups (`pgid == leader pid`) tracked in a 32-slot job table. (`ecbe9fd`) | **Done** |
+| **Native runlevels + declarative services** | hamsh PID-1 supervisor gains `runlevel: N` bitmask field in service declarations (bit N = belongs to that runlevel). `service` + `initctl` CLI. Default multi-user runlevel 3; runlevel 0 = halt/poweroff, 6 = reboot. (`6fd5552`) | **Done** |
+| **Virtual terminals VT1..VT4 + chvt** | `sys/src/9/port/devvt.ad` — four virtual terminals on `/dev/vt/1`..`/dev/vt/4` + `/dev/vt/ctl` for active-VT switching. `user/chvt.ad` writes the VT number to `/dev/vt/ctl`. Alt+F1..F4 keyboard shortcuts wired. (`80d8d0a`) | **Done** |
+| **X11 first slice** | `user/x11/x11srv.ad` — a native Adder X11 core-protocol server listening on TCP port 6000 over `/net/tcp`. Handles `CreateWindow`, `MapWindow`, `PolyFillRectangle`, `CreateGC`, `PutImage`, and a sentinel `InternAtom` for clean shutdown. `user/x11/x11test.ad` demo client draws a coloured rectangle and verifies the server. (`05d050f`) | **Done** |
+| **SMP: MADT-driven N-AP bringup** | `arch/x86/kernel/smp.ad` parses ACPI MADT Type-0 (Local APIC) entries via `drivers/acpi/acpi.ad`; boots each AP via INIT-SIPI-SIPI; sets up per-AP `%gs` + `LAPIC` + TSS; tracks all CPUs online via `cpus_online`. Falls back to APIC ID 1 when no MADT is present. (`a370b45`) | **Done** |
+| **SMP: APs wired into scheduler** | `kernel/sched/core.ad` gains: test-and-set `rq_lock` spinlock (`spinlock_asm.S`); `current_idx` promoted to `Percpu[uint64]` so each CPU tracks its own current task independently; `sched_ap_idle_loop` idle kthread per AP — picks `STATE_READY` kernel tasks from the shared runqueue. APs are now full scheduler participants. Single shared runqueue (per-CPU runqueues / load balancing are follow-up). (`9a9c2b5`, `69c2bc4`) | **Done** |
+| **Syscall-boundary access_ok hardening** | `arch/x86/kernel/syscall.ad` gains `access_ok(uptr, length)` and `access_ok_str(uptr)` validators that reject kernel-address (≥ 0x8000000000000000) userland pointer arguments. Wired to every native write/read syscall path that accepts a user pointer. Fuzz test: 200 kernel-address probes all return `-EFAULT`. (`e502c3d`) | **Done** |
+| **Network packet parser hardening** | DHCP, DNS, TCP, ARP, HTTP parsers audited and hardened against malformed/oversize input: bounds checks on every field, length validation before dereferencing, truncation of oversized names/responses. (`11db3d9`) | **Done** |
+| **TCP loopback smoke test** | In-kernel TCP loopback: `tcp_listen` + `tcp_accept` + `tcp_connect` + `tcp_send` + `tcp_recv` round-trip over `127.0.0.1`. Validated by the IP loopback shortcut (no NIC needed). (`0d2cb0d`) | **Done** |
+| **Real TCP checksum + kernel_sendto/recvfrom** | TCP checksums computed over real pseudo-header. `kernel_sendto`/`kernel_recvfrom` (L-shim BSD socket ABI) wired to the in-kernel TCP stack. (`23dddb8`) | **Done** |
+| **Per-class memory-leak accounting** | `mm/sched` gains a per-class accounting soak test that boots, allocates across slab/pages/VMA/task, then checks that freeing returns all counters to baseline. Guards against future allocation leaks. (`fddb384`) | **Done** |
+| **CI: auto-publish hpm package channel** | GitHub Actions auto-publishes the `packages/` submodule to `https://255.one/` on every `main` push. Requires the `PACKAGES_DEPLOY_TOKEN` secret. (`92d8642`) | **Done** |
+
+**Headline of this wave:** Hamnix now has a real graphical desktop —
+hamUI Phases 4a+4b+4c all landed; `hamUId` renders markup to the
+framebuffer with a classic GNOME2-style panel, taskbar, minimize, and
+clock. The kernel runs on all available CPUs (MADT-driven AP bringup,
+APs wired into the scheduler). Multi-user auth (`useradd`/`passwd`/
+`login`/`su`/`whoami`) is end-to-end. Shell job control (`&`/`fg`/
+`bg`/`jobs`/Ctrl-Z), virtual terminals (VT1..VT4 + chvt), a native vi
+editor, tar/gzip, native cron daemon, and concurrent httpd are all
+real. X11 core-protocol server prototype in `user/x11/`. Adder
+inlined in-tree (no submodule). Syscall boundary hardening closes a
+kernel-address EFAULT injection class.
+

@@ -42,15 +42,15 @@ retrofitted backwards.
 
 ## Now — useful-system gap fill (priority-ordered, locked with user 2026-05-28)
 
-1. [ ] **hamUI Phase 4a** — layered draw protocol cdev plumbing
-   ([`docs/hamUI.md`](docs/hamUI.md) H-§G): per-window
-   `/dev/wsys/<wid>/draw/<name>/{kind,z,opacity,geometry,markup,fb}`
-   + `ctl` verbs (`mklayer` / `rmlayer` / `setz` / `ls`). No
-   rasterisation yet; just the file surface.
-2. [ ] **hamUI Phase 4b** — `hamUId` userland renderer daemon: hamML
-   parser + bitmap-font rasteriser + compositor.
-3. [ ] **hamUI Phase 4c** — framebuffer driver + drag-to-create
-   gesture (H-§D).
+1. [x] **hamUI Phase 4a** — LANDED: layered draw protocol cdev
+   (`/dev/wsys/<wid>/draw/<name>/{kind,z,opacity,geometry,markup,fb}`
+   + `ctl` verbs `mklayer`/`rmlayer`/`setz`/`ls`).
+2. [x] **hamUI Phase 4b** — LANDED: `hamUId` userland renderer daemon
+   (hamML parser, bitmap-font rasteriser, compositor).
+3. [x] **hamUI Phase 4c** — LANDED: `/dev/fb` framebuffer cdev; drag-
+   title-to-move + click-to-close window management; drag-to-create
+   gesture; GNOME2/MATE-style panel with Applications menu, taskbar
+   (window-list buttons), minimize buttons, and live clock.
 4. [ ] **hamUI Phase 4d** — bitmap font store (mono/sans/serif BDF).
 5. [ ] **`lib/hamui.ad`** — Adder graphics library wrapping H-§G
    (Window/Layer/Rect/Text/Image/Button/Input/Event + event loop).
@@ -61,14 +61,20 @@ retrofitted backwards.
 7. [ ] **Outgoing `ssh` client** — `sshd` ships but nothing dials out.
    `curl`/`wget` now exist (shared `user/http9.ad`); an SSH *client*
    is a separate protocol/crypto lift still to do.
-8. [ ] **Pipes + job control in hamsh** — audit `|`; add `&`
-    background, `bg`/`fg`/`jobs`, process groups + SIGTSTP/SIGCONT.
-9. [ ] **Real editor** — vi-shape or acme-shape. `ed` is too minimal.
-10. [ ] **`tar` + `gzip` / `gunzip`** — share/backup workflows.
+8. [x] **Pipes + job control in hamsh** — LANDED: `&` background,
+    `bg`/`fg`/`jobs`, Ctrl-Z → SIGTSTP / SIGCONT. Process groups
+    and pipelines work end-to-end.
+9. [x] **Real editor** — LANDED: `vi` native modal text editor
+    (`user/vi.ad`).
+10. [x] **`tar` + `gzip` / `gunzip`** — LANDED: ustar archiver
+    (`user/tar.ad`) + DEFLATE compressor/decompressor (`user/gzip.ad`,
+    `user/gunzip.ad`). xz/LZMA2 decompression also landed
+    (`lib/xz/xz.ad`).
 11. [ ] **Audio** — `snd_hda_intel.ko` loads cleanly; need `aplay`-shape
     userland tool that pushes PCM to the cdev.
-12. [ ] **`hpm update` + rollback** — install works; in-place upgrade
-    + snapshot-before-upgrade do not.
+12. [x] **`hpm update` + rollback** — LANDED: `hpm update` and
+    transactional history + `hpm rollback` shipped (`b011ce9`,
+    `65e6685`).
 
 ## hamUI later phases (after Phase 4)
 
@@ -126,8 +132,12 @@ STATUS.md). What remains, off the critical path and parallelisable:
   `/dev/urandom` — today both alias the same pool (D5/F2).
 
 ### §8 SMP & scheduler
-- [ ] Per-CPU runqueues + real SMP scheduling (AP bringup works;
-  single-rq today); load balancing / work stealing; CPU affinity.
+- [~] **MADT-driven SMP landed** (2026-05-30): `arch/x86/kernel/smp.ad`
+  discovers all APIC IDs from the ACPI MADT, boots each AP via INIT-SIPI-
+  SIPI, sets up per-CPU `%gs` / `current_task`; `kernel/sched/core.ad`
+  has a spinlock-protected shared runqueue and `sched_ap_idle_loop` so APs
+  pick up `STATE_READY` tasks. **Open**: per-CPU runqueues, load balancing
+  / work stealing, CPU affinity.
 
 ### §10 Networking
 - [ ] Congestion control: slow-start + congestion-avoidance (RFC 5681),
