@@ -703,6 +703,18 @@ class XhciState:
     diag_reset_ep_ok:      uint32
     diag_recfg_cc:         int32
     diag_recfg_ok:         uint32
+    # diag-rev=14 force-usb2 readbacks: the Intel PCI port-routing registers
+    # read back AFTER we wrote them (XUSB2PR<-mask, USB3_PSSEN<-0). If
+    # fu2_pssen!=0 the write was rejected/BIOS-locked; if ==0 it stuck yet the
+    # device still trained SS => SS training ignores PSSEN on this silicon.
+    # fu2_demoted = how many CCS=1 SuperSpeed ports we PED-disabled; fu2_comp_*
+    # = the USB2-range port that came up after demotion (speed should be 3=HS).
+    fu2_active:            uint32      # 1 = Intel xHC, force-usb2 path armed
+    fu2_xusb2pr:           uint32
+    fu2_pssen:             uint32
+    fu2_demoted:           uint32
+    fu2_comp_port:         uint32
+    fu2_comp_speed:        uint32
 
 
 xhci: XhciState
@@ -829,6 +841,9 @@ def _xhci_intel_force_usb2(bdf: uint32):
     pci_config_write_dword(bus, dev, fn, 0xD8, 0)
     xusb2pr_rb: uint32 = pci_config_read_dword(bus, dev, fn, 0xD0)
     pssen_rb:   uint32 = pci_config_read_dword(bus, dev, fn, 0xD8)
+    xhci.fu2_active  = 1
+    xhci.fu2_xusb2pr = xusb2pr_rb
+    xhci.fu2_pssen   = pssen_rb
     printk2("[xhci] force-usb2: XUSB2PR=%x (mask=%x)\n",
             cast[uint64](xusb2pr_rb), cast[uint64](xusb2prm))
     printk2("[xhci] force-usb2: USB3_PSSEN=%x (mask=%x)\n",
@@ -2743,11 +2758,28 @@ def xhci_bulk_diag_report():
     # Reprint the latched one-shot bulk-failure diagnostic in the LATE frame
     # (right before start_first_task) so it survives the scroll and the dead
     # USB writes. No-op if no bulk failure was ever recorded.
+    # diag-rev=14: force-USB2 outcome ALWAYS surfaces on Intel — even if the
+    # stick re-attached at USB2 and booted (no bulk failure) OR never
+    # re-attached (no bulk diag at all). PSSEN!=0 => the PCI write was
+    # rejected/locked; comp_speed=3 => the device moved to its USB2 companion
+    # (the win condition); ms_speed is the speed the storage slot enumerated at
+    # (4=SuperSpeed still wedged, 3=HighSpeed = forced over).
+    if xhci.fu2_active != 0:
+        printk0("[xhci-fu2] (late) diag-rev=14 portsc-demote\n")
+        printk2("[xhci-fu2] (late) XUSB2PR=%x PSSEN=%x\n",
+                cast[uint64](xhci.fu2_xusb2pr),
+                cast[uint64](xhci.fu2_pssen))
+        printk2("[xhci-fu2] (late) ss_demoted=%d comp_port=%d\n",
+                cast[uint64](xhci.fu2_demoted),
+                cast[uint64](xhci.fu2_comp_port))
+        printk2("[xhci-fu2] (late) comp_speed=%d ms_speed=%d\n",
+                cast[uint64](xhci.fu2_comp_speed),
+                cast[uint64](xhci.ms_speed))
     if xhci.bulk_diag_done == 0:
         return
     # Image-identity marker so a NUC photo unambiguously tells us which
     # build booted (each reflash is expensive). Bump on every diag/fix ship.
-    printk0("[xhci-bulk] (late) diag-rev=13 force-usb2\n")
+    printk0("[xhci-bulk] (late) diag-rev=14 portsc-demote\n")
     printk2("[xhci-bulk] (late) expect_trb=%p evt_seen=%d\n",
             xhci.diag_expect_trb, cast[uint64](xhci.diag_evt_seen))
     printk2("[xhci-bulk] (late) last_evt_p=%p db=%p\n",
@@ -3540,7 +3572,73 @@ def _xhci_attach_mass_storage_locked(target_port: uint32,
     return slot
 
 
+def _xhci_demote_ss_ports():
+    # diag-rev=14: OS-level force-USB2. The Intel PCI port-routing write
+    # (_xhci_intel_force_usb2) did NOT move the boot stick off SuperSpeed on
+    # the NUC (photo: slot_dw0=…/speed=4 unchanged) — XUSB2PR/USB3_PSSEN are
+    # likely BIOS-locked or ignored once a SS link is trained. Act directly on
+    # the live port state machine instead: PED (PORTSC bit1) is RW1CS, so
+    # writing it back as 1 DISABLES the port. Disabling every connected
+    # SuperSpeed root port forces a dual-bus device to re-attach on its USB2
+    # companion port at High-Speed, where the bulk-OUT flow-control wedge
+    # doesn't occur. Intel-only (fu2_active) so qemu-xhci is untouched (and in
+    # QEMU the MSC is HighSpeed anyway, so no SS port would match).
+    if xhci.fu2_active == 0:
+        return
+    if xhci.ss_port_hi == 0:
+        return
+    demoted: uint32 = 0
+    n: uint32 = 0
+    while n < xhci.max_ports:
+        port: uint32 = n + 1
+        if _xhci_port_is_ss(port) != 0:
+            port_addr: uint64 = xhci.op_base + XHCI_PORT_BASE \
+                              + cast[uint64](n) * XHCI_PORT_STRIDE \
+                              + XHCI_PORT_PORTSC
+            portsc: uint32 = _xhci_r32(port_addr)
+            if (portsc & XHCI_PORTSC_CCS) != 0:
+                _xhci_portsc_write(port_addr, XHCI_PORTSC_PED)
+                demoted = demoted + 1
+                printk1("[xhci] force-usb2: demoted SS port %d (PED<-1)\n",
+                        cast[uint64](port))
+        n = n + 1
+    xhci.fu2_demoted = demoted
+    if demoted == 0:
+        return
+    # Settle: let the disabled SS link drop and the USB2 companion train +
+    # latch its Connect-Status-Change. ~tens of ms in spin cycles (mirrors
+    # _xhci_do_reset's busy budget — no msleep available this early).
+    settle: uint64 = 0
+    while settle < 20000000:
+        settle = settle + 1
+    # Record the first USB2-range port that now reports a connection, so the
+    # late frame shows whether the device actually moved (speed should = 3).
+    m: uint32 = 0
+    while m < xhci.max_ports:
+        cport: uint32 = m + 1
+        if _xhci_port_is_ss(cport) == 0:
+            caddr: uint64 = xhci.op_base + XHCI_PORT_BASE \
+                          + cast[uint64](m) * XHCI_PORT_STRIDE \
+                          + XHCI_PORT_PORTSC
+            cpsc: uint32 = _xhci_r32(caddr)
+            if (cpsc & XHCI_PORTSC_CCS) != 0:
+                xhci.fu2_comp_port  = cport
+                xhci.fu2_comp_speed = (cpsc >> XHCI_PORTSC_SPEED_SHIFT) \
+                                    & XHCI_PORTSC_SPEED_MASK
+                printk2("[xhci] force-usb2: companion port %d speed=%d\n",
+                        cast[uint64](cport),
+                        cast[uint64](xhci.fu2_comp_speed))
+                return
+        m = m + 1
+
+
 def xhci_attach_mass_storage() -> uint32:
+    # diag-rev=14: before scanning, demote any connected SuperSpeed root port
+    # so the boot stick re-attaches on its USB2 companion (Intel-only). See
+    # _xhci_demote_ss_ports. Runs once; the two-pass scan below then finds the
+    # device on the USB2 port in pass 1.
+    if xhci.ms_enabled == 0:
+        _xhci_demote_ss_ports()
     # Public entry: scan the root hub for a connected port, run the
     # BOT enumeration on the first candidate, and return the enabled
     # slot ID (0 on failure / none found). storage.ad calls this after
