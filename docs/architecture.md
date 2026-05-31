@@ -458,6 +458,67 @@ breaks either reverts before merge.
   (already shipped). New services come up as Layer 3 daemons
   launched from there.
 
+## Self-hosting and the compiler bootstrap
+
+Adder is the native systems language: the kernel and all native
+userland are Adder. The toolchain-identity milestone is that Hamnix
+can build its own compiler in its own language, on device. The Adder
+compiler has therefore been rewritten in Adder — `adder/compiler/
+lexer.ad`, `parser.ad`, `codegen.ad` (a hand-written x86_64 backend
+that emits raw machine-code bytes; no external assembler) — alongside
+the original Python implementation in `adder/compiler/*.py`.
+
+**Decision (locked in): keep the Python compiler as a frozen `stage0`
+seed; do NOT retire it.** This is the GCC / rustc model. Self-hosting
+is a *verified property*, not a deletion event:
+
+1. Python compiler (`stage0`) builds the Adder-in-Adder compiler →
+   **`stage1`**.
+2. `stage1` compiles its own source → **`stage2`**.
+3. Assert **`stage1` bytes == `stage2` bytes** (the fixpoint). That
+   byte-identical diff IS the credibility proof — stronger than
+   "we removed Python."
+
+Once the fixpoint passes, Python stops being a parallel track. It is
+frozen and touched only when the language gains a feature the compiler
+*itself* must use to build — and then only enough for the seed to
+parse it. That is far cheaper than maintaining two compilers.
+
+**Why keep the seed rather than retire it:**
+
+- The dev inner-loop stays fast — compile on the Linux host, no QEMU
+  boot per build.
+- Clean-room bootstrap-from-source stays possible. Retiring Python
+  means the seed becomes a committed *binary* blob, which reintroduces
+  the Ken-Thompson "Trusting Trust" opacity and breaks
+  build-from-pure-source.
+- The cost we accept: the compiler's own source is constrained to the
+  construct subset the seed can build. (As of this writing `codegen.ad`
+  already covers the full construct set its own source uses.)
+
+**Build-out sequence (the active plan):**
+
+1. **ELF emit** — `codegen.ad` currently emits to a fixed in-memory
+   buffer (CODE @ `0`, DATA @ `CODE_CAP`) and is *emulator-verified*.
+   Add an ELF64 emitter so it produces a runnable `x86_64-adder-user`
+   image the Hamnix loader can `exec`. This is the gating prerequisite
+   for everything below.
+2. **`hamnix-cc` host wrapper** — a Linux-host tool that boots a
+   minimal Hamnix image under QEMU carrying the Adder compiler + the
+   target source (injected via virtio-9p shared dir or initramfs),
+   runs the on-device compile, and extracts the emitted ELF.
+3. **`stage1`/`stage2` fixpoint test** — wire the above into a CI test
+   asserting the byte-identical fixpoint.
+4. **(Optional, reversible) retire Python** — only after the fixpoint
+   is solid, and only if we accept the binary-seed tradeoff above.
+
+The `hamnix-cc` scaffolding is worth building **regardless** of the
+retire decision: in the keep-Python world it is the harness that
+*proves* the fixpoint; in a retire world it becomes the build system.
+Same artifact, so the retirement call stays reversible.
+
+See `x86-backend.md` for the encoder, and task #154 for status.
+
 ## Reading order for a new contributor
 
 1. This document.
