@@ -676,6 +676,20 @@ class XhciState:
     diag_evt254_ctl:  uint32
     diag_evt_cyc1:    uint32
     diag_evt_hw_enq:  uint32
+    # Stop-Endpoint + Set-TR-Dequeue recovery (Image #43 -> diag-rev=9).
+    # bigring4096 proved the wedge is NOT Event-Ring-Full (4096-slot ring,
+    # controller still stopped at 255 events). The real wedge: a specific
+    # bulk-OUT CBW never executes despite a valid owned TRB + Running ep. To
+    # resolve stale-vs-stuck on the controller's TR dequeue we Stop the
+    # endpoint (forces an authoritative dequeue writeback) and record it,
+    # then Set TR Dequeue back to the unexecuted CBW and re-ring. trdq_tried
+    # = recovery ran; trdq_stopped_deq = the controller's REAL cached dequeue
+    # at stop time (==ring base => genuinely stuck at index 0; ==our enqueue
+    # region => it kept up and just won't start the next TD); trdq_ok = the
+    # re-ring after Set TR Dequeue finally completed (=> desync fixed).
+    diag_trdq_tried:       uint32
+    diag_trdq_ok:          uint32
+    diag_trdq_stopped_deq: uint64
 
 
 xhci: XhciState
@@ -2383,6 +2397,27 @@ def _xhci_cmd_set_tr_dequeue(slot: uint32, ep_id: uint32,
     return -1
 
 
+def _xhci_cmd_stop_endpoint(slot: uint32, ep_id: uint32) -> int32:
+    # Stop Endpoint command. Transitions a Running endpoint to Stopped and
+    # — critically for diagnostics — makes the xHC write the endpoint's
+    # AUTHORITATIVE internal TR Dequeue Pointer back into the Output Device
+    # Context (octx[2]/octx[3]). Outside of a stop/halt that field is only
+    # the value we last programmed, so reading it cold can't distinguish
+    # "controller kept up but stale-readback" from "controller stuck at
+    # base". ep_id is the DCI; slot in bits 24..31, ep in bits 16..20.
+    ctl: uint32 = (TRB_TYPE_STOP_ENDPOINT << TRB_TYPE_SHIFT) \
+                | ((ep_id & 0x1F) << 16) \
+                | ((slot & 0xFF) << 24)
+    _xhci_cmd_submit(0, 0, 0, ctl)
+    sx: uint32 = 0
+    cc: int32 = _xhci_wait_cmd_completion(cast[Ptr[uint32]](&sx))
+    if cc == cast[int32](TRB_CC_SUCCESS) \
+       or cc == cast[int32](TRB_CC_CONTEXT_STATE):
+        return 0
+    printk1("[xhci] Stop Endpoint cc=%d\n", cast[uint64](cc))
+    return -1
+
+
 def _xhci_clear_endpoint_halt(ep_id: uint32) -> int32:
     # Issue a standard Clear-Feature(ENDPOINT_HALT) control request to
     # the DEVICE for the endpoint identified by xHCI Device Context Index
@@ -2633,7 +2668,7 @@ def xhci_bulk_diag_report():
         return
     # Image-identity marker so a NUC photo unambiguously tells us which
     # build booted (each reflash is expensive). Bump on every diag/fix ship.
-    printk0("[xhci-bulk] (late) diag-rev=8 bigring4096\n")
+    printk0("[xhci-bulk] (late) diag-rev=9 setrdq\n")
     printk2("[xhci-bulk] (late) expect_trb=%p evt_seen=%d\n",
             xhci.diag_expect_trb, cast[uint64](xhci.diag_evt_seen))
     printk2("[xhci-bulk] (late) last_evt_p=%p db=%p\n",
@@ -2723,6 +2758,17 @@ def xhci_bulk_diag_report():
     printk2("[xhci-bulk] (late) evt0_ctl=%x evt254_ctl=%x\n",
             cast[uint64](xhci.diag_evt0_ctl),
             cast[uint64](xhci.diag_evt254_ctl))
+    # Stop+Set-TR-Dequeue recovery (diag-rev=9). trdq_tried=1 => recovery ran.
+    # trdq_stopped_deq = the controller's AUTHORITATIVE TR dequeue at Stop time
+    # (==transfer-ring base => genuinely stuck at index 0; mid-ring/==our
+    # enqueue => it kept up and just won't start the next TD). trdq_ok=1 => the
+    # re-ring after Set TR Dequeue completed => producer/consumer desync was
+    # THE wedge and this is a real fix path.
+    printk2("[xhci-bulk] (late) trdq_tried=%d trdq_ok=%d\n",
+            cast[uint64](xhci.diag_trdq_tried),
+            cast[uint64](xhci.diag_trdq_ok))
+    printk2("[xhci-bulk] (late) trdq_stopped_deq=%p ring_base=%p\n",
+            xhci.diag_trdq_stopped_deq, xhci.ms_out_ring)
     # Committed OUTPUT Slot Context dword0: Speed = bits[23:20], CtxEntries =
     # bits[31:27]. Speed!=0 confirms the Configure-Endpoint Speed fix took on
     # the slot the IN endpoint hangs off (so the IN stall is not slot Speed).
@@ -2824,6 +2870,43 @@ def _xhci_bulk_xfer(slot: uint32, ep_id: uint32, ring: uint64,
                         xhci.diag_out_moved = cast[int32](length - resid)
                     return cast[int32](length - resid)
                 rr = rr + 1
+            # Stop + Set-TR-Dequeue recovery (Image #43 -> diag-rev=9). The
+            # re-doorbell loop exhausted: the controller still won't execute
+            # this CBW, and bigring4096 already proved the event ring is NOT
+            # full. Run ONCE per boot. Stop the endpoint (forces the xHC to
+            # write its authoritative cached TR dequeue back to the output
+            # context — resolves stale-vs-stuck), record it, then Set TR
+            # Dequeue back to THIS unexecuted CBW (trb_pa, with its own cycle
+            # as DCS) and re-ring. VM-safe: cc=0 never occurs on QEMU.
+            if xhci.diag_trdq_tried == 0 and is_in == 0:
+                xhci.diag_trdq_tried = 1
+                _xhci_cmd_stop_endpoint(slot, ep_id)
+                if xhci.kbd_output_ctx != 0:
+                    soctx: Ptr[uint32] = cast[Ptr[uint32]](
+                        xhci.kbd_output_ctx + cast[uint64](ep_id) * 32)
+                    xhci.diag_trdq_stopped_deq = cast[uint64](soctx[2]) \
+                        | (cast[uint64](soctx[3]) << 32)
+                trb_idx: uint32 = cast[uint32]((trb_pa - ring) \
+                                  / cast[uint64](TRB_SIZE))
+                trbp: Ptr[uint32] = cast[Ptr[uint32]](trb_pa)
+                trb_dcs: uint32 = 0
+                if (trbp[3] & TRB_CYCLE_BIT) != 0:
+                    trb_dcs = 1
+                _xhci_cmd_set_tr_dequeue(slot, ep_id, ring,
+                                         trb_idx, trb_dcs)
+                _xhci_w32(db_addr, ep_id)
+                cc = _xhci_wait_transfer_event_trb(
+                         cast[Ptr[uint32]](&resid), trb_pa)
+                if cc == cast[int32](TRB_CC_SUCCESS) \
+                   or cc == cast[int32](TRB_CC_SHORT_PACKET):
+                    if resid > length:
+                        resid = length
+                    xhci.diag_trdq_ok = 1
+                    xhci.bulk_fail_count = 0
+                    if is_in == 0:
+                        xhci.diag_out_cc    = cc
+                        xhci.diag_out_moved = cast[int32](length - resid)
+                    return cast[int32](length - resid)
         if is_in != 0:
             printk1("[xhci] bulk-in cc=%d\n", cast[uint64](cc))
         else:
