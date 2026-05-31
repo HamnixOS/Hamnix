@@ -354,6 +354,14 @@ if os.environ.get("ENABLE_NVME_KO") == "1":
 if os.environ.get("ENABLE_FRAMEWORK_MODULES") == "1":
     FILES.append(("/etc/framework-modules", b"1\n"))
 
+# iwlwifi.ko harvest marker. scripts/test_iwlwifi_ko.sh sets both
+# ENABLE_FRAMEWORK_MODULES=1 (to pre-load cfg80211.ko + mac80211.ko)
+# and ENABLE_IWLWIFI_KO=1 (to trigger the explicit iwlwifi.ko load
+# in init/main.ad's boot:35.W block). Without ENABLE_FRAMEWORK_MODULES
+# the iwlwifi load will fail with unresolved cfg80211_* symbols.
+if os.environ.get("ENABLE_IWLWIFI_KO") == "1":
+    FILES.append(("/etc/iwlwifi-ko", b"1\n"))
+
 # modules.dep regression test marker. scripts/test_loader_modulesdep.sh
 # sets this to exercise the in-kernel modules_dep parser: boot without
 # the framework-modules pre-load, dispatch mac80211 directly, and let
@@ -1721,6 +1729,21 @@ def build_archive() -> bytes:
         blob += cpio_entry(name, data)
         print(f"  embedded {name} ({len(data)} bytes from "
               f"kernel-modules/mac80211/mac80211.ko)")
+
+    # iwlwifi.ko — Intel wireless PCI driver (Debian 6.1.0-32 build).
+    # Bundled unconditionally alongside cfg80211 + mac80211 so the dep
+    # chain (cfg80211 -> mac80211 -> iwlwifi) is available in the cpio
+    # whenever ENABLE_FRAMEWORK_MODULES=1. The /etc/iwlwifi-ko marker
+    # (planted via ENABLE_IWLWIFI_KO=1) gates the actual kmod_linux_load
+    # in init/main.ad; the .ko bytes are always present so the modules.dep
+    # walker can find the file path without a separate condition.
+    iwlwifi_ko = here / "kernel-modules" / "iwlwifi" / "iwlwifi.ko"
+    if iwlwifi_ko.is_file():
+        data = iwlwifi_ko.read_bytes()
+        name = "/lib/modules/iwlwifi.ko"
+        blob += cpio_entry(name, data)
+        print(f"  embedded {name} ({len(data)} bytes from "
+              f"kernel-modules/iwlwifi/iwlwifi.ko)")
 
     # U5: host-built Linux ELF test binaries. Anything staged under
     # tests/u-binary/ (built by tests/u-binary/src/*/Makefile via
