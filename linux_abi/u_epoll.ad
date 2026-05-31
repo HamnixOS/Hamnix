@@ -88,6 +88,10 @@ FD_EPOLL_MARK:    uint32 = 0xFFFFFFD7
 FD_EVENTFD_MARK:  uint32 = 0xFFFFFFD6
 FD_TIMERFD_MARK:  uint32 = 0xFFFFFFD5
 FD_SIGNALFD_MARK: uint32 = 0xFFFFFFD4
+# #155: inotify. One more confined Layer-2 fd marker, in the same free
+# block immediately below FD_SIGNALFD_MARK. 0xFFFFFFD3 is clear of every
+# other marker family (FD_NET 0xD8, FD_DEVFD 0xDF, the §5 block 0xD4..D7).
+FD_INOTIFY_MARK:  uint32 = 0xFFFFFFD3
 
 
 # =====================================================================
@@ -536,6 +540,301 @@ def usfd_consume(slot: int32, sig: uint64):
 
 
 # =====================================================================
+# inotify pool
+# =====================================================================
+#
+# #155: inotify — Linux's filesystem-event notification fd. An inotify
+# instance is created with inotify_init / inotify_init1; the daemon then
+# adds "watches" (inotify_add_watch) on paths, each returning a watch
+# descriptor (wd). When the filesystem creates / deletes / modifies a
+# watched object, the kernel queues a `struct inotify_event` record on
+# the instance; read(2) on the inotify fd drains the queue.
+#
+# The notify side is one-directional: fs/vfs.ad (Layer 0/1) calls a
+# function pointer it knows nothing about — u_syscalls.ad registers
+# `uino_notify_dispatch` into vfs.ad at bring-up, exactly like the
+# CLEARTID wake hook (kernel/sched/core.ad). vfs.ad NEVER names this
+# module statically.
+#
+# Layout: flat parallel arrays, same discipline as the pools above.
+#   - UINO_MAX instances, each with UINO_WATCH_MAX watches.
+#   - Each watch: a stored absolute dir path + an accepted event mask.
+#   - Each instance has a ring of UINO_EVQ_MAX pending event records;
+#     each record carries (wd, mask, a copied name string).
+UINO_MAX:        uint64 = 8
+UINO_WATCH_MAX:  uint64 = 16
+UINO_EVQ_MAX:    uint64 = 64
+UINO_PATH_MAX:   uint64 = 128     # stored watch path length cap
+UINO_NAME_MAX:   uint64 = 64      # event name length cap (incl NUL)
+
+# inotify event mask bits (Linux <sys/inotify.h>).
+IN_MODIFY:      uint32 = 0x00000002
+IN_CLOSE_WRITE: uint32 = 0x00000008
+IN_CREATE:      uint32 = 0x00000100
+IN_DELETE:      uint32 = 0x00000200
+
+# inotify_init1 flags.
+IN_NONBLOCK:    uint32 = 0x800     # == O_NONBLOCK
+IN_CLOEXEC:     uint32 = 0x80000
+
+# Instance state.
+uino_inuse: Array[8, uint8]
+# Watch tables, indexed [inst*UINO_WATCH_MAX + w].
+uino_w_used: Array[128, uint8]      # 8 * 16
+uino_w_wd:   Array[128, int32]      # the watch descriptor (>=1)
+uino_w_mask: Array[128, uint32]     # accepted event mask
+uino_w_path: Array[16384, uint8]    # 8*16*128 — stored abs dir path, NUL-term
+uino_next_wd: Array[8, int32]       # per-instance wd counter (monotonic)
+# Event queue, indexed [inst*UINO_EVQ_MAX + slot].
+uino_q_head: Array[8, uint64]       # next slot to read
+uino_q_tail: Array[8, uint64]       # next slot to write
+uino_q_count: Array[8, uint64]      # queued record count
+uino_q_wd:   Array[512, int32]      # 8 * 64
+uino_q_mask: Array[512, uint32]
+uino_q_name: Array[32768, uint8]    # 8*64*64 — event name, NUL-term
+
+
+def uino_init():
+    i: uint64 = 0
+    while i < UINO_MAX:
+        uino_inuse[i]    = 0
+        uino_next_wd[i]  = 1
+        uino_q_head[i]   = 0
+        uino_q_tail[i]   = 0
+        uino_q_count[i]  = 0
+        i = i + 1
+    w: uint64 = 0
+    while w < UINO_MAX * UINO_WATCH_MAX:
+        uino_w_used[w] = 0
+        uino_w_wd[w]   = 0
+        uino_w_mask[w] = 0
+        w = w + 1
+
+
+def _uino_clear_inst(su: uint64):
+    # Reset one instance's watches + event queue.
+    wb: uint64 = su * UINO_WATCH_MAX
+    k: uint64 = 0
+    while k < UINO_WATCH_MAX:
+        uino_w_used[wb + k] = 0
+        uino_w_wd[wb + k]   = 0
+        uino_w_mask[wb + k] = 0
+        k = k + 1
+    uino_next_wd[su] = 1
+    uino_q_head[su]  = 0
+    uino_q_tail[su]  = 0
+    uino_q_count[su] = 0
+
+
+def uino_alloc() -> int32:
+    i: uint64 = 0
+    while i < UINO_MAX:
+        if uino_inuse[i] == 0:
+            uino_inuse[i] = 1
+            _uino_clear_inst(i)
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def uino_release(slot: int32):
+    if slot < 0:
+        return
+    su: uint64 = cast[uint64](slot)
+    if su >= UINO_MAX:
+        return
+    _uino_clear_inst(su)
+    uino_inuse[su] = 0
+
+
+def uino_valid(slot: int32) -> int32:
+    if slot < 0:
+        return 0
+    su: uint64 = cast[uint64](slot)
+    if su >= UINO_MAX:
+        return 0
+    if uino_inuse[su] == 0:
+        return 0
+    return 1
+
+
+def _uino_pathcmp(base: uint64, p: Ptr[uint8]) -> int32:
+    # 1 if the stored watch path at byte-offset `base` equals C-string p.
+    i: uint64 = 0
+    while i < UINO_PATH_MAX:
+        a: uint8 = uino_w_path[base + i]
+        b: uint8 = p[i]
+        if a != b:
+            return 0
+        if a == 0:
+            return 1
+        i = i + 1
+    return 1
+
+
+def uino_add_watch(slot: int32, path: Ptr[uint8], mask: uint32) -> int64:
+    # Add (or update) a watch on `path`. Returns the wd (>=1), or a
+    # negative errno. A repeat add on the same path updates the mask and
+    # returns the existing wd (Linux semantics).
+    if uino_valid(slot) == 0:
+        return UEP_EBADF
+    su: uint64 = cast[uint64](slot)
+    wb: uint64 = su * UINO_WATCH_MAX
+    # Update an existing watch on the same path?
+    k: uint64 = 0
+    while k < UINO_WATCH_MAX:
+        if uino_w_used[wb + k] != 0:
+            if _uino_pathcmp((wb + k) * UINO_PATH_MAX, path) != 0:
+                uino_w_mask[wb + k] = mask
+                return cast[int64](uino_w_wd[wb + k])
+        k = k + 1
+    # Allocate a fresh watch slot.
+    k = 0
+    while k < UINO_WATCH_MAX:
+        if uino_w_used[wb + k] == 0:
+            wd: int32 = uino_next_wd[su]
+            uino_next_wd[su] = wd + 1
+            uino_w_used[wb + k] = 1
+            uino_w_wd[wb + k]   = wd
+            uino_w_mask[wb + k] = mask
+            # Copy the path in (truncate at UINO_PATH_MAX-1).
+            pb: uint64 = (wb + k) * UINO_PATH_MAX
+            j: uint64 = 0
+            while j < UINO_PATH_MAX - 1:
+                c: uint8 = path[j]
+                uino_w_path[pb + j] = c
+                if c == 0:
+                    break
+                j = j + 1
+            uino_w_path[pb + (UINO_PATH_MAX - 1)] = 0
+            return cast[int64](wd)
+        k = k + 1
+    return UEP_ENOMEM
+
+
+def uino_rm_watch(slot: int32, wd: int32) -> int64:
+    if uino_valid(slot) == 0:
+        return UEP_EBADF
+    su: uint64 = cast[uint64](slot)
+    wb: uint64 = su * UINO_WATCH_MAX
+    k: uint64 = 0
+    while k < UINO_WATCH_MAX:
+        if uino_w_used[wb + k] != 0:
+            if uino_w_wd[wb + k] == wd:
+                uino_w_used[wb + k] = 0
+                uino_w_wd[wb + k]   = 0
+                uino_w_mask[wb + k] = 0
+                return 0
+        k = k + 1
+    return UEP_EINVAL
+
+
+def uino_readable(slot: int32) -> int32:
+    # 1 if a read would return immediately (events queued).
+    if uino_valid(slot) == 0:
+        return 0
+    if uino_q_count[cast[uint64](slot)] != 0:
+        return 1
+    return 0
+
+
+def _uino_queue_event(su: uint64, wd: int32, mask: uint32, name: Ptr[uint8]):
+    # Push one event record onto instance `su`'s ring. Drops on overflow
+    # (a full queue means the daemon isn't draining — Linux would post an
+    # IN_Q_OVERFLOW; dropping is the honest small-scale answer).
+    if uino_q_count[su] >= UINO_EVQ_MAX:
+        return
+    tail: uint64 = uino_q_tail[su]
+    gi: uint64 = su * UINO_EVQ_MAX + tail
+    uino_q_wd[gi]   = wd
+    uino_q_mask[gi] = mask
+    nb: uint64 = gi * UINO_NAME_MAX
+    j: uint64 = 0
+    if cast[uint64](name) != 0:
+        while j < UINO_NAME_MAX - 1:
+            c: uint8 = name[j]
+            uino_q_name[nb + j] = c
+            if c == 0:
+                break
+            j = j + 1
+    uino_q_name[nb + j] = 0
+    uino_q_tail[su]  = (tail + 1) % UINO_EVQ_MAX
+    uino_q_count[su] = uino_q_count[su] + 1
+
+
+def uino_post(dir_path: Ptr[uint8], name: Ptr[uint8], mask: uint32):
+    # The notify entry point fs/vfs.ad calls (through the registered
+    # function pointer). For every live instance watching `dir_path` with
+    # a mask that overlaps `mask`, queue one event. `name` is the basename
+    # of the affected entry inside the watched directory.
+    i: uint64 = 0
+    while i < UINO_MAX:
+        if uino_inuse[i] != 0:
+            wb: uint64 = i * UINO_WATCH_MAX
+            k: uint64 = 0
+            while k < UINO_WATCH_MAX:
+                if uino_w_used[wb + k] != 0:
+                    if (uino_w_mask[wb + k] & mask) != 0:
+                        if _uino_pathcmp((wb + k) * UINO_PATH_MAX,
+                                         dir_path) != 0:
+                            _uino_queue_event(i, uino_w_wd[wb + k],
+                                              mask, name)
+                k = k + 1
+        i = i + 1
+
+
+def uino_read(slot: int32, buf: uint64, count: uint64) -> int64:
+    # Drain queued events into the user buffer as packed
+    # struct inotify_event { i32 wd; u32 mask; u32 cookie; u32 len;
+    #                        char name[len]; }. `len` is padded so each
+    # record's name field is a multiple of 16 bytes incl the NUL, the way
+    # Linux aligns successive records. Returns bytes written, or -EAGAIN
+    # if nothing is queued.
+    if uino_valid(slot) == 0:
+        return UEP_EBADF
+    su: uint64 = cast[uint64](slot)
+    if uino_q_count[su] == 0:
+        return UEP_EAGAIN
+    written: uint64 = 0
+    while uino_q_count[su] != 0:
+        head: uint64 = uino_q_head[su]
+        gi: uint64 = su * UINO_EVQ_MAX + head
+        nb: uint64 = gi * UINO_NAME_MAX
+        # Name length incl NUL, padded up to a 16-byte multiple.
+        nlen: uint64 = 0
+        while nlen < UINO_NAME_MAX and uino_q_name[nb + nlen] != 0:
+            nlen = nlen + 1
+        namelen: uint64 = nlen + 1                  # include the NUL
+        # Pad to 16.
+        if (namelen % 16) != 0:
+            namelen = namelen + (16 - (namelen % 16))
+        reclen: uint64 = 16 + namelen               # header is 16 bytes
+        if written + reclen > count:
+            break
+        rec: uint64 = buf + written
+        cast[Ptr[int32]](rec)[0]      = uino_q_wd[gi]            # wd
+        cast[Ptr[uint32]](rec + 4)[0] = uino_q_mask[gi]         # mask
+        cast[Ptr[uint32]](rec + 8)[0] = 0                       # cookie
+        cast[Ptr[uint32]](rec + 12)[0] = cast[uint32](namelen)  # len
+        # Copy the name + NUL, then zero the pad bytes.
+        np: uint64 = rec + 16
+        j: uint64 = 0
+        while j < namelen:
+            if j < nlen:
+                cast[Ptr[uint8]](np + j)[0] = uino_q_name[nb + j]
+            else:
+                cast[Ptr[uint8]](np + j)[0] = 0
+            j = j + 1
+        written = written + reclen
+        uino_q_head[su]  = (head + 1) % UINO_EVQ_MAX
+        uino_q_count[su] = uino_q_count[su] - 1
+    if written == 0:
+        # The next record didn't fit in the caller's buffer.
+        return UEP_EINVAL
+    return cast[int64](written)
+
+
+# =====================================================================
 # epoll pool
 # =====================================================================
 #
@@ -741,5 +1040,6 @@ def u_epoll_init():
     uefd_init()
     utfd_init()
     usfd_init()
+    uino_init()
     uepoll_init()
-    printk0("[u_epoll] Layer-2 epoll/eventfd/timerfd/signalfd pools ready\n")
+    printk0("[u_epoll] Layer-2 epoll/eventfd/timerfd/signalfd/inotify pools ready\n")

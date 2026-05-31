@@ -283,11 +283,96 @@ from drivers.net.devnet import (
 # supplies; vfs_read just reports it has no data (the shim handles it).
 from linux_abi.u_epoll import (
     FD_EPOLL_MARK, FD_EVENTFD_MARK, FD_TIMERFD_MARK, FD_SIGNALFD_MARK,
+    FD_INOTIFY_MARK,
+    IN_MODIFY, IN_CLOSE_WRITE, IN_CREATE, IN_DELETE,
     uefd_release, uefd_readable, uefd_read, uefd_write,
     utfd_release, utfd_readable, utfd_read,
     usfd_release,
+    uino_release, uino_readable,
     uepoll_release,
 )
+
+
+# =====================================================================
+# inotify notification hook (#155)
+# =====================================================================
+#
+# inotify (a Layer-2 / Linux-ABI object — its pools live in
+# linux_abi/u_epoll.ad) needs the filesystem to tell it when a watched
+# directory sees a create / delete / modify. vfs.ad (Layer 0/1) must NOT
+# statically depend on the Layer-2 inotify pool — so the dependency is
+# inverted exactly like kernel/sched/core.ad's `cleartid_wake_hook`:
+# u_syscalls.ad registers its `uino_post` routine here at bring-up, and
+# the vfs create/unlink/write/close arms call it through this pointer.
+# A pure native (no Linux-ABI) build leaves the hook null and the
+# notify calls are inert.
+#
+# Signature: (dir_path: Ptr[uint8], name: Ptr[uint8], mask: uint32).
+# `dir_path` is the absolute directory the event happened in; `name` is
+# the basename of the affected entry; `mask` is one IN_* bit.
+inotify_notify_hook: Fn[None, Ptr[uint8], Ptr[uint8], uint32]
+
+
+def register_inotify_notify_hook(
+        hook: Fn[None, Ptr[uint8], Ptr[uint8], uint32]):
+    # Called once from linux_abi/u_syscalls.ad's bring-up. After this,
+    # vfs's create/delete/modify arms route events to the inotify pool.
+    inotify_notify_hook = hook
+
+
+def _vfs_inotify_notify(abs_path: Ptr[char], mask: uint32):
+    # Split an absolute file path into (dir, basename) and fire the
+    # inotify hook (if registered). Used by the create/unlink/modify/
+    # close arms. Pure string work — no Layer-2 import.
+    if inotify_notify_hook == cast[Fn[None, Ptr[uint8], Ptr[uint8],
+                                       uint32]](0):
+        return
+    p: Ptr[uint8] = cast[Ptr[uint8]](abs_path)
+    # Find the last '/'.
+    last: int64 = -1
+    i: uint64 = 0
+    while i < 256:
+        c: uint8 = p[i]
+        if c == 0:
+            break
+        if c == 47:                                  # '/'
+            last = cast[int64](i)
+        i = i + 1
+    dir_buf: Array[256, uint8]
+    name_buf: Array[64, uint8]
+    if last < 0:
+        # No slash: treat the whole thing as a basename in ".".
+        dir_buf[0] = 46                              # '.'
+        dir_buf[1] = 0
+        _vfs_ino_copy_name(&name_buf[0], p, 0)
+    else:
+        lu: uint64 = cast[uint64](last)
+        # Directory = everything before the last slash. A leading-slash-
+        # only path ("/foo") has dir == "/".
+        if lu == 0:
+            dir_buf[0] = 47                          # '/'
+            dir_buf[1] = 0
+        else:
+            j: uint64 = 0
+            while j < lu and j < 255:
+                dir_buf[j] = p[j]
+                j = j + 1
+            dir_buf[j] = 0
+        _vfs_ino_copy_name(&name_buf[0], p, lu + 1)
+    inotify_notify_hook(&dir_buf[0], &name_buf[0], mask)
+
+
+def _vfs_ino_copy_name(dst: Ptr[uint8], src: Ptr[uint8], start: uint64):
+    # Copy the NUL-terminated basename starting at src[start] into dst
+    # (cap 64 incl NUL).
+    i: uint64 = 0
+    while i < 63:
+        c: uint8 = src[start + i]
+        dst[i] = c
+        if c == 0:
+            return
+        i = i + 1
+    dst[63] = 0
 from fs.fat import (
     is_fat_path, strip_mnt_prefix, fat_open, fat_close,
     fat_open_write, fat_write_slot, fat_close_write, fat_delete,
@@ -1981,9 +2066,14 @@ def vfs_open_write(name: Ptr[char]) -> int32:
         # (-2 missing parent dir, -17 the path is a directory, -20 a
         # parent component is a file, -28 out of slots). Propagate it
         # verbatim so the caller's errstr reflects the real cause.
+        # #155: a not-yet-existing tmpfs path becoming open-for-write is
+        # an inotify IN_CREATE on its parent directory.
+        ino_existed: int32 = tmpfs_lookup(name)
         slot: int32 = tmpfs_open_for_write(name)
         if slot < 0:
             return slot
+        if ino_existed < 0:
+            _vfs_inotify_notify(name, IN_CREATE)
         task: Ptr[TaskStruct] = current_task()
         fd: int32 = _alloc_fd(task)
         if fd < 0:
@@ -2040,7 +2130,12 @@ def vfs_unlink(name: Ptr[char]) -> int32:
     #   /ext/*  →  ext4_unlink (M16.67, root dir + single-block scope)
     # Everything else falls back to -EROFS.
     if is_tmpfs_path(name) != 0:
-        return tmpfs_unlink(name)
+        # #155: a successful tmpfs delete is an inotify IN_DELETE on the
+        # parent directory.
+        urc: int32 = tmpfs_unlink(name)
+        if urc == 0:
+            _vfs_inotify_notify(name, IN_DELETE)
+        return urc
     if is_ext_path(name) != 0:
         return ext4_unlink(strip_ext_prefix(name))
     if is_fat_path(name) != 0:
@@ -2896,7 +2991,8 @@ def vfs_l2_fd_set_buf(fd: int32, val: uint64) -> int32:
     # Returns 0 on success, -EBADF if `fd` is not one of our markers.
     m: uint32 = vfs_fd_marker(fd)
     if m != FD_EPOLL_MARK and m != FD_EVENTFD_MARK \
-            and m != FD_TIMERFD_MARK and m != FD_SIGNALFD_MARK:
+            and m != FD_TIMERFD_MARK and m != FD_SIGNALFD_MARK \
+            and m != FD_INOTIFY_MARK:
         return EBADF
     task: Ptr[TaskStruct] = current_task()
     task[0].fd_buf[cast[uint64](fd)] = val
@@ -2908,7 +3004,8 @@ def vfs_l2_fd_get_buf(fd: int32) -> uint64:
     # Returns 0 ("no object") for a non-Layer-2 / closed fd.
     m: uint32 = vfs_fd_marker(fd)
     if m != FD_EPOLL_MARK and m != FD_EVENTFD_MARK \
-            and m != FD_TIMERFD_MARK and m != FD_SIGNALFD_MARK:
+            and m != FD_TIMERFD_MARK and m != FD_SIGNALFD_MARK \
+            and m != FD_INOTIFY_MARK:
         return 0
     task: Ptr[TaskStruct] = current_task()
     return task[0].fd_buf[cast[uint64](fd)]
@@ -3021,6 +3118,12 @@ def vfs_fd_poll(fd: int32) -> uint32:
     if fi == FD_SIGNALFD_MARK:
         # Needs the caller's sig_pending word — the u_syscalls.ad shim
         # answers this one. From vfs's view: not readable.
+        return 0
+    if fi == FD_INOTIFY_MARK:
+        # #155: an inotify fd is POLLIN-readable when events are queued.
+        ino_p: int32 = cast[int32](task[0].fd_buf[fdu]) - 1
+        if uino_readable(ino_p) != 0:
+            return 0x0001
         return 0
     if fi == FD_EPOLL_MARK:
         # An epoll fd is itself pollable (readable when any watched fd
@@ -4403,6 +4506,11 @@ def vfs_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         pos:  uint64 = task[0].fd_pos[fdu]
         n: uint64 = tmpfs_write(slot, buf, pos, count)
         task[0].fd_pos[fdu] = pos + n
+        # #155: a tmpfs write is an inotify IN_MODIFY on the file's parent
+        # directory. tmpfs_slot_name recovers the full absolute path.
+        if n != 0:
+            _vfs_inotify_notify(cast[Ptr[char]](tmpfs_slot_name(slot)),
+                                IN_MODIFY)
         return cast[int64](n)
     if file_idx == FD_FAT_MARK:
         # A FAT fd with the write bit set in fd_buf is a write-mode
@@ -4709,6 +4817,16 @@ def vfs_close(fd: int32) -> int32:
         utfd_release(cast[int32](task[0].fd_buf[fdu]) - 1)
     if file_idx == FD_SIGNALFD_MARK:
         usfd_release(cast[int32](task[0].fd_buf[fdu]) - 1)
+    if file_idx == FD_INOTIFY_MARK:
+        uino_release(cast[int32](task[0].fd_buf[fdu]) - 1)
+    # #155: closing a tmpfs fd posts an inotify IN_CLOSE_WRITE on its
+    # parent directory. tmpfs read/write fds share FD_TMPFS_MARK, so this
+    # fires for both; an inotify watcher filters by its requested mask, so
+    # a watcher uninterested in IN_CLOSE_WRITE never sees it.
+    if file_idx == FD_TMPFS_MARK:
+        _vfs_inotify_notify(
+            cast[Ptr[char]](tmpfs_slot_name(cast[int32](task[0].fd_buf[fdu]))),
+            IN_CLOSE_WRITE)
     # /proc/<pid>/<file> fds carry no per-fd backing — devproc_close
     # is a no-op success today (kept as a hook so future per-fd
     # snapshot support can land without re-plumbing the close path).
