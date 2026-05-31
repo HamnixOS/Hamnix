@@ -40,9 +40,16 @@ from fs.ext4 import ext4_close
 # owns is driven from timer_interrupt; this file only feeds it the
 # one switch event. See kernel/sched/loadavg.ad.
 from kernel.sched.loadavg import loadavg_note_switch
+# SMP: per-CPU id for current-task tracking and TSS gating.
+from arch.x86.kernel.setup_percpu import get_cpu_id
 
 extern def __switch_to_asm(prev: Ptr[uint8], next: Ptr[uint8])
 extern def enter_first_task(task: Ptr[uint8])
+# SMP spinlock: test-and-set via LOCK XCHG, release via plain store+SFENCE.
+# Used to protect shared runqueue mutations so APs and BSP don't race.
+extern def spinlock_lock(ptr: Ptr[uint32])
+extern def spinlock_unlock(ptr: Ptr[uint32])
+extern def cpu_relax()
 # M16.155: SYSRETQ-based first-user-task dispatch — the shipping
 # first-task entry path. Both enter_first_task (IRETQ) and
 # enter_first_task_sysret (SYSRETQ) stay exported so the call site in
@@ -444,6 +451,13 @@ STATE_EXITED:  uint64 = 3
 # runqueue — _pick_next skips it — until a SIGCONT moves it back to
 # STATE_READY. Distinct from STATE_EXITED (which is terminal).
 STATE_STOPPED: uint64 = 4
+# SMP: slot is reserved for an AP's idle kthread.  It has been created
+# (kstack allocated, entry point planted) but the AP has not yet entered
+# it.  _find_free_slot() skips PARKED slots so create_user_task cannot
+# steal the slot between sched_prepare_ap_idle() and sched_ap_launch().
+# _pick_next() skips it (only schedules READY/RUNNING).  The AP's
+# sched_ap_launch() transitions it directly to STATE_RUNNING.
+STATE_PARKED: uint64 = 5
 
 # Per-task kernel stack. 16 KiB (4 pages, buddy order 2) — a single
 # 4 KiB page is NOT enough for the deepest in-kernel call chain, the
@@ -479,7 +493,41 @@ RFLAGS_INITIAL: uint64 = 0x202           # bit 1 reserved | bit 9 IF=1
 NTASKS:      uint64 = 16
 task_table:  Array[16, TaskStruct]
 next_pid:    uint64 = 1
-current_idx: uint64 = 0                  # index into task_table
+# SMP-safe per-CPU current task slot index.  Each CPU (BSP + APs) keeps
+# its own copy in its %gs per-CPU area so schedule() / current_task()
+# always refer to the task running on THAT cpu.  The BSP initialises its
+# slot to 0 in sched_init(); each AP initialises its slot to its dedicated
+# idle kthread slot when it first enters sched_ap_launch().
+current_idx_pcpu: Percpu[uint64]
+
+# Runqueue spinlock.  A single test-and-set lock protecting:
+#   • task_table[*].state mutations in schedule() / sched_ap_idle_loop()
+#   • _find_free_slot() / _pick_next() scans that must see consistent state
+#
+# The lock is NOT held across the __switch_to_asm call itself — only
+# during the brief window of state reads and writes before the switch.
+# This keeps the hold time tiny and avoids deadlock on re-entry
+# (a task that wakes up after being switched to must not try to re-acquire
+# a lock that it doesn't hold yet).
+#
+# Hamnix scheduler spinlock design note:
+#   Uniprocessor (BSP-only): the BSP timer ISR fires with interrupts off
+#   (x86 gates interrupts on IRQ entry), so schedule() is naturally
+#   serialised and the lock is always free — the xchg round-trips cache
+#   but never spins, adding negligible latency.
+#   Multiprocessor: an AP calls schedule() from its idle loop (no timer
+#   ISR — APs do NOT have their LAPIC timer armed) while the BSP may call
+#   it from its timer ISR.  The lock prevents a simultaneous double-pick
+#   of the same READY task.
+rq_lock: uint32 = 0
+
+# Per-AP idle kthread slot indices.  Index = logical CPU id (1..MAX_CPUS-1).
+# sched_prepare_ap_idle() (called by smp_boot_aps before booting each AP)
+# stores the slot number here; sched_ap_launch() (called by the AP itself
+# after its %gs area is set up) reads it to know which task to enter.
+# Slot 0 is left unused (CPU 0 = BSP has no idle kthread — it runs init).
+AP_MAX_CPUS: uint64 = 16
+ap_idle_slots: Array[16, uint64]
 
 # Memory-leak accounting: cumulative task spawn/reap counters.
 # nr_tasks_spawned is incremented each time kthread_create or
@@ -668,13 +716,13 @@ def sched_mark_boot_task_running():
     # halting". Marking the boot task RUNNING up front makes schedule()
     # correctly return-to-self. _find_free_slot skips non-FREE slots,
     # so the first kthread_create still lands on slot 1.
-    current_idx = 0
+    current_idx_pcpu = 0
     task_table[0].state = STATE_RUNNING
 
 
 def sched_init():
     next_pid    = 1
-    current_idx = 0
+    current_idx_pcpu = 0
     # All slots already zero by .bss init -> state = STATE_FREE.
     # Re-assert the boot task as RUNNING (idempotent with the early
     # sched_mark_boot_task_running() call) so the create_user_task path
@@ -901,7 +949,7 @@ def create_user_thread(entry: uint64, name0: uint64,
     task_table[s].state       = STATE_READY
     task_table[s].is_user     = 1
     task_table[s].name0       = name0
-    task_table[s].parent_pid  = task_table[current_idx].pid
+    task_table[s].parent_pid  = task_table[current_idx_pcpu].pid
     task_table[s].exit_code   = 0
     # Per-task PML4: clone the PRISTINE BOOT PML4 so the kernel half is
     # mapped identically and the user half starts as the untouched boot
@@ -1003,8 +1051,8 @@ def create_user_thread(entry: uint64, name0: uint64,
     #      the new program's address space. Zero — first brk() call
     #      lazily allocates a fresh contiguous region (see
     #      _u_unimpl_brk in linux_abi/u_syscalls.ad).
-    if user_r9 != 0 and task_table[current_idx].is_user != 0:
-        cu: uint64 = current_idx
+    if user_r9 != 0 and task_table[current_idx_pcpu].is_user != 0:
+        cu: uint64 = current_idx_pcpu
         task_table[s].brk_base = task_table[cu].brk_base
         task_table[s].brk_end  = task_table[cu].brk_end
         task_table[s].brk_max  = task_table[cu].brk_max
@@ -1077,13 +1125,13 @@ def create_user_thread(entry: uint64, name0: uint64,
     # which holds for both flavours.
     #
     # Boot-time fallback: the FIRST user task ever created (init / PID 1)
-    # is built before any kthread_create runs, so current_idx still
+    # is built before any kthread_create runs, so current_idx_pcpu still
     # points at slot 0 in its all-zero .bss init state — uid == 0. uid 0
     # doesn't exist in Hamnix (the "root" idiom is gone; uid 1 is the
     # hostowner). Detect that case and default to hostowner (1). All
     # subsequent tasks inherit from a real parent that's either uid 1
     # or whichever uid `sys_setuid` flipped them to.
-    cu_uid: uint64 = current_idx
+    cu_uid: uint64 = current_idx_pcpu
     parent_uid: uint32 = task_table[cu_uid].uid
     parent_gid: uint32 = task_table[cu_uid].gid
     if parent_uid == 0:
@@ -1101,17 +1149,31 @@ def create_user_thread(entry: uint64, name0: uint64,
 # --- public: schedule / lifecycle ---------------------------------
 
 def _pick_next() -> int32:
-    # Round-robin starting at current_idx + 1. Returns -1 if no slot
-    # is in STATE_READY OR STATE_RUNNING (i.e. nobody to run).
+    # Round-robin starting at current_idx_pcpu + 1.  Returns the index
+    # of the first STATE_READY slot found, or -1 if none.
+    #
+    # SMP safety:
+    #   • Only STATE_READY is considered — a STATE_RUNNING task is already
+    #     executing on some CPU and must not be double-dispatched.
+    #   • On AP cores (cpu_id != 0) user tasks (is_user != 0) are SKIPPED.
+    #     User tasks require TSS.RSP0 to be per-CPU (so IRQ-from-user lands
+    #     on the right kernel stack), which is not yet implemented.  APs only
+    #     run kernel threads; this constraint is relaxed once per-CPU TSSs
+    #     are wired up.  On the BSP (cpu_id == 0) all READY tasks are
+    #     eligible (uniprocessor path unchanged).
     n: uint64 = NTASKS
-    i: uint64 = current_idx + 1
+    i: uint64 = current_idx_pcpu + 1
     tried: uint64 = 0
+    on_bsp: uint64 = 0
+    if get_cpu_id() == 0:
+        on_bsp = 1
     while tried < n:
         if i >= n:
             i = 0
         st: uint64 = task_table[i].state
-        if st == STATE_READY or st == STATE_RUNNING:
-            return cast[int32](i)
+        if st == STATE_READY:
+            if on_bsp != 0 or task_table[i].is_user == 0:
+                return cast[int32](i)
         i = i + 1
         tried = tried + 1
     return -1
@@ -1122,12 +1184,28 @@ def schedule():
     # task_exit_current() (cooperative drop). Round-robins the
     # runqueue; updates TSS.RSP0 to the new task's kstack so a
     # subsequent CPL-3 IRQ lands there; then __switch_to.
+    #
+    # SMP safety: rq_lock is held during the _pick_next() scan and all
+    # task_table state mutations, then RELEASED before __switch_to_asm.
+    # The lock must not be held across the context switch: the task we
+    # switch away from will re-enter schedule() later (via another
+    # timer tick or cooperative yield) and would deadlock if it tried
+    # to re-acquire a lock it no longer holds.
+    #
+    # On uniprocessor the BSP timer ISR fires with local interrupts
+    # disabled (x86 gates IF on hardware IRQ entry), so rq_lock is
+    # always free on the BSP path — the xchg is a cache round-trip but
+    # never spins.  On AP paths (AP idle loop, cooperative yields from
+    # tasks running on an AP) the lock may briefly contend with the BSP
+    # timer ISR, but the BSP holds it only for microseconds.
+    spinlock_lock(&rq_lock)
     nxt_signed: int32 = _pick_next()
     if nxt_signed < 0:
         # Nobody to run. If even the current task is no longer ready,
         # there are no live tasks at all; halt the box.
-        if task_table[current_idx].state != STATE_RUNNING and \
-           task_table[current_idx].state != STATE_READY:
+        if task_table[current_idx_pcpu].state != STATE_RUNNING and \
+           task_table[current_idx_pcpu].state != STATE_READY:
+            spinlock_unlock(&rq_lock)
             # System-halt notice: stamp EMERG so it always reaches the
             # live console even after userland went interactive and the
             # console-loglevel gate tightened (see early_8250.ad).
@@ -1136,17 +1214,21 @@ def schedule():
             local_irq_disable()
             while True:
                 asm_volatile("hlt")
+        spinlock_unlock(&rq_lock)
         return
 
     nxt: uint64 = cast[uint64](nxt_signed)
-    if nxt == current_idx:
+    if nxt == current_idx_pcpu:
+        spinlock_unlock(&rq_lock)
         return  # only one ready task
 
-    prev: uint64 = current_idx
+    prev: uint64 = current_idx_pcpu
     if task_table[prev].state == STATE_RUNNING:
         task_table[prev].state = STATE_READY
     task_table[nxt].state = STATE_RUNNING
-    current_idx = nxt
+    current_idx_pcpu = nxt
+
+    spinlock_unlock(&rq_lock)
 
     # §13: ctxt accounting — this is a real (prev != next) context
     # switch, so count it. /dev/stat's "ctxt" column reads this back.
@@ -1164,7 +1246,12 @@ def schedule():
     # Update RSP0 BEFORE the swap so a stray CPL-3 IRQ that happens
     # between this point and the next sysret/iretq still lands on
     # the right stack.
-    tss_set_rsp0(task_table[nxt].kstack_top)
+    # SMP gate: TSS.RSP0 is a SINGLE global TSS shared by all CPUs.
+    # Only the BSP (cpu 0) can safely write it — an AP updating TSS.RSP0
+    # would corrupt the BSP's IRQ-from-user landing stack.  APs only run
+    # kernel threads (is_user == 0), so they never need RSP0 updates.
+    if get_cpu_id() == 0:
+        tss_set_rsp0(task_table[nxt].kstack_top)
 
     # Switch page tables if the incoming task uses a different PML4.
     # Skipping the write when CR3 wouldn't change avoids a needless
@@ -1188,14 +1275,14 @@ def schedule():
 
 
 def _another_task_ready() -> uint64:
-    # Returns 1 if some slot OTHER than current_idx is STATE_READY —
+    # Returns 1 if some slot OTHER than current_idx_pcpu is STATE_READY —
     # i.e. there is genuinely a runnable peer to preempt in favour of.
     # schedule()/_pick_next would early-return when current is the
     # only READY/RUNNING slot, so the timer ISR uses this to avoid the
     # cost (and the EOI-ordering subtlety) of a no-op schedule() call.
     i: uint64 = 0
     while i < NTASKS:
-        if i != current_idx:
+        if i != current_idx_pcpu:
             if task_table[i].state == STATE_READY:
                 return 1
         i = i + 1
@@ -1249,15 +1336,15 @@ def task_exit_current(code: int64):
     # path yet — that's a slab + RCU follow-up). The exit_code is
     # consumed by a parent in SYS_WAITPID; with no parent the value
     # is simply unread.
-    task_close_all_fds(current_idx)
+    task_close_all_fds(current_idx_pcpu)
     # V2.75: drop our reference to the per-process group. If we were
     # the last referer, pgrp_ref_dec kfree's the Pgrp's heap storage,
     # so a future rfork(RFNAMEG) gets a clean kzalloc'd region. Root
     # (sentinel-pinned at PGRP_ROOT_REF_PIN) refuses to underflow
     # inside pgrp_ref_dec, so init's call here is a no-op even if
     # init ever exits.
-    pgrp_ref_dec(task_table[current_idx].pgrp)
-    task_table[current_idx].exit_code = code
+    pgrp_ref_dec(task_table[current_idx_pcpu].pgrp)
+    task_table[current_idx_pcpu].exit_code = code
     # U27: CLONE_CHILD_CLEARTID handshake. If this task (typically a
     # pthread created via clone(CLONE_CHILD_CLEARTID, ctid=&desc->tid))
     # registered a user pointer via set_tid_address / the clone ctid
@@ -1270,10 +1357,10 @@ def task_exit_current(code: int64):
     # function pointer Layer 2 registers at bring-up. A native-only
     # build leaves the hook null; native tasks never set clear_child_tid
     # anyway, so this whole block is a no-op for them.
-    ctid: uint64 = task_table[current_idx].clear_child_tid
+    ctid: uint64 = task_table[current_idx_pcpu].clear_child_tid
     if ctid != 0:
         cast[Ptr[int32]](ctid)[0] = 0
-        task_table[current_idx].clear_child_tid = 0
+        task_table[current_idx_pcpu].clear_child_tid = 0
         if cleartid_wake_hook != cast[Fn[int32, uint64]](0):
             cleartid_wake_hook(ctid)
     # §3: SIGCHLD to the parent. POSIX: a child entering its zombie
@@ -1287,8 +1374,8 @@ def task_exit_current(code: int64):
     # when the parent has actually installed a handler for it; a parent
     # that never registered one is not disturbed, exactly matching
     # Linux's "SIGCHLD default action is ignore" semantics.
-    if task_table[current_idx].detached == 0:
-        ppid: uint64 = task_table[current_idx].parent_pid
+    if task_table[current_idx_pcpu].detached == 0:
+        ppid: uint64 = task_table[current_idx_pcpu].parent_pid
         if ppid != 0:
             pslot: int32 = task_lookup_by_pid(ppid)
             if pslot >= 0:
@@ -1303,25 +1390,187 @@ def task_exit_current(code: int64):
     # STATE_EXITED so it never lingers as a zombie and the slot is
     # immediately reusable. A normal child stays STATE_EXITED until a
     # parent's wait4 / waitpid consumes its exit code and reaps it.
-    if task_table[current_idx].detached != 0:
+    if task_table[current_idx_pcpu].detached != 0:
         # Process-lifecycle event: NOTICE ("normal but significant",
         # KERN_NOTICE) so it survives the post-interactive console
         # log-level gate — a process exiting is operationally
         # meaningful, not throwaway INFO chatter.
         printk_set_level(PRINTK_LEVEL_NOTICE)
         printk2("task: pid %d exited detached (code=%d) — self-reaped\n",
-                task_table[current_idx].pid, cast[uint64](code))
+                task_table[current_idx_pcpu].pid, cast[uint64](code))
         nr_tasks_reaped = nr_tasks_reaped + 1
-        task_table[current_idx].state = STATE_FREE
+        task_table[current_idx_pcpu].state = STATE_FREE
         schedule()
         return
-    task_table[current_idx].state = STATE_EXITED
+    task_table[current_idx_pcpu].state = STATE_EXITED
     printk_set_level(PRINTK_LEVEL_NOTICE)
     printk2("task: pid %d exited (code=%d)\n",
-            task_table[current_idx].pid, cast[uint64](code))
+            task_table[current_idx_pcpu].pid, cast[uint64](code))
     schedule()
     # schedule() never returns when we're EXITED — it halts if there
     # are no other ready tasks, or switches us out forever.
+
+
+# --- SMP: AP idle kthread and per-AP scheduler bootstrap -----------
+#
+# Design:
+#   1. sched_prepare_ap_idle(cpu_id) is called by the BSP (inside
+#      smp_boot_aps' sequential AP-boot loop, while still
+#      single-threaded) for each AP it is about to wake.  It creates a
+#      dedicated kernel thread whose body is sched_ap_idle_loop(), then
+#      marks the slot STATE_FREE (so the BSP's own scheduler can never
+#      accidentally pick it up) and records the slot in ap_idle_slots[].
+#
+#   2. sched_ap_launch(cpu_id) is called by the AP itself after its
+#      %gs per-CPU area is set up.  It reads ap_idle_slots[cpu_id],
+#      stamps current_idx_pcpu, marks the slot STATE_RUNNING, and enters
+#      the kthread via enter_first_task() — the AP's first "task" is the
+#      idle loop, exactly as the BSP's first "task" is /init.
+#
+#   3. sched_ap_idle_loop() runs on the AP forever.  It:
+#        (a) Prints "SMP: cpu%d kthread alive" once, proving a scheduler
+#            task executed on a non-BSP core.
+#        (b) Loops: acquire rq_lock, search for a STATE_READY kernel-only
+#            task, if found dispatch it (set idle→READY, real→RUNNING,
+#            release lock, __switch_to_asm), loop again when the task
+#            eventually comes back (via schedule() → switch back to idle).
+#        (c) HLTs with interrupts enabled when no READY task is available
+#            (LAPIC timer is NOT armed on APs — they wake via the poll
+#            loop after the hlt).
+#
+# Safety invariants:
+#   • APs NEVER pick user tasks (is_user != 0): those require per-AP TSS
+#     setup that is not yet in place.
+#   • APs NEVER call tss_set_rsp0: schedule() already gates that on
+#     get_cpu_id() == 0.
+#   • rq_lock hold time is bounded (microsecond-scale): only the scan +
+#     state updates are inside the critical section, not the switch itself.
+#   • BSP uniprocessor path is IDENTICAL to before this patch: the lock
+#     is uncontended on the BSP (LAPIC timer fires with IF=0 → no AP can
+#     be in the lock at the same time), so schedule() latency is unchanged.
+
+def sched_ap_idle_loop():
+    # Body of the AP idle kthread.  Runs on the AP; never returns.
+    my_cpu_id: uint64 = get_cpu_id()
+    # One-time banner: proof that scheduler code ran on a non-BSP core.
+    printk1("SMP: cpu%d kthread alive\n", my_cpu_id)
+
+    while True:
+        # Acquire the runqueue lock and look for a READY kernel task.
+        spinlock_lock(&rq_lock)
+        my_idle_slot: uint64 = current_idx_pcpu
+        # Scan for a STATE_READY kernel-only task other than our own slot.
+        found_slot: int32 = -1
+        scan: uint64 = 0
+        while scan < NTASKS:
+            if scan != my_idle_slot:
+                if task_table[scan].state == STATE_READY:
+                    if task_table[scan].is_user == 0:
+                        found_slot = cast[int32](scan)
+                        scan = NTASKS  # break
+            scan = scan + 1
+
+        if found_slot >= 0:
+            nxt: uint64 = cast[uint64](found_slot)
+            # Put idle task into READY so schedule() can switch back to
+            # us when the real task yields or exits.
+            task_table[my_idle_slot].state = STATE_READY
+            task_table[nxt].state = STATE_RUNNING
+            current_idx_pcpu = nxt
+            spinlock_unlock(&rq_lock)
+
+            # Context-switch to the real task.  When it eventually calls
+            # schedule() and finds the idle slot is STATE_READY, it will
+            # switch back here — __switch_to_asm will return.
+            __switch_to_asm(cast[Ptr[uint8]](&task_table[my_idle_slot]),
+                            cast[Ptr[uint8]](&task_table[nxt]))
+
+            # Re-establish idle as STATE_RUNNING and current.
+            spinlock_lock(&rq_lock)
+            task_table[my_idle_slot].state = STATE_RUNNING
+            current_idx_pcpu = my_idle_slot
+            spinlock_unlock(&rq_lock)
+        else:
+            spinlock_unlock(&rq_lock)
+            # No ready kernel task; idle with interrupts enabled so any
+            # future IPI or BSP-generated work can wake us.
+            asm_volatile("sti")
+            asm_volatile("hlt")
+            asm_volatile("cli")
+
+
+def sched_prepare_ap_idle(cpu_id: uint64) -> int32:
+    # Called by the BSP AFTER sched_init() to create the AP's idle kthread.
+    # The slot is marked STATE_PARKED so:
+    #   (a) the BSP's _pick_next() never schedules it (only picks STATE_READY),
+    #   (b) _find_free_slot() never reclaims it (only claims STATE_FREE),
+    #       preventing create_user_task from stealing the slot between this
+    #       call and sched_ap_launch().
+    # sched_ap_launch() (called by the AP when it observes ap_idle_slots[]
+    # become non-zero) transitions it directly to STATE_RUNNING.
+    # Returns the slot index, or -1 on OOM.
+    #
+    # Interrupt-disable window: kthread_create() leaves the slot STATE_READY;
+    # we must flip it to STATE_PARKED before the BSP timer ISR can see it.
+    # Disable local interrupts to prevent the timer ISR (which takes rq_lock)
+    # from racing us — spinlock_lock + a concurrently-firing IRQ that also
+    # takes the same lock would deadlock since the ISR can't be preempted.
+    local_irq_disable()
+    spinlock_lock(&rq_lock)
+    slot: int32 = kthread_create(cast[uint64](&sched_ap_idle_loop), 0)
+    if slot < 0:
+        spinlock_unlock(&rq_lock)
+        local_irq_enable()
+        printk1("SMP: sched_prepare_ap_idle cpu%d: no free slot\n", cpu_id)
+        return -1
+    su: uint64 = cast[uint64](slot)
+    # kthread_create sets STATE_READY; park it so BSP can't schedule it
+    # and create_user_task can't reclaim the slot.
+    task_table[su].state = STATE_PARKED
+    spinlock_unlock(&rq_lock)
+    local_irq_enable()
+    # Record for sched_ap_launch to find.  Written AFTER the slot is safely
+    # parked: the AP's spin loop reads ap_idle_slots[cpu_id] and enters the
+    # kthread only once this write is visible (x86 TSO guarantees the store
+    # to ap_idle_slots[] is seen by the AP after the STATE_PARKED write above).
+    if cpu_id < AP_MAX_CPUS:
+        ap_idle_slots[cpu_id] = su
+    printk2("SMP: cpu%d idle kthread prepared (slot %d)\n", cpu_id,
+            cast[uint64](slot))
+    return slot
+
+
+def sched_ap_launch(cpu_id: uint64):
+    # Called by the AP itself after its %gs per-CPU area is set up.
+    # Enters the AP's dedicated idle kthread via enter_first_task()
+    # — from this call onward the AP is a full scheduler participant.
+    # Never returns.
+    #
+    # The AP may arrive here BEFORE the BSP has called
+    # sched_prepare_ap_idle() (which is deferred to after sched_init()
+    # to avoid PID-counter collisions). Spin-wait with STI so the BSP
+    # can make forward progress; the LAPIC timer is not armed on APs so
+    # this is just a pause loop, not a nested interrupt.
+    if cpu_id >= AP_MAX_CPUS:
+        # Out-of-range CPU; park in HLT.
+        asm_volatile("cli")
+        while True:
+            asm_volatile("hlt")
+    # Wait until BSP has filled in our idle slot (after sched_init()).
+    # Spin with cpu_relax (PAUSE) — no interrupts needed since the AP's
+    # LAPIC timer is not armed and the poll is purely memory-based.
+    while ap_idle_slots[cpu_id] == 0:
+        cpu_relax()
+    slot_u: uint64 = ap_idle_slots[cpu_id]
+    # Diagnostic: confirm the AP exited the spin loop and is about to
+    # launch its idle kthread.  This print happens from the AP's context
+    # (after spin-wait exits but before enter_first_task switches stacks).
+    printk2("SMP: cpu%d launching idle kthread slot=%d\n", cpu_id, slot_u)
+    task_table[slot_u].state = STATE_RUNNING
+    current_idx_pcpu = slot_u
+    # enter_first_task loads task->sp and tail-jumps into kthread_bootstrap
+    # which iretqs into sched_ap_idle_loop.  Does not return.
+    enter_first_task(cast[Ptr[uint8]](&task_table[slot_u]))
 
 
 def start_first_task(first_slot: uint64):
@@ -1339,7 +1588,7 @@ def start_first_task(first_slot: uint64):
     # Taking the real slot as a parameter fixes that at the source.
     fs0: uint64 = first_slot
     task_table[fs0].state = STATE_RUNNING
-    current_idx = cast[int32](fs0)
+    current_idx_pcpu = fs0
     # RETIRE THE PHANTOM BOOT TASK. sched_mark_boot_task_running()
     # marked slot 0 STATE_RUNNING during boot so a .ko-probe yield
     # wouldn't trip schedule()'s "no live tasks; halt". But slot 0 is
@@ -1538,14 +1787,15 @@ FD_HOSTNAME_MARK: uint32 = 0xFFFFFFE7
 
 
 def current_task_pid() -> uint64:
-    return task_table[current_idx].pid
+    return task_table[current_idx_pcpu].pid
 
 
 def current_idx_get() -> uint64:
     # Accessor for the running task's slot index. Used by the
     # syscall layer when it needs the index (not the pointer or pid)
     # for CWD-related operations on the current task.
-    return current_idx
+    # SMP: returns the per-CPU current slot for THIS CPU's running task.
+    return current_idx_pcpu
 
 
 def register_cleartid_wake_hook(hook: Fn[int32, uint64]):
@@ -1561,11 +1811,11 @@ def register_cleartid_wake_hook(hook: Fn[int32, uint64]):
 
 
 def current_task_is_user() -> uint64:
-    return task_table[current_idx].is_user
+    return task_table[current_idx_pcpu].is_user
 
 
 def current_task() -> Ptr[TaskStruct]:
-    return &task_table[current_idx]
+    return &task_table[current_idx_pcpu]
 
 
 def task_struct_at(slot: int32) -> Ptr[TaskStruct]:
@@ -1924,11 +2174,11 @@ def set_task_clear_child_tid(slot: int32, v: uint64):
 # hostowner can change identity; downgrade-only escalation never
 # elevates a regular user.
 def current_task_uid() -> uint32:
-    return task_table[current_idx].uid
+    return task_table[current_idx_pcpu].uid
 
 
 def current_task_gid() -> uint32:
-    return task_table[current_idx].gid
+    return task_table[current_idx_pcpu].gid
 
 
 def set_current_task_uid(v: uint32):
@@ -1939,11 +2189,11 @@ def set_current_task_uid(v: uint32):
     # check lives in syscall.ad, not here, so this helper stays usable
     # by both the cdev (which is already inside the kernel context for
     # PID 1's behalf at the auth point) and by the boot-time bring-up.
-    task_table[current_idx].uid = v
+    task_table[current_idx_pcpu].uid = v
 
 
 def set_current_task_gid(v: uint32):
-    task_table[current_idx].gid = v
+    task_table[current_idx_pcpu].gid = v
 
 
 def task_uid_at(slot: int32) -> uint32:
@@ -1995,7 +2245,7 @@ def count_live_linux_peers() -> int32:
     n: uint64 = NTASKS
     i: uint64 = 0
     peers: int32 = 0
-    cur: uint64 = current_idx
+    cur: uint64 = current_idx_pcpu
     while i < n:
         if i != cur and task_table[i].is_user != 0 \
                     and task_table[i].is_linux_userspace != 0:
@@ -2417,7 +2667,7 @@ def get_current_errstr() -> Ptr[uint8]:
     # Caller must respect ERRMAX as the buffer size. The pointer is
     # stable for the lifetime of the task slot (errstr_buf is inline
     # in TaskStruct, never relocated).
-    return &task_table[current_idx].errstr_buf[0]
+    return &task_table[current_idx_pcpu].errstr_buf[0]
 
 
 def set_current_errstr(s: Ptr[uint8]):
@@ -2427,7 +2677,7 @@ def set_current_errstr(s: Ptr[uint8]):
     # if the caller's source string is exactly ERRMAX bytes long.
     # Empty buffer (s == NULL or s[0] == 0) clears the slot — Plan 9
     # treats that as "no recent error".
-    dst: Ptr[uint8] = &task_table[current_idx].errstr_buf[0]
+    dst: Ptr[uint8] = &task_table[current_idx_pcpu].errstr_buf[0]
     if cast[uint64](s) == 0:
         dst[0] = 0
         return
@@ -2486,17 +2736,17 @@ def set_task_alt_stack_flags(slot: uint64, v: int32):
 # closes out the current syscall. Only meaningful when we're in the
 # middle of servicing a syscall from a CPL=3 caller.
 def saved_user_rip_ptr() -> Ptr[uint64]:
-    kt: uint64 = task_table[current_idx].kstack_top
+    kt: uint64 = task_table[current_idx_pcpu].kstack_top
     return cast[Ptr[uint64]](kt - 24)
 
 
 def saved_user_rsp_ptr() -> Ptr[uint64]:
-    kt: uint64 = task_table[current_idx].kstack_top
+    kt: uint64 = task_table[current_idx_pcpu].kstack_top
     return cast[Ptr[uint64]](kt - 8)
 
 
 def saved_user_rflags_ptr() -> Ptr[uint64]:
-    kt: uint64 = task_table[current_idx].kstack_top
+    kt: uint64 = task_table[current_idx_pcpu].kstack_top
     return cast[Ptr[uint64]](kt - 16)
 
 
@@ -2611,7 +2861,7 @@ def deliver_signal_to_user(sig: uint64, handler: uint64,
     cast[Ptr[uint32]](info_ptr + 8)[0] = cast[uint32](128)   # si_code
 
     # --- ucontext_t: capture the resumption state --------------------
-    cur: uint64 = current_idx
+    cur: uint64 = current_idx_pcpu
     cast[Ptr[uint64]](uc_ptr + UCTX_GREG_RSP_OFF)[0] = natural_rsp
     cast[Ptr[uint64]](uc_ptr + UCTX_GREG_RIP_OFF)[0] = saved_rip
     cast[Ptr[uint64]](uc_ptr + UCTX_GREG_EFL_OFF)[0] = saved_rflags
@@ -2668,7 +2918,7 @@ def signal_dispatch(syscall_rc: uint64, allow_handler: int32):
     #   mid-syscall (yield_to_others) checks from building a frame with
     #   a wrong %rax — SIG_DFL termination needs no %rax so it is
     #   always safe.
-    cur: uint64 = current_idx
+    cur: uint64 = current_idx_pcpu
     pending: uint64 = task_table[cur].sig_pending
     if pending == 0:
         return
@@ -2898,12 +3148,12 @@ def _init_fd_table(slot: uint64):
 
 
 def _inherit_cwd_from_parent(child_slot: uint64):
-    # Copy current_idx's CWD into the child. Called from
+    # Copy current_idx_pcpu's CWD into the child. Called from
     # create_user_task_argv just after _init_fd_table so SYS_SPAWN
     # children pick up the shell's working directory.
     i: uint64 = 0
     while i < 128:
-        c: uint8 = task_table[current_idx].cwd[i]
+        c: uint8 = task_table[current_idx_pcpu].cwd[i]
         task_table[child_slot].cwd[i] = c
         if c == 0:
             return
@@ -2968,11 +3218,11 @@ def current_pgrp() -> uint64:
     # V2.75: returns the heap pointer (uint64) parked in the current
     # task's pgrp slot. 0 means "no pgrp installed yet"; callers in
     # chan.ad pivot that onto the root Pgrp lazily.
-    return task_table[current_idx].pgrp
+    return task_table[current_idx_pcpu].pgrp
 
 
 def set_current_pgrp(v: uint64):
-    task_table[current_idx].pgrp = v
+    task_table[current_idx_pcpu].pgrp = v
 
 
 # V2.5 dropped alloc_namespace_id — pgrp_alloc in chan.ad replaces it.

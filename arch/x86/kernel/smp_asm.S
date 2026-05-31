@@ -161,13 +161,50 @@ ap_cpu_id_slot_addr:
  * The AP already has a valid kernel stack (set from ap_stack_top by
  * the trampoline) and is sharing the BSP's page tables via CR3.
  *
- * From here we just call into Hamnix. The C-style ABI shuffle is
- * straightforward: no args, no return.  */
+ * CRITICAL: the AP arrives here with CS loaded from the TRAMPOLINE GDT
+ * (selector 0x18 = 64-bit code in ap_gdt16).  Any iretq that restores
+ * CS=0x08 (the Hamnix kernel CS) would consult the TRAMPOLINE GDT where
+ * 0x08 is a 32-bit code segment, silently switching the AP into 32-bit
+ * compatibility mode.  Reload the kernel GDT (gdt64) here so that
+ * CS=0x08 is the correct 64-bit kernel code segment, identical to the
+ * BSP's view.  We use a 10-byte GDT descriptor (.word limit + .quad base)
+ * because in 64-bit mode lgdt reads a 10-byte operand.  */
     .align 16
     .globl ap_main_64
 ap_main_64:
+    /* Reload the kernel GDT so CS=0x08 means 64-bit kernel code. */
+    leaq    __ap_kernel_gdt_descriptor(%rip), %rax
+    lgdt    (%rax)
+    /* Flush CS by a far return: push 0x08:ap_gdt_flushed onto the stack
+     * and lretq into the continuation label.  This atomically loads CS
+     * from the kernel GDT without a separate ljmp instruction. */
+    leaq    ap_gdt_flushed(%rip), %rax
+    pushq   $0x08          /* kernel CS (64-bit code in kernel GDT) */
+    pushq   %rax
+    lretq
+
+ap_gdt_flushed:
+    /* CS is now 0x08 from the kernel GDT.  Reload data segments too. */
+    movw    $0x10, %ax
+    movw    %ax, %ds
+    movw    %ax, %es
+    movw    %ax, %ss
+    /* FS and GS will be set up by setup_ap_percpu_area() / ap_main_hamnix.
+     * Zero them here so any accidental %fs/%gs-relative read before
+     * setup faults cleanly rather than aliasing unknown memory. */
+    xorw    %ax, %ax
+    movw    %ax, %fs
+    movw    %ax, %gs
     call    ap_main_hamnix
     /* Defensive: if ap_main_hamnix ever returns, halt the AP. */
 1:  cli
     hlt
     jmp 1b
+
+    /* 10-byte GDT descriptor for 64-bit mode lgdt (2-byte limit + 8-byte
+     * base).  Points at the same gdt64 table the BSP loaded at boot. */
+    .section .rodata
+    .align 8
+__ap_kernel_gdt_descriptor:
+    .word   0x0037          /* limit = 7 entries * 8 - 1 = 55 = 0x37 */
+    .quad   gdt64           /* 64-bit base of the kernel GDT */

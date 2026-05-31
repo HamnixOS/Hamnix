@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# scripts/test_smp.sh — SMP bring-up regression test.
+# scripts/test_smp.sh — SMP bring-up + AP scheduler regression test.
 #
 # Boots Hamnix under QEMU with -smp 2 (one BSP + one AP) and asserts
-# that all APs come online via MADT-driven INIT-SIPI-SIPI.
+# that all APs come online via MADT-driven INIT-SIPI-SIPI AND that the
+# AP actually enters the scheduler and runs a kernel task.
 #
 # PASS markers:
 #   (a) "acpi: 2 CPU(s) cached from MADT"
@@ -18,6 +19,11 @@
 #         The AP bumped the online counter; BSP confirmed it.
 #   (f) "Hamnix: cpus_online = 2"
 #         The final counter logged by init/main.ad is 2.
+#   (g) "SMP: cpu1 kthread alive"
+#         The AP's idle kthread printed its banner from sched_ap_idle_loop(),
+#         proving that scheduler code actually EXECUTED on a non-BSP core.
+#         This is the key assertion that the AP is a full scheduler participant,
+#         not just parked in a HLT loop.
 #
 # Architecture of this test:
 #   - Uses the standard GRUB-ISO shim (_kernel_iso.sh) so the higher-half
@@ -65,7 +71,7 @@ rc=$?
 set -e
 
 echo "[test_smp] --- captured output (SMP-relevant lines) ---"
-grep -E "SMP:|smp_|acpi.*CPU|cpus_online|AP cpu|MADT" "$LOG" || true
+grep -E "SMP:|smp_|acpi.*CPU|cpus_online|AP cpu|MADT|kthread alive" "$LOG" || true
 echo "[test_smp] --- end ---"
 
 fail=0
@@ -99,6 +105,11 @@ check_marker "BSP confirmed AP online" "SMP: AP cpu1 online (cpus_online=2)"
 # (f) Final cpus_online count in init sequence
 check_marker "cpus_online=2 in init" "Hamnix: cpus_online = 2"
 
+# (g) AP kthread actually ran on the non-BSP core — the KEY scheduler assertion.
+# sched_ap_idle_loop() prints this banner once, from cpu1, proving that the AP
+# entered the Hamnix scheduler and executed kernel code on a non-BSP core.
+check_marker "AP kthread ran on non-BSP core (cpu1)" "SMP: cpu1 kthread alive"
+
 # Sanity: the BSP's scheduler is still alive (hamsh heartbeat)
 if grep -qF "[hamsh-alive]" "$LOG"; then
     echo "[test_smp] PASS: BSP scheduler alive after SMP bring-up"
@@ -111,4 +122,4 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
-echo "[test_smp] PASS — MADT-driven SMP bring-up: all APs online, per-CPU gs set up"
+echo "[test_smp] PASS — MADT-driven SMP bring-up + AP scheduler: all APs online, per-CPU gs set up, AP kthread executed"
