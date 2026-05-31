@@ -171,6 +171,24 @@ else
     fail=1
 fi
 
+# Real-module milestone: a genuine chunk of compiler source (lexer.ad's
+# character-class predicates) compiled by the self-hosted backend on device,
+# its emitted machine code executed and verified.
+if grep -F -q "[codegen_selftest] realmod: compiled" "$LOG"; then
+    echo "[selfhost_codegen] OK: realmod compiled sentinel present:"
+    grep -F "[codegen_selftest] realmod: compiled" "$LOG" | sed 's/^/  /'
+else
+    echo "[selfhost_codegen] MISS: realmod compiled sentinel absent"
+    fail=1
+fi
+
+if grep -F -q "[codegen_selftest] realmod PASS" "$LOG"; then
+    echo "[selfhost_codegen] OK: realmod PASS sentinel present"
+else
+    echo "[selfhost_codegen] MISS: realmod PASS sentinel absent"
+    fail=1
+fi
+
 if grep -F -q "TRAP: vector" "$LOG"; then
     echo "[selfhost_codegen] DIAG: kernel CPU exception"
     grep -F "TRAP: vector" "$LOG" | head -3 || true
