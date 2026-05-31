@@ -19,6 +19,7 @@
 # REQUIRES: musl-gcc on the host. SKIPs (exit 0) if it can't build.
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_qemu_drive.sh"
 . "$(dirname "$0")/_ensure_ubin.sh"
 
 set -euo pipefail
@@ -47,23 +48,13 @@ echo "[test_u_epoll] (4/4) Boot QEMU + run /bin/u_epolltest via hamsh"
 LOG=$(mktemp)
 trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
 
+# Prompt-aware drive: wait for hamsh's ready banner before sending input
+# (a fixed sleep races boot-time variance -- see _qemu_drive.sh).
 set +e
-(
-    sleep 3
-    printf 'u_epolltest\n'
-    sleep 12
-    printf 'exit\n'
-    sleep 1
-) | timeout 60s qemu-system-x86_64 \
-    -kernel "$ELF" \
-    -smp 2 \
-    -nographic \
-    -no-reboot \
-    -m 256M \
-    -monitor none \
-    -serial stdio \
-    > "$LOG" 2>&1
-rc=$?
+qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 60 \
+    -- "u_epolltest" 12 \
+       "exit" 1
+rc="$QEMU_DRIVE_RC"
 set -e
 
 echo "[test_u_epoll] --- captured output ---"
@@ -75,7 +66,7 @@ fail=0
 check_marker() {
     local label="$1"
     local needle="$2"
-    if grep -F -q "$needle" "$LOG"; then
+    if grep -a -F -q "$needle" "$LOG"; then
         echo "[test_u_epoll] OK   $label  ('$needle')"
     else
         echo "[test_u_epoll] MISS $label  ('$needle')"
@@ -90,14 +81,14 @@ check_marker "pipe epoll readiness"     "epolltest: pipe epoll ready ok"
 check_marker "poll(2) fallback"         "epolltest: poll eventfd ok"
 check_marker "overall PASS"             "epolltest: PASS"
 
-if grep -F -q "epolltest: FAIL" "$LOG"; then
+if grep -a -F -q "epolltest: FAIL" "$LOG"; then
     echo "[test_u_epoll] DIAG: fixture reported a FAIL marker"
-    grep -F "epolltest: FAIL" "$LOG" | head -5 || true
+    grep -a -F "epolltest: FAIL" "$LOG" | head -5 || true
     fail=1
 fi
-if grep -F -q "TRAP: vector" "$LOG"; then
+if grep -a -F -q "TRAP: vector" "$LOG"; then
     echo "[test_u_epoll] DIAG: CPU exception observed"
-    grep -F "TRAP: vector" "$LOG" | head -5 || true
+    grep -a -F "TRAP: vector" "$LOG" | head -5 || true
     fail=1
 fi
 

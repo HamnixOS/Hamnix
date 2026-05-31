@@ -49,6 +49,7 @@
 #   U42 dynamic hello
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_qemu_drive.sh"
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -166,22 +167,12 @@ LOG=$(mktemp)
 trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
 
 set +e
-(
-    sleep 3
-    printf 'u_dynamic_hello\n'
-    sleep 5
-    printf 'exit\n'
-    sleep 1
-) | timeout 30s qemu-system-x86_64 \
-    -kernel "$ELF" \
-    -smp 2 \
-    -nographic \
-    -no-reboot \
-    -m 512M \
-    -monitor none \
-    -serial stdio \
-    > "$LOG" 2>&1
-rc=$?
+# Prompt-aware drive: wait for hamsh's ready banner before sending input
+# (a fixed sleep races boot-time variance -- see _qemu_drive.sh).
+qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 30 \
+    -- "u_dynamic_hello" 5 \
+       "exit" 1
+rc="$QEMU_DRIVE_RC"
 set -e
 
 echo "[test_u42_dynamic_elf] --- captured output ---"
@@ -198,7 +189,7 @@ infra_ok=0
 # overlay region, munmap of unused tail) is honest, so once ld.so
 # transfers control to the app's _start the application's puts()
 # should reach the serial port.
-if grep -F -q "U42 dynamic hello" "$LOG"; then
+if grep -a -F -q "U42 dynamic hello" "$LOG"; then
     echo "[test_u42_dynamic_elf] OK: u_dynamic_hello reached main()"
 else
     echo "[test_u42_dynamic_elf] MISS: 'U42 dynamic hello' did not" \
@@ -210,7 +201,7 @@ fi
 # fs/elf.ad's PT_INTERP arm + auxv plumbing didn't regress).
 
 # 1. fs/elf.ad detected PT_INTERP and printed the interp path.
-if grep -F -q "PT_INTERP=" "$LOG"; then
+if grep -a -F -q "PT_INTERP=" "$LOG"; then
     echo "[test_u42_dynamic_elf] OK: PT_INTERP detected by loader"
     infra_ok=$((infra_ok + 1))
 else
@@ -220,7 +211,7 @@ fi
 
 # 2. fs/elf.ad's recursive load completed — the interpreter base +
 #    entry pair was printed.
-if grep -F -q "dynamic load: interp_base=" "$LOG"; then
+if grep -a -F -q "dynamic load: interp_base=" "$LOG"; then
     echo "[test_u42_dynamic_elf] OK: interpreter loaded at distinct base"
     infra_ok=$((infra_ok + 1))
 else
@@ -230,7 +221,7 @@ else
 fi
 
 # 3. Linux-ABI detection.
-if grep -F -q "Linux-ABI binary detected" "$LOG"; then
+if grep -a -F -q "Linux-ABI binary detected" "$LOG"; then
     echo "[test_u42_dynamic_elf] OK: ELF loader detected Linux-ABI"
     infra_ok=$((infra_ok + 1))
 else

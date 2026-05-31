@@ -23,6 +23,7 @@
 # Fail marker: [test_u_clock] FAIL
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_qemu_drive.sh"
 . "$(dirname "$0")/_ensure_ubin.sh"
 
 set -euo pipefail
@@ -54,22 +55,12 @@ LOG=$(mktemp)
 trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
 
 set +e
-(
-    sleep 4
-    printf 'u_musl_clock\n'
-    sleep 8
-    printf 'exit\n'
-    sleep 1
-) | timeout 50s qemu-system-x86_64 \
-    -kernel "$ELF" \
-    -smp 2 \
-    -nographic \
-    -no-reboot \
-    -m 256M \
-    -monitor none \
-    -serial stdio \
-    > "$LOG" 2>&1
-rc=$?
+# Prompt-aware drive: wait for hamsh's ready banner before sending input
+# (a fixed sleep races boot-time variance -- see _qemu_drive.sh).
+qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 50 \
+    -- "u_musl_clock" 8 \
+       "exit" 1
+rc="$QEMU_DRIVE_RC"
 set -e
 
 echo "[test_u_clock] --- captured output ---"
@@ -81,7 +72,7 @@ fail=0
 check_marker() {
     local label="$1"
     local needle="$2"
-    if grep -F -q "$needle" "$LOG"; then
+    if grep -a -F -q "$needle" "$LOG"; then
         echo "[test_u_clock] OK: $label"
     else
         echo "[test_u_clock] MISS: $label  ('$needle')"
@@ -94,21 +85,21 @@ check_marker "monotonic strictly advanced" "U-clock: monotonic advanced"
 check_marker "sub-jiffy TSC resolution"    "U-clock: hires ok"
 check_marker "CLOCK_REALTIME epoch sane"   "U-clock: realtime ok"
 
-if grep -F -q "U-clock: " "$LOG" && grep -F -q "FAIL" "$LOG"; then
+if grep -a -F -q "U-clock: " "$LOG" && grep -a -F -q "FAIL" "$LOG"; then
     if grep -E -q "U-clock: .* FAIL" "$LOG"; then
         echo "[test_u_clock] DIAG: fixture reported an internal failure"
         grep -E "U-clock: .* FAIL" "$LOG" | head -5 || true
         fail=1
     fi
 fi
-if grep -F -q "unknown syscall" "$LOG"; then
+if grep -a -F -q "unknown syscall" "$LOG"; then
     echo "[test_u_clock] DIAG: unknown syscall(s) logged"
-    grep -F "unknown syscall" "$LOG" | sort -u | head -10 || true
+    grep -a -F "unknown syscall" "$LOG" | sort -u | head -10 || true
     fail=1
 fi
-if grep -F -q "TRAP: vector" "$LOG"; then
+if grep -a -F -q "TRAP: vector" "$LOG"; then
     echo "[test_u_clock] DIAG: kernel reported a CPU exception"
-    grep -F "TRAP: vector" "$LOG" | head -5 || true
+    grep -a -F "TRAP: vector" "$LOG" | head -5 || true
     fail=1
 fi
 

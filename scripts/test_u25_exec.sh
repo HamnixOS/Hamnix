@@ -25,6 +25,7 @@
 #     make -C tests/u-binary/src/glibc_exec  install
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_qemu_drive.sh"
 . "$(dirname "$0")/_ensure_ubin.sh"
 
 set -euo pipefail
@@ -61,22 +62,12 @@ LOG=$(mktemp)
 trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
 
 set +e
-(
-    sleep 3
-    printf 'u_glibc_exec\n'
-    sleep 5
-    printf 'exit\n'
-    sleep 1
-) | timeout 30s qemu-system-x86_64 \
-    -kernel "$ELF" \
-    -smp 2 \
-    -nographic \
-    -no-reboot \
-    -m 256M \
-    -monitor none \
-    -serial stdio \
-    > "$LOG" 2>&1
-rc=$?
+# Prompt-aware drive: wait for hamsh's ready banner before sending input
+# (a fixed sleep races boot-time variance -- see _qemu_drive.sh).
+qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 30 \
+    -- "u_glibc_exec" 5 \
+       "exit" 1
+rc="$QEMU_DRIVE_RC"
 set -e
 
 echo "[test_u25_exec] --- captured output ---"
@@ -88,7 +79,7 @@ fail=0
 check_marker() {
     local label="$1"
     local needle="$2"
-    if grep -F -q "$needle" "$LOG"; then
+    if grep -a -F -q "$needle" "$LOG"; then
         echo "[test_u25_exec] OK: $label  ('$needle')"
     else
         echo "[test_u25_exec] MISS: $label  ('$needle')"
@@ -102,17 +93,17 @@ check_marker "parent ran"     "U25: parent before execve"
 check_marker "execve landed"  "U18: glibc static hello"
 
 # Diagnostics: surface the next-gap signal for triage.
-if grep -F -q "unknown syscall" "$LOG"; then
+if grep -a -F -q "unknown syscall" "$LOG"; then
     echo "[test_u25_exec] DIAG: kernel logged 'unknown syscall'"
-    grep -F "unknown syscall" "$LOG" | sort -u || true
+    grep -a -F "unknown syscall" "$LOG" | sort -u || true
 fi
-if grep -F -q "TRAP: vector" "$LOG"; then
+if grep -a -F -q "TRAP: vector" "$LOG"; then
     echo "[test_u25_exec] DIAG: kernel reported a CPU exception"
-    grep -F "TRAP: vector" "$LOG" | head -5 || true
+    grep -a -F "TRAP: vector" "$LOG" | head -5 || true
 fi
-if grep -F -q "execve" "$LOG"; then
+if grep -a -F -q "execve" "$LOG"; then
     echo "[test_u25_exec] DIAG: execve trace lines"
-    grep -F "execve" "$LOG" | head -10 || true
+    grep -a -F "execve" "$LOG" | head -10 || true
 fi
 
 if [ "$fail" -ne 0 ]; then

@@ -28,6 +28,7 @@
 # test_u_socket.sh).
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_qemu_drive.sh"
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -78,24 +79,15 @@ echo "[test_u_sockopt] boot QEMU"
 # (this test sets/gets options, it never sends a packet). The tcp
 # guestfwd keeps the boot-time net_smoke tcp_connect from stalling.
 set +e
-(
-    sleep 60
-    printf 'u_sockopt\n'
-    sleep 15
-    printf 'exit\n'
-    sleep 2
-) | timeout 240s qemu-system-x86_64 \
-    -kernel "$ELF" \
-    -netdev "user,id=n0,guestfwd=tcp:10.0.2.100:7-cmd:cat" \
-    -device virtio-net-pci,netdev=n0,mac=52:54:00:12:34:56 \
-    -smp 2 \
-    -nographic \
-    -no-reboot \
-    -m 256M \
-    -monitor none \
-    -serial stdio \
-    > "$LOG" 2>&1
-rc=$?
+# Prompt-aware drive: wait for hamsh's ready banner before sending input
+# (a fixed sleep races boot-time variance -- see _qemu_drive.sh). A net
+# device must be present so socket(2) works (no SLIRP traffic needed); pass
+# the virtio-net NIC through qemu_drive's QEMU_EXTRA_ARGS hook.
+QEMU_EXTRA_ARGS='-netdev user,id=n0,guestfwd=tcp:10.0.2.100:7-cmd:cat -device virtio-net-pci,netdev=n0,mac=52:54:00:12:34:56' \
+qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 240 \
+    -- "u_sockopt" 15 \
+       "exit" 2
+rc="$QEMU_DRIVE_RC"
 set -e
 
 echo "[test_u_sockopt] --- captured (sockopt) ---"
@@ -112,7 +104,7 @@ for needle in \
     "sockopt: broadcast ok" \
     "sockopt: PASS"
 do
-    if grep -F -q "$needle" "$LOG"; then
+    if grep -a -F -q "$needle" "$LOG"; then
         echo "[test_u_sockopt] OK: '$needle'"
     else
         echo "[test_u_sockopt] MISS: '$needle'"
@@ -120,9 +112,9 @@ do
     fi
 done
 
-if grep -F -q "TRAP: vector" "$LOG"; then
+if grep -a -F -q "TRAP: vector" "$LOG"; then
     echo "[test_u_sockopt] DIAG: kernel reported a CPU exception"
-    grep -F "TRAP: vector" "$LOG" | head -5 || true
+    grep -a -F "TRAP: vector" "$LOG" | head -5 || true
     fail=1
 fi
 

@@ -24,6 +24,7 @@
 # CI in environments without `musl-tools` keeps moving.
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_qemu_drive.sh"
 . "$(dirname "$0")/_ensure_ubin.sh"
 
 set -euo pipefail
@@ -65,22 +66,12 @@ LOG=$(mktemp)
 trap 'rm -f "$LOG" tests/u-binary/busybox; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
 
 set +e
-(
-    sleep 3
-    printf 'busybox\n'
-    sleep 6
-    printf 'exit\n'
-    sleep 1
-) | timeout 40s qemu-system-x86_64 \
-    -kernel "$ELF" \
-    -smp 2 \
-    -nographic \
-    -no-reboot \
-    -m 256M \
-    -monitor none \
-    -serial stdio \
-    > "$LOG" 2>&1
-rc=$?
+# Prompt-aware drive: wait for hamsh's ready banner before sending input
+# (a fixed sleep races boot-time variance -- see _qemu_drive.sh).
+qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 40 \
+    -- "busybox" 6 \
+       "exit" 1
+rc="$QEMU_DRIVE_RC"
 set -e
 
 echo "[test_u29_busybox] --- captured output (last 200 lines) ---"
@@ -89,25 +80,25 @@ echo "[test_u29_busybox] --- end output ---"
 
 fail=0
 
-if grep -F -q "BusyBox" "$LOG"; then
+if grep -a -F -q "BusyBox" "$LOG"; then
     echo "[test_u29_busybox] OK: busybox banner printed"
 else
     echo "[test_u29_busybox] MISS: no 'BusyBox' marker"
     fail=1
 fi
 
-if grep -F -q "unknown syscall" "$LOG"; then
+if grep -a -F -q "unknown syscall" "$LOG"; then
     echo "[test_u29_busybox] DIAG: unknown syscall(s) logged"
-    grep -F "unknown syscall" "$LOG" | sort -u | head -10 || true
+    grep -a -F "unknown syscall" "$LOG" | sort -u | head -10 || true
 fi
-if grep -F -q "TRAP: vector" "$LOG"; then
+if grep -a -F -q "TRAP: vector" "$LOG"; then
     echo "[test_u29_busybox] DIAG: kernel reported a CPU exception"
-    grep -F "TRAP: vector" "$LOG" | head -5 || true
+    grep -a -F "TRAP: vector" "$LOG" | head -5 || true
     fail=1
 fi
-if grep -F -q "page fault" "$LOG"; then
+if grep -a -F -q "page fault" "$LOG"; then
     echo "[test_u29_busybox] DIAG: page fault"
-    grep -F "page fault" "$LOG" | head -5 || true
+    grep -a -F "page fault" "$LOG" | head -5 || true
 fi
 
 if [ "$fail" -ne 0 ]; then

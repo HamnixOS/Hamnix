@@ -10,6 +10,7 @@
 # isn't staged, the script SKIPs.
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_qemu_drive.sh"
 . "$(dirname "$0")/_ensure_ubin.sh"
 
 set -euo pipefail
@@ -43,22 +44,12 @@ LOG=$(mktemp)
 trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
 
 set +e
-(
-    sleep 3
-    printf 'u_musl_sigaltstack\n'
-    sleep 4
-    printf 'exit\n'
-    sleep 1
-) | timeout 30s qemu-system-x86_64 \
-    -kernel "$ELF" \
-    -smp 2 \
-    -nographic \
-    -no-reboot \
-    -m 256M \
-    -monitor none \
-    -serial stdio \
-    > "$LOG" 2>&1
-rc=$?
+# Prompt-aware drive: wait for hamsh's ready banner before sending input
+# (a fixed sleep races boot-time variance -- see _qemu_drive.sh).
+qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 30 \
+    -- "u_musl_sigaltstack" 4 \
+       "exit" 1
+rc="$QEMU_DRIVE_RC"
 set -e
 
 echo "[test_u37_sigaltstack] --- captured output ---"
@@ -70,7 +61,7 @@ fail=0
 check_marker() {
     local label="$1"
     local needle="$2"
-    if grep -F -q "$needle" "$LOG"; then
+    if grep -a -F -q "$needle" "$LOG"; then
         echo "[test_u37_sigaltstack] OK   $label  ('$needle')"
     else
         echo "[test_u37_sigaltstack] MISS $label  ('$needle')"
@@ -90,22 +81,22 @@ else
     echo "[test_u37_sigaltstack] OK   nr=131: no -ENOSYS noise"
 fi
 
-if grep -F -q "U37: FAIL" "$LOG"; then
+if grep -a -F -q "U37: FAIL" "$LOG"; then
     echo "[test_u37_sigaltstack] DIAG: fixture reported FAIL marker"
     fail=1
 fi
 
-if grep -F -q "TRAP: vector" "$LOG"; then
+if grep -a -F -q "TRAP: vector" "$LOG"; then
     echo "[test_u37_sigaltstack] DIAG: CPU exception observed"
-    grep -F "TRAP: vector" "$LOG" | head -5 || true
+    grep -a -F "TRAP: vector" "$LOG" | head -5 || true
 fi
-if grep -F -q "page fault" "$LOG"; then
+if grep -a -F -q "page fault" "$LOG"; then
     echo "[test_u37_sigaltstack] DIAG: page fault observed"
-    grep -F "page fault" "$LOG" | head -5 || true
+    grep -a -F "page fault" "$LOG" | head -5 || true
 fi
-if grep -F -q "unknown syscall" "$LOG"; then
+if grep -a -F -q "unknown syscall" "$LOG"; then
     echo "[test_u37_sigaltstack] DIAG: remaining unknown syscall lines"
-    grep -F "unknown syscall" "$LOG" | sort -u | head -10 || true
+    grep -a -F "unknown syscall" "$LOG" | sort -u | head -10 || true
 fi
 
 if [ "$fail" -ne 0 ]; then

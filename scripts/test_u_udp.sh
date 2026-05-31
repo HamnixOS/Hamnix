@@ -30,6 +30,7 @@
 # passes — mirrors test_u_socket.sh.
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_qemu_drive.sh"
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -80,24 +81,15 @@ echo "[test_u_udp] boot QEMU with virtio-net + SLIRP DNS"
 # tcp_connect from stalling (see test_u_socket.sh for the rationale).
 # SLIRP's built-in DNS resolver at 10.0.2.2:53 needs no forwarding.
 set +e
-(
-    sleep 60
-    printf 'u_udptest\n'
-    sleep 25
-    printf 'exit\n'
-    sleep 2
-) | timeout 240s qemu-system-x86_64 \
-    -kernel "$ELF" \
-    -netdev "user,id=n0,guestfwd=tcp:10.0.2.100:7-cmd:cat" \
-    -device virtio-net-pci,netdev=n0,mac=52:54:00:12:34:56 \
-    -smp 2 \
-    -nographic \
-    -no-reboot \
-    -m 256M \
-    -monitor none \
-    -serial stdio \
-    > "$LOG" 2>&1
-rc=$?
+# Prompt-aware drive: wait for hamsh's ready banner before sending input
+# (a fixed sleep races boot-time variance -- see _qemu_drive.sh). This
+# fixture needs a SLIRP user-net NIC for sendto() to reach the network, so
+# pass the virtio-net device through qemu_drive's QEMU_EXTRA_ARGS hook.
+QEMU_EXTRA_ARGS='-netdev user,id=n0,guestfwd=tcp:10.0.2.100:7-cmd:cat -device virtio-net-pci,netdev=n0,mac=52:54:00:12:34:56' \
+qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 240 \
+    -- "u_udptest" 25 \
+       "exit" 2
+rc="$QEMU_DRIVE_RC"
 set -e
 
 echo "[test_u_udp] --- captured (udptest / udp / dhcp) ---"
@@ -111,7 +103,7 @@ for needle in \
     "udptest: dns qr ok" \
     "udptest: PASS"
 do
-    if grep -F -q "$needle" "$LOG"; then
+    if grep -a -F -q "$needle" "$LOG"; then
         echo "[test_u_udp] OK: '$needle'"
     else
         echo "[test_u_udp] MISS: '$needle'"
@@ -119,9 +111,9 @@ do
     fi
 done
 
-if grep -F -q "TRAP: vector" "$LOG"; then
+if grep -a -F -q "TRAP: vector" "$LOG"; then
     echo "[test_u_udp] DIAG: kernel reported a CPU exception"
-    grep -F "TRAP: vector" "$LOG" | head -5 || true
+    grep -a -F "TRAP: vector" "$LOG" | head -5 || true
     fail=1
 fi
 

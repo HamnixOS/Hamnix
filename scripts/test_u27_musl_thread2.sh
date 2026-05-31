@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_qemu_drive.sh"
 . "$(dirname "$0")/_ensure_ubin.sh"
 
 set -euo pipefail
@@ -22,19 +23,17 @@ python3 -m compiler.adder compile --target=x86_64-bare-metal init/main.ad -o "$E
 LOG=$(mktemp)
 trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
 
-(
-    sleep 3
-    printf 'u_musl_thread2\n'
-    sleep 8
-    printf 'exit\n'
-    sleep 1
-) | timeout 20s qemu-system-x86_64 -kernel "$ELF" -smp 2 -nographic -no-reboot -m 256M -monitor none -serial stdio > "$LOG" 2>&1 || true
+# Prompt-aware drive: wait for hamsh's ready banner before sending input
+# (a fixed sleep races boot-time variance -- see _qemu_drive.sh).
+qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 20 \
+    -- "u_musl_thread2" 8 \
+       "exit" 1
 
 echo "[test_u27_musl_thread2] --- captured ---"
 cat "$LOG"
 echo "[test_u27_musl_thread2] --- end ---"
 
-if grep -F -q "U27.2: thread" "$LOG" && grep -F -q "U27.2: main done" "$LOG"; then
+if grep -a -F -q "U27.2: thread" "$LOG" && grep -a -F -q "U27.2: main done" "$LOG"; then
     echo "[test_u27_musl_thread2] PASS"
 else
     echo "[test_u27_musl_thread2] FAIL"
