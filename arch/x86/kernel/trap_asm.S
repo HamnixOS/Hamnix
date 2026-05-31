@@ -164,13 +164,22 @@ trap_diag_stub_0e:
      *  120: error_code
      *  128: RIP ...                                                    */
 
-    /* do_page_fault(error_code, fault_va, faulting_cr3).
+    /* do_page_fault(error_code, fault_va, faulting_cr3, iret_frame).
      *   %rdi = error_code   (at 120(%rsp))
      *   %rsi = CR2          (faulting linear address)
-     *   %rdx = CR3          (the faulting task's PML4)                 */
+     *   %rdx = CR3          (the faulting task's PML4)
+     *   %rcx = &iret_frame  (address of the CPU-pushed RIP slot, i.e.
+     *                        128(%rsp) at this point: RIP / CS / RFLAGS
+     *                        / RSP_user / SS in ascending quads). W^X
+     *                        Stage 1a: an NX instruction-fetch SIGSEGV
+     *                        is delivered to a USER handler by rewriting
+     *                        this frame in place (RIP->trampoline,
+     *                        RSP_user->signal frame), so the iretq below
+     *                        lands in the handler instead of halting.   */
     movq    120(%rsp), %rdi
     movq    %cr2, %rsi
     movq    %cr3, %rdx
+    leaq    128(%rsp), %rcx
 
     /* Park the pre-call RSP in %rbx — a SysV callee-saved register, so
      * do_page_fault is contractually required to preserve it. (%rbx is
@@ -184,8 +193,9 @@ trap_diag_stub_0e:
     movq    %rbx, %rsp
 
     /* do_page_fault returned in %rax:
-     *   1  -> COW fault resolved; restore GPRs and iretq.
-     *   else -> not a COW fault (or OOM); fall through to the
+     *   1  -> COW / demand fault resolved (or a user SIGSEGV handler
+     *         was staged into the iret frame); restore GPRs and iretq.
+     *   else -> not a recoverable fault (or OOM); fall through to the
      *           diagnostic halt path.                                  */
     cmpq    $1, %rax
     jne     1f

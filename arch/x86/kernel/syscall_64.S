@@ -207,6 +207,22 @@ set_efer_sce:
     wrmsr
     ret
 
+/* ---------- set_efer_nxe: enable No-Execute (NX) -------------------- *
+ * W^X Stage 1a. IA32_EFER.NXE = bit 11 (0x800). MUST be set on a CPU
+ * BEFORE any PTE with bit 63 (NX) is loaded on that CPU — with NXE off,
+ * bit 63 is a RESERVED bit and a load faults (#PF, RSVD set). The BSP
+ * flips this in syscall_init (Adder side); each AP flips it in the
+ * realmode trampoline alongside EFER.LME, so it is on before the AP
+ * ever runs a user task carrying an NX data page. */
+    .align 16
+    .globl set_efer_nxe
+set_efer_nxe:
+    movl    $0xC0000080, %ecx          /* IA32_EFER */
+    rdmsr
+    orl     $(1 << 11), %eax           /* bit 11 = NXE (No-Execute Enable) */
+    wrmsr
+    ret
+
 /* ---------- do_execve_finish(new_rip, new_rsp, argc, argv) -------- *
  * Tail-call from the SYS_EXECVE handler when it has loaded a new ELF
  * and wants to "become" that program. We never return through the

@@ -83,10 +83,15 @@ ap_trampoline_pm:
     orl     $(1 << 9) | (1 << 10), %eax
     movl    %eax, %cr4
 
-    /* Enable long-mode in EFER (EFER.LME = bit 8 of MSR 0xC0000080). */
+    /* Enable long-mode in EFER (EFER.LME = bit 8 of MSR 0xC0000080).
+     * W^X Stage 1a: also set EFER.NXE (bit 11) so this AP can load PTEs
+     * with bit 63 (NX) set without taking a reserved-bit #PF. NXE must
+     * be live before paging is enabled / any user NX data page is
+     * mapped on this CPU — folding it into the same wrmsr as LME does
+     * exactly that. */
     movl    $0xC0000080, %ecx
     rdmsr
-    orl     $(1 << 8), %eax
+    orl     $(1 << 8) | (1 << 11), %eax
     wrmsr
 
     /* Enable paging — turns on long-mode since LME was set. */
