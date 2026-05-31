@@ -82,3 +82,34 @@ get_per_cpu_size:
     leaq    __per_cpu_template_start_word(%rip), %rcx
     subq    (%rcx), %rax
     ret
+
+/* ---------- Linux-ABI current_task per-CPU offset ----------------
+ * linux_current_task_offset() returns the byte OFFSET of the
+ * `linux_current_task_pcpu` slot within the per-CPU area — i.e.
+ * (&linux_current_task_pcpu - __per_cpu_template_start). The codegen
+ * emits `linux_current_task_pcpu` as a .globl whose link-time VALUE is
+ * its VMA inside the .data..percpu template, and the template's base is
+ * __per_cpu_template_start, so the difference is exactly the per-CPU
+ * displacement the CPU adds to GS_base.
+ *
+ * The L-series loader (linux_abi/loader.ad) resolves a stock module's
+ * R_X86_64_32S relocation against the `current_task` symbol to THIS
+ * offset, so `mov %gs:offset,%rax` lands on the slot we seeded with a
+ * dummy task_struct pointer. */
+    .section .rodata
+    .align 8
+__linux_current_task_pcpu_word:
+    .quad linux_current_task_pcpu
+__per_cpu_template_start_word2:
+    .quad __per_cpu_template_start
+
+    .section .text, "ax"
+
+    .align 16
+    .globl linux_current_task_offset
+linux_current_task_offset:
+    leaq    __linux_current_task_pcpu_word(%rip), %rax
+    movq    (%rax), %rax
+    leaq    __per_cpu_template_start_word2(%rip), %rcx
+    subq    (%rcx), %rax
+    ret
