@@ -41,20 +41,75 @@ can't recur.
 
 ## Still stubbed (out of scope for "framework loads cleanly")
 
-The 205 shims are framework scaffolding — `wiphy_new`, `wiphy_register`,
+The 205 framework shims are scaffolding — `wiphy_new`, `wiphy_register`,
 `ieee80211_alloc_hw`, `cfg80211_inform_bss_data`, `rfkill_alloc`,
 regulatory-domain notification, etc. They are honest no-op /
 `-ENOSYS` / NULL-returning stubs that let the modules' `init_module`
-complete. Bringing up an actual radio (`iwlwifi.ko`, `ath11k.ko`,
-`mt76.ko`) on top will surface the next set of contracts that need real
-implementations (scan, beacon-loss, regulatory worker, ...). That's a
-follow-up task, not a regression of the framework load path.
+complete. Bringing up an actual radio on real hardware will surface the
+next set of contracts (scan, auth, association, beacon-loss, regulatory
+worker, firmware download, DMA ring setup) — that's a follow-up task,
+not a regression of the load path.
 
-## Acceptance (re-verified 2026-05-25)
+## iwlwifi.ko radio harvest — RESOLVED (2026-05-30)
 
-| test                              | result   | relocations           |
-|-----------------------------------|----------|-----------------------|
+`kernel-modules/iwlwifi/iwlwifi.ko` (Intel wireless PCI driver, Debian
+6.1.0-32 build) now loads cleanly on top of cfg80211 + mac80211.
+
+### What was needed
+
+`nm -u iwlwifi.ko` against the existing shim union left 18 unresolved
+symbols. All 18 are now shimmed in `linux_abi/api_iwlwifi.ad`:
+
+| Group | Symbols | Shim approach |
+|---|---|---|
+| percpu | `__alloc_percpu` | kzalloc single-slot (same as mac80211's `__alloc_percpu_gfp`) |
+| stdlib | `bsearch` | return NULL (no firmware table at init) |
+| device diag | `dev_coredumpsg`, `_dev_crit` | no-op / return 0 |
+| devres DMA pool | `dmam_pool_create` | return kzalloc(64) sentinel |
+| EFI DATA | `efi` | 64-byte zeroed BSS slot |
+| firmware | `firmware_request_nowarn` | return -ENOENT |
+| dummy netdev | `init_dummy_netdev` | return 0 |
+| PCI hotplug | `pci_dev_get`, `pci_find_ext_capability`, `pci_lock_rescan_remove`, `pci_stop_and_remove_bus_device`, `pci_unlock_rescan_remove` | return dev / 0 / no-op |
+| regulatory | `reg_query_regdb_wmm` | return -ENOENT |
+| SG | `sg_nents` | return 0 |
+| TSO | `tso_start`, `tso_build_hdr`, `tso_build_data` | return 0 / no-op |
+
+### Load path
+
+`ENABLE_FRAMEWORK_MODULES=1` + `ENABLE_IWLWIFI_KO=1` plants
+`/etc/framework-modules` + `/etc/iwlwifi-ko`. init/main.ad's
+`[boot:35.F]` block loads cfg80211.ko then mac80211.ko; the new
+`[boot:35.W]` block then loads iwlwifi.ko.
+
+### Result
+
+```
+[boot:35.W] iwlwifi.ko harvest: loading Intel wifi driver
+[iwlwifi.ko] loading 797899 bytes from 0xffffffff816ca90c
+kmod_linux: vermagic=6.1.0-32-amd64 SMP preempt mod_unload modversions
+kmod_linux: relocations applied=11670 skipped=0
+kmod_linux: init_module @ ... — calling
+kmod_linux: init returned 0; slot=3
+[iwlwifi.ko] kmod_linux_load OK (slot=3)
+```
+
+### What is still stubbed
+
+All 18 new shims + the 205 framework shims are honest no-ops. No real
+PCIe/firmware/DMA radio bring-up is performed. The next milestones are:
+- firmware download (request_firmware chain): staging iwlwifi-*.ucode
+  blobs in the initramfs so `request_firmware()` resolves to a real blob
+- PCI device probe: wiring up the pci_driver.probe callback path so
+  iwlwifi's `iwl_pci_probe` actually runs against a QEMU Intel wifi
+  PCI device (e.g. `-device intel-wifi` when QEMU supports it)
+- DMA ring setup + interrupt wiring: beyond the load-only scope
+
+## Acceptance (re-verified 2026-05-30)
+
+| test                              | result   | relocations               |
+|-----------------------------------|----------|---------------------------|
 | `scripts/test_cfg80211_ko.sh`     | PASS     | `applied=41771 skipped=0` |
 | `scripts/test_mac80211_ko.sh`     | PASS     | `applied=43566 skipped=0` |
+| `scripts/test_iwlwifi_ko.sh`      | PASS     | `applied=11670 skipped=0` |
 | `scripts/test_e1000e_tx.sh`       | PASS     | `applied=12247 skipped=0` |
-| `scripts/test_iso_qemu.sh`        | PASS     | BIOS + UEFI banner    |
+| `scripts/test_iso_qemu.sh`        | PASS     | BIOS + UEFI banner        |
