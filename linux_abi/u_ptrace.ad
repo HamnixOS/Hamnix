@@ -1,0 +1,412 @@
+# linux_abi/u_ptrace.ad — Linux ptrace(2) for Hamnix's Linux-ABI layer.
+#
+# #147 ("strace credibility"). Implements just enough of ptrace(2) +
+# the syscall-enter/exit STOP machinery for a real strace to trace a
+# stock Linux ELF binary running under Hamnix's Linux-ABI shim.
+#
+# ARCHITECTURE
+#
+# Both the tracer (strace) and the tracee are Linux ELF binaries. Every
+# Linux syscall a tracee makes funnels through ONE choke point —
+# linux_u_syscall_dispatch in u_syscalls.ad — and that wrapper calls
+#   ptrace_syscall_enter_stop(nr)    before the real handler runs, and
+#   ptrace_syscall_exit_stop(rc)     after it returns.
+# When the tracee is being traced AND the tracer asked for syscall
+# stops (PTRACE_SYSCALL), each of those points parks the tracee in a
+# cooperative stop: it snapshots its own user_regs_struct into per-task
+# kernel storage, raises a ptrace stop that the tracer observes via
+# waitpid (WIFSTOPPED / SIGTRAP[|0x80]), and spins yield_to_others()
+# until the tracer issues the next PTRACE_CONT / PTRACE_SYSCALL.
+#
+# There is NO preemption — the stop is a cooperative yield loop, exactly
+# like the rest of Hamnix's blocking syscalls. The tracee stays
+# STATE_RUNNING (it is the one yielding); the tracer's wait4 detects the
+# stop by reading the tracee's pt_stop_state, not by a STATE_STOPPED
+# transition (that keeps the schedule()/halt edge cases out of play).
+#
+# The whole feature is LAYER-2-ONLY: every entry point here is reached
+# only when is_linux_userspace != 0, and core.ad never statically
+# depends on this module — it exposes plain get/set accessors that we
+# call, mirroring the cleartid_wake_hook one-directional rule.
+
+from kernel.printk.printk import printk0, printk1, printk2
+from kernel.sched.core import (
+    current_task_pid, current_idx_get, task_lookup_by_pid,
+    task_pid_at, task_state, yield_to_others, set_current_errstr,
+    task_parent_pid,
+    STATE_FREE, STATE_EXITED,
+    get_task_pt_tracer_pid, set_task_pt_tracer_pid,
+    get_task_pt_traced, set_task_pt_traced,
+    get_task_pt_stop_state, set_task_pt_stop_state,
+    get_task_pt_options, set_task_pt_options,
+    get_task_pt_resume_req, set_task_pt_resume_req,
+    get_task_pt_in_syscall, set_task_pt_in_syscall,
+    get_task_pt_stop_reported, set_task_pt_stop_reported,
+    get_task_pt_reg, set_task_pt_reg,
+    saved_user_rip_ptr, saved_user_rsp_ptr, saved_user_rflags_ptr,
+    saved_user_nr_ptr,
+    saved_user_arg0_ptr, saved_user_arg1_ptr, saved_user_arg2_ptr,
+    saved_user_arg3_ptr, saved_user_arg4_ptr, saved_user_arg5_ptr,
+)
+
+# --- ptrace request numbers (Linux <sys/ptrace.h>) --------------------
+PTRACE_TRACEME:    uint64 = 0
+PTRACE_PEEKTEXT:   uint64 = 1
+PTRACE_PEEKDATA:   uint64 = 2
+PTRACE_POKETEXT:   uint64 = 4
+PTRACE_POKEDATA:   uint64 = 5
+PTRACE_CONT:       uint64 = 7
+PTRACE_GETREGS:    uint64 = 12
+PTRACE_SETREGS:    uint64 = 13
+PTRACE_ATTACH:     uint64 = 16
+PTRACE_DETACH:     uint64 = 17
+PTRACE_SYSCALL:    uint64 = 24
+PTRACE_SETOPTIONS: uint64 = 0x4200
+
+# PTRACE_O_TRACESYSGOOD: report syscall stops as SIGTRAP|0x80 so the
+# tracer can tell them apart from a genuine SIGTRAP.
+PTRACE_O_TRACESYSGOOD: uint64 = 1
+
+# pt_stop_state values (mirror core.ad's documentation).
+PT_STOP_NONE:   uint64 = 0
+PT_STOP_ENTER:  uint64 = 1
+PT_STOP_EXIT:   uint64 = 2
+PT_STOP_SIGNAL: uint64 = 3
+
+# pt_resume_req values.
+PT_RESUME_NONE:    uint64 = 0
+PT_RESUME_CONT:    uint64 = 1
+PT_RESUME_SYSCALL: uint64 = 2
+
+# errnos (subset; values from <asm-generic/errno.h>).
+EPT_SRCH:  int64 = -3       # ESRCH  — no such traced process
+EPT_IO:    int64 = -5       # EIO    — bad request / unreadable address
+EPT_PERM:  int64 = -1       # EPERM  — not permitted (already traced, etc.)
+EPT_INVAL: int64 = -22      # EINVAL
+
+# --- user_regs_struct layout (x86_64) ---------------------------------
+# Canonical field order of `struct user_regs_struct` from
+# <sys/user.h>; each is one uint64. We snapshot into pt_regs[] at the
+# stop point and PTRACE_GETREGS copies the array out to the tracer's
+# buffer verbatim. The orig_rax slot carries the syscall number — this
+# is what strace decodes.
+UREG_R15:      uint64 = 0
+UREG_R14:      uint64 = 1
+UREG_R13:      uint64 = 2
+UREG_R12:      uint64 = 3
+UREG_RBP:      uint64 = 4
+UREG_RBX:      uint64 = 5
+UREG_R11:      uint64 = 6
+UREG_R10:      uint64 = 7
+UREG_R9:       uint64 = 8
+UREG_R8:       uint64 = 9
+UREG_RAX:      uint64 = 10
+UREG_RCX:      uint64 = 11
+UREG_RDX:      uint64 = 12
+UREG_RSI:      uint64 = 13
+UREG_RDI:      uint64 = 14
+UREG_ORIG_RAX: uint64 = 15
+UREG_RIP:      uint64 = 16
+UREG_CS:       uint64 = 17
+UREG_EFLAGS:   uint64 = 18
+UREG_RSP:      uint64 = 19
+UREG_SS:       uint64 = 20
+UREG_FS_BASE:  uint64 = 21
+UREG_GS_BASE:  uint64 = 22
+UREG_DS:       uint64 = 23
+UREG_ES:       uint64 = 24
+UREG_FS:       uint64 = 25
+UREG_GS:       uint64 = 26
+
+# x86_64 user-mode selectors (matches syscall_64.S's sysret CS/SS).
+PT_USER_CS: uint64 = 0x33
+PT_USER_SS: uint64 = 0x2B
+
+
+def _pt_snapshot_regs(slot: uint64, retval: uint64, have_ret: int32):
+    # Capture the CURRENT task's user register frame into its pt_regs[]
+    # snapshot. MUST be called from the tracee's own context (the saved_
+    # user_* accessors read current_idx_pcpu's trap frame). `retval` is
+    # only meaningful on a syscall-EXIT stop (have_ret==1) — on entry the
+    # syscall hasn't run, so RAX still holds the orig syscall nr.
+    nr:    uint64 = saved_user_nr_ptr()[0]
+    a0:    uint64 = saved_user_arg0_ptr()[0]
+    a1:    uint64 = saved_user_arg1_ptr()[0]
+    a2:    uint64 = saved_user_arg2_ptr()[0]
+    a3:    uint64 = saved_user_arg3_ptr()[0]
+    a4:    uint64 = saved_user_arg4_ptr()[0]
+    a5:    uint64 = saved_user_arg5_ptr()[0]
+    rip:   uint64 = saved_user_rip_ptr()[0]
+    rflag: uint64 = saved_user_rflags_ptr()[0]
+    # syscall_64.S parks (user_rsp - 8) — undo the pushq %r12 so the
+    # tracer sees the natural user RSP, matching what GETREGS reports on
+    # real Linux at a syscall stop.
+    rsp:   uint64 = saved_user_rsp_ptr()[0] + 8
+
+    set_task_pt_reg(slot, UREG_ORIG_RAX, nr)
+    # orig_rax always holds the syscall nr; rax holds the return value on
+    # exit, or (by Linux convention) -ENOSYS on entry. strace keys off
+    # orig_rax for the name and rax for the result.
+    if have_ret != 0:
+        set_task_pt_reg(slot, UREG_RAX, retval)
+    else:
+        set_task_pt_reg(slot, UREG_RAX, cast[uint64](-38))   # -ENOSYS
+    set_task_pt_reg(slot, UREG_RDI, a0)
+    set_task_pt_reg(slot, UREG_RSI, a1)
+    set_task_pt_reg(slot, UREG_RDX, a2)
+    set_task_pt_reg(slot, UREG_R10, a3)
+    set_task_pt_reg(slot, UREG_R8,  a4)
+    set_task_pt_reg(slot, UREG_R9,  a5)
+    set_task_pt_reg(slot, UREG_RIP, rip)
+    set_task_pt_reg(slot, UREG_RSP, rsp)
+    set_task_pt_reg(slot, UREG_EFLAGS, rflag)
+    set_task_pt_reg(slot, UREG_CS, PT_USER_CS)
+    set_task_pt_reg(slot, UREG_SS, PT_USER_SS)
+    # The callee-saved GPRs (rbx/rbp/r12..r15) and segment bases are NOT
+    # spilled by the SYSCALL entry stub (the x86_64 SYSCALL ABI declares
+    # them caller-preserved across the syscall, so the dispatch path
+    # never saves them). We report 0 for them — strace's syscall decode
+    # only consults orig_rax + the six arg regs + rax, all of which ARE
+    # faithful. This mirrors the same fidelity tradeoff the signal-
+    # delivery ucontext already documents.
+
+
+def _pt_do_stop(stop_kind: uint64, retval: uint64, have_ret: int32):
+    # Park the CURRENT (tracee) task at a ptrace stop until the tracer
+    # resumes it. Snapshots regs, raises the stop, then cooperatively
+    # yields until pt_resume_req is set by a PTRACE_CONT / PTRACE_SYSCALL
+    # from the tracer (which runs the moment we yield to it).
+    slot: uint64 = current_idx_get()
+    _pt_snapshot_regs(slot, retval, have_ret)
+    set_task_pt_stop_state(slot, stop_kind)
+    set_task_pt_stop_reported(slot, 0)
+    set_task_pt_resume_req(slot, PT_RESUME_NONE)
+    # Spin until the tracer issues a resume. yield_to_others rotates to
+    # the tracer (blocked in wait4), which reports the stop and then
+    # issues the resume request — at which point we fall through.
+    while get_task_pt_resume_req(slot) == PT_RESUME_NONE:
+        yield_to_others()
+    # Resumed. Clear the stop; the resume kind stays in pt_resume_req so
+    # the enter/exit wrap can decide whether to stop again next syscall.
+    set_task_pt_stop_state(slot, PT_STOP_NONE)
+
+
+def ptrace_syscall_enter_stop(nr: uint64):
+    # Called by linux_u_syscall_dispatch BEFORE running the real handler.
+    # If the current task is traced and the tracer last asked for syscall
+    # stops (PTRACE_SYSCALL), park at a syscall-ENTER stop. Marks
+    # pt_in_syscall so the matching exit wrap fires.
+    slot: uint64 = current_idx_get()
+    if get_task_pt_traced(slot) == 0:
+        return
+    # ptrace(2) is itself a syscall the tracer makes ON the tracee's
+    # behalf — but a TRACEME tracee never calls ptrace again, so no
+    # special-casing of nr is needed here. We only stop when the tracer
+    # last requested PTRACE_SYSCALL. A PTRACE_CONT tracee runs through.
+    if get_task_pt_resume_req(slot) != PT_RESUME_SYSCALL:
+        return
+    set_task_pt_in_syscall(slot, 1)
+    _pt_do_stop(PT_STOP_ENTER, 0, 0)
+
+
+def ptrace_syscall_exit_stop(rc: int64) -> int64:
+    # Called by linux_u_syscall_dispatch AFTER the real handler returns,
+    # with the handler's return value. If we entered via a syscall-enter
+    # stop (pt_in_syscall set) and the tracer wants syscall stops, park
+    # at a syscall-EXIT stop reporting rc in the rax slot. Returns rc
+    # unchanged (a future SETREGS-on-exit could rewrite it).
+    slot: uint64 = current_idx_get()
+    if get_task_pt_traced(slot) == 0:
+        return rc
+    if get_task_pt_in_syscall(slot) == 0:
+        return rc
+    set_task_pt_in_syscall(slot, 0)
+    if get_task_pt_resume_req(slot) != PT_RESUME_SYSCALL:
+        return rc
+    _pt_do_stop(PT_STOP_EXIT, cast[uint64](rc), 1)
+    return rc
+
+
+def _pt_validate_tracee(req: uint64, pid: uint64) -> int32:
+    # Resolve `pid` to a live task slot and verify the caller is its
+    # tracer. Returns the slot on success, or a negative errno cast to
+    # int32 sentinel handling is done by the caller via a separate
+    # path — here we just return -1 on any failure and let the caller
+    # emit ESRCH. TRACEME (req 0) takes no pid and never calls this.
+    tslot: int32 = task_lookup_by_pid(pid)
+    if tslot < 0:
+        return -1
+    su: uint64 = cast[uint64](tslot)
+    st: uint64 = task_state(tslot)
+    if st == STATE_FREE or st == STATE_EXITED:
+        return -1
+    if get_task_pt_traced(su) == 0:
+        return -1
+    if get_task_pt_tracer_pid(su) != current_task_pid():
+        return -1
+    return tslot
+
+
+def _pt_peek(tslot: int32, addr: uint64, data_out: uint64) -> int64:
+    # PTRACE_PEEKTEXT/PEEKDATA: read one word from the tracee's address
+    # space. Hamnix runs ET_DYN Linux binaries identity-mapped, so a
+    # tracee user VA is directly dereferenceable from kernel context for
+    # the common case. We copy the word into *data_out (glibc-style API:
+    # ptrace stores the result through the 4th arg) AND return it; musl-
+    # style callers read the return value. A NULL addr is rejected.
+    if addr == 0:
+        return EPT_IO
+    word: uint64 = cast[Ptr[uint64]](addr)[0]
+    if data_out != 0:
+        cast[Ptr[uint64]](data_out)[0] = word
+    return cast[int64](word)
+
+
+def _pt_poke(tslot: int32, addr: uint64, data: uint64) -> int64:
+    # PTRACE_POKETEXT/POKEDATA: write one word into the tracee's address
+    # space. Same identity-mapped assumption as peek.
+    if addr == 0:
+        return EPT_IO
+    cast[Ptr[uint64]](addr)[0] = data
+    return 0
+
+
+def _pt_getregs(tslot: int32, uregs: uint64) -> int64:
+    # PTRACE_GETREGS: copy the tracee's captured user_regs_struct (27
+    # uint64 == 216 bytes) into the tracer's buffer at `uregs`. The
+    # snapshot was taken by the tracee at its current stop.
+    if uregs == 0:
+        return EPT_IO
+    su: uint64 = cast[uint64](tslot)
+    dst: Ptr[uint64] = cast[Ptr[uint64]](uregs)
+    i: uint64 = 0
+    while i < 27:
+        dst[i] = get_task_pt_reg(su, i)
+        i = i + 1
+    return 0
+
+
+def _pt_setregs(tslot: int32, uregs: uint64) -> int64:
+    # PTRACE_SETREGS: copy the tracer's user_regs_struct into the
+    # tracee's snapshot. The snapshot is replayed into the live trap
+    # frame only for the slots the SYSCALL entry stub actually restores
+    # (orig_rax/args/rip/rsp/rflags) — done lazily by the tracee on
+    # resume is out of scope; here we update the snapshot so a follow-up
+    # GETREGS is consistent. Faithful live-frame rewrite of arbitrary
+    # GPRs would need the entry stub to spill them, which it doesn't, so
+    # this is a best-effort that keeps strace's occasional SETREGS happy.
+    if uregs == 0:
+        return EPT_IO
+    su: uint64 = cast[uint64](tslot)
+    src: Ptr[uint64] = cast[Ptr[uint64]](uregs)
+    i: uint64 = 0
+    while i < 27:
+        set_task_pt_reg(su, i, src[i])
+        i = i + 1
+    return 0
+
+
+def _pt_resume(tslot: int32, kind: uint64) -> int64:
+    # Shared body for PTRACE_CONT / PTRACE_SYSCALL / PTRACE_DETACH. Sets
+    # the tracee's resume request, which its _pt_do_stop loop reads to
+    # leave the stop on its next scheduling slice. We do NOT yield here —
+    # the tracer returns to its own waitpid, which yields to the tracee.
+    su: uint64 = cast[uint64](tslot)
+    if get_task_pt_stop_state(su) == PT_STOP_NONE:
+        # Not currently stopped — resuming a running tracee is a no-op
+        # but not an error (matches Linux returning 0 for a benign race).
+        set_task_pt_resume_req(su, kind)
+        return 0
+    set_task_pt_resume_req(su, kind)
+    return 0
+
+
+def _u_ptrace(a0: uint64, a1: uint64, a2: uint64,
+              a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # long ptrace(enum __ptrace_request request, pid_t pid,
+    #             void *addr, void *data)
+    #   a0 = request, a1 = pid, a2 = addr, a3 = data
+    req:  uint64 = a0
+    pid:  uint64 = a1
+    addr: uint64 = a2
+    data: uint64 = a3
+
+    # PTRACE_TRACEME: the CHILD declares itself traced by its parent.
+    # No pid argument. Records the parent's pid as the tracer and arms
+    # the traced flag; the first syscall the child then makes will honour
+    # the tracer's PTRACE_SYSCALL requests.
+    if req == PTRACE_TRACEME:
+        slot: uint64 = current_idx_get()
+        if get_task_pt_traced(slot) != 0:
+            return EPT_PERM          # already traced
+        # Our tracer is our parent. Use the parent_pid recorded at fork.
+        ppid: uint64 = task_parent_pid(cast[int32](slot))
+        set_task_pt_tracer_pid(slot, ppid)
+        set_task_pt_traced(slot, 1)
+        set_task_pt_options(slot, 0)
+        set_task_pt_stop_state(slot, PT_STOP_NONE)
+        # Default to "stop at next syscall" so the first PTRACE_SYSCALL
+        # from the tracer lines up with the child's next syscall — but
+        # the canonical flow has the tracer drive each step, so we start
+        # with no resume pending (the child runs until the tracer's
+        # first PTRACE_SYSCALL). We arm SYSCALL stops by default so a
+        # child that continues straight into its workload gets caught at
+        # its very first syscall even before the tracer's first resume.
+        set_task_pt_resume_req(slot, PT_RESUME_SYSCALL)
+        printk1("ptrace: TRACEME pid=%d armed\n",
+                cast[int32](current_task_pid()))
+        return 0
+
+    # PTRACE_ATTACH: the tracer attaches to an already-running tracee by
+    # pid. We record the relationship and arm syscall stops; a faithful
+    # implementation would also inject a stop NOW, but our cooperative
+    # tracees stop at their next syscall, which is sufficient for strace
+    # of a freshly-spawned target. The classic strace flow uses TRACEME
+    # + exec, not ATTACH, so this is the rounding-out path.
+    if req == PTRACE_ATTACH:
+        tslot: int32 = task_lookup_by_pid(pid)
+        if tslot < 0:
+            set_current_errstr("ptrace: attach: no such pid")
+            return EPT_SRCH
+        su: uint64 = cast[uint64](tslot)
+        if get_task_pt_traced(su) != 0:
+            return EPT_PERM
+        set_task_pt_tracer_pid(su, current_task_pid())
+        set_task_pt_traced(su, 1)
+        set_task_pt_options(su, 0)
+        set_task_pt_resume_req(su, PT_RESUME_SYSCALL)
+        return 0
+
+    # Every other request operates on an existing tracee we own.
+    tslot2: int32 = _pt_validate_tracee(req, pid)
+    if tslot2 < 0:
+        set_current_errstr("ptrace: no such traced process")
+        return EPT_SRCH
+
+    if req == PTRACE_PEEKTEXT or req == PTRACE_PEEKDATA:
+        return _pt_peek(tslot2, addr, data)
+    if req == PTRACE_POKETEXT or req == PTRACE_POKEDATA:
+        return _pt_poke(tslot2, addr, data)
+    if req == PTRACE_GETREGS:
+        return _pt_getregs(tslot2, data)
+    if req == PTRACE_SETREGS:
+        return _pt_setregs(tslot2, data)
+    if req == PTRACE_SETOPTIONS:
+        set_task_pt_options(cast[uint64](tslot2), data)
+        return 0
+    if req == PTRACE_CONT:
+        return _pt_resume(tslot2, PT_RESUME_CONT)
+    if req == PTRACE_SYSCALL:
+        return _pt_resume(tslot2, PT_RESUME_SYSCALL)
+    if req == PTRACE_DETACH:
+        su2: uint64 = cast[uint64](tslot2)
+        set_task_pt_traced(su2, 0)
+        set_task_pt_tracer_pid(su2, 0)
+        set_task_pt_stop_state(su2, PT_STOP_NONE)
+        # Let it run free.
+        set_task_pt_resume_req(su2, PT_RESUME_CONT)
+        return 0
+
+    # Unsupported request — fail this one and let the tracer press on.
+    set_current_errstr("ptrace: unsupported request")
+    return EPT_IO
