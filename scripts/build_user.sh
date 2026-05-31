@@ -202,3 +202,11 @@ python3 -m compiler.adder compile \
     adder/compiler/lex_selftest.ad \
     -o build/user/lex_selftest.elf
 file build/user/lex_selftest.elf
+
+# --- Self-hosting milestone: Adder-in-Adder parser -------------------
+echo "[build_user] compiling adder/compiler/parse_selftest.ad -> build/user/parse_selftest.elf"
+python3 -m compiler.adder compile \
+    --target=x86_64-adder-user \
+    adder/compiler/parse_selftest.ad \
+    -o build/user/parse_selftest.elf
+file build/user/parse_selftest.elf
