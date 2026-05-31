@@ -1,0 +1,428 @@
+# adder/compiler/codegen.ad
+#
+# Adder-in-Adder implementation of (a usable subset of) the x86_64 code
+# generator. This is the THIRD self-hosting milestone (lexer and parser
+# were the first two): the Adder compiler's own x86_64 backend, rewritten
+# IN Adder, consuming the AST that compiler/parser.ad produces and
+# emitting raw x86_64 machine-code bytes.
+#
+# The authoritative spec for the opcode encodings is
+# compiler/codegen_x86.py — that file emits System V AMD64 GNU `as`
+# AT&T-syntax assembly; this file emits the SAME instruction sequences
+# but assembles them straight to bytes (no external assembler), so the
+# device can build native code with no toolchain.
+#
+# Design constraints (Adder/bare-metal — same as lexer.ad / parser.ad):
+#   - No dynamic allocation: all storage is global fixed arrays.
+#   - Output: a flat global byte buffer (code[]) with a length counter.
+#   - The codegen reads the parser's global AST arena (nd_kind, nd_aux,
+#     nd_num, nd_a, nd_b, nd_c, nd_next, nd_name_off/len) directly, since
+#     both are single-instance global modules.
+#
+# Subset covered (a small but REAL slice of codegen_x86.py):
+#   * ND_FUNCTION  — prologue (endbr64; push %rbp; mov %rsp,%rbp;
+#                    sub $frame,%rsp), parameter spill from arg regs into
+#                    stack slots, epilogue (leave; ret).
+#   * ND_RETURN    — evaluate the value expr into %rax, then leave; ret.
+#   * ND_INT_LIT   — movq $imm, %rax (32-bit-immediate form).
+#   * ND_IDENT     — load a parameter/local from its %rbp-relative slot.
+#   * ND_BINARY    — ADD / SUB / MUL via the same right-push / left /
+#                    pop-%rcx stack-machine lowering codegen_x86.py uses:
+#                      addq %rcx,%rax  /  subq %rcx,%rax  /  imulq %rcx,%rax
+#
+# Calling convention (System V AMD64, mirroring codegen_x86.py):
+#   - Integer/pointer args in %rdi,%rsi,%rdx,%rcx,%r8,%r9 (we cover the
+#     first 6); we spill each to a stack slot with movq <argreg>,off(%rbp)
+#     so the body's identifier loads use one uniform slot path.
+#   - Return value in %rax.
+
+from compiler.parser import (
+    nd_kind,
+    nd_aux,
+    nd_num,
+    nd_name_off,
+    nd_name_len,
+    nd_a,
+    nd_b,
+    nd_c,
+    nd_next,
+    ND_FUNCTION,
+    ND_RETURN,
+    ND_BINARY,
+    ND_IDENT,
+    ND_INT_LIT,
+    ND_PARAM,
+    BINOP_ADD,
+    BINOP_SUB,
+    BINOP_MUL,
+)
+
+from compiler.lexer import (
+    strbuf,
+)
+
+# -----------------------------------------------------------------------
+# Output buffer: flat machine-code bytes.
+# -----------------------------------------------------------------------
+
+CODE_CAP: uint32 = 8192
+code: Array[8192, uint8]
+code_len: uint32 = 0
+
+# Codegen error flag (set on overflow / unsupported node).
+cg_err: uint32 = 0
+
+# -----------------------------------------------------------------------
+# Per-function local/parameter slot table.
+#
+# Mirrors FunctionContext.alloc_local in codegen_x86.py: each slot is
+# 8-byte-rounded and laid out at a negative %rbp offset. We map a slot to
+# the parameter's strbuf name reference (off/len), so identifier loads can
+# resolve a name back to its frame offset by string comparison.
+# -----------------------------------------------------------------------
+
+MAX_LOCALS: uint32 = 64
+
+loc_name_off: Array[64, uint32]
+loc_name_len: Array[64, uint32]
+loc_offset: Array[64, int32]      # negative %rbp-relative byte offset
+loc_count: uint32 = 0
+cg_stack_size: uint32 = 0
+
+
+def cg_init():
+    code_len = 0
+    cg_err = 0
+    loc_count = 0
+    cg_stack_size = 0
+
+
+# Append one byte to the output buffer.
+def emit_b(b: uint32):
+    if code_len >= CODE_CAP:
+        cg_err = 1
+        return
+    code[code_len] = cast[uint8](b & 255)
+    code_len = code_len + 1
+
+
+# Append a little-endian 32-bit immediate.
+def emit_imm32(v: uint64):
+    emit_b(cast[uint32](v & 255))
+    emit_b(cast[uint32]((v >> 8) & 255))
+    emit_b(cast[uint32]((v >> 16) & 255))
+    emit_b(cast[uint32]((v >> 24) & 255))
+
+
+# Compare a strbuf name slice [aoff,alen) against [boff,blen).
+def name_match(aoff: uint32, alen: uint32, boff: uint32, blen: uint32) -> int32:
+    if alen != blen:
+        return 0
+    i: uint32 = 0
+    while i < alen:
+        if strbuf[aoff + i] != strbuf[boff + i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+# Allocate an 8-byte stack slot for a named parameter/local. Returns the
+# negative %rbp-relative offset, mirroring alloc_local's growth direction.
+def alloc_local(name_off: uint32, name_len: uint32) -> int32:
+    if loc_count >= MAX_LOCALS:
+        cg_err = 1
+        return 0
+    cg_stack_size = cg_stack_size + 8
+    off: int32 = 0 - cast[int32](cg_stack_size)
+    loc_name_off[loc_count] = name_off
+    loc_name_len[loc_count] = name_len
+    loc_offset[loc_count] = off
+    loc_count = loc_count + 1
+    return off
+
+
+# Resolve an identifier name to its frame offset. Returns 1 on hit and
+# writes the offset through out_off; returns 0 on miss.
+def lookup_local(name_off: uint32, name_len: uint32, out_off: Ptr[int32]) -> int32:
+    i: uint32 = 0
+    while i < loc_count:
+        if name_match(loc_name_off[i], loc_name_len[i], name_off, name_len) != 0:
+            out_off[0] = loc_offset[i]
+            return 1
+        i = i + 1
+    return 0
+
+
+# -----------------------------------------------------------------------
+# Instruction emitters (encodings authoritative per codegen_x86.py's
+# AT&T mnemonics; bytes are the standard SysV AMD64 encodings).
+# -----------------------------------------------------------------------
+
+# endbr64  -> F3 0F 1E FA
+def emit_endbr64():
+    emit_b(0xF3)
+    emit_b(0x0F)
+    emit_b(0x1E)
+    emit_b(0xFA)
+
+
+# pushq %rbp  -> 55
+def emit_push_rbp():
+    emit_b(0x55)
+
+
+# popq %rbp   -> 5D   (part of `leave`; kept for completeness, unused)
+def emit_pop_rbp():
+    emit_b(0x5D)
+
+
+# movq %rsp, %rbp  -> 48 89 E5
+def emit_mov_rsp_rbp():
+    emit_b(0x48)
+    emit_b(0x89)
+    emit_b(0xE5)
+
+
+# subq $imm32, %rsp  -> 48 81 EC imm32
+def emit_sub_rsp(imm: uint32):
+    emit_b(0x48)
+    emit_b(0x81)
+    emit_b(0xEC)
+    emit_imm32(cast[uint64](imm))
+
+
+# leave  -> C9
+def emit_leave():
+    emit_b(0xC9)
+
+
+# ret    -> C3
+def emit_ret():
+    emit_b(0xC3)
+
+
+# pushq %rax  -> 50
+def emit_push_rax():
+    emit_b(0x50)
+
+
+# popq %rcx   -> 59
+def emit_pop_rcx():
+    emit_b(0x59)
+
+
+# movq $imm32, %rax (sign-extended) -> 48 C7 C0 imm32
+def emit_mov_imm_rax(v: uint64):
+    emit_b(0x48)
+    emit_b(0xC7)
+    emit_b(0xC0)
+    emit_imm32(v)
+
+
+# addq %rcx, %rax  -> 48 01 C8
+def emit_add_rcx_rax():
+    emit_b(0x48)
+    emit_b(0x01)
+    emit_b(0xC8)
+
+
+# subq %rcx, %rax  -> 48 29 C8
+def emit_sub_rcx_rax():
+    emit_b(0x48)
+    emit_b(0x29)
+    emit_b(0xC8)
+
+
+# imulq %rcx, %rax  -> 48 0F AF C1
+def emit_imul_rcx_rax():
+    emit_b(0x48)
+    emit_b(0x0F)
+    emit_b(0xAF)
+    emit_b(0xC1)
+
+
+# movq <arg-reg>, disp8(%rbp)   spill a parameter into its slot.
+#   movq %rdi, off(%rbp) -> 48 89 7D <disp8>
+#   movq %rsi, off(%rbp) -> 48 89 75 <disp8>
+#   movq %rdx, off(%rbp) -> 48 89 55 <disp8>
+#   movq %rcx, off(%rbp) -> 48 89 4D <disp8>
+#   movq %r8,  off(%rbp) -> 4C 89 45 <disp8>
+#   movq %r9,  off(%rbp) -> 4C 89 4D <disp8>
+# The disp8 byte is the offset taken as a signed 8-bit value (slots are
+# small and negative, well within -128).
+def emit_spill_arg(argidx: uint32, off: int32):
+    disp: uint32 = cast[uint32](off) & 255
+    if argidx == 0:
+        emit_b(0x48)
+        emit_b(0x89)
+        emit_b(0x7D)
+        emit_b(disp)
+    elif argidx == 1:
+        emit_b(0x48)
+        emit_b(0x89)
+        emit_b(0x75)
+        emit_b(disp)
+    elif argidx == 2:
+        emit_b(0x48)
+        emit_b(0x89)
+        emit_b(0x55)
+        emit_b(disp)
+    elif argidx == 3:
+        emit_b(0x48)
+        emit_b(0x89)
+        emit_b(0x4D)
+        emit_b(disp)
+    elif argidx == 4:
+        emit_b(0x4C)
+        emit_b(0x89)
+        emit_b(0x45)
+        emit_b(disp)
+    else:
+        emit_b(0x4C)
+        emit_b(0x89)
+        emit_b(0x4D)
+        emit_b(disp)
+
+
+# movq disp8(%rbp), %rax   load a local/param into %rax.
+#   -> 48 8B 45 <disp8>
+def emit_load_local_rax(off: int32):
+    disp: uint32 = cast[uint32](off) & 255
+    emit_b(0x48)
+    emit_b(0x8B)
+    emit_b(0x45)
+    emit_b(disp)
+
+
+# -----------------------------------------------------------------------
+# Expression codegen — value left in %rax (mirrors gen_expr).
+# -----------------------------------------------------------------------
+
+def gen_expr(node: uint32):
+    if node == 0:
+        return
+    k: uint32 = nd_kind[node]
+
+    if k == ND_INT_LIT:
+        emit_mov_imm_rax(nd_num[node])
+        return
+
+    if k == ND_IDENT:
+        off: int32 = 0
+        if lookup_local(nd_name_off[node], nd_name_len[node], &off) != 0:
+            emit_load_local_rax(off)
+        else:
+            # Unknown identifier — out of this subset's scope.
+            cg_err = 1
+        return
+
+    if k == ND_BINARY:
+        op: uint32 = nd_aux[node]
+        # Evaluate right first, push; then left; pop into %rcx. After this
+        # %rax = left, %rcx = right — exactly codegen_x86.gen_binary.
+        gen_expr(nd_b[node])
+        emit_push_rax()
+        gen_expr(nd_a[node])
+        emit_pop_rcx()
+        if op == BINOP_ADD:
+            emit_add_rcx_rax()
+        elif op == BINOP_SUB:
+            emit_sub_rcx_rax()
+        elif op == BINOP_MUL:
+            emit_imul_rcx_rax()
+        else:
+            cg_err = 1
+        return
+
+    # Anything else is outside this milestone's subset.
+    cg_err = 1
+
+
+# -----------------------------------------------------------------------
+# Statement codegen.
+# -----------------------------------------------------------------------
+
+def gen_stmt(node: uint32):
+    if node == 0:
+        return
+    k: uint32 = nd_kind[node]
+    if k == ND_RETURN:
+        gen_expr(nd_a[node])
+        emit_leave()
+        emit_ret()
+        return
+    # Other statement kinds not covered by this subset.
+    cg_err = 1
+
+
+# -----------------------------------------------------------------------
+# Function codegen — emits a full prologue / body / epilogue. Returns the
+# byte offset in code[] where this function's machine code begins.
+# -----------------------------------------------------------------------
+
+def gen_function(fn: uint32) -> uint32:
+    start: uint32 = code_len
+
+    # Fresh per-function slot table.
+    loc_count = 0
+    cg_stack_size = 0
+
+    # Allocate a slot per parameter (param chain on nd_a, count in nd_aux).
+    p: uint32 = nd_a[fn]
+    nparams: uint32 = 0
+    while p != 0:
+        alloc_local(nd_name_off[p], nd_name_len[p])
+        nparams = nparams + 1
+        p = nd_next[p]
+
+    # Prologue.
+    emit_endbr64()
+    emit_push_rbp()
+    emit_mov_rsp_rbp()
+
+    # 16-byte-aligned frame reservation (matches codegen_x86's
+    # (stack_size + 15) & ~15). Skip the subq entirely when zero.
+    frame: uint32 = (cg_stack_size + 15) & cast[uint32](0xFFFFFFF0)
+    if frame > 0:
+        emit_sub_rsp(frame)
+
+    # Spill parameters from their arg registers into the stack slots.
+    p2: uint32 = nd_a[fn]
+    idx: uint32 = 0
+    while p2 != 0:
+        emit_spill_arg(idx, loc_offset[idx])
+        idx = idx + 1
+        p2 = nd_next[p2]
+
+    # Body (statement chain on nd_c).
+    s: uint32 = nd_c[fn]
+    last_was_return: uint32 = 0
+    while s != 0:
+        gen_stmt(s)
+        if nd_kind[s] == ND_RETURN:
+            last_was_return = 1
+        else:
+            last_was_return = 0
+        s = nd_next[s]
+
+    # Fallthrough epilogue when the body did not end in a return (mirrors
+    # codegen_x86's `if not last_is_return: leave; ret`).
+    if last_was_return == 0:
+        emit_leave()
+        emit_ret()
+
+    return start
+
+
+# Generate code for the first function found in a parsed program. The
+# program node has its declaration chain on nd_b; we walk to the first
+# ND_FUNCTION and emit it. Returns that function's code start offset.
+def gen_program_first_function(prog: uint32) -> uint32:
+    decls: uint32 = nd_b[prog]
+    cur: uint32 = decls
+    while cur != 0:
+        if nd_kind[cur] == ND_FUNCTION:
+            return gen_function(cur)
+        cur = nd_next[cur]
+    cg_err = 1
+    return 0

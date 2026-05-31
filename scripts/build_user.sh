@@ -210,3 +210,11 @@ python3 -m compiler.adder compile \
     adder/compiler/parse_selftest.ad \
     -o build/user/parse_selftest.elf
 file build/user/parse_selftest.elf
+
+# --- Self-hosting milestone: Adder-in-Adder codegen ------------------
+echo "[build_user] compiling adder/compiler/codegen_selftest.ad -> build/user/codegen_selftest.elf"
+python3 -m compiler.adder compile \
+    --target=x86_64-adder-user \
+    adder/compiler/codegen_selftest.ad \
+    -o build/user/codegen_selftest.elf
+file build/user/codegen_selftest.elf
