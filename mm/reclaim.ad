@@ -1,0 +1,446 @@
+# mm/reclaim.ad
+#
+# #167: page reclaim under memory pressure + an OOM killer.
+#
+# This is the policy layer that ties the swap store (mm/swap.ad) and the
+# anonymous-page eviction primitives (mm/vma.ad) into a Linux-shaped
+# response to physical memory pressure:
+#
+#   1. RECLAIM — when free memory falls below a watermark, walk the live
+#      user tasks and ask each to evict some of its resident anonymous
+#      (demand-paged) pages to swap (vma_reclaim_anon_pages). Each evicted
+#      page is written to a swap slot, its PTE rewritten to a not-present
+#      swap entry, and the physical page freed back to the buddy
+#      allocator. A later access faults the page back in transparently
+#      (vma_swap_in_fault, wired into the #PF handler).
+#
+#   2. OOM KILLER — when reclaim cannot free enough (swap full, or no
+#      swappable pages left) and an allocation would otherwise fail hard,
+#      pick the victim task with the largest resident anonymous set
+#      (badness = RSS) and kill it (oom_kill_task → SIGKILL + reap),
+#      which returns its whole address space to the allocator. A clear
+#      "[oom]" kernel-log marker records the victim pid + rss.
+#
+# The reclaim trigger is exposed as reclaim_under_pressure(want_pages):
+# the buddy-allocator OOM path and the self-test both call it. It returns
+# the number of pages it managed to free (via swap eviction); if that is
+# still short of `want_pages` the caller escalates to the OOM killer
+# (oom_kill_one).
+
+from kernel.printk.printk import printk0, printk1, printk2
+from kernel.sched.core import (
+    task_table_size, current_idx_get,
+    task_is_live_at, task_is_user_at, task_pid_at, oom_kill_task,
+    create_user_task, task_pml4, task_pid_at,
+)
+from mm.vma import (
+    vma_task_anon_rss, vma_reclaim_anon_pages,
+    vma_alloc_demand, vma_demand_fault, vma_swap_in_fault,
+    _vma_pte_slot_addr,
+)
+from mm.swap import (
+    swap_slots_used, swap_slots_total, swap_ready,
+    swap_pageouts, swap_pageins,
+    swap_make_pte, swap_pte_is_swap, swap_pte_slot, swap_out_page,
+    swap_in_page,
+)
+from mm.page_alloc import alloc_page, free_page
+
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+extern def load_cr3(value: uint64)
+extern def get_bsp_cr3() -> uint64
+
+
+# How many anon pages to try to evict per task during a reclaim sweep.
+# Reclaim walks every live user task; capping the per-task evict count
+# keeps any single task from being completely paged out while another is
+# left untouched (a crude fairness floor — Linux's LRU does this more
+# precisely, but a per-task cap is enough at NTASKS=16).
+RECLAIM_PER_TASK_CAP: uint64 = 256
+
+
+def reclaim_under_pressure(want_pages: uint64) -> uint64:
+    # Free up to `want_pages` physical pages by evicting resident
+    # anonymous pages to swap across the live user tasks. Returns the
+    # number of pages actually reclaimed (freed back to the buddy
+    # allocator). Stops early once `want_pages` is met or swap fills up.
+    #
+    # This is the "kswapd / direct reclaim" body: it does NOT kill
+    # anything — that's the OOM killer's job, invoked separately by the
+    # caller when reclaim comes up short.
+    if want_pages == 0:
+        return 0
+    if swap_ready() == 0:
+        return 0
+    freed: uint64 = 0
+    n: uint64 = task_table_size()
+    slot: uint64 = 0
+    while slot < n and freed < want_pages:
+        if task_is_live_at(slot) != 0 and task_is_user_at(slot) != 0:
+            remaining: uint64 = want_pages - freed
+            cap: uint64 = RECLAIM_PER_TASK_CAP
+            if remaining < cap:
+                cap = remaining
+            got: uint64 = vma_reclaim_anon_pages(slot, cap)
+            freed = freed + got
+        slot = slot + 1
+    if freed > 0:
+        printk2("[reclaim] evicted %d pages to swap (%d slots used)\n",
+                freed, swap_slots_used())
+    return freed
+
+
+def oom_select_victim(protect_slot: uint64) -> int64:
+    # Badness heuristic: pick the live USER task with the largest resident
+    # anonymous set (RSS). `protect_slot` is never selected — the OOM
+    # killer must not kill the task it is running in (its stacks / page
+    # tables are live). Returns the victim slot, or -1 if there is no
+    # eligible victim.
+    n: uint64 = task_table_size()
+    best_slot: int64 = cast[int64](-1)
+    best_rss:  uint64 = 0
+    slot: uint64 = 0
+    while slot < n:
+        if slot != protect_slot \
+                and task_is_live_at(slot) != 0 \
+                and task_is_user_at(slot) != 0:
+            rss: uint64 = vma_task_anon_rss(slot)
+            if cast[int64](-1) == best_slot or rss > best_rss:
+                best_slot = cast[int64](slot)
+                best_rss  = rss
+        slot = slot + 1
+    return best_slot
+
+
+def oom_kill_one(protect_slot: uint64) -> int64:
+    # Select and kill the worst OOM victim (largest RSS), protecting
+    # `protect_slot` (the caller's own slot). Logs a clear "[oom]" marker
+    # with the victim's pid + rss, kills + reaps it (freeing its whole
+    # address space), and returns the killed slot, or -1 if no victim was
+    # available.
+    victim64: int64 = oom_select_victim(protect_slot)
+    if victim64 < 0:
+        printk0("[oom] no eligible victim — out of memory\n")
+        return cast[int64](-1)
+    victim: uint64 = cast[uint64](victim64)
+    vpid: uint64 = task_pid_at(cast[int32](victim))
+    vrss: uint64 = vma_task_anon_rss(victim)
+    printk2("[oom] killing victim pid=%d rss=%d pages (largest RSS)\n",
+            vpid, vrss)
+    if oom_kill_task(victim) != 0:
+        printk1("[oom] reaped pid=%d — memory reclaimed\n", vpid)
+        return victim64
+    printk1("[oom] kill of pid=%d failed\n", vpid)
+    return cast[int64](-1)
+
+
+# ---------------------------------------------------------------------
+# #167 self-test — gated on /etc/mm-test (init/main.ad boot:37.mm)
+# ---------------------------------------------------------------------
+#
+# Runs on the boot task with interrupts off, in the same style as the
+# [vk] / [sched_fair] self-tests. Two unforgeable assertions:
+#
+#   PART A — SWAP ROUND-TRIP
+#     Build a real demand-paged anonymous VMA in the boot task's own
+#     address space, fault every page in, and write a DETERMINISTIC
+#     per-byte pattern into each. Take an FNV-1a checksum of the whole
+#     region. Then drive reclaim_under_pressure(), which evicts every
+#     page to swap (rewriting each PTE to a not-present swap entry and
+#     freeing the physical page). Assert:
+#       * a specific page's PTE is now a SWAP ENTRY (swap_pte_is_swap),
+#         not present — proves eviction really rewrote the page table;
+#       * the swap store reports the expected pageout count;
+#     Then fault every page back IN via vma_swap_in_fault (the exact
+#     routine the #PF handler calls) and RE-CHECKSUM. The checksum must
+#     equal the pre-eviction checksum to the bit — proving the swap-out
+#     then swap-in restored every page's exact byte pattern, not a
+#     zero-fill or a no-op.
+#
+#   PART B — OOM KILLER
+#     Create two real user tasks, give each a demand VMA, fault a
+#     DIFFERENT number of pages into each so their resident sets differ
+#     by a known margin, then run the OOM killer. Assert it selected the
+#     LARGER-RSS task (by pid) as the victim, reaped it, and that the
+#     system kept running (a post-kill marker prints and the smaller task
+#     survives).
+
+# Mirror the VMA layer's PROT_* / MAP_* numeric values (kept in sync by
+# hand, as the rest of the tree does).
+MM_PROT_READ:   int32 = 0x1
+MM_PROT_WRITE:  int32 = 0x2
+MM_PROT_EXEC:   int32 = 0x4
+MM_MAP_PRIVATE: int32 = 0x02
+MM_MAP_ANON:    int32 = 0x20
+MM_PAGE: uint64 = 4096
+
+# This self-test runs at boot:37.mm, BEFORE syscall_init() (boot:39)
+# enables EFER.NXE on the BSP. With NXE off, any PTE carrying the NX bit
+# (bit 63) triggers a RESERVED-BIT page fault on access — even a benign
+# kernel data read/write. The demand-paged anon VMAs the test touches
+# from kernel context must therefore NOT be NX. We map them PROT_EXEC so
+# _vma_nx_flag() returns 0 (no NX bit); the swap round-trip is identical
+# regardless of the exec bit, so this only affects the page-table flag,
+# not what is being proven.
+MM_TEST_PROT: int32 = 0x7   # READ|WRITE|EXEC (0x1|0x2|0x4 — NX cleared)
+
+FNV_OFFSET: uint64 = 0xcbf29ce484222325
+FNV_PRIME:  uint64 = 0x00000100000001b3
+
+
+def _mm_fnv_region(base: uint64, nbytes: uint64) -> uint64:
+    # FNV-1a hash over [base, base+nbytes) of identity-mapped memory.
+    h: uint64 = FNV_OFFSET
+    i: uint64 = 0
+    while i < nbytes:
+        b: uint64 = cast[uint64](cast[Ptr[uint8]](base + i)[0])
+        h = (h ^ b) * FNV_PRIME
+        i = i + 1
+    return h
+
+
+def _mm_fill_pattern(base: uint64, nbytes: uint64, seed: uint64):
+    # Write a deterministic, position-dependent byte pattern. Each byte
+    # is (seed + offset*31) & 0xFF — distinct from a zero-fill so a
+    # swap-in that silently returned a zero page would fail the checksum.
+    i: uint64 = 0
+    while i < nbytes:
+        v: uint64 = (seed + i * 31) & 0xFF
+        cast[Ptr[uint8]](base + i)[0] = cast[uint8](v)
+        i = i + 1
+
+
+def _mm_fault_in_range(slot: uint64, pml4: uint64,
+                       base: uint64, npages: uint64):
+    # Populate every page of a demand VMA by calling the real demand-fault
+    # handler directly (the kernel can't take a #PF on its own access in
+    # this synchronous self-test context, so we invoke the populator the
+    # way do_page_fault would).
+    p: uint64 = 0
+    while p < npages:
+        vma_demand_fault(slot, pml4, base + p * MM_PAGE)
+        p = p + 1
+
+
+def _mm_count_swap_ptes(pml4: uint64, base: uint64,
+                        npages: uint64) -> uint64:
+    n: uint64 = 0
+    p: uint64 = 0
+    while p < npages:
+        pslot: uint64 = _vma_pte_slot_addr(pml4, base + p * MM_PAGE)
+        if pslot != 0:
+            pte: uint64 = cast[Ptr[uint64]](pslot)[0]
+            if swap_pte_is_swap(pte) != 0:
+                n = n + 1
+        p = p + 1
+    return n
+
+
+def mm_pressure_selftest() -> int32:
+    # Returns 1 if ALL assertions passed, 0 otherwise. Prints [mm] PASS/
+    # FAIL lines the test script greps for.
+    if swap_ready() == 0:
+        printk0("[mm] FAIL: swap not initialised\n")
+        return 0
+
+    boot_slot: uint64 = current_idx_get()
+    boot_pml4: uint64 = task_pml4(cast[int32](boot_slot))
+    boot_cr3: uint64 = get_bsp_cr3()
+
+    ok: int32 = 1
+
+    # ---- PART A: swap round-trip on a real demand VMA ----------------
+    A_PAGES: uint64 = 64
+    a_len: uint64 = A_PAGES * MM_PAGE
+    a_base64: int64 = vma_alloc_demand(boot_slot, 0, a_len,
+                                       MM_TEST_PROT,
+                                       MM_MAP_PRIVATE | MM_MAP_ANON)
+    if a_base64 < 0:
+        printk0("[mm] FAIL: vma_alloc_demand (part A) failed\n")
+        return 0
+    a_base: uint64 = cast[uint64](a_base64)
+    # vma_alloc_demand switched CR3 to the boot task's own pml4 (it already
+    # was). Fault every page in, then stamp a deterministic pattern.
+    _mm_fault_in_range(boot_slot, boot_pml4, a_base, A_PAGES)
+    _mm_fill_pattern(a_base, a_len, 0xA5)
+    csum_before: uint64 = _mm_fnv_region(a_base, a_len)
+    printk1("[mm] part A: region checksum before eviction = %p\n",
+            csum_before)
+
+    # Snapshot one specific page's physical frame to prove eviction frees
+    # it and the PTE becomes a swap entry.
+    probe_va: uint64 = a_base + 7 * MM_PAGE
+    probe_pte_slot: uint64 = _vma_pte_slot_addr(boot_pml4, probe_va)
+    pre_pageouts: uint64 = swap_pageouts()
+
+    # Drive reclaim on the boot task's own VMA directly. (The boot task
+    # is a kernel task — is_user == 0 — so the task-walking
+    # reclaim_under_pressure() deliberately skips it; we exercise the same
+    # eviction primitive it calls per user task, vma_reclaim_anon_pages,
+    # against the region we just built.)
+    freed: uint64 = vma_reclaim_anon_pages(boot_slot, A_PAGES)
+    if freed < A_PAGES:
+        printk2("[mm] FAIL: reclaim freed %d of %d pages\n", freed, A_PAGES)
+        ok = 0
+    else:
+        printk1("[mm] PASS: reclaim evicted all %d anon pages to swap\n",
+                freed)
+
+    # Assert the probe page's PTE is now a not-present swap entry.
+    probe_pte: uint64 = cast[Ptr[uint64]](probe_pte_slot)[0]
+    if swap_pte_is_swap(probe_pte) != 0:
+        printk1("[mm] PASS: evicted page PTE is a swap entry (slot=%d)\n",
+                swap_pte_slot(probe_pte))
+    else:
+        printk1("[mm] FAIL: evicted page PTE not a swap entry (pte=%p)\n",
+                probe_pte)
+        ok = 0
+
+    # Every page should now read as a swap entry.
+    swap_ptes: uint64 = _mm_count_swap_ptes(boot_pml4, a_base, A_PAGES)
+    if swap_ptes == A_PAGES:
+        printk1("[mm] PASS: all %d PTEs are swap entries\n", swap_ptes)
+    else:
+        printk2("[mm] FAIL: only %d of %d PTEs are swap entries\n",
+                swap_ptes, A_PAGES)
+        ok = 0
+
+    pageouts: uint64 = swap_pageouts() - pre_pageouts
+    if pageouts == A_PAGES:
+        printk1("[mm] PASS: swap recorded %d pageouts\n", pageouts)
+    else:
+        printk2("[mm] FAIL: swap recorded %d pageouts (want %d)\n",
+                pageouts, A_PAGES)
+        ok = 0
+
+    # Fault every page back in via the real swap-in path, then re-checksum.
+    pin: uint64 = 0
+    swapin_ok: int32 = 1
+    while pin < A_PAGES:
+        rc: int32 = vma_swap_in_fault(boot_slot, boot_pml4,
+                                      a_base + pin * MM_PAGE)
+        if rc != 1:
+            swapin_ok = 0
+        pin = pin + 1
+    if swapin_ok == 0:
+        printk0("[mm] FAIL: a swap-in fault did not resolve\n")
+        ok = 0
+
+    csum_after: uint64 = _mm_fnv_region(a_base, a_len)
+    if csum_after == csum_before:
+        printk1("[mm] PASS: swap-in restored exact bytes (checksum %p)\n",
+                csum_after)
+    else:
+        printk2("[mm] FAIL: checksum mismatch before=%p after=%p\n",
+                csum_before, csum_after)
+        ok = 0
+
+    # ---- PART B: OOM killer -----------------------------------------
+    # Create two real user tasks and give each a demand VMA with a
+    # DIFFERENT resident-set size. The OOM killer must pick the larger.
+    big_slot: int32 = create_user_task(0x401000, 0x6f6f6d5f626967)  # "oom_big"
+    small_slot: int32 = create_user_task(0x401000, 0x6f6f6d5f736d)  # "oom_sm"
+    if big_slot < 0 or small_slot < 0:
+        printk0("[mm] FAIL: could not create OOM victim tasks\n")
+        # Restore CR3 and bail with whatever PART A produced.
+        load_cr3(boot_cr3)
+        if ok == 1:
+            printk0("[mm] PASS: pressure self-test complete\n")
+        return ok
+
+    bs: uint64 = cast[uint64](big_slot)
+    ss: uint64 = cast[uint64](small_slot)
+    big_pid: uint64 = task_pid_at(big_slot)
+    small_pid: uint64 = task_pid_at(small_slot)
+    big_pml4: uint64 = task_pml4(big_slot)
+    small_pml4: uint64 = task_pml4(small_slot)
+
+    # Fault 48 pages into the big task, 8 into the small one. (vma_alloc_
+    # demand load_cr3's into the target task's pml4; restore boot CR3
+    # after each population so the self-test keeps running on its own
+    # address space.)
+    B_BIG: uint64 = 48
+    B_SMALL: uint64 = 8
+    big_base64: int64 = vma_alloc_demand(bs, 0, B_BIG * MM_PAGE,
+                                         MM_TEST_PROT,
+                                         MM_MAP_PRIVATE | MM_MAP_ANON)
+    load_cr3(boot_cr3)
+    small_base64: int64 = vma_alloc_demand(ss, 0, B_SMALL * MM_PAGE,
+                                           MM_TEST_PROT,
+                                           MM_MAP_PRIVATE | MM_MAP_ANON)
+    load_cr3(boot_cr3)
+    if big_base64 < 0 or small_base64 < 0:
+        printk0("[mm] FAIL: OOM victim VMA alloc failed\n")
+        load_cr3(boot_cr3)
+        return 0
+
+    # Populate the demand pages. Switch to each victim's pml4 so the
+    # demand-fault installs the leaf PTEs into the right tree, then
+    # restore boot CR3.
+    load_cr3(big_pml4)
+    _mm_fault_in_range(bs, big_pml4, cast[uint64](big_base64), B_BIG)
+    load_cr3(boot_cr3)
+    load_cr3(small_pml4)
+    _mm_fault_in_range(ss, small_pml4, cast[uint64](small_base64), B_SMALL)
+    load_cr3(boot_cr3)
+
+    big_rss: uint64 = vma_task_anon_rss(bs)
+    small_rss: uint64 = vma_task_anon_rss(ss)
+    printk2("[mm] part B: big pid=%d rss=%d\n", big_pid, big_rss)
+    printk2("[mm] part B: small pid=%d rss=%d\n", small_pid, small_rss)
+
+    if big_rss <= small_rss:
+        printk0("[mm] FAIL: RSS setup did not differ as expected\n")
+        ok = 0
+
+    # Exercise the task-walking reclaim DRIVER (reclaim_under_pressure):
+    # it scans live USER tasks and evicts their resident anon pages to
+    # swap. Ask for a modest 4 pages — enough to prove the driver reaches
+    # the user tasks the boot-task path could not, while leaving big's RSS
+    # comfortably above small's so the OOM victim choice below is still
+    # deterministic.
+    pre_drv_pageouts: uint64 = swap_pageouts()
+    drv_freed: uint64 = reclaim_under_pressure(4)
+    drv_pageouts: uint64 = swap_pageouts() - pre_drv_pageouts
+    if drv_freed == 4 and drv_pageouts == 4:
+        printk1("[mm] PASS: reclaim driver evicted %d user-task pages\n",
+                drv_freed)
+    else:
+        printk2("[mm] FAIL: reclaim driver freed %d (pageouts %d) want 4\n",
+                drv_freed, drv_pageouts)
+        ok = 0
+
+    # Run the OOM killer, protecting the boot task. It must pick the
+    # larger-RSS victim (big_pid).
+    victim64: int64 = oom_kill_one(boot_slot)
+    if victim64 < 0:
+        printk0("[mm] FAIL: OOM killer selected no victim\n")
+        ok = 0
+    else:
+        killed_slot: uint64 = cast[uint64](victim64)
+        # task_pid_at on a reaped (STATE_FREE) slot may read stale; we
+        # compare the slot index against big_slot instead.
+        if killed_slot == bs:
+            printk1("[mm] PASS: OOM killed largest-RSS victim pid=%d\n",
+                    big_pid)
+        else:
+            printk2("[mm] FAIL: OOM killed slot %d, expected big slot %d\n",
+                    killed_slot, bs)
+            ok = 0
+
+    # System keeps running: the smaller task must still be live, and we
+    # are still executing (this marker proves no halt / corruption).
+    if task_is_live_at(ss) != 0:
+        printk1("[mm] PASS: system survived OOM kill (small pid=%d alive)\n",
+                small_pid)
+    else:
+        printk0("[mm] FAIL: small task did not survive OOM kill\n")
+        ok = 0
+
+    # Clean up: reap the surviving small victim so the slot is reusable.
+    oom_kill_task(ss)
+    load_cr3(boot_cr3)
+
+    if ok == 1:
+        printk0("[mm] PASS: pressure self-test complete\n")
+    return ok

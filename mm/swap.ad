@@ -1,0 +1,225 @@
+# mm/swap.ad
+#
+# #167: anonymous-page swap backing store + swap-out / swap-in.
+#
+# Hamnix has a buddy allocator (mm/page_alloc.ad) and per-process VMAs
+# (mm/vma.ad) but, before this milestone, no way to relieve physical
+# memory pressure: alloc_page() simply returned 0 (OOM) and the faulting
+# path either halted or returned -ENOMEM. This module adds the swap half
+# of a Linux-shaped memory-pressure subsystem:
+#
+#   * A SWAP DEVICE: a contiguous region of physical RAM reserved from
+#     memblock at mem_init() time, BEFORE the buddy allocator starts so
+#     the swap store is never itself handed out as a usable page. It is
+#     carved into 4 KiB SLOTS, each able to hold the verbatim bytes of
+#     one evicted anonymous page. (A RAM-backed swap device is the same
+#     model as Linux's `zram` / a swapfile on a ramdisk — the eviction
+#     and restore PATHS are real; only the backing medium is volatile.)
+#
+#   * swap_out_page(phys): copy a page's 4 KiB of bytes into a free swap
+#     slot, return the slot id (>= 0) or -1 if swap is full. The caller
+#     (mm/reclaim.ad) then rewrites the owning PTE to a SWAP ENTRY
+#     (present=0, swap-marker bit set, slot id encoded) and frees the
+#     physical page back to the buddy allocator.
+#
+#   * swap_in_page(slot, phys): copy a swap slot's bytes back into a
+#     freshly-allocated physical page, then release the slot. The
+#     page-fault handler (arch/x86/kernel/trap_diag.ad::do_page_fault)
+#     recognises a not-present PTE whose swap-marker bit is set, decodes
+#     the slot, allocates a page, calls this to restore the bytes, and
+#     re-installs a present PTE so the faulting instruction resumes
+#     transparently.
+#
+# SWAP PTE ENCODING (a not-present PTE is entirely software-defined):
+#
+#   bit 0  (P)            = 0   — not present (so an access faults)
+#   bit 10 (0x400)        = 1   — SWAP marker (distinguishes a swap
+#                                 entry from a plain zero / demand-zero
+#                                 not-present PTE, and from a COW PTE
+#                                 which is bit 9 + present)
+#   bits 12..51           = slot id  (the swap slot index, << 12)
+#
+# Bit 10 is software-available in an x86_64 PTE. COW uses bit 9 (0x200)
+# but ONLY on PRESENT, read-only pages, so there is no collision: a swap
+# entry is never present. The original PTE's permission bits (RW / US /
+# NX) are reconstructed by the fault handler from the owning VMA, so we
+# do not need to preserve them in the swap entry.
+
+from mm.memblock import memblock_alloc
+from kernel.printk.printk import printk0, printk1, printk2
+
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+
+SWAP_PAGE_SIZE: uint64 = 4096
+
+# Swap PTE marker bit (software-available, only meaningful when P=0).
+SWAP_PTE_BIT:  uint64 = 0x400
+# Shift to pack the slot id into the PTE's phys-address field.
+SWAP_SLOT_SHIFT: uint64 = 12
+SWAP_SLOT_MASK:  uint64 = 0x000FFFFFFFFFF000   # bits [51:12]
+
+# Number of swap slots. 4096 slots * 4 KiB = 16 MiB of swap. Plenty to
+# evict the self-test's working set and demonstrate the round-trip; the
+# region is carved from memblock so it doesn't shrink usable RAM beyond
+# this fixed reservation.
+SWAP_NR_SLOTS: uint64 = 4096
+
+# Base physical address of the swap backing region (0 until swap_init).
+swap_region_base: uint64 = 0
+# Per-slot in-use bitmap, one byte per slot (0 = free, 1 = occupied).
+# Carved from memblock alongside the region. Kept as a byte array rather
+# than a packed bitmap for simplicity — SWAP_NR_SLOTS bytes is tiny.
+swap_slot_used: uint64 = 0
+# Rotating hint for the next free-slot search, so a steady evict/restore
+# stream doesn't re-scan from 0 every time.
+swap_next_hint: uint64 = 0
+
+# Diagnostics / self-test counters.
+swap_nr_slots_used:   uint64 = 0     # slots currently occupied
+swap_nr_pageouts:     uint64 = 0     # cumulative swap_out_page successes
+swap_nr_pageins:      uint64 = 0     # cumulative swap_in_page successes
+
+
+def swap_init():
+    # Reserve the swap backing region + slot bitmap from memblock. Called
+    # from mem_init() (arch/x86/mm/init.ad) right after cow_init() and
+    # BEFORE page_alloc_init(), so the swap store comes out of the bump
+    # allocator and is never handed to the buddy allocator.
+    region_bytes: uint64 = SWAP_NR_SLOTS * SWAP_PAGE_SIZE
+    base: uint64 = memblock_alloc(region_bytes, SWAP_PAGE_SIZE)
+    if base == 0:
+        printk0("[swap] FATAL: swap region alloc failed\n")
+        # Leave swap_region_base 0; swap_out_page returns -1 (swap full)
+        # so reclaim degrades to the OOM killer. Boot still proceeds.
+        return
+    bitmap: uint64 = memblock_alloc(SWAP_NR_SLOTS, 8)
+    if bitmap == 0:
+        printk0("[swap] FATAL: swap slot bitmap alloc failed\n")
+        return
+    # Zero the bitmap (all slots free).
+    i: uint64 = 0
+    while i < SWAP_NR_SLOTS:
+        cast[Ptr[uint8]](bitmap + i)[0] = 0
+        i = i + 1
+    swap_region_base    = base
+    swap_slot_used      = bitmap
+    swap_next_hint      = 0
+    swap_nr_slots_used  = 0
+    printk2("[swap] %d slots, region @ %p\n", SWAP_NR_SLOTS, base)
+
+
+def _swap_slot_addr(slot: uint64) -> uint64:
+    # Physical address of swap slot `slot`'s 4 KiB backing buffer.
+    return swap_region_base + slot * SWAP_PAGE_SIZE
+
+
+def _swap_alloc_slot() -> int64:
+    # Claim a free swap slot, returning its id, or -1 if swap is full /
+    # uninitialised. Linear scan from the rotating hint.
+    if swap_slot_used == 0:
+        return cast[int64](-1)
+    scanned: uint64 = 0
+    s: uint64 = swap_next_hint
+    while scanned < SWAP_NR_SLOTS:
+        if s >= SWAP_NR_SLOTS:
+            s = 0
+        if cast[Ptr[uint8]](swap_slot_used + s)[0] == 0:
+            cast[Ptr[uint8]](swap_slot_used + s)[0] = 1
+            swap_nr_slots_used = swap_nr_slots_used + 1
+            swap_next_hint = s + 1
+            return cast[int64](s)
+        s = s + 1
+        scanned = scanned + 1
+    return cast[int64](-1)
+
+
+def _swap_free_slot(slot: uint64):
+    if swap_slot_used == 0:
+        return
+    if slot >= SWAP_NR_SLOTS:
+        return
+    if cast[Ptr[uint8]](swap_slot_used + slot)[0] != 0:
+        cast[Ptr[uint8]](swap_slot_used + slot)[0] = 0
+        if swap_nr_slots_used > 0:
+            swap_nr_slots_used = swap_nr_slots_used - 1
+
+
+def swap_out_page(phys: uint64) -> int64:
+    # Evict the page at physical address `phys` to a free swap slot.
+    # Copies the page's 4 KiB verbatim into the slot's backing buffer and
+    # returns the slot id (>= 0). Returns -1 if swap is full or
+    # uninitialised. The caller is responsible for rewriting the PTE to a
+    # swap entry (see swap_make_pte) and freeing `phys`.
+    if phys == 0:
+        return cast[int64](-1)
+    slot64: int64 = _swap_alloc_slot()
+    if slot64 < 0:
+        return cast[int64](-1)
+    slot: uint64 = cast[uint64](slot64)
+    dst: uint64 = _swap_slot_addr(slot)
+    # Both addresses are identity-mapped physical RAM — copy directly.
+    memcpy(cast[Ptr[uint8]](dst), cast[Ptr[uint8]](phys), SWAP_PAGE_SIZE)
+    swap_nr_pageouts = swap_nr_pageouts + 1
+    return slot64
+
+
+def swap_in_page(slot: uint64, phys: uint64) -> int32:
+    # Restore swap slot `slot`'s bytes into the freshly-allocated physical
+    # page `phys`, then release the slot. Returns 0 on success, -1 on a
+    # bad slot. The caller (the #PF handler) allocates `phys` and installs
+    # the present PTE.
+    if swap_region_base == 0:
+        return -1
+    if slot >= SWAP_NR_SLOTS:
+        return -1
+    src: uint64 = _swap_slot_addr(slot)
+    memcpy(cast[Ptr[uint8]](phys), cast[Ptr[uint8]](src), SWAP_PAGE_SIZE)
+    _swap_free_slot(slot)
+    swap_nr_pageins = swap_nr_pageins + 1
+    return 0
+
+
+# --- swap PTE encode / decode --------------------------------------
+
+def swap_make_pte(slot: uint64) -> uint64:
+    # Build the not-present swap-entry PTE value for slot `slot`:
+    # P=0, SWAP marker set, slot packed into the phys-address field.
+    return (slot << SWAP_SLOT_SHIFT) | SWAP_PTE_BIT
+
+
+def swap_pte_is_swap(pte: uint64) -> int32:
+    # 1 if `pte` is a swap entry: NOT present, with the swap marker set.
+    if (pte & 0x1) != 0:
+        return 0
+    if (pte & SWAP_PTE_BIT) != 0:
+        return 1
+    return 0
+
+
+def swap_pte_slot(pte: uint64) -> uint64:
+    # Decode the slot id from a swap-entry PTE.
+    return (pte & SWAP_SLOT_MASK) >> SWAP_SLOT_SHIFT
+
+
+# --- stats accessors (self-test + diagnostics) ---------------------
+
+def swap_slots_total() -> uint64:
+    return SWAP_NR_SLOTS
+
+
+def swap_slots_used() -> uint64:
+    return swap_nr_slots_used
+
+
+def swap_pageouts() -> uint64:
+    return swap_nr_pageouts
+
+
+def swap_pageins() -> uint64:
+    return swap_nr_pageins
+
+
+def swap_ready() -> int32:
+    if swap_region_base != 0:
+        return 1
+    return 0

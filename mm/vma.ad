@@ -62,6 +62,10 @@ from kernel.sched.core import (
 from mm.slab import kmalloc, kfree
 from mm.page_alloc import alloc_pages, alloc_page, free_pages, free_page
 from mm.cow import cow_drop_page, cow_pte_bit
+from mm.swap import (
+    swap_out_page, swap_make_pte, swap_ready,
+    swap_pte_is_swap, swap_pte_slot, swap_in_page,
+)
 from fs.elf import (
     elf_install_user_mapping, vm_cow_share_range,
     vm_share_range, vm_protect_range, vm_pin_range,
@@ -72,6 +76,7 @@ from fs.elf import (
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 extern def load_cr3(value: uint64)
+extern def invlpg_one(va: uint64)
 
 # ---------------------------------------------------------------------
 # Constants
@@ -1315,6 +1320,189 @@ def vma_demand_fault(slot: uint64, pml4_phys: uint64,
                         _vma_nx_flag(prot)) < 0:
         free_page(phys)
         printk1("vma: demand map failed at va=0x%x\n", fault_va)
+        return -1
+    return 1
+
+
+# ---------------------------------------------------------------------
+# #167: page reclaim — evict anonymous (demand-paged) pages to swap
+# ---------------------------------------------------------------------
+#
+# A demand-paged anonymous VMA (is_demand == 1) is the canonical
+# swappable region: each present 4 KiB page is PRIVATE (one mapper, no
+# COW refcount), identity-mapped, and was populated lazily on first
+# touch by vma_demand_fault. Under memory pressure mm/reclaim.ad asks a
+# task to give up some of these pages:
+#
+#   1. walk the task's demand VMAs page-by-page,
+#   2. for each PRESENT page, copy its bytes into a free swap slot
+#      (swap_out_page),
+#   3. rewrite the page's PTE to a not-present SWAP ENTRY encoding that
+#      slot (swap_make_pte),
+#   4. free the physical page back to the buddy allocator.
+#
+# A later access to that virtual address faults not-present; the #PF
+# handler decodes the swap entry, allocates a fresh page, restores the
+# bytes (swap_in_page), and re-installs a present PTE — transparently.
+#
+# Clean / unmodified pages could be dropped without writeback, but a
+# demand-zero anon page that was written is dirty by definition, so we
+# always write it to swap to preserve its contents. (We have no per-page
+# dirty bit plumbed yet; treating every anon page as dirty is correct,
+# just slightly conservative.)
+
+
+def _vma_pte_slot_addr(pml4_phys: uint64, vaddr: uint64) -> uint64:
+    # Return the ADDRESS of the 4 KiB PTE slot mapping `vaddr`, or 0 if
+    # any level is not-present or the leaf is a huge page. Read-only walk
+    # — never allocates or cracks a table (the demand pages it serves are
+    # always already mapped at 4 KiB granularity by vma_demand_fault).
+    if pml4_phys == 0:
+        return 0
+    pml4_idx: uint64 = (vaddr >> 39) & 0x1FF
+    pdpt_idx: uint64 = (vaddr >> 30) & 0x1FF
+    pd_idx:   uint64 = (vaddr >> 21) & 0x1FF
+    pt_idx:   uint64 = (vaddr >> 12) & 0x1FF
+
+    pml4: Ptr[uint64] = cast[Ptr[uint64]](pml4_phys & VMA_PT_ADDR_MASK)
+    pml4e: uint64 = pml4[pml4_idx]
+    if (pml4e & VMA_PT_FLAG_P) == 0:
+        return 0
+    pdpt: Ptr[uint64] = cast[Ptr[uint64]](pml4e & VMA_PT_ADDR_MASK)
+    pdpte: uint64 = pdpt[pdpt_idx]
+    if (pdpte & VMA_PT_FLAG_P) == 0:
+        return 0
+    if (pdpte & VMA_PT_FLAG_PS) != 0:
+        return 0
+    pd: Ptr[uint64] = cast[Ptr[uint64]](pdpte & VMA_PT_ADDR_MASK)
+    pde: uint64 = pd[pd_idx]
+    if (pde & VMA_PT_FLAG_P) == 0:
+        return 0
+    if (pde & VMA_PT_FLAG_PS) != 0:
+        return 0
+    pt: Ptr[uint64] = cast[Ptr[uint64]](pde & VMA_PT_ADDR_MASK)
+    return cast[uint64](pt) + pt_idx * 8
+
+
+def vma_task_anon_rss(slot: uint64) -> uint64:
+    # Count PRESENT 4 KiB pages backing this task's demand-paged anon
+    # VMAs — the resident anonymous working set. Used by the OOM killer's
+    # badness heuristic (largest-RSS victim) and by the reclaim driver to
+    # know how much it can evict.
+    pml4: uint64 = task_pml4(cast[int32](slot))
+    if pml4 == 0:
+        return 0
+    rss: uint64 = 0
+    cur: uint64 = task_vma_list_head(slot)
+    while cur != 0:
+        if cast[Ptr[VmaNode]](cur)[0].is_demand != 0:
+            s: uint64 = cast[Ptr[VmaNode]](cur)[0].start
+            e: uint64 = cast[Ptr[VmaNode]](cur)[0].end
+            va: uint64 = s
+            while va < e:
+                pte: uint64 = _vma_pte_lookup(pml4, va)
+                if pte != 0:
+                    rss = rss + 1
+                va = va + VMA_PAGE_SIZE
+        cur = _vma_node_get_next(cur)
+    return rss
+
+
+def vma_reclaim_anon_pages(slot: uint64, want: uint64) -> uint64:
+    # Evict up to `want` present anonymous pages of `slot` to swap and
+    # free them. Returns the number actually reclaimed. A page is
+    # reclaimed only if swap_out_page succeeds (swap not full); if swap is
+    # full the scan stops early. The PTE is rewritten to a swap entry so a
+    # later access faults the page back in transparently.
+    if want == 0:
+        return 0
+    if swap_ready() == 0:
+        return 0
+    pml4: uint64 = task_pml4(cast[int32](slot))
+    if pml4 == 0:
+        return 0
+    reclaimed: uint64 = 0
+    cur: uint64 = task_vma_list_head(slot)
+    while cur != 0 and reclaimed < want:
+        if cast[Ptr[VmaNode]](cur)[0].is_demand != 0:
+            s: uint64 = cast[Ptr[VmaNode]](cur)[0].start
+            e: uint64 = cast[Ptr[VmaNode]](cur)[0].end
+            va: uint64 = s
+            while va < e and reclaimed < want:
+                pslot: uint64 = _vma_pte_slot_addr(pml4, va)
+                if pslot != 0:
+                    pte: uint64 = cast[Ptr[uint64]](pslot)[0]
+                    if (pte & VMA_PT_FLAG_P) != 0:
+                        phys: uint64 = pte & VMA_PT_ADDR_MASK
+                        if phys != 0:
+                            sw: int64 = swap_out_page(phys)
+                            if sw < 0:
+                                # Swap full — stop; the OOM killer takes
+                                # over from here.
+                                return reclaimed
+                            # Rewrite the PTE to a not-present swap entry,
+                            # flush the TLB, and free the physical page.
+                            cast[Ptr[uint64]](pslot)[0] = \
+                                swap_make_pte(cast[uint64](sw))
+                            invlpg_one(va)
+                            free_page(phys)
+                            reclaimed = reclaimed + 1
+                va = va + VMA_PAGE_SIZE
+        cur = _vma_node_get_next(cur)
+    return reclaimed
+
+
+# ---------------------------------------------------------------------
+# #167: swap-in — fault a swapped-out anonymous page back from swap
+# ---------------------------------------------------------------------
+#
+# Called from the #PF handler (arch/x86/kernel/trap_diag.ad) on a
+# not-present USER fault whose PTE is a SWAP ENTRY (swap_pte_is_swap).
+# Decodes the swap slot, allocates a fresh physical page, restores the
+# slot's bytes into it (swap_in_page), and rewrites the PTE present with
+# the owning VMA's permissions — so the faulting instruction resumes and
+# reads exactly the bytes that were evicted.
+#
+# Returns:
+#    1  swapped page restored — re-run the faulting instruction.
+#    0  the PTE at fault_va is NOT a swap entry — not our fault.
+#   -1  swap-in failed (OOM allocating the restore page, or bad slot) —
+#       the caller surfaces it.
+
+
+def vma_swap_in_fault(slot: uint64, pml4_phys: uint64,
+                      fault_va: uint64) -> int32:
+    va_al: uint64 = fault_va & ~(VMA_PAGE_SIZE - 1)
+    pte_slot: uint64 = _vma_pte_slot_addr(pml4_phys, va_al)
+    if pte_slot == 0:
+        return 0
+    pte: uint64 = cast[Ptr[uint64]](pte_slot)[0]
+    if swap_pte_is_swap(pte) == 0:
+        return 0
+    # It IS a swap entry. Decode the slot, allocate a restore page.
+    sw_slot: uint64 = swap_pte_slot(pte)
+    phys: uint64 = alloc_page()
+    if phys == 0:
+        printk1("vma: swap-in OOM at va=0x%x\n", fault_va)
+        return -1
+    if swap_in_page(sw_slot, phys) < 0:
+        free_page(phys)
+        printk1("vma: swap-in bad slot at va=0x%x\n", fault_va)
+        return -1
+    # Reconstruct the PTE permissions from the owning VMA's prot. A
+    # swapped anon page is private DATA — present + user, writable iff the
+    # VMA is PROT_WRITE, NX unless PROT_EXEC.
+    node: uint64 = vma_find(slot, va_al)
+    want_write: int32 = 0
+    nx: uint64 = PT_FLAG_NX
+    if node != 0:
+        prot: int32 = cast[Ptr[VmaNode]](node)[0].prot
+        if (prot & VMA_PROT_WRITE) != 0:
+            want_write = 1
+        nx = _vma_nx_flag(prot)
+    if elf_map_one_page(pml4_phys, va_al, phys, want_write, nx) < 0:
+        free_page(phys)
+        printk1("vma: swap-in map failed at va=0x%x\n", fault_va)
         return -1
     return 1
 

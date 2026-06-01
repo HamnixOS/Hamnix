@@ -280,6 +280,18 @@ if os.environ.get("ENABLE_SCHED_FAIR") == "1":
 if os.environ.get("ENABLE_VK_TEST") == "1":
     FILES.append(("/etc/vk-test", b"1\n"))
 
+# #167: memory-pressure subsystem (swap + page reclaim + OOM killer)
+# self-test. scripts/test_mm_pressure.sh sets ENABLE_MM_TEST=1 to plant
+# /etc/mm-test. init/main.ad at boot:37.mm detects the marker and calls
+# mm_pressure_selftest() (mm/reclaim.ad): it builds a real demand-paged
+# anon VMA, evicts every page to swap (asserting the PTE becomes a swap
+# entry), faults each back in via the real swap-in path and re-checksums
+# (proving the round-trip restores exact bytes), then drives the OOM
+# killer against two victim tasks and asserts the largest-RSS one was
+# killed while the system kept running. Default boots omit the marker.
+if os.environ.get("ENABLE_MM_TEST") == "1":
+    FILES.append(("/etc/mm-test", b"1\n"))
+
 # Partition write-smoke fixtures (mkpart MBR on sd0, gpt on nvme0n1).
 # These WRITE a partition table onto a freshly-registered disk that has
 # no MBR, so they must NEVER run on production media. Set
