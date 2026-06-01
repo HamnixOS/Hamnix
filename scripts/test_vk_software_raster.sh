@@ -96,6 +96,7 @@ check "clear color at corner"            "[vk] PASS: corner pixel is clear color
 check "far-only interpolated gradient"   "[vk] PASS: far-only pixel carries far triangle gradient"
 check "depth test chose nearer triangle" "[vk] PASS: overlap shows NEAR triangle (depth test won)"
 check "color image checksum matches golden" "[vk] PASS: color image checksum matches golden"
+check "present advanced pixel count"     "[vk] PASS: present advanced pixel count by W*H"
 check "spine self-test complete"         "[vk] PASS: Phase-0 spine self-test complete"
 
 if [ "$fail" -ne 0 ]; then
