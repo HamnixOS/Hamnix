@@ -292,6 +292,19 @@ if os.environ.get("ENABLE_VK_TEST") == "1":
 if os.environ.get("ENABLE_MM_TEST") == "1":
     FILES.append(("/etc/mm-test", b"1\n"))
 
+# #149: ext4 JBD2 journal crash-consistency self-test. scripts/
+# test_ext4_journal.sh sets ENABLE_EXT4_JOURNAL_TEST=1 to plant
+# /etc/ext4-journal-test. init/main.ad detects the marker after the
+# ext4 mount and calls ext4_journal_selftest() (fs/ext4.ad): it stages
+# a metadata transaction, commits it to the journal, skips checkpoint
+# to simulate a crash, replays, and asserts the committed change
+# survives; then stages a torn (no-commit-block) transaction and
+# asserts replay rolls it back. The self-test WRITES raw scratch fs
+# blocks, so it must only run on the disposable journalled test image.
+# Default boots omit the marker so it never fires unintentionally.
+if os.environ.get("ENABLE_EXT4_JOURNAL_TEST") == "1":
+    FILES.append(("/etc/ext4-journal-test", b"1\n"))
+
 # Partition write-smoke fixtures (mkpart MBR on sd0, gpt on nvme0n1).
 # These WRITE a partition table onto a freshly-registered disk that has
 # no MBR, so they must NEVER run on production media. Set

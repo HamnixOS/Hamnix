@@ -1,0 +1,654 @@
+# fs/jbd2.ad
+#
+# JBD2 — the ext4 journal (write-ahead log), ordered/metadata mode.
+#
+# This is a minimum-scope but ON-DISK-COMPATIBLE mirror of Linux's
+# fs/jbd2/. We do NOT reimplement the full kernel journaling thread
+# machinery (kjournald, the running/committing transaction handoff,
+# t_buffers lists, etc.). What we DO implement is the part that makes
+# the filesystem crash-consistent:
+#
+#   1. Parse the real JBD2 journal living in the ext4 journal inode
+#      (conventionally inode 8). Read its superblock (journal block 0)
+#      and validate the magic 0xC03B3998. This proves we're talking to
+#      a journal a real Linux mkfs.ext4 produced, not a stub.
+#
+#   2. A transaction API. A caller stages the metadata blocks it is
+#      about to change (inode-table blocks, bitmaps, directory blocks,
+#      group descriptors), then commits: we write a DESCRIPTOR block
+#      naming the final on-disk destinations, the DATA blocks, and a
+#      COMMIT block — all into the circular journal area — and only
+#      THEN checkpoint (copy each staged block to its real on-disk
+#      location with _ext4_write_block).
+#
+#   3. Recovery/replay. On mount after an unclean shutdown we scan the
+#      journal from the superblock's s_start, and for every FULLY
+#      committed transaction (descriptor -> data -> commit-block
+#      present, with a matching sequence number) we re-apply the data
+#      blocks to their final destinations. A trailing transaction whose
+#      commit block is missing (a torn write / crash mid-commit) is
+#      discarded — its staged blocks never touch the main filesystem.
+#
+# Journaling MODE: ordered / metadata-only. We journal metadata blocks.
+# File DATA is written to its final location by the ext4 write path
+# BEFORE the metadata transaction commits (the existing ext4 write
+# functions write data straight through), which is exactly the ordering
+# guarantee ext4's data=ordered mode provides. We do NOT journal file
+# data blocks.
+#
+# --- On-disk format (all multi-byte fields BIG-ENDIAN) ----------------
+#
+# Every journal block opens with journal_header_t (12 bytes):
+#   0x00  h_magic     u32  = 0xC03B3998
+#   0x04  h_blocktype u32  (1=descriptor 2=commit 3=superblock_v1
+#                            4=superblock_v2 5=revoke)
+#   0x08  h_sequence  u32  transaction sequence this block belongs to
+#
+# The journal superblock (journal block 0) is journal_superblock_t:
+#   0x00  header (h_blocktype = 4 for v2)
+#   0x0C  s_blocksize    u32  journal block size (== fs block size)
+#   0x10  s_maxlen       u32  total journal length in journal blocks
+#   0x14  s_first        u32  first journal block that holds log data
+#                              (block 1 — block 0 is the superblock)
+#   0x18  s_sequence     u32  first commit ID expected on recovery
+#   0x1C  s_start        u32  journal block where the log starts; 0 if
+#                              the journal is clean (empty)
+#
+# A descriptor block, after its 12-byte header, is a packed array of
+# journal_block_tag_t entries, one per data block that follows:
+#   0x00  t_blocknr   u32  final fs block this journal data block maps to
+#   0x04  t_flags     u32  (0x01 ESCAPE, 0x02 SAME_UUID, 0x08 LAST_TAG)
+#   (t_blocknr_high u32 + 16-byte UUID when SAME_UUID is clear; we keep
+#    the tags minimal — 64-bit feature off, SAME_UUID set on every tag
+#    after the first so no UUID is emitted, matching JBD2_FEATURE_*.)
+#
+# We use the v2-style fixed tag we control end to end. To stay simple
+# and self-consistent we emit a 8-byte tag (t_blocknr, t_flags) with
+# SAME_UUID set so no UUID trails, and never set the 64-bit or csum
+# incompat features — the journal we mint/replay is the one we wrote.
+
+from kernel.block.blk import (
+    blk_read_sectors, blk_write_sectors, blk_flush, SECTOR_SIZE,
+)
+from kernel.printk.printk import printk0, printk1, printk2
+
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+
+
+JBD2_MAGIC: uint32 = 0xC03B3998
+
+JBD2_DESCRIPTOR_BLOCK: uint32 = 1
+JBD2_COMMIT_BLOCK:     uint32 = 2
+JBD2_SUPERBLOCK_V1:    uint32 = 3
+JBD2_SUPERBLOCK_V2:    uint32 = 4
+JBD2_REVOKE_BLOCK:     uint32 = 5
+
+# journal_block_tag flags.
+JBD2_FLAG_ESCAPE:    uint32 = 0x01
+JBD2_FLAG_SAME_UUID: uint32 = 0x02
+JBD2_FLAG_DELETED:   uint32 = 0x04
+JBD2_FLAG_LAST_TAG:  uint32 = 0x08
+
+# 8-byte minimal tag: t_blocknr (u32) + t_flags (u32). We always set
+# SAME_UUID so no 16-byte UUID trails the tag.
+JBD2_TAG_BYTES: uint64 = 8
+
+
+# --- Big-endian field helpers ----------------------------------------
+#
+# JBD2 is network byte order. ext4's own metadata is little-endian, so
+# we cannot reuse ext4's readers here.
+
+def jbd2_be32(p: Ptr[uint8]) -> uint32:
+    return ((cast[uint32](p[0]) << 24)
+            | (cast[uint32](p[1]) << 16)
+            | (cast[uint32](p[2]) << 8)
+            | cast[uint32](p[3]))
+
+
+def jbd2_put_be32(p: Ptr[uint8], v: uint32):
+    p[0] = cast[uint8]((v >> 24) & 0xFF)
+    p[1] = cast[uint8]((v >> 16) & 0xFF)
+    p[2] = cast[uint8]((v >> 8) & 0xFF)
+    p[3] = cast[uint8](v & 0xFF)
+
+
+# --- Mount-time journal state ----------------------------------------
+#
+# Single journal (single ext4 mount). The values are filled by
+# jbd2_attach() once ext4_init has located the journal inode and read
+# its superblock.
+
+jbd2_slot:        int32  = -1     # block-device slot of the host fs
+jbd2_block_size:  uint64 = 0      # journal block size (== fs block size)
+jbd2_maxlen:      uint64 = 0      # journal length in journal blocks
+jbd2_first:       uint64 = 0      # first usable log block (1)
+jbd2_sequence:    uint32 = 0      # next sequence to assign
+jbd2_start:       uint64 = 0      # current head of the log (s_start)
+jbd2_attached:    int32  = 0      # 1 once a valid JBD2 sb was parsed
+jbd2_sb_magic:    uint32 = 0      # the magic word actually read from sb
+
+# The journal inode's data is NOT contiguous on disk in general — the
+# journal inode uses an extent tree. We resolve each journal LOGICAL
+# block to a PHYSICAL fs block through a callback the ext4 layer wires
+# (it owns the extent walker). Stored as a small map we populate at
+# attach time so the journal I/O paths stay self-contained.
+JBD2_MAX_MAP: uint64 = 4096
+jbd2_blkmap: Array[4096, uint64]      # journal lblk -> fs phys block
+jbd2_map_len: uint64 = 0
+
+
+# One journal-block scratch (4 KiB covers 1 KiB and 4 KiB fs blocks).
+jbd2_blk_buf: Array[4096, uint8]
+# A second scratch so a descriptor read and a data read don't collide
+# during replay.
+jbd2_data_buf: Array[4096, uint8]
+
+
+def jbd2_is_attached() -> int32:
+    return jbd2_attached
+
+
+def jbd2_super_magic_read() -> uint32:
+    # The magic word actually read from the journal superblock at
+    # attach time. The crash-consistency self-test asserts this equals
+    # 0xC03B3998 to prove we parsed a real JBD2 journal, not a stub.
+    return jbd2_sb_magic
+
+
+def _jbd2_phys(lblk: uint64) -> uint64:
+    # Map a journal logical block to its physical fs block. Returns 0
+    # (an impossible journal location) if out of the mapped range.
+    if lblk >= jbd2_map_len:
+        return 0
+    return jbd2_blkmap[lblk]
+
+
+def _jbd2_read_jblock(lblk: uint64, buf: Ptr[uint8]) -> int32:
+    # Read journal block `lblk` (logical within the journal file) into
+    # `buf`, exactly jbd2_block_size bytes.
+    phys: uint64 = _jbd2_phys(lblk)
+    if phys == 0:
+        return -1
+    spb: uint64 = jbd2_block_size / SECTOR_SIZE
+    return blk_read_sectors(jbd2_slot, phys * spb, spb, buf)
+
+
+def _jbd2_write_jblock(lblk: uint64, buf: Ptr[uint8]) -> int32:
+    phys: uint64 = _jbd2_phys(lblk)
+    if phys == 0:
+        return -1
+    spb: uint64 = jbd2_block_size / SECTOR_SIZE
+    return blk_write_sectors(jbd2_slot, phys * spb, spb, buf)
+
+
+def _jbd2_write_fsblock(fsblk: uint64, buf: Ptr[uint8]) -> int32:
+    # Write to a FINAL on-disk fs block (checkpoint / replay target).
+    spb: uint64 = jbd2_block_size / SECTOR_SIZE
+    return blk_write_sectors(jbd2_slot, fsblk * spb, spb, buf)
+
+
+# --- attach: parse the JBD2 superblock --------------------------------
+#
+# Called by ext4_init once it has the journal inode's logical->physical
+# block map. `map` is an array of fs-block numbers indexed by journal
+# logical block; `map_len` entries. The journal superblock lives at
+# journal logical block 0.
+
+def jbd2_attach(slot: int32, fs_block_size: uint64,
+                map: Ptr[uint64], map_len: uint64) -> int32:
+    jbd2_attached = 0
+    jbd2_slot       = slot
+    jbd2_block_size = fs_block_size
+    if map_len == 0 or map_len > JBD2_MAX_MAP:
+        printk1("jbd2: bad journal map length %d\n", map_len)
+        return -1
+    # Copy the journal block map into our table.
+    i: uint64 = 0
+    while i < map_len:
+        jbd2_blkmap[i] = map[i]
+        i = i + 1
+    jbd2_map_len = map_len
+
+    # Read journal block 0 = the JBD2 superblock.
+    if _jbd2_read_jblock(0, &jbd2_blk_buf[0]) != 0:
+        printk0("jbd2: failed to read journal superblock block\n")
+        return -1
+    sb: Ptr[uint8] = &jbd2_blk_buf[0]
+    magic: uint32 = jbd2_be32(sb)
+    jbd2_sb_magic = magic
+    if magic != JBD2_MAGIC:
+        printk1("jbd2: bad superblock magic 0x%x (no journal)\n",
+                cast[uint64](magic))
+        return -1
+    blocktype: uint32 = jbd2_be32(cast[Ptr[uint8]](cast[uint64](sb) + 4))
+    if blocktype != JBD2_SUPERBLOCK_V2 and blocktype != JBD2_SUPERBLOCK_V1:
+        printk1("jbd2: journal sb has unexpected blocktype %d\n",
+                cast[uint64](blocktype))
+        return -1
+    s_blocksize: uint32 = jbd2_be32(cast[Ptr[uint8]](cast[uint64](sb) + 0x0C))
+    s_maxlen:    uint32 = jbd2_be32(cast[Ptr[uint8]](cast[uint64](sb) + 0x10))
+    s_first:     uint32 = jbd2_be32(cast[Ptr[uint8]](cast[uint64](sb) + 0x14))
+    s_sequence:  uint32 = jbd2_be32(cast[Ptr[uint8]](cast[uint64](sb) + 0x18))
+    s_start:     uint32 = jbd2_be32(cast[Ptr[uint8]](cast[uint64](sb) + 0x1C))
+
+    # The journal block size must match what we were told the fs block
+    # size is — JBD2 keeps them equal for an internal journal.
+    if cast[uint64](s_blocksize) != fs_block_size:
+        printk2("jbd2: journal blocksize %d != fs blocksize %d\n",
+                cast[uint64](s_blocksize), fs_block_size)
+        # Trust the journal's own blocksize for journal I/O.
+        jbd2_block_size = cast[uint64](s_blocksize)
+
+    jbd2_maxlen   = cast[uint64](s_maxlen)
+    jbd2_first    = cast[uint64](s_first)
+    if jbd2_first == 0:
+        jbd2_first = 1
+    jbd2_sequence = s_sequence
+    if jbd2_sequence == 0:
+        jbd2_sequence = 1
+    jbd2_start    = cast[uint64](s_start)
+    jbd2_attached = 1
+
+    printk2("jbd2: journal magic=0x%x maxlen=%d\n",
+            cast[uint64](magic), jbd2_maxlen)
+    printk2("jbd2: first=%d sequence=%d\n",
+            jbd2_first, cast[uint64](jbd2_sequence))
+    printk1("jbd2: s_start=%d (0 = clean)\n", jbd2_start)
+    return 0
+
+
+# --- Persist an updated journal superblock ---------------------------
+#
+# After replay completes (or after a checkpoint frees the log) we
+# rewrite s_sequence / s_start so a later mount sees the journal as
+# clean. Marking s_start = 0 means "no committed-but-uncheckpointed
+# transactions remain" — the canonical JBD2 clean state.
+
+def jbd2_update_super(new_start: uint64, new_sequence: uint32) -> int32:
+    if jbd2_attached == 0:
+        return -1
+    if _jbd2_read_jblock(0, &jbd2_blk_buf[0]) != 0:
+        return -1
+    sb: Ptr[uint8] = &jbd2_blk_buf[0]
+    jbd2_put_be32(cast[Ptr[uint8]](cast[uint64](sb) + 0x18), new_sequence)
+    jbd2_put_be32(cast[Ptr[uint8]](cast[uint64](sb) + 0x1C),
+                  cast[uint32](new_start))
+    if _jbd2_write_jblock(0, &jbd2_blk_buf[0]) != 0:
+        return -1
+    blk_flush(jbd2_slot)
+    jbd2_start    = new_start
+    jbd2_sequence = new_sequence
+    return 0
+
+
+# --- Transaction staging ---------------------------------------------
+#
+# A transaction collects up to JBD2_TXN_MAX (final fs block number,
+# block contents) pairs. The contents are snapshotted into a staging
+# buffer at jbd2_txn_add time, so the caller may keep mutating its own
+# scratch afterwards. On commit we lay the staged blocks into the
+# journal (descriptor + data + commit) then checkpoint them to their
+# final destinations.
+
+JBD2_TXN_MAX: uint64 = 16
+
+class Jbd2Txn:
+    active:    int32
+    nblocks:   uint64
+    sequence:  uint32
+    pad:       uint32
+
+jbd2_txn: Jbd2Txn
+# Parallel arrays: destination fs block + staged contents.
+jbd2_txn_dest: Array[16, uint64]
+# 16 blocks x 4096 bytes of staging = 64 KiB .bss. Acceptable for the
+# single-mount, single-transaction model.
+jbd2_txn_data: Array[65536, uint8]
+
+
+def jbd2_txn_begin() -> int32:
+    if jbd2_attached == 0:
+        return -1
+    if jbd2_txn.active != 0:
+        printk0("jbd2: txn_begin while a txn is already active\n")
+        return -1
+    jbd2_txn.active   = 1
+    jbd2_txn.nblocks  = 0
+    jbd2_txn.sequence = jbd2_sequence
+    return 0
+
+
+def jbd2_txn_add(fs_block: uint64, buf: Ptr[uint8]) -> int32:
+    # Stage one metadata block (its FINAL fs block number + a snapshot
+    # of its new contents) into the running transaction.
+    if jbd2_txn.active == 0:
+        return -1
+    # Coalesce: if this fs block is already staged, overwrite its
+    # snapshot rather than logging it twice.
+    i: uint64 = 0
+    while i < jbd2_txn.nblocks:
+        if jbd2_txn_dest[i] == fs_block:
+            dst: uint64 = cast[uint64](&jbd2_txn_data[0]) \
+                        + i * jbd2_block_size
+            memcpy(cast[Ptr[uint8]](dst), buf, jbd2_block_size)
+            return 0
+        i = i + 1
+    if jbd2_txn.nblocks >= JBD2_TXN_MAX:
+        printk0("jbd2: transaction full (raise JBD2_TXN_MAX)\n")
+        return -1
+    idx: uint64 = jbd2_txn.nblocks
+    jbd2_txn_dest[idx] = fs_block
+    dst2: uint64 = cast[uint64](&jbd2_txn_data[0]) + idx * jbd2_block_size
+    memcpy(cast[Ptr[uint8]](dst2), buf, jbd2_block_size)
+    jbd2_txn.nblocks = idx + 1
+    return 0
+
+
+def jbd2_txn_abort():
+    jbd2_txn.active  = 0
+    jbd2_txn.nblocks = 0
+
+
+def _jbd2_log_capacity() -> uint64:
+    # Usable log blocks = maxlen - first (block 0 is the superblock).
+    if jbd2_maxlen <= jbd2_first:
+        return 0
+    return jbd2_maxlen - jbd2_first
+
+
+def _jbd2_wrap(blk: uint64) -> uint64:
+    # Map an ABSOLUTE journal block number into the circular log area
+    # [first, maxlen). For an in-range block this is the identity, so
+    # callers may pass either an in-range absolute block (s_start, head)
+    # or one that has run off the end of the log and needs wrapping.
+    cap: uint64 = _jbd2_log_capacity()
+    if cap == 0:
+        return jbd2_first
+    if blk < jbd2_first:
+        return jbd2_first + (blk % cap)
+    return jbd2_first + ((blk - jbd2_first) % cap)
+
+
+# --- Commit: write descriptor + data + commit into the journal --------
+#
+# Returns 0 on success. After this returns, the transaction is DURABLE
+# in the journal (a crash now is recoverable via replay), but the
+# blocks are NOT yet at their final on-disk homes — that's checkpoint.
+
+def jbd2_txn_commit() -> int32:
+    return _jbd2_txn_commit_internal(1)
+
+
+def jbd2_txn_commit_nocommitblk() -> int32:
+    # Write the descriptor + data blocks into the journal but DELIBERATELY
+    # skip the commit block. This stages a TORN transaction — exactly the
+    # state a crash leaves behind if power is lost after the data blocks
+    # land but before the commit block does. Recovery must DISCARD it.
+    # Used only by the crash-consistency self-test.
+    return _jbd2_txn_commit_internal(0)
+
+
+def _jbd2_txn_commit_internal(write_commit: int32) -> int32:
+    if jbd2_txn.active == 0:
+        return -1
+    n: uint64 = jbd2_txn.nblocks
+    if n == 0:
+        jbd2_txn.active = 0
+        return 0
+    # We need 1 descriptor + n data + 1 commit blocks in the log.
+    if n + 2 > _jbd2_log_capacity():
+        printk0("jbd2: transaction larger than journal capacity\n")
+        jbd2_txn_abort()
+        return -1
+    seq: uint32 = jbd2_txn.sequence
+
+    # The head of the log. If the journal is clean (start == 0), start
+    # logging at `first`.
+    head: uint64 = jbd2_start
+    if head == 0:
+        head = jbd2_first
+
+    # --- 1. Descriptor block ---------------------------------------
+    _jbd2_zero(&jbd2_blk_buf[0], jbd2_block_size)
+    desc: Ptr[uint8] = &jbd2_blk_buf[0]
+    jbd2_put_be32(desc, JBD2_MAGIC)
+    jbd2_put_be32(cast[Ptr[uint8]](cast[uint64](desc) + 4),
+                  JBD2_DESCRIPTOR_BLOCK)
+    jbd2_put_be32(cast[Ptr[uint8]](cast[uint64](desc) + 8), seq)
+    # Tag array starts right after the 12-byte header.
+    tagoff: uint64 = 12
+    i: uint64 = 0
+    while i < n:
+        tp: uint64 = cast[uint64](desc) + tagoff
+        jbd2_put_be32(cast[Ptr[uint8]](tp), cast[uint32](jbd2_txn_dest[i]))
+        flags: uint32 = JBD2_FLAG_SAME_UUID
+        if i == n - 1:
+            flags = flags | JBD2_FLAG_LAST_TAG
+        jbd2_put_be32(cast[Ptr[uint8]](tp + 4), flags)
+        tagoff = tagoff + JBD2_TAG_BYTES
+        i = i + 1
+    desc_lblk: uint64 = _jbd2_wrap(head)
+    if _jbd2_write_jblock(desc_lblk, &jbd2_blk_buf[0]) != 0:
+        printk0("jbd2: failed to write descriptor block\n")
+        jbd2_txn_abort()
+        return -1
+
+    # --- 2. Data blocks --------------------------------------------
+    j: uint64 = 0
+    while j < n:
+        data_lblk: uint64 = _jbd2_wrap(head + 1 + j)
+        src: uint64 = cast[uint64](&jbd2_txn_data[0]) + j * jbd2_block_size
+        if _jbd2_write_jblock(data_lblk,
+                              cast[Ptr[uint8]](src)) != 0:
+            printk0("jbd2: failed to write journal data block\n")
+            jbd2_txn_abort()
+            return -1
+        j = j + 1
+
+    # Barrier: descriptor + data must hit the medium before the commit
+    # block so a torn write can never leave a commit pointing at
+    # half-written data.
+    blk_flush(jbd2_slot)
+
+    # The on-disk superblock must point s_start at THIS transaction's
+    # descriptor and s_sequence at THIS transaction's id, so that a
+    # crash before checkpoint causes recovery to scan from here. We
+    # write it before the commit block: that way the torn-write case
+    # (no commit block) still leaves the superblock pointing at the
+    # half-written transaction, and recovery correctly discards it.
+    jbd2_update_super(_jbd2_wrap(head), seq)
+
+    if write_commit == 0:
+        # TORN-TRANSACTION simulation: stop here with NO commit block.
+        # The descriptor + data are on disk and the superblock points
+        # at them, but recovery will find no commit block and roll the
+        # whole transaction back.
+        jbd2_txn.active  = 0
+        jbd2_txn.nblocks = 0
+        printk1("jbd2: staged torn txn seq=%d (no commit block)\n",
+                cast[uint64](seq))
+        return 0
+
+    # --- 3. Commit block -------------------------------------------
+    _jbd2_zero(&jbd2_blk_buf[0], jbd2_block_size)
+    cmt: Ptr[uint8] = &jbd2_blk_buf[0]
+    jbd2_put_be32(cmt, JBD2_MAGIC)
+    jbd2_put_be32(cast[Ptr[uint8]](cast[uint64](cmt) + 4),
+                  JBD2_COMMIT_BLOCK)
+    jbd2_put_be32(cast[Ptr[uint8]](cast[uint64](cmt) + 8), seq)
+    commit_lblk: uint64 = _jbd2_wrap(head + 1 + n)
+    if _jbd2_write_jblock(commit_lblk, &jbd2_blk_buf[0]) != 0:
+        printk0("jbd2: failed to write commit block\n")
+        jbd2_txn_abort()
+        return -1
+    # The commit block itself must be durable before we report the
+    # transaction committed.
+    blk_flush(jbd2_slot)
+
+    # Advance the in-memory log head and bump the next sequence. The
+    # on-disk s_start still points at THIS txn's descriptor (set above)
+    # — the journal stays "dirty" until checkpoint completes, so a crash
+    # between commit and checkpoint still triggers replay on next mount.
+    new_head: uint64 = head + n + 2
+    jbd2_start    = _jbd2_wrap(new_head)
+    jbd2_sequence = seq + 1
+    return 0
+
+
+def jbd2_txn_skip_checkpoint():
+    # Test hook: declare the transaction committed-but-not-checkpointed.
+    # Used by the crash-consistency self-test to simulate a power loss
+    # AFTER the commit block landed but BEFORE checkpoint — the staged
+    # blocks must then be recovered by replay, not by checkpoint.
+    jbd2_txn.active  = 0
+    jbd2_txn.nblocks = 0
+
+
+def jbd2_txn_checkpoint() -> int32:
+    # Copy every staged block to its FINAL on-disk location, then mark
+    # the journal clean (s_start = 0). Must be called only after a
+    # successful jbd2_txn_commit.
+    if jbd2_attached == 0:
+        return -1
+    n: uint64 = jbd2_txn.nblocks
+    i: uint64 = 0
+    while i < n:
+        src: uint64 = cast[uint64](&jbd2_txn_data[0]) + i * jbd2_block_size
+        if _jbd2_write_fsblock(jbd2_txn_dest[i],
+                               cast[Ptr[uint8]](src)) != 0:
+            printk0("jbd2: checkpoint write failed\n")
+            return -1
+        i = i + 1
+    blk_flush(jbd2_slot)
+    # Journal is now clean — every committed change is at its final
+    # home. Mark s_start = 0 so the next mount sees nothing to replay.
+    jbd2_update_super(0, jbd2_sequence)
+    jbd2_txn.active  = 0
+    jbd2_txn.nblocks = 0
+    return 0
+
+
+def _jbd2_zero(p: Ptr[uint8], n: uint64):
+    i: uint64 = 0
+    while i < n:
+        p[i] = 0
+        i = i + 1
+
+
+# --- Recovery / replay ------------------------------------------------
+#
+# Scan the journal forward from `start_lblk` applying every fully
+# committed transaction (descriptor -> n data -> commit, all sharing
+# one sequence number). Stops at the first block that is not a valid
+# descriptor for the expected sequence, OR a descriptor whose commit
+# block is absent (a torn transaction) — that transaction and anything
+# after it is discarded.
+#
+# Returns the number of transactions replayed, or -1 on a fatal read
+# error. After a successful scan the journal superblock is marked clean.
+
+jbd2_replay_dests: Array[16, uint64]
+
+
+def jbd2_recover() -> int32:
+    if jbd2_attached == 0:
+        return -1
+    # Re-read the ON-DISK superblock so recovery uses the durable
+    # s_start / s_sequence, not whatever the in-memory head advanced to
+    # after a commit. This is what a real fresh mount would see.
+    if _jbd2_read_jblock(0, &jbd2_blk_buf[0]) != 0:
+        return -1
+    dsb: Ptr[uint8] = &jbd2_blk_buf[0]
+    disk_seq:   uint32 = jbd2_be32(cast[Ptr[uint8]](cast[uint64](dsb) + 0x18))
+    disk_start: uint32 = jbd2_be32(cast[Ptr[uint8]](cast[uint64](dsb) + 0x1C))
+    jbd2_start = cast[uint64](disk_start)
+    if disk_seq != 0:
+        jbd2_sequence = disk_seq
+    if jbd2_start == 0:
+        # Clean journal — nothing to replay.
+        printk0("jbd2: journal clean, no recovery needed\n")
+        return 0
+    printk1("jbd2: recovering from s_start=%d\n", jbd2_start)
+    cur: uint64 = jbd2_start
+    expect_seq: uint32 = jbd2_sequence
+    # On a real recovery the next sequence to expect is s_sequence; the
+    # committed transactions on disk carry s_sequence, s_sequence+1, ...
+    replayed: int32 = 0
+    cap: uint64 = _jbd2_log_capacity()
+    # Bound the scan to the whole log so a corrupt sequence can't loop.
+    scanned: uint64 = 0
+    while scanned <= cap:
+        scanned = scanned + 1
+        # Read the candidate descriptor block.
+        if _jbd2_read_jblock(_jbd2_wrap(cur), &jbd2_blk_buf[0]) != 0:
+            break
+        hdr: Ptr[uint8] = &jbd2_blk_buf[0]
+        magic: uint32 = jbd2_be32(hdr)
+        if magic != JBD2_MAGIC:
+            break
+        btype: uint32 = jbd2_be32(cast[Ptr[uint8]](cast[uint64](hdr) + 4))
+        bseq:  uint32 = jbd2_be32(cast[Ptr[uint8]](cast[uint64](hdr) + 8))
+        if btype != JBD2_DESCRIPTOR_BLOCK:
+            # No more descriptors (could be a stale commit/superblock).
+            break
+        if bseq != expect_seq:
+            # Sequence mismatch: this is stale log content from an older
+            # epoch, not part of the chain we are recovering.
+            break
+        # Parse the tag array to learn how many data blocks follow and
+        # where each one belongs.
+        ntags: uint64 = 0
+        tagoff: uint64 = 12
+        done: int32 = 0
+        while done == 0 and ntags < JBD2_TXN_MAX:
+            tp: uint64 = cast[uint64](hdr) + tagoff
+            t_blocknr: uint32 = jbd2_be32(cast[Ptr[uint8]](tp))
+            t_flags:   uint32 = jbd2_be32(cast[Ptr[uint8]](tp + 4))
+            jbd2_replay_dests[ntags] = cast[uint64](t_blocknr)
+            ntags = ntags + 1
+            tagoff = tagoff + JBD2_TAG_BYTES
+            if (t_flags & JBD2_FLAG_LAST_TAG) != 0:
+                done = 1
+        # The commit block sits right after descriptor + ntags data.
+        commit_lblk: uint64 = _jbd2_wrap(cur + 1 + ntags)
+        if _jbd2_read_jblock(commit_lblk, &jbd2_data_buf[0]) != 0:
+            break
+        cmt: Ptr[uint8] = &jbd2_data_buf[0]
+        cmagic: uint32 = jbd2_be32(cmt)
+        cbtype: uint32 = jbd2_be32(cast[Ptr[uint8]](cast[uint64](cmt) + 4))
+        cbseq:  uint32 = jbd2_be32(cast[Ptr[uint8]](cast[uint64](cmt) + 8))
+        if cmagic != JBD2_MAGIC or cbtype != JBD2_COMMIT_BLOCK \
+                or cbseq != bseq:
+            # TORN TRANSACTION: descriptor + data present but the commit
+            # block never landed (crash mid-commit). Discard it AND
+            # everything after — the log is no longer trustworthy past
+            # this point. The staged blocks were never checkpointed, so
+            # the main FS is untouched and stays consistent.
+            printk1("jbd2: incomplete txn seq=%d discarded (no commit)\n",
+                    cast[uint64](bseq))
+            break
+        # Fully committed: re-apply each data block to its final home.
+        k: uint64 = 0
+        while k < ntags:
+            data_lblk: uint64 = _jbd2_wrap(cur + 1 + k)
+            if _jbd2_read_jblock(data_lblk, &jbd2_data_buf[0]) != 0:
+                printk0("jbd2: replay data read failed\n")
+                return -1
+            if _jbd2_write_fsblock(jbd2_replay_dests[k],
+                                   &jbd2_data_buf[0]) != 0:
+                printk0("jbd2: replay data write failed\n")
+                return -1
+            k = k + 1
+        replayed = replayed + 1
+        printk2("jbd2: replayed txn seq=%d (%d blocks)\n",
+                cast[uint64](bseq), ntags)
+        # Advance past descriptor + data + commit to the next txn.
+        cur = cur + 1 + ntags + 1
+        expect_seq = bseq + 1
+    # Flush the replayed metadata, then mark the journal clean.
+    blk_flush(jbd2_slot)
+    jbd2_update_super(0, expect_seq)
+    printk1("jbd2: recovery complete, %d transaction(s) replayed\n",
+            cast[uint64](replayed))
+    return replayed

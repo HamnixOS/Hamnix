@@ -38,6 +38,16 @@ from drivers.rtc.cmos import rtc_read_unix_time
 # the new inode's i_uid/i_gid fields. Kernel-internal create paths
 # (mkfs root inode, blob_save) fall back to uid 1 (hostowner).
 from kernel.sched.core import current_task_uid, current_task_gid
+# #149: the ext4 journal (JBD2). ext4_init detects the has_journal
+# feature, reads the journal inode (conventionally inode 8), hands the
+# journal's logical->physical block map to jbd2_attach, and recovers
+# any uncheckpointed transactions on an unclean mount.
+from fs.jbd2 import (
+    jbd2_attach, jbd2_recover, jbd2_is_attached,
+    jbd2_txn_begin, jbd2_txn_add, jbd2_txn_commit, jbd2_txn_checkpoint,
+    jbd2_txn_skip_checkpoint, jbd2_txn_abort, jbd2_txn_commit_nocommitblk,
+    jbd2_super_magic_read,
+)
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
@@ -74,6 +84,27 @@ ext4_gdt_block:       uint64 = 0
 # byte offset 1024 from the partition start; two sectors (0..1023)
 # cover the boot area, and we need sectors 2..3 for the sb itself.
 ext4_sb_buf: Array[1024, uint8]
+
+# #149: journal (JBD2) mount state. s_feature_compat HAS_JOURNAL (0x4)
+# and s_journal_inum (sb offset 0xE0) tell us whether a journal exists
+# and which inode holds it. ext4_has_journal is 1 once jbd2_attach
+# parsed a valid JBD2 superblock from that inode.
+ext4_journal_inum: uint32 = 0
+ext4_has_journal:  int32  = 0
+
+# Journal logical->physical block map handed to jbd2_attach. The
+# journal inode's data blocks are resolved through the extent tree and
+# laid out here, indexed by journal logical block. 4096 entries covers
+# a 16 MiB journal at 4 KiB blocks / 4 MiB at 1 KiB blocks — enough for
+# every image we mint.
+EXT4_JOURNAL_MAP_MAX: uint64 = 4096
+ext4_journal_map: Array[4096, uint64]
+
+# Scratch block for the #149 journal crash-consistency self-test. Kept
+# separate from ext4_blk_buf so the self-test's stage-and-verify dance
+# (which reads back via ext4_blk_buf) never clobbers the block it just
+# staged. 4 KiB covers both 1 KiB and 4 KiB fs blocks.
+ext4_jtest_buf: Array[4096, uint8]
 
 
 def _ext4_read_u16(p: Ptr[uint8]) -> uint16:
@@ -126,6 +157,19 @@ def ext4_init(slot: int32) -> int32:
         ext4_desc_size = 32                    # legacy default
     ext4_gdt_block = ext4_first_data_blk + 1
 
+    # #149: read the journal feature flag + journal inode number from
+    # the superblock so the post-mount journal hookup knows whether to
+    # look for a JBD2 journal and where it lives.
+    feature_compat: uint32 = _ext4_read_u32(
+        cast[Ptr[uint8]](cast[uint64](sb) + 0x5C))
+    if (feature_compat & 0x4) != 0:
+        ext4_journal_inum = _ext4_read_u32(
+            cast[Ptr[uint8]](cast[uint64](sb) + 0xE0))
+        if ext4_journal_inum == 0:
+            ext4_journal_inum = 8          # JBD2 convention
+    else:
+        ext4_journal_inum = 0
+
     ext4_blockdev_slot = slot
     printk2("ext4: mounted; block_size=%d inodes_count=%d\n",
             ext4_block_size, ext4_inodes_count)
@@ -133,6 +177,62 @@ def ext4_init(slot: int32) -> int32:
             ext4_blocks_per_grp, ext4_inodes_per_grp)
     printk2("ext4:   first_data_block=%d inode_size=%d\n",
             ext4_first_data_blk, ext4_inode_size)
+
+    # #149: detect + attach + recover the journal. A no-journal image
+    # (^has_journal) leaves ext4_has_journal at 0 and the FS behaves
+    # exactly as before. A journalled image parses its JBD2 superblock
+    # and replays any uncheckpointed transactions before we return.
+    _ext4_journal_setup()
+    return 0
+
+
+def _ext4_journal_setup() -> int32:
+    # Build the journal inode's logical->physical block map and hand it
+    # to jbd2_attach, then run recovery. Returns 0 on success / no
+    # journal, -1 only if a journal exists but its superblock is bad.
+    ext4_has_journal = 0
+    if ext4_journal_inum == 0:
+        printk0("ext4: no journal (has_journal feature off)\n")
+        return 0
+    # Read the journal inode to learn its size (journal length).
+    jino: Array[256, uint8]
+    if ext4_read_inode(cast[uint64](ext4_journal_inum), &jino[0]) != 0:
+        printk0("ext4: failed to read journal inode\n")
+        return -1
+    jsize: uint64 = cast[uint64](ext4_inode_size_lo(&jino[0]))
+    # Some ext4 images keep the high 32 bits of journal size in
+    # i_size_high (offset 0x6C); the journals we mint are well under
+    # 4 GiB so the lo word is authoritative.
+    njblocks: uint64 = jsize / ext4_block_size
+    if njblocks == 0 or njblocks > EXT4_JOURNAL_MAP_MAX:
+        printk1("ext4: journal block count %d out of range\n", njblocks)
+        return -1
+    # Resolve every journal logical block to its physical fs block via
+    # the journal inode's extent tree.
+    lb: uint64 = 0
+    while lb < njblocks:
+        phys: uint64 = _ext4_logical_to_physical(&jino[0], lb)
+        if phys == 0:
+            printk1("ext4: journal lblk %d unmapped\n", lb)
+            return -1
+        ext4_journal_map[lb] = phys
+        lb = lb + 1
+    if jbd2_attach(ext4_blockdev_slot, ext4_block_size,
+                   &ext4_journal_map[0], njblocks) != 0:
+        printk0("ext4: jbd2_attach failed (journal superblock bad)\n")
+        return -1
+    ext4_has_journal = 1
+    printk0("ext4: journal attached (JBD2)\n")
+    # Replay any committed-but-uncheckpointed transactions left by an
+    # unclean shutdown. On a clean journal this is a no-op.
+    jbd2_recover()
+    return 0
+
+
+def ext4_journal_active() -> int32:
+    # 1 if a JBD2 journal is mounted and ready to wrap metadata writes.
+    if ext4_has_journal != 0 and jbd2_is_attached() != 0:
+        return 1
     return 0
 
 
@@ -171,6 +271,32 @@ def _ext4_write_block(block_nr: uint64, buf: Ptr[uint8]) -> int32:
     sectors_per_block: uint64 = ext4_block_size / SECTOR_SIZE
     lba: uint64 = block_nr * sectors_per_block
     return blk_write_sectors(ext4_blockdev_slot, lba, sectors_per_block, buf)
+
+
+def _ext4_journal_write_block(block_nr: uint64, buf: Ptr[uint8]) -> int32:
+    # #149: write a single METADATA block crash-consistently. When a
+    # JBD2 journal is mounted, the new block contents are first logged
+    # (descriptor + data + commit) and only then checkpointed to the
+    # final location — so a crash either leaves the OLD block intact
+    # (commit never reached the journal) or recovers the NEW block
+    # (commit landed, replay finishes the checkpoint). With no journal
+    # this degrades to a straight-through _ext4_write_block, matching
+    # the historical no-journal behaviour.
+    #
+    # This is ordered/metadata-mode journaling: only metadata blocks
+    # flow through here. File DATA is written straight to its final home
+    # by the ext4 write path BEFORE the metadata transaction commits.
+    if ext4_journal_active() == 0:
+        return _ext4_write_block(block_nr, buf)
+    if jbd2_txn_begin() != 0:
+        # Journal busy / unusable — fall back rather than lose the write.
+        return _ext4_write_block(block_nr, buf)
+    if jbd2_txn_add(block_nr, buf) != 0:
+        jbd2_txn_abort()
+        return _ext4_write_block(block_nr, buf)
+    if jbd2_txn_commit() != 0:
+        return _ext4_write_block(block_nr, buf)
+    return jbd2_txn_checkpoint()
 
 
 def ext4_read_inode(inum: uint64, out: Ptr[uint8]) -> int32:
@@ -1941,10 +2067,11 @@ def ext4_write_open_file(slot: int32, src: Ptr[uint8],
 # Delete a regular file from the root directory. Frees the inode,
 # frees its first data block (extent walks past one block aren't
 # yet wired — file extension is the same TODO), and tombstones its
-# dirent. Linux's ext4_unlink does this under the journal; we
-# don't have a journal, so the writes go straight to disk in the
-# same order Linux's no-journal path (`ext4_journal_get_write_access`
-# is a no-op without has_journal) commits them.
+# dirent. Linux's ext4_unlink does this under the journal. #149:
+# when a JBD2 journal is mounted, the dirent-tombstone block write
+# is wrapped in a transaction (_ext4_journal_write_block) so the
+# delete is crash-consistent; on a no-journal image the write goes
+# straight to disk in the same order Linux's no-journal path commits.
 
 def ext4_unlink(name: Ptr[char]) -> int32:
     if ext4_blockdev_slot < 0:
@@ -2017,7 +2144,7 @@ def ext4_unlink(name: Ptr[char]) -> int32:
         return -1
     _ext4_write_u32(cast[Ptr[uint8]](
         cast[uint64](&ext4_blk_buf[0]) + target_pos + 0), 0)
-    return _ext4_write_block(target_phys, &ext4_blk_buf[0])
+    return _ext4_journal_write_block(target_phys, &ext4_blk_buf[0])
 
 
 # --- truncate / ftruncate (M16.x §12.2) ---------------------------
@@ -2761,6 +2888,141 @@ def ext4_fsync_smoke_test() -> int32:
         return -1
     ext4_unlink("FSYNC.TXT")
     printk0("ext4: fsync smoke PASS\n")
+    return 0
+
+
+# --- #149 JBD2 crash-consistency self-test ------------------------
+#
+# Proves the journal actually makes the filesystem crash-consistent,
+# not merely that "writes work". Gated by a sentinel so it only runs
+# under scripts/test_ext4_journal.sh (ENABLE_EXT4_JOURNAL_TEST=1).
+#
+# It operates DIRECTLY on raw fs blocks (not files) so the assertions
+# are about concrete on-disk block contents, immune to higher-level
+# caching. It picks a scratch fs block well past the metadata + the
+# tiny set of files mkfs planted, writes a known byte to it, then:
+#
+#   Phase A (committed survives crash): start a txn that rewrites the
+#     scratch block to a new marker, COMMIT it to the journal, then
+#     DELIBERATELY skip checkpoint (== power lost after commit). The
+#     final fs block still holds the OLD marker at this point. Running
+#     recovery must re-apply the journalled block, so the final fs
+#     block ends up holding the NEW marker.
+#
+#   Phase B (torn rolls back): start a txn that would rewrite the block
+#     to a THIRD marker, write descriptor+data but NO commit block
+#     (== power lost mid-commit), then run recovery. Recovery must find
+#     no commit block and DISCARD the txn — the final fs block must
+#     still hold Phase A's NEW marker, never the third one.
+#
+#   Phase C: assert the JBD2 superblock magic actually read was
+#     0xC03B3998 — proves we parsed a real journal.
+#
+# A scratch fs block that no file or metadata uses. The journalled
+# images this test mints are >= 8 MiB with thousands of free blocks;
+# a block in the 600s is data-area free space on every layout we mint.
+EXT4_JTEST_SCRATCH_BLOCK: uint64 = 600
+
+# Distinct markers so a stale buffer can't accidentally satisfy an
+# assertion — each phase checks for a specific byte pattern.
+def _ext4_jtest_fill(buf: Ptr[uint8], tag: uint8):
+    _ext4_zero(buf, ext4_block_size)
+    i: uint64 = 0
+    while i < 16:
+        buf[i] = tag
+        i = i + 1
+
+
+def _ext4_jtest_check(blk: uint64, tag: uint8) -> int32:
+    # 1 if the first 16 bytes of fs block `blk` all equal `tag`.
+    if _ext4_read_block(blk, &ext4_blk_buf[0]) != 0:
+        return 0
+    i: uint64 = 0
+    while i < 16:
+        if ext4_blk_buf[i] != tag:
+            return 0
+        i = i + 1
+    return 1
+
+
+def ext4_journal_selftest() -> int32:
+    if ext4_blockdev_slot < 0:
+        return 0
+    if ext4_journal_active() == 0:
+        printk0("[ext4_journal] FAIL: no journal attached\n")
+        return -1
+
+    # Phase C first: prove we read a real JBD2 superblock.
+    magic: uint32 = jbd2_super_magic_read()
+    if magic != 0xC03B3998:
+        printk1("[ext4_journal] FAIL: journal magic 0x%x != 0xC03B3998\n",
+                cast[uint64](magic))
+        return -1
+    printk0("[ext4_journal] OK magic=0xC03B3998 (real JBD2 superblock parsed)\n")
+
+    blk: uint64 = EXT4_JTEST_SCRATCH_BLOCK
+
+    # Seed the scratch block with the OLD marker (0xA1) directly.
+    _ext4_jtest_fill(&ext4_jtest_buf[0], 0xA1)
+    if _ext4_write_block(blk, &ext4_jtest_buf[0]) != 0:
+        printk0("[ext4_journal] FAIL: seed write\n")
+        return -1
+    if _ext4_jtest_check(blk, 0xA1) == 0:
+        printk0("[ext4_journal] FAIL: seed readback\n")
+        return -1
+
+    # --- Phase A: committed transaction survives a crash -----------
+    if jbd2_txn_begin() != 0:
+        printk0("[ext4_journal] FAIL: txn_begin (A)\n")
+        return -1
+    _ext4_jtest_fill(&ext4_jtest_buf[0], 0xB2)        # NEW marker
+    if jbd2_txn_add(blk, &ext4_jtest_buf[0]) != 0:
+        printk0("[ext4_journal] FAIL: txn_add (A)\n")
+        return -1
+    if jbd2_txn_commit() != 0:
+        printk0("[ext4_journal] FAIL: txn_commit (A)\n")
+        return -1
+    # Simulate the crash: commit landed in the journal, but checkpoint
+    # NEVER ran. The final fs block must STILL hold the OLD marker.
+    jbd2_txn_skip_checkpoint()
+    if _ext4_jtest_check(blk, 0xA1) == 0:
+        printk0("[ext4_journal] FAIL: block changed before checkpoint?!\n")
+        return -1
+    printk0("[ext4_journal] OK committed-but-uncheckpointed: fs block still OLD\n")
+    # Recover. Replay must apply the journalled block to its final home.
+    if jbd2_recover() < 0:
+        printk0("[ext4_journal] FAIL: recover (A)\n")
+        return -1
+    if _ext4_jtest_check(blk, 0xB2) == 0:
+        printk0("[ext4_journal] FAIL: committed txn NOT applied after replay\n")
+        return -1
+    printk0("[ext4_journal] OK committed txn survived crash (replay applied NEW)\n")
+
+    # --- Phase B: torn (uncommitted) transaction rolls back --------
+    if jbd2_txn_begin() != 0:
+        printk0("[ext4_journal] FAIL: txn_begin (B)\n")
+        return -1
+    _ext4_jtest_fill(&ext4_jtest_buf[0], 0xC3)        # THIRD marker
+    if jbd2_txn_add(blk, &ext4_jtest_buf[0]) != 0:
+        printk0("[ext4_journal] FAIL: txn_add (B)\n")
+        return -1
+    # Write descriptor + data but NO commit block (torn / power loss).
+    if jbd2_txn_commit_nocommitblk() != 0:
+        printk0("[ext4_journal] FAIL: txn_commit_nocommitblk (B)\n")
+        return -1
+    # Recover. The torn txn has no commit block — it MUST be discarded.
+    if jbd2_recover() < 0:
+        printk0("[ext4_journal] FAIL: recover (B)\n")
+        return -1
+    if _ext4_jtest_check(blk, 0xC3) != 0:
+        printk0("[ext4_journal] FAIL: torn txn WAS applied (no rollback)\n")
+        return -1
+    if _ext4_jtest_check(blk, 0xB2) == 0:
+        printk0("[ext4_journal] FAIL: fs block corrupted after rollback\n")
+        return -1
+    printk0("[ext4_journal] OK torn txn rolled back (fs block unchanged)\n")
+
+    printk0("[ext4_journal] PASS crash-consistency (commit survives, torn rolls back)\n")
     return 0
 
 
