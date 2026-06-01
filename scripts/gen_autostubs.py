@@ -54,6 +54,7 @@ Stdout summary at the end:
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -65,6 +66,20 @@ HERE = Path(__file__).resolve().parent.parent
 KMODS = HERE / "kernel-modules"
 LINUX_ABI = HERE / "linux_abi"
 OUT = LINUX_ABI / "api_autostubs.ad"
+
+# Committed per-.ko UND-symbol manifest. Records, per curated .ko, the
+# catalog-matched UND symbol names. The generator UNIONS the manifest
+# with whatever .ko files are physically present at scan time, so a stub
+# for a transiently-absent driver (large .ko's like i915.ko / drm.ko are
+# harvested only by their own test, gitignored otherwise) survives a
+# build that doesn't have that .ko on disk. When a .ko IS present, its
+# manifest entry is refreshed/augmented (monotonic union, never shrinks)
+# and the manifest file rewritten — so the manifest is self-healing.
+#
+# This is what makes api_autostubs.ad a STABLE committed artifact: its
+# content is the union across ALL curated drivers, invariant to which
+# .ko subset a given build happens to have present.
+MANIFEST = LINUX_ABI / "autostub_und_manifest.json"
 
 # Catalog: ordered list of (regex, stub-kind, comment). Stub-kind drives
 # the emission shape in render_autostub_file(). The order matters only
@@ -169,6 +184,52 @@ def _scan_modules() -> tuple[list[Path], dict[str, list[str]]]:
             ko_files.append(ko)
             per_ko[ko.stem] = _und_symbols(ko)
     return ko_files, per_ko
+
+
+def _load_manifest() -> dict[str, list[str]]:
+    """Load the committed per-.ko UND manifest (ko_stem -> sorted names).
+
+    Returns an empty dict if the file is missing or unreadable — the
+    generator then degrades to pure live-scan behaviour (no crash).
+    """
+    if not MANIFEST.is_file():
+        return {}
+    try:
+        data = json.loads(MANIFEST.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, list[str]] = {}
+    for stem, syms in data.items():
+        if isinstance(syms, list):
+            out[str(stem)] = [str(s) for s in syms]
+    return out
+
+
+def _merge_manifest(manifest: dict[str, list[str]],
+                    per_ko_matched: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Union the live-scanned catalog-matched symbols into the manifest.
+
+    For each .ko present on disk, its manifest entry becomes the union of
+    the previously-recorded names and the freshly-scanned names — so the
+    manifest grows monotonically and self-heals when a driver IS present.
+    A .ko that is absent at scan time keeps its recorded entry untouched
+    (that is the whole point: transiently-absent drivers' stubs survive).
+    """
+    merged: dict[str, list[str]] = {k: list(v) for k, v in manifest.items()}
+    for stem, matched in per_ko_matched.items():
+        prev = set(merged.get(stem, []))
+        prev.update(matched)
+        merged[stem] = sorted(prev)
+    # Drop empty entries so the manifest stays tidy.
+    return {k: v for k, v in sorted(merged.items()) if v}
+
+
+def _manifest_text(manifest: dict[str, list[str]]) -> str:
+    """Deterministic, byte-stable JSON serialization of the manifest."""
+    ordered = {k: sorted(set(manifest[k])) for k in sorted(manifest)}
+    return json.dumps(ordered, indent=2, sort_keys=True) + "\n"
 
 
 def _classify(name: str) -> tuple[str | None, str | None, str]:
@@ -344,17 +405,37 @@ def render_autostub_file(matches: list[tuple[str, str, str | None, str]]) -> str
 
 # --- driver --------------------------------------------------------------
 
-def generate(verbose: bool = True) -> tuple[str, dict[str, int]]:
-    """Scan, classify, render. Returns (file-content, stats-dict).
+def generate(verbose: bool = True
+             ) -> tuple[str, dict[str, int], dict[str, list[str]]]:
+    """Scan, classify, render. Returns (file-content, stats, manifest).
 
-    stats keys: ko_files, und_total, matched, skipped_shimmed.
+    stats keys: ko_files, und_total, matched, skipped_shimmed,
+                manifest_only.
+    The returned manifest is the merged (live ∪ committed) per-.ko map;
+    main() persists it back to MANIFEST so it self-heals.
     """
     ko_files, per_ko_und = _scan_modules()
     shimmed = _existing_shimmed_names()
 
-    # Aggregate UND across all .ko (dedup — many .ko share the same
-    # tracepoint trampolines).
+    # Per-.ko catalog-matched UND symbols from the live scan. We record
+    # the matched set (not the raw UND set) so the committed manifest
+    # stays small and stable.
+    per_ko_matched: dict[str, list[str]] = {}
+    for stem, syms in per_ko_und.items():
+        matched = sorted({s for s in syms if _classify(s)[0] is not None})
+        if matched:
+            per_ko_matched[stem] = matched
+
+    # Merge live scan into the committed manifest (monotonic union).
+    manifest = _merge_manifest(_load_manifest(), per_ko_matched)
+
+    # The emitted stub set is the UNION across ALL curated drivers in
+    # the manifest — invariant to which .ko subset is present on disk.
     all_und: set[str] = set()
+    for syms in manifest.values():
+        all_und.update(syms)
+    # Also include any live UND that matched but somehow isn't catalogued
+    # yet (defensive — _merge_manifest already folds per_ko_matched in).
     for syms in per_ko_und.values():
         all_und.update(syms)
 
@@ -375,16 +456,24 @@ def generate(verbose: bool = True) -> tuple[str, dict[str, int]]:
 
     content = render_autostub_file(matches)
 
+    # How many manifest entries are for .ko absent from this scan — the
+    # stubs that would have been lost without the manifest union.
+    live_stems = set(per_ko_matched)
+    manifest_only = sum(1 for stem in manifest if stem not in live_stems)
+
     stats = {
         "ko_files": len(ko_files),
         "und_total": len(all_und),
         "matched": len(matches),
         "skipped_shimmed": skipped,
+        "manifest_only": manifest_only,
     }
 
     if verbose:
         print(f"[gen_autostubs] scanned {stats['ko_files']} .ko files, "
               f"{stats['und_total']} unique UND symbols")
+        print(f"[gen_autostubs] manifest: {len(manifest)} curated .ko "
+              f"({manifest_only} absent from this scan, stubs preserved)")
         for kind in ("bss64", "thunk", "noop", "ret0"):
             n = by_pattern.get(kind, 0)
             if n:
@@ -393,26 +482,49 @@ def generate(verbose: bool = True) -> tuple[str, dict[str, int]]:
         print(f"[gen_autostubs] matched {stats['matched']} trivial patterns, "
               f"{stats['skipped_shimmed']} skipped (already shimmed)")
 
-    return content, stats
+    return content, stats, manifest
 
 
 def main(argv: list[str]) -> int:
     print_only = "--print-only" in argv
     check = "--check" in argv
 
-    content, stats = generate(verbose=True)
+    content, stats, manifest = generate(verbose=True)
+    manifest_text = _manifest_text(manifest)
 
     if print_only:
         sys.stdout.write(content)
         return 0
 
     if check:
-        if OUT.is_file() and OUT.read_text(encoding="utf-8") == content:
-            print(f"[gen_autostubs] OK: {OUT.relative_to(HERE)} up to date")
+        ok = True
+        if not (OUT.is_file() and OUT.read_text(encoding="utf-8") == content):
+            print(f"[gen_autostubs] FAIL: {OUT.relative_to(HERE)} out of date "
+                  f"— rerun gen_autostubs.py")
+            ok = False
+        if not (MANIFEST.is_file()
+                and MANIFEST.read_text(encoding="utf-8") == manifest_text):
+            print(f"[gen_autostubs] FAIL: {MANIFEST.relative_to(HERE)} out of "
+                  f"date — rerun gen_autostubs.py")
+            ok = False
+        if ok:
+            print(f"[gen_autostubs] OK: {OUT.relative_to(HERE)} + "
+                  f"{MANIFEST.relative_to(HERE)} up to date")
             return 0
-        print(f"[gen_autostubs] FAIL: {OUT.relative_to(HERE)} out of date "
-              f"— rerun gen_autostubs.py")
         return 1
+
+    # Persist the self-healed manifest first (only when it changed) so a
+    # present-driver scan augments the committed union for next time.
+    prev_manifest: str | None = None
+    if MANIFEST.is_file():
+        try:
+            prev_manifest = MANIFEST.read_text(encoding="utf-8")
+        except OSError:
+            prev_manifest = None
+    if prev_manifest != manifest_text:
+        MANIFEST.write_text(manifest_text, encoding="utf-8")
+        print(f"[gen_autostubs] updated manifest {MANIFEST.relative_to(HERE)} "
+              f"({len(manifest)} curated .ko)")
 
     # Only rewrite if the content changed — keeps the file's mtime stable
     # so the kernel build doesn't see needless recompile triggers.
