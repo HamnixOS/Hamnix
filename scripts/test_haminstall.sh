@@ -46,7 +46,7 @@ PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
 ELF=build/hamnix-kernel.elf
-BOOT_TIMEOUT="${HAMINSTALL_TIMEOUT:-90}"
+BOOT_TIMEOUT="${HAMINSTALL_TIMEOUT:-150}"
 
 MKFS_EXT4="/sbin/mkfs.ext4"
 if [ ! -x "$MKFS_EXT4" ]; then
@@ -72,7 +72,7 @@ fi
 
 echo "[test_haminstall] (2/6) Build initramfs"
 INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null
-trap 'INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null 2>&1 || true; rm -f "${LOG:-}" "${ROOTIMG:-}" "${TGTIMG:-}" "${ESPIMG:-}"; rm -rf "${STAGE:-}"' EXIT
+trap 'INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null 2>&1 || true; rm -f "${LOG:-}" "${ROOTIMG:-}" "${TGTIMG:-}" "${ESPIMG:-}" "${FIFO:-}"; rm -rf "${STAGE:-}"' EXIT
 
 echo "[test_haminstall] (3/6) Rebuild kernel image"
 python3 -m compiler.adder compile \
@@ -125,37 +125,102 @@ source "$PROJ_ROOT/scripts/_kernel_iso.sh"
 KISO="$(kernel_iso "$ELF")"
 LOG="$(mktemp)"
 
+# Prompt-AWARE driver (see scripts/_qemu_drive.sh for the rationale): a
+# fixed `sleep 8` before the first keystroke races the boot. On current
+# main the kernel boot is heavier/slower (vDSO maps pages on every exec;
+# extra boot hooks) so the early-typed `haminstall vdb ...` command was
+# being shoved at the 16550 RX FIFO BEFORE hamsh reached its interactive
+# prompt and was lost — the target read back all-zero. Instead of racing
+# fixed sleeps we GATE each phase on a marker actually appearing in the
+# serial log:
+#   * first keystroke      <- hamsh interactive prompt is up
+#   * post-install command <- the installer printed "install complete"
+# A FIFO carries hamsh's stdin (held open for the feeder's lifetime so
+# QEMU's reader never sees EOF mid-run); the feeder tails $LOG and only
+# writes once the gating marker shows up, with a bounded backstop.
+HAMSH_READY='[hamsh:stage-07] loop-enter'
+INSTALL_DONE='[haminstall] install complete on /dev/blk/vdb'
+
+# wait_for_marker <literal-substring> <max-seconds> — returns 0 once the
+# substring appears in $LOG, 1 if the bound elapses first.
+wait_for_marker() {
+    local marker="$1"; local max="$2"; local waited=0
+    while [ "$waited" -lt "$max" ]; do
+        if [ -f "$LOG" ] && grep -aF -q "$marker" "$LOG"; then
+            return 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    return 1
+}
+
+FIFO="$(mktemp -u)"
+mkfifo "$FIFO"
+
 set +e
+# --- feeder: marker-gated keystroke driver --------------------------
 (
-    # Wait for the boot rc to finish and drop to interactive hamsh.
-    sleep 8
+    # Hold the FIFO open for writing for the whole feeder lifetime so
+    # QEMU's stdin reader doesn't see EOF between commands.
+    exec 9>"$FIFO"
+
+    # Phase 1: wait for hamsh to reach its interactive loop, then stage
+    # the manifest + source file. Bound: most of the boot budget.
+    if ! wait_for_marker "$HAMSH_READY" "$(( BOOT_TIMEOUT > 70 ? 70 : BOOT_TIMEOUT ))"; then
+        echo "[test_haminstall] feeder: hamsh prompt marker never appeared" \
+             "— boot stalled? (sending nothing; grep checks will FAIL)" >&2
+        exec 9>&-
+        exit 0
+    fi
+    # A short settle so hamsh has printed the prompt and has a live
+    # SYS_READ on stdin before the first byte lands.
+    sleep 1
     # Stage a tiny rootfs manifest + a source file. The manifest copies
     # one real file onto the new root so install_rootfs_from_manifest
     # exercises the per-file ext4 write path (target dir 'etc' created).
-    printf 'echo hamnix-haminstall-test > /tmp/src.txt\n'
+    printf 'echo hamnix-haminstall-test > /tmp/src.txt\n' >&9
     sleep 1
-    printf 'echo "etc/marker.txt /tmp/src.txt" > /tmp/m\n'
+    printf 'echo "etc/marker.txt /tmp/src.txt" > /tmp/m\n' >&9
     sleep 1
     # The install: GPT + mkfs + ESP copy (from vdc) + rootfs (manifest).
-    printf 'haminstall vdb --esp-src vdc --manifest /tmp/m\n'
-    sleep 25
-    printf 'echo HAMINSTALL_PRIMARY_DONE\n'
+    printf 'haminstall vdb --esp-src vdc --manifest /tmp/m\n' >&9
+
+    # Phase 2: gate the next command on the installer's completion marker
+    # instead of a blind sleep. The install does real GPT/mkfs/dd/rootfs
+    # work; key off "install complete" so we never proceed mid-format.
+    if wait_for_marker "$INSTALL_DONE" 40; then
+        sleep 1
+    else
+        # Backstop: if the marker is somehow missed, still drive the rest
+        # so the guard phase runs and the log/read-back checks decide.
+        echo "[test_haminstall] feeder: install-complete marker not seen" \
+             "within 40s after kicking install — proceeding anyway" >&2
+    fi
+    printf 'echo HAMINSTALL_PRIMARY_DONE\n' >&9
     sleep 2
     # The guard: targeting the live root disk (vda) must be REFUSED.
-    printf 'haminstall vda\n'
+    printf 'haminstall vda\n' >&9
     sleep 4
-    printf 'echo HAMINSTALL_GUARD_DONE\n'
+    printf 'echo HAMINSTALL_GUARD_DONE\n' >&9
     sleep 2
-    printf 'exit\n'
+    printf 'exit\n' >&9
     sleep 1
-) | timeout "${BOOT_TIMEOUT}s" qemu-system-x86_64 \
+    exec 9>&-
+) &
+FEEDER_PID=$!
+
+timeout "${BOOT_TIMEOUT}s" qemu-system-x86_64 \
     -boot d -cdrom "$KISO" \
     -drive if=virtio,file="$ROOTIMG",format=raw \
     -drive if=virtio,file="$TGTIMG",format=raw \
     -drive if=virtio,file="$ESPIMG",format=raw \
     -smp 2 -nographic -no-reboot -m 384M -monitor none -serial stdio \
+    < "$FIFO" \
     > "$LOG" 2>&1
 RC=$?
+wait "$FEEDER_PID" 2>/dev/null || true
+rm -f "$FIFO"
 set -e
 echo "[test_haminstall] QEMU rc=$RC (124 = timeout-killed is acceptable)"
 
