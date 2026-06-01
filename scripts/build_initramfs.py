@@ -646,6 +646,26 @@ if _CPIO_STRESS_RAW:
             _payload = b"x\n"
         FILES.append((f"/cpio-stress/file{_i}", _payload))
 
+# hamnix-ac source injection: scripts/hamnix-ac stages a host-side Adder
+# source FILE into the cpio at a known in-guest path so the on-device
+# self-hosted compiler (codegen_ac_driver) can open()+read() it, lex it,
+# parse it, codegen it, and elf_emit it. HAMNIX_AC_SRC names the host
+# file; HAMNIX_AC_SRC_PATH (default /src/input.ad) is the in-guest path
+# the driver opens. This is the file-read injection mechanism — it scales
+# to arbitrarily large sources (subject only to the driver's read buffer
+# and the compiler's CODE_CAP), unlike build-time string embedding.
+_CC_SRC = os.environ.get("HAMNIX_AC_SRC", "")
+if _CC_SRC:
+    _cc_src_path = os.environ.get("HAMNIX_AC_SRC_PATH", "/src/input.ad")
+    _cc_src_file = Path(_CC_SRC)
+    if not _cc_src_file.is_file():
+        raise SystemExit(
+            f"HAMNIX_AC_SRC={_CC_SRC!r}: source file not found")
+    _cc_src_bytes = _cc_src_file.read_bytes()
+    FILES.append((_cc_src_path, _cc_src_bytes))
+    print(f"  [hamnix-ac] staged {_cc_src_path} "
+          f"({len(_cc_src_bytes)} bytes from {_CC_SRC})")
+
 # Multi-NIC L-shim scale-out: r8169.ko (Realtek consumer GbE) and
 # igb.ko (Intel server/workstation). scripts/test_r8169_ko.sh sets
 # ENABLE_R8169_KO=1 to plant /etc/r8169-ko; scripts/test_igb_ko.sh

@@ -1,0 +1,244 @@
+# adder/compiler/codegen_ac_driver.ad
+#
+# hamnix-ac — generalized on-device Adder compile driver.
+#
+# This is the host-driven generalization of codegen_elf_selftest.ad. Where
+# the selftest baked a HARDCODED Adder snippet into its own source, this
+# driver instead READS the source to compile from a file the host staged
+# into the initramfs (default /src/input.ad). That is the only structural
+# difference — everything downstream (lex -> parse -> codegen ->
+# elf_emit -> hex-dump-over-serial) is identical, so the host harness
+# (scripts/hamnix-ac) can reuse the proven capture/reconstruct flow.
+#
+# Source injection mechanism: FILE-READ (sys_open + sys_read). This was
+# chosen over build-time string embedding because it scales to arbitrarily
+# large sources without recompiling the driver and without tripping the
+# seed compiler's Ptr[uint8]-global-string-literal limit. The host stages
+# any <input.ad> at the known path via build_initramfs.py's HAMNIX_AC_SRC
+# hook; the driver simply opens that path and reads it into a fixed buffer.
+#
+# Pipeline:
+#   1. open()+read() the injected source into cc_src[] (a module-level
+#      buffer that stays alive for the whole compile — the lexer keeps a
+#      pointer into it, so it must NOT be a transient stack array),
+#   2. lex   (lexer.ad),
+#   3. parse (parser.ad)  -> AST,
+#   4. codegen (codegen.ad) -> x86_64 machine-code bytes,
+#   5. elf_emit (elf_emit.ad) -> a complete loadable elf32-i386 user ELF
+#      with a _start stub that calls the compiled entry at vaddr 0 and
+#      exits with its return value.
+#
+# It then hex-dumps the emitted ELF between [hamnix_ac_emit] HEXBEGIN /
+# HEXEND sentinels for the host to capture. Distinct sentinels (vs the
+# selftest's [selfhost_elf_emit]) keep the two harnesses independent.
+#
+# On any stage error it prints a clear [hamnix_ac_emit] FAIL diagnostic
+# (with the offending line where available) and SYS_EXITs nonzero, so the
+# host caller surfaces the on-device error rather than reconstructing a
+# truncated ELF.
+#
+# Build:
+#   python3 -m compiler.adder compile --target=x86_64-adder-user \
+#       adder/compiler/codegen_ac_driver.ad \
+#       -o build/user/codegen_ac_driver.elf
+
+from compiler.lexer import (
+    lex_init,
+    lex_tokenize,
+    tok_count,
+)
+
+from compiler.parser import (
+    parser_init,
+    parse_program,
+    p_err,
+    p_err_line,
+    nd_kind,
+    nd_b,
+    ND_FUNCTION,
+)
+
+from compiler.codegen import (
+    cg_init,
+    cg_err,
+    code_len,
+    gen_program_with_globals,
+    gdata_len,
+    fn_count,
+    CODE_CAP,
+)
+
+from compiler.elf_emit import (
+    elf_emit_image,
+    elf_buf,
+    elf_len,
+    elf_err,
+    elf_entry_vaddr,
+)
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_exit(code: uint64)
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+
+# Module-level source buffer. The lexer stores the bare pointer we hand it
+# (lex_src), so the bytes must outlive the whole compile — hence a global,
+# not a function-local. 64 KiB is comfortably larger than any input the
+# CODE_CAP=8192 backend can compile today; the host reports the actual
+# source size it injected, so buffer-scaling is observable from the host.
+CC_SRC_CAP: uint32 = 65536
+cc_src: Array[65536, uint8]
+
+
+def strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def emit(msg: Ptr[uint8]):
+    sys_write(1, msg, strlen(msg))
+
+
+def put_u32(v: uint32):
+    if v == 0:
+        sys_write(1, "0", 1)
+        return
+    digits: Array[16, uint8]
+    i: uint64 = 0
+    n: uint32 = v
+    while n != 0:
+        digits[i] = cast[uint8](n % 10) + 48
+        n = n / 10
+        i = i + 1
+    out: Array[16, uint8]
+    j: uint64 = 0
+    while j < i:
+        out[j] = digits[i - 1 - j]
+        j = j + 1
+    sys_write(1, &out[0], i)
+
+
+# Map a 0..15 nibble to its lowercase hex ASCII digit.
+def hex_digit(v: uint32) -> uint32:
+    if v < 10:
+        return v + 48          # '0'..'9'
+    return v + 87              # 'a'..'f'
+
+
+# Dump elf_buf[0..elf_len) as one continuous lowercase-hex stream,
+# wrapped at 64 hex chars (32 bytes) per line for sane serial capture.
+def dump_hex():
+    line: Array[80, uint8]
+    col: uint32 = 0
+    i: uint32 = 0
+    while i < elf_len:
+        b: uint32 = cast[uint32](elf_buf[i])
+        line[col] = cast[uint8](hex_digit((b >> 4) & 15))
+        col = col + 1
+        line[col] = cast[uint8](hex_digit(b & 15))
+        col = col + 1
+        if col >= 64:
+            line[col] = 10        # '\n'
+            sys_write(1, &line[0], cast[uint64](col + 1))
+            col = 0
+        i = i + 1
+    if col > 0:
+        line[col] = 10
+        sys_write(1, &line[0], cast[uint64](col + 1))
+
+
+# Read the injected source at /src/input.ad into cc_src[]. Returns the
+# byte count read (>0), or 0 on open/read failure / empty file.
+def read_source() -> uint32:
+    fd: int32 = sys_open("/src/input.ad")
+    if fd < 0:
+        return 0
+    total: uint32 = 0
+    while total < CC_SRC_CAP:
+        n: int64 = sys_read(fd,
+                            cast[Ptr[uint8]](cast[uint64](&cc_src[0]) +
+                                             cast[uint64](total)),
+                            cast[uint64](CC_SRC_CAP - total))
+        if n <= 0:
+            break
+        total = total + cast[uint32](n)
+    sys_close(fd)
+    # NUL-terminate so the lexer's lex_cur()==0 EOF guard is well-defined
+    # even if a token scan runs slightly past lex_src_len.
+    if total < CC_SRC_CAP:
+        cc_src[total] = 0
+    return total
+
+
+def main() -> int32:
+    emit("[hamnix_ac_emit] start\n")
+
+    n: uint32 = read_source()
+    if n == 0:
+        emit("[hamnix_ac_emit] FAIL: cannot read /src/input.ad\n")
+        sys_exit(2)
+    emit("[hamnix_ac_emit] src bytes=")
+    put_u32(n)
+    emit("\n")
+
+    lex_init(&cc_src[0], n)
+    lex_tokenize()
+    emit("[hamnix_ac_emit] tokens=")
+    put_u32(tok_count)
+    emit("\n")
+
+    parser_init()
+    prog: uint32 = parse_program()
+    if p_err != 0:
+        emit("[hamnix_ac_emit] FAIL: parse error at line ")
+        put_u32(p_err_line)
+        emit("\n")
+        sys_exit(3)
+
+    # The program must declare at least one function (the entry).
+    decls: uint32 = nd_b[prog]
+    if nd_kind[decls] != ND_FUNCTION:
+        emit("[hamnix_ac_emit] FAIL: first decl not a function\n")
+        sys_exit(4)
+
+    cg_init()
+    start: uint32 = gen_program_with_globals(prog)
+    if cg_err != 0:
+        emit("[hamnix_ac_emit] FAIL: codegen error\n")
+        sys_exit(5)
+    if start != 0:
+        emit("[hamnix_ac_emit] FAIL: entry not at code offset 0\n")
+        sys_exit(6)
+
+    emit("[hamnix_ac_emit] codegen ok: ")
+    put_u32(fn_count)
+    emit(" funcs, code_len=")
+    put_u32(code_len)
+    emit(" gdata_len=")
+    put_u32(gdata_len)
+    emit("\n")
+
+    # Wrap the emitted code/data buffers into a complete user ELF. The
+    # entry arg is irrelevant (entry fn takes no params) — pass 0.
+    total: uint32 = elf_emit_image(0)
+    if elf_err != 0 or total == 0:
+        emit("[hamnix_ac_emit] FAIL: ELF emit error\n")
+        sys_exit(7)
+
+    emit("[hamnix_ac_emit] elf ok: bytes=")
+    put_u32(elf_len)
+    emit(" entry_vaddr=")
+    put_u32(elf_entry_vaddr)
+    emit(" code_cap=")
+    put_u32(CODE_CAP)
+    emit("\n")
+
+    # Emit the image as hex, bracketed by host-capturable sentinels.
+    emit("[hamnix_ac_emit] HEXBEGIN\n")
+    dump_hex()
+    emit("[hamnix_ac_emit] HEXEND\n")
+    emit("[hamnix_ac_emit] PASS\n")
+    return 0

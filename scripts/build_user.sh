@@ -229,3 +229,14 @@ python3 -m compiler.adder compile \
     adder/compiler/codegen_elf_selftest.ad \
     -o build/user/codegen_elf_selftest.elf
 file build/user/codegen_elf_selftest.elf
+
+# --- hamnix-ac: generalized on-device Adder compile driver -----------
+# Same pipeline as codegen_elf_selftest, but reads the source to compile
+# from a host-injected file (/src/input.ad) instead of a baked snippet.
+# Consumed by scripts/hamnix-ac and scripts/test_hamnix_ac.sh.
+echo "[build_user] compiling adder/compiler/codegen_ac_driver.ad -> build/user/codegen_ac_driver.elf"
+python3 -m compiler.adder compile \
+    --target=x86_64-adder-user \
+    adder/compiler/codegen_ac_driver.ad \
+    -o build/user/codegen_ac_driver.elf
+file build/user/codegen_ac_driver.elf

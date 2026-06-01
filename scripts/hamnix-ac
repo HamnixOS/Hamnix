@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+# scripts/hamnix-ac — host-driven, on-device Adder compiler.
+#
+#   scripts/hamnix-ac <input.ad> [-o <output.elf>]
+#
+# Compiles an arbitrary host-side Adder source FILE by running the
+# SELF-HOSTED Adder compiler (lexer.ad -> parser.ad -> codegen.ad ->
+# elf_emit.ad) ON-DEVICE inside Hamnix under QEMU, then extracts the
+# emitted elf32-i386 image back to the host.
+#
+# This generalizes scripts/test_selfhost_elf.sh / codegen_elf_selftest.ad:
+# instead of a HARDCODED embedded snippet, the source is supplied by the
+# caller and staged into the initramfs at /src/input.ad. The on-device
+# driver (adder/compiler/codegen_ac_driver.ad) open()+read()s that path,
+# runs the full pipeline, and hex-dumps the resulting ELF to serial. We
+# capture the hex between [hamnix_ac_emit] HEXBEGIN/HEXEND sentinels and
+# reconstruct the exact bytes into <output.elf>.
+#
+# Injection mechanism: FILE-READ. Chosen over build-time string embedding
+# because it scales to arbitrarily large sources (no driver recompile, no
+# Ptr[uint8]-global-string-literal seed-compiler limit). The driver's
+# read buffer is 64 KiB; the real ceiling on what compiles is the
+# backend's CODE_CAP=8192 code window, not the injection path.
+#
+# Exit status:
+#   0  — on-device compile succeeded; <output.elf> written.
+#   non-zero — on-device lexer/parser/codegen/elf error (the on-device
+#              [hamnix_ac_emit] FAIL diagnostic is echoed to stderr), or a
+#              harness/QEMU failure. No truncated ELF is produced on error.
+
+. "$(dirname "$0")/_build_lock.sh"
+
+set -euo pipefail
+PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$PROJ_ROOT"
+
+usage() {
+    echo "usage: scripts/hamnix-ac <input.ad> [-o <output.elf>]" >&2
+    exit 2
+}
+
+INPUT=""
+OUTPUT=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o)
+            shift; [ $# -gt 0 ] || usage
+            OUTPUT="$1"; shift ;;
+        -o*)
+            OUTPUT="${1#-o}"; shift ;;
+        -h|--help) usage ;;
+        -*)
+            echo "hamnix-ac: unknown option: $1" >&2; usage ;;
+        *)
+            if [ -z "$INPUT" ]; then INPUT="$1"; else usage; fi
+            shift ;;
+    esac
+done
+
+[ -n "$INPUT" ] || usage
+if [ ! -f "$INPUT" ]; then
+    echo "hamnix-ac: input not found: $INPUT" >&2
+    exit 2
+fi
+# Resolve to an absolute path so build_initramfs.py (run from PROJ_ROOT)
+# can find it regardless of the caller's CWD.
+INPUT_ABS="$(cd "$(dirname "$INPUT")" && pwd)/$(basename "$INPUT")"
+
+if [ -z "$OUTPUT" ]; then
+    OUTPUT="$(basename "$INPUT")"
+    OUTPUT="${OUTPUT%.ad}.elf"
+fi
+# Make OUTPUT absolute too (we cd into PROJ_ROOT).
+case "$OUTPUT" in
+    /*) : ;;
+    *)  OUTPUT="$(pwd)/$OUTPUT" ;;
+esac
+
+ELF=build/hamnix-kernel.elf
+HAMSH_ELF=build/user/hamsh.elf
+DRIVER_ELF=build/user/codegen_ac_driver.elf
+
+# ---------------------------------------------------------------------
+# (1/5) Bootstrap: seed-compile the on-device driver to assembly, prove
+#       it links against the self-hosted compiler + elf_emit.
+# ---------------------------------------------------------------------
+echo "[hamnix_ac] (1/5) Bootstrap: compile codegen_ac_driver.ad to assembly" >&2
+python3 -m compiler.adder compile \
+    --target=x86_64-adder-user \
+    --emit-asm \
+    adder/compiler/codegen_ac_driver.ad \
+    -o /tmp/hamnix_ac_bootstrap.elf >/dev/null
+BOOT_S=adder/compiler/codegen_ac_driver.s
+if grep -q "^elf_emit_image:" "$BOOT_S" && \
+   grep -q "^gen_program_with_globals:" "$BOOT_S"; then
+    echo "[hamnix_ac] OK: self-hosted compiler symbols present" >&2
+else
+    echo "[hamnix_ac] FAIL: driver assembly missing expected symbols" >&2
+    rm -f "$BOOT_S"
+    exit 1
+fi
+rm -f "$BOOT_S"
+
+# ---------------------------------------------------------------------
+# (2/5) Build userland (incl. codegen_ac_driver) + modules.
+# ---------------------------------------------------------------------
+echo "[hamnix_ac] (2/5) Build userland + modules" >&2
+bash scripts/build_user.sh >/dev/null
+if [ ! -f "$DRIVER_ELF" ]; then
+    echo "[hamnix_ac] FAIL: $DRIVER_ELF not built" >&2
+    exit 1
+fi
+bash scripts/build_modules.sh >/dev/null
+
+# ---------------------------------------------------------------------
+# (3/5) Stage source at /src/input.ad, embed hamsh as /init, build kernel.
+# ---------------------------------------------------------------------
+echo "[hamnix_ac] (3/5) Stage $INPUT -> /src/input.ad + build kernel" >&2
+INIT_ELF="$HAMSH_ELF" HAMNIX_AC_SRC="$INPUT_ABS" \
+    python3 scripts/build_initramfs.py >/dev/null
+python3 -m compiler.adder compile \
+    --target=x86_64-bare-metal \
+    init/main.ad \
+    -o "$ELF" >/dev/null
+
+# Restore the default initramfs on exit so a run doesn't leave a stale
+# /init or a stale staged /src/input.ad behind.
+trap 'INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null 2>&1 || true' EXIT
+
+run_qemu() {
+    # $1 = log file, $2 = command to type, $3 = regex to wait for.
+    local log="$1" cmd="$2" donere="$3"
+    local fifo
+    fifo=$(mktemp -u)
+    mkfifo "$fifo"
+    (
+        exec 3>"$fifo"
+        for _ in $(seq 1 600); do
+            grep -q "shell ready" "$log" 2>/dev/null && break
+            sleep 0.1
+        done
+        sleep 1
+        printf '%s\n' "$cmd" >&3
+        for _ in $(seq 1 900); do
+            grep -Eq "$donere" "$log" 2>/dev/null && break
+            sleep 0.1
+        done
+        sleep 1
+        printf 'exit\n' >&3
+        sleep 1
+        exec 3>&-
+    ) &
+    local driver_pid=$!
+    timeout 180s qemu-system-x86_64 \
+        -kernel "$ELF" \
+        -smp 2 \
+        -nographic \
+        -no-reboot \
+        -m 256M \
+        -monitor none \
+        -serial stdio \
+        < "$fifo" \
+        > "$log" 2>&1
+    local rc=$?
+    kill "$driver_pid" 2>/dev/null
+    wait "$driver_pid" 2>/dev/null || true
+    rm -f "$fifo"
+    return $rc
+}
+
+# ---------------------------------------------------------------------
+# (4/5) Boot QEMU, run the on-device compile, capture serial.
+# ---------------------------------------------------------------------
+echo "[hamnix_ac] (4/5) Boot Hamnix, compile on-device" >&2
+LOG=$(mktemp)
+set +e
+run_qemu "$LOG" "/bin/codegen_ac_driver" '\[hamnix_ac_emit\] (PASS|FAIL)'
+qrc=$?
+set -e
+
+echo "[hamnix_ac] --- on-device emit lines ---" >&2
+grep -E '\[hamnix_ac_emit\]' "$LOG" | grep -v HEXBEGIN | grep -v HEXEND | head -20 >&2 || true
+echo "[hamnix_ac] --- end ---" >&2
+
+if grep -F -q "[hamnix_ac_emit] FAIL" "$LOG"; then
+    echo "[hamnix_ac] ERROR: on-device compile failed:" >&2
+    grep -F "[hamnix_ac_emit] FAIL" "$LOG" >&2 || true
+    rm -f "$LOG"
+    exit 3
+fi
+if ! grep -F -q "[hamnix_ac_emit] PASS" "$LOG"; then
+    echo "[hamnix_ac] ERROR: on-device compile did not reach PASS (qemu rc=${qrc})" >&2
+    tail -n 60 "$LOG" >&2
+    rm -f "$LOG"
+    exit 1
+fi
+
+# ---------------------------------------------------------------------
+# (5/5) Reconstruct the emitted ELF from serial hex into <output.elf>.
+# ---------------------------------------------------------------------
+echo "[hamnix_ac] (5/5) Reconstruct emitted ELF -> $OUTPUT" >&2
+awk '/\[hamnix_ac_emit\] HEXBEGIN/{f=1;next} /\[hamnix_ac_emit\] HEXEND/{f=0} f' "$LOG" \
+    | tr -d '\r\n ' > /tmp/hamnix_ac_emitted.hex
+HEXLEN=$(wc -c < /tmp/hamnix_ac_emitted.hex)
+if [ "$HEXLEN" -lt 200 ] || [ $((HEXLEN % 2)) -ne 0 ]; then
+    echo "[hamnix_ac] ERROR: implausible hex capture length ${HEXLEN}" >&2
+    rm -f "$LOG" /tmp/hamnix_ac_emitted.hex
+    exit 1
+fi
+mkdir -p "$(dirname "$OUTPUT")"
+python3 -c "import binascii,sys; open(sys.argv[1],'wb').write(binascii.unhexlify(open('/tmp/hamnix_ac_emitted.hex','rb').read().strip()))" "$OUTPUT"
+rm -f /tmp/hamnix_ac_emitted.hex "$LOG"
+
+if [ ! -s "$OUTPUT" ]; then
+    echo "[hamnix_ac] ERROR: reconstructed ELF is empty" >&2
+    exit 1
+fi
+# Sanity: ELF magic (0x7f 'E' 'L' 'F').
+if [ "$(head -c4 "$OUTPUT" | od -An -tx1 | tr -d ' \n')" != "7f454c46" ]; then
+    echo "[hamnix_ac] ERROR: reconstructed file lacks ELF magic" >&2
+    exit 1
+fi
+
+NBYTES=$(wc -c < "$OUTPUT")
+echo "[hamnix_ac] compiled $INPUT -> $OUTPUT (${NBYTES} bytes)" >&2
+exit 0
