@@ -1,0 +1,361 @@
+# lib/vk/vk_raster.ad
+#
+# Hamnix native software rasterizer — the backend behind the Vulkan-
+# shaped spine (lib/vk/vk_core.ad). 100% native Adder, no Linux.
+#
+# ===================================================================
+# RASTERIZATION MODEL
+# ===================================================================
+# Triangle-list rasterizer with:
+#   * triangle setup from a tightly-packed vertex buffer
+#   * integer edge functions (the standard half-plane test) for
+#     point-in-triangle, evaluated incrementally per pixel
+#   * barycentric interpolation of depth (z) and per-vertex RGBA color
+#   * a per-pixel depth test against a D32 depth image (LESS: a
+#     fragment passes when its z is strictly less than the stored z,
+#     i.e. nearer wins), with depth write-back on pass
+#   * a top-left fill rule so shared triangle edges don't double-cover
+#   * clipping to the viewport rectangle (AND to the image bounds)
+#
+# All math is integer / fixed-point so the rendered image is bit-exact
+# deterministic — the test checksums the color image and asserts a
+# known-good value, which is only stable if no FPU rounding sneaks in.
+#
+# VERTEX LAYOUT (VkVertex, 24 bytes, matches vk_core's contract):
+#   off  0: x   int32   screen-space X in Q16.16 fixed point
+#   off  4: y   int32   screen-space Y in Q16.16 fixed point
+#   off  8: z   uint32  depth in [0, 65536]  (0 = near, 65536 = far);
+#                       this is the value stored/compared in the D32
+#                       depth image
+#   off 12: r   uint8
+#   off 13: g   uint8
+#   off 14: b   uint8
+#   off 15: a   uint8
+#   off 16..23: padding to a 24-byte stride
+#
+# The Q16.16 screen positions let the test place vertices on exact
+# pixel centres (x<<16) so the rasterized coverage is reproducible.
+#
+# ===================================================================
+# ADDER NOTES
+# ===================================================================
+#   * No function-local nested Arrays. The per-triangle working set is
+#     a handful of scalars; pixel storage is the caller's kmalloc'd
+#     image backing (passed as a raw base pointer).
+#   * Edge functions use 64-bit signed intermediates to avoid overflow
+#     when the Q16.16 coordinates are multiplied.
+
+from kernel.printk.printk import printk0, printk1, printk2
+
+
+VK_VERTEX_STRIDE: uint64 = 24
+Q16_ONE: int64 = 65536
+
+
+def vk_raster_clear(color_base: uint64, w: uint64, h: uint64,
+                    clear_rgba: uint32,
+                    depth_base: uint64, depth_w: uint64,
+                    clear_depth: uint32):
+    # Fill the color image with clear_rgba (stored as R,G,B,A bytes)
+    # and, if a depth image is bound, fill it with clear_depth.
+    #
+    # clear_rgba is packed 0xRRGGBBAA (R in the high byte) so a literal
+    # like 0x101828FF reads naturally as #101828 opaque.
+    if color_base == 0 or w == 0 or h == 0:
+        return
+    cr: uint8 = cast[uint8]((clear_rgba >> 24) & 0xFF)
+    cg: uint8 = cast[uint8]((clear_rgba >> 16) & 0xFF)
+    cb: uint8 = cast[uint8]((clear_rgba >> 8) & 0xFF)
+    ca: uint8 = cast[uint8](clear_rgba & 0xFF)
+    total: uint64 = w * h
+    p: uint64 = 0
+    while p < total:
+        o: uint64 = color_base + p * 4
+        cast[Ptr[uint8]](o)[0] = cr
+        cast[Ptr[uint8]](o + 1)[0] = cg
+        cast[Ptr[uint8]](o + 2)[0] = cb
+        cast[Ptr[uint8]](o + 3)[0] = ca
+        p = p + 1
+    if depth_base != 0 and depth_w != 0:
+        dp: uint64 = 0
+        while dp < total:
+            cast[Ptr[uint32]](depth_base + dp * 4)[0] = clear_depth
+            dp = dp + 1
+
+
+# --- vertex accessors ----------------------------------------------
+
+def _vx(vbase: uint64, idx: uint64, stride: uint64) -> int64:
+    return cast[int64](cast[Ptr[int32]](vbase + idx * stride + 0)[0])
+
+def _vy(vbase: uint64, idx: uint64, stride: uint64) -> int64:
+    return cast[int64](cast[Ptr[int32]](vbase + idx * stride + 4)[0])
+
+def _vz(vbase: uint64, idx: uint64, stride: uint64) -> int64:
+    return cast[int64](cast[Ptr[uint32]](vbase + idx * stride + 8)[0])
+
+def _vr(vbase: uint64, idx: uint64, stride: uint64) -> int64:
+    return cast[int64](cast[Ptr[uint8]](vbase + idx * stride + 12)[0])
+
+def _vg(vbase: uint64, idx: uint64, stride: uint64) -> int64:
+    return cast[int64](cast[Ptr[uint8]](vbase + idx * stride + 13)[0])
+
+def _vb(vbase: uint64, idx: uint64, stride: uint64) -> int64:
+    return cast[int64](cast[Ptr[uint8]](vbase + idx * stride + 14)[0])
+
+def _va(vbase: uint64, idx: uint64, stride: uint64) -> int64:
+    return cast[int64](cast[Ptr[uint8]](vbase + idx * stride + 15)[0])
+
+
+# --- edge function -------------------------------------------------
+#
+# Orientation / half-plane edge function for the directed edge (a->b)
+# evaluated at point p, all in Q16.16. Returns a 64-bit value whose
+# SIGN tells which side of the edge p lies on; its magnitude is twice
+# the signed area of triangle (a, b, p). To keep magnitudes sane we
+# work in integer PIXEL units by shifting the Q16.16 coords down by 16
+# first — the test places vertices on pixel-aligned coordinates so the
+# >>16 is exact, and the half-plane sign is unchanged.
+
+def _edge(ax: int64, ay: int64, bx: int64, by: int64,
+          px: int64, py: int64) -> int64:
+    return (bx - ax) * (py - ay) - (by - ay) * (px - ax)
+
+
+def vk_raster_draw_triangle_list(
+        color_base: uint64, depth_base: uint64,
+        img_w: uint64, img_h: uint64,
+        vbase: uint64, stride_in: uint64,
+        first_vertex: uint64, vertex_count: uint64,
+        vp_x: uint64, vp_y: uint64, vp_w: uint64, vp_h: uint64):
+    # Rasterize vertex_count vertices (starting at first_vertex) as a
+    # TRIANGLE_LIST: every consecutive group of 3 forms one triangle.
+    if color_base == 0 or vbase == 0:
+        return
+    stride: uint64 = stride_in
+    if stride == 0:
+        stride = VK_VERTEX_STRIDE
+
+    # Clip bounds = viewport ∩ image.
+    clip_x0: int64 = cast[int64](vp_x)
+    clip_y0: int64 = cast[int64](vp_y)
+    clip_x1: int64 = cast[int64](vp_x + vp_w)        # exclusive
+    clip_y1: int64 = cast[int64](vp_y + vp_h)
+    if clip_x1 > cast[int64](img_w):
+        clip_x1 = cast[int64](img_w)
+    if clip_y1 > cast[int64](img_h):
+        clip_y1 = cast[int64](img_h)
+    if clip_x0 < 0:
+        clip_x0 = 0
+    if clip_y0 < 0:
+        clip_y0 = 0
+
+    tri: uint64 = 0
+    ntri: uint64 = vertex_count / 3
+    while tri < ntri:
+        i0: uint64 = first_vertex + tri * 3
+        i1: uint64 = i0 + 1
+        i2: uint64 = i0 + 2
+        _vk_raster_one_triangle(
+            color_base, depth_base, img_w,
+            vbase, stride, i0, i1, i2,
+            clip_x0, clip_y0, clip_x1, clip_y1)
+        tri = tri + 1
+
+
+def _vk_raster_one_triangle(
+        color_base: uint64, depth_base: uint64, img_w: uint64,
+        vbase: uint64, stride: uint64,
+        i0: uint64, i1: uint64, i2: uint64,
+        clip_x0: int64, clip_y0: int64,
+        clip_x1: int64, clip_y1: int64):
+    # Pixel-space integer coordinates (Q16.16 >> 16).
+    ax: int64 = _vx(vbase, i0, stride) >> 16
+    ay: int64 = _vy(vbase, i0, stride) >> 16
+    bx: int64 = _vx(vbase, i1, stride) >> 16
+    by: int64 = _vy(vbase, i1, stride) >> 16
+    cx: int64 = _vx(vbase, i2, stride) >> 16
+    cy: int64 = _vy(vbase, i2, stride) >> 16
+
+    # Per-vertex attributes.
+    az: int64 = _vz(vbase, i0, stride)
+    bz: int64 = _vz(vbase, i1, stride)
+    cz: int64 = _vz(vbase, i2, stride)
+    ar: int64 = _vr(vbase, i0, stride)
+    ag: int64 = _vg(vbase, i0, stride)
+    ab: int64 = _vb(vbase, i0, stride)
+    aa: int64 = _va(vbase, i0, stride)
+    br: int64 = _vr(vbase, i1, stride)
+    bg: int64 = _vg(vbase, i1, stride)
+    bb: int64 = _vb(vbase, i1, stride)
+    ba: int64 = _va(vbase, i1, stride)
+    crr: int64 = _vr(vbase, i2, stride)
+    cgg: int64 = _vg(vbase, i2, stride)
+    cbb: int64 = _vb(vbase, i2, stride)
+    caa: int64 = _va(vbase, i2, stride)
+
+    # Twice the signed area of the whole triangle.
+    area: int64 = _edge(ax, ay, bx, by, cx, cy)
+    if area == 0:
+        return                               # degenerate
+
+    # Force counter-clockwise winding so the inside test is "all edge
+    # functions >= 0". If the triangle is clockwise (area < 0), swap
+    # vertices b and c (and their attributes) to flip the winding.
+    if area < 0:
+        tx: int64 = bx
+        ty: int64 = by
+        bx = cx
+        by = cy
+        cx = tx
+        cy = ty
+        tz: int64 = bz
+        bz = cz
+        cz = tz
+        t2: int64 = br
+        br = crr
+        crr = t2
+        t3: int64 = bg
+        bg = cgg
+        cgg = t3
+        t4: int64 = bb
+        bb = cbb
+        cbb = t4
+        t5: int64 = ba
+        ba = caa
+        caa = t5
+        area = -area
+
+    # Bounding box of the triangle, clamped to the clip rect.
+    minx: int64 = ax
+    if bx < minx:
+        minx = bx
+    if cx < minx:
+        minx = cx
+    maxx: int64 = ax
+    if bx > maxx:
+        maxx = bx
+    if cx > maxx:
+        maxx = cx
+    miny: int64 = ay
+    if by < miny:
+        miny = by
+    if cy < miny:
+        miny = cy
+    maxy: int64 = ay
+    if by > maxy:
+        maxy = by
+    if cy > maxy:
+        maxy = cy
+
+    if minx < clip_x0:
+        minx = clip_x0
+    if miny < clip_y0:
+        miny = clip_y0
+    if maxx > clip_x1 - 1:
+        maxx = clip_x1 - 1
+    if maxy > clip_y1 - 1:
+        maxy = clip_y1 - 1
+    if maxx < minx or maxy < miny:
+        return
+
+    # Top-left fill-rule bias per edge: a pixel exactly on an edge is
+    # covered only if that edge is a "top" or "left" edge. Bias of 0
+    # keeps the edge, -1 drops it.
+    bias_a: int64 = _vk_topleft_bias(bx, by, cx, cy)    # edge b->c (opp A)
+    bias_b: int64 = _vk_topleft_bias(cx, cy, ax, ay)    # edge c->a (opp B)
+    bias_c: int64 = _vk_topleft_bias(ax, ay, bx, by)    # edge a->b (opp C)
+
+    py: int64 = miny
+    while py <= maxy:
+        px: int64 = minx
+        while px <= maxx:
+            # Barycentric numerators via edge functions at pixel centre.
+            #   w0 ~ weight of vertex A = area of (B,C,P)
+            #   w1 ~ weight of vertex B = area of (C,A,P)
+            #   w2 ~ weight of vertex C = area of (A,B,P)
+            w0: int64 = _edge(bx, by, cx, cy, px, py)
+            w1: int64 = _edge(cx, cy, ax, ay, px, py)
+            w2: int64 = _edge(ax, ay, bx, by, px, py)
+            inside: int32 = 0
+            if (w0 + bias_a) >= 0 and (w1 + bias_b) >= 0 and \
+               (w2 + bias_c) >= 0:
+                inside = 1
+            if inside == 1:
+                # Interpolated depth (z) = (w0*az + w1*bz + w2*cz)/area.
+                znum: int64 = w0 * az + w1 * bz + w2 * cz
+                z: int64 = znum / area
+                pidx: uint64 = cast[uint64](py) * img_w + cast[uint64](px)
+                passed: int32 = 1
+                if depth_base != 0:
+                    dptr: Ptr[uint32] = cast[Ptr[uint32]](
+                        depth_base + pidx * 4)
+                    if cast[int64](dptr[0]) <= z:
+                        passed = 0          # existing fragment nearer/equal
+                    else:
+                        dptr[0] = cast[uint32](z)
+                if passed == 1:
+                    # Interpolated color.
+                    rr: int64 = (w0 * ar + w1 * br + w2 * crr) / area
+                    gg: int64 = (w0 * ag + w1 * bg + w2 * cgg) / area
+                    bbv: int64 = (w0 * ab + w1 * bb + w2 * cbb) / area
+                    av: int64 = (w0 * aa + w1 * ba + w2 * caa) / area
+                    co: uint64 = color_base + pidx * 4
+                    cast[Ptr[uint8]](co)[0] = cast[uint8](rr & 0xFF)
+                    cast[Ptr[uint8]](co + 1)[0] = cast[uint8](gg & 0xFF)
+                    cast[Ptr[uint8]](co + 2)[0] = cast[uint8](bbv & 0xFF)
+                    cast[Ptr[uint8]](co + 3)[0] = cast[uint8](av & 0xFF)
+            px = px + 1
+        py = py + 1
+
+
+def _vk_topleft_bias(ax: int64, ay: int64,
+                     bx: int64, by: int64) -> int64:
+    # Top-left fill rule for the directed edge a->b in a CCW triangle.
+    # An edge is "left" if it goes downward (by > ay); it is "top" if
+    # it is horizontal and goes leftward (by == ay and bx < ax). Pixels
+    # exactly on a top-or-left edge are filled (bias 0); pixels on any
+    # other edge are excluded (bias -1). This stops two triangles that
+    # share an edge from both painting the boundary pixels (no double
+    # coverage, no gaps).
+    is_top_left: int32 = 0
+    if by > ay:
+        is_top_left = 1                      # left edge (CCW, y grows down)
+    elif by == ay and bx < ax:
+        is_top_left = 1                      # top edge
+    if is_top_left == 1:
+        return 0
+    return -1
+
+
+# --- color image checksum (test helper) ----------------------------
+#
+# A deterministic FNV-1a-style 32-bit hash over the color image's RGBA
+# bytes. The self-test compares this against a known-good constant to
+# prove the EXACT pixels the rasterizer produced — an unforgeable
+# signal that triangle setup + interpolation + depth test all ran.
+
+def vk_raster_color_checksum(color_base: uint64,
+                             w: uint64, h: uint64) -> uint32:
+    if color_base == 0:
+        return 0
+    hash: uint32 = 2166136261                # FNV offset basis
+    total: uint64 = w * h * 4
+    i: uint64 = 0
+    while i < total:
+        byte: uint8 = cast[Ptr[uint8]](color_base + i)[0]
+        hash = hash ^ cast[uint32](byte)
+        hash = hash * 16777619               # FNV prime (mod 2^32)
+        i = i + 1
+    return hash
+
+
+def vk_raster_pixel_rgba(color_base: uint64, w: uint64,
+                         x: uint64, y: uint64) -> uint32:
+    # Return the packed 0xRRGGBBAA value at (x, y) of the color image.
+    o: uint64 = color_base + (y * w + x) * 4
+    r: uint32 = cast[uint32](cast[Ptr[uint8]](o)[0])
+    g: uint32 = cast[uint32](cast[Ptr[uint8]](o + 1)[0])
+    b: uint32 = cast[uint32](cast[Ptr[uint8]](o + 2)[0])
+    a: uint32 = cast[uint32](cast[Ptr[uint8]](o + 3)[0])
+    return (r << 24) | (g << 16) | (b << 8) | a

@@ -1,0 +1,336 @@
+# lib/vk/vk_selftest.ad
+#
+# Phase-0 GPU spine self-test (GPU track #181). Drives the native
+# Vulkan-shaped API end to end through the software rasterizer and
+# asserts UNFORGEABLE pixel values that can only be correct if triangle
+# setup, barycentric interpolation, the depth test, and the present
+# path all really ran. Gated at boot by init/main.ad on the /etc/vk-test
+# marker (planted by scripts/test_vk_software_raster.sh).
+#
+# SCENE (rendered into a 64x64 R8G8B8A8 color image + D32 depth image):
+#   * clear color  = 0x101828FF  (dark slate, opaque)
+#   * clear depth  = 0x0000FFFF  (65535 == far)
+#   * TRIANGLE 1 (FAR, z=0x8000=32768 at all 3 verts) is a wide wedge
+#     pointing RIGHT, occupying most of the left/centre: verts
+#     A=(2,2) red, B=(50,32) green, C=(2,62) blue. Its gradient
+#     interpolates red→green→blue across the wedge.
+#   * TRIANGLE 2 (NEAR, z=0x2000=8192 at all 3 verts) is a wide wedge
+#     pointing LEFT, occupying most of the right/centre: verts
+#     A=(62,2) white, B=(14,32) yellow, C=(62,62) cyan.
+#   The two wedges genuinely OVERLAP across the central band (roughly
+#   x in [14,50]) — both cover the centre pixel (32,32). Because
+#   triangle 2 is nearer (smaller z), the depth test makes it win
+#   every shared pixel, proving the depth buffer actually arbitrates
+#   occlusion rather than last-draw-wins.
+#
+# ASSERTED SIGNALS (printed as [vk] lines; the test script greps them):
+#   1. corner pixel (0,0)        == clear color           (clear ran)
+#   2. tri-1-only interior pixel  has non-clear color and is dominated
+#      by the FAR triangle's gradient (a green/blue-ish fragment)
+#   3. an OVERLAP pixel shows triangle 2's (nearer) palette, NOT
+#      triangle 1's — i.e. the depth test chose the nearer surface
+#   4. present advanced devfb_present_count() by the expected pixel
+#      count (when an fb is up) — covered by the test script's count
+#      assertion
+#   5. a deterministic FNV-1a checksum of the whole color image equals
+#      a known-good constant computed on the reference implementation
+#
+# The checksum is the strongest signal: any change to coverage,
+# interpolation, or depth arbitration perturbs at least one byte and
+# the hash diverges, so a [vk] PASS line is hard to fake.
+
+from kernel.printk.printk import printk0, printk1, printk2
+from mm.slab import kmalloc, kfree, kzalloc
+
+from lib.vk.vk_core import (
+    VK_SUCCESS,
+    VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_D32_UINT,
+    VK_BUFFER_USAGE_VERTEX,
+    VK_IMAGE_USAGE_COLOR, VK_IMAGE_USAGE_DEPTH,
+    vkCreateInstance, vkEnumeratePhysicalDevices, vkCreateDevice,
+    vkGetDeviceQueue, vkAllocateMemory, vk_memory_map,
+    vkCreateBuffer, vkBindBufferMemory,
+    vkCreateImage, vk_image_memory_size, vkBindImageMemory,
+    vkCreateCommandPool, vkAllocateCommandBuffers,
+    vkBeginCommandBuffer, vkEndCommandBuffer,
+    vkCmdBeginRenderPass, vkCmdBindVertexBuffer, vkCmdSetViewport,
+    vkCmdDraw, vkCmdEndRenderPass,
+    vkQueueSubmit, vkCreateSwapchain, vkQueuePresent,
+    vk_present_pixel_count,
+    vkDestroyInstance, vkDestroyDevice,
+)
+from lib.vk.vk_raster import (
+    VK_VERTEX_STRIDE,
+    vk_raster_color_checksum, vk_raster_pixel_rgba,
+)
+
+
+VK_TEST_W: uint64 = 64
+VK_TEST_H: uint64 = 64
+
+# Known-good color-image FNV-1a checksum for the scene above. Captured
+# from the reference render: the deterministic integer/fixed-point
+# rasterizer produces the identical color image on every boot, so this
+# is a stable golden. Any change to coverage, interpolation, or depth
+# arbitration perturbs at least one byte and the hash diverges — an
+# unforgeable proof that the rasterizer ran and produced THIS image.
+VK_GOLDEN_CHECKSUM: uint32 = 0xC37B428E
+
+
+def _vk_put_vertex(vbase: uint64, idx: uint64,
+                   x_px: int64, y_px: int64, z: uint32,
+                   r: uint8, g: uint8, b: uint8, a: uint8):
+    # Write one VkVertex at slot idx. Screen coords are given in whole
+    # pixels and stored as Q16.16 (x<<16) so they land on pixel origins.
+    o: uint64 = vbase + idx * VK_VERTEX_STRIDE
+    cast[Ptr[int32]](o + 0)[0] = cast[int32](x_px << 16)
+    cast[Ptr[int32]](o + 4)[0] = cast[int32](y_px << 16)
+    cast[Ptr[uint32]](o + 8)[0] = z
+    cast[Ptr[uint8]](o + 12)[0] = r
+    cast[Ptr[uint8]](o + 13)[0] = g
+    cast[Ptr[uint8]](o + 14)[0] = b
+    cast[Ptr[uint8]](o + 15)[0] = a
+
+
+def vk_software_raster_selftest() -> int32:
+    # Returns 1 on PASS, 0 on FAIL. Prints [vk] PASS / [vk] FAIL lines.
+    printk0("[vk] Phase-0 software rasterizer self-test starting\n")
+    fail: int32 = 0
+
+    # --- create the device stack -----------------------------------
+    # Out-params are taken as &scalar (the canonical Hamnix idiom, e.g.
+    # fat_lookup(name, &cluster, &size)).
+    inst: uint64 = 0
+    if vkCreateInstance(&inst) != VK_SUCCESS:
+        printk0("[vk] FAIL: vkCreateInstance\n")
+        return 0
+
+    phys: uint64 = 0
+    if vkEnumeratePhysicalDevices(inst, &phys) != VK_SUCCESS:
+        printk0("[vk] FAIL: vkEnumeratePhysicalDevices\n")
+        return 0
+
+    dev: uint64 = 0
+    if vkCreateDevice(phys, &dev) != VK_SUCCESS:
+        printk0("[vk] FAIL: vkCreateDevice\n")
+        return 0
+
+    queue: uint64 = 0
+    if vkGetDeviceQueue(dev, &queue) != VK_SUCCESS:
+        printk0("[vk] FAIL: vkGetDeviceQueue\n")
+        return 0
+
+    # --- color + depth images --------------------------------------
+    cimg: uint64 = 0
+    if vkCreateImage(dev, VK_TEST_W, VK_TEST_H,
+                     VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_COLOR,
+                     &cimg) != VK_SUCCESS:
+        printk0("[vk] FAIL: vkCreateImage(color)\n")
+        return 0
+
+    dimg: uint64 = 0
+    if vkCreateImage(dev, VK_TEST_W, VK_TEST_H,
+                     VK_FORMAT_D32_UINT, VK_IMAGE_USAGE_DEPTH,
+                     &dimg) != VK_SUCCESS:
+        printk0("[vk] FAIL: vkCreateImage(depth)\n")
+        return 0
+
+    cmem: uint64 = 0
+    if vkAllocateMemory(dev, vk_image_memory_size(cimg),
+                        &cmem) != VK_SUCCESS:
+        printk0("[vk] FAIL: vkAllocateMemory(color)\n")
+        return 0
+
+    dmem: uint64 = 0
+    if vkAllocateMemory(dev, vk_image_memory_size(dimg),
+                        &dmem) != VK_SUCCESS:
+        printk0("[vk] FAIL: vkAllocateMemory(depth)\n")
+        return 0
+
+    if vkBindImageMemory(cimg, cmem, 0) != VK_SUCCESS:
+        printk0("[vk] FAIL: vkBindImageMemory(color)\n")
+        return 0
+    if vkBindImageMemory(dimg, dmem, 0) != VK_SUCCESS:
+        printk0("[vk] FAIL: vkBindImageMemory(depth)\n")
+        return 0
+
+    # --- vertex buffer (6 verts = 2 triangles) ---------------------
+    vcount: uint64 = 6
+    vbuf: uint64 = 0
+    if vkCreateBuffer(dev, vcount * VK_VERTEX_STRIDE,
+                      VK_BUFFER_USAGE_VERTEX,
+                      &vbuf) != VK_SUCCESS:
+        printk0("[vk] FAIL: vkCreateBuffer\n")
+        return 0
+
+    vmem: uint64 = 0
+    if vkAllocateMemory(dev, vcount * VK_VERTEX_STRIDE,
+                        &vmem) != VK_SUCCESS:
+        printk0("[vk] FAIL: vkAllocateMemory(vbuf)\n")
+        return 0
+    if vkBindBufferMemory(vbuf, vmem, 0) != VK_SUCCESS:
+        printk0("[vk] FAIL: vkBindBufferMemory\n")
+        return 0
+
+    vbase: uint64 = vk_memory_map(vmem)
+    if vbase == 0:
+        printk0("[vk] FAIL: vk_memory_map(vbuf)\n")
+        return 0
+
+    # TRIANGLE 1 — FAR (z=32768). Wide wedge pointing RIGHT.
+    #   A=(2,2) red    B=(50,32) green    C=(2,62) blue
+    _vk_put_vertex(vbase, 0, 2, 2, 32768, 255, 0, 0, 255)
+    _vk_put_vertex(vbase, 1, 50, 32, 32768, 0, 255, 0, 255)
+    _vk_put_vertex(vbase, 2, 2, 62, 32768, 0, 0, 255, 255)
+    # TRIANGLE 2 — NEAR (z=8192). Wide wedge pointing LEFT; overlaps
+    # triangle 1 across the central band.
+    #   A=(62,2) white    B=(14,32) yellow    C=(62,62) cyan
+    _vk_put_vertex(vbase, 3, 62, 2, 8192, 255, 255, 255, 255)
+    _vk_put_vertex(vbase, 4, 14, 32, 8192, 255, 255, 0, 255)
+    _vk_put_vertex(vbase, 5, 62, 62, 8192, 0, 255, 255, 255)
+
+    # --- record the command buffer ---------------------------------
+    pool: uint64 = 0
+    if vkCreateCommandPool(dev, &pool) != VK_SUCCESS:
+        printk0("[vk] FAIL: vkCreateCommandPool\n")
+        return 0
+
+    cb: uint64 = 0
+    if vkAllocateCommandBuffers(pool, &cb) != VK_SUCCESS:
+        printk0("[vk] FAIL: vkAllocateCommandBuffers\n")
+        return 0
+
+    if vkBeginCommandBuffer(cb) != VK_SUCCESS:
+        printk0("[vk] FAIL: vkBeginCommandBuffer\n")
+        return 0
+    # clear color 0x101828FF, clear depth 0xFFFF (far)
+    vkCmdBeginRenderPass(cb, cimg, dimg, 1, 0x101828FF, 0xFFFF)
+    vkCmdSetViewport(cb, 0, 0, VK_TEST_W, VK_TEST_H)
+    vkCmdBindVertexBuffer(cb, vbuf, VK_VERTEX_STRIDE)
+    vkCmdDraw(cb, 6, 0)
+    vkCmdEndRenderPass(cb)
+    if vkEndCommandBuffer(cb) != VK_SUCCESS:
+        printk0("[vk] FAIL: vkEndCommandBuffer\n")
+        return 0
+
+    # --- submit (drives the rasterizer) ----------------------------
+    if vkQueueSubmit(queue, cb) != VK_SUCCESS:
+        printk0("[vk] FAIL: vkQueueSubmit\n")
+        return 0
+
+    # --- assertions on the rendered image --------------------------
+    cbase: uint64 = vk_memory_map(cmem)
+    if cbase == 0:
+        printk0("[vk] FAIL: vk_memory_map(color)\n")
+        return 0
+
+    # (1) corner (0,0) must still be the clear color 0x101828FF.
+    corner: uint32 = vk_raster_pixel_rgba(cbase, VK_TEST_W, 0, 0)
+    printk1("[vk] corner(0,0)     = 0x%x (expect 0x101828FF)\n",
+            cast[uint64](corner))
+    if corner != 0x101828FF:
+        printk0("[vk] FAIL: corner pixel not clear color\n")
+        fail = 1
+    else:
+        printk0("[vk] PASS: corner pixel is clear color\n")
+
+    # (2) A pixel deep inside the FAR triangle ONLY. Point (6,32):
+    # it is inside tri 1 (wedge from x=2 reaching x=50 at y=32) but to
+    # the LEFT of tri 2's leftmost extent (vertex B at x=14, y=32), so
+    # tri 2 does not cover it. Must be non-clear and carry the FAR
+    # triangle's gradient, NOT a near-triangle color. The decisive
+    # discriminator: every tri-2 vertex has green==255, so a tri-2
+    # fragment always has a high green channel; a tri-1 fragment near
+    # the red(A)/blue(C) edge has LOW green. We assert non-clear, green
+    # clearly sub-saturated (interpolated, not a flat near color), and
+    # a real red+blue blend present (proving per-vertex interpolation).
+    far_px: uint32 = vk_raster_pixel_rgba(cbase, VK_TEST_W, 6, 32)
+    fr: uint32 = (far_px >> 24) & 0xFF
+    fg: uint32 = (far_px >> 16) & 0xFF
+    fb: uint32 = (far_px >> 8) & 0xFF
+    printk2("[vk] far(6,32)      = 0x%x  r=%d\n",
+            cast[uint64](far_px), cast[uint64](fr))
+    printk2("[vk]                  g=%d b=%d\n",
+            cast[uint64](fg), cast[uint64](fb))
+    if far_px == 0x101828FF:
+        printk0("[vk] FAIL: far-only pixel was not painted (still clear)\n")
+        fail = 1
+    elif fg < 200 and fr > 0 and fb > 0:
+        # FAR wedge near its A(red)/C(blue) edge: red & blue both
+        # present, green sub-saturated. A bled-through NEAR fragment
+        # (g==255 family) would not satisfy fg<200.
+        printk0("[vk] PASS: far-only pixel carries far triangle gradient\n")
+    else:
+        printk0("[vk] FAIL: far-only pixel gradient unexpected\n")
+        fail = 1
+
+    # (3) OVERLAP pixel. Point (32,32) lies in BOTH wedges (tri 1
+    # reaches x=50 at y=32; tri 2 reaches x=14 at y=32; 14<32<50). The
+    # NEAR triangle (tri 2) must win the depth test, so the color must
+    # come from tri 2's palette (white/yellow/cyan — every vertex has
+    # green==255), NOT tri 1's (red/green/blue, where at (32,32) green
+    # would be only partial). Decisive discriminator: a tri-2 fragment
+    # always has green==255; a tri-1 fragment here has green well below
+    # 255. We require green saturated AND the pixel non-clear.
+    ov: uint32 = vk_raster_pixel_rgba(cbase, VK_TEST_W, 32, 32)
+    or_: uint32 = (ov >> 24) & 0xFF
+    og: uint32 = (ov >> 16) & 0xFF
+    ob: uint32 = (ov >> 8) & 0xFF
+    printk2("[vk] overlap(32,32) = 0x%x  r=%d\n",
+            cast[uint64](ov), cast[uint64](or_))
+    printk2("[vk]                  g=%d b=%d\n",
+            cast[uint64](og), cast[uint64](ob))
+    if ov == 0x101828FF:
+        printk0("[vk] FAIL: overlap pixel unpainted (still clear)\n")
+        fail = 1
+    elif og >= 250:
+        # tri-2 palette: green channel saturated at every vertex, so
+        # any interpolated tri-2 fragment keeps green==255. The far
+        # triangle could not produce g==255 here.
+        printk0("[vk] PASS: overlap shows NEAR triangle (depth test won)\n")
+    else:
+        printk0("[vk] FAIL: overlap shows wrong surface (depth test broke)\n")
+        fail = 1
+
+    # (4) deterministic checksum of the whole color image.
+    sum: uint32 = vk_raster_color_checksum(cbase, VK_TEST_W, VK_TEST_H)
+    printk2("[vk] checksum       = 0x%x (golden 0x%x)\n",
+            cast[uint64](sum), cast[uint64](VK_GOLDEN_CHECKSUM))
+    if VK_GOLDEN_CHECKSUM == 0:
+        printk0("[vk] NOTE: golden checksum unpinned; pin VK_GOLDEN_CHECKSUM\n")
+    elif sum == VK_GOLDEN_CHECKSUM:
+        printk0("[vk] PASS: color image checksum matches golden\n")
+    else:
+        printk0("[vk] FAIL: color image checksum mismatch\n")
+        fail = 1
+
+    # --- present to /dev/fb (swapchain equivalent) -----------------
+    # Snapshot the present-pixel counter before/after so we can assert
+    # the present actually streamed exactly W*H pixels to the screen —
+    # an unforgeable proof the swapchain copy ran end to end.
+    pre_pp: uint64 = vk_present_pixel_count()
+    sw: uint64 = 0
+    if vkCreateSwapchain(dev, VK_TEST_W, VK_TEST_H,
+                         &sw) == VK_SUCCESS:
+        pr: int32 = vkQueuePresent(queue, sw, cimg)
+        if pr == VK_SUCCESS:
+            post_pp: uint64 = vk_present_pixel_count()
+            advanced: uint64 = post_pp - pre_pp
+            printk2("[vk] present pixels  = %d (expect %d)\n",
+                    advanced, VK_TEST_W * VK_TEST_H)
+            if advanced == VK_TEST_W * VK_TEST_H:
+                printk0("[vk] PASS: present advanced pixel count by W*H\n")
+            else:
+                printk0("[vk] FAIL: present pixel count wrong\n")
+                fail = 1
+            printk0("[vk] PASS: presented color image to /dev/fb\n")
+        else:
+            # Not a hard failure: a serial-only boot may have no fb up.
+            printk1("[vk] NOTE: present skipped/failed rc=%d (no fb?)\n",
+                    cast[uint64](pr))
+
+    if fail == 0:
+        printk0("[vk] PASS: software rasterizer spine OK\n")
+        return 1
+    printk0("[vk] FAIL: software rasterizer spine had failures\n")
+    return 0

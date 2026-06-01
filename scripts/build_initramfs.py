@@ -260,6 +260,17 @@ if os.environ.get("ENABLE_SMP_SOAK") == "1":
 if os.environ.get("ENABLE_SCHED_FAIR") == "1":
     FILES.append(("/etc/sched-fair", b"1\n"))
 
+# GPU track #181 Phase 0: native Vulkan-shaped software-rasterizer spine
+# self-test. scripts/test_vk_software_raster.sh sets ENABLE_VK_TEST=1 to
+# plant /etc/vk-test. init/main.ad at boot:37.vk detects the marker and
+# calls vk_software_raster_selftest() (lib/vk/vk_selftest.ad): it drives
+# the whole Vulkan-shaped API through the software rasterizer to render a
+# depth-tested two-triangle scene, asserts known pixel values + a
+# deterministic checksum, and presents to /dev/fb. Default boots omit
+# the marker so the spine self-test never fires unintentionally.
+if os.environ.get("ENABLE_VK_TEST") == "1":
+    FILES.append(("/etc/vk-test", b"1\n"))
+
 # Partition write-smoke fixtures (mkpart MBR on sd0, gpt on nvme0n1).
 # These WRITE a partition table onto a freshly-registered disk that has
 # no MBR, so they must NEVER run on production media. Set
