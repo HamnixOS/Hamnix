@@ -181,6 +181,9 @@ from fs.elf import (
     elf_last_interp_img_phys_get, elf_last_interp_img_sz_get,
     vm_cow_share_all,
 )
+# #169 vDSO: map the AT_SYSINFO_EHDR shared-time mini-ELF + data page
+# into each Linux guest's address space at exec/spawn time.
+from linux_abi.vdso import vdso_map_into_user, vdso_user_code_vaddr
 from mm.page_alloc import alloc_page, alloc_pages
 # Real uaccess translation layer. copy_to_user / copy_from_user /
 # get_user / put_user / strncpy_from_user walk the CURRENT task's page
@@ -968,11 +971,16 @@ AT_PAGESZ:  uint64 = 6
 AT_BASE:    uint64 = 7
 AT_ENTRY:   uint64 = 9
 AT_RANDOM:  uint64 = 25
+# #169 vDSO: AT_SYSINFO_EHDR (33) advertises the user vaddr of the
+# vDSO mini-ELF page. glibc/musl parse that ELF and call
+# __vdso_clock_gettime et al. directly, skipping the syscall trap.
+AT_SYSINFO_EHDR: uint64 = 33
 
 
 def _build_user_argv_linux(ustack_top: uint64, argv_user: uint64,
                            envp_user: uint64,
-                           entry_addr: uint64, region: uint64) -> uint64:
+                           entry_addr: uint64, region: uint64,
+                           vdso_ehdr: uint64) -> uint64:
     # Linux process init-stack layout. musl's _start does
     # `mov %rsp,%rdi; call _start_c`; _start_c then reads
     # `argc = *(int*)rdi`, `argv = rdi+8`, walks envp from there, and
@@ -1074,7 +1082,13 @@ def _build_user_argv_linux(ustack_top: uint64, argv_user: uint64,
     #    8) aligned-from str_sp must satisfy that bottom = 16-aligned.
     #    We pre-bump str_sp down 0 or 8 bytes to make it so.
     str_sp = str_sp & ~cast[uint64](7)
-    fixed_bytes: uint64 = (cast[uint64](19) + argc + envc) * 8
+    # Base fixed cells = 19 (8 auxv pairs + envp/argv NULLs + argc). When
+    # the vDSO is present we add ONE more auxv pair (AT_SYSINFO_EHDR) =
+    # 2 cells, so the alignment pre-bump accounts for it.
+    aux_extra: uint64 = 0
+    if vdso_ehdr != 0:
+        aux_extra = 2
+    fixed_bytes: uint64 = (cast[uint64](19) + aux_extra + argc + envc) * 8
     bottom: uint64 = str_sp - fixed_bytes
     if (bottom & cast[uint64](15)) != 0:
         str_sp = str_sp - 8                            # align pad
@@ -1094,6 +1108,18 @@ def _build_user_argv_linux(ustack_top: uint64, argv_user: uint64,
     cast[Ptr[uint64]](str_sp)[0] = 0                   # AT_NULL.value
     str_sp = str_sp - 8
     cast[Ptr[uint64]](str_sp)[0] = AT_NULL             # AT_NULL.type
+
+    # #169 vDSO: AT_SYSINFO_EHDR points at the user vaddr of the vDSO
+    # mini-ELF page. Emitted only when do_execve successfully mapped
+    # the vDSO (vdso_ehdr != 0); otherwise the entry is omitted and
+    # glibc/musl fall back to the clock_gettime syscall. Auxv ordering
+    # is irrelevant to the loader (it scans to AT_NULL), so we plant it
+    # just below AT_NULL.
+    if vdso_ehdr != 0:
+        str_sp = str_sp - 8
+        cast[Ptr[uint64]](str_sp)[0] = vdso_ehdr       # AT_SYSINFO_EHDR.value
+        str_sp = str_sp - 8
+        cast[Ptr[uint64]](str_sp)[0] = AT_SYSINFO_EHDR
 
     str_sp = str_sp - 8
     cast[Ptr[uint64]](str_sp)[0] = random_addr         # AT_RANDOM.value
@@ -1341,6 +1367,14 @@ def do_execve(a0: uint64, a1: uint64, a2: uint64) -> int64:
     argv_out: uint64 = 0
     new_rsp: uint64 = 0
     if is_linux != 0:
+        # #169 vDSO: map the shared vDSO mini-ELF + time data page into
+        # THIS task's address space (the same cur_pml4 the image + stack
+        # were just installed into) and capture the user vaddr of the
+        # ELF page for AT_SYSINFO_EHDR. Returns 0 if the vDSO isn't ready
+        # or the mapping failed — in which case the auxv entry is simply
+        # omitted and glibc/musl fall back to the clock_gettime syscall.
+        vdso_ehdr: uint64 = vdso_map_into_user(cur_pml4)
+        load_cr3(cur_pml4)                 # publish the new vDSO PTEs
         # U16: Linux process init-stack — *rsp points to argc;
         # argv/envp/auxv all reachable from rsp+8. musl ignores
         # %rdi/%rsi, so we pass argc=0/argv=0 in the SysV slots.
@@ -1350,7 +1384,8 @@ def do_execve(a0: uint64, a1: uint64, a2: uint64) -> int64:
         # AT_ENTRY / AT_PHDR / AT_PHNUM for glibc/musl's own
         # _dl_relocate_static_pie pass.
         new_rsp = _build_user_argv_linux(new_ustack_top, a1, a2,
-                                         entry, elf_last_load_base)
+                                         entry, elf_last_load_base,
+                                         vdso_ehdr)
     else:
         new_rsp = _build_user_argv(new_ustack_top, a1,
                                    &argc_out, &argv_out)
@@ -2260,8 +2295,13 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
             # U20: pass entry + load base so the child's auxv carries
             # AT_ENTRY / AT_PHDR / AT_PHNUM (glibc/musl _start needs
             # them to run _dl_relocate_static_pie).
+            # #169 vDSO: AT_SYSINFO_EHDR points at the FIXED vDSO user
+            # vaddr (same in every address space). We plant it now; the
+            # actual page mapping into the child's PML4 happens after
+            # create_user_task_argv gives us the child slot (below).
             new_rsp = _build_user_argv_linux(ustack_top, a1, a4,
-                                             entry, elf_last_load_base)
+                                             entry, elf_last_load_base,
+                                             vdso_user_code_vaddr())
         else:
             new_rsp = _build_user_argv(ustack_top, a1,
                                        &argc_out, &argv_out)
@@ -2333,6 +2373,15 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
             task_reap(slot)
             set_current_errstr("spawn: cannot map stack")
             return cast[uint64](-12)           # -ENOMEM
+        # #169 vDSO: map the shared vDSO ELF + time data page into the
+        # child's PML4 at the fixed VDSO_USER window the auxv already
+        # advertised. No CR3 reload needed (the child hasn't run yet).
+        # A 0 return (vDSO not ready) is harmless: AT_SYSINFO_EHDR was
+        # only planted when vdso_user_code_vaddr() was non-zero, so the
+        # two stay consistent. Map failure isn't fatal — glibc/musl fall
+        # back to the syscall — so we don't reap the slot on it.
+        if is_linux != 0:
+            vdso_map_into_user(task_pml4(slot))
         # U5: SYS_SPAWN runs in the parent's context. If the loaded
         # image is a Linux-ABI ELF, flip is_linux_userspace on the
         # *child* slot (not current) so the new task's syscalls route

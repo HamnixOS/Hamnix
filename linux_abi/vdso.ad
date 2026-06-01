@@ -1,0 +1,395 @@
+# linux_abi/vdso.ad — #169 Linux-ABI vDSO: kernel side.
+#
+# Linux maps a small shared "vDSO" ELF page into every process and
+# advertises it via the AT_SYSINFO_EHDR (33) auxv entry. glibc/musl
+# parse that mini-ELF's dynamic symbol table and call
+# __vdso_clock_gettime / __vdso_gettimeofday / __vdso_time /
+# __vdso_getcpu DIRECTLY in userspace — no syscall trap — by reading a
+# kernel-maintained shared time page. This removes the syscall round-
+# trip for the hottest time calls.
+#
+# This module owns:
+#
+#   * The PHYSICAL backing of two pages, allocated once at boot:
+#       - vdso_data_phys : the shared time data page (read-only to user,
+#                          NX). The timer tick writes it under a seqlock.
+#       - vdso_code_phys : a copy of the arch/x86/kernel/vdso_image.S
+#                          mini-ELF (read-only to user, executable).
+#     The data page is mapped one page BELOW the code page in every
+#     user address space; the vDSO function bodies recover the data
+#     page from their own RIP by masking to the code page and stepping
+#     back 0x1000 (see vdso_image.S). So the two pages MUST be mapped
+#     adjacently, data-below-code, at the SAME pair of user vaddrs in
+#     every process. We pick a fixed user vaddr window for that
+#     (VDSO_USER_BASE) — Linux randomises it via AT_SYSINFO_EHDR, but a
+#     fixed window is correct and simpler; the ABI only requires that
+#     AT_SYSINFO_EHDR point at the code page wherever it lands.
+#
+#   * vdso_update_time(): called from the LAPIC timer tick to publish
+#     the current realtime/monotonic clock into the data page under a
+#     seqlock (even=stable, odd=writing). Same time source as the
+#     syscall path (_u_clock_gettime): tsc_monotonic_ns() + the RTC
+#     boot epoch — so vDSO and syscall reads agree.
+#
+#   * vdso_map_into_user(pml4_phys): install both pages into a user
+#     PML4 and return the user vaddr of the code page (the
+#     AT_SYSINFO_EHDR value). Called from the execve init-stack path.
+
+from kernel.printk.printk import printk0, printk1, printk2
+from mm.page_alloc import alloc_page, alloc_pages
+from arch.x86.kernel.time import tsc_monotonic_ns
+from drivers.rtc.cmos import rtc_boot_epoch_get
+from fs.elf import (
+    elf_install_user_range, elf_set_range_ro,
+    PT_FLAG_NX, PAGE_SIZE_4K,
+)
+
+# The vDSO mini-ELF blob, assembled in arch/x86/kernel/vdso_image.S.
+# vdso_image_base() returns its (higher-half) kernel address;
+# vdso_image_size() its byte length.
+extern def vdso_image_base() -> uint64
+extern def vdso_image_size() -> uint64
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
+# --- shared time-data page layout -------------------------------------
+# Keep these offsets in sync with arch/x86/kernel/vdso_image.S's
+# function bodies (VDSO_TD_* there are open-coded as 0x00/0x08/...).
+VDSO_TD_SEQ:       uint64 = 0x00   # u32 seqlock counter
+VDSO_TD_REAL_SEC:  uint64 = 0x08   # u64 CLOCK_REALTIME seconds
+VDSO_TD_REAL_NSEC: uint64 = 0x10   # u64 CLOCK_REALTIME nanoseconds
+VDSO_TD_MONO_SEC:  uint64 = 0x18   # u64 CLOCK_MONOTONIC seconds
+VDSO_TD_MONO_NSEC: uint64 = 0x20   # u64 CLOCK_MONOTONIC nanoseconds
+
+# User-visible vDSO addresses. Hamnix uses an IDENTITY memory model for
+# user tasks: the ELF image, brk heap, and user stack all live at
+# vaddr == phys in low memory (PML4 entry 0's subtree, which the loader
+# cracks into real 4 KiB PTEs per task). We map the vDSO the SAME way —
+# at vaddr == phys — so it shares that already-present PML4[0] subtree.
+#
+# A fixed HIGH window (e.g. 0x7ffff7ffd000, Linux-style) does NOT work
+# here: that vaddr lives in PML4 entry 255, which the boot page tables
+# leave entirely UNMAPPED (entry == 0). elf_install_user_mapping's
+# clone-on-first-touch path then produces a PML4 entry with no
+# present/RW/US flags (it OR's the new PDPT base with the OLD entry's
+# flag bits, and the old entry was 0), leaving the whole subtree
+# unreachable -> the vDSO page faults not-present on first read. Keeping
+# the vDSO in PML4[0] (identity) sidesteps that core-loader edge case
+# entirely; the ABI only requires AT_SYSINFO_EHDR point at the code page
+# wherever it actually lands.
+#
+# vdso_data_phys / vdso_code_phys are two CONTIGUOUS pages (data below
+# code) allocated once at boot; the code-page identity vaddr IS the
+# AT_SYSINFO_EHDR value, and the vDSO function bodies recover the data
+# page by masking their own RIP to the code page and stepping back one
+# page (see arch/x86/kernel/vdso_image.S) — which is exactly
+# data == code - 0x1000 by the contiguous allocation.
+vdso_data_phys: uint64 = 0   # physical backing of the data page (== user vaddr)
+vdso_code_phys: uint64 = 0   # physical backing of the code page (== user vaddr)
+vdso_ready:     uint8  = 0   # 1 once vdso_init() succeeded
+
+
+def vdso_init():
+    # Allocate two CONTIGUOUS backing pages (order-1 buddy block: data
+    # page first, code page immediately above it), copy the mini-ELF into
+    # the code page, seed the data page with a first time sample (so the
+    # seqlock starts even/stable and userspace never spins forever on a
+    # zero seq before the first tick), and run a parse self-test of the
+    # embedded ELF's hash table. Call once at boot, after tsc_init()
+    # (so the first time sample is meaningful) and the page allocator
+    # is up.
+    #
+    # CONTIGUITY MATTERS: the vDSO functions compute the data-page base
+    # as (their own RIP & ~0xfff) - 0x1000, so the data page MUST sit
+    # exactly one page below the code page. An order-1 alloc_pages gives
+    # a 2-page-aligned, contiguous block; data = base, code = base+4K.
+    blk: uint64 = alloc_pages(1)
+    if blk == 0:
+        printk0("[vdso] FATAL: no 2-page block for vDSO\n")
+        return
+    dpg: uint64 = blk
+    cpg: uint64 = blk + PAGE_SIZE_4K
+    vdso_data_phys = dpg
+    vdso_code_phys = cpg
+
+    # Zero both pages, then copy the assembled mini-ELF into the code
+    # page. The blob is < 4 KiB (asserted below).
+    memset(cast[Ptr[uint8]](dpg), 0, PAGE_SIZE_4K)
+    memset(cast[Ptr[uint8]](cpg), 0, PAGE_SIZE_4K)
+
+    img: uint64 = vdso_image_base()
+    sz:  uint64 = vdso_image_size()
+    if sz == 0 or sz > PAGE_SIZE_4K:
+        printk1("[vdso] FATAL: image size %d does not fit one page\n", sz)
+        return
+    memcpy(cast[Ptr[uint8]](cpg), cast[Ptr[uint8]](img), sz)
+    printk2("[vdso] image copied: %d bytes -> phys %p\n", sz, cpg)
+
+    # Seed the data page with a first sample so seq is even (stable) and
+    # the time fields are valid before the first timer tick fires.
+    vdso_update_time()
+
+    # Self-test the embedded ELF: parse it exactly as glibc would and
+    # confirm __vdso_clock_gettime resolves to a sane in-image offset.
+    if vdso_selftest(cpg) != 0:
+        printk0("[vdso] FATAL: embedded ELF self-test FAILED\n")
+        return
+
+    vdso_ready = 1
+    printk0("[vdso] ready: AT_SYSINFO_EHDR vDSO armed\n")
+
+
+def vdso_update_time():
+    # Publish the current clock into the shared data page under a
+    # seqlock. Readers (the vDSO functions) load seq, read the fields,
+    # re-load seq, and retry if it changed or was odd. Writer protocol:
+    #   seq++ (now odd: "writing")  ->  store fields  ->  seq++ (even).
+    # The two increments bracket the field stores so any reader that
+    # observed an odd seq, or a different seq before/after, retries.
+    #
+    # Called from the timer tick (arch/x86/kernel/time.ad) AND once from
+    # vdso_init for the initial seed. Single-writer (the BSP tick), so
+    # no inter-writer locking is needed; the seqlock only guards against
+    # a userspace reader racing a partial update.
+    if vdso_data_phys == 0:
+        return
+    d: uint64 = vdso_data_phys
+
+    mono_ns: uint64 = tsc_monotonic_ns()
+    base:    uint64 = rtc_boot_epoch_get()
+    mono_sec:  uint64 = mono_ns / 1000000000
+    mono_nsec: uint64 = mono_ns % 1000000000
+    real_sec:  uint64 = base + mono_sec
+    real_nsec: uint64 = mono_nsec
+
+    seq: uint32 = cast[Ptr[uint32]](d + VDSO_TD_SEQ)[0]
+    # Enter write section: make seq odd.
+    cast[Ptr[uint32]](d + VDSO_TD_SEQ)[0] = seq + 1
+    # A compiler/CPU store fence would go here on a weakly-ordered ISA;
+    # x86 is TSO (stores retire in program order) so the seq=odd store
+    # is globally visible before the field stores below — no explicit
+    # barrier needed for a single-writer x86 seqlock.
+    cast[Ptr[uint64]](d + VDSO_TD_REAL_SEC)[0]  = real_sec
+    cast[Ptr[uint64]](d + VDSO_TD_REAL_NSEC)[0] = real_nsec
+    cast[Ptr[uint64]](d + VDSO_TD_MONO_SEC)[0]  = mono_sec
+    cast[Ptr[uint64]](d + VDSO_TD_MONO_NSEC)[0] = mono_nsec
+    # Leave write section: make seq even again (== original + 2).
+    cast[Ptr[uint32]](d + VDSO_TD_SEQ)[0] = seq + 2
+
+
+def vdso_map_into_user(pml4_phys: uint64) -> uint64:
+    # Install the vDSO data + code pages into the supplied user PML4 at
+    # their IDENTITY addresses (user vaddr == physical page) and return
+    # the user vaddr of the code page (the value to advertise in
+    # AT_SYSINFO_EHDR). Returns 0 if the vDSO isn't ready or a mapping
+    # failed (the caller then simply omits AT_SYSINFO_EHDR — glibc/musl
+    # fall back to the clock_gettime syscall, so this degrades gracefully
+    # rather than breaking exec).
+    #
+    # Identity mapping (vaddr == phys) puts the two pages in PML4 entry
+    # 0's subtree — the same already-cracked, present subtree the task's
+    # ELF image / brk / stack live in. See the VDSO addressing note above
+    # for why a fixed HIGH window (PML4[255]) does NOT work under
+    # Hamnix's loader.
+    #
+    # Mapping shape:
+    #   data page : RO + NX   (pure data; user must not write or execute)
+    #   code page : RO + X    (the mini-ELF; executed, never written)
+    #
+    # elf_install_user_range installs leaf PTEs as RW|US|P|extra_flags.
+    # We pass PT_FLAG_NX for the data page; for the code page we pass 0
+    # (executable). Then we drop the RW bit on BOTH ranges via
+    # elf_set_range_ro so userspace can neither scribble the data page
+    # nor patch the vDSO code. (elf_set_range_ro leaves the NX bit
+    # untouched, so the code page stays executable and the data page
+    # stays NX.)
+    if vdso_ready == 0:
+        return 0
+    data_va: uint64 = vdso_data_phys
+    code_va: uint64 = vdso_code_phys
+    # Data page (one page below the code page), RO+NX.
+    if elf_install_user_range(pml4_phys,
+                              data_va,
+                              data_va + PAGE_SIZE_4K,
+                              vdso_data_phys,
+                              "vdso-data", PT_FLAG_NX) < 0:
+        printk0("[vdso] data-page user map FAILED\n")
+        return 0
+    # Code page (the ELF), RO+X.
+    if elf_install_user_range(pml4_phys,
+                              code_va,
+                              code_va + PAGE_SIZE_4K,
+                              vdso_code_phys,
+                              "vdso-code", 0) < 0:
+        printk0("[vdso] code-page user map FAILED\n")
+        return 0
+    # Drop RW on both pages: data becomes RO (NX kept), code becomes
+    # RO (executable kept).
+    elf_set_range_ro(pml4_phys, data_va, data_va + PAGE_SIZE_4K)
+    elf_set_range_ro(pml4_phys, code_va, code_va + PAGE_SIZE_4K)
+    return code_va
+
+
+def vdso_is_ready() -> uint8:
+    return vdso_ready
+
+
+def vdso_user_code_vaddr() -> uint64:
+    # The user vaddr the vDSO code (ELF) page lands at — i.e. the
+    # AT_SYSINFO_EHDR value. Under the identity model this is simply the
+    # code page's physical address (same in every address space, since
+    # every process maps it at vaddr == phys). Returns 0 if the vDSO
+    # isn't ready. Callers that build the auxv BEFORE they have the
+    # child's PML4 (SYS_SPAWN) plant AT_SYSINFO_EHDR up front from this
+    # and do the actual vdso_map_into_user() once the child task exists.
+    if vdso_ready == 0:
+        return 0
+    return vdso_code_phys
+
+
+# ---------------------------------------------------------------------
+# Embedded-ELF parse self-test — runs at boot. Walks the copied mini-
+# ELF exactly the way glibc/musl's dl-vdso resolver does (e_phoff ->
+# PT_DYNAMIC -> DT_HASH/DT_STRTAB/DT_SYMTAB -> elf_hash bucket/chain
+# lookup) and confirms __vdso_clock_gettime resolves to an offset that
+# lands inside the image. If the hand-built hash/dynsym in vdso_image.S
+# is ever mis-edited, this catches it at boot instead of shipping a
+# vDSO real libc would fail to resolve.
+# ---------------------------------------------------------------------
+def _vdso_elf_hash(name: Ptr[uint8]) -> uint32:
+    # The classic SysV ELF hash (same as glibc dl_new_hash's predecessor
+    # used for DT_HASH). Operates on the NUL-terminated `name`.
+    h: uint32 = 0
+    i: uint64 = 0
+    while name[i] != 0:
+        h = (h << 4) + cast[uint32](name[i])
+        g: uint32 = h & 0xf0000000
+        if g != 0:
+            h = h ^ (g >> 24)
+        h = h & ~g
+        i = i + 1
+    return h
+
+
+def _vdso_streq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    # 1 if the two NUL-terminated byte strings are equal, else 0.
+    i: uint64 = 0
+    while True:
+        ca: uint8 = a[i]
+        cb: uint8 = b[i]
+        if ca != cb:
+            return 0
+        if ca == 0:
+            return 1
+        i = i + 1
+    return 0
+
+
+def vdso_selftest(base: uint64) -> int32:
+    # Resolve "__vdso_clock_gettime" through the image at `base` (a
+    # kernel-readable copy). Returns 0 on success, -1 on any structural
+    # failure. Mirrors the loader walk precisely.
+    b: Ptr[uint8] = cast[Ptr[uint8]](base)
+    # ELF magic.
+    if b[0] != 0x7f or b[1] != 0x45 or b[2] != 0x4c or b[3] != 0x46:
+        printk0("[vdso] selftest: bad ELF magic\n")
+        return -1
+    e_phoff: uint64 = cast[Ptr[uint64]](base + 0x20)[0]
+    e_phnum: uint16 = cast[Ptr[uint16]](base + 0x38)[0]
+    # Find PT_DYNAMIC (p_type == 2) among the program headers.
+    dyn_off: uint64 = 0
+    i: uint64 = 0
+    while i < cast[uint64](e_phnum):
+        ph: uint64 = base + e_phoff + i * 56
+        p_type: uint32 = cast[Ptr[uint32]](ph)[0]
+        if p_type == 2:
+            # p_vaddr at offset 16 (image-relative, == file offset here).
+            dyn_off = cast[Ptr[uint64]](ph + 16)[0]
+        i = i + 1
+    if dyn_off == 0:
+        printk0("[vdso] selftest: no PT_DYNAMIC\n")
+        return -1
+    # Walk .dynamic for DT_HASH(4)/DT_STRTAB(5)/DT_SYMTAB(6)/DT_SYMENT(11).
+    hash_off: uint64 = 0
+    str_off:  uint64 = 0
+    sym_off:  uint64 = 0
+    syment:   uint64 = 0
+    dp: uint64 = base + dyn_off
+    while True:
+        d_tag: uint64 = cast[Ptr[uint64]](dp)[0]
+        d_val: uint64 = cast[Ptr[uint64]](dp + 8)[0]
+        if d_tag == 0:
+            break
+        if d_tag == 4:
+            hash_off = d_val
+        if d_tag == 5:
+            str_off = d_val
+        if d_tag == 6:
+            sym_off = d_val
+        if d_tag == 11:
+            syment = d_val
+        dp = dp + 16
+    if hash_off == 0 or str_off == 0 or sym_off == 0 or syment != 24:
+        printk0("[vdso] selftest: dynamic table incomplete\n")
+        return -1
+    # SysV hash lookup of __vdso_clock_gettime.
+    want: Array[24, uint8]
+    _vdso_set_name(&want[0])
+    nbucket: uint32 = cast[Ptr[uint32]](base + hash_off)[0]
+    bucket_base: uint64 = base + hash_off + 8
+    chain_base:  uint64 = bucket_base + cast[uint64](nbucket) * 4
+    h: uint32 = _vdso_elf_hash(&want[0])
+    idx: uint32 = cast[Ptr[uint32]](bucket_base
+                                    + cast[uint64](h % nbucket) * 4)[0]
+    guard: uint32 = 0
+    while idx != 0 and guard < 64:
+        sym: uint64 = base + sym_off + cast[uint64](idx) * syment
+        st_name: uint32 = cast[Ptr[uint32]](sym)[0]
+        st_value: uint64 = cast[Ptr[uint64]](sym + 8)[0]
+        nm: Ptr[uint8] = cast[Ptr[uint8]](base + str_off
+                                          + cast[uint64](st_name))
+        if _vdso_streq(nm, &want[0]) != 0:
+            # Found it. st_value must land strictly inside the image.
+            if st_value == 0 or st_value >= PAGE_SIZE_4K:
+                printk1("[vdso] selftest: bad st_value %p\n", st_value)
+                return -1
+            printk1("[vdso] selftest OK: __vdso_clock_gettime @ +%p\n",
+                    st_value)
+            return 0
+        idx = cast[Ptr[uint32]](chain_base
+                                + cast[uint64](idx) * 4)[0]
+        guard = guard + 1
+    printk0("[vdso] selftest: __vdso_clock_gettime NOT FOUND in dynsym\n")
+    return -1
+
+
+def _vdso_set_name(dst: Ptr[uint8]):
+    # Write the literal "__vdso_clock_gettime\0" into dst. Spelled out
+    # byte-by-byte to avoid depending on a string-literal-global lowering
+    # for a 20-char name (kept robust across Adder codegen revisions).
+    s: Array[21, uint8]
+    s[0]  = 0x5f   # _
+    s[1]  = 0x5f   # _
+    s[2]  = 0x76   # v
+    s[3]  = 0x64   # d
+    s[4]  = 0x73   # s
+    s[5]  = 0x6f   # o
+    s[6]  = 0x5f   # _
+    s[7]  = 0x63   # c
+    s[8]  = 0x6c   # l
+    s[9]  = 0x6f   # o
+    s[10] = 0x63   # c
+    s[11] = 0x6b   # k
+    s[12] = 0x5f   # _
+    s[13] = 0x67   # g
+    s[14] = 0x65   # e
+    s[15] = 0x74   # t
+    s[16] = 0x74   # t
+    s[17] = 0x69   # i
+    s[18] = 0x6d   # m
+    s[19] = 0x65   # e
+    s[20] = 0x00   # NUL
+    i: uint64 = 0
+    while i < 21:
+        dst[i] = s[i]
+        i = i + 1
