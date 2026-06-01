@@ -184,6 +184,15 @@ if os.environ.get("ENABLE_TCP_THROUGHPUT_SMOKE") == "1":
 if os.environ.get("ENABLE_TCP_LOOPBACK_SMOKE") == "1":
     FILES.append(("/etc/tcp-loopback-test", b"1\n"))
 
+# #166: TCP data-path maturity self-test (congestion control, window
+# scaling, SACK, multi-listener accept backlog). scripts/test_tcp_maturity.sh
+# sets ENABLE_TCP_TEST=1 to plant /etc/tcp-test; init/main.ad's boot:30.c
+# gate calls tcp_maturity_selftest(), which asserts against crafted in-kernel
+# state — no SLIRP / guestfwd needed. Default boots ship no marker so the
+# self-test never fires unintentionally.
+if os.environ.get("ENABLE_TCP_TEST") == "1":
+    FILES.append(("/etc/tcp-test", b"1\n"))
+
 # DHCP renew/rebind/expiry smoke. Gated the same way as the TLS / TCP
 # ring markers above. The renew smoke leaves DHCP state at IDLE on
 # exit, which breaks any downstream test that requires state == BOUND
