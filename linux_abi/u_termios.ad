@@ -1,0 +1,309 @@
+# linux_abi/u_termios.ad
+#
+# #164 — the Linux-ABI terminal line discipline.
+#
+# WHY THIS EXISTS
+# ---------------
+# A Linux guest launched from the local console (`enter linux { /bin/sh }`)
+# inherits stdio bound to the physical console device (DEVFD_CONS). Before
+# this milestone the guest's read(2) on fd 0 went straight to devcons_read
+# — a RAW byte stream: no echo, no line editing, and TCGETS/TCSETS were
+# fictions (always reported an all-zero termios = ICANON off / ECHO off).
+# A user typing at the prompt saw NOTHING and the shell read one un-echoed
+# keystroke at a time. Interactive `/bin/sh`, `bash`, a `python3` REPL —
+# all unusable from the console.
+#
+# This module gives every task a real, per-task termios state (defaulting
+# to the Linux cooked default: ICANON | ECHO | ECHOE | ICRNL | OPOST, sane
+# c_cc) and a canonical-mode line discipline that:
+#   * echoes typed characters to the console,
+#   * assembles a line, honouring VERASE (^? / ^H backspace) editing,
+#   * terminates the line on '\n' (ICANON returns one line per read),
+#   * treats VEOF (^D) on an empty line as end-of-file (read returns 0),
+#   * maps CR→NL on input when ICRNL is set.
+# When an app turns ICANON off (a REPL with its own readline, vi, less),
+# the read becomes raw: bytes pass straight through, echoed only if ECHO
+# is still set, returning as soon as >=1 byte is available (or VMIN/VTIME
+# defaults — we approximate VMIN=1).
+#
+# Ctrl-C / Ctrl-Z are NOT handled here: the UART/keyboard FIFO drain
+# (drivers/tty/serial/early_8250.ad, drivers/input/atkbd.ad) plucks 0x03 /
+# 0x1A out of the byte stream BEFORE it reaches any reader and posts
+# SIGINT / SIGTSTP to the terminal foreground group. So ISIG is effectively
+# always-on at a layer below us and those bytes never reach the discipline.
+# (A raw-mode app that wants ^C as a literal byte therefore can't get it —
+# a documented limitation, see the test's coverage note.)
+#
+# BOUNDARY LAW
+# ------------
+# Layer 2 (Linux-ABI shim). It consumes the console through the narrow
+# fs/vfs.ad bridge (vfs_console_read_nb / vfs_console_write) — it does NOT
+# reach into devcons / the rings directly, and it never marshals 9P. The
+# per-task termios store is a confined side table, the same shape as the
+# epoll / O_NONBLOCK pools.
+#
+# ADDER QUIRKS HONOURED
+#   * Top-level Array storage only — the termios store lives at module
+#     scope, not in a nested frame.
+#   * No sizeof — struct byte offsets are hand-numbered constants.
+
+from kernel.sched.core import (
+    current_idx_get, yield_to_others, NTASKS,
+)
+from fs.vfs import (
+    vfs_console_read_nb, vfs_console_write,
+)
+
+
+# --- struct termios byte layout (Linux x86_64 asm-generic) ----------
+#
+# struct termios {
+#   tcflag_t c_iflag;   // off 0   (u32)
+#   tcflag_t c_oflag;   // off 4   (u32)
+#   tcflag_t c_cflag;   // off 8   (u32)
+#   tcflag_t c_lflag;   // off 12  (u32)
+#   cc_t     c_line;    // off 16  (u8)
+#   cc_t     c_cc[NCCS];// off 17  (NCCS=19 bytes)
+# };  total 36 bytes — matches the size _u_ioctl already writes for TCGETS.
+TERMIOS_BYTES: uint64 = 36
+TERMIOS_NCCS:  uint64 = 19
+
+# c_iflag bits
+ICRNL:  uint32 = 0x0100
+IXON:   uint32 = 0x0400
+# c_oflag bits
+OPOST:  uint32 = 0x0001
+ONLCR:  uint32 = 0x0004
+# c_lflag bits
+ISIG:   uint32 = 0x0001
+ICANON: uint32 = 0x0002
+ECHO:   uint32 = 0x0008
+ECHOE:  uint32 = 0x0010
+ECHOK:  uint32 = 0x0020
+ECHONL: uint32 = 0x0040
+# c_cflag bits (only what we report for a believable tty)
+CS8:    uint32 = 0x0030
+CREAD:  uint32 = 0x0080
+B38400: uint32 = 0x000F      # baud bits — cosmetic
+
+# c_cc indices
+VINTR:  uint64 = 0
+VQUIT:  uint64 = 1
+VERASE: uint64 = 2
+VKILL:  uint64 = 3
+VEOF:   uint64 = 4
+VMIN:   uint64 = 6
+VEOL:   uint64 = 11
+VSUSP:  uint64 = 10
+
+
+# --- per-task termios store -----------------------------------------
+#
+# One termios row per task slot (0..NTASKS-1). Four flag words + a
+# c_line byte + NCCS control chars. Parallel flat Arrays (Adder: no
+# struct-of-arrays nesting in a frame).
+ut_valid:  Array[16, int32]              # 0 = never initialised (= cooked default)
+ut_iflag:  Array[16, uint32]
+ut_oflag:  Array[16, uint32]
+ut_cflag:  Array[16, uint32]
+ut_lflag:  Array[16, uint32]
+ut_line:   Array[16, uint8]
+ut_cc:     Array[304, uint8]             # 16 rows * 19 c_cc
+
+
+def _ut_set_defaults(slot: uint64):
+    # The Linux kernel's cooked tty default (n_tty_init / INIT_C_CC):
+    # canonical mode, echo on, CR→NL on input, output post-processing.
+    ut_iflag[slot] = ICRNL | IXON
+    ut_oflag[slot] = OPOST | ONLCR
+    ut_cflag[slot] = CS8 | CREAD | B38400
+    ut_lflag[slot] = ISIG | ICANON | ECHO | ECHOE | ECHOK
+    ut_line[slot]  = 0
+    base: uint64 = slot * TERMIOS_NCCS
+    i: uint64 = 0
+    while i < TERMIOS_NCCS:
+        ut_cc[base + i] = 0
+        i = i + 1
+    # The canonical INIT_C_CC control characters.
+    ut_cc[base + VINTR]  = 3            # ^C
+    ut_cc[base + VQUIT]  = 28           # ^\
+    ut_cc[base + VERASE] = 127          # ^? (DEL)
+    ut_cc[base + VKILL]  = 21           # ^U
+    ut_cc[base + VEOF]   = 4            # ^D
+    ut_cc[base + VMIN]   = 1
+    ut_cc[base + VSUSP]  = 26           # ^Z
+    ut_valid[slot] = 1
+
+
+def _ut_ensure(slot: uint64):
+    # Lazily seed a task's termios to the cooked default the first time
+    # it is touched (a TCGETS, a TCSETS, or a cooked console read).
+    if slot >= NTASKS:
+        return
+    if ut_valid[slot] == 0:
+        _ut_set_defaults(slot)
+
+
+# --- TCGETS / TCSETS -------------------------------------------------
+
+def utermios_tcgets(out: uint64) -> int64:
+    # Fill the caller's `struct termios` (36 bytes) from this task's
+    # stored state. Returns 0 on success.
+    if out == 0:
+        return cast[int64](-22)                # -EINVAL
+    slot: uint64 = current_idx_get()
+    _ut_ensure(slot)
+    cast[Ptr[uint32]](out)[0]      = ut_iflag[slot]
+    cast[Ptr[uint32]](out + 4)[0]  = ut_oflag[slot]
+    cast[Ptr[uint32]](out + 8)[0]  = ut_cflag[slot]
+    cast[Ptr[uint32]](out + 12)[0] = ut_lflag[slot]
+    cast[Ptr[uint8]](out + 16)[0]  = ut_line[slot]
+    base: uint64 = slot * TERMIOS_NCCS
+    i: uint64 = 0
+    while i < TERMIOS_NCCS:
+        cast[Ptr[uint8]](out + 17 + i)[0] = ut_cc[base + i]
+        i = i + 1
+    return 0
+
+
+def utermios_tcsets(inp: uint64) -> int64:
+    # Apply the caller's `struct termios` to this task's stored state.
+    # This is what makes raw-mode actually take effect: a REPL clearing
+    # ICANON|ECHO lands here and the next console read becomes raw.
+    if inp == 0:
+        return cast[int64](-22)
+    slot: uint64 = current_idx_get()
+    _ut_ensure(slot)
+    ut_iflag[slot] = cast[Ptr[uint32]](inp)[0]
+    ut_oflag[slot] = cast[Ptr[uint32]](inp + 4)[0]
+    ut_cflag[slot] = cast[Ptr[uint32]](inp + 8)[0]
+    ut_lflag[slot] = cast[Ptr[uint32]](inp + 12)[0]
+    ut_line[slot]  = cast[Ptr[uint8]](inp + 16)[0]
+    base: uint64 = slot * TERMIOS_NCCS
+    i: uint64 = 0
+    while i < TERMIOS_NCCS:
+        ut_cc[base + i] = cast[Ptr[uint8]](inp + 17 + i)[0]
+        i = i + 1
+    return 0
+
+
+# --- echo helpers ----------------------------------------------------
+
+def _ut_echo_byte(c: int32):
+    one: Array[1, uint8]
+    one[0] = cast[uint8](c & 0xFF)
+    vfs_console_write(&one[0], 1)
+
+
+def _ut_echo_erase():
+    # Visually erase one cell: backspace, space, backspace.
+    seq: Array[3, uint8]
+    seq[0] = 8                                  # BS
+    seq[1] = 32                                 # ' '
+    seq[2] = 8                                  # BS
+    vfs_console_write(&seq[0], 3)
+
+
+# --- the line discipline --------------------------------------------
+#
+# utermios_console_read(fd, buf, count) — the cooked/raw read a Linux
+# guest's read(2) on a console-backed fd routes through. Returns >0
+# bytes, 0 == EOF (VEOF on an empty canonical line), <0 errno.
+
+def utermios_console_read(buf: Ptr[uint8], count: uint64) -> int64:
+    if count == 0:
+        return 0
+    slot: uint64 = current_idx_get()
+    _ut_ensure(slot)
+    lflag: uint32 = ut_lflag[slot]
+    iflag: uint32 = ut_iflag[slot]
+    base:  uint64 = slot * TERMIOS_NCCS
+    cc_erase: int32 = cast[int32](ut_cc[base + VERASE])
+    cc_eof:   int32 = cast[int32](ut_cc[base + VEOF])
+    cc_kill:  int32 = cast[int32](ut_cc[base + VKILL])
+    do_echo:  int32 = 0
+    if (lflag & ECHO) != 0:
+        do_echo = 1
+
+    # --- RAW (non-canonical) mode -----------------------------------
+    # VMIN=1 approximation: block until at least one byte, then drain
+    # what is available up to `count`. Echo each byte iff ECHO is set.
+    if (lflag & ICANON) == 0:
+        scratch: Array[64, uint8]
+        n: uint64 = 0
+        while n < count:
+            cap: uint64 = count - n
+            if cap > 64:
+                cap = 64
+            got: int64 = vfs_console_read_nb(&scratch[0], cap)
+            if got <= 0:
+                if n > 0:
+                    return cast[int64](n)
+                yield_to_others()
+                continue
+            k: uint64 = 0
+            while k < cast[uint64](got):
+                ch: uint8 = scratch[k]
+                buf[n] = ch
+                if do_echo != 0:
+                    _ut_echo_byte(cast[int32](ch))
+                n = n + 1
+                k = k + 1
+            return cast[int64](n)            # VMIN=1: return the first burst
+        return cast[int64](n)
+
+    # --- CANONICAL (cooked) mode ------------------------------------
+    # Assemble a line; return on '\n' (kept in the buffer, Linux n_tty
+    # behaviour) or when the buffer fills. VEOF on an empty line == EOF.
+    icrnl: int32 = 0
+    if (iflag & ICRNL) != 0:
+        icrnl = 1
+    n: uint64 = 0
+    while True:
+        one: Array[1, uint8]
+        got: int64 = vfs_console_read_nb(&one[0], 1)
+        if got <= 0:
+            yield_to_others()
+            continue
+        c: int32 = cast[int32](one[0])
+        # CR → NL (ICRNL)
+        if c == 13 and icrnl != 0:
+            c = 10
+        # VEOF (^D): on an empty line it is end-of-file; mid-line it
+        # delivers the line so far WITHOUT the EOF byte (n_tty does the
+        # same — ^D flushes the partial line to the reader).
+        if c == cc_eof:
+            if n == 0:
+                return 0                     # EOF
+            return cast[int64](n)
+        # VERASE (^? / ^H): rub out the previous char.
+        if c == cc_erase or c == 8:
+            if n > 0:
+                n = n - 1
+                if do_echo != 0 and (lflag & ECHOE) != 0:
+                    _ut_echo_erase()
+            continue
+        # VKILL (^U): erase the whole pending line.
+        if c == cc_kill:
+            while n > 0:
+                n = n - 1
+                if do_echo != 0 and (lflag & ECHOE) != 0:
+                    _ut_echo_erase()
+            continue
+        # Newline terminates the canonical line. Echo it (so the cursor
+        # advances) regardless of ECHO when ECHONL-style — n_tty always
+        # echoes the NL in canon mode when ECHO is on; we mirror that.
+        if c == 10:
+            buf[n] = 10
+            n = n + 1
+            if do_echo != 0:
+                _ut_echo_byte(10)
+            return cast[int64](n)
+        # Ordinary printable / control byte: store + echo.
+        buf[n] = cast[uint8](c & 0xFF)
+        if do_echo != 0:
+            _ut_echo_byte(c)
+        n = n + 1
+        if n >= count:
+            return cast[int64](n)            # buffer full — give it back
+    return cast[int64](n)
