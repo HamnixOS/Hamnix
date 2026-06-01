@@ -216,6 +216,20 @@ sys_yield:
     .size sys_yield, .-sys_yield
 
 
+    /* --- sys_nice(nice, op) -> int64 --------------------------------
+     * #151 / CFS-lite. op==0 SET the calling task's nice (arg0, clamped
+     * to [-20,+19]); op==1 GET (arg0 ignored). Returns the resulting
+     * nice value. SysV arg regs rdi/rsi already align with the syscall
+     * arg regs, so no shuffle is needed. */
+    .globl sys_nice
+    .type sys_nice, @function
+sys_nice:
+    movq    $311, %rax              /* SYS_NICE */
+    syscall
+    ret
+    .size sys_nice, .-sys_nice
+
+
     /* --- sys_open(path) -> int32 ------------------------------------- */
     .globl sys_open
     .type sys_open, @function

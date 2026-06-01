@@ -251,6 +251,15 @@ if os.environ.get("ENABLE_USBMS_TEST") == "1":
 if os.environ.get("ENABLE_SMP_SOAK") == "1":
     FILES.append(("/etc/smp-soak", b"1\n"))
 
+# #151: CFS-lite + SMP load-balance self-test. scripts/test_sched_fair.sh
+# sets ENABLE_SCHED_FAIR=1 to plant /etc/sched-fair. init/main.ad at
+# boot:37 detects the marker and calls sched_fair_smp_selftest()
+# (kernel/sched/core.ad): it checks weight ordering / vruntime accrual and
+# spawns CPU-bound kthreads to prove the AP work-steals (dispatch spread
+# across >1 CPU under -smp 2). Default boots omit the marker.
+if os.environ.get("ENABLE_SCHED_FAIR") == "1":
+    FILES.append(("/etc/sched-fair", b"1\n"))
+
 # Partition write-smoke fixtures (mkpart MBR on sd0, gpt on nvme0n1).
 # These WRITE a partition table onto a freshly-registered disk that has
 # no MBR, so they must NEVER run on production media. Set

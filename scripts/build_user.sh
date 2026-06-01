@@ -167,6 +167,9 @@ build_adder_user sshd                 # SSH-2.0 server daemon: curve25519-sha256
 build_adder_user ssh                  # SSH-2.0 OUTBOUND client: ssh [user@]host [cmd] over /net (mirrors sshd's transport)
 build_adder_user preempt_hog          # preemption test: syscall-free infinite CPU hog
 build_adder_user preempt_demo         # preemption test: spawns the hog, proves the timer preempts it
+build_adder_user nice_hi              # #151 CFS-lite: high-priority (nice -20) CPU hog
+build_adder_user nice_lo              # #151 CFS-lite: low-priority  (nice +19) CPU hog
+build_adder_user nice_demo            # #151 CFS-lite: spawns nice_hi + nice_lo, proves CPU-share ratio
 build_adder_user hpm                  # Hamnix package manager (docs/packages.md)
 build_adder_user mkfs_ext4            # installer: format a /dev/blk/<dev> as ext4 (via /ctl)
 build_adder_user mkfs_fat             # installer: format a /dev/blk/<dev> as FAT (via /ctl; stub)
