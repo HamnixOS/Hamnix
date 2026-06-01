@@ -1,0 +1,461 @@
+# mm/uaccess.ad
+#
+# Real user-memory accessor layer — copy_to_user / copy_from_user /
+# get_user / put_user / strncpy_from_user / clear_user — that TRANSLATES
+# a user virtual address through the CURRENT TASK's page tables to a
+# kernel-accessible physical mapping before touching it.
+#
+# WHY THIS EXISTS (the decoupling)
+#
+# Historically the Hamnix kernel cheated: every user pointer was
+# dereferenced DIRECTLY, relying on the invariant `user vaddr == phys`
+# that holds only because user images, stacks, heaps and mmap regions
+# are all identity-mapped (the alloc_pages() physical address IS handed
+# back as the user vaddr). That invariant is the single biggest blocker
+# to a maturing kernel: it makes ET_DYN load-bias ASLR and mmap-base
+# ASLR impossible (randomizing the *virtual* base independently of the
+# physical backing would make vaddr != phys and break every raw deref),
+# and it makes per-task address spaces fragile.
+#
+# This layer removes the cheat. Every helper here WALKS the current
+# task's PML4 (the live CR3, which schedule() keeps pointed at the
+# running task) to resolve each user page's physical frame, obtains a
+# kernel pointer to that frame (low physical RAM is identity-mapped, so
+# phys == a valid kernel VA), and copies through it — one page at a
+# time, re-walking at every page boundary because a user range can span
+# pages backed by discontiguous physical frames. A page that is absent,
+# not user-accessible, or (for writes) not writable yields -EFAULT
+# instead of a #PF panic.
+#
+# RELATIONSHIP TO EXISTING WALKERS
+#
+#   * arch/x86/mm/pgtable.ad::pgtable_walk() walks the BSP CR3 only and
+#     is a diagnostic. We need a per-PML4 walk against the CURRENT task.
+#   * fs/elf.ad::_cow_resolve_pte_slot() is a MUTATING walk that CRACKS
+#     huge pages and ALLOCATES intermediate tables. We must NOT mutate
+#     the page tables to merely read/write user memory, so uaccess uses
+#     its own non-allocating read walk (uaccess_resolve below).
+#
+# CONTRACT
+#
+#   copy_to_user(dst_uvaddr, src_kptr, n)   -> bytes NOT copied (0 = ok)
+#   copy_from_user(dst_kptr, src_uvaddr, n) -> bytes NOT copied (0 = ok)
+#   (these mirror Linux's _copy_to_user / _copy_from_user return ABI:
+#    the count of bytes that could NOT be transferred. A clean copy
+#    returns 0; a fault partway returns the residual.)
+#
+#   get_user_{8,16,32,64}(uvaddr, *out)     -> 0 ok, -EFAULT on fault
+#   put_user_{8,16,32,64}(val, uvaddr)      -> 0 ok, -EFAULT on fault
+#   strncpy_from_user(kdst, usrc, n)        -> len copied (excl NUL), or
+#                                              -EFAULT on fault
+#   clear_user(uvaddr, n)                   -> bytes NOT cleared (0 = ok)
+
+from kernel.printk.printk import printk0, printk1, printk2
+from kernel.sched.core import current_task, TaskStruct
+from mm.page_alloc import alloc_page, free_page
+from fs.elf import vm_map_user_page
+
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+extern def get_bsp_cr3() -> uint64
+
+# --- PTE / page-table layout constants (mirror fs/elf.ad) ----------
+UA_PT_FLAG_P:   uint64 = 0x1                 # Present
+UA_PT_FLAG_RW:  uint64 = 0x2                 # Read/Write
+UA_PT_FLAG_US:  uint64 = 0x4                 # User/Supervisor (1 = CPL3 ok)
+UA_PT_FLAG_PS:  uint64 = 0x80                # Page-Size (terminal here)
+UA_PT_ADDR_MASK: uint64 = 0x000FFFFFFFFFF000 # bits [51:12]: phys base
+
+UA_PAGE_4K:   uint64 = 0x1000
+UA_PAGE_2M:   uint64 = 0x200000
+UA_PAGE_1G:   uint64 = 0x40000000
+UA_OFF_4K:    uint64 = 0xFFF
+UA_OFF_2M:    uint64 = 0x1FFFFF
+UA_OFF_1G:    uint64 = 0x3FFFFFFF
+
+# -EFAULT (Linux errno 14, negated for the syscall ABI).
+UA_EFAULT: int64 = -14
+
+
+def uaccess_current_pml4() -> uint64:
+    # Physical address of the running task's top-level page table. The
+    # scheduler keeps task.cr3 == the live %cr3 for the running task, so
+    # this is exactly the address translation hardware uses right now.
+    # Falls back to the BSP CR3 for the boot/kthread context where the
+    # current task's cr3 may be 0 (slot 0 / early boot).
+    t: Ptr[TaskStruct] = current_task()
+    c: uint64 = t.cr3
+    if c == 0:
+        return get_bsp_cr3() & UA_PT_ADDR_MASK
+    return c & UA_PT_ADDR_MASK
+
+
+# uaccess_resolve — NON-ALLOCATING, NON-MUTATING page-table walk.
+#
+# Walk `pml4_phys` (PML4 -> PDPT -> PD -> PT, honouring 1 GiB / 2 MiB
+# huge-page short-circuits) and return the PHYSICAL address that
+# `uvaddr` maps to, applying the in-page offset for whichever leaf size
+# we landed on. Returns 0 if any level is not-present, or if the leaf is
+# not user-accessible (US=0), or — when `need_write` is set — if the
+# leaf is read-only (RW=0). A 0 return therefore means "this access
+# would fault"; callers translate that into -EFAULT.
+#
+# 0 is never a legitimate physical translation here: a user vaddr never
+# resolves to physical frame 0 (the zero page is reserved and the NULL
+# guard is below the lowest user mapping), so a 0 sentinel is
+# unambiguous.
+def uaccess_resolve(pml4_phys: uint64, uvaddr: uint64,
+                    need_write: int32) -> uint64:
+    pml4_idx: uint64 = (uvaddr >> 39) & 0x1FF
+    pdpt_idx: uint64 = (uvaddr >> 30) & 0x1FF
+    pd_idx:   uint64 = (uvaddr >> 21) & 0x1FF
+    pt_idx:   uint64 = (uvaddr >> 12) & 0x1FF
+
+    pml4: uint64 = pml4_phys & UA_PT_ADDR_MASK
+    pml4e: uint64 = cast[Ptr[uint64]](pml4 + pml4_idx * 8)[0]
+    if (pml4e & UA_PT_FLAG_P) == 0:
+        return 0
+    # US must be set on EVERY level for a CPL=3 access to succeed; the
+    # hardware ANDs the US bits down the walk. We enforce the same so a
+    # kernel-only intermediate (US=0) is reported as a fault.
+    if (pml4e & UA_PT_FLAG_US) == 0:
+        return 0
+
+    pdpt: uint64 = pml4e & UA_PT_ADDR_MASK
+    pdpte: uint64 = cast[Ptr[uint64]](pdpt + pdpt_idx * 8)[0]
+    if (pdpte & UA_PT_FLAG_P) == 0:
+        return 0
+    if (pdpte & UA_PT_FLAG_US) == 0:
+        return 0
+    if (pdpte & UA_PT_FLAG_PS) != 0:
+        # 1 GiB huge page — pdpte is the leaf.
+        if need_write != 0 and (pdpte & UA_PT_FLAG_RW) == 0:
+            return 0
+        return (pdpte & UA_PT_ADDR_MASK) + (uvaddr & UA_OFF_1G)
+
+    pd: uint64 = pdpte & UA_PT_ADDR_MASK
+    pde: uint64 = cast[Ptr[uint64]](pd + pd_idx * 8)[0]
+    if (pde & UA_PT_FLAG_P) == 0:
+        return 0
+    if (pde & UA_PT_FLAG_US) == 0:
+        return 0
+    if (pde & UA_PT_FLAG_PS) != 0:
+        # 2 MiB huge page — pde is the leaf.
+        if need_write != 0 and (pde & UA_PT_FLAG_RW) == 0:
+            return 0
+        return (pde & UA_PT_ADDR_MASK) + (uvaddr & UA_OFF_2M)
+
+    pt: uint64 = pde & UA_PT_ADDR_MASK
+    pte: uint64 = cast[Ptr[uint64]](pt + pt_idx * 8)[0]
+    if (pte & UA_PT_FLAG_P) == 0:
+        return 0
+    if (pte & UA_PT_FLAG_US) == 0:
+        return 0
+    if need_write != 0 and (pte & UA_PT_FLAG_RW) == 0:
+        return 0
+    return (pte & UA_PT_ADDR_MASK) + (uvaddr & UA_OFF_4K)
+
+
+def _ua_bytes_to_page_end(uvaddr: uint64) -> uint64:
+    # Bytes remaining from `uvaddr` to the end of its containing 4 KiB
+    # page. We chunk every copy at 4 KiB boundaries (the smallest leaf
+    # granularity) so that re-resolving at the boundary always lands on
+    # the correct frame even when a huge page straddles the range — the
+    # next chunk re-walks and gets the right physical base.
+    return UA_PAGE_4K - (uvaddr & UA_OFF_4K)
+
+
+# --- copy_from_user ------------------------------------------------
+#
+# Copy `n` bytes from user virtual address `usrc` into kernel buffer
+# `kdst`. Returns the number of bytes that could NOT be copied (0 on a
+# complete copy), matching Linux's _copy_from_user residual ABI.
+def copy_from_user(kdst: uint64, usrc: uint64, n: uint64) -> uint64:
+    if n == 0:
+        return 0
+    pml4: uint64 = uaccess_current_pml4()
+    remaining: uint64 = n
+    cur_u: uint64 = usrc
+    cur_k: uint64 = kdst
+    while remaining > 0:
+        phys: uint64 = uaccess_resolve(pml4, cur_u, 0)
+        if phys == 0:
+            return remaining
+        chunk: uint64 = _ua_bytes_to_page_end(cur_u)
+        if chunk > remaining:
+            chunk = remaining
+        memcpy(cast[Ptr[uint8]](cur_k), cast[Ptr[uint8]](phys), chunk)
+        cur_u = cur_u + chunk
+        cur_k = cur_k + chunk
+        remaining = remaining - chunk
+    return 0
+
+
+# --- copy_to_user --------------------------------------------------
+#
+# Copy `n` bytes from kernel buffer `ksrc` into user virtual address
+# `udst`. Each destination page must be present AND user-writable
+# (US=1, RW=1) or the copy stops and the residual is returned.
+def copy_to_user(udst: uint64, ksrc: uint64, n: uint64) -> uint64:
+    if n == 0:
+        return 0
+    pml4: uint64 = uaccess_current_pml4()
+    remaining: uint64 = n
+    cur_u: uint64 = udst
+    cur_k: uint64 = ksrc
+    while remaining > 0:
+        phys: uint64 = uaccess_resolve(pml4, cur_u, 1)
+        if phys == 0:
+            return remaining
+        chunk: uint64 = _ua_bytes_to_page_end(cur_u)
+        if chunk > remaining:
+            chunk = remaining
+        memcpy(cast[Ptr[uint8]](phys), cast[Ptr[uint8]](cur_k), chunk)
+        cur_u = cur_u + chunk
+        cur_k = cur_k + chunk
+        remaining = remaining - chunk
+    return 0
+
+
+# --- get_user_* ----------------------------------------------------
+#
+# Read a fixed-width scalar from user space into *out. Returns 0 on
+# success, -EFAULT if the source faults. The width-specific variants
+# all funnel through copy_from_user so a value that straddles a page
+# boundary (an unaligned 64-bit load across two frames) is handled
+# correctly.
+def get_user_8(uvaddr: uint64, out: Ptr[uint8]) -> int64:
+    if copy_from_user(cast[uint64](out), uvaddr, 1) != 0:
+        return UA_EFAULT
+    return 0
+
+
+def get_user_16(uvaddr: uint64, out: Ptr[uint16]) -> int64:
+    if copy_from_user(cast[uint64](out), uvaddr, 2) != 0:
+        return UA_EFAULT
+    return 0
+
+
+def get_user_32(uvaddr: uint64, out: Ptr[uint32]) -> int64:
+    if copy_from_user(cast[uint64](out), uvaddr, 4) != 0:
+        return UA_EFAULT
+    return 0
+
+
+def get_user_64(uvaddr: uint64, out: Ptr[uint64]) -> int64:
+    if copy_from_user(cast[uint64](out), uvaddr, 8) != 0:
+        return UA_EFAULT
+    return 0
+
+
+# --- put_user_* ----------------------------------------------------
+#
+# Write a fixed-width scalar to user space. Returns 0 on success,
+# -EFAULT if the destination faults / is read-only.
+def put_user_8(val: uint8, uvaddr: uint64) -> int64:
+    v: uint8 = val
+    if copy_to_user(uvaddr, cast[uint64](&v), 1) != 0:
+        return UA_EFAULT
+    return 0
+
+
+def put_user_16(val: uint16, uvaddr: uint64) -> int64:
+    v: uint16 = val
+    if copy_to_user(uvaddr, cast[uint64](&v), 2) != 0:
+        return UA_EFAULT
+    return 0
+
+
+def put_user_32(val: uint32, uvaddr: uint64) -> int64:
+    v: uint32 = val
+    if copy_to_user(uvaddr, cast[uint64](&v), 4) != 0:
+        return UA_EFAULT
+    return 0
+
+
+def put_user_64(val: uint64, uvaddr: uint64) -> int64:
+    v: uint64 = val
+    if copy_to_user(uvaddr, cast[uint64](&v), 8) != 0:
+        return UA_EFAULT
+    return 0
+
+
+# --- strncpy_from_user ---------------------------------------------
+#
+# Copy a NUL-terminated string from user `usrc` into kernel buffer
+# `kdst`, at most `maxlen` bytes (INCLUDING the NUL). Returns the string
+# length copied (NOT counting the NUL), or -EFAULT if any byte faults.
+# If the source has no NUL within maxlen-1 bytes the result is truncated
+# and NUL-terminated at kdst[maxlen-1], returning maxlen-1.
+#
+# We resolve one page at a time and scan within the resolved physical
+# frame, so a long string spanning several frames re-walks at each page
+# boundary — exactly the translation the raw deref used to skip.
+def strncpy_from_user(kdst: uint64, usrc: uint64, maxlen: uint64) -> int64:
+    if maxlen == 0:
+        return 0
+    pml4: uint64 = uaccess_current_pml4()
+    copied: uint64 = 0
+    cur_u: uint64 = usrc
+    dstp: Ptr[uint8] = cast[Ptr[uint8]](kdst)
+    # Leave room for the terminating NUL: we copy at most maxlen-1 real
+    # bytes, then always NUL-terminate.
+    cap: uint64 = maxlen - 1
+    while copied < cap:
+        phys: uint64 = uaccess_resolve(pml4, cur_u, 0)
+        if phys == 0:
+            return UA_EFAULT
+        # Bytes available in this frame before the next page boundary.
+        page_left: uint64 = _ua_bytes_to_page_end(cur_u)
+        srcp: Ptr[uint8] = cast[Ptr[uint8]](phys)
+        i: uint64 = 0
+        while i < page_left and copied < cap:
+            b: uint8 = srcp[i]
+            dstp[copied] = b
+            if b == 0:
+                # Hit the terminator — string fully copied. `copied`
+                # counts characters before the NUL.
+                return cast[int64](copied)
+            copied = copied + 1
+            i = i + 1
+        cur_u = cur_u + page_left
+    # Truncated: no NUL within cap bytes. Terminate and report cap.
+    dstp[copied] = 0
+    return cast[int64](copied)
+
+
+# --- clear_user ----------------------------------------------------
+#
+# Zero `n` bytes of user memory at `uvaddr`. Returns the number of bytes
+# NOT cleared (0 on full success), matching Linux's clear_user residual.
+# Each page must be present and user-writable.
+def clear_user(uvaddr: uint64, n: uint64) -> uint64:
+    if n == 0:
+        return 0
+    pml4: uint64 = uaccess_current_pml4()
+    remaining: uint64 = n
+    cur_u: uint64 = uvaddr
+    while remaining > 0:
+        phys: uint64 = uaccess_resolve(pml4, cur_u, 1)
+        if phys == 0:
+            return remaining
+        chunk: uint64 = _ua_bytes_to_page_end(cur_u)
+        if chunk > remaining:
+            chunk = remaining
+        memset(cast[Ptr[uint8]](phys), 0, chunk)
+        cur_u = cur_u + chunk
+        remaining = remaining - chunk
+    return 0
+
+
+# ===================================================================
+# Stage A proof — the DECOUPLING test.
+#
+# Maps a fresh physical page at a user vaddr DELIBERATELY OFFSET from
+# its physical frame (a genuine non-identity mapping: vaddr != phys),
+# then proves:
+#   1. copy_to_user(V, ...) lands at the PHYSICAL frame P (not at V),
+#   2. copy_from_user(..., V) reads it back through the same translation,
+#   3. an UNMAPPED user address returns the full residual (-EFAULT-shape),
+#   4. a READ-ONLY user page rejects copy_to_user but allows
+#      copy_from_user.
+#
+# The whole point: NONE of this works if the kernel still assumes
+# vaddr == phys. A PASS here is the proof the translation is real.
+#
+# The test vaddr sits high in the canonical user half (well above any
+# identity-mapped RAM) so it can only resolve via the PTE we install —
+# if uaccess fell back to a raw deref it would touch unmapped memory and
+# the round-trip would visibly fail.
+# ===================================================================
+
+UA_TEST_VADDR_RW: uint64 = 0x0000555500000000   # non-identity, writable
+UA_TEST_VADDR_RO: uint64 = 0x0000555500001000   # non-identity, read-only
+UA_TEST_VADDR_UNMAPPED: uint64 = 0x0000666600000000
+
+
+def uaccess_smoke_test():
+    printk0("Hamnix: uaccess smoke test (vaddr != phys translation)\n")
+    pml4: uint64 = uaccess_current_pml4()
+
+    # --- map a writable page at V_rw -> P_rw (V_rw != P_rw) ---------
+    p_rw: uint64 = alloc_page()
+    if p_rw == 0:
+        printk0("  [uaccess-smoke] SKIP: alloc_page failed\n")
+        return
+    # Pre-poison the physical frame so we can tell a real translated
+    # write from a no-op.
+    memset(cast[Ptr[uint8]](p_rw), 0xAB, 4096)
+    if vm_map_user_page(pml4, UA_TEST_VADDR_RW, p_rw, 1) < 0:
+        printk0("  [uaccess-smoke] FAIL: could not install RW test mapping\n")
+        free_page(p_rw)
+        return
+    printk2("  [uaccess-smoke] mapped V=%p -> P=%p (writable)\n",
+            UA_TEST_VADDR_RW, p_rw)
+
+    # 1. copy_to_user must write through the translation to P_rw.
+    kbuf: Array[64, uint8]
+    i: uint64 = 0
+    while i < 64:
+        kbuf[i] = cast[uint8](0x10 + i)
+        i = i + 1
+    r1: uint64 = copy_to_user(UA_TEST_VADDR_RW, cast[uint64](&kbuf[0]), 64)
+    # Read directly from the PHYSICAL frame: if translation worked, the
+    # bytes are at p_rw, NOT at the (unmapped-as-RAM) vaddr.
+    phys_view: Ptr[uint8] = cast[Ptr[uint8]](p_rw)
+    ok_write: int32 = 1
+    if r1 != 0:
+        ok_write = 0
+    i = 0
+    while i < 64:
+        if phys_view[i] != cast[uint8](0x10 + i):
+            ok_write = 0
+        i = i + 1
+    if ok_write != 0:
+        printk0("  [uaccess-smoke] PASS: copy_to_user reached the physical frame\n")
+    else:
+        printk1("  [uaccess-smoke] FAIL: copy_to_user residual=%p / bytes wrong\n", r1)
+
+    # 2. copy_from_user must read the same bytes back through V_rw.
+    kback: Array[64, uint8]
+    memset(cast[Ptr[uint8]](&kback[0]), 0, 64)
+    r2: uint64 = copy_from_user(cast[uint64](&kback[0]), UA_TEST_VADDR_RW, 64)
+    ok_read: int32 = 1
+    if r2 != 0:
+        ok_read = 0
+    i = 0
+    while i < 64:
+        if kback[i] != cast[uint8](0x10 + i):
+            ok_read = 0
+        i = i + 1
+    if ok_read != 0:
+        printk0("  [uaccess-smoke] PASS: copy_from_user round-tripped through V\n")
+    else:
+        printk1("  [uaccess-smoke] FAIL: copy_from_user residual=%p / bytes wrong\n", r2)
+
+    # 3. an UNMAPPED user address must fault cleanly (full residual),
+    #    NOT panic.
+    r3: uint64 = copy_from_user(cast[uint64](&kback[0]),
+                                UA_TEST_VADDR_UNMAPPED, 64)
+    if r3 == 64:
+        printk0("  [uaccess-smoke] PASS: unmapped address -> EFAULT (no panic)\n")
+    else:
+        printk1("  [uaccess-smoke] FAIL: unmapped residual=%p (expected 64)\n", r3)
+
+    # 4. a READ-ONLY user page: copy_from_user OK, copy_to_user rejected.
+    p_ro: uint64 = alloc_page()
+    if p_ro != 0:
+        memset(cast[Ptr[uint8]](p_ro), 0x5C, 4096)
+        if vm_map_user_page(pml4, UA_TEST_VADDR_RO, p_ro, 0) == 0:
+            r4r: uint64 = copy_from_user(cast[uint64](&kback[0]),
+                                         UA_TEST_VADDR_RO, 8)
+            r4w: uint64 = copy_to_user(UA_TEST_VADDR_RO,
+                                       cast[uint64](&kbuf[0]), 8)
+            if r4r == 0 and r4w == 8:
+                printk0("  [uaccess-smoke] PASS: RO page readable, write -> EFAULT\n")
+            else:
+                printk2("  [uaccess-smoke] FAIL: RO page r=%p w=%p\n", r4r, r4w)
+        free_page(p_ro)
+
+    free_page(p_rw)
+    printk0("  [uaccess-smoke] done\n")
