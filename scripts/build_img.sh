@@ -120,8 +120,28 @@ bash scripts/build_modules.sh
 # HAMNIX_PARTITION_RC_SOURCED_OK assertion). This is the "no cpio in the
 # live install path" end state. The `-kernel` developer/test path keeps
 # its own full cpio via run_x86_bare.sh.
+# USB driver default for the shipped image. The Linux xhci_hcd.ko USB
+# stack is the DEFAULT root-on-USB driver (it is more mature than the
+# native driver and, unlike native, works on real hardware — the NUC).
+# The kernel reads the /etc/xhci-ko* marker files from the (otherwise
+# empty) cpio BEFORE the ext4 root is online to select the .ko path and
+# register /dev/blk/sd0 backed by it, then mounts the ext4 root THROUGH
+# xhci_hcd.ko.
+#
+# CLEAN OPT-OUT: set ENABLE_NATIVE_USB=1 (or DISABLE_XHCI_KO_REAL=1) to
+# restore the native drivers/usb/{xhci,storage}.ad path — no markers are
+# planted and the kernel's root-on-USB bring-up uses xhci_init_force() +
+# usbms_init() exactly as before.
+if [ "${ENABLE_NATIVE_USB:-0}" = "1" ] || [ "${DISABLE_XHCI_KO_REAL:-0}" = "1" ]; then
+    echo "[build_img] USB driver: NATIVE (opt-out via ENABLE_NATIVE_USB/DISABLE_XHCI_KO_REAL)."
+    XHCI_KO_REAL_ENV=""
+else
+    echo "[build_img] USB driver: Linux xhci_hcd.ko (.ko-real DEFAULT; opt out with ENABLE_NATIVE_USB=1)."
+    XHCI_KO_REAL_ENV="ENABLE_XHCI_KO_REAL=1 ENABLE_XHCI_KO_REAL_MMIO=1"
+fi
+
 echo "[build_img] Building empty initramfs (kernel boots off ext4; cpio symbol kept for link)."
-HAMNIX_CPIO_EMPTY=1 python3 scripts/build_initramfs.py
+env HAMNIX_CPIO_EMPTY=1 ${XHCI_KO_REAL_ENV} python3 scripts/build_initramfs.py
 
 echo "[build_img] Building ext4 rootfs partition (~${HAMNIX_ROOTFS_SIZE_MB} MiB shipped)."
 HAMNIX_ROOTFS_OUT="$HAMNIX_ROOTFS_IMG" python3 scripts/build_rootfs_img.py

@@ -856,9 +856,23 @@ def build_archive() -> bytes:
     # deleting fs/cpio.ad would require (~380 test scripts boot via
     # run_x86_bare.sh's regenerated blob).
     if os.environ.get("HAMNIX_CPIO_EMPTY", "0") == "1":
-        print("[build_initramfs] HAMNIX_CPIO_EMPTY=1: emitting a "
-              "trailer-only cpio (installed disk boots off ext4).")
-        return cpio_trailer()
+        # Trailer-only userland — the installed disk boots off ext4 and
+        # needs NO embedded userland. BUT the boot-MODE marker files
+        # (/etc/xhci-ko*, etc.) are tiny gate files the kernel reads from
+        # the cpio BEFORE the ext4 root is online — they select which USB
+        # driver brings the root block device up. Those MUST survive into
+        # the shipped image (e.g. ENABLE_XHCI_KO_REAL=1 makes the Linux
+        # xhci_hcd.ko the default root-on-USB driver). So we emit the
+        # /etc/* marker FILES here while still carrying zero userland.
+        marker_blob = b""
+        n_markers = 0
+        for name, data in FILES:
+            if name.startswith("/etc/"):
+                marker_blob += cpio_entry(name, data)
+                n_markers += 1
+        print("[build_initramfs] HAMNIX_CPIO_EMPTY=1: emitting %d /etc boot "
+              "markers + trailer (installed disk boots off ext4)." % n_markers)
+        return marker_blob + cpio_trailer()
 
     # HAMNIX_CPIO_LEAN=1 — strip everything from the cpio that the
     # rootfs partition (build/hamnix-rootfs.img, see
