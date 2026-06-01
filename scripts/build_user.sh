@@ -230,6 +230,17 @@ python3 -m compiler.adder compile \
     -o build/user/codegen_elf_selftest.elf
 file build/user/codegen_elf_selftest.elf
 
+# Companion on-device emitter that exercises the .bss + .data model: a
+# zero-init array global (.bss, no file bytes) plus initialised string +
+# scalar globals (.data). Consumed by scripts/test_selfhost_bss.sh, which
+# EXECs the emitted ELF natively to prove the BSS model works on the CPU.
+echo "[build_user] compiling adder/compiler/codegen_bss_selftest.ad -> build/user/codegen_bss_selftest.elf"
+python3 -m compiler.adder compile \
+    --target=x86_64-adder-user \
+    adder/compiler/codegen_bss_selftest.ad \
+    -o build/user/codegen_bss_selftest.elf
+file build/user/codegen_bss_selftest.elf
+
 # --- hamnix-ac: generalized on-device Adder compile driver -----------
 # Same pipeline as codegen_elf_selftest, but reads the source to compile
 # from a host-injected file (/src/input.ad) instead of a baked snippet.
