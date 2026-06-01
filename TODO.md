@@ -88,6 +88,64 @@ retrofitted backwards.
 
 ---
 
+## GPU / graphics track (#181–185, native-first, locked with user 2026-06-01)
+
+Target: GL + Vulkan to the point that **glxgears and vkcube spin in a
+window in the hamUI desktop**, on accelerated hardware where present.
+
+**Two laws this track is built on — do not conflate them:**
+1. **The DE never requires the Linux *namespace*.** The Debian userspace
+   (apt, Mesa `.so` ICDs like `lavapipe`/ANV, served by `distrofs`) is
+   never a desktop dependency. The always-works baseline is a **native
+   (Adder) Vulkan spine with a native *software rasterizer*** — NOT
+   lavapipe (lavapipe is a Linux Mesa userspace binary, explicitly ruled
+   out as the DE fallback).
+2. **Linux `.ko` kernel modules via the L-shim ARE used and wanted.** A
+   `.ko` is an in-kernel module resolved against `linux_abi/api_*.ad`; it
+   needs no namespace. Intel silicon is driven by `i915.ko` through the
+   shim (vendor-mess HW → `.ko`, per the native-vs-L-shim law). `.ko` ≠
+   namespace.
+
+So "no Linux-namespace requirement" ≠ "no Linux kernel modules."
+Hardware accel is a pure perf upgrade, never a gate: if every accel path
+fails, the DE keeps running CPU-rendered on the native software rasterizer.
+
+- [ ] **#181 Phase 0 — all-native Vulkan spine.** Native Vulkan API +
+  compositor + **native software rasterizer** + present/WSI (CPU image →
+  KMS/GOP scanout). Zero Linux, zero namespace. Accept: a native
+  vkcube/gears composites in the DE in a VM. The always-works baseline.
+- [ ] **#182 Phase 1 — native acceleration in a VM.** Native
+  **virtio-gpu** driver (reuse the native virtio core in
+  `drivers/virtio/`; standardized HW → native) + native **venus** (Vulkan
+  marshalling — no in-guest shader compiler, the host compiles). Real
+  accelerated DRM stack in a VM, no NUC, no Linux. Validates the kernel
+  DRM / dma-buf / ioctl contract (depends on #163 uaccess).
+- [ ] **#183 Phase 2 — DE composites via the native spine.** REQUIRED:
+  native vkcube in a hamUI window with the namespace absent. OPTIONAL /
+  additive: Linux X11/GL apps bridge **in** via a venus-shaped shim ICD +
+  **Zink** (GL-on-Vulkan), so a Linux `glxgears` + `vkcube` spin in an
+  X11 window in the DE — proving the bridge without making Linux a DE
+  requirement. VM-debuggable. Relates to hamUI Phase 5 (X11 bridge).
+- [ ] **#184 Phase 3 (METAL-ONLY) — Intel i915 silicon bring-up.** Drive
+  the NUC iGPU via **`i915.ko` through the L-shim** (namespace-free
+  kernel module): GEM + GTT/PPGTT, real KMS modeset (EDID/DP-AUX,
+  pipes/planes, page-flip — replaces the GOP fb), execlist submission +
+  dma-fence, GuC/HuC firmware. Accel userspace ICD = native
+  ANV-equivalent (#185, Linux-free) OR Mesa ANV `.so` via the namespace
+  (optional). If all accel fails → native software-rasterizer fallback
+  (the desktop never goes dark). De-risked: everything above it is
+  VM-proven in Phases 0–2; only the Intel-Gen delta is new. Debug via ESP
+  `LOG.TXT` persistence or VFIO passthrough.
+- [ ] **#185 Phase 4 (long pole, optional) — native ANV-equivalent.**
+  Native Intel-Gen ISA shader compiler + command-buffer build + bo alloc
+  + execlist submit over #184's i915. Removes the *last* namespace
+  dependency (Mesa ANV userspace) for hardware accel on silicon. Shader
+  compilation is the dividing line that makes this the hardest native
+  piece (virtio-gpu needs none; bare silicon needs a real ISA compiler).
+  Validate with a native spinning-cube demo. Lowest priority.
+
+---
+
 ## Open kernel work
 
 The Phase D inversion + §1..§13 critical path is **closed** (see
@@ -241,6 +299,22 @@ STATUS.md). What remains, off the critical path and parallelisable:
   hamUI Phase 5 (X11 bridge).
 - [ ] Suspend / power management.
 - [ ] Multi-arch (ARM64) — currently x86_64 only.
+- [ ] **#186 Native packages go source-based (Gentoo-style).** Since the
+  Adder compiler self-hosts on-box (#154), the **native** `hpm` repo
+  becomes **source-primary + optional binary cache** (Gentoo source+binpkg
+  model, locked with user 2026-06-01). A package's source of truth is a
+  source tarball — `.ad` sources + a recipe (name, version, runtime
+  `depends`, `builddeps`, compile target `x86_64-adder-user`, produced-
+  binary→install-path map). `index.json` always carries `src_url`/
+  `src_sha256`; the binary becomes an OPTIONAL cache (`bin_url`/
+  `bin_sha256` + an `arch` tag — wrong-arch cache ignored, falls back to
+  source). `hpm install` defaults to compile-from-source (fetch source →
+  resolve builddeps → invoke the on-box compiler → install map), prefers
+  the cache when arch-matched, `--from-source` forces a rebuild. CI keeps
+  building the binary (now the cache) AND publishes source. **Native repo
+  ONLY** — Debian/namespace packages stay prebuilt `.deb` via apt/dpkg in
+  the distrofs namespace. Payoff: ARM64 (#175) source packages "just work"
+  once the compiler ports — no per-arch binary build farm.
 - [ ] Signed package indexes (sha256 covers tarballs; the index itself
   is unsigned today).
 - [ ] Kernel oops capture (svc logs cover userland; kernel panics
