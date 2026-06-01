@@ -177,6 +177,7 @@ build_adder_user hamnix_partition     # installer: GPT init + ESP + rootfs mkpar
 build_adder_user dd_blk               # installer: sector-aligned /dev/blk/SRC -> /dev/blk/DST copy
 build_adder_user install_file_to_slot # installer: copy one local file → target ext4 partition (via /ctl install_file verb)
 build_adder_user install_rootfs_from_manifest  # installer: walk manifest, install_file_to_slot each (target_path source_path) pair
+build_adder_user haminstall           # installer: one-shot on-target install (GPT+mkfs+ESP+rootfs) with live-root safety guard
 
 # --- X11 server + client (user/x11/ subdirectory) -------------------
 # The source lives in user/x11/<name>.ad but the ELF goes into

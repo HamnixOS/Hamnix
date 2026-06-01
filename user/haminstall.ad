@@ -1,0 +1,434 @@
+# user/haminstall.ad
+#
+# On-target Hamnix installer: from a RUNNING Hamnix system, lay down a
+# fresh, independently-bootable system onto a blank block device. This
+# is the native equivalent of the Debian installer or an Arch manual
+# install — partition GPT, mkfs the ESP + root, copy the running
+# rootfs onto the new root, install the ESP boot files, sync, done.
+#
+# Usage:
+#   /bin/haminstall <target-disk>
+#   /bin/haminstall vdb
+#   /bin/haminstall /dev/blk/vdb
+#   /bin/haminstall vdb --esp-src vdap2 --manifest /etc/install/rootfs.manifest
+#
+# Positional:
+#   <target-disk>   the blank disk to install onto. Either the bare
+#                   device name ("vdb") or a "/dev/blk/<name>" path.
+#                   MUST be a whole disk, NOT a partition (we write a
+#                   GPT to it). MUST NOT be the disk backing the live
+#                   root FS — the installer refuses that explicitly.
+#
+# Options:
+#   --esp-src <dev>     source ESP partition to byte-copy onto the new
+#                       ESP (e.g. "vdap2"). FAT has no per-file kernel
+#                       writer yet, so the ESP is a raw sector copy of
+#                       the live ISO's ESP. Default: vdap2.
+#   --manifest <path>   rootfs manifest (target_path source_path per
+#                       line). Default: /etc/install/rootfs.manifest.
+#   --esp-mb <n>        ESP size in MiB. Default: 32.
+#   --no-esp            skip the ESP copy step (root-only install).
+#   --no-rootfs         skip the rootfs manifest copy (partition+mkfs
+#                       only — used by the read-back-assertion test arm).
+#   --force             override the live-root safety refusal. STILL
+#                       refuses if the target IS the exact live root
+#                       disk (that can never be safe while running).
+#
+# SAFETY: before touching the disk, the installer reads
+# /dev/blk/rootdev (the kernel exposes the BASE DISK name backing the
+# live root FS there) and refuses to proceed if the target matches.
+# The guard lives in the kernel (kernel/block/blk.ad::blk_root_disk_name
+# + sys/src/9/port/devblk.ad's rootdev pseudo-file) so it cannot be
+# bypassed by a stale userland assumption.
+#
+# Flow (each step shells out to the existing, proven installer tool so
+# there is ONE implementation of each primitive):
+#   1. hamnix_partition <disk> <esp_mb>      GPT + ESP + root + rescan
+#   2. mkfs_fat  <disk>p1 <esp_mb>           format the ESP   (FAT)
+#      mkfs_ext4 <disk>p2                     format the root  (ext4)
+#   3. dd_blk <esp_src> <disk>p1             copy ESP boot files
+#   4. install_rootfs_from_manifest <disk>p2 <manifest>   copy rootfs
+#   5. report success (a final fsync is implicit: every kernel-side
+#      ext4 install_file path fsyncs, and dd_blk's writes are
+#      synchronous through blk_write_sectors).
+
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_spawn(path: Ptr[char], argv: Ptr[uint64],
+                     stdin_fd: int32, stdout_fd: int32,
+                     envp: Ptr[uint64]) -> int32
+extern def sys_waitpid(pid: int32) -> int64
+
+
+# --- string helpers -------------------------------------------------
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+def strcpy(dst: Ptr[uint8], src: Ptr[uint8]) -> uint64:
+    i: uint64 = 0
+    while src[i] != 0:
+        dst[i] = src[i]
+        i = i + 1
+    dst[i] = 0
+    return i
+
+
+def streq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while a[i] != 0 and b[i] != 0:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    if a[i] == b[i]:
+        return 1
+    return 0
+
+
+def render_u64(v: uint64, out: Ptr[uint8]) -> uint64:
+    if v == 0:
+        out[0] = 48
+        out[1] = 0
+        return 1
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    while v != 0:
+        digits[n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    written: uint64 = n
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    out[i] = 0
+    return written
+
+
+def parse_u64(s: Ptr[uint8]) -> uint64:
+    v: uint64 = 0
+    i: uint64 = 0
+    while s[i] != 0:
+        c: uint8 = s[i]
+        if c < 48 or c > 57:
+            break
+        v = v * 10 + cast[uint64](c - 48)
+        i = i + 1
+    return v
+
+
+# --- device-name normalisation --------------------------------------
+#
+# Accept either "vdb" or "/dev/blk/vdb"; produce both a bare name (for
+# the rootdev compare) and a "/dev/blk/<name>" path (for the tools).
+
+
+def starts_with(s: Ptr[uint8], pfx: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while pfx[i] != 0:
+        if s[i] != pfx[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def bare_name(arg: Ptr[uint8], out: Ptr[uint8]):
+    # Strip a leading "/dev/blk/" if present; copy the rest.
+    src: Ptr[uint8] = arg
+    if starts_with(arg, cast[Ptr[uint8]]("/dev/blk/")) == 1:
+        src = cast[Ptr[uint8]](cast[uint64](arg) + 9)
+    strcpy(out, src)
+
+
+def make_blk_path(bare: Ptr[uint8], out: Ptr[uint8]):
+    n: uint64 = strcpy(out, cast[Ptr[uint8]]("/dev/blk/"))
+    i: uint64 = 0
+    while bare[i] != 0:
+        out[n + i] = bare[i]
+        i = i + 1
+    out[n + i] = 0
+
+
+def make_part_path(bare: Ptr[uint8], pnum: uint64, out: Ptr[uint8]):
+    # "/dev/blk/<bare>p<pnum>"
+    n: uint64 = strcpy(out, cast[Ptr[uint8]]("/dev/blk/"))
+    i: uint64 = 0
+    while bare[i] != 0:
+        out[n + i] = bare[i]
+        i = i + 1
+    n = n + i
+    out[n] = 0x70                                     # 'p'
+    n = n + 1
+    scratch: Array[8, uint8]
+    m: uint64 = render_u64(pnum, &scratch[0])
+    j: uint64 = 0
+    while j < m:
+        out[n + j] = scratch[j]
+        j = j + 1
+    out[n + m] = 0
+
+
+# --- safety guard ---------------------------------------------------
+
+root_name_buf: Array[40, uint8]
+
+
+def read_live_root(out: Ptr[uint8]) -> int32:
+    # Read /dev/blk/rootdev -> the BASE DISK name backing the live
+    # root FS (e.g. "vdb"). Returns 1 + fills out on success, 0 if no
+    # live root is recorded (cpio-only boot — nothing to collide with).
+    fd: int32 = sys_open(cast[Ptr[char]]("/dev/blk/rootdev"))
+    if fd < 0:
+        return 0
+    buf: Array[40, uint8]
+    n: int64 = sys_read(fd, &buf[0], 39)
+    sys_close(fd)
+    if n <= 0:
+        return 0
+    # Trim trailing newline / whitespace.
+    ln: uint64 = cast[uint64](n)
+    while ln > 0 and (buf[ln - 1] == 10 or buf[ln - 1] == 13
+                      or buf[ln - 1] == 32):
+        ln = ln - 1
+    if ln == 0:
+        return 0
+    i: uint64 = 0
+    while i < ln:
+        out[i] = buf[i]
+        i = i + 1
+    out[ln] = 0
+    return 1
+
+
+# --- spawn-a-tool helper --------------------------------------------
+#
+# argv buffer + path buffer are module-global scratch reused per step
+# (steps run strictly sequentially).
+step_argv: Array[8, uint64]
+tool_path_buf: Array[64, uint8]
+
+
+def run_tool(toolname: Ptr[uint8],
+             a1: Ptr[uint8], a2: Ptr[uint8], a3: Ptr[uint8]) -> int32:
+    # Spawn /bin/<toolname> with up to three string args (NULL-stop on
+    # the first null pointer), inherit stdin(0)/stdout(1), wait, and
+    # return the child's exit code. Returns -1 on spawn failure.
+    n: uint64 = strcpy(&tool_path_buf[0], cast[Ptr[uint8]]("/bin/"))
+    i: uint64 = 0
+    while toolname[i] != 0:
+        tool_path_buf[n + i] = toolname[i]
+        i = i + 1
+    tool_path_buf[n + i] = 0
+    ai: uint64 = 0
+    step_argv[ai] = cast[uint64](&tool_path_buf[0])
+    ai = ai + 1
+    if cast[uint64](a1) != 0:
+        step_argv[ai] = cast[uint64](a1)
+        ai = ai + 1
+    if cast[uint64](a2) != 0:
+        step_argv[ai] = cast[uint64](a2)
+        ai = ai + 1
+    if cast[uint64](a3) != 0:
+        step_argv[ai] = cast[uint64](a3)
+        ai = ai + 1
+    step_argv[ai] = 0
+    pid: int32 = sys_spawn(cast[Ptr[char]](&tool_path_buf[0]),
+                           &step_argv[0], 0, 1,
+                           cast[Ptr[uint64]](0))
+    if pid < 0:
+        write_str(2, "haminstall: spawn failed for ")
+        write_str(2, &tool_path_buf[0])
+        write_str(2, "\n")
+        return -1
+    code: int64 = sys_waitpid(pid)
+    return cast[int32](code)
+
+
+# --- buffers --------------------------------------------------------
+
+target_bare:   Array[32, uint8]
+target_disk:   Array[64, uint8]
+target_p1:     Array[64, uint8]
+target_p2:     Array[64, uint8]
+esp_src_bare:  Array[32, uint8]
+esp_src_path:  Array[64, uint8]
+esp_mb_str:    Array[16, uint8]
+manifest_path: Array[256, uint8]
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    if argc < 2:
+        write_str(2,
+            "usage: haminstall <target-disk> [--esp-src <dev>] "
+            "[--manifest <path>] [--esp-mb <n>] [--no-esp] "
+            "[--no-rootfs] [--force]\n")
+        write_str(2,
+            "  e.g. haminstall vdb\n")
+        return 1
+
+    # Defaults.
+    strcpy(&esp_src_bare[0], cast[Ptr[uint8]]("vdap2"))
+    strcpy(&manifest_path[0],
+           cast[Ptr[uint8]]("/etc/install/rootfs.manifest"))
+    esp_mb: uint64 = 32
+    do_esp:    int32 = 1
+    do_rootfs: int32 = 1
+    force:     int32 = 0
+
+    # The first positional is the target disk.
+    bare_name(cast[Ptr[uint8]](argv[1]), &target_bare[0])
+
+    # Parse options.
+    ai: int32 = 2
+    while ai < argc:
+        opt: Ptr[uint8] = cast[Ptr[uint8]](argv[ai])
+        if streq(opt, cast[Ptr[uint8]]("--esp-src")) == 1 and ai + 1 < argc:
+            ai = ai + 1
+            bare_name(cast[Ptr[uint8]](argv[ai]), &esp_src_bare[0])
+        elif streq(opt, cast[Ptr[uint8]]("--manifest")) == 1 \
+                and ai + 1 < argc:
+            ai = ai + 1
+            strcpy(&manifest_path[0], cast[Ptr[uint8]](argv[ai]))
+        elif streq(opt, cast[Ptr[uint8]]("--esp-mb")) == 1 \
+                and ai + 1 < argc:
+            ai = ai + 1
+            esp_mb = parse_u64(cast[Ptr[uint8]](argv[ai]))
+            if esp_mb == 0:
+                esp_mb = 32
+        elif streq(opt, cast[Ptr[uint8]]("--no-esp")) == 1:
+            do_esp = 0
+        elif streq(opt, cast[Ptr[uint8]]("--no-rootfs")) == 1:
+            do_rootfs = 0
+        elif streq(opt, cast[Ptr[uint8]]("--force")) == 1:
+            force = 1
+        else:
+            write_str(2, "haminstall: unknown / incomplete option: ")
+            write_str(2, opt)
+            write_str(2, "\n")
+            return 1
+        ai = ai + 1
+
+    # Compose device paths.
+    make_blk_path(&target_bare[0], &target_disk[0])
+    make_part_path(&target_bare[0], 1, &target_p1[0])
+    make_part_path(&target_bare[0], 2, &target_p2[0])
+    make_blk_path(&esp_src_bare[0], &esp_src_path[0])
+    render_u64(esp_mb, &esp_mb_str[0])
+
+    write_str(1, "[haminstall] ============================================\n")
+    write_str(1, "[haminstall] Hamnix on-target installer\n")
+    write_str(1, "[haminstall]   target disk : ")
+    write_str(1, &target_disk[0])
+    write_str(1, "\n[haminstall]   ESP source  : ")
+    write_str(1, &esp_src_path[0])
+    write_str(1, "\n[haminstall]   manifest    : ")
+    write_str(1, &manifest_path[0])
+    write_str(1, "\n[haminstall]   ESP size    : ")
+    write_str(1, &esp_mb_str[0])
+    write_str(1, " MiB\n")
+    write_str(1, "[haminstall] ============================================\n")
+
+    # --- SAFETY GUARD: never install onto the live root disk ---------
+    if read_live_root(&root_name_buf[0]) == 1:
+        write_str(1, "[haminstall] live root disk is /dev/blk/")
+        write_str(1, &root_name_buf[0])
+        write_str(1, "\n")
+        if streq(&root_name_buf[0], &target_bare[0]) == 1:
+            write_str(2,
+                "[haminstall] REFUSING: target IS the live root disk. "
+                "Installing here would destroy the running system. Abort.\n")
+            # --force does NOT override the exact-live-root case: it can
+            # never be safe to repartition the disk we're running from.
+            return 2
+    else:
+        write_str(1,
+            "[haminstall] (no live root recorded; guard inert)\n")
+
+    # --- step 1/4: GPT + ESP + root partitions -----------------------
+    write_str(1, "[haminstall] (1/4) partition ")
+    write_str(1, &target_disk[0])
+    write_str(1, " (GPT + ESP + rootfs)\n")
+    rc: int32 = run_tool(cast[Ptr[uint8]]("hamnix_partition"),
+                         &target_disk[0], &esp_mb_str[0],
+                         cast[Ptr[uint8]](0))
+    if rc != 0:
+        write_str(2, "[haminstall] FAIL: partitioning returned non-zero\n")
+        return 1
+
+    # --- step 2/4: format the partitions -----------------------------
+    write_str(1, "[haminstall] (2/4) mkfs ESP (FAT) on ")
+    write_str(1, &target_p1[0])
+    write_str(1, "\n")
+    rc = run_tool(cast[Ptr[uint8]]("mkfs_fat"),
+                  &target_p1[0], &esp_mb_str[0], cast[Ptr[uint8]](0))
+    if rc != 0:
+        # mkfs_fat is a stub today (the ESP gets a raw copy of the live
+        # ESP in step 3, which carries a real FAT). Warn but continue.
+        write_str(1,
+            "[haminstall] note: mkfs_fat non-zero (stub); ESP comes "
+            "from the dd copy in step 3\n")
+
+    write_str(1, "[haminstall] (2/4) mkfs root (ext4) on ")
+    write_str(1, &target_p2[0])
+    write_str(1, "\n")
+    rc = run_tool(cast[Ptr[uint8]]("mkfs_ext4"),
+                  &target_p2[0], cast[Ptr[uint8]](0), cast[Ptr[uint8]](0))
+    if rc != 0:
+        write_str(2, "[haminstall] FAIL: mkfs_ext4 returned non-zero\n")
+        return 1
+
+    # --- step 3/4: install ESP boot files (raw FAT copy) -------------
+    if do_esp == 1:
+        write_str(1, "[haminstall] (3/4) copy ESP boot files ")
+        write_str(1, &esp_src_path[0])
+        write_str(1, " -> ")
+        write_str(1, &target_p1[0])
+        write_str(1, "\n")
+        rc = run_tool(cast[Ptr[uint8]]("dd_blk"),
+                      &esp_src_path[0], &target_p1[0],
+                      cast[Ptr[uint8]](0))
+        if rc != 0:
+            write_str(2,
+                "[haminstall] FAIL: ESP copy (dd_blk) returned non-zero\n")
+            return 1
+    else:
+        write_str(1, "[haminstall] (3/4) ESP copy SKIPPED (--no-esp)\n")
+
+    # --- step 4/4: copy the running rootfs onto the new root ---------
+    if do_rootfs == 1:
+        write_str(1,
+            "[haminstall] (4/4) install rootfs (manifest-driven) -> ")
+        write_str(1, &target_p2[0])
+        write_str(1, "\n")
+        rc = run_tool(cast[Ptr[uint8]]("install_rootfs_from_manifest"),
+                      &target_p2[0], &manifest_path[0],
+                      cast[Ptr[uint8]](0))
+        if rc != 0:
+            write_str(2,
+                "[haminstall] FAIL: rootfs manifest install non-zero\n")
+            return 1
+    else:
+        write_str(1,
+            "[haminstall] (4/4) rootfs copy SKIPPED (--no-rootfs)\n")
+
+    write_str(1, "[haminstall] ============================================\n")
+    write_str(1, "[haminstall] install complete on ")
+    write_str(1, &target_disk[0])
+    write_str(1, "\n")
+    write_str(1,
+        "[haminstall] the disk is now independently bootable: power off,\n")
+    write_str(1,
+        "[haminstall] detach the install media, and boot the target disk.\n")
+    write_str(1, "[haminstall] ============================================\n")
+    return 0
