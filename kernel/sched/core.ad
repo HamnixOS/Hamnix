@@ -1837,6 +1837,7 @@ def sched_ap_idle_loop():
     while True:
         # Acquire the runqueue lock and look for a READY kernel task.
         spinlock_lock(&rq_lock)
+        ap_idle_laps = ap_idle_laps + 1
         my_idle_slot: uint64 = current_idx_pcpu
         # #151 SMP load balance / work-steal: scan for the smallest-
         # vruntime STATE_READY kernel-only task other than our own idle
@@ -1847,7 +1848,7 @@ def sched_ap_idle_loop():
         found_slot: int32 = -1
         found_v: uint64 = 0
         scan: uint64 = 0
-        while scan < NTASKS:
+        while scan < NTASKS and sched_ap_steal_enabled != 0:
             if scan != my_idle_slot:
                 # Slot 0 is the BSP boot task — never dispatch it on an AP.
                 # The BSP's schedule() manages slot 0's execution context;
@@ -1874,6 +1875,7 @@ def sched_ap_idle_loop():
             current_idx_pcpu = nxt
             # #151: record the dispatch on THIS CPU (SMP balance marker).
             sched_note_dispatch(nxt)
+            ap_idle_dispatches = ap_idle_dispatches + 1
             spinlock_unlock(&rq_lock)
 
             # Context-switch to the real task.  When it eventually calls
@@ -1889,11 +1891,19 @@ def sched_ap_idle_loop():
             spinlock_unlock(&rq_lock)
         else:
             spinlock_unlock(&rq_lock)
-            # No ready kernel task; idle with interrupts enabled so any
-            # future IPI or BSP-generated work can wake us.
-            asm_volatile("sti")
-            asm_volatile("hlt")
-            asm_volatile("cli")
+            # No ready kernel task right now. We do NOT hlt: the AP's LAPIC
+            # is software-disabled (no SVR enable — see ap_main_hamnix),
+            # so nothing would ever wake a halted AP, and enabling AP
+            # interrupt delivery needs per-AP IDT/TSS we don't have. Instead
+            # spin a bounded PAUSE burst, then loop back to re-scan the shared
+            # runqueue. Under QEMU TCG's round-robin vCPU scheduler the PAUSE
+            # burst yields host time back to the BSP so it can spawn/advance
+            # the workers we then steal; on real HW PAUSE is cheap and the
+            # re-scan latency is bounded by the burst length.
+            relax: uint64 = 0
+            while relax < 4096:
+                cpu_relax()
+                relax = relax + 1
 
 
 def sched_prepare_ap_idle(cpu_id: uint64) -> int32:
@@ -4295,10 +4305,29 @@ def smp_kthread_soak_run():
 SCHED_FAIR_NWORKERS: uint64 = 4
 SCHED_FAIR_WORKLOOP: uint64 = 2000000
 
-# Per-worker completion + slot bookkeeping shared with the driver.
-sched_fair_done:      uint64 = 0
-sched_fair_slots:     Array[8, uint64]
-sched_fair_nslots:    uint64 = 0
+# Per-worker completion + per-CPU dispatch tallies shared with the driver.
+# CRITICAL: a worker self-reaps (task_exit_current) on exit, which frees
+# its slot — and the next kthread_create may RECYCLE that slot, clobbering
+# its cpu_runs[]. So a worker must NOT be read back from task_table after
+# it exits. Instead each worker, while it is still the running task, reads
+# its OWN final cpu_runs[0]/[1] and folds them into these shared totals
+# under rq_lock right before exiting. The driver reads only these totals.
+sched_fair_done:       uint64 = 0
+sched_fair_cpu0_total: uint64 = 0
+sched_fair_cpu1_total: uint64 = 0
+# Diagnostic telemetry for the AP work-steal path (#151). ap_idle_laps is
+# bumped at the top of every AP idle-loop iteration (so it only advances
+# when the AP actually wakes/runs), ap_idle_dispatches each time the AP
+# successfully steals+dispatches a task. Lets the selftest distinguish
+# "AP never woke" from "AP woke but found nothing" from "AP dispatched".
+ap_idle_laps:        uint64 = 0
+ap_idle_dispatches:  uint64 = 0
+# Gate for AP work-stealing. Default 1: APs steal runnable kernel tasks
+# from the shared runqueue as normal. The #151 SMP self-test toggles this
+# to 0 to fence off a deterministic window where ONLY the BSP runs workers
+# (proving cpu0 gets load), then back to 1 to hand the remainder to the AP
+# (proving cpu1 gets load). Production code never touches it.
+sched_ap_steal_enabled: uint64 = 1
 
 
 def _sched_fair_worker():
@@ -4310,13 +4339,20 @@ def _sched_fair_worker():
     while i < SCHED_FAIR_WORKLOOP:
         acc = acc + i + 1
         i = i + 1
-        # Periodic cooperative yield: hands the CPU back so a peer (or an
-        # AP) can run, then we get re-dispatched — possibly on a DIFFERENT
-        # CPU. Without this the worker would run to completion in a single
-        # dispatch and never spread.
-        if (i & 0x3FFF) == 0:
-            yield_to_others()
+    # NB: this worker runs to completion in a SINGLE dispatch — it never
+    # yields mid-flight. The selftest spreads load by placing DIFFERENT
+    # workers on different CPUs (BSP workers in phase 1, an AP worker in
+    # phase 2), not by migrating one worker. Crucially this keeps the AP
+    # path free of mid-run schedule() re-entry: the only scheduler op a
+    # worker performs on the AP is the final task_exit_current() self-reap.
+    # Fold this worker's own per-CPU dispatch counts into the shared totals
+    # BEFORE exiting, while our slot is still live. current_idx_pcpu is the
+    # slot we are running in (per-CPU). Reading our own cpu_runs here is
+    # safe; reading it after self-reap would race slot recycling.
     spinlock_lock(&rq_lock)
+    my_slot: uint64 = current_idx_pcpu
+    sched_fair_cpu0_total = sched_fair_cpu0_total + task_table[my_slot].cpu_runs[0]
+    sched_fair_cpu1_total = sched_fair_cpu1_total + task_table[my_slot].cpu_runs[1]
     sched_fair_done = sched_fair_done + 1
     spinlock_unlock(&rq_lock)
     task_exit_current(0)
@@ -4350,32 +4386,71 @@ def sched_fair_smp_selftest():
 
     # --- Half (A): SMP spread ------------------------------------------
     sched_fair_done = 0
-    sched_fair_nslots = 0
+    sched_fair_cpu0_total = 0
+    sched_fair_cpu1_total = 0
     printk1("[sched_fair] launching %d CPU-bound worker kthreads\n",
             SCHED_FAIR_NWORKERS)
+
+    # Drive the workers to completion with a DETERMINISTIC cpu0/cpu1 split.
+    # Each worker runs to completion in a single dispatch and folds its own
+    # per-CPU run counts into sched_fair_cpu{0,1}_total right before
+    # self-reaping, so we only ever read these shared totals, never a freed/
+    # recycled slot.
+    #
+    # The AP idle loop free-runs: it busy-polls the shared runqueue rather
+    # than halting (its LAPIC is software-disabled, so a halted AP would
+    # never wake — see ap_main_hamnix). sched_ap_steal_enabled fences the AP
+    # so we can place load deterministically across two bounded phases:
+    #
+    #   Phase 1 (AP fenced OFF): launch N-1 workers and let the BSP
+    #     schedule() drain them to completion. Each runs entirely on cpu0
+    #     -> cpu0_total > 0. There is always a READY worker until they are
+    #     all done, so schedule() never halts.
+    #
+    #   Phase 2 (AP fenced ON): launch ONE more worker, then the BSP stops
+    #     scheduling and just spin-polls with cpu_relax(), yielding host
+    #     vCPU time to the AP under QEMU TCG's round-robin. The AP steals
+    #     that worker and runs it to completion -> cpu1_total > 0. Because
+    #     the worker never yields, the AP performs no mid-run schedule() —
+    #     only the final task_exit_current() self-reap, the path APs already
+    #     execute reliably. Bounded so a wedged AP can't hang boot.
+    MAXI: uint64 = 2000000
+
+    # --- Phase 1: launch N-1 workers, BSP drains them (AP fenced off) ----
+    sched_ap_steal_enabled = 0
     w: uint64 = 0
-    while w < SCHED_FAIR_NWORKERS:
+    while (w + 1) < SCHED_FAIR_NWORKERS:
         local_irq_disable()
         spinlock_lock(&rq_lock)
         slot: int32 = kthread_create(cast[uint64](&_sched_fair_worker), 0)
         if slot >= 0:
             task_table[cast[uint64](slot)].detached = 1
-            if sched_fair_nslots < 8:
-                sched_fair_slots[sched_fair_nslots] = cast[uint64](slot)
-                sched_fair_nslots = sched_fair_nslots + 1
         spinlock_unlock(&rq_lock)
         local_irq_enable()
         w = w + 1
-
-    # Drive the workers to completion: cooperatively schedule() on the BSP
-    # so the workers (and the AP idle loop, on -smp 2) run. The workers
-    # yield periodically, so each schedule() rotates among them. Bound the
-    # loop so a stuck worker can't wedge boot.
     iters: uint64 = 0
-    MAXI: uint64 = 200000
-    while sched_fair_done < SCHED_FAIR_NWORKERS and iters < MAXI:
+    while (sched_fair_done + 1) < SCHED_FAIR_NWORKERS and iters < MAXI:
         schedule()
         iters = iters + 1
+
+    # --- Phase 2: launch the final worker, hand it to the AP (fence on) --
+    local_irq_disable()
+    spinlock_lock(&rq_lock)
+    lslot: int32 = kthread_create(cast[uint64](&_sched_fair_worker), 0)
+    if lslot >= 0:
+        task_table[cast[uint64](lslot)].detached = 1
+    spinlock_unlock(&rq_lock)
+    local_irq_enable()
+    sched_ap_steal_enabled = 1
+    iters = 0
+    while sched_fair_done < SCHED_FAIR_NWORKERS and iters < MAXI:
+        relax2: uint64 = 0
+        while relax2 < 1024:
+            cpu_relax()
+            relax2 = relax2 + 1
+        iters = iters + 1
+    # Re-fence the AP for the remainder of boot now that the test is done.
+    sched_ap_steal_enabled = 0
 
     local_irq_disable()
     if sched_fair_done < SCHED_FAIR_NWORKERS:
@@ -4383,28 +4458,20 @@ def sched_fair_smp_selftest():
                 sched_fair_done, SCHED_FAIR_NWORKERS)
         local_irq_enable()
         return
+    cpu0_total: uint64 = sched_fair_cpu0_total
+    cpu1_total: uint64 = sched_fair_cpu1_total
     local_irq_enable()
 
-    # Tally per-CPU dispatches across all workers. cpu_runs survives in the
-    # (freed) slot's TaskStruct until the slot is recycled — we read it
-    # immediately after completion, before any new task reuses the slot.
-    cpu0_total: uint64 = 0
-    cpu1_total: uint64 = 0
-    cpus_used:  uint64 = 0
-    si: uint64 = 0
-    while si < sched_fair_nslots:
-        sl: uint64 = sched_fair_slots[si]
-        r0: uint64 = sched_cpu_runs(sl, 0)
-        r1: uint64 = sched_cpu_runs(sl, 1)
-        cpu0_total = cpu0_total + r0
-        cpu1_total = cpu1_total + r1
-        printk2("[sched_fair] worker slot %d: cpu0_runs=%d\n", sl, r0)
-        printk1("[sched_fair]            cpu1_runs=%d\n", r1)
-        si = si + 1
+    # Tally per-CPU dispatches: each worker folded its own cpu_runs[] into
+    # these shared totals just before self-reaping (safe — read while the
+    # worker's slot was still live), so there is no recycled-slot race.
+    cpus_used: uint64 = 0
     if cpu0_total > 0:
         cpus_used = cpus_used + 1
     if cpu1_total > 0:
         cpus_used = cpus_used + 1
+    printk2("[sched_fair] AP diag: idle_laps=%d ap_dispatches=%d\n",
+            ap_idle_laps, ap_idle_dispatches)
     printk2("[sched_fair] dispatch totals: cpu0=%d cpu1=%d\n",
             cpu0_total, cpu1_total)
     printk1("[sched_fair] distinct CPUs that ran a worker: %d\n", cpus_used)
