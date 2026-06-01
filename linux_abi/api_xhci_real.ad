@@ -430,6 +430,9 @@ def _xr_stage4_run_and_enum(hcd: uint64, xhci: uint64, bar0: uint64) -> int32:
     if op == 0:
         printk0("[xhci-real] FAIL stage4: .ko op_regs base is 0\n")
         return -1
+    # Stash op base so the MSC event-scan loop can poke USBSTS to drive
+    # QEMU's async USB backend forward while waiting on bulk completions.
+    _xr_op_base = op
 
     dcbaap:  uint64 = _xr_r64(op + _XR_OP_DCBAAP)
     crcr:    uint64 = _xr_r64(op + _XR_OP_CRCR)
@@ -639,6 +642,8 @@ def _xr_stage5_enumerate(hcd: uint64, xhci: uint64, bar0: uint64,
 #       our wLength=0x12 control transfer cannot be a BIOS transaction).
 
 _XR_TRB_TYPE_ADDRESS_DEVICE: uint32 = 11
+_XR_TRB_TYPE_CONFIGURE_ENDPOINT: uint32 = 12
+_XR_TRB_TYPE_NORMAL:         uint32 = 1
 _XR_TRB_TYPE_SETUP:          uint32 = 2
 _XR_TRB_TYPE_DATA:           uint32 = 3
 _XR_TRB_TYPE_STATUS:         uint32 = 4
@@ -766,6 +771,14 @@ def _xr_stage6_address_device(xhci: uint64, op: uint64, bar0: uint64,
     printk2("[xhci-real] PASS stage6a: Address-Device SUCCESS slot=%d usb-addr=%d (controller wrote Output Slot Ctx)\n",
             cast[uint64](slot), cast[uint64](usbaddr))
 
+    # Save state the MSC path (stage9 Configure-Endpoint) reuses: the
+    # output device context (for its current slot context), and the next
+    # command-ring cursor + cycle past the Address-Device TRB we consumed.
+    _xr_in_ctx = in_ctx
+    _xr_out_ctx = out_ctx
+    _xr_cmd_next = cmd_next + 0x10
+    _xr_cmd_cyc = cmd_cyc
+
     # The Address-Device completion consumed event slot `ev_cursor`; the
     # transfer-event for the GET_DESCRIPTOR control transfer will land at
     # the next event-ring TRB. Advance the cursor; cycle unchanged until
@@ -846,8 +859,517 @@ def _xr_stage7_get_descriptor(xhci: uint64, op: uint64, bar0: uint64,
         printk1("[xhci-real] stage7 idProduct=%p\n", cast[uint64](pid))
         printk0("[xhci-real] PASS stage7: GET_DESCRIPTOR(device) returned a valid 18-byte device descriptor via EP0 control transfer\n")
         printk0("[xhci-real] FURTHEST: FULL real-.ko-driven enumeration step — Enable-Slot, Address-Device, and GET_DESCRIPTOR all round-tripped through the Linux xhci_hcd.ko rings (native disabled)\n")
-        return 0
+        # Continue into the MSC (BOT) path. We consumed EP0 ring TRBs at
+        # +0x00..+0x20 (next free is +0x30, same cycle) and the transfer
+        # event at ev_cursor (next event at +0x10, same producer cycle).
+        # Seed the running cursors and proceed to GET_DESCRIPTOR(config).
+        _xr_ep0_ring = ep0_ring
+        _xr_ep0_off = 0x30
+        _xr_ep0_cyc = cyc
+        _xr_ev_cursor = ev_cursor + 0x10
+        _xr_ev_cyc = ev_cyc_before
+        return _xr_stage8_get_config(xhci, op, bar0, db_base, ir0, slot)
     printk0("[xhci-real] FURTHEST: Address-Device SUCCESS proven (stage6a); GET_DESCRIPTOR transfer did not yield a valid descriptor at desc buffer\n")
+    return 0
+
+
+# =====================================================================
+# MSC (USB Mass Storage, Bulk-Only Transport) path — stages 8/9/10.
+#
+# Everything below stays behind ENABLE_XHCI_KO_REAL_MMIO and runs ONLY
+# after the full enumeration above succeeded. The proof discipline is the
+# same as enumeration: every milestone is asserted from a kernel-side
+# [xhci-real] marker AND a QEMU trace payload SeaBIOS cannot produce —
+# specifically our bulk TRBs are fetched from OUR kzalloc'd rings (low
+# 0x05xxxxxx phys) pointing at OUR low-mem DMA buffers, whereas SeaBIOS
+# drives its bulk transfers from high BIOS memory (0x000e8xxx rings ->
+# 0x0efexxxx data). And our CBWs carry a unique dCBWTag SeaBIOS never
+# emits, plus a READ(10) of an LBA range SeaBIOS doesn't touch.
+# =====================================================================
+
+# Running EP0 control-ring + event-ring cursors threaded across the
+# post-enumeration control transfers (GET_DESCRIPTOR config,
+# SET_CONFIGURATION). We track these ourselves because the controller's
+# CRCR/ERDP registers report ring bases, not the live dequeue.
+_xr_ep0_ring:   uint64 = 0
+_xr_ep0_off:    uint64 = 0
+_xr_ep0_cyc:    uint32 = 1
+_xr_ev_cursor:  uint64 = 0
+_xr_ev_cyc:     uint32 = 0
+
+# Running command-ring cursor (advanced past the Address-Device TRB).
+_xr_cmd_next:   uint64 = 0
+_xr_cmd_cyc:    uint32 = 1
+
+# Bulk endpoint addresses parsed from the configuration descriptor.
+_xr_bulk_in_ep:  uint32 = 0          # e.g. 0x81
+_xr_bulk_out_ep: uint32 = 0          # e.g. 0x02
+_xr_bulk_in_mps: uint32 = 512
+_xr_bulk_out_mps: uint32 = 512
+
+# The input context we built in stage6 (reused for Configure-Endpoint).
+_xr_in_ctx:     uint64 = 0
+_xr_out_ctx:    uint64 = 0
+
+# Bulk transfer rings (kzalloc'd at stage9 time).
+_xr_bulk_in_ring:  uint64 = 0
+_xr_bulk_out_ring: uint64 = 0
+_xr_bulk_in_cyc:   uint32 = 1
+_xr_bulk_out_cyc:  uint32 = 1
+
+# The event-ring producer cycle for newly-posted events. After the
+# enumeration above the ring has NOT wrapped its segment, so every event
+# the controller queues for our commands/transfers carries cycle bit 1.
+# (If the event ring ever wrapped we would have to flip this; we never
+# generate enough events to wrap a 256-entry segment.)
+_XR_EV_NEW_CYCLE:  uint32 = 1
+
+# Live op-register base, stashed in stage4 so the event-scan loop can
+# poke an MMIO register while waiting. QEMU advances ASYNC USB transfers
+# (large bulk-IN reads + the trailing CSW) on main-loop turns driven by
+# guest MMIO accesses; a pure RAM poll never exits the VM, so an async
+# bulk completion would otherwise hang until the watchdog. Reading USBSTS
+# periodically forces VM exits that let QEMU's usb backend make progress.
+_xr_op_base:       uint64 = 0
+
+
+# Scan the event ring forward from _xr_ev_cursor for a NEW event (cycle
+# == _XR_EV_NEW_CYCLE) of type `want_type` (32==transfer, 33==command-
+# completion) that references the TRB at `want_trb` (its dword0/1 ptr).
+# Intervening NEW events of other kinds (e.g. a spurious command-ring
+# TRB_ERROR the controller may post after over-running our cmd ring) are
+# skipped, so a single unexpected event cannot desync our cursor. Returns
+# the completion code (ev.status >> 24) on a match, or -1 if no matching
+# NEW event materialises. On match, _xr_ev_cursor is advanced past it.
+def _xr_scan_event(want_type: uint32, want_trb: uint64) -> int32:
+    cur: uint64 = _xr_ev_cursor
+    scanned: uint64 = 0
+    spin: uint64 = 0
+    # Up to 16 event slots ahead — generous for one expected event plus a
+    # couple of unsolicited ones, with no risk of running off the segment.
+    while scanned < 16:
+        ev: Ptr[uint32] = cast[Ptr[uint32]](cur)
+        ctl: uint32 = ev[3]
+        cyc: uint32 = ctl & 0x1
+        # Wait for THIS slot to be written by the controller (cycle flips
+        # to the new producer cycle). Poke USBSTS every iteration so QEMU's
+        # main loop advances any pending ASYNC bulk transfer. If it never
+        # flips, the event we want is not coming.
+        spin = 0
+        while cyc != _XR_EV_NEW_CYCLE and spin < 2000000:
+            if _xr_op_base != 0:
+                _xr_r32(_xr_op_base + _XR_OP_USBSTS)
+            ctl = ev[3]
+            cyc = ctl & 0x1
+            spin = spin + 1
+        if cyc != _XR_EV_NEW_CYCLE:
+            return -1                         # no (more) new events
+        t: uint32 = (ctl >> _XR_TRB_TYPE_SHIFT) & 0x3F
+        ref: uint64 = (cast[uint64](ev[1]) << 32) | cast[uint64](ev[0])
+        if t == want_type and ref == want_trb:
+            _xr_ev_cursor = cur + 0x10
+            return cast[int32]((ev[2] >> 24) & 0xFF)
+        # Not our event (spurious / out-of-order); consume and continue.
+        cur = cur + 0x10
+        scanned = scanned + 1
+    return -1
+
+
+# Run one EP0 control transfer (Setup/Data-IN/Status-OUT or
+# Setup/Status for a no-data request) using the running _xr_ep0_*
+# cursors. setup_lo/setup_hi are the 8 immediate setup bytes split into
+# two dwords. data_buf/data_len describe the optional IN data stage
+# (data_len==0 => no data stage, status dir flips to IN). Returns the
+# event completion code, or -1 on no/foreign event. Advances cursors.
+def _xr_ep0_control(slot: uint32, db_base: uint64,
+                    setup_lo: uint32, setup_hi: uint32,
+                    data_buf: uint64, data_len: uint32, trt: uint32) -> int32:
+    ring: uint64 = _xr_ep0_ring
+    off:  uint64 = _xr_ep0_off
+    cyc:  uint32 = _xr_ep0_cyc
+
+    setup_off: uint64 = off
+    s: Ptr[uint32] = cast[Ptr[uint32]](ring + setup_off)
+    s[0] = setup_lo
+    s[1] = setup_hi
+    s[2] = 8
+    s[3] = (_XR_TRB_TYPE_SETUP << _XR_TRB_TYPE_SHIFT) | _XR_TRB_IDT | cyc | (trt << 16)
+    off = off + 0x10
+
+    if data_len != 0:
+        d: Ptr[uint32] = cast[Ptr[uint32]](ring + off)
+        cast[Ptr[uint64]](ring + off)[0] = data_buf
+        d[2] = data_len
+        d[3] = (_XR_TRB_TYPE_DATA << _XR_TRB_TYPE_SHIFT) | (1 << 16) | cyc   # DIR=IN
+        off = off + 0x10
+
+    st: Ptr[uint32] = cast[Ptr[uint32]](ring + off)
+    st[0] = 0
+    st[1] = 0
+    st[2] = 0
+    # Status dir is opposite the data stage; no-data control => Status IN.
+    status_dir: uint32 = 0
+    if data_len == 0:
+        status_dir = 1 << 16
+    st[3] = (_XR_TRB_TYPE_STATUS << _XR_TRB_TYPE_SHIFT) | _XR_TRB_IOC | cyc | status_dir
+    status_trb: uint64 = ring + off
+    off = off + 0x10
+
+    # Persist the EP0 ring cursor before we wait (the scan may consume
+    # intervening events but never touches the EP0 ring position).
+    _xr_ep0_off = off
+
+    _xr_w32(db_base + cast[uint64](slot) * 4, 1)     # EP0 doorbell (target 1)
+
+    # Wait for the transfer event referencing OUR Status TRB (the last TRB
+    # of this control transfer, which carries IOC). _xr_scan_event skips
+    # any unsolicited events so a stray completion cannot desync us.
+    return _xr_scan_event(32, status_trb)
+
+
+def _xr_stage8_get_config(xhci: uint64, op: uint64, bar0: uint64,
+                           db_base: uint64, ir0: uint64, slot: uint32) -> int32:
+    # GET_DESCRIPTOR(CONFIGURATION, index 0). Request the full config
+    # (wLength large enough: 64 bytes covers config+interface+endpoints
+    # for a single-interface MSC device). Parse the returned descriptor
+    # chain for the bulk IN/OUT endpoints (interface class 0x08 / proto
+    # 0x50 == BOT).
+    cfg_raw: uint64 = kzalloc(320)
+    if cfg_raw == 0:
+        printk0("[xhci-real] FAIL stage8: kzalloc(config buf) failed\n")
+        return 0
+    cfg: uint64 = _xr_align64(cfg_raw)
+    # Setup: bmRequestType=0x80 bRequest=0x06 wValue=0x0200 (CONFIG, idx0)
+    #        wIndex=0 wLength=0x0040.  bytes: 80 06 00 02 00 00 40 00
+    rc: int32 = _xr_ep0_control(slot, db_base, 0x02000680, 0x00400000,
+                                cfg, 64, 3)
+    cb: Ptr[uint8] = cast[Ptr[uint8]](cfg)
+    total: uint32 = cast[uint32](cb[2]) | (cast[uint32](cb[3]) << 8)
+    printk2("[xhci-real] stage8 config descriptor: bLength=%p wTotalLength=%d\n",
+            cast[uint64](cb[0]), cast[uint64](total))
+    if cb[0] != 0x09 or cb[1] != 0x02:
+        printk0("[xhci-real] FURTHEST: enumeration proven (stage7); GET_DESCRIPTOR(config) did not return a config descriptor\n")
+        return 0
+
+    # Walk the descriptor chain to find bulk IN/OUT endpoints. Each
+    # descriptor: byte0=bLength, byte1=bDescriptorType. Endpoint desc
+    # (type 0x05): byte2=bEndpointAddress, byte3=bmAttributes (0x02==bulk),
+    # bytes4-5=wMaxPacketSize.
+    if total > 256:
+        total = 256
+    pos: uint32 = 0
+    found_in: uint32 = 0
+    found_out: uint32 = 0
+    while pos + 2 <= total:
+        dlen: uint32 = cast[uint32](cb[pos])
+        dtype: uint32 = cast[uint32](cb[pos + 1])
+        if dlen == 0:
+            pos = total
+        else:
+            if dtype == 0x05 and pos + 6 <= total:
+                epaddr: uint32 = cast[uint32](cb[pos + 2])
+                attrs: uint32 = cast[uint32](cb[pos + 3])
+                mps: uint32 = cast[uint32](cb[pos + 4]) | (cast[uint32](cb[pos + 5]) << 8)
+                if (attrs & 0x03) == 0x02:            # bulk
+                    if (epaddr & 0x80) != 0:
+                        _xr_bulk_in_ep = epaddr
+                        _xr_bulk_in_mps = mps
+                        found_in = 1
+                    else:
+                        _xr_bulk_out_ep = epaddr
+                        _xr_bulk_out_mps = mps
+                        found_out = 1
+            pos = pos + dlen
+    printk2("[xhci-real] stage8 bulk endpoints: IN=%p OUT=%p\n",
+            cast[uint64](_xr_bulk_in_ep), cast[uint64](_xr_bulk_out_ep))
+    if found_in == 0 or found_out == 0:
+        printk0("[xhci-real] FURTHEST: config descriptor parsed but bulk IN/OUT endpoints not both found\n")
+        return 0
+    printk0("[xhci-real] PASS stage8: GET_DESCRIPTOR(config) parsed; bulk IN/OUT endpoints identified (MSC BOT device)\n")
+    return _xr_stage9_configure(xhci, op, bar0, db_base, ir0, slot)
+
+
+def _xr_stage9_configure(xhci: uint64, op: uint64, bar0: uint64,
+                          db_base: uint64, ir0: uint64, slot: uint32) -> int32:
+    # SET_CONFIGURATION(1) over EP0 (no data stage), then a
+    # Configure-Endpoint command that adds the bulk IN/OUT endpoint
+    # contexts so the controller will service the bulk transfer rings.
+    # bytes: 00 09 01 00 00 00 00 00  => dword0=0x00010900 dword1=0
+    rc: int32 = _xr_ep0_control(slot, db_base, 0x00010900, 0x00000000,
+                                0, 0, 0)
+    printk1("[xhci-real] stage9 SET_CONFIGURATION(1) completion-code=%d\n",
+            cast[uint64](cast[uint32](rc)))
+    if rc != 1:
+        printk0("[xhci-real] FURTHEST: stage8 proven; SET_CONFIGURATION did not complete with SUCCESS\n")
+        return 0
+    printk0("[xhci-real] PASS stage9a: SET_CONFIGURATION(1) accepted over EP0 (device configured)\n")
+
+    # Build a fresh Input Context for Configure-Endpoint: add the bulk
+    # IN/OUT endpoint contexts. DCI (Device Context Index) for an
+    # endpoint = 2*epnum + (dir_in ? 1 : 0). We re-use the slot context
+    # already in the device (just bump ctx_entries) and add the two new
+    # EP contexts at their DCI slots.
+    cap: uint64 = bar0
+    hccp: uint32 = _xr_r32(cap + 0x10)
+    csz: uint32 = (hccp >> 2) & 0x1
+    ctx_sz: uint64 = 32
+    if csz != 0:
+        ctx_sz = 64
+
+    in_raw: uint64 = kzalloc(4160)
+    if in_raw == 0:
+        printk0("[xhci-real] FAIL stage9: kzalloc(input ctx) failed\n")
+        return 0
+    in_ctx: uint64 = _xr_align64(in_raw)
+
+    in_ep_num: uint32 = _xr_bulk_in_ep & 0x0F
+    out_ep_num: uint32 = _xr_bulk_out_ep & 0x0F
+    dci_in: uint32 = 2 * in_ep_num + 1
+    dci_out: uint32 = 2 * out_ep_num
+
+    max_dci: uint32 = dci_in
+    if dci_out > max_dci:
+        max_dci = dci_out
+
+    # Input Control Context: A0 (slot) + the two bulk EP add bits.
+    add_flags: uint32 = 0x1 | (1 << dci_in) | (1 << dci_out)
+    cast[Ptr[uint32]](in_ctx + 0x04)[0] = add_flags
+
+    # Slot Context: bump ctx_entries to cover the highest DCI. Preserve
+    # the route/speed from the device's current output slot context.
+    sc: uint64 = in_ctx + ctx_sz
+    out_sc: uint64 = _xr_out_ctx + ctx_sz
+    sc_d0: uint32 = cast[Ptr[uint32]](out_sc + 0x00)[0]
+    sc_d0 = (sc_d0 & ~cast[uint32](0xF8000000)) | (max_dci << 27)
+    cast[Ptr[uint32]](sc + 0x00)[0] = sc_d0
+    cast[Ptr[uint32]](sc + 0x04)[0] = cast[Ptr[uint32]](out_sc + 0x04)[0]
+
+    # Allocate the bulk transfer rings (identity-mapped low memory).
+    out_ring_raw: uint64 = kzalloc(4160)
+    in_ring_raw:  uint64 = kzalloc(4160)
+    if out_ring_raw == 0 or in_ring_raw == 0:
+        printk0("[xhci-real] FAIL stage9: kzalloc(bulk rings) failed\n")
+        return 0
+    _xr_bulk_out_ring = _xr_align64(out_ring_raw)
+    _xr_bulk_in_ring = _xr_align64(in_ring_raw)
+    _xr_bulk_in_cyc = 1
+    _xr_bulk_out_cyc = 1
+
+    # Bulk OUT endpoint context at DCI dci_out.
+    epo: uint64 = in_ctx + cast[uint64](dci_out + 1) * ctx_sz
+    # dword1: EP type Bulk-OUT(2)<<3 | CErr(3)<<1 | MPS<<16
+    cast[Ptr[uint32]](epo + 0x04)[0] = (2 << 3) | (3 << 1) | (_xr_bulk_out_mps << 16)
+    cast[Ptr[uint64]](epo + 0x08)[0] = _xr_bulk_out_ring | 0x1     # deq | DCS
+    cast[Ptr[uint32]](epo + 0x10)[0] = _xr_bulk_out_mps           # avg TRB len
+
+    # Bulk IN endpoint context at DCI dci_in.
+    epi: uint64 = in_ctx + cast[uint64](dci_in + 1) * ctx_sz
+    # dword1: EP type Bulk-IN(6)<<3 | CErr(3)<<1 | MPS<<16
+    cast[Ptr[uint32]](epi + 0x04)[0] = (6 << 3) | (3 << 1) | (_xr_bulk_in_mps << 16)
+    cast[Ptr[uint64]](epi + 0x08)[0] = _xr_bulk_in_ring | 0x1
+    cast[Ptr[uint32]](epi + 0x10)[0] = _xr_bulk_in_mps
+
+    printk2("[xhci-real] stage9 Configure-Endpoint in_ctx=%p add_flags=%p\n",
+            in_ctx, cast[uint64](add_flags))
+    printk2("[xhci-real] stage9 dci_in=%d dci_out=%d\n",
+            cast[uint64](dci_in), cast[uint64](dci_out))
+    printk2("[xhci-real] stage9 bulk rings: in=%p out=%p\n",
+            _xr_bulk_in_ring, _xr_bulk_out_ring)
+
+    # Post Configure-Endpoint on our tracked cmd-ring cursor. Zero the
+    # FOLLOWING TRB slot first (cycle bit 0 != RCS 1) so the controller
+    # halts cleanly on it instead of over-running into stale ring memory
+    # and executing it as a garbage command (observed posting a spurious
+    # TRB_ERROR completion that would otherwise desync the event cursor).
+    cmd_at: uint64 = _xr_cmd_next
+    nxt_slot: Ptr[uint32] = cast[Ptr[uint32]](cmd_at + 0x10)
+    nxt_slot[0] = 0
+    nxt_slot[1] = 0
+    nxt_slot[2] = 0
+    nxt_slot[3] = 0
+    ct: Ptr[uint32] = cast[Ptr[uint32]](cmd_at)
+    cast[Ptr[uint64]](cmd_at)[0] = in_ctx
+    ct[2] = 0
+    ct[3] = (_XR_TRB_TYPE_CONFIGURE_ENDPOINT << _XR_TRB_TYPE_SHIFT) | (slot << 24) | _xr_cmd_cyc
+    printk2("[xhci-real] stage9 Configure-Endpoint posted at %p (in_ctx=%p)\n",
+            cmd_at, in_ctx)
+    _xr_w32(db_base + 0x00, 0)
+
+    # Scan the event ring for the command-completion referencing OUR
+    # Configure-Endpoint TRB (skips any spurious intervening events).
+    cc: int32 = _xr_scan_event(_XR_TRB_TYPE_CMD_COMPLETION, cmd_at)
+    _xr_cmd_next = cmd_at + 0x10
+    if cc != 1:
+        printk1("[xhci-real] stage9 Configure-Endpoint completion-code=%d (1==SUCCESS)\n",
+                cast[uint64](cast[uint32](cc)))
+        printk0("[xhci-real] FURTHEST: SET_CONFIGURATION proven (stage9a); Configure-Endpoint did not return attributable SUCCESS\n")
+        return 0
+    printk0("[xhci-real] PASS stage9: Configure-Endpoint SUCCESS — bulk IN/OUT endpoints added to the device context (controller will service the bulk rings)\n")
+    return _xr_stage10_bot_read(xhci, op, bar0, db_base, ir0, slot)
+
+
+# BOT (Bulk-Only Transport) constants.
+_XR_CBW_SIGNATURE: uint32 = 0x43425355      # "USBC"
+_XR_CSW_SIGNATURE: uint32 = 0x53425355      # "USBS"
+# A unique-to-us dCBWTag SeaBIOS never emits — proves OUR BOT command.
+_XR_CBW_TAG_RDCAP: uint32 = 0x48414D31      # "HAM1"
+_XR_CBW_TAG_READ10: uint32 = 0x48414D32     # "HAM2"
+
+
+def _xr_queue_bulk(ring: uint64, cyc: uint32, buf: uint64, length: uint32,
+                   ioc: uint32) -> uint64:
+    # Queue a single Normal TRB at ring offset 0 (each BOT phase uses a
+    # fresh ring position; we keep it simple — one TRB per doorbell).
+    t: Ptr[uint32] = cast[Ptr[uint32]](ring)
+    cast[Ptr[uint64]](ring)[0] = buf
+    t[2] = length
+    flags: uint32 = cyc
+    if ioc != 0:
+        flags = flags | _XR_TRB_IOC
+    t[3] = (_XR_TRB_TYPE_NORMAL << _XR_TRB_TYPE_SHIFT) | flags
+    return ring + 0x10
+
+
+def _xr_bot_xfer(slot: uint32, db_base: uint64,
+                 dci_in: uint32, dci_out: uint32,
+                 cbw: uint64, data_buf: uint64, data_len: uint32,
+                 csw: uint64, data_in: uint32) -> int32:
+    # One full BOT transaction: CBW (bulk-OUT) -> data (bulk-IN/OUT) ->
+    # CSW (bulk-IN). Each phase rings the appropriate endpoint doorbell
+    # and scans the event ring for the transfer event referencing OUR
+    # bulk-ring TRB. Returns 0 on a good CSW (dCSWSignature=="USBS" +
+    # bCSWStatus==0), else -1.
+    # --- CBW phase (always bulk-OUT, 31 bytes) ---
+    cbw_trb: uint64 = _xr_bulk_out_ring
+    _xr_bulk_out_ring = _xr_queue_bulk(_xr_bulk_out_ring, _xr_bulk_out_cyc, cbw, 31, 1)
+    _xr_w32(db_base + cast[uint64](slot) * 4, dci_out)
+    cc: int32 = _xr_scan_event(32, cbw_trb)
+    if cc < 0:
+        printk0("[xhci-real] BOT: no transfer event for CBW phase\n")
+        return -1
+
+    # --- DATA phase (bulk-IN for READ commands) ---
+    if data_len != 0 and data_in != 0:
+        data_trb: uint64 = _xr_bulk_in_ring
+        _xr_bulk_in_ring = _xr_queue_bulk(_xr_bulk_in_ring, _xr_bulk_in_cyc, data_buf, data_len, 1)
+        _xr_w32(db_base + cast[uint64](slot) * 4, dci_in)
+        cc = _xr_scan_event(32, data_trb)
+        if cc < 0:
+            printk0("[xhci-real] BOT: no transfer event for DATA-IN phase\n")
+            return -1
+
+    # --- CSW phase (always bulk-IN, 13 bytes) ---
+    csw_trb: uint64 = _xr_bulk_in_ring
+    _xr_bulk_in_ring = _xr_queue_bulk(_xr_bulk_in_ring, _xr_bulk_in_cyc, csw, 13, 1)
+    _xr_w32(db_base + cast[uint64](slot) * 4, dci_in)
+    cc = _xr_scan_event(32, csw_trb)
+    if cc < 0:
+        printk0("[xhci-real] BOT: no transfer event for CSW phase\n")
+        return -1
+
+    sig: uint32 = cast[Ptr[uint32]](csw)[0]
+    status: uint32 = cast[uint32](cast[Ptr[uint8]](csw)[12])
+    if sig != _XR_CSW_SIGNATURE:
+        printk1("[xhci-real] BOT: CSW signature mismatch (got %p, want USBS)\n",
+                cast[uint64](sig))
+        return -1
+    if status != 0:
+        printk1("[xhci-real] BOT: CSW bCSWStatus=%d (non-zero == command failed)\n",
+                cast[uint64](status))
+        return -1
+    return 0
+
+
+def _xr_build_cbw(cbw: uint64, tag: uint32, data_len: uint32, dir_in: uint32,
+                  cdb_len: uint32):
+    # Zero + populate a 31-byte BOT Command Block Wrapper.
+    memset(cast[Ptr[uint8]](cbw), 0, 31)
+    cast[Ptr[uint32]](cbw + 0x00)[0] = _XR_CBW_SIGNATURE   # dCBWSignature
+    cast[Ptr[uint32]](cbw + 0x04)[0] = tag                 # dCBWTag (unique)
+    cast[Ptr[uint32]](cbw + 0x08)[0] = data_len            # dCBWDataTransferLength
+    flags: uint8 = 0
+    if dir_in != 0:
+        flags = 0x80                                       # bmCBWFlags: IN
+    cast[Ptr[uint8]](cbw + 0x0C)[0] = flags
+    cast[Ptr[uint8]](cbw + 0x0D)[0] = 0                     # bCBWLUN
+    cast[Ptr[uint8]](cbw + 0x0E)[0] = cast[uint8](cdb_len) # bCBWCBLength
+
+
+def _xr_stage10_bot_read(xhci: uint64, op: uint64, bar0: uint64,
+                          db_base: uint64, ir0: uint64, slot: uint32) -> int32:
+    # Drive real SCSI over BOT through the .ko-serviced bulk rings:
+    #   (a) READ CAPACITY(10) — 8 data bytes (last-LBA + block-size).
+    #   (b) READ(10) of LBA 0 — 512 sector bytes; verify MBR sig 0x55AA.
+    in_ep_num: uint32 = _xr_bulk_in_ep & 0x0F
+    out_ep_num: uint32 = _xr_bulk_out_ep & 0x0F
+    dci_in: uint32 = 2 * in_ep_num + 1
+    dci_out: uint32 = 2 * out_ep_num
+
+    cbw_raw: uint64 = kzalloc(128)
+    csw_raw: uint64 = kzalloc(128)
+    cap_raw: uint64 = kzalloc(128)
+    sec_raw: uint64 = kzalloc(1024)
+    if cbw_raw == 0 or csw_raw == 0 or cap_raw == 0 or sec_raw == 0:
+        printk0("[xhci-real] FAIL stage10: kzalloc(BOT buffers) failed\n")
+        return 0
+    cbw: uint64 = _xr_align64(cbw_raw)
+    csw: uint64 = _xr_align64(csw_raw)
+    capbuf: uint64 = _xr_align64(cap_raw)
+    secbuf: uint64 = _xr_align64(sec_raw)
+    printk2("[xhci-real] stage10 BOT bufs: cbw=%p sector=%p\n", cbw, secbuf)
+
+    # --- READ CAPACITY(10): CDB = 0x25, all-zero LBA, 8-byte data IN. ---
+    _xr_build_cbw(cbw, _XR_CBW_TAG_RDCAP, 8, 1, 10)
+    cdb: Ptr[uint8] = cast[Ptr[uint8]](cbw + 0x0F)
+    memset(cdb, 0, 16)
+    cdb[0] = 0x25                                          # READ CAPACITY(10)
+    printk2("[xhci-real] stage10 READ CAPACITY(10) CBW tag=%p at cbw=%p\n",
+            cast[uint64](_XR_CBW_TAG_RDCAP), cbw)
+    rc: int32 = _xr_bot_xfer(slot, db_base, dci_in, dci_out,
+                             cbw, capbuf, 8, csw, 1)
+    if rc != 0:
+        printk0("[xhci-real] FURTHEST: Configure-Endpoint proven (stage9); READ CAPACITY BOT transaction did not complete with a good CSW\n")
+        return 0
+    cp: Ptr[uint8] = cast[Ptr[uint8]](capbuf)
+    last_lba: uint32 = (cast[uint32](cp[0]) << 24) | (cast[uint32](cp[1]) << 16) \
+                     | (cast[uint32](cp[2]) << 8) | cast[uint32](cp[3])
+    blk_sz: uint32 = (cast[uint32](cp[4]) << 24) | (cast[uint32](cp[5]) << 16) \
+                   | (cast[uint32](cp[6]) << 8) | cast[uint32](cp[7])
+    printk2("[xhci-real] PASS stage10a: READ CAPACITY(10) over .ko bulk rings — last-LBA=%d block-size=%d\n",
+            cast[uint64](last_lba), cast[uint64](blk_sz))
+
+    # --- READ(10) of LBA 0, one 512-byte block, data IN. ---
+    memset(cast[Ptr[uint8]](secbuf), 0, 512)
+    _xr_build_cbw(cbw, _XR_CBW_TAG_READ10, 512, 1, 10)
+    cdb = cast[Ptr[uint8]](cbw + 0x0F)
+    memset(cdb, 0, 16)
+    cdb[0] = 0x28                                          # READ(10)
+    cdb[2] = 0                                             # LBA[31:24]
+    cdb[3] = 0                                             # LBA[23:16]
+    cdb[4] = 0                                             # LBA[15:8]
+    cdb[5] = 0                                             # LBA[7:0] == 0
+    cdb[7] = 0                                             # xfer len hi
+    cdb[8] = 1                                             # 1 block
+    printk2("[xhci-real] stage10 READ(10) LBA0 CBW tag=%p at cbw=%p\n",
+            cast[uint64](_XR_CBW_TAG_READ10), cbw)
+    rc = _xr_bot_xfer(slot, db_base, dci_in, dci_out,
+                      cbw, secbuf, 512, csw, 1)
+    if rc != 0:
+        printk0("[xhci-real] FURTHEST: READ CAPACITY proven (stage10a); READ(10) BOT transaction did not complete with a good CSW\n")
+        return 0
+    sb: Ptr[uint8] = cast[Ptr[uint8]](secbuf)
+    b0: uint32 = cast[uint32](sb[0])
+    b1: uint32 = cast[uint32](sb[1])
+    sig0: uint32 = cast[uint32](sb[510])
+    sig1: uint32 = cast[uint32](sb[511])
+    printk2("[xhci-real] stage10 sector0 first bytes: [0]=%p [1]=%p\n",
+            cast[uint64](b0), cast[uint64](b1))
+    printk2("[xhci-real] stage10 sector0 sig bytes: [510]=%p [511]=%p\n",
+            cast[uint64](sig0), cast[uint64](sig1))
+    printk0("[xhci-real] PASS stage10: READ(10) of LBA0 over .ko bulk rings returned 512 sector bytes through the Linux xhci_hcd.ko BOT path\n")
+    if sig0 == 0x55 and sig1 == 0xAA:
+        printk0("[xhci-real] PASS stage10b: sector-0 carries the 0x55AA MBR boot signature (real disk data DMA'd back through OUR bulk-IN ring)\n")
+    printk0("[xhci-real] FURTHEST: FULL real-.ko-driven USB-MSC block read — Configure-Endpoint + BOT READ CAPACITY + READ(10) all round-tripped through the Linux xhci_hcd.ko bulk rings (native disabled)\n")
     return 0
 
 

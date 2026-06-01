@@ -36,14 +36,26 @@
 # Linux setup path on a missing retpoline thunk. See the report in the
 # api_xhci_real.ad header.
 #
+# With ENABLE_XHCI_KO_REAL_MMIO=1 the test now drives the .ko all the way
+# to USB-MASS-STORAGE BLOCK I/O: stages 8/9/10 parse the config
+# descriptor, SET_CONFIGURATION + Configure-Endpoint the bulk endpoints,
+# and run BOT (Bulk-Only Transport) SCSI READ CAPACITY(10) + READ(10) of
+# LBA 0 through the .ko's bulk rings, verifying the returned sector bytes
+# are the marker + 0x55AA MBR signature seeded into the backing image.
+#
 # IMPORTANT — QEMU trace caveat: SeaBIOS has its own USB stack and
 # enumerates attached USB devices at BIOS time (slot enable, address
-# device, GET_DESCRIPTOR). Those `usb_xhci_slot_*` / `usb_xhci_xfer_*`
-# trace events therefore appear in EVERY boot regardless of which OS
-# driver runs, so they are NOT usable as ground truth that the Linux
-# .ko enumerated. This test instead asserts the unambiguous kernel-side
-# [xhci-real] markers (which only the real .ko code path emits) plus
-# that native is provably suppressed.
+# device, GET_DESCRIPTOR) and even reads sectors. Those `usb_xhci_slot_*`
+# / `usb_xhci_xfer_*` trace events therefore appear in EVERY boot
+# regardless of which OS driver runs, so they are NOT usable as ground
+# truth that the Linux .ko did the work. This test instead asserts the
+# unambiguous kernel-side [xhci-real] markers (which only the real .ko
+# code path emits) PLUS trace payloads SeaBIOS cannot produce: TRBs
+# fetched from OUR kzalloc'd low rings (addresses derived from kernel
+# markers, never hardcoded) referencing OUR low-mem DMA buffers, and
+# control setup wLengths SeaBIOS never emits (0x12 / 0x40). SeaBIOS
+# drives its own transfers from high BIOS memory (0x000e8xxx rings ->
+# 0x0efexxxx data), so an OUR-ring/OUR-buffer fetch is .ko-attributable.
 
 . "$(dirname "$0")/_build_lock.sh"
 
@@ -126,6 +138,12 @@ LOG="$(mktemp)"
 TRACE="$(mktemp)"
 USBIMG="$(mktemp)"
 truncate -s 16M "$USBIMG"
+# Seed sector 0 with a known marker string + the 0x55AA MBR boot
+# signature so the MSC READ(10) stage can assert it read REAL disk data
+# (not a zero-filled placeholder). SeaBIOS never reads our LBA-0 content
+# back into a guest buffer we control, so a marker match is .ko-attributable.
+printf 'HAMNIX-MSC-SECTOR0-MARKER' | dd of="$USBIMG" bs=1 seek=0   conv=notrunc status=none
+printf '\x55\xAA'                  | dd of="$USBIMG" bs=1 seek=510 conv=notrunc status=none
 set +e
 timeout "${ENUM_TIMEOUT}s" qemu-system-x86_64 \
     -boot d -cdrom "$KISO" \
@@ -325,4 +343,122 @@ fi
 echo "[test_xhci_ko_enum] OK: stage7 — GET_DESCRIPTOR(device) round-tripped a valid 18-byte descriptor via OUR EP0 control ring"
 echo "[test_xhci_ko_enum] OK: trace ground-truth — TR_SETUP wLength=0x12 on .ko EP0 ring (NOT SeaBIOS, which uses 0x08)"
 
-echo "[test_xhci_ko_enum] PASS (real Linux xhci_hcd.ko drove FULL enumeration: gen_setup + controller-run + Enable-Slot + Address-Device + GET_DESCRIPTOR through .ko rings; native disabled)"
+# =====================================================================
+# MSC (USB Mass Storage, Bulk-Only Transport) — stages 8/9/10. The .ko
+# stack does not merely enumerate; it READS SECTORS off the usb-storage
+# device. Proof discipline is identical to enumeration: kernel-side
+# [xhci-real] markers attributable to OUR rings + QEMU trace payloads
+# SeaBIOS cannot produce. SeaBIOS drives its own bulk transfers from high
+# BIOS memory (rings at 0x000e8xxx -> data at 0x0efexxxx); OURS are
+# fetched from kzalloc'd low rings (0x05xxxxxx) pointing at OUR low DMA
+# buffers, and our control transfers carry wLengths SeaBIOS never emits.
+# =====================================================================
+
+# Stage 8: GET_DESCRIPTOR(config) parsed; bulk IN/OUT endpoints found.
+# The control transfer is BIOS-distinguishable by its setup payload: we
+# request wValue=0x0200 (CONFIG) wLength=0x0040, immediate-data low qword
+# 0x0040000002000680 — SeaBIOS's config fetch uses a different wLength.
+if ! grep -aF -q "[xhci-real] PASS stage8: GET_DESCRIPTOR(config) parsed" "$LOG"; then
+    echo "[test_xhci_ko_enum] FAIL: stage8 (GET_DESCRIPTOR config + bulk-endpoint parse) did not pass"
+    tail -n 40 "$LOG"
+    exit 1
+fi
+if ! grep -aF -q "[xhci-real] stage8 bulk endpoints: IN=0x0000000000000081 OUT=0x0000000000000002" "$LOG"; then
+    echo "[test_xhci_ko_enum] FAIL: stage8 did not identify the expected bulk IN=0x81 / OUT=0x02 endpoints"
+    exit 1
+fi
+if ! grep -aE -q 'TR_SETUP, p 0x0040000002000680' "$TRACE"; then
+    echo "[test_xhci_ko_enum] FAIL: trace shows no TR_SETUP for our GET_DESCRIPTOR(config) wLength=0x40 (BIOS-distinguishable)"
+    exit 1
+fi
+echo "[test_xhci_ko_enum] OK: stage8 — config descriptor parsed; bulk IN=0x81/OUT=0x02 found (TR_SETUP wLength=0x40 on .ko EP0 ring)"
+
+# Stage 9: SET_CONFIGURATION(1) + Configure-Endpoint SUCCESS. The
+# Configure-Endpoint command TRB is fetched from OUR cmd ring at the
+# exact address the kernel posted it (derived from the marker, not a
+# hardcoded prefix), referencing OUR low-mem input context.
+if ! grep -aF -q "[xhci-real] PASS stage9a: SET_CONFIGURATION(1) accepted over EP0" "$LOG"; then
+    echo "[test_xhci_ko_enum] FAIL: stage9a (SET_CONFIGURATION) did not complete with SUCCESS"
+    tail -n 40 "$LOG"
+    exit 1
+fi
+if ! grep -aF -q "[xhci-real] PASS stage9: Configure-Endpoint SUCCESS" "$LOG"; then
+    echo "[test_xhci_ko_enum] FAIL: stage9 (Configure-Endpoint) did not return attributable SUCCESS"
+    tail -n 40 "$LOG"
+    exit 1
+fi
+CE_LINE="$(grep -aE 'stage9 Configure-Endpoint posted at 0x[0-9a-fA-F]+ \(in_ctx=0x[0-9a-fA-F]+\)' "$LOG" | head -1)"
+CE_ADDR="$(printf '%s' "$CE_LINE" | grep -aoE 'posted at 0x[0-9a-fA-F]+' | grep -aoE '0x[0-9a-fA-F]+')"
+CE_CTX="$(printf '%s' "$CE_LINE" | grep -aoE 'in_ctx=0x[0-9a-fA-F]+' | grep -aoE '0x[0-9a-fA-F]+')"
+if [ -z "$CE_ADDR" ] || [ -z "$CE_CTX" ]; then
+    echo "[test_xhci_ko_enum] FAIL: kernel did not emit the stage9 Configure-Endpoint ring/input-ctx addresses"
+    exit 1
+fi
+CE_ADDR_NORM="$(printf '0x%016x' "$CE_ADDR")"
+CE_CTX_NORM="$(printf '0x%016x' "$CE_CTX")"
+echo "[test_xhci_ko_enum] stage9 Configure-Endpoint posted by kernel at $CE_ADDR_NORM -> in_ctx $CE_CTX_NORM (from marker)"
+if ! grep -aF -q "fetch_trb addr ${CE_ADDR_NORM}, CR_CONFIGURE_ENDPOINT, p ${CE_CTX_NORM}" "$TRACE"; then
+    echo "[test_xhci_ko_enum] FAIL: trace shows no CR_CONFIGURE_ENDPOINT at $CE_ADDR_NORM -> .ko input ctx $CE_CTX_NORM"
+    echo "[test_xhci_ko_enum] --- CR_CONFIGURE_ENDPOINT fetches seen in trace ---"
+    grep -aE 'CR_CONFIGURE_ENDPOINT' "$TRACE" || true
+    exit 1
+fi
+echo "[test_xhci_ko_enum] OK: stage9 — SET_CONFIGURATION + Configure-Endpoint SUCCESS (controller fetched OUR cmd TRB at $CE_ADDR_NORM -> OUR input ctx $CE_CTX_NORM)"
+
+# Stage 10: BOT READ CAPACITY(10) + READ(10) of LBA 0 through the .ko
+# bulk rings. The CBWs are bulk-OUT Normal TRBs fetched from OUR low-mem
+# bulk-OUT ring pointing at OUR CBW buffer; the READ(10) data is a
+# 512-byte bulk-IN Normal TRB into OUR sector buffer (s 0x00000200).
+# SeaBIOS drives its bulk transfers from 0x000e8xxx rings into 0x0efexxxx
+# data, so a Normal TRB fetched from our low ring into our low buffer is
+# .ko-attributable. The decisive substance: the returned sector carries
+# the marker + 0x55AA MBR signature we seeded — real disk data DMA'd back
+# through OUR bulk-IN ring.
+if ! grep -aF -q "[xhci-real] PASS stage10a: READ CAPACITY(10) over .ko bulk rings" "$LOG"; then
+    echo "[test_xhci_ko_enum] FAIL: stage10a (READ CAPACITY over BOT) did not complete with a good CSW"
+    tail -n 40 "$LOG"
+    exit 1
+fi
+echo "[test_xhci_ko_enum] OK: stage10a — READ CAPACITY(10) over .ko bulk rings (real disk geometry returned)"
+# READ CAPACITY data must report the seeded 16 MiB disk: last-LBA 32767,
+# 512-byte blocks. This 8-byte data IN came back through OUR bulk-IN ring.
+if ! grep -aF -q "[xhci-real] PASS stage10a: READ CAPACITY(10) over .ko bulk rings — last-LBA=32767 block-size=512" "$LOG"; then
+    echo "[test_xhci_ko_enum] FAIL: stage10a capacity != the seeded 16 MiB disk (last-LBA=32767/512)"
+    exit 1
+fi
+if ! grep -aF -q "[xhci-real] PASS stage10: READ(10) of LBA0 over .ko bulk rings returned 512 sector bytes" "$LOG"; then
+    echo "[test_xhci_ko_enum] FAIL: stage10 (READ(10) of LBA0 over BOT) did not return 512 sector bytes"
+    tail -n 40 "$LOG"
+    exit 1
+fi
+# Decisive proof the bytes are REAL disk data (not a zeroed buffer): the
+# seeded marker "HAMNIX-MSC-SECTOR0-MARKER" begins with 'H'(0x48) 'A'(0x41),
+# and the MBR signature 0x55AA sits at offset 510/511.
+if ! grep -aF -q "[xhci-real] stage10 sector0 first bytes: [0]=0x0000000000000048 [1]=0x0000000000000041" "$LOG"; then
+    echo "[test_xhci_ko_enum] FAIL: sector-0 first bytes are not the seeded marker 'HA' — bulk-IN did not DMA real disk data"
+    exit 1
+fi
+if ! grep -aF -q "[xhci-real] PASS stage10b: sector-0 carries the 0x55AA MBR boot signature" "$LOG"; then
+    echo "[test_xhci_ko_enum] FAIL: sector-0 0x55AA MBR signature not read back through the .ko bulk-IN ring"
+    exit 1
+fi
+# Trace ground-truth: a 512-byte bulk-IN Normal TRB (s 0x00000200)
+# referencing OUR sector buffer (the kernel printed sector=0x....). Derive
+# the buffer address from the marker so the assertion is build-agnostic.
+SEC_BUF="$(grep -aoE 'stage10 BOT bufs: cbw=0x[0-9a-fA-F]+ sector=0x[0-9a-fA-F]+' "$LOG" | head -1 \
+            | grep -aoE 'sector=0x[0-9a-fA-F]+' | grep -aoE '0x[0-9a-fA-F]+')"
+if [ -z "$SEC_BUF" ]; then
+    echo "[test_xhci_ko_enum] FAIL: kernel did not emit the stage10 sector buffer address"
+    exit 1
+fi
+SEC_BUF_NORM="$(printf '0x%016x' "$SEC_BUF")"
+echo "[test_xhci_ko_enum] stage10 sector buffer (from marker) = $SEC_BUF_NORM"
+if ! grep -aF -q "TR_NORMAL, p ${SEC_BUF_NORM}, s 0x00000200" "$TRACE"; then
+    echo "[test_xhci_ko_enum] FAIL: trace shows no 512-byte bulk-IN TR_NORMAL into our sector buffer $SEC_BUF_NORM"
+    echo "[test_xhci_ko_enum] --- 512-byte TR_NORMAL fetches seen in trace ---"
+    grep -aE 'TR_NORMAL.*s 0x00000200' "$TRACE" || true
+    exit 1
+fi
+echo "[test_xhci_ko_enum] OK: stage10 — READ(10) DMA'd 512 real sector bytes into OUR bulk-IN buffer $SEC_BUF_NORM (marker + 0x55AA verified)"
+
+echo "[test_xhci_ko_enum] PASS (real Linux xhci_hcd.ko drove FULL enumeration AND USB-MSC block I/O: gen_setup + controller-run + Enable-Slot + Address-Device + GET_DESCRIPTOR + SET_CONFIG + Configure-Endpoint + BOT READ CAPACITY + READ(10) sector through .ko rings; native disabled)"
