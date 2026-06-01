@@ -218,3 +218,14 @@ python3 -m compiler.adder compile \
     adder/compiler/codegen_selftest.ad \
     -o build/user/codegen_selftest.elf
 file build/user/codegen_selftest.elf
+
+# --- Self-hosting milestone: Adder-in-Adder ELF emit -----------------
+# On-device tool that runs lexer.ad -> parser.ad -> codegen.ad ->
+# elf_emit.ad and dumps a complete, loadable user ELF as hex (consumed by
+# scripts/test_selfhost_elf.sh, which then EXECs the emitted ELF natively).
+echo "[build_user] compiling adder/compiler/codegen_elf_selftest.ad -> build/user/codegen_elf_selftest.elf"
+python3 -m compiler.adder compile \
+    --target=x86_64-adder-user \
+    adder/compiler/codegen_elf_selftest.ad \
+    -o build/user/codegen_elf_selftest.elf
+file build/user/codegen_elf_selftest.elf

@@ -1,0 +1,304 @@
+# adder/compiler/elf_emit.ad
+#
+# Self-hosted ELF32 image emitter for the Adder-in-Adder x86_64 backend.
+#
+# codegen.ad (lexer.ad -> parser.ad -> codegen.ad) emits raw x86_64
+# machine-code bytes into two fixed in-memory buffers:
+#   * code[0..code_len)   — the code region, conceptually at virtual 0.
+#   * gdata[0..gdata_len)  — the data region, conceptually at virtual
+#     base DATA_BASE (== CODE_CAP == 8192), i.e. exactly CODE_CAP bytes
+#     after code start. codegen's RIP-relative data fixups encode
+#     disp32 = (DATA_BASE + data_off) - rip_field_end, so the data
+#     region MUST sit exactly CODE_CAP bytes after code start in the
+#     loaded image or every global access is misaddressed.
+#
+# This module turns those buffers into a complete, loadable
+# `x86_64-adder-user` ELF image (an elf32-i386 wrapper around 64-bit
+# code — the exact format user/init.lds produces and fs/elf.ad's
+# ELFCLASS32 path loads). The kernel loader (fs/elf.ad _load_elf*) for
+# the ELF32 class allocates one contiguous region of size
+# max(p_vaddr + p_memsz), copies each PT_LOAD segment to
+# region + (p_vaddr - lowest_v), and jumps to region + (e_entry -
+# lowest_v). Because lowest_v == 0 here, the in-image virtual offsets
+# (code at 0, data at CODE_CAP) are preserved verbatim after the rebase
+# — so codegen's RIP-relative displacements stay correct on device.
+#
+# Image layout (single PT_LOAD, vaddr base 0):
+#
+#   vaddr 0 .............. code[0..code_len)         compiled program
+#   vaddr code_len ....... _start stub (hand-emitted machine code)
+#   vaddr CODE_CAP ....... gdata[0..gdata_len)        global data section
+#
+# The compiled program's ENTRY function is at vaddr 0 (codegen always
+# emits the first function there). e_entry points at the _start stub,
+# NOT at vaddr 0: _start sets the entry's first arg in %rdi, `call`s the
+# entry at vaddr 0, then issues SYS_EXIT with the entry's return value
+# (%rax -> %rdi) so the process terminates cleanly with an observable
+# exit status. This keeps the emitted ELF self-contained (no runtime.S
+# link step needed).
+
+from compiler.codegen import (
+    code,
+    code_len,
+    gdata,
+    gdata_len,
+    CODE_CAP,
+)
+
+# -----------------------------------------------------------------------
+# Output ELF image buffer.
+#
+# CODE_CAP (8192) code window + a small _start stub + GDATA (<= 8192) +
+# 84 bytes of ELF + program headers, generously rounded. 32 KiB is
+# plenty and negligible.
+# -----------------------------------------------------------------------
+ELF_BUF_CAP: uint32 = 32768
+elf_buf: Array[32768, uint8]
+elf_len: uint32 = 0
+
+# Error flag (set on overflow). The caller checks this after emit.
+elf_err: uint32 = 0
+
+# The byte offset within elf_buf where the loadable segment's bytes
+# begin (file offset of the PT_LOAD). ELF header (52) + one program
+# header (32) = 84.
+ELF_SEG_FILE_OFF: uint32 = 84
+
+# The _start stub's virtual address (== its offset within the segment,
+# since the segment's vaddr base is 0). Recorded by elf_emit_image so a
+# test can assert e_entry. Placed right after the compiled code.
+elf_entry_vaddr: uint32 = 0
+
+
+def elf_reset():
+    elf_len = 0
+    elf_err = 0
+    elf_entry_vaddr = 0
+
+
+# Append one byte to the ELF image buffer.
+def eb(b: uint32):
+    if elf_len >= ELF_BUF_CAP:
+        elf_err = 1
+        return
+    elf_buf[elf_len] = cast[uint8](b & 255)
+    elf_len = elf_len + 1
+
+
+# Append a little-endian uint16 at the current position.
+def eb16(v: uint32):
+    eb(v & 255)
+    eb((v >> 8) & 255)
+
+
+# Append a little-endian uint32 at the current position.
+def eb32(v: uint32):
+    eb(v & 255)
+    eb((v >> 8) & 255)
+    eb((v >> 16) & 255)
+    eb((v >> 24) & 255)
+
+
+# Overwrite a little-endian uint32 already present at byte offset `at`.
+def patch32(at: uint32, v: uint32):
+    elf_buf[at] = cast[uint8](v & 255)
+    elf_buf[at + 1] = cast[uint8]((v >> 8) & 255)
+    elf_buf[at + 2] = cast[uint8]((v >> 16) & 255)
+    elf_buf[at + 3] = cast[uint8]((v >> 24) & 255)
+
+
+# -----------------------------------------------------------------------
+# Build the complete ELF image into elf_buf[0..elf_len).
+#
+# `entry_arg` is the 32-bit value the _start stub loads into %edi before
+# calling the compiled entry at vaddr 0. The compiled entry reads it as
+# its first parameter (System-V: first arg in %rdi). For a no-arg `main`
+# the value is simply ignored by the callee.
+#
+# Returns the total image length (elf_len), or 0 on overflow (elf_err
+# is also set).
+# -----------------------------------------------------------------------
+def elf_emit_image(entry_arg: uint32) -> uint32:
+    elf_reset()
+
+    # The _start stub sits immediately after the compiled code, still
+    # far below CODE_CAP (the program is tiny vs the 8 KiB window). Its
+    # vaddr == its offset in the segment (segment vaddr base 0).
+    start_vaddr: uint32 = code_len
+    elf_entry_vaddr = start_vaddr
+
+    # --- _start machine code (hand-assembled x86_64) --------------------
+    # We assemble it into a tiny local buffer first so we know its exact
+    # length and the call's rel32 displacement before laying out the
+    # ELF (e_entry needs the stub vaddr; the segment file size needs the
+    # stub length). The stub is:
+    #
+    #   BF <imm32>            mov    edi, entry_arg     ; first arg
+    #   E8 <rel32>            call   entry              ; entry at vaddr 0
+    #   48 89 C7             mov    rdi, rax           ; return -> exit code
+    #   B8 01 00 00 00       mov    eax, 1             ; SYS_EXIT
+    #   0F 05                syscall
+    #   EB FE                jmp    .                  ; defensive spin
+    #
+    # The `call` is RIP-relative: rel32 = target - (addr_of_field + 4),
+    # where target = 0 (entry vaddr) and addr_of_field is the vaddr of
+    # the rel32 immediate. The stub begins at start_vaddr; the `mov edi`
+    # is 5 bytes (1 opcode + 4 imm), so the call opcode is at
+    # start_vaddr + 5, its rel32 field at start_vaddr + 6, and the field
+    # end at start_vaddr + 10.
+    stub: Array[32, uint8]
+    sn: uint32 = 0
+
+    # mov edi, entry_arg
+    stub[sn] = 0xBF
+    sn = sn + 1
+    stub[sn] = cast[uint8](entry_arg & 255)
+    sn = sn + 1
+    stub[sn] = cast[uint8]((entry_arg >> 8) & 255)
+    sn = sn + 1
+    stub[sn] = cast[uint8]((entry_arg >> 16) & 255)
+    sn = sn + 1
+    stub[sn] = cast[uint8]((entry_arg >> 24) & 255)
+    sn = sn + 1
+
+    # call rel32 -> entry at vaddr 0
+    field_end: uint32 = start_vaddr + 10
+    # rel32 = 0 - field_end, as an unsigned 32-bit two's complement value.
+    rel: uint32 = cast[uint32](0) - field_end
+    stub[sn] = 0xE8
+    sn = sn + 1
+    stub[sn] = cast[uint8](rel & 255)
+    sn = sn + 1
+    stub[sn] = cast[uint8]((rel >> 8) & 255)
+    sn = sn + 1
+    stub[sn] = cast[uint8]((rel >> 16) & 255)
+    sn = sn + 1
+    stub[sn] = cast[uint8]((rel >> 24) & 255)
+    sn = sn + 1
+
+    # mov rdi, rax  (REX.W 89 /r, modrm C7 = rax->rdi)
+    stub[sn] = 0x48
+    sn = sn + 1
+    stub[sn] = 0x89
+    sn = sn + 1
+    stub[sn] = 0xC7
+    sn = sn + 1
+
+    # mov eax, 1   (SYS_EXIT)
+    stub[sn] = 0xB8
+    sn = sn + 1
+    stub[sn] = 0x01
+    sn = sn + 1
+    stub[sn] = 0x00
+    sn = sn + 1
+    stub[sn] = 0x00
+    sn = sn + 1
+    stub[sn] = 0x00
+    sn = sn + 1
+
+    # syscall
+    stub[sn] = 0x0F
+    sn = sn + 1
+    stub[sn] = 0x05
+    sn = sn + 1
+
+    # jmp . (EB FE) defensive spin if SYS_EXIT ever returns
+    stub[sn] = 0xEB
+    sn = sn + 1
+    stub[sn] = 0xFE
+    sn = sn + 1
+
+    stub_len: uint32 = sn
+
+    # --- Segment sizing -------------------------------------------------
+    # The loadable segment spans [vaddr 0, CODE_CAP + gdata_len):
+    #   code  : [0, code_len)
+    #   _start: [code_len, code_len + stub_len)   (within the code window)
+    #   gdata : [CODE_CAP, CODE_CAP + gdata_len)
+    # We require the stub to fit inside the code window so gdata stays at
+    # exactly CODE_CAP (the addressing invariant).
+    if code_len + stub_len > CODE_CAP:
+        elf_err = 1
+        return 0
+
+    seg_filesz: uint32 = CODE_CAP + gdata_len
+    seg_memsz: uint32 = seg_filesz
+
+    # --- ELF32 header (52 bytes) ----------------------------------------
+    # e_ident
+    eb(0x7F)          # EI_MAG0
+    eb(69)            # 'E'
+    eb(76)            # 'L'
+    eb(70)            # 'F'
+    eb(1)             # EI_CLASS = ELFCLASS32 (fs/elf.ad ELF32 path)
+    eb(1)             # EI_DATA  = ELFDATA2LSB (little-endian)
+    eb(1)             # EI_VERSION = EV_CURRENT
+    eb(0)             # EI_OSABI = ELFOSABI_SYSV (native, not Linux)
+    eb(0)             # EI_ABIVERSION
+    eb(0)             # EI_PAD..
+    eb(0)
+    eb(0)
+    eb(0)
+    eb(0)
+    eb(0)
+    eb(0)
+    eb16(2)           # e_type = ET_EXEC
+    eb16(3)           # e_machine = EM_386 (matches the elf32-i386 wrapper)
+    eb32(1)           # e_version = EV_CURRENT
+    # e_entry: the _start stub's vaddr. fs/elf.ad ELF32 path returns
+    # region + (e_entry - lowest_v); lowest_v == 0 so the stub runs at
+    # its in-image vaddr offset.
+    eb32(elf_entry_vaddr)
+    eb32(52)          # e_phoff = right after the 52-byte ELF header
+    eb32(0)           # e_shoff = 0 (no section headers; loader ignores)
+    eb32(0)           # e_flags
+    eb16(52)          # e_ehsize
+    eb16(32)          # e_phentsize (elf32 program header size)
+    eb16(1)           # e_phnum = 1 (single PT_LOAD)
+    eb16(0)           # e_shentsize
+    eb16(0)           # e_shnum
+    eb16(0)           # e_shstrndx
+
+    # --- Program header (PT_LOAD, 32 bytes) -----------------------------
+    eb32(1)                 # p_type = PT_LOAD
+    eb32(ELF_SEG_FILE_OFF)  # p_offset = file offset where segment bytes start
+    eb32(0)                 # p_vaddr = 0 (base; loader rebases by lowest_v)
+    eb32(0)                 # p_paddr
+    eb32(seg_filesz)        # p_filesz
+    eb32(seg_memsz)         # p_memsz
+    eb32(7)                 # p_flags = RWX (loader ignores per-seg flags here)
+    eb32(4096)              # p_align
+
+    # Sanity: header bytes must total ELF_SEG_FILE_OFF.
+    if elf_len != ELF_SEG_FILE_OFF:
+        elf_err = 1
+        return 0
+
+    # --- Segment payload ------------------------------------------------
+    # 1) Compiled code at vaddr 0.
+    ci: uint32 = 0
+    while ci < code_len:
+        eb(cast[uint32](code[ci]))
+        ci = ci + 1
+
+    # 2) _start stub at vaddr code_len.
+    si: uint32 = 0
+    while si < stub_len:
+        eb(cast[uint32](stub[si]))
+        si = si + 1
+
+    # 3) Pad the code window out to CODE_CAP so gdata lands at exactly
+    #    CODE_CAP (the RIP-relative data-fixup invariant).
+    while (elf_len - ELF_SEG_FILE_OFF) < CODE_CAP:
+        eb(0)
+
+    # 4) Global data section at vaddr CODE_CAP.
+    gi: uint32 = 0
+    while gi < gdata_len:
+        eb(cast[uint32](gdata[gi]))
+        gi = gi + 1
+
+    if elf_err != 0:
+        return 0
+
+    return elf_len
