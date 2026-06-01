@@ -5948,6 +5948,384 @@ def _check_file_conflicts(tar_len: uint64,
     return 0
 
 
+# =====================================================================
+# #186: SOURCE packages (Gentoo-style) — compile ON-BOX at install time
+# =====================================================================
+#
+# The native hpm repo is SOURCE-PRIMARY. A source package ships its
+# Adder `.ad` source plus a `recipe` manifest INSIDE the tarball (at the
+# tarball root, alongside PKGINFO), and DOES NOT carry a prebuilt binary
+# in `files/`. At install time hpm:
+#
+#   1. stages the whole tarball at /tmp/hpm/staging/<pkg>-<ver>/ (the
+#      existing _stage_tarball already does this for hooks),
+#   2. notices the `recipe` file there → this is a SOURCE package,
+#   3. for each `build <src.ad> <out>` line, compiles the staged source
+#      ON-BOX by spawning /bin/adder_cc (Hamnix's self-hosted Adder
+#      compiler front-end) → writes the ELF into the staging tree's
+#      files/<out>,
+#   4. falls through to the normal files/ → target extraction, which
+#      lays the freshly-compiled binary down at its install path.
+#
+# OPTIONAL BINARY CACHE: if the staging tree already has files/<out>
+# (i.e. the publisher shipped a prebuilt cache artifact in the tarball),
+# hpm SKIPS the compile for that output and uses the cached binary. The
+# source path is PRIMARY; the cache is a pure optimisation. A recipe may
+# force-recompile by setting `cache no`.
+#
+# Recipe grammar (one directive per line; '#' comments; blank lines ok):
+#   build <src-rel> <out-rel>     compile <staging>/<src-rel> into
+#                                 <staging>/files/<out-rel>
+#   cache yes|no                  (default yes) allow using a prebuilt
+#                                 files/<out-rel> cache artifact if present
+#
+# <src-rel> is relative to the staging root; <out-rel> is relative to
+# files/ (so it ends up at the package's normal install path). Both are
+# path-safety checked (no abs / no '..').
+
+# The on-box self-hosted Adder compiler front-end. NOTE (U9 discipline):
+# the x86_64 backend rejects string-literal MODULE globals, so this path
+# is materialised inline at each call site via _adder_cc_path() rather
+# than a top-level `Ptr[uint8] = "..."` constant.
+def _adder_cc_path() -> Ptr[uint8]:
+    return "/bin/adder_cc"
+
+
+# Recipe state. recipe_buf holds the raw recipe; the build table holds
+# parsed (src-rel, out-rel) pairs. Top-level BSS per U9 discipline.
+RECIPE_CAP: uint64 = 16384
+recipe_buf:     Array[16384, uint8]
+recipe_len:     uint64 = 0
+recipe_have:    int32 = 0
+recipe_cache_ok: int32 = 1
+
+RECIPE_MAX_BUILDS: uint64 = 64
+recipe_src_off: Array[64, uint64]
+recipe_src_len: Array[64, uint64]
+recipe_out_off: Array[64, uint64]
+recipe_out_len: Array[64, uint64]
+recipe_build_n: uint64 = 0
+
+# Path scratch for the compile spawn. Top-level BSS.
+src_full_buf:  Array[640, uint8]    # "<staging>/<src-rel>" + NUL
+out_full_buf:  Array[640, uint8]    # "<staging>/files/<out-rel>" + NUL
+tgt_full_buf:  Array[640, uint8]    # "<target_prefix><out-rel>" + NUL
+recipe_path_buf: Array[640, uint8]  # "<staging>/recipe" + NUL
+cc_argv_buf:   Array[4, uint64]
+
+
+def _recipe_reset():
+    recipe_len = 0
+    recipe_have = 0
+    recipe_cache_ok = 1
+    recipe_build_n = 0
+
+
+# Load <staging_root>/recipe into recipe_buf. Returns 1 if a recipe was
+# read, 0 if absent (i.e. a plain binary package), -1 on read error.
+def _recipe_load(staging_root: Ptr[uint8]) -> int32:
+    _recipe_reset()
+    # Compose "<staging_root>/recipe".
+    p: uint64 = 0
+    ri: uint64 = 0
+    while staging_root[ri] != 0 and p + 1 < 632:
+        recipe_path_buf[p] = staging_root[ri]
+        p = p + 1
+        ri = ri + 1
+    recipe_path_buf[p] = 47
+    p = p + 1
+    suf: Ptr[uint8] = "recipe"
+    si: uint64 = 0
+    while suf[si] != 0:
+        recipe_path_buf[p] = suf[si]
+        p = p + 1
+        si = si + 1
+    recipe_path_buf[p] = 0
+
+    fd: int32 = sys_open(cast[Ptr[char]](&recipe_path_buf[0]))
+    if fd < 0:
+        return 0                                          # no recipe
+    tot: uint64 = 0
+    while tot < RECIPE_CAP:
+        n: int64 = sys_read(fd, &recipe_buf[tot], RECIPE_CAP - tot)
+        if n <= 0:
+            break
+        tot = tot + cast[uint64](n)
+    sys_close(fd)
+    recipe_len = tot
+    recipe_have = 1
+    return 1
+
+
+# Parse recipe_buf[0..recipe_len) into the build table. Returns 0 on
+# success, -1 on malformed recipe (overflow / bad directive).
+def _recipe_parse() -> int32:
+    p: uint64 = 0
+    end: uint64 = recipe_len
+    while p < end:
+        # End of line.
+        lend: uint64 = p
+        while lend < end and recipe_buf[lend] != 10:
+            lend = lend + 1
+        vend: uint64 = lend
+        if vend > p and recipe_buf[vend - 1] == 13:
+            vend = vend - 1
+        # Skip leading whitespace.
+        ls: uint64 = p
+        while ls < vend and (recipe_buf[ls] == 32 or recipe_buf[ls] == 9):
+            ls = ls + 1
+        # Blank / comment line.
+        if ls >= vend or recipe_buf[ls] == 35:
+            p = lend + 1
+            continue
+        # First token = directive.
+        d0: uint64 = ls
+        while ls < vend and recipe_buf[ls] != 32 and recipe_buf[ls] != 9:
+            ls = ls + 1
+        dlen: uint64 = ls - d0
+        dp: Ptr[uint8] = &recipe_buf[d0]
+        # Skip whitespace to first arg.
+        while ls < vend and (recipe_buf[ls] == 32 or recipe_buf[ls] == 9):
+            ls = ls + 1
+
+        if dlen == 5 and _streq_n(dp, cast[Ptr[uint8]]("build"), 5) != 0:
+            # build <src> <out>
+            a0: uint64 = ls
+            while ls < vend and recipe_buf[ls] != 32 and recipe_buf[ls] != 9:
+                ls = ls + 1
+            a0_len: uint64 = ls - a0
+            while ls < vend and (recipe_buf[ls] == 32 or recipe_buf[ls] == 9):
+                ls = ls + 1
+            a1: uint64 = ls
+            while ls < vend and recipe_buf[ls] != 32 and recipe_buf[ls] != 9:
+                ls = ls + 1
+            a1_len: uint64 = ls - a1
+            if a0_len == 0 or a1_len == 0:
+                write_str(2, "hpm: recipe: malformed `build` line (need <src> <out>)\n")
+                return -1
+            if recipe_build_n >= RECIPE_MAX_BUILDS:
+                write_str(2, "hpm: recipe: too many build directives\n")
+                return -1
+            recipe_src_off[recipe_build_n] = a0
+            recipe_src_len[recipe_build_n] = a0_len
+            recipe_out_off[recipe_build_n] = a1
+            recipe_out_len[recipe_build_n] = a1_len
+            recipe_build_n = recipe_build_n + 1
+        elif dlen == 5 and _streq_n(dp, cast[Ptr[uint8]]("cache"), 5) != 0:
+            # cache yes|no
+            a0: uint64 = ls
+            while ls < vend and recipe_buf[ls] != 32 and recipe_buf[ls] != 9:
+                ls = ls + 1
+            a0_len: uint64 = ls - a0
+            if a0_len == 2 and recipe_buf[a0] == 110 and recipe_buf[a0 + 1] == 111:
+                recipe_cache_ok = 0                       # "no"
+            else:
+                recipe_cache_ok = 1
+        else:
+            write_str(2, "hpm: recipe: unknown directive (ignored)\n")
+        p = lend + 1
+    if recipe_build_n == 0:
+        write_str(2, "hpm: recipe: no `build` directives\n")
+        return -1
+    return 0
+
+
+# Compose <staging>/<rel> into `dst`, with a path-safety check on <rel>.
+# `mid` is an optional middle segment (e.g. "files/") inserted between
+# the staging root and <rel>; pass an empty cstring for none. Returns 0
+# on success, -1 on overflow / unsafe rel.
+def _compose_staged(dst: Ptr[uint8], dcap: uint64,
+                    staging_root: Ptr[uint8], mid: Ptr[uint8],
+                    rel: Ptr[uint8], rel_len: uint64) -> int32:
+    # Path safety on rel: NUL-terminate a copy + reuse _entry_name_is_unsafe.
+    safe: Array[256, uint8]
+    sl: uint64 = rel_len
+    if sl >= 256:
+        sl = 255
+    si: uint64 = 0
+    while si < sl:
+        safe[si] = rel[si]
+        si = si + 1
+    safe[sl] = 0
+    if _entry_name_is_unsafe(&safe[0]) != 0:
+        write_str(2, "hpm: recipe: refusing unsafe path: ")
+        write_str(2, &safe[0])
+        write_str(2, "\n")
+        return -1
+    p: uint64 = 0
+    ri: uint64 = 0
+    while staging_root[ri] != 0 and p + 1 < dcap:
+        dst[p] = staging_root[ri]
+        p = p + 1
+        ri = ri + 1
+    dst[p] = 47
+    p = p + 1
+    mi: uint64 = 0
+    while mid[mi] != 0 and p + 1 < dcap:
+        dst[p] = mid[mi]
+        p = p + 1
+        mi = mi + 1
+    ki: uint64 = 0
+    while ki < rel_len and p + 1 < dcap:
+        dst[p] = rel[ki]
+        p = p + 1
+        ki = ki + 1
+    dst[p] = 0
+    return 0
+
+
+# Spawn /bin/adder_cc <src_full> <out_full> and wait. Returns 0 on a
+# zero exit, -1 otherwise.
+def _spawn_adder_cc(src_full: Ptr[uint8], out_full: Ptr[uint8]) -> int32:
+    # Make sure the destination directory (files/<...>'s parent) exists.
+    _dirname_mkdir_p(out_full)
+    cc_argv_buf[0] = cast[uint64](_adder_cc_path())
+    cc_argv_buf[1] = cast[uint64](src_full)
+    cc_argv_buf[2] = cast[uint64](out_full)
+    cc_argv_buf[3] = 0
+    pid: int32 = sys_spawn(cast[Ptr[char]](_adder_cc_path()),
+                           &cc_argv_buf[0], 0, 1, cast[Ptr[uint64]](0))
+    if pid < 0:
+        write_str(2, "hpm: cannot spawn the on-box Adder compiler (")
+        write_str(2, _adder_cc_path())
+        write_str(2, ")\n")
+        return -1
+    code: int64 = sys_waitpid(pid)
+    if code != 0:
+        write_str(2, "hpm: on-box compile failed (adder_cc exit ")
+        write_dec_u64(2, cast[uint64](code))
+        write_str(2, ")\n")
+        return -1
+    return 0
+
+
+# True if the file at `path` exists (and is openable for read).
+def _file_exists(path: Ptr[uint8]) -> int32:
+    fd: int32 = sys_open(cast[Ptr[char]](path))
+    if fd < 0:
+        return 0
+    sys_close(fd)
+    return 1
+
+
+# Copy the file at src_path to dst_path (mkdir -p dst's parent first).
+# Streams through tar_buf's tail as a scratch window is risky (it holds
+# the live archive); use a dedicated BSS buffer. Returns 0 on success.
+srccopy_buf: Array[131072, uint8]
+
+
+def _copy_file_path(src_path: Ptr[uint8], dst_path: Ptr[uint8]) -> int32:
+    sfd: int32 = sys_open(cast[Ptr[char]](src_path))
+    if sfd < 0:
+        write_str(2, "hpm: cannot open compiled binary ")
+        write_str(2, src_path)
+        write_str(2, "\n")
+        return -1
+    _dirname_mkdir_p(dst_path)
+    dfd: int32 = sys_open_write(cast[Ptr[char]](dst_path))
+    if dfd < 0:
+        write_str(2, "hpm: cannot create ")
+        write_str(2, dst_path)
+        write_str(2, "\n")
+        sys_close(sfd)
+        return -1
+    while True:
+        n: int64 = sys_read(sfd, &srccopy_buf[0], 131072)
+        if n <= 0:
+            break
+        wn: int64 = _write_full(dfd, &srccopy_buf[0], cast[uint64](n))
+        if wn < 0 or wn != n:
+            write_str(2, "hpm: short write installing compiled binary\n")
+            sys_close(sfd)
+            sys_close(dfd)
+            return -1
+    sys_close(sfd)
+    sys_close(dfd)
+    return 0
+
+
+# Orchestrate a source-package build: load + parse the recipe, then for
+# each build directive either reuse a prebuilt files/<out> cache artifact
+# or compile <src> on-box into files/<out>; then install the resulting
+# binary at <target_prefix><out> and record it in new_files_*. Returns:
+#   1  — this WAS a source package and its build succeeded,
+#   0  — NOT a source package (no recipe present); caller continues with
+#        the normal binary-install path,
+#  -1  — source package but the build failed.
+def _build_source_package(staging_root: Ptr[uint8],
+                          target_prefix: Ptr[uint8]) -> int32:
+    lr: int32 = _recipe_load(staging_root)
+    if lr < 0:
+        return -1
+    if lr == 0:
+        return 0                                          # plain binary pkg
+    write_str(1, "hpm: source package — compiling on-box via ")
+    write_str(1, _adder_cc_path())
+    write_str(1, "\n")
+    if _recipe_parse() != 0:
+        return -1
+    bi: uint64 = 0
+    while bi < recipe_build_n:
+        # Compose the staged output path "<staging>/files/<out>".
+        if _compose_staged(&out_full_buf[0], 640, staging_root,
+                           cast[Ptr[uint8]]("files/"),
+                           &recipe_buf[recipe_out_off[bi]],
+                           recipe_out_len[bi]) != 0:
+            return -1
+        # Optional binary cache: if files/<out> already shipped in the
+        # tarball AND the recipe permits it, reuse it instead of compiling.
+        cache_hit: int32 = 0
+        if recipe_cache_ok != 0 and _file_exists(&out_full_buf[0]) != 0:
+            cache_hit = 1
+            write_str(1, "hpm:   cache hit: ")
+            sys_write(1, &recipe_buf[recipe_out_off[bi]], recipe_out_len[bi])
+            write_str(1, " (prebuilt binary; skipping compile)\n")
+        if cache_hit == 0:
+            if _compose_staged(&src_full_buf[0], 640, staging_root,
+                               cast[Ptr[uint8]](""),
+                               &recipe_buf[recipe_src_off[bi]],
+                               recipe_src_len[bi]) != 0:
+                return -1
+            write_str(1, "hpm:   compiling ")
+            sys_write(1, &recipe_buf[recipe_src_off[bi]], recipe_src_len[bi])
+            write_str(1, " -> files/")
+            sys_write(1, &recipe_buf[recipe_out_off[bi]], recipe_out_len[bi])
+            write_str(1, "\n")
+            if _spawn_adder_cc(&src_full_buf[0], &out_full_buf[0]) != 0:
+                return -1
+            if _file_exists(&out_full_buf[0]) == 0:
+                write_str(2, "hpm: on-box compile produced no output\n")
+                return -1
+
+        # Install the compiled (or cached) binary at <target_prefix><out>.
+        # tgt_full_buf = "<target_prefix><out>".
+        po: uint64 = 0
+        ti: uint64 = 0
+        while target_prefix[ti] != 0 and po + 1 < 640:
+            tgt_full_buf[po] = target_prefix[ti]
+            po = po + 1
+            ti = ti + 1
+        oi: uint64 = 0
+        while oi < recipe_out_len[bi] and po + 1 < 640:
+            tgt_full_buf[po] = recipe_buf[recipe_out_off[bi] + oi]
+            po = po + 1
+            oi = oi + 1
+        tgt_full_buf[po] = 0
+        if _copy_file_path(&out_full_buf[0], &tgt_full_buf[0]) != 0:
+            return -1
+        # Record the install-relative path (the <out> under files/) so
+        # `hpm list` / `hpm remove` track the compiled binary like any
+        # other installed file.
+        if _new_files_record(&recipe_buf[recipe_out_off[bi]],
+                             recipe_out_len[bi]) != 0:
+            return -1
+        write_str(1, "hpm:   installed ")
+        sys_write(1, &recipe_buf[recipe_out_off[bi]], recipe_out_len[bi])
+        write_str(1, "\n")
+        bi = bi + 1
+    return 1
+
+
 # Install one resolved package by repo index. Reuses the Phase 3
 # install flow but takes the repo idx directly (rather than parsing
 # a name@ver spec). Returns 0 on success.
@@ -6080,6 +6458,19 @@ def _install_one_by_repo_idx(pi: uint64, pinned: int32) -> int32:
         return 1
 
     _new_files_reset()
+
+    # #186 SOURCE package: if the staged tree carries a `recipe`, compile
+    # its .ad source ON-BOX into files/<out>, then install the compiled
+    # binary at <target_prefix><out> and record it. A plain binary
+    # package has no recipe and skips this entirely (return 0). A prebuilt
+    # files/<out> cache artifact in the tarball is reused when present
+    # (the optional binary-cache path). The compiled outputs are appended
+    # to new_files_* BEFORE the tarball's own files/ entries below.
+    src_rc: int32 = _build_source_package(&staging_root_buf[0],
+                                          &target_prefix_buf[0])
+    if src_rc < 0:
+        return 1
+
     if _stage_extract_files(tar_len, &target_prefix_buf[0]) != 0:
         return 1
     write_str(1, "hpm: extracted ")

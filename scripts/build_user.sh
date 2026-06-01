@@ -255,3 +255,16 @@ python3 -m compiler.adder compile \
     adder/compiler/codegen_ac_driver.ad \
     -o build/user/codegen_ac_driver.elf
 file build/user/codegen_ac_driver.elf
+
+# --- adder_cc: generic ON-BOX Adder compiler tool --------------------
+# Same self-hosted pipeline as codegen_ac_driver, but takes the input +
+# output paths from argv and WRITES the emitted ELF straight to a file
+# on the local fs (no serial round-trip). This is the front-end `hpm`
+# spawns to compile a SOURCE package on the box (#186). Staged at
+# /bin/adder_cc.
+echo "[build_user] compiling adder/compiler/adder_cc_driver.ad -> build/user/adder_cc.elf"
+python3 -m compiler.adder compile \
+    --target=x86_64-adder-user \
+    adder/compiler/adder_cc_driver.ad \
+    -o build/user/adder_cc.elf
+file build/user/adder_cc.elf
