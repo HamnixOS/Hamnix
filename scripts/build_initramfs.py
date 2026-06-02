@@ -193,6 +193,14 @@ if os.environ.get("ENABLE_TCP_LOOPBACK_SMOKE") == "1":
 if os.environ.get("ENABLE_TCP_TEST") == "1":
     FILES.append(("/etc/tcp-test", b"1\n"))
 
+# #173: ELF process core dumps. scripts/test_coredump.sh sets
+# ENABLE_COREDUMP_TEST=1 to plant /etc/coredump-test; init/main.ad's
+# boot:30.d gate confirms kernel/core/coredump.ad linked and announces
+# the u_coredump fixture, which deliberately SIGSEGVs with no handler so
+# the kernel writes /tmp/core, then re-reads + validates the ELF.
+if os.environ.get("ENABLE_COREDUMP_TEST") == "1":
+    FILES.append(("/etc/coredump-test", b"1\n"))
+
 # DHCP renew/rebind/expiry smoke. Gated the same way as the TLS / TCP
 # ring markers above. The renew smoke leaves DHCP state at IDLE on
 # exit, which breaks any downstream test that requires state == BOUND

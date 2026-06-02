@@ -1,0 +1,477 @@
+# kernel/core/coredump.ad
+#
+# #173 observability — ELF process core dumps.
+#
+# When a user task dies from a fatal, unhandled fault signal (SIGSEGV,
+# SIGABRT, SIGILL, SIGFPE, SIGBUS) with NO installed handler, the kernel
+# writes a standard ELF ET_CORE file capturing the task's register state
+# and the bytes of every readable VMA region, so the crash can be
+# inspected post-mortem (the way `gdb ./prog core` works on Linux).
+#
+# Before this, the only post-mortem artefact was a Plan-9 sysnote
+# (kernel/.../sysnote.ad) — a one-line text note, not a real core image.
+#
+# Where this runs
+#
+#   coredump_write_current() is called from kernel/sched/core.ad at the
+#   two fatal-terminate sites, BEFORE task_exit_current() tears the task
+#   down (closes fds, drops the address space). At that instant the
+#   faulting task is still `current`, its VMA list and page tables are
+#   intact, and the CPU iret frame from the fault is available — so the
+#   dump reads ground truth.
+#
+# Core file path
+#
+#   A fixed path "/tmp/core" in the in-RAM tmpfs (writable AND readable
+#   by any task, no on-disk backend required). A debugger / the self-test
+#   re-opens it with a normal open()/read(). V1 uses one fixed name; a
+#   future revision can switch to "/core.<pid>".
+#
+# Size cap
+#
+#   To stop a process with a huge mapping (e.g. a multi-GiB mmap) from
+#   producing a gigantic core, the TOTAL dumped segment bytes are capped
+#   at _CD_MAX_BYTES (16 MiB — exactly the tmpfs per-file cap). Once the
+#   budget is exhausted, further VMA regions are recorded with a PT_LOAD
+#   header but zero p_filesz (memsz preserved), and no bytes are copied —
+#   mirroring how Linux truncates a core that exceeds RLIMIT.
+#
+# ELF layout produced
+#
+#   [ Elf64_Ehdr                       ]  e_type = ET_CORE, mach = x86_64
+#   [ Phdr 0: PT_NOTE                   ]  -> NT_PRSTATUS (CORE)
+#   [ Phdr 1..N: PT_LOAD per VMA region ]
+#   [ PT_NOTE contents (prstatus note)  ]
+#   [ PT_LOAD 0 bytes ... PT_LOAD N-1   ]
+#
+# All multi-byte fields are little-endian (x86_64), written by byte
+# stores so the encoding is explicit and self-consistent.
+#
+# NOTE: every top-level name here is module-private (leading '_') so it
+# can't collide with the ELF constants other modules (linux_abi/loader,
+# fs/elf, ...) already export globally. Only the two entry points
+# (coredump_write_current / coredump_is_fatal_sig) are public.
+
+from kernel.printk.printk import printk0, printk1, printk_set_level
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
+from kernel.sched.core import (
+    current_idx_get, current_task_pid,
+    task_image_lo, task_image_hi,
+    task_ustack_lo, task_ustack_sz,
+    task_brk_base, task_brk_end,
+)
+from mm.vma import (
+    vma_iter_first, vma_iter_next,
+    vma_node_start, vma_node_end, vma_node_prot,
+    vma_page_present,
+)
+from fs.tmpfs import (
+    tmpfs_open_for_write, tmpfs_write,
+)
+
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
+# ---------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------
+
+_CD_ET_CORE:      uint16 = 4
+_CD_EM_X86_64:    uint16 = 62
+_CD_EV_CURRENT:   uint32 = 1
+_CD_ELFCLASS64:   uint8  = 2
+_CD_ELFDATA2LSB:  uint8  = 1
+
+_CD_PT_LOAD:      uint32 = 1
+_CD_PT_NOTE:      uint32 = 4
+
+# PF_* segment permission flags (ELF program-header p_flags).
+_CD_PF_X:         uint32 = 0x1
+_CD_PF_W:         uint32 = 0x2
+_CD_PF_R:         uint32 = 0x4
+
+_CD_NT_PRSTATUS:  uint32 = 1
+
+_CD_EHDR_SZ:      uint64 = 64
+_CD_PHDR_SZ:      uint64 = 56
+
+_CD_PAGE_SIZE:    uint64 = 0x1000
+
+# PROT_* mirror of mm/vma.ad (advisory; we treat any non-NONE region as
+# dumpable and skip pages that aren't physically present).
+_CD_PROT_READ:    int32 = 0x1
+_CD_PROT_WRITE:   int32 = 0x2
+_CD_PROT_EXEC:    int32 = 0x4
+
+# Total dumped segment-byte budget. Matches the tmpfs per-file cap so a
+# core never short-writes mid-segment for lack of file space.
+_CD_MAX_BYTES:    uint64 = 16777216         # 16 MiB
+
+# Hard ceiling on the number of PT_LOAD program headers (one per VMA).
+# A single user process accrues ~12 VMAs; 128 is generous headroom and
+# bounds the header-buffer size below.
+_CD_MAX_SEGMENTS: int32 = 128
+
+# elf_prstatus layout (Linux <sys/procfs.h> on x86_64). We zero-fill the
+# whole struct and populate only pr_reg; the offsets below are the ones
+# a reader (gdb, the self-test) uses to find the registers.
+#   pr_reg (elf_gregset_t) starts at byte 112 and is 27 * 8 = 216 bytes.
+_CD_PRSTATUS_SZ:      uint64 = 336
+_CD_PRSTATUS_REG_OFF: uint64 = 112
+
+# elf_gregset_t register-index slots (user_regs_struct order on x86_64).
+_CD_GREG_RIP:    uint64 = 16
+_CD_GREG_CS:     uint64 = 17
+_CD_GREG_EFLAGS: uint64 = 18
+_CD_GREG_RSP:    uint64 = 19
+_CD_GREG_SS:     uint64 = 20
+
+# ---------------------------------------------------------------------
+# Module-scope flat buffers
+# ---------------------------------------------------------------------
+#
+# Per the Adder compiler-quirk log, sizable buffers must be top-level
+# module-scope flat byte Arrays (nested frame-local Arrays miscompile).
+#
+#   _cd_hdr  — the whole ELF prologue: Ehdr (64) + (1 + MAX_SEGMENTS)
+#              phdrs. 64 + 129*56 = 7288 bytes; round to 8192.
+#   _cd_note — the PT_NOTE payload: 12-byte Elf64_Nhdr + "CORE\0" padded
+#              to 8 + prstatus (336). 384 is ample.
+#   _cd_copy — a 4 KiB staging page for copying VMA bytes out one page at
+#              a time (tmpfs_write takes a kernel src pointer).
+_CD_HDR_CAP:  uint64 = 8192
+_CD_NOTE_CAP: uint64 = 384
+
+_cd_hdr:  Array[8192, uint8]
+_cd_note: Array[384, uint8]
+_cd_copy: Array[4096, uint8]
+
+# Collected dumpable regions: the three fixed task segments (loaded ELF
+# image, brk heap, user stack) PLUS every VMA. Parallel flat arrays
+# (start / end / prot), module-scope per the nested-Array caveat. Sized
+# to 3 fixed + _CD_MAX_SEGMENTS VMAs.
+_CD_MAX_REGIONS: int32 = 131                 # 3 + 128
+_cd_rstart: Array[131, uint64]
+_cd_rend:   Array[131, uint64]
+_cd_rprot:  Array[131, int32]
+_cd_nreg:   int32
+
+# ---------------------------------------------------------------------
+# Little-endian byte stores into a flat buffer at an explicit offset
+# ---------------------------------------------------------------------
+
+def _cd_put_u16(buf: Ptr[uint8], off: uint64, v: uint16):
+    buf[off]     = cast[uint8](v & 0xFF)
+    buf[off + 1] = cast[uint8]((v >> 8) & 0xFF)
+
+
+def _cd_put_u32(buf: Ptr[uint8], off: uint64, v: uint32):
+    buf[off]     = cast[uint8](v & 0xFF)
+    buf[off + 1] = cast[uint8]((v >> 8) & 0xFF)
+    buf[off + 2] = cast[uint8]((v >> 16) & 0xFF)
+    buf[off + 3] = cast[uint8]((v >> 24) & 0xFF)
+
+
+def _cd_put_u64(buf: Ptr[uint8], off: uint64, v: uint64):
+    buf[off]     = cast[uint8](v & 0xFF)
+    buf[off + 1] = cast[uint8]((v >> 8) & 0xFF)
+    buf[off + 2] = cast[uint8]((v >> 16) & 0xFF)
+    buf[off + 3] = cast[uint8]((v >> 24) & 0xFF)
+    buf[off + 4] = cast[uint8]((v >> 32) & 0xFF)
+    buf[off + 5] = cast[uint8]((v >> 40) & 0xFF)
+    buf[off + 6] = cast[uint8]((v >> 48) & 0xFF)
+    buf[off + 7] = cast[uint8]((v >> 56) & 0xFF)
+
+
+def _cd_greg(reg: uint64, v: uint64):
+    # Store one elf_gregset_t register slot into the prstatus note buffer.
+    # The prstatus DESC starts at note offset 20 (12-byte Elf64_Nhdr +
+    # 8-byte padded "CORE\0" name); pr_reg is at desc+112; register `reg`
+    # is at pr_reg + reg*8.
+    off: uint64 = 20 + _CD_PRSTATUS_REG_OFF + reg * 8
+    _cd_put_u64(&_cd_note[0], off, v)
+
+
+# ---------------------------------------------------------------------
+# p_flags from a VMA prot mask
+# ---------------------------------------------------------------------
+
+def _cd_pflags(prot: int32) -> uint32:
+    f: uint32 = 0
+    if (prot & _CD_PROT_READ) != 0:
+        f = f | _CD_PF_R
+    if (prot & _CD_PROT_WRITE) != 0:
+        f = f | _CD_PF_W
+    if (prot & _CD_PROT_EXEC) != 0:
+        f = f | _CD_PF_X
+    # An anonymous data VMA records PROT_NONE in some paths but is still
+    # readable memory worth dumping; default to R so the segment is
+    # marked readable in the core.
+    if f == 0:
+        f = _CD_PF_R
+    return f
+
+
+# ---------------------------------------------------------------------
+# The PT_NOTE payload: one NT_PRSTATUS note ("CORE")
+# ---------------------------------------------------------------------
+
+def _cd_build_note(iret_frame: Ptr[uint64]):
+    # Layout of _cd_note:
+    #   [0]  Elf64_Nhdr: n_namesz=5, n_descsz=PRSTATUS_SZ, n_type=NT_PRSTATUS
+    #   [12] "CORE\0" padded to 8 bytes (name is 4-byte aligned -> 8)
+    #   [20] prstatus (336 bytes), pr_reg at +112
+    # Total = 12 + 8 + 336 = 356 bytes.
+    memset(&_cd_note[0], 0, _CD_NOTE_CAP)
+
+    # Elf64_Nhdr (note descriptor sizes EXCLUDE padding, per the ELF
+    # note convention — the consumer rounds namesz/descsz up to 4).
+    _cd_put_u32(&_cd_note[0], 0, cast[uint32](5))             # n_namesz "CORE\0"
+    _cd_put_u32(&_cd_note[0], 4, cast[uint32](_CD_PRSTATUS_SZ))  # n_descsz
+    _cd_put_u32(&_cd_note[0], 8, _CD_NT_PRSTATUS)            # n_type
+
+    # name "CORE\0" at offset 12 (already zeroed beyond the NUL).
+    _cd_note[12] = 67                                        # 'C'
+    _cd_note[13] = 79                                        # 'O'
+    _cd_note[14] = 82                                        # 'R'
+    _cd_note[15] = 69                                        # 'E'
+    _cd_note[16] = 0
+
+    # prstatus.pr_reg — populate from the fault iret frame when present.
+    # The iret frame (arch/x86/kernel/trap_asm.S) is the ascending quad
+    # run: [0]=RIP [1]=CS [2]=RFLAGS [3]=RSP [4]=SS. The general-purpose
+    # registers (rax/rbx/...) are not threaded through to this site, so
+    # they are left zero — RIP/RSP/RFLAGS/CS/SS are the load-bearing
+    # post-mortem state and are captured exactly.
+    if iret_frame != cast[Ptr[uint64]](0):
+        _cd_greg(_CD_GREG_RIP,    iret_frame[0])
+        _cd_greg(_CD_GREG_CS,     iret_frame[1])
+        _cd_greg(_CD_GREG_EFLAGS, iret_frame[2])
+        _cd_greg(_CD_GREG_RSP,    iret_frame[3])
+        _cd_greg(_CD_GREG_SS,     iret_frame[4])
+
+
+def _cd_note_total() -> uint64:
+    # 12-byte nhdr + 8-byte padded name + prstatus.
+    return 12 + 8 + _CD_PRSTATUS_SZ
+
+
+# ---------------------------------------------------------------------
+# Region collection
+# ---------------------------------------------------------------------
+
+def _cd_add_region(start: uint64, end: uint64, prot: int32):
+    # Append one [start, end) region (if non-empty and there is room).
+    if end <= start:
+        return
+    if _cd_nreg >= _CD_MAX_REGIONS:
+        return
+    iu: uint64 = cast[uint64](_cd_nreg)
+    _cd_rstart[iu] = start
+    _cd_rend[iu]   = end
+    _cd_rprot[iu]  = prot
+    _cd_nreg = _cd_nreg + 1
+
+
+def _cd_collect_regions(slot: uint64):
+    # Gather every dumpable region of the current task into the parallel
+    # _cd_r* arrays. The three FIXED segments come first (loaded ELF
+    # image = code+data+bss where the program's globals live, the brk
+    # heap, and the user stack) because they are mapped by direct
+    # page-table surgery (fs/elf.ad) and are NOT in the VMA list — a
+    # VMA-only dump would miss the program's own .data/.bss. Then every
+    # VMA (mmap / ld.so reservations) is appended.
+    _cd_nreg = 0
+
+    # 1) loaded ELF image (RX/RW — record as R|W|X; advisory).
+    img_lo: uint64 = task_image_lo(slot)
+    img_hi: uint64 = task_image_hi(slot)
+    _cd_add_region(img_lo, img_hi,
+                   _CD_PROT_READ | _CD_PROT_WRITE | _CD_PROT_EXEC)
+
+    # 2) brk heap.
+    bk_lo: uint64 = task_brk_base(slot)
+    bk_hi: uint64 = task_brk_end(slot)
+    _cd_add_region(bk_lo, bk_hi, _CD_PROT_READ | _CD_PROT_WRITE)
+
+    # 3) user stack.
+    st_lo: uint64 = task_ustack_lo(slot)
+    st_sz: uint64 = task_ustack_sz(slot)
+    _cd_add_region(st_lo, st_lo + st_sz, _CD_PROT_READ | _CD_PROT_WRITE)
+
+    # 4) every VMA.
+    node: uint64 = vma_iter_first(slot)
+    while node != 0:
+        s: uint64 = vma_node_start(node)
+        e: uint64 = vma_node_end(node)
+        _cd_add_region(s, e, vma_node_prot(node))
+        node = vma_iter_next(node)
+
+
+# ---------------------------------------------------------------------
+# Main entry
+# ---------------------------------------------------------------------
+
+def coredump_write_current(sig: uint64, iret_frame: Ptr[uint64]) -> int32:
+    # Write an ELF ET_CORE image of the CURRENT (faulting) task to
+    # /tmp/core. Returns 0 on success, negative on failure. Best-effort:
+    # a failure here must never block the subsequent task teardown.
+    slot: uint64 = current_idx_get()
+    pid:  uint64 = current_task_pid()
+
+    # EMERG so the marker survives the interactive-prompt log gating
+    # (printk_set_level is a ONE-SHOT, so each line that must reach the
+    # live console stamps its own level — see kernel/printk/printk.ad).
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk1("[coredump] pid=%d capturing core...\n", pid)
+
+    # --- collect dumpable regions (image + heap + stack + VMAs) -----
+    _cd_collect_regions(slot)
+    nseg: int32 = _cd_nreg
+
+    # phnum = 1 (PT_NOTE) + nseg (PT_LOAD).
+    phnum: int32 = 1 + nseg
+
+    # --- build the PT_NOTE payload now (we need its size) -----------
+    _cd_build_note(iret_frame)
+    note_sz: uint64 = _cd_note_total()
+
+    # --- lay out file offsets ---------------------------------------
+    # Ehdr, then the phdr table, then the note, then the segment bytes.
+    hdr_sz:   uint64 = _CD_EHDR_SZ + cast[uint64](phnum) * _CD_PHDR_SZ
+    note_off: uint64 = hdr_sz
+    data_off: uint64 = note_off + note_sz
+
+    # --- Elf64_Ehdr -------------------------------------------------
+    memset(&_cd_hdr[0], 0, _CD_HDR_CAP)
+    _cd_hdr[0] = 0x7F
+    _cd_hdr[1] = 69                               # 'E'
+    _cd_hdr[2] = 76                               # 'L'
+    _cd_hdr[3] = 70                               # 'F'
+    _cd_hdr[4] = _CD_ELFCLASS64
+    _cd_hdr[5] = _CD_ELFDATA2LSB
+    _cd_hdr[6] = cast[uint8](_CD_EV_CURRENT)      # e_ident[EI_VERSION]
+    _cd_put_u16(&_cd_hdr[0], 16, _CD_ET_CORE)     # e_type
+    _cd_put_u16(&_cd_hdr[0], 18, _CD_EM_X86_64)   # e_machine
+    _cd_put_u32(&_cd_hdr[0], 20, _CD_EV_CURRENT)  # e_version
+    _cd_put_u64(&_cd_hdr[0], 24, 0)               # e_entry (n/a for core)
+    _cd_put_u64(&_cd_hdr[0], 32, _CD_EHDR_SZ)     # e_phoff
+    _cd_put_u64(&_cd_hdr[0], 40, 0)               # e_shoff
+    _cd_put_u32(&_cd_hdr[0], 48, 0)               # e_flags
+    _cd_put_u16(&_cd_hdr[0], 52, cast[uint16](_CD_EHDR_SZ))   # e_ehsize
+    _cd_put_u16(&_cd_hdr[0], 54, cast[uint16](_CD_PHDR_SZ))   # e_phentsize
+    _cd_put_u16(&_cd_hdr[0], 56, cast[uint16](phnum))        # e_phnum
+    _cd_put_u16(&_cd_hdr[0], 58, 0)               # e_shentsize
+    _cd_put_u16(&_cd_hdr[0], 60, 0)               # e_shnum
+    _cd_put_u16(&_cd_hdr[0], 62, 0)               # e_shstrndx
+
+    # --- Phdr 0: PT_NOTE --------------------------------------------
+    ph0: uint64 = _CD_EHDR_SZ
+    _cd_put_u32(&_cd_hdr[0], ph0 + 0,  _CD_PT_NOTE)    # p_type
+    _cd_put_u32(&_cd_hdr[0], ph0 + 4,  _CD_PF_R)       # p_flags
+    _cd_put_u64(&_cd_hdr[0], ph0 + 8,  note_off)       # p_offset
+    _cd_put_u64(&_cd_hdr[0], ph0 + 16, 0)              # p_vaddr
+    _cd_put_u64(&_cd_hdr[0], ph0 + 24, 0)              # p_paddr
+    _cd_put_u64(&_cd_hdr[0], ph0 + 32, note_sz)        # p_filesz
+    _cd_put_u64(&_cd_hdr[0], ph0 + 40, note_sz)        # p_memsz
+    _cd_put_u64(&_cd_hdr[0], ph0 + 48, 0)              # p_align
+
+    # --- Phdr 1..N: one PT_LOAD per collected region ----------------
+    # We honour the global byte budget: once exhausted a region's
+    # p_filesz is 0 (header recorded, no bytes copied).
+    seg_off:  uint64 = data_off
+    budget:   uint64 = _CD_MAX_BYTES
+    phi:      int32  = 0
+    while phi < nseg:
+        pu: uint64 = cast[uint64](phi)
+        s2: uint64 = _cd_rstart[pu]
+        e2: uint64 = _cd_rend[pu]
+        length2: uint64 = e2 - s2
+        take2: uint64 = length2
+        if take2 > budget:
+            take2 = budget
+
+        phx: uint64 = _CD_EHDR_SZ + cast[uint64](1 + phi) * _CD_PHDR_SZ
+        _cd_put_u32(&_cd_hdr[0], phx + 0,  _CD_PT_LOAD)
+        _cd_put_u32(&_cd_hdr[0], phx + 4,  _cd_pflags(_cd_rprot[pu]))
+        _cd_put_u64(&_cd_hdr[0], phx + 8,  seg_off)       # p_offset
+        _cd_put_u64(&_cd_hdr[0], phx + 16, s2)            # p_vaddr
+        _cd_put_u64(&_cd_hdr[0], phx + 24, 0)             # p_paddr
+        _cd_put_u64(&_cd_hdr[0], phx + 32, take2)         # p_filesz
+        _cd_put_u64(&_cd_hdr[0], phx + 40, length2)       # p_memsz
+        _cd_put_u64(&_cd_hdr[0], phx + 48, _CD_PAGE_SIZE) # p_align
+
+        seg_off = seg_off + take2
+        budget  = budget - take2
+        phi = phi + 1
+
+    # --- open /tmp/core (tmpfs, truncating) -------------------------
+    cpath: Ptr[char] = "/tmp/core"
+    fslot: int32 = tmpfs_open_for_write(cpath)
+    if fslot < 0:
+        printk1("[coredump] open /tmp/core failed rc=%d\n",
+                cast[uint64](fslot))
+        return -1
+
+    # --- write the header block + note ------------------------------
+    pos: uint64 = 0
+    w1: uint64 = tmpfs_write(fslot, &_cd_hdr[0], pos, hdr_sz)
+    pos = pos + w1
+    w2: uint64 = tmpfs_write(fslot, &_cd_note[0], pos, note_sz)
+    pos = pos + w2
+
+    # --- write each region's bytes, page by page --------------------
+    # Iterate the SAME collected regions in the SAME order so the bytes
+    # land at exactly the p_offset recorded above. The byte budget is
+    # re-applied identically.
+    budget3:  uint64 = _CD_MAX_BYTES
+    phw:      int32  = 0
+    while phw < nseg:
+        wu: uint64 = cast[uint64](phw)
+        s3: uint64 = _cd_rstart[wu]
+        e3: uint64 = _cd_rend[wu]
+        length3: uint64 = e3 - s3
+        take3: uint64 = length3
+        if take3 > budget3:
+            take3 = budget3
+        # Copy [s3, s3+take3) page by page. A page that isn't present in
+        # the task's page table (unbacked / not-yet-faulted, or a
+        # huge-page leaf the 4K walk can't read) is dumped as zeros so
+        # the segment's file length stays consistent with the p_filesz
+        # recorded above.
+        done: uint64 = 0
+        while done < take3:
+            chunk: uint64 = take3 - done
+            if chunk > _CD_PAGE_SIZE:
+                chunk = _CD_PAGE_SIZE
+            vaddr: uint64 = s3 + done
+            pbase: uint64 = vaddr & ~(_CD_PAGE_SIZE - 1)
+            if vma_page_present(slot, pbase) != 0:
+                memcpy(&_cd_copy[0], cast[Ptr[uint8]](vaddr), chunk)
+            else:
+                memset(&_cd_copy[0], 0, chunk)
+            wn: uint64 = tmpfs_write(fslot, &_cd_copy[0], pos, chunk)
+            pos  = pos + wn
+            done = done + chunk
+            if wn < chunk:
+                # tmpfs short-write (file cap hit) — stop cleanly.
+                done = take3
+        budget3 = budget3 - take3
+        phw = phw + 1
+
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk1("[coredump] wrote /tmp/core size=%d\n", pos)
+    return 0
+
+
+# ---------------------------------------------------------------------
+# Fatal-signal predicate
+# ---------------------------------------------------------------------
+
+def coredump_is_fatal_sig(sig: uint64) -> int32:
+    # 1 iff `sig` is a fault signal whose default disposition is
+    # "terminate + dump core": SIGILL(4), SIGABRT(6), SIGFPE(8),
+    # SIGSEGV(11), SIGBUS(7). Mirrors Linux's SIG_KERNEL_COREDUMP_MASK.
+    if sig == 4 or sig == 6 or sig == 7 or sig == 8 or sig == 11:
+        return 1
+    return 0
