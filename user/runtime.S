@@ -862,6 +862,24 @@ sys_wsys_free:
     .size sys_wsys_free, .-sys_wsys_free
 
 
+    /* --- sys_vk_window_frame(wid, reserved, frame) -> int64 ---------
+     * GPU track #183: ask the kernel to render native Vulkan frame
+     * `frame` into window `wid`'s draw-surface fb layer "vk". lib/vk is
+     * a kernel-only library, so the RENDER runs in the kernel; the
+     * COMPOSITE runs in this userland desktop daemon (hamUId), bridged
+     * by the per-window draw surface this populates. 3-arg form: SysV
+     * arg regs rdi/rsi/rdx already match the syscall a0/a1/a2 ABI, so no
+     * shuffle is needed. Returns 0 on success or -1 on failure.
+     * Number 312 (next free after SYS_NICE=311). Hostowner-only. */
+    .globl sys_vk_window_frame
+    .type sys_vk_window_frame, @function
+sys_vk_window_frame:
+    movq    $312, %rax              /* SYS_VK_WINDOW_FRAME */
+    syscall
+    ret
+    .size sys_vk_window_frame, .-sys_vk_window_frame
+
+
     /* --- sys_pipechan() -> int32 ------------------------------------
      * HAMSH §7: create a local pipe Chan pair; returns the pipe SLOT
      * id (NOT fds). The shell threads the slot into two sys_fdbind
