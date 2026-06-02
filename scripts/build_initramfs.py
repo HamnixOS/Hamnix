@@ -837,6 +837,15 @@ if os.environ.get("ENABLE_RUCHILD_TEST"):
 if os.environ.get("ENABLE_RLIMIT_TEST"):
     FILES.append(("/etc/rlimit-test", b"1\n"))
 
+# getpriority(2)/setpriority(2) round-trip self-test. scripts/test_priosys.sh
+# sets ENABLE_PRIOSYS_TEST=1 to plant /etc/priosys-test. init/main.ad detects
+# the marker and calls priority_syscall_selftest() (linux_abi/u_syscalls.ad):
+# it SETs nice=5 via setpriority, asserts the real per-task nice store took
+# it, GETs it back via getpriority (biased 20-nice ABI form == 15), restores
+# the saved nice, then emits the [PRIOSYS] PASS banner. Default boots omit it.
+if os.environ.get("ENABLE_PRIOSYS_TEST"):
+    FILES.append(("/etc/priosys-test", b"1\n"))
+
 # vsize/rss + ru_maxrss self-test. scripts/test_vmstat.sh sets
 # ENABLE_VMSTAT_TEST=1 to plant /etc/vmstat-test. init/main.ad at
 # boot:37.vmstat detects the marker and calls vmstat_selftest()
