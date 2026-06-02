@@ -469,6 +469,16 @@ if os.environ.get("ENABLE_EXT4_JOURNAL_TEST") == "1":
 if os.environ.get("ENABLE_EXT4DIR_TEST") == "1":
     FILES.append(("/etc/ext4dir-test", b"1\n"))
 
+# ext4 mkdir self-test. scripts/test_ext4_mkdir.sh sets
+# ENABLE_EXT4_MKDIR_TEST=1 to plant /etc/ext4-mkdir-test. init/main.ad
+# detects the marker after the ext4 mount and calls ext4_mkdir_selftest()
+# (fs/ext4.ad): it mkdir's a real directory on the live ext4 mount via the
+# wired vfs_mkdir -> ext4_mkdir_live path, then re-reads the parent dir to
+# confirm the new entry exists DIR-typed. Writes to the mounted image, so
+# it is opt-in. Default boots omit the marker so it never fires.
+if os.environ.get("ENABLE_EXT4_MKDIR_TEST") == "1":
+    FILES.append(("/etc/ext4-mkdir-test", b"1\n"))
+
 # MBR extended/logical-partition (EBR chain) self-test. scripts/
 # test_partebr.sh sets ENABLE_PARTEBR_TEST=1 to plant /etc/partebr-test
 # and attaches a raw "vda" disk carrying an MBR + extended container +
