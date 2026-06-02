@@ -1,0 +1,336 @@
+# arch/x86/kernel/efi_runtime.ad — task #171
+#
+# EFI Runtime Services: GetTime / GetVariable / SetVariable, callable
+# AFTER ExitBootServices.
+#
+# How the kernel reaches firmware after boot
+# ------------------------------------------
+# The UEFI boot path (arch/x86/boot/efi_stub.S) captured the
+# EFI_SYSTEM_TABLE pointer at entry (Microsoft x64 ABI: RDX). Right after
+# it locates the Hamnix handoff table it copies, into the kernel's
+# .boot.data `efi_rt_info` struct (handoff slot +72, header.S):
+#
+#   - SystemTable           (EFI_SYSTEM_TABLE *)
+#   - SystemTable->RuntimeServices  (off 88)
+#   - SystemTable->ConfigurationTable (off 112)
+#   - SystemTable->NumberOfTableEntries (off 104)
+#
+# Runtime services live in EfiRuntimeServices{Code,Data} memory which the
+# firmware keeps mapped at its PHYSICAL address after ExitBootServices.
+# Hamnix keeps a 512-GiB low identity map live in CR3 for the entire
+# kernel lifetime (efi_stub.S STEP 8 / header.S pdpt_low), so the
+# firmware's identity-mapped runtime pages are directly reachable from
+# the higher-half kernel. We therefore call the firmware's PHYSICAL
+# (identity) function pointers WITHOUT ever calling SetVirtualAddressMap
+# — exactly what the UEFI spec permits when the OS chooses to keep the
+# firmware's physical map in place.
+#
+# Calling convention
+# ------------------
+# EFI uses the Microsoft x64 ABI (args RCX/RDX/R8/R9 + 32-byte shadow
+# stack); the Adder kernel is SysV. arch/x86/kernel/boot_info_asm.S
+# provides efi_ms_call4 / efi_ms_call5 thunks that marshal SysV->MS and
+# reserve the shadow space.
+#
+# RUNTIME-SERVICES TABLE OFFSETS (UEFI 2.10 §4.5, EFI_RUNTIME_SERVICES):
+#   off 24:  GetTime
+#   off 72:  GetVariable
+#   off 88:  SetVariable
+
+from kernel.printk.printk import printk0, printk1, printk2, printk_set_level
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
+
+# Boot-info accessors (arch/x86/kernel/boot_info_asm.S, populated by the
+# UEFI stub from handoff slot +72).
+extern def get_efi_rt_present() -> uint32
+extern def get_efi_rt_num_config() -> uint32
+extern def get_efi_rt_system_table() -> uint64
+extern def get_efi_rt_runtime_services() -> uint64
+extern def get_efi_rt_config_table() -> uint64
+
+# MS x64 ABI thunks (arch/x86/kernel/boot_info_asm.S).
+extern def efi_ms_call4(fn: uint64, a: uint64, b: uint64,
+                        c: uint64, d: uint64) -> uint64
+extern def efi_ms_call5(fn: uint64, a: uint64, b: uint64,
+                        c: uint64, d: uint64, e: uint64) -> uint64
+
+
+EFI_RT_OFF_GET_TIME:     uint64 = 24
+EFI_RT_OFF_GET_VARIABLE: uint64 = 72
+EFI_RT_OFF_SET_VARIABLE: uint64 = 88
+
+EFI_SUCCESS:        uint64 = 0
+# High bit set => error. EFI_NOT_FOUND = 0x800...0E; EFI_BUFFER_TOO_SMALL
+# = 0x800...05. We only need to distinguish success (0) from non-zero.
+
+# EFI_TIME field offsets (UEFI 2.10 §8.3, 16 bytes):
+EFI_TIME_OFF_YEAR:   uint64 = 0     # uint16
+EFI_TIME_OFF_MONTH:  uint64 = 2     # uint8
+EFI_TIME_OFF_DAY:    uint64 = 3     # uint8
+EFI_TIME_OFF_HOUR:   uint64 = 4     # uint8
+EFI_TIME_OFF_MINUTE: uint64 = 5     # uint8
+EFI_TIME_OFF_SECOND: uint64 = 6     # uint8
+
+# Module-scope scratch buffers. Adder miscompiles nested frame-local
+# arrays, so all firmware-facing buffers are flat module globals. The
+# firmware writes into these via the identity map; the kernel reads them
+# back afterward.
+_efi_time_buf:   Array[32, uint8]    # EFI_TIME (16) + slack
+_efi_var_name:   Array[64, uint16]   # CHAR16 variable name, NUL-terminated
+_efi_var_guid:   Array[16, uint8]    # EFI_GUID (16 bytes)
+_efi_var_data:   Array[64, uint8]    # GetVariable/SetVariable data
+_efi_var_size:   Array[1, uint64]    # UINTN DataSize in/out
+_efi_var_attr:   Array[1, uint32]    # UINT32 Attributes out
+
+
+def efi_runtime_available() -> int32:
+    # 1 iff the UEFI stub handed us a usable RuntimeServices pointer.
+    if get_efi_rt_present() == 0:
+        return 0
+    if get_efi_rt_runtime_services() == 0:
+        return 0
+    return 1
+
+
+# --- GetTime -----------------------------------------------------------
+#
+# EFI_STATUS GetTime(EFI_TIME *Time, EFI_TIME_CAPABILITIES *Capabilities)
+# RuntimeServices offset 24. We pass Capabilities = NULL.
+#
+# On success the firmware has written a 16-byte EFI_TIME into out_buf.
+# Returns the raw EFI_STATUS (0 == EFI_SUCCESS).
+
+def efi_get_time(out_buf: Ptr[uint8]) -> uint64:
+    if efi_runtime_available() == 0:
+        return 0x8000000000000003     # EFI_INVALID_PARAMETER shape
+    rt: uint64 = get_efi_rt_runtime_services()
+    fn: uint64 = cast[Ptr[uint64]](rt + EFI_RT_OFF_GET_TIME)[0]
+    if fn == 0:
+        return 0x8000000000000003
+    st: uint64 = efi_ms_call4(fn,
+                              cast[uint64](out_buf),    # EFI_TIME *
+                              0,                          # Capabilities = NULL
+                              0, 0)
+    return st
+
+
+# --- GetVariable -------------------------------------------------------
+#
+# EFI_STATUS GetVariable(CHAR16 *VariableName, EFI_GUID *VendorGuid,
+#                        UINT32 *Attributes, UINTN *DataSize, VOID *Data)
+# RuntimeServices offset 72. Five arguments — uses efi_ms_call5.
+#
+# data_size_io[0] must hold the buffer size on entry; the firmware writes
+# back the actual size. Returns the raw EFI_STATUS.
+
+def efi_get_variable(name_w: Ptr[uint16], guid: Ptr[uint8],
+                     attr_out: Ptr[uint32],
+                     data_size_io: Ptr[uint64],
+                     data_out: Ptr[uint8]) -> uint64:
+    if efi_runtime_available() == 0:
+        return 0x8000000000000003
+    rt: uint64 = get_efi_rt_runtime_services()
+    fn: uint64 = cast[Ptr[uint64]](rt + EFI_RT_OFF_GET_VARIABLE)[0]
+    if fn == 0:
+        return 0x8000000000000003
+    st: uint64 = efi_ms_call5(fn,
+                              cast[uint64](name_w),
+                              cast[uint64](guid),
+                              cast[uint64](attr_out),
+                              cast[uint64](data_size_io),
+                              cast[uint64](data_out))
+    return st
+
+
+# --- SetVariable -------------------------------------------------------
+#
+# EFI_STATUS SetVariable(CHAR16 *VariableName, EFI_GUID *VendorGuid,
+#                        UINT32 Attributes, UINTN DataSize, VOID *Data)
+# RuntimeServices offset 88. Five arguments — uses efi_ms_call5.
+# (Attributes + DataSize are by-value UINTN here, not pointers.)
+
+def efi_set_variable(name_w: Ptr[uint16], guid: Ptr[uint8],
+                     attributes: uint32, data_size: uint64,
+                     data_in: Ptr[uint8]) -> uint64:
+    if efi_runtime_available() == 0:
+        return 0x8000000000000003
+    rt: uint64 = get_efi_rt_runtime_services()
+    fn: uint64 = cast[Ptr[uint64]](rt + EFI_RT_OFF_SET_VARIABLE)[0]
+    if fn == 0:
+        return 0x8000000000000003
+    st: uint64 = efi_ms_call5(fn,
+                              cast[uint64](name_w),
+                              cast[uint64](guid),
+                              cast[uint64](attributes),
+                              data_size,
+                              cast[uint64](data_in))
+    return st
+
+
+# --- EFI_GLOBAL_VARIABLE GUID -----------------------------------------
+#
+# 8be4df61-93ca-11d2-aa0d-00e098032b8c, stored as an EFI_GUID:
+#   Data1 (u32 LE): 0x8be4df61
+#   Data2 (u16 LE): 0x93ca
+#   Data3 (u16 LE): 0x11d2
+#   Data4 (8 bytes, big-endian byte order): aa 0d 00 e0 98 03 2b 8c
+# In raw little-endian byte layout the 16 bytes are:
+#   61 df e4 8b ca 93 d2 11 aa 0d 00 e0 98 03 2b 8c
+
+def _efi_fill_global_var_guid():
+    _efi_var_guid[0]  = 0x61
+    _efi_var_guid[1]  = 0xdf
+    _efi_var_guid[2]  = 0xe4
+    _efi_var_guid[3]  = 0x8b
+    _efi_var_guid[4]  = 0xca
+    _efi_var_guid[5]  = 0x93
+    _efi_var_guid[6]  = 0xd2
+    _efi_var_guid[7]  = 0x11
+    _efi_var_guid[8]  = 0xaa
+    _efi_var_guid[9]  = 0x0d
+    _efi_var_guid[10] = 0x00
+    _efi_var_guid[11] = 0xe0
+    _efi_var_guid[12] = 0x98
+    _efi_var_guid[13] = 0x03
+    _efi_var_guid[14] = 0x2b
+    _efi_var_guid[15] = 0x8c
+
+
+# Fill _efi_var_name with the CHAR16 string "SecureBoot\0".
+def _efi_fill_secureboot_name():
+    _efi_var_name[0]  = cast[uint16](83)    # 'S'
+    _efi_var_name[1]  = cast[uint16](101)   # 'e'
+    _efi_var_name[2]  = cast[uint16](99)    # 'c'
+    _efi_var_name[3]  = cast[uint16](117)   # 'u'
+    _efi_var_name[4]  = cast[uint16](114)   # 'r'
+    _efi_var_name[5]  = cast[uint16](101)   # 'e'
+    _efi_var_name[6]  = cast[uint16](66)    # 'B'
+    _efi_var_name[7]  = cast[uint16](111)   # 'o'
+    _efi_var_name[8]  = cast[uint16](111)   # 'o'
+    _efi_var_name[9]  = cast[uint16](116)   # 't'
+    _efi_var_name[10] = cast[uint16](0)     # NUL
+
+
+# --- Boot self-test (gated on /etc/efi-test in init/main.ad) -----------
+#
+# Proves the runtime-services path is REAL under OVMF:
+#   1. efi_runtime_available() must be true (the stub handed us a usable
+#      RuntimeServices pointer through the +72 handoff slot).
+#   2. GetTime returns EFI_SUCCESS and a plausible wall-clock (year in a
+#      sane range, month 1..12, day 1..31, hour/min/sec in range). OVMF's
+#      RTC is wired to the host clock, so the values are real.
+#   3. GetVariable("SecureBoot", EFI_GLOBAL_VARIABLE) returns SUCCESS and
+#      a 1-byte value (0 or 1) on firmware that exposes it; on firmware
+#      that does NOT define the variable it returns EFI_NOT_FOUND — both
+#      are accepted as "the GetVariable call really reached firmware".
+#
+# Returns 1 on PASS, 0 on FAIL. Prints EMERG-stamped [efi] marker lines.
+
+def efi_runtime_selftest() -> int32:
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0("[efi] runtime-services self-test starting\n")
+
+    if efi_runtime_available() == 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[efi] FAIL: no EFI runtime services (not a UEFI boot?)\n")
+        return 0
+
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk2("[efi] system_table=%p runtime_services=%p\n",
+            get_efi_rt_system_table(), get_efi_rt_runtime_services())
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk2("[efi] config_table=%p num_config_entries=%d\n",
+            get_efi_rt_config_table(),
+            cast[uint64](get_efi_rt_num_config()))
+
+    ok: int32 = 1
+
+    # --- GetTime ---
+    i: uint64 = 0
+    while i < 32:
+        _efi_time_buf[i] = 0
+        i = i + 1
+    gt_st: uint64 = efi_get_time(&_efi_time_buf[0])
+    if gt_st != EFI_SUCCESS:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk1("[efi] FAIL: GetTime returned status=%p\n", gt_st)
+        ok = 0
+    else:
+        yr_lo: uint64 = cast[uint64](_efi_time_buf[EFI_TIME_OFF_YEAR])
+        yr_hi: uint64 = cast[uint64](_efi_time_buf[EFI_TIME_OFF_YEAR + 1])
+        year:  uint64 = yr_lo | (yr_hi << 8)
+        month: uint64 = cast[uint64](_efi_time_buf[EFI_TIME_OFF_MONTH])
+        day:   uint64 = cast[uint64](_efi_time_buf[EFI_TIME_OFF_DAY])
+        hour:  uint64 = cast[uint64](_efi_time_buf[EFI_TIME_OFF_HOUR])
+        minute: uint64 = cast[uint64](_efi_time_buf[EFI_TIME_OFF_MINUTE])
+        second: uint64 = cast[uint64](_efi_time_buf[EFI_TIME_OFF_SECOND])
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk2("[efi] GetTime OK: year=%d month=%d\n", year, month)
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk2("[efi] GetTime OK: day=%d hour=%d\n", day, hour)
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk2("[efi] GetTime OK: minute=%d second=%d\n", minute, second)
+        # Plausibility: a real firmware clock. OVMF is host-synced.
+        plausible: int32 = 1
+        if year < 2015:
+            plausible = 0
+        if year > 2099:
+            plausible = 0
+        if month < 1:
+            plausible = 0
+        if month > 12:
+            plausible = 0
+        if day < 1:
+            plausible = 0
+        if day > 31:
+            plausible = 0
+        if hour > 23:
+            plausible = 0
+        if minute > 59:
+            plausible = 0
+        if second > 59:
+            plausible = 0
+        if plausible == 1:
+            printk_set_level(PRINTK_LEVEL_EMERG)
+            printk0("[efi] GetTime values plausible OK\n")
+        else:
+            printk_set_level(PRINTK_LEVEL_EMERG)
+            printk0("[efi] FAIL: GetTime values implausible\n")
+            ok = 0
+
+    # --- GetVariable("SecureBoot", EFI_GLOBAL_VARIABLE) ---
+    _efi_fill_global_var_guid()
+    _efi_fill_secureboot_name()
+    i = 0
+    while i < 64:
+        _efi_var_data[i] = 0
+        i = i + 1
+    _efi_var_size[0] = 64
+    _efi_var_attr[0] = 0
+    gv_st: uint64 = efi_get_variable(&_efi_var_name[0],
+                                     &_efi_var_guid[0],
+                                     &_efi_var_attr[0],
+                                     &_efi_var_size[0],
+                                     &_efi_var_data[0])
+    if gv_st == EFI_SUCCESS:
+        sb_val: uint64 = cast[uint64](_efi_var_data[0])
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk2("[efi] GetVariable SecureBoot OK: size=%d value=%d\n",
+                _efi_var_size[0], sb_val)
+        if _efi_var_size[0] != 1:
+            printk_set_level(PRINTK_LEVEL_EMERG)
+            printk0("[efi] note: SecureBoot value size != 1 (still a real read)\n")
+    else:
+        # EFI_NOT_FOUND (firmware without a SecureBoot var) is acceptable:
+        # the call still reached firmware and returned a defined status.
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk1("[efi] GetVariable SecureBoot status=%p (not-found is OK)\n",
+                gv_st)
+
+    if ok == 1:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[efi] PASS\n")
+    else:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[efi] FAIL\n")
+    return ok

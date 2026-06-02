@@ -217,6 +217,132 @@ get_efi_mmap_desc_version:
     movl    24(%rax), %eax
     ret
 
+    /* ---- EFI runtime-services accessors (#171) ------------------------
+     *
+     * Read the efi_rt_info struct the UEFI stub populated. All zero on a
+     * BIOS / multiboot1 boot, so get_efi_rt_present() returning 0 is the
+     * well-defined "no EFI runtime services" signal. */
+    .align 16
+    .globl get_efi_rt_present
+get_efi_rt_present:
+    movabsq $efi_rt_info, %rax
+    movl    0(%rax), %eax
+    ret
+
+    .align 16
+    .globl get_efi_rt_num_config
+get_efi_rt_num_config:
+    movabsq $efi_rt_info, %rax
+    movl    4(%rax), %eax
+    ret
+
+    .align 16
+    .globl get_efi_rt_system_table
+get_efi_rt_system_table:
+    movabsq $efi_rt_info, %rcx
+    movq    8(%rcx), %rax
+    ret
+
+    .align 16
+    .globl get_efi_rt_runtime_services
+get_efi_rt_runtime_services:
+    movabsq $efi_rt_info, %rcx
+    movq    16(%rcx), %rax
+    ret
+
+    .align 16
+    .globl get_efi_rt_config_table
+get_efi_rt_config_table:
+    movabsq $efi_rt_info, %rcx
+    movq    24(%rcx), %rax
+    ret
+
+    /* ---- MS x64 ABI thunk for EFI runtime calls (#171) ----------------
+     *
+     * efi_ms_call4(fn, a, b, c, d) -> uint64
+     *
+     * The kernel is compiled SysV (args in RDI, RSI, RDX, RCX, R8; return
+     * in RAX). EFI firmware uses the Microsoft x64 ABI (args in RCX, RDX,
+     * R8, R9; caller must reserve 32 bytes of "shadow space" below the
+     * return address and keep RSP 16-byte aligned at the call). This thunk
+     * marshals up to four arguments SysV->MS and performs the indirect
+     * call into firmware.
+     *
+     * SysV inbound:
+     *   RDI = fn (firmware function pointer, physical/identity address)
+     *   RSI = a  -> MS RCX
+     *   RDX = b  -> MS RDX
+     *   RCX = c  -> MS R8
+     *   R8  = d  -> MS R9
+     *
+     * MS callee may clobber RAX RCX RDX R8 R9 R10 R11 (all SysV-caller-
+     * saved too) plus the x87/SSE volatile set; it preserves RBX RBP RDI
+     * RSI R12-R15. We additionally save/restore RDI RSI here because the
+     * MS ABI treats them as callee-saved but firmware that mixes ABIs has
+     * historically clobbered RSI/RDI — saving them is cheap insurance and
+     * keeps this thunk safe regardless. */
+    .align 16
+    .globl efi_ms_call4
+efi_ms_call4:
+    pushq   %rbp
+    movq    %rsp, %rbp
+    pushq   %rdi                    /* preserve across the firmware call */
+    pushq   %rsi
+    movq    %rdi, %rax              /* RAX = firmware fn ptr             */
+    movq    %rsi, %rcx              /* MS arg0                           */
+                                    /* MS arg1 already in RDX            */
+    movq    %rcx, %r8               /* MS arg2                           */
+                                    /* MS arg3 already in R8 -> stays    */
+    /* Re-align RSP to a 16-byte boundary and reserve 32-byte shadow.
+     * After `pushq %rbp; pushq %rdi; pushq %rsi` RSP is 16-aligned
+     * (entry RSP was 16-aligned minus 8 for the return addr; +3 pushes
+     * = -32 total -> 16-aligned). Reserve exactly 32 bytes of shadow so
+     * the call instruction keeps RSP 16-aligned. */
+    subq    $32, %rsp
+    call    *%rax
+    addq    $32, %rsp
+    popq    %rsi
+    popq    %rdi
+    movq    %rbp, %rsp
+    popq    %rbp
+    ret
+
+    /* ---- efi_ms_call5(fn, a, b, c, d, e) -> uint64 --------------------
+     *
+     * Five-argument MS x64 thunk for GetVariable / SetVariable. SysV
+     * inbound: RDI=fn, RSI=a, RDX=b, RCX=c, R8=d, R9=e.
+     * MS outbound: RCX=a, RDX=b, R8=c, R9=d, [RSP+32]=e (5th arg passed
+     * on the stack just above the 32-byte shadow per the MS x64 ABI). */
+    .align 16
+    .globl efi_ms_call5
+efi_ms_call5:
+    pushq   %rbp
+    movq    %rsp, %rbp
+    pushq   %rdi
+    pushq   %rsi
+    /* SysV inbound (all still live): RDI=fn RSI=a RDX=b RCX=c R8=d R9=e.
+     * MS targets: RCX=a RDX=b R8=c R9=d, 5th arg (e) on the stack.
+     * Marshal in an order that never overwrites a source before use:
+     *   RAX = fn ; R10 = e ; R9 = d(from R8) ; R8 = c(from RCX) ;
+     *   RCX = a(from RSI). RDX(=b) is already correct. */
+    movq    %rdi, %rax              /* RAX = firmware fn ptr             */
+    movq    %r9,  %r10             /* stash 5th arg (e)                 */
+    movq    %r8,  %r9              /* MS arg3 = d                       */
+    movq    %rcx, %r8              /* MS arg2 = c                       */
+    movq    %rsi, %rcx              /* MS arg0 = a                       */
+    /* RSP is 16-aligned here (pushed rbp/rdi/rsi). Reserve 32 shadow +
+     * 8 for the 5th arg + 8 pad so the call keeps RSP 16-aligned
+     * (call pushes 8 -> callee entry RSP %16 == 8 as MS requires). */
+    subq    $48, %rsp
+    movq    %r10, 32(%rsp)          /* 5th arg lands just above shadow   */
+    call    *%rax
+    addq    $48, %rsp
+    popq    %rsi
+    popq    %rdi
+    movq    %rbp, %rsp
+    popq    %rbp
+    ret
+
     /* ---- EFI GOP framebuffer storage ----------------------------------
      *
      * Lives in .boot.data (the LOW boot region) so the EFI handoff
@@ -267,4 +393,41 @@ efi_mmap_info:
     .quad 0     /* off 16 size_bytes           */
     .long 0     /* off 24 desc_version         */
     .long 0     /* off 28 _reserved            */
+    .quad 0     /* off 32 _reserved64          */
+
+    /* ---- EFI runtime-services handoff storage (#171) -------------------
+     *
+     * Sibling of efi_fb_info / efi_mmap_info. Populated by
+     * arch/x86/boot/efi_stub.S right after it locates the handoff table,
+     * from the captured EFI_SYSTEM_TABLE pointer (held in the stub as
+     * efi_system_table). The stub finds THIS struct via handoff slot +72
+     * in the multiboot header (arch/x86/boot/header.S).
+     *
+     * EFI runtime services (GetTime / GetVariable / SetVariable) remain
+     * callable AFTER ExitBootServices — they live in EfiRuntimeServices*
+     * memory which firmware keeps mapped at its physical address. The
+     * Hamnix higher-half kernel keeps a 512-GiB low identity map live
+     * in CR3 (arch/x86/boot/efi_stub.S STEP 8 + header.S pdpt_low), so
+     * the firmware's identity-mapped RuntimeServices pages are reachable
+     * without ever calling SetVirtualAddressMap. We therefore use the
+     * firmware's PHYSICAL (identity) function pointers directly.
+     *
+     * Layout (40 bytes):
+     *   off  0: uint32 present              (1 = populated, 0 = no EFI rt)
+     *   off  4: uint32 num_config_entries   (EFI_SYSTEM_TABLE.NumberOfTableEntries)
+     *   off  8: uint64 system_table         (EFI_SYSTEM_TABLE *)
+     *   off 16: uint64 runtime_services     (EFI_RUNTIME_SERVICES *)
+     *   off 24: uint64 config_table         (EFI_CONFIGURATION_TABLE *)
+     *   off 32: uint64 _reserved64
+     *
+     * Zero on every BIOS / multiboot1 boot.
+     */
+    .align 8
+    .globl efi_rt_info
+efi_rt_info:
+    .long 0     /* off  0 present              */
+    .long 0     /* off  4 num_config_entries   */
+    .quad 0     /* off  8 system_table         */
+    .quad 0     /* off 16 runtime_services     */
+    .quad 0     /* off 24 config_table         */
     .quad 0     /* off 32 _reserved64          */

@@ -95,6 +95,7 @@ multiboot_header:
      *   +60  uint32  gdt64_addr         = &gdt64
      *   +64  uint32  efi_fb_info_addr   = &efi_fb_info  (GOP capture)
      *   +68  uint32  efi_mmap_info_addr = &efi_mmap_info (EFI memmap)
+     *   +72  uint32  efi_rt_info_addr   = &efi_rt_info  (#171 runtime svc)
      *
      * EVERY symbol referenced here lives in the LOW boot region
      * (.head.text / .boot.text / .boot.data), so each .long resolves
@@ -116,6 +117,7 @@ multiboot_header:
     .long   gdt64                   /* off 60 */
     .long   efi_fb_info             /* off 64 */
     .long   efi_mmap_info           /* off 68 */
+    .long   efi_rt_info             /* off 72 */
 
 /* ---------- 32-bit protected-mode entry ---------------------------- */
     .globl  _start

@@ -522,6 +522,35 @@ efi_main:
     movl    68(%rsi), %eax                  /* efi_mmap_info addr */
     movq    %rax, efi_kernel_mmap_info_ptr(%rip)
 
+    /* #171: EFI runtime-services handoff. Pull &efi_rt_info out of the
+     * +72 slot. We can populate this struct NOW (unlike efi_mmap_info,
+     * which must wait for the final post-ExitBootServices map): the
+     * EFI_SYSTEM_TABLE and the RuntimeServices/ConfigurationTable
+     * pointers it carries are static for the life of the firmware and
+     * remain valid after ExitBootServices. The struct lives in the
+     * kernel's LOW .boot.data, so a 32-bit address is the right shape.
+     * A zero slot means a pre-#171 kernel — skip silently. */
+    movl    72(%rsi), %eax                  /* efi_rt_info addr */
+    movq    %rax, efi_kernel_rt_info_ptr(%rip)
+    testq   %rax, %rax
+    jz      .Lefi_rt_handoff_skip
+    movq    %rax, %r10                      /* %r10 = &efi_rt_info */
+    movq    efi_system_table(%rip), %r11    /* %r11 = EFI_SYSTEM_TABLE * */
+    /* num_config_entries = SystemTable->NumberOfTableEntries (off 104) */
+    movl    104(%r11), %eax
+    movl    %eax, 4(%r10)
+    /* system_table pointer (off 8) */
+    movq    %r11, 8(%r10)
+    /* runtime_services = SystemTable->RuntimeServices (off 88) */
+    movq    88(%r11), %rax
+    movq    %rax, 16(%r10)
+    /* config_table = SystemTable->ConfigurationTable (off 112) */
+    movq    112(%r11), %rax
+    movq    %rax, 24(%r10)
+    /* present = 1 — written LAST so the kernel never sees a torn struct. */
+    movl    $1, 0(%r10)
+.Lefi_rt_handoff_skip:
+
     /* Patch *boot_via_efi = 1 so e820_init() takes the EFI fallback. */
     movq    efi_boot_via_efi_ptr(%rip), %rax
     movl    $1, (%rax)
@@ -1413,6 +1442,13 @@ efi_kernel_fb_info_ptr:     .quad 0
      * walk the descriptors and unlock RAM > 240 MiB on UEFI boots. */
     .globl efi_kernel_mmap_info_ptr
 efi_kernel_mmap_info_ptr:   .quad 0
+    /* #171: Address of the kernel's `efi_rt_info` struct (in
+     * arch/x86/kernel/boot_info_asm.S .boot.data). Pulled from the +72
+     * handoff slot. The stub stashes the EFI_SYSTEM_TABLE +
+     * RuntimeServices + ConfigurationTable pointers here so the kernel
+     * can call GetTime / GetVariable / SetVariable after boot. */
+    .globl efi_kernel_rt_info_ptr
+efi_kernel_rt_info_ptr:     .quad 0
 
     /* GetMemoryMap scratch. */
     .align 8

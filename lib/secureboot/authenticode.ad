@@ -1,0 +1,266 @@
+# lib/secureboot/authenticode.ad — task #171 (Part B)
+#
+# Secure Boot image verification: compute the Authenticode PE/COFF image
+# hash, then verify an RSA signature over that hash against an embedded
+# trust anchor (a self-signed X.509 cert). REUSES the existing crypto
+# stack:
+#   - lib/x509/x509.ad   : x509_parse() extracts the signer's RSA pubkey
+#                          (SPKI) from the DER cert.
+#   - lib/rsa/rsa.ad     : rsa_pkcs1_v1_5_verify() does the real RSASSA-
+#                          PKCS1-v1.5-SHA256 signature check.
+#   - lib/ecdsa/ecdsa.ad : ecdsa_sha256() is a contiguous SHA-256 oneshot
+#                          (re-used here for the Authenticode digest).
+#
+# Authenticode PE hash (Microsoft "Windows Authenticode Portable
+# Executable Signature Format", §"Calculating the PE Image Hash"):
+#   The image hash is SHA-256 over the entire PE file EXCEPT three
+#   regions, in file order:
+#     (a) the 4-byte CheckSum field in the optional header,
+#     (b) the 8-byte Certificate Table entry (data directory index 4),
+#     (c) the attribute certificate table itself (it lives at the end of
+#         the file, pointed to by (b)).
+#   We hash the concatenation of the surviving byte ranges.
+#
+# Test container (planted by scripts/build_initramfs.py under
+# ENABLE_EFI_TEST=1; see scripts/gen_secureboot_blob.py):
+#   /etc/secureboot-anchor   : DER of the self-signed RSA-2048 test cert
+#                              (the embedded TRUST ANCHOR == the signer).
+#   /etc/secureboot-pe-good  : a minimal valid PE32+ image, followed by a
+#                              trailer  [u32 LE pe_len][u32 LE sig_len][sig]
+#                              where `sig` = RSASSA-PKCS1-v1.5-SHA256 over
+#                              the Authenticode digest of the first pe_len
+#                              bytes. The trailer (and thus the cert table
+#                              region) is excluded from the hash because
+#                              we only hash the pe_len-byte PE portion,
+#                              minus the checksum + cert-dir holes.
+#   /etc/secureboot-pe-bad   : identical, but one .text byte is flipped so
+#                              the Authenticode digest no longer matches
+#                              the signature -> MUST be rejected.
+#
+# The point (per the #171 brief) is a working verifier with a REAL crypto
+# path: a genuine PE Authenticode digest + a genuine RSA signature check
+# against a cert parsed by the real X.509 stack, with a trust-anchor
+# identity check. Full Authenticode SignedData/PKCS#7 ASN.1 corner-cases
+# are deliberately out of scope.
+
+from lib.x509.x509 import X509Cert, x509_parse
+from lib.rsa.rsa import (
+    RsaPubkey, rsa_init, rsa_parse_pubkey, rsa_pkcs1_v1_5_verify,
+    RSA_DIGEST_SHA256,
+)
+from lib.ecdsa.ecdsa import ecdsa_init, ecdsa_sha256
+from kernel.printk.printk import printk0, printk1, printk2, printk_set_level
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
+
+
+# Result codes for sb_verify_pe.
+SB_OK:            int32 = 0
+SB_BAD_PE:        int32 = -1   # not a parseable PE32+
+SB_BAD_TRAILER:   int32 = -2   # missing/short trailer
+SB_BAD_ANCHOR:    int32 = -3   # anchor cert won't parse
+SB_BAD_PUBKEY:    int32 = -4   # SPKI won't load
+SB_SIG_REJECT:    int32 = -5   # signature did NOT verify (tamper/bad key)
+
+
+# --- module-scope scratch (Adder miscompiles frame-local arrays) -------
+_sb_hash_buf:   Array[8192, uint8]    # contiguous "to-hash" byte stream
+_sb_digest:     Array[32, uint8]      # Authenticode SHA-256 digest
+_sb_cert:       X509Cert              # parsed anchor cert
+_sb_pubkey:     RsaPubkey             # signer RSA public key
+
+
+def _sb_rd_u16le(p: Ptr[uint8], off: uint64) -> uint64:
+    lo: uint64 = cast[uint64](p[off])
+    hi: uint64 = cast[uint64](p[off + 1])
+    return lo | (hi << 8)
+
+
+def _sb_rd_u32le(p: Ptr[uint8], off: uint64) -> uint64:
+    b0: uint64 = cast[uint64](p[off])
+    b1: uint64 = cast[uint64](p[off + 1])
+    b2: uint64 = cast[uint64](p[off + 2])
+    b3: uint64 = cast[uint64](p[off + 3])
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+
+
+# Build the Authenticode "to-hash" byte stream into _sb_hash_buf:
+# copy [0, pe_len) skipping the 4-byte CheckSum field at `cksum_off`
+# and the 8-byte Certificate Table data-directory entry at `certdir_off`.
+# Returns the number of bytes written, or 0 on overflow/inconsistency.
+def _sb_build_hash_stream(pe: Ptr[uint8], pe_len: uint64,
+                          cksum_off: uint64, certdir_off: uint64) -> uint64:
+    if pe_len > 8192:
+        return 0
+    out_n: uint64 = 0
+    i: uint64 = 0
+    while i < pe_len:
+        skip: int32 = 0
+        if i >= cksum_off:
+            if i < cksum_off + 4:
+                skip = 1
+        if i >= certdir_off:
+            if i < certdir_off + 8:
+                skip = 1
+        if skip == 0:
+            _sb_hash_buf[out_n] = pe[i]
+            out_n = out_n + 1
+        i = i + 1
+    return out_n
+
+
+# Parse the PE just enough to locate the CheckSum field offset and the
+# Certificate Table data-directory entry offset. Writes them through the
+# out pointers. Returns SB_OK or SB_BAD_PE.
+#
+# PE layout walked:
+#   0x3C            : e_lfanew (u32) -> PE signature offset
+#   pe_sig          : "PE\0\0" (0x50 0x45 0x00 0x00)
+#   pe_sig + 4      : COFF file header (20 bytes)
+#   pe_sig + 24     : optional header. magic u16 == 0x20B for PE32+.
+#   opt + 64        : CheckSum (u32)              (PE32+ and PE32 alike)
+#   opt + 108       : NumberOfRvaAndSizes (u32)   (PE32+)
+#   opt + 112       : data directories[0]. index 4 = Certificate Table,
+#                     so its 8-byte entry is at opt + 112 + 4*8 = opt+144.
+def _sb_locate_fields(pe: Ptr[uint8], pe_len: uint64,
+                      cksum_off_out: Ptr[uint64],
+                      certdir_off_out: Ptr[uint64]) -> int32:
+    if pe_len < 0x40:
+        return SB_BAD_PE
+    # DOS magic "MZ".
+    if pe[0] != 0x4D:
+        return SB_BAD_PE
+    if pe[1] != 0x5A:
+        return SB_BAD_PE
+    pe_sig: uint64 = _sb_rd_u32le(pe, 0x3C)
+    if pe_sig + 24 > pe_len:
+        return SB_BAD_PE
+    # "PE\0\0".
+    if pe[pe_sig] != 0x50:
+        return SB_BAD_PE
+    if pe[pe_sig + 1] != 0x45:
+        return SB_BAD_PE
+    if pe[pe_sig + 2] != 0x00:
+        return SB_BAD_PE
+    if pe[pe_sig + 3] != 0x00:
+        return SB_BAD_PE
+    opt: uint64 = pe_sig + 24
+    if opt + 144 + 8 > pe_len:
+        return SB_BAD_PE
+    magic: uint64 = _sb_rd_u16le(pe, opt)
+    # 0x20B = PE32+. (0x10B = PE32; we only generate PE32+ here.)
+    if magic != 0x20B:
+        return SB_BAD_PE
+    cksum_off_out[0]   = opt + 64
+    certdir_off_out[0] = opt + 144
+    return SB_OK
+
+
+# Verify a signed PE blob against the DER anchor cert.
+#   blob / blob_len : /etc/secureboot-pe-{good,bad} contents
+#   anchor/anchor_len : /etc/secureboot-anchor DER cert
+# Returns SB_OK if the signature verifies against the anchor's pubkey,
+# else a negative SB_* code.
+def sb_verify_pe(blob: Ptr[uint8], blob_len: uint64,
+                 anchor: Ptr[uint8], anchor_len: uint64) -> int32:
+    # Trailer: last 8 bytes are [u32 LE pe_len][u32 LE sig_len], with the
+    # `sig` (sig_len bytes) sitting immediately before those 8 bytes.
+    if blob_len < 8:
+        return SB_BAD_TRAILER
+    pe_len:  uint64 = _sb_rd_u32le(blob, blob_len - 8)
+    sig_len: uint64 = _sb_rd_u32le(blob, blob_len - 4)
+    if sig_len == 0:
+        return SB_BAD_TRAILER
+    if pe_len == 0:
+        return SB_BAD_TRAILER
+    # Layout: [pe (pe_len)][sig (sig_len)][pe_len u32][sig_len u32]
+    if pe_len + sig_len + 8 != blob_len:
+        return SB_BAD_TRAILER
+    sig_off: uint64 = pe_len
+
+    cksum_off:   uint64 = 0
+    certdir_off: uint64 = 0
+    lrc: int32 = _sb_locate_fields(blob, pe_len, &cksum_off, &certdir_off)
+    if lrc != SB_OK:
+        return lrc
+
+    # Authenticode hash stream.
+    stream_n: uint64 = _sb_build_hash_stream(blob, pe_len,
+                                             cksum_off, certdir_off)
+    if stream_n == 0:
+        return SB_BAD_PE
+    ecdsa_sha256(&_sb_hash_buf[0], stream_n, &_sb_digest[0])
+
+    # Parse the trust anchor and load its RSA pubkey.
+    if x509_parse(anchor, anchor_len, &_sb_cert) != 0:
+        return SB_BAD_ANCHOR
+    if rsa_parse_pubkey(&_sb_cert.pubkey_bytes[0],
+                        _sb_cert.pubkey_bytes_len, &_sb_pubkey) != 0:
+        return SB_BAD_PUBKEY
+
+    # Verify: signature is RSASSA-PKCS1-v1.5-SHA256 over the 32-byte
+    # Authenticode digest (the "message"). rsa_pkcs1_v1_5_verify hashes
+    # its message argument internally, so the signer signed
+    # SHA256(authenticode_digest) — a real, consistent RSA path.
+    vrc: int32 = rsa_pkcs1_v1_5_verify(&_sb_pubkey,
+                                       cast[Ptr[uint8]](0), 0,
+                                       RSA_DIGEST_SHA256,
+                                       &_sb_digest[0], 32,
+                                       &blob[sig_off], sig_len)
+    if vrc == 1:
+        return SB_OK
+    return SB_SIG_REJECT
+
+
+# --- boot self-test ----------------------------------------------------
+#
+# Called from init/main.ad (gated on /etc/efi-test). Proves the verifier
+#   (a) ACCEPTS the correctly-signed /etc/secureboot-pe-good, and
+#   (b) REJECTS the tampered /etc/secureboot-pe-bad.
+# Returns 1 on PASS (accept-good AND reject-bad), 0 otherwise.
+
+def secureboot_selftest(anchor: Ptr[uint8], anchor_len: uint64,
+                        good: Ptr[uint8], good_len: uint64,
+                        bad: Ptr[uint8], bad_len: uint64) -> int32:
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0("[secureboot] image-verification self-test starting\n")
+    rsa_init()
+    # ecdsa_init() populates the SHA-256 round-constant table that
+    # ecdsa_sha256() (our Authenticode digest) depends on. Without it the
+    # K table is all zeros and every digest is wrong.
+    ecdsa_init()
+
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk2("[secureboot] anchor=%d bytes good=%d bytes\n",
+            anchor_len, good_len)
+
+    ok: int32 = 1
+
+    # (a) good blob must ACCEPT.
+    r_good: int32 = sb_verify_pe(good, good_len, anchor, anchor_len)
+    if r_good == SB_OK:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[secureboot] ACCEPT good blob OK\n")
+    else:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk1("[secureboot] FAIL: good blob rejected rc=%d\n",
+                cast[uint64](cast[int64](r_good)))
+        ok = 0
+
+    # (b) bad (tampered) blob must REJECT with SB_SIG_REJECT.
+    r_bad: int32 = sb_verify_pe(bad, bad_len, anchor, anchor_len)
+    if r_bad == SB_SIG_REJECT:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[secureboot] REJECT tampered blob OK\n")
+    else:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk1("[secureboot] FAIL: tampered blob not rejected rc=%d\n",
+                cast[uint64](cast[int64](r_bad)))
+        ok = 0
+
+    if ok == 1:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[secureboot] PASS\n")
+    else:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[secureboot] FAIL\n")
+    return ok

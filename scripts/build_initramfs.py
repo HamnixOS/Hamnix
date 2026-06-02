@@ -322,6 +322,31 @@ if os.environ.get("ENABLE_MM_TEST") == "1":
 if os.environ.get("ENABLE_KEYMAP_TEST") == "1":
     FILES.append(("/etc/keymap-test", b"ENABLE_KEYMAP_TEST=1\n"))
 
+# #171: EFI runtime services + Secure Boot image verification self-test.
+# scripts/test_efi_secureboot.sh sets ENABLE_EFI_TEST=1 to plant
+# /etc/efi-test plus the Secure Boot crypto fixtures. init/main.ad at
+# boot:37.efi detects the marker and runs efi_runtime_selftest()
+# (arch/x86/kernel/efi_runtime.ad — GetTime / GetVariable via the
+# firmware RuntimeServices captured by the UEFI stub) and
+# secureboot_selftest() (lib/secureboot/authenticode.ad — recomputes the
+# Authenticode PE image hash and verifies a real RSASSA-PKCS1-v1.5-SHA256
+# signature against the embedded trust anchor: it ACCEPTS the correctly
+# signed blob and REJECTS a one-byte-tampered blob). The three fixture
+# files are generated fresh per build by scripts/gen_secureboot_blob.py
+# (no secrets committed; the verifier trusts only the embedded anchor).
+# Default boots omit the marker so neither self-test ever fires.
+if os.environ.get("ENABLE_EFI_TEST") == "1":
+    FILES.append(("/etc/efi-test", b"ENABLE_EFI_TEST=1\n"))
+    import sys as _sb_sys
+    _sb_scripts_dir = str(Path(__file__).resolve().parent)
+    if _sb_scripts_dir not in _sb_sys.path:
+        _sb_sys.path.insert(0, _sb_scripts_dir)
+    from gen_secureboot_blob import build_secureboot_fixtures
+    _sb_fx = build_secureboot_fixtures()
+    FILES.append(("/etc/secureboot-anchor", _sb_fx["secureboot-anchor"]))
+    FILES.append(("/etc/secureboot-pe-good", _sb_fx["secureboot-pe-good"]))
+    FILES.append(("/etc/secureboot-pe-bad", _sb_fx["secureboot-pe-bad"]))
+
 # #149: ext4 JBD2 journal crash-consistency self-test. scripts/
 # test_ext4_journal.sh sets ENABLE_EXT4_JOURNAL_TEST=1 to plant
 # /etc/ext4-journal-test. init/main.ad detects the marker after the
