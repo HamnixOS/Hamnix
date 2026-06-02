@@ -744,6 +744,19 @@ if os.environ.get("ENABLE_STATFS_TEST") == "1":
 if os.environ.get("ENABLE_ACCESS_MODE_TEST") == "1":
     FILES.append(("/etc/access-mode-test", b"1\n"))
 
+# readlink(2)/readlinkat(2)-on-tmpfs-symlink self-test. scripts/
+# test_tmpfs_readlink.sh sets ENABLE_TMPFS_READLINK_TEST=1 to plant
+# /etc/tmpfs-readlink-test. init/main.ad at boot:37.trl detects the marker
+# and calls tmpfs_readlink_selftest() (linux_abi/u_syscalls.ad): it creates
+# a tmpfs file plus a tmpfs symlink with a known target string, then drives
+# SYS_readlink and SYS_readlinkat through the real Linux-ABI dispatch on the
+# symlink, asserting the returned byte count == the target length, the
+# copied bytes == the target string, no trailing NUL, and that readlink on a
+# non-symlink tmpfs file returns -EINVAL. Purely RAM-backed (tmpfs) so it
+# needs no disk image; default boots omit the marker so it never fires.
+if os.environ.get("ENABLE_TMPFS_READLINK_TEST") == "1":
+    FILES.append(("/etc/tmpfs-readlink-test", b"1\n"))
+
 # MBR extended/logical-partition (EBR chain) self-test. scripts/
 # test_partebr.sh sets ENABLE_PARTEBR_TEST=1 to plant /etc/partebr-test
 # and attaches a raw "vda" disk carrying an MBR + extended container +

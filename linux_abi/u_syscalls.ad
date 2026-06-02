@@ -238,6 +238,9 @@ from fs.tmpfs import (
     # statfs(2): classify a path as tmpfs-backed (/tmp, /var) and report
     # tmpfs's per-file capacity as the synthetic fs size.
     is_tmpfs_path, is_var_path, is_tmpfs_dir_path, TMPFS_FILE_CAP,
+    # readlink(2): resolve a tmpfs symlink's stored target string.
+    tmpfs_path_is_symlink, tmpfs_readlink_path, tmpfs_create_symlink,
+    tmpfs_unlink,
 )
 # statfs(2): the ext4 block/inode geometry the df numbers come from. The
 # total counts + block size are captured by ext4_init at mount; the free
@@ -5492,12 +5495,35 @@ def _u_readlinkat(a0: uint64, a1: uint64, a2: uint64,
             dst[i] = reply[i]
             i = i + 1
         return cast[int64](limit)
-    # Any other path: check whether it resolves. If yes, return
-    # -EINVAL (not a symlink); if no, -ENOENT.
+    # Any other path: resolve it to an absolute path so the backend
+    # classifiers (is_tmpfs_path / tmpfs_path_is_symlink) see the canonical
+    # spelling.
     abs_path: Array[256, uint8]
     rc: int32 = resolve_path(cast[Ptr[char]](a1), &abs_path[0], 256)
     if rc != 0:
         return ELINUX_NOENT
+    # tmpfs branch: tmpfs now stores symlink targets in-RAM. If the
+    # resolved path is a tmpfs symlink, hand back its stored target
+    # truncated to bufsiz with NO trailing NUL (the readlink(2) contract).
+    if tmpfs_path_is_symlink(cast[Ptr[char]](&abs_path[0])) != 0:
+        tgt: Ptr[uint8] = tmpfs_readlink_path(cast[Ptr[char]](&abs_path[0]))
+        if tgt != cast[Ptr[uint8]](0):
+            # Length of the target up to its NUL terminator.
+            tn: uint64 = 0
+            while tgt[tn] != 0:
+                tn = tn + 1
+            tdst: Ptr[uint8] = cast[Ptr[uint8]](a2)
+            tlimit: uint64 = tn
+            if tlimit > a3:
+                tlimit = a3
+            ti: uint64 = 0
+            while ti < tlimit:
+                tdst[ti] = tgt[ti]
+                ti = ti + 1
+            return cast[int64](tlimit)
+    # Not a tmpfs symlink. Check whether the path resolves to something.
+    # If yes, return -EINVAL (a regular file is not a symlink); if no,
+    # -ENOENT.
     fd: int32 = vfs_open(cast[Ptr[char]](&abs_path[0]))
     if fd < 0:
         return ELINUX_NOENT
@@ -6284,6 +6310,164 @@ def _statfs_selftest_restore(boot_task: Ptr[TaskStruct],
     while fdr < 16:
         boot_task[0].fd_idx[fdr] = fd_save[fdr]
         fdr = fdr + 1
+
+
+# =====================================================================
+# readlink(2) / readlinkat(2) on a tmpfs symlink self-test
+#   (gated on /etc/tmpfs-readlink-test, ENABLE_TMPFS_READLINK_TEST=1)
+# =====================================================================
+#
+# tmpfs now stores symlink targets in-RAM (fs/tmpfs.ad). This proves the
+# Linux-ABI readlink path consults tmpfs: it creates a tmpfs file plus a
+# tmpfs symlink with a KNOWN target string, then drives the REAL in-kernel
+# dispatch (linux_u_syscall_dispatch — the exact path a Debian/glibc
+# binary takes) for both SYS_readlink and SYS_readlinkat against the
+# symlink and asserts:
+#   * the returned byte count == the target length,
+#   * the bytes copied into the user buffer == the target string,
+#   * NO trailing NUL is written (the byte past the count is left clear),
+#   * readlink on a NON-symlink tmpfs file returns -EINVAL.
+# Prints a single "[TMPFS_READLINK] PASS" / "[TMPFS_READLINK] FAIL ..."
+# on the EMERG serial channel. A default boot ships no marker.
+
+
+def _trl_cstr_len(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def tmpfs_readlink_selftest() -> int32:
+    # boot:37 bootstrap-task fd-table prime (same uninitialised-table
+    # issue statfs_selftest handles): snapshot slots 3..15, mark them
+    # FD_CLOSED_MARK, restore on every exit.
+    boot_task: Ptr[TaskStruct] = current_task()
+    fd_save: Array[16, uint32]
+    fdi: uint64 = 3
+    while fdi < 16:
+        fd_save[fdi] = boot_task[0].fd_idx[fdi]
+        boot_task[0].fd_idx[fdi] = FD_CLOSED_MARK
+        fdi = fdi + 1
+
+    # --- create a tmpfs target file ------------------------------------
+    # tmpfs_open_for_write returns a SLOT (not an fd): write through the
+    # slot directly, no vfs_close needed (mirrors the msync selftest).
+    tgt_path: Ptr[char] = cast[Ptr[char]]("/tmp/trl-target")
+    wslot: int32 = tmpfs_open_for_write(tgt_path)
+    if wslot < 0:
+        printk1("[TMPFS_READLINK] FAIL target open=%d\n",
+                cast[uint64](cast[int64](wslot)))
+        _statfs_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    onebyte: Array[1, uint8]
+    onebyte[0] = 90                                       # 'Z'
+    tmpfs_write(wslot, &onebyte[0], 0, 1)
+
+    # --- create a tmpfs symlink with a KNOWN target string -------------
+    # The link itself lives at /tmp/trl-link; its stored target string is
+    # exactly tgt_path ("/tmp/trl-target", 15 bytes).
+    link_path: Ptr[char] = cast[Ptr[char]]("/tmp/trl-link")
+    crc: int32 = tmpfs_create_symlink(link_path, tgt_path)
+    if crc != 0:
+        printk1("[TMPFS_READLINK] FAIL create_symlink rc=%d\n",
+                cast[uint64](cast[int64](crc)))
+        _statfs_selftest_restore(boot_task, &fd_save[0])
+        return 1
+
+    want: Ptr[uint8] = cast[Ptr[uint8]]("/tmp/trl-target")
+    want_len: uint64 = _trl_cstr_len(want)
+
+    # --- SYS_readlink(/tmp/trl-link) : byte count == target length -----
+    rl_buf: Array[64, uint8]
+    bi: uint64 = 0
+    while bi < 64:
+        rl_buf[bi] = 0
+        bi = bi + 1
+    rl_n: int64 = _uabi_test_dispatch(SYS_readlink,
+                                      cast[uint64](link_path),
+                                      cast[uint64](&rl_buf[0]), 64, 0)
+    if rl_n != cast[int64](want_len):
+        printk2("[TMPFS_READLINK] FAIL readlink rc=%d want=%d\n",
+                cast[uint64](rl_n), want_len)
+        _statfs_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    ci: uint64 = 0
+    while ci < want_len:
+        if rl_buf[ci] != want[ci]:
+            printk1("[TMPFS_READLINK] FAIL readlink byte mismatch @%d\n", ci)
+            _statfs_selftest_restore(boot_task, &fd_save[0])
+            return 1
+        ci = ci + 1
+    # readlink(2) writes NO trailing NUL: the byte just past the count
+    # must still be the cleared 0 we pre-seeded.
+    if rl_buf[want_len] != 0:
+        printk0("[TMPFS_READLINK] FAIL readlink wrote trailing NUL\n")
+        _statfs_selftest_restore(boot_task, &fd_save[0])
+        return 1
+
+    # --- SYS_readlinkat(AT_FDCWD, /tmp/trl-link) : same result ---------
+    ra_buf: Array[64, uint8]
+    bj: uint64 = 0
+    while bj < 64:
+        ra_buf[bj] = 0
+        bj = bj + 1
+    ra_n: int64 = linux_u_syscall_dispatch(SYS_readlinkat, AT_FDCWD_U64,
+                                           cast[uint64](link_path),
+                                           cast[uint64](&ra_buf[0]),
+                                           64, 0, 0)
+    if ra_n != cast[int64](want_len):
+        printk2("[TMPFS_READLINK] FAIL readlinkat rc=%d want=%d\n",
+                cast[uint64](ra_n), want_len)
+        _statfs_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    cj: uint64 = 0
+    while cj < want_len:
+        if ra_buf[cj] != want[cj]:
+            printk1("[TMPFS_READLINK] FAIL readlinkat byte mismatch @%d\n", cj)
+            _statfs_selftest_restore(boot_task, &fd_save[0])
+            return 1
+        cj = cj + 1
+
+    # --- truncation: bufsiz < target → exactly bufsiz bytes, no more ----
+    tr_buf: Array[8, uint8]
+    tk: uint64 = 0
+    while tk < 8:
+        tr_buf[tk] = 0
+        tk = tk + 1
+    tr_n: int64 = _uabi_test_dispatch(SYS_readlink,
+                                      cast[uint64](link_path),
+                                      cast[uint64](&tr_buf[0]), 4, 0)
+    if tr_n != 4:
+        printk1("[TMPFS_READLINK] FAIL readlink trunc rc=%d (want 4)\n",
+                cast[uint64](tr_n))
+        _statfs_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    tc: uint64 = 0
+    while tc < 4:
+        if tr_buf[tc] != want[tc]:
+            printk0("[TMPFS_READLINK] FAIL readlink trunc bytes\n")
+            _statfs_selftest_restore(boot_task, &fd_save[0])
+            return 1
+        tc = tc + 1
+
+    # --- readlink on a NON-symlink tmpfs file → -EINVAL ----------------
+    ni_n: int64 = _uabi_test_dispatch(SYS_readlink,
+                                      cast[uint64](tgt_path),
+                                      cast[uint64](&rl_buf[0]), 64, 0)
+    if ni_n != ELINUX_INVAL:
+        printk1("[TMPFS_READLINK] FAIL non-symlink rc=%d (want -22)\n",
+                cast[uint64](ni_n))
+        _statfs_selftest_restore(boot_task, &fd_save[0])
+        return 1
+
+    # --- cleanup: drop the symlink + target so the table is pristine ----
+    tmpfs_unlink(link_path)
+    tmpfs_unlink(tgt_path)
+
+    _statfs_selftest_restore(boot_task, &fd_save[0])
+    printk0("[TMPFS_READLINK] PASS\n")
+    return 0
 
 
 # =====================================================================
