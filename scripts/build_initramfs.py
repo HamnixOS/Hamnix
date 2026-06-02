@@ -310,6 +310,18 @@ if os.environ.get("ENABLE_ACPI_TEST") == "1":
 if os.environ.get("ENABLE_MM_TEST") == "1":
     FILES.append(("/etc/mm-test", b"1\n"))
 
+# task #178: selectable-keyboard-layout self-test. scripts/test_keymap.sh
+# sets ENABLE_KEYMAP_TEST=1 to plant /etc/keymap-test. init/main.ad at
+# boot:37.km detects the marker and calls keymap_selftest()
+# (drivers/input/atkbd.ad): it feeds fixed Set-1 make-codes through the
+# scancode->char translator under each of the US/DE/FR layouts and
+# asserts per-layout characters (same key gives US 'y' but DE 'z';
+# AltGr+Q='@' under DE; AZERTY 'a' under FR; shifted symbols), proving
+# the runtime layout switch really re-routes translation. Default boots
+# omit the marker so the self-test never fires unintentionally.
+if os.environ.get("ENABLE_KEYMAP_TEST") == "1":
+    FILES.append(("/etc/keymap-test", b"ENABLE_KEYMAP_TEST=1\n"))
+
 # #149: ext4 JBD2 journal crash-consistency self-test. scripts/
 # test_ext4_journal.sh sets ENABLE_EXT4_JOURNAL_TEST=1 to plant
 # /etc/ext4-journal-test. init/main.ad detects the marker after the
