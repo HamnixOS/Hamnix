@@ -914,6 +914,89 @@ def copyin_path(uptr: uint64, kdst: Ptr[uint8], cap: uint64) -> int64:
     return r
 
 
+# ===========================================================================
+# uaccess (#163, keystone final piece): kernel-side snapshot of the caller's
+# argv[]/envp[] — the LAST raw user-pointer deref in the exec path.
+#
+# do_execve tears down the outgoing address space (vma_clear) and reinstalls
+# the new image's mappings into the task's PML4 (elf_apply_last_user_mapping +
+# load_cr3) BEFORE the init-stack builders run. The builders historically
+# raw-dereferenced the caller's argv/envp (a1/a2) at that late point, which
+# only worked because low memory was identity-mapped (vaddr == phys) and the
+# old mappings happened to survive the in-place PML4 mutation. That is exactly
+# the cheat #163 exists to kill: it makes ET_DYN / mmap-base ASLR impossible.
+#
+# The fix mirrors Linux's copy_strings(): deep-copy the argv/envp arrays AND
+# their strings into kernel BSS at the very TOP of do_execve — while the
+# caller's page tables still fully map its address space — translating every
+# user pointer through the current task's PML4 via get_user_64 /
+# strncpy_from_user. The builders then consume these kernel-resident arrays
+# (reachable in every CR3, higher-half), so they stay correct even once the
+# new image's user vaddr != phys. A faulting user pointer returns -EFAULT
+# here, BEFORE any teardown, leaving the caller intact.
+#
+# Single global snapshot: execve is already serialized at this granularity
+# (elf_load_blob uses global elf_last_* state), so one BSS buffer is correct.
+EXEC_ARG_BLOB_SZ: uint64 = 24576              # argv(16*256) + envp(64*256) + slack
+_exec_str_blob:  Array[24576, uint8]
+_exec_argv_ptrs: Array[17, uint64]            # MAX_ARGV + NULL terminator
+_exec_envp_ptrs: Array[65, uint64]            # MAX_ENVP + NULL terminator
+
+
+def _exec_snapshot_one(arr_user: uint64, out_ptrs: Ptr[uint64],
+                       max_entries: uint64, max_bytes: uint64,
+                       blob_base: uint64, blob_off_io: Ptr[uint64]) -> int64:
+    # Copy one NULL-terminated user array of cstring pointers (argv or envp)
+    # into the kernel blob. out_ptrs[] receives kernel addresses of each
+    # copied string and is NULL-terminated. blob_off_io is the shared bump
+    # cursor into _exec_str_blob (advanced past each string + its NUL).
+    # Returns the entry count (>= 0) on success, or -14 (-EFAULT) on a
+    # faulting user pointer. arr_user == 0 yields an empty (count 0) array.
+    n: uint64 = 0
+    if arr_user != 0:
+        while n < max_entries:
+            slot: uint64 = 0
+            if get_user_64(arr_user + n * 8, &slot) < 0:
+                return cast[int64](-14)
+            if slot == 0:
+                break
+            off: uint64 = blob_off_io[0]
+            cap: uint64 = max_bytes
+            if off + cap > EXEC_ARG_BLOB_SZ:
+                cap = EXEC_ARG_BLOB_SZ - off
+            if cap == 0:
+                break                              # blob exhausted; stop early
+            r: int64 = strncpy_from_user(blob_base + off, slot, cap)
+            if r < 0:
+                return cast[int64](-14)
+            out_ptrs[n] = blob_base + off
+            blob_off_io[0] = off + cast[uint64](r) + 1   # incl. NUL
+            n = n + 1
+    out_ptrs[n] = 0                                # NULL-terminate
+    return cast[int64](n)
+
+
+def exec_snapshot_args(argv_user: uint64, envp_user: uint64) -> int64:
+    # Front-load BOTH argv and envp into kernel BSS before any address-space
+    # teardown. Returns 0 on success, -14 (-EFAULT) if any user pointer
+    # faults. On return, _exec_argv_ptrs / _exec_envp_ptrs are kernel-resident
+    # NULL-terminated arrays the init-stack builders consume in place of the
+    # raw user a1/a2.
+    blob_base: uint64 = cast[uint64](&_exec_str_blob[0])
+    blob_off: uint64 = 0
+    ra: int64 = _exec_snapshot_one(argv_user, &_exec_argv_ptrs[0],
+                                   MAX_ARGV, MAX_ARG_BYTES,
+                                   blob_base, &blob_off)
+    if ra < 0:
+        return ra
+    re: int64 = _exec_snapshot_one(envp_user, &_exec_envp_ptrs[0],
+                                   MAX_ENVP, MAX_ENV_BYTES,
+                                   blob_base, &blob_off)
+    if re < 0:
+        return re
+    return 0
+
+
 def _argv_strlen(s: uint64) -> uint64:
     n: uint64 = 0
     while cast[Ptr[uint8]](s + n)[0] != 0 and n < MAX_ARG_BYTES:
@@ -1285,11 +1368,13 @@ def do_execve(a0: uint64, a1: uint64, a2: uint64) -> int64:
     # buffer through the page-table-walking strncpy_from_user, so the
     # ns_blob_ptr / vfs_perm_check_exec lookups operate on a kernel copy
     # rather than raw-dereferencing the user vaddr (vaddr != phys safe).
-    # NOTE: the argv (a1) / envp (a2) ARRAYS are deliberately still read
-    # raw by the _build_user_argv* init-stack builders below — converting
-    # those is a separate, larger job (the builders also STORE into the
-    # identity-mapped user stack, which the stack-ASLR design pins at
-    # vaddr == phys). Left for a follow-up batch.
+    # uaccess (#163 keystone final): the argv (a1) / envp (a2) ARRAYS are now
+    # ALSO pulled through the page-table-walking uaccess layer — see
+    # exec_snapshot_args() below, called before any address-space teardown.
+    # The builders consume that kernel-resident snapshot, so NO raw user
+    # deref remains in the exec path. (The builders still STORE into the
+    # identity-mapped new user stack; flipping that stack to vaddr != phys is
+    # the separate ET_DYN / mmap-base ASLR enablement step.)
     exec_kpath: Array[256, uint8]
     if copyin_path(a0, &exec_kpath[0], 256) < 0:
         set_current_errstr("execve: bad path address")
@@ -1309,6 +1394,16 @@ def do_execve(a0: uint64, a1: uint64, a2: uint64) -> int64:
         set_current_errstr("execve: file does not exist")
         return cast[int64](-2)            # -ENOENT
     sz: uint64 = ns_blob_size(path)
+    # uaccess (#163 keystone final): snapshot the caller's argv/envp into
+    # kernel BSS NOW — before vma_clear / load_cr3 tear down and replace the
+    # caller's address space. The init-stack builders below then read these
+    # kernel-resident arrays instead of raw-dereferencing a1/a2, so they stay
+    # correct once the new image's user vaddr != phys (ET_DYN / mmap ASLR).
+    # A faulting user pointer returns -EFAULT here, while the caller is still
+    # fully intact (no teardown has happened yet).
+    if exec_snapshot_args(a1, a2) < 0:
+        set_current_errstr("execve: bad argv/envp address")
+        return cast[int64](-14)           # -EFAULT
     # U42 VMA: drop the outgoing image's mappings BEFORE we load the
     # new ELF. Without this, the new program would inherit the parent
     # image's stack/heap/mmap VMAs and a subsequent mprotect or munmap
@@ -1455,11 +1550,17 @@ def do_execve(a0: uint64, a1: uint64, a2: uint64) -> int64:
         # U20: pass entry + load base so the auxv carries
         # AT_ENTRY / AT_PHDR / AT_PHNUM for glibc/musl's own
         # _dl_relocate_static_pie pass.
-        new_rsp = _build_user_argv_linux(new_ustack_top, a1, a2,
+        # uaccess (#163): builders consume the kernel-resident argv/envp
+        # snapshot (exec_snapshot_args above), NOT raw user a1/a2 — those no
+        # longer resolve now that CR3 holds the new image's mappings.
+        new_rsp = _build_user_argv_linux(new_ustack_top,
+                                         cast[uint64](&_exec_argv_ptrs[0]),
+                                         cast[uint64](&_exec_envp_ptrs[0]),
                                          entry, elf_last_load_base,
                                          vdso_ehdr)
     else:
-        new_rsp = _build_user_argv(new_ustack_top, a1,
+        new_rsp = _build_user_argv(new_ustack_top,
+                                   cast[uint64](&_exec_argv_ptrs[0]),
                                    &argc_out, &argv_out)
     printk2("execve: jumping to %p with stack %p\n",
             entry, new_rsp)
@@ -2392,14 +2493,21 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
             set_current_errstr("spawn: bad path address")
             return cast[uint64](-14)             # -EFAULT
         # uaccess: copy the path string into a kernel buffer first; the
-        # ns_blob_ptr / ns_blob_size lookups read the kernel copy. (argv
-        # a1 / envp a4 ARRAYS stay raw — same _build_user_argv* punt as
-        # do_execve, noted there.)
+        # ns_blob_ptr / ns_blob_size lookups read the kernel copy. The argv
+        # (a1) / envp (a4) ARRAYS are snapshotted into kernel BSS below
+        # (exec_snapshot_args), same as do_execve — no raw user deref remains.
         spawn_kpath: Array[256, uint8]
         if copyin_path(a0, &spawn_kpath[0], 256) < 0:
             set_current_errstr("spawn: bad path address")
             return cast[uint64](-14)             # -EFAULT
         path: Ptr[char] = cast[Ptr[char]](&spawn_kpath[0])
+        # uaccess (#163): snapshot the parent's argv/envp into kernel BSS
+        # while the PARENT is current (spawn never switches CR3 away from the
+        # caller), translating each user pointer through the parent's PML4.
+        # The init-stack builders below consume the kernel-resident arrays.
+        if exec_snapshot_args(a1, a4) < 0:
+            set_current_errstr("spawn: bad argv/envp address")
+            return cast[uint64](-14)           # -EFAULT
         blob: uint64 = ns_blob_ptr(path)
         if blob == 0:
             set_current_errstr("spawn: file does not exist")
@@ -2445,11 +2553,14 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
             # vaddr (same in every address space). We plant it now; the
             # actual page mapping into the child's PML4 happens after
             # create_user_task_argv gives us the child slot (below).
-            new_rsp = _build_user_argv_linux(ustack_top, a1, a4,
+            new_rsp = _build_user_argv_linux(ustack_top,
+                                             cast[uint64](&_exec_argv_ptrs[0]),
+                                             cast[uint64](&_exec_envp_ptrs[0]),
                                              entry, elf_last_load_base,
                                              vdso_user_code_vaddr())
         else:
-            new_rsp = _build_user_argv(ustack_top, a1,
+            new_rsp = _build_user_argv(ustack_top,
+                                       cast[uint64](&_exec_argv_ptrs[0]),
                                        &argc_out, &argv_out)
         slot: int32 = create_user_task_argv(
             entry, 0x5f5f7370776e5f5f,         # "__spwn__"
