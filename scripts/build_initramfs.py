@@ -614,6 +614,19 @@ if os.environ.get("ENABLE_FAT16_MKFS_TEST") == "1":
 if os.environ.get("ENABLE_FAT32_MKFS_TEST") == "1":
     FILES.append(("/etc/fat32-mkfs-test", b"1\n"))
 
+# FAT directory cross-cluster growth self-test. scripts/test_fat_dirgrow.sh
+# sets ENABLE_FAT_DIRGROW_TEST=1 to plant /etc/fat-dirgrow-test. init/main.ad
+# at boot:37.dgr detects the marker and calls fat_dirgrow_selftest()
+# (fs/fat.ad): it lays down a tiny FAT32 volume on the AHCI scratch disk
+# registered as "sd0" with 512-byte clusters (16 dirents/cluster), creates
+# 24 files in the root directory — forcing the root dirent region to grow
+# past its first cluster into a freshly-allocated, chain-linked second
+# cluster — then re-looks-up every file by name to prove entries in the
+# grown cluster are reachable. Requires the test to attach a QEMU ich9-ahci
+# disk. Default boots omit the marker so it never fires.
+if os.environ.get("ENABLE_FAT_DIRGROW_TEST") == "1":
+    FILES.append(("/etc/fat-dirgrow-test", b"1\n"))
+
 # Plan-9 namespace bind/mount/unmount self-test. scripts/test_bind.sh sets
 # ENABLE_BIND_TEST=1 to plant /etc/bind-test plus two source directories
 # of fixture files. init/main.ad at boot:37.bind detects the marker and

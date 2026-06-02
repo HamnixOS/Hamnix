@@ -20,9 +20,12 @@
 
 from kernel.block.blk import (
     blk_read_sectors, blk_write_sectors, blk_capacity_sectors,
-    SECTOR_SIZE,
+    find_blockdev, SECTOR_SIZE,
 )
-from kernel.printk.printk import printk0, printk1, printk2
+from kernel.printk.printk import (
+    printk0, printk1, printk2,
+    printk_set_level, PRINTK_LEVEL_EMERG,
+)
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
@@ -673,16 +676,13 @@ def _fat_free_chain(first_cluster: uint64) -> int32:
 
 # --- directory entry create / delete ------------------------------
 
-def _fat_dir_find_free_slot(dir_cluster: uint64,
-                            out_lba: Ptr[uint64],
-                            out_off: Ptr[uint64]) -> int32:
-    # Scan the directory's first cluster for a usable 32-byte slot —
-    # either an end-of-directory sentinel (first byte 0x00) or a
-    # deleted entry (first byte 0xE5). Fills out_lba + out_off with the
-    # slot's location. Returns 1 on hit, 0 if the cluster is full.
-    #
-    # Single-cluster directory scope: our root + subdir each fit one
-    # cluster; growing a directory across clusters is a follow-up.
+def _fat_dir_scan_cluster_for_slot(dir_cluster: uint64,
+                                   out_lba: Ptr[uint64],
+                                   out_off: Ptr[uint64]) -> int32:
+    # Scan a SINGLE directory cluster for a usable 32-byte slot — either
+    # an end-of-directory sentinel (first byte 0x00) or a deleted entry
+    # (first byte 0xE5). Fills out_lba + out_off with the slot's
+    # location. Returns 1 on hit, 0 if the cluster is full.
     sec: uint64 = 0
     while sec < fat_sectors_per_clu:
         lba: uint64 = _cluster_to_lba(dir_cluster) + sec
@@ -700,6 +700,53 @@ def _fat_dir_find_free_slot(dir_cluster: uint64,
             ei = ei + 1
         sec = sec + 1
     return 0
+
+
+def _fat_dir_find_free_slot(dir_cluster: uint64,
+                            out_lba: Ptr[uint64],
+                            out_off: Ptr[uint64]) -> int32:
+    # Find a usable 32-byte slot anywhere in the directory's cluster
+    # chain. Scans the first cluster; if it's full, follows the FAT
+    # chain and scans each successive cluster. When every cluster in
+    # the chain is full, GROWS the directory: allocate a fresh cluster,
+    # zero it (so its 0x00 bytes act as the end-of-dir sentinel), link
+    # it onto the END of the chain, and return its first slot.
+    # Returns 1 on hit, 0 on I/O error / volume full.
+    #
+    # Directories grow across an arbitrary cluster chain — mirroring
+    # the file-data growth path in fat_write(). Same primitives:
+    # _fat_alloc_cluster + _fat_zero_cluster + _fat_set_cluster link.
+    cluster: uint64 = dir_cluster
+    safety:  uint64 = _fat_total_clusters() + 4
+    while True:
+        if _fat_dir_scan_cluster_for_slot(cluster, out_lba,
+                                          out_off) != 0:
+            return 1
+        # This cluster is full. Follow the chain to the next cluster.
+        nxt: uint32 = _fat_lookup_cluster(cluster)
+        if _is_end_of_chain(nxt) != 0:
+            # End of chain reached and every cluster was full — grow.
+            nc: uint64 = _fat_alloc_cluster()
+            if nc == 0:
+                return 0
+            if _fat_zero_cluster(nc) != 0:
+                _fat_set_cluster(nc, 0)
+                return 0
+            # Link the previously-last cluster to the new one. nc was
+            # stamped EOC by _fat_alloc_cluster, so the chain stays
+            # terminated.
+            if _fat_set_cluster(cluster, cast[uint32](nc)) != 0:
+                _fat_set_cluster(nc, 0)
+                return 0
+            # The new cluster is all-zero: its first slot is free.
+            out_lba[0] = _cluster_to_lba(nc)
+            out_off[0] = 0
+            return 1
+        if safety == 0:
+            printk0("fat: dir chain too long (corrupt?)\n")
+            return 0
+        safety = safety - 1
+        cluster = cast[uint64](nxt)
 
 
 def _fat_write_dir_entry(lba: uint64, off: uint64, name83: Ptr[uint8],
@@ -744,39 +791,50 @@ def _fat_dir_find_entry(dir_cluster: uint64, target83: Ptr[uint8],
                         out_lba: Ptr[uint64], out_off: Ptr[uint64],
                         out_cluster: Ptr[uint64],
                         out_size: Ptr[uint64]) -> int32:
-    # Locate the live 8.3 entry matching `target83` in the directory's
-    # first cluster. Fills the slot location + first cluster + size.
-    # Returns 1 on hit, 0 on miss.
-    sec: uint64 = 0
-    while sec < fat_sectors_per_clu:
-        lba: uint64 = _cluster_to_lba(dir_cluster) + sec
-        if blk_read_sectors(fat_blockdev_slot, lba, 1,
-                            &fat_sector_buf[0]) != 0:
+    # Locate the live 8.3 entry matching `target83` anywhere in the
+    # directory's cluster chain. Fills the slot location + first cluster
+    # + size. Returns 1 on hit, 0 on miss. Follows the FAT chain so
+    # entries in a grown (2nd+) directory cluster are still found.
+    cluster: uint64 = dir_cluster
+    safety:  uint64 = _fat_total_clusters() + 4
+    while _is_end_of_chain(cast[uint32](cluster)) == 0 and cluster >= 2:
+        sec: uint64 = 0
+        while sec < fat_sectors_per_clu:
+            lba: uint64 = _cluster_to_lba(cluster) + sec
+            if blk_read_sectors(fat_blockdev_slot, lba, 1,
+                                &fat_sector_buf[0]) != 0:
+                return 0
+            n: uint64 = _dir_entries_per_sector()
+            ei: uint64 = 0
+            while ei < n:
+                entry: Ptr[uint8] = cast[Ptr[uint8]](
+                    cast[uint64](&fat_sector_buf[0]) + ei * 32)
+                first_byte: uint8 = entry[0]
+                if first_byte == 0:
+                    return 0                    # end-of-directory
+                attr: uint8 = entry[11]
+                if first_byte != 0xE5 and attr != 0x0F:
+                    if _name_match(entry, target83) != 0:
+                        hi: uint16 = _read_u16_le(
+                            cast[Ptr[uint8]](cast[uint64](entry) + 20))
+                        lo: uint16 = _read_u16_le(
+                            cast[Ptr[uint8]](cast[uint64](entry) + 26))
+                        out_cluster[0] = (cast[uint64](hi) << 16) \
+                                       | cast[uint64](lo)
+                        out_size[0] = cast[uint64](_read_u32_le(
+                            cast[Ptr[uint8]](cast[uint64](entry) + 28)))
+                        out_lba[0] = lba
+                        out_off[0] = ei * 32
+                        return 1
+                ei = ei + 1
+            sec = sec + 1
+        if safety == 0:
             return 0
-        n: uint64 = _dir_entries_per_sector()
-        ei: uint64 = 0
-        while ei < n:
-            entry: Ptr[uint8] = cast[Ptr[uint8]](
-                cast[uint64](&fat_sector_buf[0]) + ei * 32)
-            first_byte: uint8 = entry[0]
-            if first_byte == 0:
-                return 0                        # end-of-directory
-            attr: uint8 = entry[11]
-            if first_byte != 0xE5 and attr != 0x0F:
-                if _name_match(entry, target83) != 0:
-                    hi: uint16 = _read_u16_le(
-                        cast[Ptr[uint8]](cast[uint64](entry) + 20))
-                    lo: uint16 = _read_u16_le(
-                        cast[Ptr[uint8]](cast[uint64](entry) + 26))
-                    out_cluster[0] = (cast[uint64](hi) << 16) \
-                                   | cast[uint64](lo)
-                    out_size[0] = cast[uint64](_read_u32_le(
-                        cast[Ptr[uint8]](cast[uint64](entry) + 28)))
-                    out_lba[0] = lba
-                    out_off[0] = ei * 32
-                    return 1
-            ei = ei + 1
-        sec = sec + 1
+        safety = safety - 1
+        nxt: uint32 = _fat_lookup_cluster(cluster)
+        if _is_end_of_chain(nxt) != 0:
+            return 0
+        cluster = cast[uint64](nxt)
     return 0
 
 
@@ -1197,3 +1255,183 @@ def strip_mnt_prefix(name: Ptr[char]) -> Ptr[char]:
     # /mnt/ is 5 chars; the byte beyond it is the basename's first
     # char. Caller has already verified is_fat_path returned true.
     return cast[Ptr[char]](cast[uint64](name) + 5)
+
+
+# --- directory-growth boot self-test ------------------------------
+#
+# Proves _fat_dir_find_free_slot grows a directory across a cluster
+# boundary. The test lays down a fresh, tiny FAT32 volume on the AHCI
+# scratch disk (sd0) with sectors_per_cluster=1 — a 512-byte cluster
+# holds exactly 16 directory entries. It then mounts the volume via
+# fat_init and fat_creates MORE than 16 files in the root directory,
+# which forces the root dirent region past its first cluster and into
+# a freshly-allocated, chain-linked second cluster. Finally every
+# created file is re-looked-up by name; a hit on the files that landed
+# in the GROWN (2nd+) cluster proves both the chain-follow scan and
+# the grow-on-exhaustion link are correct.
+#
+# A small geometry is laid down by hand (rather than via fat_mkfs,
+# which hardcodes 16 KiB clusters and a fixed FAT12 root region that
+# doesn't grow). sectors_per_cluster=1 + FAT32 cluster-chained root is
+# exactly the build_diskimg.py baked-image shape, scaled up.
+
+_DG_TOTAL_SECTORS:  uint64 = 512        # 256 KiB volume
+_DG_RESERVED:       uint64 = 16
+_DG_NUM_FATS:       uint64 = 1
+_DG_SECTORS_PER_FAT: uint64 = 2         # 256 u32 entries — plenty
+_DG_ROOT_CLUSTER:   uint64 = 2
+_DG_FILES:          uint64 = 24         # > 16 entries/cluster
+
+_dg_buf: Array[512, uint8]
+
+
+def _dg_zero_buf():
+    i: uint64 = 0
+    while i < SECTOR_SIZE:
+        _dg_buf[i] = 0
+        i = i + 1
+
+
+def _dg_format(slot: int32) -> int32:
+    # Write a minimal FAT32 volume: BPB, one FAT (entries 0/1 reserved,
+    # entry 2 = root EOC), and a zeroed root cluster. Returns 0 / -1.
+    p: Ptr[uint8] = &_dg_buf[0]
+
+    # --- boot sector / BPB ---
+    _dg_zero_buf()
+    p[0] = 0xEB
+    p[1] = 0x3C
+    p[2] = 0x90
+    _write_u16_le(cast[Ptr[uint8]](cast[uint64](p) + 11),
+                  cast[uint16](SECTOR_SIZE))         # bytes/sector
+    p[13] = 1                                         # sectors/cluster
+    _write_u16_le(cast[Ptr[uint8]](cast[uint64](p) + 14),
+                  cast[uint16](_DG_RESERVED))         # reserved sectors
+    p[16] = cast[uint8](_DG_NUM_FATS)                 # FAT count
+    _write_u16_le(cast[Ptr[uint8]](cast[uint64](p) + 17),
+                  cast[uint16](0))                    # root entries (0=FAT32)
+    _write_u16_le(cast[Ptr[uint8]](cast[uint64](p) + 19),
+                  cast[uint16](0))                    # total_sectors_16 (0)
+    p[21] = 0xF8                                      # media descriptor
+    _write_u16_le(cast[Ptr[uint8]](cast[uint64](p) + 22),
+                  cast[uint16](0))                    # sectors/FAT_16 (0=FAT32)
+    _write_u32_le(cast[Ptr[uint8]](cast[uint64](p) + 32),
+                  cast[uint32](_DG_TOTAL_SECTORS))    # total_sectors_32
+    _write_u32_le(cast[Ptr[uint8]](cast[uint64](p) + 36),
+                  cast[uint32](_DG_SECTORS_PER_FAT))  # sectors/FAT_32
+    _write_u32_le(cast[Ptr[uint8]](cast[uint64](p) + 44),
+                  cast[uint32](_DG_ROOT_CLUSTER))     # root cluster
+    p[510] = 0x55
+    p[511] = 0xAA
+    if blk_write_sectors(slot, 0, 1, p) != 0:
+        return -1
+
+    # --- FAT region: zero every sector, then seed the first one ---
+    fat_lba: uint64 = _DG_RESERVED
+    s: uint64 = 0
+    while s < _DG_SECTORS_PER_FAT:
+        _dg_zero_buf()
+        if s == 0:
+            # entry 0 = media + 0x0FFFFF00, entry 1 = EOC, entry 2
+            # (root) = EOC.
+            _write_u32_le(&_dg_buf[0], 0x0FFFFFF8)
+            _write_u32_le(cast[Ptr[uint8]](cast[uint64](&_dg_buf[0]) + 4),
+                          0x0FFFFFFF)
+            _write_u32_le(cast[Ptr[uint8]](cast[uint64](&_dg_buf[0]) + 8),
+                          0x0FFFFFFF)
+        if blk_write_sectors(slot, fat_lba + s, 1, &_dg_buf[0]) != 0:
+            return -1
+        s = s + 1
+
+    # --- root cluster (cluster 2): zero it so 0x00 is end-of-dir ---
+    _dg_zero_buf()
+    root_lba: uint64 = _DG_RESERVED + _DG_NUM_FATS * _DG_SECTORS_PER_FAT
+    if blk_write_sectors(slot, root_lba, 1, &_dg_buf[0]) != 0:
+        return -1
+    return 0
+
+
+def _dg_make_name(idx: uint64, out: Ptr[uint8]):
+    # Build "FILEnn.TXT\0" into out (caller buffer >= 12 bytes).
+    out[0] = 70                                        # 'F'
+    out[1] = 73                                        # 'I'
+    out[2] = 76                                        # 'L'
+    out[3] = 69                                        # 'E'
+    out[4] = cast[uint8](48 + (idx / 10) % 10)         # tens digit
+    out[5] = cast[uint8](48 + idx % 10)                # ones digit
+    out[6] = 46                                        # '.'
+    out[7] = 84                                        # 'T'
+    out[8] = 88                                        # 'X'
+    out[9] = 84                                        # 'T'
+    out[10] = 0
+
+
+def fat_dirgrow_selftest() -> int32:
+    # Format + mount a tiny FAT32 volume on sd0, create _DG_FILES files
+    # in the root (forcing growth past the first 16-entry cluster), then
+    # re-look-up every file by name. Prints [FAT_DIRGROW] PASS / FAIL.
+    # Returns 1 on PASS, 0 on FAIL.
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0("[FAT_DIRGROW] self-test start\n")
+
+    slot: int32 = find_blockdev("sd0")
+    if slot < 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[FAT_DIRGROW] FAIL: sd0 not registered\n")
+        return 0
+
+    if _dg_format(slot) != 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[FAT_DIRGROW] FAIL: format I/O error\n")
+        return 0
+
+    if fat_init(slot) != 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[FAT_DIRGROW] FAIL: fat_init failed\n")
+        return 0
+
+    # Create _DG_FILES files in the root directory.
+    name: Array[16, uint8]
+    i: uint64 = 0
+    while i < _DG_FILES:
+        _dg_make_name(i, &name[0])
+        if fat_create(cast[Ptr[char]](&name[0])) != 0:
+            printk_set_level(PRINTK_LEVEL_EMERG)
+            printk1("[FAT_DIRGROW] FAIL: create failed at file %d\n", i)
+            return 0
+        i = i + 1
+
+    # Confirm the root directory really grew past one cluster: its FAT
+    # chain head (cluster 2) must now point at a second cluster.
+    nxt: uint32 = _fat_lookup_cluster(_DG_ROOT_CLUSTER)
+    if _is_end_of_chain(nxt) != 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[FAT_DIRGROW] FAIL: root dir did not grow (still 1 cluster)\n")
+        return 0
+
+    # Re-look-up every file by name. Files past index 15 live in the
+    # grown 2nd cluster, so a hit there proves the chain-follow scan.
+    found: uint64 = 0
+    j: uint64 = 0
+    while j < _DG_FILES:
+        _dg_make_name(j, &name[0])
+        out_cluster: uint64 = 0
+        out_size:    uint64 = 0
+        if fat_lookup(cast[Ptr[char]](&name[0]),
+                      &out_cluster, &out_size) == 0:
+            printk_set_level(PRINTK_LEVEL_EMERG)
+            printk1("[FAT_DIRGROW] FAIL: file %d not found after grow\n", j)
+            return 0
+        found = found + 1
+        j = j + 1
+
+    if found != _DG_FILES:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk2("[FAT_DIRGROW] FAIL: found %d of %d files\n",
+                found, _DG_FILES)
+        return 0
+
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk1("[FAT_DIRGROW] PASS (%d files reachable across grown dir)\n",
+            found)
+    return 1
