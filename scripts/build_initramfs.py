@@ -358,6 +358,19 @@ if os.environ.get("ENABLE_EFI_TEST") == "1":
 if os.environ.get("ENABLE_NSCAP_TEST") == "1":
     FILES.append(("/etc/nscap-test", b"ENABLE_NSCAP_TEST=1\n"))
 
+# Native packet-filter firewall self-test. scripts/test_firewall.sh sets
+# ENABLE_FIREWALL_TEST=1 to plant /etc/firewall-test. init/main.ad at
+# boot:37.fw detects the marker and calls firewall_selftest()
+# (drivers/net/firewall.ad): it drives the REAL _fw_evaluate verdict
+# engine (the exact function the ip_rx/ip_send enforcement hooks call)
+# to prove a DROP rule drops a matching tcp dport-23 packet (and bumps
+# its hit counter) while a non-matching dport-80 packet is ACCEPTed, and
+# to prove stateful conntrack lets an established reply (returning
+# SYN-ACK) through a default-drop-inbound policy that would otherwise
+# discard it. Default boots omit the marker so it never fires.
+if os.environ.get("ENABLE_FIREWALL_TEST") == "1":
+    FILES.append(("/etc/firewall-test", b"ENABLE_FIREWALL_TEST=1\n"))
+
 # #149: ext4 JBD2 journal crash-consistency self-test. scripts/
 # test_ext4_journal.sh sets ENABLE_EXT4_JOURNAL_TEST=1 to plant
 # /etc/ext4-journal-test. init/main.ad detects the marker after the

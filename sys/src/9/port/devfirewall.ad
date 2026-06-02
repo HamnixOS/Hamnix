@@ -1,0 +1,440 @@
+# sys/src/port9/port/devfirewall.ad
+#
+# The Plan-9-shape control surface for the native packet-filter firewall
+# (drivers/net/firewall.ad). /dev/firewall is a stateful READ + WRITE
+# pseudo-file in the introspection family — a sibling of /dev/hostname
+# and /dev/keymap — NOT a Linux netfilter/iptables ioctl ABI. You add a
+# rule by writing a line; you list the ruleset (with per-rule hit
+# counters) by reading.
+#
+#   Write directives (one per write):
+#     "policy accept"  / "policy drop"          set the default policy
+#     "flush"                                   clear all rules + conntrack
+#     "<verdict> <dir> <proto> <src/N> [sport P] <dst/N> [dport P] [established]"
+#         verdict : accept | drop
+#         dir     : in | out | any
+#         proto   : tcp | udp | icmp | any
+#         src/N   : a.b.c.d/prefix  (0.0.0.0/0 == any)
+#         dst/N   : a.b.c.d/prefix
+#         sport/dport : optional, tcp/udp only
+#         established : optional trailing keyword — match only tracked
+#                       established flows (the stateful allow rule)
+#
+#     e.g.  echo 'drop in tcp 0.0.0.0/0 dport 23' > /dev/firewall
+#           echo 'accept in tcp 0.0.0.0/0 0.0.0.0/0 established' > /dev/firewall
+#           echo 'policy drop' > /dev/firewall
+#
+#   Read shape:
+#     "policy <accept|drop>\n"
+#     one "rule N: <verdict> <dir> <proto> ... hits=<count>\n" per rule
+#     "conntrack: <nflows> flows\n"
+#
+# Adder compiler-quirk note: the flat global symbol namespace across
+# merged modules means every shared-shape helper here is prefixed `_fwd_`
+# to avoid colliding with devhostname's `_hn_`, devkeymap's `_kmd_`, etc.
+
+from kernel.printk.printk import printk0, printk1
+from drivers.net.firewall import (
+    fw_set_policy, fw_get_policy, fw_flush, fw_add_rule,
+    fw_rule_count, fw_conn_count, fw_rule_hits,
+    fw_rule_dir, fw_rule_proto, fw_rule_verdict, fw_rule_flags,
+    fw_rule_src, fw_rule_smask, fw_rule_dst, fw_rule_dmask,
+    fw_rule_sport, fw_rule_dport,
+    FW_ACCEPT, FW_DROP,
+    FW_DIR_IN, FW_DIR_OUT, FW_DIR_ANY,
+    FW_PROTO_TCP, FW_PROTO_UDP, FW_PROTO_ICMP, FW_PROTO_ANY,
+    FW_MATCH_ESTABLISHED,
+)
+
+
+# Scratch for assembling read output. 64 rules × ~64 bytes + headers.
+_FWD_OUT_MAX: uint64 = 4096
+_fwd_out: Array[4096, uint8]
+
+
+# --- tiny parse helpers (no libc) -------------------------------------
+
+def _fwd_is_ws(c: uint8) -> int32:
+    if c == 32:                                       # ' '
+        return 1
+    if c == 9:                                        # '\t'
+        return 1
+    if c == 10:                                       # '\n'
+        return 1
+    if c == 13:                                       # '\r'
+        return 1
+    return 0
+
+
+def _fwd_tok_eq(buf: Ptr[uint8], start: uint64, end: uint64,
+                lit: Ptr[uint8]) -> int32:
+    # Compare buf[start..end) against a NUL-terminated literal.
+    i: uint64 = start
+    j: uint64 = 0
+    while i < end:
+        if lit[j] == 0:
+            return 0                                  # literal shorter
+        if buf[i] != lit[j]:
+            return 0
+        i = i + 1
+        j = j + 1
+    if lit[j] != 0:
+        return 0                                      # literal longer
+    return 1
+
+
+def _fwd_skip_ws(buf: Ptr[uint8], pos: uint64, end: uint64) -> uint64:
+    p: uint64 = pos
+    while p < end:
+        if _fwd_is_ws(buf[p]) == 0:
+            break
+        p = p + 1
+    return p
+
+
+def _fwd_tok_end(buf: Ptr[uint8], pos: uint64, end: uint64) -> uint64:
+    # Return the index of the first whitespace at/after pos (or end).
+    p: uint64 = pos
+    while p < end:
+        if _fwd_is_ws(buf[p]) == 1:
+            break
+        p = p + 1
+    return p
+
+
+def _fwd_parse_u32(buf: Ptr[uint8], start: uint64, end: uint64,
+                   out: Ptr[uint32]) -> uint64:
+    # Parse decimal digits from start; stop at the first non-digit or
+    # `end`. Writes the value to *out and returns the stop index.
+    v: uint32 = 0
+    p: uint64 = start
+    while p < end:
+        c: uint8 = buf[p]
+        if c < 48 or c > 57:
+            break
+        v = v * 10 + cast[uint32](c - 48)
+        p = p + 1
+    out[0] = v
+    return p
+
+
+def _fwd_parse_cidr(buf: Ptr[uint8], start: uint64, end: uint64,
+                    out_addr: Ptr[uint32], out_mask: Ptr[uint32]) -> int32:
+    # Parse "a.b.c.d/prefix" inside buf[start..end). Returns 1 on success.
+    p: uint64 = start
+    octs: Array[4, uint32]
+    k: uint64 = 0
+    while k < 4:
+        v: uint32 = 0
+        p = _fwd_parse_u32(buf, p, end, &v)
+        octs[k] = v & 0xFF
+        if k < 3:
+            if p >= end:
+                return 0
+            if buf[p] != 46:                          # '.'
+                return 0
+            p = p + 1
+        k = k + 1
+    prefix: uint32 = 32
+    if p < end:
+        if buf[p] == 47:                              # '/'
+            p = p + 1
+            pf: uint32 = 0
+            p = _fwd_parse_u32(buf, p, end, &pf)
+            prefix = pf
+    addr: uint32 = (octs[0] << 24) | (octs[1] << 16)
+    addr = addr | (octs[2] << 8) | octs[3]
+    out_addr[0] = addr
+    if prefix == 0:
+        out_mask[0] = 0
+    elif prefix >= 32:
+        out_mask[0] = 0xFFFFFFFF
+    else:
+        shift: uint64 = 32 - cast[uint64](prefix)
+        full: uint32 = 0xFFFFFFFF
+        out_mask[0] = cast[uint32]((cast[uint64](full) << shift) & 0xFFFFFFFF)
+    return 1
+
+
+# --- read: serialise the ruleset --------------------------------------
+
+def _fwd_emit_byte(pos: uint64, c: uint8) -> uint64:
+    if pos < _FWD_OUT_MAX:
+        _fwd_out[pos] = c
+        return pos + 1
+    return pos
+
+
+def _fwd_emit_str(pos: uint64, s: Ptr[uint8]) -> uint64:
+    p: uint64 = pos
+    i: uint64 = 0
+    while s[i] != 0:
+        p = _fwd_emit_byte(p, s[i])
+        i = i + 1
+    return p
+
+
+def _fwd_emit_u32(pos: uint64, v: uint32) -> uint64:
+    # Decimal, no leading zeros (except value 0 itself).
+    if v == 0:
+        return _fwd_emit_byte(pos, 48)                # '0'
+    digits: Array[12, uint8]
+    n: uint64 = 0
+    x: uint32 = v
+    while x > 0:
+        digits[n] = cast[uint8](48 + (x % 10))
+        x = x / 10
+        n = n + 1
+    p: uint64 = pos
+    while n > 0:
+        n = n - 1
+        p = _fwd_emit_byte(p, digits[n])
+    return p
+
+
+def _fwd_emit_addr(pos: uint64, addr: uint32, mask: uint32) -> uint64:
+    p: uint64 = pos
+    p = _fwd_emit_u32(p, (addr >> 24) & 0xFF)
+    p = _fwd_emit_byte(p, 46)                         # '.'
+    p = _fwd_emit_u32(p, (addr >> 16) & 0xFF)
+    p = _fwd_emit_byte(p, 46)
+    p = _fwd_emit_u32(p, (addr >> 8) & 0xFF)
+    p = _fwd_emit_byte(p, 46)
+    p = _fwd_emit_u32(p, addr & 0xFF)
+    p = _fwd_emit_byte(p, 47)                          # '/'
+    # mask → prefix length (popcount of the contiguous high bits).
+    prefix: uint32 = 0
+    m: uint32 = mask
+    while m != 0:
+        prefix = prefix + (m & 1)
+        m = m >> 1
+    p = _fwd_emit_u32(p, prefix)
+    return p
+
+
+def _fwd_build_output() -> uint64:
+    # Returns the number of bytes written into _fwd_out.
+    p: uint64 = 0
+    # policy line
+    p = _fwd_emit_str(p, "policy ")
+    if fw_get_policy() == FW_DROP:
+        p = _fwd_emit_str(p, "drop\n")
+    else:
+        p = _fwd_emit_str(p, "accept\n")
+    # one line per rule
+    nr: uint64 = fw_rule_count()
+    i: uint64 = 0
+    while i < nr:
+        p = _fwd_emit_str(p, "rule ")
+        p = _fwd_emit_u32(p, cast[uint32](i))
+        p = _fwd_emit_str(p, ": ")
+        if fw_rule_verdict(i) == FW_DROP:
+            p = _fwd_emit_str(p, "drop ")
+        else:
+            p = _fwd_emit_str(p, "accept ")
+        d: uint8 = fw_rule_dir(i)
+        if d == FW_DIR_IN:
+            p = _fwd_emit_str(p, "in ")
+        elif d == FW_DIR_OUT:
+            p = _fwd_emit_str(p, "out ")
+        else:
+            p = _fwd_emit_str(p, "any ")
+        pr: uint8 = fw_rule_proto(i)
+        if pr == FW_PROTO_TCP:
+            p = _fwd_emit_str(p, "tcp ")
+        elif pr == FW_PROTO_UDP:
+            p = _fwd_emit_str(p, "udp ")
+        elif pr == FW_PROTO_ICMP:
+            p = _fwd_emit_str(p, "icmp ")
+        else:
+            p = _fwd_emit_str(p, "any ")
+        p = _fwd_emit_addr(p, fw_rule_src(i), fw_rule_smask(i))
+        sp: uint16 = fw_rule_sport(i)
+        if sp != 0:
+            p = _fwd_emit_str(p, " sport ")
+            p = _fwd_emit_u32(p, cast[uint32](sp))
+        p = _fwd_emit_byte(p, 32)
+        p = _fwd_emit_addr(p, fw_rule_dst(i), fw_rule_dmask(i))
+        dp: uint16 = fw_rule_dport(i)
+        if dp != 0:
+            p = _fwd_emit_str(p, " dport ")
+            p = _fwd_emit_u32(p, cast[uint32](dp))
+        if (fw_rule_flags(i) & FW_MATCH_ESTABLISHED) != 0:
+            p = _fwd_emit_str(p, " established")
+        p = _fwd_emit_str(p, " hits=")
+        p = _fwd_emit_u32(p, cast[uint32](fw_rule_hits(i)))
+        p = _fwd_emit_byte(p, 10)                      # '\n'
+        i = i + 1
+    # conntrack summary
+    p = _fwd_emit_str(p, "conntrack ")
+    p = _fwd_emit_u32(p, cast[uint32](fw_conn_count()))
+    p = _fwd_emit_str(p, " flows\n")
+    return p
+
+
+def devfirewall_read(buf: Ptr[uint8], count: uint64, off: uint64) -> int64:
+    # Snapshot the whole ruleset into _fwd_out, then return the slice
+    # [off, off+count). Returns 0 at/after EOF so `cat` terminates.
+    total: uint64 = _fwd_build_output()
+    if off >= total:
+        return 0
+    avail: uint64 = total - off
+    take: uint64 = count
+    if take > avail:
+        take = avail
+    j: uint64 = 0
+    while j < take:
+        buf[j] = _fwd_out[off + j]
+        j = j + 1
+    return cast[int64](take)
+
+
+# --- write: parse one directive ---------------------------------------
+
+def _fwd_parse_dir(buf: Ptr[uint8], s: uint64, e: uint64,
+                   out: Ptr[uint8]) -> int32:
+    if _fwd_tok_eq(buf, s, e, "in") == 1:
+        out[0] = FW_DIR_IN
+        return 1
+    if _fwd_tok_eq(buf, s, e, "out") == 1:
+        out[0] = FW_DIR_OUT
+        return 1
+    if _fwd_tok_eq(buf, s, e, "any") == 1:
+        out[0] = FW_DIR_ANY
+        return 1
+    return 0
+
+
+def _fwd_parse_proto(buf: Ptr[uint8], s: uint64, e: uint64,
+                     out: Ptr[uint8]) -> int32:
+    if _fwd_tok_eq(buf, s, e, "tcp") == 1:
+        out[0] = FW_PROTO_TCP
+        return 1
+    if _fwd_tok_eq(buf, s, e, "udp") == 1:
+        out[0] = FW_PROTO_UDP
+        return 1
+    if _fwd_tok_eq(buf, s, e, "icmp") == 1:
+        out[0] = FW_PROTO_ICMP
+        return 1
+    if _fwd_tok_eq(buf, s, e, "any") == 1:
+        out[0] = FW_PROTO_ANY
+        return 1
+    return 0
+
+
+def devfirewall_write(buf: Ptr[uint8], count: uint64) -> int64:
+    # Parse exactly one directive from the caller's bytes. Always report
+    # the full `count` consumed so the writing shell's loop terminates,
+    # even on a malformed line (we log + ignore it, the Plan-9 way).
+    if count == 0:
+        return 0
+    end: uint64 = count
+
+    pos: uint64 = _fwd_skip_ws(buf, 0, end)
+    if pos >= end:
+        return cast[int64](count)
+    te: uint64 = _fwd_tok_end(buf, pos, end)
+
+    # --- "flush" ------------------------------------------------------
+    if _fwd_tok_eq(buf, pos, te, "flush") == 1:
+        fw_flush()
+        printk0("firewall: flushed\n")
+        return cast[int64](count)
+
+    # --- "policy <accept|drop>" --------------------------------------
+    if _fwd_tok_eq(buf, pos, te, "policy") == 1:
+        p2: uint64 = _fwd_skip_ws(buf, te, end)
+        e2: uint64 = _fwd_tok_end(buf, p2, end)
+        if _fwd_tok_eq(buf, p2, e2, "drop") == 1:
+            fw_set_policy(FW_DROP)
+            printk0("firewall: policy drop\n")
+        elif _fwd_tok_eq(buf, p2, e2, "accept") == 1:
+            fw_set_policy(FW_ACCEPT)
+            printk0("firewall: policy accept\n")
+        else:
+            printk0("firewall: bad policy directive\n")
+        return cast[int64](count)
+
+    # --- rule: "<verdict> <dir> <proto> <src/N> [sport P] <dst/N> [dport P] [established]"
+    verdict: int32 = FW_ACCEPT
+    if _fwd_tok_eq(buf, pos, te, "drop") == 1:
+        verdict = FW_DROP
+    elif _fwd_tok_eq(buf, pos, te, "accept") == 1:
+        verdict = FW_ACCEPT
+    else:
+        printk0("firewall: unknown directive (ignored)\n")
+        return cast[int64](count)
+
+    # direction
+    pos = _fwd_skip_ws(buf, te, end)
+    te = _fwd_tok_end(buf, pos, end)
+    direction: uint8 = FW_DIR_ANY
+    if _fwd_parse_dir(buf, pos, te, &direction) == 0:
+        printk0("firewall: bad direction (ignored)\n")
+        return cast[int64](count)
+
+    # protocol
+    pos = _fwd_skip_ws(buf, te, end)
+    te = _fwd_tok_end(buf, pos, end)
+    proto: uint8 = FW_PROTO_ANY
+    if _fwd_parse_proto(buf, pos, te, &proto) == 0:
+        printk0("firewall: bad protocol (ignored)\n")
+        return cast[int64](count)
+
+    # src CIDR
+    pos = _fwd_skip_ws(buf, te, end)
+    te = _fwd_tok_end(buf, pos, end)
+    src: uint32 = 0
+    smask: uint32 = 0
+    if _fwd_parse_cidr(buf, pos, te, &src, &smask) == 0:
+        printk0("firewall: bad src cidr (ignored)\n")
+        return cast[int64](count)
+
+    # The remaining tokens are optional and order-flexible-ish:
+    #   [sport P] <dst/N> [dport P] [established]
+    # We walk token-by-token: a "sport"/"dport" keyword consumes the
+    # next token as its port; "established" sets the flag; the first
+    # bare a.b.c.d/N token that isn't a keyword value is the dst CIDR.
+    dst: uint32 = 0
+    dmask: uint32 = 0
+    have_dst: int32 = 0
+    sport: uint16 = 0
+    dport: uint16 = 0
+    flags: uint8 = 0
+
+    while True:
+        pos = _fwd_skip_ws(buf, te, end)
+        if pos >= end:
+            break
+        te = _fwd_tok_end(buf, pos, end)
+        if _fwd_tok_eq(buf, pos, te, "sport") == 1:
+            pos = _fwd_skip_ws(buf, te, end)
+            te = _fwd_tok_end(buf, pos, end)
+            pv: uint32 = 0
+            _fwd_parse_u32(buf, pos, te, &pv)
+            sport = cast[uint16](pv & 0xFFFF)
+        elif _fwd_tok_eq(buf, pos, te, "dport") == 1:
+            pos = _fwd_skip_ws(buf, te, end)
+            te = _fwd_tok_end(buf, pos, end)
+            pv2: uint32 = 0
+            _fwd_parse_u32(buf, pos, te, &pv2)
+            dport = cast[uint16](pv2 & 0xFFFF)
+        elif _fwd_tok_eq(buf, pos, te, "established") == 1:
+            flags = flags | FW_MATCH_ESTABLISHED
+        else:
+            # Bare token → the dst CIDR (only the first one counts).
+            if have_dst == 0:
+                d: uint32 = 0
+                dm: uint32 = 0
+                if _fwd_parse_cidr(buf, pos, te, &d, &dm) == 1:
+                    dst = d
+                    dmask = dm
+                    have_dst = 1
+
+    rc: int32 = fw_add_rule(direction, proto, verdict, flags,
+                            src, smask, dst, dmask, sport, dport)
+    if rc < 0:
+        printk0("firewall: rule add failed (table full)\n")
+    else:
+        printk1("firewall: rule %d added\n", cast[uint64](rc))
+    return cast[int64](count)

@@ -1,0 +1,702 @@
+# drivers/net/firewall.ad
+#
+# Native stateful packet-filter firewall — the credibility equivalent of
+# iptables/nftables, but with a Plan-9 control surface (a pseudo-file you
+# write rules to) instead of a Linux netfilter/iptables ioctl ABI.
+#
+# The engine is evaluated on EVERY IPv4 packet:
+#   * INGRESS — from drivers/net/ip.ad:ip_rx, before the L4 demux. A
+#     DROP verdict makes ip_rx return without dispatching to
+#     icmp_rx/udp_rx/tcp_rx (the packet is silently discarded).
+#   * EGRESS  — from drivers/net/ip.ad:ip_send, before the frame is
+#     composed and handed to eth_tx (or re-injected on the loopback
+#     shortcut). A DROP verdict makes ip_send return -1.
+#
+# Rule model (iptables-shape, simplified):
+#   direction  : FW_DIR_IN | FW_DIR_OUT | FW_DIR_ANY
+#   protocol   : FW_PROTO_TCP | FW_PROTO_UDP | FW_PROTO_ICMP | FW_PROTO_ANY
+#   src/dst    : IPv4 address + mask (both network byte order, /N parsed
+#                into a mask). 0.0.0.0/0 == match-any.
+#   sport/dport: TCP/UDP only; 0 == match-any.
+#   verdict    : FW_ACCEPT | FW_DROP  (REJECT-with-ICMP is a future knob).
+#
+# Rules are evaluated in insertion order; FIRST MATCH WINS. If no rule
+# matches, the configurable default policy applies (default ACCEPT, so an
+# empty ruleset is fully open — exactly like an empty iptables filter
+# table with -P ACCEPT).
+#
+# STATEFULNESS (what makes this a real firewall, not a static ACL):
+# a flat fixed-size connection-tracking table keyed by the canonical
+# 4-tuple (low-addr/low-port, high-addr/high-port) records every TCP
+# flow the box has seen go out (or come in and be accepted). A rule
+# carrying the FW_MATCH_ESTABLISHED bit matches ONLY packets that belong
+# to a tracked flow — so the canonical "default-drop inbound, allow
+# established/related" policy works: an outbound SYN seeds conntrack, and
+# the returning SYN-ACK is allowed by the established rule even though a
+# bare default-drop-inbound policy would otherwise discard it.
+#
+# Control surface (sys/src/9/port/devfirewall.ad → /dev/firewall):
+#   read   -> "policy <accept|drop>\n" then one line per rule with its
+#             per-rule hit counter, then a conntrack summary line.
+#   write  -> one directive per write:
+#               "policy accept" / "policy drop"
+#               "flush"
+#               "<verdict> <dir> <proto> <src/N> [sport P] <dst/N> [dport P] [established]"
+#             e.g.  echo 'drop in tcp 0.0.0.0/0 dport 23' > /dev/firewall
+#
+# Adder compiler constraints honoured here:
+#   * The rule table and conntrack table are FLAT module-scope Arrays of
+#     scalars (parallel arrays), never nested frame-local arrays.
+#   * Every top-level helper/const is underscore-prefixed to avoid the
+#     flat-global symbol collisions across merged .ad modules.
+#   * No adjacent string-literal concatenation.
+
+from kernel.printk.printk import printk0, printk1, printk2
+
+
+# --- verdicts / enums -------------------------------------------------
+
+FW_ACCEPT: int32 = 0
+FW_DROP:   int32 = 1
+
+FW_DIR_IN:  uint8 = 0
+FW_DIR_OUT: uint8 = 1
+FW_DIR_ANY: uint8 = 2
+
+FW_PROTO_ICMP: uint8 = 1
+FW_PROTO_TCP:  uint8 = 6
+FW_PROTO_UDP:  uint8 = 17
+FW_PROTO_ANY:  uint8 = 0
+
+# Per-rule match flags (bitmask in _fw_rule_flags[]).
+FW_MATCH_ESTABLISHED: uint8 = 1
+
+# TCP flag bits (mirror drivers/net/tcp.ad — kept local to avoid an
+# import cycle; the firewall does not otherwise depend on tcp.ad).
+_FW_TCP_FIN: uint8 = 0x01
+_FW_TCP_SYN: uint8 = 0x02
+_FW_TCP_RST: uint8 = 0x04
+_FW_TCP_ACK: uint8 = 0x10
+
+
+# --- rule table (flat parallel arrays) --------------------------------
+
+_FW_MAX_RULES: uint64 = 64
+
+_fw_rule_dir:    Array[64, uint8]
+_fw_rule_proto:  Array[64, uint8]
+_fw_rule_verdict: Array[64, int32]
+_fw_rule_flags:  Array[64, uint8]
+# Source / dest address + mask, stored as packed big-endian uint32 so a
+# single &-compare does the subnet test. 0-mask == match-any.
+_fw_rule_src:    Array[64, uint32]
+_fw_rule_smask:  Array[64, uint32]
+_fw_rule_dst:    Array[64, uint32]
+_fw_rule_dmask:  Array[64, uint32]
+_fw_rule_sport:  Array[64, uint16]   # 0 == any
+_fw_rule_dport:  Array[64, uint16]   # 0 == any
+_fw_rule_hits:   Array[64, uint64]
+
+_fw_nrules: uint64 = 0
+
+# Default policy verdict applied when no rule matches.
+_fw_policy: int32 = 0                 # FW_ACCEPT
+
+
+# --- connection-tracking table (flat parallel arrays) -----------------
+#
+# Keyed by the CANONICAL tuple so the same flow hashes the same way in
+# both directions: (lo_addr, lo_port) is always the numerically smaller
+# (addr,port) endpoint, (hi_addr, hi_port) the larger. proto is recorded
+# so a TCP flow and a UDP flow on the same ports don't alias.
+
+_FW_MAX_CONN: uint64 = 128
+
+_fw_ct_used:    Array[128, uint8]    # 0 = free slot
+_fw_ct_proto:   Array[128, uint8]
+_fw_ct_lo_addr: Array[128, uint32]
+_fw_ct_lo_port: Array[128, uint16]
+_fw_ct_hi_addr: Array[128, uint32]
+_fw_ct_hi_port: Array[128, uint16]
+_fw_ct_state:   Array[128, uint8]    # 0=new/syn, 1=established
+
+_FW_CT_NEW:  uint8 = 0
+_FW_CT_EST:  uint8 = 1
+
+_fw_nconn: uint64 = 0
+
+# Diagnostic counters (surfaced through /dev/firewall read + selftest).
+_fw_pkts_in:   uint64 = 0
+_fw_pkts_out:  uint64 = 0
+_fw_dropped:   uint64 = 0
+_fw_ct_hits:   uint64 = 0
+
+
+def firewall_init():
+    _fw_nrules = 0
+    _fw_policy = FW_ACCEPT
+    _fw_nconn = 0
+    _fw_pkts_in = 0
+    _fw_pkts_out = 0
+    _fw_dropped = 0
+    _fw_ct_hits = 0
+    i: uint64 = 0
+    while i < _FW_MAX_RULES:
+        _fw_rule_hits[i] = 0
+        i = i + 1
+    i = 0
+    while i < _FW_MAX_CONN:
+        _fw_ct_used[i] = 0
+        i = i + 1
+    printk0("firewall: initialized (policy accept, 0 rules)\n")
+
+
+# --- rule-table mutators (used by the /dev/firewall write backend) ----
+
+def fw_set_policy(verdict: int32):
+    _fw_policy = verdict
+
+
+def fw_get_policy() -> int32:
+    return _fw_policy
+
+
+def fw_flush():
+    # Clear every rule AND the conntrack table (a full reset, like
+    # `iptables -F` plus `conntrack -F`). Hit counters reset with the
+    # rules they belonged to.
+    _fw_nrules = 0
+    _fw_nconn = 0
+    i: uint64 = 0
+    while i < _FW_MAX_CONN:
+        _fw_ct_used[i] = 0
+        i = i + 1
+    i = 0
+    while i < _FW_MAX_RULES:
+        _fw_rule_hits[i] = 0
+        i = i + 1
+
+
+def fw_rule_count() -> uint64:
+    return _fw_nrules
+
+
+def fw_conn_count() -> uint64:
+    return _fw_nconn
+
+
+def fw_rule_hits(idx: uint64) -> uint64:
+    if idx >= _fw_nrules:
+        return 0
+    return _fw_rule_hits[idx]
+
+
+def fw_add_rule(direction: uint8, proto: uint8, verdict: int32,
+                flags: uint8,
+                src: uint32, smask: uint32,
+                dst: uint32, dmask: uint32,
+                sport: uint16, dport: uint16) -> int32:
+    # Append a rule. Returns the rule index on success, -1 if full.
+    if _fw_nrules >= _FW_MAX_RULES:
+        printk0("firewall: rule table full\n")
+        return -1
+    n: uint64 = _fw_nrules
+    _fw_rule_dir[n] = direction
+    _fw_rule_proto[n] = proto
+    _fw_rule_verdict[n] = verdict
+    _fw_rule_flags[n] = flags
+    _fw_rule_src[n] = src
+    _fw_rule_smask[n] = smask
+    _fw_rule_dst[n] = dst
+    _fw_rule_dmask[n] = dmask
+    _fw_rule_sport[n] = sport
+    _fw_rule_dport[n] = dport
+    _fw_rule_hits[n] = 0
+    _fw_nrules = n + 1
+    return cast[int32](n)
+
+
+# --- accessors for the read backend -----------------------------------
+
+def fw_rule_dir(i: uint64) -> uint8:
+    return _fw_rule_dir[i]
+
+def fw_rule_proto(i: uint64) -> uint8:
+    return _fw_rule_proto[i]
+
+def fw_rule_verdict(i: uint64) -> int32:
+    return _fw_rule_verdict[i]
+
+def fw_rule_flags(i: uint64) -> uint8:
+    return _fw_rule_flags[i]
+
+def fw_rule_src(i: uint64) -> uint32:
+    return _fw_rule_src[i]
+
+def fw_rule_smask(i: uint64) -> uint32:
+    return _fw_rule_smask[i]
+
+def fw_rule_dst(i: uint64) -> uint32:
+    return _fw_rule_dst[i]
+
+def fw_rule_dmask(i: uint64) -> uint32:
+    return _fw_rule_dmask[i]
+
+def fw_rule_sport(i: uint64) -> uint16:
+    return _fw_rule_sport[i]
+
+def fw_rule_dport(i: uint64) -> uint16:
+    return _fw_rule_dport[i]
+
+
+# --- address helpers --------------------------------------------------
+
+def _fw_pack(b0: uint8, b1: uint8, b2: uint8, b3: uint8) -> uint32:
+    # Pack four address bytes (network order, b0 most-significant) into a
+    # uint32 for masked compares.
+    r: uint32 = cast[uint32](b0)
+    r = (r << 8) | cast[uint32](b1)
+    r = (r << 8) | cast[uint32](b2)
+    r = (r << 8) | cast[uint32](b3)
+    return r
+
+
+def _fw_prefix_to_mask(prefix: uint64) -> uint32:
+    # /N → 32-bit netmask. /0 → 0 (match-any), /32 → 0xFFFFFFFF.
+    if prefix == 0:
+        return 0
+    if prefix >= 32:
+        return 0xFFFFFFFF
+    # (0xFFFFFFFF << (32 - prefix)) keeping only 32 bits.
+    shift: uint64 = 32 - prefix
+    full: uint32 = 0xFFFFFFFF
+    m: uint32 = cast[uint32]((cast[uint64](full) << shift) & 0xFFFFFFFF)
+    return m
+
+
+# --- conntrack core ---------------------------------------------------
+
+def _fw_ct_canon(a_addr: uint32, a_port: uint16,
+                 b_addr: uint32, b_port: uint16,
+                 out_lo_addr: Ptr[uint32], out_lo_port: Ptr[uint16],
+                 out_hi_addr: Ptr[uint32], out_hi_port: Ptr[uint16]):
+    # Order the two endpoints canonically so both directions of a flow
+    # map to the same key. Compare on (addr, port) lexicographically.
+    a_first: int32 = 0
+    if a_addr < b_addr:
+        a_first = 1
+    elif a_addr == b_addr:
+        if a_port <= b_port:
+            a_first = 1
+    if a_first == 1:
+        out_lo_addr[0] = a_addr
+        out_lo_port[0] = a_port
+        out_hi_addr[0] = b_addr
+        out_hi_port[0] = b_port
+    else:
+        out_lo_addr[0] = b_addr
+        out_lo_port[0] = b_port
+        out_hi_addr[0] = a_addr
+        out_hi_port[0] = a_port
+
+
+def _fw_ct_find(proto: uint8,
+                lo_addr: uint32, lo_port: uint16,
+                hi_addr: uint32, hi_port: uint16) -> int64:
+    # Linear scan for an existing flow. Returns the slot index, or -1.
+    i: uint64 = 0
+    while i < _FW_MAX_CONN:
+        if _fw_ct_used[i] == 1:
+            if _fw_ct_proto[i] == proto:
+                if _fw_ct_lo_addr[i] == lo_addr:
+                    if _fw_ct_lo_port[i] == lo_port:
+                        if _fw_ct_hi_addr[i] == hi_addr:
+                            if _fw_ct_hi_port[i] == hi_port:
+                                return cast[int64](i)
+        i = i + 1
+    return -1
+
+
+def _fw_ct_alloc() -> int64:
+    # First free slot, or -1 if the table is full.
+    i: uint64 = 0
+    while i < _FW_MAX_CONN:
+        if _fw_ct_used[i] == 0:
+            return cast[int64](i)
+        i = i + 1
+    return -1
+
+
+def _fw_ct_lookup_state(proto: uint8,
+                        src_addr: uint32, src_port: uint16,
+                        dst_addr: uint32, dst_port: uint16) -> int32:
+    # Returns the conntrack state of the flow this packet belongs to:
+    #   -1 = no tracked flow
+    #    _FW_CT_NEW / _FW_CT_EST otherwise.
+    lo_a: uint32 = 0
+    lo_p: uint16 = 0
+    hi_a: uint32 = 0
+    hi_p: uint16 = 0
+    _fw_ct_canon(src_addr, src_port, dst_addr, dst_port,
+                 &lo_a, &lo_p, &hi_a, &hi_p)
+    slot: int64 = _fw_ct_find(proto, lo_a, lo_p, hi_a, hi_p)
+    if slot < 0:
+        return -1
+    return cast[int32](_fw_ct_state[slot])
+
+
+def _fw_ct_track(proto: uint8, direction: uint8, tcp_flags: uint8,
+                 src_addr: uint32, src_port: uint16,
+                 dst_addr: uint32, dst_port: uint16):
+    # State-machine update for an ACCEPTED packet. We track TCP (and UDP
+    # as a pseudo-flow so UDP "established"-style allow works too).
+    #
+    #   * An outbound SYN (no ACK) seeds a NEW flow.
+    #   * Any subsequent packet on a known flow promotes it to
+    #     ESTABLISHED — in particular the returning SYN-ACK, which is
+    #     what the "allow established" inbound rule keys on.
+    #   * A RST or FIN tears the flow down.
+    if proto != FW_PROTO_TCP and proto != FW_PROTO_UDP:
+        return
+    lo_a: uint32 = 0
+    lo_p: uint16 = 0
+    hi_a: uint32 = 0
+    hi_p: uint16 = 0
+    _fw_ct_canon(src_addr, src_port, dst_addr, dst_port,
+                 &lo_a, &lo_p, &hi_a, &hi_p)
+    slot: int64 = _fw_ct_find(proto, lo_a, lo_p, hi_a, hi_p)
+
+    # TCP teardown: drop the flow on RST/FIN so the table doesn't fill.
+    if proto == FW_PROTO_TCP:
+        if (tcp_flags & _FW_TCP_RST) != 0 or (tcp_flags & _FW_TCP_FIN) != 0:
+            if slot >= 0:
+                _fw_ct_used[slot] = 0
+                if _fw_nconn > 0:
+                    _fw_nconn = _fw_nconn - 1
+            return
+
+    if slot >= 0:
+        # Known flow — any non-SYN-only packet promotes to ESTABLISHED.
+        if proto == FW_PROTO_TCP:
+            # A lone SYN keeps it NEW; SYN+ACK / ACK / data establish.
+            is_lone_syn: int32 = 0
+            if (tcp_flags & _FW_TCP_SYN) != 0:
+                if (tcp_flags & _FW_TCP_ACK) == 0:
+                    is_lone_syn = 1
+            if is_lone_syn == 0:
+                _fw_ct_state[slot] = _FW_CT_EST
+        else:
+            _fw_ct_state[slot] = _FW_CT_EST
+        return
+
+    # Unknown flow — create it. For TCP, only an outbound SYN (or any
+    # accepted first packet) seeds tracking; we seed on any accepted
+    # packet so that an outbound UDP request also tracks its flow.
+    ns: int64 = _fw_ct_alloc()
+    if ns < 0:
+        return
+    _fw_ct_used[ns] = 1
+    _fw_ct_proto[ns] = proto
+    _fw_ct_lo_addr[ns] = lo_a
+    _fw_ct_lo_port[ns] = lo_p
+    _fw_ct_hi_addr[ns] = hi_a
+    _fw_ct_hi_port[ns] = hi_p
+    _fw_ct_state[ns] = _FW_CT_NEW
+    _fw_nconn = _fw_nconn + 1
+
+
+# --- rule matching ----------------------------------------------------
+
+def _fw_rule_matches(idx: uint64, direction: uint8, proto: uint8,
+                     src_addr: uint32, src_port: uint16,
+                     dst_addr: uint32, dst_port: uint16,
+                     ct_state: int32) -> int32:
+    # Test rule `idx` against the packet 5-tuple. Returns 1 on match.
+    rdir: uint8 = _fw_rule_dir[idx]
+    if rdir != FW_DIR_ANY:
+        if rdir != direction:
+            return 0
+    rproto: uint8 = _fw_rule_proto[idx]
+    if rproto != FW_PROTO_ANY:
+        if rproto != proto:
+            return 0
+    # Source subnet.
+    smask: uint32 = _fw_rule_smask[idx]
+    if smask != 0:
+        if (src_addr & smask) != (_fw_rule_src[idx] & smask):
+            return 0
+    # Dest subnet.
+    dmask: uint32 = _fw_rule_dmask[idx]
+    if dmask != 0:
+        if (dst_addr & dmask) != (_fw_rule_dst[idx] & dmask):
+            return 0
+    # Ports (TCP/UDP only; 0 == any).
+    rsport: uint16 = _fw_rule_sport[idx]
+    if rsport != 0:
+        if rsport != src_port:
+            return 0
+    rdport: uint16 = _fw_rule_dport[idx]
+    if rdport != 0:
+        if rdport != dst_port:
+            return 0
+    # Stateful match flag: the rule fires only for packets that belong
+    # to a flow conntrack already knows about. This mirrors iptables'
+    # `-m conntrack --ctstate ESTABLISHED,RELATED`: the original
+    # outbound SYN seeded the flow (state NEW), so the returning SYN-ACK
+    # — and every subsequent segment — has a tracked tuple (ct_state >=
+    # 0) and matches, whereas a COLD inbound SYN-ACK to an untracked
+    # tuple (ct_state == -1) does not. A bare default-drop-inbound
+    # policy thus blocks unsolicited inbound while allowing replies to
+    # our own outbound connections.
+    rflags: uint8 = _fw_rule_flags[idx]
+    if (rflags & FW_MATCH_ESTABLISHED) != 0:
+        if ct_state < 0:
+            return 0
+    return 1
+
+
+def _fw_evaluate(direction: uint8, proto: uint8, tcp_flags: uint8,
+                 src_addr: uint32, src_port: uint16,
+                 dst_addr: uint32, dst_port: uint16) -> int32:
+    # The core verdict function. Walk rules in order, first match wins;
+    # fall through to the default policy. On ACCEPT, update conntrack so
+    # the reverse direction can match an "established" rule.
+    if direction == FW_DIR_IN:
+        _fw_pkts_in = _fw_pkts_in + 1
+    else:
+        _fw_pkts_out = _fw_pkts_out + 1
+
+    ct_state: int32 = _fw_ct_lookup_state(proto, src_addr, src_port,
+                                          dst_addr, dst_port)
+    if ct_state == cast[int32](_FW_CT_EST):
+        _fw_ct_hits = _fw_ct_hits + 1
+
+    verdict: int32 = _fw_policy
+    i: uint64 = 0
+    while i < _fw_nrules:
+        if _fw_rule_matches(i, direction, proto,
+                            src_addr, src_port, dst_addr, dst_port,
+                            ct_state) == 1:
+            _fw_rule_hits[i] = _fw_rule_hits[i] + 1
+            verdict = _fw_rule_verdict[i]
+            i = _fw_nrules                        # first match wins
+        else:
+            i = i + 1
+
+    if verdict == FW_ACCEPT:
+        # Track the (now-permitted) flow so its reply can be matched by
+        # an "established" rule on the opposite direction.
+        _fw_ct_track(proto, direction, tcp_flags,
+                     src_addr, src_port, dst_addr, dst_port)
+    else:
+        _fw_dropped = _fw_dropped + 1
+    return verdict
+
+
+# --- hook entry points (called from drivers/net/ip.ad) ----------------
+#
+# Both take the raw IPv4 packet (header included) plus the direction.
+# They parse the 5-tuple out of the header + the first 4 bytes of the L4
+# payload (TCP/UDP src/dst ports) themselves, so the ip.ad call sites
+# stay a one-liner. Return FW_ACCEPT (0) or FW_DROP (1).
+
+def _fw_parse_and_eval(pkt: Ptr[uint8], length: uint64,
+                       direction: uint8) -> int32:
+    # Defensive: a runt that can't even hold an IPv4 header is dropped
+    # at the L3 layer anyway; treat as accept here so the firewall never
+    # changes behaviour for malformed packets (ip_rx's own checks fire).
+    if length < 20:
+        return FW_ACCEPT
+    version_ihl: uint8 = pkt[0]
+    ihl: uint8 = version_ihl & 0x0F
+    if ihl < 5:
+        return FW_ACCEPT
+    proto: uint8 = pkt[9]
+    src_addr: uint32 = _fw_pack(pkt[12], pkt[13], pkt[14], pkt[15])
+    dst_addr: uint32 = _fw_pack(pkt[16], pkt[17], pkt[18], pkt[19])
+    hdr_bytes: uint64 = cast[uint64](ihl) * 4
+
+    src_port: uint16 = 0
+    dst_port: uint16 = 0
+    tcp_flags: uint8 = 0
+    if proto == FW_PROTO_TCP or proto == FW_PROTO_UDP:
+        # Need at least the 4-byte L4 port header.
+        if length >= hdr_bytes + 4:
+            l4: uint64 = cast[uint64](pkt) + hdr_bytes
+            lp: Ptr[uint8] = cast[Ptr[uint8]](l4)
+            src_port = (cast[uint16](lp[0]) << 8) | cast[uint16](lp[1])
+            dst_port = (cast[uint16](lp[2]) << 8) | cast[uint16](lp[3])
+            if proto == FW_PROTO_TCP:
+                # TCP flags live at L4 offset 13 (after 12-byte fixed
+                # prefix). Read only if the segment is long enough.
+                if length >= hdr_bytes + 14:
+                    tcp_flags = lp[13]
+    return _fw_evaluate(direction, proto, tcp_flags,
+                        src_addr, src_port, dst_addr, dst_port)
+
+
+def firewall_ingress(pkt: Ptr[uint8], length: uint64) -> int32:
+    # INGRESS hook — called from ip_rx before the L4 demux.
+    return _fw_parse_and_eval(pkt, length, FW_DIR_IN)
+
+
+def firewall_egress(pkt: Ptr[uint8], length: uint64) -> int32:
+    # EGRESS hook — called from ip_send with the freshly-built IPv4
+    # packet (header + payload), before eth_tx / loopback re-injection.
+    return _fw_parse_and_eval(pkt, length, FW_DIR_OUT)
+
+
+# --- diagnostics getters (read backend + selftest) --------------------
+
+def fw_stat_pkts_in() -> uint64:
+    return _fw_pkts_in
+
+def fw_stat_pkts_out() -> uint64:
+    return _fw_pkts_out
+
+def fw_stat_dropped() -> uint64:
+    return _fw_dropped
+
+def fw_stat_ct_hits() -> uint64:
+    return _fw_ct_hits
+
+
+# --- self-test (driven from init/main.ad boot:37.fw) ------------------
+#
+# Exercises the REAL _fw_evaluate engine (the exact function the ip_rx /
+# ip_send hooks call) — not a parallel mock. Proves, in order:
+#   1. A DROP rule for tcp dport 23 drops a matching inbound packet and
+#      bumps the rule's hit counter, while a non-matching dport-80 packet
+#      is ACCEPTed under default-accept policy.
+#   2. With default policy DROP and a single "allow inbound established"
+#      rule: a fresh inbound SYN-ACK is DROPPED (no tracked flow), but
+#      after an outbound SYN seeds conntrack, the returning SYN-ACK is
+#      ACCEPTED — the stateful core of a real firewall.
+#
+# Returns 1 on full pass, 0 on any failed assertion. Prints [firewall]
+# lines for each assertion and a final [firewall] PASS / FAIL.
+
+def _fw_selftest_eq(label: Ptr[char], got: int32, want: int32,
+                    pass_ctr: Ptr[uint64], fail_ctr: Ptr[uint64]):
+    # The label already carries its own "[firewall] ..." marker so the
+    # test script can grep each assertion line. On a mismatch we append
+    # an explicit FAIL marker (also "[firewall] "-prefixed) so the
+    # harness's failure grep fires.
+    if got == want:
+        printk0(label)
+        printk0(" OK\n")
+        pass_ctr[0] = pass_ctr[0] + 1
+    else:
+        printk0(label)
+        printk2(" [firewall] FAIL got=%d want=%d\n",
+                cast[uint64](got), cast[uint64](want))
+        fail_ctr[0] = fail_ctr[0] + 1
+
+
+def firewall_selftest() -> int32:
+    npass: uint64 = 0
+    nfail: uint64 = 0
+
+    firewall_init()
+
+    # Addresses used throughout: local 10.0.2.15, remote 93.184.216.34.
+    local: uint32 = _fw_pack(10, 0, 2, 15)
+    remote: uint32 = _fw_pack(93, 184, 216, 34)
+    anymask: uint32 = 0
+    anyaddr: uint32 = 0
+
+    # === Phase 1: static ACL — drop inbound telnet (tcp dport 23) =====
+    fw_set_policy(FW_ACCEPT)
+    r0: int32 = fw_add_rule(FW_DIR_IN, FW_PROTO_TCP, FW_DROP, 0,
+                            anyaddr, anymask, anyaddr, anymask,
+                            cast[uint16](0), cast[uint16](23))
+
+    # Inbound TCP to dport 23 → DROP, hit counter increments.
+    v1: int32 = _fw_evaluate(FW_DIR_IN, FW_PROTO_TCP, _FW_TCP_SYN,
+                             remote, cast[uint16](51000),
+                             local, cast[uint16](23))
+    _fw_selftest_eq("[firewall] inbound tcp dport23 -> DROP",
+                    v1, FW_DROP, &npass, &nfail)
+
+    h0: uint64 = fw_rule_hits(0)
+    hit_ok: int32 = 0
+    if h0 >= 1:
+        hit_ok = 1
+    _fw_selftest_eq("[firewall] rule0 hit counter incremented",
+                    hit_ok, 1, &npass, &nfail)
+
+    # Inbound TCP to dport 80 → no match → default ACCEPT.
+    v2: int32 = _fw_evaluate(FW_DIR_IN, FW_PROTO_TCP, _FW_TCP_SYN,
+                             remote, cast[uint16](51001),
+                             local, cast[uint16](80))
+    _fw_selftest_eq("[firewall] inbound tcp dport80 -> ACCEPT",
+                    v2, FW_ACCEPT, &npass, &nfail)
+
+    # === Phase 2: stateful — default-drop inbound, allow established ===
+    firewall_init()
+    fw_set_policy(FW_ACCEPT)        # outbound stays open by default
+
+    # Inbound default policy DROP, but allow established inbound flows.
+    fw_set_policy(FW_DROP)
+    r1: int32 = fw_add_rule(FW_DIR_IN, FW_PROTO_TCP, FW_ACCEPT,
+                            FW_MATCH_ESTABLISHED,
+                            anyaddr, anymask, anyaddr, anymask,
+                            cast[uint16](0), cast[uint16](0))
+    # Allow ALL outbound so the SYN can leave (seeds conntrack).
+    r2: int32 = fw_add_rule(FW_DIR_OUT, FW_PROTO_ANY, FW_ACCEPT, 0,
+                            anyaddr, anymask, anyaddr, anymask,
+                            cast[uint16](0), cast[uint16](0))
+
+    # (a) BEFORE any outbound: a cold inbound SYN-ACK has no tracked
+    #     flow → default policy DROP applies.
+    cold: int32 = _fw_evaluate(FW_DIR_IN, FW_PROTO_TCP,
+                               _FW_TCP_SYN | _FW_TCP_ACK,
+                               remote, cast[uint16](443),
+                               local, cast[uint16](40000))
+    _fw_selftest_eq("[firewall] cold inbound SYN-ACK -> DROP (no state)",
+                    cold, FW_DROP, &npass, &nfail)
+
+    # (b) Outbound SYN local:40000 -> remote:443 — ACCEPTED (out policy
+    #     ACCEPT via r2) and seeds conntrack with a NEW flow.
+    out_syn: int32 = _fw_evaluate(FW_DIR_OUT, FW_PROTO_TCP, _FW_TCP_SYN,
+                                  local, cast[uint16](40000),
+                                  remote, cast[uint16](443))
+    _fw_selftest_eq("[firewall] outbound SYN -> ACCEPT (seeds conntrack)",
+                    out_syn, FW_ACCEPT, &npass, &nfail)
+
+    ct_seeded: int32 = 0
+    if fw_conn_count() >= 1:
+        ct_seeded = 1
+    _fw_selftest_eq("[firewall] conntrack now tracks 1 flow",
+                    ct_seeded, 1, &npass, &nfail)
+
+    # (c) Returning SYN-ACK remote:443 -> local:40000 — now matches the
+    #     established rule and is ACCEPTED, even though the default
+    #     inbound policy is DROP. This is the stateful firewall win.
+    reply: int32 = _fw_evaluate(FW_DIR_IN, FW_PROTO_TCP,
+                                _FW_TCP_SYN | _FW_TCP_ACK,
+                                remote, cast[uint16](443),
+                                local, cast[uint16](40000))
+    _fw_selftest_eq("[firewall] established reply SYN-ACK -> ACCEPT",
+                    reply, FW_ACCEPT, &npass, &nfail)
+
+    # (d) An UNRELATED inbound flow (different ports) still DROPs under
+    #     the default-drop policy — proves the established rule is keyed
+    #     to the tracked tuple, not a blanket allow.
+    unrel: int32 = _fw_evaluate(FW_DIR_IN, FW_PROTO_TCP,
+                                _FW_TCP_SYN | _FW_TCP_ACK,
+                                remote, cast[uint16](8080),
+                                local, cast[uint16](40001))
+    _fw_selftest_eq("[firewall] unrelated inbound flow -> DROP",
+                    unrel, FW_DROP, &npass, &nfail)
+
+    # Reset so the live stack starts with an open, empty firewall.
+    firewall_init()
+
+    if nfail == 0:
+        printk2("[firewall] PASS (%d/%d assertions)\n",
+                cast[uint64](npass), cast[uint64](npass))
+        return 1
+    printk2("[firewall] FAIL (%d passed, %d failed)\n",
+            cast[uint64](npass), cast[uint64](nfail))
+    return 0
