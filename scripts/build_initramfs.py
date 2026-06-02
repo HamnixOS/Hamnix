@@ -829,6 +829,17 @@ if os.environ.get("ENABLE_NSIGNALS_TEST") == "1":
 if os.environ.get("ENABLE_VMSTAT_TEST") == "1":
     FILES.append(("/etc/vmstat-test", b"1\n"))
 
+# /proc/<pid>/statm self-test. scripts/test_statm.sh sets
+# ENABLE_STATM_TEST=1 to plant /etc/statm-test. init/main.ad detects the
+# marker and calls statm_selftest() (linux_abi/u_syscalls.ad): it builds
+# a demand-paged anonymous VMA, faults its pages in, renders the statm
+# line via the PUBLIC emit_statm, parses fields 1 (size = vsize/4096) and
+# 2 (resident = present pages), cross-checks them against the on-demand
+# VMA helpers, and emits the [STATM] PASS banner. Needs no extra device;
+# default boots omit the marker.
+if os.environ.get("ENABLE_STATM_TEST") == "1":
+    FILES.append(("/etc/statm-test", b"1\n"))
+
 # times(2) CPU-time self-test. scripts/test_times.sh sets
 # ENABLE_TIMES_TEST=1 to plant /etc/times-test. init/main.ad at
 # boot:37.times detects the marker and calls times_selftest()
