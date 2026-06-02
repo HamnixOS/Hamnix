@@ -322,6 +322,18 @@ if os.environ.get("ENABLE_MM_TEST") == "1":
 if os.environ.get("ENABLE_KEYMAP_TEST") == "1":
     FILES.append(("/etc/keymap-test", b"ENABLE_KEYMAP_TEST=1\n"))
 
+# Cryptographic /dev/random CSPRNG self-test. scripts/test_random.sh sets
+# ENABLE_RANDOM_TEST=1 to plant /etc/random-test. init/main.ad at
+# boot:37.rnd detects the marker and calls devrandom_selftest()
+# (sys/src/9/port/devrandom.ad): it checks the RFC 8439 §2.3.2 ChaCha20
+# known-answer keystream EXACTLY, then proves the live pool's output is
+# nonconstant, that successive reads differ (fast-key-erasure ratchet),
+# and that two large reads differ (no short period). Prints its own
+# EMERG-level [random] markers + a single [random] PASS. Default boots
+# omit the marker so the self-test never fires unintentionally.
+if os.environ.get("ENABLE_RANDOM_TEST") == "1":
+    FILES.append(("/etc/random-test", b"ENABLE_RANDOM_TEST=1\n"))
+
 # #171: EFI runtime services + Secure Boot image verification self-test.
 # scripts/test_efi_secureboot.sh sets ENABLE_EFI_TEST=1 to plant
 # /etc/efi-test plus the Secure Boot crypto fixtures. init/main.ad at

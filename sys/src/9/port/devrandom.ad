@@ -1,62 +1,68 @@
 # sys/src/9/port/devrandom.ad
 #
-# Layer 1 (Plan 9-shape) random device — cryptographic /dev/random.
+# Layer 1 (Plan 9-shape) random device — a REAL cryptographic CSPRNG.
 # Mirrors 9front's /sys/src/9/port/devrandom.c at minimum scope: one
 # read fills the caller's buffer with bytes from a kernel-side CSPRNG;
 # writes mix new entropy into the state.
 #
-# M16.96: ChaCha20 (RFC 8439) keyed off CPU hardware RNG (RDSEED
-# preferred, RDRAND fallback, get_jiffies last resort). Replaces the
-# M16.95 xorshift64 placeholder. The VFS contract
-# (vfs_open("/dev/random") -> FD_RANDOM_MARK -> devrandom_read) is
-# unchanged; only the body of devrandom_read changed.
+# Core: ChaCha20 (RFC 8439 §2.3) keystream with FAST KEY ERASURE.
+# This is the modern Linux/OpenBSD arc4random design:
+#   * The pool is a 256-bit ChaCha20 key + a 96-bit nonce.
+#   * Each refill generates ONE 64-byte ChaCha20 block. The FIRST 32
+#     bytes of EVERY block ratchet the key forward (they become the
+#     new key) so previously-emitted output cannot be recovered even
+#     if the current key field is later disclosed (forward secrecy).
+#   * The remaining 32 bytes are the keystream handed to callers.
+# This is "fast key erasure" — see djb's analysis and Linux's
+# drivers/char/random.c `crng` design.
 #
-# State quantum: every 4096 bytes (64 ChaCha20 blocks) we rekey from
-# RDSEED/RDRAND by XOR-mixing 32 fresh bytes into the key field
-# (state words 4..11) and resetting the counter word (state[12]).
-# This bounds the damage from a (hypothetical) state-recovery attack
-# to the previous 4 KiB of output.
+# Seeding: _maybe_seed() is lazy (first read / write / getrandom).
+# It gathers real entropy from, in preference order, RDSEED, RDRAND,
+# the TSC (rdtsc) sampled repeatedly to harvest timing jitter, and
+# get_jiffies(). Seed material is ABSORBED into the pool by running
+# it through the ChaCha20 cipher (a sponge-style mix), NOT by XOR
+# alone — every seed word perturbs the whole key via a keystream
+# block, so weak/biased sources cannot cancel each other out.
 #
-# Lazy seed: init/main.ad does not call devrandom_init() yet (kept
-# off-limits by parallel agents this milestone). seeded_yet flag
-# triggers a full seed on the first read or write — same lazy-init
-# pattern M16.95 used, with stronger entropy now.
+# Writes (`echo x > /dev/random`) follow the standard /dev/random
+# write contract: caller bytes are mixed into the pool (again through
+# the cipher), perturbing all future output. They never block and
+# never reduce entropy estimates (modern semantics — no blocking
+# entropy accounting; once seeded the pool always serves CSPRNG bytes).
+#
+# /dev/random, /dev/urandom and getrandom(2) all draw from this one
+# pool: identical modern Linux semantics.
 #
 # Stateless backend per-fd: FD_RANDOM_MARK carries no slot, no
-# kmalloc, no refcount. State lives module-global so all /dev/random
-# fds across all tasks share one keystream. Writes XOR caller bytes
-# into the nonce field (state words 13..15) — a poor-man's "add
-# entropy" path; the proper hash-mix would land alongside a real
-# entropy accounting subsystem (out of scope for this commit).
-#
-# RFC 8439 constants ("expand 32-byte k") — these prime state[0..3]
-# and are stable across all ChaCha20 instances.
+# kmalloc, no refcount. State lives module-global so all consumers
+# share one keystream.
 
-from arch.x86.kernel.time import get_jiffies
+from arch.x86.kernel.time import get_jiffies, read_tsc
+from kernel.printk.printk import printk0, printk1, printk2, printk_set_level
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
 
 # -- module-global state -----------------------------------------------------
 
 # ChaCha20 16-word state.
 #   state[0..3]   : constants "expand 32-byte k"
-#   state[4..11]  : 256-bit key
+#   state[4..11]  : 256-bit key (ratcheted forward every block)
 #   state[12]     : 32-bit block counter
 #   state[13..15] : 96-bit nonce
 chacha_state: Array[16, uint32]
 
-# 64-byte keystream block. devrandom_read serves bytes from here,
-# regenerating on exhaustion.
+# 64-byte keystream block scratch. The first 32 bytes re-key the pool
+# (fast key erasure); the remaining 32 bytes are user-visible output.
 chacha_keystream: Array[64, uint8]
 
-# Position into chacha_keystream (0..63). When == 64, next byte read
-# triggers a fresh block generation.
-chacha_pos: uint64 = 64
+# Output buffer: 32 user-visible bytes per generated block. devrandom_read
+# serves bytes from here, regenerating on exhaustion.
+csprng_out: Array[32, uint8]
 
-# Block counter for periodic rekey. Decrements every block; on 0, we
-# pull fresh RDSEED/RDRAND bytes, XOR-mix into the key field, and
-# reset the counter. 64 blocks * 64 bytes = 4 KiB per epoch.
-chacha_blocks_until_rekey: uint64 = 0
+# Position into csprng_out (0..32). When == 32, next byte read triggers a
+# fresh block generation + key ratchet.
+csprng_pos: uint64 = 32
 
-# Lazy-init guard. seeded_yet == 0 => devrandom_read/_write trigger
+# Lazy-init guard. seeded_yet == 0 => read/write/getrandom paths trigger
 # _maybe_seed() before producing output.
 seeded_yet: uint32 = 0
 
@@ -67,9 +73,8 @@ hwrng_features: uint64 = 0
 
 # Scratch slot for inline-asm RDRAND/RDSEED/CPUID output. The
 # zero-operand asm_volatile intrinsic cannot return a value to the
-# caller via %rax (the next Adder statement re-loads %rax for its own
-# purposes), so the inline asm parks its result in this RIP-relative
-# global and the wrapping Adder function returns it.
+# caller via %rax, so the inline asm parks its result in this
+# RIP-relative global and the wrapping Adder function returns it.
 hwrng_scratch: uint64 = 0
 # CF state from the most recent RDRAND/RDSEED. 1 = success, 0 = failure.
 hwrng_cf: uint64 = 0
@@ -78,6 +83,17 @@ cpuid_eax: uint64 = 0
 cpuid_ebx: uint64 = 0
 cpuid_ecx: uint64 = 0
 cpuid_edx: uint64 = 0
+
+# Self-test scratch (used only by devrandom_selftest()). Kept at module
+# scope because the Adder compiler miscompiles large frame-local arrays.
+st_buf_a: Array[64, uint8]
+st_buf_b: Array[64, uint8]
+st_save_state: Array[16, uint32]
+st_save_keystream: Array[64, uint8]
+st_save_out: Array[32, uint8]
+# KAT expected first 16 bytes of the RFC 8439 §2.3.2 keystream block.
+#   10 f1 e7 e4 d1 3b 59 15 50 0f dd 1f a3 20 71 c4
+kat_expect: Array[16, uint8]
 
 
 # -- CPUID / RDRAND / RDSEED wrappers ----------------------------------------
@@ -119,7 +135,7 @@ def _detect_hwrng():
 def _rdrand64() -> uint64:
     # Issue RDRAND %rax up to 10 times until CF=1; park result in
     # hwrng_scratch and CF in hwrng_cf. Returns 0 on persistent
-    # failure (caller falls back to jiffies entropy).
+    # failure (caller falls back to TSC/jiffies entropy).
     if (hwrng_features & 1) == 0:
         return 0
     hwrng_cf = 0
@@ -166,22 +182,52 @@ def _rdseed64() -> uint64:
     return hwrng_scratch
 
 
+def _tsc_jitter64() -> uint64:
+    # Harvest timing jitter from the TSC. We sample rdtsc many times in
+    # a short loop and fold the low bits of each inter-sample delta into
+    # an accumulator. On real hardware the inter-sample timing wobbles
+    # (cache, prefetch, interrupts, frequency scaling) so the low bits of
+    # the deltas carry true physical entropy. Under TCG the deltas are
+    # less random but still vary run-to-run, which keeps the pool from
+    # being deterministic in the emulator. Never the SOLE source — it
+    # augments RDSEED/RDRAND.
+    acc: uint64 = 0x9E3779B97F4A7C15
+    prev: uint64 = read_tsc()
+    i: uint64 = 0
+    while i < 64:
+        cur: uint64 = read_tsc()
+        delta: uint64 = cur - prev
+        prev = cur
+        # Rotate-mix the delta into the accumulator (a cheap diffusion
+        # step so each sample's low bits scatter across the word).
+        acc = acc ^ delta
+        acc = ((acc << 7) | (acc >> 57)) & 0xFFFFFFFFFFFFFFFF
+        acc = (acc + 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
+        i = i + 1
+    return acc
+
+
 def _hw_entropy64(counter: uint64) -> uint64:
-    # Best available 64-bit entropy. Prefer RDSEED, fall back to
-    # RDRAND, fall back to (get_jiffies() ^ counter ^ golden-ratio).
-    # The last fallback gives the test environment something to chew
-    # on when the CPU exposes no hardware RNG (very old microarchs);
-    # entropy is then weak but the keystream is still ChaCha20.
-    v: uint64 = _rdseed64()
-    if v != 0:
-        return v
-    v = _rdrand64()
-    if v != 0:
-        return v
-    return get_jiffies() ^ counter ^ 0x9E3779B97F4A7C15
+    # Best available 64-bit entropy. Combine ALL reachable sources:
+    # RDSEED (preferred), RDRAND, TSC jitter, and a jiffies splash.
+    # Mixing them means the result is unpredictable as long as ANY ONE
+    # source carries entropy — a hostile or absent hwrng cannot zero it
+    # out, because TSC jitter and jiffies always contribute.
+    v: uint64 = 0
+    s: uint64 = _rdseed64()
+    if s != 0:
+        v = v ^ s
+    r: uint64 = _rdrand64()
+    if r != 0:
+        # Rotate so RDRAND lands in different bit positions than RDSEED.
+        v = v ^ (((r << 23) | (r >> 41)) & 0xFFFFFFFFFFFFFFFF)
+    j: uint64 = _tsc_jitter64()
+    v = v ^ (((j << 41) | (j >> 23)) & 0xFFFFFFFFFFFFFFFF)
+    v = v ^ get_jiffies() ^ counter ^ 0x9E3779B97F4A7C15
+    return v
 
 
-# -- ChaCha20 block function -------------------------------------------------
+# -- ChaCha20 block function (RFC 8439 §2.3) ---------------------------------
 
 # Rotate-left a 32-bit value by n bits (1..31). Returns a uint32-shape
 # value (high 32 bits are masked off).
@@ -225,13 +271,12 @@ def _chacha_quarter_round(a_idx: uint64, b_idx: uint64,
 def _chacha_block():
     # Generate one 64-byte keystream block into chacha_keystream:
     #   working = state
-    #   for 10 rounds: column-round + diagonal-round
+    #   for 10 iterations: column-round + diagonal-round (= 20 rounds)
     #   working = working + state (mod 2^32)
     #   serialise working as little-endian uint32s
-    # Then increment the block counter.
-    #
-    # We perform the 20 rounds in-place on chacha_state, accumulating
-    # the initial state in `orig[]` so we can add it back at the end.
+    # Then increment the block counter. The input state[] (constants +
+    # key + nonce) is preserved; only the counter advances, exactly per
+    # RFC 8439 §2.3.
     orig: Array[16, uint32]
     i: uint64 = 0
     while i < 16:
@@ -263,48 +308,85 @@ def _chacha_block():
         chacha_keystream[base + 1] = cast[uint8]((sum_w >> 8) & 0xFF)
         chacha_keystream[base + 2] = cast[uint8]((sum_w >> 16) & 0xFF)
         chacha_keystream[base + 3] = cast[uint8]((sum_w >> 24) & 0xFF)
-        # Restore state[i] to orig[i] — we want the NEXT block to
-        # come from the original state (constants + key + nonce)
-        # with just the counter advanced.
+        # Restore state[i] to orig[i] — the NEXT block must come from the
+        # original state (constants + key + nonce) with only the counter
+        # advanced.
         chacha_state[i] = orig[i]
         i = i + 1
 
-    # Advance the 32-bit block counter (state[12]). Wraps every 2^32
-    # blocks = 256 GiB, which we never approach in practice but we
-    # don't paper over the wrap either.
+    # Advance the 32-bit block counter (state[12]).
     counter: uint64 = (cast[uint64](chacha_state[12]) + 1) & 0xFFFFFFFF
     chacha_state[12] = cast[uint32](counter)
-    chacha_pos = 0
 
 
-def _chacha_rekey():
-    # Pull 32 fresh bytes from RDSEED/RDRAND and XOR-mix them into
-    # the key field (state[4..11]); reset the counter (state[12]).
-    # Called from _maybe_seed (first seed) and every 64 blocks
-    # thereafter from _refill_keystream_if_needed.
+def _csprng_generate():
+    # FAST KEY ERASURE refill. Generate one ChaCha20 block, then:
+    #   * bytes  0..31 -> become the NEW 256-bit key (state[4..11]).
+    #     This ratchets the pool forward: the key that produced this
+    #     block is destroyed, so the just-emitted output cannot be
+    #     reconstructed from any later state snapshot (forward secrecy).
+    #   * bytes 32..63 -> user-visible output (csprng_out[0..31]).
+    _chacha_block()
+    # Re-key from the first 32 keystream bytes (little-endian words).
     i: uint64 = 0
     while i < 8:
-        word: uint64 = _hw_entropy64(i)
-        # Mix the low 32 bits into state[4+i]; mix the high 32 into
-        # state[4 + ((i+4) mod 8)] for an extra splash.
-        lo: uint32 = cast[uint32](word & 0xFFFFFFFF)
-        hi: uint32 = cast[uint32]((word >> 32) & 0xFFFFFFFF)
-        chacha_state[4 + i] = chacha_state[4 + i] ^ lo
-        target: uint64 = 4 + ((i + 4) & 7)
-        chacha_state[target] = chacha_state[target] ^ hi
+        base: uint64 = i * 4
+        w: uint64 = (cast[uint64](chacha_keystream[base + 0])
+                     | (cast[uint64](chacha_keystream[base + 1]) << 8)
+                     | (cast[uint64](chacha_keystream[base + 2]) << 16)
+                     | (cast[uint64](chacha_keystream[base + 3]) << 24))
+        chacha_state[4 + i] = cast[uint32](w & 0xFFFFFFFF)
         i = i + 1
+    # Reset the block counter — the key is fresh, so the counter starts
+    # over per the fast-key-erasure construction.
     chacha_state[12] = 0
-    chacha_blocks_until_rekey = 64
+    # Copy the output half (bytes 32..63) to the user-visible buffer.
+    i = 0
+    while i < 32:
+        csprng_out[i] = chacha_keystream[32 + i]
+        i = i + 1
+    csprng_pos = 0
+
+
+# -- entropy absorption (cipher-based mixing, not XOR-only) -------------------
+
+def _absorb64(word: uint64):
+    # Mix one 64-bit entropy word into the pool THROUGH the cipher.
+    #   1. XOR the word across the nonce + low key words (initial splash).
+    #   2. Run a ChaCha20 block to diffuse it.
+    #   3. Fold the resulting keystream back into the key field.
+    # Step 2 is what makes this a cipher-mix rather than a plain XOR: a
+    # single biased input bit, after one block, is spread non-linearly
+    # across all 256 key bits, so subsequent absorbs of correlated words
+    # cannot cancel.
+    lo: uint32 = cast[uint32](word & 0xFFFFFFFF)
+    hi: uint32 = cast[uint32]((word >> 32) & 0xFFFFFFFF)
+    chacha_state[13] = chacha_state[13] ^ lo
+    chacha_state[14] = chacha_state[14] ^ hi
+    chacha_state[15] = chacha_state[15] ^ (lo ^ hi)
+    _chacha_block()
+    i: uint64 = 0
+    while i < 8:
+        base: uint64 = i * 4
+        w: uint64 = (cast[uint64](chacha_keystream[base + 0])
+                     | (cast[uint64](chacha_keystream[base + 1]) << 8)
+                     | (cast[uint64](chacha_keystream[base + 2]) << 16)
+                     | (cast[uint64](chacha_keystream[base + 3]) << 24))
+        chacha_state[4 + i] = chacha_state[4 + i] ^ cast[uint32](w & 0xFFFFFFFF)
+        i = i + 1
+    # Force callers to draw a fresh ratcheted block after a reseed.
+    csprng_pos = 32
 
 
 def _maybe_seed():
-    # First-touch initialiser. Sets constants, pulls 256 bits of key
-    # entropy from RDSEED/RDRAND, seeds the nonce from get_jiffies(),
-    # and primes the first keystream block. Idempotent after first call.
+    # First-touch initialiser. Sets constants, then absorbs 256+ bits of
+    # entropy (8 words) gathered from RDSEED/RDRAND/TSC-jitter/jiffies,
+    # mixing each word into the pool THROUGH the cipher (sponge-style).
+    # Idempotent after first call.
     if seeded_yet != 0:
         return
 
-    # CPUID feature detection.
+    # CPUID feature detection (populates hwrng_features for RDSEED/RDRAND).
     _detect_hwrng()
 
     # state[0..3] = "expand 32-byte k" (sigma).
@@ -313,86 +395,241 @@ def _maybe_seed():
     chacha_state[2] = 0x79622d32
     chacha_state[3] = 0x6b206574
 
-    # state[4..11] = 256-bit key from RDSEED/RDRAND/jiffies fallback.
+    # state[4..11] = key, primed with a first entropy pull (so the very
+    # first cipher block in _absorb64 already operates on live entropy
+    # rather than zeros).
     i: uint64 = 0
     while i < 8:
-        word: uint64 = _hw_entropy64(i)
-        chacha_state[4 + i] = cast[uint32](word & 0xFFFFFFFF)
+        chacha_state[4 + i] = cast[uint32](_hw_entropy64(i) & 0xFFFFFFFF)
         i = i + 1
 
-    # state[12] = block counter (start at 0 per RFC 8439).
+    # state[12] = block counter (start 0). state[13..15] = nonce, seeded
+    # from a fresh entropy word so two boots differ even before absorb.
     chacha_state[12] = 0
+    n0: uint64 = _hw_entropy64(0xA5)
+    n1: uint64 = _hw_entropy64(0xC3)
+    chacha_state[13] = cast[uint32](n0 & 0xFFFFFFFF)
+    chacha_state[14] = cast[uint32]((n0 >> 32) & 0xFFFFFFFF)
+    chacha_state[15] = cast[uint32](n1 & 0xFFFFFFFF)
 
-    # state[13..15] = 96-bit nonce. Seed from get_jiffies() XORed
-    # with a fresh hwrng word for early-boot variance even when
-    # hwrng is unavailable.
-    nonce_seed: uint64 = _hw_entropy64(0xA5) ^ get_jiffies()
-    chacha_state[13] = cast[uint32](nonce_seed & 0xFFFFFFFF)
-    chacha_state[14] = cast[uint32]((nonce_seed >> 32) & 0xFFFFFFFF)
-    chacha_state[15] = cast[uint32](_hw_entropy64(0xC3) & 0xFFFFFFFF)
+    # Absorb 8 more independent entropy words through the cipher. Each
+    # _absorb64 runs a full ChaCha20 block, so by the end every key bit
+    # depends non-linearly on every seed word.
+    i = 0
+    while i < 8:
+        _absorb64(_hw_entropy64(0x100 + i))
+        i = i + 1
 
-    chacha_blocks_until_rekey = 64
-    # Force first read to generate a fresh block.
-    chacha_pos = 64
+    # Force the first read to generate a fresh ratcheted output block.
+    csprng_pos = 32
     seeded_yet = 1
 
 
-def _refill_keystream_if_needed():
-    # Called per output byte. When the current block is drained
-    # (chacha_pos == 64), generate the next block; when 64 blocks
-    # have elapsed, rekey first.
-    if chacha_pos < 64:
-        return
-    if chacha_blocks_until_rekey == 0:
-        _chacha_rekey()
-    _chacha_block()
-    chacha_blocks_until_rekey = chacha_blocks_until_rekey - 1
-
-
-# -- public API (stable since M16.95) ----------------------------------------
+# -- public API --------------------------------------------------------------
 
 def devrandom_init(seed: uint64):
-    # External seeding entrypoint (not called from init/main.ad this
-    # commit; kept exported so the Phase D boot sequence can wire it
-    # once init/main.ad becomes editable again). XOR-mixes the seed
-    # into the nonce field. Triggers the full _maybe_seed init on
-    # first call if not yet seeded.
+    # External seeding entrypoint. Runs lazy init if needed, then absorbs
+    # the supplied seed word through the cipher (same path writes use).
     _maybe_seed()
-    chacha_state[13] = chacha_state[13] ^ cast[uint32](seed & 0xFFFFFFFF)
-    chacha_state[14] = chacha_state[14] ^ cast[uint32]((seed >> 32) & 0xFFFFFFFF)
+    _absorb64(seed)
 
 
 def devrandom_read(buf: Ptr[uint8], count: uint64) -> int64:
-    # Per-byte stream out of the ChaCha20 keystream. Hot path: serve
-    # from chacha_keystream[chacha_pos] until exhausted, then refill.
-    # Rekey every 64 blocks (4 KiB) from RDSEED/RDRAND.
+    # Stream out of the fast-key-erasure CSPRNG. Serve from csprng_out
+    # until exhausted (32 bytes), then generate a fresh block — which
+    # ratchets the key forward, making output forward-secret.
     _maybe_seed()
     i: uint64 = 0
     while i < count:
-        _refill_keystream_if_needed()
-        buf[i] = chacha_keystream[chacha_pos]
-        chacha_pos = chacha_pos + 1
+        if csprng_pos >= 32:
+            _csprng_generate()
+        buf[i] = csprng_out[csprng_pos]
+        csprng_pos = csprng_pos + 1
         i = i + 1
     return cast[int64](count)
 
 
 def devrandom_write(buf: Ptr[uint8], count: uint64) -> int64:
-    # "Add entropy" path. Mirrors 9front's devrandom write semantics
-    # at the smallest scope: XOR caller bytes into the nonce field of
-    # the ChaCha20 state. The proper hash-mix lands when an entropy
-    # accounting subsystem exists; this is the M16.95-compatible
-    # minimum that lets `echo something > /dev/random` perturb the
-    # stream without breaking the read path.
+    # Standard /dev/random write contract: mix caller-supplied bytes into
+    # the pool. We pack the input into 64-bit words and absorb each one
+    # through the cipher (_absorb64), so a write perturbs ALL future
+    # output non-linearly — not a single nonce slot. Always consumes the
+    # whole buffer; never blocks; never lowers entropy.
     _maybe_seed()
     i: uint64 = 0
+    acc: uint64 = 0
+    nbits: uint64 = 0
     while i < count:
-        # Cycle the input bytes through state[13..15] (the nonce).
-        # Each input byte XORs into one of 3 nonce words at a byte
-        # offset, so a long write spreads its entropy across the
-        # whole 96-bit nonce instead of stomping a single byte slot.
-        target_word: uint64 = 13 + ((i / 4) % 3)
-        shift: uint64 = (i % 4) * 8
-        mixin: uint32 = cast[uint32](cast[uint64](buf[i]) << shift)
-        chacha_state[target_word] = chacha_state[target_word] ^ mixin
+        acc = acc | (cast[uint64](buf[i]) << nbits)
+        nbits = nbits + 8
+        if nbits == 64:
+            _absorb64(acc)
+            acc = 0
+            nbits = 0
         i = i + 1
+    # Absorb any trailing partial word (also fold in the length so a
+    # short write still moves the pool).
+    if nbits != 0:
+        _absorb64(acc ^ count)
     return cast[int64](count)
+
+
+# -- self-test (boot-gated; see init/main.ad boot:37.rnd) --------------------
+
+def _emit(msg: Ptr[char]):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0(msg)
+
+
+def _kat_set_state():
+    # Load the RFC 8439 §2.3.2 known-answer test vector into chacha_state:
+    #   key   = 00 01 02 .. 1f
+    #   count = 1
+    #   nonce = 00 00 00 09 00 00 00 4a 00 00 00 00
+    # One ChaCha20 block then yields the documented keystream whose first
+    # 16 bytes are 10 f1 e7 e4 d1 3b 59 15 50 0f dd 1f a3 20 71 c4.
+    chacha_state[0] = 0x61707865
+    chacha_state[1] = 0x3320646e
+    chacha_state[2] = 0x79622d32
+    chacha_state[3] = 0x6b206574
+    # Key words, little-endian from 00 01 02 03 ...
+    chacha_state[4]  = 0x03020100
+    chacha_state[5]  = 0x07060504
+    chacha_state[6]  = 0x0b0a0908
+    chacha_state[7]  = 0x0f0e0d0c
+    chacha_state[8]  = 0x13121110
+    chacha_state[9]  = 0x17161514
+    chacha_state[10] = 0x1b1a1918
+    chacha_state[11] = 0x1f1e1d1c
+    chacha_state[12] = 0x00000001            # counter = 1
+    chacha_state[13] = 0x09000000            # nonce: 00 00 00 09
+    chacha_state[14] = 0x4a000000            # nonce: 00 00 00 4a
+    chacha_state[15] = 0x00000000            # nonce: 00 00 00 00
+
+
+def devrandom_selftest() -> int32:
+    # Boot-gated self-test. Proves four things and prints EMERG-level
+    # [random] markers the test harness greps:
+    #   (a) RFC 8439 §2.3.2 ChaCha20 KAT matches EXACTLY (cipher core OK)
+    #   (b) output is not the all-zero / constant block
+    #   (c) successive reads differ (key ratchet advances)
+    #   (d) two large reads differ (no trivially-short period)
+    # Returns 1 on full PASS, 0 on any failure.
+    _emit("[random] selftest start\n")
+
+    # ---- (a) RFC 8439 §2.3.2 known-answer test ----
+    # Save the live pool so the KAT can clobber chacha_state safely, then
+    # restore it afterwards (the live pool must keep its real entropy).
+    si: uint64 = 0
+    while si < 16:
+        st_save_state[si] = chacha_state[si]
+        si = si + 1
+    si = 0
+    while si < 64:
+        st_save_keystream[si] = chacha_keystream[si]
+        si = si + 1
+
+    kat_expect[0]  = 0x10
+    kat_expect[1]  = 0xf1
+    kat_expect[2]  = 0xe7
+    kat_expect[3]  = 0xe4
+    kat_expect[4]  = 0xd1
+    kat_expect[5]  = 0x3b
+    kat_expect[6]  = 0x59
+    kat_expect[7]  = 0x15
+    kat_expect[8]  = 0x50
+    kat_expect[9]  = 0x0f
+    kat_expect[10] = 0xdd
+    kat_expect[11] = 0x1f
+    kat_expect[12] = 0xa3
+    kat_expect[13] = 0x20
+    kat_expect[14] = 0x71
+    kat_expect[15] = 0xc4
+
+    _kat_set_state()
+    _chacha_block()
+    kat_ok: int32 = 1
+    ki: uint64 = 0
+    while ki < 16:
+        if chacha_keystream[ki] != kat_expect[ki]:
+            kat_ok = 0
+            ki = 16
+        else:
+            ki = ki + 1
+
+    # Restore the live pool.
+    si = 0
+    while si < 16:
+        chacha_state[si] = st_save_state[si]
+        si = si + 1
+    si = 0
+    while si < 64:
+        chacha_keystream[si] = st_save_keystream[si]
+        si = si + 1
+
+    if kat_ok == 1:
+        _emit("[random] KAT RFC8439-2.3.2 ChaCha20 keystream OK\n")
+    else:
+        _emit("[random] KAT RFC8439-2.3.2 ChaCha20 keystream MISMATCH\n")
+
+    # Make sure the live pool is seeded before drawing output.
+    _maybe_seed()
+
+    # ---- (b) first read is not all-zero / constant ----
+    devrandom_read(&st_buf_a[0], 64)
+    nonzero: int32 = 0
+    allsame: int32 = 1
+    bi: uint64 = 1
+    while bi < 64:
+        if st_buf_a[bi] != 0:
+            nonzero = 1
+        if st_buf_a[bi] != st_buf_a[0]:
+            allsame = 0
+        bi = bi + 1
+    if st_buf_a[0] != 0:
+        nonzero = 1
+    notconst: int32 = 0
+    if nonzero == 1 and allsame == 0:
+        notconst = 1
+        _emit("[random] output nonconstant OK\n")
+    else:
+        _emit("[random] output CONSTANT or ZERO\n")
+
+    # ---- (c) a second read differs from the first (ratchet advances) ----
+    devrandom_read(&st_buf_b[0], 64)
+    diff_ab: int32 = 0
+    di: uint64 = 0
+    while di < 64:
+        if st_buf_a[di] != st_buf_b[di]:
+            diff_ab = 1
+            di = 64
+        else:
+            di = di + 1
+    if diff_ab == 1:
+        _emit("[random] successive reads differ OK\n")
+    else:
+        _emit("[random] successive reads IDENTICAL\n")
+
+    # ---- (d) two large back-to-back reads differ (no short period) ----
+    # Reuse st_buf_a / st_buf_b for two fresh 64-byte draws; if the
+    # keystream had a period <= 64 they would coincide.
+    devrandom_read(&st_buf_a[0], 64)
+    devrandom_read(&st_buf_b[0], 64)
+    noperiod: int32 = 0
+    pi: uint64 = 0
+    while pi < 64:
+        if st_buf_a[pi] != st_buf_b[pi]:
+            noperiod = 1
+            pi = 64
+        else:
+            pi = pi + 1
+    if noperiod == 1:
+        _emit("[random] large reads differ (no short period) OK\n")
+    else:
+        _emit("[random] large reads IDENTICAL (short period)\n")
+
+    if kat_ok == 1 and notconst == 1 and diff_ab == 1 and noperiod == 1:
+        _emit("[random] PASS\n")
+        return 1
+    _emit("[random] FAIL\n")
+    return 0
