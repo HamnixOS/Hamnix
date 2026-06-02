@@ -850,6 +850,17 @@ if os.environ.get("ENABLE_STATM_TEST") == "1":
 if os.environ.get("ENABLE_STARTTIME_TEST") == "1":
     FILES.append(("/etc/starttime-test", b"1\n"))
 
+# /proc/<pid>/stat priority+nice (fields 18/19) self-test.
+# scripts/test_prionice.sh sets ENABLE_PRIONICE_TEST=1 to plant
+# /etc/prionice-test. init/main.ad detects the marker and calls
+# prionice_selftest() (devproc.ad): it sets the boot slot's nice to a known
+# negative value, asserts sched_get_nice reads it back, renders
+# _emit_linux_stat for the boot slot, parses field 18 (priority = 20 + nice)
+# and field 19 (nice, SIGNED), confirms priority==15 / nice==-5, then emits
+# the [PRIONICE] PASS banner. Needs no extra device; default boots omit it.
+if os.environ.get("ENABLE_PRIONICE_TEST") == "1":
+    FILES.append(("/etc/prionice-test", b"1\n"))
+
 # times(2) CPU-time self-test. scripts/test_times.sh sets
 # ENABLE_TIMES_TEST=1 to plant /etc/times-test. init/main.ad at
 # boot:37.times detects the marker and calls times_selftest()
