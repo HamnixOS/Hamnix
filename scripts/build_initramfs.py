@@ -679,6 +679,18 @@ if os.environ.get("ENABLE_EXT4_SYMLINK_TEST") == "1":
 if os.environ.get("ENABLE_FSTAT_BACKEND_TEST") == "1":
     FILES.append(("/etc/fstat-backend-test", b"1\n"))
 
+# tmpfs symlink + hard-link self-test. scripts/test_tmpfs_link.sh sets
+# ENABLE_TMPFS_LINK_TEST=1 to plant /etc/tmpfs-link-test. init/main.ad's
+# boot:37.tln hook detects the marker and calls tmpfs_link_selftest()
+# (fs/vfs.ad): it creates a tmpfs file with known contents, a tmpfs
+# symlink to it (verifying open-follow reads the file), a tmpfs hard link
+# (verifying both names read the same data), then unlinks names one at a
+# time to prove the per-slot link count keeps the storage alive until the
+# last name is gone. RAM-backed only — no disk, so it always runs once the
+# marker is present. Default boots omit the marker.
+if os.environ.get("ENABLE_TMPFS_LINK_TEST") == "1":
+    FILES.append(("/etc/tmpfs-link-test", b"1\n"))
+
 # statfs(2)/fstatfs(2) capacity self-test. scripts/test_statfs.sh sets
 # ENABLE_STATFS_TEST=1 to plant /etc/statfs-test. init/main.ad at
 # boot:37.sfs detects the marker after the ext4 mount and calls

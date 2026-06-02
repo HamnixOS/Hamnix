@@ -42,7 +42,7 @@ from drivers.tty.serial.early_8250 import (
 )
 from drivers.input.atkbd import kbd_rx_pop
 from kernel.printk.printk import printk0, printk1, printk2, printk_set_level
-from drivers.tty.serial.early_8250 import PRINTK_LEVEL_WARN
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_WARN, PRINTK_LEVEL_EMERG
 from kernel.sched.core import (
     TaskStruct, current_task,
     FD_CLOSED_MARK, FD_STDIN_MARK, FD_STDOUT_MARK, FD_STDERR_MARK,
@@ -195,6 +195,9 @@ from fs.tmpfs import (
     tmpfs_rename, tmpfs_slot_name,
     tmpfs_mkdir, tmpfs_path_is_dir, tmpfs_listdir,
     tmpfs_var_skeleton_init, is_var_path, tmpfs_path_exists,
+    # §links: tmpfs symlink + hard-link support.
+    tmpfs_create_symlink, tmpfs_hardlink, tmpfs_is_symlink,
+    tmpfs_path_is_symlink, tmpfs_readlink,
 )
 from fs.pipe import (
     pipe_alloc, pipe_read, pipe_write,
@@ -2261,9 +2264,11 @@ def vfs_symlink(target: Ptr[char], linkpath: Ptr[char]) -> int32:
     # follow the link transparently when a process opens `linkpath`.
     #
     # Routing:
-    #   /ext/*  → ext4_create_symlink (the only writable FS with on-disk
-    #             symlink support right now; tmpfs symlinks are a follow-up)
-    #   else    → -EROFS
+    #   /ext/*         → ext4_create_symlink (on-disk symlink support)
+    #   /tmp/*, /var/* → tmpfs_create_symlink (RAM-backed; the target
+    #                    string is stored inline in the slot and the
+    #                    resolver follows it transparently on open)
+    #   else           → -EROFS
     if _vfs_check_perm(linkpath, PERM_W) != 0:
         return EPERM_PERM
     if is_ext_path(linkpath) != 0:
@@ -2273,6 +2278,11 @@ def vfs_symlink(target: Ptr[char], linkpath: Ptr[char]) -> int32:
         if inum == 0:
             return ENOENT
         return 0
+    if is_tmpfs_path(linkpath) != 0:
+        # tmpfs_create_symlink returns 0 on success or a negative
+        # TMPFS_E* (which already lines up with the VFS errno space:
+        # -ENOENT / -EEXIST / -ENOTDIR / -ENOSPC / -ENAMETOOLONG).
+        return tmpfs_create_symlink(linkpath, target)
     return EROFS
 
 
@@ -2373,7 +2383,29 @@ def vfs_link(oldpath: Ptr[char], newpath: Ptr[char]) -> int32:
         if ext4_hardlink(src_leaf, dst_leaf, 2) != 0:
             return ENOENT
         return 0
-    # tmpfs / cpio / other local backends: hardlinks not implemented.
+    # tmpfs hardlinks: both names must live in the same tmpfs server
+    # (/tmp/* or /var/*). A second slot is created for newpath aliasing
+    # oldpath's data slot, with the link count tracked on the canonical
+    # slot (fs/tmpfs.ad: tmpfs_hardlink). A tmpfs↔other-backend pair is a
+    # cross-backend link and is rejected with -EXDEV, matching the ext4
+    # leg above.
+    tmp_old: int32 = is_tmpfs_path(oldpath)
+    tmp_new: int32 = is_tmpfs_path(newpath)
+    if tmp_old != 0:
+        if tmp_new == 0:
+            printk_set_level(PRINTK_LEVEL_WARN)
+            printk0("vfs_link: EXDEV: cross-backend link rejected\n")
+            return EXDEV_LINK
+        # tmpfs_hardlink returns 0 on success or a negative TMPFS_E*
+        # (ENOENT / EEXIST / ENOTDIR / ENOSPC / ENAMETOOLONG) — all in
+        # the VFS errno space already.
+        return tmpfs_hardlink(oldpath, newpath)
+    if tmp_new != 0:
+        # newpath is tmpfs but oldpath is some other local backend.
+        printk_set_level(PRINTK_LEVEL_WARN)
+        printk0("vfs_link: EXDEV: cross-backend link rejected\n")
+        return EXDEV_LINK
+    # cpio / other read-only local backends: hardlinks not implemented.
     return EROFS
 
 
@@ -3527,7 +3559,30 @@ def _open_tmpfs_read(name: Ptr[char]) -> int32:
     # FAT / ext4 directory-open path, so getdents64() / chdir's
     # is-a-dir probe / `ls` all work through it. A path resolving to
     # a file opens as the existing FD_TMPFS_MARK read fd.
-    if tmpfs_path_is_dir(name) != 0:
+    #
+    # §links: if `name` resolves to a tmpfs SYMLINK, follow it
+    # transparently — substitute the stored target. Tmpfs->tmpfs hops
+    # are chased iteratively here (capped at 8, mirroring the cpio
+    # _lookup_name 8-hop cap, so a cyclic chain fails cleanly instead of
+    # spinning). The moment a target leaves tmpfs (points at an ext4 /
+    # cpio / device path) we hand off to vfs_open, which routes it to the
+    # right backend (and follows that backend's own symlinks).
+    cur: Ptr[char] = name
+    sym_hops: int32 = 0
+    while tmpfs_path_is_symlink(cur) != 0:
+        if sym_hops >= 8:
+            return ENOENT
+        sslot: int32 = tmpfs_lookup(cur)
+        tgt: Ptr[uint8] = tmpfs_readlink(sslot)
+        if cast[uint64](tgt) == 0:
+            return ENOENT
+        tgt_c: Ptr[char] = cast[Ptr[char]](tgt)
+        if is_tmpfs_path(tgt_c) == 0 and is_tmpfs_dir_path(tgt_c) == 0:
+            # Target lives on another backend — re-dispatch.
+            return vfs_open(tgt_c)
+        cur = tgt_c
+        sym_hops = sym_hops + 1
+    if tmpfs_path_is_dir(cur) != 0:
         task: Ptr[TaskStruct] = current_task()
         fd: int32 = _alloc_fd(task)
         if fd < 0:
@@ -3535,7 +3590,7 @@ def _open_tmpfs_read(name: Ptr[char]) -> int32:
         buf: uint64 = kmalloc(DIR_BUF_SIZE)
         if buf == 0:
             return cast[int32](-12)                   # -ENOMEM
-        n: int64 = tmpfs_listdir(name, cast[Ptr[uint8]](buf),
+        n: int64 = tmpfs_listdir(cur, cast[Ptr[uint8]](buf),
                                  DIR_BUF_SIZE)
         if n < 0:
             kfree(buf)
@@ -3546,7 +3601,7 @@ def _open_tmpfs_read(name: Ptr[char]) -> int32:
         task[0].fd_buf[fdu]    = buf
         task[0].fd_buflen[fdu] = cast[uint64](n)
         return fd
-    slot: int32 = tmpfs_lookup(name)
+    slot: int32 = tmpfs_lookup(cur)
     if slot < 0:
         return ENOENT
     task: Ptr[TaskStruct] = current_task()
@@ -5469,3 +5524,188 @@ def vfs_distrofs_load(inst: uint64, dst: uint64, max_len: uint64) -> int64:
     _dfs_set_instance(inst)
     return ext4_blob_load(cast[Ptr[char]](&_dfs_blob_name[0]),
                           cast[Ptr[uint8]](dst), max_len)
+
+
+# --- tmpfs symlink + hard-link self-test ----------------------------
+#
+# Driven by /etc/tmpfs-link-test (planted by scripts/build_initramfs.py
+# under ENABLE_TMPFS_LINK_TEST=1). init/main.ad's boot:37.tln hook scans
+# for the marker and calls tmpfs_link_selftest(). It exercises the full
+# RAM-backed link contract added to fs/tmpfs.ad:
+#   1. create a tmpfs file with known contents;
+#   2. create a tmpfs SYMLINK to it and verify opening the symlink reads
+#      the file's contents (resolver-follow through _open_tmpfs_read);
+#   3. create a tmpfs HARD LINK and verify both names read the same data;
+#   4. unlink one hard-link name and verify the other still reads the
+#      data (link-count > 0 keeps the storage alive);
+#   5. unlink the last name and verify it is gone (storage freed).
+# Prints [TMPFS_LINK] PASS on success or [TMPFS_LINK] FAIL ... on any
+# mismatch, at EMERG level so the marker always reaches the console.
+
+_TLINK_BODY: Array[16, uint8]
+_TLINK_RBUF: Array[64, uint8]
+
+
+def _tlink_emerg(msg: Ptr[char]):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0(msg)
+
+
+def _tlink_read_all(path: Ptr[char], out: Ptr[uint8],
+                    cap: uint64) -> int64:
+    # Open `path` for read (following any symlink), read up to `cap`
+    # bytes into `out`, close. Returns bytes read, or a negative open/
+    # read error. Used to verify a name reads the expected contents.
+    fd: int32 = vfs_open(path)
+    if fd < 0:
+        return cast[int64](fd)
+    n: int64 = vfs_read(fd, out, cap)
+    vfs_close(fd)
+    return n
+
+
+def _tlink_body_matches(out: Ptr[uint8], n: int64) -> int32:
+    # 1 if `out[0..n)` equals the 6-byte known body, else 0.
+    if n != 6:
+        return 0
+    i: uint64 = 0
+    while i < 6:
+        if out[i] != _TLINK_BODY[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def tmpfs_link_selftest() -> int32:
+    # Boot-task fd-table priming: like fstat_backend_selftest, this runs
+    # from the kernel-init task whose fd table is still all-zero .bss, so
+    # every fd_idx slot reads as 0 ("cpio index 0"), not FD_CLOSED_MARK,
+    # and _alloc_fd would report EMFILE on the first open. Snapshot slots
+    # 3..15 (0..2 are the std streams) to FD_CLOSED_MARK, run the test,
+    # then restore. The selftest opens/closes its fds in matched pairs so
+    # the table is clean by the time we restore anyway, but snapshot +
+    # restore keeps the boot task's later use of stdio untouched.
+    seltask: Ptr[TaskStruct] = current_task()
+    saved: Array[16, uint32]
+    fclr: uint64 = 3
+    while fclr < 16:
+        saved[fclr] = seltask[0].fd_idx[fclr]
+        seltask[0].fd_idx[fclr] = FD_CLOSED_MARK
+        fclr = fclr + 1
+
+    rc: int32 = _tmpfs_link_selftest_body()
+
+    # Restore the boot task's fd slots.
+    frst: uint64 = 3
+    while frst < 16:
+        seltask[0].fd_idx[frst] = saved[frst]
+        frst = frst + 1
+    return rc
+
+
+def _tmpfs_link_selftest_body() -> int32:
+    # Known 6-byte payload "LINK!\n".
+    _TLINK_BODY[0] = 76     # 'L'
+    _TLINK_BODY[1] = 73     # 'I'
+    _TLINK_BODY[2] = 78     # 'N'
+    _TLINK_BODY[3] = 75     # 'K'
+    _TLINK_BODY[4] = 33     # '!'
+    _TLINK_BODY[5] = 10     # '\n'
+    want: uint64 = 6
+
+    file_path: Ptr[char] = "/tmp/link-orig"
+    sym_path:  Ptr[char] = "/tmp/link-sym"
+    h1_path:   Ptr[char] = "/tmp/link-h1"
+    h2_path:   Ptr[char] = "/tmp/link-h2"
+
+    # (1) Create the original file with the known contents.
+    wfd: int32 = vfs_open_write(file_path)
+    if wfd < 0:
+        _tlink_emerg("[TMPFS_LINK] FAIL: open_write /tmp/link-orig\n")
+        return -1
+    wn: int64 = vfs_write(wfd, &_TLINK_BODY[0], want)
+    vfs_close(wfd)
+    if wn != cast[int64](want):
+        _tlink_emerg("[TMPFS_LINK] FAIL: short write to original\n")
+        return -1
+    on: int64 = _tlink_read_all(file_path, &_TLINK_RBUF[0], 64)
+    if _tlink_body_matches(&_TLINK_RBUF[0], on) == 0:
+        _tlink_emerg("[TMPFS_LINK] FAIL: original read-back mismatch\n")
+        return -1
+
+    # (2) Symlink → original; opening the symlink must read the file.
+    sr: int32 = vfs_symlink(file_path, sym_path)
+    if sr != 0:
+        _tlink_emerg("[TMPFS_LINK] FAIL: vfs_symlink returned nonzero\n")
+        return -1
+    if tmpfs_path_is_symlink(sym_path) == 0:
+        _tlink_emerg("[TMPFS_LINK] FAIL: symlink slot not SYMLINK-kind\n")
+        return -1
+    sn: int64 = _tlink_read_all(sym_path, &_TLINK_RBUF[0], 64)
+    if _tlink_body_matches(&_TLINK_RBUF[0], sn) == 0:
+        _tlink_emerg("[TMPFS_LINK] FAIL: symlink-follow read mismatch\n")
+        return -1
+
+    # (3) Hard link → original; both names must read the same data.
+    hr: int32 = vfs_link(file_path, h1_path)
+    if hr != 0:
+        _tlink_emerg("[TMPFS_LINK] FAIL: vfs_link (h1) returned nonzero\n")
+        return -1
+    h1n: int64 = _tlink_read_all(h1_path, &_TLINK_RBUF[0], 64)
+    if _tlink_body_matches(&_TLINK_RBUF[0], h1n) == 0:
+        _tlink_emerg("[TMPFS_LINK] FAIL: hardlink h1 read mismatch\n")
+        return -1
+    # A second hard link, so we can prove link-count survives one unlink.
+    hr2: int32 = vfs_link(h1_path, h2_path)
+    if hr2 != 0:
+        _tlink_emerg("[TMPFS_LINK] FAIL: vfs_link (h2) returned nonzero\n")
+        return -1
+    h2n: int64 = _tlink_read_all(h2_path, &_TLINK_RBUF[0], 64)
+    if _tlink_body_matches(&_TLINK_RBUF[0], h2n) == 0:
+        _tlink_emerg("[TMPFS_LINK] FAIL: hardlink h2 read mismatch\n")
+        return -1
+
+    # (4) Unlink the ORIGINAL (canonical) name. The two hard links must
+    # still read the data — storage stays alive while nlink > 0, and the
+    # canonical data slot is promoted to a surviving alias.
+    ur: int32 = vfs_unlink(file_path)
+    if ur != 0:
+        _tlink_emerg("[TMPFS_LINK] FAIL: unlink original returned nonzero\n")
+        return -1
+    if vfs_open(file_path) >= 0:
+        _tlink_emerg("[TMPFS_LINK] FAIL: original still openable post-unlink\n")
+        return -1
+    a1: int64 = _tlink_read_all(h1_path, &_TLINK_RBUF[0], 64)
+    if _tlink_body_matches(&_TLINK_RBUF[0], a1) == 0:
+        _tlink_emerg("[TMPFS_LINK] FAIL: h1 read mismatch after unlink\n")
+        return -1
+    a2: int64 = _tlink_read_all(h2_path, &_TLINK_RBUF[0], 64)
+    if _tlink_body_matches(&_TLINK_RBUF[0], a2) == 0:
+        _tlink_emerg("[TMPFS_LINK] FAIL: h2 read mismatch after unlink\n")
+        return -1
+
+    # Unlink one hard-link name; the other must still read the data.
+    u1: int32 = vfs_unlink(h1_path)
+    if u1 != 0:
+        _tlink_emerg("[TMPFS_LINK] FAIL: unlink h1 returned nonzero\n")
+        return -1
+    b2: int64 = _tlink_read_all(h2_path, &_TLINK_RBUF[0], 64)
+    if _tlink_body_matches(&_TLINK_RBUF[0], b2) == 0:
+        _tlink_emerg("[TMPFS_LINK] FAIL: h2 read mismatch after h1 unlink\n")
+        return -1
+
+    # (5) Unlink the LAST name; the file must be gone.
+    u2: int32 = vfs_unlink(h2_path)
+    if u2 != 0:
+        _tlink_emerg("[TMPFS_LINK] FAIL: unlink h2 returned nonzero\n")
+        return -1
+    if vfs_open(h2_path) >= 0:
+        _tlink_emerg("[TMPFS_LINK] FAIL: h2 still openable after last unlink\n")
+        return -1
+
+    # Tidy up the symlink (it still points at the now-gone original;
+    # removing it leaves tmpfs clean for the rest of boot).
+    vfs_unlink(sym_path)
+
+    _tlink_emerg("[TMPFS_LINK] PASS\n")
+    return 0
