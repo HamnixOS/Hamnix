@@ -419,6 +419,19 @@ if os.environ.get("ENABLE_DISKSTATS_TEST") == "1":
 if os.environ.get("ENABLE_NOTEPG_TEST") == "1":
     FILES.append(("/etc/notepg-test", b"ENABLE_NOTEPG_TEST=1\n"))
 
+# Plan 9 single-target (one pid) note delivery self-test.
+# scripts/test_notepid.sh sets ENABLE_NOTEPID_TEST=1 to plant
+# /etc/notepid-test. init/main.ad at boot:37.npid detects the marker and
+# calls notepid_selftest() (sys/src/9/port/sysnote.ad): it claims two
+# inert live task slots, stamps each a known distinct pid, posts a note to
+# the FIRST pid via the REAL post_note_to_pid path (the same path
+# /proc/<pid>/note cross-task writes now drive), and asserts the note was
+# enqueued onto EXACTLY that one target while the non-target witness was
+# skipped, the return value equals count, and a post to a non-existent pid
+# honestly returns -ESRCH. Default boots omit the marker so it never fires.
+if os.environ.get("ENABLE_NOTEPID_TEST") == "1":
+    FILES.append(("/etc/notepid-test", b"1\n"))
+
 # Real AHCI Native Command Queuing self-test. scripts/test_ahci_ncq.sh sets
 # ENABLE_AHCI_NCQ_TEST=1 to plant /etc/ahci-ncq-test. init/main.ad at
 # boot:37.ncq detects the marker and calls ahci_ncq_selftest()
