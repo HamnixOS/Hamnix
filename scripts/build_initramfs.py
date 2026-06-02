@@ -753,6 +753,16 @@ if os.environ.get("ENABLE_STATFS_TEST") == "1":
 if os.environ.get("ENABLE_RUSAGE_TEST") == "1":
     FILES.append(("/etc/rusage-test", b"1\n"))
 
+# times(2) CPU-time self-test. scripts/test_times.sh sets
+# ENABLE_TIMES_TEST=1 to plant /etc/times-test. init/main.ad at
+# boot:37.times detects the marker and calls times_selftest()
+# (linux_abi/u_syscalls.ad): it lets the timer ISR accrue a few system
+# ticks to the boot task, then drives _u_times and asserts tms_stime
+# advanced (real per-task CPU-time accounting), cutime stayed zeroed,
+# and the jiffies return is positive. Default boots omit the marker.
+if os.environ.get("ENABLE_TIMES_TEST") == "1":
+    FILES.append(("/etc/times-test", b"1\n"))
+
 # access(2) mode-bit self-test. scripts/test_access_mode.sh sets
 # ENABLE_ACCESS_MODE_TEST=1 to plant /etc/access-mode-test. init/main.ad
 # at boot:37.acc detects the marker after the ext4 mount and calls
