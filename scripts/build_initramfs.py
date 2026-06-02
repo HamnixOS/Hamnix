@@ -1599,6 +1599,88 @@ def cpio_trailer() -> bytes:
     return cpio_entry("TRAILER!!!", b"")
 
 
+def _embed_usb_hcd_chain(here: Path) -> bytes:
+    """Embed the USB host-controller class L-shim chain (usbcore +
+    xhci_pci + xhci_hcd + ehci_pci + ehci_hcd) into a cpio blob.
+
+    This is load-bearing for the .ko-default root-on-USB path: the
+    controller is brought up THROUGH these .kos BEFORE the ext4 root is
+    online, so the .ko bytes MUST live in the initramfs (the rootfs
+    partition is unreadable until USB enumerates). Both the normal fat
+    cpio and the HAMNIX_CPIO_EMPTY=1 shipped-image path (build_img.sh)
+    call this so the export surface (xhci_init_driver / xhci_run /
+    xhci_gen_setup) resolves identically in either build.
+
+    See the inline notes at the original call site: the dep filename for
+    xhci_hcd is the DASH form (xhci-hcd.ko) because `modinfo -F depends
+    xhci_pci.ko` returns `xhci-hcd, usbcore`, and the in-kernel
+    modules_dep parser walks dep tokens VERBATIM to build the lookup
+    path.
+    """
+    blob = b""
+    for ko_dir, ko_name, dep_filename in (
+            ("usbcore",  "usbcore.ko",  "usbcore.ko"),
+            ("xhci_pci", "xhci_pci.ko", "xhci_pci.ko"),
+            ("xhci_hcd", "xhci_hcd.ko", "xhci-hcd.ko"),
+            ("ehci_pci", "ehci_pci.ko", "ehci_pci.ko"),
+            ("ehci_hcd", "ehci_hcd.ko", "ehci-hcd.ko"),
+    ):
+        ko_path = here / "kernel-modules" / ko_dir / ko_name
+        if ko_path.is_file():
+            data = ko_path.read_bytes()
+            paths = [
+                f"/lib/modules/{dep_filename}",
+                f"/lib/modules/6.12/{dep_filename}",
+            ]
+            # Also plant the underscore-form filename if it differs from
+            # the dep-form — userspace `insmod` users habitually type
+            # xhci_hcd.ko (with underscore) since that's the modinfo
+            # -F name output.
+            if dep_filename != ko_name:
+                paths += [
+                    f"/lib/modules/{ko_name}",
+                    f"/lib/modules/6.12/{ko_name}",
+                ]
+            for name in paths:
+                blob += cpio_entry(name, data)
+                print(f"  embedded {name} ({len(data)} bytes from "
+                      f"kernel-modules/{ko_dir}/{ko_name})")
+    return blob
+
+
+def _embed_modules_dep(here: Path) -> bytes:
+    """Embed the Linux-shape modules.dep dependency table for the
+    in-kernel modules_dep parser (kernel/modules_dep.ad).
+
+    The xhci_pci -> xhci-hcd -> usbcore dep chain is resolved from this
+    table; without it the parser falls back to "load only the requested
+    module, no deps", so xhci_pci's init_module fires before xhci_hcd is
+    loaded and the cross-module ksymtab never registers xhci_init_driver.
+    Shared by the normal and HAMNIX_CPIO_EMPTY=1 paths.
+    """
+    blob = b""
+    kmods_root = here / "kernel-modules"
+    if kmods_root.is_dir() and any(kmods_root.glob("*/*.ko")):
+        import importlib.util as _ilu_dep
+        _mod_dep_path = here / "scripts" / "build_modules_dep.py"
+        _spec_dep = _ilu_dep.spec_from_file_location(
+            "build_modules_dep", _mod_dep_path)
+        if _spec_dep is None or _spec_dep.loader is None:
+            raise SystemExit(
+                f"build_initramfs: cannot import {_mod_dep_path}")
+        _mod_dep = _ilu_dep.module_from_spec(_spec_dep)
+        _spec_dep.loader.exec_module(_mod_dep)
+        dep_text = _mod_dep.build_dep_table(kmods_root)
+        dep_bytes = dep_text.encode()
+        blob += cpio_entry("/lib/modules/modules.dep", dep_bytes)
+        _dep_lines_n = sum(
+            1 for ln in dep_text.splitlines()
+            if ln and not ln.startswith("#"))
+        print(f"  embedded /lib/modules/modules.dep "
+              f"({len(dep_bytes)} bytes, {_dep_lines_n} module rows)")
+    return blob
+
+
 def build_archive() -> bytes:
     blob = b""
     here = Path(__file__).resolve().parent.parent
@@ -1633,6 +1715,26 @@ def build_archive() -> bytes:
                 n_markers += 1
         print("[build_initramfs] HAMNIX_CPIO_EMPTY=1: emitting %d /etc boot "
               "markers + trailer (installed disk boots off ext4)." % n_markers)
+        # The .ko-default root-on-USB path (ENABLE_XHCI_KO_REAL=1, the
+        # shipped-image default in build_img.sh) brings the USB controller
+        # up THROUGH the Linux xhci_hcd.ko stack BEFORE the ext4 root is
+        # online. The /etc/xhci-ko* markers above tell the kernel to take
+        # that path, but the controller cannot enumerate — and the cross-
+        # module ksymtab can never resolve xhci_init_driver / xhci_run /
+        # xhci_gen_setup — unless the .ko bytes + modules.dep are ALSO in
+        # the cpio. They CANNOT live on the ext4 root: the root is
+        # unreadable until USB enumerates. So embed the USB host-controller
+        # .ko chain + modules.dep here whenever the .ko USB path is armed.
+        # (Without this the shipped image printed [xhci-real] but FAILED
+        # stage1 with ksymtab xhci_init_driver=0x0 — the real-HW NUC #GP.)
+        if os.environ.get("ENABLE_XHCI_KO_REAL", "0") == "1":
+            here = Path(__file__).resolve().parent.parent
+            print("[build_initramfs] HAMNIX_CPIO_EMPTY=1 + ENABLE_XHCI_KO_REAL"
+                  "=1: also embedding USB host-controller .ko chain + "
+                  "modules.dep (root-on-USB needs them before ext4 is "
+                  "online).")
+            marker_blob += _embed_usb_hcd_chain(here)
+            marker_blob += _embed_modules_dep(here)
         return marker_blob + cpio_trailer()
 
     # HAMNIX_CPIO_LEAN=1 — strip everything from the cpio that the
@@ -2331,27 +2433,9 @@ def build_archive() -> bytes:
     # The cost is small (a few hundred bytes — one short line per .ko).
     # When the table is absent the in-kernel parser just falls back to
     # the legacy "load only the requested module, no deps" behavior.
-    _kmods_root_for_dep = here / "kernel-modules"
-    if _kmods_root_for_dep.is_dir() and any(
-            _kmods_root_for_dep.glob("*/*.ko")):
-        import importlib.util as _ilu_dep
-        _mod_dep_path = here / "scripts" / "build_modules_dep.py"
-        _spec_dep = _ilu_dep.spec_from_file_location(
-            "build_modules_dep", _mod_dep_path)
-        if _spec_dep is None or _spec_dep.loader is None:
-            raise SystemExit(
-                f"build_initramfs: cannot import {_mod_dep_path}")
-        _mod_dep = _ilu_dep.module_from_spec(_spec_dep)
-        _spec_dep.loader.exec_module(_mod_dep)
-        dep_text = _mod_dep.build_dep_table(_kmods_root_for_dep)
-        dep_bytes = dep_text.encode()
-        blob += cpio_entry("/lib/modules/modules.dep", dep_bytes)
-        # Count the data lines (those not starting with '#') for the log.
-        _dep_lines_n = sum(
-            1 for ln in dep_text.splitlines()
-            if ln and not ln.startswith("#"))
-        print(f"  embedded /lib/modules/modules.dep "
-              f"({len(dep_bytes)} bytes, {_dep_lines_n} module rows)")
+    # Shared with the HAMNIX_CPIO_EMPTY=1 shipped-image path via
+    # _embed_modules_dep.
+    blob += _embed_modules_dep(here)
 
     # Userland modprobe test fixture. scripts/test_modprobe.sh sets
     # ENABLE_MODPROBE_USERLAND_TEST=1 to plant a synthetic Linux-shape
@@ -2538,34 +2622,9 @@ def build_archive() -> bytes:
     # Therefore plant the cpio entries using the dash-form filename
     # (mirroring nvme-core.ko which has the same dash-vs-underscore
     # split). Name normalization in _md_name_eq only handles the
-    # already-loaded fingerprint table.
-    for ko_dir, ko_name, dep_filename in (
-            ("usbcore",  "usbcore.ko",  "usbcore.ko"),
-            ("xhci_pci", "xhci_pci.ko", "xhci_pci.ko"),
-            ("xhci_hcd", "xhci_hcd.ko", "xhci-hcd.ko"),
-            ("ehci_pci", "ehci_pci.ko", "ehci_pci.ko"),
-            ("ehci_hcd", "ehci_hcd.ko", "ehci-hcd.ko"),
-    ):
-        ko_path = here / "kernel-modules" / ko_dir / ko_name
-        if ko_path.is_file():
-            data = ko_path.read_bytes()
-            paths = [
-                f"/lib/modules/{dep_filename}",
-                f"/lib/modules/6.12/{dep_filename}",
-            ]
-            # Also plant the underscore-form filename if it differs from
-            # the dep-form — userspace `insmod` users habitually type
-            # xhci_hcd.ko (with underscore) since that's the modinfo
-            # -F name output.
-            if dep_filename != ko_name:
-                paths += [
-                    f"/lib/modules/{ko_name}",
-                    f"/lib/modules/6.12/{ko_name}",
-                ]
-            for name in paths:
-                blob += cpio_entry(name, data)
-                print(f"  embedded {name} ({len(data)} bytes from "
-                      f"kernel-modules/{ko_dir}/{ko_name})")
+    # already-loaded fingerprint table. Shared with the
+    # HAMNIX_CPIO_EMPTY=1 shipped-image path via _embed_usb_hcd_chain.
+    blob += _embed_usb_hcd_chain(here)
 
     # WiFi pivot: cfg80211.ko (configuration/admin layer, ~2.3 MiB)
     # and mac80211.ko (soft-MAC stack, ~2.4 MiB) — Debian 6.1.0-32
