@@ -1,0 +1,417 @@
+# drivers/virtio/virtio_modern.ad
+#
+# Modern virtio-1.0 PCI transport. The legacy transport
+# (drivers/virtio/virtio_pci.ad) only speaks the transitional port-I/O
+# BAR0 / single-PFN ring protocol; QEMU's `-device virtio-gpu-pci` (and
+# every other "modern-only" virtio-1.0 device, PCI device-id >= 0x1040)
+# has NO legacy interface. This module adds the structured-capability
+# MMIO transport so the kernel can drive those devices.
+#
+# What "modern" means here:
+#   - The device advertises four (or more) PCI vendor-specific
+#     capabilities (cap-id 0x09), each a VIRTIO_PCI_CAP struct naming a
+#     BAR + byte offset + length and a cfg_type:
+#       cfg_type 1 = COMMON_CFG   (the queue/feature/status registers)
+#       cfg_type 2 = NOTIFY_CFG   (+ a u32 notify_off_multiplier)
+#       cfg_type 3 = ISR_CFG      (read-to-clear interrupt status)
+#       cfg_type 4 = DEVICE_CFG   (device-specific config, e.g. gpu)
+#   - All of those live in MMIO BARs (not I/O ports). The first 4 GiB is
+#     identity-mapped by the boot stub, so a BAR base under 4 GiB is
+#     directly dereferenceable — same assumption nvme.ad / xhci.ad make.
+#   - The split-virtqueue IN-MEMORY layout (descriptor table / avail
+#     ring / used ring) is IDENTICAL to legacy, so we reuse the
+#     descriptor-fill + used-ring-poll helpers from virtio_ring.ad
+#     (virtq_add_chain*, _desc_set). Only the TRANSPORT differs: instead
+#     of one queue_pfn register we program the three rings' 64-bit
+#     physical addresses into queue_desc/queue_driver/queue_device in the
+#     common-config MMIO struct, set queue_size + queue_enable, and
+#     notify by writing to a per-queue notify offset in the notify BAR.
+#
+# This file is deliberately standalone: legacy virtio_blk / virtio_net
+# keep using virtio_pci.ad untouched. A modern consumer (virtio_gpu)
+# drives the device entirely through a VirtioModernDev handle returned
+# by virtio_modern_init().
+
+from kernel.printk.printk import printk0, printk1, printk2
+from mm.page_alloc import alloc_pages
+from arch.x86.mm.pgtable import virt_to_phys
+from drivers.pci.pci import (
+    pci_bdf_bus, pci_bdf_dev, pci_bdf_fn,
+    pci_config_read_byte, pci_config_read_dword,
+    pci_bar_mem_base, pci_enable_mem_and_master,
+    PCI_STATUS_OFFSET, PCI_STATUS_CAP_LIST, PCI_CAP_PTR_OFFSET,
+)
+from drivers.virtio.virtio_ring import VirtQueue
+
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
+
+# --- PCI capability ids / virtio cap struct layout -----------------
+#
+# VIRTIO_PCI_CAP (virtio spec §4.1.4) — a vendor-specific PCI cap:
+#   +0  u8  cap_vndr     (0x09 = vendor-specific)
+#   +1  u8  cap_next     (next-cap byte offset)
+#   +2  u8  cap_len      (this cap's length)
+#   +3  u8  cfg_type     (1=COMMON 2=NOTIFY 3=ISR 4=DEVICE 5=PCI)
+#   +4  u8  bar          (which BAR holds this structure)
+#   +5  u8  id
+#   +6  u8  padding[2]
+#   +8  u32 offset       (byte offset into the BAR)
+#   +12 u32 length       (length of the structure)
+# The NOTIFY cap is followed by an extra u32 notify_off_multiplier at +16.
+PCI_CAP_ID_VNDR:        uint32 = 0x09
+
+VIRTIO_PCI_CAP_COMMON_CFG: uint32 = 1
+VIRTIO_PCI_CAP_NOTIFY_CFG: uint32 = 2
+VIRTIO_PCI_CAP_ISR_CFG:    uint32 = 3
+VIRTIO_PCI_CAP_DEVICE_CFG: uint32 = 4
+
+# Common-config MMIO struct field byte offsets (virtio spec §4.1.4.3).
+VIRTIO_PCI_COMMON_DFSELECT:   uint64 = 0    # u32 device_feature_select
+VIRTIO_PCI_COMMON_DF:         uint64 = 4    # u32 device_feature   (RO)
+VIRTIO_PCI_COMMON_GFSELECT:   uint64 = 8    # u32 driver_feature_select
+VIRTIO_PCI_COMMON_GF:         uint64 = 12   # u32 driver_feature   (RW)
+VIRTIO_PCI_COMMON_MSIX:       uint64 = 16   # u16 msix_config
+VIRTIO_PCI_COMMON_NUMQ:       uint64 = 18   # u16 num_queues  (RO)
+VIRTIO_PCI_COMMON_STATUS:     uint64 = 20   # u8  device_status
+VIRTIO_PCI_COMMON_CFGGEN:     uint64 = 21   # u8  config_generation (RO)
+VIRTIO_PCI_COMMON_Q_SELECT:   uint64 = 22   # u16 queue_select
+VIRTIO_PCI_COMMON_Q_SIZE:     uint64 = 24   # u16 queue_size
+VIRTIO_PCI_COMMON_Q_MSIX:     uint64 = 26   # u16 queue_msix_vector
+VIRTIO_PCI_COMMON_Q_ENABLE:   uint64 = 28   # u16 queue_enable
+VIRTIO_PCI_COMMON_Q_NOFF:     uint64 = 30   # u16 queue_notify_off (RO)
+VIRTIO_PCI_COMMON_Q_DESC:     uint64 = 32   # u64 queue_desc
+VIRTIO_PCI_COMMON_Q_DRIVER:   uint64 = 40   # u64 queue_driver (avail)
+VIRTIO_PCI_COMMON_Q_DEVICE:   uint64 = 48   # u64 queue_device (used)
+
+# Device status bits (same as legacy, plus FEATURES_OK which IS used in
+# the modern handshake).
+VM_STATUS_ACK:         uint32 = 0x01
+VM_STATUS_DRIVER:      uint32 = 0x02
+VM_STATUS_DRIVER_OK:   uint32 = 0x04
+VM_STATUS_FEATURES_OK: uint32 = 0x08
+VM_STATUS_FAILED:      uint32 = 0x80
+
+# Feature bit 32: VIRTIO_F_VERSION_1 — MUST be negotiated for a modern
+# device. It lives in feature word 1 (bits 32..63 → select=1, bit 0).
+VIRTIO_F_VERSION_1_WORD:   uint32 = 1
+VIRTIO_F_VERSION_1_BIT:    uint32 = 0x1
+
+VM_DESC_F_NEXT:  uint16 = 1
+VM_DESC_F_WRITE: uint16 = 2
+VM_DESC_SIZE:    uint64 = 16
+
+
+# Per-device modern-transport handle. Holds the resolved MMIO bases for
+# each capability structure plus the notify multiplier. A consumer
+# (virtio_gpu) keeps one of these and passes it to the queue/notify
+# helpers below.
+class VirtioModernDev:
+    bdf:           uint32
+    common_base:   uint64    # COMMON_CFG MMIO base
+    notify_base:   uint64    # NOTIFY_CFG BAR base + cap.offset
+    isr_base:      uint64    # ISR_CFG MMIO base
+    device_base:   uint64    # DEVICE_CFG MMIO base (device-specific)
+    notify_mult:   uint32    # notify_off_multiplier
+    num_queues:    uint32
+
+
+# --- MMIO accessors ------------------------------------------------
+
+def _m_r8(addr: uint64) -> uint32:
+    return cast[uint32](cast[Ptr[uint8]](addr)[0])
+
+
+def _m_w8(addr: uint64, value: uint32):
+    cast[Ptr[uint8]](addr)[0] = cast[uint8](value & 0xFF)
+
+
+def _m_r16(addr: uint64) -> uint32:
+    return cast[uint32](cast[Ptr[uint16]](addr)[0])
+
+
+def _m_w16(addr: uint64, value: uint32):
+    cast[Ptr[uint16]](addr)[0] = cast[uint16](value & 0xFFFF)
+
+
+def _m_r32(addr: uint64) -> uint32:
+    return cast[Ptr[uint32]](addr)[0]
+
+
+def _m_w32(addr: uint64, value: uint32):
+    cast[Ptr[uint32]](addr)[0] = value
+
+
+def _m_w64(addr: uint64, value: uint64):
+    # Common-config 64-bit fields are written low-dword then high-dword
+    # per the spec (the device latches on the high write). Two 32-bit
+    # stores keep us portable and match QEMU's expectation.
+    cast[Ptr[uint32]](addr + 0)[0] = cast[uint32](value & 0xFFFFFFFF)
+    cast[Ptr[uint32]](addr + 4)[0] = cast[uint32](value >> 32)
+
+
+# --- Capability walk -----------------------------------------------
+
+def _virtio_cap_find(bdf: uint32, want_cfg_type: uint32,
+                     out_base: Ptr[uint64],
+                     out_mult: Ptr[uint32]) -> int32:
+    # Walk the PCI capability list for a vendor-specific (0x09) cap
+    # whose cfg_type == want_cfg_type. Resolves the named BAR to its
+    # MMIO base and adds the cap's `offset` field, writing the final
+    # MMIO address to *out_base. For NOTIFY_CFG also reads the trailing
+    # notify_off_multiplier into *out_mult (ignored otherwise; pass a
+    # scratch). Returns 0 on success, -1 if not found.
+    bus: uint32 = pci_bdf_bus(bdf)
+    dev: uint32 = pci_bdf_dev(bdf)
+    fn:  uint32 = pci_bdf_fn(bdf)
+
+    status: uint32 = pci_config_read_dword(bus, dev, fn, 0x04) >> 16
+    if (status & PCI_STATUS_CAP_LIST) == 0:
+        return -1
+    cap_ptr: uint32 = pci_config_read_byte(bus, dev, fn,
+                                           PCI_CAP_PTR_OFFSET) & 0xFC
+    steps: uint32 = 0
+    while cap_ptr != 0 and steps < 64:
+        cap_id: uint32 = pci_config_read_byte(bus, dev, fn, cap_ptr)
+        if cap_id == PCI_CAP_ID_VNDR:
+            cfg_type: uint32 = pci_config_read_byte(bus, dev, fn,
+                                                    cap_ptr + 3)
+            if cfg_type == want_cfg_type:
+                bar_idx: uint32 = pci_config_read_byte(bus, dev, fn,
+                                                       cap_ptr + 4)
+                off: uint32 = pci_config_read_dword(bus, dev, fn,
+                                                    cap_ptr + 8)
+                bar_base: uint64 = pci_bar_mem_base(bdf, bar_idx)
+                if bar_base == 0:
+                    printk1("virtio-modern: cap cfg_type=%d BAR not MEM\n",
+                            cast[uint64](want_cfg_type))
+                    return -1
+                out_base[0] = bar_base + cast[uint64](off)
+                if want_cfg_type == VIRTIO_PCI_CAP_NOTIFY_CFG:
+                    out_mult[0] = pci_config_read_dword(bus, dev, fn,
+                                                        cap_ptr + 16)
+                return 0
+        cap_ptr = pci_config_read_byte(bus, dev, fn, cap_ptr + 1) & 0xFC
+        steps = steps + 1
+    return -1
+
+
+# --- Status handshake ----------------------------------------------
+
+def _status_read(dev: Ptr[VirtioModernDev]) -> uint32:
+    return _m_r8(dev[0].common_base + VIRTIO_PCI_COMMON_STATUS)
+
+
+def _status_write(dev: Ptr[VirtioModernDev], value: uint32):
+    _m_w8(dev[0].common_base + VIRTIO_PCI_COMMON_STATUS, value)
+
+
+# --- Public: discover + negotiate ----------------------------------
+
+def virtio_modern_init(bdf: uint32, dev: Ptr[VirtioModernDev]) -> int32:
+    # Resolve the four capability structures, run the modern status
+    # handshake (ACK → DRIVER → negotiate VIRTIO_F_VERSION_1 →
+    # FEATURES_OK → confirm), leaving the device ready for queue setup.
+    # The caller then calls virtio_modern_setup_queue() for each queue
+    # and finally virtio_modern_driver_ok(). Returns 0 on success.
+    dev[0].bdf = bdf
+    dev[0].common_base = 0
+    dev[0].notify_base = 0
+    dev[0].isr_base = 0
+    dev[0].device_base = 0
+    dev[0].notify_mult = 0
+    dev[0].num_queues = 0
+
+    pci_enable_mem_and_master(bdf)
+
+    scratch_mult: uint32 = 0
+    if _virtio_cap_find(bdf, VIRTIO_PCI_CAP_COMMON_CFG,
+                        &dev[0].common_base, &scratch_mult) != 0:
+        printk0("virtio-modern: no COMMON_CFG capability\n")
+        return -1
+    if _virtio_cap_find(bdf, VIRTIO_PCI_CAP_NOTIFY_CFG,
+                        &dev[0].notify_base, &dev[0].notify_mult) != 0:
+        printk0("virtio-modern: no NOTIFY_CFG capability\n")
+        return -1
+    # ISR + DEVICE caps are nice-to-have; ISR is needed for INTx (we
+    # poll, so optional) and DEVICE for device-specific config. Don't
+    # hard-fail if a device lacks DEVICE_CFG, but virtio-gpu has it.
+    if _virtio_cap_find(bdf, VIRTIO_PCI_CAP_ISR_CFG,
+                        &dev[0].isr_base, &scratch_mult) != 0:
+        dev[0].isr_base = 0
+    if _virtio_cap_find(bdf, VIRTIO_PCI_CAP_DEVICE_CFG,
+                        &dev[0].device_base, &scratch_mult) != 0:
+        dev[0].device_base = 0
+
+    printk2("virtio-modern: common=%p notify=%p\n",
+            dev[0].common_base, dev[0].notify_base)
+    printk2("virtio-modern: isr=%p device=%p\n",
+            dev[0].isr_base, dev[0].device_base)
+    printk1("virtio-modern: notify_off_multiplier=%d\n",
+            cast[uint64](dev[0].notify_mult))
+
+    # Reset: write 0 to status, then read back until it reads 0.
+    _status_write(dev, 0)
+    spin: uint32 = 0
+    while _status_read(dev) != 0 and spin < 1000000:
+        spin = spin + 1
+
+    # ACK + DRIVER.
+    _status_write(dev, VM_STATUS_ACK)
+    _status_write(dev, VM_STATUS_ACK | VM_STATUS_DRIVER)
+
+    # Feature negotiation: read the device's feature words, but only
+    # accept VIRTIO_F_VERSION_1 (bit 32). We don't need any device
+    # feature for 2D virtio-gpu (VIRGL/3D stays off).
+    #   word 0 = bits 0..31, word 1 = bits 32..63.
+    _m_w32(dev[0].common_base + VIRTIO_PCI_COMMON_DFSELECT, 0)
+    df0: uint32 = _m_r32(dev[0].common_base + VIRTIO_PCI_COMMON_DF)
+    _m_w32(dev[0].common_base + VIRTIO_PCI_COMMON_DFSELECT, 1)
+    df1: uint32 = _m_r32(dev[0].common_base + VIRTIO_PCI_COMMON_DF)
+    printk2("virtio-modern: device_features lo=%x hi=%x\n",
+            cast[uint64](df0), cast[uint64](df1))
+    if (df1 & VIRTIO_F_VERSION_1_BIT) == 0:
+        printk0("virtio-modern: device does NOT offer VERSION_1\n")
+        return -1
+
+    # Accept only VERSION_1: driver_feature word0 = 0, word1 = bit 0.
+    _m_w32(dev[0].common_base + VIRTIO_PCI_COMMON_GFSELECT, 0)
+    _m_w32(dev[0].common_base + VIRTIO_PCI_COMMON_GF, 0)
+    _m_w32(dev[0].common_base + VIRTIO_PCI_COMMON_GFSELECT, 1)
+    _m_w32(dev[0].common_base + VIRTIO_PCI_COMMON_GF,
+           VIRTIO_F_VERSION_1_BIT)
+
+    # FEATURES_OK, then confirm it stuck.
+    _status_write(dev, VM_STATUS_ACK | VM_STATUS_DRIVER
+                  | VM_STATUS_FEATURES_OK)
+    confirm: uint32 = _status_read(dev)
+    if (confirm & VM_STATUS_FEATURES_OK) == 0:
+        printk1("virtio-modern: FEATURES_OK rejected (status=%x)\n",
+                cast[uint64](confirm))
+        return -1
+
+    dev[0].num_queues = _m_r16(dev[0].common_base + VIRTIO_PCI_COMMON_NUMQ)
+    printk1("virtio-modern: num_queues=%d\n",
+            cast[uint64](dev[0].num_queues))
+    return 0
+
+
+def virtio_modern_driver_ok(dev: Ptr[VirtioModernDev]):
+    # Final step of the handshake — flip DRIVER_OK so the device starts
+    # processing virtqueue notifications.
+    _status_write(dev, VM_STATUS_ACK | VM_STATUS_DRIVER
+                  | VM_STATUS_FEATURES_OK | VM_STATUS_DRIVER_OK)
+
+
+# --- Queue setup (modern) ------------------------------------------
+
+def _align_up(value: uint64, alignment: uint64) -> uint64:
+    return (value + alignment - 1) & ~(alignment - 1)
+
+
+def virtio_modern_setup_queue(dev: Ptr[VirtioModernDev], qidx: uint32,
+                              vq: Ptr[VirtQueue]) -> int32:
+    # Allocate the split-ring storage (desc / avail / used) for queue
+    # `qidx`, program the three 64-bit physical addresses into the
+    # common-config struct, and enable the queue. The in-memory layout
+    # is identical to legacy, so the VirtQueue handle we fill works with
+    # virtio_ring.ad's virtq_add_chain* / _desc_set helpers unchanged —
+    # only the queue_notify path differs (handled by virtio_modern_notify
+    # below; do NOT call the legacy virtq_kick_and_wait, use
+    # virtio_modern_kick_and_wait instead).
+    common: uint64 = dev[0].common_base
+    _m_w16(common + VIRTIO_PCI_COMMON_Q_SELECT, qidx)
+    qsize: uint32 = _m_r16(common + VIRTIO_PCI_COMMON_Q_SIZE)
+    if qsize == 0:
+        printk1("virtio-modern: queue %d size 0 (absent)\n",
+                cast[uint64](qidx))
+        return -1
+    # Cap to 256 so the rings fit in our 16 KiB (order-2) allocation,
+    # same ceiling as the legacy virtq_setup. virtio-gpu's controlq
+    # under QEMU is 256 entries.
+    if qsize > 256:
+        qsize = 256
+        _m_w16(common + VIRTIO_PCI_COMMON_Q_SIZE, qsize)
+
+    page: uint64 = alloc_pages(2)        # 16 KiB contiguous, low/phys
+    if page == 0:
+        return -1
+    memset(cast[Ptr[uint8]](page), 0, 16384)
+
+    desc_off:   uint64 = 0
+    desc_size:  uint64 = cast[uint64](qsize) * VM_DESC_SIZE
+    avail_off:  uint64 = _align_up(desc_off + desc_size, 2)
+    avail_size: uint64 = 6 + cast[uint64](qsize) * 2
+    # Modern spec only requires desc/avail/used each be naturally
+    # aligned (16/2/4). Keep the used ring on its own page-ish boundary
+    # for headroom — page-align it like the legacy path so the three
+    # regions never overlap regardless of qsize.
+    used_off:   uint64 = _align_up(avail_off + avail_size, 4096)
+
+    vq[0].qsize         = cast[uint16](qsize & 0xFFFF)
+    vq[0].free_head     = 0
+    vq[0].used_idx_seen = 0
+    vq[0].desc_addr     = page + desc_off
+    vq[0].avail_addr    = page + avail_off
+    vq[0].used_addr     = page + used_off
+    vq[0].page_addr     = page
+
+    # Seed the descriptor free-list .next chain (same as legacy setup).
+    i: uint16 = 0
+    while i < vq[0].qsize:
+        d: uint64 = vq[0].desc_addr + cast[uint64](i) * VM_DESC_SIZE
+        cast[Ptr[uint16]](d + 12)[0] = VM_DESC_F_NEXT
+        cast[Ptr[uint16]](d + 14)[0] = i + 1
+        i = i + 1
+
+    # Program the ring physical addresses. alloc_pages returns a low
+    # physical address that's also identity-mapped, so virt_to_phys is a
+    # no-op for these, but we run them through it for uniformity with the
+    # rest of the DMA path.
+    _m_w64(common + VIRTIO_PCI_COMMON_Q_DESC,
+           virt_to_phys(vq[0].desc_addr))
+    _m_w64(common + VIRTIO_PCI_COMMON_Q_DRIVER,
+           virt_to_phys(vq[0].avail_addr))
+    _m_w64(common + VIRTIO_PCI_COMMON_Q_DEVICE,
+           virt_to_phys(vq[0].used_addr))
+    _m_w16(common + VIRTIO_PCI_COMMON_Q_SIZE, qsize)
+    _m_w16(common + VIRTIO_PCI_COMMON_Q_ENABLE, 1)
+
+    printk2("virtio-modern: queue %d ready (size=%d)\n",
+            cast[uint64](qidx), cast[uint64](qsize))
+    return 0
+
+
+def virtio_modern_notify(dev: Ptr[VirtioModernDev], qidx: uint32):
+    # Notify by writing the queue index to:
+    #   notify_base + queue_notify_off * notify_off_multiplier
+    # queue_notify_off is read from the common-config after selecting the
+    # queue. With multiplier 0 every queue shares notify_base+0; QEMU's
+    # virtio-gpu uses a non-zero multiplier giving each queue its own
+    # cell.
+    common: uint64 = dev[0].common_base
+    _m_w16(common + VIRTIO_PCI_COMMON_Q_SELECT, qidx)
+    noff: uint32 = _m_r16(common + VIRTIO_PCI_COMMON_Q_NOFF)
+    addr: uint64 = dev[0].notify_base \
+                 + cast[uint64](noff) * cast[uint64](dev[0].notify_mult)
+    _m_w16(addr, qidx)
+
+
+def virtio_modern_kick_and_wait(dev: Ptr[VirtioModernDev], qidx: uint32,
+                                vq: Ptr[VirtQueue]) -> int32:
+    # Notify the device then spin until the used-ring index advances.
+    # Mirrors the legacy virtq_kick_and_wait used-ring poll exactly; only
+    # the notify mechanism differs. Returns 0 on completion, -1 on a
+    # poll timeout.
+    virtio_modern_notify(dev, qidx)
+    used: uint64 = vq[0].used_addr
+    deadline: uint32 = 0
+    while True:
+        cur: uint16 = cast[Ptr[uint16]](used + 2)[0]
+        if cur != vq[0].used_idx_seen:
+            vq[0].used_idx_seen = cur
+            return 0
+        deadline = deadline + 1
+        if deadline > 200000000:
+            printk0("virtio-modern: timeout waiting for used-ring bump\n")
+            return -1

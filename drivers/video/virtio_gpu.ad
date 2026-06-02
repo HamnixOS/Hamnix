@@ -1,0 +1,498 @@
+# drivers/video/virtio_gpu.ad
+#
+# Native virtio-gpu 2D driver (GPU track #182, Phase 1). Drives QEMU's
+# `-device virtio-gpu-pci` (PCI 1AF4:1050, a MODERN-ONLY virtio-1.0
+# device) over the modern virtio transport (drivers/virtio/virtio_modern.ad)
+# to present a software-rendered RGBA image onto the device's scanout.
+# ZERO Linux / namespace dependency — this is the first real GPU device
+# data path beyond the GOP linear framebuffer.
+#
+# The 2D control flow (all over controlq = queue 0):
+#   1. GET_DISPLAY_INFO       → scanout 0 width/height
+#   2. RESOURCE_CREATE_2D     → a host 2D resource (id 1, BGRA8)
+#   3. RESOURCE_ATTACH_BACKING→ point it at our guest-physical RGBA buffer
+#   4. SET_SCANOUT            → bind resource 1 to scanout 0
+#   5. (fill the backing buffer)
+#   6. TRANSFER_TO_HOST_2D    → guest backing → host resource
+#   7. RESOURCE_FLUSH         → flush the resource rect to the scanout
+#
+# Each command is a device-readable request descriptor chained to a
+# device-writable response descriptor. We poll the used ring for
+# completion (no MSI-X / IRQs), mirroring virtio_blk.
+#
+# Adder has no sizeof: every struct field offset is computed by hand,
+# exactly like the rest of the kernel. virtio_gpu_ctrl_hdr is 24 bytes:
+#   +0  u32 type
+#   +4  u32 flags
+#   +8  u64 fence_id
+#   +16 u32 ctx_id
+#   +20 u32 padding
+
+from kernel.printk.printk import printk0, printk1, printk2
+from mm.page_alloc import alloc_pages
+from arch.x86.mm.pgtable import virt_to_phys
+from drivers.pci.pci import pci_find, PCI_BDF_NONE
+from drivers.virtio.virtio_ring import (
+    VirtQueue, VirtBuf, virtq_add_chain3,
+)
+from drivers.virtio.virtio_modern import (
+    VirtioModernDev, virtio_modern_init, virtio_modern_setup_queue,
+    virtio_modern_driver_ok, virtio_modern_kick_and_wait,
+)
+
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
+
+# --- PCI identity --------------------------------------------------
+# Modern virtio-gpu: vendor 0x1AF4, device 0x1050. (0x1040 + virtio
+# device-type 16 = GPU.)
+VGPU_VENDOR:        uint32 = 0x1AF4
+VIRTIO_GPU_MODERN:    uint32 = 0x1050
+
+
+# --- virtio-gpu command / response types (spec §5.7.6.7) -----------
+VIRTIO_GPU_CMD_GET_DISPLAY_INFO:      uint32 = 0x0100
+VIRTIO_GPU_CMD_RESOURCE_CREATE_2D:    uint32 = 0x0101
+VIRTIO_GPU_CMD_RESOURCE_UNREF:        uint32 = 0x0102
+VIRTIO_GPU_CMD_SET_SCANOUT:           uint32 = 0x0103
+VIRTIO_GPU_CMD_RESOURCE_FLUSH:        uint32 = 0x0104
+VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D:   uint32 = 0x0105
+VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING: uint32 = 0x0106
+
+VIRTIO_GPU_RESP_OK_NODATA:            uint32 = 0x1100
+VIRTIO_GPU_RESP_OK_DISPLAY_INFO:      uint32 = 0x1101
+
+# 2D pixel format. B8G8R8A8_UNORM = 1 in the virtio-gpu formats enum.
+# QEMU treats this as little-endian BGRA bytes; we write our backing
+# buffer to match.
+VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM:     uint32 = 1
+
+# The resource id we use throughout (any non-zero id works).
+GPU_RESOURCE_ID:   uint32 = 1
+GPU_SCANOUT_ID:    uint32 = 0
+
+# Default scanout size if GET_DISPLAY_INFO returns an unset rect.
+GPU_DEFAULT_W:     uint32 = 1024
+GPU_DEFAULT_H:     uint32 = 768
+
+# virtio_gpu_ctrl_hdr field offsets.
+HDR_TYPE:     uint64 = 0
+HDR_FLAGS:    uint64 = 4
+HDR_FENCE:    uint64 = 8
+HDR_CTXID:    uint64 = 16
+HDR_PAD:      uint64 = 20
+HDR_SIZE:     uint64 = 24
+
+
+# --- Driver state --------------------------------------------------
+#
+# One control-request scratch buffer pair (request + response) in a page
+# we allocate at init, so command DMA targets are low/physical without a
+# per-call malloc. The backing framebuffer is a separate larger
+# allocation. controlq is queue 0.
+class VirtioGpu:
+    present:       int32              # 1 once probed + scanned out
+    dev:           VirtioModernDev
+    vq:            VirtQueue
+    cmd_page:      uint64             # page: [0..512) request, [512..) response
+    fb_phys:       uint64             # backing RGBA buffer (guest-physical)
+    fb_pages_ord:  int32
+    width:         uint32
+    height:        uint32
+
+
+gpu_state: VirtioGpu
+gpu_bufs:  Array[3, VirtBuf]
+
+
+# --- Command request/response helpers ------------------------------
+#
+# Layout in cmd_page:
+#   request  at cmd_page + 0    (device-readable)
+#   response at cmd_page + 512  (device-writable)
+# Both well under a page; 512 is comfortable headroom for the largest
+# request body (RESOURCE_ATTACH_BACKING hdr + nr_entries + one entry =
+# 24 + 8 + 16 = 48 bytes).
+GPU_REQ_OFF:  uint64 = 0
+GPU_RESP_OFF: uint64 = 512
+
+
+def _req_addr() -> uint64:
+    return gpu_state.cmd_page + GPU_REQ_OFF
+
+
+def _resp_addr() -> uint64:
+    return gpu_state.cmd_page + GPU_RESP_OFF
+
+
+def _hdr_init(addr: uint64, cmd_type: uint32):
+    cast[Ptr[uint32]](addr + HDR_TYPE)[0]  = cmd_type
+    cast[Ptr[uint32]](addr + HDR_FLAGS)[0] = 0
+    cast[Ptr[uint32]](addr + HDR_FENCE + 0)[0] = 0
+    cast[Ptr[uint32]](addr + HDR_FENCE + 4)[0] = 0
+    cast[Ptr[uint32]](addr + HDR_CTXID)[0] = 0
+    cast[Ptr[uint32]](addr + HDR_PAD)[0]   = 0
+
+
+def _submit(req_len: uint32, resp_len: uint32) -> uint32:
+    # Submit the request currently laid out at _req_addr() as a
+    # device-readable descriptor chained to a device-writable response
+    # descriptor (zeroed first), kick controlq, poll the used ring, and
+    # return the response header's `type`. virtq_add_chain3 wants a
+    # 3-buffer chain; we use a 2-buffer logical command by pointing the
+    # middle descriptor at a 0-length tail of the request (harmless) —
+    # but simpler: chain req(RO) -> resp(WO), so build the chain
+    # manually as req(RO,NEXT) + resp(WO). We reuse virtq_add_chain3 by
+    # making buf[1] the response and buf[2] a 0-length writable pad.
+    #
+    # Actually virtq_add_chain3 always marks buf[2] writable with no
+    # NEXT and buf[0]/buf[1] chained. So: buf[0]=request (RO),
+    # buf[1]=response (WO), buf[2]=a 1-byte writable scratch in the resp
+    # page tail (device ignores extra writable space). That yields the
+    # required RO-request → WO-response shape.
+    memset(cast[Ptr[uint8]](_resp_addr()), 0, 256)
+
+    gpu_bufs[0].addr   = _req_addr()
+    gpu_bufs[0].length = req_len
+    gpu_bufs[0].write  = 0
+    gpu_bufs[1].addr   = _resp_addr()
+    gpu_bufs[1].length = resp_len
+    gpu_bufs[1].write  = 1
+    # 3rd descriptor: tiny writable pad just past the response area.
+    gpu_bufs[2].addr   = _resp_addr() + 256
+    gpu_bufs[2].length = 1
+    gpu_bufs[2].write  = 1
+
+    head: uint16 = virtq_add_chain3(&gpu_state.vq, &gpu_bufs[0])
+    if head == 0xFFFF:
+        printk0("virtio-gpu: descriptor exhausted\n")
+        return 0
+    rc: int32 = virtio_modern_kick_and_wait(&gpu_state.dev, 0,
+                                            &gpu_state.vq)
+    # Single in-flight request: reset the free list head each time.
+    gpu_state.vq.free_head = 0
+    if rc != 0:
+        return 0
+    return cast[Ptr[uint32]](_resp_addr() + HDR_TYPE)[0]
+
+
+def _resp_is_ok(resp_type: uint32) -> int32:
+    # Any 0x11xx response is a success code; the no-data OK and the
+    # display-info OK are the two we expect.
+    if (resp_type & 0xFF00) == 0x1100:
+        return 1
+    return 0
+
+
+# --- Individual 2D commands ----------------------------------------
+
+def _gpu_get_display_info() -> int32:
+    # Request is just the bare 24-byte header. The response is a
+    # virtio_gpu_resp_display_info: 24-byte hdr + 16 scanouts, each
+    # struct virtio_gpu_display_one { rect{x,y,w,h u32}, enabled u32,
+    # flags u32 } = 24 bytes. Scanout 0's rect starts at resp+24.
+    _hdr_init(_req_addr(), VIRTIO_GPU_CMD_GET_DISPLAY_INFO)
+    resp_type: uint32 = _submit(cast[uint32](HDR_SIZE), 24 + 16 * 24)
+    if _resp_is_ok(resp_type) == 0:
+        printk1("virtio-gpu: GET_DISPLAY_INFO bad resp=%x\n",
+                cast[uint64](resp_type))
+        return -1
+    # Scanout 0: rect at resp+24 → x(+0) y(+4) w(+8) h(+12) enabled(+16)
+    so0: uint64 = _resp_addr() + 24
+    w: uint32 = cast[Ptr[uint32]](so0 + 8)[0]
+    h: uint32 = cast[Ptr[uint32]](so0 + 12)[0]
+    en: uint32 = cast[Ptr[uint32]](so0 + 16)[0]
+    printk2("virtio-gpu: DISPLAY_INFO scanout0 %dx%d\n",
+            cast[uint64](w), cast[uint64](h))
+    printk1("virtio-gpu: scanout0 enabled=%d\n", cast[uint64](en))
+    if w == 0 or h == 0:
+        w = GPU_DEFAULT_W
+        h = GPU_DEFAULT_H
+        printk2("virtio-gpu: scanout0 unset, defaulting to %dx%d\n",
+                cast[uint64](w), cast[uint64](h))
+    gpu_state.width = w
+    gpu_state.height = h
+    return 0
+
+
+def _gpu_resource_create_2d() -> int32:
+    # virtio_gpu_resource_create_2d: hdr(24) + resource_id(u32 @24) +
+    # format(u32 @28) + width(u32 @32) + height(u32 @36) = 40 bytes.
+    a: uint64 = _req_addr()
+    _hdr_init(a, VIRTIO_GPU_CMD_RESOURCE_CREATE_2D)
+    cast[Ptr[uint32]](a + 24)[0] = GPU_RESOURCE_ID
+    cast[Ptr[uint32]](a + 28)[0] = VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM
+    cast[Ptr[uint32]](a + 32)[0] = gpu_state.width
+    cast[Ptr[uint32]](a + 36)[0] = gpu_state.height
+    resp_type: uint32 = _submit(40, cast[uint32](HDR_SIZE))
+    if _resp_is_ok(resp_type) == 0:
+        printk1("virtio-gpu: CREATE_2D bad resp=%x\n",
+                cast[uint64](resp_type))
+        return -1
+    return 0
+
+
+def _gpu_attach_backing() -> int32:
+    # virtio_gpu_resource_attach_backing: hdr(24) + resource_id(u32 @24)
+    # + nr_entries(u32 @28), then nr_entries × mem_entry{addr u64,
+    # length u32, padding u32}. One entry: addr @32, length @40, pad @44
+    # = 48 bytes total.
+    a: uint64 = _req_addr()
+    _hdr_init(a, VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING)
+    cast[Ptr[uint32]](a + 24)[0] = GPU_RESOURCE_ID
+    cast[Ptr[uint32]](a + 28)[0] = 1                  # nr_entries
+    # mem entry: 64-bit guest-physical address of the backing buffer.
+    cast[Ptr[uint32]](a + 32)[0] = cast[uint32](gpu_state.fb_phys & 0xFFFFFFFF)
+    cast[Ptr[uint32]](a + 36)[0] = cast[uint32](gpu_state.fb_phys >> 32)
+    cast[Ptr[uint32]](a + 40)[0] = gpu_state.width * gpu_state.height * 4
+    cast[Ptr[uint32]](a + 44)[0] = 0                  # padding
+    resp_type: uint32 = _submit(48, cast[uint32](HDR_SIZE))
+    if _resp_is_ok(resp_type) == 0:
+        printk1("virtio-gpu: ATTACH_BACKING bad resp=%x\n",
+                cast[uint64](resp_type))
+        return -1
+    return 0
+
+
+def _gpu_set_scanout() -> int32:
+    # virtio_gpu_set_scanout: hdr(24) + rect{x,y,w,h u32 @24..36} +
+    # scanout_id(u32 @40) + resource_id(u32 @44) = 48 bytes.
+    a: uint64 = _req_addr()
+    _hdr_init(a, VIRTIO_GPU_CMD_SET_SCANOUT)
+    cast[Ptr[uint32]](a + 24)[0] = 0                  # rect.x
+    cast[Ptr[uint32]](a + 28)[0] = 0                  # rect.y
+    cast[Ptr[uint32]](a + 32)[0] = gpu_state.width    # rect.w
+    cast[Ptr[uint32]](a + 36)[0] = gpu_state.height   # rect.h
+    cast[Ptr[uint32]](a + 40)[0] = GPU_SCANOUT_ID
+    cast[Ptr[uint32]](a + 44)[0] = GPU_RESOURCE_ID
+    resp_type: uint32 = _submit(48, cast[uint32](HDR_SIZE))
+    if _resp_is_ok(resp_type) == 0:
+        printk1("virtio-gpu: SET_SCANOUT bad resp=%x\n",
+                cast[uint64](resp_type))
+        return -1
+    return 0
+
+
+def _gpu_transfer_to_host() -> int32:
+    # virtio_gpu_transfer_to_host_2d: hdr(24) + rect{x,y,w,h @24..36} +
+    # offset(u64 @40) + resource_id(u32 @48) + padding(u32 @52) = 56.
+    a: uint64 = _req_addr()
+    _hdr_init(a, VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D)
+    cast[Ptr[uint32]](a + 24)[0] = 0                  # rect.x
+    cast[Ptr[uint32]](a + 28)[0] = 0                  # rect.y
+    cast[Ptr[uint32]](a + 32)[0] = gpu_state.width    # rect.w
+    cast[Ptr[uint32]](a + 36)[0] = gpu_state.height   # rect.h
+    cast[Ptr[uint32]](a + 40)[0] = 0                  # offset lo
+    cast[Ptr[uint32]](a + 44)[0] = 0                  # offset hi
+    cast[Ptr[uint32]](a + 48)[0] = GPU_RESOURCE_ID
+    cast[Ptr[uint32]](a + 52)[0] = 0                  # padding
+    resp_type: uint32 = _submit(56, cast[uint32](HDR_SIZE))
+    if _resp_is_ok(resp_type) == 0:
+        printk1("virtio-gpu: TRANSFER_TO_HOST bad resp=%x\n",
+                cast[uint64](resp_type))
+        return -1
+    return 0
+
+
+def _gpu_resource_flush() -> int32:
+    # virtio_gpu_resource_flush: hdr(24) + rect{x,y,w,h @24..36} +
+    # resource_id(u32 @40) + padding(u32 @44) = 48 bytes.
+    a: uint64 = _req_addr()
+    _hdr_init(a, VIRTIO_GPU_CMD_RESOURCE_FLUSH)
+    cast[Ptr[uint32]](a + 24)[0] = 0                  # rect.x
+    cast[Ptr[uint32]](a + 28)[0] = 0                  # rect.y
+    cast[Ptr[uint32]](a + 32)[0] = gpu_state.width    # rect.w
+    cast[Ptr[uint32]](a + 36)[0] = gpu_state.height   # rect.h
+    cast[Ptr[uint32]](a + 40)[0] = GPU_RESOURCE_ID
+    cast[Ptr[uint32]](a + 44)[0] = 0                  # padding
+    resp_type: uint32 = _submit(48, cast[uint32](HDR_SIZE))
+    if _resp_is_ok(resp_type) == 0:
+        printk1("virtio-gpu: RESOURCE_FLUSH bad resp=%x\n",
+                cast[uint64](resp_type))
+        return -1
+    return 0
+
+
+# --- Backing-buffer allocation -------------------------------------
+
+def _order_for_bytes(nbytes: uint64) -> int32:
+    # Smallest buddy order whose run (PAGE_SIZE << order) covers nbytes.
+    pages: uint64 = (nbytes + 4095) / 4096
+    order: int32 = 0
+    run: uint64 = 1
+    while run < pages:
+        run = run * 2
+        order = order + 1
+    return order
+
+
+def _gpu_alloc_backing() -> int32:
+    nbytes: uint64 = cast[uint64](gpu_state.width) \
+                   * cast[uint64](gpu_state.height) * 4
+    order: int32 = _order_for_bytes(nbytes)
+    page: uint64 = alloc_pages(order)
+    if page == 0:
+        printk1("virtio-gpu: backing alloc failed (order=%d)\n",
+                cast[uint64](order))
+        return -1
+    gpu_state.fb_phys = virt_to_phys(page)
+    gpu_state.fb_pages_ord = order
+    # Clear to opaque black.
+    memset(cast[Ptr[uint8]](page), 0, _page_size_times(order))
+    printk2("virtio-gpu: backing %d bytes at phys=%p\n",
+            nbytes, gpu_state.fb_phys)
+    return 0
+
+
+def _page_size_times(order: int32) -> uint64:
+    return cast[uint64](4096) << cast[uint64](order)
+
+
+# --- Pattern fill --------------------------------------------------
+
+def _gpu_fill_quadrants():
+    # Paint four solid quadrants into the BGRA backing buffer so the
+    # screendump test can assert unforgeable pixels at known coords:
+    #   top-left  = RED      (B=0  G=0   R=255 A=255)
+    #   top-right = GREEN    (B=0  G=255 R=0   A=255)
+    #   bot-left  = BLUE     (B=255 G=0  R=0   A=255)
+    #   bot-right = WHITE    (B=255 G=255 R=255 A=255)
+    # BGRA little-endian: byte0=B byte1=G byte2=R byte3=A.
+    base: uint64 = gpu_state.fb_phys           # phys == identity VA
+    w: uint32 = gpu_state.width
+    h: uint32 = gpu_state.height
+    halfw: uint32 = w / 2
+    halfh: uint32 = h / 2
+    y: uint32 = 0
+    while y < h:
+        x: uint32 = 0
+        while x < w:
+            px: uint64 = base + (cast[uint64](y) * cast[uint64](w)
+                                 + cast[uint64](x)) * 4
+            b: uint8 = 0
+            g: uint8 = 0
+            r: uint8 = 0
+            if y < halfh:
+                if x < halfw:
+                    r = 255                    # RED
+                else:
+                    g = 255                    # GREEN
+            else:
+                if x < halfw:
+                    b = 255                    # BLUE
+                else:
+                    b = 255                    # WHITE
+                    g = 255
+                    r = 255
+            cast[Ptr[uint8]](px + 0)[0] = b
+            cast[Ptr[uint8]](px + 1)[0] = g
+            cast[Ptr[uint8]](px + 2)[0] = r
+            cast[Ptr[uint8]](px + 3)[0] = 255
+            x = x + 1
+        y = y + 1
+
+
+# --- Public present API --------------------------------------------
+
+def virtio_gpu_present_rgba(buf_ptr: uint64, width: uint32,
+                            height: uint32) -> int32:
+    # Copy an externally-supplied RGBA/BGRA image into the backing buffer
+    # (clamped to the scanned-out resource size), then run
+    # TRANSFER_TO_HOST_2D + RESOURCE_FLUSH so the pixels appear. The
+    # resource + scanout must already be established (virtio_gpu_init).
+    # buf_ptr points at width*height*4 bytes of BGRA. Returns 0 on
+    # success.
+    if gpu_state.present == 0:
+        return -1
+    copy_w: uint32 = width
+    if copy_w > gpu_state.width:
+        copy_w = gpu_state.width
+    copy_h: uint32 = height
+    if copy_h > gpu_state.height:
+        copy_h = gpu_state.height
+    dst: uint64 = gpu_state.fb_phys
+    row: uint32 = 0
+    while row < copy_h:
+        i: uint32 = 0
+        while i < copy_w:
+            so: uint64 = buf_ptr + (cast[uint64](row) * cast[uint64](width)
+                                    + cast[uint64](i)) * 4
+            doff: uint64 = dst + (cast[uint64](row)
+                                  * cast[uint64](gpu_state.width)
+                                  + cast[uint64](i)) * 4
+            cast[Ptr[uint32]](doff)[0] = cast[Ptr[uint32]](so)[0]
+            i = i + 1
+        row = row + 1
+    if _gpu_transfer_to_host() != 0:
+        return -1
+    if _gpu_resource_flush() != 0:
+        return -1
+    return 0
+
+
+def virtio_gpu_present_test_pattern() -> int32:
+    # Paint the four-quadrant pattern directly into the backing buffer
+    # and flush it. Used by the boot-flag-gated self-test.
+    if gpu_state.present == 0:
+        return -1
+    _gpu_fill_quadrants()
+    if _gpu_transfer_to_host() != 0:
+        return -1
+    if _gpu_resource_flush() != 0:
+        return -1
+    printk0("virtio-gpu: FLUSH ok (test pattern presented)\n")
+    return 0
+
+
+# --- Probe + init --------------------------------------------------
+
+def virtio_gpu_init() -> int32:
+    # Probe the modern virtio-gpu PCI device, bring up the modern
+    # transport + controlq, query the display, and create+attach+scanout
+    # a 2D resource so it's ready for present. Does NOT itself draw
+    # anything to screen (the screen-takeover present is gated behind a
+    # boot flag in init/main.ad). Returns 0 if a device was set up, -1
+    # otherwise (no device / init failure — caller treats as "no GPU").
+    gpu_state.present = 0
+    bdf: uint32 = pci_find(VGPU_VENDOR, VIRTIO_GPU_MODERN)
+    if bdf == PCI_BDF_NONE:
+        printk0("virtio-gpu: no PCI device (1AF4:1050)\n")
+        return -1
+    printk1("virtio-gpu: found device bdf=%x\n", cast[uint64](bdf))
+
+    if virtio_modern_init(bdf, &gpu_state.dev) != 0:
+        printk0("virtio-gpu: modern transport init failed\n")
+        return -1
+    printk0("virtio-gpu: modern transport bound\n")
+
+    # controlq = queue 0.
+    if virtio_modern_setup_queue(&gpu_state.dev, 0, &gpu_state.vq) != 0:
+        printk0("virtio-gpu: controlq setup failed\n")
+        return -1
+
+    # DRIVER_OK before issuing commands.
+    virtio_modern_driver_ok(&gpu_state.dev)
+
+    # Command scratch page (request + response).
+    gpu_state.cmd_page = alloc_pages(0)
+    if gpu_state.cmd_page == 0:
+        printk0("virtio-gpu: cmd page alloc failed\n")
+        return -1
+    memset(cast[Ptr[uint8]](gpu_state.cmd_page), 0, 4096)
+
+    if _gpu_get_display_info() != 0:
+        return -1
+
+    if _gpu_alloc_backing() != 0:
+        return -1
+    if _gpu_resource_create_2d() != 0:
+        return -1
+    if _gpu_attach_backing() != 0:
+        return -1
+    if _gpu_set_scanout() != 0:
+        return -1
+
+    gpu_state.present = 1
+    printk2("virtio-gpu: ready, scanout %dx%d\n",
+            cast[uint64](gpu_state.width), cast[uint64](gpu_state.height))
+    return 0

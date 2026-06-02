@@ -414,6 +414,17 @@ if os.environ.get("ENABLE_SCHED_FAIR") == "1":
 if os.environ.get("ENABLE_VK_TEST") == "1":
     FILES.append(("/etc/vk-test", b"1\n"))
 
+# GPU track #182 Phase 1: native virtio-gpu 2D present self-test.
+# scripts/test_virtio_gpu_present.sh sets ENABLE_VIRTIO_GPU_TEST=1 to
+# plant /etc/virtio-gpu-test. init/main.ad at boot:37.vgpu detects the
+# marker and calls virtio_gpu_present_test_pattern(): it paints the
+# four-quadrant RED/GREEN/BLUE/WHITE pattern into the virtio-gpu backing
+# buffer and runs TRANSFER_TO_HOST_2D + RESOURCE_FLUSH so the pixels land
+# on the virtio-gpu scanout. Default boots omit the marker so the screen
+# takeover never fires unintentionally.
+if os.environ.get("ENABLE_VIRTIO_GPU_TEST") == "1":
+    FILES.append(("/etc/virtio-gpu-test", b"1\n"))
+
 # #168: REAL ACPI S5 poweroff + reboot self-test.
 # scripts/test_acpi_poweroff.sh sets ENABLE_ACPI_TEST=1 to plant
 # /etc/acpi-test. init/main.ad at boot:37.acpi detects the marker, logs
