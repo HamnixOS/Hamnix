@@ -17,10 +17,21 @@
 # about for the foreseeable future). When a real driver wants a
 # different physical sector size it shadows this in its own ops.
 
-from kernel.printk.printk import printk0, printk1, printk2
+from kernel.printk.printk import (
+    printk0, printk1, printk2, printk_set_level,
+)
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
 from drivers.block.partition import (
     partition_scan_named, partition_for, Partition,
 )
+# §13: interrupt-safe monotonic microsecond clock for I/O service-time
+# accounting. tsc_monotonic_us() keeps advancing even while EFLAGS.IF is
+# masked (a SYSCALL entry clears IF, so jiffies freezes for the whole
+# duration of a read(2)/write(2)) — see arch/x86/kernel/time.ad. Adder's
+# import collector deduplicates cyclic edges (compiler/adder.py
+# collect_all_imports visited-set), so importing time.ad here is safe even
+# though time.ad transitively reaches a lot of the kernel.
+from arch.x86.kernel.time import tsc_monotonic_us
 
 SECTOR_SIZE: uint64 = 512
 
@@ -94,20 +105,36 @@ blockdev_table: Array[32, BlockDevice]
 #
 # Counters tracked (the subset blk_read_sectors / blk_write_sectors
 # can honestly bump on a synchronous block layer):
-#   rd_ios      completed read requests   (one per blk_read_sectors OK)
-#   rd_sectors  512-byte sectors read
-#   wr_ios      completed write requests  (one per blk_write_sectors OK)
-#   wr_sectors  512-byte sectors written
-# The merge / ticks / in_flight / time_in_queue columns Linux also
-# reports stay 0 — a synchronous block layer never merges or queues,
-# and has no request whose service time we could clock. /dev/diskstats
-# renders the full 14-field row regardless so userland sscanf is happy.
+#   rd_ios       completed read requests   (one per blk_read_sectors OK)
+#   rd_sectors   512-byte sectors read
+#   wr_ios       completed write requests  (one per blk_write_sectors OK)
+#   wr_sectors   512-byte sectors written
+#   in_flight    requests currently dispatched into a driver but not yet
+#                completed. Our block layer is synchronous so a request is
+#                "in flight" only for the span of the driver's
+#                read/write_sectors call; we bump it on dispatch and drop
+#                it on completion so a concurrent reader (another CPU, an
+#                interrupt-context introspection read) observing the
+#                counter mid-call sees the true depth. It settles back to 0
+#                once the queue drains, exactly like Linux's field 12.
+#   io_ticks_ms  accumulated milliseconds the device spent servicing I/O
+#                (Linux field 13, "time spent doing I/Os"). We clock each
+#                request with tsc_monotonic_us() around the driver call and
+#                fold the elapsed microseconds into a microsecond
+#                accumulator; the renderer divides by 1000 to emit ms.
+# The merge columns (rd_merges, wr_merges) and the rd_ticks / wr_ticks /
+# time_in_queue weighted-time columns Linux also reports stay 0 — a
+# synchronous block layer never merges or queues requests, so there is no
+# per-class wait time to weight. /dev/diskstats renders the full 14-field
+# row regardless so userland sscanf is happy.
 
 class BlkStats:
-    rd_ios:      uint64
-    rd_sectors:  uint64
-    wr_ios:      uint64
-    wr_sectors:  uint64
+    rd_ios:       uint64
+    rd_sectors:   uint64
+    wr_ios:       uint64
+    wr_sectors:   uint64
+    in_flight:    uint64
+    io_ticks_us:  uint64        # microsecond accumulator; /1000 -> ms
 
 blk_stats_table: Array[32, BlkStats]
 
@@ -134,6 +161,23 @@ def blk_stats_wr_sectors(slot: int32) -> uint64:
     if slot < 0 or cast[uint64](slot) >= BLKDEV_MAX:
         return 0
     return blk_stats_table[cast[uint64](slot)].wr_sectors
+
+
+def blk_stats_in_flight(slot: int32) -> uint64:
+    # Requests currently dispatched into the driver but not yet completed.
+    # Settles to 0 when the device is idle.
+    if slot < 0 or cast[uint64](slot) >= BLKDEV_MAX:
+        return 0
+    return blk_stats_table[cast[uint64](slot)].in_flight
+
+
+def blk_stats_io_ticks_ms(slot: int32) -> uint64:
+    # Accumulated milliseconds the device spent servicing I/O. Stored
+    # internally in microseconds (io_ticks_us) for resolution; reported in
+    # ms to match Linux /proc/diskstats field 13.
+    if slot < 0 or cast[uint64](slot) >= BLKDEV_MAX:
+        return 0
+    return blk_stats_table[cast[uint64](slot)].io_ticks_us / 1000
 
 
 def _blk_name_eq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
@@ -244,7 +288,17 @@ def blk_read_sectors(slot: int32, lba: uint64, count: uint64,
     ops: Ptr[BlockDeviceOps] = blockdev_table[su].ops
     priv: uint64 = blockdev_table[su].priv
     fn: Fn[int32, uint64, uint64, uint64, Ptr[uint8]] = ops[0].read_sectors
+    # §13: clock the request and mark it in-flight for the span of the
+    # driver call. in_flight settles back to 0 once the (synchronous)
+    # request completes; io_ticks_us accumulates real service time.
+    blk_stats_table[su].in_flight = blk_stats_table[su].in_flight + 1
+    t0: uint64 = tsc_monotonic_us()
     rc: int32 = fn(priv, lba, count, buf)
+    t1: uint64 = tsc_monotonic_us()
+    blk_stats_table[su].in_flight = blk_stats_table[su].in_flight - 1
+    if t1 > t0:
+        blk_stats_table[su].io_ticks_us = \
+            blk_stats_table[su].io_ticks_us + (t1 - t0)
     # §13: bump the per-device read counters on success so
     # /dev/diskstats reports real I/O. One "io" per request; sectors
     # is the request length in 512-byte units.
@@ -275,7 +329,15 @@ def blk_write_sectors(slot: int32, lba: uint64, count: uint64,
         return -1
     priv: uint64 = blockdev_table[su].priv
     fn: Fn[int32, uint64, uint64, uint64, Ptr[uint8]] = ops[0].write_sectors
+    # §13: clock + in-flight accounting, mirroring the read path.
+    blk_stats_table[su].in_flight = blk_stats_table[su].in_flight + 1
+    t0: uint64 = tsc_monotonic_us()
     rc: int32 = fn(priv, lba, count, buf)
+    t1: uint64 = tsc_monotonic_us()
+    blk_stats_table[su].in_flight = blk_stats_table[su].in_flight - 1
+    if t1 > t0:
+        blk_stats_table[su].io_ticks_us = \
+            blk_stats_table[su].io_ticks_us + (t1 - t0)
     # §13: bump the per-device write counters on success.
     if rc == 0:
         blk_stats_table[su].wr_ios     = blk_stats_table[su].wr_ios + 1
@@ -630,3 +692,152 @@ def blk_register_partitions(parent_slot: int32,
             registered = registered + 1
         pi = pi + 1
     return registered
+
+
+# --- §13: per-device I/O accounting self-test -------------------------
+#
+# Gated boot self-test (init/main.ad boot:37.ds, planted /etc/diskstats-test).
+# It PROVES the /dev/diskstats counters are REAL — fed by actual block I/O
+# through blk_read_sectors — not a parallel fake:
+#
+#   1. Snapshot ram0's rd_ios / rd_sectors AND a second device's counters
+#      (the idle witness — ram1 if present, else any other live slot).
+#   2. Drive a KNOWN amount of block I/O at ram0 through blk_read_sectors:
+#      _DS_TEST_SINGLES single-sector reads, then one _DS_TEST_BURST-sector
+#      read. Total expected: (_DS_TEST_SINGLES + 1) ios and
+#      (_DS_TEST_SINGLES + _DS_TEST_BURST) sectors.
+#   3. Snapshot ram0 again; assert the deltas EXACTLY match the I/O issued,
+#      and that the idle witness's counters did NOT move.
+#   4. Assert in_flight settled back to 0 (synchronous request completed).
+#
+# Each marker line stamps EMERG so it reaches serial even at the prompt.
+
+# 4 KiB scratch (8 sectors) — flat module-scope per the Adder array quirk;
+# a frame-local Array[...] of this size miscompiles.
+_DS_TEST_SECTORS: uint64 = 8
+_blk_ds_scratch: Array[4096, uint8]
+
+_DS_TEST_SINGLES: uint64 = 5       # single-sector reads
+_DS_TEST_BURST:   uint64 = 4       # one multi-sector read of this many
+
+
+def _blk_ds_emerg0(s: Ptr[char]):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0(s)
+
+
+def _blk_ds_emerg1(s: Ptr[char], a: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk1(s, a)
+
+
+def _blk_ds_emerg2(s: Ptr[char], a: uint64, b: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk2(s, a, b)
+
+
+def _blk_find_idle_witness(busy: int32) -> int32:
+    # Pick a registered slot != `busy` to use as the idle-counter witness.
+    # Prefer "ram1"; otherwise the first other live slot. Returns -1 if no
+    # second device is registered (the witness check is then skipped).
+    w: int32 = find_blockdev("ram1")
+    if w >= 0 and w != busy:
+        return w
+    i: uint64 = 0
+    while i < BLKDEV_MAX:
+        si: int32 = cast[int32](i)
+        if blk_slot_in_use(si) != 0 and si != busy:
+            return si
+        i = i + 1
+    return -1
+
+
+def blk_diskstats_selftest() -> int32:
+    # Returns 1 on PASS, 0 on FAIL. Prints [diskstats] marker lines.
+    _blk_ds_emerg0("[diskstats] self-test start\n")
+
+    slot: int32 = find_blockdev("ram0")
+    if slot < 0:
+        _blk_ds_emerg0("[diskstats] FAIL: ram0 not registered\n")
+        return 0
+    su: uint64 = cast[uint64](slot)
+
+    # Snapshot ram0 + idle witness.
+    rd0: uint64 = blk_stats_rd_ios(slot)
+    sc0: uint64 = blk_stats_rd_sectors(slot)
+    _blk_ds_emerg2("[diskstats] ram0 baseline rd_ios=%d rd_sectors=%d\n",
+                   rd0, sc0)
+
+    witness: int32 = _blk_find_idle_witness(slot)
+    wrd0: uint64 = 0
+    wsc0: uint64 = 0
+    if witness >= 0:
+        wrd0 = blk_stats_rd_ios(witness)
+        wsc0 = blk_stats_rd_sectors(witness)
+        _blk_ds_emerg2(
+            "[diskstats] idle-witness baseline rd_ios=%d rd_sectors=%d\n",
+            wrd0, wsc0)
+    else:
+        _blk_ds_emerg0("[diskstats] note: no idle witness device\n")
+
+    # Issue a KNOWN amount of real block I/O through blk_read_sectors.
+    bufp: Ptr[uint8] = &_blk_ds_scratch[0]
+    k: uint64 = 0
+    while k < _DS_TEST_SINGLES:
+        rc: int32 = blk_read_sectors(slot, k, 1, bufp)
+        if rc != 0:
+            _blk_ds_emerg1("[diskstats] FAIL: single read rc=%d\n",
+                           cast[uint64](cast[int64](rc)))
+            return 0
+        k = k + 1
+    rcb: int32 = blk_read_sectors(slot, 0, _DS_TEST_BURST, bufp)
+    if rcb != 0:
+        _blk_ds_emerg1("[diskstats] FAIL: burst read rc=%d\n",
+                       cast[uint64](cast[int64](rcb)))
+        return 0
+
+    # Snapshot again and compute deltas.
+    rd1: uint64 = blk_stats_rd_ios(slot)
+    sc1: uint64 = blk_stats_rd_sectors(slot)
+    d_ios:     uint64 = rd1 - rd0
+    d_sectors: uint64 = sc1 - sc0
+    exp_ios:     uint64 = _DS_TEST_SINGLES + 1
+    exp_sectors: uint64 = _DS_TEST_SINGLES + _DS_TEST_BURST
+    _blk_ds_emerg2("[diskstats] ram0 delta rd_ios=%d rd_sectors=%d\n",
+                   d_ios, d_sectors)
+    _blk_ds_emerg2("[diskstats] expected rd_ios=%d rd_sectors=%d\n",
+                   exp_ios, exp_sectors)
+
+    ok: int32 = 1
+    if d_ios != exp_ios:
+        _blk_ds_emerg0("[diskstats] FAIL: rd_ios delta mismatch\n")
+        ok = 0
+    if d_sectors != exp_sectors:
+        _blk_ds_emerg0("[diskstats] FAIL: rd_sectors delta mismatch\n")
+        ok = 0
+
+    # in_flight must have settled to 0 after the synchronous requests.
+    infl: uint64 = blk_stats_in_flight(slot)
+    if infl != 0:
+        _blk_ds_emerg1("[diskstats] FAIL: in_flight not idle (=%d)\n", infl)
+        ok = 0
+    else:
+        _blk_ds_emerg0("[diskstats] in_flight settled to 0 OK\n")
+
+    # Idle witness must not have moved.
+    if witness >= 0:
+        wrd1: uint64 = blk_stats_rd_ios(witness)
+        wsc1: uint64 = blk_stats_rd_sectors(witness)
+        if wrd1 != wrd0 or wsc1 != wsc0:
+            _blk_ds_emerg2(
+                "[diskstats] FAIL: idle witness moved rd_ios=%d rd_sectors=%d\n",
+                wrd1 - wrd0, wsc1 - wsc0)
+            ok = 0
+        else:
+            _blk_ds_emerg0("[diskstats] idle witness unchanged OK\n")
+
+    if ok == 1:
+        _blk_ds_emerg0("[diskstats] PASS\n")
+        return 1
+    _blk_ds_emerg0("[diskstats] FAIL\n")
+    return 0

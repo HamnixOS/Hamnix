@@ -371,6 +371,18 @@ if os.environ.get("ENABLE_NSCAP_TEST") == "1":
 if os.environ.get("ENABLE_FIREWALL_TEST") == "1":
     FILES.append(("/etc/firewall-test", b"ENABLE_FIREWALL_TEST=1\n"))
 
+# §13: per-device block-I/O accounting self-test. scripts/test_diskstats.sh
+# sets ENABLE_DISKSTATS_TEST=1 to plant /etc/diskstats-test. init/main.ad at
+# boot:37.ds detects the marker and calls blk_diskstats_selftest()
+# (kernel/block/blk.ad): it snapshots ram0's /dev/diskstats counters, drives
+# a KNOWN amount of real block I/O through blk_read_sectors, and asserts the
+# rd_ios / rd_sectors deltas EXACTLY match the I/O issued while an idle
+# witness device's counters do not move — proving the /proc/diskstats
+# numbers are fed by real I/O, not a fake parallel counter. Default boots
+# omit the marker so it never fires.
+if os.environ.get("ENABLE_DISKSTATS_TEST") == "1":
+    FILES.append(("/etc/diskstats-test", b"ENABLE_DISKSTATS_TEST=1\n"))
+
 # #149: ext4 JBD2 journal crash-consistency self-test. scripts/
 # test_ext4_journal.sh sets ENABLE_EXT4_JOURNAL_TEST=1 to plant
 # /etc/ext4-journal-test. init/main.ad detects the marker after the
