@@ -818,6 +818,17 @@ if os.environ.get("ENABLE_BLKIO_TEST") == "1":
 if os.environ.get("ENABLE_NSIGNALS_TEST") == "1":
     FILES.append(("/etc/nsignals-test", b"1\n"))
 
+# vsize/rss + ru_maxrss self-test. scripts/test_vmstat.sh sets
+# ENABLE_VMSTAT_TEST=1 to plant /etc/vmstat-test. init/main.ad at
+# boot:37.vmstat detects the marker and calls vmstat_selftest()
+# (linux_abi/u_syscalls.ad): it walks the boot task's VMAs on demand to
+# compute /proc/<pid>/stat field 23 (vsize, bytes) and field 24 (rss,
+# pages), then drives getrusage and asserts ru_maxrss (0x20) is >= the
+# current rss in KB, then emits the [VMSTAT] PASS banner. Needs no extra
+# device; default boots omit the marker.
+if os.environ.get("ENABLE_VMSTAT_TEST") == "1":
+    FILES.append(("/etc/vmstat-test", b"1\n"))
+
 # times(2) CPU-time self-test. scripts/test_times.sh sets
 # ENABLE_TIMES_TEST=1 to plant /etc/times-test. init/main.ad at
 # boot:37.times detects the marker and calls times_selftest()

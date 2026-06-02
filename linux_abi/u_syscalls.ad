@@ -250,6 +250,10 @@ from kernel.sched.core import (
     # getrusage(2) / nsignals_selftest: per-task signal-delivery count and
     # the slot-indexed charge helper signal_post drives at the latch site.
     current_task_nsignals, task_account_signal_at,
+    # getrusage(2) / vmstat_selftest: ru_maxrss (0x20) high-water mark
+    # accessor + monotonic updater. The current rss is computed on demand
+    # from the VMA walk; this field just remembers the peak in KB.
+    task_maxrss_kb_at, task_set_maxrss_kb_at,
 )
 # msync_selftest backs its known-content file on tmpfs (the cpio initramfs
 # is read-only — a MAP_SHARED-writable mapping over it is refused), then
@@ -327,7 +331,16 @@ from mm.vma import (
     # msync_selftest builds a writable file-backed shared VMA and faults
     # its pages in directly (a synchronous kernel self-test cannot take a
     # real #PF on its own access), then drives msync via the real dispatch.
-    vma_alloc_file_shared, vma_demand_fault,
+    vma_alloc_file_shared, vma_demand_fault, vma_alloc_demand,
+    # getrusage(2) ru_maxrss + vmstat_selftest: on-demand virtual size /
+    # resident-page walks over the calling task's VMAs.
+    task_vsize_bytes, task_rss_pages,
+    # vmstat_selftest builds a real demand-paged anonymous VMA in the boot
+    # task and faults its pages in so the walk has present 4 KiB PTEs to
+    # count (the boot task's identity map uses huge pages, which the
+    # 4 KiB-granular present-walk reads as not-present).
+    VMA_MAP_PRIVATE, VMA_MAP_ANONYMOUS,
+    VMA_PROT_READ, VMA_PROT_WRITE,
 )
 
 # memset for zero-filling user-supplied stat buffers before we poke
@@ -1349,6 +1362,7 @@ def _u_getrusage(a0: uint64, a1: uint64, a2: uint64,
     # the per-task user/system tick counters the timer ISR accrues:
     #   offset 0x00  ru_utime  struct timeval {s64 tv_sec; s64 tv_usec}
     #   offset 0x10  ru_stime  struct timeval
+    #   offset 0x20  ru_maxrss  long — REAL peak resident set size in KB
     #   offset 0x40  ru_minflt  long — REAL minor page-fault count
     #   offset 0x48  ru_majflt  long — REAL major page-fault count
     #   offset 0x58  ru_inblock long — REAL 512-byte block reads charged
@@ -1356,14 +1370,24 @@ def _u_getrusage(a0: uint64, a1: uint64, a2: uint64,
     #   offset 0x78  ru_nsignals long — REAL count of signals delivered
     #   offset 0x80  ru_nvcsw   long — REAL voluntary ctx-switch count
     #   offset 0x88  ru_nivcsw  long — REAL involuntary ctx-switch count
-    # The remaining 7 longs (ru_maxrss, ru_nswap, ru_msgsnd/rcv, in
-    # 0x20..0x50 / 0x68..0x70) stay zero — Hamnix doesn't track rss/swap/
-    # msg accounting yet.
+    # ru_maxrss is a monotonic high-water: we compute the CURRENT rss on
+    # demand (present 4 KiB pages * 4 KB) by walking the calling task's
+    # VMAs, bump the per-task high-water field if it grew, and report the
+    # high-water — so it never decrements and has no drift site. The
+    # remaining 6 longs (ru_nswap, ru_msgsnd/rcv, in 0x28..0x38 /
+    # 0x50 / 0x68..0x70) stay zero — Hamnix tracks no swap/msg accounting.
     # HZ=100, so 1 tick = 10 ms = 10000 microseconds: for a tick count N,
     # tv_sec = N/100 and tv_usec = (N%100)*10000.
     if a1 == 0:
         return ELINUX_INVAL
     memset(cast[Ptr[uint8]](a1), 0, 144)
+    # ru_maxrss (0x20): current rss in KB (present pages * 4 KB/page),
+    # promoted to a monotonic per-task high-water before it is reported.
+    gru_slot: int32 = cast[int32](current_idx_get())
+    cur_kb: uint64 = task_rss_pages(current_idx_get()) * 4
+    if cur_kb > task_maxrss_kb_at(gru_slot):
+        task_set_maxrss_kb_at(gru_slot, cur_kb)
+    cast[Ptr[uint64]](a1 + 0x20)[0] = task_maxrss_kb_at(gru_slot)
     ut: uint64 = current_task_utime_ticks()
     st: uint64 = current_task_stime_ticks()
     cast[Ptr[int64]](a1 + 0x00)[0] = cast[int64](ut / 100)
@@ -7009,6 +7033,75 @@ def nsignals_selftest() -> int32:
     # "[NSIGNALS] PASS nsignals=5" regardless of any real signals delivered
     # to this boot task earlier.
     printk1("[NSIGNALS] PASS nsignals=%d\n", ns_after - ns_before)
+    return 1
+
+
+def vmstat_selftest() -> int32:
+    # /proc/<pid>/stat fields 23 (vsize) / 24 (rss) + getrusage ru_maxrss
+    # (0x20) — all three computed on demand from the VMA walk. The boot
+    # task that runs this hook (boot:37) went through neither do_execve nor
+    # create_user_task, so its VMA list is EMPTY. Build a real demand-paged
+    # anonymous VMA (vma_alloc_demand reserves the range with not-present
+    # 4 KiB PTEs) and fault its pages in directly (a synchronous kernel
+    # self-test cannot take a real #PF on its own access), so the
+    # 4 KiB-granular present-walk has genuine present PTEs to count. An
+    # EAGER vma_alloc would not work here: its pages live in the huge-page
+    # identity map, which _vma_pte_lookup reads as not-present. Arm NXE
+    # first — the writable-NX demand pages would otherwise take a
+    # reserved-bit #PF, same as the file-mmap selftests.
+    PG: uint64 = 4096
+    NPAGES: uint64 = 4
+    set_efer_nxe()
+    slot: uint64 = current_idx_get()
+    boot_pml4: uint64 = task_pml4(cast[int32](slot))
+
+    base64: int64 = vma_alloc_demand(slot, 0, NPAGES * PG,
+                                     VMA_PROT_READ | VMA_PROT_WRITE,
+                                     VMA_MAP_PRIVATE | VMA_MAP_ANONYMOUS)
+    if base64 < 0:
+        printk1("[VMSTAT] FAIL vma_alloc_demand rc=%d\n",
+                cast[uint64](base64))
+        return 0
+    vbase: uint64 = cast[uint64](base64)
+
+    # Fault every page in so it gets a present private 4 KiB PTE.
+    fp: uint64 = 0
+    while fp < NPAGES:
+        if vma_demand_fault(slot, boot_pml4, vbase + fp * PG) != 1:
+            printk1("[VMSTAT] FAIL demand-fault page %d\n", fp)
+            return 0
+        fp = fp + 1
+
+    vs: uint64 = task_vsize_bytes(slot)
+    if vs == 0:
+        printk0("[VMSTAT] FAIL vsize is 0 (task has no VMAs?)\n")
+        return 0
+
+    rp: uint64 = task_rss_pages(slot)
+    if rp == 0:
+        printk0("[VMSTAT] FAIL rss is 0 (no present pages?)\n")
+        return 0
+
+    # Drive _u_getrusage into a LOCAL 144-byte buffer poisoned with 0xAA
+    # first, then read ru_maxrss at offset 0x20 and assert the KB high-
+    # water is at least the current rss in KB (present pages * 4 KB).
+    rbuf: Array[144, uint8]
+    pi: uint64 = 0
+    while pi < 144:
+        rbuf[pi] = 0xAA
+        pi = pi + 1
+    rc: int64 = _u_getrusage(0, cast[uint64](&rbuf[0]), 0, 0, 0, 0)
+    if rc != 0:
+        printk1("[VMSTAT] FAIL getrusage rc=%d\n", cast[uint64](rc))
+        return 0
+
+    ru_maxrss: uint64 = cast[Ptr[uint64]](cast[uint64](&rbuf[0]) + 0x20)[0]
+    if ru_maxrss < rp * 4:
+        printk2("[VMSTAT] FAIL ru_maxrss=%d < rss_kb=%d\n",
+                ru_maxrss, rp * 4)
+        return 0
+
+    printk2("[VMSTAT] PASS vsize=%d rss=%d\n", vs, rp)
     return 1
 
 
