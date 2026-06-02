@@ -442,8 +442,10 @@ def ext4_inode_owner_at(inum: uint32, uid_out: Ptr[uint32],
 #   0x00  u16 eh_magic       (0xF30A)
 #   0x02  u16 eh_entries
 #   0x04  u16 eh_max
-#   0x06  u16 eh_depth       (0 = leaf, >0 = index — we don't
-#                              walk indirect index blocks yet)
+#   0x06  u16 eh_depth       (0 = leaf, >0 = index — index nodes
+#                              ARE walked: see _ext4_logical_to_physical
+#                              for read and _ext4_extent_append_block /
+#                              _ext4_extent_trim_to for grow/shrink)
 #   0x08  u32 eh_generation
 #
 # Followed by up to 4 struct ext4_extent records (12 bytes each at
@@ -585,10 +587,12 @@ def ext4_dir_lookup(dir_inode_buf: Ptr[uint8],
 
 # --- file read ----------------------------------------------------
 #
-# Walks the inode's inline leaf extents looking for the extent that
+# Walks the extent tree (any depth) looking for the extent that
 # contains logical block N. Returns the physical block, or 0 on miss
-# (sparse file or N past end-of-file). Index nodes (eh_depth > 0)
-# are deferred — they kick in for files >> 50 KiB.
+# (sparse file or N past end-of-file). Index nodes (eh_depth > 0) are
+# walked transparently: each level's chosen index record points at a
+# child block holding the next-level header, until a depth-0 leaf is
+# reached. This is what lets a file exceed the 4-inline-extent ceiling.
 
 def _ext4_logical_to_physical(inode_buf: Ptr[uint8],
                               logical_blk: uint64) -> uint64:
@@ -614,7 +618,18 @@ def _ext4_logical_to_physical(inode_buf: Ptr[uint8],
         if magic != EXT4_EXTENT_MAGIC:
             return 0
         entries: uint16 = _ext4_read_u16(cast[Ptr[uint8]](eh + 2))
+        eh_max:  uint16 = _ext4_read_u16(cast[Ptr[uint8]](eh + 4))
         depth:   uint16 = _ext4_read_u16(cast[Ptr[uint8]](eh + 6))
+        # On-disk header is UNTRUSTED. Reject an entry count that
+        # exceeds the declared capacity (eh_entries <= eh_max) — that
+        # would read records past the node's allocation — and a depth
+        # the FS never produces. Bail to "unmapped" rather than walk
+        # out of bounds. (eh_max==0 at depth 0 is a legitimately empty
+        # freshly-created leaf, so only enforce the relation, not >0.)
+        if entries > eh_max:
+            return 0
+        if depth > 5:
+            return 0
         if depth == 0:
             # Leaf: find the extent covering logical_blk.
             i: uint16 = 0
@@ -1892,11 +1907,13 @@ def ext4_create_smoke_test() -> int32:
 # and appending to the inode's inline extent leaf via
 # _ext4_extent_append_block whenever the write spills past the last
 # allocated logical block. This is the same growth pattern
-# ext4_blob_save uses on the install path. Cap is the depth-0 leaf
-# 4-slot limit (with coalescing); on our 4-KiB-block image that
-# covers a comfortable tens-of-MiB range before fragmentation forces
-# the 4-slot ceiling. Hitting the ceiling returns a short write —
-# extent-index-node support is a documented follow-up.
+# ext4_blob_save uses on the install path. When the inline depth-0
+# leaf's 4 slots fill, _ext4_extent_append_block promotes the inode to
+# a depth-1 INDEX node (extents move into a leaf block; further leaves
+# allocated under up to 4 index records) — so a heavily-fragmented file
+# now grows to thousands of non-contiguous blocks instead of capping at
+# 4 extents. Only a depth-2 tree (index records also exhausted) returns
+# a short write; that is a documented follow-up.
 #
 # Close flushes the final inode i_size via a re-write (it's already
 # up-to-date because we update i_size on each write — close is just
@@ -2219,12 +2236,11 @@ def ext4_unlink(name: Ptr[char]) -> int32:
     if target_inum == 0:
         return -2                                  # -ENOENT
 
-    # Read the file's inode and walk every extent in the inline
-    # leaf, freeing each physical block. _ext4_extent_trim_to(..., 0)
-    # does exactly this — the same helper ext4_truncate_inode uses
-    # for a full truncate-to-zero. Inline-leaf-only (eh_depth=0);
-    # an index-node file (eh_depth>0) would need an extent-tree walk
-    # — none of our writers produce that yet.
+    # Read the file's inode and free every data block via
+    # _ext4_extent_trim_to(..., 0) — the same helper ext4_truncate_inode
+    # uses for a full truncate-to-zero. It now walks both the inline
+    # depth-0 leaf AND a depth-1 index tree (freeing index/leaf blocks),
+    # so an index-node file is fully reclaimed here.
     finode: Array[256, uint8]
     if ext4_read_inode(cast[uint64](target_inum), &finode[0]) == 0:
         _ext4_extent_trim_to(&finode[0], 0)
@@ -2247,13 +2263,12 @@ def ext4_unlink(name: Ptr[char]) -> int32:
 # --- truncate / ftruncate (M16.x §12.2) ---------------------------
 #
 # Resize a regular file to an arbitrary byte length, freeing or
-# allocating blocks as needed and updating i_size. Scope: files whose
-# extents fit inline in the inode's i_block window (depth-0 leaf,
-# eh_max 4) — that covers everything our create/write path produces
-# and any small file on a real ext4 volume. A file deep enough to
-# need an index node (eh_depth > 0) is rejected with -1; growing such
-# a file would need to split the extent tree, which is a documented
-# follow-up.
+# allocating blocks as needed and updating i_size. Handles both a
+# depth-0 inline leaf AND a depth-1 index tree: a shrink trims/frees
+# leaf blocks and folds the tree back to inline when it collapses to
+# <= 1 leaf; a grow appends extents (promoting to depth 1 on overflow
+# of the inline 4 slots). Only a depth-2 tree (eh_depth > 1) is
+# rejected — our writers never produce one.
 #
 # Linux's ext4_truncate() does the same two jobs: ext4_ext_remove_space
 # for a shrink, and (on grow) leaves the tail sparse / zero-fills the
@@ -2281,17 +2296,18 @@ def _ext4_leaf_entries(inode_buf: Ptr[uint8]) -> int32:
         cast[Ptr[uint8]](eh + EXT4_EH_ENTRIES_OFFSET)))
 
 
-def _ext4_inode_block_count(inode_buf: Ptr[uint8]) -> uint64:
-    # Total logical blocks covered by the inline leaf extents — i.e.
-    # how many blocks of file data are currently allocated. Returns 0
-    # for an empty or non-leaf inode.
-    n: int32 = _ext4_leaf_entries(inode_buf)
-    if n < 0:
+def _ext4_leaf_block_count(eh: uint64) -> uint64:
+    # Highest (ee_block + ee_len) across a depth-0 leaf header at `eh`.
+    magic: uint16 = _ext4_read_u16(cast[Ptr[uint8]](eh + 0))
+    if magic != EXT4_EXTENT_MAGIC:
         return 0
-    eh: uint64 = cast[uint64](inode_buf) + INODE_I_BLOCK_OFFSET
+    entries: uint16 = _ext4_read_u16(cast[Ptr[uint8]](eh + 2))
+    eh_max:  uint16 = _ext4_read_u16(cast[Ptr[uint8]](eh + 4))
+    if entries > eh_max:
+        return 0
     total: uint64 = 0
-    i: int32 = 0
-    while i < n:
+    i: uint16 = 0
+    while i < entries:
         ee: uint64 = eh + 12 + cast[uint64](i) * 12
         ee_block: uint32 = _ext4_read_u32(cast[Ptr[uint8]](ee + 0))
         ee_len:   uint16 = _ext4_read_u16(cast[Ptr[uint8]](ee + 4))
@@ -2302,72 +2318,307 @@ def _ext4_inode_block_count(inode_buf: Ptr[uint8]) -> uint64:
     return total
 
 
-def _ext4_extent_append_block(inode_buf: Ptr[uint8],
-                              logical_blk: uint64,
-                              phys_blk: uint64) -> int32:
-    # Append a one-block extent (ee_block=logical_blk, ee_len=1) to the
-    # inode's inline leaf. If the new logical block is contiguous with
-    # the last extent's physical run, the last extent is simply
-    # lengthened instead of consuming a new slot (the same coalescing
-    # ext4_ext_try_to_merge does). Returns 0 on success, -1 if the
-    # leaf is full (eh_entries == eh_max) and no merge was possible.
+def _ext4_extent_depth(inode_buf: Ptr[uint8]) -> int32:
+    # Extent-tree depth of the inode: 0 (inline leaf) or 1 (index node
+    # over leaf blocks). Returns -1 if the inode is not an extents inode
+    # (bad magic) or its depth is beyond what we rewrite (>1).
     eh: uint64 = cast[uint64](inode_buf) + INODE_I_BLOCK_OFFSET
     magic: uint16 = _ext4_read_u16(cast[Ptr[uint8]](eh + 0))
     if magic != EXT4_EXTENT_MAGIC:
         return -1
     depth: uint16 = _ext4_read_u16(
         cast[Ptr[uint8]](eh + EXT4_EH_DEPTH_OFFSET))
-    if depth != 0:
+    if depth > 1:
         return -1
+    return cast[int32](depth)
+
+
+def _ext4_inode_block_count(inode_buf: Ptr[uint8]) -> uint64:
+    # Total logical blocks covered by the file's extents — i.e. how many
+    # blocks of file data are currently allocated. Walks both the inline
+    # depth-0 leaf and a depth-1 index tree (reading each leaf block).
+    # Returns 0 for an empty or malformed inode.
+    eh: uint64 = cast[uint64](inode_buf) + INODE_I_BLOCK_OFFSET
+    magic: uint16 = _ext4_read_u16(cast[Ptr[uint8]](eh + 0))
+    if magic != EXT4_EXTENT_MAGIC:
+        return 0
+    depth: uint16 = _ext4_read_u16(
+        cast[Ptr[uint8]](eh + EXT4_EH_DEPTH_OFFSET))
+    if depth == 0:
+        return _ext4_leaf_block_count(eh)
+    if depth != 1:
+        return 0
+    # depth 1: max over every leaf block's coverage.
+    idx_entries: uint16 = _ext4_read_u16(
+        cast[Ptr[uint8]](eh + EXT4_EH_ENTRIES_OFFSET))
+    idx_max: uint16 = _ext4_read_u16(cast[Ptr[uint8]](eh + 4))
+    if idx_entries > idx_max:
+        return 0
+    total: uint64 = 0
+    i: uint16 = 0
+    while i < idx_entries:
+        ei: uint64 = eh + 12 + cast[uint64](i) * 12
+        leaf_lo: uint32 = _ext4_read_u32(cast[Ptr[uint8]](ei + 4))
+        leaf_hi: uint16 = _ext4_read_u16(cast[Ptr[uint8]](ei + 8))
+        leaf_blk: uint64 = (cast[uint64](leaf_hi) << 32) \
+                         | cast[uint64](leaf_lo)
+        if _ext4_read_block(leaf_blk, &ext4_ext_scratch[0]) == 0:
+            c: uint64 = _ext4_leaf_block_count(
+                cast[uint64](&ext4_ext_scratch[0]))
+            if c > total:
+                total = c
+        i = i + 1
+    return total
+
+
+# Scratch block for an on-disk extent LEAF node (eh_depth==0 header +
+# its extent records, living in its own physical fs block at depth 1).
+# Kept distinct from ext4_blk_buf (data RMW), ext4_ext_scratch (read
+# index walk), and ext4_bitmap_buf (alloc/free) so an append's leaf
+# read-modify-write never collides with those concurrent uses. 4 KiB
+# covers both 1 KiB and 4 KiB fs blocks.
+ext4_extleaf_buf: Array[4096, uint8]
+
+
+def _ext4_leaf_block_max(blk_size: uint64) -> uint64:
+    # How many 12-byte extent records fit in an on-disk leaf block:
+    # (block_size - 12-byte header) / 12.
+    return (blk_size - 12) / 12
+
+
+def _ext4_extent_append_block(inode_buf: Ptr[uint8],
+                              logical_blk: uint64,
+                              phys_blk: uint64) -> int32:
+    # Append a one-block extent (ee_block=logical_blk, ee_len=1) to the
+    # file's extent tree. If the new logical block is physically
+    # contiguous with the last extent's run, that extent is lengthened
+    # instead of consuming a new slot (the same coalescing
+    # ext4_ext_try_to_merge does).
+    #
+    # Tree growth:
+    #   depth 0 (inline leaf) until the inode's 4 slots fill;
+    #   on overflow the 4 inline extents are MOVED into a freshly
+    #   allocated data block as a depth-0 leaf, and the inode header is
+    #   rewritten as a depth-1 INDEX node with one index record pointing
+    #   at that leaf (eh_depth=1). Further appends land in the rightmost
+    #   leaf; when THAT leaf fills, a new leaf block is allocated and a
+    #   new index record added to the inode (up to 4 index records, i.e.
+    #   4 leaf blocks). The leaf-block writes go through
+    #   _ext4_journal_write_block so they're crash-consistent under JBD2.
+    #
+    # Returns 0 on success, -1 only when the inode's 4 index slots are
+    # ALSO exhausted (a depth-2 tree, beyond this scope) or on I/O error.
+    eh: uint64 = cast[uint64](inode_buf) + INODE_I_BLOCK_OFFSET
+    magic: uint16 = _ext4_read_u16(cast[Ptr[uint8]](eh + 0))
+    if magic != EXT4_EXTENT_MAGIC:
+        return -1
+    depth: uint16 = _ext4_read_u16(
+        cast[Ptr[uint8]](eh + EXT4_EH_DEPTH_OFFSET))
+    if depth == 0:
+        return _ext4_extent_append_depth0(inode_buf, logical_blk, phys_blk)
+    if depth == 1:
+        return _ext4_extent_append_depth1(inode_buf, logical_blk, phys_blk)
+    # depth >= 2 trees are not produced by our writers; reject rather
+    # than corrupt a deeper tree we can't correctly rebalance.
+    printk0("ext4: extent append: depth>1 tree unsupported\n")
+    return -1
+
+
+def _ext4_extent_try_merge(rec: uint64, logical_blk: uint64,
+                           phys_blk: uint64) -> int32:
+    # If the 12-byte extent at `rec` ends exactly where (logical_blk,
+    # phys_blk) begins (both logically and physically contiguous) and
+    # has room to grow, lengthen it by one and return 1. Else return 0.
+    l_block:    uint32 = _ext4_read_u32(cast[Ptr[uint8]](rec + 0))
+    l_len:      uint16 = _ext4_read_u16(cast[Ptr[uint8]](rec + 4))
+    l_start_hi: uint16 = _ext4_read_u16(cast[Ptr[uint8]](rec + 6))
+    l_start_lo: uint32 = _ext4_read_u32(cast[Ptr[uint8]](rec + 8))
+    l_phys: uint64 = (cast[uint64](l_start_hi) << 32) \
+                   | cast[uint64](l_start_lo)
+    l_logend:  uint64 = cast[uint64](l_block) + cast[uint64](l_len)
+    l_physend: uint64 = l_phys + cast[uint64](l_len)
+    if l_logend == logical_blk and l_physend == phys_blk \
+            and l_len < 32768:
+        _ext4_write_u16(cast[Ptr[uint8]](rec + 4),
+                        cast[uint16](l_len + 1))
+        return 1
+    return 0
+
+
+def _ext4_extent_write_rec(rec: uint64, logical_blk: uint64,
+                           phys_blk: uint64):
+    # Write a fresh single-block leaf extent record at `rec`.
+    _ext4_write_u32(cast[Ptr[uint8]](rec + 0), cast[uint32](logical_blk))
+    _ext4_write_u16(cast[Ptr[uint8]](rec + 4), 1)
+    _ext4_write_u16(cast[Ptr[uint8]](rec + 6),
+                    cast[uint16]((phys_blk >> 32) & 0xFFFF))
+    _ext4_write_u32(cast[Ptr[uint8]](rec + 8),
+                    cast[uint32](phys_blk & 0xFFFFFFFF))
+
+
+def _ext4_idx_write_rec(rec: uint64, ei_block: uint64, leaf_blk: uint64):
+    # Write a 12-byte index record at `rec` pointing at child leaf
+    # `leaf_blk`, covering logical blocks starting at `ei_block`.
+    #   0x00 u32 ei_block   0x04 u32 ei_leaf_lo
+    #   0x08 u16 ei_leaf_hi 0x0A u16 ei_unused
+    _ext4_write_u32(cast[Ptr[uint8]](rec + 0), cast[uint32](ei_block))
+    _ext4_write_u32(cast[Ptr[uint8]](rec + 4),
+                    cast[uint32](leaf_blk & 0xFFFFFFFF))
+    _ext4_write_u16(cast[Ptr[uint8]](rec + 8),
+                    cast[uint16]((leaf_blk >> 32) & 0xFFFF))
+    _ext4_write_u16(cast[Ptr[uint8]](rec + 10), 0)
+
+
+def _ext4_extent_append_depth0(inode_buf: Ptr[uint8],
+                               logical_blk: uint64,
+                               phys_blk: uint64) -> int32:
+    # Append into the inode's inline depth-0 leaf. On overflow, promote
+    # to a depth-1 index node (move inline extents into a leaf block).
+    eh: uint64 = cast[uint64](inode_buf) + INODE_I_BLOCK_OFFSET
     entries: uint16 = _ext4_read_u16(
         cast[Ptr[uint8]](eh + EXT4_EH_ENTRIES_OFFSET))
     eh_max: uint16 = _ext4_read_u16(cast[Ptr[uint8]](eh + 4))
     if entries > 0:
-        # Try to extend the last extent if the new block continues it.
         last: uint64 = eh + 12 + cast[uint64](entries - 1) * 12
-        l_block:    uint32 = _ext4_read_u32(cast[Ptr[uint8]](last + 0))
-        l_len:      uint16 = _ext4_read_u16(cast[Ptr[uint8]](last + 4))
-        l_start_hi: uint16 = _ext4_read_u16(cast[Ptr[uint8]](last + 6))
-        l_start_lo: uint32 = _ext4_read_u32(cast[Ptr[uint8]](last + 8))
-        l_phys: uint64 = (cast[uint64](l_start_hi) << 32) \
-                       | cast[uint64](l_start_lo)
-        l_logend:  uint64 = cast[uint64](l_block) + cast[uint64](l_len)
-        l_physend: uint64 = l_phys + cast[uint64](l_len)
-        if l_logend == logical_blk and l_physend == phys_blk \
-                and l_len < 32768:
-            _ext4_write_u16(cast[Ptr[uint8]](last + 4),
-                            cast[uint16](l_len + 1))
+        if _ext4_extent_try_merge(last, logical_blk, phys_blk) != 0:
             return 0
-    if entries >= eh_max:
-        printk0("ext4: extent leaf full (truncate-grow needs index)\n")
+    if entries < eh_max:
+        ne: uint64 = eh + 12 + cast[uint64](entries) * 12
+        _ext4_extent_write_rec(ne, logical_blk, phys_blk)
+        _ext4_write_u16(cast[Ptr[uint8]](eh + EXT4_EH_ENTRIES_OFFSET),
+                        cast[uint16](entries + 1))
+        return 0
+    # Inline leaf full → promote to depth 1.
+    if _ext4_extent_promote_to_depth1(inode_buf) != 0:
         return -1
-    ne: uint64 = eh + 12 + cast[uint64](entries) * 12
-    _ext4_write_u32(cast[Ptr[uint8]](ne + 0),
-                    cast[uint32](logical_blk))
-    _ext4_write_u16(cast[Ptr[uint8]](ne + 4), 1)
-    _ext4_write_u16(cast[Ptr[uint8]](ne + 6),
-                    cast[uint16]((phys_blk >> 32) & 0xFFFF))
-    _ext4_write_u32(cast[Ptr[uint8]](ne + 8),
-                    cast[uint32](phys_blk & 0xFFFFFFFF))
-    _ext4_write_u16(cast[Ptr[uint8]](eh + EXT4_EH_ENTRIES_OFFSET),
-                    cast[uint16](entries + 1))
+    # Re-dispatch the append; the inode is now a depth-1 index node.
+    return _ext4_extent_append_depth1(inode_buf, logical_blk, phys_blk)
+
+
+def _ext4_extent_promote_to_depth1(inode_buf: Ptr[uint8]) -> int32:
+    # Convert a full inline depth-0 leaf into a depth-1 index node:
+    #   1. allocate a fresh data block to hold the moved leaf;
+    #   2. build a leaf header + copy the inode's 4 extents into it;
+    #   3. journal-write that leaf block;
+    #   4. rewrite the inode's i_block as an index header with one index
+    #      record (ei_block = first leaf extent's logical block) pointing
+    #      at the new leaf; eh_depth=1, eh_entries=1, eh_max=4.
+    # The inode itself is flushed by the caller. Returns 0 / -1.
+    eh: uint64 = cast[uint64](inode_buf) + INODE_I_BLOCK_OFFSET
+    entries: uint16 = _ext4_read_u16(
+        cast[Ptr[uint8]](eh + EXT4_EH_ENTRIES_OFFSET))
+    leaf_blk: uint64 = ext4_alloc_block()
+    if leaf_blk == 0:
+        printk0("ext4: promote depth1 FAIL (alloc leaf)\n")
+        return -1
+    # Build the leaf node in ext4_extleaf_buf.
+    lp: uint64 = cast[uint64](&ext4_extleaf_buf[0])
+    _ext4_zero(&ext4_extleaf_buf[0], ext4_block_size)
+    leaf_max: uint64 = _ext4_leaf_block_max(ext4_block_size)
+    _ext4_write_u16(cast[Ptr[uint8]](lp + 0), EXT4_EXTENT_MAGIC)
+    _ext4_write_u16(cast[Ptr[uint8]](lp + 2), entries)         # eh_entries
+    _ext4_write_u16(cast[Ptr[uint8]](lp + 4),
+                    cast[uint16](leaf_max))                    # eh_max
+    _ext4_write_u16(cast[Ptr[uint8]](lp + 6), 0)               # eh_depth=0
+    _ext4_write_u32(cast[Ptr[uint8]](lp + 8), 0)               # eh_generation
+    # Copy the 12*entries extent bytes from the inode into the leaf.
+    memcpy(cast[Ptr[uint8]](lp + 12),
+           cast[Ptr[uint8]](eh + 12),
+           cast[uint64](entries) * 12)
+    # The first leaf extent's logical block is the index record key.
+    first_lblk: uint32 = _ext4_read_u32(cast[Ptr[uint8]](eh + 12))
+    if _ext4_journal_write_block(leaf_blk, &ext4_extleaf_buf[0]) != 0:
+        ext4_free_block(leaf_blk)
+        printk0("ext4: promote depth1 FAIL (write leaf)\n")
+        return -1
+    # Rewrite the inode i_block as a depth-1 index node.
+    _ext4_zero(cast[Ptr[uint8]](eh), 60)
+    _ext4_write_u16(cast[Ptr[uint8]](eh + 0), EXT4_EXTENT_MAGIC)
+    _ext4_write_u16(cast[Ptr[uint8]](eh + 2), 1)               # eh_entries
+    _ext4_write_u16(cast[Ptr[uint8]](eh + 4), 4)               # eh_max (4 idx)
+    _ext4_write_u16(cast[Ptr[uint8]](eh + 6), 1)               # eh_depth=1
+    _ext4_write_u32(cast[Ptr[uint8]](eh + 8), 0)               # eh_generation
+    _ext4_idx_write_rec(eh + 12, cast[uint64](first_lblk), leaf_blk)
     return 0
 
 
-def _ext4_extent_trim_to(inode_buf: Ptr[uint8],
-                         keep_blocks: uint64) -> int32:
-    # Drop file data past logical block `keep_blocks`: free every
-    # physical block at logical index >= keep_blocks and rewrite the
-    # leaf so only the first `keep_blocks` logical blocks survive. An
-    # extent that straddles the cut is split (its ee_len shrunk);
-    # extents entirely past the cut are dropped and their blocks
-    # freed. Returns 0 on success, -1 on a non-leaf inode.
-    n: int32 = _ext4_leaf_entries(inode_buf)
-    if n < 0:
-        return -1
+def _ext4_extent_append_depth1(inode_buf: Ptr[uint8],
+                               logical_blk: uint64,
+                               phys_blk: uint64) -> int32:
+    # Append into a depth-1 tree. Target the rightmost (last) index
+    # record's leaf block; coalesce / append a record there. If that
+    # leaf is full, allocate a new leaf block and add a new index record
+    # to the inode (capacity = eh_max index records).
     eh: uint64 = cast[uint64](inode_buf) + INODE_I_BLOCK_OFFSET
+    idx_entries: uint16 = _ext4_read_u16(
+        cast[Ptr[uint8]](eh + EXT4_EH_ENTRIES_OFFSET))
+    idx_max: uint16 = _ext4_read_u16(cast[Ptr[uint8]](eh + 4))
+    if idx_entries == 0:
+        return -1
+    # Rightmost index record → its leaf block.
+    last_idx: uint64 = eh + 12 + cast[uint64](idx_entries - 1) * 12
+    leaf_lo: uint32 = _ext4_read_u32(cast[Ptr[uint8]](last_idx + 4))
+    leaf_hi: uint16 = _ext4_read_u16(cast[Ptr[uint8]](last_idx + 8))
+    leaf_blk: uint64 = (cast[uint64](leaf_hi) << 32) \
+                     | cast[uint64](leaf_lo)
+    if _ext4_read_block(leaf_blk, &ext4_extleaf_buf[0]) != 0:
+        return -1
+    lp: uint64 = cast[uint64](&ext4_extleaf_buf[0])
+    if _ext4_read_u16(cast[Ptr[uint8]](lp + 0)) != EXT4_EXTENT_MAGIC:
+        return -1
+    leaf_ent: uint16 = _ext4_read_u16(cast[Ptr[uint8]](lp + 2))
+    leaf_max: uint16 = _ext4_read_u16(cast[Ptr[uint8]](lp + 4))
+    if leaf_ent > leaf_max:
+        return -1
+    # Try to coalesce with the leaf's last extent.
+    if leaf_ent > 0:
+        llast: uint64 = lp + 12 + cast[uint64](leaf_ent - 1) * 12
+        if _ext4_extent_try_merge(llast, logical_blk, phys_blk) != 0:
+            return _ext4_journal_write_block(leaf_blk, &ext4_extleaf_buf[0])
+    if leaf_ent < leaf_max:
+        nrec: uint64 = lp + 12 + cast[uint64](leaf_ent) * 12
+        _ext4_extent_write_rec(nrec, logical_blk, phys_blk)
+        _ext4_write_u16(cast[Ptr[uint8]](lp + 2),
+                        cast[uint16](leaf_ent + 1))
+        return _ext4_journal_write_block(leaf_blk, &ext4_extleaf_buf[0])
+    # Rightmost leaf is full → need a new leaf under a new index record.
+    if idx_entries >= idx_max:
+        printk0("ext4: extent index full (depth-2 tree unsupported)\n")
+        return -1
+    new_leaf: uint64 = ext4_alloc_block()
+    if new_leaf == 0:
+        printk0("ext4: extent append FAIL (alloc new leaf)\n")
+        return -1
+    nlmax: uint64 = _ext4_leaf_block_max(ext4_block_size)
+    _ext4_zero(&ext4_extleaf_buf[0], ext4_block_size)
+    _ext4_write_u16(cast[Ptr[uint8]](lp + 0), EXT4_EXTENT_MAGIC)
+    _ext4_write_u16(cast[Ptr[uint8]](lp + 2), 1)               # eh_entries
+    _ext4_write_u16(cast[Ptr[uint8]](lp + 4),
+                    cast[uint16](nlmax))                       # eh_max
+    _ext4_write_u16(cast[Ptr[uint8]](lp + 6), 0)               # eh_depth=0
+    _ext4_write_u32(cast[Ptr[uint8]](lp + 8), 0)               # eh_generation
+    _ext4_extent_write_rec(lp + 12, logical_blk, phys_blk)
+    if _ext4_journal_write_block(new_leaf, &ext4_extleaf_buf[0]) != 0:
+        ext4_free_block(new_leaf)
+        return -1
+    # Add the new index record to the inode (covers logical_blk onward).
+    nidx: uint64 = eh + 12 + cast[uint64](idx_entries) * 12
+    _ext4_idx_write_rec(nidx, logical_blk, new_leaf)
+    _ext4_write_u16(cast[Ptr[uint8]](eh + EXT4_EH_ENTRIES_OFFSET),
+                    cast[uint16](idx_entries + 1))
+    return 0
+
+
+def _ext4_leaf_trim_to(eh: uint64, keep_blocks: uint64) -> int32:
+    # Trim a single depth-0 leaf header at `eh` to logical block
+    # `keep_blocks`: free every data block at logical index >=
+    # keep_blocks and compact the surviving extents in place. Works on
+    # both the inode's inline leaf and an on-disk leaf-block header.
+    # Returns the surviving extent count (>= 0).
+    n: uint16 = _ext4_read_u16(
+        cast[Ptr[uint8]](eh + EXT4_EH_ENTRIES_OFFSET))
     surviving: int32 = 0
-    i: int32 = 0
+    i: uint16 = 0
     while i < n:
         ee: uint64 = eh + 12 + cast[uint64](i) * 12
         ee_block:    uint32 = _ext4_read_u32(cast[Ptr[uint8]](ee + 0))
@@ -2414,12 +2665,130 @@ def _ext4_extent_trim_to(inode_buf: Ptr[uint8],
         i = i + 1
     # Zero the dropped slots so a stale extent never gets walked.
     z: int32 = surviving
-    while z < n:
+    while z < cast[int32](n):
         zz: uint64 = eh + 12 + cast[uint64](z) * 12
         _ext4_zero(cast[Ptr[uint8]](zz), 12)
         z = z + 1
     _ext4_write_u16(cast[Ptr[uint8]](eh + EXT4_EH_ENTRIES_OFFSET),
                     cast[uint16](surviving))
+    return surviving
+
+
+def _ext4_extent_trim_to(inode_buf: Ptr[uint8],
+                         keep_blocks: uint64) -> int32:
+    # Drop file data past logical block `keep_blocks`: free every
+    # physical block at logical index >= keep_blocks and rewrite the
+    # extent tree so only the first `keep_blocks` logical blocks survive.
+    # Handles both the inode's inline depth-0 leaf AND a depth-1 index
+    # tree. For depth 1: each leaf block is trimmed; a leaf that ends up
+    # entirely past the cut is freed and its index record dropped. When
+    # the trim collapses the tree to a single (or zero) leaf, the inode
+    # is folded back to an inline depth-0 leaf so small files don't keep
+    # an index level around. Returns 0 on success, -1 on a malformed /
+    # too-deep inode.
+    eh: uint64 = cast[uint64](inode_buf) + INODE_I_BLOCK_OFFSET
+    magic: uint16 = _ext4_read_u16(cast[Ptr[uint8]](eh + 0))
+    if magic != EXT4_EXTENT_MAGIC:
+        return -1
+    depth: uint16 = _ext4_read_u16(
+        cast[Ptr[uint8]](eh + EXT4_EH_DEPTH_OFFSET))
+    if depth == 0:
+        _ext4_leaf_trim_to(eh, keep_blocks)
+        return 0
+    if depth != 1:
+        printk0("ext4: trim: depth>1 tree unsupported\n")
+        return -1
+    return _ext4_extent_trim_depth1(inode_buf, keep_blocks)
+
+
+def _ext4_extent_trim_depth1(inode_buf: Ptr[uint8],
+                             keep_blocks: uint64) -> int32:
+    # Trim a depth-1 index tree. For each index record (left to right):
+    #   * read its leaf block;
+    #   * trim it via _ext4_leaf_trim_to;
+    #   * if the leaf still holds extents, journal-write it back and
+    #     keep the index record (compacting index slots down);
+    #   * if the leaf is now empty, free the leaf block and drop the
+    #     index record.
+    # Finally, if 0 or 1 leaf survives, fold the inode back to a depth-0
+    # inline leaf (copy the lone leaf's extents inline, free that leaf
+    # block) so the tree only stays deep while it must.
+    eh: uint64 = cast[uint64](inode_buf) + INODE_I_BLOCK_OFFSET
+    idx_entries: uint16 = _ext4_read_u16(
+        cast[Ptr[uint8]](eh + EXT4_EH_ENTRIES_OFFSET))
+    idx_max: uint16 = _ext4_read_u16(cast[Ptr[uint8]](eh + 4))
+    if idx_entries > idx_max:
+        return -1
+    surviving: int32 = 0
+    i: uint16 = 0
+    while i < idx_entries:
+        ei: uint64 = eh + 12 + cast[uint64](i) * 12
+        ei_block: uint32 = _ext4_read_u32(cast[Ptr[uint8]](ei + 0))
+        leaf_lo:  uint32 = _ext4_read_u32(cast[Ptr[uint8]](ei + 4))
+        leaf_hi:  uint16 = _ext4_read_u16(cast[Ptr[uint8]](ei + 8))
+        leaf_blk: uint64 = (cast[uint64](leaf_hi) << 32) \
+                         | cast[uint64](leaf_lo)
+        if _ext4_read_block(leaf_blk, &ext4_extleaf_buf[0]) != 0:
+            return -1
+        lp: uint64 = cast[uint64](&ext4_extleaf_buf[0])
+        if _ext4_read_u16(cast[Ptr[uint8]](lp + 0)) != EXT4_EXTENT_MAGIC:
+            return -1
+        rem: int32 = _ext4_leaf_trim_to(lp, keep_blocks)
+        if rem > 0:
+            # Leaf survives. Re-key the index record to its (possibly
+            # now-higher) first logical block, write it back, and
+            # compact the index slot down.
+            new_key: uint32 = _ext4_read_u32(cast[Ptr[uint8]](lp + 12))
+            if _ext4_journal_write_block(leaf_blk,
+                                         &ext4_extleaf_buf[0]) != 0:
+                return -1
+            sv: uint64 = eh + 12 + cast[uint64](surviving) * 12
+            _ext4_idx_write_rec(sv, cast[uint64](new_key), leaf_blk)
+            surviving = surviving + 1
+        else:
+            # Leaf is empty now — free the leaf block, drop the record.
+            ext4_free_block(leaf_blk)
+        i = i + 1
+    # Zero the dropped index slots.
+    z: int32 = surviving
+    while z < cast[int32](idx_entries):
+        zz: uint64 = eh + 12 + cast[uint64](z) * 12
+        _ext4_zero(cast[Ptr[uint8]](zz), 12)
+        z = z + 1
+    _ext4_write_u16(cast[Ptr[uint8]](eh + EXT4_EH_ENTRIES_OFFSET),
+                    cast[uint16](surviving))
+    # Fold back to a depth-0 inline leaf when the tree shrank to <= 1
+    # leaf. A 0-leaf tree becomes an empty inline leaf; a 1-leaf tree
+    # copies that leaf's extents inline (if they fit the 4 inline slots)
+    # and frees the leaf block.
+    if surviving == 0:
+        _ext4_zero(cast[Ptr[uint8]](eh), 60)
+        _ext4_write_u16(cast[Ptr[uint8]](eh + 0), EXT4_EXTENT_MAGIC)
+        _ext4_write_u16(cast[Ptr[uint8]](eh + 2), 0)           # eh_entries
+        _ext4_write_u16(cast[Ptr[uint8]](eh + 4), 4)           # eh_max
+        _ext4_write_u16(cast[Ptr[uint8]](eh + 6), 0)           # eh_depth=0
+        return 0
+    if surviving == 1:
+        ei: uint64 = eh + 12
+        leaf_lo:  uint32 = _ext4_read_u32(cast[Ptr[uint8]](ei + 4))
+        leaf_hi:  uint16 = _ext4_read_u16(cast[Ptr[uint8]](ei + 8))
+        leaf_blk: uint64 = (cast[uint64](leaf_hi) << 32) \
+                         | cast[uint64](leaf_lo)
+        if _ext4_read_block(leaf_blk, &ext4_extleaf_buf[0]) == 0:
+            lp: uint64 = cast[uint64](&ext4_extleaf_buf[0])
+            lent: uint16 = _ext4_read_u16(cast[Ptr[uint8]](lp + 2))
+            if lent <= 4:
+                # Fits inline — fold it back to depth 0.
+                _ext4_zero(cast[Ptr[uint8]](eh), 60)
+                _ext4_write_u16(cast[Ptr[uint8]](eh + 0),
+                                EXT4_EXTENT_MAGIC)
+                _ext4_write_u16(cast[Ptr[uint8]](eh + 2), lent)
+                _ext4_write_u16(cast[Ptr[uint8]](eh + 4), 4)
+                _ext4_write_u16(cast[Ptr[uint8]](eh + 6), 0)
+                memcpy(cast[Ptr[uint8]](eh + 12),
+                       cast[Ptr[uint8]](lp + 12),
+                       cast[uint64](lent) * 12)
+                ext4_free_block(leaf_blk)
     return 0
 
 
@@ -2444,8 +2813,8 @@ def ext4_truncate_inode(inum: uint32, new_len: uint64) -> int32:
     inode: Array[256, uint8]
     if ext4_read_inode(cast[uint64](inum), &inode[0]) != 0:
         return -1
-    if _ext4_leaf_entries(&inode[0]) < 0:
-        printk0("ext4: truncate: inode not a depth-0 extents file\n")
+    if _ext4_extent_depth(&inode[0]) < 0:
+        printk0("ext4: truncate: inode not a depth-0/1 extents file\n")
         return -1
     old_len: uint64 = cast[uint64](ext4_inode_size_lo(&inode[0]))
     if new_len == old_len:
@@ -3342,6 +3711,200 @@ def ext4_dirmb_selftest() -> int32:
                 printk0("[ext4dir] note: htreedir present but not INDEX-flagged; skipping htree assertion\n")
 
     printk0("[ext4dir] PASS\n")
+    return 0
+
+
+# --- ext4 extent-index-node self-test (eh_depth > 0) --------------
+#
+# Driven by /etc/ext4idx-test (planted by scripts/test_ext4idx.sh).
+# Builds a file LARGE/FRAGMENTED enough that its 4 inline extent slots
+# overflow, forcing the inode to a depth-1 INDEX node. Proves the
+# write/grow path promotes to depth 1, the read path walks the index
+# tree to map every logical block, and the truncate path frees the
+# index + leaf + data blocks (folding the tree back to inline). Prints
+# [ext4idx] lines + exactly one [ext4idx] PASS.
+
+# Number of (deliberately non-contiguous) one-block extents the test
+# appends. 100 exceeds both the 4 inline slots (forcing depth 1) AND
+# one 1 KiB on-disk leaf block's capacity (84 records/leaf), so a SECOND
+# leaf + index record is forced too — exercising the "rightmost leaf
+# full → allocate a new leaf and a new index record" growth path.
+EXT4IDX_NBLOCKS: uint64 = 100
+
+# Spacer blocks kept allocated between data blocks so consecutive data
+# blocks are NEVER physically contiguous (defeating extent coalescing,
+# guaranteeing one extent per data block → forced index node). Freed at
+# the end of the test.
+ext4idx_spacers: Array[100, uint64]
+
+# Verify scratch for one fs block of read-back data.
+ext4idx_vbuf: Array[4096, uint8]
+
+
+def _ext4idx_pattern_byte(lblk: uint64, off: uint64) -> uint8:
+    # Deterministic per-(logical-block, offset) pattern byte so a
+    # read-back can verify the EXACT block landed at the EXACT logical
+    # position (catches an index walk that maps a block wrong).
+    return cast[uint8](((lblk * 131 + off * 7 + 0x5A) & 0xFF))
+
+
+def _ext4idx_make_empty_file(name: Ptr[char]) -> uint32:
+    # Create an empty regular file (depth-0 leaf, eh_entries=0) in the
+    # root dir and return its inum (0 on failure). No data block is
+    # allocated — the test's appends do that.
+    new_inum: uint32 = ext4_alloc_inode()
+    if new_inum == 0:
+        return 0
+    p: Ptr[uint8] = &ext4_new_inode_buf[0]
+    _ext4_zero(p, ext4_inode_size)
+    _ext4_write_u16(p, 0x81B4)                          # i_mode IFREG|0664
+    _ext4_inode_stamp_creator(p)
+    _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](p) + 4), 0)   # i_size=0
+    _ext4_write_u16(cast[Ptr[uint8]](cast[uint64](p) + 26), 1)  # links=1
+    _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](p) + 28), 0)  # i_blocks=0
+    _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](p) + 32),
+                    0x80000)                            # EXT4_EXTENTS_FL
+    eh: uint64 = cast[uint64](p) + INODE_I_BLOCK_OFFSET
+    _ext4_write_u16(cast[Ptr[uint8]](eh + 0), EXT4_EXTENT_MAGIC)
+    _ext4_write_u16(cast[Ptr[uint8]](eh + 2), 0)        # eh_entries=0
+    _ext4_write_u16(cast[Ptr[uint8]](eh + 4), 4)        # eh_max=4
+    _ext4_write_u16(cast[Ptr[uint8]](eh + 6), 0)        # eh_depth=0
+    _ext4_stamp_all_times(p)
+    if ext4_write_inode(cast[uint64](new_inum), p) != 0:
+        ext4_free_inode(new_inum)
+        return 0
+    if ext4_dir_insert(2, name, new_inum, 1) != 0:
+        ext4_free_inode(new_inum)
+        return 0
+    return new_inum
+
+
+def ext4_extentidx_selftest() -> int32:
+    if ext4_blockdev_slot < 0:
+        printk0("[ext4idx] FAIL: ext4 not mounted\n")
+        return -1
+    printk1("[ext4idx] block_size=%d\n", ext4_block_size)
+
+    inum: uint32 = _ext4idx_make_empty_file("ext4idx.bin")
+    if inum == 0:
+        printk0("[ext4idx] FAIL: create empty file\n")
+        return -1
+
+    inode: Array[256, uint8]
+    if ext4_read_inode(cast[uint64](inum), &inode[0]) != 0:
+        printk0("[ext4idx] FAIL: read inode after create\n")
+        return -1
+
+    # Append EXT4IDX_NBLOCKS deliberately non-contiguous one-block
+    # extents. For each logical block: alloc a data block, alloc a
+    # spacer (kept) so the NEXT data block can't be contiguous, fill the
+    # data block with a per-block pattern, and append it to the tree.
+    lb: uint64 = 0
+    while lb < EXT4IDX_NBLOCKS:
+        db: uint64 = ext4_alloc_block()
+        if db == 0:
+            printk0("[ext4idx] FAIL: out of data blocks\n")
+            return -1
+        sp: uint64 = ext4_alloc_block()        # spacer (kept until end)
+        ext4idx_spacers[lb] = sp
+        # Fill the data block with its pattern.
+        o: uint64 = 0
+        while o < ext4_block_size:
+            ext4idx_vbuf[o] = _ext4idx_pattern_byte(lb, o)
+            o = o + 1
+        if _ext4_write_block(db, &ext4idx_vbuf[0]) != 0:
+            printk0("[ext4idx] FAIL: write data block\n")
+            return -1
+        if _ext4_extent_append_block(&inode[0], lb, db) != 0:
+            printk1("[ext4idx] FAIL: append block at lblk=%d\n", lb)
+            return -1
+        lb = lb + 1
+
+    # Commit the inode (size + extents). i_size = NBLOCKS full blocks.
+    fsize: uint64 = EXT4IDX_NBLOCKS * ext4_block_size
+    _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](&inode[0]) + 4),
+                    cast[uint32](fsize))
+    if ext4_write_inode(cast[uint64](inum), &inode[0]) != 0:
+        printk0("[ext4idx] FAIL: write inode after grow\n")
+        return -1
+
+    # Re-read the inode from disk and assert it became a depth-1 index
+    # node (the whole point — > 4 fragmented extents can't fit inline).
+    if ext4_read_inode(cast[uint64](inum), &inode[0]) != 0:
+        printk0("[ext4idx] FAIL: re-read inode\n")
+        return -1
+    depth: uint16 = _ext4_read_u16(cast[Ptr[uint8]](
+        cast[uint64](&inode[0]) + INODE_I_BLOCK_OFFSET + EXT4_EH_DEPTH_OFFSET))
+    idx_ent: uint16 = _ext4_read_u16(cast[Ptr[uint8]](
+        cast[uint64](&inode[0]) + INODE_I_BLOCK_OFFSET + EXT4_EH_ENTRIES_OFFSET))
+    if depth != 1:
+        printk1("[ext4idx] FAIL: expected depth=1 got %d\n",
+                cast[uint64](depth))
+        return -1
+    # 100 fragmented blocks overflow one 1 KiB leaf (84 records), so the
+    # tree MUST hold >= 2 index records — proving the multi-leaf growth
+    # path (rightmost-leaf-full → new leaf + new index record) ran.
+    if idx_ent < 2:
+        printk1("[ext4idx] FAIL: expected >=2 index records got %d\n",
+                cast[uint64](idx_ent))
+        return -1
+    printk2("[ext4idx] forced index node: eh_depth=%d index_records=%d\n",
+            cast[uint64](depth), cast[uint64](idx_ent))
+
+    # Read EVERY block back through ext4_read_file (which walks the
+    # index tree) and verify the pattern, proving each logical block
+    # maps to the right physical block.
+    vb: uint64 = 0
+    while vb < EXT4IDX_NBLOCKS:
+        n: int64 = ext4_read_file(inum, vb * ext4_block_size,
+                                  ext4_block_size, &ext4idx_vbuf[0])
+        if n != cast[int64](ext4_block_size):
+            printk1("[ext4idx] FAIL: short read at lblk=%d\n", vb)
+            return -1
+        o: uint64 = 0
+        while o < ext4_block_size:
+            if ext4idx_vbuf[o] != _ext4idx_pattern_byte(vb, o):
+                printk2("[ext4idx] FAIL: byte mismatch lblk=%d off=%d\n",
+                        vb, o)
+                return -1
+            o = o + 1
+        vb = vb + 1
+    printk1("[ext4idx] read-back verified %d blocks through index walk\n",
+            EXT4IDX_NBLOCKS)
+
+    # Truncate the file to 0 and assert the tree folds back to an empty
+    # inline depth-0 leaf (index + leaf + data blocks freed).
+    if ext4_truncate_inode(inum, 0) != 0:
+        printk0("[ext4idx] FAIL: truncate to 0\n")
+        return -1
+    if ext4_read_inode(cast[uint64](inum), &inode[0]) != 0:
+        printk0("[ext4idx] FAIL: re-read inode after truncate\n")
+        return -1
+    tdepth: uint16 = _ext4_read_u16(cast[Ptr[uint8]](
+        cast[uint64](&inode[0]) + INODE_I_BLOCK_OFFSET + EXT4_EH_DEPTH_OFFSET))
+    tent: uint16 = _ext4_read_u16(cast[Ptr[uint8]](
+        cast[uint64](&inode[0]) + INODE_I_BLOCK_OFFSET + EXT4_EH_ENTRIES_OFFSET))
+    if tdepth != 0 or tent != 0:
+        printk2("[ext4idx] FAIL: after truncate depth=%d entries=%d\n",
+                cast[uint64](tdepth), cast[uint64](tent))
+        return -1
+    # A read past EOF now returns 0 bytes.
+    if ext4_read_file(inum, 0, ext4_block_size, &ext4idx_vbuf[0]) != 0:
+        printk0("[ext4idx] FAIL: read after truncate returned data\n")
+        return -1
+    printk0("[ext4idx] truncate freed index+leaf+data; tree folded to depth 0\n")
+
+    # Clean up: free spacer blocks + the file inode, tombstone its
+    # dirent so the root-dir entry count other tests assert stays sane.
+    s: uint64 = 0
+    while s < EXT4IDX_NBLOCKS:
+        if ext4idx_spacers[s] != 0:
+            ext4_free_block(ext4idx_spacers[s])
+            ext4idx_spacers[s] = 0
+        s = s + 1
+    ext4_unlink("ext4idx.bin")
+
+    printk0("[ext4idx] PASS\n")
     return 0
 
 
