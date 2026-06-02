@@ -218,6 +218,8 @@ from kernel.sched.core import (
     task_brk_base, set_task_brk_base,
     task_brk_end, set_task_brk_end,
     task_brk_max, set_task_brk_max,
+    # getrlimit/setrlimit/prlimit64: the real per-task rlimit store.
+    rlimit_get_cur, rlimit_get_max, rlimit_set,
     set_current_errstr,
     register_cleartid_wake_hook,
     task_pml4,
@@ -571,6 +573,7 @@ SYS_seccomp:         uint64 = 317
 SYS_getrandom:       uint64 = 318
 SYS_rseq:            uint64 = 334
 SYS_getrlimit:       uint64 = 97
+SYS_setrlimit:       uint64 = 160
 # statfs(2) / fstatfs(2): filesystem capacity query. df, statvfs-based
 # tools, and installers reach for these to size the target volume.
 SYS_statfs:          uint64 = 137
@@ -3146,29 +3149,39 @@ def _u_set_robust_list(a0: uint64, a1: uint64, a2: uint64,
 def _u_prlimit64(a0: uint64, a1: uint64, a2: uint64,
                  a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int prlimit64(pid_t pid, int resource, const struct rlimit64 *new,
-    #               struct rlimit64 *old).
-    # glibc calls prlimit64(0, RLIMIT_STACK, NULL, &lim) before main()
-    # to figure out the stack size for thread bring-up. Hamnix has no
-    # rlimit infrastructure; we hand back sane Linux defaults so the
-    # caller sees an 8 MiB stack and 1024 file descriptors.
+    #               struct rlimit64 *old). a0=pid, a1=resource, a2=new,
+    #               a3=old.
     # struct rlimit64 is { uint64 rlim_cur; uint64 rlim_max; }.
-    RLIMIT_STACK:  uint64 = 3
-    RLIMIT_NOFILE: uint64 = 7
-    if a3 == 0:
-        return 0                                          # nothing to fill
-    cur: uint64 = 0
-    maxv: uint64 = 0
-    if a1 == RLIMIT_STACK:
-        cur  = 0x800000                                   # 8 MiB
-        maxv = 0x800000
-    elif a1 == RLIMIT_NOFILE:
-        cur  = 1024
-        maxv = 1024
+    #
+    # This is now backed by a REAL per-task rlimit store (kernel/sched/core.ad
+    # g_rlim_cur/g_rlim_max, keyed by task slot, seeded to Linux defaults by
+    # rlimit_init_task). getrlimit/setrlimit/prlimit64 all round-trip through
+    # it: two setrlimit calls followed by a getrlimit observe the change.
+    # `old` (if requested) is captured BEFORE `new` is applied, matching
+    # Linux's pre-change-value semantics.
+    if a1 >= 16:
+        return ELINUX_INVAL
+    # Resolve target slot: pid 0 means the current task; otherwise look it up.
+    slot: uint64 = 0
+    if a0 == 0:
+        slot = current_idx_get()
     else:
-        cur  = 0xFFFFFFFFFFFFFFFF                         # RLIM_INFINITY
-        maxv = 0xFFFFFFFFFFFFFFFF
-    cast[Ptr[uint64]](a3)[0]     = cur
-    cast[Ptr[uint64]](a3 + 8)[0] = maxv
+        sidx: int32 = task_lookup_by_pid(a0)
+        if sidx < 0:
+            return ELINUX_SRCH
+        slot = cast[uint64](sidx)
+    # `old` wanted: report the CURRENT stored values before any mutation.
+    if a3 != 0:
+        cast[Ptr[uint64]](a3)[0]     = rlimit_get_cur(slot, a1)
+        cast[Ptr[uint64]](a3 + 8)[0] = rlimit_get_max(slot, a1)
+    # `new` given: validate cur <= max, then store. Single-user-root model —
+    # no privilege check on raising the hard limit.
+    if a2 != 0:
+        nc: uint64 = cast[Ptr[uint64]](a2)[0]
+        nm: uint64 = cast[Ptr[uint64]](a2 + 8)[0]
+        if nc > nm:
+            return ELINUX_INVAL
+        rlimit_set(slot, a1, nc, nm)
     return 0
 
 
@@ -3179,6 +3192,14 @@ def _u_getrlimit(a0: uint64, a1: uint64, a2: uint64,
     # of a3, and there is no pid/new-limit pair. Forward to the prlimit64
     # body by reassembling the (pid, resource, new=NULL, old=rlim) tuple.
     return _u_prlimit64(0, a0, 0, a1, 0, 0)
+
+
+def _u_setrlimit(a0: uint64, a1: uint64, a2: uint64,
+                 a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # int setrlimit(int resource, const struct rlimit *rlim).
+    # resource=a0, rlim=a1. Forward to prlimit64 with the current task
+    # (pid=0), new=rlim, old=NULL — the store mutation lives in one place.
+    return _u_prlimit64(0, a0, a1, 0, 0, 0)
 
 
 def _u_rseq(a0: uint64, a1: uint64, a2: uint64,
@@ -7175,6 +7196,65 @@ def ruchild_selftest() -> int32:
     return 1
 
 
+def rlimit_selftest() -> int32:
+    # getrlimit/setrlimit/prlimit64 round-trip self-test against the REAL
+    # per-task rlimit store. SET RLIMIT_NOFILE(7) to {512,4096} on the current
+    # task via prlimit64(new), GET it back via prlimit64(old) and assert the
+    # set persisted. Also GET RLIMIT_STACK(3) and assert the seeded 8 MiB
+    # default. Restore NOFILE to its default afterward so the boot task is
+    # left clean. struct rlimit64 = { uint64 rlim_cur; uint64 rlim_max; }.
+    RLIMIT_STACK:  uint64 = 3
+    RLIMIT_NOFILE: uint64 = 7
+
+    # Build `new` = {cur=512, max=4096} on the stack and SET it.
+    newbuf: Array[16, uint8]
+    cast[Ptr[uint64]](cast[uint64](&newbuf[0]))[0]     = 512
+    cast[Ptr[uint64]](cast[uint64](&newbuf[0]) + 8)[0] = 4096
+    rc: int64 = _u_prlimit64(0, RLIMIT_NOFILE,
+                             cast[uint64](&newbuf[0]), 0, 0, 0)
+    if rc != 0:
+        printk1("[RLIMIT] FAIL set nofile rc=%d\n", cast[uint64](rc))
+        return 0
+
+    # GET it back into a second buffer and verify it persisted.
+    oldbuf: Array[16, uint8]
+    cast[Ptr[uint64]](cast[uint64](&oldbuf[0]))[0]     = 0
+    cast[Ptr[uint64]](cast[uint64](&oldbuf[0]) + 8)[0] = 0
+    rc = _u_prlimit64(0, RLIMIT_NOFILE, 0,
+                      cast[uint64](&oldbuf[0]), 0, 0)
+    if rc != 0:
+        printk1("[RLIMIT] FAIL get nofile rc=%d\n", cast[uint64](rc))
+        return 0
+    nofile_cur: uint64 = cast[Ptr[uint64]](cast[uint64](&oldbuf[0]))[0]
+    nofile_max: uint64 = cast[Ptr[uint64]](cast[uint64](&oldbuf[0]) + 8)[0]
+    if nofile_cur != 512:
+        printk1("[RLIMIT] FAIL nofile_cur=%d != 512\n", nofile_cur)
+        return 0
+    if nofile_max != 4096:
+        printk1("[RLIMIT] FAIL nofile_max=%d != 4096\n", nofile_max)
+        return 0
+
+    # GET RLIMIT_STACK — proves the seeded default is real.
+    rc = _u_prlimit64(0, RLIMIT_STACK, 0,
+                      cast[uint64](&oldbuf[0]), 0, 0)
+    if rc != 0:
+        printk1("[RLIMIT] FAIL get stack rc=%d\n", cast[uint64](rc))
+        return 0
+    stack_cur: uint64 = cast[Ptr[uint64]](cast[uint64](&oldbuf[0]))[0]
+    if stack_cur != 0x800000:
+        printk1("[RLIMIT] FAIL stack_cur=%d != 8388608\n", stack_cur)
+        return 0
+
+    # Restore RLIMIT_NOFILE to its default {1024, 4096} so the boot task is
+    # left clean.
+    cast[Ptr[uint64]](cast[uint64](&newbuf[0]))[0]     = 1024
+    cast[Ptr[uint64]](cast[uint64](&newbuf[0]) + 8)[0] = 4096
+    _u_prlimit64(0, RLIMIT_NOFILE, cast[uint64](&newbuf[0]), 0, 0, 0)
+
+    printk0("[RLIMIT] PASS nofile_cur=512 nofile_max=4096 stack_cur=8388608\n")
+    return 1
+
+
 def vmstat_selftest() -> int32:
     # /proc/<pid>/stat fields 23 (vsize) / 24 (rss) + getrusage ru_maxrss
     # (0x20) — all three computed on demand from the VMA walk. The boot
@@ -7887,6 +7967,8 @@ def _linux_u_syscall_dispatch_inner(nr: uint64,
         return _u_newfstatat(a0, a1, a2, a3, a4, a5)
     if nr == SYS_getrlimit:
         return _u_getrlimit(a0, a1, a2, a3, a4, a5)
+    if nr == SYS_setrlimit:
+        return _u_setrlimit(a0, a1, a2, a3, a4, a5)
     if nr == SYS_set_robust_list:
         return _u_set_robust_list(a0, a1, a2, a3, a4, a5)
     if nr == SYS_prlimit64:

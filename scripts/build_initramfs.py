@@ -828,6 +828,15 @@ if os.environ.get("ENABLE_NSIGNALS_TEST") == "1":
 if os.environ.get("ENABLE_RUCHILD_TEST"):
     FILES.append(("/etc/ruchild-test", b"1\n"))
 
+# getrlimit/setrlimit/prlimit64 round-trip self-test. scripts/test_rlimit.sh
+# sets ENABLE_RLIMIT_TEST=1 to plant /etc/rlimit-test. init/main.ad detects
+# the marker and calls rlimit_selftest() (linux_abi/u_syscalls.ad): it SETs
+# RLIMIT_NOFILE via prlimit64, GETs it back to prove the real per-task store
+# persisted, verifies the seeded 8 MiB RLIMIT_STACK default, then emits the
+# [RLIMIT] PASS banner. Default boots omit the marker.
+if os.environ.get("ENABLE_RLIMIT_TEST"):
+    FILES.append(("/etc/rlimit-test", b"1\n"))
+
 # vsize/rss + ru_maxrss self-test. scripts/test_vmstat.sh sets
 # ENABLE_VMSTAT_TEST=1 to plant /etc/vmstat-test. init/main.ad at
 # boot:37.vmstat detects the marker and calls vmstat_selftest()
