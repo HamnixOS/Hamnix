@@ -236,6 +236,14 @@ if os.environ.get("ENABLE_IPV6_SELFTEST") == "1":
 if os.environ.get("ENABLE_XHCI_SELFTEST") == "1":
     FILES.append(("/etc/xhci-selftest", b"1\n"))
 
+# Framebuffer page-pause log-capture aid. Set ENABLE_LOG_SLOW=1 to plant
+# /etc/log-slow; init/main.ad (boot:03) then makes the GOP text console
+# pause ~1 s and stamp an OCR delimiter ("### HAMNIX-LOGPAGE NNNN ###")
+# after every screenful of scrolled output, so a capture card can grab
+# the fast-scrolling NUC boot log one page at a time. Off by default.
+if os.environ.get("ENABLE_LOG_SLOW") == "1":
+    FILES.append(("/etc/log-slow", b"1\n"))
+
 # xHCI LIVE keyboard round-trip. Set ENABLE_XHCI_KBD_LIVE=1 to plant
 # /etc/xhci-kbd-live; init/main.ad gates xhci_kbd_live_watch() on it.
 # Unlike ENABLE_XHCI_SELFTEST (which drives the SYNTHETIC forged-event
