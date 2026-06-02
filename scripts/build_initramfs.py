@@ -395,6 +395,20 @@ if os.environ.get("ENABLE_FIREWALL_TEST") == "1":
 if os.environ.get("ENABLE_DISKSTATS_TEST") == "1":
     FILES.append(("/etc/diskstats-test", b"ENABLE_DISKSTATS_TEST=1\n"))
 
+# Phase G: Plan 9 note-group WIDE delivery self-test. scripts/test_notepg.sh
+# sets ENABLE_NOTEPG_TEST=1 to plant /etc/notepg-test. init/main.ad at
+# boot:37.npg detects the marker and calls notegroup_selftest()
+# (sys/src/9/port/sysnote.ad): it builds a controlled population of inert
+# task slots (three live members in one note group, one member in a
+# different group, one dead/STATE_EXITED member in the first group), runs
+# the REAL post_note_to_group walk, and asserts the note was enqueued onto
+# EXACTLY the three live group members while the cross-group witness and the
+# dead member were skipped — proving the group fan-out + membership/liveness
+# logic, which decides WHO receives a note posted to a note group. Default
+# boots omit the marker so it never fires.
+if os.environ.get("ENABLE_NOTEPG_TEST") == "1":
+    FILES.append(("/etc/notepg-test", b"ENABLE_NOTEPG_TEST=1\n"))
+
 # Plan-9 namespace bind/mount/unmount self-test. scripts/test_bind.sh sets
 # ENABLE_BIND_TEST=1 to plant /etc/bind-test plus two source directories
 # of fixture files. init/main.ad at boot:37.bind detects the marker and

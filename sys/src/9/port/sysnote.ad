@@ -60,6 +60,12 @@ from kernel.sched.core import (
     task_note_msg_ptr,
     saved_user_rip_ptr, saved_user_rsp_ptr,
     set_current_errstr, task_exit_current,
+    # Phase G note-group walk: iterate the task table by raw slot,
+    # test note-liveness, read/match each slot's note_group.
+    note_table_nslots, task_slot_is_note_live,
+    task_note_group,
+    # note-group walk self-test scaffolding.
+    notetest_claim_slot, notetest_release_slot,
 )
 from kernel.printk.printk import printk0, printk1, printk2
 
@@ -217,3 +223,214 @@ def deliver_note_to_current(msg: Ptr[uint8], count: uint64) -> int64:
     printk2("note: delivered to pid_slot=%d, handler=%x\n",
             cast[uint64](cast[uint32](cast[int32](cur))), handler)
     return cast[int64](count)
+
+
+# --- Phase G: note-group WIDE delivery ------------------------------
+#
+# Plan 9's defining note feature is the NOTE GROUP: posting a note to a
+# group delivers it to EVERY process in that group at once. That's how
+# Plan 9 does process-group signalling — far cleaner than Unix process
+# groups, where you signal a pgid and the kernel fans out. Hamnix
+# already tracks note_group per TaskStruct (M16.98); this is the
+# delivery walker that fans a note across it.
+#
+# Contract:
+#   * Walk every task-table slot. Skip dead/reaped slots (STATE_FREE /
+#     STATE_EXITED — see task_slot_is_note_live): a note is for LIVE
+#     processes only.
+#   * For each live slot whose note_group == group, ENQUEUE the note:
+#     copy the message into that task's note_msg buffer (NUL-terminated,
+#     capped at 127) and set note_pending=1. Reuses the exact per-task
+#     note storage the single-pid path uses, so the target acts on the
+#     note on its next return-to-user via the same note_pending model
+#     (run its installed handler, or default-terminate when it has none).
+#   * For the member that IS the current task (the poster posting to its
+#     own group, the common Plan 9 idiom), do the FULL self-delivery —
+#     deliver_note_to_current retargets the saved-user-RIP slot so the
+#     handler fires on this syscall's return. The other members only get
+#     the pending flag + message parked; the cross-task trap-return drain
+#     that consumes note_pending for a task already in user mode is the
+#     remaining milestone (the saved-RIP retarget can only be done safely
+#     from inside the target's own kernel context).
+#
+# Returns the number of live group members the note was enqueued onto.
+def _enqueue_note_on_slot(slot: uint64, msg: Ptr[uint8], count: uint64):
+    # Park the note string + pending flag on a target TaskStruct. This
+    # is the cross-task half of note delivery — no RIP retarget (we are
+    # not in the target's kernel context); the target consults
+    # note_pending on its next return-to-user.
+    dst: Ptr[uint8] = task_note_msg_ptr(slot)
+    take: uint64 = count
+    if take > 127:
+        take = 127
+    i: uint64 = 0
+    while i < take:
+        dst[i] = msg[i]
+        i = i + 1
+    dst[i] = 0
+    set_task_note_pending(slot, 1)
+
+
+def post_note_to_group(group: int32, msg: Ptr[uint8],
+                       count: uint64) -> int64:
+    # Fan a note across every LIVE member of note group `group`.
+    # group 0 is the "default group" every fresh task is in; posting to
+    # it would hit basically everything, so callers that want isolation
+    # MUST first move their cohort into a dedicated group via
+    # alloc_note_group_id() (rfork RFNOTEG). We still honour group 0 —
+    # Plan 9 doesn't special-case it — but the control paths above only
+    # ever post to a deliberately-allocated group.
+    cur: uint64 = current_idx_get()
+    nslots: uint64 = note_table_nslots()
+    delivered: int64 = 0
+    s: uint64 = 0
+    while s < nslots:
+        if task_slot_is_note_live(s) != 0:
+            g: int32 = task_note_group(cast[int32](s))
+            if g == group:
+                if s == cur:
+                    # Self: full handler-retarget self-delivery.
+                    deliver_note_to_current(msg, count)
+                else:
+                    _enqueue_note_on_slot(s, msg, count)
+                delivered = delivered + 1
+        s = s + 1
+    printk2("note: group %d wide-delivery hit %d members\n",
+            cast[uint64](cast[uint32](group)),
+            cast[uint64](cast[uint32](cast[int32](delivered))))
+    return delivered
+
+
+# --- note-group walk self-test --------------------------------------
+#
+# Proves the load-bearing group-walk + per-target enqueue logic
+# deterministically, without racing the live scheduler. Builds a
+# controlled population of inert task slots:
+#
+#   * three members in group A (STATE_STOPPED — live, off the runqueue)
+#   * one member in a DIFFERENT group B (must NOT receive — isolation)
+#   * one member in group A that is STATE_EXITED (dead/reaped — must be
+#     SKIPPED even though its note_group matches)
+#
+# then calls post_note_to_group(A, ...) and asserts:
+#   * exactly the three live group-A members got note_pending=1 and the
+#     note string in their note_msg buffer,
+#   * the group-B member did NOT (isolation across groups),
+#   * the dead group-A member did NOT (no delivery to corpses),
+#   * the returned recipient count is exactly 3.
+#
+# A fuller test would additionally drive several REAL scheduled tasks
+# through the trap-return drain so each runs its note handler (or
+# default-terminates) on its next return-to-user; that needs the
+# cross-task note_pending drain hook, which is the next milestone. This
+# test pins the fan-out + membership/liveness logic, which is the part
+# that decides WHO gets the note.
+
+_NOTE_GROUP_A: int32 = 4242
+_NOTE_GROUP_B: int32 = 4343
+
+
+def _slot_got_note(slot: int32, expect: Ptr[uint8]) -> int32:
+    # 1 iff slot has note_pending set AND its note_msg matches `expect`.
+    su: uint64 = cast[uint64](slot)
+    if task_note_pending(su) == 0:
+        return 0
+    got: Ptr[uint8] = task_note_msg_ptr(su)
+    i: uint64 = 0
+    while True:
+        ce: uint8 = expect[i]
+        cg: uint8 = got[i]
+        if ce != cg:
+            return 0
+        if ce == 0:
+            return 1
+        i = i + 1
+
+
+def notegroup_selftest() -> int32:
+    # Returns 1 on PASS, 0 on FAIL. Prints [notepg] lines.
+    printk0("[notepg] note-group wide-delivery self-test start\n")
+
+    msg: Ptr[uint8] = "hangup"
+
+    a0: int32 = notetest_claim_slot(5, _NOTE_GROUP_A)   # STATE_STOPPED
+    a1: int32 = notetest_claim_slot(5, _NOTE_GROUP_A)
+    a2: int32 = notetest_claim_slot(5, _NOTE_GROUP_A)
+    b0: int32 = notetest_claim_slot(5, _NOTE_GROUP_B)   # other group
+    dead: int32 = notetest_claim_slot(3, _NOTE_GROUP_A) # STATE_EXITED
+
+    if a0 < 0 or a1 < 0 or a2 < 0 or b0 < 0 or dead < 0:
+        printk0("[notepg] FAIL — could not claim 5 task slots\n")
+        # Best-effort release of whatever was claimed.
+        if a0 >= 0:
+            notetest_release_slot(a0)
+        if a1 >= 0:
+            notetest_release_slot(a1)
+        if a2 >= 0:
+            notetest_release_slot(a2)
+        if b0 >= 0:
+            notetest_release_slot(b0)
+        if dead >= 0:
+            notetest_release_slot(dead)
+        return 0
+
+    printk2("[notepg] group A members slots %d %d ...\n",
+            cast[uint64](cast[uint32](a0)),
+            cast[uint64](cast[uint32](a1)))
+    printk2("[notepg] group B witness slot %d, dead group-A slot %d\n",
+            cast[uint64](cast[uint32](b0)),
+            cast[uint64](cast[uint32](dead)))
+
+    # Run the REAL group walk.
+    n: int64 = post_note_to_group(_NOTE_GROUP_A, msg, 6)
+    printk1("[notepg] post_note_to_group returned %d recipients\n",
+            cast[uint64](cast[uint32](cast[int32](n))))
+
+    ok: int32 = 1
+
+    # Every live group-A member must have the note enqueued.
+    if _slot_got_note(a0, msg) == 0:
+        printk0("[notepg] FAIL — group-A member a0 missed the note\n")
+        ok = 0
+    if _slot_got_note(a1, msg) == 0:
+        printk0("[notepg] FAIL — group-A member a1 missed the note\n")
+        ok = 0
+    if _slot_got_note(a2, msg) == 0:
+        printk0("[notepg] FAIL — group-A member a2 missed the note\n")
+        ok = 0
+    if ok == 1:
+        printk0("[notepg] all 3 live group-A members received OK\n")
+
+    # The group-B witness must NOT have received (cross-group isolation).
+    if _slot_got_note(b0, msg) != 0:
+        printk0("[notepg] FAIL — group-B witness wrongly received note\n")
+        ok = 0
+    else:
+        printk0("[notepg] group-B witness correctly isolated OK\n")
+
+    # The dead group-A slot must NOT have received (no delivery to corpse).
+    if task_note_pending(cast[uint64](dead)) != 0:
+        printk0("[notepg] FAIL — dead group-A slot wrongly received note\n")
+        ok = 0
+    else:
+        printk0("[notepg] dead group-A slot correctly skipped OK\n")
+
+    # Recipient count must be exactly 3.
+    if n != 3:
+        printk1("[notepg] FAIL — recipient count %d, expected 3\n",
+                cast[uint64](cast[uint32](cast[int32](n))))
+        ok = 0
+    else:
+        printk0("[notepg] recipient count == 3 OK\n")
+
+    notetest_release_slot(a0)
+    notetest_release_slot(a1)
+    notetest_release_slot(a2)
+    notetest_release_slot(b0)
+    notetest_release_slot(dead)
+
+    if ok == 1:
+        printk0("[notepg] PASS\n")
+        return 1
+    printk0("[notepg] FAIL\n")
+    return 0
