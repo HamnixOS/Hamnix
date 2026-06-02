@@ -345,6 +345,30 @@ def ext4_inode_size_lo(buf: Ptr[uint8]) -> uint32:
     return _ext4_read_u32(cast[Ptr[uint8]](cast[uint64](buf) + 4))
 
 
+# struct ext4_inode.i_flags is a u32 at offset 0x20. EXT4_INDEX_FL
+# (0x1000) marks a directory whose entries are organised as a hashed
+# B-tree (htree / dir_index) rather than a flat linear list. We do NOT
+# implement htree hash lookup; instead the dir walk scans EVERY data
+# block linearly. htree index blocks (the dx_root in logical block 0
+# and any dx_node interior blocks) each begin with a single fake
+# ext4_dir_entry_2 whose rec_len pads to end-of-block, so a strictly
+# bounded linear scan naturally skips them and only harvests real
+# entries out of the leaf blocks. See _ext4_dirblock_lookup.
+INODE_I_FLAGS_OFFSET: uint64 = 0x20           # i_flags
+EXT4_INDEX_FL:        uint32 = 0x1000         # dir uses htree index
+
+
+def ext4_inode_flags(buf: Ptr[uint8]) -> uint32:
+    return _ext4_read_u32(cast[Ptr[uint8]](cast[uint64](buf)
+                                           + INODE_I_FLAGS_OFFSET))
+
+
+def ext4_inode_is_htree_dir(buf: Ptr[uint8]) -> int32:
+    if (ext4_inode_flags(buf) & EXT4_INDEX_FL) != 0:
+        return 1
+    return 0
+
+
 # docs/security.md Phase 5: ext4 inode owner/group accessors. Layout
 # is the standard ext4 / ext2 inode struct:
 #   offset 0x02  i_uid       (u16 — low 16 bits of UID)
@@ -458,6 +482,22 @@ def ext4_inode_first_extent_block(buf: Ptr[uint8]) -> uint64:
 # rec_len walks us to the next entry. The last entry in the block
 # has rec_len that spans to end-of-block (consuming the remainder
 # as implicit padding).
+#
+# Multi-block directories: a directory's i_size grows in whole-block
+# increments as it accumulates entries. Once the entries overflow one
+# block ext4 maps a second data block, and so on; each block is a
+# self-contained sequence of records (the last record in EACH block
+# pads its rec_len to that block's end, so a record never straddles a
+# block boundary). The lookup / readdir walks therefore iterate EVERY
+# data block of the directory inode (via the extent walk used for file
+# reads) and scan each block independently — never running a record
+# from one block into the next.
+#
+# On-disk records are UNTRUSTED. Every scan loop below bounds itself
+# strictly: rec_len must be >= the 8-byte header, must not run the
+# record past end-of-block, and name_len must fit inside both the
+# record and the block. A record that violates any of these ends the
+# scan of that block rather than reading out of bounds.
 
 DIR_ENTRY_HDR_BYTES: uint64 = 8
 
@@ -475,14 +515,53 @@ def _name_eq_with_len(a: Ptr[uint8], b: Ptr[uint8], n: uint64) -> int32:
     return 1
 
 
+def _ext4_dirblock_lookup(name: Ptr[char]) -> uint32:
+    # Scan the single directory block already loaded into ext4_blk_buf
+    # for an entry matching `name`. Returns the matched inode number,
+    # or 0 on miss. Every record is bounds-checked against UNTRUSTED
+    # on-disk data: a record whose rec_len can't hold its own header,
+    # runs past end-of-block, or whose name overflows the record/block
+    # ends the scan rather than reading out of bounds.
+    #
+    # htree index blocks (dx_root / dx_node) carry one fake entry that
+    # pads rec_len to end-of-block with no real name to match, so this
+    # linear scan harmlessly skips them — only leaf-block entries hit.
+    pos: uint64 = 0
+    while pos + DIR_ENTRY_HDR_BYTES <= ext4_block_size:
+        e: uint64 = cast[uint64](&ext4_blk_buf[0]) + pos
+        inum: uint32 = _ext4_read_u32(cast[Ptr[uint8]](e + 0))
+        rec_len: uint64 = cast[uint64](_ext4_read_u16(cast[Ptr[uint8]](e + 4)))
+        if rec_len < DIR_ENTRY_HDR_BYTES:
+            break                                  # too small for a header
+        if pos + rec_len > ext4_block_size:
+            break                                  # record runs off block
+        if inum != 0:
+            name_len: uint64 = cast[uint64](cast[Ptr[uint8]](e + 6)[0])
+            # name must fit inside both this record and this block.
+            if DIR_ENTRY_HDR_BYTES + name_len <= rec_len and \
+               pos + DIR_ENTRY_HDR_BYTES + name_len <= ext4_block_size:
+                if _name_eq_with_len(cast[Ptr[uint8]](e + 8),
+                                     cast[Ptr[uint8]](name),
+                                     name_len) != 0:
+                    return inum
+        pos = pos + rec_len
+    return 0
+
+
 def ext4_dir_lookup(dir_inode_buf: Ptr[uint8],
                     name: Ptr[char]) -> uint32:
     # Walk EVERY data block of the directory looking for `name`. A
     # directory's size grows in block-sized chunks as it accumulates
     # entries; ~30 entries fills a 1 KiB block, after which ext4
-    # allocates another block. Walking only block 0 (the M16.51..58
-    # behavior) silently truncates lookups for large dirs. Returns
-    # the matched inode number, or 0 on miss.
+    # allocates another block. Walking only block 0 silently truncates
+    # lookups once a directory overflows its first block, so we iterate
+    # all blocks here. Returns the matched inode number, or 0 on miss.
+    #
+    # htree (EXT4_INDEX_FL) directories are handled by linear-leaf-scan:
+    # we still walk every mapped block, but the index blocks contribute
+    # nothing (their lone fake entry pads to end-of-block), so the real
+    # entries are harvested from the leaf blocks without implementing
+    # htree hashing.
     dir_size: uint64 = cast[uint64](ext4_inode_size_lo(dir_inode_buf))
     if dir_size == 0:
         return 0
@@ -491,23 +570,15 @@ def ext4_dir_lookup(dir_inode_buf: Ptr[uint8],
     while lb < nblocks:
         phys: uint64 = _ext4_logical_to_physical(dir_inode_buf, lb)
         if phys == 0:
-            return 0
+            # Sparse hole in a directory: skip it, keep walking the
+            # remaining mapped blocks rather than aborting the lookup.
+            lb = lb + 1
+            continue
         if _ext4_read_block(phys, &ext4_blk_buf[0]) != 0:
             return 0
-        pos: uint64 = 0
-        while pos + DIR_ENTRY_HDR_BYTES <= ext4_block_size:
-            e: uint64 = cast[uint64](&ext4_blk_buf[0]) + pos
-            inum: uint32 = _ext4_read_u32(cast[Ptr[uint8]](e + 0))
-            rec_len: uint16 = _ext4_read_u16(cast[Ptr[uint8]](e + 4))
-            if rec_len == 0:
-                break                              # advance to next block
-            if inum != 0:
-                name_len: uint64 = cast[uint64](cast[Ptr[uint8]](e + 6)[0])
-                if _name_eq_with_len(cast[Ptr[uint8]](e + 8),
-                                     cast[Ptr[uint8]](name),
-                                     name_len) != 0:
-                    return inum
-            pos = pos + cast[uint64](rec_len)
+        hit: uint32 = _ext4_dirblock_lookup(name)
+        if hit != 0:
+            return hit
         lb = lb + 1
     return 0
 
@@ -1038,28 +1109,36 @@ def ext4_listdir(path: Ptr[char], buf: Ptr[uint8],
     while lb < nblocks:
         phys: uint64 = _ext4_logical_to_physical(&dir_inode[0], lb)
         if phys == 0:
-            return cast[int64](out)
+            # Sparse hole — skip and keep enumerating later blocks.
+            lb = lb + 1
+            continue
         if _ext4_read_block(phys, &ext4_blk_buf[0]) != 0:
             return cast[int64](out)
         pos: uint64 = 0
         while pos + DIR_ENTRY_HDR_BYTES <= ext4_block_size:
             e: uint64 = cast[uint64](&ext4_blk_buf[0]) + pos
             ent_inum: uint32 = _ext4_read_u32(cast[Ptr[uint8]](e + 0))
-            rec_len:  uint16 = _ext4_read_u16(cast[Ptr[uint8]](e + 4))
-            if rec_len == 0:
-                break                              # next block
+            rec_len:  uint64 = cast[uint64](
+                _ext4_read_u16(cast[Ptr[uint8]](e + 4)))
+            if rec_len < DIR_ENTRY_HDR_BYTES:
+                break                              # malformed, next block
+            if pos + rec_len > ext4_block_size:
+                break                              # record runs off block
             if ent_inum != 0:
                 name_len: uint64 = cast[uint64](cast[Ptr[uint8]](e + 6)[0])
-                # Need room for the name + '\n' + leave 1 spare for NUL.
-                if out + name_len + 1 >= count:
-                    return cast[int64](out)
-                i: uint64 = 0
-                while i < name_len:
-                    buf[out + i] = cast[Ptr[uint8]](e + 8 + i)[0]
-                    i = i + 1
-                buf[out + name_len] = 10            # '\n'
-                out = out + name_len + 1
-            pos = pos + cast[uint64](rec_len)
+                # Bound name against record AND block before copying.
+                if DIR_ENTRY_HDR_BYTES + name_len <= rec_len and \
+                   pos + DIR_ENTRY_HDR_BYTES + name_len <= ext4_block_size:
+                    # Need room for the name + '\n' + 1 spare for NUL.
+                    if out + name_len + 1 >= count:
+                        return cast[int64](out)
+                    i: uint64 = 0
+                    while i < name_len:
+                        buf[out + i] = cast[Ptr[uint8]](e + 8 + i)[0]
+                        i = i + 1
+                    buf[out + name_len] = 10        # '\n'
+                    out = out + name_len + 1
+            pos = pos + rec_len
         lb = lb + 1
     return cast[int64](out)
 
@@ -1093,33 +1172,51 @@ def strip_ext_prefix(name: Ptr[char]) -> Ptr[char]:
 
 
 def ext4_dir_dump(dir_inode_buf: Ptr[uint8]):
-    # Read the directory's first data block and print each entry's
-    # name. Only handles single-block dirs for now (no FAT-chain
-    # walk across multiple extents).
-    blk: uint64 = ext4_inode_first_extent_block(dir_inode_buf)
-    if blk == 0:
+    # Print every entry's name across ALL data blocks of the directory
+    # (not just block 0). Walks the inode's extent map block by block,
+    # scanning each block's linear ext4_dir_entry_2 records with strict
+    # bounds against untrusted on-disk data. htree (EXT4_INDEX_FL) dirs
+    # are dumped by linear-leaf-scan: index blocks contribute their lone
+    # fake (inode==0) entry only, so just the real leaf entries print.
+    dir_size: uint64 = cast[uint64](ext4_inode_size_lo(dir_inode_buf))
+    if dir_size == 0:
         printk0("ext4: empty/index directory (M16.54)\n")
         return
-    if _ext4_read_block(blk, &ext4_blk_buf[0]) != 0:
-        printk0("ext4: dir block read failed\n")
-        return
-    pos: uint64 = 0
-    while pos + DIR_ENTRY_HDR_BYTES <= ext4_block_size:
-        e: uint64 = cast[uint64](&ext4_blk_buf[0]) + pos
-        inum: uint32 = _ext4_read_u32(cast[Ptr[uint8]](e + 0))
-        rec_len: uint16 = _ext4_read_u16(cast[Ptr[uint8]](e + 4))
-        if rec_len == 0:
-            return                              # malformed
-        if inum != 0:
-            name_len: uint8 = cast[Ptr[uint8]](e + 6)[0]
-            printk1("  dirent inode=%d name='", cast[uint64](inum))
-            i: uint64 = 0
-            while i < cast[uint64](name_len):
-                printk1("%c",
-                        cast[uint64](cast[Ptr[uint8]](e + 8 + i)[0]))
-                i = i + 1
-            printk0("'\n")
-        pos = pos + cast[uint64](rec_len)
+    if ext4_inode_is_htree_dir(dir_inode_buf) != 0:
+        printk0("ext4: htree dir (linear-leaf-scan)\n")
+    nblocks: uint64 = (dir_size + ext4_block_size - 1) / ext4_block_size
+    lb: uint64 = 0
+    while lb < nblocks:
+        phys: uint64 = _ext4_logical_to_physical(dir_inode_buf, lb)
+        if phys == 0:
+            lb = lb + 1
+            continue
+        if _ext4_read_block(phys, &ext4_blk_buf[0]) != 0:
+            printk0("ext4: dir block read failed\n")
+            return
+        pos: uint64 = 0
+        while pos + DIR_ENTRY_HDR_BYTES <= ext4_block_size:
+            e: uint64 = cast[uint64](&ext4_blk_buf[0]) + pos
+            inum: uint32 = _ext4_read_u32(cast[Ptr[uint8]](e + 0))
+            rec_len: uint64 = cast[uint64](
+                _ext4_read_u16(cast[Ptr[uint8]](e + 4)))
+            if rec_len < DIR_ENTRY_HDR_BYTES:
+                break                              # malformed, next block
+            if pos + rec_len > ext4_block_size:
+                break                              # record runs off block
+            if inum != 0:
+                name_len: uint64 = cast[uint64](cast[Ptr[uint8]](e + 6)[0])
+                if DIR_ENTRY_HDR_BYTES + name_len <= rec_len and \
+                   pos + DIR_ENTRY_HDR_BYTES + name_len <= ext4_block_size:
+                    printk1("  dirent inode=%d name='", cast[uint64](inum))
+                    i: uint64 = 0
+                    while i < name_len:
+                        printk1("%c",
+                                cast[uint64](cast[Ptr[uint8]](e + 8 + i)[0]))
+                        i = i + 1
+                    printk0("'\n")
+            pos = pos + rec_len
+        lb = lb + 1
 
 
 # --- block bitmap (M16.61) ----------------------------------------
@@ -3023,6 +3120,228 @@ def ext4_journal_selftest() -> int32:
     printk0("[ext4_journal] OK torn txn rolled back (fs block unchanged)\n")
 
     printk0("[ext4_journal] PASS crash-consistency (commit survives, torn rolls back)\n")
+    return 0
+
+
+# --- multi-block directory self-test ------------------------------
+#
+# Proves the linear multi-block directory walk: a host-minted ext4
+# image (scripts/test_ext4dir.sh) carries /bigdir populated with many
+# short-named files so the directory inode spans several data blocks.
+# Two extra files at root carry the ground truth this test asserts
+# against, so the script and kernel never disagree on a hardcoded
+# constant:
+#
+#   /bigdir-count.txt  — decimal count of regular files in /bigdir
+#                        (one line). readdir must enumerate EXACTLY
+#                        this many entries (excluding . and ..).
+#   /bigdir-last.txt   — the NAME of a file that the host placed in
+#                        the LAST data block of /bigdir; its payload is
+#                        that same name. We resolve /bigdir/<thatname>
+#                        by name (forcing the walk past block 0) and
+#                        assert the bytes read back equal the name.
+#
+# A second pass also runs against /htreedir when the host built one
+# with dir_index enabled (EXT4_INDEX_FL), proving htree-flagged dirs
+# are walked by linear-leaf-scan rather than misread as linear.
+
+ext4_dirmb_listbuf: Array[16384, uint8]
+ext4_dirmb_namebuf: Array[256, uint8]
+ext4_dirmb_readbuf: Array[256, uint8]
+
+
+def _ext4_dirmb_parse_uint(buf: Ptr[uint8], n: uint64) -> uint64:
+    # Parse a leading decimal integer out of buf[0..n]. Stops at the
+    # first non-digit (newline, NUL, etc). Bounded by n.
+    v: uint64 = 0
+    i: uint64 = 0
+    while i < n:
+        c: uint8 = buf[i]
+        if c < 48 or c > 57:
+            break
+        v = v * 10 + cast[uint64](c - 48)
+        i = i + 1
+    return v
+
+
+def _ext4_dirmb_count_lines(buf: Ptr[uint8], n: uint64) -> uint64:
+    # Count '\n'-terminated lines in buf[0..n].
+    cnt: uint64 = 0
+    i: uint64 = 0
+    while i < n:
+        if buf[i] == 10:
+            cnt = cnt + 1
+        i = i + 1
+    return cnt
+
+
+def _ext4_dirmb_nblocks_for(path: Ptr[char]) -> uint64:
+    # How many data blocks the directory at `path` spans (0 on miss).
+    dir_inum: uint32 = ext4_resolve_dir(path)
+    if dir_inum == 0:
+        return 0
+    dnode: Array[256, uint8]
+    if ext4_read_inode(cast[uint64](dir_inum), &dnode[0]) != 0:
+        return 0
+    dsz: uint64 = cast[uint64](ext4_inode_size_lo(&dnode[0]))
+    if dsz == 0:
+        return 0
+    return (dsz + ext4_block_size - 1) / ext4_block_size
+
+
+def _ext4_dirmb_read_root_line(name: Ptr[char],
+                               out: Ptr[uint8], cap: uint64) -> int64:
+    # Read the file at root-relative `name` into out (NUL-terminated),
+    # stripping a single trailing newline. Returns the trimmed length,
+    # or -1 on miss.
+    inum: uint32 = 0
+    fsz: uint64 = 0
+    if ext4_resolve_file(name, &inum, &fsz) == 0:
+        return -1
+    take: uint64 = fsz
+    if take > cap - 1:
+        take = cap - 1
+    n: int64 = ext4_read_file(inum, 0, take, out)
+    if n < 0:
+        return -1
+    ln: uint64 = cast[uint64](n)
+    if ln > 0 and out[ln - 1] == 10:
+        ln = ln - 1
+    out[ln] = 0
+    return cast[int64](ln)
+
+
+def _ext4_dirmb_check_one(dirpath: Ptr[char], label: Ptr[char],
+                          want_count: uint64,
+                          last_name: Ptr[char],
+                          last_len: uint64) -> int32:
+    # Run the assertions for one populated directory. Returns 0 on
+    # PASS, -1 on FAIL (with a printed reason).
+    nblk: uint64 = _ext4_dirmb_nblocks_for(dirpath)
+    if nblk < 3:
+        printk2("[ext4dir] FAIL: %s spans only %d block(s), need >= 3\n",
+                cast[uint64](cast[Ptr[uint8]](label)), nblk)
+        return -1
+    printk2("[ext4dir] %s spans %d data blocks\n",
+            cast[uint64](cast[Ptr[uint8]](label)), nblk)
+
+    # (a) readdir: enumerate ALL entries; count must match ground truth
+    # (the host's count EXCLUDES . and .., so subtract 2).
+    listed: int64 = ext4_listdir(dirpath, &ext4_dirmb_listbuf[0], 16384)
+    if listed < 0:
+        printk1("[ext4dir] FAIL: listdir rc=%d\n", cast[uint64](listed))
+        return -1
+    lines: uint64 = _ext4_dirmb_count_lines(&ext4_dirmb_listbuf[0],
+                                            cast[uint64](listed))
+    if lines < 2:
+        printk0("[ext4dir] FAIL: readdir missing . / ..\n")
+        return -1
+    got: uint64 = lines - 2                     # drop '.' and '..'
+    if got != want_count:
+        printk2("[ext4dir] FAIL: readdir counted %d entries, want %d\n",
+                got, want_count)
+        return -1
+    printk1("[ext4dir] readdir enumerated all %d files across every block\n",
+            got)
+
+    # (b) lookup: resolve the file the host placed in the LAST block by
+    # name (forces the walk past block 0) and read its payload back.
+    # Build the path "<dirpath>/<last_name>" in a scratch buffer.
+    p: uint64 = 0
+    dp: Ptr[uint8] = cast[Ptr[uint8]](dirpath)
+    while dp[p] != 0 and p < 200:
+        ext4_dirmb_namebuf[p] = dp[p]
+        p = p + 1
+    ext4_dirmb_namebuf[p] = 47                   # '/'
+    p = p + 1
+    k: uint64 = 0
+    ln: Ptr[uint8] = cast[Ptr[uint8]](last_name)
+    while k < last_len and p < 254:
+        ext4_dirmb_namebuf[p] = ln[k]
+        p = p + 1
+        k = k + 1
+    ext4_dirmb_namebuf[p] = 0
+
+    inum: uint32 = 0
+    fsz: uint64 = 0
+    if ext4_resolve_file(cast[Ptr[char]](&ext4_dirmb_namebuf[0]),
+                         &inum, &fsz) == 0:
+        printk0("[ext4dir] FAIL: last-block file did not resolve by name\n")
+        return -1
+    rn: int64 = ext4_read_file(inum, 0, 255, &ext4_dirmb_readbuf[0])
+    if rn < 0:
+        printk0("[ext4dir] FAIL: last-block file read error\n")
+        return -1
+    rl: uint64 = cast[uint64](rn)
+    # Payload on disk == the file's own name (the host wrote it so).
+    if rl != last_len:
+        printk2("[ext4dir] FAIL: last-block payload len %d != %d\n",
+                rl, last_len)
+        return -1
+    j: uint64 = 0
+    while j < last_len:
+        if ext4_dirmb_readbuf[j] != ln[j]:
+            printk0("[ext4dir] FAIL: last-block payload mismatch\n")
+            return -1
+        j = j + 1
+    printk1("[ext4dir] last-block file resolved by name and read OK (%d bytes)\n",
+            rl)
+    return 0
+
+
+def ext4_dirmb_selftest() -> int32:
+    # Driven by /etc/ext4dir-test. Asserts multi-block linear directory
+    # support against the host-minted image. Prints [ext4dir] PASS on
+    # success; any FAIL line + non-PASS means the test script fails.
+    if ext4_blockdev_slot < 0:
+        printk0("[ext4dir] FAIL: ext4 not mounted\n")
+        return -1
+
+    # Ground truth for /bigdir (the must-have linear multi-block case).
+    cbuf: Array[64, uint8]
+    if _ext4_dirmb_read_root_line("bigdir-count.txt", &cbuf[0], 64) < 0:
+        printk0("[ext4dir] FAIL: bigdir-count.txt missing\n")
+        return -1
+    want: uint64 = _ext4_dirmb_parse_uint(&cbuf[0], 64)
+    lbuf: Array[64, uint8]
+    llen: int64 = _ext4_dirmb_read_root_line("bigdir-last.txt", &lbuf[0], 64)
+    if llen < 0:
+        printk0("[ext4dir] FAIL: bigdir-last.txt missing\n")
+        return -1
+
+    if _ext4_dirmb_check_one("bigdir", "bigdir(linear)", want,
+                             cast[Ptr[char]](&lbuf[0]),
+                             cast[uint64](llen)) != 0:
+        return -1
+
+    # Optional second pass: an htree (dir_index) directory. Present only
+    # when the host built /htreedir with -O dir_index. We require its
+    # inode to actually carry EXT4_INDEX_FL, proving we walk a real
+    # htree by linear-leaf-scan (not a coincidentally-linear dir).
+    ht_inum: uint32 = ext4_resolve_dir("htreedir")
+    if ht_inum != 0:
+        htnode: Array[256, uint8]
+        if ext4_read_inode(cast[uint64](ht_inum), &htnode[0]) == 0:
+            if ext4_inode_is_htree_dir(&htnode[0]) != 0:
+                printk0("[ext4dir] htreedir carries EXT4_INDEX_FL (htree)\n")
+                hcbuf: Array[64, uint8]
+                if _ext4_dirmb_read_root_line("htreedir-count.txt",
+                                              &hcbuf[0], 64) >= 0:
+                    hwant: uint64 = _ext4_dirmb_parse_uint(&hcbuf[0], 64)
+                    hlbuf: Array[64, uint8]
+                    hllen: int64 = _ext4_dirmb_read_root_line(
+                        "htreedir-last.txt", &hlbuf[0], 64)
+                    if hllen >= 0:
+                        if _ext4_dirmb_check_one(
+                                "htreedir", "htreedir(htree)", hwant,
+                                cast[Ptr[char]](&hlbuf[0]),
+                                cast[uint64](hllen)) != 0:
+                            return -1
+                        printk0("[ext4dir] htree-flagged dir walked by linear-leaf-scan OK\n")
+            else:
+                printk0("[ext4dir] note: htreedir present but not INDEX-flagged; skipping htree assertion\n")
+
+    printk0("[ext4dir] PASS\n")
     return 0
 
 

@@ -384,6 +384,18 @@ if os.environ.get("ENABLE_FIREWALL_TEST") == "1":
 if os.environ.get("ENABLE_EXT4_JOURNAL_TEST") == "1":
     FILES.append(("/etc/ext4-journal-test", b"1\n"))
 
+# Multi-block ext4 directory walk self-test. scripts/test_ext4dir.sh
+# sets ENABLE_EXT4DIR_TEST=1 to plant /etc/ext4dir-test. init/main.ad
+# detects the marker after the ext4 mount and calls ext4_dirmb_selftest()
+# (fs/ext4.ad): it walks a host-minted /bigdir that spans several data
+# blocks, asserting readdir enumerates EVERY block's entries (not just
+# block 0) and that a file the host placed in the LAST block resolves by
+# name and reads back correctly. Read-only, but it expects the special
+# test image attached on virtio, so it is opt-in. Default boots omit the
+# marker so it never fires unintentionally.
+if os.environ.get("ENABLE_EXT4DIR_TEST") == "1":
+    FILES.append(("/etc/ext4dir-test", b"1\n"))
+
 # Partition write-smoke fixtures (mkpart MBR on sd0, gpt on nvme0n1).
 # These WRITE a partition table onto a freshly-registered disk that has
 # no MBR, so they must NEVER run on production media. Set
