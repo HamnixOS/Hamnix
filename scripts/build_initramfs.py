@@ -743,6 +743,16 @@ if os.environ.get("ENABLE_TMPFS_LINK_TEST") == "1":
 if os.environ.get("ENABLE_STATFS_TEST") == "1":
     FILES.append(("/etc/statfs-test", b"1\n"))
 
+# getrusage(2) CPU-time self-test. scripts/test_rusage.sh sets
+# ENABLE_RUSAGE_TEST=1 to plant /etc/rusage-test. init/main.ad at
+# boot:37.ru detects the marker and calls rusage_selftest()
+# (linux_abi/u_syscalls.ad): it lets the timer ISR accrue a few system
+# ticks to the boot task, then drives _u_getrusage and asserts ru_stime
+# advanced (real per-task CPU-time accounting) and the unsupported tail
+# stayed zeroed. Needs no extra device; default boots omit the marker.
+if os.environ.get("ENABLE_RUSAGE_TEST") == "1":
+    FILES.append(("/etc/rusage-test", b"1\n"))
+
 # access(2) mode-bit self-test. scripts/test_access_mode.sh sets
 # ENABLE_ACCESS_MODE_TEST=1 to plant /etc/access-mode-test. init/main.ad
 # at boot:37.acc detects the marker after the ext4 mount and calls
