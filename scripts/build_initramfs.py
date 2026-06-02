@@ -818,6 +818,16 @@ if os.environ.get("ENABLE_BLKIO_TEST") == "1":
 if os.environ.get("ENABLE_NSIGNALS_TEST") == "1":
     FILES.append(("/etc/nsignals-test", b"1\n"))
 
+# getrusage(2) RUSAGE_CHILDREN self-test. scripts/test_ruchild.sh sets
+# ENABLE_RUCHILD_TEST=1 to plant /etc/ruchild-test. init/main.ad detects the
+# marker and calls ruchild_selftest() (linux_abi/u_syscalls.ad): it seeds the
+# boot task's child accumulators (cutime/cstime/cminflt/cmajflt) with known
+# sentinels, calls _u_getrusage with who=RUSAGE_CHILDREN, asserts the child
+# counters land in ru_utime/ru_stime/ru_minflt/ru_majflt, then emits the
+# [RUCHILD] PASS banner. Default boots omit the marker.
+if os.environ.get("ENABLE_RUCHILD_TEST"):
+    FILES.append(("/etc/ruchild-test", b"1\n"))
+
 # vsize/rss + ru_maxrss self-test. scripts/test_vmstat.sh sets
 # ENABLE_VMSTAT_TEST=1 to plant /etc/vmstat-test. init/main.ad at
 # boot:37.vmstat detects the marker and calls vmstat_selftest()
