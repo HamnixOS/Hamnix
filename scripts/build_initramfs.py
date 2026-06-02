@@ -422,6 +422,19 @@ if os.environ.get("ENABLE_NOTEPG_TEST") == "1":
 if os.environ.get("ENABLE_AHCI_NCQ_TEST") == "1":
     FILES.append(("/etc/ahci-ncq-test", b"ENABLE_AHCI_NCQ_TEST=1\n"))
 
+# AHCI generic block-layer round-trip self-test. scripts/test_ahci_blk.sh
+# sets ENABLE_AHCI_BLK_TEST=1 to plant /etc/ahci-blk-test. init/main.ad at
+# boot:37.ablk detects the marker and calls ahci_blk_selftest()
+# (drivers/ata/ahci.ad): it resolves the AHCI port THROUGH the kernel block
+# layer (find_blockdev("sd0")), writes a known pattern via the generic
+# blk_write_sectors vtable dispatch (NOT ahci_write_sectors directly), reads
+# it back via blk_read_sectors, and byte-compares — proving the AHCI port's
+# register_blockdev() wiring lands ext4/fat-class block I/O on the real SATA
+# disk. Requires the test to attach a QEMU ich9-ahci disk. Default boots omit
+# the marker so it never fires.
+if os.environ.get("ENABLE_AHCI_BLK_TEST") == "1":
+    FILES.append(("/etc/ahci-blk-test", b"1\n"))
+
 # Plan-9 namespace bind/mount/unmount self-test. scripts/test_bind.sh sets
 # ENABLE_BIND_TEST=1 to plant /etc/bind-test plus two source directories
 # of fixture files. init/main.ad at boot:37.bind detects the marker and
