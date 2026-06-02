@@ -301,6 +301,17 @@ if os.environ.get("ENABLE_MMAP_FILE_TEST") == "1":
 if os.environ.get("ENABLE_MMAP_SHARED_TEST") == "1":
     FILES.append(("/etc/mmap-shared-test", b"1\n"))
 
+# /proc/cpuinfo real-CPUID self-test. scripts/test_cpuinfo.sh sets
+# ENABLE_CPUINFO_TEST=1 to plant /etc/cpuinfo-test. init/main.ad at
+# boot:37.cpi detects it and calls cpuinfo_selftest() (fs/procfs.ad),
+# which renders /proc/cpuinfo into a scratch buffer and asserts the
+# real CPUID vendor string is present (NOT the literal "Hamnix"), that
+# "processor\t: 0" appears, and that the processor-line count equals
+# the SMP online CPU count. Prints "[CPUINFO] PASS" / "[CPUINFO] FAIL".
+# Default boots omit the marker so the self-test is a no-op elsewhere.
+if os.environ.get("ENABLE_CPUINFO_TEST") == "1":
+    FILES.append(("/etc/cpuinfo-test", b"1\n"))
+
 # linux-abi U-ABI fills self-test. scripts/test_uabi_fills.sh sets
 # ENABLE_UABI_FILLS_TEST=1 to plant /etc/uabi-fills-test. init/main.ad at
 # boot:37.uaf detects the marker and calls uabi_fills_selftest()

@@ -23,9 +23,11 @@ from kernel.sched.core import (
     STATE_FREE, STATE_READY, STATE_RUNNING, STATE_EXITED,
     task_state, task_pid_at, task_name0_at, task_table_size,
 )
-from arch.x86.kernel.time import get_jiffies
+from arch.x86.kernel.time import get_jiffies, tsc_hz_get
+from arch.x86.kernel.smp import get_cpus_online
 from mm.page_alloc import page_alloc_total, page_alloc_free_count
 from kernel.printk.printk_log import printk_log_snapshot, PRINTK_LOG_SIZE
+from kernel.printk.printk import printk0, printk2
 # /proc/realtime: wall-clock now + ISO-8601 rendering. The drivers/rtc
 # layer captures the boot epoch from CMOS at boot; time_realtime_seconds()
 # adds the TSC monotonic delta to give a live wall clock.
@@ -42,6 +44,10 @@ from sys.src.port9.port.chan import (
 )
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+
+# CPUID dispatcher (asm); same one arch/x86/kernel/smp.ad declares.
+# out[4] = {eax, ebx, ecx, edx} for the requested leaf/subleaf.
+extern def cpuid_get(leaf: uint32, subleaf: uint32, out: Ptr[uint32])
 
 
 # -------------------------------------------------------------------
@@ -663,17 +669,277 @@ def render_meminfo(buf: Ptr[uint8]) -> uint64:
     return pos
 
 
+# --- /proc/cpuinfo: real CPUID identity + per-CPU SMP enumeration ---
+#
+# We mirror arch/x86/kernel/cpu/proc.c: one stanza per online logical
+# CPU, with identity fields derived from real CPUID leaves. The CPUID
+# identity is the same across cores on the symmetric SMP VMs we run
+# (and on uniform silicon), which is exactly what Linux reports too —
+# only the `processor :` index differs per stanza.
+#
+# Tab layout matches Linux byte-for-byte: most keys use a single \t,
+# but `model name` and `cpu MHz` use \t\t because their key text is
+# short enough that Linux pads them to the column with a second tab.
+# `nproc` counts `^processor` lines; `lscpu` parses vendor_id /
+# model name / cpu family / model / stepping.
+
+def _cpuid_put_reg(buf: Ptr[uint8], pos: uint64, reg: uint32) -> uint64:
+    # Append the 4 little-endian bytes of a 32-bit CPUID register as
+    # ASCII chars. byte 0 (low 8 bits) is the first character — this is
+    # how the vendor/brand strings are laid out in EBX/EDX/ECX etc.
+    out: uint64 = pos
+    i: uint64 = 0
+    while i < 4:
+        c: uint8 = cast[uint8]((reg >> (i * 8)) & 0xFF)
+        if c == 0:
+            return out
+        buf[out] = c
+        out = out + 1
+        i = i + 1
+    return out
+
+
+def _cpuinfo_put_vendor(buf: Ptr[uint8], pos: uint64) -> uint64:
+    # CPUID leaf 0: 12-char vendor string in EBX, EDX, ECX (that order).
+    # "GenuineIntel" = EBX="Genu", EDX="ineI", ECX="ntel".
+    leaf0: Array[4, uint32]
+    cpuid_get(cast[uint32](0), cast[uint32](0), &leaf0[0])
+    out: uint64 = pos
+    out = _cpuid_put_reg(buf, out, leaf0[1])      # EBX
+    out = _cpuid_put_reg(buf, out, leaf0[3])      # EDX
+    out = _cpuid_put_reg(buf, out, leaf0[2])      # ECX
+    return out
+
+
+def _cpuinfo_put_brand(buf: Ptr[uint8], pos: uint64) -> uint64:
+    # CPUID extended leaves 0x80000002/3/4 hold the 48-byte brand
+    # string (16 bytes per leaf, EAX/EBX/ECX/EDX). Only valid when
+    # leaf 0x80000000 EAX >= 0x80000004; else fall back to a generic
+    # truthful label.
+    ext: Array[4, uint32]
+    cpuid_get(cast[uint32](0x80000000), cast[uint32](0), &ext[0])
+    if ext[0] < cast[uint32](0x80000004):
+        return _buf_put_str(buf, pos, "x86_64 generic")
+    out: uint64 = pos
+    leaf: uint32 = cast[uint32](0x80000002)
+    n: uint64 = 0
+    while n < 3:
+        regs: Array[4, uint32]
+        cpuid_get(leaf, cast[uint32](0), &regs[0])
+        out = _cpuid_put_reg(buf, out, regs[0])   # EAX
+        out = _cpuid_put_reg(buf, out, regs[1])   # EBX
+        out = _cpuid_put_reg(buf, out, regs[2])   # ECX
+        out = _cpuid_put_reg(buf, out, regs[3])   # EDX
+        leaf = leaf + cast[uint32](1)
+        n = n + 1
+    return out
+
+
+def _cpuinfo_render_one(buf: Ptr[uint8], pos: uint64, idx: uint64) -> uint64:
+    # Render a single processor stanza. CPUID identity fields are read
+    # fresh per stanza but are uniform across logical CPUs on the SMP
+    # VMs we target (same as Linux on symmetric silicon).
+    leaf1: Array[4, uint32]
+    cpuid_get(cast[uint32](1), cast[uint32](0), &leaf1[0])
+    eax: uint32 = leaf1[0]
+
+    base_family: uint64 = cast[uint64]((eax >> 8) & cast[uint32](0xF))
+    ext_family:  uint64 = cast[uint64]((eax >> 20) & cast[uint32](0xFF))
+    family: uint64 = base_family
+    if base_family == 0xF:
+        family = base_family + ext_family
+
+    base_model: uint64 = cast[uint64]((eax >> 4) & cast[uint32](0xF))
+    ext_model:  uint64 = cast[uint64]((eax >> 16) & cast[uint32](0xF))
+    model: uint64 = base_model
+    if base_family == 0xF or base_family == 6:
+        model = base_model | (ext_model << 4)
+
+    stepping: uint64 = cast[uint64](eax & cast[uint32](0xF))
+
+    pos2: uint64 = pos
+    pos2 = _buf_put_str(buf, pos2, "processor\t: ")
+    pos2 = _buf_put_dec(buf, pos2, idx)
+    buf[pos2] = 10
+    pos2 = pos2 + 1
+
+    pos2 = _buf_put_str(buf, pos2, "vendor_id\t: ")
+    pos2 = _cpuinfo_put_vendor(buf, pos2)
+    buf[pos2] = 10
+    pos2 = pos2 + 1
+
+    pos2 = _buf_put_str(buf, pos2, "cpu family\t: ")
+    pos2 = _buf_put_dec(buf, pos2, family)
+    buf[pos2] = 10
+    pos2 = pos2 + 1
+
+    pos2 = _buf_put_str(buf, pos2, "model\t\t: ")
+    pos2 = _buf_put_dec(buf, pos2, model)
+    buf[pos2] = 10
+    pos2 = pos2 + 1
+
+    pos2 = _buf_put_str(buf, pos2, "model name\t: ")
+    pos2 = _cpuinfo_put_brand(buf, pos2)
+    buf[pos2] = 10
+    pos2 = pos2 + 1
+
+    pos2 = _buf_put_str(buf, pos2, "stepping\t: ")
+    pos2 = _buf_put_dec(buf, pos2, stepping)
+    buf[pos2] = 10
+    pos2 = pos2 + 1
+
+    # cpu MHz from the calibrated TSC if available, else a fallback.
+    hz: uint64 = tsc_hz_get()
+    mhz: uint64 = 1000
+    if hz != 0:
+        mhz = hz / 1000000
+    pos2 = _buf_put_str(buf, pos2, "cpu MHz\t\t: ")
+    pos2 = _buf_put_dec(buf, pos2, mhz)
+    buf[pos2] = 10
+    pos2 = pos2 + 1
+
+    # A small, real flag subset derived from CPUID.01h EDX/ECX. lscpu
+    # and friends scan this line; we emit only architecturally-stable
+    # bits to keep the change tight.
+    edx: uint32 = leaf1[3]
+    ecx: uint32 = leaf1[2]
+    pos2 = _buf_put_str(buf, pos2, "flags\t\t:")
+    if (edx & cast[uint32](0x00000001)) != 0:
+        pos2 = _buf_put_str(buf, pos2, " fpu")
+    if (edx & cast[uint32](0x00000010)) != 0:
+        pos2 = _buf_put_str(buf, pos2, " tsc")
+    if (edx & cast[uint32](0x00000020)) != 0:
+        pos2 = _buf_put_str(buf, pos2, " msr")
+    if (edx & cast[uint32](0x02000000)) != 0:
+        pos2 = _buf_put_str(buf, pos2, " sse")
+    if (edx & cast[uint32](0x04000000)) != 0:
+        pos2 = _buf_put_str(buf, pos2, " sse2")
+    if (ecx & cast[uint32](0x00000001)) != 0:
+        pos2 = _buf_put_str(buf, pos2, " sse3")
+    if (ecx & cast[uint32](0x80000000)) != 0:
+        pos2 = _buf_put_str(buf, pos2, " hypervisor")
+    buf[pos2] = 10
+    pos2 = pos2 + 1
+
+    # Blank line between stanzas, matching Linux.
+    buf[pos2] = 10
+    pos2 = pos2 + 1
+    return pos2
+
+
 def render_cpuinfo(buf: Ptr[uint8]) -> uint64:
-    # Static for now: SMP enumeration through CPUID/MADT lands later.
-    # The tab between key and ':' is what /usr/bin/lscpu et al expect;
-    # Linux's arch/x86/kernel/cpu/proc.c emits the exact same shape.
+    # One stanza per online logical CPU. SMP count comes from the live
+    # boot-state counter the AP bring-up bumps (smp.ad cpus_online).
+    ncpu: uint64 = get_cpus_online()
+    if ncpu == 0:
+        ncpu = 1
     pos: uint64 = 0
-    pos = _buf_put_str(buf, pos, "processor\t: 0\n")
-    pos = _buf_put_str(buf, pos, "vendor_id\t: Hamnix\n")
-    pos = _buf_put_str(buf, pos, "cpu family\t: 6\n")
-    pos = _buf_put_str(buf, pos, "model name\t: x86_64 generic\n")
-    pos = _buf_put_str(buf, pos, "cpu MHz\t\t: 1000\n")
+    i: uint64 = 0
+    while i < ncpu:
+        pos = _cpuinfo_render_one(buf, pos, i)
+        i = i + 1
     return pos
+
+
+def cpuinfo_selftest() -> int32:
+    # Boot self-test for the real /proc/cpuinfo renderer. Renders into a
+    # scratch buffer and asserts:
+    #   * a REAL vendor string is present (CPUID leaf-0, not "Hamnix")
+    #   * "processor\t: 0" appears
+    #   * the count of "processor\t:" lines == get_cpus_online()
+    # printk0 a single PASS/FAIL line.
+    sbuf: Array[4096, uint8]
+    n: uint64 = render_cpuinfo(&sbuf[0])
+
+    # Must not be the old literal placeholder vendor.
+    if _cpuinfo_buf_contains(&sbuf[0], n, "Hamnix") != 0:
+        printk0("[CPUINFO] FAIL placeholder vendor present\n")
+        return 0
+
+    # Real vendor: derive leaf-0 string and confirm it's in the output.
+    vbuf: Array[16, uint8]
+    vn: uint64 = _cpuinfo_put_vendor(&vbuf[0], 0)
+    vbuf[vn] = 0
+    if vn == 0:
+        printk0("[CPUINFO] FAIL empty vendor\n")
+        return 0
+    if _cpuinfo_buf_contains(&sbuf[0], n, &vbuf[0]) == 0:
+        printk0("[CPUINFO] FAIL real vendor missing\n")
+        return 0
+
+    # processor : 0 stanza header present.
+    if _cpuinfo_buf_contains(&sbuf[0], n, "processor\t: 0") == 0:
+        printk0("[CPUINFO] FAIL processor 0 header missing\n")
+        return 0
+
+    # processor-line count == SMP online count.
+    pcount: uint64 = _cpuinfo_count_proc_lines(&sbuf[0], n)
+    ncpu: uint64 = get_cpus_online()
+    if ncpu == 0:
+        ncpu = 1
+    if pcount != ncpu:
+        printk2("[CPUINFO] FAIL proc-lines %d != cpus %d\n", pcount, ncpu)
+        return 0
+
+    printk2("[CPUINFO] PASS vendor ok, %d processor stanza(s), cpus=%d\n",
+            pcount, ncpu)
+    return 1
+
+
+def _cpuinfo_buf_contains(buf: Ptr[uint8], n: uint64, needle: Ptr[uint8]) -> int32:
+    # Naive substring search over the first n bytes of buf.
+    m: uint64 = _str_len(needle)
+    if m == 0:
+        return 1
+    if m > n:
+        return 0
+    i: uint64 = 0
+    while i + m <= n:
+        j: uint64 = 0
+        while j < m:
+            if buf[i + j] != needle[j]:
+                j = m + 1
+            else:
+                j = j + 1
+        if j == m:
+            return 1
+        i = i + 1
+    return 0
+
+
+def _cpuinfo_count_proc_lines(buf: Ptr[uint8], n: uint64) -> uint64:
+    # Count occurrences of a line starting with "processor\t:" — the
+    # same shape `nproc` counts. A match requires being at buf start or
+    # right after a newline.
+    cnt: uint64 = 0
+    i: uint64 = 0
+    while i < n:
+        at_line_start: int32 = 0
+        if i == 0:
+            at_line_start = 1
+        else:
+            if buf[i - 1] == 10:
+                at_line_start = 1
+        if at_line_start != 0:
+            if _cpuinfo_match_proc_at(buf, n, i) != 0:
+                cnt = cnt + 1
+        i = i + 1
+    return cnt
+
+
+def _cpuinfo_match_proc_at(buf: Ptr[uint8], n: uint64, off: uint64) -> int32:
+    # Match the literal "processor\t:" at buf[off..].
+    pat: Array[12, uint8]
+    pn: uint64 = _buf_put_str(&pat[0], 0, "processor\t:")
+    pat[pn] = 0
+    if off + pn > n:
+        return 0
+    k: uint64 = 0
+    while k < pn:
+        if buf[off + k] != pat[k]:
+            return 0
+        k = k + 1
+    return 1
 
 
 def render_kmsg(buf: Ptr[uint8], max: uint64) -> uint64:
