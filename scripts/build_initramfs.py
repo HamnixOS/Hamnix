@@ -627,6 +627,17 @@ if os.environ.get("ENABLE_FAT32_MKFS_TEST") == "1":
 if os.environ.get("ENABLE_FAT_DIRGROW_TEST") == "1":
     FILES.append(("/etc/fat-dirgrow-test", b"1\n"))
 
+# sysinfo(2) live-accounting self-test. scripts/test_sysinfo.sh sets
+# ENABLE_SYSINFO_TEST=1 to plant /etc/sysinfo-test. init/main.ad at
+# boot:37.sysi detects the marker and calls sysinfo_selftest()
+# (linux_abi/u_syscalls.ad): it drives _u_sysinfo against a poisoned
+# buffer and asserts mem_unit==1, totalram==page_alloc_total()*4096 (>0),
+# 0 < freeram <= totalram, and procs>=1 — proving the struct sysinfo is
+# filled from live kernel accounting, not hardcoded constants. Needs no
+# block device. Default boots omit the marker so it never fires.
+if os.environ.get("ENABLE_SYSINFO_TEST") == "1":
+    FILES.append(("/etc/sysinfo-test", b"1\n"))
+
 # Plan-9 namespace bind/mount/unmount self-test. scripts/test_bind.sh sets
 # ENABLE_BIND_TEST=1 to plant /etc/bind-test plus two source directories
 # of fixture files. init/main.ad at boot:37.bind detects the marker and
