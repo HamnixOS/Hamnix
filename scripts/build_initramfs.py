@@ -472,6 +472,16 @@ if os.environ.get("ENABLE_NSCAP_TEST") == "1":
 if os.environ.get("ENABLE_FIREWALL_TEST") == "1":
     FILES.append(("/etc/firewall-test", b"ENABLE_FIREWALL_TEST=1\n"))
 
+# /net local-address renderer self-test. scripts/test_devnet_local.sh sets
+# ENABLE_DEVNET_LOCAL_TEST=1 to plant /etc/devnet-local-test. init/main.ad at
+# boot:37.dnl detects the marker and calls devnet_local_selftest()
+# (drivers/net/devnet.ad): it sets a known host IP (10.0.2.15), clones a
+# /net/tcp conn, renders its /local file via devnet_local_render, and asserts
+# the output reports the REAL host IP ("10.0.2.15!") instead of the old
+# 0.0.0.0 placeholder. Default boots omit the marker so it never fires.
+if os.environ.get("ENABLE_DEVNET_LOCAL_TEST") == "1":
+    FILES.append(("/etc/devnet-local-test", b"ENABLE_DEVNET_LOCAL_TEST=1\n"))
+
 # §13: per-device block-I/O accounting self-test. scripts/test_diskstats.sh
 # sets ENABLE_DISKSTATS_TEST=1 to plant /etc/diskstats-test. init/main.ad at
 # boot:37.ds detects the marker and calls blk_diskstats_selftest()
