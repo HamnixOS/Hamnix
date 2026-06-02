@@ -753,6 +753,16 @@ if os.environ.get("ENABLE_STATFS_TEST") == "1":
 if os.environ.get("ENABLE_RUSAGE_TEST") == "1":
     FILES.append(("/etc/rusage-test", b"1\n"))
 
+# /proc/<pid>/stat CPU-time self-test. scripts/test_procstat_cpu.sh sets
+# ENABLE_PROCSTAT_CPU_TEST=1 to plant /etc/procstat-cpu-test. init/main.ad
+# at boot:37.pscpu detects the marker and calls procstat_cpu_selftest()
+# (sys/src/9/port/devproc.ad): it lets the timer ISR accrue a few system
+# ticks to the boot task, renders _emit_linux_stat for the boot slot, and
+# asserts /proc/<pid>/stat field 15 (stime) is the real tick count, not 0.
+# Needs no extra device; default boots omit the marker.
+if os.environ.get("ENABLE_PROCSTAT_CPU_TEST") == "1":
+    FILES.append(("/etc/procstat-cpu-test", b"1\n"))
+
 # times(2) CPU-time self-test. scripts/test_times.sh sets
 # ENABLE_TIMES_TEST=1 to plant /etc/times-test. init/main.ad at
 # boot:37.times detects the marker and calls times_selftest()
