@@ -167,6 +167,18 @@ def main():
     out = args.out or (os.path.splitext(args.video)[0] + ".ocr.txt")
     if args.debug_frames:
         os.makedirs(args.debug_frames, exist_ok=True)
+        # Wipe PNGs from any previous run so the dir only ever holds THIS
+        # run's chosen frames. Without this, stale page_NNNN/frame_NNNNNN
+        # images linger (only same-named labels get overwritten) and make
+        # the folder look unchanged — masking a fresh capture.
+        stale = 0
+        for fn in os.listdir(args.debug_frames):
+            if fn.endswith(".png"):
+                os.remove(os.path.join(args.debug_frames, fn))
+                stale += 1
+        if stale:
+            print(f"[ocr] cleared {stale} stale frame PNG(s) from "
+                  f"{args.debug_frames}", file=sys.stderr)
 
     cap = cv2.VideoCapture(args.video)
     if not cap.isOpened():

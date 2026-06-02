@@ -426,6 +426,62 @@ _XR_OP_CONFIG:  uint64 = 0x38     # u32 Max Device Slots Enabled
 _XR_CMD_RS:     uint32 = 0x01     # Run/Stop
 _XR_STS_HCH:    uint32 = 0x01     # Host Controller Halted
 
+# xHCI extended-capability IDs / USB Legacy Support bit layout.
+_XR_ECP_LEGACY:    uint32 = 0x01           # cap id 1 = USB Legacy Support
+_XR_LEGSUP_BIOS:   uint32 = 0x00010000     # HC BIOS Owned Semaphore (bit16)
+_XR_LEGSUP_OS:     uint32 = 0x01000000     # HC OS Owned Semaphore   (bit24)
+
+
+def _xr_bios_handoff(bar0: uint64) -> int32:
+    # xHCI BIOS->OS ownership handoff (xHCI spec 4.22.1 / 7.1.1). The
+    # NUC's UEFI firmware enumerated this controller at boot, so SMM may
+    # still own it. Asserting USBCMD.R/S while the HC is BIOS-owned traps
+    # into SMM on real Intel silicon and wedges the CPU — the exact hang
+    # observed at "stage4 USBSTS before run". QEMU exposes no legacy cap
+    # (xECP=0 or no id-1 entry), so this is a no-op there.
+    #
+    # xECP lives in HCCPARAMS1[31:16] as a dword offset from the cap base.
+    hccparams1: uint32 = _xr_r32(bar0 + 0x10)
+    xecp: uint32 = (hccparams1 >> 16) & 0xFFFF
+    if xecp == 0:
+        printk0("[xhci-real] handoff: no extended caps (xECP=0) — QEMU/no-legacy, skip\n")
+        return 0
+    capptr: uint64 = bar0 + cast[uint64](xecp) * 4
+    guard: uint32 = 0
+    while guard < 256:
+        guard = guard + 1
+        dw: uint32 = _xr_r32(capptr)
+        capid: uint32 = dw & 0xFF
+        if capid == _XR_ECP_LEGACY:
+            printk2("[xhci-real] handoff: USBLEGSUP@%p = %p\n",
+                    capptr, cast[uint64](dw))
+            if (dw & _XR_LEGSUP_BIOS) == 0:
+                printk0("[xhci-real] handoff: already OS-owned (BIOS bit clear)\n")
+            # Claim OS ownership and wait (bounded) for BIOS to release.
+            _xr_w32(capptr, dw | _XR_LEGSUP_OS)
+            spin: uint32 = 0
+            cur: uint32 = _xr_r32(capptr)
+            while (cur & _XR_LEGSUP_BIOS) != 0 and spin < 1000000:
+                cur = _xr_r32(capptr)
+                spin = spin + 1
+            if (cur & _XR_LEGSUP_BIOS) != 0:
+                printk1("[xhci-real] handoff: WARN BIOS still owns after wait (USBLEGSUP=%p)\n",
+                        cast[uint64](cur))
+            else:
+                printk0("[xhci-real] handoff: OS ownership acquired (BIOS released)\n")
+            # Disable all legacy SMI sources and clear RW1C SMI status in
+            # USBLEGCTLSTS (USBLEGSUP+4) so the running HC can't fire an
+            # SMI the firmware never set us up to service.
+            _xr_w32(capptr + 4, 0xE0000000)
+            printk0("[xhci-real] handoff: legacy SMIs disabled in USBLEGCTLSTS\n")
+            return 0
+        nxt: uint32 = (dw >> 8) & 0xFF
+        if nxt == 0:
+            break
+        capptr = capptr + cast[uint64](nxt) * 4
+    printk0("[xhci-real] handoff: no USB Legacy Support cap (id=1) in xECP chain — skip\n")
+    return 0
+
 
 def _xr_stage4_run_and_enum(hcd: uint64, xhci: uint64, bar0: uint64) -> int32:
     # The real .ko's xhci_mem_init programmed the controller's ring
@@ -453,11 +509,17 @@ def _xr_stage4_run_and_enum(hcd: uint64, xhci: uint64, bar0: uint64) -> int32:
             crcr, cast[uint64](config & 0xFF))
 
     # DCBAAP must equal the .ko's dcbaa phys (identity-mapped, so virt
-    # == phys in Hamnix low memory). CRCR holds the command-ring phys
-    # OR'd with the ring-cycle-state bit (bit0). Both non-zero == the
-    # .ko genuinely programmed the controller.
-    if dcbaap == 0 or crcr == 0:
-        printk0("[xhci-real] FAIL stage4: controller ring pointers still 0 (.ko did not program MMIO)\n")
+    # == phys in Hamnix low memory). DCBAAP (op+0x30) is fully readable,
+    # so a non-zero read-back proves the .ko wrote live silicon.
+    #
+    # Do NOT gate on CRCR: per xHCI spec 5.4.5 the Command Ring Pointer
+    # field (bits 63:6) and RCS (bit0) are write-only and ALWAYS read as
+    # 0. So CRCR=0 read-back is spec-correct, not a programming failure.
+    # QEMU's model non-spec-ly returns the written value, which is why a
+    # crcr==0 gate passed in the VM but false-failed on real Intel
+    # silicon (NUC Sunrise Point-H: DCBAAP=0x102455000 OK, CRCR reads 0).
+    if dcbaap == 0:
+        printk0("[xhci-real] FAIL stage4: DCBAAP still 0 (.ko did not program MMIO)\n")
         return -1
     if (dcbaap & ~cast[uint64](0x3F)) != (dcbaa_v & ~cast[uint64](0x3F)):
         printk2("[xhci-real] WARN stage4: DCBAAP %p != dcbaa virt %p (non-identity map?)\n",
@@ -472,8 +534,21 @@ def _xr_stage4_run_and_enum(hcd: uint64, xhci: uint64, bar0: uint64) -> int32:
     sts0: uint32 = _xr_r32(op + _XR_OP_USBSTS)
     printk1("[xhci-real] stage4 USBSTS before run=%p (HCH expected set)\n",
             cast[uint64](sts0))
+
+    # CRITICAL on real silicon: take HC ownership from BIOS/SMM BEFORE
+    # touching USBCMD.R/S. Without this the R/S write traps into SMM on
+    # the NUC and wedges (QEMU has no legacy cap → no-op). See
+    # _xr_bios_handoff.
+    _xr_bios_handoff(bar0)
+
+    # Bracket each operational-register access with a marker so that if a
+    # wedge survives the handoff the next capture shows EXACTLY which MMIO
+    # access hangs (read-USBCMD vs R/S-write vs first poll read).
+    printk0("[xhci-real] stage4 run: reading USBCMD\n")
     cmd: uint32 = _xr_r32(op + _XR_OP_USBCMD)
+    printk1("[xhci-real] stage4 run: USBCMD=%p, writing R/S\n", cast[uint64](cmd))
     _xr_w32(op + _XR_OP_USBCMD, cmd | _XR_CMD_RS)
+    printk0("[xhci-real] stage4 run: R/S written, polling USBSTS for HCH clear\n")
 
     spin: uint64 = 0
     sts: uint32 = _xr_r32(op + _XR_OP_USBSTS)
@@ -557,95 +632,142 @@ def _xr_stage5_enumerate(hcd: uint64, xhci: uint64, bar0: uint64,
     printk2("[xhci-real] stage5 cmd_ring=%p first_seg=%p\n", cmd_ring, first_seg)
     printk2("[xhci-real] stage5 cmd_ring->enqueue=%p\n", enq, enq)
 
-    # GROUND TRUTH for where to post the command: the controller's OWN
-    # command-ring dequeue is CRCR (op+0x18). CRCR.base (& ~0x3F) is the
-    # phys/virt the controller will DMA-read next; CRCR bit0 == RCS, the
-    # cycle bit the controller currently expects. The .ko's enqueue may
-    # be advanced past the controller's dequeue (link/no-op TRBs from
-    # mem_init), and the controller stops at the first TRB whose cycle !=
-    # its consumer cycle. So we write our Enable-Slot TRB EXACTLY at the
-    # controller dequeue with EXACTLY the RCS cycle — guaranteeing the
-    # controller consumes it on the next doorbell.
+    # GROUND TRUTH for where to post the command: the command ring's FIRST
+    # SEGMENT TRB BASE (first_seg->trbs), NOT cmd_ring->enqueue.
+    #
+    # Why not enqueue? Two metal findings (NUC boots 11-45/11-54):
+    #  (1) cmd_ring->enqueue lands at a 32-byte (odd-TRB) offset
+    #      (...4220, & 0x3F == 0x20). The CRCR Command-Ring-Pointer is bits
+    #      63:6 (xHCI §5.4.5) — the low 6 bits are RCS/reserved — so writing
+    #      CRCR=enqueue truncates the pointer to a 64-byte boundary
+    #      (...4200), 0x20 BEFORE our TRB. The controller then dequeues a
+    #      stale/zero TRB, sees a cycle mismatch, and never runs the command
+    #      (it kept posting Port-Status-Change events but zero Cmd-Completes).
+    #  (2) enqueue at a non-base offset means the ring is NOT fresh-at-base,
+    #      so it is not a safe place to re-point a stopped controller.
+    # The segment TRB base is allocated 64-byte (page) aligned per spec and
+    # is exactly where a stopped controller's command-ring dequeue belongs.
+    # We take over the ring: post our Enable-Slot at the base with the .ko's
+    # producer cycle and re-arm CRCR to the aligned base (legal while CRR=0).
+    seg_trbs: uint64 = cast[Ptr[uint64]](first_seg + 0x00)[0]
+    cmd_cycle: uint32 = cast[Ptr[uint32]](cmd_ring + XHCI_RING_CYCLE_OFF)[0] & 0x1
+    # FORCE 64-byte alignment. NUC boots 11-54/12-04 proved both
+    # cmd_ring->enqueue AND first_seg->trbs land at a 32-byte (0x20) offset
+    # on this hardware — tolerated by QEMU, but the xHCI CRCR pointer is bits
+    # 63:6 so real Intel silicon TRUNCATES the low 6 bits and dequeues from a
+    # DIFFERENT 64-byte slot than where we wrote, so the command is never
+    # run. We take over the command ring entirely (the .ko is not using it
+    # and the controller is stopped, CRR=0): pick a 64-byte-aligned address,
+    # write our Enable-Slot TRB THERE, and re-arm CRCR to the SAME address.
+    # Post-address == CRCR-pointer (both aligned) is the invariant that makes
+    # the controller fetch exactly the TRB we wrote. Round DOWN; the slot is
+    # in our DMA-coherent region either way and we own the whole ring now.
+    deq: uint64 = seg_trbs & ~cast[uint64](0x3F)
+    rcs: uint32 = cmd_cycle
+    # CRCR readback kept for diagnostics ONLY (reads 0 on real silicon).
     crcr_raw: uint64 = _xr_r64(op + _XR_OP_CRCR)
-    deq: uint64 = crcr_raw & ~cast[uint64](0x3F)
-    rcs: uint32 = cast[uint32](crcr_raw & 0x1)
-    printk2("[xhci-real] stage5 controller deq(CRCR base)=%p RCS=%d\n",
-            deq, cast[uint64](rcs))
+    printk2("[xhci-real] stage5 first_seg->trbs=%p -> 64B-aligned deq=%p\n",
+            seg_trbs, deq)
+    printk2("[xhci-real] stage5 post-at deq=%p align&0x3F=%p\n",
+            deq, deq & cast[uint64](0x3F))
+    printk1("[xhci-real] stage5 CRCR readback (diag, 0 on metal)=%p\n", crcr_raw)
     printk2("[xhci-real] stage5 db_base=%p ir0(runtime)=%p\n", db_base, ir0)
 
-    # Snapshot the event-ring dequeue (ERDP) BEFORE the command so we
-    # can read the completion TRB the controller posts. The producer
-    # cycle of a freshly-initialised event ring is 1.
+    # Initialise the SHARED event-ring walker (_xr_scan_event) before
+    # posting any command. The walker maintains a live dequeue cursor +
+    # consumer cycle and skips intervening events. This is REQUIRED on real
+    # hardware: the instant R/S started the controller, every root-hub port
+    # that already has a device attached posts a Port-Status-Change event
+    # (type 34) into the event ring AHEAD of our Command-Completion. The old
+    # "inspect the single TRB at ERDP and wait for a cycle flip" logic spun
+    # forever on that PSC event (the fresh ring's producer cycle is already
+    # 1, so there is no flip to see). QEMU posted the completion first so it
+    # never tripped on this. A fresh event ring's producer cycle is 1.
     erdp_before: uint64 = _xr_r64(ir0 + _XR_IR_ERDP) & ~cast[uint64](0xF)
+    _xr_ev_cursor = erdp_before
+    _xr_ev_cyc = 1
+    _xr_op_base = op
     printk1("[xhci-real] stage5 event-ring ERDP(before)=%p\n", erdp_before)
-    ev: Ptr[uint32] = cast[Ptr[uint32]](erdp_before)
-    ev_cyc_before: uint32 = ev[3] & 0x1
 
-    # Build the Enable-Slot command TRB at the controller's dequeue:
-    #   dword0/1 = parameter (0), dword2 = status (0),
-    #   dword3 = (type<<10) | RCS.   Write the cycle bit LAST so the
-    #   controller never sees a half-written TRB with the right cycle.
+    # Build the Enable-Slot command TRB at the .ko's command-ring enqueue
+    # (deq, computed from cmd_ring->enqueue above): dword0/1 = parameter (0),
+    # dword2 = status (0), dword3 = (type<<10) | cycle. Write the cycle bit
+    # LAST so the controller never sees a half-written TRB.
     trb: Ptr[uint32] = cast[Ptr[uint32]](deq)
     trb[0] = 0
     trb[1] = 0
     trb[2] = 0
     trb[3] = (_XR_TRB_TYPE_ENABLE_SLOT << _XR_TRB_TYPE_SHIFT) | rcs
 
+    # EXPLICITLY RE-ARM the Command Ring on metal. DIAG dump (NUC boot
+    # 11-45-04) proved the controller is RUNNING and posting Port-Status-
+    # Change events to the event ring, our Enable-Slot TRB is intact
+    # (dword3=0x2401), yet NO Command-Completion is ever posted — i.e. the
+    # controller never DEQUEUES the command ring. The controller's internal
+    # Command Ring Dequeue Pointer was set by the .ko's xhci_mem_init CRCR
+    # write; since CRCR is write-only (reads 0 on real silicon) we cannot
+    # see where it actually points, and on metal it evidently does NOT point
+    # at cmd_ring->enqueue. Per xHCI spec §5.4.5 the CRCR pointer is only
+    # latched while the ring is STOPPED (CRR=0) — true here (fresh ring, no
+    # command yet processed) — so we authoritatively point the controller at
+    # OUR TRB: write CRCR = (deq physical | RCS). deq is identity-mapped
+    # (virt==phys, confirmed via DCBAA), so deq is the correct bus address.
+    _xr_w64(op + _XR_OP_CRCR, deq | cast[uint64](rcs))
+    printk2("[xhci-real] stage5 re-armed CRCR=%p|RCS=%d (authoritative cmd-ring deq)\n",
+            deq, cast[uint64](rcs))
+
     # Ring command doorbell 0 (DB target 0 == host controller command).
     _xr_w32(db_base + 0x00, 0)
     printk0("[xhci-real] stage5 Enable-Slot posted at controller dequeue; doorbell 0 rung\n")
 
-    # Poll the event ring for the Command-Completion event. The
-    # controller DMA-writes it at the event-ring enqueue position; the
-    # NEW event has a flipped cycle bit relative to what was there
-    # before. Watch the TRB at ERDP for: cycle changed AND type == 33.
-    spin: uint64 = 0
-    ctl: uint32 = ev[3]
-    evtype: uint32 = (ctl >> _XR_TRB_TYPE_SHIFT) & 0x3F
-    evcyc: uint32 = ctl & 0x1
-    while (evtype != _XR_TRB_TYPE_CMD_COMPLETION or evcyc == ev_cyc_before) and spin < 4000000:
-        ctl = ev[3]
-        evtype = (ctl >> _XR_TRB_TYPE_SHIFT) & 0x3F
-        evcyc = ctl & 0x1
-        spin = spin + 1
-    if evtype != _XR_TRB_TYPE_CMD_COMPLETION:
-        printk2("[xhci-real] stage5: no Cmd-Completion event at ERDP (last TRB ctl=%p type=%d)\n",
-                cast[uint64](ctl), cast[uint64](evtype))
-        printk0("[xhci-real] FURTHEST: controller running off .ko rings; command consumed from .ko cmd-ring (see usb_xhci_fetch_trb) but completion not observed at ERDP\n")
+    # Walk the event ring for the Command-Completion (type 33) referencing
+    # our Enable-Slot TRB at `deq`, skipping the Port-Status-Change events.
+    cc_i: int32 = _xr_scan_event(_XR_TRB_TYPE_CMD_COMPLETION, deq)
+    if cc_i < 0:
+        printk0("[xhci-real] stage5: no Cmd-Completion for our Enable-Slot found while walking the event ring\n")
+        # DECISIVE METAL DIAGNOSTIC: dump controller state + the raw command
+        # TRB we wrote + the raw first 8 event-ring TRBs, so we can see what
+        # (if anything) the controller actually DMA-posted. completion code
+        # !=1, a TRB_ERROR, a cref mismatch, or an all-zero ring each point
+        # at a different root cause that the type-matched scan hides.
+        dsts:  uint32 = _xr_r32(op + _XR_OP_USBSTS)
+        dcmd:  uint32 = _xr_r32(op + _XR_OP_USBCMD)
+        printk2("[xhci-real] stage5 DIAG USBSTS=%p USBCMD=%p\n",
+                cast[uint64](dsts), cast[uint64](dcmd))
+        ctrb: Ptr[uint32] = cast[Ptr[uint32]](deq)
+        printk2("[xhci-real] stage5 DIAG cmd-TRB@%p readback dword3=%p\n",
+                deq, cast[uint64](ctrb[3]))
+        printk2("[xhci-real] stage5 DIAG ev_base=%p nslots=%d\n",
+                _xr_ev_base, _xr_ev_nslots)
+        di: uint64 = 0
+        while di < 8:
+            esl: Ptr[uint32] = cast[Ptr[uint32]](_xr_ev_base + di * 0x10)
+            elo: uint64 = (cast[uint64](esl[1]) << 32) | cast[uint64](esl[0])
+            printk2("[xhci-real] stage5 DIAG ev[%d] ptr=%p\n", di, elo)
+            printk2("[xhci-real] stage5 DIAG ev    sts=%p ctl=%p\n",
+                    cast[uint64](esl[2]), cast[uint64](esl[3]))
+            di = di + 1
+        printk0("[xhci-real] FURTHEST: controller running off .ko rings; command posted to .ko cmd-ring but no attributable completion in the event ring (see usb_xhci_fetch_trb)\n")
         return 0
-    cc: uint32 = (ev[2] >> 24) & 0xFF
-    slot: uint32 = (ev[3] >> 24) & 0xFF
-    # The completion TRB's parameter (dword0/1) points back at the
-    # command TRB the controller consumed — prove it's OUR TRB. Reject a
-    # cycle-coincidence false positive: the completion MUST reference the
-    # exact phys addr (deq) where we posted our Enable-Slot.
-    cmd_ptr: uint64 = _xr_r64(erdp_before)
+    cc: uint32 = cast[uint32](cc_i)
+    slot: uint32 = _xr_cc_slot
     printk2("[xhci-real] stage5 Cmd-Completion: completion-code=%d slot-id=%d\n",
             cast[uint64](cc), cast[uint64](slot))
-    printk2("[xhci-real] stage5 Cmd-Completion cmd-TRB-ptr=%p (posted at %p)\n",
-            cmd_ptr, deq)
-    if cmd_ptr != deq:
-        printk0("[xhci-real] stage5: completion does NOT reference our TRB (BIOS-ring event); not claiming PASS\n")
-        printk0("[xhci-real] FURTHEST: controller running off .ko rings (USBSTS HCH cleared); Enable-Slot completion not attributable to our TRB\n")
+    if slot == 0:
+        printk0("[xhci-real] stage5: completion carried slot-id 0 (Enable-Slot did not assign a slot)\n")
         return 0
     printk0("[xhci-real] PASS stage5: real .ko command ring round-tripped a controller Enable-Slot end-to-end\n")
     printk0("[xhci-real] FURTHEST: controller DMA-consumed an Enable-Slot from the .ko-built cmd ring and DMA-posted a Command-Completion to the .ko-built event ring\n")
 
-    # Advance to Address Device on the slot we just enabled, then a
-    # control GET_DESCRIPTOR. We MUST track ring positions ourselves —
-    # the controller's CRCR register reports the ring BASE, not the live
-    # dequeue, so re-reading it after a command points us back at the
-    # already-consumed TRB. We posted Enable-Slot at `deq`; the next
-    # command TRB therefore goes at deq+0x10 (same cycle, no wrap within
-    # a 256-TRB segment). Likewise the controller wrote the Enable-Slot
-    # completion at erdp_before; its NEXT event lands at erdp_before+0x10,
-    # so advance the event read cursor by one TRB. `evcyc` is the cycle
-    # the completion carried — the next event keeps the same producer
-    # cycle until the event ring wraps.
+    # Advance to Address Device on the slot we just enabled. We track the
+    # command-ring cursor ourselves (CRCR reports the ring BASE / reads 0 on
+    # real silicon, not the live dequeue): the next command TRB goes at
+    # deq+0x10 (same cycle, no wrap within a 256-TRB segment). The event-ring
+    # cursor is now the SHARED walker state (_xr_ev_cursor/_xr_ev_cyc), so we
+    # no longer thread an event cursor through the call.
     cmd_next: uint64 = deq + 0x10
-    ev_next:  uint64 = erdp_before + 0x10
     return _xr_stage6_address_device(xhci, op, bar0, db_base, ir0,
-                                     ev_next, evcyc, cmd_next, rcs, slot)
+                                     0, 0, cmd_next, rcs, slot)
 
 
 # --- stage6: Address Device + GET_DESCRIPTOR -------------------------
@@ -701,6 +823,45 @@ def _xr_wait_cmd_complete(ev: Ptr[uint32], ev_cyc_before: uint32,
     return cast[int32]((ev[2] >> 24) & 0xFF)   # completion code
 
 
+# Scan the root-hub ports for a connected device and (for USB2 ports that
+# are not auto-enabled) drive a hot reset to train the link speed. On QEMU
+# the device sits on port 1 and is already PED=1, so this returns
+# immediately; on real Intel silicon the stick lands on some other port and
+# its USB2 companion needs an explicit Port-Reset (PORTSC.PR) before the
+# port enables and reports a trained speed. Returns (port_number << 8) |
+# speed (speed = PORTSC bits 10..13), or 0 if no connected+enabled port.
+#
+# PORTSC write hygiene: the change bits (CSC/PEC/PRC) are RW1C and PED is
+# write-1-to-disable, so we build a "neutral" write that preserves PP (bit
+# 9) + PLS (bits 5..8) and zeroes everything else before OR-ing in PR —
+# this avoids accidentally disabling the port or clearing status we still
+# need. (Mirrors Linux xhci_port_state_to_neutral.)
+def _xr_find_connected_port(op: uint64, bar0: uint64) -> uint32:
+    hcs: uint32 = _xr_r32(bar0 + 0x04)
+    max_ports: uint32 = (hcs >> 24) & 0xFF
+    p: uint32 = 1
+    while p <= max_ports:
+        pa: uint64 = op + 0x400 + cast[uint64](p - 1) * 0x10
+        v: uint32 = _xr_r32(pa)
+        if (v & 0x1) != 0:                       # CCS: device connected
+            if (v & 0x2) == 0:                   # PED == 0: needs a reset
+                _xr_w32(pa, (v & 0x3E0) | 0x10)  # preserve PP/PLS, set PR
+                spin: uint64 = 0
+                v = _xr_r32(pa)
+                while (v & 0x10) != 0 and spin < 8000000:   # wait PR clear
+                    v = _xr_r32(pa)
+                    spin = spin + 1
+                _xr_w32(pa, (v & 0x3E0) | (1 << 21))        # clear PRC (RW1C)
+                v = _xr_r32(pa)
+            spd: uint32 = (v >> 10) & 0xF
+            printk2("[xhci-real] port%d connected PORTSC=%p\n",
+                    cast[uint64](p), cast[uint64](v))
+            if (v & 0x2) != 0:                   # enabled now
+                return (p << 8) | spd
+        p = p + 1
+    return 0
+
+
 def _xr_stage6_address_device(xhci: uint64, op: uint64, bar0: uint64,
                                db_base: uint64, ir0: uint64,
                                ev_cursor: uint64, ev_cyc: uint32,
@@ -750,16 +911,23 @@ def _xr_stage6_address_device(xhci: uint64, op: uint64, bar0: uint64,
 
     # Slot Context (at in_ctx + ctx_sz):
     #   dword0: route(0) | speed(<<20) | ctx_entries(1)<<27
-    #   dword1: root-hub-port-number (1) << 16
+    #   dword1: root-hub-port-number << 16
     sc: uint64 = in_ctx + ctx_sz
-    # Read PORTSC for port1 to extract the trained speed (bits 10..13).
-    op_ports: uint64 = op + 0x400
-    portsc: uint32 = _xr_r32(op_ports + 0x00)
-    pspeed: uint32 = (portsc >> 10) & 0xF
-    printk2("[xhci-real] stage6 PORTSC(port1)=%p speed=%d\n",
-            cast[uint64](portsc), cast[uint64](pspeed))
+    # Find the port the device is actually on and train its speed. On QEMU
+    # this is port 1 (already PED=1); on real silicon it's some other port
+    # whose USB2 companion needs a Port-Reset before it enables. Hardcoding
+    # port 1 with speed=0 (its empty PORTSC) was the cause of the metal
+    # Address-Device USB-Transaction-Error (completion code 4).
+    pp: uint32 = _xr_find_connected_port(op, bar0)
+    port_num: uint32 = (pp >> 8) & 0xFF
+    pspeed: uint32 = pp & 0xF
+    if port_num == 0:
+        port_num = 1
+        pspeed = (_xr_r32(op + 0x400) >> 10) & 0xF
+    printk2("[xhci-real] stage6 connected port=%d trained-speed=%d\n",
+            cast[uint64](port_num), cast[uint64](pspeed))
     cast[Ptr[uint32]](sc + 0x00)[0] = (1 << 27) | (pspeed << 20)
-    cast[Ptr[uint32]](sc + 0x04)[0] = (1 << 16)
+    cast[Ptr[uint32]](sc + 0x04)[0] = (port_num << 16)
 
     # EP0 Context (at in_ctx + 2*ctx_sz):
     #   dword1: EP type = Control (4) << 3 | MPS<<16 | CErr(3)<<1
@@ -773,9 +941,7 @@ def _xr_stage6_address_device(xhci: uint64, op: uint64, bar0: uint64,
 
     # Post Address-Device at OUR tracked cmd-ring enqueue (cmd_next) with
     # the ring cycle (cmd_cyc). Do NOT re-read CRCR — it reports the ring
-    # base, not the live dequeue, and would point back at the consumed
-    # Enable-Slot TRB.
-    ev: Ptr[uint32] = cast[Ptr[uint32]](ev_cursor)
+    # base, not the live dequeue, and reads 0 on real silicon.
     ct: Ptr[uint32] = cast[Ptr[uint32]](cmd_next)
     cast[Ptr[uint64]](cmd_next)[0] = in_ctx       # param = input ctx phys
     ct[2] = 0
@@ -784,7 +950,10 @@ def _xr_stage6_address_device(xhci: uint64, op: uint64, bar0: uint64,
             cmd_next, in_ctx)
     _xr_w32(db_base + 0x00, 0)
 
-    cc: int32 = _xr_wait_cmd_complete(ev, ev_cyc, cmd_next)
+    # Walk the shared event ring for the Address-Device completion (skips any
+    # remaining Port-Status-Change events / the already-harvested Enable-Slot
+    # completion still resident in the ring).
+    cc: int32 = _xr_scan_event(_XR_TRB_TYPE_CMD_COMPLETION, cmd_next)
     if cc != 1:
         printk1("[xhci-real] stage6: Address-Device completion-code=%d (1==SUCCESS, -1==no/foreign event)\n",
                 cast[uint64](cast[uint32](cc)))
@@ -804,13 +973,10 @@ def _xr_stage6_address_device(xhci: uint64, op: uint64, bar0: uint64,
     _xr_cmd_next = cmd_next + 0x10
     _xr_cmd_cyc = cmd_cyc
 
-    # The Address-Device completion consumed event slot `ev_cursor`; the
-    # transfer-event for the GET_DESCRIPTOR control transfer will land at
-    # the next event-ring TRB. Advance the cursor; cycle unchanged until
-    # the event ring wraps its segment.
-    ev_next: uint64 = ev_cursor + 0x10
+    # The event-ring cursor is the SHARED walker state now; stage7 calls
+    # _xr_scan_event for its transfer event, so no cursor is threaded here.
     return _xr_stage7_get_descriptor(xhci, op, bar0, db_base, ir0,
-                                     ev_next, ev_cyc, slot, ep0_ring, desc)
+                                     0, 0, slot, ep0_ring, desc)
 
 
 def _xr_stage7_get_descriptor(xhci: uint64, op: uint64, bar0: uint64,
@@ -848,28 +1014,17 @@ def _xr_stage7_get_descriptor(xhci: uint64, op: uint64, bar0: uint64,
 
     # Ring the slot's EP0 doorbell. DB register for slot N is at
     # db_base + N*4; EP0 control == target 1.
-    ev: Ptr[uint32] = cast[Ptr[uint32]](ev_cursor)
     _xr_w32(db_base + cast[uint64](slot) * 4, 1)
     printk2("[xhci-real] stage7 GET_DESCRIPTOR queued on EP0 ring=%p; DB slot%d target1 rung\n",
             ep0_ring, cast[uint64](slot))
 
-    # Wait for the transfer event (type 32 == ER_TRANSFER) at our cursor,
-    # cycle flipped vs the snapshot, referencing our Status TRB on the
-    # EP0 ring (ep0_ring + 0x20) — rejects BIOS-ring transfer events.
+    # Walk the shared event ring for the transfer event (type 32) that
+    # references our Status TRB (ep0_ring + 0x20). The walker skips any
+    # intervening events and advances the controller's ERDP.
     want_evt: uint64 = ep0_ring + 0x20
-    spin: uint64 = 0
-    ctl: uint32 = ev[3]
-    t: uint32 = (ctl >> _XR_TRB_TYPE_SHIFT) & 0x3F
-    c: uint32 = ctl & 0x1
-    while (t != 32 or c == ev_cyc_before) and spin < 4000000:
-        ctl = ev[3]
-        t = (ctl >> _XR_TRB_TYPE_SHIFT) & 0x3F
-        c = ctl & 0x1
-        spin = spin + 1
-    evt_ref: uint64 = (cast[uint64](ev[1]) << 32) | cast[uint64](ev[0])
-    if t == 32:
-        printk2("[xhci-real] stage7 transfer-event ref=%p (our Status TRB=%p)\n",
-                evt_ref, want_evt)
+    xcc: int32 = _xr_scan_event(32, want_evt)
+    if xcc >= 0:
+        printk1("[xhci-real] stage7 transfer-event for Status TRB=%p observed\n", want_evt)
     db: Ptr[uint8] = cast[Ptr[uint8]](desc)
     blen: uint32 = cast[uint32](db[0])
     btype: uint32 = cast[uint32](db[1])
@@ -885,18 +1040,14 @@ def _xr_stage7_get_descriptor(xhci: uint64, op: uint64, bar0: uint64,
         printk0("[xhci-real] PASS stage7: GET_DESCRIPTOR(device) returned a valid 18-byte device descriptor via EP0 control transfer\n")
         printk0("[xhci-real] FURTHEST: FULL real-.ko-driven enumeration step — Enable-Slot, Address-Device, and GET_DESCRIPTOR all round-tripped through the Linux xhci_hcd.ko rings (native disabled)\n")
         # Continue into the MSC (BOT) path. We consumed EP0 ring TRBs at
-        # +0x00..+0x20 (next free is +0x30, same cycle) and the transfer
-        # event at ev_cursor (next event at +0x10, same producer cycle).
-        # ev_cyc_before here is the cycle the controller is CURRENTLY
-        # writing (stages 5/6/7 already advanced it), so the next event at
-        # ev_cursor+0x10 carries that same cycle — seed cyc_want to
-        # ev_cyc_before directly. _xr_scan_event flips it on each segment
-        # wrap. Seed the running cursors and proceed to GET_DESCRIPTOR.
+        # +0x00..+0x20 (next free is +0x30, same cycle). The event-ring
+        # walker (_xr_ev_cursor/_xr_ev_cyc) is already live and advancing
+        # from stage5 onward, so we must NOT reseed it here — doing so would
+        # clobber the live cursor with stale zero params. Seed only the EP0
+        # producer cursors and proceed.
         _xr_ep0_ring = ep0_ring
         _xr_ep0_off = 0x30
         _xr_ep0_cyc = cyc
-        _xr_ev_cursor = ev_cursor + 0x10
-        _xr_ev_cyc = ev_cyc_before
         return _xr_stage8_get_config(xhci, op, bar0, db_base, ir0, slot)
     printk0("[xhci-real] FURTHEST: Address-Device SUCCESS proven (stage6a); GET_DESCRIPTOR transfer did not yield a valid descriptor at desc buffer\n")
     return 0
@@ -986,7 +1137,13 @@ _XR_EV_NEW_CYCLE:  uint32 = 1
 # ever outstanding at a time in this driver.
 _xr_cmdcmpl_ref:   uint64 = 0          # cmd-TRB ptr of stashed completion
 _xr_cmdcmpl_code:  int32 = 0           # its completion code
+_xr_cmdcmpl_slot:  uint32 = 0          # its slot id (Enable-Slot result)
 _xr_cmdcmpl_valid: uint32 = 0          # 1 == stash holds an unconsumed cc
+
+# Slot id from the most recent command-completion _xr_scan_event matched.
+# Enable-Slot's completion carries the controller-assigned slot id in
+# ev.control[31:24]; stage5 reads it here after the scan returns.
+_xr_cc_slot:       uint32 = 0
 
 # Transfer-event stash. The SAME async/interleave hazard that bites
 # command completions also bites BOT transfer events: across the three
@@ -1072,6 +1229,7 @@ def _xr_scan_event(want_type: uint32, want_trb: uint64) -> int32:
     if want_type == _XR_TRB_TYPE_CMD_COMPLETION and _xr_cmdcmpl_valid != 0:
         if _xr_cmdcmpl_ref == want_trb:
             _xr_cmdcmpl_valid = 0
+            _xr_cc_slot = _xr_cmdcmpl_slot
             return _xr_cmdcmpl_code
     # Command-completion direct search. A command completion is uniquely
     # identified by the cmd-ring TRB pointer it references, and the
@@ -1098,6 +1256,7 @@ def _xr_scan_event(want_type: uint32, want_trb: uint64) -> int32:
                 ctype: uint32 = (cctl >> _XR_TRB_TYPE_SHIFT) & 0x3F
                 cref: uint64 = (cast[uint64](cev[1]) << 32) | cast[uint64](cev[0])
                 if ctype == _XR_TRB_TYPE_CMD_COMPLETION and cref == want_trb:
+                    _xr_cc_slot = (cev[3] >> 24) & 0xFF
                     return cast[int32]((cev[2] >> 24) & 0xFF)
                 si = si + 1
             if _xr_op_base != 0:
@@ -1166,6 +1325,7 @@ def _xr_scan_event(want_type: uint32, want_trb: uint64) -> int32:
         if t == _XR_TRB_TYPE_CMD_COMPLETION:
             _xr_cmdcmpl_ref = ref
             _xr_cmdcmpl_code = code
+            _xr_cmdcmpl_slot = (ev[3] >> 24) & 0xFF
             _xr_cmdcmpl_valid = 1
         elif t == 32:
             # Transfer event for a phase other than the one we're hunting
