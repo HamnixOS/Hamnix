@@ -312,6 +312,18 @@ if os.environ.get("ENABLE_MMAP_SHARED_TEST") == "1":
 if os.environ.get("ENABLE_CPUINFO_TEST") == "1":
     FILES.append(("/etc/cpuinfo-test", b"1\n"))
 
+# /proc/mounts real per-namespace mount-table self-test.
+# scripts/test_procmounts.sh sets ENABLE_PROCMOUNTS_TEST=1 to plant
+# /etc/procmounts-test. init/main.ad at boot:37.pmt detects the marker
+# and calls procmounts_selftest() (fs/procfs.ad), which renders
+# /proc/mounts into a scratch buffer and asserts the root-pinned base
+# lines are present, then performs a runtime mnttab_bind and re-renders,
+# asserting the new bind shows up as a 6-field /proc/mounts line. Prints
+# "[PROCMOUNTS] PASS" / "[PROCMOUNTS] FAIL". Default boots omit the
+# marker so the self-test is a no-op everywhere else.
+if os.environ.get("ENABLE_PROCMOUNTS_TEST") == "1":
+    FILES.append(("/etc/procmounts-test", b"1\n"))
+
 # linux-abi U-ABI fills self-test. scripts/test_uabi_fills.sh sets
 # ENABLE_UABI_FILLS_TEST=1 to plant /etc/uabi-fills-test. init/main.ad at
 # boot:37.uaf detects the marker and calls uabi_fills_selftest()
