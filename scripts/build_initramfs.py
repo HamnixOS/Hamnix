@@ -774,6 +774,17 @@ if os.environ.get("ENABLE_PROCSTAT_CPU_TEST") == "1":
 if os.environ.get("ENABLE_PROCSTAT_INTR_TEST") == "1":
     FILES.append(("/etc/procstat-intr-test", b"1\n"))
 
+# Per-task page-fault accounting self-test. scripts/test_pgfault.sh sets
+# ENABLE_PGFAULT_TEST=1 to plant /etc/pgfault-test. init/main.ad at
+# boot:37.pgf detects the marker and calls pgfault_selftest()
+# (linux_abi/u_syscalls.ad): it charges 3 minor + 2 major faults via the
+# same helpers the page-fault handler drives, asserts the read accessors
+# and getrusage's ru_minflt (0x40) / ru_majflt (0x48) rose to match, then
+# emits the [PGFAULT] PASS banner. Needs no extra device; default boots
+# omit the marker.
+if os.environ.get("ENABLE_PGFAULT_TEST") == "1":
+    FILES.append(("/etc/pgfault-test", b"1\n"))
+
 # times(2) CPU-time self-test. scripts/test_times.sh sets
 # ENABLE_TIMES_TEST=1 to plant /etc/times-test. init/main.ad at
 # boot:37.times detects the marker and calls times_selftest()
