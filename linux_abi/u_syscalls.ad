@@ -248,6 +248,9 @@ from fs.ext4 import (
     is_ext_path, ext4_is_mounted,
     ext4_block_size, ext4_blocks_count, ext4_inodes_count,
     ext4_blockdev_slot,
+    strip_ext_prefix, ext4_path_mode,
+    ext4_create_file, ext4_resolve_file, ext4_read_inode,
+    ext4_inode_set_mode, ext4_write_inode,
 )
 # statfs(2): classify /mnt paths as the FAT backend.
 from fs.fat import is_fat_path
@@ -3773,20 +3776,45 @@ def _u_access(a0: uint64, a1: uint64, a2: uint64,
               a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int access(const char *pathname, int mode)
     # mode bits per <unistd.h>: F_OK (0), X_OK (1), W_OK (2), R_OK (4).
-    # Hamnix has no per-file permission state at the fs layer yet, so
-    # we treat R/W/X identically to F_OK: "does the path resolve to
-    # something we can open?" If so, return 0; otherwise -ENOENT. This
-    # is enough to unblock busybox's PATH search (which probes X_OK on
-    # candidates) and `test -f` (F_OK). A real R/W/X check arrives
-    # alongside the inode-level mode bits a future fs refactor will
-    # surface — at that point this body grows a `(mode & X_OK) &&
-    # !(st_mode & 0111)` guard.
+    #
+    # For an ext4-backed path we now do a REAL R/W/X check against the
+    # file's mode bits: read the inode i_mode via ext4_path_mode() and
+    # test the requested R/W/X bits against the OWNER permission bits
+    # (Hamnix's native side is effectively single-user/root). If a
+    # requested permission bit is absent we return -EACCES; if all are
+    # present we return 0. F_OK (mode==0) keeps the pure "does it
+    # resolve?" behaviour for ext4 paths too.
+    #
+    # Backends that don't surface inode mode bits (tmpfs, cpio, fat,
+    # /proc, /dev) keep the original permissive behaviour: resolve →
+    # 0. This is enough to unblock busybox's PATH search (which probes
+    # X_OK on candidates) and `test -f` (F_OK) on those backends while
+    # giving ext4 a faithful POSIX check.
     if a0 == 0:
         return ELINUX_INVAL
+    mode: uint64 = a1
     abs_path: Array[256, uint8]
     rc: int32 = resolve_path(cast[Ptr[char]](a0), &abs_path[0], 256)
     if rc != 0:
         return ELINUX_NOENT
+    # ext4-backed path: consult the real inode mode bits.
+    if is_ext_path(cast[Ptr[char]](&abs_path[0])) != 0:
+        tail: Ptr[char] = strip_ext_prefix(cast[Ptr[char]](&abs_path[0]))
+        imode: int32 = ext4_path_mode(tail)
+        if imode < 0:
+            return ELINUX_NOENT
+        # F_OK (mode==0): existence only — the resolve above proved it.
+        if mode == 0:
+            return 0
+        perm: uint64 = cast[uint64](imode) & 0x1FF      # low-9 rwx bits
+        if (mode & 4) != 0 and (perm & 0x100) == 0:     # R_OK vs 0400
+            return ELINUX_ACCES
+        if (mode & 2) != 0 and (perm & 0x080) == 0:     # W_OK vs 0200
+            return ELINUX_ACCES
+        if (mode & 1) != 0 and (perm & 0x040) == 0:     # X_OK vs 0100
+            return ELINUX_ACCES
+        return 0
+    # Non-ext4 backend: permissive existence check (no mode bits).
     fd: int32 = vfs_open(cast[Ptr[char]](&abs_path[0]))
     if fd < 0:
         return ELINUX_NOENT
@@ -6256,6 +6284,145 @@ def _statfs_selftest_restore(boot_task: Ptr[TaskStruct],
     while fdr < 16:
         boot_task[0].fd_idx[fdr] = fd_save[fdr]
         fdr = fdr + 1
+
+
+# =====================================================================
+# access(2) mode-bit self-test
+#   (gated on /etc/access-mode-test, ENABLE_ACCESS_MODE_TEST=1)
+# =====================================================================
+#
+# Proves the access(2) handler (_u_access) does a REAL R/W/X check
+# against an ext4 file's mode bits — the bit a busybox PATH search or
+# `test -x` relies on. Drives SYS_access through the live in-kernel
+# Linux-ABI dispatch (the exact path a Debian/busybox binary takes),
+# against ext4 files whose modes the test itself stamps on the live
+# /ext mount:
+#   * 0664 (S_IFREG|rw-rw-r--): F_OK==0, R_OK==0, W_OK==0, X_OK==-EACCES
+#   * 0755 (S_IFREG|rwxr-xr-x): X_OK==0 (PATH-search executable case)
+#   * 0444 (S_IFREG|r--r--r--): R_OK==0, W_OK==-EACCES
+#   * a non-existent path: -ENOENT
+#
+# Mode bits per <unistd.h>: F_OK=0, X_OK=1, W_OK=2, R_OK=4.
+
+
+def _access_sel_make(name: Ptr[char], mode: uint16) -> int32:
+    # Create /ext/<name> on the live mount and stamp its i_mode to
+    # `mode` (the full S_IF*|perm word). Returns 0 on success, -1 on
+    # any failure along the way.
+    empty: Array[1, uint8]
+    empty[0] = 0
+    inum: uint32 = ext4_create_file(2, name, &empty[0], 0)
+    if inum == 0:
+        return -1
+    inode_buf: Array[256, uint8]
+    if ext4_read_inode(cast[uint64](inum), &inode_buf[0]) != 0:
+        return -1
+    ext4_inode_set_mode(&inode_buf[0], mode)
+    if ext4_write_inode(cast[uint64](inum), &inode_buf[0]) != 0:
+        return -1
+    return 0
+
+
+def access_mode_selftest() -> int32:
+    # boot:37 bootstrap-task fd-table prime (same uninitialised-table
+    # issue statfs_selftest handles): snapshot slots 3..15, mark them
+    # FD_CLOSED_MARK, restore on every exit.
+    boot_task: Ptr[TaskStruct] = current_task()
+    fd_save: Array[16, uint32]
+    fdi: uint64 = 3
+    while fdi < 16:
+        fd_save[fdi] = boot_task[0].fd_idx[fdi]
+        boot_task[0].fd_idx[fdi] = FD_CLOSED_MARK
+        fdi = fdi + 1
+
+    if ext4_blockdev_slot < 0:
+        printk0("[ACCESS_MODE] FAIL ext4 not mounted\n")
+        _statfs_selftest_restore(boot_task, &fd_save[0])
+        return 1
+
+    # S_IFREG is 0x8000; OR in the perm bits.
+    if _access_sel_make("ACMODE64.TXT", 0x81B4) != 0:        # 0664
+        printk0("[ACCESS_MODE] FAIL create 0664\n")
+        _statfs_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    if _access_sel_make("ACMODE55.TXT", 0x81ED) != 0:        # 0755
+        printk0("[ACCESS_MODE] FAIL create 0755\n")
+        _statfs_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    if _access_sel_make("ACMODE44.TXT", 0x8124) != 0:        # 0444
+        printk0("[ACCESS_MODE] FAIL create 0444\n")
+        _statfs_selftest_restore(boot_task, &fd_save[0])
+        return 1
+
+    p64: Ptr[uint8] = cast[Ptr[uint8]]("/ext/ACMODE64.TXT")
+    p55: Ptr[uint8] = cast[Ptr[uint8]]("/ext/ACMODE55.TXT")
+    p44: Ptr[uint8] = cast[Ptr[uint8]]("/ext/ACMODE44.TXT")
+    pno: Ptr[uint8] = cast[Ptr[uint8]]("/ext/ACMODE_NOPE.TXT")
+
+    # --- F_OK on an existing file: 0 -----------------------------------
+    r: int64 = _uabi_test_dispatch(SYS_access, cast[uint64](p64), 0, 0, 0)
+    if r != 0:
+        printk1("[ACCESS_MODE] FAIL F_OK(0664) rc=%d (want 0)\n",
+                cast[uint64](r))
+        _statfs_selftest_restore(boot_task, &fd_save[0])
+        return 1
+
+    # --- R_OK(4) / W_OK(2) on the 0664 file: 0 -------------------------
+    r = _uabi_test_dispatch(SYS_access, cast[uint64](p64), 4, 0, 0)
+    if r != 0:
+        printk1("[ACCESS_MODE] FAIL R_OK(0664) rc=%d (want 0)\n",
+                cast[uint64](r))
+        _statfs_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    r = _uabi_test_dispatch(SYS_access, cast[uint64](p64), 2, 0, 0)
+    if r != 0:
+        printk1("[ACCESS_MODE] FAIL W_OK(0664) rc=%d (want 0)\n",
+                cast[uint64](r))
+        _statfs_selftest_restore(boot_task, &fd_save[0])
+        return 1
+
+    # --- X_OK(1) on the 0664 file (no x bit): -EACCES ------------------
+    r = _uabi_test_dispatch(SYS_access, cast[uint64](p64), 1, 0, 0)
+    if r != ELINUX_ACCES:
+        printk1("[ACCESS_MODE] FAIL X_OK(0664) rc=%d (want -13)\n",
+                cast[uint64](r))
+        _statfs_selftest_restore(boot_task, &fd_save[0])
+        return 1
+
+    # --- X_OK(1) on the 0755 file (x bit set): 0 -----------------------
+    r = _uabi_test_dispatch(SYS_access, cast[uint64](p55), 1, 0, 0)
+    if r != 0:
+        printk1("[ACCESS_MODE] FAIL X_OK(0755) rc=%d (want 0)\n",
+                cast[uint64](r))
+        _statfs_selftest_restore(boot_task, &fd_save[0])
+        return 1
+
+    # --- W_OK(2) on the 0444 file (no w bit): -EACCES ------------------
+    r = _uabi_test_dispatch(SYS_access, cast[uint64](p44), 2, 0, 0)
+    if r != ELINUX_ACCES:
+        printk1("[ACCESS_MODE] FAIL W_OK(0444) rc=%d (want -13)\n",
+                cast[uint64](r))
+        _statfs_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    # R_OK(4) on the 0444 file is still allowed.
+    r = _uabi_test_dispatch(SYS_access, cast[uint64](p44), 4, 0, 0)
+    if r != 0:
+        printk1("[ACCESS_MODE] FAIL R_OK(0444) rc=%d (want 0)\n",
+                cast[uint64](r))
+        _statfs_selftest_restore(boot_task, &fd_save[0])
+        return 1
+
+    # --- non-existent path: -ENOENT ------------------------------------
+    r = _uabi_test_dispatch(SYS_access, cast[uint64](pno), 0, 0, 0)
+    if r != ELINUX_NOENT:
+        printk1("[ACCESS_MODE] FAIL ENOENT rc=%d (want -2)\n",
+                cast[uint64](r))
+        _statfs_selftest_restore(boot_task, &fd_save[0])
+        return 1
+
+    _statfs_selftest_restore(boot_task, &fd_save[0])
+    printk0("[ACCESS_MODE] PASS\n")
+    return 0
 
 
 # =====================================================================

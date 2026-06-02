@@ -704,6 +704,18 @@ if os.environ.get("ENABLE_TMPFS_LINK_TEST") == "1":
 if os.environ.get("ENABLE_STATFS_TEST") == "1":
     FILES.append(("/etc/statfs-test", b"1\n"))
 
+# access(2) mode-bit self-test. scripts/test_access_mode.sh sets
+# ENABLE_ACCESS_MODE_TEST=1 to plant /etc/access-mode-test. init/main.ad
+# at boot:37.acc detects the marker after the ext4 mount and calls
+# access_mode_selftest() (linux_abi/u_syscalls.ad): it stamps a few ext4
+# files with known modes (0664/0755/0444) on the live /ext mount, then
+# drives SYS_access through the real Linux-ABI dispatch asserting the
+# R/W/X bit check against i_mode (X_OK on a no-x file is -EACCES, X_OK on
+# an executable is 0, W_OK on a read-only file is -EACCES) plus -ENOENT
+# for a missing path. Writes to the mounted ext4 image, so it is opt-in.
+if os.environ.get("ENABLE_ACCESS_MODE_TEST") == "1":
+    FILES.append(("/etc/access-mode-test", b"1\n"))
+
 # MBR extended/logical-partition (EBR chain) self-test. scripts/
 # test_partebr.sh sets ENABLE_PARTEBR_TEST=1 to plant /etc/partebr-test
 # and attaches a raw "vda" disk carrying an MBR + extended container +
