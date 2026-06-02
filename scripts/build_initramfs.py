@@ -585,6 +585,20 @@ if os.environ.get("ENABLE_AHCI_BLK_TEST") == "1":
 if os.environ.get("ENABLE_FAT_MKFS_TEST") == "1":
     FILES.append(("/etc/fat-mkfs-test", b"1\n"))
 
+# FAT16 mkfs formatter self-test. scripts/test_fat16_mkfs.sh sets
+# ENABLE_FAT16_MKFS_TEST=1 to plant /etc/fat16-mkfs-test. init/main.ad at
+# boot:37.fmk16 detects the marker and calls fat16_mkfs_selftest()
+# (fs/fat_mkfs.ad): it formats the AHCI scratch disk registered as "sd0"
+# with a 128 MiB volume (~8188 clusters -> FAT16) via fat_mkfs(slot, 128),
+# then reads the boot sector + first FAT sector back through the generic
+# block layer and verifies the BPB fields (0x55AA signature, bytes/sector,
+# sectors/cluster, "FAT16   " FS-type string) and the 16-bit FAT[0]/FAT[1]
+# seed (entry0 low byte 0xF8, entry1 0xFFFF). Requires the test to attach a
+# QEMU ich9-ahci disk >= 128 MiB. Default boots omit the marker so it never
+# fires.
+if os.environ.get("ENABLE_FAT16_MKFS_TEST") == "1":
+    FILES.append(("/etc/fat16-mkfs-test", b"1\n"))
+
 # Plan-9 namespace bind/mount/unmount self-test. scripts/test_bind.sh sets
 # ENABLE_BIND_TEST=1 to plant /etc/bind-test plus two source directories
 # of fixture files. init/main.ad at boot:37.bind detects the marker and
