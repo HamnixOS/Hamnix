@@ -223,6 +223,15 @@ from kernel.sched.core import (
     # task's fd table (it is uninitialised at boot:37 — per-task fd tables
     # are only set up by create_user_task / kthread_create).
     FD_CLOSED_MARK,
+    # msync_selftest builds a tmpfs-backed MAP_SHARED VMA; its FDs (and the
+    # backing-identity triple it hands vma_alloc_file_shared) use this mark.
+    FD_TMPFS_MARK,
+)
+# msync_selftest backs its known-content file on tmpfs (the cpio initramfs
+# is read-only — a MAP_SHARED-writable mapping over it is refused), then
+# reads it back independently of the mapping to confirm the flush landed.
+from fs.tmpfs import (
+    tmpfs_open_for_write, tmpfs_write, tmpfs_read, tmpfs_size,
 )
 # M16.36: install per-task PT entries for the lazy brk reservation.
 # Previously the brk heap (and stack, and ELF image) relied on the
@@ -252,7 +261,13 @@ from mm.page_alloc import alloc_pages, free_pages
 # vma_clear is called from arch/x86/kernel/syscall.ad::do_execve before
 # loading the new ELF image; everything else (mmap/munmap/mprotect) is
 # self-contained inside this module.
-from mm.vma import vma_alloc, vma_unmap, vma_protect, vma_madvise
+from mm.vma import (
+    vma_alloc, vma_unmap, vma_protect, vma_madvise, vma_writeback_range,
+    # msync_selftest builds a writable file-backed shared VMA and faults
+    # its pages in directly (a synchronous kernel self-test cannot take a
+    # real #PF on its own access), then drives msync via the real dispatch.
+    vma_alloc_file_shared, vma_demand_fault,
+)
 
 # memset for zero-filling user-supplied stat buffers before we poke
 # individual fields. Declared `extern` because the actual body lives in
@@ -263,6 +278,11 @@ extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
 # brk reservation installs fresh per-task PT entries — the same TLB-
 # flush dance do_execve / SYS_SPAWN do after elf_apply_last_user_mapping.
 extern def load_cr3(value: uint64)
+# msync_selftest runs at boot:37.msy, BEFORE syscall_init (boot:39) arms
+# IA32_EFER.NXE. Shared-writable file pages are WRITABLE NX DATA, so a
+# data access would otherwise take a reserved-bit #PF. Arm NXE first
+# (idempotent — syscall_init re-arms it), like the file-mmap selftests.
+extern def set_efer_nxe()
 
 # Generic MSR writer — the asm body lives in arch/x86/kernel/syscall_64.S
 # (write_msr) and takes the canonical (index, value) pair. We need it for
@@ -3912,7 +3932,27 @@ def _u_unimpl_mremap(a0: uint64, a1: uint64, a2: uint64,
 
 def _u_unimpl_msync(a0: uint64, a1: uint64, a2: uint64,
                     a3: uint64, a4: uint64, a5: uint64) -> int64:
-    return ELINUX_NOSYS
+    # int msync(void *addr, size_t length, int flags).
+    # a0 = addr, a1 = length, a2 = flags (MS_ASYNC=1, MS_INVALIDATE=2,
+    # MS_SYNC=4). Flush the dirtied resident pages of every MAP_SHARED
+    # writable file-backed VMA intersecting [addr, addr+length) back to
+    # the backing file. This mirrors the native SYS_MSYNC handler in
+    # arch/x86/kernel/syscall.ad: addr must be page-aligned, MS_SYNC and
+    # MS_ASYNC are treated identically (the underlying write-back is
+    # synchronous — there is no deferred queue), and a range covering no
+    # file-shared VMA (anonymous / MAP_PRIVATE / read-only) is a
+    # successful no-op, exactly like Linux. The flush itself lives in
+    # mm/vma.ad::vma_writeback_range; we just translate the kernel rc to
+    # the Linux return convention (0 on success, negative errno on fail).
+    if (a0 & (0x1000 - 1)) != 0:
+        set_current_errstr("msync: addr not page-aligned")
+        return ELINUX_INVAL              # -EINVAL, matching POSIX
+    msync_slot: uint64 = current_idx_get()
+    msync_rc: int64 = vma_writeback_range(msync_slot, a0, a1)
+    if msync_rc < 0:
+        set_current_errstr("msync: writeback failed")
+        return msync_rc
+    return 0
 
 
 def _u_unimpl_nanosleep(a0: uint64, a1: uint64, a2: uint64,
@@ -5790,6 +5830,215 @@ def uabi_fills_selftest() -> int32:
 
     printk0("[UABI_FILLS] PASS\n")
     return 0
+
+
+# =====================================================================
+# msync(2) self-test  (gated on /etc/msync-test, ENABLE_MSYNC_TEST=1)
+# =====================================================================
+#
+# Proves the real msync(2) handler (_u_unimpl_msync) flushes a dirtied
+# MAP_SHARED writable file-backed mapping back to the BACKING FILE, driven
+# through the REAL in-kernel Linux-ABI dispatch (the exact path a Debian/
+# glibc binary takes), NOT a direct vma_writeback_range call.
+#
+# Steps:
+#   1. Create /tmp/msync-data on tmpfs and fill it with known content.
+#   2. Build a shared-writable file VMA over it (vma_alloc_file_shared,
+#      same backing-identity triple a userland open would yield) and fault
+#      every page in (the populator reads the current file bytes).
+#   3. Modify a span of bytes THROUGH the mapping.
+#   4. Call msync(addr, len, MS_SYNC) via linux_u_syscall_dispatch.
+#   5. Read the backing file back via tmpfs_read (NOT the mapping) and
+#      confirm the modified bytes landed in the file, and that the
+#      unmodified region is preserved.
+#   6. Assert msync of a non-page-aligned addr returns -EINVAL, and msync
+#      of an anonymous/non-file region is a benign 0 (nothing to flush).
+# Prints a single "[MSYNC] PASS" / "[MSYNC] FAIL ..." on EMERG serial.
+#
+# Runs in the boot task's own address space and drives vma_demand_fault
+# directly (a synchronous kernel self-test cannot take a real #PF on its
+# own access), mirroring mmap_shared_selftest in init/main.ad.
+
+
+def _msync_expect_byte(i: uint64) -> uint8:
+    # Original known-content formula for the backing file.
+    return cast[uint8](((i * 37 + 7) & 0xFF))
+
+
+def msync_selftest() -> int32:
+    # Returns 0 on PASS, non-zero on the first failed assertion.
+    PROT_READ:  int32 = 0x1
+    PROT_WRITE: int32 = 0x2
+    MAP_SHARED: int32 = 0x01
+    MS_SYNC:    uint64 = 4
+    PG: uint64 = 4096
+
+    # Shared-writable pages are WRITABLE NX DATA; arm NXE before any
+    # access (idempotent — syscall_init re-arms it later).
+    set_efer_nxe()
+
+    # The boot task that runs this hook (boot:37.msy) has an UNINITIALISED
+    # fd table: per-task fd tables are only primed by create_user_task /
+    # kthread_create, neither of which has run for the bootstrap context.
+    # tmpfs_open_for_write allocates an fd, so mark slots 3..15 free first
+    # (then restore them) — same handling as uabi_fills_selftest.
+    boot_task: Ptr[TaskStruct] = current_task()
+    fd_save: Array[16, uint32]
+    fdi: uint64 = 3
+    while fdi < 16:
+        fd_save[fdi] = boot_task[0].fd_idx[fdi]
+        boot_task[0].fd_idx[fdi] = FD_CLOSED_MARK
+        fdi = fdi + 1
+
+    boot_slot: uint64 = current_idx_get()
+    boot_pml4: uint64 = task_pml4(cast[int32](boot_slot))
+
+    # ---- Build the known-content backing file on tmpfs -----------------
+    fsize: uint64 = 2 * PG + 64
+    fpath: Ptr[char] = "/tmp/msync-data"
+    slot: int32 = tmpfs_open_for_write(fpath)
+    if slot < 0:
+        printk1("[MSYNC] FAIL tmpfs create rc=%d\n",
+                cast[uint64](cast[int64](slot)))
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    fillbuf: Array[256, uint8]
+    wpos: uint64 = 0
+    while wpos < fsize:
+        n: uint64 = fsize - wpos
+        if n > 256:
+            n = 256
+        bk: uint64 = 0
+        while bk < n:
+            fillbuf[bk] = _msync_expect_byte(wpos + bk)
+            bk = bk + 1
+        wrote: uint64 = tmpfs_write(slot, &fillbuf[0], wpos, n)
+        if wrote != n:
+            printk0("[MSYNC] FAIL tmpfs short write\n")
+            _msync_restore_fds(boot_task, &fd_save[0])
+            return 1
+        wpos = wpos + n
+    if tmpfs_size(slot) != fsize:
+        printk2("[MSYNC] FAIL tmpfs size=%d want=%d\n",
+                tmpfs_size(slot), fsize)
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    marker:  uint32 = FD_TMPFS_MARK
+    backing: uint64 = cast[uint64](cast[uint32](slot))
+
+    # ---- Map whole file, MAP_SHARED | PROT_READ|PROT_WRITE -------------
+    base64: int64 = vma_alloc_file_shared(boot_slot, 0, fsize,
+                                          PROT_READ | PROT_WRITE,
+                                          MAP_SHARED,
+                                          cast[int32](marker), backing,
+                                          fsize, 0)
+    if base64 < 0:
+        printk0("[MSYNC] FAIL vma_alloc_file_shared\n")
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    base: uint64 = cast[uint64](base64)
+    npages: uint64 = (fsize + PG - 1) / PG
+    fp: uint64 = 0
+    while fp < npages:
+        vma_demand_fault(boot_slot, boot_pml4, base + fp * PG)
+        fp = fp + 1
+
+    # Confirm the faulted-in bytes equal the original file content.
+    mism0: uint64 = 0
+    bi: uint64 = 0
+    while bi < fsize:
+        if cast[Ptr[uint8]](base + bi)[0] != _msync_expect_byte(bi):
+            mism0 = mism0 + 1
+        bi = bi + 1
+    if mism0 != 0:
+        printk1("[MSYNC] FAIL initial content mismatch (%d)\n", mism0)
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+
+    # ---- Modify a span THROUGH the mapping (straddles page boundary) ---
+    # New byte i == (i*53 + 17) & 0xFF, 220 bytes across the 1st boundary.
+    mod_start: uint64 = PG - 90
+    mod_len:   uint64 = 220
+    mp: uint64 = 0
+    while mp < mod_len:
+        cast[Ptr[uint8]](base + mod_start + mp)[0] = \
+            cast[uint8](((mod_start + mp) * 53 + 17) & 0xFF)
+        mp = mp + 1
+
+    # ---- msync(addr, len, MS_SYNC) via the REAL dispatch ---------------
+    msrc: int64 = _uabi_test_dispatch(SYS_msync, base, fsize, MS_SYNC, 0)
+    if msrc != 0:
+        printk1("[MSYNC] FAIL msync rc=%d\n", cast[uint64](msrc))
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+
+    # ---- Read the backing file independently (NOT the mapping) ---------
+    rdbuf: Array[256, uint8]
+    rd_mism: uint64 = 0
+    ri: uint64 = mod_start
+    while ri < mod_start + mod_len:
+        chunk: uint64 = mod_start + mod_len - ri
+        if chunk > 256:
+            chunk = 256
+        got: uint64 = tmpfs_read(slot, &rdbuf[0], ri, chunk)
+        if got != chunk:
+            printk0("[MSYNC] FAIL tmpfs read short during verify\n")
+            _msync_restore_fds(boot_task, &fd_save[0])
+            return 1
+        ck: uint64 = 0
+        while ck < chunk:
+            want: uint8 = cast[uint8](((ri + ck) * 53 + 17) & 0xFF)
+            if rdbuf[ck] != want:
+                rd_mism = rd_mism + 1
+            ck = ck + 1
+        ri = ri + chunk
+    if rd_mism != 0:
+        printk1("[MSYNC] FAIL backing file missing writes (%d)\n", rd_mism)
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+
+    # Bytes OUTSIDE the modified span must still hold original content.
+    if tmpfs_read(slot, &rdbuf[0], 0, 16) != 16:
+        printk0("[MSYNC] FAIL tmpfs read head\n")
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+    hk: uint64 = 0
+    while hk < 16:
+        if rdbuf[hk] != _msync_expect_byte(hk):
+            printk0("[MSYNC] FAIL unmodified region corrupted\n")
+            _msync_restore_fds(boot_task, &fd_save[0])
+            return 1
+        hk = hk + 1
+
+    # ---- Negative: non-page-aligned addr must return -EINVAL ----------
+    bad_rc: int64 = _uabi_test_dispatch(SYS_msync, base + 1, fsize,
+                                        MS_SYNC, 0)
+    if bad_rc != cast[int64](-22):
+        printk1("[MSYNC] FAIL unaligned addr rc=%d (want -22)\n",
+                cast[uint64](bad_rc))
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+
+    # ---- Benign: msync of a length-0 range is a no-op success ----------
+    zero_rc: int64 = _uabi_test_dispatch(SYS_msync, base, 0, MS_SYNC, 0)
+    if zero_rc != 0:
+        printk1("[MSYNC] FAIL zero-len rc=%d (want 0)\n",
+                cast[uint64](zero_rc))
+        _msync_restore_fds(boot_task, &fd_save[0])
+        return 1
+
+    _msync_restore_fds(boot_task, &fd_save[0])
+    printk0("[MSYNC] PASS\n")
+    return 0
+
+
+def _msync_restore_fds(boot_task: Ptr[TaskStruct], fd_save: Ptr[uint32]):
+    # Restore the boot task's original fd slots so the table looks
+    # untouched to anything that runs after this hook.
+    fdr: uint64 = 3
+    while fdr < 16:
+        boot_task[0].fd_idx[fdr] = fd_save[fdr]
+        fdr = fdr + 1
 
 
 # =====================================================================

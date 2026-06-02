@@ -312,6 +312,19 @@ if os.environ.get("ENABLE_MMAP_SHARED_TEST") == "1":
 if os.environ.get("ENABLE_UABI_FILLS_TEST") == "1":
     FILES.append(("/etc/uabi-fills-test", b"1\n"))
 
+# linux-abi msync(2) self-test. scripts/test_msync.sh sets
+# ENABLE_MSYNC_TEST=1 to plant /etc/msync-test (the gate marker).
+# init/main.ad at boot:37.msy detects it and calls msync_selftest()
+# (linux_abi/u_syscalls.ad): it creates a known-content file on tmpfs (a
+# WRITABLE backend), mmap()s it MAP_SHARED|PROT_WRITE, modifies bytes
+# through the mapping, calls msync(MS_SYNC) via the REAL Linux-ABI
+# dispatch, then reads the backing file back via the normal read path (NOT
+# the mapping), confirming the flush landed. Prints "[MSYNC] PASS" /
+# "[MSYNC] FAIL". Default boots omit the marker so the self-test never
+# fires.
+if os.environ.get("ENABLE_MSYNC_TEST") == "1":
+    FILES.append(("/etc/msync-test", b"1\n"))
+
 # SMP kthread-churn soak. scripts/test_smp_soak.sh sets ENABLE_SMP_SOAK=1
 # to plant /etc/smp-soak in the initramfs. init/main.ad at boot:37 detects
 # the marker and calls smp_kthread_soak_run() (kernel/sched/core.ad) which
