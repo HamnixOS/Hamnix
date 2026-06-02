@@ -861,6 +861,16 @@ if os.environ.get("ENABLE_STARTTIME_TEST") == "1":
 if os.environ.get("ENABLE_PRIONICE_TEST") == "1":
     FILES.append(("/etc/prionice-test", b"1\n"))
 
+# /proc/<pid>/stat pgrp (field 5) self-test.
+# scripts/test_pgrp.sh sets ENABLE_PGRP_TEST=1 to plant /etc/pgrp-test.
+# init/main.ad detects the marker and calls pgrp_selftest() (devproc.ad):
+# it sets the boot slot's job_pgid to a known sentinel (4242), renders
+# _emit_linux_stat for the boot slot, parses field 5 (pgrp), confirms it
+# equals 4242, then emits the [PGRP] PASS banner. Needs no extra device;
+# default boots omit it.
+if os.environ.get("ENABLE_PGRP_TEST") == "1":
+    FILES.append(("/etc/pgrp-test", b"1\n"))
+
 # /proc/<pid>/stat child-resource accounting (fields 11/13/16/17) self-test.
 # scripts/test_childacct.sh sets ENABLE_CHILDACCT_TEST=1 to plant
 # /etc/childacct-test. init/main.ad detects the marker and calls
