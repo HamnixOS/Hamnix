@@ -596,6 +596,17 @@ if os.environ.get("ENABLE_EXT4_MKDIR_TEST") == "1":
 if os.environ.get("ENABLE_EXT4_SYMLINK_TEST") == "1":
     FILES.append(("/etc/ext4-symlink-test", b"1\n"))
 
+# Per-backend fstat metadata self-test. scripts/test_fstat_backend.sh sets
+# ENABLE_FSTAT_BACKEND_TEST=1 to plant /etc/fstat-backend-test. init/main.ad
+# detects the marker after the ext4 mount and calls fstat_backend_selftest()
+# (sys/src/9/port/sysfile.ad): it writes a known-length file on tmpfs and on
+# the live ext4 mount, fstat's each fd, and asserts the returned Dir-record
+# length matches the bytes written — proving do_fstat now returns real
+# per-backend metadata instead of "backend not supported". Writes to the
+# mounted ext4 image, so it is opt-in. Default boots omit the marker.
+if os.environ.get("ENABLE_FSTAT_BACKEND_TEST") == "1":
+    FILES.append(("/etc/fstat-backend-test", b"1\n"))
+
 # MBR extended/logical-partition (EBR chain) self-test. scripts/
 # test_partebr.sh sets ENABLE_PARTEBR_TEST=1 to plant /etc/partebr-test
 # and attaches a raw "vda" disk carrying an MBR + extended container +
