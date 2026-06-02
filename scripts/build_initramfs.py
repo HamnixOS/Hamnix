@@ -927,6 +927,15 @@ if os.environ.get("ENABLE_PROCIO_TEST"):
 if os.environ.get("ENABLE_PROCLIMITS_TEST"):
     FILES.append(("/etc/proclimits-test", b"1\n"))
 
+# /proc/<pid>/ctl write-surface self-test. scripts/test_procctl.sh sets
+# ENABLE_PROCCTL_TEST=1 to plant /etc/procctl-test. init/main.ad detects the
+# marker and calls procctl_selftest() (devproc.ad): it drives the real
+# _ctl_parse_pri on a "pri -5" control message, applies it via sched_set_nice,
+# and asserts sched_get_nice(boot_slot)==-5, then emits the [PROCCTL] PASS
+# banner. Needs no extra device.
+if os.environ.get("ENABLE_PROCCTL_TEST"):
+    FILES.append(("/etc/procctl-test", b"1\n"))
+
 # /proc/<pid>/stat child-resource accounting (fields 11/13/16/17) self-test.
 # scripts/test_childacct.sh sets ENABLE_CHILDACCT_TEST=1 to plant
 # /etc/childacct-test. init/main.ad detects the marker and calls
