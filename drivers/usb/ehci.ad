@@ -99,9 +99,12 @@ from drivers.usb.usb import (
     usb_if_class, usb_if_protocol, usb_if_number,
     usb_ep_is_interrupt_in, usb_ep_address, usb_ep_max_packet,
     usb_ep_interval,
+    usb_ep_is_bulk_in, usb_ep_is_bulk_out,
+    USB_CLASS_MASS_STORAGE,
 )
 
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
 
 # --- PCI class triple ---------------------------------------------
@@ -455,6 +458,33 @@ class EhciState:
     irq_pin:     uint32     # IOAPIC pin (INTx fallback path only)
     irq_count:   uint64     # times ehci_irq_handler fired
     irq_reports: uint32     # interrupt-IN reports drained from IRQ ctx
+
+    # --- V3 mass-storage (Bulk-Only Transport) state -------------
+    #
+    # A USB 2.0 mass-storage stick on a root-hub port. The bulk path
+    # uses its OWN async QH (msc_bulk_qh) separate from the control QH,
+    # plus a dedicated DMA page (msc_page) holding the bulk QH, two
+    # bulk qTDs, and CBW/CSW/data staging buffers — see the
+    # EHCI_MSC_OFF_* offsets. Each bulk endpoint keeps its OWN data
+    # toggle in software (msc_in_toggle / msc_out_toggle), since a bulk
+    # endpoint's toggle persists across transfers (DTC=0 on the QH).
+    msc_present:    uint32  # 1 once a mass-storage device is enumerated
+    msc_page:       uint64  # bulk DMA page base
+    msc_bulk_qh:    uint64  # async bulk QH
+    msc_bqtd0:      uint64  # bulk qTD slot 0
+    msc_bqtd1:      uint64  # bulk qTD slot 1
+    msc_cbw_buf:    uint64  # 31-byte CBW staging
+    msc_csw_buf:    uint64  # 13-byte CSW staging
+    msc_data_buf:   uint64  # bulk data DMA buffer
+    msc_in_ep:      uint32  # bulk-IN endpoint number
+    msc_out_ep:     uint32  # bulk-OUT endpoint number
+    msc_in_mps:     uint32  # bulk-IN max packet (512 for HS)
+    msc_out_mps:    uint32  # bulk-OUT max packet (512 for HS)
+    msc_in_toggle:  uint32  # software data toggle for the IN endpoint
+    msc_out_toggle: uint32  # software data toggle for the OUT endpoint
+    msc_tag:        uint32  # rolling CBW tag
+    msc_block_size: uint32  # SCSI logical block size
+    msc_last_lba:   uint32  # last addressable LBA (READ CAPACITY)
 
 
 ehci: EhciState
@@ -1955,3 +1985,648 @@ def ehci_v1_selftest():
 #     handler only logs the Port Change cause).
 #   - MSI-X (cap ID 0x11) for multi-vector — V2 stays single-vector MSI.
 # =====================================================================
+
+
+# =====================================================================
+# V3 — Bulk transfers + USB Mass-Storage (Bulk-Only Transport).
+# =====================================================================
+#
+# The control + interrupt paths above prove the EHCI engine can run the
+# async (control) and periodic (interrupt-IN) schedules. A USB 2.0 mass-
+# storage stick needs a THIRD transfer type: BULK. A bulk endpoint lives
+# on the async ring exactly like the control QH, but:
+#   - its Endpoint-Characteristics carry the bulk EP number + a 512-byte
+#     max-packet (high-speed bulk), and Data-Toggle-Control = 0 — the
+#     toggle is owned by the QH/endpoint and persists across transfers,
+#     UNLIKE control (where every SETUP restarts at toggle 0). We track
+#     each direction's toggle in software (msc_in_toggle/msc_out_toggle)
+#     and seed it into the qTD, then flip it by the number of packets the
+#     transfer consumed.
+#   - there is no SETUP/STATUS framing: a bulk transfer is just a qTD
+#     chain of IN or OUT data, IOC on the last qTD, polled to retirement.
+#
+# On top of the bulk primitive we run Bulk-Only Transport (USB Mass
+# Storage Class, BOT rev 1.0): CBW on bulk-OUT, optional data phase, CSW
+# on bulk-IN — the SAME protocol drivers/usb/storage.ad runs over xHCI.
+# We implement the minimal SCSI (INQUIRY / READ CAPACITY / READ(10))
+# needed to enumerate the stick and read sector 0 back, mirroring the
+# xHCI usbms exercise. The selftest (ehci_msc_selftest, gated on
+# /etc/ehci-msc-test) proves the whole stack on an EHCI controller.
+
+
+# --- V3: bulk DMA-page byte offsets -------------------------------
+#
+# One alloc_pages(0) page (4 KiB, page-aligned). Every k*32 offset is
+# 32-byte aligned (QH/qTD requirement). The data buffer is page-aligned
+# at +0x800 so a 512-byte (or 8/13/36-byte) transfer never crosses a
+# page boundary — a single qTD buffer pointer suffices.
+EHCI_MSC_OFF_BULK_QH:  uint64 = 0x000     # bulk async QH   (96 B)
+EHCI_MSC_OFF_BQTD0:    uint64 = 0x100     # bulk qTD slot 0 (32 B)
+EHCI_MSC_OFF_BQTD1:    uint64 = 0x120     # bulk qTD slot 1 (32 B)
+EHCI_MSC_OFF_CBW_BUF:  uint64 = 0x200     # 31-byte CBW staging
+EHCI_MSC_OFF_CSW_BUF:  uint64 = 0x240     # 13-byte CSW staging
+EHCI_MSC_OFF_DATA_BUF: uint64 = 0x800     # bulk data DMA buffer (<=512 B)
+
+# Bulk-Only Transport / SCSI constants (mirror drivers/usb/storage.ad).
+EHCI_CBW_SIGNATURE: uint32 = 0x43425355   # "USBC"
+EHCI_CSW_SIGNATURE: uint32 = 0x53425355   # "USBS"
+EHCI_CBW_LEN:       uint32 = 31
+EHCI_CSW_LEN:       uint32 = 13
+EHCI_CBW_FLAG_IN:   uint8  = 0x80
+EHCI_CBW_FLAG_OUT:  uint8  = 0x00
+
+EHCI_SCSI_INQUIRY:        uint8 = 0x12
+EHCI_SCSI_READ_CAPACITY: uint8 = 0x25
+EHCI_SCSI_READ10:        uint8 = 0x28
+EHCI_SCSI_TEST_UNIT_RDY: uint8 = 0x00
+
+
+# --- V3: little-endian / big-endian field writers -----------------
+
+def _ehci_le32(p: Ptr[uint8], off: uint64, v: uint32):
+    p[off + 0] = cast[uint8](v & 0xFF)
+    p[off + 1] = cast[uint8]((v >> 8) & 0xFF)
+    p[off + 2] = cast[uint8]((v >> 16) & 0xFF)
+    p[off + 3] = cast[uint8]((v >> 24) & 0xFF)
+
+
+def _ehci_be32_write(p: Ptr[uint8], off: uint64, v: uint32):
+    p[off + 0] = cast[uint8]((v >> 24) & 0xFF)
+    p[off + 1] = cast[uint8]((v >> 16) & 0xFF)
+    p[off + 2] = cast[uint8]((v >> 8) & 0xFF)
+    p[off + 3] = cast[uint8](v & 0xFF)
+
+
+def _ehci_be16_write(p: Ptr[uint8], off: uint64, v: uint16):
+    p[off + 0] = cast[uint8]((cast[uint32](v) >> 8) & 0xFF)
+    p[off + 1] = cast[uint8](cast[uint32](v) & 0xFF)
+
+
+def _ehci_le32_read(p: Ptr[uint8], off: uint64) -> uint32:
+    return cast[uint32](p[off + 0]) \
+         | (cast[uint32](p[off + 1]) << 8) \
+         | (cast[uint32](p[off + 2]) << 16) \
+         | (cast[uint32](p[off + 3]) << 24)
+
+
+def _ehci_be32_read(p: Ptr[uint8], off: uint64) -> uint32:
+    return (cast[uint32](p[off + 0]) << 24) \
+         | (cast[uint32](p[off + 1]) << 16) \
+         | (cast[uint32](p[off + 2]) << 8) \
+         | cast[uint32](p[off + 3])
+
+
+# --- V3: bulk qTD writer (handles a buffer crossing one page edge) -
+
+def _ehci_bulk_qtd_init(qtd: uint64, next_qtd: uint64,
+                        pid: uint32, toggle: uint32,
+                        buf: uint64, nbytes: uint32, ioc: uint32):
+    # Like _ehci_qtd_init but fills buffer pointers 0 and 1 so a buffer
+    # of up to ~4 KiB starting at an arbitrary page offset is described
+    # correctly (the data buffer is page-aligned so pointer 0 alone
+    # covers <=4096 bytes, but we fill pointer 1 defensively).
+    p: Ptr[uint32] = cast[Ptr[uint32]](qtd)
+    if next_qtd == 0:
+        p[0] = EHCI_QTD_T
+    else:
+        p[0] = cast[uint32](next_qtd & 0xFFFFFFE0)
+    p[1] = EHCI_QTD_T
+    tok: uint32 = EHCI_QTD_STS_ACTIVE | EHCI_QTD_CERR3 | pid \
+                | (nbytes << EHCI_QTD_BYTES_SHIFT)
+    if toggle != 0:
+        tok = tok | EHCI_QTD_TOGGLE
+    if ioc != 0:
+        tok = tok | EHCI_QTD_IOC
+    p[2] = tok
+    # Buffer pointer 0: the full buffer address (page base + offset).
+    p[3] = cast[uint32](buf & 0xFFFFFFFF)
+    # Buffer pointer 1: next 4 KiB page base (used only if the transfer
+    # spills past the first page boundary — bits 11..0 must be 0).
+    next_page: uint64 = (buf & 0xFFFFF000) + 0x1000
+    p[4] = cast[uint32](next_page & 0xFFFFFFFF)
+    p[5] = 0
+    p[6] = 0
+    p[7] = 0
+
+
+# --- V3: bulk async QH -------------------------------------------
+
+def _ehci_bulk_qh_init(ep: uint32, mps: uint32):
+    # Build the bulk QH (async schedule). DTC=0 — a bulk endpoint owns
+    # its own data toggle (taken from the QH overlay, seeded by the
+    # qTD's toggle bit at arm time). High-speed, device = msc address.
+    qh: Ptr[uint32] = cast[Ptr[uint32]](ehci.msc_bulk_qh)
+    i: uint32 = 0
+    while i < 24:
+        qh[i] = 0
+        i = i + 1
+    # dword 0: horizontal link — splice happens in _ehci_bulk_link.
+    qh[0] = cast[uint32](ehci.async_qh & 0xFFFFFFE0) | EHCI_QH_TYPE_QH
+    # dword 1: Endpoint Characteristics. NO EHCI_QH_EC_DTC (toggle from
+    # qTD overlay seed, persists in the overlay across transfers).
+    ec: uint32 = ehci.dev_addr & 0x7F
+    ec = ec | ((ep & 0x0F) << 8)
+    ec = ec | EHCI_QH_SPEED_HIGH
+    ec = ec | ((mps & 0x7FF) << 16)
+    qh[1] = ec
+    # dword 2: Mult = 1 (one transaction per micro-frame), no S-mask.
+    qh[2] = EHCI_QH_EC_MULT1
+    # dwords 4..6: overlay — terminate, no work yet.
+    qh[4] = EHCI_QTD_T
+    qh[5] = EHCI_QTD_T
+    qh[6] = 0
+
+
+def _ehci_bulk_link():
+    # Splice the bulk QH into the async ring after ctrl_qh:
+    #   async_qh -> ctrl_qh -> bulk_qh -> async_qh
+    cqh: Ptr[uint32] = cast[Ptr[uint32]](ehci.ctrl_qh)
+    bqh: Ptr[uint32] = cast[Ptr[uint32]](ehci.msc_bulk_qh)
+    bqh[0] = cast[uint32](ehci.async_qh & 0xFFFFFFE0) | EHCI_QH_TYPE_QH
+    cqh[0] = cast[uint32](ehci.msc_bulk_qh & 0xFFFFFFE0) | EHCI_QH_TYPE_QH
+
+
+# --- V3: bulk transfer primitive ----------------------------------
+
+def _ehci_bulk_xfer(ep: uint32, mps: uint32, dir_in: int32,
+                    buf: uint64, nbytes: uint32,
+                    toggle_in: uint32) -> int32:
+    # Issue ONE bulk transfer (IN or OUT) of nbytes bytes on endpoint
+    # `ep`. Reconfigures the bulk QH for this endpoint/mps, builds a
+    # single-qTD chain seeded with `toggle_in`, polls the qTD to
+    # retirement, and returns the number of bytes moved (>=0) or -1 on
+    # timeout / halt / error. The whole MSC path keeps nbytes <= 512
+    # (one logical sector) so a single qTD with one page-aligned buffer
+    # is always sufficient.
+    if ehci.msc_present == 0 and ehci.msc_bulk_qh == 0:
+        return -1
+    pid: uint32 = EHCI_QTD_PID_OUT
+    if dir_in != 0:
+        pid = EHCI_QTD_PID_IN
+
+    # (Re)point the QH's Endpoint-Characteristics at this endpoint/mps.
+    qh: Ptr[uint32] = cast[Ptr[uint32]](ehci.msc_bulk_qh)
+    ec: uint32 = ehci.dev_addr & 0x7F
+    ec = ec | ((ep & 0x0F) << 8)
+    ec = ec | EHCI_QH_SPEED_HIGH
+    ec = ec | ((mps & 0x7FF) << 16)
+    qh[1] = ec
+
+    # Build the single data qTD: IOC set, toggle seeded.
+    _ehci_bulk_qtd_init(ehci.msc_bqtd0, 0, pid, toggle_in,
+                        buf, nbytes, 1)
+
+    # Clear the overlay status and point Next-qTD at our qTD. The
+    # controller copies it into the overlay on the next async pass and
+    # adopts the seeded toggle (DTC=0 = "use the qTD's toggle bit").
+    qh[6] = 0
+    qh[5] = EHCI_QTD_T
+    qh[4] = cast[uint32](ehci.msc_bqtd0 & 0xFFFFFFE0)
+
+    # Poll the qTD's Active bit (bounded spin).
+    lp: Ptr[uint32] = cast[Ptr[uint32]](ehci.msc_bqtd0)
+    spin: uint64 = 0
+    done: int32 = 0
+    while spin < 5000000:
+        tok: uint32 = lp[2]
+        if (tok & EHCI_QTD_STS_ACTIVE) == 0:
+            done = 1
+            spin = 5000000
+        else:
+            spin = spin + 1
+    if done == 0:
+        printk0("[ehci-msc] bulk transfer timeout (qTD still active)\n")
+        return -1
+    fin: uint32 = lp[2]
+    if (fin & EHCI_QTD_STS_HALTED) != 0 \
+       or (fin & EHCI_QTD_STS_ERRMASK) != 0:
+        printk1("[ehci-msc] bulk transfer error: token=%x\n",
+                cast[uint64](fin))
+        return -1
+    # Bytes moved = requested - the residual Total-Bytes still in the
+    # token (a short IN packet leaves a non-zero residual).
+    residual: uint32 = (fin >> EHCI_QTD_BYTES_SHIFT) & 0x7FFF
+    moved: uint32 = nbytes
+    if residual <= nbytes:
+        moved = nbytes - residual
+    return cast[int32](moved)
+
+
+def _ehci_bulk_advance_toggle(dir_in: int32, nbytes: uint32, mps: uint32):
+    # Advance the software data toggle for the endpoint by the number of
+    # packets a transfer of nbytes (with max-packet mps) consumed. A
+    # zero-length transfer still consumes one packet (the toggle flips
+    # once). EHCI's overlay tracks the live toggle, but we re-seed it
+    # every transfer, so we mirror the count here.
+    if mps == 0:
+        mps = 512
+    packets: uint32 = (nbytes + mps - 1) / mps
+    if packets == 0:
+        packets = 1
+    flip: uint32 = packets & 1
+    if dir_in != 0:
+        ehci.msc_in_toggle = ehci.msc_in_toggle ^ flip
+    else:
+        ehci.msc_out_toggle = ehci.msc_out_toggle ^ flip
+
+
+# --- V3: Bulk-Only Transport (CBW -> data -> CSW) -----------------
+
+def _ehci_bot_xfer(cdb: Ptr[uint8], cdb_len: uint8,
+                   data_len: uint32, dir_in: int32) -> int32:
+    # One BOT command. Builds + sends the 31-byte CBW on bulk-OUT, moves
+    # the optional data phase (into/out of msc_data_buf) on the matching
+    # bulk endpoint, then reads + validates the 13-byte CSW on bulk-IN.
+    # Returns bytes moved (>=0) on a GOOD CSW, -1 otherwise.
+    cbw: Ptr[uint8] = cast[Ptr[uint8]](ehci.msc_cbw_buf)
+    memset(cbw, 0, EHCI_CBW_LEN)
+    _ehci_le32(cbw, 0, EHCI_CBW_SIGNATURE)
+    ehci.msc_tag = ehci.msc_tag + 1
+    _ehci_le32(cbw, 4, ehci.msc_tag)
+    _ehci_le32(cbw, 8, data_len)
+    if dir_in != 0:
+        cbw[12] = EHCI_CBW_FLAG_IN
+    else:
+        cbw[12] = EHCI_CBW_FLAG_OUT
+    cbw[13] = 0                                  # LUN 0
+    cbw[14] = cdb_len
+    i: uint64 = 0
+    while i < cast[uint64](cdb_len) and i < 16:
+        cbw[15 + i] = cdb[i]
+        i = i + 1
+
+    # Command phase: 31-byte CBW on bulk-OUT.
+    if _ehci_bulk_xfer(ehci.msc_out_ep, ehci.msc_out_mps, 0,
+                       ehci.msc_cbw_buf, EHCI_CBW_LEN,
+                       ehci.msc_out_toggle) < 0:
+        printk0("[ehci-msc] CBW send failed\n")
+        return -1
+    _ehci_bulk_advance_toggle(0, EHCI_CBW_LEN, ehci.msc_out_mps)
+
+    # Data phase.
+    moved: int32 = 0
+    if data_len != 0:
+        if dir_in != 0:
+            moved = _ehci_bulk_xfer(ehci.msc_in_ep, ehci.msc_in_mps, 1,
+                                    ehci.msc_data_buf, data_len,
+                                    ehci.msc_in_toggle)
+            if moved >= 0:
+                _ehci_bulk_advance_toggle(1, data_len, ehci.msc_in_mps)
+        else:
+            moved = _ehci_bulk_xfer(ehci.msc_out_ep, ehci.msc_out_mps, 0,
+                                    ehci.msc_data_buf, data_len,
+                                    ehci.msc_out_toggle)
+            if moved >= 0:
+                _ehci_bulk_advance_toggle(0, data_len, ehci.msc_out_mps)
+        if moved < 0:
+            printk0("[ehci-msc] data phase failed\n")
+            return -1
+
+    # Status phase: 13-byte CSW on bulk-IN.
+    csw: Ptr[uint8] = cast[Ptr[uint8]](ehci.msc_csw_buf)
+    memset(csw, 0, EHCI_CSW_LEN)
+    if _ehci_bulk_xfer(ehci.msc_in_ep, ehci.msc_in_mps, 1,
+                       ehci.msc_csw_buf, EHCI_CSW_LEN,
+                       ehci.msc_in_toggle) < 0:
+        printk0("[ehci-msc] CSW read failed\n")
+        return -1
+    _ehci_bulk_advance_toggle(1, EHCI_CSW_LEN, ehci.msc_in_mps)
+
+    sig: uint32 = _ehci_le32_read(csw, 0)
+    if sig != EHCI_CSW_SIGNATURE:
+        printk1("[ehci-msc] bad CSW signature %x\n", cast[uint64](sig))
+        return -1
+    rtag: uint32 = _ehci_le32_read(csw, 4)
+    if rtag != ehci.msc_tag:
+        printk2("[ehci-msc] CSW tag mismatch got=%d want=%d\n",
+                cast[uint64](rtag), cast[uint64](ehci.msc_tag))
+        return -1
+    status: uint8 = csw[12]
+    if status != 0:
+        printk1("[ehci-msc] CSW status=%d (command failed)\n",
+                cast[uint64](status))
+        return -1
+    return moved
+
+
+# --- V3: minimal SCSI over BOT ------------------------------------
+
+def _ehci_scsi_test_unit_ready() -> int32:
+    cdb: Array[6, uint8]
+    memset(&cdb[0], 0, 6)
+    cdb[0] = EHCI_SCSI_TEST_UNIT_RDY
+    return _ehci_bot_xfer(&cdb[0], 6, 0, 1)
+
+
+def _ehci_scsi_inquiry() -> int32:
+    # Standard INQUIRY, 36 bytes into msc_data_buf. Returns peripheral
+    # device type (bits 4:0 of byte 0; 0 = direct-access block), -1 fail.
+    cdb: Array[6, uint8]
+    memset(&cdb[0], 0, 6)
+    cdb[0] = EHCI_SCSI_INQUIRY
+    cdb[4] = 36
+    if _ehci_bot_xfer(&cdb[0], 6, 36, 1) < 0:
+        return -1
+    d: Ptr[uint8] = cast[Ptr[uint8]](ehci.msc_data_buf)
+    pdt: uint8 = d[0] & 0x1F
+    printk1("[ehci-msc] INQUIRY: peripheral-device-type=%d\n",
+            cast[uint64](pdt))
+    return cast[int32](pdt)
+
+
+def _ehci_scsi_read_capacity() -> int32:
+    # READ CAPACITY(10): 8-byte response = (last LBA, block length),
+    # both big-endian. Fills msc_last_lba / msc_block_size. -1 on fail.
+    cdb: Array[10, uint8]
+    memset(&cdb[0], 0, 10)
+    cdb[0] = EHCI_SCSI_READ_CAPACITY
+    if _ehci_bot_xfer(&cdb[0], 10, 8, 1) < 0:
+        return -1
+    d: Ptr[uint8] = cast[Ptr[uint8]](ehci.msc_data_buf)
+    last_lba: uint32 = _ehci_be32_read(d, 0)
+    blk_len:  uint32 = _ehci_be32_read(d, 4)
+    if blk_len == 0:
+        blk_len = 512
+    ehci.msc_last_lba   = last_lba
+    ehci.msc_block_size = blk_len
+    printk2("[ehci-msc] READ CAPACITY: last_lba=%d block_size=%d\n",
+            cast[uint64](last_lba), cast[uint64](blk_len))
+    return 0
+
+
+def _ehci_scsi_read10(lba: uint32, blocks: uint16) -> int32:
+    # READ(10) of `blocks` logical blocks at `lba` into msc_data_buf.
+    # Returns bytes moved (>=0) or -1.
+    cdb: Array[10, uint8]
+    memset(&cdb[0], 0, 10)
+    cdb[0] = EHCI_SCSI_READ10
+    _ehci_be32_write(&cdb[0], 2, lba)
+    _ehci_be16_write(&cdb[0], 7, blocks)
+    bs: uint32 = ehci.msc_block_size
+    if bs == 0:
+        bs = 512
+    nbytes: uint32 = cast[uint32](blocks) * bs
+    return _ehci_bot_xfer(&cdb[0], 10, nbytes, 1)
+
+
+# --- V3: mass-storage enumeration ---------------------------------
+
+def _ehci_find_msc_port() -> uint32:
+    # First enabled (high-speed) root-hub port carrying a device.
+    # Identical to _ehci_find_kbd_port — a stick and a keyboard look the
+    # same at the port level; the interface descriptor distinguishes them.
+    n: uint32 = 0
+    while n < ehci.n_ports:
+        addr: uint64 = _ehci_portsc_addr(n)
+        portsc: uint32 = _ehci_r32(addr)
+        if (portsc & EHCI_PORTSC_CCS) != 0 \
+           and (portsc & EHCI_PORTSC_PED) != 0:
+            return n + 1
+        n = n + 1
+    return 0
+
+
+def ehci_msc_attach() -> int32:
+    # Enumerate a USB 2.0 mass-storage device on an EHCI root-hub port:
+    # carve the bulk DMA page, build + link a fresh control QH, run
+    # SET_ADDRESS / GET_DESCRIPTOR(s) / SET_CONFIGURATION, locate the
+    # bulk IN/OUT endpoints from the BOT interface, build + link the bulk
+    # QH, and run TEST UNIT READY / INQUIRY / READ CAPACITY. Returns 0 on
+    # success, -1 on any failure. Independent of the keyboard path: it
+    # uses its OWN address (2) and its OWN bulk QH + DMA page.
+    if ehci.present == 0:
+        printk0("[ehci-msc] no EHCI controller present\n")
+        return -1
+    port: uint32 = _ehci_find_msc_port()
+    if port == 0:
+        printk0("[ehci-msc] no enabled high-speed port — no device\n")
+        return -1
+    printk1("[ehci-msc] enumerating device on port %d\n",
+            cast[uint64](port))
+
+    # Re-reset the port so the device returns to the default USB address
+    # 0. ehci_init() runs _ehci_v1_attach_keyboard() during boot, which
+    # SET_ADDRESS(1)s ANY high-speed device on the port (including a mass-
+    # storage stick) before discovering it is not a keyboard. Without a
+    # port reset here the stick would still answer only at address 1, so
+    # our address-0 enumeration would talk to nobody. A reset re-arms the
+    # default-address state machine.
+    _ehci_reset_port(port - 1)
+
+    # Carve the bulk DMA page.
+    page: uint64 = alloc_pages(0)
+    if page == 0:
+        printk0("[ehci-msc] bulk DMA page allocation failed\n")
+        return -1
+    memset(cast[Ptr[uint8]](page), 0, 4096)
+    ehci.msc_page     = page
+    ehci.msc_bulk_qh  = page + EHCI_MSC_OFF_BULK_QH
+    ehci.msc_bqtd0    = page + EHCI_MSC_OFF_BQTD0
+    ehci.msc_bqtd1    = page + EHCI_MSC_OFF_BQTD1
+    ehci.msc_cbw_buf  = page + EHCI_MSC_OFF_CBW_BUF
+    ehci.msc_csw_buf  = page + EHCI_MSC_OFF_CSW_BUF
+    ehci.msc_data_buf = page + EHCI_MSC_OFF_DATA_BUF
+    ehci.msc_tag      = 0
+    ehci.msc_block_size = 512
+    ehci.msc_in_toggle  = 0
+    ehci.msc_out_toggle = 0
+
+    # The control QH is shared with the keyboard path's DMA page. If the
+    # keyboard attach never ran (no kbd on this boot — the usb-storage
+    # case), ehci.ctrl_qh is 0 and we must carve a control QH ourselves.
+    # Reuse the V1 keyboard DMA page if present; otherwise alloc one.
+    if ehci.ctrl_qh == 0:
+        cpage: uint64 = alloc_pages(0)
+        if cpage == 0:
+            printk0("[ehci-msc] control DMA page allocation failed\n")
+            return -1
+        memset(cast[Ptr[uint8]](cpage), 0, 4096)
+        ehci.dma_page  = cpage
+        ehci.ctrl_qh   = cpage + EHCI_DMA_OFF_CTRL_QH
+        ehci.qtd0      = cpage + EHCI_DMA_OFF_QTD0
+        ehci.qtd1      = cpage + EHCI_DMA_OFF_QTD1
+        ehci.qtd2      = cpage + EHCI_DMA_OFF_QTD2
+        ehci.setup_buf = cpage + EHCI_DMA_OFF_SETUP_BUF
+        ehci.data_buf  = cpage + EHCI_DMA_OFF_DATA_BUF
+
+    # Use device address 2 so we never collide with a keyboard that the
+    # V1 path may have addressed as 1 on a shared root hub.
+    ehci.dev_addr = 0
+    ehci.max_pkt0 = 8
+    ehci.ep0_toggle = 0
+    _ehci_qh_init_control(ehci.ctrl_qh)
+    _ehci_async_link()
+
+    # GET_DESCRIPTOR(device, 8) — learn bMaxPacketSize0.
+    if _ehci_control_transfer(USB_RT_GET_DESCRIPTOR,
+                              USB_REQ_GET_DESCRIPTOR,
+                              cast[uint32](USB_DT_DEVICE) << 8, 0,
+                              8, ehci.data_buf) < 0:
+        printk0("[ehci-msc] GET_DESCRIPTOR(device,8) failed\n")
+        return -1
+    mp0: uint8 = usb_dd_max_packet_size0(cast[Ptr[uint8]](ehci.data_buf))
+    if mp0 == 8 or mp0 == 16 or mp0 == 32 or mp0 == 64:
+        ehci.max_pkt0 = cast[uint32](mp0)
+    else:
+        ehci.max_pkt0 = 64
+    printk1("[ehci-msc] device max-packet-0 = %d\n",
+            cast[uint64](ehci.max_pkt0))
+
+    # SET_ADDRESS(2).
+    new_addr: uint32 = 2
+    if _ehci_control_transfer(USB_RT_SET_ADDRESS, USB_REQ_SET_ADDRESS,
+                              new_addr, 0, 0, 0) < 0:
+        printk0("[ehci-msc] SET_ADDRESS failed\n")
+        return -1
+    ehci.dev_addr = new_addr
+    printk1("[ehci-msc] device addressed (addr=%d)\n",
+            cast[uint64](new_addr))
+
+    # GET_DESCRIPTOR(device, 18).
+    if _ehci_control_transfer(USB_RT_GET_DESCRIPTOR,
+                              USB_REQ_GET_DESCRIPTOR,
+                              cast[uint32](USB_DT_DEVICE) << 8, 0,
+                              18, ehci.data_buf) < 0:
+        printk0("[ehci-msc] GET_DESCRIPTOR(device,18) failed\n")
+        return -1
+
+    # GET_DESCRIPTOR(config, 9) header -> wTotalLength -> full set.
+    if _ehci_control_transfer(USB_RT_GET_DESCRIPTOR,
+                              USB_REQ_GET_DESCRIPTOR,
+                              cast[uint32](USB_DT_CONFIG) << 8, 0,
+                              9, ehci.data_buf) < 0:
+        printk0("[ehci-msc] GET_DESCRIPTOR(config,9) failed\n")
+        return -1
+    total: uint16 = usb_cfg_total_length(cast[Ptr[uint8]](ehci.data_buf))
+    if total > 512:
+        total = 512
+    if _ehci_control_transfer(USB_RT_GET_DESCRIPTOR,
+                              USB_REQ_GET_DESCRIPTOR,
+                              cast[uint32](USB_DT_CONFIG) << 8, 0,
+                              cast[uint32](total), ehci.data_buf) < 0:
+        printk0("[ehci-msc] GET_DESCRIPTOR(config,full) failed\n")
+        return -1
+    cfg_value: uint8 = usb_cfg_value(cast[Ptr[uint8]](ehci.data_buf))
+
+    # Walk the config set: find the mass-storage interface + its bulk
+    # IN/OUT endpoints.
+    found_msc: int32 = 0
+    in_ep:   uint32 = 0
+    out_ep:  uint32 = 0
+    in_mps:  uint32 = 512
+    out_mps: uint32 = 512
+    off: uint64 = 9
+    while off + 2 <= cast[uint64](total):
+        dlen:  uint8 = cast[Ptr[uint8]](ehci.data_buf + off)[0]
+        dtype: uint8 = cast[Ptr[uint8]](ehci.data_buf + off + 1)[0]
+        if dlen == 0:
+            off = cast[uint64](total)
+        else:
+            dptr: Ptr[uint8] = cast[Ptr[uint8]](ehci.data_buf + off)
+            if dtype == 0x04:                    # interface descriptor
+                if usb_if_class(dptr) == USB_CLASS_MASS_STORAGE:
+                    found_msc = 1
+            elif dtype == 0x05:                  # endpoint descriptor
+                if found_msc == 1:
+                    if usb_ep_is_bulk_in(dptr) != 0 and in_ep == 0:
+                        in_ep = cast[uint32](usb_ep_address(dptr) & 0x0F)
+                        in_mps = cast[uint32](usb_ep_max_packet(dptr) \
+                                              & 0x07FF)
+                        if in_mps == 0:
+                            in_mps = 512
+                    elif usb_ep_is_bulk_out(dptr) != 0 and out_ep == 0:
+                        out_ep = cast[uint32](usb_ep_address(dptr) & 0x0F)
+                        out_mps = cast[uint32](usb_ep_max_packet(dptr) \
+                                               & 0x07FF)
+                        if out_mps == 0:
+                            out_mps = 512
+            off = off + cast[uint64](dlen)
+
+    if found_msc == 0 or in_ep == 0 or out_ep == 0:
+        printk0("[ehci-msc] device is not a bulk mass-storage device\n")
+        return -1
+    printk2("[ehci-msc] bulk-in-ep=%d bulk-out-ep=%d\n",
+            cast[uint64](in_ep), cast[uint64](out_ep))
+
+    # SET_CONFIGURATION.
+    if _ehci_control_transfer(USB_RT_SET_CONFIGURATION,
+                              USB_REQ_SET_CONFIGURATION,
+                              cast[uint32](cfg_value), 0, 0, 0) < 0:
+        printk0("[ehci-msc] SET_CONFIGURATION failed\n")
+        return -1
+    printk1("[ehci-msc] device configured (config %d)\n",
+            cast[uint64](cfg_value))
+
+    ehci.msc_in_ep  = in_ep
+    ehci.msc_out_ep = out_ep
+    ehci.msc_in_mps  = in_mps
+    ehci.msc_out_mps = out_mps
+    ehci.msc_in_toggle  = 0
+    ehci.msc_out_toggle = 0
+
+    # Build + link the bulk QH into the async ring.
+    _ehci_bulk_qh_init(in_ep, in_mps)
+    _ehci_bulk_link()
+    ehci.msc_present = 1
+
+    # SCSI bring-up: TEST UNIT READY (retry — unit attention), INQUIRY,
+    # READ CAPACITY.
+    ready: int32 = -1
+    a: uint32 = 0
+    while a < 4:
+        ready = _ehci_scsi_test_unit_ready()
+        if ready == 0:
+            a = 4
+        else:
+            a = a + 1
+    if ready != 0:
+        printk0("[ehci-msc] TEST UNIT READY never succeeded (continuing)\n")
+
+    if _ehci_scsi_inquiry() < 0:
+        printk0("[ehci-msc] INQUIRY failed\n")
+        return -1
+    if _ehci_scsi_read_capacity() < 0:
+        printk0("[ehci-msc] READ CAPACITY failed\n")
+        return -1
+    printk0("[ehci-msc] mass-storage device ready\n")
+    return 0
+
+
+# --- V3: gated self-test ------------------------------------------
+
+def ehci_msc_selftest():
+    # Gated on the /etc/ehci-msc-test cpio marker (planted by
+    # scripts/test_ehci_msc.sh via ENABLE_EHCI_MSC_TEST=1). Enumerates a
+    # USB 2.0 mass-storage stick attached to an EHCI controller, reads
+    # sector 0 back over the new bulk path, and matches the EHCIUSB tag
+    # stamped into the test image. PASS/FAIL on printk0 (EMERG -> serial).
+    if ehci_present() == 0:
+        printk0("[ehci-msc] SKIPPED (no EHCI controller this boot)\n")
+        return
+    printk0("[boot:07.e] ehci_msc_selftest\n")
+    if ehci_msc_attach() != 0:
+        printk0("[ehci-msc] FAIL: enumeration / SCSI bring-up failed\n")
+        return
+    # READ(10) of sector 0 (one 512-byte logical block) into msc_data_buf.
+    if _ehci_scsi_read10(0, 1) < 0:
+        printk0("[ehci-msc] FAIL: READ(10) of sector 0 failed\n")
+        return
+    d: Ptr[uint8] = cast[Ptr[uint8]](ehci.msc_data_buf)
+    printk2("[ehci-msc] sector0[0..1]=%x %x\n",
+            cast[uint64](d[0]), cast[uint64](d[1]))
+    printk2("[ehci-msc] sector0[2..3]=%x %x\n",
+            cast[uint64](d[2]), cast[uint64](d[3]))
+    # The test image stamps the ASCII tag "EHCIUSB!" at offset 0.
+    tag: Ptr[uint8] = "EHCIUSB!"
+    tag_ok: int32 = 1
+    k: uint64 = 0
+    while k < 8:
+        if d[k] != tag[k]:
+            tag_ok = 0
+            k = 8
+        else:
+            k = k + 1
+    if tag_ok == 1:
+        printk0("[ehci-msc] PASS: READ(10) sector 0 returned EHCIUSB tag\n")
+    else:
+        printk0("[ehci-msc] FAIL: sector 0 tag mismatch\n")

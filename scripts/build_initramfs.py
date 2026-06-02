@@ -259,6 +259,16 @@ if os.environ.get("ENABLE_XHCI_KBD_LIVE") == "1":
 if os.environ.get("ENABLE_USBMS_TEST") == "1":
     FILES.append(("/etc/usbms-test", b"1\n"))
 
+# EHCI (USB 2.0) mass-storage bulk exercise. Set ENABLE_EHCI_MSC_TEST=1
+# to plant /etc/ehci-msc-test; init/main.ad gates ehci_msc_selftest() on
+# it, which enumerates a USB stick on an EHCI controller (boot QEMU with
+# `-device usb-ehci -device usb-storage,bus=ehci.0,drive=...`), drives
+# the new EHCI bulk path through Bulk-Only Transport + SCSI READ(10), and
+# reads sector 0 back. Default boots ship no marker so the probe is a
+# no-op when no stick is present.
+if os.environ.get("ENABLE_EHCI_MSC_TEST") == "1":
+    FILES.append(("/etc/ehci-msc-test", b"1\n"))
+
 # SMP kthread-churn soak. scripts/test_smp_soak.sh sets ENABLE_SMP_SOAK=1
 # to plant /etc/smp-soak in the initramfs. init/main.ad at boot:37 detects
 # the marker and calls smp_kthread_soak_run() (kernel/sched/core.ad) which
