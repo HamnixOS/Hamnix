@@ -301,6 +301,17 @@ if os.environ.get("ENABLE_MMAP_FILE_TEST") == "1":
 if os.environ.get("ENABLE_MMAP_SHARED_TEST") == "1":
     FILES.append(("/etc/mmap-shared-test", b"1\n"))
 
+# linux-abi U-ABI fills self-test. scripts/test_uabi_fills.sh sets
+# ENABLE_UABI_FILLS_TEST=1 to plant /etc/uabi-fills-test. init/main.ad at
+# boot:37.uaf detects the marker and calls uabi_fills_selftest()
+# (linux_abi/u_syscalls.ad), which drives the newly-filled Linux-ABI
+# syscalls (arch_prctl GET_FS, readlink, uname, newfstatat, pwrite64)
+# through the real in-kernel dispatch entry and prints "[UABI_FILLS] PASS"
+# / "[UABI_FILLS] FAIL ...". The marker doubles as the file newfstatat
+# stat()s. Default boots omit the marker so the self-test never fires.
+if os.environ.get("ENABLE_UABI_FILLS_TEST") == "1":
+    FILES.append(("/etc/uabi-fills-test", b"1\n"))
+
 # SMP kthread-churn soak. scripts/test_smp_soak.sh sets ENABLE_SMP_SOAK=1
 # to plant /etc/smp-soak in the initramfs. init/main.ad at boot:37 detects
 # the marker and calls smp_kthread_soak_run() (kernel/sched/core.ad) which
