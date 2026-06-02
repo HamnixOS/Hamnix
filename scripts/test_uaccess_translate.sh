@@ -83,6 +83,7 @@ need=(
     "unmapped address -> EFAULT (no panic)"
     "RO page readable, write -> EFAULT"
     "SYS_GETCWD copied to the physical frame"
+    "strncpy_from_user copied a path via V != phys"
 )
 for m in "${need[@]}"; do
     if grep -a -q -F "$m" "$LOG"; then
