@@ -280,6 +280,16 @@ if os.environ.get("ENABLE_SCHED_FAIR") == "1":
 if os.environ.get("ENABLE_VK_TEST") == "1":
     FILES.append(("/etc/vk-test", b"1\n"))
 
+# #168: REAL ACPI S5 poweroff + reboot self-test.
+# scripts/test_acpi_poweroff.sh sets ENABLE_ACPI_TEST=1 to plant
+# /etc/acpi-test. init/main.ad at boot:37.acpi detects the marker, logs
+# the FADT PM1a_CNT_BLK + DSDT-decoded \_S5 SLP_TYPa that acpi_init()
+# parsed, then triggers a real-only poweroff (PM1a S5 write, no emulator
+# debug ports) so a clean VM exit proves the real FADT path. Default
+# boots omit the marker so the self-test never powers a normal boot off.
+if os.environ.get("ENABLE_ACPI_TEST") == "1":
+    FILES.append(("/etc/acpi-test", b"1\n"))
+
 # #167: memory-pressure subsystem (swap + page reclaim + OOM killer)
 # self-test. scripts/test_mm_pressure.sh sets ENABLE_MM_TEST=1 to plant
 # /etc/mm-test. init/main.ad at boot:37.mm detects the marker and calls

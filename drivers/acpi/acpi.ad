@@ -69,6 +69,78 @@ acpi_xsdt_phys:  uint64 = 0
 acpi_rsdt_phys:  uint64 = 0
 acpi_madt_phys:  uint64 = 0
 acpi_mcfg_phys:  uint64 = 0
+acpi_fadt_phys:  uint64 = 0
+acpi_dsdt_phys:  uint64 = 0
+
+
+# --- FADT (FACP) / \_S5 sleep state — REAL ACPI poweroff + reboot -----
+#
+# Task #168. The FADT (ACPI "Fixed ACPI Description Table", signature
+# "FACP") gives us the firmware-defined power-management register block
+# and the DSDT pointer. From those we drive a real S5 (soft-off) on ANY
+# ACPI machine instead of the QEMU/VirtualBox debug-port shortcut.
+#
+# FADT field offsets we read (ACPI 6.x spec §5.2.9):
+#   +40  (u32)  DSDT                  32-bit DSDT physical address
+#   +64  (u32)  PM1a_CNT_BLK          PM1a control register I/O port
+#   +68  (u32)  PM1b_CNT_BLK          PM1b control register I/O port (0 ok)
+#   +112 (u32)  Flags                 RESET_REG_SUP = bit 10
+#   +116 (12B)  RESET_REG             generic-address structure
+#   +128 (u8)   RESET_VALUE           value to write to RESET_REG
+#   +140 (u64)  X_DSDT                64-bit DSDT physical (preferred if !=0)
+#
+# Generic Address Structure (RESET_REG, 12 bytes, spec §5.2.3.2):
+#   +0  (u8)  address_space_id   0=SystemMemory, 1=SystemIO
+#   +1  (u8)  register_bit_width
+#   +2  (u8)  register_bit_offset
+#   +3  (u8)  access_size
+#   +4  (u64) address
+#
+# We extract the \_S5 SLP_TYP values by scanning the DSDT body for the
+# `_S5_` NameOp/Package byte pattern — the well-known minimal-ACPI
+# poweroff technique — WITHOUT a full AML interpreter (which is out of
+# scope). PM1a/PM1b control writes of (SLP_TYPa<<10)|SLP_EN trigger the
+# transition.
+ACPI_FADT_OFF_DSDT32:       uint64 = 40
+ACPI_FADT_OFF_PM1A_CNT:     uint64 = 64
+ACPI_FADT_OFF_PM1B_CNT:     uint64 = 68
+ACPI_FADT_OFF_FLAGS:        uint64 = 112
+ACPI_FADT_OFF_RESET_REG:    uint64 = 116
+ACPI_FADT_OFF_RESET_VALUE:  uint64 = 128
+ACPI_FADT_OFF_XDSDT:        uint64 = 140
+
+# Flags bit 10 (0x400) = RESET_REG_SUP: firmware supports reset via the
+# RESET_REG generic-address register.
+ACPI_FADT_FLAG_RESET_REG_SUP: uint32 = 0x400
+
+# Generic-address address_space_id values we honour for reset.
+ACPI_GAS_SPACE_MEM: uint8 = 0
+ACPI_GAS_SPACE_IO:  uint8 = 1
+
+# SLP_EN is bit 13 of the PM1 control register; writing it with the
+# SLP_TYP field set commits the sleep-state transition.
+ACPI_SLP_EN: uint32 = 0x2000
+
+# Parsed + cached power-management state. Zero/-1 = "not parsed".
+# acpi_pm1a_cnt_port==0 means the FADT/DSDT parse never produced a
+# usable S5 vector, so the poweroff path must fall back to the emulator
+# debug ports.
+acpi_pm1a_cnt_port:  uint32 = 0
+acpi_pm1b_cnt_port:  uint32 = 0
+acpi_s5_slp_typa:    int32  = -1
+acpi_s5_slp_typb:    int32  = -1
+acpi_s5_valid:       int32  = 0
+
+# Parsed reset register (RESET_REG_SUP). acpi_reset_supported==0 means
+# no usable firmware reset register; _do_reboot() falls back to i8042.
+acpi_reset_supported: int32  = 0
+acpi_reset_space:     uint8  = 0
+acpi_reset_addr:      uint64 = 0
+acpi_reset_value:     uint8  = 0
+
+# Scratch for the two decoded \_S5 SLP_TYP integers. Module-scope (flat)
+# rather than a deeply-nested frame-local Array per the Adder buffer rule.
+acpi_s5_scratch: Array[2, int32]
 
 
 # MADT entries are TLVs after the 44-byte MADT header.
@@ -381,6 +453,10 @@ def acpi_walk_xsdt(rsdp_phys: uint64):
             elif _sig_eq(tbl, 0x4D, 0x43, 0x46, 0x47) == 1:
                 acpi_mcfg_phys = tbl
                 printk1("ACPI: found MCFG @ %p\n", tbl)
+            # "FACP" = 0x46 0x41 0x43 0x50 -> FADT (fixed ACPI desc table)
+            elif _sig_eq(tbl, 0x46, 0x41, 0x43, 0x50) == 1:
+                acpi_fadt_phys = tbl
+                printk1("ACPI: found FADT @ %p\n", tbl)
 
         i = i + 1
 
@@ -457,6 +533,200 @@ def acpi_pcie_ecam_base() -> uint64:
     return cast[Ptr[uint64]](acpi_mcfg_phys + 44)[0]
 
 
+def _acpi_scan_s5(dsdt_phys: uint64) -> int32:
+    # Scan the DSDT body for the `_S5_` NameOp + Package and decode the
+    # first two small integers (SLP_TYPa, SLP_TYPb). This is the classic
+    # minimal-ACPI poweroff technique used by coreboot, SeaBIOS, the BSDs,
+    # etc. — it avoids a full AML interpreter.
+    #
+    # AML pattern we match (ACPI spec §20):
+    #   '_' 'S' '5' '_'      the four name characters (0x5F 0x53 0x35 0x5F)
+    #   0x12                  PackageOp
+    #   PkgLength             1..N bytes; high 2 bits of byte 0 = extra
+    #                         length bytes. We skip them generically.
+    #   NumElements (u8)      element count
+    #   then per element a DataObject; the first two we want are small
+    #   integers encoded as:
+    #     0x00            ZeroOp   -> 0
+    #     0x01            OneOp    -> 1
+    #     0x0A bb         BytePrefix + u8
+    #     0x0B bb bb      WordPrefix + u16   (we take low byte)
+    #
+    # A NameOp (0x08) may precede the `_S5_` characters; many tables emit
+    # `08 5F 53 35 5F 12 ...`. We don't require the 0x08 (we anchor on the
+    # name chars) but we DO validate the PackageOp right after the name so
+    # a stray "_S5_" in a string can't misfire.
+    if dsdt_phys == 0:
+        return 0
+
+    dsdt_len: uint32 = cast[Ptr[uint32]](dsdt_phys + 4)[0]
+    if dsdt_len <= 36:
+        return 0
+
+    body: uint64 = dsdt_phys + 36
+    body_len: uint64 = cast[uint64](dsdt_len) - 36
+    p: Ptr[uint8] = cast[Ptr[uint8]](body)
+
+    i: uint64 = 0
+    # Need room for "_S5_" + PackageOp + PkgLen + NumElem + 2 small ints.
+    while i + 8 <= body_len:
+        if p[i] == 0x5F:
+            if p[i + 1] == 0x53:
+                if p[i + 2] == 0x35:
+                    if p[i + 3] == 0x5F:
+                        # Validate the PackageOp preamble so we don't
+                        # misfire on a false "_S5_" match.
+                        if p[i + 4] == 0x12:
+                            # PkgLength byte 0: low nibble bits + count of
+                            # extra length bytes in top 2 bits.
+                            pkglead: uint8 = p[i + 5]
+                            extra: uint64 = cast[uint64]((pkglead >> 6) & 0x3)
+                            # NumElements follows the PkgLength field.
+                            ne_off: uint64 = i + 6 + extra
+                            if ne_off + 1 < body_len:
+                                # Decode the two small integers after
+                                # NumElements.
+                                eo: uint64 = ne_off + 1
+                                acpi_s5_scratch[0] = -1
+                                acpi_s5_scratch[1] = -1
+                                got: uint64 = 0
+                                while got < 2:
+                                    if eo >= body_len:
+                                        got = 2
+                                    else:
+                                        op: uint8 = p[eo]
+                                        if op == 0x00:
+                                            acpi_s5_scratch[got] = 0
+                                            eo = eo + 1
+                                            got = got + 1
+                                        elif op == 0x01:
+                                            acpi_s5_scratch[got] = 1
+                                            eo = eo + 1
+                                            got = got + 1
+                                        elif op == 0x0A:
+                                            if eo + 1 < body_len:
+                                                acpi_s5_scratch[got] = cast[int32](p[eo + 1])
+                                            eo = eo + 2
+                                            got = got + 1
+                                        elif op == 0x0B:
+                                            if eo + 1 < body_len:
+                                                acpi_s5_scratch[got] = cast[int32](p[eo + 1])
+                                            eo = eo + 3
+                                            got = got + 1
+                                        else:
+                                            # Unexpected opcode — abandon
+                                            # this match and keep scanning.
+                                            got = 2
+                                            acpi_s5_scratch[0] = -1
+                                if acpi_s5_scratch[0] >= 0:
+                                    acpi_s5_slp_typa = acpi_s5_scratch[0]
+                                    if acpi_s5_scratch[1] >= 0:
+                                        acpi_s5_slp_typb = acpi_s5_scratch[1]
+                                    else:
+                                        acpi_s5_slp_typb = 0
+                                    acpi_s5_valid = 1
+                                    return 1
+        i = i + 1
+    return 0
+
+
+def acpi_parse_fadt():
+    # Parse the FADT: cache PM1a/PM1b control ports, the reset register,
+    # locate the DSDT, and decode the \_S5 SLP_TYP values. Idempotent.
+    # On success acpi_s5_valid / acpi_pm1a_cnt_port are populated so
+    # arch/x86/kernel/power.ad can issue a real S5 transition.
+    if acpi_fadt_phys == 0:
+        printk0("acpi: no FADT — real S5 poweroff unavailable\n")
+        return
+
+    fadt: uint64 = acpi_fadt_phys
+    flen: uint32 = cast[Ptr[uint32]](fadt + 4)[0]
+
+    # PM1a/PM1b control I/O ports.
+    if cast[uint64](flen) >= ACPI_FADT_OFF_PM1A_CNT + 4:
+        acpi_pm1a_cnt_port = cast[Ptr[uint32]](fadt + ACPI_FADT_OFF_PM1A_CNT)[0]
+    if cast[uint64](flen) >= ACPI_FADT_OFF_PM1B_CNT + 4:
+        acpi_pm1b_cnt_port = cast[Ptr[uint32]](fadt + ACPI_FADT_OFF_PM1B_CNT)[0]
+
+    # Reset register (only if RESET_REG_SUP is set + the table is long
+    # enough to carry the RESET_REG/RESET_VALUE fields, ACPI 2.0+).
+    if cast[uint64](flen) >= ACPI_FADT_OFF_RESET_VALUE + 1:
+        flags: uint32 = cast[Ptr[uint32]](fadt + ACPI_FADT_OFF_FLAGS)[0]
+        if (flags & ACPI_FADT_FLAG_RESET_REG_SUP) != 0:
+            rr: uint64 = fadt + ACPI_FADT_OFF_RESET_REG
+            acpi_reset_space = cast[Ptr[uint8]](rr)[0]
+            acpi_reset_addr  = cast[Ptr[uint64]](rr + 4)[0]
+            acpi_reset_value = cast[Ptr[uint8]](fadt + ACPI_FADT_OFF_RESET_VALUE)[0]
+            if acpi_reset_addr != 0:
+                acpi_reset_supported = 1
+
+    # Locate the DSDT: prefer the 64-bit X_DSDT (ACPI 2.0+), fall back to
+    # the 32-bit DSDT pointer.
+    dsdt: uint64 = 0
+    if cast[uint64](flen) >= ACPI_FADT_OFF_XDSDT + 8:
+        dsdt = cast[Ptr[uint64]](fadt + ACPI_FADT_OFF_XDSDT)[0]
+    if dsdt == 0:
+        if cast[uint64](flen) >= ACPI_FADT_OFF_DSDT32 + 4:
+            dsdt = cast[uint64](cast[Ptr[uint32]](fadt + ACPI_FADT_OFF_DSDT32)[0])
+    acpi_dsdt_phys = dsdt
+
+    printk2("acpi: FADT PM1a_CNT_BLK=%p PM1b_CNT_BLK=%p\n",
+            cast[uint64](acpi_pm1a_cnt_port),
+            cast[uint64](acpi_pm1b_cnt_port))
+    printk1("acpi: DSDT @ %p\n", dsdt)
+
+    # Decode \_S5 SLP_TYPa/b from the DSDT body.
+    if _acpi_scan_s5(dsdt) == 1:
+        printk2("acpi: _S5 SLP_TYPa=%d SLP_TYPb=%d\n",
+                cast[uint64](cast[uint32](acpi_s5_slp_typa)),
+                cast[uint64](cast[uint32](acpi_s5_slp_typb)))
+    else:
+        printk0("acpi: _S5 not found in DSDT — S5 poweroff unavailable\n")
+
+
+# --- Accessors for the power layer (arch/x86/kernel/power.ad) ---------
+def acpi_s5_ready() -> int32:
+    # 1 iff the FADT+DSDT parse produced a usable real S5 vector
+    # (a non-zero PM1a control port AND a decoded SLP_TYPa).
+    if acpi_s5_valid == 0:
+        return 0
+    if acpi_pm1a_cnt_port == 0:
+        return 0
+    return 1
+
+
+def acpi_pm1a_cnt() -> uint32:
+    return acpi_pm1a_cnt_port
+
+
+def acpi_pm1b_cnt() -> uint32:
+    return acpi_pm1b_cnt_port
+
+
+def acpi_slp_typa() -> int32:
+    return acpi_s5_slp_typa
+
+
+def acpi_slp_typb() -> int32:
+    return acpi_s5_slp_typb
+
+
+def acpi_reset_reg_supported() -> int32:
+    return acpi_reset_supported
+
+
+def acpi_reset_reg_space() -> uint8:
+    return acpi_reset_space
+
+
+def acpi_reset_reg_addr() -> uint64:
+    return acpi_reset_addr
+
+
+def acpi_reset_reg_value() -> uint8:
+    return acpi_reset_value
+
+
 # Set once acpi_init() has run a full probe. Lets early consumers
 # (the IOAPIC routing code, which runs before start_kernel reaches
 # the acpi_init() call site) trigger the probe lazily without the
@@ -500,4 +770,10 @@ def acpi_init() -> int32:
 
     ecam: uint64 = acpi_pcie_ecam_base()
     printk1("acpi: PCIe ECAM base = %p\n", ecam)
+
+    # #168: parse the FADT (FACP) for the real S5 poweroff vector +
+    # firmware reset register. Populates the power-management state that
+    # arch/x86/kernel/power.ad reads to drive a portable ACPI poweroff
+    # instead of the QEMU/VirtualBox debug-port shortcut.
+    acpi_parse_fadt()
     return 0
