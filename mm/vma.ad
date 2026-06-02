@@ -72,6 +72,13 @@ from fs.elf import (
     elf_prepare_demand_range, elf_map_one_page,
     PT_FLAG_NX,
 )
+# §file-mmap: identity-based kernel pread for file-backed VMA fault-in.
+# fs.elf already imports from fs.vfs, so fs.vfs's symbols are in the
+# merged namespace; importing vfs_pread_backing here is consistent (no
+# new cycle). vma_demand_fault's is_file branch calls it to read a page's
+# bytes from the backing file; bytes past file_size are left zero by the
+# caller's pre-zeroing of the page.
+from fs.vfs import vfs_pread_backing
 
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
@@ -244,16 +251,44 @@ class VmaNode:
     # demand pages are always private, unshared). is_demand is mutually
     # exclusive with is_cow / is_shared / is_pinned.
     is_demand:   int32
+    # §file-mmap / file-backed demand paging: 1 when this VMA maps a
+    # FILE's contents (mmap with a real fd). It is ALSO is_demand (pages
+    # are populated lazily on #PF), but instead of zero-filling, each
+    # page is read from the backing file at
+    #   file_offset + (page_va - start)
+    # via vfs_pread_backing(file_marker, backing, file_size, ...). Any
+    # bytes past file_size (a sub-page EOF tail) read as zero. The fd the
+    # mapping was created from may be closed afterwards (POSIX) — the
+    # snapshot below is self-contained.
+    #
+    # MAP_PRIVATE file-backed (the common case, e.g. loading a shared
+    # object): on a WRITE fault the page is already private (one mapper,
+    # never written back) so a fresh copy is taken via the COW path the
+    # same way an anonymous demand page is — file pages are mapped
+    # read-only on a PROT_WRITE private mapping and copied on first write.
+    is_file:     int32
+    # Backing-store kind marker (an FD_*_MARK / FD_FILEMMAP_* value from
+    # fs/vfs.ad), captured at mmap time. Stored as int32 (the markers fit
+    # the high uint32 range; reinterpreted to uint32 when used).
+    file_marker: int32
+    # Total size in bytes of the backing file at mmap time — the EOF
+    # boundary for zero-fill of the sub-page tail.
+    file_size:   uint64
+    # For a file-backed VMA, `backing` (above) is REPURPOSED to hold the
+    # stable backing IDENTITY (cpio index / tmpfs slot / ext4 inode num /
+    # buffer pointer) rather than a physical page run — a file-backed
+    # demand VMA never owns a buddy backing run.
 
 
 # ---------------------------------------------------------------------
 # Allocation helpers
 # ---------------------------------------------------------------------
 
-# VmaNode size: 6 uint64 (48) + 10 int32 (40) = 88 bytes exactly.
-# Adding is_demand (the 10th int32) fills the last 4 bytes of padding
-# that existed after §1 added is_shared + is_pinned. No size change.
-VMA_NODE_SIZE: uint64 = 88
+# VmaNode size: 6 uint64 (48) + 10 int32 (40) = 88 bytes; §file-mmap
+# adds is_file + file_marker (2 int32 = 8) + file_size (uint64 = 8) for
+# 104 bytes total. memset-zeroed on alloc, so every node defaults to
+# is_file=0 (anonymous/non-file) unless a file-backed allocator sets it.
+VMA_NODE_SIZE: uint64 = 104
 
 
 def _vma_node_new() -> uint64:
@@ -284,6 +319,9 @@ def _vma_node_set(node: uint64, start: uint64, end: uint64,
     cast[Ptr[VmaNode]](node)[0].is_shared   = 0
     cast[Ptr[VmaNode]](node)[0].is_pinned   = 0
     cast[Ptr[VmaNode]](node)[0].is_demand   = 0
+    cast[Ptr[VmaNode]](node)[0].is_file     = 0
+    cast[Ptr[VmaNode]](node)[0].file_marker = 0
+    cast[Ptr[VmaNode]](node)[0].file_size   = 0
 
 
 def _vma_node_get_next(node: uint64) -> uint64:
@@ -1381,6 +1419,81 @@ def vma_alloc_demand(slot: uint64, addr_in: uint64, len_in: uint64,
 
 
 # ---------------------------------------------------------------------
+# §file-mmap — vma_alloc_file_demand: demand-paged FILE-backed mmap
+# ---------------------------------------------------------------------
+#
+# Identical page-table preparation to vma_alloc_demand, but the resulting
+# VMA is flagged is_file=1 and carries the backing-file snapshot
+# (marker / backing-id / total size / file offset). On a NOT-PRESENT #PF
+# the page is filled from the file (vfs_pread_backing) instead of zeroed;
+# bytes past file_size read as zero (the sub-page EOF tail). The caller
+# (the SYS_MMAP handler) has already captured the snapshot via
+# vfs_fd_backing_info while the fd was still open, so the user may close
+# the fd immediately after mmap (POSIX).
+#
+# Returns the resolved base address (>= 0) on success, or a negative
+# Linux errno on failure.
+
+def vma_alloc_file_demand(slot: uint64, addr_in: uint64, len_in: uint64,
+                          prot: int32, flags: int32,
+                          file_marker: int32, file_backing: uint64,
+                          file_size: uint64,
+                          file_offset: uint64) -> int64:
+    if len_in == 0:
+        return cast[int64](-22)
+    length: uint64 = (len_in + VMA_PAGE_SIZE - 1) & ~(VMA_PAGE_SIZE - 1)
+
+    is_fixed: int32 = 0
+    if (flags & VMA_MAP_FIXED) != 0 and addr_in != 0:
+        is_fixed = 1
+
+    base: uint64 = 0
+    if is_fixed != 0:
+        _vma_carve_range(slot, addr_in, addr_in + length)
+        base = addr_in
+    else:
+        window: uint64 = (length + VMA_MAX_CHUNK - 1) \
+                         & ~(VMA_MAX_CHUNK - 1)
+        base = vma_large_next
+        if base + window > VMA_LARGE_LIMIT:
+            printk1("vma: file-mmap window exhausted (need 0x%x)\n",
+                    window)
+            return cast[int64](-12)
+        vma_large_next = base + window
+
+    pml4: uint64 = task_pml4(cast[int32](slot))
+    GIB: uint64 = 0x40000000
+    cur: uint64 = base
+    while cur < base + length:
+        gib_end: uint64 = (cur + GIB) & ~(GIB - 1)
+        chunk_end: uint64 = gib_end
+        if chunk_end > base + length:
+            chunk_end = base + length
+        if elf_prepare_demand_range(pml4, cur, chunk_end) < 0:
+            printk1("vma: file-mmap PT prep OOM @ 0x%x\n", cur)
+            return cast[int64](-12)
+        cur = chunk_end
+
+    load_cr3(pml4)
+
+    node: uint64 = _vma_node_new()
+    if node == 0:
+        return cast[int64](-12)
+    end_v: uint64 = base + length
+    # Repurpose `backing` to carry the stable backing IDENTITY (cpio
+    # index / tmpfs slot / ext4 inode / buffer pointer) — a file-backed
+    # demand VMA owns no buddy run. file_offset is the in-file start.
+    _vma_node_set(node, base, end_v, prot, flags, -1, file_offset,
+                  file_backing, 0)
+    cast[Ptr[VmaNode]](node)[0].is_demand   = 1
+    cast[Ptr[VmaNode]](node)[0].is_file     = 1
+    cast[Ptr[VmaNode]](node)[0].file_marker = file_marker
+    cast[Ptr[VmaNode]](node)[0].file_size   = file_size
+    _vma_insert_sorted(slot, node)
+    return cast[int64](base)
+
+
+# ---------------------------------------------------------------------
 # §142 — vma_demand_fault: populate one demand page on #PF
 # ---------------------------------------------------------------------
 #
@@ -1432,6 +1545,32 @@ def vma_demand_fault(slot: uint64, pml4_phys: uint64,
         printk1("vma: demand OOM at va=0x%x\n", fault_va)
         return -1
     memset(cast[Ptr[uint8]](phys), 0, 4096)
+
+    # §file-mmap: a FILE-backed demand VMA reads the page's bytes from
+    # the backing file instead of leaving it zero. The page is already
+    # zeroed, so a short read at EOF (or a sub-page tail) leaves the
+    # remainder reading as zero exactly as the mapping contract requires.
+    # Because we read into a FRESH private page (never the file's own
+    # storage), a later MAP_PRIVATE write to this page never reaches the
+    # file — the copy-on-write contract holds for free.
+    if cast[Ptr[VmaNode]](node)[0].is_file != 0:
+        v_start:  uint64 = cast[Ptr[VmaNode]](node)[0].start
+        f_off0:   uint64 = cast[Ptr[VmaNode]](node)[0].file_offset
+        f_marker: uint32 = cast[uint32]( \
+            cast[Ptr[VmaNode]](node)[0].file_marker)
+        f_back:   uint64 = cast[Ptr[VmaNode]](node)[0].backing
+        f_size:   uint64 = cast[Ptr[VmaNode]](node)[0].file_size
+        page_va:  uint64 = fault_va & ~(VMA_PAGE_SIZE - 1)
+        # File offset of this page = mmap offset + (page_va - vma_start).
+        frd_off: uint64 = f_off0 + (page_va - v_start)
+        prc: int64 = vfs_pread_backing(f_marker, f_back, f_size,
+                                       frd_off,
+                                       cast[Ptr[uint8]](phys), 4096)
+        if prc < 0:
+            free_page(phys)
+            nscap_mem_uncharge_slot(slot, 4096)
+            printk1("vma: file-mmap read failed at va=0x%x\n", fault_va)
+            return -1
 
     # Map the page at the faulting address. W^X Stage 1a: a demand-paged
     # anonymous VMA is non-executable DATA unless it was mmap'd
@@ -1870,9 +2009,33 @@ def vma_fork_copy(child_slot: uint64, parent_slot: uint64,
         p_is_cow:    int32 = cast[Ptr[VmaNode]](cur)[0].is_cow
         p_is_shared: int32 = cast[Ptr[VmaNode]](cur)[0].is_shared
         p_is_pinned: int32 = cast[Ptr[VmaNode]](cur)[0].is_pinned
+        p_is_file: int32 = cast[Ptr[VmaNode]](cur)[0].is_file
         node: uint64 = _vma_node_new()
         if node == 0:
             return -1
+
+        # §file-mmap: a FILE-backed demand VMA (MAP_PRIVATE) forks like
+        # an anonymous demand VMA — the child gets a FRESH empty is_file
+        # copy carrying the same backing snapshot, and each process
+        # faults its own private file pages independently. The parent's
+        # already-faulted pages are NOT shared (they are private copies
+        # of the file, and re-reading the file gives the child the same
+        # bytes), so this stays a pure metadata copy regardless of
+        # `backing` being non-zero (it holds the backing IDENTITY, not a
+        # buddy run). Handle it up front so the owns_pages heuristic
+        # below never mis-routes it into the COW/share page-table walk.
+        if p_is_file != 0:
+            _vma_node_set(node, p_start, p_end, p_prot, p_flags,
+                          p_fd, p_off, p_back, 0)
+            cast[Ptr[VmaNode]](node)[0].is_demand   = 1
+            cast[Ptr[VmaNode]](node)[0].is_file     = 1
+            cast[Ptr[VmaNode]](node)[0].file_marker = \
+                cast[Ptr[VmaNode]](cur)[0].file_marker
+            cast[Ptr[VmaNode]](node)[0].file_size   = \
+                cast[Ptr[VmaNode]](cur)[0].file_size
+            _vma_insert_sorted(child_slot, node)
+            cur = cast[Ptr[VmaNode]](cur)[0].next
+            continue
 
         # Does this VMA hold (a share of) physical pages? A fresh owner
         # has backing / chunks; but a node that was ALREADY refcount-

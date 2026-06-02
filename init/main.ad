@@ -97,8 +97,20 @@ from arch.x86.kernel.e820 import (
     efi_fb_height, efi_fb_bpp, efi_fb_pixel_format, efi_fb_dump,
     is_boot_via_efi,
 )
+# §file-mmap: file-backed mmap self-test (ENABLE_MMAP_FILE_TEST=1).
+# vma_alloc_file_demand builds a file-backed demand VMA; vma_demand_fault
+# is the populator the #PF handler calls (driven directly here since a
+# synchronous kernel self-test can't take a real #PF on its own access).
+from mm.vma import vma_alloc_file_demand, vma_demand_fault
+from kernel.sched.core import current_idx_get
 from fs.vfs import (
     vfs_init, vfs_open, vfs_read, vfs_write, vfs_close,
+    # §file-mmap: snapshot an open fd's stable backing identity for the
+    # file-backed mmap self-test, plus the synthetic initramfs backing
+    # marker so the self-test can build the same snapshot directly from a
+    # cpio index (the kernel boot task has no user fd table to open
+    # through).
+    vfs_fd_backing_info, FD_FILEMMAP_INITRAMFS,
     initramfs_data_ptr, initramfs_data_size,
     # Namespace-aware blob resolution: reads a path off whatever
     # backend the calling namespace routes it to (cpio entry OR a
@@ -320,6 +332,11 @@ extern def trigger_int3()
 extern def local_irq_enable()
 extern def local_irq_disable()
 extern def cpu_relax()
+# W^X Stage 1a: enable IA32_EFER.NXE (bit 11) so PTEs carrying NX (bit 63)
+# load without a reserved-bit #PF. syscall_init() also calls this at
+# boot:39, but the file-mmap self-test (boot:37.mmf) installs NX-stamped
+# data pages earlier, so it must arm NXE itself first (idempotent).
+extern def set_efer_nxe()
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 extern def memmove(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
@@ -3191,6 +3208,162 @@ def http_redirect_smoke_test():
     printk0("[http-redirect] downgrade-reject path is wrapper-level (logged separately)\n")
 
 
+def _mmf_expect_byte(i: uint64) -> uint8:
+    # The deterministic content formula build_initramfs.py planted into
+    # /etc/mmap-file-data: byte i == (i*31 + 7) & 0xFF.
+    return cast[uint8]((i * 31 + 7) & 0xFF)
+
+
+def mmap_file_selftest():
+    # §file-mmap: prove REAL file-backed mmap. Open the known-content
+    # backing file /etc/mmap-file-data, snapshot its backing identity,
+    # CLOSE the fd (POSIX: the mapping must survive), build a file-backed
+    # demand VMA, fault its pages in via the real populator, and memcmp
+    # the mapped bytes against the content formula. Covers: multi-page
+    # fault-in, an in-file offset, and a sub-page EOF tail (bytes past
+    # EOF read as zero). Prints "[mmap-file] PASS" / "[mmap-file] FAIL".
+    #
+    # Runs in the boot (kernel) task's own address space. The boot task
+    # cannot take a #PF on its own access synchronously, so we drive the
+    # populator (vma_demand_fault) directly the way do_page_fault would —
+    # the same idiom mm/reclaim.ad::mm_pressure_selftest uses.
+    PROT_READ:   int32 = 0x1
+    MAP_PRIVATE: int32 = 0x2
+    PG: uint64 = 4096
+
+    # The file-backed VMA is non-executable DATA, so vma_demand_fault
+    # stamps NX (PT_FLAG_NX, bit 63) into its PTEs. This self-test runs at
+    # boot:37.mmf, BEFORE syscall_init (boot:39) arms IA32_EFER.NXE on the
+    # BSP — so without enabling NXE here, the very first data read of the
+    # mapped page would take a reserved-bit #PF (err=0x09). Arm NXE now;
+    # syscall_init re-arms it harmlessly later (the wrmsr is idempotent).
+    set_efer_nxe()
+
+    boot_slot: uint64 = current_idx_get()
+    boot_pml4: uint64 = task_pml4(cast[int32](boot_slot))
+
+    # Locate the known-content backing file /etc/mmap-file-data in the
+    # initramfs by name. The kernel boot task has no user fd table to
+    # vfs_open() through, so we build the backing snapshot directly from
+    # the cpio index — the SAME (marker, backing, size) triple that
+    # vfs_fd_backing_info() would produce for a userland open of a cpio
+    # file (marker = FD_FILEMMAP_INITRAMFS, backing = cpio index, size =
+    # the entry size). The real userland mmap(fd) path goes through
+    # vfs_fd_backing_info; this self-test feeds the identical inputs to
+    # the identical downstream code (vma_alloc_file_demand +
+    # vma_demand_fault + vfs_pread_backing).
+    data_idx: int64 = -1
+    fi_idx: uint64 = 0
+    fi_count: uint64 = initramfs_entry_count()
+    while fi_idx < fi_count:
+        fi_name: Ptr[char] = initramfs_entry_name(fi_idx)
+        fi_ok: int32 = 1
+        fi_tgt: Ptr[uint8] = "/etc/mmap-file-data"
+        fi_j: uint64 = 0
+        while fi_j < 20:                       # 19 chars + NUL
+            if cast[uint8](fi_name[fi_j]) != fi_tgt[fi_j]:
+                fi_ok = 0
+                fi_j = 20
+            else:
+                fi_j = fi_j + 1
+        if fi_ok == 1:
+            data_idx = cast[int64](fi_idx)
+            fi_idx = fi_count
+        else:
+            fi_idx = fi_idx + 1
+    if data_idx < 0:
+        printk0("[mmap-file] FAIL: /etc/mmap-file-data not in initramfs\n")
+        return
+    marker:  uint32 = FD_FILEMMAP_INITRAMFS
+    backing: uint64 = cast[uint64](data_idx)
+    fsize:   uint64 = initramfs_entry_size(cast[uint64](data_idx))
+    printk2("[mmap-file] file size=%d cpio-idx=%d\n", fsize, backing)
+
+    EXPECT_LEN: uint64 = 2 * PG + 100
+    if fsize != EXPECT_LEN:
+        printk2("[mmap-file] FAIL: size=%d want=%d\n", fsize, EXPECT_LEN)
+        return
+
+    # ---- Map 1: whole file at offset 0, PROT_READ MAP_PRIVATE ----------
+    base64: int64 = vma_alloc_file_demand(boot_slot, 0, fsize,
+                                          PROT_READ, MAP_PRIVATE,
+                                          cast[int32](marker), backing,
+                                          fsize, 0)
+    if base64 < 0:
+        printk0("[mmap-file] FAIL: vma_alloc_file_demand (map1) failed\n")
+        return
+    base: uint64 = cast[uint64](base64)
+    # Fault in all 3 pages (2 full + the tail page) via the real populator.
+    npages: uint64 = (fsize + PG - 1) / PG
+    fp: uint64 = 0
+    while fp < npages:
+        vma_demand_fault(boot_slot, boot_pml4, base + fp * PG)
+        fp = fp + 1
+
+    # Verify every byte [0, fsize) matches the content formula.
+    mism1: uint64 = 0
+    bi: uint64 = 0
+    while bi < fsize:
+        got: uint8 = cast[Ptr[uint8]](base + bi)[0]
+        if got != _mmf_expect_byte(bi):
+            mism1 = mism1 + 1
+        bi = bi + 1
+    if mism1 != 0:
+        printk1("[mmap-file] FAIL: map1 content mismatch (%d bytes)\n",
+                mism1)
+        return
+    printk0("[mmap-file] map1 (offset 0) content OK\n")
+
+    # Verify the sub-page EOF tail reads as zero: from fsize up to the
+    # end of the last mapped page must be zero (the page was zero-filled
+    # before the short file read).
+    tail_zero_ok: int32 = 1
+    last_page_end: uint64 = npages * PG
+    ti: uint64 = fsize
+    while ti < last_page_end:
+        if cast[Ptr[uint8]](base + ti)[0] != 0:
+            tail_zero_ok = 0
+            ti = last_page_end
+        else:
+            ti = ti + 1
+    if tail_zero_ok == 0:
+        printk0("[mmap-file] FAIL: sub-page EOF tail not zero\n")
+        return
+    printk0("[mmap-file] sub-page EOF tail reads as zero OK\n")
+
+    # ---- Map 2: same file at in-file OFFSET = one page -----------------
+    # The mapped bytes must equal the file content starting at byte PG.
+    off2: uint64 = PG
+    len2: uint64 = fsize - off2
+    base2_64: int64 = vma_alloc_file_demand(boot_slot, 0, len2,
+                                            PROT_READ, MAP_PRIVATE,
+                                            cast[int32](marker), backing,
+                                            fsize, off2)
+    if base2_64 < 0:
+        printk0("[mmap-file] FAIL: vma_alloc_file_demand (map2) failed\n")
+        return
+    base2: uint64 = cast[uint64](base2_64)
+    npages2: uint64 = (len2 + PG - 1) / PG
+    fp2: uint64 = 0
+    while fp2 < npages2:
+        vma_demand_fault(boot_slot, boot_pml4, base2 + fp2 * PG)
+        fp2 = fp2 + 1
+    mism2: uint64 = 0
+    bj: uint64 = 0
+    while bj < len2:
+        got2: uint8 = cast[Ptr[uint8]](base2 + bj)[0]
+        if got2 != _mmf_expect_byte(off2 + bj):
+            mism2 = mism2 + 1
+        bj = bj + 1
+    if mism2 != 0:
+        printk1("[mmap-file] FAIL: map2 (offset) content mismatch (%d)\n",
+                mism2)
+        return
+    printk0("[mmap-file] map2 (offset 4096) content OK\n")
+
+    printk0("[mmap-file] PASS\n")
+
+
 def usbms_exercise():
     # USB mass-storage (BOT/SCSI over xHCI bulk) EXERCISE. Gated on the
     # /etc/usbms-test cpio marker (planted by scripts/test_usbms.sh via
@@ -5591,6 +5764,41 @@ def start_kernel():
             printk0("[mm] FAIL: memory-pressure self-test failed\n")
     else:
         printk0("[mm] skipped (no /etc/mm-test marker)\n")
+
+    # §file-mmap: REAL file-backed mmap self-test. Gated on
+    # /etc/mmap-file-test (planted by build_initramfs.py when
+    # ENABLE_MMAP_FILE_TEST=1, via scripts/test_mmap_file.sh). Same
+    # marker-scan shape as the gates above. mmap_file_selftest()
+    # (defined below) writes a known-content file, mmap()s it PROT_READ
+    # MAP_PRIVATE, faults pages in, and memcmp's the mapped bytes against
+    # the source (incl. an offset map + a sub-page EOF tail that reads as
+    # zero). Prints "[mmap-file] PASS" / "[mmap-file] FAIL".
+    printk0("[boot:37.mmf] checking /etc/mmap-file-test marker\n")
+    mmf_marker_found: int32 = 0
+    mmf_idx: uint64 = 0
+    mmf_count: uint64 = initramfs_entry_count()
+    while mmf_idx < mmf_count:
+        mmf_name: Ptr[char] = initramfs_entry_name(mmf_idx)
+        # Compare byte-by-byte with "/etc/mmap-file-test\0" (20 bytes).
+        mmf_ok: int32 = 1
+        mmf_tgt: Ptr[uint8] = "/etc/mmap-file-test"
+        mmf_j: uint64 = 0
+        while mmf_j < 20:
+            if cast[uint8](mmf_name[mmf_j]) != mmf_tgt[mmf_j]:
+                mmf_ok = 0
+                mmf_j = 20
+            else:
+                mmf_j = mmf_j + 1
+        if mmf_ok == 1:
+            mmf_marker_found = 1
+            mmf_idx = mmf_count
+        else:
+            mmf_idx = mmf_idx + 1
+    if mmf_marker_found == 1:
+        printk0("[boot:37.mmf] /etc/mmap-file-test found — running self-test\n")
+        mmap_file_selftest()
+    else:
+        printk0("[mmap-file] skipped (no /etc/mmap-file-test marker)\n")
 
     # task #178: selectable-keyboard-layout self-test. Gated on
     # /etc/keymap-test (planted by build_initramfs.py when

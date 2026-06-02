@@ -269,6 +269,25 @@ if os.environ.get("ENABLE_USBMS_TEST") == "1":
 if os.environ.get("ENABLE_EHCI_MSC_TEST") == "1":
     FILES.append(("/etc/ehci-msc-test", b"1\n"))
 
+# §file-mmap: REAL file-backed mmap self-test. scripts/test_mmap_file.sh
+# sets ENABLE_MMAP_FILE_TEST=1 to plant /etc/mmap-file-test. init/main.ad
+# at boot:37 detects the marker and calls mmap_file_selftest(): it writes
+# a known-content file, mmap()s it PROT_READ MAP_PRIVATE, faults several
+# pages in, memcmp's the mapped bytes against the source (including an
+# offset map and a sub-page EOF tail that must read as zero), and prints
+# "[mmap-file] PASS" / "[mmap-file] FAIL". Default boots omit the marker.
+if os.environ.get("ENABLE_MMAP_FILE_TEST") == "1":
+    FILES.append(("/etc/mmap-file-test", b"1\n"))
+    # Known-content backing file the self-test mmap()s and verifies. The
+    # content is the deterministic byte formula (i*31 + 7) & 0xFF, which
+    # mmap_file_selftest() regenerates to memcmp against the mapped bytes.
+    # Length = 2 pages + 100 bytes (8292) so the test covers multi-page
+    # fault-in, an in-file offset, AND a sub-page EOF tail (bytes past
+    # EOF in the last mapped page must read as zero).
+    _mmf_len = 2 * 4096 + 100
+    _mmf_data = bytes(((i * 31 + 7) & 0xFF) for i in range(_mmf_len))
+    FILES.append(("/etc/mmap-file-data", _mmf_data))
+
 # SMP kthread-churn soak. scripts/test_smp_soak.sh sets ENABLE_SMP_SOAK=1
 # to plant /etc/smp-soak in the initramfs. init/main.ad at boot:37 detects
 # the marker and calls smp_kthread_soak_run() (kernel/sched/core.ad) which
