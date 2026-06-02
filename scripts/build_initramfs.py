@@ -891,6 +891,15 @@ if os.environ.get("ENABLE_PGRP_TEST") == "1":
 if os.environ.get("ENABLE_PROCFLAGS_TEST"):
     FILES.append(("/etc/procflags-test", b"1\n"))
 
+# /proc/<pid>/io self-test. scripts/test_procio.sh sets ENABLE_PROCIO_TEST=1
+# to plant /etc/procio-test. init/main.ad detects the marker and calls
+# procio_selftest() (devproc.ad): it stamps the boot slot's rchar/wchar/
+# syscr/syscw (+ inblock/oublock), renders emit_proc_io, parses the seven
+# lines, and confirms the values, then emits the [PROCIO] PASS banner. Needs
+# no extra device; default boots omit it.
+if os.environ.get("ENABLE_PROCIO_TEST"):
+    FILES.append(("/etc/procio-test", b"1\n"))
+
 # /proc/<pid>/stat child-resource accounting (fields 11/13/16/17) self-test.
 # scripts/test_childacct.sh sets ENABLE_CHILDACCT_TEST=1 to plant
 # /etc/childacct-test. init/main.ad detects the marker and calls
