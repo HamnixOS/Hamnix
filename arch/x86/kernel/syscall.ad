@@ -185,11 +185,15 @@ from fs.elf import (
     # task so task_reap frees it (closing the per-dynamic-spawn leak).
     elf_last_interp_img_phys_get, elf_last_interp_img_sz_get,
     vm_cow_share_all,
+    # uaccess syscall self-test: install a user PTE at a deliberately
+    # non-identity vaddr so the converted SYS_GETCWD copy-out proves it
+    # translates rather than raw-derefs.
+    vm_map_user_page,
 )
 # #169 vDSO: map the AT_SYSINFO_EHDR shared-time mini-ELF + data page
 # into each Linux guest's address space at exec/spawn time.
 from linux_abi.vdso import vdso_map_into_user, vdso_user_code_vaddr
-from mm.page_alloc import alloc_page, alloc_pages
+from mm.page_alloc import alloc_page, alloc_pages, free_page
 # Real uaccess translation layer. copy_to_user / copy_from_user /
 # get_user / put_user / strncpy_from_user walk the CURRENT task's page
 # tables to translate a user vaddr -> physical frame before touching it,
@@ -199,6 +203,7 @@ from mm.page_alloc import alloc_page, alloc_pages
 from mm.uaccess import (
     copy_to_user, copy_from_user,
     get_user_64, put_user_64, strncpy_from_user, clear_user,
+    uaccess_current_pml4,
 )
 # U42 follow-up: per-task VMA list. do_execve clears the outgoing
 # image's mappings before ELF-loading the incoming image so the new
@@ -356,6 +361,7 @@ extern def enter_user_mode(entry: uint64, stack: uint64)
 extern def user_demo_entry()
 extern def local_irq_disable()
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
 extern def load_cr3(value: uint64)
 # TEMP_DEBUG_EXECVE_SYSRET: read live CR3 for the pre-SYSRETQ dump in do_execve().
 extern def get_bsp_cr3() -> uint64
@@ -839,6 +845,15 @@ USER_ADDR_MAX: uint64 = 0x0000800000000000
 # attack — real read/write/recv/send never need more than ~32 MiB in
 # a single call.
 ACCESS_OK_MAX_LEN: uint64 = 0x10000000
+
+# Kernel bounce-buffer size for SYS_READ / SYS_WRITE. These syscalls no
+# longer raw-deref the user buffer: they stage data through a fixed
+# kernel buffer and copy_to_user / copy_from_user it across the user/
+# kernel boundary (translating the user vaddr through the current task's
+# page tables). 4 KiB == one page; read(2) returns whatever a single
+# bounce-fill yields, write(2) loops bounce-sized chunks. Keep this in
+# sync with the `Array[4096, uint8]` bounce locals in those handlers.
+UA_BOUNCE_SZ: uint64 = 4096
 
 
 def access_ok(uptr: uint64, length: uint64) -> int32:
@@ -2187,10 +2202,35 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         if access_ok(a1, a2) == 0:
             set_current_errstr("read: bad address")
             return cast[uint64](-14)             # -EFAULT
+        # read(2) via a kernel BOUNCE buffer + copy_to_user, NOT a raw
+        # write into the user vaddr. vfs_read fills the kernel bounce;
+        # copy_to_user then WALKS the current task's page tables to land
+        # the bytes at the (possibly non-identity) physical frame backing
+        # a1. read(2) returns as soon as ANY data is available, so a
+        # single bounce-sized vfs_read is the correct shape: we never
+        # spin to fill the whole user buffer. For counts larger than the
+        # bounce we cap at the bounce size — a short read is legal.
+        rd_n: uint64 = a2
+        if rd_n > UA_BOUNCE_SZ:
+            rd_n = UA_BOUNCE_SZ
+        rd_bounce: Array[4096, uint8]
         n: int64 = vfs_read(cast[int32](a0),
-                            cast[Ptr[uint8]](a1), a2)
+                            cast[Ptr[uint8]](&rd_bounce[0]), rd_n)
         if n < 0:
             set_current_errstr("read: bad fd")
+            return cast[uint64](n)
+        if n > 0:
+            resid: uint64 = copy_to_user(a1, cast[uint64](&rd_bounce[0]),
+                                         cast[uint64](n))
+            if resid != 0:
+                # The user buffer faulted partway. Report only the bytes
+                # that actually landed (read(2) cannot un-consume the fd
+                # data, so the residual is lost — same hazard Linux has).
+                set_current_errstr("read: bad address")
+                copied: uint64 = cast[uint64](n) - resid
+                if copied == 0:
+                    return cast[uint64](-14)     # -EFAULT
+                return copied
         return cast[uint64](n)
     if nr == SYS_READ_NB:
         # Non-blocking read. Used by single-threaded event-loop daemons
@@ -2240,11 +2280,44 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         if access_ok(a1, a2) == 0:
             set_current_errstr("write: bad address")
             return cast[uint64](-14)             # -EFAULT
-        n: int64 = vfs_write(cast[int32](a0),
-                             cast[Ptr[uint8]](a1), a2)
-        if n < 0:
-            set_current_errstr("write: bad fd")
-        return cast[uint64](n)
+        # write(2) via copy_from_user + a kernel BOUNCE buffer, NOT a raw
+        # read of the user vaddr. copy_from_user WALKS the current task's
+        # page tables to fetch each chunk from the (possibly non-identity)
+        # physical frame backing a1; vfs_write then consumes the kernel
+        # copy. We chunk at the bounce size and loop so a >4 KiB write
+        # still transfers in full, accumulating the bytes written. A
+        # short vfs_write (e.g. a pipe filling up) stops the loop and we
+        # return the partial count — standard write(2) semantics.
+        wr_total: uint64 = 0
+        wr_left: uint64 = a2
+        wr_u: uint64 = a1
+        wr_bounce: Array[4096, uint8]
+        while wr_left > 0:
+            wr_chunk: uint64 = wr_left
+            if wr_chunk > UA_BOUNCE_SZ:
+                wr_chunk = UA_BOUNCE_SZ
+            if copy_from_user(cast[uint64](&wr_bounce[0]), wr_u,
+                              wr_chunk) != 0:
+                set_current_errstr("write: bad address")
+                if wr_total == 0:
+                    return cast[uint64](-14)     # -EFAULT
+                return wr_total
+            wn: int64 = vfs_write(cast[int32](a0),
+                                  cast[Ptr[uint8]](&wr_bounce[0]),
+                                  wr_chunk)
+            if wn < 0:
+                set_current_errstr("write: bad fd")
+                if wr_total == 0:
+                    return cast[uint64](wn)
+                return wr_total
+            wr_total = wr_total + cast[uint64](wn)
+            # A short write means the sink could not take more right now;
+            # stop and report what we've sent so far.
+            if cast[uint64](wn) < wr_chunk:
+                return wr_total
+            wr_left = wr_left - wr_chunk
+            wr_u = wr_u + wr_chunk
+        return wr_total
     if nr == SYS_LSEEK:
         n: int64 = vfs_lseek(cast[int32](a0),
                              cast[int64](a1), cast[int32](a2))
@@ -2745,6 +2818,14 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         # Copy current cwd into the user buffer, up to a1 bytes
         # including the NUL terminator. Returns the number of bytes
         # written (incl NUL) or -ERANGE if a1 is 0.
+        #
+        # The cwd lives in the task's kernel-side cwd[] (128 bytes). We
+        # build the NUL-terminated copy-out image in a kernel buffer and
+        # push it to the user buffer through copy_to_user, which WALKS
+        # the current task's page tables to translate `a0`. The old
+        # byte-by-byte `dst[i] = c` raw deref only worked while every
+        # user page was identity-mapped (vaddr == phys); copy_to_user
+        # is correct even when the destination frame != its vaddr.
         if a1 == 0:
             set_current_errstr("getcwd: buffer too small")
             return cast[uint64](-34)           # -ERANGE
@@ -2752,16 +2833,36 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
             set_current_errstr("getcwd: bad address")
             return cast[uint64](-14)           # -EFAULT
         src: Ptr[uint8] = get_cwd_buf(current_idx_get())
-        dst: Ptr[uint8] = cast[Ptr[uint8]](a0)
+        cwd_out: Array[128, uint8]
+        # Bound the copy-out length by the user's buffer (a1) AND the
+        # kernel cwd capacity (128, incl NUL). i counts bytes BEFORE the
+        # terminator; we always write a trailing NUL.
+        gw_max: uint64 = a1
+        if gw_max > 128:
+            gw_max = 128
         i: uint64 = 0
-        while i + 1 < a1:
+        gw_hit_nul: int32 = 0
+        while i + 1 < gw_max:
             c: uint8 = src[i]
-            dst[i] = c
-            i = i + 1
+            cwd_out[i] = c
             if c == 0:
-                return i
-        dst[i] = 0
-        return i + 1
+                gw_hit_nul = 1
+                break
+            i = i + 1
+        # i = index of the terminator slot. NUL-terminate the image.
+        cwd_out[i] = 0
+        # Total bytes to copy out = path chars + the NUL = i + 1.
+        gw_total: uint64 = i + 1
+        if copy_to_user(a0, cast[uint64](&cwd_out[0]), gw_total) != 0:
+            set_current_errstr("getcwd: bad address")
+            return cast[uint64](-14)           # -EFAULT
+        # Return value mirrors the prior contract: if the string fit
+        # (we saw the NUL) return i+1 == bytes incl NUL; if it was
+        # truncated to fill the buffer, return i (the prior loop's
+        # "i+1 < a1" exit returned i without the +1).
+        if gw_hit_nul != 0:
+            return gw_total
+        return i
     if nr == SYS_UNLINK:
         # Resolve to absolute first so vfs_unlink's prefix routing
         # sees the canonical form (matches SYS_OPEN's behaviour).
@@ -4015,3 +4116,99 @@ def netcfg_smoke_test():
     printk0("[netcfg] static-dns PASS dns=1.1.1.1 source=static\n")
 
     printk0("[netcfg] PASS\n")
+
+
+# ===================================================================
+# uaccess SYSCALL-level proof — the decoupling, exercised end-to-end.
+#
+# mm/uaccess.ad::uaccess_smoke_test already proves the copy_to_user /
+# copy_from_user PRIMITIVES translate a vaddr != phys mapping. This test
+# proves the CONVERTED SYSCALL HANDLERS do too: it drives do_syscall()
+# for SYS_GETCWD against a user buffer whose physical frame is
+# DELIBERATELY NOT EQUAL to its virtual address, then asserts:
+#
+#   1. the cwd bytes land at the PHYSICAL frame P (the translated
+#      destination), NOT at the raw vaddr V,
+#   2. the syscall return value matches the (string length + NUL),
+#   3. the OLD raw-deref path would have been WRONG — we pre-poison P
+#      so a no-op (untranslated) write would leave the poison intact;
+#      a poison-free, correct-bytes frame is the proof the handler
+#      translated rather than dereferenced V directly.
+#
+# The test vaddr sits high in the canonical user half (0x5555_6000_0000),
+# well above any identity-mapped RAM, so it can ONLY resolve via the PTE
+# we install. A handler that still raw-deref'd V would touch unmapped
+# memory and never reach P.
+#
+# Gated by the caller (init/main.ad runs it unconditionally at boot,
+# right after uaccess_smoke_test). PASS markers consumed by
+# scripts/test_uaccess_translate.sh.
+# ===================================================================
+
+UA_SC_TEST_VADDR: uint64 = 0x0000555560000000
+
+
+def uaccess_syscall_test():
+    printk0("Hamnix: uaccess syscall test (SYS_GETCWD via vaddr != phys)\n")
+    slot: uint64 = current_idx_get()
+    pml4: uint64 = uaccess_current_pml4()
+
+    # SAVE the boot task's existing cwd so the probe below doesn't
+    # perturb later boot. We restore it before returning.
+    cwd_save: Array[128, uint8]
+    cwd_cur: Ptr[uint8] = get_cwd_buf(slot)
+    si: uint64 = 0
+    while si < 128:
+        cwd_save[si] = cwd_cur[si]
+        si = si + 1
+
+    # Install a known cwd in the task's kernel-side cwd[] so the
+    # converted SYS_GETCWD has a deterministic string to copy out.
+    cwd_probe: Array[16, uint8]
+    cwd_probe[0] = cast[uint8](47)        # '/'
+    cwd_probe[1] = cast[uint8](117)       # 'u'
+    cwd_probe[2] = cast[uint8](97)        # 'a'
+    cwd_probe[3] = cast[uint8](120)       # 'x'
+    cwd_probe[4] = 0
+    set_task_cwd(slot, &cwd_probe[0])     # expected copy-out: "/uax\0", 5 bytes
+
+    # Map a fresh physical page at a NON-IDENTITY user vaddr (V != P).
+    p: uint64 = alloc_page()
+    if p == 0:
+        printk0("  [uaccess-sc] SKIP: alloc_page failed\n")
+        return
+    # Pre-poison the physical frame: if SYS_GETCWD failed to translate
+    # (the old raw-deref-of-V behaviour) the poison would survive.
+    memset(cast[Ptr[uint8]](p), 0xCD, 4096)
+    if vm_map_user_page(pml4, UA_SC_TEST_VADDR, p, 1) < 0:
+        printk0("  [uaccess-sc] FAIL: could not install test mapping\n")
+        free_page(p)
+        return
+    printk2("  [uaccess-sc] mapped V=%p -> P=%p (writable)\n",
+            UA_SC_TEST_VADDR, p)
+
+    # Drive the CONVERTED syscall: write the cwd into the user buffer V.
+    ret: uint64 = do_syscall(SYS_GETCWD, UA_SC_TEST_VADDR, 16,
+                             0, 0, 0, 0)
+
+    # 1. The bytes MUST appear at the physical frame P (translated dst).
+    phys_view: Ptr[uint8] = cast[Ptr[uint8]](p)
+    ok: int32 = 1
+    if phys_view[0] != 47 or phys_view[1] != 117 \
+            or phys_view[2] != 97 or phys_view[3] != 120 \
+            or phys_view[4] != 0:
+        ok = 0
+    # 2. Return value is "/uax" (4) + NUL (1) = 5.
+    if ret != 5:
+        printk1("  [uaccess-sc] FAIL: ret=%p (expected 5)\n", ret)
+        ok = 0
+    if ok != 0:
+        printk0("  [uaccess-sc] PASS: SYS_GETCWD copied to the physical frame\n")
+    else:
+        printk2("  [uaccess-sc] FAIL: frame[0..1]=%p,%p (poison=0xCD => untranslated)\n",
+                cast[uint64](phys_view[0]), cast[uint64](phys_view[1]))
+
+    free_page(p)
+    # Restore the boot task's original cwd.
+    set_task_cwd(slot, &cwd_save[0])
+    printk0("  [uaccess-sc] done\n")

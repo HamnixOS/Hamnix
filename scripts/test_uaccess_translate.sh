@@ -21,9 +21,17 @@
 #   3. an UNMAPPED user address returns the full residual (EFAULT, no panic),
 #   4. a READ-ONLY user page is readable but rejects copy_to_user.
 #
-# This fixture boots the kernel ONCE and asserts all four PASS markers
-# plus the absence of any FAIL marker. A PASS therefore demonstrates that
-# user vaddr no longer has to equal phys — the decoupling is real.
+# uaccess_syscall_test() (arch/x86/kernel/syscall.ad, run immediately
+# after) goes one level UP: it maps a non-identity user page and drives
+# the CONVERTED SYS_GETCWD handler through do_syscall(), proving the
+# SYSCALL LAYER (not just the copy_to_user primitive) translates rather
+# than raw-derefs — the cwd bytes land at the physical frame, the poison
+# we pre-write is gone, and the return value is the string length + NUL.
+#
+# This fixture boots the kernel ONCE and asserts all PASS markers plus
+# the absence of any FAIL marker. A PASS therefore demonstrates that
+# user vaddr no longer has to equal phys — the decoupling is real both
+# at the primitive layer AND through a real converted syscall.
 #
 # NOTE: a trailing QEMU rc=124 AFTER the markers have printed is benign
 # (the kernel halts without powering off qemu); the grep checks below are
@@ -50,26 +58,31 @@ echo "[test_uaccess] (2/2) Boot and capture uaccess smoke markers"
 LOG=$(mktemp)
 trap 'rm -f "$LOG"' EXIT
 set +e
-qemu_drive "$LOG" "$ELF" "[uaccess-smoke] done" 70 -- "exit" 1
+qemu_drive "$LOG" "$ELF" "[uaccess-sc] done" 70 -- "exit" 1
 set -e
 
-echo "[test_uaccess] --- uaccess smoke lines ---"
-grep -a "uaccess-smoke" "$LOG" || true
+echo "[test_uaccess] --- uaccess smoke + syscall lines ---"
+grep -a "uaccess-smoke\|uaccess-sc" "$LOG" || true
 
 fail=0
 
-# No FAIL marker anywhere.
+# No FAIL marker anywhere (primitive layer OR syscall layer).
 if grep -a -q "\[uaccess-smoke\] FAIL" "$LOG"; then
     echo "[test_uaccess] MISS: a uaccess-smoke FAIL marker is present"
     fail=1
 fi
+if grep -a -q "\[uaccess-sc\] FAIL" "$LOG"; then
+    echo "[test_uaccess] MISS: a uaccess-sc FAIL marker is present"
+    fail=1
+fi
 
-# All four PASS markers present.
+# All PASS markers present — four primitive-layer + the syscall-layer one.
 need=(
     "copy_to_user reached the physical frame"
     "copy_from_user round-tripped through V"
     "unmapped address -> EFAULT (no panic)"
     "RO page readable, write -> EFAULT"
+    "SYS_GETCWD copied to the physical frame"
 )
 for m in "${need[@]}"; do
     if grep -a -q -F "$m" "$LOG"; then
@@ -88,4 +101,5 @@ if [ "$fail" -ne 0 ]; then
 fi
 
 echo "[test_uaccess] PASS — copy_to/from_user translate a user vaddr != phys" \
-     "through the current task's page tables, with safe -EFAULT on fault"
+     "through the current task's page tables (with safe -EFAULT on fault)," \
+     "and the converted SYS_GETCWD handler does the same end-to-end"
