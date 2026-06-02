@@ -502,6 +502,18 @@ if os.environ.get("ENABLE_EXT4DIR_TEST") == "1":
 if os.environ.get("ENABLE_EXT4_MKDIR_TEST") == "1":
     FILES.append(("/etc/ext4-mkdir-test", b"1\n"))
 
+# ext4 slow-symlink self-test. scripts/test_ext4_symlink.sh sets
+# ENABLE_EXT4_SYMLINK_TEST=1 to plant /etc/ext4-symlink-test. init/main.ad
+# detects the marker after the ext4 mount and calls ext4_symlink_selftest()
+# (fs/ext4.ad): it creates a symlink whose target exceeds 60 bytes (forcing
+# the slow path: a data block recorded as a depth-0 extent) plus a short
+# (<=60-byte) symlink (the fast inline path), then reads both targets back
+# via _ext4_read_symlink_target and compares them byte-for-byte against
+# what was written. Writes to the mounted image, so it is opt-in. Default
+# boots omit the marker so it never fires.
+if os.environ.get("ENABLE_EXT4_SYMLINK_TEST") == "1":
+    FILES.append(("/etc/ext4-symlink-test", b"1\n"))
+
 # MBR extended/logical-partition (EBR chain) self-test. scripts/
 # test_partebr.sh sets ENABLE_PARTEBR_TEST=1 to plant /etc/partebr-test
 # and attaches a raw "vda" disk carrying an MBR + extended container +
