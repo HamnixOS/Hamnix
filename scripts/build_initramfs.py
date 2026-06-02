@@ -347,6 +347,17 @@ if os.environ.get("ENABLE_EFI_TEST") == "1":
     FILES.append(("/etc/secureboot-pe-good", _sb_fx["secureboot-pe-good"]))
     FILES.append(("/etc/secureboot-pe-bad", _sb_fx["secureboot-pe-bad"]))
 
+# #174: per-namespace CPU + memory resource-cap self-test.
+# scripts/test_nscap.sh sets ENABLE_NSCAP_TEST=1 to plant /etc/nscap-test.
+# init/main.ad at boot:37.nsc detects the marker and calls nscap_selftest()
+# (mm/nscap_test.ad): it builds two user tasks in SEPARATE namespaces,
+# caps one's memory, and asserts that a demand-fault past the cap is
+# DENIED in the capped namespace while the UNCAPPED namespace faults the
+# same pages — plus the 25% CPU-cap vruntime-inflation factor. Default
+# boots omit the marker so the self-test never fires unintentionally.
+if os.environ.get("ENABLE_NSCAP_TEST") == "1":
+    FILES.append(("/etc/nscap-test", b"ENABLE_NSCAP_TEST=1\n"))
+
 # #149: ext4 JBD2 journal crash-consistency self-test. scripts/
 # test_ext4_journal.sh sets ENABLE_EXT4_JOURNAL_TEST=1 to plant
 # /etc/ext4-journal-test. init/main.ad detects the marker after the

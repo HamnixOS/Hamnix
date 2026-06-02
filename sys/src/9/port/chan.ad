@@ -161,6 +161,31 @@ class Pgrp:
     ref:       int32                   # refcount; 0 = unreferenced, fire kfree
     mnt_count: int32                   # live entries in mtab (cached)
     mtab:      Array[32, MountEntry]   # the inline bindings
+    # --- #174: per-namespace resource caps (Plan-9-native, NOT cgroups) -
+    # A resource cap binds to the NAMESPACE (this Pgrp), not to a task or
+    # a Linux cgroup. Every task whose `pgrp` field points at this struct
+    # shares these caps; a clone (rfork RFNAMEG) inherits the cap VALUES
+    # but starts its own fresh `mem_charged` (the child namespace accounts
+    # its own residency separately). Control surface: the /dev/nscap cdev.
+    #
+    #   mem_cap_bytes  — max resident bytes for all tasks in this
+    #                    namespace. 0 == uncapped (the default). When a
+    #                    task here page-ins past the cap the allocation is
+    #                    DENIED exactly like an over-OOM allocation (the
+    #                    caller surfaces -ENOMEM); no reclaim/kill is
+    #                    forced — the namespace simply cannot grow past its
+    #                    own ceiling.
+    #   mem_charged    — running sum of bytes charged to this namespace.
+    #                    Bumped on page-in (vma_alloc / demand fault /
+    #                    large alloc), dropped on unmap / task_reap.
+    #   cpu_cap_pct    — CPU share ceiling in percent (1..100). 0 == 100 ==
+    #                    uncapped. The CFS-lite picker inflates this
+    #                    namespace's vruntime accrual by 100/cpu_cap_pct, so
+    #                    a 25%-capped namespace accrues vruntime 4x faster
+    #                    and _pick_next selects its tasks ~1/4 as often.
+    mem_cap_bytes:  uint64
+    mem_charged:    uint64
+    cpu_cap_pct:    uint64
 
 
 # Per-Pgrp mount-table cap. V2 had MNTTAB_PER_NS=8; V2.5+ uses 32.
@@ -174,10 +199,11 @@ MNT_CAP: uint64 = 32
 #   ref + mnt_count                            = 2 * 4 = 8
 #   mtab: 32 entries × (4+4+4+4 + 16 chan + 128 + 128 + 32 label)
 #                                              = 32 * 320 = 10240
-# Total = 10248 bytes. kmalloc routes this through _kmalloc_large
+#   #174 caps: mem_cap_bytes + mem_charged + cpu_cap_pct = 3 * 8 = 24
+# Total = 10272 bytes. kmalloc routes this through _kmalloc_large
 # (size > 2048) which calls alloc_pages(order=2) → 16 KiB, comfortably
-# above 10248.
-PGRP_SIZE: uint64 = 10248
+# above 10272.
+PGRP_SIZE: uint64 = 10272
 
 # Address of the root Pgrp, lazily kzalloc'd in pgrp_init. Tasks that
 # default to "the root namespace" carry this exact pointer in their
@@ -839,6 +865,13 @@ def pgrp_clone(src: uint64) -> uint64:
     # snapshot of the parent's. Pipe ends are refcount-bumped inside
     # devfd_clone_row.
     devfd_clone_row(src, new_addr)
+    # #174: a divergent namespace INHERITS the cap CEILINGS but starts a
+    # fresh residency count — the clone accounts its own pages from zero.
+    # (kzalloc already zeroed mem_charged in the new Pgrp.)
+    sp: Ptr[Pgrp] = _pgrp_ptr(src)
+    np: Ptr[Pgrp] = _pgrp_ptr(new_addr)
+    np[0].mem_cap_bytes = sp[0].mem_cap_bytes
+    np[0].cpu_cap_pct   = sp[0].cpu_cap_pct
     return new_addr
 
 
@@ -922,6 +955,139 @@ def pgrp_root() -> uint64:
     # current task's pgrp (which during boot may not be sensible).
     _ensure_root()
     return pgrp_root_addr
+
+
+# --- #174: per-namespace resource caps -------------------------------
+#
+# These are the kernel-internal surface the mm layer (charge/uncharge),
+# the scheduler (cpu throttle factor), and the /dev/nscap control cdev
+# all call. Everything binds to a Pgrp pointer — the Plan-9 namespace
+# object — never to a task or a Linux cgroup. The `_nscap_` prefix keeps
+# the helpers out of the flat global symbol namespace's way.
+
+def nscap_set_mem(p: uint64, nbytes: uint64):
+    # Install a memory ceiling (in nbytes) on namespace `p`. 0 == uncapped.
+    if p == 0:
+        return
+    _pgrp_ptr(p)[0].mem_cap_bytes = nbytes
+
+
+def nscap_set_cpu(p: uint64, pct: uint64):
+    # Install a CPU-share ceiling (1..100 %) on namespace `p`. 0 or >=100
+    # == uncapped. Out-of-range high values clamp to uncapped.
+    if p == 0:
+        return
+    pp: uint64 = pct
+    if pp >= 100:
+        pp = 0
+    _pgrp_ptr(p)[0].cpu_cap_pct = pp
+
+
+def nscap_get_mem_cap(p: uint64) -> uint64:
+    if p == 0:
+        return 0
+    return _pgrp_ptr(p)[0].mem_cap_bytes
+
+
+def nscap_get_mem_charged(p: uint64) -> uint64:
+    if p == 0:
+        return 0
+    return _pgrp_ptr(p)[0].mem_charged
+
+
+def nscap_get_cpu(p: uint64) -> uint64:
+    if p == 0:
+        return 0
+    return _pgrp_ptr(p)[0].cpu_cap_pct
+
+
+def nscap_mem_charge(p: uint64, nbytes: uint64) -> int32:
+    # Try to charge `nbytes` of fresh residency to namespace `p`. Returns 0
+    # on success (charge applied), -1 if the charge would exceed the cap
+    # (charge NOT applied — caller must fail the allocation like OOM).
+    # An uncapped namespace (mem_cap_bytes == 0) always succeeds but its
+    # running total is still tracked so a later `echo mem ... > /dev/nscap`
+    # reports the live residency.
+    if p == 0:
+        return 0
+    g: Ptr[Pgrp] = _pgrp_ptr(p)
+    cap: uint64 = g[0].mem_cap_bytes
+    if cap != 0:
+        if g[0].mem_charged + nbytes > cap:
+            return -1
+    g[0].mem_charged = g[0].mem_charged + nbytes
+    return 0
+
+
+def nscap_mem_uncharge(p: uint64, nbytes: uint64):
+    # Drop `nbytes` of residency from namespace `p` (page free / unmap /
+    # task_reap). Saturates at 0 so a double-uncharge can't underflow.
+    if p == 0:
+        return
+    g: Ptr[Pgrp] = _pgrp_ptr(p)
+    if nbytes >= g[0].mem_charged:
+        g[0].mem_charged = 0
+    else:
+        g[0].mem_charged = g[0].mem_charged - nbytes
+
+
+# --- charge/uncharge against the CURRENT task's namespace ------------
+#
+# The mm layer almost always wants "charge to whoever is running" — it
+# calls these so it never has to reach into core.ad for the pgrp pointer
+# itself. They resolve current_pgrp() (0 == not-yet-installed → treated
+# as the root namespace, which is uncapped by default so boot-time
+# allocations never trip a cap).
+
+def nscap_mem_charge_slot(slot: uint64, nbytes: uint64) -> int32:
+    # Charge against the namespace of task `slot` (used by the mm layer's
+    # page-fault / vma_alloc paths, where the charging task is identified
+    # by its slot index, not necessarily current_idx). A slot whose
+    # pgrp is 0 (root default, uncapped) always succeeds.
+    p: uint64 = task_pgrp(cast[int32](slot))
+    if p == 0:
+        return 0
+    return nscap_mem_charge(p, nbytes)
+
+
+def nscap_mem_uncharge_slot(slot: uint64, nbytes: uint64):
+    p: uint64 = task_pgrp(cast[int32](slot))
+    if p == 0:
+        return
+    nscap_mem_uncharge(p, nbytes)
+
+
+def nscap_charge_current(nbytes: uint64) -> int32:
+    p: uint64 = current_pgrp()
+    if p == 0:
+        return 0
+    return nscap_mem_charge(p, nbytes)
+
+
+def nscap_uncharge_current(nbytes: uint64):
+    p: uint64 = current_pgrp()
+    if p == 0:
+        return
+    nscap_mem_uncharge(p, nbytes)
+
+
+def nscap_cpu_factor_current() -> uint64:
+    # CFS-lite throttle factor for the currently-running task's namespace:
+    # the integer multiplier by which vruntime accrual is inflated. 100%
+    # (or uncapped) → 1 (no inflation). 25% → 4. 10% → 10. Computed as
+    # 100/cpu_cap_pct, floored at 1. preempt_tick multiplies the per-tick
+    # vruntime advance by this so a capped namespace's tasks lose the
+    # _pick_next race proportionally and get throttled.
+    p: uint64 = current_pgrp()
+    if p == 0:
+        return 1
+    pct: uint64 = _pgrp_ptr(p)[0].cpu_cap_pct
+    if pct == 0 or pct >= 100:
+        return 1
+    f: uint64 = 100 / pct
+    if f < 1:
+        f = 1
+    return f
 
 
 # --- legacy wrappers kept for compatibility with downstream calls --

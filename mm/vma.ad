@@ -78,6 +78,22 @@ extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 extern def load_cr3(value: uint64)
 extern def invlpg_one(va: uint64)
 
+# #174: per-namespace memory caps. nscap_mem_charge_slot /
+# nscap_mem_uncharge_slot live in sys/src/9/port/chan.ad (alongside the
+# Pgrp struct that holds the cap + the running residency count). The mm
+# layer charges a page-in / uncharges a free against the faulting task's
+# namespace. chan.ad imports from kernel.sched.core + mm.slab (NOT mm.vma),
+# so this import is acyclic.
+#
+#   nscap_mem_charge_slot(slot, nbytes)  -> 0 ok / -1 over-cap (NOT charged)
+#   nscap_mem_uncharge_slot(slot, nbytes)
+# `slot` is the task slot index; the helper resolves its Pgrp. A slot
+# whose namespace is uncapped always succeeds. The byte total is tracked
+# either way so /dev/nscap reports live residency.
+from sys.src.port9.port.chan import (
+    nscap_mem_charge_slot, nscap_mem_uncharge_slot,
+)
+
 # ---------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------
@@ -370,8 +386,12 @@ def _vma_free_cow_range(pml4_phys: uint64, vlo: uint64, vhi: uint64):
         vaddr = vaddr + VMA_PAGE_SIZE
 
 
-def _vma_node_free(node: uint64, pml4_phys: uint64):
+def _vma_node_free(slot: uint64, node: uint64, pml4_phys: uint64):
     # Release the node's backing pages (if any) then the node itself.
+    # #174: `slot` identifies the owning task so a demand-paged node's
+    # freed pages can be UNCHARGED from that task's namespace residency
+    # (charge happened per-page at demand-fault time). Only demand pages
+    # are namespace-charged today, so only that arm uncharges.
     # backing == 0 marks "no kernel-owned pages here" (an alias node
     # for a MAP_FIXED slice inside an enclosing region; only the
     # enclosing node owns the pages).
@@ -395,13 +415,31 @@ def _vma_node_free(node: uint64, pml4_phys: uint64):
         d_start: uint64 = cast[Ptr[VmaNode]](node)[0].start
         d_end:   uint64 = cast[Ptr[VmaNode]](node)[0].end
         daddr: uint64 = d_start
+        freed_pages: uint64 = 0
         while daddr < d_end:
             pte: uint64 = _vma_pte_lookup(pml4_phys, daddr)
             if pte != 0:
                 dphys: uint64 = pte & VMA_PT_ADDR_MASK
                 if dphys != 0:
                     free_page(dphys)
+                    freed_pages = freed_pages + 1
+            else:
+                # #174: a not-present PTE that is a SWAP ENTRY was still
+                # charged to the namespace at demand-fault time (swap-out
+                # frees the RAM page but keeps the namespace commitment).
+                # Count it for uncharge so the residency doesn't leak when
+                # a swapped page's VMA is torn down. _vma_pte_lookup masks
+                # to present PTEs, so re-walk the raw PTE slot for the
+                # swap test.
+                pslot2: uint64 = _vma_pte_slot_addr(pml4_phys, daddr)
+                if pslot2 != 0:
+                    raw: uint64 = cast[Ptr[uint64]](pslot2)[0]
+                    if swap_pte_is_swap(raw) != 0:
+                        freed_pages = freed_pages + 1
             daddr = daddr + VMA_PAGE_SIZE
+        # #174: return the freed residency to the namespace's quota.
+        if freed_pages > 0:
+            nscap_mem_uncharge_slot(slot, freed_pages * 4096)
         if nr_vma_nodes_live > 0:
             nr_vma_nodes_live = nr_vma_nodes_live - 1
         kfree(node)
@@ -460,6 +498,12 @@ def _vma_node_free(node: uint64, pml4_phys: uint64):
     if backing != 0:
         order: int32 = cast[Ptr[VmaNode]](node)[0].order
         free_pages(backing, order)
+        # #174: the single-chunk eager path (vma_alloc) charged the VMA's
+        # page-rounded length to the namespace at create time. Give it
+        # back symmetrically (end - start == that page-rounded length).
+        b_start: uint64 = cast[Ptr[VmaNode]](node)[0].start
+        b_end:   uint64 = cast[Ptr[VmaNode]](node)[0].end
+        nscap_mem_uncharge_slot(slot, b_end - b_start)
     if nr_vma_nodes_live > 0:
         nr_vma_nodes_live = nr_vma_nodes_live - 1
     kfree(node)
@@ -830,13 +874,13 @@ def _vma_carve_range(slot: uint64, start: uint64, end: uint64):
                     # carve still makes progress (over-unmaps the head
                     # remainder — rare, OOM-only).
                     _vma_unlink(slot, cur)
-                    _vma_node_free(cur, pml4)
+                    _vma_node_free(slot, cur, pml4)
                     cur = nxt
                 else:
                     tail: uint64 = _vma_split_at(slot, cur, start)
                     if tail == 0:
                         _vma_unlink(slot, cur)
-                        _vma_node_free(cur, pml4)
+                        _vma_node_free(slot, cur, pml4)
                         cur = nxt
                     else:
                         # Re-walk from the tail (the overlapping part).
@@ -847,25 +891,25 @@ def _vma_carve_range(slot: uint64, start: uint64, end: uint64):
                 # covered — drop it; continue from the surviving tail.
                 if _vma_make_refcounted(slot, cur) < 0:
                     _vma_unlink(slot, cur)
-                    _vma_node_free(cur, pml4)
+                    _vma_node_free(slot, cur, pml4)
                     cur = nxt
                 else:
                     tail2: uint64 = _vma_split_at(slot, cur, end)
                     if tail2 == 0:
                         _vma_unlink(slot, cur)
-                        _vma_node_free(cur, pml4)
+                        _vma_node_free(slot, cur, pml4)
                         cur = nxt
                     else:
                         # `cur` is now [s, end) — fully covered. Drop
                         # it; the surviving tail2 is past `end` so the
                         # carve is complete.
                         _vma_unlink(slot, cur)
-                        _vma_node_free(cur, pml4)
+                        _vma_node_free(slot, cur, pml4)
                         done = 1
             else:
                 # Node fully inside [start, end): drop it whole.
                 _vma_unlink(slot, cur)
-                _vma_node_free(cur, pml4)
+                _vma_node_free(slot, cur, pml4)
                 cur = nxt
         elif s >= end:
             done = 1
@@ -1220,8 +1264,17 @@ def vma_alloc(slot: uint64, addr_in: uint64, len_in: uint64,
         return _vma_alloc_large(slot, length, prot, flags,
                                 file_fd, file_offset)
 
+    # #174: charge the eager allocation to the task's namespace. The
+    # whole VMA is backed up front (pages alloc'd + zeroed below), so the
+    # full `length` is resident immediately — charge it all. Over-cap →
+    # deny like OOM (-ENOMEM), nothing allocated.
+    if nscap_mem_charge_slot(slot, length) != 0:
+        printk1("vma: alloc DENIED by namespace mem cap len=%d\n", length)
+        return cast[int64](-12)
+
     base: uint64 = alloc_pages(order)
     if base == 0:
+        nscap_mem_uncharge_slot(slot, length)
         printk1("vma: alloc_pages OOM len=%d\n", length)
         return cast[int64](-12)
 
@@ -1230,6 +1283,7 @@ def vma_alloc(slot: uint64, addr_in: uint64, len_in: uint64,
     node: uint64 = _vma_node_new()
     if node == 0:
         free_pages(base, order)
+        nscap_mem_uncharge_slot(slot, length)
         return cast[int64](-12)
     end_v: uint64 = base + length
     _vma_node_set(node, base, end_v, prot, flags, file_fd,
@@ -1357,10 +1411,24 @@ def vma_demand_fault(slot: uint64, pml4_phys: uint64,
     if (prot & VMA_PROT_WRITE) != 0:
         want_write = 1
 
+    # #174: charge this page-in to the faulting task's namespace BEFORE
+    # touching the page allocator. If the namespace's memory cap would be
+    # exceeded, deny the fault exactly like an over-OOM allocation: return
+    # -1 so do_page_fault treats it as a fatal allocation failure (the
+    # task takes the OOM/SIGSEGV path), and DON'T allocate the page. An
+    # uncapped namespace returns 0 here and proceeds.
+    if nscap_mem_charge_slot(slot, 4096) != 0:
+        printk1("vma: demand DENIED by namespace mem cap at va=0x%x\n",
+                fault_va)
+        return -1
+
     # Allocate one physical page and zero-fill it (anonymous mapping
     # contract: demand pages read as zero on first access).
     phys: uint64 = alloc_page()
     if phys == 0:
+        # Charged but couldn't get a page — give the charge back so the
+        # namespace's residency stays honest.
+        nscap_mem_uncharge_slot(slot, 4096)
         printk1("vma: demand OOM at va=0x%x\n", fault_va)
         return -1
     memset(cast[Ptr[uint8]](phys), 0, 4096)
@@ -1372,6 +1440,7 @@ def vma_demand_fault(slot: uint64, pml4_phys: uint64,
     if elf_map_one_page(pml4_phys, va_al, phys, want_write,
                         _vma_nx_flag(prot)) < 0:
         free_page(phys)
+        nscap_mem_uncharge_slot(slot, 4096)
         printk1("vma: demand map failed at va=0x%x\n", fault_va)
         return -1
     return 1
@@ -1703,7 +1772,7 @@ def vma_clear(slot: uint64):
     cur: uint64 = task_vma_list_head(slot)
     while cur != 0:
         nxt: uint64 = _vma_node_get_next(cur)
-        _vma_node_free(cur, pml4)
+        _vma_node_free(slot, cur, pml4)
         cur = nxt
     set_task_vma_list_head(slot, 0)
 
