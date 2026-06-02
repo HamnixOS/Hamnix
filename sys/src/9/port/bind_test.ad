@@ -1,0 +1,308 @@
+# sys/src/9/port/bind_test.ad
+#
+# Plan-9 namespace bind/mount/unmount self-test. Boot-gated on
+# /etc/bind-test (planted by scripts/build_initramfs.py when
+# ENABLE_BIND_TEST=1); init/main.ad at boot:37.bind calls
+# bind_selftest() below.
+#
+# This is the UNFORGEABLE proof that the native bind(2)/mount(2)/
+# unmount(2) syscalls build a REAL per-process namespace — not a
+# table that records bindings but never redirects a lookup. Each
+# assertion resolves a path THROUGH a bound name with resolve_path()
+# (the exact seam SYS_OPEN consults) and reads the backing cpio bytes,
+# so a marker only prints if the namespace walk landed on the right
+# source file.
+#
+# Fixtures (cpio, planted by build_initramfs.py):
+#   /bind_src_a/onlyA.txt   = "AAA"      (only in source A)
+#   /bind_src_a/shared.txt  = "FROM-A"   (shared name, A copy)
+#   /bind_src_b/onlyB.txt   = "BBB"      (only in source B)
+#   /bind_src_b/shared.txt  = "FROM-B"   (shared name, B copy)
+#
+# What each phase proves:
+#
+#   1. REDIRECT (MREPL): bind /bind_src_a -> /bind_union, then resolve
+#      /bind_union/onlyA.txt and read "AAA". A bare table-record could
+#      not make a NEW name resolve to A's bytes — only a walk that
+#      consults the mount table does.
+#
+#   2. UNION (MBEFORE): add bind -b /bind_src_b -> /bind_union over the
+#      A bind. Now /bind_union/onlyA.txt STILL reads "AAA" (member A)
+#      AND /bind_union/onlyB.txt reads "BBB" (member B) — files from
+#      BOTH members visible at the one union point. /bind_union/shared
+#      reads "FROM-B" because the MBEFORE member shadows the base.
+#
+#   3. UNMOUNT: unmount the B branch, then unmount everything at
+#      /bind_union. Afterwards /bind_union/onlyB.txt no longer resolves
+#      to B's bytes (the binding reverted) — proves removal is real.
+#
+#   4. PER-NAMESPACE ISOLATION: clone a fresh Pgrp, swap the current
+#      task onto it, bind /bind_src_b -> /iso_union there, confirm the
+#      child namespace sees it, then restore the original Pgrp and
+#      confirm the parent namespace does NOT see the child's bind.
+#      Proves binds are per-Pgrp, not global.
+
+from kernel.printk.printk import printk0, printk_set_level
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
+from kernel.sched.core import (
+    current_idx_get, set_task_pgrp, task_pgrp,
+)
+from sys.src.port9.port.chan import (
+    mnttab_bind, mnttab_unmount,
+    pgrp_clone, pgrp_ref_dec, pgrp_current,
+)
+from fs.vfs import resolve_path
+from fs.cpio import (
+    initramfs_entry_count, initramfs_entry_name,
+    initramfs_entry_data, initramfs_entry_size,
+)
+
+# Plan-9 mount-order flags (MORDER band). Mirrors user/hamsh.ad's
+# MREPL_FLAG / MBEFORE_FLAG / MAFTER_FLAG.
+_BT_MREPL:   int32 = 0
+_BT_MBEFORE: int32 = 1
+_BT_MAFTER:  int32 = 2
+
+
+def _bt_emerg(s: Ptr[char]):
+    # Stamp a marker line EMERG so it survives the console gate and
+    # reaches the captured serial log.
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0(s)
+
+
+def _bt_streq_n(a: Ptr[uint8], b: Ptr[uint8], n: uint64) -> int32:
+    # 1 if the first n bytes of a and b are equal.
+    i: uint64 = 0
+    while i < n:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def _bt_cpio_lookup(path: Ptr[uint8]) -> int32:
+    # Equal-length C-string compare against every cpio entry. Returns
+    # the entry index or -1. Local copy so bind_test.ad doesn't depend
+    # on sysfile.ad's private helper.
+    count: uint64 = initramfs_entry_count()
+    i: uint64 = 0
+    while i < count:
+        cand: Ptr[char] = initramfs_entry_name(i)
+        k: uint64 = 0
+        eq: int32 = 1
+        while True:
+            ca: int32 = cast[int32](path[k] & 0xFF)
+            cb: int32 = cand[k]
+            if ca != cb:
+                eq = 0
+                break
+            if ca == 0:
+                break
+            k = k + 1
+        if eq != 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _bt_resolve_reads(user_path: Ptr[char], want: Ptr[uint8],
+                      want_len: uint64) -> int32:
+    # Resolve `user_path` through the CURRENT namespace (resolve_path
+    # applies the bind/union ladder), then read the backing cpio bytes
+    # and compare to `want`. Returns 1 if the resolved file's first
+    # want_len bytes equal `want`, 0 on any miss (no bind match,
+    # resolved file absent, or content mismatch). This is THE proof
+    # that the walk through a bound name lands on the right source.
+    abs_buf: Array[256, uint8]
+    rc: int32 = resolve_path(user_path, &abs_buf[0], 256)
+    if rc != 0:
+        return 0
+    idx: int32 = _bt_cpio_lookup(&abs_buf[0])
+    if idx < 0:
+        return 0
+    sz: uint64 = initramfs_entry_size(cast[uint64](idx))
+    if sz < want_len:
+        return 0
+    data: Ptr[uint8] = initramfs_entry_data(cast[uint64](idx))
+    return _bt_streq_n(data, want, want_len)
+
+
+def _bt_resolves_to_source(user_path: Ptr[char]) -> int32:
+    # 1 if `user_path` resolves to an EXISTING cpio file under the
+    # current namespace. Used by the unmount phase: after unbinding,
+    # a path that previously resolved through the union must NO LONGER
+    # land on a backing file.
+    abs_buf: Array[256, uint8]
+    rc: int32 = resolve_path(user_path, &abs_buf[0], 256)
+    if rc != 0:
+        return 0
+    if _bt_cpio_lookup(&abs_buf[0]) < 0:
+        return 0
+    return 1
+
+
+def bind_selftest() -> int32:
+    # Returns 1 on PASS, 0 on FAIL. Prints [bind] markers throughout
+    # and a single "[bind] PASS" on full success.
+    _bt_emerg("[bind] starting Plan-9 namespace bind/mount/unmount self-test\n")
+
+    aaa: Array[4, uint8]
+    aaa[0] = 65                                      # 'A'
+    aaa[1] = 65
+    aaa[2] = 65
+    aaa[3] = 0
+    bbb: Array[4, uint8]
+    bbb[0] = 66                                      # 'B'
+    bbb[1] = 66
+    bbb[2] = 66
+    bbb[3] = 0
+    from_a: Array[7, uint8]
+    from_a[0] = 70                                   # 'F'
+    from_a[1] = 82                                   # 'R'
+    from_a[2] = 79                                   # 'O'
+    from_a[3] = 77                                   # 'M'
+    from_a[4] = 45                                   # '-'
+    from_a[5] = 65                                   # 'A'
+    from_a[6] = 0
+    from_b: Array[7, uint8]
+    from_b[0] = 70
+    from_b[1] = 82
+    from_b[2] = 79
+    from_b[3] = 77
+    from_b[4] = 45
+    from_b[5] = 66                                   # 'B'
+    from_b[6] = 0
+
+    ok: int32 = 1
+
+    # --- Phase 0: sanity — the fixtures actually exist verbatim -----
+    if _bt_cpio_lookup(cast[Ptr[uint8]]("/bind_src_a/onlyA.txt")) < 0:
+        _bt_emerg("[bind] FAIL: fixture /bind_src_a/onlyA.txt missing\n")
+        return 0
+    if _bt_cpio_lookup(cast[Ptr[uint8]]("/bind_src_b/onlyB.txt")) < 0:
+        _bt_emerg("[bind] FAIL: fixture /bind_src_b/onlyB.txt missing\n")
+        return 0
+
+    # --- Phase 1: REDIRECT (MREPL) ----------------------------------
+    # bind /bind_src_a -> /bind_union. hamsh's wrapper passes
+    # sys_bind(new=DST, old=SRC); the kernel mnttab_bind takes
+    # (new_path=the lookup name, old_path=the source). So the lookup
+    # name "/bind_union" is new, the source "/bind_src_a" is old.
+    r1: int32 = mnttab_bind(cast[Ptr[uint8]]("/bind_union"),
+                            cast[Ptr[uint8]]("/bind_src_a"),
+                            _BT_MREPL)
+    if r1 < 0:
+        _bt_emerg("[bind] FAIL: phase1 mnttab_bind returned error\n")
+        return 0
+    if _bt_resolve_reads(cast[Ptr[char]]("/bind_union/onlyA.txt"),
+                         &aaa[0], 3) != 0:
+        _bt_emerg("[bind] phase1 OK: /bind_union/onlyA.txt -> 'AAA' (MREPL redirect)\n")
+    else:
+        _bt_emerg("[bind] FAIL: phase1 /bind_union/onlyA.txt did not read 'AAA'\n")
+        ok = 0
+    # The shared name resolves to A's copy while A is the only member.
+    if _bt_resolve_reads(cast[Ptr[char]]("/bind_union/shared.txt"),
+                         &from_a[0], 6) != 0:
+        _bt_emerg("[bind] phase1 OK: /bind_union/shared.txt -> 'FROM-A'\n")
+    else:
+        _bt_emerg("[bind] FAIL: phase1 /bind_union/shared.txt did not read 'FROM-A'\n")
+        ok = 0
+
+    # --- Phase 2: UNION (MBEFORE) -----------------------------------
+    # Add bind -b /bind_src_b -> /bind_union OVER the A bind. The
+    # union point now stacks {B (MBEFORE, front), A (MREPL, base)}.
+    r2: int32 = mnttab_bind(cast[Ptr[uint8]]("/bind_union"),
+                            cast[Ptr[uint8]]("/bind_src_b"),
+                            _BT_MBEFORE)
+    if r2 < 0:
+        _bt_emerg("[bind] FAIL: phase2 union mnttab_bind returned error\n")
+        return 0
+    # Both members visible: A's file still resolves...
+    if _bt_resolve_reads(cast[Ptr[char]]("/bind_union/onlyA.txt"),
+                         &aaa[0], 3) != 0:
+        _bt_emerg("[bind] phase2 OK: union member A visible (/bind_union/onlyA.txt -> 'AAA')\n")
+    else:
+        _bt_emerg("[bind] FAIL: phase2 union member A lost (/bind_union/onlyA.txt)\n")
+        ok = 0
+    # ...AND B's file resolves through the SAME union point.
+    if _bt_resolve_reads(cast[Ptr[char]]("/bind_union/onlyB.txt"),
+                         &bbb[0], 3) != 0:
+        _bt_emerg("[bind] phase2 OK: union member B visible (/bind_union/onlyB.txt -> 'BBB')\n")
+    else:
+        _bt_emerg("[bind] FAIL: phase2 union member B NOT visible (/bind_union/onlyB.txt)\n")
+        ok = 0
+    # The shared name now resolves to the MBEFORE member (B), shadowing A.
+    if _bt_resolve_reads(cast[Ptr[char]]("/bind_union/shared.txt"),
+                         &from_b[0], 6) != 0:
+        _bt_emerg("[bind] phase2 OK: MBEFORE shadows base (/bind_union/shared.txt -> 'FROM-B')\n")
+    else:
+        _bt_emerg("[bind] FAIL: phase2 MBEFORE did not shadow (/bind_union/shared.txt != 'FROM-B')\n")
+        ok = 0
+
+    # --- Phase 3: UNMOUNT -------------------------------------------
+    # Remove EVERYTHING at /bind_union. Afterwards no /bind_union/*
+    # path resolves to a backing file — the bindings reverted.
+    r3: int32 = mnttab_unmount(cast[Ptr[uint8]](0),
+                               cast[Ptr[uint8]]("/bind_union"))
+    if r3 < 0:
+        _bt_emerg("[bind] FAIL: phase3 unmount returned error\n")
+        ok = 0
+    if _bt_resolves_to_source(cast[Ptr[char]]("/bind_union/onlyB.txt")) == 0:
+        _bt_emerg("[bind] phase3 OK: post-unmount /bind_union/onlyB.txt no longer resolves\n")
+    else:
+        _bt_emerg("[bind] FAIL: phase3 /bind_union/onlyB.txt STILL resolves after unmount\n")
+        ok = 0
+    if _bt_resolves_to_source(cast[Ptr[char]]("/bind_union/onlyA.txt")) == 0:
+        _bt_emerg("[bind] phase3 OK: post-unmount /bind_union/onlyA.txt no longer resolves\n")
+    else:
+        _bt_emerg("[bind] FAIL: phase3 /bind_union/onlyA.txt STILL resolves after unmount\n")
+        ok = 0
+
+    # --- Phase 4: PER-NAMESPACE ISOLATION ---------------------------
+    # Clone a fresh Pgrp from the current one and swap the current task
+    # onto it (the in-kernel analogue of rfork(RFNAMEG)). A bind in the
+    # child Pgrp must be invisible after we restore the parent Pgrp.
+    slot: int32 = current_idx_get()
+    # Save the EXACT raw pgrp slot value so we restore the task to its
+    # original namespace byte-for-byte (it may legitimately be 0 at this
+    # boot stage — "default to root"). Clone from the RESOLVED parent
+    # (pgrp_current collapses a 0 slot onto the root Pgrp) so the child
+    # inherits the live root bindings.
+    saved_raw_pg: uint64 = task_pgrp(slot)
+    parent_pg: uint64 = pgrp_current()
+    child_pg: uint64 = pgrp_clone(parent_pg)
+    if child_pg == 0:
+        _bt_emerg("[bind] FAIL: phase4 pgrp_clone returned 0\n")
+        return 0
+    set_task_pgrp(slot, child_pg)
+    # Bind in the CHILD namespace only.
+    r4: int32 = mnttab_bind(cast[Ptr[uint8]]("/iso_union"),
+                            cast[Ptr[uint8]]("/bind_src_b"),
+                            _BT_MREPL)
+    if r4 < 0:
+        _bt_emerg("[bind] FAIL: phase4 child mnttab_bind returned error\n")
+        set_task_pgrp(slot, saved_raw_pg)
+        pgrp_ref_dec(child_pg)
+        return 0
+    if _bt_resolve_reads(cast[Ptr[char]]("/iso_union/onlyB.txt"),
+                         &bbb[0], 3) != 0:
+        _bt_emerg("[bind] phase4 OK: child namespace sees its own bind (/iso_union/onlyB.txt -> 'BBB')\n")
+    else:
+        _bt_emerg("[bind] FAIL: phase4 child namespace bind not visible in child\n")
+        ok = 0
+    # Restore the PARENT namespace and confirm the child's bind is gone.
+    set_task_pgrp(slot, saved_raw_pg)
+    if _bt_resolves_to_source(cast[Ptr[char]]("/iso_union/onlyB.txt")) == 0:
+        _bt_emerg("[bind] phase4 OK: parent namespace does NOT see child bind (isolation holds)\n")
+    else:
+        _bt_emerg("[bind] FAIL: phase4 child bind LEAKED into parent namespace\n")
+        ok = 0
+    # Drop the child Pgrp's reference now that the task is back on parent.
+    pgrp_ref_dec(child_pg)
+
+    if ok == 1:
+        _bt_emerg("[bind] PASS\n")
+        return 1
+    _bt_emerg("[bind] FAIL: one or more assertions failed\n")
+    return 0

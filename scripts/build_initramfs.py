@@ -395,6 +395,28 @@ if os.environ.get("ENABLE_FIREWALL_TEST") == "1":
 if os.environ.get("ENABLE_DISKSTATS_TEST") == "1":
     FILES.append(("/etc/diskstats-test", b"ENABLE_DISKSTATS_TEST=1\n"))
 
+# Plan-9 namespace bind/mount/unmount self-test. scripts/test_bind.sh sets
+# ENABLE_BIND_TEST=1 to plant /etc/bind-test plus two source directories
+# of fixture files. init/main.ad at boot:37.bind detects the marker and
+# calls bind_selftest() (sys/src/9/port/bind_test.ad): it binds one
+# source dir onto a union name and resolves files THROUGH the name (proves
+# the binding redirects the walk), unions a second dir over the first with
+# MBEFORE (proves files from BOTH members are visible and the MBEFORE
+# member shadows a shared name), unmounts (proves the binding reverts), and
+# clones a fresh Pgrp to bind in isolation (proves a child-namespace bind
+# is NOT visible in the parent's namespace). The two source trees:
+#   /bind_src_a/onlyA.txt   = "AAA"      (only in A)
+#   /bind_src_a/shared.txt  = "FROM-A"   (shared name, A copy)
+#   /bind_src_b/onlyB.txt   = "BBB"      (only in B)
+#   /bind_src_b/shared.txt  = "FROM-B"   (shared name, B copy)
+# Default boots omit the marker so the self-test never fires.
+if os.environ.get("ENABLE_BIND_TEST") == "1":
+    FILES.append(("/etc/bind-test", b"ENABLE_BIND_TEST=1\n"))
+    FILES.append(("/bind_src_a/onlyA.txt", b"AAA"))
+    FILES.append(("/bind_src_a/shared.txt", b"FROM-A"))
+    FILES.append(("/bind_src_b/onlyB.txt", b"BBB"))
+    FILES.append(("/bind_src_b/shared.txt", b"FROM-B"))
+
 # #149: ext4 JBD2 journal crash-consistency self-test. scripts/
 # test_ext4_journal.sh sets ENABLE_EXT4_JOURNAL_TEST=1 to plant
 # /etc/ext4-journal-test. init/main.ad detects the marker after the
