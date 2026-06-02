@@ -763,6 +763,17 @@ if os.environ.get("ENABLE_RUSAGE_TEST") == "1":
 if os.environ.get("ENABLE_TIMES_TEST") == "1":
     FILES.append(("/etc/times-test", b"1\n"))
 
+# /proc/stat CPU-split self-test. scripts/test_devstat_split.sh sets
+# ENABLE_DEVSTAT_SPLIT_TEST=1 to plant /etc/devstat-split-test. init/main.ad
+# at boot:37.dss detects the marker and calls devstat_split_selftest()
+# (sys/src/9/port/devstat.ad): it lets the timer ISR accrue a few ticks to
+# the boot task, then asserts the real three-way user/system/idle jiffie
+# split (system advances, the three counters are independent, and every
+# tick was charged to exactly one bucket). Needs no extra device; default
+# boots omit the marker.
+if os.environ.get("ENABLE_DEVSTAT_SPLIT_TEST") == "1":
+    FILES.append(("/etc/devstat-split-test", b"1\n"))
+
 # access(2) mode-bit self-test. scripts/test_access_mode.sh sets
 # ENABLE_ACCESS_MODE_TEST=1 to plant /etc/access-mode-test. init/main.ad
 # at boot:37.acc detects the marker after the ext4 mount and calls
