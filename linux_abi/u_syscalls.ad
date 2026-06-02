@@ -226,13 +226,34 @@ from kernel.sched.core import (
     # msync_selftest builds a tmpfs-backed MAP_SHARED VMA; its FDs (and the
     # backing-identity triple it hands vma_alloc_file_shared) use this mark.
     FD_TMPFS_MARK,
+    # statfs(2): fstatfs/statfs map an open fd's marker to its backing
+    # filesystem (ext4 / FAT) the same way fstat recovers the backend.
+    FD_EXT4_MARK, FD_FAT_MARK,
 )
 # msync_selftest backs its known-content file on tmpfs (the cpio initramfs
 # is read-only — a MAP_SHARED-writable mapping over it is refused), then
 # reads it back independently of the mapping to confirm the flush landed.
 from fs.tmpfs import (
     tmpfs_open_for_write, tmpfs_write, tmpfs_read, tmpfs_size,
+    # statfs(2): classify a path as tmpfs-backed (/tmp, /var) and report
+    # tmpfs's per-file capacity as the synthetic fs size.
+    is_tmpfs_path, is_var_path, is_tmpfs_dir_path, TMPFS_FILE_CAP,
 )
+# statfs(2): the ext4 block/inode geometry the df numbers come from. The
+# total counts + block size are captured by ext4_init at mount; the free
+# counts are re-read from the live superblock (sectors 2..3) on demand via
+# blk_read_sectors, since ext4.ad caches no running free counters. We only
+# READ these — fs/ext4.ad is never modified.
+from fs.ext4 import (
+    is_ext_path, ext4_is_mounted,
+    ext4_block_size, ext4_blocks_count, ext4_inodes_count,
+    ext4_blockdev_slot,
+)
+# statfs(2): classify /mnt paths as the FAT backend.
+from fs.fat import is_fat_path
+# statfs(2): re-read the ext4 superblock's free-block / free-inode words
+# straight off the block device (ext4.ad keeps no live free counters).
+from kernel.block.blk import blk_read_sectors
 # M16.36: install per-task PT entries for the lazy brk reservation.
 # Previously the brk heap (and stack, and ELF image) relied on the
 # BSP's inherited 1 GiB identity stamp; M16.36 makes each user-owned
@@ -474,6 +495,10 @@ SYS_seccomp:         uint64 = 317
 SYS_getrandom:       uint64 = 318
 SYS_rseq:            uint64 = 334
 SYS_getrlimit:       uint64 = 97
+# statfs(2) / fstatfs(2): filesystem capacity query. df, statvfs-based
+# tools, and installers reach for these to size the target volume.
+SYS_statfs:          uint64 = 137
+SYS_fstatfs:         uint64 = 138
 # U21: identity / time / sysinfo / readlinkat — the tail of glibc's
 # pre-main probing surface. None of these need actual kernel-side
 # state at this milestone (single-task-per-binary, no symlinks, no
@@ -4889,6 +4914,275 @@ def _u_sysinfo(a0: uint64, a1: uint64, a2: uint64,
 
 
 # =====================================================================
+# statfs(2) / fstatfs(2): filesystem capacity for df / statvfs
+# =====================================================================
+#
+# Linux x86_64 `struct statfs` is 120 bytes. Field layout (all 8-byte
+# words except f_fsid which is two u32s, and f_spare which is 4 u64s):
+#
+#   0x00  f_type      magic (EXT4=0xEF53, TMPFS=0x01021994,
+#                            MSDOS/FAT=0x4d44, RAMFS/initramfs=0x858458f6)
+#   0x08  f_bsize     block size (4096 here, or the ext4 block size)
+#   0x10  f_blocks    total data blocks (fs size / f_bsize)
+#   0x18  f_bfree     free blocks
+#   0x20  f_bavail    free blocks available to unprivileged (== f_bfree)
+#   0x28  f_files     total inodes
+#   0x30  f_ffree     free inodes
+#   0x38  f_fsid      two u32 words (0 here)
+#   0x40  f_namelen   max filename length (255)
+#   0x48  f_frsize    fragment size (== f_bsize)
+#   0x50  f_flags     mount flags (0)
+#   0x58  f_spare     4 u64 reserved (zero)  -> ends at 0x78 = 120
+#
+# We fill REAL numbers where the backend exposes them (ext4 reads its
+# live superblock geometry; tmpfs reports its per-file capacity), and
+# plausible non-zero constants otherwise so `df` never shows a 0-total
+# (broken) line.
+
+STATFS_SIZE:        uint64 = 120
+STATFS_OFF_TYPE:    uint64 = 0
+STATFS_OFF_BSIZE:   uint64 = 8
+STATFS_OFF_BLOCKS:  uint64 = 16
+STATFS_OFF_BFREE:   uint64 = 24
+STATFS_OFF_BAVAIL:  uint64 = 32
+STATFS_OFF_FILES:   uint64 = 40
+STATFS_OFF_FFREE:   uint64 = 48
+STATFS_OFF_NAMELEN: uint64 = 64
+STATFS_OFF_FRSIZE:  uint64 = 72
+
+# Filesystem magic numbers (linux/magic.h).
+STATFS_MAGIC_EXT4:   uint64 = 0xEF53
+STATFS_MAGIC_TMPFS:  uint64 = 0x01021994
+STATFS_MAGIC_MSDOS:  uint64 = 0x4d44
+STATFS_MAGIC_RAMFS:  uint64 = 0x858458f6
+
+STATFS_NAMELEN: uint64 = 255
+
+# Backend selector returned by _u_statfs_classify_*.
+STATFS_BK_EXT4:  int32 = 0
+STATFS_BK_TMPFS: int32 = 1
+STATFS_BK_FAT:   int32 = 2
+STATFS_BK_RAMFS: int32 = 3      # cpio initramfs / synthetic root
+
+# ext4 superblock free-count field offsets (from the SB base at byte
+# 1024). s_free_blocks_count_lo @ 0x0C, s_free_inodes_count @ 0x10.
+_EXT4_SB_OFF_FREE_BLOCKS: uint64 = 0x0C
+_EXT4_SB_OFF_FREE_INODES: uint64 = 0x10
+
+# Scratch for the on-demand superblock re-read. The SB lives at byte
+# offset 1024 (sectors 2..3); two 512-byte sectors land it at index 0.
+_statfs_sb_buf: Array[1024, uint8]
+
+
+def _statfs_rd_u32(p: Ptr[uint8], off: uint64) -> uint32:
+    # Little-endian u32 read at byte offset `off`.
+    base: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](p) + off)
+    return (cast[uint32](base[0])
+            | (cast[uint32](base[1]) << 8)
+            | (cast[uint32](base[2]) << 16)
+            | (cast[uint32](base[3]) << 24))
+
+
+def _statfs_ext4_free(free_blocks: Ptr[uint64],
+                      free_inodes: Ptr[uint64]) -> int32:
+    # Re-read the live ext4 superblock's free-block / free-inode counters.
+    # ext4.ad caches only the totals, so the running free counts have to
+    # come straight off the device. Returns 0 on success, -1 if the read
+    # fails (caller then falls back to a conservative estimate).
+    if ext4_blockdev_slot < 0:
+        return -1
+    rc: int32 = blk_read_sectors(ext4_blockdev_slot, 2, 2,
+                                 &_statfs_sb_buf[0])
+    if rc != 0:
+        return -1
+    fb: uint32 = _statfs_rd_u32(&_statfs_sb_buf[0],
+                                _EXT4_SB_OFF_FREE_BLOCKS)
+    fi: uint32 = _statfs_rd_u32(&_statfs_sb_buf[0],
+                                _EXT4_SB_OFF_FREE_INODES)
+    free_blocks[0] = cast[uint64](fb)
+    free_inodes[0] = cast[uint64](fi)
+    return 0
+
+
+def _u_fill_statfs(buf: uint64, backend: int32) -> int64:
+    # Zero the whole 120-byte region, then fill the per-backend geometry.
+    if buf == 0:
+        return ELINUX_FAULT
+    memset(cast[Ptr[uint8]](buf), 0, STATFS_SIZE)
+    cast[Ptr[uint64]](buf + STATFS_OFF_NAMELEN)[0] = STATFS_NAMELEN
+
+    magic:   uint64 = STATFS_MAGIC_RAMFS
+    bsize:   uint64 = 4096
+    blocks:  uint64 = 0
+    bfree:   uint64 = 0
+    files:   uint64 = 0
+    ffree:   uint64 = 0
+
+    if backend == STATFS_BK_EXT4 and ext4_is_mounted() != 0:
+        # REAL ext4 capacity. Totals + block size are captured at mount;
+        # the free counts are read back from the live superblock.
+        magic  = STATFS_MAGIC_EXT4
+        bsize  = ext4_block_size
+        if bsize == 0:
+            bsize = 4096
+        blocks = ext4_blocks_count
+        files  = ext4_inodes_count
+        fb: uint64 = 0
+        fi: uint64 = 0
+        if _statfs_ext4_free(&fb, &fi) == 0:
+            bfree = fb
+            ffree = fi
+        else:
+            # Superblock re-read failed — report a conservative non-zero
+            # free estimate (half the volume) rather than a 0/broken line.
+            bfree = blocks / 2
+            ffree = files / 2
+    elif backend == STATFS_BK_TMPFS:
+        # tmpfs tracks no running used-byte total, so report its per-file
+        # capacity as the synthetic fs size with most of it free.
+        magic  = STATFS_MAGIC_TMPFS
+        blocks = TMPFS_FILE_CAP / bsize
+        bfree  = blocks                       # RAM-backed; treat as free
+        files  = 65536
+        ffree  = 65000
+    elif backend == STATFS_BK_FAT:
+        # FAT capacity isn't surfaced through a getter; report a plausible
+        # non-zero geometry so `df /mnt` shows a real line.
+        magic  = STATFS_MAGIC_MSDOS
+        blocks = 0x10000                      # 256 MiB at 4 KiB blocks
+        bfree  = blocks / 2
+        files  = 0                            # FAT has no inode table
+        ffree  = 0
+    else:
+        # cpio initramfs / synthetic root — read-only, in-RAM.
+        magic  = STATFS_MAGIC_RAMFS
+        blocks = SYSINFO_TOTALRAM / bsize
+        bfree  = 0                            # read-only: nothing free
+        files  = 0
+        ffree  = 0
+
+    cast[Ptr[uint64]](buf + STATFS_OFF_TYPE)[0]   = magic
+    cast[Ptr[uint64]](buf + STATFS_OFF_BSIZE)[0]  = bsize
+    cast[Ptr[uint64]](buf + STATFS_OFF_BLOCKS)[0] = blocks
+    cast[Ptr[uint64]](buf + STATFS_OFF_BFREE)[0]  = bfree
+    cast[Ptr[uint64]](buf + STATFS_OFF_BAVAIL)[0] = bfree
+    cast[Ptr[uint64]](buf + STATFS_OFF_FILES)[0]  = files
+    cast[Ptr[uint64]](buf + STATFS_OFF_FFREE)[0]  = ffree
+    cast[Ptr[uint64]](buf + STATFS_OFF_FRSIZE)[0] = bsize
+    return 0
+
+
+def _statfs_classify_path(name: Ptr[char]) -> int32:
+    # Map an absolute path to its backing filesystem, mirroring the VFS
+    # prefix dispatch (is_fat_path / is_ext_path / is_tmpfs_path).
+    if is_ext_path(name) != 0:
+        return STATFS_BK_EXT4
+    if _path_eq_const4(name, 47, 101, 120, 116):          # "/ext"
+        return STATFS_BK_EXT4
+    if is_fat_path(name) != 0:
+        return STATFS_BK_FAT
+    if _path_eq_const4(name, 47, 109, 110, 116):          # "/mnt"
+        return STATFS_BK_FAT
+    if is_tmpfs_path(name) != 0 or is_tmpfs_dir_path(name) != 0:
+        return STATFS_BK_TMPFS
+    if is_var_path(name) != 0:
+        return STATFS_BK_TMPFS
+    return STATFS_BK_RAMFS
+
+
+def _path_eq_const4(name: Ptr[char], c0: uint8, c1: uint8,
+                    c2: uint8, c3: uint8) -> int32:
+    # True if `name` is exactly the 4-char string c0c1c2c3 (NUL after).
+    if cast[uint8](name[0] & 0xFF) != c0:
+        return 0
+    if cast[uint8](name[1] & 0xFF) != c1:
+        return 0
+    if cast[uint8](name[2] & 0xFF) != c2:
+        return 0
+    if cast[uint8](name[3] & 0xFF) != c3:
+        return 0
+    if cast[uint8](name[4] & 0xFF) != 0:
+        return 0
+    return 1
+
+
+def _statfs_path_is_root(name: Ptr[char]) -> int32:
+    # True if `name` is exactly "/" — the synthetic cpio-initramfs root,
+    # always a valid statfs target.
+    if cast[uint8](name[0] & 0xFF) != 47:                  # '/'
+        return 0
+    if cast[uint8](name[1] & 0xFF) != 0:
+        return 0
+    return 1
+
+
+def _statfs_classify_fd(fd: int32) -> int32:
+    # Recover the backing filesystem for an open fd from its fd marker —
+    # the same FD_*_MARK tags vfs_open stamps per backend.
+    m: uint32 = vfs_fd_marker(fd)
+    if m == FD_EXT4_MARK:
+        return STATFS_BK_EXT4
+    if m == FD_TMPFS_MARK:
+        return STATFS_BK_TMPFS
+    if m == FD_FAT_MARK:
+        return STATFS_BK_FAT
+    return STATFS_BK_RAMFS
+
+
+def _u_statfs(a0: uint64, a1: uint64, a2: uint64,
+              a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # int statfs(const char *path, struct statfs *buf)
+    if a1 == 0:
+        return ELINUX_FAULT
+    if a0 == 0:
+        return ELINUX_FAULT
+    abs_path: Array[256, uint8]
+    rc: int32 = resolve_path(cast[Ptr[char]](a0), &abs_path[0], 256)
+    if rc != 0:
+        return ELINUX_NOENT
+    # The path prefix unambiguously identifies the backing filesystem
+    # (is_ext_path / is_fat_path / is_tmpfs_path), so classify by path
+    # first. A bare mount-point directory ("/ext", "/mnt", "/tmp") opens
+    # as a directory whose fd marker is NOT the backend mark, so the
+    # path classification is the authoritative one here.
+    backend: int32 = _statfs_classify_path(cast[Ptr[char]](&abs_path[0]))
+    # Confirm the path actually resolves to something before reporting
+    # capacity (statfs(2) returns -ENOENT for a missing path). A backend
+    # that is a real mount point (ext4 / fat / tmpfs) is taken as present;
+    # the synthetic-root fallback verifies via vfs_open.
+    fd: int32 = vfs_open(cast[Ptr[char]](&abs_path[0]))
+    if fd >= 0:
+        # If the path classifier could not pin a backend (synthetic root),
+        # fall back to the fd marker — an opened file under a real backend
+        # carries its FD_*_MARK even when the path prefix did not match.
+        if backend == STATFS_BK_RAMFS:
+            backend = _statfs_classify_fd(fd)
+        vfs_close(fd)
+        return _u_fill_statfs(a1, backend)
+    # Open did not hand back an fd. Real mount-point directories ("/ext",
+    # "/mnt", "/tmp", "/var") and the synthetic root "/" are still valid
+    # statfs targets; anything else that neither opens nor classifies to a
+    # mount point is ENOENT.
+    if backend != STATFS_BK_RAMFS:
+        return _u_fill_statfs(a1, backend)
+    if _statfs_path_is_root(cast[Ptr[char]](&abs_path[0])) != 0:
+        return _u_fill_statfs(a1, backend)
+    return ELINUX_NOENT
+
+
+def _u_fstatfs(a0: uint64, a1: uint64, a2: uint64,
+               a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # int fstatfs(int fd, struct statfs *buf)
+    if a1 == 0:
+        return ELINUX_FAULT
+    fd: int32 = cast[int32](a0)
+    if vfs_fd_is_open(fd) == 0:
+        return ELINUX_BADF
+    backend: int32 = _statfs_classify_fd(fd)
+    return _u_fill_statfs(a1, backend)
+
+
+# =====================================================================
 # U21: futex
 # =====================================================================
 #
@@ -5833,6 +6127,138 @@ def uabi_fills_selftest() -> int32:
 
 
 # =====================================================================
+# statfs(2) / fstatfs(2) self-test
+#   (gated on /etc/statfs-test, ENABLE_STATFS_TEST=1)
+# =====================================================================
+#
+# Drives _u_statfs / _u_fstatfs through the REAL in-kernel Linux-ABI
+# dispatch (linux_u_syscall_dispatch — the exact path a Debian/glibc `df`
+# takes) on:
+#   * the live ext4 mount (/ext) — asserts f_type==EXT4_MAGIC, a non-zero
+#     block size and a non-zero total-block count (the REAL superblock
+#     geometry), proving df sees real capacity for the installer's target.
+#   * the synthetic root (/) — asserts a non-zero block size + total.
+#   * an open tmpfs fd via fstatfs — asserts f_type==TMPFS_MAGIC.
+# Prints a single "[STATFS] PASS" / "[STATFS] FAIL ..." on the EMERG
+# serial channel. A default boot ships no marker, so this never runs.
+
+
+def _statfs_field_u64(buf: Ptr[uint8], off: uint64) -> uint64:
+    return cast[Ptr[uint64]](cast[uint64](buf) + off)[0]
+
+
+def statfs_selftest() -> int32:
+    # Prime the boot task's fd table (same uninitialised-table issue the
+    # uabi_fills hook handles) so the tmpfs open + fstatfs leg can grab fds.
+    boot_task: Ptr[TaskStruct] = current_task()
+    fd_save: Array[16, uint32]
+    fdi: uint64 = 3
+    while fdi < 16:
+        fd_save[fdi] = boot_task[0].fd_idx[fdi]
+        boot_task[0].fd_idx[fdi] = FD_CLOSED_MARK
+        fdi = fdi + 1
+
+    sfbuf: Array[120, uint8]
+
+    # --- statfs(/ext) : live ext4 mount, REAL superblock geometry -------
+    ext_path: Ptr[uint8] = cast[Ptr[uint8]]("/ext")
+    erc: int64 = _uabi_test_dispatch(SYS_statfs, cast[uint64](ext_path),
+                                     cast[uint64](&sfbuf[0]), 0, 0)
+    if erc != 0:
+        printk1("[STATFS] FAIL statfs(/ext) rc=%d\n", cast[uint64](erc))
+        _statfs_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    e_type:   uint64 = _statfs_field_u64(&sfbuf[0], STATFS_OFF_TYPE)
+    e_bsize:  uint64 = _statfs_field_u64(&sfbuf[0], STATFS_OFF_BSIZE)
+    e_blocks: uint64 = _statfs_field_u64(&sfbuf[0], STATFS_OFF_BLOCKS)
+    if e_type != STATFS_MAGIC_EXT4:
+        printk1("[STATFS] FAIL ext4 f_type=%x (want 0xEF53)\n", e_type)
+        _statfs_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    if e_bsize == 0:
+        printk0("[STATFS] FAIL ext4 f_bsize==0\n")
+        _statfs_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    if e_blocks == 0:
+        printk0("[STATFS] FAIL ext4 f_blocks==0\n")
+        _statfs_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    printk2("[STATFS] ext4 bsize=%d blocks=%d\n", e_bsize, e_blocks)
+
+    # --- statfs(/) : synthetic root, non-zero geometry ------------------
+    root_path: Ptr[uint8] = cast[Ptr[uint8]]("/")
+    rrc: int64 = _uabi_test_dispatch(SYS_statfs, cast[uint64](root_path),
+                                     cast[uint64](&sfbuf[0]), 0, 0)
+    if rrc != 0:
+        printk1("[STATFS] FAIL statfs(/) rc=%d\n", cast[uint64](rrc))
+        _statfs_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    r_bsize:  uint64 = _statfs_field_u64(&sfbuf[0], STATFS_OFF_BSIZE)
+    r_blocks: uint64 = _statfs_field_u64(&sfbuf[0], STATFS_OFF_BLOCKS)
+    if r_bsize == 0 or r_blocks == 0:
+        printk0("[STATFS] FAIL root f_bsize/f_blocks==0\n")
+        _statfs_selftest_restore(boot_task, &fd_save[0])
+        return 1
+
+    # --- fstatfs(open tmpfs fd) : f_type==TMPFS_MAGIC -------------------
+    tw: int32 = vfs_open_write("/tmp/statfs-sel")
+    if tw < 0:
+        printk1("[STATFS] FAIL tmpfs open_write rc=%d\n",
+                cast[uint64](cast[int64](tw)))
+        _statfs_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    onebyte: Array[1, uint8]
+    onebyte[0] = 65
+    vfs_write(tw, &onebyte[0], 1)
+    vfs_close(tw)
+    tr: int32 = vfs_open("/tmp/statfs-sel")
+    if tr < 0:
+        printk0("[STATFS] FAIL tmpfs reopen\n")
+        _statfs_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    frc: int64 = _uabi_test_dispatch(SYS_fstatfs, cast[uint64](tr),
+                                     cast[uint64](&sfbuf[0]), 0, 0)
+    f_type:  uint64 = _statfs_field_u64(&sfbuf[0], STATFS_OFF_TYPE)
+    f_bsize: uint64 = _statfs_field_u64(&sfbuf[0], STATFS_OFF_BSIZE)
+    vfs_close(tr)
+    if frc != 0:
+        printk1("[STATFS] FAIL fstatfs rc=%d\n", cast[uint64](frc))
+        _statfs_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    if f_type != STATFS_MAGIC_TMPFS:
+        printk1("[STATFS] FAIL fstatfs f_type=%x (want tmpfs)\n", f_type)
+        _statfs_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    if f_bsize == 0:
+        printk0("[STATFS] FAIL fstatfs f_bsize==0\n")
+        _statfs_selftest_restore(boot_task, &fd_save[0])
+        return 1
+
+    # --- fstatfs(bad fd) : -EBADF ---------------------------------------
+    brc: int64 = _uabi_test_dispatch(SYS_fstatfs, 999,
+                                     cast[uint64](&sfbuf[0]), 0, 0)
+    if brc != ELINUX_BADF:
+        printk1("[STATFS] FAIL fstatfs(badfd) rc=%d (want -9)\n",
+                cast[uint64](brc))
+        _statfs_selftest_restore(boot_task, &fd_save[0])
+        return 1
+
+    _statfs_selftest_restore(boot_task, &fd_save[0])
+    printk0("[STATFS] PASS\n")
+    return 0
+
+
+def _statfs_selftest_restore(boot_task: Ptr[TaskStruct],
+                             fd_save: Ptr[uint32]):
+    # Restore the boot task's original fd slots so the table looks
+    # untouched to anything that runs after this hook.
+    fdr: uint64 = 3
+    while fdr < 16:
+        boot_task[0].fd_idx[fdr] = fd_save[fdr]
+        fdr = fdr + 1
+
+
+# =====================================================================
 # msync(2) self-test  (gated on /etc/msync-test, ENABLE_MSYNC_TEST=1)
 # =====================================================================
 #
@@ -6234,6 +6660,11 @@ def _linux_u_syscall_dispatch_inner(nr: uint64,
         return _u_gettimeofday(a0, a1, a2, a3, a4, a5)
     if nr == SYS_sysinfo:
         return _u_sysinfo(a0, a1, a2, a3, a4, a5)
+    # statfs / fstatfs: filesystem capacity for df / statvfs / installers.
+    if nr == SYS_statfs:
+        return _u_statfs(a0, a1, a2, a3, a4, a5)
+    if nr == SYS_fstatfs:
+        return _u_fstatfs(a0, a1, a2, a3, a4, a5)
     if nr == SYS_getuid:
         return _u_getuid(a0, a1, a2, a3, a4, a5)
     if nr == SYS_getgid:

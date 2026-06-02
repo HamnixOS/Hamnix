@@ -641,6 +641,19 @@ if os.environ.get("ENABLE_EXT4_SYMLINK_TEST") == "1":
 if os.environ.get("ENABLE_FSTAT_BACKEND_TEST") == "1":
     FILES.append(("/etc/fstat-backend-test", b"1\n"))
 
+# statfs(2)/fstatfs(2) capacity self-test. scripts/test_statfs.sh sets
+# ENABLE_STATFS_TEST=1 to plant /etc/statfs-test. init/main.ad at
+# boot:37.sfs detects the marker after the ext4 mount and calls
+# statfs_selftest() (linux_abi/u_syscalls.ad): it drives _u_statfs through
+# the real Linux-ABI dispatch on the live ext4 mount (/ext) and on the
+# synthetic root (/), asserting a non-zero block size + total-block count
+# and the EXT4 magic (the REAL superblock geometry df reports), then drives
+# _u_fstatfs on an open tmpfs fd (TMPFS magic) and a bad fd (-EBADF).
+# Needs a real ext4 device attached, so it is opt-in; default boots omit
+# the marker so the self-test never fires.
+if os.environ.get("ENABLE_STATFS_TEST") == "1":
+    FILES.append(("/etc/statfs-test", b"1\n"))
+
 # MBR extended/logical-partition (EBR chain) self-test. scripts/
 # test_partebr.sh sets ENABLE_PARTEBR_TEST=1 to plant /etc/partebr-test
 # and attaches a raw "vda" disk carrying an MBR + extended container +
