@@ -96,6 +96,23 @@ if os.environ.get("ENABLE_TLS_GZIP_SMOKE") == "1":
 # dynamic-Huffman DEFLATE blocks — proving our `gunzip` INFLATE handles
 # real Huffman streams, not merely our own stored-block output. The
 # matching plaintext is staged alongside so the test can diff against it.
+# Loop (file-backed block) device fixture. scripts/test_loop.sh sets
+# ENABLE_LOOP_TEST=1 to bake a REAL FAT image FILE into the cpio at
+# /tests/loop/disk.img plus the /etc/loop-test marker. init/main.ad's
+# loop_e2e_selftest() attaches that image FILE as /dev/blk/loop0, mounts
+# FAT off the loop slot, and reads HELLO.TXT back — proving an image file
+# can be mounted like a real disk (Linux losetup + mount). The image is
+# the very same FAT layout build_diskimg.py bakes into /dev/ram0, so its
+# known file HELLO.TXT carries the FAT32_MARKER the self-test asserts.
+if os.environ.get("ENABLE_LOOP_TEST") == "1":
+    import sys as _loop_sys
+    _loop_scripts_dir = str(Path(__file__).resolve().parent)
+    if _loop_scripts_dir not in _loop_sys.path:
+        _loop_sys.path.insert(0, _loop_scripts_dir)
+    import build_diskimg as _diskimg_mod
+    FILES.append(("/tests/loop/disk.img", _diskimg_mod.build_image()))
+    FILES.append(("/etc/loop-test", b"1\n"))
+
 if os.environ.get("ENABLE_TAR_GZIP_FIXTURE") == "1":
     import gzip as _gzip_mod
     # Repetitive, compressible plaintext: zlib chooses dynamic Huffman

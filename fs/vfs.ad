@@ -110,6 +110,13 @@ from sys.src.port9.port.devblk import (
     devblk_capacity_bytes,
     FD_BLK_MARK,
 )
+# Loop (file-backed block) device control surface. /dev/loop/ctl is a
+# global write-to-attach / read-to-list cdev; the loop block devices it
+# spawns appear under /dev/blk/loopN (served by devblk above). FD_LOOP_MARK
+# fds dispatch here to loopctl_read / loopctl_write.
+from drivers.block.loop import (
+    loopctl_path_match, loopctl_read, loopctl_write, FD_LOOP_MARK,
+)
 from sys.src.port9.port.devproc import (
     devproc_open, devproc_read, devproc_write, devproc_close,
     devproc_is_proc_fd, devproc_path_match,
@@ -1241,6 +1248,10 @@ def vfs_open(name: Ptr[char]) -> int32:
     if bp_rc < 0:
         set_current_errstr("blk: no such device")
         return ENOENT
+    # /dev/loop/ctl — the loop (file-backed block) device control file.
+    # A read renders the attach table; writes carry attach/detach verbs.
+    if loopctl_path_match(name) == 1:
+        return _open_loop_marked()
     # ARCH §10: the /net 9P file tree. /net/tcp/clone, /net/udp/clone
     # and the per-connection /net/<proto>/<N>/{ctl,data,status,local,
     # remote} files are the Plan-9-shaped networking surface — open
@@ -2077,6 +2088,9 @@ def vfs_open_write(name: Ptr[char]) -> int32:
     if bwp_rc < 0:
         set_current_errstr("blk: no such device")
         return ENOENT
+    # /dev/loop/ctl OWRITE side — losetup writes attach/detach verbs here.
+    if loopctl_path_match(name) == 1:
+        return _open_loop_marked()
     # Phase D: the universal namec open path, OWRITE side. The same
     # probe vfs_open uses for reads — namec() walks the Pgrp mount
     # table, produces a local-device Chan for a /dev/<name> cdev or a
@@ -3493,6 +3507,52 @@ def vfs_fd_backing_info(fd: int32, out_marker: Ptr[uint32],
     return cast[int32](ENODEV)
 
 
+def vfs_resolve_backing(name: Ptr[char], out_marker: Ptr[uint32],
+                        out_backing: Ptr[uint64],
+                        out_size: Ptr[uint64]) -> int32:
+    # FD-LESS sibling of vfs_fd_backing_info: resolve `name` straight to
+    # a stable (marker, backing, size) triple WITHOUT allocating an fd.
+    #
+    # WHY THIS EXISTS: the kernel boot/idle task has no usable fd table
+    # (the same reason _ns_ext4_slurp_by_id reads ext4 fd-lessly at
+    # boot:36). A loop_attach() issued from a boot self-test or from the
+    # /dev/loop/ctl handler therefore can't go through vfs_open() — it
+    # would fail with -EMFILE before ever touching the backing store.
+    # This resolver mirrors the on-disk routing order of vfs_open but
+    # produces only the backing snapshot the loop driver needs, so the
+    # data path (vfs_pread_backing / vfs_pwrite_backing) is identical to
+    # the fd-based one. Returns 0 on success, a negative errno on miss.
+    #
+    # ext4 — resolve the inode fd-lessly (inum is stable across recycle).
+    if is_ext_path(name) != 0:
+        leaf: Ptr[char] = strip_ext_prefix(name)
+        einum: uint32 = 0
+        esize: uint64 = 0
+        if ext4_resolve_file(leaf, &einum, &esize) == 0:
+            return ENOENT
+        out_marker[0]  = FD_EXT4_MARK
+        out_backing[0] = cast[uint64](einum)
+        out_size[0]    = esize
+        return 0
+    # tmpfs — a path that tmpfs owns and actually has.
+    if is_tmpfs_path(name) != 0 or is_var_path(name) != 0:
+        if tmpfs_path_exists(name) != 0:
+            tslot: int32 = tmpfs_lookup(name)
+            if tslot >= 0:
+                out_marker[0]  = FD_TMPFS_MARK
+                out_backing[0] = cast[uint64](cast[uint32](tslot))
+                out_size[0]    = tmpfs_size(tslot)
+                return 0
+    # cpio (initramfs) — the index IS the backing id; read-only.
+    cidx: int32 = _lookup_name(name)
+    if cidx >= 0:
+        out_marker[0]  = FD_FILEMMAP_INITRAMFS
+        out_backing[0] = cast[uint64](cidx)
+        out_size[0]    = initramfs_entry_size(cast[uint64](cidx))
+        return 0
+    return ENOENT
+
+
 def vfs_pread_backing(marker: uint32, backing: uint64, file_size: uint64,
                       offset: uint64, dst: Ptr[uint8],
                       count: uint64) -> int64:
@@ -3684,6 +3744,23 @@ def _open_blk_marked(pack: uint64) -> int32:
     task[0].fd_idx[fdu] = FD_BLK_MARK
     task[0].fd_pos[fdu] = 0
     task[0].fd_buf[fdu] = pack
+    return fd
+
+
+def _open_loop_marked() -> int32:
+    # /dev/loop/ctl open. The ctl file carries no per-fd state — fd_pos
+    # is the read cursor (so a second read renders EOF for the listing)
+    # and fd_buf is unused. Writes carry attach/detach verbs; reads
+    # render the attach table. No close cleanup is needed (close falls
+    # through to close_fd_in_task).
+    task: Ptr[TaskStruct] = current_task()
+    fd: int32 = _alloc_fd(task)
+    if fd < 0:
+        return EMFILE
+    fdu: uint64 = cast[uint64](fd)
+    task[0].fd_idx[fdu] = FD_LOOP_MARK
+    task[0].fd_pos[fdu] = 0
+    task[0].fd_buf[fdu] = 0
     return fd
 
 
@@ -4416,6 +4493,14 @@ def vfs_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         if bp_n > 0:
             task[0].fd_pos[fdu] = bp_pos + cast[uint64](bp_n)
         return bp_n
+    if file_idx == FD_LOOP_MARK:
+        # /dev/loop/ctl read side — render the attached-loop table once.
+        # fd_pos gates the second read so `cat /dev/loop/ctl` terminates.
+        lp_pos: uint64 = task[0].fd_pos[fdu]
+        lp_n: int64 = loopctl_read(lp_pos, buf, count)
+        if lp_n > 0:
+            task[0].fd_pos[fdu] = lp_pos + cast[uint64](lp_n)
+        return lp_n
     if file_idx == FD_AUTH_MARK:
         # docs/security.md Phase 4: /dev/auth read side — drain the
         # rendered "ok <uid> <gid>\n" or "denied\n" response. fd_buf
@@ -4793,6 +4878,11 @@ def vfs_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         if bw_n > 0:
             task[0].fd_pos[fdu] = bw_pos + cast[uint64](bw_n)
         return bw_n
+    if file_idx == FD_LOOP_MARK:
+        # /dev/loop/ctl write side — parse an attach/detach verb. The
+        # ctl file is stateless across writes (each write is a complete
+        # command line), so fd_pos is not advanced.
+        return loopctl_write(buf, count)
     if file_idx == FD_AUTH_MARK:
         # docs/security.md Phase 4: /dev/auth write side — parse a
         # "user <name>\n" or "pass <plaintext>\n" line into the per-fd

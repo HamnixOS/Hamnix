@@ -1,0 +1,396 @@
+# drivers/block/loop.ad
+#
+# File-backed block device — Hamnix's equivalent of Linux's
+# drivers/block/loop.c + losetup(8). A loop device exposes a regular
+# file (anywhere in the VFS) as a block device, so a filesystem IMAGE
+# FILE (ext4/FAT) can be mounted exactly like a real disk.
+#
+# Linux mapping:
+#   losetup /dev/loop0 disk.img   ->  echo attach disk.img > /dev/loop/ctl
+#   losetup -d /dev/loop0         ->  echo detach 0        > /dev/loop/ctl
+#   struct loop_device            ->  LoopDevice (this file)
+#   lo_backing_file (struct file) ->  (marker, backing, size) snapshot
+#   loop_set_fd()/lo_read_simple  ->  loop_attach()/loop_read_sectors
+#
+# Plan-9 control surface: there is NO LOOP_SET_FD ioctl. Attach/detach/
+# list happen through writes to the global /dev/loop/ctl cdev (parsed by
+# loopctl_write below, wired into fs/vfs.ad's FD_LOOP_MARK dispatch).
+# The userland `losetup` tool (user/losetup.ad) just opens that ctl file
+# and writes a verb line.
+#
+# Backing store I/O: rather than hold an open per-process fd (which would
+# be tied to the attaching task's fd table), loop_attach() snapshots the
+# STABLE backing identity of the file — a (marker, backing-id, size)
+# triple — via vfs_fd_backing_info(). read/write_sectors then go through
+# vfs_pread_backing()/vfs_pwrite_backing(), which are independent of any
+# fd table and safe to call from any task that later issues block I/O
+# (e.g. the FS-layer mount running in a different process). This mirrors
+# how file-backed mmap reads a page on a #PF after the mmap fd is closed.
+
+from kernel.block.blk import (
+    BlockDeviceOps, register_blockdev, blk_unregister_by_name,
+    SECTOR_SIZE,
+)
+from fs.vfs import (
+    vfs_resolve_backing,
+    vfs_pread_backing, vfs_pwrite_backing,
+)
+from kernel.printk.printk import printk0, printk1, printk2
+
+
+# Per-loop-device state. priv passed to read/write_sectors is
+# &loop_devices[slot] so the dispatch path recovers the backing snapshot
+# without a side table — the same pointer-as-cookie convention brd uses.
+class LoopDevice:
+    used:     uint32           # 0 = free, 1 = attached
+    marker:   uint32           # vfs backing marker (FD_EXT4_MARK, ...)
+    backing:  uint64           # vfs backing id (inode / cpio idx / slot)
+    nbytes:   uint64           # backing file size in bytes
+    nsectors: uint64           # nbytes / SECTOR_SIZE (whole sectors)
+
+
+LOOP_MAX: uint64 = 4
+loop_devices: Array[4, LoopDevice]
+loop_ops:     BlockDeviceOps
+
+
+def loop_read_sectors(priv: uint64, lba: uint64, count: uint64,
+                      buf: Ptr[uint8]) -> int32:
+    # priv is &loop_devices[slot]. blk_read_sectors already bounds-checked
+    # the request against the registered capacity (nsectors), so the
+    # offset can never run past the backing file's whole-sector region.
+    # A short pread (a sector partially past EOF can't happen here since
+    # capacity == whole sectors) is zero-filled by us for safety.
+    dev: Ptr[LoopDevice] = cast[Ptr[LoopDevice]](priv)
+    if dev[0].used == 0:
+        return -1
+    offset: uint64 = lba * SECTOR_SIZE
+    nbytes: uint64 = count * SECTOR_SIZE
+    n: int64 = vfs_pread_backing(dev[0].marker, dev[0].backing,
+                                 dev[0].nbytes, offset, buf, nbytes)
+    if n < 0:
+        return -1
+    # Zero-fill any tail the backing read couldn't supply.
+    got: uint64 = cast[uint64](n)
+    while got < nbytes:
+        buf[got] = 0
+        got = got + 1
+    return 0
+
+
+def loop_write_sectors(priv: uint64, lba: uint64, count: uint64,
+                       buf: Ptr[uint8]) -> int32:
+    # Write-through to the backing file. Read-only backing kinds (a cpio
+    # initramfs file) reject with -EROFS inside vfs_pwrite_backing, which
+    # surfaces here as a non-`nbytes` return -> -1, so a mount that tries
+    # to write a read-only loop image fails cleanly instead of silently
+    # dropping the data.
+    dev: Ptr[LoopDevice] = cast[Ptr[LoopDevice]](priv)
+    if dev[0].used == 0:
+        return -1
+    offset: uint64 = lba * SECTOR_SIZE
+    nbytes: uint64 = count * SECTOR_SIZE
+    n: int64 = vfs_pwrite_backing(dev[0].marker, dev[0].backing,
+                                  offset, buf, nbytes)
+    if n < 0 or cast[uint64](n) != nbytes:
+        return -1
+    return 0
+
+
+def loop_init():
+    # Wire the shared vtable once; the LoopDevice table starts all-free.
+    # No loop device is registered until userland attaches one through
+    # /dev/loop/ctl — matching Linux where loopN appears empty and is
+    # bound by losetup.
+    loop_ops.read_sectors  = loop_read_sectors
+    loop_ops.write_sectors = loop_write_sectors
+    loop_ops.flush         = cast[Fn[int32, uint64]](0)
+    i: uint64 = 0
+    while i < LOOP_MAX:
+        loop_devices[i].used     = 0
+        loop_devices[i].marker   = 0
+        loop_devices[i].backing  = 0
+        loop_devices[i].nbytes   = 0
+        loop_devices[i].nsectors = 0
+        i = i + 1
+    printk0("loop: file-backed block device ready (4 slots)\n")
+
+
+def _loop_name_build(slot: int32, out: Ptr[uint8]):
+    # Build "loopN\0" into a 16-byte buffer. slot is 0..LOOP_MAX-1 so a
+    # single decimal digit is always enough.
+    out[0] = 108                                   # 'l'
+    out[1] = 111                                   # 'o'
+    out[2] = 111                                   # 'o'
+    out[3] = 112                                   # 'p'
+    out[4] = cast[uint8](cast[uint64](slot) % 10) + 48
+    out[5] = 0
+
+
+def loop_attach(path: Ptr[char]) -> int32:
+    # Bind the regular file at `path` to the first free loop slot and
+    # register it as /dev/blk/loopN. Returns the slot index (>= 0) on
+    # success, or a negative error:
+    #   -1  no free loop slot
+    #   -2  cannot resolve / open the backing file
+    #   -3  backing file is not a seekable random-access kind
+    #   -4  backing file is smaller than one sector
+    #   -5  block-device registration failed
+    slot: int32 = -1
+    i: uint64 = 0
+    while i < LOOP_MAX:
+        if loop_devices[i].used == 0:
+            slot = cast[int32](i)
+            break
+        i = i + 1
+    if slot < 0:
+        printk0("loop: no free loop device\n")
+        return -1
+
+    # FD-LESS backing resolution. loop_attach can run from a context with
+    # no usable fd table (the kernel boot/idle task at boot self-test
+    # time, or the /dev/loop/ctl write handler), so going through
+    # vfs_open() would fail with -EMFILE before ever touching the file.
+    # vfs_resolve_backing snapshots the same stable (marker, backing,
+    # size) triple vfs_fd_backing_info would, but needs no fd.
+    marker: uint32 = 0
+    backing: uint64 = 0
+    size: uint64 = 0
+    rc: int32 = vfs_resolve_backing(path, &marker, &backing, &size)
+    if rc != 0:
+        printk0("loop: cannot resolve backing file\n")
+        return -2
+    if size < SECTOR_SIZE:
+        printk1("loop: backing file too small (%d bytes)\n", size)
+        return -4
+
+    nsectors: uint64 = size / SECTOR_SIZE
+    su: uint64 = cast[uint64](slot)
+    loop_devices[su].marker   = marker
+    loop_devices[su].backing  = backing
+    loop_devices[su].nbytes   = nsectors * SECTOR_SIZE
+    loop_devices[su].nsectors = nsectors
+    loop_devices[su].used     = 1
+
+    name_buf: Array[16, uint8]
+    _loop_name_build(slot, &name_buf[0])
+    rrc: int32 = register_blockdev(
+        cast[Ptr[char]](&name_buf[0]), nsectors, &loop_ops,
+        cast[uint64](&loop_devices[su]))
+    if rrc < 0:
+        loop_devices[su].used = 0
+        printk0("loop: block-device registration failed\n")
+        return -5
+    printk2("loop: /dev/blk/loop%d attached (sectors=%d)\n",
+            su, nsectors)
+    return slot
+
+
+def loop_detach(slot: int32) -> int32:
+    # Release loop slot `slot`: unregister /dev/blk/loopN and free the
+    # backing snapshot. Returns 0 on success, -1 on a bad / already-free
+    # slot.
+    if slot < 0 or cast[uint64](slot) >= LOOP_MAX:
+        return -1
+    su: uint64 = cast[uint64](slot)
+    if loop_devices[su].used == 0:
+        return -1
+    name_buf: Array[16, uint8]
+    _loop_name_build(slot, &name_buf[0])
+    blk_unregister_by_name(cast[Ptr[char]](&name_buf[0]))
+    loop_devices[su].used     = 0
+    loop_devices[su].marker   = 0
+    loop_devices[su].backing  = 0
+    loop_devices[su].nbytes   = 0
+    loop_devices[su].nsectors = 0
+    printk1("loop: /dev/blk/loop%d detached\n", su)
+    return 0
+
+
+# --- /dev/loop/ctl control surface ----------------------------------
+#
+# Global write-only control file. Verbs (one per write, '\n' or
+# end-of-buffer terminated):
+#   attach <path>   bind <path> to the first free loop slot
+#   detach <N>      release loop slot N
+#   list            (no-op placeholder; listing is rendered by reads)
+#
+# Wired into fs/vfs.ad via FD_LOOP_MARK: an open of "/dev/loop/ctl"
+# returns an FD_LOOP_MARK fd whose writes land in loopctl_write and
+# whose reads render the attach table (loopctl_read).
+
+FD_LOOP_MARK: uint32 = 0xFFFFFFD9
+
+loopctl_buf:  Array[1024, uint8]
+loopctl_path: Array[1024, uint8]
+
+
+def loopctl_path_match(path: Ptr[char]) -> int32:
+    # 1 if `path` is exactly "/dev/loop/ctl", 0 otherwise.
+    want: Array[14, uint8]
+    want[0] = 47                                   # '/'
+    want[1] = 100                                  # 'd'
+    want[2] = 101                                  # 'e'
+    want[3] = 118                                  # 'v'
+    want[4] = 47                                   # '/'
+    want[5] = 108                                  # 'l'
+    want[6] = 111                                  # 'o'
+    want[7] = 111                                  # 'o'
+    want[8] = 112                                  # 'p'
+    want[9] = 47                                   # '/'
+    want[10] = 99                                  # 'c'
+    want[11] = 116                                 # 't'
+    want[12] = 108                                 # 'l'
+    want[13] = 0
+    i: uint64 = 0
+    while i < 14:
+        if cast[uint8](path[i]) != want[i]:
+            return 0
+        if want[i] == 0:
+            return 1
+        i = i + 1
+    return 1
+
+
+def _lc_skip_ws(buf: Ptr[uint8], n: uint64, pos: uint64) -> uint64:
+    while pos < n:
+        c: uint8 = buf[pos]
+        if c != 32 and c != 9:                     # ' ' / '\t'
+            return pos
+        pos = pos + 1
+    return pos
+
+
+def _lc_starts_with(buf: Ptr[uint8], n: uint64, s: Ptr[char]) -> int32:
+    i: uint64 = 0
+    while s[i] != 0:
+        if i >= n:
+            return 0
+        if cast[int32](buf[i]) != s[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def _lc_parse_u64(buf: Ptr[uint8], n: uint64, pos: uint64,
+                  out: Ptr[uint64]) -> uint64:
+    pos = _lc_skip_ws(buf, n, pos)
+    v: uint64 = 0
+    while pos < n:
+        c: uint8 = buf[pos]
+        if c < 48 or c > 57:
+            break
+        v = v * 10 + cast[uint64](c - 48)
+        pos = pos + 1
+    out[0] = v
+    return pos
+
+
+def loopctl_write(buf: Ptr[uint8], count: uint64) -> int64:
+    # Parse one verb line. Returns `count` bytes consumed on success, a
+    # negative errno on a parse / attach / detach failure.
+    n: uint64 = count
+    if n > 1023:
+        n = 1023
+    i: uint64 = 0
+    while i < n:
+        loopctl_buf[i] = buf[i]
+        i = i + 1
+    loopctl_buf[n] = 0
+    # Trim a trailing newline so a token that runs to end-of-line ends
+    # cleanly at the NUL.
+    if n > 0 and loopctl_buf[n - 1] == 10:
+        loopctl_buf[n - 1] = 0
+        n = n - 1
+    bp: Ptr[uint8] = &loopctl_buf[0]
+
+    if _lc_starts_with(bp, n, "attach") != 0:
+        pos: uint64 = 6                            # past "attach"
+        pos = _lc_skip_ws(bp, n, pos)
+        if pos >= n or bp[pos] == 0:
+            printk0("loop: attach: missing path\n")
+            return -22                             # -EINVAL
+        # Copy the path token (runs to end of line / NUL — paths may
+        # contain '/').
+        plen: uint64 = 0
+        while pos < n and bp[pos] != 0 and bp[pos] != 10:
+            loopctl_path[plen] = bp[pos]
+            plen = plen + 1
+            pos = pos + 1
+            if plen >= 1023:
+                break
+        loopctl_path[plen] = 0
+        rc: int32 = loop_attach(cast[Ptr[char]](&loopctl_path[0]))
+        if rc < 0:
+            return -5                              # -EIO
+        return cast[int64](count)
+    if _lc_starts_with(bp, n, "detach") != 0:
+        pos: uint64 = 6                            # past "detach"
+        idx: uint64 = 0
+        pos = _lc_parse_u64(bp, n, pos, &idx)
+        rc: int32 = loop_detach(cast[int32](idx))
+        if rc < 0:
+            return -22                             # -EINVAL
+        return cast[int64](count)
+    if _lc_starts_with(bp, n, "list") != 0:
+        # No state change — the listing is produced by reads. Accept it
+        # so `losetup -a` can write a harmless verb if it ever wants to.
+        return cast[int64](count)
+    printk0("loop: ctl: unknown command\n")
+    return -22
+
+
+def _u64_to_dec(v: uint64, out: Ptr[uint8]) -> uint64:
+    if v == 0:
+        out[0] = 48
+        return 1
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    while v != 0:
+        digits[n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    w: uint64 = n
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    return w
+
+
+loopctl_render: Array[512, uint8]
+
+
+def loopctl_read(fd_pos: uint64, buf: Ptr[uint8], count: uint64) -> int64:
+    # One-shot listing of attached loop devices, one per line:
+    #   loop<N> <nbytes>\n
+    # A second read (fd_pos > 0) is EOF so `cat /dev/loop/ctl` ends.
+    if fd_pos > 0:
+        return 0
+    w: uint64 = 0
+    i: uint64 = 0
+    while i < LOOP_MAX:
+        if loop_devices[i].used != 0:
+            loopctl_render[w] = 108                # 'l'
+            loopctl_render[w + 1] = 111            # 'o'
+            loopctl_render[w + 2] = 111            # 'o'
+            loopctl_render[w + 3] = 112            # 'p'
+            w = w + 4
+            loopctl_render[w] = cast[uint8](i % 10) + 48
+            w = w + 1
+            loopctl_render[w] = 32                 # ' '
+            w = w + 1
+            w = w + _u64_to_dec(loop_devices[i].nbytes,
+                                &loopctl_render[w])
+            loopctl_render[w] = 10                 # '\n'
+            w = w + 1
+        i = i + 1
+    take: uint64 = count
+    if take > w:
+        take = w
+    j: uint64 = 0
+    while j < take:
+        buf[j] = loopctl_render[j]
+        j = j + 1
+    return cast[int64](take)
