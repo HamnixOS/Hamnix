@@ -909,6 +909,15 @@ if os.environ.get("ENABLE_PROCFLAGS_TEST"):
 if os.environ.get("ENABLE_PROCIO_TEST"):
     FILES.append(("/etc/procio-test", b"1\n"))
 
+# /proc/<pid>/limits self-test. scripts/test_proclimits.sh sets
+# ENABLE_PROCLIMITS_TEST=1 to plant /etc/proclimits-test. init/main.ad detects
+# the marker and calls proclimits_selftest() (devproc.ad): it renders
+# emit_proc_limits for the boot slot, parses the "Max open files"/"Max stack
+# size" rows, and asserts nofile_soft=1024 nofile_hard=4096 stack_soft=8388608,
+# then emits the [PROCLIMITS] PASS banner. Needs no extra device.
+if os.environ.get("ENABLE_PROCLIMITS_TEST"):
+    FILES.append(("/etc/proclimits-test", b"1\n"))
+
 # /proc/<pid>/stat child-resource accounting (fields 11/13/16/17) self-test.
 # scripts/test_childacct.sh sets ENABLE_CHILDACCT_TEST=1 to plant
 # /etc/childacct-test. init/main.ad detects the marker and calls
