@@ -936,6 +936,15 @@ if os.environ.get("ENABLE_PROCLIMITS_TEST"):
 if os.environ.get("ENABLE_PROCCTL_TEST"):
     FILES.append(("/etc/procctl-test", b"1\n"))
 
+# Per-task oom_score_adj store + OOM-killer exemption/clamp self-test.
+# scripts/test_oomadj.sh sets ENABLE_OOMADJ_TEST=1 to plant /etc/oomadj-test.
+# init/main.ad detects the marker and calls oomadj_selftest()
+# (kernel/sched/core.ad): it drives the real oom_adj_set/get/is_exempt store,
+# asserts exemption at -1000 and the upper clamp at 1000, then emits the
+# [OOMADJ] PASS banner. Needs no extra device.
+if os.environ.get("ENABLE_OOMADJ_TEST"):
+    FILES.append(("/etc/oomadj-test", b"1\n"))
+
 # /proc/<pid>/stat child-resource accounting (fields 11/13/16/17) self-test.
 # scripts/test_childacct.sh sets ENABLE_CHILDACCT_TEST=1 to plant
 # /etc/childacct-test. init/main.ad detects the marker and calls
