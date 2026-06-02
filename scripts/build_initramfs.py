@@ -599,6 +599,21 @@ if os.environ.get("ENABLE_FAT_MKFS_TEST") == "1":
 if os.environ.get("ENABLE_FAT16_MKFS_TEST") == "1":
     FILES.append(("/etc/fat16-mkfs-test", b"1\n"))
 
+# FAT32 mkfs formatter self-test. scripts/test_fat32_mkfs.sh sets
+# ENABLE_FAT32_MKFS_TEST=1 to plant /etc/fat32-mkfs-test. init/main.ad at
+# boot:37.fmk32 detects the marker and calls fat32_mkfs_selftest()
+# (fs/fat_mkfs.ad): it formats the AHCI scratch disk registered as "sd0"
+# with a 512 MiB volume (~131000 clusters at 4 KiB clusters -> FAT32) via
+# fat_mkfs(slot, 512), then reads the boot sector + first FAT sector back
+# through the generic block layer and verifies the FAT32 BPB fields
+# (BPB_FATSz16==0, BPB_RootEntCnt==0, BPB_RootClus==2, "FAT32   " FS-type
+# string) and the 32-bit FAT[0]/FAT[1]/FAT[2] seed (entry0 low byte 0xF8,
+# entry1/entry2 low 28 bits all-ones). Requires the test to attach a QEMU
+# ich9-ahci disk >= 512 MiB. Default boots omit the marker so it never
+# fires.
+if os.environ.get("ENABLE_FAT32_MKFS_TEST") == "1":
+    FILES.append(("/etc/fat32-mkfs-test", b"1\n"))
+
 # Plan-9 namespace bind/mount/unmount self-test. scripts/test_bind.sh sets
 # ENABLE_BIND_TEST=1 to plant /etc/bind-test plus two source directories
 # of fixture files. init/main.ad at boot:37.bind detects the marker and
