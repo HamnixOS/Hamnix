@@ -589,7 +589,60 @@ _XR_IR_ERDP:     uint64 = 0x18
 _XR_TRB_TYPE_SHIFT:      uint32 = 10
 _XR_TRB_CYCLE:          uint32 = 0x01
 _XR_TRB_TYPE_ENABLE_SLOT: uint32 = 9
+_XR_TRB_TYPE_DISABLE_SLOT: uint32 = 10
 _XR_TRB_TYPE_CMD_COMPLETION: uint32 = 33
+
+# Multi-port enumeration state. The bring-up iterates the root-hub ports,
+# addressing each connected device and binding the FIRST that exposes an
+# MSC BOT interface. _xr_cur_port/_xr_cur_speed are the port the current
+# attempt is addressing (set by the loop, read by stage6). _xr_msc_bound
+# is set to 1 inside stage8 the instant both bulk endpoints are found, so
+# the loop knows to STOP (stage9 itself returns 0 even on success — the
+# real success signal is sd0 registration, not a return value).
+_xr_cur_port:   uint32 = 0
+_xr_cur_speed:  uint32 = 0
+_xr_msc_bound:  uint32 = 0
+
+
+# Post a single Enable-Slot at the RUNNING command-ring cursor
+# (_xr_cmd_next/_xr_cmd_cyc) and return the controller-assigned slot id, or
+# 0 on failure. Unlike stage5's FIRST Enable-Slot this does NOT re-arm CRCR:
+# the command ring is already running (CRR=1) so a fresh command is simply
+# written at the live enqueue and the doorbell rung. Used by the multi-port
+# bring-up loop to obtain a fresh slot for the next connected device after
+# the previous (non-MSC) device's slot was disabled.
+def _xr_enable_slot_once(op: uint64, bar0: uint64, db_base: uint64) -> uint32:
+    cmd_at: uint64 = _xr_cmd_next
+    ct: Ptr[uint32] = cast[Ptr[uint32]](cmd_at)
+    ct[0] = 0
+    ct[1] = 0
+    ct[2] = 0
+    ct[3] = (_XR_TRB_TYPE_ENABLE_SLOT << _XR_TRB_TYPE_SHIFT) | _xr_cmd_cyc
+    _xr_w32(db_base + 0x00, 0)
+    cc: int32 = _xr_scan_event(_XR_TRB_TYPE_CMD_COMPLETION, cmd_at)
+    _xr_cmd_next = cmd_at + 0x10
+    if cc != 1:
+        printk1("[xhci-real] enable-slot-once completion-code=%d (not SUCCESS)\n",
+                cast[uint64](cast[uint32](cc)))
+        return 0
+    return _xr_cc_slot
+
+
+# Release a slot we addressed but rejected (non-MSC device on this port).
+# Posts a Disable-Slot command at the running command-ring cursor so the
+# controller frees the slot's resources before we Enable a fresh one for
+# the next port.
+def _xr_disable_slot(db_base: uint64, slot: uint32):
+    cmd_at: uint64 = _xr_cmd_next
+    ct: Ptr[uint32] = cast[Ptr[uint32]](cmd_at)
+    ct[0] = 0
+    ct[1] = 0
+    ct[2] = 0
+    ct[3] = (_XR_TRB_TYPE_DISABLE_SLOT << _XR_TRB_TYPE_SHIFT) | (slot << 24) | _xr_cmd_cyc
+    _xr_w32(db_base + 0x00, 0)
+    _xr_scan_event(_XR_TRB_TYPE_CMD_COMPLETION, cmd_at)
+    _xr_cmd_next = cmd_at + 0x10
+    printk1("[xhci-real] disabled non-MSC slot %d\n", cast[uint64](slot))
 
 
 def _xr_stage5_enumerate(hcd: uint64, xhci: uint64, bar0: uint64,
@@ -759,15 +812,60 @@ def _xr_stage5_enumerate(hcd: uint64, xhci: uint64, bar0: uint64,
     printk0("[xhci-real] PASS stage5: real .ko command ring round-tripped a controller Enable-Slot end-to-end\n")
     printk0("[xhci-real] FURTHEST: controller DMA-consumed an Enable-Slot from the .ko-built cmd ring and DMA-posted a Command-Completion to the .ko-built event ring\n")
 
-    # Advance to Address Device on the slot we just enabled. We track the
-    # command-ring cursor ourselves (CRCR reports the ring BASE / reads 0 on
-    # real silicon, not the live dequeue): the next command TRB goes at
-    # deq+0x10 (same cycle, no wrap within a 256-TRB segment). The event-ring
-    # cursor is now the SHARED walker state (_xr_ev_cursor/_xr_ev_cyc), so we
-    # no longer thread an event cursor through the call.
-    cmd_next: uint64 = deq + 0x10
-    return _xr_stage6_address_device(xhci, op, bar0, db_base, ir0,
-                                     0, 0, cmd_next, rcs, slot)
+    # Multi-port enumeration. We have a slot; now iterate the connected
+    # root-hub ports and bind the FIRST device that enumerates as MSC BOT
+    # (two bulk endpoints). On QEMU the stick is the only device (port 1),
+    # so the first attempt binds it and the loop exits immediately. On real
+    # NUC silicon several internal USB devices (an internal hub — config
+    # wTotalLength=25, one interrupt EP — plus BT/camera) sit on lower root
+    # ports and address fine but expose NO bulk endpoints; we must skip
+    # them, release each slot, and keep advancing until we reach the
+    # mass-storage stick on its own root port. This is exactly what a real
+    # USB bus driver does: enumerate every port, bind by interface class.
+    #
+    # We track the command-ring cursor ourselves (CRCR reports the ring
+    # BASE / reads 0 on real silicon): the next command TRB goes at deq+0x10
+    # (same cycle, no wrap within a 256-TRB segment for the <=24 commands a
+    # bring-up emits). The event-ring cursor is the SHARED walker state.
+    _xr_cmd_next = deq + 0x10
+    _xr_cmd_cyc = rcs
+    hcs2: uint32 = _xr_r32(bar0 + 0x04)
+    max_ports2: uint32 = (hcs2 >> 24) & 0xFF
+    port_cursor: uint32 = 1
+    cur_slot: uint32 = slot
+    attempts: uint32 = 0
+    while attempts < 24:
+        pp: uint32 = _xr_find_connected_port(op, bar0, port_cursor)
+        if pp == 0:
+            printk0("[xhci-real] bring-up: no more connected ports to try\n")
+            break
+        _xr_cur_port = (pp >> 8) & 0xFF
+        _xr_cur_speed = pp & 0xF
+        printk2("[xhci-real] bring-up attempt: slot=%d addressing port=%d\n",
+                cast[uint64](cur_slot), cast[uint64](_xr_cur_port))
+        _xr_msc_bound = 0
+        r: int32 = _xr_stage6_address_device(xhci, op, bar0, db_base, ir0,
+                                             0, 0, _xr_cmd_next, _xr_cmd_cyc,
+                                             cur_slot)
+        if _xr_msc_bound != 0:
+            # stage8 found bulk IN/OUT on this device — it IS the MSC stick.
+            # Stop iterating regardless of stage9's return (sd0 registration
+            # is the real success signal, emitted inside stage9).
+            return r
+        # Non-MSC device (or this port failed to enumerate). Release the slot
+        # and advance to the next connected port with a fresh slot.
+        port_cursor = _xr_cur_port + 1
+        attempts = attempts + 1
+        if port_cursor > max_ports2:
+            printk0("[xhci-real] bring-up: scanned all root ports, no MSC device found\n")
+            break
+        _xr_disable_slot(db_base, cur_slot)
+        cur_slot = _xr_enable_slot_once(op, bar0, db_base)
+        if cur_slot == 0:
+            printk0("[xhci-real] bring-up: Enable-Slot for next port failed\n")
+            break
+    printk0("[xhci-real] FURTHEST: enumerated all connected ports; none exposed an MSC BOT interface (no sd0)\n")
+    return 0
 
 
 # --- stage6: Address Device + GET_DESCRIPTOR -------------------------
@@ -836,10 +934,12 @@ def _xr_wait_cmd_complete(ev: Ptr[uint32], ev_cyc_before: uint32,
 # 9) + PLS (bits 5..8) and zeroes everything else before OR-ing in PR —
 # this avoids accidentally disabling the port or clearing status we still
 # need. (Mirrors Linux xhci_port_state_to_neutral.)
-def _xr_find_connected_port(op: uint64, bar0: uint64) -> uint32:
+def _xr_find_connected_port(op: uint64, bar0: uint64, start: uint32) -> uint32:
     hcs: uint32 = _xr_r32(bar0 + 0x04)
     max_ports: uint32 = (hcs >> 24) & 0xFF
-    p: uint32 = 1
+    p: uint32 = start
+    if p < 1:
+        p = 1
     while p <= max_ports:
         pa: uint64 = op + 0x400 + cast[uint64](p - 1) * 0x10
         v: uint32 = _xr_r32(pa)
@@ -913,14 +1013,15 @@ def _xr_stage6_address_device(xhci: uint64, op: uint64, bar0: uint64,
     #   dword0: route(0) | speed(<<20) | ctx_entries(1)<<27
     #   dword1: root-hub-port-number << 16
     sc: uint64 = in_ctx + ctx_sz
-    # Find the port the device is actually on and train its speed. On QEMU
-    # this is port 1 (already PED=1); on real silicon it's some other port
-    # whose USB2 companion needs a Port-Reset before it enables. Hardcoding
-    # port 1 with speed=0 (its empty PORTSC) was the cause of the metal
-    # Address-Device USB-Transaction-Error (completion code 4).
-    pp: uint32 = _xr_find_connected_port(op, bar0)
-    port_num: uint32 = (pp >> 8) & 0xFF
-    pspeed: uint32 = pp & 0xF
+    # The port this attempt addresses is chosen by the multi-port bring-up
+    # loop in stage5 (_xr_cur_port / _xr_cur_speed), which has already
+    # Port-Reset the USB2 companion so the port is enabled and reports a
+    # trained speed. Hardcoding port 1 with speed=0 (its empty PORTSC) was
+    # the cause of the metal Address-Device USB-Transaction-Error (cc=4);
+    # picking only the FIRST connected port (an internal hub on the NUC) was
+    # the cause of the stage8 "no bulk endpoints" wall.
+    port_num: uint32 = _xr_cur_port
+    pspeed: uint32 = _xr_cur_speed
     if port_num == 0:
         port_num = 1
         pspeed = (_xr_r32(op + 0x400) >> 10) & 0xF
@@ -1445,6 +1546,17 @@ def _xr_stage8_get_config(xhci: uint64, op: uint64, bar0: uint64,
         if dlen == 0:
             pos = total
         else:
+            if dtype == 0x04 and pos + 6 <= total:
+                # Interface descriptor: byte5=bInterfaceClass, byte6=subclass,
+                # byte7=protocol. MSC BOT = class 0x08 / proto 0x50; a USB hub
+                # = class 0x09. Logging this disambiguates which internal NUC
+                # device sits on each non-MSC port.
+                iclass: uint32 = cast[uint32](cb[pos + 5])
+                iproto: uint32 = 0
+                if pos + 7 <= total:
+                    iproto = cast[uint32](cb[pos + 7])
+                printk2("[xhci-real] stage8 interface class=%p protocol=%p\n",
+                        cast[uint64](iclass), cast[uint64](iproto))
             if dtype == 0x05 and pos + 6 <= total:
                 epaddr: uint32 = cast[uint32](cb[pos + 2])
                 attrs: uint32 = cast[uint32](cb[pos + 3])
@@ -1465,6 +1577,10 @@ def _xr_stage8_get_config(xhci: uint64, op: uint64, bar0: uint64,
         printk0("[xhci-real] FURTHEST: config descriptor parsed but bulk IN/OUT endpoints not both found\n")
         return 0
     printk0("[xhci-real] PASS stage8: GET_DESCRIPTOR(config) parsed; bulk IN/OUT endpoints identified (MSC BOT device)\n")
+    # Tell the multi-port bring-up loop this device IS the MSC stick so it
+    # stops iterating ports (stage9 returns 0 even on success; sd0
+    # registration inside stage9 is the real success signal).
+    _xr_msc_bound = 1
     return _xr_stage9_configure(xhci, op, bar0, db_base, ir0, slot)
 
 

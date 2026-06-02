@@ -261,18 +261,20 @@ echo "[test_xhci_ko_enum] OK: stage4 — controller RUNNING off .ko rings (QEMU 
 # the kernel posted it at. kzalloc returns whatever identity-mapped low
 # page is free, so the ring's phys address is BUILD-DEPENDENT — we must
 # NOT hardcode a 0x05.. prefix (that misses a genuine fetch on builds
-# where the ring lands elsewhere). Instead we parse the address the
-# kernel emitted ("stage5 controller deq(CRCR base)=0x....") and assert
-# the controller fetched CR_ENABLE_SLOT at THAT address. This keeps the
-# "controller really DMA-fetched OUR TRB from OUR ring" proof while being
-# address-agnostic across builds.
+# where the ring lands elsewhere). Instead we parse the 64-byte-aligned
+# address the kernel posted Enable-Slot at and re-armed CRCR to
+# ("stage5 post-at deq=0x....") and assert the controller fetched
+# CR_ENABLE_SLOT at THAT address. This keeps the "controller really
+# DMA-fetched OUR TRB from OUR ring" proof while being address-agnostic
+# across builds.
 if ! grep -aF -q "[xhci-real] PASS stage5" "$LOG"; then
     echo "[test_xhci_ko_enum] FAIL: stage5 (Enable-Slot round-trip) did not pass"
     tail -n 40 "$LOG"
     exit 1
 fi
-# Parse "stage5 controller deq(CRCR base)=0x000000000XXXXXXX" from the log.
-ES_ADDR="$(grep -aoE 'stage5 controller deq\(CRCR base\)=0x[0-9a-fA-F]+' "$LOG" \
+# Parse "stage5 post-at deq=0x000000000XXXXXXX" from the log (the
+# 64B-aligned address the kernel posted Enable-Slot at + re-armed CRCR to).
+ES_ADDR="$(grep -aoE 'stage5 post-at deq=0x[0-9a-fA-F]+' "$LOG" \
             | head -1 | grep -aoE '0x[0-9a-fA-F]+')"
 if [ -z "$ES_ADDR" ]; then
     echo "[test_xhci_ko_enum] FAIL: kernel did not emit the stage5 Enable-Slot ring address"
