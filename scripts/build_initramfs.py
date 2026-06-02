@@ -881,6 +881,16 @@ if os.environ.get("ENABLE_PRIONICE_TEST") == "1":
 if os.environ.get("ENABLE_PGRP_TEST") == "1":
     FILES.append(("/etc/pgrp-test", b"1\n"))
 
+# /proc/<pid>/stat flags (field 9) self-test. scripts/test_procflags.sh sets
+# ENABLE_PROCFLAGS_TEST=1 to plant /etc/procflags-test. init/main.ad detects
+# the marker and calls procflags_selftest() (devproc.ad): it renders
+# _emit_linux_stat for the boot slot, parses field 9 (flags), and confirms it
+# equals the real PF_KTHREAD bit (2097152) derived from the boot task's
+# is_user, then emits the [PROCFLAGS] PASS banner. Needs no extra device;
+# default boots omit it.
+if os.environ.get("ENABLE_PROCFLAGS_TEST"):
+    FILES.append(("/etc/procflags-test", b"1\n"))
+
 # /proc/<pid>/stat child-resource accounting (fields 11/13/16/17) self-test.
 # scripts/test_childacct.sh sets ENABLE_CHILDACCT_TEST=1 to plant
 # /etc/childacct-test. init/main.ad detects the marker and calls
