@@ -288,6 +288,19 @@ if os.environ.get("ENABLE_MMAP_FILE_TEST") == "1":
     _mmf_data = bytes(((i * 31 + 7) & 0xFF) for i in range(_mmf_len))
     FILES.append(("/etc/mmap-file-data", _mmf_data))
 
+# §shared-mmap: MAP_SHARED writable file-backed mmap self-test.
+# scripts/test_mmap_shared_file.sh sets ENABLE_MMAP_SHARED_TEST=1 to plant
+# /etc/mmap-shared-test (the gate marker). init/main.ad at boot:37.mms
+# detects it and calls mmap_shared_selftest(): it creates a known-content
+# file on tmpfs (a WRITABLE backend), mmap()s it MAP_SHARED|PROT_WRITE,
+# modifies bytes through the mapping, msync(MS_SYNC)s, then reads the
+# backing file back via the normal read path (NOT the mapping) and a
+# second fresh mmap, confirming the modifications landed in the file.
+# Prints "[mmap-shared] PASS" / "[mmap-shared] FAIL". Default boots omit
+# the marker so the self-test is a no-op everywhere else.
+if os.environ.get("ENABLE_MMAP_SHARED_TEST") == "1":
+    FILES.append(("/etc/mmap-shared-test", b"1\n"))
+
 # SMP kthread-churn soak. scripts/test_smp_soak.sh sets ENABLE_SMP_SOAK=1
 # to plant /etc/smp-soak in the initramfs. init/main.ad at boot:37 detects
 # the marker and calls smp_kthread_soak_run() (kernel/sched/core.ad) which

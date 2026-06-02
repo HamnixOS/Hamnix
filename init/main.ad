@@ -102,6 +102,20 @@ from arch.x86.kernel.e820 import (
 # is the populator the #PF handler calls (driven directly here since a
 # synchronous kernel self-test can't take a real #PF on its own access).
 from mm.vma import vma_alloc_file_demand, vma_demand_fault
+# §shared-mmap: MAP_SHARED writable file-backed mmap self-test
+# (ENABLE_MMAP_SHARED_TEST=1). vma_alloc_file_shared builds the writable
+# file-shared VMA; vma_writeback_range flushes its dirty pages to the
+# backing file (the msync(MS_SYNC) path).
+from mm.vma import vma_alloc_file_shared, vma_writeback_range
+# tmpfs is the WRITABLE backend the shared-mmap self-test writes its
+# known-content file to (initramfs/cpio is read-only and cannot be
+# written back). tmpfs_open_for_write creates/truncates a file and
+# returns its stable slot; tmpfs_write/tmpfs_read drive content;
+# tmpfs_size reports its length.
+from fs.tmpfs import (
+    tmpfs_open_for_write, tmpfs_write, tmpfs_read, tmpfs_size,
+)
+from kernel.sched.core import FD_TMPFS_MARK
 from kernel.sched.core import current_idx_get
 from fs.vfs import (
     vfs_init, vfs_open, vfs_read, vfs_write, vfs_close,
@@ -3364,6 +3378,204 @@ def mmap_file_selftest():
     printk0("[mmap-file] PASS\n")
 
 
+def _mms_expect_byte(i: uint64) -> uint8:
+    # Known content of the shared-mmap backing file: byte i == (i*17+3)&0xFF.
+    return cast[uint8]((i * 17 + 3) & 0xFF)
+
+
+def mmap_shared_selftest():
+    # §shared-mmap: prove MAP_SHARED writable file-backed mmap with REAL
+    # write-back to the backing file. Unlike the read-only / MAP_PRIVATE
+    # mmap_file_selftest, this exercises the new is_file_shared VMA path:
+    # a writable mapping whose dirtied pages are flushed to the backing
+    # FILE on msync(MS_SYNC) / munmap.
+    #
+    # We run on a WRITABLE backend (tmpfs) — the initramfs (cpio) backing
+    # is read-only and a MAP_SHARED-writable mapping over it is refused.
+    # Steps:
+    #   1. Create /tmp/mms-data on tmpfs and fill it with known content.
+    #   2. Snapshot its tmpfs backing identity (marker=FD_TMPFS_MARK,
+    #      backing=slot, size) — the SAME triple vfs_fd_backing_info would
+    #      produce for a userland open — and build a shared-writable file
+    #      VMA via vma_alloc_file_shared.
+    #   3. Fault every page in (the populator reads the current file
+    #      bytes), verify they match the known content.
+    #   4. Modify a span of bytes THROUGH the mapping, then
+    #      vma_writeback_range (the msync(MS_SYNC) path).
+    #   5. Read the backing file back via tmpfs_read (NOT the mapping) and
+    #      confirm the modified bytes landed in the file.
+    #   6. Build a SECOND fresh mapping of the same file and confirm it
+    #      faults in the NEW bytes.
+    # Prints "[mmap-shared] PASS" / "[mmap-shared] FAIL ...".
+    #
+    # Like mmap_file_selftest, this runs in the boot task's own address
+    # space and drives vma_demand_fault directly (a synchronous kernel
+    # self-test cannot take a real #PF on its own access).
+    PROT_READ:  int32 = 0x1
+    PROT_WRITE: int32 = 0x2
+    MAP_SHARED: int32 = 0x01
+    PG: uint64 = 4096
+
+    # Shared-writable pages are WRITABLE NX DATA. vma_demand_fault stamps
+    # NX (bit 63); this runs at boot:37.mms BEFORE syscall_init (boot:39)
+    # arms IA32_EFER.NXE, so a data access would otherwise take a
+    # reserved-bit #PF. Arm NXE now (idempotent — syscall_init re-arms it).
+    set_efer_nxe()
+
+    boot_slot: uint64 = current_idx_get()
+    boot_pml4: uint64 = task_pml4(cast[int32](boot_slot))
+
+    # ---- Build the known-content backing file on tmpfs -----------------
+    fsize: uint64 = 2 * PG + 50
+    fpath: Ptr[char] = "/tmp/mms-data"
+    slot: int32 = tmpfs_open_for_write(fpath)
+    if slot < 0:
+        printk1("[mmap-shared] FAIL: tmpfs create rc=%d\n",
+                cast[uint64](cast[int64](slot)))
+        return
+    # Fill with the content formula, one chunk at a time via a stack buf.
+    fillbuf: Array[256, uint8]
+    wpos: uint64 = 0
+    while wpos < fsize:
+        n: uint64 = fsize - wpos
+        if n > 256:
+            n = 256
+        bk: uint64 = 0
+        while bk < n:
+            fillbuf[bk] = _mms_expect_byte(wpos + bk)
+            bk = bk + 1
+        wrote: uint64 = tmpfs_write(slot, &fillbuf[0], wpos, n)
+        if wrote != n:
+            printk0("[mmap-shared] FAIL: tmpfs short write\n")
+            return
+        wpos = wpos + n
+    if tmpfs_size(slot) != fsize:
+        printk2("[mmap-shared] FAIL: tmpfs size=%d want=%d\n",
+                tmpfs_size(slot), fsize)
+        return
+    marker:  uint32 = FD_TMPFS_MARK
+    backing: uint64 = cast[uint64](cast[uint32](slot))
+    printk2("[mmap-shared] tmpfs file size=%d slot=%d\n", fsize, backing)
+
+    # ---- Map 1: whole file, MAP_SHARED | PROT_READ|PROT_WRITE ----------
+    base64: int64 = vma_alloc_file_shared(boot_slot, 0, fsize,
+                                          PROT_READ | PROT_WRITE,
+                                          MAP_SHARED,
+                                          cast[int32](marker), backing,
+                                          fsize, 0)
+    if base64 < 0:
+        printk0("[mmap-shared] FAIL: vma_alloc_file_shared (map1)\n")
+        return
+    base: uint64 = cast[uint64](base64)
+    npages: uint64 = (fsize + PG - 1) / PG
+    fp: uint64 = 0
+    while fp < npages:
+        vma_demand_fault(boot_slot, boot_pml4, base + fp * PG)
+        fp = fp + 1
+
+    # Verify the faulted-in bytes equal the original file content.
+    mism1: uint64 = 0
+    bi: uint64 = 0
+    while bi < fsize:
+        if cast[Ptr[uint8]](base + bi)[0] != _mms_expect_byte(bi):
+            mism1 = mism1 + 1
+        bi = bi + 1
+    if mism1 != 0:
+        printk1("[mmap-shared] FAIL: map1 initial content mismatch (%d)\n",
+                mism1)
+        return
+    printk0("[mmap-shared] map1 initial content OK\n")
+
+    # ---- Modify a span THROUGH the mapping, then msync(MS_SYNC) --------
+    # Modify 200 bytes straddling the first page boundary so write-back
+    # touches two pages. New byte i == (i*23 + 11) & 0xFF.
+    mod_start: uint64 = PG - 80
+    mod_len:   uint64 = 200
+    mp: uint64 = 0
+    while mp < mod_len:
+        cast[Ptr[uint8]](base + mod_start + mp)[0] = \
+            cast[uint8](((mod_start + mp) * 23 + 11) & 0xFF)
+        mp = mp + 1
+    # msync(MS_SYNC) — flush dirty pages to the backing file.
+    msrc: int64 = vma_writeback_range(boot_slot, base, fsize)
+    if msrc < 0:
+        printk1("[mmap-shared] FAIL: writeback rc=%d\n",
+                cast[uint64](msrc))
+        return
+    printk0("[mmap-shared] msync(MS_SYNC) write-back OK\n")
+
+    # ---- Read the backing file independently (NOT the mapping) ---------
+    rdbuf: Array[256, uint8]
+    rd_mism: uint64 = 0
+    ri: uint64 = mod_start
+    while ri < mod_start + mod_len:
+        chunk: uint64 = mod_start + mod_len - ri
+        if chunk > 256:
+            chunk = 256
+        got: uint64 = tmpfs_read(slot, &rdbuf[0], ri, chunk)
+        if got != chunk:
+            printk0("[mmap-shared] FAIL: tmpfs read short during verify\n")
+            return
+        ck: uint64 = 0
+        while ck < chunk:
+            want: uint8 = cast[uint8](((ri + ck) * 23 + 11) & 0xFF)
+            if rdbuf[ck] != want:
+                rd_mism = rd_mism + 1
+            ck = ck + 1
+        ri = ri + chunk
+    if rd_mism != 0:
+        printk1("[mmap-shared] FAIL: backing file missing writes (%d)\n",
+                rd_mism)
+        return
+    printk0("[mmap-shared] backing file holds the modified bytes OK\n")
+
+    # Bytes OUTSIDE the modified span must still hold the original content.
+    if tmpfs_read(slot, &rdbuf[0], 0, 16) != 16:
+        printk0("[mmap-shared] FAIL: tmpfs read head\n")
+        return
+    head_ok: int32 = 1
+    hk: uint64 = 0
+    while hk < 16:
+        if rdbuf[hk] != _mms_expect_byte(hk):
+            head_ok = 0
+            hk = 16
+        else:
+            hk = hk + 1
+    if head_ok == 0:
+        printk0("[mmap-shared] FAIL: unmodified region corrupted\n")
+        return
+    printk0("[mmap-shared] unmodified region preserved OK\n")
+
+    # ---- Map 2: a fresh mapping must SEE the written-back bytes --------
+    base2_64: int64 = vma_alloc_file_shared(boot_slot, 0, fsize,
+                                            PROT_READ | PROT_WRITE,
+                                            MAP_SHARED,
+                                            cast[int32](marker), backing,
+                                            fsize, 0)
+    if base2_64 < 0:
+        printk0("[mmap-shared] FAIL: vma_alloc_file_shared (map2)\n")
+        return
+    base2: uint64 = cast[uint64](base2_64)
+    fp2: uint64 = 0
+    while fp2 < npages:
+        vma_demand_fault(boot_slot, boot_pml4, base2 + fp2 * PG)
+        fp2 = fp2 + 1
+    m2_mism: uint64 = 0
+    bj: uint64 = mod_start
+    while bj < mod_start + mod_len:
+        want2: uint8 = cast[uint8]((bj * 23 + 11) & 0xFF)
+        if cast[Ptr[uint8]](base2 + bj)[0] != want2:
+            m2_mism = m2_mism + 1
+        bj = bj + 1
+    if m2_mism != 0:
+        printk1("[mmap-shared] FAIL: fresh mmap missing writes (%d)\n",
+                m2_mism)
+        return
+    printk0("[mmap-shared] fresh mmap sees written-back bytes OK\n")
+
+    printk0("[mmap-shared] PASS\n")
+
+
 def usbms_exercise():
     # USB mass-storage (BOT/SCSI over xHCI bulk) EXERCISE. Gated on the
     # /etc/usbms-test cpio marker (planted by scripts/test_usbms.sh via
@@ -5799,6 +6011,41 @@ def start_kernel():
         mmap_file_selftest()
     else:
         printk0("[mmap-file] skipped (no /etc/mmap-file-test marker)\n")
+
+    # §shared-mmap: MAP_SHARED writable file-backed mmap self-test. Gated
+    # on /etc/mmap-shared-test (planted by build_initramfs.py when
+    # ENABLE_MMAP_SHARED_TEST=1, via scripts/test_mmap_shared_file.sh).
+    # Same marker-scan shape. mmap_shared_selftest() (defined above)
+    # creates a tmpfs file, mmap()s it MAP_SHARED|PROT_WRITE, modifies
+    # bytes through the mapping, msync(MS_SYNC)s, reads the backing file
+    # back (NOT through the mapping), and confirms the writes landed.
+    # Prints "[mmap-shared] PASS" / "[mmap-shared] FAIL".
+    printk0("[boot:37.mms] checking /etc/mmap-shared-test marker\n")
+    mms_marker_found: int32 = 0
+    mms_idx: uint64 = 0
+    mms_count: uint64 = initramfs_entry_count()
+    while mms_idx < mms_count:
+        mms_name: Ptr[char] = initramfs_entry_name(mms_idx)
+        # Compare byte-by-byte with "/etc/mmap-shared-test\0" (22 bytes).
+        mms_ok: int32 = 1
+        mms_tgt: Ptr[uint8] = "/etc/mmap-shared-test"
+        mms_j: uint64 = 0
+        while mms_j < 22:
+            if cast[uint8](mms_name[mms_j]) != mms_tgt[mms_j]:
+                mms_ok = 0
+                mms_j = 22
+            else:
+                mms_j = mms_j + 1
+        if mms_ok == 1:
+            mms_marker_found = 1
+            mms_idx = mms_count
+        else:
+            mms_idx = mms_idx + 1
+    if mms_marker_found == 1:
+        printk0("[boot:37.mms] /etc/mmap-shared-test found — running self-test\n")
+        mmap_shared_selftest()
+    else:
+        printk0("[mmap-shared] skipped (no /etc/mmap-shared-test marker)\n")
 
     # task #178: selectable-keyboard-layout self-test. Gated on
     # /etc/keymap-test (planted by build_initramfs.py when

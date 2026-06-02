@@ -78,7 +78,7 @@ from fs.elf import (
 # new cycle). vma_demand_fault's is_file branch calls it to read a page's
 # bytes from the backing file; bytes past file_size are left zero by the
 # caller's pre-zeroing of the page.
-from fs.vfs import vfs_pread_backing
+from fs.vfs import vfs_pread_backing, vfs_pwrite_backing
 
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
@@ -272,8 +272,19 @@ class VmaNode:
     # the high uint32 range; reinterpreted to uint32 when used).
     file_marker: int32
     # Total size in bytes of the backing file at mmap time — the EOF
-    # boundary for zero-fill of the sub-page tail.
+    # boundary for zero-fill of the sub-page tail. (Kept at this offset,
+    # 8-byte aligned, so the §shared-mmap field below is appended last.)
     file_size:   uint64
+    # §shared-mmap: 1 when this is a MAP_SHARED *writable* file-backed
+    # mapping. It is also is_file=1 + is_demand=1. Unlike a MAP_PRIVATE
+    # file VMA (whose faulted pages are private copies, never written
+    # back), a shared-writable file VMA maps each faulted page WRITABLE
+    # and tracks it for write-back: on msync(MS_SYNC) and on munmap /
+    # teardown, every resident dirty page is flushed to the backing file
+    # via vfs_pwrite_backing(marker, backing, file_offset+page-off, ...).
+    # The PTE dirty bit (bit 6) selects which pages actually changed.
+    # Appended as the LAST field so file_size stays 8-byte aligned.
+    is_file_shared: int32
     # For a file-backed VMA, `backing` (above) is REPURPOSED to hold the
     # stable backing IDENTITY (cpio index / tmpfs slot / ext4 inode num /
     # buffer pointer) rather than a physical page run — a file-backed
@@ -286,9 +297,11 @@ class VmaNode:
 
 # VmaNode size: 6 uint64 (48) + 10 int32 (40) = 88 bytes; §file-mmap
 # adds is_file + file_marker (2 int32 = 8) + file_size (uint64 = 8) for
-# 104 bytes total. memset-zeroed on alloc, so every node defaults to
-# is_file=0 (anonymous/non-file) unless a file-backed allocator sets it.
-VMA_NODE_SIZE: uint64 = 104
+# 104 bytes; §shared-mmap adds is_file_shared (int32 = 4) for 108 bytes
+# total. memset-zeroed on alloc, so every node defaults to is_file=0 /
+# is_file_shared=0 (anonymous/non-file) unless a file-backed allocator
+# sets them.
+VMA_NODE_SIZE: uint64 = 108
 
 
 def _vma_node_new() -> uint64:
@@ -322,6 +335,7 @@ def _vma_node_set(node: uint64, start: uint64, end: uint64,
     cast[Ptr[VmaNode]](node)[0].is_file     = 0
     cast[Ptr[VmaNode]](node)[0].file_marker = 0
     cast[Ptr[VmaNode]](node)[0].file_size   = 0
+    cast[Ptr[VmaNode]](node)[0].is_file_shared = 0
 
 
 def _vma_node_get_next(node: uint64) -> uint64:
@@ -444,6 +458,18 @@ def _vma_node_free(slot: uint64, node: uint64, pml4_phys: uint64):
     # A multi-chunk VMA (nchunks > 0) instead owns an array of VmaChunk
     # descriptors; free every chunk at its own order, then release the
     # descriptor array. backing/order are unused for such nodes.
+    # §shared-mmap: a MAP_SHARED writable file-backed VMA flushes its
+    # dirty resident pages to the backing file BEFORE its frames are
+    # released (munmap and task teardown both reach here). This realises
+    # the POSIX guarantee that munmap of a MAP_SHARED mapping writes back
+    # outstanding modifications. _vma_writeback_node tolerates a -EROFS
+    # backing (it never appears here — the mmap path refuses a read-only
+    # backing for MAP_SHARED-writable) and only flushes PTE-dirty pages.
+    if cast[Ptr[VmaNode]](node)[0].is_file_shared != 0:
+        _vma_writeback_node(node, pml4_phys,
+                            cast[Ptr[VmaNode]](node)[0].start,
+                            cast[Ptr[VmaNode]](node)[0].end)
+
     is_demand: int32 = cast[Ptr[VmaNode]](node)[0].is_demand
     if is_demand != 0:
         # Demand-paged VMA (§142): pages were allocated individually on
@@ -1439,6 +1465,35 @@ def vma_alloc_file_demand(slot: uint64, addr_in: uint64, len_in: uint64,
                           file_marker: int32, file_backing: uint64,
                           file_size: uint64,
                           file_offset: uint64) -> int64:
+    # Read-only / MAP_PRIVATE file-backed mapping (the default). Delegates
+    # to the shared-aware core with is_shared=0 so faulted pages stay
+    # private copies and nothing is ever written back.
+    return _vma_alloc_file_core(slot, addr_in, len_in, prot, flags,
+                                file_marker, file_backing, file_size,
+                                file_offset, 0)
+
+
+def vma_alloc_file_shared(slot: uint64, addr_in: uint64, len_in: uint64,
+                          prot: int32, flags: int32,
+                          file_marker: int32, file_backing: uint64,
+                          file_size: uint64,
+                          file_offset: uint64) -> int64:
+    # §shared-mmap: MAP_SHARED writable file-backed mapping. Faulted pages
+    # are mapped WRITABLE and tracked for write-back to the backing file
+    # (msync(MS_SYNC) / munmap). The caller (SYS_MMAP) must have already
+    # rejected a read-only backing object (initramfs) so write-back can
+    # land somewhere.
+    return _vma_alloc_file_core(slot, addr_in, len_in, prot, flags,
+                                file_marker, file_backing, file_size,
+                                file_offset, 1)
+
+
+def _vma_alloc_file_core(slot: uint64, addr_in: uint64, len_in: uint64,
+                         prot: int32, flags: int32,
+                         file_marker: int32, file_backing: uint64,
+                         file_size: uint64,
+                         file_offset: uint64,
+                         is_shared: int32) -> int64:
     if len_in == 0:
         return cast[int64](-22)
     length: uint64 = (len_in + VMA_PAGE_SIZE - 1) & ~(VMA_PAGE_SIZE - 1)
@@ -1487,6 +1542,7 @@ def vma_alloc_file_demand(slot: uint64, addr_in: uint64, len_in: uint64,
                   file_backing, 0)
     cast[Ptr[VmaNode]](node)[0].is_demand   = 1
     cast[Ptr[VmaNode]](node)[0].is_file     = 1
+    cast[Ptr[VmaNode]](node)[0].is_file_shared = is_shared
     cast[Ptr[VmaNode]](node)[0].file_marker = file_marker
     cast[Ptr[VmaNode]](node)[0].file_size   = file_size
     _vma_insert_sorted(slot, node)
@@ -1583,6 +1639,109 @@ def vma_demand_fault(slot: uint64, pml4_phys: uint64,
         printk1("vma: demand map failed at va=0x%x\n", fault_va)
         return -1
     return 1
+
+
+# ---------------------------------------------------------------------
+# §shared-mmap — write-back of MAP_SHARED writable file pages
+# ---------------------------------------------------------------------
+#
+# PTE dirty bit (set by the CPU on the first write to a writable page).
+VMA_PT_FLAG_D: uint64 = 0x40
+
+
+def _vma_writeback_node(node: uint64, pml4_phys: uint64,
+                        lo: uint64, hi: uint64) -> int64:
+    # Flush the dirty resident pages of a MAP_SHARED writable file-backed
+    # VMA `node` whose virtual range intersects [lo, hi) back to the
+    # backing file. Returns 0 on success, a negative errno on the first
+    # write-back failure (e.g. -EROFS for an initramfs backing, which the
+    # mmap path should already have refused). A page is flushed iff its
+    # PTE is present AND has the dirty bit set; the dirty bit is cleared
+    # after a successful flush so a later msync re-flushes only pages
+    # written since.
+    if cast[Ptr[VmaNode]](node)[0].is_file_shared == 0:
+        return 0
+    v_start:  uint64 = cast[Ptr[VmaNode]](node)[0].start
+    v_end:    uint64 = cast[Ptr[VmaNode]](node)[0].end
+    f_off0:   uint64 = cast[Ptr[VmaNode]](node)[0].file_offset
+    f_marker: uint32 = cast[uint32](cast[Ptr[VmaNode]](node)[0].file_marker)
+    f_back:   uint64 = cast[Ptr[VmaNode]](node)[0].backing
+    f_size:   uint64 = cast[Ptr[VmaNode]](node)[0].file_size
+
+    # Clamp the flush window to the VMA's own range.
+    w_lo: uint64 = lo
+    if w_lo < v_start:
+        w_lo = v_start
+    w_hi: uint64 = hi
+    if w_hi > v_end:
+        w_hi = v_end
+    if w_lo >= w_hi:
+        return 0
+
+    # Page-align the window.
+    page: uint64 = w_lo & ~(VMA_PAGE_SIZE - 1)
+    rc: int64 = 0
+    while page < w_hi:
+        pslot: uint64 = _vma_pte_slot_addr(pml4_phys, page)
+        if pslot != 0:
+            pte: uint64 = cast[Ptr[uint64]](pslot)[0]
+            if (pte & VMA_PT_FLAG_P) != 0 and (pte & VMA_PT_FLAG_D) != 0:
+                phys: uint64 = pte & VMA_PT_ADDR_MASK
+                if phys != 0:
+                    # In-file offset of this page.
+                    frd_off: uint64 = f_off0 + (page - v_start)
+                    # Don't write past the file's recorded size — the
+                    # sub-page EOF tail is not part of the file.
+                    if frd_off < f_size:
+                        wlen: uint64 = VMA_PAGE_SIZE
+                        if frd_off + wlen > f_size:
+                            wlen = f_size - frd_off
+                        wb: int64 = vfs_pwrite_backing(f_marker, f_back,
+                                                       frd_off,
+                                                       cast[Ptr[uint8]](phys),
+                                                       wlen)
+                        if wb < 0:
+                            printk1("vma: writeback FAIL at va=0x%x\n", page)
+                            rc = wb
+                            return rc
+                    # Clear the dirty bit so subsequent msync only
+                    # re-flushes pages dirtied since this flush.
+                    cast[Ptr[uint64]](pslot)[0] = pte & ~VMA_PT_FLAG_D
+        page = page + VMA_PAGE_SIZE
+    return rc
+
+
+def vma_writeback_range(slot: uint64, addr: uint64,
+                        len_in: uint64) -> int64:
+    # msync(MS_SYNC): flush every MAP_SHARED writable file-backed VMA that
+    # intersects [addr, addr+len) back to its backing file. Anonymous /
+    # MAP_PRIVATE / read-only file VMAs in the range are skipped (a no-op,
+    # like Linux msync on a non-file mapping). Returns 0 on success or the
+    # first negative errno encountered. A range covering no file-shared
+    # VMA is a successful no-op.
+    if len_in == 0:
+        return 0
+    length: uint64 = (len_in + VMA_PAGE_SIZE - 1) & ~(VMA_PAGE_SIZE - 1)
+    lo: uint64 = addr & ~(VMA_PAGE_SIZE - 1)
+    hi: uint64 = addr + length
+    pml4: uint64 = task_pml4(cast[int32](slot))
+    # Flush the TLB before reading dirty bits so the CPU's in-flight
+    # writes are reflected in the page tables we're about to scan.
+    load_cr3(pml4)
+    rc: int64 = 0
+    cur: uint64 = task_vma_list_head(slot)
+    while cur != 0:
+        nxt: uint64 = cast[Ptr[VmaNode]](cur)[0].next
+        if cast[Ptr[VmaNode]](cur)[0].is_file_shared != 0:
+            n_start: uint64 = cast[Ptr[VmaNode]](cur)[0].start
+            n_end:   uint64 = cast[Ptr[VmaNode]](cur)[0].end
+            # Intersect?
+            if n_start < hi and n_end > lo:
+                r: int64 = _vma_writeback_node(cur, pml4, lo, hi)
+                if r < 0 and rc == 0:
+                    rc = r
+        cur = nxt
+    return rc
 
 
 # ---------------------------------------------------------------------
@@ -2029,6 +2188,14 @@ def vma_fork_copy(child_slot: uint64, parent_slot: uint64,
                           p_fd, p_off, p_back, 0)
             cast[Ptr[VmaNode]](node)[0].is_demand   = 1
             cast[Ptr[VmaNode]](node)[0].is_file     = 1
+            # §shared-mmap: a MAP_SHARED writable file VMA forks as a fresh
+            # file-shared copy carrying the same backing snapshot. Each
+            # process faults its own resident pages and writes them back to
+            # the SAME backing file (the file is the shared medium), so the
+            # mapping stays coherent through the file. Carry the flag so the
+            # child also maps pages writable and flushes on msync/unmap.
+            cast[Ptr[VmaNode]](node)[0].is_file_shared = \
+                cast[Ptr[VmaNode]](cur)[0].is_file_shared
             cast[Ptr[VmaNode]](node)[0].file_marker = \
                 cast[Ptr[VmaNode]](cur)[0].file_marker
             cast[Ptr[VmaNode]](node)[0].file_size   = \
