@@ -98,4 +98,4 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
-echo "[test_uabi_fills] PASS — readlink/arch_prctl GET_FS/uname/newfstatat/pwrite64 work via real dispatch"
+echo "[test_uabi_fills] PASS — readlink/arch_prctl/uname/newfstatat/pwrite64 plus preadv/pwritev, faccessat2, fchmod/fchown, umask, getcpu, sched_get/setaffinity, membarrier, mkdirat/unlinkat, clock_nanosleep via real dispatch"
