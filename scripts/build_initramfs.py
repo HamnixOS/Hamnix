@@ -344,6 +344,18 @@ if os.environ.get("ENABLE_KEYMAP_TEST") == "1":
 if os.environ.get("ENABLE_RANDOM_TEST") == "1":
     FILES.append(("/etc/random-test", b"ENABLE_RANDOM_TEST=1\n"))
 
+# TLS handshake-entropy source self-test. scripts/test_tls_rng.sh sets
+# ENABLE_TLS_RNG_TEST=1 to plant /etc/tls-rng-test. init/main.ad at
+# boot:37.tlsrng detects the marker and calls tls_rng_selftest()
+# (drivers/net/tls.ad): it proves TLS client_random + the X25519
+# ephemeral private scalar now draw from the real kernel CSPRNG
+# (devrandom_read) and not the old jiffies-seeded xorshift toy — two
+# 64-byte draws differ, neither is all-zero, and the output is not a
+# constant byte. Prints an EMERG-level [tls-rng] PASS / FAIL marker.
+# Default boots omit the marker so the self-test never fires.
+if os.environ.get("ENABLE_TLS_RNG_TEST") == "1":
+    FILES.append(("/etc/tls-rng-test", b"1\n"))
+
 # #171: EFI runtime services + Secure Boot image verification self-test.
 # scripts/test_efi_secureboot.sh sets ENABLE_EFI_TEST=1 to plant
 # /etc/efi-test plus the Secure Boot crypto fixtures. init/main.ad at
