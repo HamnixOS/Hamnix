@@ -785,6 +785,17 @@ if os.environ.get("ENABLE_PROCSTAT_INTR_TEST") == "1":
 if os.environ.get("ENABLE_PGFAULT_TEST") == "1":
     FILES.append(("/etc/pgfault-test", b"1\n"))
 
+# Context-switch accounting self-test. scripts/test_ctxsw.sh sets
+# ENABLE_CTXSW_TEST=1 to plant /etc/ctxsw-test. init/main.ad at
+# boot:37.ctx detects the marker and calls ctxsw_selftest()
+# (linux_abi/u_syscalls.ad): it charges 2 voluntary + 3 involuntary
+# switches via the same slot-indexed helpers schedule() drives, asserts the
+# read accessors and getrusage's ru_nvcsw (0x80) / ru_nivcsw (0x88) rose to
+# match, then emits the [CTXSW] PASS banner. Needs no extra device; default
+# boots omit the marker.
+if os.environ.get("ENABLE_CTXSW_TEST") == "1":
+    FILES.append(("/etc/ctxsw-test", b"1\n"))
+
 # times(2) CPU-time self-test. scripts/test_times.sh sets
 # ENABLE_TIMES_TEST=1 to plant /etc/times-test. init/main.ad at
 # boot:37.times detects the marker and calls times_selftest()
