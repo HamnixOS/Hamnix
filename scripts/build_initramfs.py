@@ -348,6 +348,18 @@ if os.environ.get("ENABLE_UABI_FILLS_TEST") == "1":
 if os.environ.get("ENABLE_MSYNC_TEST") == "1":
     FILES.append(("/etc/msync-test", b"1\n"))
 
+# Writable-/dev/mouse synthetic-event self-test. scripts/test_devmouse_write.sh
+# sets ENABLE_DEVMOUSE_WRITE_TEST=1 to plant /etc/devmouse-write-test.
+# init/main.ad at boot:37.dmw detects the marker and calls
+# devmouse_write_selftest() (sys/src/9/port/devmouse.ad): it injects a known
+# event via devmouse_write ("5 -3 1\n"), reads it back via devmouse_read,
+# decodes the ASCII line, and asserts dx==5, dy==-3, buttons==1 (plus a
+# malformed-input reject path). Prints "[DEVMOUSE_WRITE] PASS" /
+# "[DEVMOUSE_WRITE] FAIL ...". Default boots omit the marker so the
+# self-test never fires.
+if os.environ.get("ENABLE_DEVMOUSE_WRITE_TEST") == "1":
+    FILES.append(("/etc/devmouse-write-test", b"1\n"))
+
 # SMP kthread-churn soak. scripts/test_smp_soak.sh sets ENABLE_SMP_SOAK=1
 # to plant /etc/smp-soak in the initramfs. init/main.ad at boot:37 detects
 # the marker and calls smp_kthread_soak_run() (kernel/sched/core.ad) which
