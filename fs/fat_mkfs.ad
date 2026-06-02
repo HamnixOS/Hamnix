@@ -1,51 +1,425 @@
 # fs/fat_mkfs.ad
 #
-# Minimal FAT12 formatter — sibling of fs/ext4.ad::ext4_mkfs. The
-# brief calls for a full kernel-side FAT12 writer to mirror the
-# scripts/build_iso.sh mformat invocation byte-for-byte, but the
-# installer (etc/install.hamsh) DOESN'T USE IT: instead the installer
-# copies the running ISO's ESP partition verbatim onto the new disk
-# (raw-sector-copy via /dev/blk/<src> -> /dev/blk/<dst>), which sidesteps
-# every FAT subtlety (LFN, dirent timestamps, sparse-cluster allocation,
-# boot-code preservation, mtools-vs-Linux fsck nits, ...).
+# Real kernel-side FAT12 formatter — sibling of fs/ext4.ad::ext4_mkfs.
+# Writes a fresh, mountable FAT12 volume onto a registered block device
+# (slot identified by /dev/blk/<dev>'s CTL dispatch in
+# sys/src/9/port/devblk.ad). Replaces the earlier ENOSYS stub.
 #
-# This file therefore provides a minimum-functional stub that:
+# What gets written:
 #
-#   1. Reports a working "FAT12 mkfs" path so devblk.ad's CTL
-#      dispatch doesn't fail to import.
+#   sector 0        : boot sector / BPB + extended BPB + 0x55AA sig
+#   reserved..      : nothing else (reserved = 1)
+#   FAT region      : two identical FAT copies, seeded with
+#                       FAT[0] = 0xFF8  (media byte 0xF8 + 0xF nibbles)
+#                       FAT[1] = 0xFFF  (end-of-chain marker)
+#                     packed per FAT12's 12-bit nibble layout; the
+#                     remaining entries are zero (free clusters).
+#   root dir region : zeroed (512 dirents); a single volume-label
+#                     dirent ("HAMNIX     ", attr 0x08) is written first.
 #
-#   2. Returns -1 with a printk explanation so anyone who DID call
-#      `mkfs_fat` (via /dev/blk/<dev>/ctl) gets a deterministic
-#      diagnostic, rather than a silent success that leaves the
-#      target ESP unbootable.
+# FAT12 vs FAT16: decided by cluster count. FAT12 tops out at 4084
+# clusters. The 32 MiB target with 16 KiB clusters yields ~2000
+# clusters, well under the ceiling, so this implements FAT12 ONLY and
+# rejects (with -EINVAL) any geometry that would exceed 4084 clusters.
 #
-# When a full FAT12 writer is needed (e.g. for a clean-install on a
-# disk without an ISO to copy from), the Phase-2 plan in the brief
-# describes the layout — see the constants list below. The bulk of
-# the work is dirent + FAT-allocator code which already exists in
-# fs/fat.ad's write path; the only NEW code would be the BPB +
-# initial FAT[0]/FAT[1] + empty root-directory blast at format time.
-#
-# Geometry constants documented for the future writer:
+# Geometry for the 32 MiB default (mformat `-c 32` shape):
 #
 #   - 32 MiB volume     = 65536 sectors of 512 B
-#   - heads=64, sec/track=32, tracks=2048
-#   - cluster=32 sectors = 16 KiB clusters  (mformat default `-c 32`)
+#   - heads=64, sec/track=32
+#   - cluster=32 sectors = 16 KiB clusters
 #   - reserved=1, FATs=2, root_entries=512 (FAT12 fixed)
-#   - FAT12: each FAT entry is 12 bits packed across nibble pairs
+#   - root_dir_sectors = (512 * 32) / 512 = 32 sectors
+#   - sectors/FAT computed iteratively (see _compute_sectors_per_fat)
+#   - resulting clusters ~2000 -> FAT12.
+
+from kernel.block.blk import (
+    blk_write_sectors, blk_read_sectors, blk_capacity_sectors,
+    find_blockdev, SECTOR_SIZE,
+)
+from kernel.printk.printk import (
+    printk0, printk1, printk2,
+    printk_set_level, PRINTK_LEVEL_EMERG,
+)
+
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
+
+# --- tunable geometry constants (FAT12) --------------------------------
+_FMK_BYTES_PER_SECTOR:  uint64 = 512
+_FMK_SECTORS_PER_CLU:   uint64 = 32          # 16 KiB clusters
+_FMK_RESERVED_SECTORS:  uint64 = 1
+_FMK_NUM_FATS:          uint64 = 2
+_FMK_ROOT_ENTRIES:      uint64 = 512
+_FMK_SECTORS_PER_TRACK: uint64 = 32
+_FMK_NUM_HEADS:         uint64 = 64
+_FMK_MEDIA:             uint64 = 0xF8
+_FMK_FAT12_MAX_CLUSTERS: uint64 = 4084
+
+# A single 512-byte scratch sector. The formatter never recurses, and
+# the kernel never calls it reentrantly, so one global buffer is safe.
+_fmk_sector: Array[512, uint8]
+
+
+# --- little-endian field writers ---------------------------------------
+
+def _fmk_put_u16(p: Ptr[uint8], off: uint64, v: uint64):
+    p[off]     = cast[uint8](v & 0xFF)
+    p[off + 1] = cast[uint8]((v >> 8) & 0xFF)
+
+
+def _fmk_put_u32(p: Ptr[uint8], off: uint64, v: uint64):
+    p[off]     = cast[uint8](v & 0xFF)
+    p[off + 1] = cast[uint8]((v >> 8) & 0xFF)
+    p[off + 2] = cast[uint8]((v >> 16) & 0xFF)
+    p[off + 3] = cast[uint8]((v >> 24) & 0xFF)
+
+
+# --- root-dir-sector count ---------------------------------------------
+
+def _fmk_root_dir_sectors() -> uint64:
+    # ((root_entries * 32) + (bytes/sector - 1)) / bytes/sector
+    return ((_FMK_ROOT_ENTRIES * 32) + (_FMK_BYTES_PER_SECTOR - 1)) \
+           / _FMK_BYTES_PER_SECTOR
+
+
+# --- sectors/FAT iterative solve ---------------------------------------
 #
-#   Computed:
-#     root_dir_sectors = (512 * 32) / 512 = 32 sectors
-#     data_clusters    = (65536 - 1 - 2*N - 32) / 32   (N = sec/FAT)
-#     N (sec/FAT)      = ceil((data_clusters + 2) * 1.5 / 512) bytes
-#                      → ~3 sectors per FAT covers all 2000-ish clusters
-#     FAT12 cluster ceiling: 4084 clusters → fine for 32 MiB.
+# The classic mkdosfs fixpoint: pick sectors/FAT N, derive the number
+# of data clusters that leaves, recompute the FAT size needed to index
+# those clusters (+2 reserved entries) at 1.5 bytes/entry, and iterate
+# until N stops growing. FAT12 = 12 bits = 3 nibbles = 1.5 bytes/entry.
 
-from kernel.printk.printk import printk0
+def _fmk_sectors_per_fat(total_sectors: uint64) -> uint64:
+    rds: uint64 = _fmk_root_dir_sectors()
+    n: uint64 = 1
+    # Bounded fixpoint: N can only grow, and is tiny (a few sectors for
+    # 32 MiB). 64 iterations is far more than enough.
+    iters: uint64 = 0
+    while iters < 64:
+        # System area = reserved + FATs*N + root-dir sectors.
+        sys_sectors: uint64 = _FMK_RESERVED_SECTORS \
+                            + _FMK_NUM_FATS * n + rds
+        if sys_sectors >= total_sectors:
+            return 0
+        data_sectors: uint64 = total_sectors - sys_sectors
+        clusters: uint64 = data_sectors / _FMK_SECTORS_PER_CLU
+        # FAT must hold (clusters + 2) entries * 1.5 bytes, rounded up
+        # to a whole sector.
+        fat_bytes: uint64 = ((clusters + 2) * 3 + 1) / 2     # ceil(*1.5)
+        need: uint64 = (fat_bytes + (_FMK_BYTES_PER_SECTOR - 1)) \
+                     / _FMK_BYTES_PER_SECTOR
+        if need <= n:
+            return n
+        n = need
+        iters = iters + 1
+    return n
 
+
+def _fmk_cluster_count(total_sectors: uint64, spf: uint64) -> uint64:
+    sys_sectors: uint64 = _FMK_RESERVED_SECTORS \
+                        + _FMK_NUM_FATS * spf + _fmk_root_dir_sectors()
+    if sys_sectors >= total_sectors:
+        return 0
+    return (total_sectors - sys_sectors) / _FMK_SECTORS_PER_CLU
+
+
+# --- boot sector / BPB -------------------------------------------------
+
+def _fmk_write_boot_sector(slot: int32, total_sectors: uint64,
+                           spf: uint64) -> int32:
+    p: Ptr[uint8] = &_fmk_sector[0]
+    memset(p, 0, 512)
+
+    # Jump instruction (EB 3C 90) + OEM name "MSWIN4.1".
+    p[0] = 0xEB
+    p[1] = 0x3C
+    p[2] = 0x90
+    p[3]  = 0x4D                       # 'M'
+    p[4]  = 0x53                       # 'S'
+    p[5]  = 0x57                       # 'W'
+    p[6]  = 0x49                       # 'I'
+    p[7]  = 0x4E                       # 'N'
+    p[8]  = 0x34                       # '4'
+    p[9]  = 0x2E                       # '.'
+    p[10] = 0x31                       # '1'
+
+    # --- BPB ---
+    _fmk_put_u16(p, 11, _FMK_BYTES_PER_SECTOR)     # bytes/sector
+    p[13] = cast[uint8](_FMK_SECTORS_PER_CLU)      # sectors/cluster
+    _fmk_put_u16(p, 14, _FMK_RESERVED_SECTORS)     # reserved sectors
+    p[16] = cast[uint8](_FMK_NUM_FATS)             # FAT count
+    _fmk_put_u16(p, 17, _FMK_ROOT_ENTRIES)         # root dir entries
+    # Total sectors: if it fits in 16 bits use the 16-bit field at 19,
+    # else use the 32-bit field at 32 (16-bit field = 0).
+    if total_sectors < 0x10000:
+        _fmk_put_u16(p, 19, total_sectors)
+        _fmk_put_u32(p, 32, 0)
+    else:
+        _fmk_put_u16(p, 19, 0)
+        _fmk_put_u32(p, 32, total_sectors)
+    p[21] = cast[uint8](_FMK_MEDIA)                # media descriptor
+    _fmk_put_u16(p, 22, spf)                        # sectors/FAT (16-bit)
+    _fmk_put_u16(p, 24, _FMK_SECTORS_PER_TRACK)    # sectors/track
+    _fmk_put_u16(p, 26, _FMK_NUM_HEADS)            # heads
+    _fmk_put_u32(p, 28, 0)                          # hidden sectors
+
+    # --- Extended BPB (FAT12/16 layout) ---
+    p[36] = 0x80                       # drive number (0x80 = hard disk)
+    p[37] = 0                          # reserved (NT flags)
+    p[38] = 0x29                       # extended boot signature
+    _fmk_put_u32(p, 39, 0x48414D58)    # volume id (arbitrary; "HAMX" LE-ish)
+
+    # Volume label "HAMNIX     " (11 bytes, space padded), offset 43.
+    _label: Ptr[uint8] = "HAMNIX     "
+    li: uint64 = 0
+    while li < 11:
+        p[43 + li] = _label[li]
+        li = li + 1
+
+    # FS type "FAT12   " (8 bytes, space padded), offset 54.
+    _fstype: Ptr[uint8] = "FAT12   "
+    fi: uint64 = 0
+    while fi < 8:
+        p[54 + fi] = _fstype[fi]
+        fi = fi + 1
+
+    # Boot signature.
+    p[510] = 0x55
+    p[511] = 0xAA
+
+    return blk_write_sectors(slot, 0, 1, p)
+
+
+# --- FAT region --------------------------------------------------------
+
+def _fmk_write_fats(slot: int32, spf: uint64) -> int32:
+    # Seed the first FAT sector: FAT[0] = 0xFF8 (media byte 0xF8 in low
+    # nibbles + 0xF), FAT[1] = 0xFFF (EOC). FAT12 packs two 12-bit
+    # entries per 3 bytes:
+    #   byte0 = E0[7:0]
+    #   byte1 = (E1[3:0] << 4) | E0[11:8]
+    #   byte2 = E1[11:4]
+    # With E0 = 0xFF8, E1 = 0xFFF:
+    #   byte0 = 0xF8
+    #   byte1 = (0xF << 4) | 0xF = 0xFF
+    #   byte2 = 0xFF
+    fat0: uint64 = (cast[uint64](_FMK_MEDIA) & 0xFFF) | 0xF00
+    fat1: uint64 = 0xFFF
+    f: uint64 = 0
+    while f < _FMK_NUM_FATS:
+        fat_lba: uint64 = _FMK_RESERVED_SECTORS + f * spf
+        # First sector carries the two seed entries; rest are zero.
+        s: uint64 = 0
+        while s < spf:
+            p: Ptr[uint8] = &_fmk_sector[0]
+            memset(p, 0, 512)
+            if s == 0:
+                p[0] = cast[uint8](fat0 & 0xFF)
+                p[1] = cast[uint8](((fat1 & 0xF) << 4) | ((fat0 >> 8) & 0xF))
+                p[2] = cast[uint8]((fat1 >> 4) & 0xFF)
+            rc: int32 = blk_write_sectors(slot, fat_lba + s, 1, p)
+            if rc != 0:
+                return rc
+            s = s + 1
+        f = f + 1
+    return 0
+
+
+# --- root directory region ---------------------------------------------
+
+def _fmk_write_root_dir(slot: int32, spf: uint64) -> int32:
+    rds: uint64 = _fmk_root_dir_sectors()
+    root_lba: uint64 = _FMK_RESERVED_SECTORS + _FMK_NUM_FATS * spf
+    s: uint64 = 0
+    while s < rds:
+        p: Ptr[uint8] = &_fmk_sector[0]
+        memset(p, 0, 512)
+        if s == 0:
+            # Volume-label dirent (attr 0x08) as the first entry. Name
+            # field is the 11-byte label, no extension separator.
+            _label: Ptr[uint8] = "HAMNIX     "
+            li: uint64 = 0
+            while li < 11:
+                p[li] = _label[li]
+                li = li + 1
+            p[11] = 0x08               # ATTR_VOLUME_ID
+        rc: int32 = blk_write_sectors(slot, root_lba + s, 1, p)
+        if rc != 0:
+            return rc
+        s = s + 1
+    return 0
+
+
+# --- public entry ------------------------------------------------------
 
 def fat_mkfs(slot: int32, size_mb: uint64) -> int32:
-    # Stub: returns -1 (ENOSYS-shaped). The installer doesn't call
-    # this path — see the file header.
-    printk0("fat_mkfs: not implemented (installer uses raw ESP copy)\n")
-    return -1
+    # Format the block device `slot` as a fresh FAT12 volume. If
+    # size_mb is 0, use the device's full capacity. Returns 0 on
+    # success, negative on error.
+    if slot < 0:
+        printk0("fat_mkfs: invalid slot\n")
+        return -1
+
+    cap_sectors: uint64 = blk_capacity_sectors(slot)
+    if cap_sectors == 0:
+        printk0("fat_mkfs: device has zero capacity\n")
+        return -1
+
+    total_sectors: uint64 = cap_sectors
+    if size_mb != 0:
+        req: uint64 = size_mb * (1024 * 1024 / 512)      # MiB -> sectors
+        if req > cap_sectors:
+            printk2("fat_mkfs: size %d MiB exceeds capacity (%d sectors)\n",
+                    size_mb, cap_sectors)
+            return -1
+        total_sectors = req
+
+    if total_sectors < 64:
+        printk1("fat_mkfs: volume too small (%d sectors)\n", total_sectors)
+        return -22
+
+    spf: uint64 = _fmk_sectors_per_fat(total_sectors)
+    if spf == 0:
+        printk0("fat_mkfs: geometry too small for a FAT\n")
+        return -22
+
+    clusters: uint64 = _fmk_cluster_count(total_sectors, spf)
+    if clusters == 0:
+        printk0("fat_mkfs: no data clusters fit\n")
+        return -22
+    if clusters > _FMK_FAT12_MAX_CLUSTERS:
+        printk2("fat_mkfs: %d clusters exceeds FAT12 ceiling %d (FAT16 not implemented)\n",
+                clusters, _FMK_FAT12_MAX_CLUSTERS)
+        return -22
+
+    printk2("fat_mkfs: total_sectors=%d sectors/FAT=%d\n",
+            total_sectors, spf)
+    printk1("fat_mkfs: data clusters=%d (FAT12)\n", clusters)
+
+    rc: int32 = _fmk_write_boot_sector(slot, total_sectors, spf)
+    if rc != 0:
+        printk0("fat_mkfs: boot-sector write failed\n")
+        return -5
+    rc = _fmk_write_fats(slot, spf)
+    if rc != 0:
+        printk0("fat_mkfs: FAT write failed\n")
+        return -5
+    rc = _fmk_write_root_dir(slot, spf)
+    if rc != 0:
+        printk0("fat_mkfs: root-dir write failed\n")
+        return -5
+
+    printk0("fat_mkfs: FAT12 format complete\n")
+    return 0
+
+
+# --- boot self-test ----------------------------------------------------
+#
+# Formats the AHCI scratch disk registered as "sd0" by the test harness
+# (scripts/test_fat_mkfs.sh attaches a QEMU AHCI disk), then reads the
+# boot sector + first FAT sector back through the generic block layer and
+# verifies the BPB fields and the packed FAT[0]/FAT[1] seed. Prints a
+# single "[FAT_MKFS] PASS" or "[FAT_MKFS] FAIL ..." at EMERG so it reaches
+# serial. Returns 1 on PASS, 0 on FAIL.
+
+_fmk_verify_buf: Array[512, uint8]
+
+
+def _fmk_rd_u16(p: Ptr[uint8], off: uint64) -> uint64:
+    return cast[uint64](p[off]) | (cast[uint64](p[off + 1]) << 8)
+
+
+def fat_mkfs_selftest() -> int32:
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0("[FAT_MKFS] self-test start\n")
+
+    slot: int32 = find_blockdev("sd0")
+    if slot < 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[FAT_MKFS] FAIL: sd0 not registered\n")
+        return 0
+
+    # Format a 32 MiB FAT12 volume (the documented target). The scratch
+    # disk is sized >= 32 MiB by the harness.
+    rc: int32 = fat_mkfs(slot, 32)
+    if rc != 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk1("[FAT_MKFS] FAIL: fat_mkfs returned %d\n", cast[uint64](rc))
+        return 0
+
+    # Read sector 0 back and verify the BPB.
+    vp: Ptr[uint8] = &_fmk_verify_buf[0]
+    memset(vp, 0, 512)
+    if blk_read_sectors(slot, 0, 1, vp) != 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[FAT_MKFS] FAIL: boot-sector readback failed\n")
+        return 0
+
+    if vp[510] != 0x55 or vp[511] != 0xAA:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[FAT_MKFS] FAIL: bad 0x55AA signature\n")
+        return 0
+
+    bps: uint64 = _fmk_rd_u16(vp, 11)
+    if bps != _FMK_BYTES_PER_SECTOR:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk1("[FAT_MKFS] FAIL: bytes/sector=%d\n", bps)
+        return 0
+
+    if cast[uint64](vp[13]) != _FMK_SECTORS_PER_CLU:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk1("[FAT_MKFS] FAIL: sectors/cluster=%d\n", cast[uint64](vp[13]))
+        return 0
+
+    if _fmk_rd_u16(vp, 14) != _FMK_RESERVED_SECTORS:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[FAT_MKFS] FAIL: reserved sectors\n")
+        return 0
+
+    if cast[uint64](vp[16]) != _FMK_NUM_FATS:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[FAT_MKFS] FAIL: FAT count\n")
+        return 0
+
+    if _fmk_rd_u16(vp, 17) != _FMK_ROOT_ENTRIES:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[FAT_MKFS] FAIL: root entries\n")
+        return 0
+
+    if cast[uint64](vp[21]) != _FMK_MEDIA:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[FAT_MKFS] FAIL: media descriptor\n")
+        return 0
+
+    spf: uint64 = _fmk_rd_u16(vp, 22)
+    if spf == 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[FAT_MKFS] FAIL: sectors/FAT is zero\n")
+        return 0
+
+    # FS type string "FAT12   " at offset 54.
+    _fstype: Ptr[uint8] = "FAT12   "
+    fi: uint64 = 0
+    while fi < 8:
+        if vp[54 + fi] != _fstype[fi]:
+            printk_set_level(PRINTK_LEVEL_EMERG)
+            printk0("[FAT_MKFS] FAIL: fs type string\n")
+            return 0
+        fi = fi + 1
+
+    # Read the first FAT sector and verify the packed FAT[0]/FAT[1] seed.
+    memset(vp, 0, 512)
+    if blk_read_sectors(slot, _FMK_RESERVED_SECTORS, 1, vp) != 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[FAT_MKFS] FAIL: FAT readback failed\n")
+        return 0
+    # Expected packed bytes: 0xF8 0xFF 0xFF.
+    if vp[0] != 0xF8 or vp[1] != 0xFF or vp[2] != 0xFF:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk2("[FAT_MKFS] FAIL: FAT seed (%x %x ...)\n",
+                cast[uint64](vp[0]), cast[uint64](vp[1]))
+        return 0
+
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0("[FAT_MKFS] PASS\n")
+    return 1

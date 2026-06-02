@@ -502,6 +502,20 @@ if os.environ.get("ENABLE_AHCI_NCQ_TEST") == "1":
 if os.environ.get("ENABLE_AHCI_BLK_TEST") == "1":
     FILES.append(("/etc/ahci-blk-test", b"1\n"))
 
+# FAT12 mkfs formatter self-test. scripts/test_fat_mkfs.sh sets
+# ENABLE_FAT_MKFS_TEST=1 to plant /etc/fat-mkfs-test. init/main.ad at
+# boot:37.fmk detects the marker and calls fat_mkfs_selftest()
+# (fs/fat_mkfs.ad): it formats the AHCI scratch disk registered as "sd0"
+# with a fresh FAT12 volume via fat_mkfs(slot, 32), then reads the boot
+# sector + first FAT sector back through the generic block layer and
+# verifies the BPB fields (0x55AA signature, bytes/sector, sectors/
+# cluster, FAT count, root entries, media byte, FS-type string) and the
+# packed FAT[0]/FAT[1] seed bytes (0xF8 0xFF 0xFF). Requires the test to
+# attach a QEMU ich9-ahci disk >= 32 MiB. Default boots omit the marker
+# so it never fires.
+if os.environ.get("ENABLE_FAT_MKFS_TEST") == "1":
+    FILES.append(("/etc/fat-mkfs-test", b"1\n"))
+
 # Plan-9 namespace bind/mount/unmount self-test. scripts/test_bind.sh sets
 # ENABLE_BIND_TEST=1 to plant /etc/bind-test plus two source directories
 # of fixture files. init/main.ad at boot:37.bind detects the marker and
