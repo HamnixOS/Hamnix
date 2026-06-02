@@ -861,6 +861,17 @@ if os.environ.get("ENABLE_STARTTIME_TEST") == "1":
 if os.environ.get("ENABLE_PRIONICE_TEST") == "1":
     FILES.append(("/etc/prionice-test", b"1\n"))
 
+# /proc/<pid>/stat child-resource accounting (fields 11/13/16/17) self-test.
+# scripts/test_childacct.sh sets ENABLE_CHILDACCT_TEST=1 to plant
+# /etc/childacct-test. init/main.ad detects the marker and calls
+# childacct_selftest() (devproc.ad): it stamps the boot slot's four child
+# accumulators (cutime/cstime/cminflt/cmajflt) with known sentinels, asserts
+# the accessors read them back, renders _emit_linux_stat for the boot slot,
+# parses fields 11/13/16/17, confirms they match, then emits the
+# [CHILDACCT] PASS banner. Needs no extra device; default boots omit it.
+if os.environ.get("ENABLE_CHILDACCT_TEST") == "1":
+    FILES.append(("/etc/childacct-test", b"1\n"))
+
 # times(2) CPU-time self-test. scripts/test_times.sh sets
 # ENABLE_TIMES_TEST=1 to plant /etc/times-test. init/main.ad at
 # boot:37.times detects the marker and calls times_selftest()
