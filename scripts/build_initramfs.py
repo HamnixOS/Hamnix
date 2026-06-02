@@ -807,6 +807,17 @@ if os.environ.get("ENABLE_CTXSW_TEST") == "1":
 if os.environ.get("ENABLE_BLKIO_TEST") == "1":
     FILES.append(("/etc/blkio-test", b"1\n"))
 
+# Signal-delivery accounting self-test. scripts/test_nsignals.sh sets
+# ENABLE_NSIGNALS_TEST=1 to plant /etc/nsignals-test. init/main.ad at
+# boot:37.nsignals detects the marker and calls nsignals_selftest()
+# (linux_abi/u_syscalls.ad): it charges 5 delivered signals via the same
+# slot-indexed helper signal_post drives at the latch site, asserts the
+# read accessor and getrusage's ru_nsignals (0x78) rose to match, then
+# emits the [NSIGNALS] PASS banner. Needs no extra device; default boots
+# omit the marker.
+if os.environ.get("ENABLE_NSIGNALS_TEST") == "1":
+    FILES.append(("/etc/nsignals-test", b"1\n"))
+
 # times(2) CPU-time self-test. scripts/test_times.sh sets
 # ENABLE_TIMES_TEST=1 to plant /etc/times-test. init/main.ad at
 # boot:37.times detects the marker and calls times_selftest()
