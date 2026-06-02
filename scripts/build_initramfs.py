@@ -763,6 +763,17 @@ if os.environ.get("ENABLE_RUSAGE_TEST") == "1":
 if os.environ.get("ENABLE_PROCSTAT_CPU_TEST") == "1":
     FILES.append(("/etc/procstat-cpu-test", b"1\n"))
 
+# /proc/stat per-IRQ-column self-test. scripts/test_procstat_intr.sh sets
+# ENABLE_PROCSTAT_INTR_TEST=1 to plant /etc/procstat-intr-test. init/main.ad
+# at boot:37.psintr detects the marker and calls procstat_intr_selftest()
+# (sys/src/9/port/devstat.ad): it lets the timer ISR bump the IRQ0 (vector
+# 32) per-vector count, renders /proc/stat into a local buffer, and asserts
+# the first per-IRQ column (right after the total) is the real non-zero
+# timer count, not the old hardcoded 0. Needs no extra device; default
+# boots omit the marker.
+if os.environ.get("ENABLE_PROCSTAT_INTR_TEST") == "1":
+    FILES.append(("/etc/procstat-intr-test", b"1\n"))
+
 # times(2) CPU-time self-test. scripts/test_times.sh sets
 # ENABLE_TIMES_TEST=1 to plant /etc/times-test. init/main.ad at
 # boot:37.times detects the marker and calls times_selftest()
