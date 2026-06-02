@@ -469,6 +469,19 @@ if os.environ.get("ENABLE_EXT4_JOURNAL_TEST") == "1":
 if os.environ.get("ENABLE_EXT4DIR_TEST") == "1":
     FILES.append(("/etc/ext4dir-test", b"1\n"))
 
+# MBR extended/logical-partition (EBR chain) self-test. scripts/
+# test_partebr.sh sets ENABLE_PARTEBR_TEST=1 to plant /etc/partebr-test
+# and attaches a raw "vda" disk carrying an MBR + extended container +
+# a 3-EBR logical chain. init/main.ad at boot:37.ebr detects the marker
+# and calls partition_ebr_selftest() (drivers/block/partition.ad): it
+# re-scans vda and asserts the three LOGICAL partitions enumerate at
+# their exact absolute LBA windows (proving the next-EBR pointer is
+# anchored at the extended-partition base, not the current EBR — the
+# classic offset gotcha). Read-only, opt-in; default boots omit the
+# marker so it never fires.
+if os.environ.get("ENABLE_PARTEBR_TEST") == "1":
+    FILES.append(("/etc/partebr-test", b"1\n"))
+
 # Partition write-smoke fixtures (mkpart MBR on sd0, gpt on nvme0n1).
 # These WRITE a partition table onto a freshly-registered disk that has
 # no MBR, so they must NEVER run on production media. Set

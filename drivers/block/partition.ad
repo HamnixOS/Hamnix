@@ -53,6 +53,7 @@ from kernel.printk.printk import printk0, printk1, printk2, printk_set_level
 from drivers.tty.serial.early_8250 import PRINTK_LEVEL_NOTICE
 from kernel.block.blk import (
     blk_read_sectors, blk_write_sectors, SECTOR_SIZE,
+    blk_capacity_sectors, find_blockdev,
 )
 
 
@@ -128,6 +129,35 @@ MBR_SIG_HI:            uint8  = 0xAA
 
 MBR_TYPE_EMPTY:        uint8  = 0x00
 MBR_TYPE_GPT_PROTECT:  uint8  = 0xEE
+
+# Extended-partition container types. A primary entry of one of these
+# types does NOT describe data directly — its first sector is an EBR
+# (Extended Boot Record) at the head of a singly-linked list of LOGICAL
+# partitions.
+#
+#   0x05  extended, CHS (DOS)
+#   0x0F  extended, LBA  (Windows 95+ / W95 Extended (LBA))
+#   0x85  Linux extended
+#
+# All three are walked identically — the LBA fields in each EBR entry
+# are authoritative regardless of the container's declared type.
+MBR_TYPE_EXT_CHS:      uint8  = 0x05
+MBR_TYPE_EXT_LBA:      uint8  = 0x0F
+MBR_TYPE_EXT_LINUX:    uint8  = 0x85
+
+# Linux numbers logical partitions starting at /dev/sdN5, leaving 1..4
+# for the four MBR primary slots. We mirror that: the first logical
+# partition we record lands at table index 4 (0-based), i.e. the 5th
+# slot, so it surfaces as sd0p5 / vdap5 etc.
+MBR_LOGICAL_FIRST_IDX: uint64 = 4
+
+# Hard cap on EBR-chain iterations. A correct chain on a real disk is
+# bounded by the number of logical partitions; this guards against a
+# cyclic or corrupt next-EBR pointer (an EBR whose entry[1] points back
+# into the chain) wedging the scan in an infinite loop. 64 is far more
+# than any sane MBR layout carries and still leaves room before we run
+# out of the 16-entry per-disk table.
+MBR_EBR_CHAIN_MAX:     uint64 = 64
 
 
 # --- GPT layout constants ------------------------------------------
@@ -387,6 +417,11 @@ def parse_mbr(slot: int32) -> int32:
 
     sptr: Ptr[uint8] = &sec[0]
     found: uint64 = 0
+    # Defer the (at most one) extended container so all four primary
+    # entries are recorded into slots 0..3 first, then logicals fill
+    # 4.. — matching Linux's sdN1..4 primaries, sdN5.. logicals layout.
+    ext_base: uint64 = 0
+    has_ext:  int32  = 0
     i: uint64 = 0
     while i < MBR_PART_ENTRY_COUNT:
         eoff: uint64 = MBR_PART_TABLE_OFFSET + i * MBR_PART_ENTRY_SIZE
@@ -396,24 +431,159 @@ def parse_mbr(slot: int32) -> int32:
             nsec_u32:      uint32 = _part_read_u32_le(sptr, eoff + 12)
             lba_start: uint64 = cast[uint64](lba_start_u32)
             nsec:      uint64 = cast[uint64](nsec_u32)
-            if nsec > 0:
-                lba_end: uint64 = lba_start + nsec - 1
-                # Pack the type byte as a 4-byte ASCII "0xNN" so the
-                # log line `type=0x83` reads naturally. We store it
-                # as a single uint32 LE: byte0='0', byte1='x',
-                # byte2=hex-hi, byte3=hex-lo.
-                hi_n: uint32 = cast[uint32]((ptype >> 4) & 0xF)
-                lo_n: uint32 = cast[uint32](ptype & 0xF)
-                hi_c: uint32 = _hex_nibble(hi_n)
-                lo_c: uint32 = _hex_nibble(lo_n)
-                tag: uint32 = cast[uint32](0x30) \
-                            | (cast[uint32](0x78) << 8) \
-                            | (hi_c << 16) | (lo_c << 24)
-                _record_partition(slot, found, lba_start, lba_end,
-                                  tag, 1)
-                found = found + 1
+            if _mbr_type_is_extended(ptype) != 0:
+                # Container entry. Its start LBA is the BASE of the whole
+                # extended partition — the anchor for every next-EBR
+                # pointer in the chain. We record it (kind=1) so the
+                # `[partition]` log still shows the container, then walk
+                # the EBR list separately. Only the first extended
+                # container found is honoured (DOS never nests two).
+                if nsec > 0 and has_ext == 0:
+                    has_ext  = 1
+                    ext_base = lba_start
+                    lba_end_x: uint64 = lba_start + nsec - 1
+                    tag_x: uint32 = _mbr_type_tag(ptype)
+                    _record_partition(slot, i, lba_start, lba_end_x,
+                                      tag_x, 1)
+            else:
+                if nsec > 0:
+                    lba_end: uint64 = lba_start + nsec - 1
+                    # Pack the type byte as a 4-byte ASCII "0xNN" so the
+                    # log line `type=0x83` reads naturally. We store it
+                    # as a single uint32 LE: byte0='0', byte1='x',
+                    # byte2=hex-hi, byte3=hex-lo.
+                    tag: uint32 = _mbr_type_tag(ptype)
+                    # Primaries always land in their natural slot 0..3
+                    # so logical numbering can start cleanly at index 4.
+                    _record_partition(slot, i, lba_start, lba_end,
+                                      tag, 1)
+                    found = found + 1
         i = i + 1
+    if has_ext != 0:
+        nlog: int32 = _parse_ebr_chain(slot, ext_base)
+        if nlog > 0:
+            found = found + cast[uint64](nlog)
     return cast[int32](found)
+
+
+def _mbr_type_is_extended(ptype: uint8) -> int32:
+    # 1 if `ptype` is one of the three extended-container type bytes.
+    if ptype == MBR_TYPE_EXT_CHS:
+        return 1
+    if ptype == MBR_TYPE_EXT_LBA:
+        return 1
+    if ptype == MBR_TYPE_EXT_LINUX:
+        return 1
+    return 0
+
+
+def _mbr_type_tag(ptype: uint8) -> uint32:
+    # Pack the MBR type byte as the 4-byte ASCII tag "0xNN" stored as a
+    # uint32 LE (byte0='0', byte1='x', byte2=hex-hi, byte3=hex-lo) — the
+    # same encoding parse_mbr used inline before logical partitions
+    # needed the identical packing.
+    hi_n: uint32 = cast[uint32]((ptype >> 4) & 0xF)
+    lo_n: uint32 = cast[uint32](ptype & 0xF)
+    hi_c: uint32 = _hex_nibble(hi_n)
+    lo_c: uint32 = _hex_nibble(lo_n)
+    return cast[uint32](0x30) \
+         | (cast[uint32](0x78) << 8) \
+         | (hi_c << 16) | (lo_c << 24)
+
+
+def _parse_ebr_chain(slot: int32, ext_base: uint64) -> int32:
+    # Walk the EBR singly-linked list rooted at `ext_base` (the start
+    # LBA of the extended-partition container) and record each LOGICAL
+    # partition. Returns the number of logicals recorded, or -1 on a
+    # fatal read error before any were recorded.
+    #
+    # EBR layout (identical 64-byte table at 0x1BE + 0x55AA sig):
+    #   entry[0] : the LOGICAL partition for THIS EBR. Its LBA-start
+    #              field is RELATIVE TO THE CURRENT EBR's own LBA, so
+    #              the logical partition's absolute first sector is
+    #                  cur_ebr_lba + entry0.lba_start
+    #              and entry0.nsec covers the data extent.
+    #   entry[1] : link to the NEXT EBR, if non-empty and an extended
+    #              type. Its LBA-start field is RELATIVE TO ext_base
+    #              (the head of the whole extended partition), NOT to
+    #              the current EBR — this is the classic gotcha. The
+    #              next absolute EBR LBA is therefore
+    #                  ext_base + entry1.lba_start
+    #              We follow it and repeat until entry[1] is empty.
+    cap: uint64 = blk_capacity_sectors(slot)
+    sec: Array[512, uint8]
+    sp: Ptr[uint8] = &sec[0]
+    cur_ebr: uint64 = ext_base
+    log_idx: uint64 = MBR_LOGICAL_FIRST_IDX
+    recorded: int32 = 0
+    iters: uint64 = 0
+    while iters < MBR_EBR_CHAIN_MAX:
+        iters = iters + 1
+        # Never read past the disk.
+        if cap != 0 and cur_ebr >= cap:
+            printk1("[partition] EBR LBA %d past end of disk\n", cur_ebr)
+            return recorded
+        if blk_read_sectors(slot, cur_ebr, 1, &sec[0]) != 0:
+            printk1("[partition] read EBR sector LBA=%d failed\n", cur_ebr)
+            if recorded > 0:
+                return recorded
+            return -1
+        # Validate the boot signature on every EBR sector; a corrupt /
+        # absent signature means the chain is broken — stop.
+        if sp[MBR_SIG_OFFSET] != MBR_SIG_LO \
+                or sp[MBR_SIG_OFFSET + 1] != MBR_SIG_HI:
+            printk1("[partition] EBR LBA=%d bad 0x55AA signature\n", cur_ebr)
+            return recorded
+
+        # --- entry[0]: the logical partition for this EBR ----------
+        e0: uint64 = MBR_PART_TABLE_OFFSET + 0 * MBR_PART_ENTRY_SIZE
+        l0_type: uint8 = sp[e0 + 4]
+        l0_rel:  uint64 = cast[uint64](_part_read_u32_le(sp, e0 + 8))
+        l0_nsec: uint64 = cast[uint64](_part_read_u32_le(sp, e0 + 12))
+        if l0_type != MBR_TYPE_EMPTY and l0_nsec > 0:
+            log_abs: uint64 = cur_ebr + l0_rel
+            log_end: uint64 = log_abs + l0_nsec - 1
+            # Bound: reject zero-length (already excluded) or any extent
+            # that runs off the end of the disk.
+            in_disk: int32 = 1
+            if cap != 0:
+                if log_abs >= cap or log_end >= cap:
+                    in_disk = 0
+            if in_disk != 0:
+                if log_idx < PARTITIONS_PER_DISK:
+                    tag0: uint32 = _mbr_type_tag(l0_type)
+                    _record_partition(slot, log_idx, log_abs, log_end,
+                                      tag0, 1)
+                    log_idx = log_idx + 1
+                    recorded = recorded + 1
+            else:
+                printk1("[partition] logical extent at LBA=%d out of disk\n",
+                        log_abs)
+
+        # --- entry[1]: link to the next EBR ------------------------
+        e1: uint64 = MBR_PART_TABLE_OFFSET + 1 * MBR_PART_ENTRY_SIZE
+        l1_type: uint8 = sp[e1 + 4]
+        l1_rel:  uint64 = cast[uint64](_part_read_u32_le(sp, e1 + 8))
+        l1_nsec: uint64 = cast[uint64](_part_read_u32_le(sp, e1 + 12))
+        # Chain ends when entry[1] is empty (type 0 OR zero-length).
+        if l1_type == MBR_TYPE_EMPTY or l1_nsec == 0:
+            return recorded
+        # A valid next-EBR link must carry an extended type.
+        if _mbr_type_is_extended(l1_type) == 0:
+            printk1("[partition] EBR link type 0x%x not extended; stop\n",
+                    cast[uint64](l1_type))
+            return recorded
+        # next EBR LBA is RELATIVE TO ext_base, not the current EBR.
+        next_ebr: uint64 = ext_base + l1_rel
+        # Cycle guard: a link that doesn't advance (or points backward
+        # into the chain head) would loop forever — the iteration cap is
+        # the backstop, but catch the obvious self-loop early.
+        if next_ebr == cur_ebr:
+            printk1("[partition] EBR self-loop at LBA=%d; stop\n", cur_ebr)
+            return recorded
+        cur_ebr = next_ebr
+    printk0("[partition] EBR chain hit iteration cap; truncating\n")
+    return recorded
 
 
 def _hex_nibble(n: uint32) -> uint32:
@@ -1353,3 +1523,138 @@ def _partition_gpt_smoke_dispatch(slot: int32) -> int32:
 
 
 from tests.test_gpt_mkpart import partition_gpt_mkpart_smoke_test
+
+
+# --- EBR extended/logical-partition self-test ----------------------
+#
+# Proves the EBR chain walker (_parse_ebr_chain, reached from parse_mbr
+# when a primary entry is an extended-container type) enumerates LOGICAL
+# partitions chained across multiple EBRs at the correct ABSOLUTE LBAs.
+#
+# Gated on /etc/partebr-test (planted by scripts/test_partebr.sh). The
+# host attaches a raw disk as "vda" carrying:
+#
+#   MBR @ LBA 0:
+#     primary[0] = extended container (type 0x05),
+#                  start_lba = 2048, big enough to hold the chain.
+#   EBR1 @ LBA 2048 (== ext_base):
+#     entry[0] = logical, rel_start=2048  -> abs 4096,  nsec=2048
+#                                         -> p5 = 4096..6143   (type 0x83)
+#     entry[1] = link, type 0x05, rel(ext_base)=6144 -> EBR2 @ 8192
+#   EBR2 @ LBA 8192:
+#     entry[0] = logical, rel_start=2048  -> abs 10240, nsec=4096
+#                                         -> p6 = 10240..14335 (type 0x83)
+#     entry[1] = link, type 0x05, rel(ext_base)=14336 -> EBR3 @ 16384
+#   EBR3 @ LBA 16384:
+#     entry[0] = logical, rel_start=2048  -> abs 18432, nsec=8192
+#                                         -> p7 = 18432..26623 (type 0x83)
+#     entry[1] = empty -> chain ends.
+#
+# The THREE-EBR chain makes the relative-offset arithmetic load-bearing:
+# the EBR2->EBR3 link's start field (14336) is RELATIVE TO ext_base
+# (2048), NOT to EBR2 (8192). A wrong implementation that anchored the
+# next-EBR pointer at the current EBR would compute EBR3 @ 8192+14336 =
+# 22528 instead of 2048+14336 = 16384, mis-reading p7 (or hitting a
+# non-EBR sector and dropping it). Asserting p7's exact LBA window
+# therefore catches the classic gotcha.
+#
+# Returns 1 on PASS, 0 on FAIL. Prints [part-ebr] lines + exactly one
+# [part-ebr] PASS on success.
+
+PARTEBR_EXPECT_P5_START: uint64 = 4096
+PARTEBR_EXPECT_P5_END:   uint64 = 6143
+PARTEBR_EXPECT_P6_START: uint64 = 10240
+PARTEBR_EXPECT_P6_END:   uint64 = 14335
+PARTEBR_EXPECT_P7_START: uint64 = 18432
+PARTEBR_EXPECT_P7_END:   uint64 = 26623
+
+
+def _partebr_check_one(slot: int32, idx: uint64,
+                       want_start: uint64, want_end: uint64) -> int32:
+    # Verify the partition record at table index `idx` is a live MBR
+    # entry (kind=1) covering exactly [want_start, want_end]. Returns 1
+    # if it matches, 0 otherwise. Prints what it saw either way.
+    p: Ptr[Partition] = partition_for(slot, idx)
+    if cast[uint64](p) == 0:
+        printk1("[part-ebr] idx=%d NULL partition record\n", idx)
+        return 0
+    k: uint32 = p[0].kind
+    if k != 1:
+        printk2("[part-ebr] idx=%d kind=%d (want 1/MBR)\n",
+                idx, cast[uint64](k))
+        return 0
+    gs: uint64 = p[0].lba_start
+    ge: uint64 = p[0].lba_end
+    printk2("[part-ebr] logical idx=%d lba_start=%d", idx, gs)
+    printk1(" lba_end=%d", ge)
+    printk1(" (p%d)\n", idx + 1)
+    if gs != want_start:
+        printk2("[part-ebr] idx=%d lba_start=%d MISMATCH", idx, gs)
+        printk1(" want=%d\n", want_start)
+        return 0
+    if ge != want_end:
+        printk2("[part-ebr] idx=%d lba_end=%d MISMATCH", idx, ge)
+        printk1(" want=%d\n", want_end)
+        return 0
+    return 1
+
+
+def partition_ebr_selftest() -> int32:
+    printk0("[part-ebr] self-test start\n")
+    vda_name: Ptr[char] = "vda"
+    slot: int32 = find_blockdev(vda_name)
+    if slot < 0:
+        printk0("[part-ebr] FAIL: no vda block device attached\n")
+        return 0
+    printk1("[part-ebr] scanning vda (slot=%d)\n", cast[uint64](slot))
+    # Re-scan from scratch so the assertion is against a fresh walk of
+    # the EBR chain (the boot path already scanned vda, but re-scanning
+    # is idempotent and keeps the test independent of boot ordering).
+    # partition_rescan() preserves the "vda" display name (partition_scan
+    # would clobber it to "slot0"), so the [partition] disk=vda log lines
+    # emitted by partition_log carry the recognisable name.
+    nrec: int32 = partition_rescan(slot)
+    if nrec < 0:
+        printk0("[part-ebr] FAIL: partition_rescan returned error\n")
+        return 0
+    printk1("[part-ebr] partition_scan recorded %d entries\n",
+            cast[uint64](nrec))
+
+    # The extended CONTAINER must occupy primary slot 0 (idx 0, kind=1).
+    cp: Ptr[Partition] = partition_for(slot, 0)
+    if cast[uint64](cp) == 0 or cp[0].kind != 1:
+        printk0("[part-ebr] FAIL: extended container not at idx 0\n")
+        return 0
+    printk1("[part-ebr] extended container idx=0 lba_start=%d\n",
+            cp[0].lba_start)
+
+    ok: int32 = 1
+    # Logicals land at table indices 4,5,6 (Linux p5,p6,p7).
+    if _partebr_check_one(slot, 4,
+                          PARTEBR_EXPECT_P5_START,
+                          PARTEBR_EXPECT_P5_END) == 0:
+        ok = 0
+    if _partebr_check_one(slot, 5,
+                          PARTEBR_EXPECT_P6_START,
+                          PARTEBR_EXPECT_P6_END) == 0:
+        ok = 0
+    if _partebr_check_one(slot, 6,
+                          PARTEBR_EXPECT_P7_START,
+                          PARTEBR_EXPECT_P7_END) == 0:
+        ok = 0
+
+    # Guard against phantom logicals beyond the three we planted — a
+    # buggy walker that mis-anchored the next-EBR base could record a
+    # garbage entry at idx 7.
+    extra: Ptr[Partition] = partition_for(slot, 7)
+    if cast[uint64](extra) != 0 and extra[0].kind != 0:
+        printk1("[part-ebr] FAIL: phantom logical at idx 7 lba_start=%d\n",
+                extra[0].lba_start)
+        ok = 0
+
+    if ok == 0:
+        printk0("[part-ebr] FAIL: logical-partition enumeration mismatch\n")
+        return 0
+    printk0("[part-ebr] all three logical partitions at correct LBAs\n")
+    printk0("[part-ebr] PASS\n")
+    return 1
