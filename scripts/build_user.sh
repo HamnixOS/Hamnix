@@ -48,6 +48,7 @@ build_adder_user hamsh                # M16.35: interactive shell
 build_adder_user ps                   # M16.36: dumps /proc snapshots
 build_adder_user echo                 # M16.37: writes argv to stdout
 build_adder_user cat                  # M16.37: streams files to stdout
+build_adder_user aplay                # native HDA: streams a PCM/WAV file to /dev/audio
 build_adder_user dup_demo             # M16.41: exercises sys_dup / sys_dup2
 build_adder_user ls                   # M16.46: directory listing
 build_adder_user pwd                  # M16.47: print working dir

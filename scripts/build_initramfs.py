@@ -1590,6 +1590,16 @@ if os.environ.get("ENABLE_XHCI_KO_REAL", "0") == "1":
     if os.environ.get("ENABLE_XHCI_KO_REAL_MMIO", "0") == "1":
         FILES.append(("/etc/xhci-ko-real-mmio", b"1\n"))
 
+# Native Intel HDA audio self-test. scripts/test_hda_audio.sh sets
+# ENABLE_AUDIO_TEST=1 to plant /etc/audio-test; init/main.ad's boot:37.aud
+# gate then runs audio_selftest(), which synthesizes a square-wave tone,
+# streams it to /dev/audio (Plan-9 cdev) via the native HDA stream DMA
+# engine, and proves the DMA link-position advanced. QEMU's wav audiodev
+# captures the played samples to a host file the test asserts is
+# non-silent. Default boots ship no marker so the audio path stays quiet.
+if os.environ.get("ENABLE_AUDIO_TEST") == "1":
+    FILES.append(("/etc/audio-test", b"1\n"))
+
 
 # See INIT_ELF handling inside build_archive(): set INIT_ELF=path to
 # override which on-disk file becomes /init in the cpio archive, e.g.

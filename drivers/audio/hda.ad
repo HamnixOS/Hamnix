@@ -1,0 +1,698 @@
+# drivers/audio/hda.ad
+#
+# Native Intel HD Audio ("Azalia") controller driver — a REAL PCM
+# playback path, NOT a probe. Intel HDA is a fully standardized spec
+# (the controller MMIO register interface + the codec verb interface are
+# vendor-neutral), so per Hamnix's "native where the hardware is
+# standardized" law this is a from-scratch native driver, not a Linux
+# .ko shim.
+#
+# What this driver actually does (the data path is the point):
+#   1. PCI discovery by class 0x0403 (multimedia / HDA). Works on QEMU's
+#      `intel-hda` (8086:2668) and `ich9-intel-hda` (8086:293e) and any
+#      real Intel/AMD HDA controller, because we match the CLASS, not a
+#      vendor table.
+#   2. Controller bring-up per the HDA spec: GCTL.CRST reset, wait for
+#      out-of-reset, set up CORB (Command Output Ring Buffer) + RIRB
+#      (Response Input Ring Buffer) for codec verbs and enable them.
+#   3. Codec enumeration over CORB/RIRB: STATESTS finds present codecs;
+#      we walk the widget node tree (root -> function group -> widgets)
+#      to find an Audio Output Converter (DAC) and an output Pin Complex,
+#      then power/unmute/connect them.
+#   4. Stream/DMA engine: one output stream descriptor pointed at a
+#      Buffer Descriptor List (BDL) referencing a DMA buffer of PCM
+#      samples; CBL/LVI/FMT programmed, stream tagged, RUN bit set. DMA
+#      from the buffer to the codec produces sound.
+#
+# The HDA controller DMA engine reads PHYSICAL addresses. On Hamnix the
+# low 4 GiB of physical RAM is identity-mapped (1 GiB pages, see
+# arch/x86/boot/header.S), so a kzalloc/alloc_pages address is usable
+# directly as BOTH the kernel pointer and the DMA address — the same
+# trick drivers/virtio/* and the USB drivers use for ring memory.
+#
+# Polled, no interrupts: a polled playback loop is sufficient to prove
+# real sound out (we preload the buffer and let DMA cycle / poll the
+# stream position). MSI is intentionally out of scope.
+#
+# ADDER QUIRKS HONOURED
+#   * No libc, no sizeof: struct layouts are hand-offset constants.
+#   * MMIO goes through _hda_r8/16/32 / _hda_w8/16/32 volatile helpers.
+#   * Leading-underscore top-level names are module-private.
+
+from kernel.printk.printk import printk0, printk1, printk2
+from drivers.pci.pci import (
+    pci_find_by_class, pci_bar_mem_base, pci_enable_mem_and_master,
+    PCI_BDF_NONE,
+)
+from mm.page_alloc import alloc_pages
+
+
+# --- HDA controller MMIO register offsets (HDA spec §3.3) -----------
+HDA_GCAP:        uint64 = 0x00   # u16  Global Capabilities
+HDA_GCTL:        uint64 = 0x08   # u32  Global Control
+HDA_WAKEEN:      uint64 = 0x0C   # u16
+HDA_STATESTS:    uint64 = 0x0E   # u16  State Change Status (codec present bits)
+HDA_INTCTL:      uint64 = 0x20   # u32  Interrupt Control
+HDA_INTSTS:      uint64 = 0x24   # u32  Interrupt Status
+
+HDA_CORBLBASE:   uint64 = 0x40   # u32  CORB base low
+HDA_CORBUBASE:   uint64 = 0x44   # u32  CORB base high
+HDA_CORBWP:      uint64 = 0x48   # u16  CORB write pointer
+HDA_CORBRP:      uint64 = 0x4A   # u16  CORB read pointer
+HDA_CORBCTL:     uint64 = 0x4C   # u8   CORB control
+HDA_CORBSTS:     uint64 = 0x4D   # u8   CORB status
+HDA_CORBSIZE:    uint64 = 0x4E   # u8   CORB size
+
+HDA_RIRBLBASE:   uint64 = 0x50   # u32  RIRB base low
+HDA_RIRBUBASE:   uint64 = 0x54   # u32  RIRB base high
+HDA_RIRBWP:      uint64 = 0x58   # u16  RIRB write pointer
+HDA_RINTCNT:     uint64 = 0x5A   # u16  Response Interrupt Count
+HDA_RIRBCTL:     uint64 = 0x5C   # u8   RIRB control
+HDA_RIRBSTS:     uint64 = 0x5D   # u8   RIRB status
+HDA_RIRBSIZE:    uint64 = 0x5E   # u8   RIRB size
+
+# Stream descriptor 0 base (the first OUTPUT stream sits after the input
+# streams; QEMU's intel-hda exposes input streams then output streams).
+# The Stream Descriptor base register block is at 0x80, each descriptor
+# is 0x20 bytes. We compute the output stream descriptor base from GCAP.
+HDA_SD_BASE:     uint64 = 0x80
+HDA_SD_LEN:      uint64 = 0x20
+
+# Stream descriptor register offsets (relative to a descriptor base):
+HDA_SD_CTL:      uint64 = 0x00   # u24 (3 bytes) stream control
+HDA_SD_STS:      uint64 = 0x03   # u8  stream status
+HDA_SD_LPIB:     uint64 = 0x04   # u32 link position in buffer
+HDA_SD_CBL:      uint64 = 0x08   # u32 cyclic buffer length
+HDA_SD_LVI:      uint64 = 0x0C   # u16 last valid index
+HDA_SD_FIFOS:    uint64 = 0x10   # u16 fifo size
+HDA_SD_FMT:      uint64 = 0x12   # u16 stream format
+HDA_SD_BDPL:     uint64 = 0x18   # u32 BDL pointer low
+HDA_SD_BDPU:     uint64 = 0x1C   # u32 BDL pointer high
+
+# GCTL bits
+HDA_GCTL_CRST:   uint32 = 0x01   # 0 = reset, 1 = run
+
+# CORBCTL / RIRBCTL bits
+HDA_CORBCTL_RUN: uint32 = 0x02   # CORB DMA run (CMEIE is bit0)
+HDA_RIRBCTL_RUN: uint32 = 0x02   # RIRB DMA run (RINTCTL is bit0)
+
+# CORBRP reset bit
+HDA_CORBRP_RST:  uint32 = 0x8000
+# CORBSIZE/RIRBSIZE low 2 bits select size; we use 256 entries (value 2).
+HDA_RINGSIZE_256: uint32 = 0x02
+
+# Stream descriptor CTL bits (low byte / bit positions)
+HDA_SDCTL_SRST:  uint32 = 0x01       # stream reset
+HDA_SDCTL_RUN:   uint32 = 0x02       # stream run
+HDA_SDCTL_IOCE:  uint32 = 0x04       # interrupt on completion enable
+# Stream number is bits 20..23 of the 24-bit CTL register.
+
+# Stream status bits
+HDA_SDSTS_BCIS:  uint32 = 0x04       # buffer completion interrupt status
+HDA_SDSTS_FIFOE: uint32 = 0x08
+HDA_SDSTS_DESE:  uint32 = 0x10
+
+
+# --- HDA codec verb encodings (HDA spec §7) -------------------------
+# A "node command" is: (codec_addr<<28) | (node_id<<20) | verb. Verbs
+# come in two widths: 12-bit verb + 8-bit payload, or 4-bit verb +
+# 16-bit payload.
+HDA_VERB_GET_PARAM:          uint32 = 0xF00   # get parameter (payload = param id)
+HDA_VERB_GET_CONN_LIST:      uint32 = 0xF02
+HDA_VERB_SET_CONN_SELECT:    uint32 = 0x701
+HDA_VERB_SET_POWER_STATE:    uint32 = 0x705
+HDA_VERB_SET_CONV_FMT:       uint32 = 0x200   # 4-bit verb (16-bit payload)
+HDA_VERB_SET_AMP_GAIN_MUTE:  uint32 = 0x300   # 4-bit verb (16-bit payload)
+HDA_VERB_SET_CONV_STREAM_CH: uint32 = 0x706
+HDA_VERB_SET_PIN_WIDGET_CTL: uint32 = 0x707
+HDA_VERB_GET_PIN_WIDGET_CTL: uint32 = 0xF07
+
+# GET_PARAMETER parameter ids
+HDA_PARAM_VENDOR_ID:         uint32 = 0x00
+HDA_PARAM_NODE_COUNT:        uint32 = 0x04   # subordinate node count
+HDA_PARAM_FN_GROUP_TYPE:     uint32 = 0x05
+HDA_PARAM_AUDIO_WIDGET_CAP:  uint32 = 0x09   # widget capabilities
+HDA_PARAM_PIN_CAP:           uint32 = 0x0C
+
+# Widget type (bits 20..23 of AUDIO_WIDGET_CAP)
+HDA_WIDGET_AUDIO_OUT:        uint32 = 0x0     # DAC / output converter
+HDA_WIDGET_PIN:              uint32 = 0x4     # pin complex
+
+# Function group type: audio function group == 0x01
+HDA_FN_GROUP_AUDIO:          uint32 = 0x01
+
+# SET_POWER_STATE payloads
+HDA_POWER_D0:                uint32 = 0x00
+
+# SET_PIN_WIDGET_CONTROL: bit 6 = output enable, bit 7 = HP-amp enable
+HDA_PIN_CTL_OUT_EN:          uint32 = 0x40
+HDA_PIN_CTL_HP_EN:           uint32 = 0x80
+
+# SET_AMP_GAIN_MUTE payload bits:
+#   bit15 = set output amp, bit14 = set input amp,
+#   bit13 = set left, bit12 = set right, bit7 = mute, bits0..6 = gain.
+HDA_AMP_SET_OUTPUT:          uint32 = 0x8000
+HDA_AMP_SET_LEFT:            uint32 = 0x2000
+HDA_AMP_SET_RIGHT:           uint32 = 0x1000
+HDA_AMP_UNMUTE_MAXGAIN:      uint32 = 0x002A   # gain 0x2A, mute bit clear
+
+
+# --- module state ---------------------------------------------------
+hda_mmio:        uint64 = 0          # controller MMIO base (0 = not up)
+hda_corb:        uint64 = 0          # CORB DMA buffer phys/virt
+hda_rirb:        uint64 = 0          # RIRB DMA buffer phys/virt
+hda_corb_wp:     uint32 = 0          # our cached CORB write pointer
+hda_rirb_rp:     uint32 = 0          # our cached RIRB read pointer
+hda_codec_addr:  uint32 = 0          # first present codec address
+hda_dac_nid:     uint32 = 0          # discovered DAC widget node id
+hda_pin_nid:     uint32 = 0          # discovered output pin widget node id
+hda_out_sd:      uint64 = 0          # output stream descriptor base (MMIO)
+hda_stream_tag:  uint32 = 1          # stream tag we use
+hda_initialized: int32  = 0
+
+# Stream DMA: one BDL + one PCM buffer.
+hda_bdl:         uint64 = 0          # BDL DMA buffer (phys/virt)
+hda_pcm_buf:     uint64 = 0          # PCM DMA buffer (phys/virt)
+hda_pcm_cap:     uint64 = 0          # PCM buffer capacity in bytes
+hda_pcm_len:     uint64 = 0          # current valid PCM bytes loaded
+
+# Current playback config (defaults: 48 kHz, 2ch, s16le)
+hda_rate:        uint32 = 48000
+hda_channels:    uint32 = 2
+hda_bits:        uint32 = 16
+
+
+# --- volatile MMIO helpers ------------------------------------------
+
+def _hda_r8(off: uint64) -> uint32:
+    return cast[uint32](cast[Ptr[uint8]](hda_mmio + off)[0])
+
+
+def _hda_w8(off: uint64, v: uint32):
+    cast[Ptr[uint8]](hda_mmio + off)[0] = cast[uint8](v & 0xFF)
+
+
+def _hda_r16(off: uint64) -> uint32:
+    return cast[uint32](cast[Ptr[uint16]](hda_mmio + off)[0])
+
+
+def _hda_w16(off: uint64, v: uint32):
+    cast[Ptr[uint16]](hda_mmio + off)[0] = cast[uint16](v & 0xFFFF)
+
+
+def _hda_r32(off: uint64) -> uint32:
+    return cast[Ptr[uint32]](hda_mmio + off)[0]
+
+
+def _hda_w32(off: uint64, v: uint32):
+    cast[Ptr[uint32]](hda_mmio + off)[0] = v
+
+
+# Stream-descriptor-relative accessors (descriptor base in hda_out_sd).
+def _sd_r8(off: uint64) -> uint32:
+    return cast[uint32](cast[Ptr[uint8]](hda_out_sd + off)[0])
+
+
+def _sd_w8(off: uint64, v: uint32):
+    cast[Ptr[uint8]](hda_out_sd + off)[0] = cast[uint8](v & 0xFF)
+
+
+def _sd_r32(off: uint64) -> uint32:
+    return cast[Ptr[uint32]](hda_out_sd + off)[0]
+
+
+def _sd_w32(off: uint64, v: uint32):
+    cast[Ptr[uint32]](hda_out_sd + off)[0] = v
+
+
+def _sd_w16(off: uint64, v: uint32):
+    cast[Ptr[uint16]](hda_out_sd + off)[0] = cast[uint16](v & 0xFFFF)
+
+
+def _hda_spin(n: uint64):
+    i: uint64 = 0
+    while i < n:
+        # touch a volatile MMIO reg so the loop isn't optimized away.
+        _x: uint32 = _hda_r16(HDA_GCAP)
+        i = i + 1
+
+
+# --- CORB/RIRB codec verb transport ---------------------------------
+#
+# A verb is written into the CORB ring at CORBWP+1; the controller's
+# CORB DMA engine reads it, sends it to the codec, and the response
+# lands in the RIRB ring (two dwords per response: the 32-bit response
+# and a 32-bit response-extended/solicited field). We poll RIRBWP until
+# it advances, then read the response back out.
+
+def _hda_corb_send(verb: uint32):
+    hda_corb_wp = (hda_corb_wp + 1) % 256
+    # CORB entry = one dword per command.
+    cast[Ptr[uint32]](hda_corb + cast[uint64](hda_corb_wp) * 4)[0] = verb
+    _hda_w16(HDA_CORBWP, hda_corb_wp)
+
+
+def _hda_rirb_recv() -> uint32:
+    # Poll RIRBWP until it advances past our cached read pointer, then
+    # read the response dword (the low dword of the 8-byte response slot).
+    spin: uint64 = 0
+    while spin < 1000000:
+        wp: uint32 = _hda_r16(HDA_RIRBWP) & 0xFF
+        if wp != (hda_rirb_rp & 0xFF):
+            hda_rirb_rp = (hda_rirb_rp + 1) % 256
+            resp: uint32 = cast[Ptr[uint32]](
+                hda_rirb + cast[uint64](hda_rirb_rp) * 8)[0]
+            # Clear any latched RIRB status (RINTFL / overrun) so the
+            # controller keeps DMA'ing subsequent responses. Write-1-to-
+            # clear; bits: 0=RINTFL, 2=RIRBOIS.
+            _hda_w8(HDA_RIRBSTS, 0x05)
+            return resp
+        spin = spin + 1
+    # No response within the poll window — return the all-ones sentinel.
+    # Callers treat a 0xFFFFFFFF parameter response as "absent".
+    return 0xFFFFFFFF
+
+
+def _hda_command(codec: uint32, nid: uint32, verb: uint32,
+                 payload: uint32) -> uint32:
+    # Compose and send a codec command, then return the response.
+    # 12-bit verbs carry an 8-bit payload; 4-bit verbs carry 16-bit.
+    cmd: uint32 = 0
+    if verb >= 0x100 and verb <= 0xFFF:
+        cmd = (codec << 28) | (nid << 20) | (verb << 8) | (payload & 0xFF)
+    else:
+        # 4-bit verb (e.g. 0x2xx, 0x3xx) — payload is 16 bits.
+        cmd = (codec << 28) | (nid << 20) | (verb << 16) \
+            | (payload & 0xFFFF)
+    _hda_corb_send(cmd)
+    return _hda_rirb_recv()
+
+
+def _hda_get_param(codec: uint32, nid: uint32, param: uint32) -> uint32:
+    return _hda_command(codec, nid, HDA_VERB_GET_PARAM, param)
+
+
+# --- controller bring-up --------------------------------------------
+
+def _hda_reset_controller() -> int32:
+    # GCTL.CRST low then high; wait for the controller to ack each edge.
+    _hda_w32(HDA_GCTL, 0)
+    spin: uint64 = 0
+    while spin < 100000:
+        if (_hda_r32(HDA_GCTL) & HDA_GCTL_CRST) == 0:
+            spin = 100001
+        else:
+            spin = spin + 1
+    if spin == 100000:
+        return -1
+    _hda_spin(1000)
+    _hda_w32(HDA_GCTL, HDA_GCTL_CRST)
+    spin = 0
+    while spin < 100000:
+        if (_hda_r32(HDA_GCTL) & HDA_GCTL_CRST) != 0:
+            spin = 100001
+        else:
+            spin = spin + 1
+    if spin == 100000:
+        return -1
+    # Spec: wait >=521 us after CRST goes high before STATESTS is valid.
+    _hda_spin(20000)
+    return 0
+
+
+def _hda_setup_corb_rirb() -> int32:
+    # Allocate one 4 KiB page for CORB (256*4 = 1 KiB) and one for RIRB
+    # (256*8 = 2 KiB). alloc_pages returns identity-mapped low memory,
+    # usable directly as the DMA address.
+    hda_corb = alloc_pages(0)
+    hda_rirb = alloc_pages(0)
+    if hda_corb == 0 or hda_rirb == 0:
+        return -1
+    # zero them
+    i: uint64 = 0
+    while i < 4096:
+        cast[Ptr[uint8]](hda_corb + i)[0] = 0
+        cast[Ptr[uint8]](hda_rirb + i)[0] = 0
+        i = i + 1
+
+    # Stop CORB/RIRB DMA before reprogramming.
+    _hda_w8(HDA_CORBCTL, 0)
+    _hda_w8(HDA_RIRBCTL, 0)
+
+    # CORB: program base, size = 256 entries, reset read pointer. Follow
+    # the Linux azx sequence: write CORBWP=0, then pulse CORBRP's RST bit,
+    # then clear it back to 0 and confirm. QEMU's intel-hda self-clears
+    # the RST bit, but we wait for the read-back either way.
+    _hda_w32(HDA_CORBLBASE, cast[uint32](hda_corb & 0xFFFFFFFF))
+    _hda_w32(HDA_CORBUBASE, cast[uint32](hda_corb >> 32))
+    _hda_w8(HDA_CORBSIZE, HDA_RINGSIZE_256)
+    _hda_w16(HDA_CORBWP, 0)
+    # Pulse the CORBRP reset and wait for it to read back set.
+    _hda_w16(HDA_CORBRP, HDA_CORBRP_RST)
+    spin: uint64 = 0
+    while spin < 10000:
+        if (_hda_r16(HDA_CORBRP) & HDA_CORBRP_RST) != 0:
+            spin = 10001
+        else:
+            spin = spin + 1
+    # Clear the reset and wait for CORBRP to read back 0.
+    _hda_w16(HDA_CORBRP, 0)
+    spin = 0
+    while spin < 10000:
+        if (_hda_r16(HDA_CORBRP) & 0xFF) == 0:
+            spin = 10001
+        else:
+            spin = spin + 1
+    hda_corb_wp = 0
+
+    # RIRB: program base, size = 256 entries, reset write pointer.
+    _hda_w32(HDA_RIRBLBASE, cast[uint32](hda_rirb & 0xFFFFFFFF))
+    _hda_w32(HDA_RIRBUBASE, cast[uint32](hda_rirb >> 32))
+    _hda_w8(HDA_RIRBSIZE, HDA_RINGSIZE_256)
+    _hda_w16(HDA_RIRBWP, 0x8000)        # reset RIRB write pointer
+    _hda_spin(1000)
+    # Response interrupt count: 0xFF (max) so the controller never gates
+    # response posting on an unserviced interrupt — we poll RIRBWP.
+    _hda_w16(HDA_RINTCNT, 0xFF)
+    hda_rirb_rp = 0
+
+    # Start CORB + RIRB DMA engines.
+    _hda_w8(HDA_CORBCTL, HDA_CORBCTL_RUN)
+    _hda_w8(HDA_RIRBCTL, HDA_RIRBCTL_RUN)
+    _hda_spin(2000)
+    return 0
+
+
+# --- codec enumeration ----------------------------------------------
+
+def _hda_widget_type(codec: uint32, nid: uint32) -> uint32:
+    cap: uint32 = _hda_get_param(codec, nid, HDA_PARAM_AUDIO_WIDGET_CAP)
+    return (cap >> 20) & 0xF
+
+
+def _hda_find_widgets(codec: uint32) -> int32:
+    # Walk: root (nid 0) -> function group(s) -> widgets. Find the first
+    # audio-output converter (DAC) and the first output pin complex.
+    hda_dac_nid = 0
+    hda_pin_nid = 0
+    root_nc: uint32 = _hda_get_param(codec, 0, HDA_PARAM_NODE_COUNT)
+    fg_start: uint32 = (root_nc >> 16) & 0xFF
+    fg_count: uint32 = root_nc & 0xFF
+    fg: uint32 = 0
+    while fg < fg_count:
+        fg_nid: uint32 = fg_start + fg
+        fgt: uint32 = _hda_get_param(codec, fg_nid,
+                                     HDA_PARAM_FN_GROUP_TYPE) & 0xFF
+        if fgt == HDA_FN_GROUP_AUDIO:
+            # Power the function group up.
+            _hda_command(codec, fg_nid, HDA_VERB_SET_POWER_STATE,
+                         HDA_POWER_D0)
+            wnc: uint32 = _hda_get_param(codec, fg_nid,
+                                         HDA_PARAM_NODE_COUNT)
+            w_start: uint32 = (wnc >> 16) & 0xFF
+            w_count: uint32 = wnc & 0xFF
+            w: uint32 = 0
+            while w < w_count:
+                wnid: uint32 = w_start + w
+                wt: uint32 = _hda_widget_type(codec, wnid)
+                if wt == HDA_WIDGET_AUDIO_OUT and hda_dac_nid == 0:
+                    hda_dac_nid = wnid
+                if wt == HDA_WIDGET_PIN and hda_pin_nid == 0:
+                    # Accept the first pin complex as our output. QEMU's
+                    # hda-output exposes a single line-out pin.
+                    hda_pin_nid = wnid
+                w = w + 1
+        fg = fg + 1
+    if hda_dac_nid == 0 or hda_pin_nid == 0:
+        return -1
+    return 0
+
+
+def _hda_find_codec() -> int32:
+    statests: uint32 = _hda_r16(HDA_STATESTS)
+    if statests == 0:
+        return -1
+    addr: uint32 = 0
+    while addr < 15:
+        if (statests & (cast[uint32](1) << addr)) != 0:
+            hda_codec_addr = addr
+            return 0
+        addr = addr + 1
+    return -1
+
+
+# --- stream format encoding -----------------------------------------
+
+def _hda_fmt_word() -> uint32:
+    # HDA stream format (spec §3.7.1): 16-bit value.
+    #   bit14    : 0 = PCM
+    #   bits11..13 BASE/MULT/DIV for sample rate
+    #   bits4..6 : bits-per-sample (0=8,1=16,2=20,3=24,4=32)
+    #   bits0..3 : channels - 1
+    # 48 kHz: base 48k, mult 1, div 1 -> rate bits all 0.
+    # 44.1 kHz: base bit set (bit14? no — bit14 is 0 for PCM); base/44.1
+    # is encoded by bit at position 14? Per spec, bit 14 selects 44.1 kHz
+    # base; we keep it simple and support 48 kHz (=0) and 44.1 kHz.
+    fmt: uint32 = 0
+    if hda_rate == 44100:
+        fmt = fmt | 0x4000          # 44.1 kHz base
+    # else 48 kHz base (0)
+    bps: uint32 = 1                 # default 16-bit
+    if hda_bits == 8:
+        bps = 0
+    elif hda_bits == 20:
+        bps = 2
+    elif hda_bits == 24:
+        bps = 3
+    elif hda_bits == 32:
+        bps = 4
+    fmt = fmt | (bps << 4)
+    fmt = fmt | ((hda_channels - 1) & 0xF)
+    return fmt
+
+
+# --- output stream setup --------------------------------------------
+
+def _hda_setup_stream() -> int32:
+    # Compute the output stream descriptor base. GCAP encodes the number
+    # of input (ISS) and output (OSS) stream descriptors:
+    #   bits 8..11  = number of input streams
+    #   bits 12..15 = number of output streams
+    # Output descriptors follow input descriptors in the SD register
+    # block at 0x80. QEMU's intel-hda: 4 in + 4 out.
+    gcap: uint32 = _hda_r16(HDA_GCAP)
+    n_in: uint32 = (gcap >> 8) & 0xF
+    # First output stream descriptor index = n_in.
+    out_index: uint32 = n_in
+    hda_out_sd = hda_mmio + HDA_SD_BASE \
+               + cast[uint64](out_index) * HDA_SD_LEN
+
+    # Allocate BDL (must be 128-byte aligned; a 4 KiB page is) and PCM
+    # buffer. One BDL page holds many entries; we use a single entry.
+    hda_bdl = alloc_pages(0)
+    # PCM buffer: 64 KiB (16 pages, order 4) — room for a couple seconds
+    # of a low-rate tone and plenty for the test's preloaded tone.
+    hda_pcm_buf = alloc_pages(6)        # 64 pages = 256 KiB
+    if hda_bdl == 0 or hda_pcm_buf == 0:
+        return -1
+    hda_pcm_cap = 256 * 1024
+
+    # Reset the stream descriptor (SRST) and wait for it to come up.
+    _sd_w8(HDA_SD_CTL, HDA_SDCTL_SRST)
+    _hda_spin(2000)
+    _sd_w8(HDA_SD_CTL, 0)
+    _hda_spin(2000)
+    return 0
+
+
+def _hda_program_bdl(pcm_len: uint64):
+    # One BDL entry: 16 bytes = [u64 addr][u32 length][u32 flags(IOC)].
+    cast[Ptr[uint64]](hda_bdl + 0)[0] = hda_pcm_buf
+    cast[Ptr[uint32]](hda_bdl + 8)[0] = cast[uint32](pcm_len & 0xFFFFFFFF)
+    cast[Ptr[uint32]](hda_bdl + 12)[0] = 0x01       # IOC on this buffer
+
+    # Point the stream descriptor at the BDL.
+    _sd_w32(HDA_SD_BDPL, cast[uint32](hda_bdl & 0xFFFFFFFF))
+    _sd_w32(HDA_SD_BDPU, cast[uint32](hda_bdl >> 32))
+    # Cyclic buffer length = total PCM bytes; last valid index = 0 (one
+    # BDL entry).
+    _sd_w32(HDA_SD_CBL, cast[uint32](pcm_len & 0xFFFFFFFF))
+    _sd_w16(HDA_SD_LVI, 0)
+    # Stream format.
+    _sd_w16(HDA_SD_FMT, _hda_fmt_word())
+
+
+def _hda_connect_codec_path():
+    # Power up + format the DAC, tag it with our stream, unmute it, and
+    # enable the output pin (powered + unmuted + output-enabled).
+    codec: uint32 = hda_codec_addr
+    _hda_command(codec, hda_dac_nid, HDA_VERB_SET_POWER_STATE, HDA_POWER_D0)
+    _hda_command(codec, hda_pin_nid, HDA_VERB_SET_POWER_STATE, HDA_POWER_D0)
+    # DAC stream/channel: stream tag in bits 4..7, channel in bits 0..3.
+    _hda_command(codec, hda_dac_nid, HDA_VERB_SET_CONV_STREAM_CH,
+                 (hda_stream_tag << 4) | 0)
+    # DAC converter format (16-bit value, 4-bit verb 0x2).
+    _hda_command(codec, hda_dac_nid, HDA_VERB_SET_CONV_FMT, _hda_fmt_word())
+    # Unmute DAC output amp (left+right, max gain).
+    _hda_command(codec, hda_dac_nid, HDA_VERB_SET_AMP_GAIN_MUTE,
+                 HDA_AMP_SET_OUTPUT | HDA_AMP_SET_LEFT | HDA_AMP_SET_RIGHT
+                 | HDA_AMP_UNMUTE_MAXGAIN)
+    # Unmute pin output amp too (harmless if the pin has no amp).
+    _hda_command(codec, hda_pin_nid, HDA_VERB_SET_AMP_GAIN_MUTE,
+                 HDA_AMP_SET_OUTPUT | HDA_AMP_SET_LEFT | HDA_AMP_SET_RIGHT
+                 | HDA_AMP_UNMUTE_MAXGAIN)
+    # Enable the pin as an output (+ HP amp).
+    _hda_command(codec, hda_pin_nid, HDA_VERB_SET_PIN_WIDGET_CTL,
+                 HDA_PIN_CTL_OUT_EN | HDA_PIN_CTL_HP_EN)
+
+
+# --- public driver API ----------------------------------------------
+
+def hda_init() -> int32:
+    # Discover an HDA controller by PCI class 0x0403, map its BAR0 MMIO,
+    # reset + bring up CORB/RIRB, find a codec + a DAC/pin path, and
+    # prepare an output stream descriptor. Returns 0 on success.
+    if hda_initialized != 0:
+        return 0
+    bdf: uint32 = pci_find_by_class(0x04, 0x03)
+    if bdf == PCI_BDF_NONE:
+        printk0("[hda] no HDA controller (class 0403) found\n")
+        return -1
+    pci_enable_mem_and_master(bdf)
+    base: uint64 = pci_bar_mem_base(bdf, 0)
+    if base == 0:
+        printk0("[hda] BAR0 not a MEM BAR\n")
+        return -1
+    hda_mmio = base
+    printk1("[hda] controller MMIO @ %x\n", hda_mmio)
+
+    if _hda_reset_controller() != 0:
+        printk0("[hda] controller reset FAILED\n")
+        return -1
+    printk0("[hda] controller out of reset\n")
+
+    if _hda_setup_corb_rirb() != 0:
+        printk0("[hda] CORB/RIRB setup FAILED\n")
+        return -1
+    printk0("[hda] CORB/RIRB up\n")
+
+    if _hda_find_codec() != 0:
+        printk0("[hda] no codec present (STATESTS=0)\n")
+        return -1
+    printk1("[hda] codec at address %d\n", cast[uint64](hda_codec_addr))
+
+    if _hda_find_widgets(hda_codec_addr) != 0:
+        printk0("[hda] no DAC/pin path found\n")
+        return -1
+    printk2("[hda] DAC nid=%d pin nid=%d\n",
+            cast[uint64](hda_dac_nid), cast[uint64](hda_pin_nid))
+
+    if _hda_setup_stream() != 0:
+        printk0("[hda] output stream setup FAILED\n")
+        return -1
+    printk0("[hda] output stream descriptor ready\n")
+
+    hda_initialized = 1
+    printk0("[hda] init OK\n")
+    return 0
+
+
+def hda_is_initialized() -> int32:
+    return hda_initialized
+
+
+def hda_set_rate(rate: uint32):
+    hda_rate = rate
+
+
+def hda_set_channels(ch: uint32):
+    if ch >= 1 and ch <= 8:
+        hda_channels = ch
+
+
+def hda_set_bits(bits: uint32):
+    hda_bits = bits
+
+
+def hda_pcm_capacity() -> uint64:
+    return hda_pcm_cap
+
+
+def hda_stop():
+    # Clear the stream RUN bit.
+    if hda_initialized == 0:
+        return
+    ctl: uint32 = _sd_r8(HDA_SD_CTL)
+    _sd_w8(HDA_SD_CTL, ctl & ~HDA_SDCTL_RUN)
+
+
+# --- the PCM write path ---------------------------------------------
+
+def hda_write_pcm(buf: Ptr[uint8], count: uint64, off: uint64) -> int64:
+    # Copy PCM bytes into the stream DMA buffer at `off` (the file
+    # offset, so a chunked writer composes), bounded by capacity. The
+    # actual start happens on hda_start(); a plain write just stages
+    # bytes. Returns bytes consumed.
+    if hda_initialized == 0:
+        return -1
+    if off >= hda_pcm_cap:
+        return 0
+    take: uint64 = count
+    if off + take > hda_pcm_cap:
+        take = hda_pcm_cap - off
+    i: uint64 = 0
+    while i < take:
+        cast[Ptr[uint8]](hda_pcm_buf + off + i)[0] = buf[i]
+        i = i + 1
+    if off + take > hda_pcm_len:
+        hda_pcm_len = off + take
+    return cast[int64](take)
+
+
+def hda_start() -> int32:
+    # Program the BDL for the currently-staged PCM length, set the stream
+    # number in SD_CTL, and set the RUN bit. DMA cycles the buffer to the
+    # codec, producing sound. Returns 0 on success.
+    if hda_initialized == 0:
+        return -1
+    if hda_pcm_len == 0:
+        return -1
+    # Round the cyclic length down to a frame boundary (channels*bytes).
+    frame: uint64 = cast[uint64](hda_channels) * cast[uint64](hda_bits / 8)
+    pcm_len: uint64 = hda_pcm_len
+    if frame > 0:
+        pcm_len = (pcm_len / frame) * frame
+    if pcm_len == 0:
+        return -1
+
+    _hda_program_bdl(pcm_len)
+    _hda_connect_codec_path()
+
+    # Clear stream status (write-1-to-clear the latched bits).
+    _sd_w8(HDA_SD_STS, HDA_SDSTS_BCIS | HDA_SDSTS_FIFOE | HDA_SDSTS_DESE)
+
+    # Program SD_CTL: stream number in bits 20..23, then set RUN. The
+    # 24-bit CTL register is byte-addressable; the stream tag lives in
+    # the high byte (bits 20..23 -> byte at offset +2 bits 4..7).
+    _sd_w8(HDA_SD_CTL + 2, (hda_stream_tag & 0xF) << 4)
+    ctl: uint32 = _sd_r8(HDA_SD_CTL)
+    _sd_w8(HDA_SD_CTL, ctl | HDA_SDCTL_RUN | HDA_SDCTL_IOCE)
+    return 0
+
+
+def hda_reset_buffer():
+    # Drop the staged PCM so a fresh stream can be loaded from offset 0.
+    hda_pcm_len = 0
+
+
+def hda_link_position() -> uint32:
+    # The controller's link-position-in-buffer counter; advances while
+    # DMA runs. Used to PROVE the DMA engine is actually consuming the
+    # buffer (non-zero == samples are flowing to the codec).
+    if hda_initialized == 0:
+        return 0
+    return _sd_r32(HDA_SD_LPIB)
+
+
+def hda_pcm_loaded() -> uint64:
+    return hda_pcm_len
