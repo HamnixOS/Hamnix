@@ -409,6 +409,19 @@ if os.environ.get("ENABLE_DISKSTATS_TEST") == "1":
 if os.environ.get("ENABLE_NOTEPG_TEST") == "1":
     FILES.append(("/etc/notepg-test", b"ENABLE_NOTEPG_TEST=1\n"))
 
+# Real AHCI Native Command Queuing self-test. scripts/test_ahci_ncq.sh sets
+# ENABLE_AHCI_NCQ_TEST=1 to plant /etc/ahci-ncq-test. init/main.ad at
+# boot:37.ncq detects the marker and calls ahci_ncq_selftest()
+# (drivers/ata/ahci.ad): it allocates a fresh command-list slot per read,
+# submits SEVERAL reads of distinct LBAs back-to-back across INDEPENDENT CI
+# bits without draining between them, watches the CI bits clear to detect
+# which slots finished (recording the peak simultaneous in-flight count),
+# and re-reads each LBA serially to verify the concurrently-fetched buffers
+# hold the right sectors. Requires the test to attach a QEMU ich9-ahci disk.
+# Default boots omit the marker so it never fires.
+if os.environ.get("ENABLE_AHCI_NCQ_TEST") == "1":
+    FILES.append(("/etc/ahci-ncq-test", b"ENABLE_AHCI_NCQ_TEST=1\n"))
+
 # Plan-9 namespace bind/mount/unmount self-test. scripts/test_bind.sh sets
 # ENABLE_BIND_TEST=1 to plant /etc/bind-test plus two source directories
 # of fixture files. init/main.ad at boot:37.bind detects the marker and
