@@ -1729,6 +1729,20 @@ if os.environ.get("ENABLE_XHCI_KO_REAL", "0") == "1":
 if os.environ.get("ENABLE_AUDIO_TEST") == "1":
     FILES.append(("/etc/audio-test", b"1\n"))
 
+# Native device-mapper self-test. scripts/test_devmapper.sh sets
+# ENABLE_DEVMAPPER_TEST=1 to plant /etc/devmapper-test; init/main.ad's
+# boot:37.dm gate then runs dm_selftest() (drivers/block/dm.ad), which
+# registers a dedicated in-kernel backing ramdisk and proves the LINEAR
+# target remaps virtual writes to the correct underlying sector, two
+# CONCATENATED linear targets route each span to its own backing region,
+# and the CRYPT (dm-crypt / ChaCha20) target writes real ciphertext
+# (sector-keyed IV -> identical plaintext at two sectors yields different
+# ciphertext) that round-trips back to plaintext on read. Prints
+# "[device-mapper] PASS" / "[device-mapper] FAIL". Default boots ship no
+# marker so the device-mapper self-test is a no-op everywhere else.
+if os.environ.get("ENABLE_DEVMAPPER_TEST") == "1":
+    FILES.append(("/etc/devmapper-test", b"1\n"))
+
 
 # See INIT_ELF handling inside build_archive(): set INIT_ELF=path to
 # override which on-disk file becomes /init in the cpio archive, e.g.

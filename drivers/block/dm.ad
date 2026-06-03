@@ -1,0 +1,841 @@
+# drivers/block/dm.ad
+#
+# Native device-mapper — Hamnix's equivalent of Linux's
+# drivers/md/dm.c + the dm-linear / dm-crypt targets. A genuine
+# Linux-parity gap: there was NO device-mapper in the tree before this.
+#
+# A device-mapper "mapped device" is a VIRTUAL block device whose
+# address space is described by a TABLE of one or more TARGETS. Each
+# target owns a contiguous [start_sector, length) span of the virtual
+# device and translates every I/O that lands in its span to an
+# underlying real block device at a target-specific offset. The block
+# layer (kernel/block/blk.ad) sees the mapped device as an ordinary
+# registered BlockDevice — filesystems can mount and read/write through
+# it exactly like a partition or a loop device.
+#
+# Linux mapping:
+#
+#   struct mapped_device          -> MappedDevice (this file)
+#   struct dm_table / dm_target   -> DmTarget[] inside MappedDevice
+#   dm-linear (drivers/md/dm-linear.c)  -> DM_TARGET_LINEAR
+#   dm-crypt  (drivers/md/dm-crypt.c)    -> DM_TARGET_CRYPT
+#   dmsetup create --table "..."  -> dm_create_linear / dm_create_concat
+#                                    / dm_create_crypt (this file)
+#   bio remap (map_bio)           -> _dm_read_blkop / _dm_write_blkop
+#
+# TARGETS:
+#
+#   LINEAR — maps a span of the virtual device onto an underlying block
+#   device at a fixed sector offset. This is the foundation of LVM:
+#   concatenating several linear targets, each pointing at a different
+#   underlying device (or a different region of one), builds a single
+#   large virtual device out of smaller physical extents.
+#
+#   CRYPT (dm-crypt) — like linear (it forwards to an underlying device
+#   at an offset) but encrypts every sector on the way out and decrypts
+#   on the way in, so the bytes resting on the backing store are
+#   ciphertext while reads through the mapped device return plaintext.
+#   The cipher is ChaCha20 (RFC 8439, 256-bit key) implemented in full
+#   below — NOT a toy XOR. WHY ChaCha20: the rest of the tree already
+#   ships proven ChaCha20 implementations (drivers/net/tls.ad's kernel
+#   TLS path; lib/ssh/sshcrypto.ad for the CPL-3 SSH server), but those
+#   are module-private `_tls_*` / user-space `ssh_*` helpers — tls.ad
+#   would drag the whole network stack into the block layer's import
+#   closure, and sshcrypto.ad is a CPL-3 user file. Re-namespacing the
+#   same standard algorithm here (the codebase's established pattern —
+#   see the duplication note in lib/ssh/sshcrypto.ad) keeps the block
+#   layer's dependencies minimal while still using a real, correct,
+#   well-understood stream cipher. The per-sector IV is dm-crypt's
+#   "plain64": the 64-bit sector number is the ChaCha block-counter /
+#   nonce seed, so the SAME plaintext at two DIFFERENT sectors encrypts
+#   to DIFFERENT ciphertext.
+
+from kernel.block.blk import (
+    BlockDeviceOps, register_blockdev, blk_unregister_by_name,
+    blk_read_sectors, blk_write_sectors, find_blockdev,
+    blk_capacity_sectors, SECTOR_SIZE,
+)
+from kernel.printk.printk import (
+    printk0, printk1, printk2, printk_set_level,
+)
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
+
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+
+
+# =========================================================================
+# ChaCha20 (RFC 8439) — self-contained 256-bit-key stream cipher
+# =========================================================================
+#
+# The block function and its working state live in module-scope .bss
+# scratch (we can't recurse and big buffers must be module-scope per the
+# Adder array quirk). dm-crypt I/O is serialised through the synchronous
+# block layer, so a single shared scratch state is safe.
+
+_dm_chacha_state:     Array[16, uint32]
+_dm_chacha_block_out: Array[64, uint8]
+
+
+def _dm_rotl32(v: uint32, n: uint64) -> uint32:
+    x:  uint64 = cast[uint64](v) & 0xFFFFFFFF
+    lo: uint64 = (x << n) & 0xFFFFFFFF
+    hi: uint64 = x >> (32 - n)
+    return cast[uint32](lo | hi)
+
+
+def _dm_le_load32(buf: Ptr[uint8], off: uint64) -> uint32:
+    b0: uint32 = cast[uint32](buf[off + 0])
+    b1: uint32 = cast[uint32](buf[off + 1])
+    b2: uint32 = cast[uint32](buf[off + 2])
+    b3: uint32 = cast[uint32](buf[off + 3])
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+
+
+def _dm_le_store32(buf: Ptr[uint8], off: uint64, v: uint32):
+    buf[off + 0] = cast[uint8](v & 0xFF)
+    buf[off + 1] = cast[uint8]((v >> 8) & 0xFF)
+    buf[off + 2] = cast[uint8]((v >> 16) & 0xFF)
+    buf[off + 3] = cast[uint8]((v >> 24) & 0xFF)
+
+
+def _dm_chacha_qr(a_idx: uint64, b_idx: uint64,
+                  c_idx: uint64, d_idx: uint64):
+    a: uint64 = cast[uint64](_dm_chacha_state[a_idx]) & 0xFFFFFFFF
+    b: uint64 = cast[uint64](_dm_chacha_state[b_idx]) & 0xFFFFFFFF
+    c: uint64 = cast[uint64](_dm_chacha_state[c_idx]) & 0xFFFFFFFF
+    d: uint64 = cast[uint64](_dm_chacha_state[d_idx]) & 0xFFFFFFFF
+
+    a = (a + b) & 0xFFFFFFFF
+    d = d ^ a
+    d = cast[uint64](_dm_rotl32(cast[uint32](d), 16))
+
+    c = (c + d) & 0xFFFFFFFF
+    b = b ^ c
+    b = cast[uint64](_dm_rotl32(cast[uint32](b), 12))
+
+    a = (a + b) & 0xFFFFFFFF
+    d = d ^ a
+    d = cast[uint64](_dm_rotl32(cast[uint32](d), 8))
+
+    c = (c + d) & 0xFFFFFFFF
+    b = b ^ c
+    b = cast[uint64](_dm_rotl32(cast[uint32](b), 7))
+
+    _dm_chacha_state[a_idx] = cast[uint32](a)
+    _dm_chacha_state[b_idx] = cast[uint32](b)
+    _dm_chacha_state[c_idx] = cast[uint32](c)
+    _dm_chacha_state[d_idx] = cast[uint32](d)
+
+
+def _dm_chacha_block(key: Ptr[uint8], counter: uint32, nonce: Ptr[uint8]):
+    # ChaCha20 block, RFC 8439 §2.3: state[12] = 32-bit block counter,
+    # state[13..15] = 96-bit nonce. `key` is 32 bytes, `nonce` is 12
+    # bytes. Produces 64 keystream bytes into _dm_chacha_block_out.
+    _dm_chacha_state[0] = 0x61707865
+    _dm_chacha_state[1] = 0x3320646E
+    _dm_chacha_state[2] = 0x79622D32
+    _dm_chacha_state[3] = 0x6B206574
+    _dm_chacha_state[4]  = _dm_le_load32(key, 0)
+    _dm_chacha_state[5]  = _dm_le_load32(key, 4)
+    _dm_chacha_state[6]  = _dm_le_load32(key, 8)
+    _dm_chacha_state[7]  = _dm_le_load32(key, 12)
+    _dm_chacha_state[8]  = _dm_le_load32(key, 16)
+    _dm_chacha_state[9]  = _dm_le_load32(key, 20)
+    _dm_chacha_state[10] = _dm_le_load32(key, 24)
+    _dm_chacha_state[11] = _dm_le_load32(key, 28)
+    _dm_chacha_state[12] = counter
+    _dm_chacha_state[13] = _dm_le_load32(nonce, 0)
+    _dm_chacha_state[14] = _dm_le_load32(nonce, 4)
+    _dm_chacha_state[15] = _dm_le_load32(nonce, 8)
+
+    orig: Array[16, uint32]
+    i: uint64 = 0
+    while i < 16:
+        orig[i] = _dm_chacha_state[i]
+        i = i + 1
+
+    r: uint64 = 0
+    while r < 10:
+        _dm_chacha_qr(0, 4, 8, 12)
+        _dm_chacha_qr(1, 5, 9, 13)
+        _dm_chacha_qr(2, 6, 10, 14)
+        _dm_chacha_qr(3, 7, 11, 15)
+        _dm_chacha_qr(0, 5, 10, 15)
+        _dm_chacha_qr(1, 6, 11, 12)
+        _dm_chacha_qr(2, 7, 8, 13)
+        _dm_chacha_qr(3, 4, 9, 14)
+        r = r + 1
+
+    i = 0
+    while i < 16:
+        sum_w: uint64 = ((cast[uint64](_dm_chacha_state[i]) & 0xFFFFFFFF)
+                         + (cast[uint64](orig[i]) & 0xFFFFFFFF)) & 0xFFFFFFFF
+        _dm_le_store32(cast[Ptr[uint8]](&_dm_chacha_block_out[0]),
+                       i * 4, cast[uint32](sum_w))
+        i = i + 1
+
+
+def _dm_chacha20_xor(key: Ptr[uint8], counter_start: uint32,
+                     nonce: Ptr[uint8],
+                     dst: Ptr[uint8], src: Ptr[uint8], n: uint64):
+    # XOR-encrypt n bytes from src into dst, starting at block counter
+    # `counter_start`. RFC 8439 §2.4. Encrypt and decrypt are the same
+    # operation (the keystream is added/removed by XOR), so dm-crypt's
+    # read and write paths both call this.
+    block_ptr: Ptr[uint8] = cast[Ptr[uint8]](&_dm_chacha_block_out[0])
+    pos:     uint64 = 0
+    counter: uint32 = counter_start
+    while pos < n:
+        _dm_chacha_block(key, counter, nonce)
+        chunk: uint64 = 64
+        if n - pos < chunk:
+            chunk = n - pos
+        j: uint64 = 0
+        while j < chunk:
+            dst[pos + j] = src[pos + j] ^ block_ptr[j]
+            j = j + 1
+        pos = pos + chunk
+        counter = counter + 1
+
+
+# =========================================================================
+# Device-mapper core
+# =========================================================================
+
+DM_TARGET_NONE:   uint32 = 0
+DM_TARGET_LINEAR: uint32 = 1
+DM_TARGET_CRYPT:  uint32 = 2
+
+DM_KEY_LEN:      uint64 = 32       # ChaCha20 256-bit key
+DM_MAX_TARGETS:  uint64 = 8        # targets per mapped device
+DM_MAX_DEVICES:  uint64 = 8        # mapped devices system-wide
+DM_NAME_LEN:     uint64 = 16
+
+
+class DmTarget:
+    # One row of a mapped device's table. The virtual span this target
+    # covers is [start_sector, start_sector + length). On an I/O whose
+    # virtual LBA falls in that span, the offset within the target is
+    # (vlba - start_sector); the underlying LBA is
+    # (under_start + offset_in_target). `ttype` selects linear vs crypt.
+    ttype:        uint32
+    pad:          uint32
+    start_sector: uint64           # first virtual sector this target owns
+    length:       uint64           # number of sectors in the span
+    under_slot:   int32            # underlying block-device slot
+    pad2:         uint32
+    under_start:  uint64           # base LBA on the underlying device
+
+
+class MappedDevice:
+    # A virtual block device described by a table of targets. Registered
+    # with the block layer under `name` so the rest of the kernel reads
+    # and writes through it transparently.
+    used:        uint32
+    n_targets:   uint32
+    capacity:    uint64            # total virtual sectors (sum of spans)
+    self_slot:   int32             # this mapped device's own block slot
+    pad:         uint32
+    targets:     Array[8, DmTarget]
+    key:         Array[32, uint8]  # ChaCha20 key (crypt targets only)
+
+
+dm_devices: Array[8, MappedDevice]
+dm_ops:     BlockDeviceOps
+dm_inited:  uint32 = 0
+
+# One-sector ciphertext staging buffer for the crypt path. dm-crypt I/O
+# is serialised through the synchronous block layer, so a single shared
+# module-scope sector buffer is safe (no two crypt transfers overlap).
+_dm_crypt_sector: Array[512, uint8]
+# 12-byte ChaCha20 nonce derived per sector ("plain64" IV: the low 64
+# bits hold the sector number little-endian, the top 32 bits are zero).
+_dm_crypt_nonce:  Array[12, uint8]
+
+
+def dm_init():
+    # Wire the shared vtable once; the device table starts all-free. No
+    # mapped device exists until a dm_create_* call (or a /dev/mapper/ctl
+    # write) builds one — matching Linux where dm has no devices until
+    # dmsetup creates them.
+    if dm_inited != 0:
+        return
+    dm_ops.read_sectors  = _dm_read_blkop
+    dm_ops.write_sectors = _dm_write_blkop
+    dm_ops.flush         = cast[Fn[int32, uint64]](0)
+    i: uint64 = 0
+    while i < DM_MAX_DEVICES:
+        dm_devices[i].used      = 0
+        dm_devices[i].n_targets = 0
+        dm_devices[i].capacity  = 0
+        dm_devices[i].self_slot = -1
+        i = i + 1
+    dm_inited = 1
+    printk0("dm: device-mapper ready (linear + crypt targets)\n")
+
+
+def _dm_find_target(dev: Ptr[MappedDevice], vlba: uint64) -> int32:
+    # Return the index of the target whose span contains virtual LBA
+    # `vlba`, or -1 if none does. Targets are stored in ascending span
+    # order by construction, but a linear scan is fine for <= 8 rows.
+    n: uint32 = dev[0].n_targets
+    i: uint64 = 0
+    while i < cast[uint64](n):
+        st:  uint64 = dev[0].targets[i].start_sector
+        ln:  uint64 = dev[0].targets[i].length
+        if vlba >= st and vlba < st + ln:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _dm_set_plain64_nonce(sector: uint64):
+    # dm-crypt "plain64" IV: the 64-bit sector number little-endian in
+    # the low 8 bytes of the 12-byte ChaCha nonce, high 4 bytes zero.
+    # This makes the keystream sector-dependent, so identical plaintext
+    # at two sectors yields different ciphertext.
+    i: uint64 = 0
+    while i < 8:
+        _dm_crypt_nonce[i] = cast[uint8]((sector >> (i * 8)) & 0xFF)
+        i = i + 1
+    _dm_crypt_nonce[8]  = 0
+    _dm_crypt_nonce[9]  = 0
+    _dm_crypt_nonce[10] = 0
+    _dm_crypt_nonce[11] = 0
+
+
+def _dm_linear_io(t: Ptr[DmTarget], is_write: int32, off_in_t: uint64,
+                  count: uint64, buf: Ptr[uint8]) -> int32:
+    # Linear remap: forward the whole [under_start + off_in_t, +count)
+    # span straight to the underlying device. Plaintext passthrough.
+    ulba: uint64 = t[0].under_start + off_in_t
+    if is_write != 0:
+        return blk_write_sectors(t[0].under_slot, ulba, count, buf)
+    return blk_read_sectors(t[0].under_slot, ulba, count, buf)
+
+
+def _dm_crypt_io(dev: Ptr[MappedDevice], t: Ptr[DmTarget],
+                 is_write: int32, off_in_t: uint64, vlba: uint64,
+                 count: uint64, buf: Ptr[uint8]) -> int32:
+    # Crypt remap: process one sector at a time so each gets its own
+    # sector-derived IV. On write, encrypt the plaintext sector from
+    # `buf` into the staging buffer and write the CIPHERTEXT to the
+    # backing device. On read, fetch the ciphertext from the backing
+    # device into staging and decrypt into the caller's `buf`. The IV is
+    # keyed on the VIRTUAL sector number (vlba) so the same plaintext at
+    # different mapped sectors produces different ciphertext.
+    keyp:   Ptr[uint8] = cast[Ptr[uint8]](&dev[0].key[0])
+    stagep: Ptr[uint8] = cast[Ptr[uint8]](&_dm_crypt_sector[0])
+    s: uint64 = 0
+    while s < count:
+        ulba: uint64 = t[0].under_start + off_in_t + s
+        vsec: uint64 = vlba + s
+        cur:  Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](buf) + s * SECTOR_SIZE)
+        _dm_set_plain64_nonce(vsec)
+        noncep: Ptr[uint8] = cast[Ptr[uint8]](&_dm_crypt_nonce[0])
+        if is_write != 0:
+            # plaintext (cur) -> ciphertext (staging) -> backing store
+            _dm_chacha20_xor(keyp, 0, noncep, stagep, cur, SECTOR_SIZE)
+            rc: int32 = blk_write_sectors(t[0].under_slot, ulba, 1, stagep)
+            if rc != 0:
+                return rc
+        else:
+            # backing store -> ciphertext (staging) -> plaintext (cur)
+            rc2: int32 = blk_read_sectors(t[0].under_slot, ulba, 1, stagep)
+            if rc2 != 0:
+                return rc2
+            _dm_chacha20_xor(keyp, 0, noncep, cur, stagep, SECTOR_SIZE)
+        s = s + 1
+    return 0
+
+
+def _dm_io(dev: Ptr[MappedDevice], is_write: int32, vlba: uint64,
+           count: uint64, buf: Ptr[uint8]) -> int32:
+    # Core remap. Walk the request sector-span, splitting it at target
+    # boundaries (a single request may straddle two concatenated linear
+    # targets), and dispatch each sub-span to its target's handler.
+    if count == 0:
+        return 0
+    done: uint64 = 0
+    while done < count:
+        cur_v: uint64 = vlba + done
+        ti: int32 = _dm_find_target(dev, cur_v)
+        if ti < 0:
+            printk1("dm: I/O outside any target (vlba=%d)\n", cur_v)
+            return -1
+        t: Ptr[DmTarget] = &dev[0].targets[cast[uint64](ti)]
+        st:  uint64 = t[0].start_sector
+        ln:  uint64 = t[0].length
+        off_in_t: uint64 = cur_v - st
+        # How many sectors remain in THIS target's span from cur_v on.
+        avail: uint64 = ln - off_in_t
+        chunk: uint64 = count - done
+        if chunk > avail:
+            chunk = avail
+        bufp: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](buf) + done * SECTOR_SIZE)
+        rc: int32 = 0
+        if t[0].ttype == DM_TARGET_CRYPT:
+            rc = _dm_crypt_io(dev, t, is_write, off_in_t, cur_v,
+                              chunk, bufp)
+        else:
+            rc = _dm_linear_io(t, is_write, off_in_t, chunk, bufp)
+        if rc != 0:
+            return rc
+        done = done + chunk
+    return 0
+
+
+def _dm_read_blkop(priv: uint64, lba: uint64, count: uint64,
+                   buf: Ptr[uint8]) -> int32:
+    dev: Ptr[MappedDevice] = cast[Ptr[MappedDevice]](priv)
+    if dev[0].used == 0:
+        return -1
+    return _dm_io(dev, 0, lba, count, buf)
+
+
+def _dm_write_blkop(priv: uint64, lba: uint64, count: uint64,
+                    buf: Ptr[uint8]) -> int32:
+    dev: Ptr[MappedDevice] = cast[Ptr[MappedDevice]](priv)
+    if dev[0].used == 0:
+        return -1
+    return _dm_io(dev, 1, lba, count, buf)
+
+
+def _dm_alloc_device() -> int32:
+    # Claim a free MappedDevice slot, or -1 if the table is full.
+    i: uint64 = 0
+    while i < DM_MAX_DEVICES:
+        if dm_devices[i].used == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _dm_register(idx: uint64, name: Ptr[char]) -> int32:
+    # Register the (already-populated) mapped device at table index `idx`
+    # with the block layer. Returns 0 on success, -1 on failure.
+    cap: uint64 = dm_devices[idx].capacity
+    priv: uint64 = cast[uint64](&dm_devices[idx])
+    slot: int32 = register_blockdev(name, cap, &dm_ops, priv)
+    if slot < 0:
+        printk0("dm: block-device registration failed\n")
+        return -1
+    dm_devices[idx].self_slot = slot
+    dm_devices[idx].used      = 1
+    return 0
+
+
+# =========================================================================
+# dmsetup-shape control surface (public API)
+# =========================================================================
+
+def dm_create_linear(name: Ptr[char], under_slot: int32,
+                     under_start: uint64, length: uint64) -> int32:
+    # Create a mapped device with a SINGLE linear target covering the
+    # whole virtual device [0, length): virtual sector v maps to
+    # underlying sector (under_start + v) on `under_slot`. This is the
+    # `dmsetup create NAME --table "0 LENGTH linear DEV START"` shape.
+    # Returns the registered block slot (>= 0) or a negative error.
+    dm_init()
+    if length == 0:
+        return -1
+    if under_slot < 0:
+        return -2
+    # Underlying device must actually hold the mapped span.
+    ucap: uint64 = blk_capacity_sectors(under_slot)
+    if under_start + length > ucap:
+        printk0("dm: linear target exceeds underlying capacity\n")
+        return -3
+    idx_s: int32 = _dm_alloc_device()
+    if idx_s < 0:
+        printk0("dm: device table full\n")
+        return -4
+    idx: uint64 = cast[uint64](idx_s)
+    dm_devices[idx].n_targets             = 1
+    dm_devices[idx].capacity              = length
+    dm_devices[idx].targets[0].ttype        = DM_TARGET_LINEAR
+    dm_devices[idx].targets[0].start_sector = 0
+    dm_devices[idx].targets[0].length       = length
+    dm_devices[idx].targets[0].under_slot   = under_slot
+    dm_devices[idx].targets[0].under_start  = under_start
+    if _dm_register(idx, name) != 0:
+        dm_devices[idx].used = 0
+        return -5
+    return dm_devices[idx].self_slot
+
+
+def dm_create_concat(name: Ptr[char],
+                     slot_a: int32, start_a: uint64, len_a: uint64,
+                     slot_b: int32, start_b: uint64, len_b: uint64) -> int32:
+    # Create a mapped device from TWO concatenated linear targets — the
+    # canonical LVM "join two physical extents into one logical volume"
+    # case. Virtual [0, len_a) maps onto (slot_a, start_a..); virtual
+    # [len_a, len_a+len_b) maps onto (slot_b, start_b..). The block layer
+    # sees one device of (len_a + len_b) sectors. Returns the registered
+    # block slot or a negative error.
+    dm_init()
+    if len_a == 0 or len_b == 0:
+        return -1
+    if slot_a < 0 or slot_b < 0:
+        return -2
+    if start_a + len_a > blk_capacity_sectors(slot_a):
+        printk0("dm: concat target A exceeds underlying capacity\n")
+        return -3
+    if start_b + len_b > blk_capacity_sectors(slot_b):
+        printk0("dm: concat target B exceeds underlying capacity\n")
+        return -3
+    idx_s: int32 = _dm_alloc_device()
+    if idx_s < 0:
+        printk0("dm: device table full\n")
+        return -4
+    idx: uint64 = cast[uint64](idx_s)
+    dm_devices[idx].n_targets = 2
+    dm_devices[idx].capacity  = len_a + len_b
+    dm_devices[idx].targets[0].ttype        = DM_TARGET_LINEAR
+    dm_devices[idx].targets[0].start_sector = 0
+    dm_devices[idx].targets[0].length       = len_a
+    dm_devices[idx].targets[0].under_slot   = slot_a
+    dm_devices[idx].targets[0].under_start  = start_a
+    dm_devices[idx].targets[1].ttype        = DM_TARGET_LINEAR
+    dm_devices[idx].targets[1].start_sector = len_a
+    dm_devices[idx].targets[1].length       = len_b
+    dm_devices[idx].targets[1].under_slot   = slot_b
+    dm_devices[idx].targets[1].under_start  = start_b
+    if _dm_register(idx, name) != 0:
+        dm_devices[idx].used = 0
+        return -5
+    return dm_devices[idx].self_slot
+
+
+def dm_create_crypt(name: Ptr[char], under_slot: int32,
+                    under_start: uint64, length: uint64,
+                    key: Ptr[uint8], keylen: uint64) -> int32:
+    # Create a dm-crypt mapped device with a SINGLE crypt target over
+    # [0, length): every sector written through the mapped device is
+    # ChaCha20-encrypted (sector-keyed IV) before it reaches the backing
+    # store, and decrypted on read. `key` supplies up to DM_KEY_LEN
+    # bytes; a short key is zero-padded. This is the
+    # `dmsetup create NAME --table "0 LENGTH crypt chacha20 KEY 0 DEV START"`
+    # shape. Returns the registered block slot or a negative error.
+    dm_init()
+    if length == 0:
+        return -1
+    if under_slot < 0:
+        return -2
+    if under_start + length > blk_capacity_sectors(under_slot):
+        printk0("dm: crypt target exceeds underlying capacity\n")
+        return -3
+    idx_s: int32 = _dm_alloc_device()
+    if idx_s < 0:
+        printk0("dm: device table full\n")
+        return -4
+    idx: uint64 = cast[uint64](idx_s)
+    # Install the key (zero-pad / truncate to DM_KEY_LEN).
+    ki: uint64 = 0
+    while ki < DM_KEY_LEN:
+        if ki < keylen:
+            dm_devices[idx].key[ki] = key[ki]
+        else:
+            dm_devices[idx].key[ki] = 0
+        ki = ki + 1
+    dm_devices[idx].n_targets = 1
+    dm_devices[idx].capacity  = length
+    dm_devices[idx].targets[0].ttype        = DM_TARGET_CRYPT
+    dm_devices[idx].targets[0].start_sector = 0
+    dm_devices[idx].targets[0].length       = length
+    dm_devices[idx].targets[0].under_slot   = under_slot
+    dm_devices[idx].targets[0].under_start  = under_start
+    if _dm_register(idx, name) != 0:
+        dm_devices[idx].used = 0
+        return -5
+    return dm_devices[idx].self_slot
+
+
+def dm_remove(name: Ptr[char]) -> int32:
+    # Tear down a mapped device by name: unregister its block-device
+    # identity and free the MappedDevice slot. dmsetup remove NAME.
+    # Returns 0 on success, -1 if no mapped device carried that name.
+    slot: int32 = find_blockdev(name)
+    if slot < 0:
+        return -1
+    i: uint64 = 0
+    while i < DM_MAX_DEVICES:
+        if dm_devices[i].used != 0 and dm_devices[i].self_slot == slot:
+            blk_unregister_by_name(name)
+            dm_devices[i].used      = 0
+            dm_devices[i].n_targets = 0
+            dm_devices[i].capacity  = 0
+            dm_devices[i].self_slot = -1
+            return 0
+        i = i + 1
+    return -1
+
+
+# =========================================================================
+# Deterministic device-mapper self-test
+# =========================================================================
+#
+# Gated boot self-test (init/main.ad, planted /etc/devmapper-test by
+# build_initramfs.py when ENABLE_DEVMAPPER_TEST=1). It runs entirely
+# against a DEDICATED in-kernel backing ramdisk (registered here as
+# "dmback0"), so it never touches ram0's FAT image and is fully
+# deterministic.
+#
+# It PROVES four things:
+#
+#   1. LINEAR remap correctness: write a known pattern THROUGH the linear
+#      mapped device at virtual LBA L, then read the SAME data back from
+#      the UNDERLYING backing device at the mapped offset (under_start+L).
+#      The bytes match -> the linear target really remaps to the right
+#      underlying sector.
+#   2. CONCATENATION: a two-target mapped device routes virtual sectors
+#      in span A to backing region A and virtual sectors in span B to a
+#      DIFFERENT backing region B. Writing distinct patterns to one
+#      virtual sector in each span and reading the underlying regions
+#      back confirms each landed in the correct backing device offset.
+#   3. CRYPT round-trip + IV-dependence: plaintext written through the
+#      crypt device is CIPHERTEXT on the backing store (differs from the
+#      plaintext), yet reads back through the crypt device as the
+#      ORIGINAL plaintext. AND the SAME plaintext written to two
+#      DIFFERENT virtual sectors produces DIFFERENT ciphertext on disk
+#      (the plain64 IV is sector-dependent).
+#
+# Each marker line stamps EMERG so it reaches serial even at the prompt.
+
+# Dedicated backing ramdisk: 256 sectors = 128 KiB. Module-scope per the
+# Adder large-array quirk.
+_DM_BACK_SECTORS: uint64 = 256
+_dm_back_store:   Array[131072, uint8]   # 256 * 512
+_dm_back_ops:     BlockDeviceOps
+
+# Scratch buffers for the self-test (all module-scope, one sector each
+# unless noted).
+_dm_t_plain:   Array[512, uint8]   # plaintext written through a mapped dev
+_dm_t_plain2:  Array[512, uint8]   # second plaintext (concat span B)
+_dm_t_read:    Array[512, uint8]   # readback through a mapped dev
+_dm_t_under:   Array[512, uint8]   # raw read from the backing device
+_dm_t_under2:  Array[512, uint8]   # raw read from a second backing sector
+_dm_t_key:     Array[32, uint8]    # ChaCha20 key for the crypt device
+
+
+def _dm_back_read(priv: uint64, lba: uint64, count: uint64,
+                  buf: Ptr[uint8]) -> int32:
+    src: uint64 = cast[uint64](&_dm_back_store[0]) + lba * SECTOR_SIZE
+    memcpy(buf, cast[Ptr[uint8]](src), count * SECTOR_SIZE)
+    return 0
+
+
+def _dm_back_write(priv: uint64, lba: uint64, count: uint64,
+                   buf: Ptr[uint8]) -> int32:
+    dst: uint64 = cast[uint64](&_dm_back_store[0]) + lba * SECTOR_SIZE
+    memcpy(cast[Ptr[uint8]](dst), buf, count * SECTOR_SIZE)
+    return 0
+
+
+def _dm_emerg0(s: Ptr[char]):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0(s)
+
+
+def _dm_emerg1(s: Ptr[char], a: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk1(s, a)
+
+
+def _dm_emerg2(s: Ptr[char], a: uint64, b: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk2(s, a, b)
+
+
+def _dm_back_register() -> int32:
+    # Register the dedicated test backing ramdisk as "dmback0". Returns
+    # the slot, or the existing slot if already registered.
+    existing: int32 = find_blockdev("dmback0")
+    if existing >= 0:
+        return existing
+    # Zero the backing store so the test starts from a clean slate.
+    z: uint64 = 0
+    while z < 131072:
+        _dm_back_store[z] = 0
+        z = z + 1
+    _dm_back_ops.read_sectors  = _dm_back_read
+    _dm_back_ops.write_sectors = _dm_back_write
+    _dm_back_ops.flush         = cast[Fn[int32, uint64]](0)
+    return register_blockdev("dmback0", _DM_BACK_SECTORS,
+                             &_dm_back_ops, 0)
+
+
+def _dm_buf_eq(a: Ptr[uint8], b: Ptr[uint8], n: uint64) -> int32:
+    i: uint64 = 0
+    while i < n:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def dm_selftest() -> int32:
+    # Returns 1 on PASS, 0 on FAIL. Prints [device-mapper] marker lines.
+    _dm_emerg0("[device-mapper] self-test start\n")
+    dm_init()
+
+    back: int32 = _dm_back_register()
+    if back < 0:
+        _dm_emerg0("[device-mapper] FAIL: backing register\n")
+        return 0
+    _dm_emerg1("[device-mapper] backing dmback0 slot=%d\n",
+               cast[uint64](cast[int64](back)))
+
+    ok: int32 = 1
+
+    # --- Test 1: LINEAR target remaps to the right underlying sector ---
+    # Map [0, 16) of a virtual device onto dmback0 starting at sector 32.
+    # Write a pattern through the mapped device at virtual LBA 5; it must
+    # land on backing sector 32 + 5 = 37.
+    pi: uint64 = 0
+    while pi < SECTOR_SIZE:
+        _dm_t_plain[pi] = cast[uint8]((pi * 7 + 3) & 0xFF)
+        pi = pi + 1
+    lin: int32 = dm_create_linear("dmlin0", back, 32, 16)
+    if lin < 0:
+        _dm_emerg1("[device-mapper] FAIL: dm_create_linear rc=%d\n",
+                   cast[uint64](cast[int64](lin)))
+        return 0
+    if blk_write_sectors(lin, 5, 1, &_dm_t_plain[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: linear write\n")
+        return 0
+    # Read the UNDERLYING backing sector 37 directly.
+    if blk_read_sectors(back, 37, 1, &_dm_t_under[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: backing read (linear)\n")
+        return 0
+    if _dm_buf_eq(&_dm_t_plain[0], &_dm_t_under[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: linear remap landed on wrong sector\n")
+        ok = 0
+    else:
+        _dm_emerg0("[device-mapper] linear: vLBA5 -> backing sector 37 OK\n")
+    # And it must read back through the mapped device unchanged.
+    if blk_read_sectors(lin, 5, 1, &_dm_t_read[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: linear readback\n")
+        return 0
+    if _dm_buf_eq(&_dm_t_plain[0], &_dm_t_read[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: linear readback mismatch\n")
+        ok = 0
+    else:
+        _dm_emerg0("[device-mapper] linear: readback byte-identical OK\n")
+
+    # --- Test 2: CONCATENATION across two backing regions ---
+    # Span A: virtual [0, 8) -> dmback0 @ 64. Span B: virtual [8, 16) ->
+    # dmback0 @ 128. Write distinct patterns to a sector in each span and
+    # confirm each landed in the correct backing region.
+    qi: uint64 = 0
+    while qi < SECTOR_SIZE:
+        _dm_t_plain[qi]  = cast[uint8]((qi * 11 + 1) & 0xFF)   # span A
+        _dm_t_plain2[qi] = cast[uint8]((qi * 13 + 9) & 0xFF)   # span B
+        qi = qi + 1
+    cc: int32 = dm_create_concat("dmcat0", back, 64, 8, back, 128, 8)
+    if cc < 0:
+        _dm_emerg1("[device-mapper] FAIL: dm_create_concat rc=%d\n",
+                   cast[uint64](cast[int64](cc)))
+        return 0
+    # Virtual LBA 2 is in span A -> backing 64 + 2 = 66.
+    if blk_write_sectors(cc, 2, 1, &_dm_t_plain[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: concat write A\n")
+        return 0
+    # Virtual LBA 10 is in span B (offset 2) -> backing 128 + 2 = 130.
+    if blk_write_sectors(cc, 10, 1, &_dm_t_plain2[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: concat write B\n")
+        return 0
+    if blk_read_sectors(back, 66, 1, &_dm_t_under[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: backing read 66\n")
+        return 0
+    if blk_read_sectors(back, 130, 1, &_dm_t_under2[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: backing read 130\n")
+        return 0
+    if _dm_buf_eq(&_dm_t_plain[0], &_dm_t_under[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: concat span A wrong backing sector\n")
+        ok = 0
+    else:
+        _dm_emerg0("[device-mapper] concat: span A vLBA2 -> backing 66 OK\n")
+    if _dm_buf_eq(&_dm_t_plain2[0], &_dm_t_under2[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: concat span B wrong backing sector\n")
+        ok = 0
+    else:
+        _dm_emerg0("[device-mapper] concat: span B vLBA10 -> backing 130 OK\n")
+
+    # --- Test 3: CRYPT round-trip + IV-dependence ---
+    # Map [0, 16) onto dmback0 @ 192 with a fixed key. Write identical
+    # plaintext to virtual sectors 0 and 1; on the backing store sectors
+    # 192 and 193 must hold CIPHERTEXT that (a) differs from the plaintext
+    # and (b) differs from EACH OTHER (sector-dependent IV). Reading both
+    # back through the crypt device must return the original plaintext.
+    ki2: uint64 = 0
+    while ki2 < DM_KEY_LEN:
+        _dm_t_key[ki2] = cast[uint8]((ki2 * 17 + 5) & 0xFF)
+        ki2 = ki2 + 1
+    pj: uint64 = 0
+    while pj < SECTOR_SIZE:
+        _dm_t_plain[pj] = cast[uint8]((pj * 3 + 42) & 0xFF)
+        pj = pj + 1
+    cr: int32 = dm_create_crypt("dmcrypt0", back, 192, 16,
+                                &_dm_t_key[0], DM_KEY_LEN)
+    if cr < 0:
+        _dm_emerg1("[device-mapper] FAIL: dm_create_crypt rc=%d\n",
+                   cast[uint64](cast[int64](cr)))
+        return 0
+    # Same plaintext to virtual sectors 0 and 1.
+    if blk_write_sectors(cr, 0, 1, &_dm_t_plain[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: crypt write sec0\n")
+        return 0
+    if blk_write_sectors(cr, 1, 1, &_dm_t_plain[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: crypt write sec1\n")
+        return 0
+    # Backing 192 / 193 hold the two ciphertexts.
+    if blk_read_sectors(back, 192, 1, &_dm_t_under[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: backing read 192\n")
+        return 0
+    if blk_read_sectors(back, 193, 1, &_dm_t_under2[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: backing read 193\n")
+        return 0
+    # (a) ciphertext on disk differs from plaintext (real encryption,
+    # not a passthrough).
+    if _dm_buf_eq(&_dm_t_plain[0], &_dm_t_under[0], SECTOR_SIZE) != 0:
+        _dm_emerg0("[device-mapper] FAIL: crypt backing == plaintext (no encryption)\n")
+        ok = 0
+    else:
+        _dm_emerg0("[device-mapper] crypt: backing sector 192 is ciphertext OK\n")
+    # (b) the two sectors' ciphertext differ (IV is sector-dependent).
+    if _dm_buf_eq(&_dm_t_under[0], &_dm_t_under2[0], SECTOR_SIZE) != 0:
+        _dm_emerg0("[device-mapper] FAIL: identical plaintext -> identical ciphertext (IV not sector-keyed)\n")
+        ok = 0
+    else:
+        _dm_emerg0("[device-mapper] crypt: same plaintext, two sectors -> different ciphertext OK\n")
+    # Round-trip: read back through the crypt device -> original plaintext.
+    if blk_read_sectors(cr, 0, 1, &_dm_t_read[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: crypt readback sec0\n")
+        return 0
+    if _dm_buf_eq(&_dm_t_plain[0], &_dm_t_read[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: crypt round-trip sec0 mismatch\n")
+        ok = 0
+    else:
+        _dm_emerg0("[device-mapper] crypt: sector 0 round-trips to plaintext OK\n")
+    if blk_read_sectors(cr, 1, 1, &_dm_t_read[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: crypt readback sec1\n")
+        return 0
+    if _dm_buf_eq(&_dm_t_plain[0], &_dm_t_read[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: crypt round-trip sec1 mismatch\n")
+        ok = 0
+    else:
+        _dm_emerg0("[device-mapper] crypt: sector 1 round-trips to plaintext OK\n")
+
+    # Clean up the mapped devices (frees slots; leaves dmback0 in place).
+    dm_remove("dmlin0")
+    dm_remove("dmcat0")
+    dm_remove("dmcrypt0")
+
+    if ok == 1:
+        _dm_emerg0("[device-mapper] PASS\n")
+        return 1
+    _dm_emerg0("[device-mapper] FAIL\n")
+    return 0
