@@ -743,6 +743,459 @@ def blk_register_partitions(parent_slot: int32,
     return registered
 
 
+# --- §sched: additive block I/O scheduler (plug / merge / elevator) ---
+#
+# Linux mapping:
+#   struct blk_plug            -> BlkPlug (this section)
+#   blk_start_plug()           -> blk_plug_begin()
+#   blk_plug_list / bio_attempt_*_merge -> _blk_plug_sort + _blk_plug_merge
+#   blk_finish_plug() / __blk_flush_plug -> blk_unplug()
+#   elevator (deadline-lite)   -> single-direction LBA SCAN sort
+#
+# WHY this is purely additive and cannot regress correctness:
+#
+#   * The synchronous entry points blk_read_sectors / blk_write_sectors
+#     above are UNTOUCHED — they still go straight to the driver vtable.
+#     ext4/fat/AHCI/NVMe all keep calling them and every byte is
+#     identical to before.
+#   * The scheduler is an OPT-IN path: a caller wraps a batch between
+#     blk_plug_begin() and blk_unplug(). With a SINGLE queued request the
+#     unplug dispatches exactly one blk_read_sectors / blk_write_sectors
+#     call — bit-for-bit the synchronous path.
+#   * Dispatch ALWAYS funnels back through blk_read_sectors /
+#     blk_write_sectors, so the device range checks, in-flight
+#     accounting, io_ticks and rd/wr counters all behave exactly as on
+#     the direct path. The scheduler only reorders and coalesces; it
+#     never invents or drops a byte.
+#
+# Coalescing rule (contiguity in BOTH disk-LBA AND host memory):
+#   Two same-op requests r and s (r.lba < s.lba) merge iff
+#     r.lba + r.count == s.lba                       (adjacent on disk)
+#     AND r.buf + r.count*512 == s.buf               (adjacent in memory)
+#   OR they overlap such that s is wholly inside r's resulting span with
+#   a matching memory offset (idempotent re-submit). Requiring memory
+#   adjacency keeps the merged transfer a single contiguous DMA into one
+#   buffer, so the bytes a caller reads back are exactly what it would
+#   have read with N separate transfers — no scatter/gather needed.
+#
+# Elevator: a one-direction SCAN — sort the queued requests by ascending
+# start LBA before merging, so the head sweeps in one direction and
+# adjacent ranges become neighbours (a prerequisite for merging) while
+# total seek distance drops. This is "deadline-lite": no starvation
+# windows are modelled, but FIFO order within an equal-LBA group is
+# preserved by using a STABLE insertion sort.
+
+BLK_OP_READ:  uint32 = 0
+BLK_OP_WRITE: uint32 = 1
+
+BLK_PLUG_MAX: uint64 = 32     # max in-flight queued requests per plug
+
+
+class BlkReq:
+    op:    uint32
+    used:  uint32             # 1 = live slot in the plug queue
+    lba:   uint64
+    count: uint64
+    buf:   uint64             # Ptr[uint8] held as uint64 for the table
+
+
+class BlkPlug:
+    slot:    int32            # target block-device slot, -1 when idle
+    active:  uint32           # 1 between blk_plug_begin and blk_unplug
+    n:       uint32           # number of live requests in `reqs`
+    pad:     uint32
+    reqs:    Array[32, BlkReq]
+
+
+# A single global plug. The kernel block layer is synchronous and
+# non-preemptible across a plug/unplug span (no scheduling point sits
+# between blk_plug_begin and blk_unplug in the batch callers), so one
+# global plug is sufficient and avoids a per-task allocation. Linux uses
+# a per-task current->plug for the same reason — to batch a single
+# thread's bios — but our batches are bounded straight-line code.
+blk_plug_g: BlkPlug
+
+
+# --- §sched: accounting -----------------------------------------------
+# Observable effect of the scheduler. blk_sched_merges counts how many
+# request-merge events folded two requests into one; blk_sched_dispatched
+# counts the merged requests actually handed to the driver. With N
+# submitted and M merges, exactly N-M requests dispatch.
+blk_sched_merges_g:     uint64 = 0
+blk_sched_dispatched_g: uint64 = 0
+blk_sched_submitted_g:  uint64 = 0
+
+
+def blk_sched_merges() -> uint64:
+    return blk_sched_merges_g
+
+
+def blk_sched_dispatched() -> uint64:
+    return blk_sched_dispatched_g
+
+
+def blk_sched_submitted() -> uint64:
+    return blk_sched_submitted_g
+
+
+def blk_plug_begin(slot: int32) -> int32:
+    # Open a plug against `slot`. Returns 0 on success, -1 if a plug is
+    # already active (nested plugging is not supported — callers must
+    # unplug before opening another) or the slot is invalid.
+    if blk_plug_g.active != 0:
+        printk0("blk: blk_plug_begin: plug already active\n")
+        return -1
+    if slot < 0 or cast[uint64](slot) >= BLKDEV_MAX:
+        return -1
+    if blockdev_table[cast[uint64](slot)].used == 0:
+        return -1
+    blk_plug_g.slot   = slot
+    blk_plug_g.active = 1
+    blk_plug_g.n      = 0
+    i: uint64 = 0
+    while i < BLK_PLUG_MAX:
+        blk_plug_g.reqs[i].used = 0
+        i = i + 1
+    return 0
+
+
+def _blk_plug_submit(op: uint32, lba: uint64, count: uint64,
+                     buf: Ptr[uint8]) -> int32:
+    # Queue one request into the active plug. No I/O happens yet — the
+    # request is coalesced and dispatched at blk_unplug. Returns 0 on
+    # success, -1 if no plug is active or the queue is full.
+    if blk_plug_g.active == 0:
+        printk0("blk: submit with no active plug\n")
+        return -1
+    if count == 0:
+        return 0
+    n: uint32 = blk_plug_g.n
+    if cast[uint64](n) >= BLK_PLUG_MAX:
+        printk0("blk: plug queue full\n")
+        return -1
+    idx: uint64 = cast[uint64](n)
+    blk_plug_g.reqs[idx].op    = op
+    blk_plug_g.reqs[idx].used  = 1
+    blk_plug_g.reqs[idx].lba   = lba
+    blk_plug_g.reqs[idx].count = count
+    blk_plug_g.reqs[idx].buf   = cast[uint64](buf)
+    blk_plug_g.n = n + 1
+    blk_sched_submitted_g = blk_sched_submitted_g + 1
+    return 0
+
+
+def blk_plug_read(lba: uint64, count: uint64, buf: Ptr[uint8]) -> int32:
+    return _blk_plug_submit(BLK_OP_READ, lba, count, buf)
+
+
+def blk_plug_write(lba: uint64, count: uint64, buf: Ptr[uint8]) -> int32:
+    return _blk_plug_submit(BLK_OP_WRITE, lba, count, buf)
+
+
+def _blk_plug_sort():
+    # Elevator: stable insertion sort of the live requests by ascending
+    # (op, lba). Stable so equal keys keep FIFO order (deadline-lite). The
+    # queue is small (<= BLK_PLUG_MAX) so O(n^2) is cheap and predictable.
+    n: uint64 = cast[uint64](blk_plug_g.n)
+    i: uint64 = 1
+    while i < n:
+        # Save request i.
+        op_i:  uint32 = blk_plug_g.reqs[i].op
+        lba_i: uint64 = blk_plug_g.reqs[i].lba
+        cnt_i: uint64 = blk_plug_g.reqs[i].count
+        buf_i: uint64 = blk_plug_g.reqs[i].buf
+        # Shift larger keys right. Order by op first (reads before writes
+        # in this one-direction sweep), then by start LBA.
+        j: uint64 = i
+        while j > 0:
+            op_p:  uint32 = blk_plug_g.reqs[j - 1].op
+            lba_p: uint64 = blk_plug_g.reqs[j - 1].lba
+            greater: int32 = 0
+            if op_p > op_i:
+                greater = 1
+            else:
+                if op_p == op_i and lba_p > lba_i:
+                    greater = 1
+            if greater == 0:
+                break
+            blk_plug_g.reqs[j].op    = op_p
+            blk_plug_g.reqs[j].lba   = lba_p
+            blk_plug_g.reqs[j].count = blk_plug_g.reqs[j - 1].count
+            blk_plug_g.reqs[j].buf   = blk_plug_g.reqs[j - 1].buf
+            j = j - 1
+        blk_plug_g.reqs[j].op    = op_i
+        blk_plug_g.reqs[j].lba   = lba_i
+        blk_plug_g.reqs[j].count = cnt_i
+        blk_plug_g.reqs[j].buf   = buf_i
+        i = i + 1
+
+
+def _blk_plug_merge() -> uint64:
+    # Coalesce adjacent same-op requests after the sort. Walk the sorted
+    # queue; whenever request k is disk- AND memory-contiguous with the
+    # current accumulator, fold it in (grow count) and mark it dead.
+    # Returns the number of merge events performed. Caller has already
+    # sorted, so a request can only merge with its immediate predecessor.
+    n: uint64 = cast[uint64](blk_plug_g.n)
+    if n < 2:
+        return 0
+    merges: uint64 = 0
+    # `head` is the index of the live accumulator we are growing into.
+    head: uint64 = 0
+    k: uint64 = 1
+    while k < n:
+        op_h:  uint32 = blk_plug_g.reqs[head].op
+        lba_h: uint64 = blk_plug_g.reqs[head].lba
+        cnt_h: uint64 = blk_plug_g.reqs[head].count
+        buf_h: uint64 = blk_plug_g.reqs[head].buf
+        op_k:  uint32 = blk_plug_g.reqs[k].op
+        lba_k: uint64 = blk_plug_g.reqs[k].lba
+        cnt_k: uint64 = blk_plug_g.reqs[k].count
+        buf_k: uint64 = blk_plug_g.reqs[k].buf
+        disk_end_h: uint64 = lba_h + cnt_h            # one past head's last LBA
+        mem_end_h:  uint64 = buf_h + cnt_h * SECTOR_SIZE
+        do_merge: int32 = 0
+        if op_h == op_k and lba_k == disk_end_h and buf_k == mem_end_h:
+            # Pure adjacency: head | k become one contiguous transfer.
+            do_merge = 1
+        else:
+            if op_h == op_k and lba_k >= lba_h and lba_k < disk_end_h:
+                # Overlap: k starts inside head's span. Mergeable only if
+                # k's buffer sits at the matching memory offset AND k does
+                # not extend past head's existing span (idempotent / fully
+                # contained re-submit), OR it extends contiguously with a
+                # matching memory layout.
+                off: uint64 = lba_k - lba_h
+                if buf_k == buf_h + off * SECTOR_SIZE:
+                    do_merge = 1
+        if do_merge != 0:
+            # Grow head to cover through the end of k (if k extends it).
+            k_end: uint64 = lba_k + cnt_k
+            new_end: uint64 = disk_end_h
+            if k_end > new_end:
+                new_end = k_end
+            blk_plug_g.reqs[head].count = new_end - lba_h
+            blk_plug_g.reqs[k].used = 0
+            merges = merges + 1
+        else:
+            # k cannot merge into head; it becomes the new accumulator.
+            head = k
+        k = k + 1
+    return merges
+
+
+def blk_unplug() -> int32:
+    # Sort (elevator), merge (coalesce), then dispatch every surviving
+    # request through the SYNCHRONOUS blk_read_sectors / blk_write_sectors
+    # entry points — so dispatch is byte-identical to the direct path.
+    # Returns 0 if every dispatched request succeeded, -1 otherwise (and
+    # on the first driver error). The plug is always closed on return.
+    if blk_plug_g.active == 0:
+        return -1
+    slot: int32 = blk_plug_g.slot
+    n: uint64 = cast[uint64](blk_plug_g.n)
+    rc_all: int32 = 0
+    if n > 0:
+        _blk_plug_sort()
+        merges: uint64 = _blk_plug_merge()
+        blk_sched_merges_g = blk_sched_merges_g + merges
+        # Dispatch the survivors in elevator (ascending-LBA) order.
+        i: uint64 = 0
+        while i < n:
+            if blk_plug_g.reqs[i].used != 0:
+                op:    uint32 = blk_plug_g.reqs[i].op
+                lba:   uint64 = blk_plug_g.reqs[i].lba
+                count: uint64 = blk_plug_g.reqs[i].count
+                buf:   Ptr[uint8] = cast[Ptr[uint8]](blk_plug_g.reqs[i].buf)
+                rc: int32 = 0
+                if op == BLK_OP_WRITE:
+                    rc = blk_write_sectors(slot, lba, count, buf)
+                else:
+                    rc = blk_read_sectors(slot, lba, count, buf)
+                blk_sched_dispatched_g = blk_sched_dispatched_g + 1
+                if rc != 0 and rc_all == 0:
+                    rc_all = rc
+            i = i + 1
+    # Close the plug.
+    blk_plug_g.active = 0
+    blk_plug_g.slot   = -1
+    blk_plug_g.n      = 0
+    return rc_all
+
+
+# --- §sched: deterministic block I/O scheduler self-test --------------
+#
+# Gated boot self-test (init/main.ad boot:37.bsch, planted
+# /etc/blk-sched-test). PROVES the scheduler merges + orders real I/O and
+# preserves byte-correctness:
+#
+#   1. Pick a real in-VM block device (sd0 / nvme0n1 / vda / ram0).
+#   2. SEED four adjacent sectors (LBA base..base+3) with distinct,
+#      identifiable contents through the plain synchronous write path.
+#   3. Open a plug and submit FOUR reads OUT OF ORDER but into a single
+#      contiguous scratch buffer at the matching offsets, so they are both
+#      disk- and memory-contiguous and MUST coalesce to one transfer.
+#      Snapshot the merge / dispatch counters around the unplug.
+#   4. Assert exactly 3 merges happened (4 reqs -> 1 dispatch) and that
+#      the dispatched count rose by exactly 1.
+#   5. Byte-compare the scratch buffer against an independent synchronous
+#      read of the same 4-sector span — proving the merged/reordered I/O
+#      returned identical bytes.
+#   6. Submit a NON-mergeable batch (a gap between LBAs) and assert it
+#      dispatches as separate transfers with zero new merges.
+#
+# Each marker line stamps EMERG so it reaches serial even at the prompt.
+
+# 4 sectors of seed pattern + a 4-sector scratch + a 4-sector witness,
+# all flat module-scope per the Adder large-array quirk.
+_BSCH_SEED:    Array[2048, uint8]      # 4 * 512 known pattern
+_BSCH_SCRATCH: Array[2048, uint8]      # merged-read destination
+_BSCH_WITNESS: Array[2048, uint8]      # independent synchronous read
+_BSCH_BASE:    uint64 = 64             # scratch LBA base (well clear of FS)
+
+
+def _blk_bsch_pick_dev() -> int32:
+    # Prefer a real disk so the test exercises a true driver path; fall
+    # back to ram0. Returns a live slot or -1.
+    s: int32 = find_blockdev("sd0")
+    if s >= 0:
+        return s
+    s = find_blockdev("nvme0n1")
+    if s >= 0:
+        return s
+    s = find_blockdev("vda")
+    if s >= 0:
+        return s
+    return find_blockdev("ram0")
+
+
+def blk_sched_selftest() -> int32:
+    # Returns 1 on PASS, 0 on FAIL. Prints [blk-sched] marker lines.
+    _blk_ds_emerg0("[blk-sched] self-test start\n")
+
+    slot: int32 = _blk_bsch_pick_dev()
+    if slot < 0:
+        _blk_ds_emerg0("[blk-sched] FAIL: no block device registered\n")
+        return 0
+    nm: Ptr[char] = blk_slot_name(slot)
+    _blk_ds_emerg1("[blk-sched] using device slot=%d\n",
+                   cast[uint64](cast[int64](slot)))
+    if blk_capacity_sectors(slot) < _BSCH_BASE + 8:
+        _blk_ds_emerg0("[blk-sched] FAIL: device too small for test\n")
+        return 0
+
+    # 1. Seed 4 distinct sectors via the SYNCHRONOUS write path.
+    seedp: Ptr[uint8] = &_BSCH_SEED[0]
+    si: uint64 = 0
+    while si < 2048:
+        # Sector index 0..3 in the high nibble, byte index low — every byte
+        # is unique-ish so a mis-ordered/short transfer is caught.
+        sec: uint64 = si / SECTOR_SIZE
+        _BSCH_SEED[si] = cast[uint8]((sec * 37 + si * 13 + 1) & 0xFF)
+        si = si + 1
+    wrc: int32 = blk_write_sectors(slot, _BSCH_BASE, 4, seedp)
+    if wrc != 0:
+        _blk_ds_emerg0("[blk-sched] FAIL: seed write failed\n")
+        return 0
+    _blk_ds_emerg0("[blk-sched] seeded 4 adjacent sectors (sync write)\n")
+
+    # 2. Plug + submit 4 OUT-OF-ORDER adjacent reads into one contiguous
+    #    buffer. Order submitted: LBA+2, LBA+0, LBA+3, LBA+1. The elevator
+    #    sorts them ascending, then the merger folds all 4 into 1 transfer.
+    scr: Ptr[uint8] = &_BSCH_SCRATCH[0]
+    m0: uint64 = blk_sched_merges()
+    d0: uint64 = blk_sched_dispatched()
+    if blk_plug_begin(slot) != 0:
+        _blk_ds_emerg0("[blk-sched] FAIL: blk_plug_begin\n")
+        return 0
+    # Each read targets the offset in `scr` that matches its LBA offset,
+    # so disk- and memory-contiguity both hold and the merge is legal.
+    blk_plug_read(_BSCH_BASE + 2, 1, cast[Ptr[uint8]](
+        cast[uint64](scr) + 2 * SECTOR_SIZE))
+    blk_plug_read(_BSCH_BASE + 0, 1, cast[Ptr[uint8]](
+        cast[uint64](scr) + 0 * SECTOR_SIZE))
+    blk_plug_read(_BSCH_BASE + 3, 1, cast[Ptr[uint8]](
+        cast[uint64](scr) + 3 * SECTOR_SIZE))
+    blk_plug_read(_BSCH_BASE + 1, 1, cast[Ptr[uint8]](
+        cast[uint64](scr) + 1 * SECTOR_SIZE))
+    urc: int32 = blk_unplug()
+    if urc != 0:
+        _blk_ds_emerg0("[blk-sched] FAIL: unplug dispatch error\n")
+        return 0
+    m1: uint64 = blk_sched_merges()
+    d1: uint64 = blk_sched_dispatched()
+    d_merge:    uint64 = m1 - m0
+    d_dispatch: uint64 = d1 - d0
+    _blk_ds_emerg2("[blk-sched] merged-batch merges=%d dispatched=%d\n",
+                   d_merge, d_dispatch)
+
+    ok: int32 = 1
+    if d_merge != 3:
+        _blk_ds_emerg0("[blk-sched] FAIL: expected 3 merges (4 reqs -> 1)\n")
+        ok = 0
+    if d_dispatch != 1:
+        _blk_ds_emerg0("[blk-sched] FAIL: expected 1 dispatched transfer\n")
+        ok = 0
+    if ok == 1:
+        _blk_ds_emerg0("[blk-sched] 4 adjacent reqs coalesced to 1 transfer OK\n")
+
+    # 3. Byte-correctness: independent synchronous read of the same span,
+    #    then compare against the merged scratch buffer AND the seed.
+    witp: Ptr[uint8] = &_BSCH_WITNESS[0]
+    rrc: int32 = blk_read_sectors(slot, _BSCH_BASE, 4, witp)
+    if rrc != 0:
+        _blk_ds_emerg0("[blk-sched] FAIL: witness read failed\n")
+        return 0
+    bi: uint64 = 0
+    mism: uint64 = 0
+    while bi < 2048:
+        if _BSCH_SCRATCH[bi] != _BSCH_WITNESS[bi]:
+            mism = mism + 1
+        if _BSCH_SCRATCH[bi] != _BSCH_SEED[bi]:
+            mism = mism + 1
+        bi = bi + 1
+    if mism != 0:
+        _blk_ds_emerg1("[blk-sched] FAIL: byte mismatch count=%d\n", mism)
+        ok = 0
+    else:
+        _blk_ds_emerg0("[blk-sched] merged readback byte-identical to seed OK\n")
+
+    # 4. NON-mergeable batch: two reads with a 1-sector gap on disk must
+    #    dispatch as TWO transfers with ZERO merges.
+    m2: uint64 = blk_sched_merges()
+    d2: uint64 = blk_sched_dispatched()
+    if blk_plug_begin(slot) != 0:
+        _blk_ds_emerg0("[blk-sched] FAIL: blk_plug_begin (gap)\n")
+        return 0
+    # LBA base and base+2 (gap at base+1) -> not adjacent -> no merge.
+    blk_plug_read(_BSCH_BASE + 0, 1, cast[Ptr[uint8]](
+        cast[uint64](scr) + 0 * SECTOR_SIZE))
+    blk_plug_read(_BSCH_BASE + 2, 1, cast[Ptr[uint8]](
+        cast[uint64](scr) + 2 * SECTOR_SIZE))
+    grc: int32 = blk_unplug()
+    if grc != 0:
+        _blk_ds_emerg0("[blk-sched] FAIL: gap unplug dispatch error\n")
+        return 0
+    g_merge:    uint64 = blk_sched_merges() - m2
+    g_dispatch: uint64 = blk_sched_dispatched() - d2
+    _blk_ds_emerg2("[blk-sched] gap-batch merges=%d dispatched=%d\n",
+                   g_merge, g_dispatch)
+    if g_merge != 0:
+        _blk_ds_emerg0("[blk-sched] FAIL: non-adjacent reqs must not merge\n")
+        ok = 0
+    if g_dispatch != 2:
+        _blk_ds_emerg0("[blk-sched] FAIL: expected 2 dispatched (gap)\n")
+        ok = 0
+    if ok == 1:
+        _blk_ds_emerg0("[blk-sched] non-adjacent batch kept 2 transfers OK\n")
+
+    if ok == 1:
+        _blk_ds_emerg0("[blk-sched] PASS\n")
+        return 1
+    _blk_ds_emerg0("[blk-sched] FAIL\n")
+    return 0
+
+
 # --- §13: per-device I/O accounting self-test -------------------------
 #
 # Gated boot self-test (init/main.ad boot:37.ds, planted /etc/diskstats-test).

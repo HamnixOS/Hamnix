@@ -598,6 +598,20 @@ if os.environ.get("ENABLE_DEVNET_LOCAL_TEST") == "1":
 if os.environ.get("ENABLE_DISKSTATS_TEST") == "1":
     FILES.append(("/etc/diskstats-test", b"ENABLE_DISKSTATS_TEST=1\n"))
 
+# §sched: additive block I/O scheduler self-test. scripts/test_blk_sched.sh
+# sets ENABLE_BLK_SCHED_TEST=1 to plant /etc/blk-sched-test. init/main.ad at
+# boot:37.bsch detects the marker and calls blk_sched_selftest()
+# (kernel/block/blk.ad): it seeds 4 adjacent sectors via the synchronous
+# write path, plugs + submits 4 OUT-OF-ORDER adjacent reads into one
+# contiguous buffer, and asserts the elevator+merger coalesced them to a
+# single dispatched transfer (3 merge events), byte-compares the merged
+# readback against an independent synchronous read AND the seed, and proves a
+# non-adjacent batch stays 2 transfers (0 merges) — proving request merging +
+# elevator ordering are real while the synchronous correctness path is
+# byte-identical. Default boots omit the marker so it never fires.
+if os.environ.get("ENABLE_BLK_SCHED_TEST") == "1":
+    FILES.append(("/etc/blk-sched-test", b"1\n"))
+
 # Phase G: Plan 9 note-group WIDE delivery self-test. scripts/test_notepg.sh
 # sets ENABLE_NOTEPG_TEST=1 to plant /etc/notepg-test. init/main.ad at
 # boot:37.npg detects the marker and calls notegroup_selftest()
