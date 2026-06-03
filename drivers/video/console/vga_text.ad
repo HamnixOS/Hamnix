@@ -18,8 +18,32 @@
 #   attribute 0x0F    = bright white on black
 #   attribute 0x07    = light grey on black (BIOS default)
 #
+# HARDWARE CURSOR (CRTC @ 0x3D4 / 0x3D5)
+# --------------------------------------
+# The legacy VGA CRT controller exposes a blinking text cursor whose
+# on-screen position and shape are programmed through an indexed
+# register pair: write the register index to the address port 0x3D4,
+# then read/write the value at the data port 0x3D5. The registers we
+# touch (matching Linux's vgacon hardware-cursor path in
+# drivers/video/console/vgacon.c):
+#
+#   index 0x0A  Cursor Start — bits 0..4 = first scanline of the cursor
+#                              cell; BIT 5 (0x20) = "cursor disable".
+#   index 0x0B  Cursor End   — bits 0..4 = last scanline of the cursor.
+#   index 0x0E  Cursor Location High — high byte of the linear cell index.
+#   index 0x0F  Cursor Location Low  — low  byte of the linear cell index.
+#
+# The linear cell index is row*VGA_COLS + col (the same 0..1999 cell
+# number the framebuffer uses, minus the *2 byte stride). Programming
+# it makes the firmware-drawn blinking underline track wherever the
+# next glyph will land — so a user typing at the interactive hamsh
+# prompt on a BIOS/legacy boot finally sees a live insertion point,
+# exactly the way the EFI/GOP path already does with its software
+# cursor (drivers/video/console/fb_text.ad). DECTCEM (ESC[?25h /
+# ESC[?25l) now toggles the real hardware cursor via the 0x0A disable
+# bit instead of being a documented no-op.
+#
 # Things deliberately deferred:
-#   - hardware cursor positioning via CRTC ports 0x3D4/0x3D5
 #   - colour API beyond a single global attribute
 #   - mode-set / 80×50 / non-text modes
 #   - a `struct console` registration like vgacon does on Linux —
@@ -27,10 +51,33 @@
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
+from kernel.printk.printk import printk0, printk1, printk2
+from drivers.video.console.fb_text import fb_cup_selftest
+
 VGA_BUFFER:   uint64 = 0xB8000
 VGA_COLS:     uint64 = 80
 VGA_ROWS:     uint64 = 25
 DEFAULT_ATTR: int32  = 0x0F          # bright white on black
+
+# --- CRTC hardware-cursor registers --------------------------------
+VGA_CRTC_INDEX: int32 = 0x3D4        # index/address port
+VGA_CRTC_DATA:  int32 = 0x3D5        # data port
+CRTC_CURSOR_START: int32 = 0x0A      # bit5 = disable; bits0..4 = start line
+CRTC_CURSOR_END:   int32 = 0x0B      # bits0..4 = end line
+CRTC_CURSOR_HI:    int32 = 0x0E      # cursor location, high byte
+CRTC_CURSOR_LO:    int32 = 0x0F      # cursor location, low byte
+CRTC_CURSOR_DISABLE: int32 = 0x20    # Cursor Start bit 5 = cursor off
+
+# Cursor cell shape: an underline occupying scanlines 13..15 of the
+# 16-pixel-tall text cell — the BIOS default block-bottom underline,
+# matching the software underline the GOP console draws.
+CURSOR_SCANLINE_START: int32 = 13
+CURSOR_SCANLINE_END:   int32 = 15
+
+# 1 = the hardware cursor should be visible (DECTCEM set / default);
+# 0 = hidden (ESC[?25l). Tracked so a position update while hidden
+# does not silently re-enable the cursor.
+vga_cursor_visible: int32 = 1
 
 vga_row: uint64 = 0
 vga_col: uint64 = 0
@@ -62,12 +109,90 @@ vga_initialized: int32 = 0
 #                3 = saw ESC [ ? (DEC private prefix).
 vga_esc_state: int32  = 0
 vga_esc_param: uint64 = 0
+# Second CSI parameter (the part after a ';'). ESC[<row>;<col>H — the
+# absolute cursor-position (CUP) sequence every full-screen TUI emits —
+# carries two parameters; without a second accumulator the column was
+# silently dropped and the cursor always homed to (0,0). vga_esc_nparam
+# tracks how many parameters have actually been seen (0 = bare ESC[H, so
+# both default to 1 per the ANSI convention).
+vga_esc_param2:  uint64 = 0
+vga_esc_nparam:  int32  = 0
 
 
 def _write_cell(row: uint64, col: uint64, ch: int32, attr: int32):
     addr: uint64 = VGA_BUFFER + (row * VGA_COLS + col) * 2
     cast[Ptr[uint8]](addr)[0]     = cast[uint8](ch & 0xFF)
     cast[Ptr[uint8]](addr + 1)[0] = cast[uint8](attr & 0xFF)
+
+
+# --- hardware cursor (CRTC) ----------------------------------------
+
+def _crtc_write(index: int32, value: int32):
+    # Indexed CRTC register write: address port selects the register,
+    # data port carries the byte. Only the low 8 bits are meaningful.
+    outb(index, VGA_CRTC_INDEX)
+    outb(value & 0xFF, VGA_CRTC_DATA)
+
+
+def _crtc_read(index: int32) -> int32:
+    # Indexed CRTC register read: select via the address port, read the
+    # byte back from the data port. Used by the boot self-test to verify
+    # the cursor-location registers reflect the cursor position.
+    outb(index, VGA_CRTC_INDEX)
+    return inb(VGA_CRTC_DATA) & 0xFF
+
+
+def _vga_cursor_shape(enable: int32):
+    # Program the Cursor Start / Cursor End registers. Setting bit 5 of
+    # Cursor Start disables the cursor entirely; clearing it (and writing
+    # a sane start/end scanline pair) shows a bottom-underline cursor.
+    if enable == 0:
+        _crtc_write(CRTC_CURSOR_START, CRTC_CURSOR_DISABLE)
+        return
+    _crtc_write(CRTC_CURSOR_START, CURSOR_SCANLINE_START)
+    _crtc_write(CRTC_CURSOR_END, CURSOR_SCANLINE_END)
+
+
+def _vga_move_cursor():
+    # Point the hardware cursor at the current (vga_row, vga_col) cell.
+    # No-op before init (the CRTC may still be in a firmware-set mode and
+    # vga_row/vga_col are boot-zero) and while the cursor is hidden — a
+    # hidden cursor must stay hidden even as the write position advances.
+    if vga_initialized == 0:
+        return
+    if vga_cursor_visible == 0:
+        return
+    # Clamp to the visible grid so a transiently out-of-range write
+    # position can never program a cell index past the last cell.
+    row: uint64 = vga_row
+    col: uint64 = vga_col
+    if row >= VGA_ROWS:
+        row = VGA_ROWS - 1
+    if col >= VGA_COLS:
+        col = VGA_COLS - 1
+    cell: uint64 = row * VGA_COLS + col
+    _crtc_write(CRTC_CURSOR_HI, cast[int32]((cell >> 8) & 0xFF))
+    _crtc_write(CRTC_CURSOR_LO, cast[int32](cell & 0xFF))
+
+
+def vga_read_cursor_pos() -> int32:
+    # Diagnostic readback: reconstruct the linear cell index the CRTC
+    # cursor-location registers currently hold (high<<8 | low). The boot
+    # self-test compares this against the expected row*COLS+col to prove
+    # the hardware cursor actually tracked the write position.
+    hi: int32 = _crtc_read(CRTC_CURSOR_HI)
+    lo: int32 = _crtc_read(CRTC_CURSOR_LO)
+    return (hi << 8) | lo
+
+
+def vga_read_cursor_disabled() -> int32:
+    # Diagnostic readback: 1 if the Cursor Start register currently has
+    # its disable bit set (cursor hidden), 0 otherwise. Lets the self-test
+    # verify ESC[?25l / ESC[?25h flip the real hardware cursor.
+    start: int32 = _crtc_read(CRTC_CURSOR_START)
+    if (start & CRTC_CURSOR_DISABLE) != 0:
+        return 1
+    return 0
 
 
 def _vga_scroll():
@@ -101,6 +226,121 @@ def vga_init():
     vga_row = 0
     vga_col = 0
     vga_initialized = 1
+    # Program the hardware cursor: enable the underline shape and park it
+    # at the home cell. From here on every glyph write / cursor-move
+    # repositions it so the firmware-drawn blinking cursor tracks the
+    # live write position.
+    vga_cursor_visible = 1
+    _vga_cursor_shape(1)
+    _vga_move_cursor()
+
+    # Chain the CSI cursor-position self-test off vga_init so init/main.ad
+    # needs no edit (the same "chain off an already-called init" pattern
+    # drivers/block/partition.ad uses). It runs on every -nographic boot
+    # because QEMU always exposes the VGA text buffer; it restores the
+    # home position when done so production output is unaffected.
+    vga_cup_selftest()
+
+
+# --- CSI cursor-position (CUP) self-test ----------------------------
+#
+# Drives vga_putc() with real ESC[<row>;<col>H sequences and asserts the
+# parser landed the cursor on the requested 1-based cell (clamped into
+# the 80x25 grid) AND that the hardware CRTC cursor-location registers
+# tracked it. Before the two-parameter CUP fix this homed to (0,0) for
+# every sequence; the test would have caught the regression.
+
+def _vga_cup_feed(s: Ptr[char]):
+    # Push a NUL-terminated escape string through vga_putc one byte at a
+    # time (exactly how the real console byte-stream arrives).
+    i: uint64 = 0
+    while s[i] != 0:
+        vga_putc(cast[int32](cast[uint8](s[i])))
+        i = i + 1
+
+
+def _vga_cup_check(want_row: uint64, want_col: uint64) -> int32:
+    # Assert vga_row/vga_col AND the CRTC cursor cell. Returns 1 on pass.
+    ok: int32 = 1
+    if vga_row != want_row or vga_col != want_col:
+        ok = 0
+    cell: uint64 = want_row * VGA_COLS + want_col
+    if cast[uint64](vga_read_cursor_pos()) != cell:
+        ok = 0
+    if ok == 0:
+        printk2("[vga-cup] FAIL: got row=%d col=%d",
+                vga_row, vga_col)
+        printk2(" want row=%d col=%d\n", want_row, want_col)
+    return ok
+
+
+def vga_cup_selftest() -> int32:
+    printk0("[vga-cup] CSI cursor-position self-test start\n")
+    pass_all: int32 = 1
+
+    # ESC[10;20H -> 1-based (10,20) == 0-based (9,19).
+    _vga_cup_feed("\x1b[10;20H")
+    if _vga_cup_check(9, 19) == 0:
+        pass_all = 0
+
+    # ESC[5;1H -> row 5 col 1 == 0-based (4,0).
+    _vga_cup_feed("\x1b[5;1H")
+    if _vga_cup_check(4, 0) == 0:
+        pass_all = 0
+
+    # Bare ESC[H homes to (0,0) (no parameters).
+    _vga_cup_feed("\x1b[H")
+    if _vga_cup_check(0, 0) == 0:
+        pass_all = 0
+
+    # ESC[;15H -> default row (1), explicit col 15 == 0-based (0,14):
+    # an omitted-but-present first parameter must default to 1, not be
+    # treated as the column.
+    _vga_cup_feed("\x1b[;15H")
+    if _vga_cup_check(0, 14) == 0:
+        pass_all = 0
+
+    # ESC[24;80H -> last cell (bottom-right) == 0-based (23,79).
+    _vga_cup_feed("\x1b[24;80H")
+    if _vga_cup_check(23, 79) == 0:
+        pass_all = 0
+
+    # Over-range ESC[999;999H clamps to the last on-screen cell. The grid
+    # is 25 rows x 80 cols, so the last 0-based cell is (24,79).
+    _vga_cup_feed("\x1b[999;999H")
+    if _vga_cup_check(24, 79) == 0:
+        pass_all = 0
+
+    # ESC[3;7f (the 'f' synonym for CUP) -> 0-based (2,6).
+    _vga_cup_feed("\x1b[3;7f")
+    if _vga_cup_check(2, 6) == 0:
+        pass_all = 0
+
+    # Re-home + re-clear so production console output starts clean: the
+    # self-test only moved the (invisible-under -nographic) cursor and
+    # wrote no glyphs, but leave nothing surprising behind.
+    vga_row = 0
+    vga_col = 0
+    _vga_move_cursor()
+
+    # Drive the framebuffer console's CUP path too (it shares the exact
+    # same two-parameter fix). fb_text can't printk — it sits below printk
+    # in the import graph — so it returns a failure COUNT and we report it
+    # here. It runs against its own self-contained scratch framebuffer, so
+    # this is safe even on a -nographic boot where no GOP fb exists.
+    fb_fails: int32 = fb_cup_selftest()
+    if fb_fails == 0:
+        printk0("[fb-cup] PASS\n")
+    else:
+        printk1("[fb-cup] FAIL: %d cursor-position assertion(s)\n",
+                cast[uint64](fb_fails))
+        pass_all = 0
+
+    if pass_all != 0:
+        printk0("[vga-cup] PASS\n")
+        return 1
+    printk0("[vga-cup] FAIL\n")
+    return 0
 
 
 def _vga_erase_to_eol():
@@ -136,30 +376,66 @@ def vga_putc(ch: int32):
         if ch == 0x5B:                                      # '['
             vga_esc_state = 2
             vga_esc_param = 0
+            vga_esc_param2 = 0
+            vga_esc_nparam = 0
         else:
             vga_esc_state = 0
         return
     if vga_esc_state == 2:
-        if ch == 0x3F and vga_esc_param == 0:               # '?'
+        if ch == 0x3F and vga_esc_param == 0 and vga_esc_nparam == 0:  # '?'
             vga_esc_state = 3
             return
         if ch >= 0x30 and ch <= 0x39:                       # '0'..'9'
-            vga_esc_param = vga_esc_param * 10 + cast[uint64](ch - 0x30)
+            # Accumulate into the parameter currently being parsed. The
+            # first ';' switches accumulation to the second slot (CUP's
+            # column). We cap at two parameters — everything CUP needs.
+            if vga_esc_nparam <= 1:
+                vga_esc_nparam = 1
+                vga_esc_param = vga_esc_param * 10 + cast[uint64](ch - 0x30)
+            else:
+                vga_esc_param2 = vga_esc_param2 * 10 + cast[uint64](ch - 0x30)
+            return
+        if ch == 0x3B:                                      # ';' separator
+            # Move on to the second parameter (clamp the counter at 2 so a
+            # malformed ESC[1;2;3H can't run the accumulator off its slot).
+            if vga_esc_nparam < 2:
+                vga_esc_nparam = 2
             return
         if ch == 0x4A:                                      # 'J'
             _vga_clear_screen()
             vga_col = 0
             vga_row = 0
             vga_esc_state = 0
+            _vga_move_cursor()
             return
         if ch == 0x4B:                                      # 'K'
             _vga_erase_to_eol()
             vga_esc_state = 0
             return
-        if ch == 0x48 or ch == 0x66:                        # 'H'/'f'
-            vga_col = 0
-            vga_row = 0
+        if ch == 0x48 or ch == 0x66:                        # 'H'/'f' — CUP
+            # ESC[<row>;<col>H — absolute cursor position. Parameters are
+            # 1-based in ANSI; a missing/zero parameter defaults to 1.
+            # Bare ESC[H (nparam==0) homes the cursor. Both are clamped
+            # into the visible grid so a TUI asking for an off-screen cell
+            # can never index past the buffer.
+            want_row: uint64 = 1
+            want_col: uint64 = 1
+            if vga_esc_nparam >= 1:
+                if vga_esc_param != 0:
+                    want_row = vga_esc_param
+            if vga_esc_nparam >= 2:
+                if vga_esc_param2 != 0:
+                    want_col = vga_esc_param2
+            r: uint64 = want_row - 1
+            c: uint64 = want_col - 1
+            if r >= VGA_ROWS:
+                r = VGA_ROWS - 1
+            if c >= VGA_COLS:
+                c = VGA_COLS - 1
+            vga_row = r
+            vga_col = c
             vga_esc_state = 0
+            _vga_move_cursor()
             return
         if ch == 0x43:                                      # 'C' — fwd
             n: uint64 = vga_esc_param
@@ -169,6 +445,7 @@ def vga_putc(ch: int32):
             if vga_col >= VGA_COLS:
                 vga_col = VGA_COLS - 1
             vga_esc_state = 0
+            _vga_move_cursor()
             return
         if ch == 0x44:                                      # 'D' — back
             n2: uint64 = vga_esc_param
@@ -179,6 +456,7 @@ def vga_putc(ch: int32):
             else:
                 vga_col = vga_col - n2
             vga_esc_state = 0
+            _vga_move_cursor()
             return
         if ch >= 0x40 and ch <= 0x7E:
             vga_esc_state = 0
@@ -187,10 +465,26 @@ def vga_putc(ch: int32):
         if ch >= 0x30 and ch <= 0x39:                       # '0'..'9'
             vga_esc_param = vga_esc_param * 10 + cast[uint64](ch - 0x30)
             return
-        # DEC-private 'h' / 'l' — DECTCEM show/hide; no software
-        # cursor on VGA so the toggles are no-ops, but we still need
-        # to consume the final byte so the parser returns to ground
-        # state and the screen doesn't pick up stray glyphs.
+        # DEC-private 'h' / 'l' — DECTCEM show/hide. We now drive the
+        # real hardware cursor via the CRTC Cursor Start disable bit, so
+        # ESC[?25h re-enables the underline and re-parks it at the live
+        # position, and ESC[?25l hides it. Other DEC-private modes are
+        # consumed without action.
+        if ch == 0x68:                                      # 'h' — set
+            if vga_esc_param == 25:
+                vga_cursor_visible = 1
+                _vga_cursor_shape(1)
+                _vga_move_cursor()
+            vga_esc_state = 0
+            return
+        if ch == 0x6C:                                      # 'l' — clear
+            if vga_esc_param == 25:
+                vga_cursor_visible = 0
+                _vga_cursor_shape(0)
+            vga_esc_state = 0
+            return
+        # Any other DEC-private final byte: consume and reset so the
+        # screen doesn't pick up stray glyphs.
         if ch >= 0x40 and ch <= 0x7E:
             vga_esc_state = 0
         return
@@ -205,13 +499,16 @@ def vga_putc(ch: int32):
         if vga_row >= VGA_ROWS:
             _vga_scroll()
             vga_row = VGA_ROWS - 1
+        _vga_move_cursor()
         return
     if ch == 13:                                            # '\r'
         vga_col = 0
+        _vga_move_cursor()
         return
     if ch == 8 and vga_col > 0:                             # '\b'
         vga_col = vga_col - 1
         _write_cell(vga_row, vga_col, 0x20, DEFAULT_ATTR)
+        _vga_move_cursor()
         return
 
     _write_cell(vga_row, vga_col, ch, DEFAULT_ATTR)
@@ -222,6 +519,7 @@ def vga_putc(ch: int32):
         if vga_row >= VGA_ROWS:
             _vga_scroll()
             vga_row = VGA_ROWS - 1
+    _vga_move_cursor()
 
 
 def vga_puts(s: Ptr[char]):
