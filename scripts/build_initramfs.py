@@ -445,6 +445,18 @@ if os.environ.get("ENABLE_VK_TEST") == "1":
 if os.environ.get("ENABLE_VIRTIO_GPU_TEST") == "1":
     FILES.append(("/etc/virtio-gpu-test", b"1\n"))
 
+# /proc/net renderer self-test. scripts/test_procnet.sh sets
+# ENABLE_PROCNET_TEST=1 to plant /etc/procnet-test; init/main.ad at
+# boot:37.pnt detects the marker and runs procnet_selftest().
+if os.environ.get("ENABLE_PROCNET_TEST") == "1":
+    FILES.append(("/etc/procnet-test", b"1\n"))
+
+# #U52 System V IPC self-test. scripts/test_u52_sysvipc.sh sets
+# ENABLE_SYSVIPC_TEST=1 to plant /etc/sysvipc-test; init/main.ad at
+# boot:37.ipc detects the marker and runs sysvipc_selftest().
+if os.environ.get("ENABLE_SYSVIPC_TEST") == "1":
+    FILES.append(("/etc/sysvipc-test", b"1\n"))
+
 # #168: REAL ACPI S5 poweroff + reboot self-test.
 # scripts/test_acpi_poweroff.sh sets ENABLE_ACPI_TEST=1 to plant
 # /etc/acpi-test. init/main.ad at boot:37.acpi detects the marker, logs
