@@ -1162,11 +1162,111 @@ class Arm64CodeGen:
 
     # -- calls --------------------------------------------------------------
 
+    # -- bare-metal aarch64 system-register intrinsics ----------------------
+    #
+    # The Phase-3 kernel spine needs privileged MSR/MRS access plus barriers,
+    # TLB maintenance, and WFI to bring up the MMU, GICv2, and the generic
+    # timer entirely from Adder (kmain.ad). Rather than reach for inline asm
+    # (UNSUPPORTED here), the codegen recognises a small fixed set of intrinsic
+    # call names and emits the exact instruction. Each `_msr_*` takes one arg
+    # (evaluated into x0, then moved to the system register); each `_mrs_*`
+    # takes no args and leaves the read value in x0; barriers/wfi take none.
+    #
+    # `_msr_daifclr` / `_msr_daifset` take a compile-time-constant immediate
+    # (the DAIF bitfield) since DAIFClr/DAIFSet are immediate-only forms.
+
+    # name -> system register spelled for `msr <reg>, x0`.
+    _MSR_INTRINSICS = {
+        "_msr_vbar_el1":      "vbar_el1",
+        "_msr_mair_el1":      "mair_el1",
+        "_msr_tcr_el1":       "tcr_el1",
+        "_msr_ttbr0_el1":     "ttbr0_el1",
+        "_msr_ttbr1_el1":     "ttbr1_el1",
+        "_msr_sctlr_el1":     "sctlr_el1",
+        "_msr_cntv_tval_el0": "cntv_tval_el0",
+        "_msr_cntv_ctl_el0":  "cntv_ctl_el0",
+    }
+    # name -> system register spelled for `mrs x0, <reg>`.
+    _MRS_INTRINSICS = {
+        "_mrs_cntfrq_el0": "cntfrq_el0",
+        "_mrs_sctlr_el1":  "sctlr_el1",
+    }
+    # name -> verbatim barrier / maintenance / wait instruction (no operands).
+    _NULLARY_INTRINSICS = {
+        "_dsb_ish":         "dsb ish",
+        "_isb":             "isb",
+        "_tlbi_vmalle1is":  "tlbi vmalle1is",
+        "_wfi":             "wfi",
+    }
+
+    def _try_gen_arm64_intrinsic(self, name, args, span) -> bool:
+        """Emit a bare-metal aarch64 sysreg/barrier intrinsic if `name` is one.
+
+        Returns True if it handled the call (so gen_call should stop), False
+        if `name` is not an intrinsic. Intrinsics are only honoured in
+        bare-metal mode and only when not shadowed by a real user function.
+        """
+        if not self.bare_metal:
+            return False
+        if name in self.defined_funcs or name in self.extern_funcs:
+            return False
+        if name in self._MSR_INTRINSICS:
+            if len(args) != 1:
+                raise CodeGenError(
+                    f"aarch64: {name} expects exactly 1 argument")
+            self.gen_expr(args[0])               # value -> x0
+            self.emit(f"    msr {self._MSR_INTRINSICS[name]}, x0")
+            self.emit("    mov x0, #0")
+            return True
+        if name in self._MRS_INTRINSICS:
+            if len(args) != 0:
+                raise CodeGenError(
+                    f"aarch64: {name} expects no arguments")
+            self.emit(f"    mrs x0, {self._MRS_INTRINSICS[name]}")
+            return True
+        if name in self._NULLARY_INTRINSICS:
+            if len(args) != 0:
+                raise CodeGenError(
+                    f"aarch64: {name} expects no arguments")
+            self.emit(f"    {self._NULLARY_INTRINSICS[name]}")
+            self.emit("    mov x0, #0")
+            return True
+        if name == "_install_vbar":
+            # Install the EL1 exception vector table from arch/arm64/vectors.S.
+            # Its symbol `arm64_vectors` is 0x800-aligned (16 entries x 0x80);
+            # load its address PC-relative and write VBAR_EL1.
+            if len(args) != 0:
+                raise CodeGenError(
+                    "aarch64: _install_vbar expects no arguments")
+            self.emit("    adrp x0, arm64_vectors")
+            self.emit("    add x0, x0, :lo12:arm64_vectors")
+            self.emit("    msr vbar_el1, x0")
+            self.emit("    mov x0, #0")
+            return True
+        if name in ("_msr_daifclr", "_msr_daifset"):
+            if len(args) != 1:
+                raise CodeGenError(
+                    f"aarch64: {name} expects exactly 1 constant argument")
+            imm = self._const_int_value(args[0])
+            if imm is None:
+                raise CodeGenError(
+                    f"aarch64: {name} requires a constant immediate")
+            mnem = "daifclr" if name == "_msr_daifclr" else "daifset"
+            self.emit(f"    msr {mnem}, #{imm & 0xf}")
+            self.emit("    mov x0, #0")
+            return True
+        return False
+
     def gen_call(self, call: CallExpr) -> None:
         if call.kwargs:
             raise _unsupported("keyword arguments", call.span)
 
         name = call.func.name if isinstance(call.func, Identifier) else None
+
+        # Bare-metal aarch64 sysreg / barrier intrinsics (MMU/GIC/timer spine).
+        if name is not None and self._try_gen_arm64_intrinsic(
+                name, call.args, call.span):
+            return
 
         # Raw Linux syscall builtins __syscallN(num, a1..aN).
         if name is not None and self._is_syscall_builtin(name) \

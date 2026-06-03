@@ -601,8 +601,9 @@ def assemble_and_link_arm64_baremetal(asm_file: Path, output: Path,
             return False
 
     boot_s = project_root / "arch/arm64/boot.S"
+    vectors_s = project_root / "arch/arm64/vectors.S"
     lds = project_root / "arch/arm64/kernel.lds"
-    for required in (boot_s, lds):
+    for required in (boot_s, vectors_s, lds):
         if not required.exists():
             print(f"Error: missing {required}", file=sys.stderr)
             return False
@@ -610,9 +611,14 @@ def assemble_and_link_arm64_baremetal(asm_file: Path, output: Path,
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
         boot_o = tmpdir / "boot.o"
+        vectors_o = tmpdir / "vectors.o"
         main_o = tmpdir / "main.o"
 
-        for src, obj in [(boot_s, boot_o), (asm_file, main_o)]:
+        # Phase 3: the EL1 exception vector table (vectors.S) is assembled
+        # alongside the boot stub and the Adder-compiled kmain. Its IRQ stub
+        # calls back into the Adder handler arm64_irq_handler.
+        for src, obj in [(boot_s, boot_o), (vectors_s, vectors_o),
+                         (asm_file, main_o)]:
             result = subprocess.run(
                 [as_cmd, "-o", str(obj), str(src)],
                 capture_output=True, text=True,
@@ -627,7 +633,7 @@ def assemble_and_link_arm64_baremetal(asm_file: Path, output: Path,
         link_cmd = [
             ld_cmd, "-nostdlib", "-static", "-z", "noexecstack",
             "-T", str(lds), "-o", str(output),
-            str(boot_o), str(main_o),
+            str(boot_o), str(vectors_o), str(main_o),
         ]
         result = subprocess.run(link_cmd, capture_output=True, text=True)
         if result.returncode != 0:

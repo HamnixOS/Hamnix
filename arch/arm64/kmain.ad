@@ -1,26 +1,84 @@
-# arch/arm64/kmain.ad — Phase 2 bare-metal aarch64 kernel entry.
+# arch/arm64/kmain.ad — Phase 3 bare-metal aarch64 interrupt-driven spine.
 #
-# This is the first Adder code that runs on bare aarch64 (no Linux, no libc).
-# The boot stub arch/arm64/boot.S sets up a stack and branches here. We write
-# a recognizable banner to QEMU virt's PL011 UART (MMIO at 0x0900_0000), then
-# halt forever in a wfi loop.
+# This is the Adder-level kernel that boots on QEMU `virt`. The boot stub
+# arch/arm64/boot.S sets up a stack and branches to kmain(); the EL1 exception
+# vector table lives in arch/arm64/vectors.S and its IRQ entry calls back into
+# the Adder handler arm64_irq_handler() below.
 #
-# Everything here stays inside the Phase 1 arm64 codegen subset: plain
-# function defs, while loops, pointer indexing, casts, and volatile MMIO
-# stores (a write through a cast[Ptr[uint8]](addr) pointer). No structs,
-# globals-with-init, classes, or syscalls — there is no OS underneath.
+# What kmain() does, all driven from Adder:
+#   1. Print a recognizable banner over the PL011 UART (MMIO @0x0900_0000).
+#   2. Bring up a minimal identity-mapped MMU (1 GiB block descriptors:
+#      device region @0x0000_0000, RAM @0x4000_0000) and enable it.
+#   3. Install the EL1 vector table (VBAR_EL1) and initialise GICv2
+#      (distributor @0x0800_0000, CPU interface @0x0801_0000).
+#   4. Program the ARM generic *virtual* timer (PPI INTID 27) for a periodic
+#      tick and unmask IRQs.
+#   5. Spin in WFI. Each timer IRQ prints "[arm64] timer tick"; after 5 ticks
+#      the handler prints "[arm64] timer IRQ OK" and halts deterministically.
+#
+# The privileged system-register pokes (MSR/MRS to VBAR_EL1, SCTLR_EL1,
+# TTBR0_EL1, MAIR_EL1, TCR_EL1, CNTV_*, DAIF) plus DSB/ISB/TLBI/WFI are
+# emitted by codegen_arm64.py as recognised intrinsics (_msr_*, _mrs_*,
+# _dsb_ish, _isb, _tlbi_vmalle1is, _wfi). Everything else — GIC/timer MMIO,
+# the page-table fill, the IRQ service logic — is ordinary Adder.
 
-# QEMU `virt` PL011 UART, primary instance.
-#   data register (DR)   : base + 0x00  — write a byte to transmit it
-#   flag register (FR)   : base + 0x18  — bit 5 (0x20) = TX FIFO full (TXFF)
+# ---------------------------------------------------------------------------
+# PL011 UART (QEMU virt, primary instance).
+#   DR : base + 0x00 — write a byte to transmit it
+#   FR : base + 0x18 — bit 5 (0x20) = TX FIFO full (TXFF)
+# ---------------------------------------------------------------------------
 PL011_BASE: uint64 = 0x09000000
 PL011_FR_TXFF: uint64 = 0x20
 
+# ---------------------------------------------------------------------------
+# GICv2 (QEMU virt).
+#   GICD (distributor)  base = 0x0800_0000
+#   GICC (cpu interface) base = 0x0801_0000
+# ---------------------------------------------------------------------------
+GICD_BASE: uint64 = 0x08000000
+GICC_BASE: uint64 = 0x08010000
+
+GICD_CTLR: uint64 = 0x000
+GICD_ISENABLER: uint64 = 0x100      # set-enable, 1 bit / INTID, 32 / reg
+GICD_IPRIORITYR: uint64 = 0x400     # 8 bits / INTID (byte addressed)
+
+GICC_CTLR: uint64 = 0x000
+GICC_PMR: uint64 = 0x004            # priority mask
+GICC_BPR: uint64 = 0x008
+GICC_IAR: uint64 = 0x00C            # interrupt acknowledge
+GICC_EOIR: uint64 = 0x010           # end of interrupt
+
+VTIMER_INTID: uint64 = 27           # virtual timer PPI
+TICK_LIMIT: int64 = 5
+
+# ---------------------------------------------------------------------------
+# Identity-mapped L1 page table. A single level-1 table of 512 8-byte block
+# descriptors (4 KiB granule => each L1 entry spans 1 GiB). We place it at a
+# fixed, 4 KiB-aligned physical address in RAM, well past the kernel image
+# (loaded at 0x4008_0000) and its 64 KiB boot stack. RAM is identity-mapped
+# Normal-WB by this very table, so the page used to hold the table is itself
+# cacheable Normal memory — fine, the table is read by the page-table walker
+# regardless.
+# ---------------------------------------------------------------------------
+L1_PGTABLE: uint64 = 0x40100000
+
+# Block descriptor attribute bits (stage-1, level-1 block).
+DESC_VALID: uint64 = 0x1            # bit0 valid
+DESC_AF: uint64 = 0x400             # bit10 Access Flag (else translation fault)
+DESC_SH_INNER: uint64 = 0x300       # bits[9:8]=3 Inner shareable
+# AttrIndx: bits[4:2]. attr0 = Device-nGnRE, attr1 = Normal WB.
+DEV_FLAGS: uint64 = 0x401           # VALID | AF | AttrIndx0 (device)
+MEM_FLAGS: uint64 = 0x705           # VALID | AF | SH_INNER | AttrIndx1 (normal)
+
+# Timer period (ticks of CNTFRQ): firing every freq/100 ~= 10 ms. Stashed by
+# kmain after reading CNTFRQ_EL0 so the IRQ handler can re-arm the timer.
+arm64_timer_period: uint64 = 0
+# Number of timer ticks serviced so far.
+arm64_tick_count: int64 = 0
+
 
 def _uart_putc(c: uint8) -> int64:
-    # Spin while the transmit FIFO is full so we never drop a byte. QEMU's
-    # emulated PL011 drains instantly, but polling keeps this correct on
-    # real PL011 silicon too.
+    # Spin while the transmit FIFO is full so we never drop a byte.
     fr: Ptr[uint8] = cast[Ptr[uint8]](PL011_BASE + 0x18)
     while (cast[uint64](fr[0]) & PL011_FR_TXFF) != 0:
         pass
@@ -39,8 +97,176 @@ def _uart_puts(s: Ptr[char]) -> int64:
     return i
 
 
+# ---------------------------------------------------------------------------
+# MMU: build the identity map and enable translation + caches.
+# ---------------------------------------------------------------------------
+def arm64_mmu_init() -> int64:
+    tbl: Ptr[uint64] = cast[Ptr[uint64]](L1_PGTABLE)
+
+    # Zero all 512 entries (anything not explicitly mapped faults).
+    i: int64 = 0
+    while i < 512:
+        tbl[i] = 0
+        i = i + 1
+
+    # entry[0] : VA 0x0000_0000 .. 0x3FFF_FFFF -> Device-nGnRE (GIC + UART).
+    tbl[0] = cast[uint64](0) | DEV_FLAGS
+    # entry[1] : VA 0x4000_0000 .. 0x7FFF_FFFF -> Normal WB (RAM @0x4000_0000).
+    tbl[1] = cast[uint64](0x40000000) | MEM_FLAGS
+
+    # MAIR_EL1 = 0xff04: attr0 = Device-nGnRE (0x04), attr1 = Normal WB (0xff).
+    _msr_mair_el1(cast[uint64](0xff04))
+
+    # TCR_EL1 = 0x1_0000_3519:
+    #   T0SZ=25 (39-bit VA), IRGN0=1, ORGN0=1, SH0=3 (inner shareable),
+    #   TG0=0 (4 KiB granule), IPS=1 (36-bit PA).
+    _msr_tcr_el1(cast[uint64](0x100003519))
+
+    # TTBR0_EL1 = &L1 table; TTBR1_EL1 unused.
+    _msr_ttbr0_el1(L1_PGTABLE)
+    _msr_ttbr1_el1(cast[uint64](0))
+
+    # Make the table writes + sysreg writes visible, flush the TLB.
+    _dsb_ish()
+    _tlbi_vmalle1is()
+    _dsb_ish()
+    _isb()
+
+    # SCTLR_EL1: set M (MMU, bit0), C (data cache, bit2), I (instr cache,
+    # bit12). Read-modify-write to preserve the reset state of the rest.
+    sctlr: uint64 = cast[uint64](_mrs_sctlr_el1())
+    sctlr = sctlr | cast[uint64](0x1)      # M
+    sctlr = sctlr | cast[uint64](0x4)      # C
+    sctlr = sctlr | cast[uint64](0x1000)   # I
+    _msr_sctlr_el1(sctlr)
+    _isb()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# GICv2 bring-up: install VBAR_EL1 (the vector table from vectors.S), then
+# enable the distributor + CPU interface and route our timer INTID.
+# ---------------------------------------------------------------------------
+def arm64_gic_init() -> int64:
+    # Install the EL1 exception vector table. arm64_vectors is defined in
+    # arch/arm64/vectors.S; we materialise its address as an extern.
+    _install_vbar()
+    _isb()
+
+    # --- GIC Distributor ---
+    gicd_ctlr: Ptr[uint32] = cast[Ptr[uint32]](GICD_BASE + GICD_CTLR)
+    gicd_ctlr[0] = 0                                  # disable while configuring
+
+    # Enable INTID 27 (timer PPI). It lives in ISENABLER[0] (INTIDs 0..31).
+    isenabler: Ptr[uint32] = cast[Ptr[uint32]](GICD_BASE + GICD_ISENABLER)
+    isenabler[0] = cast[uint32](1 << 27)
+
+    # Priority 0 (highest) for INTID 27. IPRIORITYR is byte-addressed.
+    iprio: Ptr[uint8] = cast[Ptr[uint8]](GICD_BASE + GICD_IPRIORITYR + VTIMER_INTID)
+    iprio[0] = 0
+
+    gicd_ctlr[0] = 1                                  # enable distributor
+
+    # --- GIC CPU interface ---
+    gicc_pmr: Ptr[uint32] = cast[Ptr[uint32]](GICC_BASE + GICC_PMR)
+    gicc_pmr[0] = 0xF0                                # allow all priorities
+    gicc_bpr: Ptr[uint32] = cast[Ptr[uint32]](GICC_BASE + GICC_BPR)
+    gicc_bpr[0] = 0                                   # no preemption grouping
+    gicc_ctlr: Ptr[uint32] = cast[Ptr[uint32]](GICC_BASE + GICC_CTLR)
+    gicc_ctlr[0] = 1                                  # enable signalling
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Virtual timer: program a periodic tick and unmask IRQs.
+# ---------------------------------------------------------------------------
+def arm64_timer_init() -> int64:
+    freq: uint64 = cast[uint64](_mrs_cntfrq_el0())    # timer rate (Hz)
+    period: uint64 = freq / cast[uint64](100)         # ~10 ms
+    arm64_timer_period = period
+
+    _msr_cntv_tval_el0(period)                        # CVAL = now + period
+    _msr_cntv_ctl_el0(cast[uint64](1))                # ENABLE=1, IMASK=0
+    _isb()
+
+    _msr_daifclr(2)                                   # clear DAIF.I -> IRQs on
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# IRQ service routine — called from the vectors.S IRQ stub (which has saved
+# the GPR frame). Acks at GICC, prints a per-tick marker, re-arms the timer,
+# EOIs, and after TICK_LIMIT ticks prints the completion banner and halts.
+# ---------------------------------------------------------------------------
+def arm64_irq_handler() -> int64:
+    gicc_iar: Ptr[uint32] = cast[Ptr[uint32]](GICC_BASE + GICC_IAR)
+    gicc_eoir: Ptr[uint32] = cast[Ptr[uint32]](GICC_BASE + GICC_EOIR)
+
+    iar: uint32 = gicc_iar[0]                          # ack: raw IAR
+    intid: uint64 = cast[uint64](iar) & cast[uint64](0x3FF)
+
+    if intid != VTIMER_INTID:
+        gicc_eoir[0] = iar                            # spurious: just EOI
+        return 0
+
+    # Our timer. Quiesce the firing condition while we service it.
+    _msr_cntv_ctl_el0(cast[uint64](0))
+
+    tickmsg: Ptr[char] = "[arm64] timer tick\n"
+    _uart_puts(tickmsg)
+
+    arm64_tick_count = arm64_tick_count + 1
+
+    # Re-arm the next compare and re-enable the timer.
+    _msr_cntv_tval_el0(arm64_timer_period)
+    _msr_cntv_ctl_el0(cast[uint64](1))
+
+    # EOI the verbatim IAR value.
+    gicc_eoir[0] = iar
+
+    if arm64_tick_count >= TICK_LIMIT:
+        donemsg: Ptr[char] = "[arm64] timer IRQ OK\n"
+        _uart_puts(donemsg)
+        # Mask IRQs and halt deterministically in a WFI loop.
+        _msr_daifset(2)
+        while True:
+            _wfi()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Synchronous / unhandled exception diagnostics (called from vectors.S).
+# ---------------------------------------------------------------------------
+def arm64_sync_panic() -> int64:
+    msg: Ptr[char] = "[arm64] SYNC EXCEPTION\n"
+    _uart_puts(msg)
+    while True:
+        _wfi()
+    return 0
+
+
+def arm64_unhandled_panic() -> int64:
+    msg: Ptr[char] = "[arm64] UNHANDLED EXCEPTION\n"
+    _uart_puts(msg)
+    while True:
+        _wfi()
+    return 0
+
+
 def kmain() -> int64:
     banner: Ptr[char] = "HAMNIX aarch64 boot OK\n"
     _uart_puts(banner)
-    # Boot stub halts on return; return cleanly.
+
+    arm64_mmu_init()
+    mmu_msg: Ptr[char] = "[arm64] MMU enabled\n"
+    _uart_puts(mmu_msg)
+
+    arm64_gic_init()
+    arm64_timer_init()
+    gic_msg: Ptr[char] = "[arm64] GICv2 + timer up\n"
+    _uart_puts(gic_msg)
+
+    # Wait for timer IRQs; the handler halts after TICK_LIMIT ticks.
+    while True:
+        _wfi()
     return 0
