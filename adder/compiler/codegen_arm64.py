@@ -1229,6 +1229,11 @@ class Arm64CodeGen:
         # trapping; without this an EL0 (or kernel) fmov would take an EC=0x07
         # access-to-SIMD fault.
         "_msr_cpacr_el1":     "cpacr_el1",
+        # Phase 23: TPIDR_EL0 is the EL0-accessible thread pointer the AArch64
+        # TLS ABI uses. The kernel writes it on every context switch (per-thread
+        # SETTLS value) so an EL0 thread can read its own thread-local block base
+        # with `mrs x, tpidr_el0` and no syscall.
+        "_msr_tpidr_el0":     "tpidr_el0",
     }
     # name -> system register spelled for `mrs x0, <reg>`.
     _MRS_INTRINSICS = {
@@ -1259,6 +1264,10 @@ class Arm64CodeGen:
         # Phase 13: CPACR_EL1 is read so the FP demo can OR in FPEN without
         # clobbering other (RES0/RES1) bits before writing it back.
         "_mrs_cpacr_el1":  "cpacr_el1",
+        # Phase 23: TPIDR_EL0 is read back by the kernel to confirm what the
+        # running EL0 thread sees as its thread pointer, and by EL0 code itself
+        # (via the same intrinsic in a built routine) to fetch its TLS base.
+        "_mrs_tpidr_el0":  "tpidr_el0",
     }
     # name -> verbatim barrier / maintenance / wait instruction (no operands).
     _NULLARY_INTRINSICS = {
