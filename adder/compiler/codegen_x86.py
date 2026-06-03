@@ -423,6 +423,55 @@ class X86CodeGen:
             return self.get_type_size(t.base_type)
         return 8
 
+    def _emit_cast_widen(self, inner: Expr, cast_to: Optional[Type]) -> None:
+        """After `cast[T](inner)` has left the inner value in %rax, fix up
+        the high bits of %rax when the cast WIDENS a sub-8-byte integer.
+
+        x86 integer widening must follow C: a signed narrower source
+        sign-extends, an unsigned narrower source zero-extends. We already
+        have the (zero- or sign-extended) sub-word in %rax from the inner
+        loader, but that loader extended according to the SOURCE's width &
+        signedness, not the cast's intent — and for runtime sources whose
+        type we can't see, it may have left junk in the high bits. So when
+        the target is wider than the source and the source is a known
+        signed integer, re-extend with the proper signed move keyed on the
+        source width. Unsigned / unknown / same-or-narrowing cases are left
+        untouched (preserving the historical no-op behaviour and the
+        pointer / uint64 arithmetic paths)."""
+        if cast_to is None:
+            return
+        # Only plain integer target types participate; pointers, arrays,
+        # structs, function pointers, floats etc. are never sign-extended.
+        if not (hasattr(cast_to, "name")
+                and getattr(cast_to, "name", None) in self._INT_NAMES):
+            return
+        src_type = self.get_expr_type(inner)
+        if src_type is None:
+            # Unknown source type: keep the historical no-op. We can't tell
+            # signedness, and assuming signed could corrupt an unsigned
+            # value with the high bit set.
+            return
+        # Pointers / aggregates as a source are never narrow signed ints.
+        if not (hasattr(src_type, "name")
+                and getattr(src_type, "name", None) in self._INT_NAMES):
+            return
+        src_size = self.get_type_size(src_type)
+        dst_size = self.get_type_size(cast_to)
+        if dst_size <= src_size or src_size >= 8:
+            # Narrowing or same-width: no high-bit fix needed.
+            return
+        if self._is_unsigned_type(src_type):
+            # Unsigned widening = zero-extend. The inner loader already
+            # zero-extends sub-word loads (movl auto-clears the high 32;
+            # movzbq/movzwq clear the rest), so nothing to do.
+            return
+        # Signed widening: sign-extend the low `src_size` bytes of %rax.
+        sext = {1: "movsbq %al, %rax",
+                2: "movswq %ax, %rax",
+                4: "movslq %eax, %rax"}.get(src_size)
+        if sext is not None:
+            self.emit(f"    {sext}")
+
     def emit_load_sized(self, size: int, addr_reg: str = "%rax",
                         dst: str = "%rax") -> None:
         """Load `size` bytes from [addr_reg] into `dst` (zero-extended)."""
@@ -2183,14 +2232,22 @@ class X86CodeGen:
             case CallExpr():
                 self.gen_call(expr)
 
-            case CastExpr(expr=inner):
-                # All integer types live in a 64-bit %rax slot in our ABI;
-                # widening / narrowing between int32/int64/uint64/etc. is
-                # a no-op at the assembly level (callers that care about
-                # the upper bits use explicit masks). Float<->int would
-                # need runtime conversion, but no x86 caller exercises
-                # that path yet — when it does we'll specialize here.
+            case CastExpr(expr=inner, target_type=cast_to):
+                # All integer types live in a 64-bit %rax slot in our ABI.
+                # Narrowing is a no-op here (callers that care about the
+                # upper bits mask). WIDENING a sub-8-byte source, however,
+                # must respect the SOURCE type's signedness so the high
+                # bits of %rax carry the right value for subsequent signed
+                # 64-bit arithmetic/compares:
+                #   * signed   narrower source -> sign-extend (movsXq)
+                #   * unsigned narrower source -> zero-extend (movzXq / movl)
+                # Without this, a runtime negative int32 (e.g. -1000 =
+                # 0xFFFFFC18) loaded via a 32-bit `movl` lands in %rax as
+                # 0x00000000FFFFFC18 — silently positive when later compared
+                # as int64. (A compile-time constant already sign-extends in
+                # its loader, which is why only runtime values were bitten.)
                 self.gen_expr(inner)
+                self._emit_cast_widen(inner, cast_to)
 
             case ConditionalExpr(condition=cond, then_expr=t_expr,
                                  else_expr=e_expr):
@@ -2732,6 +2789,9 @@ class X86CodeGen:
     _SIGNED_INT_NAMES = frozenset({
         "int8", "int16", "int32", "int64", "int",
     })
+    # All scalar integer type names (signed + unsigned). Used to gate the
+    # cast-widening sign/zero-extension fix-up to genuine integer casts.
+    _INT_NAMES = _UNSIGNED_INT_NAMES | _SIGNED_INT_NAMES
 
     def _is_unsigned_type(self, t: Optional[Type]) -> Optional[bool]:
         """True if `t` is an unsigned integer / pointer type, False if signed,
