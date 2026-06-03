@@ -52,6 +52,34 @@ from sys.src.port9.port.chan import (
 from sys.src.port9.port.chan import (
     pgrp_current, pgrp_render_ns, mnttab_entry_count, mnttab_bind,
 )
+# /proc/net/{tcp,udp,arp,route,dev}: rendered live from the kernel net
+# stack. Each subsystem exposes tiny read-only getters (it owns its own
+# parallel-array globals; procfs can't reach them directly).
+#   socket.ad : kernel socket table (UDP/TCP slot tuples + state)
+#   tcp.ad    : TCB table (TCP state machine, per-slot ports/remote IP)
+#   arp.ad    : ARP cache entries
+#   ip.ad     : our IPv4, gateway, netmask
+#   eth.ad    : the single net_device (name/mtu/up + packet counters)
+from drivers.net.socket import (
+    ksock_slot_state, ksock_slot_type, ksock_slot_local_ip,
+    ksock_slot_local_port, ksock_slot_peer_ip, ksock_slot_peer_port,
+    SS_FREE, KSOCK_DGRAM,
+)
+from drivers.net.tcp import (
+    tcp_num_slots, tcp_slot_st, tcp_slot_lport, tcp_slot_rport,
+    tcp_slot_rip, TCP_CLOSED,
+)
+from drivers.net.arp import (
+    arp_cache_size, arp_slot_valid, arp_slot_ip, arp_slot_mac_byte,
+)
+from drivers.net.ip import (
+    ip_our_ip_b, ip_gateway_b, ip_netmask_b, ip_have_our_ip,
+    ip_have_gateway, ip_have_netmask,
+)
+from drivers.net.eth import (
+    nd_name_ptr, nd_is_up, nd_mtu_get,
+    nd_rx_pkts_get, nd_rx_drop_get, nd_tx_pkts_get,
+)
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
@@ -1184,6 +1212,485 @@ def procmounts_selftest() -> int32:
     return 1
 
 
+# -------------------------------------------------------------------
+# /proc/net/{tcp,udp,arp,route,dev} — Linux-format network state
+#
+# Mirrors fs/proc/net/* in Linux at the smallest shipping scope. Every
+# node renders live kernel net state into the Linux text format so the
+# stock Linux tools that parse /proc/net (netstat, ss, ifconfig, route,
+# arp -a) read them byte-compatibly. All addresses follow Linux's wire
+# conventions: /proc/net/tcp + /proc/net/udp print the IPv4 as the
+# little-endian hex of the 32-bit network-order address; /proc/net/route
+# prints destination/gateway/mask the same little-endian way. Ports in
+# tcp/udp are big-endian (network) hex; here we render them host-order
+# hex since that is what the slot/socket tables store.
+
+# Module-scope scratch buffer for the boot self-test (renderers write
+# into the caller-supplied page; this is only the self-test target).
+procnet_selftest_buf: Array[4096, uint8]
+
+
+def _hex_nib(v: uint8) -> uint8:
+    # One hex nibble (0..15) -> ASCII '0'..'9','A'..'F'.
+    if v < 10:
+        return v + 48                          # '0'
+    return (v - 10) + 65                        # 'A'
+
+
+def _buf_put_hex8(buf: Ptr[uint8], pos: uint64, value: uint32) -> uint64:
+    # 8 hex digits, MSB first, zero-padded (%08X).
+    i: int32 = 7
+    while i >= 0:
+        nib: uint8 = cast[uint8]((value >> cast[uint32](i * 4)) & 0xF)
+        buf[pos] = _hex_nib(nib)
+        pos = pos + 1
+        i = i - 1
+    return pos
+
+
+def _buf_put_hex4(buf: Ptr[uint8], pos: uint64, value: uint16) -> uint64:
+    # 4 hex digits, MSB first, zero-padded (%04X).
+    v: uint32 = cast[uint32](value)
+    i: int32 = 3
+    while i >= 0:
+        nib: uint8 = cast[uint8]((v >> cast[uint32](i * 4)) & 0xF)
+        buf[pos] = _hex_nib(nib)
+        pos = pos + 1
+        i = i - 1
+    return pos
+
+
+def _buf_put_hex2(buf: Ptr[uint8], pos: uint64, value: uint8) -> uint64:
+    # 2 hex digits (%02X).
+    buf[pos] = _hex_nib((value >> 4) & 0xF)
+    buf[pos + 1] = _hex_nib(value & 0xF)
+    return pos + 2
+
+
+def _swap32(v: uint32) -> uint32:
+    # Byte-reverse a 32-bit word. Our IP getters pack the first dotted-
+    # quad octet in the HIGH byte (a.b.c.d -> 0xAABBCCDD); Linux prints
+    # /proc/net addresses as the little-endian hex of the network-order
+    # bytes, i.e. 0xDDCCBBAA. Swapping converts one to the other.
+    b0: uint32 = (v >> 24) & 0xFF
+    b1: uint32 = (v >> 16) & 0xFF
+    b2: uint32 = (v >> 8) & 0xFF
+    b3: uint32 = v & 0xFF
+    return (b3 << 24) | (b2 << 16) | (b1 << 8) | b0
+
+
+def _buf_put_le_addr(buf: Ptr[uint8], pos: uint64, ip_hi: uint32) -> uint64:
+    # Render an IPv4 (packed first-octet-high) as Linux's little-endian
+    # %08X /proc/net address.
+    return _buf_put_hex8(buf, pos, _swap32(ip_hi))
+
+
+def _buf_put_dec_pad(buf: Ptr[uint8], pos: uint64, value: uint64,
+                     width: uint64) -> uint64:
+    # Right-justify a decimal in a field `width` wide with leading
+    # spaces (e.g. "%4d"). Used for the /proc/net/tcp `sl` column.
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    if value == 0:
+        digits[0] = 48
+        n = 1
+    else:
+        v: uint64 = value
+        while v != 0:
+            digits[n] = cast[uint8](v % 10) + 48
+            v = v / 10
+            n = n + 1
+    pad: uint64 = 0
+    while pad + n < width:
+        buf[pos] = 32                          # ' '
+        pos = pos + 1
+        pad = pad + 1
+    k: uint64 = n
+    while k > 0:
+        k = k - 1
+        buf[pos] = digits[k]
+        pos = pos + 1
+    return pos
+
+
+def _net_tcp_state_num(st: uint32) -> uint32:
+    # Map the kernel's TCP_* enum (drivers/net/tcp.ad) to Linux's
+    # /proc/net/tcp numeric state. The two enums already line up 1:1
+    # for the states we implement (CLOSED..TIME_WAIT == 0..10 in BOTH),
+    # but Linux uses 1=ESTABLISHED..11=CLOSING ordering. Translate so
+    # netstat/ss print the right state name. Our enum:
+    #   CLOSED=0 LISTEN=1 SYN_SENT=2 SYN_RECV=3 ESTABLISHED=4
+    #   FIN_WAIT_1=5 FIN_WAIT_2=6 CLOSE_WAIT=7 CLOSING=8 LAST_ACK=9
+    #   TIME_WAIT=10
+    # Linux /proc enum (include/net/tcp_states.h, +1 vs the C enum):
+    #   ESTABLISHED=1 SYN_SENT=2 SYN_RECV=3 FIN_WAIT1=4 FIN_WAIT2=5
+    #   TIME_WAIT=6 CLOSE=7 CLOSE_WAIT=8 LAST_ACK=9 LISTEN=10 CLOSING=11
+    if st == TCP_CLOSED:
+        return 7                                # TCP_CLOSE
+    if st == 1:                                 # our LISTEN
+        return 10
+    if st == 2:                                 # SYN_SENT
+        return 2
+    if st == 3:                                 # SYN_RECV
+        return 3
+    if st == 4:                                 # ESTABLISHED
+        return 1
+    if st == 5:                                 # FIN_WAIT_1
+        return 4
+    if st == 6:                                 # FIN_WAIT_2
+        return 5
+    if st == 7:                                 # CLOSE_WAIT
+        return 8
+    if st == 8:                                 # CLOSING
+        return 11
+    if st == 9:                                 # LAST_ACK
+        return 9
+    if st == 10:                                # TIME_WAIT
+        return 6
+    return 7
+
+
+def _net_put_conn_row(buf: Ptr[uint8], pos: uint64, sl: uint64,
+                      laddr_hi: uint32, lport: uint16,
+                      raddr_hi: uint32, rport: uint16,
+                      st: uint32) -> uint64:
+    # One /proc/net/{tcp,udp} row:
+    #   "  sl: LADDR:LPORT RADDR:RPORT ST tx rx tr when retr uid to inode\n"
+    # We fill the columns we don't track with the zero values Linux
+    # prints for an idle socket, keeping the field layout intact so
+    # netstat/ss tokenise it correctly.
+    pos = _buf_put_dec_pad(buf, pos, sl, 4)
+    buf[pos] = 58                              # ':'
+    pos = pos + 1
+    buf[pos] = 32
+    pos = pos + 1
+    pos = _buf_put_le_addr(buf, pos, laddr_hi)
+    buf[pos] = 58
+    pos = pos + 1
+    pos = _buf_put_hex4(buf, pos, lport)
+    buf[pos] = 32
+    pos = pos + 1
+    pos = _buf_put_le_addr(buf, pos, raddr_hi)
+    buf[pos] = 58
+    pos = pos + 1
+    pos = _buf_put_hex4(buf, pos, rport)
+    buf[pos] = 32
+    pos = pos + 1
+    pos = _buf_put_hex2(buf, pos, cast[uint8](st & 0xFF))
+    # tx_queue:rx_queue tr:tm->when retrnsmt  (all zero — untracked)
+    pos = _buf_put_str(buf, pos, " 00000000:00000000 00:00000000 00000000")
+    # uid  timeout inode
+    pos = _buf_put_str(buf, pos, "     0        0 0\n")
+    return pos
+
+
+def render_net_tcp(buf: Ptr[uint8]) -> uint64:
+    # /proc/net/tcp — one row per active TCB plus any CONNECTED kernel
+    # stream socket the TCB table doesn't already cover.
+    pos: uint64 = 0
+    pos = _buf_put_str(buf, pos,
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n")
+    sl: uint64 = 0
+    laddr_hi: uint32 = 0
+    if ip_have_our_ip() != 0:
+        laddr_hi = _net_our_ip_hi()
+    n: uint64 = tcp_num_slots()
+    i: uint64 = 0
+    while i < n:
+        st: uint32 = tcp_slot_st(i)
+        if st != TCP_CLOSED:
+            lnum: uint32 = _net_tcp_state_num(st)
+            pos = _net_put_conn_row(buf, pos, sl, laddr_hi,
+                                    tcp_slot_lport(i),
+                                    tcp_slot_rip(i), tcp_slot_rport(i),
+                                    lnum)
+            sl = sl + 1
+        i = i + 1
+    return pos
+
+
+def render_net_udp(buf: Ptr[uint8]) -> uint64:
+    # /proc/net/udp — one row per non-free DGRAM kernel socket. UDP is
+    # connectionless, so Linux always prints state 07 (TCP_CLOSE) for
+    # UDP sockets; we do the same. Ports/IPs come from the kernel socket
+    # table (network order; we host-order the port for %04X).
+    pos: uint64 = 0
+    pos = _buf_put_str(buf, pos,
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n")
+    sl: uint64 = 0
+    i: uint64 = 0
+    while i < 16:
+        if ksock_slot_state(i) != SS_FREE:
+            if ksock_slot_type(i) == KSOCK_DGRAM:
+                # ksock IPs are network-order packed first-octet-high
+                # (same as our other getters); ports are network order.
+                lport: uint16 = _net_ntohs(ksock_slot_local_port(i))
+                rport: uint16 = _net_ntohs(ksock_slot_peer_port(i))
+                pos = _net_put_conn_row(buf, pos, sl,
+                                        ksock_slot_local_ip(i), lport,
+                                        ksock_slot_peer_ip(i), rport,
+                                        7)
+                sl = sl + 1
+        i = i + 1
+    return pos
+
+
+def render_net_arp(buf: Ptr[uint8]) -> uint64:
+    # /proc/net/arp — one row per live ARP cache entry:
+    #   IP address  HW type  Flags  HW address  Mask  Device
+    # HW type 0x1 = ARPHRD_ETHER, Flags 0x2 = ATF_COM (complete).
+    pos: uint64 = 0
+    pos = _buf_put_str(buf, pos,
+        "IP address       HW type     Flags       HW address            Mask     Device\n")
+    ifn: Ptr[uint8] = nd_name_ptr()
+    n: uint64 = arp_cache_size()
+    i: uint64 = 0
+    while i < n:
+        if arp_slot_valid(i) != 0:
+            ip_hi: uint32 = arp_slot_ip(i)
+            # "10.0.2.2        " — dotted quad left-justified in 16 cols.
+            start: uint64 = pos
+            pos = _net_put_dotted(buf, pos, ip_hi)
+            while pos - start < 16:
+                buf[pos] = 32
+                pos = pos + 1
+            pos = _buf_put_str(buf, pos, "0x1         0x2         ")
+            # MAC "aa:bb:cc:dd:ee:ff"
+            j: uint64 = 0
+            while j < 6:
+                if j > 0:
+                    buf[pos] = 58
+                    pos = pos + 1
+                pos = _buf_put_hex2(buf, pos, arp_slot_mac_byte(i, j))
+                j = j + 1
+            pos = _buf_put_str(buf, pos, "     *        ")
+            pos = _net_put_ifname(buf, pos, ifn)
+            buf[pos] = 10
+            pos = pos + 1
+        i = i + 1
+    return pos
+
+
+def render_net_route(buf: Ptr[uint8]) -> uint64:
+    # /proc/net/route — kernel routing table, tab-separated, Linux
+    # format. Addresses are little-endian hex of the network-order
+    # address. We emit two routes when configured: the default route
+    # (0.0.0.0 via gateway, flags 0x3 = UP|GATEWAY) and the on-link
+    # subnet route (network/netmask, gateway 0.0.0.0, flags 0x1 = UP).
+    pos: uint64 = 0
+    pos = _buf_put_str(buf, pos,
+        "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n")
+    ifn: Ptr[uint8] = nd_name_ptr()
+    mtu: uint64 = cast[uint64](nd_mtu_get())
+    # Default route via the gateway.
+    if ip_have_gateway() != 0:
+        gw_hi: uint32 = _net_gateway_hi()
+        pos = _net_put_ifname(buf, pos, ifn)
+        buf[pos] = 9
+        pos = pos + 1
+        pos = _buf_put_hex8(buf, pos, 0)                 # dest 0.0.0.0
+        buf[pos] = 9
+        pos = pos + 1
+        pos = _buf_put_hex8(buf, pos, _swap32(gw_hi))    # gateway LE
+        pos = _buf_put_str(buf, pos, "\t0003\t0\t0\t0\t")
+        pos = _buf_put_hex8(buf, pos, 0)                 # mask 0.0.0.0
+        pos = _net_put_route_tail(buf, pos, mtu)
+    # On-link subnet route.
+    if ip_have_our_ip() != 0:
+        mask_hi: uint32 = _net_netmask_hi()
+        net_hi: uint32 = _net_our_ip_hi() & mask_hi
+        pos = _net_put_ifname(buf, pos, ifn)
+        buf[pos] = 9
+        pos = pos + 1
+        pos = _buf_put_hex8(buf, pos, _swap32(net_hi))   # dest = network
+        buf[pos] = 9
+        pos = pos + 1
+        pos = _buf_put_hex8(buf, pos, 0)                 # gateway 0.0.0.0
+        pos = _buf_put_str(buf, pos, "\t0001\t0\t0\t0\t")
+        pos = _buf_put_hex8(buf, pos, _swap32(mask_hi))  # mask LE
+        pos = _net_put_route_tail(buf, pos, mtu)
+    return pos
+
+
+def render_net_dev(buf: Ptr[uint8]) -> uint64:
+    # /proc/net/dev — two header lines, then one row per interface. We
+    # have a loopback (synthetic, all-zero counters) and the single real
+    # NIC. We track packet counters but no byte counters, so the bytes
+    # columns are 0 and the *_packets columns carry the real counts.
+    pos: uint64 = 0
+    pos = _buf_put_str(buf, pos,
+        "Inter-|   Receive                                                |  Transmit\n")
+    pos = _buf_put_str(buf, pos,
+        " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n")
+    # lo — synthetic loopback, all zeros.
+    pos = _net_put_dev_row(buf, pos, "lo", 0, 0, 0, 0)
+    # The real NIC. nd_name is empty until the driver sets it; fall back
+    # to "eth0" so the row is always greppable.
+    ifn: Ptr[uint8] = nd_name_ptr()
+    if ifn[0] == 0:
+        pos = _net_put_dev_row(buf, pos, "eth0",
+                               nd_rx_pkts_get(), nd_rx_drop_get(),
+                               nd_tx_pkts_get(), 0)
+    else:
+        pos = _net_put_dev_row_p(buf, pos, ifn,
+                                 nd_rx_pkts_get(), nd_rx_drop_get(),
+                                 nd_tx_pkts_get(), 0)
+    return pos
+
+
+# --- small render helpers shared by the /proc/net family ------------
+
+def _net_ntohs(v: uint16) -> uint16:
+    # Network->host 16-bit swap (the socket table stores ports in
+    # network order; %04X wants host order so the printed hex matches
+    # Linux which prints the network-order value byte-swapped).
+    return cast[uint16]((cast[uint32](v) >> 8) | ((cast[uint32](v) & 0xFF) << 8))
+
+
+def _net_our_ip_hi() -> uint32:
+    b0: uint32 = cast[uint32](ip_our_ip_b(0))
+    b1: uint32 = cast[uint32](ip_our_ip_b(1))
+    b2: uint32 = cast[uint32](ip_our_ip_b(2))
+    b3: uint32 = cast[uint32](ip_our_ip_b(3))
+    return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+
+
+def _net_gateway_hi() -> uint32:
+    b0: uint32 = cast[uint32](ip_gateway_b(0))
+    b1: uint32 = cast[uint32](ip_gateway_b(1))
+    b2: uint32 = cast[uint32](ip_gateway_b(2))
+    b3: uint32 = cast[uint32](ip_gateway_b(3))
+    return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+
+
+def _net_netmask_hi() -> uint32:
+    # When no netmask is configured, default to /24 (255.255.255.0) so
+    # the on-link route still has a sane mask.
+    if ip_have_netmask() == 0:
+        return 0xFFFFFF00
+    b0: uint32 = cast[uint32](ip_netmask_b(0))
+    b1: uint32 = cast[uint32](ip_netmask_b(1))
+    b2: uint32 = cast[uint32](ip_netmask_b(2))
+    b3: uint32 = cast[uint32](ip_netmask_b(3))
+    return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+
+
+def _net_put_dotted(buf: Ptr[uint8], pos: uint64, ip_hi: uint32) -> uint64:
+    # Dotted-quad from a first-octet-high packed IP.
+    pos = _buf_put_dec(buf, pos, cast[uint64]((ip_hi >> 24) & 0xFF))
+    buf[pos] = 46
+    pos = pos + 1
+    pos = _buf_put_dec(buf, pos, cast[uint64]((ip_hi >> 16) & 0xFF))
+    buf[pos] = 46
+    pos = pos + 1
+    pos = _buf_put_dec(buf, pos, cast[uint64]((ip_hi >> 8) & 0xFF))
+    buf[pos] = 46
+    pos = pos + 1
+    pos = _buf_put_dec(buf, pos, cast[uint64](ip_hi & 0xFF))
+    return pos
+
+
+def _net_put_ifname(buf: Ptr[uint8], pos: uint64, ifn: Ptr[uint8]) -> uint64:
+    # Interface name, with an "eth0" fallback when nd_name is empty.
+    if ifn[0] == 0:
+        return _buf_put_str(buf, pos, "eth0")
+    return _buf_put_str(buf, pos, ifn)
+
+
+def _net_put_route_tail(buf: Ptr[uint8], pos: uint64, mtu: uint64) -> uint64:
+    # "\tMTU\t0\t0\n" — MTU then Window/IRTT (both 0).
+    buf[pos] = 9
+    pos = pos + 1
+    pos = _buf_put_dec(buf, pos, mtu)
+    pos = _buf_put_str(buf, pos, "\t0\t0\n")
+    return pos
+
+
+def _net_put_dev_counts(buf: Ptr[uint8], pos: uint64, rx_pkts: uint64,
+                        rx_drop: uint64, tx_pkts: uint64,
+                        tx_drop: uint64) -> uint64:
+    # The 16 counter columns. bytes/errs/fifo/frame/compressed/multicast
+    # /colls/carrier are untracked (0); packets + drop are real.
+    #   RX: bytes packets errs drop fifo frame compressed multicast
+    pos = _buf_put_str(buf, pos, "       0 ")        # rx bytes
+    pos = _buf_put_dec(buf, pos, rx_pkts)
+    buf[pos] = 32
+    pos = pos + 1
+    pos = _buf_put_str(buf, pos, "0 ")               # errs
+    pos = _buf_put_dec(buf, pos, rx_drop)
+    pos = _buf_put_str(buf, pos, " 0 0 0 0")         # fifo frame compr mcast
+    #   TX: bytes packets errs drop fifo colls carrier compressed
+    pos = _buf_put_str(buf, pos, "        0 ")       # tx bytes
+    pos = _buf_put_dec(buf, pos, tx_pkts)
+    buf[pos] = 32
+    pos = pos + 1
+    pos = _buf_put_str(buf, pos, "0 ")               # errs
+    pos = _buf_put_dec(buf, pos, tx_drop)
+    pos = _buf_put_str(buf, pos, " 0 0 0 0\n")       # fifo colls carrier compr
+    return pos
+
+
+def _net_put_dev_row(buf: Ptr[uint8], pos: uint64, name: Ptr[uint8],
+                     rx_pkts: uint64, rx_drop: uint64,
+                     tx_pkts: uint64, tx_drop: uint64) -> uint64:
+    # "<name>: <counts>\n". /proc/net/dev right-justifies the name in a
+    # 6-char field; we keep it simple-but-parseable (leading spaces +
+    # name + ':').
+    start: uint64 = pos
+    pos = _buf_put_str(buf, pos, name)
+    # Right-justify is cosmetic; Linux tools split on ':' so a plain
+    # "name:" works. Pad to align the common 1-2 char names anyway.
+    while pos - start < 6:
+        buf[pos] = 32
+        pos = pos + 1
+    buf[pos] = 58
+    pos = pos + 1
+    return _net_put_dev_counts(buf, pos, rx_pkts, rx_drop, tx_pkts, tx_drop)
+
+
+def _net_put_dev_row_p(buf: Ptr[uint8], pos: uint64, name: Ptr[uint8],
+                       rx_pkts: uint64, rx_drop: uint64,
+                       tx_pkts: uint64, tx_drop: uint64) -> uint64:
+    # Same as _net_put_dev_row but name comes from a live buffer ptr.
+    return _net_put_dev_row(buf, pos, name, rx_pkts, rx_drop,
+                            tx_pkts, tx_drop)
+
+
+def procnet_selftest() -> int32:
+    # Boot self-test: render each /proc/net node and assert the header
+    # line and basic shape are present. Returns 1 on PASS, 0 on FAIL.
+    n: uint64 = render_net_tcp(&procnet_selftest_buf[0])
+    if _cpuinfo_buf_contains(&procnet_selftest_buf[0], n,
+            "local_address rem_address") == 0:
+        printk0("[PROCNET] FAIL /proc/net/tcp header missing\n")
+        return 0
+    n = render_net_udp(&procnet_selftest_buf[0])
+    if _cpuinfo_buf_contains(&procnet_selftest_buf[0], n,
+            "local_address rem_address") == 0:
+        printk0("[PROCNET] FAIL /proc/net/udp header missing\n")
+        return 0
+    n = render_net_arp(&procnet_selftest_buf[0])
+    if _cpuinfo_buf_contains(&procnet_selftest_buf[0], n,
+            "HW address") == 0:
+        printk0("[PROCNET] FAIL /proc/net/arp header missing\n")
+        return 0
+    n = render_net_route(&procnet_selftest_buf[0])
+    if _cpuinfo_buf_contains(&procnet_selftest_buf[0], n,
+            "Destination") == 0:
+        printk0("[PROCNET] FAIL /proc/net/route header missing\n")
+        return 0
+    n = render_net_dev(&procnet_selftest_buf[0])
+    if _cpuinfo_buf_contains(&procnet_selftest_buf[0], n,
+            "face |bytes") == 0:
+        printk0("[PROCNET] FAIL /proc/net/dev header missing\n")
+        return 0
+    if _cpuinfo_buf_contains(&procnet_selftest_buf[0], n, "lo") == 0:
+        printk0("[PROCNET] FAIL /proc/net/dev lo row missing\n")
+        return 0
+    printk0("[PROCNET] PASS tcp/udp/arp/route/dev rendered\n")
+    return 1
+
+
 def proc_render(path: Ptr[char], buf: Ptr[uint8]) -> int64:
     # Dispatch on path. Returns bytes written, or -1 if the path
     # isn't a known /proc entry. Caller has already established
@@ -1202,6 +1709,18 @@ def proc_render(path: Ptr[char], buf: Ptr[uint8]) -> int64:
         return cast[int64](render_cpuinfo(buf))
     if _path_eq(path, "/proc/mounts") != 0:
         return cast[int64](render_mounts(buf))
+    # /proc/net/* — live network state in Linux text format, so stock
+    # Linux tools (netstat, ss, ifconfig, route, arp -a) parse them.
+    if _path_eq(path, "/proc/net/tcp") != 0:
+        return cast[int64](render_net_tcp(buf))
+    if _path_eq(path, "/proc/net/udp") != 0:
+        return cast[int64](render_net_udp(buf))
+    if _path_eq(path, "/proc/net/arp") != 0:
+        return cast[int64](render_net_arp(buf))
+    if _path_eq(path, "/proc/net/route") != 0:
+        return cast[int64](render_net_route(buf))
+    if _path_eq(path, "/proc/net/dev") != 0:
+        return cast[int64](render_net_dev(buf))
     if _path_eq(path, "/proc/cmdline") != 0:
         return cast[int64](render_cmdline(buf))
     if _path_eq(path, "/proc/kmsg") != 0:
