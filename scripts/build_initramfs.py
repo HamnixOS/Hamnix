@@ -457,6 +457,12 @@ if os.environ.get("ENABLE_PROCNET_TEST") == "1":
 if os.environ.get("ENABLE_SYSVIPC_TEST") == "1":
     FILES.append(("/etc/sysvipc-test", b"1\n"))
 
+# POSIX message queues (mq_*) self-test. scripts/test_mqueue.sh sets
+# ENABLE_MQUEUE_TEST=1 to plant /etc/mqueue-test; init/main.ad at
+# boot:37.mq detects the marker and runs posixmq_selftest().
+if os.environ.get("ENABLE_MQUEUE_TEST") == "1":
+    FILES.append(("/etc/mqueue-test", b"1\n"))
+
 # ext4 xattr + POSIX ACL self-test. scripts/test_ext4_xattr.sh sets
 # ENABLE_EXT4XATTR_TEST=1 to plant /etc/ext4xattr-test; init/main.ad at
 # boot:37.xat detects the marker and runs ext4_xattr_selftest().

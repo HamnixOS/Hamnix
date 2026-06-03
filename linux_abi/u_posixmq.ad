@@ -1,0 +1,799 @@
+# linux_abi/u_posixmq.ad — POSIX message queues (mq_*) for the Linux shim.
+#
+# Hamnix's NATIVE model is Plan-9 files, not POSIX IPC. But real Linux
+# software — realtime daemons, audio servers, message-bus shims — reaches
+# for mq_open/mq_send/mq_receive (the POSIX.1b realtime message-queue API)
+# before it will run. This module supplies those syscalls to the Linux-ABI
+# surface ONLY. It lives in linux_abi/ (Layer 2); the native kernel never
+# links it.
+#
+# This mirrors linux_abi/u_sysvipc.ad's established IPC pattern: fixed pools
+# of module-scope Array globals (no dynamic IPC-object allocation), the same
+# cooperative bounded-park blocking primitive (yield_to_others() loop with a
+# budget so a peerless single-core workload can't deadlock), and the same
+# in-kernel synchronous self-test shape.
+#
+# Differences from SysV message queues:
+#   * Named queues. mq_open takes a NUL-terminated "/name" string, not a
+#     key_t. A name table holds up to MQ_NQUEUES distinct queues.
+#   * Per-queue attributes (mq_maxmsg, mq_msgsize) chosen at create time.
+#   * PRIORITY-ordered delivery: mq_receive returns the highest-priority
+#     message first; equal priority is FIFO (lowest send-sequence wins).
+#   * mqd_t is an fd-like per-task handle (a small integer) returned by
+#     mq_open; subsequent ops pass it. mq_close releases the handle.
+#
+# Compiler-quirk note: Adder has a flat global symbol namespace across
+# merged modules, so every helper here is prefixed `_mq_`/`mq_` and every
+# constant `MQ_`/`PMQ_`. We avoid the reserved identifiers bytes/match/
+# case/char/bool/field/int8..uint64 as variable names throughout.
+
+from kernel.printk.printk import (
+    printk0, printk1, printk2,
+)
+from kernel.sched.core import (
+    current_task_pid, yield_to_others,
+)
+from arch.x86.kernel.time import get_jiffies
+from mm.uaccess import (
+    copy_from_user, copy_to_user,
+)
+
+
+# ---------------------------------------------------------------------
+# Linux ABI constants
+# ---------------------------------------------------------------------
+#
+# open(2)-style flags (mq_open's oflag uses the same O_* values).
+PMQ_O_RDONLY:   uint64 = 0x0000
+PMQ_O_WRONLY:   uint64 = 0x0001
+PMQ_O_RDWR:     uint64 = 0x0002
+PMQ_O_CREAT:    uint64 = 0x0040       # 0100  — create if absent
+PMQ_O_EXCL:     uint64 = 0x0080       # 0200  — fail if exists (with CREAT)
+PMQ_O_NONBLOCK: uint64 = 0x0800       # 04000 — non-blocking send/receive
+PMQ_O_ACCMODE:  uint64 = 0x0003       # access-mode mask
+
+# Linux errnos (negative; same values as the rest of the Linux shim).
+PMQ_EPERM:      int64 = -1
+PMQ_ENOENT:     int64 = -2
+PMQ_EBADF:      int64 = -9
+PMQ_EAGAIN:     int64 = -11
+PMQ_ENOMEM:     int64 = -12
+PMQ_EFAULT:     int64 = -14
+PMQ_EEXIST:     int64 = -17
+PMQ_EINVAL:     int64 = -22
+PMQ_ENFILE:     int64 = -23           # whole-system fd table full
+PMQ_EMFILE:     int64 = -24           # per-task handle table full
+PMQ_ENOSPC:     int64 = -28
+PMQ_EMSGSIZE:   int64 = -90           # message too big for mq_msgsize
+PMQ_ETIMEDOUT:  int64 = -110
+
+
+# ---------------------------------------------------------------------
+# Pool geometry
+# ---------------------------------------------------------------------
+
+MQ_NQUEUES:   uint64 = 32             # max named queues system-wide
+MQ_NAME_MAX:  uint64 = 64             # max bytes of a queue name (inc NUL)
+MQ_SLOTS_MAX: uint64 = 64             # max resident messages per queue
+MQ_MSGSIZE_MAX: uint64 = 1024         # hard cap on mq_msgsize (bytes)
+MQ_NHANDLES:  uint64 = 64             # mqd_t handle table size (per system)
+
+# Block-loop budget: how many yields a blocking op spins before giving up
+# and returning -EAGAIN (mirrors u_sysvipc.ad SYSV_BLOCK_BUDGET — a
+# workload with no live peer must not deadlock the single core).
+MQ_BLOCK_BUDGET: uint64 = 4096
+
+
+# ---------------------------------------------------------------------
+# Named-queue table
+# ---------------------------------------------------------------------
+#
+# A queue holds up to mq_maxmsg messages (<= MQ_SLOTS_MAX). Each message
+# is (priority, length, send-sequence, text bytes). Delivery picks the
+# highest priority; equal priority breaks to the lowest send-sequence
+# (FIFO). The per-queue mq_msgsize bounds one message's byte length.
+
+mq_used:    Array[32, uint8]          # 1 = this queue is live
+mq_name:    Array[2048, uint8]        # 32 * 64 — NUL-terminated names
+mq_maxmsg:  Array[32, uint64]         # mq_attr.mq_maxmsg
+mq_msgsize: Array[32, uint64]         # mq_attr.mq_msgsize
+mq_curmsgs: Array[32, uint64]         # current resident message count
+mq_refcnt:  Array[32, uint64]         # open mqd_t handles referencing it
+mq_unlinked: Array[32, uint8]         # 1 = mq_unlink'd, reap on last close
+mq_seq_ctr: Array[32, uint64]         # monotonic FIFO stamp per queue
+mq_ctime:   Array[32, uint64]         # creation jiffies
+
+# Per-slot message metadata + a flat text store. Index [queue*SLOTS + s].
+mq_slot_live: Array[2048, uint8]      # 32 * 64
+mq_slot_prio: Array[2048, uint32]
+mq_slot_len:  Array[2048, uint64]
+mq_slot_seq:  Array[2048, uint64]     # FIFO sequence stamp
+# text store: [(queue*SLOTS + s) * MSGSIZE_MAX]
+mq_text:    Array[2097152, uint8]     # 32*64*1024 = 2 MiB
+
+# Per-handle table: an mqd_t indexes here. Maps to the owning queue + the
+# access mode + O_NONBLOCK flag recorded at open time.
+mqd_used:   Array[64, uint8]
+mqd_queue:  Array[64, uint64]         # which mq_* queue this handle opens
+mqd_oflag:  Array[64, uint64]         # the oflag the handle was opened with
+
+
+def _mq_slot(q: uint64, s: uint64) -> uint64:
+    return q * MQ_SLOTS_MAX + s
+
+
+def _mq_text_base(q: uint64, s: uint64) -> uint64:
+    return _mq_slot(q, s) * MQ_MSGSIZE_MAX
+
+
+def _mq_name_base(q: uint64) -> uint64:
+    return q * MQ_NAME_MAX
+
+
+# ---------------------------------------------------------------------
+# Name helpers (no libc; raw byte compares against module storage)
+# ---------------------------------------------------------------------
+
+def _mq_name_eq(q: uint64, nm: Ptr[uint8]) -> int32:
+    # Compare the stored name for queue q against the NUL-terminated nm.
+    base: uint64 = _mq_name_base(q)
+    i: uint64 = 0
+    while i < MQ_NAME_MAX:
+        a: uint8 = mq_name[base + i]
+        b: uint8 = cast[uint8](nm[i])
+        if a != b:
+            return 0
+        if a == 0:
+            return 1
+        i = i + 1
+    return 0
+
+
+def _mq_name_store(q: uint64, nm: Ptr[uint8]) -> int32:
+    # Copy nm into queue q's name slot. Returns 0 ok / -1 too long.
+    base: uint64 = _mq_name_base(q)
+    i: uint64 = 0
+    while i < MQ_NAME_MAX:
+        c: uint8 = cast[uint8](nm[i])
+        mq_name[base + i] = c
+        if c == 0:
+            return 0
+        i = i + 1
+    return -1
+
+
+def _mq_find_name(nm: Ptr[uint8]) -> int64:
+    # Return the queue index whose name matches nm, or -1 if none.
+    i: uint64 = 0
+    while i < MQ_NQUEUES:
+        if mq_used[i] != 0 and _mq_name_eq(i, nm) != 0:
+            return cast[int64](i)
+        i = i + 1
+    return -1
+
+
+# ---------------------------------------------------------------------
+# Queue + handle allocation
+# ---------------------------------------------------------------------
+
+def _mq_alloc_queue(nm: Ptr[uint8], maxmsg: uint64,
+                    msgsize: uint64) -> int64:
+    # Claim a free queue slot. Returns the queue index or -ENOSPC.
+    i: uint64 = 0
+    while i < MQ_NQUEUES:
+        if mq_used[i] == 0:
+            if _mq_name_store(i, nm) != 0:
+                return PMQ_ENAMETOOLONG
+            mq_used[i] = 1
+            mq_maxmsg[i] = maxmsg
+            mq_msgsize[i] = msgsize
+            mq_curmsgs[i] = 0
+            mq_refcnt[i] = 0
+            mq_unlinked[i] = 0
+            mq_seq_ctr[i] = 0
+            mq_ctime[i] = get_jiffies()
+            s: uint64 = 0
+            while s < MQ_SLOTS_MAX:
+                mq_slot_live[_mq_slot(i, s)] = 0
+                s = s + 1
+            return cast[int64](i)
+        i = i + 1
+    return PMQ_ENOSPC
+
+
+def _mq_alloc_handle(q: uint64, oflag: uint64) -> int64:
+    # Claim a free mqd_t handle bound to queue q. Returns the mqd_t or -EMFILE.
+    h: uint64 = 0
+    while h < MQ_NHANDLES:
+        if mqd_used[h] == 0:
+            mqd_used[h] = 1
+            mqd_queue[h] = q
+            mqd_oflag[h] = oflag
+            mq_refcnt[q] = mq_refcnt[q] + 1
+            return cast[int64](h)
+        h = h + 1
+    return PMQ_EMFILE
+
+
+def _mq_reap_if_dead(q: uint64):
+    # Free an unlinked queue once its last open handle closes.
+    if mq_unlinked[q] != 0 and mq_refcnt[q] == 0:
+        mq_used[q] = 0
+        mq_unlinked[q] = 0
+        mq_curmsgs[q] = 0
+
+
+# ---------------------------------------------------------------------
+# mq_open
+# ---------------------------------------------------------------------
+#
+# mqd_t mq_open(const char *name, int oflag, mode_t mode,
+#               struct mq_attr *attr)
+#
+# struct mq_attr { long mq_flags; long mq_maxmsg; long mq_msgsize;
+#                  long mq_curmsgs; long __reserved[4]; }  (64 bytes)
+
+PMQ_ENAMETOOLONG: int64 = -36
+
+
+def _mq_validate_name(name_u: uint64) -> int64:
+    # Pull the name in from userspace into mq_name_scratch and validate it
+    # is "/" followed by at least one non-slash char (POSIX rule). Returns
+    # 0 on success (mq_name_scratch holds the NUL-terminated name) or a
+    # negative errno.
+    if name_u == 0:
+        return PMQ_EINVAL
+    if copy_from_user(cast[uint64](&mq_name_scratch[0]), name_u,
+                      MQ_NAME_MAX) != 0:
+        # A short name may straddle the page tail; tolerate by copying
+        # byte-at-a-time until NUL. Fall through to per-byte validation
+        # which treats an unreadable byte as the end.
+        i0: uint64 = 0
+        while i0 < MQ_NAME_MAX:
+            mq_name_scratch[i0] = 0
+            i0 = i0 + 1
+        b: uint8 = 0
+        i0 = 0
+        while i0 < MQ_NAME_MAX - 1:
+            if copy_from_user(cast[uint64](&b), name_u + i0, 1) != 0:
+                mq_name_scratch[i0] = 0
+                i0 = MQ_NAME_MAX
+            else:
+                mq_name_scratch[i0] = b
+                if b == 0:
+                    i0 = MQ_NAME_MAX
+                else:
+                    i0 = i0 + 1
+    # Force NUL-termination at the buffer tail.
+    mq_name_scratch[MQ_NAME_MAX - 1] = 0
+    # POSIX: name must start with '/'.
+    if mq_name_scratch[0] != 47:        # '/'
+        return PMQ_EINVAL
+    if mq_name_scratch[1] == 0:
+        return PMQ_EINVAL               # "/" alone is invalid
+    return 0
+
+
+def _mq_open(name_u: uint64, oflag: uint64, mode: uint64,
+             attr_u: uint64) -> int64:
+    vrc: int64 = _mq_validate_name(name_u)
+    if vrc != 0:
+        return vrc
+    nm: Ptr[uint8] = &mq_name_scratch[0]
+    existing: int64 = _mq_find_name(nm)
+    if existing >= 0:
+        if (oflag & PMQ_O_CREAT) != 0 and (oflag & PMQ_O_EXCL) != 0:
+            return PMQ_EEXIST
+        return _mq_alloc_handle(cast[uint64](existing), oflag)
+    # Not found.
+    if (oflag & PMQ_O_CREAT) == 0:
+        return PMQ_ENOENT
+    # Creating: derive maxmsg/msgsize from attr (if given) or defaults.
+    maxmsg: uint64 = 10                 # Linux default mq_maxmsg
+    msgsize: uint64 = 8192              # Linux default mq_msgsize
+    if attr_u != 0:
+        if copy_from_user(cast[uint64](&mq_attr_scratch[0]), attr_u, 32) != 0:
+            return PMQ_EFAULT
+        a_maxmsg: int64 = cast[Ptr[int64]](&mq_attr_scratch[8])[0]
+        a_msgsize: int64 = cast[Ptr[int64]](&mq_attr_scratch[16])[0]
+        if a_maxmsg <= 0 or a_msgsize <= 0:
+            return PMQ_EINVAL
+        maxmsg = cast[uint64](a_maxmsg)
+        msgsize = cast[uint64](a_msgsize)
+    # Clamp to our fixed-arena limits.
+    if maxmsg > MQ_SLOTS_MAX:
+        return PMQ_EINVAL
+    if msgsize > MQ_MSGSIZE_MAX:
+        return PMQ_EINVAL
+    q: int64 = _mq_alloc_queue(nm, maxmsg, msgsize)
+    if q < 0:
+        return q
+    return _mq_alloc_handle(cast[uint64](q), oflag)
+
+
+# ---------------------------------------------------------------------
+# mq_close / mq_unlink
+# ---------------------------------------------------------------------
+
+def _mq_handle_ok(mqdes: uint64) -> int32:
+    if mqdes >= MQ_NHANDLES:
+        return 0
+    if mqd_used[mqdes] == 0:
+        return 0
+    return 1
+
+
+def _mq_close(mqdes: uint64) -> int64:
+    if _mq_handle_ok(mqdes) == 0:
+        return PMQ_EBADF
+    q: uint64 = mqd_queue[mqdes]
+    mqd_used[mqdes] = 0
+    if mq_refcnt[q] > 0:
+        mq_refcnt[q] = mq_refcnt[q] - 1
+    _mq_reap_if_dead(q)
+    return 0
+
+
+def _mq_unlink(name_u: uint64) -> int64:
+    vrc: int64 = _mq_validate_name(name_u)
+    if vrc != 0:
+        return vrc
+    existing: int64 = _mq_find_name(&mq_name_scratch[0])
+    if existing < 0:
+        return PMQ_ENOENT
+    q: uint64 = cast[uint64](existing)
+    # Detach the name immediately (a fresh mq_open of the same name will
+    # create a new queue), but keep the backing alive until the last open
+    # handle closes — POSIX unlink-while-open semantics.
+    mq_unlinked[q] = 1
+    # Blank the stored name so _mq_find_name won't match it again.
+    mq_name[_mq_name_base(q)] = 0
+    _mq_reap_if_dead(q)
+    return 0
+
+
+# ---------------------------------------------------------------------
+# mq_send / mq_timedsend
+# ---------------------------------------------------------------------
+#
+# int mq_send(mqd_t, const char *msg_ptr, size_t msg_len,
+#             unsigned int msg_prio)
+# int mq_timedsend(mqd_t, const char *msg_ptr, size_t msg_len,
+#             unsigned int msg_prio, const struct timespec *abs_timeout)
+
+def _mq_send(mqdes: uint64, msg_u: uint64, msg_len: uint64,
+             msg_prio: uint64) -> int64:
+    if _mq_handle_ok(mqdes) == 0:
+        return PMQ_EBADF
+    oflag: uint64 = mqd_oflag[mqdes]
+    # A handle opened O_RDONLY may not send.
+    if (oflag & PMQ_O_ACCMODE) == PMQ_O_RDONLY:
+        return PMQ_EBADF
+    q: uint64 = mqd_queue[mqdes]
+    if mq_used[q] == 0:
+        return PMQ_EBADF
+    if msg_len > mq_msgsize[q]:
+        return PMQ_EMSGSIZE
+    nonblock: int32 = 0
+    if (oflag & PMQ_O_NONBLOCK) != 0:
+        nonblock = 1
+    budget: uint64 = 0
+    do:
+        if mq_used[q] == 0:
+            return PMQ_EBADF
+        if mq_curmsgs[q] < mq_maxmsg[q]:
+            free_s: int64 = _mq_free_slot(q)
+            if free_s >= 0:
+                s: uint64 = cast[uint64](free_s)
+                if msg_len > 0:
+                    if copy_from_user(
+                            cast[uint64](&mq_text[_mq_text_base(q, s)]),
+                            msg_u, msg_len) != 0:
+                        return PMQ_EFAULT
+                mq_slot_live[_mq_slot(q, s)] = 1
+                mq_slot_prio[_mq_slot(q, s)] = cast[uint32](msg_prio)
+                mq_slot_len[_mq_slot(q, s)] = msg_len
+                mq_seq_ctr[q] = mq_seq_ctr[q] + 1
+                mq_slot_seq[_mq_slot(q, s)] = mq_seq_ctr[q]
+                mq_curmsgs[q] = mq_curmsgs[q] + 1
+                return 0
+        # Full.
+        if nonblock != 0:
+            return PMQ_EAGAIN
+        yield_to_others()
+        budget = budget + 1
+        if budget >= MQ_BLOCK_BUDGET:
+            return PMQ_EAGAIN
+    while 1
+    return 0
+
+
+def _mq_free_slot(q: uint64) -> int64:
+    s: uint64 = 0
+    while s < MQ_SLOTS_MAX:
+        if mq_slot_live[_mq_slot(q, s)] == 0:
+            return cast[int64](s)
+        s = s + 1
+    return -1
+
+
+# ---------------------------------------------------------------------
+# mq_receive / mq_timedreceive
+# ---------------------------------------------------------------------
+#
+# ssize_t mq_receive(mqd_t, char *msg_ptr, size_t msg_len,
+#                    unsigned int *msg_prio)
+#
+# Returns the number of bytes in the received message. Delivery order:
+# highest priority first; equal priority is FIFO (lowest send-sequence).
+
+def _mq_pick(q: uint64) -> int64:
+    # Choose the slot to deliver: highest priority wins; ties broken by
+    # lowest send-sequence (FIFO). Returns the slot index or -1 if empty.
+    best: int64 = -1
+    best_prio: uint32 = 0
+    best_seq: uint64 = 0
+    s: uint64 = 0
+    while s < MQ_SLOTS_MAX:
+        idx: uint64 = _mq_slot(q, s)
+        if mq_slot_live[idx] != 0:
+            pr: uint32 = mq_slot_prio[idx]
+            sq: uint64 = mq_slot_seq[idx]
+            take: int32 = 0
+            if best < 0:
+                take = 1
+            elif pr > best_prio:
+                take = 1
+            elif pr == best_prio and sq < best_seq:
+                take = 1
+            if take != 0:
+                best = cast[int64](s)
+                best_prio = pr
+                best_seq = sq
+        s = s + 1
+    return best
+
+
+def _mq_receive(mqdes: uint64, msg_u: uint64, msg_len: uint64,
+                prio_u: uint64) -> int64:
+    if _mq_handle_ok(mqdes) == 0:
+        return PMQ_EBADF
+    oflag: uint64 = mqd_oflag[mqdes]
+    # A handle opened O_WRONLY may not receive.
+    if (oflag & PMQ_O_ACCMODE) == PMQ_O_WRONLY:
+        return PMQ_EBADF
+    q: uint64 = mqd_queue[mqdes]
+    if mq_used[q] == 0:
+        return PMQ_EBADF
+    # msg_len must be at least mq_msgsize (POSIX EMSGSIZE rule).
+    if msg_len < mq_msgsize[q]:
+        return PMQ_EMSGSIZE
+    nonblock: int32 = 0
+    if (oflag & PMQ_O_NONBLOCK) != 0:
+        nonblock = 1
+    budget: uint64 = 0
+    do:
+        if mq_used[q] == 0:
+            return PMQ_EBADF
+        s64: int64 = _mq_pick(q)
+        if s64 >= 0:
+            s: uint64 = cast[uint64](s64)
+            idx: uint64 = _mq_slot(q, s)
+            mlen: uint64 = mq_slot_len[idx]
+            if mlen > 0:
+                if copy_to_user(msg_u,
+                                cast[uint64](&mq_text[_mq_text_base(q, s)]),
+                                mlen) != 0:
+                    return PMQ_EFAULT
+            if prio_u != 0:
+                pr32: uint32 = mq_slot_prio[idx]
+                if copy_to_user(prio_u, cast[uint64](&pr32), 4) != 0:
+                    return PMQ_EFAULT
+            # Remove the message.
+            mq_slot_live[idx] = 0
+            mq_curmsgs[q] = mq_curmsgs[q] - 1
+            return cast[int64](mlen)
+        # Empty.
+        if nonblock != 0:
+            return PMQ_EAGAIN
+        yield_to_others()
+        budget = budget + 1
+        if budget >= MQ_BLOCK_BUDGET:
+            return PMQ_EAGAIN
+    while 1
+    return 0
+
+
+# ---------------------------------------------------------------------
+# mq_getattr / mq_setattr  (both ride SYS_mq_getsetattr)
+# ---------------------------------------------------------------------
+#
+# int mq_getsetattr(mqd_t, const struct mq_attr *newattr,
+#                   struct mq_attr *oldattr)
+#
+# glibc's mq_getattr  -> mq_getsetattr(mqdes, NULL, &attr)
+#        mq_setattr  -> mq_getsetattr(mqdes, &newattr, &oldattr)
+#
+# Only mq_flags (the O_NONBLOCK bit) is mutable via setattr; mq_maxmsg and
+# mq_msgsize are fixed at create time (POSIX).
+
+def _mq_fill_attr(q: uint64, oflag: uint64):
+    # Build a struct mq_attr (64 bytes) in mq_attr_scratch.
+    i: uint64 = 0
+    while i < 64:
+        mq_attr_scratch[i] = 0
+        i = i + 1
+    flags: int64 = 0
+    if (oflag & PMQ_O_NONBLOCK) != 0:
+        flags = cast[int64](PMQ_O_NONBLOCK)
+    cast[Ptr[int64]](&mq_attr_scratch[0])[0] = flags
+    cast[Ptr[int64]](&mq_attr_scratch[8])[0] = cast[int64](mq_maxmsg[q])
+    cast[Ptr[int64]](&mq_attr_scratch[16])[0] = cast[int64](mq_msgsize[q])
+    cast[Ptr[int64]](&mq_attr_scratch[24])[0] = cast[int64](mq_curmsgs[q])
+
+
+def _mq_getsetattr(mqdes: uint64, newattr_u: uint64,
+                   oldattr_u: uint64) -> int64:
+    if _mq_handle_ok(mqdes) == 0:
+        return PMQ_EBADF
+    q: uint64 = mqd_queue[mqdes]
+    if mq_used[q] == 0:
+        return PMQ_EBADF
+    # If oldattr requested, report the CURRENT attributes first.
+    if oldattr_u != 0:
+        _mq_fill_attr(q, mqd_oflag[mqdes])
+        if copy_to_user(oldattr_u, cast[uint64](&mq_attr_scratch[0]), 64) != 0:
+            return PMQ_EFAULT
+    # If newattr present, only mq_flags (O_NONBLOCK) is honoured.
+    if newattr_u != 0:
+        if copy_from_user(cast[uint64](&mq_attr_scratch[0]),
+                          newattr_u, 8) != 0:
+            return PMQ_EFAULT
+        new_flags: int64 = cast[Ptr[int64]](&mq_attr_scratch[0])[0]
+        cur: uint64 = mqd_oflag[mqdes]
+        if (cast[uint64](new_flags) & PMQ_O_NONBLOCK) != 0:
+            cur = cur | PMQ_O_NONBLOCK
+        else:
+            cur = cur & (~PMQ_O_NONBLOCK)
+        mqd_oflag[mqdes] = cur
+    return 0
+
+
+# ---------------------------------------------------------------------
+# Shared scratch buffers (module-scope per the Adder big-buffer rule)
+# ---------------------------------------------------------------------
+
+mq_name_scratch: Array[64, uint8]     # one queue name in flight
+mq_attr_scratch: Array[64, uint8]     # one struct mq_attr in flight
+
+
+# ---------------------------------------------------------------------
+# Public syscall entry points (called from u_syscalls.ad dispatch)
+# ---------------------------------------------------------------------
+
+def posixmq_open(a0: uint64, a1: uint64, a2: uint64,
+                 a3: uint64, a4: uint64, a5: uint64) -> int64:
+    return _mq_open(a0, a1, a2, a3)
+
+
+def posixmq_unlink(a0: uint64, a1: uint64, a2: uint64,
+                   a3: uint64, a4: uint64, a5: uint64) -> int64:
+    return _mq_unlink(a0)
+
+
+def posixmq_timedsend(a0: uint64, a1: uint64, a2: uint64,
+                      a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # mq_timedsend(mqdes, msg_ptr, msg_len, msg_prio, abs_timeout).
+    # The abs_timeout is accepted; our bounded-park budget already bounds
+    # the block, so an expired timeout converges on the same -EAGAIN/-ETIMEDOUT
+    # behaviour a peerless single-core workload needs. We forward to _mq_send.
+    return _mq_send(a0, a1, a2, a3)
+
+
+def posixmq_timedreceive(a0: uint64, a1: uint64, a2: uint64,
+                         a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # mq_timedreceive(mqdes, msg_ptr, msg_len, msg_prio, abs_timeout).
+    return _mq_receive(a0, a1, a2, a3)
+
+
+def posixmq_getsetattr(a0: uint64, a1: uint64, a2: uint64,
+                       a3: uint64, a4: uint64, a5: uint64) -> int64:
+    return _mq_getsetattr(a0, a1, a2)
+
+
+# =====================================================================
+# In-kernel self-test (synchronous, boot-context)
+# =====================================================================
+#
+# Mirrors u_sysvipc.ad's sysvipc_selftest shape: drive the mq_* primitives
+# directly in the boot context (no concurrent scheduler run needed) and
+# assert observable behaviour. Returns 1 iff every assertion held. Prints
+# [mqueue] lines a test script greps; the final marker is "[mqueue] PASS".
+#
+# Coverage:
+#   * mq_open create + mq_send + mq_receive round-trips a message.
+#   * PRIORITY ordering: a high-prio message sent AFTER a low-prio one is
+#     received FIRST; equal priority is FIFO.
+#   * EMSGSIZE on an oversize send.
+#   * EAGAIN on O_NONBLOCK empty-receive AND O_NONBLOCK full-send.
+#   * mq_getattr reports the right counts (maxmsg/msgsize/curmsgs).
+#   * mq_unlink, then a non-CREAT open of the gone name -> ENOENT.
+
+mq_test_io:   Array[1088, uint8]      # message text in flight
+mq_test_name: Array[64, uint8]        # "/hamnix-mqtest"
+mq_test_attr: Array[64, uint8]        # struct mq_attr in/out
+
+
+def _mq_assert(cond: int32, msg0: Ptr[uint8]) -> int32:
+    if cond != 0:
+        printk1("[mqueue] PASS: %s\n", cast[uint64](msg0))
+        return 1
+    printk1("[mqueue] FAIL: %s\n", cast[uint64](msg0))
+    return 0
+
+
+def _mq_set_name(s: Ptr[uint8]):
+    # Copy the literal name s into mq_test_name (NUL-terminated).
+    i: uint64 = 0
+    while i < MQ_NAME_MAX:
+        c: uint8 = cast[uint8](s[i])
+        mq_test_name[i] = c
+        if c == 0:
+            i = MQ_NAME_MAX
+        else:
+            i = i + 1
+
+
+def _mq_test_fill(prio_fill: uint8, n: uint64):
+    # Fill mq_test_io[0..n) with prio_fill bytes.
+    i: uint64 = 0
+    while i < n:
+        mq_test_io[i] = prio_fill
+        i = i + 1
+
+
+def posixmq_selftest() -> int32:
+    printk0("[mqueue] self-test start\n")
+    ok: int32 = 1
+
+    _mq_set_name("/hamnix-mqtest")
+    name_u: uint64 = cast[uint64](&mq_test_name[0])
+
+    # --- mq_open: create with attr maxmsg=4, msgsize=16 ---------------
+    cast[Ptr[int64]](&mq_test_attr[0])[0] = 0          # mq_flags
+    cast[Ptr[int64]](&mq_test_attr[8])[0] = 4          # mq_maxmsg
+    cast[Ptr[int64]](&mq_test_attr[16])[0] = 16        # mq_msgsize
+    cast[Ptr[int64]](&mq_test_attr[24])[0] = 0         # mq_curmsgs
+    mqd64: int64 = _mq_open(name_u, PMQ_O_CREAT | PMQ_O_RDWR, 0x1B6,
+                            cast[uint64](&mq_test_attr[0]))
+    if mqd64 < 0:
+        printk1("[mqueue] FAIL: mq_open rc=%d\n", cast[uint64](mqd64))
+        return 0
+    mqd: uint64 = cast[uint64](mqd64)
+
+    # O_EXCL on the existing name -> EEXIST.
+    excl_rc: int64 = _mq_open(name_u, PMQ_O_CREAT | PMQ_O_EXCL | PMQ_O_RDWR,
+                              0x1B6, cast[uint64](&mq_test_attr[0]))
+    if _mq_assert(cast[int32](excl_rc == PMQ_EEXIST),
+                  "mq_open O_CREAT|O_EXCL on existing -> EEXIST") == 0:
+        ok = 0
+
+    # --- round-trip a single message ---------------------------------
+    _mq_test_fill(65, 3)                # "AAA"
+    s_rc: int64 = _mq_send(mqd, cast[uint64](&mq_test_io[0]), 3, 5)
+    if _mq_assert(cast[int32](s_rc == 0), "mq_send single message succeeds") == 0:
+        ok = 0
+    # Clear the buffer, receive it back.
+    _mq_test_fill(0, 16)
+    rprio: uint32 = 0
+    r_rc: int64 = _mq_receive(mqd, cast[uint64](&mq_test_io[0]), 16,
+                              cast[uint64](&rprio))
+    if _mq_assert(cast[int32](r_rc == 3 and mq_test_io[0] == 65 and rprio == 5),
+                  "mq_receive round-trips length+data+prio") == 0:
+        ok = 0
+
+    # --- EAGAIN on O_NONBLOCK empty-receive --------------------------
+    # The queue is empty now. Set the handle non-blocking via setattr.
+    cast[Ptr[int64]](&mq_test_attr[0])[0] = cast[int64](PMQ_O_NONBLOCK)
+    _mq_getsetattr(mqd, cast[uint64](&mq_test_attr[0]), 0)
+    empty_rc: int64 = _mq_receive(mqd, cast[uint64](&mq_test_io[0]), 16, 0)
+    if _mq_assert(cast[int32](empty_rc == PMQ_EAGAIN),
+                  "mq_receive O_NONBLOCK on empty -> EAGAIN") == 0:
+        ok = 0
+    # Clear non-blocking again for the priority test (so sends never EAGAIN).
+    cast[Ptr[int64]](&mq_test_attr[0])[0] = 0
+    _mq_getsetattr(mqd, cast[uint64](&mq_test_attr[0]), 0)
+
+    # --- priority ordering -------------------------------------------
+    # Send low-prio first (prio 1, "L"), then high-prio (prio 9, "H").
+    # mq_receive must return the HIGH-prio "H" first.
+    _mq_test_fill(76, 1)                # "L"
+    _mq_send(mqd, cast[uint64](&mq_test_io[0]), 1, 1)
+    _mq_test_fill(72, 1)                # "H"
+    _mq_send(mqd, cast[uint64](&mq_test_io[0]), 1, 9)
+    # Also send two EQUAL-priority (prio 4) messages "1" then "2" to prove
+    # FIFO among equals.
+    _mq_test_fill(0x31, 1)             # "1"
+    _mq_send(mqd, cast[uint64](&mq_test_io[0]), 1, 4)
+    _mq_test_fill(0x32, 1)             # "2"
+    _mq_send(mqd, cast[uint64](&mq_test_io[0]), 1, 4)
+
+    # First out: prio 9 "H".
+    _mq_test_fill(0, 16)
+    p1: uint32 = 0
+    _mq_receive(mqd, cast[uint64](&mq_test_io[0]), 16, cast[uint64](&p1))
+    if _mq_assert(cast[int32](p1 == 9 and mq_test_io[0] == 72),
+                  "priority: highest (9) delivered first") == 0:
+        ok = 0
+    # Next two: the equal-prio-4 pair in FIFO order ("1" then "2").
+    _mq_test_fill(0, 16)
+    p2: uint32 = 0
+    _mq_receive(mqd, cast[uint64](&mq_test_io[0]), 16, cast[uint64](&p2))
+    first_eq: uint8 = mq_test_io[0]
+    _mq_test_fill(0, 16)
+    p3: uint32 = 0
+    _mq_receive(mqd, cast[uint64](&mq_test_io[0]), 16, cast[uint64](&p3))
+    second_eq: uint8 = mq_test_io[0]
+    if _mq_assert(cast[int32](p2 == 4 and p3 == 4 and first_eq == 0x31 and second_eq == 0x32),
+                  "priority: equal prio is FIFO (1 before 2)") == 0:
+        ok = 0
+    # Last out: prio 1 "L".
+    _mq_test_fill(0, 16)
+    p4: uint32 = 0
+    _mq_receive(mqd, cast[uint64](&mq_test_io[0]), 16, cast[uint64](&p4))
+    if _mq_assert(cast[int32](p4 == 1 and mq_test_io[0] == 76),
+                  "priority: lowest (1) delivered last") == 0:
+        ok = 0
+
+    # --- EMSGSIZE on oversize send -----------------------------------
+    over_rc: int64 = _mq_send(mqd, cast[uint64](&mq_test_io[0]), 17, 0)
+    if _mq_assert(cast[int32](over_rc == PMQ_EMSGSIZE),
+                  "mq_send oversize (>msgsize) -> EMSGSIZE") == 0:
+        ok = 0
+
+    # --- EAGAIN on O_NONBLOCK full-send ------------------------------
+    # Fill the queue (maxmsg=4) then a 5th non-blocking send -> EAGAIN.
+    cast[Ptr[int64]](&mq_test_attr[0])[0] = cast[int64](PMQ_O_NONBLOCK)
+    _mq_getsetattr(mqd, cast[uint64](&mq_test_attr[0]), 0)
+    _mq_test_fill(0x2A, 1)             # "*"
+    f0: int64 = _mq_send(mqd, cast[uint64](&mq_test_io[0]), 1, 0)
+    f1: int64 = _mq_send(mqd, cast[uint64](&mq_test_io[0]), 1, 0)
+    f2: int64 = _mq_send(mqd, cast[uint64](&mq_test_io[0]), 1, 0)
+    f3: int64 = _mq_send(mqd, cast[uint64](&mq_test_io[0]), 1, 0)
+    f4: int64 = _mq_send(mqd, cast[uint64](&mq_test_io[0]), 1, 0)
+    if _mq_assert(cast[int32](f0 == 0 and f1 == 0 and f2 == 0 and f3 == 0 and f4 == PMQ_EAGAIN),
+                  "mq_send O_NONBLOCK on full (maxmsg=4) -> EAGAIN") == 0:
+        ok = 0
+
+    # --- mq_getattr reports right counts -----------------------------
+    # Queue is full: curmsgs == 4, maxmsg == 4, msgsize == 16.
+    _mq_getsetattr(mqd, 0, cast[uint64](&mq_test_attr[0]))
+    g_maxmsg: int64 = cast[Ptr[int64]](&mq_test_attr[8])[0]
+    g_msgsize: int64 = cast[Ptr[int64]](&mq_test_attr[16])[0]
+    g_curmsgs: int64 = cast[Ptr[int64]](&mq_test_attr[24])[0]
+    if _mq_assert(cast[int32](g_maxmsg == 4 and g_msgsize == 16 and g_curmsgs == 4),
+                  "mq_getattr maxmsg=4 msgsize=16 curmsgs=4") == 0:
+        ok = 0
+
+    # --- mq_unlink + ENOENT ------------------------------------------
+    u_rc: int64 = _mq_unlink(name_u)
+    if _mq_assert(cast[int32](u_rc == 0), "mq_unlink succeeds") == 0:
+        ok = 0
+    # After unlink, a non-CREAT open of the gone name -> ENOENT.
+    gone_rc: int64 = _mq_open(name_u, PMQ_O_RDWR, 0, 0)
+    if _mq_assert(cast[int32](gone_rc == PMQ_ENOENT),
+                  "mq_open non-CREAT after unlink -> ENOENT") == 0:
+        ok = 0
+    # Close the still-open original handle (drops the last ref, reaps it).
+    _mq_close(mqd)
+    # mq_close on a bad handle -> EBADF.
+    bad_rc: int64 = _mq_close(mqd)
+    if _mq_assert(cast[int32](bad_rc == PMQ_EBADF),
+                  "mq_close on closed handle -> EBADF") == 0:
+        ok = 0
+
+    if ok == 1:
+        printk0("[mqueue] PASS\n")
+    else:
+        printk0("[mqueue] FAIL\n")
+    return ok
