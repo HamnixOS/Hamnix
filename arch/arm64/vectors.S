@@ -44,7 +44,7 @@ arm64_vectors:
 
 /* ---- Current EL with SP_ELx (this is where the kernel runs) ---- */
     .balign 0x80
-    b       arm64_sync_panic_stub   /* Synchronous (0x200) */
+    b       arm64_el1_sync_entry    /* Synchronous (0x200): EL1 fault / panic */
     .balign 0x80
     b       arm64_irq_entry         /* IRQ (0x280) */
     .balign 0x80
@@ -264,6 +264,53 @@ arm64_sync_panic_stub:
     bl      arm64_sync_panic
 1:  wfi
     b       1b
+
+/*
+ * Current-EL (EL1h) synchronous entry — the Phase 15 KERNEL FAULT-FIXUP path.
+ *
+ * Most current-EL synchronous exceptions are genuine kernel bugs and must halt
+ * (the legacy arm64_sync_panic behaviour). But the Phase-15 safe user-memory
+ * accessors (copy_from_user / copy_to_user) DELIBERATELY dereference a possibly-
+ * bad user pointer from EL1; if it faults we must NOT panic — we must trap the
+ * abort, mark it, and RESUME the kernel just past the faulting instruction so the
+ * accessor can return -EFAULT (exactly Linux's exception-table fixup model).
+ *
+ * We save the caller-saved GPR frame (x0..x18 + x29/x30), hand its base to the
+ * Adder handler arm64_el1_sync_handler(frame_ptr). The handler decides: on a
+ * fixable uaccess data abort it advances ELR_EL1 past the faulting access and
+ * returns (so we eret and the kernel resumes); otherwise it prints + halts in
+ * WFI and never returns here. On return we restore the frame and ERET.
+ */
+arm64_el1_sync_entry:
+    sub     sp, sp, #(16 * 11)
+    stp     x0,  x1,  [sp, #(16 * 0)]
+    stp     x2,  x3,  [sp, #(16 * 1)]
+    stp     x4,  x5,  [sp, #(16 * 2)]
+    stp     x6,  x7,  [sp, #(16 * 3)]
+    stp     x8,  x9,  [sp, #(16 * 4)]
+    stp     x10, x11, [sp, #(16 * 5)]
+    stp     x12, x13, [sp, #(16 * 6)]
+    stp     x14, x15, [sp, #(16 * 7)]
+    stp     x16, x17, [sp, #(16 * 8)]
+    stp     x18, x29, [sp, #(16 * 9)]
+    str     x30,      [sp, #(16 * 10)]
+
+    mov     x0, sp                      /* frame_ptr -> arg0 */
+    bl      arm64_el1_sync_handler
+
+    ldp     x0,  x1,  [sp, #(16 * 0)]
+    ldp     x2,  x3,  [sp, #(16 * 1)]
+    ldp     x4,  x5,  [sp, #(16 * 2)]
+    ldp     x6,  x7,  [sp, #(16 * 3)]
+    ldp     x8,  x9,  [sp, #(16 * 4)]
+    ldp     x10, x11, [sp, #(16 * 5)]
+    ldp     x12, x13, [sp, #(16 * 6)]
+    ldp     x14, x15, [sp, #(16 * 7)]
+    ldp     x16, x17, [sp, #(16 * 8)]
+    ldp     x18, x29, [sp, #(16 * 9)]
+    ldr     x30,      [sp, #(16 * 10)]
+    add     sp, sp, #(16 * 11)
+    eret
 
 arm64_unhandled:
     bl      arm64_unhandled_panic

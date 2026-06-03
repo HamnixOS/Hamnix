@@ -1398,6 +1398,42 @@ class Arm64CodeGen:
             self.emit("    ldp d14, d15, [x0, #48]")
             self.emit("    mov x0, #0")
             return True
+        if name == "_uaccess_get64":
+            # Phase 15: SAFE 64-bit read from a (possibly bad) user pointer for
+            # copy_from_user. Evaluate the user address into x0, then emit the
+            # single faulting load `ldr x0, [x0]`. If the pointer is unmapped /
+            # EL1-only-faults, the load takes a current-EL data abort which the
+            # Phase-15 EL1 sync handler traps: it sets the uaccess-fault flag and
+            # advances ELR_EL1 PAST this very load (so the kernel resumes at the
+            # next instruction without crashing). On success x0 holds the loaded
+            # value; on a trapped fault x0 is indeterminate and the caller must
+            # consult the fault flag (arm64_uaccess_faulted) — never x0. The load
+            # is a SELF-CONTAINED single instruction so the +4 ELR fixup lands
+            # cleanly on the instruction the codegen emits next.
+            if len(args) != 1:
+                raise CodeGenError(
+                    "aarch64: _uaccess_get64 expects exactly 1 argument")
+            self.gen_expr(args[0])               # user address -> x0
+            self.emit("    ldr x0, [x0]")        # FAULTABLE user load
+            return True
+        if name == "_uaccess_put64":
+            # Phase 15: SAFE 64-bit write to a (possibly bad) user pointer for
+            # copy_to_user. Evaluate the user address into x0 and the value into
+            # x1, then emit the single faulting store `str x1, [x0]`. A bad
+            # pointer faults to the Phase-15 EL1 sync handler, which flags the
+            # fault and advances ELR_EL1 past this store so the kernel resumes
+            # safely. The caller checks arm64_uaccess_faulted to detect EFAULT.
+            if len(args) != 2:
+                raise CodeGenError(
+                    "aarch64: _uaccess_put64 expects exactly 2 arguments")
+            self.gen_expr(args[0])               # user address -> x0
+            self.push("x0")
+            self.gen_expr(args[1])               # value -> x0
+            self.emit("    mov x1, x0")          # value -> x1
+            self.pop("x0")                       # user address -> x0
+            self.emit("    str x1, [x0]")        # FAULTABLE user store
+            self.emit("    mov x0, #0")
+            return True
         if name in ("_msr_daifclr", "_msr_daifset"):
             if len(args) != 1:
                 raise CodeGenError(
