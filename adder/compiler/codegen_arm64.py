@@ -1209,6 +1209,10 @@ class Arm64CodeGen:
         # broader EL0 syscall surface exposes it as a "clock read" syscall so an
         # EL0 task can observe monotonically advancing kernel time.
         "_mrs_cntvct_el0": "cntvct_el0",
+        # Phase 11: SP_EL0 is READ (not just written) so the kernel can find the
+        # interrupted EL0 task's stack pointer when delivering a signal — it
+        # pushes a signal frame below the live SP_EL0 and redirects there.
+        "_mrs_sp_el0":     "sp_el0",
     }
     # name -> verbatim barrier / maintenance / wait instruction (no operands).
     _NULLARY_INTRINSICS = {

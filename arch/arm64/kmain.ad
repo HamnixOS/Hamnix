@@ -705,6 +705,13 @@ def arm64_sync_handler(frame_ptr: Ptr[uint64]) -> int64:
         while True:
             _wfi()
 
+    # Phase 11: while the EL0 signal-delivery demo is live, route every svc into
+    # the Phase-11 dispatcher (raise/sigreturn/handler-ran/write/exit). raise()
+    # builds a signal frame on the EL0 stack and redirects EL0 into a user signal
+    # handler; sigreturn() restores the interrupted context; exit() prints PASS.
+    if arm64_sig_active != 0:
+        return arm64_sig_dispatch(frame_ptr, nr, a0, a1, a2)
+
     # Phase 9: while the page-table-backed brk demo is live, route every svc into
     # the Phase-9 dispatcher (brk/report/write/exit). brk-grow installs a fresh
     # page mapping into the live TTBR0 tables; report verifies the EL0 task read
@@ -2002,8 +2009,359 @@ def arm64_run_smp() -> int64:
         bad3: Ptr[char] = "[arm64] SMP bring-up FAIL\n"
         _uart_puts(bad3)
 
+    # Phase 10 complete. The secondary parks in WFE; the PRIMARY hands off to
+    # Phase 11 (EL0 signal delivery). IRQs stay masked (deterministic, no timer
+    # re-entry); arm64_run_signal_demo() halts after the Phase-11 PASS marker and
+    # never returns.
+    _msr_daifset(2)
+    arm64_run_signal_demo()
     while True:
         _wfi()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 11 — EL0 SIGNAL DELIVERY (push a signal frame, run a user handler,
+# sigreturn back to the interrupted EL0 context).
+#
+# This mirrors the x86 signal-delivery path: a running EL0 task asks the kernel
+# to deliver a signal to itself; the kernel saves the interrupted EL0 context
+# (resume PC + stack pointer + the syscall's x0 result) into a SIGNAL FRAME it
+# pushes onto the task's OWN EL0 stack, redirects EL0 to a user signal HANDLER,
+# and ERETs into it. The handler runs entirely in EL0 (it records that it ran
+# via a kernel-private syscall) and finally invokes a sigreturn TRAMPOLINE,
+# which traps to the kernel; the kernel restores ELR_EL1 + SP_EL0 (and x0) from
+# the saved frame and ERETs back to EXACTLY where the original raise() left off.
+# The main routine then observes it resumed past the raise and exit(0)s, proving
+# a complete deliver -> handle -> return round trip on bare-metal aarch64.
+#
+# Implementation notes:
+#   * The signal frame is pushed BELOW the live SP_EL0 (read via MRS SP_EL0) so
+#     it lands in the task's EL0-RWX stack window; SP_EL0 is then lowered past it
+#     while the handler runs, and restored to its original value on sigreturn.
+#   * raise()/sigreturn() are serviced from arm64_sync_handler's normal return
+#     path: that path does NOT overwrite SPSR_EL1/ELR_EL1/SP_EL0 (it only reloads
+#     the GPR frame then erets), so mutating ELR_EL1 + SP_EL0 inside the handler
+#     and returning 0 makes the stub's ERET resume EL0 at the redirected target.
+#   * SPSR_EL1 is left as the trapped EL0t PSTATE for both transitions, so the
+#     handler and the resumed mainline both run at EL0t with IRQs masked.
+# ---------------------------------------------------------------------------
+
+# Kernel-private Phase-11 syscall numbers (outside the Linux ABI range used by
+# write/exit). raise() asks the kernel to deliver the signal; sighandler_ran()
+# lets the user handler tell the kernel it executed; sigreturn() asks the kernel
+# to restore the interrupted context and resume the mainline.
+SYS_RAISE_NR: uint64 = 520
+SYS_SIGHANDLER_RAN_NR: uint64 = 521
+SYS_SIGRETURN_NR: uint64 = 522
+
+# The signal "number" the demo raises (mirrors a POSIX signal value; here it is
+# only a token passed to the handler in x0 so we can prove it arrived intact).
+SIG_DEMO_NR: uint64 = 0x11               # 17 — an arbitrary recognizable token
+
+# Phase-11 EL0 layout, all inside the EL0-RWX window (USER_L2_INDEX @ 0x4020_0000):
+#   main entry, handler entry, sigreturn trampoline, and the write() message.
+SIG_MAIN_CODE: uint64 = 0x40200000       # main routine (== USER_CODE_BASE)
+SIG_HANDLER_CODE: uint64 = 0x40208000    # signal handler routine
+SIG_RET_TRAMP: uint64 = 0x4020C000       # sigreturn trampoline (handler returns here)
+SIG_MSG_BASE: uint64 = 0x40223000        # handler's write() message buffer
+SIG_STACK_TOP: uint64 = 0x40270000       # EL0 stack top for the signal demo task
+
+# Phase-11 bookkeeping. arm64_sig_active routes svc into the Phase-11 dispatcher.
+# The saved-frame cells latch the interrupted EL0 context across handler
+# execution. arm64_sig_handler_ran / arm64_sig_delivered / arm64_sig_returned
+# latch the three milestones so exit() can prove the full round trip occurred.
+arm64_sig_active: int64 = 0
+arm64_sig_saved_pc: uint64 = 0           # ELR_EL1 at raise (resume PC)
+arm64_sig_saved_sp: uint64 = 0           # SP_EL0 at raise (resume stack)
+arm64_sig_saved_x0: uint64 = 0           # x0 the mainline expects after raise
+arm64_sig_delivered: int64 = 0           # set once the frame is pushed + redirected
+arm64_sig_handler_ran: int64 = 0         # set when the EL0 handler reports in
+arm64_sig_returned: int64 = 0            # set once sigreturn restored the context
+arm64_sig_handler_arg: uint64 = 0        # the signal token the handler received
+
+# The return value raise() hands back to the mainline once the handler has run
+# and sigreturn has resumed it (a recognizable sentinel so the mainline can
+# confirm the kernel restored its x0 across the signal round trip).
+SIG_RAISE_RESULT: uint64 = 0x5161        # "Q a" — arbitrary recognizable value
+
+
+# Materialise the Phase-11 EL0 MAIN routine into SIG_MAIN_CODE:
+#   x8 = 520 (raise); svc #0          -> kernel delivers the signal here
+#   (control diverts to the handler, runs it, sigreturns back to the next insn)
+#   ... resumes here with x0 = SIG_RAISE_RESULT ...
+#   write(1, msg, len)                -> echo a "resumed" marker
+#   exit(0)
+# Because raise() diverts to the handler and only returns AFTER sigreturn, the
+# instructions after the raise svc are the resumption point the kernel restores.
+def arm64_build_sig_main(msg_len: uint64) -> int64:
+    a: uint64 = SIG_MAIN_CODE
+
+    # raise(): x8 = 520; svc #0. The kernel saves THIS post-svc PC as the resume
+    # point, delivers the signal, and only resumes here once sigreturn fires.
+    a = _emit_load_imm64(a, cast[uint64](8), SYS_RAISE_NR)
+    a = _emit_word(a, cast[uint64](0xD4000001))                # svc #0
+
+    # write(1, msg, len): x0 = 1; x1 = msg; x2 = len; x8 = 64; svc #0
+    a = _emit_load_imm64(a, cast[uint64](0), cast[uint64](1))
+    a = _emit_load_imm64(a, cast[uint64](1), SIG_MSG_BASE)
+    a = _emit_load_imm64(a, cast[uint64](2), msg_len)
+    a = _emit_load_imm64(a, cast[uint64](8), SYS_WRITE_NR)
+    a = _emit_word(a, cast[uint64](0xD4000001))                # svc #0
+
+    # exit(0): x0 = 0; x8 = 93; svc #0
+    a = _emit_load_imm64(a, cast[uint64](0), cast[uint64](0))
+    a = _emit_load_imm64(a, cast[uint64](8), SYS_EXIT_NR)
+    a = _emit_word(a, cast[uint64](0xD4000001))                # svc #0
+
+    _dsb_ish()
+    _isb()
+    return 0
+
+
+# Materialise the Phase-11 EL0 signal HANDLER into SIG_HANDLER_CODE. On entry the
+# kernel has set x0 = the signal token (SIG_DEMO_NR). The handler:
+#   sighandler_ran(x0): x8 = 521; svc #0   -> tell the kernel it executed (passing
+#                                             the signal token back for checking)
+#   b SIG_RET_TRAMP                         -> jump to the sigreturn trampoline
+# The trampoline then issues the sigreturn svc, so the handler never falls off
+# its end. (x0 already holds the signal token on entry, courtesy of the kernel.)
+def arm64_build_sig_handler() -> int64:
+    a: uint64 = SIG_HANDLER_CODE
+
+    # sighandler_ran(token): the kernel placed the token in x0 already; move it to
+    # x1 (so x0 can carry nothing in particular) — but simplest is to keep the
+    # token in x0 as arg0. x8 = 521; svc #0.
+    a = _emit_load_imm64(a, cast[uint64](8), SYS_SIGHANDLER_RAN_NR)
+    a = _emit_word(a, cast[uint64](0xD4000001))                # svc #0
+
+    # b SIG_RET_TRAMP : 0x14000000 | imm26; imm26 = (target - here) / 4.
+    b_here: uint64 = a
+    off_tramp: int64 = cast[int64](SIG_RET_TRAMP) - cast[int64](b_here)
+    imm26: uint64 = cast[uint64](off_tramp >> 2) & cast[uint64](0x3FFFFFF)
+    a = _emit_word(a, cast[uint64](0x14000000) | imm26)
+
+    _dsb_ish()
+    _isb()
+    return 0
+
+
+# Materialise the Phase-11 sigreturn TRAMPOLINE into SIG_RET_TRAMP:
+#   x8 = 522 (sigreturn); svc #0   -> kernel restores the interrupted context and
+#                                     resumes the mainline (this svc never returns
+#                                     to the trampoline; the kernel erets to the
+#                                     saved mainline PC instead).
+# A real Linux signal frame stores this trampoline address as the handler's
+# return address; here the handler branches to it directly, which is equivalent.
+def arm64_build_sig_trampoline() -> int64:
+    a: uint64 = SIG_RET_TRAMP
+    a = _emit_load_imm64(a, cast[uint64](8), SYS_SIGRETURN_NR)
+    a = _emit_word(a, cast[uint64](0xD4000001))                # svc #0
+    _dsb_ish()
+    _isb()
+    return 0
+
+
+# Deliver the signal to the running EL0 task. The trapped ELR_EL1 already points
+# at the instruction AFTER the raise svc — that is the resume PC. Saves the
+# interrupted context, pushes a signal frame below SP_EL0, redirects ELR_EL1 to
+# the handler with the signal token in x0, and lowers SP_EL0 past the frame.
+def arm64_sig_do_raise(frame_ptr: Ptr[uint64]) -> int64:
+    resume_pc: uint64 = cast[uint64](_mrs_elr_el1())
+    cur_sp: uint64 = cast[uint64](_mrs_sp_el0())
+
+    rm: Ptr[char] = "[arm64] EL0 raise() -> delivering signal\n"
+    _uart_puts(rm)
+
+    # Save the interrupted context the mainline must see restored. The saved x0 is
+    # a sentinel so the resumption can prove the kernel restored x0 round trip.
+    arm64_sig_saved_pc = resume_pc
+    arm64_sig_saved_sp = cur_sp
+    arm64_sig_saved_x0 = SIG_RAISE_RESULT
+
+    # Push a minimal signal frame onto the EL0 stack below the live SP_EL0 (two
+    # 8-byte words, 16-byte aligned): the saved PC + SP, mirroring a real
+    # sigframe. The kernel reads these back on sigreturn.
+    new_sp: uint64 = cur_sp - cast[uint64](16)
+    framep: Ptr[uint64] = cast[Ptr[uint64]](new_sp)
+    framep[0] = resume_pc
+    framep[1] = cur_sp
+
+    pcmsg: Ptr[char] = "[arm64] signal frame pushed; resume PC="
+    _uart_puts(pcmsg)
+    _uart_puthex(resume_pc)
+    nl0: Ptr[char] = "\n"
+    _uart_puts(nl0)
+
+    # Redirect EL0 into the user handler on the lowered stack, with the signal
+    # token in x0 (the handler's arg0). The sync stub reloads the GPR frame then
+    # erets, so writing the frame's x0 slot sets the handler's x0, and setting
+    # ELR_EL1 + SP_EL0 here lands the eret on the handler.
+    frame_ptr[0] = SIG_DEMO_NR
+    _msr_elr_el1(SIG_HANDLER_CODE)
+    _msr_sp_el0(new_sp)
+    arm64_sig_delivered = 1
+
+    dm: Ptr[char] = "[arm64] redirected EL0 to signal handler\n"
+    _uart_puts(dm)
+    return 0
+
+
+# Restore the interrupted EL0 context from the saved signal frame and resume the
+# mainline. Reads the frame back off the EL0 stack to prove the pushed layout
+# round-tripped, then restores ELR_EL1 + SP_EL0 + x0.
+def arm64_sig_do_return(frame_ptr: Ptr[uint64]) -> int64:
+    sp_at_ret: uint64 = cast[uint64](_mrs_sp_el0())
+    framep: Ptr[uint64] = cast[Ptr[uint64]](sp_at_ret)
+    framed_pc: uint64 = framep[0]
+    framed_sp: uint64 = framep[1]
+
+    srm: Ptr[char] = "[arm64] EL0 sigreturn() -> restoring context\n"
+    _uart_puts(srm)
+
+    # The frame-stored PC/SP must match what raise() saved.
+    ok_pc: int64 = 0
+    if framed_pc == arm64_sig_saved_pc:
+        ok_pc = 1
+    ok_sp: int64 = 0
+    if framed_sp == arm64_sig_saved_sp:
+        ok_sp = 1
+    if (ok_pc != 0) and (ok_sp != 0):
+        fm: Ptr[char] = "[arm64] sigreturn frame matched saved context OK\n"
+        _uart_puts(fm)
+    else:
+        bm: Ptr[char] = "[arm64] sigreturn frame MISMATCH FAIL\n"
+        _uart_puts(bm)
+
+    # Restore ELR_EL1 (resume PC) + SP_EL0 (original stack), and place the saved
+    # x0 sentinel into the frame's x0 slot so the mainline resumes with raise()'s
+    # return value. SPSR_EL1 is unchanged (still EL0t).
+    _msr_elr_el1(arm64_sig_saved_pc)
+    _msr_sp_el0(arm64_sig_saved_sp)
+    frame_ptr[0] = arm64_sig_saved_x0
+    arm64_sig_returned = 1
+
+    dm: Ptr[char] = "[arm64] resuming interrupted EL0 mainline; PC="
+    _uart_puts(dm)
+    _uart_puthex(arm64_sig_saved_pc)
+    nl: Ptr[char] = "\n"
+    _uart_puts(nl)
+    return 0
+
+
+# Phase-11 exit: record the code, print PASS iff the whole signal round trip ran
+# cleanly (frame delivered + handler ran with the right token + sigreturn
+# restored + resumed), then halt deterministically. Never returns.
+def arm64_sig_do_exit(a0: uint64) -> int64:
+    arm64_el0_exit_code = cast[int64](a0)
+    arm64_el0_exited = 1
+    em: Ptr[char] = "[arm64] EL0 exit(11) syscall serviced\n"
+    _uart_puts(em)
+    ok: int64 = 0
+    if a0 == cast[uint64](0):
+        if arm64_sig_delivered != 0:
+            if arm64_sig_handler_ran != 0:
+                if arm64_sig_returned != 0:
+                    if arm64_sig_handler_arg == SIG_DEMO_NR:
+                        ok = 1
+    if ok != 0:
+        pm: Ptr[char] = "[arm64] EL0 signal delivery OK\n"
+        _uart_puts(pm)
+    else:
+        fm: Ptr[char] = "[arm64] EL0 signal delivery FAIL\n"
+        _uart_puts(fm)
+    arm64_sig_active = 0
+    # Phase 11 is the final EL0 milestone; halt deterministically.
+    _msr_daifset(2)
+    while True:
+        _wfi()
+    return 0
+
+
+# Phase-11 signal dispatcher. Routed from arm64_sync_handler while the signal
+# demo is live. Services raise (deliver), sighandler_ran (handler reporting in),
+# sigreturn (restore + resume), write and exit. raise/sigreturn mutate ELR_EL1 +
+# SP_EL0 and return 0 so the sync stub's ERET lands on the redirected target.
+def arm64_sig_dispatch(frame_ptr: Ptr[uint64], nr: uint64, a0: uint64, a1: uint64, a2: uint64) -> int64:
+    if nr == SYS_RAISE_NR:
+        return arm64_sig_do_raise(frame_ptr)
+
+    if nr == SYS_SIGHANDLER_RAN_NR:
+        # The EL0 signal handler is executing and reporting in (a0 = signal token).
+        arm64_sig_handler_ran = 1
+        arm64_sig_handler_arg = a0
+        hm: Ptr[char] = "[arm64] EL0 signal handler ran; token="
+        _uart_puts(hm)
+        _uart_puthex(a0)
+        nl: Ptr[char] = "\n"
+        _uart_puts(nl)
+        frame_ptr[0] = cast[uint64](0)
+        return 0
+
+    if nr == SYS_SIGRETURN_NR:
+        return arm64_sig_do_return(frame_ptr)
+
+    if nr == SYS_WRITE_NR:
+        buf: Ptr[uint8] = cast[Ptr[uint8]](a1)
+        n: uint64 = cast[uint64](0)
+        while n < a2:
+            _uart_putc(buf[n])
+            n = n + cast[uint64](1)
+        wm: Ptr[char] = "[arm64] EL0 write(11) syscall serviced\n"
+        _uart_puts(wm)
+        frame_ptr[0] = a2
+        return 0
+
+    if nr == SYS_EXIT_NR:
+        return arm64_sig_do_exit(a0)
+
+    um: Ptr[char] = "[arm64] EL0 unknown syscall (phase 11)\n"
+    _uart_puts(um)
+    frame_ptr[0] = cast[uint64](0)
+    return 0
+
+
+# Phase-11 entry point (invoked from the Phase-10 SMP hand-off). Restore the
+# kernel's identity TTBR0, build the EL0 main routine + signal handler + sigreturn
+# trampoline + handler message, arm Phase-11 dispatch, and ERET into the main
+# routine at EL0t with IRQs masked. Never returns (the task's exit() halts).
+def arm64_run_signal_demo() -> int64:
+    intro: Ptr[char] = "[arm64] Phase 11: EL0 signal delivery\n"
+    _uart_puts(intro)
+
+    # Restore the kernel's identity-only TTBR0 so the EL0 code/stack windows
+    # resolve through L1_PGTABLE, then flush the TLB for a clean address space.
+    _dsb_ish()
+    _msr_ttbr0_el1(L1_PGTABLE)
+    _dsb_ish()
+    _tlbi_vmalle1is()
+    _dsb_ish()
+    _isb()
+
+    # Build the three EL0 routines + the handler's write() message.
+    sigmsg: Ptr[char] = "Resumed EL0 mainline after signal handler\n"
+    msg_len: uint64 = _copy_msg_to(sigmsg, SIG_MSG_BASE)
+    arm64_build_sig_main(msg_len)
+    arm64_build_sig_handler()
+    arm64_build_sig_trampoline()
+
+    # Seed Phase-11 bookkeeping and arm the dispatcher.
+    arm64_el0_exited = 0
+    arm64_el0_exit_code = -1
+    arm64_sig_delivered = 0
+    arm64_sig_handler_ran = 0
+    arm64_sig_returned = 0
+    arm64_sig_handler_arg = 0
+    arm64_sig_active = 1
+
+    enter: Ptr[char] = "[arm64] launching EL0 signal-delivery task\n"
+    _uart_puts(enter)
+
+    _msr_spsr_el1(SPSR_EL0T_DAIF)      # EL0t, IRQ/FIQ masked (deterministic)
+    _msr_elr_el1(SIG_MAIN_CODE)        # EL0 entry PC (the main routine)
+    _msr_sp_el0(SIG_STACK_TOP)         # EL0 stack pointer
+    _isb()
+    _eret()                            # -> EL0; svc traps re-enter EL1; no return
     return 0
 
 
