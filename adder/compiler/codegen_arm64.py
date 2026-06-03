@@ -1332,6 +1332,20 @@ class Arm64CodeGen:
             self.emit("    tlbi aside1is, x0")
             self.emit("    mov x0, #0")
             return True
+        if name == "_tlbi_vaae1is":
+            # Phase 24: invalidate, inner-shareable, all stage-1 EL1&0 TLB entries
+            # that match a given VA (all-ASID). The operand register carries the
+            # VA in bits[43:0] as VA>>12 (page number); the rest RES0. Unlike the
+            # broad `tlbi vmalle1is`, this tears down ONLY the single page's stale
+            # translation — the precise maintenance a demand-paging fault handler
+            # performs after installing one fresh L3 PTE.
+            if len(args) != 1:
+                raise CodeGenError(
+                    "aarch64: _tlbi_vaae1is expects exactly 1 argument")
+            self.gen_expr(args[0])               # VA>>12 operand -> x0
+            self.emit("    tlbi vaae1is, x0")
+            self.emit("    mov x0, #0")
+            return True
         if name == "_install_vbar":
             # Install the EL1 exception vector table from arch/arm64/vectors.S.
             # Its symbol `arm64_vectors` is 0x800-aligned (16 entries x 0x80);

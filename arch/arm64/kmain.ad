@@ -1314,6 +1314,67 @@ arm64_p23_both_ran_split: int64 = 0  # switches where outgoing+incoming TLS diff
 P23_GOAL: int64 = 24                 # swaps before the verdict
 
 # ---------------------------------------------------------------------------
+# Phase 24: EL0 DEMAND PAGING across a fresh, wholly-unmapped VA window. Phase 14
+# proved the mechanism on TWO hard-coded VAs; Phase 24 generalises it to a real
+# multi-page window: a 2 MiB EL0 window is left ENTIRELY unmapped (its L2 slot is
+# zero, no L3 table), so the FIRST touch of EACH page raises an independent
+# translation Data Abort from EL0. The same EL1 synchronous handler decodes
+# ESR_EL1 (EC == 0x24 Data Abort from a lower EL; DFSC == 0b0001xx translation
+# fault), allocates a fresh physical page from a small per-phase page pool,
+# installs its L3 PTE with EL0 RW permissions, invalidates ONLY that page's stale
+# translation (tlbi vaae1is + dsb/isb), and returns WITHOUT advancing ELR so the
+# faulting store/load RETRIES and completes transparently. The EL0 demo walks
+# N_PAGES distinct pages across the window, writes a per-page sentinel to each,
+# reads them all back, and hands the read-backs to the kernel, which verifies
+# every value AND that exactly N_PAGES faults were serviced. A translation fault
+# OUTSIDE the window keeps the existing fatal-fault behaviour (no masking of real
+# bugs).
+#
+# Window VA 0x4220_0000: L1 idx 1 (the existing L2_PGTABLE), L2 idx 17 (UNMAPPED
+# at boot, above Phase 23's TLS VA at L2 idx 16). L3 idx walks 0..N_PAGES-1.
+# ---------------------------------------------------------------------------
+P24_WINDOW_BASE: uint64 = 0x42200000     # EL0 demand-paged window base (unmapped)
+P24_WINDOW_L2_INDEX: uint64 = 17         # (0x4220_0000 - 0x4000_0000) / 2 MiB
+P24_PAGE_SIZE: uint64 = 0x1000           # 4 KiB pages
+P24_N_PAGES: int64 = 4                   # distinct pages the demo touches/faults
+
+# Fresh EL1-only physical pages: P24_L3 is the new L3 table installed under the
+# window's L2 slot; P24_POOL_BASE is the base of a contiguous pool of N_PAGES
+# physical pages the fault handler hands out one-per-fault. All sit in otherwise-
+# unused EL1-only RAM above Phase 23's per-slot L1/L2 scratch (ends 0x4019_2000).
+P24_L3: uint64 = 0x40192000              # new L3 table for the window's L2 slot
+P24_POOL_BASE: uint64 = 0x40193000       # 4 contiguous backing pages (0x193..0x196)
+
+# L3 PAGE descriptor flags: EL0 read/write Normal page (VALID | AF | SH_INNER |
+# AttrIndx1 | AP[1]), bits[1:0]=0b11 so the walker treats it as a level-3 page.
+P24_PAGE_FLAGS: uint64 = 0x747
+
+# Per-page sentinel = base XOR (page index salt). Distinct per page so a read-back
+# proves the RIGHT page paged in (not a stale alias of an earlier page).
+P24_SENTINEL_BASE: uint64 = 0xC0FFEE0000000000
+
+# Kernel-private syscalls (clear of every prior private nr). REPORT hands one
+# read-back (index, value) pair back per page so the kernel verifies each.
+SYS_P24_REPORT_NR: uint64 = 570          # a0 = page index, a1 = value read back
+SYS_P24_WRITE_NR: uint64 = 571           # write(1, buf, len) -> UART
+SYS_P24_EXIT_NR: uint64 = 572            # exit(code) -> verdict + halt
+
+# EL0 message buffer (inside the identity-mapped EL0 RWX window, clear of code).
+P24_MSG_BASE: uint64 = 0x40226000
+
+# Phase 24 bookkeeping. arm64_p24_active routes EL0 aborts + svc into the Phase-24
+# path while the demo is live. arm64_p24_faults counts translation faults the
+# handler serviced (must reach N_PAGES). arm64_p24_next_page is the next pool page
+# to hand out. arm64_p24_mapped_mask/_correct_mask are per-page latch bitmasks.
+arm64_p24_active: int64 = 0
+arm64_p24_faults: int64 = 0
+arm64_p24_next_page: int64 = 0
+arm64_p24_mapped_mask: uint64 = 0        # bit i set when page i's PTE installed
+arm64_p24_correct_mask: uint64 = 0       # bit i set when page i read back correctly
+arm64_p24_outside: int64 = 0             # translation faults OUTSIDE the window
+arm64_p24_reports: int64 = 0             # report syscalls received
+
+# ---------------------------------------------------------------------------
 # Identity-mapped L1 page table. A single level-1 table of 512 8-byte block
 # descriptors (4 KiB granule => each L1 entry spans 1 GiB). We place it at a
 # fixed, 4 KiB-aligned physical address in RAM, well past the kernel image
@@ -1737,6 +1798,14 @@ def arm64_sync_handler(frame_ptr: Ptr[uint64]) -> int64:
             if arm64_demand_active != 0:
                 if arm64_try_demand_page(esr) != 0:
                     return 0
+            # Phase 24: a data abort might be a DEMAND-PAGING translation fault on
+            # a still-unmapped page inside the Phase-24 window — allocate a fresh
+            # page, install its EL0-RW L3 PTE, flush only that VA, and resume EL0
+            # at the faulting instruction (retry). arm64_p24_try_fault returns 1 if
+            # it handled the fault, 0 to fall through to the fatal-fault reaper.
+            if arm64_p24_active != 0:
+                if arm64_p24_try_fault(esr) != 0:
+                    return 0
             # Phase 16: while the mmap demo is live, a data abort might be a
             # demand fault inside a LIVE anonymous VMA (page it in + resume) or a
             # post-munmap touch of a now-dead VMA (fall through to the reaper,
@@ -1830,6 +1899,13 @@ def arm64_sync_handler(frame_ptr: Ptr[uint64]) -> int64:
     # path (arm64_mp_try_fault / arm64_mp_reap), not here.
     if arm64_mp_active != 0:
         return arm64_mp_dispatch(frame_ptr, nr, a0, a1, a2)
+
+    # Phase 24: while the demand-paging window demo is live, route every svc into
+    # the Phase-24 dispatcher (report / write / exit). The page-ins themselves
+    # happen on the ABORT path (arm64_p24_try_fault), not here; these are the
+    # task's explicit syscalls AFTER its faulting stores transparently completed.
+    if arm64_p24_active != 0:
+        return arm64_p24_dispatch(frame_ptr, nr, a0, a1, a2)
 
     # Phase 23: while the TLS demo is live, route every svc into the Phase-23
     # dispatcher (settls / tick-report). SETTLS installs the running thread's
@@ -8454,6 +8530,15 @@ def arm64_p23_finish() -> int64:
         _uart_puts(rp)
         op: Ptr[char] = "[arm64] EL0 thread-local storage (TPIDR_EL0) scheduling OK\n"
         _uart_puts(op)
+        # Phase 23 complete and clean. Hand off to Phase 24 (EL0 demand paging
+        # across a fresh unmapped VA window). Mask IRQs (deterministic, no timer
+        # re-entry) and run the demo; arm64_run_demand_paging24_demo halts after
+        # PASS. This is the Phase 23 -> 24 hand-off point.
+        _msr_daifset(2)
+        arm64_run_demand_paging24_demo()
+        # Unreachable: arm64_run_demand_paging24_demo halts. Safety loop.
+        while True:
+            _wfi()
     else:
         fm: Ptr[char] = "[arm64] EL0 thread-local storage scheduling FAIL\n"
         _uart_puts(fm)
@@ -8526,6 +8611,322 @@ def arm64_run_tls_demo() -> int64:
     _msr_sp_el0(ctx[CTX_SP_EL0])
     _isb()
     _eret()                                  # -> slot A at EL0 under ASID 11
+    return 0
+
+
+# ===========================================================================
+# Phase 24 — EL0 DEMAND PAGING across a fresh, wholly-unmapped VA window.
+# ===========================================================================
+
+# Per-page sentinel the EL0 task stores then reads back. Distinct per page so a
+# read-back proves the RIGHT page paged in.
+def arm64_p24_sentinel_for(idx: int64) -> uint64:
+    u: uint64 = cast[uint64](idx)
+    return P24_SENTINEL_BASE | (u << cast[uint64](8)) | u
+
+
+# VA of page `idx` inside the demand window.
+def arm64_p24_va_for(idx: int64) -> uint64:
+    return P24_WINDOW_BASE + (cast[uint64](idx) * P24_PAGE_SIZE)
+
+
+# Install the window's L3 table under its (currently UNMAPPED) L2 slot, zeroed so
+# every 4 KiB slot still translation-faults on first touch. Idempotent: if the L2
+# slot already points at an L3 table it returns without re-wiring.
+def arm64_p24_install_l3() -> int64:
+    l2: Ptr[uint64] = cast[Ptr[uint64]](L2_PGTABLE)
+    if l2[cast[int64](P24_WINDOW_L2_INDEX)] != cast[uint64](0):
+        return 0                          # L3 already wired under this L2 slot
+
+    # Zero the brand-new L3 table so every still-unmapped 4 KiB slot keeps
+    # faulting (each page is a genuine first-touch translation fault).
+    l3: Ptr[uint64] = cast[Ptr[uint64]](P24_L3)
+    i: int64 = 0
+    while i < 512:
+        l3[i] = cast[uint64](0)
+        i = i + 1
+    _dsb_ish()
+
+    # Point the window's L2 slot at the new L3 table (table descriptor).
+    l2[cast[int64](P24_WINDOW_L2_INDEX)] = P24_L3 | DESC_TABLE
+    _dsb_ish()
+    _tlbi_vmalle1is()
+    _dsb_ish()
+    _isb()
+    return 0
+
+
+# Allocate the next fresh physical page from the per-phase pool, install it as the
+# L3 PTE backing VA `va` with EL0 RW permissions, then invalidate ONLY that VA's
+# stale translation (tlbi vaae1is) so EL0 sees the new mapping. Returns the L3
+# index installed.
+def arm64_p24_map_page(va: uint64) -> uint64:
+    arm64_p24_install_l3()
+
+    # Hand out the next pool page (the handler only ever fires N_PAGES times).
+    page_pa: uint64 = P24_POOL_BASE + (cast[uint64](arm64_p24_next_page) * P24_PAGE_SIZE)
+    arm64_p24_next_page = arm64_p24_next_page + 1
+
+    # Zero the backing physical page (a fresh page must start clean).
+    pg: Ptr[uint64] = cast[Ptr[uint64]](page_pa)
+    j: int64 = 0
+    while j < 512:
+        pg[j] = cast[uint64](0)
+        j = j + 1
+    _dsb_ish()
+
+    # L3 index of `va` = VA[20:12].
+    l3_index: uint64 = (va >> cast[uint64](12)) & cast[uint64](0x1FF)
+    l3: Ptr[uint64] = cast[Ptr[uint64]](P24_L3)
+    l3[cast[int64](l3_index)] = page_pa | P24_PAGE_FLAGS
+
+    # Publish the L3 edit, then flush ONLY this page's stale (faulting)
+    # translation. The TLBI VAAE1IS operand is the VA's page number (VA >> 12).
+    _dsb_ish()
+    _tlbi_vaae1is(va >> cast[uint64](12))
+    _dsb_ish()
+    _isb()
+    return l3_index
+
+
+# Phase-24 demand-paging fault entry. Called from arm64_sync_handler for a data
+# abort from EL0 while the demo is live. Decodes ESR_EL1.ISS.DFSC: a TRANSLATION
+# fault (0b0001xx) on a page INSIDE the window is paged in (return 1 -> resume EL0
+# at the faulting instruction, which retries). Anything else (permission fault, or
+# a translation fault OUTSIDE the window) returns 0 so the fatal-fault reaper runs
+# — real bugs are never masked.
+def arm64_p24_try_fault(esr: uint64) -> int64:
+    dfsc: uint64 = esr & ESR_DFSC_MASK
+    kind: uint64 = dfsc >> ESR_DFSC_KIND_SHIFT
+    if kind != ESR_DFSC_KIND_XLAT:
+        # Not a translation fault (e.g. a permission fault) — not demand-pageable.
+        return 0
+
+    far: uint64 = cast[uint64](_mrs_far_el1())
+    page_va: uint64 = far & cast[uint64](0xFFFFFFFFFFFFF000)
+
+    # Is the faulting page inside the demand window [BASE, BASE + N_PAGES*4KiB)?
+    win_top: uint64 = P24_WINDOW_BASE + (cast[uint64](P24_N_PAGES) * P24_PAGE_SIZE)
+    if page_va < P24_WINDOW_BASE:
+        arm64_p24_outside = arm64_p24_outside + 1
+        return 0
+    if page_va >= win_top:
+        arm64_p24_outside = arm64_p24_outside + 1
+        return 0
+
+    idx: int64 = cast[int64]((page_va - P24_WINDOW_BASE) >> cast[uint64](12))
+    arm64_p24_map_page(page_va)
+    arm64_p24_mapped_mask = arm64_p24_mapped_mask | (cast[uint64](1) << cast[uint64](idx))
+    arm64_p24_faults = arm64_p24_faults + 1
+
+    m: Ptr[char] = "[arm64] Phase 24 demand fault: paged in VA "
+    _uart_puts(m)
+    _uart_puthex(page_va)
+    pi: Ptr[char] = " (page "
+    _uart_puts(pi)
+    _uart_puthex(cast[uint64](idx))
+    cl: Ptr[char] = ")\n"
+    _uart_puts(cl)
+    return 1
+
+
+# Materialise the Phase-24 EL0 routine into USER_CODE_BASE. For each of N_PAGES
+# pages: load the page VA + its sentinel, str (FAULTS first touch; kernel pages it
+# in then resumes here so the store completes), then ldr it back and hand (idx,
+# value) to the kernel via SYS_P24_REPORT_NR. Finally write(1, msg, len), exit(0).
+# Stores/loads fault transparently; nothing in the task references the page-fault
+# path. GPR-only (no FP).
+def arm64_build_p24_routine(msg_len: uint64) -> int64:
+    a: uint64 = USER_CODE_BASE
+    idx: int64 = 0
+    while idx < P24_N_PAGES:
+        va: uint64 = arm64_p24_va_for(idx)
+        sent: uint64 = arm64_p24_sentinel_for(idx)
+
+        # x10 = VA ; x9 = sentinel ; str x9,[x10] (faults -> demand-paged)
+        a = _emit_load_imm64(a, cast[uint64](10), va)
+        a = _emit_load_imm64(a, cast[uint64](9), sent)
+        a = _emit_word(a, cast[uint64](0xF9000000) | (cast[uint64](10) << cast[uint64](5)) | cast[uint64](9))
+        # x9 = 0 ; ldr x9,[x10]  (read the sentinel back through the new page)
+        a = _emit_load_imm64(a, cast[uint64](9), cast[uint64](0))
+        a = _emit_word(a, cast[uint64](0xF9400000) | (cast[uint64](10) << cast[uint64](5)) | cast[uint64](9))
+        # report(idx, value): x0 = idx ; x1 = x9 ; x8 = 570 ; svc #0
+        a = _emit_load_imm64(a, cast[uint64](0), cast[uint64](idx))
+        # mov x1, x9  (ORR x1, xzr, x9) = 0xAA0003E1 | (9<<16) = 0xAA0903E1
+        a = _emit_word(a, cast[uint64](0xAA0003E1) | (cast[uint64](9) << cast[uint64](16)))
+        a = _emit_load_imm64(a, cast[uint64](8), SYS_P24_REPORT_NR)
+        a = _emit_word(a, cast[uint64](0xD4000001))
+        idx = idx + 1
+
+    # write(1, msg, len): x0 = 1; x1 = msg; x2 = len; x8 = 571; svc #0
+    a = _emit_load_imm64(a, cast[uint64](0), cast[uint64](1))
+    a = _emit_load_imm64(a, cast[uint64](1), P24_MSG_BASE)
+    a = _emit_load_imm64(a, cast[uint64](2), msg_len)
+    a = _emit_load_imm64(a, cast[uint64](8), SYS_P24_WRITE_NR)
+    a = _emit_word(a, cast[uint64](0xD4000001))
+
+    # exit(0): x0 = 0; x8 = 572; svc #0
+    a = _emit_load_imm64(a, cast[uint64](0), cast[uint64](0))
+    a = _emit_load_imm64(a, cast[uint64](8), SYS_P24_EXIT_NR)
+    a = _emit_word(a, cast[uint64](0xD4000001))
+
+    _dsb_ish()
+    _isb()
+    return 0
+
+
+# Phase-24 syscall dispatcher. Routed from arm64_sync_handler while the demo is
+# live. REPORT records + verifies one (page idx, read-back value) pair; write
+# emits to the UART; exit runs the verdict + halts.
+def arm64_p24_dispatch(frame_ptr: Ptr[uint64], nr: uint64, a0: uint64, a1: uint64, a2: uint64) -> int64:
+    nl: Ptr[char] = "\n"
+
+    if nr == SYS_P24_REPORT_NR:
+        idx: int64 = cast[int64](a0)
+        arm64_p24_reports = arm64_p24_reports + 1
+        want: uint64 = arm64_p24_sentinel_for(idx)
+
+        r0: Ptr[char] = "[arm64] Phase 24 read-back page "
+        _uart_puts(r0)
+        _uart_puthex(a0)
+        ar: Ptr[char] = " -> "
+        _uart_puts(ar)
+        _uart_puthex(a1)
+        _uart_puts(nl)
+
+        if a1 == want:
+            # Independently confirm the BACKING physical page holds the sentinel,
+            # so the demand mapping truly reached the pool page (not a stale alias).
+            back: Ptr[uint64] = cast[Ptr[uint64]](P24_POOL_BASE + (cast[uint64](idx) * P24_PAGE_SIZE))
+            if back[0] == want:
+                arm64_p24_correct_mask = arm64_p24_correct_mask | (cast[uint64](1) << cast[uint64](idx))
+        frame_ptr[0] = cast[uint64](0)
+        return 0
+
+    if nr == SYS_P24_WRITE_NR:
+        buf: Ptr[uint8] = cast[Ptr[uint8]](a1)
+        n: uint64 = cast[uint64](0)
+        while n < a2:
+            _uart_putc(buf[n])
+            n = n + cast[uint64](1)
+        wm: Ptr[char] = "[arm64] EL0 write(24) syscall serviced\n"
+        _uart_puts(wm)
+        frame_ptr[0] = a2
+        return 0
+
+    if nr == SYS_P24_EXIT_NR:
+        arm64_el0_exit_code = cast[int64](a0)
+        arm64_el0_exited = 1
+        em: Ptr[char] = "[arm64] EL0 exit(24) syscall serviced\n"
+        _uart_puts(em)
+        arm64_p24_finish(a0)
+        # Unreachable: arm64_p24_finish halts. Safety loop if it falls through.
+        while True:
+            _wfi()
+
+    um: Ptr[char] = "[arm64] EL0 unknown syscall (phase 24)\n"
+    _uart_puts(um)
+    frame_ptr[0] = cast[uint64](0)
+    return 0
+
+
+# Phase-24 verdict. PASS iff exit(0) AND exactly N_PAGES translation faults were
+# serviced (one per page), AND every page was mapped, AND every read-back matched
+# its sentinel, AND no translation fault fired OUTSIDE the window. Print the fault
+# count + the required summary lines, then halt deterministically. Never returns.
+def arm64_p24_finish(code: uint64) -> int64:
+    arm64_p24_active = 0
+    nl: Ptr[char] = "\n"
+
+    fc: Ptr[char] = "[arm64] Phase 24 demand-paging: "
+    _uart_puts(fc)
+    _uart_puthex(cast[uint64](arm64_p24_faults))
+    fs: Ptr[char] = " faults serviced\n"
+    _uart_puts(fs)
+
+    full: uint64 = (cast[uint64](1) << cast[uint64](P24_N_PAGES)) - cast[uint64](1)
+
+    ok: int64 = 0
+    if code == cast[uint64](0):
+        if arm64_p24_faults == P24_N_PAGES:
+            if arm64_p24_mapped_mask == full:
+                if arm64_p24_correct_mask == full:
+                    if arm64_p24_outside == 0:
+                        if arm64_p24_reports == P24_N_PAGES:
+                            ok = 1
+
+    if ok != 0:
+        sm: Ptr[char] = "[arm64] Phase 24 first-touch pages faulted in on demand across the window\n"
+        _uart_puts(sm)
+        pm: Ptr[char] = "[arm64] Phase 24 PASS\n"
+        _uart_puts(pm)
+    else:
+        fm: Ptr[char] = "[arm64] Phase 24 demand-paging FAIL\n"
+        _uart_puts(fm)
+
+    _msr_daifset(2)
+    while True:
+        _wfi()
+    return 0
+
+
+# Phase-24 entry point (from the Phase-23 finish hand-off). Restore the kernel's
+# identity TTBR0, force the window's L2 slot UNMAPPED (so the first touch of every
+# page genuinely translation-faults), build the EL0 routine + message, arm
+# Phase-24 dispatch, and ERET into the demand task at EL0t with IRQs masked
+# (deterministic; the page-ins all happen on the synchronous abort path). Never
+# returns (the task's exit() halts after the PASS marker).
+def arm64_run_demand_paging24_demo() -> int64:
+    intro: Ptr[char] = "[arm64] Phase 24: EL0 demand paging across an unmapped VA window\n"
+    _uart_puts(intro)
+
+    # Mask EL1 IRQs: Phase 24 is a single-task, abort-driven demo; no scheduler.
+    _msr_daifset(2)
+
+    # Restore the kernel's identity-only TTBR0 (be explicit), then flush the TLB.
+    _dsb_ish()
+    _msr_ttbr0_el1(L1_PGTABLE)
+    _dsb_ish()
+    _tlbi_vmalle1is()
+    _dsb_ish()
+    _isb()
+
+    # Force the window's L2 slot UNMAPPED so the first touch of every page raises a
+    # translation Data Abort (a clean, repeatable initial state).
+    l2: Ptr[uint64] = cast[Ptr[uint64]](L2_PGTABLE)
+    l2[cast[int64](P24_WINDOW_L2_INDEX)] = cast[uint64](0)
+    _dsb_ish()
+    _tlbi_vmalle1is()
+    _dsb_ish()
+    _isb()
+
+    # Seed Phase-24 bookkeeping.
+    arm64_p24_faults = 0
+    arm64_p24_next_page = 0
+    arm64_p24_mapped_mask = cast[uint64](0)
+    arm64_p24_correct_mask = cast[uint64](0)
+    arm64_p24_outside = 0
+    arm64_p24_reports = 0
+
+    p24msg: Ptr[char] = "Hello from a demand-paged EL0 window\n"
+    msg_len: uint64 = _copy_msg_to(p24msg, P24_MSG_BASE)
+    arm64_build_p24_routine(msg_len)
+
+    arm64_el0_exited = 0
+    arm64_el0_exit_code = -1
+    arm64_p24_active = 1
+
+    enter: Ptr[char] = "[arm64] launching EL0 demand-paging window task (4 pages)\n"
+    _uart_puts(enter)
+
+    _msr_spsr_el1(SPSR_EL0T_DAIF)      # EL0t, IRQ/FIQ masked (deterministic)
+    _msr_elr_el1(USER_CODE_BASE)       # EL0 entry PC
+    _msr_sp_el0(USER_STACK_TOP)        # EL0 stack pointer
+    _isb()
+    _eret()                            # -> EL0; first store faults, kernel pages in
+    # Unreachable: the task's exit() halts after the PASS marker.
+    while True:
+        _wfi()
     return 0
 
 
