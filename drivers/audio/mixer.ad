@@ -1,0 +1,371 @@
+# drivers/audio/mixer.ad
+#
+# Native software audio MIXER for the Intel HDA playback path
+# (drivers/audio/hda.ad). The bare HDA driver is single-stream: exactly
+# one writer fills the single hardware PCM DMA buffer and gets the codec.
+# A real desktop OS mixes MULTIPLE concurrent PCM streams (e.g. a media
+# player + a notification beep) into that one hardware buffer, with a
+# per-stream gain and a master volume. That is what this module does.
+#
+# WHAT IT DOES (the mix loop is the point — it is REAL, not a stub):
+#   * Up to MIX_MAX_STREAMS independent PCM streams can be open at once.
+#     Each has its own staging buffer, its own valid-length, and its own
+#     volume (a per-stream gain applied before mixing).
+#   * hda_mix_render() walks every active stream sample-by-sample, applies
+#     the per-stream gain, SUMS the gain-scaled samples with SATURATING
+#     add (so a loud sum clamps to the s16 range instead of wrapping to a
+#     loud click), applies the master volume to the final mix, clamps to
+#     the s16 sample range, and writes the result into the single hardware
+#     PCM DMA buffer via the hda.ad public write path.
+#   * A stream that has fewer staged bytes than the mix length simply
+#     contributes SILENCE for the missing tail (an underrun is silence,
+#     not noise).
+#
+# FIXED-POINT, INTEGER-ONLY. Volume is a Q8 fixed-point gain in [0..256]
+# where 256 == unity (100%). The control surface takes PERCENT (0..100)
+# and converts: gain = percent * 256 / 100. All sample math is int32 /
+# int64 — there is NO floating point anywhere in the mix loop.
+#
+# SAMPLE FORMAT. The mixer operates on s16le (signed 16-bit little-endian)
+# PCM, which is the HDA driver's default and what /dev/audio expects. Each
+# 2-byte sample is decoded to a signed int32, scaled, summed, clamped to
+# [-32768, 32767], and re-encoded as 2 little-endian bytes.
+#
+# PLAN-9 CONTROL SURFACE. There are no new syscalls and no ioctls. Volume
+# is set by TEXT writes to the existing /dev/audioctl control file (see
+# drivers/audio/audio_cdev.ad), which routes the mixer verbs here:
+#       master 80          # master volume = 80%
+#       stream 1 50        # stream id 1 volume = 50%
+# and the /dev/audio status read reports the current levels back. This is
+# the same "echo a string at a ctl file" idiom every other Hamnix device
+# uses.
+#
+# ADDER QUIRKS HONOURED: big buffers are module-scope Array globals (the
+# per-stream staging buffers and the scratch mix buffer); no libc; signed
+# sample math uses int32/int64 with explicit sign-extension; Ptr[T]+N is
+# byte-offset (unscaled).
+
+from kernel.printk.printk import printk0, printk1, printk2
+from drivers.audio.hda import (
+    hda_is_initialized, hda_write_pcm, hda_start, hda_reset_buffer,
+    hda_pcm_capacity,
+)
+
+
+# --- mixer geometry -------------------------------------------------
+MIX_MAX_STREAMS:  uint64 = 4               # concurrent open PCM streams
+MIX_STREAM_BYTES: uint64 = 65536           # 64 KiB staged per stream
+MIX_TOTAL_BYTES:  uint64 = 262144          # MIX_MAX_STREAMS * MIX_STREAM_BYTES
+
+# Q8 fixed-point gain: 256 == unity (100%).
+MIX_UNITY_GAIN:   int32  = 256
+
+# s16 sample range.
+MIX_S16_MAX:      int32  = 32767
+MIX_S16_MIN:      int32  = -32768
+
+
+# --- module state ---------------------------------------------------
+# Per-stream staging buffers, packed into one flat Array global. Stream
+# `id` occupies bytes [id*MIX_STREAM_BYTES .. (id+1)*MIX_STREAM_BYTES).
+mix_stage:    Array[262144, uint8]         # MIX_TOTAL_BYTES staging area
+# Scratch buffer for the rendered (mixed) PCM before it is handed to the
+# hardware DMA buffer through hda_write_pcm().
+mix_out:      Array[65536, uint8]          # MIX_STREAM_BYTES rendered PCM
+
+mix_active:   Array[4, int32]              # 1 == stream slot in use
+mix_len:      Array[4, uint64]             # valid PCM bytes staged per slot
+mix_vol:      Array[4, int32]              # per-stream Q8 gain (0..256)
+
+mix_master:   int32  = 256                 # master Q8 gain (0..256), unity
+mix_inited:   int32  = 0                   # slots/volumes initialized
+
+
+# --- init -----------------------------------------------------------
+
+def _mix_init_once():
+    # Lazily reset all slot bookkeeping the first time the mixer is used.
+    if mix_inited != 0:
+        return
+    i: uint64 = 0
+    while i < MIX_MAX_STREAMS:
+        mix_active[i] = 0
+        mix_len[i] = 0
+        mix_vol[i] = MIX_UNITY_GAIN        # default per-stream = 100%
+        i = i + 1
+    mix_master = MIX_UNITY_GAIN
+    mix_inited = 1
+
+
+# --- percent <-> Q8 gain helpers ------------------------------------
+
+def _mix_pct_to_gain(pct: uint64) -> int32:
+    # Clamp percent to 0..100, then gain = pct * 256 / 100.
+    p: uint64 = pct
+    if p > 100:
+        p = 100
+    return cast[int32]((p * 256) / 100)
+
+
+def _mix_gain_to_pct(gain: int32) -> uint64:
+    # Inverse for status reporting: pct = gain * 100 / 256 (rounded).
+    g: int32 = gain
+    if g < 0:
+        g = 0
+    return (cast[uint64](g) * 100 + 128) / 256
+
+
+# --- stream lifecycle -----------------------------------------------
+
+def hda_mix_open() -> int32:
+    # Claim a free mixer stream slot. Returns the stream id (>=0) or -1 if
+    # all slots are in use / no audio device.
+    if hda_is_initialized() == 0:
+        return -1
+    _mix_init_once()
+    i: uint64 = 0
+    while i < MIX_MAX_STREAMS:
+        if mix_active[i] == 0:
+            mix_active[i] = 1
+            mix_len[i] = 0
+            # Keep any previously-set volume; default to unity if unset.
+            if mix_vol[i] <= 0:
+                mix_vol[i] = MIX_UNITY_GAIN
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def hda_mix_close(id: int32):
+    # Release a mixer stream slot.
+    if id < 0:
+        return
+    sid: uint64 = cast[uint64](id)
+    if sid >= MIX_MAX_STREAMS:
+        return
+    mix_active[sid] = 0
+    mix_len[sid] = 0
+
+
+def hda_mix_is_active(id: int32) -> int32:
+    if id < 0:
+        return 0
+    sid: uint64 = cast[uint64](id)
+    if sid >= MIX_MAX_STREAMS:
+        return 0
+    return mix_active[sid]
+
+
+def hda_mix_reset(id: int32):
+    # Drop a stream's staged PCM (rewind it to empty) without closing it.
+    if id < 0:
+        return
+    sid: uint64 = cast[uint64](id)
+    if sid >= MIX_MAX_STREAMS:
+        return
+    mix_len[sid] = 0
+
+
+# --- per-stream PCM staging -----------------------------------------
+
+def hda_mix_write(id: int32, buf: Ptr[uint8], count: uint64,
+                  off: uint64) -> int64:
+    # Stage `count` PCM bytes for stream `id` at byte offset `off` in that
+    # stream's private staging buffer, bounded by MIX_STREAM_BYTES. A
+    # chunked writer composes by advancing `off`. Returns bytes consumed.
+    if hda_is_initialized() == 0:
+        return -1
+    if id < 0:
+        return -1
+    sid: uint64 = cast[uint64](id)
+    if sid >= MIX_MAX_STREAMS:
+        return -1
+    if mix_active[sid] == 0:
+        return -1
+    if off >= MIX_STREAM_BYTES:
+        return 0
+    take: uint64 = count
+    if off + take > MIX_STREAM_BYTES:
+        take = MIX_STREAM_BYTES - off
+    base: uint64 = sid * MIX_STREAM_BYTES + off
+    i: uint64 = 0
+    while i < take:
+        mix_stage[base + i] = buf[i]
+        i = i + 1
+    if off + take > mix_len[sid]:
+        mix_len[sid] = off + take
+    return cast[int64](take)
+
+
+# --- volume control -------------------------------------------------
+
+def hda_mix_set_master_pct(pct: uint64):
+    _mix_init_once()
+    mix_master = _mix_pct_to_gain(pct)
+
+
+def hda_mix_set_stream_pct(id: int32, pct: uint64):
+    _mix_init_once()
+    if id < 0:
+        return
+    sid: uint64 = cast[uint64](id)
+    if sid >= MIX_MAX_STREAMS:
+        return
+    mix_vol[sid] = _mix_pct_to_gain(pct)
+
+
+def hda_mix_master_pct() -> uint64:
+    _mix_init_once()
+    return _mix_gain_to_pct(mix_master)
+
+
+def hda_mix_stream_pct(id: int32) -> uint64:
+    _mix_init_once()
+    if id < 0:
+        return 0
+    sid: uint64 = cast[uint64](id)
+    if sid >= MIX_MAX_STREAMS:
+        return 0
+    return _mix_gain_to_pct(mix_vol[sid])
+
+
+def hda_mix_max_streams() -> uint64:
+    return MIX_MAX_STREAMS
+
+
+# --- the mix loop (the core) ----------------------------------------
+
+def _mix_decode_s16(base: uint64, idx: uint64) -> int32:
+    # Decode the s16le sample at byte offset (base + idx*2) of mix_stage
+    # into a sign-extended int32.
+    p: uint64 = base + idx * 2
+    lo: uint32 = cast[uint32](mix_stage[p])
+    hi: uint32 = cast[uint32](mix_stage[p + 1])
+    raw: uint32 = lo | (hi << 8)
+    v: int32 = cast[int32](raw)
+    if v >= 32768:
+        v = v - 65536                      # sign-extend the 16-bit value
+    return v
+
+
+def _mix_clamp_s16(v: int32) -> int32:
+    if v > MIX_S16_MAX:
+        return MIX_S16_MAX
+    if v < MIX_S16_MIN:
+        return MIX_S16_MIN
+    return v
+
+
+def _mix_sat_add(acc: int32, add: int32) -> int32:
+    # Saturating signed add into the s16 range, computed in int64 so the
+    # intermediate never wraps.
+    s: int64 = cast[int64](acc) + cast[int64](add)
+    if s > cast[int64](MIX_S16_MAX):
+        return MIX_S16_MAX
+    if s < cast[int64](MIX_S16_MIN):
+        return MIX_S16_MIN
+    return cast[int32](s)
+
+
+def _mix_apply_gain(sample: int32, gain: int32) -> int32:
+    # Q8 gain: (sample * gain) / 256, in int64 to avoid overflow. Integer
+    # division truncates toward zero, which is the standard fixed-point
+    # behaviour for a volume scale.
+    return cast[int32]((cast[int64](sample) * cast[int64](gain)) / 256)
+
+
+def hda_mix_render() -> int64:
+    # Render every active stream into the single hardware PCM buffer.
+    #
+    # 1. Determine the mix length = the longest active stream's staged
+    #    bytes, rounded down to whole s16 samples, bounded by the scratch
+    #    buffer and the hardware capacity.
+    # 2. For each output sample position: start the accumulator at 0, then
+    #    for each active stream add its gain-scaled sample (SILENCE if that
+    #    stream has underrun past its staged length) with a saturating add.
+    # 3. Apply the master gain and clamp to s16, encode little-endian into
+    #    the scratch out buffer.
+    # 4. Push the rendered PCM into the hardware DMA buffer via hda.ad.
+    #
+    # Returns the number of rendered PCM bytes (>=0) or -1 on error.
+    if hda_is_initialized() == 0:
+        return -1
+    _mix_init_once()
+
+    # longest active stream, in bytes
+    mix_bytes: uint64 = 0
+    s: uint64 = 0
+    while s < MIX_MAX_STREAMS:
+        if mix_active[s] != 0 and mix_len[s] > mix_bytes:
+            mix_bytes = mix_len[s]
+        s = s + 1
+    if mix_bytes == 0:
+        return 0
+
+    # bound by the scratch buffer and the hardware capacity
+    if mix_bytes > MIX_STREAM_BYTES:
+        mix_bytes = MIX_STREAM_BYTES
+    cap: uint64 = hda_pcm_capacity()
+    if mix_bytes > cap:
+        mix_bytes = cap
+    # whole s16 samples only
+    n_samples: uint64 = mix_bytes / 2
+    mix_bytes = n_samples * 2
+
+    # the mix loop
+    si: uint64 = 0
+    while si < n_samples:
+        acc: int32 = 0
+        st: uint64 = 0
+        while st < MIX_MAX_STREAMS:
+            if mix_active[st] != 0:
+                base: uint64 = st * MIX_STREAM_BYTES
+                # this stream contributes a sample only if it has staged
+                # PCM covering this sample position; otherwise SILENCE.
+                if (si * 2 + 2) <= mix_len[st]:
+                    raw_s: int32 = _mix_decode_s16(base, si)
+                    g: int32 = _mix_apply_gain(raw_s, mix_vol[st])
+                    acc = _mix_sat_add(acc, g)
+                # else: silence (add nothing)
+            st = st + 1
+        # master volume, then final clamp
+        out_s: int32 = _mix_apply_gain(acc, mix_master)
+        out_s = _mix_clamp_s16(out_s)
+        enc: uint32 = cast[uint32](out_s) & 0xFFFF
+        op: uint64 = si * 2
+        mix_out[op] = cast[uint8](enc & 0xFF)
+        mix_out[op + 1] = cast[uint8]((enc >> 8) & 0xFF)
+        si = si + 1
+
+    # hand the rendered mix to the hardware DMA buffer (offset 0).
+    hda_reset_buffer()
+    wn: int64 = hda_write_pcm(&mix_out[0], mix_bytes, 0)
+    if wn < 0:
+        return wn
+    return cast[int64](mix_bytes)
+
+
+def hda_mix_play() -> int32:
+    # Render the active streams and start hardware playback of the mix.
+    rn: int64 = hda_mix_render()
+    if rn <= 0:
+        return -1
+    return hda_start()
+
+
+# --- test/inspection helpers (read the rendered output) -------------
+#
+# The self-test reads the mixed hardware-bound PCM back out of the scratch
+# buffer to verify the saturating-summed, gain-scaled result byte-for-byte.
+# This reflects exactly what was handed to hda_write_pcm().
+
+def hda_mix_out_sample(idx: uint64) -> int32:
+    # Decode the rendered s16 sample at output sample index `idx`.
+    p: uint64 = idx * 2
+    lo: uint32 = cast[uint32](mix_out[p])
+    hi: uint32 = cast[uint32](mix_out[p + 1])
+    raw: uint32 = lo | (hi << 8)
+    v: int32 = cast[int32](raw)
+    if v >= 32768:
+        v = v - 65536
+    return v

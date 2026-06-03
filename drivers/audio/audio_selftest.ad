@@ -25,7 +25,13 @@ from kernel.printk.printk import printk0, printk1, printk2
 from drivers.audio.hda import (
     hda_is_initialized, hda_link_position, hda_pcm_loaded,
 )
-from sys.src.port9.port.namec import namec, namec_write, namec_close
+from drivers.audio.mixer import (
+    hda_mix_open, hda_mix_close, hda_mix_write, hda_mix_render,
+    hda_mix_out_sample, hda_mix_master_pct, hda_mix_stream_pct,
+)
+from sys.src.port9.port.namec import (
+    namec, namec_write, namec_close, namec_read,
+)
 
 
 # Tone parameters. 48 kHz, 2 channels, 16-bit. We emit a ~1 kHz square
@@ -42,6 +48,230 @@ def _spin(n: uint64):
     i: uint64 = 0
     while i < n:
         i = i + 1
+
+
+# --- software mixer self-test --------------------------------------
+#
+# Opens 2 concurrent mixer streams via the real /dev/audioctl control
+# surface (mixer verbs) + the mixer API, writes KNOWN s16le sample
+# patterns to each, sets distinct per-stream + master volumes, renders the
+# mix into the hardware-bound buffer, and asserts EVERY mixed sample equals
+# the expected saturating-summed, gain-scaled result computed independently
+# here. This proves the mix loop is real fixed-point DSP, not a stub.
+
+MIX_TEST_SAMPLES: uint64 = 64              # s16 samples per stream to mix
+
+# Reference per-stream sample patterns (module-scope; computed here, fed to
+# the mixer, then used to re-derive the expected mix for the assertion).
+mixt_a: Array[64, int32]                   # stream 0 reference samples
+mixt_b: Array[64, int32]                   # stream 1 reference samples
+mixt_bytes_a: Array[128, uint8]            # 64 samples * 2 bytes (s16le)
+mixt_bytes_b: Array[128, uint8]
+
+
+def _mixt_clamp_s16(v: int32) -> int32:
+    if v > 32767:
+        return 32767
+    if v < -32768:
+        return -32768
+    return v
+
+
+def _mixt_apply_gain(sample: int32, gain_pct: uint64) -> int32:
+    # Q8 gain reconstructed from percent the SAME way the mixer does it:
+    # gain = pct*256/100, then (sample*gain)/256. Independent recompute.
+    gain: int32 = cast[int32]((gain_pct * 256) / 100)
+    return cast[int32]((cast[int64](sample) * cast[int64](gain)) / 256)
+
+
+def _mixt_sat_add(acc: int32, add: int32) -> int32:
+    s: int64 = cast[int64](acc) + cast[int64](add)
+    if s > 32767:
+        return 32767
+    if s < -32768:
+        return -32768
+    return cast[int32](s)
+
+
+def _mixt_encode(samples: Ptr[int32], out: Ptr[uint8], n: uint64):
+    # s16le encode the reference int32 samples into a byte buffer.
+    i: uint64 = 0
+    while i < n:
+        enc: uint32 = cast[uint32](samples[i]) & 0xFFFF
+        out[i * 2] = cast[uint8](enc & 0xFF)
+        out[i * 2 + 1] = cast[uint8]((enc >> 8) & 0xFF)
+        i = i + 1
+
+
+def audio_mixer_selftest() -> int32:
+    # Returns 1 on PASS, 0 on FAIL.
+    if hda_is_initialized() == 0:
+        printk0("[audio-mix] FAIL: HDA controller not initialized\n")
+        return 0
+
+    # --- build two known patterns -----------------------------------
+    # Both streams carry LARGE same-sign amplitudes at many indices so
+    # that, after the per-stream gains (80% / 40%) are applied, their sum
+    # exceeds the s16 range and the SATURATING add must clamp — proving the
+    # saturation clamps instead of wrapping. Other indices stay small so
+    # the non-saturating mix path is exercised too, and the sign flips so
+    # both the +32767 ceiling and the -32768 floor are hit.
+    i: uint64 = 0
+    while i < MIX_TEST_SAMPLES:
+        # Stream A: full-scale square wave (±32000).
+        a: int32 = 32000
+        if (i % 2) == 1:
+            a = -32000
+        # one-quarter of the samples drop A to a small ramp (non-clip mix).
+        if (i % 4) == 0:
+            a = cast[int32](i) * 50              # small, won't saturate
+        mixt_a[i] = a
+        # Stream B: loud constant of the SAME sign pattern as A's square so
+        # the gain-scaled sum saturates at the matching rail.
+        b: int32 = 30000
+        if (i % 2) == 1:
+            b = -30000
+        mixt_b[i] = b
+        i = i + 1
+    _mixt_encode(&mixt_a[0], &mixt_bytes_a[0], MIX_TEST_SAMPLES)
+    _mixt_encode(&mixt_b[0], &mixt_bytes_b[0], MIX_TEST_SAMPLES)
+
+    # --- open two concurrent mixer streams --------------------------
+    id0: int32 = hda_mix_open()
+    id1: int32 = hda_mix_open()
+    if id0 < 0 or id1 < 0:
+        printk2("[audio-mix] FAIL: open streams id0=%d id1=%d\n",
+                cast[uint64](cast[int64](id0)),
+                cast[uint64](cast[int64](id1)))
+        return 0
+    printk2("[audio-mix] opened 2 streams (id0=%d id1=%d)\n",
+            cast[uint64](cast[int64](id0)), cast[uint64](cast[int64](id1)))
+
+    # --- set distinct volumes via the real /dev/audioctl ctl surface -
+    # master 75%, stream id0 = 80%, stream id1 = 40%.
+    pct_master: uint64 = 75
+    pct0: uint64 = 80
+    pct1: uint64 = 40
+    ctl_cid: int32 = namec("/dev/audioctl", 1)       # OWRITE
+    if ctl_cid < 0:
+        printk1("[audio-mix] FAIL: open /dev/audioctl rc=%d\n",
+                cast[uint64](cast[int64](ctl_cid)))
+        hda_mix_close(id0)
+        hda_mix_close(id1)
+        return 0
+    v_master: Ptr[uint8] = "master 75\n"
+    namec_write(ctl_cid, 0, v_master, 10)
+    # "stream 0 80\n" / "stream 1 40\n" — build the exact id in the string.
+    s0: Array[16, uint8]
+    s0[0] = 115                    # 's'
+    s0[1] = 116                    # 't'
+    s0[2] = 114                    # 'r'
+    s0[3] = 101                    # 'e'
+    s0[4] = 97                     # 'a'
+    s0[5] = 109                    # 'm'
+    s0[6] = 32                     # ' '
+    s0[7] = cast[uint8](48 + cast[uint64](id0))
+    s0[8] = 32                     # ' '
+    s0[9] = 56                     # '8'
+    s0[10] = 48                    # '0'
+    s0[11] = 10                    # '\n'
+    namec_write(ctl_cid, 0, &s0[0], 12)
+    s1: Array[16, uint8]
+    s1[0] = 115
+    s1[1] = 116
+    s1[2] = 114
+    s1[3] = 101
+    s1[4] = 97
+    s1[5] = 109
+    s1[6] = 32
+    s1[7] = cast[uint8](48 + cast[uint64](id1))
+    s1[8] = 32
+    s1[9] = 52                     # '4'
+    s1[10] = 48                    # '0'
+    s1[11] = 10
+    namec_write(ctl_cid, 0, &s1[0], 12)
+
+    # verify the ctl writes landed in the mixer state
+    if hda_mix_master_pct() != pct_master:
+        printk1("[audio-mix] FAIL: master pct=%d (want 75)\n",
+                hda_mix_master_pct())
+        namec_close(ctl_cid)
+        hda_mix_close(id0)
+        hda_mix_close(id1)
+        return 0
+    if hda_mix_stream_pct(id0) != pct0 or hda_mix_stream_pct(id1) != pct1:
+        printk2("[audio-mix] FAIL: stream pct id0=%d id1=%d\n",
+                hda_mix_stream_pct(id0), hda_mix_stream_pct(id1))
+        namec_close(ctl_cid)
+        hda_mix_close(id0)
+        hda_mix_close(id1)
+        return 0
+    printk0("[audio-mix] volumes set via /dev/audioctl (master 75, s0 80, s1 40)\n")
+
+    # --- stage the known PCM into each stream -----------------------
+    wn0: int64 = hda_mix_write(id0, &mixt_bytes_a[0], MIX_TEST_SAMPLES * 2, 0)
+    wn1: int64 = hda_mix_write(id1, &mixt_bytes_b[0], MIX_TEST_SAMPLES * 2, 0)
+    if wn0 != cast[int64](MIX_TEST_SAMPLES * 2) \
+            or wn1 != cast[int64](MIX_TEST_SAMPLES * 2):
+        printk2("[audio-mix] FAIL: stage write wn0=%d wn1=%d\n",
+                cast[uint64](wn0), cast[uint64](wn1))
+        namec_close(ctl_cid)
+        hda_mix_close(id0)
+        hda_mix_close(id1)
+        return 0
+
+    # --- render the mix ---------------------------------------------
+    rn: int64 = hda_mix_render()
+    if rn != cast[int64](MIX_TEST_SAMPLES * 2):
+        printk1("[audio-mix] FAIL: render returned %d bytes\n",
+                cast[uint64](rn))
+        namec_close(ctl_cid)
+        hda_mix_close(id0)
+        hda_mix_close(id1)
+        return 0
+
+    # --- verify EVERY mixed sample against an independent recompute --
+    mismatches: uint64 = 0
+    clips: uint64 = 0
+    k: uint64 = 0
+    while k < MIX_TEST_SAMPLES:
+        # independent reference: per-stream gain, saturating sum, master.
+        ga: int32 = _mixt_apply_gain(mixt_a[k], pct0)
+        gb: int32 = _mixt_apply_gain(mixt_b[k], pct1)
+        # raw (unclamped) sum vs saturating sum — a difference means the
+        # saturating add actually clamped this sample.
+        raw_sum: int64 = cast[int64](ga) + cast[int64](gb)
+        acc: int32 = _mixt_sat_add(0, ga)
+        acc = _mixt_sat_add(acc, gb)
+        if raw_sum != cast[int64](acc):
+            clips = clips + 1
+        expect: int32 = _mixt_apply_gain(acc, pct_master)
+        expect = _mixt_clamp_s16(expect)
+        got: int32 = hda_mix_out_sample(k)
+        if got != expect:
+            if mismatches < 4:
+                printk2("[audio-mix] sample %d mismatch got=%d\n",
+                        k, cast[uint64](cast[int64](got)))
+            mismatches = mismatches + 1
+        k = k + 1
+
+    namec_close(ctl_cid)
+    hda_mix_close(id0)
+    hda_mix_close(id1)
+
+    if mismatches != 0:
+        printk1("[audio-mix] FAIL: %d mixed samples mismatched\n", mismatches)
+        return 0
+    if clips == 0:
+        # The B pattern at these gains should drive at least some samples
+        # into saturation; if nothing clipped the saturating path went
+        # untested, which means the test is not proving what it claims.
+        printk0("[audio-mix] FAIL: no samples saturated (sat-add untested)\n")
+        return 0
+    printk2("[audio-mix] verified %d mixed samples (%d saturated) byte-exact\n",
+            MIX_TEST_SAMPLES, clips)
+    printk0("[audio-mix] PASS\n")
+    return 1
 
 
 def audio_selftest() -> int32:
@@ -147,11 +377,19 @@ def audio_selftest() -> int32:
 
     if max_lpib > 0:
         printk0("[audio] DMA engine consumed the buffer (LPIB advanced)\n")
-        return 1
-    # Even if LPIB didn't tick within our poll window (some QEMU builds
-    # report LPIB lazily), the wav backend still captured whatever DMA
-    # delivered; the host-side WAV non-silence check is the ground truth.
-    # We report a soft PASS here so the kernel marker doesn't override the
-    # authoritative host check — but log it distinctly.
-    printk0("[audio] LPIB did not advance in poll window (host WAV is ground truth)\n")
+    else:
+        # Even if LPIB didn't tick within our poll window (some QEMU builds
+        # report LPIB lazily), the wav backend still captured whatever DMA
+        # delivered; the host-side WAV non-silence check is the ground
+        # truth. Log it distinctly but don't fail on it.
+        printk0("[audio] LPIB did not advance in poll window (host WAV is ground truth)\n")
+
+    # --- software mixer self-test -----------------------------------
+    # Multi-stream mixing + per-stream/master volume, verified byte-exact
+    # against an independent recompute. This runs under the SAME audio-test
+    # gate (no new boot marker needed).
+    mix_rc: int32 = audio_mixer_selftest()
+    if mix_rc != 1:
+        printk0("[audio] FAIL: software mixer self-test failed\n")
+        return 0
     return 1
