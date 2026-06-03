@@ -697,6 +697,12 @@ SYS_statx:           uint64 = 332
 # wiring, so the body just bounces through a small stack buffer — same
 # observable behaviour, no ENOSYS spam.
 SYS_sendfile:        uint64 = 40
+# copy_file_range(2): fd->fd byte copy with independent in/out offset
+# pointers. We have no reflink/server-side copy, so it bounces through a
+# staging buffer via the same VFS read/write path sendfile uses — same
+# observable result for the regular-file -> regular-file case `cp`
+# (and busybox's coreutils) probe first.
+SYS_copy_file_range: uint64 = 326
 # U35: AF_UNIX socket-shaped stubs. Hamnix has no network stack, but
 # busybox / glibc paths that probe socket(2) early (e.g. sh's
 # job-control / `[`-builtin code path) still need *some* answer. We
@@ -4664,6 +4670,121 @@ def _u_sendfile(a0: uint64, a1: uint64, a2: uint64,
     return total
 
 
+# copy_file_range(2) staging buffer. Module-scope so the copy loop never
+# blows the syscall stack — sized to match sendfile's grain.
+CFR_CHUNK: uint64 = 4096
+_cfr_buf: Array[4096, uint8]
+
+
+def _u_copy_file_range(a0: uint64, a1: uint64, a2: uint64,
+                       a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # ssize_t copy_file_range(int fd_in, off_t *off_in,
+    #                         int fd_out, off_t *off_out,
+    #                         size_t len, unsigned int flags)
+    #
+    # Copy up to `len` bytes from fd_in to fd_out. Each side carries its
+    # own optional off_t* with the same semantics as sendfile's offset:
+    #   * off_in  != NULL: read starts at *off_in, fd_in's own position is
+    #                      NOT advanced, and *off_in is updated by the
+    #                      bytes copied.
+    #   * off_in  == NULL: read uses/advances fd_in's position.
+    #   * off_out != NULL: write starts at *off_out, fd_out's own position
+    #                      is NOT advanced, and *off_out is updated.
+    #   * off_out == NULL: write uses/advances fd_out's position.
+    # flags must be 0 (Linux reserves them); anything else is -EINVAL.
+    #
+    # No reflink / server-side copy — we bounce through a module-scope
+    # staging buffer over the same VFS read/write path sendfile uses.
+    fd_in:  int32 = cast[int32](a0)
+    off_in_ptr: uint64 = a1
+    fd_out: int32 = cast[int32](a2)
+    off_out_ptr: uint64 = a3
+    remaining: uint64 = a4
+    flags: uint64 = a5
+
+    if flags != 0:
+        return ELINUX_INVAL
+    if fd_in < 0 or fd_out < 0:
+        return ELINUX_BADF
+    if remaining == 0:
+        return 0
+
+    # Seek each side to its supplied *offset before the copy. We read the
+    # pointer once and write the updated position back at the end so the
+    # underlying fd position stays untouched in the pointer case.
+    in_off: int64 = 0
+    if off_in_ptr != 0:
+        in_off = cast[Ptr[int64]](off_in_ptr)[0]
+        ri: int64 = vfs_lseek(fd_in, in_off, SEEK_SET)
+        if ri < 0:
+            return ri
+        in_off = ri
+    out_off: int64 = 0
+    if off_out_ptr != 0:
+        out_off = cast[Ptr[int64]](off_out_ptr)[0]
+        ro: int64 = vfs_lseek(fd_out, out_off, SEEK_SET)
+        if ro < 0:
+            return ro
+        out_off = ro
+
+    total: int64 = 0
+    cont: int32 = 1
+    while cont != 0:
+        want: uint64 = remaining
+        if want > CFR_CHUNK:
+            want = CFR_CHUNK
+        # off_in pointer case: re-seek fd_in each iteration so fd_in's own
+        # position is never the thing we advance (matches POSIX sendfile).
+        if off_in_ptr != 0:
+            rs: int64 = vfs_lseek(fd_in, in_off, SEEK_SET)
+            if rs < 0:
+                if total == 0:
+                    return rs
+                cont = 0
+                continue
+        n: int64 = vfs_read(fd_in, &_cfr_buf[0], want)
+        if n < 0:
+            if total == 0:
+                return n
+            cont = 0
+            continue
+        if n == 0:
+            cont = 0                                      # EOF
+            continue
+        got: uint64 = cast[uint64](n)
+        # off_out pointer case: re-seek fd_out so its own position is
+        # untouched, then write the chunk.
+        if off_out_ptr != 0:
+            rw: int64 = vfs_lseek(fd_out, out_off, SEEK_SET)
+            if rw < 0:
+                if total == 0:
+                    return rw
+                cont = 0
+                continue
+        w: int64 = vfs_write(fd_out, &_cfr_buf[0], got)
+        if w < 0:
+            if total == 0:
+                return w
+            cont = 0
+            continue
+        total = total + w
+        in_off = in_off + w
+        out_off = out_off + w
+        if cast[uint64](w) < got:
+            # Short write — drop the remainder.
+            cont = 0
+            continue
+        remaining = remaining - got
+        if remaining == 0:
+            cont = 0
+
+    if off_in_ptr != 0:
+        cast[Ptr[int64]](off_in_ptr)[0] = in_off
+    if off_out_ptr != 0:
+        cast[Ptr[int64]](off_out_ptr)[0] = out_off
+    return total
+
+
 def _u_access_path(upath: uint64, mode: uint64) -> int64:
     # Shared body for access(2) / faccessat(2) / faccessat2(2). `upath`
     # is the user path pointer (relative paths resolve against the task
@@ -7568,6 +7689,158 @@ def uabi_fills_selftest() -> int32:
     if sns_rc != ELINUX_INVAL:
         printk1("[UABI_FILLS] FAIL setns rc=%d\n", cast[uint64](sns_rc))
         return 1
+
+    # --- copy_file_range(2): fd->fd byte copy through the VFS path -----
+    # Write 8 known bytes into a source tmpfs file, copy_file_range the
+    # whole lot into a fresh dest file with NULL offset pointers (so each
+    # fd uses/advances its own position), then read the dest back and
+    # assert byte-equality. Also assert flags!=0 is rejected -EINVAL and
+    # a bad fd is -EBADF.
+    cfr_src_name: Ptr[char] = cast[Ptr[char]]("/tmp/uabi-cfr-src")
+    cfr_src_fd: int32 = vfs_open_write(cfr_src_name)
+    if cfr_src_fd < 0:
+        printk1("[UABI_FILLS] FAIL copy_file_range src open=%d\n",
+                cast[uint64](cast[int64](cfr_src_fd)))
+        _uabi_fills_restore_fds(boot_task, &fd_save[0])
+        return 1
+    cfr_payload: Array[8, uint8]
+    cfr_payload[0] = 67                                   # 'C'
+    cfr_payload[1] = 70                                   # 'F'
+    cfr_payload[2] = 82                                   # 'R'
+    cfr_payload[3] = 33                                   # '!'
+    cfr_payload[4] = 49                                   # '1'
+    cfr_payload[5] = 50                                   # '2'
+    cfr_payload[6] = 51                                   # '3'
+    cfr_payload[7] = 52                                   # '4'
+    vfs_write(cfr_src_fd, &cfr_payload[0], 8)
+    vfs_lseek(cfr_src_fd, 0, 0)                           # rewind for read
+    cfr_dst_name: Ptr[char] = cast[Ptr[char]]("/tmp/uabi-cfr-dst")
+    cfr_dst_fd: int32 = vfs_open_write(cfr_dst_name)
+    if cfr_dst_fd < 0:
+        printk1("[UABI_FILLS] FAIL copy_file_range dst open=%d\n",
+                cast[uint64](cast[int64](cfr_dst_fd)))
+        _uabi_fills_restore_fds(boot_task, &fd_save[0])
+        return 1
+    # flags != 0 must be rejected before any copy.
+    cfr_bad: int64 = linux_u_syscall_dispatch(SYS_copy_file_range,
+                                              cast[uint64](cfr_src_fd), 0,
+                                              cast[uint64](cfr_dst_fd), 0,
+                                              8, 1)
+    if cfr_bad != ELINUX_INVAL:
+        printk1("[UABI_FILLS] FAIL copy_file_range flags rc=%d\n",
+                cast[uint64](cfr_bad))
+        _uabi_fills_restore_fds(boot_task, &fd_save[0])
+        return 1
+    # bad fd_in must be -EBADF.
+    cfr_ebadf: int64 = linux_u_syscall_dispatch(SYS_copy_file_range,
+                                               cast[uint64](cast[int64](-1)), 0,
+                                               cast[uint64](cfr_dst_fd), 0,
+                                               8, 0)
+    if cfr_ebadf != ELINUX_BADF:
+        printk1("[UABI_FILLS] FAIL copy_file_range badfd rc=%d\n",
+                cast[uint64](cfr_ebadf))
+        _uabi_fills_restore_fds(boot_task, &fd_save[0])
+        return 1
+    # The real copy: NULL offsets, both fds at position 0.
+    cfr_n: int64 = linux_u_syscall_dispatch(SYS_copy_file_range,
+                                            cast[uint64](cfr_src_fd), 0,
+                                            cast[uint64](cfr_dst_fd), 0,
+                                            8, 0)
+    if cfr_n != 8:
+        printk1("[UABI_FILLS] FAIL copy_file_range count=%d\n",
+                cast[uint64](cfr_n))
+        _uabi_fills_restore_fds(boot_task, &fd_save[0])
+        return 1
+    # Read the dest back from offset 0 and compare all 8 bytes.
+    vfs_lseek(cfr_dst_fd, 0, 0)
+    cfr_rb: Array[8, uint8]
+    cfr_ri: uint64 = 0
+    while cfr_ri < 8:
+        cfr_rb[cfr_ri] = 0
+        cfr_ri = cfr_ri + 1
+    cfr_rn: int64 = vfs_read(cfr_dst_fd, &cfr_rb[0], 8)
+    if cfr_rn != 8:
+        printk1("[UABI_FILLS] FAIL copy_file_range readback count=%d\n",
+                cast[uint64](cfr_rn))
+        _uabi_fills_restore_fds(boot_task, &fd_save[0])
+        return 1
+    cfr_ci: uint64 = 0
+    while cfr_ci < 8:
+        if cfr_rb[cfr_ci] != cfr_payload[cfr_ci]:
+            printk1("[UABI_FILLS] FAIL copy_file_range byte mismatch idx=%d\n",
+                    cfr_ci)
+            _uabi_fills_restore_fds(boot_task, &fd_save[0])
+            return 1
+        cfr_ci = cfr_ci + 1
+    vfs_close(cfr_src_fd)
+    vfs_close(cfr_dst_fd)
+    printk0("[copyfilerange] PASS\n")
+
+    # --- sendfile(2): file -> file copy with an explicit *offset ------
+    # Reuse the same payload shape but exercise the offset-pointer arm:
+    # source file has 8 bytes, sendfile from *offset=2 for 4 bytes into a
+    # dest file. Assert the count, that *offset advanced to 6, and that
+    # the 4 copied bytes match source[2..5].
+    sf_src_name: Ptr[char] = cast[Ptr[char]]("/tmp/uabi-sf-src")
+    sf_src_fd: int32 = vfs_open_write(sf_src_name)
+    if sf_src_fd < 0:
+        printk1("[UABI_FILLS] FAIL sendfile src open=%d\n",
+                cast[uint64](cast[int64](sf_src_fd)))
+        _uabi_fills_restore_fds(boot_task, &fd_save[0])
+        return 1
+    sf_payload: Array[8, uint8]
+    sf_payload[0] = 83                                    # 'S'
+    sf_payload[1] = 70                                    # 'F'
+    sf_payload[2] = 97                                    # 'a'
+    sf_payload[3] = 98                                    # 'b'
+    sf_payload[4] = 99                                    # 'c'
+    sf_payload[5] = 100                                   # 'd'
+    sf_payload[6] = 101                                   # 'e'
+    sf_payload[7] = 102                                   # 'f'
+    vfs_write(sf_src_fd, &sf_payload[0], 8)
+    sf_dst_name: Ptr[char] = cast[Ptr[char]]("/tmp/uabi-sf-dst")
+    sf_dst_fd: int32 = vfs_open_write(sf_dst_name)
+    if sf_dst_fd < 0:
+        printk1("[UABI_FILLS] FAIL sendfile dst open=%d\n",
+                cast[uint64](cast[int64](sf_dst_fd)))
+        _uabi_fills_restore_fds(boot_task, &fd_save[0])
+        return 1
+    sf_off: Array[1, int64]
+    sf_off[0] = 2                                         # start at byte 2
+    sf_n: int64 = _uabi_test_dispatch(SYS_sendfile,
+                                      cast[uint64](sf_dst_fd),
+                                      cast[uint64](sf_src_fd),
+                                      cast[uint64](&sf_off[0]),
+                                      4)                   # copy 4 bytes
+    if sf_n != 4:
+        printk1("[UABI_FILLS] FAIL sendfile count=%d\n", cast[uint64](sf_n))
+        _uabi_fills_restore_fds(boot_task, &fd_save[0])
+        return 1
+    if sf_off[0] != 6:
+        printk1("[UABI_FILLS] FAIL sendfile offset adv=%d\n",
+                cast[uint64](sf_off[0]))
+        _uabi_fills_restore_fds(boot_task, &fd_save[0])
+        return 1
+    vfs_lseek(sf_dst_fd, 0, 0)
+    sf_rb: Array[4, uint8]
+    sf_rb[0] = 0
+    sf_rb[1] = 0
+    sf_rb[2] = 0
+    sf_rb[3] = 0
+    sf_rn: int64 = vfs_read(sf_dst_fd, &sf_rb[0], 4)
+    if sf_rn != 4:
+        printk1("[UABI_FILLS] FAIL sendfile readback count=%d\n",
+                cast[uint64](sf_rn))
+        _uabi_fills_restore_fds(boot_task, &fd_save[0])
+        return 1
+    if sf_rb[0] != 97 or sf_rb[1] != 98 or sf_rb[2] != 99 or sf_rb[3] != 100:
+        printk0("[UABI_FILLS] FAIL sendfile readback bytes\n")
+        _uabi_fills_restore_fds(boot_task, &fd_save[0])
+        return 1
+    vfs_close(sf_src_fd)
+    vfs_close(sf_dst_fd)
+    printk0("[sendfile] PASS\n")
+
     # --- #163 EFAULT proof: a bad user pointer must NOT panic ---------
     # The whole point of the uaccess adoption is that a malformed user
     # pointer to a converted syscall now returns -EFAULT (-14) cleanly
@@ -9442,6 +9715,10 @@ def _linux_u_syscall_dispatch_inner(nr: uint64,
     # tee / log-rotator path that probes sendfile first.
     if nr == SYS_sendfile:
         return _u_sendfile(a0, a1, a2, a3, a4, a5)
+    # copy_file_range(2): fd->fd byte copy through the VFS read/write
+    # path. Real handler overrides any autostub routing for nr 326.
+    if nr == SYS_copy_file_range:
+        return _u_copy_file_range(a0, a1, a2, a3, a4, a5)
     # socket(2) family. U-socket: socket / connect / sendto / recvfrom
     # are now bridged to the real in-kernel TCP stack (drivers/net/
     # tcp.ad) for AF_INET + SOCK_STREAM — a user binary can complete a
