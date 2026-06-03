@@ -21,7 +21,7 @@
 # timer_interrupt(). We also call it explicitly from SYS_EXIT to give
 # the CPU to a sibling when the current task tears down.
 
-from mm.memblock import memblock_alloc
+from mm.memblock import memblock_alloc, memblock_region_top
 from mm.page_alloc import alloc_page, alloc_pages, free_page, free_pages, region_free
 from mm.slab import kfree
 from mm.cow import cow_boot_cr3
@@ -64,6 +64,13 @@ extern def local_irq_disable()
 extern def local_irq_enable()
 extern def get_bsp_cr3() -> uint64
 extern def load_cr3(value: uint64)
+# Physical end of the loaded kernel image. The page allocator's memblock
+# floor is set at (or just above) this address by e820_init, so NO
+# kernel-owned page (table or frame) ever has a physical base below it.
+# Used by the page-table teardown walk as the stable lower bound when
+# validating a sub-table / leaf address (the live memblock cursor can't
+# serve as a floor — it advances on every allocation).
+extern def kernel_image_end() -> uint64
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 # U27: MSR access for per-task FS_BASE save/restore across context
 # switches. The asm body is the generic write_msr in
@@ -3594,6 +3601,49 @@ def task_exit_code(slot: int32) -> int64:
     return task_table[cast[uint64](slot)].exit_code
 
 
+def _pt_subtable_phys_ok(phys: uint64) -> int32:
+    # Validity gate for a physical address the page-table teardown walk
+    # is about to TREAT AS A PAGE-TABLE PAGE (descend into) or FREE.
+    #
+    # Every PDPT/PD/PT page and every leaf frame the kernel ever maps was
+    # handed out by alloc_page()/alloc_pages()/region_alloc — all of which
+    # ultimately carve from memblock, whose RAM window is bounded BELOW by
+    # the page allocator's floor (kernel_image_end(), set by e820_init —
+    # e.g. ~0x05aec000 in QEMU) and ABOVE by memblock_region_top(). A real
+    # entry's masked physical base is ALWAYS page-aligned and inside
+    # [floor, top).
+    #
+    # A teardown walk that blindly trusts page-table memory is fragile:
+    # if a single page-table page is corrupted (a stray kernel write lands
+    # in it), the walk reads bogus "entries" and tries to descend into /
+    # free WILD addresses — e.g. a leaf-like value pointing at physical
+    # 0x1000 (real-mode IVT/BIOS), at a sub-floor address (0x103000), or
+    # at a userspace virtual address (0x5555_6000_0000). Descending into
+    # the BIOS reads more garbage; freeing a non-canonical address makes
+    # free_pages' free-list store `*addr = head` raise #GP and halt the
+    # kernel during process teardown.
+    #
+    # The correct invariant — not a symptom mask — is that the kernel
+    # NEVER wrote a page-table entry pointing outside managed RAM. So any
+    # masked address that is below the allocator floor or at/above the RAM
+    # top is provably NOT a kernel-owned table/frame and MUST be skipped.
+    # This bounds-validates the walk at every level (PML4->PDPT->PD->PT)
+    # and at each leaf free, so a corrupted table can at worst leak a few
+    # real pages — never fault. kernel_image_end() is the stable floor:
+    # the live memblock cursor advances on every alloc and so can't serve.
+    if phys == 0:
+        return 0
+    if (phys & 0xFFF) != 0:                  # not page-aligned -> not a table
+        return 0
+    floor: uint64 = kernel_image_end()
+    if floor != 0 and phys < floor:
+        return 0
+    top: uint64 = memblock_region_top()
+    if top != 0 and phys >= top:
+        return 0
+    return 1
+
+
 def _free_task_user_pagetables(su: uint64):
     # Free the PRIVATE lower-level page tables this task cracked into
     # its per-task PML4 (the PDPT/PD/PT pages elf_install_user_mapping
@@ -3604,6 +3654,15 @@ def _free_task_user_pagetables(su: uint64):
     # pages (the ELF image region + the user stack) are freed
     # separately via region_free / free_pages, so here we free table
     # pages only, never leaf frames.
+    #
+    # Every descend / free is gated on _pt_subtable_phys_ok: a real
+    # page-table entry the kernel itself wrote ALWAYS points at a
+    # page-aligned physical page inside managed RAM. An entry that does
+    # not (a malformed identity leaf mapping phys 0, a stray sub-megabyte
+    # value, a userspace VA from a corrupted slot, an unaligned blob) is
+    # NOT a kernel table/frame and is skipped — so a corrupted table page
+    # can never make the walk descend into the BIOS or free a wild,
+    # non-canonical address and #GP-halt the kernel during teardown.
     cr3: uint64 = task_table[su].cr3
     if cr3 == 0:
         return
@@ -3619,9 +3678,10 @@ def _free_task_user_pagetables(su: uint64):
     while li < 256:
         e: uint64 = pml4[li]
         be: uint64 = bpml4[li]
-        # Private PDPT for this task? (present, and not the shared boot
-        # entry at this index)
-        if (e & PT_P) != 0 and e != be:
+        # Private PDPT for this task? (present, not the shared boot entry,
+        # and pointing at a real in-RAM page-aligned sub-table page).
+        if (e & PT_P) != 0 and e != be \
+                and _pt_subtable_phys_ok(e & PT_ADDR) != 0:
             pdpt_phys: uint64 = e & PT_ADDR
             bpdpt_phys: uint64 = be & PT_ADDR
             pdpt: Ptr[uint64] = cast[Ptr[uint64]](pdpt_phys)
@@ -3632,15 +3692,19 @@ def _free_task_user_pagetables(su: uint64):
                 bpe: uint64 = 0
                 if (be & PT_P) != 0:
                     bpe = bpdpt[pi]
-                # A private, present, non-1GiB PD page?
-                if (pe & PT_P) != 0 and (pe & PT_PS) == 0 and pe != bpe:
+                # A private, present, non-1GiB PD page in real RAM?
+                if (pe & PT_P) != 0 and (pe & PT_PS) == 0 and pe != bpe \
+                        and _pt_subtable_phys_ok(pe & PT_ADDR) != 0:
                     pd_phys: uint64 = pe & PT_ADDR
                     pd: Ptr[uint64] = cast[Ptr[uint64]](pd_phys)
                     di: uint64 = 0
                     while di < 512:
                         de: uint64 = pd[di]
-                        # A private, present, non-2MiB PT page?
-                        if (de & PT_P) != 0 and (de & PT_PS) == 0:
+                        # A private, present, non-2MiB PT page in real RAM?
+                        # (an identity leaf mapping phys 0, or any out-of-RAM
+                        # / unaligned value, is never a freeable PT page.)
+                        if (de & PT_P) != 0 and (de & PT_PS) == 0 \
+                                and _pt_subtable_phys_ok(de & PT_ADDR) != 0:
                             free_page(de & PT_ADDR)
                         di = di + 1
                     free_page(pd_phys)
