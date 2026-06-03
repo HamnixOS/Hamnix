@@ -2852,6 +2852,15 @@ def arm64_init_ctx(ctx_base: uint64, code_base: uint64, stack_top: uint64) -> in
 # so the stub restores+erets into it. After SWITCH_LIMIT preemptions the test
 # has proven both tasks ran and were repeatedly preempted; print PASS and halt.
 def arm64_sched_pick(cur_ctx: uint64) -> uint64:
+    # Phase 27: when the two-task preemptive round-robin demo is live, feed
+    # preemptions to its picker — each timer tick it SAVES nothing extra (the .S
+    # stub already saved the full GPR/SP/ELR/SPSR context), round-robins to the
+    # peer slot, swaps TTBR0+ASID into that task's private space, re-arms the
+    # timer, and ERETs back into the next EL0 task. The two tasks each busy-loop
+    # incrementing a counter in their OWN data page; only the timer moves control.
+    if arm64_p27_active != 0:
+        return arm64_p27_sched_pick(cur_ctx)
+
     # Phase 23: when the TLS scheduler is live, feed preemptions to its picker —
     # each tick it SAVES the outgoing thread's TPIDR_EL0 into its slot, round-
     # robins to the peer slot, swaps TTBR0+ASID, and RESTORES the incoming
@@ -10338,6 +10347,15 @@ def arm64_p26_finish(code: uint64) -> int64:
         _uart_puts(rp)
         pp: Ptr[char] = "[arm64] Phase 26 PASS\n"
         _uart_puts(pp)
+        # Phase 26 complete and clean. Hand off to Phase 27 (a REAL preemptive
+        # round-robin scheduler between two concurrent EL0 user tasks, each in its
+        # own ASID-tagged address space, driven involuntarily by the generic
+        # timer). This is the Phase 26 -> 27 hand-off point. arm64_p27_run never
+        # returns (its finish halts after the verdict).
+        arm64_p27_run()
+        # Unreachable: arm64_p27_run halts. Safety loop.
+        while True:
+            _wfi()
     else:
         fp: Ptr[char] = "[arm64] Phase 26 ELF-loader FAIL\n"
         _uart_puts(fp)
@@ -10419,6 +10437,271 @@ def arm64_run_elf_loader26_demo() -> int64:
     # Unreachable: the program's exit() halts after the PASS marker.
     while True:
         _wfi()
+    return 0
+
+
+# ===========================================================================
+# Phase 27 — TIMER-PREEMPTIVE ROUND-ROBIN between two concurrent EL0 tasks.
+#
+# Two independent EL0 user tasks (T0 = slot 0, T1 = slot 1) each run in their
+# OWN ASID-tagged address space (reusing the Phase-25 slot machinery: separate
+# ASID, TTBR0, L1/L2/L3, EL0 stack and saved register-context block). Both run
+# the SAME small EL0 routine at the SAME virtual address (P25_CODE_BASE) — a
+# pure busy loop that endlessly increments a per-task counter at the SAME EL0
+# virtual address (P25_DATA_VA). But that VA maps, per ASID, to a DIFFERENT
+# PHYSICAL page in each space (P27_T0_DATA_PA vs P27_T1_DATA_PA), so each task
+# increments its OWN counter, proving genuine address-space isolation.
+#
+# Neither task ever issues a syscall or yields: the ONLY thing that moves
+# control between them is the generic timer. On each timer IRQ at EL1 the
+# generic .S vector (arm64_lower_irq_entry) saves the interrupted task's FULL
+# register context (x0..x30, SP_EL0, ELR_EL1, SPSR_EL1) into that task's
+# context block and calls arm64_sched_pick(), which (while arm64_p27_active)
+# routes here: we ack + re-arm the timer, EOI to the GIC, round-robin to the
+# OTHER task, swap TTBR0+ASID (arm64_p25_switch_to), publish the next task's
+# context block, and the .S stub restores it + ERETs into the next task with
+# IRQs UNMASKED in its SPSR (SPSR_EL0T_IRQ) so the timer keeps preempting.
+#
+# After P27_TICK_GOAL preemptions we stop scheduling and run the verdict: PASS
+# iff BOTH counters advanced (> 0), enough involuntary preemptions occurred
+# (>= P27_SWITCH_MIN), and the two counters live at the same EL0 VA but in
+# DISTINCT physical pages (own-address-space proof).
+# ===========================================================================
+
+# Two DISTINCT physical backing pages for the per-task counter, both 2 MiB
+# clear of Phase 25's shared data page (0x4300_0000) and each other.
+P27_T0_DATA_PA: uint64 = 0x43200000
+P27_T1_DATA_PA: uint64 = 0x43400000
+
+# How many preemptive ticks to run before the verdict, and the minimum number
+# of involuntary context switches the verdict demands as proof of real
+# preemption (not a single switch).
+P27_TICK_GOAL: int64 = 60
+P27_SWITCH_MIN: int64 = 4
+
+# Phase 27 bookkeeping. arm64_p27_active routes the timer IRQ into this picker
+# while the demo is live. arm64_p27_cur is the live slot (0=T0, 1=T1).
+arm64_p27_active: int64 = 0
+arm64_p27_cur: int64 = 0
+arm64_p27_switches: int64 = 0
+# Per-task run-tally: how many ticks each task was the OUTGOING (running) task,
+# i.e. how many times the timer actually caught it executing.
+arm64_p27_t0_runs: int64 = 0
+arm64_p27_t1_runs: int64 = 0
+
+
+# Materialise the shared Phase-27 EL0 busy-increment routine at P25_CODE_BASE.
+# Both tasks map this identical text at the same VA; it endlessly increments the
+# 64-bit counter at P25_DATA_VA (which is a DIFFERENT physical page per ASID):
+#   entry:  x10 = P25_DATA_VA
+#   loop:   ldr  x9, [x10]
+#           add  x9, x9, #1
+#           str  x9, [x10]
+#           b    loop
+# No syscall, no yield: only the timer preempts it.
+def arm64_build_p27_routine() -> int64:
+    a: uint64 = P25_CODE_BASE
+
+    # x10 = P25_DATA_VA (the per-task counter VA).
+    a = _emit_load_imm64(a, cast[uint64](10), P25_DATA_VA)
+
+    loop_top: uint64 = a
+    # ldr x9, [x10]   = 0xF9400000 | (x10 << 5) | x9
+    a = _emit_word(a, cast[uint64](0xF9400000) | (cast[uint64](10) << cast[uint64](5)) | cast[uint64](9))
+    # add x9, x9, #1  = 0x91000400 | (x9 << 5) | x9  (imm12=1 in bits[21:10])
+    a = _emit_word(a, cast[uint64](0x91000000) | (cast[uint64](1) << cast[uint64](10)) | (cast[uint64](9) << cast[uint64](5)) | cast[uint64](9))
+    # str x9, [x10]   = 0xF9000000 | (x10 << 5) | x9
+    a = _emit_word(a, cast[uint64](0xF9000000) | (cast[uint64](10) << cast[uint64](5)) | cast[uint64](9))
+    # b loop_top : 0x14000000 | imm26 ; imm26 = (loop_top - here) / 4.
+    b_here: uint64 = a
+    off_loop: int64 = cast[int64](loop_top) - cast[int64](b_here)
+    imm26: uint64 = cast[uint64](off_loop >> 2) & cast[uint64](0x3FFFFFF)
+    a = _emit_word(a, cast[uint64](0x14000000) | imm26)
+
+    _dsb_ish()
+    _isb()
+    return 0
+
+
+# Phase-27 timer-IRQ scheduler — invoked (via arm64_sched_pick) from the EL0 IRQ
+# vector with the interrupted task's register context already saved by the .S
+# stub. Ack + re-arm the timer, EOI to the GIC, tally the outgoing task's run,
+# round-robin to the peer slot, swap TTBR0+ASID into its private space, publish
+# its context block, and return it so the stub restores+ERETs into it. After
+# P27_TICK_GOAL preemptions, run the verdict (never returns).
+def arm64_p27_sched_pick(cur_ctx: uint64) -> uint64:
+    gicc_iar: Ptr[uint32] = cast[Ptr[uint32]](GICC_BASE + GICC_IAR)
+    gicc_eoir: Ptr[uint32] = cast[Ptr[uint32]](GICC_BASE + GICC_EOIR)
+
+    iar: uint32 = gicc_iar[0]
+    intid: uint64 = cast[uint64](iar) & cast[uint64](0x3FF)
+
+    if intid != VTIMER_INTID:
+        gicc_eoir[0] = iar                  # spurious: EOI, stay on this task
+        return cur_ctx
+
+    # Quiesce, re-arm, and EOI the timer for the next tick.
+    _msr_cntv_ctl_el0(cast[uint64](0))
+    _msr_cntv_tval_el0(arm64_timer_period)
+    _msr_cntv_ctl_el0(cast[uint64](1))
+    gicc_eoir[0] = iar
+
+    # Tally which task the timer just caught running (the OUTGOING task).
+    out_idx: int64 = arm64_p27_cur
+    if out_idx == 0:
+        arm64_p27_t0_runs = arm64_p27_t0_runs + 1
+    else:
+        arm64_p27_t1_runs = arm64_p27_t1_runs + 1
+
+    arm64_p27_switches = arm64_p27_switches + 1
+    swmsg: Ptr[char] = "[arm64] Phase 27 preempt switch\n"
+    _uart_puts(swmsg)
+
+    # Verdict once enough involuntary preemptions have run.
+    if arm64_p27_switches >= P27_TICK_GOAL:
+        arm64_p27_finish()
+        while True:
+            _wfi()
+
+    # Round-robin to the peer slot (both tasks are always RUNNABLE here).
+    nxt: int64 = out_idx + 1
+    if nxt >= 2:
+        nxt = 0
+
+    arm64_p27_cur = nxt
+    arm64_p25_switch_to(nxt)                  # TTBR0+ASID -> the incoming task
+
+    next_ctx: uint64 = arm64_p25_ctx_for(nxt)
+    arm64_current_ctx = next_ctx              # publish for the .S restore path
+    return next_ctx
+
+
+# Phase-27 verdict. PASS iff: BOTH per-task counters advanced (each > 0, proving
+# the timer ran BOTH distinct EL0 contexts, not just one); enough involuntary
+# preemptions occurred (>= P27_SWITCH_MIN); the timer caught EACH task running
+# at least once; and the two counters live at the SAME EL0 VA (P25_DATA_VA) but
+# in DISTINCT physical pages (so T0's increments never touched T1's counter).
+# Print the summary, the PASS/FAIL marker, then halt (this is the last phase).
+def arm64_p27_finish() -> int64:
+    arm64_p27_active = 0
+    nl: Ptr[char] = "\n"
+
+    # Read each task's counter straight from its OWN physical backing page.
+    t0p: Ptr[uint64] = cast[Ptr[uint64]](P27_T0_DATA_PA)
+    t1p: Ptr[uint64] = cast[Ptr[uint64]](P27_T1_DATA_PA)
+    t0: uint64 = t0p[0]
+    t1: uint64 = t1p[0]
+
+    asid_flips: int64 = arm64_p27_switches    # every switch flipped TTBR0 ASID
+
+    sm: Ptr[char] = "[arm64] Phase 27 summary: t0="
+    _uart_puts(sm)
+    _uart_puthex(t0)
+    s2: Ptr[char] = " t1="
+    _uart_puts(s2)
+    _uart_puthex(t1)
+    s3: Ptr[char] = " switches="
+    _uart_puts(s3)
+    _uart_puthex(cast[uint64](arm64_p27_switches))
+    s4: Ptr[char] = " asid_flips="
+    _uart_puts(s4)
+    _uart_puthex(cast[uint64](asid_flips))
+    _uart_puts(nl)
+
+    ok: int64 = 1
+    # BOTH tasks made forward progress under involuntary preemption.
+    if t0 == cast[uint64](0):
+        ok = 0
+    if t1 == cast[uint64](0):
+        ok = 0
+    # Enough preemptions occurred (not a single switch).
+    if arm64_p27_switches < P27_SWITCH_MIN:
+        ok = 0
+    # The timer actually caught EACH task running at least once.
+    if arm64_p27_t0_runs <= 0:
+        ok = 0
+    if arm64_p27_t1_runs <= 0:
+        ok = 0
+    # Own-address-space proof: the two counters live in DISTINCT physical pages.
+    if P27_T0_DATA_PA == P27_T1_DATA_PA:
+        ok = 0
+
+    if ok != 0:
+        rp: Ptr[char] = "[arm64] Phase 27: the generic timer preemptively round-robined two EL0 tasks in separate ASID address spaces; each advanced its OWN counter (same VA, distinct physical pages) with no syscall/yield\n"
+        _uart_puts(rp)
+        pp: Ptr[char] = "[arm64] Phase 27 PASS\n"
+        _uart_puts(pp)
+    else:
+        fp: Ptr[char] = "[arm64] Phase 27 FAIL\n"
+        _uart_puts(fp)
+
+    _msr_daifset(2)
+    while True:
+        _wfi()
+    return 0
+
+
+# Phase-27 entry point (from the Phase-26 finish hand-off). Build both tasks'
+# private ASID-tagged address spaces (each mapping the SHARED counter VA to its
+# OWN distinct physical page, pre-zeroed) + the shared EL0 busy-increment
+# routine + per-task context blocks; recycle both ASIDs once; then ERET into
+# task 0 under its private TTBR0+ASID with the timer LIVE and IRQs UNMASKED in
+# EL0 (via the context SPSR) so the timer involuntarily preempts and
+# round-robins the two tasks. Never returns (halts at the verdict).
+def arm64_p27_run() -> int64:
+    intro: Ptr[char] = "[arm64] Phase 27: timer-preemptive round-robin between two EL0 tasks\n"
+    _uart_puts(intro)
+
+    # Mask EL1 IRQs while we build everything so a stray timer IRQ cannot run the
+    # scheduler mid-setup; re-enable just before the ERET into task 0.
+    _msr_daifset(2)
+
+    # Zero each task's private counter page (counter at offset 0).
+    z0: Ptr[uint64] = cast[Ptr[uint64]](P27_T0_DATA_PA)
+    z1: Ptr[uint64] = cast[Ptr[uint64]](P27_T1_DATA_PA)
+    z0[0] = cast[uint64](0)
+    z1[0] = cast[uint64](0)
+    _dsb_ish()
+
+    # Build each task's private space (slot 0 -> T0's data page, slot 1 -> T1's
+    # data page), the shared EL0 routine, and each task's context block.
+    arm64_p25_build_space(0, P27_T0_DATA_PA, P25_PAGE_RW)
+    arm64_p25_build_space(1, P27_T1_DATA_PA, P25_PAGE_RW)
+    arm64_build_p27_routine()
+    arm64_init_ctx(arm64_p25_ctx_for(0), P25_CODE_BASE, arm64_p25_stack_for(0))
+    arm64_init_ctx(arm64_p25_ctx_for(1), P25_CODE_BASE, arm64_p25_stack_for(1))
+
+    # Recycle both slots' ASIDs before first use; thereafter swaps need no flush.
+    _dsb_ish()
+    _tlbi_aside1is(arm64_p25_asid_for(0) << P23_ASID_SHIFT)
+    _tlbi_aside1is(arm64_p25_asid_for(1) << P23_ASID_SHIFT)
+    _dsb_ish()
+    _isb()
+
+    arm64_p27_cur = 0
+    arm64_p27_switches = 0
+    arm64_p27_t0_runs = 0
+    arm64_p27_t1_runs = 0
+    arm64_current_ctx = arm64_p25_ctx_for(0)
+    arm64_p27_active = 1
+
+    enter: Ptr[char] = "[arm64] launching two preemptive EL0 tasks (T0 slot 0, T1 slot 1; separate ASIDs)\n"
+    _uart_puts(enter)
+
+    # Switch to task 0's private space, re-arm + enable the timer, unmask EL1
+    # IRQs, then ERET into task 0 at EL0t WITH IRQs unmasked (via its context
+    # SPSR == SPSR_EL0T_IRQ) so the timer preempts it.
+    arm64_p25_switch_to(0)
+    _msr_cntv_tval_el0(arm64_timer_period)
+    _msr_cntv_ctl_el0(cast[uint64](1))
+    _msr_daifclr(2)                          # EL1 IRQs on
+
+    ctx: Ptr[uint64] = cast[Ptr[uint64]](arm64_p25_ctx_for(0))
+    _msr_spsr_el1(ctx[CTX_SPSR])
+    _msr_elr_el1(ctx[CTX_ELR])
+    _msr_sp_el0(ctx[CTX_SP_EL0])
+    _isb()
+    _eret()                                  # -> task 0 at EL0; never returns here
     return 0
 
 
