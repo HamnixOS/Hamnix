@@ -733,6 +733,13 @@ def arm64_sync_handler(frame_ptr: Ptr[uint64]) -> int64:
     if arm64_sig_active != 0:
         return arm64_sig_dispatch(frame_ptr, nr, a0, a1, a2)
 
+    # Phase 13: while the FP context-switch demo is live, route every svc into the
+    # Phase-13 dispatcher (fpcheck/yield/exit). yield saves the outgoing task's
+    # d8..d15, restores the incoming task's, and erets into it; fpcheck verifies a
+    # task's FP signature survived the switch.
+    if arm64_fp_active != 0:
+        return arm64_fp_dispatch(frame_ptr, nr, a0, a1, a2)
+
     # Phase 9: while the page-table-backed brk demo is live, route every svc into
     # the Phase-9 dispatcher (brk/report/write/exit). brk-grow installs a fresh
     # page mapping into the live TTBR0 tables; report verifies the EL0 task read
@@ -2487,8 +2494,13 @@ def arm64_sig_do_exit(a0: uint64) -> int64:
         fm: Ptr[char] = "[arm64] EL0 signal delivery FAIL\n"
         _uart_puts(fm)
     arm64_sig_active = 0
-    # Phase 11 is the final EL0 milestone; halt deterministically.
+    # Phase 11 done; hand off to Phase 13 (EL0 FP/SIMD context save/restore across
+    # a context switch). Mask IRQs so the cooperative-yield FP demo runs
+    # deterministically (no timer re-entry); arm64_run_fp_demo() halts after its
+    # own PASS marker and never returns.
     _msr_daifset(2)
+    arm64_run_fp_demo()
+    # Unreachable safety halt.
     while True:
         _wfi()
     return 0
@@ -2578,6 +2590,366 @@ def arm64_run_signal_demo() -> int64:
     _msr_sp_el0(SIG_STACK_TOP)         # EL0 stack pointer
     _isb()
     _eret()                            # -> EL0; svc traps re-enter EL1; no return
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 13 — EL0 FP/SIMD CONTEXT SAVE/RESTORE ACROSS A CONTEXT SWITCH.
+#
+# Linux saves/restores the FP/SIMD register file (the V registers) on every
+# context switch; without that, a task's floating-point state would be silently
+# corrupted the moment another task ran. The aarch64 port's earlier scheduler
+# (Phase 5) only saved the GPRs (x0..x30 + SP/ELR/SPSR), NOT the FP registers, so
+# FP state did NOT survive a switch. Phase 13 closes that gap and PROVES it.
+#
+# Design (deterministic, cooperative — no timer needed):
+#   * CPACR_EL1.FPEN is set so EL0 (and the kernel) may execute FP/SIMD ops; until
+#     now FP was trapped.
+#   * Two EL0 tasks each seed the callee-saved scalar FP register d8 with a
+#     DISTINCTIVE 64-bit signature (FP_SIG0 / FP_SIG1) via a hand-emitted
+#     `fmov d8, x9`. Each then loops: read d8 back (`fmov x_, d8`), hand the value
+#     to the kernel via a private `fpcheck` syscall, then `yield`.
+#   * The kernel runs a COOPERATIVE round-robin scheduler keyed off yield. On every
+#     yield it SAVES the outgoing task's d8..d15 into that task's FP save area and
+#     RESTORES the incoming task's d8..d15 from its save area — the FP half of a
+#     real context switch. Between a task's two consecutive yields the OTHER task
+#     runs and overwrites the LIVE d8 with its own signature, so WITHOUT the
+#     save/restore a task would read back the wrong value. fpcheck FAILs loudly if
+#     a task ever observes a value other than its own signature.
+#   * After each task has been scheduled FP_YIELD_LIMIT times and every fpcheck
+#     matched, the kernel prints the Phase-13 PASS marker and halts. A PASS proves
+#     FP/SIMD state is per-task and genuinely survives an EL0<->EL0 context switch
+#     on bare-metal aarch64.
+# ---------------------------------------------------------------------------
+
+# Kernel-private Phase-13 syscall: an EL0 task reports the current value it read
+# back out of d8 so the kernel can verify its FP signature survived the switch.
+SYS_FPCHECK_NR: uint64 = 530
+
+# The two task FP signatures (arbitrary recognizable 64-bit values). Each task
+# seeds d8 with its own and must always read exactly this back.
+FP_SIG0: uint64 = 0x1234567811112222
+FP_SIG1: uint64 = 0xCAFEF00D33334444
+
+# Phase-13 EL0 layout — both tasks live inside the EL0-RWX 2 MiB window.
+FP_TASK0_CODE: uint64 = 0x40200000
+FP_TASK1_CODE: uint64 = 0x40210000
+FP_TASK0_STACK_TOP: uint64 = 0x40240000
+FP_TASK1_STACK_TOP: uint64 = 0x40250000
+
+# Per-task context blocks (GPR frame, 34 slots) in EL1-only RAM, clear of the
+# Phase-5 blocks (0x40104000 / 0x40105000) so the two demos never collide.
+FP_TASK0_CTX: uint64 = 0x40106000
+FP_TASK1_CTX: uint64 = 0x40107000
+
+# Per-task FP save areas (d8..d15 = 8 doubles = 64 bytes each), EL1-only RAM. A
+# task can neither read nor scribble the saved FP state of the other.
+FP_TASK0_FPAREA: uint64 = 0x40108000
+FP_TASK1_FPAREA: uint64 = 0x40108080
+
+# How many times EACH task must be scheduled (and pass its fpcheck) before the
+# demo declares success. Small but >1 so the save/restore is exercised both ways
+# multiple times.
+FP_YIELD_LIMIT: int64 = 6
+
+# Phase-13 bookkeeping.
+arm64_fp_active: int64 = 0           # routes svc into the Phase-13 dispatcher
+arm64_fp_cur_task: int64 = 0         # which task is live (0 or 1)
+arm64_fp_checks0: int64 = 0          # successful fpchecks by task 0
+arm64_fp_checks1: int64 = 0          # successful fpchecks by task 1
+arm64_fp_corrupt: int64 = 0          # set if ANY task ever read a wrong value
+arm64_fp_current_ctx: uint64 = 0     # ctx block of the live task (for symmetry)
+
+
+# Materialise a Phase-13 EL0 FP task into `code_base`. The task:
+#   x9 = sig ; fmov d8, x9          -> seed its FP signature into d8
+#   loop:
+#     fmov x0, d8                   -> read d8 back into x0 (arg0)
+#     x8 = 530 (fpcheck) ; svc #0   -> kernel verifies x0 == this task's sig
+#     x8 = 124 (yield)   ; svc #0   -> cooperatively yield to the other task
+#     b loop
+# The task never exits; the kernel ends the demo once both tasks have passed
+# FP_YIELD_LIMIT fpchecks. fmov encodings:
+#   fmov d8, xN  : 0x9E670000 | (N<<5) | 8
+#   fmov x0, d8  : 0x9E660000 | (8<<5) | 0
+def arm64_build_fp_task(code_base: uint64, sig: uint64) -> int64:
+    a: uint64 = code_base
+
+    # x9 = sig ; fmov d8, x9
+    a = _emit_load_imm64(a, cast[uint64](9), sig)
+    fmov_d8_x9: uint64 = cast[uint64](0x9E670000) | (cast[uint64](9) << cast[uint64](5)) | cast[uint64](8)
+    a = _emit_word(a, fmov_d8_x9)
+
+    loop_top: uint64 = a
+
+    # fmov x0, d8  (read the live d8 into x0 as fpcheck's arg0)
+    fmov_x0_d8: uint64 = cast[uint64](0x9E660000) | (cast[uint64](8) << cast[uint64](5)) | cast[uint64](0)
+    a = _emit_word(a, fmov_x0_d8)
+
+    # fpcheck(x0): x8 = 530 ; svc #0
+    a = _emit_load_imm64(a, cast[uint64](8), SYS_FPCHECK_NR)
+    a = _emit_word(a, cast[uint64](0xD4000001))                # svc #0
+
+    # yield(): x8 = 124 ; svc #0
+    a = _emit_load_imm64(a, cast[uint64](8), SYS_YIELD_NR)
+    a = _emit_word(a, cast[uint64](0xD4000001))                # svc #0
+
+    # b loop_top : 0x14000000 | imm26
+    b_here: uint64 = a
+    off_loop: int64 = cast[int64](loop_top) - cast[int64](b_here)
+    imm26: uint64 = cast[uint64](off_loop >> 2) & cast[uint64](0x3FFFFFF)
+    a = _emit_word(a, cast[uint64](0x14000000) | imm26)
+
+    _dsb_ish()
+    _isb()
+    return 0
+
+
+# Enable EL0/EL1 FP/SIMD access by setting CPACR_EL1.FPEN (bits[21:20] = 0b11).
+# Without this, the first fmov (kernel or EL0) traps as an EC=0x07 access fault.
+def arm64_fp_enable() -> int64:
+    cpacr: uint64 = cast[uint64](_mrs_cpacr_el1())
+    cpacr = cpacr | cast[uint64](0x300000)     # FPEN = 0b11 (no trapping)
+    _msr_cpacr_el1(cpacr)
+    _isb()
+    return 0
+
+
+# Phase-13 cooperative scheduler: invoked from the dispatcher when the running
+# task yields. The svc trap path (arm64_lower_sync_entry in vectors.S) reloads the
+# GPR frame then erets WITHOUT touching SP_EL0/ELR_EL1/SPSR_EL1 — so, exactly like
+# the Phase-11 signal path, we redirect the eret by mutating ELR_EL1 + SP_EL0 here.
+#
+# Save the OUTGOING task's resume context (the post-yield ELR_EL1 + live SP_EL0)
+# into its ctx block AND save its FP registers d8..d15 into its FP save area; then
+# pick the OTHER task, restore its FP registers, and program ELR_EL1/SP_EL0/SPSR
+# from its ctx block so the stub's eret resumes it where it last yielded (or at its
+# entry on the first schedule). This is the FP half of a real context switch
+# layered on the GPR-frame reload the vector stub already does.
+def arm64_fp_switch() -> uint64:
+    out_ctx: uint64 = FP_TASK0_CTX
+    out_area: uint64 = FP_TASK0_FPAREA
+    in_ctx: uint64 = FP_TASK1_CTX
+    in_area: uint64 = FP_TASK1_FPAREA
+    if arm64_fp_cur_task == 0:
+        out_ctx = FP_TASK0_CTX
+        out_area = FP_TASK0_FPAREA
+        in_ctx = FP_TASK1_CTX
+        in_area = FP_TASK1_FPAREA
+        arm64_fp_cur_task = 1
+    else:
+        out_ctx = FP_TASK1_CTX
+        out_area = FP_TASK1_FPAREA
+        in_ctx = FP_TASK0_CTX
+        in_area = FP_TASK0_FPAREA
+        arm64_fp_cur_task = 0
+
+    # Save the outgoing task's resume PC (ELR_EL1, already pointing past its yield
+    # svc) and live stack (SP_EL0) so it resumes mid-loop next time it is picked.
+    outc: Ptr[uint64] = cast[Ptr[uint64]](out_ctx)
+    outc[CTX_ELR] = cast[uint64](_mrs_elr_el1())
+    outc[CTX_SP_EL0] = cast[uint64](_mrs_sp_el0())
+    outc[CTX_SPSR] = SPSR_EL0T_DAIF
+
+    # Save the outgoing task's FP state, then load the incoming task's FP state
+    # into the live registers — the heart of the FP context switch.
+    _fp_save_d8_d15(out_area)
+    _fp_restore_d8_d15(in_area)
+
+    # Program the eret target from the incoming task's ctx block.
+    inc: Ptr[uint64] = cast[Ptr[uint64]](in_ctx)
+    _msr_elr_el1(inc[CTX_ELR])
+    _msr_sp_el0(inc[CTX_SP_EL0])
+    _msr_spsr_el1(inc[CTX_SPSR])
+
+    arm64_fp_current_ctx = in_ctx
+    arm64_current_ctx = in_ctx
+    return in_ctx
+
+
+# Phase-13 syscall dispatcher. Services fpcheck (verify a task's FP signature),
+# yield (save/restore FP + switch task), write and exit. fpcheck/yield return into
+# EL0; the demo ends from inside the dispatcher (it never returns to EL0 then).
+def arm64_fp_dispatch(frame_ptr: Ptr[uint64], nr: uint64, a0: uint64, a1: uint64, a2: uint64) -> int64:
+    if nr == SYS_FPCHECK_NR:
+        # a0 = the value the task read back out of d8. It must equal the live
+        # task's signature; otherwise FP state was lost across a switch.
+        expected: uint64 = FP_SIG0
+        if arm64_fp_cur_task == 0:
+            expected = FP_SIG0
+        else:
+            expected = FP_SIG1
+        if a0 == expected:
+            if arm64_fp_cur_task == 0:
+                arm64_fp_checks0 = arm64_fp_checks0 + 1
+            else:
+                arm64_fp_checks1 = arm64_fp_checks1 + 1
+            okm: Ptr[char] = "[arm64] fpcheck OK task="
+            _uart_puts(okm)
+            _uart_puthex(cast[uint64](arm64_fp_cur_task))
+            sm: Ptr[char] = " d8="
+            _uart_puts(sm)
+            _uart_puthex(a0)
+            nl: Ptr[char] = "\n"
+            _uart_puts(nl)
+        else:
+            arm64_fp_corrupt = 1
+            bm: Ptr[char] = "[arm64] fpcheck CORRUPT task="
+            _uart_puts(bm)
+            _uart_puthex(cast[uint64](arm64_fp_cur_task))
+            gm: Ptr[char] = " got="
+            _uart_puts(gm)
+            _uart_puthex(a0)
+            em: Ptr[char] = " want="
+            _uart_puts(em)
+            _uart_puthex(expected)
+            nl2: Ptr[char] = "\n"
+            _uart_puts(nl2)
+        frame_ptr[0] = cast[uint64](0)
+        return 0
+
+    if nr == SYS_YIELD_NR:
+        # Both tasks have run enough times AND every fpcheck matched -> success.
+        if arm64_fp_checks0 >= FP_YIELD_LIMIT:
+            if arm64_fp_checks1 >= FP_YIELD_LIMIT:
+                arm64_fp_finish()
+                # Unreachable: arm64_fp_finish halts. Safety loop if it falls through.
+                while True:
+                    _wfi()
+
+        # Otherwise switch FP context to the other task. arm64_fp_switch saves the
+        # outgoing FP + resume context and programs ELR_EL1/SP_EL0/SPSR for the
+        # incoming task; we then return 0 so the sync stub reloads the GPR frame and
+        # erets into the incoming task at its redirected resume point.
+        arm64_fp_switch()
+        frame_ptr[0] = cast[uint64](0)
+        return 0
+
+    if nr == SYS_EXIT_NR:
+        arm64_fp_finish()
+        while True:
+            _wfi()
+
+    um: Ptr[char] = "[arm64] EL0 unknown syscall (phase 13)\n"
+    _uart_puts(um)
+    frame_ptr[0] = cast[uint64](0)
+    return 0
+
+
+# ERET into the task whose context block is `ctx_base`: program SPSR/ELR/SP_EL0
+# from the saved context and eret. Cooperative (no timer), so SPSR keeps IRQs
+# masked (SPSR_EL0T_DAIF). Never returns; control resumes in EL0.
+def arm64_fp_eret(ctx_base: uint64) -> int64:
+    ctx: Ptr[uint64] = cast[Ptr[uint64]](ctx_base)
+    _msr_spsr_el1(ctx[CTX_SPSR])
+    _msr_elr_el1(ctx[CTX_ELR])
+    _msr_sp_el0(ctx[CTX_SP_EL0])
+    _isb()
+    _eret()
+    return 0
+
+
+# Phase-13 finish: print PASS iff both tasks were scheduled FP_YIELD_LIMIT times
+# with every fpcheck matching its signature (so FP state survived every switch)
+# and no corruption was ever observed. Halt deterministically. Never returns.
+def arm64_fp_finish() -> int64:
+    arm64_fp_active = 0
+    nl: Ptr[char] = "\n"
+    c0m: Ptr[char] = "[arm64] task0 fpchecks passed -> "
+    _uart_puts(c0m)
+    _uart_puthex(cast[uint64](arm64_fp_checks0))
+    _uart_puts(nl)
+    c1m: Ptr[char] = "[arm64] task1 fpchecks passed -> "
+    _uart_puts(c1m)
+    _uart_puthex(cast[uint64](arm64_fp_checks1))
+    _uart_puts(nl)
+
+    ok: int64 = 0
+    if arm64_fp_corrupt == 0:
+        if arm64_fp_checks0 >= FP_YIELD_LIMIT:
+            if arm64_fp_checks1 >= FP_YIELD_LIMIT:
+                ok = 1
+    if ok != 0:
+        sm: Ptr[char] = "[arm64] FP state survived context switch\n"
+        _uart_puts(sm)
+        pm: Ptr[char] = "[arm64] EL0 FP context switch OK\n"
+        _uart_puts(pm)
+    else:
+        fm: Ptr[char] = "[arm64] EL0 FP context switch FAIL\n"
+        _uart_puts(fm)
+    _msr_daifset(2)
+    while True:
+        _wfi()
+    return 0
+
+
+# Phase-13 entry point (invoked from the Phase-11 exit hand-off). Restore the
+# kernel's identity TTBR0, enable FP/SIMD, build both EL0 FP tasks + their context
+# blocks, seed each task's FP save area with its signature (so the FIRST restore
+# of an incoming task loads the right value), arm Phase-13 dispatch, and ERET into
+# task 0 at EL0t with IRQs masked. Never returns (the demo halts at its PASS).
+def arm64_run_fp_demo() -> int64:
+    intro: Ptr[char] = "[arm64] Phase 13: EL0 FP/SIMD context save/restore\n"
+    _uart_puts(intro)
+
+    # Restore the kernel's identity-only TTBR0 (earlier phases may have left a
+    # per-task TTBR0 installed), then flush the TLB for a clean address space.
+    _dsb_ish()
+    _msr_ttbr0_el1(L1_PGTABLE)
+    _dsb_ish()
+    _tlbi_vmalle1is()
+    _dsb_ish()
+    _isb()
+
+    # Enable FP/SIMD so the tasks' fmov instructions (and the kernel's FP save/
+    # restore) do not trap.
+    arm64_fp_enable()
+    fpm: Ptr[char] = "[arm64] CPACR_EL1.FPEN enabled\n"
+    _uart_puts(fpm)
+
+    # Build both EL0 FP tasks (each seeds d8 with its own signature) and their
+    # context blocks (entry PC + stack, EL0t with IRQs masked for determinism).
+    arm64_build_fp_task(FP_TASK0_CODE, FP_SIG0)
+    arm64_build_fp_task(FP_TASK1_CODE, FP_SIG1)
+    arm64_init_ctx(FP_TASK0_CTX, FP_TASK0_CODE, FP_TASK0_STACK_TOP)
+    arm64_init_ctx(FP_TASK1_CTX, FP_TASK1_CODE, FP_TASK1_STACK_TOP)
+    # arm64_init_ctx sets SPSR to SPSR_EL0T_IRQ (IRQs on). This demo is cooperative
+    # with IRQs masked, so force EL0t with DAIF masked in both context blocks.
+    ctx0: Ptr[uint64] = cast[Ptr[uint64]](FP_TASK0_CTX)
+    ctx1: Ptr[uint64] = cast[Ptr[uint64]](FP_TASK1_CTX)
+    ctx0[CTX_SPSR] = SPSR_EL0T_DAIF
+    ctx1[CTX_SPSR] = SPSR_EL0T_DAIF
+
+    # Seed each task's FP save area so that the very first time the scheduler
+    # RESTORES a task, it loads that task's signature into d8 — though both tasks
+    # also re-seed d8 themselves on entry, so this only matters for the inactive
+    # task's first restore. Write d8's slot (offset 0) to the signature; the
+    # remaining d9..d15 slots are left zero.
+    area0: Ptr[uint64] = cast[Ptr[uint64]](FP_TASK0_FPAREA)
+    area1: Ptr[uint64] = cast[Ptr[uint64]](FP_TASK1_FPAREA)
+    i: int64 = 0
+    while i < 8:
+        area0[i] = cast[uint64](0)
+        area1[i] = cast[uint64](0)
+        i = i + 1
+    area0[0] = FP_SIG0
+    area1[0] = FP_SIG1
+
+    # Seed bookkeeping and arm the dispatcher.
+    arm64_el0_exited = 0
+    arm64_el0_exit_code = -1
+    arm64_fp_cur_task = 0
+    arm64_fp_checks0 = 0
+    arm64_fp_checks1 = 0
+    arm64_fp_corrupt = 0
+    arm64_fp_current_ctx = FP_TASK0_CTX
+    arm64_current_ctx = FP_TASK0_CTX
+    arm64_fp_active = 1
+
+    enter: Ptr[char] = "[arm64] launching EL0 FP tasks\n"
+    _uart_puts(enter)
+
+    arm64_fp_eret(FP_TASK0_CTX)        # -> task 0 at EL0; svc traps re-enter EL1
     return 0
 
 

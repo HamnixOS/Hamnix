@@ -1190,6 +1190,11 @@ class Arm64CodeGen:
         "_msr_spsr_el1":      "spsr_el1",
         "_msr_elr_el1":       "elr_el1",
         "_msr_sp_el0":        "sp_el0",
+        # Phase 13: CPACR_EL1.FPEN gates EL0/EL1 FP/SIMD access. The FP context-
+        # switch demo writes bits[21:20]=0b11 here so V/FP instructions stop
+        # trapping; without this an EL0 (or kernel) fmov would take an EC=0x07
+        # access-to-SIMD fault.
+        "_msr_cpacr_el1":     "cpacr_el1",
     }
     # name -> system register spelled for `mrs x0, <reg>`.
     _MRS_INTRINSICS = {
@@ -1217,6 +1222,9 @@ class Arm64CodeGen:
         # The secondary-core scheduling demo reads it so each core can stamp its
         # own id and prove genuine cross-core execution under one shared lock.
         "_mrs_mpidr_el1":  "mpidr_el1",
+        # Phase 13: CPACR_EL1 is read so the FP demo can OR in FPEN without
+        # clobbering other (RES0/RES1) bits before writing it back.
+        "_mrs_cpacr_el1":  "cpacr_el1",
     }
     # name -> verbatim barrier / maintenance / wait instruction (no operands).
     _NULLARY_INTRINSICS = {
@@ -1340,6 +1348,54 @@ class Arm64CodeGen:
             self.gen_expr(args[0])               # lock address -> x0
             self.emit("    stlr xzr, [x0]")      # store-release 0 = free
             self.emit("    sev")                 # wake waiters
+            self.emit("    mov x0, #0")
+            return True
+        if name == "_fp_set_d8":
+            # Phase 13: write the 64-bit value in the single argument into the
+            # callee-saved scalar FP register d8 (fmov d8, x0). Used to seed a
+            # task's distinctive FP signature so the context-switch save/restore
+            # can be proven. Requires CPACR_EL1.FPEN already enabled.
+            if len(args) != 1:
+                raise CodeGenError(
+                    "aarch64: _fp_set_d8 expects exactly 1 argument")
+            self.gen_expr(args[0])               # value -> x0
+            self.emit("    fmov d8, x0")         # FMOV (general -> SIMD, 64-bit)
+            self.emit("    mov x0, #0")
+            return True
+        if name == "_fp_get_d8":
+            # Phase 13: read d8 back into x0 (fmov x0, d8) so the kernel can
+            # confirm a task's FP signature survived a context switch.
+            if len(args) != 0:
+                raise CodeGenError(
+                    "aarch64: _fp_get_d8 expects no arguments")
+            self.emit("    fmov x0, d8")         # FMOV (SIMD -> general, 64-bit)
+            return True
+        if name == "_fp_save_d8_d15":
+            # Phase 13: save the callee-saved scalar FP registers d8..d15 (eight
+            # 64-bit doubles, 64 bytes total) to memory at the argument address.
+            # This is the FP half of a context switch: stash the outgoing task's
+            # FP state. We use STP pairs at fixed offsets off the base in x0.
+            if len(args) != 1:
+                raise CodeGenError(
+                    "aarch64: _fp_save_d8_d15 expects exactly 1 argument")
+            self.gen_expr(args[0])               # save-area base -> x0
+            self.emit("    stp d8,  d9,  [x0, #0]")
+            self.emit("    stp d10, d11, [x0, #16]")
+            self.emit("    stp d12, d13, [x0, #32]")
+            self.emit("    stp d14, d15, [x0, #48]")
+            self.emit("    mov x0, #0")
+            return True
+        if name == "_fp_restore_d8_d15":
+            # Phase 13: restore d8..d15 from the save area at the argument address
+            # (the incoming task's FP state). Mirror image of _fp_save_d8_d15.
+            if len(args) != 1:
+                raise CodeGenError(
+                    "aarch64: _fp_restore_d8_d15 expects exactly 1 argument")
+            self.gen_expr(args[0])               # save-area base -> x0
+            self.emit("    ldp d8,  d9,  [x0, #0]")
+            self.emit("    ldp d10, d11, [x0, #16]")
+            self.emit("    ldp d12, d13, [x0, #32]")
+            self.emit("    ldp d14, d15, [x0, #48]")
             self.emit("    mov x0, #0")
             return True
         if name in ("_msr_daifclr", "_msr_daifset"):
