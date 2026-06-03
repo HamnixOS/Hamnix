@@ -76,12 +76,35 @@ USER_STACK_TOP: uint64 = 0x40280000   # EL0 stack top (grows down), 16B-aligned
 SYS_WRITE_NR: uint64 = 64
 SYS_EXIT_NR: uint64 = 93
 
+# Phase 6: a deliberately-EL1-only EL0 virtual address. RAM is split into 2 MiB
+# L2 blocks; only the block at USER_L2_INDEX (0x4020_0000 .. 0x403F_FFFF) carries
+# AP[1] (EL0 access). The block at 0x4040_0000 (L2 index 2) is mapped Normal
+# EL1-only (no AP[1]), so an EL0 load from it raises a Data Abort (permission
+# fault) — exactly the bad access the page-fault handler must catch. We pick a
+# memorable sentinel so the reported FAR_EL1 is unmistakable in the log.
+FAULT_VA: uint64 = 0x40400000
+
+# Page-fault bookkeeping: set non-zero by the handler once it has caught and
+# reported an EL0 abort, so the launcher can confirm the task was terminated
+# (not resumed into the faulting instruction) before proceeding to Phase 5.
+arm64_fault_handled: int64 = 0
+
 # SPSR_EL1 value to ERET into EL0t with all interrupts masked: bits[3:0]=0
 # (EL0t) and DAIF (bits[9:6]) set. 0x3C0 = D|A|I|F masked, mode EL0t.
 SPSR_EL0T_DAIF: uint64 = 0x3C0
 
 # ESR_EL1.EC (bits[31:26]) value for "SVC instruction execution in AArch64".
 ESR_EC_SVC64: uint64 = 0x15
+
+# Phase 6: ESR_EL1.EC values for memory aborts taken from a LOWER EL (EL0):
+#   0x20 = Instruction Abort from a lower EL
+#   0x21 = Instruction Abort from the current EL
+#   0x24 = Data Abort from a lower EL
+#   0x25 = Data Abort from the current EL
+# The EL0 page-fault path catches 0x20 (bad fetch) and 0x24 (bad load/store);
+# FAR_EL1 then holds the faulting virtual address.
+ESR_EC_IABORT_LOWER: uint64 = 0x20
+ESR_EC_DABORT_LOWER: uint64 = 0x24
 
 # Recorded EL0 exit code (written by the exit syscall) and a done flag.
 arm64_el0_exit_code: int64 = -1
@@ -152,6 +175,22 @@ def _uart_puts(s: Ptr[char]) -> int64:
         _uart_putc(p[i])
         i = i + 1
     return i
+
+
+# Print a 64-bit value as "0x" + 16 hex digits, MSB first. Used by the Phase 6
+# page-fault handler to report the faulting VA (FAR_EL1) and EL0 PC (ELR_EL1).
+def _uart_puthex(value: uint64) -> int64:
+    _uart_putc(cast[uint8](0x30))          # '0'
+    _uart_putc(cast[uint8](0x78))          # 'x'
+    shift: int64 = 60
+    while shift >= 0:
+        nib: uint64 = (value >> cast[uint64](shift)) & cast[uint64](0xF)
+        if nib < cast[uint64](10):
+            _uart_putc(cast[uint8](cast[uint64](0x30) + nib))      # '0'..'9'
+        else:
+            _uart_putc(cast[uint8](cast[uint64](0x37) + nib))      # 'A'..'F'
+        shift = shift - 4
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -411,7 +450,17 @@ def arm64_sync_handler(frame_ptr: Ptr[uint64]) -> int64:
     ec: uint64 = (esr >> cast[uint64](26)) & cast[uint64](0x3F)
 
     if ec != ESR_EC_SVC64:
-        # Not a syscall — a genuine fault from EL0. Report and halt.
+        # Not a syscall. Phase 6: an EL0 memory abort (bad load/store/fetch) is
+        # a recoverable *user* fault — the kernel must report it and TERMINATE
+        # the offending task, never hang. Catch data/instruction aborts taken
+        # from the lower EL (EC 0x24 / 0x20), report the faulting VA (FAR_EL1)
+        # and EL0 PC (ELR_EL1), then advance to Phase 5 instead of resuming the
+        # dead task into its faulting instruction (which would re-fault forever).
+        if ec == ESR_EC_DABORT_LOWER:
+            return arm64_handle_el0_fault(esr, cast[uint64](0))
+        if ec == ESR_EC_IABORT_LOWER:
+            return arm64_handle_el0_fault(esr, cast[uint64](1))
+        # Anything else from EL0 is genuinely unexpected — report and halt.
         msg: Ptr[char] = "[arm64] EL0 non-SVC sync exception\n"
         _uart_puts(msg)
         while True:
@@ -451,9 +500,11 @@ def arm64_sync_handler(frame_ptr: Ptr[uint64]) -> int64:
     frame_ptr[0] = ret
 
     # If EL0 asked to exit, don't return into it. Emit the Phase-4 single-task
-    # PASS marker, then advance to Phase 5: launch the preemptively-scheduled
-    # two-task workload. arm64_start_tasks() erets to EL0 and never returns, so
-    # this exit-syscall service point becomes the hand-off from Phase 4 -> 5.
+    # PASS marker, then advance to Phase 6: run a deliberately-faulting EL0 task
+    # and prove the kernel catches the abort + terminates the task. The Phase-6
+    # handler in turn hands off to Phase 5 (preemptive scheduling). Each stage's
+    # launcher erets to EL0 and never returns, so this exit-syscall service point
+    # is the hand-off from Phase 4 -> 6 -> 5.
     if arm64_el0_exited != 0:
         if arm64_el0_exit_code == 0:
             passmsg: Ptr[char] = "[arm64] EL0 syscall OK\n"
@@ -461,9 +512,10 @@ def arm64_sync_handler(frame_ptr: Ptr[uint64]) -> int64:
         else:
             failmsg: Ptr[char] = "[arm64] EL0 exited nonzero\n"
             _uart_puts(failmsg)
-        # Mask IRQs while we transition, then launch Phase 5 (never returns).
+        # Mask IRQs while we transition, then launch Phase 6 (never returns):
+        # the faulting task aborts, is reaped, and Phase 6 advances to Phase 5.
         _msr_daifset(2)
-        arm64_start_tasks()
+        arm64_run_faulting_task()
         # Unreachable; safe halt if the launcher ever falls through.
         while True:
             _wfi()
@@ -489,6 +541,109 @@ def arm64_enter_el0() -> int64:
     _msr_sp_el0(USER_STACK_TOP)        # EL0 stack pointer
     _isb()
     _eret()                            # -> EL0; never returns here
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 — EL0 page-fault path.
+#
+# A buggy or hostile EL0 task that dereferences an unmapped / EL1-only address
+# must NOT wedge the kernel. The CPU takes a Data (or Instruction) Abort to the
+# "Lower EL using AArch64" Synchronous vector — the SAME vector as `svc` — so
+# arm64_sync_handler sees ESR_EL1.EC == 0x24 (data) or 0x20 (instruction).
+# Instead of resuming EL0 into the offending instruction (which would re-fault
+# forever) we read FAR_EL1 (the faulting VA) + ELR_EL1 (the EL0 PC), report
+# them, mark the fault handled, and TERMINATE the task by transferring to the
+# next schedulable workload (Phase 5) rather than ERET-ing back. This is the
+# aarch64 analogue of delivering SIGSEGV and reaping the process.
+# ---------------------------------------------------------------------------
+
+# Materialise a deliberately-faulting EL0 routine into USER_CODE_BASE:
+#   x1 = FAULT_VA (an EL1-only RAM address); ldr x0, [x1]  -> Data Abort.
+# The load never completes; control traps to EL1 and never returns to this code.
+def arm64_build_faulting_routine() -> int64:
+    a: uint64 = USER_CODE_BASE
+    a = _emit_load_imm64(a, cast[uint64](1), FAULT_VA)     # x1 = bad VA
+    # ldr x0, [x1]  = 0xF9400020 (LDR (immediate, unsigned offset 0), Xt=x0,
+    # Xn=x1). This load from an EL0-inaccessible page raises a Data Abort.
+    a = _emit_word(a, cast[uint64](0xF9400020))
+    # Should never be reached; emit a trap-shaped svc exit as a safety net so a
+    # miraculous non-fault still terminates cleanly rather than running off.
+    a = _emit_load_imm64(a, cast[uint64](0), cast[uint64](0))
+    a = _emit_load_imm64(a, cast[uint64](8), SYS_EXIT_NR)
+    a = _emit_word(a, cast[uint64](0xD4000001))            # svc #0
+    _dsb_ish()
+    _isb()
+    return 0
+
+
+# The page-fault handler proper. `is_instr` is 0 for a data abort, 1 for an
+# instruction abort. Reports the faulting VA + EL0 PC, latches the handled flag,
+# then terminates the task by launching Phase 5 (never returns to EL0). This is
+# the deliberate design: a faulting EL0 task is reaped, the kernel survives.
+def arm64_handle_el0_fault(esr: uint64, is_instr: uint64) -> int64:
+    far: uint64 = cast[uint64](_mrs_far_el1())
+    elr: uint64 = cast[uint64](_mrs_elr_el1())
+
+    if is_instr != 0:
+        k0: Ptr[char] = "[arm64] EL0 instruction abort\n"
+        _uart_puts(k0)
+    else:
+        k1: Ptr[char] = "[arm64] EL0 data abort\n"
+        _uart_puts(k1)
+
+    famsg: Ptr[char] = "[arm64] fault VA (FAR_EL1)="
+    _uart_puts(famsg)
+    _uart_puthex(far)
+    nl0: Ptr[char] = "\n"
+    _uart_puts(nl0)
+
+    pcmsg: Ptr[char] = "[arm64] fault PC (ELR_EL1)="
+    _uart_puts(pcmsg)
+    _uart_puthex(elr)
+    nl1: Ptr[char] = "\n"
+    _uart_puts(nl1)
+
+    esrmsg: Ptr[char] = "[arm64] fault ESR_EL1="
+    _uart_puts(esrmsg)
+    _uart_puthex(esr)
+    nl2: Ptr[char] = "\n"
+    _uart_puts(nl2)
+
+    arm64_fault_handled = 1
+
+    term: Ptr[char] = "[arm64] EL0 task terminated; kernel survived\n"
+    _uart_puts(term)
+
+    pass_mark: Ptr[char] = "[arm64] EL0 page-fault OK\n"
+    _uart_puts(pass_mark)
+
+    # The faulting task is dead. Rather than ERET back into its faulting
+    # instruction, hand off to the next schedulable workload (Phase 5). Mask
+    # IRQs while we transition; arm64_start_tasks() never returns.
+    _msr_daifset(2)
+    arm64_start_tasks()
+    # Unreachable safety halt.
+    while True:
+        _wfi()
+    return 0
+
+
+# Build the deliberately-faulting EL0 task and ERET into it. The abort it raises
+# traps to arm64_sync_handler -> arm64_handle_el0_fault, which reports + reaps
+# it and never returns here. This is the Phase-6 entry point, invoked from the
+# Phase-4 exit hand-off so all three EL0 milestones run in one boot.
+def arm64_run_faulting_task() -> int64:
+    arm64_build_faulting_routine()
+
+    enter: Ptr[char] = "[arm64] launching faulting EL0 task\n"
+    _uart_puts(enter)
+
+    _msr_spsr_el1(SPSR_EL0T_DAIF)      # EL0t, IRQ/FIQ masked (deterministic)
+    _msr_elr_el1(USER_CODE_BASE)       # EL0 entry PC (the bad load)
+    _msr_sp_el0(USER_STACK_TOP)        # EL0 stack pointer
+    _isb()
+    _eret()                            # -> EL0; faults immediately, never returns
     return 0
 
 

@@ -1198,6 +1198,13 @@ class Arm64CodeGen:
         # Phase 4: ESR_EL1 carries the syndrome (EC field) of the trapped
         # synchronous exception so the Adder sync handler can recognise SVC.
         "_mrs_esr_el1":    "esr_el1",
+        # Phase 6: FAR_EL1 holds the faulting virtual address of a data/
+        # instruction abort taken from EL0, so the page-fault handler can
+        # report exactly which VA the user task touched before terminating it.
+        "_mrs_far_el1":    "far_el1",
+        # Phase 6: ELR_EL1 is read (not just written) so the fault handler can
+        # report the EL0 PC that faulted alongside the faulting data address.
+        "_mrs_elr_el1":    "elr_el1",
     }
     # name -> verbatim barrier / maintenance / wait instruction (no operands).
     _NULLARY_INTRINSICS = {
