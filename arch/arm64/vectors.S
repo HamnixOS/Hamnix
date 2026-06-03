@@ -56,7 +56,7 @@ arm64_vectors:
     .balign 0x80
     b       arm64_lower_sync_entry  /* Synchronous (0x400): EL0 `svc #0` */
     .balign 0x80
-    b       arm64_unhandled         /* IRQ (0x480) */
+    b       arm64_lower_irq_entry   /* IRQ (0x480): preempt running EL0 task */
     .balign 0x80
     b       arm64_unhandled         /* FIQ (0x500) */
     .balign 0x80
@@ -161,6 +161,98 @@ arm64_lower_sync_entry:
     ldp     x28, x29, [sp, #(16 * 14)]
     ldr     x30,      [sp, #(16 * 15)]
     add     sp, sp, #(16 * 16)
+    eret
+
+/*
+ * Lower-EL (EL0) IRQ entry — the Phase 5 PREEMPTIVE SCHEDULER path. While an
+ * EL0 task runs, each generic-timer IRQ traps here at EL1h. We save the FULL
+ * interrupted EL0 context (x0..x30 + SP_EL0 + ELR_EL1 + SPSR_EL1) into the
+ * *currently running* task's context block, hand that block to the Adder
+ * scheduler `arm64_sched_pick(cur_ctx)` which services the tick and returns the
+ * NEXT task's context block, then restore that task's full context and ERET
+ * into it. This is a real EL0<->EL0 context switch driven by the EL1 timer IRQ.
+ *
+ * Context block layout (8-byte slots, from base):
+ *   0..30 : x0..x30
+ *   31    : SP_EL0
+ *   32    : ELR_EL1  (resume PC)
+ *   33    : SPSR_EL1 (resume PSTATE)
+ *
+ * The address of the running task's context block is published by the kernel
+ * in the global `arm64_current_ctx` before it first erets to EL0; we read it
+ * here to know where to save. The scheduler returns the chosen next block and
+ * also updates `arm64_current_ctx` itself.
+ */
+arm64_lower_irq_entry:
+    /* Save x0..x30 into the current context block. We need two scratch regs
+     * (x0 as the block base, x1 to stage SP_EL0/ELR/SPSR) but must preserve
+     * the task's real x0/x1 — so first stash them on the kernel stack. */
+    sub     sp, sp, #16
+    stp     x0, x1, [sp]                 /* park task x0,x1 on kernel stack */
+
+    ldr     x0, =.Lglobal_arm64_current_ctx
+    ldr     x0, [x0]                     /* x0 = &cur_ctx (block base) */
+
+    /* Store x2..x30 directly (their live values are intact). */
+    stp     x2,  x3,  [x0, #(8 * 2)]
+    stp     x4,  x5,  [x0, #(8 * 4)]
+    stp     x6,  x7,  [x0, #(8 * 6)]
+    stp     x8,  x9,  [x0, #(8 * 8)]
+    stp     x10, x11, [x0, #(8 * 10)]
+    stp     x12, x13, [x0, #(8 * 12)]
+    stp     x14, x15, [x0, #(8 * 14)]
+    stp     x16, x17, [x0, #(8 * 16)]
+    stp     x18, x19, [x0, #(8 * 18)]
+    stp     x20, x21, [x0, #(8 * 20)]
+    stp     x22, x23, [x0, #(8 * 22)]
+    stp     x24, x25, [x0, #(8 * 24)]
+    stp     x26, x27, [x0, #(8 * 26)]
+    stp     x28, x29, [x0, #(8 * 28)]
+    str     x30,      [x0, #(8 * 30)]
+
+    /* Recover the task's real x0,x1 from the kernel stack and store them. */
+    ldp     x2, x3, [sp]                 /* x2=task x0, x3=task x1 */
+    add     sp, sp, #16
+    stp     x2, x3, [x0, #(8 * 0)]
+
+    /* Save SP_EL0, ELR_EL1, SPSR_EL1. */
+    mrs     x1, sp_el0
+    str     x1, [x0, #(8 * 31)]
+    mrs     x1, elr_el1
+    str     x1, [x0, #(8 * 32)]
+    mrs     x1, spsr_el1
+    str     x1, [x0, #(8 * 33)]
+
+    /* x0 already = &cur_ctx == arg0; call the Adder scheduler, which acks the
+     * IRQ, re-arms the timer, picks the next task, updates arm64_current_ctx,
+     * and returns the next task's context block base in x0. */
+    bl      arm64_sched_pick
+
+    /* x0 = &next_ctx. Restore SPSR/ELR/SP_EL0 first (x1 scratch). */
+    ldr     x1, [x0, #(8 * 33)]
+    msr     spsr_el1, x1
+    ldr     x1, [x0, #(8 * 32)]
+    msr     elr_el1, x1
+    ldr     x1, [x0, #(8 * 31)]
+    msr     sp_el0, x1
+
+    /* Restore x2..x30, then x0,x1 last (x0 is the block base until then). */
+    ldp     x2,  x3,  [x0, #(8 * 2)]
+    ldp     x4,  x5,  [x0, #(8 * 4)]
+    ldp     x6,  x7,  [x0, #(8 * 6)]
+    ldp     x8,  x9,  [x0, #(8 * 8)]
+    ldp     x10, x11, [x0, #(8 * 10)]
+    ldp     x12, x13, [x0, #(8 * 12)]
+    ldp     x14, x15, [x0, #(8 * 14)]
+    ldp     x16, x17, [x0, #(8 * 16)]
+    ldp     x18, x19, [x0, #(8 * 18)]
+    ldp     x20, x21, [x0, #(8 * 20)]
+    ldp     x22, x23, [x0, #(8 * 22)]
+    ldp     x24, x25, [x0, #(8 * 24)]
+    ldp     x26, x27, [x0, #(8 * 26)]
+    ldp     x28, x29, [x0, #(8 * 28)]
+    ldr     x30,      [x0, #(8 * 30)]
+    ldp     x0,  x1,  [x0, #(8 * 0)]
     eret
 
 /*

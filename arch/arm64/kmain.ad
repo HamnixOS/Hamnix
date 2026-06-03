@@ -450,8 +450,10 @@ def arm64_sync_handler(frame_ptr: Ptr[uint64]) -> int64:
     # Stash the return value into the x0 slot so eret resumes EL0 with x0 set.
     frame_ptr[0] = ret
 
-    # If EL0 asked to exit, don't return into it; halt the test deterministically
-    # with a PASS marker the test script greps for.
+    # If EL0 asked to exit, don't return into it. Emit the Phase-4 single-task
+    # PASS marker, then advance to Phase 5: launch the preemptively-scheduled
+    # two-task workload. arm64_start_tasks() erets to EL0 and never returns, so
+    # this exit-syscall service point becomes the hand-off from Phase 4 -> 5.
     if arm64_el0_exited != 0:
         if arm64_el0_exit_code == 0:
             passmsg: Ptr[char] = "[arm64] EL0 syscall OK\n"
@@ -459,7 +461,10 @@ def arm64_sync_handler(frame_ptr: Ptr[uint64]) -> int64:
         else:
             failmsg: Ptr[char] = "[arm64] EL0 exited nonzero\n"
             _uart_puts(failmsg)
+        # Mask IRQs while we transition, then launch Phase 5 (never returns).
         _msr_daifset(2)
+        arm64_start_tasks()
+        # Unreachable; safe halt if the launcher ever falls through.
         while True:
             _wfi()
     return 0
@@ -487,6 +492,218 @@ def arm64_enter_el0() -> int64:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Phase 5 — timer-driven PREEMPTIVE round-robin scheduling of two EL0 tasks.
+#
+# Two independent EL0 tasks each run an endless loop: write(1, marker, len) then
+# spin in a short busy-loop. Neither ever yields or exits. The EL1 generic-timer
+# IRQ fires periodically while a task runs; the "Lower EL using AArch64" IRQ
+# vector (arm64_lower_irq_entry in vectors.S) saves the running task's FULL
+# context (x0..x30 + SP_EL0 + ELR_EL1 + SPSR_EL1) into its context block, calls
+# the Adder scheduler arm64_sched_pick() — which services the timer and swaps
+# the current-task pointer to the OTHER task — and restores+erets into that
+# task. Each task therefore makes forward progress only because the kernel
+# preempts and round-robins it: a real EL0<->EL0 context switch on bare aarch64,
+# orchestrated from Adder.
+#
+# The .S IRQ stub finds the running task's context block via the global
+# `arm64_current_ctx`, which the scheduler keeps pointing at the live task.
+# ---------------------------------------------------------------------------
+
+# Two task code pages, message buffers and stacks — all inside the single EL0
+# RWX 2 MiB window (0x4020_0000 .. 0x403F_FFFF) granted by the L2 map.
+TASK0_CODE: uint64 = 0x40200000
+TASK1_CODE: uint64 = 0x40210000
+TASK0_MSG: uint64 = 0x40220000
+TASK1_MSG: uint64 = 0x40221000
+TASK0_STACK_TOP: uint64 = 0x40240000
+TASK1_STACK_TOP: uint64 = 0x40250000
+
+# Context blocks (34 x 8-byte slots: x0..x30, SP_EL0, ELR_EL1, SPSR_EL1). These
+# live in EL1-only RAM (outside the EL0 window) so a buggy/hostile EL0 task can
+# neither read nor scribble the saved scheduler state.
+TASK0_CTX: uint64 = 0x40104000
+TASK1_CTX: uint64 = 0x40105000
+
+CTX_X0: uint64 = 0          # slot index of x0
+CTX_SP_EL0: uint64 = 31
+CTX_ELR: uint64 = 32
+CTX_SPSR: uint64 = 33
+
+# SPSR to ERET into EL0t with IRQs ENABLED (so the timer can preempt the task):
+# mode EL0t (bits[3:0]=0), DAIF with only D|A|F masked and I (bit7) CLEAR.
+# 0x340 = D|A|F masked, IRQ unmasked, EL0t.
+SPSR_EL0T_IRQ: uint64 = 0x340
+
+# Published to the .S IRQ stub: address of the context block of the task that is
+# currently running at EL0. The scheduler swaps this on every tick.
+arm64_current_ctx: uint64 = 0
+
+# Round-robin bookkeeping: which task index is live, and how many preemptive
+# switches we have performed. After SWITCH_LIMIT switches (proving BOTH tasks
+# ran and were preempted multiple times) the scheduler prints PASS and halts.
+arm64_cur_task: int64 = 0
+arm64_switch_count: int64 = 0
+SWITCH_LIMIT: int64 = 8
+
+
+# Materialise a self-looping EL0 task into `code_base`:
+#   loop:
+#     x0 = 1; x1 = msg; x2 = len; x8 = 64 (write); svc #0
+#     x9 = busy; busy:  subs x9,x9,#1; b.ne busy
+#     b loop
+# The task never exits; only the preemptive timer IRQ moves control away. We
+# hand-emit the busy-loop and backward branch directly (the imm-builder already
+# exists for the syscall argument setup).
+def arm64_build_task(code_base: uint64, msg_base: uint64, msg_len: uint64) -> int64:
+    a: uint64 = code_base
+    loop_top: uint64 = a
+
+    a = _emit_load_imm64(a, cast[uint64](0), cast[uint64](1))      # x0 = 1 (fd)
+    a = _emit_load_imm64(a, cast[uint64](1), msg_base)             # x1 = msg ptr
+    a = _emit_load_imm64(a, cast[uint64](2), msg_len)             # x2 = len
+    a = _emit_load_imm64(a, cast[uint64](8), SYS_WRITE_NR)        # x8 = 64 (write)
+    a = _emit_word(a, cast[uint64](0xD4000001))                  # svc #0
+
+    # x9 = 0x40000 busy-loop counter (movz x9, #0x4, lsl #16). hw=1 => lsl #16.
+    movz_x9: uint64 = cast[uint64](0xD2800000) | (cast[uint64](1) << cast[uint64](21)) | (cast[uint64](4) << cast[uint64](5)) | cast[uint64](9)
+    a = _emit_word(a, movz_x9)
+    busy_top: uint64 = a
+    # subs x9, x9, #1   = 0xF1000529
+    a = _emit_word(a, cast[uint64](0xF1000529))
+    # b.ne busy_top : 0x54000001 | (imm19 << 5); imm19 = (busy_top - here) / 4.
+    bne_here: uint64 = a
+    off_busy: int64 = cast[int64](busy_top) - cast[int64](bne_here)
+    imm19_busy: uint64 = cast[uint64](off_busy >> 2) & cast[uint64](0x7FFFF)
+    a = _emit_word(a, cast[uint64](0x54000001) | (imm19_busy << cast[uint64](5)))
+
+    # b loop_top : 0x14000000 | imm26; imm26 = (loop_top - here) / 4.
+    b_here: uint64 = a
+    off_loop: int64 = cast[int64](loop_top) - cast[int64](b_here)
+    imm26: uint64 = cast[uint64](off_loop >> 2) & cast[uint64](0x3FFFFFF)
+    a = _emit_word(a, cast[uint64](0x14000000) | imm26)
+
+    _dsb_ish()
+    _isb()
+    return 0
+
+
+# Copy a NUL-terminated string into an arbitrary EL0 buffer; return byte length.
+def _copy_msg_to(s: Ptr[char], dst_base: uint64) -> uint64:
+    src: Ptr[uint8] = cast[Ptr[uint8]](s)
+    dst: Ptr[uint8] = cast[Ptr[uint8]](dst_base)
+    i: int64 = 0
+    while src[i] != 0:
+        dst[i] = src[i]
+        i = i + 1
+    return cast[uint64](i)
+
+
+# Initialise a task's context block so the very first ERET starts it cleanly at
+# its code entry, on its own stack, in EL0t with IRQs unmasked.
+def arm64_init_ctx(ctx_base: uint64, code_base: uint64, stack_top: uint64) -> int64:
+    ctx: Ptr[uint64] = cast[Ptr[uint64]](ctx_base)
+    i: int64 = 0
+    while i < 34:
+        ctx[i] = cast[uint64](0)
+        i = i + 1
+    ctx[CTX_SP_EL0] = stack_top
+    ctx[CTX_ELR] = code_base
+    ctx[CTX_SPSR] = SPSR_EL0T_IRQ
+    return 0
+
+
+# Scheduler — invoked from the EL0 IRQ vector (arm64_lower_irq_entry) with the
+# running task's context block already fully saved. We ack/re-arm the timer,
+# pick the OTHER task, publish it as current, and return its context block base
+# so the stub restores+erets into it. After SWITCH_LIMIT preemptions the test
+# has proven both tasks ran and were repeatedly preempted; print PASS and halt.
+def arm64_sched_pick(cur_ctx: uint64) -> uint64:
+    gicc_iar: Ptr[uint32] = cast[Ptr[uint32]](GICC_BASE + GICC_IAR)
+    gicc_eoir: Ptr[uint32] = cast[Ptr[uint32]](GICC_BASE + GICC_EOIR)
+
+    iar: uint32 = gicc_iar[0]
+    intid: uint64 = cast[uint64](iar) & cast[uint64](0x3FF)
+
+    if intid != VTIMER_INTID:
+        gicc_eoir[0] = iar                  # spurious: EOI, stay on this task
+        return cur_ctx
+
+    # Quiesce, re-arm, and EOI the timer.
+    _msr_cntv_ctl_el0(cast[uint64](0))
+    _msr_cntv_tval_el0(arm64_timer_period)
+    _msr_cntv_ctl_el0(cast[uint64](1))
+    gicc_eoir[0] = iar
+
+    arm64_switch_count = arm64_switch_count + 1
+    swmsg: Ptr[char] = "[arm64] preempt switch\n"
+    _uart_puts(swmsg)
+
+    if arm64_switch_count >= SWITCH_LIMIT:
+        passmsg: Ptr[char] = "[arm64] EL0 preempt sched OK\n"
+        _uart_puts(passmsg)
+        _msr_daifset(2)                     # mask IRQs and halt deterministically
+        while True:
+            _wfi()
+
+    # Round-robin to the other task.
+    next_ctx: uint64 = TASK1_CTX
+    if arm64_cur_task == 0:
+        arm64_cur_task = 1
+        next_ctx = TASK1_CTX
+    else:
+        arm64_cur_task = 0
+        next_ctx = TASK0_CTX
+
+    arm64_current_ctx = next_ctx            # publish for the next preemption
+    return next_ctx
+
+
+# Build both tasks + context blocks, then ERET into task 0 with the timer live.
+def arm64_start_tasks() -> int64:
+    # Mask EL1 IRQs while we build the tasks so a stray current-EL timer IRQ
+    # (left armed/unmasked by arm64_timer_init) cannot run the legacy handler
+    # mid-setup. We re-enable just before ERETing into EL0.
+    _msr_daifset(2)
+
+    # Clear the Phase-4 single-task exit latch: the two Phase-5 tasks only ever
+    # issue write() (nr 64) and must NOT re-enter the exit/hand-off path the svc
+    # dispatcher keys off arm64_el0_exited.
+    arm64_el0_exited = 0
+    arm64_el0_exit_code = -1
+
+    m0: Ptr[char] = "[task0] running on EL0\n"
+    m1: Ptr[char] = "[task1] running on EL0\n"
+    len0: uint64 = _copy_msg_to(m0, TASK0_MSG)
+    len1: uint64 = _copy_msg_to(m1, TASK1_MSG)
+
+    arm64_build_task(TASK0_CODE, TASK0_MSG, len0)
+    arm64_build_task(TASK1_CODE, TASK1_MSG, len1)
+
+    arm64_init_ctx(TASK0_CTX, TASK0_CODE, TASK0_STACK_TOP)
+    arm64_init_ctx(TASK1_CTX, TASK1_CODE, TASK1_STACK_TOP)
+
+    arm64_cur_task = 0
+    arm64_current_ctx = TASK0_CTX
+
+    enter: Ptr[char] = "[arm64] launching preemptive EL0 tasks\n"
+    _uart_puts(enter)
+
+    # Re-arm and enable the timer, unmask IRQs, then ERET into task 0 at EL0t
+    # WITH IRQs unmasked (via its context SPSR) so the timer preempts it.
+    _msr_cntv_tval_el0(arm64_timer_period)
+    _msr_cntv_ctl_el0(cast[uint64](1))
+    _msr_daifclr(2)                          # EL1 IRQs on
+
+    ctx: Ptr[uint64] = cast[Ptr[uint64]](TASK0_CTX)
+    _msr_spsr_el1(ctx[CTX_SPSR])
+    _msr_elr_el1(ctx[CTX_ELR])
+    _msr_sp_el0(ctx[CTX_SP_EL0])
+    _isb()
+    _eret()                                  # -> task 0 at EL0; never returns here
+    return 0
+
+
 def kmain() -> int64:
     banner: Ptr[char] = "HAMNIX aarch64 boot OK\n"
     _uart_puts(banner)
@@ -500,7 +717,10 @@ def kmain() -> int64:
     gic_msg: Ptr[char] = "[arm64] GICv2 + timer up\n"
     _uart_puts(gic_msg)
 
-    # Wait for timer IRQs; the handler halts after TICK_LIMIT ticks.
+    # Wait for timer IRQs. After TICK_LIMIT ticks the IRQ handler runs the
+    # Phase-4 single-task EL0 svc demo; on that task's exit() the syscall
+    # dispatcher hands off to Phase 5 (preemptive two-task scheduling). Control
+    # never returns here.
     while True:
         _wfi()
     return 0
