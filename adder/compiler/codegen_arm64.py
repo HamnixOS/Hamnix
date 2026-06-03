@@ -1310,6 +1310,19 @@ class Arm64CodeGen:
             self.emit(f"    {self._NULLARY_INTRINSICS[name]}")
             self.emit("    mov x0, #0")
             return True
+        if name == "_tlbi_aside1is":
+            # Phase 19: invalidate, inner-shareable, all stage-1 EL1&0 TLB entries
+            # that match a given ASID. The operand register carries the ASID in
+            # bits[63:48] (the rest RES0). Unlike the broad `tlbi vmalle1is`, this
+            # tears down ONLY one address space's translations — the maintenance a
+            # real per-ASID context switch performs when it recycles an ASID.
+            if len(args) != 1:
+                raise CodeGenError(
+                    "aarch64: _tlbi_aside1is expects exactly 1 argument")
+            self.gen_expr(args[0])               # ASID operand -> x0
+            self.emit("    tlbi aside1is, x0")
+            self.emit("    mov x0, #0")
+            return True
         if name == "_install_vbar":
             # Install the EL1 exception vector table from arch/arm64/vectors.S.
             # Its symbol `arm64_vectors` is 0x800-aligned (16 entries x 0x80);
