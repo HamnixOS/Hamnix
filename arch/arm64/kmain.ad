@@ -319,6 +319,27 @@ SMP_SENTINEL: uint64 = 0x40160008      # cross-core sentinel cell
 SMP_ENTERED: uint64 = 0x40160010       # set to 1 by the secondary on entry
 SMP_SENTINEL_VALUE: uint64 = 0x5A5A5A5A   # the value CPU1 publishes
 
+# Phase 12: SECONDARY-CORE SCHEDULING under a real cache-coherent spinlock. After
+# Phase 10 has proven CPU1 is alive, the secondary — instead of parking — spins
+# on a "go" flag and then runs genuine scheduler work: SMP_ITERS locked
+# increments of a SHARED counter, contending with CPU0 doing the same. The lock
+# is acquired with ldaxr/stlxr (acquire) and released with stlr (release), so the
+# read-modify-write of the shared counter cannot lose updates. The final count is
+# deterministic (2*SMP_ITERS) and is ONLY correct if both cores actually ran AND
+# the lock held — a missing core or a broken lock produces a wrong total. These
+# cells live in their own 4 KiB page, clear of the Phase-10 cells above.
+SMP_LOCK: uint64 = 0x40161000          # spinlock word (0 = free, 1 = held)
+SMP_SHARED_COUNT: uint64 = 0x40161008  # the contended shared counter
+SMP_GO: uint64 = 0x40161010            # primary sets 1 to release CPU1 into work
+SMP_CPU0_DONE: uint64 = 0x40161018     # CPU0 sets 1 when its iterations finish
+SMP_CPU1_DONE: uint64 = 0x40161020     # CPU1 sets 1 when its iterations finish
+SMP_CPU1_TOUCHED: uint64 = 0x40161028  # CPU1 stamps its MPIDR Aff0 under the lock
+# Per-core iteration count for the contended-increment demo. Each core performs
+# this many locked increments, so a correct run leaves the shared counter at
+# 2*SMP_ITERS. Chosen large enough that real contention occurs but the spin stays
+# short under TCG.
+SMP_ITERS: uint64 = 100000
+
 # The secondary core does NOT touch the shared PL011 UART: with both cores alive
 # and no UART lock, concurrent writes would interleave bytes mid-line. Instead
 # the secondary signals liveness purely through the shared memory cells above
@@ -1856,6 +1877,29 @@ def arm64_run_brk_demo() -> int64:
 # cell with a dmb ish so the primary observes it, then increments the online
 # counter. It deliberately does NOT touch the UART (no cross-core interleave);
 # the primary prints all markers. After signalling liveness it parks forever.
+def arm64_secondary_mmu_on() -> int64:
+    # Phase 12: enable the secondary core's MMU using the page tables the primary
+    # already built (L1_PGTABLE / L2_PGTABLE). We do NOT rewrite the tables — only
+    # program this core's translation sysregs and flip on SCTLR_EL1.{M,C,I}. After
+    # this the secondary sees RAM as Cacheable Inner-Shareable Normal memory,
+    # matching the primary, so cross-core ldaxr/stlxr exclusives are coherent.
+    _msr_mair_el1(cast[uint64](0xff04))
+    _msr_tcr_el1(cast[uint64](0x100003519))
+    _msr_ttbr0_el1(L1_PGTABLE)
+    _msr_ttbr1_el1(cast[uint64](0))
+    _dsb_ish()
+    _tlbi_vmalle1is()
+    _dsb_ish()
+    _isb()
+    sctlr: uint64 = cast[uint64](_mrs_sctlr_el1())
+    sctlr = sctlr | cast[uint64](0x1)      # M (MMU)
+    sctlr = sctlr | cast[uint64](0x4)      # C (data cache)
+    sctlr = sctlr | cast[uint64](0x1000)   # I (instruction cache)
+    _msr_sctlr_el1(sctlr)
+    _isb()
+    return 0
+
+
 def arm64_secondary_main() -> int64:
     # Record entry into the Adder body (the primary reports this for us).
     entered: Ptr[uint64] = cast[Ptr[uint64]](SMP_ENTERED)
@@ -1889,10 +1933,68 @@ def arm64_secondary_main() -> int64:
     online[0] = cur + cast[uint64](1)
     _dmb_ish()
 
-    # Liveness signalled. Wake any core spinning in wfe, then park forever.
+    # Liveness signalled. Wake any core spinning in wfe.
+    _sev()
+
+    # Phase 12: enable THIS core's MMU using the primary's already-built page
+    # tables BEFORE doing any ldaxr/stlxr work. The exclusive monitor used by the
+    # spinlock requires the lock word to be Cacheable Inner-Shareable Normal
+    # memory on every observer; with the MMU off the secondary would treat it as
+    # non-cacheable and the global monitor would not be reliable across cores.
+    # Turning the secondary's MMU on (same tables as the primary) makes both cores
+    # see identical, inner-shareable cacheable attributes, so ldaxr/stlxr work.
+    arm64_secondary_mmu_on()
+
+    # Now the secondary runs REAL scheduler work.
+    # Wait until the primary publishes the "go" flag (so both cores start the
+    # contended loop together), then run SMP_ITERS locked increments against the
+    # shared counter — concurrently with CPU0 doing the same. Re-read the go cell
+    # through a dmb ish each spin so we observe the primary's publish.
+    go: Ptr[uint64] = cast[Ptr[uint64]](SMP_GO)
+    while True:
+        _dmb_ish()
+        if go[0] != cast[uint64](0):
+            break
+        _wfe()
+
+    # Stamp our own MPIDR Aff0 (1 on CPU1) under the lock, proving this core ran
+    # inside the critical section, then run the contended increments.
+    arm64_smp_worker(cast[uint64](1))
+
+    # Signal completion, wake the primary, then park forever.
+    done: Ptr[uint64] = cast[Ptr[uint64]](SMP_CPU1_DONE)
+    _dmb_ish()
+    done[0] = cast[uint64](1)
+    _dmb_ish()
     _sev()
     while True:
         _wfe()
+    return 0
+
+
+# Phase 12: the contended scheduler-work body run by BOTH cores. `core_id` is the
+# running core's MPIDR Aff0 (0 on the primary, 1 on the secondary). Each call
+# performs SMP_ITERS iterations of: acquire the shared spinlock (ldaxr/stlxr,
+# acquire), read-modify-write the SHARED counter, stamp the touch cell with this
+# core's id, release the lock (stlr, release). The acquire/release pair makes the
+# read-add-write atomic across cores, so no increment is lost; the final counter
+# (2*SMP_ITERS once both cores finish) is only correct if the lock truly held.
+def arm64_smp_worker(core_id: uint64) -> int64:
+    counter: Ptr[uint64] = cast[Ptr[uint64]](SMP_SHARED_COUNT)
+    touched: Ptr[uint64] = cast[Ptr[uint64]](SMP_CPU1_TOUCHED)
+    i: uint64 = 0
+    while i < SMP_ITERS:
+        _spin_lock(SMP_LOCK)
+        # ---- critical section: only one core here at a time ----
+        cur: uint64 = counter[0]
+        counter[0] = cur + cast[uint64](1)
+        # Stamp the touch cell so the primary can prove the secondary entered the
+        # critical section at least once (CPU1's id is 1; CPU0 leaves it alone so
+        # any nonzero value can only have come from the secondary).
+        if core_id != cast[uint64](0):
+            touched[0] = core_id
+        _spin_unlock(SMP_LOCK)
+        i = i + cast[uint64](1)
     return 0
 
 
@@ -2009,10 +2111,124 @@ def arm64_run_smp() -> int64:
         bad3: Ptr[char] = "[arm64] SMP bring-up FAIL\n"
         _uart_puts(bad3)
 
-    # Phase 10 complete. The secondary parks in WFE; the PRIMARY hands off to
-    # Phase 11 (EL0 signal delivery). IRQs stay masked (deterministic, no timer
-    # re-entry); arm64_run_signal_demo() halts after the Phase-11 PASS marker and
-    # never returns.
+    # Phase 10 complete: CPU1 is live. Hand off to Phase 12 (secondary-core
+    # scheduling under a real spinlock). The secondary is NOT parked yet — it is
+    # spinning on the Phase-12 "go" flag — so the primary drives the contended
+    # demo, then hands off to Phase 11. arm64_run_smp_sched() never returns.
+    arm64_run_smp_sched()
+    while True:
+        _wfi()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 12 — SECONDARY-CORE SCHEDULING under a cache-coherent spinlock.
+#
+# Phase 10 proved CPU1 is alive but then parked it. Phase 12 puts it to WORK: the
+# primary releases both cores into a contended loop where each performs SMP_ITERS
+# increments of a SHARED counter, every increment guarded by one spinlock taken
+# with ldaxr/stlxr (acquire) and freed with stlr (release). If both cores ran and
+# the lock held, the final counter is exactly 2*SMP_ITERS — a deterministic total
+# that is WRONG if either core failed to run or the lock dropped an update. The
+# primary also checks that CPU1 stamped its id inside a critical section, proving
+# the second core genuinely entered the lock. Only the primary touches the UART.
+# ---------------------------------------------------------------------------
+def arm64_run_smp_sched() -> int64:
+    intro: Ptr[char] = "[arm64] Phase 12: secondary-core scheduling under a spinlock\n"
+    _uart_puts(intro)
+
+    # Seed the Phase-12 shared cells. Lock free, counter zero, both done flags
+    # clear, touch cell clear. The go flag stays 0 until both sides are armed.
+    lock: Ptr[uint64] = cast[Ptr[uint64]](SMP_LOCK)
+    counter: Ptr[uint64] = cast[Ptr[uint64]](SMP_SHARED_COUNT)
+    go: Ptr[uint64] = cast[Ptr[uint64]](SMP_GO)
+    cpu0_done: Ptr[uint64] = cast[Ptr[uint64]](SMP_CPU0_DONE)
+    cpu1_done: Ptr[uint64] = cast[Ptr[uint64]](SMP_CPU1_DONE)
+    touched: Ptr[uint64] = cast[Ptr[uint64]](SMP_CPU1_TOUCHED)
+    lock[0] = cast[uint64](0)
+    counter[0] = cast[uint64](0)
+    cpu0_done[0] = cast[uint64](0)
+    cpu1_done[0] = cast[uint64](0)
+    touched[0] = cast[uint64](0)
+    _dsb_ish()
+
+    # Release both cores into the contended loop together. The secondary is
+    # spinning on this cell (with dmb ish); publish it and sev to wake its wfe.
+    go[0] = cast[uint64](1)
+    _dsb_ish()
+    _sev()
+
+    # The primary runs its OWN share of the work (core_id 0) contending with CPU1.
+    arm64_smp_worker(cast[uint64](0))
+    _dmb_ish()
+    cpu0_done[0] = cast[uint64](1)
+    _dmb_ish()
+    _sev()
+
+    # Wait for the secondary to finish its share. Bound the wait so a wedged core
+    # fails loudly instead of hanging.
+    spins: int64 = 0
+    seen_done: int64 = 0
+    while spins < 200000000:
+        _dmb_ish()
+        if cpu1_done[0] != cast[uint64](0):
+            seen_done = 1
+            break
+        spins = spins + 1
+
+    nl: Ptr[char] = "\n"
+
+    if seen_done == 0:
+        to: Ptr[char] = "[arm64] secondary did not finish its work (timeout)\n"
+        _uart_puts(to)
+        bad: Ptr[char] = "[arm64] SMP scheduling FAIL\n"
+        _uart_puts(bad)
+        while True:
+            _wfi()
+
+    bothmsg: Ptr[char] = "[arm64] both cores finished\n"
+    _uart_puts(bothmsg)
+
+    # Read the final shared count and the CPU1 touch stamp through a dmb ish so we
+    # observe every locked store from both cores.
+    _dmb_ish()
+    total: uint64 = counter[0]
+    stamp: uint64 = touched[0]
+
+    expected: uint64 = SMP_ITERS + SMP_ITERS
+
+    cmsg: Ptr[char] = "[arm64] shared counter -> "
+    _uart_puts(cmsg)
+    _uart_puthex(total)
+    _uart_puts(nl)
+    emsg: Ptr[char] = "[arm64] expected         -> "
+    _uart_puts(emsg)
+    _uart_puthex(expected)
+    _uart_puts(nl)
+    smsg: Ptr[char] = "[arm64] CPU1 touched lock -> "
+    _uart_puts(smsg)
+    _uart_puthex(stamp)
+    _uart_puts(nl)
+
+    # PASS iff the total is exactly 2*SMP_ITERS (no lost updates -> the lock held
+    # AND both cores ran) AND CPU1 stamped its id (the secondary entered the
+    # critical section, so it really executed under the shared lock).
+    if total == expected and stamp == cast[uint64](1):
+        ranmsg: Ptr[char] = "[arm64] CPU1 ran in scheduler\n"
+        _uart_puts(ranmsg)
+        heldmsg: Ptr[char] = "[arm64] spinlock held under contention\n"
+        _uart_puts(heldmsg)
+        okmsg: Ptr[char] = "[arm64] SMP scheduling OK\n"
+        _uart_puts(okmsg)
+    else:
+        failmsg: Ptr[char] = "[arm64] SMP scheduling FAIL\n"
+        _uart_puts(failmsg)
+        while True:
+            _wfi()
+
+    # Phase 12 complete. The secondary is now parked in WFE; the PRIMARY hands off
+    # to Phase 11 (EL0 signal delivery). Mask IRQs (deterministic, no timer
+    # re-entry); arm64_run_signal_demo() halts after the Phase-11 PASS marker.
     _msr_daifset(2)
     arm64_run_signal_demo()
     while True:

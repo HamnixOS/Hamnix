@@ -1213,6 +1213,10 @@ class Arm64CodeGen:
         # interrupted EL0 task's stack pointer when delivering a signal — it
         # pushes a signal frame below the live SP_EL0 and redirects there.
         "_mrs_sp_el0":     "sp_el0",
+        # Phase 12: MPIDR_EL1 identifies the running core (Aff0 in bits[7:0]).
+        # The secondary-core scheduling demo reads it so each core can stamp its
+        # own id and prove genuine cross-core execution under one shared lock.
+        "_mrs_mpidr_el1":  "mpidr_el1",
     }
     # name -> verbatim barrier / maintenance / wait instruction (no operands).
     _NULLARY_INTRINSICS = {
@@ -1299,6 +1303,44 @@ class Arm64CodeGen:
             self.pop("x1")                        # target_cpu
             self.pop("x0")                        # func_id
             self.emit("    hvc #0")
+            return True
+        if name == "_spin_lock":
+            # Phase 12: acquire a test-and-set spinlock at the uint64 address in
+            # the single argument, with ACQUIRE ordering. The lock word is 0 =
+            # free, 1 = held. We use the exclusive-monitor pair ldaxr/stlxr so the
+            # acquire is atomic and cache-coherent across cores; ldaxr's Acquire
+            # semantics fence later loads/stores in the critical section after the
+            # lock is taken. Spin (with wfe between failed tries, woken by the
+            # unlocker's sev) until we win the word.
+            if len(args) != 1:
+                raise CodeGenError(
+                    "aarch64: _spin_lock expects exactly 1 argument")
+            self.gen_expr(args[0])               # lock address -> x0
+            self.emit("    mov x1, #1")          # value to write (held)
+            self.emit("1:")
+            self.emit("    ldaxr x2, [x0]")      # load-acquire current owner
+            self.emit("    cbnz x2, 2f")         # already held -> wait
+            self.emit("    stlxr w3, x1, [x0]")  # try to store 1 (store-release)
+            self.emit("    cbnz w3, 1b")         # store failed -> retry
+            self.emit("    b 3f")                # got the lock
+            self.emit("2:")
+            self.emit("    wfe")                 # held: low-power wait for sev
+            self.emit("    b 1b")
+            self.emit("3:")
+            self.emit("    mov x0, #0")
+            return True
+        if name == "_spin_unlock":
+            # Phase 12: release the spinlock at the argument address with RELEASE
+            # ordering (stlr 0), so every store in the critical section is visible
+            # to the next acquirer before the lock reads free. Then sev to wake any
+            # core spinning in wfe inside _spin_lock.
+            if len(args) != 1:
+                raise CodeGenError(
+                    "aarch64: _spin_unlock expects exactly 1 argument")
+            self.gen_expr(args[0])               # lock address -> x0
+            self.emit("    stlr xzr, [x0]")      # store-release 0 = free
+            self.emit("    sev")                 # wake waiters
+            self.emit("    mov x0, #0")
             return True
         if name in ("_msr_daifclr", "_msr_daifset"):
             if len(args) != 1:
