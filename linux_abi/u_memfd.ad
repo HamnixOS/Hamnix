@@ -1,0 +1,327 @@
+# linux_abi/u_memfd.ad — Linux memfd_create(2) + file sealing for the
+# Linux-ABI surface.
+#
+# Hamnix's NATIVE model is Plan-9 files, not anonymous memory fds. But
+# real Linux software — Wayland/graphics clients passing shared buffers,
+# dconf, systemd, dbus, language runtimes — reaches for memfd_create(2)
+# plus fcntl(F_ADD_SEALS) to create an anonymous, growable, optionally
+# SEALABLE file backed by RAM. This module supplies that ABI to the
+# Linux shim ONLY. It lives in linux_abi/ (Layer 2); the native kernel
+# never links it.
+#
+# Backing store: a memfd is just a path-less tmpfs file. We do NOT invent
+# a new in-memory backing — fs/tmpfs.ad already chunks file storage,
+# grows on write, and is reachable through the FD_TMPFS_MARK fd machinery
+# in fs/vfs.ad. vfs_open_memfd() allocates one such anonymous slot and
+# binds it to a new fd; read/write/lseek/ftruncate then reuse the named-
+# tmpfs data path verbatim. Sealing is per-slot state on the TmpfsEntry
+# (seals + seal_allow), enforced inside tmpfs_write / tmpfs_ftruncate.
+#
+# Two ABI entry points:
+#   memfd_create(name, flags)        (x86_64 nr 319) -> umemfd_create
+#   fcntl(fd, F_ADD_SEALS, seals)    -> umemfd_add_seals  (via _u_fcntl)
+#   fcntl(fd, F_GET_SEALS)           -> umemfd_get_seals  (via _u_fcntl)
+#
+# Compiler-quirk note: Adder has a flat global symbol namespace across
+# merged modules, so every helper here is prefixed `umemfd_`/`_memfd_`
+# and every constant `MFD_`. Reserved identifiers (bytes/match/case/
+# char/bool/field/int8..uint64) are avoided as variable names.
+
+from kernel.printk.printk import (
+    printk0, printk1,
+)
+from mm.uaccess import (
+    strncpy_from_user,
+)
+from fs.vfs import (
+    vfs_open_memfd, vfs_fd_tmpfs_slot,
+    vfs_write, vfs_read, vfs_lseek, vfs_ftruncate, vfs_close,
+)
+from fs.tmpfs import (
+    tmpfs_add_seals, tmpfs_get_seals,
+)
+# §memfd self-test only: the boot:37.memfd hook runs in the bootstrap
+# task context, whose fd table is uninitialised. We mark slots free
+# before driving vfs_open_memfd, then restore — the same dance
+# do_pidfd_selftest performs. Not used by the syscall handlers above.
+from kernel.sched.core import (
+    TaskStruct, current_task, FD_CLOSED_MARK,
+)
+
+# memfd_create(2) flags (uapi/linux/memfd.h).
+MFD_CLOEXEC:        uint64 = 1        # 0x0001 — set close-on-exec on the fd
+MFD_ALLOW_SEALING:  uint64 = 2       # 0x0002 — seals may be added later
+MFD_HUGETLB:        uint64 = 4       # 0x0004 — hugetlbfs backing (unsupported)
+MFD_KNOWN_FLAGS:    uint64 = 7       # CLOEXEC|ALLOW_SEALING|HUGETLB
+
+# fcntl(2) sealing commands (uapi/linux/fcntl.h). Mirrored from fs/tmpfs.ad
+# (the seal bitmask itself lives there as F_SEAL_*); these are the fcntl
+# command numbers wired into _u_fcntl in u_syscalls.ad.
+F_ADD_SEALS_CMD:    uint64 = 1033    # 1024 + 9
+F_GET_SEALS_CMD:    uint64 = 1034    # 1024 + 10
+
+# Errnos (Linux negative-return convention).
+MEMFD_EINVAL:  int64 = -22
+MEMFD_EFAULT:  int64 = -14
+MEMFD_EBADF:   int64 = -9
+MEMFD_EPERM:   int64 = -1
+MEMFD_EBUSY:   int64 = -16
+
+# memfd_create's name is capped (Linux: NAME_MAX-len("memfd:") = 249).
+# We cap the copied label well within the tmpfs component limit; the
+# label is cosmetic (only /proc/<pid>/fd display uses it).
+MEMFD_NAME_MAX: uint64 = 64
+
+
+_memfd_name_buf: Array[64, uint8]    # scratch for the copied name label
+
+
+def umemfd_create(a0: uint64, a1: uint64, a2: uint64,
+                  a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # int memfd_create(const char *name, unsigned int flags)
+    #   a0 = name (user pointer, NUL-terminated)
+    #   a1 = flags (MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_HUGETLB)
+    #
+    # Returns a new fd on success, or a negative errno:
+    #   -EINVAL  unknown flag bit, or MFD_HUGETLB (not supported)
+    #   -EFAULT  name pointer is unreadable
+    #   -ENOSPC  tmpfs has no free slot  (propagated from vfs_open_memfd)
+    #   -EMFILE  the process fd table is full (propagated)
+    flags: uint64 = a1
+    # Reject unknown flags exactly like Linux's check_flags.
+    if (flags & ~cast[uint64](MFD_KNOWN_FLAGS)) != 0:
+        return MEMFD_EINVAL
+    # We do not back memfds with hugetlb pages.
+    if (flags & MFD_HUGETLB) != 0:
+        return MEMFD_EINVAL
+
+    # Copy the user name into a kernel label buffer (bounded, NUL-terminated
+    # by strncpy_from_user). A NULL/unreadable pointer -> EFAULT, matching
+    # Linux (which copies the name with strndup_user before allocating).
+    if a0 == 0:
+        return MEMFD_EFAULT
+    nlen: int64 = strncpy_from_user(cast[uint64](&_memfd_name_buf[0]),
+                                    a0, MEMFD_NAME_MAX)
+    if nlen < 0:
+        return MEMFD_EFAULT
+    # Ensure NUL-termination at the cap even if the user string was longer.
+    _memfd_name_buf[MEMFD_NAME_MAX - 1] = 0
+
+    allow: int32 = 0
+    if (flags & MFD_ALLOW_SEALING) != 0:
+        allow = 1
+
+    # MFD_CLOEXEC is accepted: Hamnix has no FD_CLOEXEC bookkeeping (exec
+    # preserves the fd table), so close-on-exec is a documented no-op —
+    # the same stance the rest of u_syscalls.ad takes for *_CLOEXEC.
+    fd: int32 = vfs_open_memfd(cast[Ptr[char]](&_memfd_name_buf[0]), allow)
+    return cast[int64](fd)
+
+
+def umemfd_add_seals(fd: int32, seals: uint64) -> int64:
+    # fcntl(fd, F_ADD_SEALS, seals): add seals to a memfd. Routed here
+    # from _u_fcntl. Resolves the fd to its tmpfs slot and delegates the
+    # rule enforcement (MFD_ALLOW_SEALING required, no-seal-after-SEAL,
+    # unknown-bit EINVAL, writable-mmap EBUSY) to tmpfs_add_seals.
+    #
+    # writable_refs is passed as 0: Hamnix has no per-file writable-mmap
+    # refcount today, so F_SEAL_WRITE can always be applied (the simpler
+    # "no writable refs" rule). DOCUMENTED LIMITATION: a Linux kernel
+    # returns EBUSY if the file currently has a writable MAP_SHARED
+    # mapping; here that case cannot arise from tracking, so we never
+    # EBUSY. The seal still blocks all subsequent write(2)/ftruncate.
+    slot: int32 = vfs_fd_tmpfs_slot(fd)
+    if slot < 0:
+        return MEMFD_EINVAL                  # not a memfd/tmpfs fd
+    rc: int32 = tmpfs_add_seals(slot, seals, 0)
+    return cast[int64](rc)
+
+
+def umemfd_get_seals(fd: int32) -> int64:
+    # fcntl(fd, F_GET_SEALS): return the current seal bitmask of a memfd,
+    # or -EINVAL if the fd is not a sealable (tmpfs) file. Routed here
+    # from _u_fcntl.
+    slot: int32 = vfs_fd_tmpfs_slot(fd)
+    if slot < 0:
+        return MEMFD_EINVAL
+    return tmpfs_get_seals(slot)
+
+
+# --- in-kernel self-test (boot:37.memfd) -----------------------------
+#
+# Exercises the memfd + sealing path end to end in boot context, driving
+# the same functions the syscall entry points call (vfs_open_memfd +
+# vfs_read/write/lseek/ftruncate + umemfd_add_seals/get_seals). Prints
+# "[memfd] PASS" only when every assertion holds; "[memfd] FAIL: ..."
+# (and returns early) on the first failure. Gated by init/main.ad on
+# the /etc/memfd-test marker.
+
+_memfd_st_src:  Array[32, uint8]     # write payload
+_memfd_st_dst:  Array[32, uint8]     # read-back buffer
+
+SEEK_SET_MEMFD: int32 = 0
+
+
+def _memfd_fill_payload():
+    # "memfd-rocks!" — 12 ASCII bytes, NUL-terminated to 13.
+    p: Ptr[uint8] = "memfd-rocks!"
+    i: uint64 = 0
+    while i < 13:
+        _memfd_st_src[i] = p[i]
+        i = i + 1
+
+
+def memfd_selftest():
+    # The boot:37.memfd hook runs in the bootstrap task, whose per-task
+    # fd table is UNINITIALISED (only create_user_task / kthread_create
+    # prime one). _alloc_fd then finds no FD_CLOSED_MARK slot and
+    # vfs_open_memfd returns -EMFILE. Mark slots 3..15 free before the
+    # body runs, snapshot + restore so nothing downstream sees a mutated
+    # table; slots 0..2 (stdio) are untouched. Same dance
+    # do_pidfd_selftest uses. The body has many early returns, so the
+    # restore is done here after it returns (not threaded through each).
+    mfd_boot_task: Ptr[TaskStruct] = current_task()
+    mfd_fd_save: Array[16, uint32]
+    mfd_fdi: uint64 = 3
+    while mfd_fdi < 16:
+        mfd_fd_save[mfd_fdi] = mfd_boot_task[0].fd_idx[mfd_fdi]
+        mfd_boot_task[0].fd_idx[mfd_fdi] = FD_CLOSED_MARK
+        mfd_fdi = mfd_fdi + 1
+    _memfd_selftest_body()
+    mfd_fdi = 3
+    while mfd_fdi < 16:
+        mfd_boot_task[0].fd_idx[mfd_fdi] = mfd_fd_save[mfd_fdi]
+        mfd_fdi = mfd_fdi + 1
+
+
+def _memfd_selftest_body():
+    printk0("[memfd] self-test start\n")
+    _memfd_fill_payload()
+
+    # --- (1) create a SEALABLE memfd, write 12 bytes, read them back ---
+    name1: Ptr[char] = "selftest"
+    fd1: int32 = vfs_open_memfd(name1, 1)             # MFD_ALLOW_SEALING
+    if fd1 < 0:
+        printk1("[memfd] FAIL: vfs_open_memfd err rc=%d\n",
+                cast[uint64](cast[int64](fd1)))
+        return
+    wn: int64 = vfs_write(fd1, &_memfd_st_src[0], 12)
+    if wn != 12:
+        printk0("[memfd] FAIL: short write to fresh memfd\n")
+        vfs_close(fd1)
+        return
+    # Rewind and read back, asserting byte-exact contents.
+    if vfs_lseek(fd1, 0, SEEK_SET_MEMFD) != 0:
+        printk0("[memfd] FAIL: lseek to 0 failed\n")
+        vfs_close(fd1)
+        return
+    rn: int64 = vfs_read(fd1, &_memfd_st_dst[0], 12)
+    if rn != 12:
+        printk0("[memfd] FAIL: short read-back from memfd\n")
+        vfs_close(fd1)
+        return
+    k: uint64 = 0
+    while k < 12:
+        if _memfd_st_dst[k] != _memfd_st_src[k]:
+            printk0("[memfd] FAIL: read-back bytes differ from written\n")
+            vfs_close(fd1)
+            return
+        k = k + 1
+    printk0("[memfd] PASS: write+read byte-exact (12 bytes)\n")
+
+    # --- (2) F_SEAL_WRITE then a subsequent write must EPERM -----------
+    sr: int64 = umemfd_add_seals(fd1, F_SEAL_WRITE)
+    if sr != 0:
+        printk0("[memfd] FAIL: F_SEAL_WRITE add was rejected\n")
+        vfs_close(fd1)
+        return
+    # Seek to EOF and try to append: F_SEAL_WRITE -> EPERM. tmpfs_write
+    # short-circuits a write-sealed file to 0, which vfs surfaces as 0
+    # bytes written — the write made no progress, exactly the refusal
+    # Linux signals via -EPERM at the syscall boundary.
+    if vfs_lseek(fd1, 0, SEEK_SET_MEMFD) != 0:
+        printk0("[memfd] FAIL: lseek before sealed write failed\n")
+        vfs_close(fd1)
+        return
+    wn2: int64 = vfs_write(fd1, &_memfd_st_src[0], 4)
+    if wn2 != 0:
+        printk0("[memfd] FAIL: write succeeded despite F_SEAL_WRITE\n")
+        vfs_close(fd1)
+        return
+    # F_GET_SEALS must report the write seal is in force.
+    gs: int64 = umemfd_get_seals(fd1)
+    if (gs & cast[int64](F_SEAL_WRITE)) == 0:
+        printk0("[memfd] FAIL: F_GET_SEALS missing F_SEAL_WRITE\n")
+        vfs_close(fd1)
+        return
+    printk0("[memfd] PASS: F_SEAL_WRITE blocks subsequent write (EPERM)\n")
+    vfs_close(fd1)
+
+    # --- (3) F_SEAL_GROW blocks growth (ftruncate larger + extend) -----
+    name2: Ptr[char] = "growtest"
+    fd2: int32 = vfs_open_memfd(name2, 1)             # MFD_ALLOW_SEALING
+    if fd2 < 0:
+        printk0("[memfd] FAIL: vfs_open_memfd (grow) error\n")
+        return
+    # Seed 8 bytes so the file has a non-zero size, then GROW-seal it.
+    if vfs_write(fd2, &_memfd_st_src[0], 8) != 8:
+        printk0("[memfd] FAIL: seeding grow-test memfd\n")
+        vfs_close(fd2)
+        return
+    if umemfd_add_seals(fd2, F_SEAL_GROW) != 0:
+        printk0("[memfd] FAIL: F_SEAL_GROW add rejected\n")
+        vfs_close(fd2)
+        return
+    # ftruncate to a LARGER size must EPERM (-1) under F_SEAL_GROW.
+    ft: int32 = vfs_ftruncate(fd2, 4096)
+    if ft != -1:
+        printk0("[memfd] FAIL: ftruncate grow not refused with EPERM\n")
+        vfs_close(fd2)
+        return
+    # An extending write past the current 8-byte size must not grow it:
+    # seek to offset 8 (EOF) and write — tmpfs_write refuses (0 bytes).
+    if vfs_lseek(fd2, 8, SEEK_SET_MEMFD) != 8:
+        printk0("[memfd] FAIL: lseek to EOF (grow) failed\n")
+        vfs_close(fd2)
+        return
+    gw: int64 = vfs_write(fd2, &_memfd_st_src[0], 4)
+    if gw != 0:
+        printk0("[memfd] FAIL: extending write grew a GROW-sealed memfd\n")
+        vfs_close(fd2)
+        return
+    printk0("[memfd] PASS: F_SEAL_GROW blocks ftruncate-grow + extend\n")
+    vfs_close(fd2)
+
+    # --- (4) sealing a NON-ALLOW_SEALING memfd must EPERM --------------
+    name3: Ptr[char] = "nosealtest"
+    fd3: int32 = vfs_open_memfd(name3, 0)             # NO MFD_ALLOW_SEALING
+    if fd3 < 0:
+        printk0("[memfd] FAIL: vfs_open_memfd (noseal) error\n")
+        return
+    nsr: int64 = umemfd_add_seals(fd3, F_SEAL_WRITE)
+    if nsr != cast[int64](MEMFD_EPERM):
+        printk0("[memfd] FAIL: seal on non-ALLOW_SEALING memfd not EPERM\n")
+        vfs_close(fd3)
+        return
+    printk0("[memfd] PASS: seal on non-ALLOW_SEALING memfd EPERMs\n")
+    vfs_close(fd3)
+
+    # --- (5) F_SEAL_SEAL then any further seal must EPERM --------------
+    name4: Ptr[char] = "sealsealtest"
+    fd4: int32 = vfs_open_memfd(name4, 1)             # MFD_ALLOW_SEALING
+    if fd4 < 0:
+        printk0("[memfd] FAIL: vfs_open_memfd (sealseal) error\n")
+        return
+    if umemfd_add_seals(fd4, F_SEAL_SEAL) != 0:
+        printk0("[memfd] FAIL: F_SEAL_SEAL add rejected\n")
+        vfs_close(fd4)
+        return
+    fsr: int64 = umemfd_add_seals(fd4, F_SEAL_GROW)
+    if fsr != cast[int64](MEMFD_EPERM):
+        printk0("[memfd] FAIL: seal after F_SEAL_SEAL not EPERM\n")
+        vfs_close(fd4)
+        return
+    printk0("[memfd] PASS: F_SEAL_SEAL forbids any further seal (EPERM)\n")
+    vfs_close(fd4)
+
+    printk0("[memfd] PASS\n")

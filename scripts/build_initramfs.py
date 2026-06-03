@@ -488,6 +488,14 @@ if os.environ.get("ENABLE_MQUEUE_TEST") == "1":
 if os.environ.get("ENABLE_PIDFD_TEST") == "1":
     FILES.append(("/etc/pidfd-test", b"1\n"))
 
+# memfd_create(2) + file-sealing self-test. scripts/test_memfd.sh sets
+# ENABLE_MEMFD_TEST=1 to plant /etc/memfd-test; init/main.ad at
+# boot:37.memfd detects the marker and runs memfd_selftest()
+# (linux_abi/u_memfd.ad), which exercises create/write/read byte-exact +
+# F_SEAL_WRITE/GROW/SEAL and the non-ALLOW_SEALING EPERM path.
+if os.environ.get("ENABLE_MEMFD_TEST") == "1":
+    FILES.append(("/etc/memfd-test", b"1\n"))
+
 # Pipe zero-copy I/O family (splice/tee/vmsplice) self-test.
 # scripts/test_splice.sh sets ENABLE_SPLICE_TEST=1 to plant
 # /etc/splice-test; init/main.ad at boot:37.splice detects the marker

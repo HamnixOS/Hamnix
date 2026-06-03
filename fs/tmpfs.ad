@@ -142,6 +142,16 @@ class TmpfsEntry:
                                       # shares. The alias only stores its
                                       # own name + parent_idx; size/data
                                       # reads dereference through link_to.
+    seals:      uint64                # §memfd: F_SEAL_* bitmask in force on
+                                      # this file. 0 for an ordinary tmpfs
+                                      # entry (no sealing). Set only on
+                                      # memfd-created anonymous files via
+                                      # fcntl(F_ADD_SEALS). Enforced by
+                                      # tmpfs_write / tmpfs_ftruncate.
+    seal_allow: uint64                # §memfd: 1 if this file was created
+                                      # with MFD_ALLOW_SEALING (seals may be
+                                      # added). 0 otherwise — F_ADD_SEALS
+                                      # EPERMs. Ordinary tmpfs files are 0.
     name:       Array[32, uint8]      # NUL-terminated path COMPONENT
 
 
@@ -325,6 +335,17 @@ TMPFS_EEXIST:  int32 = -17
 TMPFS_ENOTDIR: int32 = -20
 TMPFS_ENAMETOOLONG: int32 = -36
 TMPFS_ENOSPC:  int32 = -28
+TMPFS_EPERM:   int32 = -1
+TMPFS_EBUSY:   int32 = -16
+TMPFS_EINVAL:  int32 = -22
+
+# §memfd: file-sealing bitmask (linux <uapi/linux/fcntl.h>).
+F_SEAL_SEAL:   uint64 = 1            # 0x0001 — no further seals may be set
+F_SEAL_SHRINK: uint64 = 2           # 0x0002 — file may not be made smaller
+F_SEAL_GROW:   uint64 = 4           # 0x0004 — file may not be made larger
+F_SEAL_WRITE:  uint64 = 8           # 0x0008 — no writes at all
+F_SEAL_ALL:    uint64 = 15          # SEAL|SHRINK|GROW|WRITE (the set we
+                                    # implement; future seals OR in here)
 
 
 def _path_after_mount(name: Ptr[char]) -> int32:
@@ -990,13 +1011,35 @@ def tmpfs_write(slot: int32, src: Ptr[uint8], pos: uint64,
     # error (which is exactly what dpkg / apt already do).
     cslot: int32 = _tmpfs_canon(slot)
     su: uint64 = cast[uint64](cslot)
+    # §memfd: file seals gate the write. F_SEAL_WRITE forbids ALL writes;
+    # F_SEAL_GROW forbids any write that would extend the file past its
+    # current size. Both surface as -EPERM via the negative-return contract
+    # tmpfs_write_checked exposes to the syscall layer; the legacy
+    # tmpfs_write entry point just short-circuits to 0 (a short-write that
+    # the caller's _write_full loop reports as a failure). Ordinary tmpfs
+    # files carry seals == 0 so this is a no-op for them.
+    sealb: uint64 = tmpfs_table[su].seals
+    if (sealb & F_SEAL_WRITE) != 0:
+        return 0
     cap: uint64 = TMPFS_FILE_CAP
     if pos >= cap:
         return 0
+    if (sealb & F_SEAL_GROW) != 0:
+        # A grow-sealed file may only be written within its existing
+        # bounds. Refuse any write whose start is already past EOF, and
+        # clamp a straddling write to the current size below.
+        if pos >= tmpfs_table[su].size:
+            return 0
     remaining: uint64 = cap - pos
     take: uint64 = count
     if take > remaining:
         take = remaining
+    if (sealb & F_SEAL_GROW) != 0:
+        # Clamp a straddling write so it never extends the file: only the
+        # bytes that land within [pos, current_size) are written.
+        cur_size: uint64 = tmpfs_table[su].size
+        if pos + take > cur_size:
+            take = cur_size - pos
     out_done: uint64 = 0
     cur_pos: uint64 = pos
     while out_done < take:
@@ -1246,3 +1289,172 @@ def tmpfs_var_skeleton_init():
     # commitment yet).
     _skel_mkdir("/var/log")
     _skel_mkdir("/var/log/svc")
+
+
+# --- §memfd: anonymous tmpfs files + file sealing ---------------------
+#
+# A memfd is a tmpfs file with NO path: it lives in a slot but its
+# parent_idx is -1 and it is not reachable through name resolution
+# (_resolve_full never visits it because no directory lists it as a
+# child). The fd returned by memfd_create(2) holds the slot index in
+# the per-fd FD_TMPFS_MARK record, so read/write/lseek/ftruncate all
+# reuse the existing tmpfs data path. When the last fd closes, the slot
+# is released via tmpfs_release_anon (memfds have no link count to walk).
+#
+# Sealing is per-slot state (TmpfsEntry.seals + .seal_allow), enforced
+# inside tmpfs_write (F_SEAL_WRITE / F_SEAL_GROW) and tmpfs_ftruncate
+# (F_SEAL_SHRINK / F_SEAL_GROW). fcntl(F_ADD_SEALS / F_GET_SEALS) routes
+# through tmpfs_add_seals / tmpfs_get_seals.
+
+def tmpfs_create_anon(name: Ptr[char], allow_sealing: int32) -> int32:
+    # Allocate a fresh anonymous (path-less) tmpfs FILE slot for a memfd.
+    # `name` is a short display label (memfd_create's name arg, prefixed
+    # "memfd:" by Linux for /proc/<pid>/fd) copied into the slot's name
+    # field truncated to TMPFS_NAME_LEN-1. `allow_sealing` != 0 records
+    # MFD_ALLOW_SEALING so F_ADD_SEALS is permitted later.
+    # Returns the slot index, or TMPFS_ENOSPC (-28) if no slot is free.
+    _tmpfs_ensure_root()
+    slot: int32 = _tmpfs_find_free_slot()
+    if slot < 0:
+        return TMPFS_ENOSPC
+    su: uint64 = cast[uint64](slot)
+    # Copy the label (single component, truncated). memfds never path-
+    # resolve, so this is purely cosmetic for /proc.
+    i: uint64 = 0
+    while i < TMPFS_NAME_LEN - 1:
+        c: uint8 = cast[Ptr[uint8]](name)[i]
+        if c == 0:
+            break
+        tmpfs_table[su].name[i] = c
+        i = i + 1
+    tmpfs_table[su].name[i]    = 0
+    tmpfs_table[su].used       = 1
+    tmpfs_table[su].kind       = TMPFS_KIND_FILE
+    tmpfs_table[su].parent_idx = -1               # anonymous: no parent dir
+    tmpfs_table[su].size       = 0
+    tmpfs_table[su].nlink      = 1
+    tmpfs_table[su].link_to    = -1
+    tmpfs_table[su].seals      = 0
+    tmpfs_table[su].seal_allow = 0
+    if allow_sealing != 0:
+        tmpfs_table[su].seal_allow = 1
+    # NOTE: .data may carry a stale chunk-table from a prior occupant of
+    # this slot; the write path reuses or overwrites it, and size==0 means
+    # a read sees nothing until a write extends the file. Free any stale
+    # storage so a fresh memfd starts genuinely empty.
+    _tmpfs_free_storage(su)
+    return slot
+
+
+def tmpfs_release_anon(slot: int32):
+    # Release an anonymous memfd slot when its last fd closes. Frees the
+    # chunk chain and retires the slot. Safe to call on a non-anon slot
+    # too, but only the memfd close path uses it.
+    if slot < 0:
+        return
+    su: uint64 = cast[uint64](slot)
+    if su >= TMPFS_MAX_FILES:
+        return
+    if tmpfs_table[su].used == 0:
+        return
+    _tmpfs_free_storage(su)
+    tmpfs_table[su].used       = 0
+    tmpfs_table[su].size       = 0
+    tmpfs_table[su].link_to    = -1
+    tmpfs_table[su].seals      = 0
+    tmpfs_table[su].seal_allow = 0
+    tmpfs_table[su].name[0]    = 0
+
+
+def tmpfs_get_seals(slot: int32) -> int64:
+    # F_GET_SEALS: return the current seal bitmask for `slot`, or
+    # TMPFS_EINVAL (-22) for an invalid/retired slot.
+    if slot < 0:
+        return cast[int64](TMPFS_EINVAL)
+    su: uint64 = cast[uint64](slot)
+    if su >= TMPFS_MAX_FILES or tmpfs_table[su].used == 0:
+        return cast[int64](TMPFS_EINVAL)
+    return cast[int64](tmpfs_table[cast[uint64](_tmpfs_canon(slot))].seals)
+
+
+def tmpfs_add_seals(slot: int32, new_seals: uint64,
+                    writable_refs: int32) -> int32:
+    # F_ADD_SEALS: OR `new_seals` into the file's seal set, enforcing the
+    # Linux rules:
+    #   - file must have been created with MFD_ALLOW_SEALING  -> else EPERM
+    #   - F_SEAL_SEAL already set forbids any further seal     -> EPERM
+    #   - only recognised seal bits may be set                 -> else EINVAL
+    #   - adding F_SEAL_WRITE while writable refs (mmaps) exist -> EBUSY
+    # Returns 0 on success. `writable_refs` is the count of writable
+    # mmaps on the file; Hamnix has no per-file mmap-writable tracking
+    # yet, so the syscall layer passes 0 and we enforce the simpler
+    # "no writable refs" rule (always satisfiable) — documented below.
+    if slot < 0:
+        return TMPFS_EINVAL
+    cu: uint64 = cast[uint64](_tmpfs_canon(slot))
+    if cu >= TMPFS_MAX_FILES or tmpfs_table[cu].used == 0:
+        return TMPFS_EINVAL
+    if tmpfs_table[cu].seal_allow == 0:
+        return TMPFS_EPERM                        # no MFD_ALLOW_SEALING
+    if (new_seals & ~cast[uint64](F_SEAL_ALL)) != 0:
+        return TMPFS_EINVAL                       # unknown seal bit
+    if (tmpfs_table[cu].seals & F_SEAL_SEAL) != 0:
+        return TMPFS_EPERM                        # already fully sealed
+    if (new_seals & F_SEAL_WRITE) != 0:
+        if writable_refs != 0:
+            return TMPFS_EBUSY                     # live writable mmap
+    tmpfs_table[cu].seals = tmpfs_table[cu].seals | new_seals
+    return 0
+
+
+def tmpfs_ftruncate(slot: int32, length: uint64) -> int32:
+    # ftruncate(2) on a tmpfs (incl. memfd) file. Sets the file size to
+    # exactly `length`, enforcing seals:
+    #   - F_SEAL_WRITE  : any size change is a write -> EPERM
+    #   - F_SEAL_SHRINK : refuse length < current size -> EPERM
+    #   - F_SEAL_GROW   : refuse length > current size -> EPERM
+    # Growing zero-fills (reads of unallocated chunks already return
+    # zeros). Shrinking frees no chunks here (the slot is RAM-cheap and
+    # reclaimed wholesale on close); it just lowers the logical size so
+    # reads stop early. Returns 0 on success.
+    if slot < 0:
+        return TMPFS_EINVAL
+    cu: uint64 = cast[uint64](_tmpfs_canon(slot))
+    if cu >= TMPFS_MAX_FILES or tmpfs_table[cu].used == 0:
+        return TMPFS_EINVAL
+    if tmpfs_table[cu].kind != TMPFS_KIND_FILE:
+        return TMPFS_EINVAL
+    if length > TMPFS_FILE_CAP:
+        return TMPFS_EINVAL
+    sealb: uint64 = tmpfs_table[cu].seals
+    cur: uint64 = tmpfs_table[cu].size
+    if length != cur:
+        if (sealb & F_SEAL_WRITE) != 0:
+            return TMPFS_EPERM
+    if length < cur:
+        if (sealb & F_SEAL_SHRINK) != 0:
+            return TMPFS_EPERM
+    if length > cur:
+        if (sealb & F_SEAL_GROW) != 0:
+            return TMPFS_EPERM
+    tmpfs_table[cu].size = length
+    return 0
+
+
+def tmpfs_is_anon(slot: int32) -> int32:
+    # Return 1 if `slot` is a live anonymous memfd file (parent_idx == -1,
+    # not one of the two reserved synthetic roots). Used by vfs_close to
+    # decide whether closing an FD_TMPFS_MARK fd should reclaim the slot
+    # (memfds: yes; named /tmp or /var files: no, they persist by path).
+    if slot < 0:
+        return 0
+    su: uint64 = cast[uint64](slot)
+    if su >= TMPFS_MAX_FILES:
+        return 0
+    if su == TMPFS_ROOT_SLOT or su == TMPFS_VAR_SLOT:
+        return 0
+    if tmpfs_table[su].used == 0:
+        return 0
+    if tmpfs_table[su].parent_idx == -1:
+        return 1
+    return 0
