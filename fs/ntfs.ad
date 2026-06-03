@@ -1,0 +1,934 @@
+# fs/ntfs.ad
+#
+# Read-only NTFS filesystem reader.
+#
+# WHY: NTFS is the on-disk filesystem of every Windows install and the
+# format of countless external drives, USB sticks and disk images that
+# arrive at a machine pre-formatted. A Linux/Unix competitor must be
+# able to mount such media read-only and pull data off it. Hamnix
+# already reads ext4/FAT/exFAT/squashfs/ISO9660; NTFS closes the last
+# big consumer-filesystem gap on the read side.
+#
+# SCOPE (mirrors fs/iso9660.ad's read-only, single-mount, .bss-scratch
+# shape — no per-call kmalloc, no reentrancy, read path only; NTFS
+# writes are out of scope by design here):
+#
+#   ntfs_mount(dev_slot)                         -> int32
+#   ntfs_lookup(path, out_ref, out_size, isdir)  -> int32  (path -> MFT ref)
+#   ntfs_read(mft_ref, offset, buf, len)         -> int64  ($DATA bytes)
+#   ntfs_readdir(dir_ref, cb, ctx)               -> int32  (enumerate a dir)
+#
+# ON-DISK MODEL
+#   * The volume starts with the BOOT SECTOR / BPB. We read:
+#       bytes/sector            (offset 0x0B, u16)
+#       sectors/cluster         (offset 0x0D, u8)
+#       MFT cluster (LCN)       (offset 0x30, u64)
+#       clusters-per-MFT-record (offset 0x40, SIGNED i8: a negative
+#                                value v means the record is 2^|v| BYTES;
+#                                a positive value means v clusters)
+#       clusters-per-INDX-block (offset 0x44, SIGNED i8, same encoding)
+#   * The Master File Table ($MFT) is itself a file: a run of FILE
+#     records (typically 1024 bytes each). FILE record N describes the
+#     file/dir with MFT reference N. The $MFT's own $DATA attribute
+#     (record 0) gives the runlist that maps MFT record numbers to
+#     on-disk clusters, so the MFT need not be contiguous. We decode it
+#     at mount and use it for every subsequent record fetch.
+#   * Each FILE record carries an Update Sequence Number (USN) "fixup"
+#     array: the last 2 bytes of every 512-byte device sector inside the
+#     record are stolen for the USN and the real values are stashed in
+#     the fixup array at the record's start. We must SWAP them back
+#     before trusting the record bytes. INDX index blocks carry the same
+#     fixup.
+#   * A FILE record is a header followed by a stream of ATTRIBUTES, each
+#     a common header (type, length, resident flag, name) plus a body.
+#     RESIDENT attributes store their data inline in the record;
+#     NON-RESIDENT attributes store a "runlist" (data runs) that map
+#     virtual cluster numbers (VCN) to logical cluster numbers (LCN)
+#     using a compact signed-delta encoding.
+#   * Attributes we parse:
+#       0x10 $STANDARD_INFORMATION  (mode/time — we skip, name+size suffice)
+#       0x30 $FILE_NAME             (name + allocated/real size)
+#       0x80 $DATA                  (file contents; resident or non-resident)
+#       0x90 $INDEX_ROOT           (resident directory index, small dirs)
+#       0xA0 $INDEX_ALLOCATION     (non-resident INDX blocks, large dirs)
+#   * A directory's children are INDEX ENTRIES sorted by $FILE_NAME. A
+#     small directory keeps them all inside $INDEX_ROOT; a large one
+#     spills into INDX blocks pointed at by $INDEX_ALLOCATION (each INDX
+#     block has its OWN fixup). The INDEX_ROOT node's "has sub-node" flag
+#     tells us to walk the INDX blocks; we walk both.
+#
+# RUNLIST DECODE
+#   A runlist is a sequence of runs. Each run begins with a header byte:
+#   low nibble = #bytes of the run LENGTH field, high nibble = #bytes of
+#   the LCN-DELTA field. A zero header byte ends the list. The length is
+#   an unsigned little-endian integer (in clusters); the delta is a
+#   SIGNED little-endian integer added to the running LCN (so runs can
+#   point backwards). A run with an offset field of zero length is a
+#   SPARSE hole (we treat as zero-filled). This lets a file span many
+#   non-contiguous runs / be larger than one cluster.
+#
+# UTF-16 NOTE: NTFS names are UTF-16LE. We fold to bytes by taking the
+# low byte of each code unit (ASCII-faithful, which covers test/most
+# filenames); a high byte is surfaced verbatim. Case-insensitive NTFS
+# matching is approximated with an ASCII case-fold so "HELLO.TXT" and
+# "hello.txt" both resolve — sufficient for read access.
+
+from kernel.block.blk import blk_read_sectors, SECTOR_SIZE
+from kernel.printk.printk import printk0, printk1, printk2
+
+
+# --- constants --------------------------------------------------------
+
+NTFS_MFT_RECORD_DEFAULT: uint64 = 1024     # typical FILE record size
+
+# Attribute type codes.
+NTFS_AT_STANDARD_INFO: uint32 = 0x10
+NTFS_AT_FILE_NAME:     uint32 = 0x30
+NTFS_AT_DATA:          uint32 = 0x80
+NTFS_AT_INDEX_ROOT:    uint32 = 0x90
+NTFS_AT_INDEX_ALLOC:   uint32 = 0xA0
+NTFS_AT_END:           uint32 = 0xFFFFFFFF
+
+# FILE record header flags.
+NTFS_FILE_IN_USE:      uint16 = 0x0001
+NTFS_FILE_IS_DIR:      uint16 = 0x0002
+
+# Index entry flags.
+NTFS_IE_HAS_SUBNODE:   uint16 = 0x0001
+NTFS_IE_LAST:          uint16 = 0x0002
+
+# Scratch sizing for the single-mount state.
+NTFS_MAX_NAME:         uint64 = 256
+NTFS_MAX_RUNS:         uint64 = 64        # runs in the $MFT runlist
+NTFS_MAX_FILE_RUNS:    uint64 = 64        # runs in a file/index runlist
+
+
+# --- mount-time state (single mount only) -----------------------------
+
+ntfs_dev_slot:      int32  = -1
+ntfs_bytes_per_sec: uint64 = 512
+ntfs_sec_per_clus:  uint64 = 8
+ntfs_cluster_size:  uint64 = 4096
+ntfs_mft_lcn:       uint64 = 0
+ntfs_mft_rec_size:  uint64 = 1024
+ntfs_indx_size:     uint64 = 4096
+
+# Decoded $MFT runlist: maps MFT record bytes -> device bytes. Stored as
+# parallel arrays of (start VCN, LCN, length-in-clusters).
+ntfs_mft_run_vcn:   Array[64, uint64]
+ntfs_mft_run_lcn:   Array[64, uint64]
+ntfs_mft_run_len:   Array[64, uint64]
+ntfs_mft_run_count: uint64 = 0
+
+# Scratch buffers (module-scope per the Adder large-array quirk).
+ntfs_sector_buf:    Array[512, uint8]     # one hardware sector
+ntfs_rec_buf:       Array[4096, uint8]    # one FILE record (post-fixup)
+ntfs_indx_buf:      Array[8192, uint8]    # one INDX block (post-fixup)
+ntfs_name_buf:      Array[256, uint8]     # folded UTF-16 -> bytes name
+
+# A file/index runlist decoded on demand (single in-flight at a time;
+# callers consume it before the next decode, matching iso's scratch model).
+ntfs_run_vcn:       Array[64, uint64]
+ntfs_run_lcn:       Array[64, uint64]
+ntfs_run_len:       Array[64, uint64]
+ntfs_run_sparse:    Array[64, int32]
+ntfs_run_count:     uint64 = 0
+
+
+# --- little-endian readers --------------------------------------------
+
+def _ntfs_rd_u16(p: Ptr[uint8]) -> uint16:
+    return cast[uint16](p[0]) | (cast[uint16](p[1]) << 8)
+
+
+def _ntfs_rd_u32(p: Ptr[uint8]) -> uint32:
+    return cast[uint32](p[0]) \
+        | (cast[uint32](p[1]) << 8) \
+        | (cast[uint32](p[2]) << 16) \
+        | (cast[uint32](p[3]) << 24)
+
+
+def _ntfs_rd_u64(p: Ptr[uint8]) -> uint64:
+    lo: uint64 = cast[uint64](_ntfs_rd_u32(p))
+    hi: uint64 = cast[uint64](_ntfs_rd_u32(
+        cast[Ptr[uint8]](cast[uint64](p) + 4)))
+    return lo | (hi << 32)
+
+
+# --- raw device read at an arbitrary byte offset ----------------------
+#
+# Byte-granular reads layered over the 512-byte block layer, exactly as
+# fs/iso9660.ad does. `buf` must hold `len` bytes.
+
+def ntfs_dev_read(offset: uint64, buf: Ptr[uint8], len: uint64) -> int32:
+    if len == 0:
+        return 0
+    start_lba: uint64 = offset / SECTOR_SIZE
+    skew:      uint64 = offset % SECTOR_SIZE
+    produced:  uint64 = 0
+    lba:       uint64 = start_lba
+    while produced < len:
+        rc: int32 = blk_read_sectors(ntfs_dev_slot, lba, 1,
+                                     &ntfs_sector_buf[0])
+        if rc != 0:
+            return -1
+        avail: uint64 = SECTOR_SIZE - skew
+        want:  uint64 = len - produced
+        n:     uint64 = avail
+        if want < n:
+            n = want
+        # byte-by-byte copy (no memcpy dependency; small slices)
+        di: uint64 = 0
+        dst: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](buf) + produced)
+        src: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](&ntfs_sector_buf[0]) + skew)
+        while di < n:
+            dst[di] = src[di]
+            di = di + 1
+        produced = produced + n
+        skew = 0
+        lba = lba + 1
+    return 0
+
+
+# --- USN fixup --------------------------------------------------------
+#
+# Apply the Update Sequence Array fixup IN PLACE on a record loaded into
+# `buf` (`rec_size` bytes). The header carries usa_off (u16 @4) and
+# usa_cnt (u16 @6). usa[0] is the USN; usa[1..usa_cnt-1] are the
+# original last-2-bytes of each 512-byte device sector. We restore them.
+# Returns 0 on success, -1 if the record looks malformed.
+
+def _ntfs_apply_fixup(buf: Ptr[uint8], rec_size: uint64) -> int32:
+    usa_off: uint64 = cast[uint64](_ntfs_rd_u16(
+        cast[Ptr[uint8]](cast[uint64](buf) + 4)))
+    usa_cnt: uint64 = cast[uint64](_ntfs_rd_u16(
+        cast[Ptr[uint8]](cast[uint64](buf) + 6)))
+    if usa_cnt == 0:
+        return 0
+    # usa_cnt includes the USN itself; (usa_cnt-1) sectors are covered.
+    sectors: uint64 = usa_cnt - 1
+    if (sectors * 512) > rec_size:
+        return -1
+    i: uint64 = 1
+    while i < usa_cnt:
+        # Original value lives at usa_off + i*2; destination is the last
+        # 2 bytes of sector (i-1).
+        src: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](buf) + usa_off + i * 2)
+        dst_off: uint64 = (i * 512) - 2
+        if dst_off + 1 < rec_size:
+            buf[dst_off]     = src[0]
+            buf[dst_off + 1] = src[1]
+        i = i + 1
+    return 0
+
+
+# --- runlist decode ---------------------------------------------------
+#
+# Decode a non-resident attribute's runlist starting at `rl` (bounded by
+# `rl_max` bytes) into the ntfs_run_* scratch arrays. Each run yields a
+# (start VCN, LCN, length-in-clusters, sparse) tuple. A sparse run (the
+# offset field absent => zero size) carries LCN 0 with sparse=1. Returns
+# the number of runs decoded (>=0), or -1 on overflow/malformed input.
+
+def _ntfs_decode_runlist(rl: Ptr[uint8], rl_max: uint64) -> int32:
+    pos:   uint64 = 0
+    vcn:   uint64 = 0
+    lcn:   int64  = 0
+    count: uint64 = 0
+    while pos < rl_max:
+        hdr: uint8 = rl[pos]
+        if hdr == 0:
+            pos = rl_max                          # terminator
+        else:
+            len_sz: uint64 = cast[uint64](hdr & 0x0F)
+            off_sz: uint64 = cast[uint64]((hdr >> 4) & 0x0F)
+            pos = pos + 1
+            if pos + len_sz + off_sz > rl_max:
+                return -1
+            # Run length: unsigned LE.
+            run_len: uint64 = 0
+            k: uint64 = 0
+            while k < len_sz:
+                run_len = run_len | (cast[uint64](rl[pos + k]) << (k * 8))
+                k = k + 1
+            pos = pos + len_sz
+            sparse: int32 = 0
+            if off_sz == 0:
+                sparse = 1                        # hole: no LCN delta
+            else:
+                # LCN delta: SIGNED LE; sign-extend from the top byte.
+                delta: int64 = 0
+                j: uint64 = 0
+                while j < off_sz:
+                    delta = delta | cast[int64](
+                        cast[uint64](rl[pos + j]) << (j * 8))
+                    j = j + 1
+                # Sign-extend if the high bit of the top byte is set.
+                top: uint8 = rl[pos + off_sz - 1]
+                if (top & 0x80) != 0:
+                    # Set all bits above the (off_sz*8) low bits.
+                    shift: uint64 = off_sz * 8
+                    if shift < 64:
+                        mask: int64 = cast[int64](cast[uint64](0xFFFFFFFFFFFFFFFF) << shift)
+                        delta = delta | mask
+                lcn = lcn + delta
+                pos = pos + off_sz
+            if count >= NTFS_MAX_FILE_RUNS:
+                return -1
+            ntfs_run_vcn[count]    = vcn
+            ntfs_run_len[count]    = run_len
+            ntfs_run_sparse[count] = sparse
+            if sparse == 1:
+                ntfs_run_lcn[count] = 0
+            else:
+                ntfs_run_lcn[count] = cast[uint64](lcn)
+            count = count + 1
+            vcn = vcn + run_len
+    ntfs_run_count = count
+    return cast[int32](count)
+
+
+# --- $MFT runlist read (mount-time) -----------------------------------
+#
+# Read FILE record 0 ($MFT) straight off the device using mft_lcn (it is
+# self-locating: its first cluster is at mft_lcn), apply fixup, find its
+# non-resident $DATA attribute and decode its runlist into the
+# ntfs_mft_run_* arrays. Every later MFT record fetch maps through this.
+
+def _ntfs_load_mft_runlist() -> int32:
+    base: uint64 = ntfs_mft_lcn * ntfs_cluster_size
+    if ntfs_dev_read(base, &ntfs_rec_buf[0], ntfs_mft_rec_size) != 0:
+        printk0("ntfs: $MFT record 0 read failed\n")
+        return -1
+    # Magic "FILE".
+    if ntfs_rec_buf[0] != 0x46 or ntfs_rec_buf[1] != 0x49 \
+            or ntfs_rec_buf[2] != 0x4C or ntfs_rec_buf[3] != 0x45:
+        printk0("ntfs: $MFT record 0 bad magic\n")
+        return -1
+    if _ntfs_apply_fixup(&ntfs_rec_buf[0], ntfs_mft_rec_size) != 0:
+        printk0("ntfs: $MFT record 0 fixup failed\n")
+        return -1
+    attr_off: uint64 = cast[uint64](_ntfs_rd_u16(
+        cast[Ptr[uint8]](cast[uint64](&ntfs_rec_buf[0]) + 0x14)))
+    p: uint64 = attr_off
+    while p + 4 <= ntfs_mft_rec_size:
+        a: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](&ntfs_rec_buf[0]) + p)
+        atype: uint32 = _ntfs_rd_u32(a)
+        if atype == NTFS_AT_END:
+            p = ntfs_mft_rec_size
+        else:
+            alen: uint64 = cast[uint64](_ntfs_rd_u32(
+                cast[Ptr[uint8]](cast[uint64](a) + 4)))
+            if alen == 0:
+                p = ntfs_mft_rec_size
+            else:
+                non_res: uint8 = a[8]
+                if atype == NTFS_AT_DATA and non_res != 0:
+                    rl_off: uint64 = cast[uint64](_ntfs_rd_u16(
+                        cast[Ptr[uint8]](cast[uint64](a) + 0x20)))
+                    if rl_off >= alen:
+                        return -1
+                    nc: int32 = _ntfs_decode_runlist(
+                        cast[Ptr[uint8]](cast[uint64](a) + rl_off),
+                        alen - rl_off)
+                    if nc < 0:
+                        printk0("ntfs: $MFT runlist decode failed\n")
+                        return -1
+                    # Copy the scratch runlist into the persistent $MFT
+                    # arrays.
+                    c: uint64 = 0
+                    while c < ntfs_run_count and c < NTFS_MAX_RUNS:
+                        ntfs_mft_run_vcn[c] = ntfs_run_vcn[c]
+                        ntfs_mft_run_lcn[c] = ntfs_run_lcn[c]
+                        ntfs_mft_run_len[c] = ntfs_run_len[c]
+                        c = c + 1
+                    ntfs_mft_run_count = c
+                    return 0
+                p = p + alen
+    printk0("ntfs: $MFT has no non-resident $DATA\n")
+    return -1
+
+
+# Map an MFT record number to its absolute device byte offset using the
+# decoded $MFT runlist. Returns the offset, or 0xFFFFFFFFFFFFFFFF on a
+# VCN outside any run (which never happens for a valid MFT).
+
+def _ntfs_mft_record_offset(rec_no: uint64) -> uint64:
+    rec_byte: uint64 = rec_no * ntfs_mft_rec_size
+    vcn:      uint64 = rec_byte / ntfs_cluster_size
+    in_clus:  uint64 = rec_byte % ntfs_cluster_size
+    i: uint64 = 0
+    while i < ntfs_mft_run_count:
+        start: uint64 = ntfs_mft_run_vcn[i]
+        end:   uint64 = start + ntfs_mft_run_len[i]
+        if vcn >= start and vcn < end:
+            lcn: uint64 = ntfs_mft_run_lcn[i] + (vcn - start)
+            return lcn * ntfs_cluster_size + in_clus
+        i = i + 1
+    return 0xFFFFFFFFFFFFFFFF
+
+
+# Load FILE record `rec_no` into ntfs_rec_buf, fixed-up. Returns 0 ok.
+
+def _ntfs_read_mft_record(rec_no: uint64) -> int32:
+    off: uint64 = _ntfs_mft_record_offset(rec_no)
+    if off == 0xFFFFFFFFFFFFFFFF:
+        return -1
+    if ntfs_dev_read(off, &ntfs_rec_buf[0], ntfs_mft_rec_size) != 0:
+        return -1
+    if ntfs_rec_buf[0] != 0x46 or ntfs_rec_buf[1] != 0x49 \
+            or ntfs_rec_buf[2] != 0x4C or ntfs_rec_buf[3] != 0x45:
+        return -1
+    if _ntfs_apply_fixup(&ntfs_rec_buf[0], ntfs_mft_rec_size) != 0:
+        return -1
+    return 0
+
+
+# --- mount: parse the boot sector / BPB -------------------------------
+
+def ntfs_mount(dev_slot: int32) -> int32:
+    ntfs_dev_slot = dev_slot
+    ntfs_mft_run_count = 0
+
+    # Boot sector is hardware sector 0.
+    if blk_read_sectors(ntfs_dev_slot, 0, 1, &ntfs_sector_buf[0]) != 0:
+        printk0("ntfs: boot sector read failed\n")
+        ntfs_dev_slot = -1
+        return -1
+    bp: Ptr[uint8] = &ntfs_sector_buf[0]
+    # OEM id at offset 3 must be "NTFS    ".
+    if bp[3] != 0x4E or bp[4] != 0x54 or bp[5] != 0x46 or bp[6] != 0x53:
+        printk0("ntfs: not an NTFS volume (bad OEM id)\n")
+        ntfs_dev_slot = -1
+        return -1
+
+    ntfs_bytes_per_sec = cast[uint64](_ntfs_rd_u16(
+        cast[Ptr[uint8]](cast[uint64](bp) + 0x0B)))
+    ntfs_sec_per_clus  = cast[uint64](bp[0x0D])
+    if ntfs_bytes_per_sec == 0 or ntfs_sec_per_clus == 0:
+        printk0("ntfs: degenerate BPB geometry\n")
+        ntfs_dev_slot = -1
+        return -1
+    ntfs_cluster_size = ntfs_bytes_per_sec * ntfs_sec_per_clus
+
+    ntfs_mft_lcn = _ntfs_rd_u64(
+        cast[Ptr[uint8]](cast[uint64](bp) + 0x30))
+
+    # clusters-per-MFT-record at 0x40, SIGNED. Negative => 2^|v| bytes.
+    cpr: int8 = cast[int8](bp[0x40])
+    if cast[int32](cpr) < 0:
+        shift: uint64 = cast[uint64](cast[int64](0 - cast[int32](cpr)))
+        ntfs_mft_rec_size = cast[uint64](1) << shift
+    else:
+        ntfs_mft_rec_size = cast[uint64](cast[int64](cast[int32](cpr))) \
+            * ntfs_cluster_size
+
+    # clusters-per-INDX-block at 0x44, same signed encoding.
+    cpi: int8 = cast[int8](bp[0x44])
+    if cast[int32](cpi) < 0:
+        ishift: uint64 = cast[uint64](cast[int64](0 - cast[int32](cpi)))
+        ntfs_indx_size = cast[uint64](1) << ishift
+    else:
+        ntfs_indx_size = cast[uint64](cast[int64](cast[int32](cpi))) \
+            * ntfs_cluster_size
+
+    if ntfs_mft_rec_size == 0 or ntfs_mft_rec_size > 4096:
+        printk0("ntfs: implausible MFT record size\n")
+        ntfs_dev_slot = -1
+        return -1
+
+    # Decode the $MFT's own runlist so we can read arbitrary records.
+    if _ntfs_load_mft_runlist() != 0:
+        ntfs_dev_slot = -1
+        return -1
+
+    printk2("ntfs: mounted; cluster=%d mft_rec=%d\n",
+            ntfs_cluster_size, ntfs_mft_rec_size)
+    return 0
+
+
+# --- attribute / file-name helpers ------------------------------------
+#
+# These operate on the FILE record currently in ntfs_rec_buf.
+
+# Find an attribute of type `want` (optionally the Nth, idx) in the
+# current record. Returns the attribute's byte offset within
+# ntfs_rec_buf, or 0xFFFFFFFFFFFFFFFF if absent. `idx` lets a caller
+# pick the 2nd, 3rd... attribute of a type (e.g. multiple $DATA).
+
+def _ntfs_find_attr(want: uint32, idx: uint64) -> uint64:
+    attr_off: uint64 = cast[uint64](_ntfs_rd_u16(
+        cast[Ptr[uint8]](cast[uint64](&ntfs_rec_buf[0]) + 0x14)))
+    p:    uint64 = attr_off
+    seen: uint64 = 0
+    while p + 4 <= ntfs_mft_rec_size:
+        a: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](&ntfs_rec_buf[0]) + p)
+        atype: uint32 = _ntfs_rd_u32(a)
+        if atype == NTFS_AT_END:
+            return 0xFFFFFFFFFFFFFFFF
+        alen: uint64 = cast[uint64](_ntfs_rd_u32(
+            cast[Ptr[uint8]](cast[uint64](a) + 4)))
+        if alen == 0:
+            return 0xFFFFFFFFFFFFFFFF
+        if atype == want:
+            if seen == idx:
+                return p
+            seen = seen + 1
+        p = p + alen
+    return 0xFFFFFFFFFFFFFFFF
+
+
+# Fold a UTF-16LE name (`nchars` code units at `src`) into ntfs_name_buf
+# as bytes, NUL-terminating. Returns the byte length.
+
+def _ntfs_fold_name(src: Ptr[uint8], nchars: uint64) -> uint64:
+    out: uint64 = 0
+    i:   uint64 = 0
+    while i < nchars and out < NTFS_MAX_NAME - 1:
+        lo: uint8 = src[i * 2]
+        hi: uint8 = src[i * 2 + 1]
+        if hi == 0:
+            ntfs_name_buf[out] = lo
+        else:
+            ntfs_name_buf[out] = lo               # best-effort ASCII fold
+        out = out + 1
+        i = i + 1
+    ntfs_name_buf[out] = 0
+    return out
+
+
+# ASCII case-insensitive compare of a folded name (in some buffer `a`,
+# `alen` bytes) against a NUL-terminated C string `b`.
+
+def _ntfs_ci_eq(a: Ptr[uint8], alen: uint64, b: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while i < alen:
+        bc: uint8 = b[i]
+        if bc == 0:
+            return 0                               # b shorter
+        ca: uint8 = a[i]
+        cb: uint8 = bc
+        # fold A-Z to a-z
+        if ca >= 0x41 and ca <= 0x5A:
+            ca = ca + 0x20
+        if cb >= 0x41 and cb <= 0x5A:
+            cb = cb + 0x20
+        if ca != cb:
+            return 0
+        i = i + 1
+    if b[alen] != 0:
+        return 0                                   # b longer
+    return 1
+
+
+# --- $DATA read -------------------------------------------------------
+#
+# Read up to `len` bytes of file `mft_ref`'s unnamed $DATA starting at
+# `offset`. Handles resident $DATA (inline in the record) and
+# non-resident $DATA (runlist of clusters, possibly many runs / many
+# clusters). Returns bytes read, or -1 on error.
+
+def ntfs_read(mft_ref: uint64, offset: uint64,
+              buf: Ptr[uint8], len: uint64) -> int64:
+    if ntfs_dev_slot < 0:
+        return -1
+    if _ntfs_read_mft_record(mft_ref) != 0:
+        return -1
+    da: uint64 = _ntfs_find_attr(NTFS_AT_DATA, 0)
+    if da == 0xFFFFFFFFFFFFFFFF:
+        return -1
+    a: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](&ntfs_rec_buf[0]) + da)
+    non_res: uint8 = a[8]
+
+    if non_res == 0:
+        # Resident: content_len @0x10 (u32), content_off @0x14 (u16).
+        clen: uint64 = cast[uint64](_ntfs_rd_u32(
+            cast[Ptr[uint8]](cast[uint64](a) + 0x10)))
+        coff: uint64 = cast[uint64](_ntfs_rd_u16(
+            cast[Ptr[uint8]](cast[uint64](a) + 0x14)))
+        if offset >= clen:
+            return 0
+        want: uint64 = len
+        if offset + want > clen:
+            want = clen - offset
+        src: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](a) + coff + offset)
+        i: uint64 = 0
+        while i < want:
+            buf[i] = src[i]
+            i = i + 1
+        return cast[int64](want)
+
+    # Non-resident: real size @0x30 (u64), runlist @ run_off (u16 @0x20).
+    real_size: uint64 = _ntfs_rd_u64(
+        cast[Ptr[uint8]](cast[uint64](a) + 0x30))
+    rl_off: uint64 = cast[uint64](_ntfs_rd_u16(
+        cast[Ptr[uint8]](cast[uint64](a) + 0x20)))
+    alen: uint64 = cast[uint64](_ntfs_rd_u32(
+        cast[Ptr[uint8]](cast[uint64](a) + 4)))
+    if rl_off >= alen:
+        return -1
+    if _ntfs_decode_runlist(
+            cast[Ptr[uint8]](cast[uint64](a) + rl_off),
+            alen - rl_off) < 0:
+        return -1
+    nruns: uint64 = ntfs_run_count
+
+    if offset >= real_size:
+        return 0
+    want: uint64 = len
+    if offset + want > real_size:
+        want = real_size - offset
+    if want == 0:
+        return 0
+
+    produced: uint64 = 0
+    pos:      uint64 = offset
+    while produced < want:
+        vcn:     uint64 = pos / ntfs_cluster_size
+        in_clus: uint64 = pos % ntfs_cluster_size
+        # Find the run holding this VCN.
+        r: uint64 = 0
+        found: int32 = 0
+        run_lcn:   uint64 = 0
+        run_start: uint64 = 0
+        run_len:   uint64 = 0
+        run_sparse: int32 = 0
+        while r < nruns:
+            s: uint64 = ntfs_run_vcn[r]
+            e: uint64 = s + ntfs_run_len[r]
+            if vcn >= s and vcn < e:
+                run_lcn    = ntfs_run_lcn[r]
+                run_start  = s
+                run_len    = ntfs_run_len[r]
+                run_sparse = ntfs_run_sparse[r]
+                found = 1
+                r = nruns
+            else:
+                r = r + 1
+        if found == 0:
+            return -1
+        # Bytes left in this cluster.
+        chunk: uint64 = ntfs_cluster_size - in_clus
+        left:  uint64 = want - produced
+        if left < chunk:
+            chunk = left
+        dst: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](buf) + produced)
+        if run_sparse == 1:
+            # Sparse hole: zero-fill.
+            z: uint64 = 0
+            while z < chunk:
+                dst[z] = 0
+                z = z + 1
+        else:
+            lcn:   uint64 = run_lcn + (vcn - run_start)
+            dev_off: uint64 = lcn * ntfs_cluster_size + in_clus
+            if ntfs_dev_read(dev_off, dst, chunk) != 0:
+                return -1
+        produced = produced + chunk
+        pos      = pos + chunk
+    return cast[int64](produced)
+
+
+# --- index-entry walk -------------------------------------------------
+#
+# Walk a run of INDEX ENTRIES at byte range [start, end) inside `buf`,
+# invoking cb for each non-last, real (key-length>0) entry. Each entry:
+#   0x00 u64 MFT reference (low 48 bits = record number)
+#   0x08 u16 entry length
+#   0x0A u16 key (FILE_NAME) length
+#   0x0C u16 flags (bit0 has-subnode, bit1 last)
+#   0x10     FILE_NAME key:
+#              0x40 u8  filename length (chars)
+#              0x41 u8  namespace
+#              0x42     UTF-16LE name
+#            (FILE_NAME real-size @0x30 u64)
+# cb(ctx, name_ptr, name_len, mft_ref, is_dir) -> int32 (nonzero stops).
+# Returns 0 normally, 1 if cb requested a stop.
+
+def _ntfs_walk_index_entries(
+        buf: Ptr[uint8], start: uint64, end: uint64,
+        cb: Fn[int32, uint64, uint64, uint64, uint64, int32],
+        ctx: uint64) -> int32:
+    p: uint64 = start
+    while p + 16 <= end:
+        e: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](buf) + p)
+        ref:   uint64 = _ntfs_rd_u64(e) & 0x0000FFFFFFFFFFFF
+        elen:  uint64 = cast[uint64](_ntfs_rd_u16(
+            cast[Ptr[uint8]](cast[uint64](e) + 0x08)))
+        klen:  uint64 = cast[uint64](_ntfs_rd_u16(
+            cast[Ptr[uint8]](cast[uint64](e) + 0x0A)))
+        flags: uint16 = _ntfs_rd_u16(
+            cast[Ptr[uint8]](cast[uint64](e) + 0x0C))
+        if elen == 0:
+            p = end                                # malformed: stop
+        else:
+            is_last: int32 = 0
+            if (cast[uint64](flags) & cast[uint64](NTFS_IE_LAST)) != 0:
+                is_last = 1
+            if is_last == 1:
+                p = end                            # last entry: done
+            else:
+                if klen > 0:
+                    key: Ptr[uint8] = cast[Ptr[uint8]](
+                        cast[uint64](e) + 0x10)
+                    # FILE_NAME file-attribute flags @0x38 (u32): bit28
+                    # (0x10000000, FILE_ATTRIBUTE_DIRECTORY) marks a dir.
+                    fn_flags: uint32 = _ntfs_rd_u32(
+                        cast[Ptr[uint8]](cast[uint64](key) + 0x38))
+                    is_dir: int32 = 0
+                    if (cast[uint64](fn_flags)
+                            & cast[uint64](0x10000000)) != 0:
+                        is_dir = 1
+                    name_chars: uint64 = cast[uint64](key[0x40])
+                    name_src: Ptr[uint8] = cast[Ptr[uint8]](
+                        cast[uint64](key) + 0x42)
+                    nlen: uint64 = _ntfs_fold_name(name_src, name_chars)
+                    stop: int32 = cb(ctx,
+                                     cast[uint64](&ntfs_name_buf[0]),
+                                     nlen, ref, is_dir)
+                    if stop != 0:
+                        return 1
+                p = p + elen
+    return 0
+
+
+# --- directory enumeration --------------------------------------------
+#
+# Enumerate directory `dir_ref`: read its FILE record, walk $INDEX_ROOT
+# (resident) entries, then — if the root node points to sub-nodes — walk
+# every INDX block named by $INDEX_ALLOCATION (each fixed-up). cb is
+# invoked per child (see _ntfs_walk_index_entries). Returns 0 ok, -1 err.
+#
+# NOTE: this records the $INDEX_ALLOCATION runlist into a local copy of
+# the run arrays BEFORE walking INDX blocks, because reading an INDX
+# block does not touch the record buffer but we must not let a nested
+# ntfs_read clobber ntfs_run_*; readdir does no nested reads, so the
+# scratch runlist stays valid across the INDX loop.
+
+def ntfs_readdir(dir_ref: uint64,
+                 cb: Fn[int32, uint64, uint64, uint64, uint64, int32],
+                 ctx: uint64) -> int32:
+    if ntfs_dev_slot < 0:
+        return -1
+    if _ntfs_read_mft_record(dir_ref) != 0:
+        return -1
+    ir: uint64 = _ntfs_find_attr(NTFS_AT_INDEX_ROOT, 0)
+    if ir == 0xFFFFFFFFFFFFFFFF:
+        return -1                                  # not a directory
+    a: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](&ntfs_rec_buf[0]) + ir)
+    # $INDEX_ROOT is resident: content @ content_off (u16 @0x14),
+    # content_len (u32 @0x10).
+    ir_coff: uint64 = cast[uint64](_ntfs_rd_u16(
+        cast[Ptr[uint8]](cast[uint64](a) + 0x14)))
+    ir_clen: uint64 = cast[uint64](_ntfs_rd_u32(
+        cast[Ptr[uint8]](cast[uint64](a) + 0x10)))
+    content: uint64 = cast[uint64](&ntfs_rec_buf[0]) + ir + ir_coff
+    cptr: Ptr[uint8] = cast[Ptr[uint8]](content)
+    # INDEX_ROOT header (16 bytes), then NODE HEADER:
+    #   @0x10 u32 entries_off (relative to node header start, i.e. +16)
+    #   @0x14 u32 index_total
+    #   @0x18 u32 index_alloc
+    #   @0x1C u32 flags (bit0 => has sub-nodes / large index)
+    node_hdr: uint64 = 16
+    entries_off: uint64 = cast[uint64](_ntfs_rd_u32(
+        cast[Ptr[uint8]](content + node_hdr + 0x00)))
+    node_flags: uint32 = _ntfs_rd_u32(
+        cast[Ptr[uint8]](content + node_hdr + 0x0C))
+
+    # Walk the resident root entries.
+    root_start: uint64 = node_hdr + entries_off
+    if root_start < ir_clen:
+        if _ntfs_walk_index_entries(cptr, root_start, ir_clen, cb, ctx) == 1:
+            return 0
+    else:
+        # entries_off can index just past content in a fully-empty root;
+        # tolerate it (large dirs keep all entries in INDX blocks).
+        pass
+
+    # If the index is small (no sub-nodes), we're done.
+    if (cast[uint64](node_flags) & 0x01) == 0:
+        return 0
+
+    # Large index: walk the INDX blocks. Locate $INDEX_ALLOCATION (non-
+    # resident) and decode its runlist into ntfs_run_*.
+    ia: uint64 = _ntfs_find_attr(NTFS_AT_INDEX_ALLOC, 0)
+    if ia == 0xFFFFFFFFFFFFFFFF:
+        return 0                                   # large flag but none?
+    ja: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](&ntfs_rec_buf[0]) + ia)
+    ia_rl_off: uint64 = cast[uint64](_ntfs_rd_u16(
+        cast[Ptr[uint8]](cast[uint64](ja) + 0x20)))
+    ia_alen: uint64 = cast[uint64](_ntfs_rd_u32(
+        cast[Ptr[uint8]](cast[uint64](ja) + 4)))
+    ia_alloc: uint64 = _ntfs_rd_u64(
+        cast[Ptr[uint8]](cast[uint64](ja) + 0x28))
+    if ia_rl_off >= ia_alen:
+        return -1
+    if _ntfs_decode_runlist(
+            cast[Ptr[uint8]](cast[uint64](ja) + ia_rl_off),
+            ia_alen - ia_rl_off) < 0:
+        return -1
+
+    # Walk each INDX-block-sized window across the allocated index space.
+    # Total allocated bytes = ia_alloc. Each INDX block is ntfs_indx_size.
+    nblocks: uint64 = 0
+    if ntfs_indx_size > 0:
+        nblocks = ia_alloc / ntfs_indx_size
+
+    blk: uint64 = 0
+    while blk < nblocks:
+        vcn_byte: uint64 = blk * ntfs_indx_size
+        # Map this index-VCN through the $INDEX_ALLOCATION runlist.
+        ivcn:    uint64 = vcn_byte / ntfs_cluster_size
+        in_clus: uint64 = vcn_byte % ntfs_cluster_size
+        r: uint64 = 0
+        dev_off: uint64 = 0xFFFFFFFFFFFFFFFF
+        while r < ntfs_run_count:
+            s: uint64 = ntfs_run_vcn[r]
+            e: uint64 = s + ntfs_run_len[r]
+            if ivcn >= s and ivcn < e:
+                if ntfs_run_sparse[r] == 0:
+                    lcn: uint64 = ntfs_run_lcn[r] + (ivcn - s)
+                    dev_off = lcn * ntfs_cluster_size + in_clus
+                r = ntfs_run_count
+            else:
+                r = r + 1
+        if dev_off != 0xFFFFFFFFFFFFFFFF:
+            sz: uint64 = ntfs_indx_size
+            if sz > 8192:
+                sz = 8192
+            if ntfs_dev_read(dev_off, &ntfs_indx_buf[0], sz) == 0:
+                # "INDX" magic + fixup, then a node header at 0x18.
+                if ntfs_indx_buf[0] == 0x49 and ntfs_indx_buf[1] == 0x4E \
+                        and ntfs_indx_buf[2] == 0x44 \
+                        and ntfs_indx_buf[3] == 0x58:
+                    if _ntfs_apply_fixup(&ntfs_indx_buf[0], sz) == 0:
+                        ni_hdr: uint64 = 0x18
+                        ni_eoff: uint64 = cast[uint64](_ntfs_rd_u32(
+                            cast[Ptr[uint8]](
+                                cast[uint64](&ntfs_indx_buf[0])
+                                + ni_hdr + 0x00)))
+                        ni_etot: uint64 = cast[uint64](_ntfs_rd_u32(
+                            cast[Ptr[uint8]](
+                                cast[uint64](&ntfs_indx_buf[0])
+                                + ni_hdr + 0x04)))
+                        e_start: uint64 = ni_hdr + ni_eoff
+                        e_end:   uint64 = ni_hdr + ni_etot
+                        if e_end > sz:
+                            e_end = sz
+                        if _ntfs_walk_index_entries(
+                                &ntfs_indx_buf[0], e_start, e_end,
+                                cb, ctx) == 1:
+                            return 0
+        blk = blk + 1
+    return 0
+
+
+# --- lookup: resolve a path to an MFT reference -----------------------
+#
+# Walks the path component by component from the root directory (MFT
+# record 5), case-insensitively matching each component against the
+# directory's index entries. On success writes the target's MFT ref,
+# $DATA size and is-dir flag to the out params. Returns 0, or -1 if any
+# component is missing.
+#
+# The match runs through the readdir callback into module-scope match
+# state, then we re-read the matched record to continue descent (no
+# nested record-buffer reentrancy).
+
+NTFS_ROOT_REF: uint64 = 5
+
+ntfs_lk_want:     Array[256, uint8]    # current component to match
+ntfs_lk_want_p:   uint64 = 0           # C-string ptr to component
+ntfs_lk_hit:      int32  = 0
+ntfs_lk_ref:      uint64 = 0
+ntfs_lk_is_dir:   int32  = 0
+
+
+def _ntfs_lookup_cb(ctx: uint64, name_ptr: uint64, name_len: uint64,
+                    mft_ref: uint64, is_dir: int32) -> int32:
+    if ntfs_lk_hit == 1:
+        return 1
+    if _ntfs_ci_eq(cast[Ptr[uint8]](name_ptr), name_len,
+                   cast[Ptr[uint8]](ntfs_lk_want_p)) == 1:
+        ntfs_lk_ref    = mft_ref
+        ntfs_lk_is_dir = is_dir
+        ntfs_lk_hit    = 1
+        return 1
+    return 0
+
+
+# Compute the $DATA real size of record `ref` (0 for directories or if
+# absent). Reads the record into ntfs_rec_buf.
+
+def _ntfs_data_size(ref: uint64) -> uint64:
+    if _ntfs_read_mft_record(ref) != 0:
+        return 0
+    da: uint64 = _ntfs_find_attr(NTFS_AT_DATA, 0)
+    if da == 0xFFFFFFFFFFFFFFFF:
+        return 0
+    a: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](&ntfs_rec_buf[0]) + da)
+    non_res: uint8 = a[8]
+    if non_res == 0:
+        return cast[uint64](_ntfs_rd_u32(
+            cast[Ptr[uint8]](cast[uint64](a) + 0x10)))
+    return _ntfs_rd_u64(cast[Ptr[uint8]](cast[uint64](a) + 0x30))
+
+
+def ntfs_lookup(path: Ptr[char], out_ref: Ptr[uint64],
+                out_size: Ptr[uint64], out_is_dir: Ptr[int32]) -> int32:
+    if ntfs_dev_slot < 0:
+        return -1
+    p: Ptr[uint8] = cast[Ptr[uint8]](path)
+    i: uint64 = 0
+    if p[0] == 0x2F:                               # skip leading '/'
+        i = 1
+    cur_ref:   uint64 = NTFS_ROOT_REF
+    cur_isdir: int32  = 1
+
+    # Empty path or "/" => the root directory.
+    if p[i] == 0:
+        out_ref[0]    = cur_ref
+        out_size[0]   = 0
+        out_is_dir[0] = 1
+        return 0
+
+    while p[i] != 0:
+        # Extract the next component into ntfs_lk_want.
+        wl: uint64 = 0
+        while p[i] != 0 and p[i] != 0x2F:
+            if wl < NTFS_MAX_NAME - 1:
+                ntfs_lk_want[wl] = p[i]
+                wl = wl + 1
+            i = i + 1
+        ntfs_lk_want[wl] = 0
+        if p[i] == 0x2F:
+            i = i + 1
+        if wl == 0:
+            pass                                   # doubled/trailing slash
+        else:
+            if cur_isdir == 0:
+                return -1                          # descend into a file
+            ntfs_lk_hit    = 0
+            ntfs_lk_ref    = 0
+            ntfs_lk_is_dir = 0
+            ntfs_lk_want_p = cast[uint64](&ntfs_lk_want[0])
+            if ntfs_readdir(cur_ref, _ntfs_lookup_cb, 0) != 0:
+                return -1
+            if ntfs_lk_hit != 1:
+                return -1
+            cur_ref   = ntfs_lk_ref
+            cur_isdir = ntfs_lk_is_dir
+
+    out_ref[0]    = cur_ref
+    out_is_dir[0] = cur_isdir
+    if cur_isdir == 1:
+        out_size[0] = 0
+    else:
+        out_size[0] = _ntfs_data_size(cur_ref)
+    return 0

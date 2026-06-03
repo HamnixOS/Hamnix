@@ -131,6 +131,26 @@ if os.environ.get("ENABLE_ISO9660_TEST") == "1":
     FILES.append(("/tests/iso9660/test.iso", _iso_mod.build_iso_image()))
     FILES.append(("/etc/iso9660-test", b"1\n"))
 
+# ENABLE_NTFS_TEST=1 (via scripts/test_ntfs.sh) bakes a REAL NTFS image
+# FILE into the cpio at /tests/ntfs/test.img plus the /etc/ntfs-test
+# marker. init/main.ad's ntfs_e2e_selftest() loop-attaches that image as
+# /dev/blk/loopN, parses the boot sector/BPB, decodes the $MFT runlist,
+# reads FILE records (USN fixup), enumerates the root directory (small
+# INDEX_ROOT + non-resident INDEX_ALLOCATION INDX blocks), reads a
+# resident file (HELLO.TXT) byte-exact, reads a non-resident multi-
+# cluster file (BIG.DAT) byte-exact, and resolves a nested file —
+# proving the read-only NTFS reader (fs/ntfs.ad) end-to-end. The image is
+# built at build time (mkntfs/ntfs-3g) and kept OUT of git, exactly like
+# the ISO9660 and loop FAT fixtures above.
+if os.environ.get("ENABLE_NTFS_TEST") == "1":
+    import sys as _ntfs_sys
+    _ntfs_scripts_dir = str(Path(__file__).resolve().parent)
+    if _ntfs_scripts_dir not in _ntfs_sys.path:
+        _ntfs_sys.path.insert(0, _ntfs_scripts_dir)
+    import build_ntfs_fixture as _ntfs_mod
+    FILES.append(("/tests/ntfs/test.img", _ntfs_mod.build_ntfs_image()))
+    FILES.append(("/etc/ntfs-test", b"1\n"))
+
 if os.environ.get("ENABLE_TAR_GZIP_FIXTURE") == "1":
     import gzip as _gzip_mod
     # Repetitive, compressible plaintext: zlib chooses dynamic Huffman
