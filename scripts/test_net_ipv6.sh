@@ -12,7 +12,10 @@
 #      feeds it through the REAL eth_rx -> ipv6_rx -> _icmp6_rx demux,
 #      asserting a Neighbor Advertisement was built;
 #   3. synthesizes an ICMPv6 Echo Request to that address and asserts an
-#      Echo Reply was built.
+#      Echo Reply was built;
+#   4. transmits a UDP6 datagram with a known payload and asserts the
+#      mandatory pseudo-header checksum the kernel wrote into the wire
+#      buffer matches a hand-verified value (0x15C2, never the illegal 0).
 #
 # This is a DETERMINISTIC offline exercise of the v6 RX/TX path — it
 # does not depend on QEMU SLIRP IPv6 behaviour. A trailing QEMU rc=124
@@ -64,6 +67,7 @@ for needle in \
     "[ipv6] link-local address fe80:: derived: fe80:" \
     "[ipv6-selftest] NS->NA PASS" \
     "[ipv6-selftest] echo PASS" \
+    "[ipv6-selftest] udp6 csum PASS" \
     "[ipv6-selftest] ALL PASS"
 do
     if grep -a -F -q "$needle" "$LOG"; then
