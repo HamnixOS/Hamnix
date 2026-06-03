@@ -360,6 +360,17 @@ if os.environ.get("ENABLE_PROCMOUNTS_TEST") == "1":
 if os.environ.get("ENABLE_UABI_FILLS_TEST") == "1":
     FILES.append(("/etc/uabi-fills-test", b"1\n"))
 
+# Kernel backtrace self-test. scripts/test_backtrace.sh sets
+# ENABLE_BACKTRACE_TEST=1 to plant /etc/backtrace-test. init/main.ad at
+# boot:37.bt detects the marker and calls backtrace_selftest(), which
+# fires one WARN_ON(true); kernel/panic.ad's WARN_ON then runs
+# dump_stack(), the frame-pointer backtrace walker, printing the
+# "Call trace (kernel text base = 0x...)" header + "  [<0x...>] +0x..."
+# frame lines. WARN_ON does not halt, so the box keeps booting. Default
+# boots omit the marker so the self-test never fires.
+if os.environ.get("ENABLE_BACKTRACE_TEST") == "1":
+    FILES.append(("/etc/backtrace-test", b"1\n"))
+
 # linux-abi msync(2) self-test. scripts/test_msync.sh sets
 # ENABLE_MSYNC_TEST=1 to plant /etc/msync-test (the gate marker).
 # init/main.ad at boot:37.msy detects it and calls msync_selftest()

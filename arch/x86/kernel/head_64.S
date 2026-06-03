@@ -101,3 +101,50 @@ kernel_image_end:
     movabsq $KERNEL_VBASE_HI, %rcx
     subq    %rcx, %rax
     ret
+
+/* ---------- kernel_text_start() / kernel_text_end() -------------- *
+ * Return the HIGH-VMA bounds of the kernel .text section as linked by
+ * kernel.lds (__kernel_text_start / __kernel_text_end). Unlike
+ * kernel_image_end() above — which subtracts KERNEL_VBASE to hand
+ * memblock a PHYSICAL address — these return the addresses UNTOUCHED,
+ * i.e. the same 0xffffffff80...... values the CPU pushes as return
+ * addresses onto the stack. dump_stack() (kernel/panic.ad) uses them
+ * to (a) validate that a candidate %rbp+8 word lands inside kernel
+ * .text before trusting it as a return address, and (b) print the
+ * text base so an operator can offline-symbolize raw addresses against
+ * the build's unstripped ELF.
+ *
+ * __kernel_text_end is the linker's __bss_end-adjacent marker placed
+ * AFTER .data/.bss (see kernel.lds line 180); for validating return
+ * addresses any address below it and at/above __kernel_text_start is
+ * "inside the image", which is the conservative bound we want — a
+ * looser-than-strict-.text bound never produces a FALSE return-address
+ * acceptance for a frame-pointer walk (the saved RIP is genuine), it
+ * only affects the best-effort scan fallback, which we do not use. */
+    .section .text, "ax"
+    .align 16
+    .globl kernel_text_start
+kernel_text_start:
+    leaq    __kernel_text_start(%rip), %rax
+    ret
+
+    .align 16
+    .globl kernel_text_end
+kernel_text_end:
+    leaq    __kernel_text_end(%rip), %rax
+    ret
+
+/* ---------- read_rbp() ------------------------------------------- *
+ * Return the CALLER's frame-pointer (%rbp) so dump_stack() can start
+ * walking the saved-%rbp linked list. This is a LEAF helper with NO
+ * prologue of its own: it does not `pushq %rbp` / `movq %rsp,%rbp`,
+ * so on entry %rbp still holds the caller's frame pointer, which we
+ * hand back in %rax untouched. (Adder-emitted functions always frame
+ * with %rbp — see compiler/codegen_x86.py:21 — so the caller's %rbp
+ * is a valid frame whose [%rbp]=saved-caller-rbp and [%rbp+8]=return
+ * address, the chain dump_stack walks.) */
+    .align 16
+    .globl read_rbp
+read_rbp:
+    movq    %rbp, %rax
+    ret
