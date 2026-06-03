@@ -59,18 +59,47 @@ python3 -m compiler.adder compile \
 
 echo "[test_p9wstat] (5/5) Boot QEMU + drive the test via hamsh"
 LOG=$(mktemp)
-trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
+FIFO=$(mktemp -u)
+mkfifo "$FIFO"
+trap 'rm -f "$LOG" "$FIFO"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
+
+# Gate keystrokes on the shell-ready marker rather than a fixed sleep.
+# Boot has grown (xhci/esp smoke tests run for tens of seconds on some
+# hosts); a fixed `sleep 3` raced ahead of hamsh's readline and the
+# command was dropped. Hold the FIFO open + wait for "[hamsh] M16.35
+# shell ready" in the live log, THEN type the fixture command. See
+# memory feedback_interactive_test_wait_for_prompt.
+(
+    # Keep the FIFO write end open for the lifetime of this subshell so
+    # QEMU's stdin doesn't EOF before we've typed anything.
+    exec 3>"$FIFO"
+    for _ in $(seq 1 600); do
+        if grep -a -q "M16.35 shell ready" "$LOG" 2>/dev/null; then
+            break
+        fi
+        sleep 0.2
+    done
+    # Small settle so the prompt's readline is actually in SYS_READ.
+    sleep 1
+    printf '/bin/test_p9wstat\n' >&3
+    # Wait for the fixture to reach PASS (or just finish) before exiting.
+    for _ in $(seq 1 100); do
+        if grep -a -q "\[p9wstat\] PASS" "$LOG" 2>/dev/null; then
+            break
+        fi
+        if grep -a -q "\[p9wstat\] FAIL" "$LOG" 2>/dev/null; then
+            break
+        fi
+        sleep 0.2
+    done
+    printf 'exit\n' >&3
+    sleep 1
+    exec 3>&-
+) &
+DRIVER_PID=$!
 
 set +e
-(
-    # Let the kernel finish its smoke tests before hamsh starts
-    # SYS_READ'ing stdin. Same pacing as scripts/test_p9file.sh.
-    sleep 3
-    printf '/bin/test_p9wstat\n'
-    sleep 3
-    printf 'exit\n'
-    sleep 1
-) | timeout 20s qemu-system-x86_64 \
+timeout 120s qemu-system-x86_64 \
     -kernel "$ELF" \
     -smp 2 \
     -nographic \
@@ -78,9 +107,10 @@ set +e
     -m 256M \
     -monitor none \
     -serial stdio \
-    > "$LOG" 2>&1
+    < "$FIFO" > "$LOG" 2>&1
 rc=$?
 set -e
+wait "$DRIVER_PID" 2>/dev/null || true
 
 echo "[test_p9wstat] --- captured output ---"
 cat "$LOG"
@@ -124,9 +154,16 @@ else
 fi
 
 if grep -F -q "[p9wstat] wstat mode no-op ok" "$LOG"; then
-    echo "[test_p9wstat] OK: SYS_WSTAT mode leg accepted (no-op)"
+    echo "[test_p9wstat] OK: SYS_WSTAT mode leg accepted (chmod honoured; tmpfs no-op)"
 else
     echo "[test_p9wstat] MISS: wstat mode failed"
+    fail=1
+fi
+
+if grep -F -q "[p9wstat] wstat length tmpfs-gap ok" "$LOG"; then
+    echo "[test_p9wstat] OK: SYS_WSTAT length leg wired to VFS (tmpfs gap surfaced)"
+else
+    echo "[test_p9wstat] MISS: wstat length leg not wired"
     fail=1
 fi
 

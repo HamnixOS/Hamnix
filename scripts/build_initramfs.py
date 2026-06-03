@@ -765,6 +765,16 @@ if os.environ.get("ENABLE_EXT4_SYMLINK_TEST") == "1":
 if os.environ.get("ENABLE_FSTAT_BACKEND_TEST") == "1":
     FILES.append(("/etc/fstat-backend-test", b"1\n"))
 
+# wstat chmod/truncate round-trip self-test. scripts/test_p9wstat_ext4.sh sets
+# ENABLE_WSTAT_APPLY_TEST=1 to plant /etc/wstat-apply-test. init/main.ad detects
+# the marker after the ext4 mount and calls wstat_apply_selftest()
+# (sys/src/9/port/sysfile.ad): it creates an ext4 file, drives do_wstat with the
+# mode (chmod) + length (truncate) legs, and asserts the inode mode and file
+# size round-trip through wstat. Writes to the mounted ext4 image, so it is
+# opt-in. Default boots omit the marker.
+if os.environ.get("ENABLE_WSTAT_APPLY_TEST") == "1":
+    FILES.append(("/etc/wstat-apply-test", b"1\n"))
+
 # tmpfs symlink + hard-link self-test. scripts/test_tmpfs_link.sh sets
 # ENABLE_TMPFS_LINK_TEST=1 to plant /etc/tmpfs-link-test. init/main.ad's
 # boot:37.tln hook detects the marker and calls tmpfs_link_selftest()

@@ -39,6 +39,7 @@ from fs.vfs import (
     vfs_open, vfs_open_write, vfs_unlink, vfs_close,
     vfs_rename, vfs_mkdir, resolve_path,
     vfs_fd_backing_info,
+    vfs_truncate, vfs_chmod, vfs_set_mtime,
 )
 from fs.tmpfs import tmpfs_slot_name
 from fs.fat import fat_open_size
@@ -49,6 +50,10 @@ from fs.cpio import (
 from arch.x86.kernel.time import get_jiffies
 from kernel.printk.printk import printk0, printk1
 from fs.ext4 import ext4_create_file
+from fs.ext4 import (
+    ext4_inode_owner_at, ext4_read_inode, ext4_write_inode,
+    ext4_inode_set_mode, ext4_resolve_file,
+)
 from fs.vfs import vfs_write, vfs_read
 
 # FD_*_MARK constants we recognise on the fstat path. Imported here
@@ -883,18 +888,9 @@ def _apply_wstat(target_path: Ptr[uint8], buf_user: uint64,
     if off > nbuf:
         set_current_errstr("wstat failed: truncated record tail")
         return cast[int64](-1)
-    # Reject non-sentinel values for fields we don't yet honour.
-    # length: only the WSTAT_SENTINEL_U64 sentinel is accepted.
-    if length_new != WSTAT_SENTINEL_U64:
-        set_current_errstr("wstat: length not supported")
-        return cast[int64](-1)
-    # mtime: only the WSTAT_SENTINEL_U32 sentinel is accepted. The
-    # Plan 9 wstat contract lets "don't change" coexist with mtime=0
-    # — we treat the all-ones bit pattern as the only "leave alone"
-    # value (matches 9front's syswstat).
-    if mtime_new != WSTAT_SENTINEL_U32:
-        set_current_errstr("wstat: mtime not supported")
-        return cast[int64](-1)
+    # length / mtime are honoured below (after the name/mode legs).
+    # The all-ones sentinel means "don't change"; any other value is
+    # applied through the VFS. gid / muid remain unsupported.
     # gid / muid: empty string (length 0) means "don't change". Any
     # non-empty value is unsupported.
     if gid_len != 0:
@@ -910,9 +906,15 @@ def _apply_wstat(target_path: Ptr[uint8], buf_user: uint64,
     # BASENAME only — the file stays in the same directory. We
     # synthesise the new absolute path by stitching the existing
     # parent dir to the supplied basename.
+    # Effective path for the mode/length/mtime legs: starts as the
+    # caller-supplied path, but if the name (rename) leg moves the
+    # file the subsequent legs must act on the NEW path (the old name
+    # no longer resolves). new_abs is hoisted here so eff_path can
+    # outlive the rename block.
+    new_abs: Array[256, uint8]
+    eff_path: Ptr[uint8] = target_path
     if name_len != 0:
         # Build the new absolute path: parent(target_path) + '/' + name.
-        new_abs: Array[256, uint8]
         parent_end: uint64 = _basename_offset(target_path)
         if parent_end + name_len + 1 > 256:
             set_current_errstr("wstat: name too long")
@@ -936,13 +938,43 @@ def _apply_wstat(target_path: Ptr[uint8], buf_user: uint64,
             else:
                 set_current_errstr("wstat: rename not supported")
             return cast[int64](-1)
-    # --- mode: chmod leg. No per-inode mode storage yet — accept
-    # any non-sentinel value as a successful no-op so callers writing
-    # `chmod(2)` over wstat see success. When tmpfs/ext4 grow mode
-    # bits the value plumbs through; until then we drop it.
+        eff_path = &new_abs[0]
+    # --- mode: chmod leg. A non-sentinel value plumbs through to the
+    # VFS (ext4 persists i_mode; tmpfs/cpio no-op success). This is
+    # how `chmod(2)` over wstat takes effect.
     if mode_new != WSTAT_SENTINEL_U32:
-        # Intentionally no-op; see header comment + TODO follow-up.
-        pass
+        mrc: int32 = vfs_chmod(cast[Ptr[char]](eff_path),
+                               cast[uint16](mode_new & 0xFFFF))
+        if mrc != 0:
+            if mrc == -2:
+                set_current_errstr("wstat: mode target not found")
+            else:
+                set_current_errstr("wstat: mode not supported")
+            return cast[int64](-1)
+    # --- length: truncate leg. A non-sentinel value resizes the file
+    # via vfs_truncate (ext4 path-resolved truncate). This is how
+    # `truncate(2)` over wstat takes effect.
+    if length_new != WSTAT_SENTINEL_U64:
+        trc: int32 = vfs_truncate(cast[Ptr[char]](eff_path),
+                                  length_new)
+        if trc != 0:
+            if trc == -2:
+                set_current_errstr("wstat: length target not found")
+            else:
+                set_current_errstr("wstat: length not supported")
+            return cast[int64](-1)
+    # --- mtime leg. A non-sentinel value sets i_mtime via the VFS
+    # (ext4 persists; tmpfs/cpio no-op success). We no longer reject
+    # caller-supplied mtimes.
+    if mtime_new != WSTAT_SENTINEL_U32:
+        src: int32 = vfs_set_mtime(cast[Ptr[char]](eff_path),
+                                   mtime_new)
+        if src != 0:
+            if src == -2:
+                set_current_errstr("wstat: mtime target not found")
+            else:
+                set_current_errstr("wstat: mtime not supported")
+            return cast[int64](-1)
     return 0
 
 
@@ -1096,4 +1128,127 @@ def fstat_backend_selftest() -> int32:
         printk0("[FSTAT_BACKEND] note: ext4 leg skipped (no mount)\n")
 
     printk0("[FSTAT_BACKEND] PASS\n")
+    return 0
+
+
+# --- wstat chmod/truncate round-trip self-test --------------------
+#
+# Driven by /etc/wstat-apply-test (planted by
+# scripts/test_p9wstat_ext4.sh). Proves the wstat handler now HONOURS
+# the mode (chmod) and length (truncate) legs against a live ext4
+# mount instead of dropping/rejecting them:
+#
+#   1. Create /ext/WSTATAP.TXT with 16 bytes of content and mode 0644.
+#   2. Build a 9P Dir record carrying mode=0600 + length=4 (both legs
+#      non-sentinel; name/uid/gid/muid sentinel = "don't change").
+#   3. do_wstat("/ext/WSTATAP.TXT", rec) — the exact path userland
+#      hits via SYS_WSTAT.
+#   4. Re-read the inode mode via ext4_inode_owner_at and the file
+#      length via do_stat's Dir record; assert mode==0600 and
+#      length==4. This proves chmod-then-stat + truncate-then-stat
+#      round-trip through wstat.
+#
+# Runs after the live ext4 mount in init/main.ad. If no ext4 device is
+# mounted the create fails and the leg is SKIPPED (printed), so the
+# test is a no-op on device-less boots rather than a false failure.
+
+def _wstat_sel_build_record(buf: Ptr[uint8], mode: uint32,
+                            length: uint64) -> uint64:
+    # Build a 9P Dir record with mode + length set and every other
+    # mutable field at its sentinel (name/uid/gid/muid empty). Mirrors
+    # _write_dir_record's layout. Returns total record length.
+    _write_le16(&buf[2], 0)                       # type
+    _write_le32(&buf[4], 0)                        # dev
+    buf[8] = 0                                     # qid.type
+    _write_le32(&buf[9], 0)                        # qid.vers
+    _write_le64(&buf[13], 0)                        # qid.path
+    _write_le32(&buf[21], cast[uint64](mode))      # mode (honoured)
+    _write_le32(&buf[25], cast[uint64](WSTAT_SENTINEL_U32))   # atime
+    _write_le32(&buf[29], cast[uint64](WSTAT_SENTINEL_U32))   # mtime
+    _write_le64(&buf[33], length)                  # length (honoured)
+    off: uint64 = 41
+    _write_le16(&buf[off], 0)                       # name (empty)
+    off = off + 2
+    _write_le16(&buf[off], 0)                       # uid (empty)
+    off = off + 2
+    _write_le16(&buf[off], 0)                       # gid (empty)
+    off = off + 2
+    _write_le16(&buf[off], 0)                       # muid (empty)
+    off = off + 2
+    _write_le16(&buf[0], off - 2)                   # size = total - 2
+    return off
+
+
+def wstat_apply_selftest() -> int32:
+    # Prime the boot task's fd table (same all-zero .bss issue
+    # fstat_backend_selftest handles) so vfs_open hands back real fds.
+    seltask: Ptr[TaskStruct] = current_task()
+    fclr: uint64 = 0
+    while fclr < 16:
+        seltask[0].fd_idx[fclr] = FD_CLOSED_MARK
+        fclr = fclr + 1
+
+    # 16-byte known payload.
+    body: Array[16, uint8]
+    bi: uint64 = 0
+    while bi < 16:
+        body[bi] = 65 + cast[uint8](bi)            # 'A'..'P'
+        bi = bi + 1
+
+    enm: Ptr[char] = "WSTATAP.TXT"
+    einum: uint32 = ext4_create_file(2, enm, &body[0], 16)
+    if einum == 0:
+        printk0("[WSTAT_APPLY] note: ext4 leg skipped (no mount)\n")
+        printk0("[WSTAT_APPLY] PASS\n")
+        return 0
+
+    # Stamp a known starting mode 0644 | S_IFREG (0x81A4) so the chmod
+    # result is unambiguous.
+    inode_buf: Array[256, uint8]
+    if ext4_read_inode(cast[uint64](einum), &inode_buf[0]) != 0:
+        printk0("[WSTAT_APPLY] FAIL: read inode (pre)\n")
+        return -1
+    ext4_inode_set_mode(&inode_buf[0], cast[uint16](0x81A4))
+    if ext4_write_inode(cast[uint64](einum), &inode_buf[0]) != 0:
+        printk0("[WSTAT_APPLY] FAIL: write inode (pre)\n")
+        return -1
+
+    # Build the wstat record: chmod -> 0600|S_IFREG (0x8180),
+    # truncate -> 4 bytes.
+    rec: Array[128, uint8]
+    reclen: uint64 = _wstat_sel_build_record(&rec[0],
+                                             cast[uint32](0x8180), 4)
+    epath: Ptr[uint8] = cast[Ptr[uint8]]("/ext/WSTATAP.TXT")
+    wrc: int64 = do_wstat(cast[uint64](epath),
+                          cast[uint64](&rec[0]), reclen)
+    if wrc != 0:
+        printk1("[WSTAT_APPLY] FAIL: do_wstat rc=%d (want 0)\n",
+                cast[uint64](wrc))
+        return -1
+
+    # --- verify chmod leg: inode mode must now be 0600|S_IFREG -----
+    got_uid: uint32 = 0
+    got_gid: uint32 = 0
+    got_mode: uint16 = 0
+    if ext4_inode_owner_at(einum, &got_uid, &got_gid, &got_mode) != 0:
+        printk0("[WSTAT_APPLY] FAIL: owner_at read-back\n")
+        return -1
+    if got_mode != cast[uint16](0x8180):
+        printk1("[WSTAT_APPLY] FAIL: mode=0x%x (want 0x8180)\n",
+                cast[uint64](got_mode))
+        return -1
+
+    # --- verify truncate leg: the inode's on-disk size must now be 4.
+    # Re-resolve the file (ext4_resolve_file fills out_size from the
+    # freshly-read inode) — the exact size do_stat would report.
+    chk_inum: uint32 = 0
+    chk_size: uint64 = 0
+    if ext4_resolve_file("WSTATAP.TXT", &chk_inum, &chk_size) == 0:
+        printk0("[WSTAT_APPLY] FAIL: resolve read-back\n")
+        return -1
+    if chk_size != 4:
+        printk1("[WSTAT_APPLY] FAIL: length=%d (want 4)\n", chk_size)
+        return -1
+
+    printk0("[WSTAT_APPLY] PASS\n")
     return 0
