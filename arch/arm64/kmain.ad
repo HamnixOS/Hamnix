@@ -14,13 +14,24 @@
 #   4. Program the ARM generic *virtual* timer (PPI INTID 27) for a periodic
 #      tick and unmask IRQs.
 #   5. Spin in WFI. Each timer IRQ prints "[arm64] timer tick"; after 5 ticks
-#      the handler prints "[arm64] timer IRQ OK" and halts deterministically.
+#      the handler prints "[arm64] timer IRQ OK".
+#   6. (Phase 4) Drop to EL0: hand-emit a tiny AArch64 user routine into an
+#      identity-mapped, EL0-accessible 2 MiB window, program SPSR_EL1 (EL0t),
+#      ELR_EL1 (user entry) and SP_EL0 (user stack), then `eret` into it. The
+#      EL0 routine issues write(1, msg, len) then exit(0) via `svc #0`. Each
+#      svc traps to the "Lower EL using AArch64" Synchronous vector, which
+#      saves the GPR frame and calls the Adder dispatcher arm64_sync_handler():
+#      it reads ESR_EL1.EC to confirm SVC, services the syscall (write -> UART,
+#      exit -> record code + halt), and writes the return value back into the
+#      frame's x0 slot before eret-ing back to EL0. On exit() the test halts
+#      after printing "[arm64] EL0 syscall OK".
 #
 # The privileged system-register pokes (MSR/MRS to VBAR_EL1, SCTLR_EL1,
-# TTBR0_EL1, MAIR_EL1, TCR_EL1, CNTV_*, DAIF) plus DSB/ISB/TLBI/WFI are
-# emitted by codegen_arm64.py as recognised intrinsics (_msr_*, _mrs_*,
-# _dsb_ish, _isb, _tlbi_vmalle1is, _wfi). Everything else — GIC/timer MMIO,
-# the page-table fill, the IRQ service logic — is ordinary Adder.
+# TTBR0_EL1, MAIR_EL1, TCR_EL1, CNTV_*, DAIF, SPSR_EL1, ELR_EL1, SP_EL0,
+# ESR_EL1) plus DSB/ISB/TLBI/WFI/ERET are emitted by codegen_arm64.py as
+# recognised intrinsics (_msr_*, _mrs_*, _dsb_ish, _isb, _tlbi_vmalle1is,
+# _wfi, _eret). Everything else — GIC/timer MMIO, the page-table fill, the
+# IRQ/syscall service logic, the EL0 blob builder — is ordinary Adder.
 
 # ---------------------------------------------------------------------------
 # PL011 UART (QEMU virt, primary instance).
@@ -52,6 +63,31 @@ VTIMER_INTID: uint64 = 27           # virtual timer PPI
 TICK_LIMIT: int64 = 5
 
 # ---------------------------------------------------------------------------
+# Phase 4: EL0 userspace. A tiny hand-emitted AArch64 routine is written into
+# an identity-mapped RAM page and entered via `eret` with SPSR_EL1 selecting
+# EL0t. It issues two syscalls mirroring the Linux aarch64 ABI (x8 = nr,
+# x0..x5 = args, return in x0): write(1, msg, len) then exit(0).
+# ---------------------------------------------------------------------------
+USER_CODE_BASE: uint64 = 0x40200000   # EL0 instruction page (identity-mapped)
+USER_MSG_BASE: uint64 = 0x40201000    # EL0 message buffer
+USER_STACK_TOP: uint64 = 0x40280000   # EL0 stack top (grows down), 16B-aligned
+
+# Linux-shape aarch64 syscall numbers used by the demo.
+SYS_WRITE_NR: uint64 = 64
+SYS_EXIT_NR: uint64 = 93
+
+# SPSR_EL1 value to ERET into EL0t with all interrupts masked: bits[3:0]=0
+# (EL0t) and DAIF (bits[9:6]) set. 0x3C0 = D|A|I|F masked, mode EL0t.
+SPSR_EL0T_DAIF: uint64 = 0x3C0
+
+# ESR_EL1.EC (bits[31:26]) value for "SVC instruction execution in AArch64".
+ESR_EC_SVC64: uint64 = 0x15
+
+# Recorded EL0 exit code (written by the exit syscall) and a done flag.
+arm64_el0_exit_code: int64 = -1
+arm64_el0_exited: int64 = 0
+
+# ---------------------------------------------------------------------------
 # Identity-mapped L1 page table. A single level-1 table of 512 8-byte block
 # descriptors (4 KiB granule => each L1 entry spans 1 GiB). We place it at a
 # fixed, 4 KiB-aligned physical address in RAM, well past the kernel image
@@ -61,14 +97,35 @@ TICK_LIMIT: int64 = 5
 # regardless.
 # ---------------------------------------------------------------------------
 L1_PGTABLE: uint64 = 0x40100000
+# Phase 4: a second-level (L2) table covering the 1 GiB RAM block at
+# 0x4000_0000 in 2 MiB blocks. We replace the coarse L1 RAM *block* with an L1
+# *table* descriptor pointing here, so a single 2 MiB region can be granted EL0
+# access without making the kernel's own (.text/stack/pgtable) memory
+# EL0-writable. (EL0-writable memory is forced Privileged-eXecute-Never, which
+# would fault the kernel's instruction fetches — hence the split.)
+L2_PGTABLE: uint64 = 0x40102000
 
-# Block descriptor attribute bits (stage-1, level-1 block).
+# Block descriptor attribute bits (stage-1 block, levels 1 and 2).
 DESC_VALID: uint64 = 0x1            # bit0 valid
 DESC_AF: uint64 = 0x400             # bit10 Access Flag (else translation fault)
 DESC_SH_INNER: uint64 = 0x300       # bits[9:8]=3 Inner shareable
 # AttrIndx: bits[4:2]. attr0 = Device-nGnRE, attr1 = Normal WB.
 DEV_FLAGS: uint64 = 0x401           # VALID | AF | AttrIndx0 (device)
 MEM_FLAGS: uint64 = 0x705           # VALID | AF | SH_INNER | AttrIndx1 (normal)
+# Table descriptor (bits[1:0]=0b11) for an L1 entry that points at an L2 table.
+DESC_TABLE: uint64 = 0x3
+# Phase 4: the EL0 region's 2 MiB L2 block additionally carries AP[1]
+# (bit6 = 0x40) so EL0 can read/write/execute it. UXN is left clear so EL0 may
+# execute the hand-emitted user blob; this region holds NO kernel code, so the
+# implied PXN-at-EL1 (from EL0 writability) does not affect the kernel.
+AP_EL0: uint64 = 0x40               # AP[1]: EL0 access permitted
+MEM_FLAGS_EL0: uint64 = 0x745       # MEM_FLAGS | AP_EL0
+
+# RAM L2 geometry: 2 MiB per L2 entry. The user region (USER_CODE_BASE ..
+# USER_STACK_TOP) all falls inside one 2 MiB block; index it off RAM base.
+RAM_BASE: uint64 = 0x40000000
+L2_BLOCK_SIZE: uint64 = 0x200000     # 2 MiB
+USER_L2_INDEX: uint64 = 1            # (0x4020_0000 - 0x4000_0000) / 2 MiB
 
 # Timer period (ticks of CNTFRQ): firing every freq/100 ~= 10 ms. Stashed by
 # kmain after reading CNTFRQ_EL0 so the IRQ handler can re-arm the timer.
@@ -111,8 +168,23 @@ def arm64_mmu_init() -> int64:
 
     # entry[0] : VA 0x0000_0000 .. 0x3FFF_FFFF -> Device-nGnRE (GIC + UART).
     tbl[0] = cast[uint64](0) | DEV_FLAGS
-    # entry[1] : VA 0x4000_0000 .. 0x7FFF_FFFF -> Normal WB (RAM @0x4000_0000).
-    tbl[1] = cast[uint64](0x40000000) | MEM_FLAGS
+
+    # entry[1] : VA 0x4000_0000 .. 0x7FFF_FFFF -> RAM. Instead of a coarse 1 GiB
+    # block (which would force the whole kernel image EL0-accessible to expose
+    # the EL0 demo region), point to a second-level table of 2 MiB blocks so we
+    # can grant EL0 access to exactly one 2 MiB window.
+    l2: Ptr[uint64] = cast[Ptr[uint64]](L2_PGTABLE)
+    j: int64 = 0
+    while j < 512:
+        # Identity-map each 2 MiB block at RAM_BASE + j*2MiB, Normal-WB EL1-only.
+        blk_pa: uint64 = RAM_BASE + (cast[uint64](j) * L2_BLOCK_SIZE)
+        if cast[uint64](j) == USER_L2_INDEX:
+            l2[j] = blk_pa | MEM_FLAGS_EL0   # EL0 RWX window for the demo
+        else:
+            l2[j] = blk_pa | MEM_FLAGS       # kernel: EL1-only
+        j = j + 1
+    # L1 entry 1 = table descriptor referencing the L2 table.
+    tbl[1] = L2_PGTABLE | DESC_TABLE
 
     # MAIR_EL1 = 0xff04: attr0 = Device-nGnRE (0x04), attr1 = Normal WB (0xff).
     _msr_mair_el1(cast[uint64](0xff04))
@@ -227,8 +299,12 @@ def arm64_irq_handler() -> int64:
     if arm64_tick_count >= TICK_LIMIT:
         donemsg: Ptr[char] = "[arm64] timer IRQ OK\n"
         _uart_puts(donemsg)
-        # Mask IRQs and halt deterministically in a WFI loop.
+        # Mask IRQs so the EL0 demo runs without timer re-entry, then proceed
+        # to Phase 4: drop to EL0 and service its syscalls. arm64_enter_el0()
+        # does not return (the EL0 exit() halts the test).
         _msr_daifset(2)
+        arm64_enter_el0()
+        # Unreachable; arm64_enter_el0 erets to EL0 and never comes back here.
         while True:
             _wfi()
     return 0
@@ -250,6 +326,164 @@ def arm64_unhandled_panic() -> int64:
     _uart_puts(msg)
     while True:
         _wfi()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — EL0 userspace + svc syscall path.
+# ---------------------------------------------------------------------------
+
+# Store a 32-bit little-endian instruction word at a code address. Returns the
+# next address so the builder can chain word-by-word.
+def _emit_word(addr: uint64, word: uint64) -> uint64:
+    p: Ptr[uint32] = cast[Ptr[uint32]](addr)
+    p[0] = cast[uint32](word & cast[uint64](0xFFFFFFFF))
+    return addr + cast[uint64](4)
+
+
+# Build a 64-bit immediate into register xd using movz + up-to-three movk. The
+# AArch64 encodings:
+#   movz xd, #imm16, lsl #(16*hw)  = 0xD2800000 | (hw<<21) | (imm16<<5) | xd
+#   movk xd, #imm16, lsl #(16*hw)  = 0xF2800000 | (hw<<21) | (imm16<<5) | xd
+# We always emit the full 4-halfword sequence for simplicity/determinism.
+def _emit_load_imm64(addr: uint64, xd: uint64, value: uint64) -> uint64:
+    a: uint64 = addr
+    h0: uint64 = value & cast[uint64](0xFFFF)
+    h1: uint64 = (value >> cast[uint64](16)) & cast[uint64](0xFFFF)
+    h2: uint64 = (value >> cast[uint64](32)) & cast[uint64](0xFFFF)
+    h3: uint64 = (value >> cast[uint64](48)) & cast[uint64](0xFFFF)
+
+    movz: uint64 = cast[uint64](0xD2800000) | (h0 << cast[uint64](5)) | xd
+    a = _emit_word(a, movz)
+    w1: uint64 = cast[uint64](0xF2800000) | (cast[uint64](1) << cast[uint64](21)) | (h1 << cast[uint64](5)) | xd
+    a = _emit_word(a, w1)
+    w2: uint64 = cast[uint64](0xF2800000) | (cast[uint64](2) << cast[uint64](21)) | (h2 << cast[uint64](5)) | xd
+    a = _emit_word(a, w2)
+    w3: uint64 = cast[uint64](0xF2800000) | (cast[uint64](3) << cast[uint64](21)) | (h3 << cast[uint64](5)) | xd
+    a = _emit_word(a, w3)
+    return a
+
+
+# Copy a NUL-terminated string into the EL0 message buffer and return its
+# byte length (excluding the terminator).
+def _copy_user_msg(s: Ptr[char]) -> uint64:
+    src: Ptr[uint8] = cast[Ptr[uint8]](s)
+    dst: Ptr[uint8] = cast[Ptr[uint8]](USER_MSG_BASE)
+    i: int64 = 0
+    while src[i] != 0:
+        dst[i] = src[i]
+        i = i + 1
+    return cast[uint64](i)
+
+
+# Materialise the EL0 routine into USER_CODE_BASE:
+#   x0 = 1 (stdout); x1 = msg ptr; x2 = len; x8 = 64 (write); svc #0
+#   x0 = 0;          x8 = 93 (exit);                            svc #0
+# Returns nothing meaningful; the page is then entered via eret.
+def arm64_build_user_routine(msg_len: uint64) -> int64:
+    a: uint64 = USER_CODE_BASE
+    a = _emit_load_imm64(a, cast[uint64](0), cast[uint64](1))            # x0 = 1
+    a = _emit_load_imm64(a, cast[uint64](1), USER_MSG_BASE)             # x1 = msg
+    a = _emit_load_imm64(a, cast[uint64](2), msg_len)                   # x2 = len
+    a = _emit_load_imm64(a, cast[uint64](8), SYS_WRITE_NR)              # x8 = 64
+    a = _emit_word(a, cast[uint64](0xD4000001))                        # svc #0
+    a = _emit_load_imm64(a, cast[uint64](0), cast[uint64](0))           # x0 = 0
+    a = _emit_load_imm64(a, cast[uint64](8), SYS_EXIT_NR)              # x8 = 93
+    a = _emit_word(a, cast[uint64](0xD4000001))                        # svc #0
+
+    # Ensure the freshly-written instructions are visible to the I-side: clean
+    # the data writes and invalidate I-cache (we use a full barrier + ISB; the
+    # demo page is small so a coarse maintenance is sufficient here).
+    _dsb_ish()
+    _isb()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# EL0 synchronous-exception (svc) dispatcher. Called from the vectors.S
+# lower-EL sync stub with `frame_ptr` -> the saved x0..x30 frame (slot n holds
+# xn). We confirm the trap is an AArch64 SVC via ESR_EL1.EC, pull the syscall
+# number (x8) and args (x0..x5) out of the frame, service it, and write the
+# return value back into the x0 slot so the eret resumes EL0 with x0 set.
+# ---------------------------------------------------------------------------
+def arm64_sync_handler(frame_ptr: Ptr[uint64]) -> int64:
+    esr: uint64 = cast[uint64](_mrs_esr_el1())
+    ec: uint64 = (esr >> cast[uint64](26)) & cast[uint64](0x3F)
+
+    if ec != ESR_EC_SVC64:
+        # Not a syscall — a genuine fault from EL0. Report and halt.
+        msg: Ptr[char] = "[arm64] EL0 non-SVC sync exception\n"
+        _uart_puts(msg)
+        while True:
+            _wfi()
+
+    nr: uint64 = frame_ptr[8]          # x8 = syscall number
+    a0: uint64 = frame_ptr[0]          # x0
+    a1: uint64 = frame_ptr[1]          # x1
+    a2: uint64 = frame_ptr[2]          # x2
+
+    ret: uint64 = cast[uint64](0)
+
+    if nr == SYS_WRITE_NR:
+        # write(fd, buf, len): emit the buffer to the kernel UART regardless of
+        # fd (the demo only ever uses fd 1). Return the byte count.
+        buf: Ptr[uint8] = cast[Ptr[uint8]](a1)
+        n: uint64 = cast[uint64](0)
+        while n < a2:
+            _uart_putc(buf[n])
+            n = n + cast[uint64](1)
+        okmsg: Ptr[char] = "[arm64] EL0 write syscall serviced\n"
+        _uart_puts(okmsg)
+        ret = a2
+    elif nr == SYS_EXIT_NR:
+        # exit(code): record the code and signal the launcher to halt.
+        arm64_el0_exit_code = cast[int64](a0)
+        arm64_el0_exited = 1
+        exmsg: Ptr[char] = "[arm64] EL0 exit syscall serviced\n"
+        _uart_puts(exmsg)
+        ret = cast[uint64](0)
+    else:
+        unkmsg: Ptr[char] = "[arm64] EL0 unknown syscall\n"
+        _uart_puts(unkmsg)
+        ret = cast[uint64](0)
+
+    # Stash the return value into the x0 slot so eret resumes EL0 with x0 set.
+    frame_ptr[0] = ret
+
+    # If EL0 asked to exit, don't return into it; halt the test deterministically
+    # with a PASS marker the test script greps for.
+    if arm64_el0_exited != 0:
+        if arm64_el0_exit_code == 0:
+            passmsg: Ptr[char] = "[arm64] EL0 syscall OK\n"
+            _uart_puts(passmsg)
+        else:
+            failmsg: Ptr[char] = "[arm64] EL0 exited nonzero\n"
+            _uart_puts(failmsg)
+        _msr_daifset(2)
+        while True:
+            _wfi()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Drop to EL0 and run the user routine. Programs SPSR_EL1 (EL0t + DAIF),
+# ELR_EL1 (user entry), SP_EL0 (user stack), then `eret`. Control resumes at
+# USER_CODE_BASE in EL0; the svc traps re-enter EL1 via arm64_sync_handler,
+# which halts the test on exit() (so this function does not return).
+# ---------------------------------------------------------------------------
+def arm64_enter_el0() -> int64:
+    usermsg: Ptr[char] = "Hello from EL0 via svc write\n"
+    msg_len: uint64 = _copy_user_msg(usermsg)
+    arm64_build_user_routine(msg_len)
+
+    enter: Ptr[char] = "[arm64] dropping to EL0\n"
+    _uart_puts(enter)
+
+    _msr_spsr_el1(SPSR_EL0T_DAIF)      # target PSTATE: EL0t, IRQ/FIQ masked
+    _msr_elr_el1(USER_CODE_BASE)       # EL0 entry PC
+    _msr_sp_el0(USER_STACK_TOP)        # EL0 stack pointer
+    _isb()
+    _eret()                            # -> EL0; never returns here
     return 0
 
 

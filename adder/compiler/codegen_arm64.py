@@ -1185,11 +1185,19 @@ class Arm64CodeGen:
         "_msr_sctlr_el1":     "sctlr_el1",
         "_msr_cntv_tval_el0": "cntv_tval_el0",
         "_msr_cntv_ctl_el0":  "cntv_ctl_el0",
+        # Phase 4: EL1->EL0 transition state. SPSR_EL1 holds the target PSTATE
+        # (mode + DAIF), ELR_EL1 the EL0 entry PC, SP_EL0 the EL0 stack pointer.
+        "_msr_spsr_el1":      "spsr_el1",
+        "_msr_elr_el1":       "elr_el1",
+        "_msr_sp_el0":        "sp_el0",
     }
     # name -> system register spelled for `mrs x0, <reg>`.
     _MRS_INTRINSICS = {
         "_mrs_cntfrq_el0": "cntfrq_el0",
         "_mrs_sctlr_el1":  "sctlr_el1",
+        # Phase 4: ESR_EL1 carries the syndrome (EC field) of the trapped
+        # synchronous exception so the Adder sync handler can recognise SVC.
+        "_mrs_esr_el1":    "esr_el1",
     }
     # name -> verbatim barrier / maintenance / wait instruction (no operands).
     _NULLARY_INTRINSICS = {
@@ -1197,6 +1205,9 @@ class Arm64CodeGen:
         "_isb":             "isb",
         "_tlbi_vmalle1is":  "tlbi vmalle1is",
         "_wfi":             "wfi",
+        # Phase 4: return from EL1 to EL0 using SPSR_EL1/ELR_EL1. This never
+        # returns to the Adder caller; control resumes at ELR_EL1 in EL0.
+        "_eret":            "eret",
     }
 
     def _try_gen_arm64_intrinsic(self, name, args, span) -> bool:
