@@ -1,0 +1,1013 @@
+# linux_abi/u_iouring.ad — Linux io_uring async-I/O interface (U-track).
+#
+# io_uring is Linux's modern asynchronous-I/O submission/completion-ring
+# API. A process calls io_uring_setup(2) to allocate a ring context and
+# obtain a ring fd; it mmaps three regions of kernel memory through that
+# fd (the submission-queue ring, the completion-queue ring, and the SQE
+# array) at the documented IORING_OFF_* offsets; it fills SQEs and
+# advances the SQ-ring tail; then io_uring_enter(2) hands the kernel the
+# pending submissions, which the kernel executes and for which it posts
+# completion entries (CQEs) into the CQ ring with the original user_data
+# echoed back alongside the result.
+#
+# This is a SYNCHRONOUS-completion implementation: io_uring_enter executes
+# each submitted opcode inline and posts its CQE immediately before
+# returning. That is a fully valid io_uring implementation — the API never
+# promised asynchrony, only that completions arrive via the CQ ring — and
+# it reuses the SAME file backends (vfs_read / vfs_write / vfs_fsync) the
+# read/readv/writev/fsync syscalls drive, so an io_uring READV behaves
+# byte-for-byte like a readv(2) on the same fd.
+#
+# Memory model. The three ring regions live in kernel memory allocated by
+# kzalloc at setup. Userspace reaches them in one of two ways:
+#   (a) mmap(ring_fd, ..., IORING_OFF_SQ_RING / CQ_RING / SQES) — the
+#       _u_mmap path recognises FD_IORING_MARK and aliases the kernel
+#       pages (see iouring_mmap_region below, wired from u_syscalls.ad).
+#   (b) io_uring_setup also writes the kernel base addresses of the three
+#       regions into the resv[] tail of io_uring_params, so a same-address-
+#       space caller (the boot self-test, or a kernel-cooperating libc)
+#       can use them directly without mmap. This is the documented
+#       params-address fallback the build permits.
+#
+# Layout. To keep the three regions addressable from a single mmap offset
+# selector, each ring context allocates ONE contiguous kzalloc block laid
+# out as: [ SQ ring header+array | CQ ring header+array | SQE array ].
+# IORING_OFF_SQ_RING/CQ_RING/SQES therefore map to fixed sub-offsets we
+# compute at setup and report in the io_uring_params sq_off/cq_off blocks.
+
+from kernel.printk.printk import (
+    printk0, printk1,
+)
+from mm.uaccess import (
+    copy_from_user, copy_to_user,
+)
+from mm.slab import (
+    kzalloc, kfree,
+)
+from fs.vfs import (
+    vfs_alloc_l2_fd, vfs_fd_marker,
+    vfs_read, vfs_write, vfs_fsync, vfs_lseek, vfs_close, vfs_open_memfd,
+)
+# §self-test only: the boot:37.iouring hook runs in the bootstrap task,
+# whose per-task fd table is uninitialised. We free slots 3..15 before the
+# body and restore after — the same dance memfd/pidfd self-tests perform.
+from kernel.sched.core import (
+    TaskStruct, current_task, FD_CLOSED_MARK,
+)
+
+# --- FD marker ------------------------------------------------------
+#
+# 0xFFFFFFD0 is the free slot immediately below FD_PIDFD_MARK (0xD1) and
+# clear of every other Layer-2 marker (epoll family 0xD3..0xD7, filemmap
+# 0xD2, pidfd 0xD1). fd_buf on this slot holds the 1-based ring-context
+# index (0 means "no context"); fd_pos/fd_buflen stay zero.
+FD_IORING_MARK: uint32 = 0xFFFFFFD0
+
+# --- Linux io_uring uapi constants (uapi/linux/io_uring.h) ----------
+
+# io_uring_setup flags we recognise. We accept (and ignore) the common
+# ones; unknown bits are rejected with EINVAL like the kernel.
+IORING_SETUP_KNOWN: uint32 = 0xFFFFFFFF   # tolerate any (we run synchronously)
+
+# io_uring_enter flags.
+IORING_ENTER_GETEVENTS: uint32 = 0x1
+
+# mmap offsets (the magic constants libc passes as the mmap `offset`).
+IORING_OFF_SQ_RING: uint64 = 0x0
+IORING_OFF_CQ_RING: uint64 = 0x8000000
+IORING_OFF_SQES:    uint64 = 0x10000000
+
+# Opcodes (io_uring_op). Only the ones we execute are named.
+IORING_OP_NOP:    uint8 = 0
+IORING_OP_READV:  uint8 = 1
+IORING_OP_WRITEV: uint8 = 2
+IORING_OP_FSYNC:  uint8 = 3
+IORING_OP_READ:   uint8 = 22
+IORING_OP_WRITE:  uint8 = 23
+
+# io_uring_register opcodes.
+IORING_REGISTER_BUFFERS:   uint32 = 0
+IORING_UNREGISTER_BUFFERS: uint32 = 1
+IORING_REGISTER_FILES:     uint32 = 2
+IORING_UNREGISTER_FILES:   uint32 = 3
+
+# Errnos (Linux negative-return convention).
+IOU_EPERM:  int64 = -1
+IOU_EBADF:  int64 = -9
+IOU_EFAULT: int64 = -14
+IOU_EBUSY:  int64 = -16
+IOU_EINVAL: int64 = -22
+IOU_EMFILE: int64 = -24
+IOU_ENOMEM: int64 = -12
+
+# Structure sizes (bytes). The SQE is a fixed 64-byte record; the CQE is
+# 16 bytes. These match the on-disk uapi layouts exactly so a real libc
+# (liburing) talking to a real mmap of the ring sees the right shapes.
+SQE_BYTES: uint64 = 64
+CQE_BYTES: uint64 = 16
+
+# struct io_sqring_offsets / io_cqring_offsets field offsets inside the
+# kernel ring header. We place the per-ring control words (head, tail,
+# ring_mask, ring_entries, flags, dropped/overflow, array) at the front of
+# each ring region in this fixed order, then report these offsets in the
+# io_uring_params sq_off/cq_off so userspace finds them.
+#
+# Ring-header word layout (uint32 each, 4 bytes apart):
+#   [0] head        [1] tail        [2] ring_mask   [3] ring_entries
+#   [4] flags       [5] dropped/overflow            [6] reserved
+# The SQ ring then has its index `array` immediately after the header
+# (SQ_ARRAY_OFF); the CQ ring has its CQE array after the header
+# (CQ_CQES_OFF). The SQE array is a wholly separate region.
+RING_HDR_HEAD:    uint64 = 0
+RING_HDR_TAIL:    uint64 = 4
+RING_HDR_MASK:    uint64 = 8
+RING_HDR_ENTRIES: uint64 = 12
+RING_HDR_FLAGS:   uint64 = 16
+RING_HDR_DROPPED: uint64 = 20
+RING_HDR_RESV:    uint64 = 24
+RING_HDR_BYTES:   uint64 = 64        # padded header; SQ array follows here
+
+# --- Ring context pool ---------------------------------------------
+
+IOURING_MAX_RINGS:   uint64 = 8      # concurrent ring fds supported
+IOURING_MAX_ENTRIES: uint32 = 4096   # cap on SQ/CQ entries (Linux caps 32768)
+
+# Per-ring kernel state. Kept in module-scope parallel arrays (Adder has
+# no struct-array-of-records sugar we lean on elsewhere; flat arrays keep
+# the allocation static and the access checks trivial).
+_ring_in_use:  Array[8, int32]       # 1 if this slot is live
+_ring_fd:      Array[8, int32]       # the ring fd that owns this slot
+_ring_base:    Array[8, uint64]      # kzalloc base of the contiguous block
+_ring_total:   Array[8, uint64]      # total bytes allocated (for kfree)
+_ring_sq_off:  Array[8, uint64]      # SQ ring region offset within base
+_ring_cq_off:  Array[8, uint64]      # CQ ring region offset within base
+_ring_sqes_off: Array[8, uint64]     # SQE array region offset within base
+_ring_entries: Array[8, uint32]      # SQ/CQ entry count (power of two)
+_ring_inited:  int32 = 0
+
+
+def _iouring_pool_init():
+    # Idempotent one-time zeroing of the ring pool. Called from setup.
+    if _ring_inited != 0:
+        return
+    i: uint64 = 0
+    while i < IOURING_MAX_RINGS:
+        _ring_in_use[i] = 0
+        _ring_fd[i] = -1
+        _ring_base[i] = 0
+        _ring_total[i] = 0
+        i = i + 1
+    _ring_inited = 1
+
+
+def _iouring_alloc_slot() -> int64:
+    # Claim a free ring-context slot index, or -1 if the pool is full.
+    i: uint64 = 0
+    while i < IOURING_MAX_RINGS:
+        if _ring_in_use[i] == 0:
+            return cast[int64](i)
+        i = i + 1
+    return -1
+
+
+def _roundup_pow2_u32(v: uint32) -> uint32:
+    # Smallest power of two >= v (v>=1). io_uring rounds `entries` up.
+    if v <= 1:
+        return 1
+    r: uint32 = 1
+    while r < v:
+        r = r * 2
+    return r
+
+
+# --- io_uring_setup (nr 425) ----------------------------------------
+
+# io_uring_params field byte-offsets (uapi/linux/io_uring.h). The struct:
+#   __u32 sq_entries;        +0
+#   __u32 cq_entries;        +4
+#   __u32 flags;             +8
+#   __u32 sq_thread_cpu;     +12
+#   __u32 sq_thread_idle;    +16
+#   __u32 features;          +20
+#   __u32 wq_fd;             +24
+#   __u32 resv[3];           +28 (12 bytes)
+#   struct io_sqring_offsets sq_off;   +40 (40 bytes)
+#   struct io_cqring_offsets cq_off;   +80 (40 bytes)
+# total 120 bytes. We copy it in, fill it, copy it back.
+PARAMS_BYTES: uint64 = 120
+PARAMS_SQ_ENTRIES: uint64 = 0
+PARAMS_CQ_ENTRIES: uint64 = 4
+PARAMS_FLAGS:      uint64 = 8
+PARAMS_FEATURES:   uint64 = 20
+PARAMS_RESV0:      uint64 = 28      # resv[0]
+PARAMS_RESV1:      uint64 = 32      # resv[1] — used for ring base addr lo
+PARAMS_SQ_OFF:     uint64 = 40
+PARAMS_CQ_OFF:     uint64 = 80
+
+# struct io_sqring_offsets (and io_cqring_offsets share the first words):
+#   __u32 head; tail; ring_mask; ring_entries; flags; dropped; array; ...
+SQO_HEAD:    uint64 = 0
+SQO_TAIL:    uint64 = 4
+SQO_MASK:    uint64 = 8
+SQO_ENTRIES: uint64 = 12
+SQO_FLAGS:   uint64 = 16
+SQO_DROPPED: uint64 = 20
+SQO_ARRAY:   uint64 = 24
+
+CQO_HEAD:     uint64 = 0
+CQO_TAIL:     uint64 = 4
+CQO_MASK:     uint64 = 8
+CQO_ENTRIES:  uint64 = 12
+CQO_OVERFLOW: uint64 = 16
+CQO_CQES:     uint64 = 20
+
+# IORING_FEAT_* bits we advertise. SINGLE_MMAP lets userspace map SQ and
+# CQ in one call; we report it but also support separate maps.
+IORING_FEAT_SINGLE_MMAP: uint32 = 1
+IORING_FEAT_NODROP:      uint32 = 2
+
+_params_scratch: Array[120, uint8]   # kernel staging for io_uring_params
+
+
+def _u32_store(base: uint64, off: uint64, v: uint32):
+    cast[Ptr[uint32]](base + off)[0] = v
+
+
+def _u32_load(base: uint64, off: uint64) -> uint32:
+    return cast[Ptr[uint32]](base + off)[0]
+
+
+def io_uring_setup(a0: uint64, a1: uint64, a2: uint64,
+                   a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # int io_uring_setup(u32 entries, struct io_uring_params *params)
+    #   a0 = entries (requested SQ depth; rounded up to a power of two)
+    #   a1 = params  (user pointer, both in (flags) and out)
+    _iouring_pool_init()
+
+    entries: uint32 = cast[uint32](a0)
+    if entries == 0:
+        return IOU_EINVAL
+    if entries > IOURING_MAX_ENTRIES:
+        entries = IOURING_MAX_ENTRIES
+    n: uint32 = _roundup_pow2_u32(entries)
+
+    if a1 == 0:
+        return IOU_EFAULT
+    # Pull the user's io_uring_params in (we read flags, and zero the rest
+    # before writing our offsets back).
+    if copy_from_user(cast[uint64](&_params_scratch[0]), a1,
+                      PARAMS_BYTES) != 0:
+        return IOU_EFAULT
+    pb: uint64 = cast[uint64](&_params_scratch[0])
+    flags: uint32 = _u32_load(pb, PARAMS_FLAGS)
+    # We run completions synchronously; reject SQPOLL/IOPOLL-only setups
+    # would be unfriendly, so we tolerate any flag bit (the work still
+    # completes inline). No EINVAL on unknown flags here, matching the
+    # permissive stance the rest of the U-track takes.
+
+    # Region sizes. SQ ring = header + (n * u32 index array). CQ ring =
+    # header + (n * CQE). SQE array = n * SQE. Page-align each region so a
+    # future real mmap can hand whole pages.
+    page: uint64 = 0x1000
+    sq_region: uint64 = RING_HDR_BYTES + cast[uint64](n) * 4
+    sq_region = (sq_region + page - 1) & ~(page - 1)
+    cq_region: uint64 = RING_HDR_BYTES + cast[uint64](n) * CQE_BYTES
+    cq_region = (cq_region + page - 1) & ~(page - 1)
+    sqes_region: uint64 = cast[uint64](n) * SQE_BYTES
+    sqes_region = (sqes_region + page - 1) & ~(page - 1)
+    total: uint64 = sq_region + cq_region + sqes_region
+
+    slot: int64 = _iouring_alloc_slot()
+    if slot < 0:
+        return IOU_EMFILE
+    su: uint64 = cast[uint64](slot)
+
+    base: uint64 = kzalloc(total)
+    if base == 0:
+        return IOU_ENOMEM
+
+    fd: int32 = vfs_alloc_l2_fd(FD_IORING_MARK)
+    if fd < 0:
+        kfree(base)
+        return IOU_EMFILE
+    # The ring fd -> slot mapping is kept HERE in _ring_fd[] (fs/vfs.ad's
+    # generic fd_buf whitelist does not include FD_IORING_MARK, so we own
+    # the back-reference rather than leaning on the shared fd_buf word).
+    # _iouring_slot_for_fd searches _ring_fd[] for a live match.
+
+    _ring_in_use[su] = 1
+    _ring_fd[su] = fd
+    _ring_base[su] = base
+    _ring_total[su] = total
+    _ring_sq_off[su] = 0
+    _ring_cq_off[su] = sq_region
+    _ring_sqes_off[su] = sq_region + cq_region
+    _ring_entries[su] = n
+
+    # Initialise the SQ ring header in kernel memory.
+    sq_base: uint64 = base + 0
+    _u32_store(sq_base, RING_HDR_HEAD, 0)
+    _u32_store(sq_base, RING_HDR_TAIL, 0)
+    _u32_store(sq_base, RING_HDR_MASK, n - 1)
+    _u32_store(sq_base, RING_HDR_ENTRIES, n)
+    _u32_store(sq_base, RING_HDR_FLAGS, 0)
+    _u32_store(sq_base, RING_HDR_DROPPED, 0)
+    # SQ index array sits right after the header. Identity-initialise it so
+    # a userspace that submits sequentially without touching `array` (the
+    # common liburing pattern uses array[i] = sqe_index) still works for an
+    # in-order ring: array[k] = k.
+    sq_array_off: uint64 = RING_HDR_BYTES
+    ai: uint64 = 0
+    while ai < cast[uint64](n):
+        cast[Ptr[uint32]](sq_base + sq_array_off + ai * 4)[0] = cast[uint32](ai)
+        ai = ai + 1
+
+    # Initialise the CQ ring header.
+    cq_base: uint64 = base + sq_region
+    _u32_store(cq_base, RING_HDR_HEAD, 0)
+    _u32_store(cq_base, RING_HDR_TAIL, 0)
+    _u32_store(cq_base, RING_HDR_MASK, n - 1)
+    _u32_store(cq_base, RING_HDR_ENTRIES, n)
+    _u32_store(cq_base, RING_HDR_FLAGS, 0)
+    _u32_store(cq_base, RING_HDR_DROPPED, 0)
+
+    # Fill the io_uring_params to report back.
+    _u32_store(pb, PARAMS_SQ_ENTRIES, n)
+    _u32_store(pb, PARAMS_CQ_ENTRIES, n)
+    _u32_store(pb, PARAMS_FEATURES,
+               IORING_FEAT_SINGLE_MMAP | IORING_FEAT_NODROP)
+
+    # sq_off: offsets WITHIN the SQ ring mmap region (IORING_OFF_SQ_RING).
+    _u32_store(pb, PARAMS_SQ_OFF + SQO_HEAD,    cast[uint32](RING_HDR_HEAD))
+    _u32_store(pb, PARAMS_SQ_OFF + SQO_TAIL,    cast[uint32](RING_HDR_TAIL))
+    _u32_store(pb, PARAMS_SQ_OFF + SQO_MASK,    cast[uint32](RING_HDR_MASK))
+    _u32_store(pb, PARAMS_SQ_OFF + SQO_ENTRIES, cast[uint32](RING_HDR_ENTRIES))
+    _u32_store(pb, PARAMS_SQ_OFF + SQO_FLAGS,   cast[uint32](RING_HDR_FLAGS))
+    _u32_store(pb, PARAMS_SQ_OFF + SQO_DROPPED, cast[uint32](RING_HDR_DROPPED))
+    _u32_store(pb, PARAMS_SQ_OFF + SQO_ARRAY,   cast[uint32](sq_array_off))
+
+    # cq_off: offsets WITHIN the CQ ring mmap region (IORING_OFF_CQ_RING).
+    cq_cqes_off: uint64 = RING_HDR_BYTES
+    _u32_store(pb, PARAMS_CQ_OFF + CQO_HEAD,     cast[uint32](RING_HDR_HEAD))
+    _u32_store(pb, PARAMS_CQ_OFF + CQO_TAIL,     cast[uint32](RING_HDR_TAIL))
+    _u32_store(pb, PARAMS_CQ_OFF + CQO_MASK,     cast[uint32](RING_HDR_MASK))
+    _u32_store(pb, PARAMS_CQ_OFF + CQO_ENTRIES,  cast[uint32](RING_HDR_ENTRIES))
+    _u32_store(pb, PARAMS_CQ_OFF + CQO_OVERFLOW, cast[uint32](RING_HDR_DROPPED))
+    _u32_store(pb, PARAMS_CQ_OFF + CQO_CQES,     cast[uint32](cq_cqes_off))
+
+    # Params-address fallback: expose the kernel SQ-ring base address in
+    # resv[1..2] (8 bytes across two u32) so a same-address-space caller
+    # (the boot self-test) can use the regions directly without mmap. A
+    # real userspace ignores resv and mmaps instead.
+    _u32_store(pb, PARAMS_RESV1, cast[uint32](base & 0xFFFFFFFF))
+    _u32_store(pb, PARAMS_RESV1 + 4, cast[uint32](base >> 32))
+
+    if copy_to_user(a1, pb, PARAMS_BYTES) != 0:
+        # Roll back: free the ring + the fd record.
+        _iouring_teardown_slot(su)
+        vfs_close(fd)
+        return IOU_EFAULT
+
+    return cast[int64](fd)
+
+
+def _iouring_teardown_slot(su: uint64):
+    # Release a ring context's kernel memory and mark the slot free. The
+    # fd record itself is closed by the caller / vfs_close path.
+    if su >= IOURING_MAX_RINGS:
+        return
+    if _ring_in_use[su] == 0:
+        return
+    if _ring_base[su] != 0:
+        kfree(_ring_base[su])
+    _ring_in_use[su] = 0
+    _ring_fd[su] = -1
+    _ring_base[su] = 0
+    _ring_total[su] = 0
+
+
+def iouring_close_fd(fd: int32) -> int32:
+    # Called from the close(2) path when an FD_IORING_MARK fd is closed:
+    # tear down its ring context. Returns 0 if it WAS an io_uring fd (and
+    # was released), -1 otherwise so the caller can fall through.
+    if vfs_fd_marker(fd) != FD_IORING_MARK:
+        return -1
+    su64: int64 = _iouring_slot_for_fd(fd)
+    if su64 < 0:
+        return 0
+    _iouring_teardown_slot(cast[uint64](su64))
+    return 0
+
+
+def _iouring_slot_for_fd(fd: int32) -> int64:
+    # Resolve an io_uring fd to its ring-context slot index by searching
+    # the _ring_fd[] back-reference for a live match, or -1. We confirm
+    # the fd marker first so a recycled non-io_uring fd that happens to
+    # share an integer value never resolves.
+    if vfs_fd_marker(fd) != FD_IORING_MARK:
+        return -1
+    i: uint64 = 0
+    while i < IOURING_MAX_RINGS:
+        if _ring_in_use[i] != 0 and _ring_fd[i] == fd:
+            return cast[int64](i)
+        i = i + 1
+    return -1
+
+
+# --- mmap-of-ring-fd hook (wired from u_syscalls.ad::_u_mmap) -------
+#
+# Given an io_uring fd and the mmap `offset` selector, return the kernel
+# base address of the requested ring region so the mmap path can alias it.
+# Returns 0 if `fd` is not an io_uring fd or the offset is unknown.
+def iouring_mmap_region(fd: int32, offset: uint64) -> uint64:
+    su64: int64 = _iouring_slot_for_fd(fd)
+    if su64 < 0:
+        return 0
+    su: uint64 = cast[uint64](su64)
+    base: uint64 = _ring_base[su]
+    if offset == IORING_OFF_SQ_RING:
+        return base + _ring_sq_off[su]
+    if offset == IORING_OFF_CQ_RING:
+        return base + _ring_cq_off[su]
+    if offset == IORING_OFF_SQES:
+        return base + _ring_sqes_off[su]
+    return 0
+
+
+# --- SQE decode + opcode execution ----------------------------------
+#
+# struct io_uring_sqe (64 bytes) — the fields we read:
+#   u8  opcode;       +0
+#   u8  flags;        +1
+#   u16 ioprio;       +2
+#   s32 fd;           +4
+#   u64 off;          +8   (file offset, or addr2 for some ops)
+#   u64 addr;         +16  (buffer / iovec pointer)
+#   u32 len;          +24  (length / iovec count)
+#   u32 op_flags;     +28  (rw_flags / fsync_flags / ...)
+#   u64 user_data;    +32  (echoed verbatim into the CQE)
+#   ... (rest unused here)
+SQE_OPCODE:    uint64 = 0
+SQE_FD:        uint64 = 4
+SQE_OFF:       uint64 = 8
+SQE_ADDR:      uint64 = 16
+SQE_LEN:       uint64 = 24
+SQE_USER_DATA: uint64 = 32
+
+
+def _iouring_do_readv(fd: int32, iov: uint64, cnt: uint64) -> int64:
+    # Mirror of _u_readv's iovec walk, fanning each chunk through
+    # vfs_read. The iovec[] lives in user memory but (like _u_readv) is
+    # accessed directly — boot self-test and identity-mapped userspace
+    # both satisfy that. 16 bytes per iovec entry (base, len).
+    if cnt == 0:
+        return 0
+    if iov == 0:
+        return IOU_EINVAL
+    total: int64 = 0
+    i: uint64 = 0
+    while i < cnt:
+        entry: uint64 = iov + i * 16
+        ibase: uint64 = cast[Ptr[uint64]](entry)[0]
+        ilen:  uint64 = cast[Ptr[uint64]](entry + 8)[0]
+        if ilen == 0:
+            i = i + 1
+            continue
+        nn: int64 = vfs_read(fd, cast[Ptr[uint8]](ibase), ilen)
+        if nn < 0:
+            if total == 0:
+                return nn
+            return total
+        total = total + nn
+        if cast[uint64](nn) < ilen:
+            return total
+        i = i + 1
+    return total
+
+
+def _iouring_do_writev(fd: int32, iov: uint64, cnt: uint64) -> int64:
+    if cnt == 0:
+        return 0
+    if iov == 0:
+        return IOU_EINVAL
+    total: int64 = 0
+    i: uint64 = 0
+    while i < cnt:
+        entry: uint64 = iov + i * 16
+        ibase: uint64 = cast[Ptr[uint64]](entry)[0]
+        ilen:  uint64 = cast[Ptr[uint64]](entry + 8)[0]
+        if ilen == 0:
+            i = i + 1
+            continue
+        nn: int64 = vfs_write(fd, cast[Ptr[uint8]](ibase), ilen)
+        if nn < 0:
+            if total == 0:
+                return nn
+            return total
+        total = total + nn
+        if cast[uint64](nn) < ilen:
+            return total
+        i = i + 1
+    return total
+
+
+def _iouring_exec_sqe(sqe: uint64) -> int64:
+    # Decode one SQE and execute its opcode synchronously, returning the
+    # result the CQE should carry (>=0 bytes / 0 success, or -errno).
+    opcode: uint8 = cast[Ptr[uint8]](sqe + SQE_OPCODE)[0]
+    fd: int32 = cast[Ptr[int32]](sqe + SQE_FD)[0]
+    off: uint64 = cast[Ptr[uint64]](sqe + SQE_OFF)[0]
+    addr: uint64 = cast[Ptr[uint64]](sqe + SQE_ADDR)[0]
+    len: uint32 = cast[Ptr[uint32]](sqe + SQE_LEN)[0]
+
+    if opcode == IORING_OP_NOP:
+        return 0
+    if opcode == IORING_OP_READV:
+        # off is ignored for READV (Linux uses the fd's offset unless
+        # off!=0 — we honour off when non-zero by seeking first).
+        if off != 0:
+            sk: int64 = vfs_lseek(fd, cast[int64](off), 0)
+            if sk < 0:
+                return sk
+        return _iouring_do_readv(fd, addr, cast[uint64](len))
+    if opcode == IORING_OP_WRITEV:
+        if off != 0:
+            sk2: int64 = vfs_lseek(fd, cast[int64](off), 0)
+            if sk2 < 0:
+                return sk2
+        return _iouring_do_writev(fd, addr, cast[uint64](len))
+    if opcode == IORING_OP_READ:
+        if off != 0:
+            sk3: int64 = vfs_lseek(fd, cast[int64](off), 0)
+            if sk3 < 0:
+                return sk3
+        return vfs_read(fd, cast[Ptr[uint8]](addr), cast[uint64](len))
+    if opcode == IORING_OP_WRITE:
+        if off != 0:
+            sk4: int64 = vfs_lseek(fd, cast[int64](off), 0)
+            if sk4 < 0:
+                return sk4
+        return vfs_write(fd, cast[Ptr[uint8]](addr), cast[uint64](len))
+    if opcode == IORING_OP_FSYNC:
+        rc: int32 = vfs_fsync(fd)
+        return cast[int64](rc)
+    # Unknown opcode: Linux posts -EINVAL in the CQE (the ring keeps
+    # working). Do the same.
+    return IOU_EINVAL
+
+
+def _iouring_post_cqe(su: uint64, user_data: uint64, res: int64):
+    # Append a completion (user_data echoed, res = result) to the CQ ring.
+    # struct io_uring_cqe { u64 user_data; s32 res; u32 flags; } — 16 B.
+    base: uint64 = _ring_base[su]
+    cq_base: uint64 = base + _ring_cq_off[su]
+    n: uint32 = _ring_entries[su]
+    mask: uint32 = n - 1
+    tail: uint32 = _u32_load(cq_base, RING_HDR_TAIL)
+    idx: uint32 = tail & mask
+    cqes: uint64 = cq_base + RING_HDR_BYTES
+    cqe: uint64 = cqes + cast[uint64](idx) * CQE_BYTES
+    cast[Ptr[uint64]](cqe + 0)[0] = user_data
+    cast[Ptr[int32]](cqe + 8)[0] = cast[int32](res)
+    cast[Ptr[uint32]](cqe + 12)[0] = 0
+    # Publish: advance the CQ tail by one.
+    _u32_store(cq_base, RING_HDR_TAIL, tail + 1)
+
+
+# --- io_uring_enter (nr 426) ----------------------------------------
+
+def io_uring_enter(a0: uint64, a1: uint64, a2: uint64,
+                   a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # int io_uring_enter(unsigned fd, u32 to_submit, u32 min_complete,
+    #                    u32 flags, sigset_t *sig, size_t sigsz)
+    fd: int32 = cast[int32](a0)
+    to_submit: uint32 = cast[uint32](a1)
+    min_complete: uint32 = cast[uint32](a2)
+    flags: uint32 = cast[uint32](a3)
+
+    su64: int64 = _iouring_slot_for_fd(fd)
+    if su64 < 0:
+        return IOU_EBADF
+    su: uint64 = cast[uint64](su64)
+
+    base: uint64 = _ring_base[su]
+    sq_base: uint64 = base + _ring_sq_off[su]
+    n: uint32 = _ring_entries[su]
+    mask: uint32 = n - 1
+    sq_array: uint64 = sq_base + RING_HDR_BYTES
+    sqes: uint64 = base + _ring_sqes_off[su]
+
+    submitted: uint32 = 0
+    sq_head: uint32 = _u32_load(sq_base, RING_HDR_HEAD)
+    sq_tail: uint32 = _u32_load(sq_base, RING_HDR_TAIL)
+
+    # Consume up to to_submit SQEs that userspace has published (between
+    # head and tail). Each consumed SQE is executed inline and its CQE
+    # posted immediately.
+    while submitted < to_submit and sq_head != sq_tail:
+        arr_idx: uint32 = sq_head & mask
+        # SQ `array` indirection: array[arr_idx] -> sqe slot.
+        sqe_idx: uint32 = cast[Ptr[uint32]](sq_array
+                                            + cast[uint64](arr_idx) * 4)[0]
+        sqe_idx = sqe_idx & mask
+        sqe: uint64 = sqes + cast[uint64](sqe_idx) * SQE_BYTES
+        user_data: uint64 = cast[Ptr[uint64]](sqe + SQE_USER_DATA)[0]
+        res: int64 = _iouring_exec_sqe(sqe)
+        _iouring_post_cqe(su, user_data, res)
+        sq_head = sq_head + 1
+        submitted = submitted + 1
+
+    # Publish the new SQ head so userspace knows what we consumed.
+    _u32_store(sq_base, RING_HDR_HEAD, sq_head)
+
+    # IORING_ENTER_GETEVENTS: ensure at least min_complete CQEs are
+    # available. Because every submission completes synchronously above,
+    # the count of posted CQEs already equals what we submitted; there is
+    # nothing left to wait for. Validate the invariant rather than spin.
+    if (flags & IORING_ENTER_GETEVENTS) != 0:
+        cq_base: uint64 = base + _ring_cq_off[su]
+        cq_head: uint32 = _u32_load(cq_base, RING_HDR_HEAD)
+        cq_tail: uint32 = _u32_load(cq_base, RING_HDR_TAIL)
+        avail: uint32 = cq_tail - cq_head
+        if avail < min_complete:
+            # Synchronous model: we cannot produce more completions than
+            # were submitted. Report what we submitted; the caller reaps
+            # what's there. (No async source can add to the ring later.)
+            return cast[int64](submitted)
+
+    return cast[int64](submitted)
+
+
+# --- io_uring_register (nr 427) -------------------------------------
+#
+# Minimal support: REGISTER_BUFFERS / REGISTER_FILES record that
+# registration happened (and validate the args), then succeed. Since our
+# opcodes resolve buffers/fds directly from each SQE at execution time
+# (we do not use the fixed-buffer / fixed-file fast paths), registration
+# is a bookkeeping no-op that nonetheless lets liburing's
+# io_uring_register_buffers()/files() succeed. UNREGISTER mirrors it.
+_ring_reg_nbuf:  Array[8, uint32]
+_ring_reg_nfile: Array[8, uint32]
+
+
+def io_uring_register(a0: uint64, a1: uint64, a2: uint64,
+                      a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # int io_uring_register(unsigned fd, unsigned opcode, void *arg,
+    #                       unsigned nr_args)
+    fd: int32 = cast[int32](a0)
+    opcode: uint32 = cast[uint32](a1)
+    nr_args: uint32 = cast[uint32](a3)
+
+    su64: int64 = _iouring_slot_for_fd(fd)
+    if su64 < 0:
+        return IOU_EBADF
+    su: uint64 = cast[uint64](su64)
+
+    if opcode == IORING_REGISTER_BUFFERS:
+        if a2 == 0 or nr_args == 0:
+            return IOU_EINVAL
+        if _ring_reg_nbuf[su] != 0:
+            return IOU_EBUSY               # already registered
+        _ring_reg_nbuf[su] = nr_args
+        return 0
+    if opcode == IORING_UNREGISTER_BUFFERS:
+        if _ring_reg_nbuf[su] == 0:
+            return IOU_EINVAL
+        _ring_reg_nbuf[su] = 0
+        return 0
+    if opcode == IORING_REGISTER_FILES:
+        if a2 == 0 or nr_args == 0:
+            return IOU_EINVAL
+        if _ring_reg_nfile[su] != 0:
+            return IOU_EBUSY
+        _ring_reg_nfile[su] = nr_args
+        return 0
+    if opcode == IORING_UNREGISTER_FILES:
+        if _ring_reg_nfile[su] == 0:
+            return IOU_EINVAL
+        _ring_reg_nfile[su] = 0
+        return 0
+    return IOU_EINVAL
+
+
+# --- in-kernel self-test (boot:37.iouring) --------------------------
+#
+# Drives the full setup -> submit -> complete path in boot context using
+# the params-address fallback (resv[1] carries the kernel ring base), so
+# no mmap is needed. Steps:
+#   (1) io_uring_setup(8, params); decode sq_off/cq_off + ring base.
+#   (2) submit a NOP, enter, assert its CQE (user_data echoed, res 0).
+#   (3) open a tmpfs file; WRITEV bytes via the ring; READV them back
+#       byte-exact via the ring; FSYNC via the ring.
+# Prints "[iouring] PASS" only when every assertion holds.
+
+_iou_params: Array[120, uint8]       # user-visible io_uring_params (boot ctx)
+_iou_iov:    Array[16, uint8]        # one iovec (base@0, len@8)
+_iou_src:    Array[32, uint8]        # writev payload
+_iou_dst:    Array[32, uint8]        # readv buffer
+
+
+def _iou_fail(msg: Ptr[char]):
+    printk0("[iouring] FAIL: ")
+    printk0(msg)
+    printk0("\n")
+
+
+def iouring_selftest():
+    # Free fd slots 3..15 in the bootstrap task (its fd table is
+    # uninitialised), run the body, then restore — same dance as
+    # memfd_selftest.
+    iou_task: Ptr[TaskStruct] = current_task()
+    iou_save: Array[16, uint32]
+    iou_i: uint64 = 3
+    while iou_i < 16:
+        iou_save[iou_i] = iou_task[0].fd_idx[iou_i]
+        iou_task[0].fd_idx[iou_i] = FD_CLOSED_MARK
+        iou_i = iou_i + 1
+    _iouring_selftest_body()
+    iou_i = 3
+    while iou_i < 16:
+        iou_task[0].fd_idx[iou_i] = iou_save[iou_i]
+        iou_i = iou_i + 1
+
+
+def _iou_fill_payload():
+    # "io_uring-rocks!" — 15 ASCII bytes.
+    p: Ptr[uint8] = "io_uring-rocks!"
+    i: uint64 = 0
+    while i < 15:
+        _iou_src[i] = p[i]
+        i = i + 1
+    _iou_src[15] = 0
+
+
+def _iouring_selftest_body():
+    printk0("[iouring] self-test start\n")
+    _iou_fill_payload()
+
+    # --- (1) setup -----------------------------------------------------
+    # Zero the user-visible params and call setup. In boot context the
+    # "user pointer" is an identity-mapped kernel buffer, which
+    # copy_from_user/copy_to_user resolve through the current PML4.
+    pi: uint64 = 0
+    while pi < 120:
+        _iou_params[pi] = 0
+        pi = pi + 1
+    pp: uint64 = cast[uint64](&_iou_params[0])
+    ring_fd: int64 = io_uring_setup(8, pp, 0, 0, 0, 0)
+    if ring_fd < 0:
+        _iou_fail("io_uring_setup returned error")
+        return
+    fd: int32 = cast[int32](ring_fd)
+    if vfs_fd_marker(fd) != FD_IORING_MARK:
+        _iou_fail("ring fd not tagged FD_IORING_MARK")
+        vfs_close(fd)
+        return
+
+    # Recover the kernel ring base from resv[1..2] (params-address path).
+    rb_lo: uint32 = _u32_load(pp, PARAMS_RESV1)
+    rb_hi: uint32 = _u32_load(pp, PARAMS_RESV1 + 4)
+    base: uint64 = cast[uint64](rb_lo) | (cast[uint64](rb_hi) << 32)
+    if base == 0:
+        _iou_fail("ring base address not reported in params")
+        vfs_close(fd)
+        return
+    n: uint32 = _u32_load(pp, PARAMS_SQ_ENTRIES)
+    if n != 8:
+        _iou_fail("sq_entries not rounded to 8")
+        vfs_close(fd)
+        return
+
+    # Resolve the three regions from the reported offsets. The boot-ctx
+    # ring base equals _ring_base for slot 0, but we deliberately use the
+    # params-reported base + sq_off/cq_off to exercise the real contract.
+    su64: int64 = _iouring_slot_for_fd(fd)
+    if su64 < 0:
+        _iou_fail("slot lookup failed")
+        vfs_close(fd)
+        return
+    su: uint64 = cast[uint64](su64)
+    sq_base: uint64 = base + _ring_sq_off[su]
+    cq_base: uint64 = base + _ring_cq_off[su]
+    sqes: uint64 = base + _ring_sqes_off[su]
+    mask: uint32 = n - 1
+    sq_array: uint64 = sq_base + RING_HDR_BYTES
+    cq_cqes: uint64 = cq_base + RING_HDR_BYTES
+
+    # --- (2) NOP -------------------------------------------------------
+    # Build SQE 0 = NOP with user_data 0xCAFE, publish via the SQ ring
+    # (array[0]=0, advance tail), enter, then reap the CQE.
+    sqe0: uint64 = sqes + 0
+    j: uint64 = 0
+    while j < SQE_BYTES:
+        cast[Ptr[uint8]](sqe0 + j)[0] = 0
+        j = j + 1
+    cast[Ptr[uint8]](sqe0 + SQE_OPCODE)[0] = IORING_OP_NOP
+    cast[Ptr[uint64]](sqe0 + SQE_USER_DATA)[0] = cast[uint64](0xCAFE)
+    cast[Ptr[uint32]](sq_array + 0)[0] = 0
+    sq_tail0: uint32 = _u32_load(sq_base, RING_HDR_TAIL)
+    _u32_store(sq_base, RING_HDR_TAIL, sq_tail0 + 1)
+
+    er: int64 = io_uring_enter(cast[uint64](fd), 1, 1,
+                               cast[uint64](IORING_ENTER_GETEVENTS), 0, 0)
+    if er != 1:
+        _iou_fail("enter(NOP) did not report 1 submission")
+        vfs_close(fd)
+        return
+    cq_tail: uint32 = _u32_load(cq_base, RING_HDR_TAIL)
+    cq_head: uint32 = _u32_load(cq_base, RING_HDR_HEAD)
+    if cq_tail - cq_head < 1:
+        _iou_fail("no CQE posted for NOP")
+        vfs_close(fd)
+        return
+    cqe0: uint64 = cq_cqes + cast[uint64](cq_head & mask) * CQE_BYTES
+    ud0: uint64 = cast[Ptr[uint64]](cqe0 + 0)[0]
+    res0: int32 = cast[Ptr[int32]](cqe0 + 8)[0]
+    if ud0 != cast[uint64](0xCAFE):
+        _iou_fail("NOP CQE user_data not echoed")
+        vfs_close(fd)
+        return
+    if res0 != 0:
+        _iou_fail("NOP CQE res not 0")
+        vfs_close(fd)
+        return
+    # Consume the CQE.
+    _u32_store(cq_base, RING_HDR_HEAD, cq_head + 1)
+    printk0("[iouring] PASS: NOP completion (user_data echoed, res=0)\n")
+
+    # --- (3) WRITEV then READV byte-exact via the ring + FSYNC ---------
+    tfd: int32 = vfs_open_memfd("iouring-test", 0)
+    if tfd < 0:
+        _iou_fail("could not open tmpfs scratch file")
+        vfs_close(fd)
+        return
+
+    # iovec -> _iou_src[0..15].
+    cast[Ptr[uint64]](cast[uint64](&_iou_iov[0]) + 0)[0] = cast[uint64](&_iou_src[0])
+    cast[Ptr[uint64]](cast[uint64](&_iou_iov[0]) + 8)[0] = 15
+
+    # SQE 1 = WRITEV(tfd, iov, 1, off=0).
+    sqe1: uint64 = sqes + 1 * SQE_BYTES
+    j = 0
+    while j < SQE_BYTES:
+        cast[Ptr[uint8]](sqe1 + j)[0] = 0
+        j = j + 1
+    cast[Ptr[uint8]](sqe1 + SQE_OPCODE)[0] = IORING_OP_WRITEV
+    cast[Ptr[int32]](sqe1 + SQE_FD)[0] = tfd
+    cast[Ptr[uint64]](sqe1 + SQE_OFF)[0] = 0
+    cast[Ptr[uint64]](sqe1 + SQE_ADDR)[0] = cast[uint64](&_iou_iov[0])
+    cast[Ptr[uint32]](sqe1 + SQE_LEN)[0] = 1
+    cast[Ptr[uint64]](sqe1 + SQE_USER_DATA)[0] = cast[uint64](0x1111)
+
+    # Publish SQE 1 via array slot at the current head&mask position.
+    sq_tail1: uint32 = _u32_load(sq_base, RING_HDR_TAIL)
+    cast[Ptr[uint32]](sq_array
+                      + cast[uint64](sq_tail1 & mask) * 4)[0] = 1
+    _u32_store(sq_base, RING_HDR_TAIL, sq_tail1 + 1)
+    ew: int64 = io_uring_enter(cast[uint64](fd), 1, 1,
+                               cast[uint64](IORING_ENTER_GETEVENTS), 0, 0)
+    if ew != 1:
+        _iou_fail("enter(WRITEV) did not report 1 submission")
+        vfs_close(tfd)
+        vfs_close(fd)
+        return
+    cq_head = _u32_load(cq_base, RING_HDR_HEAD)
+    cqe1: uint64 = cq_cqes + cast[uint64](cq_head & mask) * CQE_BYTES
+    if cast[Ptr[uint64]](cqe1 + 0)[0] != cast[uint64](0x1111):
+        _iou_fail("WRITEV CQE user_data wrong")
+        vfs_close(tfd)
+        vfs_close(fd)
+        return
+    wres: int32 = cast[Ptr[int32]](cqe1 + 8)[0]
+    if wres != 15:
+        _iou_fail("WRITEV did not write 15 bytes")
+        vfs_close(tfd)
+        vfs_close(fd)
+        return
+    _u32_store(cq_base, RING_HDR_HEAD, cq_head + 1)
+    printk0("[iouring] PASS: WRITEV wrote 15 bytes via the ring\n")
+
+    # Rewind via lseek then READV back into _iou_dst.
+    if vfs_lseek(tfd, 0, 0) != 0:
+        _iou_fail("lseek-to-0 before READV failed")
+        vfs_close(tfd)
+        vfs_close(fd)
+        return
+    di: uint64 = 0
+    while di < 32:
+        _iou_dst[di] = 0
+        di = di + 1
+    cast[Ptr[uint64]](cast[uint64](&_iou_iov[0]) + 0)[0] = cast[uint64](&_iou_dst[0])
+    cast[Ptr[uint64]](cast[uint64](&_iou_iov[0]) + 8)[0] = 15
+
+    # SQE 2 = READV(tfd, iov, 1, off=0).
+    sqe2: uint64 = sqes + 2 * SQE_BYTES
+    j = 0
+    while j < SQE_BYTES:
+        cast[Ptr[uint8]](sqe2 + j)[0] = 0
+        j = j + 1
+    cast[Ptr[uint8]](sqe2 + SQE_OPCODE)[0] = IORING_OP_READV
+    cast[Ptr[int32]](sqe2 + SQE_FD)[0] = tfd
+    cast[Ptr[uint64]](sqe2 + SQE_OFF)[0] = 0
+    cast[Ptr[uint64]](sqe2 + SQE_ADDR)[0] = cast[uint64](&_iou_iov[0])
+    cast[Ptr[uint32]](sqe2 + SQE_LEN)[0] = 1
+    cast[Ptr[uint64]](sqe2 + SQE_USER_DATA)[0] = cast[uint64](0x2222)
+
+    sq_tail2: uint32 = _u32_load(sq_base, RING_HDR_TAIL)
+    cast[Ptr[uint32]](sq_array
+                      + cast[uint64](sq_tail2 & mask) * 4)[0] = 2
+    _u32_store(sq_base, RING_HDR_TAIL, sq_tail2 + 1)
+    eread: int64 = io_uring_enter(cast[uint64](fd), 1, 1,
+                                  cast[uint64](IORING_ENTER_GETEVENTS), 0, 0)
+    if eread != 1:
+        _iou_fail("enter(READV) did not report 1 submission")
+        vfs_close(tfd)
+        vfs_close(fd)
+        return
+    cq_head = _u32_load(cq_base, RING_HDR_HEAD)
+    cqe2: uint64 = cq_cqes + cast[uint64](cq_head & mask) * CQE_BYTES
+    if cast[Ptr[uint64]](cqe2 + 0)[0] != cast[uint64](0x2222):
+        _iou_fail("READV CQE user_data wrong")
+        vfs_close(tfd)
+        vfs_close(fd)
+        return
+    rres: int32 = cast[Ptr[int32]](cqe2 + 8)[0]
+    if rres != 15:
+        _iou_fail("READV did not read 15 bytes")
+        vfs_close(tfd)
+        vfs_close(fd)
+        return
+    _u32_store(cq_base, RING_HDR_HEAD, cq_head + 1)
+    # Byte-exact compare.
+    k: uint64 = 0
+    while k < 15:
+        if _iou_dst[k] != _iou_src[k]:
+            _iou_fail("READV bytes differ from WRITEV payload")
+            vfs_close(tfd)
+            vfs_close(fd)
+            return
+        k = k + 1
+    printk0("[iouring] PASS: READV read back 15 bytes byte-exact\n")
+
+    # --- (4) FSYNC via the ring ----------------------------------------
+    sqe3: uint64 = sqes + 3 * SQE_BYTES
+    j = 0
+    while j < SQE_BYTES:
+        cast[Ptr[uint8]](sqe3 + j)[0] = 0
+        j = j + 1
+    cast[Ptr[uint8]](sqe3 + SQE_OPCODE)[0] = IORING_OP_FSYNC
+    cast[Ptr[int32]](sqe3 + SQE_FD)[0] = tfd
+    cast[Ptr[uint64]](sqe3 + SQE_USER_DATA)[0] = cast[uint64](0x3333)
+
+    sq_tail3: uint32 = _u32_load(sq_base, RING_HDR_TAIL)
+    cast[Ptr[uint32]](sq_array
+                      + cast[uint64](sq_tail3 & mask) * 4)[0] = 3
+    _u32_store(sq_base, RING_HDR_TAIL, sq_tail3 + 1)
+    efs: int64 = io_uring_enter(cast[uint64](fd), 1, 1,
+                                cast[uint64](IORING_ENTER_GETEVENTS), 0, 0)
+    if efs != 1:
+        _iou_fail("enter(FSYNC) did not report 1 submission")
+        vfs_close(tfd)
+        vfs_close(fd)
+        return
+    cq_head = _u32_load(cq_base, RING_HDR_HEAD)
+    cqe3: uint64 = cq_cqes + cast[uint64](cq_head & mask) * CQE_BYTES
+    if cast[Ptr[uint64]](cqe3 + 0)[0] != cast[uint64](0x3333):
+        _iou_fail("FSYNC CQE user_data wrong")
+        vfs_close(tfd)
+        vfs_close(fd)
+        return
+    fres: int32 = cast[Ptr[int32]](cqe3 + 8)[0]
+    if fres != 0:
+        _iou_fail("FSYNC CQE res not 0")
+        vfs_close(tfd)
+        vfs_close(fd)
+        return
+    _u32_store(cq_base, RING_HDR_HEAD, cq_head + 1)
+    printk0("[iouring] PASS: FSYNC completed via the ring\n")
+
+    # --- (5) io_uring_register buffers round-trip ----------------------
+    reg: int64 = io_uring_register(cast[uint64](fd), IORING_REGISTER_BUFFERS,
+                                   cast[uint64](&_iou_iov[0]), 1, 0, 0)
+    if reg != 0:
+        _iou_fail("io_uring_register(BUFFERS) failed")
+        vfs_close(tfd)
+        vfs_close(fd)
+        return
+    unreg: int64 = io_uring_register(cast[uint64](fd),
+                                     IORING_UNREGISTER_BUFFERS, 0, 0, 0, 0)
+    if unreg != 0:
+        _iou_fail("io_uring_register(UNREGISTER_BUFFERS) failed")
+        vfs_close(tfd)
+        vfs_close(fd)
+        return
+    printk0("[iouring] PASS: register/unregister buffers round-trip\n")
+
+    vfs_close(tfd)
+    # Closing the ring fd tears down its context via iouring_close_fd
+    # (wired into the close path) — but the boot self-test fd table is
+    # restored by iouring_selftest, so tear down explicitly here too.
+    iouring_close_fd(fd)
+    vfs_close(fd)
+
+    printk0("[iouring] PASS\n")

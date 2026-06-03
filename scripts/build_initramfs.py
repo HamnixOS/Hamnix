@@ -543,6 +543,15 @@ if os.environ.get("ENABLE_PIDFD_TEST") == "1":
 if os.environ.get("ENABLE_MEMFD_TEST") == "1":
     FILES.append(("/etc/memfd-test", b"1\n"))
 
+# io_uring_setup/enter/register self-test. scripts/test_iouring.sh sets
+# ENABLE_IOURING_TEST=1 to plant /etc/iouring-test; init/main.ad at
+# boot:37.iouring detects the marker and runs iouring_selftest()
+# (linux_abi/u_iouring.ad), which sets up a ring, submits a NOP + asserts
+# its CQE, WRITEVs/READVs a tmpfs file byte-exact via the ring, FSYNCs, and
+# round-trips register/unregister buffers.
+if os.environ.get("ENABLE_IOURING_TEST") == "1":
+    FILES.append(("/etc/iouring-test", b"1\n"))
+
 # Pipe zero-copy I/O family (splice/tee/vmsplice) self-test.
 # scripts/test_splice.sh sets ENABLE_SPLICE_TEST=1 to plant
 # /etc/splice-test; init/main.ad at boot:37.splice detects the marker
