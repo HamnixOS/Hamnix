@@ -512,6 +512,87 @@ arm64_p15_efault1: int64 = 0          # copy_from_user(unmapped #2) -> -EFAULT
 arm64_p15_efault2: int64 = 0          # copy_to_user(unmapped)      -> -EFAULT
 
 # ---------------------------------------------------------------------------
+# Phase 16: EL0 mmap / munmap with DEMAND-PAGED ANONYMOUS MAPPINGS.
+#
+# Phase 14 demand-paged a HARD-CODED window: the abort handler knew the two demand
+# VAs by constant. Real Linux mmap is dynamic — userspace asks for an anonymous
+# region of a given length, the kernel records a VMA (a [base,len) span) and hands
+# back a base address WITHOUT mapping any page; the pages materialise lazily on
+# first touch, and ONLY because the faulting VA falls inside a live VMA. munmap
+# then tears the region down so a later touch of the SAME address faults fatally.
+#
+# Phase 16 builds exactly this on aarch64. A single EL0 task:
+#   1. mmap(len)              -> kernel records a VMA, returns the anon base VA
+#                               (no page mapped yet — purely lazy)
+#   2. str sentinel,[base]    -> translation fault; the abort handler walks the VMA
+#                               table, finds the VA covered, demand-maps a fresh
+#                               page and RESUMES the store (it now completes)
+#   3. ldr back               -> reads the sentinel through the new mapping
+#   4. mmap_report(readback)  -> hands the value back; kernel verifies the demand
+#                               map landed in the backing physical page
+#   5. munmap(base,len)       -> kernel clears the L3 entry, drops the VMA, flushes
+#   6. str sentinel2,[base]   -> translation fault AGAIN, but the VA is now in NO
+#                               VMA, so the handler reaps the task (a real SIGSEGV)
+# A PASS proves: the anon region was lazily backed only inside its VMA (one demand
+# fault), the read-back reached the backing page, AND munmap genuinely removed the
+# mapping (the post-munmap touch faulted and was NOT silently re-paged) — the full
+# Linux mmap/munmap lifecycle on bare aarch64, driven from Adder.
+#
+# The mmap region lives in L2 slot 8 (VA 0x4100_0000), which arm64_mmu_init maps
+# identity EL1-only; the Phase-16 launcher CLEARS that slot so the first EL0 touch
+# genuinely translation-faults (mirroring how Phase 14 clears its slot 7).
+# ---------------------------------------------------------------------------
+
+# The anonymous mmap base the kernel hands back. L1 idx 1 (existing L2_PGTABLE),
+# L2 idx 8 (cleared to UNMAPPED by the launcher), L3 idx 0.
+P16_MMAP_BASE: uint64 = 0x41000000
+P16_MMAP_L2_INDEX: uint64 = 8            # (0x4100_0000 - 0x4000_0000) / 2 MiB
+P16_MMAP_LEN: uint64 = 0x1000            # one 4 KiB page (anonymous)
+
+# Fresh EL1-only scratch: the new L3 table under L2 slot 8, and the physical page
+# the anon VA demand-maps to. Both sit in otherwise-unused EL1-only RAM, clear of
+# the L1/L2 tables and every prior phase's scratch (Phase 9 .. 0x4013_2000,
+# Phase 14 .. 0x4013_7000, Phase 15 P15_OUT_CELL @0x4013_9000).
+P16_L3: uint64 = 0x4013A000              # new L3 table for the mmap L2 slot
+P16_PAGE: uint64 = 0x4013C000            # physical page backing P16_MMAP_BASE
+
+# L3 PAGE descriptor flags (same as Phase 9/14): EL0 read/write Normal page,
+# bits[1:0]=0b11 so the walker treats it as a level-3 page.
+P16_PAGE_FLAGS: uint64 = 0x747
+
+# Sentinels the EL0 task stores: the first through the freshly demand-paged anon
+# page (read back + verified), the second after munmap (its store must fault).
+P16_SENTINEL: uint64 = 0xB16B00B5C0DE0001
+P16_SENTINEL2: uint64 = 0xDEAD0000FACE0002
+
+# mmap region's EL0 message buffer (inside the existing EL0 RWX window, clear of
+# the code page and every prior phase's buffers).
+P16_MSG_BASE: uint64 = 0x40226000
+
+# Linux aarch64 syscall numbers reused verbatim. mmap is 222, munmap is 215.
+SYS_MMAP_NR: uint64 = 222
+SYS_MUNMAP_NR: uint64 = 215
+# Kernel-private "mmap report" syscall: the EL0 task hands back the value it read
+# from the demand-paged anon page so the kernel can verify the mapping. Outside the
+# Linux ABI range; clear of the other private nrs (512/514/540).
+SYS_MMAP_REPORT_NR: uint64 = 541
+
+# Phase 16 bookkeeping. arm64_mmap_active routes EL0 aborts/svc into the mmap path
+# while the demo is live. The VMA table is a single dynamic span [vma_base, vma_base
+# + vma_len); vma_live latches whether it is currently mapped (mmap sets it, munmap
+# clears it). The abort handler honours a fault ONLY when vma_live and the VA is in
+# range. The counters/latches feed the finish-time verdict.
+arm64_mmap_active: int64 = 0
+arm64_mmap_vma_base: uint64 = 0
+arm64_mmap_vma_len: uint64 = 0
+arm64_mmap_vma_live: int64 = 0
+arm64_mmap_faults: int64 = 0          # demand faults serviced inside a live VMA
+arm64_mmap_paged: int64 = 0           # anon page was demand-mapped at least once
+arm64_mmap_readback: uint64 = 0       # value the EL0 task read back from the page
+arm64_mmap_unmapped: int64 = 0        # munmap tore the VMA + mapping down
+arm64_mmap_segv: int64 = 0            # post-munmap touch faulted with NO live VMA
+
+# ---------------------------------------------------------------------------
 # Identity-mapped L1 page table. A single level-1 table of 512 8-byte block
 # descriptors (4 KiB granule => each L1 entry spans 1 GiB). We place it at a
 # fixed, 4 KiB-aligned physical address in RAM, well past the kernel image
@@ -935,6 +1016,14 @@ def arm64_sync_handler(frame_ptr: Ptr[uint64]) -> int64:
             if arm64_demand_active != 0:
                 if arm64_try_demand_page(esr) != 0:
                     return 0
+            # Phase 16: while the mmap demo is live, a data abort might be a
+            # demand fault inside a LIVE anonymous VMA (page it in + resume) or a
+            # post-munmap touch of a now-dead VMA (fall through to the reaper,
+            # which the mmap reaper turns into the Phase-16 SEGV PASS).
+            if arm64_mmap_active != 0:
+                if arm64_mmap_try_fault(esr) != 0:
+                    return 0
+                return arm64_mmap_reap(esr)
             return arm64_handle_el0_fault(esr, cast[uint64](0))
         if ec == ESR_EC_IABORT_LOWER:
             return arm64_handle_el0_fault(esr, cast[uint64](1))
@@ -980,6 +1069,13 @@ def arm64_sync_handler(frame_ptr: Ptr[uint64]) -> int64:
     # explicit syscalls AFTER its faulting stores have transparently completed.
     if arm64_demand_active != 0:
         return arm64_demand_dispatch(frame_ptr, nr, a0, a1, a2)
+
+    # Phase 16: while the mmap demo is live, route every svc into the Phase-16
+    # dispatcher (mmap/munmap/report/write/exit). mmap records a VMA + returns its
+    # base; the page-in itself happens on the ABORT path (arm64_mmap_try_fault).
+    # munmap tears the VMA + mapping down. report verifies the demand-paged value.
+    if arm64_mmap_active != 0:
+        return arm64_mmap_dispatch(frame_ptr, nr, a0, a1, a2)
 
     # Phase 13: while the FP context-switch demo is live, route every svc into the
     # Phase-13 dispatcher (fpcheck/yield/exit). yield saves the outgoing task's
@@ -3587,6 +3683,15 @@ def arm64_uaccess_finish() -> int64:
         _uart_puts(sm)
         pm: Ptr[char] = "[arm64] EL1 safe user access OK\n"
         _uart_puts(pm)
+        # Phase 15 complete and clean. Hand off to Phase 16 (EL0 mmap/munmap with
+        # demand-paged anonymous mappings). Mask IRQs (deterministic, no timer
+        # re-entry) and run the demo; arm64_run_mmap_demo halts after PASS. This is
+        # the Phase 15 -> 16 hand-off point.
+        _msr_daifset(2)
+        arm64_run_mmap_demo()
+        # Unreachable: arm64_run_mmap_demo halts. Safety loop if it falls through.
+        while True:
+            _wfi()
     else:
         fm: Ptr[char] = "[arm64] EL1 safe user access FAIL\n"
         _uart_puts(fm)
@@ -3697,6 +3802,381 @@ def arm64_run_uaccess_demo() -> int64:
     while True:
         _wfi()
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 16 — EL0 mmap / munmap with DEMAND-PAGED ANONYMOUS MAPPINGS.
+# ---------------------------------------------------------------------------
+
+# Install the L3 table under the mmap window's L2 slot (idempotently): zero a fresh
+# L3 table the first time, then point the L2 slot at it with a table descriptor +
+# break-before-make TLB maintenance. Mirrors arm64_demand_install_l3 for the mmap
+# L2 slot. Subsequent map/unmap cycles reuse this L3 table; only the per-page L3
+# entry is added/removed by the caller.
+def arm64_mmap_install_l3() -> int64:
+    l2: Ptr[uint64] = cast[Ptr[uint64]](L2_PGTABLE)
+    if l2[cast[int64](P16_MMAP_L2_INDEX)] != cast[uint64](0):
+        return 0                          # L3 already wired under this L2 slot
+
+    l3: Ptr[uint64] = cast[Ptr[uint64]](P16_L3)
+    i: int64 = 0
+    while i < 512:
+        l3[i] = cast[uint64](0)
+        i = i + 1
+    _dsb_ish()
+
+    l2[cast[int64](P16_MMAP_L2_INDEX)] = P16_L3 | DESC_TABLE
+    _dsb_ish()
+    _tlbi_vmalle1is()
+    _dsb_ish()
+    _isb()
+    return 0
+
+
+# Map one fresh physical page at anon VA `va` (which must lie in the mmap window)
+# into the live TTBR0_EL1 tables, EL0 read/write, then flush so EL0 sees the new
+# translation. `page_pa` is the backing physical page. Mirrors arm64_demand_map_page.
+def arm64_mmap_map_page(va: uint64, page_pa: uint64) -> uint64:
+    arm64_mmap_install_l3()
+
+    # Zero the backing physical page (a fresh anon page must start clean).
+    pg: Ptr[uint64] = cast[Ptr[uint64]](page_pa)
+    j: int64 = 0
+    while j < 512:
+        pg[j] = cast[uint64](0)
+        j = j + 1
+    _dsb_ish()
+
+    l3_index: uint64 = (va >> cast[uint64](12)) & cast[uint64](0x1FF)
+    l3: Ptr[uint64] = cast[Ptr[uint64]](P16_L3)
+    l3[cast[int64](l3_index)] = page_pa | P16_PAGE_FLAGS
+
+    _dsb_ish()
+    _tlbi_vmalle1is()
+    _dsb_ish()
+    _isb()
+    return l3_index
+
+
+# Tear down one anon page mapping: clear its L3 entry (back to faulting) and flush.
+def arm64_mmap_unmap_page(va: uint64) -> int64:
+    l3_index: uint64 = (va >> cast[uint64](12)) & cast[uint64](0x1FF)
+    l3: Ptr[uint64] = cast[Ptr[uint64]](P16_L3)
+    l3[cast[int64](l3_index)] = cast[uint64](0)
+    _dsb_ish()
+    _tlbi_vmalle1is()
+    _dsb_ish()
+    _isb()
+    return 0
+
+
+# Phase-16 anon-mapping fault entry. Called from arm64_sync_handler for a data
+# abort from EL0 while the mmap demo is live. Honours the fault ONLY when it is a
+# TRANSLATION fault for a VA inside the CURRENTLY-LIVE VMA: maps a fresh page and
+# returns 1 so the caller resumes EL0 at the faulting store. Returns 0 otherwise —
+# in particular for a touch after munmap (vma_live == 0), which the caller turns
+# into a fatal SIGSEGV (proving munmap really removed the mapping).
+def arm64_mmap_try_fault(esr: uint64) -> int64:
+    dfsc: uint64 = esr & ESR_DFSC_MASK
+    kind: uint64 = dfsc >> ESR_DFSC_KIND_SHIFT
+    if kind != ESR_DFSC_KIND_XLAT:
+        return 0                          # not a translation fault
+
+    if arm64_mmap_vma_live == 0:
+        return 0                          # no live VMA -> not demand-pageable
+
+    far: uint64 = cast[uint64](_mrs_far_el1())
+    page_va: uint64 = far & cast[uint64](0xFFFFFFFFFFFFF000)
+
+    # Is the faulting VA inside the live VMA span [base, base + len)?
+    if page_va < arm64_mmap_vma_base:
+        return 0
+    if page_va >= (arm64_mmap_vma_base + arm64_mmap_vma_len):
+        return 0
+
+    # Covered by the live VMA: demand-map a fresh page and resume.
+    arm64_mmap_map_page(page_va, P16_PAGE)
+    arm64_mmap_paged = 1
+    arm64_mmap_faults = arm64_mmap_faults + 1
+    m: Ptr[char] = "[arm64] mmap demand fault: paged in anon VA "
+    _uart_puts(m)
+    _uart_puthex(page_va)
+    nl: Ptr[char] = "\n"
+    _uart_puts(nl)
+    return 1
+
+
+# Phase-16 fatal-fault path. Reached only when arm64_mmap_try_fault declined a data
+# abort while the mmap demo is live — i.e. the EL0 task touched the anon VA AFTER
+# munmap, when no VMA covers it. This is exactly a Linux SIGSEGV: report it, latch
+# that the post-munmap touch faulted, and run the Phase-16 verdict. Never returns.
+def arm64_mmap_reap(esr: uint64) -> int64:
+    far: uint64 = cast[uint64](_mrs_far_el1())
+    elr: uint64 = cast[uint64](_mrs_elr_el1())
+    m: Ptr[char] = "[arm64] mmap post-munmap fault (no VMA) at VA "
+    _uart_puts(m)
+    _uart_puthex(far)
+    nl: Ptr[char] = "\n"
+    _uart_puts(nl)
+    pcm: Ptr[char] = "[arm64] mmap SIGSEGV PC (ELR_EL1)="
+    _uart_puts(pcm)
+    _uart_puthex(elr)
+    _uart_puts(nl)
+    arm64_mmap_segv = 1
+    seg: Ptr[char] = "[arm64] munmap region unmapped; touch faulted (no re-page)\n"
+    _uart_puts(seg)
+    arm64_mmap_finish()
+    # Unreachable: arm64_mmap_finish halts. Safety loop if it falls through.
+    while True:
+        _wfi()
+    return 0
+
+
+# Materialise the Phase-16 EL0 routine into USER_CODE_BASE. The kernel patches the
+# anon base into x10 (it is returned by the mmap syscall at RUNTIME, but for this
+# self-contained demo the base is the fixed P16_MMAP_BASE the kernel hands back, so
+# we can build the touch sequence around it). The routine:
+#   mmap(len): x0=len; x8=222; svc #0      -> x0 = anon base (== P16_MMAP_BASE)
+#   x10 = anon base ; x9 = P16_SENTINEL
+#   str x9,[x10]                            -> FAULTS; kernel demand-maps + resumes
+#   x9 = 0 ; ldr x9,[x10]                   -> read the sentinel back
+#   mmap_report(x9): x0=x9; x8=541; svc #0  -> kernel verifies the demand map
+#   write(1,msg,len): x0=1; x1=msg; x2=len; x8=64; svc #0   (echo through the page)
+#   munmap(base,len): x0=base; x1=len; x8=215; svc #0
+#   x9 = P16_SENTINEL2 ; str x9,[x10]       -> FAULTS AGAIN (no VMA) -> SIGSEGV
+# The last store never returns; the reaper takes over. We still emit a trailing
+# exit(0) for completeness in case the store were ever (wrongly) re-paged.
+def arm64_build_mmap_routine(msg_len: uint64) -> int64:
+    a: uint64 = USER_CODE_BASE
+
+    # mmap(len): x0 = len; x8 = 222; svc #0
+    a = _emit_load_imm64(a, cast[uint64](0), P16_MMAP_LEN)
+    a = _emit_load_imm64(a, cast[uint64](8), SYS_MMAP_NR)
+    a = _emit_word(a, cast[uint64](0xD4000001))
+
+    # x10 = anon base (== P16_MMAP_BASE); x9 = P16_SENTINEL
+    a = _emit_load_imm64(a, cast[uint64](10), P16_MMAP_BASE)
+    a = _emit_load_imm64(a, cast[uint64](9), P16_SENTINEL)
+    # str x9, [x10]   = 0xF9000000 | (Rn<<5) | Rt   (FAULTS first time)
+    a = _emit_word(a, cast[uint64](0xF9000000) | (cast[uint64](10) << cast[uint64](5)) | cast[uint64](9))
+    # x9 = 0 ; ldr x9, [x10]   = 0xF9400000 | (Rn<<5) | Rt
+    a = _emit_load_imm64(a, cast[uint64](9), cast[uint64](0))
+    a = _emit_word(a, cast[uint64](0xF9400000) | (cast[uint64](10) << cast[uint64](5)) | cast[uint64](9))
+
+    # mmap_report(x9): x0 = x9; x8 = 541; svc #0
+    # mov x0, x9  (ORR x0, xzr, x9) = 0xAA0003E0 | (9<<16) = 0xAA0903E0
+    a = _emit_word(a, cast[uint64](0xAA0003E0) | (cast[uint64](9) << cast[uint64](16)))
+    a = _emit_load_imm64(a, cast[uint64](8), SYS_MMAP_REPORT_NR)
+    a = _emit_word(a, cast[uint64](0xD4000001))
+
+    # write(1, msg, len): x0 = 1; x1 = msg; x2 = len; x8 = 64; svc #0
+    a = _emit_load_imm64(a, cast[uint64](0), cast[uint64](1))
+    a = _emit_load_imm64(a, cast[uint64](1), P16_MSG_BASE)
+    a = _emit_load_imm64(a, cast[uint64](2), msg_len)
+    a = _emit_load_imm64(a, cast[uint64](8), SYS_WRITE_NR)
+    a = _emit_word(a, cast[uint64](0xD4000001))
+
+    # munmap(base, len): x0 = base; x1 = len; x8 = 215; svc #0
+    a = _emit_load_imm64(a, cast[uint64](0), P16_MMAP_BASE)
+    a = _emit_load_imm64(a, cast[uint64](1), P16_MMAP_LEN)
+    a = _emit_load_imm64(a, cast[uint64](8), SYS_MUNMAP_NR)
+    a = _emit_word(a, cast[uint64](0xD4000001))
+
+    # x9 = P16_SENTINEL2 ; str x9, [x10]   (FAULTS AGAIN; reaper takes over)
+    a = _emit_load_imm64(a, cast[uint64](9), P16_SENTINEL2)
+    a = _emit_word(a, cast[uint64](0xF9000000) | (cast[uint64](10) << cast[uint64](5)) | cast[uint64](9))
+
+    # exit(0): x0 = 0; x8 = 93; svc #0  (only reached if the touch were re-paged)
+    a = _emit_load_imm64(a, cast[uint64](0), cast[uint64](0))
+    a = _emit_load_imm64(a, cast[uint64](8), SYS_EXIT_NR)
+    a = _emit_word(a, cast[uint64](0xD4000001))
+
+    _dsb_ish()
+    _isb()
+    return 0
+
+
+# Phase-16 syscall dispatcher. Routed from arm64_sync_handler while the mmap demo
+# is live. Services mmap (record VMA + return base), munmap (drop VMA + mapping),
+# the kernel-private mmap report (verify the demand-paged value), and a defensive
+# exit. The demand page-in happens on the ABORT path (arm64_mmap_try_fault).
+def arm64_mmap_dispatch(frame_ptr: Ptr[uint64], nr: uint64, a0: uint64, a1: uint64, a2: uint64) -> int64:
+    if nr == SYS_MMAP_NR:
+        # Anonymous mmap: record a single VMA [P16_MMAP_BASE, +len) and return the
+        # base. No page is mapped here — it materialises lazily on first touch.
+        arm64_mmap_vma_base = P16_MMAP_BASE
+        arm64_mmap_vma_len = a0
+        arm64_mmap_vma_live = 1
+        m: Ptr[char] = "[arm64] EL0 mmap(anon, len="
+        _uart_puts(m)
+        _uart_puthex(a0)
+        sep: Ptr[char] = ") -> base "
+        _uart_puts(sep)
+        _uart_puthex(P16_MMAP_BASE)
+        nl: Ptr[char] = "\n"
+        _uart_puts(nl)
+        frame_ptr[0] = P16_MMAP_BASE
+        return 0
+
+    if nr == SYS_MMAP_REPORT_NR:
+        arm64_mmap_readback = a0
+        r: Ptr[char] = "[arm64] EL0 mmap read-back -> "
+        _uart_puts(r)
+        _uart_puthex(a0)
+        nl: Ptr[char] = "\n"
+        _uart_puts(nl)
+        # Independently confirm the BACKING physical page holds the sentinel, so the
+        # demand map truly reached P16_PAGE (not a stale alias).
+        back: Ptr[uint64] = cast[Ptr[uint64]](P16_PAGE)
+        pv: uint64 = back[0]
+        pm: Ptr[char] = "[arm64] mmap backing phys -> "
+        _uart_puts(pm)
+        _uart_puthex(pv)
+        _uart_puts(nl)
+        if a0 == P16_SENTINEL:
+            if pv == P16_SENTINEL:
+                ok: Ptr[char] = "[arm64] mmap demand-paged store/load OK\n"
+                _uart_puts(ok)
+            else:
+                bad: Ptr[char] = "[arm64] mmap backing phys mismatch FAIL\n"
+                _uart_puts(bad)
+        else:
+            bad2: Ptr[char] = "[arm64] mmap read-back mismatch FAIL\n"
+            _uart_puts(bad2)
+        frame_ptr[0] = cast[uint64](0)
+        return 0
+
+    if nr == SYS_MUNMAP_NR:
+        # munmap(base, len): drop the VMA and tear the page mapping down so a later
+        # touch of the same VA faults fatally. Returns 0 like Linux munmap.
+        arm64_mmap_unmap_page(a0)
+        arm64_mmap_vma_live = 0
+        arm64_mmap_unmapped = 1
+        m: Ptr[char] = "[arm64] EL0 munmap(base="
+        _uart_puts(m)
+        _uart_puthex(a0)
+        sep: Ptr[char] = ", len="
+        _uart_puts(sep)
+        _uart_puthex(a1)
+        sep2: Ptr[char] = ") -> 0\n"
+        _uart_puts(sep2)
+        frame_ptr[0] = cast[uint64](0)
+        return 0
+
+    if nr == SYS_WRITE_NR:
+        buf: Ptr[uint8] = cast[Ptr[uint8]](a1)
+        n: uint64 = cast[uint64](0)
+        while n < a2:
+            _uart_putc(buf[n])
+            n = n + cast[uint64](1)
+        wm: Ptr[char] = "[arm64] EL0 write(16) syscall serviced\n"
+        _uart_puts(wm)
+        frame_ptr[0] = a2
+        return 0
+
+    if nr == SYS_EXIT_NR:
+        # Reached only if the post-munmap touch were (wrongly) re-paged instead of
+        # faulting. The verdict will FAIL because arm64_mmap_segv stays 0.
+        arm64_el0_exit_code = cast[int64](a0)
+        arm64_el0_exited = 1
+        em: Ptr[char] = "[arm64] EL0 exit(16) syscall serviced (touch did NOT fault!)\n"
+        _uart_puts(em)
+        arm64_mmap_finish()
+        while True:
+            _wfi()
+
+    um: Ptr[char] = "[arm64] EL0 unknown syscall (phase 16)\n"
+    _uart_puts(um)
+    frame_ptr[0] = cast[uint64](0)
+    return 0
+
+
+# Phase-16 finish: print PASS iff the anon page was demand-paged exactly once
+# inside its VMA, the read-back matched the sentinel, munmap tore the mapping down,
+# AND the post-munmap touch faulted with no live VMA (so it was NOT re-paged).
+# Report the fault count for evidence, then halt deterministically. Never returns.
+def arm64_mmap_finish() -> int64:
+    arm64_mmap_active = 0
+    nl: Ptr[char] = "\n"
+    fc: Ptr[char] = "[arm64] mmap demand faults serviced -> "
+    _uart_puts(fc)
+    _uart_puthex(cast[uint64](arm64_mmap_faults))
+    _uart_puts(nl)
+
+    ok: int64 = 0
+    if arm64_mmap_paged != 0:
+        if arm64_mmap_faults == 1:
+            if arm64_mmap_readback == P16_SENTINEL:
+                if arm64_mmap_unmapped != 0:
+                    if arm64_mmap_segv != 0:
+                        ok = 1
+    if ok != 0:
+        sm: Ptr[char] = "[arm64] anon mmap lazily backed; munmap removed it\n"
+        _uart_puts(sm)
+        pm: Ptr[char] = "[arm64] EL0 mmap/munmap OK\n"
+        _uart_puts(pm)
+    else:
+        fm: Ptr[char] = "[arm64] EL0 mmap/munmap FAIL\n"
+        _uart_puts(fm)
+    _msr_daifset(2)
+    while True:
+        _wfi()
+    return 0
+
+
+# Phase-16 entry point (invoked from the Phase-15 finish hand-off). Restore the
+# kernel's identity TTBR0, force the mmap window's L2 slot UNMAPPED (so the first
+# EL0 touch genuinely translation-faults), seed bookkeeping, build the EL0 routine,
+# arm Phase-16 dispatch, and ERET into the mmap task at EL0t with IRQs masked.
+# Never returns (the task faults fatally after munmap, handing off to the reaper).
+def arm64_run_mmap_demo() -> int64:
+    intro: Ptr[char] = "[arm64] Phase 16: EL0 mmap/munmap with demand-paged anonymous mappings\n"
+    _uart_puts(intro)
+
+    # Restore the kernel's identity-only TTBR0, then flush for a clean state.
+    _dsb_ish()
+    _msr_ttbr0_el1(L1_PGTABLE)
+    _dsb_ish()
+    _tlbi_vmalle1is()
+    _dsb_ish()
+    _isb()
+
+    # Force the mmap window's L2 slot UNMAPPED so the first EL0 touch there raises a
+    # translation Data Abort (a clean, repeatable initial state).
+    l2: Ptr[uint64] = cast[Ptr[uint64]](L2_PGTABLE)
+    l2[cast[int64](P16_MMAP_L2_INDEX)] = cast[uint64](0)
+    _dsb_ish()
+    _tlbi_vmalle1is()
+    _dsb_ish()
+    _isb()
+
+    # Seed Phase-16 bookkeeping.
+    arm64_mmap_vma_base = cast[uint64](0)
+    arm64_mmap_vma_len = cast[uint64](0)
+    arm64_mmap_vma_live = 0
+    arm64_mmap_faults = 0
+    arm64_mmap_paged = 0
+    arm64_mmap_readback = cast[uint64](0)
+    arm64_mmap_unmapped = 0
+    arm64_mmap_segv = 0
+
+    mapmsg: Ptr[char] = "Hello from an anonymous mmap region\n"
+    msg_len: uint64 = _copy_msg_to(mapmsg, P16_MSG_BASE)
+    arm64_build_mmap_routine(msg_len)
+
+    arm64_el0_exited = 0
+    arm64_el0_exit_code = -1
+    arm64_mmap_active = 1
+
+    enter: Ptr[char] = "[arm64] launching EL0 mmap/munmap task\n"
+    _uart_puts(enter)
+
+    _msr_spsr_el1(SPSR_EL0T_DAIF)      # EL0t, IRQ/FIQ masked (deterministic)
+    _msr_elr_el1(USER_CODE_BASE)       # EL0 entry PC
+    _msr_sp_el0(USER_STACK_TOP)        # EL0 stack pointer
+    _isb()
+    _eret()                            # -> EL0; mmap, touch (faults+paged), munmap,
+    return 0                           #    touch (faults fatally) -> reaper PASS
 
 
 def kmain() -> int64:
