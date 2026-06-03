@@ -775,6 +775,16 @@ if os.environ.get("ENABLE_AHCI_NCQ_TEST") == "1":
 if os.environ.get("ENABLE_AHCI_BLK_TEST") == "1":
     FILES.append(("/etc/ahci-blk-test", b"1\n"))
 
+# virtio-9p (9P-over-virtio-PCI) end-to-end self-test. scripts/test_virtio9p.sh
+# sets ENABLE_V9P_TEST=1 to plant /etc/v9p-test. init/main.ad at boot:37.v9p
+# detects the marker and calls v9p_e2e_selftest(): it brings up the QEMU
+# virtio-9p-pci device, runs the full 9P2000.u attach/walk/open/read handshake
+# over the request virtqueue against a host-shared directory, enumerates the
+# export root, and byte-compares a known hello.txt. Requires the test to attach
+# a QEMU virtio-9p-pci device. Default boots omit the marker so it never fires.
+if os.environ.get("ENABLE_V9P_TEST") == "1":
+    FILES.append(("/etc/v9p-test", b"1\n"))
+
 # AHCI TRIM + IDENTIFY/SMART maturity self-test. scripts/test_ahci_trim.sh
 # sets ENABLE_AHCI_TRIM_TEST=1 to plant /etc/ahci-trim-test. init/main.ad at
 # boot:37.atrim detects the marker and calls ahci_trim_selftest()
