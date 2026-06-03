@@ -58,9 +58,8 @@ retrofitted backwards.
    no third tier.
 6. [ ] **hamsh `use hamui`** — bindings on top of #5. May require
    hamsh extensions for closures + event loop + persistent state.
-7. [ ] **Outgoing `ssh` client** — `sshd` ships but nothing dials out.
-   `curl`/`wget` now exist (shared `user/http9.ad`); an SSH *client*
-   is a separate protocol/crypto lift still to do.
+7. [x] **Outgoing `ssh` client** — LANDED (#170): crypto + key exchange
+   + channels; dials out (including to self).
 8. [x] **Pipes + job control in hamsh** — LANDED: `&` background,
     `bg`/`fg`/`jobs`, Ctrl-Z → SIGTSTP / SIGCONT. Process groups
     and pipelines work end-to-end.
@@ -70,8 +69,7 @@ retrofitted backwards.
     (`user/tar.ad`) + DEFLATE compressor/decompressor (`user/gzip.ad`,
     `user/gunzip.ad`). xz/LZMA2 decompression also landed
     (`lib/xz/xz.ad`).
-11. [ ] **Audio** — `snd_hda_intel.ko` loads cleanly; need `aplay`-shape
-    userland tool that pushes PCM to the cdev.
+11. [x] **Audio** — LANDED (#152): PCM playback path (snd_hda sound out).
 12. [x] **`hpm update` + rollback** — LANDED: `hpm update` and
     transactional history + `hpm rollback` shipped (`b011ce9`,
     `65e6685`).
@@ -182,7 +180,8 @@ STATUS.md). What remains, off the critical path and parallelisable:
   epoll covers most real Linux daemons).
 
 ### §6 Timekeeping
-- [ ] vDSO: map `gettimeofday`/`clock_gettime` without syscall overhead.
+- [x] vDSO (#169): `gettimeofday`/`clock_gettime` without syscall
+  overhead landed.
 
 ### §7 Entropy / RNG
 - [ ] ChaCha20 CSPRNG promotion beyond M16.96 (RDRAND/RDSEED seeding
@@ -194,31 +193,37 @@ STATUS.md). What remains, off the critical path and parallelisable:
   discovers all APIC IDs from the ACPI MADT, boots each AP via INIT-SIPI-
   SIPI, sets up per-CPU `%gs` / `current_task`; `kernel/sched/core.ad`
   has a spinlock-protected shared runqueue and `sched_ap_idle_loop` so APs
-  pick up `STATE_READY` tasks. **Open**: per-CPU runqueues, load balancing
-  / work stealing, CPU affinity.
+  pick up `STATE_READY` tasks. Per-CPU runqueue + user-task load balancing
+  landed (#139, #151). **Open**: work stealing, CPU affinity.
 
 ### §10 Networking
-- [ ] Congestion control: slow-start + congestion-avoidance (RFC 5681),
-  NewReno or CUBIC.
-- [ ] Multi-listener accept queue / wider TCB table; window scaling +
-  SACK + timestamps.
+- [x] Congestion control (#166): slow-start + congestion-avoidance
+  (RFC 5681) landed.
+- [x] Multi-listener accept queue + window scaling + SACK + timestamps
+  (#166) landed.
+- [x] IPv6 (#156): addr, ND, ICMPv6, UDP/TCP over v6 + DNS AAAA landed.
 - [ ] Generic unicast ARP helper; ICMP time-exceeded / redirect.
-- [ ] IPv6 (and DNS AAAA records, gated on IPv6 header).
 
 ### §12 Filesystem write maturity
-- [ ] ext4 truncate on index-node (`eh_depth>0`) files; growing a
-  full ext4 directory block; multi-cluster FAT directories.
-- [ ] ext4 extent index-node support (depth>0 leaves) — D5 caps at
-  depth-0 4-slot leaf today (~512 MiB max file when contiguous).
+- [x] ext4 extent index-node support (#189): depth>0 extent trees for
+  >512 MiB files landed.
+- [~] ext4 directory-op maturity (rmdir + dir-rename `..` fixup) — in
+  flight (#245).
+- [ ] ext4 truncate on index-node files; growing a full ext4 directory
+  block.
 
 ### §13 cdev / proc completions
-- [ ] `/proc/net/*`.
+- [~] `/proc/net/*` — in flight (tcp/udp/arp/route/dev from live net
+  state).
 - [ ] Per-backend errstr (ext4 / fat / blk) + user-mode `perror` helper.
 
 ### §14 Resource control & security (stretch)
-- [ ] Per-namespace CPU/memory caps (ride the namespace model, not
-  Linux cgroups); `seccomp-bpf`; POSIX capabilities (drop-root
-  daemons).
+- [x] Per-namespace CPU/memory caps (#174): namespace-native, not
+  cgroups.
+- [x] seccomp-lite (#160): per-task syscall filter at the Layer-2
+  dispatch boundary.
+- [ ] `seccomp-bpf` (full classic-BPF program); POSIX capabilities
+  (drop-root daemons).
 
 ### §15 Compiler / language infra
 - [ ] `match` / `case` tokenization → implement.
@@ -247,9 +252,9 @@ STATUS.md). What remains, off the critical path and parallelisable:
   `drivers/nvme/nvme.ad` (not yet audited).
 - [ ] Real NIC silicon: e1000e EEPROM walk on a physical Intel NIC;
   r8169 RX on physical RTL8168; Broadcom tg3; Intel igb.
-- [ ] EFI Runtime Services (`GetTime`, `GetVariable`); PE `.reloc`
-  table (Secure Boot prereq); drop the FAT12 32 MiB ESP cap via the
-  GPT-ESP path.
+- [x] EFI Runtime Services (`GetTime`, `GetVariable`) + PE `.reloc`
+  table + image signing (#171, Secure Boot) landed.
+- [ ] Drop the FAT12 32 MiB ESP cap via the GPT-ESP path.
 - [ ] NUC network silent on real I219 — needs hardware time.
 
 ## Storage driver maturity
@@ -260,17 +265,17 @@ STATUS.md). What remains, off the critical path and parallelisable:
 - [ ] Partition: extended-CHS chains, BSD disklabel, APM; GPT UTF-16
   names into the block tag; `mount /dev/sd0p1 /mnt` path-to-slot
   resolver.
-- [ ] ext4 mkfs multi-block-group layout; journal (jbd2). Installer
-  plumbing already has the ext4 write path; an on-target installer that
-  lays down a fresh `build/hamnix.img`-shape GPT disk (FAT ESP +
-  UEFI stub + ext4 root) is still missing. (No GRUB / MBR — the boot
-  path is the native UEFI stub.)
+- [x] On-target installer (#172): lays down a fresh GPT disk (FAT ESP +
+  UEFI stub + ext4 root) from a running system. (No GRUB / MBR — the
+  boot path is the native UEFI stub.)
+- [ ] ext4 mkfs multi-block-group layout; journal (jbd2) at mkfs time.
 
 ## Input
 
-- [ ] International keyboard layouts (`kbd_set_layout` + compiled-in
-  tables); dead-key / compose / IME; PS/2 mouse 4-byte scroll-wheel;
-  blocking read on `/dev/mouse`; MADT IRQ-override consumption.
+- [x] International keyboard layouts + mouse scroll + BT HID (#178)
+  landed.
+- [ ] Dead-key / compose / IME; blocking read on `/dev/mouse`; MADT
+  IRQ-override consumption.
 
 ## Userspace polish — known gaps
 
@@ -297,8 +302,12 @@ STATUS.md). What remains, off the critical path and parallelisable:
   2026-05-27; see `memory/project_nonfree_repo.md`).
 - [ ] Browser (Firefox / Chromium) in a hamUI window — gated on
   hamUI Phase 5 (X11 bridge).
-- [ ] Suspend / power management.
-- [ ] Multi-arch (ARM64) — currently x86_64 only.
+- [x] Suspend / power management (#168): ACPI suspend/resume + thermal
+  + battery + ACPI shutdown landed.
+- [~] Multi-arch (ARM64) (#175): Adder aarch64 backend landed — both
+  `aarch64-linux` (runnable Linux ELF) and `aarch64-bare-metal`
+  (QEMU `virt` boot stub over PL011 UART). **Open**: full bare-metal
+  kernel port (Phase 3).
 - [ ] **#186 Native packages go source-based (Gentoo-style).** Since the
   Adder compiler self-hosts on-box (#154), the **native** `hpm` repo
   becomes **source-primary + optional binary cache** (Gentoo source+binpkg
