@@ -15,7 +15,14 @@
 #      Echo Reply was built;
 #   4. transmits a UDP6 datagram with a known payload and asserts the
 #      mandatory pseudo-header checksum the kernel wrote into the wire
-#      buffer matches a hand-verified value (0x15C2, never the illegal 0).
+#      buffer matches a hand-verified value (0x15C2, never the illegal 0);
+#   5. injects a two-fragment ICMPv6 Echo Request (out of order, carried
+#      in Fragment extension headers) and asserts the kernel walks the
+#      extension-header chain, reassembles the datagram, and builds an
+#      Echo Reply (frag-reasm PASS);
+#   6. injects an ICMPv6 Router Advertisement with a Source Link-Layer
+#      Address option and asserts the kernel processes it and caches the
+#      router neighbor binding (router-adv PASS).
 #
 # This is a DETERMINISTIC offline exercise of the v6 RX/TX path — it
 # does not depend on QEMU SLIRP IPv6 behaviour. A trailing QEMU rc=124
@@ -68,6 +75,8 @@ for needle in \
     "[ipv6-selftest] NS->NA PASS" \
     "[ipv6-selftest] echo PASS" \
     "[ipv6-selftest] udp6 csum PASS" \
+    "[ipv6-selftest] frag-reasm PASS" \
+    "[ipv6-selftest] router-adv PASS" \
     "[ipv6-selftest] ALL PASS"
 do
     if grep -a -F -q "$needle" "$LOG"; then
