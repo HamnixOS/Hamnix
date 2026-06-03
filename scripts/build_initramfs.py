@@ -1772,6 +1772,20 @@ if os.environ.get("ENABLE_DEVMAPPER_TEST") == "1":
 if os.environ.get("ENABLE_MDRAID_TEST") == "1":
     FILES.append(("/etc/mdraid-test", b"1\n"))
 
+# Linux-style overlayfs (union filesystem) self-test. scripts/test_overlayfs.sh
+# sets ENABLE_OVERLAYFS_TEST=1 to plant /etc/overlayfs-test; init/main.ad's
+# boot:37.ovl gate then runs overlayfs_selftest() (fs/overlayfs.ad), which
+# builds a two-layer (one read-only LOWER + one writable UPPER) overlay backed
+# by tmpfs and proves: upper SHADOWS lower on lookup; COPY-UP-on-write copies a
+# lower-only file into upper (the lower stays pristine); WHITEOUT-on-delete
+# hides a lower file via a ".wh.<name>" marker without touching the lower;
+# re-creating over a whiteout makes the name live again; and merged READDIR is
+# the deduped union of upper+lower with whiteouts hidden. Prints
+# "[overlayfs] PASS" / "[overlayfs] FAIL". Default boots ship no marker so the
+# overlayfs self-test is a no-op everywhere else.
+if os.environ.get("ENABLE_OVERLAYFS_TEST") == "1":
+    FILES.append(("/etc/overlayfs-test", b"1\n"))
+
 
 # See INIT_ELF handling inside build_archive(): set INIT_ELF=path to
 # override which on-disk file becomes /init in the cpio archive, e.g.

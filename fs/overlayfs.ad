@@ -1,0 +1,1163 @@
+# fs/overlayfs.ad
+#
+# Linux-style overlay (union) filesystem for Hamnix.
+#
+# Real overlayfs semantics, implemented natively on Hamnix's Plan-9-shaped
+# VFS. An overlay stitches one or more read-only LOWER layers under a single
+# writable UPPER layer and presents a single MERGED view:
+#
+#   merged/<name>  resolves to:
+#       upper/<name>      if it exists in upper AND is not whiteouted
+#       lower[k]/<name>   else, the TOPMOST lower layer that has it
+#       (nothing)         if a whiteout for <name> sits in upper
+#
+# Backend: each layer is a subtree of the existing in-memory tmpfs
+# (fs/tmpfs.ad) — we do NOT invent a new on-disk format. The overlay logic
+# (precedence, copy-up, whiteouts, merged readdir dedup) lives here and
+# drives tmpfs through its public primitives (tmpfs_open_for_write,
+# tmpfs_read/write, tmpfs_lookup, tmpfs_mkdir, tmpfs_unlink, tmpfs_listdir,
+# tmpfs_size, tmpfs_path_is_dir, tmpfs_path_exists). Linux mapping:
+# fs/overlayfs/* (super.c / namei.c / copy_up.c / dir.c).
+#
+# Layer layout under tmpfs (one overlay instance):
+#   /tmp/ovl/lowerN/...   read-only lower layer N (N = 0 is the topmost
+#                         lower; higher N = deeper/older layer)
+#   /tmp/ovl/upper/...    the writable upper layer; copy-ups + new files
+#                         + whiteout markers land here
+#
+# WHITEOUT encoding: deleting a name that exists only in a lower layer can't
+# remove the lower file (it's read-only), so we record the deletion in upper
+# as a marker file named ".wh.<name>" (the same convention Linux overlayfs
+# uses on disk). A merged lookup that finds ".wh.<name>" in upper treats
+# <name> as absent. Creating a new file at <name> first removes the
+# ".wh.<name>" marker so the name reappears (now upper-owned).
+#
+# OPAQUE DIRECTORY encoding: a directory recreated in upper that should hide
+# ALL lower entries of the same name carries a ".wh..wh..opq" marker file
+# inside it; merged readdir of such a directory ignores the lower layers
+# entirely. (Implemented; exercised by the self-test's opaque case.)
+#
+# Scope notes:
+#   * One overlay instance is plenty for the native use case (a Debian-shape
+#     read-only base + a writable scratch upper). The data structures are a
+#     fixed array so a second instance is a trivial future extension.
+#   * COPY-UP copies data + the file kind (file/dir). Hamnix tmpfs has no
+#     ownership/mode bits to carry, so "metadata" here is kind + size; when
+#     tmpfs grows mode/uid the copy-up loop extends to carry them too.
+#   * Nested directories ARE supported: copy-up of a lower file under a
+#     lower-only directory first copies up the parent directory chain
+#     (ovl_ensure_upper_dir), exactly like Linux's recursive copy-up.
+
+from mm.slab import kmalloc, kfree
+from kernel.printk.printk import printk0, printk1, printk2
+from fs.tmpfs import (
+    tmpfs_mkdir, tmpfs_open_for_write, tmpfs_open_for_append,
+    tmpfs_write, tmpfs_read, tmpfs_size, tmpfs_lookup, tmpfs_unlink,
+    tmpfs_listdir, tmpfs_path_is_dir, tmpfs_path_exists, tmpfs_is_dir,
+)
+
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
+
+# --- configuration --------------------------------------------------
+
+OVL_MAX_LOWERS:  uint64 = 8          # max read-only lower layers
+OVL_PATH_MAX:    uint64 = 256        # absolute tmpfs path buffer size
+OVL_NAME_MAX:    uint64 = 64         # one path component (incl ".wh." prefix)
+OVL_COPYUP_CHUNK: uint64 = 4096      # copy-up streaming chunk
+
+# Error returns (negative errno, Linux convention).
+OVL_ENOENT:  int32 = -2
+OVL_EEXIST:  int32 = -17
+OVL_EINVAL:  int32 = -22
+OVL_ENOSPC:  int32 = -28
+OVL_EIO:     int32 = -5
+OVL_ENAMETOOLONG: int32 = -36
+
+
+class OverlayInstance:
+    used:       uint32               # 0 = not configured
+    nr_lowers:  uint32               # number of active lower layers
+    # Each layer is the tmpfs subtree rooted at one of these absolute
+    # tmpfs paths (NUL-terminated). lower[0] is the TOPMOST lower.
+    upper_root: Array[256, uint8]
+    lower_root: Array[8, Array[256, uint8]]
+
+
+ovl_inst: OverlayInstance
+
+# Module-scope scratch buffers (single-threaded fs ops at this scale make
+# these safe; Adder requires big buffers to be module globals, not locals).
+_ovl_path_a:  Array[256, uint8]
+_ovl_path_b:  Array[256, uint8]
+_ovl_name_buf: Array[64, uint8]
+_ovl_copy_buf: Array[4096, uint8]
+_ovl_dir_lower: Array[4096, uint8]   # readdir scratch for one lower layer
+# Seen-name table for readdir dedup: packed NUL-terminated names.
+_ovl_seen: Array[8192, uint8]
+_ovl_seen_len: uint64 = 0
+
+
+# --- small string helpers -------------------------------------------
+
+def _ovl_strlen(s: Ptr[uint8]) -> uint64:
+    i: uint64 = 0
+    while s[i] != 0:
+        i = i + 1
+    return i
+
+
+def _ovl_streq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while True:
+        ca: uint8 = a[i]
+        cb: uint8 = b[i]
+        if ca != cb:
+            return 0
+        if ca == 0:
+            return 1
+        i = i + 1
+
+
+def _ovl_append(dst: Ptr[uint8], pos: uint64, src: Ptr[uint8],
+                cap: uint64) -> uint64:
+    # Append NUL-terminated src to dst starting at byte `pos`. Returns the
+    # new position (index of the terminating NUL). Caps at cap-1 bytes.
+    i: uint64 = pos
+    j: uint64 = 0
+    while src[j] != 0:
+        if i + 1 >= cap:
+            dst[i] = 0
+            return i
+        dst[i] = src[j]
+        i = i + 1
+        j = j + 1
+    dst[i] = 0
+    return i
+
+
+def _ovl_append_char(dst: Ptr[uint8], pos: uint64, c: uint8,
+                     cap: uint64) -> uint64:
+    if pos + 1 >= cap:
+        dst[pos] = 0
+        return pos
+    dst[pos] = c
+    dst[pos + 1] = 0
+    return pos + 1
+
+
+def _ovl_is_valid_rel(rel: Ptr[uint8]) -> int32:
+    # A relative path with no leading slash, no "..", no empty components,
+    # no NUL-only string. Overlay merged paths are always relative to a
+    # layer root; reject anything that could escape the layer.
+    if rel[0] == 0:
+        return 0
+    if rel[0] == 47:                  # leading '/'
+        return 0
+    i: uint64 = 0
+    comp_start: uint64 = 0
+    while True:
+        c: uint8 = rel[i]
+        if c == 47 or c == 0:
+            clen: uint64 = i - comp_start
+            if clen == 0:
+                return 0              # empty component ("//", trailing '/')
+            if clen == 2:
+                if rel[comp_start] == 46 and rel[comp_start + 1] == 46:
+                    return 0          # ".."
+            comp_start = i + 1
+            if c == 0:
+                return 1
+        i = i + 1
+
+
+def _ovl_basename(rel: Ptr[uint8], out: Ptr[uint8], cap: uint64) -> int32:
+    # Copy the final component of `rel` into `out` (NUL-terminated).
+    # Returns 1 on success, 0 if it doesn't fit.
+    n: uint64 = _ovl_strlen(rel)
+    start: uint64 = 0
+    i: uint64 = 0
+    while i < n:
+        if rel[i] == 47:
+            start = i + 1
+        i = i + 1
+    blen: uint64 = n - start
+    if blen + 1 > cap:
+        return 0
+    j: uint64 = 0
+    while j < blen:
+        out[j] = rel[start + j]
+        j = j + 1
+    out[blen] = 0
+    return 1
+
+
+def _ovl_dirname_into(rel: Ptr[uint8], out: Ptr[uint8], cap: uint64) -> int32:
+    # Copy the parent-directory portion of `rel` into `out`. If `rel` has
+    # no '/', `out` becomes "" (empty -> the layer root itself). Returns 1
+    # on success (incl. the empty case), 0 if it doesn't fit.
+    n: uint64 = _ovl_strlen(rel)
+    last: int64 = -1
+    i: uint64 = 0
+    while i < n:
+        if rel[i] == 47:
+            last = cast[int64](i)
+        i = i + 1
+    if last < 0:
+        out[0] = 0
+        return 1
+    dlen: uint64 = cast[uint64](last)
+    if dlen + 1 > cap:
+        return 0
+    j: uint64 = 0
+    while j < dlen:
+        out[j] = rel[j]
+        j = j + 1
+    out[dlen] = 0
+    return 1
+
+
+# --- path composition -----------------------------------------------
+
+def _ovl_join(root: Ptr[uint8], rel: Ptr[uint8], out: Ptr[uint8],
+              cap: uint64) -> int32:
+    # Build the absolute tmpfs path  <root>/<rel>  into `out`. `rel` may be
+    # empty (-> just <root>). Returns 1 on success, 0 on overflow.
+    pos: uint64 = _ovl_append(out, 0, root, cap)
+    if rel[0] == 0:
+        return 1
+    pos = _ovl_append_char(out, pos, 47, cap)      # '/'
+    pos = _ovl_append(out, pos, rel, cap)
+    if pos + 1 >= cap:
+        return 0
+    return 1
+
+
+def _ovl_wh_name(name: Ptr[uint8], out: Ptr[uint8], cap: uint64) -> int32:
+    # Build the whiteout marker name ".wh.<name>" into `out`.
+    pos: uint64 = _ovl_append(out, 0, ".wh.", cap)
+    pos = _ovl_append(out, pos, name, cap)
+    if pos + 1 >= cap:
+        return 0
+    return 1
+
+
+def _ovl_upper_path(rel: Ptr[uint8], out: Ptr[uint8], cap: uint64) -> int32:
+    return _ovl_join(&ovl_inst.upper_root[0], rel, out, cap)
+
+
+def _ovl_lower_path(idx: uint64, rel: Ptr[uint8], out: Ptr[uint8],
+                    cap: uint64) -> int32:
+    return _ovl_join(&ovl_inst.lower_root[idx][0], rel, out, cap)
+
+
+# --- whiteout / opaque probes ---------------------------------------
+
+def _ovl_whiteout_present(rel: Ptr[uint8]) -> int32:
+    # True if upper holds ".wh.<basename(rel)>" in the directory that would
+    # contain `rel`. That whiteout hides any lower copy of `rel`.
+    if _ovl_dirname_into(rel, &_ovl_name_buf[0], OVL_NAME_MAX) == 0:
+        return 0
+    # Build upper-dir absolute path into _ovl_path_a.
+    if _ovl_upper_path(&_ovl_name_buf[0], &_ovl_path_a[0], OVL_PATH_MAX) == 0:
+        return 0
+    # basename(rel) -> _ovl_name_buf (reuse; dirname already consumed)
+    base: Array[64, uint8]
+    if _ovl_basename(rel, &base[0], OVL_NAME_MAX) == 0:
+        return 0
+    wh: Array[64, uint8]
+    if _ovl_wh_name(&base[0], &wh[0], OVL_NAME_MAX) == 0:
+        return 0
+    # absolute = <upper-dir>/.wh.<base>
+    pos: uint64 = _ovl_strlen(&_ovl_path_a[0])
+    pos = _ovl_append_char(&_ovl_path_a[0], pos, 47, OVL_PATH_MAX)
+    pos = _ovl_append(&_ovl_path_a[0], pos, &wh[0], OVL_PATH_MAX)
+    if tmpfs_path_exists(cast[Ptr[char]](&_ovl_path_a[0])) != 0:
+        return 1
+    return 0
+
+
+def _ovl_dir_is_opaque(rel: Ptr[uint8]) -> int32:
+    # True if the UPPER copy of directory `rel` carries the opaque marker
+    # file ".wh..wh..opq" — meaning lower entries of the same dir are hidden.
+    if _ovl_upper_path(rel, &_ovl_path_a[0], OVL_PATH_MAX) == 0:
+        return 0
+    pos: uint64 = _ovl_strlen(&_ovl_path_a[0])
+    pos = _ovl_append_char(&_ovl_path_a[0], pos, 47, OVL_PATH_MAX)
+    pos = _ovl_append(&_ovl_path_a[0], pos, ".wh..wh..opq", OVL_PATH_MAX)
+    if tmpfs_path_exists(cast[Ptr[char]](&_ovl_path_a[0])) != 0:
+        return 1
+    return 0
+
+
+# --- configuration --------------------------------------------------
+
+def ovl_reset():
+    # Tear the instance config down (does NOT delete backing tmpfs files).
+    ovl_inst.used = 0
+    ovl_inst.nr_lowers = 0
+    ovl_inst.upper_root[0] = 0
+
+
+def ovl_set_upper(path: Ptr[char]) -> int32:
+    # Register the writable upper-layer root (an absolute tmpfs dir path).
+    n: uint64 = 0
+    while cast[uint8](path[n]) != 0:
+        if n + 1 >= OVL_PATH_MAX:
+            return OVL_ENAMETOOLONG
+        ovl_inst.upper_root[n] = cast[uint8](path[n])
+        n = n + 1
+    ovl_inst.upper_root[n] = 0
+    ovl_inst.used = 1
+    return 0
+
+
+def ovl_add_lower(path: Ptr[char]) -> int32:
+    # Append a read-only lower-layer root. Lowers are searched in the order
+    # added; the FIRST added is the topmost (shadows later ones).
+    idx: uint64 = cast[uint64](ovl_inst.nr_lowers)
+    if idx >= OVL_MAX_LOWERS:
+        return OVL_ENOSPC
+    n: uint64 = 0
+    while cast[uint8](path[n]) != 0:
+        if n + 1 >= OVL_PATH_MAX:
+            return OVL_ENAMETOOLONG
+        ovl_inst.lower_root[idx][n] = cast[uint8](path[n])
+        n = n + 1
+    ovl_inst.lower_root[idx][n] = 0
+    ovl_inst.nr_lowers = ovl_inst.nr_lowers + 1
+    return 0
+
+
+# --- core resolution ------------------------------------------------
+
+OVL_LAYER_NONE:  int32 = -1
+OVL_LAYER_UPPER: int32 = -2
+# >= 0 means lower layer index.
+
+
+def ovl_resolve_layer(rel: Ptr[uint8]) -> int32:
+    # Resolve a merged relative path to the layer that owns it:
+    #   OVL_LAYER_UPPER  if upper has it (and it's not a whiteout marker),
+    #   <lower idx>      else the topmost lower that has it AND no whiteout
+    #                    hides it AND no opaque parent hides it,
+    #   OVL_LAYER_NONE   if nothing in the merged view resolves it.
+    if ovl_inst.used == 0:
+        return OVL_LAYER_NONE
+    if _ovl_is_valid_rel(rel) == 0:
+        return OVL_LAYER_NONE
+    # 1. Upper wins outright.
+    if _ovl_upper_path(rel, &_ovl_path_a[0], OVL_PATH_MAX) != 0:
+        if tmpfs_path_exists(cast[Ptr[char]](&_ovl_path_a[0])) != 0:
+            return OVL_LAYER_UPPER
+    # 2. A whiteout in upper hides every lower copy.
+    if _ovl_whiteout_present(rel) != 0:
+        return OVL_LAYER_NONE
+    # 3. An opaque parent directory in upper hides lower copies under it.
+    if _ovl_parent_opaque(rel) != 0:
+        return OVL_LAYER_NONE
+    # 4. Topmost lower that has it.
+    i: uint64 = 0
+    while i < cast[uint64](ovl_inst.nr_lowers):
+        if _ovl_lower_path(i, rel, &_ovl_path_a[0], OVL_PATH_MAX) != 0:
+            if tmpfs_path_exists(cast[Ptr[char]](&_ovl_path_a[0])) != 0:
+                return cast[int32](i)
+        i = i + 1
+    return OVL_LAYER_NONE
+
+
+def _ovl_parent_opaque(rel: Ptr[uint8]) -> int32:
+    # True if the immediate parent directory of `rel` exists in upper AND is
+    # marked opaque (so lower copies of `rel` are hidden).
+    pdir: Array[256, uint8]
+    if _ovl_dirname_into(rel, &pdir[0], OVL_PATH_MAX) == 0:
+        return 0
+    if pdir[0] == 0:
+        return 0                      # parent is the root; never opaque
+    # Parent must exist in upper for opacity to apply.
+    if _ovl_upper_path(&pdir[0], &_ovl_path_a[0], OVL_PATH_MAX) == 0:
+        return 0
+    if tmpfs_path_exists(cast[Ptr[char]](&_ovl_path_a[0])) == 0:
+        return 0
+    return _ovl_dir_is_opaque(&pdir[0])
+
+
+def ovl_exists(rel: Ptr[uint8]) -> int32:
+    # True if `rel` resolves to anything in the merged view.
+    if ovl_resolve_layer(rel) == OVL_LAYER_NONE:
+        return 0
+    return 1
+
+
+def ovl_is_dir(rel: Ptr[uint8]) -> int32:
+    # True if `rel` resolves to a directory in the merged view.
+    layer: int32 = ovl_resolve_layer(rel)
+    if layer == OVL_LAYER_NONE:
+        return 0
+    if layer == OVL_LAYER_UPPER:
+        if _ovl_upper_path(rel, &_ovl_path_a[0], OVL_PATH_MAX) == 0:
+            return 0
+        return tmpfs_path_is_dir(cast[Ptr[char]](&_ovl_path_a[0]))
+    if _ovl_lower_path(cast[uint64](layer), rel, &_ovl_path_a[0],
+                       OVL_PATH_MAX) == 0:
+        return 0
+    return tmpfs_path_is_dir(cast[Ptr[char]](&_ovl_path_a[0]))
+
+
+def ovl_size(rel: Ptr[uint8]) -> int64:
+    # Size of the merged file `rel`, or negative errno.
+    layer: int32 = ovl_resolve_layer(rel)
+    if layer == OVL_LAYER_NONE:
+        return cast[int64](OVL_ENOENT)
+    if layer == OVL_LAYER_UPPER:
+        if _ovl_upper_path(rel, &_ovl_path_a[0], OVL_PATH_MAX) == 0:
+            return cast[int64](OVL_ENAMETOOLONG)
+    else:
+        if _ovl_lower_path(cast[uint64](layer), rel, &_ovl_path_a[0],
+                           OVL_PATH_MAX) == 0:
+            return cast[int64](OVL_ENAMETOOLONG)
+    slot: int32 = tmpfs_lookup(cast[Ptr[char]](&_ovl_path_a[0]))
+    if slot < 0:
+        return cast[int64](OVL_ENOENT)
+    return cast[int64](tmpfs_size(slot))
+
+
+# --- read -----------------------------------------------------------
+
+def ovl_read(rel: Ptr[uint8], dst: Ptr[uint8], pos: uint64,
+             count: uint64) -> int64:
+    # Read up to `count` bytes from merged file `rel` at offset `pos`.
+    # Returns bytes read, or negative errno if the name doesn't resolve.
+    layer: int32 = ovl_resolve_layer(rel)
+    if layer == OVL_LAYER_NONE:
+        return cast[int64](OVL_ENOENT)
+    if layer == OVL_LAYER_UPPER:
+        if _ovl_upper_path(rel, &_ovl_path_a[0], OVL_PATH_MAX) == 0:
+            return cast[int64](OVL_ENAMETOOLONG)
+    else:
+        if _ovl_lower_path(cast[uint64](layer), rel, &_ovl_path_a[0],
+                           OVL_PATH_MAX) == 0:
+            return cast[int64](OVL_ENAMETOOLONG)
+    slot: int32 = tmpfs_lookup(cast[Ptr[char]](&_ovl_path_a[0]))
+    if slot < 0:
+        return cast[int64](OVL_ENOENT)
+    return cast[int64](tmpfs_read(slot, dst, pos, count))
+
+
+# --- copy-up --------------------------------------------------------
+
+def ovl_ensure_upper_dir(rel: Ptr[uint8]) -> int32:
+    # Make sure directory `rel` (and every ancestor) exists in upper,
+    # creating it with tmpfs_mkdir as needed. `rel` "" -> the upper root
+    # itself (assumed to already exist). Returns 0 on success, negative
+    # errno otherwise. Walks the components left-to-right, mkdir'ing each.
+    if rel[0] == 0:
+        return 0
+    # Build progressively: upper_root + "/" + comp + ...
+    acc: Array[256, uint8]
+    acc_pos: uint64 = _ovl_append(&acc[0], 0, &ovl_inst.upper_root[0],
+                                  OVL_PATH_MAX)
+    n: uint64 = _ovl_strlen(rel)
+    i: uint64 = 0
+    comp_start: uint64 = 0
+    while i <= n:
+        c: uint8 = 0
+        if i < n:
+            c = rel[i]
+        if c == 47 or i == n:
+            clen: uint64 = i - comp_start
+            if clen > 0:
+                acc_pos = _ovl_append_char(&acc[0], acc_pos, 47,
+                                           OVL_PATH_MAX)
+                k: uint64 = 0
+                while k < clen:
+                    acc_pos = _ovl_append_char(&acc[0], acc_pos,
+                                               rel[comp_start + k],
+                                               OVL_PATH_MAX)
+                    k = k + 1
+                # mkdir this prefix; tolerate EEXIST.
+                rc: int32 = tmpfs_mkdir(cast[Ptr[char]](&acc[0]))
+                if rc != 0:
+                    if rc != OVL_EEXIST:
+                        return rc
+            comp_start = i + 1
+        i = i + 1
+    return 0
+
+
+def ovl_copy_up(rel: Ptr[uint8]) -> int32:
+    # Copy the lower-layer file `rel` into upper (data + kind), leaving the
+    # lower pristine. Idempotent: if `rel` already lives in upper, returns 0
+    # immediately. Recursively materialises the parent directory chain in
+    # upper first (ovl_ensure_upper_dir). Returns 0 on success, negative
+    # errno on failure.
+    if ovl_inst.used == 0:
+        return OVL_EINVAL
+    # NOTE: the shared _ovl_path_a/_ovl_path_b scratch buffers are clobbered
+    # by every nested helper (ovl_resolve_layer, ovl_ensure_upper_dir, ...),
+    # so this routine keeps its own LOCAL path buffers and recomputes the
+    # upper/lower absolute paths right before each tmpfs call.
+    upath: Array[256, uint8]
+    lpath: Array[256, uint8]
+    # Already in upper? Nothing to do.
+    if _ovl_upper_path(rel, &upath[0], OVL_PATH_MAX) == 0:
+        return OVL_ENAMETOOLONG
+    if tmpfs_path_exists(cast[Ptr[char]](&upath[0])) != 0:
+        return 0
+    # Locate the source lower layer.
+    layer: int32 = ovl_resolve_layer(rel)
+    if layer == OVL_LAYER_NONE:
+        return OVL_ENOENT
+    if layer == OVL_LAYER_UPPER:
+        return 0                      # raced; already upper
+    src_idx: uint64 = cast[uint64](layer)
+    if _ovl_lower_path(src_idx, rel, &lpath[0], OVL_PATH_MAX) == 0:
+        return OVL_ENAMETOOLONG
+    src_slot: int32 = tmpfs_lookup(cast[Ptr[char]](&lpath[0]))
+    if src_slot < 0:
+        return OVL_ENOENT
+    # Ensure the parent directory chain exists in upper.
+    pdir: Array[256, uint8]
+    if _ovl_dirname_into(rel, &pdir[0], OVL_PATH_MAX) == 0:
+        return OVL_ENAMETOOLONG
+    prc: int32 = ovl_ensure_upper_dir(&pdir[0])
+    if prc != 0:
+        return prc
+    # Directory copy-up: just mkdir the upper counterpart.
+    if tmpfs_is_dir(src_slot) != 0:
+        mrc: int32 = tmpfs_mkdir(cast[Ptr[char]](&upath[0]))
+        if mrc != 0:
+            if mrc != OVL_EEXIST:
+                return mrc
+        return 0
+    # File copy-up: create the upper file, then stream data lower->upper.
+    dst_slot: int32 = tmpfs_open_for_write(cast[Ptr[char]](&upath[0]))
+    if dst_slot < 0:
+        return dst_slot
+    total: uint64 = tmpfs_size(src_slot)
+    off: uint64 = 0
+    while off < total:
+        want: uint64 = total - off
+        if want > OVL_COPYUP_CHUNK:
+            want = OVL_COPYUP_CHUNK
+        got: uint64 = tmpfs_read(src_slot, &_ovl_copy_buf[0], off, want)
+        if got == 0:
+            break
+        wrote: uint64 = tmpfs_write(dst_slot, &_ovl_copy_buf[0], off, got)
+        if wrote != got:
+            return OVL_EIO            # short write -> backing store full
+        off = off + got
+    return 0
+
+
+# --- write / open-for-write -----------------------------------------
+
+def ovl_open_for_write(rel: Ptr[uint8]) -> int32:
+    # Open merged `rel` for writing, copying it up from a lower layer first
+    # if it's lower-only (so the lower stays pristine and writes hit upper).
+    # If `rel` doesn't exist in any layer, it's created fresh in upper. A
+    # whiteout for `rel` (if any) is removed so the name becomes live again.
+    # Returns the UPPER tmpfs slot index to write through, or negative errno.
+    if ovl_inst.used == 0:
+        return OVL_EINVAL
+    if _ovl_is_valid_rel(rel) == 0:
+        return OVL_EINVAL
+    layer: int32 = ovl_resolve_layer(rel)
+    if layer >= 0:
+        # Lower-only: copy up first.
+        cu: int32 = ovl_copy_up(rel)
+        if cu != 0:
+            return cu
+    elif layer == OVL_LAYER_NONE:
+        # New file (possibly over a whiteout): ensure parent dirs in upper
+        # and remove any whiteout marker hiding the name.
+        pdir: Array[256, uint8]
+        if _ovl_dirname_into(rel, &pdir[0], OVL_PATH_MAX) == 0:
+            return OVL_ENAMETOOLONG
+        prc: int32 = ovl_ensure_upper_dir(&pdir[0])
+        if prc != 0:
+            return prc
+        _ovl_remove_whiteout(rel)
+    # layer == UPPER falls through (already writable in upper).
+    if _ovl_upper_path(rel, &_ovl_path_a[0], OVL_PATH_MAX) == 0:
+        return OVL_ENAMETOOLONG
+    return tmpfs_open_for_write(cast[Ptr[char]](&_ovl_path_a[0]))
+
+
+def ovl_write(rel: Ptr[uint8], src: Ptr[uint8], pos: uint64,
+              count: uint64) -> int64:
+    # Convenience: open-for-write (with copy-up) then write at `pos`.
+    slot: int32 = ovl_open_for_write(rel)
+    if slot < 0:
+        return cast[int64](slot)
+    return cast[int64](tmpfs_write(slot, src, pos, count))
+
+
+# --- delete / whiteout ----------------------------------------------
+
+def _ovl_remove_whiteout(rel: Ptr[uint8]) -> int32:
+    # Remove the ".wh.<basename(rel)>" marker from upper (if present).
+    # Returns 0 whether or not a marker was actually there.
+    pdir: Array[256, uint8]
+    if _ovl_dirname_into(rel, &pdir[0], OVL_PATH_MAX) == 0:
+        return 0
+    base: Array[64, uint8]
+    if _ovl_basename(rel, &base[0], OVL_NAME_MAX) == 0:
+        return 0
+    wh: Array[64, uint8]
+    if _ovl_wh_name(&base[0], &wh[0], OVL_NAME_MAX) == 0:
+        return 0
+    if _ovl_upper_path(&pdir[0], &_ovl_path_a[0], OVL_PATH_MAX) == 0:
+        return 0
+    pos: uint64 = _ovl_strlen(&_ovl_path_a[0])
+    pos = _ovl_append_char(&_ovl_path_a[0], pos, 47, OVL_PATH_MAX)
+    pos = _ovl_append(&_ovl_path_a[0], pos, &wh[0], OVL_PATH_MAX)
+    if tmpfs_path_exists(cast[Ptr[char]](&_ovl_path_a[0])) != 0:
+        tmpfs_unlink(cast[Ptr[char]](&_ovl_path_a[0]))
+    return 0
+
+
+def _ovl_make_whiteout(rel: Ptr[uint8]) -> int32:
+    # Create the ".wh.<basename(rel)>" marker in upper so the merged view
+    # hides every lower copy of `rel`. The parent dir chain is materialised
+    # in upper first. Returns 0 on success, negative errno otherwise.
+    pdir: Array[256, uint8]
+    if _ovl_dirname_into(rel, &pdir[0], OVL_PATH_MAX) == 0:
+        return OVL_ENAMETOOLONG
+    prc: int32 = ovl_ensure_upper_dir(&pdir[0])
+    if prc != 0:
+        return prc
+    base: Array[64, uint8]
+    if _ovl_basename(rel, &base[0], OVL_NAME_MAX) == 0:
+        return OVL_ENAMETOOLONG
+    wh: Array[64, uint8]
+    if _ovl_wh_name(&base[0], &wh[0], OVL_NAME_MAX) == 0:
+        return OVL_ENAMETOOLONG
+    if _ovl_upper_path(&pdir[0], &_ovl_path_a[0], OVL_PATH_MAX) == 0:
+        return OVL_ENAMETOOLONG
+    pos: uint64 = _ovl_strlen(&_ovl_path_a[0])
+    pos = _ovl_append_char(&_ovl_path_a[0], pos, 47, OVL_PATH_MAX)
+    pos = _ovl_append(&_ovl_path_a[0], pos, &wh[0], OVL_PATH_MAX)
+    slot: int32 = tmpfs_open_for_write(cast[Ptr[char]](&_ovl_path_a[0]))
+    if slot < 0:
+        return slot
+    return 0
+
+
+def ovl_unlink(rel: Ptr[uint8]) -> int32:
+    # Delete the merged name `rel`.
+    #   * If it lives in upper, remove the upper copy.
+    #   * If a lower copy also exists (or it was lower-only), drop a
+    #     whiteout in upper so the name vanishes from the merged view while
+    #     the lower layer stays untouched.
+    # Returns 0 on success, -ENOENT if the name doesn't resolve.
+    if ovl_inst.used == 0:
+        return OVL_EINVAL
+    if _ovl_is_valid_rel(rel) == 0:
+        return OVL_EINVAL
+    layer: int32 = ovl_resolve_layer(rel)
+    if layer == OVL_LAYER_NONE:
+        return OVL_ENOENT
+    # Does any lower layer still hold this name? If so we need a whiteout
+    # even after removing the upper copy.
+    lower_has: int32 = 0
+    li: uint64 = 0
+    while li < cast[uint64](ovl_inst.nr_lowers):
+        if _ovl_lower_path(li, rel, &_ovl_path_b[0], OVL_PATH_MAX) != 0:
+            if tmpfs_path_exists(cast[Ptr[char]](&_ovl_path_b[0])) != 0:
+                lower_has = 1
+                li = cast[uint64](ovl_inst.nr_lowers)
+            else:
+                li = li + 1
+        else:
+            li = li + 1
+    if layer == OVL_LAYER_UPPER:
+        # Remove the upper copy first.
+        if _ovl_upper_path(rel, &_ovl_path_a[0], OVL_PATH_MAX) == 0:
+            return OVL_ENAMETOOLONG
+        tmpfs_unlink(cast[Ptr[char]](&_ovl_path_a[0]))
+    if lower_has != 0:
+        return _ovl_make_whiteout(rel)
+    return 0
+
+
+# --- merged readdir -------------------------------------------------
+
+def _ovl_seen_reset():
+    _ovl_seen_len = 0
+
+
+def _ovl_seen_has(name: Ptr[uint8]) -> int32:
+    # Linear scan of the packed seen-table for `name`.
+    i: uint64 = 0
+    while i < _ovl_seen_len:
+        if _ovl_streq(&_ovl_seen[i], name) != 0:
+            return 1
+        # advance past this NUL-terminated entry
+        while _ovl_seen[i] != 0:
+            i = i + 1
+        i = i + 1
+    return 0
+
+
+def _ovl_seen_add(name: Ptr[uint8]):
+    n: uint64 = _ovl_strlen(name)
+    if _ovl_seen_len + n + 1 >= 8192:
+        return                        # table full; dedup best-effort
+    j: uint64 = 0
+    while j < n:
+        _ovl_seen[_ovl_seen_len + j] = name[j]
+        j = j + 1
+    _ovl_seen[_ovl_seen_len + n] = 0
+    _ovl_seen_len = _ovl_seen_len + n + 1
+
+
+def _ovl_is_wh_name(name: Ptr[uint8]) -> int32:
+    # True if `name` begins with ".wh." (a whiteout/opaque marker that must
+    # not appear in the merged listing).
+    if name[0] != 46:                 # '.'
+        return 0
+    if name[1] != 119:                # 'w'
+        return 0
+    if name[2] != 104:                # 'h'
+        return 0
+    if name[3] != 46:                 # '.'
+        return 0
+    return 1
+
+
+def _ovl_wh_basename(name: Ptr[uint8], out: Ptr[uint8], cap: uint64) -> int32:
+    # Given a ".wh.<x>" name, copy "<x>" into out. Returns 1 on success.
+    src: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](name) + 4)
+    n: uint64 = _ovl_strlen(src)
+    if n + 1 > cap:
+        return 0
+    i: uint64 = 0
+    while i <= n:
+        out[i] = src[i]
+        i = i + 1
+    return 1
+
+
+def _ovl_emit_lines(layer_buf: Ptr[uint8], used: uint64,
+                    out: Ptr[uint8], out_pos: uint64,
+                    out_cap: uint64, whiteouts_active: int32) -> uint64:
+    # Walk the "NAME\n"-packed `layer_buf` (length `used`); for each name not
+    # already seen and not a ".wh." marker and not whiteouted, append
+    # "NAME\n" to `out` and record it as seen. Returns the new out position.
+    pos: uint64 = out_pos
+    i: uint64 = 0
+    while i < used:
+        # Extract one component up to '\n'.
+        start: uint64 = i
+        while i < used and layer_buf[i] != 10:
+            i = i + 1
+        clen: uint64 = i - start
+        if i < used:
+            i = i + 1                 # skip '\n'
+        if clen == 0:
+            continue
+        if clen + 1 > OVL_NAME_MAX:
+            continue                  # absurdly long; skip defensively
+        nm: Array[64, uint8]
+        k: uint64 = 0
+        while k < clen:
+            nm[k] = layer_buf[start + k]
+            k = k + 1
+        nm[clen] = 0
+        # Whiteout/opaque markers never show in the merged listing.
+        if _ovl_is_wh_name(&nm[0]) != 0:
+            continue
+        # Already emitted (upper won) OR seeded as a whiteout basename
+        # (deleted from the merged view) -> skip. The whiteouts_active flag
+        # is informational: lower layers rely on the upper whiteout seeding
+        # done by _ovl_seed_whiteouts_from_upper_dir before this runs.
+        if _ovl_seen_has(&nm[0]) != 0:
+            continue
+        _ovl_seen_add(&nm[0])
+        # Append "NAME\n".
+        if pos + clen + 1 >= out_cap:
+            return pos
+        m: uint64 = 0
+        while m < clen:
+            out[pos] = nm[m]
+            pos = pos + 1
+            m = m + 1
+        out[pos] = 10                 # '\n'
+        pos = pos + 1
+    return pos
+
+
+def _ovl_seed_whiteouts_from_upper_dir(rel: Ptr[uint8]) -> int32:
+    # Pre-populate the seen-table with the basenames of every ".wh.<x>"
+    # marker found in upper's copy of directory `rel`, so those names are
+    # treated as deleted when the lower layers are merged in. Returns 0.
+    if _ovl_upper_path(rel, &_ovl_path_a[0], OVL_PATH_MAX) == 0:
+        return 0
+    if tmpfs_path_exists(cast[Ptr[char]](&_ovl_path_a[0])) == 0:
+        return 0
+    n: int64 = tmpfs_listdir(cast[Ptr[char]](&_ovl_path_a[0]),
+                             &_ovl_dir_lower[0], 4096)
+    if n <= 0:
+        return 0
+    used: uint64 = cast[uint64](n)
+    i: uint64 = 0
+    while i < used:
+        start: uint64 = i
+        while i < used and _ovl_dir_lower[i] != 10:
+            i = i + 1
+        clen: uint64 = i - start
+        if i < used:
+            i = i + 1
+        if clen == 0:
+            continue
+        if clen + 1 > OVL_NAME_MAX:
+            continue
+        nm: Array[64, uint8]
+        k: uint64 = 0
+        while k < clen:
+            nm[k] = _ovl_dir_lower[start + k]
+            k = k + 1
+        nm[clen] = 0
+        if _ovl_is_wh_name(&nm[0]) != 0:
+            base: Array[64, uint8]
+            if _ovl_wh_basename(&nm[0], &base[0], OVL_NAME_MAX) != 0:
+                _ovl_seen_add(&base[0])
+    return 0
+
+
+def ovl_listdir(rel: Ptr[uint8], out: Ptr[uint8], cap: uint64) -> int64:
+    # Merged directory listing of `rel` as "NAME\n" lines: union of upper +
+    # all lower entries, deduplicated (upper wins on collision), with
+    # ".wh." markers hidden and whiteouted names removed. If the upper copy
+    # of the directory is opaque, the lower layers are skipped entirely.
+    # `rel` "" lists the overlay root. Returns bytes written or negative
+    # errno.
+    if ovl_inst.used == 0:
+        return cast[int64](OVL_EINVAL)
+    if cap == 0:
+        return 0
+    _ovl_seen_reset()
+    out_pos: uint64 = 0
+    # Seed the seen-table with whiteout basenames in upper's copy of this
+    # dir, so deleted lower names stay hidden.
+    _ovl_seed_whiteouts_from_upper_dir(rel)
+    # 1. Upper layer entries first (they win on collision).
+    upper_present: int32 = 0
+    if _ovl_upper_path(rel, &_ovl_path_a[0], OVL_PATH_MAX) != 0:
+        if tmpfs_path_exists(cast[Ptr[char]](&_ovl_path_a[0])) != 0:
+            upper_present = 1
+            un: int64 = tmpfs_listdir(cast[Ptr[char]](&_ovl_path_a[0]),
+                                      &_ovl_dir_lower[0], 4096)
+            if un > 0:
+                out_pos = _ovl_emit_lines(&_ovl_dir_lower[0],
+                                          cast[uint64](un),
+                                          out, out_pos, cap, 0)
+    # 2. If upper's copy of this dir is opaque, skip lowers entirely.
+    opaque: int32 = 0
+    if upper_present != 0:
+        opaque = _ovl_dir_is_opaque(rel)
+    if opaque == 0:
+        # 3. Each lower layer, topmost first.
+        i: uint64 = 0
+        while i < cast[uint64](ovl_inst.nr_lowers):
+            if _ovl_lower_path(i, rel, &_ovl_path_a[0], OVL_PATH_MAX) != 0:
+                if tmpfs_path_exists(cast[Ptr[char]](&_ovl_path_a[0])) != 0:
+                    ln: int64 = tmpfs_listdir(
+                        cast[Ptr[char]](&_ovl_path_a[0]),
+                        &_ovl_dir_lower[0], 4096)
+                    if ln > 0:
+                        out_pos = _ovl_emit_lines(&_ovl_dir_lower[0],
+                                                  cast[uint64](ln),
+                                                  out, out_pos, cap, 1)
+            i = i + 1
+    return cast[int64](out_pos)
+
+
+# --- mkdir ----------------------------------------------------------
+
+def ovl_mkdir(rel: Ptr[uint8]) -> int32:
+    # Create directory `rel` in the upper layer (materialising parents),
+    # clearing any whiteout that hid the name. Returns 0 on success.
+    if ovl_inst.used == 0:
+        return OVL_EINVAL
+    if _ovl_is_valid_rel(rel) == 0:
+        return OVL_EINVAL
+    if ovl_exists(rel) != 0:
+        return OVL_EEXIST
+    pdir: Array[256, uint8]
+    if _ovl_dirname_into(rel, &pdir[0], OVL_PATH_MAX) == 0:
+        return OVL_ENAMETOOLONG
+    prc: int32 = ovl_ensure_upper_dir(&pdir[0])
+    if prc != 0:
+        return prc
+    _ovl_remove_whiteout(rel)
+    if _ovl_upper_path(rel, &_ovl_path_a[0], OVL_PATH_MAX) == 0:
+        return OVL_ENAMETOOLONG
+    return tmpfs_mkdir(cast[Ptr[char]](&_ovl_path_a[0]))
+
+
+def ovl_mark_opaque(rel: Ptr[uint8]) -> int32:
+    # Mark the upper directory `rel` opaque (hide all lower entries of the
+    # same dir). `rel` must already exist in upper. Returns 0 on success.
+    if ovl_inst.used == 0:
+        return OVL_EINVAL
+    if _ovl_upper_path(rel, &_ovl_path_a[0], OVL_PATH_MAX) == 0:
+        return OVL_ENAMETOOLONG
+    if tmpfs_path_exists(cast[Ptr[char]](&_ovl_path_a[0])) == 0:
+        return OVL_ENOENT
+    pos: uint64 = _ovl_strlen(&_ovl_path_a[0])
+    pos = _ovl_append_char(&_ovl_path_a[0], pos, 47, OVL_PATH_MAX)
+    pos = _ovl_append(&_ovl_path_a[0], pos, ".wh..wh..opq", OVL_PATH_MAX)
+    slot: int32 = tmpfs_open_for_write(cast[Ptr[char]](&_ovl_path_a[0]))
+    if slot < 0:
+        return slot
+    return 0
+
+
+# --- self-test ------------------------------------------------------
+#
+# Builds a two-layer overlay entirely in tmpfs and proves the four core
+# overlayfs behaviours. Emits "[overlayfs] ..." lines and a single
+# "[overlayfs] PASS" on success. Returns 1 on PASS, 0 on FAIL.
+#
+# Layout:
+#   lower  = /tmp/ovl/lower0
+#   upper  = /tmp/ovl/upper
+# Files:
+#   lower0/only_lower      -> "LOWERDATA"     (lower-only file)
+#   lower0/shadowed        -> "LOWERV"        (shadowed by upper)
+#   lower0/to_delete       -> "BYE"           (will be whiteouted)
+#   upper/shadowed         -> "UPPERV"        (wins lookup)
+#   upper/only_upper       -> "UPPERONLY"
+
+_ovl_t_rbuf: Array[64, uint8]
+_ovl_t_dbuf: Array[1024, uint8]
+
+
+def _ovl_t_write(rel: Ptr[uint8], data: Ptr[uint8]) -> int32:
+    n: uint64 = _ovl_strlen(data)
+    rc: int64 = ovl_write(rel, data, 0, n)
+    if rc < 0:
+        return cast[int32](rc)
+    if cast[uint64](rc) != n:
+        return -1
+    return 0
+
+
+def _ovl_t_read_eq(rel: Ptr[uint8], expect: Ptr[uint8]) -> int32:
+    # Read merged `rel` and compare to NUL-terminated `expect`. Returns 1
+    # if equal, 0 otherwise.
+    n: uint64 = _ovl_strlen(expect)
+    got: int64 = ovl_read(rel, &_ovl_t_rbuf[0], 0, 64)
+    if got < 0:
+        return 0
+    if cast[uint64](got) != n:
+        return 0
+    i: uint64 = 0
+    while i < n:
+        if _ovl_t_rbuf[i] != expect[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def _ovl_t_listing_has(rel: Ptr[uint8], name: Ptr[uint8]) -> int32:
+    # True if a merged listdir of `rel` contains the line `name`.
+    n: int64 = ovl_listdir(rel, &_ovl_t_dbuf[0], 1024)
+    if n <= 0:
+        return 0
+    used: uint64 = cast[uint64](n)
+    i: uint64 = 0
+    while i < used:
+        start: uint64 = i
+        while i < used and _ovl_t_dbuf[i] != 10:
+            i = i + 1
+        clen: uint64 = i - start
+        if i < used:
+            i = i + 1
+        # Compare [start, start+clen) to name.
+        match_ok: int32 = 1
+        k: uint64 = 0
+        while k < clen:
+            if _ovl_t_dbuf[start + k] != name[k]:
+                match_ok = 0
+                k = clen
+            else:
+                k = k + 1
+        if match_ok != 0:
+            if name[clen] == 0:
+                return 1
+    return 0
+
+
+def _ovl_t_listing_count(rel: Ptr[uint8]) -> int32:
+    # Count merged listing lines of `rel`.
+    n: int64 = ovl_listdir(rel, &_ovl_t_dbuf[0], 1024)
+    if n <= 0:
+        return 0
+    used: uint64 = cast[uint64](n)
+    cnt: int32 = 0
+    i: uint64 = 0
+    while i < used:
+        if _ovl_t_dbuf[i] == 10:
+            cnt = cnt + 1
+        i = i + 1
+    return cnt
+
+
+def overlayfs_selftest() -> int32:
+    printk0("[overlayfs] self-test start\n")
+    ovl_reset()
+    # Build the backing tmpfs layer dirs.
+    if tmpfs_mkdir("/tmp/ovl") != 0:
+        pass                          # tolerate EEXIST on re-run
+    if tmpfs_mkdir("/tmp/ovl/lower0") != 0:
+        pass
+    if tmpfs_mkdir("/tmp/ovl/upper") != 0:
+        pass
+
+    # Seed lower-layer files DIRECTLY through tmpfs (lower is read-only to
+    # the overlay; we populate it out-of-band like a pre-built base image).
+    if _ovl_seed_lower("/tmp/ovl/lower0/only_lower", "LOWERDATA") != 0:
+        printk0("[overlayfs] FAIL: seed only_lower\n")
+        return 0
+    if _ovl_seed_lower("/tmp/ovl/lower0/shadowed", "LOWERV") != 0:
+        printk0("[overlayfs] FAIL: seed shadowed\n")
+        return 0
+    if _ovl_seed_lower("/tmp/ovl/lower0/to_delete", "BYE") != 0:
+        printk0("[overlayfs] FAIL: seed to_delete\n")
+        return 0
+
+    # Configure the overlay: one lower + one upper.
+    if ovl_set_upper("/tmp/ovl/upper") != 0:
+        printk0("[overlayfs] FAIL: set_upper\n")
+        return 0
+    if ovl_add_lower("/tmp/ovl/lower0") != 0:
+        printk0("[overlayfs] FAIL: add_lower\n")
+        return 0
+
+    # Put a shadowing copy + an upper-only file into upper through the
+    # overlay write path.
+    if _ovl_t_write("shadowed", "UPPERV") != 0:
+        printk0("[overlayfs] FAIL: write upper shadowed\n")
+        return 0
+    if _ovl_t_write("only_upper", "UPPERONLY") != 0:
+        printk0("[overlayfs] FAIL: write only_upper\n")
+        return 0
+
+    # CHECK 1: upper shadows lower on lookup.
+    if _ovl_t_read_eq("shadowed", "UPPERV") == 0:
+        printk0("[overlayfs] FAIL: upper-shadows-lower lookup\n")
+        return 0
+    printk0("[overlayfs] upper-shadows-lower: 'shadowed' reads UPPERV OK\n")
+
+    # CHECK 2: copy-up-on-write. Open lower-only 'only_lower' for write and
+    # overwrite it; the merged file changes, the LOWER stays pristine.
+    if _ovl_t_read_eq("only_lower", "LOWERDATA") == 0:
+        printk0("[overlayfs] FAIL: pre-copyup read\n")
+        return 0
+    if _ovl_t_write("only_lower", "COPIEDUP") != 0:
+        printk0("[overlayfs] FAIL: copy-up write\n")
+        return 0
+    if _ovl_t_read_eq("only_lower", "COPIEDUP") == 0:
+        printk0("[overlayfs] FAIL: post-copyup merged read\n")
+        return 0
+    # Lower must still read its original bytes DIRECTLY through tmpfs.
+    lslot: int32 = tmpfs_lookup("/tmp/ovl/lower0/only_lower")
+    if lslot < 0:
+        printk0("[overlayfs] FAIL: lower gone after copy-up\n")
+        return 0
+    got: uint64 = tmpfs_read(lslot, &_ovl_t_rbuf[0], 0, 64)
+    if got != 9:                      # len("LOWERDATA")
+        printk0("[overlayfs] FAIL: lower size changed after copy-up\n")
+        return 0
+    exp: Ptr[uint8] = "LOWERDATA"
+    ci: uint64 = 0
+    while ci < 9:
+        if _ovl_t_rbuf[ci] != exp[ci]:
+            printk0("[overlayfs] FAIL: lower bytes changed after copy-up\n")
+            return 0
+        ci = ci + 1
+    # And an upper copy must now exist.
+    if tmpfs_lookup("/tmp/ovl/upper/only_lower") < 0:
+        printk0("[overlayfs] FAIL: no upper copy after copy-up\n")
+        return 0
+    printk0("[overlayfs] copy-up-on-write: upper has COPIEDUP, lower still LOWERDATA OK\n")
+
+    # CHECK 3: whiteout-on-delete hides a lower-only file.
+    if ovl_exists("to_delete") == 0:
+        printk0("[overlayfs] FAIL: to_delete missing pre-unlink\n")
+        return 0
+    if ovl_unlink("to_delete") != 0:
+        printk0("[overlayfs] FAIL: unlink to_delete\n")
+        return 0
+    if ovl_exists("to_delete") != 0:
+        printk0("[overlayfs] FAIL: to_delete visible after whiteout\n")
+        return 0
+    # Lower copy must still physically exist.
+    if tmpfs_lookup("/tmp/ovl/lower0/to_delete") < 0:
+        printk0("[overlayfs] FAIL: whiteout touched the lower layer\n")
+        return 0
+    # And a whiteout marker must exist in upper.
+    if tmpfs_lookup("/tmp/ovl/upper/.wh.to_delete") < 0:
+        printk0("[overlayfs] FAIL: no whiteout marker in upper\n")
+        return 0
+    printk0("[overlayfs] whiteout-on-delete: 'to_delete' hidden, lower pristine OK\n")
+
+    # CHECK 3b: re-creating over a whiteout makes the name live again.
+    if _ovl_t_write("to_delete", "REBORN") != 0:
+        printk0("[overlayfs] FAIL: recreate over whiteout\n")
+        return 0
+    if _ovl_t_read_eq("to_delete", "REBORN") == 0:
+        printk0("[overlayfs] FAIL: recreated file wrong contents\n")
+        return 0
+    if tmpfs_lookup("/tmp/ovl/upper/.wh.to_delete") >= 0:
+        printk0("[overlayfs] FAIL: whiteout not cleared on recreate\n")
+        return 0
+    printk0("[overlayfs] recreate-over-whiteout: 'to_delete' live again OK\n")
+
+    # CHECK 4: merged readdir union + dedup + whiteout hiding.
+    # Expected merged names at root: shadowed (1x), only_upper, only_lower,
+    # to_delete (reborn). 'to_delete' was whiteouted then recreated so it
+    # shows exactly once. The ".wh." marker must NOT appear.
+    if _ovl_t_listing_has("", "shadowed") == 0:
+        printk0("[overlayfs] FAIL: readdir missing 'shadowed'\n")
+        return 0
+    if _ovl_t_listing_has("", "only_upper") == 0:
+        printk0("[overlayfs] FAIL: readdir missing 'only_upper'\n")
+        return 0
+    if _ovl_t_listing_has("", "only_lower") == 0:
+        printk0("[overlayfs] FAIL: readdir missing 'only_lower'\n")
+        return 0
+    if _ovl_t_listing_has("", "to_delete") == 0:
+        printk0("[overlayfs] FAIL: readdir missing reborn 'to_delete'\n")
+        return 0
+    if _ovl_t_listing_has("", ".wh.to_delete") != 0:
+        printk0("[overlayfs] FAIL: whiteout marker leaked into readdir\n")
+        return 0
+    # 'shadowed' must be deduped (upper wins) — count must be exactly the
+    # four live names (shadowed, only_upper, only_lower, to_delete).
+    cnt: int32 = _ovl_t_listing_count("")
+    if cnt != 4:
+        printk1("[overlayfs] FAIL: readdir count=%d (want 4)\n",
+                cast[uint64](cnt))
+        return 0
+    printk0("[overlayfs] merged-readdir: union deduped, whiteout hidden, count=4 OK\n")
+
+    printk0("[overlayfs] PASS\n")
+    return 1
+
+
+def _ovl_seed_lower(path: Ptr[char], data: Ptr[uint8]) -> int32:
+    # Write `data` into a tmpfs file at `path` (used to pre-populate the
+    # read-only lower layer out-of-band, the way a base image would).
+    slot: int32 = tmpfs_open_for_write(path)
+    if slot < 0:
+        return cast[int32](slot)
+    n: uint64 = _ovl_strlen(data)
+    wrote: uint64 = tmpfs_write(slot, data, 0, n)
+    if wrote != n:
+        return -1
+    return 0
