@@ -1087,6 +1087,20 @@ if os.environ.get("ENABLE_PARTEBR_TEST") == "1":
 if os.environ.get("ENABLE_EXT4IDX_TEST") == "1":
     FILES.append(("/etc/ext4idx-test", b"1\n"))
 
+# ext4 DEPTH-2 extent-tree self-test. scripts/test_ext4d2.sh sets
+# ENABLE_EXT4D2_TEST=1 to plant /etc/ext4d2-test. init/main.ad detects
+# the marker after the ext4 mount and calls ext4_extentd2_selftest()
+# (fs/ext4.ad): it appends enough deliberately non-contiguous one-block
+# extents to overflow the depth-1 capacity (4 inode index slots × leaf
+# records), forcing the inode into a DEPTH-2 index tree (idx → idx →
+# leaf); it reads every block back through the two-level index walk,
+# partially truncates (exercising depth-2 trim), then truncates to zero
+# (folding the tree back to an inline depth-0 leaf). It WRITES to the
+# mounted image, so it must only run on the disposable test image —
+# opt-in via the marker. Default boots omit it so it never fires.
+if os.environ.get("ENABLE_EXT4D2_TEST") == "1":
+    FILES.append(("/etc/ext4d2-test", b"1\n"))
+
 # Partition write-smoke fixtures (mkpart MBR on sd0, gpt on nvme0n1).
 # These WRITE a partition table onto a freshly-registered disk that has
 # no MBR, so they must NEVER run on production media. Set
