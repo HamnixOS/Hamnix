@@ -102,6 +102,19 @@ partition_table: Array[64, Partition]
 PARTITION_NAME_LEN:  uint64 = 16
 partition_dev_name:  Array[64, uint8]
 
+# Per-PARTITION GPT name, parallel to partition_table. A GPT entry's
+# name field (offset +56) is 36 UTF-16LE code units; decoded to ASCII
+# that's at most 36 chars + a NUL terminator. We round the per-slot
+# stride up to 40 bytes for clean arithmetic. MBR/EBR partitions have
+# no on-disk name, so their slot is left blank (a leading NUL).
+#
+# 4 devices * 16 partitions * 40 bytes = 2560 bytes of .bss. Cheap.
+#   partition_part_name[(slot * PARTITIONS_PER_DISK + idx) * GPT_NAME_STRIDE + c]
+GPT_NAME_CODE_UNITS: uint64 = 36       # GPT spec: 72 bytes / 2
+GPT_NAME_STRIDE:     uint64 = 40       # 36 ASCII + NUL, padded
+GPT_NAME_FIELD_OFF:  uint64 = 56       # byte offset of the name field
+partition_part_name: Array[2560, uint8]
+
 
 # --- MBR layout constants ------------------------------------------
 #
@@ -316,6 +329,60 @@ def _name_base_index(slot: int32) -> uint64:
     return cast[uint64](slot) * PARTITION_NAME_LEN
 
 
+def _part_name_base(slot: int32, idx: uint64) -> uint64:
+    # Byte offset into partition_part_name for (slot, idx)'s ASCII name.
+    flat: uint64 = cast[uint64](slot) * PARTITIONS_PER_DISK + idx
+    return flat * GPT_NAME_STRIDE
+
+
+def _clear_part_name(slot: int32, idx: uint64):
+    # Blank one partition's GPT name slot (leading NUL = empty).
+    base: uint64 = _part_name_base(slot, idx)
+    partition_part_name[base] = 0
+
+
+def _decode_gpt_name(buf: Ptr[uint8], eoff: uint64,
+                     slot: int32, idx: uint64):
+    # Decode the 72-byte UTF-16LE name field at (eoff + GPT_NAME_FIELD_OFF)
+    # into a bounded ASCII string stored at partition_part_name[(slot,idx)].
+    # Each UTF-16 code unit is read LE; an ASCII code unit (0x01..0x7F)
+    # is copied verbatim, a non-ASCII unit becomes '?', and the first
+    # NUL code unit terminates the string. An empty name leaves a blank
+    # (leading-NUL) slot.
+    base: uint64 = _part_name_base(slot, idx)
+    name_off: uint64 = eoff + GPT_NAME_FIELD_OFF
+    out: uint64 = 0
+    i: uint64 = 0
+    while i < GPT_NAME_CODE_UNITS:
+        lo: uint32 = cast[uint32](buf[name_off + i * 2])
+        hi: uint32 = cast[uint32](buf[name_off + i * 2 + 1])
+        cu: uint32 = lo | (hi << 8)
+        if cu == 0:
+            i = GPT_NAME_CODE_UNITS
+        else:
+            ch: uint8 = 0x3F                     # '?'
+            if cu >= 0x20 and cu < 0x7F:
+                ch = cast[uint8](cu & 0xFF)
+            if out < (GPT_NAME_STRIDE - 1):
+                partition_part_name[base + out] = ch
+                out = out + 1
+            i = i + 1
+    partition_part_name[base + out] = 0
+
+
+def partition_name_ptr(slot: int32, idx: uint64) -> Ptr[char]:
+    # Read-only getter: the decoded GPT partition name for (slot, idx)
+    # as a NUL-terminated ASCII string. Returns NULL on out-of-range.
+    # MBR/EBR partitions and unnamed GPT entries return a pointer to a
+    # blank ("") string.
+    if _slot_in_range(slot) == 0:
+        return cast[Ptr[char]](0)
+    if idx >= PARTITIONS_PER_DISK:
+        return cast[Ptr[char]](0)
+    arr_base: uint64 = cast[uint64](&partition_part_name)
+    return cast[Ptr[char]](arr_base + _part_name_base(slot, idx))
+
+
 def _clear_table_for(slot: int32):
     # Zero the per-device partition table. Called at the start of every
     # partition_scan so a re-scan after media change doesn't leave
@@ -327,6 +394,7 @@ def _clear_table_for(slot: int32):
         partition_table[base + i].lba_end    = 0
         partition_table[base + i].type_short = 0
         partition_table[base + i].kind       = 0
+        _clear_part_name(slot, i)
         i = i + 1
 
 
@@ -670,6 +738,9 @@ def parse_gpt(slot: int32) -> int32:
             # entropy that matters for logging.
             ts: uint32 = _part_read_u32_le(sp, eoff + GPT_ENT_TYPE_GUID_OFF)
             _record_partition(slot, found, first_lba, last_lba, ts, 2)
+            # Decode the UTF-16LE partition name into the parallel name
+            # table at the SAME table index the record landed in.
+            _decode_gpt_name(sp, eoff, slot, found)
             found = found + 1
         e = e + 1
     return cast[int32](found)
@@ -793,6 +864,18 @@ def partition_log(slot: int32):
             printk1("%d", le)
             printk0(" type=")
             _emit_type_short(ts, k)
+            # GPT entries carry an on-disk UTF-16LE name; surface the
+            # decoded ASCII form so the log line reads e.g.
+            #   ... type=c12a7328 name="EFI System"
+            # MBR/EBR rows have no name field — their slot is blank and
+            # we omit the `name=` clause entirely.
+            pn_base: uint64 = _part_name_base(slot, i)
+            if partition_part_name[pn_base] != 0:
+                pn_arr_base: uint64 = cast[uint64](&partition_part_name)
+                pn_ptr: Ptr[char] = cast[Ptr[char]](pn_arr_base + pn_base)
+                printk0(" name=\"")
+                printk1("%s", cast[uint64](pn_ptr))
+                printk0("\"")
             printk0("\n")
         i = i + 1
 
@@ -1599,7 +1682,100 @@ def _partebr_check_one(slot: int32, idx: uint64,
     return 1
 
 
+# --- GPT partition-NAME self-test ----------------------------------
+#
+# Proves parse_gpt() decodes the UTF-16LE name field (entry offset +56)
+# into ASCII, stores it in the parallel partition_part_name table, and
+# surfaces it through partition_name_ptr() + the partition_log line.
+#
+# Opt-in: only fires when a block device named "vdb" is attached (the
+# fixture in scripts/test_gpt_names.sh hangs a GPT-named disk there as a
+# SECOND virtio drive, alongside the EBR fixture on "vda"). When no vdb
+# is present this returns 1 (vacuous pass) so default boots — and the
+# standalone EBR test — are completely unaffected.
+#
+# The fixture disk carries a GPT with two named partitions:
+#   p1 = "EFI System"  (ESP type GUID)
+#   p2 = "ham-root"    (Linux fs type GUID)
+#
+# Returns 1 on PASS (or when no vdb is attached), 0 on a real FAIL.
+# Prints [gpt-names] lines + exactly one [gpt-names] PASS on success.
+
+def _gpt_name_matches(slot: int32, idx: uint64, want: Ptr[char]) -> int32:
+    # 1 if the decoded GPT name at (slot, idx) equals `want` byte-for-
+    # byte (both NUL-terminated), else 0.
+    got: Ptr[char] = partition_name_ptr(slot, idx)
+    if cast[uint64](got) == 0:
+        return 0
+    i: uint64 = 0
+    while i < GPT_NAME_STRIDE:
+        gc: int32 = got[i]
+        wc: int32 = want[i]
+        if gc != wc:
+            return 0
+        if gc == 0:
+            return 1
+        i = i + 1
+    return 0
+
+
+def partition_gpt_names_selftest() -> int32:
+    vdb_name: Ptr[char] = "vdb"
+    slot: int32 = find_blockdev(vdb_name)
+    if slot < 0:
+        # No GPT-named fixture disk attached — nothing to assert.
+        printk0("[gpt-names] skipped (no vdb GPT disk)\n")
+        return 1
+    printk0("[gpt-names] self-test start\n")
+    printk1("[gpt-names] scanning vdb (slot=%d)\n", cast[uint64](slot))
+    nrec: int32 = partition_rescan(slot)
+    if nrec < 0:
+        printk0("[gpt-names] FAIL: partition_rescan returned error\n")
+        return 0
+    printk1("[gpt-names] recorded %d GPT entries\n", cast[uint64](nrec))
+
+    # Both partitions must be live GPT rows (kind=2).
+    p0: Ptr[Partition] = partition_for(slot, 0)
+    p1: Ptr[Partition] = partition_for(slot, 1)
+    if cast[uint64](p0) == 0 or p0[0].kind != 2:
+        printk0("[gpt-names] FAIL: idx0 not a GPT partition\n")
+        return 0
+    if cast[uint64](p1) == 0 or p1[0].kind != 2:
+        printk0("[gpt-names] FAIL: idx1 not a GPT partition\n")
+        return 0
+
+    n0: Ptr[char] = partition_name_ptr(slot, 0)
+    n1: Ptr[char] = partition_name_ptr(slot, 1)
+    printk0("[gpt-names] idx=0 name=\"")
+    printk1("%s", cast[uint64](n0))
+    printk0("\"\n")
+    printk0("[gpt-names] idx=1 name=\"")
+    printk1("%s", cast[uint64](n1))
+    printk0("\"\n")
+
+    ok: int32 = 1
+    want0: Ptr[char] = "EFI System"
+    want1: Ptr[char] = "ham-root"
+    if _gpt_name_matches(slot, 0, want0) == 0:
+        printk0("[gpt-names] FAIL: idx0 name != \"EFI System\"\n")
+        ok = 0
+    if _gpt_name_matches(slot, 1, want1) == 0:
+        printk0("[gpt-names] FAIL: idx1 name != \"ham-root\"\n")
+        ok = 0
+
+    if ok == 0:
+        printk0("[gpt-names] FAIL: GPT name decode mismatch\n")
+        return 0
+    printk0("[gpt-names] both GPT names decoded correctly\n")
+    printk0("[gpt-names] PASS\n")
+    return 1
+
+
 def partition_ebr_selftest() -> int32:
+    # Chain the GPT partition-name self-test off the existing partition-
+    # scan self-test so init/main.ad needs no edit: when the fixture
+    # attaches a GPT-named "vdb" disk this fires; otherwise it's a no-op.
+    partition_gpt_names_selftest()
     printk0("[part-ebr] self-test start\n")
     vda_name: Ptr[char] = "vda"
     slot: int32 = find_blockdev(vda_name)
