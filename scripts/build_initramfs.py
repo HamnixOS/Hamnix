@@ -457,6 +457,18 @@ if os.environ.get("ENABLE_PROCNET_TEST") == "1":
 if os.environ.get("ENABLE_SYSVIPC_TEST") == "1":
     FILES.append(("/etc/sysvipc-test", b"1\n"))
 
+# ext4 xattr + POSIX ACL self-test. scripts/test_ext4_xattr.sh sets
+# ENABLE_EXT4XATTR_TEST=1 to plant /etc/ext4xattr-test; init/main.ad at
+# boot:37.xat detects the marker and runs ext4_xattr_selftest().
+if os.environ.get("ENABLE_EXT4XATTR_TEST") == "1":
+    FILES.append(("/etc/ext4xattr-test", b"1\n"))
+
+# FAT VFAT long-filename self-test. scripts/test_fat_lfn.sh sets
+# ENABLE_FATLFN_TEST=1 to plant /etc/fatlfn-test; init/main.ad at
+# boot:37.lfn detects the marker and runs fat_lfn_selftest().
+if os.environ.get("ENABLE_FATLFN_TEST") == "1":
+    FILES.append(("/etc/fatlfn-test", b"1\n"))
+
 # #168: REAL ACPI S5 poweroff + reboot self-test.
 # scripts/test_acpi_poweroff.sh sets ENABLE_ACPI_TEST=1 to plant
 # /etc/acpi-test. init/main.ad at boot:37.acpi detects the marker, logs
