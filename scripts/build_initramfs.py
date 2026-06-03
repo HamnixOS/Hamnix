@@ -651,6 +651,20 @@ if os.environ.get("ENABLE_AHCI_NCQ_TEST") == "1":
 if os.environ.get("ENABLE_AHCI_BLK_TEST") == "1":
     FILES.append(("/etc/ahci-blk-test", b"1\n"))
 
+# AHCI TRIM + IDENTIFY/SMART maturity self-test. scripts/test_ahci_trim.sh
+# sets ENABLE_AHCI_TRIM_TEST=1 to plant /etc/ahci-trim-test. init/main.ad at
+# boot:37.atrim detects the marker and calls ahci_trim_selftest()
+# (drivers/ata/ahci.ad): it issues IDENTIFY DEVICE (0xEC), decodes the
+# 48-bit LBA capacity (words 100..103) + rotation rate (word 217 -> SSD
+# detect), asserts the capacity matches the attached disk, then issues
+# DATA SET MANAGEMENT / TRIM (0x06, feature 0x01) with a real LBA-range
+# payload and verifies a correct completion-or-graceful-abort status (the
+# driver reads the TFD.ERR bit if QEMU rejects TRIM/SMART). Requires the
+# test to attach a QEMU ich9-ahci disk. Default boots omit the marker so it
+# never fires.
+if os.environ.get("ENABLE_AHCI_TRIM_TEST") == "1":
+    FILES.append(("/etc/ahci-trim-test", b"1\n"))
+
 # FAT12 mkfs formatter self-test. scripts/test_fat_mkfs.sh sets
 # ENABLE_FAT_MKFS_TEST=1 to plant /etc/fat-mkfs-test. init/main.ad at
 # boot:37.fmk detects the marker and calls fat_mkfs_selftest()

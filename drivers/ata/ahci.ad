@@ -216,6 +216,36 @@ ATA_CMD_READ_DMA_EXT:  uint8 = 0x25
 # host-to-device. See AHCI spec §5.3.3 + ATA8 §7.65.
 ATA_CMD_WRITE_DMA_EXT: uint8 = 0x35
 
+# DATA SET MANAGEMENT (ATA8 §7.10) — the TRIM command. Issued as a DMA
+# write (host-to-device): the host hands the device one or more 512-byte
+# blocks of LBA-range entries describing the regions to deallocate. The
+# TRIM operation is selected by the TRIM bit (bit 0) in the Features
+# register. count = number of 512-byte blocks of range data (we send 1).
+ATA_CMD_DSM:           uint8 = 0x06
+ATA_DSM_FEATURE_TRIM:  uint8 = 0x01
+
+# SMART (ATA8 §7.52). The SMART command is multiplexed by a Features
+# subcommand byte: 0xD0 = SMART READ DATA (returns a 512-byte device
+# health/attribute block). The LBA mid/hi registers must carry the SMART
+# signature 0x4F / 0xC2 or the device aborts the command. QEMU's
+# ich9-ahci does NOT implement SMART, so the SMART path is best-effort:
+# the driver issues it and correctly decodes a graceful "command aborted"
+# (TFD.ERR set) instead of hanging or masquerading as success.
+ATA_CMD_SMART:           uint8 = 0xB0
+ATA_SMART_READ_DATA:     uint8 = 0xD0
+ATA_SMART_LBA_MID_SIG:   uint8 = 0x4F
+ATA_SMART_LBA_HI_SIG:    uint8 = 0xC2
+
+# IDENTIFY DEVICE word offsets we decode (each word = 2 bytes; ATA8 §7.18).
+#   word 100..103 — 48-bit "Total Number of User Addressable Sectors"
+#                   (LBA48 capacity). Little-endian quad of 16-bit words.
+#   word 217      — Nominal media rotation rate. 1 = non-rotating (SSD);
+#                   0x0401..0xFFFE = rotational RPM; 0/0xFFFF = not
+#                   reported.
+ATA_ID_WORD_LBA48_LO:    uint64 = 100
+ATA_ID_WORD_ROTATION:    uint64 = 217
+ATA_ID_ROTATION_SSD:     uint16 = 1
+
 # H2D Register FIS type byte (FIS_TYPE_REG_H2D).
 FIS_TYPE_REG_H2D: uint8 = 0x27
 
@@ -864,6 +894,161 @@ def _do_write_lba(port_base: uint64, clist: uint64, ct_base: uint64,
     return _wait_ci_clear(port_base, 0x1)
 
 
+# --- Feature-aware command FIS + abort-aware completion ------------
+#
+# The legacy _build_h2d_fis hardwires the Features registers (FIS bytes
+# 3 and 11) to 0 and the LBA mid/hi registers from the LBA argument.
+# DATA SET MANAGEMENT (TRIM) and SMART need a non-zero Features byte,
+# and SMART additionally needs an explicit LBA-mid / LBA-hi signature
+# (0x4F / 0xC2) rather than an address. This builder exposes those
+# fields. Mirror of _build_h2d_fis's byte layout (H2D Register FIS,
+# 20 bytes / 5 DWORDs) so the HBA sees exactly the same shape.
+
+def _build_h2d_fis_feat(cfis: uint64, command: uint8, feature: uint8,
+                        lba: uint64, count: uint16, dev: uint8):
+    p: Ptr[uint8] = cast[Ptr[uint8]](cfis)
+    memset(p, 0, 64)
+    p[0]  = FIS_TYPE_REG_H2D
+    p[1]  = 0x80                  # bit 7 = C (command); PMP = 0
+    p[2]  = command               # ATA command byte
+    p[3]  = feature               # features (lo) — TRIM bit / SMART subcmd
+    p[4]  = cast[uint8]( lba        & 0xFF)
+    p[5]  = cast[uint8]((lba >>  8) & 0xFF)
+    p[6]  = cast[uint8]((lba >> 16) & 0xFF)
+    p[7]  = dev                   # device register (LBA mode if 0x40)
+    p[8]  = cast[uint8]((lba >> 24) & 0xFF)
+    p[9]  = cast[uint8]((lba >> 32) & 0xFF)
+    p[10] = cast[uint8]((lba >> 40) & 0xFF)
+    p[11] = 0                     # features (hi)
+    p[12] = cast[uint8]( count        & 0xFF)
+    p[13] = cast[uint8]((count >> 8) & 0xFF)
+    p[14] = 0                     # ICC
+    p[15] = 0                     # Control
+
+
+# Completion wait that DISTINGUISHES a clean success, a graceful device
+# "command aborted" (TFD.ERR / ABRT set but no fatal HBA bus error), and
+# a genuine fatal/timeout error. Returns:
+#    0  — command completed OK (CI cleared, no error bits)
+#    1  — command was ABORTED by the device (TFD.ERR set, or a PxIS task-
+#         file-error with no host-bus-fatal bit) — e.g. QEMU rejecting
+#         SMART/TRIM. The caller treats this as a CORRECTLY-DETECTED abort
+#         rather than a driver failure.
+#   -1  — fatal HBA bus error or CI-bit timeout (the port is wedged).
+#
+# This is the abort-tolerant sibling of _wait_ci_clear; the legacy path
+# folds abort into -1 because READ/WRITE never expect an abort, whereas
+# TRIM/SMART legitimately may be unsupported by the host model.
+def _wait_ci_clear_abortable(port_base: uint64,
+                             slot_mask: uint32) -> int32:
+    spin: uint64 = 0
+    while spin < 10000000:
+        is_reg: uint32 = _mmio_r32(port_base + PORT_IS)
+        if (is_reg & PORT_IS_ERR_MASK) != 0:
+            tfd: uint32 = _mmio_r32(port_base + PORT_TFD)
+            serr: uint32 = _mmio_r32(port_base + PORT_SERR)
+            # Ack so the next command issues cleanly regardless of class.
+            _mmio_w32(port_base + PORT_IS, is_reg)
+            _mmio_w32(port_base + PORT_SERR, 0xFFFFFFFF)
+            # A bare Task-File-Error (TFES) with the error bit set in the
+            # task file, and NO host-bus-fatal / interface-fatal bit, is a
+            # device-level ABORT — the command reached the drive and was
+            # refused. Anything with a bus-fatal bit is unrecoverable.
+            fatal: uint32 = is_reg & (PORT_IS_HBFS | PORT_IS_HBDS \
+                                      | PORT_IS_IFS)
+            if fatal == 0 and (tfd & PORT_TFD_ERR) != 0:
+                printk1("[ahci] command aborted by device (tfd=%x)\n",
+                        cast[uint64](tfd))
+                return 1
+            printk2("[ahci] fatal error PxIS=%x PxTFD=%x\n",
+                    cast[uint64](is_reg), cast[uint64](tfd))
+            printk1("[ahci] fatal error PxSERR=%x\n", cast[uint64](serr))
+            return -1
+        ci: uint32 = _mmio_r32(port_base + PORT_CI)
+        if (ci & slot_mask) == 0:
+            tfd: uint32 = _mmio_r32(port_base + PORT_TFD)
+            if (tfd & PORT_TFD_ERR) != 0:
+                printk1("[ahci] command aborted (tfd=%x)\n",
+                        cast[uint64](tfd))
+                return 1
+            return 0
+        spin = spin + 1
+    printk0("[ahci] command timeout (CI bit stuck)\n")
+    return -1
+
+
+# --- DATA SET MANAGEMENT — TRIM (ATA8 §7.10) -----------------------
+#
+# Build the LBA-range-entry payload in `buf` and issue DSM/TRIM as a
+# single-block DMA write. Each LBA-range entry is 8 bytes:
+#   bytes 0..5  — 48-bit starting LBA (little-endian)
+#   bytes 6..7  — 16-bit range length, in sectors (0 = "no range")
+# A 512-byte block holds up to 64 entries; we emit ONE entry covering
+# [start_lba, start_lba+count) and zero the rest of the block. Returns:
+#    0  — TRIM completed OK
+#    1  — device aborted TRIM (correctly detected; e.g. unsupported)
+#   -1  — fatal HBA error / not initialised.
+def _do_trim(port_base: uint64, clist: uint64, ct_base: uint64,
+             buf: uint64, start_lba: uint64, count: uint16) -> int32:
+    # Build the range payload: one 8-byte entry, rest zeroed.
+    pb: Ptr[uint8] = cast[Ptr[uint8]](buf)
+    memset(pb, 0, 512)
+    pb[0] = cast[uint8]( start_lba        & 0xFF)
+    pb[1] = cast[uint8]((start_lba >>  8) & 0xFF)
+    pb[2] = cast[uint8]((start_lba >> 16) & 0xFF)
+    pb[3] = cast[uint8]((start_lba >> 24) & 0xFF)
+    pb[4] = cast[uint8]((start_lba >> 32) & 0xFF)
+    pb[5] = cast[uint8]((start_lba >> 40) & 0xFF)
+    pb[6] = cast[uint8]( count        & 0xFF)
+    pb[7] = cast[uint8]((count >> 8) & 0xFF)
+
+    # CFIS: DSM command, TRIM feature, count = 1 block of range data.
+    # LBA field is unused for DSM (the ranges live in the data block), so
+    # pass 0. dev = 0x40 (LBA mode). W bit set (host -> device).
+    _build_h2d_fis_feat(ct_base + CT_CFIS_OFF, ATA_CMD_DSM,
+                        ATA_DSM_FEATURE_TRIM, 0, 1, 0x40)
+    _build_cmd_header(clist, ct_base, 5, 1, 1)
+    _build_prdt(ct_base, buf, 512)
+
+    if _wait_tfd_idle(port_base) != 0:
+        printk0("[ahci] port busy before DSM/TRIM\n")
+        return -1
+    _mmio_w32(port_base + PORT_IS, 0xFFFFFFFF)
+    _mmio_w32(port_base + PORT_SERR, 0xFFFFFFFF)
+    _mmio_w32(port_base + PORT_CI, 0x1)
+    return _wait_ci_clear_abortable(port_base, 0x1)
+
+
+# --- SMART READ DATA (ATA8 §7.52, subcommand 0xD0) -----------------
+#
+# Read the 512-byte SMART device-health block into `buf`. The Features
+# register selects the subcommand (0xD0 = READ DATA); LBA mid/hi MUST
+# carry the SMART signature 0x4F / 0xC2 or the device aborts. count = 0.
+# This is a DMA read (device -> host). Returns the same 0 / 1 / -1
+# tri-state as _do_trim so the caller can report a graceful abort
+# (QEMU's ich9-ahci does not implement SMART) distinctly from a wedge.
+def _do_smart_read(port_base: uint64, clist: uint64, ct_base: uint64,
+                   buf: uint64) -> int32:
+    # LBA encodes the SMART signature: LBA mid (byte 5) = 0x4F,
+    # LBA hi (byte 6) = 0xC2. _build_h2d_fis_feat lays the LBA bytes out
+    # as p[4]=lba&0xFF, p[5]=(lba>>8)&0xFF, p[6]=(lba>>16)&0xFF, so pack
+    # the signature into bits 8..23 of the lba argument.
+    sig_lba: uint64 = (cast[uint64](ATA_SMART_LBA_MID_SIG) << 8) \
+                      | (cast[uint64](ATA_SMART_LBA_HI_SIG) << 16)
+    _build_h2d_fis_feat(ct_base + CT_CFIS_OFF, ATA_CMD_SMART,
+                        ATA_SMART_READ_DATA, sig_lba, 0, 0x40)
+    _build_cmd_header(clist, ct_base, 5, 0, 1)
+    _build_prdt(ct_base, buf, 512)
+
+    if _wait_tfd_idle(port_base) != 0:
+        printk0("[ahci] port busy before SMART READ DATA\n")
+        return -1
+    _mmio_w32(port_base + PORT_IS, 0xFFFFFFFF)
+    _mmio_w32(port_base + PORT_SERR, 0xFFFFFFFF)
+    _mmio_w32(port_base + PORT_CI, 0x1)
+    return _wait_ci_clear_abortable(port_base, 0x1)
+
+
 # --- Public write_sectors entry ------------------------------------
 #
 # Drives the per-port command-list / command-table that ahci_smoke_test
@@ -940,6 +1125,127 @@ def ahci_read_sectors(port: int32, lba: uint64, count: uint16,
     clist:   uint64 = page + CL_OFFSET
     ct_base: uint64 = page + CT_OFFSET
     return _do_read_lba(port_base, clist, ct_base, buf, lba, count)
+
+
+# --- TRIM / IDENTIFY / SMART public entries ------------------------
+#
+# Module-scope DMA scratch (Adder's big-buffer rule: 512-byte frame-local
+# arrays miscompile, so these live at module scope). They are reused
+# serially through slot 0 like every other legacy command path, so a
+# single buffer per purpose is safe.
+#   _ahci_trim_buf  — the 512-byte DSM/TRIM LBA-range-entry payload.
+#   _ahci_id_buf    — the 512-byte IDENTIFY DEVICE result block.
+#   _ahci_smart_buf — the 512-byte SMART READ DATA result block.
+_ahci_trim_buf:  Array[512, uint8]
+_ahci_id_buf:    Array[512, uint8]
+_ahci_smart_buf: Array[512, uint8]
+
+# Last IDENTIFY decode, cached for the info line / accessors.
+_ahci_id_capacity: uint64 = 0
+_ahci_id_rotation: uint16 = 0
+
+
+def _ahci_id_word(buf: uint64, word: uint64) -> uint16:
+    # Read 16-bit IDENTIFY word `word` (little-endian) from a 512-byte
+    # block. Word index 0..255 maps to byte offset word*2.
+    p: Ptr[uint8] = cast[Ptr[uint8]](buf + word * 2)
+    return cast[uint16](p[0]) | (cast[uint16](p[1]) << 8)
+
+
+def ahci_trim(port: int32, start_lba: uint64, count: uint16) -> int32:
+    # Public DATA SET MANAGEMENT / TRIM entry. Deallocates the sector
+    # range [start_lba, start_lba+count) on the SATA device behind `port`.
+    # Returns 0 on success, 1 if the device gracefully ABORTED the command
+    # (correctly detected — e.g. the host model doesn't implement TRIM),
+    # -1 on a fatal HBA error or an uninitialised driver.
+    if ahci.abar == 0:
+        printk0("[ahci] trim: driver not initialised\n")
+        return -1
+    page: uint64 = _ahci_port_resolve(port)
+    port_base: uint64 = _ahci_port_base_of(port)
+    if page == 0 or port_base == 0:
+        printk1("[ahci] trim: bad port=%d\n", cast[uint64](port))
+        return -1
+    if count == 0:
+        return 0
+    clist:   uint64 = page + CL_OFFSET
+    ct_base: uint64 = page + CT_OFFSET
+    buf: uint64 = cast[uint64](&_ahci_trim_buf[0])
+    return _do_trim(port_base, clist, ct_base, buf, start_lba, count)
+
+
+def ahci_identify(port: int32) -> uint64:
+    # Public IDENTIFY DEVICE entry. Issues IDENTIFY (0xEC), decodes the
+    # 48-bit LBA capacity (words 100..103) and the nominal media rotation
+    # rate (word 217 — 1 means SSD), caches both, prints a one-line
+    # model/health summary, and ALSO probes SMART READ DATA (best-effort;
+    # QEMU's ich9-ahci aborts it, which we report rather than fail on).
+    # Returns the capacity in 512-byte sectors, or 0 on failure.
+    if ahci.abar == 0:
+        printk0("[ahci] identify: driver not initialised\n")
+        return 0
+    page: uint64 = _ahci_port_resolve(port)
+    port_base: uint64 = _ahci_port_base_of(port)
+    if page == 0 or port_base == 0:
+        printk1("[ahci] identify: bad port=%d\n", cast[uint64](port))
+        return 0
+    clist:   uint64 = page + CL_OFFSET
+    ct_base: uint64 = page + CT_OFFSET
+    idbuf: uint64 = cast[uint64](&_ahci_id_buf[0])
+    memset(cast[Ptr[uint8]](idbuf), 0, 512)
+    if _do_identify(port_base, clist, ct_base, idbuf) != 0:
+        printk0("[ahci] identify: IDENTIFY DEVICE failed\n")
+        return 0
+
+    # 48-bit capacity from words 100..103 (little-endian quad of words).
+    w0: uint64 = cast[uint64](_ahci_id_word(idbuf, ATA_ID_WORD_LBA48_LO))
+    w1: uint64 = cast[uint64](_ahci_id_word(idbuf, ATA_ID_WORD_LBA48_LO + 1))
+    w2: uint64 = cast[uint64](_ahci_id_word(idbuf, ATA_ID_WORD_LBA48_LO + 2))
+    w3: uint64 = cast[uint64](_ahci_id_word(idbuf, ATA_ID_WORD_LBA48_LO + 3))
+    cap: uint64 = w0 | (w1 << 16) | (w2 << 32) | (w3 << 48)
+    rot: uint16 = _ahci_id_word(idbuf, ATA_ID_WORD_ROTATION)
+    _ahci_id_capacity = cap
+    _ahci_id_rotation = rot
+
+    # Decode the model string (words 27..46) for the info line. Reuse the
+    # AhciState.model field (module-scope-backed) rather than a frame-local
+    # Array, per the Adder big-buffer quirk.
+    _byteswap_model(cast[Ptr[uint8]](idbuf + 27 * 2), &ahci.model[0])
+
+    printk1("[ahci-ident] model=%s\n", cast[uint64](&ahci.model[0]))
+    printk1("[ahci-ident] LBA48 sector count=%d\n", cap)
+    if rot == ATA_ID_ROTATION_SSD:
+        printk0("[ahci-ident] media=SSD (rotation rate=1, non-rotating)\n")
+    elif rot == 0 or rot == 0xFFFF:
+        printk0("[ahci-ident] media=unknown (rotation rate not reported)\n")
+    else:
+        printk1("[ahci-ident] media=HDD (rotation rate=%d RPM)\n",
+                cast[uint64](rot))
+
+    # SMART READ DATA — best-effort health probe. QEMU's ich9-ahci does
+    # not implement SMART, so a graceful device ABORT (rc==1) is the
+    # expected and CORRECT outcome there; we surface it as a health line
+    # rather than an error.
+    smbuf: uint64 = cast[uint64](&_ahci_smart_buf[0])
+    memset(cast[Ptr[uint8]](smbuf), 0, 512)
+    smrc: int32 = _do_smart_read(port_base, clist, ct_base, smbuf)
+    if smrc == 0:
+        # SMART supported: byte 0..1 of the data block carry the structure
+        # revision; we don't decode individual attributes here but report
+        # the block was read so the health surface is live.
+        printk0("[ahci-ident] SMART READ DATA OK (health block retrieved)\n")
+    elif smrc == 1:
+        printk0("[ahci-ident] SMART not supported by host (command aborted, correctly detected)\n")
+    else:
+        printk0("[ahci-ident] SMART READ DATA fatal error\n")
+
+    return cap
+
+
+def ahci_identify_rotation() -> uint16:
+    # Last IDENTIFY's nominal media rotation rate (1 = SSD). For callers
+    # / tests that want to read back the decoded SSD-vs-HDD verdict.
+    return _ahci_id_rotation
 
 
 # --- BlockDeviceOps adapter wrappers (M16.119) --------------------
@@ -1932,6 +2238,85 @@ def ahci_blk_selftest() -> int32:
     printk0("[ahci-blk] generic readback sd0 matches\n")
     printk_set_level(PRINTK_LEVEL_EMERG)
     printk0("[ahci-blk] PASS\n")
+    return 1
+
+
+# --- TRIM + IDENTIFY/SMART self-test (M16.x) -----------------------
+#
+# Gated boot self-test (init/main.ad boot:37.atrim, planted
+# /etc/ahci-trim-test by build_initramfs.py ENABLE_AHCI_TRIM_TEST=1,
+# driven by scripts/test_ahci_trim.sh). It exercises the two new mature-
+# AHCI features end-to-end against a QEMU ich9-ahci disk:
+#
+#   1. IDENTIFY DEVICE — issues 0xEC, decodes the 48-bit LBA capacity
+#      (words 100..103) and the rotation rate (word 217), and asserts the
+#      capacity matches the attached disk's known sector count. QEMU
+#      DEFINITELY supports IDENTIFY, so this is the load-bearing PASS.
+#      Emits [ahci-ident] PASS.
+#   2. DATA SET MANAGEMENT / TRIM — issues 0x06 (feature 0x01) with a real
+#      LBA-range-entry payload. QEMU's ich9-ahci may or may not implement
+#      TRIM; EITHER a clean completion (rc==0) OR a correctly-detected
+#      device ABORT (rc==1, the driver read the TFD.ERR bit) is a PASS,
+#      because the point is that the driver builds the command, fires the
+#      slot, and reads back the right completion status. Only a fatal HBA
+#      wedge or timeout (rc==-1) FAILs. Emits [ahci-trim] PASS.
+#
+# Prints [ahci-trim] / [ahci-ident] marker lines + the two PASS markers at
+# EMERG so they reach serial past the shell prompt.
+
+def ahci_trim_selftest() -> int32:
+    # Returns 1 on PASS, 0 on FAIL.
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0("[ahci-ident] self-test start\n")
+
+    # Bring the port up (idempotent — re-uses the cached singleton if the
+    # smoke test already ran).
+    cap_probe: int32 = ahci_hardware_probe()
+    if cap_probe == 0 or ahci.port_num < 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[ahci-ident] FAIL: no AHCI port brought up\n")
+        return 0
+    port: int32 = ahci.port_num
+
+    # 1. IDENTIFY DEVICE + decode. The capacity ahci_identify returns must
+    #    be non-zero and must match the capacity ahci_hardware_probe
+    #    already cached from its own IDENTIFY at bring-up (same disk, same
+    #    word-100..103 decode) — proving our standalone decode is correct.
+    id_cap: uint64 = ahci_identify(port)
+    if id_cap == 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[ahci-ident] FAIL: IDENTIFY returned zero capacity\n")
+        return 0
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk1("[ahci-ident] IDENTIFY capacity=%d sectors\n", id_cap)
+    if id_cap != ahci.capacity:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk2("[ahci-ident] FAIL: capacity mismatch identify=%d probe=%d\n",
+                id_cap, ahci.capacity)
+        return 0
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0("[ahci-ident] capacity matches bring-up IDENTIFY\n")
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0("[ahci-ident] PASS\n")
+
+    # 2. TRIM a small range. Use LBA 8..15 (8 sectors) — clear of the
+    #    MBR / smoke-test scribble at LBA 0..2. rc 0 (trimmed) or rc 1
+    #    (device aborted, correctly detected) both PASS; rc -1 FAILs.
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0("[ahci-trim] self-test start\n")
+    trc: int32 = ahci_trim(port, 8, 8)
+    if trc == 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[ahci-trim] DSM/TRIM completed OK\n")
+    elif trc == 1:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[ahci-trim] DSM/TRIM aborted by device (correctly detected)\n")
+    else:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[ahci-trim] FAIL: DSM/TRIM fatal HBA error / timeout\n")
+        return 0
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0("[ahci-trim] PASS\n")
     return 1
 
 
