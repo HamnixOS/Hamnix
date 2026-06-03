@@ -789,6 +789,18 @@ if os.environ.get("ENABLE_EXT4DIR_TEST") == "1":
 if os.environ.get("ENABLE_EXT4_MKDIR_TEST") == "1":
     FILES.append(("/etc/ext4-mkdir-test", b"1\n"))
 
+# ext4 cross-directory directory-rename self-test.
+# scripts/test_ext4_dirrename.sh sets ENABLE_EXT4DIRRENAME_TEST=1 to plant
+# /etc/ext4dirrename-test. init/main.ad detects the marker after the ext4
+# mount and calls ext4_dirrename_selftest() (fs/ext4.ad): it moves a
+# sub-directory to a different parent and asserts the moved dir's ".." is
+# rewritten to the new parent inode AND both parents' i_links_count are
+# rebalanced (old parent -1, new parent +1), while a same-parent rename
+# leaves link counts and ".." untouched. Writes to the mounted image, so
+# it is opt-in. Default boots omit the marker so it never fires.
+if os.environ.get("ENABLE_EXT4DIRRENAME_TEST") == "1":
+    FILES.append(("/etc/ext4dirrename-test", b"1\n"))
+
 # ext4 slow-symlink self-test. scripts/test_ext4_symlink.sh sets
 # ENABLE_EXT4_SYMLINK_TEST=1 to plant /etc/ext4-symlink-test. init/main.ad
 # detects the marker after the ext4 mount and calls ext4_symlink_selftest()
