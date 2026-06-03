@@ -24,6 +24,7 @@ from .lexer import tokenize, LexerError
 from .parser import Parser, ParseError, parse
 from .ast_nodes import Program, ImportDecl
 from .codegen_x86 import generate as generate_x86, CodeGenError
+from .codegen_arm64 import generate as generate_arm64
 
 
 # Compilation targets. `codegen` selects the backend; `kbuild` means the
@@ -44,6 +45,13 @@ TARGETS = {
     # elf32-i386 so the kernel's loader can parse it).
     "x86_64-adder-user": {"codegen": "x86", "kbuild": False,
                           "bare_metal": True},
+    # PHASE 1 multi-arch: aarch64 (ARM64) Linux user-mode ELF, runnable
+    # under qemu-aarch64. Hand-written aarch64 encoder in codegen_arm64.py;
+    # assembled + statically linked with aarch64-linux-gnu binutils. This
+    # is the foundational backend; the bare-metal ARM64 kernel port is a
+    # later phase. The x86_64 paths above are untouched.
+    "aarch64-linux": {"codegen": "arm64", "kbuild": False,
+                      "bare_metal": False},
 }
 DEFAULT_TARGET = "x86_64-bare-metal"
 
@@ -59,6 +67,8 @@ def get_generator(target: str):
     if spec["codegen"] == "x86":
         bare = spec.get("bare_metal", False)
         return lambda program: generate_x86(program, bare_metal=bare)
+    if spec["codegen"] == "arm64":
+        return lambda program: generate_arm64(program)
     raise AssertionError(f"unhandled codegen backend: {spec['codegen']}")
 
 
@@ -500,6 +510,54 @@ def compile_with_imports(main_file: Path, target: str = DEFAULT_TARGET) -> str:
         sys.exit(1)
 
 
+def assemble_and_link_arm64_linux(asm_file: Path, output: Path) -> bool:
+    """Assemble + statically link a Adder aarch64 Linux user-mode ELF.
+
+    PHASE 1 multi-arch. The aarch64 backend (codegen_arm64.py) emits a
+    self-contained user-mode program: a `_start` that calls `main` and
+    issues the Linux `exit` syscall, plus the `write` syscall for output.
+    No libc, no C runtime — we assemble with aarch64-linux-gnu-as and link
+    a static, no-stdlib ELF with aarch64-linux-gnu-ld, entry point `_start`.
+    Runnable under qemu-aarch64 (user-mode emulation).
+    """
+    as_cmd = "aarch64-linux-gnu-as"
+    ld_cmd = "aarch64-linux-gnu-ld"
+
+    for tool in (as_cmd, ld_cmd):
+        try:
+            subprocess.run([tool, "--version"], capture_output=True,
+                           check=True)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            print(f"Error: {tool} not found "
+                  f"(install binutils-aarch64-linux-gnu)", file=sys.stderr)
+            return False
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        main_o = tmpdir / "main.o"
+
+        result = subprocess.run(
+            [as_cmd, "-o", str(main_o), str(asm_file)],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            print(f"Error assembling (aarch64):\n{result.stderr}",
+                  file=sys.stderr)
+            return False
+
+        link_cmd = [
+            ld_cmd, "-nostdlib", "-static", "-z", "noexecstack",
+            "-e", "_start", "-o", str(output), str(main_o),
+        ]
+        result = subprocess.run(link_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"Error linking (aarch64):\n{result.stderr}",
+                  file=sys.stderr)
+            return False
+
+    return True
+
+
 def assemble_and_link_x86_bare(asm_file: Path, output: Path,
                                 project_root: Path) -> bool:
     """Assemble + link a Adder bare-metal x86_64 kernel image.
@@ -752,7 +810,9 @@ def cmd_compile(args: argparse.Namespace) -> int:
         asm_path = Path(f.name)
 
     try:
-        if args.target == "x86_64-bare-metal":
+        if args.target == "aarch64-linux":
+            ok = assemble_and_link_arm64_linux(asm_path, output)
+        elif args.target == "x86_64-bare-metal":
             ok = assemble_and_link_x86_bare(asm_path, output, find_hamnix_root())
         elif args.target == "x86_64-adder-user":
             # TEMP_DEBUG_HAMSH_BRINGUP: pass the source-file stem as the
@@ -764,8 +824,8 @@ def cmd_compile(args: argparse.Namespace) -> int:
             )
         else:
             raise AssertionError(
-                f"x86_64-bare-metal / x86_64-adder-user are the only "
-                f"non-kbuild link paths; got '{args.target}'"
+                f"x86_64-bare-metal / x86_64-adder-user / aarch64-linux "
+                f"are the only non-kbuild link paths; got '{args.target}'"
             )
         if not ok:
             return 1
