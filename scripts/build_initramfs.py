@@ -1307,6 +1307,19 @@ if os.environ.get("ENABLE_EXT4IDX_TEST") == "1":
 if os.environ.get("ENABLE_EXT4D2_TEST") == "1":
     FILES.append(("/etc/ext4d2-test", b"1\n"))
 
+# ext4 extent-FREE / no-leak self-test. scripts/test_ext4_extent_free.sh
+# sets ENABLE_EXT4EXTFREE_TEST=1 to plant /etc/ext4extfree-test.
+# init/main.ad detects the marker after the ext4 mount and calls
+# ext4_extentfree_selftest() (fs/ext4.ad): it records the free-block
+# bitmap count, writes a multi-block fragmented file (spanning several
+# extents), unlinks it, and asserts the free count returns to its pre-
+# write value — proving ext4_unlink walks the extent tree and frees ALL
+# data + index/leaf metadata blocks (no leak). It also round-trips a
+# depth-3 extent tree byte-exact. WRITES the mounted image, so opt-in via
+# the marker; default boots omit it so it never fires.
+if os.environ.get("ENABLE_EXT4EXTFREE_TEST") == "1":
+    FILES.append(("/etc/ext4extfree-test", b"1\n"))
+
 # Partition write-smoke fixtures (mkpart MBR on sd0, gpt on nvme0n1).
 # These WRITE a partition table onto a freshly-registered disk that has
 # no MBR, so they must NEVER run on production media. Set
