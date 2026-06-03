@@ -2089,6 +2089,218 @@ def vma_protect(slot: uint64, addr: uint64, len_in: uint64,
 
 
 # ---------------------------------------------------------------------
+# vma_mremap — Linux mremap(2): grow-in-place / move / shrink
+# ---------------------------------------------------------------------
+#
+# Flags follow the Linux MREMAP_* bits (re-declared here so the kernel
+# core does not depend on the linux_abi shim's constants):
+VMA_MREMAP_MAYMOVE: uint64 = 1
+VMA_MREMAP_FIXED:   uint64 = 2
+
+
+def _vma_range_is_free(slot: uint64, lo: uint64, hi: uint64) -> int32:
+    # 1 iff NO VMA in `slot`'s list overlaps [lo, hi); 0 otherwise.
+    # Used by the grow-in-place fast path to confirm the virtual range
+    # immediately after a mapping is unoccupied before extending into it.
+    if hi <= lo:
+        return 1
+    cur: uint64 = task_vma_list_head(slot)
+    while cur != 0:
+        s: uint64 = _vma_node_start(cur)
+        e: uint64 = _vma_node_end(cur)
+        if s < hi and lo < e:
+            return 0
+        if s >= hi:
+            return 1
+        cur = _vma_node_get_next(cur)
+    return 1
+
+
+def _vma_grow_in_place(slot: uint64, node: uint64, old_end: uint64,
+                       delta: uint64, prot: int32) -> int32:
+    # Allocate `delta` bytes of fresh backing and OVERLAY it at
+    # [old_end, old_end+delta) in the task's PML4 with the SAME prot as
+    # the region (W^X-correct: new pages inherit _vma_rw_flag | _vma_nx_flag
+    # of `prot`, not blanket-RWX). The covered range must already be
+    # confirmed free. Grows `node`'s end on success. Returns 0 on success
+    # or a negative errno (no partial state on failure).
+    #
+    # Only safe for a windowed (>= VMA_LARGE_BASE) region: there the new
+    # virtual range is genuinely unbacked address space the kernel may
+    # overlay onto fresh phys. The chunks are recorded so the tail frees
+    # correctly on unmap.
+    nnew: int32 = cast[int32]((delta + VMA_MAX_CHUNK - 1) / VMA_MAX_CHUNK)
+    if nnew <= 0:
+        return -22
+    pml4: uint64 = task_pml4(cast[int32](slot))
+    # Grow the node's chunk array to hold the existing chunks plus the
+    # new ones. A node grown in place is always one we created via the
+    # large-window path (it carries a chunks array); defensively bail if
+    # it somehow does not.
+    old_carr: uint64 = cast[Ptr[VmaNode]](node)[0].chunks
+    old_nchunks: int32 = cast[Ptr[VmaNode]](node)[0].nchunks
+    if old_carr == 0 or old_nchunks <= 0:
+        return -22
+    total: int32 = old_nchunks + nnew
+    newcarr: uint64 = kmalloc(cast[uint64](total) * VMA_CHUNK_SIZE)
+    if newcarr == 0:
+        return -12
+    memset(cast[Ptr[uint8]](newcarr), 0,
+           cast[uint64](total) * VMA_CHUNK_SIZE)
+    # Copy the existing chunk descriptors into the front of the new array.
+    cpy: int32 = 0
+    while cpy < old_nchunks:
+        src: uint64 = old_carr + cast[uint64](cpy) * VMA_CHUNK_SIZE
+        dst: uint64 = newcarr + cast[uint64](cpy) * VMA_CHUNK_SIZE
+        cast[Ptr[VmaChunk]](dst)[0].phys  = cast[Ptr[VmaChunk]](src)[0].phys
+        cast[Ptr[VmaChunk]](dst)[0].order = cast[Ptr[VmaChunk]](src)[0].order
+        cast[Ptr[VmaChunk]](dst)[0].pad   = 0
+        cpy = cpy + 1
+    # Allocate + zero + overlay each new chunk.
+    i: int32 = 0
+    ok: int32 = 1
+    while i < nnew and ok != 0:
+        off: uint64 = cast[uint64](i) * VMA_MAX_CHUNK
+        remain: uint64 = delta - off
+        csize: uint64 = VMA_MAX_CHUNK
+        if remain < csize:
+            csize = remain
+        corder: int32 = _order_for_chunk(csize)
+        cphys: uint64 = alloc_pages(corder)
+        if cphys == 0:
+            ok = 0
+        else:
+            memset(cast[Ptr[uint8]](cphys), 0, csize)
+            slotc: int32 = old_nchunks + i
+            ce: uint64 = newcarr + cast[uint64](slotc) * VMA_CHUNK_SIZE
+            cast[Ptr[VmaChunk]](ce)[0].phys  = cphys
+            cast[Ptr[VmaChunk]](ce)[0].order = corder
+            cast[Ptr[VmaChunk]](ce)[0].pad   = 0
+            vlo: uint64 = old_end + off
+            rc: int32 = elf_install_user_mapping(pml4, vlo, vlo + csize,
+                                                 cphys,
+                                                 _vma_nx_flag(prot)
+                                                 | _vma_rw_flag(prot))
+            if rc < 0:
+                free_pages(cphys, corder)
+                ok = 0
+            else:
+                i = i + 1
+    if ok == 0:
+        # Roll back ONLY the new chunks we grabbed (the front-copied
+        # existing chunks still belong to the live node).
+        j: int32 = 0
+        while j < i:
+            slotc2: int32 = old_nchunks + j
+            ce2: uint64 = newcarr + cast[uint64](slotc2) * VMA_CHUNK_SIZE
+            free_pages(cast[Ptr[VmaChunk]](ce2)[0].phys,
+                       cast[Ptr[VmaChunk]](ce2)[0].order)
+            j = j + 1
+        kfree(newcarr)
+        return -12
+    load_cr3(pml4)
+    # Commit: swap in the grown chunk array and extend the node.
+    kfree(old_carr)
+    cast[Ptr[VmaNode]](node)[0].chunks  = newcarr
+    cast[Ptr[VmaNode]](node)[0].nchunks = total
+    cast[Ptr[VmaNode]](node)[0].end     = old_end + delta
+    return 0
+
+
+def vma_mremap(slot: uint64, old_addr: uint64, old_len_in: uint64,
+               new_len_in: uint64, flags: uint64,
+               new_addr: uint64) -> int64:
+    # Linux mremap(2). Returns the resolved base address on success
+    # (cast to int64 so the ABI shim can return it directly), or a
+    # negative Linux errno.
+    if old_len_in == 0 or new_len_in == 0:
+        return cast[int64](-22)
+    if (old_addr & (VMA_PAGE_SIZE - 1)) != 0:
+        return cast[int64](-22)
+    old_len: uint64 = (old_len_in + VMA_PAGE_SIZE - 1) & ~(VMA_PAGE_SIZE - 1)
+    new_len: uint64 = (new_len_in + VMA_PAGE_SIZE - 1) & ~(VMA_PAGE_SIZE - 1)
+
+    node: uint64 = vma_find(slot, old_addr)
+    if node == 0:
+        return cast[int64](-22)
+    # mremap only operates on a mapping that starts exactly at old_addr
+    # and whose recorded length matches old_len (Linux requires the old
+    # range to lie within a single VMA; the common malloc/realloc caller
+    # passes the exact base+len it got from mmap).
+    nstart: uint64 = _vma_node_start(node)
+    nend:   uint64 = _vma_node_end(node)
+    if nstart != old_addr:
+        return cast[int64](-22)
+    if nend - nstart < old_len:
+        return cast[int64](-22)
+    prot: int32 = cast[Ptr[VmaNode]](node)[0].prot
+
+    is_fixed: int32 = 0
+    if (flags & VMA_MREMAP_FIXED) != 0:
+        is_fixed = 1
+    may_move: int32 = 0
+    if (flags & VMA_MREMAP_MAYMOVE) != 0:
+        may_move = 1
+
+    # MREMAP_FIXED: deferred (see _u_mremap shim comment). Linux requires
+    # MAYMOVE alongside FIXED; without it the call is invalid regardless.
+    if is_fixed != 0:
+        return cast[int64](-22)
+
+    # ---- Shrink in place: new_len < old_len. Unmap the tail. ----
+    if new_len < old_len:
+        tail_lo: uint64 = old_addr + new_len
+        tail_hi: uint64 = old_addr + old_len
+        _vma_carve_range(slot, tail_lo, tail_hi)
+        return cast[int64](old_addr)
+
+    # ---- No-op: identical length. ----
+    if new_len == old_len:
+        return cast[int64](old_addr)
+
+    # ---- Grow. new_len > old_len. ----
+    delta: uint64 = new_len - old_len
+    grow_lo: uint64 = old_addr + old_len
+    grow_hi: uint64 = old_addr + new_len
+    # Grow-in-place is only attempted for a windowed region (its trailing
+    # virtual space is genuinely unbacked) whose exact-length single node
+    # we can extend, and only when the trailing range is free.
+    can_grow_here: int32 = 0
+    if nstart >= VMA_LARGE_BASE and nend == old_addr + old_len:
+        if grow_hi <= VMA_LARGE_LIMIT \
+                and _vma_range_is_free(slot, grow_lo, grow_hi) != 0:
+            if cast[Ptr[VmaNode]](node)[0].chunks != 0 \
+                    and cast[Ptr[VmaNode]](node)[0].nchunks > 0:
+                can_grow_here = 1
+    if can_grow_here != 0:
+        grc: int32 = _vma_grow_in_place(slot, node, grow_lo, delta, prot)
+        if grc == 0:
+            return cast[int64](old_addr)
+        # A grow-in-place OOM falls through to the move path below if
+        # MAYMOVE is set, else reports the failure.
+
+    # Can't grow in place. Without MAYMOVE this MUST fail (Linux semantics:
+    # never silently move).
+    if may_move == 0:
+        return cast[int64](-12)              # -ENOMEM
+
+    # ---- Move: allocate a fresh anonymous range of new_len, copy the
+    # old contents (min(old_len,new_len) = old_len bytes), map with the
+    # old region's prot, then drop the old range. ----
+    move_flags: int32 = VMA_MAP_ANONYMOUS | VMA_MAP_PRIVATE
+    nb: int64 = vma_alloc(slot, 0, new_len, prot, move_flags, -1, 0)
+    if nb < 0:
+        return nb
+    newbase: uint64 = cast[uint64](nb)
+    # The running task's CR3 is this task's PML4, so both old and new
+    # window vaddrs are directly dereferenceable here. Copy the live data.
+    memcpy(cast[Ptr[uint8]](newbase), cast[Ptr[uint8]](old_addr), old_len)
+    # Drop the old mapping (frees its backing pages).
+    _vma_carve_range(slot, old_addr, old_addr + old_len)
+    return cast[int64](newbase)
+
+
+# ---------------------------------------------------------------------
 # §1 — vma_madvise (MADV_DONTNEED actually drops pages)
 # ---------------------------------------------------------------------
 
