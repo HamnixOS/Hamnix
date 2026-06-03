@@ -1,0 +1,189 @@
+# drivers/audio/audio_capture_selftest.ad
+#
+# Boot-gated self-test for the native Intel HDA PCM CAPTURE (record) path.
+# Gated on /etc/audiocap-test (planted by build_initramfs.py when
+# ENABLE_AUDIOCAP_TEST=1). It proves the capture buffer management,
+# position tracking, blocking/empty semantics, and the /dev/audioin read
+# handler are GENUINELY implemented — not a faked read.
+#
+# QEMU's audio model does not supply a live microphone, so we cannot rely
+# on real ADC samples arriving. Instead we feed a KNOWN synthetic PCM
+# pattern into the capture ring through the SAME entry point the DMA-
+# complete handler uses (hda_capture_deposit), then read it back out via
+# the real /dev/audioin read handler (through the Plan-9 namec path) and
+# assert it is byte-identical. We also assert:
+#
+#   * capture stream init succeeded (input descriptor + ring armed);
+#   * an empty ring read returns 0 (non-blocking / EOF-style semantics);
+#   * the read pointer advances exactly by the bytes consumed;
+#   * a ring WRAP (deposit + read spanning the ring boundary) returns the
+#     pattern byte-identical across the wrap.
+#
+# Emits "[audio-capture] PASS" on success.
+
+from kernel.printk.printk import printk0, printk1, printk2
+from drivers.audio.hda import (
+    hda_is_initialized, hda_capture_is_ready, hda_capture_deposit,
+    hda_capture_read, hda_capture_avail, hda_capture_reset,
+    hda_capture_wpos, hda_capture_rpos,
+)
+from sys.src.port9.port.namec import namec, namec_read, namec_close
+
+
+# A deterministic synthetic PCM pattern: a byte ramp (value = index & 0xFF)
+# is trivially verifiable and self-describing across a wrap.
+ACAP_PATTERN_LEN: uint64 = 4096
+ACAP_RING_BYTES:  uint64 = 65536       # must match HDA_CAP_RING_BYTES
+
+# Scratch buffers (module-scope per Adder big-buffer rule).
+acap_src:  Array[4096, uint8]          # synthetic deposit pattern
+acap_dst:  Array[4096, uint8]          # readback buffer
+
+
+def _acap_fill_pattern(seed: uint64):
+    # Fill acap_src with a deterministic ramp starting at `seed`.
+    i: uint64 = 0
+    while i < ACAP_PATTERN_LEN:
+        acap_src[i] = cast[uint8]((seed + i) & 0xFF)
+        i = i + 1
+
+
+def audio_capture_selftest() -> int32:
+    # Returns 1 on PASS, 0 on FAIL.
+    if hda_is_initialized() == 0:
+        printk0("[audio-capture] FAIL: HDA controller not initialized\n")
+        return 0
+    if hda_capture_is_ready() == 0:
+        printk0("[audio-capture] FAIL: capture stream not armed\n")
+        return 0
+    printk0("[audio-capture] capture stream init OK\n")
+
+    # Start from a clean ring.
+    hda_capture_reset()
+
+    # --- open /dev/audioin through the real Plan-9 namec path -------
+    # mode 0 == OREAD.
+    cap_cid: int32 = namec("/dev/audioin", 0)
+    if cap_cid < 0:
+        printk1("[audio-capture] FAIL: open /dev/audioin rc=%d\n",
+                cast[uint64](cast[int64](cap_cid)))
+        return 0
+
+    # --- CASE 1: empty ring read returns 0 (non-blocking semantics) --
+    n0: int64 = namec_read(cap_cid, 0, &acap_dst[0], ACAP_PATTERN_LEN)
+    if n0 != 0:
+        printk1("[audio-capture] FAIL: empty read returned %d (want 0)\n",
+                cast[uint64](n0))
+        namec_close(cap_cid)
+        return 0
+    printk0("[audio-capture] empty-ring read returned 0 (OK)\n")
+
+    # --- CASE 2: deposit a known pattern through the DMA-complete path,
+    #             read it back via /dev/audioin, assert byte-identical ---
+    _acap_fill_pattern(0)
+    dep: uint64 = hda_capture_deposit(&acap_src[0], ACAP_PATTERN_LEN)
+    if dep != ACAP_PATTERN_LEN:
+        printk1("[audio-capture] FAIL: deposit accounted %d bytes\n",
+                cast[uint64](dep))
+        namec_close(cap_cid)
+        return 0
+    if hda_capture_avail() != ACAP_PATTERN_LEN:
+        printk1("[audio-capture] FAIL: avail=%d after deposit\n",
+                hda_capture_avail())
+        namec_close(cap_cid)
+        return 0
+
+    rpos_before: uint64 = hda_capture_rpos()
+    got: uint64 = 0
+    while got < ACAP_PATTERN_LEN:
+        rn: int64 = namec_read(cap_cid, 0, &acap_dst[got],
+                               ACAP_PATTERN_LEN - got)
+        if rn <= 0:
+            printk1("[audio-capture] FAIL: short read rc=%d\n",
+                    cast[uint64](rn))
+            namec_close(cap_cid)
+            return 0
+        got = got + cast[uint64](rn)
+
+    # byte-identical check
+    k: uint64 = 0
+    while k < ACAP_PATTERN_LEN:
+        if acap_dst[k] != acap_src[k]:
+            printk2("[audio-capture] FAIL: data mismatch at %d (got %d)\n",
+                    k, cast[uint64](acap_dst[k]))
+            namec_close(cap_cid)
+            return 0
+        k = k + 1
+    printk1("[audio-capture] read back %d bytes byte-identical\n", got)
+
+    # read pointer advanced exactly by the bytes consumed
+    if hda_capture_rpos() != rpos_before + ACAP_PATTERN_LEN:
+        printk1("[audio-capture] FAIL: rpos advanced wrong (rpos=%d)\n",
+                hda_capture_rpos())
+        namec_close(cap_cid)
+        return 0
+    printk0("[audio-capture] read pointer advanced correctly\n")
+
+    # ring now drained -> next read is 0 again
+    n1: int64 = namec_read(cap_cid, 0, &acap_dst[0], ACAP_PATTERN_LEN)
+    if n1 != 0:
+        printk1("[audio-capture] FAIL: drained read returned %d\n",
+                cast[uint64](n1))
+        namec_close(cap_cid)
+        return 0
+
+    # --- CASE 3: ring WRAP. Push the write/read pointers near the end of
+    #             the ring, then deposit + read a pattern that straddles
+    #             the wrap boundary. Assert byte-identical across the seam.
+    # Drive both pointers to RING_BYTES - 1024 by depositing+draining
+    # filler so the next deposit crosses the wrap.
+    pre: uint64 = ACAP_RING_BYTES - 1024
+    _acap_fill_pattern(0x11)
+    done: uint64 = 0
+    while done < pre:
+        step: uint64 = ACAP_PATTERN_LEN
+        if step > (pre - done):
+            step = pre - done
+        hda_capture_deposit(&acap_src[0], step)
+        # drain it back out so rpos keeps pace (no overrun)
+        drained: uint64 = 0
+        while drained < step:
+            rn2: int64 = namec_read(cap_cid, 0, &acap_dst[0], step - drained)
+            if rn2 <= 0:
+                printk0("[audio-capture] FAIL: wrap pre-fill drain stalled\n")
+                namec_close(cap_cid)
+                return 0
+            drained = drained + cast[uint64](rn2)
+        done = done + step
+
+    # Now wpos == rpos == pre (= RING_BYTES-1024). Deposit a 2048-byte
+    # straddling pattern (1024 before the seam, 1024 after).
+    _acap_fill_pattern(0x55)
+    span: uint64 = 2048
+    hda_capture_deposit(&acap_src[0], span)
+    if hda_capture_avail() != span:
+        printk1("[audio-capture] FAIL: wrap avail=%d (want 2048)\n",
+                hda_capture_avail())
+        namec_close(cap_cid)
+        return 0
+    wgot: uint64 = 0
+    while wgot < span:
+        rn3: int64 = namec_read(cap_cid, 0, &acap_dst[wgot], span - wgot)
+        if rn3 <= 0:
+            printk1("[audio-capture] FAIL: wrap read rc=%d\n",
+                    cast[uint64](rn3))
+            namec_close(cap_cid)
+            return 0
+        wgot = wgot + cast[uint64](rn3)
+    wk: uint64 = 0
+    while wk < span:
+        if acap_dst[wk] != acap_src[wk]:
+            printk1("[audio-capture] FAIL: wrap mismatch at %d\n", wk)
+            namec_close(cap_cid)
+            return 0
+        wk = wk + 1
+    printk0("[audio-capture] ring wrap read byte-identical across seam\n")
+
+    namec_close(cap_cid)
+    printk0("[audio-capture] PASS\n")
+    return 1

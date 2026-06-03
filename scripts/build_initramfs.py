@@ -1735,6 +1735,16 @@ if os.environ.get("ENABLE_XHCI_KO_REAL", "0") == "1":
 if os.environ.get("ENABLE_AUDIO_TEST") == "1":
     FILES.append(("/etc/audio-test", b"1\n"))
 
+# Native Intel HDA PCM CAPTURE (record) self-test. ENABLE_AUDIOCAP_TEST=1
+# plants /etc/audiocap-test; init/main.ad's boot:37.acap gate then runs
+# audio_capture_selftest(), which arms the HDA input-stream DMA ring, feeds
+# a known synthetic PCM pattern through the DMA-complete deposit path, and
+# reads it back byte-identical via the /dev/audioin Plan-9 cdev — proving
+# the capture ring/position/wrap and read handler are real. Uniquely-named
+# marker so it never collides with the playback /etc/audio-test gate.
+if os.environ.get("ENABLE_AUDIOCAP_TEST") == "1":
+    FILES.append(("/etc/audiocap-test", b"1\n"))
+
 # Native device-mapper self-test. scripts/test_devmapper.sh sets
 # ENABLE_DEVMAPPER_TEST=1 to plant /etc/devmapper-test; init/main.ad's
 # boot:37.dm gate then runs dm_selftest() (drivers/block/dm.ad), which
