@@ -1319,6 +1319,19 @@ class Arm64CodeGen:
             self.emit(f"    {self._NULLARY_INTRINSICS[name]}")
             self.emit("    mov x0, #0")
             return True
+        if name == "_eret_x0":
+            # Phase 25: ERET into EL0 with x0 preset to a caller-chosen value
+            # (the fork() return discipline: child resumes with x0=0, parent with
+            # x0=1). The argument is evaluated into x0 and we ERET immediately, so
+            # EL0 resumes at ELR_EL1 seeing that value in x0. Never returns to the
+            # Adder caller. SPSR_EL1/ELR_EL1/SP_EL0 must already be set up.
+            if len(args) != 1:
+                raise CodeGenError(
+                    "aarch64: _eret_x0 expects exactly 1 argument")
+            self.gen_expr(args[0])               # x0-return value -> x0
+            self.emit("    eret")
+            self.emit("    mov x0, #0")
+            return True
         if name == "_tlbi_aside1is":
             # Phase 19: invalidate, inner-shareable, all stage-1 EL1&0 TLB entries
             # that match a given ASID. The operand register carries the ASID in
