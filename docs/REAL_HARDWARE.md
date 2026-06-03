@@ -52,6 +52,7 @@ The rest of this doc unpacks each step.
 4. [Booting from the USB stick](#4-booting-from-the-usb-stick)
 5. [What to expect on the serial console](#5-what-to-expect-on-the-serial-console)
 6. [Diagnostic dump cheat-sheet (no serial cable)](#6-diagnostic-dump-cheat-sheet-no-serial-cable)
+   - 6.1 [Page-pause debug image + OCR log capture](#61-page-pause-debug-image--ocr-log-capture-the-full-scrollback)
 7. [Known broken hardware / firmware combos](#7-known-broken-hardware--firmware-combos)
 8. [Expected hardware coverage](#8-expected-hardware-coverage)
 9. [Test checklist](#9-test-checklist)
@@ -492,6 +493,73 @@ Most laptops have no serial port. On a frozen box where the screen
 If you're investigating a repeatable hang, a $5 USB-to-serial adapter
 (CH340G / FTDI / Silicon Labs CP2102) clipped to the board's COM1
 header is worth it. Otherwise: phone camera, every time.
+
+### 6.1 Page-pause debug image + OCR log capture (the full scrollback)
+
+A single photo only catches the *last* screenful. When the interesting
+markers (e.g. the `.ko` USB bring-up around `[boot:31.r]`) scroll past
+before the box freezes — or never freezes at all — build a **page-pause
+debug image**: the framebuffer console holds each screenful static for
+~1 second and stamps an OCR delimiter, so a phone video of the whole
+boot can be turned back into text, one page at a time.
+
+**Build the debug image** (everything else about the image is identical
+to the normal `build/hamnix.img`):
+
+```sh
+ENABLE_LOG_SLOW=1 bash scripts/build_img.sh
+```
+
+Then flash and boot exactly as in §3–§4.
+
+**How it works (so you can reason about it / extend it):**
+
+- `ENABLE_LOG_SLOW=1` makes `scripts/build_initramfs.py` plant a tiny
+  `/etc/log-slow` marker file in the kernel's embedded cpio. The marker
+  survives into the shipped image even though it carries zero userland
+  (the `HAMNIX_CPIO_EMPTY=1` path that `build_img.sh` uses still emits
+  every `/etc/*` boot-mode marker — see the comment at
+  `scripts/build_initramfs.py` ~line 2061).
+- At boot, `init/main.ad` (boot:03, ~line 6195) scans the cpio for
+  `/etc/log-slow`; if present it calls `fb_set_pause_enabled(1)`. It is
+  enabled this early on purpose, so it covers the USB bring-up.
+- `drivers/video/console/fb_text.ad` (`fb_scroll`, guarded by
+  `g_fb_pause_enabled`) then, after **every** screenful scrolled, busy-
+  holds the GOP framebuffer motionless for ~1 s and prints a unique
+  banner line:
+
+  ```
+  ### HAMNIX-LOGPAGE NNNN ###
+  ```
+
+  `NNNN` is a zero-padded, monotonically increasing page counter — the
+  ordering/gap-detection key. The string appears nowhere else, so it's a
+  reliable page delimiter.
+- The pause is **purely timed — no keypress is needed** (the NUC has no
+  working keyboard yet anyway). Just point a 60 fps phone camera at the
+  screen and let the whole boot play out; each page gets a full static
+  second on screen.
+
+**Turn the video into text:**
+
+```sh
+python3 scripts/ocr_boot_log.py "/path/to/boot-video.mp4"
+```
+
+This walks every frame, detects the motionless twin-confirmed page
+freezes (low motion, non-black, two byte-identical consecutive frames),
+OCRs only those clean frames with tesseract, reads the
+`HAMNIX-LOGPAGE NNNN` number off the banner, and writes the captured
+pages **in capture order** to:
+
+- stdout, and
+- `/path/to/boot-video.mp4.ocr.txt`
+
+Each page is headed `===== PAGE NNNN  (frame F) =====`; gaps in the
+page-number sequence are reported so you know if a page was missed.
+Requires `tesseract` + `ffmpeg`/`opencv` on the build host. Read the
+resulting `.ocr.txt` directly — do **not** re-OCR the video a second
+time.
 
 ## 7. Known broken hardware / firmware combos
 
