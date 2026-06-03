@@ -14,9 +14,11 @@
 # for the superblock/inode/dentry refactor that M16.46 EXT4 will
 # force on us.
 #
-# Long filenames (LFN, attr 0x0F) are skipped — we match short-name
-# entries exclusively. The image generator emits uppercase 8.3
-# names so a real round-trip is exercised without LFN parsing.
+# Long filenames (LFN, attr 0x0F): both lookup and directory descent
+# reassemble the VFAT slot chain so an open("/mnt/<long name>") resolves
+# the file by its real name (case-insensitive, vfat-style) — not just by
+# its 8.3 alias. _lookup_in_dir verifies the slot-chain checksum binds
+# to the trailing 8.3 entry before accepting a long-name match.
 
 from kernel.block.blk import (
     blk_read_sectors, blk_write_sectors, blk_capacity_sectors,
@@ -185,24 +187,73 @@ def _dir_entries_per_sector() -> uint64:
     return SECTOR_SIZE / 32                  # 16
 
 
+def _fat_blank83(out: Ptr[uint8]):
+    # Fill an 11-byte 8.3 field with spaces — a sentinel that no real
+    # directory entry name can ever equal (every real short name has at
+    # least one non-space byte), so _name_match never spuriously hits.
+    i: uint64 = 0
+    while i < 11:
+        out[i] = 32
+        i = i + 1
+
+
 def _name_match(entry: Ptr[uint8], target83: Ptr[uint8]) -> int32:
+    # Reject an all-space target outright: that is the _fat_blank83
+    # sentinel used when a long name has no valid 8.3 alias, and it
+    # would otherwise alias a (rare) all-space short field.
+    all_space: int32 = 1
     i: uint64 = 0
     while i < 11:
         if entry[i] != target83[i]:
             return 0
+        if target83[i] != 32:
+            all_space = 0
         i = i + 1
+    if all_space != 0:
+        return 0
     return 1
 
 
+# Case-insensitive (ASCII) NUL-terminated compare. VFAT long-name
+# matching is case-insensitive the same way Windows/Linux vfat is, so
+# "ReadMe.TXT" finds an on-disk "readme.txt". Both args are byte
+# cstrings; returns 1 on equal-ignoring-case, 0 otherwise.
+def _fat_streq_ci(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while True:
+        ca: uint8 = _to_upper(a[i])
+        cb: uint8 = _to_upper(b[i])
+        if ca != cb:
+            return 0
+        if a[i] == 0:
+            return 1
+        i = i + 1
+
+
+# Dedicated LFN-reassembly scratch for the path-resolution scan, kept
+# separate from fat_find_by_longname's _lfn_collect/_lfn_decoded so the
+# two code paths never alias. Module-scope (FAT routines never reenter).
+_lk_lfn_collect: Array[640, uint8]      # up to 20 physical LFN slots
+_lk_lfn_decoded: Array[272, uint8]      # decoded long name (NUL-term)
+
+
 def _lookup_in_dir(dir_cluster: uint64, target83: Ptr[uint8],
+                   long_name: Ptr[uint8],
                    out_cluster: Ptr[uint64], out_size: Ptr[uint64],
                    out_is_dir: Ptr[uint32]) -> int32:
-    # Walk one directory's cluster chain looking for an 8.3-named
-    # entry. On hit, fills out_cluster (first cluster of the entry's
-    # data), out_size (byte size; 0 for directories), and out_is_dir
-    # (1 if attr & 0x10 is set). Returns 1 on hit, 0 on miss / read
-    # failure.
+    # Walk one directory's cluster chain looking for an entry that
+    # matches EITHER the 8.3 padded name `target83` OR the VFAT long
+    # name `long_name` (a NUL-terminated leaf; may be NULL to disable
+    # long-name matching). LFN slots (attr 0x0F) preceding each 8.3
+    # entry are reassembled and compared case-insensitively against
+    # `long_name`, with the standard checksum verifying the slot chain
+    # belongs to the trailing short entry. On hit, fills out_cluster
+    # (first cluster of the entry's data), out_size (byte size; 0 for
+    # directories) and out_is_dir (1 if attr & 0x10 is set). Returns 1
+    # on hit, 0 on miss / read failure.
     cluster: uint64 = dir_cluster
+    collected:  uint64 = 0                  # buffered LFN slots
+    seen_cksum: uint8  = 0
     while _is_end_of_chain(cast[uint32](cluster)) == 0 and cluster != 0:
         sec_in_cluster: uint64 = 0
         while sec_in_cluster < fat_sectors_per_clu:
@@ -220,8 +271,37 @@ def _lookup_in_dir(dir_cluster: uint64, target83: Ptr[uint8],
                 if first_byte == 0:
                     return 0                # end-of-directory sentinel
                 attr: uint8 = entry[11]
-                if first_byte != 0xE5 and attr != 0x0F:
+                if first_byte == 0xE5:
+                    collected = 0           # deleted: discard LFN run
+                elif attr == 0x0F:
+                    # Buffer this physical LFN slot for the next 8.3.
+                    if collected < 20:
+                        memcpy(cast[Ptr[uint8]](
+                                   cast[uint64](&_lk_lfn_collect[0])
+                                   + collected * 32),
+                               entry, 32)
+                        seen_cksum = entry[13]
+                        collected = collected + 1
+                    else:
+                        collected = 0       # overlong: bail this run
+                else:
+                    # A real 8.3 entry. Decide if it matches.
+                    matched: int32 = 0
                     if _name_match(entry, target83) != 0:
+                        matched = 1
+                    elif collected > 0 and \
+                         cast[uint64](long_name) != 0:
+                        # Reassemble the long name and compare. Verify
+                        # the checksum binds the slots to THIS 8.3 entry.
+                        _fat_decode_lfn_run(&_lk_lfn_collect[0],
+                                            collected,
+                                            &_lk_lfn_decoded[0], 272)
+                        ck: uint8 = _fat_lfn_checksum(entry)
+                        if ck == seen_cksum:
+                            if _fat_streq_ci(&_lk_lfn_decoded[0],
+                                             long_name) != 0:
+                                matched = 1
+                    if matched != 0:
                         hi: uint16 = _read_u16_le(
                             cast[Ptr[uint8]](cast[uint64](entry) + 20))
                         lo: uint16 = _read_u16_le(
@@ -235,6 +315,7 @@ def _lookup_in_dir(dir_cluster: uint64, target83: Ptr[uint8],
                         else:
                             out_is_dir[0] = 0
                         return 1
+                    collected = 0           # consumed this run
                 ei = ei + 1
             sec_in_cluster = sec_in_cluster + 1
         next_cluster: uint32 = _fat_lookup_cluster(cluster)
@@ -278,11 +359,14 @@ def fat_lookup(name: Ptr[char], out_cluster: Ptr[uint64],
     start: uint64 = 0
     while True:
         nxt: int64 = _path_next_component(name, start, &component[0])
-        # Convert this component to 8.3.
+        # Convert this component to 8.3. A long-name component won't fit
+        # 8.3; when it can't, blank target83 so only the long-name match
+        # (via the LFN slot chain) can hit — never a partial 8.3 alias.
         if fat_name_to_83(cast[Ptr[char]](&component[0]),
                           &target83[0]) == 0:
-            return 0
+            _fat_blank83(&target83[0])
         hit: int32 = _lookup_in_dir(cluster, &target83[0],
+                                    &component[0],
                                     &found_cluster, &found_size,
                                     &found_is_dir)
         if hit == 0:
@@ -395,10 +479,13 @@ def _fat_resolve_dir(path: Ptr[char]) -> uint64:
                 return cluster
             start = cast[uint64](nxt)
             continue
+        # Long-named directory components resolve via the LFN slot
+        # chain too; blank the 8.3 form so only the long-name path hits.
         if fat_name_to_83(cast[Ptr[char]](&component[0]),
                           &target83[0]) == 0:
-            return 0
+            _fat_blank83(&target83[0])
         hit: int32 = _lookup_in_dir(cluster, &target83[0],
+                                    &component[0],
                                     &found_cluster, &found_size,
                                     &found_is_dir)
         if hit == 0:
@@ -2133,5 +2220,58 @@ def fat_lfn_selftest() -> int32:
         printk0("[fat-lfn] FAIL: long-name metadata drifted\n")
         return 0
 
+    # The real VFS open path: fat_lookup() must resolve the file BY ITS
+    # LONG NAME (not the 8.3 alias). This is what fat_open() — and hence
+    # every open("/mnt/<long name>") — calls. Before the LFN-aware
+    # _lookup_in_dir this returned a miss for any non-8.3 name.
+    lk_first: uint64 = 0
+    lk_size:  uint64 = 0
+    if fat_lookup(want, &lk_first, &lk_size) == 0:
+        printk0("[fat-lfn] FAIL: fat_lookup miss on long name\n")
+        return 0
+    if lk_first != first or lk_size != 40:
+        printk0("[fat-lfn] FAIL: fat_lookup returned wrong metadata\n")
+        return 0
+
+    # Case-insensitivity: the SAME file must resolve when the requested
+    # long name differs only in letter case, mirroring vfat semantics.
+    ci_name: Array[64, uint8]
+    ci_src:  Ptr[uint8] = "a LONG vfat FILENAME.TXT"
+    cj: uint64 = 0
+    while True:
+        cc: uint8 = ci_src[cj]
+        ci_name[cj] = cc
+        if cc == 0:
+            break
+        cj = cj + 1
+    ci_first: uint64 = 0
+    ci_size:  uint64 = 0
+    if fat_lookup(cast[Ptr[char]](&ci_name[0]),
+                  &ci_first, &ci_size) == 0:
+        printk0("[fat-lfn] FAIL: fat_lookup not case-insensitive\n")
+        return 0
+    if ci_first != first:
+        printk0("[fat-lfn] FAIL: case-insensitive lookup wrong file\n")
+        return 0
+
+    # A genuinely different long name must NOT match (no false hit from
+    # the blank-8.3 sentinel or a partial LFN run).
+    miss_name: Array[64, uint8]
+    miss_src:  Ptr[uint8] = "Some other long name.txt"
+    mj: uint64 = 0
+    while True:
+        mc: uint8 = miss_src[mj]
+        miss_name[mj] = mc
+        if mc == 0:
+            break
+        mj = mj + 1
+    miss_first: uint64 = 0
+    miss_size:  uint64 = 0
+    if fat_lookup(cast[Ptr[char]](&miss_name[0]),
+                  &miss_first, &miss_size) != 0:
+        printk0("[fat-lfn] FAIL: fat_lookup false-hit on absent name\n")
+        return 0
+
+    printk0("[fat-lfn] fat_lookup resolves long name (case-insensitive)\n")
     printk0("[fat-lfn] PASS\n")
     return 1
