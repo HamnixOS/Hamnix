@@ -1,0 +1,544 @@
+# drivers/virtio/virtio_9p.ad
+#
+# Real virtio-9p (9P-over-virtio-PCI) client. Mounts a QEMU host-shared
+# directory exported by `-device virtio-9p-pci,fsdev=...,mount_tag=...`
+# and reads files / enumerates directories through the 9P2000 protocol.
+#
+# This reuses the kernel's existing virtio infrastructure end to end:
+#   - drivers/pci/pci.ad         : PCI device enumeration + BAR read
+#   - drivers/virtio/virtio_modern.ad : modern virtio-1.0 PCI transport
+#                                    (structured PCI capabilities, MMIO
+#                                    common/notify/isr/device cfg,
+#                                    VIRTIO_F_VERSION_1 + FEATURES_OK
+#                                    handshake, 64-bit ring addresses,
+#                                    per-queue notify offset)
+#   - drivers/virtio/virtio_ring.ad : split-virtqueue (descriptor table +
+#                                    avail/used rings); we add a 2-desc
+#                                    chain (T out, R in) and poll the used
+#                                    ring for completion exactly like
+#                                    virtio-blk. The VirtQueue handle +
+#                                    virtq_add_chain2/_desc_set helpers are
+#                                    transport-agnostic; only setup/notify
+#                                    differ between legacy + modern.
+#   - lib/9p/9p.ad (9P2000)      : the wire codec — Tversion/Tattach/
+#                                    Twalk/Topen/Tread/Tclunk emit +
+#                                    Rversion/Rattach/Rwalk/Ropen/Rread/
+#                                    Rclunk/Rerror/stat decode
+#
+# QEMU's virtio-9p server negotiates the protocol version from the
+# Tversion the client offers. We offer plain "9P2000" (the base
+# protocol), which QEMU's hw/9pfs accepts — that lets us reuse the
+# existing 9P2000 codec verbatim rather than re-implementing the
+# 9P2000.L (Tgetattr/Treaddir) variants. Directory enumeration uses a
+# Tread on the directory fid, which on 9P2000 returns a packed stream
+# of Stat records (parsed with p9_decode_stat).
+#
+# Device: virtio vendor 0x1AF4, modern virtio-9p device id 0x1049
+# (= virtio device-type 9 + the 0x1040 modern PCI base). QEMU's
+# `-device virtio-9p-pci` is modern-only under 10.x: it exposes the
+# structured virtio-1.0 capabilities (no legacy IO BAR / single PFN), so
+# we drive it through the modern transport. The single request virtqueue
+# is queue 0. Each 9P RPC is one 2-descriptor chain: descriptor 0 = the
+# encoded T-message (device READS it), descriptor 1 = our receive buffer
+# (device WRITES the R-message into it). We submit, notify the queue's
+# notify cell, and poll the used ring — single in-flight request,
+# synchronous, matching virtio-blk's polled model.
+#
+# The modern device-specific config window (DEVICE_CFG capability) for
+# virtio-9p holds: u16 tag_len, then tag_len bytes of the mount_tag. We
+# read it so the mount can be matched against an expected tag, but a
+# single export is all we drive here.
+
+from kernel.printk.printk import printk0, printk1
+from mm.page_alloc import alloc_pages
+from drivers.pci.pci import (
+    pci_find_from, PCI_BDF_NONE,
+)
+from drivers.virtio.virtio_modern import (
+    VirtioModernDev, virtio_modern_init, virtio_modern_setup_queue,
+    virtio_modern_driver_ok, virtio_modern_kick_and_wait,
+)
+from drivers.virtio.virtio_ring import (
+    VirtQueue, VirtBuf, virtq_add_chain2,
+)
+from lib.9p.9p import (
+    P9Cursor, p9_cursor_init, p9_cursor_bytes,
+    p9_decode_header,
+    p9_emit_tversion, p9_decode_rversion,
+    p9_emit_tattach_u, p9_decode_rattach,
+    p9_emit_twalk,   p9_decode_rwalk,
+    p9_emit_topen,   p9_decode_ropen,
+    p9_emit_tread,   p9_decode_rread,
+    p9_emit_tclunk,  p9_decode_rclunk,
+    p9_decode_rerror,
+    p9_decode_stat_u,
+    P9_NOFID, P9_NOTAG, P9_NONUNAME,
+    P9_TVERSION, P9_RVERSION, P9_RATTACH, P9_RWALK,
+    P9_ROPEN, P9_RREAD, P9_RCLUNK, P9_RERROR,
+    P9_OREAD, P9_QTDIR,
+)
+
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
+
+V9P_VIRTIO_VENDOR: uint32 = 0x1AF4
+# Two PCI device ids name the same hardware. QEMU's `-device
+# virtio-9p-pci` is a TRANSITIONAL device: it keeps the legacy device id
+# 0x1009 yet ALSO exposes the modern virtio-1.0 capability structures, so
+# we drive it through the modern transport. `-device
+# virtio-9p-pci-non-transitional` (and any future modern-only build)
+# presents the modern id 0x1049 (= 0x1040 + virtio type 9). We probe for
+# both; the modern transport handles either since both advertise the
+# structured PCI capabilities.
+V9P_VIRTIO_ID_MODERN: uint32 = 0x1049
+V9P_VIRTIO_ID_TRANS:  uint32 = 0x1009
+
+# virtio-9p device-specific config (modern DEVICE_CFG): u16 tag_len at
+# offset 0, then tag_len bytes of the mount_tag.
+V9P_CFG_TAG_LEN: uint64 = 0
+
+# Negotiated 9P msize. The DMA scratch buffers below are sized to hold
+# one whole message of this size, so keep them in sync. 8 KiB is plenty
+# for the self-test's small files and one page of directory stats while
+# still fitting the request virtqueue's per-descriptor buffer comfortably.
+V9P_MSIZE: uint32 = 8192
+V9P_BUF_LEN: uint64 = 8192
+
+# Client-side fid numbering. Fid 0 is the attached root; subsequent
+# walks spend fids 1..N. The self-test only needs a couple at a time.
+V9P_ROOT_FID:  uint32 = 0
+V9P_WORK_FID:  uint32 = 1
+
+
+# Per-device state. One request virtqueue, two DMA scratch buffers (one
+# for the outgoing T-message, one for the incoming R-message), the
+# negotiated msize, and a monotonic tag counter. The scratch buffers are
+# page-allocated low physical RAM so the device DMAs to them directly;
+# the VirtQueue / VirtBuf descriptors live inline.
+class Virtio9p:
+    mdev:     VirtioModernDev # modern transport handle
+    present:  int32          # 1 once init succeeded
+    msize:    uint32
+    next_tag: uint16
+    vq:       VirtQueue
+    tx_buf:   uint64         # phys/low VA of the T-message DMA buffer
+    rx_buf:   uint64         # phys/low VA of the R-message DMA buffer
+
+
+# Single global instance — the kernel drives one host export. The
+# request scratch (two VirtBufs) is global too so an RPC needs no
+# allocation.
+v9p_dev:  Virtio9p
+v9p_bufs: Array[2, VirtBuf]
+
+
+def virtio_9p_present() -> int32:
+    return v9p_dev.present
+
+
+def _v9p_next_tag() -> uint16:
+    t: uint16 = v9p_dev.next_tag
+    v9p_dev.next_tag = t + 1
+    if v9p_dev.next_tag == P9_NOTAG:
+        v9p_dev.next_tag = 0
+    return t
+
+
+# Submit one already-encoded T-message (tx_len bytes in v9p_dev.tx_buf),
+# poll for completion, and leave the R-message in v9p_dev.rx_buf. Returns
+# the R-message total size (from its 9P header) on success, or -1.
+def _v9p_rpc(tx_len: uint64) -> int64:
+    # Wipe the RX buffer header so a stale R from a prior RPC can't be
+    # mistaken for this reply if the device somehow doesn't write.
+    cast[Ptr[uint32]](v9p_dev.rx_buf)[0] = 0
+
+    v9p_bufs[0].addr   = v9p_dev.tx_buf
+    v9p_bufs[0].length = cast[uint32](tx_len)
+    v9p_bufs[0].write  = 0                 # device READS the T-message
+    v9p_bufs[1].addr   = v9p_dev.rx_buf
+    v9p_bufs[1].length = cast[uint32](V9P_BUF_LEN)
+    v9p_bufs[1].write  = 1                 # device WRITES the R-message
+
+    head: uint16 = virtq_add_chain2(&v9p_dev.vq, &v9p_bufs[0])
+    if head == 0xFFFF:
+        return cast[int64](-1)
+    rc: int32 = virtio_modern_kick_and_wait(&v9p_dev.mdev, 0, &v9p_dev.vq)
+    # Single in-flight request: reclaim the whole descriptor chain.
+    v9p_dev.vq.free_head = 0
+    if rc != 0:
+        printk0("[v9p] rpc: used-ring wait failed\n")
+        return cast[int64](-1)
+
+    # The R-message carries its own size in the first 4 bytes; we don't
+    # rely on the used-ring length. Decode the header to learn size+type.
+    rx: Ptr[uint8] = cast[Ptr[uint8]](v9p_dev.rx_buf)
+    rsize: uint32 = 0
+    rtype: uint8  = 0
+    rtag:  uint16 = 0
+    hrc: int32 = p9_decode_header(rx, V9P_BUF_LEN, &rsize, &rtype, &rtag)
+    if hrc != 0:
+        printk0("[v9p] rpc: malformed R-message header\n")
+        return cast[int64](-1)
+    if rtype == P9_RERROR:
+        ename:     Ptr[uint8] = cast[Ptr[uint8]](0)
+        ename_len: uint64 = 0
+        et: uint16 = 0
+        if p9_decode_rerror(rx, cast[uint64](rsize), &et,
+                            &ename, &ename_len) > 0:
+            printk1("[v9p] server Rerror (%d byte name)\n", ename_len)
+        else:
+            printk0("[v9p] server Rerror (undecodable)\n")
+        return cast[int64](-1)
+    return cast[int64](rsize)
+
+
+# --- 9P operations over the virtqueue -------------------------------
+
+def _v9p_version() -> int32:
+    # Tversion("9P2000"), msize = V9P_MSIZE. QEMU echoes the agreed
+    # version + an msize <= ours; we honour the smaller.
+    c: P9Cursor
+    p9_cursor_init(&c, cast[Ptr[uint8]](v9p_dev.tx_buf), V9P_BUF_LEN)
+    # QEMU's hw/9pfs only speaks "9P2000.u" / "9P2000.L"; a bare "9P2000"
+    # comes back as an "unknown" Rversion and every later request is
+    # rejected ("Failed to decode VirtFS request type ..."). We offer the
+    # .u dialect, which keeps Twalk/Topen/Tread/Tclunk byte-identical to
+    # base 9P2000 and only adds n_uname to Tattach + four trailing fields
+    # to each packed stat record (handled by p9_emit_tattach_u /
+    # p9_decode_stat_u).
+    ver: Ptr[uint8] = "9P2000.u"
+    if p9_emit_tversion(&c, P9_NOTAG, V9P_MSIZE, ver, 8) < 0:
+        return -1
+    rs: int64 = _v9p_rpc(p9_cursor_bytes(&c))
+    if rs < 0:
+        return -1
+    rx: Ptr[uint8] = cast[Ptr[uint8]](v9p_dev.rx_buf)
+    rtag:  uint16 = 0
+    rmsize: uint32 = 0
+    rver:     Ptr[uint8] = cast[Ptr[uint8]](0)
+    rver_len: uint64 = 0
+    if p9_decode_rversion(rx, cast[uint64](rs), &rtag, &rmsize,
+                          &rver, &rver_len) < 0:
+        printk0("[v9p] Tversion: bad Rversion\n")
+        return -1
+    if rmsize < v9p_dev.msize:
+        v9p_dev.msize = rmsize
+    printk1("[v9p] negotiated msize=%d\n", cast[uint64](v9p_dev.msize))
+    return 0
+
+
+def _v9p_attach() -> int32:
+    # Tattach root_fid, afid=NOFID, uname="hamnix", aname="". Returns 0
+    # with V9P_ROOT_FID now bound to the export root.
+    c: P9Cursor
+    p9_cursor_init(&c, cast[Ptr[uint8]](v9p_dev.tx_buf), V9P_BUF_LEN)
+    uname: Ptr[uint8] = "hamnix"
+    aname: Ptr[uint8] = ""
+    # .u Tattach: trailing n_uname = NONUNAME so QEMU authorises by the
+    # string uname (its security_model=none export accepts any).
+    if p9_emit_tattach_u(&c, _v9p_next_tag(), V9P_ROOT_FID, P9_NOFID,
+                         uname, 6, aname, 0, P9_NONUNAME) < 0:
+        return -1
+    rs: int64 = _v9p_rpc(p9_cursor_bytes(&c))
+    if rs < 0:
+        return -1
+    rx: Ptr[uint8] = cast[Ptr[uint8]](v9p_dev.rx_buf)
+    rtag:  uint16 = 0
+    qt: uint8 = 0
+    qv: uint32 = 0
+    qp: uint64 = 0
+    if p9_decode_rattach(rx, cast[uint64](rs), &rtag, &qt, &qv, &qp) < 0:
+        printk0("[v9p] Tattach: bad Rattach\n")
+        return -1
+    return 0
+
+
+# Walk from `fid` to a single-component `name` into `newfid`. Returns
+# the qid type byte of the resolved component (>=0), or -1 on failure.
+def _v9p_walk1(fid: uint32, newfid: uint32,
+               name: Ptr[uint8], name_len: uint64) -> int32:
+    c: P9Cursor
+    p9_cursor_init(&c, cast[Ptr[uint8]](v9p_dev.tx_buf), V9P_BUF_LEN)
+    wnames:  Array[1, Ptr[uint8]]
+    wlens:   Array[1, uint64]
+    wnames[0] = name
+    wlens[0]  = name_len
+    if p9_emit_twalk(&c, _v9p_next_tag(), fid, newfid, 1,
+                     &wnames[0], &wlens[0]) < 0:
+        return -1
+    rs: int64 = _v9p_rpc(p9_cursor_bytes(&c))
+    if rs < 0:
+        return -1
+    rx: Ptr[uint8] = cast[Ptr[uint8]](v9p_dev.rx_buf)
+    rtag:  uint16 = 0
+    nwqid: uint16 = 0
+    qtypes: Array[16, uint8]
+    qvers:  Array[16, uint32]
+    qpaths: Array[16, uint64]
+    if p9_decode_rwalk(rx, cast[uint64](rs), &rtag, &nwqid,
+                       &qtypes[0], &qvers[0], &qpaths[0]) < 0:
+        printk0("[v9p] Twalk: bad Rwalk\n")
+        return -1
+    if nwqid < 1:
+        # Server walked zero components — the name didn't resolve.
+        printk0("[v9p] Twalk: component not found\n")
+        return -1
+    return cast[int32](qtypes[nwqid - 1])
+
+
+# Walk the root fid to itself (zero names) into newfid — a clone fid we
+# can open the directory on without consuming the root. Returns 0 / -1.
+def _v9p_walk_clone(fid: uint32, newfid: uint32) -> int32:
+    c: P9Cursor
+    p9_cursor_init(&c, cast[Ptr[uint8]](v9p_dev.tx_buf), V9P_BUF_LEN)
+    if p9_emit_twalk(&c, _v9p_next_tag(), fid, newfid, 0,
+                     cast[Ptr[Ptr[uint8]]](0), cast[Ptr[uint64]](0)) < 0:
+        return -1
+    rs: int64 = _v9p_rpc(p9_cursor_bytes(&c))
+    if rs < 0:
+        return -1
+    rx: Ptr[uint8] = cast[Ptr[uint8]](v9p_dev.rx_buf)
+    rtag:  uint16 = 0
+    nwqid: uint16 = 0
+    qtypes: Array[16, uint8]
+    qvers:  Array[16, uint32]
+    qpaths: Array[16, uint64]
+    if p9_decode_rwalk(rx, cast[uint64](rs), &rtag, &nwqid,
+                       &qtypes[0], &qvers[0], &qpaths[0]) < 0:
+        return -1
+    return 0
+
+
+def _v9p_open(fid: uint32, mode: uint8) -> int32:
+    c: P9Cursor
+    p9_cursor_init(&c, cast[Ptr[uint8]](v9p_dev.tx_buf), V9P_BUF_LEN)
+    if p9_emit_topen(&c, _v9p_next_tag(), fid, mode) < 0:
+        return -1
+    rs: int64 = _v9p_rpc(p9_cursor_bytes(&c))
+    if rs < 0:
+        return -1
+    rx: Ptr[uint8] = cast[Ptr[uint8]](v9p_dev.rx_buf)
+    rtag:  uint16 = 0
+    qt: uint8 = 0
+    qv: uint32 = 0
+    qp: uint64 = 0
+    iounit: uint32 = 0
+    if p9_decode_ropen(rx, cast[uint64](rs), &rtag, &qt, &qv, &qp,
+                       &iounit) < 0:
+        printk0("[v9p] Topen: bad Ropen\n")
+        return -1
+    return 0
+
+
+# Read up to `count` bytes from `fid` at `offset` into `dst`. Returns the
+# byte count delivered (>=0), or -1. Copies out of the DMA RX buffer into
+# the caller's buffer.
+def _v9p_read(fid: uint32, offset: uint64, count: uint32,
+              dst: Ptr[uint8], dst_cap: uint64) -> int64:
+    cap: uint32 = count
+    if cast[uint64](cap) > dst_cap:
+        cap = cast[uint32](dst_cap)
+    c: P9Cursor
+    p9_cursor_init(&c, cast[Ptr[uint8]](v9p_dev.tx_buf), V9P_BUF_LEN)
+    if p9_emit_tread(&c, _v9p_next_tag(), fid, offset, cap) < 0:
+        return cast[int64](-1)
+    rs: int64 = _v9p_rpc(p9_cursor_bytes(&c))
+    if rs < 0:
+        return cast[int64](-1)
+    rx: Ptr[uint8] = cast[Ptr[uint8]](v9p_dev.rx_buf)
+    rtag:  uint16 = 0
+    data:  Ptr[uint8] = cast[Ptr[uint8]](0)
+    rcount: uint32 = 0
+    if p9_decode_rread(rx, cast[uint64](rs), &rtag, &data, &rcount) < 0:
+        printk0("[v9p] Tread: bad Rread\n")
+        return cast[int64](-1)
+    n: uint64 = cast[uint64](rcount)
+    if n > dst_cap:
+        n = dst_cap
+    i: uint64 = 0
+    while i < n:
+        dst[i] = data[i]
+        i = i + 1
+    return cast[int64](n)
+
+
+def _v9p_clunk(fid: uint32) -> int32:
+    c: P9Cursor
+    p9_cursor_init(&c, cast[Ptr[uint8]](v9p_dev.tx_buf), V9P_BUF_LEN)
+    if p9_emit_tclunk(&c, _v9p_next_tag(), fid) < 0:
+        return -1
+    rs: int64 = _v9p_rpc(p9_cursor_bytes(&c))
+    if rs < 0:
+        return -1
+    rx: Ptr[uint8] = cast[Ptr[uint8]](v9p_dev.rx_buf)
+    rtag:  uint16 = 0
+    if p9_decode_rclunk(rx, cast[uint64](rs), &rtag) < 0:
+        return -1
+    return 0
+
+
+# --- Public client surface ------------------------------------------
+#
+# These compose the primitives into the operations the VFS / a mount
+# point needs. They are deliberately small + synchronous; a richer VFS
+# integration (FD_*_MARK dispatch like 9p_client.ad) layers on top of
+# this surface without changing it.
+
+# Resolve a single-component path under the export root, open it read-
+# only, read up to dst_cap bytes into dst, and clunk it. Returns bytes
+# read (>=0) or -1. `is_dir` (non-null) is set to 1 if the component is
+# a directory. Uses V9P_WORK_FID as the scratch fid.
+def virtio_9p_read_file(name: Ptr[uint8], name_len: uint64,
+                        dst: Ptr[uint8], dst_cap: uint64,
+                        is_dir: Ptr[int32]) -> int64:
+    if v9p_dev.present != 1:
+        return cast[int64](-1)
+    qt: int32 = _v9p_walk1(V9P_ROOT_FID, V9P_WORK_FID, name, name_len)
+    if qt < 0:
+        return cast[int64](-1)
+    dir_flag: int32 = 0
+    if (cast[uint8](qt) & P9_QTDIR) != 0:
+        dir_flag = 1
+    if is_dir != cast[Ptr[int32]](0):
+        is_dir[0] = dir_flag
+    if _v9p_open(V9P_WORK_FID, P9_OREAD) < 0:
+        _v9p_clunk(V9P_WORK_FID)
+        return cast[int64](-1)
+    n: int64 = _v9p_read(V9P_WORK_FID, 0, cast[uint32](dst_cap),
+                         dst, dst_cap)
+    _v9p_clunk(V9P_WORK_FID)
+    return n
+
+
+# Enumerate the export root directory: clone the root fid, open it for
+# reading, Tread the packed Stat stream, and invoke nothing — instead we
+# count + print the entries here (the self-test consumes the printed
+# names). Returns the number of entries enumerated (>=0) or -1.
+def virtio_9p_list_root() -> int32:
+    if v9p_dev.present != 1:
+        return -1
+    if _v9p_walk_clone(V9P_ROOT_FID, V9P_WORK_FID) < 0:
+        printk0("[v9p] list: clone walk failed\n")
+        return -1
+    if _v9p_open(V9P_WORK_FID, P9_OREAD) < 0:
+        _v9p_clunk(V9P_WORK_FID)
+        printk0("[v9p] list: open dir failed\n")
+        return -1
+    # One Tread is enough for the self-test's tiny export; a real VFS
+    # readdir would loop on offset until Rread returns 0.
+    dbuf: Array[4096, uint8]
+    n: int64 = _v9p_read(V9P_WORK_FID, 0, 4096, &dbuf[0], 4096)
+    _v9p_clunk(V9P_WORK_FID)
+    if n < 0:
+        return -1
+    # Walk the packed Stat records. Each is size[2] + body; p9_decode_stat
+    # returns the total record length consumed.
+    count: int32 = 0
+    off: uint64 = 0
+    total: uint64 = cast[uint64](n)
+    while off < total:
+        st_type: uint16 = 0
+        dev: uint32 = 0
+        qt: uint8 = 0
+        qv: uint32 = 0
+        qp: uint64 = 0
+        mode: uint32 = 0
+        atime: uint32 = 0
+        mtime: uint32 = 0
+        length: uint64 = 0
+        nm:  Ptr[uint8] = cast[Ptr[uint8]](0)
+        nml: uint64 = 0
+        uid: Ptr[uint8] = cast[Ptr[uint8]](0)
+        uidl: uint64 = 0
+        gid: Ptr[uint8] = cast[Ptr[uint8]](0)
+        gidl: uint64 = 0
+        muid: Ptr[uint8] = cast[Ptr[uint8]](0)
+        muidl: uint64 = 0
+        ext: Ptr[uint8] = cast[Ptr[uint8]](0)
+        extl: uint64 = 0
+        n_uid: uint32 = 0
+        n_gid: uint32 = 0
+        n_muid: uint32 = 0
+        consumed: int64 = p9_decode_stat_u(&dbuf[0], total, off,
+            &st_type, &dev, &qt, &qv, &qp, &mode, &atime, &mtime,
+            &length, &nm, &nml, &uid, &uidl, &gid, &gidl, &muid, &muidl,
+            &ext, &extl, &n_uid, &n_gid, &n_muid)
+        if consumed <= 0:
+            off = total
+        else:
+            count = count + 1
+            off = off + cast[uint64](consumed)
+    return count
+
+
+# --- Device bring-up ------------------------------------------------
+
+def _virtio_9p_init_one(bdf: uint32) -> int32:
+    printk1("[v9p] bdf=%x\n", cast[uint64](bdf))
+
+    # Modern virtio-1.0 init: walk the structured PCI capabilities,
+    # negotiate VIRTIO_F_VERSION_1, reach FEATURES_OK. virtio_modern_init
+    # leaves the device ready for queue setup; we don't need any 9P device
+    # feature (base 9P2000 over the request queue needs none).
+    if virtio_modern_init(bdf, &v9p_dev.mdev) < 0:
+        printk0("[v9p] modern virtio init failed\n")
+        return -1
+
+    # Read the mount_tag length from device-specific config (the
+    # DEVICE_CFG capability), informational. device_base may be 0 if the
+    # device exposes no DEVICE_CFG cap, in which case we skip it.
+    if v9p_dev.mdev.device_base != 0:
+        tag_len: uint32 = cast[uint32](
+            cast[Ptr[uint16]](v9p_dev.mdev.device_base + V9P_CFG_TAG_LEN)[0])
+        printk1("[v9p] mount_tag length field=%d\n", cast[uint64](tag_len))
+
+    # Set up the request virtqueue (queue 0). The VirtQueue handle it
+    # fills works with virtq_add_chain2/_desc_set unchanged.
+    if virtio_modern_setup_queue(&v9p_dev.mdev, 0, &v9p_dev.vq) < 0:
+        printk0("[v9p] request queue setup failed\n")
+        return -1
+
+    # Two page-aligned DMA scratch buffers (one T, one R), each one
+    # msize. alloc_pages returns low physical RAM the device can DMA to.
+    tx: uint64 = alloc_pages(1)        # 2 pages = 8 KiB
+    rx: uint64 = alloc_pages(1)
+    if tx == 0 or rx == 0:
+        printk0("[v9p] DMA buffer alloc failed\n")
+        return -1
+    memset(cast[Ptr[uint8]](tx), 0, V9P_BUF_LEN)
+    memset(cast[Ptr[uint8]](rx), 0, V9P_BUF_LEN)
+    v9p_dev.tx_buf = tx
+    v9p_dev.rx_buf = rx
+    v9p_dev.msize  = V9P_MSIZE
+    v9p_dev.next_tag = 1
+
+    virtio_modern_driver_ok(&v9p_dev.mdev)
+
+    # Tversion handshake — confirms the virtqueue round-trips real 9P.
+    if _v9p_version() < 0:
+        printk0("[v9p] Tversion handshake failed\n")
+        return -1
+    if _v9p_attach() < 0:
+        printk0("[v9p] Tattach failed\n")
+        return -1
+    v9p_dev.present = 1
+    printk0("[v9p] attached to host export root\n")
+    return 0
+
+
+# Probe + bring up the first virtio-9p-pci device on the bus. Returns 0
+# if one was found and attached, -1 otherwise. Safe to call when no
+# virtio-9p device is present (default boots): returns -1 quietly.
+def virtio_9p_init() -> int32:
+    v9p_dev.present = 0
+    # Try the modern-only id first, then the transitional id QEMU's
+    # default virtio-9p-pci uses. Both expose the modern capabilities.
+    bdf: uint32 = pci_find_from(V9P_VIRTIO_VENDOR, V9P_VIRTIO_ID_MODERN, 0)
+    if bdf == PCI_BDF_NONE:
+        bdf = pci_find_from(V9P_VIRTIO_VENDOR, V9P_VIRTIO_ID_TRANS, 0)
+    if bdf == PCI_BDF_NONE:
+        printk0("[v9p] no virtio-9p PCI device found\n")
+        return -1
+    if _virtio_9p_init_one(bdf) < 0:
+        return -1
+    return 0

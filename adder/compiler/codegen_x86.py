@@ -622,9 +622,28 @@ class X86CodeGen:
 
         # Pass 1: collect structs first (later passes consult them for type
         # sizes), then symbol kinds for call classification + globals.
+        #
+        # A class may embed another class BY VALUE as a field (e.g.
+        # `class Virtio9p: mdev: VirtioModernDev`). layout_struct sizes
+        # each field via get_type_size(), which only knows an embedded
+        # class's real size once that class is already in self.structs.
+        # When the embedded class is declared LATER in program.declarations
+        # (typically because it lives in a different module imported after
+        # the embedder), a naive in-order walk would size the field as a
+        # bare 8-byte slot — silently truncating the struct and aliasing
+        # later fields onto the embedded class's body. _layout_class_ordered
+        # lays a class's embedded-class dependencies out FIRST (recursively,
+        # cycle-guarded) so every field is sized against a fully-known
+        # layout regardless of declaration order.
+        class_defs_by_name: dict[str, ClassDef] = {}
         for decl in program.declarations:
             if isinstance(decl, ClassDef):
-                self.layout_struct(decl, program)
+                class_defs_by_name[decl.name] = decl
+        laying_out: set[str] = set()
+        for decl in program.declarations:
+            if isinstance(decl, ClassDef):
+                self._layout_class_ordered(
+                    decl, program, class_defs_by_name, laying_out)
         # Build the per-class method table BEFORE Pass-1 symbol
         # registration so the registration loop can register each
         # method's mangled symbol (`Class__method`) as a defined
@@ -850,6 +869,61 @@ class X86CodeGen:
             orig_name=m.orig_name or m.name,
         )
         self.gen_function(mangled)
+
+    def _layout_class_ordered(
+        self,
+        cls: ClassDef,
+        program: Program,
+        class_defs_by_name: dict[str, ClassDef],
+        laying_out: set[str],
+    ) -> None:
+        """Lay out `cls`, but first lay out any class it embeds BY VALUE
+        (a field whose type is a class name, or an array of one) that
+        isn't in self.structs yet. This makes struct sizing independent
+        of declaration order across modules: an embedder declared before
+        its embedded class still gets the full, correctly-sized layout.
+
+        Pointer fields (`Ptr[T]`) are 8 bytes regardless of T, so they
+        are NOT treated as dependencies — that keeps self-referential /
+        mutually-pointing structs (linked lists, trees) from cycling.
+        A genuine by-value embedding cycle is impossible in a C-ABI
+        struct (infinite size); `laying_out` guards against it defensively
+        so a malformed program errors out via the normal path rather than
+        recursing forever.
+        """
+        if cls.name in self.structs or cls.name in laying_out:
+            return
+        laying_out.add(cls.name)
+
+        def _embedded_class_name(t: Type) -> Optional[str]:
+            # The by-value class name embedded by a field type, or None.
+            # Ptr[T]/Fn[...] are 8-byte slots — not a layout dependency.
+            if isinstance(t, ArrayType):
+                return _embedded_class_name(t.element_type)
+            if isinstance(t, (PointerType, FunctionPointerType, PercpuType)):
+                return None
+            name = getattr(t, "name", None)
+            if name in class_defs_by_name:
+                return name
+            return None
+
+        # Bases are prepended by value too — size them first.
+        for base in cls.bases:
+            dep = class_defs_by_name.get(base)
+            if dep is not None:
+                self._layout_class_ordered(
+                    dep, program, class_defs_by_name, laying_out)
+        for f in cls.fields:
+            dep_name = _embedded_class_name(f.field_type)
+            if dep_name is not None:
+                dep = class_defs_by_name.get(dep_name)
+                if dep is not None:
+                    self._layout_class_ordered(
+                        dep, program, class_defs_by_name, laying_out)
+
+        laying_out.discard(cls.name)
+        if cls.name not in self.structs:
+            self.layout_struct(cls, program)
 
     def layout_struct(self, cls: ClassDef,
                       program: Optional[Program] = None) -> None:
