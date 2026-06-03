@@ -31,6 +31,10 @@
 from kernel.printk.printk import printk0, printk1, printk2
 from drivers.net.arp import arp_lookup, arp_set_our_ip
 from drivers.net.eth import eth_tx, eth_get_mac
+# Initramfs (cpio) directory accessors — used ONLY to scan for the
+# /etc/ipreasm-test marker that gates the boot-time reassembly self-test
+# (so no init/main.ad edit is needed to wire the test in).
+from fs.cpio import cpio_init, initramfs_entry_count, initramfs_entry_name
 # Native stateful packet-filter firewall. firewall_ingress() is the
 # INGRESS hook (ip_rx, pre-L4-demux) and firewall_egress() the EGRESS
 # hook (ip_send, pre-frame-build). Both return FW_ACCEPT(0)/FW_DROP(1).
@@ -76,6 +80,20 @@ class IpHdr:
 ip_in_pkts:    uint64 = 0
 ip_in_hdr_err: uint64 = 0
 ip_in_addr_err: uint64 = 0
+# /proc/net/snmp Ip: ReasmReqds / ReasmOKs / ReasmFails — fragment
+# reassembly accounting. ReasmReqds counts every fragment that needed
+# reassembly (MF set or non-zero offset), ReasmOKs a datagram fully
+# reassembled and re-dispatched, ReasmFails a reassembly that was torn
+# down (no free context, oversize, or overlap/bad-bounds).
+ip_reasm_reqds: uint64 = 0
+ip_reasm_oks:   uint64 = 0
+ip_reasm_fails: uint64 = 0
+# InCsumErrors — packets dropped because the IPv4 header checksum did
+# not verify. Stock Linux drops these in ip_rcv before any further
+# processing; we do the same so a corrupt header never reaches L4 or
+# (critically) the reassembly engine, where a flipped id/offset/proto
+# byte would mis-bin a fragment.
+ip_in_csum_err: uint64 = 0
 
 
 # Outbound state. Both addresses live in network byte order so a
@@ -261,6 +279,304 @@ def ip_csum16(buf: Ptr[uint8], length: uint64) -> uint16:
     return csum
 
 
+def _ip_pack4(b0: uint8, b1: uint8, b2: uint8, b3: uint8) -> uint32:
+    # Pack four address bytes (network order, b0 most-significant) into a
+    # uint32. Used as the reassembly-context key for src/dst.
+    r: uint32 = cast[uint32](b0)
+    r = (r << 8) | cast[uint32](b1)
+    r = (r << 8) | cast[uint32](b2)
+    r = (r << 8) | cast[uint32](b3)
+    return r
+
+
+# --- IPv4 fragment reassembly --------------------------------------
+#
+# Stock Linux reassembles fragmented IPv4 datagrams in
+# net/ipv4/ip_fragment.c (the "ip_defrag" / inet_frags machinery).
+# Without it, a datagram split across the wire — common for >MTU UDP
+# (e.g. a large DNS-over-UDP answer or an NFS RPC) — would be handed to
+# the L4 demuxer one fragment at a time, each looking like a truncated
+# (and, for non-first fragments, header-less) datagram. The result is
+# silent corruption: udp_rx sees a runt, tcp_rx sees garbage. This is a
+# genuine missing IPv4 feature, not a cosmetic gap.
+#
+# Design (sized for the bare-metal kernel, no dynamic allocation):
+#   * IP_REASM_CTX reassembly contexts, each a fixed 64 KiB payload
+#     buffer (the IPv4 maximum: total_length is a 16-bit field, header
+#     included). A context is keyed by the 4-tuple that identifies a
+#     datagram on the wire: (src_addr, dst_addr, id, protocol).
+#   * A per-context bitmap of received 8-byte blocks tracks coverage so
+#     overlapping/duplicate fragments are handled idempotently and the
+#     "all blocks present up to the final fragment" completion test is
+#     exact (RFC 815's algorithm, bitmap variant).
+#   * The total length is learned from the fragment carrying MF=0 (the
+#     last fragment): its (offset*8 + frag_payload_len) is the datagram
+#     length. Until that arrives, completion is impossible.
+#   * On completion the reassembled L3 payload (the original datagram
+#     MINUS its IPv4 header) is materialised behind a freshly-built
+#     20-byte IPv4 header (DF/MF cleared, frag offset 0, correct
+#     total_length + checksum) and re-fed through the normal ip_rx
+#     dispatch, so the L4 handlers see one clean, complete datagram.
+#
+# This is intentionally a no-timeout reassembler: a context is freed on
+# completion, or evicted (LRU by a monotonic generation counter) when
+# all contexts are busy and a new fragment for an unknown datagram
+# arrives. Stock Linux ages fragments out after 30 s; for a kernel with
+# a single NIC and no adversarial fragment-flood threat model the LRU
+# eviction is sufficient and simpler, and it can never leak a context.
+
+IP_REASM_CTX:      uint64 = 4         # concurrent datagrams reassembled
+IP_REASM_MAXLEN:   uint64 = 65535     # IPv4 max total_length
+# 64 KiB / 8 = 8192 blocks; bitmap is 8192/8 = 1024 bytes per context.
+IP_REASM_BLOCKS:   uint64 = 8192
+IP_REASM_BMBYTES:  uint64 = 1024
+
+# Per-context key + bookkeeping (parallel flat arrays).
+ip_reasm_used:     Array[4, uint8]    # 1 = context in use
+ip_reasm_src:      Array[4, uint32]   # packed src addr (big-endian)
+ip_reasm_dst:      Array[4, uint32]   # packed dst addr (big-endian)
+ip_reasm_id:       Array[4, uint16]   # IPv4 id field
+ip_reasm_proto:    Array[4, uint8]    # protocol byte
+ip_reasm_have_last: Array[4, uint8]   # 1 once the MF=0 fragment seen
+ip_reasm_totlen:   Array[4, uint64]   # datagram payload length (set by last frag)
+ip_reasm_gen:      Array[4, uint64]   # monotonic touch generation (LRU)
+
+# Reassembly payload buffers + coverage bitmaps. These are the big
+# buffers; module-scope Arrays per the Adder discipline. 4 * 64 KiB =
+# 256 KiB of BSS for the data, 4 * 1 KiB for the bitmaps.
+ip_reasm_data:     Array[262144, uint8]   # 4 * 65536
+ip_reasm_bitmap:   Array[4096, uint8]      # 4 * 1024
+
+ip_reasm_clock:    uint64 = 0          # monotonic LRU generation source
+
+# Scratch IPv4 frame used to re-inject a fully reassembled datagram
+# back through ip_rx (header rebuilt, fragmentation stripped).
+IP_REASM_INJECT:   uint64 = 65535
+ip_reasm_inject:   Array[65535, uint8]
+
+# Self-test capture. When ip_reasm_capture_on == 1, _ip_reasm_dispatch
+# copies the reassembled L3 PAYLOAD (datagram minus IPv4 header) into
+# ip_reasm_capture so the self-test can byte-compare it against the
+# original un-fragmented payload. Off (0) in normal operation so the hot
+# path pays nothing.
+IP_REASM_CAP:      uint64 = 4096
+ip_reasm_capture:  Array[4096, uint8]
+ip_reasm_capture_on:  uint8 = 0
+ip_reasm_capture_len: uint64 = 0
+
+
+def ip_reasm_init():
+    ip_reasm_reqds = 0
+    ip_reasm_oks   = 0
+    ip_reasm_fails = 0
+    ip_reasm_clock = 0
+    i: uint64 = 0
+    while i < IP_REASM_CTX:
+        ip_reasm_used[i] = 0
+        ip_reasm_have_last[i] = 0
+        ip_reasm_totlen[i] = 0
+        ip_reasm_gen[i] = 0
+        i = i + 1
+
+
+def _ip_reasm_find(src: uint32, dst: uint32,
+                   id: uint16, proto: uint8) -> int64:
+    # Locate the context for this datagram's 4-tuple, or -1.
+    i: uint64 = 0
+    while i < IP_REASM_CTX:
+        if ip_reasm_used[i] == 1:
+            if ip_reasm_src[i] == src:
+                if ip_reasm_dst[i] == dst:
+                    if ip_reasm_id[i] == id:
+                        if ip_reasm_proto[i] == proto:
+                            return cast[int64](i)
+        i = i + 1
+    return -1
+
+
+def _ip_reasm_alloc(src: uint32, dst: uint32,
+                    id: uint16, proto: uint8) -> int64:
+    # Grab a free context, or evict the least-recently-touched one. The
+    # evicted in-flight datagram counts as a ReasmFail (we discarded a
+    # partial reassembly). Returns the (now-cleared) context index.
+    free_idx: int64 = -1
+    i: uint64 = 0
+    while i < IP_REASM_CTX:
+        if ip_reasm_used[i] == 0:
+            free_idx = cast[int64](i)
+            i = IP_REASM_CTX
+        else:
+            i = i + 1
+    if free_idx < 0:
+        # All busy — evict the smallest generation (oldest touch).
+        oldest: uint64 = 0
+        oldest_gen: uint64 = ip_reasm_gen[0]
+        k: uint64 = 1
+        while k < IP_REASM_CTX:
+            if ip_reasm_gen[k] < oldest_gen:
+                oldest_gen = ip_reasm_gen[k]
+                oldest = k
+            k = k + 1
+        free_idx = cast[int64](oldest)
+        ip_reasm_fails = ip_reasm_fails + 1
+    ci: uint64 = cast[uint64](free_idx)
+    ip_reasm_used[ci] = 1
+    ip_reasm_src[ci] = src
+    ip_reasm_dst[ci] = dst
+    ip_reasm_id[ci] = id
+    ip_reasm_proto[ci] = proto
+    ip_reasm_have_last[ci] = 0
+    ip_reasm_totlen[ci] = 0
+    # Clear this context's coverage bitmap.
+    bm_base: uint64 = ci * IP_REASM_BMBYTES
+    b: uint64 = 0
+    while b < IP_REASM_BMBYTES:
+        ip_reasm_bitmap[bm_base + b] = 0
+        b = b + 1
+    return free_idx
+
+
+def _ip_reasm_complete(ci: uint64) -> int32:
+    # A datagram is complete iff the last fragment has been seen AND
+    # every 8-byte block from 0 up to the datagram length is covered.
+    if ip_reasm_have_last[ci] == 0:
+        return 0
+    total: uint64 = ip_reasm_totlen[ci]
+    # Number of blocks the datagram spans (round up the last partial).
+    nblocks: uint64 = (total + 7) / 8
+    bm_base: uint64 = ci * IP_REASM_BMBYTES
+    blk: uint64 = 0
+    while blk < nblocks:
+        byte_i: uint64 = bm_base + (blk >> 3)
+        bit: uint8 = cast[uint8](1) << cast[uint8](blk & 7)
+        if (ip_reasm_bitmap[byte_i] & bit) == 0:
+            return 0
+        blk = blk + 1
+    return 1
+
+
+def _ip_reasm_mark(ci: uint64, off: uint64, flen: uint64):
+    # Mark every 8-byte block covered by [off, off+flen) as present.
+    bm_base: uint64 = ci * IP_REASM_BMBYTES
+    first_blk: uint64 = off / 8
+    last_byte: uint64 = off + flen
+    last_blk: uint64 = (last_byte + 7) / 8        # exclusive
+    blk: uint64 = first_blk
+    while blk < last_blk:
+        if blk < IP_REASM_BLOCKS:
+            byte_i: uint64 = bm_base + (blk >> 3)
+            bit: uint8 = cast[uint8](1) << cast[uint8](blk & 7)
+            ip_reasm_bitmap[byte_i] = ip_reasm_bitmap[byte_i] | bit
+        blk = blk + 1
+
+
+def _ip_reasm_dispatch(ci: uint64):
+    # Re-build a single un-fragmented IPv4 datagram from a completed
+    # context and feed it back through ip_rx, so the L4 handlers see one
+    # clean packet. The header is synthesised fresh: DF/MF cleared,
+    # frag-offset 0, total_length = 20 + payload, checksum recomputed.
+    total: uint64 = ip_reasm_totlen[ci]
+    if total + IP_HDR_LEN > IP_REASM_INJECT:
+        ip_reasm_fails = ip_reasm_fails + 1
+        return
+    src: uint32 = ip_reasm_src[ci]
+    dst: uint32 = ip_reasm_dst[ci]
+    proto: uint8 = ip_reasm_proto[ci]
+    tl: uint16 = cast[uint16](IP_HDR_LEN + total)
+    ip_reasm_inject[0] = 0x45               # version 4, IHL 5
+    ip_reasm_inject[1] = 0                   # DSCP/ECN
+    ip_reasm_inject[2] = cast[uint8]((cast[uint32](tl) >> 8) & 0xFF)
+    ip_reasm_inject[3] = cast[uint8](cast[uint32](tl) & 0xFF)
+    ip_reasm_inject[4] = cast[uint8]((cast[uint32](ip_reasm_id[ci]) >> 8) & 0xFF)
+    ip_reasm_inject[5] = cast[uint8](cast[uint32](ip_reasm_id[ci]) & 0xFF)
+    ip_reasm_inject[6] = 0                   # flags=0, frag=0 (whole datagram)
+    ip_reasm_inject[7] = 0
+    ip_reasm_inject[8] = IP_TTL
+    ip_reasm_inject[9] = proto
+    ip_reasm_inject[10] = 0                  # checksum (computed below)
+    ip_reasm_inject[11] = 0
+    ip_reasm_inject[12] = cast[uint8]((src >> 24) & 0xFF)
+    ip_reasm_inject[13] = cast[uint8]((src >> 16) & 0xFF)
+    ip_reasm_inject[14] = cast[uint8]((src >> 8) & 0xFF)
+    ip_reasm_inject[15] = cast[uint8](src & 0xFF)
+    ip_reasm_inject[16] = cast[uint8]((dst >> 24) & 0xFF)
+    ip_reasm_inject[17] = cast[uint8]((dst >> 16) & 0xFF)
+    ip_reasm_inject[18] = cast[uint8]((dst >> 8) & 0xFF)
+    ip_reasm_inject[19] = cast[uint8](dst & 0xFF)
+    hcsum: uint16 = ip_csum16(cast[Ptr[uint8]](&ip_reasm_inject[0]), IP_HDR_LEN)
+    ip_reasm_inject[10] = cast[uint8]((cast[uint32](hcsum) >> 8) & 0xFF)
+    ip_reasm_inject[11] = cast[uint8](cast[uint32](hcsum) & 0xFF)
+    # Copy the reassembled payload in behind the header.
+    data_base: uint64 = ci * IP_REASM_MAXLEN
+    c: uint64 = 0
+    while c < total:
+        ip_reasm_inject[IP_HDR_LEN + c] = ip_reasm_data[data_base + c]
+        c = c + 1
+    # Self-test content capture (no-op in normal operation).
+    if ip_reasm_capture_on == 1:
+        cap_n: uint64 = total
+        if cap_n > IP_REASM_CAP:
+            cap_n = IP_REASM_CAP
+        cc: uint64 = 0
+        while cc < cap_n:
+            ip_reasm_capture[cc] = ip_reasm_data[data_base + cc]
+            cc = cc + 1
+        ip_reasm_capture_len = cap_n
+    # Free the context BEFORE re-dispatch so a (pathological) nested
+    # fragment for the same id can take a fresh context.
+    ip_reasm_used[ci] = 0
+    ip_reasm_have_last[ci] = 0
+    ip_reasm_oks = ip_reasm_oks + 1
+    ip_rx(cast[Ptr[uint8]](&ip_reasm_inject[0]), IP_HDR_LEN + total)
+
+
+def _ip_reasm_input(src: uint32, dst: uint32, id: uint16, proto: uint8,
+                    more_frags: int32, frag_off_blocks: uint64,
+                    frag_payload: Ptr[uint8], frag_len: uint64):
+    # Feed one fragment into reassembly. `frag_off_blocks` is the raw
+    # 13-bit fragment-offset field (units of 8 bytes); the byte offset is
+    # frag_off_blocks*8. `frag_payload`/`frag_len` are the L4 payload of
+    # THIS fragment (IPv4 header already stripped by the caller).
+    ip_reasm_reqds = ip_reasm_reqds + 1
+    byte_off: uint64 = frag_off_blocks * 8
+
+    # Bound check: a fragment that would land past the 64 KiB IPv4 max is
+    # malformed — discard the whole reassembly (RFC: fragment offset +
+    # length must not exceed 65535).
+    if byte_off + frag_len > IP_REASM_MAXLEN:
+        ip_reasm_fails = ip_reasm_fails + 1
+        existing: int64 = _ip_reasm_find(src, dst, id, proto)
+        if existing >= 0:
+            ip_reasm_used[existing] = 0
+            ip_reasm_have_last[existing] = 0
+        return
+
+    slot: int64 = _ip_reasm_find(src, dst, id, proto)
+    if slot < 0:
+        slot = _ip_reasm_alloc(src, dst, id, proto)
+    ci: uint64 = cast[uint64](slot)
+
+    # Touch the LRU generation.
+    ip_reasm_clock = ip_reasm_clock + 1
+    ip_reasm_gen[ci] = ip_reasm_clock
+
+    # Copy this fragment's bytes into the reassembly buffer at its offset.
+    data_base: uint64 = ci * IP_REASM_MAXLEN
+    i: uint64 = 0
+    while i < frag_len:
+        ip_reasm_data[data_base + byte_off + i] = frag_payload[i]
+        i = i + 1
+    _ip_reasm_mark(ci, byte_off, frag_len)
+
+    # The last fragment (MF=0) fixes the total datagram length.
+    if more_frags == 0:
+        ip_reasm_have_last[ci] = 1
+        ip_reasm_totlen[ci] = byte_off + frag_len
+
+    if _ip_reasm_complete(ci) == 1:
+        _ip_reasm_dispatch(ci)
+
+
 # --- receive --------------------------------------------------------
 
 def ip_rx(pkt: Ptr[uint8], length: uint64):
@@ -312,6 +628,52 @@ def ip_rx(pkt: Ptr[uint8], length: uint64):
     effective_len: uint64 = length
     if total_length <= length:
         effective_len = total_length
+    # --- IPv4 header checksum validation ---------------------------
+    # Stock Linux's ip_rcv verifies the header checksum (ip_fast_csum)
+    # and drops on mismatch (IpInCsumErrors) before any further work. We
+    # do the same: ip_csum16 over the header bytes must fold to zero for
+    # a valid header (the stored checksum already complements the sum).
+    # Dropping here is doubly important now that fragment reassembly
+    # keys on id/offset/proto — a single flipped header byte would
+    # otherwise mis-bin a fragment into the wrong (or a corrupt)
+    # reassembly context. A zero stored checksum is treated as "checksum
+    # not present" only by some hosts; we require a correct checksum.
+    hcsum: uint16 = ip_csum16(pkt, hdr_bytes)
+    if hcsum != 0:
+        ip_in_csum_err = ip_in_csum_err + 1
+        ip_in_hdr_err = ip_in_hdr_err + 1
+        return
+    # --- IPv4 fragmentation ----------------------------------------
+    # flags_frag (header bytes 6..7, big-endian): bit 15 reserved, bit
+    # 14 DF, bit 13 MF, bits 12..0 fragment offset (in 8-byte units). A
+    # packet is a fragment iff MF is set OR the fragment offset is
+    # non-zero. Such a packet is NOT a complete datagram and must not be
+    # handed to L4 directly — it goes into the reassembler, which will
+    # re-inject the completed datagram through ip_rx once all fragments
+    # have arrived. A non-fragment (the common case) falls straight
+    # through with zero added cost beyond the two-byte field read.
+    ff_hi: uint64 = cast[uint64](pkt[6])
+    ff_lo: uint64 = cast[uint64](pkt[7])
+    flags_frag: uint64 = (ff_hi << 8) | ff_lo
+    mf_set: int32 = 0
+    if (flags_frag & 0x2000) != 0:
+        mf_set = 1
+    frag_off_blocks: uint64 = flags_frag & 0x1FFF
+    if mf_set == 1 or frag_off_blocks != 0:
+        # This is a fragment. Re-key on (src,dst,id,proto), copy its L4
+        # payload into the reassembly buffer at its byte offset, and
+        # re-inject the whole datagram once complete.
+        frag_src: uint32 = _ip_pack4(pkt[12], pkt[13], pkt[14], pkt[15])
+        frag_dst: uint32 = _ip_pack4(pkt[16], pkt[17], pkt[18], pkt[19])
+        frag_id: uint16 = cast[uint16](
+            (cast[uint32](pkt[4]) << 8) | cast[uint32](pkt[5]))
+        frag_payload: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](pkt) + hdr_bytes)
+        frag_l4_len: uint64 = effective_len - hdr_bytes
+        _ip_reasm_input(frag_src, frag_dst, frag_id, proto,
+                        mf_set, frag_off_blocks,
+                        frag_payload, frag_l4_len)
+        return
     # --- INGRESS firewall hook -------------------------------------
     # Evaluate the packet-filter rules on the full IPv4 packet (header
     # included) BEFORE the L4 demux. A DROP verdict discards the packet
@@ -580,10 +942,24 @@ def ip_send(dst_b0: uint8, dst_b1: uint8, dst_b2: uint8, dst_b3: uint8,
     return eth_tx(cast[Ptr[uint8]](&ip_tx_buf[0]), total_frame)
 
 
+def ip_reasm_reqds_get() -> uint64:
+    return ip_reasm_reqds
+
+def ip_reasm_oks_get() -> uint64:
+    return ip_reasm_oks
+
+def ip_reasm_fails_get() -> uint64:
+    return ip_reasm_fails
+
+def ip_in_csum_err_get() -> uint64:
+    return ip_in_csum_err
+
+
 def ip_init():
     ip_in_pkts     = 0
     ip_in_hdr_err  = 0
     ip_in_addr_err = 0
+    ip_in_csum_err = 0
     ip_our_set = 0
     ip_gw_set  = 0
     ip_mask_set = 0
@@ -595,6 +971,14 @@ def ip_init():
         ip_gateway[i] = 0
         ip_netmask[i] = 0
         i = i + 1
+    ip_reasm_init()
+    # Run the reassembly self-test on every boot that exercises the net
+    # stack, gated on the /etc/ipreasm-test cpio marker (planted by
+    # scripts/test_net_ipreasm.sh). This driver-internal gate avoids any
+    # init/main.ad edit — ip_init() is already on the boot path. Default
+    # boots have no marker, so it never fires unintentionally.
+    if _ip_reasm_marker_present() == 1:
+        ip_reasm_selftest()
     printk0("ip: initialized\n")
 
 
@@ -606,3 +990,260 @@ def ip_init():
 # real definition. Since the Adder build merges all .ad files into a
 # single program and the linker resolves direct calls by name, neither
 # is necessary.
+
+
+# =====================================================================
+# IPv4 fragment-reassembly self-test
+# =====================================================================
+#
+# Deterministic, NIC-free exercise of the REAL ip_rx fragment path. We
+# hand-build IPv4 fragments (valid header checksum, MF/offset set) for a
+# single UDP datagram, feed them through ip_rx exactly as the wire would,
+# and assert:
+#   1. A fragmented datagram delivered IN ORDER reassembles, the
+#      ReasmOKs counter bumps, and the reassembled payload is byte-exact.
+#   2. The SAME datagram delivered OUT OF ORDER (last fragment first)
+#      also reassembles correctly — proving the engine is order-
+#      independent (RFC 815), not a naive append.
+#   3. A duplicate/overlapping fragment is idempotent (re-sending the
+#      first fragment does not corrupt the result or double-count).
+#   4. A fragment whose offset+length exceeds the 64 KiB IPv4 max is
+#      rejected (ReasmFails bumps) and does not complete.
+#   5. A packet with a CORRUPT header checksum is dropped (InCsumErrors
+#      bumps) before it can pollute a reassembly context.
+#
+# Each assertion prints "[ip-reasm] <name> PASS/FAIL"; a final
+# "[ip-reasm] PASS-ALL" sentinel is what scripts/test_net_ipreasm.sh
+# greps for. Gated at boot on the /etc/ipreasm-test cpio marker so it
+# never runs on a normal boot.
+
+# Scratch frame builder for a single IPv4 fragment (header + L4 bytes).
+IP_RST_FRAME:  uint64 = 1600
+ip_rst_frame:  Array[1600, uint8]
+# The full original UDP datagram (8-byte UDP header + payload) we will
+# fragment. Kept small enough to split into clean 8-byte-aligned pieces.
+IP_RST_DGRAM:  uint64 = 64
+ip_rst_dgram:  Array[64, uint8]
+
+ip_reasm_st_fails: int32 = 0
+
+
+def _ip_reasm_marker_present() -> int32:
+    # Scan the initramfs directory for "/etc/ipreasm-test" (17 chars +
+    # NUL = 18 bytes compared). Mirrors the marker-scan shape used by the
+    # boot-time gates in init/main.ad, but lives here so no init/main.ad
+    # edit is needed to wire the test in.
+    # ip_init() runs (from net_smoke_test) BEFORE init/main.ad's net path
+    # populates the cpio file_table, so the index would be empty here.
+    # cpio_init() is idempotent (vfs_init / net_smoke_test call it too),
+    # so populate it ourselves before walking — no init/main.ad edit needed.
+    cpio_init()
+    n: uint64 = initramfs_entry_count()
+    idx: uint64 = 0
+    while idx < n:
+        nm: Ptr[char] = initramfs_entry_name(idx)
+        ok: int32 = 1
+        tgt: Ptr[uint8] = "/etc/ipreasm-test"
+        j: uint64 = 0
+        while j < 18:
+            if cast[uint8](nm[j]) != tgt[j]:
+                ok = 0
+                j = 18
+            else:
+                j = j + 1
+        if ok == 1:
+            return 1
+        idx = idx + 1
+    return 0
+
+
+def _ip_rst_check(name: Ptr[uint8], ok: int32):
+    if ok != 0:
+        printk1("[ip-reasm] %s PASS\n", cast[uint64](name))
+    else:
+        printk1("[ip-reasm] %s FAIL\n", cast[uint64](name))
+        ip_reasm_st_fails = ip_reasm_st_fails + 1
+
+
+def _ip_rst_build_frag(src: uint32, dst: uint32, id: uint16, proto: uint8,
+                       mf: int32, off_blocks: uint64,
+                       l4: Ptr[uint8], l4_len: uint64) -> uint64:
+    # Build a complete IPv4 fragment into ip_rst_frame (no Ethernet
+    # header — ip_rx takes the L3 packet). Header checksum is computed so
+    # the packet passes ip_rx's new validation. Returns total frame len.
+    z: uint64 = 0
+    while z < IP_RST_FRAME:
+        ip_rst_frame[z] = 0
+        z = z + 1
+    tl: uint16 = cast[uint16](IP_HDR_LEN + l4_len)
+    ip_rst_frame[0] = 0x45
+    ip_rst_frame[1] = 0
+    ip_rst_frame[2] = cast[uint8]((cast[uint32](tl) >> 8) & 0xFF)
+    ip_rst_frame[3] = cast[uint8](cast[uint32](tl) & 0xFF)
+    ip_rst_frame[4] = cast[uint8]((cast[uint32](id) >> 8) & 0xFF)
+    ip_rst_frame[5] = cast[uint8](cast[uint32](id) & 0xFF)
+    # flags_frag: MF (bit 13) | fragment offset (bits 12..0).
+    ff: uint16 = cast[uint16](off_blocks & 0x1FFF)
+    if mf == 1:
+        ff = ff | 0x2000
+    ip_rst_frame[6] = cast[uint8]((cast[uint32](ff) >> 8) & 0xFF)
+    ip_rst_frame[7] = cast[uint8](cast[uint32](ff) & 0xFF)
+    ip_rst_frame[8] = IP_TTL
+    ip_rst_frame[9] = proto
+    ip_rst_frame[10] = 0
+    ip_rst_frame[11] = 0
+    ip_rst_frame[12] = cast[uint8]((src >> 24) & 0xFF)
+    ip_rst_frame[13] = cast[uint8]((src >> 16) & 0xFF)
+    ip_rst_frame[14] = cast[uint8]((src >> 8) & 0xFF)
+    ip_rst_frame[15] = cast[uint8](src & 0xFF)
+    ip_rst_frame[16] = cast[uint8]((dst >> 24) & 0xFF)
+    ip_rst_frame[17] = cast[uint8]((dst >> 16) & 0xFF)
+    ip_rst_frame[18] = cast[uint8]((dst >> 8) & 0xFF)
+    ip_rst_frame[19] = cast[uint8](dst & 0xFF)
+    cs: uint16 = ip_csum16(cast[Ptr[uint8]](&ip_rst_frame[0]), IP_HDR_LEN)
+    ip_rst_frame[10] = cast[uint8]((cast[uint32](cs) >> 8) & 0xFF)
+    ip_rst_frame[11] = cast[uint8](cast[uint32](cs) & 0xFF)
+    k: uint64 = 0
+    while k < l4_len:
+        ip_rst_frame[IP_HDR_LEN + k] = l4[k]
+        k = k + 1
+    return IP_HDR_LEN + l4_len
+
+
+def _ip_rst_capture_matches(orig: Ptr[uint8], n: uint64) -> int32:
+    # Compare the captured reassembled payload against the original.
+    if ip_reasm_capture_len != n:
+        return 0
+    i: uint64 = 0
+    while i < n:
+        if ip_reasm_capture[i] != orig[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def ip_reasm_selftest():
+    printk0("[ip-reasm] begin reassembly self-test\n")
+    ip_reasm_st_fails = 0
+    ip_reasm_init()
+    ip_reasm_capture_on = 1
+
+    # Build a 48-byte UDP datagram: 8-byte UDP header + 40-byte payload.
+    # src/dst ports + length + (zero) checksum, then a recognisable
+    # payload pattern. We will split it into 3 fragments of 16 bytes each
+    # (16/8 = 2 blocks per fragment; offsets 0, 2, 4).
+    dlen: uint64 = 48
+    ud: Ptr[uint8] = cast[Ptr[uint8]](&ip_rst_dgram[0])
+    ud[0] = 0xC0                     # src port hi (49152)
+    ud[1] = 0x00
+    ud[2] = 0x00                     # dst port hi (53 = DNS)
+    ud[3] = 0x35
+    ud[4] = cast[uint8]((dlen >> 8) & 0xFF)
+    ud[5] = cast[uint8](dlen & 0xFF)
+    ud[6] = 0                        # udp csum (not checked on this path)
+    ud[7] = 0
+    pi: uint64 = 8
+    while pi < dlen:
+        ud[pi] = cast[uint8]((pi * 7 + 3) & 0xFF)    # deterministic pattern
+        pi = pi + 1
+
+    src: uint32 = _ip_pack4(192, 0, 2, 10)
+    dst: uint32 = _ip_pack4(10, 0, 2, 15)
+    proto: uint8 = IPPROTO_UDP
+
+    # --- (1) In-order reassembly -----------------------------------
+    oks0: uint64 = ip_reasm_oks
+    fl0: uint64 = _ip_rst_build_frag(src, dst, 0x1111, proto, 1, 0, ud, 16)
+    ip_rx(cast[Ptr[uint8]](&ip_rst_frame[0]), fl0)
+    fl1: uint64 = _ip_rst_build_frag(src, dst, 0x1111, proto, 1, 2,
+                                     cast[Ptr[uint8]](
+                                        cast[uint64](ud) + 16), 16)
+    ip_rx(cast[Ptr[uint8]](&ip_rst_frame[0]), fl1)
+    fl2: uint64 = _ip_rst_build_frag(src, dst, 0x1111, proto, 0, 4,
+                                     cast[Ptr[uint8]](
+                                        cast[uint64](ud) + 32), 16)
+    ip_rx(cast[Ptr[uint8]](&ip_rst_frame[0]), fl2)
+    inorder_ok: int32 = 0
+    if ip_reasm_oks == oks0 + 1:
+        if _ip_rst_capture_matches(ud, 48) == 1:
+            inorder_ok = 1
+    _ip_rst_check("in-order-reassembly", inorder_ok)
+
+    # --- (2) Out-of-order reassembly (last fragment first) ---------
+    ip_reasm_init()
+    ip_reasm_capture_on = 1
+    oks1: uint64 = ip_reasm_oks
+    g2: uint64 = _ip_rst_build_frag(src, dst, 0x2222, proto, 0, 4,
+                                    cast[Ptr[uint8]](
+                                       cast[uint64](ud) + 32), 16)
+    ip_rx(cast[Ptr[uint8]](&ip_rst_frame[0]), g2)
+    g0: uint64 = _ip_rst_build_frag(src, dst, 0x2222, proto, 1, 0, ud, 16)
+    ip_rx(cast[Ptr[uint8]](&ip_rst_frame[0]), g0)
+    g1: uint64 = _ip_rst_build_frag(src, dst, 0x2222, proto, 1, 2,
+                                    cast[Ptr[uint8]](
+                                       cast[uint64](ud) + 16), 16)
+    ip_rx(cast[Ptr[uint8]](&ip_rst_frame[0]), g1)
+    ooo_ok: int32 = 0
+    if ip_reasm_oks == oks1 + 1:
+        if _ip_rst_capture_matches(ud, 48) == 1:
+            ooo_ok = 1
+    _ip_rst_check("out-of-order-reassembly", ooo_ok)
+
+    # --- (3) Duplicate fragment is idempotent ----------------------
+    ip_reasm_init()
+    ip_reasm_capture_on = 1
+    oks2: uint64 = ip_reasm_oks
+    d0: uint64 = _ip_rst_build_frag(src, dst, 0x3333, proto, 1, 0, ud, 16)
+    ip_rx(cast[Ptr[uint8]](&ip_rst_frame[0]), d0)
+    # Re-send the SAME first fragment — must not complete or corrupt.
+    ip_rx(cast[Ptr[uint8]](&ip_rst_frame[0]), d0)
+    d1: uint64 = _ip_rst_build_frag(src, dst, 0x3333, proto, 1, 2,
+                                    cast[Ptr[uint8]](
+                                       cast[uint64](ud) + 16), 16)
+    ip_rx(cast[Ptr[uint8]](&ip_rst_frame[0]), d1)
+    d2: uint64 = _ip_rst_build_frag(src, dst, 0x3333, proto, 0, 4,
+                                    cast[Ptr[uint8]](
+                                       cast[uint64](ud) + 32), 16)
+    ip_rx(cast[Ptr[uint8]](&ip_rst_frame[0]), d2)
+    dup_ok: int32 = 0
+    if ip_reasm_oks == oks2 + 1:
+        if _ip_rst_capture_matches(ud, 48) == 1:
+            dup_ok = 1
+    _ip_rst_check("duplicate-fragment-idempotent", dup_ok)
+
+    # --- (4) Oversize fragment rejected ----------------------------
+    ip_reasm_init()
+    ip_reasm_capture_on = 1
+    fails0: uint64 = ip_reasm_fails
+    oks3: uint64 = ip_reasm_oks
+    # offset 8191 blocks (* 8 = 65528) + 16 bytes payload overruns 65535.
+    ov: uint64 = _ip_rst_build_frag(src, dst, 0x4444, proto, 0, 8191, ud, 16)
+    ip_rx(cast[Ptr[uint8]](&ip_rst_frame[0]), ov)
+    oversize_ok: int32 = 0
+    if ip_reasm_fails > fails0:
+        if ip_reasm_oks == oks3:
+            oversize_ok = 1
+    _ip_rst_check("oversize-fragment-rejected", oversize_ok)
+
+    # --- (5) Corrupt header checksum dropped -----------------------
+    ip_reasm_capture_on = 0
+    cerr0: uint64 = ip_in_csum_err
+    bl: uint64 = _ip_rst_build_frag(src, dst, 0x5555, proto, 1, 0, ud, 16)
+    # Flip a header byte AFTER the checksum was computed so it no longer
+    # verifies. ip_rx must drop it and bump InCsumErrors.
+    ip_rst_frame[8] = ip_rst_frame[8] ^ 0xFF
+    ip_rx(cast[Ptr[uint8]](&ip_rst_frame[0]), bl)
+    csum_ok: int32 = 0
+    if ip_in_csum_err > cerr0:
+        csum_ok = 1
+    _ip_rst_check("corrupt-header-checksum-dropped", csum_ok)
+
+    ip_reasm_capture_on = 0
+    # Leave the engine clean for the live stack.
+    ip_reasm_init()
+
+    if ip_reasm_st_fails == 0:
+        printk0("[ip-reasm] PASS-ALL\n")
+    else:
+        printk1("[ip-reasm] %d FAILURE(S)\n",
+                cast[uint64](ip_reasm_st_fails))
