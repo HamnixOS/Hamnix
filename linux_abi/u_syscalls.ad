@@ -69,6 +69,13 @@ from kernel.printk.printk import (
     printk0, printk1, printk2, printk_set_level,
 )
 from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
+# splice/tee/vmsplice: the anonymous-pipe ring primitives. tee(2) needs
+# a non-consuming peek (pipe_peek) and a direct ring write (pipe_write)
+# against the backing slots vfs_fd_pipe_slot resolves; pipe_count gives
+# the readable-byte bound and pipe_readers/_writers the EOF/EPIPE state.
+from fs.pipe import (
+    pipe_peek, pipe_count, pipe_write, pipe_readers, pipe_writers,
+)
 from fs.vfs import (
     vfs_open, vfs_open_write, vfs_read, vfs_write, vfs_close, vfs_lseek,
     vfs_dup, vfs_dup2, vfs_unlink, vfs_mkdir, resolve_path, vfs_pipe,
@@ -88,6 +95,9 @@ from fs.vfs import (
     # #164: console-backed-fd probe + the termios line-discipline's
     # narrow console bridge (read_nb / write for echo).
     vfs_fd_is_console,
+    # splice/tee/vmsplice: recognise the pipe side of a splice and reach
+    # the backing ring slot for the non-consuming tee path.
+    vfs_fd_pipe_slot, vfs_fd_is_pipe_read, vfs_fd_is_pipe_write,
     # #165: PTY fd recogniser — returns the packed (slot<<1|is_master)
     # for an FD_PTMX_MARK fd so the ioctl shim can route tty ioctls to
     # the right pair.
@@ -341,7 +351,7 @@ from kernel.block.blk import blk_read_sectors
 # Previously the brk heap (and stack, and ELF image) relied on the
 # BSP's inherited 1 GiB identity stamp; M16.36 makes each user-owned
 # region present in the task's OWN PML4 as a private 4 KiB PTE chain.
-from fs.elf import elf_install_user_heap
+from fs.elf import elf_install_user_heap, vm_map_user_page
 from arch.x86.kernel.time import get_jiffies, tsc_monotonic_ns, HZ
 # getrandom(2) draws from the same kernel CSPRNG as /dev/random and
 # /dev/urandom — one shared ChaCha20 fast-key-erasure pool.
@@ -362,7 +372,7 @@ from arch.x86.kernel.power import (
 from drivers.rtc.cmos import rtc_boot_epoch_get
 from mm.slab import kmalloc, kfree, kzalloc
 from mm.page_alloc import alloc_pages, free_pages, \
-    page_alloc_free_count
+    page_alloc_free_count, alloc_page, free_page
 # sysinfo(2) reports the machine's real RAM extent (the memblock region)
 # and what of it is still unhanded-out, plus any pages the buddy allocator
 # has parked back on its free list.
@@ -408,9 +418,13 @@ from mm.vma import (
 # introduced here: under today's identity map every translated access is
 # the same physical write the raw deref used to do.
 from mm.uaccess import (
-    copy_to_user,
+    copy_to_user, copy_from_user,
     get_user_64, put_user_16, put_user_32, put_user_64,
     strncpy_from_user,
+    # splice self-test: stand up a real vaddr!=phys user mapping so the
+    # vmsplice copy_from_user gather path is exercised against genuine
+    # user memory rather than a kernel pointer.
+    uaccess_current_pml4,
 )
 
 # memset for zero-filling user-supplied stat buffers before we poke
@@ -730,6 +744,15 @@ SYS_sendfile:        uint64 = 40
 # observable result for the regular-file -> regular-file case `cp`
 # (and busybox's coreutils) probe first.
 SYS_copy_file_range: uint64 = 326
+# Pipe zero-copy I/O family. splice(2)/tee(2)/vmsplice(2) move bytes
+# through the anonymous-pipe ring (fs/pipe.ad) with at least one pipe
+# end, reusing the same VFS read/write data-move primitives sendfile /
+# copy_file_range bounce through. No SPLICE_F_MOVE page-stealing — the
+# observable byte stream matches Linux for the copy-semantics callers
+# (busybox / glibc tee, log shippers) actually depend on.
+SYS_splice:          uint64 = 275
+SYS_tee:             uint64 = 276
+SYS_vmsplice:        uint64 = 278
 # U35: AF_UNIX socket-shaped stubs. Hamnix has no network stack, but
 # busybox / glibc paths that probe socket(2) early (e.g. sh's
 # job-control / `[`-builtin code path) still need *some* answer. We
@@ -865,6 +888,7 @@ ELINUX_ADDRINUSE:    int64 = -98    # EADDRINUSE — bind port already in use
 ELINUX_BUSY:         int64 = -16    # EBUSY — a TLS session is already live
 ELINUX_PROTO:        int64 = -71    # EPROTO — TLS handshake / cert validation failed
 ELINUX_PIPE:         int64 = -32    # EPIPE — write to a pipe / socket with no reader
+ELINUX_SPIPE:        int64 = -29    # ESPIPE — illegal seek (splice offset on a pipe)
 # §10 UDP-socket / sockopt errnos.
 ELINUX_MSGSIZE:      int64 = -90    # EMSGSIZE — datagram larger than the UDP MTU
 ELINUX_NOPROTOOPT:   int64 = -92    # ENOPROTOOPT — unrecognised setsockopt option
@@ -4922,6 +4946,281 @@ def _u_copy_file_range(a0: uint64, a1: uint64, a2: uint64,
     return total
 
 
+# splice/tee/vmsplice staging buffer. Module-scope so the move loop
+# never blows the syscall stack — matches sendfile / copy_file_range's
+# 4 KiB grain so a pipe<->file move fills the ring in the same cadence.
+SPLICE_CHUNK: uint64 = 4096
+_splice_buf: Array[4096, uint8]
+
+
+def _u_splice(a0: uint64, a1: uint64, a2: uint64,
+              a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # ssize_t splice(int fd_in, loff_t *off_in,
+    #                int fd_out, loff_t *off_out,
+    #                size_t len, unsigned int flags)
+    #
+    # Move up to `len` bytes between fd_in and fd_out where AT LEAST ONE
+    # side is an anonymous pipe. Three shapes:
+    #   * pipe -> file : read from the pipe (vfs_read routes the
+    #                    FD_PIPE_MARK_R arm), write into the file. off_out
+    #                    seeks the file side; off_in on a pipe is ESPIPE.
+    #   * file -> pipe : read the file (off_in seeks it), write the pipe.
+    #                    off_out on a pipe is ESPIPE.
+    #   * pipe -> pipe : read in-pipe, write out-pipe. Neither offset is
+    #                    allowed (both ESPIPE).
+    # EINVAL when neither side is a pipe. EBADF for a bad fd. Bytes are
+    # bounced through a kernel staging buffer over the same vfs read/write
+    # path copy_file_range uses, so the byte stream is identical — no
+    # SPLICE_F_MOVE page-stealing (Linux is free to fall back to a copy,
+    # and every copy-semantics caller is happy with that).
+    fd_in:  int32 = cast[int32](a0)
+    off_in_ptr:  uint64 = a1
+    fd_out: int32 = cast[int32](a2)
+    off_out_ptr: uint64 = a3
+    remaining: uint64 = a4
+
+    if fd_in < 0 or fd_out < 0:
+        return ELINUX_BADF
+    in_is_pipe:  int32 = vfs_fd_is_pipe_read(fd_in)
+    out_is_pipe: int32 = vfs_fd_is_pipe_write(fd_out)
+    # At least one end must be a pipe (Linux requires exactly the read
+    # end of fd_in or the write end of fd_out to be a pipe).
+    if in_is_pipe == 0 and out_is_pipe == 0:
+        return ELINUX_INVAL
+    # Offsets are illegal on the pipe side(s).
+    if in_is_pipe != 0 and off_in_ptr != 0:
+        return ELINUX_SPIPE
+    if out_is_pipe != 0 and off_out_ptr != 0:
+        return ELINUX_SPIPE
+    if remaining == 0:
+        return 0
+
+    # Seek the seekable (non-pipe) side(s) to the supplied *offset. We
+    # read the pointer once and write the advanced value back at the end
+    # so the underlying fd position stays untouched in the pointer case
+    # (matches copy_file_range / sendfile).
+    in_off: int64 = 0
+    if off_in_ptr != 0:
+        in_off = cast[Ptr[int64]](off_in_ptr)[0]
+        ri: int64 = vfs_lseek(fd_in, in_off, SEEK_SET)
+        if ri < 0:
+            return ri
+        in_off = ri
+    out_off: int64 = 0
+    if off_out_ptr != 0:
+        out_off = cast[Ptr[int64]](off_out_ptr)[0]
+        ro: int64 = vfs_lseek(fd_out, out_off, SEEK_SET)
+        if ro < 0:
+            return ro
+        out_off = ro
+
+    total: int64 = 0
+    cont: int32 = 1
+    while cont != 0:
+        want: uint64 = remaining
+        if want > SPLICE_CHUNK:
+            want = SPLICE_CHUNK
+        # off_in pointer case: re-seek fd_in each iteration so its own
+        # position is never the thing we advance.
+        if off_in_ptr != 0:
+            rs: int64 = vfs_lseek(fd_in, in_off, SEEK_SET)
+            if rs < 0:
+                if total == 0:
+                    return rs
+                cont = 0
+                continue
+        n: int64 = vfs_read(fd_in, &_splice_buf[0], want)
+        if n < 0:
+            if total == 0:
+                return n
+            cont = 0
+            continue
+        if n == 0:
+            cont = 0                                      # EOF
+            continue
+        got: uint64 = cast[uint64](n)
+        if off_out_ptr != 0:
+            rw: int64 = vfs_lseek(fd_out, out_off, SEEK_SET)
+            if rw < 0:
+                if total == 0:
+                    return rw
+                cont = 0
+                continue
+        w: int64 = vfs_write(fd_out, &_splice_buf[0], got)
+        if w < 0:
+            if w == ELINUX_PIPE:
+                signal_post(current_idx_get(), SIGPIPE)
+            if total == 0:
+                return w
+            cont = 0
+            continue
+        total = total + w
+        in_off = in_off + w
+        out_off = out_off + w
+        if cast[uint64](w) < got:
+            # Short write — drop the remainder (ring full / back-pressure).
+            cont = 0
+            continue
+        remaining = remaining - got
+        if remaining == 0:
+            cont = 0
+
+    if off_in_ptr != 0:
+        cast[Ptr[int64]](off_in_ptr)[0] = in_off
+    if off_out_ptr != 0:
+        cast[Ptr[int64]](off_out_ptr)[0] = out_off
+    return total
+
+
+def _u_tee(a0: uint64, a1: uint64, a2: uint64,
+           a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # ssize_t tee(int fd_in, int fd_out, size_t len, unsigned int flags)
+    #
+    # Duplicate up to `len` bytes from one pipe (fd_in, a read end) into
+    # another pipe (fd_out, a write end) WITHOUT consuming the input —
+    # the bytes stay readable on fd_in. Both fds must be pipes (EINVAL
+    # otherwise). We peek the in-ring (non-destructive, pipe_peek leaves
+    # head/count untouched) and write the bytes into the out-ring.
+    fd_in:  int32 = cast[int32](a0)
+    fd_out: int32 = cast[int32](a1)
+    remaining: uint64 = a2
+
+    if fd_in < 0 or fd_out < 0:
+        return ELINUX_BADF
+    in_slot:  int32 = vfs_fd_pipe_slot(fd_in)
+    out_slot: int32 = vfs_fd_pipe_slot(fd_out)
+    # Both ends must be pipes — and specifically the read end of fd_in
+    # and the write end of fd_out.
+    if vfs_fd_is_pipe_read(fd_in) == 0 or vfs_fd_is_pipe_write(fd_out) == 0:
+        return ELINUX_INVAL
+    if in_slot < 0 or out_slot < 0:
+        return ELINUX_INVAL
+    if remaining == 0:
+        return 0
+    # A tee whose out-pipe has no readers can never make progress — Linux
+    # reports EPIPE (and a SIGPIPE).
+    if pipe_readers(out_slot) == 0:
+        signal_post(current_idx_get(), SIGPIPE)
+        return ELINUX_PIPE
+
+    total: int64 = 0
+    # Peek from a moving in-ring offset: pipe_peek always copies from the
+    # ring head, so we track how far we've duplicated and only count the
+    # bytes past `done`. Bounded by what's currently buffered — tee never
+    # blocks waiting for more input in this single-task model.
+    avail: uint64 = pipe_count(in_slot)
+    if avail == 0:
+        return 0
+    if remaining > avail:
+        remaining = avail
+
+    done: uint64 = 0
+    cont: int32 = 1
+    while cont != 0:
+        want: uint64 = remaining - done
+        if want == 0:
+            cont = 0
+            continue
+        if want > SPLICE_CHUNK:
+            want = SPLICE_CHUNK
+        # Peek the whole prefix up to done+want, then copy only the new
+        # tail [done, done+got) so we never re-write already-teed bytes.
+        peeked: int64 = pipe_peek(in_slot, &_splice_buf[0], done + want)
+        if peeked <= 0:
+            cont = 0
+            continue
+        pk: uint64 = cast[uint64](peeked)
+        if pk <= done:
+            cont = 0
+            continue
+        seg: uint64 = pk - done
+        w: int64 = pipe_write(out_slot,
+                              cast[Ptr[uint8]](cast[uint64](&_splice_buf[0]) + done),
+                              seg)
+        if w <= 0:
+            # Out-ring full (0) or gone — stop; report bytes so far.
+            cont = 0
+            continue
+        total = total + w
+        done = done + cast[uint64](w)
+        if cast[uint64](w) < seg:
+            cont = 0
+            continue
+        if done >= remaining:
+            cont = 0
+    return total
+
+
+def _u_vmsplice(a0: uint64, a1: uint64, a2: uint64,
+                a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # ssize_t vmsplice(int fd, const struct iovec *iov,
+    #                  size_t nr_segs, unsigned int flags)
+    #
+    # Gather user iovec memory into a pipe. fd must be the write end of a
+    # pipe (EBADF/EINVAL otherwise). We copy each iovec segment out of
+    # user space (copy_from_user — never a raw user-pointer deref) into a
+    # kernel staging buffer, then push it into the ring with pipe_write.
+    # No SPLICE_F_GIFT page-donation: plain copy semantics, which is all
+    # the common callers rely on.
+    fd: int32 = cast[int32](a0)
+    iov: uint64 = a1
+    nr_segs: uint64 = a2
+
+    if fd < 0:
+        return ELINUX_BADF
+    if vfs_fd_is_pipe_write(fd) == 0:
+        return ELINUX_INVAL
+    out_slot: int32 = vfs_fd_pipe_slot(fd)
+    if out_slot < 0:
+        return ELINUX_INVAL
+    if nr_segs == 0:
+        return 0
+    if iov == 0:
+        return ELINUX_INVAL
+    if pipe_readers(out_slot) == 0:
+        signal_post(current_idx_get(), SIGPIPE)
+        return ELINUX_PIPE
+
+    total: int64 = 0
+    i: uint64 = 0
+    while i < nr_segs:
+        # Each iovec entry: { void *iov_base; size_t iov_len; } — 16
+        # bytes, no padding (same layout readv/writev walk).
+        entry: uint64 = iov + i * 16
+        base: uint64 = cast[Ptr[uint64]](entry)[0]
+        seglen: uint64 = cast[Ptr[uint64]](entry + 8)[0]
+        if seglen == 0:
+            i = i + 1
+            continue
+        seg_done: uint64 = 0
+        seg_stop: int32 = 0
+        while seg_done < seglen and seg_stop == 0:
+            chunk: uint64 = seglen - seg_done
+            if chunk > SPLICE_CHUNK:
+                chunk = SPLICE_CHUNK
+            resid: uint64 = copy_from_user(cast[uint64](&_splice_buf[0]),
+                                           base + seg_done, chunk)
+            if resid != 0:
+                # User fault mid-segment: surface EFAULT if nothing moved
+                # yet, otherwise return the partial total.
+                if total == 0:
+                    return ELINUX_EFAULT
+                return total
+            w: int64 = pipe_write(out_slot, &_splice_buf[0], chunk)
+            if w <= 0:
+                # Ring full right now — stop, report bytes so far.
+                seg_stop = 1
+                continue
+            total = total + w
+            seg_done = seg_done + cast[uint64](w)
+            if cast[uint64](w) < chunk:
+                seg_stop = 1                              # ring full
+        if seg_stop != 0:
+            return total
+        i = i + 1
+    return total
+
+
 def _u_access_path(upath: uint64, mode: uint64) -> int64:
     # Shared body for access(2) / faccessat(2) / faccessat2(2). `upath`
     # is the user path pointer (relative paths resolve against the task
@@ -8287,6 +8586,306 @@ def _pty_selftest_restore(boot_task: Ptr[TaskStruct], fd_save: Ptr[uint32]):
 
 
 # =====================================================================
+# splice(2) / tee(2) / vmsplice(2) self-test
+#   (gated on /etc/splice-test, ENABLE_SPLICE_TEST=1)
+# =====================================================================
+#
+# Drives the pipe zero-copy I/O family through the REAL in-kernel
+# Linux-ABI dispatch (linux_u_syscall_dispatch — the exact path a Linux
+# glibc tee / log-shipper takes):
+#
+#   * file -> pipe  splice : 8 bytes from a tmpfs file into a pipe, read
+#                            the pipe back, byte-exact.
+#   * pipe -> file  splice : 8 bytes pushed into a pipe, spliced into a
+#                            fresh file with off_out, byte-exact + offset
+#                            advanced.
+#   * pipe -> pipe  splice : 8 bytes moved between two pipes, byte-exact,
+#                            and CONSUMED from the source (read returns 0).
+#   * tee                  : 8 bytes duplicated A->B leaving A intact —
+#                            B reads the copy AND A still reads the same
+#                            bytes afterwards.
+#   * vmsplice             : a real (vaddr != phys) user buffer gathered
+#                            into a pipe via copy_from_user, byte-exact.
+#   * error paths          : EINVAL when neither side is a pipe; ESPIPE
+#                            for an offset on the pipe side.
+#
+# Prints "[splice] PASS" once every assertion holds; "[splice] FAIL ..."
+# on the first failure. A default boot ships no marker, so this is inert.
+
+# Non-identity user vaddr for the vmsplice gather buffer (well above any
+# identity-mapped RAM, like the uaccess smoke test's V_rw).
+SPLICE_TEST_VADDR: uint64 = 0x0000557700000000
+
+
+def splice_selftest() -> int32:
+    # Prime the boot task's fd table (same uninitialised-table dance the
+    # pty / uabi_fills hooks use) so the open / pipe legs can grab fds.
+    boot_task: Ptr[TaskStruct] = current_task()
+    fd_save: Array[16, uint32]
+    fdi: uint64 = 3
+    while fdi < 16:
+        fd_save[fdi] = boot_task[0].fd_idx[fdi]
+        boot_task[0].fd_idx[fdi] = FD_CLOSED_MARK
+        fdi = fdi + 1
+
+    # The 8-byte payload every leg round-trips.
+    payload: Array[8, uint8]
+    payload[0] = 83                                      # 'S'
+    payload[1] = 80                                      # 'P'
+    payload[2] = 76                                      # 'L'
+    payload[3] = 105                                     # 'i'
+    payload[4] = 99                                      # 'c'
+    payload[5] = 101                                     # 'e'
+    payload[6] = 49                                      # '1'
+    payload[7] = 50                                      # '2'
+
+    # --- 1. file -> pipe splice --------------------------------------
+    fp_src_name: Ptr[char] = cast[Ptr[char]]("/tmp/splice-fp-src")
+    fp_src: int32 = vfs_open_write(fp_src_name)
+    if fp_src < 0:
+        printk1("[splice] FAIL fp src open=%d\n",
+                cast[uint64](cast[int64](fp_src)))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    vfs_write(fp_src, &payload[0], 8)
+    vfs_lseek(fp_src, 0, 0)
+    fp_fds: Array[2, int32]
+    if vfs_pipe(&fp_fds[0]) != 0:
+        printk0("[splice] FAIL fp pipe alloc\n")
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    fp_n: int64 = linux_u_syscall_dispatch(SYS_splice,
+                                           cast[uint64](fp_src), 0,
+                                           cast[uint64](fp_fds[1]), 0,
+                                           8, 0)
+    if fp_n != 8:
+        printk1("[splice] FAIL file->pipe count=%d\n", cast[uint64](fp_n))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    fp_rb: Array[8, uint8]
+    fp_rn: int64 = vfs_read(fp_fds[0], &fp_rb[0], 8)
+    if fp_rn != 8 or _splice_bytes_eq(&fp_rb[0], &payload[0], 8) == 0:
+        printk1("[splice] FAIL file->pipe readback n=%d\n", cast[uint64](fp_rn))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    vfs_close(fp_src)
+    vfs_close(fp_fds[0])
+    vfs_close(fp_fds[1])
+    printk0("[splice] file->pipe OK\n")
+
+    # --- 2. pipe -> file splice (off_out pointer) --------------------
+    pf_fds: Array[2, int32]
+    if vfs_pipe(&pf_fds[0]) != 0:
+        printk0("[splice] FAIL pf pipe alloc\n")
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    vfs_write(pf_fds[1], &payload[0], 8)
+    pf_dst_name: Ptr[char] = cast[Ptr[char]]("/tmp/splice-pf-dst")
+    pf_dst: int32 = vfs_open_write(pf_dst_name)
+    if pf_dst < 0:
+        printk0("[splice] FAIL pf dst open\n")
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    pf_off: Array[1, int64]
+    pf_off[0] = 0
+    pf_n: int64 = linux_u_syscall_dispatch(SYS_splice,
+                                           cast[uint64](pf_fds[0]), 0,
+                                           cast[uint64](pf_dst),
+                                           cast[uint64](&pf_off[0]),
+                                           8, 0)
+    if pf_n != 8:
+        printk1("[splice] FAIL pipe->file count=%d\n", cast[uint64](pf_n))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    if pf_off[0] != 8:
+        printk1("[splice] FAIL pipe->file off adv=%d\n", cast[uint64](pf_off[0]))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    vfs_lseek(pf_dst, 0, 0)
+    pf_rb: Array[8, uint8]
+    pf_rn: int64 = vfs_read(pf_dst, &pf_rb[0], 8)
+    if pf_rn != 8 or _splice_bytes_eq(&pf_rb[0], &payload[0], 8) == 0:
+        printk1("[splice] FAIL pipe->file readback n=%d\n", cast[uint64](pf_rn))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    vfs_close(pf_dst)
+    vfs_close(pf_fds[0])
+    vfs_close(pf_fds[1])
+    printk0("[splice] pipe->file OK\n")
+
+    # --- 3. pipe -> pipe splice (consumes source) --------------------
+    pa: Array[2, int32]
+    pb: Array[2, int32]
+    if vfs_pipe(&pa[0]) != 0 or vfs_pipe(&pb[0]) != 0:
+        printk0("[splice] FAIL pp pipe alloc\n")
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    vfs_write(pa[1], &payload[0], 8)
+    pp_n: int64 = linux_u_syscall_dispatch(SYS_splice,
+                                           cast[uint64](pa[0]), 0,
+                                           cast[uint64](pb[1]), 0,
+                                           8, 0)
+    if pp_n != 8:
+        printk1("[splice] FAIL pipe->pipe count=%d\n", cast[uint64](pp_n))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    pp_rb: Array[8, uint8]
+    pp_rn: int64 = vfs_read(pb[0], &pp_rb[0], 8)
+    if pp_rn != 8 or _splice_bytes_eq(&pp_rb[0], &payload[0], 8) == 0:
+        printk1("[splice] FAIL pipe->pipe readback n=%d\n", cast[uint64](pp_rn))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    vfs_close(pa[0])
+    vfs_close(pa[1])
+    vfs_close(pb[0])
+    vfs_close(pb[1])
+    printk0("[splice] pipe->pipe OK\n")
+
+    # --- 4. tee leaves the input intact ------------------------------
+    ta: Array[2, int32]
+    tb: Array[2, int32]
+    if vfs_pipe(&ta[0]) != 0 or vfs_pipe(&tb[0]) != 0:
+        printk0("[splice] FAIL tee pipe alloc\n")
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    vfs_write(ta[1], &payload[0], 8)
+    tee_n: int64 = _uabi_test_dispatch(SYS_tee,
+                                       cast[uint64](ta[0]),
+                                       cast[uint64](tb[1]),
+                                       8, 0)
+    if tee_n != 8:
+        printk1("[splice] FAIL tee count=%d\n", cast[uint64](tee_n))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    # B gets the duplicate.
+    tb_rb: Array[8, uint8]
+    tb_rn: int64 = vfs_read(tb[0], &tb_rb[0], 8)
+    if tb_rn != 8 or _splice_bytes_eq(&tb_rb[0], &payload[0], 8) == 0:
+        printk1("[splice] FAIL tee dst readback n=%d\n", cast[uint64](tb_rn))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    # A is UNTOUCHED — the same 8 bytes are still readable.
+    ta_rb: Array[8, uint8]
+    ta_rn: int64 = vfs_read(ta[0], &ta_rb[0], 8)
+    if ta_rn != 8 or _splice_bytes_eq(&ta_rb[0], &payload[0], 8) == 0:
+        printk1("[splice] FAIL tee src consumed n=%d\n", cast[uint64](ta_rn))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    vfs_close(ta[0])
+    vfs_close(ta[1])
+    vfs_close(tb[0])
+    vfs_close(tb[1])
+    printk0("[splice] tee (input intact) OK\n")
+
+    # --- 5. error paths ----------------------------------------------
+    # EINVAL: neither side a pipe (two plain files).
+    e_src: int32 = vfs_open_write(cast[Ptr[char]]("/tmp/splice-e-src"))
+    e_dst: int32 = vfs_open_write(cast[Ptr[char]]("/tmp/splice-e-dst"))
+    if e_src < 0 or e_dst < 0:
+        printk0("[splice] FAIL err-path file open\n")
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    vfs_write(e_src, &payload[0], 8)
+    vfs_lseek(e_src, 0, 0)
+    e_inval: int64 = linux_u_syscall_dispatch(SYS_splice,
+                                              cast[uint64](e_src), 0,
+                                              cast[uint64](e_dst), 0,
+                                              8, 0)
+    if e_inval != ELINUX_INVAL:
+        printk1("[splice] FAIL file->file want EINVAL got=%d\n",
+                cast[uint64](e_inval))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    # ESPIPE: an offset pointer on the pipe side.
+    sp_fds: Array[2, int32]
+    if vfs_pipe(&sp_fds[0]) != 0:
+        printk0("[splice] FAIL espipe pipe alloc\n")
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    sp_off: Array[1, int64]
+    sp_off[0] = 0
+    e_espipe: int64 = linux_u_syscall_dispatch(SYS_splice,
+                                               cast[uint64](sp_fds[0]),
+                                               cast[uint64](&sp_off[0]),
+                                               cast[uint64](e_dst), 0,
+                                               8, 0)
+    if e_espipe != ELINUX_SPIPE:
+        printk1("[splice] FAIL pipe-offset want ESPIPE got=%d\n",
+                cast[uint64](e_espipe))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    vfs_close(e_src)
+    vfs_close(e_dst)
+    vfs_close(sp_fds[0])
+    vfs_close(sp_fds[1])
+    printk0("[splice] error paths (EINVAL/ESPIPE) OK\n")
+
+    # --- 6. vmsplice from a REAL user buffer -------------------------
+    # Stand up a non-identity user-writable page (vaddr != phys), lay the
+    # payload into it via copy_to_user, point the iovec at the user vaddr,
+    # and vmsplice it into a pipe. This exercises the copy_from_user
+    # gather path against genuine user memory, not a kernel pointer.
+    pml4: uint64 = uaccess_current_pml4()
+    upage: uint64 = alloc_page()
+    if upage == 0:
+        printk0("[splice] FAIL vmsplice alloc_page\n")
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    if vm_map_user_page(pml4, SPLICE_TEST_VADDR, upage, 1) < 0:
+        printk0("[splice] FAIL vmsplice map user page\n")
+        free_page(upage)
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    if copy_to_user(SPLICE_TEST_VADDR, cast[uint64](&payload[0]), 8) != 0:
+        printk0("[splice] FAIL vmsplice copy_to_user setup\n")
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    vm_fds: Array[2, int32]
+    if vfs_pipe(&vm_fds[0]) != 0:
+        printk0("[splice] FAIL vmsplice pipe alloc\n")
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    # iovec { base = SPLICE_TEST_VADDR, len = 8 }. The iovec STRUCT is a
+    # kernel array (vmsplice reads it by raw deref, like readv/writev);
+    # only iov_base points at user memory.
+    vm_iov: Array[2, uint64]
+    vm_iov[0] = SPLICE_TEST_VADDR
+    vm_iov[1] = 8
+    vm_n: int64 = _uabi_test_dispatch(SYS_vmsplice,
+                                      cast[uint64](vm_fds[1]),
+                                      cast[uint64](&vm_iov[0]),
+                                      1, 0)
+    if vm_n != 8:
+        printk1("[splice] FAIL vmsplice count=%d\n", cast[uint64](vm_n))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    vm_rb: Array[8, uint8]
+    vm_rn: int64 = vfs_read(vm_fds[0], &vm_rb[0], 8)
+    if vm_rn != 8 or _splice_bytes_eq(&vm_rb[0], &payload[0], 8) == 0:
+        printk1("[splice] FAIL vmsplice readback n=%d\n", cast[uint64](vm_rn))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    vfs_close(vm_fds[0])
+    vfs_close(vm_fds[1])
+    free_page(upage)
+    printk0("[splice] vmsplice (user iovec) OK\n")
+
+    _pty_selftest_restore(boot_task, &fd_save[0])
+    printk0("[splice] PASS\n")
+    return 0
+
+
+def _splice_bytes_eq(a: Ptr[uint8], b: Ptr[uint8], n: uint64) -> int32:
+    # 1 if the first n bytes of a and b are equal, else 0.
+    i: uint64 = 0
+    while i < n:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+# =====================================================================
 # statfs(2) / fstatfs(2) self-test
 #   (gated on /etc/statfs-test, ENABLE_STATFS_TEST=1)
 # =====================================================================
@@ -9869,6 +10468,16 @@ def _linux_u_syscall_dispatch_inner(nr: uint64,
     # path. Real handler overrides any autostub routing for nr 326.
     if nr == SYS_copy_file_range:
         return _u_copy_file_range(a0, a1, a2, a3, a4, a5)
+    # Pipe zero-copy I/O family: splice (pipe<->file / pipe<->pipe),
+    # tee (non-consuming pipe->pipe duplicate), vmsplice (user iovec ->
+    # pipe). Built on the same VFS read/write + pipe-ring primitives the
+    # copy_file_range / sendfile handlers use, so semantics stay aligned.
+    if nr == SYS_splice:
+        return _u_splice(a0, a1, a2, a3, a4, a5)
+    if nr == SYS_tee:
+        return _u_tee(a0, a1, a2, a3, a4, a5)
+    if nr == SYS_vmsplice:
+        return _u_vmsplice(a0, a1, a2, a3, a4, a5)
     # socket(2) family. U-socket: socket / connect / sendto / recvfrom
     # are now bridged to the real in-kernel TCP stack (drivers/net/
     # tcp.ad) for AF_INET + SOCK_STREAM — a user binary can complete a

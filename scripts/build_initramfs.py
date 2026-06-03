@@ -463,6 +463,13 @@ if os.environ.get("ENABLE_SYSVIPC_TEST") == "1":
 if os.environ.get("ENABLE_MQUEUE_TEST") == "1":
     FILES.append(("/etc/mqueue-test", b"1\n"))
 
+# Pipe zero-copy I/O family (splice/tee/vmsplice) self-test.
+# scripts/test_splice.sh sets ENABLE_SPLICE_TEST=1 to plant
+# /etc/splice-test; init/main.ad at boot:37.splice detects the marker
+# and runs splice_selftest().
+if os.environ.get("ENABLE_SPLICE_TEST") == "1":
+    FILES.append(("/etc/splice-test", b"1\n"))
+
 # ext4 xattr + POSIX ACL self-test. scripts/test_ext4_xattr.sh sets
 # ENABLE_EXT4XATTR_TEST=1 to plant /etc/ext4xattr-test; init/main.ad at
 # boot:37.xat detects the marker and runs ext4_xattr_selftest().
