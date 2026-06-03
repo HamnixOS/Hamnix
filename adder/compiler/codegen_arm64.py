@@ -1205,6 +1205,10 @@ class Arm64CodeGen:
         # Phase 6: ELR_EL1 is read (not just written) so the fault handler can
         # report the EL0 PC that faulted alongside the faulting data address.
         "_mrs_elr_el1":    "elr_el1",
+        # Phase 8: CNTVCT_EL0 is the always-incrementing virtual counter. The
+        # broader EL0 syscall surface exposes it as a "clock read" syscall so an
+        # EL0 task can observe monotonically advancing kernel time.
+        "_mrs_cntvct_el0": "cntvct_el0",
     }
     # name -> verbatim barrier / maintenance / wait instruction (no operands).
     _NULLARY_INTRINSICS = {

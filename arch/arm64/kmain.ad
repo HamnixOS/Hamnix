@@ -76,6 +76,23 @@ USER_STACK_TOP: uint64 = 0x40280000   # EL0 stack top (grows down), 16B-aligned
 SYS_WRITE_NR: uint64 = 64
 SYS_EXIT_NR: uint64 = 93
 
+# Phase 8: a broader EL0 syscall surface. These mirror the Linux aarch64 ABI
+# syscall numbers so the dispatch-by-x8 path proves a realistic multi-call
+# interface (args in x0..x5, return in x0). One EL0 task exercises each in turn.
+#   getpid (172): return the running task's PID.
+#   gettid (178): return the running task's TID (== PID for our single thread).
+#   sched_yield (124): voluntary yield; the kernel acknowledges and resumes.
+#   brk (214): set the program break. brk(0) queries the current break; a
+#              non-zero arg moves the break (within a fixed kernel-tracked heap
+#              window) and returns the resulting break, sbrk-style.
+#   clock_gettime-shape read (kernel-private 513): return CNTVCT_EL0 (the
+#              monotonically-advancing virtual counter) so EL0 can observe time.
+SYS_GETPID_NR: uint64 = 172
+SYS_GETTID_NR: uint64 = 178
+SYS_YIELD_NR: uint64 = 124
+SYS_BRK_NR: uint64 = 214
+SYS_CLOCK_NR: uint64 = 513
+
 # Phase 6: a deliberately-EL1-only EL0 virtual address. RAM is split into 2 MiB
 # L2 blocks; only the block at USER_L2_INDEX (0x4020_0000 .. 0x403F_FFFF) carries
 # AP[1] (EL0 access). The block at 0x4040_0000 (L2 index 2) is mapped Normal
@@ -161,6 +178,32 @@ arm64_iso_reported_a: uint64 = 0
 arm64_iso_reported_b: uint64 = 0
 # Which isolation task is currently live (0 = A, 1 = B).
 arm64_iso_cur: int64 = 0
+
+# Phase 8: broader EL0 syscall surface bookkeeping. While the multi-syscall demo
+# task runs, arm64_sys_active is non-zero so the svc dispatcher routes calls into
+# the Phase-8 handler (getpid/gettid/yield/brk/clock) instead of the Phase-4
+# write/exit-only path. arm64_sys_pid is the PID the kernel reports to the task.
+# arm64_sys_brk tracks the program break, seeded to the heap base; brk() bumps it
+# within [SYS_HEAP_BASE, SYS_HEAP_END). arm64_sys_clock_first latches the first
+# CNTVCT_EL0 the task read so the kernel can confirm a later read advanced (proving
+# the clock is live + monotonic). arm64_sys_calls counts serviced syscalls.
+arm64_sys_active: int64 = 0
+arm64_sys_pid: uint64 = 0
+arm64_sys_brk: uint64 = 0
+arm64_sys_clock_first: uint64 = 0
+arm64_sys_clock_seen: int64 = 0
+arm64_sys_calls: int64 = 0
+
+# Phase 8 program-break window. The "heap" is a fixed EL0-RWX region inside the
+# existing 2 MiB EL0 window (USER_L2_INDEX): brk() may only move the break within
+# [SYS_HEAP_BASE, SYS_HEAP_END). The demo task brk(0)s to query the initial break,
+# then brk(SYS_HEAP_BASE + 0x1000) to grow it by 4 KiB and confirms the return.
+SYS_HEAP_BASE: uint64 = 0x40230000
+SYS_HEAP_END: uint64 = 0x40238000
+SYS_HEAP_GROW: uint64 = 0x40231000     # the break the demo task requests (BASE + 4 KiB)
+
+# The fixed PID/TID the kernel assigns the single Phase-8 EL0 task.
+SYS_DEMO_PID: uint64 = 0x2A            # 42
 
 # ---------------------------------------------------------------------------
 # Identity-mapped L1 page table. A single level-1 table of 512 8-byte block
@@ -540,6 +583,14 @@ def arm64_sync_handler(frame_ptr: Ptr[uint64]) -> int64:
         _uart_puts(isobad)
         while True:
             _wfi()
+
+    # Phase 8: while the broader-syscall-surface demo is live, route by x8 into
+    # the Phase-8 handler (getpid/gettid/yield/brk/clock/write/exit). It services
+    # the call, writes the return value into the x0 frame slot, and returns 0 so
+    # the common eret path resumes EL0 — EXCEPT exit, which never returns (it
+    # halts the boot after printing the Phase-8 PASS marker).
+    if arm64_sys_active != 0:
+        return arm64_sys_dispatch(frame_ptr, nr, a0, a1, a2)
 
     ret: uint64 = cast[uint64](0)
 
@@ -1072,7 +1123,14 @@ def arm64_sched_pick(cur_ctx: uint64) -> uint64:
     if arm64_switch_count >= SWITCH_LIMIT:
         passmsg: Ptr[char] = "[arm64] EL0 preempt sched OK\n"
         _uart_puts(passmsg)
-        _msr_daifset(2)                     # mask IRQs and halt deterministically
+        # Mask IRQs (so the broader-syscall demo runs deterministically without
+        # timer re-entry) and hand off to Phase 8: a single EL0 task exercising a
+        # wider svc surface (getpid/gettid/yield/brk/clock/write/exit) dispatched
+        # by x8. arm64_run_syscall_demo() does not return (its task's exit() halts
+        # the boot), so Phase 5's PASS marker is the hand-off point to Phase 8.
+        _msr_daifset(2)
+        arm64_run_syscall_demo()
+        # Unreachable safety halt.
         while True:
             _wfi()
 
@@ -1131,6 +1189,254 @@ def arm64_start_tasks() -> int64:
     _msr_sp_el0(ctx[CTX_SP_EL0])
     _isb()
     _eret()                                  # -> task 0 at EL0; never returns here
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 8 — broader EL0 syscall surface dispatched by x8.
+#
+# A single EL0 task issues a sequence of syscalls mirroring the Linux aarch64
+# ABI (number in x8, args x0..x5, return in x0):
+#   getpid()                  -> the kernel-assigned PID (42)
+#   gettid()                  -> the TID (== PID for our single thread)
+#   sched_yield()             -> 0 (kernel acknowledges; resumes the same task)
+#   clock read (CNTVCT) x2    -> the virtual counter; the kernel latches the
+#                                first value and confirms the second ADVANCED
+#                                (live, monotonic time visible to EL0)
+#   brk(0)                    -> the current program break (queries it)
+#   brk(BASE + 4 KiB)         -> moves the break and returns the new value (sbrk)
+#   write(1, msg, len)        -> echoes a buffer to the UART, returns the length
+#   exit(0)                   -> records the code and halts the boot
+# The kernel services each call in arm64_sys_dispatch(), prints a per-call marker
+# so the test can prove every syscall ran with a correct result, and on exit(0)
+# prints the Phase-8 PASS marker.
+# ---------------------------------------------------------------------------
+
+# Phase 8 EL0 message buffer (inside the EL0 RWX window, clear of the code page
+# at USER_CODE_BASE and the heap window at SYS_HEAP_BASE).
+SYS_MSG_BASE: uint64 = 0x40222000
+
+
+# Materialise the Phase-8 EL0 routine into USER_CODE_BASE. It issues the syscall
+# sequence above. Every syscall but write needs no register args beyond x8 (or a
+# single x0 for brk), so we reuse the imm-builder for x8/x0 and emit `svc #0`.
+def arm64_build_syscall_routine(msg_len: uint64) -> int64:
+    a: uint64 = USER_CODE_BASE
+
+    # getpid(): x8 = 172; svc #0
+    a = _emit_load_imm64(a, cast[uint64](8), SYS_GETPID_NR)
+    a = _emit_word(a, cast[uint64](0xD4000001))
+
+    # gettid(): x8 = 178; svc #0
+    a = _emit_load_imm64(a, cast[uint64](8), SYS_GETTID_NR)
+    a = _emit_word(a, cast[uint64](0xD4000001))
+
+    # sched_yield(): x8 = 124; svc #0
+    a = _emit_load_imm64(a, cast[uint64](8), SYS_YIELD_NR)
+    a = _emit_word(a, cast[uint64](0xD4000001))
+
+    # clock read #1: x8 = 513; svc #0
+    a = _emit_load_imm64(a, cast[uint64](8), SYS_CLOCK_NR)
+    a = _emit_word(a, cast[uint64](0xD4000001))
+
+    # clock read #2: x8 = 513; svc #0  (kernel confirms it advanced)
+    a = _emit_load_imm64(a, cast[uint64](8), SYS_CLOCK_NR)
+    a = _emit_word(a, cast[uint64](0xD4000001))
+
+    # brk(0): x0 = 0; x8 = 214; svc #0  (query current break)
+    a = _emit_load_imm64(a, cast[uint64](0), cast[uint64](0))
+    a = _emit_load_imm64(a, cast[uint64](8), SYS_BRK_NR)
+    a = _emit_word(a, cast[uint64](0xD4000001))
+
+    # brk(SYS_HEAP_GROW): x0 = new break; x8 = 214; svc #0  (grow the heap)
+    a = _emit_load_imm64(a, cast[uint64](0), SYS_HEAP_GROW)
+    a = _emit_load_imm64(a, cast[uint64](8), SYS_BRK_NR)
+    a = _emit_word(a, cast[uint64](0xD4000001))
+
+    # write(1, msg, len): x0 = 1; x1 = msg; x2 = len; x8 = 64; svc #0
+    a = _emit_load_imm64(a, cast[uint64](0), cast[uint64](1))
+    a = _emit_load_imm64(a, cast[uint64](1), SYS_MSG_BASE)
+    a = _emit_load_imm64(a, cast[uint64](2), msg_len)
+    a = _emit_load_imm64(a, cast[uint64](8), SYS_WRITE_NR)
+    a = _emit_word(a, cast[uint64](0xD4000001))
+
+    # exit(0): x0 = 0; x8 = 93; svc #0
+    a = _emit_load_imm64(a, cast[uint64](0), cast[uint64](0))
+    a = _emit_load_imm64(a, cast[uint64](8), SYS_EXIT_NR)
+    a = _emit_word(a, cast[uint64](0xD4000001))
+
+    _dsb_ish()
+    _isb()
+    return 0
+
+
+# Phase-8 syscall dispatcher. Called from arm64_sync_handler while the broader-
+# surface demo is live, with `frame_ptr` -> the saved x0..x30 frame, `nr` the
+# syscall number (x8) and a0..a2 the first three args. Services the call, writes
+# the return value into the x0 frame slot, and returns 0 so the common eret path
+# resumes EL0 — except exit(), which halts the boot after the PASS marker.
+def arm64_sys_dispatch(frame_ptr: Ptr[uint64], nr: uint64, a0: uint64, a1: uint64, a2: uint64) -> int64:
+    arm64_sys_calls = arm64_sys_calls + 1
+    ret: uint64 = cast[uint64](0)
+
+    if nr == SYS_GETPID_NR:
+        ret = arm64_sys_pid
+        m: Ptr[char] = "[arm64] EL0 getpid -> "
+        _uart_puts(m)
+        _uart_puthex(ret)
+        nl: Ptr[char] = "\n"
+        _uart_puts(nl)
+        frame_ptr[0] = ret
+        return 0
+
+    if nr == SYS_GETTID_NR:
+        # Single-threaded task: TID == PID.
+        ret = arm64_sys_pid
+        m: Ptr[char] = "[arm64] EL0 gettid -> "
+        _uart_puts(m)
+        _uart_puthex(ret)
+        nl: Ptr[char] = "\n"
+        _uart_puts(nl)
+        frame_ptr[0] = ret
+        return 0
+
+    if nr == SYS_YIELD_NR:
+        # Voluntary yield: the kernel acknowledges and resumes the same task
+        # (there is only one Phase-8 task). Return 0 like Linux sched_yield.
+        m: Ptr[char] = "[arm64] EL0 sched_yield serviced\n"
+        _uart_puts(m)
+        frame_ptr[0] = cast[uint64](0)
+        return 0
+
+    if nr == SYS_CLOCK_NR:
+        # Read the always-incrementing virtual counter. Latch the first value;
+        # on a later read, confirm it strictly advanced (live monotonic clock).
+        now: uint64 = cast[uint64](_mrs_cntvct_el0())
+        if arm64_sys_clock_seen == 0:
+            arm64_sys_clock_first = now
+            arm64_sys_clock_seen = 1
+            m0: Ptr[char] = "[arm64] EL0 clock read #1 -> "
+            _uart_puts(m0)
+            _uart_puthex(now)
+            nl0: Ptr[char] = "\n"
+            _uart_puts(nl0)
+        else:
+            m1: Ptr[char] = "[arm64] EL0 clock read #2 -> "
+            _uart_puts(m1)
+            _uart_puthex(now)
+            nl1: Ptr[char] = "\n"
+            _uart_puts(nl1)
+            if now > arm64_sys_clock_first:
+                adv: Ptr[char] = "[arm64] EL0 clock advanced OK\n"
+                _uart_puts(adv)
+            else:
+                bad: Ptr[char] = "[arm64] EL0 clock did NOT advance FAIL\n"
+                _uart_puts(bad)
+        frame_ptr[0] = now
+        return 0
+
+    if nr == SYS_BRK_NR:
+        # brk(new): if a0 == 0, query the current break. Otherwise move it,
+        # clamped to [SYS_HEAP_BASE, SYS_HEAP_END]; return the resulting break.
+        if a0 == cast[uint64](0):
+            m: Ptr[char] = "[arm64] EL0 brk query -> "
+            _uart_puts(m)
+            _uart_puthex(arm64_sys_brk)
+            nl: Ptr[char] = "\n"
+            _uart_puts(nl)
+            frame_ptr[0] = arm64_sys_brk
+            return 0
+        if (a0 >= SYS_HEAP_BASE) and (a0 <= SYS_HEAP_END):
+            arm64_sys_brk = a0
+        # Out-of-range requests leave the break unchanged (Linux brk returns the
+        # current break on failure rather than erroring).
+        m2: Ptr[char] = "[arm64] EL0 brk set -> "
+        _uart_puts(m2)
+        _uart_puthex(arm64_sys_brk)
+        nl2: Ptr[char] = "\n"
+        _uart_puts(nl2)
+        frame_ptr[0] = arm64_sys_brk
+        return 0
+
+    if nr == SYS_WRITE_NR:
+        buf: Ptr[uint8] = cast[Ptr[uint8]](a1)
+        n: uint64 = cast[uint64](0)
+        while n < a2:
+            _uart_putc(buf[n])
+            n = n + cast[uint64](1)
+        m: Ptr[char] = "[arm64] EL0 write syscall serviced\n"
+        _uart_puts(m)
+        frame_ptr[0] = a2
+        return 0
+
+    if nr == SYS_EXIT_NR:
+        # Record the exit code; if the whole sequence ran cleanly, print PASS.
+        arm64_el0_exit_code = cast[int64](a0)
+        arm64_el0_exited = 1
+        em: Ptr[char] = "[arm64] EL0 exit syscall serviced\n"
+        _uart_puts(em)
+        if a0 == cast[uint64](0):
+            pm: Ptr[char] = "[arm64] EL0 syscall surface OK\n"
+            _uart_puts(pm)
+        else:
+            fm: Ptr[char] = "[arm64] EL0 syscall surface exited nonzero\n"
+            _uart_puts(fm)
+        # The demo is complete. Leave Phase-8 mode and halt deterministically.
+        arm64_sys_active = 0
+        _msr_daifset(2)
+        while True:
+            _wfi()
+
+    # Unknown syscall under the Phase-8 surface.
+    um: Ptr[char] = "[arm64] EL0 unknown syscall (phase 8)\n"
+    _uart_puts(um)
+    frame_ptr[0] = cast[uint64](0)
+    return 0
+
+
+# Phase-8 entry point (invoked from the Phase-5 sched PASS hand-off). Seed the
+# PID + program break, build the EL0 routine and its message, arm Phase-8 mode,
+# and ERET into the single multi-syscall EL0 task at EL0t with IRQs masked
+# (deterministic; the demo never needs preemption). Never returns here.
+def arm64_run_syscall_demo() -> int64:
+    intro: Ptr[char] = "[arm64] Phase 8: broader EL0 syscall surface\n"
+    _uart_puts(intro)
+
+    # Seed kernel-tracked per-task state for the demo.
+    arm64_sys_pid = SYS_DEMO_PID
+    arm64_sys_brk = SYS_HEAP_BASE
+    arm64_sys_clock_first = cast[uint64](0)
+    arm64_sys_clock_seen = 0
+    arm64_sys_calls = 0
+
+    # Restore the kernel's identity-only TTBR0 (Phase 7 may have left a per-task
+    # root live) so the EL0 code/heap windows resolve through L1_PGTABLE, then
+    # flush the TLB so no stale isolation translation lingers.
+    _dsb_ish()
+    _msr_ttbr0_el1(L1_PGTABLE)
+    _dsb_ish()
+    _tlbi_vmalle1is()
+    _dsb_ish()
+    _isb()
+
+    # Build the EL0 routine + its write() message.
+    sysmsg: Ptr[char] = "Hello from the EL0 syscall surface\n"
+    msg_len: uint64 = _copy_msg_to(sysmsg, SYS_MSG_BASE)
+    arm64_build_syscall_routine(msg_len)
+
+    # Clear the Phase-4/5 exit latch and arm Phase-8 dispatch.
+    arm64_el0_exited = 0
+    arm64_el0_exit_code = -1
+    arm64_sys_active = 1
+
+    enter: Ptr[char] = "[arm64] launching EL0 syscall-surface task\n"
+    _uart_puts(enter)
+
+    _msr_spsr_el1(SPSR_EL0T_DAIF)      # EL0t, IRQ/FIQ masked (deterministic)
+    _msr_elr_el1(USER_CODE_BASE)       # EL0 entry PC
+    _msr_sp_el0(USER_STACK_TOP)        # EL0 stack pointer
+    _isb()
+    _eret()                            # -> EL0; svc traps re-enter EL1; no return
     return 0
 
 
