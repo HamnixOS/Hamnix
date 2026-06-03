@@ -1,0 +1,1186 @@
+# linux_abi/u_sysvipc.ad — System V IPC for the Linux compatibility shim.
+#
+# Hamnix's NATIVE model is Plan-9 files, not SysV/POSIX IPC. But real
+# Linux software — PostgreSQL, Apache's prefork MPM, countless daemons —
+# reaches for shmget/shmat, semget/semop, msgget/msgsnd/msgrcv before it
+# will even start. This module supplies those System V IPC syscalls to
+# the Linux-ABI surface ONLY. It lives in linux_abi/ (Layer 2); the
+# native kernel never links it.
+#
+# Design notes
+# ------------
+#  * Fixed pools of module-scope Array globals (no dynamic IPC-object
+#    allocation): 64 semaphore sets x 32 sems, 64 message queues with a
+#    bounded byte budget each, 64 shared-memory segments. Big buffers are
+#    module-scope Arrays per the Adder big-buffer rule.
+#
+#  * BLOCKING is built on the SAME cooperative wait/wake primitive the
+#    futex code uses (linux_abi/u_syscalls.ad _u_futex): a `yield_to_others()`
+#    loop that re-checks the wait condition each turn. There is no separate
+#    scheduler primitive — semop's "decrement would go negative" parks the
+#    caller by yielding until another task raises the value (or the set is
+#    removed). Same for msgsnd-when-full / msgrcv-when-empty. This matches
+#    how Hamnix already parks futex waiters and pipe readers. The park is
+#    BUDGETED (SYSV_BLOCK_BUDGET yields) exactly like _u_futex's bounded
+#    park, so a peerless single-core workload can't deadlock — it returns
+#    -EAGAIN, which SysV callers retry.
+#
+#  * SEM_UNDO is accepted and IGNORED. Hamnix has no per-task undo list;
+#    a task that exits holding a semaphore does not auto-restore it. This
+#    is documented here and is acceptable for the bring-up workload (the
+#    daemons we target use SEM_UNDO defensively, not for correctness on
+#    every op). A future milestone can add a per-task undo journal.
+#
+#  * Shared memory is GENUINELY cross-process. Hamnix runs user vaddr ==
+#    phys (the boot identity map; every task clones the pristine boot PML4
+#    in kernel/sched/core.ad create_user_task, so the whole boot identity
+#    range is mapped US=1/RW=1 in EVERY task's page table). A segment's
+#    backing pages are allocated ONCE (alloc_pages, lazily on first
+#    attach) and their identity-mapped physical address IS what shmat
+#    returns to every attacher. Two processes that attach the same segment
+#    therefore read & write the SAME physical frames at the SAME address —
+#    real coherence, no copy. shmat deliberately does NOT route through
+#    vma_alloc: a not-enclosed MAP_FIXED vma_alloc would ALLOCATE FRESH
+#    pages and clobber the shared frames; the identity map already maps
+#    the segment, so returning the phys address is the complete mapping.
+#
+# Compiler-quirk note: Adder has a flat global symbol namespace across
+# merged modules, so every helper here is prefixed `_ipc_`/`_sysv_`/
+# `sysv_` and every constant `SYSV_`/`IPC_`/`SEM_`/`MSG_`/`SHM_`.
+
+from kernel.printk.printk import (
+    printk0, printk1, printk2,
+)
+from kernel.sched.core import (
+    current_task_pid, current_idx_get, yield_to_others,
+)
+from arch.x86.kernel.time import get_jiffies
+from mm.page_alloc import alloc_pages, free_pages
+from mm.uaccess import (
+    copy_from_user, copy_to_user,
+    get_user_64, put_user_64,
+)
+
+
+# ---------------------------------------------------------------------
+# Linux ABI constants (from <linux/ipc.h>, <linux/sem.h>, <linux/msg.h>,
+# <linux/shm.h>). Same numeric values Linux userspace passes.
+# ---------------------------------------------------------------------
+
+IPC_PRIVATE:  uint64 = 0           # key_t IPC_PRIVATE — always-new object
+IPC_CREAT:    uint64 = 0x200       # 01000  — create if key absent
+IPC_EXCL:     uint64 = 0x400       # 02000  — fail if key exists (with CREAT)
+IPC_NOWAIT:   uint64 = 0x800       # 04000  — non-blocking op
+
+IPC_RMID:     uint64 = 0           # remove the object
+IPC_SET:      uint64 = 1           # set ipc_perm (accepted, minimal)
+IPC_STAT:     uint64 = 2           # copy out the *_ds metadata
+
+# semctl cmds. semctl's `cmd` space is distinct from the *get* flags.
+SEM_GETPID:   uint64 = 11
+SEM_GETVAL:   uint64 = 12
+SEM_GETALL:   uint64 = 13
+SEM_GETNCNT:  uint64 = 14
+SEM_GETZCNT:  uint64 = 15
+SEM_SETVAL:   uint64 = 16
+SEM_SETALL:   uint64 = 17
+
+# msgrcv flags / shmat flags
+MSG_NOERROR:  uint64 = 0x1000      # truncate oversized message silently
+SHM_RDONLY:   uint64 = 0x1000      # attach read-only
+
+# Linux errnos (negative; same values as the rest of the Linux shim).
+SYSV_EPERM:   int64 = -1
+SYSV_ENOENT:  int64 = -2
+SYSV_E2BIG:   int64 = -7
+SYSV_EAGAIN:  int64 = -11
+SYSV_ENOMEM:  int64 = -12
+SYSV_EACCES:  int64 = -13
+SYSV_EFAULT:  int64 = -14
+SYSV_EEXIST:  int64 = -17
+SYSV_EINVAL:  int64 = -22
+SYSV_ENOSPC:  int64 = -28
+SYSV_ERANGE:  int64 = -34
+SYSV_IDRM:    int64 = -43          # EIDRM — identifier removed
+
+
+# ---------------------------------------------------------------------
+# Pool geometry
+# ---------------------------------------------------------------------
+
+SYSV_NSEMSETS:  uint64 = 64        # number of semaphore SETS
+SYSV_SEMMSL:    uint64 = 32        # max sems per set (Linux SEMMSL)
+SYSV_NMSGQ:     uint64 = 64        # number of message queues
+SYSV_MSGQ_CAP:  uint64 = 8192      # per-queue byte budget (msg_qbytes)
+SYSV_MSGQ_SLOTS: uint64 = 64       # max messages parked per queue
+SYSV_MSG_MAXTEXT: uint64 = 1024    # max bytes of one message's text
+SYSV_NSHM:      uint64 = 64        # number of shared-memory segments
+
+# Block-loop budget: how many yields a blocking op spins before giving up
+# and returning -EAGAIN (mirrors _u_futex's bounded park — a workload with
+# no live peer to raise the value must not deadlock the single core).
+SYSV_BLOCK_BUDGET: uint64 = 4096
+
+
+# =====================================================================
+# Semaphore sets
+# =====================================================================
+#
+# A "set" is SYSV_SEMMSL semaphore counters. semget allocates a set;
+# semop applies a batch of (sem_num, sem_op, sem_flg) operations
+# all-or-none: if any op would block we apply NONE this pass and park,
+# matching SysV's atomic-batch semantics.
+
+sem_used:  Array[64, uint8]        # 1 = this set is live
+sem_key:   Array[64, int64]        # the key it was created with (-1 == PRIVATE)
+sem_nsems: Array[64, uint64]       # number of sems in the set
+sem_ctime: Array[64, uint64]       # creation jiffies (sem_ctime)
+sem_otime: Array[64, uint64]       # last-op jiffies (sem_otime)
+# Flat [set * SEMMSL + n] counter + last-pid storage.
+sem_val:   Array[2048, int32]      # 64 * 32 semaphore values
+sem_pid:   Array[2048, uint64]     # sempid of the last op on each sem
+
+
+def _sem_idx(set_i: uint64, n: uint64) -> uint64:
+    return set_i * SYSV_SEMMSL + n
+
+
+def _sysv_sem_find_key(key: int64) -> int64:
+    # Return the set index that owns `key`, or -1 if none.
+    i: uint64 = 0
+    while i < SYSV_NSEMSETS:
+        if sem_used[i] != 0 and sem_key[i] == key:
+            return cast[int64](i)
+        i = i + 1
+    return -1
+
+
+def _sysv_sem_alloc(key: int64, nsems: uint64) -> int64:
+    # Claim a free set slot, zero its sems. Returns the semid or -ENOSPC.
+    i: uint64 = 0
+    while i < SYSV_NSEMSETS:
+        if sem_used[i] == 0:
+            sem_used[i] = 1
+            sem_key[i] = key
+            sem_nsems[i] = nsems
+            sem_ctime[i] = get_jiffies()
+            sem_otime[i] = 0
+            n: uint64 = 0
+            while n < SYSV_SEMMSL:
+                sem_val[_sem_idx(i, n)] = 0
+                sem_pid[_sem_idx(i, n)] = 0
+                n = n + 1
+            return cast[int64](i)
+        i = i + 1
+    return SYSV_ENOSPC
+
+
+def _sysv_semget(key: uint64, nsems: uint64, semflg: uint64) -> int64:
+    # int semget(key_t key, int nsems, int semflg)
+    if nsems > SYSV_SEMMSL:
+        return SYSV_EINVAL
+    if key == IPC_PRIVATE:
+        if nsems == 0:
+            return SYSV_EINVAL
+        return _sysv_sem_alloc(-1, nsems)
+    keyi: int64 = cast[int64](key)
+    existing: int64 = _sysv_sem_find_key(keyi)
+    if existing >= 0:
+        if (semflg & IPC_CREAT) != 0 and (semflg & IPC_EXCL) != 0:
+            return SYSV_EEXIST
+        # nsems==0 means "don't care how many"; else it must not exceed
+        # the existing set's count.
+        if nsems != 0 and nsems > sem_nsems[cast[uint64](existing)]:
+            return SYSV_EINVAL
+        return existing
+    if (semflg & IPC_CREAT) == 0:
+        return SYSV_ENOENT
+    if nsems == 0:
+        return SYSV_EINVAL
+    return _sysv_sem_alloc(keyi, nsems)
+
+
+# sembuf: { unsigned short sem_num; short sem_op; short sem_flg; } = 6 bytes.
+SYSV_SEMBUF_SZ: uint64 = 6
+
+
+def _sysv_semop(semid: uint64, sops_u: uint64, nsops: uint64) -> int64:
+    # int semop(int semid, struct sembuf *sops, size_t nsops)
+    if semid >= SYSV_NSEMSETS:
+        return SYSV_EINVAL
+    if sem_used[semid] == 0:
+        return SYSV_EINVAL
+    if nsops == 0:
+        return SYSV_EINVAL
+    if nsops > SYSV_SEMMSL:
+        return SYSV_E2BIG
+    nset: uint64 = sem_nsems[semid]
+    # Pull the sembuf array in via uaccess so a bad pointer is -EFAULT.
+    total: uint64 = nsops * SYSV_SEMBUF_SZ
+    if copy_from_user(cast[uint64](&sembuf_scratch[0]), sops_u, total) != 0:
+        return SYSV_EFAULT
+    # Validate sem_num up front (Linux validates the whole batch first).
+    op: uint64 = 0
+    while op < nsops:
+        snum: uint16 = cast[Ptr[uint16]](&sembuf_scratch[op * SYSV_SEMBUF_SZ])[0]
+        if cast[uint64](snum) >= nset:
+            return SYSV_ERANGE
+        op = op + 1
+    # Apply-or-block loop. Each pass tries to apply ALL ops; if any op
+    # would block (decrement below 0, or wait-for-zero on a non-zero sem)
+    # we apply NOTHING this pass and yield, then retry.
+    pid: uint64 = current_task_pid()
+    budget: uint64 = 0
+    do:
+        # Re-validate the set still exists each turn (IPC_RMID wakes us).
+        if sem_used[semid] == 0:
+            return SYSV_IDRM
+        # Check whether the whole batch can apply right now.
+        can: int32 = 1
+        op = 0
+        while op < nsops:
+            base: uint64 = op * SYSV_SEMBUF_SZ
+            snum: uint16 = cast[Ptr[uint16]](&sembuf_scratch[base])[0]
+            semop_v: int16 = cast[Ptr[int16]](&sembuf_scratch[base + 2])[0]
+            cur: int32 = sem_val[_sem_idx(semid, cast[uint64](snum))]
+            if semop_v == 0:
+                # wait-for-zero
+                if cur != 0:
+                    can = 0
+            else:
+                if cur + cast[int32](semop_v) < 0:
+                    can = 0
+            op = op + 1
+        if can != 0:
+            # Apply the whole batch.
+            op = 0
+            while op < nsops:
+                base2: uint64 = op * SYSV_SEMBUF_SZ
+                snum2: uint16 = cast[Ptr[uint16]](&sembuf_scratch[base2])[0]
+                semop_v2: int16 = cast[Ptr[int16]](&sembuf_scratch[base2 + 2])[0]
+                idx: uint64 = _sem_idx(semid, cast[uint64](snum2))
+                sem_val[idx] = sem_val[idx] + cast[int32](semop_v2)
+                sem_pid[idx] = pid
+                op = op + 1
+            sem_otime[semid] = get_jiffies()
+            return 0
+        # Cannot apply now. Honour IPC_NOWAIT if ANY op set it.
+        nowait_block: int32 = 0
+        op = 0
+        while op < nsops:
+            base3: uint64 = op * SYSV_SEMBUF_SZ
+            flg: uint16 = cast[Ptr[uint16]](&sembuf_scratch[base3 + 4])[0]
+            if (cast[uint64](flg) & IPC_NOWAIT) != 0:
+                nowait_block = 1
+            op = op + 1
+        if nowait_block != 0:
+            return SYSV_EAGAIN
+        # Block: yield and re-check. Bounded so a peerless workload can't
+        # deadlock the single core (mirrors _u_futex's budgeted park).
+        yield_to_others()
+        budget = budget + 1
+        if budget >= SYSV_BLOCK_BUDGET:
+            return SYSV_EAGAIN
+    while 1
+    return 0
+
+
+# semid_ds (the subset IPC_STAT consumers read). Linux's struct is
+# arch-dependent; we emit the x86_64 layout's load-bearing fields:
+#   off 0:  struct ipc_perm sem_perm (we fill __key; uid/gid/mode = 0)
+#   off 40: __kernel_time_t sem_otime
+#   off 48: __kernel_time_t sem_ctime
+#   off 56: unsigned long    sem_nsems
+# Total size we copy out: 64 bytes (zero-filled then patched).
+SYSV_SEMID_DS_SZ: uint64 = 64
+
+
+def _sysv_semctl(semid: uint64, semnum: uint64, cmd: uint64,
+                 arg: uint64) -> int64:
+    # int semctl(int semid, int semnum, int cmd, union semun arg)
+    # `arg` carries either an int val (SETVAL) or a pointer (GETALL/SETALL/
+    # IPC_STAT) depending on cmd — the union is passed by value as the 4th
+    # syscall arg (glibc packs the union's first member there).
+    if semid >= SYSV_NSEMSETS:
+        return SYSV_EINVAL
+    if sem_used[semid] == 0:
+        return SYSV_IDRM
+    nset: uint64 = sem_nsems[semid]
+    if cmd == IPC_RMID:
+        sem_used[semid] = 0
+        sem_key[semid] = 0
+        # Waiters in semop re-check sem_used each turn and return -EIDRM.
+        return 0
+    if cmd == SEM_GETVAL:
+        if semnum >= nset:
+            return SYSV_EINVAL
+        return cast[int64](sem_val[_sem_idx(semid, semnum)])
+    if cmd == SEM_GETPID:
+        if semnum >= nset:
+            return SYSV_EINVAL
+        return cast[int64](sem_pid[_sem_idx(semid, semnum)])
+    if cmd == SEM_SETVAL:
+        if semnum >= nset:
+            return SYSV_EINVAL
+        sem_val[_sem_idx(semid, semnum)] = cast[int32](cast[int64](arg) & 0xFFFFFFFF)
+        sem_pid[_sem_idx(semid, semnum)] = current_task_pid()
+        sem_otime[semid] = get_jiffies()
+        return 0
+    if cmd == SEM_GETALL:
+        # arg is `unsigned short *array`. Copy each sem value out as u16.
+        n: uint64 = 0
+        while n < nset:
+            v: uint16 = cast[uint16](sem_val[_sem_idx(semid, n)] & 0xFFFF)
+            if copy_to_user(arg + n * 2, cast[uint64](&v), 2) != 0:
+                return SYSV_EFAULT
+            n = n + 1
+        return 0
+    if cmd == SEM_SETALL:
+        # arg is `unsigned short *array`. Read each value in.
+        n2: uint64 = 0
+        while n2 < nset:
+            v2: uint16 = 0
+            if copy_from_user(cast[uint64](&v2), arg + n2 * 2, 2) != 0:
+                return SYSV_EFAULT
+            sem_val[_sem_idx(semid, n2)] = cast[int32](cast[uint32](v2))
+            sem_pid[_sem_idx(semid, n2)] = current_task_pid()
+            n2 = n2 + 1
+        sem_otime[semid] = get_jiffies()
+        return 0
+    if cmd == IPC_STAT:
+        # Zero the scratch, patch in the load-bearing fields, copy out.
+        i: uint64 = 0
+        while i < SYSV_SEMID_DS_SZ:
+            ds_scratch[i] = 0
+            i = i + 1
+        # ipc_perm.__key at offset 0 (int32).
+        cast[Ptr[int32]](&ds_scratch[0])[0] = cast[int32](sem_key[semid] & 0xFFFFFFFF)
+        # sem_otime @40, sem_ctime @48, sem_nsems @56 (unsigned long).
+        cast[Ptr[uint64]](&ds_scratch[40])[0] = sem_otime[semid]
+        cast[Ptr[uint64]](&ds_scratch[48])[0] = sem_ctime[semid]
+        cast[Ptr[uint64]](&ds_scratch[56])[0] = nset
+        if copy_to_user(arg, cast[uint64](&ds_scratch[0]), SYSV_SEMID_DS_SZ) != 0:
+            return SYSV_EFAULT
+        return 0
+    if cmd == IPC_SET:
+        # We carry no mutable uid/gid/mode worth honouring; accept it.
+        sem_ctime[semid] = get_jiffies()
+        return 0
+    return SYSV_EINVAL
+
+
+# =====================================================================
+# Message queues
+# =====================================================================
+#
+# Each queue holds up to SYSV_MSGQ_SLOTS messages, FIFO within a type.
+# A message is (mtype: int64, length, text bytes). The per-queue byte
+# budget (SYSV_MSGQ_CAP) bounds the sum of resident message text.
+
+msg_used:  Array[64, uint8]
+msg_key:   Array[64, int64]
+msg_qnum:  Array[64, uint64]       # live message count
+msg_qbytes: Array[64, uint64]      # resident text bytes
+msg_ctime: Array[64, uint64]
+msg_stime: Array[64, uint64]       # last msgsnd
+msg_rtime: Array[64, uint64]       # last msgrcv
+msg_lspid: Array[64, uint64]       # last send pid
+msg_lrpid: Array[64, uint64]       # last recv pid
+msg_seq_counter: Array[64, uint64] # monotonic FIFO stamp per queue
+
+# Per-slot message metadata + a flat text store. Index [queue*SLOTS + s].
+msg_slot_live: Array[4096, uint8]     # 64 * 64
+msg_slot_type: Array[4096, int64]
+msg_slot_len:  Array[4096, uint64]
+msg_slot_seq:  Array[4096, uint64]    # FIFO sequence stamp
+# text store: [(queue*SLOTS + s) * MAXTEXT]
+msg_text: Array[4194304, uint8]       # 64*64*1024 = 4 MiB
+
+
+def _msg_slot(q: uint64, s: uint64) -> uint64:
+    return q * SYSV_MSGQ_SLOTS + s
+
+
+def _msg_text_base(q: uint64, s: uint64) -> uint64:
+    return _msg_slot(q, s) * SYSV_MSG_MAXTEXT
+
+
+def _sysv_msg_find_key(key: int64) -> int64:
+    i: uint64 = 0
+    while i < SYSV_NMSGQ:
+        if msg_used[i] != 0 and msg_key[i] == key:
+            return cast[int64](i)
+        i = i + 1
+    return -1
+
+
+def _sysv_msg_alloc(key: int64) -> int64:
+    i: uint64 = 0
+    while i < SYSV_NMSGQ:
+        if msg_used[i] == 0:
+            msg_used[i] = 1
+            msg_key[i] = key
+            msg_qnum[i] = 0
+            msg_qbytes[i] = 0
+            msg_ctime[i] = get_jiffies()
+            msg_stime[i] = 0
+            msg_rtime[i] = 0
+            msg_lspid[i] = 0
+            msg_lrpid[i] = 0
+            msg_seq_counter[i] = 0
+            s: uint64 = 0
+            while s < SYSV_MSGQ_SLOTS:
+                msg_slot_live[_msg_slot(i, s)] = 0
+                s = s + 1
+            return cast[int64](i)
+        i = i + 1
+    return SYSV_ENOSPC
+
+
+def _sysv_msgget(key: uint64, msgflg: uint64) -> int64:
+    # int msgget(key_t key, int msgflg)
+    if key == IPC_PRIVATE:
+        return _sysv_msg_alloc(-1)
+    keyi: int64 = cast[int64](key)
+    existing: int64 = _sysv_msg_find_key(keyi)
+    if existing >= 0:
+        if (msgflg & IPC_CREAT) != 0 and (msgflg & IPC_EXCL) != 0:
+            return SYSV_EEXIST
+        return existing
+    if (msgflg & IPC_CREAT) == 0:
+        return SYSV_ENOENT
+    return _sysv_msg_alloc(keyi)
+
+
+def _msg_free_slot(q: uint64) -> int64:
+    s: uint64 = 0
+    while s < SYSV_MSGQ_SLOTS:
+        if msg_slot_live[_msg_slot(q, s)] == 0:
+            return cast[int64](s)
+        s = s + 1
+    return -1
+
+
+def _sysv_msgsnd(msqid: uint64, msgp_u: uint64, msgsz: uint64,
+                 msgflg: uint64) -> int64:
+    # int msgsnd(int msqid, const void *msgp, size_t msgsz, int msgflg)
+    # msgp -> struct msgbuf { long mtype; char mtext[]; }
+    if msqid >= SYSV_NMSGQ:
+        return SYSV_EINVAL
+    if msg_used[msqid] == 0:
+        return SYSV_EINVAL
+    if msgsz > SYSV_MSG_MAXTEXT:
+        return SYSV_EINVAL
+    # Read mtype (8-byte long) first.
+    mtype: uint64 = 0
+    if get_user_64(msgp_u, cast[Ptr[uint64]](&mtype)) != 0:
+        return SYSV_EFAULT
+    if cast[int64](mtype) < 1:
+        return SYSV_EINVAL
+    # Block-while-full loop. Full == no free slot OR byte budget exceeded.
+    budget: uint64 = 0
+    do:
+        if msg_used[msqid] == 0:
+            return SYSV_IDRM
+        free_s: int64 = _msg_free_slot(msqid)
+        fits_bytes: int32 = 0
+        if msg_qbytes[msqid] + msgsz <= SYSV_MSGQ_CAP:
+            fits_bytes = 1
+        if free_s >= 0 and fits_bytes != 0:
+            s: uint64 = cast[uint64](free_s)
+            # Pull the text in past the 8-byte mtype header.
+            if msgsz > 0:
+                if copy_from_user(cast[uint64](&msg_text[_msg_text_base(msqid, s)]),
+                                  msgp_u + 8, msgsz) != 0:
+                    return SYSV_EFAULT
+            msg_slot_live[_msg_slot(msqid, s)] = 1
+            msg_slot_type[_msg_slot(msqid, s)] = cast[int64](mtype)
+            msg_slot_len[_msg_slot(msqid, s)] = msgsz
+            msg_seq_counter[msqid] = msg_seq_counter[msqid] + 1
+            msg_slot_seq[_msg_slot(msqid, s)] = msg_seq_counter[msqid]
+            msg_qnum[msqid] = msg_qnum[msqid] + 1
+            msg_qbytes[msqid] = msg_qbytes[msqid] + msgsz
+            msg_stime[msqid] = get_jiffies()
+            msg_lspid[msqid] = current_task_pid()
+            return 0
+        if (msgflg & IPC_NOWAIT) != 0:
+            return SYSV_EAGAIN
+        yield_to_others()
+        budget = budget + 1
+        if budget >= SYSV_BLOCK_BUDGET:
+            return SYSV_EAGAIN
+    while 1
+    return 0
+
+
+def _msg_pick(q: uint64, msgtyp: int64) -> int64:
+    # Choose the slot to deliver per msgrcv's msgtyp rules:
+    #   msgtyp == 0 : first (lowest seq) message of any type
+    #   msgtyp >  0 : first message of exactly that type
+    #   msgtyp <  0 : first message of the LOWEST type that is <= |msgtyp|
+    # Returns the slot index, or -1 if no eligible message is present.
+    best: int64 = -1
+    best_seq: uint64 = 0
+    best_type: int64 = 0
+    s: uint64 = 0
+    while s < SYSV_MSGQ_SLOTS:
+        idx: uint64 = _msg_slot(q, s)
+        if msg_slot_live[idx] != 0:
+            t: int64 = msg_slot_type[idx]
+            seq: uint64 = msg_slot_seq[idx]
+            eligible: int32 = 0
+            if msgtyp == 0:
+                eligible = 1
+            elif msgtyp > 0:
+                if t == msgtyp:
+                    eligible = 1
+            else:
+                # msgtyp < 0
+                lim: int64 = 0 - msgtyp
+                if t <= lim:
+                    eligible = 1
+            if eligible != 0:
+                take: int32 = 0
+                if best < 0:
+                    take = 1
+                elif msgtyp < 0:
+                    # lowest type wins; ties broken by FIFO seq
+                    if t < best_type:
+                        take = 1
+                    elif t == best_type and seq < best_seq:
+                        take = 1
+                else:
+                    # FIFO: lowest seq wins
+                    if seq < best_seq:
+                        take = 1
+                if take != 0:
+                    best = cast[int64](s)
+                    best_seq = seq
+                    best_type = t
+        s = s + 1
+    return best
+
+
+def _sysv_msgrcv(msqid: uint64, msgp_u: uint64, msgsz: uint64,
+                 msgtyp: int64, msgflg: uint64) -> int64:
+    # ssize_t msgrcv(int msqid, void *msgp, size_t msgsz, long msgtyp,
+    #                int msgflg)
+    if msqid >= SYSV_NMSGQ:
+        return SYSV_EINVAL
+    if msg_used[msqid] == 0:
+        return SYSV_EINVAL
+    budget: uint64 = 0
+    do:
+        if msg_used[msqid] == 0:
+            return SYSV_IDRM
+        s64: int64 = _msg_pick(msqid, msgtyp)
+        if s64 >= 0:
+            s: uint64 = cast[uint64](s64)
+            idx: uint64 = _msg_slot(msqid, s)
+            mlen: uint64 = msg_slot_len[idx]
+            copy_len: uint64 = mlen
+            if copy_len > msgsz:
+                if (msgflg & MSG_NOERROR) != 0:
+                    copy_len = msgsz
+                else:
+                    return SYSV_E2BIG
+            # Write the mtype header (8-byte long) then the text.
+            mt: uint64 = cast[uint64](msg_slot_type[idx])
+            if put_user_64(mt, msgp_u) != 0:
+                return SYSV_EFAULT
+            if copy_len > 0:
+                if copy_to_user(msgp_u + 8,
+                                cast[uint64](&msg_text[_msg_text_base(msqid, s)]),
+                                copy_len) != 0:
+                    return SYSV_EFAULT
+            # Remove the message.
+            msg_slot_live[idx] = 0
+            msg_qnum[msqid] = msg_qnum[msqid] - 1
+            msg_qbytes[msqid] = msg_qbytes[msqid] - mlen
+            msg_rtime[msqid] = get_jiffies()
+            msg_lrpid[msqid] = current_task_pid()
+            return cast[int64](copy_len)
+        if (msgflg & IPC_NOWAIT) != 0:
+            return SYSV_ENOMSG
+        yield_to_others()
+        budget = budget + 1
+        if budget >= SYSV_BLOCK_BUDGET:
+            return SYSV_ENOMSG
+    while 1
+    return 0
+
+
+# msgrcv with IPC_NOWAIT and no matching message returns -ENOMSG (-42).
+SYSV_ENOMSG: int64 = -42
+
+
+# msqid_ds load-bearing fields (x86_64):
+#   off 0:  struct ipc_perm msg_perm
+#   off 40: __kernel_time_t msg_stime
+#   off 48: __kernel_time_t msg_rtime
+#   off 56: __kernel_time_t msg_ctime
+#   off 64: unsigned long   __msg_cbytes
+#   off 72: msgqnum_t       msg_qnum
+#   off 80: msglen_t        msg_qbytes
+#   off 88: pid_t           msg_lspid
+#   off 92: pid_t           msg_lrpid
+SYSV_MSQID_DS_SZ: uint64 = 96
+
+
+def _sysv_msgctl(msqid: uint64, cmd: uint64, buf_u: uint64) -> int64:
+    # int msgctl(int msqid, int cmd, struct msqid_ds *buf)
+    if msqid >= SYSV_NMSGQ:
+        return SYSV_EINVAL
+    if msg_used[msqid] == 0:
+        return SYSV_IDRM
+    if cmd == IPC_RMID:
+        msg_used[msqid] = 0
+        msg_key[msqid] = 0
+        return 0
+    if cmd == IPC_STAT:
+        i: uint64 = 0
+        while i < SYSV_MSQID_DS_SZ:
+            ds_scratch[i] = 0
+            i = i + 1
+        cast[Ptr[int32]](&ds_scratch[0])[0] = cast[int32](msg_key[msqid] & 0xFFFFFFFF)
+        cast[Ptr[uint64]](&ds_scratch[40])[0] = msg_stime[msqid]
+        cast[Ptr[uint64]](&ds_scratch[48])[0] = msg_rtime[msqid]
+        cast[Ptr[uint64]](&ds_scratch[56])[0] = msg_ctime[msqid]
+        cast[Ptr[uint64]](&ds_scratch[64])[0] = msg_qbytes[msqid]
+        cast[Ptr[uint64]](&ds_scratch[72])[0] = msg_qnum[msqid]
+        cast[Ptr[uint64]](&ds_scratch[80])[0] = SYSV_MSGQ_CAP
+        cast[Ptr[uint32]](&ds_scratch[88])[0] = cast[uint32](msg_lspid[msqid])
+        cast[Ptr[uint32]](&ds_scratch[92])[0] = cast[uint32](msg_lrpid[msqid])
+        if copy_to_user(buf_u, cast[uint64](&ds_scratch[0]), SYSV_MSQID_DS_SZ) != 0:
+            return SYSV_EFAULT
+        return 0
+    if cmd == IPC_SET:
+        msg_ctime[msqid] = get_jiffies()
+        return 0
+    return SYSV_EINVAL
+
+
+# =====================================================================
+# Shared memory
+# =====================================================================
+#
+# A segment's backing pages are allocated ONCE (alloc_pages) the first
+# time the segment is attached, then their identity-mapped address is
+# returned to every attacher — genuine cross-process sharing under the
+# vaddr==phys identity map. shmctl(IPC_RMID) marks for removal; the
+# pages are freed on the last detach (or immediately if unattached).
+
+SYSV_SHM_PAGE: uint64 = 0x1000
+
+
+shm_used:   Array[64, uint8]
+shm_key:    Array[64, int64]
+shm_size:   Array[64, uint64]      # requested size (bytes)
+shm_pages:  Array[64, uint64]      # rounded page count
+shm_order:  Array[64, int32]       # alloc_pages order for the backing
+shm_phys:   Array[64, uint64]      # backing physical/identity base (0 = unbacked)
+shm_nattch: Array[64, uint64]      # current attach count
+shm_ctime:  Array[64, uint64]
+shm_atime:  Array[64, uint64]
+shm_dtime:  Array[64, uint64]
+shm_cpid:   Array[64, uint64]      # creator pid
+shm_lpid:   Array[64, uint64]      # last attach/detach pid
+shm_rmid:   Array[64, uint8]       # 1 = marked for removal (IPC_RMID pending)
+
+
+def _order_for_pages(npages: uint64) -> int32:
+    # Smallest buddy order whose 2^order page count covers npages.
+    order: int32 = 0
+    cover: uint64 = 1
+    while cover < npages:
+        cover = cover * 2
+        order = order + 1
+        if order > 10:                 # buddy MAX_ORDER == 10 (4 MiB)
+            return -1
+    return order
+
+
+def _sysv_shm_find_key(key: int64) -> int64:
+    i: uint64 = 0
+    while i < SYSV_NSHM:
+        if shm_used[i] != 0 and shm_key[i] == key:
+            return cast[int64](i)
+        i = i + 1
+    return -1
+
+
+def _sysv_shm_alloc(key: int64, size: uint64) -> int64:
+    npages: uint64 = (size + SYSV_SHM_PAGE - 1) / SYSV_SHM_PAGE
+    if npages == 0:
+        npages = 1
+    order: int32 = _order_for_pages(npages)
+    if order < 0:
+        return SYSV_EINVAL
+    i: uint64 = 0
+    while i < SYSV_NSHM:
+        if shm_used[i] == 0:
+            shm_used[i] = 1
+            shm_key[i] = key
+            shm_size[i] = size
+            shm_pages[i] = npages
+            shm_order[i] = order
+            shm_phys[i] = 0            # lazy: backed on first attach
+            shm_nattch[i] = 0
+            shm_ctime[i] = get_jiffies()
+            shm_atime[i] = 0
+            shm_dtime[i] = 0
+            shm_cpid[i] = current_task_pid()
+            shm_lpid[i] = 0
+            shm_rmid[i] = 0
+            return cast[int64](i)
+        i = i + 1
+    return SYSV_ENOSPC
+
+
+def _sysv_shmget(key: uint64, size: uint64, shmflg: uint64) -> int64:
+    # int shmget(key_t key, size_t size, int shmflg)
+    if key == IPC_PRIVATE:
+        if size == 0:
+            return SYSV_EINVAL
+        return _sysv_shm_alloc(-1, size)
+    keyi: int64 = cast[int64](key)
+    existing: int64 = _sysv_shm_find_key(keyi)
+    if existing >= 0:
+        if (shmflg & IPC_CREAT) != 0 and (shmflg & IPC_EXCL) != 0:
+            return SYSV_EEXIST
+        # A non-zero size that EXCEEDS the existing segment is -EINVAL.
+        if size != 0 and size > shm_size[cast[uint64](existing)]:
+            return SYSV_EINVAL
+        return existing
+    if (shmflg & IPC_CREAT) == 0:
+        return SYSV_ENOENT
+    if size == 0:
+        return SYSV_EINVAL
+    return _sysv_shm_alloc(keyi, size)
+
+
+def _sysv_shm_ensure_backed(shmid: uint64) -> int64:
+    # Allocate the segment's backing pages if not yet present. Returns 0
+    # on success or a negative errno. The pages are zero-filled (Linux
+    # guarantees a fresh shm segment reads as zero).
+    if shm_phys[shmid] != 0:
+        return 0
+    base: uint64 = alloc_pages(shm_order[shmid])
+    if base == 0:
+        return SYSV_ENOMEM
+    # Zero the whole backing extent.
+    nbytes: uint64 = shm_pages[shmid] * SYSV_SHM_PAGE
+    p: uint64 = 0
+    while p < nbytes:
+        cast[Ptr[uint8]](base + p)[0] = 0
+        p = p + 1
+    shm_phys[shmid] = base
+    return 0
+
+
+def _sysv_shmat(shmid: uint64, shmaddr: uint64, shmflg: uint64) -> int64:
+    # void *shmat(int shmid, const void *shmaddr, int shmflg)
+    #
+    # CROSS-PROCESS COHERENCE: Hamnix runs user vaddr == phys (the boot
+    # identity map; every task clones the pristine boot PML4, so the whole
+    # boot identity range is mapped US=1/RW=1 in EVERY task's page table —
+    # see kernel/sched/core.ad create_user_task). The segment's backing
+    # pages are allocated ONCE (alloc_pages, lazily on first attach) and
+    # their identity-mapped physical address IS the attach address handed
+    # to every attacher. Two processes that attach the same segment
+    # therefore read & write the SAME physical frames at the SAME address
+    # — genuine SysV shared memory, no copy.
+    #
+    # We deliberately do NOT route the attach through vma_alloc: a
+    # MAP_FIXED vma_alloc at a not-enclosed address ALLOCATES FRESH backing
+    # pages (mm/vma.ad _vma_alloc_fixed_at), which would clobber the shared
+    # frames and break coherence. The pages are already mapped by the
+    # identity stamp, so returning `phys` is the correct (and complete)
+    # mapping. A non-zero `shmaddr` hint is ignored (Linux lets the kernel
+    # choose when shmaddr==0). SHM_RDONLY is accepted; the identity map is
+    # RW, so a read-only attach is not separately page-protected here.
+    if shmid >= SYSV_NSHM:
+        return SYSV_EINVAL
+    if shm_used[shmid] == 0:
+        return SYSV_EINVAL
+    if _sysv_shm_ensure_backed(shmid) != 0:
+        return SYSV_ENOMEM
+    phys: uint64 = shm_phys[shmid]
+    shm_nattch[shmid] = shm_nattch[shmid] + 1
+    shm_atime[shmid] = get_jiffies()
+    shm_lpid[shmid] = current_task_pid()
+    return cast[int64](phys)
+
+
+def _sysv_shmdt(shmaddr: uint64) -> int64:
+    # int shmdt(const void *shmaddr)
+    # Find the segment whose backing base == shmaddr. The mapping is the
+    # identity map itself (no per-attach VMA was created — see _sysv_shmat),
+    # so detach is bookkeeping only: drop the attach count and reap the
+    # segment if it was IPC_RMID'd and this was the last attach. The pages
+    # stay identity-mapped, so no PTE teardown is needed.
+    i: uint64 = 0
+    found: int64 = -1
+    while i < SYSV_NSHM:
+        if shm_used[i] != 0 and shm_phys[i] == shmaddr:
+            found = cast[int64](i)
+            i = SYSV_NSHM
+        else:
+            i = i + 1
+    if found < 0:
+        return SYSV_EINVAL
+    shmid: uint64 = cast[uint64](found)
+    if shm_nattch[shmid] > 0:
+        shm_nattch[shmid] = shm_nattch[shmid] - 1
+    shm_dtime[shmid] = get_jiffies()
+    shm_lpid[shmid] = current_task_pid()
+    _sysv_shm_reap_if_dead(shmid)
+    return 0
+
+
+def _sysv_shm_reap_if_dead(shmid: uint64):
+    # Free a removed segment's backing pages once the last attach drops.
+    if shm_rmid[shmid] != 0 and shm_nattch[shmid] == 0:
+        if shm_phys[shmid] != 0:
+            free_pages(shm_phys[shmid], shm_order[shmid])
+            shm_phys[shmid] = 0
+        shm_used[shmid] = 0
+        shm_key[shmid] = 0
+        shm_rmid[shmid] = 0
+
+
+# shmid_ds load-bearing fields (x86_64):
+#   off 0:  struct ipc_perm shm_perm
+#   off 40: size_t          shm_segsz
+#   off 48: __kernel_time_t shm_atime
+#   off 56: __kernel_time_t shm_dtime
+#   off 64: __kernel_time_t shm_ctime
+#   off 72: pid_t           shm_cpid
+#   off 76: pid_t           shm_lpid
+#   off 80: shmatt_t        shm_nattch
+SYSV_SHMID_DS_SZ: uint64 = 88
+
+
+def _sysv_shmctl(shmid: uint64, cmd: uint64, buf_u: uint64) -> int64:
+    # int shmctl(int shmid, int cmd, struct shmid_ds *buf)
+    if shmid >= SYSV_NSHM:
+        return SYSV_EINVAL
+    if shm_used[shmid] == 0:
+        return SYSV_EINVAL
+    if cmd == IPC_RMID:
+        # Mark for removal; free immediately if nothing is attached.
+        shm_rmid[shmid] = 1
+        if shm_nattch[shmid] == 0:
+            if shm_phys[shmid] != 0:
+                free_pages(shm_phys[shmid], shm_order[shmid])
+                shm_phys[shmid] = 0
+            shm_used[shmid] = 0
+            shm_key[shmid] = 0
+            shm_rmid[shmid] = 0
+        return 0
+    if cmd == IPC_STAT:
+        i: uint64 = 0
+        while i < SYSV_SHMID_DS_SZ:
+            ds_scratch[i] = 0
+            i = i + 1
+        cast[Ptr[int32]](&ds_scratch[0])[0] = cast[int32](shm_key[shmid] & 0xFFFFFFFF)
+        cast[Ptr[uint64]](&ds_scratch[40])[0] = shm_size[shmid]
+        cast[Ptr[uint64]](&ds_scratch[48])[0] = shm_atime[shmid]
+        cast[Ptr[uint64]](&ds_scratch[56])[0] = shm_dtime[shmid]
+        cast[Ptr[uint64]](&ds_scratch[64])[0] = shm_ctime[shmid]
+        cast[Ptr[uint32]](&ds_scratch[72])[0] = cast[uint32](shm_cpid[shmid])
+        cast[Ptr[uint32]](&ds_scratch[76])[0] = cast[uint32](shm_lpid[shmid])
+        cast[Ptr[uint64]](&ds_scratch[80])[0] = shm_nattch[shmid]
+        if copy_to_user(buf_u, cast[uint64](&ds_scratch[0]), SYSV_SHMID_DS_SZ) != 0:
+            return SYSV_EFAULT
+        return 0
+    if cmd == IPC_SET:
+        shm_ctime[shmid] = get_jiffies()
+        return 0
+    return SYSV_EINVAL
+
+
+# =====================================================================
+# Shared scratch buffers (module-scope per the Adder big-buffer rule)
+# =====================================================================
+
+sembuf_scratch: Array[256, uint8]   # nsops <= 32, 6 bytes each = 192
+ds_scratch:     Array[128, uint8]   # largest *_ds we emit is 96 bytes
+
+
+# =====================================================================
+# Public syscall entry points (called from u_syscalls.ad dispatch)
+# =====================================================================
+
+def sysv_semget(a0: uint64, a1: uint64, a2: uint64,
+                a3: uint64, a4: uint64, a5: uint64) -> int64:
+    return _sysv_semget(a0, a1, a2)
+
+
+def sysv_semop(a0: uint64, a1: uint64, a2: uint64,
+               a3: uint64, a4: uint64, a5: uint64) -> int64:
+    return _sysv_semop(a0, a1, a2)
+
+
+def sysv_semctl(a0: uint64, a1: uint64, a2: uint64,
+                a3: uint64, a4: uint64, a5: uint64) -> int64:
+    return _sysv_semctl(a0, a1, a2, a3)
+
+
+def sysv_msgget(a0: uint64, a1: uint64, a2: uint64,
+                a3: uint64, a4: uint64, a5: uint64) -> int64:
+    return _sysv_msgget(a0, a1)
+
+
+def sysv_msgsnd(a0: uint64, a1: uint64, a2: uint64,
+                a3: uint64, a4: uint64, a5: uint64) -> int64:
+    return _sysv_msgsnd(a0, a1, a2, a3)
+
+
+def sysv_msgrcv(a0: uint64, a1: uint64, a2: uint64,
+                a3: uint64, a4: uint64, a5: uint64) -> int64:
+    return _sysv_msgrcv(a0, a1, a2, cast[int64](a3), a4)
+
+
+def sysv_msgctl(a0: uint64, a1: uint64, a2: uint64,
+                a3: uint64, a4: uint64, a5: uint64) -> int64:
+    return _sysv_msgctl(a0, a1, a2)
+
+
+def sysv_shmget(a0: uint64, a1: uint64, a2: uint64,
+                a3: uint64, a4: uint64, a5: uint64) -> int64:
+    return _sysv_shmget(a0, a1, a2)
+
+
+def sysv_shmat(a0: uint64, a1: uint64, a2: uint64,
+               a3: uint64, a4: uint64, a5: uint64) -> int64:
+    return _sysv_shmat(a0, a1, a2)
+
+
+def sysv_shmdt(a0: uint64, a1: uint64, a2: uint64,
+               a3: uint64, a4: uint64, a5: uint64) -> int64:
+    return _sysv_shmdt(a0)
+
+
+def sysv_shmctl(a0: uint64, a1: uint64, a2: uint64,
+                a3: uint64, a4: uint64, a5: uint64) -> int64:
+    return _sysv_shmctl(a0, a1, a2)
+
+
+# =====================================================================
+# In-kernel self-test (synchronous, boot-context)
+# =====================================================================
+#
+# Mirrors mm/nscap_test.ad's nscap_selftest shape: drive the IPC
+# primitives directly in the boot context (no concurrent scheduler run
+# needed) and assert observable behaviour. Returns 1 iff every assertion
+# held. Prints [sysvipc] lines a test script greps; the final marker is
+# "[sysvipc] PASS".
+#
+# Coverage:
+#   * semget/semctl(SETVAL/GETVAL/GETALL/SETALL/IPC_STAT/IPC_RMID) and the
+#     semop non-blocking fast path (a non-negative decrement succeeds;
+#     a would-go-negative decrement with IPC_NOWAIT returns -EAGAIN;
+#     raising the value then re-running the decrement succeeds — the
+#     rendezvous the block/wake loop implements).
+#   * msgget/msgsnd/msgrcv with msgtyp ordering (0 / >0 / <0) + msgctl.
+#   * shmget/shmat from TWO attaches sees the SAME physical address
+#     (cross-process coherence proof) + a write through one attach is
+#     visible through the other; shmctl IPC_STAT; shmdt; IPC_RMID.
+
+# Self-test scratch (module-scope per the Adder big-buffer rule).
+selftest_sembuf: Array[8, uint8]
+setall_buf:  Array[32, uint16]
+getall_buf:  Array[32, uint16]
+statout_buf: Array[128, uint8]
+msgbuf_io:   Array[1088, uint8]      # 8-byte mtype + up to 1024 text + slack
+
+
+def _ipc_assert(cond: int32, msg0: Ptr[uint8]) -> int32:
+    if cond != 0:
+        printk1("[sysvipc] PASS: %s\n", cast[uint64](msg0))
+        return 1
+    printk1("[sysvipc] FAIL: %s\n", cast[uint64](msg0))
+    return 0
+
+
+def _ipc_semop_direct(semid: uint64, dec: uint64) -> int64:
+    # One op: sem_num 0, sem_op = -dec, sem_flg 0 (blocking allowed).
+    cast[Ptr[uint16]](&selftest_sembuf[0])[0] = 0
+    cast[Ptr[int16]](&selftest_sembuf[2])[0] = cast[int16](0 - cast[int64](dec))
+    cast[Ptr[uint16]](&selftest_sembuf[4])[0] = 0
+    return _sysv_semop(semid, cast[uint64](&selftest_sembuf[0]), 1)
+
+
+def _ipc_semop_nowait(semid: uint64, dec: uint64) -> int64:
+    cast[Ptr[uint16]](&selftest_sembuf[0])[0] = 0
+    cast[Ptr[int16]](&selftest_sembuf[2])[0] = cast[int16](0 - cast[int64](dec))
+    cast[Ptr[uint16]](&selftest_sembuf[4])[0] = cast[uint16](IPC_NOWAIT)
+    return _sysv_semop(semid, cast[uint64](&selftest_sembuf[0]), 1)
+
+
+def _ipc_semop_raise(semid: uint64, inc: uint64) -> int64:
+    cast[Ptr[uint16]](&selftest_sembuf[0])[0] = 0
+    cast[Ptr[int16]](&selftest_sembuf[2])[0] = cast[int16](cast[int64](inc))
+    cast[Ptr[uint16]](&selftest_sembuf[4])[0] = 0
+    return _sysv_semop(semid, cast[uint64](&selftest_sembuf[0]), 1)
+
+
+def _ipc_msg_build(mtype: uint64, fill: uint8, n: uint64):
+    # Build a msgbuf { long mtype; char text[n] } in msgbuf_io.
+    cast[Ptr[uint64]](&msgbuf_io[0])[0] = mtype
+    i: uint64 = 0
+    while i < n:
+        msgbuf_io[8 + i] = fill
+        i = i + 1
+
+
+def sysvipc_selftest() -> int32:
+    printk0("[sysvipc] self-test start\n")
+    ok: int32 = 1
+
+    # --- semaphores --------------------------------------------------
+    semid64: int64 = _sysv_semget(IPC_PRIVATE, 4, IPC_CREAT | 0x1B6)
+    if semid64 < 0:
+        printk1("[sysvipc] FAIL: semget rc=%d\n", cast[uint64](semid64))
+        return 0
+    semid: uint64 = cast[uint64](semid64)
+
+    # SETVAL sem 0 = 1, then GETVAL reads it back.
+    _sysv_semctl(semid, 0, SEM_SETVAL, 1)
+    gv: int64 = _sysv_semctl(semid, 0, SEM_GETVAL, 0)
+    if _ipc_assert(cast[int32](gv == 1), "semctl SETVAL/GETVAL roundtrip") == 0:
+        ok = 0
+
+    # semop: decrement sem 0 by 1 (1 -> 0) succeeds. The _ipc_semop_*
+    # helpers build a one-op sembuf in module scratch and call the real
+    # _sysv_semop, which pulls it in via copy_from_user — in this
+    # synchronous boot context the kernel runs identity-mapped (US=1),
+    # so a kernel scratch address resolves through uaccess fine.
+    r1: int64 = _ipc_semop_direct(semid, 1)
+    if _ipc_assert(cast[int32](r1 == 0), "semop -1 (1->0) succeeds") == 0:
+        ok = 0
+    gv = _sysv_semctl(semid, 0, SEM_GETVAL, 0)
+    if _ipc_assert(cast[int32](gv == 0), "sem value is 0 after decrement") == 0:
+        ok = 0
+    # A -1 with NOWAIT must fail with -EAGAIN (would go negative).
+    r2: int64 = _ipc_semop_nowait(semid, 1)
+    if _ipc_assert(cast[int32](r2 == SYSV_EAGAIN), "semop -1 NOWAIT on 0 -> EAGAIN") == 0:
+        ok = 0
+    # Raise it (the "other task posts" half of a rendezvous), then the
+    # decrement succeeds — exactly the wake the block loop waits for.
+    _ipc_semop_raise(semid, 1)                       # +1 -> value 1
+    r3: int64 = _ipc_semop_direct(semid, 1)          # -1 -> 0, succeeds now
+    if _ipc_assert(cast[int32](r3 == 0), "semop -1 after raise (rendezvous) succeeds") == 0:
+        ok = 0
+
+    # GETALL / SETALL roundtrip.
+    setall_buf[0] = 5
+    setall_buf[1] = 6
+    setall_buf[2] = 7
+    setall_buf[3] = 8
+    _sysv_semctl(semid, 0, SEM_SETALL, cast[uint64](&setall_buf[0]))
+    getall_buf[0] = 0
+    getall_buf[3] = 0
+    _sysv_semctl(semid, 0, SEM_GETALL, cast[uint64](&getall_buf[0]))
+    if _ipc_assert(cast[int32](getall_buf[0] == 5 and getall_buf[3] == 8),
+                   "semctl SETALL/GETALL roundtrip") == 0:
+        ok = 0
+
+    # IPC_STAT reports nsems == 4.
+    _sysv_semctl(semid, 0, IPC_STAT, cast[uint64](&statout_buf[0]))
+    nsems_out: uint64 = cast[Ptr[uint64]](&statout_buf[56])[0]
+    if _ipc_assert(cast[int32](nsems_out == 4), "semctl IPC_STAT nsems == 4") == 0:
+        ok = 0
+
+    # IPC_RMID, then a GETVAL on the removed set returns -EIDRM.
+    _sysv_semctl(semid, 0, IPC_RMID, 0)
+    rmid_rc: int64 = _sysv_semctl(semid, 0, SEM_GETVAL, 0)
+    if _ipc_assert(cast[int32](rmid_rc == SYSV_IDRM), "semctl after IPC_RMID -> EIDRM") == 0:
+        ok = 0
+
+    # --- message queues ----------------------------------------------
+    mqid64: int64 = _sysv_msgget(IPC_PRIVATE, IPC_CREAT | 0x1B6)
+    if mqid64 < 0:
+        printk1("[sysvipc] FAIL: msgget rc=%d\n", cast[uint64](mqid64))
+        return 0
+    mqid: uint64 = cast[uint64](mqid64)
+    # Send three messages: type 2 ("BB"), type 1 ("A"), type 3 ("CCC").
+    _ipc_msg_build(2, 66, 2)            # mtype 2, text "BB"
+    _sysv_msgsnd(mqid, cast[uint64](&msgbuf_io[0]), 2, 0)
+    _ipc_msg_build(1, 65, 1)            # mtype 1, text "A"
+    _sysv_msgsnd(mqid, cast[uint64](&msgbuf_io[0]), 1, 0)
+    _ipc_msg_build(3, 67, 3)            # mtype 3, text "CCC"
+    _sysv_msgsnd(mqid, cast[uint64](&msgbuf_io[0]), 3, 0)
+
+    # msgtyp 0: first message in FIFO = the type-2 "BB".
+    n0: int64 = _sysv_msgrcv(mqid, cast[uint64](&msgbuf_io[0]), 64, 0, 0)
+    t0: int64 = cast[Ptr[int64]](&msgbuf_io[0])[0]
+    if _ipc_assert(cast[int32](n0 == 2 and t0 == 2 and msgbuf_io[8] == 66),
+                   "msgrcv msgtyp 0 = first FIFO (type 2)") == 0:
+        ok = 0
+    # msgtyp 3: the "CCC" message, skipping the type-1 still queued.
+    n1: int64 = _sysv_msgrcv(mqid, cast[uint64](&msgbuf_io[0]), 64, 3, 0)
+    t1: int64 = cast[Ptr[int64]](&msgbuf_io[0])[0]
+    if _ipc_assert(cast[int32](n1 == 3 and t1 == 3 and msgbuf_io[8] == 67),
+                   "msgrcv msgtyp >0 (exact type 3)") == 0:
+        ok = 0
+    # msgtyp -5: lowest type <= 5 remaining = the type-1 "A".
+    n2: int64 = _sysv_msgrcv(mqid, cast[uint64](&msgbuf_io[0]), 64, cast[int64](0 - 5), 0)
+    t2: int64 = cast[Ptr[int64]](&msgbuf_io[0])[0]
+    if _ipc_assert(cast[int32](n2 == 1 and t2 == 1 and msgbuf_io[8] == 65),
+                   "msgrcv msgtyp <0 (lowest type <= |5|)") == 0:
+        ok = 0
+    # Empty queue + IPC_NOWAIT -> -ENOMSG.
+    n3: int64 = _sysv_msgrcv(mqid, cast[uint64](&msgbuf_io[0]), 64, 0, IPC_NOWAIT)
+    if _ipc_assert(cast[int32](n3 == SYSV_ENOMSG), "msgrcv empty NOWAIT -> ENOMSG") == 0:
+        ok = 0
+    # msgctl IPC_STAT: qnum == 0 now.
+    _sysv_msgctl(mqid, IPC_STAT, cast[uint64](&statout_buf[0]))
+    qnum_out: uint64 = cast[Ptr[uint64]](&statout_buf[72])[0]
+    if _ipc_assert(cast[int32](qnum_out == 0), "msgctl IPC_STAT qnum == 0") == 0:
+        ok = 0
+    _sysv_msgctl(mqid, IPC_RMID, 0)
+
+    # --- shared memory (cross-process coherence) ---------------------
+    shmid64: int64 = _sysv_shmget(IPC_PRIVATE, 4096, IPC_CREAT | 0x1B6)
+    if shmid64 < 0:
+        printk1("[sysvipc] FAIL: shmget rc=%d\n", cast[uint64](shmid64))
+        return 0
+    shmid: uint64 = cast[uint64](shmid64)
+    # Attach twice (modelling two processes). Under vaddr==phys both
+    # attaches return the SAME identity-mapped address — the same frames.
+    a_addr: int64 = _sysv_shmat(shmid, 0, 0)
+    b_addr: int64 = _sysv_shmat(shmid, 0, 0)
+    if a_addr < 0 or b_addr < 0:
+        printk0("[sysvipc] FAIL: shmat returned an error\n")
+        return 0
+    if _ipc_assert(cast[int32](a_addr == b_addr),
+                   "shmat: two attaches share the same address") == 0:
+        ok = 0
+    # Write through attach A, read through attach B -> same memory.
+    cast[Ptr[uint64]](cast[uint64](a_addr))[0] = 0xCAFEF00DD15EA5E
+    rb: uint64 = cast[Ptr[uint64]](cast[uint64](b_addr))[0]
+    if _ipc_assert(cast[int32](rb == 0xCAFEF00DD15EA5E),
+                   "shm: write via A visible via B (coherent)") == 0:
+        ok = 0
+    # shmctl IPC_STAT: segsz == 4096, nattch == 2.
+    _sysv_shmctl(shmid, IPC_STAT, cast[uint64](&statout_buf[0]))
+    segsz_out: uint64 = cast[Ptr[uint64]](&statout_buf[40])[0]
+    nattch_out: uint64 = cast[Ptr[uint64]](&statout_buf[80])[0]
+    if _ipc_assert(cast[int32](segsz_out == 4096 and nattch_out == 2),
+                   "shmctl IPC_STAT segsz/nattch") == 0:
+        ok = 0
+    # Detach both, then IPC_RMID frees the segment.
+    _sysv_shmdt(cast[uint64](a_addr))
+    _sysv_shmdt(cast[uint64](b_addr))
+    _sysv_shmctl(shmid, IPC_RMID, 0)
+    if _ipc_assert(cast[int32](shm_used[shmid] == 0),
+                   "shmctl IPC_RMID frees segment after last detach") == 0:
+        ok = 0
+
+    if ok == 1:
+        printk0("[sysvipc] PASS\n")
+    else:
+        printk0("[sysvipc] FAIL\n")
+    return ok
