@@ -740,3 +740,107 @@ real. X11 core-protocol server prototype in `user/x11/`. Adder
 inlined in-tree (no submodule). Syscall boundary hardening closes a
 kernel-address EFAULT injection class.
 
+---
+
+## Wave — Kernel maturity, security & Linux-ABI depth (2026-06)
+
+A long autonomous parallel-agent run (204 commits since the previous
+wave) taking Hamnix from "boots a desktop" to a credible Linux/Unix
+competitor: real process/memory/scheduler primitives, a security
+baseline (W^X + NX + ASLR + seccomp), deep `/proc` fidelity, a real
+uaccess layer, and broad driver/filesystem maturity.
+
+### Process, memory & scheduling
+
+| Item | What | Status |
+|------|------|--------|
+| **Copy-on-write `fork()`** | Eager-copy replaced with a real private per-process address space: per-task PML4 cloned from a pristine boot snapshot, 4 KiB COW fork of ELF/brk/stack/mmap VMAs + `MAP_SHARED`. (`#143`) | **Done** |
+| **`mmap`/`munmap` + demand paging + file-backed mmap** | Anonymous + file-backed `mmap`, demand-paged on fault; `MAP_SHARED` writable file-backed writeback through the VFS. (`#142`,`#194`,`#199`) | **Done** |
+| **futex (FUTEX_WAIT/WAKE)** | Userspace-threading primitive; glibc pthread workloads (8 MiB stacks) run. (`#144`) | **Done** |
+| **poll/epoll** | I/O multiplexing across fd backends. (`#145`) | **Done** |
+| **Priority/CFS-lite scheduling + SMP load balancing** | Per-CPU runqueues, nice/priority, user-task load balancing across APs. (`#151`,`#139`) | **Done** |
+| **Memory pressure: swap + reclaim + OOM killer** | Page reclaim under pressure, swap, an OOM badness heuristic with `oom_score_adj` bias. (`#167`,`#236`) | **Done** |
+| **Kernel leak accounting + soak** | Per-class slab/page/VMA/task accounting returns to baseline after a spawn/reap soak. (`#128`) | **Done** |
+
+### Security baseline (`#157`, `#160`, `#137`)
+
+| Item | What | Status |
+|------|------|--------|
+| **seccomp-lite** | Per-task syscall filter (STRICT + lite allow-list bitmap) enforced at the Linux-ABI dispatch boundary; denial posts SIGSYS; inherited across fork/clone/execve. (`ccbca29`) | **Done** |
+| **W^X — NX on data** | Stack/brk/anon-mmap mapped NX (PTE bit 63); exec-from-data → SIGSEGV. (`740c1c5`) | **Done** |
+| **W^X — .text/.rodata read-only** | Non-writable PT_LOAD spans flipped RO after image install, before first user instruction; write-to-code → SIGSEGV; COW fork shares W^X pages verbatim. (`4cdff63`) | **Done** |
+| **Stack-base ASLR** | Per-exec entropy-driven page-aligned user-stack slide (≤16 pages), wired into execve + SYS_SPAWN. (`600b141`) | **Partial** — ET_DYN/mmap-base ASLR deferred (needs vaddr≠phys decoupling, see `#163`). |
+| **Syscall-boundary audit + abuse test** | `access_ok`/`access_ok_str` reject kernel-address user pointers; fuzz coverage. (`#137`) | **Done** |
+
+### Linux-ABI / uaccess / `/proc`
+
+| Item | What | Status |
+|------|------|--------|
+| **Real `copy_to/from_user` uaccess** | `mm/uaccess.ad` per-task PML4-walking accessors adopted at the hot syscall sites — a bad user pointer returns `-EFAULT` instead of #PF-panicking. (`461bd27b`,`#163`) | **Partial** — vaddr≠phys decoupling (the half that unblocks full ASLR) still deferred for a serialized pass. |
+| **Linux syscall ABI completeness audit + fill** | U-series coverage sweep vs real `strace`: readlink/arch_prctl/pwrite64/pwritev/preadv/statfs/sysinfo/times/getrusage and dozens more. (`#165`,`#200`,`#203`,`#213`) | **Done** |
+| **Deep `/proc` fidelity** | Real `/proc/stat`, `/proc/PID/{stat,statm,status,io,limits,maps}` fields: utime/stime, page faults, ctx-switch counts, vsize, starttime, priority/nice, pgrp, flags, child accounting, per-task rlimits. (`#216`–`#235`) | **Done** |
+| **Pseudo-terminals (PTY)** | 16 master/slave pairs entirely in the Linux-ABI shim (`linux_abi/u_pty.ad`) with cooked/raw line discipline (ICANON/ECHO/OPOST/ONLCR) + termios + winsize, wired through real syscall dispatch for tmux/screen/sshd. (`63dbd57b`) | **Done** |
+| **Interactive Linux-guest TTY/termios** | `enter linux { /bin/sh }` stdin now reaches the process. (`#164`) | **Done** |
+| **Container primitives** | `unshare`/`clone` `CLONE_NEWNS` mapped onto the Plan 9 mount namespace. (`#240`) | **Done** |
+
+### Time, events, observability
+
+| Item | What | Status |
+|------|------|--------|
+| **High-res time** | `clock_gettime`/`nanosleep`/`timerfd`; vDSO `gettimeofday`/`clock_gettime` without syscall overhead. (`#146`,`#169`) | **Done** |
+| **Event fds** | `eventfd`/`signalfd`/`inotify`. (`#155`) | **Done** |
+| **Full POSIX signals** | `sigaction`, masks, realtime signals; Plan 9 note-group + cross-task single-note delivery underneath. (`#148`,`#190`,`#196`) | **Done** |
+| **ptrace + strace** | Tracing + the `strace` tool. (`#147`) | **Done** |
+| **Observability** | Persistent kernel log/journal, process core dumps, a tracing hook, and a panic backtrace (`dump_stack()` frame walker + symbolization). (`#173`,`#241`) | **Done** |
+
+### Filesystems & storage
+
+| Item | What | Status |
+|------|------|--------|
+| **ext4 write + journaling + fsync** | Crash-consistent writes wrapped in JBD2 transactions; extent trees to depth 2 for large files; multi-block dirs; on-disk symlinks (incl. >60-byte targets); 9P `wstat` honouring chmod/truncate/mtime. (`#149`,`#189`,`4ce20487`,`#197`,`234027a7`) | **Done** |
+| **VFS** | Symlinks, namespace-enforced hardlinks, namespace permission enforcement, `access(2)` mode bits. (`#150`,`#209`) | **Done** |
+| **mkfs family** | Real FAT12/16/32 formatters + cross-cluster dir growth. (`#201`,`#207`,`#210`,`#211`) | **Done** |
+| **Block layer** | AHCI registered with the block layer + NCQ multi-slot queuing; MBR extended-partition (EBR) chains; diskstats. (`#188`,`#195`,`#191`,`#187`) | **Done** |
+| **On-target installer** | Lay down a fresh GPT disk from a running system. (`#172`) | **Done** |
+
+### Networking & crypto
+
+| Item | What | Status |
+|------|------|--------|
+| **TCP maturity** | Congestion control + window scaling + SACK + multi-listener accept. (`#166`) | **Done** |
+| **IPv6 basic stack** | Addr, ND, ICMPv6, UDP/TCP over v6. (`#156`) | **Done** |
+| **TLS/crypto + ssh** | TLS 1.3 with cert verification + modern ciphers, RNG wired to the kernel CSPRNG; an outbound ssh client (KEX + channels). (`#177`,`#198`,`#170`) | **Done** |
+
+### Drivers, platform & power
+
+| Item | What | Status |
+|------|------|--------|
+| **USB .ko as the real metal path** | Linux `xhci_hcd.ko` drives full enumeration + MSC READ(10) through real `.ko` rings and serves the ext4 root as `sd0`. (`#179`,`#180`,`#162`) | **Done** (VM); metal HW bring-up ongoing (`#238`,`#242`). |
+| **Audio PCM out** | `snd_hda_intel` playback path. (`#152`) | **Done** |
+| **ACPI power management** | Suspend/resume + thermal + battery + ACPI shutdown. (`#168`) | **Done** |
+| **Input + Bluetooth** | Intl keyboard layouts, mouse scroll, BT HID. (`#178`) | **Done** |
+| **Secure Boot + EFI runtime services** | PE `.reloc`, image signing, `GetTime`/`GetVariable`. (`#171`) | **Done** |
+| **GPU — native Vulkan spine** | All-native Vulkan API + compositor + native software rasterizer + present (zero Linux dependency); VM accel (virtio-gpu + venus) + DE-composites-via-spine in progress. (`#181`; `#182`,`#183` in flight) | **Partial** |
+| **aarch64 / ARM64** | Adder aarch64 codegen backend + kernel port. (`#175`) | **In flight** |
+
+### Packaging & self-host
+
+| Item | What | Status |
+|------|------|--------|
+| **On-device Adder self-hosting** | The Adder-in-Adder compiler compiles itself on-box. (`#154`) | **Done** |
+| **Source-based hpm** | Native packages go Gentoo-style: ship `.ad` source + recipe, compile on-box, optional binary cache. (`#186`) | **Done** |
+| **hpm rollback/transactions** | Snapshot install history + revert. (`#111`) | **Done** |
+
+**Headline of this wave:** Hamnix crossed from "graphical desktop on
+SMP" to a real OS: COW fork, demand-paged mmap, futex, poll/epoll, full
+POSIX signals, swap+OOM, and CFS-lite scheduling give it Unix process
+semantics; a security baseline (W^X + NX + stack ASLR + seccomp + a real
+`copy_to/from_user` uaccess layer) closes the obvious holes; ext4 gained
+journaling + depth-2 extents + wstat; `/proc` reports real per-task
+accounting; PTYs + interactive Linux-guest TTYs let real Debian binaries
+run; and the driver surface (USB `.ko` metal path, audio, ACPI power,
+TLS 1.3, ssh, Secure Boot) is broad. The open long poles are full
+ET_DYN/mmap ASLR (gated on vaddr≠phys uaccess decoupling, `#163`), GPU
+acceleration (`#182`/`#183`), aarch64 (`#175`), and the NUC USB metal
+bring-up (`#238`/`#242`).
+
