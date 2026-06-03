@@ -2520,6 +2520,70 @@ class X86CodeGen:
                     f"x86: _emit_compare_rax_rcx: unexpected op {op}"
                 )
 
+    def gen_short_circuit(self, op: BinOp, left: Expr, right: Expr) -> None:
+        """Lower a logical `and`/`or` with true short-circuit semantics.
+
+        Result (0 or 1) lands in %rax, matching the bitwise-fold lowering it
+        replaces, so callers that test the result (`if`, `while`, assignment
+        to a bool) keep working unchanged.
+
+        `or`:  if left is truthy, result is 1 and the right operand is NOT
+               evaluated; otherwise the result is (right != 0).
+        `and`: if left is falsy, result is 0 and the right operand is NOT
+               evaluated; otherwise the result is (right != 0).
+
+        Layout for `or`:
+            <eval left> -> %rax
+            testq %rax, %rax
+            jnz  .Lsc_true_N        ; left truthy -> short-circuit to true
+            <eval right> -> %rax
+            testq %rax, %rax
+            jnz  .Lsc_true_N
+            xorl %eax, %eax         ; both falsy -> 0
+            jmp  .Lsc_end_N
+          .Lsc_true_N:
+            movq $1, %rax
+          .Lsc_end_N:
+
+        Layout for `and`:
+            <eval left> -> %rax
+            testq %rax, %rax
+            jz   .Lsc_false_N       ; left falsy -> short-circuit to false
+            <eval right> -> %rax
+            testq %rax, %rax
+            jz   .Lsc_false_N
+            movq $1, %rax
+            jmp  .Lsc_end_N
+          .Lsc_false_N:
+            xorl %eax, %eax
+          .Lsc_end_N:
+        """
+        end_label = self.ctx.new_label("sc_end")
+        self.gen_expr(left)
+        self.emit("    testq %rax, %rax")
+        if op is BinOp.OR:
+            true_label = self.ctx.new_label("sc_true")
+            self.emit(f"    jnz {true_label}")
+            self.gen_expr(right)
+            self.emit("    testq %rax, %rax")
+            self.emit(f"    jnz {true_label}")
+            self.emit("    xorl %eax, %eax")
+            self.emit(f"    jmp {end_label}")
+            self.emit(f"{true_label}:")
+            self.emit("    movq $1, %rax")
+            self.emit(f"{end_label}:")
+        else:  # BinOp.AND
+            false_label = self.ctx.new_label("sc_false")
+            self.emit(f"    jz {false_label}")
+            self.gen_expr(right)
+            self.emit("    testq %rax, %rax")
+            self.emit(f"    jz {false_label}")
+            self.emit("    movq $1, %rax")
+            self.emit(f"    jmp {end_label}")
+            self.emit(f"{false_label}:")
+            self.emit("    xorl %eax, %eax")
+            self.emit(f"{end_label}:")
+
     def gen_binary(self, op: BinOp, left: Expr, right: Expr) -> None:
         """Generate a binary op. Result in %rax."""
         # Chained comparison: `a OP1 b OP2 c` is parsed left-associatively as
@@ -2531,6 +2595,19 @@ class X86CodeGen:
         chain = self._unwrap_comparison_chain(op, left, right)
         if chain is not None:
             self.gen_chained_compare(chain)
+            return
+
+        # Logical `and`/`or` MUST short-circuit (Python semantics) and MUST
+        # evaluate the left operand first.  The old lowering evaluated BOTH
+        # operands unconditionally (in right-then-left order) and folded them
+        # bitwise.  That diverges from Python whenever the right operand has a
+        # side effect, faults, or merely reads state that is only meaningful
+        # when the left operand did not already decide the result — which is
+        # exactly why "splitting the condition into two separate `if`s" (whose
+        # second test only runs when the first didn't fire) silently behaved
+        # differently from a single `or`.  Lower to a branch chain instead.
+        if op is BinOp.OR or op is BinOp.AND:
+            self.gen_short_circuit(op, left, right)
             return
 
         # Evaluate right first, push, then left. After pop, %rax = left,
