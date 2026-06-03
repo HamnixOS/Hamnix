@@ -836,6 +836,60 @@ VRUNTIME_SCALE: uint64 = 256
 # express the weight ratio against a nice +19 peer (weight 15).
 SCHED_QUANTUM_MAX: uint64 = 20
 
+# --- realtime scheduling policies (SCHED_FIFO / SCHED_RR) -------------
+#
+# Linux-parity POSIX realtime scheduling. Every task carries a SCHEDULING
+# POLICY and (for the realtime policies) a REALTIME PRIORITY in [1, 99].
+# The default for a fresh task is SCHED_OTHER — the existing CFS-lite
+# weighted-fair behaviour, completely unchanged for normal tasks.
+#
+#   SCHED_OTHER (0) — the CFS-lite policy. nice/weight/vruntime as today.
+#                     rt_priority is meaningless (treated as 0).
+#   SCHED_FIFO  (1) — strict realtime, first-in-first-out. A FIFO task
+#                     runs until it blocks, yields, or exits. It is NEVER
+#                     preempted by an equal-or-lower realtime priority,
+#                     and never by any SCHED_OTHER task. No timeslice.
+#   SCHED_RR    (2) — strict realtime, round-robin. Like FIFO but a task
+#                     at the end of its RR timeslice rotates to the TAIL
+#                     of its priority level so equal-priority RR peers
+#                     share the CPU. Higher priorities still strictly
+#                     preempt lower ones.
+#
+# The pick rule (in _pick_next / the AP steal loop): ANY runnable realtime
+# task outranks ALL SCHED_OTHER tasks; among realtime tasks the HIGHEST
+# rt_priority wins; ties within a priority level rotate (RR) via a
+# per-level FIFO order captured in rt_enqueue_seq.
+#
+# Both fields live in parallel module-global tables keyed by task slot
+# (the rlimit / oom_score_adj pattern) so TaskStruct's hand-maintained
+# byte-offset layout is left completely untouched.
+SCHED_OTHER: uint64 = 0
+SCHED_FIFO:  uint64 = 1
+SCHED_RR:    uint64 = 2
+# POSIX realtime priority range. sched_get_priority_max/min return these
+# for FIFO/RR and 0/0 for OTHER.
+RT_PRIO_MIN: int64 = 1
+RT_PRIO_MAX: int64 = 99
+# RR timeslice in 100 Hz ticks (Linux default RR quantum is ~100 ms; HZ=100
+# so 10 ticks). An RR task that exhausts this rotates to its level's tail.
+SCHED_RR_TICKS: uint64 = 10
+# Per-task policy + realtime priority, slot-indexed. All zero on a fresh
+# slot => SCHED_OTHER / rt_priority 0, the unchanged CFS-lite default.
+g_sched_policy:   Array[16, uint64]
+g_rt_priority:    Array[16, uint64]
+# Monotonic enqueue sequence per slot. When a realtime task becomes the
+# pick at its priority level we choose the SMALLEST sequence (oldest
+# arrival) so FIFO order is honoured; an RR task that uses up its slice
+# is re-stamped to the current max+1 (sent to the tail). 0 means "not yet
+# stamped" and is treated as oldest. The counter is monotonic; at the
+# 16-slot scale it never realistically wraps.
+g_rt_enqueue_seq: Array[16, uint64]
+g_rt_seq_next:    uint64 = 1
+# RR slice countdown, slot-indexed. Decremented on each timer tick that
+# catches an RR task running; on reaching 0 the task rotates and the
+# slice re-arms. SCHED_OTHER/FIFO tasks ignore this field.
+g_rr_slice_left:  Array[16, uint64]
+
 # Linux sched_prio_to_weight[40], index 0 == nice -20 .. index 39 ==
 # nice +19. Verbatim from kernel/sched/core.c so the CPU-share ratios
 # match a real Linux box for a given pair of nice values. Filled lazily
@@ -936,6 +990,126 @@ def sched_quantum_for(slot: uint64) -> uint64:
     if q > SCHED_QUANTUM_MAX:
         q = SCHED_QUANTUM_MAX
     return q
+
+
+# --- realtime policy accessors / mutators ----------------------------
+
+def sched_get_policy(slot: uint64) -> uint64:
+    # Return the SCHED_* policy of `slot`. Out-of-range slots report
+    # SCHED_OTHER so callers never act on garbage.
+    if slot >= NTASKS:
+        return SCHED_OTHER
+    return g_sched_policy[slot]
+
+
+def sched_get_rt_priority(slot: uint64) -> uint64:
+    # Return the realtime priority [1,99] of `slot`, or 0 for a
+    # SCHED_OTHER task / out-of-range slot.
+    if slot >= NTASKS:
+        return 0
+    return g_rt_priority[slot]
+
+
+def sched_is_realtime(slot: uint64) -> uint64:
+    # 1 if `slot` runs a realtime policy (FIFO or RR), else 0.
+    if slot >= NTASKS:
+        return 0
+    p: uint64 = g_sched_policy[slot]
+    if p == SCHED_FIFO or p == SCHED_RR:
+        return 1
+    return 0
+
+
+def _rt_stamp_seq(slot: uint64):
+    # Stamp `slot` with the next monotonic enqueue sequence. Smallest
+    # sequence == oldest arrival; used to break ties within a realtime
+    # priority level so FIFO order (and RR rotation to the tail) is honoured.
+    g_rt_enqueue_seq[slot] = g_rt_seq_next
+    g_rt_seq_next = g_rt_seq_next + 1
+
+
+def sched_set_scheduler(slot: uint64, policy: uint64, rt_prio: int64) -> int32:
+    # Apply a scheduling policy + realtime priority to `slot`. This is the
+    # single mechanism behind both the Linux sched_setscheduler ABI and the
+    # native `/proc/<pid>/ctl` `policy` verb.
+    #
+    # Validation mirrors Linux:
+    #   • policy must be one of SCHED_OTHER/FIFO/RR.
+    #   • a realtime policy requires rt_prio in [1,99].
+    #   • SCHED_OTHER requires rt_prio == 0.
+    # Returns 1 on success, 0 on an invalid argument (caller maps to EINVAL).
+    if slot >= NTASKS:
+        return 0
+    if policy != SCHED_OTHER and policy != SCHED_FIFO and policy != SCHED_RR:
+        return 0
+    if policy == SCHED_OTHER:
+        if rt_prio != 0:
+            return 0
+        g_sched_policy[slot]   = SCHED_OTHER
+        g_rt_priority[slot]    = 0
+        g_rt_enqueue_seq[slot] = 0
+        g_rr_slice_left[slot]  = 0
+        return 1
+    # Realtime policy.
+    if rt_prio < RT_PRIO_MIN or rt_prio > RT_PRIO_MAX:
+        return 0
+    g_sched_policy[slot] = policy
+    g_rt_priority[slot]  = cast[uint64](rt_prio)
+    # A newly-realtime task arrives at the TAIL of its priority level: stamp
+    # it with a fresh sequence so existing same-priority peers (older
+    # sequences) are picked ahead of it until they yield.
+    _rt_stamp_seq(slot)
+    if policy == SCHED_RR:
+        g_rr_slice_left[slot] = SCHED_RR_TICKS
+    else:
+        g_rr_slice_left[slot] = 0
+    return 1
+
+
+def sched_priority_max(policy: uint64) -> int64:
+    # sched_get_priority_max(2): 99 for FIFO/RR, 0 for OTHER.
+    if policy == SCHED_FIFO or policy == SCHED_RR:
+        return RT_PRIO_MAX
+    return 0
+
+
+def sched_priority_min(policy: uint64) -> int64:
+    # sched_get_priority_min(2): 1 for FIFO/RR, 0 for OTHER.
+    if policy == SCHED_FIFO or policy == SCHED_RR:
+        return RT_PRIO_MIN
+    return 0
+
+
+def sched_init_task_policy(slot: uint64):
+    # Reset a freshly-created / recycled slot's realtime policy state to the
+    # SCHED_OTHER default. Called from sched_init_task_weight so a reused slot
+    # never inherits a stale realtime policy from a previous tenant.
+    if slot >= NTASKS:
+        return
+    g_sched_policy[slot]   = SCHED_OTHER
+    g_rt_priority[slot]    = 0
+    g_rt_enqueue_seq[slot] = 0
+    g_rr_slice_left[slot]  = 0
+
+
+def sched_inherit_policy_to_child(child_slot: uint64, parent_slot: uint64):
+    # fork/clone: POSIX says a child inherits the parent's scheduling policy
+    # and realtime priority. (Linux's SCHED_RESET_ON_FORK can opt out; we
+    # don't model that flag yet — straight inheritance, the common case.) The
+    # child arrives at the TAIL of its priority level via a fresh sequence.
+    if child_slot >= NTASKS or parent_slot >= NTASKS:
+        return
+    g_sched_policy[child_slot] = g_sched_policy[parent_slot]
+    g_rt_priority[child_slot]  = g_rt_priority[parent_slot]
+    if sched_is_realtime(child_slot) != 0:
+        _rt_stamp_seq(child_slot)
+        if g_sched_policy[child_slot] == SCHED_RR:
+            g_rr_slice_left[child_slot] = SCHED_RR_TICKS
+        else:
+            g_rr_slice_left[child_slot] = 0
+    else:
+        g_rt_enqueue_seq[child_slot] = 0
+        g_rr_slice_left[child_slot]  = 0
 
 
 # ---------------------------------------------------------------------------
@@ -1121,6 +1295,164 @@ def oomadj_selftest() -> int32:
     return 1
 
 
+def rtsched_selftest() -> int32:
+    # Deterministic proof of the SCHED_FIFO / SCHED_RR realtime policy
+    # mechanism. Drives the REAL sched_set_scheduler / _pick_next /
+    # preempt_tick rotation code over fabricated task fixtures in spare
+    # slots, with NO real context switch needed.
+    #
+    # Asserts:
+    #   (1) sched_get_priority_max/min == 99/1 for FIFO/RR, 0/0 for OTHER.
+    #   (2) A SCHED_FIFO task at priority 50 is ALWAYS picked over a runnable
+    #       SCHED_OTHER task (realtime tier outranks CFS-lite).
+    #   (3) Two SCHED_RR tasks at equal priority ALTERNATE on timeslice
+    #       rotation (the spent task is re-stamped to the level's tail, so
+    #       _pick_next flips to its peer).
+    #   (4) A FIFO task is NOT preempted by a newly-runnable LOWER-priority
+    #       RR task (_pick_next keeps the higher FIFO).
+    #
+    # Fixtures use two spare FREE slots, marked READY only for the duration
+    # of each _pick_next probe and restored to FREE afterward so the live
+    # runqueue is left exactly as found. Returns 1 PASS, 0 FAIL. PUBLIC so
+    # init/main.ad can call it. The probe runs on the BSP (boot task), where
+    # _pick_next treats all READY slots as eligible.
+
+    # --- (1) priority range queries ---
+    if sched_priority_max(SCHED_FIFO) != RT_PRIO_MAX:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[rtsched] FAIL priority_max(FIFO) != 99\n")
+        return 0
+    if sched_priority_min(SCHED_FIFO) != RT_PRIO_MIN:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[rtsched] FAIL priority_min(FIFO) != 1\n")
+        return 0
+    if sched_priority_max(SCHED_RR) != RT_PRIO_MAX:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[rtsched] FAIL priority_max(RR) != 99\n")
+        return 0
+    if sched_priority_min(SCHED_RR) != RT_PRIO_MIN:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[rtsched] FAIL priority_min(RR) != 1\n")
+        return 0
+    if sched_priority_max(SCHED_OTHER) != 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[rtsched] FAIL priority_max(OTHER) != 0\n")
+        return 0
+    if sched_priority_min(SCHED_OTHER) != 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[rtsched] FAIL priority_min(OTHER) != 0\n")
+        return 0
+
+    # Find two spare FREE slots for the fixtures.
+    sa: int32 = -1
+    sb: int32 = -1
+    scan: uint64 = 0
+    while scan < NTASKS:
+        if task_table[scan].state == STATE_FREE:
+            if sa < 0:
+                sa = cast[int32](scan)
+            elif sb < 0:
+                sb = cast[int32](scan)
+        scan = scan + 1
+    if sa < 0 or sb < 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[rtsched] FAIL no two spare slots for fixtures\n")
+        return 0
+    ua: uint64 = cast[uint64](sa)
+    ub: uint64 = cast[uint64](sb)
+
+    # Fabricate both fixtures as BSP-eligible kernel tasks (is_user=0). Save
+    # nothing else: these slots are FREE, so we own them for the probe.
+    task_table[ua].is_user = 0
+    task_table[ub].is_user = 0
+    task_table[ua].vruntime = 0
+    task_table[ub].vruntime = 0
+
+    pass_all: int32 = 1
+
+    # --- (2) FIFO@50 always beats a runnable SCHED_OTHER ---
+    # sa = SCHED_FIFO prio 50, sb = SCHED_OTHER. Both READY.
+    sched_init_task_policy(ua)
+    sched_init_task_policy(ub)
+    if sched_set_scheduler(ua, SCHED_FIFO, 50) != 1:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[rtsched] FAIL set FIFO 50 rejected\n")
+        pass_all = 0
+    task_table[ua].state = STATE_READY
+    task_table[ub].state = STATE_READY      # sb stays SCHED_OTHER
+    pick2: int32 = _pick_next()
+    if pick2 != sa:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk2("[rtsched] FAIL FIFO not picked over OTHER pick=%d want=%d\n",
+                cast[uint64](cast[uint32](pick2)), cast[uint64](cast[uint32](sa)))
+        pass_all = 0
+
+    # --- (4) FIFO@50 NOT preempted by a newly-runnable LOWER-priority RR ---
+    # Reconfigure sb as SCHED_RR prio 10 (lower than sa's FIFO 50), still READY.
+    if sched_set_scheduler(ub, SCHED_RR, 10) != 1:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[rtsched] FAIL set RR 10 rejected\n")
+        pass_all = 0
+    pick4: int32 = _pick_next()
+    if pick4 != sa:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk2("[rtsched] FAIL higher FIFO yielded to lower RR pick=%d want=%d\n",
+                cast[uint64](cast[uint32](pick4)), cast[uint64](cast[uint32](sa)))
+        pass_all = 0
+
+    # --- (3) Two equal-priority RR tasks alternate on rotation ---
+    # Both sa and sb become SCHED_RR prio 30. sa was stamped (set) before sb,
+    # so sa has the smaller enqueue sequence and _pick_next prefers sa first.
+    sched_init_task_policy(ua)
+    sched_init_task_policy(ub)
+    if sched_set_scheduler(ua, SCHED_RR, 30) != 1:
+        pass_all = 0
+    if sched_set_scheduler(ub, SCHED_RR, 30) != 1:
+        pass_all = 0
+    task_table[ua].state = STATE_READY
+    task_table[ub].state = STATE_READY
+    first: int32 = _pick_next()
+    if first != sa:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk2("[rtsched] FAIL RR oldest not first pick=%d want=%d\n",
+                cast[uint64](cast[uint32](first)), cast[uint64](cast[uint32](sa)))
+        pass_all = 0
+    # Simulate sa exhausting its RR slice and rotating to the tail: drive the
+    # real rotation primitive (re-stamp sequence + re-arm slice), exactly what
+    # preempt_tick does when an RR slice drains. After rotation sb (now the
+    # smaller sequence) must be picked.
+    _rt_stamp_seq(ua)
+    g_rr_slice_left[ua] = SCHED_RR_TICKS
+    second: int32 = _pick_next()
+    if second != sb:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk2("[rtsched] FAIL RR no rotation pick=%d want=%d\n",
+                cast[uint64](cast[uint32](second)), cast[uint64](cast[uint32](sb)))
+        pass_all = 0
+    # Rotate sb too; the turn must come back to sa (genuine alternation).
+    _rt_stamp_seq(ub)
+    g_rr_slice_left[ub] = SCHED_RR_TICKS
+    third: int32 = _pick_next()
+    if third != sa:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk2("[rtsched] FAIL RR no alternation back pick=%d want=%d\n",
+                cast[uint64](cast[uint32](third)), cast[uint64](cast[uint32](sa)))
+        pass_all = 0
+
+    # Tear down the fixtures: reset policy state and return both slots to FREE
+    # so the live runqueue is exactly as we found it.
+    sched_init_task_policy(ua)
+    sched_init_task_policy(ub)
+    task_table[ua].state = STATE_FREE
+    task_table[ub].state = STATE_FREE
+
+    if pass_all == 0:
+        return 0
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0("[rtsched] PASS FIFO>OTHER, RR-rotate, FIFO!<RR, prio 99/1\n")
+    return 1
+
+
 def sched_init_task_weight(slot: uint64):
     # Seed a freshly-created task's CFS-lite fields. nice 0 / NICE0
     # weight by default; vruntime seeded to the current runqueue minimum
@@ -1129,6 +1461,9 @@ def sched_init_task_weight(slot: uint64):
     task_table[slot].nice         = 0
     task_table[slot].sched_weight = NICE0_WEIGHT
     task_table[slot].vruntime     = sched_min_vruntime()
+    # Realtime scheduling policy resets to the SCHED_OTHER default so a
+    # recycled slot never inherits a stale FIFO/RR policy.
+    sched_init_task_policy(slot)
     c: uint64 = 0
     while c < 16:
         task_table[slot].cpu_runs[c] = 0
@@ -1198,6 +1533,8 @@ def sched_inherit_nice_to_child(child_slot: uint64, parent_slot: uint64):
     task_table[child_slot].nice         = task_table[parent_slot].nice
     task_table[child_slot].sched_weight = task_table[parent_slot].sched_weight
     task_table[child_slot].vruntime     = sched_min_vruntime()
+    # POSIX: a child inherits the parent's scheduling policy + rt priority.
+    sched_inherit_policy_to_child(child_slot, parent_slot)
 
 
 def sched_note_dispatch(slot: uint64):
@@ -1836,10 +2173,54 @@ def _pick_next() -> int32:
     # Tie-break: among equal-vruntime eligibles we prefer a DIFFERENT slot
     # than current_idx_pcpu when one exists, so two CPU-bound tasks at the
     # same vruntime still alternate rather than one pinning the CPU.
+    #
+    # REALTIME TIER (SCHED_FIFO / SCHED_RR): before the CFS-lite scan we
+    # look for any eligible runnable realtime task. ANY such task outranks
+    # ALL SCHED_OTHER tasks. Among realtime tasks the HIGHEST rt_priority
+    # wins; within a priority level the SMALLEST enqueue sequence (oldest
+    # arrival / least-recently-rotated) wins, which gives FIFO order and —
+    # because an RR task that exhausts its slice is re-stamped to the tail —
+    # round-robin rotation among equal-priority RR peers. The CFS-lite scan
+    # below is reached ONLY when no realtime task is runnable, so normal
+    # tasks behave EXACTLY as before whenever no RT task competes.
     on_bsp: uint64 = 0
     if get_cpu_id() == 0:
         on_bsp = 1
     cur: uint64 = current_idx_pcpu
+
+    rt_best:     int32  = -1
+    rt_best_pri: uint64 = 0
+    rt_best_seq: uint64 = 0
+    r: uint64 = 0
+    while r < NTASKS:
+        if task_table[r].state == STATE_READY:
+            relig: uint64 = 0
+            if on_bsp != 0 or task_table[r].is_user == 0:
+                if on_bsp != 0 or r != 0:
+                    relig = 1
+            if relig != 0 and sched_is_realtime(r) != 0:
+                rp:  uint64 = g_rt_priority[r]
+                rsq: uint64 = g_rt_enqueue_seq[r]
+                if rt_best < 0:
+                    rt_best = cast[int32](r)
+                    rt_best_pri = rp
+                    rt_best_seq = rsq
+                elif rp > rt_best_pri:
+                    rt_best = cast[int32](r)
+                    rt_best_pri = rp
+                    rt_best_seq = rsq
+                elif rp == rt_best_pri and rsq < rt_best_seq:
+                    # Same priority level: oldest arrival (smallest sequence)
+                    # is picked. RR rotation re-stamps the spent task to the
+                    # tail, so this implements both FIFO order and RR turn-
+                    # taking with one comparison.
+                    rt_best = cast[int32](r)
+                    rt_best_pri = rp
+                    rt_best_seq = rsq
+        r = r + 1
+    if rt_best >= 0:
+        return rt_best
+
     best: int32 = -1
     best_v: uint64 = 0
     i: uint64 = 0
@@ -1948,6 +2329,12 @@ def schedule():
     # delivers the weight ratio between two CPU-bound peers.
     quantum_left = sched_quantum_for(nxt)
 
+    # Realtime: a freshly-dispatched SCHED_RR task gets a full round-robin
+    # slice so it isn't preempted into instantly by inheriting a peer's
+    # spent slice. SCHED_FIFO has no slice; SCHED_OTHER ignores this field.
+    if g_sched_policy[nxt] == SCHED_RR:
+        g_rr_slice_left[nxt] = SCHED_RR_TICKS
+
     # #151: per-CPU dispatch accounting (SMP load-balance test marker).
     sched_note_dispatch(nxt)
 
@@ -1997,6 +2384,23 @@ def _another_task_ready() -> uint64:
     return 0
 
 
+def _rt_rotatable_peer_ready(self_slot: uint64) -> uint64:
+    # Returns 1 if some READY realtime task OTHER than self_slot has a
+    # realtime priority >= self_slot's — i.e. there is genuinely a peer worth
+    # rotating an RR slice to (or a higher-priority RT task that should run).
+    # Used by the SCHED_RR tick path to avoid a no-op schedule() when the
+    # rotating task is the only runnable thing at (or above) its level.
+    sp: uint64 = g_rt_priority[self_slot]
+    i: uint64 = 0
+    while i < NTASKS:
+        if i != self_slot:
+            if task_table[i].state == STATE_READY:
+                if sched_is_realtime(i) != 0 and g_rt_priority[i] >= sp:
+                    return 1
+        i = i + 1
+    return 0
+
+
 def preempt_tick(from_user: uint64) -> uint64:
     # Called once per 100 Hz timer tick from timer_interrupt(), AFTER
     # the timer EOI has been sent. `from_user` is non-zero when the
@@ -2035,6 +2439,49 @@ def preempt_tick(from_user: uint64) -> uint64:
     # heavy tasks: a nice -20 task (weight 88761) advances ~1/87th as fast
     # as a nice 0 task instead of being flattened to a +1 floor.
     cur: uint64 = current_idx_pcpu
+
+    # Realtime tier (SCHED_FIFO / SCHED_RR). A realtime task does NOT accrue
+    # CFS-lite vruntime and ignores the weighted quantum entirely — its
+    # preemption is governed solely by realtime rules:
+    #   • SCHED_FIFO: never time-sliced. It runs until it blocks, yields, or
+    #     exits, and is never preempted by an equal-or-lower realtime priority
+    #     (or by any SCHED_OTHER task). So a FIFO tick simply returns 0.
+    #   • SCHED_RR: time-sliced among EQUAL-priority RR peers. Each tick that
+    #     catches it running decrements its slice; when the slice hits 0 the
+    #     task rotates to the TAIL of its priority level (re-stamped sequence)
+    #     and re-arms a fresh slice. We then ask for a switch only if there is
+    #     another runnable RR peer at the SAME priority to rotate to (a strictly
+    #     higher-priority RT task would already have preempted via _pick_next;
+    #     a lower-priority one must NOT preempt). _pick_next then picks the
+    #     oldest same-priority peer.
+    # Either way we DO NOT touch quantum_left / vruntime: those belong to the
+    # CFS-lite path and a realtime task leaving the CPU re-arms them via the
+    # schedule() dispatch of whoever runs next.
+    if sched_is_realtime(cur) != 0:
+        if g_sched_policy[cur] == SCHED_FIFO:
+            return 0
+        # SCHED_RR slice accounting.
+        if g_rr_slice_left[cur] > 0:
+            g_rr_slice_left[cur] = g_rr_slice_left[cur] - 1
+        if g_rr_slice_left[cur] != 0:
+            return 0
+        # Slice spent: rotate to the tail of this priority level and re-arm.
+        # Same ring-0 non-preemptibility rule as the CFS-lite path: a ring-0
+        # tick ages (and here rotates) the slice but never forces a switch,
+        # because preempting arbitrary kernel code could corrupt a lock. The
+        # rotation still stands, so the very next ring-3 tick (or a cooperative
+        # yield) hands the CPU to the peer _pick_next now prefers.
+        _rt_stamp_seq(cur)
+        g_rr_slice_left[cur] = SCHED_RR_TICKS
+        if from_user == 0:
+            return 0
+        # Only force a switch when a same-or-higher-priority RT peer is
+        # runnable to rotate to; with none, this task keeps the CPU
+        # (re-selected by _pick_next) and the rotation is a harmless no-op.
+        if _rt_rotatable_peer_ready(cur) == 0:
+            return 0
+        return 1
+
     cw: uint64 = task_table[cur].sched_weight
     if cw == 0:
         cw = NICE0_WEIGHT
@@ -2202,8 +2649,17 @@ def sched_ap_idle_loop():
         # than first-fit) means a CPU with an empty/short runqueue steals
         # the most-starved runnable task from the busier shared set — a
         # CFS-lite balancing decision over the single shared task_table.
+        #
+        # Realtime override: a runnable realtime (FIFO/RR) kernel task
+        # outranks ALL CFS-lite kernel tasks here too, and among RT peers
+        # the highest rt_priority (then oldest enqueue sequence) wins —
+        # mirroring _pick_next so an AP never runs a normal task while an
+        # eligible realtime kthread is starving.
         found_slot: int32 = -1
         found_v: uint64 = 0
+        found_rt:  uint64 = 0
+        found_pri: uint64 = 0
+        found_seq: uint64 = 0
         scan: uint64 = 0
         while scan < NTASKS and sched_ap_steal_enabled != 0:
             if scan != my_idle_slot:
@@ -2215,12 +2671,32 @@ def sched_ap_idle_loop():
                     if task_table[scan].state == STATE_READY:
                         if task_table[scan].is_user == 0:
                             sv: uint64 = task_table[scan].vruntime
+                            srt: uint64 = sched_is_realtime(scan)
+                            spri: uint64 = g_rt_priority[scan]
+                            sseq: uint64 = g_rt_enqueue_seq[scan]
+                            take: uint64 = 0
                             if found_slot < 0:
+                                take = 1
+                            elif srt > found_rt:
+                                # A realtime candidate beats any CFS one.
+                                take = 1
+                            elif srt == found_rt:
+                                if srt != 0:
+                                    # Both realtime: higher prio, then oldest.
+                                    if spri > found_pri:
+                                        take = 1
+                                    elif spri == found_pri and sseq < found_seq:
+                                        take = 1
+                                else:
+                                    # Both CFS: smallest vruntime.
+                                    if sv < found_v:
+                                        take = 1
+                            if take != 0:
                                 found_slot = cast[int32](scan)
                                 found_v = sv
-                            elif sv < found_v:
-                                found_slot = cast[int32](scan)
-                                found_v = sv
+                                found_rt = srt
+                                found_pri = spri
+                                found_seq = sseq
             scan = scan + 1
 
         if found_slot >= 0:

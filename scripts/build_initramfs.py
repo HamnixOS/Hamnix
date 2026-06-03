@@ -1083,6 +1083,19 @@ if os.environ.get("ENABLE_PROCCTL_TEST"):
 if os.environ.get("ENABLE_OOMADJ_TEST"):
     FILES.append(("/etc/oomadj-test", b"1\n"))
 
+# SCHED_FIFO/SCHED_RR realtime scheduling-policy self-test.
+# scripts/test_rtsched.sh sets ENABLE_RTSCHED_TEST=1 to plant /etc/rtsched-test.
+# init/main.ad detects the marker and calls rtsched_selftest()
+# (kernel/sched/core.ad): it drives the real sched_set_scheduler / _pick_next /
+# RR-rotation mechanism over spare-slot fixtures, asserts a FIFO@50 task beats a
+# SCHED_OTHER task, two equal-priority RR tasks alternate on rotation, a FIFO
+# task is not preempted by a lower-priority RR task, and the priority-range
+# queries return 99/1 (FIFO/RR) / 0 (OTHER), then emits the [rtsched] PASS
+# banner. Needs no extra device. Uniquely-named gate so it never collides with
+# a sibling kernel-scheduler agent's marker block.
+if os.environ.get("ENABLE_RTSCHED_TEST"):
+    FILES.append(("/etc/rtsched-test", b"1\n"))
+
 # /proc/<pid>/stat child-resource accounting (fields 11/13/16/17) self-test.
 # scripts/test_childacct.sh sets ENABLE_CHILDACCT_TEST=1 to plant
 # /etc/childacct-test. init/main.ad detects the marker and calls
