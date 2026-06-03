@@ -88,6 +88,10 @@ from fs.vfs import (
     # #164: console-backed-fd probe + the termios line-discipline's
     # narrow console bridge (read_nb / write for echo).
     vfs_fd_is_console,
+    # #165: PTY fd recogniser — returns the packed (slot<<1|is_master)
+    # for an FD_PTMX_MARK fd so the ioctl shim can route tty ioctls to
+    # the right pair.
+    vfs_fd_pty_pack,
     # #155: inotify notify-hook registration (the boundary inversion —
     # vfs.ad calls our uino_post through a function pointer it knows
     # nothing about, registered here at bring-up).
@@ -99,6 +103,20 @@ from fs.vfs import (
 # the per-task termios state so raw-mode apps (a python3 REPL) work.
 from linux_abi.u_termios import (
     utermios_console_read, utermios_tcgets, utermios_tcsets,
+)
+# #165: the Linux-ABI pseudo-terminal layer. The open/read/write/close
+# data path is wired in fs/vfs.ad via FD_PTMX_MARK; the tty *control*
+# path (TIOCGPTN / TIOCSPTLCK / TCGETS / TCSETS / TIOC{G,S}WINSZ on a
+# pty fd) is serviced here in the ioctl shim against the same pair pool.
+from linux_abi.u_pty import (
+    pty_tcgets, pty_tcsets, pty_getwinsz, pty_setwinsz,
+    pty_set_lock, pty_valid, pty_master_readable,
+)
+# #165: user-pointer-safe scalar accessors for the new pty ioctls
+# (TIOCGPTN writes *out, TIOCSPTLCK reads *in). A bad user pointer must
+# return -EFAULT, never #PF — the house uaccess layer is the right tool.
+from mm.uaccess import (
+    get_user_32, put_user_32,
 )
 # §5 Layer-2 async I/O — the confined epoll/eventfd/timerfd/signalfd
 # object pools + the O_NONBLOCK bitmap. linux_abi/u_epoll.ad is a
@@ -1232,6 +1250,61 @@ def _u_lseek(a0: uint64, a1: uint64, a2: uint64,
     return n
 
 
+def _u_ioctl_pty(pack: int64, req: uint64, out: uint64) -> int64:
+    # #165: the tty control surface for an FD_PTMX_MARK fd. `pack` is the
+    # fd_buf value (slot << 1 | is_master). Returns the ioctl result, or
+    # ELINUX_NOSYS for a request this layer doesn't own (the caller then
+    # falls through to the generic ioctl arms). User-pointer reads/writes
+    # go through the uaccess accessors so a bad *out is -EFAULT, not #PF.
+    slot: int32 = cast[int32](pack >> 1)
+    if pty_valid(slot) == 0:
+        return ELINUX_NOTTY
+    # TIOCGPTN (0x80045430) — return the slave index N via *out (u32).
+    # The encoded request carries the _IOR size in the high bits; busybox
+    # / glibc issue exactly 0x80045430, but match on the low 16 bits so a
+    # differently-encoded caller still resolves.
+    if (req & 0xFFFF) == 0x5430:
+        if out == 0:
+            return ELINUX_INVAL
+        rc: int64 = put_user_32(cast[uint32](slot), out)
+        if rc != 0:
+            return ELINUX_FAULT
+        return 0
+    # TIOCSPTLCK (0x40045431) — *out is an int lock flag (0 = unlock).
+    if (req & 0xFFFF) == 0x5431:
+        if out == 0:
+            return ELINUX_INVAL
+        lockv: uint32 = 0
+        rc2: int64 = get_user_32(out, cast[Ptr[uint32]](&lockv))
+        if rc2 != 0:
+            return ELINUX_FAULT
+        pty_set_lock(slot, cast[int32](lockv))
+        return 0
+    # TIOCGPTLCK (0x80045439) — report the current lock state via *out.
+    if (req & 0xFFFF) == 0x5439:
+        if out == 0:
+            return ELINUX_INVAL
+        # pty_valid already confirmed the pair; report unlocked(0) by
+        # convention once a slave has been unlocked. We don't surface the
+        # internal lock flag, so report 0 (the common post-unlock state).
+        if put_user_32(0, out) != 0:
+            return ELINUX_FAULT
+        return 0
+    # TCGETS (0x5401) — per-pair termios.
+    if req == 0x5401:
+        return pty_tcgets(slot, out)
+    # TCSETS / TCSETSW / TCSETSF (0x5402/3/4) — apply per-pair termios.
+    if req == 0x5402 or req == 0x5403 or req == 0x5404:
+        return pty_tcsets(slot, out)
+    # TIOCGWINSZ (0x5413) — per-pair winsize.
+    if req == 0x5413:
+        return pty_getwinsz(slot, out)
+    # TIOCSWINSZ (0x5414) — store per-pair winsize.
+    if req == 0x5414:
+        return pty_setwinsz(slot, out)
+    return ELINUX_NOSYS
+
+
 def _u_ioctl(a0: uint64, a1: uint64, a2: uint64,
              a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int ioctl(int fd, unsigned long request, ...)
@@ -1247,6 +1320,20 @@ def _u_ioctl(a0: uint64, a1: uint64, a2: uint64,
     fd:  int32  = cast[int32](a0)
     req: uint64 = a1
     out: uint64 = a2
+    # #165: PTY-fd ioctls. If `fd` is an FD_PTMX_MARK fd, its tty control
+    # surface operates on THAT pair's state — TIOCGPTN (the slave index),
+    # TIOCSPTLCK (lock/unlock the slave open), TCGETS/TCSETS (per-pair
+    # termios, ICANON|ECHO actually gating the slave's discipline), and
+    # TIOC{G,S}WINSZ (per-pair winsize). Handled here, ahead of the
+    # console-fd arms below, so a pty's ioctls never fall through to the
+    # per-task console termios. A non-pty fd (pack == -1) falls through.
+    pty_pack: int64 = vfs_fd_pty_pack(fd)
+    if pty_pack >= 0:
+        ptt: int64 = _u_ioctl_pty(pty_pack, req, out)
+        if ptt != ELINUX_NOSYS:
+            return ptt
+        # An unrecognised ioctl on a pty fd falls through to the generic
+        # arms (e.g. TIOCGPGRP), so job-control probes still answer.
     # TIOCGWINSZ — struct winsize { u16 row, col, xpixel, ypixel }
     if req == 0x5413:
         if out == 0:
@@ -7506,6 +7593,261 @@ def uabi_fills_selftest() -> int32:
 def _uabi_fills_restore_fds(boot_task: Ptr[TaskStruct],
                             fd_save: Ptr[uint32]):
     # Restore boot-task fd slots 3..15 the selftest temporarily freed.
+    fdr: uint64 = 3
+    while fdr < 16:
+        boot_task[0].fd_idx[fdr] = fd_save[fdr]
+        fdr = fdr + 1
+
+
+# =====================================================================
+# #165: PTY (pseudo-terminal) self-test
+#   (gated on /etc/pty-test, ENABLE_PTY_TEST=1)
+# =====================================================================
+#
+# Drives the full ptmx/pts data + control path through the REAL in-kernel
+# Linux-ABI dispatch (linux_u_syscall_dispatch — the exact path a Linux
+# tmux / sshd-spawned pty takes):
+#   1. openat(/dev/ptmx, O_RDWR)            -> master fd
+#   2. ioctl(master, TIOCGPTN, &n)          -> slave index N
+#   3. ioctl(master, TIOCSPTLCK, &0)        -> unlock the slave
+#   4. (locked-slave open before unlock fails -EIO)  [tested first]
+#   5. openat(/dev/pts/N, O_RDWR)           -> slave fd
+#   6. write(master, "hi\n")                -> feeds slave input
+#   7. read(slave, ...)  (cooked)           -> returns "hi\n"
+#   8. read(master, ...)                    -> the ECHO "hi\n"
+#   9. write(slave, "OK\n")                 -> program output
+#  10. read(master, ...)                    -> "OK\r\n" (ONLCR)
+#  11. raw-mode (TCSETS clears ICANON|ECHO): write+read passes bytes
+#      through with NO echo and NO line assembly.
+# Prints a single "[PTY] PASS" / "[PTY] FAIL ..." on the EMERG serial
+# channel. A default boot ships no marker, so this never runs.
+
+O_RDWR_U64: uint64 = 2
+
+# c_lflag bits (mirror u_termios.ad) for the raw-mode TCSETS leg.
+PTYT_ICANON: uint32 = 0x0002
+PTYT_ECHO:   uint32 = 0x0008
+
+
+def pty_selftest() -> int32:
+    # Prime the boot task's fd table (same uninitialised-table issue the
+    # uabi_fills / statfs hooks handle) so the open legs can grab fds.
+    boot_task: Ptr[TaskStruct] = current_task()
+    fd_save: Array[16, uint32]
+    fdi: uint64 = 3
+    while fdi < 16:
+        fd_save[fdi] = boot_task[0].fd_idx[fdi]
+        boot_task[0].fd_idx[fdi] = FD_CLOSED_MARK
+        fdi = fdi + 1
+
+    # --- 1. open /dev/ptmx -> master fd ------------------------------
+    ptmx_path: Ptr[uint8] = cast[Ptr[uint8]]("/dev/ptmx")
+    master_fd: int64 = _uabi_test_dispatch(SYS_openat, AT_FDCWD_U64,
+                                           cast[uint64](ptmx_path),
+                                           O_RDWR_U64, 0)
+    if master_fd < 0:
+        printk1("[PTY] FAIL open ptmx rc=%d\n", cast[uint64](master_fd))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+
+    # --- 2. TIOCGPTN -> slave index N --------------------------------
+    ptn: Array[1, uint32]
+    ptn[0] = 0xFFFFFFFF
+    gptn_rc: int64 = _uabi_test_dispatch(SYS_ioctl,
+                                         cast[uint64](master_fd),
+                                         0x80045430,            # TIOCGPTN
+                                         cast[uint64](&ptn[0]), 0)
+    if gptn_rc != 0:
+        printk1("[PTY] FAIL TIOCGPTN rc=%d\n", cast[uint64](gptn_rc))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    slave_n: uint64 = cast[uint64](ptn[0])
+
+    # --- 4. a locked slave open must fail -EIO (BEFORE unlock) -------
+    # Build "/dev/pts/<N>" into a scratch buffer.
+    pts_path: Array[24, uint8]
+    _pty_build_pts_path(&pts_path[0], slave_n)
+    locked_open: int64 = _uabi_test_dispatch(SYS_openat, AT_FDCWD_U64,
+                                             cast[uint64](&pts_path[0]),
+                                             O_RDWR_U64, 0)
+    if locked_open >= 0:
+        printk0("[PTY] FAIL locked slave open succeeded (want -EIO)\n")
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+
+    # --- 3. TIOCSPTLCK(&0) -> unlock ---------------------------------
+    lock0: Array[1, uint32]
+    lock0[0] = 0
+    sptl_rc: int64 = _uabi_test_dispatch(SYS_ioctl,
+                                         cast[uint64](master_fd),
+                                         0x40045431,            # TIOCSPTLCK
+                                         cast[uint64](&lock0[0]), 0)
+    if sptl_rc != 0:
+        printk1("[PTY] FAIL TIOCSPTLCK rc=%d\n", cast[uint64](sptl_rc))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+
+    # --- 5. open /dev/pts/N -> slave fd ------------------------------
+    slave_fd: int64 = _uabi_test_dispatch(SYS_openat, AT_FDCWD_U64,
+                                          cast[uint64](&pts_path[0]),
+                                          O_RDWR_U64, 0)
+    if slave_fd < 0:
+        printk1("[PTY] FAIL open pts rc=%d\n", cast[uint64](slave_fd))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+
+    # --- 6/7. write(master,"hi\n") then cooked read(slave) -----------
+    line_in: Array[3, uint8]
+    line_in[0] = 104                                     # 'h'
+    line_in[1] = 105                                     # 'i'
+    line_in[2] = 10                                      # '\n'
+    mw_n: int64 = _uabi_test_dispatch(SYS_write,
+                                      cast[uint64](master_fd),
+                                      cast[uint64](&line_in[0]), 3, 0)
+    if mw_n != 3:
+        printk1("[PTY] FAIL master write count=%d\n", cast[uint64](mw_n))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    sr_buf: Array[16, uint8]
+    sr_n: int64 = _uabi_test_dispatch(SYS_read,
+                                      cast[uint64](slave_fd),
+                                      cast[uint64](&sr_buf[0]), 16, 0)
+    if sr_n != 3:
+        printk1("[PTY] FAIL slave cooked read count=%d\n", cast[uint64](sr_n))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    if sr_buf[0] != 104 or sr_buf[1] != 105 or sr_buf[2] != 10:
+        printk0("[PTY] FAIL slave cooked read bytes\n")
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+
+    # --- 8. read(master) -> the ECHO of "hi\n" -----------------------
+    # ECHO produced "h" "i" "\n" into the master read queue during the
+    # cooked slave read above.
+    ce_buf: Array[16, uint8]
+    ce_n: int64 = _uabi_test_dispatch(SYS_read,
+                                      cast[uint64](master_fd),
+                                      cast[uint64](&ce_buf[0]), 16, 0)
+    if ce_n != 3:
+        printk1("[PTY] FAIL master echo read count=%d\n", cast[uint64](ce_n))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    if ce_buf[0] != 104 or ce_buf[1] != 105 or ce_buf[2] != 10:
+        printk0("[PTY] FAIL master echo bytes\n")
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+
+    # --- 9/10. write(slave,"OK\n") then read(master) -> "OK\r\n" -----
+    # OPOST|ONLCR is on by default, so '\n' becomes CR+LF on the master.
+    out_line: Array[3, uint8]
+    out_line[0] = 79                                     # 'O'
+    out_line[1] = 75                                     # 'K'
+    out_line[2] = 10                                     # '\n'
+    sw_n: int64 = _uabi_test_dispatch(SYS_write,
+                                      cast[uint64](slave_fd),
+                                      cast[uint64](&out_line[0]), 3, 0)
+    if sw_n != 3:
+        printk1("[PTY] FAIL slave write count=%d\n", cast[uint64](sw_n))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    mo_buf: Array[16, uint8]
+    mo_n: int64 = _uabi_test_dispatch(SYS_read,
+                                      cast[uint64](master_fd),
+                                      cast[uint64](&mo_buf[0]), 16, 0)
+    if mo_n != 4:
+        printk1("[PTY] FAIL master out read count=%d (want 4 CRLF)\n",
+                cast[uint64](mo_n))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    if mo_buf[0] != 79 or mo_buf[1] != 75 or mo_buf[2] != 13 \
+            or mo_buf[3] != 10:
+        printk0("[PTY] FAIL master out bytes (want O K CR LF)\n")
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+
+    # --- 11. raw mode: TCSETS clears ICANON|ECHO on the slave --------
+    # Fetch the pair's termios, clear ICANON|ECHO, set it back, then
+    # confirm a master write reaches the slave read RAW with NO echo and
+    # NO line assembly (a single byte returns immediately, no '\n' needed).
+    tio: Array[36, uint8]
+    g_rc: int64 = _uabi_test_dispatch(SYS_ioctl, cast[uint64](slave_fd),
+                                      0x5401,                  # TCGETS
+                                      cast[uint64](&tio[0]), 0)
+    if g_rc != 0:
+        printk1("[PTY] FAIL slave TCGETS rc=%d\n", cast[uint64](g_rc))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    # c_lflag is at byte offset 12 (u32). Clear ICANON|ECHO.
+    lflag: uint32 = cast[Ptr[uint32]](cast[uint64](&tio[0]) + 12)[0]
+    lflag = lflag & ~(PTYT_ICANON | PTYT_ECHO)
+    cast[Ptr[uint32]](cast[uint64](&tio[0]) + 12)[0] = lflag
+    s_rc: int64 = _uabi_test_dispatch(SYS_ioctl, cast[uint64](slave_fd),
+                                      0x5402,                  # TCSETS
+                                      cast[uint64](&tio[0]), 0)
+    if s_rc != 0:
+        printk1("[PTY] FAIL slave TCSETS rc=%d\n", cast[uint64](s_rc))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    # Master writes a single raw byte 'X' (no newline). Cooked mode would
+    # block waiting for '\n'; raw mode returns it immediately.
+    rawb: Array[1, uint8]
+    rawb[0] = 88                                         # 'X'
+    rw_n: int64 = _uabi_test_dispatch(SYS_write, cast[uint64](master_fd),
+                                      cast[uint64](&rawb[0]), 1, 0)
+    if rw_n != 1:
+        printk1("[PTY] FAIL raw master write count=%d\n", cast[uint64](rw_n))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    rr_buf: Array[4, uint8]
+    rr_n: int64 = _uabi_test_dispatch(SYS_read, cast[uint64](slave_fd),
+                                      cast[uint64](&rr_buf[0]), 4, 0)
+    if rr_n != 1 or rr_buf[0] != 88:
+        printk1("[PTY] FAIL raw slave read count=%d\n", cast[uint64](rr_n))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    # Raw mode has ECHO cleared, so the master read queue must be EMPTY
+    # (a non-blocking master read returns 0). Use the vfs non-blocking
+    # peek to avoid a block: there should be nothing echoed.
+    if pty_master_readable(cast[int32](slave_n)) != 0:
+        printk0("[PTY] FAIL raw mode produced echo (want none)\n")
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+
+    # --- 8(close). close both ends -----------------------------------
+    _uabi_test_dispatch(SYS_close, cast[uint64](slave_fd), 0, 0, 0)
+    _uabi_test_dispatch(SYS_close, cast[uint64](master_fd), 0, 0, 0)
+    # After both closes the pair must be free again (reusable).
+    if pty_valid(cast[int32](slave_n)) != 0:
+        printk0("[PTY] FAIL pair not freed after dual close\n")
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+
+    _pty_selftest_restore(boot_task, &fd_save[0])
+    printk0("[PTY] PASS\n")
+    return 0
+
+
+def _pty_build_pts_path(dst: Ptr[uint8], n: uint64):
+    # Write "/dev/pts/<n>\0" into dst (n < 100 covers the 16-pair pool).
+    dst[0] = 47                                          # '/'
+    dst[1] = 100                                         # 'd'
+    dst[2] = 101                                         # 'e'
+    dst[3] = 118                                         # 'v'
+    dst[4] = 47                                          # '/'
+    dst[5] = 112                                         # 'p'
+    dst[6] = 116                                         # 't'
+    dst[7] = 115                                         # 's'
+    dst[8] = 47                                          # '/'
+    p: uint64 = 9
+    if n >= 10:
+        dst[p] = cast[uint8](48 + ((n / 10) % 10))
+        p = p + 1
+    dst[p] = cast[uint8](48 + (n % 10))
+    p = p + 1
+    dst[p] = 0
+
+
+def _pty_selftest_restore(boot_task: Ptr[TaskStruct], fd_save: Ptr[uint32]):
     fdr: uint64 = 3
     while fdr < 16:
         boot_task[0].fd_idx[fdr] = fd_save[fdr]

@@ -1,0 +1,627 @@
+# linux_abi/u_pty.ad
+#
+# #165 — the Linux-ABI pseudo-terminal (PTY) layer.
+#
+# WHY THIS EXISTS
+# ---------------
+# Linux terminal multiplexers and terminal emulators (tmux, screen, an
+# sshd-spawned login pty, xterm) all build on the BSD-style ptmx/pts
+# pair: a process opens /dev/ptmx, gets a MASTER fd and a slave index N,
+# unlocks it, then a child opens /dev/pts/N as its controlling terminal.
+# Bytes written to the master are the terminal's *input* to the slave
+# (and run through the slave's line discipline — cooked editing + echo);
+# bytes written to the slave are the program's *output* back to the
+# master (the emulator paints them on screen).
+#
+# Before this milestone Hamnix had a per-task console line discipline
+# (linux_abi/u_termios.ad, #164) but no PTY: a Linux app opening
+# /dev/ptmx got -ENOENT, so anything that fork+exec's under a pty
+# (every interactive shell launched by sshd, every tmux pane) failed.
+#
+# This module gives the LINUX namespace a fixed pool of 16 PTY pairs.
+# Each pair carries:
+#   * two byte queues — m2s (master→slave, the slave's input) and
+#     s2m (slave→master, the program's output + the slave's echo),
+#   * a per-pair `struct termios` (same 36-byte layout u_termios uses),
+#   * a per-pair winsize (row/col/xpixel/ypixel; default 24x80),
+#   * a lock flag (TIOCSPTLCK) and master/slave open refcounts.
+# The line discipline is the SAME canonical/raw + ECHO/ERASE/EOF
+# algorithm #164 documents, but sourced from the pair's m2s queue with
+# echo routed into the pair's s2m queue (so a terminal emulator sees
+# what it typed) instead of the physical console.
+#
+# BOUNDARY LAW
+# ------------
+# Layer 2 (Linux-ABI shim). The pair pool is a confined top-level
+# slot-indexed Array side table — the exact shape as the u_termios
+# store and the epoll/eventfd object pools. It never marshals 9P, never
+# touches devcons, and is opened/read/written/closed ONLY through the
+# fs/vfs.ad fd-marker dispatch (FD_PTMX_MARK), so a native Plan 9 binary
+# can never see it.
+#
+# ADDER QUIRKS HONOURED
+#   * Top-level Array storage only — the pair pool lives at module scope.
+#   * No sizeof — termios byte offsets are hand-numbered constants
+#     matching u_termios.ad exactly.
+#   * fd_buf packs (slot << 1) | is_master so one marker serves both ends.
+
+from kernel.sched.core import yield_to_others
+
+
+# --- FD marker ------------------------------------------------------
+#
+# Colocated here (not kernel/sched/core.ad) following the devstat /
+# devauth / FD_NET_MARK pattern: Adder's flat-merge symbol model lands
+# this constant in the same image .bss as core.ad's markers, so the
+# placement is immaterial to codegen — it just keeps the PTY concern in
+# one file. 0xFFFFFFCA is below the documented-free VT block and unused
+# by every other marker (audited at landing).
+FD_PTMX_MARK: uint32 = 0xFFFFFFCA
+
+
+# --- struct termios byte layout (mirrors u_termios.ad) --------------
+PTY_NCCS:      uint64 = 19
+
+# c_iflag bits
+P_ICRNL:  uint32 = 0x0100
+P_IXON:   uint32 = 0x0400
+# c_oflag bits
+P_OPOST:  uint32 = 0x0001
+P_ONLCR:  uint32 = 0x0004
+# c_lflag bits
+P_ISIG:   uint32 = 0x0001
+P_ICANON: uint32 = 0x0002
+P_ECHO:   uint32 = 0x0008
+P_ECHOE:  uint32 = 0x0010
+P_ECHOK:  uint32 = 0x0020
+# c_cflag bits
+P_CS8:    uint32 = 0x0030
+P_CREAD:  uint32 = 0x0080
+P_B38400: uint32 = 0x000F
+
+# c_cc indices
+P_VINTR:  uint64 = 0
+P_VQUIT:  uint64 = 1
+P_VERASE: uint64 = 2
+P_VKILL:  uint64 = 3
+P_VEOF:   uint64 = 4
+P_VMIN:   uint64 = 6
+P_VEOL:   uint64 = 11
+P_VSUSP:  uint64 = 10
+
+
+# --- the pair pool --------------------------------------------------
+#
+# NPTY pairs. Each queue is a simple flat ring of PTY_QCAP bytes with a
+# head (read cursor) and a count. Two queues per pair.
+NPTY:     uint64 = 16
+PTY_QCAP: uint64 = 4096
+
+# Per-pair lifecycle / control state.
+pty_inuse:   Array[16, int32]            # 0 = free slot
+pty_locked:  Array[16, int32]            # 1 = slave open blocked (TIOCSPTLCK)
+pty_mref:    Array[16, int32]            # master open refcount
+pty_sref:    Array[16, int32]            # slave open refcount
+
+# Per-pair termios (parallel flat Arrays, u_termios shape).
+pty_iflag:   Array[16, uint32]
+pty_oflag:   Array[16, uint32]
+pty_cflag:   Array[16, uint32]
+pty_lflag:   Array[16, uint32]
+pty_line:    Array[16, uint8]
+pty_cc:      Array[304, uint8]           # 16 * 19
+
+# Per-pair winsize (struct winsize { u16 row, col, xpixel, ypixel }).
+pty_ws_row:  Array[16, uint16]
+pty_ws_col:  Array[16, uint16]
+pty_ws_xp:   Array[16, uint16]
+pty_ws_yp:   Array[16, uint16]
+
+# m2s queue: master→slave (the slave's input stream).
+pty_m2s_buf:  Array[65536, uint8]        # 16 * 4096
+pty_m2s_head: Array[16, uint64]
+pty_m2s_cnt:  Array[16, uint64]
+
+# s2m queue: slave→master (program output + slave echo).
+pty_s2m_buf:  Array[65536, uint8]        # 16 * 4096
+pty_s2m_head: Array[16, uint64]
+pty_s2m_cnt:  Array[16, uint64]
+
+
+def _pty_set_termios_defaults(slot: uint64):
+    # The same cooked default u_termios._ut_set_defaults installs: a
+    # canonical tty with echo, CR→NL, output post-processing, and the
+    # INIT_C_CC control characters.
+    pty_iflag[slot] = P_ICRNL | P_IXON
+    pty_oflag[slot] = P_OPOST | P_ONLCR
+    pty_cflag[slot] = P_CS8 | P_CREAD | P_B38400
+    pty_lflag[slot] = P_ISIG | P_ICANON | P_ECHO | P_ECHOE | P_ECHOK
+    pty_line[slot]  = 0
+    base: uint64 = slot * PTY_NCCS
+    i: uint64 = 0
+    while i < PTY_NCCS:
+        pty_cc[base + i] = 0
+        i = i + 1
+    pty_cc[base + P_VINTR]  = 3            # ^C
+    pty_cc[base + P_VQUIT]  = 28           # ^\
+    pty_cc[base + P_VERASE] = 127          # ^? (DEL)
+    pty_cc[base + P_VKILL]  = 21           # ^U
+    pty_cc[base + P_VEOF]   = 4            # ^D
+    pty_cc[base + P_VMIN]   = 1
+    pty_cc[base + P_VSUSP]  = 26           # ^Z
+
+
+# --- queue primitives ----------------------------------------------
+#
+# A ring per (slot, direction). dir 0 == m2s, dir 1 == s2m.
+
+def _pty_q_cnt(slot: uint64, dir: int32) -> uint64:
+    if dir == 0:
+        return pty_m2s_cnt[slot]
+    return pty_s2m_cnt[slot]
+
+
+def _pty_q_push(slot: uint64, dir: int32, b: uint8) -> int32:
+    # Append one byte to a ring. Returns 1 on success, 0 if full (the
+    # byte is dropped — a full tty queue back-pressures by dropping,
+    # which is acceptable for our cooperative, non-preempting model).
+    base: uint64 = slot * PTY_QCAP
+    if dir == 0:
+        if pty_m2s_cnt[slot] >= PTY_QCAP:
+            return 0
+        tail: uint64 = (pty_m2s_head[slot] + pty_m2s_cnt[slot]) % PTY_QCAP
+        pty_m2s_buf[base + tail] = b
+        pty_m2s_cnt[slot] = pty_m2s_cnt[slot] + 1
+        return 1
+    if pty_s2m_cnt[slot] >= PTY_QCAP:
+        return 0
+    tail2: uint64 = (pty_s2m_head[slot] + pty_s2m_cnt[slot]) % PTY_QCAP
+    pty_s2m_buf[base + tail2] = b
+    pty_s2m_cnt[slot] = pty_s2m_cnt[slot] + 1
+    return 1
+
+
+def _pty_q_pop(slot: uint64, dir: int32) -> int32:
+    # Remove and return the head byte (0..255), or -1 if empty.
+    base: uint64 = slot * PTY_QCAP
+    if dir == 0:
+        if pty_m2s_cnt[slot] == 0:
+            return -1
+        b: uint8 = pty_m2s_buf[base + pty_m2s_head[slot]]
+        pty_m2s_head[slot] = (pty_m2s_head[slot] + 1) % PTY_QCAP
+        pty_m2s_cnt[slot] = pty_m2s_cnt[slot] - 1
+        return cast[int32](b)
+    if pty_s2m_cnt[slot] == 0:
+        return -1
+    b2: uint8 = pty_s2m_buf[base + pty_s2m_head[slot]]
+    pty_s2m_head[slot] = (pty_s2m_head[slot] + 1) % PTY_QCAP
+    pty_s2m_cnt[slot] = pty_s2m_cnt[slot] - 1
+    return cast[int32](b2)
+
+
+def _pty_q_peek(slot: uint64, dir: int32) -> int32:
+    # Return the head byte without consuming it, or -1 if empty.
+    base: uint64 = slot * PTY_QCAP
+    if dir == 0:
+        if pty_m2s_cnt[slot] == 0:
+            return -1
+        return cast[int32](pty_m2s_buf[base + pty_m2s_head[slot]])
+    if pty_s2m_cnt[slot] == 0:
+        return -1
+    return cast[int32](pty_s2m_buf[base + pty_s2m_head[slot]])
+
+
+def _pty_q_unpop(slot: uint64, dir: int32, b: uint8):
+    # Push a byte back onto the HEAD of the ring (used to keep a '\n'
+    # available to the next canonical read). Safe because we only ever
+    # un-pop a byte we just popped, so capacity is guaranteed.
+    base: uint64 = slot * PTY_QCAP
+    if dir == 0:
+        pty_m2s_head[slot] = (pty_m2s_head[slot] + PTY_QCAP - 1) % PTY_QCAP
+        pty_m2s_buf[base + pty_m2s_head[slot]] = b
+        pty_m2s_cnt[slot] = pty_m2s_cnt[slot] + 1
+        return
+    pty_s2m_head[slot] = (pty_s2m_head[slot] + PTY_QCAP - 1) % PTY_QCAP
+    pty_s2m_buf[base + pty_s2m_head[slot]] = b
+    pty_s2m_cnt[slot] = pty_s2m_cnt[slot] + 1
+
+
+# --- pair allocation / release -------------------------------------
+
+def pty_alloc_pair() -> int32:
+    # Allocate a free PTY pair, seed its termios/winsize defaults, and
+    # take the first MASTER reference. The pair starts LOCKED (Linux
+    # opens /dev/ptmx, then TIOCSPTLCK-unlocks before letting a slave
+    # open). Returns the slot index, or -1 if the pool is exhausted.
+    slot: uint64 = 0
+    while slot < NPTY:
+        if pty_inuse[slot] == 0:
+            pty_inuse[slot] = 1
+            pty_locked[slot] = 1
+            pty_mref[slot] = 1
+            pty_sref[slot] = 0
+            pty_m2s_head[slot] = 0
+            pty_m2s_cnt[slot] = 0
+            pty_s2m_head[slot] = 0
+            pty_s2m_cnt[slot] = 0
+            _pty_set_termios_defaults(slot)
+            pty_ws_row[slot] = 24
+            pty_ws_col[slot] = 80
+            pty_ws_xp[slot] = 0
+            pty_ws_yp[slot] = 0
+            return cast[int32](slot)
+        slot = slot + 1
+    return -1
+
+
+def pty_slave_open(slot: int32) -> int32:
+    # Take a slave reference on an already-allocated, UNLOCKED pair.
+    # Returns 0 on success, -5 (-EIO) if the pair is locked or invalid
+    # (a locked slave open is the kernel's "you didn't TIOCSPTLCK" guard).
+    if slot < 0 or cast[uint64](slot) >= NPTY:
+        return -5
+    su: uint64 = cast[uint64](slot)
+    if pty_inuse[su] == 0:
+        return -5
+    if pty_locked[su] != 0:
+        return -5
+    pty_sref[su] = pty_sref[su] + 1
+    return 0
+
+
+def pty_master_unref(slot: int32):
+    # Drop a master reference; free the whole pair once BOTH ends'
+    # refcounts reach zero (Plan 9 / Linux: the pair lives as long as
+    # either end is open).
+    if slot < 0 or cast[uint64](slot) >= NPTY:
+        return
+    su: uint64 = cast[uint64](slot)
+    if pty_mref[su] > 0:
+        pty_mref[su] = pty_mref[su] - 1
+    _pty_maybe_free(su)
+
+
+def pty_slave_unref(slot: int32):
+    if slot < 0 or cast[uint64](slot) >= NPTY:
+        return
+    su: uint64 = cast[uint64](slot)
+    if pty_sref[su] > 0:
+        pty_sref[su] = pty_sref[su] - 1
+    _pty_maybe_free(su)
+
+
+def _pty_maybe_free(su: uint64):
+    if pty_mref[su] == 0 and pty_sref[su] == 0:
+        pty_inuse[su] = 0
+        pty_locked[su] = 0
+        pty_m2s_cnt[su] = 0
+        pty_s2m_cnt[su] = 0
+
+
+def pty_unlock(slot: int32) -> int32:
+    # TIOCSPTLCK(&0) — clear the lock so a slave open succeeds.
+    if slot < 0 or cast[uint64](slot) >= NPTY:
+        return -5
+    pty_locked[cast[uint64](slot)] = 0
+    return 0
+
+
+def pty_set_lock(slot: int32, lock: int32) -> int32:
+    # TIOCSPTLCK with a nonzero arg re-locks; with 0 unlocks.
+    if slot < 0 or cast[uint64](slot) >= NPTY:
+        return -5
+    if lock != 0:
+        pty_locked[cast[uint64](slot)] = 1
+    else:
+        pty_locked[cast[uint64](slot)] = 0
+    return 0
+
+
+def pty_valid(slot: int32) -> int32:
+    if slot < 0 or cast[uint64](slot) >= NPTY:
+        return 0
+    return pty_inuse[cast[uint64](slot)]
+
+
+# --- termios get/set (per pair) ------------------------------------
+
+def pty_tcgets(slot: int32, out: uint64) -> int64:
+    # Fill the caller's `struct termios` from the pair's stored state.
+    if slot < 0 or cast[uint64](slot) >= NPTY:
+        return cast[int64](-9)               # -EBADF
+    if out == 0:
+        return cast[int64](-22)
+    su: uint64 = cast[uint64](slot)
+    cast[Ptr[uint32]](out)[0]      = pty_iflag[su]
+    cast[Ptr[uint32]](out + 4)[0]  = pty_oflag[su]
+    cast[Ptr[uint32]](out + 8)[0]  = pty_cflag[su]
+    cast[Ptr[uint32]](out + 12)[0] = pty_lflag[su]
+    cast[Ptr[uint8]](out + 16)[0]  = pty_line[su]
+    base: uint64 = su * PTY_NCCS
+    i: uint64 = 0
+    while i < PTY_NCCS:
+        cast[Ptr[uint8]](out + 17 + i)[0] = pty_cc[base + i]
+        i = i + 1
+    return 0
+
+
+def pty_tcsets(slot: int32, inp: uint64) -> int64:
+    # Apply the caller's `struct termios` to the pair. Clearing
+    # ICANON|ECHO here is what flips the slave into raw mode.
+    if slot < 0 or cast[uint64](slot) >= NPTY:
+        return cast[int64](-9)
+    if inp == 0:
+        return cast[int64](-22)
+    su: uint64 = cast[uint64](slot)
+    pty_iflag[su] = cast[Ptr[uint32]](inp)[0]
+    pty_oflag[su] = cast[Ptr[uint32]](inp + 4)[0]
+    pty_cflag[su] = cast[Ptr[uint32]](inp + 8)[0]
+    pty_lflag[su] = cast[Ptr[uint32]](inp + 12)[0]
+    pty_line[su]  = cast[Ptr[uint8]](inp + 16)[0]
+    base: uint64 = su * PTY_NCCS
+    i: uint64 = 0
+    while i < PTY_NCCS:
+        pty_cc[base + i] = cast[Ptr[uint8]](inp + 17 + i)[0]
+        i = i + 1
+    return 0
+
+
+# --- winsize get/set (per pair) ------------------------------------
+
+def pty_getwinsz(slot: int32, out: uint64) -> int64:
+    if slot < 0 or cast[uint64](slot) >= NPTY:
+        return cast[int64](-9)
+    if out == 0:
+        return cast[int64](-22)
+    su: uint64 = cast[uint64](slot)
+    cast[Ptr[uint16]](out)[0]     = pty_ws_row[su]
+    cast[Ptr[uint16]](out + 2)[0] = pty_ws_col[su]
+    cast[Ptr[uint16]](out + 4)[0] = pty_ws_xp[su]
+    cast[Ptr[uint16]](out + 6)[0] = pty_ws_yp[su]
+    return 0
+
+
+def pty_setwinsz(slot: int32, inp: uint64) -> int64:
+    if slot < 0 or cast[uint64](slot) >= NPTY:
+        return cast[int64](-9)
+    if inp == 0:
+        return cast[int64](-22)
+    su: uint64 = cast[uint64](slot)
+    pty_ws_row[su] = cast[Ptr[uint16]](inp)[0]
+    pty_ws_col[su] = cast[Ptr[uint16]](inp + 2)[0]
+    pty_ws_xp[su]  = cast[Ptr[uint16]](inp + 4)[0]
+    pty_ws_yp[su]  = cast[Ptr[uint16]](inp + 6)[0]
+    return 0
+
+
+# --- echo helper ----------------------------------------------------
+#
+# Echo bytes go into the s2m queue (the master's read stream) so a
+# terminal emulator paints what was typed — exactly what u_termios does
+# with vfs_console_write, only the sink is this pair's master side.
+
+def _pty_echo_byte(slot: uint64, c: int32):
+    _pty_q_push(slot, 1, cast[uint8](c & 0xFF))
+
+
+def _pty_echo_erase(slot: uint64):
+    # Visually erase one cell on the master: BS, space, BS.
+    _pty_q_push(slot, 1, 8)
+    _pty_q_push(slot, 1, 32)
+    _pty_q_push(slot, 1, 8)
+
+
+# --- master write: feed the slave input queue ----------------------
+
+def pty_master_write(slot: int32, buf: Ptr[uint8], count: uint64) -> int64:
+    # write(master, ...) — the bytes the terminal "types" into the slave.
+    # They land RAW in the m2s queue; the line discipline runs lazily on
+    # the slave's read (so ERASE/EOF editing sees the whole pending line).
+    if slot < 0 or cast[uint64](slot) >= NPTY:
+        return cast[int64](-9)
+    su: uint64 = cast[uint64](slot)
+    if pty_inuse[su] == 0:
+        return cast[int64](-9)
+    n: uint64 = 0
+    while n < count:
+        if _pty_q_push(su, 0, buf[n]) == 0:
+            break                            # queue full — short write
+        n = n + 1
+    return cast[int64](n)
+
+
+# --- slave write: feed the master read queue -----------------------
+
+def pty_slave_write(slot: int32, buf: Ptr[uint8], count: uint64) -> int64:
+    # write(slave, ...) — the program's output to the terminal. Honour
+    # OPOST|ONLCR (NL→CRNL) so a cooked-mode program's '\n' shows as a
+    # CR+LF on the master, matching a real tty.
+    if slot < 0 or cast[uint64](slot) >= NPTY:
+        return cast[int64](-9)
+    su: uint64 = cast[uint64](slot)
+    if pty_inuse[su] == 0:
+        return cast[int64](-9)
+    oflag: uint32 = pty_oflag[su]
+    onlcr: int32 = 0
+    if (oflag & P_OPOST) != 0 and (oflag & P_ONLCR) != 0:
+        onlcr = 1
+    n: uint64 = 0
+    while n < count:
+        b: uint8 = buf[n]
+        if onlcr != 0 and b == 10:
+            if _pty_q_push(su, 1, 13) == 0:
+                break
+        if _pty_q_push(su, 1, b) == 0:
+            break
+        n = n + 1
+    return cast[int64](n)
+
+
+# --- master read: drain the s2m queue (program output + echo) ------
+
+def pty_master_read(slot: int32, buf: Ptr[uint8], count: uint64) -> int64:
+    # read(master, ...) — what a terminal emulator pulls to paint the
+    # screen: the slave's output AND any echo the slave's discipline
+    # produced. Blocks (yields) until at least one byte is available;
+    # then drains what's queued up to `count`. Raw stream — no discipline
+    # on the master side (a master is always "raw").
+    if slot < 0 or cast[uint64](slot) >= NPTY:
+        return cast[int64](-9)
+    su: uint64 = cast[uint64](slot)
+    if pty_inuse[su] == 0:
+        return cast[int64](-9)
+    if count == 0:
+        return 0
+    while _pty_q_cnt(su, 1) == 0:
+        # If the slave end is gone and nothing is queued, EOF.
+        if pty_sref[su] == 0:
+            return 0
+        yield_to_others()
+    n: uint64 = 0
+    while n < count:
+        b: int32 = _pty_q_pop(su, 1)
+        if b < 0:
+            break
+        buf[n] = cast[uint8](b & 0xFF)
+        n = n + 1
+    return cast[int64](n)
+
+
+# --- master read, non-blocking single-shot -------------------------
+
+def pty_master_read_nb(slot: int32, buf: Ptr[uint8], count: uint64) -> int64:
+    # Non-blocking drain of the s2m queue. >0 bytes, 0 == would-block
+    # (or EOF if the slave is gone). For the O_NONBLOCK / poll path.
+    if slot < 0 or cast[uint64](slot) >= NPTY:
+        return cast[int64](-9)
+    su: uint64 = cast[uint64](slot)
+    if pty_inuse[su] == 0:
+        return cast[int64](-9)
+    if count == 0:
+        return 0
+    n: uint64 = 0
+    while n < count:
+        b: int32 = _pty_q_pop(su, 1)
+        if b < 0:
+            break
+        buf[n] = cast[uint8](b & 0xFF)
+        n = n + 1
+    return cast[int64](n)
+
+
+# --- slave read: the line discipline over the m2s queue ------------
+
+def pty_slave_read(slot: int32, buf: Ptr[uint8], count: uint64) -> int64:
+    # read(slave, ...) — the cooked/raw line discipline, sourced from the
+    # m2s queue (master writes) with echo routed to the s2m queue. This
+    # is the SAME canonical/raw + ECHO/ERASE/EOF algorithm u_termios.ad
+    # documents; the only difference is the byte source and echo sink.
+    # Returns >0 bytes, 0 == EOF (VEOF on an empty canonical line, or the
+    # master end gone), <0 errno.
+    if slot < 0 or cast[uint64](slot) >= NPTY:
+        return cast[int64](-9)
+    su: uint64 = cast[uint64](slot)
+    if pty_inuse[su] == 0:
+        return cast[int64](-9)
+    if count == 0:
+        return 0
+    lflag: uint32 = pty_lflag[su]
+    iflag: uint32 = pty_iflag[su]
+    base:  uint64 = su * PTY_NCCS
+    cc_erase: int32 = cast[int32](pty_cc[base + P_VERASE])
+    cc_eof:   int32 = cast[int32](pty_cc[base + P_VEOF])
+    cc_kill:  int32 = cast[int32](pty_cc[base + P_VKILL])
+    do_echo:  int32 = 0
+    if (lflag & P_ECHO) != 0:
+        do_echo = 1
+
+    # --- RAW (non-canonical) mode -----------------------------------
+    if (lflag & P_ICANON) == 0:
+        # VMIN=1 approximation: block until at least one byte, then drain
+        # what is available up to `count`.
+        while _pty_q_cnt(su, 0) == 0:
+            if pty_mref[su] == 0:
+                return 0                     # master gone — EOF
+            yield_to_others()
+        n: uint64 = 0
+        while n < count:
+            b: int32 = _pty_q_pop(su, 0)
+            if b < 0:
+                break
+            buf[n] = cast[uint8](b & 0xFF)
+            if do_echo != 0:
+                _pty_echo_byte(su, b)
+            n = n + 1
+        return cast[int64](n)
+
+    # --- CANONICAL (cooked) mode ------------------------------------
+    icrnl: int32 = 0
+    if (iflag & P_ICRNL) != 0:
+        icrnl = 1
+    n: uint64 = 0
+    while True:
+        got: int32 = _pty_q_pop(su, 0)
+        if got < 0:
+            if pty_mref[su] == 0:
+                # Master gone: deliver any partial line, else EOF.
+                if n > 0:
+                    return cast[int64](n)
+                return 0
+            yield_to_others()
+            continue
+        c: int32 = got
+        # CR → NL (ICRNL)
+        if c == 13 and icrnl != 0:
+            c = 10
+        # VEOF (^D): empty line == EOF; mid-line flushes the partial line.
+        if c == cc_eof:
+            if n == 0:
+                return 0
+            return cast[int64](n)
+        # VERASE (^? / ^H): rub out the previous char.
+        if c == cc_erase or c == 8:
+            if n > 0:
+                n = n - 1
+                if do_echo != 0 and (lflag & P_ECHOE) != 0:
+                    _pty_echo_erase(su)
+            continue
+        # VKILL (^U): erase the whole pending line.
+        if c == cc_kill:
+            while n > 0:
+                n = n - 1
+                if do_echo != 0 and (lflag & P_ECHOE) != 0:
+                    _pty_echo_erase(su)
+            continue
+        # Newline terminates the canonical line.
+        if c == 10:
+            buf[n] = 10
+            n = n + 1
+            if do_echo != 0:
+                _pty_echo_byte(su, 10)
+            return cast[int64](n)
+        # Ordinary byte: store + echo.
+        buf[n] = cast[uint8](c & 0xFF)
+        if do_echo != 0:
+            _pty_echo_byte(su, c)
+        n = n + 1
+        if n >= count:
+            return cast[int64](n)
+    return cast[int64](n)
+
+
+# --- readiness probe (poll/epoll) ----------------------------------
+
+def pty_master_readable(slot: int32) -> int32:
+    if slot < 0 or cast[uint64](slot) >= NPTY:
+        return 0
+    if _pty_q_cnt(cast[uint64](slot), 1) > 0:
+        return 1
+    return 0
+
+
+def pty_slave_readable(slot: int32) -> int32:
+    if slot < 0 or cast[uint64](slot) >= NPTY:
+        return 0
+    if _pty_q_cnt(cast[uint64](slot), 0) > 0:
+        return 1
+    return 0

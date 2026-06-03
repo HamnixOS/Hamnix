@@ -371,6 +371,15 @@ if os.environ.get("ENABLE_UABI_FILLS_TEST") == "1":
 if os.environ.get("ENABLE_BACKTRACE_TEST") == "1":
     FILES.append(("/etc/backtrace-test", b"1\n"))
 
+# #165: linux-abi PTY (pseudo-terminal) self-test. scripts/test_pty.sh
+# sets ENABLE_PTY_TEST=1 to plant /etc/pty-test (the gate marker).
+# init/main.ad at boot:37.pty detects it and calls pty_selftest()
+# (linux_abi/u_syscalls.ad), which drives the full ptmx/pts open+ioctl+
+# read+write+close path through the real in-kernel dispatch and prints
+# "[PTY] PASS" / "[PTY] FAIL ...". Default boots omit the marker.
+if os.environ.get("ENABLE_PTY_TEST") == "1":
+    FILES.append(("/etc/pty-test", b"1\n"))
+
 # linux-abi msync(2) self-test. scripts/test_msync.sh sets
 # ENABLE_MSYNC_TEST=1 to plant /etc/msync-test (the gate marker).
 # init/main.ad at boot:37.msy detects it and calls msync_selftest()

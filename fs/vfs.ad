@@ -102,6 +102,20 @@ from sys.src.port9.port.devauth import (
     devauth_alloc, devauth_close, devauth_read, devauth_write,
     FD_AUTH_MARK,
 )
+# #165: the Linux-ABI pseudo-terminal layer. /dev/ptmx + /dev/pts/N are
+# routed here at open() to FD_PTMX_MARK fds whose fd_buf packs
+# (slot << 1) | is_master; vfs_read / vfs_write / vfs_close dispatch the
+# data path + teardown through the u_pty pair pool. This is a Layer-2
+# (linux_abi/) concern — a native Plan 9 binary never opens these paths
+# (they have no namec devtab entry), so the marker only ever appears in
+# a Linux guest's fd table. Colocated FD_PTMX_MARK follows the same
+# flat-merge-symbol pattern as FD_AUTH_MARK above.
+from linux_abi.u_pty import (
+    FD_PTMX_MARK,
+    pty_alloc_pair, pty_slave_open, pty_master_unref, pty_slave_unref,
+    pty_master_read, pty_slave_read, pty_master_write, pty_slave_write,
+    pty_valid,
+)
 # M16.x: /dev/blk/<name> block-device cdev. FD_BLK_MARK fds carry
 # (slot, mode) in fd_buf and a byte offset in fd_pos. Dispatch arms
 # below route reads/writes to blk_read_sectors/blk_write_sectors.
@@ -1215,6 +1229,24 @@ def vfs_open(name: Ptr[char]) -> int32:
     # slot for the user/pass/response buffers + rate-limit timestamp).
     if _path_eq_const(name, "/dev/auth", 9) != 0:
         return _open_auth_marked()
+    # #165: /dev/ptmx — allocate a fresh PTY pair and return the MASTER
+    # fd. /dev/pts/<N> — open the SLAVE end of pair N (fails -EIO until
+    # the master TIOCSPTLCK-unlocks it). Routed BEFORE namec because the
+    # PTY layer is a Layer-2 (linux_abi/) concern with no namec devtab
+    # entry; matching these here keeps the pair pool entirely inside the
+    # Linux-ABI surface. See _open_ptmx / _open_pts.
+    if _path_eq_const(name, "/dev/ptmx", 9) != 0:
+        return _open_ptmx()
+    pts_n: int32 = _pts_path_index(name)
+    if pts_n >= -1:
+        # _pts_path_index returns >=0 for a valid /dev/pts/<digits>,
+        # -1 for a malformed /dev/pts/<...> (a real path that is the
+        # pts dir but not a numbered slave — -ENOENT), or -2 when the
+        # path is not under /dev/pts at all (fall through).
+        if pts_n == -1:
+            set_current_errstr("pts: no such terminal")
+            return ENOENT
+        return _open_pts(pts_n)
     # Phase D: the universal namec open path. namec() walks the
     # calling process's Pgrp mount table; if `name` falls under a 9P
     # SRV-kind mount it produces a mounted-9P Chan, and if `name` is a
@@ -2081,6 +2113,19 @@ def vfs_open_write(name: Ptr[char]) -> int32:
     # for that case.
     if _path_eq_const(name, "/dev/auth", 9) != 0:
         return _open_auth_marked()
+    # #165 Linux-ABI PTY: a pseudo-terminal is inherently opened O_RDWR,
+    # so the master (/dev/ptmx) and slave (/dev/pts/N) opens land HERE on
+    # the write path (accmode != 0 in _u_open). Route them to the same
+    # pair-pool helpers vfs_open uses; without this they fall through to
+    # the generic write-create probe and return -EROFS.
+    if _path_eq_const(name, "/dev/ptmx", 9) != 0:
+        return _open_ptmx()
+    pts_wn: int32 = _pts_path_index(name)
+    if pts_wn >= -1:
+        if pts_wn == -1:
+            set_current_errstr("pts: no such terminal")
+            return ENOENT
+        return _open_pts(pts_wn)
     # /dev/blk/<name>{,/size,/ctl} OWRITE side. The installer opens
     # the block-device cdev with SYS_OPEN_WRITE and streams raw bytes
     # (or sends a CTL command); same fd shape as the OREAD path.
@@ -3254,6 +3299,22 @@ def vfs_fd_marker(fd: int32) -> uint32:
     return task[0].fd_idx[cast[uint64](fd)]
 
 
+def vfs_fd_pty_pack(fd: int32) -> int64:
+    # #165: if `fd` is an open PTY fd (FD_PTMX_MARK), return its packed
+    # fd_buf — (slot << 1) | is_master — widened to int64. Returns -1 for
+    # any non-PTY / closed fd. The Layer-2 ioctl shim uses this to route
+    # TIOCGPTN / TIOCSPTLCK / TCGETS / TCSETS / TIOC{G,S}WINSZ on a pty
+    # to the right pair without importing the pair pool.
+    rc: int32 = _check_fd(fd)
+    if rc != 0:
+        return -1
+    task: Ptr[TaskStruct] = current_task()
+    fdu: uint64 = cast[uint64](fd)
+    if task[0].fd_idx[fdu] != FD_PTMX_MARK:
+        return -1
+    return cast[int64](task[0].fd_buf[fdu])
+
+
 def vfs_fd_is_console(fd: int32) -> int32:
     # #164: is `fd` backed by the physical console (keyboard / UART)?
     # The Linux-ABI termios line discipline (linux_abi/u_termios.ad)
@@ -3786,6 +3847,92 @@ def vfs_fd_auth_slot(fd: int32) -> int32:
     if task[0].fd_idx[fdu] != FD_AUTH_MARK:
         return -1
     return cast[int32](task[0].fd_buf[fdu])
+
+
+# --- #165: PTY open helpers ----------------------------------------
+#
+# fd_buf packs (slot << 1) | is_master so one FD_PTMX_MARK serves both
+# the master (/dev/ptmx) and slave (/dev/pts/N) ends. fd_pos is unused
+# (a tty is a stream, not seekable — see the lseek arm).
+
+def _pty_fd_slot(pk: uint64) -> int32:
+    return cast[int32](pk >> 1)
+
+
+def _pty_fd_is_master(pk: uint64) -> int32:
+    return cast[int32](pk & 1)
+
+
+def _open_ptmx() -> int32:
+    # /dev/ptmx open: allocate a fresh pair (master ref taken inside
+    # pty_alloc_pair) and install an FD_PTMX_MARK fd tagged as the master.
+    slot: int32 = pty_alloc_pair()
+    if slot < 0:
+        set_current_errstr("ptmx: no free PTY pairs")
+        return EMFILE
+    task: Ptr[TaskStruct] = current_task()
+    fd: int32 = _alloc_fd(task)
+    if fd < 0:
+        pty_master_unref(slot)
+        return EMFILE
+    fdu: uint64 = cast[uint64](fd)
+    task[0].fd_idx[fdu] = FD_PTMX_MARK
+    task[0].fd_pos[fdu] = 0
+    task[0].fd_buf[fdu] = (cast[uint64](cast[uint32](slot)) << 1) | 1
+    return fd
+
+
+def _open_pts(slot: int32) -> int32:
+    # /dev/pts/<N> open: take a slave ref (fails -EIO on a locked or
+    # invalid pair), then install an FD_PTMX_MARK fd tagged as the slave.
+    rc: int32 = pty_slave_open(slot)
+    if rc != 0:
+        set_current_errstr("pts: slave locked or invalid")
+        return EIO
+    task: Ptr[TaskStruct] = current_task()
+    fd: int32 = _alloc_fd(task)
+    if fd < 0:
+        pty_slave_unref(slot)
+        return EMFILE
+    fdu: uint64 = cast[uint64](fd)
+    task[0].fd_idx[fdu] = FD_PTMX_MARK
+    task[0].fd_pos[fdu] = 0
+    task[0].fd_buf[fdu] = (cast[uint64](cast[uint32](slot)) << 1)
+    return fd
+
+
+def _pts_path_index(name: Ptr[char]) -> int32:
+    # Parse a `/dev/pts/<digits>` path. Returns the slot index >=0 for a
+    # well-formed numbered slave, -1 for a path that IS under /dev/pts/
+    # but isn't valid digits (-> -ENOENT), or -2 when the path is not
+    # under /dev/pts at all (caller falls through to other routing).
+    prefix: Array[9, uint8]
+    prefix[0] = 47                              # '/'
+    prefix[1] = 100                             # 'd'
+    prefix[2] = 101                             # 'e'
+    prefix[3] = 118                             # 'v'
+    prefix[4] = 47                              # '/'
+    prefix[5] = 112                             # 'p'
+    prefix[6] = 116                             # 't'
+    prefix[7] = 115                             # 's'
+    prefix[8] = 47                              # '/'
+    i: uint64 = 0
+    while i < 9:
+        if name[i] != cast[int32](prefix[i]):
+            return -2                           # not /dev/pts/...
+        i = i + 1
+    # Parse decimal digits after the prefix; must be non-empty + NUL.
+    if name[9] == 0:
+        return -1                               # bare "/dev/pts/"
+    n: int32 = 0
+    j: uint64 = 9
+    while name[j] != 0:
+        c: int32 = name[j]
+        if c < 48 or c > 57:
+            return -1                           # non-digit -> ENOENT
+        n = n * 10 + (c - 48)
+        j = j + 1
+    return n
 
 
 def _open_blk_marked(pack: uint64) -> int32:
@@ -4330,6 +4477,17 @@ def vfs_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
     if file_idx == FD_DEVNULL_MARK:
         # /dev/null reads always return EOF.
         return 0
+    if file_idx == FD_PTMX_MARK:
+        # #165: a PTY fd. fd_buf packs (slot << 1) | is_master. A master
+        # read drains the slave's output (s2m queue); a slave read runs
+        # the cooked/raw line discipline over the master-write queue
+        # (m2s). Both block-yield until bytes are available (or the peer
+        # end closes -> EOF). The discipline + echo live in u_pty.ad.
+        pty_pk: uint64 = task[0].fd_buf[fdu]
+        pty_slot: int32 = _pty_fd_slot(pty_pk)
+        if _pty_fd_is_master(pty_pk) != 0:
+            return pty_master_read(pty_slot, buf, count)
+        return pty_slave_read(pty_slot, buf, count)
     if file_idx == FD_NET_MARK:
         # ARCH §10: a /net file-tree fd. fd_buf packs (proto, conn,
         # file-kind). The clone / info files render text snapshots that
@@ -4828,6 +4986,16 @@ def vfs_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         # /dev/null and /dev/zero swallow writes silently — the
         # full `count` is returned as bytes-written.
         return cast[int64](count)
+    if file_idx == FD_PTMX_MARK:
+        # #165: a PTY fd. A master write feeds the slave's input queue
+        # (m2s — the bytes the terminal "types"); a slave write feeds the
+        # master's read queue (s2m — the program's output, OPOST|ONLCR
+        # applied). See u_pty.ad.
+        pty_pk: uint64 = task[0].fd_buf[fdu]
+        pty_slot: int32 = _pty_fd_slot(pty_pk)
+        if _pty_fd_is_master(pty_pk) != 0:
+            return pty_master_write(pty_slot, buf, count)
+        return pty_slave_write(pty_slot, buf, count)
     if file_idx == FD_NET_MARK:
         # ARCH §10: a /net file-tree fd. A write to the data file
         # streams bytes onto the connection; a write to the ctl file
@@ -5274,6 +5442,17 @@ def vfs_close(fd: int32) -> int32:
     if file_idx == FD_AUTH_MARK:
         au_c_slot: int32 = cast[int32](task[0].fd_buf[fdu])
         devauth_close(au_c_slot)
+    # #165: a PTY fd — drop the right end's refcount BEFORE
+    # close_fd_in_task wipes fd_buf (core.ad knows nothing of
+    # FD_PTMX_MARK, same rationale as the FD_AUTH_MARK / FD_NET_MARK
+    # arms). Releasing BOTH ends frees the pair slot inside u_pty.ad.
+    if file_idx == FD_PTMX_MARK:
+        pty_c_pk: uint64 = task[0].fd_buf[fdu]
+        pty_c_slot: int32 = _pty_fd_slot(pty_c_pk)
+        if _pty_fd_is_master(pty_c_pk) != 0:
+            pty_master_unref(pty_c_slot)
+        else:
+            pty_slave_unref(pty_c_slot)
     # V5: socketpair endpoint — decrement the SocketPair's refcount
     # BEFORE close_fd_in_task wipes the slot (it doesn't know about
     # FD_SOCKETPAIR_MARK, since core.ad is off-limits for this
@@ -5432,7 +5611,7 @@ def vfs_lseek(fd: int32, offset: int64, whence: int32) -> int64:
             or file_idx == FD_LOADAVG_MARK or file_idx == FD_VERSION_MARK \
             or file_idx == FD_HOSTNAME_MARK or file_idx == FD_STAT_MARK \
             or file_idx == FD_MOUNTS_MARK or file_idx == FD_DISKSTATS_MARK \
-            or file_idx == FD_AUTH_MARK:
+            or file_idx == FD_AUTH_MARK or file_idx == FD_PTMX_MARK:
         # Linux returns ESPIPE for seek on a pipe / tty / char device;
         # we don't distinguish that errno yet, just say EINVAL. procfs
         # files are seekable in Linux but our snapshot semantics make
