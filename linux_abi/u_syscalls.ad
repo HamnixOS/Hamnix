@@ -362,6 +362,20 @@ from mm.vma import (
     VMA_PROT_READ, VMA_PROT_WRITE,
 )
 
+# #163 (SAFE half) — adopt the real user-memory accessor layer for the
+# hottest, highest-risk user-pointer writeback/read sites in this file.
+# These helpers walk the CURRENT task's page tables, so a malformed user
+# pointer yields a clean -EFAULT instead of a kernel #PF panic, and the
+# future ET_DYN / mmap-base ASLR work (vaddr != phys) becomes a localized
+# change instead of a whole-tree audit. NO vaddr!=phys decoupling is
+# introduced here: under today's identity map every translated access is
+# the same physical write the raw deref used to do.
+from mm.uaccess import (
+    copy_to_user,
+    get_user_64, put_user_16, put_user_32, put_user_64,
+    strncpy_from_user,
+)
+
 # memset for zero-filling user-supplied stat buffers before we poke
 # individual fields. Declared `extern` because the actual body lives in
 # the C-runtime shim that compiler.adder links against; same pattern as
@@ -749,11 +763,18 @@ SYS_faccessat2:        uint64 = 439
 ELINUX_NOENT:  int64 = -2
 ELINUX_SRCH:   int64 = -3
 ELINUX_BADF:   int64 = -9
+# #163: -EFAULT for the uaccess-converted handlers below. (A second
+# ELINUX_FAULT is declared later near the seccomp block with the same
+# value; both resolve to -14. This early copy guarantees the converted
+# high-traffic handlers — clock_gettime, uname, getcwd, stat, … — have
+# the constant in scope regardless of source order.)
+ELINUX_EFAULT: int64 = -14
 # ELINUX_AGAIN (-11) is declared later alongside the futex stubs; we
 # reuse the same constant for accept(2)'s would-block answer below.
 ELINUX_INVAL:  int64 = -22
 ELINUX_NOTDIR: int64 = -20
 ELINUX_RANGE:  int64 = -34
+ELINUX_NAMETOOLONG: int64 = -36     # -ENAMETOOLONG (#163 path copy-in)
 ELINUX_NOSYS:  int64 = -38
 ELINUX_NOTTY:  int64 = -25
 ELINUX_CONNREFUSED: int64 = -111
@@ -957,6 +978,44 @@ def _u_translate_proc_to_dev(path: Ptr[uint8]) -> int32:
 
 
 # =====================================================================
+# #163: user path-string copy-in
+# =====================================================================
+#
+# The path-taking syscalls (open / openat / stat / mkdir / unlink /
+# rename / chdir / readlink…) used to hand the RAW user `const char *`
+# straight to resolve_path(), which walks the string byte-by-byte via a
+# raw deref — a malformed user path pointer therefore faulted the kernel
+# instead of returning -EFAULT. We now copy the user path into a kernel
+# scratch via strncpy_from_user (a translated, fault-tolerant walk of the
+# current task's page tables) BEFORE resolve_path ever touches it. The
+# kernel scratch is then what resolve_path / vfs_open see — they keep
+# their existing kernel-pointer contract unchanged. resolve_path stays a
+# pure kernel-buffer routine; only this copy-in is migrated.
+#
+# MAX_USER_PATH matches the 256-byte abs_path cap every path handler
+# already uses for resolve_path's output, so we never accept a source
+# longer than the canonicaliser could hold.
+MAX_USER_PATH: uint64 = 256
+
+
+def _u_copyin_path(uptr: uint64, kdst: Ptr[uint8]) -> int64:
+    # Copy the NUL-terminated user path at `uptr` into the kernel buffer
+    # `kdst` (MAX_USER_PATH bytes). Returns 0 on success, ELINUX_EFAULT if
+    # the user pointer faults, or ELINUX_NAMETOOLONG if the path did not
+    # terminate within the cap. strncpy_from_user re-walks at every page
+    # boundary so a path spanning frames is handled correctly.
+    if uptr == 0:
+        return ELINUX_EFAULT
+    r: int64 = strncpy_from_user(cast[uint64](kdst), uptr, MAX_USER_PATH)
+    if r < 0:
+        return ELINUX_EFAULT
+    if cast[uint64](r) >= MAX_USER_PATH - 1:
+        # No NUL inside the cap — reject rather than silently truncate.
+        return ELINUX_NAMETOOLONG
+    return 0
+
+
+# =====================================================================
 # Forwarders to Hamnix native primitives
 # =====================================================================
 #
@@ -985,6 +1044,11 @@ def _u_read(a0: uint64, a1: uint64, a2: uint64,
 
 def _u_read_body(a0: uint64, a1: uint64, a2: uint64,
                  a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # #163 FOLLOW-UP: the data buffer (a1) is still passed raw into
+    # vfs_read/vfs_read_nb/utermios_console_read, which write it directly.
+    # Routing the bulk data path through copy_to_user needs a chunked
+    # kernel bounce buffer threaded into every vfs_read backend; deferred
+    # to keep this pass low-risk. access_ok already range-checks a1 here.
     fd: int32 = cast[int32](a0)
     marker: uint32 = vfs_fd_marker(fd)
     nonblock: int32 = _u_fd_is_nonblock(fd)
@@ -1084,6 +1148,10 @@ def _u_write_body(a0: uint64, a1: uint64, a2: uint64,
     # pipe / socket fd must return -EAGAIN rather than yield-spinning in
     # vfs_write's blocking loop. vfs_write_nb returns >0 bytes accepted,
     # 0 for would-block, or a negative errno; 0 maps to -EAGAIN.
+    # #163 FOLLOW-UP: the data buffer (a1) is still passed raw into
+    # vfs_write/vfs_write_nb (the bulk data path); routing it through
+    # copy_from_user needs a chunked kernel bounce buffer in every vfs
+    # write backend — deferred. access_ok range-checks a1 at the gate.
     fd: int32 = cast[int32](a0)
     n: int64 = 0
     if _u_fd_is_nonblock(fd) != 0:
@@ -1108,8 +1176,16 @@ def _u_open(a0: uint64, a1: uint64, a2: uint64,
     # `open(path, O_WRONLY|O_CREAT)` actually create the file (and, via
     # the #155 vfs notify hook, fire an inotify IN_CREATE).
     flags: uint64 = a1
+    # #163: copy the user path into a kernel scratch via strncpy_from_user
+    # before resolve_path touches it — a bad path pointer now returns
+    # -EFAULT instead of faulting the kernel mid-canonicalisation.
+    upath: Array[256, uint8]
+    pin: int64 = _u_copyin_path(a0, &upath[0])
+    if pin != 0:
+        set_current_errstr("open: bad path pointer")
+        return pin
     abs_path: Array[256, uint8]
-    rc: int32 = resolve_path(cast[Ptr[char]](a0), &abs_path[0], 256)
+    rc: int32 = resolve_path(cast[Ptr[char]](&upath[0]), &abs_path[0], 256)
     if rc != 0:
         set_current_errstr("open: path too long")
         return cast[int64](rc)
@@ -1175,10 +1251,11 @@ def _u_ioctl(a0: uint64, a1: uint64, a2: uint64,
     if req == 0x5413:
         if out == 0:
             return ELINUX_INVAL
-        cast[Ptr[uint16]](out)[0]     = 24
-        cast[Ptr[uint16]](out + 2)[0] = 80
-        cast[Ptr[uint16]](out + 4)[0] = 0
-        cast[Ptr[uint16]](out + 6)[0] = 0
+        # #163: write the winsize fields through the translated path.
+        if put_user_16(24, out) != 0 or put_user_16(80, out + 2) != 0 \
+                or put_user_16(0, out + 4) != 0 \
+                or put_user_16(0, out + 6) != 0:
+            return ELINUX_EFAULT
         return 0
     # TIOCSWINSZ — accept whatever the caller set.
     if req == 0x5414:
@@ -1188,7 +1265,9 @@ def _u_ioctl(a0: uint64, a1: uint64, a2: uint64,
     if req == 0x540F or req == 0x5429:
         if out == 0:
             return ELINUX_INVAL
-        cast[Ptr[int32]](out)[0] = cast[int32](current_task_pid())
+        # #163: translated writeback of the pid_t out-param.
+        if put_user_32(cast[uint32](current_task_pid()), out) != 0:
+            return ELINUX_EFAULT
         return 0
     # TIOCSPGRP — accept; no pgrp bookkeeping to update.
     if req == 0x5410:
@@ -1220,7 +1299,9 @@ def _u_ioctl(a0: uint64, a1: uint64, a2: uint64,
     if req == 0x541B:
         if out == 0:
             return ELINUX_INVAL
-        cast[Ptr[int32]](out)[0] = 0
+        # #163: translated writeback of the int out-param.
+        if put_user_32(0, out) != 0:
+            return ELINUX_EFAULT
         return 0
     return ELINUX_NOSYS
 
@@ -1235,9 +1316,21 @@ def _u_pipe(a0: uint64, a1: uint64, a2: uint64,
     if a0 == 0:
         set_current_errstr("pipe: null fds buffer")
         return ELINUX_INVAL
-    rc: int32 = vfs_pipe(cast[Ptr[int32]](a0))
+    # #163: have vfs_pipe write the two fds into a kernel scratch, then
+    # copy_to_user the 8-byte int[2] out in one translated transfer — a
+    # bad user fds buffer now returns -EFAULT instead of faulting vfs_pipe
+    # on a raw user pointer.
+    fds: Array[2, int32]
+    rc: int32 = vfs_pipe(&fds[0])
     if rc < 0:
         set_current_errstr("pipe: out of fds")
+        return cast[int64](rc)
+    if copy_to_user(a0, cast[uint64](&fds[0]), 8) != 0:
+        # Roll back the just-created pipe so we don't leak two fds.
+        vfs_close(fds[0])
+        vfs_close(fds[1])
+        set_current_errstr("pipe: bad fds buffer")
+        return ELINUX_EFAULT
     return cast[int64](rc)
 
 
@@ -1251,12 +1344,19 @@ def _u_pipe2(a0: uint64, a1: uint64, a2: uint64,
     # returns -EAGAIN — epoll-driven pipe daemons depend on this.
     if a0 == 0:
         return ELINUX_INVAL
-    rc: int32 = vfs_pipe(cast[Ptr[int32]](a0))
+    # #163: same translated-writeback shape as _u_pipe.
+    fds: Array[2, int32]
+    rc: int32 = vfs_pipe(&fds[0])
     if rc < 0:
         return cast[int64](rc)
+    rfd: int32 = fds[0]
+    wfd: int32 = fds[1]
+    if copy_to_user(a0, cast[uint64](&fds[0]), 8) != 0:
+        vfs_close(rfd)
+        vfs_close(wfd)
+        set_current_errstr("pipe2: bad fds buffer")
+        return ELINUX_EFAULT
     if (a1 & O_NONBLOCK_BIT) != 0:
-        rfd: int32 = cast[Ptr[int32]](a0)[0]
-        wfd: int32 = cast[Ptr[int32]](a0)[1]
         _u_set_fd_nonblock(rfd, 1)
         _u_set_fd_nonblock(wfd, 1)
     return cast[int64](rc)
@@ -1617,7 +1717,14 @@ def _u_statx(a0: uint64, a1: uint64, a2: uint64,
         printk2("linux_u: statx unsupported flags=%x path=%x\n",
                 a2, a1)
         return ELINUX_INVAL
-    p: Ptr[char] = cast[Ptr[char]](a1)
+    # #163: copy the user path into a kernel buffer up-front so every
+    # subsequent deref (the empty/abs byte checks AND resolve_path) hits
+    # kernel memory — a bad user pointer is a clean -EFAULT, not a #PF.
+    statx_path: Array[256, uint8]
+    statx_pin: int64 = _u_copyin_path(a1, &statx_path[0])
+    if statx_pin != 0:
+        return statx_pin
+    p: Ptr[char] = cast[Ptr[char]](&statx_path[0])
     is_empty: int32 = 0
     if cast[uint8](p[0] & 0xFF) == 0:
         is_empty = 1
@@ -1631,7 +1738,7 @@ def _u_statx(a0: uint64, a1: uint64, a2: uint64,
     if a0 != AT_FDCWD_U64 and is_abs == 0:
         return ELINUX_BADF
     abs_path: Array[256, uint8]
-    rc: int32 = resolve_path(cast[Ptr[char]](a1), &abs_path[0], 256)
+    rc: int32 = resolve_path(cast[Ptr[char]](&statx_path[0]), &abs_path[0], 256)
     if rc != 0:
         return cast[int64](rc)
     fd: int32 = vfs_open(cast[Ptr[char]](&abs_path[0]))
@@ -1679,8 +1786,14 @@ def _u_exit_group(a0: uint64, a1: uint64, a2: uint64,
 def _u_chdir(a0: uint64, a1: uint64, a2: uint64,
              a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int chdir(const char *path)
+    # #163: translated path copy-in before resolve_path.
+    upath: Array[256, uint8]
+    pin: int64 = _u_copyin_path(a0, &upath[0])
+    if pin != 0:
+        set_current_errstr("chdir: bad path pointer")
+        return pin
     abs_path: Array[256, uint8]
-    rc: int32 = resolve_path(cast[Ptr[char]](a0), &abs_path[0], 256)
+    rc: int32 = resolve_path(cast[Ptr[char]](&upath[0]), &abs_path[0], 256)
     if rc != 0:
         set_current_errstr("chdir: path too long")
         return cast[int64](rc)
@@ -1689,6 +1802,14 @@ def _u_chdir(a0: uint64, a1: uint64, a2: uint64,
         set_current_errstr("chdir: path too long")
         return -7                                    # -E2BIG
     return 0
+
+
+# #163: kernel scratch for getcwd(2). The cwd path is bounded by the
+# native 256-byte cap; this scratch holds the (possibly truncated) string
+# before the single translated copy_to_user. Top-level BSS, not a
+# nested-frame Array (U9 quirk).
+GETCWD_SCRATCH_MAX: uint64 = 256
+u_getcwd_scratch: Array[256, uint8]
 
 
 def _u_getcwd(a0: uint64, a1: uint64, a2: uint64,
@@ -1701,16 +1822,31 @@ def _u_getcwd(a0: uint64, a1: uint64, a2: uint64,
         set_current_errstr("getcwd: buffer too small")
         return ELINUX_RANGE
     src: Ptr[uint8] = get_cwd_buf(current_idx_get())
-    dst: Ptr[uint8] = cast[Ptr[uint8]](a0)
+    # #163: assemble the (possibly truncated) cwd string in a kernel
+    # scratch, then copy_to_user it in one translated transfer so a bad
+    # user buffer returns -EFAULT instead of faulting on a raw deref.
+    # The cwd is bounded by GETCWD_SCRATCH_MAX (the native path cap); a
+    # request larger than that is served up to the scratch size.
+    cap: uint64 = a1
+    if cap > GETCWD_SCRATCH_MAX:
+        cap = GETCWD_SCRATCH_MAX
     i: uint64 = 0
-    while i + 1 < a1:
+    nbytes: uint64 = 0
+    while i + 1 < cap:
         c: uint8 = src[i]
-        dst[i] = c
+        u_getcwd_scratch[i] = c
         i = i + 1
         if c == 0:
-            return cast[int64](i)
-    dst[i] = 0
-    return cast[int64](i + 1)
+            nbytes = i
+            break
+    if nbytes == 0:
+        # No NUL hit within cap-1 bytes (or cap was 1): terminate here.
+        u_getcwd_scratch[i] = 0
+        nbytes = i + 1
+    if copy_to_user(a0, cast[uint64](&u_getcwd_scratch[0]), nbytes) != 0:
+        set_current_errstr("getcwd: bad buffer pointer")
+        return ELINUX_EFAULT
+    return cast[int64](nbytes)
 
 
 def _u_mkdir(a0: uint64, a1: uint64, a2: uint64,
@@ -1720,8 +1856,14 @@ def _u_mkdir(a0: uint64, a1: uint64, a2: uint64,
     # absolute path then route through vfs_mkdir (same shape as
     # _u_unlink). Non-tmpfs paths return -EROFS. mode is ignored
     # (tmpfs has no permission bits at this milestone).
+    # #163: translated path copy-in before resolve_path.
+    upath: Array[256, uint8]
+    pin: int64 = _u_copyin_path(a0, &upath[0])
+    if pin != 0:
+        set_current_errstr("mkdir: bad path pointer")
+        return pin
     abs_path: Array[256, uint8]
-    rc: int32 = resolve_path(cast[Ptr[char]](a0), &abs_path[0], 256)
+    rc: int32 = resolve_path(cast[Ptr[char]](&upath[0]), &abs_path[0], 256)
     if rc != 0:
         set_current_errstr("mkdir: path too long")
         return cast[int64](rc)
@@ -1734,8 +1876,14 @@ def _u_mkdir(a0: uint64, a1: uint64, a2: uint64,
 def _u_unlink(a0: uint64, a1: uint64, a2: uint64,
               a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int unlink(const char *pathname)
+    # #163: translated path copy-in before resolve_path.
+    upath: Array[256, uint8]
+    pin: int64 = _u_copyin_path(a0, &upath[0])
+    if pin != 0:
+        set_current_errstr("unlink: bad path pointer")
+        return pin
     abs_path: Array[256, uint8]
-    rc: int32 = resolve_path(cast[Ptr[char]](a0), &abs_path[0], 256)
+    rc: int32 = resolve_path(cast[Ptr[char]](&upath[0]), &abs_path[0], 256)
     if rc != 0:
         set_current_errstr("unlink: path too long")
         return cast[int64](rc)
@@ -1752,13 +1900,24 @@ def _u_rename(a0: uint64, a1: uint64, a2: uint64,
     # vfs_rename — which moves the dirent (with overwrite of an
     # existing destination) on tmpfs or ext4. `mv` and apt/dpkg's
     # "write temp, rename into place" idiom land here.
+    # #163: translated copy-in of both user paths before resolve_path.
+    uold: Array[256, uint8]
+    unew: Array[256, uint8]
+    pin: int64 = _u_copyin_path(a0, &uold[0])
+    if pin != 0:
+        set_current_errstr("rename: bad old path pointer")
+        return pin
+    pin = _u_copyin_path(a1, &unew[0])
+    if pin != 0:
+        set_current_errstr("rename: bad new path pointer")
+        return pin
     old_abs: Array[256, uint8]
     new_abs: Array[256, uint8]
-    rc: int32 = resolve_path(cast[Ptr[char]](a0), &old_abs[0], 256)
+    rc: int32 = resolve_path(cast[Ptr[char]](&uold[0]), &old_abs[0], 256)
     if rc != 0:
         set_current_errstr("rename: old path too long")
         return cast[int64](rc)
-    rc = resolve_path(cast[Ptr[char]](a1), &new_abs[0], 256)
+    rc = resolve_path(cast[Ptr[char]](&unew[0]), &new_abs[0], 256)
     if rc != 0:
         set_current_errstr("rename: new path too long")
         return cast[int64](rc)
@@ -1784,13 +1943,24 @@ def _u_renameat(a0: uint64, a1: uint64, a2: uint64,
     if nr_is_renameat2_flagged(a4) != 0:
         set_current_errstr("renameat2: unsupported flags")
         return ELINUX_INVAL
+    # #163: translated copy-in of both user paths before resolve_path.
+    uold: Array[256, uint8]
+    unew: Array[256, uint8]
+    pin: int64 = _u_copyin_path(a1, &uold[0])
+    if pin != 0:
+        set_current_errstr("renameat: bad old path pointer")
+        return pin
+    pin = _u_copyin_path(a3, &unew[0])
+    if pin != 0:
+        set_current_errstr("renameat: bad new path pointer")
+        return pin
     old_abs: Array[256, uint8]
     new_abs: Array[256, uint8]
-    rc: int32 = resolve_path(cast[Ptr[char]](a1), &old_abs[0], 256)
+    rc: int32 = resolve_path(cast[Ptr[char]](&uold[0]), &old_abs[0], 256)
     if rc != 0:
         set_current_errstr("renameat: old path too long")
         return cast[int64](rc)
-    rc = resolve_path(cast[Ptr[char]](a3), &new_abs[0], 256)
+    rc = resolve_path(cast[Ptr[char]](&unew[0]), &new_abs[0], 256)
     if rc != 0:
         set_current_errstr("renameat: new path too long")
         return cast[int64](rc)
@@ -2012,8 +2182,13 @@ def _u_reboot(a0: uint64, a1: uint64, a2: uint64,
 def _u_truncate(a0: uint64, a1: uint64, a2: uint64,
                 a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int truncate(const char *path, off_t length)
+    # #163: copy-in the user path so a bad pointer is -EFAULT, not a #PF.
+    trunc_path: Array[256, uint8]
+    trunc_pin: int64 = _u_copyin_path(a0, &trunc_path[0])
+    if trunc_pin != 0:
+        return trunc_pin
     abs_path: Array[256, uint8]
-    rc: int32 = resolve_path(cast[Ptr[char]](a0), &abs_path[0], 256)
+    rc: int32 = resolve_path(cast[Ptr[char]](&trunc_path[0]), &abs_path[0], 256)
     if rc != 0:
         set_current_errstr("truncate: path too long")
         return cast[int64](rc)
@@ -2116,8 +2291,13 @@ def _u_clock_gettime(a0: uint64, a1: uint64, a2: uint64,
         sec  = mono_ns / 1000000000
         nsec = mono_ns % 1000000000
 
-    cast[Ptr[uint64]](a1)[0]     = sec
-    cast[Ptr[uint64]](a1 + 8)[0] = nsec
+    # #163: write the timespec back through the translated uaccess path
+    # rather than a raw deref. put_user_64 walks the current task's page
+    # tables; under today's identity map this is the same physical write,
+    # but it stays correct once the user stack / mmap sits at vaddr != phys.
+    if put_user_64(sec, a1) != 0 or put_user_64(nsec, a1 + 8) != 0:
+        set_current_errstr("clock_gettime: bad timespec pointer")
+        return ELINUX_EFAULT
     return 0
 
 
@@ -3459,14 +3639,21 @@ def _u_prlimit64(a0: uint64, a1: uint64, a2: uint64,
             return ELINUX_SRCH
         slot = cast[uint64](sidx)
     # `old` wanted: report the CURRENT stored values before any mutation.
+    # #163: writeback via put_user_64 (translated) instead of a raw deref.
     if a3 != 0:
-        cast[Ptr[uint64]](a3)[0]     = rlimit_get_cur(slot, a1)
-        cast[Ptr[uint64]](a3 + 8)[0] = rlimit_get_max(slot, a1)
+        if put_user_64(rlimit_get_cur(slot, a1), a3) != 0 \
+                or put_user_64(rlimit_get_max(slot, a1), a3 + 8) != 0:
+            set_current_errstr("prlimit64: bad old rlimit pointer")
+            return ELINUX_EFAULT
     # `new` given: validate cur <= max, then store. Single-user-root model —
     # no privilege check on raising the hard limit.
+    # #163: read the new limit pair via get_user — a bad pointer -> EFAULT.
     if a2 != 0:
-        nc: uint64 = cast[Ptr[uint64]](a2)[0]
-        nm: uint64 = cast[Ptr[uint64]](a2 + 8)[0]
+        nc: uint64 = 0
+        nm: uint64 = 0
+        if get_user_64(a2, &nc) != 0 or get_user_64(a2 + 8, &nm) != 0:
+            set_current_errstr("prlimit64: bad new rlimit pointer")
+            return ELINUX_EFAULT
         if nc > nm:
             return ELINUX_INVAL
         rlimit_set(slot, a1, nc, nm)
@@ -3546,6 +3733,13 @@ def _u_rseq(a0: uint64, a1: uint64, a2: uint64,
     return ELINUX_NOSYS
 
 
+# #163: kernel scratch for getrandom(2). CSPRNG bytes land here before
+# being copy_to_user'd to the caller in 256-byte chunks (top-level BSS,
+# not a nested-frame Array — the U9 quirk).
+GETRANDOM_SCRATCH_MAX: uint64 = 256
+u_getrandom_scratch: Array[256, uint8]
+
+
 def _u_getrandom(a0: uint64, a1: uint64, a2: uint64,
                  a3: uint64, a4: uint64, a5: uint64) -> int64:
     # ssize_t getrandom(void *buf, size_t buflen, unsigned int flags).
@@ -3562,11 +3756,35 @@ def _u_getrandom(a0: uint64, a1: uint64, a2: uint64,
         return ELINUX_INVAL
     if (a2 & ~cast[uint64](0x3)) != 0:
         return ELINUX_INVAL
-    dst: Ptr[uint8] = cast[Ptr[uint8]](a0)
     n: uint64 = a1
     if n == 0:
         return 0
-    return devrandom_read(dst, n)
+    # #163: serve CSPRNG bytes into a kernel scratch, then copy_to_user
+    # each chunk through the translated path — a bad user buf returns
+    # -EFAULT (matching Linux) instead of faulting devrandom_read on a raw
+    # user pointer. We chunk so an arbitrarily large buflen needs only a
+    # fixed kernel scratch. If the FIRST chunk's copy faults we surface
+    # -EFAULT; a fault partway returns the bytes already delivered (Linux
+    # getrandom is allowed to return a short count).
+    done: uint64 = 0
+    while done < n:
+        chunk: uint64 = n - done
+        if chunk > GETRANDOM_SCRATCH_MAX:
+            chunk = GETRANDOM_SCRATCH_MAX
+        gr: int64 = devrandom_read(&u_getrandom_scratch[0], chunk)
+        if gr <= 0:
+            if done > 0:
+                return cast[int64](done)
+            return gr
+        got: uint64 = cast[uint64](gr)
+        if copy_to_user(a0 + done,
+                        cast[uint64](&u_getrandom_scratch[0]), got) != 0:
+            if done > 0:
+                return cast[int64](done)
+            set_current_errstr("getrandom: bad buffer pointer")
+            return ELINUX_EFAULT
+        done = done + got
+    return cast[int64](done)
 
 
 def _u_munmap(a0: uint64, a1: uint64, a2: uint64,
@@ -4347,8 +4565,13 @@ def _u_access_path(upath: uint64, mode: uint64) -> int64:
     # existence check (no inode mode bits to consult). See _u_access.
     if upath == 0:
         return ELINUX_INVAL
+    # #163: copy-in the user path so a bad pointer is -EFAULT, not a #PF.
+    acc_path: Array[256, uint8]
+    acc_pin: int64 = _u_copyin_path(upath, &acc_path[0])
+    if acc_pin != 0:
+        return acc_pin
     abs_path: Array[256, uint8]
-    rc: int32 = resolve_path(cast[Ptr[char]](upath), &abs_path[0], 256)
+    rc: int32 = resolve_path(cast[Ptr[char]](&acc_path[0]), &abs_path[0], 256)
     if rc != 0:
         return ELINUX_NOENT
     # ext4-backed path: consult the real inode mode bits.
@@ -4876,6 +5099,13 @@ def _u_wait4(a0: uint64, a1: uint64, a2: uint64,
 UTSNAME_FIELD_LEN: uint64 = 65
 UTSNAME_TOTAL:     uint64 = 390
 
+# #163: kernel scratch for uname(2). We assemble the whole utsname here
+# (a fixed kernel buffer — never a user pointer) and then copy_to_user it
+# in one translated transfer, so a malformed user buf yields -EFAULT
+# instead of faulting memset/_u_uts_field on a raw user pointer. Top-level
+# BSS rather than a nested-frame Array (the U9 nested-frame-Array quirk).
+u_uts_scratch: Array[390, uint8]
+
 
 def _u_uts_field(buf: uint64, off: uint64, s: Ptr[uint8]):
     # Copy NUL-terminated `s` into the utsname buffer at byte offset
@@ -4898,20 +5128,22 @@ def _u_uname(a0: uint64, a1: uint64, a2: uint64,
              a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int uname(struct utsname *buf)
     # The single argument is a pointer to a 390-byte char-array struct.
-    # We zero the whole region first so every field starts NUL-padded,
-    # then poke each of the six 65-byte slots in turn. Linux returns 0
-    # on success and -EFAULT on a bad pointer; we have no user/kernel
-    # split at this milestone, so a NULL check is the only validation
-    # we can offer.
+    # #163: assemble the struct in a kernel scratch (zero-padded fields)
+    # then copy it out in ONE translated copy_to_user, so a malformed user
+    # buf returns -EFAULT instead of faulting the kernel on a raw deref.
     if a0 == 0:
         return ELINUX_INVAL
-    memset(cast[Ptr[uint8]](a0), 0, UTSNAME_TOTAL)
-    _u_uts_field(a0,   0, cast[Ptr[uint8]]("Hamnix"))
-    _u_uts_field(a0,  65, cast[Ptr[uint8]]("hamnix"))
-    _u_uts_field(a0, 130, cast[Ptr[uint8]]("6.12.0-hamnix"))
-    _u_uts_field(a0, 195, cast[Ptr[uint8]]("#1 Hamnix"))
-    _u_uts_field(a0, 260, cast[Ptr[uint8]]("x86_64"))
-    _u_uts_field(a0, 325, cast[Ptr[uint8]]("(none)"))
+    ksc: uint64 = cast[uint64](&u_uts_scratch[0])
+    memset(cast[Ptr[uint8]](ksc), 0, UTSNAME_TOTAL)
+    _u_uts_field(ksc,   0, cast[Ptr[uint8]]("Hamnix"))
+    _u_uts_field(ksc,  65, cast[Ptr[uint8]]("hamnix"))
+    _u_uts_field(ksc, 130, cast[Ptr[uint8]]("6.12.0-hamnix"))
+    _u_uts_field(ksc, 195, cast[Ptr[uint8]]("#1 Hamnix"))
+    _u_uts_field(ksc, 260, cast[Ptr[uint8]]("x86_64"))
+    _u_uts_field(ksc, 325, cast[Ptr[uint8]]("(none)"))
+    if copy_to_user(a0, ksc, UTSNAME_TOTAL) != 0:
+        set_current_errstr("uname: bad utsname pointer")
+        return ELINUX_EFAULT
     return 0
 
 
@@ -4920,6 +5152,10 @@ def _u_uname(a0: uint64, a1: uint64, a2: uint64,
 # the canonical layout. See <asm-generic/stat.h> for the source of
 # truth — these match the x86_64 variant (not the legacy 32-bit one).
 STAT_SIZE:       uint64 = 144
+# #163: kernel scratch for the assembled struct stat. We fill this then
+# copy_to_user it in one translated transfer (top-level BSS, not a
+# nested-frame Array — the U9 quirk).
+u_stat_scratch: Array[144, uint8]
 ST_OFF_DEV:      uint64 = 0
 ST_OFF_INO:      uint64 = 8
 ST_OFF_NLINK:    uint64 = 16
@@ -4966,13 +5202,18 @@ def _u_file_size_via_lseek(fd: int32) -> int64:
 
 
 def _u_fill_stat(buf: uint64, fd: int32) -> int64:
-    # Shared body for fstat and newfstatat: zero the user's struct
-    # stat, then poke the fields that matter. fd is assumed to refer
-    # to a regular file; caller is responsible for opening (and
-    # closing, in newfstatat's case).
+    # Shared body for fstat and newfstatat: assemble struct stat in a
+    # kernel scratch, then copy it out in ONE translated copy_to_user.
+    # #163: previously each field was poked through a RAW user pointer, so
+    # a malformed `buf` faulted the kernel; now a bad buf returns -EFAULT.
+    # fd is assumed to refer to a regular file; caller is responsible for
+    # opening (and closing, in newfstatat's case).
     if buf == 0:
         return ELINUX_INVAL
-    memset(cast[Ptr[uint8]](buf), 0, STAT_SIZE)
+    # Assemble into the kernel scratch (ksb); copy_to_user(buf, ...) at
+    # the end performs the single translated write to the user struct.
+    ksb: uint64 = cast[uint64](&u_stat_scratch[0])
+    memset(cast[Ptr[uint8]](ksb), 0, STAT_SIZE)
     # st_dev stays 0 — we don't track per-FS device IDs.
     # §4: st_ino MUST be a stable, per-FILE-unique identifier.
     # glibc's ld.so keys its already-loaded-DSO check off the
@@ -4984,27 +5225,27 @@ def _u_fill_stat(buf: uint64, fd: int32) -> int64:
     # previously-mapped DSO used would collide and ld.so would hand
     # back the wrong link_map (dlsym then failed). vfs_fd_inode
     # derives the inode from the backing file's identity instead.
-    cast[Ptr[uint64]](buf + ST_OFF_INO)[0] = vfs_fd_inode(fd)
-    cast[Ptr[uint64]](buf + ST_OFF_NLINK)[0] = 1
+    cast[Ptr[uint64]](ksb + ST_OFF_INO)[0] = vfs_fd_inode(fd)
+    cast[Ptr[uint64]](ksb + ST_OFF_NLINK)[0] = 1
     # U32: report S_IFDIR for directory-flavoured fds so ls(1) decides
     # to enumerate via getdents64 instead of dumping the dir as a file.
     mode_v: uint32 = STAT_MODE_REG
     if vfs_fd_is_dir(fd) != 0:
         mode_v = STAT_MODE_DIR
-    cast[Ptr[uint32]](buf + ST_OFF_MODE)[0] = mode_v
-    cast[Ptr[uint32]](buf + ST_OFF_UID)[0] = 0
-    cast[Ptr[uint32]](buf + ST_OFF_GID)[0] = 0
-    cast[Ptr[uint64]](buf + ST_OFF_RDEV)[0] = 0
+    cast[Ptr[uint32]](ksb + ST_OFF_MODE)[0] = mode_v
+    cast[Ptr[uint32]](ksb + ST_OFF_UID)[0] = 0
+    cast[Ptr[uint32]](ksb + ST_OFF_GID)[0] = 0
+    cast[Ptr[uint64]](ksb + ST_OFF_RDEV)[0] = 0
     # st_size: best-effort lookup via lseek SEEK_END. Stream fds and
     # other lseek-rejecting backings end up with st_size=0, which is
     # the safest fallback for tools that read until EOF anyway.
     size: int64 = _u_file_size_via_lseek(fd)
     if size < 0:
         size = 0
-    cast[Ptr[int64]](buf + ST_OFF_SIZE)[0] = size
-    cast[Ptr[int64]](buf + ST_OFF_BLKSIZE)[0] = 4096
+    cast[Ptr[int64]](ksb + ST_OFF_SIZE)[0] = size
+    cast[Ptr[int64]](ksb + ST_OFF_BLKSIZE)[0] = 4096
     blocks: int64 = (size + 511) / 512
-    cast[Ptr[int64]](buf + ST_OFF_BLOCKS)[0] = blocks
+    cast[Ptr[int64]](ksb + ST_OFF_BLOCKS)[0] = blocks
     # atime/mtime/ctime tv_sec. ext4 files carry a real per-inode
     # mtime (stamped from the RTC on create/write/truncate) — report
     # it so `stat` and make's "target newer than source" logic work.
@@ -5015,9 +5256,15 @@ def _u_fill_stat(buf: uint64, fd: int32) -> int64:
     mt: int64 = vfs_fd_mtime(fd)
     if mt >= 0:
         sec = mt
-    cast[Ptr[int64]](buf + ST_OFF_ATIME)[0] = sec
-    cast[Ptr[int64]](buf + ST_OFF_MTIME)[0] = sec
-    cast[Ptr[int64]](buf + ST_OFF_CTIME)[0] = sec
+    cast[Ptr[int64]](ksb + ST_OFF_ATIME)[0] = sec
+    cast[Ptr[int64]](ksb + ST_OFF_MTIME)[0] = sec
+    cast[Ptr[int64]](ksb + ST_OFF_CTIME)[0] = sec
+    # #163: single translated copy of the assembled struct to the user
+    # buffer. A bad / unmapped user `buf` returns -EFAULT instead of a
+    # kernel page fault.
+    if copy_to_user(buf, ksb, STAT_SIZE) != 0:
+        set_current_errstr("stat: bad statbuf pointer")
+        return ELINUX_EFAULT
     return 0
 
 
@@ -5035,17 +5282,24 @@ def _u_fstat(a0: uint64, a1: uint64, a2: uint64,
     return _u_fill_stat(a1, fd)
 
 
-def _u_stat_path(path: Ptr[char], buf: uint64) -> int64:
-    # Shared body for stat() and lstat(): resolve the (possibly
-    # relative) `path` against the task cwd, open it via vfs_open,
-    # hand the resulting fd to _u_fill_stat, then close. Returns 0 on
-    # success or a negative Linux errno. Factored out so SYS_stat
-    # (4) and SYS_lstat (6) share one code path — Hamnix has no
-    # symlinks, so the two syscalls are semantically identical here.
-    if cast[uint64](path) == 0 or buf == 0:
+def _u_stat_path(upath: uint64, buf: uint64) -> int64:
+    # Shared body for stat() and lstat(): copy the (possibly relative)
+    # user path into a kernel scratch, resolve it against the task cwd,
+    # open it via vfs_open, hand the resulting fd to _u_fill_stat, then
+    # close. Returns 0 on success or a negative Linux errno. Factored
+    # out so SYS_stat (4) and SYS_lstat (6) share one code path —
+    # Hamnix has no symlinks, so the two syscalls are semantically
+    # identical here.
+    # #163: the path arrives as a user pointer; copy it in through the
+    # translated strncpy_from_user before resolve_path touches it.
+    if upath == 0 or buf == 0:
         return ELINUX_INVAL
+    kpath: Array[256, uint8]
+    pin: int64 = _u_copyin_path(upath, &kpath[0])
+    if pin != 0:
+        return pin
     abs_path: Array[256, uint8]
-    rc: int32 = resolve_path(path, &abs_path[0], 256)
+    rc: int32 = resolve_path(cast[Ptr[char]](&kpath[0]), &abs_path[0], 256)
     if rc != 0:
         return cast[int64](rc)
     fd: int32 = vfs_open(cast[Ptr[char]](&abs_path[0]))
@@ -5059,7 +5313,7 @@ def _u_stat_path(path: Ptr[char], buf: uint64) -> int64:
 def _u_stat(a0: uint64, a1: uint64, a2: uint64,
             a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int stat(const char *pathname, struct stat *statbuf)
-    return _u_stat_path(cast[Ptr[char]](a0), a1)
+    return _u_stat_path(a0, a1)
 
 
 def _u_lstat(a0: uint64, a1: uint64, a2: uint64,
@@ -5069,7 +5323,7 @@ def _u_lstat(a0: uint64, a1: uint64, a2: uint64,
     # there's nothing to "not follow". When real symlinks land in vfs
     # this body branches: stat() resolves through them, lstat()
     # reports the link itself.
-    return _u_stat_path(cast[Ptr[char]](a0), a1)
+    return _u_stat_path(a0, a1)
 
 
 # AT_FDCWD is -100 (int32) — passed in a0 as a zero-extended uint64,
@@ -5104,8 +5358,15 @@ def _u_newfstatat(a0: uint64, a1: uint64, a2: uint64,
         printk2("linux_u: newfstatat unsupported flags=%x path=%x\n",
                 a3, a1)
         return ELINUX_INVAL
-    # AT_EMPTY_PATH with an empty path string: stat the dirfd itself.
-    p: Ptr[char] = cast[Ptr[char]](a1)
+    # #163: copy the user path into a kernel scratch via the translated
+    # strncpy_from_user, then do every byte-inspection and resolve_path
+    # against the kernel copy. AT_EMPTY_PATH passes a "" path, which
+    # strncpy_from_user copies as a zero-length string — handled below.
+    kpath: Array[256, uint8]
+    pin: int64 = _u_copyin_path(a1, &kpath[0])
+    if pin != 0:
+        return pin
+    p: Ptr[char] = cast[Ptr[char]](&kpath[0])
     is_empty: int32 = 0
     if cast[uint8](p[0] & 0xFF) == 0:
         is_empty = 1
@@ -5125,7 +5386,7 @@ def _u_newfstatat(a0: uint64, a1: uint64, a2: uint64,
     if a0 != AT_FDCWD_U64 and is_abs == 0:
         return ELINUX_BADF
     abs_path: Array[256, uint8]
-    rc: int32 = resolve_path(cast[Ptr[char]](a1), &abs_path[0], 256)
+    rc: int32 = resolve_path(cast[Ptr[char]](&kpath[0]), &abs_path[0], 256)
     if rc != 0:
         return cast[int64](rc)
     fd: int32 = vfs_open(cast[Ptr[char]](&abs_path[0]))
@@ -5531,8 +5792,10 @@ def _u_gettimeofday(a0: uint64, a1: uint64, a2: uint64,
     base:    uint64 = rtc_boot_epoch_get()
     sec:  uint64 = base + (mono_ns / 1000000000)
     usec: uint64 = (mono_ns % 1000000000) / 1000
-    cast[Ptr[uint64]](a0)[0]     = sec
-    cast[Ptr[uint64]](a0 + 8)[0] = usec
+    # #163: write struct timeval back through the translated path.
+    if put_user_64(sec, a0) != 0 or put_user_64(usec, a0 + 8) != 0:
+        set_current_errstr("gettimeofday: bad timeval pointer")
+        return ELINUX_EFAULT
     return 0
 
 
@@ -5560,7 +5823,11 @@ def _u_time(a0: uint64, a1: uint64, a2: uint64,
     # time_t time(time_t *tloc)
     sec: uint64 = rtc_boot_epoch_get() + (tsc_monotonic_ns() / 1000000000)
     if a0 != 0:
-        cast[Ptr[int64]](a0)[0] = cast[int64](sec)
+        # #163: write *tloc through the translated path. A bad tloc
+        # returns -EFAULT rather than faulting the kernel.
+        if put_user_64(sec, a0) != 0:
+            set_current_errstr("time: bad tloc pointer")
+            return ELINUX_EFAULT
     return cast[int64](sec)
 
 
@@ -5970,8 +6237,13 @@ def _u_statfs(a0: uint64, a1: uint64, a2: uint64,
         return ELINUX_FAULT
     if a0 == 0:
         return ELINUX_FAULT
+    # #163: copy-in the user path so a bad pointer is -EFAULT, not a #PF.
+    statfs_path: Array[256, uint8]
+    statfs_pin: int64 = _u_copyin_path(a0, &statfs_path[0])
+    if statfs_pin != 0:
+        return statfs_pin
     abs_path: Array[256, uint8]
-    rc: int32 = resolve_path(cast[Ptr[char]](a0), &abs_path[0], 256)
+    rc: int32 = resolve_path(cast[Ptr[char]](&statfs_path[0]), &abs_path[0], 256)
     if rc != 0:
         return ELINUX_NOENT
     # The path prefix unambiguously identifies the backing filesystem
@@ -6265,10 +6537,16 @@ def _u_readlinkat(a0: uint64, a1: uint64, a2: uint64,
         return ELINUX_INVAL
     if a3 == 0:
         return ELINUX_INVAL
+    # #163: copy the user path in through the translated path, then run
+    # every byte-check / resolve_path against the kernel copy.
+    kpath: Array[256, uint8]
+    pin: int64 = _u_copyin_path(a1, &kpath[0])
+    if pin != 0:
+        return pin
     # Only AT_FDCWD or an absolute path is supported. Absolute paths
     # ignore dirfd per the Linux man page, so we check that first.
     is_abs: int32 = 0
-    p: Ptr[uint8] = cast[Ptr[uint8]](a1)
+    p: Ptr[uint8] = cast[Ptr[uint8]](&kpath[0])
     if p[0] == 47:                                    # '/'
         is_abs = 1
     if a0 != AT_FDCWD_U64 and is_abs == 0:
@@ -6280,7 +6558,7 @@ def _u_readlinkat(a0: uint64, a1: uint64, a2: uint64,
     # "/bin/u_glibc_idprobe" tripped a downstream argv-buffer overflow
     # that lives outside u_syscalls.ad's edit surface this milestone.)
     proc_self_exe: Ptr[uint8] = cast[Ptr[uint8]]("/proc/self/exe")
-    if _u_streq_cstr(cast[Ptr[uint8]](a1), proc_self_exe) != 0:
+    if _u_streq_cstr(cast[Ptr[uint8]](&kpath[0]), proc_self_exe) != 0:
         reply: Ptr[uint8] = cast[Ptr[uint8]]("/bin/u_idprobe")
         # Count the reply length up to NUL. Plain while is the right
         # shape: we don't want the body to run when reply[0] == 0.
@@ -6289,20 +6567,18 @@ def _u_readlinkat(a0: uint64, a1: uint64, a2: uint64,
             n = n + 1
         # Copy min(n, bufsiz) bytes to the user buffer. readlink(2)
         # does NOT NUL-terminate — the man page is explicit about it.
-        dst: Ptr[uint8] = cast[Ptr[uint8]](a2)
+        # #163: translated copy_to_user — a bad user buf returns -EFAULT.
         limit: uint64 = n
         if limit > a3:
             limit = a3
-        i: uint64 = 0
-        while i < limit:
-            dst[i] = reply[i]
-            i = i + 1
+        if copy_to_user(a2, cast[uint64](reply), limit) != 0:
+            return ELINUX_EFAULT
         return cast[int64](limit)
     # Any other path: resolve it to an absolute path so the backend
     # classifiers (is_tmpfs_path / tmpfs_path_is_symlink) see the canonical
     # spelling.
     abs_path: Array[256, uint8]
-    rc: int32 = resolve_path(cast[Ptr[char]](a1), &abs_path[0], 256)
+    rc: int32 = resolve_path(cast[Ptr[char]](&kpath[0]), &abs_path[0], 256)
     if rc != 0:
         return ELINUX_NOENT
     # tmpfs branch: tmpfs now stores symlink targets in-RAM. If the
@@ -6315,14 +6591,12 @@ def _u_readlinkat(a0: uint64, a1: uint64, a2: uint64,
             tn: uint64 = 0
             while tgt[tn] != 0:
                 tn = tn + 1
-            tdst: Ptr[uint8] = cast[Ptr[uint8]](a2)
             tlimit: uint64 = tn
             if tlimit > a3:
                 tlimit = a3
-            ti: uint64 = 0
-            while ti < tlimit:
-                tdst[ti] = tgt[ti]
-                ti = ti + 1
+            # #163: translated copy_to_user of the symlink target.
+            if copy_to_user(a2, cast[uint64](tgt), tlimit) != 0:
+                return ELINUX_EFAULT
             return cast[int64](tlimit)
     # Not a tmpfs symlink. Check whether the path resolves to something.
     # If yes, return -EINVAL (a regular file is not a symlink); if no,
@@ -6638,8 +6912,14 @@ def _u_inotify_add_watch(a0: uint64, a1: uint64, a2: uint64,
     # vfs.ad posts events keyed on the absolute directory, so the stored
     # watch path must be absolute too (a watch on "tmp" from cwd "/" must
     # match the "/tmp" the create/delete hook reports).
+    # #163: translated path copy-in before resolve_path.
+    upath: Array[256, uint8]
+    pin: int64 = _u_copyin_path(a1, &upath[0])
+    if pin != 0:
+        set_current_errstr("inotify_add_watch: bad path pointer")
+        return pin
     abs_path: Array[256, uint8]
-    rc: int32 = resolve_path(cast[Ptr[char]](a1), &abs_path[0], 256)
+    rc: int32 = resolve_path(cast[Ptr[char]](&upath[0]), &abs_path[0], 256)
     if rc != 0:
         set_current_errstr("inotify_add_watch: path too long")
         return ELINUX_INVAL
@@ -7179,16 +7459,57 @@ def uabi_fills_selftest() -> int32:
     if sns_rc != ELINUX_INVAL:
         printk1("[UABI_FILLS] FAIL setns rc=%d\n", cast[uint64](sns_rc))
         return 1
+    # --- #163 EFAULT proof: a bad user pointer must NOT panic ---------
+    # The whole point of the uaccess adoption is that a malformed user
+    # pointer to a converted syscall now returns -EFAULT (-14) cleanly
+    # instead of #PF-panicking the kernel. We pass a canonical-user but
+    # UNMAPPED address (the same sentinel uaccess_smoke_test uses) to
+    # three converted handlers and assert each returns -EFAULT. If any
+    # raw deref had survived the migration, the kernel would fault here
+    # and never print PASS.
+    bad_uptr: uint64 = 0x0000666600000000           # canonical-user, unmapped
+    # uname(buf=bad): copy_to_user must reject -> -EFAULT.
+    ef_uname: int64 = _uabi_test_dispatch(SYS_uname, bad_uptr, 0, 0, 0)
+    if ef_uname != ELINUX_EFAULT:
+        printk1("[UABI_FILLS] FAIL uname EFAULT got=%d\n",
+                cast[uint64](ef_uname))
+        _uabi_fills_restore_fds(boot_task, &fd_save[0])
+        return 1
+    # clock_gettime(CLOCK_MONOTONIC, tp=bad): put_user_64 must reject.
+    ef_cgt: int64 = _uabi_test_dispatch(SYS_clock_gettime, 1, bad_uptr, 0, 0)
+    if ef_cgt != ELINUX_EFAULT:
+        printk1("[UABI_FILLS] FAIL clock_gettime EFAULT got=%d\n",
+                cast[uint64](ef_cgt))
+        _uabi_fills_restore_fds(boot_task, &fd_save[0])
+        return 1
+    # newfstatat(AT_FDCWD, path=bad): strncpy_from_user path copy-in must
+    # reject the unmapped path pointer -> -EFAULT.
+    ef_stat_buf: Array[160, uint8]
+    ef_nfa: int64 = _uabi_test_dispatch(SYS_newfstatat, AT_FDCWD_U64,
+                                        bad_uptr,
+                                        cast[uint64](&ef_stat_buf[0]), 0)
+    if ef_nfa != ELINUX_EFAULT:
+        printk1("[UABI_FILLS] FAIL newfstatat EFAULT got=%d\n",
+                cast[uint64](ef_nfa))
+        _uabi_fills_restore_fds(boot_task, &fd_save[0])
+        return 1
+    printk0("[UABI_FILLS] EFAULT-proof OK (uname/clock_gettime/newfstatat)\n")
 
     # Restore the boot task's original fd slots so the table looks
     # untouched to anything that runs after this hook.
+    _uabi_fills_restore_fds(boot_task, &fd_save[0])
+
+    printk0("[UABI_FILLS] PASS\n")
+    return 0
+
+
+def _uabi_fills_restore_fds(boot_task: Ptr[TaskStruct],
+                            fd_save: Ptr[uint32]):
+    # Restore boot-task fd slots 3..15 the selftest temporarily freed.
     fdr: uint64 = 3
     while fdr < 16:
         boot_task[0].fd_idx[fdr] = fd_save[fdr]
         fdr = fdr + 1
-
-    printk0("[UABI_FILLS] PASS\n")
-    return 0
 
 
 # =====================================================================
