@@ -29,6 +29,15 @@
 
 from kernel.printk.printk import printk0, printk1, printk2
 from drivers.net.eth import eth_tx, eth_get_mac, eth_rx, eth_set_mac
+# Net-capacity self-test (scripts/test_net_capacity.sh) reaches into the
+# UDP datagram-socket queue and the kernel socket table to prove the
+# raised capacity limits. Imported only for netcap_selftest().
+from drivers.net.udp import udp_socket_open, udp_socket_bind, udp_socket_close, \
+    udp_socket_recv_pending, udp_netcap_enqueue, udp_netcap_dequeue_ok, \
+    udp_netcap_qcount, UDS_MAX, UDS_QUEUE_DEPTH
+from drivers.net.socket import sock_table_create, sock_table_release, \
+    sock_table_init, KSOCK_MAX, KAF_INET, KSOCK_DGRAM
+from fs.cpio import cpio_init, initramfs_entry_count, initramfs_entry_name
 
 
 # --- constants ------------------------------------------------------
@@ -127,24 +136,32 @@ IP6_TX_SCRATCH: uint64 = 1600
 ip6_tx_buf:     Array[1600, uint8]
 
 # --- IPv6 fragment reassembly (RFC 8200 §4.5) -----------------------
-# A single-datagram reassembly slot keyed by (src, dst, ident). This is
-# a minimal-but-real reassembler: it copies each fragment's payload into
-# a contiguous buffer at its fragment-offset and tracks how many bytes
-# have arrived plus whether the final (M=0) fragment was seen. When the
-# whole datagram is present it is re-dispatched through the upper-layer
-# demux. One slot is enough for the kernel's use (ping6 / small UDP6);
-# a second concurrent ident simply resets the slot.
-IP6_REASM_CAP:   uint64 = 2048      # max reassembled datagram payload
-ip6_reasm_buf:   Array[2048, uint8]
-ip6_reasm_fill:  Array[2048, uint8] # per-byte "received" bitmap (1 byte/byte)
-ip6_reasm_active:  uint8  = 0
-ip6_reasm_id:      uint32 = 0
-ip6_reasm_src:     Array[16, uint8]
-ip6_reasm_dst:     Array[16, uint8]
-ip6_reasm_nexthdr: uint8  = 0       # upper-layer proto carried by the frags
-ip6_reasm_total:   uint64 = 0       # known total length once M=0 seen
-ip6_reasm_have_last: uint8 = 0
-ip6_reasm_rxbytes: uint64 = 0       # count of payload bytes copied in
+# A fixed pool of IP6_REASM_CTX reassembly contexts, each keyed by
+# (src, dst, ident). This is a minimal-but-real reassembler: it copies
+# each fragment's payload into a contiguous per-context buffer at its
+# fragment-offset and tracks how many bytes have arrived plus whether
+# the final (M=0) fragment was seen. When the whole datagram is present
+# it is re-dispatched through the upper-layer demux. Multiple concurrent
+# idents from distinct peers reassemble independently; on pool
+# exhaustion the least-recently-used context is evicted (mirrors the
+# IPv4 ip_reasm_* LRU pool in drivers/net/ip.ad).
+IP6_REASM_CTX:   uint64 = 8         # concurrent datagrams reassembled
+IP6_REASM_CAP:   uint64 = 2048      # max reassembled datagram payload per ctx
+# Per-context payload buffer + per-byte "received" bitmap, indexed
+# [ctx * IP6_REASM_CAP + offset]. 8 * 2048 = 16384 bytes each.
+ip6_reasm_buf:   Array[16384, uint8]
+ip6_reasm_fill:  Array[16384, uint8]
+# Per-context scalar state (parallel arrays, one entry per context).
+ip6_reasm_active:  Array[8, uint8]   # 1 = context in use
+ip6_reasm_id:      Array[8, uint32]  # IPv6 fragment identification
+ip6_reasm_src:     Array[128, uint8] # 8 ctx * 16 bytes, src addr
+ip6_reasm_dst:     Array[128, uint8] # 8 ctx * 16 bytes, dst addr
+ip6_reasm_nexthdr: Array[8, uint8]   # upper-layer proto carried by the frags
+ip6_reasm_total:   Array[8, uint64]  # known total length once M=0 seen
+ip6_reasm_have_last: Array[8, uint8] # 1 once the M=0 fragment seen
+ip6_reasm_rxbytes: Array[8, uint64]  # count of payload bytes copied in
+ip6_reasm_gen:     Array[8, uint64]  # monotonic touch generation (LRU)
+ip6_reasm_clock:   uint64 = 0        # monotonic LRU generation source
 
 
 # =====================================================================
@@ -844,84 +861,125 @@ def _ip6_walk_exthdrs(pkt: Ptr[uint8], cap: uint64, start_off: uint64,
 
 # --- fragment reassembly (RFC 8200 §4.5) ----------------------------
 #
-# _ip6_reasm_input copies one fragment's payload into the single
-# reassembly slot at its fragment offset, tracks per-byte arrival, and
-# learns the total length from the last (M=0) fragment. It returns the
-# reassembled length once the datagram is complete (every byte present
-# up to the known total), else 0. The slot is keyed by (src, dst, id);
-# a fragment for a different key resets the slot (single-slot reasm —
-# enough for the kernel's ping6 / small-UDP6 use, no fragment flood
-# threat model on a single-NIC box).
-def _ip6_reasm_reset():
-    ip6_reasm_active = 0
-    ip6_reasm_have_last = 0
-    ip6_reasm_total = 0
-    ip6_reasm_rxbytes = 0
+# _ip6_reasm_input copies one fragment's payload into the reassembly
+# context for its (src, dst, id) key at its fragment offset, tracks
+# per-byte arrival, and learns the total length from the last (M=0)
+# fragment. It returns the reassembled length once the datagram is
+# complete (every byte present up to the known total), else 0; the
+# completing context's index is returned via out_ctx so the caller can
+# locate the contiguous payload and free the slot. A fixed pool of
+# IP6_REASM_CTX contexts lets distinct peers reassemble concurrently;
+# on exhaustion the LRU context is evicted (mirrors IPv4 ip_reasm_*).
+
+def _ip6_reasm_reset(ci: uint64):
+    ip6_reasm_active[ci] = 0
+    ip6_reasm_have_last[ci] = 0
+    ip6_reasm_total[ci] = 0
+    ip6_reasm_rxbytes[ci] = 0
+    base: uint64 = ci * IP6_REASM_CAP
     i: uint64 = 0
     while i < IP6_REASM_CAP:
-        ip6_reasm_fill[i] = 0
+        ip6_reasm_fill[base + i] = 0
         i = i + 1
 
 
-def _ip6_reasm_key_match(src: Ptr[uint8], dst: Ptr[uint8], id: uint32) -> int32:
-    if ip6_reasm_active == 0:
-        return 0
-    if ip6_reasm_id != id:
-        return 0
+# Locate the in-use context matching (src, dst, id), else IP6_REASM_CTX.
+def _ip6_reasm_find(src: Ptr[uint8], dst: Ptr[uint8], id: uint32) -> uint64:
+    c: uint64 = 0
+    while c < IP6_REASM_CTX:
+        if ip6_reasm_active[c] == 1 and ip6_reasm_id[c] == id:
+            sb: uint64 = c * 16
+            matched: int32 = 1
+            i: uint64 = 0
+            while i < 16:
+                if ip6_reasm_src[sb + i] != src[i]:
+                    matched = 0
+                if ip6_reasm_dst[sb + i] != dst[i]:
+                    matched = 0
+                i = i + 1
+            if matched == 1:
+                return c
+        c = c + 1
+    return IP6_REASM_CTX
+
+
+# Allocate a fresh context for (src, dst, id): prefer a free slot, else
+# evict the least-recently-used (smallest generation). Always succeeds.
+def _ip6_reasm_alloc(src: Ptr[uint8], dst: Ptr[uint8], id: uint32,
+                     nexthdr: uint8) -> uint64:
+    ci: uint64 = IP6_REASM_CTX
+    c: uint64 = 0
+    while c < IP6_REASM_CTX:
+        if ip6_reasm_active[c] == 0:
+            ci = c
+            c = IP6_REASM_CTX
+        else:
+            c = c + 1
+    if ci == IP6_REASM_CTX:
+        # No free slot — evict the LRU (smallest generation).
+        oldest: uint64 = ip6_reasm_gen[0]
+        ci = 0
+        k: uint64 = 1
+        while k < IP6_REASM_CTX:
+            if ip6_reasm_gen[k] < oldest:
+                oldest = ip6_reasm_gen[k]
+                ci = k
+            k = k + 1
+    _ip6_reasm_reset(ci)
+    ip6_reasm_active[ci] = 1
+    ip6_reasm_id[ci] = id
+    ip6_reasm_nexthdr[ci] = nexthdr
+    sb: uint64 = ci * 16
     i: uint64 = 0
     while i < 16:
-        if ip6_reasm_src[i] != src[i]:
-            return 0
-        if ip6_reasm_dst[i] != dst[i]:
-            return 0
+        ip6_reasm_src[sb + i] = src[i]
+        ip6_reasm_dst[sb + i] = dst[i]
         i = i + 1
-    return 1
+    return ci
 
 
 def _ip6_reasm_input(src: Ptr[uint8], dst: Ptr[uint8], id: uint32,
                      nexthdr: uint8, frag_off_bytes: uint64,
                      more: uint8, frag_payload: Ptr[uint8],
-                     frag_len: uint64) -> uint64:
+                     frag_len: uint64, out_ctx: Ptr[uint64]) -> uint64:
     ip6_in_frag = ip6_in_frag + 1
-    # New datagram key? Reset the slot and claim it.
-    if _ip6_reasm_key_match(src, dst, id) == 0:
-        _ip6_reasm_reset()
-        ip6_reasm_active = 1
-        ip6_reasm_id = id
-        ip6_reasm_nexthdr = nexthdr
-        i: uint64 = 0
-        while i < 16:
-            ip6_reasm_src[i] = src[i]
-            ip6_reasm_dst[i] = dst[i]
-            i = i + 1
+    # Find an existing context for this key, or allocate one.
+    ci: uint64 = _ip6_reasm_find(src, dst, id)
+    if ci == IP6_REASM_CTX:
+        ci = _ip6_reasm_alloc(src, dst, id, nexthdr)
+    out_ctx[0] = ci
+    # Touch the LRU generation so an active context isn't evicted.
+    ip6_reasm_clock = ip6_reasm_clock + 1
+    ip6_reasm_gen[ci] = ip6_reasm_clock
+    buf_base: uint64 = ci * IP6_REASM_CAP
     # Bounds: the fragment must fit inside the reassembly buffer. A
     # crafted offset that would overflow IP6_REASM_CAP is dropped (and
-    # resets the slot to avoid a poisoned partial datagram).
+    # frees the context to avoid a poisoned partial datagram).
     end: uint64 = frag_off_bytes + frag_len
     if end > IP6_REASM_CAP:
-        _ip6_reasm_reset()
+        _ip6_reasm_reset(ci)
         return 0
     # Copy the payload and mark each byte received.
     i: uint64 = 0
     while i < frag_len:
-        ip6_reasm_buf[frag_off_bytes + i] = frag_payload[i]
-        if ip6_reasm_fill[frag_off_bytes + i] == 0:
-            ip6_reasm_fill[frag_off_bytes + i] = 1
-            ip6_reasm_rxbytes = ip6_reasm_rxbytes + 1
+        ip6_reasm_buf[buf_base + frag_off_bytes + i] = frag_payload[i]
+        if ip6_reasm_fill[buf_base + frag_off_bytes + i] == 0:
+            ip6_reasm_fill[buf_base + frag_off_bytes + i] = 1
+            ip6_reasm_rxbytes[ci] = ip6_reasm_rxbytes[ci] + 1
         i = i + 1
     # The last fragment (M=0) pins the total datagram length.
     if more == 0:
-        ip6_reasm_have_last = 1
-        ip6_reasm_total = end
+        ip6_reasm_have_last[ci] = 1
+        ip6_reasm_total[ci] = end
     # Complete iff we know the total and every byte up to it arrived.
-    if ip6_reasm_have_last == 1 and ip6_reasm_rxbytes >= ip6_reasm_total:
+    if ip6_reasm_have_last[ci] == 1 and ip6_reasm_rxbytes[ci] >= ip6_reasm_total[ci]:
         # Verify contiguity (no holes) before declaring success.
         j: uint64 = 0
-        while j < ip6_reasm_total:
-            if ip6_reasm_fill[j] == 0:
+        while j < ip6_reasm_total[ci]:
+            if ip6_reasm_fill[buf_base + j] == 0:
                 return 0
             j = j + 1
-        return ip6_reasm_total
+        return ip6_reasm_total[ci]
     return 0
 
 
@@ -991,25 +1049,26 @@ def ipv6_rx(pkt: Ptr[uint8], length: uint64, src_mac: Ptr[uint8]):
             return
         frag_payload: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](pkt) + l4_off)
         frag_len: uint64 = cap - l4_off
+        reasm_ctx: uint64 = 0
         done: uint64 = _ip6_reasm_input(
             src_ip, dst_ip, frag_id, l4_proto, frag_off_bytes, more,
-            frag_payload, frag_len)
+            frag_payload, frag_len, &reasm_ctx)
         if done == 0:
             # Need more fragments — wait.
             return
         # Reassembly complete: re-dispatch the reassembled datagram
         # through the upper-layer demux. The reassembled payload lives
-        # contiguously in ip6_reasm_buf.
+        # contiguously in this context's slice of ip6_reasm_buf.
         ip6_reasm_ok = ip6_reasm_ok + 1
         printk1("[ipv6] reassembled datagram (%d bytes)\n", done)
-        reasm_l4: Ptr[uint8] = cast[Ptr[uint8]](&ip6_reasm_buf[0])
+        reasm_l4: Ptr[uint8] = cast[Ptr[uint8]](&ip6_reasm_buf[reasm_ctx * IP6_REASM_CAP])
         if l4_proto == IP6PROTO_ICMPV6:
             _icmp6_rx(src_ip, dst_ip, src_mac, reasm_l4, done)
         elif l4_proto == IP6PROTO_UDP:
             _udp6_rx(src_ip, dst_ip, reasm_l4, done)
         else:
             printk1("[ipv6] reasm: unhandled proto=%d\n", cast[uint64](l4_proto))
-        _ip6_reasm_reset()
+        _ip6_reasm_reset(reasm_ctx)
         return
     # --- Non-fragmented path ------------------------------------------
     if l4_off > cap:
@@ -1405,6 +1464,251 @@ def ipv6_selftest():
     else:
         printk0("[ipv6-selftest] SOME FAIL\n")
 
+    # Chain the net-capacity self-test (the three raised capacity limits),
+    # gated independently on its own /etc/netcap-test cpio marker so a
+    # plain ipv6-test boot stays unaffected.
+    if _netcap_marker_present() == 1:
+        netcap_selftest()
+
+
+# =====================================================================
+# Net-capacity self-test (scripts/test_net_capacity.sh)
+# =====================================================================
+#
+# Proves the three raised hard-capacity limits in the native net stack:
+#   (a) IPv6 reassembly is now an N-context pool — two concurrently
+#       fragmented datagrams from DIFFERENT sources both reassemble
+#       (the old single-slot reassembler dropped the first).
+#   (b) the kernel socket table holds > 16 sockets (raised to KSOCK_MAX).
+#   (c) the UDP datagram store queues > 64 datagrams without loss
+#       (raised UDS_MAX * UDS_QUEUE_DEPTH).
+# Gated on the /etc/netcap-test cpio marker so vanilla boots are quiet.
+
+# Two distinct synthetic source addresses for the concurrent-reassembly
+# test, plus per-source fragment payload scratch (16-byte datagrams).
+ip6_nc_src_a:    Array[16, uint8]
+ip6_nc_src_b:    Array[16, uint8]
+ip6_nc_dst:      Array[16, uint8]
+ip6_nc_msg_a:    Array[16, uint8]
+ip6_nc_msg_b:    Array[16, uint8]
+# Scratch payload for the UDP queue-depth test.
+ip6_nc_udp_pl:   Array[4, uint8]
+
+
+def _netcap_marker_present() -> int32:
+    # Scan the initramfs for "/etc/netcap-test" (16 chars + NUL = 17).
+    cpio_init()
+    n: uint64 = initramfs_entry_count()
+    idx: uint64 = 0
+    while idx < n:
+        nm: Ptr[char] = initramfs_entry_name(idx)
+        ok: int32 = 1
+        tgt: Ptr[uint8] = "/etc/netcap-test"
+        j: uint64 = 0
+        while j < 17:
+            if cast[uint8](nm[j]) != tgt[j]:
+                ok = 0
+                j = 17
+            else:
+                j = j + 1
+        if ok == 1:
+            return 1
+        idx = idx + 1
+    return 0
+
+
+def _netcap_check(name: Ptr[uint8], ok: int32) -> int32:
+    if ok != 0:
+        printk1("[netcap] %s PASS\n", cast[uint64](name))
+        return 0
+    printk1("[netcap] %s FAIL\n", cast[uint64](name))
+    return 1
+
+
+def _netcap_ipv6_concurrent_reasm() -> int32:
+    # Build two 16-byte "datagrams" (filled with distinct byte patterns),
+    # split each into two 8-byte fragments, and feed _ip6_reasm_input
+    # INTERLEAVED across two distinct (src,id) keys:
+    #   A.frag1(off 0, M=1) ; B.frag1(off 0, M=1) ;
+    #   A.frag2(off 8, M=0) ; B.frag2(off 8, M=0)
+    # The single-slot reassembler would have dropped A when B claimed the
+    # slot; the N-context pool must reassemble BOTH byte-exactly.
+    i: uint64 = 0
+    while i < 16:
+        ip6_nc_dst[i]   = 0
+        ip6_nc_src_a[i] = 0
+        ip6_nc_src_b[i] = 0
+        ip6_nc_msg_a[i] = cast[uint8](0xA0 + (i & 0x0F))
+        ip6_nc_msg_b[i] = cast[uint8](0xB0 + (i & 0x0F))
+        i = i + 1
+    # Our address (dst) = fe80::1234.
+    ip6_nc_dst[0]  = 0xFE
+    ip6_nc_dst[1]  = 0x80
+    ip6_nc_dst[14] = 0x12
+    ip6_nc_dst[15] = 0x34
+    # Peer A = fe80::a, Peer B = fe80::b — distinct sources.
+    ip6_nc_src_a[0]  = 0xFE
+    ip6_nc_src_a[1]  = 0x80
+    ip6_nc_src_a[15] = 0x0A
+    ip6_nc_src_b[0]  = 0xFE
+    ip6_nc_src_b[1]  = 0x80
+    ip6_nc_src_b[15] = 0x0B
+
+    ctx_a: uint64 = 0
+    ctx_b: uint64 = 0
+    id_a: uint32 = 0x0000AAAA
+    id_b: uint32 = 0x0000BBBB
+
+    # A.frag1 (offset 0, M=1) — incomplete.
+    da: uint64 = _ip6_reasm_input(
+        cast[Ptr[uint8]](&ip6_nc_src_a[0]), cast[Ptr[uint8]](&ip6_nc_dst[0]),
+        id_a, IP6PROTO_UDP, 0, 1,
+        cast[Ptr[uint8]](&ip6_nc_msg_a[0]), 8, &ctx_a)
+    # B.frag1 (offset 0, M=1) — a DIFFERENT key; must NOT disturb A.
+    db: uint64 = _ip6_reasm_input(
+        cast[Ptr[uint8]](&ip6_nc_src_b[0]), cast[Ptr[uint8]](&ip6_nc_dst[0]),
+        id_b, IP6PROTO_UDP, 0, 1,
+        cast[Ptr[uint8]](&ip6_nc_msg_b[0]), 8, &ctx_b)
+    if da != 0 or db != 0:
+        return 0                       # neither should be complete yet
+    if ctx_a == ctx_b:
+        return 0                       # must occupy distinct contexts
+    # A.frag2 (offset 8, M=0) — completes A.
+    da = _ip6_reasm_input(
+        cast[Ptr[uint8]](&ip6_nc_src_a[0]), cast[Ptr[uint8]](&ip6_nc_dst[0]),
+        id_a, IP6PROTO_UDP, 8, 0,
+        cast[Ptr[uint8]](&ip6_nc_msg_a[8]), 8, &ctx_a)
+    # B.frag2 (offset 8, M=0) — completes B.
+    db = _ip6_reasm_input(
+        cast[Ptr[uint8]](&ip6_nc_src_b[0]), cast[Ptr[uint8]](&ip6_nc_dst[0]),
+        id_b, IP6PROTO_UDP, 8, 0,
+        cast[Ptr[uint8]](&ip6_nc_msg_b[8]), 8, &ctx_b)
+    if da != 16 or db != 16:
+        return 0                       # both must now reassemble to 16
+    # Byte-exact verify both reassembled buffers from their own contexts.
+    base_a: uint64 = ctx_a * IP6_REASM_CAP
+    base_b: uint64 = ctx_b * IP6_REASM_CAP
+    k: uint64 = 0
+    while k < 16:
+        if ip6_reasm_buf[base_a + k] != cast[uint8](0xA0 + (k & 0x0F)):
+            return 0
+        if ip6_reasm_buf[base_b + k] != cast[uint8](0xB0 + (k & 0x0F)):
+            return 0
+        k = k + 1
+    _ip6_reasm_reset(ctx_a)
+    _ip6_reasm_reset(ctx_b)
+    return 1
+
+
+def _netcap_socket_table() -> int32:
+    # Allocate more than the old 16 sockets; every create up to KSOCK_MAX
+    # must succeed (the old table returned -ENFILE at the 17th). We probe
+    # at least 17 (> old bound) and assert no failure before KSOCK_MAX.
+    sock_table_init()
+    want: uint64 = 17
+    if KSOCK_MAX < want:
+        want = KSOCK_MAX
+    cookies: Array[64, int32]
+    allocated: uint64 = 0
+    i: uint64 = 0
+    while i < want:
+        c: int32 = sock_table_create(KAF_INET, KSOCK_DGRAM, 0)
+        cookies[i] = c
+        if c > 0:
+            allocated = allocated + 1
+        i = i + 1
+    # Release what we took so we leave the table clean.
+    j: uint64 = 0
+    while j < want:
+        sock_table_release(cookies[j])
+        j = j + 1
+    if allocated >= want and allocated > 16:
+        return 1
+    return 0
+
+
+def _netcap_udp_queue_depth() -> int32:
+    # Queue MORE than 64 datagrams across the UDP socket pool with zero
+    # loss, then dequeue them all byte-exact. The old store held only 8
+    # sockets * 8 deep = 64 total; we fill well past 64 and verify no
+    # enqueue reported a drop.
+    ip6_nc_udp_pl[0] = 0x5A
+    ip6_nc_udp_pl[1] = 0x5B
+    ip6_nc_udp_pl[2] = 0x5C
+    ip6_nc_udp_pl[3] = 0x5D
+    pl: Ptr[uint8] = cast[Ptr[uint8]](&ip6_nc_udp_pl[0])
+    # Spread the load over several sockets; each holds UDS_QUEUE_DEPTH.
+    # Use 8 sockets * UDS_QUEUE_DEPTH so the TOTAL is comfortably > 64.
+    nsock: uint64 = 8
+    if nsock > UDS_MAX:
+        nsock = UDS_MAX
+    slots: Array[8, int32]
+    si: uint64 = 0
+    while si < nsock:
+        slots[si] = -1
+        si = si + 1
+    # Open + bind the sockets.
+    s: uint64 = 0
+    while s < nsock:
+        sl: int32 = udp_socket_open()
+        if sl < 0:
+            return 0
+        if udp_socket_bind(sl, cast[uint16](40000 + s)) != 0:
+            return 0
+        slots[s] = sl
+        s = s + 1
+    total_queued: uint64 = 0
+    drops: uint64 = 0
+    # Fill each socket's ring to UDS_QUEUE_DEPTH.
+    s = 0
+    while s < nsock:
+        d: uint64 = 0
+        while d < UDS_QUEUE_DEPTH:
+            ok: int32 = udp_netcap_enqueue(slots[s],
+                cast[uint32](0x0A000201), cast[uint16](5000),
+                pl, 4)
+            if ok == 1:
+                total_queued = total_queued + 1
+            else:
+                drops = drops + 1
+            d = d + 1
+        s = s + 1
+    # Verify each socket reports a full ring and dequeue byte-exact.
+    bad: uint64 = 0
+    s = 0
+    while s < nsock:
+        if udp_netcap_qcount(slots[s]) != UDS_QUEUE_DEPTH:
+            bad = bad + 1
+        d: uint64 = 0
+        while d < UDS_QUEUE_DEPTH:
+            if udp_netcap_dequeue_ok(slots[s], 0x5A, 4) != 1:
+                bad = bad + 1
+            d = d + 1
+        s = s + 1
+    # Close the sockets.
+    s = 0
+    while s < nsock:
+        udp_socket_close(slots[s])
+        s = s + 1
+    if drops == 0 and bad == 0 and total_queued > 64:
+        return 1
+    return 0
+
+
+def netcap_selftest():
+    printk0("[netcap] begin net-capacity self-test\n")
+    fails: int32 = 0
+    fails = fails + _netcap_check("ipv6-concurrent-reasm",
+                                  _netcap_ipv6_concurrent_reasm())
+    fails = fails + _netcap_check("socket-table-gt16",
+                                  _netcap_socket_table())
+    fails = fails + _netcap_check("udp-queue-gt64",
+                                  _netcap_udp_queue_depth())
+    if fails == 0:
+        printk0("[netcap] PASS\n")
+    else:
+        printk0("[netcap] FAIL\n")
+
 
 def ipv6_init():
     ip6_in_pkts        = 0
@@ -1424,16 +1728,21 @@ def ipv6_init():
     icmp6_in_ra        = 0
     ip6_lladdr_set     = 0
     ndc_next_evict     = 0
-    ip6_reasm_active   = 0
-    ip6_reasm_have_last = 0
-    ip6_reasm_total    = 0
-    ip6_reasm_rxbytes  = 0
+    ip6_reasm_clock    = 0
     i: uint64 = 0
     while i < NDC_SIZE:
         ndc_valid[i] = 0
         i = i + 1
+    c: uint64 = 0
+    while c < IP6_REASM_CTX:
+        ip6_reasm_active[c] = 0
+        ip6_reasm_have_last[c] = 0
+        ip6_reasm_total[c] = 0
+        ip6_reasm_rxbytes[c] = 0
+        ip6_reasm_gen[c] = 0
+        c = c + 1
     j: uint64 = 0
-    while j < IP6_REASM_CAP:
+    while j < (IP6_REASM_CTX * IP6_REASM_CAP):
         ip6_reasm_fill[j] = 0
         j = j + 1
     printk0("ipv6: initialized (link-local + ND + ICMPv6 + UDP6 + frag-reasm)\n")
