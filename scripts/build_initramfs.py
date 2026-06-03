@@ -469,6 +469,14 @@ if os.environ.get("ENABLE_EXT4XATTR_TEST") == "1":
 if os.environ.get("ENABLE_FATLFN_TEST") == "1":
     FILES.append(("/etc/fatlfn-test", b"1\n"))
 
+# Read-only exFAT reader self-test. scripts/test_exfat.sh sets
+# ENABLE_EXFAT_TEST=1 to plant /etc/exfat-test; init/main.ad at
+# boot:37.exfat detects the marker and runs exfat_selftest(), which
+# mounts the exFAT image attached as sd0, lists the root, opens a known
+# file and asserts its bytes.
+if os.environ.get("ENABLE_EXFAT_TEST") == "1":
+    FILES.append(("/etc/exfat-test", b"1\n"))
+
 # #168: REAL ACPI S5 poweroff + reboot self-test.
 # scripts/test_acpi_poweroff.sh sets ENABLE_ACPI_TEST=1 to plant
 # /etc/acpi-test. init/main.ad at boot:37.acpi detects the marker, logs

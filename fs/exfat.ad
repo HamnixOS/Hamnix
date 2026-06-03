@@ -1,0 +1,677 @@
+# fs/exfat.ad
+#
+# Read-only exFAT filesystem reader — the on-disk format Windows/macOS
+# put on large USB sticks and SD cards (>32 GiB), where FAT32 stops and
+# ext4 is never used. Linux's fs/exfat/ has a full read/write inode +
+# dentry + allocation-bitmap + upcase-table stack; we expose a minimal
+# read-only surface mirroring fs/fat.ad's three-call shape:
+#
+#   exfat_init(blockdev_slot)              parse the boot sector once
+#   exfat_probe(blockdev_slot)             "is this an exFAT volume?"
+#   exfat_lookup(name, &first, &size,
+#                &nofatchain)              resolve a root-dir file
+#   exfat_read(first_cluster, size,
+#              nofatchain, pos, count,buf) stream a file's bytes
+#   exfat_listdir(buf, count)             pack root names as "NAME\n"
+#
+# Single mount only (one global state block), same constraint as FAT.
+#
+# exFAT differs from FAT32 in three load-bearing ways we handle here:
+#   * Geometry comes from the Main Boot Record (LBA 0) field set:
+#     FatOffset / ClusterHeapOffset / FirstClusterOfRootDirectory /
+#     {BytesPer,SectorsPerCluster}Shift, all in SECTORS (not the FAT
+#     BPB layout).
+#   * A directory is an ENTRY SET: a 0x85 File entry (attrs + secondary
+#     count) followed by a 0xC0 Stream Extension entry (FirstCluster +
+#     DataLength + ValidDataLength + a per-file NoFatChain flag in its
+#     GeneralSecondaryFlags) followed by one-or-more 0xC1 File Name
+#     entries carrying 15 UTF-16LE code units each. We reassemble the
+#     name (ASCII-folded — non-ASCII code units are passed through as
+#     their low byte, sufficient for the round-trip test).
+#   * Allocation is either FAT-chained (32-bit FAT entries, same walk
+#     shape as FAT32 but 0xFFFFFFF8.. = EOC) OR contiguous when the
+#     file's NoFatChain bit is set — then cluster N+1 simply follows
+#     cluster N on the heap, no FAT read.
+
+from kernel.block.blk import (
+    blk_read_sectors, find_blockdev, SECTOR_SIZE,
+)
+from kernel.printk.printk import (
+    printk0, printk1, printk2,
+    printk_set_level, PRINTK_LEVEL_EMERG,
+)
+
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+
+
+# --- mount-time state (one mount only) ---------------------------
+
+exfat_blockdev_slot:   int32  = -1
+exfat_bytes_per_sec:   uint64 = 512        # 1 << BytesPerSectorShift
+exfat_secs_per_clu:    uint64 = 1          # 1 << SectorsPerClusterShift
+exfat_clu_bytes:       uint64 = 512        # bytes/sec * secs/clu
+exfat_fat_offset:      uint64 = 0          # in sectors, from LBA 0
+exfat_heap_offset:     uint64 = 0          # ClusterHeapOffset, sectors
+exfat_root_cluster:    uint64 = 0          # FirstClusterOfRootDirectory
+exfat_volume_length:   uint64 = 0          # total volume sectors
+
+
+# Module-scope scratch buffers (.bss). exFAT clusters can be large; we
+# size the cluster buffer for up to 32 KiB (the largest cluster we will
+# read in one shot — bigger clusters fall back to per-sector reads in
+# exfat_read). The FAT buffer is one sector. Never reentrant.
+EXFAT_MAX_CLU_BYTES: uint64 = 32768
+exfat_clu_buf:  Array[32768, uint8]
+exfat_fat_buf:  Array[512, uint8]
+exfat_dir_buf:  Array[512, uint8]
+
+
+def _read_u16_le(p: Ptr[uint8]) -> uint16:
+    return cast[uint16](p[0]) | (cast[uint16](p[1]) << 8)
+
+
+def _read_u32_le(p: Ptr[uint8]) -> uint32:
+    return (cast[uint32](p[0])
+            | (cast[uint32](p[1]) << 8)
+            | (cast[uint32](p[2]) << 16)
+            | (cast[uint32](p[3]) << 24))
+
+
+def _read_u64_le(p: Ptr[uint8]) -> uint64:
+    return (cast[uint64](p[0])
+            | (cast[uint64](p[1]) << 8)
+            | (cast[uint64](p[2]) << 16)
+            | (cast[uint64](p[3]) << 24)
+            | (cast[uint64](p[4]) << 32)
+            | (cast[uint64](p[5]) << 40)
+            | (cast[uint64](p[6]) << 48)
+            | (cast[uint64](p[7]) << 56))
+
+
+def _exfat_is_signature(p: Ptr[uint8]) -> int32:
+    # The exFAT Main Boot Record carries the ASCII FileSystemName
+    # "EXFAT   " (3 trailing spaces, 8 bytes) at offset 3, plus the
+    # 0x55 0xAA boot signature at offset 510.
+    fsn: Array[8, uint8]
+    fsn[0] = 69     # 'E'
+    fsn[1] = 88     # 'X'
+    fsn[2] = 70     # 'F'
+    fsn[3] = 65     # 'A'
+    fsn[4] = 84     # 'T'
+    fsn[5] = 32     # ' '
+    fsn[6] = 32     # ' '
+    fsn[7] = 32     # ' '
+    i: uint64 = 0
+    while i < 8:
+        if p[3 + i] != fsn[i]:
+            return 0
+        i = i + 1
+    if p[510] != 0x55:
+        return 0
+    if p[511] != 0xAA:
+        return 0
+    return 1
+
+
+def exfat_probe(slot: int32) -> int32:
+    # Returns 1 if `slot`'s LBA 0 is an exFAT Main Boot Record, else 0.
+    rc: int32 = blk_read_sectors(slot, 0, 1, &exfat_dir_buf[0])
+    if rc != 0:
+        return 0
+    return _exfat_is_signature(&exfat_dir_buf[0])
+
+
+def exfat_init(slot: int32) -> int32:
+    # Read the Main Boot Record (LBA 0) and pull out the geometry.
+    # Returns 0 on success, -1 on read failure / non-exFAT image.
+    rc: int32 = blk_read_sectors(slot, 0, 1, &exfat_dir_buf[0])
+    if rc != 0:
+        printk0("exfat: failed to read boot sector\n")
+        return -1
+    p: Ptr[uint8] = &exfat_dir_buf[0]
+    if _exfat_is_signature(p) == 0:
+        printk0("exfat: not an exFAT volume\n")
+        return -1
+
+    # exFAT MBR field layout (offsets per the Microsoft spec):
+    #   64  PartitionOffset            (u64, sectors)  — ignored, we
+    #                                                    read LBAs relative
+    #                                                    to this block dev
+    #   72  VolumeLength               (u64, sectors)
+    #   80  FatOffset                  (u32, sectors)
+    #   84  FatLength                  (u32, sectors)
+    #   88  ClusterHeapOffset          (u32, sectors)
+    #   92  ClusterCount               (u32)
+    #   96  FirstClusterOfRootDirectory(u32, cluster)
+    #  108  BytesPerSectorShift        (u8)
+    #  109  SectorsPerClusterShift     (u8)
+    exfat_volume_length = _read_u64_le(
+        cast[Ptr[uint8]](cast[uint64](p) + 72))
+    exfat_fat_offset = cast[uint64](_read_u32_le(
+        cast[Ptr[uint8]](cast[uint64](p) + 80)))
+    exfat_heap_offset = cast[uint64](_read_u32_le(
+        cast[Ptr[uint8]](cast[uint64](p) + 88)))
+    exfat_root_cluster = cast[uint64](_read_u32_le(
+        cast[Ptr[uint8]](cast[uint64](p) + 96)))
+
+    bps_shift: uint64 = cast[uint64](p[108])
+    spc_shift: uint64 = cast[uint64](p[109])
+    exfat_bytes_per_sec = cast[uint64](1) << bps_shift
+    exfat_secs_per_clu  = cast[uint64](1) << spc_shift
+    exfat_clu_bytes     = exfat_bytes_per_sec * exfat_secs_per_clu
+
+    # We address the block device in 512-byte sectors. Only support
+    # 512-byte-logical-sector exFAT here (BytesPerSectorShift == 9);
+    # larger needs a re-scaling pass we punt on.
+    if exfat_bytes_per_sec != SECTOR_SIZE:
+        printk1("exfat: unsupported sector size %d\n", exfat_bytes_per_sec)
+        return -1
+
+    exfat_blockdev_slot = slot
+    printk2("exfat: mounted; root_cluster=%d heap_lba=%d\n",
+            exfat_root_cluster, exfat_heap_offset)
+    return 0
+
+
+def _cluster_to_lba(cluster: uint64) -> uint64:
+    # exFAT cluster numbering starts at 2 (entries 0 and 1 are reserved,
+    # just like FAT). Cluster N begins at ClusterHeapOffset +
+    # (N - 2) * SectorsPerCluster, all measured in sectors from LBA 0.
+    return exfat_heap_offset + (cluster - 2) * exfat_secs_per_clu
+
+
+EXFAT_EOC_MIN: uint32 = 0xFFFFFFF8         # 0xFFFFFFF8..0xFFFFFFFF = EOC
+EXFAT_BAD_CLU: uint32  = 0xFFFFFFF7         # bad cluster marker
+
+
+def _exfat_fat_next(cluster: uint64) -> uint32:
+    # Read the 32-bit FAT entry for `cluster` and return its raw value.
+    # The exFAT FAT lives at FatOffset (sectors from LBA 0); entry N is
+    # at byte offset N*4. Returns 0 on read failure (treat as "no next").
+    entry_off: uint64 = cluster * 4
+    fat_lba: uint64 = exfat_fat_offset + entry_off / SECTOR_SIZE
+    within: uint64 = entry_off % SECTOR_SIZE
+    rc: int32 = blk_read_sectors(exfat_blockdev_slot, fat_lba, 1,
+                                 &exfat_fat_buf[0])
+    if rc != 0:
+        return 0
+    return _read_u32_le(
+        cast[Ptr[uint8]](cast[uint64](&exfat_fat_buf[0]) + within))
+
+
+def _is_eoc(entry: uint32) -> int32:
+    if entry >= EXFAT_EOC_MIN:
+        return 1
+    return 0
+
+
+def _next_cluster(cluster: uint64, nofatchain: uint32) -> uint64:
+    # Advance one cluster along a chain. For contiguous (NoFatChain)
+    # files the next cluster is simply cluster+1 — there is no valid FAT
+    # to read. For FAT-chained files we read the FAT. Returns 0 if the
+    # chain ends (caller should stop).
+    if nofatchain != 0:
+        return cluster + 1
+    nxt: uint32 = _exfat_fat_next(cluster)
+    if _is_eoc(nxt) != 0:
+        return 0
+    if nxt == EXFAT_BAD_CLU or nxt < 2:
+        return 0
+    return cast[uint64](nxt)
+
+
+# --- directory entry-set parsing ----------------------------------
+#
+# Each directory entry is 32 bytes. The entry types we care about:
+#   0x85  File Directory Entry: byte[1] = SecondaryCount (number of
+#         following secondary entries that belong to this set),
+#         byte[4..6] = FileAttributes.
+#   0xC0  Stream Extension Entry: byte[1] = GeneralSecondaryFlags
+#         (bit0 = AllocationPossible, bit1 = NoFatChain),
+#         byte[3] = NameLength (UTF-16 code units),
+#         byte[20..24] = FirstCluster (u32),
+#         byte[24..32] = DataLength (u64).
+#   0xC1  File Name Entry: byte[2..32] = 15 UTF-16LE code units of the
+#         name fragment.
+# An entry whose first byte has bit7 clear (e.g. 0x05/0x40) is the
+# "InUse cleared" variant of the same type; 0x00 ends the directory.
+
+EXFAT_ENTRY_BYTES: uint64 = 32
+EXFAT_TYPE_FILE:   uint8 = 0x85
+EXFAT_TYPE_STREAM: uint8 = 0xC0
+EXFAT_TYPE_NAME:   uint8 = 0xC1
+EXFAT_ATTR_DIR:    uint16 = 0x10
+
+
+# Reassembled name of the entry the directory walk last matched/listed,
+# stored as a NUL-terminated ASCII cstring (non-ASCII folded to low
+# byte). 256 UTF-16 units max per exFAT spec -> 255 chars + NUL.
+exfat_name_buf: Array[256, uint8]
+
+
+def _ascii_eq(a: Ptr[uint8], b: Ptr[char]) -> int32:
+    # Case-SENSITIVE compare of NUL-terminated cstrings. exFAT is
+    # case-insensitive via the upcase table; for the deterministic
+    # self-test we mint exact-case names so a plain compare suffices.
+    i: uint64 = 0
+    while True:
+        ca: uint8 = a[i]
+        cb: uint8 = cast[uint8](b[i] & 0xFF)
+        if ca != cb:
+            return 0
+        if ca == 0:
+            return 1
+        i = i + 1
+
+
+def _decode_name_fragment(entry: Ptr[uint8], name_out: Ptr[uint8],
+                          pos: uint64, name_len: uint64) -> uint64:
+    # Append up to 15 UTF-16LE code units from a 0xC1 File Name entry
+    # into name_out (ASCII-folded), stopping at name_len total chars.
+    # Returns the new total character count.
+    k: uint64 = 0
+    cur: uint64 = pos
+    while k < 15:
+        if cur >= name_len:
+            return cur
+        cu: uint16 = _read_u16_le(
+            cast[Ptr[uint8]](cast[uint64](entry) + 2 + k * 2))
+        # Fold to ASCII low byte (sufficient for the round-trip test;
+        # full UTF-8 expansion is a follow-up).
+        name_out[cur] = cast[uint8](cu & 0xFF)
+        cur = cur + 1
+        k = k + 1
+    return cur
+
+
+class ExfatDirEnt:
+    # One parsed file entry-set result.
+    valid:       uint32
+    is_dir:      uint32
+    nofatchain:  uint32
+    pad:         uint32
+    first_clu:   uint64
+    data_len:    uint64
+
+
+# --- low-level directory scanner ----------------------------------
+#
+# Walk the root directory's cluster chain entry-by-entry, invoking the
+# caller-supplied logic. To keep this in one place without callbacks
+# (Adder has no closures here), the scanner is specialised twice:
+#   _exfat_find_in_root  — resolve one named file
+#   exfat_listdir        — pack all names
+# Both share _parse_entry_set, which given the File entry index inside a
+# loaded 512-byte directory sector, decodes the Stream + Name secondaries
+# IF they all fall within the same sector. exFAT entry-sets can straddle
+# a sector boundary; to handle that robustly we load the whole root
+# directory linearly cluster-by-cluster into a streaming offset cursor
+# rather than per-sector. We do this by reading the directory through a
+# byte cursor over its cluster chain.
+
+
+# Read `nbytes` of the root directory starting at byte offset `off`
+# (within the directory's logical byte stream) into dst. Follows the
+# root cluster chain (root is always FAT-chained in practice, but we
+# honor a contiguous root too). Returns bytes read (0 on EOF/error).
+def _read_dir_bytes(off: uint64, nbytes: uint64, dst: Ptr[uint8]) -> uint64:
+    cluster: uint64 = exfat_root_cluster
+    # Skip whole clusters to reach `off`.
+    skip: uint64 = off / exfat_clu_bytes
+    while skip > 0:
+        nxt: uint64 = _next_cluster(cluster, 0)
+        if nxt == 0:
+            return 0
+        cluster = nxt
+        skip = skip - 1
+    off_in_clu: uint64 = off % exfat_clu_bytes
+    got: uint64 = 0
+    while got < nbytes:
+        sec_in_clu: uint64 = off_in_clu / SECTOR_SIZE
+        off_in_sec: uint64 = off_in_clu % SECTOR_SIZE
+        lba: uint64 = _cluster_to_lba(cluster) + sec_in_clu
+        rc: int32 = blk_read_sectors(exfat_blockdev_slot, lba, 1,
+                                     &exfat_fat_buf[0])
+        if rc != 0:
+            return got
+        chunk: uint64 = SECTOR_SIZE - off_in_sec
+        if chunk > nbytes - got:
+            chunk = nbytes - got
+        memcpy(cast[Ptr[uint8]](cast[uint64](dst) + got),
+               cast[Ptr[uint8]](cast[uint64](&exfat_fat_buf[0]) + off_in_sec),
+               chunk)
+        got = got + chunk
+        off_in_clu = off_in_clu + chunk
+        if off_in_clu >= exfat_clu_bytes:
+            nxt: uint64 = _next_cluster(cluster, 0)
+            if nxt == 0:
+                return got
+            cluster = nxt
+            off_in_clu = 0
+    return got
+
+
+# A 32-byte staging area for one directory entry read out of the stream.
+exfat_ent_a: Array[32, uint8]
+exfat_ent_b: Array[32, uint8]
+
+
+def _parse_entry_set(byte_off: uint64, out: Ptr[ExfatDirEnt]) -> uint64:
+    # Given the byte offset of a 0x85 File entry inside the directory
+    # stream, decode the Stream + Name secondaries and fill `out`.
+    # Reassembles the name into exfat_name_buf. Returns the byte offset
+    # one past the whole entry set (so the caller advances there). On a
+    # malformed set returns byte_off + 32 (skip just the File entry).
+    out[0].valid = 0
+    n: uint64 = _read_dir_bytes(byte_off, 32, &exfat_ent_a[0])
+    if n != 32:
+        return byte_off + 32
+    fe: Ptr[uint8] = &exfat_ent_a[0]
+    if fe[0] != EXFAT_TYPE_FILE:
+        return byte_off + 32
+    secondary_count: uint64 = cast[uint64](fe[1])
+    attrs: uint16 = _read_u16_le(
+        cast[Ptr[uint8]](cast[uint64](fe) + 4))
+    is_dir: uint32 = 0
+    if (attrs & EXFAT_ATTR_DIR) != 0:
+        is_dir = 1
+
+    # The first secondary MUST be the Stream Extension (0xC0).
+    stream_off: uint64 = byte_off + 32
+    m: uint64 = _read_dir_bytes(stream_off, 32, &exfat_ent_b[0])
+    if m != 32:
+        return byte_off + 32
+    se: Ptr[uint8] = &exfat_ent_b[0]
+    if se[0] != EXFAT_TYPE_STREAM:
+        # Skip past the whole declared set anyway.
+        return byte_off + (secondary_count + 1) * 32
+    sec_flags: uint8 = se[1]
+    nofatchain: uint32 = 0
+    if (sec_flags & 0x02) != 0:                # bit1 = NoFatChain
+        nofatchain = 1
+    name_len: uint64 = cast[uint64](se[3])
+    first_clu: uint64 = cast[uint64](_read_u32_le(
+        cast[Ptr[uint8]](cast[uint64](se) + 20)))
+    data_len: uint64 = _read_u64_le(
+        cast[Ptr[uint8]](cast[uint64](se) + 24))
+
+    # Remaining secondaries (secondary_count - 1 of them) are 0xC1 File
+    # Name entries. Reassemble the name.
+    name_pos: uint64 = 0
+    si: uint64 = 1
+    while si < secondary_count:
+        ne_off: uint64 = byte_off + (si + 1) * 32
+        q: uint64 = _read_dir_bytes(ne_off, 32, &exfat_ent_b[0])
+        if q != 32:
+            si = secondary_count
+        else:
+            ne: Ptr[uint8] = &exfat_ent_b[0]
+            if ne[0] == EXFAT_TYPE_NAME:
+                name_pos = _decode_name_fragment(ne, &exfat_name_buf[0],
+                                                 name_pos, name_len)
+            si = si + 1
+    exfat_name_buf[name_pos] = 0
+
+    out[0].valid = 1
+    out[0].is_dir = is_dir
+    out[0].nofatchain = nofatchain
+    out[0].first_clu = first_clu
+    out[0].data_len = data_len
+    return byte_off + (secondary_count + 1) * 32
+
+
+def _exfat_root_dir_max_bytes() -> uint64:
+    # Upper bound on how far we will scan the root directory: walk the
+    # root's cluster chain length in bytes. We cap the scan in the
+    # caller by the 0x00 end sentinel, but bound the byte cursor here to
+    # avoid runaway on a corrupt FAT. Allow up to 64 clusters of root.
+    cap: uint64 = exfat_clu_bytes * 64
+    return cap
+
+
+def _exfat_find_in_root(name: Ptr[char], out: Ptr[ExfatDirEnt]) -> int32:
+    # Scan the root directory for a file/dir whose reassembled name
+    # equals `name`. On hit fills `out` and returns 1; else 0.
+    byte_off: uint64 = 0
+    limit: uint64 = _exfat_root_dir_max_bytes()
+    while byte_off < limit:
+        hdr: Array[1, uint8]
+        n: uint64 = _read_dir_bytes(byte_off, 1, &hdr[0])
+        if n != 1:
+            return 0
+        etype: uint8 = hdr[0]
+        if etype == 0:
+            return 0                            # end of directory
+        if etype == EXFAT_TYPE_FILE:
+            ent: ExfatDirEnt
+            nxt: uint64 = _parse_entry_set(byte_off, &ent)
+            if ent.valid != 0:
+                if _ascii_eq(&exfat_name_buf[0], name) != 0:
+                    out[0].valid = ent.valid
+                    out[0].is_dir = ent.is_dir
+                    out[0].nofatchain = ent.nofatchain
+                    out[0].first_clu = ent.first_clu
+                    out[0].data_len = ent.data_len
+                    return 1
+            byte_off = nxt
+        else:
+            byte_off = byte_off + 32
+    return 0
+
+
+def exfat_lookup(name: Ptr[char], out_first: Ptr[uint64],
+                 out_size: Ptr[uint64],
+                 out_nofatchain: Ptr[uint32]) -> int32:
+    # Resolve a root-directory FILE named `name`. Returns 1 on hit (and
+    # fills first cluster / byte size / NoFatChain flag), 0 on miss or if
+    # the name resolves to a directory.
+    ent: ExfatDirEnt
+    if _exfat_find_in_root(name, &ent) == 0:
+        return 0
+    if ent.is_dir != 0:
+        return 0
+    out_first[0] = ent.first_clu
+    out_size[0] = ent.data_len
+    out_nofatchain[0] = ent.nofatchain
+    return 1
+
+
+# --- file read (cluster-chain walk, FAT or contiguous) ------------
+
+def exfat_read(first_cluster: uint64, file_size: uint64,
+               nofatchain: uint32, pos: uint64, count: uint64,
+               buf: Ptr[uint8]) -> int64:
+    # Stream up to `count` bytes from a file starting at offset `pos`.
+    # `nofatchain` selects contiguous vs FAT-chained allocation.
+    # Returns bytes copied; 0 = EOF.
+    if pos >= file_size:
+        return 0
+    remaining: uint64 = file_size - pos
+    if count > remaining:
+        count = remaining
+    # Walk to the cluster containing `pos`.
+    skip: uint64 = pos / exfat_clu_bytes
+    cluster: uint64 = first_cluster
+    while skip > 0:
+        nxt: uint64 = _next_cluster(cluster, nofatchain)
+        if nxt == 0:
+            return 0
+        cluster = nxt
+        skip = skip - 1
+    off_in_clu: uint64 = pos % exfat_clu_bytes
+    written: uint64 = 0
+    while written < count:
+        sec_in_clu: uint64 = off_in_clu / SECTOR_SIZE
+        off_in_sec: uint64 = off_in_clu % SECTOR_SIZE
+        lba: uint64 = _cluster_to_lba(cluster) + sec_in_clu
+        rc: int32 = blk_read_sectors(exfat_blockdev_slot, lba, 1,
+                                     &exfat_dir_buf[0])
+        if rc != 0:
+            return cast[int64](written)
+        chunk: uint64 = SECTOR_SIZE - off_in_sec
+        if chunk > count - written:
+            chunk = count - written
+        memcpy(cast[Ptr[uint8]](cast[uint64](buf) + written),
+               cast[Ptr[uint8]](cast[uint64](&exfat_dir_buf[0]) + off_in_sec),
+               chunk)
+        written = written + chunk
+        off_in_clu = off_in_clu + chunk
+        if off_in_clu >= exfat_clu_bytes:
+            nxt: uint64 = _next_cluster(cluster, nofatchain)
+            if nxt == 0:
+                return cast[int64](written)
+            cluster = nxt
+            off_in_clu = 0
+    return cast[int64](written)
+
+
+# --- directory listing --------------------------------------------
+
+def _emit_name_line(buf: Ptr[uint8], pos: uint64, max: uint64,
+                    name: Ptr[uint8]) -> uint64:
+    # Append "name\n" to buf at pos, bounded by max. Returns new pos.
+    out: uint64 = pos
+    i: uint64 = 0
+    while name[i] != 0:
+        if out + 1 >= max:
+            return out
+        buf[out] = name[i]
+        out = out + 1
+        i = i + 1
+    if out + 1 < max:
+        buf[out] = 10                           # '\n'
+        out = out + 1
+    return out
+
+
+def exfat_listdir(buf: Ptr[uint8], count: uint64) -> int64:
+    # Pack the root directory's file/dir names into `buf` as a stream of
+    # "NAME\n" lines. Returns total bytes written. -1 on count == 0.
+    if count == 0:
+        return -1
+    byte_off: uint64 = 0
+    limit: uint64 = _exfat_root_dir_max_bytes()
+    pos: uint64 = 0
+    while byte_off < limit:
+        hdr: Array[1, uint8]
+        n: uint64 = _read_dir_bytes(byte_off, 1, &hdr[0])
+        if n != 1:
+            return cast[int64](pos)
+        etype: uint8 = hdr[0]
+        if etype == 0:
+            return cast[int64](pos)
+        if etype == EXFAT_TYPE_FILE:
+            ent: ExfatDirEnt
+            nxt: uint64 = _parse_entry_set(byte_off, &ent)
+            if ent.valid != 0:
+                pos = _emit_name_line(buf, pos, count, &exfat_name_buf[0])
+                if pos + 1 >= count:
+                    return cast[int64](pos)
+            byte_off = nxt
+        else:
+            byte_off = byte_off + 32
+    return cast[int64](pos)
+
+
+# --- in-kernel self-test ------------------------------------------
+#
+# Mounts a known exFAT image attached as sd0 (scripts/test_exfat.sh
+# mints it and hangs it off an ich9-ahci SATA port), lists the root,
+# opens a known file, reads its bytes and asserts the content. The image
+# generator writes a file named "HELLO_EXFAT.TXT" whose contents are the
+# 64-byte ASCII pattern below. Emits [exfat] PASS / [exfat] FAIL.
+
+# The expected file name and its known contents (must match
+# scripts/test_exfat.sh's generator exactly).
+exfat_test_want_name: Array[16, uint8]      # "HELLO_EXFAT.TXT"
+exfat_test_readback:  Array[128, uint8]
+
+
+def _set_want_name():
+    nm: Ptr[char] = "HELLO_EXFAT.TXT"
+    i: uint64 = 0
+    while True:
+        c: uint8 = cast[uint8](nm[i] & 0xFF)
+        exfat_test_want_name[i] = c
+        if c == 0:
+            return
+        i = i + 1
+
+
+# The known 64-byte content: bytes value (i*7 + 3) & 0xFF for i in 0..64.
+# The test image generator writes exactly these bytes.
+def _expected_byte(i: uint64) -> uint8:
+    return cast[uint8]((i * 7 + 3) & 0xFF)
+
+
+def exfat_selftest() -> int32:
+    # Returns 1 on PASS, 0 on FAIL.
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0("[exfat] self-test start\n")
+
+    slot: int32 = find_blockdev("sd0")
+    if slot < 0:
+        printk0("[exfat] FAIL: sd0 not registered\n")
+        return 0
+
+    if exfat_probe(slot) == 0:
+        printk0("[exfat] FAIL: sd0 is not an exFAT volume\n")
+        return 0
+
+    if exfat_init(slot) != 0:
+        printk0("[exfat] FAIL: exfat_init failed\n")
+        return 0
+
+    # List the root — the known file must appear.
+    listing: Array[256, uint8]
+    nbytes: int64 = exfat_listdir(&listing[0], 256)
+    if nbytes <= 0:
+        printk0("[exfat] FAIL: root listing empty\n")
+        return 0
+    printk1("[exfat] root listing: %d bytes\n", cast[uint64](nbytes))
+
+    # Resolve the known file by name.
+    _set_want_name()
+    want: Ptr[char] = cast[Ptr[char]](&exfat_test_want_name[0])
+    first: uint64 = 0
+    size: uint64 = 0
+    nofat: uint32 = 0
+    if exfat_lookup(want, &first, &size, &nofat) == 0:
+        printk0("[exfat] FAIL: known file not found\n")
+        return 0
+    printk2("[exfat] found file first_clu=%d size=%d\n", first, size)
+
+    if size != 64:
+        printk1("[exfat] FAIL: unexpected file size %d (want 64)\n", size)
+        return 0
+
+    # Read the whole file and assert the content pattern.
+    got: int64 = exfat_read(first, size, nofat, 0, 64,
+                            &exfat_test_readback[0])
+    if got != 64:
+        printk1("[exfat] FAIL: short read %d (want 64)\n",
+                cast[uint64](got))
+        return 0
+    i: uint64 = 0
+    while i < 64:
+        if exfat_test_readback[i] != _expected_byte(i):
+            printk1("[exfat] FAIL: content mismatch at byte %d\n", i)
+            return 0
+        i = i + 1
+
+    # Also exercise a non-zero seek into the chain.
+    seek_got: int64 = exfat_read(first, size, nofat, 33, 7,
+                                 &exfat_test_readback[0])
+    if seek_got != 7:
+        printk1("[exfat] FAIL: seek read %d (want 7)\n",
+                cast[uint64](seek_got))
+        return 0
+    j: uint64 = 0
+    while j < 7:
+        if exfat_test_readback[j] != _expected_byte(33 + j):
+            printk0("[exfat] FAIL: seek content mismatch\n")
+            return 0
+        j = j + 1
+
+    printk0("[exfat] PASS\n")
+    return 1
