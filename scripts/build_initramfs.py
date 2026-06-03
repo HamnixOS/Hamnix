@@ -1743,6 +1743,19 @@ if os.environ.get("ENABLE_AUDIO_TEST") == "1":
 if os.environ.get("ENABLE_DEVMAPPER_TEST") == "1":
     FILES.append(("/etc/devmapper-test", b"1\n"))
 
+# Native software-RAID (md) self-test. scripts/test_mdraid.sh sets
+# ENABLE_MDRAID_TEST=1 to plant /etc/mdraid-test; init/main.ad's boot:37.md
+# gate then runs md_selftest() (drivers/block/md.ad), which registers
+# dedicated in-kernel backing ramdisks and proves the RAID0 (stripe) target
+# routes each virtual sector to the correct member+offset (including a
+# request that straddles a chunk boundary, split across two members), the
+# RAID1 (mirror) target fans a write out to BOTH members and reads it back,
+# and RAID1 DEGRADED mode (one member marked Faulty) still round-trips
+# through the survivor. Prints "[mdraid] PASS" / "[mdraid] FAIL". Default
+# boots ship no marker so the md self-test is a no-op everywhere else.
+if os.environ.get("ENABLE_MDRAID_TEST") == "1":
+    FILES.append(("/etc/mdraid-test", b"1\n"))
+
 
 # See INIT_ELF handling inside build_archive(): set INIT_ELF=path to
 # override which on-disk file becomes /init in the cpio archive, e.g.
