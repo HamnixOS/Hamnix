@@ -150,6 +150,23 @@ PORT_TFD_BSY: uint32 = 0x80
 PORT_TFD_DRQ: uint32 = 0x08
 PORT_TFD_ERR: uint32 = 0x01
 
+# PxSSTS DET (device detection) field values (spec §3.3.10).
+#   0 = no device, no PHY
+#   1 = device present, no PHY communication
+#   3 = device present, PHY communication established
+#   4 = PHY in offline / disabled mode
+PORT_SSTS_DET_PRESENT_PHY: uint32 = 3
+
+# PxSCTL DET (spec §3.3.11) — host-controlled link-reset request.
+#   0 = no action / allow normal operation
+#   1 = perform COMRESET (interface reset, re-establish PHY)
+#   4 = disable the SATA interface (offline)
+# The COMRESET sequence writes DET=1, holds it >= 1 ms, then writes
+# DET=0 and waits for PxSSTS DET to settle to 3 again.
+PORT_SCTL_DET_MASK:     uint32 = 0xF
+PORT_SCTL_DET_COMRESET: uint32 = 1
+PORT_SCTL_DET_IDLE:     uint32 = 0
+
 # PxIS error bits (spec §3.3.5). PxIS is the per-port interrupt status
 # register; even with polled I/O we read it after each command so a
 # Task-File Error or Host-Bus Fatal Error can be reported instead of
@@ -313,6 +330,55 @@ _ncq_slots_used_mask: uint32 = 0
 # against ahci.port_num before dispatching to the driver-level
 # read/write primitives.
 ahci_ops: BlockDeviceOps
+
+# --- Multi-port enumeration table (M16.x) --------------------------
+#
+# Real AHCI HBAs expose up to 32 implemented ports; the legacy bring-up
+# path drove exactly ONE (ahci.port_num / ahci.page / ahci.port_base /
+# ahci.capacity, kept working for the single-disk callers). The
+# multi-port path brings up EVERY implemented port that has an active
+# ATA device and registers each as its own block device — first present
+# port -> "sd0", second -> "sd1", and so on.
+#
+# Per the Adder big-buffer rule, the per-port state is flat module-scope
+# arrays indexed by the AHCI port number (0..31), NOT a nested struct
+# array. The block-layer `priv` cookie carries the PORT NUMBER, so
+# _ahci_*_blkop routes reads/writes to the right port by indexing these
+# tables — _ahci_port_base[priv] / _ahci_port_page[priv] /
+# _ahci_port_ctpage[priv]. sd0's port also mirrors into the legacy
+# AhciState singleton so ahci_active_port()/ahci_active_capacity() and
+# the existing slot-0 smoke/NCQ tests keep working unchanged.
+#
+#   _ahci_port_present[p]   1 if port p was brought up (FIS/CLB running,
+#                           IDENTIFY succeeded), 0 otherwise.
+#   _ahci_port_base[p]      ABAR + 0x100 + 0x80*p (port register block).
+#   _ahci_port_page[p]      4 KiB working page (cmd list + FIS + legacy CT).
+#   _ahci_port_ctpage[p]    16 KiB region: 32 per-slot command tables.
+#   _ahci_port_capacity[p]  LBA48 sector count from IDENTIFY.
+#   _ahci_port_blkslot[p]   block-layer slot index from register_blockdev.
+_ahci_port_present:  Array[32, uint32]
+_ahci_port_base:     Array[32, uint64]
+_ahci_port_page:     Array[32, uint64]
+_ahci_port_ctpage:   Array[32, uint64]
+_ahci_port_capacity: Array[32, uint64]
+_ahci_port_blkslot:  Array[32, int32]
+
+# One BlockDeviceOps vtable per port. register_blockdev stores a Ptr to
+# the ops struct, so each registered device needs a stable, distinct
+# (or at least live) ops record. A single shared vtable would work
+# functionally (the routing is via priv), but giving each port its own
+# keeps the registration records self-describing and avoids any aliasing
+# surprise if the ops struct is ever mutated per-device.
+_ahci_port_ops: Array[32, BlockDeviceOps]
+
+# How many ports the multi-port enumerator brought up + registered.
+_ahci_ports_registered: uint32 = 0
+
+
+def ahci_ports_registered() -> uint32:
+    # Number of AHCI ports successfully enumerated + registered as block
+    # devices this boot. The multi-port self-test reads it.
+    return _ahci_ports_registered
 
 
 # --- Port stop/start (spec §10.1.2) --------------------------------
@@ -631,6 +697,81 @@ def _wait_tfd_idle(port_base: uint64) -> int32:
     return -1
 
 
+# --- COMRESET / port-reset retry (spec §10.4.2) --------------------
+#
+# A port whose device doesn't come ready on the first probe (PxSSTS DET
+# != 3, or the task file is wedged BSY/DRQ) gets a per-port COMRESET:
+# write PxSCTL.DET = 1 (initiate interface reset), hold it for a brief
+# spin, then write DET = 0 (resume normal operation) and wait for PxSSTS
+# DET to settle back to 3 (device present + PHY established). We retry
+# the whole sequence a bounded number of times before declaring the port
+# empty. This is a PER-PORT interface reset only — we deliberately do NOT
+# touch GHC.HR (global HBA reset), which would re-COMRESET every port and
+# blow away signatures the firmware already established (see the comment
+# in ahci_hardware_probe).
+
+AHCI_COMRESET_RETRIES: uint32 = 3
+
+
+def _port_comreset(port_base: uint64):
+    # One COMRESET pulse on a single port. Per spec §10.4.2 the DET=1
+    # state must be held at least 1 ms; with no fine-grained timer in
+    # this polled driver we busy-spin a generous fixed count, which on
+    # any plausible CPU is well over 1 ms. After de-asserting (DET=0)
+    # we clear PxSERR (the reset latches PHYRDY-change / comm-init
+    # diagnostic bits).
+    sctl: uint32 = _mmio_r32(port_base + PORT_SCTL)
+    sctl = (sctl & ~PORT_SCTL_DET_MASK) | PORT_SCTL_DET_COMRESET
+    _mmio_w32(port_base + PORT_SCTL, sctl)
+    spin: uint64 = 0
+    while spin < 2000000:
+        spin = spin + 1
+    sctl = _mmio_r32(port_base + PORT_SCTL)
+    sctl = (sctl & ~PORT_SCTL_DET_MASK) | PORT_SCTL_DET_IDLE
+    _mmio_w32(port_base + PORT_SCTL, sctl)
+    # Ack any SError the reset raised so a later command sees a clean
+    # register.
+    _mmio_w32(port_base + PORT_SERR, 0xFFFFFFFF)
+
+
+def _wait_det_present(port_base: uint64) -> int32:
+    # Poll PxSSTS until DET == 3 (device present + PHY established) after
+    # a COMRESET. Returns 0 once the PHY links, -1 on timeout.
+    spin: uint64 = 0
+    while spin < 1000000:
+        ssts: uint32 = _mmio_r32(port_base + PORT_SSTS)
+        det: uint32 = ssts & 0xF
+        if det == PORT_SSTS_DET_PRESENT_PHY:
+            return 0
+        spin = spin + 1
+    return -1
+
+
+def _port_wait_ready_with_comreset(port_base: uint64) -> int32:
+    # Bring a port's device to a ready state, COMRESET-retrying on
+    # failure. "Ready" means PxSSTS DET == 3 AND the task file is idle
+    # (BSY+DRQ clear). On the first attempt we just check; if either
+    # condition is unmet we issue a COMRESET and re-check, up to
+    # AHCI_COMRESET_RETRIES total reset attempts. Returns 0 when ready,
+    # -1 if the port never becomes ready (caller treats it as empty).
+    attempt: uint32 = 0
+    while attempt <= AHCI_COMRESET_RETRIES:
+        ssts: uint32 = _mmio_r32(port_base + PORT_SSTS)
+        det: uint32 = ssts & 0xF
+        if det == PORT_SSTS_DET_PRESENT_PHY:
+            if _wait_tfd_idle(port_base) == 0:
+                return 0
+        # Not ready: out of retries?
+        if attempt == AHCI_COMRESET_RETRIES:
+            return -1
+        printk1("[ahci] port-reset: COMRESET attempt %d\n",
+                cast[uint64](attempt + 1))
+        _port_comreset(port_base)
+        _wait_det_present(port_base)
+        attempt = attempt + 1
+    return -1
+
+
 # --- IDENTIFY DEVICE ----------------------------------------------
 
 def _byteswap_model(raw: Ptr[uint8], out: Ptr[uint8]):
@@ -738,19 +879,47 @@ def _do_write_lba(port_base: uint64, clist: uint64, ct_base: uint64,
 # port today). `count` is in 512-byte sectors. Returns 0 on success,
 # -1 on any failure (HBA wedged, command error, no port set up).
 
+def _ahci_port_resolve(port: int32) -> uint64:
+    # Resolve a port number to the working page VA the read/write
+    # primitives carve their command list + command table out of.
+    # Multi-port path: index the per-port table. Legacy single-port
+    # path: fall back to the singleton AhciState. Returns 0 if the port
+    # is neither present in the table nor the legacy active port.
+    if port < 0 or cast[uint64](port) >= 32:
+        return 0
+    if _ahci_port_present[cast[uint64](port)] != 0:
+        return _ahci_port_page[cast[uint64](port)]
+    if port == ahci.port_num:
+        return ahci.page
+    return 0
+
+
+def _ahci_port_base_of(port: int32) -> uint64:
+    # Companion to _ahci_port_resolve: the MMIO port register block.
+    if port < 0 or cast[uint64](port) >= 32:
+        return 0
+    if _ahci_port_present[cast[uint64](port)] != 0:
+        return _ahci_port_base[cast[uint64](port)]
+    if port == ahci.port_num:
+        return ahci.port_base
+    return 0
+
+
 def ahci_write_sectors(port: int32, lba: uint64, count: uint16,
                        buf: uint64) -> int32:
-    if ahci.abar == 0 or ahci.port_num < 0:
+    if ahci.abar == 0:
         printk0("[ahci] write_sectors: driver not initialised\n")
         return -1
-    if port != ahci.port_num:
+    page: uint64 = _ahci_port_resolve(port)
+    port_base: uint64 = _ahci_port_base_of(port)
+    if page == 0 or port_base == 0:
         printk1("[ahci] write_sectors: bad port=%d\n", cast[uint64](port))
         return -1
     if count == 0:
         return 0
-    clist:   uint64 = ahci.page + CL_OFFSET
-    ct_base: uint64 = ahci.page + CT_OFFSET
-    return _do_write_lba(ahci.port_base, clist, ct_base, buf, lba, count)
+    clist:   uint64 = page + CL_OFFSET
+    ct_base: uint64 = page + CT_OFFSET
+    return _do_write_lba(port_base, clist, ct_base, buf, lba, count)
 
 
 def ahci_read_sectors(port: int32, lba: uint64, count: uint16,
@@ -759,16 +928,18 @@ def ahci_read_sectors(port: int32, lba: uint64, count: uint16,
     # read-back smoke test below. The smoke test in ahci_smoke_test
     # uses _do_read_lba directly; this wrapper lets callers outside
     # that function do the same without poking at private state.
-    if ahci.abar == 0 or ahci.port_num < 0:
+    if ahci.abar == 0:
         printk0("[ahci] read_sectors: driver not initialised\n")
         return -1
-    if port != ahci.port_num:
+    page: uint64 = _ahci_port_resolve(port)
+    port_base: uint64 = _ahci_port_base_of(port)
+    if page == 0 or port_base == 0:
         return -1
     if count == 0:
         return 0
-    clist:   uint64 = ahci.page + CL_OFFSET
-    ct_base: uint64 = ahci.page + CT_OFFSET
-    return _do_read_lba(ahci.port_base, clist, ct_base, buf, lba, count)
+    clist:   uint64 = page + CL_OFFSET
+    ct_base: uint64 = page + CT_OFFSET
+    return _do_read_lba(port_base, clist, ct_base, buf, lba, count)
 
 
 # --- BlockDeviceOps adapter wrappers (M16.119) --------------------
@@ -1018,6 +1189,19 @@ def ahci_hardware_probe() -> int32:
     ahci.capacity = lba_count
     printk1("[ahci] sectors=%d\n", lba_count)
 
+    # Mirror the legacy-path port into the multi-port table so the
+    # routing primitives (_ahci_port_resolve / _ahci_port_base_of) and a
+    # later multi-port enumeration treat sd0's port uniformly with the
+    # others. This is the FIRST present port; the multi-port enumerator
+    # skips re-bringing it up because _ahci_port_present is already set.
+    pn: uint64 = cast[uint64](port_num)
+    _ahci_port_present[pn]  = 1
+    _ahci_port_base[pn]     = port_base
+    _ahci_port_page[pn]     = page
+    _ahci_port_ctpage[pn]   = ct_page
+    _ahci_port_capacity[pn] = lba_count
+    _ahci_port_blkslot[pn]  = -1
+
     # M16.114: wire the IRQ. Same shape as drivers/net/virtio_net.ad's
     # M16.113 template — read PCI INTx pin / line, route the firmware-
     # assigned IOAPIC pin to our chosen vector (0x41) on LAPIC 0,
@@ -1051,6 +1235,259 @@ def ahci_hardware_probe() -> int32:
     if lba_count > 0x7FFFFFFF:
         return 0x7FFFFFFF
     return cast[int32](lba_count & 0x7FFFFFFF)
+
+
+# --- Multi-port bring-up + enumeration (M16.x) ---------------------
+#
+# _ahci_bring_up_port brings ONE port (not the first/legacy one, which
+# ahci_hardware_probe already handles) from "link active" to "IDENTIFY
+# succeeded + table populated". It mirrors the per-port half of
+# ahci_hardware_probe: COMRESET-retry the device-ready wait, stop the
+# port, allocate its own 4 KiB working page + 16 KiB CT region, plant
+# CLB/FB, start the port, confirm the ATA signature, run IDENTIFY for
+# capacity, and record everything in the per-port table. Returns the
+# LBA48 sector count on success, 0 on any failure (port left absent).
+#
+# Note we do NOT re-wire the IRQ here — the controller-level INTx is
+# already routed by ahci_hardware_probe, and the driver is polled.
+
+def _ahci_bring_up_port(port_num: int32) -> uint64:
+    pn: uint64 = cast[uint64](port_num)
+    if pn >= 32:
+        return 0
+    abar: uint64 = ahci.abar
+    port_base: uint64 = abar + HBA_PORTS_BASE \
+                      + pn * HBA_PORT_STRIDE
+
+    # COMRESET-retry the device-ready wait. If the device never becomes
+    # ready, treat the port as empty.
+    if _port_wait_ready_with_comreset(port_base) != 0:
+        printk1("[ahci] port %d not ready after COMRESET retries\n", pn)
+        return 0
+
+    # Stop the port before re-pointing CLB/FB at our memory.
+    _port_stop(port_base)
+
+    page: uint64 = alloc_pages(0)
+    if page == 0:
+        printk0("[ahci] alloc_pages(0) failed (multi-port)\n")
+        return 0
+    memset(cast[Ptr[uint8]](page), 0, 4096)
+
+    ct_page: uint64 = alloc_pages(AHCI_CT_PAGE_ORDER)
+    if ct_page == 0:
+        printk0("[ahci] alloc_pages(ct) failed (multi-port)\n")
+        return 0
+    memset(cast[Ptr[uint8]](ct_page), 0, 16384)
+
+    clist:   uint64 = page + CL_OFFSET
+    fis:     uint64 = page + FIS_OFFSET
+    ct_base: uint64 = page + CT_OFFSET
+
+    _mmio_w32(port_base + PORT_CLB,  cast[uint32](clist & 0xFFFFFFFF))
+    _mmio_w32(port_base + PORT_CLBU, cast[uint32](clist >> 32))
+    _mmio_w32(port_base + PORT_FB,   cast[uint32](fis   & 0xFFFFFFFF))
+    _mmio_w32(port_base + PORT_FBU,  cast[uint32](fis   >> 32))
+    _mmio_w32(port_base + PORT_SERR, 0xFFFFFFFF)
+    _mmio_w32(port_base + PORT_IS,   0xFFFFFFFF)
+
+    _port_start(port_base)
+
+    sig: uint32 = _mmio_r32(port_base + PORT_SIG)
+    printk2("[ahci] port %d signature = %x\n", pn, cast[uint64](sig))
+    if sig != PORT_SIG_ATA:
+        printk1("[ahci] port %d not an ATA disk; skipping\n", pn)
+        return 0
+
+    id_buf: uint64 = kmalloc(512)
+    if id_buf == 0:
+        printk0("[ahci] kmalloc(512) IDENTIFY failed (multi-port)\n")
+        return 0
+    memset(cast[Ptr[uint8]](id_buf), 0, 512)
+    if _do_identify(port_base, clist, ct_base, id_buf) != 0:
+        printk1("[ahci] port %d IDENTIFY failed\n", pn)
+        return 0
+
+    lba_count: uint64 = cast[Ptr[uint64]](id_buf + 100 * 2)[0]
+    printk2("[ahci] port %d sectors=%d\n", pn, lba_count)
+
+    _ahci_port_present[pn]  = 1
+    _ahci_port_base[pn]     = port_base
+    _ahci_port_page[pn]     = page
+    _ahci_port_ctpage[pn]   = ct_page
+    _ahci_port_capacity[pn] = lba_count
+    _ahci_port_blkslot[pn]  = -1
+    return lba_count
+
+
+def _ahci_sdname(idx: uint32, out: Ptr[uint8]):
+    # Build "sd<idx>" into out. idx is the disk ordinal (0..). We only
+    # ever register a handful of ports, but support multi-digit just in
+    # case (sd0..sd31). Caller provides a >= 8-byte buffer.
+    out[0] = 0x73        # 's'
+    out[1] = 0x64        # 'd'
+    if idx < 10:
+        out[2] = cast[uint8](0x30 + idx)
+        out[3] = 0
+    else:
+        out[2] = cast[uint8](0x30 + (idx / 10))
+        out[3] = cast[uint8](0x30 + (idx % 10))
+        out[4] = 0
+
+
+# Static name buffers per disk ordinal — register_blockdev copies the
+# name in, but we keep them module-scope to dodge frame-local array
+# quirks. 8 bytes each is room for "sd<NN>\0".
+_ahci_sdname_buf: Array[32, uint8]
+
+
+def ahci_enumerate_ports() -> uint32:
+    # Walk EVERY implemented port (PI bitmask), bring up each one that
+    # has an active ATA device, and register it as its own block device
+    # named sd0, sd1, sd2, ... in port order. The first present port is
+    # already brought up by ahci_hardware_probe (it is also sd0); this
+    # function registers it as sd0 and brings up + registers the rest.
+    # Returns the number of ports registered. Idempotent-ish: re-running
+    # skips ports already marked present, and register_blockdev for an
+    # existing name no-ops at the block layer.
+    if ahci.abar == 0:
+        return 0
+    abar: uint64 = ahci.abar
+    pi: uint32 = _mmio_r32(abar + HBA_PI)
+
+    disk_idx: uint32 = 0
+    registered: uint32 = 0
+    i: uint32 = 0
+    while i < 32:
+        if (pi & (cast[uint32](1) << i)) != 0:
+            pb: uint64 = abar + HBA_PORTS_BASE \
+                       + cast[uint64](i) * HBA_PORT_STRIDE
+            ssts: uint32 = _mmio_r32(pb + PORT_SSTS)
+            det: uint32 = ssts & 0xF
+            ipm: uint32 = (ssts >> 8) & 0xF
+            pn: uint64 = cast[uint64](i)
+            # A port is a candidate if it links now (det==3) OR it was
+            # already brought up by the legacy probe. det!=3 ports get a
+            # COMRESET-retry inside _ahci_bring_up_port before we give up.
+            present_already: uint32 = _ahci_port_present[pn]
+            if present_already != 0 or (det == 3 and ipm == 1):
+                cap: uint64 = 0
+                if present_already != 0:
+                    cap = _ahci_port_capacity[pn]
+                else:
+                    cap = _ahci_bring_up_port(cast[int32](i))
+                if cap != 0 and _ahci_port_present[pn] != 0:
+                    # Register this port under the next sd ordinal.
+                    nb: Ptr[uint8] = &_ahci_sdname_buf[0]
+                    _ahci_sdname(disk_idx, nb)
+                    _ahci_port_ops[pn].read_sectors  = \
+                        _ahci_read_sectors_blkop
+                    _ahci_port_ops[pn].write_sectors = \
+                        _ahci_write_sectors_blkop
+                    bslot: int32 = register_blockdev(
+                        cast[Ptr[char]](nb), cap,
+                        &_ahci_port_ops[pn], pn)
+                    if bslot >= 0:
+                        _ahci_port_blkslot[pn] = bslot
+                        printk2("[ahci] port %d registered as %s\n",
+                                pn, cast[uint64](nb))
+                        printk2("[ahci-mp] %s -> AHCI port %d\n",
+                                cast[uint64](nb), pn)
+                        registered = registered + 1
+                        disk_idx = disk_idx + 1
+                    else:
+                        printk1("[ahci] register_blockdev port %d failed\n",
+                                pn)
+        i = i + 1
+    _ahci_ports_registered = registered
+    printk1("[ahci-mp] enumerated %d AHCI port(s)\n",
+            cast[uint64](registered))
+    return registered
+
+
+# --- Multi-port self-test (M16.x) ----------------------------------
+#
+# Chained off ahci_smoke_test (no init/main.ad edit needed). Proves the
+# multi-port enumeration worked end to end:
+#   1. >= 2 AHCI ports were enumerated + registered.
+#   2. find_blockdev("sd0") AND find_blockdev("sd1") both resolve.
+#   3. A whole-disk READ of LBA 0 on EACH device returns that disk's
+#      DISTINCT first-sector bytes (the test plants different signatures
+#      on each backing image), routed through the GENERIC block-layer
+#      vtable so the priv-cookie port routing is exercised, not bypassed.
+# Prints a single unique "[ahci-mp] PASS" the test script greps for.
+# Returns 1 on PASS, 0 on FAIL. If fewer than 2 ports exist (single-disk
+# boot), it SKIPS cleanly (prints a skip marker, returns 1) so the
+# default single-disk test_ahci.sh path is unaffected.
+
+_ahci_mp_buf0: Array[512, uint8]
+_ahci_mp_buf1: Array[512, uint8]
+
+
+def ahci_multiport_selftest() -> int32:
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0("[ahci-mp] self-test start\n")
+    nports: uint32 = ahci_ports_registered()
+    printk1("[ahci-mp] ports registered = %d\n", cast[uint64](nports))
+    if nports < 2:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[ahci-mp] SKIP: fewer than 2 AHCI ports present\n")
+        return 1
+
+    s0: int32 = find_blockdev("sd0")
+    s1: int32 = find_blockdev("sd1")
+    if s0 < 0 or s1 < 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk2("[ahci-mp] FAIL: sd0/sd1 not both registered (s0=%d s1=%d)\n",
+                cast[uint64](s0), cast[uint64](s1))
+        return 0
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk2("[ahci-mp] sd0=slot%d sd1=slot%d\n",
+            cast[uint64](s0), cast[uint64](s1))
+
+    p0: Ptr[uint8] = &_ahci_mp_buf0[0]
+    p1: Ptr[uint8] = &_ahci_mp_buf1[0]
+    memset(p0, 0, 512)
+    memset(p1, 0, 512)
+
+    # Read LBA 0 from EACH disk through the generic block layer.
+    if blk_read_sectors(s0, 0, 1, p0) != 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[ahci-mp] FAIL: blk_read_sectors(sd0, lba=0)\n")
+        return 0
+    if blk_read_sectors(s1, 0, 1, p1) != 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[ahci-mp] FAIL: blk_read_sectors(sd1, lba=0)\n")
+        return 0
+
+    # The test harness plants distinct first bytes: disk0 byte0 = 0xD0,
+    # disk1 byte0 = 0xD1 (and a matching tag at byte 1). Assert each disk
+    # returned ITS OWN signature — this is the load-bearing proof that
+    # the priv-cookie routing sends sd0's read to port A and sd1's to
+    # port B rather than both hitting the same port.
+    printk2("[ahci-mp] sd0 LBA0[0..1]=%x %x\n",
+            cast[uint64](p0[0]), cast[uint64](p0[1]))
+    printk2("[ahci-mp] sd1 LBA0[0..1]=%x %x\n",
+            cast[uint64](p1[0]), cast[uint64](p1[1]))
+    if p0[0] == p1[0]:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[ahci-mp] FAIL: sd0 and sd1 returned identical sector 0\n")
+        return 0
+    # Also assert the MBR signature survived on both (planted by harness).
+    if p0[510] != 0x55 or p0[511] != 0xAA:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[ahci-mp] FAIL: sd0 MBR signature bad\n")
+        return 0
+    if p1[510] != 0x55 or p1[511] != 0xAA:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[ahci-mp] FAIL: sd1 MBR signature bad\n")
+        return 0
+
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0("[ahci-mp] sd0 and sd1 returned DISTINCT first sectors\n")
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0("[ahci-mp] PASS\n")
+    return 1
 
 
 def ahci_smoke_test() -> int32:
@@ -1120,10 +1557,15 @@ def ahci_smoke_test() -> int32:
     # re-validate it against the singleton ahci.port_num. Naming is
     # "sd0" (Linux-style SCSI/SATA disk slot 0); multi-port HBAs +
     # partition-aware names (sd0p1) are follow-ups.
-    ahci_ops.read_sectors  = _ahci_read_sectors_blkop
-    ahci_ops.write_sectors = _ahci_write_sectors_blkop
-    bslot: int32 = register_blockdev("sd0", lba_count, &ahci_ops,
-                                     cast[uint64](port_num))
+    #
+    # M16.x MULTI-PORT: instead of registering only the first port as
+    # "sd0", enumerate EVERY implemented port with an active ATA device
+    # and register each as its own block device (sd0, sd1, ...) in port
+    # order. The first present port is the one ahci_hardware_probe
+    # already brought up, so it becomes sd0 and the existing single-disk
+    # callers (ahci_active_port / blk find "sd0") are unchanged.
+    nports: uint32 = ahci_enumerate_ports()
+    bslot: int32 = find_blockdev("sd0")
     if bslot < 0:
         printk0("[ahci] register_blockdev(sd0) failed\n")
         return 0
@@ -1139,6 +1581,12 @@ def ahci_smoke_test() -> int32:
     # the raw `sd0` device is still usable for whole-disk reads.
     blk_scan_partitions(bslot)
     blk_register_partitions(bslot, "sd0")
+
+    # M16.x: multi-port self-test. Chained off the smoke path (no
+    # init/main.ad edit). When >= 2 AHCI ports are present it proves
+    # sd0 AND sd1 are both registered and return DISTINCT first sectors
+    # via the generic block layer; with a single disk it SKIPs cleanly.
+    ahci_multiport_selftest()
 
     return 0
 
