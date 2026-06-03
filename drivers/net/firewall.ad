@@ -185,7 +185,95 @@ _fw_ct_state:   Array[128, uint8]    # 0=new/syn, 1=established
 _FW_CT_NEW:  uint8 = 0
 _FW_CT_EST:  uint8 = 1
 
+# --- per-conntrack NAT mapping (parallel to the ct_* arrays above) -----
+#
+# When a flow is NATed, the conntrack entry records the translation so
+# BOTH directions are handled by the one stateful table — this is the
+# whole point of NAT-over-conntrack: the forward (originating) packet is
+# rewritten by a NAT rule, the reply is un-rewritten by looking up the
+# same flow and applying the inverse.
+#
+# We record the ORIGINAL forward 5-tuple (the tuple as the originating
+# packet looked BEFORE any translation) and the TRANSLATED forward
+# 5-tuple (what actually goes on the wire). Any later packet on the flow
+# is classified:
+#   * matches the translated-forward tuple  → an already-translated
+#     forward packet (retransmit); re-apply the same forward rewrite.
+#   * matches the REVERSE of the translated-forward tuple → a reply;
+#     apply the inverse rewrite so the original sender sees its own tuple.
+#
+# nat_kind: 0 = none, _FW_NAT_SNAT (source rewritten on egress),
+#           _FW_NAT_DNAT (dest rewritten on ingress).
+_FW_NAT_NONE: uint8 = 0
+_FW_NAT_SNAT: uint8 = 1
+_FW_NAT_DNAT: uint8 = 2
+
+_fw_ct_nat_kind:      Array[128, uint8]
+# Original forward tuple (pre-translation).
+_fw_ct_nat_osrc_addr: Array[128, uint32]
+_fw_ct_nat_osrc_port: Array[128, uint16]
+_fw_ct_nat_odst_addr: Array[128, uint32]
+_fw_ct_nat_odst_port: Array[128, uint16]
+# Translated forward tuple (post-translation, on the wire).
+_fw_ct_nat_tsrc_addr: Array[128, uint32]
+_fw_ct_nat_tsrc_port: Array[128, uint16]
+_fw_ct_nat_tdst_addr: Array[128, uint32]
+_fw_ct_nat_tdst_port: Array[128, uint16]
+
 _fw_nconn: uint64 = 0
+
+# --- NAT rule table (flat parallel arrays) ----------------------------
+#
+# Separate from the filter rule table because NAT rules carry a different
+# vocabulary (a translation target, not a verdict) and run at different
+# hook points (DNAT pre-routing/pre-filter on ingress, SNAT post-filter
+# on egress — Linux's PREROUTING / POSTROUTING). Each rule matches a
+# subset of the 5-tuple and names a rewrite.
+#
+#   kind   : _FW_NAT_SNAT | _FW_NAT_DNAT | (MASQUERADE = SNAT with
+#            nat_masq=1, meaning "to the egress interface's primary IP",
+#            resolved at apply time, not baked into the rule).
+#   proto  : FW_PROTO_TCP | FW_PROTO_UDP | FW_PROTO_ANY
+#   match  : src/dst CIDR + an optional matched dport (DNAT) / any.
+#   target : to_addr (+ to_port for DNAT port-forward; 0 = keep port).
+#
+# SNAT/MASQUERADE rules match on EGRESS (the originating outbound
+# packet); DNAT rules match on INGRESS (the inbound packet to be
+# forwarded inward). The hooks dispatch by direction.
+
+_FW_MAX_NAT: uint64 = 32
+
+_fw_nat_kind:    Array[32, uint8]    # _FW_NAT_SNAT / _FW_NAT_DNAT
+_fw_nat_masq:    Array[32, uint8]    # 1 = MASQUERADE (SNAT to box IP)
+_fw_nat_proto:   Array[32, uint8]
+_fw_nat_src:     Array[32, uint32]
+_fw_nat_smask:   Array[32, uint32]
+_fw_nat_dst:     Array[32, uint32]
+_fw_nat_dmask:   Array[32, uint32]
+# Matched dest port (DNAT: the external port being forwarded; 0 == any).
+_fw_nat_mport:   Array[32, uint16]
+# Translation target.
+_fw_nat_to_addr: Array[32, uint32]   # 0 == use box IP (for MASQUERADE)
+_fw_nat_to_port: Array[32, uint16]   # 0 == keep original port
+_fw_nat_hits:    Array[32, uint64]
+
+_fw_nnat: uint64 = 0
+
+# The box's own primary IP, packed big-endian. Used as the SNAT/
+# MASQUERADE source. Pushed down from ip.ad (ip_set_our_ip) so the
+# firewall never imports ip.ad (avoids an import cycle). 0 == unset.
+_fw_box_ip: uint32 = 0
+
+# NAT diagnostic counters.
+_fw_snat_done: uint64 = 0
+_fw_dnat_done: uint64 = 0
+_fw_unnat_done: uint64 = 0
+
+# Synthetic packet scratch for the NAT self-test (module-scope per the
+# big-buffer rule). A single 64-byte IPv4 packet (20B header + a 20-byte
+# TCP / 8-byte UDP L4 header) is plenty for the deterministic NAT cases.
+_FW_TESTPKT_MAX: uint64 = 64
+_fw_testpkt: Array[64, uint8]
 
 # Diagnostic counters (surfaced through /dev/firewall read + selftest).
 _fw_pkts_in:   uint64 = 0
@@ -212,6 +300,10 @@ def firewall_init():
     _fw_rejected = 0
     _fw_ct_hits = 0
     _fw_last_iface = 0
+    _fw_nnat = 0
+    _fw_snat_done = 0
+    _fw_dnat_done = 0
+    _fw_unnat_done = 0
     i: uint64 = 0
     while i < _FW_MAX_RULES:
         _fw_rule_hits[i] = 0
@@ -219,6 +311,11 @@ def firewall_init():
     i = 0
     while i < _FW_MAX_CONN:
         _fw_ct_used[i] = 0
+        _fw_ct_nat_kind[i] = _FW_NAT_NONE
+        i = i + 1
+    i = 0
+    while i < _FW_MAX_NAT:
+        _fw_nat_hits[i] = 0
         i = i + 1
     printk0("firewall: initialized (policy accept, 0 rules)\n")
 
@@ -261,13 +358,19 @@ def fw_flush():
     # (iptables -F does not reset -P either).
     _fw_nrules = 0
     _fw_nconn = 0
+    _fw_nnat = 0
     i: uint64 = 0
     while i < _FW_MAX_CONN:
         _fw_ct_used[i] = 0
+        _fw_ct_nat_kind[i] = _FW_NAT_NONE
         i = i + 1
     i = 0
     while i < _FW_MAX_RULES:
         _fw_rule_hits[i] = 0
+        i = i + 1
+    i = 0
+    while i < _FW_MAX_NAT:
+        _fw_nat_hits[i] = 0
         i = i + 1
 
 
@@ -536,7 +639,493 @@ def _fw_ct_track(proto: uint8, direction: uint8, tcp_flags: uint8,
     _fw_ct_hi_addr[ns] = hi_a
     _fw_ct_hi_port[ns] = hi_p
     _fw_ct_state[ns] = _FW_CT_NEW
+    _fw_ct_nat_kind[ns] = _FW_NAT_NONE
     _fw_nconn = _fw_nconn + 1
+
+
+# --- NAT: box-IP plumbing, rule table, checksum fixup, apply ----------
+#
+# This is the SNAT/MASQUERADE + DNAT engine. It reuses the SAME conntrack
+# table as the filter — a NATed flow gets ONE conntrack entry carrying
+# both the original and translated forward tuples, so the reply is
+# reverse-translated by a table lookup (never a second parallel table).
+
+
+def fw_set_box_ip(b0: uint8, b1: uint8, b2: uint8, b3: uint8):
+    # Pushed down from ip.ad's ip_set_our_ip so MASQUERADE/SNAT-to-box-IP
+    # knows the egress interface's primary address without importing
+    # ip.ad (which would create an import cycle: ip.ad already imports us).
+    _fw_box_ip = _fw_pack(b0, b1, b2, b3)
+
+
+def fw_get_box_ip() -> uint32:
+    return _fw_box_ip
+
+
+# --- NAT rule mutators (used by the /dev/firewall write backend) ------
+
+def fw_add_nat_rule(kind: uint8, masq: uint8, proto: uint8,
+                    src: uint32, smask: uint32,
+                    dst: uint32, dmask: uint32,
+                    mport: uint16,
+                    to_addr: uint32, to_port: uint16) -> int32:
+    # Append a NAT rule. Returns the rule index, or -1 if the table is
+    # full. kind is _FW_NAT_SNAT or _FW_NAT_DNAT; masq=1 marks a SNAT
+    # rule as MASQUERADE (translate to the box's primary IP at apply
+    # time).
+    if _fw_nnat >= _FW_MAX_NAT:
+        printk0("firewall: nat table full\n")
+        return -1
+    n: uint64 = _fw_nnat
+    _fw_nat_kind[n] = kind
+    _fw_nat_masq[n] = masq
+    _fw_nat_proto[n] = proto
+    _fw_nat_src[n] = src
+    _fw_nat_smask[n] = smask
+    _fw_nat_dst[n] = dst
+    _fw_nat_dmask[n] = dmask
+    _fw_nat_mport[n] = mport
+    _fw_nat_to_addr[n] = to_addr
+    _fw_nat_to_port[n] = to_port
+    _fw_nat_hits[n] = 0
+    _fw_nnat = n + 1
+    return cast[int32](n)
+
+
+def fw_nat_count() -> uint64:
+    return _fw_nnat
+
+
+# --- NAT accessors for the read backend -------------------------------
+
+def fw_nat_kind(i: uint64) -> uint8:
+    return _fw_nat_kind[i]
+
+def fw_nat_is_masq(i: uint64) -> uint8:
+    return _fw_nat_masq[i]
+
+def fw_nat_proto(i: uint64) -> uint8:
+    return _fw_nat_proto[i]
+
+def fw_nat_src(i: uint64) -> uint32:
+    return _fw_nat_src[i]
+
+def fw_nat_smask(i: uint64) -> uint32:
+    return _fw_nat_smask[i]
+
+def fw_nat_dst(i: uint64) -> uint32:
+    return _fw_nat_dst[i]
+
+def fw_nat_dmask(i: uint64) -> uint32:
+    return _fw_nat_dmask[i]
+
+def fw_nat_mport(i: uint64) -> uint16:
+    return _fw_nat_mport[i]
+
+def fw_nat_to_addr(i: uint64) -> uint32:
+    return _fw_nat_to_addr[i]
+
+def fw_nat_to_port(i: uint64) -> uint16:
+    return _fw_nat_to_port[i]
+
+def fw_nat_hits(i: uint64) -> uint64:
+    return _fw_nat_hits[i]
+
+
+# --- incremental checksum fixup ---------------------------------------
+#
+# RFC 1624: when a 16-bit word in a checksummed region changes from
+# old->new, the new one's-complement checksum is
+#   HC' = ~(~HC + ~old + new)
+# folding to 16 bits. We apply this per changed 16-bit word so we never
+# rescan the whole header/segment. The stored checksum is held in HOST
+# order here (we read it big-endian off the wire, fix it, write it back
+# big-endian).
+
+def _fw_csum_replace2(old_csum: uint16, old_word: uint16,
+                      new_word: uint16) -> uint16:
+    # One-word incremental update. All args host-order. Returns the new
+    # 16-bit checksum (still the complemented on-the-wire value).
+    s: uint32 = cast[uint32](~old_csum & 0xFFFF)
+    s = s + cast[uint32](~old_word & 0xFFFF)
+    s = s + cast[uint32](new_word)
+    while (s >> 16) != 0:
+        s = (s & 0xFFFF) + (s >> 16)
+    return cast[uint16](~s & 0xFFFF)
+
+
+def _fw_csum_replace_addr(old_csum: uint16, old_addr: uint32,
+                          new_addr: uint32) -> uint16:
+    # A 32-bit address change = two 16-bit word replacements.
+    c: uint16 = old_csum
+    c = _fw_csum_replace2(c, cast[uint16]((old_addr >> 16) & 0xFFFF),
+                          cast[uint16]((new_addr >> 16) & 0xFFFF))
+    c = _fw_csum_replace2(c, cast[uint16](old_addr & 0xFFFF),
+                          cast[uint16](new_addr & 0xFFFF))
+    return c
+
+
+# --- header field read/write helpers (operate on the live packet) -----
+
+def _fw_rd16(pkt: Ptr[uint8], off: uint64) -> uint16:
+    return (cast[uint16](pkt[off]) << 8) | cast[uint16](pkt[off + 1])
+
+
+def _fw_wr16(pkt: Ptr[uint8], off: uint64, v: uint16):
+    pkt[off] = cast[uint8]((cast[uint32](v) >> 8) & 0xFF)
+    pkt[off + 1] = cast[uint8](cast[uint32](v) & 0xFF)
+
+
+def _fw_rd_addr(pkt: Ptr[uint8], off: uint64) -> uint32:
+    return _fw_pack(pkt[off], pkt[off + 1], pkt[off + 2], pkt[off + 3])
+
+
+def _fw_wr_addr(pkt: Ptr[uint8], off: uint64, a: uint32):
+    pkt[off]     = cast[uint8]((a >> 24) & 0xFF)
+    pkt[off + 1] = cast[uint8]((a >> 16) & 0xFF)
+    pkt[off + 2] = cast[uint8]((a >> 8) & 0xFF)
+    pkt[off + 3] = cast[uint8](a & 0xFF)
+
+
+# --- rewrite the SOURCE or DEST address (+ optional L4 port) ----------
+#
+# `which` = 0 → rewrite source (IP src @ off 12, L4 src port @ l4+0).
+# `which` = 1 → rewrite dest   (IP dst @ off 16, L4 dst port @ l4+2).
+# Recomputes the IPv4 header checksum incrementally, and (for TCP/UDP)
+# the L4 checksum incrementally too (the L4 checksum covers a pseudo-
+# header that includes the IP addresses, so an address change touches
+# both). new_port == 0 leaves the port unchanged.
+
+def _fw_rewrite(pkt: Ptr[uint8], length: uint64, which: int32,
+                new_addr: uint32, new_port: uint16):
+    ihl: uint8 = pkt[0] & 0x0F
+    hdr_bytes: uint64 = cast[uint64](ihl) * 4
+    proto: uint8 = pkt[9]
+
+    ip_off: uint64 = 12          # source address
+    port_off: uint64 = 0         # L4 source port (relative to L4 start)
+    if which == 1:
+        ip_off = 16              # dest address
+        port_off = 2             # L4 dest port
+
+    old_addr: uint32 = _fw_rd_addr(pkt, ip_off)
+
+    # --- IPv4 header checksum (bytes 10..11) ---
+    old_ipcsum: uint16 = _fw_rd16(pkt, 10)
+    new_ipcsum: uint16 = _fw_csum_replace_addr(old_ipcsum, old_addr,
+                                               new_addr)
+    _fw_wr16(pkt, 10, new_ipcsum)
+    _fw_wr_addr(pkt, ip_off, new_addr)
+
+    # --- L4 checksum + port (TCP/UDP only) ---
+    if proto == FW_PROTO_TCP or proto == FW_PROTO_UDP:
+        # The L4 segment starts at hdr_bytes. Need the full fixed L4
+        # header to touch ports/checksum: TCP checksum @ +16, UDP @ +6.
+        l4_csum_off: uint64 = hdr_bytes + 16          # TCP
+        if proto == FW_PROTO_UDP:
+            l4_csum_off = hdr_bytes + 6
+        # Bounds: we must be able to read the checksum field and the
+        # port being rewritten.
+        need: uint64 = hdr_bytes + 4
+        if l4_csum_off + 2 > need:
+            need = l4_csum_off + 2
+        if length < need:
+            return                                    # too short — skip
+        l4_csum: uint16 = _fw_rd16(pkt, l4_csum_off)
+        # Address change feeds the L4 checksum via the pseudo-header.
+        # A UDP checksum of 0 means "no checksum" — leave it alone.
+        do_l4: int32 = 1
+        if proto == FW_PROTO_UDP and l4_csum == 0:
+            do_l4 = 0
+        if do_l4 == 1:
+            l4_csum = _fw_csum_replace_addr(l4_csum, old_addr, new_addr)
+        # Port rewrite (also a checksummed 16-bit word).
+        if new_port != 0:
+            abs_port_off: uint64 = hdr_bytes + port_off
+            old_port: uint16 = _fw_rd16(pkt, abs_port_off)
+            if old_port != new_port:
+                if do_l4 == 1:
+                    l4_csum = _fw_csum_replace2(l4_csum, old_port,
+                                                new_port)
+                _fw_wr16(pkt, abs_port_off, new_port)
+        if do_l4 == 1:
+            _fw_wr16(pkt, l4_csum_off, l4_csum)
+
+
+# --- parse the 5-tuple out of a live IPv4 packet ----------------------
+
+def _fw_pkt_proto(pkt: Ptr[uint8]) -> uint8:
+    return pkt[9]
+
+
+def _fw_pkt_l4ports(pkt: Ptr[uint8], length: uint64,
+                    out_sport: Ptr[uint16], out_dport: Ptr[uint16]) -> int32:
+    # Read L4 src/dst ports if the packet is TCP/UDP and long enough.
+    # Returns 1 on success (ports written), 0 otherwise (ports = 0).
+    out_sport[0] = 0
+    out_dport[0] = 0
+    proto: uint8 = pkt[9]
+    if proto != FW_PROTO_TCP and proto != FW_PROTO_UDP:
+        return 0
+    ihl: uint8 = pkt[0] & 0x0F
+    hdr_bytes: uint64 = cast[uint64](ihl) * 4
+    if length < hdr_bytes + 4:
+        return 0
+    out_sport[0] = _fw_rd16(pkt, hdr_bytes)
+    out_dport[0] = _fw_rd16(pkt, hdr_bytes + 2)
+    return 1
+
+
+# --- NAT rule lookup --------------------------------------------------
+
+def _fw_nat_match(idx: uint64, kind: uint8, proto: uint8,
+                  src_addr: uint32, dst_addr: uint32,
+                  dst_port: uint16) -> int32:
+    # Test NAT rule `idx` against a forward (originating) packet.
+    if _fw_nat_kind[idx] != kind:
+        return 0
+    rproto: uint8 = _fw_nat_proto[idx]
+    if rproto != FW_PROTO_ANY:
+        if rproto != proto:
+            return 0
+    smask: uint32 = _fw_nat_smask[idx]
+    if smask != 0:
+        if (src_addr & smask) != (_fw_nat_src[idx] & smask):
+            return 0
+    dmask: uint32 = _fw_nat_dmask[idx]
+    if dmask != 0:
+        if (dst_addr & dmask) != (_fw_nat_dst[idx] & dmask):
+            return 0
+    mport: uint16 = _fw_nat_mport[idx]
+    if mport != 0:
+        if dst_port != mport:
+            return 0
+    return 1
+
+
+def _fw_ct_get_or_make(proto: uint8,
+                       src_addr: uint32, src_port: uint16,
+                       dst_addr: uint32, dst_port: uint16) -> int64:
+    # Find the conntrack slot for this flow, creating it if absent.
+    lo_a: uint32 = 0
+    lo_p: uint16 = 0
+    hi_a: uint32 = 0
+    hi_p: uint16 = 0
+    _fw_ct_canon(src_addr, src_port, dst_addr, dst_port,
+                 &lo_a, &lo_p, &hi_a, &hi_p)
+    slot: int64 = _fw_ct_find(proto, lo_a, lo_p, hi_a, hi_p)
+    if slot >= 0:
+        return slot
+    ns: int64 = _fw_ct_alloc()
+    if ns < 0:
+        return -1
+    _fw_ct_used[ns] = 1
+    _fw_ct_proto[ns] = proto
+    _fw_ct_lo_addr[ns] = lo_a
+    _fw_ct_lo_port[ns] = lo_p
+    _fw_ct_hi_addr[ns] = hi_a
+    _fw_ct_hi_port[ns] = hi_p
+    _fw_ct_state[ns] = _FW_CT_NEW
+    _fw_ct_nat_kind[ns] = _FW_NAT_NONE
+    _fw_nconn = _fw_nconn + 1
+    return ns
+
+
+# --- reply detection: is this packet the REVERSE of a NATed flow? -----
+#
+# We scan the conntrack table for a NATed entry whose TRANSLATED forward
+# tuple is the exact reverse of this packet — i.e. this packet's
+# (src,sport,dst,dport) == translated (dst,dport,src,sport). If found,
+# this is a reply that must be un-NATed: undo the forward rewrite.
+
+def _fw_ct_find_reply(proto: uint8,
+                      src_addr: uint32, src_port: uint16,
+                      dst_addr: uint32, dst_port: uint16) -> int64:
+    i: uint64 = 0
+    while i < _FW_MAX_CONN:
+        if _fw_ct_used[i] == 1:
+            if _fw_ct_proto[i] == proto:
+                if _fw_ct_nat_kind[i] != _FW_NAT_NONE:
+                    # reply matches reverse of the translated forward tuple
+                    if _fw_ct_nat_tdst_addr[i] == src_addr:
+                        if _fw_ct_nat_tdst_port[i] == src_port:
+                            if _fw_ct_nat_tsrc_addr[i] == dst_addr:
+                                if _fw_ct_nat_tsrc_port[i] == dst_port:
+                                    return cast[int64](i)
+        i = i + 1
+    return -1
+
+
+# --- ingress NAT (DNAT) : runs BEFORE the filter, like PREROUTING -----
+
+def _fw_nat_ingress(pkt: Ptr[uint8], length: uint64) -> int32:
+    # Apply DNAT to an inbound packet, OR un-SNAT a reply to one of our
+    # outbound MASQUERADE/SNAT flows. Mutates the packet in place and
+    # fixes checksums. Returns 1 if the packet was rewritten, else 0.
+    if length < 20:
+        return 0
+    ihl: uint8 = pkt[0] & 0x0F
+    if ihl < 5:
+        return 0
+    proto: uint8 = pkt[9]
+    src_addr: uint32 = _fw_rd_addr(pkt, 12)
+    dst_addr: uint32 = _fw_rd_addr(pkt, 16)
+    sport: uint16 = 0
+    dport: uint16 = 0
+    _fw_pkt_l4ports(pkt, length, &sport, &dport)
+
+    # (1) Reply to one of OUR outbound SNAT/MASQUERADE flows? Reverse it
+    #     first — the inbound reply's DEST is the box IP:translated-port
+    #     and must be restored to the original internal sender.
+    rep: int64 = _fw_ct_find_reply(proto, src_addr, sport, dst_addr, dport)
+    if rep >= 0:
+        nk: uint8 = _fw_ct_nat_kind[rep]
+        if nk == _FW_NAT_SNAT:
+            # Undo SNAT: the forward rewrote SOURCE osrc->tsrc, so the
+            # reply's DEST (==tsrc) restores to osrc.
+            _fw_rewrite(pkt, length, 1,
+                        _fw_ct_nat_osrc_addr[rep],
+                        _fw_ct_nat_osrc_port[rep])
+            _fw_unnat_done = _fw_unnat_done + 1
+            return 1
+        if nk == _FW_NAT_DNAT:
+            # Undo DNAT: the forward rewrote DEST odst->tdst, so the
+            # reply's SOURCE (==tdst) restores to odst.
+            _fw_rewrite(pkt, length, 0,
+                        _fw_ct_nat_odst_addr[rep],
+                        _fw_ct_nat_odst_port[rep])
+            _fw_unnat_done = _fw_unnat_done + 1
+            return 1
+
+    # (2) Forward DNAT: match an inbound packet against the DNAT rules.
+    i: uint64 = 0
+    while i < _fw_nnat:
+        if _fw_nat_match(i, _FW_NAT_DNAT, proto, src_addr, dst_addr,
+                         dport) == 1:
+            new_addr: uint32 = _fw_nat_to_addr[i]
+            new_port: uint16 = _fw_nat_to_port[i]
+            # Seed/record the conntrack NAT mapping so the reply path can
+            # reverse it. Original forward tuple = what arrived; the
+            # translated forward tuple = same src, rewritten dst.
+            slot: int64 = _fw_ct_get_or_make(proto, src_addr, sport,
+                                             dst_addr, dport)
+            if slot >= 0:
+                eff_port: uint16 = dport
+                if new_port != 0:
+                    eff_port = new_port
+                _fw_ct_nat_kind[slot] = _FW_NAT_DNAT
+                _fw_ct_nat_osrc_addr[slot] = src_addr
+                _fw_ct_nat_osrc_port[slot] = sport
+                _fw_ct_nat_odst_addr[slot] = dst_addr
+                _fw_ct_nat_odst_port[slot] = dport
+                _fw_ct_nat_tsrc_addr[slot] = src_addr
+                _fw_ct_nat_tsrc_port[slot] = sport
+                _fw_ct_nat_tdst_addr[slot] = new_addr
+                _fw_ct_nat_tdst_port[slot] = eff_port
+            _fw_rewrite(pkt, length, 1, new_addr, new_port)
+            _fw_nat_hits[i] = _fw_nat_hits[i] + 1
+            _fw_dnat_done = _fw_dnat_done + 1
+            return 1
+        i = i + 1
+    return 0
+
+
+# --- egress NAT (SNAT/MASQUERADE) : runs AFTER the filter (POSTROUTING)
+
+def _fw_nat_egress(pkt: Ptr[uint8], length: uint64) -> int32:
+    # Apply SNAT/MASQUERADE to an outbound packet, OR un-DNAT a reply
+    # leaving the box for a port-forwarded inbound flow. Mutates in place
+    # and fixes checksums. Returns 1 if rewritten, else 0.
+    if length < 20:
+        return 0
+    ihl: uint8 = pkt[0] & 0x0F
+    if ihl < 5:
+        return 0
+    proto: uint8 = pkt[9]
+    src_addr: uint32 = _fw_rd_addr(pkt, 12)
+    dst_addr: uint32 = _fw_rd_addr(pkt, 16)
+    sport: uint16 = 0
+    dport: uint16 = 0
+    _fw_pkt_l4ports(pkt, length, &sport, &dport)
+
+    # (1) Reply leaving the box for an inbound DNAT flow: the outbound
+    #     reply's SOURCE is the internal host and must be restored to the
+    #     box's externally-visible address.
+    rep: int64 = _fw_ct_find_reply(proto, src_addr, sport, dst_addr, dport)
+    if rep >= 0:
+        nk: uint8 = _fw_ct_nat_kind[rep]
+        if nk == _FW_NAT_DNAT:
+            _fw_rewrite(pkt, length, 0,
+                        _fw_ct_nat_odst_addr[rep],
+                        _fw_ct_nat_odst_port[rep])
+            _fw_unnat_done = _fw_unnat_done + 1
+            return 1
+        if nk == _FW_NAT_SNAT:
+            # (symmetry) a reply restoring a SNAT seen on egress.
+            _fw_rewrite(pkt, length, 1,
+                        _fw_ct_nat_osrc_addr[rep],
+                        _fw_ct_nat_osrc_port[rep])
+            _fw_unnat_done = _fw_unnat_done + 1
+            return 1
+
+    # (2) Forward SNAT/MASQUERADE: match an outbound packet.
+    i: uint64 = 0
+    while i < _fw_nnat:
+        if _fw_nat_match(i, _FW_NAT_SNAT, proto, src_addr, dst_addr,
+                         dport) == 1:
+            new_addr: uint32 = _fw_nat_to_addr[i]
+            if _fw_nat_masq[i] == 1:
+                new_addr = _fw_box_ip       # MASQUERADE → egress box IP
+            if new_addr == 0:
+                new_addr = _fw_box_ip
+            new_port: uint16 = _fw_nat_to_port[i]
+            slot: int64 = _fw_ct_get_or_make(proto, src_addr, sport,
+                                             dst_addr, dport)
+            if slot >= 0:
+                eff_port: uint16 = sport
+                if new_port != 0:
+                    eff_port = new_port
+                _fw_ct_nat_kind[slot] = _FW_NAT_SNAT
+                _fw_ct_nat_osrc_addr[slot] = src_addr
+                _fw_ct_nat_osrc_port[slot] = sport
+                _fw_ct_nat_odst_addr[slot] = dst_addr
+                _fw_ct_nat_odst_port[slot] = dport
+                _fw_ct_nat_tsrc_addr[slot] = new_addr
+                _fw_ct_nat_tsrc_port[slot] = eff_port
+                _fw_ct_nat_tdst_addr[slot] = dst_addr
+                _fw_ct_nat_tdst_port[slot] = dport
+            _fw_rewrite(pkt, length, 0, new_addr, new_port)
+            _fw_nat_hits[i] = _fw_nat_hits[i] + 1
+            _fw_snat_done = _fw_snat_done + 1
+            return 1
+        i = i + 1
+    return 0
+
+
+# --- NAT hook entry points (called from drivers/net/ip.ad) ------------
+
+def firewall_nat_ingress(pkt: Ptr[uint8], length: uint64) -> int32:
+    # PREROUTING-equivalent: applied in ip_rx BEFORE the ingress filter,
+    # so the filter (and the L4 demux) see the post-DNAT addresses.
+    return _fw_nat_ingress(pkt, length)
+
+
+def firewall_nat_egress(pkt: Ptr[uint8], length: uint64) -> int32:
+    # POSTROUTING-equivalent: applied in ip_send AFTER the egress filter,
+    # so the filter sees the pre-SNAT (real internal) source address.
+    return _fw_nat_egress(pkt, length)
+
+
+# --- NAT diagnostics getters ------------------------------------------
+
+def fw_stat_snat() -> uint64:
+    return _fw_snat_done
+
+def fw_stat_dnat() -> uint64:
+    return _fw_dnat_done
+
+def fw_stat_unnat() -> uint64:
+    return _fw_unnat_done
 
 
 # --- rule matching ----------------------------------------------------
@@ -805,6 +1394,135 @@ def _fw_selftest_eq(label: Ptr[char], got: int32, want: int32,
         fail_ctr[0] = fail_ctr[0] + 1
 
 
+# --- NAT self-test helpers --------------------------------------------
+
+def _fw_build_testpkt(proto: uint8,
+                      src_addr: uint32, src_port: uint16,
+                      dst_addr: uint32, dst_port: uint16) -> uint64:
+    # Build a minimal valid IPv4 + L4 packet into _fw_testpkt with
+    # correct IP and (for TCP/UDP) L4 checksums, so the NAT rewriter's
+    # incremental fixup can be checked against a from-scratch recompute.
+    # Returns the packet length.
+    i: uint64 = 0
+    while i < _FW_TESTPKT_MAX:
+        _fw_testpkt[i] = 0
+        i = i + 1
+    l4_len: uint64 = 8                       # UDP header
+    if proto == FW_PROTO_TCP:
+        l4_len = 20                          # TCP fixed header
+    total: uint64 = 20 + l4_len
+    pp: Ptr[uint8] = cast[Ptr[uint8]](&_fw_testpkt[0])
+    pp[0] = 0x45
+    pp[1] = 0
+    pp[2] = cast[uint8]((total >> 8) & 0xFF)
+    pp[3] = cast[uint8](total & 0xFF)
+    pp[8] = 64                               # TTL
+    pp[9] = proto
+    _fw_wr_addr(pp, 12, src_addr)
+    _fw_wr_addr(pp, 16, dst_addr)
+    # IP header checksum.
+    pp[10] = 0
+    pp[11] = 0
+    ipc: uint16 = _fw_ipcsum(pp, 20)
+    _fw_wr16(pp, 10, ipc)
+    # L4 ports.
+    _fw_wr16(pp, 20, src_port)
+    _fw_wr16(pp, 22, dst_port)
+    if proto == FW_PROTO_TCP:
+        pp[32] = 0x50                        # data offset = 5 (20 bytes)
+    else:
+        # UDP length field.
+        _fw_wr16(pp, 24, cast[uint16](l4_len))
+    # L4 checksum (over pseudo-header + L4 segment).
+    l4_csum_off: uint64 = 36                 # TCP checksum @ +16
+    if proto == FW_PROTO_UDP:
+        l4_csum_off = 26                     # UDP checksum @ +6
+    _fw_wr16(pp, l4_csum_off, 0)
+    l4c: uint16 = _fw_l4csum(pp, total)
+    if proto == FW_PROTO_UDP and l4c == 0:
+        l4c = 0xFFFF
+    _fw_wr16(pp, l4_csum_off, l4c)
+    return total
+
+
+def _fw_ipcsum(pkt: Ptr[uint8], length: uint64) -> uint16:
+    # One's-complement checksum over `length` header bytes (same fold as
+    # ip.ad's ip_csum16, re-implemented here to avoid an import cycle).
+    s: uint32 = 0
+    i: uint64 = 0
+    pairs: uint64 = length & ~cast[uint64](1)
+    while i < pairs:
+        s = s + ((cast[uint32](pkt[i]) << 8) | cast[uint32](pkt[i + 1]))
+        i = i + 2
+    if i < length:
+        s = s + (cast[uint32](pkt[i]) << 8)
+    while (s >> 16) != 0:
+        s = (s & 0xFFFF) + (s >> 16)
+    return cast[uint16](~s & 0xFFFF)
+
+
+def _fw_l4csum(pkt: Ptr[uint8], total: uint64) -> uint16:
+    # TCP/UDP checksum over the IPv4 pseudo-header + the L4 segment. The
+    # checksum field in the segment must already be zeroed by the caller.
+    ihl: uint8 = pkt[0] & 0x0F
+    hdr_bytes: uint64 = cast[uint64](ihl) * 4
+    l4_len: uint64 = total - hdr_bytes
+    proto: uint8 = pkt[9]
+    s: uint32 = 0
+    # pseudo-header: src addr, dst addr (4 words), proto, l4 length.
+    s = s + _fw_rd16(pkt, 12)
+    s = s + _fw_rd16(pkt, 14)
+    s = s + _fw_rd16(pkt, 16)
+    s = s + _fw_rd16(pkt, 18)
+    s = s + cast[uint32](proto)
+    s = s + cast[uint32](l4_len)
+    # L4 segment 16-bit words.
+    i: uint64 = hdr_bytes
+    seg_pairs_end: uint64 = hdr_bytes + (l4_len & ~cast[uint64](1))
+    while i < seg_pairs_end:
+        s = s + ((cast[uint32](pkt[i]) << 8) | cast[uint32](pkt[i + 1]))
+        i = i + 2
+    if i < total:
+        s = s + (cast[uint32](pkt[i]) << 8)
+    while (s >> 16) != 0:
+        s = (s & 0xFFFF) + (s >> 16)
+    return cast[uint16](~s & 0xFFFF)
+
+
+def _fw_pkt_csums_ok(pkt: Ptr[uint8], total: uint64) -> int32:
+    # Verify both the IP header checksum and (TCP/UDP) the L4 checksum
+    # fold to the canonical "valid" result after a NAT rewrite. The IPv4
+    # header verifies by recompute-with-zeroed-field == stored. The L4
+    # likewise.
+    # IP header: recompute over a zeroed-csum copy and compare.
+    stored_ip: uint16 = _fw_rd16(pkt, 10)
+    _fw_wr16(pkt, 10, 0)
+    calc_ip: uint16 = _fw_ipcsum(pkt, 20)
+    _fw_wr16(pkt, 10, stored_ip)
+    if calc_ip != stored_ip:
+        return 0
+    proto: uint8 = pkt[9]
+    if proto != FW_PROTO_TCP and proto != FW_PROTO_UDP:
+        return 1
+    ihl: uint8 = pkt[0] & 0x0F
+    hdr_bytes: uint64 = cast[uint64](ihl) * 4
+    l4_csum_off: uint64 = hdr_bytes + 16
+    if proto == FW_PROTO_UDP:
+        l4_csum_off = hdr_bytes + 6
+    stored_l4: uint16 = _fw_rd16(pkt, l4_csum_off)
+    # A UDP checksum of 0 means "not present" — accept it.
+    if proto == FW_PROTO_UDP and stored_l4 == 0:
+        return 1
+    _fw_wr16(pkt, l4_csum_off, 0)
+    calc_l4: uint16 = _fw_l4csum(pkt, total)
+    if proto == FW_PROTO_UDP and calc_l4 == 0:
+        calc_l4 = 0xFFFF
+    _fw_wr16(pkt, l4_csum_off, stored_l4)
+    if calc_l4 != stored_l4:
+        return 0
+    return 1
+
+
 def firewall_selftest() -> int32:
     npass: uint64 = 0
     nfail: uint64 = 0
@@ -1040,6 +1758,153 @@ def firewall_selftest() -> int32:
                                 local, cast[uint16](22))
     _fw_selftest_eq("[firewall] NEW inbound tcp dport22 -> DROP",
                     new22, FW_DROP, &npass, &nfail)
+
+    # === Phase 9: SNAT / MASQUERADE over conntrack =====================
+    # An outbound TCP packet internal:src -> remote:80 is MASQUERADEd:
+    # its SOURCE is rewritten to the box IP, conntrack records the
+    # mapping, and the returning reply remote:80 -> box:src is un-NATed
+    # back to the original internal sender. Checksums stay valid.
+    firewall_init()
+    box_ip: uint32 = _fw_pack(203, 0, 113, 9)         # the box's public IP
+    internal: uint32 = _fw_pack(10, 0, 0, 5)          # an internal host
+    fw_set_box_ip(203, 0, 113, 9)
+    # nat masq out (any proto, any src/dst).
+    nr0: int32 = fw_add_nat_rule(_FW_NAT_SNAT, cast[uint8](1),
+                                 FW_PROTO_ANY, anyaddr, anymask,
+                                 anyaddr, anymask, cast[uint16](0),
+                                 cast[uint32](0), cast[uint16](0))
+
+    # Outbound packet internal:50000 -> remote:80.
+    len_o: uint64 = _fw_build_testpkt(FW_PROTO_TCP,
+                                      internal, cast[uint16](50000),
+                                      remote, cast[uint16](80))
+    ppo: Ptr[uint8] = cast[Ptr[uint8]](&_fw_testpkt[0])
+    did_snat: int32 = _fw_nat_egress(ppo, len_o)
+    _fw_selftest_eq("[firewall] outbound packet SNATed (rewrite applied)",
+                    did_snat, 1, &npass, &nfail)
+    snat_src: uint32 = _fw_rd_addr(ppo, 12)
+    snat_src_ok: int32 = 0
+    if snat_src == box_ip:
+        snat_src_ok = 1
+    _fw_selftest_eq("[firewall] SNAT source rewritten to box IP",
+                    snat_src_ok, 1, &npass, &nfail)
+    # The dest must be untouched.
+    snat_dst: uint32 = _fw_rd_addr(ppo, 16)
+    snat_dst_ok: int32 = 0
+    if snat_dst == remote:
+        snat_dst_ok = 1
+    _fw_selftest_eq("[firewall] SNAT leaves destination intact",
+                    snat_dst_ok, 1, &npass, &nfail)
+    _fw_selftest_eq("[firewall] SNAT packet checksums valid",
+                    _fw_pkt_csums_ok(ppo, len_o), 1, &npass, &nfail)
+
+    # The reply remote:80 -> box:50000 must un-NAT back to internal:50000.
+    len_r: uint64 = _fw_build_testpkt(FW_PROTO_TCP,
+                                      remote, cast[uint16](80),
+                                      box_ip, cast[uint16](50000))
+    ppr: Ptr[uint8] = cast[Ptr[uint8]](&_fw_testpkt[0])
+    did_unnat: int32 = _fw_nat_ingress(ppr, len_r)
+    _fw_selftest_eq("[firewall] SNAT reply un-NATed (rewrite applied)",
+                    did_unnat, 1, &npass, &nfail)
+    rep_dst: uint32 = _fw_rd_addr(ppr, 16)
+    rep_dst_ok: int32 = 0
+    if rep_dst == internal:
+        rep_dst_ok = 1
+    _fw_selftest_eq("[firewall] SNAT reply dest restored to internal host",
+                    rep_dst_ok, 1, &npass, &nfail)
+    rep_dport: uint16 = _fw_rd16(ppr, 22)
+    rep_dport_ok: int32 = 0
+    if rep_dport == cast[uint16](50000):
+        rep_dport_ok = 1
+    _fw_selftest_eq("[firewall] SNAT reply dport restored to original",
+                    rep_dport_ok, 1, &npass, &nfail)
+    _fw_selftest_eq("[firewall] SNAT reply checksums valid",
+                    _fw_pkt_csums_ok(ppr, len_r), 1, &npass, &nfail)
+
+    # === Phase 10: DNAT / port-forward over conntrack ==================
+    # An inbound packet remote:src -> box:8080 is port-forwarded to an
+    # internal host:80. Its DESTINATION is rewritten; conntrack records
+    # the mapping; the reply internal:80 -> remote:src has its SOURCE
+    # restored to box:8080. Checksums stay valid throughout.
+    firewall_init()
+    fw_set_box_ip(203, 0, 113, 9)
+    box_ip2: uint32 = _fw_pack(203, 0, 113, 9)
+    inhost: uint32 = _fw_pack(10, 0, 0, 80)
+    # nat dnat tcp dport 8080 -> 10.0.0.80:80.
+    nr1: int32 = fw_add_nat_rule(_FW_NAT_DNAT, cast[uint8](0),
+                                 FW_PROTO_TCP, anyaddr, anymask,
+                                 anyaddr, anymask, cast[uint16](8080),
+                                 inhost, cast[uint16](80))
+
+    len_i: uint64 = _fw_build_testpkt(FW_PROTO_TCP,
+                                      remote, cast[uint16](40000),
+                                      box_ip2, cast[uint16](8080))
+    ppi: Ptr[uint8] = cast[Ptr[uint8]](&_fw_testpkt[0])
+    did_dnat: int32 = _fw_nat_ingress(ppi, len_i)
+    _fw_selftest_eq("[firewall] inbound packet DNATed (rewrite applied)",
+                    did_dnat, 1, &npass, &nfail)
+    dnat_dst: uint32 = _fw_rd_addr(ppi, 16)
+    dnat_dst_ok: int32 = 0
+    if dnat_dst == inhost:
+        dnat_dst_ok = 1
+    _fw_selftest_eq("[firewall] DNAT destination rewritten to internal host",
+                    dnat_dst_ok, 1, &npass, &nfail)
+    dnat_dport: uint16 = _fw_rd16(ppi, 22)
+    dnat_dport_ok: int32 = 0
+    if dnat_dport == cast[uint16](80):
+        dnat_dport_ok = 1
+    _fw_selftest_eq("[firewall] DNAT dport rewritten 8080 -> 80",
+                    dnat_dport_ok, 1, &npass, &nfail)
+    _fw_selftest_eq("[firewall] DNAT packet checksums valid",
+                    _fw_pkt_csums_ok(ppi, len_i), 1, &npass, &nfail)
+
+    # The reply internal:80 -> remote:40000 must restore its SOURCE to
+    # box:8080 (the externally-visible address the client expects).
+    len_d: uint64 = _fw_build_testpkt(FW_PROTO_TCP,
+                                      inhost, cast[uint16](80),
+                                      remote, cast[uint16](40000))
+    ppd: Ptr[uint8] = cast[Ptr[uint8]](&_fw_testpkt[0])
+    did_undnat: int32 = _fw_nat_egress(ppd, len_d)
+    _fw_selftest_eq("[firewall] DNAT reply un-NATed (rewrite applied)",
+                    did_undnat, 1, &npass, &nfail)
+    und_src: uint32 = _fw_rd_addr(ppd, 12)
+    und_src_ok: int32 = 0
+    if und_src == box_ip2:
+        und_src_ok = 1
+    _fw_selftest_eq("[firewall] DNAT reply source restored to box IP",
+                    und_src_ok, 1, &npass, &nfail)
+    und_sport: uint16 = _fw_rd16(ppd, 20)
+    und_sport_ok: int32 = 0
+    if und_sport == cast[uint16](8080):
+        und_sport_ok = 1
+    _fw_selftest_eq("[firewall] DNAT reply sport restored to 8080",
+                    und_sport_ok, 1, &npass, &nfail)
+    _fw_selftest_eq("[firewall] DNAT reply checksums valid",
+                    _fw_pkt_csums_ok(ppd, len_d), 1, &npass, &nfail)
+
+    # === Phase 11: UDP SNAT with checksum fixup ========================
+    # A UDP outbound flow MASQUERADEs and its reply un-NATs, proving the
+    # UDP checksum path (different L4 checksum offset) is handled too.
+    firewall_init()
+    fw_set_box_ip(203, 0, 113, 9)
+    nr2: int32 = fw_add_nat_rule(_FW_NAT_SNAT, cast[uint8](1),
+                                 FW_PROTO_UDP, anyaddr, anymask,
+                                 anyaddr, anymask, cast[uint16](0),
+                                 cast[uint32](0), cast[uint16](0))
+    len_u: uint64 = _fw_build_testpkt(FW_PROTO_UDP,
+                                      internal, cast[uint16](33333),
+                                      remote, cast[uint16](53))
+    ppu: Ptr[uint8] = cast[Ptr[uint8]](&_fw_testpkt[0])
+    did_usnat: int32 = _fw_nat_egress(ppu, len_u)
+    usnat_src: uint32 = _fw_rd_addr(ppu, 12)
+    usnat_ok: int32 = 0
+    if did_usnat == 1:
+        if usnat_src == box_ip:
+            usnat_ok = 1
+    _fw_selftest_eq("[firewall] UDP outbound SNATed to box IP",
+                    usnat_ok, 1, &npass, &nfail)
+    _fw_selftest_eq("[firewall] UDP SNAT checksums valid",
+                    _fw_pkt_csums_ok(ppu, len_u), 1, &npass, &nfail)
 
     # Reset so the live stack starts with an open, empty firewall.
     firewall_init()
