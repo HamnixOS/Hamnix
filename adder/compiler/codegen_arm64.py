@@ -426,7 +426,14 @@ class Arm64CodeGen:
                 self.emit(f"    .globl {label}")
                 self.emit("    .align 3")
                 self.emit(f"{label}:")
-                self.emit(f"    .quad {init & 0xFFFFFFFFFFFFFFFF}")
+                if isinstance(_t, ArrayType):
+                    # A module-scope Array reserves its full byte size, zeroed.
+                    # (Array globals are buffers; the only supported initialiser
+                    # is an implicit / `= 0` zero-fill.)
+                    nbytes = self.get_type_size(_t)
+                    self.emit(f"    .zero {nbytes}")
+                else:
+                    self.emit(f"    .quad {init & 0xFFFFFFFFFFFFFFFF}")
 
     # ----------------------------------------------------------------------
     # Functions
@@ -493,39 +500,58 @@ class Arm64CodeGen:
 
     # local load/store (x29-relative; slots are 8 bytes, sized access) ------
 
-    def _store_local(self, var: LocalVar, reg: str = "x0") -> None:
+    # ldur/stur carry a SIGNED 9-bit immediate, so the x29-relative byte offset
+    # (always negative here) only reaches -256. Functions with large frames spill
+    # past that; for those slots we first materialise the slot address into the
+    # intra-procedure scratch x16 with `sub x16, x29, #var.offset` (sub's imm12,
+    # optionally <<12, covers frames up to 16 MiB) and address [x16] register-
+    # indirect. var.offset is positive (the slot lives BELOW x29).
+    _LDST_IMM9_MIN = -256
+
+    def _frame_base_reg(self, var: LocalVar) -> str:
+        """Return (base_reg, off) to address this local.
+
+        For in-range slots that is ("x29", -var.offset). For out-of-range slots
+        we emit `sub x16, x29, #var.offset` and return ("x16", 0)."""
         off = -var.offset
+        if off >= self._LDST_IMM9_MIN:
+            return ("x29", off)
+        self.emit(f"    sub x16, x29, #{var.offset}")
+        return ("x16", 0)
+
+    def _store_local(self, var: LocalVar, reg: str = "x0") -> None:
+        base, off = self._frame_base_reg(var)
         sz = self._scalar_size(var)
         w = "w" + reg[1:]
         if sz == 1:
-            self.emit(f"    sturb {w}, [x29, #{off}]")
+            self.emit(f"    sturb {w}, [{base}, #{off}]")
         elif sz == 2:
-            self.emit(f"    sturh {w}, [x29, #{off}]")
+            self.emit(f"    sturh {w}, [{base}, #{off}]")
         elif sz == 4:
-            self.emit(f"    stur {w}, [x29, #{off}]")
+            self.emit(f"    stur {w}, [{base}, #{off}]")
         else:
-            self.emit(f"    stur {reg}, [x29, #{off}]")
+            self.emit(f"    stur {reg}, [{base}, #{off}]")
 
     def _load_local(self, var: LocalVar, reg: str = "x0") -> None:
-        off = -var.offset
+        base, off = self._frame_base_reg(var)
         sz = self._scalar_size(var)
         signed = self._is_signed_type(var.var_type)
         w = "w" + reg[1:]
         if sz == 1:
             mnem = "ldursb" if signed else "ldurb"
             dst = reg if signed else w
-            self.emit(f"    {mnem} {dst}, [x29, #{off}]")
+            self.emit(f"    {mnem} {dst}, [{base}, #{off}]")
         elif sz == 2:
             mnem = "ldursh" if signed else "ldurh"
             dst = reg if signed else w
-            self.emit(f"    {mnem} {dst}, [x29, #{off}]")
+            self.emit(f"    {mnem} {dst}, [{base}, #{off}]")
         elif sz == 4:
             if signed:
-                self.emit(f"    ldursw {reg}, [x29, #{off}]")
+                self.emit(f"    ldursw {reg}, [{base}, #{off}]")
             else:
-                self.emit(f"    ldur {w}, [x29, #{off}]")
+                self.emit(f"    ldur {w}, [{base}, #{off}]")
         else:
-            self.emit(f"    ldur {reg}, [x29, #{off}]")
+            self.emit(f"    ldur {reg}, [{base}, #{off}]")
 
     def _scalar_size(self, var: LocalVar) -> int:
         t = var.var_type
@@ -539,8 +565,10 @@ class Arm64CodeGen:
 
     def _local_addr(self, var: LocalVar, reg: str = "x0") -> None:
         """Compute &local into `reg`."""
-        off = -var.offset
-        self.emit(f"    add {reg}, x29, #{off}")
+        # The slot lives below x29 at x29 - var.offset. `add` with a negative
+        # immediate is illegal, so use `sub` with the positive offset; sub's imm12
+        # (optionally <<12) covers frames up to 16 MiB.
+        self.emit(f"    sub {reg}, x29, #{var.offset}")
 
     # ----------------------------------------------------------------------
     # Statements
@@ -879,8 +907,14 @@ class Arm64CodeGen:
                 self._load_local(var, "x0")
             return
         if name in self.int_globals:
-            self._global_addr(name, "x0")
-            self.emit("    ldr x0, [x0]")
+            gt = self.int_globals[name][2]
+            if isinstance(gt, ArrayType):
+                # A module-scope array identifier evaluates to its base address
+                # (same as a local array), NOT a loaded scalar value.
+                self._global_addr(name, "x0")
+            else:
+                self._global_addr(name, "x0")
+                self.emit("    ldr x0, [x0]")
             return
         if name in self.defined_funcs or name in self.extern_funcs:
             # Function used as a value: load its address.
