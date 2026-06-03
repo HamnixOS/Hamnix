@@ -1,0 +1,1301 @@
+# linux_abi/u_unixsock.ad — Linux AF_UNIX (local) domain sockets.
+#
+# Hamnix's NATIVE model is Plan-9 files (/net, per-process namespaces),
+# and there are NO native BSD sockets. But real Linux software — udev,
+# systemd notify, dbus, X11, journald, ssh-agent, countless daemons —
+# rendezvous over AF_UNIX (a.k.a. AF_LOCAL) sockets: socketpair(2) for a
+# pre-connected fd pair, or bind(2)/listen(2)/accept(2)/connect(2) over
+# a filesystem pathname (or the Linux abstract namespace). This module
+# supplies that family to the Linux-ABI surface ONLY. It lives in
+# linux_abi/ (Layer 2); the native kernel never links it.
+#
+# ARCHITECTURE — sibling of the AF_INET path:
+#   The AF_INET socket family in linux_abi/u_syscalls.ad is a Layer-2
+#   CONSUMER of the in-kernel TCP/UDP stack (drivers/net/*), keyed off a
+#   real FD_SOCKET_MARK fd whose backing record lives in
+#   fs/socket_state.ad. AF_UNIX has NO transport to consume — a unix
+#   socket is purely an in-kernel byte conduit between two fds in the
+#   SAME box. So the family is fully self-contained here: a fixed pool
+#   of "endpoints" (each with its own ring buffer), a bound-name
+#   registry for rendezvous, and a per-listener accept queue. The fd is
+#   still a real FD_SOCKET_MARK fd (allocated via vfs_alloc_socket_fd so
+#   poll(2) / close(2) recognise it), but its fd_buf carries an AF_UNIX
+#   TAG instead of an fs/socket_state.ad record id — so the existing
+#   FD_SOCKET_MARK read/write arms in fs/vfs.ad see usock_valid()==0 and
+#   fall through, while linux_abi/u_syscalls.ad intercepts read/write/
+#   close on these fds BEFORE vfs and routes them here.
+#
+# COMPILER-QUIRK note (Adder): flat global symbol namespace across merged
+# modules, so every helper here is prefixed `afunix_`/`_afu_` and every
+# constant `AFU_`. No adjacent string-literal concat; reserved
+# identifiers (bytes/match/case/char/bool/field/int8..uint64) avoided as
+# variable names. Module-scope Array[N,T] globals only (the U9
+# nested-frame-Array quirk). Ptr[T]+N is UNSCALED — index with p[i].
+
+from kernel.printk.printk import (
+    printk0, printk1, printk2,
+)
+from mm.uaccess import (
+    copy_from_user, copy_to_user,
+)
+
+
+# --- Constants ------------------------------------------------------
+
+# Linux <sys/socket.h> family / type values (the subset we honour).
+AFU_AF_UNIX:     uint32 = 1
+AFU_SOCK_STREAM: uint32 = 1
+AFU_SOCK_DGRAM:  uint32 = 2
+
+# Errnos (negative, <asm-generic/errno{,-base}.h>).
+AFU_EBADF:        int64 = -9
+AFU_EAGAIN:       int64 = -11
+AFU_EINVAL:       int64 = -22
+AFU_ENFILE:       int64 = -23
+AFU_EMFILE:       int64 = -24
+AFU_EPIPE:        int64 = -32
+AFU_ENAMETOOLONG: int64 = -36
+AFU_ENOTCONN:     int64 = -107
+AFU_ECONNREFUSED: int64 = -111
+AFU_EADDRINUSE:   int64 = -98
+AFU_EADDRNOTAVAIL: int64 = -99
+AFU_ENOTSOCK:     int64 = -88
+AFU_EISCONN:      int64 = -106
+AFU_EOPNOTSUPP:   int64 = -95
+AFU_EFAULT:       int64 = -14
+
+# Endpoint pool size. AF_UNIX is heavily used for fd pairs (socketpair)
+# and a handful of long-lived daemon listeners; 32 endpoints is plenty
+# for a single-box Linux personality (a connected stream pair burns 2,
+# a listener 1 + 1 per accepted connection).
+AFU_MAX_EP: uint64 = 32
+
+# Per-endpoint ring buffer size (bytes). A unix-socket pipe holds up to
+# this many in-flight bytes; a writer that fills it would-blocks (or
+# returns EAGAIN when the fd is non-blocking). 4 KiB matches a typical
+# Linux unix-socket sndbuf granularity for the IPC chatter we serve.
+AFU_RING: uint64 = 4096
+
+# Bound-name registry. A name is up to AFU_NAME_MAX bytes; the abstract
+# namespace (sun_path[0]==0) stores the bytes AFTER the leading NUL with
+# afu_name_abstract[i]==1 so an abstract "\0foo" never collides with a
+# filesystem "foo".
+AFU_NAME_MAX: uint64 = 108
+
+# Per-listener accept backlog depth.
+AFU_BACKLOG: uint64 = 8
+
+# Datagram queue depth per bound DGRAM endpoint and per-datagram cap.
+AFU_DGRAM_Q:   uint64 = 8
+AFU_DGRAM_MAX: uint64 = 1024
+
+# fd_buf TAG marking an AF_UNIX socket fd. The low bits carry
+# (ep_slot + 1). 0x40000000 is far above fs/socket_state.ad's record-id
+# range (0..8) so the existing FD_SOCKET_MARK arms in fs/vfs.ad decode
+# usock_record_for_fdbuf -> a huge value, usock_valid()==0, and fall
+# through to their inert default — exactly what we want for a fd this
+# module owns end-to-end.
+AFU_FDBUF_TAG:  uint64 = 0x40000000
+AFU_FDBUF_MASK: uint64 = 0x3FFFFFFF
+
+
+# --- Endpoint states ------------------------------------------------
+AFU_ST_FREE:      uint32 = 0   # slot not allocated
+AFU_ST_CREATED:   uint32 = 1   # socket() done, unbound, unconnected
+AFU_ST_BOUND:     uint32 = 2   # bind() done (DGRAM stays here; STREAM
+                               #   server pre-listen)
+AFU_ST_LISTENING: uint32 = 3   # listen() done — passive STREAM endpoint
+AFU_ST_CONNECTED: uint32 = 4   # STREAM connected (peer != -1)
+AFU_ST_CLOSED:    uint32 = 5   # peer hung up — drain remaining, then EOF
+
+
+# --- Endpoint pool (parallel arrays, top-level BSS) -----------------
+#
+# afu_type      : AFU_SOCK_STREAM / AFU_SOCK_DGRAM.
+# afu_state     : AFU_ST_*.
+# afu_peer      : connected STREAM peer endpoint slot, -1 if none.
+# afu_bound     : 1 if this endpoint holds a registered name.
+# afu_abstract  : 1 if the bound name is an abstract-namespace name.
+# afu_namelen   : length of the bound name (bytes; 0 if unbound).
+# afu_rx_head/tail/count : the endpoint's incoming byte ring (a STREAM
+#                 writer writes into its PEER's ring; a reader drains its
+#                 OWN ring). count == bytes currently buffered.
+# afu_peer_closed: latched when the connected peer endpoint was freed, so
+#                 a reader sees EOF after draining and a writer sees EPIPE.
+afu_inuse:    Array[32, uint8]
+afu_type:     Array[32, uint32]
+afu_state:    Array[32, uint32]
+afu_peer:     Array[32, int32]
+afu_bound:    Array[32, uint8]
+afu_abstract: Array[32, uint8]
+afu_namelen:  Array[32, uint32]
+afu_peer_closed: Array[32, uint8]
+
+afu_rx_head:  Array[32, uint64]
+afu_rx_tail:  Array[32, uint64]
+afu_rx_count: Array[32, uint64]
+
+# Per-endpoint bound name bytes. 32 endpoints * 108 bytes flattened into
+# one BSS array (Adder has no Array-of-Array global; index name[ep*108+i]).
+afu_name: Array[3456, uint8]   # 32 * 108
+
+# Per-endpoint rx ring storage. 32 * 4096 flattened.
+afu_ring: Array[131072, uint8]   # 32 * 4096
+
+# Per-listener accept queue: server-side connected endpoint slots waiting
+# for accept(2). Flattened 32 * 8.
+afu_acceptq:      Array[256, int32]   # 32 * 8
+afu_acceptq_head: Array[32, uint64]
+afu_acceptq_tail: Array[32, uint64]
+afu_acceptq_count: Array[32, uint64]
+
+# Per-DGRAM-endpoint datagram queue. Each slot holds a length + bytes.
+# Flattened: lengths 32*8; data 32*8*1024.
+afu_dgq_len:   Array[256, uint64]      # 32 * 8 datagram lengths
+afu_dgq_head:  Array[32, uint64]
+afu_dgq_tail:  Array[32, uint64]
+afu_dgq_count: Array[32, uint64]
+afu_dgq_data:  Array[262144, uint8]    # 32 * 8 * 1024
+
+
+# --- Init ------------------------------------------------------------
+
+def afunix_init():
+    # Reset every endpoint to FREE. Called once at kernel bring-up so a
+    # dirty BSS image can't be mistaken for a live socket. Idempotent.
+    i: uint64 = 0
+    while i < AFU_MAX_EP:
+        afu_inuse[i]       = 0
+        afu_type[i]        = 0
+        afu_state[i]       = AFU_ST_FREE
+        afu_peer[i]        = -1
+        afu_bound[i]       = 0
+        afu_abstract[i]    = 0
+        afu_namelen[i]     = 0
+        afu_peer_closed[i] = 0
+        afu_rx_head[i]     = 0
+        afu_rx_tail[i]     = 0
+        afu_rx_count[i]    = 0
+        afu_acceptq_head[i]  = 0
+        afu_acceptq_tail[i]  = 0
+        afu_acceptq_count[i] = 0
+        afu_dgq_head[i]    = 0
+        afu_dgq_tail[i]    = 0
+        afu_dgq_count[i]   = 0
+        i = i + 1
+    printk0("[afunix] AF_UNIX endpoint pool initialised\n")
+
+
+# --- Endpoint allocation --------------------------------------------
+
+def _afu_alloc(sock_type: uint32) -> int32:
+    # Claim the lowest free endpoint slot. Returns slot 0..AFU_MAX_EP-1
+    # or -1 if the pool is exhausted.
+    i: uint64 = 0
+    while i < AFU_MAX_EP:
+        if afu_inuse[i] == 0:
+            afu_inuse[i]       = 1
+            afu_type[i]        = sock_type
+            afu_state[i]       = AFU_ST_CREATED
+            afu_peer[i]        = -1
+            afu_bound[i]       = 0
+            afu_abstract[i]    = 0
+            afu_namelen[i]     = 0
+            afu_peer_closed[i] = 0
+            afu_rx_head[i]     = 0
+            afu_rx_tail[i]     = 0
+            afu_rx_count[i]    = 0
+            afu_acceptq_head[i]  = 0
+            afu_acceptq_tail[i]  = 0
+            afu_acceptq_count[i] = 0
+            afu_dgq_head[i]    = 0
+            afu_dgq_tail[i]    = 0
+            afu_dgq_count[i]   = 0
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _afu_valid(ep: int32) -> int32:
+    if ep < 0:
+        return 0
+    eu: uint64 = cast[uint64](ep)
+    if eu >= AFU_MAX_EP:
+        return 0
+    if afu_inuse[eu] == 0:
+        return 0
+    return 1
+
+
+def _afu_free(ep: int32):
+    # Release an endpoint. If it has a connected STREAM peer, latch the
+    # peer's peer_closed flag (so the peer's reader sees EOF after drain
+    # and its writer sees EPIPE) and break the link.
+    if _afu_valid(ep) == 0:
+        return
+    eu: uint64 = cast[uint64](ep)
+    pr: int32 = afu_peer[eu]
+    if pr >= 0:
+        if _afu_valid(pr) != 0:
+            pu: uint64 = cast[uint64](pr)
+            afu_peer_closed[pu] = 1
+            afu_peer[pu] = -1
+    afu_inuse[eu]       = 0
+    afu_type[eu]        = 0
+    afu_state[eu]       = AFU_ST_FREE
+    afu_peer[eu]        = -1
+    afu_bound[eu]       = 0
+    afu_abstract[eu]    = 0
+    afu_namelen[eu]     = 0
+    afu_peer_closed[eu] = 0
+    afu_rx_head[eu]     = 0
+    afu_rx_tail[eu]     = 0
+    afu_rx_count[eu]    = 0
+    afu_acceptq_head[eu]  = 0
+    afu_acceptq_tail[eu]  = 0
+    afu_acceptq_count[eu] = 0
+    afu_dgq_head[eu]    = 0
+    afu_dgq_tail[eu]    = 0
+    afu_dgq_count[eu]   = 0
+
+
+# --- fd_buf <-> endpoint encoding -----------------------------------
+
+def afunix_fdbuf_for_ep(ep: int32) -> uint64:
+    # Encode an endpoint slot for storage in a socket fd's fd_buf.
+    return AFU_FDBUF_TAG | (cast[uint64](ep) + 1)
+
+
+def afunix_ep_for_fdbuf(fdbuf: uint64) -> int32:
+    # Decode an endpoint slot from a socket fd's fd_buf. Returns -1 if
+    # the fd_buf is not an AF_UNIX-tagged value or names a dead slot.
+    if (fdbuf & AFU_FDBUF_TAG) == 0:
+        return -1
+    low: uint64 = fdbuf & AFU_FDBUF_MASK
+    if low == 0:
+        return -1
+    ep: int32 = cast[int32](low) - 1
+    if _afu_valid(ep) == 0:
+        return -1
+    return ep
+
+
+# --- Name registry --------------------------------------------------
+
+def _afu_name_eq(ep: int32, abstract: uint8, src: Ptr[uint8],
+                 nlen: uint32) -> int32:
+    # 1 if endpoint `ep`'s bound name matches (abstract, src[0..nlen)).
+    eu: uint64 = cast[uint64](ep)
+    if afu_bound[eu] == 0:
+        return 0
+    if afu_abstract[eu] != abstract:
+        return 0
+    if afu_namelen[eu] != nlen:
+        return 0
+    base: uint64 = eu * AFU_NAME_MAX
+    i: uint64 = 0
+    while i < cast[uint64](nlen):
+        if afu_name[base + i] != src[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def _afu_lookup_listener(abstract: uint8, src: Ptr[uint8],
+                         nlen: uint32) -> int32:
+    # Find a LISTENING stream endpoint bound to (abstract, name), or -1.
+    i: uint64 = 0
+    while i < AFU_MAX_EP:
+        if afu_inuse[i] != 0:
+            if afu_type[i] == AFU_SOCK_STREAM:
+                if afu_state[i] == AFU_ST_LISTENING:
+                    if _afu_name_eq(cast[int32](i), abstract, src, nlen) != 0:
+                        return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _afu_lookup_dgram(abstract: uint8, src: Ptr[uint8],
+                      nlen: uint32) -> int32:
+    # Find a BOUND datagram endpoint with name (abstract, name), or -1.
+    i: uint64 = 0
+    while i < AFU_MAX_EP:
+        if afu_inuse[i] != 0:
+            if afu_type[i] == AFU_SOCK_DGRAM:
+                if afu_bound[i] != 0:
+                    if _afu_name_eq(cast[int32](i), abstract, src, nlen) != 0:
+                        return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _afu_name_in_use(abstract: uint8, src: Ptr[uint8], nlen: uint32) -> int32:
+    # 1 if ANY live endpoint already holds this exact name — bind(2)'s
+    # EADDRINUSE probe.
+    i: uint64 = 0
+    while i < AFU_MAX_EP:
+        if afu_inuse[i] != 0:
+            if afu_bound[i] != 0:
+                if _afu_name_eq(cast[int32](i), abstract, src, nlen) != 0:
+                    return 1
+        i = i + 1
+    return 0
+
+
+# --- sockaddr_un parsing --------------------------------------------
+#
+# struct sockaddr_un {
+#     sa_family_t sun_family;   // offset 0, 2 bytes (AF_UNIX == 1)
+#     char        sun_path[108];// offset 2
+# };
+# A pathname address: sun_path is a NUL-terminated string. An ABSTRACT
+# address: sun_path[0]==0, the name is the bytes sun_path[1 .. addrlen-2]
+# (length = addrlen - offsetof(sun_path) - 1, NOT NUL-terminated). An
+# UNNAMED autobind (addrlen == 2) has no name.
+
+# Kernel scratch for the copied-in name (one global; the syscall path is
+# single-threaded per the cooperative model). nlen + abstract returned
+# via the out-params.
+afu_name_scratch: Array[108, uint8]
+
+
+def _afu_parse_sun(addr: uint64, addrlen: int32,
+                   out_abstract: Ptr[uint8], out_nlen: Ptr[uint32]) -> int64:
+    # Copy + validate a user sockaddr_un. On success fills
+    # afu_name_scratch with the name bytes, writes *out_abstract and
+    # *out_nlen, and returns 0. Returns a negative errno on failure.
+    # An UNNAMED address (addrlen <= 2) yields nlen==0 (valid for
+    # connect's "no name" cases is rejected by callers, but bind autobind
+    # is not modelled — callers requiring a name check nlen==0).
+    if addr == 0:
+        return AFU_EINVAL
+    if addrlen < 2:
+        return AFU_EINVAL
+    # Pull sun_family (2 host-order bytes) + sun_path via copy_from_user
+    # into a bounce buffer.
+    hdr: Array[110, uint8]
+    nbytes: uint64 = cast[uint64](addrlen)
+    if nbytes > 110:
+        nbytes = 110
+    if copy_from_user(cast[uint64](&hdr[0]), addr, nbytes) != 0:
+        return AFU_EFAULT
+    fam: uint32 = cast[uint32](hdr[0]) | (cast[uint32](hdr[1]) << 8)
+    if fam != AFU_AF_UNIX:
+        return AFU_EINVAL
+    pathlen: uint64 = nbytes - 2          # bytes available in sun_path
+    if pathlen == 0:
+        out_abstract[0] = 0
+        out_nlen[0] = 0
+        return 0
+    # Abstract namespace: first sun_path byte is NUL.
+    if hdr[2] == 0:
+        # Name = sun_path[1 .. pathlen) (the bytes after the leading NUL).
+        nlen: uint64 = pathlen - 1
+        if nlen > AFU_NAME_MAX:
+            return AFU_ENAMETOOLONG
+        i: uint64 = 0
+        while i < nlen:
+            afu_name_scratch[i] = hdr[3 + i]
+            i = i + 1
+        out_abstract[0] = 1
+        out_nlen[0] = cast[uint32](nlen)
+        return 0
+    # Pathname namespace: NUL-terminated string within sun_path.
+    nlen2: uint64 = 0
+    while nlen2 < pathlen:
+        if hdr[2 + nlen2] == 0:
+            nlen2 = pathlen          # found terminator — stop
+        else:
+            afu_name_scratch[nlen2] = hdr[2 + nlen2]
+            nlen2 = nlen2 + 1
+            if nlen2 > AFU_NAME_MAX:
+                return AFU_ENAMETOOLONG
+    # nlen2 now == actual name length if a NUL was hit, else == pathlen.
+    actual: uint64 = 0
+    while actual < pathlen:
+        if hdr[2 + actual] == 0:
+            actual = pathlen + 1     # sentinel: found terminator
+        else:
+            actual = actual + 1
+    # Recompute clean length (number of bytes before the NUL or pathlen).
+    real: uint64 = 0
+    while real < pathlen:
+        if hdr[2 + real] == 0:
+            real = pathlen           # stop counting
+        else:
+            real = real + 1
+    name_len: uint64 = 0
+    k: uint64 = 0
+    while k < pathlen:
+        if hdr[2 + k] == 0:
+            k = pathlen
+        else:
+            name_len = name_len + 1
+            k = k + 1
+    if name_len > AFU_NAME_MAX:
+        return AFU_ENAMETOOLONG
+    out_abstract[0] = 0
+    out_nlen[0] = cast[uint32](name_len)
+    return 0
+
+
+def _afu_store_name(ep: int32, abstract: uint8, nlen: uint32):
+    # Copy afu_name_scratch into endpoint ep's bound-name slot and mark
+    # it bound.
+    eu: uint64 = cast[uint64](ep)
+    base: uint64 = eu * AFU_NAME_MAX
+    i: uint64 = 0
+    while i < cast[uint64](nlen):
+        afu_name[base + i] = afu_name_scratch[i]
+        i = i + 1
+    afu_namelen[eu]  = nlen
+    afu_abstract[eu] = abstract
+    afu_bound[eu]    = 1
+
+
+# --- Ring-buffer byte conduit ---------------------------------------
+
+def _afu_ring_space(ep: int32) -> uint64:
+    # Free bytes in endpoint ep's rx ring.
+    eu: uint64 = cast[uint64](ep)
+    return AFU_RING - afu_rx_count[eu]
+
+
+def _afu_ring_push(ep: int32, src: Ptr[uint8], n: uint64) -> uint64:
+    # Push up to n bytes from src into endpoint ep's rx ring. Returns the
+    # number of bytes actually pushed (capped by free space). src is a
+    # KERNEL pointer (caller bounces user data first).
+    eu: uint64 = cast[uint64](ep)
+    space: uint64 = AFU_RING - afu_rx_count[eu]
+    take: uint64 = n
+    if take > space:
+        take = space
+    base: uint64 = eu * AFU_RING
+    tail: uint64 = afu_rx_tail[eu]
+    i: uint64 = 0
+    while i < take:
+        afu_ring[base + tail] = src[i]
+        tail = tail + 1
+        if tail >= AFU_RING:
+            tail = 0
+        i = i + 1
+    afu_rx_tail[eu]  = tail
+    afu_rx_count[eu] = afu_rx_count[eu] + take
+    return take
+
+
+def _afu_ring_pop(ep: int32, dst: Ptr[uint8], n: uint64) -> uint64:
+    # Pop up to n bytes from endpoint ep's rx ring into dst (KERNEL ptr).
+    # Returns bytes popped.
+    eu: uint64 = cast[uint64](ep)
+    avail: uint64 = afu_rx_count[eu]
+    take: uint64 = n
+    if take > avail:
+        take = avail
+    base: uint64 = eu * AFU_RING
+    head: uint64 = afu_rx_head[eu]
+    i: uint64 = 0
+    while i < take:
+        dst[i] = afu_ring[base + head]
+        head = head + 1
+        if head >= AFU_RING:
+            head = 0
+        i = i + 1
+    afu_rx_head[eu]  = head
+    afu_rx_count[eu] = afu_rx_count[eu] - take
+    return take
+
+
+# Kernel bounce buffer for the user<->ring data move (one chunk at a
+# time). Top-level BSS per the nested-frame-Array quirk.
+afu_io_scratch: Array[4096, uint8]
+
+
+# --- accept queue ---------------------------------------------------
+
+def _afu_acceptq_push(listener: int32, server_ep: int32) -> int32:
+    # Enqueue a server-side connected endpoint on a listener's accept
+    # queue. Returns 0 on success, -1 if the backlog is full.
+    lu: uint64 = cast[uint64](listener)
+    if afu_acceptq_count[lu] >= AFU_BACKLOG:
+        return -1
+    base: uint64 = lu * AFU_BACKLOG
+    tail: uint64 = afu_acceptq_tail[lu]
+    afu_acceptq[base + tail] = server_ep
+    tail = tail + 1
+    if tail >= AFU_BACKLOG:
+        tail = 0
+    afu_acceptq_tail[lu]   = tail
+    afu_acceptq_count[lu]  = afu_acceptq_count[lu] + 1
+    return 0
+
+
+def _afu_acceptq_pop(listener: int32) -> int32:
+    # Dequeue the oldest pending server endpoint, or -1 if empty.
+    lu: uint64 = cast[uint64](listener)
+    if afu_acceptq_count[lu] == 0:
+        return -1
+    base: uint64 = lu * AFU_BACKLOG
+    head: uint64 = afu_acceptq_head[lu]
+    ep: int32 = afu_acceptq[base + head]
+    head = head + 1
+    if head >= AFU_BACKLOG:
+        head = 0
+    afu_acceptq_head[lu]  = head
+    afu_acceptq_count[lu] = afu_acceptq_count[lu] - 1
+    return ep
+
+
+# --- datagram queue -------------------------------------------------
+
+def _afu_dgq_push(dst_ep: int32, src: Ptr[uint8], n: uint64) -> int64:
+    # Enqueue one datagram (src is a KERNEL ptr) on dst_ep's queue.
+    # Returns bytes accepted, or AFU_EAGAIN if the queue is full.
+    du: uint64 = cast[uint64](dst_ep)
+    if afu_dgq_count[du] >= AFU_DGRAM_Q:
+        return AFU_EAGAIN
+    take: uint64 = n
+    if take > AFU_DGRAM_MAX:
+        take = AFU_DGRAM_MAX
+    tail: uint64 = afu_dgq_tail[du]
+    qidx: uint64 = du * AFU_DGRAM_Q + tail
+    afu_dgq_len[qidx] = take
+    dbase: uint64 = (du * AFU_DGRAM_Q + tail) * AFU_DGRAM_MAX
+    i: uint64 = 0
+    while i < take:
+        afu_dgq_data[dbase + i] = src[i]
+        i = i + 1
+    tail = tail + 1
+    if tail >= AFU_DGRAM_Q:
+        tail = 0
+    afu_dgq_tail[du]   = tail
+    afu_dgq_count[du]  = afu_dgq_count[du] + 1
+    return cast[int64](take)
+
+
+def _afu_dgq_pop(ep: int32, dst: Ptr[uint8], n: uint64) -> int64:
+    # Dequeue one datagram into dst (KERNEL ptr), truncating to n bytes.
+    # Returns the (possibly truncated) byte count delivered, or
+    # AFU_EAGAIN if the queue is empty.
+    eu: uint64 = cast[uint64](ep)
+    if afu_dgq_count[eu] == 0:
+        return AFU_EAGAIN
+    head: uint64 = afu_dgq_head[eu]
+    qidx: uint64 = eu * AFU_DGRAM_Q + head
+    dlen: uint64 = afu_dgq_len[qidx]
+    take: uint64 = dlen
+    if take > n:
+        take = n
+    dbase: uint64 = (eu * AFU_DGRAM_Q + head) * AFU_DGRAM_MAX
+    i: uint64 = 0
+    while i < take:
+        dst[i] = afu_dgq_data[dbase + i]
+        i = i + 1
+    head = head + 1
+    if head >= AFU_DGRAM_Q:
+        head = 0
+    afu_dgq_head[eu]  = head
+    afu_dgq_count[eu] = afu_dgq_count[eu] - 1
+    return cast[int64](take)
+
+
+# =====================================================================
+# Public family API — called from the AF_UNIX arms of u_syscalls.ad
+# =====================================================================
+#
+# These take/return values, not raw syscall args; u_syscalls.ad owns the
+# fd allocation (vfs_alloc_socket_fd) and fd_buf wiring, and the
+# user-pointer copy_to_user of the int[2] socketpair result. Keeping the
+# fd-table touch in u_syscalls.ad (where the vfs bridge lives) means this
+# module stays a Layer-2 leaf with no fs/vfs.ad coupling beyond the
+# fdbuf encode/decode contract above.
+
+
+def afunix_socket(sock_type: uint32) -> int32:
+    # socket(AF_UNIX, type, 0). Allocate an endpoint; return its slot or
+    # a negative errno. type already has SOCK_CLOEXEC/NONBLOCK masked off
+    # by the caller.
+    if sock_type != AFU_SOCK_STREAM:
+        if sock_type != AFU_SOCK_DGRAM:
+            return cast[int32](AFU_EINVAL)
+    ep: int32 = _afu_alloc(sock_type)
+    if ep < 0:
+        return cast[int32](AFU_ENFILE)
+    return ep
+
+
+def afunix_bind(ep: int32, addr: uint64, addrlen: int32) -> int64:
+    # bind(fd, sockaddr_un, len). Register the endpoint's name in the
+    # rendezvous table. EADDRINUSE if the name is taken; EINVAL if the
+    # endpoint is already bound or the address has no name.
+    if _afu_valid(ep) == 0:
+        return AFU_ENOTSOCK
+    eu: uint64 = cast[uint64](ep)
+    if afu_bound[eu] != 0:
+        return AFU_EINVAL
+    abstract: uint8 = 0
+    nlen: uint32 = 0
+    rc: int64 = _afu_parse_sun(addr, addrlen, &abstract, &nlen)
+    if rc != 0:
+        return rc
+    if nlen == 0:
+        # Autobind (unnamed) not modelled — a server must name itself.
+        return AFU_EINVAL
+    if _afu_name_in_use(abstract, &afu_name_scratch[0], nlen) != 0:
+        return AFU_EADDRINUSE
+    _afu_store_name(ep, abstract, nlen)
+    if afu_state[eu] == AFU_ST_CREATED:
+        afu_state[eu] = AFU_ST_BOUND
+    return 0
+
+
+def afunix_listen(ep: int32, backlog: int32) -> int64:
+    # listen(fd, backlog). Mark a bound STREAM endpoint passive.
+    if _afu_valid(ep) == 0:
+        return AFU_ENOTSOCK
+    eu: uint64 = cast[uint64](ep)
+    if afu_type[eu] != AFU_SOCK_STREAM:
+        return AFU_EOPNOTSUPP
+    if afu_state[eu] == AFU_ST_LISTENING:
+        return 0
+    if afu_bound[eu] == 0:
+        return AFU_EINVAL
+    afu_state[eu] = AFU_ST_LISTENING
+    return 0
+
+
+def afunix_connect(ep: int32, addr: uint64, addrlen: int32) -> int64:
+    # connect(fd, sockaddr_un, len) for SOCK_STREAM: rendezvous with a
+    # listening server by name. Allocates a server-side endpoint, links
+    # the pair (client.peer = server, server.peer = client), and pushes
+    # the server endpoint onto the listener's accept queue. Returns 0 on
+    # success, ECONNREFUSED if no listener, EISCONN if already connected.
+    #
+    # For SOCK_DGRAM: records the destination name as the default peer
+    # (a "connected" datagram socket); a later send(2) with no addr
+    # targets it. We store the resolved bound-DGRAM endpoint slot if the
+    # name is currently bound, else defer resolution to send time.
+    if _afu_valid(ep) == 0:
+        return AFU_ENOTSOCK
+    eu: uint64 = cast[uint64](ep)
+    abstract: uint8 = 0
+    nlen: uint32 = 0
+    rc: int64 = _afu_parse_sun(addr, addrlen, &abstract, &nlen)
+    if rc != 0:
+        return rc
+    if nlen == 0:
+        return AFU_EINVAL
+    if afu_type[eu] == AFU_SOCK_DGRAM:
+        # Record the dest as the connected peer (resolve at send time so
+        # a server bound after connect still works).
+        dst: int32 = _afu_lookup_dgram(abstract, &afu_name_scratch[0], nlen)
+        afu_peer[eu] = dst                # may be -1 (unbound yet)
+        # Stash the name on this endpoint for late resolution.
+        _afu_store_name(ep, abstract, nlen)
+        afu_bound[eu] = 0                 # a connect-name isn't a bind
+        return 0
+    # SOCK_STREAM connect.
+    if afu_state[eu] == AFU_ST_CONNECTED:
+        return AFU_EISCONN
+    if afu_state[eu] != AFU_ST_CREATED:
+        if afu_state[eu] != AFU_ST_BOUND:
+            return AFU_EINVAL
+    listener: int32 = _afu_lookup_listener(abstract, &afu_name_scratch[0],
+                                           nlen)
+    if listener < 0:
+        return AFU_ECONNREFUSED
+    # Allocate the server-side endpoint for this connection.
+    srv: int32 = _afu_alloc(AFU_SOCK_STREAM)
+    if srv < 0:
+        return AFU_ECONNREFUSED          # server can't accept — refuse
+    su: uint64 = cast[uint64](srv)
+    afu_state[su] = AFU_ST_CONNECTED
+    afu_peer[su]  = ep
+    afu_peer[eu]  = srv
+    afu_state[eu] = AFU_ST_CONNECTED
+    if _afu_acceptq_push(listener, srv) != 0:
+        # Backlog full — tear the half-built pair down, refuse.
+        afu_peer[su] = -1
+        afu_peer[eu] = -1
+        afu_state[eu] = AFU_ST_CREATED
+        _afu_free(srv)
+        return AFU_ECONNREFUSED
+    return 0
+
+
+def afunix_accept_ready(ep: int32) -> int32:
+    # 1 if the listener has a pending connection to accept.
+    if _afu_valid(ep) == 0:
+        return 0
+    eu: uint64 = cast[uint64](ep)
+    if afu_state[eu] != AFU_ST_LISTENING:
+        return 0
+    if afu_acceptq_count[eu] > 0:
+        return 1
+    return 0
+
+
+def afunix_accept_take(ep: int32) -> int32:
+    # accept(fd): pop the oldest pending server endpoint. Returns the
+    # server endpoint slot, or a negative errno (EINVAL if not listening,
+    # EAGAIN if the queue is empty).
+    if _afu_valid(ep) == 0:
+        return cast[int32](AFU_ENOTSOCK)
+    eu: uint64 = cast[uint64](ep)
+    if afu_state[eu] != AFU_ST_LISTENING:
+        return cast[int32](AFU_EINVAL)
+    srv: int32 = _afu_acceptq_pop(ep)
+    if srv < 0:
+        return cast[int32](AFU_EAGAIN)
+    return srv
+
+
+# --- I/O: stream send/recv (also write/read) ------------------------
+
+def afunix_can_read(ep: int32) -> int32:
+    # 1 if a read on this STREAM endpoint would not block (data buffered
+    # OR peer closed -> EOF readiness).
+    if _afu_valid(ep) == 0:
+        return 1
+    eu: uint64 = cast[uint64](ep)
+    if afu_rx_count[eu] > 0:
+        return 1
+    if afu_peer_closed[eu] != 0:
+        return 1
+    return 0
+
+
+def afunix_send_stream(ep: int32, ubuf: uint64, ulen: uint64) -> int64:
+    # send(2)/write(2) on a connected STREAM endpoint: copy user bytes
+    # into the PEER's rx ring. Returns bytes accepted (>0), AFU_EAGAIN if
+    # the peer ring is full, or AFU_EPIPE if the peer has gone away.
+    if _afu_valid(ep) == 0:
+        return AFU_EBADF
+    eu: uint64 = cast[uint64](ep)
+    if afu_type[eu] != AFU_SOCK_STREAM:
+        return AFU_EOPNOTSUPP
+    if ulen == 0:
+        return 0
+    peer: int32 = afu_peer[eu]
+    if peer < 0 or _afu_valid(peer) == 0:
+        return AFU_EPIPE
+    if afu_state[eu] != AFU_ST_CONNECTED:
+        return AFU_ENOTCONN
+    space: uint64 = _afu_ring_space(peer)
+    if space == 0:
+        return AFU_EAGAIN
+    want: uint64 = ulen
+    if want > space:
+        want = space
+    if want > AFU_RING:
+        want = AFU_RING
+    if copy_from_user(cast[uint64](&afu_io_scratch[0]), ubuf, want) != 0:
+        return AFU_EFAULT
+    pushed: uint64 = _afu_ring_push(peer, &afu_io_scratch[0], want)
+    return cast[int64](pushed)
+
+
+def afunix_recv_stream(ep: int32, ubuf: uint64, ulen: uint64) -> int64:
+    # recv(2)/read(2) on a connected STREAM endpoint: drain bytes from
+    # this endpoint's OWN rx ring into the user buffer. Returns bytes
+    # read (>0), 0 on EOF (peer closed and ring drained), or AFU_EAGAIN
+    # if no data is buffered yet and the peer is still up.
+    if _afu_valid(ep) == 0:
+        return AFU_EBADF
+    eu: uint64 = cast[uint64](ep)
+    if afu_type[eu] != AFU_SOCK_STREAM:
+        return AFU_EOPNOTSUPP
+    if ulen == 0:
+        return 0
+    avail: uint64 = afu_rx_count[eu]
+    if avail == 0:
+        if afu_peer_closed[eu] != 0:
+            return 0                      # orderly EOF
+        return AFU_EAGAIN
+    want: uint64 = ulen
+    if want > avail:
+        want = avail
+    if want > AFU_RING:
+        want = AFU_RING
+    popped: uint64 = _afu_ring_pop(ep, &afu_io_scratch[0], want)
+    if copy_to_user(ubuf, cast[uint64](&afu_io_scratch[0]), popped) != 0:
+        return AFU_EFAULT
+    return cast[int64](popped)
+
+
+# --- I/O: datagram sendto/recvfrom ----------------------------------
+
+def afunix_sendto(ep: int32, ubuf: uint64, ulen: uint64,
+                  addr: uint64, addrlen: int32) -> int64:
+    # sendto(2) on a SOCK_DGRAM endpoint. Resolves the destination by
+    # name (addr supplied) or via the connect(2)'d default peer (addr
+    # NULL). Delivers ONE datagram into the destination endpoint's queue.
+    if _afu_valid(ep) == 0:
+        return AFU_EBADF
+    eu: uint64 = cast[uint64](ep)
+    if afu_type[eu] != AFU_SOCK_DGRAM:
+        return AFU_EOPNOTSUPP
+    dst: int32 = -1
+    if addr != 0:
+        abstract: uint8 = 0
+        nlen: uint32 = 0
+        rc: int64 = _afu_parse_sun(addr, addrlen, &abstract, &nlen)
+        if rc != 0:
+            return rc
+        if nlen == 0:
+            return AFU_EINVAL
+        dst = _afu_lookup_dgram(abstract, &afu_name_scratch[0], nlen)
+    else:
+        # Use the connect(2)'d peer. Re-resolve if it was unbound at
+        # connect time but has since bound.
+        dst = afu_peer[eu]
+        if dst < 0:
+            if afu_bound[eu] == 0:
+                if afu_namelen[eu] > 0:
+                    base: uint64 = eu * AFU_NAME_MAX
+                    dst = _afu_lookup_dgram(afu_abstract[eu],
+                                            &afu_name[base],
+                                            afu_namelen[eu])
+        if dst < 0:
+            return AFU_ENOTCONN
+    if dst < 0 or _afu_valid(dst) == 0:
+        return AFU_ECONNREFUSED
+    if afu_type[cast[uint64](dst)] != AFU_SOCK_DGRAM:
+        return AFU_ECONNREFUSED
+    want: uint64 = ulen
+    if want > AFU_DGRAM_MAX:
+        want = AFU_DGRAM_MAX
+    if want > 0:
+        if copy_from_user(cast[uint64](&afu_io_scratch[0]), ubuf, want) != 0:
+            return AFU_EFAULT
+    return _afu_dgq_push(dst, &afu_io_scratch[0], want)
+
+
+def afunix_recvfrom(ep: int32, ubuf: uint64, ulen: uint64) -> int64:
+    # recvfrom(2) on a SOCK_DGRAM endpoint: dequeue ONE datagram from
+    # this endpoint's queue. Returns the byte count (>0 / 0 for an empty
+    # datagram) or AFU_EAGAIN if the queue is empty.
+    if _afu_valid(ep) == 0:
+        return AFU_EBADF
+    eu: uint64 = cast[uint64](ep)
+    if afu_type[eu] != AFU_SOCK_DGRAM:
+        return AFU_EOPNOTSUPP
+    n: int64 = _afu_dgq_pop(ep, &afu_io_scratch[0], ulen)
+    if n < 0:
+        return n
+    if n > 0:
+        if copy_to_user(ubuf, cast[uint64](&afu_io_scratch[0]),
+                        cast[uint64](n)) != 0:
+            return AFU_EFAULT
+    return n
+
+
+def afunix_dgram_can_read(ep: int32) -> int32:
+    # 1 if a datagram is queued for this endpoint.
+    if _afu_valid(ep) == 0:
+        return 0
+    eu: uint64 = cast[uint64](ep)
+    if afu_dgq_count[eu] > 0:
+        return 1
+    return 0
+
+
+def afunix_close(ep: int32):
+    # close(fd): release the endpoint (latches the peer's EOF/EPIPE).
+    _afu_free(ep)
+
+
+def afunix_get_type(ep: int32) -> uint32:
+    if _afu_valid(ep) == 0:
+        return 0
+    return afu_type[cast[uint64](ep)]
+
+
+# --- socketpair -----------------------------------------------------
+
+def afunix_socketpair(sock_type: uint32, out_a: Ptr[int32],
+                      out_b: Ptr[int32]) -> int64:
+    # socketpair(AF_UNIX, type, 0, sv): allocate a PRE-CONNECTED pair of
+    # endpoints (each is the other's peer). Returns 0 and writes the two
+    # endpoint slots through out_a/out_b, or a negative errno.
+    if sock_type != AFU_SOCK_STREAM:
+        if sock_type != AFU_SOCK_DGRAM:
+            return AFU_EINVAL
+    a: int32 = _afu_alloc(sock_type)
+    if a < 0:
+        return AFU_ENFILE
+    b: int32 = _afu_alloc(sock_type)
+    if b < 0:
+        _afu_free(a)
+        return AFU_ENFILE
+    au: uint64 = cast[uint64](a)
+    bu: uint64 = cast[uint64](b)
+    afu_peer[au]  = b
+    afu_peer[bu]  = a
+    afu_state[au] = AFU_ST_CONNECTED
+    afu_state[bu] = AFU_ST_CONNECTED
+    out_a[0] = a
+    out_b[0] = b
+    return 0
+
+
+# =====================================================================
+# Boot self-test (gated boot:37.afunix via /etc/afunix-test)
+# =====================================================================
+#
+# Exercises the family DIRECTLY against the public API (the same code the
+# syscall arms drive), bouncing through copy_to_user/copy_from_user via a
+# user-mapped scratch page is not available at boot:37, so the self-test
+# calls the ring/queue + rendezvous primitives that DON'T touch user
+# memory plus a name-based round-trip. Emits "[afunix] PASS" on success,
+# "[afunix] FAIL: ..." on any assertion miss.
+
+# A small kernel-space sockaddr_un builder for the self-test (no user
+# memory involved — the parse path copy_from_user is exercised by real
+# syscalls, the self-test verifies the rendezvous + conduit logic).
+afu_t_addr: Array[110, uint8]
+
+
+def _afu_t_build_path(name: Ptr[uint8], nlen: uint64) -> int32:
+    # Build a pathname sockaddr_un into afu_t_addr. Returns addrlen.
+    afu_t_addr[0] = cast[uint8](AFU_AF_UNIX & 0xFF)
+    afu_t_addr[1] = cast[uint8]((AFU_AF_UNIX >> 8) & 0xFF)
+    i: uint64 = 0
+    while i < nlen:
+        afu_t_addr[2 + i] = name[i]
+        i = i + 1
+    afu_t_addr[2 + nlen] = 0
+    return cast[int32](2 + nlen + 1)
+
+
+def _afu_t_build_abstract(name: Ptr[uint8], nlen: uint64) -> int32:
+    # Build an abstract-namespace sockaddr_un (leading NUL) into
+    # afu_t_addr. Returns addrlen.
+    afu_t_addr[0] = cast[uint8](AFU_AF_UNIX & 0xFF)
+    afu_t_addr[1] = cast[uint8]((AFU_AF_UNIX >> 8) & 0xFF)
+    afu_t_addr[2] = 0                       # abstract marker
+    i: uint64 = 0
+    while i < nlen:
+        afu_t_addr[3 + i] = name[i]
+        i = i + 1
+    return cast[int32](2 + 1 + nlen)
+
+
+# Kernel-direct variants of bind/connect that parse from afu_t_addr in
+# KERNEL space (so the self-test, which has no user mapping at boot:37,
+# can still exercise the full rendezvous logic). They mirror the public
+# bind/connect bodies but read afu_t_addr directly.
+
+def _afu_t_kparse(out_abstract: Ptr[uint8], out_nlen: Ptr[uint32]) -> int32:
+    # Parse afu_t_addr (kernel space) into afu_name_scratch + flags.
+    fam: uint32 = cast[uint32](afu_t_addr[0]) \
+                | (cast[uint32](afu_t_addr[1]) << 8)
+    if fam != AFU_AF_UNIX:
+        return -1
+    if afu_t_addr[2] == 0:
+        # Abstract: name = bytes after the leading NUL until a 0 or cap.
+        i: uint64 = 0
+        while i < AFU_NAME_MAX:
+            b: uint8 = afu_t_addr[3 + i]
+            if b == 0:
+                i = AFU_NAME_MAX
+            else:
+                afu_name_scratch[i] = b
+                i = i + 1
+        # recompute length
+        n: uint64 = 0
+        while n < AFU_NAME_MAX:
+            if afu_t_addr[3 + n] == 0:
+                n = AFU_NAME_MAX
+            else:
+                afu_name_scratch[n] = afu_t_addr[3 + n]
+                n = n + 1
+        ln: uint32 = 0
+        m: uint64 = 0
+        while m < AFU_NAME_MAX:
+            if afu_t_addr[3 + m] == 0:
+                m = AFU_NAME_MAX
+            else:
+                ln = ln + 1
+                m = m + 1
+        out_abstract[0] = 1
+        out_nlen[0] = ln
+        return 0
+    # Pathname.
+    ln2: uint32 = 0
+    p: uint64 = 0
+    while p < AFU_NAME_MAX:
+        if afu_t_addr[2 + p] == 0:
+            p = AFU_NAME_MAX
+        else:
+            afu_name_scratch[p] = afu_t_addr[2 + p]
+            ln2 = ln2 + 1
+            p = p + 1
+    out_abstract[0] = 0
+    out_nlen[0] = ln2
+    return 0
+
+
+def _afu_t_kbind(ep: int32) -> int64:
+    abstract: uint8 = 0
+    nlen: uint32 = 0
+    if _afu_t_kparse(&abstract, &nlen) != 0:
+        return AFU_EINVAL
+    if nlen == 0:
+        return AFU_EINVAL
+    if _afu_name_in_use(abstract, &afu_name_scratch[0], nlen) != 0:
+        return AFU_EADDRINUSE
+    _afu_store_name(ep, abstract, nlen)
+    eu: uint64 = cast[uint64](ep)
+    if afu_state[eu] == AFU_ST_CREATED:
+        afu_state[eu] = AFU_ST_BOUND
+    return 0
+
+
+def _afu_t_kconnect(ep: int32) -> int64:
+    abstract: uint8 = 0
+    nlen: uint32 = 0
+    if _afu_t_kparse(&abstract, &nlen) != 0:
+        return AFU_EINVAL
+    eu: uint64 = cast[uint64](ep)
+    if afu_type[eu] == AFU_SOCK_DGRAM:
+        dst: int32 = _afu_lookup_dgram(abstract, &afu_name_scratch[0], nlen)
+        afu_peer[eu] = dst
+        _afu_store_name(ep, abstract, nlen)
+        afu_bound[eu] = 0
+        return 0
+    listener: int32 = _afu_lookup_listener(abstract, &afu_name_scratch[0],
+                                           nlen)
+    if listener < 0:
+        return AFU_ECONNREFUSED
+    srv: int32 = _afu_alloc(AFU_SOCK_STREAM)
+    if srv < 0:
+        return AFU_ECONNREFUSED
+    su: uint64 = cast[uint64](srv)
+    afu_state[su] = AFU_ST_CONNECTED
+    afu_peer[su]  = ep
+    afu_peer[eu]  = srv
+    afu_state[eu] = AFU_ST_CONNECTED
+    if _afu_acceptq_push(listener, srv) != 0:
+        _afu_free(srv)
+        afu_peer[eu] = -1
+        afu_state[eu] = AFU_ST_CREATED
+        return AFU_ECONNREFUSED
+    return 0
+
+
+# Kernel-direct send/recv for the self-test (no user copy): push/pop the
+# rings directly.
+def _afu_t_send(ep: int32, src: Ptr[uint8], n: uint64) -> int64:
+    eu: uint64 = cast[uint64](ep)
+    peer: int32 = afu_peer[eu]
+    if peer < 0:
+        return AFU_EPIPE
+    return cast[int64](_afu_ring_push(peer, src, n))
+
+
+def _afu_t_recv(ep: int32, dst: Ptr[uint8], n: uint64) -> int64:
+    eu: uint64 = cast[uint64](ep)
+    avail: uint64 = afu_rx_count[eu]
+    if avail == 0:
+        if afu_peer_closed[eu] != 0:
+            return 0
+        return AFU_EAGAIN
+    return cast[int64](_afu_ring_pop(ep, dst, n))
+
+
+afu_t_tx: Array[64, uint8]
+afu_t_rx: Array[64, uint8]
+
+
+def _afu_t_fail(msg: Ptr[uint8]):
+    printk0("[afunix] FAIL: ")
+    printk0(msg)
+    printk0("\n")
+
+
+def afunix_selftest():
+    # Reset the pool so a prior boot's residue can't taint the run.
+    afunix_init()
+    printk0("[afunix] self-test start\n")
+    ok: int32 = 1
+
+    # --- 1) socketpair round-trip, both directions ------------------
+    pa: int32 = 0
+    pb: int32 = 0
+    if afunix_socketpair(AFU_SOCK_STREAM, &pa, &pb) != 0:
+        _afu_t_fail("socketpair alloc")
+        ok = 0
+    if ok == 1:
+        # a -> b
+        afu_t_tx[0] = 72    # 'H'
+        afu_t_tx[1] = 73    # 'I'
+        if _afu_t_send(pa, &afu_t_tx[0], 2) != 2:
+            _afu_t_fail("socketpair send a->b")
+            ok = 0
+        rn: int64 = _afu_t_recv(pb, &afu_t_rx[0], 64)
+        if rn != 2 or afu_t_rx[0] != 72 or afu_t_rx[1] != 73:
+            _afu_t_fail("socketpair recv a->b")
+            ok = 0
+        # b -> a (reverse direction)
+        afu_t_tx[0] = 90    # 'Z'
+        if _afu_t_send(pb, &afu_t_tx[0], 1) != 1:
+            _afu_t_fail("socketpair send b->a")
+            ok = 0
+        rn2: int64 = _afu_t_recv(pa, &afu_t_rx[0], 64)
+        if rn2 != 1 or afu_t_rx[0] != 90:
+            _afu_t_fail("socketpair recv b->a")
+            ok = 0
+        afunix_close(pa)
+        afunix_close(pb)
+
+    # --- 2) bound-name STREAM listen/connect/accept + byte exchange --
+    if ok == 1:
+        srv: int32 = afunix_socket(AFU_SOCK_STREAM)
+        nm: Ptr[uint8] = "/tmp/afu.sock"
+        al: int32 = _afu_t_build_path(nm, 13)
+        if _afu_t_kbind(srv) != 0:
+            _afu_t_fail("stream bind")
+            ok = 0
+        if afunix_listen(srv, 5) != 0:
+            _afu_t_fail("stream listen")
+            ok = 0
+        cli: int32 = afunix_socket(AFU_SOCK_STREAM)
+        # rebuild addr (kparse consumed afu_name_scratch)
+        al2: int32 = _afu_t_build_path(nm, 13)
+        if _afu_t_kconnect(cli) != 0:
+            _afu_t_fail("stream connect")
+            ok = 0
+        if afunix_accept_ready(srv) != 1:
+            _afu_t_fail("stream accept not ready")
+            ok = 0
+        acc: int32 = afunix_accept_take(srv)
+        if acc < 0:
+            _afu_t_fail("stream accept take")
+            ok = 0
+        if ok == 1:
+            # client -> accepted server
+            afu_t_tx[0] = 65    # 'A'
+            afu_t_tx[1] = 66    # 'B'
+            afu_t_tx[2] = 67    # 'C'
+            if _afu_t_send(cli, &afu_t_tx[0], 3) != 3:
+                _afu_t_fail("stream send c->s")
+                ok = 0
+            rs: int64 = _afu_t_recv(acc, &afu_t_rx[0], 64)
+            if rs != 3 or afu_t_rx[0] != 65 or afu_t_rx[2] != 67:
+                _afu_t_fail("stream recv c->s")
+                ok = 0
+            # accepted server -> client
+            afu_t_tx[0] = 88    # 'X'
+            if _afu_t_send(acc, &afu_t_tx[0], 1) != 1:
+                _afu_t_fail("stream send s->c")
+                ok = 0
+            rc2: int64 = _afu_t_recv(cli, &afu_t_rx[0], 64)
+            if rc2 != 1 or afu_t_rx[0] != 88:
+                _afu_t_fail("stream recv s->c")
+                ok = 0
+            # close the accepted server end -> client read sees EOF
+            afunix_close(acc)
+            eofr: int64 = _afu_t_recv(cli, &afu_t_rx[0], 64)
+            if eofr != 0:
+                _afu_t_fail("stream EOF after peer close")
+                ok = 0
+        afunix_close(cli)
+        afunix_close(srv)
+
+    # --- 3) abstract-namespace bind + connect -----------------------
+    if ok == 1:
+        asrv: int32 = afunix_socket(AFU_SOCK_STREAM)
+        anm: Ptr[uint8] = "abstract-ep"
+        aal: int32 = _afu_t_build_abstract(anm, 11)
+        if _afu_t_kbind(asrv) != 0:
+            _afu_t_fail("abstract bind")
+            ok = 0
+        if afunix_listen(asrv, 5) != 0:
+            _afu_t_fail("abstract listen")
+            ok = 0
+        # A pathname socket with the SAME bytes must NOT match (the
+        # abstract flag distinguishes them) -> ECONNREFUSED.
+        pcli: int32 = afunix_socket(AFU_SOCK_STREAM)
+        ppl: int32 = _afu_t_build_path(anm, 11)
+        if _afu_t_kconnect(pcli) != AFU_ECONNREFUSED:
+            _afu_t_fail("abstract/path namespace isolation")
+            ok = 0
+        afunix_close(pcli)
+        # The matching abstract connect succeeds.
+        acli: int32 = afunix_socket(AFU_SOCK_STREAM)
+        aal2: int32 = _afu_t_build_abstract(anm, 11)
+        if _afu_t_kconnect(acli) != 0:
+            _afu_t_fail("abstract connect")
+            ok = 0
+        if afunix_accept_ready(asrv) != 1:
+            _afu_t_fail("abstract accept not ready")
+            ok = 0
+        aacc: int32 = afunix_accept_take(asrv)
+        if aacc < 0:
+            _afu_t_fail("abstract accept take")
+            ok = 0
+        afunix_close(acli)
+        afunix_close(asrv)
+
+    # --- 4) ECONNREFUSED with no listener ---------------------------
+    if ok == 1:
+        ncli: int32 = afunix_socket(AFU_SOCK_STREAM)
+        nnm: Ptr[uint8] = "/tmp/nobody-here.sock"
+        nal: int32 = _afu_t_build_path(nnm, 21)
+        if _afu_t_kconnect(ncli) != AFU_ECONNREFUSED:
+            _afu_t_fail("connect to no listener should be ECONNREFUSED")
+            ok = 0
+        afunix_close(ncli)
+
+    # --- 5) EADDRINUSE on double bind -------------------------------
+    if ok == 1:
+        b1: int32 = afunix_socket(AFU_SOCK_STREAM)
+        bnm: Ptr[uint8] = "/tmp/dup.sock"
+        bal: int32 = _afu_t_build_path(bnm, 13)
+        if _afu_t_kbind(b1) != 0:
+            _afu_t_fail("first bind")
+            ok = 0
+        b2: int32 = afunix_socket(AFU_SOCK_STREAM)
+        bal2: int32 = _afu_t_build_path(bnm, 13)
+        if _afu_t_kbind(b2) != AFU_EADDRINUSE:
+            _afu_t_fail("double bind should be EADDRINUSE")
+            ok = 0
+        afunix_close(b1)
+        afunix_close(b2)
+
+    # --- 6) SOCK_DGRAM sendto/recvfrom by name ----------------------
+    if ok == 1:
+        dsrv: int32 = afunix_socket(AFU_SOCK_DGRAM)
+        dnm: Ptr[uint8] = "/tmp/dgram.sock"
+        dal: int32 = _afu_t_build_path(dnm, 15)
+        if _afu_t_kbind(dsrv) != 0:
+            _afu_t_fail("dgram bind")
+            ok = 0
+        # Deliver a datagram directly into the bound endpoint's queue
+        # (kernel-direct path; the syscall arm copies user bytes first).
+        afu_t_tx[0] = 0xDE
+        afu_t_tx[1] = 0xAD
+        afu_t_tx[2] = 0xBE
+        afu_t_tx[3] = 0xEF
+        if _afu_dgq_push(dsrv, &afu_t_tx[0], 4) != 4:
+            _afu_t_fail("dgram enqueue")
+            ok = 0
+        if afunix_dgram_can_read(dsrv) != 1:
+            _afu_t_fail("dgram readiness")
+            ok = 0
+        dn: int64 = _afu_dgq_pop(dsrv, &afu_t_rx[0], 64)
+        if dn != 4 or afu_t_rx[0] != 0xDE or afu_t_rx[3] != 0xEF:
+            _afu_t_fail("dgram dequeue")
+            ok = 0
+        # Empty queue now -> EAGAIN.
+        dn2: int64 = _afu_dgq_pop(dsrv, &afu_t_rx[0], 64)
+        if dn2 != AFU_EAGAIN:
+            _afu_t_fail("dgram empty should be EAGAIN")
+            ok = 0
+        afunix_close(dsrv)
+
+    if ok == 1:
+        printk0("[afunix] PASS\n")
+    else:
+        printk0("[afunix] FAIL\n")

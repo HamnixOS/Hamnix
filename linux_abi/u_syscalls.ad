@@ -185,6 +185,22 @@ from linux_abi.u_memfd import (
     umemfd_create, umemfd_add_seals, umemfd_get_seals,
     F_ADD_SEALS_CMD, F_GET_SEALS_CMD,
 )
+# AF_UNIX (local) domain sockets — the self-contained in-kernel byte
+# conduit family. socket()/bind/listen/connect/accept/send/recv/
+# socketpair on an AF_UNIX fd route here instead of the AF_INET TCP/UDP
+# bridge; the fd is still an FD_SOCKET_MARK fd but its fd_buf carries an
+# AF_UNIX tag (afunix_fdbuf_for_ep) the fs/vfs.ad FD_SOCKET_MARK arms
+# treat as "no usock record" and ignore, while the read/write/close
+# syscall bodies below intercept it first.
+from linux_abi.u_unixsock import (
+    afunix_socket, afunix_bind, afunix_listen, afunix_connect,
+    afunix_accept_ready, afunix_accept_take,
+    afunix_send_stream, afunix_recv_stream, afunix_can_read,
+    afunix_sendto, afunix_recvfrom, afunix_dgram_can_read,
+    afunix_socketpair, afunix_close, afunix_get_type,
+    afunix_fdbuf_for_ep, afunix_ep_for_fdbuf,
+    AFU_AF_UNIX, AFU_SOCK_STREAM, AFU_SOCK_DGRAM, AFU_EAGAIN,
+)
 # U-socket: socket(2)/connect(2) on a real TCP connection. The TCP
 # stack itself is drivers/net/tcp.ad; fs/socket_state.ad is the per-
 # socket-fd backing-record store shared with fs/vfs.ad's read/write/
@@ -1174,6 +1190,28 @@ def _u_read_body(a0: uint64, a1: uint64, a2: uint64,
     fd: int32 = cast[int32](a0)
     marker: uint32 = vfs_fd_marker(fd)
     nonblock: int32 = _u_fd_is_nonblock(fd)
+    # AF_UNIX: a unix-socket fd's read(2) drains its in-kernel conduit
+    # (stream ring or datagram queue), NOT the vfs socket arms. Intercept
+    # before any vfs routing.
+    rd_uxep: int32 = _u_afunix_ep(fd)
+    if rd_uxep >= 0:
+        if afunix_get_type(rd_uxep) == AFU_SOCK_DGRAM:
+            rd_dn: int64 = afunix_recvfrom(rd_uxep, a1, a2)
+            if rd_dn == AFU_EAGAIN:
+                if nonblock != 0:
+                    return AFU_EAGAIN
+                while rd_dn == AFU_EAGAIN:
+                    yield_to_others()
+                    rd_dn = afunix_recvfrom(rd_uxep, a1, a2)
+            return rd_dn
+        rd_sn: int64 = afunix_recv_stream(rd_uxep, a1, a2)
+        if rd_sn == AFU_EAGAIN:
+            if nonblock != 0:
+                return AFU_EAGAIN
+            while rd_sn == AFU_EAGAIN:
+                yield_to_others()
+                rd_sn = afunix_recv_stream(rd_uxep, a1, a2)
+        return rd_sn
     # A pidfd carries no readable byte stream — Linux read(2) on a pidfd
     # returns EINVAL. It is poll-only (process-exit readiness) and is
     # drained via waitid(P_PIDFD), not read().
@@ -1280,6 +1318,27 @@ def _u_write_body(a0: uint64, a1: uint64, a2: uint64,
     # copy_from_user needs a chunked kernel bounce buffer in every vfs
     # write backend — deferred. access_ok range-checks a1 at the gate.
     fd: int32 = cast[int32](a0)
+    # AF_UNIX: a unix-socket fd's write(2) pushes into the peer's conduit
+    # (stream ring) or delivers one datagram to the connected peer.
+    # Intercept before any vfs routing.
+    wr_uxep: int32 = _u_afunix_ep(fd)
+    if wr_uxep >= 0:
+        wr_nb: int32 = _u_fd_is_nonblock(fd)
+        if afunix_get_type(wr_uxep) == AFU_SOCK_DGRAM:
+            # write(2) on a DGRAM socket targets the connected peer.
+            return afunix_sendto(wr_uxep, a1, a2, 0, 0)
+        wr_sn: int64 = afunix_send_stream(wr_uxep, a1, a2)
+        if wr_sn == AFU_EAGAIN:
+            if wr_nb != 0:
+                if a2 != 0:
+                    return AFU_EAGAIN
+                return 0
+            while wr_sn == AFU_EAGAIN:
+                yield_to_others()
+                wr_sn = afunix_send_stream(wr_uxep, a1, a2)
+        if wr_sn == ELINUX_PIPE:
+            signal_post(current_idx_get(), SIGPIPE)
+        return wr_sn
     n: int64 = 0
     if _u_fd_is_nonblock(fd) != 0:
         n = vfs_write_nb(fd, cast[Ptr[uint8]](a1), a2)
@@ -1353,6 +1412,12 @@ def _u_close(a0: uint64, a1: uint64, a2: uint64,
     # O_NONBLOCK clear above).
     if vfs_fd_marker(cast[int32](a0)) == FD_PIDFD_MARK:
         upidfd_clear(current_idx_get(), cast[int32](a0))
+    # AF_UNIX: release the in-kernel endpoint (latches the peer's
+    # EOF/EPIPE) before the fd slot is recycled — fs/vfs.ad has never
+    # heard of the AF_UNIX tag, so it cannot drop the endpoint.
+    cl_uxep: int32 = _u_afunix_ep(cast[int32](a0))
+    if cl_uxep >= 0:
+        afunix_close(cl_uxep)
     rc: int32 = vfs_close(cast[int32](a0))
     return cast[int64](rc)
 
@@ -2617,6 +2682,16 @@ def _u_net_ctl_errno(rc: int32) -> int64:
     return ELINUX_CONNREFUSED
 
 
+# AF_UNIX fd recogniser: returns the AF_UNIX endpoint slot backing a
+# socket fd, or -1 if the fd is not an AF_UNIX socket. An AF_UNIX fd is a
+# FD_SOCKET_MARK fd whose fd_buf carries the AFU_FDBUF_TAG; afunix_ep_for_
+# fdbuf decodes + validates it.
+def _u_afunix_ep(fd: int32) -> int32:
+    if vfs_fd_is_socket(fd) == 0:
+        return -1
+    return afunix_ep_for_fdbuf(vfs_socket_fd_get_record(fd))
+
+
 def _u_socket(a0: uint64, a1: uint64, a2: uint64,
               a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int socket(int domain, int type, int protocol)
@@ -2638,8 +2713,31 @@ def _u_socket(a0: uint64, a1: uint64, a2: uint64,
     if (cast[uint64](sock_type) & O_NONBLOCK_BIT) != 0:
         sock_nonblock = 1
     sock_type = sock_type & 0xFF
+    if domain == AFU_AF_UNIX:
+        # AF_UNIX (local) domain socket. Allocate an in-kernel endpoint
+        # in linux_abi/u_unixsock.ad, then a real FD_SOCKET_MARK fd whose
+        # fd_buf carries the AF_UNIX tag (so read/write/close intercept
+        # it here and the fs/vfs.ad arms ignore it). SOCK_STREAM and
+        # SOCK_DGRAM are both supported.
+        uep: int32 = afunix_socket(sock_type)
+        if uep < 0:
+            set_current_errstr("socket: AF_UNIX endpoint pool exhausted")
+            return cast[int64](uep)
+        ufd: int32 = vfs_alloc_socket_fd()
+        if ufd < 0:
+            afunix_close(uep)
+            set_current_errstr("socket: out of fd slots")
+            return cast[int64](ufd)
+        if vfs_socket_fd_set_record(ufd, afunix_fdbuf_for_ep(uep)) != 0:
+            afunix_close(uep)
+            vfs_close(ufd)
+            set_current_errstr("socket: AF_UNIX fd record bind failed")
+            return ELINUX_BADF
+        if sock_nonblock != 0:
+            _u_set_fd_nonblock(ufd, 1)
+        return cast[int64](ufd)
     if domain != USOCK_AF_INET:
-        # Only AF_INET — AF_UNIX / AF_INET6 not supported.
+        # Only AF_INET — AF_INET6 not supported.
         set_current_errstr("socket: address family not supported")
         return ELINUX_AFNOSUPPORT
     if sock_type != USOCK_SOCK_STREAM:
@@ -2707,6 +2805,11 @@ def _u_connect(a0: uint64, a1: uint64, a2: uint64,
     #   offset 4  : uint32  sin_addr     (network / big-endian IPv4)
     #   offset 8  : uint8[8] sin_zero    (padding)
     fd: int32 = cast[int32](a0)
+    # AF_UNIX: rendezvous with a listening server by name (STREAM) or
+    # record the default datagram peer (DGRAM).
+    uxep: int32 = _u_afunix_ep(fd)
+    if uxep >= 0:
+        return afunix_connect(uxep, a1, cast[int32](a2))
     if vfs_fd_is_socket(fd) == 0:
         return ELINUX_BADF
     rec: int32 = usock_record_for_fdbuf(vfs_socket_fd_get_record(fd))
@@ -2938,6 +3041,41 @@ def _u_accept(a0: uint64, a1: uint64, a2: uint64,
     # honoured (Linux allows it). V1 is BLOCKING only — no O_NONBLOCK
     # / accept4 SOCK_NONBLOCK fast path (see the V1 backlog).
     fd: int32 = cast[int32](a0)
+    # AF_UNIX: pop a pending connection off the listener's accept queue.
+    # Blocking accept yields until a client connect() rendezvouses; a
+    # non-blocking fd returns -EAGAIN on an empty queue.
+    uxep: int32 = _u_afunix_ep(fd)
+    if uxep >= 0:
+        uxnb: int32 = _u_fd_is_nonblock(fd)
+        usrv: int32 = afunix_accept_take(uxep)
+        if usrv == cast[int32](AFU_EAGAIN):
+            if uxnb != 0:
+                return AFU_EAGAIN
+            # Bounded cooperative block: yield until a connection lands.
+            while usrv == cast[int32](AFU_EAGAIN):
+                yield_to_others()
+                usrv = afunix_accept_take(uxep)
+        if usrv < 0:
+            return cast[int64](usrv)
+        # Install a fresh socket fd for the accepted server endpoint.
+        nufd: int32 = vfs_alloc_socket_fd()
+        if nufd < 0:
+            afunix_close(usrv)
+            set_current_errstr("accept: out of fd slots")
+            return ELINUX_MFILE
+        if vfs_socket_fd_set_record(nufd, afunix_fdbuf_for_ep(usrv)) != 0:
+            afunix_close(usrv)
+            vfs_close(nufd)
+            return ELINUX_BADF
+        # Peer sockaddr_un out-param: AF_UNIX accepted peers are unnamed,
+        # so report an addrlen of 2 (family only) when a buffer is given.
+        if a1 != 0:
+            ua: Ptr[uint8] = cast[Ptr[uint8]](a1)
+            ua[0] = cast[uint8](AFU_AF_UNIX & 0xFF)
+            ua[1] = cast[uint8]((AFU_AF_UNIX >> 8) & 0xFF)
+        if a2 != 0:
+            cast[Ptr[uint32]](a2)[0] = 2
+        return cast[int64](nufd)
     if vfs_fd_is_socket(fd) == 0:
         return ELINUX_BADF
     rec: int32 = usock_record_for_fdbuf(vfs_socket_fd_get_record(fd))
@@ -3052,6 +3190,10 @@ def _u_bind(a0: uint64, a1: uint64, a2: uint64,
     #   offset 4 : uint32 sin_addr    (network / big-endian IPv4)
     #   offset 8 : uint8[8] sin_zero  (padding)
     fd: int32 = cast[int32](a0)
+    # AF_UNIX: register the endpoint's name in the rendezvous table.
+    uxep: int32 = _u_afunix_ep(fd)
+    if uxep >= 0:
+        return afunix_bind(uxep, a1, cast[int32](a2))
     if vfs_fd_is_socket(fd) == 0:
         return ELINUX_BADF
     rec: int32 = usock_record_for_fdbuf(vfs_socket_fd_get_record(fd))
@@ -3136,6 +3278,10 @@ def _u_listen(a0: uint64, a1: uint64, a2: uint64,
     # queue depth is fixed by TCP_NUM_SLOTS, so we don't honour it
     # beyond what tcp_accept already provides (see V1 backlog).
     fd: int32 = cast[int32](a0)
+    # AF_UNIX: mark a bound STREAM endpoint passive.
+    uxep: int32 = _u_afunix_ep(fd)
+    if uxep >= 0:
+        return afunix_listen(uxep, cast[int32](a1))
     if vfs_fd_is_socket(fd) == 0:
         return ELINUX_BADF
     rec: int32 = usock_record_for_fdbuf(vfs_socket_fd_get_record(fd))
@@ -3301,11 +3447,65 @@ def _u_getsockopt(a0: uint64, a1: uint64, a2: uint64,
 def _u_socketpair(a0: uint64, a1: uint64, a2: uint64,
                   a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int socketpair(int domain, int type, int protocol, int sv[2])
-    # Forward to vfs_pipe — busybox sh uses socketpair for AF_UNIX
-    # SOCK_STREAM bidirectional IPC, which a kernel pipe pair models
-    # cleanly enough (the pair is full-duplex from the caller's POV).
+    #
+    # AF_UNIX: allocate a PRE-CONNECTED pair of AF_UNIX endpoints (the
+    # most common AF_UNIX use), each backed by a real FD_SOCKET_MARK fd
+    # whose fd_buf carries the AF_UNIX tag. The pair is a bidirectional
+    # in-kernel byte conduit (STREAM) or two datagram queues (DGRAM) —
+    # full-duplex from the caller's POV. SOCK_CLOEXEC/SOCK_NONBLOCK ride
+    # in the high bits of `type` and are applied to both fds.
     if a3 == 0:
         return ELINUX_INVAL
+    domain: uint32 = cast[uint32](a0)
+    if domain == AFU_AF_UNIX:
+        st: uint32 = cast[uint32](a1)
+        sp_nb: int32 = 0
+        if (cast[uint64](st) & O_NONBLOCK_BIT) != 0:
+            sp_nb = 1
+        st = st & 0xFF
+        ep_a: int32 = 0
+        ep_b: int32 = 0
+        prc: int64 = afunix_socketpair(st, &ep_a, &ep_b)
+        if prc != 0:
+            return prc
+        fda: int32 = vfs_alloc_socket_fd()
+        if fda < 0:
+            afunix_close(ep_a)
+            afunix_close(ep_b)
+            return ELINUX_MFILE
+        if vfs_socket_fd_set_record(fda, afunix_fdbuf_for_ep(ep_a)) != 0:
+            afunix_close(ep_a)
+            afunix_close(ep_b)
+            vfs_close(fda)
+            return ELINUX_BADF
+        fdb: int32 = vfs_alloc_socket_fd()
+        if fdb < 0:
+            vfs_close(fda)
+            afunix_close(ep_a)
+            afunix_close(ep_b)
+            return ELINUX_MFILE
+        if vfs_socket_fd_set_record(fdb, afunix_fdbuf_for_ep(ep_b)) != 0:
+            vfs_close(fda)
+            vfs_close(fdb)
+            afunix_close(ep_a)
+            afunix_close(ep_b)
+            return ELINUX_BADF
+        if sp_nb != 0:
+            _u_set_fd_nonblock(fda, 1)
+            _u_set_fd_nonblock(fdb, 1)
+        # Write the int[2] result out via copy_to_user (translated transfer).
+        sv: Array[2, int32]
+        sv[0] = fda
+        sv[1] = fdb
+        if copy_to_user(a3, cast[uint64](&sv[0]), 8) != 0:
+            vfs_close(fda)
+            vfs_close(fdb)
+            afunix_close(ep_a)
+            afunix_close(ep_b)
+            return ELINUX_EFAULT
+        return 0
+    # AF_INET / other: forward to vfs_pipe — a kernel pipe pair models a
+    # bidirectional fd pair cleanly enough for the legacy probe path.
     rc: int32 = vfs_pipe(cast[Ptr[int32]](a3))
     return cast[int64](rc)
 
@@ -3323,6 +3523,23 @@ def _u_sendto(a0: uint64, a1: uint64, a2: uint64,
     # NULL dest_addr requires the socket to have been connect(2)'d (the
     # fixed peer is used). `flags` (MSG_DONTWAIT etc.) are ignored.
     fd: int32 = cast[int32](a0)
+    # AF_UNIX: a DGRAM endpoint delivers one datagram by name (or to its
+    # connected peer); a STREAM endpoint degrades to write(2).
+    uxep: int32 = _u_afunix_ep(fd)
+    if uxep >= 0:
+        if afunix_get_type(uxep) == AFU_SOCK_DGRAM:
+            return afunix_sendto(uxep, a1, a2, a4, cast[int32](a5))
+        usn: int64 = afunix_send_stream(uxep, a1, a2)
+        if usn == AFU_EAGAIN:
+            if _u_fd_is_nonblock(fd) != 0:
+                return AFU_EAGAIN
+            # Blocking stream send: yield until the peer drains its ring.
+            while usn == AFU_EAGAIN:
+                yield_to_others()
+                usn = afunix_send_stream(uxep, a1, a2)
+        if usn == ELINUX_PIPE:
+            signal_post(current_idx_get(), SIGPIPE)
+        return usn
     if vfs_fd_is_socket(fd) == 0:
         return ELINUX_BADF
     rec: int32 = usock_record_for_fdbuf(vfs_socket_fd_get_record(fd))
@@ -3387,6 +3604,30 @@ def _u_recvfrom(a0: uint64, a1: uint64, a2: uint64,
     # fill it with the datagram's source (sockaddr_in) and set *addrlen
     # to 16. `flags` are ignored.
     fd: int32 = cast[int32](a0)
+    # AF_UNIX: a DGRAM endpoint dequeues one datagram; a STREAM endpoint
+    # degrades to read(2).
+    uxep: int32 = _u_afunix_ep(fd)
+    if uxep >= 0:
+        if afunix_get_type(uxep) == AFU_SOCK_DGRAM:
+            uxnb: int32 = _u_fd_is_nonblock(fd)
+            urn: int64 = afunix_recvfrom(uxep, a1, a2)
+            if urn == AFU_EAGAIN:
+                if uxnb != 0:
+                    return AFU_EAGAIN
+                while urn == AFU_EAGAIN:
+                    yield_to_others()
+                    urn = afunix_recvfrom(uxep, a1, a2)
+            # AF_UNIX datagrams carry no useful src name here; zero the
+            # caller's addrlen so it reads no uninitialised bytes.
+            if a4 != 0:
+                if a5 != 0:
+                    cast[Ptr[uint32]](a5)[0] = 0
+            return urn
+        # STREAM recvfrom degrades to read(2) — route via _u_read.
+        if a4 != 0:
+            if a5 != 0:
+                cast[Ptr[uint32]](a5)[0] = 0
+        return _u_read(a0, a1, a2, 0, 0, 0)
     if vfs_fd_is_socket(fd) == 0:
         return ELINUX_BADF
     rec: int32 = usock_record_for_fdbuf(vfs_socket_fd_get_record(fd))

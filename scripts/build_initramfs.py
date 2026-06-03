@@ -501,6 +501,12 @@ if os.environ.get("ENABLE_SYSVIPC_TEST") == "1":
 if os.environ.get("ENABLE_MQUEUE_TEST") == "1":
     FILES.append(("/etc/mqueue-test", b"1\n"))
 
+# AF_UNIX (local) domain socket self-test. scripts/test_afunix.sh sets
+# ENABLE_AFUNIX_TEST=1 to plant /etc/afunix-test; init/main.ad at
+# boot:37.afunix detects the marker and runs afunix_selftest().
+if os.environ.get("ENABLE_AFUNIX_TEST") == "1":
+    FILES.append(("/etc/afunix-test", b"1\n"))
+
 # pidfd process-management family (pidfd_open/pidfd_send_signal/waitid)
 # self-test. scripts/test_pidfd.sh sets ENABLE_PIDFD_TEST=1 to plant
 # /etc/pidfd-test; init/main.ad at boot:37.pidfd detects the marker and
