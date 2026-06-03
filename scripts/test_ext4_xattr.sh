@@ -1,13 +1,21 @@
 #!/usr/bin/env bash
 # scripts/test_ext4_xattr.sh — ext4 extended attributes (xattr) + POSIX ACL.
 #
-# Proves the ext4 xattr path: the in-kernel ext4_xattr_selftest() (gated on
-# the cpio marker /etc/ext4xattr-test) sets a "user." attribute on a live
-# ext4 inode, reads it back (in-inode region, magic 0xEA020000 at
-# 128 + i_extra_isize), lists it, and decodes a POSIX ACL value. The
-# selftest does all the work, so the host only attaches a plain empty ext4
-# scratch disk on virtio (default inode_size 256 leaves room for in-inode
-# xattrs).
+# Proves the ext4 xattr path end-to-end: the in-kernel ext4_xattr_selftest()
+# (gated on the cpio marker /etc/ext4xattr-test) on a live ext4 inode:
+#   * sets two "user." attributes in the in-inode region (magic 0xEA020000
+#     at 128 + i_extra_isize), gets them back byte-exact, lists them;
+#   * replaces one, asserts the other survives;
+#   * sets a 600-byte "user.big" value that does NOT fit the inode slack,
+#     forcing allocation of a fresh external i_file_acl block, then reads
+#     it back byte-exact (and confirms the in-inode attrs still resolve);
+#   * removes the in-inode "user.size" and confirms it is gone while the
+#     inline + external survivors remain;
+#   * stores a system.posix_acl_access blob, reads it back byte-exact, and
+#     re-checks the access decision on the round-tripped blob.
+# The selftest does all the work, so the host only attaches a plain empty
+# ext4 scratch disk on virtio (inode_size 256 leaves room for in-inode
+# xattrs; the external-block path is exercised by the oversized value).
 #
 # Boot path: a raw 64-bit Hamnix ELF will NOT boot under `qemu -kernel` on
 # this host; the _kernel_iso.sh PATH shim (sourced by _build_lock.sh)

@@ -8203,20 +8203,418 @@ def _ext4_xattr_emit(stage_base: uint64, e_cur: Ptr[uint64],
 def ext4_setxattr(inum: uint32, name: Ptr[char], value: Ptr[uint8],
                   value_len: uint64, flags: int32) -> int32:
     # Persisting setxattr for an on-disk inode. Reads the inode, inserts/
-    # replaces the attribute in the in-inode region, stamps ctime, and
-    # writes the inode back. Returns 0 or a negative errno.
+    # replaces the attribute. The in-inode region is preferred (no extra
+    # block I/O); when the value won't fit the inode slack we spill the
+    # attribute to the external i_file_acl block (allocating a fresh fs
+    # block the first time). Stamps ctime and writes the inode back.
+    # Returns 0 or a negative errno.
+    NEG_ENOSPC: int32 = -28
     if ext4_blockdev_slot < 0:
         return -1
     if ext4_read_inode(cast[uint64](inum),
                        &ext4_xattr_inode_buf[0]) != 0:
         return -1
+    name_len: uint64 = _ext4_strlen(name)
+    suffix_off: uint64 = 0
+    idx: uint8 = _ext4_xattr_classify(name, name_len, &suffix_off)
+    if idx == 0:
+        return -95                              # -EOPNOTSUPP
+    suffix_len: uint64 = name_len - suffix_off
+    suffix_ptr: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](name)
+                                              + suffix_off)
+
+    # A replace/create must not duplicate: if the attribute already lives
+    # in the OTHER location we must honour CREATE/REPLACE flags against
+    # the global view and remove the stale copy after writing the new one.
+    in_inode: int32 = _ext4_xattr_present_inode(&ext4_xattr_inode_buf[0],
+                                                idx, suffix_ptr, suffix_len)
+    in_ext: int32 = _ext4_xattr_present_external(&ext4_xattr_inode_buf[0],
+                                                 idx, suffix_ptr, suffix_len)
+    if flags == 1 and (in_inode != 0 or in_ext != 0):
+        return -17                              # -EEXIST
+    if flags == 2 and in_inode == 0 and in_ext == 0:
+        return -61                              # -ENODATA
+
+    # Try the in-inode region first (flags forced to 0 here; the
+    # CREATE/REPLACE pre-check above already enforced existence rules
+    # across BOTH locations).
     rc: int32 = _ext4_setxattr_inode(&ext4_xattr_inode_buf[0], name,
-                                     value, value_len, flags)
-    if rc != 0:
-        return rc
+                                     value, value_len, 0)
+    placed_inode: int32 = 0
+    if rc == 0:
+        placed_inode = 1
+    else:
+        if rc != NEG_ENOSPC:
+            return rc
+        # Inline is full / value too big — store externally.
+        rc = _ext4_setxattr_external(&ext4_xattr_inode_buf[0], idx,
+                                     suffix_ptr, suffix_len,
+                                     value, value_len)
+        if rc != 0:
+            return rc
+
+    # If a stale copy exists in the location we did NOT just write, drop
+    # it so getxattr/listxattr see exactly one entry.
+    if placed_inode != 0 and in_ext != 0:
+        _ext4_removexattr_external(&ext4_xattr_inode_buf[0], idx,
+                                   suffix_ptr, suffix_len)
+    if placed_inode == 0 and in_inode != 0:
+        _ext4_removexattr_inode(&ext4_xattr_inode_buf[0], idx,
+                                suffix_ptr, suffix_len)
+
     _ext4_stamp_mtime(&ext4_xattr_inode_buf[0])
     if ext4_write_inode(cast[uint64](inum),
                         &ext4_xattr_inode_buf[0]) != 0:
+        return -1
+    return 0
+
+
+def _ext4_xattr_present_inode(inode_buf: Ptr[uint8], idx: uint8,
+                              suffix: Ptr[uint8],
+                              suffix_len: uint64) -> int32:
+    # 1 if (idx,suffix) is present in the in-inode region, else 0.
+    ent: uint64 = 0
+    vb:  uint64 = 0
+    en:  uint64 = 0
+    if _ext4_xattr_inode_region(inode_buf, &ent, &vb, &en) == 0:
+        return 0
+    return _ext4_xattr_entry_present(ent, en, idx, suffix, suffix_len)
+
+
+def _ext4_xattr_present_external(inode_buf: Ptr[uint8], idx: uint8,
+                                 suffix: Ptr[uint8],
+                                 suffix_len: uint64) -> int32:
+    # 1 if (idx,suffix) is present in the external i_file_acl block.
+    facl: uint32 = _ext4_read_u32(
+        cast[Ptr[uint8]](cast[uint64](inode_buf) + INODE_I_FILE_ACL_OFFSET))
+    if facl == 0:
+        return 0
+    if _ext4_read_block(cast[uint64](facl), &ext4_xattr_blk_buf[0]) != 0:
+        return 0
+    base: uint64 = cast[uint64](&ext4_xattr_blk_buf[0])
+    if _ext4_read_u32(cast[Ptr[uint8]](base)) != EXT4_XATTR_MAGIC:
+        return 0
+    return _ext4_xattr_entry_present(base + EXT4_XATTR_HDR_LEN,
+                                     base + ext4_block_size,
+                                     idx, suffix, suffix_len)
+
+
+def _ext4_xattr_entry_present(entries_base: uint64, region_end: uint64,
+                              idx: uint8, suffix: Ptr[uint8],
+                              suffix_len: uint64) -> int32:
+    # Scan one entry array for (idx,suffix). Returns 1 if present.
+    p: uint64 = entries_base
+    while p + EXT4_XATTR_ENTRY_HDR <= region_end:
+        ep: Ptr[uint8] = cast[Ptr[uint8]](p)
+        if ep[0] == 0 and ep[1] == 0:
+            return 0
+        if ep[0] == cast[uint8](suffix_len) and ep[1] == idx:
+            nm: Ptr[uint8] = cast[Ptr[uint8]](p + EXT4_XATTR_ENTRY_HDR)
+            if _ext4_mem_eq(nm, suffix, suffix_len) != 0:
+                return 1
+        p = p + _ext4_xattr_align4(
+            EXT4_XATTR_ENTRY_HDR + cast[uint64](ep[0]))
+    return 0
+
+
+# --- external xattr block (i_file_acl) write path -----------------
+#
+# A second staging buffer for rebuilding the external block. The on-disk
+# block layout is: 32-byte header, then entries packing UP from offset
+# 32, with values packing DOWN from the end of the block. e_value_offs
+# in the external block is measured from the START of the block (unlike
+# the in-inode case, which measures from the entries area).
+ext4_xattr_ext_stage: Array[4096, uint8]
+
+
+def _ext4_setxattr_external(inode_buf: Ptr[uint8], new_idx: uint8,
+                            new_suffix: Ptr[uint8], new_suffix_len: uint64,
+                            new_value: Ptr[uint8],
+                            new_value_len: uint64) -> int32:
+    # Insert-or-replace (new_idx,new_suffix) in the external xattr block.
+    # Allocates a fresh fs block the first time (i_file_acl == 0). Builds
+    # the new block image in ext4_xattr_ext_stage, then journals it to
+    # disk. Updates i_file_acl in inode_buf (caller writes the inode).
+    # Returns 0 or -ENOSPC.
+    NEG_ENOSPC: int32 = -28
+    facl: uint32 = _ext4_read_u32(
+        cast[Ptr[uint8]](cast[uint64](inode_buf) + INODE_I_FILE_ACL_OFFSET))
+
+    # Source of existing entries: the live block if one exists.
+    have_src: int32 = 0
+    if facl != 0:
+        if _ext4_read_block(cast[uint64](facl),
+                            &ext4_xattr_blk_buf[0]) == 0:
+            sb_base: uint64 = cast[uint64](&ext4_xattr_blk_buf[0])
+            if _ext4_read_u32(cast[Ptr[uint8]](sb_base)) == EXT4_XATTR_MAGIC:
+                have_src = 1
+
+    # Build the new block image from scratch in the stage buffer.
+    stage: uint64 = cast[uint64](&ext4_xattr_ext_stage[0])
+    _ext4_zero(&ext4_xattr_ext_stage[0], ext4_block_size)
+    # Header: h_magic, h_refcount=1, h_blocks=1, rest 0.
+    _ext4_write_u32(cast[Ptr[uint8]](stage), EXT4_XATTR_MAGIC)
+    _ext4_write_u32(cast[Ptr[uint8]](stage + 4), 1)        # h_refcount
+    _ext4_write_u32(cast[Ptr[uint8]](stage + 8), 1)        # h_blocks
+    e_cur: uint64 = EXT4_XATTR_HDR_LEN                     # entry cursor
+    v_cur: uint64 = ext4_block_size                        # value cursor
+
+    # Copy existing entries (except the target), then append the target.
+    if have_src != 0:
+        src_base: uint64 = cast[uint64](&ext4_xattr_blk_buf[0])
+        p: uint64 = src_base + EXT4_XATTR_HDR_LEN
+        send: uint64 = src_base + ext4_block_size
+        while p + EXT4_XATTR_ENTRY_HDR <= send:
+            ep: Ptr[uint8] = cast[Ptr[uint8]](p)
+            nlen: uint8 = ep[0]
+            nidx: uint8 = ep[1]
+            if nlen == 0 and nidx == 0:
+                break
+            skip: int32 = 0
+            if nlen == cast[uint8](new_suffix_len) and nidx == new_idx:
+                nm: Ptr[uint8] = cast[Ptr[uint8]](p + EXT4_XATTR_ENTRY_HDR)
+                if _ext4_mem_eq(nm, new_suffix, new_suffix_len) != 0:
+                    skip = 1
+            if skip == 0:
+                voffs: uint16 = _ext4_read_u16(cast[Ptr[uint8]](p + 0x02))
+                vsize: uint32 = _ext4_read_u32(cast[Ptr[uint8]](p + 0x08))
+                vsrc: uint64 = src_base + cast[uint64](voffs)
+                rc: int32 = _ext4_xattr_emit_ext(
+                    stage, &e_cur, &v_cur, nidx,
+                    cast[Ptr[uint8]](p + EXT4_XATTR_ENTRY_HDR),
+                    cast[uint64](nlen),
+                    cast[Ptr[uint8]](vsrc), cast[uint64](vsize))
+                if rc != 0:
+                    return NEG_ENOSPC
+            p = p + _ext4_xattr_align4(
+                EXT4_XATTR_ENTRY_HDR + cast[uint64](nlen))
+
+    # Append the new/replacement attribute.
+    rc2: int32 = _ext4_xattr_emit_ext(stage, &e_cur, &v_cur, new_idx,
+                                      new_suffix, new_suffix_len,
+                                      new_value, new_value_len)
+    if rc2 != 0:
+        return NEG_ENOSPC
+    # Terminating zero entry must fit (stage already zeroed).
+    if e_cur + 4 > v_cur:
+        return NEG_ENOSPC
+
+    # Allocate a block on first use.
+    blk: uint32 = facl
+    if blk == 0:
+        nb: uint64 = ext4_alloc_block()
+        if nb == 0:
+            return NEG_ENOSPC
+        blk = cast[uint32](nb)
+    # Persist the block (metadata -> journal path).
+    if _ext4_journal_write_block(cast[uint64](blk),
+                                 &ext4_xattr_ext_stage[0]) != 0:
+        if facl == 0:
+            ext4_free_block(cast[uint64](blk))
+        return -1
+    _ext4_write_u32(
+        cast[Ptr[uint8]](cast[uint64](inode_buf) + INODE_I_FILE_ACL_OFFSET),
+        blk)
+    return 0
+
+
+def _ext4_xattr_emit_ext(stage_base: uint64, e_cur: Ptr[uint64],
+                         v_cur: Ptr[uint64], idx: uint8,
+                         suffix: Ptr[uint8], suffix_len: uint64,
+                         value: Ptr[uint8], value_len: uint64) -> int32:
+    # Append one attribute to the external-block stage. Entries pack up
+    # from EXT4_XATTR_HDR_LEN, values pack down from ext4_block_size.
+    # e_value_offs is stored relative to the START of the block. Returns
+    # 0 or -1 on overflow.
+    entry_sz: uint64 = _ext4_xattr_align4(
+        EXT4_XATTR_ENTRY_HDR + suffix_len)
+    vsz: uint64 = _ext4_xattr_align4(value_len)
+    # Need room for this entry, this value, AND a 4-byte terminator.
+    if e_cur[0] + entry_sz + 4 + vsz > v_cur[0]:
+        return -1
+    new_v: uint64 = v_cur[0] - vsz
+    ent: uint64 = stage_base + e_cur[0]
+    ep: Ptr[uint8] = cast[Ptr[uint8]](ent)
+    ep[0] = cast[uint8](suffix_len)
+    ep[1] = idx
+    _ext4_write_u16(cast[Ptr[uint8]](ent + 0x02),
+                    cast[uint16](new_v))            # e_value_offs (block-rel)
+    _ext4_write_u32(cast[Ptr[uint8]](ent + 0x04), 0)   # e_value_block
+    _ext4_write_u32(cast[Ptr[uint8]](ent + 0x08),
+                    cast[uint32](value_len))        # e_value_size
+    _ext4_write_u32(cast[Ptr[uint8]](ent + 0x0C), 0)   # e_hash
+    i: uint64 = 0
+    while i < suffix_len:
+        ep[EXT4_XATTR_ENTRY_HDR + i] = suffix[i]
+        i = i + 1
+    j: uint64 = 0
+    while j < value_len:
+        cast[Ptr[uint8]](stage_base + new_v)[j] = value[j]
+        j = j + 1
+    e_cur[0] = e_cur[0] + entry_sz
+    v_cur[0] = new_v
+    return 0
+
+
+# --- removexattr --------------------------------------------------
+
+def ext4_removexattr(inum: uint32, name: Ptr[char]) -> int32:
+    # Remove extended attribute `name` from an on-disk inode. Searches
+    # both the in-inode region and the external block; frees the external
+    # block when its last entry goes away. Returns 0, or -ENODATA if the
+    # attribute was not present anywhere.
+    NEG_ENODATA: int32 = -61
+    if ext4_blockdev_slot < 0:
+        return -1
+    if ext4_read_inode(cast[uint64](inum),
+                       &ext4_xattr_inode_buf[0]) != 0:
+        return -1
+    name_len: uint64 = _ext4_strlen(name)
+    suffix_off: uint64 = 0
+    idx: uint8 = _ext4_xattr_classify(name, name_len, &suffix_off)
+    if idx == 0:
+        return -95                              # -EOPNOTSUPP
+    suffix_len: uint64 = name_len - suffix_off
+    suffix_ptr: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](name)
+                                              + suffix_off)
+    removed: int32 = 0
+    if _ext4_xattr_present_inode(&ext4_xattr_inode_buf[0], idx,
+                                 suffix_ptr, suffix_len) != 0:
+        _ext4_removexattr_inode(&ext4_xattr_inode_buf[0], idx,
+                                suffix_ptr, suffix_len)
+        removed = 1
+    if _ext4_xattr_present_external(&ext4_xattr_inode_buf[0], idx,
+                                    suffix_ptr, suffix_len) != 0:
+        if _ext4_removexattr_external(&ext4_xattr_inode_buf[0], idx,
+                                      suffix_ptr, suffix_len) != 0:
+            return -1
+        removed = 1
+    if removed == 0:
+        return NEG_ENODATA
+    _ext4_stamp_mtime(&ext4_xattr_inode_buf[0])
+    if ext4_write_inode(cast[uint64](inum),
+                        &ext4_xattr_inode_buf[0]) != 0:
+        return -1
+    return 0
+
+
+def _ext4_removexattr_inode(inode_buf: Ptr[uint8], idx: uint8,
+                            suffix: Ptr[uint8], suffix_len: uint64) -> int32:
+    # Drop (idx,suffix) from the in-inode region by rebuilding it without
+    # that entry. Mutates inode_buf in place. Returns 0 (always; absence
+    # is a no-op rebuild). Does NOT persist.
+    extra: uint16 = _ext4_read_u16(
+        cast[Ptr[uint8]](cast[uint64](inode_buf) + INODE_I_EXTRA_ISIZE_OFF))
+    if extra == 0:
+        return 0
+    region_start: uint64 = 128 + cast[uint64](extra)
+    base: uint64 = cast[uint64](inode_buf)
+    if _ext4_read_u32(cast[Ptr[uint8]](base + region_start)) \
+            != EXT4_XATTR_MAGIC:
+        return 0
+    return _ext4_xattr_rebuild_drop(inode_buf, region_start, idx,
+                                    suffix, suffix_len)
+
+
+def _ext4_xattr_rebuild_drop(inode_buf: Ptr[uint8], region_start: uint64,
+                             drop_idx: uint8, drop_suffix: Ptr[uint8],
+                             drop_suffix_len: uint64) -> int32:
+    # Rebuild the in-inode region copying every entry EXCEPT
+    # (drop_idx,drop_suffix). Mirrors _ext4_xattr_rebuild without the
+    # append step.
+    base: uint64 = cast[uint64](inode_buf)
+    region_end: uint64 = base + ext4_inode_size
+    src_entries: uint64 = base + region_start + 4
+    region_len: uint64 = ext4_inode_size - (region_start + 4)
+    sb: uint64 = cast[uint64](&ext4_xattr_rebuild_buf[0])
+    _ext4_zero(&ext4_xattr_rebuild_buf[0], region_len)
+    e_cur: uint64 = 0
+    v_cur: uint64 = region_len
+    p: uint64 = src_entries
+    while p + EXT4_XATTR_ENTRY_HDR <= region_end:
+        ep: Ptr[uint8] = cast[Ptr[uint8]](p)
+        nlen: uint8 = ep[0]
+        nidx: uint8 = ep[1]
+        if nlen == 0 and nidx == 0:
+            break
+        skip: int32 = 0
+        if nlen == cast[uint8](drop_suffix_len) and nidx == drop_idx:
+            nm: Ptr[uint8] = cast[Ptr[uint8]](p + EXT4_XATTR_ENTRY_HDR)
+            if _ext4_mem_eq(nm, drop_suffix, drop_suffix_len) != 0:
+                skip = 1
+        if skip == 0:
+            voffs: uint16 = _ext4_read_u16(cast[Ptr[uint8]](p + 0x02))
+            vsize: uint32 = _ext4_read_u32(cast[Ptr[uint8]](p + 0x08))
+            vsrc: uint64 = src_entries + cast[uint64](voffs)
+            _ext4_xattr_emit(sb, &e_cur, &v_cur, region_len, nidx,
+                             cast[Ptr[uint8]](p + EXT4_XATTR_ENTRY_HDR),
+                             cast[uint64](nlen),
+                             cast[Ptr[uint8]](vsrc), cast[uint64](vsize))
+        p = p + _ext4_xattr_align4(
+            EXT4_XATTR_ENTRY_HDR + cast[uint64](nlen))
+    memcpy(cast[Ptr[uint8]](src_entries),
+           &ext4_xattr_rebuild_buf[0], region_len)
+    return 0
+
+
+def _ext4_removexattr_external(inode_buf: Ptr[uint8], idx: uint8,
+                               suffix: Ptr[uint8],
+                               suffix_len: uint64) -> int32:
+    # Drop (idx,suffix) from the external block. If that was the last
+    # entry, free the block and clear i_file_acl. Otherwise rewrite the
+    # block without the entry. Returns 0 on success, -1 on I/O error.
+    facl: uint32 = _ext4_read_u32(
+        cast[Ptr[uint8]](cast[uint64](inode_buf) + INODE_I_FILE_ACL_OFFSET))
+    if facl == 0:
+        return 0
+    if _ext4_read_block(cast[uint64](facl), &ext4_xattr_blk_buf[0]) != 0:
+        return -1
+    src_base: uint64 = cast[uint64](&ext4_xattr_blk_buf[0])
+    if _ext4_read_u32(cast[Ptr[uint8]](src_base)) != EXT4_XATTR_MAGIC:
+        return 0
+    # Rebuild into the stage buffer, skipping the target.
+    stage: uint64 = cast[uint64](&ext4_xattr_ext_stage[0])
+    _ext4_zero(&ext4_xattr_ext_stage[0], ext4_block_size)
+    _ext4_write_u32(cast[Ptr[uint8]](stage), EXT4_XATTR_MAGIC)
+    _ext4_write_u32(cast[Ptr[uint8]](stage + 4), 1)
+    _ext4_write_u32(cast[Ptr[uint8]](stage + 8), 1)
+    e_cur: uint64 = EXT4_XATTR_HDR_LEN
+    v_cur: uint64 = ext4_block_size
+    kept: uint64 = 0
+    p: uint64 = src_base + EXT4_XATTR_HDR_LEN
+    send: uint64 = src_base + ext4_block_size
+    while p + EXT4_XATTR_ENTRY_HDR <= send:
+        ep: Ptr[uint8] = cast[Ptr[uint8]](p)
+        nlen: uint8 = ep[0]
+        nidx: uint8 = ep[1]
+        if nlen == 0 and nidx == 0:
+            break
+        skip: int32 = 0
+        if nlen == cast[uint8](suffix_len) and nidx == idx:
+            nm: Ptr[uint8] = cast[Ptr[uint8]](p + EXT4_XATTR_ENTRY_HDR)
+            if _ext4_mem_eq(nm, suffix, suffix_len) != 0:
+                skip = 1
+        if skip == 0:
+            voffs: uint16 = _ext4_read_u16(cast[Ptr[uint8]](p + 0x02))
+            vsize: uint32 = _ext4_read_u32(cast[Ptr[uint8]](p + 0x08))
+            vsrc: uint64 = src_base + cast[uint64](voffs)
+            _ext4_xattr_emit_ext(stage, &e_cur, &v_cur, nidx,
+                                 cast[Ptr[uint8]](p + EXT4_XATTR_ENTRY_HDR),
+                                 cast[uint64](nlen),
+                                 cast[Ptr[uint8]](vsrc),
+                                 cast[uint64](vsize))
+            kept = kept + 1
+        p = p + _ext4_xattr_align4(
+            EXT4_XATTR_ENTRY_HDR + cast[uint64](nlen))
+    if kept == 0:
+        # No entries left — free the block and clear i_file_acl.
+        ext4_free_block(cast[uint64](facl))
+        _ext4_write_u32(
+            cast[Ptr[uint8]](cast[uint64](inode_buf)
+                             + INODE_I_FILE_ACL_OFFSET), 0)
+        return 0
+    if _ext4_journal_write_block(cast[uint64](facl),
+                                 &ext4_xattr_ext_stage[0]) != 0:
         return -1
     return 0
 
@@ -8337,6 +8735,161 @@ def ext4_acl_access_check(value: Ptr[uint8], value_len: uint64,
     return 0
 
 
+def ext4_acl_encode(tags: Ptr[uint16], perms: Ptr[uint16],
+                    ids: Ptr[uint32], count: uint64,
+                    out: Ptr[uint8], out_cap: uint64) -> int32:
+    # Inverse of ext4_acl_decode: serialize `count` parallel ACL entries
+    # into the Linux on-disk POSIX-ACL blob (a_version + packed entries)
+    # in `out`. USER/GROUP tags emit an 8-byte entry carrying e_id; all
+    # other tags emit a 4-byte entry. Returns the byte length written, or
+    # -1 if it would overflow out_cap. The resulting blob is exactly what
+    # is stored as the system.posix_acl_access / _default xattr value.
+    if out_cap < 4:
+        return -1
+    _ext4_write_u32(out, POSIX_ACL_VERSION)
+    o: uint64 = 4
+    i: uint64 = 0
+    while i < count:
+        tag: uint16 = tags[i]
+        if tag == ACL_USER or tag == ACL_GROUP:
+            if o + 8 > out_cap:
+                return -1
+            _ext4_write_u16(cast[Ptr[uint8]](cast[uint64](out) + o), tag)
+            _ext4_write_u16(cast[Ptr[uint8]](cast[uint64](out) + o + 2),
+                            perms[i])
+            _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](out) + o + 4),
+                            ids[i])
+            o = o + 8
+        else:
+            if o + 4 > out_cap:
+                return -1
+            _ext4_write_u16(cast[Ptr[uint8]](cast[uint64](out) + o), tag)
+            _ext4_write_u16(cast[Ptr[uint8]](cast[uint64](out) + o + 2),
+                            perms[i])
+            o = o + 4
+        i = i + 1
+    return cast[int32](o)
+
+
+def ext4_set_acl(inum: uint32, is_default: int32,
+                 tags: Ptr[uint16], perms: Ptr[uint16],
+                 ids: Ptr[uint32], count: uint64) -> int32:
+    # Encode the given ACL entries and store them as the
+    # system.posix_acl_access (is_default==0) or system.posix_acl_default
+    # (is_default!=0) xattr on `inum`. Returns 0 or a negative errno.
+    blob: Array[512, uint8]
+    n: int32 = ext4_acl_encode(tags, perms, ids, count, &blob[0], 512)
+    if n < 0:
+        return -28                              # -ENOSPC (blob too big)
+    nm: Ptr[char] = "system.posix_acl_access"
+    if is_default != 0:
+        nm = "system.posix_acl_default"
+    return ext4_setxattr(inum, nm, &blob[0], cast[uint64](n), 0)
+
+
+def ext4_get_acl(inum: uint32, is_default: int32,
+                 out: Ptr[uint8], out_cap: uint64) -> int32:
+    # Fetch the raw POSIX-ACL blob for `inum` into `out`. Returns the
+    # value byte count, or a negative errno (-ENODATA if no ACL).
+    if ext4_blockdev_slot < 0:
+        return -1
+    if ext4_read_inode(cast[uint64](inum),
+                       &ext4_xattr_inode_buf[0]) != 0:
+        return -1
+    nm: Ptr[char] = "system.posix_acl_access"
+    if is_default != 0:
+        nm = "system.posix_acl_default"
+    return ext4_getxattr(&ext4_xattr_inode_buf[0], nm, _ext4_strlen(nm),
+                         out, out_cap)
+
+
+# --- path/fd helpers for the Linux-ABI xattr syscalls -------------
+#
+# These resolve an ext4 path (already stripped of the /ext/ prefix) to
+# an inode number and route to the by-inum primitives above so the
+# Linux setxattr/getxattr/listxattr/removexattr syscalls have a single
+# entry point per operation.
+
+def ext4_setxattr_path(path: Ptr[char], name: Ptr[char],
+                       value: Ptr[uint8], value_len: uint64,
+                       flags: int32) -> int32:
+    inum: uint32 = 0
+    fsize: uint64 = 0
+    if ext4_resolve_file(path, &inum, &fsize) == 0:
+        # Maybe a directory (ACLs commonly live on dirs).
+        d: uint32 = ext4_resolve_dir(path)
+        if d == 0:
+            return -2                           # -ENOENT
+        inum = d
+    return ext4_setxattr(inum, name, value, value_len, flags)
+
+
+def ext4_getxattr_path(path: Ptr[char], name: Ptr[char],
+                       out: Ptr[uint8], out_cap: uint64) -> int32:
+    inum: uint32 = 0
+    fsize: uint64 = 0
+    if ext4_resolve_file(path, &inum, &fsize) == 0:
+        d: uint32 = ext4_resolve_dir(path)
+        if d == 0:
+            return -2
+        inum = d
+    if ext4_read_inode(cast[uint64](inum),
+                       &ext4_xattr_inode_buf[0]) != 0:
+        return -1
+    return ext4_getxattr(&ext4_xattr_inode_buf[0], name,
+                         _ext4_strlen(name), out, out_cap)
+
+
+def ext4_listxattr_path(path: Ptr[char], out: Ptr[uint8],
+                        out_cap: uint64) -> int32:
+    inum: uint32 = 0
+    fsize: uint64 = 0
+    if ext4_resolve_file(path, &inum, &fsize) == 0:
+        d: uint32 = ext4_resolve_dir(path)
+        if d == 0:
+            return -2
+        inum = d
+    if ext4_read_inode(cast[uint64](inum),
+                       &ext4_xattr_inode_buf[0]) != 0:
+        return -1
+    return ext4_listxattr(&ext4_xattr_inode_buf[0], out, out_cap)
+
+
+def ext4_removexattr_path(path: Ptr[char], name: Ptr[char]) -> int32:
+    inum: uint32 = 0
+    fsize: uint64 = 0
+    if ext4_resolve_file(path, &inum, &fsize) == 0:
+        d: uint32 = ext4_resolve_dir(path)
+        if d == 0:
+            return -2
+        inum = d
+    return ext4_removexattr(inum, name)
+
+
+# inum-keyed variants for the f* (fd-based) xattr syscalls. The caller
+# (linux_abi) resolves an fd to its ext4 inode number, then routes here.
+
+def ext4_getxattr_inum(inum: uint32, name: Ptr[char],
+                       out: Ptr[uint8], out_cap: uint64) -> int32:
+    if ext4_blockdev_slot < 0:
+        return -1
+    if ext4_read_inode(cast[uint64](inum),
+                       &ext4_xattr_inode_buf[0]) != 0:
+        return -1
+    return ext4_getxattr(&ext4_xattr_inode_buf[0], name,
+                         _ext4_strlen(name), out, out_cap)
+
+
+def ext4_listxattr_inum(inum: uint32, out: Ptr[uint8],
+                        out_cap: uint64) -> int32:
+    if ext4_blockdev_slot < 0:
+        return -1
+    if ext4_read_inode(cast[uint64](inum),
+                       &ext4_xattr_inode_buf[0]) != 0:
+        return -1
+    return ext4_listxattr(&ext4_xattr_inode_buf[0], out, out_cap)
+
+
 # --- xattr self-test ----------------------------------------------
 #
 # Self-contained boot-time round-trip. Creates a regular file on the
@@ -8349,6 +8902,10 @@ def ext4_acl_access_check(value: Ptr[uint8], value_len: uint64,
 ext4_xattr_test_val: Array[64, uint8]
 ext4_xattr_test_list: Array[256, uint8]
 ext4_xattr_test_acl: Array[64, uint8]
+# Larger scratch for the external-block / ACL round-trip self-test.
+ext4_xattr_big_val: Array[1024, uint8]
+ext4_xattr_big_rd:  Array[1024, uint8]
+ext4_xattr_acl_rd:  Array[128, uint8]
 
 
 def ext4_xattr_selftest() -> int32:
@@ -8515,6 +9072,114 @@ def ext4_xattr_selftest() -> int32:
     # uid 1000 wants execute (0x01) -> denied (USER perms have no x).
     if ext4_acl_access_check(ab, o, 1000, 0, 0x01) != 0:
         printk0("[ext4-xattr] FAIL: acl check uid1000 exec granted\n")
+        return -1
+
+    # --- external block: a value too large for the inode slack must
+    #     spill to a freshly-allocated i_file_acl block, yet remain
+    #     readable through the same getxattr path. The in-inode user.size
+    #     attribute must SURVIVE this external spill.
+    nbig: Ptr[char] = "user.big"
+    bi: uint64 = 0
+    while bi < 600:
+        ext4_xattr_big_val[bi] = cast[uint8](65 + (bi % 26))   # 'A'..'Z'
+        bi = bi + 1
+    if ext4_setxattr(inum, nbig, &ext4_xattr_big_val[0], 600, 0) != 0:
+        printk0("[ext4-xattr] FAIL: setxattr external user.big\n")
+        return -1
+    if ext4_read_inode(cast[uint64](inum),
+                       &ext4_xattr_inode_buf[0]) != 0:
+        printk0("[ext4-xattr] FAIL: re-read inode (external)\n")
+        return -1
+    # i_file_acl must now name a real block.
+    facl_chk: uint32 = _ext4_read_u32(
+        cast[Ptr[uint8]](cast[uint64](&ext4_xattr_inode_buf[0])
+                         + INODE_I_FILE_ACL_OFFSET))
+    if facl_chk == 0:
+        printk0("[ext4-xattr] FAIL: external block not allocated\n")
+        return -1
+    gbig: int32 = ext4_getxattr(&ext4_xattr_inode_buf[0], nbig,
+                                _ext4_strlen(nbig),
+                                &ext4_xattr_big_rd[0], 1024)
+    if gbig != 600:
+        printk1("[ext4-xattr] FAIL: getxattr big len=%d (want 600)\n",
+                cast[uint64](cast[int64](gbig)))
+        return -1
+    if _ext4_mem_eq(&ext4_xattr_big_rd[0], &ext4_xattr_big_val[0],
+                    600) == 0:
+        printk0("[ext4-xattr] FAIL: external big value mismatch\n")
+        return -1
+    # The in-inode user.size must still resolve after the spill.
+    gsz2: int32 = ext4_getxattr(&ext4_xattr_inode_buf[0], n2,
+                                _ext4_strlen(n2),
+                                &ext4_xattr_test_val[0], 64)
+    if gsz2 != cast[int32](_ext4_strlen(v2)):
+        printk0("[ext4-xattr] FAIL: inline size lost after external spill\n")
+        return -1
+    # list must show both the inline AND the external name.
+    ll2: int32 = ext4_listxattr(&ext4_xattr_inode_buf[0],
+                                &ext4_xattr_test_list[0], 256)
+    if _ext4_xattr_list_has(&ext4_xattr_test_list[0],
+                            cast[uint64](ll2), nbig) == 0:
+        printk0("[ext4-xattr] FAIL: list missing external user.big\n")
+        return -1
+    if _ext4_xattr_list_has(&ext4_xattr_test_list[0],
+                            cast[uint64](ll2), n2) == 0:
+        printk0("[ext4-xattr] FAIL: list missing inline user.size\n")
+        return -1
+
+    # --- removexattr: drop the inline user.size; user.color (inline) and
+    #     user.big (external) must survive, and user.size must be gone.
+    if ext4_removexattr(inum, n2) != 0:
+        printk0("[ext4-xattr] FAIL: removexattr user.size\n")
+        return -1
+    if ext4_read_inode(cast[uint64](inum),
+                       &ext4_xattr_inode_buf[0]) != 0:
+        printk0("[ext4-xattr] FAIL: re-read inode (remove)\n")
+        return -1
+    grm: int32 = ext4_getxattr(&ext4_xattr_inode_buf[0], n2,
+                               _ext4_strlen(n2),
+                               &ext4_xattr_test_val[0], 64)
+    if grm != -61:
+        printk1("[ext4-xattr] FAIL: removed size still present rc=%d\n",
+                cast[uint64](cast[int64](grm)))
+        return -1
+    gsurv: int32 = ext4_getxattr(&ext4_xattr_inode_buf[0], n1,
+                                 _ext4_strlen(n1),
+                                 &ext4_xattr_test_val[0], 64)
+    if gsurv != cast[int32](_ext4_strlen(v1b)):
+        printk0("[ext4-xattr] FAIL: color lost after size remove\n")
+        return -1
+    gsurv2: int32 = ext4_getxattr(&ext4_xattr_inode_buf[0], nbig,
+                                  _ext4_strlen(nbig),
+                                  &ext4_xattr_big_rd[0], 1024)
+    if gsurv2 != 600:
+        printk0("[ext4-xattr] FAIL: external big lost after size remove\n")
+        return -1
+
+    # --- POSIX ACL round-trip: store the access ACL blob built above as
+    #     system.posix_acl_access, read it back, assert byte-exact.
+    if ext4_setxattr(inum, "system.posix_acl_access", ab, o, 0) != 0:
+        printk0("[ext4-xattr] FAIL: setxattr posix_acl_access\n")
+        return -1
+    if ext4_read_inode(cast[uint64](inum),
+                       &ext4_xattr_inode_buf[0]) != 0:
+        printk0("[ext4-xattr] FAIL: re-read inode (acl)\n")
+        return -1
+    gacl: int32 = ext4_getxattr(&ext4_xattr_inode_buf[0],
+                                "system.posix_acl_access",
+                                _ext4_strlen("system.posix_acl_access"),
+                                &ext4_xattr_acl_rd[0], 128)
+    if gacl != cast[int32](o):
+        printk1("[ext4-xattr] FAIL: acl roundtrip len=%d\n",
+                cast[uint64](cast[int64](gacl)))
+        return -1
+    if _ext4_mem_eq(&ext4_xattr_acl_rd[0], ab, o) == 0:
+        printk0("[ext4-xattr] FAIL: acl blob not byte-exact\n")
+        return -1
+    # The round-tripped blob must still decode + grant uid1000 write.
+    if ext4_acl_access_check(&ext4_xattr_acl_rd[0], cast[uint64](gacl),
+                             1000, 0, 0x02) != 1:
+        printk0("[ext4-xattr] FAIL: roundtripped acl denies uid1000 write\n")
         return -1
 
     printk0("[ext4-xattr] PASS\n")
