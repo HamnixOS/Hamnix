@@ -151,6 +151,27 @@ if os.environ.get("ENABLE_NTFS_TEST") == "1":
     FILES.append(("/tests/ntfs/test.img", _ntfs_mod.build_ntfs_image()))
     FILES.append(("/etc/ntfs-test", b"1\n"))
 
+# ENABLE_BTRFS_TEST=1 (via scripts/test_btrfs.sh) bakes a REAL btrfs image
+# FILE into the cpio at /tests/btrfs/test.img plus the /etc/btrfs-test
+# marker. init/main.ad's btrfs_e2e_selftest() loop-attaches that image as
+# /dev/blk/loopN, verifies the superblock magic at 0x10000, seeds the
+# chunk map from the bootstrap sys_chunk_array, reads the CHUNK + ROOT
+# B-trees, descends the FS tree to enumerate the root directory, reads an
+# INLINE-extent file (HELLO.TXT) byte-exact and a REGULAR-extent file
+# bigger than one node (BIG.DAT) byte-exact through the chunk map, and
+# resolves a nested file — proving the read-only btrfs reader
+# (fs/btrfs.ad) end-to-end. The image is built at build time
+# (mkfs.btrfs/btrfs-progs, --rootdir, no root needed) and kept OUT of
+# git, exactly like the ISO9660 / NTFS / loop FAT fixtures above.
+if os.environ.get("ENABLE_BTRFS_TEST") == "1":
+    import sys as _btrfs_sys
+    _btrfs_scripts_dir = str(Path(__file__).resolve().parent)
+    if _btrfs_scripts_dir not in _btrfs_sys.path:
+        _btrfs_sys.path.insert(0, _btrfs_scripts_dir)
+    import build_btrfs_fixture as _btrfs_mod
+    FILES.append(("/tests/btrfs/test.img", _btrfs_mod.build_btrfs_image()))
+    FILES.append(("/etc/btrfs-test", b"1\n"))
+
 if os.environ.get("ENABLE_TAR_GZIP_FIXTURE") == "1":
     import gzip as _gzip_mod
     # Repetitive, compressible plaintext: zlib chooses dynamic Huffman

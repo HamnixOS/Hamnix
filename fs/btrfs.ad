@@ -1,0 +1,838 @@
+# fs/btrfs.ad
+#
+# Read-only btrfs (B-tree filesystem) reader for a SIMPLE image:
+# single device, single-stripe (single profile), uncompressed.
+#
+# WHY: btrfs is one of the two default Linux root filesystems (with
+# ext4). Hamnix already reads ext4/FAT/exFAT/squashfs/ISO9660/NTFS;
+# btrfs is the remaining mainstream Linux fs. This driver lets the
+# kernel mount a btrfs image off a block device (a real disk, a USB
+# stick, or a loop-attached image file) and walk it like any other
+# read-only fs, reusing the existing 512-byte block layer.
+#
+# SCOPE (mirrors fs/iso9660.ad / fs/ntfs.ad: read-only, single-mount,
+# module-scope .bss scratch — no per-call kmalloc, no reentrancy):
+#
+#   btrfs_mount(dev_slot)                           -> int32
+#   btrfs_lookup(path, out_inode, out_size, isdir)  -> int32
+#   btrfs_read(inode, file_size, off, buf, len)     -> int64
+#   btrfs_readdir(dir_inode, cb, ctx)               -> int32
+#
+# ON-DISK MODEL (all little-endian)
+#   * The PRIMARY superblock sits at byte offset 0x10000 (65536). Its
+#     magic at +0x40 is the 8 bytes "_BHRfS_M". It carries sectorsize
+#     (+0x90), nodesize (+0x94), the CHUNK-tree root logical address
+#     (+0x58), the ROOT-tree root logical address (+0x50), the
+#     bootstrap sys_chunk_array (+0x32b, byte length at +0xa0), and the
+#     root/chunk-root tree LEVELS (+0xc6 / +0xc7).
+#   * btrfs addresses metadata/data by a LOGICAL address. A CHUNK maps a
+#     contiguous logical range to one-or-more device stripes. We support
+#     a single stripe on a single device (num_stripes==1): logical L in
+#     [chunk_logical, chunk_logical+length) maps to physical
+#     stripe_offset + (L - chunk_logical). Every block read funnels
+#     through this logical->physical map.
+#   * The bootstrap sys_chunk_array in the superblock holds exactly the
+#     SYSTEM chunk(s) needed to reach the CHUNK tree itself. We seed the
+#     map from it, read the CHUNK tree (its own logical address now
+#     mappable), and add every (CHUNK_ITEM) it lists — giving the full
+#     map for the metadata + data chunks.
+#   * A tree node is `nodesize` bytes. Header (101 bytes): csum[32],
+#     fsid[16], bytenr u64(+48), flags u64(+56), chunk_tree_uuid[16],
+#     generation u64(+80), owner u64(+88), nritems u32(+96), level
+#     u8(+100). level==0 is a LEAF; level>0 an internal NODE.
+#       - LEAF items: an array of btrfs_item (25 bytes): key{objectid
+#         u64, type u8, offset u64}=17, data-offset u32(+17), data-size
+#         u32(+21). The data offset is relative to the byte right after
+#         the header (offset 101).
+#       - NODE key_ptrs (33 bytes): key(17) + child blockptr u64(+17) +
+#         generation u64(+25).
+#   * Keys order as (objectid, type, offset) ascending. A generic
+#     "search tree rooted at logical L for key K" descends internal
+#     nodes by choosing the last child whose key <= K, then linear-scans
+#     the leaf.
+#   * The ROOT tree maps tree-objectid -> btrfs_root_item; FS_TREE is
+#     objectid 5, type ROOT_ITEM(132). The root_item's tree bytenr is at
+#     +176 and its level at +235.
+#   * In the FS tree, a file/dir is described by:
+#       - INODE_ITEM(1): size u64(+16), mode u32(+52).
+#       - DIR_ITEM(84): keyed (dir_inode, 84, name-hash). Payload is a
+#         btrfs_dir_item: location key(17), transid u64(+17), data_len
+#         u16(+25), name_len u16(+27), type u8(+29), name bytes(+30).
+#         The location key's objectid is the CHILD inode number. (A
+#         single DIR_ITEM slot may pack several entries on a hash
+#         collision; we walk all of them.)
+#       - EXTENT_DATA(108): keyed (inode, 108, file-offset). Payload is
+#         a btrfs_file_extent_item: generation u64(0), ram_bytes u64(8),
+#         compression u8(16), encryption u8(17), other_encoding u16(18),
+#         type u8(20). type==0 INLINE (data inline at +21); type==1
+#         REGULAR (disk_bytenr u64(+21), disk_num_bytes u64(+29),
+#         offset u64(+37), num_bytes u64(+45) -> read file data via the
+#         chunk map). Uncompressed only; a set compression byte makes us
+#         bail cleanly (see the COMPRESSION note at the foot of the file).
+#
+# A file larger than one node carries several EXTENT_DATA items, each
+# keyed by its file offset; btrfs_read walks them in order.
+
+from kernel.block.blk import blk_read_sectors, SECTOR_SIZE
+from kernel.printk.printk import printk0, printk1, printk2
+
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+
+
+# --- constants --------------------------------------------------------
+
+BTRFS_SUPER_OFFSET: uint64 = 0x10000    # primary superblock byte offset
+BTRFS_MAX_NODESIZE: uint64 = 65536      # largest node we buffer
+
+# Object-id / item-type constants (btrfs_disk_key.type byte values).
+BTRFS_FS_TREE_OBJECTID:   uint64 = 5
+BTRFS_FIRST_FREE_INODE:   uint64 = 256   # root dir inode of an FS tree
+
+BTRFS_INODE_ITEM_KEY:     uint8 = 1
+BTRFS_DIR_ITEM_KEY:       uint8 = 84
+BTRFS_ROOT_ITEM_KEY:      uint8 = 132
+BTRFS_EXTENT_DATA_KEY:    uint8 = 108
+BTRFS_CHUNK_ITEM_KEY:     uint8 = 228
+
+# Node-header field offsets.
+BTRFS_HDR_NRITEMS_OFF:    uint64 = 96
+BTRFS_HDR_LEVEL_OFF:      uint64 = 100
+BTRFS_HDR_SIZE:           uint64 = 101    # leaf/node items begin here
+
+BTRFS_ITEM_SIZE:          uint64 = 25     # btrfs_item (leaf slot)
+BTRFS_KEYPTR_SIZE:        uint64 = 33     # internal-node key_ptr
+
+# How many chunk-map entries we can hold (a simple image uses ~4).
+BTRFS_MAX_CHUNKS:         uint64 = 64
+
+
+# --- mount-time state (single mount only) -----------------------------
+
+btrfs_dev_slot:     int32  = -1
+btrfs_sectorsize:   uint64 = 0
+btrfs_nodesize:     uint64 = 0
+btrfs_chunk_root:   uint64 = 0
+btrfs_chunk_level:  uint64 = 0
+btrfs_root_root:    uint64 = 0          # ROOT-tree root logical addr
+btrfs_root_level:   uint64 = 0
+btrfs_fs_root:      uint64 = 0          # FS_TREE root logical addr
+btrfs_fs_level:     uint64 = 0
+
+# logical->physical chunk map (parallel arrays).
+btrfs_chunk_count:  uint64 = 0
+btrfs_chunk_log:    Array[64, uint64]   # chunk logical start
+btrfs_chunk_len:    Array[64, uint64]   # chunk length (bytes)
+btrfs_chunk_phys:   Array[64, uint64]   # physical (device) offset of stripe 0
+
+# Scratch buffers (module-scope per the Adder large-array quirk).
+btrfs_sb_buf:       Array[4096, uint8]          # the superblock
+btrfs_sector_buf:   Array[512, uint8]            # one hardware sector
+btrfs_node_buf:     Array[65536, uint8]          # a tree node for descent
+btrfs_leaf_buf:     Array[65536, uint8]          # a resolved leaf (stable
+                                                 # across a nested descent)
+
+
+# --- little-endian readers --------------------------------------------
+
+def _bt_rd_u16(p: Ptr[uint8]) -> uint16:
+    return cast[uint16](p[0]) | (cast[uint16](p[1]) << 8)
+
+
+def _bt_rd_u32(p: Ptr[uint8]) -> uint32:
+    return cast[uint32](p[0]) \
+        | (cast[uint32](p[1]) << 8) \
+        | (cast[uint32](p[2]) << 16) \
+        | (cast[uint32](p[3]) << 24)
+
+
+def _bt_rd_u64(p: Ptr[uint8]) -> uint64:
+    return cast[uint64](p[0]) \
+        | (cast[uint64](p[1]) << 8) \
+        | (cast[uint64](p[2]) << 16) \
+        | (cast[uint64](p[3]) << 24) \
+        | (cast[uint64](p[4]) << 32) \
+        | (cast[uint64](p[5]) << 40) \
+        | (cast[uint64](p[6]) << 48) \
+        | (cast[uint64](p[7]) << 56)
+
+
+# --- raw device read at an arbitrary byte offset ----------------------
+#
+# Byte-granular reads layered over the 512-byte block layer, exactly as
+# fs/iso9660.ad / fs/squashfs.ad do. `buf` must hold `len` bytes.
+
+def btrfs_dev_read(offset: uint64, buf: Ptr[uint8], len: uint64) -> int32:
+    if len == 0:
+        return 0
+    start_lba: uint64 = offset / SECTOR_SIZE
+    skew:      uint64 = offset % SECTOR_SIZE
+    produced:  uint64 = 0
+    lba:       uint64 = start_lba
+    while produced < len:
+        rc: int32 = blk_read_sectors(btrfs_dev_slot, lba, 1,
+                                     &btrfs_sector_buf[0])
+        if rc != 0:
+            return -1
+        avail: uint64 = SECTOR_SIZE - skew
+        want:  uint64 = len - produced
+        n:     uint64 = avail
+        if want < n:
+            n = want
+        memcpy(cast[Ptr[uint8]](cast[uint64](buf) + produced),
+               cast[Ptr[uint8]](cast[uint64](&btrfs_sector_buf[0]) + skew), n)
+        produced = produced + n
+        skew = 0
+        lba = lba + 1
+    return 0
+
+
+# --- chunk map: logical -> physical -----------------------------------
+
+def _bt_chunk_add(logical: uint64, length: uint64, phys: uint64) -> int32:
+    # De-dup: a chunk already present (re-seen via the CHUNK tree after
+    # the bootstrap) is ignored.
+    i: uint64 = 0
+    while i < btrfs_chunk_count:
+        if btrfs_chunk_log[i] == logical:
+            return 0
+        i = i + 1
+    if btrfs_chunk_count >= BTRFS_MAX_CHUNKS:
+        return -1
+    btrfs_chunk_log[btrfs_chunk_count]  = logical
+    btrfs_chunk_len[btrfs_chunk_count]  = length
+    btrfs_chunk_phys[btrfs_chunk_count] = phys
+    btrfs_chunk_count = btrfs_chunk_count + 1
+    return 0
+
+
+# Translate a logical address to a physical (device byte) address using
+# the chunk map. Returns 1 and writes *out on success, 0 if unmapped.
+def _bt_log_to_phys(logical: uint64, out: Ptr[uint64]) -> int32:
+    i: uint64 = 0
+    while i < btrfs_chunk_count:
+        base: uint64 = btrfs_chunk_log[i]
+        if logical >= base and logical < base + btrfs_chunk_len[i]:
+            out[0] = btrfs_chunk_phys[i] + (logical - base)
+            return 1
+        i = i + 1
+    return 0
+
+
+# Parse a single CHUNK_ITEM payload (at `cp`, the start of the chunk
+# record) for the chunk that begins at logical `chunk_logical`, and add
+# it to the map. Single-stripe only. Returns 1 if added, 0 otherwise.
+def _bt_parse_chunk_item(chunk_logical: uint64, cp: Ptr[uint8]) -> int32:
+    length:      uint64 = _bt_rd_u64(cp)
+    num_stripes: uint16 = _bt_rd_u16(
+        cast[Ptr[uint8]](cast[uint64](cp) + 44))
+    # First stripe begins at offset 48: devid u64, offset u64, uuid[16].
+    if cast[uint64](num_stripes) < 1:
+        return 0
+    stripe_off: uint64 = _bt_rd_u64(
+        cast[Ptr[uint8]](cast[uint64](cp) + 48 + 8))
+    _bt_chunk_add(chunk_logical, length, stripe_off)
+    return 1
+
+
+# Read a whole tree node (nodesize bytes) at logical `logical` into buf,
+# resolving logical->physical through the chunk map. Returns 0 on
+# success, -1 on error.
+def _bt_read_node(logical: uint64, buf: Ptr[uint8]) -> int32:
+    phys: uint64 = 0
+    if _bt_log_to_phys(logical, &phys) != 1:
+        printk1("btrfs: unmapped logical 0x%x\n", logical)
+        return -1
+    return btrfs_dev_read(phys, buf, btrfs_nodesize)
+
+
+# --- key comparison ---------------------------------------------------
+#
+# Compare key (a_oid, a_type, a_off) with (b_oid, b_type, b_off).
+# Returns -1 if a<b, 0 if equal, 1 if a>b.
+
+def _bt_key_cmp(a_oid: uint64, a_type: uint8, a_off: uint64,
+                b_oid: uint64, b_type: uint8, b_off: uint64) -> int32:
+    if a_oid < b_oid:
+        return -1
+    if a_oid > b_oid:
+        return 1
+    if a_type < b_type:
+        return -1
+    if a_type > b_type:
+        return 1
+    if a_off < b_off:
+        return -1
+    if a_off > b_off:
+        return 1
+    return 0
+
+
+# --- generic B-tree descent -------------------------------------------
+#
+# Descend the tree rooted at logical `root_logical` looking for the key
+# (oid,type,off). Internal nodes are walked into `btrfs_node_buf`; the
+# final LEAF is left in `btrfs_leaf_buf` so the caller can read its item
+# table without a buffer collision against a later descent. Returns 0
+# (leaf landed) on success, -1 on error. The caller searches the leaf
+# items itself (the desired key may be the first key >= the target, etc).
+
+def _bt_descend_to_leaf(root_logical: uint64,
+                        oid: uint64, type: uint8, off: uint64) -> int32:
+    cur: uint64 = root_logical
+    depth: int32 = 0
+    while depth < 16:
+        if _bt_read_node(cur, &btrfs_node_buf[0]) != 0:
+            return -1
+        level: uint8 = btrfs_node_buf[BTRFS_HDR_LEVEL_OFF]
+        nritems: uint32 = _bt_rd_u32(
+            cast[Ptr[uint8]](cast[uint64](&btrfs_node_buf[0])
+                             + BTRFS_HDR_NRITEMS_OFF))
+        if level == 0:
+            # Leaf reached. Copy it into the stable leaf buffer.
+            memcpy(&btrfs_leaf_buf[0], &btrfs_node_buf[0], btrfs_nodesize)
+            return 0
+        # Internal node: pick the last child whose key <= target.
+        ni: uint64 = cast[uint64](nritems)
+        chosen: uint64 = 0
+        have: int32 = 0
+        i: uint64 = 0
+        while i < ni:
+            kp: Ptr[uint8] = cast[Ptr[uint8]](
+                cast[uint64](&btrfs_node_buf[0]) + BTRFS_HDR_SIZE
+                + i * BTRFS_KEYPTR_SIZE)
+            k_oid: uint64 = _bt_rd_u64(kp)
+            k_type: uint8 = kp[8]
+            k_off: uint64 = _bt_rd_u64(
+                cast[Ptr[uint8]](cast[uint64](kp) + 9))
+            cmp: int32 = _bt_key_cmp(k_oid, k_type, k_off, oid, type, off)
+            if cmp <= 0:
+                chosen = i
+                have = 1
+                i = i + 1
+            else:
+                # First key strictly greater: stop. If nothing chosen yet
+                # the target precedes all keys; descend the first child.
+                i = ni
+        if have == 0:
+            chosen = 0
+        kp2: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](&btrfs_node_buf[0]) + BTRFS_HDR_SIZE
+            + chosen * BTRFS_KEYPTR_SIZE)
+        cur = _bt_rd_u64(cast[Ptr[uint8]](cast[uint64](kp2) + 17))
+        depth = depth + 1
+    return -1
+
+
+# --- leaf item accessors (operate on btrfs_leaf_buf) ------------------
+
+def _bt_leaf_nritems() -> uint64:
+    return cast[uint64](_bt_rd_u32(
+        cast[Ptr[uint8]](cast[uint64](&btrfs_leaf_buf[0])
+                         + BTRFS_HDR_NRITEMS_OFF)))
+
+
+def _bt_leaf_item_ptr(i: uint64) -> Ptr[uint8]:
+    return cast[Ptr[uint8]](cast[uint64](&btrfs_leaf_buf[0])
+                            + BTRFS_HDR_SIZE + i * BTRFS_ITEM_SIZE)
+
+
+# Pointer to item i's DATA within btrfs_leaf_buf.
+def _bt_leaf_item_data(i: uint64) -> Ptr[uint8]:
+    it: Ptr[uint8] = _bt_leaf_item_ptr(i)
+    doff: uint32 = _bt_rd_u32(cast[Ptr[uint8]](cast[uint64](it) + 17))
+    return cast[Ptr[uint8]](cast[uint64](&btrfs_leaf_buf[0])
+                            + BTRFS_HDR_SIZE + cast[uint64](doff))
+
+
+def _bt_leaf_item_size(i: uint64) -> uint64:
+    it: Ptr[uint8] = _bt_leaf_item_ptr(i)
+    return cast[uint64](_bt_rd_u32(
+        cast[Ptr[uint8]](cast[uint64](it) + 21)))
+
+
+# --- superblock parse + mount -----------------------------------------
+
+def btrfs_mount(dev_slot: int32) -> int32:
+    btrfs_dev_slot   = dev_slot
+    btrfs_chunk_count = 0
+
+    # Read the primary superblock (one 4 KiB block at byte 0x10000).
+    if btrfs_dev_read(BTRFS_SUPER_OFFSET, &btrfs_sb_buf[0], 4096) != 0:
+        printk0("btrfs: superblock read failed\n")
+        btrfs_dev_slot = -1
+        return -1
+
+    # Verify magic "_BHRfS_M" at +0x40.
+    m: Ptr[uint8] = cast[Ptr[uint8]](
+        cast[uint64](&btrfs_sb_buf[0]) + 0x40)
+    if m[0] != 0x5F or m[1] != 0x42 or m[2] != 0x48 or m[3] != 0x52 \
+            or m[4] != 0x66 or m[5] != 0x53 or m[6] != 0x5F or m[7] != 0x4D:
+        printk0("btrfs: bad magic (not _BHRfS_M)\n")
+        btrfs_dev_slot = -1
+        return -1
+
+    sbp: uint64 = cast[uint64](&btrfs_sb_buf[0])
+    btrfs_root_root  = _bt_rd_u64(cast[Ptr[uint8]](sbp + 0x50))
+    btrfs_chunk_root = _bt_rd_u64(cast[Ptr[uint8]](sbp + 0x58))
+    btrfs_sectorsize = cast[uint64](_bt_rd_u32(
+        cast[Ptr[uint8]](sbp + 0x90)))
+    btrfs_nodesize   = cast[uint64](_bt_rd_u32(
+        cast[Ptr[uint8]](sbp + 0x94)))
+    btrfs_root_level  = cast[uint64](btrfs_sb_buf[0xc6])
+    btrfs_chunk_level = cast[uint64](btrfs_sb_buf[0xc7])
+
+    if btrfs_nodesize == 0 or btrfs_nodesize > BTRFS_MAX_NODESIZE:
+        printk1("btrfs: unsupported nodesize %d\n", btrfs_nodesize)
+        btrfs_dev_slot = -1
+        return -1
+
+    # --- bootstrap the chunk map from sys_chunk_array (+0x32b) --------
+    # Length is at +0xa0. The array is a packed sequence of
+    # (disk_key{17} + chunk_item) records. The key.offset IS the chunk's
+    # logical start; the chunk record follows immediately.
+    sys_len: uint64 = cast[uint64](_bt_rd_u32(
+        cast[Ptr[uint8]](sbp + 0xa0)))
+    arr: uint64 = sbp + 0x32b
+    pos: uint64 = 0
+    while pos + 17 < sys_len:
+        kp: Ptr[uint8] = cast[Ptr[uint8]](arr + pos)
+        k_type: uint8 = kp[8]
+        k_off:  uint64 = _bt_rd_u64(
+            cast[Ptr[uint8]](cast[uint64](kp) + 9))
+        if k_type != BTRFS_CHUNK_ITEM_KEY:
+            pos = sys_len                       # malformed: stop
+        else:
+            cp: Ptr[uint8] = cast[Ptr[uint8]](arr + pos + 17)
+            num_stripes: uint16 = _bt_rd_u16(
+                cast[Ptr[uint8]](cast[uint64](cp) + 44))
+            _bt_parse_chunk_item(k_off, cp)
+            # Advance: chunk_item header (48) + num_stripes*stripe(32).
+            rec: uint64 = 48 + cast[uint64](num_stripes) * 32
+            pos = pos + 17 + rec
+
+    if btrfs_chunk_count == 0:
+        printk0("btrfs: bootstrap sys_chunk_array empty\n")
+        btrfs_dev_slot = -1
+        return -1
+
+    # --- read the CHUNK tree to add the full logical->physical map ----
+    # The chunk-tree root is now reachable via the bootstrap map. Its
+    # leaves hold CHUNK_ITEM entries keyed (FIRST_CHUNK_TREE,228,logical).
+    if _bt_read_chunk_tree() != 0:
+        printk0("btrfs: chunk tree read failed\n")
+        btrfs_dev_slot = -1
+        return -1
+
+    # --- locate the FS_TREE root via the ROOT tree --------------------
+    if _bt_find_fs_root() != 0:
+        printk0("btrfs: FS_TREE root not found\n")
+        btrfs_dev_slot = -1
+        return -1
+
+    printk2("btrfs: mounted; nodesize=%d fs_root=0x%x\n",
+            btrfs_nodesize, btrfs_fs_root)
+    return 0
+
+
+# Walk the CHUNK tree (it is small — usually a single leaf) and add every
+# CHUNK_ITEM to the map. We descend to the leaf holding the smallest
+# chunk key, then linear-scan; for a single-leaf chunk tree this covers
+# all chunks. (A multi-level chunk tree would need leaf-to-leaf chaining;
+# a simple single-device image keeps the chunk tree to one leaf.)
+def _bt_read_chunk_tree() -> int32:
+    # Descend toward key (0,0,0) -> lands on the leftmost leaf.
+    if _bt_descend_to_leaf(btrfs_chunk_root, 0, 0, 0) != 0:
+        return -1
+    n: uint64 = _bt_leaf_nritems()
+    i: uint64 = 0
+    while i < n:
+        it: Ptr[uint8] = _bt_leaf_item_ptr(i)
+        k_type: uint8  = it[8]
+        k_off:  uint64 = _bt_rd_u64(
+            cast[Ptr[uint8]](cast[uint64](it) + 9))
+        if k_type == BTRFS_CHUNK_ITEM_KEY:
+            _bt_parse_chunk_item(k_off, _bt_leaf_item_data(i))
+        i = i + 1
+    return 0
+
+
+# Search the ROOT tree for (FS_TREE=5, ROOT_ITEM=132, 0) and read its
+# tree bytenr(+176)/level(+235) into btrfs_fs_root/btrfs_fs_level.
+def _bt_find_fs_root() -> int32:
+    if _bt_descend_to_leaf(btrfs_root_root,
+                           BTRFS_FS_TREE_OBJECTID,
+                           BTRFS_ROOT_ITEM_KEY, 0) != 0:
+        return -1
+    n: uint64 = _bt_leaf_nritems()
+    i: uint64 = 0
+    while i < n:
+        it: Ptr[uint8] = _bt_leaf_item_ptr(i)
+        k_oid:  uint64 = _bt_rd_u64(it)
+        k_type: uint8  = it[8]
+        if k_oid == BTRFS_FS_TREE_OBJECTID and k_type == BTRFS_ROOT_ITEM_KEY:
+            d: Ptr[uint8] = _bt_leaf_item_data(i)
+            btrfs_fs_root  = _bt_rd_u64(
+                cast[Ptr[uint8]](cast[uint64](d) + 176))
+            btrfs_fs_level = cast[uint64](d[235])
+            return 0
+        i = i + 1
+    return -1
+
+
+# --- inode lookup -----------------------------------------------------
+#
+# Fetch the INODE_ITEM for `inode` from the FS tree; write its size and
+# mode. Returns 0 on success, -1 if not found.
+
+def _bt_inode_info(inode: uint64, out_size: Ptr[uint64],
+                   out_mode: Ptr[uint32]) -> int32:
+    if _bt_descend_to_leaf(btrfs_fs_root, inode,
+                           BTRFS_INODE_ITEM_KEY, 0) != 0:
+        return -1
+    n: uint64 = _bt_leaf_nritems()
+    i: uint64 = 0
+    while i < n:
+        it: Ptr[uint8] = _bt_leaf_item_ptr(i)
+        k_oid:  uint64 = _bt_rd_u64(it)
+        k_type: uint8  = it[8]
+        if k_oid == inode and k_type == BTRFS_INODE_ITEM_KEY:
+            d: Ptr[uint8] = _bt_leaf_item_data(i)
+            out_size[0] = _bt_rd_u64(
+                cast[Ptr[uint8]](cast[uint64](d) + 16))
+            out_mode[0] = _bt_rd_u32(
+                cast[Ptr[uint8]](cast[uint64](d) + 52))
+            return 0
+        i = i + 1
+    return -1
+
+
+# --- directory lookup by name -----------------------------------------
+#
+# Match `name` (length nlen) against the DIR_ITEM entries of directory
+# inode `dir_inode`. On a hit write the child inode + its dir-type and
+# return 1; 0 if absent, -1 on error. Because DIR_ITEMs are keyed by a
+# NAME HASH (not the name), and we don't compute the hash, we linear-
+# scan every DIR_ITEM of the directory by descending to the first key
+# (dir_inode, DIR_ITEM, 0) and walking forward while objectid matches.
+
+def _bt_names_eq(a: Ptr[uint8], b: Ptr[uint8], n: uint64) -> int32:
+    i: uint64 = 0
+    while i < n:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def _bt_dir_lookup(dir_inode: uint64, name: Ptr[uint8], nlen: uint64,
+                   out_child: Ptr[uint64], out_type: Ptr[uint8]) -> int32:
+    if _bt_descend_to_leaf(btrfs_fs_root, dir_inode,
+                           BTRFS_DIR_ITEM_KEY, 0) != 0:
+        return -1
+    n: uint64 = _bt_leaf_nritems()
+    i: uint64 = 0
+    while i < n:
+        it: Ptr[uint8] = _bt_leaf_item_ptr(i)
+        k_oid:  uint64 = _bt_rd_u64(it)
+        k_type: uint8  = it[8]
+        if k_oid == dir_inode and k_type == BTRFS_DIR_ITEM_KEY:
+            # A DIR_ITEM slot may pack multiple btrfs_dir_item records
+            # (hash collisions). Walk them within the item data.
+            base: Ptr[uint8] = _bt_leaf_item_data(i)
+            isize: uint64 = _bt_leaf_item_size(i)
+            pos: uint64 = 0
+            while pos + 30 <= isize:
+                d: Ptr[uint8] = cast[Ptr[uint8]](
+                    cast[uint64](base) + pos)
+                child: uint64 = _bt_rd_u64(d)          # location objectid
+                data_len: uint64 = cast[uint64](_bt_rd_u16(
+                    cast[Ptr[uint8]](cast[uint64](d) + 25)))
+                name_len: uint64 = cast[uint64](_bt_rd_u16(
+                    cast[Ptr[uint8]](cast[uint64](d) + 27)))
+                dtype: uint8 = d[29]
+                nm: Ptr[uint8] = cast[Ptr[uint8]](
+                    cast[uint64](d) + 30)
+                if name_len == nlen and pos + 30 + name_len <= isize:
+                    if _bt_names_eq(nm, name, nlen) == 1:
+                        out_child[0] = child
+                        out_type[0]  = dtype
+                        return 1
+                pos = pos + 30 + name_len + data_len
+        elif k_oid > dir_inode:
+            i = n                                      # past this dir
+        i = i + 1
+    return 0
+
+
+# --- path lookup ------------------------------------------------------
+#
+# Walk a '/'-separated path from the FS root directory (inode 256),
+# resolving each component via DIR_ITEM. On success writes the target
+# inode, its size, and is-dir. Returns 0; -1 if any component missing.
+
+btrfs_comp_buf: Array[256, uint8]
+
+
+def btrfs_lookup(path: Ptr[char], out_inode: Ptr[uint64],
+                 out_size: Ptr[uint64], out_is_dir: Ptr[int32]) -> int32:
+    if btrfs_dev_slot < 0:
+        return -1
+    p: Ptr[uint8] = cast[Ptr[uint8]](path)
+    i: uint64 = 0
+    if p[0] == 0x2F:                          # skip leading '/'
+        i = 1
+    cur_inode: uint64 = BTRFS_FIRST_FREE_INODE
+    cur_is_dir: int32 = 1
+
+    # "/" => the root directory.
+    if p[i] == 0:
+        out_inode[0] = cur_inode
+        sz: uint64 = 0
+        md: uint32 = 0
+        _bt_inode_info(cur_inode, &sz, &md)
+        out_size[0]   = sz
+        out_is_dir[0] = 1
+        return 0
+
+    while p[i] != 0:
+        wl: uint64 = 0
+        while p[i] != 0 and p[i] != 0x2F:
+            if wl < 255:
+                btrfs_comp_buf[wl] = p[i]
+                wl = wl + 1
+            i = i + 1
+        btrfs_comp_buf[wl] = 0
+        if p[i] == 0x2F:
+            i = i + 1
+        if wl == 0:
+            pass                              # doubled / trailing slash
+        else:
+            if cur_is_dir == 0:
+                return -1                     # descending into a file
+            child: uint64 = 0
+            ctype: uint8  = 0
+            r: int32 = _bt_dir_lookup(cur_inode, &btrfs_comp_buf[0], wl,
+                                      &child, &ctype)
+            if r != 1:
+                return -1
+            cur_inode = child
+            # dir-type 2 == directory (btrfs FT_DIR).
+            if ctype == 2:
+                cur_is_dir = 1
+            else:
+                cur_is_dir = 0
+
+    sz2: uint64 = 0
+    md2: uint32 = 0
+    if _bt_inode_info(cur_inode, &sz2, &md2) != 0:
+        return -1
+    out_inode[0]  = cur_inode
+    out_size[0]   = sz2
+    out_is_dir[0] = cur_is_dir
+    return 0
+
+
+# --- directory enumeration --------------------------------------------
+#
+# Enumerate the entries of directory inode `dir_inode`, invoking
+# cb(ctx, name_ptr, name_len, child_inode, is_dir) for each. Returns 0
+# on success, -1 on error. cb returns nonzero to stop early.
+
+btrfs_dir_name_buf: Array[256, uint8]
+
+
+def btrfs_readdir(dir_inode: uint64,
+                  cb: Fn[int32, uint64, uint64, uint64, uint64, int32],
+                  ctx: uint64) -> int32:
+    if btrfs_dev_slot < 0:
+        return -1
+    if _bt_descend_to_leaf(btrfs_fs_root, dir_inode,
+                           BTRFS_DIR_ITEM_KEY, 0) != 0:
+        return -1
+    n: uint64 = _bt_leaf_nritems()
+    i: uint64 = 0
+    while i < n:
+        it: Ptr[uint8] = _bt_leaf_item_ptr(i)
+        k_oid:  uint64 = _bt_rd_u64(it)
+        k_type: uint8  = it[8]
+        if k_oid == dir_inode and k_type == BTRFS_DIR_ITEM_KEY:
+            base: Ptr[uint8] = _bt_leaf_item_data(i)
+            isize: uint64 = _bt_leaf_item_size(i)
+            pos: uint64 = 0
+            while pos + 30 <= isize:
+                d: Ptr[uint8] = cast[Ptr[uint8]](
+                    cast[uint64](base) + pos)
+                child: uint64 = _bt_rd_u64(d)
+                data_len: uint64 = cast[uint64](_bt_rd_u16(
+                    cast[Ptr[uint8]](cast[uint64](d) + 25)))
+                name_len: uint64 = cast[uint64](_bt_rd_u16(
+                    cast[Ptr[uint8]](cast[uint64](d) + 27)))
+                dtype: uint8 = d[29]
+                nm: Ptr[uint8] = cast[Ptr[uint8]](
+                    cast[uint64](d) + 30)
+                if pos + 30 + name_len <= isize:
+                    # Copy name into a NUL-terminated buffer for the cb.
+                    j: uint64 = 0
+                    cl: uint64 = name_len
+                    if cl > 255:
+                        cl = 255
+                    while j < cl:
+                        btrfs_dir_name_buf[j] = nm[j]
+                        j = j + 1
+                    btrfs_dir_name_buf[cl] = 0
+                    is_dir: int32 = 0
+                    if dtype == 2:
+                        is_dir = 1
+                    stop: int32 = cb(ctx,
+                                     cast[uint64](&btrfs_dir_name_buf[0]),
+                                     name_len, child, is_dir)
+                    if stop != 0:
+                        return 0
+                pos = pos + 30 + name_len + data_len
+        elif k_oid > dir_inode:
+            i = n
+        i = i + 1
+    return 0
+
+
+# --- file read --------------------------------------------------------
+#
+# Read up to `len` bytes from file `inode` at byte `offset`, walking its
+# EXTENT_DATA items. INLINE extents copy from the leaf; REGULAR extents
+# read through the chunk map. Files with several extents are stitched in
+# file-offset order. Returns bytes produced, or -1 on error. Compressed
+# extents bail cleanly with -1 (see COMPRESSION note).
+
+def btrfs_read(inode: uint64, file_size: uint64, offset: uint64,
+               buf: Ptr[uint8], len: uint64) -> int64:
+    if btrfs_dev_slot < 0:
+        return -1
+    if offset >= file_size:
+        return 0
+    want: uint64 = len
+    if offset + want > file_size:
+        want = file_size - offset
+    if want == 0:
+        return 0
+
+    produced: uint64 = 0
+    # cur_off is the file offset we still need to fill.
+    cur_off: uint64 = offset
+    guard: int32 = 0
+
+    while produced < want and guard < 4096:
+        guard = guard + 1
+        # Find the EXTENT_DATA item covering cur_off: the last item with
+        # key offset <= cur_off. Descend, then linear-scan the leaf.
+        if _bt_descend_to_leaf(btrfs_fs_root, inode,
+                               BTRFS_EXTENT_DATA_KEY, cur_off) != 0:
+            return -1
+        n: uint64 = _bt_leaf_nritems()
+        # Pick the matching extent in this leaf.
+        chosen: int64 = -1
+        ext_start: uint64 = 0
+        i: uint64 = 0
+        while i < n:
+            it: Ptr[uint8] = _bt_leaf_item_ptr(i)
+            k_oid:  uint64 = _bt_rd_u64(it)
+            k_type: uint8  = it[8]
+            k_off:  uint64 = _bt_rd_u64(
+                cast[Ptr[uint8]](cast[uint64](it) + 9))
+            if k_oid == inode and k_type == BTRFS_EXTENT_DATA_KEY:
+                if k_off <= cur_off:
+                    chosen = cast[int64](i)
+                    ext_start = k_off
+            i = i + 1
+        if chosen < 0:
+            # No extent at/<= cur_off: NO_HOLES sparse region -> zeros.
+            # Fill the rest of `want` with zeros (rare for our fixtures).
+            z: uint64 = produced
+            while z < want:
+                buf[z] = 0
+                z = z + 1
+            return cast[int64](want)
+
+        ci: uint64 = cast[uint64](chosen)
+        d: Ptr[uint8] = _bt_leaf_item_data(ci)
+        isize: uint64 = _bt_leaf_item_size(ci)
+        comp: uint8 = d[16]
+        etype: uint8 = d[20]
+        if comp != 0:
+            printk0("btrfs: compressed extent unsupported\n")
+            return -1
+
+        if etype == 0:
+            # INLINE: data bytes follow the 21-byte header in the leaf.
+            inline_len: uint64 = isize - 21
+            in_ext: uint64 = cur_off - ext_start    # offset within extent
+            avail: uint64 = 0
+            if in_ext < inline_len:
+                avail = inline_len - in_ext
+            take: uint64 = want - produced
+            if take > avail:
+                take = avail
+            src: Ptr[uint8] = cast[Ptr[uint8]](
+                cast[uint64](d) + 21 + in_ext)
+            memcpy(cast[Ptr[uint8]](cast[uint64](buf) + produced),
+                   src, take)
+            produced = produced + take
+            cur_off  = cur_off + take
+            if take == 0:
+                return cast[int64](produced)
+        else:
+            # REGULAR: disk_bytenr(+21), offset-in-extent(+37),
+            # num_bytes(+45). A disk_bytenr of 0 is a hole.
+            disk_bytenr: uint64 = _bt_rd_u64(
+                cast[Ptr[uint8]](cast[uint64](d) + 21))
+            ext_offset: uint64 = _bt_rd_u64(
+                cast[Ptr[uint8]](cast[uint64](d) + 37))
+            num_bytes: uint64 = _bt_rd_u64(
+                cast[Ptr[uint8]](cast[uint64](d) + 45))
+            in_ext: uint64 = cur_off - ext_start
+            if in_ext >= num_bytes:
+                return cast[int64](produced)         # past the extent
+            avail: uint64 = num_bytes - in_ext
+            take: uint64 = want - produced
+            if take > avail:
+                take = avail
+            if disk_bytenr == 0:
+                # Sparse hole: zero-fill this run.
+                z: uint64 = 0
+                while z < take:
+                    buf[produced + z] = 0
+                    z = z + 1
+            else:
+                # logical = disk_bytenr + ext_offset + in_ext
+                logical: uint64 = disk_bytenr + ext_offset + in_ext
+                phys: uint64 = 0
+                if _bt_log_to_phys(logical, &phys) != 1:
+                    printk1("btrfs: data logical 0x%x unmapped\n", logical)
+                    return -1
+                if btrfs_dev_read(phys,
+                                  cast[Ptr[uint8]](
+                                      cast[uint64](buf) + produced),
+                                  take) != 0:
+                    return -1
+            produced = produced + take
+            cur_off  = cur_off + take
+            if take == 0:
+                return cast[int64](produced)
+
+    return cast[int64](produced)
+
+
+# COMPRESSION NOTE: btrfs may store extents zlib/lzo/zstd-compressed
+# (the EXTENT_DATA compression byte at +16, and for inline extents the
+# same byte). This reader handles UNCOMPRESSED extents only and bails
+# cleanly (-1, with a printk) when the compression byte is non-zero.
+# Adding support means routing the on-disk extent bytes through the
+# kernel's inflate (zlib is already present for gunzip) for compression
+# type 1, and lzo/zstd decoders for types 2/3, then mapping the
+# decompressed window onto the requested file range — the tree walk and
+# chunk map above are unchanged. Left as a follow-up since mkfs.btrfs
+# stores small files inline and large files uncompressed by default.
+#
+# MULTI-DEVICE / RAID NOTE: a chunk with num_stripes>1 (DUP/RAID0/1/10/
+# 5/6) needs stripe selection + parity; we support num_stripes==1
+# (single profile) which is what `mkfs.btrfs -d single -m single` and a
+# single-device default filesystem produce.
