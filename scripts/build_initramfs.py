@@ -113,6 +113,24 @@ if os.environ.get("ENABLE_LOOP_TEST") == "1":
     FILES.append(("/tests/loop/disk.img", _diskimg_mod.build_image()))
     FILES.append(("/etc/loop-test", b"1\n"))
 
+# ENABLE_ISO9660_TEST=1 (via scripts/test_iso9660.sh) bakes a REAL Rock
+# Ridge ISO9660 image FILE into the cpio at /tests/iso9660/test.iso plus
+# the /etc/iso9660-test marker. init/main.ad's iso9660_e2e_selftest()
+# loop-attaches that .iso as /dev/blk/loop1, parses the Primary Volume
+# Descriptor, lists the root, reads a known file byte-exact, resolves a
+# Rock Ridge long name, reads a >1-sector file, and resolves a nested
+# file — proving the read-only ISO9660 reader (fs/iso9660.ad) end-to-end.
+# The .iso is built at build time (genisoimage/xorriso) and kept OUT of
+# git, exactly like the loop FAT fixture above.
+if os.environ.get("ENABLE_ISO9660_TEST") == "1":
+    import sys as _iso_sys
+    _iso_scripts_dir = str(Path(__file__).resolve().parent)
+    if _iso_scripts_dir not in _iso_sys.path:
+        _iso_sys.path.insert(0, _iso_scripts_dir)
+    import build_iso_fixture as _iso_mod
+    FILES.append(("/tests/iso9660/test.iso", _iso_mod.build_iso_image()))
+    FILES.append(("/etc/iso9660-test", b"1\n"))
+
 if os.environ.get("ENABLE_TAR_GZIP_FIXTURE") == "1":
     import gzip as _gzip_mod
     # Repetitive, compressible plaintext: zlib chooses dynamic Huffman

@@ -1,0 +1,579 @@
+# fs/iso9660.ad
+#
+# Read-only ISO9660 (ECMA-119 / CD-ROM) filesystem reader, with the
+# Rock Ridge (SUSP — System Use Sharing Protocol) extensions real
+# Linux distro CDs/DVDs and most bootable .iso images carry.
+#
+# WHY: an .iso is the canonical way Linux ships installers and live
+# media. Hamnix already reads squashfs (the live/filesystem.squashfs
+# INSIDE the iso) and ext4/FAT; ISO9660 is the OUTER container those
+# live on. This driver lets the kernel mount an .iso straight off a
+# block device (a CD-ROM, a USB stick written with an iso, or a
+# loop-attached image file) and walk it like any other read-only fs.
+#
+# SCOPE (mirrors fs/squashfs.ad's read-only, single-mount, .bss-scratch
+# shape — no per-call kmalloc, no reentrancy, read path only since
+# ISO9660 is read-only by design):
+#
+#   iso9660_mount(dev_slot)                      -> int32
+#   iso9660_lookup(path, out)                    -> int32   (path -> dir record)
+#   iso9660_read(extent_lba, size, off, buf,len) -> int64   (file data by extent)
+#   iso9660_readdir(dir_lba, dir_size, cb, ctx)  -> int32   (enumerate a dir)
+#
+# ON-DISK MODEL
+#   * 2048-byte LOGICAL sectors. The block layer reads 512-byte
+#     hardware sectors, so logical sector N spans hardware LBAs
+#     [N*4, N*4+4).
+#   * The Volume Descriptor Set begins at logical sector 16. We scan it
+#     for the Primary Volume Descriptor (type 1) and remember the root
+#     directory record it embeds. (A Supplementary VD, type 2, would
+#     carry Joliet UCS-2 names — Rock Ridge is preferred and handled
+#     instead; see the JOLIET note at the foot of the file.)
+#   * A directory is a run of variable-length Directory Records packed
+#     into its extent. Each record's first byte is its length; a zero
+#     length means "no more records in THIS logical sector" — the next
+#     record starts at the following 2048-byte boundary. Records never
+#     straddle a logical-sector boundary.
+#   * Each record names a file/dir by an 8.3-ish identifier, optionally
+#     with a ";1" version suffix we strip. The first two records of
+#     every directory are the special "." (id byte 0x00) and ".."
+#     (id byte 0x01) self/parent entries.
+#
+# ROCK RIDGE (SUSP)
+#   The bytes AFTER a record's name (padded to even) up to the record
+#   length are the "System Use" area. SUSP packs tagged entries there,
+#   each a 2-char signature + 1-byte length + 1-byte version + payload:
+#     NM  POSIX/long name (may continue across records via the CONTINUE
+#         flag; we concatenate the pieces).
+#     PX  POSIX file mode (st_mode) — we expose it so callers can tell
+#         dirs/symlinks/regular files apart independent of the ISO9660
+#         FileFlags byte.
+#     SL  Symbolic link target, assembled from component records.
+#     CE  Continuation Area — the System Use area spills into another
+#         logical block; we follow ONE level of CE to pick up NM/PX/SL
+#         entries that didn't fit inline (the common case for long
+#         names + symlinks).
+#   When Rock Ridge is absent we fall back to the plain ISO9660 name.
+
+from kernel.block.blk import blk_read_sectors, SECTOR_SIZE
+from kernel.printk.printk import printk0, printk1, printk2
+
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+
+
+# --- constants --------------------------------------------------------
+
+ISO_LOGICAL_SIZE:  uint64 = 2048      # ISO9660 logical sector
+ISO_VD_START_LBA:  uint64 = 16        # first volume descriptor logical sector
+ISO_SECTORS_RATIO: uint64 = 4         # 2048 / 512 hardware sectors per logical
+
+ISO_VD_PRIMARY:    uint8  = 1
+ISO_VD_SUPPLEMENT: uint8  = 2
+ISO_VD_TERMINATOR: uint8  = 255
+
+# Directory-record FileFlags bit (offset 25).
+ISO_FF_DIRECTORY:  uint8  = 0x02
+
+# Limits for the single-mount scratch state.
+ISO_MAX_NAME:      uint64 = 256       # assembled name buffer
+ISO_MAX_DIR_BYTES: uint64 = 65536     # largest directory extent we walk (32 logical sectors)
+
+
+# --- mount-time state (single mount only) -----------------------------
+
+iso_dev_slot:       int32  = -1
+iso_root_lba:       uint64 = 0        # root directory extent, logical sector
+iso_root_size:      uint64 = 0        # root directory byte length
+
+# Scratch buffers (module-scope per the Adder large-array quirk).
+iso_sector_buf:     Array[512, uint8]          # one hardware sector
+iso_vd_buf:         Array[2048, uint8]          # one logical sector (a VD)
+iso_dir_buf:        Array[65536, uint8]         # a directory extent
+iso_ce_buf:         Array[2048, uint8]          # a Rock Ridge continuation block
+iso_name_buf:       Array[256, uint8]           # assembled Rock Ridge / ISO name
+
+
+# --- little-endian readers (ISO stores BOTH endians; we read LE) ------
+
+def _iso_rd_u16(p: Ptr[uint8]) -> uint16:
+    return cast[uint16](p[0]) | (cast[uint16](p[1]) << 8)
+
+
+def _iso_rd_u32(p: Ptr[uint8]) -> uint32:
+    return cast[uint32](p[0]) \
+        | (cast[uint32](p[1]) << 8) \
+        | (cast[uint32](p[2]) << 16) \
+        | (cast[uint32](p[3]) << 24)
+
+
+# --- raw device read at an arbitrary byte offset ----------------------
+#
+# Byte-granular reads layered over the 512-byte block layer, exactly as
+# fs/squashfs.ad does. `buf` must hold `len` bytes.
+
+def iso_dev_read(offset: uint64, buf: Ptr[uint8], len: uint64) -> int32:
+    if len == 0:
+        return 0
+    start_lba: uint64 = offset / SECTOR_SIZE
+    skew:      uint64 = offset % SECTOR_SIZE
+    produced:  uint64 = 0
+    lba:       uint64 = start_lba
+    while produced < len:
+        rc: int32 = blk_read_sectors(iso_dev_slot, lba, 1,
+                                     &iso_sector_buf[0])
+        if rc != 0:
+            return -1
+        avail: uint64 = SECTOR_SIZE - skew
+        want:  uint64 = len - produced
+        n:     uint64 = avail
+        if want < n:
+            n = want
+        memcpy(cast[Ptr[uint8]](cast[uint64](buf) + produced),
+               cast[Ptr[uint8]](cast[uint64](&iso_sector_buf[0]) + skew), n)
+        produced = produced + n
+        skew = 0
+        lba = lba + 1
+    return 0
+
+
+# Read one whole ISO logical sector (2048 bytes) by its logical LBA.
+def iso_read_logical(log_lba: uint64, buf: Ptr[uint8]) -> int32:
+    return iso_dev_read(log_lba * ISO_LOGICAL_SIZE, buf, ISO_LOGICAL_SIZE)
+
+
+# --- mount: parse the Primary Volume Descriptor -----------------------
+
+def iso9660_mount(dev_slot: int32) -> int32:
+    iso_dev_slot = dev_slot
+    iso_root_lba = 0
+    iso_root_size = 0
+
+    # Walk the Volume Descriptor Set from logical sector 16 until we hit
+    # the terminator (type 255) or find the Primary VD (type 1).
+    lba:   uint64 = ISO_VD_START_LBA
+    found: int32  = 0
+    scan:  uint64 = 0
+    while scan < 32:                       # bound the scan defensively
+        if iso_read_logical(lba, &iso_vd_buf[0]) != 0:
+            printk0("iso9660: volume descriptor read failed\n")
+            iso_dev_slot = -1
+            return -1
+        vd_type: uint8 = iso_vd_buf[0]
+        # The 5-byte standard identifier at offset 1 must be "CD001".
+        if iso_vd_buf[1] != 0x43 or iso_vd_buf[2] != 0x44 \
+                or iso_vd_buf[3] != 0x30 or iso_vd_buf[4] != 0x30 \
+                or iso_vd_buf[5] != 0x31:
+            printk0("iso9660: bad CD001 identifier\n")
+            iso_dev_slot = -1
+            return -1
+        if vd_type == ISO_VD_TERMINATOR:
+            scan = 32
+        elif vd_type == ISO_VD_PRIMARY:
+            # The root directory record lives at offset 156, 34 bytes.
+            root: Ptr[uint8] = cast[Ptr[uint8]](
+                cast[uint64](&iso_vd_buf[0]) + 156)
+            iso_root_lba  = cast[uint64](_iso_rd_u32(
+                cast[Ptr[uint8]](cast[uint64](root) + 2)))
+            iso_root_size = cast[uint64](_iso_rd_u32(
+                cast[Ptr[uint8]](cast[uint64](root) + 10)))
+            found = 1
+            lba = lba + 1
+            scan = scan + 1
+        else:
+            lba = lba + 1
+            scan = scan + 1
+
+    if found == 0:
+        printk0("iso9660: no Primary Volume Descriptor found\n")
+        iso_dev_slot = -1
+        return -1
+    if iso_root_size == 0:
+        printk0("iso9660: empty root directory record\n")
+        iso_dev_slot = -1
+        return -1
+
+    printk2("iso9660: mounted; root extent=%d size=%d\n",
+            iso_root_lba, iso_root_size)
+    return 0
+
+
+# --- Rock Ridge SUSP parsing ------------------------------------------
+#
+# Scan the System Use area [su_ptr, su_ptr+su_len) for SUSP entries.
+# When an NM (alternate name) entry is seen, its bytes are appended to
+# iso_name_buf and *name_len is advanced. A PX entry's st_mode is
+# written to *out_mode (and *have_mode set). A CE (continuation) entry
+# is followed exactly once into iso_ce_buf and re-scanned. Returns 1 if
+# any NM bytes were collected, else 0.
+
+def _rr_scan(su_ptr: Ptr[uint8], su_len: uint64,
+             name_len: Ptr[uint64], out_mode: Ptr[uint32],
+             have_mode: Ptr[int32], depth: int32) -> int32:
+    got_nm: int32 = 0
+    pos:    uint64 = 0
+    while pos + 4 <= su_len:
+        e: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](su_ptr) + pos)
+        sig0: uint8 = e[0]
+        sig1: uint8 = e[1]
+        elen: uint64 = cast[uint64](e[2])
+        if elen < 4 or pos + elen > su_len:
+            pos = su_len                       # malformed: stop
+        else:
+            # NM = alternate name. Byte 4 = flags (bit0 CONTINUE,
+            # bit1 CURRENT ".", bit2 PARENT ".."). Payload starts at 5.
+            if sig0 == 0x4E and sig1 == 0x4D:     # "NM"
+                flags: uint8 = e[4]
+                # Ignore the "." / ".." self/parent name flags.
+                if (cast[uint64](flags) & 0x06) == 0:
+                    payload: uint64 = elen - 5
+                    j: uint64 = 0
+                    while j < payload:
+                        cur: uint64 = name_len[0]
+                        if cur < ISO_MAX_NAME - 1:
+                            iso_name_buf[cur] = e[5 + j]
+                            name_len[0] = cur + 1
+                        j = j + 1
+                    got_nm = 1
+            elif sig0 == 0x50 and sig1 == 0x58:   # "PX" POSIX attributes
+                # st_mode is the first field: an 8-byte both-endian
+                # value; the LE half is at payload offset 0 (entry +4).
+                if elen >= 12:
+                    out_mode[0] = _iso_rd_u32(
+                        cast[Ptr[uint8]](cast[uint64](e) + 4))
+                    have_mode[0] = 1
+            elif sig0 == 0x43 and sig1 == 0x45:   # "CE" continuation
+                if depth < 2 and elen >= 28:
+                    ce_lba: uint32 = _iso_rd_u32(
+                        cast[Ptr[uint8]](cast[uint64](e) + 4))
+                    ce_off: uint32 = _iso_rd_u32(
+                        cast[Ptr[uint8]](cast[uint64](e) + 12))
+                    ce_ln:  uint32 = _iso_rd_u32(
+                        cast[Ptr[uint8]](cast[uint64](e) + 20))
+                    cl: uint64 = cast[uint64](ce_ln)
+                    if cl > 0 and cl <= ISO_LOGICAL_SIZE:
+                        if iso_dev_read(
+                                cast[uint64](ce_lba) * ISO_LOGICAL_SIZE
+                                + cast[uint64](ce_off),
+                                &iso_ce_buf[0], cl) == 0:
+                            if _rr_scan(&iso_ce_buf[0], cl, name_len,
+                                        out_mode, have_mode,
+                                        depth + 1) == 1:
+                                got_nm = 1
+            elif sig0 == 0x53 and sig1 == 0x54:   # "ST" terminator
+                pos = su_len
+            pos = pos + elen
+    return got_nm
+
+
+# --- directory record name decode -------------------------------------
+#
+# Decodes the name for a directory record at `rec`. Prefers a Rock
+# Ridge NM name; otherwise falls back to the ISO9660 identifier with
+# the ";1" version suffix stripped (and a trailing "." for files with
+# an empty extension dropped). Writes a NUL-terminated name into
+# iso_name_buf and returns its length. Also fills *out_mode/*have_mode
+# from a PX entry if present.
+
+def _iso_decode_name(rec: Ptr[uint8], out_mode: Ptr[uint32],
+                     have_mode: Ptr[int32]) -> uint64:
+    rec_len:  uint64 = cast[uint64](rec[0])
+    id_len:   uint64 = cast[uint64](rec[32])
+    name_len: uint64 = 0
+    have_mode[0] = 0
+    out_mode[0]  = 0
+
+    # The System Use area follows the identifier (padded so it ends on
+    # an even offset). Identifier starts at record offset 33.
+    su_start: uint64 = 33 + id_len
+    if (su_start & 1) != 0:                     # pad to even
+        su_start = su_start + 1
+    if su_start < rec_len:
+        su_len: uint64 = rec_len - su_start
+        _rr_scan(cast[Ptr[uint8]](cast[uint64](rec) + su_start),
+                 su_len, &name_len, out_mode, have_mode, 0)
+
+    if name_len > 0:
+        # Rock Ridge name collected into iso_name_buf already.
+        iso_name_buf[name_len] = 0
+        return name_len
+
+    # Fall back to the ISO9660 identifier. Special "." and ".." come
+    # through as a single 0x00 / 0x01 id byte; surface them literally.
+    id_ptr: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](rec) + 33)
+    if id_len == 1 and id_ptr[0] == 0x00:
+        iso_name_buf[0] = 0x2E                   # "."
+        iso_name_buf[1] = 0
+        return 1
+    if id_len == 1 and id_ptr[0] == 0x01:
+        iso_name_buf[0] = 0x2E                   # ".."
+        iso_name_buf[1] = 0x2E
+        iso_name_buf[2] = 0
+        return 2
+
+    # Copy the identifier, stopping at a ';' version suffix.
+    j: uint64 = 0
+    out: uint64 = 0
+    while j < id_len:
+        c: uint8 = id_ptr[j]
+        if c == 0x3B:                            # ';' -> drop version
+            j = id_len
+        else:
+            if out < ISO_MAX_NAME - 1:
+                iso_name_buf[out] = c
+                out = out + 1
+            j = j + 1
+    # Drop a trailing '.' (a file with an empty extension, e.g. "FOO.").
+    if out > 0 and iso_name_buf[out - 1] == 0x2E:
+        out = out - 1
+    iso_name_buf[out] = 0
+    return out
+
+
+# --- directory enumeration --------------------------------------------
+#
+# Reads the directory extent at logical `dir_lba` (byte length
+# `dir_size`) into iso_dir_buf and walks every Directory Record,
+# invoking cb(ctx, name_ptr, name_len, child_lba, child_size, is_dir,
+# rr_mode) for each non-self/parent entry. Handles zero-length padding
+# (skip to the next 2048-byte boundary) and multi-sector directories.
+# cb returns nonzero to stop early. Returns 0 on success, -1 on error.
+
+def iso9660_readdir(dir_lba: uint64, dir_size: uint64,
+                    cb: Fn[int32, uint64, uint64, uint64, uint64, uint64, int32, uint32],
+                    ctx: uint64) -> int32:
+    sz: uint64 = dir_size
+    if sz > ISO_MAX_DIR_BYTES:
+        sz = ISO_MAX_DIR_BYTES
+    if iso_dev_read(dir_lba * ISO_LOGICAL_SIZE, &iso_dir_buf[0], sz) != 0:
+        printk0("iso9660: directory extent read failed\n")
+        return -1
+
+    pos: uint64 = 0
+    while pos < sz:
+        rec: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](&iso_dir_buf[0]) + pos)
+        rec_len: uint64 = cast[uint64](rec[0])
+        if rec_len == 0:
+            # No more records in this logical sector: jump to the next
+            # 2048-byte boundary.
+            next: uint64 = ((pos / ISO_LOGICAL_SIZE) + 1) * ISO_LOGICAL_SIZE
+            if next <= pos:
+                pos = sz
+            else:
+                pos = next
+        else:
+            if pos + rec_len > sz:
+                pos = sz                          # truncated tail: stop
+            else:
+                id_len: uint64 = cast[uint64](rec[32])
+                id_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+                    cast[uint64](rec) + 33)
+                is_self: int32 = 0
+                if id_len == 1 and id_ptr[0] == 0x00:
+                    is_self = 1
+                if id_len == 1 and id_ptr[0] == 0x01:
+                    is_self = 1
+                if is_self == 0:
+                    child_lba: uint64 = cast[uint64](_iso_rd_u32(
+                        cast[Ptr[uint8]](cast[uint64](rec) + 2)))
+                    child_size: uint64 = cast[uint64](_iso_rd_u32(
+                        cast[Ptr[uint8]](cast[uint64](rec) + 10)))
+                    file_flags: uint8 = rec[25]
+                    is_dir: int32 = 0
+                    if (cast[uint64](file_flags)
+                            & cast[uint64](ISO_FF_DIRECTORY)) != 0:
+                        is_dir = 1
+                    rr_mode:   uint32 = 0
+                    have_mode: int32  = 0
+                    nlen: uint64 = _iso_decode_name(rec, &rr_mode,
+                                                    &have_mode)
+                    stop: int32 = cb(ctx,
+                                     cast[uint64](&iso_name_buf[0]),
+                                     nlen, child_lba, child_size,
+                                     cast[uint64](is_dir), rr_mode)
+                    if stop != 0:
+                        pos = sz
+                    else:
+                        pos = pos + rec_len
+                else:
+                    pos = pos + rec_len
+    return 0
+
+
+# --- lookup: resolve a path to a directory record ---------------------
+#
+# Walks the path component by component from the root, matching each
+# against directory entries (Rock Ridge name OR fallen-back ISO name).
+# On success writes the target's extent LBA / size / is-dir flag to the
+# out params and returns 0. Returns -1 if any component is missing.
+#
+# The component match runs INLINE (not via the readdir callback) so it
+# can recurse into subdirectories without re-entrancy on iso_dir_buf:
+# we copy the matched child's extent out before descending.
+
+iso_lk_want:      Array[256, uint8]      # current path component to match
+iso_lk_want_len:  uint64 = 0
+iso_lk_hit:       int32  = 0
+iso_lk_child_lba: uint64 = 0
+iso_lk_child_sz:  uint64 = 0
+iso_lk_child_dir: int32  = 0
+
+
+def _iso_names_eq(a: Ptr[uint8], alen: uint64,
+                  b: Ptr[uint8], blen: uint64) -> int32:
+    if alen != blen:
+        return 0
+    i: uint64 = 0
+    while i < alen:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+# Search the directory extent at (dir_lba,dir_size) for the component
+# in iso_lk_want; on a hit set iso_lk_hit + child fields. Uses a LOCAL
+# directory buffer copy via iso_dir_buf, then immediately stashes the
+# matched extent so the next descent can reuse iso_dir_buf.
+
+def _iso_dir_find(dir_lba: uint64, dir_size: uint64) -> int32:
+    sz: uint64 = dir_size
+    if sz > ISO_MAX_DIR_BYTES:
+        sz = ISO_MAX_DIR_BYTES
+    if iso_dev_read(dir_lba * ISO_LOGICAL_SIZE, &iso_dir_buf[0], sz) != 0:
+        return -1
+    iso_lk_hit = 0
+    pos: uint64 = 0
+    while pos < sz:
+        rec: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](&iso_dir_buf[0]) + pos)
+        rec_len: uint64 = cast[uint64](rec[0])
+        if rec_len == 0:
+            next: uint64 = ((pos / ISO_LOGICAL_SIZE) + 1) * ISO_LOGICAL_SIZE
+            if next <= pos:
+                pos = sz
+            else:
+                pos = next
+        else:
+            if pos + rec_len > sz:
+                pos = sz
+            else:
+                id_len: uint64 = cast[uint64](rec[32])
+                id_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+                    cast[uint64](rec) + 33)
+                is_self: int32 = 0
+                if id_len == 1 and id_ptr[0] == 0x00:
+                    is_self = 1
+                if id_len == 1 and id_ptr[0] == 0x01:
+                    is_self = 1
+                if is_self == 0:
+                    rr_mode:   uint32 = 0
+                    have_mode: int32  = 0
+                    nlen: uint64 = _iso_decode_name(rec, &rr_mode,
+                                                    &have_mode)
+                    if _iso_names_eq(&iso_name_buf[0], nlen,
+                                     &iso_lk_want[0],
+                                     iso_lk_want_len) == 1:
+                        iso_lk_child_lba = cast[uint64](_iso_rd_u32(
+                            cast[Ptr[uint8]](cast[uint64](rec) + 2)))
+                        iso_lk_child_sz = cast[uint64](_iso_rd_u32(
+                            cast[Ptr[uint8]](cast[uint64](rec) + 10)))
+                        file_flags: uint8 = rec[25]
+                        iso_lk_child_dir = 0
+                        if (cast[uint64](file_flags)
+                                & cast[uint64](ISO_FF_DIRECTORY)) != 0:
+                            iso_lk_child_dir = 1
+                        iso_lk_hit = 1
+                        pos = sz
+                    else:
+                        pos = pos + rec_len
+                else:
+                    pos = pos + rec_len
+    if iso_lk_hit == 1:
+        return 0
+    return -1
+
+
+def iso9660_lookup(path: Ptr[char], out_lba: Ptr[uint64],
+                   out_size: Ptr[uint64], out_is_dir: Ptr[int32]) -> int32:
+    if iso_dev_slot < 0:
+        return -1
+    p: Ptr[uint8] = cast[Ptr[uint8]](path)
+    # Skip a leading '/'.
+    i: uint64 = 0
+    if p[0] == 0x2F:
+        i = 1
+    cur_lba:  uint64 = iso_root_lba
+    cur_size: uint64 = iso_root_size
+    cur_dir:  int32  = 1
+
+    # Empty path or "/" => the root directory.
+    if p[i] == 0:
+        out_lba[0]    = cur_lba
+        out_size[0]   = cur_size
+        out_is_dir[0] = 1
+        return 0
+
+    while p[i] != 0:
+        # Extract the next component into iso_lk_want.
+        wl: uint64 = 0
+        while p[i] != 0 and p[i] != 0x2F:
+            if wl < ISO_MAX_NAME - 1:
+                iso_lk_want[wl] = p[i]
+                wl = wl + 1
+            i = i + 1
+        iso_lk_want[wl]  = 0
+        iso_lk_want_len  = wl
+        # Skip the separator.
+        if p[i] == 0x2F:
+            i = i + 1
+        if wl == 0:
+            # Trailing slash or doubled slash: ignore.
+            pass
+        else:
+            if cur_dir == 0:
+                return -1                         # descending into a file
+            if _iso_dir_find(cur_lba, cur_size) != 0:
+                return -1
+            cur_lba  = iso_lk_child_lba
+            cur_size = iso_lk_child_sz
+            cur_dir  = iso_lk_child_dir
+
+    out_lba[0]    = cur_lba
+    out_size[0]   = cur_size
+    out_is_dir[0] = cur_dir
+    return 0
+
+
+# --- file read by extent ----------------------------------------------
+#
+# ISO9660 files are a single contiguous extent (LBA + byte size from
+# the directory record), so a read is a straight byte-window copy off
+# the device. Supports files spanning many logical sectors. Returns the
+# number of bytes read, or -1 on error.
+
+def iso9660_read(extent_lba: uint64, file_size: uint64,
+                 offset: uint64, buf: Ptr[uint8], len: uint64) -> int64:
+    if iso_dev_slot < 0:
+        return -1
+    if offset >= file_size:
+        return 0
+    want: uint64 = len
+    if offset + want > file_size:
+        want = file_size - offset
+    if want == 0:
+        return 0
+    base: uint64 = extent_lba * ISO_LOGICAL_SIZE + offset
+    if iso_dev_read(base, buf, want) != 0:
+        return -1
+    return cast[int64](want)
+
+
+# JOLIET NOTE: a Supplementary Volume Descriptor (type 2) with the
+# escape sequence "%/@", "%/C" or "%/E" carries names as big-endian
+# UCS-2. We deliberately prefer Rock Ridge (handled above) for long /
+# POSIX names — the path most Linux media take — and read the Primary
+# VD's directory tree. Adding Joliet would mean selecting the SVD at
+# mount, then UCS-2->ASCII-folding identifiers in _iso_decode_name; the
+# record/extent walk is otherwise identical. Left as a follow-up since
+# Rock Ridge covers the long-name requirement on the target media.
