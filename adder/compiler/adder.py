@@ -52,6 +52,17 @@ TARGETS = {
     # later phase. The x86_64 paths above are untouched.
     "aarch64-linux": {"codegen": "arm64", "kbuild": False,
                       "bare_metal": False},
+    # PHASE 2 multi-arch: standalone aarch64 kernel image bootable on
+    # QEMU's `virt` machine (qemu-system-aarch64 -M virt -kernel). Same
+    # arm64 codegen, but bare_metal=True suppresses the Linux
+    # `_start`/exit-syscall wrapper: the hand-written boot stub
+    # arch/arm64/boot.S owns the reset entry (sets up a stack, branches
+    # to the Adder `kmain`), and program output is raw MMIO to the PL011
+    # UART rather than the `write` syscall. The compiler owns assembly +
+    # link itself (no kbuild). The aarch64-linux + x86 paths above stay
+    # byte-identical.
+    "aarch64-bare-metal": {"codegen": "arm64", "kbuild": False,
+                           "bare_metal": True},
 }
 DEFAULT_TARGET = "x86_64-bare-metal"
 
@@ -68,7 +79,8 @@ def get_generator(target: str):
         bare = spec.get("bare_metal", False)
         return lambda program: generate_x86(program, bare_metal=bare)
     if spec["codegen"] == "arm64":
-        return lambda program: generate_arm64(program)
+        bare = spec.get("bare_metal", False)
+        return lambda program: generate_arm64(program, bare_metal=bare)
     raise AssertionError(f"unhandled codegen backend: {spec['codegen']}")
 
 
@@ -558,6 +570,74 @@ def assemble_and_link_arm64_linux(asm_file: Path, output: Path) -> bool:
     return True
 
 
+def assemble_and_link_arm64_baremetal(asm_file: Path, output: Path,
+                                      project_root: Path) -> bool:
+    """Assemble + link a standalone aarch64 kernel image for QEMU virt.
+
+    PHASE 2 multi-arch. Combines the compiler-emitted .S (the Adder
+    `kmain` and friends, generated with bare_metal=True so there is no
+    Linux `_start`/exit wrapper) with the hand-written boot stub
+    arch/arm64/boot.S — which provides the `_start` reset entry, sets up
+    a stack, and branches to `kmain` — and links them with
+    arch/arm64/kernel.lds so the image's load address matches QEMU virt's
+    `-kernel` entry point (0x40080000).
+
+    No libc, no Linux: the resulting ELF is loaded directly by
+    qemu-system-aarch64's `-kernel`, which jumps to its entry point at
+    EL1/EL2 with the MMU off. Output is raw MMIO to the PL011 UART
+    (the codegen lowers pointer-deref stores to volatile accesses), so no
+    syscall layer is involved.
+    """
+    as_cmd = "aarch64-linux-gnu-as"
+    ld_cmd = "aarch64-linux-gnu-ld"
+
+    for tool in (as_cmd, ld_cmd):
+        try:
+            subprocess.run([tool, "--version"], capture_output=True,
+                           check=True)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            print(f"Error: {tool} not found "
+                  f"(install binutils-aarch64-linux-gnu)", file=sys.stderr)
+            return False
+
+    boot_s = project_root / "arch/arm64/boot.S"
+    lds = project_root / "arch/arm64/kernel.lds"
+    for required in (boot_s, lds):
+        if not required.exists():
+            print(f"Error: missing {required}", file=sys.stderr)
+            return False
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        boot_o = tmpdir / "boot.o"
+        main_o = tmpdir / "main.o"
+
+        for src, obj in [(boot_s, boot_o), (asm_file, main_o)]:
+            result = subprocess.run(
+                [as_cmd, "-o", str(obj), str(src)],
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                print(f"Error assembling (aarch64 bare-metal) {src}:\n"
+                      f"{result.stderr}", file=sys.stderr)
+                return False
+
+        # boot.o first so the reset entry (_start) lands at the image's
+        # load address; the linker script enforces section placement.
+        link_cmd = [
+            ld_cmd, "-nostdlib", "-static", "-z", "noexecstack",
+            "-T", str(lds), "-o", str(output),
+            str(boot_o), str(main_o),
+        ]
+        result = subprocess.run(link_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"Error linking (aarch64 bare-metal):\n{result.stderr}",
+                  file=sys.stderr)
+            return False
+
+    return True
+
+
 def assemble_and_link_x86_bare(asm_file: Path, output: Path,
                                 project_root: Path) -> bool:
     """Assemble + link a Adder bare-metal x86_64 kernel image.
@@ -812,6 +892,9 @@ def cmd_compile(args: argparse.Namespace) -> int:
     try:
         if args.target == "aarch64-linux":
             ok = assemble_and_link_arm64_linux(asm_path, output)
+        elif args.target == "aarch64-bare-metal":
+            ok = assemble_and_link_arm64_baremetal(
+                asm_path, output, find_hamnix_root())
         elif args.target == "x86_64-bare-metal":
             ok = assemble_and_link_x86_bare(asm_path, output, find_hamnix_root())
         elif args.target == "x86_64-adder-user":
@@ -824,8 +907,9 @@ def cmd_compile(args: argparse.Namespace) -> int:
             )
         else:
             raise AssertionError(
-                f"x86_64-bare-metal / x86_64-adder-user / aarch64-linux "
-                f"are the only non-kbuild link paths; got '{args.target}'"
+                f"x86_64-bare-metal / x86_64-adder-user / aarch64-linux / "
+                f"aarch64-bare-metal are the only non-kbuild link paths; "
+                f"got '{args.target}'"
             )
         if not ok:
             return 1

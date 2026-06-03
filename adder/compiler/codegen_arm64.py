@@ -156,9 +156,28 @@ class FunctionContext:
 
 
 class Arm64CodeGen:
-    """aarch64 Linux user-mode code generator (stack machine, x0 = accumulator)."""
+    """aarch64 code generator (stack machine, x0 = accumulator).
 
-    def __init__(self) -> None:
+    Two modes, selected by the `bare_metal` flag:
+
+      * Linux user-mode (default): a `_start` is emitted that calls `main`
+        and turns its return value into the process exit code via the
+        Linux `exit` syscall. Output uses the `write` syscall. This is the
+        Phase 1 path verified under qemu-aarch64.
+
+      * bare-metal (Phase 2): NO `_start` and NO syscall epilogue are
+        emitted — a hand-written boot stub (arch/arm64/boot.S) owns the
+        reset entry, sets up a stack, and branches to the Adder `kmain`.
+        There is no Linux kernel underneath, so program output is raw
+        MMIO (the codegen already lowers `cast[Ptr[uint8]](0x..)[0] = b`
+        to a volatile store) rather than the `write` syscall, and there
+        is no `exit` — `kmain` is expected to halt (a `wfi` loop). The
+        per-function code generation is byte-identical between the two
+        modes; only the program prologue differs.
+    """
+
+    def __init__(self, bare_metal: bool = False) -> None:
+        self.bare_metal = bare_metal
         self.output: list[str] = []
         self.string_literals: dict[str, str] = {}
         self.string_counter: int = 0
@@ -329,29 +348,45 @@ class Arm64CodeGen:
                     f"top-level {type(decl).__name__}",
                     getattr(decl, "span", None))
 
-        if "main" not in self.defined_funcs:
-            raise CodeGenError(
-                "aarch64: program has no `main` function to use as the "
-                "user-mode entry point")
+        if self.bare_metal:
+            # Bare-metal: the hand-written boot stub branches to `kmain`.
+            if "kmain" not in self.defined_funcs:
+                raise CodeGenError(
+                    "aarch64 (bare-metal): program has no `kmain` function "
+                    "for the boot stub (arch/arm64/boot.S) to branch to")
+        else:
+            if "main" not in self.defined_funcs:
+                raise CodeGenError(
+                    "aarch64: program has no `main` function to use as the "
+                    "user-mode entry point")
 
         self.emit("// Adder generated aarch64 assembly")
-        self.emit("// Target: aarch64-linux (Linux user-mode, AAPCS64)")
+        if self.bare_metal:
+            self.emit("// Target: aarch64-bare-metal (no OS; entry = kmain)")
+        else:
+            self.emit("// Target: aarch64-linux (Linux user-mode, AAPCS64)")
         self.emit()
         self.emit("    .arch armv8-a")
         self.emit()
 
-        # _start: call main, then exit(main()).
-        self.emit("    .text")
-        self.emit("    .globl _start")
-        self.emit("    .type _start, %function")
-        self.emit("_start:")
-        self.emit("    bl main")
-        self.emit("    mov x1, x0")          # exit code from main's x0
-        self.emit(f"    mov x8, #{SYS_EXIT}")
-        self.emit("    mov x0, x1")
-        self.emit("    svc #0")
-        self.emit("    .size _start, .-_start")
-        self.emit()
+        if not self.bare_metal:
+            # Linux user-mode: _start calls main, then exit(main()).
+            # Bare-metal deliberately emits NO _start here — arch/arm64/boot.S
+            # owns the reset vector, sets up the stack, and calls kmain. There
+            # is no OS to exit to, so there is likewise no exit-syscall tail.
+            self.emit("    .text")
+            self.emit("    .globl _start")
+            self.emit("    .type _start, %function")
+            self.emit("_start:")
+            self.emit("    bl main")
+            self.emit("    mov x1, x0")          # exit code from main's x0
+            self.emit(f"    mov x8, #{SYS_EXIT}")
+            self.emit("    mov x0, x1")
+            self.emit("    svc #0")
+            self.emit("    .size _start, .-_start")
+            self.emit()
+        else:
+            self.emit("    .text")
 
         # Functions.
         for decl in program.declarations:
@@ -1255,7 +1290,14 @@ class Arm64CodeGen:
         return ord(v[0]) if v else 0
 
 
-def generate(program: Program) -> str:
-    """Generate aarch64 Linux user-mode assembly from an Adder AST."""
-    gen = Arm64CodeGen()
+def generate(program: Program, bare_metal: bool = False) -> str:
+    """Generate aarch64 assembly from an Adder AST.
+
+    bare_metal=False (default) emits a Linux user-mode program with a
+    `_start`/`exit`-syscall wrapper around `main` (Phase 1). bare_metal=True
+    emits a freestanding image whose entry is `kmain`, with no `_start` and
+    no syscall epilogue — the hand-written arch/arm64/boot.S provides the
+    reset entry and stack setup (Phase 2).
+    """
+    gen = Arm64CodeGen(bare_metal=bare_metal)
     return gen.gen_program(program)
