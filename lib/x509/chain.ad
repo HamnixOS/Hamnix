@@ -9,32 +9,46 @@
 #   - lib/ec/p256.ad +
 #     lib/ecdsa/ecdsa.ad       (V3) for ecdsa_p256_verify on ECDSA leaves
 #
-# RFC 5280 §6.1 PATH VALIDATION — simplified for V4:
+# RFC 5280 §6.1 PATH VALIDATION (V7 — real path-validation rules):
 #
 #   1. Parse the leaf into an X509Cert.
 #   2. Hostname check: x509_match_dns(leaf, host) == 1.
 #   3. Time-window check: leaf.not_before <= now_unix <= leaf.not_after.
-#   4. Walk the chain leaf -> root:
+#   4. Leaf policy:
+#        - leaf MUST NOT be a CA (basicConstraints cA == FALSE/absent).
+#        - if the leaf carries a critical extension we don't understand,
+#          reject (RFC 5280 §6.1.4(f)).
+#        - if the leaf asserts keyUsage, it MUST include digitalSignature
+#          or keyEncipherment or keyAgreement (the bits a TLS server leaf
+#          uses for the various key-exchange shapes).
+#        - if the leaf asserts extendedKeyUsage, it MUST include
+#          serverAuth (or anyExtendedKeyUsage).
+#   5. Walk the chain leaf -> root:
 #        a. For each non-root cert, find a parent whose subject_dn (DER
-#           bytes) matches the current cert's issuer_dn. The parent is
-#           either (i) another cert in the caller-supplied chain or
+#           bytes) EXACTLY matches the current cert's issuer_dn. The parent
+#           is either (i) another cert in the caller-supplied chain or
 #           (ii) one of the CA store roots.
-#        b. Parent must have basicConstraints CA:TRUE.
-#        c. Parent's validity window must also cover now_unix.
-#        d. Verify current cert's signature via parent's public key,
+#        b. Parent must have basicConstraints cA == TRUE.
+#        c. Parent, if it asserts keyUsage, MUST include keyCertSign.
+#        d. Parent must not carry an unknown critical extension.
+#        e. pathLenConstraint: the count of non-leaf intermediates that may
+#           still follow this CA must not be exceeded.
+#        f. Parent's validity window must also cover now_unix.
+#        g. Verify current cert's signature via parent's public key,
 #           dispatched on cert.sig_alg_oid (OID_RSASSA_PSS -> RSA-PSS,
-#           OID_ECDSA_WITH_SHA256 -> ECDSA-P256; anything else -> -1).
-#        e. If parent IS a CA-store root, we're done. Else advance to
+#           OID_SHA256_WITH_RSA_ENCRYPTION -> PKCS#1 v1.5,
+#           OID_ECDSA_WITH_SHA256 -> ECDSA-P256; SHA-1 -> hard reject;
+#           anything else -> -1).
+#        h. If parent IS a CA-store root, we're done. Else advance to
 #           parent and repeat.
-#   5. Reject if (a) chain depth > 8, (b) any signature verify fails,
-#      (c) any validity-window fails, (d) parent's CA bit unset,
-#      (e) no anchor matches the chain.
+#   6. Reject if (a) chain depth > 8, (b) any signature verify fails,
+#      (c) any validity-window fails, (d) parent's CA bit unset, (e) parent
+#      lacks keyCertSign, (f) a pathLenConstraint is violated, (g) any cert
+#      bears an unknown critical extension, (h) no anchor matches the chain.
 #
 # OUT OF SCOPE (intentional, not bugs):
 #   - CRL / OCSP revocation checks
 #   - Name constraints / policy constraints (RFC 5280 §4.2.1.10-11)
-#   - Path length constraint enforcement (we accept any path <= 8)
-#   - keyUsage / extendedKeyUsage enforcement
 #   - GeneralizedTime in validity (V4 implements just UTCTime per the
 #     1950..2049 two-digit-year rule; RFC 5280 mandates GeneralizedTime
 #     for dates >= 2050 — out of scope until V5+)
@@ -64,6 +78,10 @@ from lib.x509.x509 import (
     X509Cert,
     x509_parse,
     x509_match_dns,
+    X509_KU_DIGITAL_SIGNATURE,
+    X509_KU_KEY_ENCIPHERMENT,
+    X509_KU_KEY_AGREEMENT,
+    X509_KU_KEY_CERT_SIGN,
 )
 from lib.rsa.rsa import (
     RsaPubkey,
@@ -460,6 +478,65 @@ def _parse_root_into(slot: int32, out: Ptr[X509Cert]) -> int32:
     return x509_parse(p, n, out)
 
 
+# -- policy checks ---------------------------------------------------------
+#
+# _leaf_policy_ok: RFC 5280 §6.1.4 leaf-specific constraints. Returns 1 if
+# the leaf is acceptable as a TLS server end-entity, 0 if it violates a
+# usage / extension policy.
+
+def _leaf_policy_ok(leaf: Ptr[X509Cert]) -> int32:
+    # Unknown critical extension -> reject (§6.1.4(f)).
+    if leaf[0].has_unknown_critical_ext != 0:
+        return 0
+    # An end-entity TLS cert must not be a CA.
+    if leaf[0].is_ca != 0:
+        return 0
+    # keyUsage, if present, must permit one of the bits a TLS server leaf
+    # legitimately uses: digitalSignature (ECDHE/(EC)DSA suites),
+    # keyEncipherment (RSA key-transport suites), or keyAgreement
+    # (static-DH, rare).
+    if leaf[0].key_usage_present != 0:
+        allowed: uint32 = X509_KU_DIGITAL_SIGNATURE | X509_KU_KEY_ENCIPHERMENT
+        allowed = allowed | X509_KU_KEY_AGREEMENT
+        if (leaf[0].key_usage & allowed) == 0:
+            return 0
+    # extendedKeyUsage, if present, must include serverAuth (the parser
+    # already folds anyExtendedKeyUsage into eku_server_auth).
+    if leaf[0].eku_present != 0:
+        if leaf[0].eku_server_auth == 0:
+            return 0
+    return 1
+
+
+# _issuer_policy_ok: RFC 5280 §6.1.4 constraints on a cert acting as an
+# issuer (CA). `intermediates_below` is the number of non-self-issued
+# intermediate CA certs that appear between this issuer and the leaf
+# (i.e. how many certs this CA's pathLenConstraint must still cover).
+# Returns 1 if the issuer may sign the child, 0 otherwise.
+
+def _issuer_policy_ok(issuer: Ptr[X509Cert],
+                      intermediates_below: int32) -> int32:
+    # Unknown critical extension -> reject.
+    if issuer[0].has_unknown_critical_ext != 0:
+        return 0
+    # Must be a CA (basicConstraints cA == TRUE).
+    if issuer[0].is_ca == 0:
+        return 0
+    # keyUsage, if present, must include keyCertSign (§4.2.1.3): a CA that
+    # explicitly lists its usages but omits keyCertSign may NOT sign certs.
+    if issuer[0].key_usage_present != 0:
+        if (issuer[0].key_usage & X509_KU_KEY_CERT_SIGN) == 0:
+            return 0
+    # pathLenConstraint (§4.2.1.9): a value of N permits at most N
+    # intermediate CAs below this one. path_len == -1 means "absent" (no
+    # limit). The leaf itself is not an intermediate CA, so only the CA
+    # certs strictly between this issuer and the leaf count.
+    if issuer[0].path_len >= 0:
+        if intermediates_below > issuer[0].path_len:
+            return 0
+    return 1
+
+
 # -- validate_cert_chain ---------------------------------------------------
 #
 # chain_ptrs[0..chain_count) is the caller-supplied list of DER cert
@@ -494,15 +571,21 @@ def validate_cert_chain(chain_ptrs: Ptr[Ptr[uint8]],
     if vc == 0:
         return 0
 
-    # 4. Leaf must NOT be a CA (defence in depth — a CA cert sitting in
-    # the leaf slot would be a chain confusion). RFC 5280 §6.1.4(k):
-    # only intermediate certs may carry the CA bit.
-    if leaf_scratch.is_ca != 0:
+    # 4. Leaf policy: not-a-CA, no unknown critical ext, keyUsage and
+    # extendedKeyUsage (when asserted) must permit TLS server use.
+    # RFC 5280 §6.1.4.
+    if _leaf_policy_ok(&leaf_scratch) == 0:
         return 0
 
     # Walk the chain leaf -> root, copying leaf_scratch into
     # current_scratch as the live "child" for the loop.
     _x509_copy(&leaf_scratch, &current_scratch)
+
+    # `intermediates` counts CA certs already traversed strictly below the
+    # candidate issuer we are about to check (the leaf is not counted — it
+    # is the end entity, not an intermediate CA). This feeds each issuer's
+    # pathLenConstraint check.
+    intermediates: int32 = 0
 
     # depth counts the number of certs we've already verified -- starts
     # at 0 (we haven't proven leaf yet). Cap at CHAIN_MAX_DEPTH.
@@ -519,7 +602,8 @@ def validate_cert_chain(chain_ptrs: Ptr[Ptr[uint8]],
                                  candidate_scratch.subject_dn_len,
                                  &current_scratch.issuer_dn[0],
                                  current_scratch.issuer_dn_len) != 0:
-                        if candidate_scratch.is_ca != 0:
+                        if _issuer_policy_ok(&candidate_scratch,
+                                             intermediates) != 0:
                             vc = _check_validity(&candidate_scratch,
                                                  now_unix)
                             if vc == 1:
@@ -547,7 +631,8 @@ def validate_cert_chain(chain_ptrs: Ptr[Ptr[uint8]],
                              candidate_scratch.subject_dn_len,
                              &current_scratch.issuer_dn[0],
                              current_scratch.issuer_dn_len) != 0:
-                    if candidate_scratch.is_ca != 0:
+                    if _issuer_policy_ok(&candidate_scratch,
+                                         intermediates) != 0:
                         vc = _check_validity(&candidate_scratch, now_unix)
                         if vc < 0:
                             return -1
@@ -559,13 +644,13 @@ def validate_cert_chain(chain_ptrs: Ptr[Ptr[uint8]],
                             if vrc2 == 1:
                                 # Advance: candidate becomes the new
                                 # child, search for ITS parent next
-                                # iteration. Also verify the candidate
-                                # is not the same cert as current
-                                # (degenerate loop protection — RFC 5280
-                                # discourages but does not forbid self-
-                                # links).
+                                # iteration. This candidate is an
+                                # intermediate CA, so bump the count that
+                                # the NEXT issuer's pathLenConstraint must
+                                # cover.
                                 _x509_copy(&candidate_scratch,
                                            &current_scratch)
+                                intermediates = intermediates + 1
                                 found = 1
                                 break
             j = j + 1
