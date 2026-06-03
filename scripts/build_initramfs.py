@@ -463,6 +463,13 @@ if os.environ.get("ENABLE_SYSVIPC_TEST") == "1":
 if os.environ.get("ENABLE_MQUEUE_TEST") == "1":
     FILES.append(("/etc/mqueue-test", b"1\n"))
 
+# pidfd process-management family (pidfd_open/pidfd_send_signal/waitid)
+# self-test. scripts/test_pidfd.sh sets ENABLE_PIDFD_TEST=1 to plant
+# /etc/pidfd-test; init/main.ad at boot:37.pidfd detects the marker and
+# runs do_pidfd_selftest().
+if os.environ.get("ENABLE_PIDFD_TEST") == "1":
+    FILES.append(("/etc/pidfd-test", b"1\n"))
+
 # Pipe zero-copy I/O family (splice/tee/vmsplice) self-test.
 # scripts/test_splice.sh sets ENABLE_SPLICE_TEST=1 to plant
 # /etc/splice-test; init/main.ad at boot:37.splice detects the marker

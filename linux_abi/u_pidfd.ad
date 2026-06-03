@@ -1,0 +1,498 @@
+# linux_abi/u_pidfd.ad -- the Linux pidfd process-management family.
+#
+# Real Linux service-management software (systemd, runit, modern libc
+# spawn helpers) reaches for the pidfd API to refer to a process by a
+# stable, race-free file descriptor instead of a recyclable pid:
+#
+#   * pidfd_open(pid, flags)            nr 434  -> a new fd for `pid`
+#   * pidfd_send_signal(pidfd, sig, …)  nr 424  -> signal via the fd
+#   * waitid(P_PIDFD, pidfd, …)         nr 247  -> wait on the fd
+#   * the pidfd is POLLIN-readable once the target exits
+#
+# A pidfd is a thin handle: the ONLY per-fd state is the target pid. We
+# do NOT consume an fd_buf slot (the Layer-2 fd_buf set/get path in
+# fs/vfs.ad gates on the eventfd/timerfd/signalfd/inotify markers, and
+# this file must not grow fs/vfs.ad). Instead the target pid is held in
+# a flat (task, fd)-keyed table HERE, exactly the way u_epoll.ad keeps
+# its O_NONBLOCK bitmap. The fd itself only needs its fd_idx marker
+# (FD_PIDFD_MARK), which vfs_alloc_l2_fd stamps for any marker and
+# vfs_fd_marker reads back; vfs_close falls through cleanly for a marker
+# it has never heard of (close_fd_in_task just rewrites the slot to
+# FD_CLOSED_MARK), so no teardown plumbing is needed there either.
+#
+# Readiness model: a pidfd is POLLIN-readable once its target is no
+# longer a live task. We reuse the kernel's own task table as the source
+# of truth — task_lookup_by_pid returns the live slot (skipping
+# STATE_FREE), and a slot left in STATE_EXITED is a not-yet-reaped
+# zombie. So "readable" == (no live slot for the pid) OR (the slot is
+# STATE_EXITED). The poll readiness is answered in the u_syscalls.ad
+# poll shim (_u_poll_fd_revents), the same override route signalfd uses,
+# because vfs.ad cannot see this table.
+#
+# Layer note: this is a confined Layer-2 leaf. It calls only the kernel
+# task primitives (lookup / state / pid / signal_post) + the shared
+# do_wait4 reap path; it never touches 9P / Chan / Layer-1 code.
+
+from kernel.sched.core import (
+    task_lookup_by_pid, task_state, signal_post,
+    current_idx_get,
+    STATE_EXITED,
+)
+# The Layer-2 fd-table bridge (claim an fd slot, read its marker, close
+# it) + the user-pointer-safe copy helpers + the shared wait/reap path.
+# Explicit imports: Adder resolves cross-module symbols only through an
+# import (the flat-namespace appearance in u_syscalls.ad is its own
+# module's defs). We deliberately do NOT import u_syscalls.ad — that
+# would form a cycle (it imports us) — so the PIDFD_NONBLOCK fd flag is
+# applied by the dispatch arm in u_syscalls.ad, not here.
+from fs.vfs import (
+    vfs_alloc_l2_fd, vfs_fd_marker, vfs_close,
+)
+from mm.uaccess import (
+    copy_from_user, copy_to_user,
+)
+from arch.x86.kernel.syscall import do_wait4
+
+
+# =====================================================================
+# fd marker + errno subset (Linux negative-errno convention)
+# =====================================================================
+#
+# 0xFFFFFFD1 sits in the free gap between FD_VT1_MARK (0xCF) /
+# FD_FILEMMAP_INITRAMFS (0xD2) and the §5 async-I/O block (0xD3..0xD8),
+# clear of every other marker family (FD_NET 0xD8, FD_DEVFD 0xDF, the
+# FD_PROC family at 0xFE000000). Declared HERE, not in core.ad/vfs.ad:
+# the close path falls through cleanly for an unknown marker, so the
+# fd table never needs to learn about pidfd objects.
+FD_PIDFD_MARK: uint32 = 0xFFFFFFD1
+
+PIDFD_EPERM:  int64 = -1
+PIDFD_ESRCH:  int64 = -3
+PIDFD_EBADF:  int64 = -9
+PIDFD_EFAULT: int64 = -14
+PIDFD_EINVAL: int64 = -22
+PIDFD_EMFILE: int64 = -24
+
+# waitid idtype values (<sys/wait.h>).
+P_ALL:   uint64 = 0
+P_PID:   uint64 = 1
+P_PGID:  uint64 = 2
+P_PIDFD: uint64 = 3
+
+# pidfd_open / waitid flags we recognise. PIDFD_NONBLOCK marks the fd
+# non-blocking (handled by the caller's read/poll path); any other bit
+# is rejected with EINVAL the way Linux's sys_pidfd_open does.
+PIDFD_NONBLOCK: uint64 = 0x800       # == O_NONBLOCK
+
+# waitid options bits we honour (the rest are accepted, ignored).
+PIDFD_WEXITED:  uint64 = 0x00000004
+PIDFD_WNOHANG:  uint64 = 0x00000001
+
+
+# =====================================================================
+# (task, fd) -> target pid table
+# =====================================================================
+#
+# UPIDFD_NTASKS (16) mirrors NTASKS; UPIDFD_NRFDS (16) mirrors the
+# per-task fd-table width. A flat 256-entry uint64 array covers every
+# (task slot, fd number) pair — the same flat-bitmap shape u_epoll.ad
+# uses for O_NONBLOCK. A zero entry means "no pidfd here"; a live entry
+# holds (target_pid + 1) so pid 0 stays distinguishable from empty.
+UPIDFD_NTASKS: uint64 = 16
+UPIDFD_NRFDS:  uint64 = 16
+upidfd_pid: Array[256, uint64]    # [task*16 + fd] -> target_pid + 1
+
+
+def upidfd_init():
+    i: uint64 = 0
+    while i < 256:
+        upidfd_pid[i] = 0
+        i = i + 1
+
+
+def upidfd_set(task_idx: uint64, fd: int32, pid: uint64) -> int32:
+    # Record (task, fd) -> pid. Returns 0 on success, -1 if out of range.
+    if fd < 0:
+        return -1
+    fdu: uint64 = cast[uint64](fd)
+    if task_idx >= UPIDFD_NTASKS or fdu >= UPIDFD_NRFDS:
+        return -1
+    upidfd_pid[task_idx * UPIDFD_NRFDS + fdu] = pid + 1
+    return 0
+
+
+def upidfd_clear(task_idx: uint64, fd: int32):
+    if fd < 0:
+        return
+    fdu: uint64 = cast[uint64](fd)
+    if task_idx >= UPIDFD_NTASKS or fdu >= UPIDFD_NRFDS:
+        return
+    upidfd_pid[task_idx * UPIDFD_NRFDS + fdu] = 0
+
+
+def upidfd_get(task_idx: uint64, fd: int32) -> int64:
+    # Target pid for (task, fd), or -1 if no pidfd is recorded there.
+    if fd < 0:
+        return -1
+    fdu: uint64 = cast[uint64](fd)
+    if task_idx >= UPIDFD_NTASKS or fdu >= UPIDFD_NRFDS:
+        return -1
+    v: uint64 = upidfd_pid[task_idx * UPIDFD_NRFDS + fdu]
+    if v == 0:
+        return -1
+    return cast[int64](v - 1)
+
+
+def upidfd_target_readable(pid: uint64) -> int32:
+    # A pidfd is POLLIN-readable once its target process has exited:
+    # either there is no live task slot for the pid (reaped / gone), or
+    # the slot is a STATE_EXITED zombie (exited, awaiting reap). A live
+    # RUNNING/READY/STOPPED task is NOT readable.
+    slot: int32 = task_lookup_by_pid(pid)
+    if slot < 0:
+        return 1                              # gone / reaped -> readable
+    if task_state(slot) == STATE_EXITED:
+        return 1                              # zombie -> readable
+    return 0
+
+
+# =====================================================================
+# pidfd_open(pid, flags)  -- nr 434
+# =====================================================================
+#
+# Returns a new fd referring to the process `pid`. The fd is pollable
+# for process exit (upidfd_target_readable) and usable by
+# pidfd_send_signal / waitid(P_PIDFD). EINVAL on a bad pid or an
+# unsupported flag; ESRCH if no such live task exists.
+#
+# The fd allocation reuses the established Layer-2 fd-table bridge
+# (vfs_alloc_l2_fd) so the pidfd lives in the normal per-task fd table
+# and is closed by the normal close path. `vfs_alloc_l2_fd` /
+# `_u_set_fd_nonblock` are defined in u_syscalls.ad and resolved at link
+# time (Adder's flat function namespace), the same way the eventfd /
+# timerfd / signalfd handlers there reach them.
+def upidfd_open(pid_arg: uint64, flags: uint64) -> int64:
+    pid: int64 = cast[int64](pid_arg)
+    if pid <= 0:
+        return PIDFD_EINVAL
+    # Only PIDFD_NONBLOCK is a valid flag for pidfd_open.
+    if (flags & ~PIDFD_NONBLOCK) != 0:
+        return PIDFD_EINVAL
+    if task_lookup_by_pid(pid_arg) < 0:
+        return PIDFD_ESRCH
+    fd: int32 = vfs_alloc_l2_fd(FD_PIDFD_MARK)
+    if fd < 0:
+        return PIDFD_EMFILE
+    if upidfd_set(current_idx_get(), fd, pid_arg) != 0:
+        vfs_close(fd)
+        return PIDFD_EBADF
+    # PIDFD_NONBLOCK marks the fd O_NONBLOCK; the fd-flag bitmap lives in
+    # u_syscalls.ad (which imports this module), so the dispatch arm
+    # applies it on the returned fd to avoid an import cycle here.
+    return cast[int64](fd)
+
+
+# =====================================================================
+# pidfd_send_signal(pidfd, sig, info, flags)  -- nr 424
+# =====================================================================
+#
+# Deliver `sig` to the process referenced by `pidfd`, reusing the
+# kernel's signal_post delivery path (the same one _u_kill / tgkill
+# call). EBADF for a non-pidfd fd; ESRCH if the target has already been
+# reaped; EINVAL for a bad signal or an unsupported flag.
+#
+# `info` (a struct siginfo*) and `flags` are accepted for ABI
+# compatibility: Linux only consults siginfo for SI_QUEUE-style sends,
+# which the native signal_post path does not model, so we ignore it and
+# raise the plain signal (matching a NULL-info send). A non-NULL info is
+# read-validated via copy_from_user so a bad pointer yields EFAULT, not
+# a kernel fault.
+def upidfd_send_signal(pidfd: uint64, sig: uint64,
+                       info: uint64, flags: uint64) -> int64:
+    if flags != 0:
+        return PIDFD_EINVAL
+    fd: int32 = cast[int32](pidfd)
+    if vfs_fd_marker(fd) != FD_PIDFD_MARK:
+        return PIDFD_EBADF
+    tgt_pid: int64 = upidfd_get(current_idx_get(), fd)
+    if tgt_pid < 0:
+        return PIDFD_EBADF
+    # sig must be a valid signal number; sig==0 is the "existence probe"
+    # (no signal sent) but still validates the target.
+    if sig >= 64:
+        return PIDFD_EINVAL
+    # If a siginfo was supplied, fault-check it (4-byte si_signo lead is
+    # enough to prove the page is readable) — never deref raw user mem.
+    if info != 0:
+        probe: Array[4, uint8]
+        if copy_from_user(cast[uint64](&probe[0]), info, 4) != 0:
+            return PIDFD_EFAULT
+    slot: int32 = task_lookup_by_pid(cast[uint64](tgt_pid))
+    if slot < 0 or task_state(slot) == STATE_EXITED:
+        return PIDFD_ESRCH                     # already reaped / exited
+    if sig != 0:
+        signal_post(cast[uint64](slot), sig)
+    return 0
+
+
+# =====================================================================
+# waitid(idtype, id, infop, options, rusage)  -- nr 247
+# =====================================================================
+#
+# Hamnix has no native waitid; we wire the pidfd-relevant idtypes into
+# the shared do_wait4 reap path (the same one wait4 / waitpid use):
+#
+#   * P_PIDFD : translate pidfd -> pid, then reap that pid.
+#   * P_PID   : reap the given pid directly.
+#   * P_ALL   : reap any child.
+#
+# `infop` is a struct siginfo*; do_wait4 writes a Linux wait-status int
+# rather than a full siginfo, so we hand it a kernel scratch and (when
+# infop is non-NULL) project the essential fields (si_pid / si_signo /
+# si_code / si_status) into the user siginfo via copy_to_user. WNOHANG
+# is forwarded; do_wait4 returns 0 with no reapable child.
+#
+# do_wait4 / task_pid_at resolve at link time (kernel global namespace).
+upidfd_waitid_wstatus: Array[4, uint8]     # kernel scratch for do_wait4
+upidfd_waitid_siginfo: Array[128, uint8]   # assembled siginfo_t for out
+
+
+def _upidfd_decode_wstatus(ws: uint32, sig_out: Ptr[int32],
+                           code_out: Ptr[int32], status_out: Ptr[int32]):
+    # Decode a Linux wait-status int (as written by do_wait4) into the
+    # siginfo fields waitid reports. CLD_EXITED=1 / CLD_KILLED=2.
+    low: uint32 = ws & 0x7F
+    if low == 0:
+        # WIFEXITED: status in bits 15:8, CLD_EXITED.
+        sig_out[0]    = 17                     # SIGCHLD
+        code_out[0]   = 1                      # CLD_EXITED
+        status_out[0] = cast[int32]((ws >> 8) & 0xFF)
+    else:
+        # WIFSIGNALED: termination signal in the low 7 bits, CLD_KILLED.
+        sig_out[0]    = 17                     # SIGCHLD
+        code_out[0]   = 2                      # CLD_KILLED
+        status_out[0] = cast[int32](low)
+
+
+def upidfd_waitid(idtype: uint64, id: uint64, infop: uint64,
+                  options: uint64, rusage: uint64) -> int64:
+    # Resolve the idtype to a pid argument for do_wait4.
+    wait_pid: uint64 = id
+    if idtype == P_PIDFD:
+        fd: int32 = cast[int32](id)
+        if vfs_fd_marker(fd) != FD_PIDFD_MARK:
+            return PIDFD_EBADF
+        tgt: int64 = upidfd_get(current_idx_get(), fd)
+        if tgt < 0:
+            return PIDFD_EBADF
+        wait_pid = cast[uint64](tgt)
+    elif idtype == P_PID:
+        wait_pid = id
+    elif idtype == P_ALL:
+        wait_pid = cast[uint64](-1)            # do_wait4 "any child"
+    else:
+        return PIDFD_EINVAL                    # P_PGID unsupported
+
+    # Forward to do_wait4 with a kernel-side wstatus scratch. We pass the
+    # WNOHANG bit straight through (do_wait4 reads only WNOHANG).
+    ws_ptr: uint64 = cast[uint64](&upidfd_waitid_wstatus[0])
+    cast[Ptr[int32]](ws_ptr)[0] = 0
+    rc: int64 = do_wait4(wait_pid, ws_ptr, options, rusage)
+    if rc < 0:
+        return rc
+    if rc == 0:
+        # WNOHANG with nothing reapable: POSIX waitid leaves *infop
+        # zeroed (si_pid == 0) and returns 0.
+        if infop != 0:
+            i: uint64 = 0
+            while i < 128:
+                upidfd_waitid_siginfo[i] = 0
+                i = i + 1
+            if copy_to_user(infop, cast[uint64](&upidfd_waitid_siginfo[0]),
+                            128) != 0:
+                return PIDFD_EFAULT
+        return 0
+
+    # A child was reaped: rc is its pid. Project the wait status into a
+    # siginfo_t for *infop. The x86_64 siginfo layout we fill is the
+    # SIGCHLD shape: si_signo(0) si_errno(4) si_code(8) then the _sigchld
+    # union at offset 16: si_pid(16) si_uid(20) si_status(24).
+    if infop != 0:
+        z: uint64 = 0
+        while z < 128:
+            upidfd_waitid_siginfo[z] = 0
+            z = z + 1
+        sig_v:  int32 = 0
+        code_v: int32 = 0
+        stat_v: int32 = 0
+        ws_read: uint32 = cast[uint32](cast[Ptr[int32]](ws_ptr)[0])
+        _upidfd_decode_wstatus(ws_read, &sig_v, &code_v, &stat_v)
+        base: uint64 = cast[uint64](&upidfd_waitid_siginfo[0])
+        cast[Ptr[int32]](base + 0)[0]  = sig_v             # si_signo
+        cast[Ptr[int32]](base + 8)[0]  = code_v            # si_code
+        cast[Ptr[int32]](base + 16)[0] = cast[int32](rc)   # si_pid
+        cast[Ptr[int32]](base + 24)[0] = stat_v            # si_status
+        if copy_to_user(infop, base, 128) != 0:
+            return PIDFD_EFAULT
+    # waitid returns 0 on success (the reaped pid is reported via infop).
+    return 0
+
+
+# =====================================================================
+# Boot self-test  --  [pidfd] PASS / FAIL  (boot:37.pidfd)
+# =====================================================================
+#
+# Exercises every primitive directly in boot context against a
+# synthesised inert target task (notetest_claim_slot stamps a STATE_READY
+# slot with a known pid — the same borrow-a-slot pattern the note-group
+# self-tests use). No real fork is needed: the pidfd code path only ever
+# consults the task table, which the borrowed slot populates.
+#
+#   * pidfd_open(pid)            -> a valid fd; poll NOT readable (alive)
+#   * pidfd_open(bad flags)      -> EINVAL
+#   * pidfd_open(dead pid)       -> ESRCH
+#   * pidfd_send_signal(SIGTERM) -> target's sig_pending bit latched
+#   * pidfd_send_signal(badfd)   -> EBADF
+#   * after the target "exits" (slot released) the pidfd is POLLIN-ready
+#   * pidfd_send_signal on the now-gone target -> ESRCH
+#
+# do_pidfd_selftest is the entry init/main.ad's boot:37.pidfd gate calls.
+
+from kernel.sched.core import (
+    notetest_claim_slot, notetest_set_slot_pid, notetest_release_slot,
+    signal_pending, STATE_READY,
+    TaskStruct, current_task, FD_CLOSED_MARK,
+)
+from kernel.printk.printk import printk0
+
+
+SIGTERM_NR: uint64 = 15
+
+
+def _pidfd_fail(msg: Ptr[char]):
+    printk0("[pidfd] FAIL: ")
+    printk0(msg)
+    printk0("\n")
+
+
+def do_pidfd_selftest() -> int32:
+    upidfd_init()
+    # The boot task that runs this hook (boot:37.pidfd, inside
+    # start_kernel) has an UNINITIALISED fd table — per-task fd tables are
+    # only primed by create_user_task / kthread_create, neither of which
+    # has run for the bootstrap context. _alloc_fd then finds no
+    # FD_CLOSED_MARK slot and vfs_alloc_l2_fd returns -EMFILE. So mark fd
+    # slots 3..15 free before pidfd_open (which allocs an fd). Snapshot +
+    # restore so nothing downstream sees a mutated table; slots 0..2
+    # (stdio) are left untouched. Same dance uabi_fills_selftest uses.
+    pf_boot_task: Ptr[TaskStruct] = current_task()
+    pf_fd_save: Array[16, uint32]
+    pf_fdi: uint64 = 3
+    while pf_fdi < 16:
+        pf_fd_save[pf_fdi] = pf_boot_task[0].fd_idx[pf_fdi]
+        pf_boot_task[0].fd_idx[pf_fdi] = FD_CLOSED_MARK
+        pf_fdi = pf_fdi + 1
+
+    # Borrow an inert task slot as our target, stamp a known pid on it.
+    tgt_slot: int32 = notetest_claim_slot(STATE_READY, 0)
+    if tgt_slot < 0:
+        _pidfd_fail("could not claim a target task slot")
+        return 1
+    tgt_pid: uint64 = 90001
+    notetest_set_slot_pid(tgt_slot, tgt_pid)
+
+    # --- pidfd_open on the live target -------------------------------
+    fd64: int64 = upidfd_open(tgt_pid, 0)
+    if fd64 < 0:
+        notetest_release_slot(tgt_slot)
+        _pidfd_fail("pidfd_open returned an error on a live pid")
+        return 1
+    pidfd: int32 = cast[int32](fd64)
+    printk0("[pidfd] PASS: pidfd_open returned a valid fd\n")
+
+    # The fd must be a real pidfd marker.
+    if vfs_fd_marker(pidfd) != FD_PIDFD_MARK:
+        notetest_release_slot(tgt_slot)
+        _pidfd_fail("opened fd is not tagged FD_PIDFD_MARK")
+        return 1
+
+    # The live target must NOT be poll-readable yet.
+    if upidfd_target_readable(tgt_pid) != 0:
+        notetest_release_slot(tgt_slot)
+        _pidfd_fail("live target reported POLLIN-readable")
+        return 1
+    printk0("[pidfd] PASS: live target not yet POLLIN-readable\n")
+
+    # --- error paths on open -----------------------------------------
+    if upidfd_open(tgt_pid, 0x40000000) != PIDFD_EINVAL:
+        notetest_release_slot(tgt_slot)
+        _pidfd_fail("pidfd_open with a bad flag did not return EINVAL")
+        return 1
+    if upidfd_open(0, 0) != PIDFD_EINVAL:
+        notetest_release_slot(tgt_slot)
+        _pidfd_fail("pidfd_open(pid=0) did not return EINVAL")
+        return 1
+    if upidfd_open(88888, 0) != PIDFD_ESRCH:
+        notetest_release_slot(tgt_slot)
+        _pidfd_fail("pidfd_open on a dead pid did not return ESRCH")
+        return 1
+    printk0("[pidfd] PASS: open EINVAL/ESRCH error paths correct\n")
+
+    # --- pidfd_send_signal -------------------------------------------
+    if upidfd_send_signal(cast[uint64](pidfd), SIGTERM_NR, 0, 0) != 0:
+        notetest_release_slot(tgt_slot)
+        _pidfd_fail("pidfd_send_signal(SIGTERM) failed")
+        return 1
+    pend: uint64 = signal_pending(cast[uint64](tgt_slot))
+    term_bit: uint64 = cast[uint64](1) << SIGTERM_NR
+    if (pend & term_bit) == 0:
+        notetest_release_slot(tgt_slot)
+        _pidfd_fail("SIGTERM was not latched on the target's sig_pending")
+        return 1
+    printk0("[pidfd] PASS: pidfd_send_signal latched SIGTERM on target\n")
+
+    # send_signal error paths: EBADF for a non-pidfd, EINVAL for a bad
+    # signal number, EINVAL for an unsupported flag.
+    if upidfd_send_signal(cast[uint64](0), SIGTERM_NR, 0, 0) != PIDFD_EBADF:
+        notetest_release_slot(tgt_slot)
+        _pidfd_fail("pidfd_send_signal on a non-pidfd fd != EBADF")
+        return 1
+    if upidfd_send_signal(cast[uint64](pidfd), 200, 0, 0) != PIDFD_EINVAL:
+        notetest_release_slot(tgt_slot)
+        _pidfd_fail("pidfd_send_signal with a bad signal != EINVAL")
+        return 1
+    if upidfd_send_signal(cast[uint64](pidfd), SIGTERM_NR, 0, 1) != PIDFD_EINVAL:
+        notetest_release_slot(tgt_slot)
+        _pidfd_fail("pidfd_send_signal with a bad flag != EINVAL")
+        return 1
+    printk0("[pidfd] PASS: send_signal EBADF/EINVAL error paths correct\n")
+
+    # --- target exits: pidfd becomes POLLIN-readable -----------------
+    # Releasing the borrowed slot returns it to STATE_FREE; from the
+    # pidfd's view the pid is now gone (reaped), so it must read POLLIN.
+    notetest_release_slot(tgt_slot)
+    if upidfd_target_readable(tgt_pid) == 0:
+        _pidfd_fail("pidfd did not become POLLIN-readable after exit")
+        return 1
+    printk0("[pidfd] PASS: pidfd POLLIN-readable after target exit\n")
+
+    # A send to the now-gone target must report ESRCH (the fd is still a
+    # valid pidfd, but its process is gone).
+    if upidfd_send_signal(cast[uint64](pidfd), SIGTERM_NR, 0, 0) != PIDFD_ESRCH:
+        _pidfd_fail("send to an exited target did not return ESRCH")
+        return 1
+    printk0("[pidfd] PASS: send to an exited target returns ESRCH\n")
+
+    # Tidy: drop our (task, fd) record + the fd-table slot.
+    upidfd_clear(current_idx_get(), pidfd)
+    vfs_close(pidfd)
+
+    # Restore the boot task's original fd-table slots (3..15) so nothing
+    # downstream sees the mutated table.
+    pf_rfdi: uint64 = 3
+    while pf_rfdi < 16:
+        pf_boot_task[0].fd_idx[pf_rfdi] = pf_fd_save[pf_rfdi]
+        pf_rfdi = pf_rfdi + 1
+
+    printk0("[pidfd] PASS\n")
+    return 0
