@@ -62,6 +62,7 @@ from drivers.pci.pci import (
 from arch.x86.kernel.apic import ioapic_redirect
 from arch.x86.kernel.irq import register_irq_handler
 from mm.page_alloc import alloc_pages
+from mm.page_alloc import free_pages
 from mm.slab import kmalloc
 # Higher-half kernel: a caller-supplied DMA buffer that is a kernel
 # global needs virt_to_phys() rebasing before the NVMe controller
@@ -185,6 +186,15 @@ NVME_CNS_CONTROLLER:    uint32 = 0x01
 # greater than the NSID given in CDW1.
 NVME_CNS_ACTIVE_NS_LIST: uint32 = 0x02
 
+# GET LOG PAGE (admin opcode 0x02) log identifiers (CDW10[7..0]).
+# 0x02 is the SMART / Health Information log — a 512-byte structure with
+# the controller's health summary (critical-warning flags, composite
+# temperature, available spare, percentage used, and 128-bit data
+# units / host read/write / command counters).
+NVME_LOG_SMART:         uint32 = 0x02
+# The SMART/Health log page is 512 bytes.
+NVME_SMART_LOG_BYTES:   uint32 = 512
+
 # SET/GET FEATURES: Number of Queues feature (FID 0x07). The SET request
 # in CDW11 packs [NCQR:16..31 | NSQR:0..15] as 0-based queue counts; the
 # completion DW0 returns the granted counts in the same layout.
@@ -244,6 +254,21 @@ class NvmeState:
     model:          Array[41, uint8]
     # 20-byte controller serial number + NUL.
     serial:         Array[21, uint8]
+
+    # SMART / Health Information snapshot, captured from the last GET LOG
+    # PAGE (log id 0x02). smart_valid is 1 once a successful fetch has
+    # populated these. Temperature is in Kelvin (raw log value); the
+    # lower-64-bits of the 128-bit data/host/command counters are kept
+    # (they overwhelmingly suffice for any realistic device lifetime).
+    smart_valid:        uint32
+    smart_crit_warning: uint32   # byte 0: critical-warning bitmask
+    smart_temp_k:       uint32   # bytes 1..2: composite temp (Kelvin)
+    smart_avail_spare:  uint32   # byte 3: available spare (%)
+    smart_percent_used: uint32   # byte 5: percentage used (endurance)
+    smart_data_units_read:  uint64   # bytes 32..47 (low 64), 1000×512B
+    smart_data_units_written: uint64 # bytes 48..63 (low 64), 1000×512B
+    smart_host_reads:   uint64   # bytes 64..79 (low 64)
+    smart_host_writes:  uint64   # bytes 80..95 (low 64)
 
 
 nvme: NvmeState
@@ -1262,6 +1287,107 @@ def nvme_write_lba_ns(nsid: uint32, lba: uint64, nblocks: uint16,
     return _nvme_rw_ns(NVME_IO_WRITE, nsid, lba, nblocks, src)
 
 
+# --- FLUSH (I/O opcode 0x00) ---------------------------------------
+#
+# A FLUSH commits a namespace's volatile write cache to non-volatile
+# media. It carries NO data transfer (PRP1/PRP2 are zero) and only one
+# parameter — the namespace id in DW1. Until now NVME_IO_FLUSH was a
+# dangling constant; this is the first issuer. A durable write path
+# (e.g. fsync over an NVMe-backed filesystem) needs this to be real.
+#
+# Routes over a round-robin-selected I/O queue, the same way reads and
+# writes do, so a flush serialises after the writes that preceded it on
+# that queue. Returns 0 on completion-status 0, -1 otherwise.
+def nvme_flush_ns(nsid: uint32) -> int32:
+    if nvme.bar0 == 0:
+        return -1
+    if _ns_slot_for_nsid(nsid) < 0:
+        printk1("[nvme] flush: nsid=%d not active\n", cast[uint64](nsid))
+        return -1
+    qid: uint32 = _nvme_pick_queue()
+    # FLUSH has no data buffer: PRP1=PRP2=0, all CDWs zero.
+    status: uint32 = _io_submit_and_wait_q(
+        qid, NVME_IO_FLUSH, nsid, 0, 0, 0, 0, 0, 0, 0, 0)
+    if status != 0:
+        printk2("[nvme] flush nsid=%d qid=%d FAILED", cast[uint64](nsid),
+                cast[uint64](qid))
+        printk1(" (status=%x)\n", cast[uint64](status))
+        return -1
+    return 0
+
+
+# Convenience: flush the primary namespace (nsid=1).
+def nvme_flush() -> int32:
+    return nvme_flush_ns(1)
+
+
+# --- SMART / Health Information log (admin GET LOG PAGE, lid 0x02) --
+#
+# GET LOG PAGE returns controller/namespace health telemetry. We fetch
+# the 512-byte SMART/Health page (log id 0x02, NSID 0xFFFFFFFF =
+# controller-wide) into a page-aligned scratch buffer and decode the
+# fields we care about into the NvmeState snapshot. Until now
+# NVME_ADMIN_GET_LOG was a dangling constant; this is the first issuer.
+#
+# CDW10 layout for GET LOG PAGE: [NUMDL:16..31 | RAE:15 | LID:7..0],
+# where NUMDL is the number of DWORDs to transfer minus one. 512 bytes
+# = 128 DWORDs → NUMDL = 127. Returns 0 on success, -1 on failure.
+#
+# SMART log byte layout (NVMe §5.14.1.2):
+#   byte   0      Critical Warning (bitmask)
+#   bytes  1..2   Composite Temperature (Kelvin, LE)
+#   byte   3      Available Spare (%)
+#   byte   5      Percentage Used (endurance, %)
+#   bytes 32..47  Data Units Read    (128-bit; we keep low 64)
+#   bytes 48..63  Data Units Written (128-bit; we keep low 64)
+#   bytes 64..79  Host Read Commands (128-bit; we keep low 64)
+#   bytes 80..95  Host Write Commands (128-bit; we keep low 64)
+def nvme_fetch_smart_log() -> int32:
+    if nvme.bar0 == 0:
+        return -1
+    buf: uint64 = alloc_pages(0)
+    if buf == 0:
+        printk0("[nvme] smart: alloc_pages failed\n")
+        return -1
+    memset(cast[Ptr[uint8]](buf), 0, 4096)
+    numd: uint32 = (NVME_SMART_LOG_BYTES / 4) - 1     # DWORDs-1 = 127
+    cdw10: uint32 = (numd << 16) | (NVME_LOG_SMART & 0xFF)
+    # NSID 0xFFFFFFFF selects controller-wide SMART data.
+    status: uint32 = _admin_submit_and_wait(
+        NVME_ADMIN_GET_LOG, 0xFFFFFFFF, buf, 0,
+        cdw10, 0, 0, 0, 0, 0)
+    if status != 0:
+        printk1("[nvme] GET LOG (SMART) failed (status=%x)\n",
+                cast[uint64](status))
+        free_pages(buf, 0)
+        return -1
+
+    b: Ptr[uint8] = cast[Ptr[uint8]](buf)
+    nvme.smart_crit_warning = cast[uint32](b[0])
+    temp_lo: uint32 = cast[uint32](b[1])
+    temp_hi: uint32 = cast[uint32](b[2])
+    nvme.smart_temp_k = temp_lo | (temp_hi << 8)
+    nvme.smart_avail_spare = cast[uint32](b[3])
+    nvme.smart_percent_used = cast[uint32](b[5])
+    nvme.smart_data_units_read    = cast[Ptr[uint64]](buf + 32)[0]
+    nvme.smart_data_units_written = cast[Ptr[uint64]](buf + 48)[0]
+    nvme.smart_host_reads  = cast[Ptr[uint64]](buf + 64)[0]
+    nvme.smart_host_writes = cast[Ptr[uint64]](buf + 80)[0]
+    nvme.smart_valid = 1
+
+    printk2("[nvme] SMART crit_warn=%x temp=%dK",
+            cast[uint64](nvme.smart_crit_warning),
+            cast[uint64](nvme.smart_temp_k))
+    printk2(" spare=%d%% used=%d%%\n",
+            cast[uint64](nvme.smart_avail_spare),
+            cast[uint64](nvme.smart_percent_used))
+    printk2("[nvme] SMART data_read=%d data_written=%d units\n",
+            nvme.smart_data_units_read,
+            nvme.smart_data_units_written)
+    free_pages(buf, 0)
+    return 0
+
+
 # --- Public write/read wrappers ------------------------------------
 #
 # Same shape as virtio-blk's read_sectors / write_sectors so the
@@ -1640,6 +1766,13 @@ def nvme_smoke_test() -> int32:
     # "[nvme-multiq]" PASS markers the test script greps for.
     _nvme_multiq_self_test()
 
+    # ----- FLUSH + SMART/Health self-test -------------------------
+    # Issues the two commands that were previously dangling opcode
+    # constants: a namespace FLUSH (I/O 0x00) after a write, and a
+    # SMART/Health GET LOG PAGE (admin 0x02). Emits "[nvme-health]"
+    # PASS markers the test script greps for.
+    _nvme_health_self_test()
+
     return 0
 
 
@@ -1771,6 +1904,80 @@ def _nvme_multiq_self_test() -> int32:
             printk1("[nvme-multiq] second-namespace read FAILED (nsid=%d)\n",
                     cast[uint64](nsid2))
             return -1
+    return 0
+
+
+# Exercise the two newly-issued commands — FLUSH (I/O 0x00) and the
+# SMART/Health GET LOG PAGE (admin 0x02) — and emit stable
+# "[nvme-health]" PASS markers the test script greps for.
+#
+#   1. Write a known pattern at LBA 4 of nsid=1, then FLUSH the
+#      namespace. A FLUSH after a write proves the durability barrier
+#      command completes with status 0. Read the data back to confirm
+#      it survived the flush.
+#   2. Fetch the SMART/Health log and assert the snapshot is valid and
+#      self-consistent (temperature non-zero — every real/emulated
+#      controller reports a Kelvin temperature; available-spare <= 100).
+def _nvme_health_self_test() -> int32:
+    # ----- FLUSH -----
+    wbuf: uint64 = alloc_pages(0)
+    rbuf: uint64 = alloc_pages(0)
+    if wbuf == 0 or rbuf == 0:
+        printk0("[nvme-health] alloc_pages failed\n")
+        return -1
+    memset(cast[Ptr[uint8]](wbuf), 0, 4096)
+    memset(cast[Ptr[uint8]](rbuf), 0, 4096)
+    wp: Ptr[uint8] = cast[Ptr[uint8]](wbuf)
+    i: uint64 = 0
+    while i < 512:
+        wp[i] = cast[uint8](cast[uint8](i & 0xFF) ^ cast[uint8](0x7E))
+        i = i + 1
+    if nvme_write_lba_ns(1, 4, 1, wbuf) != 0:
+        printk0("[nvme-health] pre-flush write FAILED\n")
+        free_pages(wbuf, 0)
+        free_pages(rbuf, 0)
+        return -1
+    if nvme_flush_ns(1) != 0:
+        printk0("[nvme-health] FLUSH FAILED\n")
+        free_pages(wbuf, 0)
+        free_pages(rbuf, 0)
+        return -1
+    printk0("[nvme-health] PASS flush (nsid=1)\n")
+    # Confirm the flushed data reads back intact.
+    if nvme_read_lba_ns(1, 4, 1, rbuf) != 0:
+        printk0("[nvme-health] post-flush read FAILED\n")
+        free_pages(wbuf, 0)
+        free_pages(rbuf, 0)
+        return -1
+    rp: Ptr[uint8] = cast[Ptr[uint8]](rbuf)
+    j: uint64 = 0
+    while j < 512:
+        if rp[j] != wp[j]:
+            printk2("[nvme-health] post-flush MISMATCH byte %d (got %x)\n",
+                    j, cast[uint64](rp[j]))
+            free_pages(wbuf, 0)
+            free_pages(rbuf, 0)
+            return -1
+        j = j + 1
+    printk0("[nvme-health] PASS flush-durable readback\n")
+    free_pages(wbuf, 0)
+    free_pages(rbuf, 0)
+
+    # ----- SMART / Health log -----
+    if nvme_fetch_smart_log() != 0:
+        printk0("[nvme-health] SMART fetch FAILED\n")
+        return -1
+    if nvme.smart_valid != 1:
+        printk0("[nvme-health] SMART snapshot invalid\n")
+        return -1
+    if nvme.smart_temp_k == 0:
+        printk0("[nvme-health] SMART temperature implausible (0K)\n")
+        return -1
+    if nvme.smart_avail_spare > 100:
+        printk1("[nvme-health] SMART available-spare implausible (%d%%)\n",
+                cast[uint64](nvme.smart_avail_spare))
+        return -1
+    printk0("[nvme-health] PASS smart-log\n")
     return 0
 
 
