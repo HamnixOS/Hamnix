@@ -261,6 +261,72 @@ arm64_brk_reported: uint64 = 0
 P9_MSG_BASE: uint64 = 0x40224000
 
 # ---------------------------------------------------------------------------
+# Phase 10: SMP secondary-core bring-up via PSCI on qemu-virt.
+#
+# The aarch64 port boots single-core. qemu-virt with `-smp 2` starts the
+# secondary CPU(s) POWERED OFF; they are released only by a PSCI CPU_ON call.
+# The default `-M virt` machine (cortex-a72, no EL3 firmware) enters the OS at
+# EL1 and routes PSCI through the HVC conduit, so _psci_cpu_on() issues `hvc #0`
+# per the SMC Calling Convention.
+#
+# Bring-up sequence (all driven from the primary's Phase-9 hand-off):
+#   1. The primary hand-emits a tiny secondary entry TRAMPOLINE into a RAM page.
+#      The secondary is released with MMU OFF, SP undefined, at EL1; the
+#      trampoline sets SP to a dedicated secondary stack, then branches to the
+#      Adder body arm64_secondary_main(). (We bake arm64_secondary_main (as a value) into
+#      the trampoline as an immediate — with the identity map VA == PA, an Adder
+#      function's address is a valid physical entry point.)
+#   2. The primary issues PSCI CPU_ON (func id 0xC4000003) targeting CPU1's
+#      affinity, with the trampoline's physical address as the entry point.
+#   3. arm64_secondary_main() runs MMU-off on CPU1: it sets an entered flag,
+#      enables the GIC CPU interface for its own core, writes a sentinel to a
+#      SHARED memory cell (with a dmb ish so the primary observes it), then
+#      increments the online-CPU counter — proving real cross-core progress. It
+#      never touches the UART (only the primary prints), so the two cores never
+#      interleave bytes on the shared PL011.
+#   4. The primary spins (dmb ish + reload) waiting for the online counter to
+#      reach 2, then prints "[arm64] secondary core entered", "[arm64] CPU1
+#      online" and "[arm64] SMP bring-up OK" on the secondary's behalf. The
+#      shared cells are PLAIN memory accessed with
+#      explicit barriers on both sides (no caching tricks: identity-mapped Normal
+#      memory is coherent across the two cores once the MMU/caches are on for the
+#      primary and the secondary publishes with dmb).
+# ---------------------------------------------------------------------------
+
+# PSCI CPU_ON 64-bit function id (SMC Calling Convention, PSCI v0.2+).
+PSCI_FN_CPU_ON: uint64 = 0xC4000003
+# PSCI return status: 0 == SUCCESS.
+PSCI_SUCCESS: uint64 = 0
+# Target affinity (MPIDR_EL1.Aff0) of the secondary core we bring up. On
+# qemu-virt CPU index N has affinity N at Aff0.
+SMP_CPU1_MPIDR: uint64 = 1
+
+# Secondary entry trampoline: a hand-emitted blob in an EL1-only RAM page (clear
+# of the EL0 windows, the page tables, and the Phase-7/9 scratch pages). The
+# secondary's PSCI entry point is this page's physical address.
+SMP_TRAMPOLINE: uint64 = 0x40140000
+# Dedicated 16 KiB secondary boot stack (grows down from the top), EL1-only RAM.
+SMP_CPU1_STACK_TOP: uint64 = 0x40150000
+
+# Shared cross-core cells (plain identity-mapped Normal memory, published by the
+# secondary with dmb ish and polled by the primary with dmb ish). Kept in their
+# own 4 KiB page well clear of code/stacks/tables so cache-line traffic on them
+# is isolated. SMP_ONLINE counts cores that have reported live; SMP_SENTINEL is
+# the value the secondary writes so the primary can observe genuine cross-core
+# progress at a known address.
+SMP_ONLINE: uint64 = 0x40160000        # online-CPU counter (primary seeds to 1)
+SMP_SENTINEL: uint64 = 0x40160008      # cross-core sentinel cell
+SMP_ENTERED: uint64 = 0x40160010       # set to 1 by the secondary on entry
+SMP_SENTINEL_VALUE: uint64 = 0x5A5A5A5A   # the value CPU1 publishes
+
+# The secondary core does NOT touch the shared PL011 UART: with both cores alive
+# and no UART lock, concurrent writes would interleave bytes mid-line. Instead
+# the secondary signals liveness purely through the shared memory cells above
+# (entered flag, sentinel, online counter), and the PRIMARY prints every marker
+# once it has observed those publishes — so all UART output stays on one core
+# and the boot log is clean and deterministic.
+
+# ---------------------------------------------------------------------------
 # Identity-mapped L1 page table. A single level-1 table of 512 8-byte block
 # descriptors (4 KiB granule => each L1 entry spans 1 GiB). We place it at a
 # fixed, 4 KiB-aligned physical address in RAM, well past the kernel image
@@ -1705,7 +1771,11 @@ def arm64_brk_dispatch(frame_ptr: Ptr[uint64], nr: uint64, a0: uint64, a1: uint6
             fm: Ptr[char] = "[arm64] EL0 page-table brk FAIL\n"
             _uart_puts(fm)
         arm64_brk_active = 0
+        # Phase 9 done; hand off to Phase 10 SMP secondary-core bring-up. The
+        # IRQs stay masked (deterministic, no timer re-entry); arm64_run_smp()
+        # halts after printing the SMP PASS marker and never returns.
         _msr_daifset(2)
+        arm64_run_smp()
         while True:
             _wfi()
 
@@ -1763,6 +1833,177 @@ def arm64_run_brk_demo() -> int64:
     _msr_sp_el0(USER_STACK_TOP)        # EL0 stack pointer
     _isb()
     _eret()                            # -> EL0; svc traps re-enter EL1; no return
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 10 — SMP secondary-core bring-up via PSCI.
+# ---------------------------------------------------------------------------
+
+# The Adder body the secondary core runs once the trampoline has given it a
+# stack. It executes MMU-OFF at EL1 on CPU1: with the identity map, the kernel's
+# code/globals/MMIO all resolve at their physical == virtual addresses, so plain
+# Adder (GIC pokes, shared-cell stores) works directly. The secondary enables
+# its OWN GIC CPU interface (the GICC registers are banked per core but share
+# one MMIO address), records that it entered, publishes a sentinel to the shared
+# cell with a dmb ish so the primary observes it, then increments the online
+# counter. It deliberately does NOT touch the UART (no cross-core interleave);
+# the primary prints all markers. After signalling liveness it parks forever.
+def arm64_secondary_main() -> int64:
+    # Record entry into the Adder body (the primary reports this for us).
+    entered: Ptr[uint64] = cast[Ptr[uint64]](SMP_ENTERED)
+    entered[0] = cast[uint64](1)
+    _dmb_ish()
+
+    # Enable this core's GIC CPU interface so it could take IRQs (SGIs/PPIs).
+    # GICC is banked per-core: writing these MMIO offsets configures CPU1's own
+    # interface, independent of the primary's.
+    gicc_pmr: Ptr[uint32] = cast[Ptr[uint32]](GICC_BASE + GICC_PMR)
+    gicc_pmr[0] = 0xF0                             # allow all priorities
+    gicc_ctlr: Ptr[uint32] = cast[Ptr[uint32]](GICC_BASE + GICC_CTLR)
+    gicc_ctlr[0] = 1                               # enable signalling
+
+    # Publish the cross-core sentinel FIRST, then a dmb ish to order it before
+    # the online-counter store the primary waits on (so once the primary sees
+    # the counter reach 2, the sentinel is guaranteed already visible).
+    sentinel: Ptr[uint64] = cast[Ptr[uint64]](SMP_SENTINEL)
+    sentinel[0] = SMP_SENTINEL_VALUE
+    _dmb_ish()
+
+    # Increment the online-CPU counter so the primary observes a real second
+    # core reporting live. The secondary is the SOLE writer after the primary
+    # seeds the cell to 1 (the primary only reads it), so an ordered read-add-
+    # write under dmb ish is a correct increment here: read the seeded value,
+    # add one, publish it. The dmb ish barriers (here and the sentinel store
+    # above) give the primary a guaranteed coherent view once it sees the count.
+    online: Ptr[uint64] = cast[Ptr[uint64]](SMP_ONLINE)
+    _dmb_ish()
+    cur: uint64 = online[0]
+    online[0] = cur + cast[uint64](1)
+    _dmb_ish()
+
+    # Liveness signalled. Wake any core spinning in wfe, then park forever.
+    _sev()
+    while True:
+        _wfe()
+    return 0
+
+
+# Hand-emit the secondary entry trampoline into SMP_TRAMPOLINE. The secondary is
+# released by PSCI CPU_ON with MMU off, SP undefined, at EL1; this blob sets SP
+# to the dedicated secondary stack top and branches to arm64_secondary_main().
+# We bake the function's address in as an immediate: with the identity map a
+# kernel function's virtual address equals its physical address, so the baked
+# value is a valid MMU-off branch target. (We pass arm64_secondary_main (as a value) in so
+# the primary supplies the runtime address.)
+def arm64_build_smp_trampoline(secondary_entry: uint64) -> int64:
+    a: uint64 = SMP_TRAMPOLINE
+
+    # x9 = SMP_CPU1_STACK_TOP ; mov sp, x9   (ADD sp, x9, #0 = 0x91000000 | (Rn<<5) | 31)
+    a = _emit_load_imm64(a, cast[uint64](9), SMP_CPU1_STACK_TOP)
+    a = _emit_word(a, cast[uint64](0x91000000) | (cast[uint64](9) << cast[uint64](5)) | cast[uint64](31))
+
+    # x9 = arm64_secondary_main (as a value) ; br x9   (BR Xn = 0xD61F0000 | (Rn<<5))
+    a = _emit_load_imm64(a, cast[uint64](9), secondary_entry)
+    a = _emit_word(a, cast[uint64](0xD61F0000) | (cast[uint64](9) << cast[uint64](5)))
+
+    # Make the freshly-written instruction words visible to all cores' I-side.
+    _dsb_ish()
+    _isb()
+    return 0
+
+
+# Phase-10 entry point (invoked from the Phase-9 clean-exit hand-off). Build the
+# secondary trampoline, seed the shared cells, issue PSCI CPU_ON to release CPU1,
+# then spin (with barriers) until the secondary reports online and its sentinel
+# appears — proving real cross-core progress. Prints explicit markers and halts.
+def arm64_run_smp() -> int64:
+    intro: Ptr[char] = "[arm64] Phase 10: SMP secondary-core bring-up via PSCI\n"
+    _uart_puts(intro)
+
+    # Seed the shared cells: this (primary) core counts as 1 online; clear the
+    # sentinel + entered flag so their later appearance unambiguously comes from
+    # the secondary.
+    online: Ptr[uint64] = cast[Ptr[uint64]](SMP_ONLINE)
+    sentinel: Ptr[uint64] = cast[Ptr[uint64]](SMP_SENTINEL)
+    entered: Ptr[uint64] = cast[Ptr[uint64]](SMP_ENTERED)
+    online[0] = cast[uint64](1)
+    sentinel[0] = cast[uint64](0)
+    entered[0] = cast[uint64](0)
+    _dsb_ish()
+
+    # Build the trampoline the secondary will enter at (PSCI entry = its phys
+    # address). Pass the Adder body's address as the baked branch target.
+    arm64_build_smp_trampoline(cast[uint64](arm64_secondary_main))
+
+    # Release CPU1 via PSCI CPU_ON. ctx (x3) is passed to the secondary in x0;
+    # the trampoline ignores it, so 0 is fine.
+    status: uint64 = _psci_cpu_on(PSCI_FN_CPU_ON, SMP_CPU1_MPIDR, SMP_TRAMPOLINE, cast[uint64](0))
+    if status != PSCI_SUCCESS:
+        fm: Ptr[char] = "[arm64] PSCI CPU_ON FAILED status="
+        _uart_puts(fm)
+        _uart_puthex(status)
+        nl: Ptr[char] = "\n"
+        _uart_puts(nl)
+        bad: Ptr[char] = "[arm64] SMP bring-up FAIL\n"
+        _uart_puts(bad)
+        while True:
+            _wfi()
+
+    okmsg: Ptr[char] = "[arm64] PSCI CPU_ON issued\n"
+    _uart_puts(okmsg)
+
+    # Spin waiting for the secondary to report online. Re-read the shared cells
+    # through a dmb ish each iteration so we observe CPU1's publishes. Bound the
+    # wait with a large spin budget so a wedged secondary fails loudly instead of
+    # hanging the whole test.
+    spins: int64 = 0
+    seen_online: int64 = 0
+    while spins < 200000000:
+        _dmb_ish()
+        cur: uint64 = online[0]
+        if cur >= cast[uint64](2):
+            seen_online = 1
+            break
+        spins = spins + 1
+
+    if seen_online == 0:
+        to: Ptr[char] = "[arm64] secondary did not come online (timeout)\n"
+        _uart_puts(to)
+        bad2: Ptr[char] = "[arm64] SMP bring-up FAIL\n"
+        _uart_puts(bad2)
+        while True:
+            _wfi()
+
+    # The counter reached 2 -> CPU1 is live. Read the entered flag + cross-core
+    # sentinel it published (both ordered before the counter store by the
+    # secondary's dmb ish barriers). The primary prints these on the secondary's
+    # behalf so no UART output ever interleaves across the two cores.
+    _dmb_ish()
+    obs: uint64 = sentinel[0]
+    ent: uint64 = entered[0]
+
+    if ent != cast[uint64](0):
+        em: Ptr[char] = "[arm64] secondary core entered\n"
+        _uart_puts(em)
+
+    c1msg: Ptr[char] = "[arm64] CPU1 online\n"
+    _uart_puts(c1msg)
+    smsg: Ptr[char] = "[arm64] CPU1 sentinel -> "
+    _uart_puts(smsg)
+    _uart_puthex(obs)
+    nl2: Ptr[char] = "\n"
+    _uart_puts(nl2)
+
+    if obs == SMP_SENTINEL_VALUE:
+        pm: Ptr[char] = "[arm64] SMP bring-up OK\n"
+        _uart_puts(pm)
+    else:
+        bad3: Ptr[char] = "[arm64] SMP bring-up FAIL\n"
+        _uart_puts(bad3)
+
+    while True:
+        _wfi()
     return 0
 
 

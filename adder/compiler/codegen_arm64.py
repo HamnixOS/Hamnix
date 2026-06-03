@@ -1219,6 +1219,13 @@ class Arm64CodeGen:
         # Phase 4: return from EL1 to EL0 using SPSR_EL1/ELR_EL1. This never
         # returns to the Adder caller; control resumes at ELR_EL1 in EL0.
         "_eret":            "eret",
+        # Phase 10: a full-system data barrier (dmb ish) for ordering plain
+        # shared-memory accesses between cores (the cross-CPU sentinel handshake)
+        # without the heavier dsb ish completion semantics.
+        "_dmb_ish":         "dmb ish",
+        # Phase 10: send/wait event for inter-core spin-wait power efficiency.
+        "_sev":             "sev",
+        "_wfe":             "wfe",
     }
 
     def _try_gen_arm64_intrinsic(self, name, args, span) -> bool:
@@ -1264,6 +1271,30 @@ class Arm64CodeGen:
             self.emit("    add x0, x0, :lo12:arm64_vectors")
             self.emit("    msr vbar_el1, x0")
             self.emit("    mov x0, #0")
+            return True
+        if name == "_psci_cpu_on":
+            # Phase 10: PSCI CPU_ON via the qemu-virt conduit. The default
+            # `-M virt` machine (cortex-a72, no EL3 firmware) enters the OS at
+            # EL1 and routes PSCI through HVC, so we issue `hvc #0` per the SMC
+            # Calling Convention: x0 = function id (CPU_ON = 0xC4000003),
+            # x1 = target MPIDR affinity, x2 = secondary entry physical address,
+            # x3 = context id (passed to the secondary in x0). The PSCI status
+            # is returned in x0 (0 == SUCCESS). We evaluate the four arguments
+            # into x0..x3 (last-first so earlier evaluations are not clobbered),
+            # spilling each onto the stack, then pop them into the ABI registers.
+            if len(args) != 4:
+                raise CodeGenError(
+                    "aarch64: _psci_cpu_on expects exactly 4 arguments")
+            for a in args:
+                self.gen_expr(a)                 # value -> x0
+                self.push("x0")
+            # Stack now (top->bottom) holds: ctx, entry, target, func_id; pop in
+            # reverse so x0=func_id, x1=target, x2=entry, x3=ctx.
+            self.pop("x3")                        # ctx
+            self.pop("x2")                        # entry_pa
+            self.pop("x1")                        # target_cpu
+            self.pop("x0")                        # func_id
+            self.emit("    hvc #0")
             return True
         if name in ("_msr_daifclr", "_msr_daifset"):
             if len(args) != 1:
