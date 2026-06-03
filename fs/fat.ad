@@ -1072,6 +1072,558 @@ def fat_delete(path: Ptr[char]) -> int32:
                              &fat_sector_buf[0])
 
 
+# --- VFAT long-filename (LFN) support -----------------------------
+#
+# Mirrors fs/fat/namei_vfat.c + the LFN slot codec in fs/fat/dir.c at
+# minimum scope. An LFN slot is a 32-byte directory entry whose
+# attribute byte (offset 11) == 0x0F. Slots precede their 8.3 entry
+# and are stored in REVERSE order. Each slot carries 13 UTF-16LE
+# characters across three fields:
+#       bytes  1..10   5 chars
+#       bytes 14..25   6 chars
+#       bytes 28..31   2 chars
+# Byte 0 is the sequence number: low bits 1..N are the ordinal, bit 6
+# (0x40) marks the last-written / first-logical slot. Byte 13 is the
+# checksum of the matching 8.3 short name. Bytes 12 (type) and 26..27
+# (first-cluster, always 0 for LFN) are reserved.
+#
+# We decode the UTF-16LE stream to the driver's native byte buffer:
+# the common ASCII subset round-trips exactly; the 0x0000 terminator
+# and 0xFFFF padding stop decoding. On the write side we emit the
+# standard "BASENA~1.EXT" numeric-tail alias (unique within the dir)
+# plus the reverse-order slot chain.
+
+FAT_ATTR_LFN: uint8 = 0x0F
+LFN_LAST_MASK: uint8 = 0x40
+
+
+def _fat_lfn_checksum(name83: Ptr[uint8]) -> uint8:
+    # The standard VFAT short-name checksum: rotate-right the running
+    # sum one bit and add each of the 11 short-name bytes in turn.
+    sum: uint8 = 0
+    i: uint64 = 0
+    while i < 11:
+        # ((sum >> 1) | (sum << 7)) is a byte-wise rotate-right by 1.
+        rot: uint8 = cast[uint8](((sum >> 1) | (sum << 7)) & 0xFF)
+        sum = cast[uint8]((rot + name83[i]) & 0xFF)
+        i = i + 1
+    return sum
+
+
+def _lfn_slot_put_chars(slot: Ptr[uint8], chars: Ptr[uint16]):
+    # Pack 13 UTF-16LE code units (chars[0..12]) into the three name
+    # fields of a 32-byte LFN slot. The caller has pre-filled the
+    # sequence byte, attribute, type and checksum.
+    # field 1: bytes 1..10 (5 chars)
+    k: uint64 = 0
+    while k < 5:
+        _write_u16_le(cast[Ptr[uint8]](cast[uint64](slot) + 1 + k * 2),
+                      chars[k])
+        k = k + 1
+    # field 2: bytes 14..25 (6 chars)
+    k = 0
+    while k < 6:
+        _write_u16_le(cast[Ptr[uint8]](cast[uint64](slot) + 14 + k * 2),
+                      chars[5 + k])
+        k = k + 1
+    # field 3: bytes 28..31 (2 chars)
+    k = 0
+    while k < 2:
+        _write_u16_le(cast[Ptr[uint8]](cast[uint64](slot) + 28 + k * 2),
+                      chars[11 + k])
+        k = k + 1
+
+
+def _lfn_slot_get_chars(slot: Ptr[uint8], out: Ptr[uint16]):
+    # Inverse of _lfn_slot_put_chars: pull the 13 UTF-16LE code units
+    # out of one slot into out[0..12].
+    k: uint64 = 0
+    while k < 5:
+        out[k] = _read_u16_le(
+            cast[Ptr[uint8]](cast[uint64](slot) + 1 + k * 2))
+        k = k + 1
+    k = 0
+    while k < 6:
+        out[5 + k] = _read_u16_le(
+            cast[Ptr[uint8]](cast[uint64](slot) + 14 + k * 2))
+        k = k + 1
+    k = 0
+    while k < 2:
+        out[11 + k] = _read_u16_le(
+            cast[Ptr[uint8]](cast[uint64](slot) + 28 + k * 2))
+        k = k + 1
+
+
+def _name_needs_lfn(name: Ptr[char]) -> int32:
+    # Decide whether `name` (a NUL-terminated leaf) needs an LFN: it
+    # does NOT fit 8.3 if the stem is >8 chars, the extension is >3,
+    # there is more than one dot, or any char is lowercase / illegal
+    # for a short name. Returns 1 if an LFN is required, 0 if a plain
+    # 8.3 entry suffices.
+    i: uint64 = 0
+    stem: uint64 = 0
+    ext: uint64 = 0
+    seen_dot: int32 = 0
+    while name[i] != 0:
+        c: int32 = name[i]
+        if c == 46:                              # '.'
+            if seen_dot != 0:
+                return 1                         # second dot
+            seen_dot = 1
+            i = i + 1
+            continue
+        if c >= 97 and c <= 122:                 # lowercase
+            return 1
+        if c == 32:                              # embedded space
+            return 1
+        if seen_dot != 0:
+            ext = ext + 1
+        else:
+            stem = stem + 1
+        i = i + 1
+    if stem > 8 or ext > 3:
+        return 1
+    if stem == 0:
+        return 1                                 # no stem (e.g. ".x")
+    return 0
+
+
+def _short_base_char(c: int32) -> uint8:
+    # Map one source char to a legal uppercase short-name byte; illegal
+    # chars collapse to '_'. Used when synthesising a BASENA~1 alias.
+    if c >= 97 and c <= 122:
+        return cast[uint8](c - 32)
+    if (c >= 48 and c <= 57) or (c >= 65 and c <= 90):
+        return cast[uint8](c & 0xFF)
+    return 95                                    # '_'
+
+
+def _fat_make_short_alias(name: Ptr[char], tail: uint64,
+                          out: Ptr[uint8]):
+    # Build an 8.3 alias "BASE~<tail>.EXT" into out[0..11] (space
+    # padded). `name` is the long leaf; `tail` is the numeric suffix
+    # (>=1). The stem is the first legal chars of the basename, room
+    # left for "~<tail>".
+    # First space-fill all 11 bytes.
+    i: uint64 = 0
+    while i < 11:
+        out[i] = 32
+        i = i + 1
+    # Find where the LAST dot is, to split base / ext.
+    n: uint64 = 0
+    while name[n] != 0:
+        n = n + 1
+    dot: int64 = -1
+    k: uint64 = 0
+    while k < n:
+        if name[k] == 46:
+            dot = cast[int64](k)
+        k = k + 1
+    base_end: uint64 = n
+    if dot >= 0:
+        base_end = cast[uint64](dot)
+    # How many digits does the tail need?
+    digits: uint64 = 1
+    t: uint64 = tail
+    while t >= 10:
+        t = t / 10
+        digits = digits + 1
+    # Stem room = 8 - (1 for '~') - digits.
+    stem_room: uint64 = 8
+    if stem_room > 1 + digits:
+        stem_room = stem_room - (1 + digits)
+    else:
+        stem_room = 1
+    # Copy legal base chars into the stem.
+    si: uint64 = 0
+    bi: uint64 = 0
+    while bi < base_end and si < stem_room:
+        c: int32 = name[bi]
+        if c != 46 and c != 32:
+            out[si] = _short_base_char(c)
+            si = si + 1
+        bi = bi + 1
+    # '~' then the decimal tail.
+    out[si] = 126                                # '~'
+    si = si + 1
+    # Emit the tail digits most-significant first.
+    place: uint64 = 1
+    d: uint64 = 1
+    while d < digits:
+        place = place * 10
+        d = d + 1
+    rem: uint64 = tail
+    while place > 0:
+        out[si] = cast[uint8](48 + (rem / place) % 10)
+        si = si + 1
+        place = place / 10
+    # Extension: up to 3 legal chars after the last dot.
+    if dot >= 0:
+        ei: uint64 = 0
+        src: uint64 = cast[uint64](dot) + 1
+        while src < n and ei < 3:
+            out[8 + ei] = _short_base_char(name[src])
+            ei = ei + 1
+            src = src + 1
+
+
+def _fat_short_alias_exists(dir_cluster: uint64,
+                            name83: Ptr[uint8]) -> int32:
+    # Returns 1 if an 8.3 entry equal to `name83` already lives in the
+    # directory chain (live or LFN entries skipped via _name_match's
+    # caller). Used to make a generated alias unique.
+    l: uint64 = 0
+    o: uint64 = 0
+    c: uint64 = 0
+    s: uint64 = 0
+    return _fat_dir_find_entry(dir_cluster, name83, &l, &o, &c, &s)
+
+
+def _fat_unique_short_alias(dir_cluster: uint64, name: Ptr[char],
+                            out: Ptr[uint8]) -> int32:
+    # Generate a "BASE~N" alias unique within dir_cluster. Tries N=1..
+    # until _fat_short_alias_exists reports a miss. Returns 1 on
+    # success (out filled), 0 if it somehow can't (>4095 collisions).
+    tail: uint64 = 1
+    while tail < 4096:
+        _fat_make_short_alias(name, tail, out)
+        if _fat_short_alias_exists(dir_cluster, out) == 0:
+            return 1
+        tail = tail + 1
+    return 0
+
+
+# Scratch for the LFN char chunk being written / read. Module-scope so
+# we never put a big buffer on the stack.
+_lfn_chunk: Array[13, uint16]
+_lfn_name83: Array[11, uint8]
+
+# Directory-slot run scratch (module-scope; FAT routines never run
+# reentrantly). _lfn_run_* hold the located contiguous slot chain;
+# _lfn_win_* hold the sliding free-window during the search.
+_lfn_run_lba: Array[64, uint64]
+_lfn_run_off: Array[64, uint64]
+_lfn_win_lba: Array[64, uint64]
+_lfn_win_off: Array[64, uint64]
+
+
+def _fat_write_lfn_slot(lba: uint64, off: uint64, seq: uint8,
+                        checksum: uint8, chars: Ptr[uint16]) -> int32:
+    # RMW a single 32-byte LFN slot at (lba, off). `seq` is the full
+    # sequence byte (already OR'd with 0x40 if it's the last/first-
+    # logical slot). Returns 0 on success, -1 on I/O error.
+    if blk_read_sectors(fat_blockdev_slot, lba, 1, &fat_sector_buf[0]) != 0:
+        return -1
+    e: uint64 = cast[uint64](&fat_sector_buf[0]) + off
+    ep: Ptr[uint8] = cast[Ptr[uint8]](e)
+    # Zero the slot first.
+    i: uint64 = 0
+    while i < 32:
+        ep[i] = 0
+        i = i + 1
+    ep[0] = seq
+    ep[11] = FAT_ATTR_LFN
+    ep[12] = 0                                   # type
+    ep[13] = checksum
+    # first-cluster word at 26..27 stays 0.
+    _lfn_slot_put_chars(ep, chars)
+    return blk_write_sectors(fat_blockdev_slot, lba, 1, &fat_sector_buf[0])
+
+
+def _fat_chunk_for_slot(name: Ptr[char], namelen: uint64,
+                        slot_ordinal: uint64, out: Ptr[uint16]):
+    # Fill out[0..12] with the 13 UTF-16LE code units belonging to LFN
+    # slot `slot_ordinal` (1-based) of the name. Past the NUL we write
+    # a single 0x0000 terminator then 0xFFFF padding, exactly as
+    # Windows does.
+    base: uint64 = (slot_ordinal - 1) * 13
+    k: uint64 = 0
+    while k < 13:
+        idx: uint64 = base + k
+        if idx < namelen:
+            out[k] = cast[uint16](name[idx] & 0xFF)
+        elif idx == namelen:
+            out[k] = 0                            # NUL terminator
+        else:
+            out[k] = 0xFFFF                       # padding
+        k = k + 1
+
+
+def _fat_create_long(path: Ptr[char]) -> int32:
+    # Create an empty file at `path` whose leaf needs an LFN. Generates
+    # a unique 8.3 alias, writes the reverse-order LFN slot chain plus
+    # the real 8.3 entry into a contiguous run of directory slots, and
+    # allocates a first data cluster. Returns 0 on success, -1 on
+    # failure.
+    if fat_blockdev_slot < 0:
+        return -1
+    leaf: Array[96, uint8]
+    parent_cluster: uint64 = _fat_resolve_parent_dir(
+        path, &leaf[0])
+    if parent_cluster == 0:
+        return -1
+    namelen: uint64 = 0
+    while leaf[namelen] != 0:
+        namelen = namelen + 1
+    if namelen == 0:
+        return -1
+    # Generate a unique short alias for this directory.
+    if _fat_unique_short_alias(parent_cluster,
+                               cast[Ptr[char]](&leaf[0]),
+                               &_lfn_name83[0]) == 0:
+        printk0("fat: lfn: no unique short alias\n")
+        return -1
+    checksum: uint8 = _fat_lfn_checksum(&_lfn_name83[0])
+    # Number of LFN slots = ceil(namelen / 13).
+    nslots: uint64 = (namelen + 12) / 13
+    total_slots: uint64 = nslots + 1             # + the real 8.3 entry
+    # Allocate the file's first data cluster up front.
+    new_cluster: uint64 = _fat_alloc_cluster()
+    if new_cluster == 0:
+        return -1
+    if _fat_zero_cluster(new_cluster) != 0:
+        _fat_set_cluster(new_cluster, 0)
+        return -1
+    # Find a contiguous run of `total_slots` free 32-byte slots in
+    # directory-entry order, crossing cluster boundaries via the FAT
+    # chain (growing the directory on exhaustion). _lfn_run_* receive
+    # each slot's location.
+    if total_slots > 64:
+        _fat_set_cluster(new_cluster, 0)
+        return -1
+    if _fat_find_slot_run(parent_cluster, total_slots,
+                          &_lfn_run_lba[0], &_lfn_run_off[0]) == 0:
+        printk0("fat: lfn: no contiguous dir slots\n")
+        _fat_set_cluster(new_cluster, 0)
+        return -1
+    # Write the LFN slots in REVERSE order: the highest ordinal is the
+    # FIRST physical slot and carries the 0x40 last-logical marker.
+    # run[0] is the first physical slot.
+    s: uint64 = 0
+    while s < nslots:
+        ordinal: uint64 = nslots - s             # nslots..1
+        _fat_chunk_for_slot(cast[Ptr[char]](&leaf[0]), namelen,
+                            ordinal, &_lfn_chunk[0])
+        seq: uint8 = cast[uint8](ordinal & 0xFF)
+        if s == 0:
+            seq = cast[uint8](seq | LFN_LAST_MASK)
+        if _fat_write_lfn_slot(_lfn_run_lba[s], _lfn_run_off[s], seq,
+                               checksum, &_lfn_chunk[0]) != 0:
+            _fat_set_cluster(new_cluster, 0)
+            return -1
+        s = s + 1
+    # Finally the real 8.3 entry in the last slot of the run.
+    if _fat_write_dir_entry(_lfn_run_lba[nslots], _lfn_run_off[nslots],
+                            &_lfn_name83[0], 0x20, new_cluster, 0) != 0:
+        _fat_set_cluster(new_cluster, 0)
+        return -1
+    return 0
+
+
+def _fat_find_slot_run(dir_cluster: uint64, need: uint64,
+                       out_lba: Ptr[uint64],
+                       out_off: Ptr[uint64]) -> int32:
+    # Find `need` CONTIGUOUS usable 32-byte slots in the directory's
+    # cluster chain, filling out_lba[0..need-1] / out_off[0..need-1]
+    # with each slot's location. Contiguity is in directory-entry
+    # order, crossing cluster boundaries via the FAT chain. Growth on
+    # exhaustion reuses _fat_alloc_cluster + the dir-link path. Returns
+    # 1 on success, 0 on I/O error / volume full.
+    #
+    # Algorithm: walk every entry in chain order. Track a running
+    # window of consecutive free slots (first byte 0x00 or 0xE5). Once
+    # the window reaches `need`, we have our run. A 0x00 sentinel means
+    # the rest of this cluster is free; an entry past the sentinel is
+    # likewise free. If we reach the chain end without a long-enough
+    # run, grow the directory and the new cluster supplies fresh slots.
+    cluster: uint64 = dir_cluster
+    safety:  uint64 = _fat_total_clusters() + 4
+    win: uint64 = 0
+    while True:
+        sec: uint64 = 0
+        while sec < fat_sectors_per_clu:
+            lba: uint64 = _cluster_to_lba(cluster) + sec
+            if blk_read_sectors(fat_blockdev_slot, lba, 1,
+                                &fat_sector_buf[0]) != 0:
+                return 0
+            n: uint64 = _dir_entries_per_sector()
+            ei: uint64 = 0
+            while ei < n:
+                fb: uint8 = fat_sector_buf[ei * 32]
+                if fb == 0 or fb == 0xE5:
+                    if win < 64:
+                        _lfn_win_lba[win] = lba
+                        _lfn_win_off[win] = ei * 32
+                    win = win + 1
+                    if win >= need and win <= 64:
+                        # The first `need` slots of the current window
+                        # (which starts at index win-need) are ours.
+                        start: uint64 = win - need
+                        r: uint64 = 0
+                        while r < need:
+                            out_lba[r] = _lfn_win_lba[start + r]
+                            out_off[r] = _lfn_win_off[start + r]
+                            r = r + 1
+                        return 1
+                else:
+                    win = 0                       # run broken
+                ei = ei + 1
+            sec = sec + 1
+        nxt: uint32 = _fat_lookup_cluster(cluster)
+        if _is_end_of_chain(nxt) != 0:
+            # Grow: a fresh zeroed cluster gives `need` free slots
+            # (need <= 16 <= entries-per-cluster for our geometry, and
+            # the window may already span into it). Allocate, zero,
+            # link, and rescan from the new cluster.
+            nc: uint64 = _fat_alloc_cluster()
+            if nc == 0:
+                return 0
+            if _fat_zero_cluster(nc) != 0:
+                _fat_set_cluster(nc, 0)
+                return 0
+            if _fat_set_cluster(cluster, cast[uint32](nc)) != 0:
+                _fat_set_cluster(nc, 0)
+                return 0
+            cluster = cast[uint64](nc)
+            # Keep the running window: a partial run at the old cluster
+            # tail can complete in the new cluster.
+            continue
+        if safety == 0:
+            return 0
+        safety = safety - 1
+        cluster = cast[uint64](nxt)
+
+
+def _fat_decode_lfn_run(slots: Ptr[uint8], nslots: uint64,
+                        out: Ptr[uint8], out_max: uint64) -> uint64:
+    # Decode `nslots` collected LFN slots (in PHYSICAL order, i.e. the
+    # first physical slot — highest ordinal, 0x40 marker — at index 0)
+    # into a NUL-terminated ASCII byte name in out[0..]. Returns the
+    # decoded length. UTF-16 code units are truncated to their low byte
+    # (ASCII subset); 0x0000 / 0xFFFF stop the copy.
+    # Logical order is reverse of physical: ordinal 1 holds the first
+    # 13 chars, so we walk physical slots from the LAST to the FIRST.
+    pos: uint64 = 0
+    si: int64 = cast[int64](nslots) - 1
+    while si >= 0:
+        slot: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](slots) + cast[uint64](si) * 32)
+        _lfn_slot_get_chars(slot, &_lfn_chunk[0])
+        k: uint64 = 0
+        while k < 13:
+            cu: uint16 = _lfn_chunk[k]
+            if cu == 0 or cu == 0xFFFF:
+                out[pos] = 0
+                return pos
+            if pos + 1 < out_max:
+                out[pos] = cast[uint8](cu & 0xFF)
+                pos = pos + 1
+            k = k + 1
+        si = si - 1
+    out[pos] = 0
+    return pos
+
+
+# Buffer that holds up to 20 collected LFN slots (260 chars) for one
+# 8.3 entry while a directory scan reassembles a long name, plus the
+# decoded long-name scratch. Module-scope so no big buffer lands on the
+# stack (FAT routines are never reentrant).
+_lfn_collect: Array[640, uint8]
+_lfn_decoded: Array[272, uint8]
+
+
+def _fat_streq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while True:
+        if a[i] != b[i]:
+            return 0
+        if a[i] == 0:
+            return 1
+        i = i + 1
+
+
+def fat_find_by_longname(dir_cluster: uint64, want: Ptr[uint8],
+                         out_short83: Ptr[uint8],
+                         out_checksum: Ptr[uint8],
+                         out_cluster: Ptr[uint64],
+                         out_size: Ptr[uint64]) -> int32:
+    # Scan `dir_cluster`'s chain reassembling LFN runs. When the long
+    # name of an entry equals `want` (NUL-terminated), fill the 8.3
+    # short name (11 bytes), the on-disk LFN checksum byte, the first
+    # cluster and the size, and return 1. Returns 0 on miss. The
+    # checksum is verified against the trailing 8.3 entry before a
+    # match is accepted, proving the slot chain is self-consistent.
+    cluster: uint64 = dir_cluster
+    safety:  uint64 = _fat_total_clusters() + 4
+    collected: uint64 = 0                        # # LFN slots buffered
+    seen_cksum: uint8 = 0
+    while _is_end_of_chain(cast[uint32](cluster)) == 0 and cluster >= 2:
+        sec: uint64 = 0
+        while sec < fat_sectors_per_clu:
+            lba: uint64 = _cluster_to_lba(cluster) + sec
+            if blk_read_sectors(fat_blockdev_slot, lba, 1,
+                                &fat_sector_buf[0]) != 0:
+                return 0
+            n: uint64 = _dir_entries_per_sector()
+            ei: uint64 = 0
+            while ei < n:
+                entry: Ptr[uint8] = cast[Ptr[uint8]](
+                    cast[uint64](&fat_sector_buf[0]) + ei * 32)
+                fb: uint8 = entry[0]
+                if fb == 0:
+                    return 0                      # end-of-directory
+                attr: uint8 = entry[11]
+                if fb == 0xE5:
+                    collected = 0                 # deleted: reset run
+                elif attr == FAT_ATTR_LFN:
+                    # Buffer this physical slot for the following 8.3.
+                    if collected < 20:
+                        memcpy(cast[Ptr[uint8]](
+                                   cast[uint64](&_lfn_collect[0])
+                                   + collected * 32),
+                               entry, 32)
+                        seen_cksum = entry[13]
+                        collected = collected + 1
+                else:
+                    # A real 8.3 entry. If LFN slots preceded it, decode
+                    # and compare; else this is a plain short-name file.
+                    if collected > 0:
+                        _fat_decode_lfn_run(&_lfn_collect[0], collected,
+                                            &_lfn_decoded[0], 272)
+                        ck: uint8 = _fat_lfn_checksum(entry)
+                        if ck == seen_cksum:
+                            if _fat_streq(&_lfn_decoded[0], want) != 0:
+                                j: uint64 = 0
+                                while j < 11:
+                                    out_short83[j] = entry[j]
+                                    j = j + 1
+                                out_checksum[0] = seen_cksum
+                                hi: uint16 = _read_u16_le(
+                                    cast[Ptr[uint8]](
+                                        cast[uint64](entry) + 20))
+                                lo: uint16 = _read_u16_le(
+                                    cast[Ptr[uint8]](
+                                        cast[uint64](entry) + 26))
+                                out_cluster[0] = \
+                                    (cast[uint64](hi) << 16) \
+                                    | cast[uint64](lo)
+                                out_size[0] = cast[uint64](
+                                    _read_u32_le(cast[Ptr[uint8]](
+                                        cast[uint64](entry) + 28)))
+                                return 1
+                    collected = 0
+                ei = ei + 1
+            sec = sec + 1
+        if safety == 0:
+            return 0
+        safety = safety - 1
+        nxt: uint32 = _fat_lookup_cluster(cluster)
+        if _is_end_of_chain(nxt) != 0:
+            return 0
+        cluster = cast[uint64](nxt)
+    return 0
+
+
 def fat_write_smoke_test() -> int32:
     # End-to-end FAT write exercise: create a file, write bytes past
     # one cluster (forcing chain extension), read them back via the
@@ -1434,4 +1986,152 @@ def fat_dirgrow_selftest() -> int32:
     printk_set_level(PRINTK_LEVEL_EMERG)
     printk1("[FAT_DIRGROW] PASS (%d files reachable across grown dir)\n",
             found)
+    return 1
+
+
+# --- VFAT LFN boot self-test --------------------------------------
+#
+# Reuses the _dg_format RAM/AHCI scratch-disk harness: lay down a tiny
+# FAT32 volume on sd0, mount it, create a file with a long VFAT name,
+# then rescan the directory and find it BY ITS LONG NAME. Asserts the
+# LFN checksum (verified inside fat_find_by_longname against the 8.3
+# tail) is valid, the generated short alias is well-formed
+# ("BASENA~1.EXT" shape), and that the long name round-trips. The file
+# is also written + read back through the normal 8.3 alias path to
+# prove the data side still works. Prints [fat-lfn] PASS / FAIL.
+
+_lfn_want: Array[64, uint8]
+
+
+def _lfn_set_want():
+    # "A long VFAT filename.txt" as bytes (no string-pointer iteration
+    # needed; build it explicitly so the test owns its buffer).
+    s: Ptr[uint8] = "A long VFAT filename.txt"
+    i: uint64 = 0
+    while True:
+        c: uint8 = s[i]
+        _lfn_want[i] = c
+        if c == 0:
+            break
+        i = i + 1
+
+
+def fat_lfn_selftest() -> int32:
+    # Returns 1 on PASS, 0 on FAIL.
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0("[fat-lfn] self-test start\n")
+
+    slot: int32 = find_blockdev("sd0")
+    if slot < 0:
+        printk0("[fat-lfn] FAIL: sd0 not registered\n")
+        return 0
+    if _dg_format(slot) != 0:
+        printk0("[fat-lfn] FAIL: format I/O error\n")
+        return 0
+    if fat_init(slot) != 0:
+        printk0("[fat-lfn] FAIL: fat_init failed\n")
+        return 0
+
+    _lfn_set_want()
+    want: Ptr[char] = cast[Ptr[char]](&_lfn_want[0])
+
+    # The leaf must be flagged as needing an LFN.
+    if _name_needs_lfn(want) == 0:
+        printk0("[fat-lfn] FAIL: long name not flagged as needing LFN\n")
+        return 0
+
+    # Create the long-named file in the root directory.
+    if _fat_create_long(want) != 0:
+        printk0("[fat-lfn] FAIL: _fat_create_long failed\n")
+        return 0
+
+    # Rescan the directory: find the entry by its LONG name. This
+    # internally verifies the LFN checksum against the 8.3 tail.
+    short83:  Array[11, uint8]
+    cksum:    uint8 = 0
+    first:    uint64 = 0
+    fsize:    uint64 = 0
+    if fat_find_by_longname(fat_root_cluster, &_lfn_want[0],
+                            &short83[0], &cksum, &first, &fsize) == 0:
+        printk0("[fat-lfn] FAIL: long name not found after create\n")
+        return 0
+
+    # Assert the recovered checksum matches the short alias we stored.
+    if cksum != _fat_lfn_checksum(&short83[0]):
+        printk0("[fat-lfn] FAIL: LFN checksum mismatch\n")
+        return 0
+
+    # Assert the short alias is well-formed: a '~' followed by a digit
+    # somewhere in the 8-char stem, all stem/ext bytes printable.
+    has_tilde: int32 = 0
+    ti: uint64 = 0
+    while ti < 8:
+        if short83[ti] == 126:                   # '~'
+            if ti + 1 < 8 and short83[ti + 1] >= 48 \
+                          and short83[ti + 1] <= 57:
+                has_tilde = 1
+        ti = ti + 1
+    if has_tilde == 0:
+        printk0("[fat-lfn] FAIL: short alias not BASENA~N shape\n")
+        return 0
+    # The extension should be "TXT" (upper-cased from .txt).
+    if short83[8] != 84 or short83[9] != 88 or short83[10] != 84:
+        printk0("[fat-lfn] FAIL: short alias extension != TXT\n")
+        return 0
+
+    # Round-trip the data through the 8.3 alias path: write + read.
+    # Build the alias as a NUL-terminated "STEM.EXT" cstring.
+    alias: Array[16, uint8]
+    ai: uint64 = 0
+    bi: uint64 = 0
+    while bi < 8 and short83[bi] != 32:
+        alias[ai] = short83[bi]
+        ai = ai + 1
+        bi = bi + 1
+    if short83[8] != 32:
+        alias[ai] = 46                           # '.'
+        ai = ai + 1
+        ej: uint64 = 8
+        while ej < 11 and short83[ej] != 32:
+            alias[ai] = short83[ej]
+            ai = ai + 1
+            ej = ej + 1
+    alias[ai] = 0
+    aptr: Ptr[char] = cast[Ptr[char]](&alias[0])
+
+    payload: Array[40, uint8]
+    pi: uint64 = 0
+    while pi < 40:
+        payload[pi] = cast[uint8]((pi * 3 + 5) & 0xFF)
+        pi = pi + 1
+    if fat_write(aptr, &payload[0], 0, 40) != 40:
+        printk0("[fat-lfn] FAIL: data write via alias failed\n")
+        return 0
+    readback: Array[40, uint8]
+    if fat_read(first, 40, 0, 40, &readback[0]) != 40:
+        printk0("[fat-lfn] FAIL: data read via alias failed\n")
+        return 0
+    ri: uint64 = 0
+    while ri < 40:
+        if readback[ri] != payload[ri]:
+            printk0("[fat-lfn] FAIL: data round-trip mismatch\n")
+            return 0
+        ri = ri + 1
+
+    # Confirm the long name survives a fresh directory scan (it must
+    # still resolve to the same first cluster as before the writes).
+    f2_short: Array[11, uint8]
+    f2_ck:    uint8 = 0
+    f2_first: uint64 = 0
+    f2_size:  uint64 = 0
+    if fat_find_by_longname(fat_root_cluster, &_lfn_want[0],
+                            &f2_short[0], &f2_ck, &f2_first,
+                            &f2_size) == 0:
+        printk0("[fat-lfn] FAIL: long name lost after data write\n")
+        return 0
+    if f2_first != first or f2_size != 40:
+        printk0("[fat-lfn] FAIL: long-name metadata drifted\n")
+        return 0
+
+    printk0("[fat-lfn] PASS\n")
     return 1
