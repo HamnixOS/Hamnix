@@ -20,12 +20,21 @@
 #           CSS=0 NVM command set, EN=1)
 #         - wait CSTS.RDY=1
 #   4. Submit admin commands via a 64-byte SQ entry → tail doorbell →
-#      poll CQ phase bit → head doorbell. The five commands we send:
+#      poll CQ phase bit → head doorbell. The commands we send:
 #         - IDENTIFY controller (opc 0x06, CNS=1)  → model + serial
-#         - IDENTIFY namespace 1 (opc 0x06, CNS=0) → LBA count
-#         - CREATE I/O CQ (opc 0x05) qid=1
-#         - CREATE I/O SQ (opc 0x01) qid=1
+#         - IDENTIFY active-NS list (opc 0x06, CNS=2) → enumerate every
+#           active namespace, then IDENTIFY namespace (CNS=0) per nsid
+#           → LBA count + logical block size into a namespace table
+#         - SET FEATURES (opc 0x09, FID 0x07, Number of Queues) → ask
+#           for N I/O queue pairs, clamp to what the controller grants
+#         - CREATE I/O CQ (opc 0x05) + CREATE I/O SQ (opc 0x01) per qid,
+#           qid=1..N (each its own SQ/CQ memory, phase bit, doorbell)
 #         - I/O READ (opc 0x02) of LBA 0 on namespace 1
+#
+#      Multi-queue + multi-namespace: each active namespace is registered
+#      with the block layer as nvme0n<nsid>; reads/writes route to the
+#      correct namespace by nsid and are spread round-robin across the
+#      live I/O queues.
 #   5. Decode 16 bytes of LBA 0; check MBR signature 0x55/0xAA at
 #      bytes 510..511 and log "[nvme] MBR signature OK" on a match.
 #
@@ -157,9 +166,12 @@ NVME_PRP_ENTRIES_PER_PAGE: uint64 = 512
 # --- Admin and I/O command opcodes (NVMe §5 / §6.x) ----------------
 NVME_ADMIN_DELETE_SQ:   uint8 = 0x00
 NVME_ADMIN_CREATE_SQ:   uint8 = 0x01
+NVME_ADMIN_GET_LOG:     uint8 = 0x02
 NVME_ADMIN_DELETE_CQ:   uint8 = 0x04
 NVME_ADMIN_CREATE_CQ:   uint8 = 0x05
 NVME_ADMIN_IDENTIFY:    uint8 = 0x06
+NVME_ADMIN_SET_FEATURES: uint8 = 0x09
+NVME_ADMIN_GET_FEATURES: uint8 = 0x0A
 
 NVME_IO_FLUSH:          uint8 = 0x00
 NVME_IO_WRITE:          uint8 = 0x01
@@ -168,12 +180,36 @@ NVME_IO_READ:           uint8 = 0x02
 # IDENTIFY CNS values (CDW10[7..0]).
 NVME_CNS_NAMESPACE:     uint32 = 0x00
 NVME_CNS_CONTROLLER:    uint32 = 0x01
+# CNS=0x02 — Active Namespace ID list. Returns a 4 KiB buffer of up to
+# 1024 little-endian uint32 NSIDs (terminated by a zero entry), all
+# greater than the NSID given in CDW1.
+NVME_CNS_ACTIVE_NS_LIST: uint32 = 0x02
+
+# SET/GET FEATURES: Number of Queues feature (FID 0x07). The SET request
+# in CDW11 packs [NCQR:16..31 | NSQR:0..15] as 0-based queue counts; the
+# completion DW0 returns the granted counts in the same layout.
+NVME_FEAT_NUM_QUEUES:   uint32 = 0x07
+
+# How many I/O queue pairs we are willing to create, capped by whatever
+# the controller grants via SET FEATURES (Number of Queues). One admin
+# queue (qid 0) is always present and separate. qids run 1..NVME_MAX_IO_QUEUES.
+NVME_MAX_IO_QUEUES:     uint32 = 4
+# Maximum namespaces we track in the namespace table.
+NVME_MAX_NS:            uint32 = 8
 
 
 # --- Driver state --------------------------------------------------
 #
-# Single-controller, single-IO-queue scope. Multi-queue + multi-NS is
-# a follow-up.
+# Multi-controller is still out of scope (one active controller), but
+# this driver now creates N I/O queue pairs and enumerates every active
+# namespace the controller exposes.
+#
+# Per-queue bookkeeping (SQ/CQ rings, head/tail, phase, cid) lives in
+# module-scope parallel arrays indexed by qid. Index 0 is the admin
+# queue; indices 1..NVME_MAX_IO_QUEUES are I/O queues. The legacy
+# single-queue fields on NvmeState (iosq/iocq/iosq_tail/...) are retained
+# as mirrors of qid=1 so the pre-existing IRQ handler + any external
+# reader keeps working unchanged.
 
 class NvmeState:
     bar0:           uint64       # MMIO base
@@ -186,14 +222,19 @@ class NvmeState:
     acq_phase:      uint32       # current expected phase bit (0/1)
     admin_cid:      uint32       # monotonic command id
 
-    iosq:           uint64       # I/O SQ ring
-    iocq:           uint64       # I/O CQ ring
+    iosq:           uint64       # I/O SQ ring (mirror of qid=1)
+    iocq:           uint64       # I/O CQ ring (mirror of qid=1)
     iosq_tail:      uint32
     iocq_head:      uint32
     iocq_phase:     uint32
     io_cid:         uint32
 
-    nsze:           uint64       # namespace 1 size (LBA count)
+    n_io_queues:    uint32       # number of live I/O queue pairs (1..N)
+    rr_next:        uint32       # round-robin cursor over I/O queues
+
+    n_namespaces:   uint32       # active namespaces discovered
+
+    nsze:           uint64       # namespace 1 size (LBA count) — legacy mirror
 
     irq_pin:        uint32       # IOAPIC pin we redirected (diag)
     pad_irq:        uint32
@@ -206,6 +247,38 @@ class NvmeState:
 
 
 nvme: NvmeState
+
+# --- Per-I/O-queue ring state (indexed by qid) --------------------
+#
+# Sized to NVME_MAX_IO_QUEUES+1 so qid can index directly (qid 0 = admin
+# slot is left unused in the I/O arrays; admin uses NvmeState.asq/acq).
+# Adder needs module-scope arrays for these; per-queue scalars are tiny
+# but keeping them parallel-array keeps the qid-indexed doorbell math
+# uniform.
+io_sq_base:   Array[5, uint64]    # I/O SQ ring physical/virt base per qid
+io_cq_base:   Array[5, uint64]    # I/O CQ ring base per qid
+io_sq_tail:   Array[5, uint32]    # next SQ slot to write per qid
+io_cq_head:   Array[5, uint32]    # next CQ slot to read per qid
+io_cq_phase:  Array[5, uint32]    # expected phase bit per qid
+io_q_cid:     Array[5, uint32]    # monotonic command id per qid
+
+# --- Per-queue PRP-list page pools --------------------------------
+#
+# Each I/O queue needs its own pool of PRP-list scratch pages (one per
+# SQE slot) so concurrent submissions on different queues never alias a
+# list page. Flattened [qid * NVME_QUEUE_DEPTH + slot]. qid range is
+# 1..NVME_MAX_IO_QUEUES so we size for (NVME_MAX_IO_QUEUES+1)*depth.
+io_prp_list_pages_mq: Array[320, uint64]   # (4+1) * 64
+
+# --- Namespace table ----------------------------------------------
+#
+# Parallel arrays indexed 0..n_namespaces-1. ns_id holds the NVMe NSID
+# (1-based, not necessarily contiguous), ns_lba_count the LBA capacity
+# from IDENTIFY namespace, ns_block_size the per-namespace logical block
+# size in bytes (decoded from the active LBA format / LBADS).
+ns_id:         Array[8, uint32]
+ns_lba_count:  Array[8, uint64]
+ns_block_size: Array[8, uint32]
 # Block-layer registration table for the active controller's
 # namespace 1. Populated in nvme_smoke_test once IDENTIFY +
 # CREATE-IO-CQ/SQ + read-of-LBA-0 have all proven healthy, then
@@ -251,6 +324,10 @@ nvme_ops: BlockDeviceOps
 #     list pages.
 io_prp_list_pages: Array[64, uint64]
 io_prp_pool_ready: int32 = 0
+# Per-queue pool readiness (qid-indexed). qid=1's pool aliases the
+# legacy io_prp_list_pages above for byte-for-byte backward compat;
+# qids 2..N use io_prp_list_pages_mq.
+io_prp_pool_ready_mq: Array[5, int32]
 
 
 # --- MMIO helpers --------------------------------------------------
@@ -366,6 +443,13 @@ def _cq_doorbell(qid: uint32) -> uint64:
          + cast[uint64](2 * qid + 1) * cast[uint64](nvme.doorbell_stride)
 
 
+# DW0 of the most recently drained completion. SET/GET FEATURES return
+# command-specific data here (e.g. Number of Queues granted). Captured by
+# _poll_completion so callers that care can read it back without
+# threading an extra out-param through every submit helper.
+last_cqe_dw0: uint32 = 0
+
+
 # --- Admin / I/O command primitives --------------------------------
 #
 # SQ entry is 64 bytes:
@@ -428,6 +512,9 @@ def _poll_completion(cq_base: uint64, head_p: Ptr[uint32],
         dw3: uint32 = e[3]
         cur_phase: uint32 = (dw3 >> 16) & 0x1
         if cur_phase == expected_phase:
+            # Stash DW0 (command-specific result) for callers that need
+            # it (SET/GET FEATURES). Read it BEFORE ringing the doorbell.
+            last_cqe_dw0 = e[0]
             # Extract status field (bits 17..31 of DW3) — bit 17..30
             # is status code, bit 31 is "Do Not Retry". A status code
             # of 0 means success. We pack the full top 15 bits and
@@ -475,6 +562,47 @@ def _admin_submit_and_wait(opcode: uint8, nsid: uint32,
                             NVME_QUEUE_DEPTH)
 
 
+# Mirror the per-queue qid=1 bookkeeping back into the legacy
+# NvmeState.iosq* fields so the IRQ handler and any external reader that
+# still looks at nvme.iocq_head/phase observes a consistent view.
+def _sync_legacy_q1():
+    nvme.iosq      = io_sq_base[NVME_IO_QID]
+    nvme.iocq      = io_cq_base[NVME_IO_QID]
+    nvme.iosq_tail = io_sq_tail[NVME_IO_QID]
+    nvme.iocq_head = io_cq_head[NVME_IO_QID]
+    nvme.iocq_phase = io_cq_phase[NVME_IO_QID]
+    nvme.io_cid    = io_q_cid[NVME_IO_QID]
+
+
+def _io_submit_and_wait_q(qid: uint32, opcode: uint8, nsid: uint32,
+                          prp1: uint64, prp2: uint64,
+                          cdw10: uint32, cdw11: uint32,
+                          cdw12: uint32, cdw13: uint32,
+                          cdw14: uint32, cdw15: uint32) -> uint32:
+    # qid-aware submit: build the SQE at this queue's tail, ring its
+    # doorbell, poll its CQ. All per-queue state lives in the parallel
+    # io_* arrays indexed by qid.
+    cid: uint32 = io_q_cid[qid]
+    io_q_cid[qid] = cid + 1
+    slot_addr: uint64 = io_sq_base[qid] \
+                      + cast[uint64](io_sq_tail[qid]) \
+                      * NVME_SQ_ENTRY_BYTES
+    _build_sq_entry(slot_addr, opcode, cid, nsid, prp1, prp2,
+                    cdw10, cdw11, cdw12, cdw13, cdw14, cdw15)
+    new_tail: uint32 = io_sq_tail[qid] + 1
+    if new_tail >= NVME_QUEUE_DEPTH:
+        new_tail = 0
+    io_sq_tail[qid] = new_tail
+    _nvme_mmio_w32(_sq_doorbell(qid), new_tail)
+    status: uint32 = _poll_completion(io_cq_base[qid],
+                                      &io_cq_head[qid], &io_cq_phase[qid],
+                                      _cq_doorbell(qid),
+                                      NVME_QUEUE_DEPTH)
+    if qid == NVME_IO_QID:
+        _sync_legacy_q1()
+    return status
+
+
 def _io_submit_and_wait(opcode: uint8, nsid: uint32,
                         prp1: uint64, prp2: uint64,
                         cdw10: uint32, cdw11: uint32,
@@ -483,23 +611,9 @@ def _io_submit_and_wait(opcode: uint8, nsid: uint32,
     # Legacy entry point — caller has already resolved both PRP fields.
     # Retained so non-data-transfer I/O commands (e.g. FLUSH, opcode
     # 0x00) can still issue without going through the buffer-aware
-    # path. Data-bearing READ/WRITE go via _io_submit_buf_and_wait.
-    cid: uint32 = nvme.io_cid
-    nvme.io_cid = cid + 1
-    slot_addr: uint64 = nvme.iosq \
-                      + cast[uint64](nvme.iosq_tail) \
-                      * NVME_SQ_ENTRY_BYTES
-    _build_sq_entry(slot_addr, opcode, cid, nsid, prp1, prp2,
-                    cdw10, cdw11, cdw12, cdw13, cdw14, cdw15)
-    new_tail: uint32 = nvme.iosq_tail + 1
-    if new_tail >= NVME_QUEUE_DEPTH:
-        new_tail = 0
-    nvme.iosq_tail = new_tail
-    _nvme_mmio_w32(_sq_doorbell(NVME_IO_QID), new_tail)
-    return _poll_completion(nvme.iocq,
-                            &nvme.iocq_head, &nvme.iocq_phase,
-                            _cq_doorbell(NVME_IO_QID),
-                            NVME_QUEUE_DEPTH)
+    # path. Routes through the qid=1 queue.
+    return _io_submit_and_wait_q(NVME_IO_QID, opcode, nsid, prp1, prp2,
+                                 cdw10, cdw11, cdw12, cdw13, cdw14, cdw15)
 
 
 # --- PRP-list pool helpers (V4.2 multi-page transfers) ------------
@@ -526,6 +640,41 @@ def _alloc_io_prp_pool() -> int32:
         io_prp_list_pages[i] = p
         i = i + 1
     io_prp_pool_ready = 1
+    io_prp_pool_ready_mq[NVME_IO_QID] = 1
+    return 0
+
+
+# Resolve the PRP-list scratch page for (qid, slot). qid=1 reads the
+# legacy io_prp_list_pages so the established single-queue path is
+# byte-identical; qids >= 2 read the flattened multi-queue pool.
+def _prp_list_page(qid: uint32, slot: uint32) -> uint64:
+    if qid == NVME_IO_QID:
+        return io_prp_list_pages[slot]
+    return io_prp_list_pages_mq[qid * NVME_QUEUE_DEPTH + slot]
+
+
+def _prp_pool_ready(qid: uint32) -> int32:
+    return io_prp_pool_ready_mq[qid]
+
+
+# Allocate a PRP-list pool for an additional I/O queue (qid >= 2). One
+# page-aligned scratch page per SQE slot, stored in the flattened
+# io_prp_list_pages_mq table. Idempotent per qid.
+def _alloc_io_prp_pool_mq(qid: uint32) -> int32:
+    if io_prp_pool_ready_mq[qid] != 0:
+        return 0
+    base: uint32 = qid * NVME_QUEUE_DEPTH
+    i: uint32 = 0
+    while i < NVME_QUEUE_DEPTH:
+        p: uint64 = alloc_pages(0)
+        if p == 0:
+            printk2("[nvme] PRP pool alloc failed qid=%d slot=%d\n",
+                    cast[uint64](qid), cast[uint64](i))
+            return -1
+        memset(cast[Ptr[uint8]](p), 0, 4096)
+        io_prp_list_pages_mq[base + i] = p
+        i = i + 1
+    io_prp_pool_ready_mq[qid] = 1
     return 0
 
 
@@ -544,7 +693,8 @@ def _alloc_io_prp_pool() -> int32:
 #
 # Returns 0 on success, -1 if the PRP-list pool isn't initialised when
 # a multi-page transfer asks for one.
-def _compute_io_prp(slot: uint32, buf_phys: uint64, buf_len: uint64,
+def _compute_io_prp(qid: uint32, slot: uint32,
+                    buf_phys: uint64, buf_len: uint64,
                     prp1_p: Ptr[uint64], prp2_p: Ptr[uint64]) -> int32:
     prp1_p[0] = buf_phys
     if buf_len == 0:
@@ -569,13 +719,13 @@ def _compute_io_prp(slot: uint32, buf_phys: uint64, buf_len: uint64,
         return 0
 
     # Three or more pages: build a PRP list in this slot's pool page.
-    if io_prp_pool_ready == 0:
+    if _prp_pool_ready(qid) == 0:
         printk0("[nvme] PRP list needed but pool not ready\n")
         return -1
-    list_page: uint64 = io_prp_list_pages[slot]
+    list_page: uint64 = _prp_list_page(qid, slot)
     if list_page == 0:
-        printk1("[nvme] PRP list slot=%d has no page\n",
-                cast[uint64](slot))
+        printk2("[nvme] PRP list qid=%d slot=%d has no page\n",
+                cast[uint64](qid), cast[uint64](slot))
         return -1
 
     # Count remaining pages (bytes after the first page boundary).
@@ -629,27 +779,40 @@ def _compute_io_prp(slot: uint32, buf_phys: uint64, buf_len: uint64,
     return 0
 
 
-def _io_submit_buf_and_wait(opcode: uint8, nsid: uint32,
-                            buf_phys: uint64, buf_len: uint64,
-                            cdw10: uint32, cdw11: uint32,
-                            cdw12: uint32, cdw13: uint32,
-                            cdw14: uint32, cdw15: uint32) -> uint32:
-    # Data-bearing I/O submit: resolves PRP1/PRP2 from (buf_phys,
-    # buf_len) per NVMe spec §4.3, then falls into the same submit-
-    # and-poll path as _io_submit_and_wait. The slot index used for
-    # PRP-list-pool indexing is the current iosq_tail, which is also
-    # the slot the SQE will land in.
-    slot: uint32 = nvme.iosq_tail
+def _io_submit_buf_and_wait_q(qid: uint32, opcode: uint8, nsid: uint32,
+                              buf_phys: uint64, buf_len: uint64,
+                              cdw10: uint32, cdw11: uint32,
+                              cdw12: uint32, cdw13: uint32,
+                              cdw14: uint32, cdw15: uint32) -> uint32:
+    # Data-bearing I/O submit on a specific queue: resolves PRP1/PRP2
+    # from (buf_phys, buf_len) per NVMe spec §4.3 using THIS queue's PRP
+    # pool, then submits on this queue. The slot index used for PRP-list
+    # pool indexing is the current per-queue SQ tail (= the slot the SQE
+    # will land in).
+    slot: uint32 = io_sq_tail[qid]
     prp1: uint64 = 0
     prp2: uint64 = 0
-    rc: int32 = _compute_io_prp(slot, buf_phys, buf_len, &prp1, &prp2)
+    rc: int32 = _compute_io_prp(qid, slot, buf_phys, buf_len,
+                                &prp1, &prp2)
     if rc != 0:
         # PRP resolution failed — return a synthetic "error" status so
         # the caller's existing non-zero check fires. Status 0x7FFF is
         # not a real NVMe code, just an out-of-band sentinel.
         return 0x7FFF
-    return _io_submit_and_wait(opcode, nsid, prp1, prp2,
-                               cdw10, cdw11, cdw12, cdw13, cdw14, cdw15)
+    return _io_submit_and_wait_q(qid, opcode, nsid, prp1, prp2,
+                                 cdw10, cdw11, cdw12, cdw13, cdw14, cdw15)
+
+
+def _io_submit_buf_and_wait(opcode: uint8, nsid: uint32,
+                            buf_phys: uint64, buf_len: uint64,
+                            cdw10: uint32, cdw11: uint32,
+                            cdw12: uint32, cdw13: uint32,
+                            cdw14: uint32, cdw15: uint32) -> uint32:
+    # Legacy buffer-aware submit — routes through qid=1.
+    return _io_submit_buf_and_wait_q(NVME_IO_QID, opcode, nsid,
+                                     buf_phys, buf_len,
+                                     cdw10, cdw11, cdw12, cdw13,
+                                     cdw14, cdw15)
 
 
 # --- IDENTIFY decoding ---------------------------------------------
@@ -714,6 +877,99 @@ def _nvme_identify_namespace(buf: uint64, nsid: uint32) -> int32:
     return 0
 
 
+# Decode the active LBA format's logical block size from an IDENTIFY-
+# namespace buffer. Byte 26 (FLBAS) low 4 bits index the LBA Format
+# descriptor array at byte 128 (16 entries × 4 bytes). Each descriptor
+# DW's bits 16..23 hold LBADS, the log2 of the block size in bytes
+# (e.g. LBADS=9 → 512, LBADS=12 → 4096). Returns the block size, or 512
+# if the encoding looks degenerate (LBADS < 9).
+def _ns_block_size_from_idbuf(buf: uint64) -> uint32:
+    flbas: uint8 = cast[Ptr[uint8]](buf + 26)[0]
+    fmt_idx: uint32 = cast[uint32](flbas) & 0xF
+    lbaf_dw: uint32 = cast[Ptr[uint32]](buf + 128 + fmt_idx * 4)[0]
+    lbads: uint32 = (lbaf_dw >> 16) & 0xFF
+    if lbads < 9:
+        return 512
+    return cast[uint32](1) << lbads
+
+
+# IDENTIFY a namespace by NSID and record it in the namespace table at
+# `slot`. Captures NSZE (LBA count) + logical block size. Returns 0 on
+# success, -1 on the IDENTIFY failing.
+def _nvme_record_namespace(buf: uint64, nsid: uint32,
+                           slot: uint32) -> int32:
+    memset(cast[Ptr[uint8]](buf), 0, 4096)
+    status: uint32 = _admin_submit_and_wait(
+        NVME_ADMIN_IDENTIFY, nsid, buf, 0,
+        NVME_CNS_NAMESPACE, 0, 0, 0, 0, 0)
+    if status != 0:
+        printk2("[nvme] IDENTIFY ns nsid=%d failed (status=%x)\n",
+                cast[uint64](nsid), cast[uint64](status))
+        return -1
+    nsze: uint64 = cast[Ptr[uint64]](buf)[0]
+    bsz: uint32 = _ns_block_size_from_idbuf(buf)
+    ns_id[slot] = nsid
+    ns_lba_count[slot] = nsze
+    ns_block_size[slot] = bsz
+    printk2("[nvme] ns nsid=%d LBAs=%d", cast[uint64](nsid), nsze)
+    printk1(" blksz=%d\n", cast[uint64](bsz))
+    return 0
+
+
+# Enumerate active namespaces via IDENTIFY CNS=0x02 (Active Namespace ID
+# list). The returned 4 KiB buffer is up to 1024 LE uint32 NSIDs in
+# ascending order, zero-terminated. For each one we IDENTIFY the
+# namespace (CNS=0) and record it in the table. Returns the count of
+# namespaces recorded (>=0), or -1 if the list command itself failed.
+def _nvme_enumerate_namespaces(buf: uint64) -> int32:
+    memset(cast[Ptr[uint8]](buf), 0, 4096)
+    status: uint32 = _admin_submit_and_wait(
+        NVME_ADMIN_IDENTIFY, 0, buf, 0,
+        NVME_CNS_ACTIVE_NS_LIST, 0, 0, 0, 0, 0)
+    if status != 0:
+        printk1("[nvme] IDENTIFY active-ns-list failed (status=%x)\n",
+                cast[uint64](status))
+        return -1
+
+    # Snapshot the list into a small local array first: the per-NS
+    # IDENTIFY below reuses `buf`, which would clobber the list mid-walk.
+    # Max 1024 entries in the spec but we only track NVME_MAX_NS.
+    list_p: Ptr[uint32] = cast[Ptr[uint32]](buf)
+    count: uint32 = 0
+    i: uint32 = 0
+    # First pass: copy NSIDs into the table's id column as scratch.
+    while i < NVME_MAX_NS:
+        nsid: uint32 = list_p[i]
+        if nsid == 0:
+            i = NVME_MAX_NS
+        else:
+            ns_id[count] = nsid
+            count = count + 1
+            i = i + 1
+
+    # Second pass: IDENTIFY each recorded NSID. We read ns_id[k] before
+    # _nvme_record_namespace rewrites the same slot (with the same nsid).
+    k: uint32 = 0
+    recorded: uint32 = 0
+    while k < count:
+        nsid2: uint32 = ns_id[k]
+        if _nvme_record_namespace(buf, nsid2, recorded) == 0:
+            recorded = recorded + 1
+        k = k + 1
+    return cast[int32](recorded)
+
+
+# Look up the namespace table slot for an NSID. Returns the index, or
+# -1 if the NSID isn't an active namespace we recorded.
+def _ns_slot_for_nsid(nsid: uint32) -> int32:
+    i: uint32 = 0
+    while i < nvme.n_namespaces:
+        if ns_id[i] == nsid:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
 # --- I/O queue creation --------------------------------------------
 #
 # CREATE I/O CQ (opcode 0x05):
@@ -729,34 +985,162 @@ def _nvme_identify_namespace(buf: uint64, nsid: uint32) -> int32:
 #   CDW10  = [qsize-1:16..31 | qid:0..15]
 #   CDW11  = [CQID:16..31 | QPRIO:1..2 | PC:0]
 
-def _nvme_create_iocq() -> int32:
+# --- Number of Queues feature (FID 0x07) ---------------------------
+#
+# SET FEATURES CDW11 = [NCQR:16..31 | NSQR:0..15], both 0-based counts
+# (request value N means N+1 queues). The completion DW0 returns the
+# GRANTED counts in the same layout — the controller may grant fewer
+# than requested. We request NVME_MAX_IO_QUEUES-1 (0-based) of each and
+# clamp our actual I/O-queue count to min(granted_sq, granted_cq,
+# NVME_MAX_IO_QUEUES). Per spec this feature must be set BEFORE creating
+# any I/O queues. Returns the number of I/O queue pairs we may create
+# (>=1), or 0 on a hard failure (caller falls back to a single queue).
+def _nvme_set_num_queues() -> uint32:
+    req: uint32 = NVME_MAX_IO_QUEUES - 1          # 0-based
+    cdw11: uint32 = (req << 16) | req
+    status: uint32 = _admin_submit_and_wait(
+        NVME_ADMIN_SET_FEATURES, 0, 0, 0,
+        NVME_FEAT_NUM_QUEUES, cdw11, 0, 0, 0, 0)
+    if status != 0:
+        printk1("[nvme] SET FEATURES num-queues failed (status=%x)\n",
+                cast[uint64](status))
+        return 1
+    dw0: uint32 = last_cqe_dw0
+    granted_sq: uint32 = (dw0 & 0xFFFF) + 1       # back to 1-based
+    granted_cq: uint32 = ((dw0 >> 16) & 0xFFFF) + 1
+    granted: uint32 = granted_sq
+    if granted_cq < granted:
+        granted = granted_cq
+    if granted > NVME_MAX_IO_QUEUES:
+        granted = NVME_MAX_IO_QUEUES
+    if granted < 1:
+        granted = 1
+    printk2("[nvme] num-queues granted sq=%d cq=%d\n",
+            cast[uint64](granted_sq), cast[uint64](granted_cq))
+    return granted
+
+
+# --- qid-aware I/O queue creation ----------------------------------
+#
+# CREATE I/O CQ (opcode 0x05):
+#   PRP1 = CQ base; CDW10 = [qsize-1:16..31 | qid:0..15];
+#   CDW11 = [IV:16..31 | IEN:1 | PC:0]. PC=1, IEN=0 (we poll).
+def _nvme_create_iocq_q(qid: uint32, cq_base: uint64) -> int32:
     qsize_m1: uint32 = NVME_QUEUE_DEPTH - 1
-    cdw10: uint32 = (qsize_m1 << 16) | NVME_IO_QID
-    # PC=1 (bit 0), IEN=0 (bit 1).
+    cdw10: uint32 = (qsize_m1 << 16) | qid
     cdw11: uint32 = 0x1
     status: uint32 = _admin_submit_and_wait(
-        NVME_ADMIN_CREATE_CQ, 0, nvme.iocq, 0,
+        NVME_ADMIN_CREATE_CQ, 0, cq_base, 0,
         cdw10, cdw11, 0, 0, 0, 0)
     if status != 0:
-        printk1("[nvme] CREATE-IO-CQ failed (status=%x)\n",
-                cast[uint64](status))
+        printk2("[nvme] CREATE-IO-CQ qid=%d failed (status=%x)\n",
+                cast[uint64](qid), cast[uint64](status))
+        return -1
+    return 0
+
+
+# CREATE I/O SQ (opcode 0x01): PRP1 = SQ base;
+#   CDW10 = [qsize-1:16..31 | qid:0..15];
+#   CDW11 = [CQID:16..31 | QPRIO:1..2 | PC:0]. We bind each SQ to the CQ
+#   with the same id (one CQ per SQ — simplest correct topology).
+def _nvme_create_iosq_q(qid: uint32, sq_base: uint64) -> int32:
+    qsize_m1: uint32 = NVME_QUEUE_DEPTH - 1
+    cdw10: uint32 = (qsize_m1 << 16) | qid
+    cdw11: uint32 = 0x1 | (qid << 16)
+    status: uint32 = _admin_submit_and_wait(
+        NVME_ADMIN_CREATE_SQ, 0, sq_base, 0,
+        cdw10, cdw11, 0, 0, 0, 0)
+    if status != 0:
+        printk2("[nvme] CREATE-IO-SQ qid=%d failed (status=%x)\n",
+                cast[uint64](qid), cast[uint64](status))
+        return -1
+    return 0
+
+
+# Allocate + create a single I/O queue pair `qid`, initialise its
+# per-queue ring state, and (for qid >= 2) its PRP-list pool. Order
+# matters: the CQ must exist before the SQ that binds to it. Returns 0
+# on success, -1 on any allocation/creation failure.
+def _nvme_setup_io_queue(qid: uint32) -> int32:
+    cq: uint64 = alloc_pages(0)
+    sq: uint64 = alloc_pages(0)
+    if cq == 0 or sq == 0:
+        printk1("[nvme] queue alloc failed qid=%d\n", cast[uint64](qid))
+        return -1
+    memset(cast[Ptr[uint8]](cq), 0, 4096)
+    memset(cast[Ptr[uint8]](sq), 0, 4096)
+    io_cq_base[qid] = cq
+    io_sq_base[qid] = sq
+    io_sq_tail[qid] = 0
+    io_cq_head[qid] = 0
+    io_cq_phase[qid] = 1
+    io_q_cid[qid] = 0
+    if _nvme_create_iocq_q(qid, cq) != 0:
+        return -1
+    if _nvme_create_iosq_q(qid, sq) != 0:
+        return -1
+    if qid == NVME_IO_QID:
+        # qid=1 mirrors the legacy NvmeState fields + uses the legacy
+        # PRP pool (allocated by _alloc_io_prp_pool in the caller).
+        _sync_legacy_q1()
+    else:
+        if _alloc_io_prp_pool_mq(qid) != 0:
+            return -1
+    return 0
+
+
+# --- Legacy single-queue creation shims ----------------------------
+#
+# The Linux .ko L-shim bring-up path (linux_abi/api_nvme_core.ad) sets
+# nvme.iocq/nvme.iosq directly and then calls these two functions to
+# create the qid=1 queue pair on the controller. They are retained with
+# their original (qid=1, reads nvme.iocq/nvme.iosq) behaviour, and now
+# also seed the per-queue arrays for qid=1 so the qid-aware submit path
+# and the NS table work after a .ko-driven bring-up. n_io_queues/n_namespaces
+# default to 1 here because that path does not call SET FEATURES /
+# active-ns-list enumeration.
+def _nvme_create_iocq() -> int32:
+    io_cq_base[NVME_IO_QID] = nvme.iocq
+    io_cq_head[NVME_IO_QID] = nvme.iocq_head
+    io_cq_phase[NVME_IO_QID] = nvme.iocq_phase
+    if _nvme_create_iocq_q(NVME_IO_QID, nvme.iocq) != 0:
         return -1
     return 0
 
 
 def _nvme_create_iosq() -> int32:
-    qsize_m1: uint32 = NVME_QUEUE_DEPTH - 1
-    cdw10: uint32 = (qsize_m1 << 16) | NVME_IO_QID
-    # PC=1 (bit 0); CQID in upper 16. QPRIO=0 (medium).
-    cdw11: uint32 = 0x1 | (NVME_IO_QID << 16)
-    status: uint32 = _admin_submit_and_wait(
-        NVME_ADMIN_CREATE_SQ, 0, nvme.iosq, 0,
-        cdw10, cdw11, 0, 0, 0, 0)
-    if status != 0:
-        printk1("[nvme] CREATE-IO-SQ failed (status=%x)\n",
-                cast[uint64](status))
+    io_sq_base[NVME_IO_QID] = nvme.iosq
+    io_sq_tail[NVME_IO_QID] = nvme.iosq_tail
+    io_q_cid[NVME_IO_QID] = nvme.io_cid
+    if _nvme_create_iosq_q(NVME_IO_QID, nvme.iosq) != 0:
         return -1
+    # Seed a single-queue / single-namespace view for the .ko path.
+    nvme.n_io_queues = 1
+    nvme.rr_next = 0
+    if nvme.n_namespaces == 0:
+        ns_id[0] = 1
+        ns_lba_count[0] = nvme.nsze
+        ns_block_size[0] = cast[uint32](SECTOR_SIZE)
+        nvme.n_namespaces = 1
     return 0
+
+
+# Pick the next I/O queue for a submission. Policy: round-robin across
+# all live I/O queues (qid 1..n_io_queues). Round-robin is the simplest
+# fair policy that exercises every queue without needing per-CPU or
+# per-NS affinity state; a polled driver gains no concurrency from
+# multiple queues but RR proves each queue is independently functional.
+def _nvme_pick_queue() -> uint32:
+    n: uint32 = nvme.n_io_queues
+    if n <= 1:
+        return NVME_IO_QID
+    q: uint32 = nvme.rr_next
+    # cursor runs 0..n-1, mapped to qid 1..n.
+    nxt: uint32 = q + 1
+    if nxt >= n:
+        nxt = 0
+    nvme.rr_next = nxt
+    return q + 1
 
 
 # --- I/O READ ------------------------------------------------------
@@ -826,6 +1210,58 @@ def _nvme_write_lba(lba: uint64, nblocks: uint16, src: uint64) -> int32:
     return 0
 
 
+# --- nsid + queue-routed read/write --------------------------------
+#
+# Multi-NS / multi-queue primitives: route an LBA transfer to namespace
+# `nsid` over the round-robin-selected I/O queue. The block size used to
+# size the transfer is the namespace's own logical block size (read from
+# the NS table), not the fixed SECTOR_SIZE — so a 4 KiB-LBA namespace
+# transfers the right byte count. `nblocks` is in NAMESPACE blocks.
+
+def _nvme_rw_ns(opcode: uint8, nsid: uint32, lba: uint64,
+                nblocks: uint16, buf_virt: uint64) -> int32:
+    slot: int32 = _ns_slot_for_nsid(nsid)
+    if slot < 0:
+        printk1("[nvme] rw: nsid=%d not active\n", cast[uint64](nsid))
+        return -1
+    bsz: uint64 = cast[uint64](ns_block_size[cast[uint32](slot)])
+    if bsz == 0:
+        bsz = SECTOR_SIZE
+    qid: uint32 = _nvme_pick_queue()
+    cdw10: uint32 = cast[uint32](lba & 0xFFFFFFFF)
+    cdw11: uint32 = cast[uint32](lba >> 32)
+    cdw12: uint32 = cast[uint32](nblocks - 1) & 0xFFFF
+    buf_phys: uint64 = virt_to_phys(buf_virt)
+    buf_len: uint64 = cast[uint64](nblocks) * bsz
+    status: uint32 = _io_submit_buf_and_wait_q(
+        qid, opcode, nsid, buf_phys, buf_len,
+        cdw10, cdw11, cdw12, 0, 0, 0)
+    if status != 0:
+        printk2("[nvme] ns rw nsid=%d qid=%d FAILED", cast[uint64](nsid),
+                cast[uint64](qid))
+        printk1(" (status=%x)\n", cast[uint64](status))
+        return -1
+    return 0
+
+
+def nvme_read_lba_ns(nsid: uint32, lba: uint64, nblocks: uint16,
+                     dst: uint64) -> int32:
+    if nvme.bar0 == 0:
+        return -1
+    if nblocks == 0:
+        return 0
+    return _nvme_rw_ns(NVME_IO_READ, nsid, lba, nblocks, dst)
+
+
+def nvme_write_lba_ns(nsid: uint32, lba: uint64, nblocks: uint16,
+                      src: uint64) -> int32:
+    if nvme.bar0 == 0:
+        return -1
+    if nblocks == 0:
+        return 0
+    return _nvme_rw_ns(NVME_IO_WRITE, nsid, lba, nblocks, src)
+
+
 # --- Public write/read wrappers ------------------------------------
 #
 # Same shape as virtio-blk's read_sectors / write_sectors so the
@@ -863,11 +1299,11 @@ def nvme_read_lba(lba: uint64, nblocks: uint16, dst: uint64) -> int32:
 #   int32 (*op)(uint64 priv, uint64 lba, uint64 count, Ptr[uint8] buf)
 # Our driver-level primitives take (uint64 lba, uint16 nblocks, uint64
 # buf), so these adapters re-shape the args. priv carries the NSID we
-# stashed at register_blockdev time; the active controller only has
-# namespace 1 today (multi-NS is a follow-up). We don't pass nsid
-# explicitly to the I/O primitives — they hard-code NVME_IO_QID for
-# the queue and rely on the IDENTIFY-time NSID — but keeping it in
-# priv keeps the door open for a per-NS dispatch table later.
+# stashed at register_blockdev time; with multi-NS support the adapters
+# now pass that nsid through to nvme_read_lba_ns / nvme_write_lba_ns,
+# which look the namespace up in the NS table (block size + capacity)
+# and round-robin the I/O across the live queues. Every registered
+# namespace (nvme0n1, nvme0n2, ...) shares this same adapter pair.
 
 def _nvme_read_lba_blkop(priv: uint64, lba: uint64,
                          count: uint64, buf: Ptr[uint8]) -> int32:
@@ -878,7 +1314,12 @@ def _nvme_read_lba_blkop(priv: uint64, lba: uint64,
     if count > 65536:
         printk1("[nvme] blkop read: count=%d too large\n", count)
         return -1
-    return nvme_read_lba(lba, cast[uint16](count), cast[uint64](buf))
+    # priv carries the NSID. Route to that namespace over a round-robin
+    # I/O queue; nsid=1 still resolves through the same path the
+    # single-NS scope used.
+    nsid: uint32 = cast[uint32](priv)
+    return nvme_read_lba_ns(nsid, lba, cast[uint16](count),
+                            cast[uint64](buf))
 
 
 def _nvme_write_lba_blkop(priv: uint64, lba: uint64,
@@ -888,7 +1329,9 @@ def _nvme_write_lba_blkop(priv: uint64, lba: uint64,
     if count > 65536:
         printk1("[nvme] blkop write: count=%d too large\n", count)
         return -1
-    return nvme_write_lba(lba, cast[uint16](count), cast[uint64](buf))
+    nsid: uint32 = cast[uint32](priv)
+    return nvme_write_lba_ns(nsid, lba, cast[uint16](count),
+                             cast[uint64](buf))
 
 
 # --- Write+readback smoke test (M16.118) ---------------------------
@@ -1024,40 +1467,63 @@ def nvme_smoke_test() -> int32:
         return -1
     if _nvme_identify_controller(id_buf) != 0:
         return -1
+    # Keep the legacy nsze mirror populated from namespace 1 (the
+    # existing single-NS path + register_blockdev capacity depend on
+    # nvme.nsze); the full table is filled by _nvme_enumerate_namespaces
+    # below.
     if _nvme_identify_namespace(id_buf, 1) != 0:
         return -1
 
-    # ----- Allocate I/O queues + create on the controller --------
-    iocq: uint64 = alloc_pages(0)
-    iosq: uint64 = alloc_pages(0)
-    if iocq == 0 or iosq == 0:
-        printk0("[nvme] I/O queue allocation failed\n")
-        return -1
-    memset(cast[Ptr[uint8]](iocq), 0, 4096)
-    memset(cast[Ptr[uint8]](iosq), 0, 4096)
-    nvme.iocq = iocq
-    nvme.iosq = iosq
-    nvme.iosq_tail = 0
-    nvme.iocq_head = 0
-    nvme.iocq_phase = 1
-    nvme.io_cid = 0
+    # ----- Multi-namespace enumeration (CNS=0x02) ----------------
+    # IDENTIFY Active Namespace ID list, then IDENTIFY each namespace to
+    # record LBA count + block size into the NS table. Falls back to the
+    # single nsid=1 record if the list command is unsupported.
+    nsn: int32 = _nvme_enumerate_namespaces(id_buf)
+    if nsn <= 0:
+        # Controller didn't return an active-NS list (older/limited
+        # emulation): synthesise a single-namespace table from the
+        # nsid=1 IDENTIFY we already did.
+        if _nvme_record_namespace(id_buf, 1, 0) == 0:
+            nvme.n_namespaces = 1
+        else:
+            nvme.n_namespaces = 0
+    else:
+        nvme.n_namespaces = cast[uint32](nsn)
+    printk1("[nvme] namespaces active=%d\n",
+            cast[uint64](nvme.n_namespaces))
 
-    # Order matters: CQ first (the SQ binds to its CQID).
-    if _nvme_create_iocq() != 0:
-        return -1
-    if _nvme_create_iosq() != 0:
-        return -1
-    printk0("[nvme] I/O queues online\n")
+    # ----- Number of Queues feature, then create I/O queues ------
+    # SET FEATURES (Number of Queues) MUST precede any CREATE I/O QUEUE
+    # (spec §5.21.1.7). Clamp our queue count to what the controller
+    # grants.
+    granted: uint32 = _nvme_set_num_queues()
+    nvme.n_io_queues = 0
+    nvme.rr_next = 0
 
-    # V4.2: PRP-list page pool (one 4 KiB page per SQE slot, indexed
-    # by iosq_tail at submit time). Required for any I/O transfer that
-    # crosses a page boundary; pre-V4.2 the driver only wrote PRP1 and
-    # silently dropped bytes past the first-page edge. Allocation
-    # happens once at queue setup; failure here is fatal because every
-    # subsequent IDENTIFY/READ/WRITE depends on the pool being live.
+    # Allocate + create queue pair 1 first; its PRP pool is the legacy
+    # 64-page pool so the single-queue path stays byte-identical.
+    if _nvme_setup_io_queue(NVME_IO_QID) != 0:
+        return -1
+    # qid=1 PRP pool: the legacy allocator (sets io_prp_pool_ready and
+    # io_prp_pool_ready_mq[1]).
     if _alloc_io_prp_pool() != 0:
         printk0("[nvme] PRP-list pool init failed\n")
         return -1
+    nvme.n_io_queues = 1
+
+    # Create the remaining I/O queue pairs (qid 2..granted), each with
+    # its own SQ/CQ memory + PRP pool.
+    qid: uint32 = NVME_IO_QID + 1
+    while qid <= granted:
+        if _nvme_setup_io_queue(qid) != 0:
+            printk1("[nvme] stopping at %d I/O queues\n",
+                    cast[uint64](nvme.n_io_queues))
+            qid = granted + 1
+        else:
+            nvme.n_io_queues = nvme.n_io_queues + 1
+            qid = qid + 1
+    printk1("[nvme] I/O queues online (count=%d)\n",
+            cast[uint64](nvme.n_io_queues))
     printk0("[nvme] PRP-list pool ready (64 pages)\n")
 
     # ----- Read LBA 0 -------------------------------------------
@@ -1161,6 +1627,150 @@ def nvme_smoke_test() -> int32:
     blk_scan_partitions(nbslot)
     blk_register_partitions(nbslot, "nvme0n1")
 
+    # ----- Multi-namespace block-device registration --------------
+    # Register every active namespace beyond nsid=1 as nvme0n<nsid>.
+    # priv carries the real NSID so the blkop adapters route to the
+    # correct namespace. nsid=1 is already registered above as nvme0n1.
+    _nvme_register_extra_namespaces()
+
+    # ----- Multi-queue + multi-NS self-test -----------------------
+    # Proves: (a) more than one I/O queue is live, (b) more than one
+    # namespace was enumerated, (c) an I/O on a SECOND queue and (if
+    # present) a SECOND namespace round-trips. Emits the
+    # "[nvme-multiq]" PASS markers the test script greps for.
+    _nvme_multiq_self_test()
+
+    return 0
+
+
+# Register active namespaces other than nsid=1 with the block layer as
+# nvme0n<nsid>. The name buffer is built into a small module-scope
+# buffer because Adder has no easy stack-string formatting.
+nvme_ns_name: Array[16, uint8]
+nvme_ns_ops:  Array[8, BlockDeviceOps]
+
+
+def _fmt_nvme_ns_name(nsid: uint32):
+    # Build "nvme0n<nsid>" into nvme_ns_name. nsid is small (<= a few
+    # thousand in practice); handle up to 4 decimal digits.
+    nvme_ns_name[0] = cast[uint8](0x6E)   # 'n'
+    nvme_ns_name[1] = cast[uint8](0x76)   # 'v'
+    nvme_ns_name[2] = cast[uint8](0x6D)   # 'm'
+    nvme_ns_name[3] = cast[uint8](0x65)   # 'e'
+    nvme_ns_name[4] = cast[uint8](0x30)   # '0'
+    nvme_ns_name[5] = cast[uint8](0x6E)   # 'n'
+    # Decimal-encode nsid into a temp digit buffer, then reverse.
+    digits: Array[8, uint8]
+    nd: uint32 = 0
+    v: uint32 = nsid
+    if v == 0:
+        digits[0] = cast[uint8](0x30)
+        nd = 1
+    while v > 0:
+        digits[nd] = cast[uint8](0x30 + (v % 10))
+        v = v / 10
+        nd = nd + 1
+    di: uint32 = 0
+    while di < nd:
+        nvme_ns_name[6 + di] = digits[nd - 1 - di]
+        di = di + 1
+    nvme_ns_name[6 + nd] = 0
+
+
+def _nvme_register_extra_namespaces():
+    i: uint32 = 0
+    while i < nvme.n_namespaces:
+        nsid: uint32 = ns_id[i]
+        if nsid != 1:
+            _fmt_nvme_ns_name(nsid)
+            nvme_ns_ops[i].read_sectors  = _nvme_read_lba_blkop
+            nvme_ns_ops[i].write_sectors = _nvme_write_lba_blkop
+            cap: uint64 = ns_lba_count[i]
+            sl: int32 = register_blockdev(
+                cast[Ptr[char]](&nvme_ns_name[0]), cap,
+                &nvme_ns_ops[i], cast[uint64](nsid))
+            if sl < 0:
+                printk1("[nvme] register_blockdev nsid=%d failed\n",
+                        cast[uint64](nsid))
+            else:
+                printk2("[nvme] registered nsid=%d block slot=%d\n",
+                        cast[uint64](nsid), cast[uint64](sl))
+                printk1("[nvme] nvme0n%d registered\n",
+                        cast[uint64](nsid))
+        i = i + 1
+
+
+# Buffers for the multi-queue self-test. Module-scope (page-aligned via
+# alloc_pages in the test body; these are just the pointers).
+def _nvme_multiq_self_test() -> int32:
+    # (a) Assert we have more than one I/O queue + namespace.
+    printk2("[nvme-multiq] queues=%d namespaces=%d\n",
+            cast[uint64](nvme.n_io_queues),
+            cast[uint64](nvme.n_namespaces))
+    if nvme.n_io_queues > 1:
+        printk0("[nvme-multiq] PASS multi-queue (>1 I/O queue)\n")
+    else:
+        printk0("[nvme-multiq] WARN single I/O queue only\n")
+    if nvme.n_namespaces > 1:
+        printk0("[nvme-multiq] PASS multi-namespace (>1 NS)\n")
+    else:
+        printk0("[nvme-multiq] WARN single namespace only\n")
+
+    # (b) Drive an explicit read on the highest I/O queue (qid =
+    # n_io_queues) by writing a pattern at LBA 2 of nsid=1 over that
+    # queue and reading it back over the same queue. We bypass the
+    # round-robin picker here to PIN the transfer to a specific second
+    # queue, proving it is independently functional.
+    if nvme.n_io_queues < 2:
+        return 0
+    wbuf: uint64 = alloc_pages(0)
+    rbuf: uint64 = alloc_pages(0)
+    if wbuf == 0 or rbuf == 0:
+        printk0("[nvme-multiq] alloc_pages failed\n")
+        return -1
+    memset(cast[Ptr[uint8]](wbuf), 0, 4096)
+    memset(cast[Ptr[uint8]](rbuf), 0, 4096)
+    q2: uint32 = nvme.n_io_queues          # the last/highest I/O queue
+    wp: Ptr[uint8] = cast[Ptr[uint8]](wbuf)
+    i2: uint64 = 0
+    while i2 < 512:
+        wp[i2] = cast[uint8](cast[uint8](i2 & 0xFF) ^ cast[uint8](0x3C))
+        i2 = i2 + 1
+    wstat: uint32 = _io_submit_buf_and_wait_q(
+        q2, NVME_IO_WRITE, 1, virt_to_phys(wbuf), 512,
+        2, 0, 0, 0, 0, 0)
+    rstat: uint32 = _io_submit_buf_and_wait_q(
+        q2, NVME_IO_READ, 1, virt_to_phys(rbuf), 512,
+        2, 0, 0, 0, 0, 0)
+    if wstat != 0 or rstat != 0:
+        printk2("[nvme-multiq] q2 I/O failed wstat=%x rstat=%x\n",
+                cast[uint64](wstat), cast[uint64](rstat))
+        return -1
+    rp: Ptr[uint8] = cast[Ptr[uint8]](rbuf)
+    j2: uint64 = 0
+    while j2 < 512:
+        if rp[j2] != wp[j2]:
+            printk2("[nvme-multiq] q2 MISMATCH byte %d (got %x)\n",
+                    j2, cast[uint64](rp[j2]))
+            return -1
+        j2 = j2 + 1
+    printk1("[nvme-multiq] PASS second-queue read (qid=%d)\n",
+            cast[uint64](q2))
+
+    # (c) If there's a second namespace, prove a read on it lands. We
+    # read LBA 0 of the second namespace via its own nsid (round-robin
+    # queue). Success = the I/O completed (status 0); we don't assert
+    # content because the extra NS may be blank.
+    if nvme.n_namespaces > 1:
+        nsid2: uint32 = ns_id[1]
+        memset(cast[Ptr[uint8]](rbuf), 0, 4096)
+        if nvme_read_lba_ns(nsid2, 0, 1, rbuf) == 0:
+            printk1("[nvme-multiq] PASS second-namespace read (nsid=%d)\n",
+                    cast[uint64](nsid2))
+        else:
+            printk1("[nvme-multiq] second-namespace read FAILED (nsid=%d)\n",
+                    cast[uint64](nsid2))
+            return -1
     return 0
 
 
