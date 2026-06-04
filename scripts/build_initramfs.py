@@ -999,6 +999,17 @@ if os.environ.get("ENABLE_WSTAT_APPLY_TEST") == "1":
 if os.environ.get("ENABLE_TMPFS_LINK_TEST") == "1":
     FILES.append(("/etc/tmpfs-link-test", b"1\n"))
 
+# cgroup v2 (/sys/fs/cgroup) end-to-end self-test. scripts/test_cgroup2.sh
+# sets ENABLE_CGROUP2_TEST=1 to plant /etc/cgroup2-test. init/main.ad's
+# boot:37.cg2 hook detects the marker and calls cgroup2_vfs_selftest()
+# (fs/vfs.ad): it open()/read()s the Linux-namespace cgroup2 interface
+# files (cgroup.controllers, cgroup.procs, memory.current, pids.max,
+# cgroup.type) through the real VFS dispatch and asserts their structural
+# shape. Render-on-open only — no disk — so it always runs once the marker
+# is present. Default boots omit the marker.
+if os.environ.get("ENABLE_CGROUP2_TEST") == "1":
+    FILES.append(("/etc/cgroup2-test", b"1\n"))
+
 # statfs(2)/fstatfs(2) capacity self-test. scripts/test_statfs.sh sets
 # ENABLE_STATFS_TEST=1 to plant /etc/statfs-test. init/main.ad at
 # boot:37.sfs detects the marker after the ext4 mount and calls
