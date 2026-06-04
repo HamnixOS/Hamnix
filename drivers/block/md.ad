@@ -60,6 +60,7 @@ extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 MD_LEVEL_NONE:  uint32 = 0
 MD_LEVEL_RAID0: uint32 = 1       # striping
 MD_LEVEL_RAID1: uint32 = 2       # mirroring
+MD_LEVEL_RAID5: uint32 = 5       # striping + distributed single parity
 
 MD_MAX_MEMBERS: uint64 = 8       # member disks per array
 MD_MAX_ARRAYS:  uint64 = 8       # md arrays system-wide
@@ -270,6 +271,249 @@ def _md_raid1_io(dev: Ptr[MdArray], is_write: int32, vlba: uint64,
 
 
 # =========================================================================
+# RAID5 — striping with distributed single parity (left-symmetric)
+# =========================================================================
+#
+# Linux's drivers/md/raid5.c default layout. For N members the address
+# space is carved into CHUNKS exactly like RAID0, but each STRIPE (one
+# chunk-row spanning all N members) holds N-1 DATA chunks plus 1 PARITY
+# chunk, and the parity chunk's member ROTATES per stripe so parity write
+# load is spread across all disks. Capacity = (N-1) * per_member_chunks *
+# chunk_sectors.
+#
+# LEFT-SYMMETRIC geometry (matching raid5.c LAYOUT_LEFT_SYMMETRIC):
+#
+#   stripe s = vchunk / (N-1)         (which chunk-row)
+#   didx   d = vchunk % (N-1)         (data-block index within the stripe)
+#   pd_idx   = (N-1) - (s % N)        (member holding parity for stripe s;
+#                                      starts on the LAST member at s=0 and
+#                                      rotates LEFT as s grows)
+#   data member for data-index d = (pd_idx + 1 + d) % N
+#                                      (data blocks start just AFTER parity
+#                                      and wrap, so they are densely packed)
+#   member chunk offset = s * chunk_sectors   (same row on every member)
+#
+# P (parity) = XOR of the N-1 data chunks of that stripe.
+#
+# DEGRADED READ: if the data member we need is Faulty, reconstruct that
+# chunk by XOR-ing every SURVIVING data chunk of the stripe with the parity
+# chunk (P XOR (other data) = missing data). If the PARITY member is the
+# faulty one, a normal read of a live data member is unaffected.
+#
+# WRITE (read-modify-write): to write one data chunk we must keep P
+# consistent: new_P = old_P XOR old_data XOR new_data. So read the old data
+# and old parity, compute the delta, write the new data and new parity. If
+# the data member is faulty we can't write it but we still recompute parity
+# from survivors so the chunk stays reconstructable; if the parity member
+# is faulty we just write the data (no parity to maintain while degraded).
+
+# Per-chunk scratch buffers for RAID5 RMW / reconstruction. Sized to one
+# full default chunk (64 KiB). Module-scope per the Adder large-array quirk.
+_MD_R5_CHUNK_BYTES: uint64 = 65536        # 128 sectors * 512
+_md_r5_scratch_a: Array[65536, uint8]     # old data / accumulator
+_md_r5_scratch_b: Array[65536, uint8]     # old parity / surviving chunk
+_md_r5_scratch_c: Array[65536, uint8]     # reconstruction accumulator
+
+
+def _md_xor_into(dst: Ptr[uint8], src: Ptr[uint8], n: uint64):
+    # dst[i] ^= src[i] for n bytes. The parity primitive.
+    i: uint64 = 0
+    while i < n:
+        dst[i] = dst[i] ^ src[i]
+        i = i + 1
+
+
+def _md_r5_pd_idx(n: uint64, stripe: uint64) -> uint64:
+    # Member index holding the PARITY chunk for `stripe` (left-symmetric).
+    return (n - 1) - (stripe % n)
+
+
+def _md_r5_data_member(n: uint64, pd: uint64, didx: uint64) -> uint64:
+    # Member index holding data-block `didx` (0..N-2) of a stripe whose
+    # parity lives on member `pd` — left-symmetric packs data right after
+    # parity, wrapping.
+    return (pd + 1 + didx) % n
+
+
+def _md_r5_member_lba(dev: Ptr[MdArray], member: uint64,
+                      row_chunk: uint64, off: uint64) -> uint64:
+    # Underlying LBA on `member` for chunk-row `row_chunk` at sector `off`
+    # within the chunk.
+    return row_chunk * dev[0].chunk_sectors + off \
+        + dev[0].members[member].under_start
+
+
+def _md_r5_recon_data(dev: Ptr[MdArray], stripe: uint64, want: uint64,
+                      off: uint64, frag: uint64, out: Ptr[uint8]) -> int32:
+    # Reconstruct the data chunk-fragment that lives on member `want` for
+    # `stripe`, by XOR-ing every OTHER member's fragment (all surviving data
+    # members PLUS the parity member) at the same row/offset. This is the
+    # RAID5 resilience math: P XOR (all surviving data) = the missing data.
+    # `want` must be the (sole) faulty member. Returns 0 / -1.
+    n: uint64 = cast[uint64](dev[0].n_members)
+    nb: uint64 = frag * SECTOR_SIZE
+    # Zero the accumulator, then XOR in every member except `want`.
+    z: uint64 = 0
+    while z < nb:
+        out[z] = 0
+        z = z + 1
+    m: uint64 = 0
+    while m < n:
+        if m != want:
+            if dev[0].members[m].failed != 0:
+                # Two faults in one stripe — unrecoverable for RAID5.
+                return -1
+            mlba: uint64 = _md_r5_member_lba(dev, m, stripe, off)
+            rc: int32 = blk_read_sectors(
+                dev[0].members[m].under_slot, mlba, frag,
+                cast[Ptr[uint8]](&_md_r5_scratch_b[0]))
+            if rc != 0:
+                return rc
+            _md_xor_into(out, cast[Ptr[uint8]](&_md_r5_scratch_b[0]), nb)
+        m = m + 1
+    return 0
+
+
+def _md_raid5_read_chunkfrag(dev: Ptr[MdArray], stripe: uint64,
+                             didx: uint64, off: uint64, frag: uint64,
+                             buf: Ptr[uint8]) -> int32:
+    # Read one chunk-fragment of data-block `didx` in `stripe`. If its data
+    # member is live, read it directly. If it's Faulty, reconstruct via XOR.
+    n: uint64 = cast[uint64](dev[0].n_members)
+    pd: uint64 = _md_r5_pd_idx(n, stripe)
+    dm: uint64 = _md_r5_data_member(n, pd, didx)
+    if dev[0].members[dm].failed == 0:
+        mlba: uint64 = _md_r5_member_lba(dev, dm, stripe, off)
+        return blk_read_sectors(dev[0].members[dm].under_slot, mlba,
+                                frag, buf)
+    # Degraded: reconstruct the missing data fragment into `buf`.
+    return _md_r5_recon_data(dev, stripe, dm, off, frag, buf)
+
+
+def _md_raid5_write_chunkfrag(dev: Ptr[MdArray], stripe: uint64,
+                              didx: uint64, off: uint64, frag: uint64,
+                              buf: Ptr[uint8]) -> int32:
+    # Read-modify-write one data chunk-fragment, keeping parity consistent.
+    #   new_P = old_P XOR old_data XOR new_data
+    # We read old_data (from the data member) and old_P (from the parity
+    # member), XOR to form the delta, apply it to old_P, then write new_data
+    # and new_P. Handles a faulty data member (skip the data write, still
+    # fix parity from survivors) and a faulty parity member (write data
+    # only). `frag` <= chunk_sectors so it fits the scratch buffers.
+    n: uint64 = cast[uint64](dev[0].n_members)
+    pd: uint64 = _md_r5_pd_idx(n, stripe)
+    dm: uint64 = _md_r5_data_member(n, pd, didx)
+    nb: uint64 = frag * SECTOR_SIZE
+    data_failed: uint32 = dev[0].members[dm].failed
+    par_failed:  uint32 = dev[0].members[pd].failed
+
+    if par_failed != 0:
+        # Parity disk gone: we cannot maintain P. Just write the data (if
+        # its member is live). Reads of OTHER data members are unaffected;
+        # the failed parity will be rebuilt by md_raid5_rebuild.
+        if data_failed != 0:
+            # Both this data member and parity are down: this stripe has two
+            # faults — write is lost for this block but don't corrupt others.
+            return -1
+        mlba: uint64 = _md_r5_member_lba(dev, dm, stripe, off)
+        return blk_write_sectors(dev[0].members[dm].under_slot, mlba,
+                                 frag, buf)
+
+    # Parity is live. Compute new parity.
+    par_lba: uint64 = _md_r5_member_lba(dev, pd, stripe, off)
+    # Read old parity into scratch_a (the running new-parity accumulator).
+    prc: int32 = blk_read_sectors(dev[0].members[pd].under_slot, par_lba,
+                                  frag, cast[Ptr[uint8]](&_md_r5_scratch_a[0]))
+    if prc != 0:
+        return prc
+
+    if data_failed == 0:
+        # Normal RMW: new_P = old_P XOR old_data XOR new_data.
+        dlba: uint64 = _md_r5_member_lba(dev, dm, stripe, off)
+        drc: int32 = blk_read_sectors(
+            dev[0].members[dm].under_slot, dlba, frag,
+            cast[Ptr[uint8]](&_md_r5_scratch_b[0]))
+        if drc != 0:
+            return drc
+        # accumulator ^= old_data ^ new_data.
+        _md_xor_into(cast[Ptr[uint8]](&_md_r5_scratch_a[0]),
+                     cast[Ptr[uint8]](&_md_r5_scratch_b[0]), nb)
+        _md_xor_into(cast[Ptr[uint8]](&_md_r5_scratch_a[0]), buf, nb)
+        # Write the new data, then the new parity.
+        wrc: int32 = blk_write_sectors(dev[0].members[dm].under_slot,
+                                       dlba, frag, buf)
+        if wrc != 0:
+            return wrc
+        return blk_write_sectors(dev[0].members[pd].under_slot, par_lba,
+                                 frag, cast[Ptr[uint8]](&_md_r5_scratch_a[0]))
+
+    # Data member is Faulty: we can't store the new data, but we MUST keep
+    # parity consistent so the (now reconstructable) chunk reflects new_data.
+    # The reconstructed value of the faulty chunk == XOR of all live data +
+    # parity. We want that to equal new_data, i.e. set
+    #   new_P = new_data XOR (all OTHER live data members of this stripe).
+    # Build that directly: accumulator = new_data, then XOR each other live
+    # data member's fragment.
+    j: uint64 = 0
+    while j < nb:
+        _md_r5_scratch_a[j] = buf[j]
+        j = j + 1
+    od: uint64 = 0
+    nd: uint64 = n - 1                  # data blocks per stripe
+    while od < nd:
+        om: uint64 = _md_r5_data_member(n, pd, od)
+        if om != dm:
+            if dev[0].members[om].failed != 0:
+                return -1               # second fault — unrecoverable
+            olba: uint64 = _md_r5_member_lba(dev, om, stripe, off)
+            orc: int32 = blk_read_sectors(
+                dev[0].members[om].under_slot, olba, frag,
+                cast[Ptr[uint8]](&_md_r5_scratch_b[0]))
+            if orc != 0:
+                return orc
+            _md_xor_into(cast[Ptr[uint8]](&_md_r5_scratch_a[0]),
+                         cast[Ptr[uint8]](&_md_r5_scratch_b[0]), nb)
+        od = od + 1
+    return blk_write_sectors(dev[0].members[pd].under_slot, par_lba,
+                             frag, cast[Ptr[uint8]](&_md_r5_scratch_a[0]))
+
+
+def _md_raid5_io(dev: Ptr[MdArray], is_write: int32, vlba: uint64,
+                 count: uint64, buf: Ptr[uint8]) -> int32:
+    # Walk the request span, splitting at chunk boundaries (exactly like
+    # raid0) but mapping each chunk through the left-symmetric data/parity
+    # layout. Each fragment is one contiguous run within a single data
+    # chunk, dispatched to the read or RMW-write helper.
+    if count == 0:
+        return 0
+    n: uint64 = cast[uint64](dev[0].n_members)
+    chunk: uint64 = dev[0].chunk_sectors
+    nd: uint64 = n - 1                  # data chunks per stripe
+    done: uint64 = 0
+    while done < count:
+        cur_v: uint64 = vlba + done
+        vchunk: uint64 = cur_v / chunk
+        off:    uint64 = cur_v % chunk
+        stripe: uint64 = vchunk / nd
+        didx:   uint64 = vchunk % nd
+        avail: uint64 = chunk - off
+        frag: uint64 = count - done
+        if frag > avail:
+            frag = avail
+        bufp: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](buf) + done * SECTOR_SIZE)
+        rc: int32 = 0
+        if is_write != 0:
+            rc = _md_raid5_write_chunkfrag(dev, stripe, didx, off, frag, bufp)
+        else:
+            rc = _md_raid5_read_chunkfrag(dev, stripe, didx, off, frag, bufp)
+        if rc != 0:
+            return rc
+        done = done + frag
+    return 0
+
+
+# =========================================================================
 # I/O dispatch (block-layer vtable adapters)
 # =========================================================================
 
@@ -286,6 +530,8 @@ def _md_io(dev: Ptr[MdArray], is_write: int32, vlba: uint64,
         return _md_raid0_io(dev, is_write, vlba, count, buf)
     if dev[0].level == MD_LEVEL_RAID1:
         return _md_raid1_io(dev, is_write, vlba, count, buf)
+    if dev[0].level == MD_LEVEL_RAID5:
+        return _md_raid5_io(dev, is_write, vlba, count, buf)
     return -1
 
 
@@ -413,6 +659,146 @@ def md_create_raid1(name: Ptr[char], slots: Ptr[int32], n: uint64) -> int32:
     return md_arrays[idx].self_slot
 
 
+def md_create_raid5(name: Ptr[char], slots: Ptr[int32], n: uint64,
+                    chunk_sectors: uint64) -> int32:
+    # Assemble a RAID5 array (striping + distributed single parity,
+    # left-symmetric) from `n` member slots, n >= 3. Each stripe holds N-1
+    # data chunks and 1 rotating parity chunk; capacity = (N-1) * per_member
+    # usable. The per-member usable span is clamped to the smallest member
+    # and rounded DOWN to a whole number of chunks (uniform stripe
+    # geometry). This is the `mdadm --create NAME --level=5 --chunk=CHUNK
+    # -n N dev0 dev1 ...` shape. Returns the registered block slot (>= 0) or
+    # a negative error.
+    md_init()
+    if n < 3 or n > MD_MAX_MEMBERS:
+        return -1
+    cs: uint64 = chunk_sectors
+    if cs == 0:
+        cs = MD_DEFAULT_CHUNK_SECTORS
+    # RMW/reconstruction scratch buffers are one default chunk wide; never
+    # let a chunk exceed that or the XOR helpers would overflow.
+    if cs > MD_DEFAULT_CHUNK_SECTORS:
+        printk0("md: raid5 chunk too large\n")
+        return -1
+    smallest: uint64 = 0
+    i: uint64 = 0
+    while i < n:
+        s: int32 = slots[i]
+        if s < 0:
+            return -2
+        cap: uint64 = blk_capacity_sectors(s)
+        if cap == 0:
+            return -2
+        if smallest == 0 or cap < smallest:
+            smallest = cap
+        i = i + 1
+    per_member: uint64 = (smallest / cs) * cs
+    if per_member == 0:
+        printk0("md: raid5 members smaller than one chunk\n")
+        return -3
+    idx_s: int32 = _md_alloc_array()
+    if idx_s < 0:
+        printk0("md: array table full\n")
+        return -4
+    idx: uint64 = cast[uint64](idx_s)
+    md_arrays[idx].level         = MD_LEVEL_RAID5
+    md_arrays[idx].n_members     = cast[uint32](n)
+    md_arrays[idx].rr            = 0
+    md_arrays[idx].chunk_sectors = cs
+    # Capacity = data disks * per-member span = (N-1) * per_member.
+    md_arrays[idx].capacity      = per_member * (n - 1)
+    i = 0
+    while i < n:
+        md_arrays[idx].members[i].under_slot  = slots[i]
+        md_arrays[idx].members[i].failed      = 0
+        md_arrays[idx].members[i].under_start = 0
+        md_arrays[idx].members[i].usable      = per_member
+        i = i + 1
+    if _md_register(idx, name) != 0:
+        md_arrays[idx].used = 0
+        return -5
+    return md_arrays[idx].self_slot
+
+
+def md_raid5_rebuild(name: Ptr[char], member_idx: uint64,
+                     new_slot: int32) -> int32:
+    # Replace a Faulty member of RAID5 array `name` with the underlying
+    # block device `new_slot` and RECONSTRUCT its contents stripe-by-stripe
+    # from the survivors (XOR), then clear the degraded state (mdadm --add +
+    # recovery). For every chunk-row on the replaced member, whatever role
+    # it plays in that stripe — a data chunk or the parity chunk — its
+    # correct contents are the XOR of all the OTHER members' chunks at that
+    # row (parity = XOR of data; a data chunk = XOR of parity + other data).
+    # Either way the rebuilt chunk is the XOR of the survivors at that row,
+    # so a single XOR-of-others loop rebuilds every row uniformly. Returns 0
+    # on success, negative on error.
+    if new_slot < 0:
+        return -1
+    slot: int32 = find_blockdev(name)
+    if slot < 0:
+        return -1
+    ai: uint64 = 0
+    found: int32 = -1
+    while ai < MD_MAX_ARRAYS:
+        if md_arrays[ai].used != 0 and md_arrays[ai].self_slot == slot:
+            found = cast[int32](ai)
+            ai = MD_MAX_ARRAYS
+        else:
+            ai = ai + 1
+    if found < 0:
+        return -1
+    idx: uint64 = cast[uint64](found)
+    dev: Ptr[MdArray] = &md_arrays[idx]
+    if dev[0].level != MD_LEVEL_RAID5:
+        return -1
+    n: uint64 = cast[uint64](dev[0].n_members)
+    if member_idx >= n:
+        return -1
+    # Only one fault is recoverable in RAID5: refuse if a DIFFERENT member
+    # is also Faulty.
+    f: uint64 = 0
+    while f < n:
+        if f != member_idx and dev[0].members[f].failed != 0:
+            printk0("md: raid5 rebuild blocked — second member Faulty\n")
+            return -2
+        f = f + 1
+    # Point the member at the fresh device, mark it live, then fill it.
+    dev[0].members[member_idx].under_slot  = new_slot
+    dev[0].members[member_idx].under_start = 0
+    chunk: uint64 = dev[0].chunk_sectors
+    per_member: uint64 = dev[0].members[member_idx].usable
+    rows: uint64 = per_member / chunk
+    row: uint64 = 0
+    nb: uint64 = chunk * SECTOR_SIZE
+    while row < rows:
+        # Rebuilt row = XOR of all OTHER members' chunks at this row.
+        z: uint64 = 0
+        while z < nb:
+            _md_r5_scratch_c[z] = 0
+            z = z + 1
+        m: uint64 = 0
+        while m < n:
+            if m != member_idx:
+                mlba: uint64 = row * chunk + dev[0].members[m].under_start
+                rc: int32 = blk_read_sectors(
+                    dev[0].members[m].under_slot, mlba, chunk,
+                    cast[Ptr[uint8]](&_md_r5_scratch_b[0]))
+                if rc != 0:
+                    return rc
+                _md_xor_into(cast[Ptr[uint8]](&_md_r5_scratch_c[0]),
+                             cast[Ptr[uint8]](&_md_r5_scratch_b[0]), nb)
+            m = m + 1
+        wlba: uint64 = row * chunk + dev[0].members[member_idx].under_start
+        wrc: int32 = blk_write_sectors(new_slot, wlba, chunk,
+                                       cast[Ptr[uint8]](&_md_r5_scratch_c[0]))
+        if wrc != 0:
+            return wrc
+        row = row + 1
+    # Recovery complete: clear the Faulty bit.
+    dev[0].members[member_idx].failed = 0
+    return 0
+
+
 def md_fail_member(name: Ptr[char], member_idx: uint64) -> int32:
     # Mark member `member_idx` of array `name` Faulty — the degraded-mode
     # trigger (mdadm --fail). For a RAID1 array the array keeps serving
@@ -509,8 +895,8 @@ _md_back_ops3:    BlockDeviceOps
 # transfer the test performs).
 _md_t_pat:    Array[1024, uint8]   # patterns written through an array
 _md_t_read:   Array[1024, uint8]   # readback through an array
-_md_t_raw0:   Array[1024, uint8]   # raw read from member 0
-_md_t_raw1:   Array[1024, uint8]   # raw read from member 1
+_md_t_raw0:   Array[4096, uint8]   # raw read from member 0 (up to 4-sector chunk)
+_md_t_raw1:   Array[4096, uint8]   # raw read from member 1 (up to 4-sector chunk)
 
 # Member-slot scratch arrays handed to md_create_* (module-scope; small but
 # kept out of the frame to be safe with the Adder array quirk).
@@ -868,8 +1254,151 @@ def md_selftest() -> int32:
 
     md_remove("md1")
 
+    # ================================================================
+    # Test 4: RAID5 — striping + distributed parity, degraded-read XOR
+    # reconstruction, RMW writes, and a full member rebuild.
+    # ================================================================
+    if _md_raid5_test(b0, b1, b2, b3) != 1:
+        ok = 0
+
     if ok == 1:
         _md_emerg0("[mdraid] PASS\n")
         return 1
     _md_emerg0("[mdraid] FAIL\n")
     return 0
+
+
+# Extra scratch for the RAID5 self-test (multi-sector patterns across
+# several stripes). Module-scope per the Adder large-array quirk.
+_md_t5_pat:  Array[8192, uint8]   # 16 sectors written through the array
+_md_t5_read: Array[8192, uint8]   # readback
+_md_slots5:  Array[8, int32]
+
+
+def _md_raid5_test(b0: int32, b1: int32, b2: int32, b3: int32) -> int32:
+    # RAID5 over THREE members (mdback0,1,2). Chunk = 4 sectors so a small
+    # write spans several stripes cheaply. mdback3 is the spare used for the
+    # rebuild. Returns 1 PASS / 0 FAIL.
+    _md_emerg0("[mdraid] raid5: begin\n")
+    # Re-zero the three member stores so this test is deterministic even
+    # though earlier tests dirtied them.
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store0[0]))
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store1[0]))
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store2[0]))
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store3[0]))
+
+    _md_slots5[0] = b0
+    _md_slots5[1] = b1
+    _md_slots5[2] = b2
+    r5: int32 = md_create_raid5("md5", &_md_slots5[0], 3, 4)
+    if r5 < 0:
+        _md_emerg1("[mdraid] FAIL: md_create_raid5 rc=%d\n",
+                   cast[uint64](cast[int64](r5)))
+        return 0
+    # Capacity = (N-1) * per_member = 2 * floor(256/4)*4 = 2 * 256 = 512.
+    r5cap: uint64 = blk_capacity_sectors(r5)
+    _md_emerg1("[mdraid] raid5 capacity=%d sectors\n", r5cap)
+    if r5cap != 512:
+        _md_emerg0("[mdraid] FAIL: raid5 capacity wrong (want 512)\n")
+        return 0
+
+    # ---- Write a known 16-sector pattern at vLBA 0, spanning multiple
+    # data chunks/stripes (chunk=4 -> 4 data chunks across 2 stripes), then
+    # read it back through the healthy array. ----
+    _md_fill(&_md_t5_pat[0], 16 * SECTOR_SIZE, 717)
+    if blk_write_sectors(r5, 0, 16, &_md_t5_pat[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raid5 write 16s\n")
+        return 0
+    if blk_read_sectors(r5, 0, 16, &_md_t5_read[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raid5 readback 16s\n")
+        return 0
+    if _md_buf_eq(&_md_t5_pat[0], &_md_t5_read[0], 16 * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdraid] FAIL: raid5 rw mismatch\n")
+        return 0
+    _md_emerg0("[md] PASS raid5-rw\n")
+
+    # ---- Verify parity is REAL: for stripe 0 (vLBA 0..7 -> data chunks 0,1)
+    # parity member is pd=(N-1)-(0%N)=2 (mdback2). Read the two data chunks
+    # raw and the parity chunk raw; parity must equal data0 XOR data1. ----
+    # data-block 0 of stripe0 -> member (pd+1+0)%3 = (2+1)%3 = 0 (mdback0)
+    # data-block 1 of stripe0 -> member (2+1+1)%3 = 1 (mdback1)
+    if blk_read_sectors(b0, 0, 4, &_md_t_raw0[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raw read data0\n")
+        return 0
+    if blk_read_sectors(b1, 0, 4, &_md_t_raw1[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raw read data1\n")
+        return 0
+    if blk_read_sectors(b2, 0, 4, &_md_t5_read[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raw read parity\n")
+        return 0
+    # _md_t_raw0 ^= _md_t_raw1 -> should equal the parity chunk.
+    _md_xor_into(&_md_t_raw0[0], &_md_t_raw1[0], 4 * SECTOR_SIZE)
+    if _md_buf_eq(&_md_t_raw0[0], &_md_t5_read[0], 4 * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdraid] FAIL: raid5 parity (data0^data1) != P\n")
+        return 0
+    _md_emerg0("[mdraid] raid5: distributed parity P=data0^data1 OK\n")
+
+    # ---- DEGRADED READ: fail member 0 (mdback0) and read the whole 16s
+    # back. The chunks that lived on member0 must be reconstructed by XOR of
+    # the survivors+parity and still match the original pattern. ----
+    if md_fail_member("md5", 0) != 0:
+        _md_emerg0("[mdraid] FAIL: md_fail_member raid5\n")
+        return 0
+    _md_emerg0("[mdraid] raid5: member0 marked Faulty (degraded)\n")
+    # Wipe mdback0 underneath so a non-reconstructing read could only return
+    # garbage — proving the data truly comes from XOR reconstruction.
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store0[0]))
+    if blk_read_sectors(r5, 0, 16, &_md_t5_read[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raid5 degraded read\n")
+        return 0
+    if _md_buf_eq(&_md_t5_pat[0], &_md_t5_read[0], 16 * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdraid] FAIL: raid5 degraded read mismatch\n")
+        return 0
+    _md_emerg0("[md] PASS raid5-degraded-read\n")
+
+    # ---- DEGRADED WRITE: with member0 still Faulty, overwrite vLBA 0..7
+    # with a new pattern. Parity must be recomputed so the (reconstructed)
+    # member0 chunk reflects the new data. Read it back via reconstruction. ----
+    _md_fill(&_md_t5_pat[0], 8 * SECTOR_SIZE, 818)
+    if blk_write_sectors(r5, 0, 8, &_md_t5_pat[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raid5 degraded write\n")
+        return 0
+    if blk_read_sectors(r5, 0, 8, &_md_t5_read[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raid5 degraded write readback\n")
+        return 0
+    if _md_buf_eq(&_md_t5_pat[0], &_md_t5_read[0], 8 * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdraid] FAIL: raid5 degraded write mismatch\n")
+        return 0
+    _md_emerg0("[md] PASS raid5-degraded-write\n")
+
+    # ---- REBUILD: add mdback3 as the replacement for member0 and rebuild.
+    # After rebuild, member0 is live; verify the array reads back the LATEST
+    # data (the degraded-write pattern at 0..7, original at 8..15) and that
+    # the rebuilt member's chunk for stripe0/data0 matches the directly read
+    # chunk. ----
+    if md_raid5_rebuild("md5", 0, b3) != 0:
+        _md_emerg0("[mdraid] FAIL: md_raid5_rebuild\n")
+        return 0
+    # Build the expected full 16s image: 0..7 = pattern 818, 8..15 = 717.
+    _md_fill(&_md_t5_pat[0], 8 * SECTOR_SIZE, 818)
+    _md_fill(cast[Ptr[uint8]](cast[uint64](&_md_t5_pat[0]) + 8 * SECTOR_SIZE),
+             8 * SECTOR_SIZE, 717)
+    if blk_read_sectors(r5, 0, 16, &_md_t5_read[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raid5 post-rebuild read\n")
+        return 0
+    if _md_buf_eq(&_md_t5_pat[0], &_md_t5_read[0], 16 * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdraid] FAIL: raid5 post-rebuild mismatch\n")
+        return 0
+    # Confirm the rebuilt member (now mdback3) physically holds stripe0
+    # data0 = the new pattern's first chunk (data-block 0 lives on member0).
+    if blk_read_sectors(b3, 0, 4, &_md_t_raw0[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raw read rebuilt member\n")
+        return 0
+    if _md_buf_eq(&_md_t5_pat[0], &_md_t_raw0[0], 4 * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdraid] FAIL: rebuilt member chunk wrong\n")
+        return 0
+    _md_emerg0("[md] PASS raid5-rebuild\n")
+
+    md_remove("md5")
+    _md_emerg0("[md] raid5 PASS\n")
+    return 1

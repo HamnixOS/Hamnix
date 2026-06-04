@@ -108,6 +108,12 @@ check "raid1 read round-trip"        "[mdraid] raid1: read round-trips through m
 check "raid1 degraded write"         "[mdraid] raid1 degraded: write reached survivor OK"
 check "raid1 degraded skip failed"   "[mdraid] raid1 degraded: failed member skipped on write OK"
 check "raid1 degraded read"          "[mdraid] raid1 degraded: read round-trips via survivor OK"
+check "raid5 parity real"            "[mdraid] raid5: distributed parity P=data0^data1 OK"
+check "raid5 rw"                     "[md] PASS raid5-rw"
+check "raid5 degraded read"          "[md] PASS raid5-degraded-read"
+check "raid5 degraded write"         "[md] PASS raid5-degraded-write"
+check "raid5 rebuild"                "[md] PASS raid5-rebuild"
+check "raid5 PASS"                   "[md] raid5 PASS"
 check "mdraid PASS"                  "[mdraid] PASS"
 
 if [ "$fail" -ne 0 ]; then
@@ -115,4 +121,4 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
-echo "[test_mdraid] PASS — native software RAID: RAID0 stripe routing (with boundary-straddle split), RAID1 mirror fan-out, and RAID1 degraded-mode survivor round-trip all verified"
+echo "[test_mdraid] PASS — native software RAID: RAID0 stripe routing (with boundary-straddle split), RAID1 mirror fan-out + degraded survivor round-trip, and RAID5 distributed-parity striping with XOR degraded-read reconstruction, read-modify-write parity maintenance, and full member rebuild all verified"
