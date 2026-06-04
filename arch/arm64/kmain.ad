@@ -19513,6 +19513,10 @@ def arm64_p39_finish() -> int64:
         _uart_puts(rp)
         pp: Ptr[char] = "[arm64] Phase 39 PASS: futex thread-sync round-trip (two threads in one address space, futex_wait blocked the waiter, futex_wake woke it, handoff value matched through shared memory)\n"
         _uart_puts(pp)
+        # Hand off to Phase 40 (real in-guest TCP loopback handshake + data + teardown).
+        # Phase 40 needs no disk/net device; it runs two TCBs entirely in kernel RAM and
+        # delivers full IPv4/TCP segments through an in-guest loopback datapath.
+        arm64_p40_run()
     else:
         fp: Ptr[char] = "[arm64] Phase 39 FAIL: futex thread-sync verdict failed\n"
         _uart_puts(fp)
@@ -19663,6 +19667,778 @@ def arm64_p39_run(base: uint64) -> int64:
     _isb()
     _eret()                                      # -> EL0; both threads run
     # Unreachable: the verdict halts.
+    while True:
+        _wfi()
+    return 0
+
+
+# ===========================================================================
+# PHASE 40 — a real TCP/IPv4 three-way handshake + bidirectional data exchange
+# + orderly FIN teardown, entirely in-guest over a deterministic loopback
+# datapath on bare aarch64 (qemu-virt). NO external peer, NO SLIRP, NO ELF,
+# NO disk: two TCP control blocks (a passive-open server + an active-open
+# client) live in kernel RAM and exchange full Ethernet+IPv4+TCP segments
+# through an in-guest loopback that hands each transmitted frame straight to
+# the matching endpoint's receive path. Every segment carries a real 20-byte
+# TCP header, real sequence/acknowledgement numbers, and a real TCP checksum
+# over the IPv4 pseudo-header (src/dst/zero/proto/tcp-len) + header + payload,
+# validated on receipt. The state machines walk LISTEN/SYN_SENT/SYN_RCVD/
+# ESTABLISHED/FIN_WAIT_1/FIN_WAIT_2/CLOSE_WAIT/LAST_ACK/CLOSED exactly as a
+# real stack does. The kernel VERIFIES: both sides reached ESTABLISHED, the
+# payload bytes arrived byte-identical in BOTH directions, the ack numbers
+# advanced by exactly the bytes consumed, and both sides reached CLOSED.
+# arm64_p40_run never returns (it halts after the verdict).
+#
+# This mirrors the native x86 TCP state machine in drivers/net/tcp.ad
+# (SYN/SYN-ACK/ACK handshake, seq/ack numbering, pseudo-header checksum, FIN
+# teardown), reimplemented self-contained for the arm64 loopback path.
+# ===========================================================================
+
+# --- TCP states (match drivers/net/tcp.ad numbering) -----------------------
+P40_CLOSED:      int64 = 0
+P40_LISTEN:      int64 = 1
+P40_SYN_SENT:    int64 = 2
+P40_SYN_RCVD:    int64 = 3
+P40_ESTABLISHED: int64 = 4
+P40_FIN_WAIT_1:  int64 = 5
+P40_FIN_WAIT_2:  int64 = 6
+P40_CLOSE_WAIT:  int64 = 7
+P40_LAST_ACK:    int64 = 8
+P40_TIME_WAIT:   int64 = 9
+
+# --- TCP flag bits ---------------------------------------------------------
+P40_FIN: uint64 = 0x01
+P40_SYN: uint64 = 0x02
+P40_RST: uint64 = 0x04
+P40_PSH: uint64 = 0x08
+P40_ACK: uint64 = 0x10
+
+# --- framing geometry ------------------------------------------------------
+P40_ETH_HDR:  int64 = 14
+P40_IP_HDR:   int64 = 20
+P40_TCP_HDR:  int64 = 20
+P40_ETHERTYPE_IPV4: uint64 = 0x0800
+P40_IP_PROTO_TCP:   uint64 = 6
+
+# --- loopback addressing: both endpoints are 127.0.0.1 --------------------
+P40_LOOP_IP0: uint8 = 127
+P40_LOOP_IP1: uint8 = 0
+P40_LOOP_IP2: uint8 = 0
+P40_LOOP_IP3: uint8 = 1
+P40_SRV_PORT: uint64 = 7777          # server listens here
+P40_CLI_PORT: uint64 = 50000         # client ephemeral port
+
+# Initial sequence numbers (deterministic, distinct, non-trivial — they must
+# survive arithmetic + wrap correctness independent of each other).
+P40_CLI_ISN: uint64 = 0x10000000
+P40_SRV_ISN: uint64 = 0x70000000
+
+# Slot identifiers.
+P40_SLOT_SRV: int64 = 0              # passive open (LISTEN/accept)
+P40_SLOT_CLI: int64 = 1              # active open (connect)
+
+# --- TCB state (two slots: 0=server, 1=client) ----------------------------
+arm64_p40_state:    Array[2, int64]
+arm64_p40_snd_nxt:  Array[2, uint64]   # next seq we will send
+arm64_p40_snd_una:  Array[2, uint64]   # oldest unacked seq
+arm64_p40_rcv_nxt:  Array[2, uint64]   # next seq we expect from the peer
+arm64_p40_iss:      Array[2, uint64]   # our initial send sequence
+arm64_p40_irs:      Array[2, uint64]   # initial receive sequence (peer's ISN)
+arm64_p40_lport:    Array[2, uint64]   # our local TCP port
+arm64_p40_rport:    Array[2, uint64]   # the peer's TCP port
+arm64_p40_estab:    Array[2, int64]    # latched 1 when this side hit ESTABLISHED
+arm64_p40_closed:   Array[2, int64]    # latched 1 when this side hit CLOSED
+
+# Per-slot reassembled receive buffer (data delivered in-order to the app).
+P40_RXCAP: int64 = 256
+arm64_p40_rx0: Array[256, uint8]       # server's delivered bytes
+arm64_p40_rx1: Array[256, uint8]       # client's delivered bytes
+arm64_p40_rxlen: Array[2, int64]       # bytes delivered to each side
+
+# --- run-wide bookkeeping / verification flags ----------------------------
+arm64_p40_csum_bad:   int64 = 0        # any received segment failed checksum
+arm64_p40_segs_in:    int64 = 0        # total segments delivered via loopback
+arm64_p40_loop_depth: int64 = 0        # current loopback recursion depth
+arm64_p40_loop_max:   int64 = 0        # max recursion depth observed
+arm64_p40_srv_data_ok: int64 = 0       # server received the client payload identically
+arm64_p40_cli_data_ok: int64 = 0       # client received the server payload identically
+arm64_p40_handshake_seen: int64 = 0    # both sides reached ESTABLISHED
+
+# Frame scratch (one builder buffer; the loopback consumes it synchronously
+# before the next build, so a single buffer suffices). Generously sized at a
+# clear high PA so it cannot overflow into any prior-phase global.
+P40_FRAME_PA: uint64 = 0x46100000      # Eth+IPv4+TCP build/deliver frame
+P40_PHDR_PA:  uint64 = 0x46101000      # checksum pseudo-header scratch
+
+# The two app payloads exchanged once ESTABLISHED. Distinct content + lengths
+# so a cross-wire or truncation cannot silently pass.
+P40_CLI_MSG_LEN: int64 = 26
+P40_SRV_MSG_LEN: int64 = 22
+
+
+# Client->server application payload byte i (deterministic ramp + offset).
+def arm64_p40_cli_msg_byte(i: int64) -> uint8:
+    return cast[uint8](cast[uint64](0x41 + i * 3) & cast[uint64](0xFF))
+
+
+# Server->client application payload byte i (a different ramp).
+def arm64_p40_srv_msg_byte(i: int64) -> uint8:
+    return cast[uint8](cast[uint64](0x53 + i * 5) & cast[uint64](0xFF))
+
+
+# Store a 32-bit big-endian value at byte offset `off` of buffer `b`.
+def arm64_p40_put_be32(b: uint64, off: int64, val: uint64) -> int64:
+    p: Ptr[uint8] = cast[Ptr[uint8]](b + cast[uint64](off))
+    p[0] = cast[uint8]((val >> cast[uint64](24)) & cast[uint64](0xFF))
+    p[1] = cast[uint8]((val >> cast[uint64](16)) & cast[uint64](0xFF))
+    p[2] = cast[uint8]((val >> cast[uint64](8)) & cast[uint64](0xFF))
+    p[3] = cast[uint8](val & cast[uint64](0xFF))
+    return 0
+
+
+# Read a 32-bit big-endian value from byte offset `off` of buffer `b`.
+def arm64_p40_get_be32(b: uint64, off: int64) -> uint64:
+    p: Ptr[uint8] = cast[Ptr[uint8]](b + cast[uint64](off))
+    b0: uint64 = cast[uint64](p[0])
+    b1: uint64 = cast[uint64](p[1])
+    b2: uint64 = cast[uint64](p[2])
+    b3: uint64 = cast[uint64](p[3])
+    return (b0 << cast[uint64](24)) | (b1 << cast[uint64](16)) | (b2 << cast[uint64](8)) | b3
+
+
+# 32-bit sequence-space add (mod 2^32), matching real TCP wraparound.
+def arm64_p40_seq_add(a: uint64, b: uint64) -> uint64:
+    return (a + b) & cast[uint64](0xFFFFFFFF)
+
+
+# Deliver the per-slot reassembled byte i (slot-indexed receive buffer).
+def arm64_p40_rx_byte(slot: int64, i: int64) -> uint8:
+    if slot == P40_SLOT_SRV:
+        return arm64_p40_rx0[i]
+    return arm64_p40_rx1[i]
+
+
+# Append `n` bytes from `src` to slot's in-order receive buffer.
+def arm64_p40_rx_append(slot: int64, src: uint64, n: int64) -> int64:
+    cur: int64 = arm64_p40_rxlen[slot]
+    i: int64 = 0
+    while i < n:
+        if cur + i >= P40_RXCAP:
+            return 0
+        sp: Ptr[uint8] = cast[Ptr[uint8]](src + cast[uint64](i))
+        bv: uint8 = sp[0]
+        if slot == P40_SLOT_SRV:
+            arm64_p40_rx0[cur + i] = bv
+        else:
+            arm64_p40_rx1[cur + i] = bv
+        i = i + 1
+    arm64_p40_rxlen[slot] = cur + n
+    return n
+
+
+# 16-bit ones-complement Internet checksum over `n` bytes at `b`.
+def arm64_p40_checksum(b: uint64, n: int64) -> uint64:
+    sum: uint64 = 0
+    i: int64 = 0
+    while i + 1 < n:
+        sum = sum + arm64_p33_get_be16(b, i)
+        i = i + 2
+    if i < n:
+        p: Ptr[uint8] = cast[Ptr[uint8]](b + cast[uint64](i))
+        sum = sum + (cast[uint64](p[0]) << cast[uint64](8))
+    while (sum >> cast[uint64](16)) != cast[uint64](0):
+        sum = (sum & cast[uint64](0xFFFF)) + (sum >> cast[uint64](16))
+    return (~sum) & cast[uint64](0xFFFF)
+
+
+# Compute the TCP checksum over the IPv4 pseudo-header + TCP header + payload.
+# `tcp` points at the TCP header; `tcplen` is header+payload length. The
+# pseudo-header (src ip, dst ip, 0, proto=6, tcp length) is laid into the
+# P40_PHDR_PA scratch followed by the TCP segment bytes, then summed.
+def arm64_p40_tcp_checksum(tcp: uint64, tcplen: int64) -> uint64:
+    p: uint64 = P40_PHDR_PA
+    pp: Ptr[uint8] = cast[Ptr[uint8]](p)
+    # Both endpoints are 127.0.0.1.
+    pp[0] = P40_LOOP_IP0
+    pp[1] = P40_LOOP_IP1
+    pp[2] = P40_LOOP_IP2
+    pp[3] = P40_LOOP_IP3
+    pp[4] = P40_LOOP_IP0
+    pp[5] = P40_LOOP_IP1
+    pp[6] = P40_LOOP_IP2
+    pp[7] = P40_LOOP_IP3
+    pp[8] = cast[uint8](0)
+    pp[9] = cast[uint8](P40_IP_PROTO_TCP)
+    arm64_p33_put_be16(p, 10, cast[uint64](tcplen))
+    # Copy the TCP segment after the 12-byte pseudo-header.
+    i: int64 = 0
+    while i < tcplen:
+        sp: Ptr[uint8] = cast[Ptr[uint8]](tcp + cast[uint64](i))
+        dp: Ptr[uint8] = cast[Ptr[uint8]](p + cast[uint64](12 + i))
+        dp[0] = sp[0]
+        i = i + 1
+    return arm64_p40_checksum(p, 12 + tcplen)
+
+
+# Build a full Ethernet+IPv4+TCP frame for `slot` into P40_FRAME_PA and deliver
+# it synchronously to the loopback input path. `flags` is the TCP flag byte,
+# `seq`/`ack` the sequence/ack numbers to stamp, `payload`/`plen` the optional
+# data. Returns the total Ethernet frame length built.
+def arm64_p40_send(slot: int64, flags: uint64, seq: uint64, ack: uint64, payload: uint64, plen: int64) -> int64:
+    f: uint64 = P40_FRAME_PA
+    total: int64 = P40_ETH_HDR + P40_IP_HDR + P40_TCP_HDR + plen
+    arm64_p30_bzero(f, total + 8)
+
+    eth: Ptr[uint8] = cast[Ptr[uint8]](f)
+    # Loopback: dst MAC == src MAC == a fixed local MAC. Irrelevant to TCP but
+    # keeps the frame well-formed end to end.
+    eth[0] = cast[uint8](0x02)
+    eth[1] = cast[uint8](0x00)
+    eth[2] = cast[uint8](0x00)
+    eth[3] = cast[uint8](0x00)
+    eth[4] = cast[uint8](0x00)
+    eth[5] = cast[uint8](0x01)
+    eth[6] = cast[uint8](0x02)
+    eth[7] = cast[uint8](0x00)
+    eth[8] = cast[uint8](0x00)
+    eth[9] = cast[uint8](0x00)
+    eth[10] = cast[uint8](0x00)
+    eth[11] = cast[uint8](0x01)
+    arm64_p33_put_be16(f, 12, P40_ETHERTYPE_IPV4)
+
+    # --- IPv4 header (offset 14) ---
+    ip: uint64 = f + cast[uint64](P40_ETH_HDR)
+    ipp: Ptr[uint8] = cast[Ptr[uint8]](ip)
+    ipp[0] = cast[uint8](0x45)                           # version 4, IHL 5
+    ipp[1] = cast[uint8](0)
+    iptotal: uint64 = cast[uint64](P40_IP_HDR + P40_TCP_HDR + plen)
+    arm64_p33_put_be16(ip, 2, iptotal)
+    arm64_p33_put_be16(ip, 4, cast[uint64](0x4000))      # identification
+    arm64_p33_put_be16(ip, 6, cast[uint64](0))
+    ipp[8] = cast[uint8](64)                             # TTL
+    ipp[9] = cast[uint8](P40_IP_PROTO_TCP)               # protocol = TCP
+    arm64_p33_put_be16(ip, 10, cast[uint64](0))          # checksum placeholder
+    ipp[12] = P40_LOOP_IP0
+    ipp[13] = P40_LOOP_IP1
+    ipp[14] = P40_LOOP_IP2
+    ipp[15] = P40_LOOP_IP3
+    ipp[16] = P40_LOOP_IP0
+    ipp[17] = P40_LOOP_IP1
+    ipp[18] = P40_LOOP_IP2
+    ipp[19] = P40_LOOP_IP3
+    ipcsum: uint64 = arm64_p40_checksum(ip, P40_IP_HDR)
+    arm64_p33_put_be16(ip, 10, ipcsum)
+
+    # --- TCP header (offset 14 + 20) ---
+    tcp: uint64 = ip + cast[uint64](P40_IP_HDR)
+    arm64_p33_put_be16(tcp, 0, arm64_p40_lport[slot])    # source port
+    arm64_p33_put_be16(tcp, 2, arm64_p40_rport[slot])    # dest port
+    arm64_p40_put_be32(tcp, 4, seq)                      # sequence number
+    arm64_p40_put_be32(tcp, 8, ack)                      # acknowledgement
+    tcpp: Ptr[uint8] = cast[Ptr[uint8]](tcp)
+    tcpp[12] = cast[uint8]((P40_TCP_HDR / 4) << 4)       # data offset (5 words)
+    tcpp[13] = cast[uint8](flags & cast[uint64](0xFF))   # flags
+    arm64_p33_put_be16(tcp, 14, cast[uint64](0x8000))    # window
+    arm64_p33_put_be16(tcp, 16, cast[uint64](0))         # checksum placeholder
+    arm64_p33_put_be16(tcp, 18, cast[uint64](0))         # urgent pointer
+    # Payload.
+    j: int64 = 0
+    while j < plen:
+        dp: Ptr[uint8] = cast[Ptr[uint8]](tcp + cast[uint64](P40_TCP_HDR + j))
+        sp: Ptr[uint8] = cast[Ptr[uint8]](payload + cast[uint64](j))
+        dp[0] = sp[0]
+        j = j + 1
+    tcpcsum: uint64 = arm64_p40_tcp_checksum(tcp, P40_TCP_HDR + plen)
+    arm64_p33_put_be16(tcp, 16, tcpcsum)
+
+    _dsb_ish()
+    # Hand the built frame straight to the in-guest loopback receive path.
+    arm64_p40_input(f, total)
+    return total
+
+
+# The peer slot for a given slot (loopback: server<->client).
+def arm64_p40_peer(slot: int64) -> int64:
+    if slot == P40_SLOT_SRV:
+        return P40_SLOT_CLI
+    return P40_SLOT_SRV
+
+
+# Loopback receive path: a frame built by arm64_p40_send is delivered here.
+# Parse Ethernet+IPv4+TCP, VALIDATE the IPv4 + TCP checksums, identify the
+# destination TCB by (dst ip, dst port), and run the TCP state machine. This
+# is the real input half of the stack: every state transition (SYN -> SYN-ACK,
+# SYN-ACK -> ACK + ESTABLISHED, data -> ACK, FIN -> ACK + state move) and every
+# ack-number advance happens here against genuinely received bytes.
+def arm64_p40_input(frame: uint64, flen: int64) -> int64:
+    arm64_p40_loop_depth = arm64_p40_loop_depth + 1
+    if arm64_p40_loop_depth > arm64_p40_loop_max:
+        arm64_p40_loop_max = arm64_p40_loop_depth
+
+    etype: uint64 = arm64_p33_get_be16(frame, 12)
+    if etype != P40_ETHERTYPE_IPV4:
+        arm64_p40_loop_depth = arm64_p40_loop_depth - 1
+        return 0
+    ip: uint64 = frame + cast[uint64](P40_ETH_HDR)
+    ipp: Ptr[uint8] = cast[Ptr[uint8]](ip)
+    ver: uint64 = (cast[uint64](ipp[0]) >> cast[uint64](4)) & cast[uint64](0xF)
+    if ver != cast[uint64](4):
+        arm64_p40_loop_depth = arm64_p40_loop_depth - 1
+        return 0
+    if cast[uint64](ipp[9]) != P40_IP_PROTO_TCP:
+        arm64_p40_loop_depth = arm64_p40_loop_depth - 1
+        return 0
+    # Validate the IPv4 header checksum.
+    if arm64_p40_checksum(ip, P40_IP_HDR) != cast[uint64](0):
+        arm64_p40_csum_bad = 1
+        arm64_p40_loop_depth = arm64_p40_loop_depth - 1
+        return 0
+    iptotal: int64 = cast[int64](arm64_p33_get_be16(ip, 2))
+    tcp: uint64 = ip + cast[uint64](P40_IP_HDR)
+    tcplen: int64 = iptotal - P40_IP_HDR
+    # Validate the TCP checksum over the pseudo-header + segment.
+    if arm64_p40_tcp_checksum(tcp, tcplen) != cast[uint64](0):
+        arm64_p40_csum_bad = 1
+        arm64_p40_loop_depth = arm64_p40_loop_depth - 1
+        return 0
+    arm64_p40_segs_in = arm64_p40_segs_in + 1
+
+    dport: uint64 = arm64_p33_get_be16(tcp, 2)
+    sport: uint64 = arm64_p33_get_be16(tcp, 0)
+    seq: uint64 = arm64_p40_get_be32(tcp, 4)
+    ack: uint64 = arm64_p40_get_be32(tcp, 8)
+    tcpp: Ptr[uint8] = cast[Ptr[uint8]](tcp)
+    doff: int64 = cast[int64]((cast[uint64](tcpp[12]) >> cast[uint64](4)) & cast[uint64](0xF)) * 4
+    flags: uint64 = cast[uint64](tcpp[13])
+    payload: uint64 = tcp + cast[uint64](doff)
+    plen: int64 = tcplen - doff
+
+    # Identify the destination TCB by local port.
+    slot: int64 = -1
+    if dport == arm64_p40_lport[P40_SLOT_SRV]:
+        slot = P40_SLOT_SRV
+    else:
+        if dport == arm64_p40_lport[P40_SLOT_CLI]:
+            slot = P40_SLOT_CLI
+    if slot < 0:
+        arm64_p40_loop_depth = arm64_p40_loop_depth - 1
+        return 0
+
+    arm64_p40_handle(slot, flags, seq, ack, payload, plen)
+    arm64_p40_loop_depth = arm64_p40_loop_depth - 1
+    return 0
+
+
+# The TCP state machine for one received segment on `slot`.
+def arm64_p40_handle(slot: int64, flags: uint64, seq: uint64, ack: uint64, payload: uint64, plen: int64) -> int64:
+    st: int64 = arm64_p40_state[slot]
+    is_syn: int64 = 0
+    if (flags & P40_SYN) != cast[uint64](0):
+        is_syn = 1
+    is_ack: int64 = 0
+    if (flags & P40_ACK) != cast[uint64](0):
+        is_ack = 1
+    is_fin: int64 = 0
+    if (flags & P40_FIN) != cast[uint64](0):
+        is_fin = 1
+
+    # --- LISTEN: a SYN opens a passive connection -> SYN_RCVD + SYN-ACK ----
+    if st == P40_LISTEN:
+        if is_syn == 1:
+            arm64_p40_irs[slot] = seq
+            arm64_p40_rcv_nxt[slot] = arm64_p40_seq_add(seq, cast[uint64](1))   # SYN consumes 1 seq
+            arm64_p40_iss[slot] = P40_SRV_ISN
+            arm64_p40_snd_una[slot] = P40_SRV_ISN
+            arm64_p40_snd_nxt[slot] = P40_SRV_ISN
+            arm64_p40_state[slot] = P40_SYN_RCVD
+            bm: Ptr[char] = "[arm64] Phase 40: server LISTEN -> recv SYN -> SYN_RCVD, sending SYN-ACK\n"
+            _uart_puts(bm)
+            # Send SYN-ACK: seq = our ISS, ack = rcv_nxt; SYN consumes a seq.
+            arm64_p40_snd_nxt[slot] = arm64_p40_seq_add(arm64_p40_iss[slot], cast[uint64](1))
+            arm64_p40_send(slot, P40_SYN | P40_ACK, arm64_p40_iss[slot], arm64_p40_rcv_nxt[slot], cast[uint64](0), 0)
+        return 0
+
+    # --- SYN_SENT: expect SYN-ACK -> send ACK -> ESTABLISHED --------------
+    if st == P40_SYN_SENT:
+        if is_syn == 1:
+            if is_ack == 1:
+                # SYN-ACK must acknowledge our SYN (ack == iss+1).
+                if ack != arm64_p40_seq_add(arm64_p40_iss[slot], cast[uint64](1)):
+                    return 0
+                arm64_p40_irs[slot] = seq
+                arm64_p40_rcv_nxt[slot] = arm64_p40_seq_add(seq, cast[uint64](1))
+                arm64_p40_snd_una[slot] = ack
+                arm64_p40_snd_nxt[slot] = ack
+                arm64_p40_state[slot] = P40_ESTABLISHED
+                arm64_p40_estab[slot] = 1
+                em: Ptr[char] = "[arm64] Phase 40: client SYN_SENT -> recv SYN-ACK -> ESTABLISHED, sending ACK\n"
+                _uart_puts(em)
+                arm64_p40_send(slot, P40_ACK, arm64_p40_snd_nxt[slot], arm64_p40_rcv_nxt[slot], cast[uint64](0), 0)
+        return 0
+
+    # --- SYN_RCVD: the final ACK of the handshake -> ESTABLISHED ----------
+    if st == P40_SYN_RCVD:
+        if is_ack == 1:
+            if ack == arm64_p40_seq_add(arm64_p40_iss[slot], cast[uint64](1)):
+                arm64_p40_snd_una[slot] = ack
+                arm64_p40_state[slot] = P40_ESTABLISHED
+                arm64_p40_estab[slot] = 1
+                em: Ptr[char] = "[arm64] Phase 40: server SYN_RCVD -> recv ACK -> ESTABLISHED\n"
+                _uart_puts(em)
+                # If this ACK also carried data (piggybacked), fall through to
+                # the ESTABLISHED data handling below.
+                if plen > 0:
+                    arm64_p40_rx_data(slot, seq, payload, plen)
+        return 0
+
+    # --- ESTABLISHED: deliver in-order data + ACK it; handle peer FIN -----
+    if st == P40_ESTABLISHED:
+        if plen > 0:
+            arm64_p40_rx_data(slot, seq, payload, plen)
+        # A new outbound ACK number reflects bytes consumed; if the segment
+        # acked our data, advance snd_una.
+        if is_ack == 1:
+            arm64_p40_snd_una[slot] = ack
+        if is_fin == 1:
+            # Peer is closing: FIN consumes one sequence number.
+            arm64_p40_rcv_nxt[slot] = arm64_p40_seq_add(seq, cast[uint64](plen) + cast[uint64](1))
+            arm64_p40_state[slot] = P40_CLOSE_WAIT
+            fm: Ptr[char] = "[arm64] Phase 40: ESTABLISHED -> recv FIN -> CLOSE_WAIT, ACKing FIN\n"
+            _uart_puts(fm)
+            arm64_p40_send(slot, P40_ACK, arm64_p40_snd_nxt[slot], arm64_p40_rcv_nxt[slot], cast[uint64](0), 0)
+        return 0
+
+    # --- FIN_WAIT_1: the ACK of our FIN -> FIN_WAIT_2 (or simultaneous) ----
+    if st == P40_FIN_WAIT_1:
+        if is_ack == 1:
+            if ack == arm64_p40_snd_nxt[slot]:
+                arm64_p40_snd_una[slot] = ack
+                arm64_p40_state[slot] = P40_FIN_WAIT_2
+                wm: Ptr[char] = "[arm64] Phase 40: FIN_WAIT_1 -> recv ACK of our FIN -> FIN_WAIT_2\n"
+                _uart_puts(wm)
+        # A peer FIN here (it closes too) -> ACK it and move toward CLOSED.
+        if is_fin == 1:
+            arm64_p40_rcv_nxt[slot] = arm64_p40_seq_add(seq, cast[uint64](plen) + cast[uint64](1))
+            arm64_p40_send(slot, P40_ACK, arm64_p40_snd_nxt[slot], arm64_p40_rcv_nxt[slot], cast[uint64](0), 0)
+            arm64_p40_state[slot] = P40_TIME_WAIT
+        return 0
+
+    # --- FIN_WAIT_2: peer FIN -> ACK -> CLOSED (skip TIME_WAIT for the test) -
+    if st == P40_FIN_WAIT_2:
+        if is_fin == 1:
+            arm64_p40_rcv_nxt[slot] = arm64_p40_seq_add(seq, cast[uint64](plen) + cast[uint64](1))
+            cm: Ptr[char] = "[arm64] Phase 40: FIN_WAIT_2 -> recv peer FIN -> ACKing -> CLOSED\n"
+            _uart_puts(cm)
+            arm64_p40_send(slot, P40_ACK, arm64_p40_snd_nxt[slot], arm64_p40_rcv_nxt[slot], cast[uint64](0), 0)
+            arm64_p40_state[slot] = P40_CLOSED
+            arm64_p40_closed[slot] = 1
+        return 0
+
+    # --- LAST_ACK: the final ACK of our FIN -> CLOSED ---------------------
+    if st == P40_LAST_ACK:
+        if is_ack == 1:
+            if ack == arm64_p40_snd_nxt[slot]:
+                arm64_p40_snd_una[slot] = ack
+                arm64_p40_state[slot] = P40_CLOSED
+                arm64_p40_closed[slot] = 1
+                lm: Ptr[char] = "[arm64] Phase 40: LAST_ACK -> recv final ACK -> CLOSED\n"
+                _uart_puts(lm)
+        return 0
+
+    return 0
+
+
+# Deliver in-order received data on `slot`: only accept the segment if its seq
+# matches the expected rcv_nxt (real in-order semantics), append the bytes to
+# the slot's reassembly buffer, advance rcv_nxt by the byte count, and send a
+# pure ACK acknowledging the new rcv_nxt.
+def arm64_p40_rx_data(slot: int64, seq: uint64, payload: uint64, plen: int64) -> int64:
+    if seq != arm64_p40_rcv_nxt[slot]:
+        # Out-of-order / duplicate: re-ACK the current rcv_nxt, drop the data.
+        arm64_p40_send(slot, P40_ACK, arm64_p40_snd_nxt[slot], arm64_p40_rcv_nxt[slot], cast[uint64](0), 0)
+        return 0
+    arm64_p40_rx_append(slot, payload, plen)
+    arm64_p40_rcv_nxt[slot] = arm64_p40_seq_add(seq, cast[uint64](plen))
+    dm: Ptr[char] = "[arm64] Phase 40: delivered "
+    _uart_puts(dm)
+    _uart_puthex(cast[uint64](plen))
+    dm2: Ptr[char] = " in-order bytes to slot "
+    _uart_puts(dm2)
+    _uart_puthex(cast[uint64](slot))
+    dm3: Ptr[char] = ", ACKing rcv_nxt="
+    _uart_puts(dm3)
+    _uart_puthex(arm64_p40_rcv_nxt[slot])
+    nl: Ptr[char] = "\n"
+    _uart_puts(nl)
+    arm64_p40_send(slot, P40_ACK, arm64_p40_snd_nxt[slot], arm64_p40_rcv_nxt[slot], cast[uint64](0), 0)
+    return 0
+
+
+# Initialize both TCBs to a fresh, CLOSED-derived starting state.
+def arm64_p40_init() -> int64:
+    arm64_p40_state[P40_SLOT_SRV] = P40_CLOSED
+    arm64_p40_state[P40_SLOT_CLI] = P40_CLOSED
+    arm64_p40_estab[P40_SLOT_SRV] = 0
+    arm64_p40_estab[P40_SLOT_CLI] = 0
+    arm64_p40_closed[P40_SLOT_SRV] = 0
+    arm64_p40_closed[P40_SLOT_CLI] = 0
+    arm64_p40_rxlen[P40_SLOT_SRV] = 0
+    arm64_p40_rxlen[P40_SLOT_CLI] = 0
+    # Server: local port = SRV_PORT (peer is the client port).
+    arm64_p40_lport[P40_SLOT_SRV] = P40_SRV_PORT
+    arm64_p40_rport[P40_SLOT_SRV] = P40_CLI_PORT
+    # Client: local port = CLI_PORT (peer is the server port).
+    arm64_p40_lport[P40_SLOT_CLI] = P40_CLI_PORT
+    arm64_p40_rport[P40_SLOT_CLI] = P40_SRV_PORT
+    arm64_p40_iss[P40_SLOT_SRV] = 0
+    arm64_p40_iss[P40_SLOT_CLI] = 0
+    arm64_p40_snd_nxt[P40_SLOT_SRV] = 0
+    arm64_p40_snd_nxt[P40_SLOT_CLI] = 0
+    arm64_p40_snd_una[P40_SLOT_SRV] = 0
+    arm64_p40_snd_una[P40_SLOT_CLI] = 0
+    arm64_p40_rcv_nxt[P40_SLOT_SRV] = 0
+    arm64_p40_rcv_nxt[P40_SLOT_CLI] = 0
+    arm64_p40_csum_bad = 0
+    arm64_p40_segs_in = 0
+    arm64_p40_loop_depth = 0
+    arm64_p40_loop_max = 0
+    arm64_p40_srv_data_ok = 0
+    arm64_p40_cli_data_ok = 0
+    arm64_p40_handshake_seen = 0
+    return 0
+
+
+# Compare slot's reassembled receive buffer against the expected payload bytes
+# of `which` (0 = client message, 1 = server message). Returns 1 on a
+# byte-identical match of exactly `n` bytes, else 0.
+def arm64_p40_verify_rx(slot: int64, which: int64, n: int64) -> int64:
+    if arm64_p40_rxlen[slot] != n:
+        return 0
+    i: int64 = 0
+    while i < n:
+        got: uint8 = arm64_p40_rx_byte(slot, i)
+        exp: uint8 = cast[uint8](0)
+        if which == 0:
+            exp = arm64_p40_cli_msg_byte(i)
+        else:
+            exp = arm64_p40_srv_msg_byte(i)
+        if got != exp:
+            return 0
+        i = i + 1
+    return 1
+
+
+# Phase-40 entry point (hand-off from arm64_p39_finish on a Phase-39 PASS).
+# Runs the full TCP loopback scenario synchronously and halts at the verdict.
+def arm64_p40_run() -> int64:
+    intro: Ptr[char] = "[arm64] Phase 40: in-guest TCP loopback (127.0.0.1) three-way handshake + bidirectional data + FIN teardown\n"
+    _uart_puts(intro)
+    nl: Ptr[char] = "\n"
+
+    arm64_p40_init()
+
+    # --- passive open: the server LISTENs on port 7777 --------------------
+    arm64_p40_state[P40_SLOT_SRV] = P40_LISTEN
+    lm: Ptr[char] = "[arm64] Phase 40: server tcp_listen on 127.0.0.1:7777 -> LISTEN\n"
+    _uart_puts(lm)
+
+    # --- active open: the client tcp_connect()s -> SYN_SENT + send SYN -----
+    arm64_p40_iss[P40_SLOT_CLI] = P40_CLI_ISN
+    arm64_p40_snd_una[P40_SLOT_CLI] = P40_CLI_ISN
+    # SYN consumes one sequence number, so snd_nxt advances past it.
+    arm64_p40_snd_nxt[P40_SLOT_CLI] = arm64_p40_seq_add(P40_CLI_ISN, cast[uint64](1))
+    arm64_p40_state[P40_SLOT_CLI] = P40_SYN_SENT
+    cm: Ptr[char] = "[arm64] Phase 40: client tcp_connect 127.0.0.1:7777 -> SYN_SENT, sending SYN\n"
+    _uart_puts(cm)
+    # Sending the SYN drives the whole handshake synchronously through the
+    # loopback: SYN -> (server) SYN-ACK -> (client) ACK -> both ESTABLISHED.
+    arm64_p40_send(P40_SLOT_CLI, P40_SYN, P40_CLI_ISN, cast[uint64](0), cast[uint64](0), 0)
+
+    # Handshake verification.
+    if arm64_p40_estab[P40_SLOT_CLI] == 1:
+        if arm64_p40_estab[P40_SLOT_SRV] == 1:
+            arm64_p40_handshake_seen = 1
+    hm: Ptr[char] = "[arm64] Phase 40: handshake complete; client_estab="
+    _uart_puts(hm)
+    _uart_puthex(cast[uint64](arm64_p40_estab[P40_SLOT_CLI]))
+    hm2: Ptr[char] = " server_estab="
+    _uart_puts(hm2)
+    _uart_puthex(cast[uint64](arm64_p40_estab[P40_SLOT_SRV]))
+    _uart_puts(nl)
+
+    # --- data exchange: client -> server, then server -> client -----------
+    # Lay the client's outbound payload into a scratch buffer at FRAME+0x800
+    # region? No: build payloads in dedicated clear scratch. Reuse PHDR area's
+    # neighbour at a fresh PA to avoid clobbering the frame builder mid-send.
+    climsg: uint64 = 0x46102000
+    i: int64 = 0
+    while i < P40_CLI_MSG_LEN:
+        cp: Ptr[uint8] = cast[Ptr[uint8]](climsg + cast[uint64](i))
+        cp[0] = arm64_p40_cli_msg_byte(i)
+        i = i + 1
+    srvmsg: uint64 = 0x46103000
+    k: int64 = 0
+    while k < P40_SRV_MSG_LEN:
+        sp: Ptr[uint8] = cast[Ptr[uint8]](srvmsg + cast[uint64](k))
+        sp[0] = arm64_p40_srv_msg_byte(k)
+        k = k + 1
+
+    # Client sends its payload (PSH|ACK). The server delivers + ACKs in-order
+    # synchronously through the loopback.
+    if arm64_p40_handshake_seen == 1:
+        dm: Ptr[char] = "[arm64] Phase 40: client sending "
+        _uart_puts(dm)
+        _uart_puthex(cast[uint64](P40_CLI_MSG_LEN))
+        dm2: Ptr[char] = "-byte payload to server\n"
+        _uart_puts(dm2)
+        seqc: uint64 = arm64_p40_snd_nxt[P40_SLOT_CLI]
+        arm64_p40_send(P40_SLOT_CLI, P40_PSH | P40_ACK, seqc, arm64_p40_rcv_nxt[P40_SLOT_CLI], climsg, P40_CLI_MSG_LEN)
+        arm64_p40_snd_nxt[P40_SLOT_CLI] = arm64_p40_seq_add(seqc, cast[uint64](P40_CLI_MSG_LEN))
+
+        # Server replies with its own payload (PSH|ACK).
+        sm: Ptr[char] = "[arm64] Phase 40: server sending "
+        _uart_puts(sm)
+        _uart_puthex(cast[uint64](P40_SRV_MSG_LEN))
+        sm2: Ptr[char] = "-byte payload to client\n"
+        _uart_puts(sm2)
+        seqs: uint64 = arm64_p40_snd_nxt[P40_SLOT_SRV]
+        arm64_p40_send(P40_SLOT_SRV, P40_PSH | P40_ACK, seqs, arm64_p40_rcv_nxt[P40_SLOT_SRV], srvmsg, P40_SRV_MSG_LEN)
+        arm64_p40_snd_nxt[P40_SLOT_SRV] = arm64_p40_seq_add(seqs, cast[uint64](P40_SRV_MSG_LEN))
+
+    # Verify byte-identical delivery in both directions.
+    if arm64_p40_verify_rx(P40_SLOT_SRV, 0, P40_CLI_MSG_LEN) == 1:
+        arm64_p40_srv_data_ok = 1
+    if arm64_p40_verify_rx(P40_SLOT_CLI, 1, P40_SRV_MSG_LEN) == 1:
+        arm64_p40_cli_data_ok = 1
+
+    # --- teardown: the client closes first (active close) -----------------
+    if arm64_p40_handshake_seen == 1:
+        tm: Ptr[char] = "[arm64] Phase 40: client tcp_close -> FIN_WAIT_1, sending FIN\n"
+        _uart_puts(tm)
+        # Client sends FIN (FIN|ACK). The server ACKs (-> CLOSE_WAIT), then the
+        # server closes too (FIN), the client ACKs and CLOSEs. We orchestrate
+        # the server's matching close right after its CLOSE_WAIT transition.
+        finseq: uint64 = arm64_p40_snd_nxt[P40_SLOT_CLI]
+        arm64_p40_state[P40_SLOT_CLI] = P40_FIN_WAIT_1
+        arm64_p40_snd_nxt[P40_SLOT_CLI] = arm64_p40_seq_add(finseq, cast[uint64](1))   # FIN consumes a seq
+        arm64_p40_send(P40_SLOT_CLI, P40_FIN | P40_ACK, finseq, arm64_p40_rcv_nxt[P40_SLOT_CLI], cast[uint64](0), 0)
+
+        # The server is now in CLOSE_WAIT (it ACKed the client's FIN). It closes:
+        # send its FIN (-> LAST_ACK); the client ACKs it (-> CLOSED) and the
+        # client's FIN_WAIT_2 receives the server FIN (-> CLOSED).
+        if arm64_p40_state[P40_SLOT_SRV] == P40_CLOSE_WAIT:
+            sm3: Ptr[char] = "[arm64] Phase 40: server tcp_close -> LAST_ACK, sending FIN\n"
+            _uart_puts(sm3)
+            sfin: uint64 = arm64_p40_snd_nxt[P40_SLOT_SRV]
+            arm64_p40_state[P40_SLOT_SRV] = P40_LAST_ACK
+            arm64_p40_snd_nxt[P40_SLOT_SRV] = arm64_p40_seq_add(sfin, cast[uint64](1))
+            arm64_p40_send(P40_SLOT_SRV, P40_FIN | P40_ACK, sfin, arm64_p40_rcv_nxt[P40_SLOT_SRV], cast[uint64](0), 0)
+
+    # --- verdict ----------------------------------------------------------
+    sm4: Ptr[char] = "[arm64] Phase 40 summary: segs_in="
+    _uart_puts(sm4)
+    _uart_puthex(cast[uint64](arm64_p40_segs_in))
+    s1: Ptr[char] = " loop_max_depth="
+    _uart_puts(s1)
+    _uart_puthex(cast[uint64](arm64_p40_loop_max))
+    s2: Ptr[char] = " csum_bad="
+    _uart_puts(s2)
+    _uart_puthex(cast[uint64](arm64_p40_csum_bad))
+    _uart_puts(nl)
+
+    s3: Ptr[char] = "[arm64] Phase 40 summary: cli_estab="
+    _uart_puts(s3)
+    _uart_puthex(cast[uint64](arm64_p40_estab[P40_SLOT_CLI]))
+    s4: Ptr[char] = " srv_estab="
+    _uart_puts(s4)
+    _uart_puthex(cast[uint64](arm64_p40_estab[P40_SLOT_SRV]))
+    s5: Ptr[char] = " srv_rx_ok="
+    _uart_puts(s5)
+    _uart_puthex(cast[uint64](arm64_p40_srv_data_ok))
+    s6: Ptr[char] = " cli_rx_ok="
+    _uart_puts(s6)
+    _uart_puthex(cast[uint64](arm64_p40_cli_data_ok))
+    _uart_puts(nl)
+
+    s7: Ptr[char] = "[arm64] Phase 40 summary: cli_state="
+    _uart_puts(s7)
+    _uart_puthex(cast[uint64](arm64_p40_state[P40_SLOT_CLI]))
+    s8: Ptr[char] = " srv_state="
+    _uart_puts(s8)
+    _uart_puthex(cast[uint64](arm64_p40_state[P40_SLOT_SRV]))
+    s9: Ptr[char] = " cli_closed="
+    _uart_puts(s9)
+    _uart_puthex(cast[uint64](arm64_p40_closed[P40_SLOT_CLI]))
+    s10: Ptr[char] = " srv_closed="
+    _uart_puts(s10)
+    _uart_puthex(cast[uint64](arm64_p40_closed[P40_SLOT_SRV]))
+    _uart_puts(nl)
+
+    # Independent ack-number cross-check: each side's rcv_nxt must have advanced
+    # past the peer's ISN by exactly (1 SYN + payload bytes + 1 FIN).
+    cli_expect_rcv: uint64 = arm64_p40_seq_add(P40_SRV_ISN, cast[uint64](1 + P40_SRV_MSG_LEN + 1))
+    srv_expect_rcv: uint64 = arm64_p40_seq_add(P40_CLI_ISN, cast[uint64](1 + P40_CLI_MSG_LEN + 1))
+    ack_ok: int64 = 1
+    if arm64_p40_rcv_nxt[P40_SLOT_CLI] != cli_expect_rcv:
+        ack_ok = 0
+    if arm64_p40_rcv_nxt[P40_SLOT_SRV] != srv_expect_rcv:
+        ack_ok = 0
+    a1: Ptr[char] = "[arm64] Phase 40 summary: cli_rcv_nxt="
+    _uart_puts(a1)
+    _uart_puthex(arm64_p40_rcv_nxt[P40_SLOT_CLI])
+    a2: Ptr[char] = " (expect "
+    _uart_puts(a2)
+    _uart_puthex(cli_expect_rcv)
+    a3: Ptr[char] = ") srv_rcv_nxt="
+    _uart_puts(a3)
+    _uart_puthex(arm64_p40_rcv_nxt[P40_SLOT_SRV])
+    a4: Ptr[char] = " (expect "
+    _uart_puts(a4)
+    _uart_puthex(srv_expect_rcv)
+    a5: Ptr[char] = ") ack_ok="
+    _uart_puts(a5)
+    _uart_puthex(cast[uint64](ack_ok))
+    _uart_puts(nl)
+
+    ok: int64 = 1
+    # Both endpoints completed the three-way handshake.
+    if arm64_p40_handshake_seen == 0:
+        ok = 0
+    if arm64_p40_estab[P40_SLOT_CLI] == 0:
+        ok = 0
+    if arm64_p40_estab[P40_SLOT_SRV] == 0:
+        ok = 0
+    # Both payloads arrived byte-identical.
+    if arm64_p40_srv_data_ok == 0:
+        ok = 0
+    if arm64_p40_cli_data_ok == 0:
+        ok = 0
+    # Every received segment passed its checksum.
+    if arm64_p40_csum_bad != 0:
+        ok = 0
+    # The ack numbers advanced by exactly the bytes consumed (SYN+data+FIN).
+    if ack_ok == 0:
+        ok = 0
+    # Both sides reached CLOSED after the orderly teardown.
+    if arm64_p40_closed[P40_SLOT_CLI] == 0:
+        ok = 0
+    if arm64_p40_closed[P40_SLOT_SRV] == 0:
+        ok = 0
+    if arm64_p40_state[P40_SLOT_CLI] != P40_CLOSED:
+        ok = 0
+    if arm64_p40_state[P40_SLOT_SRV] != P40_CLOSED:
+        ok = 0
+
+    if ok != 0:
+        rp: Ptr[char] = "[arm64] Phase 40: two in-kernel TCP control blocks (a passive-open server + an active-open client, both 127.0.0.1) completed a real three-way handshake (SYN -> SYN-ACK -> ACK) over an in-guest loopback datapath, each segment carrying a real 20-byte TCP header with real seq/ack numbers and a real TCP checksum over the IPv4 pseudo-header; both sides reached ESTABLISHED, exchanged distinct payloads in BOTH directions that arrived byte-identical with ack numbers advancing exactly by the bytes consumed, then tore the connection down with a real FIN/ACK exchange to CLOSED on both sides\n"
+        _uart_puts(rp)
+        pp: Ptr[char] = "[arm64] Phase 40 PASS: TCP loopback three-way handshake + bidirectional data + FIN teardown (both sides ESTABLISHED->CLOSED, payloads byte-identical, real seq/ack + pseudo-header checksum)\n"
+        _uart_puts(pp)
+    else:
+        fp: Ptr[char] = "[arm64] Phase 40 FAIL: TCP loopback verdict failed\n"
+        _uart_puts(fp)
+
+    _msr_daifset(2)
     while True:
         _wfi()
     return 0
