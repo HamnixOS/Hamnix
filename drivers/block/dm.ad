@@ -752,6 +752,7 @@ DM_TARGET_THIN:          uint32 = 6   # thin-provisioned (on-demand alloc)
 DM_TARGET_VERITY:        uint32 = 7   # read-only Merkle-tree (sha256) verify
 DM_TARGET_CACHE:         uint32 = 8   # fast cache device fronting slow origin
 DM_TARGET_ERA:           uint32 = 9   # per-chunk write-era (generation) tracking
+DM_TARGET_WRITECACHE:    uint32 = 10  # write-back cache (writes -> fast device)
 
 DM_KEY_LEN:      uint64 = 64       # AES-256-XTS: 32B data + 32B tweak key
 DM_MAX_TARGETS:  uint64 = 8        # targets per mapped device
@@ -1127,6 +1128,76 @@ class DmEraContext:
 
 dm_era_ctxs: Array[2, DmEraContext]
 
+
+# =========================================================================
+# dm-writecache — write-back cache fronting a slow origin (Linux drivers/md/
+# dm-writecache.c)
+# =========================================================================
+#
+# dm-writecache layers a FAST cache device (in Linux: an SSD or persistent-
+# memory device) in front of a SLOW origin device, caching ONLY WRITES. It
+# differs from dm-cache (which caches reads AND writes with a replacement
+# policy): writecache's job is purely to make WRITES durable FAST and let
+# them drain back to the origin lazily.
+#
+# DATA PATH:
+#   * WRITE — allocate (or reuse) a cache SLOT for the written origin block,
+#     write the data into that slot ON THE CACHE DEVICE, mark the slot DIRTY,
+#     persist the slot metadata, and ACK. The ORIGIN is NOT touched: the
+#     acknowledged write lives only on the (fast, durable) cache device.
+#   * READ — if the requested origin block has a DIRTY (not-yet-flushed) cache
+#     slot, serve the bytes straight from the cache device (the newest data);
+#     otherwise the block was never written through the cache (or has been
+#     flushed and the slot freed), so fall through and read the origin.
+#   * FLUSH / WRITEBACK — walk every dirty slot, write its data BACK to the
+#     origin, clear the dirty flag, and persist the cleared metadata. After a
+#     flush the origin holds every acknowledged write and the cache is clean.
+#
+# DURABILITY / PERSISTENCE (the whole point): an acknowledged write is on the
+# cache device BEFORE writeback, and the slot metadata (which origin block
+# each slot holds + its dirty flag) is persisted to the cache device's
+# SUPERBLOCK/METADATA region. So if the machine crashes after the ACK but
+# before writeback, a fresh dm-writecache over the SAME cache device RESUMES
+# from the persisted metadata and the un-flushed dirty data is recovered — it
+# can still be served on reads and later flushed to the origin. This models
+# Linux dm-writecache's recovery from its on-disk (PMEM/SSD) metadata.
+#
+# CACHE-DEVICE LAYOUT:
+#   sector 0                  : superblock (magic, nblocks, nslots,
+#                               block_sectors)
+#   sectors 1 .. meta_sectors : packed slot metadata, DM_WC_PER_SECTOR slots
+#                               per 512-byte sector (each entry: origin block
+#                               uint64 + valid uint8 + dirty uint8, 16 bytes)
+#   data_start ..             : the slot DATA region; slot s occupies
+#                               [data_start + s*block_sectors, +block_sectors)
+
+DM_WC_MAX:          uint64 = 2        # writecache contexts system-wide
+DM_WC_MAX_SLOTS:    uint64 = 64       # cache data slots per context
+DM_WC_MAX_BLKSECS:  uint64 = 8        # max sectors per cache block (<= 4096B)
+DM_WC_PER_SECTOR:   uint64 = 32       # 16-byte slot entries per 512B sector
+DM_WC_ENTRY_BYTES:  uint64 = 16       # bytes per packed slot metadata entry
+DM_WC_MAGIC:        uint32 = 0x77C0DA7A  # superblock magic ("wcDATA")
+
+
+class DmWritecacheContext:
+    used:          uint32
+    pad:           uint32
+    cache_slot:    int32               # underlying FAST cache block device
+    origin_slot:   int32               # underlying SLOW origin block device
+    block_sectors: uint64              # sectors per cache block (alloc unit)
+    nblocks:       uint64              # origin blocks the device covers
+    nslots:        uint64              # cache data slots available
+    data_start:    uint64              # first cache sector of the data region
+    # Per-slot mapping. tag[s] = origin block resident in slot s (valid only
+    # when valid[s]); dirty[s] = 1 when the slot holds an un-flushed write
+    # (data newer than the origin); valid[s] = 1 once the slot is in use.
+    valid:         Array[64, uint8]
+    dirty:         Array[64, uint8]
+    tag:           Array[64, uint64]
+
+
+dm_wc_ctxs: Array[2, DmWritecacheContext]
+
 dm_devices: Array[8, MappedDevice]
 dm_ops:     BlockDeviceOps
 dm_inited:  uint32 = 0
@@ -1156,6 +1227,18 @@ _dm_cache_buf:    Array[4096, uint8]    # 8 * 512
 # serialised through the synchronous block layer, so a single shared
 # module-scope sector buffer is safe (no two metadata transfers overlap).
 _dm_era_meta_buf: Array[512, uint8]     # one metadata sector
+
+# One-cache-block staging buffer for the dm-writecache write/read/writeback
+# data path. Sized to the largest cache block the target supports
+# (DM_WC_MAX_BLKSECS = 8 sectors = 4096 bytes) per the BSS-overflow trap.
+# dm-writecache I/O is serialised through the synchronous block layer, so a
+# single shared buffer is safe (no two writecache transfers overlap).
+_dm_wc_buf:       Array[4096, uint8]    # 8 * 512
+
+# One-sector staging buffer for the dm-writecache superblock / packed slot-
+# metadata persistence path (each is 512 bytes). Separate from _dm_wc_buf so
+# a metadata flush mid-data-transfer never clobbers in-flight block data.
+_dm_wc_meta_buf:  Array[512, uint8]     # one metadata sector
 
 
 def dm_init():
@@ -1203,8 +1286,12 @@ def dm_init():
     while er < DM_ERA_MAX:
         dm_era_ctxs[er].used = 0
         er = er + 1
+    wc: uint64 = 0
+    while wc < DM_WC_MAX:
+        dm_wc_ctxs[wc].used = 0
+        wc = wc + 1
     dm_inited = 1
-    printk0("dm: device-mapper ready (linear + crypt + snapshot + integrity + thin + verity + cache + era targets)\n")
+    printk0("dm: device-mapper ready (linear + crypt + snapshot + integrity + thin + verity + cache + era + writecache targets)\n")
 
 
 def _dm_find_target(dev: Ptr[MappedDevice], vlba: uint64) -> int32:
@@ -2059,6 +2146,285 @@ def dm_era_query_since(era_idx: int32, target_era: uint32,
     return cast[int64](n)
 
 
+# =========================================================================
+# dm-writecache target handlers
+# =========================================================================
+
+def _dm_wc_put_u32(buf: Ptr[uint8], off: uint64, v: uint32):
+    # Store a uint32 little-endian into a byte buffer at byte offset `off`.
+    uv: uint64 = cast[uint64](v)
+    buf[off]     = cast[uint8](uv & 0xFF)
+    buf[off + 1] = cast[uint8]((uv >> 8) & 0xFF)
+    buf[off + 2] = cast[uint8]((uv >> 16) & 0xFF)
+    buf[off + 3] = cast[uint8]((uv >> 24) & 0xFF)
+
+
+def _dm_wc_get_u32(buf: Ptr[uint8], off: uint64) -> uint32:
+    # Load a uint32 little-endian from a byte buffer at byte offset `off`.
+    b0: uint64 = cast[uint64](buf[off])
+    b1: uint64 = cast[uint64](buf[off + 1])
+    b2: uint64 = cast[uint64](buf[off + 2])
+    b3: uint64 = cast[uint64](buf[off + 3])
+    return cast[uint32](b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
+
+
+def _dm_wc_put_u64(buf: Ptr[uint8], off: uint64, v: uint64):
+    # Store a uint64 little-endian into a byte buffer at byte offset `off`.
+    i: uint64 = 0
+    while i < 8:
+        buf[off + i] = cast[uint8]((v >> (i * 8)) & 0xFF)
+        i = i + 1
+
+
+def _dm_wc_get_u64(buf: Ptr[uint8], off: uint64) -> uint64:
+    # Load a uint64 little-endian from a byte buffer at byte offset `off`.
+    v: uint64 = 0
+    i: uint64 = 0
+    while i < 8:
+        v = v | (cast[uint64](buf[off + i]) << (i * 8))
+        i = i + 1
+    return v
+
+
+def _dm_wc_meta_sectors(nslots: uint64) -> uint64:
+    # Number of cache sectors holding the packed slot-metadata array.
+    return (nslots + DM_WC_PER_SECTOR - 1) / DM_WC_PER_SECTOR
+
+
+def _dm_wc_find(ctx: Ptr[DmWritecacheContext], oblk: uint64) -> int32:
+    # Return the cache slot currently holding origin block `oblk` (valid), or
+    # -1 if the block has no cache slot.
+    n: uint64 = ctx[0].nslots
+    i: uint64 = 0
+    while i < n:
+        if ctx[0].valid[i] != 0 and ctx[0].tag[i] == oblk:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _dm_wc_alloc(ctx: Ptr[DmWritecacheContext]) -> int32:
+    # Claim a free (invalid) cache slot for a new origin block, or -1 if the
+    # cache is full (no free slot — a real writecache would block/flush; here
+    # the test never overcommits).
+    n: uint64 = ctx[0].nslots
+    i: uint64 = 0
+    while i < n:
+        if ctx[0].valid[i] == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def dm_wc_persist(wc_idx: int32) -> int32:
+    # Flush the writecache slot metadata out to the cache device so an
+    # acknowledged-but-not-yet-flushed write survives a crash. Sector 0 =
+    # superblock (magic, nblocks, nslots, block_sectors); sectors 1.. = the
+    # packed per-slot entries (origin block + valid + dirty). Returns 0 on
+    # success, negative on error.
+    if wc_idx < 0 or cast[uint64](wc_idx) >= DM_WC_MAX:
+        return -1
+    wi: uint64 = cast[uint64](wc_idx)
+    if dm_wc_ctxs[wi].used == 0:
+        return -1
+    return dm_wc_persist_ctx(&dm_wc_ctxs[wi])
+
+
+def dm_wc_reload(wc_idx: int32) -> int32:
+    # Load persisted writecache slot metadata from the cache device back into
+    # the in-core context. Returns 1 if a valid superblock (matching magic and
+    # geometry) was found and loaded, 0 if no/invalid superblock (fresh cache
+    # device), or negative on I/O error. After a reload the un-flushed dirty
+    # data sitting in the cache slots is recoverable.
+    if wc_idx < 0 or cast[uint64](wc_idx) >= DM_WC_MAX:
+        return -1
+    wi: uint64 = cast[uint64](wc_idx)
+    if dm_wc_ctxs[wi].used == 0:
+        return -1
+    ctx: Ptr[DmWritecacheContext] = &dm_wc_ctxs[wi]
+    buf: Ptr[uint8] = cast[Ptr[uint8]](&_dm_wc_meta_buf[0])
+    if blk_read_sectors(ctx[0].cache_slot, 0, 1, buf) != 0:
+        return -1
+    if _dm_wc_get_u32(buf, 0) != DM_WC_MAGIC:
+        return 0                       # fresh cache device; nothing to resume
+    p_nblocks: uint64 = cast[uint64](_dm_wc_get_u32(buf, 4))
+    p_nslots:  uint64 = cast[uint64](_dm_wc_get_u32(buf, 8))
+    p_bs:      uint64 = cast[uint64](_dm_wc_get_u32(buf, 12))
+    if p_nblocks != ctx[0].nblocks or p_nslots != ctx[0].nslots or \
+       p_bs != ctx[0].block_sectors:
+        return 0                       # geometry mismatch; treat as fresh
+    nsec: uint64 = _dm_wc_meta_sectors(ctx[0].nslots)
+    s: uint64 = 0
+    while s < nsec:
+        if blk_read_sectors(ctx[0].cache_slot, 1 + s, 1, buf) != 0:
+            return -1
+        j: uint64 = 0
+        while j < DM_WC_PER_SECTOR:
+            slot: uint64 = s * DM_WC_PER_SECTOR + j
+            if slot < ctx[0].nslots:
+                eoff: uint64 = j * DM_WC_ENTRY_BYTES
+                ctx[0].tag[slot]   = _dm_wc_get_u64(buf, eoff)
+                ctx[0].valid[slot] = buf[eoff + 8]
+                ctx[0].dirty[slot] = buf[eoff + 9]
+            j = j + 1
+        s = s + 1
+    return 1
+
+
+def _dm_wc_io_block(ctx: Ptr[DmWritecacheContext], is_write: int32,
+                    oblk: uint64, buf: Ptr[uint8]) -> int32:
+    # Service ONE cache-block-aligned I/O for origin block `oblk`.
+    #   WRITE: land the data in a (new or existing) cache slot, mark dirty,
+    #          persist metadata, ACK — without touching the origin.
+    #   READ : if the block has a dirty/valid cache slot, serve from the cache
+    #          device; otherwise read the origin.
+    bs: uint64 = ctx[0].block_sectors
+    ds: uint64 = ctx[0].data_start
+    slot_s: int32 = _dm_wc_find(ctx, oblk)
+    if is_write == 0:
+        # READ path.
+        if slot_s >= 0:
+            slot: uint64 = cast[uint64](slot_s)
+            return blk_read_sectors(ctx[0].cache_slot,
+                                    ds + slot * bs, bs, buf)
+        # Not cached: fall through to the slow origin.
+        return blk_read_sectors(ctx[0].origin_slot, oblk * bs, bs, buf)
+    # WRITE path: reuse the block's existing slot, else allocate a free one.
+    if slot_s < 0:
+        slot_s = _dm_wc_alloc(ctx)
+        if slot_s < 0:
+            printk0("dm: writecache full (no free slot)\n")
+            return -1
+    wslot: uint64 = cast[uint64](slot_s)
+    rc: int32 = blk_write_sectors(ctx[0].cache_slot,
+                                  ds + wslot * bs, bs, buf)
+    if rc != 0:
+        return rc
+    ctx[0].valid[wslot] = 1
+    ctx[0].dirty[wslot] = 1            # newest data lives only on the cache
+    ctx[0].tag[wslot]   = oblk
+    # Persist the slot metadata so the acknowledged write is durable on the
+    # cache device before any writeback to the origin.
+    if dm_wc_persist_ctx(ctx) != 0:
+        printk0("dm: writecache metadata persist failed\n")
+        return -1
+    return 0
+
+
+def dm_wc_persist_ctx(ctx: Ptr[DmWritecacheContext]) -> int32:
+    # Persist by context pointer (used on the hot write path). Mirrors
+    # dm_wc_persist but avoids re-deriving the index. Returns 0 / negative.
+    buf: Ptr[uint8] = cast[Ptr[uint8]](&_dm_wc_meta_buf[0])
+    z: uint64 = 0
+    while z < SECTOR_SIZE:
+        buf[z] = 0
+        z = z + 1
+    _dm_wc_put_u32(buf, 0, DM_WC_MAGIC)
+    _dm_wc_put_u32(buf, 4, cast[uint32](ctx[0].nblocks))
+    _dm_wc_put_u32(buf, 8, cast[uint32](ctx[0].nslots))
+    _dm_wc_put_u32(buf, 12, cast[uint32](ctx[0].block_sectors))
+    if blk_write_sectors(ctx[0].cache_slot, 0, 1, buf) != 0:
+        return -1
+    nsec: uint64 = _dm_wc_meta_sectors(ctx[0].nslots)
+    s: uint64 = 0
+    while s < nsec:
+        zz: uint64 = 0
+        while zz < SECTOR_SIZE:
+            buf[zz] = 0
+            zz = zz + 1
+        j: uint64 = 0
+        while j < DM_WC_PER_SECTOR:
+            slot: uint64 = s * DM_WC_PER_SECTOR + j
+            if slot < ctx[0].nslots:
+                eoff: uint64 = j * DM_WC_ENTRY_BYTES
+                _dm_wc_put_u64(buf, eoff, ctx[0].tag[slot])
+                buf[eoff + 8] = ctx[0].valid[slot]
+                buf[eoff + 9] = ctx[0].dirty[slot]
+            j = j + 1
+        if blk_write_sectors(ctx[0].cache_slot, 1 + s, 1, buf) != 0:
+            return -1
+        s = s + 1
+    return 0
+
+
+def _dm_wc_io(t: Ptr[DmTarget], is_write: int32, off_in_t: uint64,
+              count: uint64, buf: Ptr[uint8]) -> int32:
+    # WRITECACHE target. Process one cache BLOCK at a time (count is a sector
+    # count; writecache I/O is block-aligned). Each block is dispatched through
+    # the slot allocate / dirty / persist machinery in _dm_wc_io_block.
+    ctx: Ptr[DmWritecacheContext] = &dm_wc_ctxs[cast[uint64](t[0].snap_ctx)]
+    bs: uint64 = ctx[0].block_sectors
+    s: uint64 = 0
+    while s < count:
+        osec: uint64 = off_in_t + s
+        if (osec % bs) != 0 or (count - s) < bs:
+            printk0("dm: writecache I/O not block-aligned\n")
+            return -1
+        oblk: uint64 = osec / bs
+        if oblk >= ctx[0].nblocks:
+            printk1("dm: writecache I/O past origin span (blk=%d)\n", oblk)
+            return -1
+        cur: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](buf) + s * SECTOR_SIZE)
+        rc: int32 = _dm_wc_io_block(ctx, is_write, oblk, cur)
+        if rc != 0:
+            return rc
+        s = s + bs
+    return 0
+
+
+def dm_wc_flush_all(wc_idx: int32) -> int32:
+    # Explicit WRITEBACK / FLUSH: walk every cache slot and, if it holds VALID
+    # DIRTY data, write it BACK to the origin and clear the dirty flag. After
+    # this the origin holds every acknowledged write and the cache is clean.
+    # Persists the cleared metadata so the flushed state is durable. Returns 0
+    # on success or a negative error.
+    if wc_idx < 0 or cast[uint64](wc_idx) >= DM_WC_MAX:
+        return -1
+    wi: uint64 = cast[uint64](wc_idx)
+    if dm_wc_ctxs[wi].used == 0:
+        return -1
+    ctx: Ptr[DmWritecacheContext] = &dm_wc_ctxs[wi]
+    bs:  uint64 = ctx[0].block_sectors
+    ds:  uint64 = ctx[0].data_start
+    buf: Ptr[uint8] = cast[Ptr[uint8]](&_dm_wc_buf[0])
+    i: uint64 = 0
+    while i < ctx[0].nslots:
+        if ctx[0].valid[i] != 0 and ctx[0].dirty[i] != 0:
+            oblk: uint64 = ctx[0].tag[i]
+            rc: int32 = blk_read_sectors(ctx[0].cache_slot,
+                                         ds + i * bs, bs, buf)
+            if rc != 0:
+                return rc
+            rc = blk_write_sectors(ctx[0].origin_slot, oblk * bs, bs, buf)
+            if rc != 0:
+                return rc
+            ctx[0].dirty[i] = 0
+        i = i + 1
+    # Persist the cleared dirty flags so the flushed state is durable.
+    if dm_wc_persist_ctx(ctx) != 0:
+        return -1
+    return 0
+
+
+def dm_wc_dirty_count(wc_idx: int32) -> int64:
+    # Observe the number of dirty (un-flushed) cache slots, or -1 for an
+    # invalid/free context. Lets the self-test assert that a flush clears dirty.
+    if wc_idx < 0 or cast[uint64](wc_idx) >= DM_WC_MAX:
+        return -1
+    wi: uint64 = cast[uint64](wc_idx)
+    if dm_wc_ctxs[wi].used == 0:
+        return -1
+    ctx: Ptr[DmWritecacheContext] = &dm_wc_ctxs[wi]
+    n: int64 = 0
+    i: uint64 = 0
+    while i < ctx[0].nslots:
+        if ctx[0].valid[i] != 0 and ctx[0].dirty[i] != 0:
+            n = n + 1
+        i = i + 1
+    return n
+
+
 def _dm_io(dev: Ptr[MappedDevice], is_write: int32, vlba: uint64,
            count: uint64, buf: Ptr[uint8]) -> int32:
     # Core remap. Walk the request sector-span, splitting it at target
@@ -2102,6 +2468,8 @@ def _dm_io(dev: Ptr[MappedDevice], is_write: int32, vlba: uint64,
             rc = _dm_cache_io(t, is_write, off_in_t, chunk, bufp)
         elif t[0].ttype == DM_TARGET_ERA:
             rc = _dm_era_io(t, is_write, off_in_t, chunk, bufp)
+        elif t[0].ttype == DM_TARGET_WRITECACHE:
+            rc = _dm_wc_io(t, is_write, off_in_t, chunk, bufp)
         else:
             rc = _dm_linear_io(t, is_write, off_in_t, chunk, bufp)
         if rc != 0:
@@ -2895,6 +3263,118 @@ def dm_era_ctx_of(name: Ptr[char]) -> int32:
     return -1
 
 
+def _dm_wc_alloc_ctx() -> int32:
+    # Claim a free writecache context slot, or -1 if the table is full.
+    i: uint64 = 0
+    while i < DM_WC_MAX:
+        if dm_wc_ctxs[i].used == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def dm_create_writecache(name: Ptr[char], cache_slot: int32,
+                         origin_slot: int32, block_sectors: uint64,
+                         nslots: uint64, nblocks: uint64) -> int32:
+    # Create a dm-writecache mapped device: a FAST `cache_slot` device
+    # write-caching the SLOW `origin_slot` device. The address space is the
+    # full origin span (nblocks cache blocks of `block_sectors` sectors each);
+    # the fast device holds a superblock + a packed slot-metadata region +
+    # `nslots` DATA slots. If the cache device already carries our superblock
+    # with matching geometry, the slot state (which origin block each slot
+    # holds + its dirty flag) is RESUMED from it, so un-flushed dirty writes
+    # are recovered. This is the `dmsetup create NAME --table "0 LEN
+    # writecache s ORIGINDEV CACHEDEV BLKSZ ..."` shape. Returns the
+    # registered block slot or a negative error.
+    dm_init()
+    if cache_slot < 0 or origin_slot < 0:
+        return -2
+    if block_sectors == 0 or block_sectors > DM_WC_MAX_BLKSECS:
+        printk0("dm: writecache block size exceeds staging buffer capacity\n")
+        return -2
+    if nblocks == 0:
+        return -2
+    if nslots == 0 or nslots > DM_WC_MAX_SLOTS:
+        printk0("dm: writecache slot count exceeds mapping-table capacity\n")
+        return -3
+    length: uint64 = nblocks * block_sectors
+    if length > blk_capacity_sectors(origin_slot):
+        printk0("dm: writecache target exceeds underlying origin capacity\n")
+        return -3
+    # Cache-device footprint: 1 superblock + meta sectors + data region.
+    data_start: uint64 = 1 + _dm_wc_meta_sectors(nslots)
+    cache_need: uint64 = data_start + nslots * block_sectors
+    if cache_need > blk_capacity_sectors(cache_slot):
+        printk0("dm: writecache exceeds underlying cache-device capacity\n")
+        return -3
+    widx_s: int32 = _dm_wc_alloc_ctx()
+    if widx_s < 0:
+        printk0("dm: writecache context table full\n")
+        return -4
+    widx: uint64 = cast[uint64](widx_s)
+    dm_wc_ctxs[widx].cache_slot    = cache_slot
+    dm_wc_ctxs[widx].origin_slot   = origin_slot
+    dm_wc_ctxs[widx].block_sectors = block_sectors
+    dm_wc_ctxs[widx].nblocks       = nblocks
+    dm_wc_ctxs[widx].nslots        = nslots
+    dm_wc_ctxs[widx].data_start    = data_start
+    s: uint64 = 0
+    while s < nslots:
+        dm_wc_ctxs[widx].valid[s] = 0
+        dm_wc_ctxs[widx].dirty[s] = 0
+        dm_wc_ctxs[widx].tag[s]   = 0
+        s = s + 1
+    dm_wc_ctxs[widx].used = 1
+    # Resume from persisted metadata if a valid superblock is present (so
+    # un-flushed dirty writes survive a teardown / crash).
+    rl: int32 = dm_wc_reload(widx_s)
+    if rl < 0:
+        dm_wc_ctxs[widx].used = 0
+        printk0("dm: writecache metadata reload I/O error\n")
+        return -5
+    idx_s: int32 = _dm_alloc_device()
+    if idx_s < 0:
+        dm_wc_ctxs[widx].used = 0
+        printk0("dm: device table full\n")
+        return -4
+    idx: uint64 = cast[uint64](idx_s)
+    dm_devices[idx].n_targets               = 1
+    dm_devices[idx].capacity                = length
+    dm_devices[idx].targets[0].ttype        = DM_TARGET_WRITECACHE
+    dm_devices[idx].targets[0].start_sector = 0
+    dm_devices[idx].targets[0].length       = length
+    dm_devices[idx].targets[0].under_slot   = origin_slot
+    dm_devices[idx].targets[0].snap_ctx     = widx_s
+    dm_devices[idx].targets[0].under_start  = 0
+    # Persist the initial (or resumed) superblock so a teardown before any
+    # write still leaves valid metadata behind.
+    if dm_wc_persist(widx_s) != 0:
+        dm_wc_ctxs[widx].used = 0
+        printk0("dm: writecache initial metadata persist failed\n")
+        return -5
+    if _dm_register(idx, name) != 0:
+        dm_devices[idx].used  = 0
+        dm_wc_ctxs[widx].used = 0
+        return -5
+    return dm_devices[idx].self_slot
+
+
+def dm_wc_ctx_of(name: Ptr[char]) -> int32:
+    # Return the writecache-context index backing the writecache mapped device
+    # `name`, or -1 if none. Lets the self-test flush and observe dirty count.
+    slot: int32 = find_blockdev(name)
+    if slot < 0:
+        return -1
+    i: uint64 = 0
+    while i < DM_MAX_DEVICES:
+        if dm_devices[i].used != 0 and dm_devices[i].self_slot == slot:
+            if dm_devices[i].targets[0].ttype == DM_TARGET_WRITECACHE:
+                return dm_devices[i].targets[0].snap_ctx
+            return -1
+        i = i + 1
+    return -1
+
+
 def dm_remove(name: Ptr[char]) -> int32:
     # Tear down a mapped device by name: unregister its block-device
     # identity and free the MappedDevice slot. dmsetup remove NAME.
@@ -2937,6 +3417,13 @@ def dm_remove(name: Ptr[char]) -> int32:
                 ec2: int32 = dm_devices[i].targets[0].snap_ctx
                 if ec2 >= 0 and cast[uint64](ec2) < DM_ERA_MAX:
                     dm_era_ctxs[cast[uint64](ec2)].used = 0
+            # Releasing a writecache device frees its slot-mapping context (the
+            # persisted metadata + dirty data on the cache device survive, so a
+            # fresh writecache over the same cache device resumes them).
+            if dm_devices[i].targets[0].ttype == DM_TARGET_WRITECACHE:
+                wc2: int32 = dm_devices[i].targets[0].snap_ctx
+                if wc2 >= 0 and cast[uint64](wc2) < DM_WC_MAX:
+                    dm_wc_ctxs[cast[uint64](wc2)].used = 0
             blk_unregister_by_name(name)
             dm_devices[i].used      = 0
             dm_devices[i].n_targets = 0
@@ -3034,6 +3521,18 @@ _DM_EMETA_SECTORS: uint64 = 256
 _dm_emeta_store:   Array[131072, uint8]   # 256 * 512
 _dm_emeta_ops:     BlockDeviceOps
 
+# Dedicated FAST CACHE ramdisk for the dm-writecache subtest (holds the
+# superblock + slot metadata + data slots). 256 sectors = 128 KiB.
+_DM_WCACHE_SECTORS: uint64 = 256
+_dm_wcache_store:   Array[131072, uint8]   # 256 * 512
+_dm_wcache_ops:     BlockDeviceOps
+
+# Dedicated SLOW ORIGIN ramdisk for the dm-writecache subtest. 256 sectors =
+# 128 KiB.
+_DM_WORIG_SECTORS: uint64 = 256
+_dm_worig_store:   Array[131072, uint8]   # 256 * 512
+_dm_worig_ops:     BlockDeviceOps
+
 # Scratch buffers for the self-test (all module-scope, one sector each
 # unless noted).
 _dm_t_plain:   Array[512, uint8]   # plaintext written through a mapped dev
@@ -3101,6 +3600,15 @@ _dm_era_rd:      Array[512, uint8]   # readback through the era device
 # Query result buffer: chunk indices returned by dm_era_query_since. Sized
 # to DM_ERA_MAX_CHUNKS (256) so a full-device result never overflows.
 _dm_era_qbuf:    Array[256, uint64]  # query result chunk indices
+
+# dm-writecache subtest scratch (all one full sector = 512 bytes to avoid the
+# BSS-overflow trap; the writecache subtest uses 1-sector cache blocks).
+_dm_wc_pa:       Array[512, uint8]   # pattern written to origin block A
+_dm_wc_pb:       Array[512, uint8]   # pattern written to origin block B
+_dm_wc_pc:       Array[512, uint8]   # pattern written to origin block C
+_dm_wc_orig0:    Array[512, uint8]   # pre-write origin contents (block A)
+_dm_wc_rd:       Array[512, uint8]   # readback through the writecache device
+_dm_wc_raw:      Array[512, uint8]   # raw read from the origin / cache device
 
 
 def _dm_back_read(priv: uint64, lba: uint64, count: uint64,
@@ -3390,6 +3898,66 @@ def _dm_emeta_register() -> int32:
     _dm_emeta_ops.flush         = cast[Fn[int32, uint64]](0)
     return register_blockdev("dmemeta0", _DM_EMETA_SECTORS,
                              &_dm_emeta_ops, 0)
+
+
+def _dm_wcache_read(priv: uint64, lba: uint64, count: uint64,
+                    buf: Ptr[uint8]) -> int32:
+    src: uint64 = cast[uint64](&_dm_wcache_store[0]) + lba * SECTOR_SIZE
+    memcpy(buf, cast[Ptr[uint8]](src), count * SECTOR_SIZE)
+    return 0
+
+
+def _dm_wcache_write(priv: uint64, lba: uint64, count: uint64,
+                     buf: Ptr[uint8]) -> int32:
+    dst: uint64 = cast[uint64](&_dm_wcache_store[0]) + lba * SECTOR_SIZE
+    memcpy(cast[Ptr[uint8]](dst), buf, count * SECTOR_SIZE)
+    return 0
+
+
+def _dm_wcache_register() -> int32:
+    # Register the dedicated dm-writecache FAST cache ramdisk as "dmwcache0".
+    existing: int32 = find_blockdev("dmwcache0")
+    if existing >= 0:
+        return existing
+    z: uint64 = 0
+    while z < 131072:
+        _dm_wcache_store[z] = 0
+        z = z + 1
+    _dm_wcache_ops.read_sectors  = _dm_wcache_read
+    _dm_wcache_ops.write_sectors = _dm_wcache_write
+    _dm_wcache_ops.flush         = cast[Fn[int32, uint64]](0)
+    return register_blockdev("dmwcache0", _DM_WCACHE_SECTORS,
+                             &_dm_wcache_ops, 0)
+
+
+def _dm_worig_read(priv: uint64, lba: uint64, count: uint64,
+                   buf: Ptr[uint8]) -> int32:
+    src: uint64 = cast[uint64](&_dm_worig_store[0]) + lba * SECTOR_SIZE
+    memcpy(buf, cast[Ptr[uint8]](src), count * SECTOR_SIZE)
+    return 0
+
+
+def _dm_worig_write(priv: uint64, lba: uint64, count: uint64,
+                    buf: Ptr[uint8]) -> int32:
+    dst: uint64 = cast[uint64](&_dm_worig_store[0]) + lba * SECTOR_SIZE
+    memcpy(cast[Ptr[uint8]](dst), buf, count * SECTOR_SIZE)
+    return 0
+
+
+def _dm_worig_register() -> int32:
+    # Register the dedicated dm-writecache SLOW origin ramdisk as "dmworig0".
+    existing: int32 = find_blockdev("dmworig0")
+    if existing >= 0:
+        return existing
+    z: uint64 = 0
+    while z < 131072:
+        _dm_worig_store[z] = 0
+        z = z + 1
+    _dm_worig_ops.read_sectors  = _dm_worig_read
+    _dm_worig_ops.write_sectors = _dm_worig_write
+    _dm_worig_ops.flush         = cast[Fn[int32, uint64]](0)
+    return register_blockdev("dmworig0", _DM_WORIG_SECTORS,
+                             &_dm_worig_ops, 0)
 
 
 def _dm_buf_eq(a: Ptr[uint8], b: Ptr[uint8], n: uint64) -> int32:
@@ -4506,6 +5074,192 @@ def dm_selftest() -> int32:
         _dm_emerg0("[dm] era PASS\n")
 
     dm_remove("dmera0")
+
+    # --- Test 11: dm-WRITECACHE write-back cache (writes -> fast device) ---
+    # Build a writecache over a dedicated FAST cache ramdisk (dmwcache0)
+    # fronting a SLOW origin (dmworig0). 1-sector cache blocks, 8 data slots,
+    # 16 origin blocks. We PROVE:
+    #   (a) WRITE-BACK not write-through: a write through the device lands the
+    #       NEW data on the CACHE device and marks the slot dirty, while the
+    #       ORIGIN block stays STALE (still its pre-write contents);
+    #   (b) READ serves the cached (dirty) new data for a written block, and
+    #       falls through to the origin for a never-written block;
+    #   (c) FLUSH walks dirty slots, writes them back to the origin, and clears
+    #       dirty — after which the origin holds the data and dirty count is 0;
+    #   (d) PERSISTENCE: un-flushed dirty writes survive a teardown — after
+    #       writing (without flushing) and removing the mapped device, a fresh
+    #       writecache over the SAME cache device RESUMES the dirty slot, still
+    #       serves the new data on read, and can flush it to the origin.
+    wcache: int32 = _dm_wcache_register()
+    if wcache < 0:
+        _dm_emerg0("[device-mapper] FAIL: writecache cache-device register\n")
+        return 0
+    worig: int32 = _dm_worig_register()
+    if worig < 0:
+        _dm_emerg0("[device-mapper] FAIL: writecache origin register\n")
+        return 0
+    _dm_emerg2("[device-mapper] writecache fast dmwcache0 slot=%d origin dmworig0 slot=%d\n",
+               cast[uint64](cast[int64](wcache)),
+               cast[uint64](cast[int64](worig)))
+    # Distinct per-block patterns (one sector each); _dm_wc_orig0 is the
+    # pre-write origin contents seeded into origin block 0.
+    wbi: uint64 = 0
+    while wbi < SECTOR_SIZE:
+        _dm_wc_pa[wbi]    = cast[uint8]((wbi * 3 + 17) & 0xFF)   # block 0 write
+        _dm_wc_pb[wbi]    = cast[uint8]((wbi * 5 + 29) & 0xFF)   # block 2 write
+        _dm_wc_pc[wbi]    = cast[uint8]((wbi * 7 + 41) & 0xFF)   # block 4 write
+        _dm_wc_orig0[wbi] = cast[uint8]((wbi * 11 + 7) & 0xFF)   # block0 origin
+        wbi = wbi + 1
+    # Seed origin block 0 with its OLD contents and block 5 (never written
+    # through the cache) so a read of block 5 falls through to the origin.
+    if blk_write_sectors(worig, 0, 1, &_dm_wc_orig0[0]) != 0 or \
+       blk_write_sectors(worig, 5, 1, &_dm_wc_pc[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: writecache origin seed\n")
+        return 0
+
+    wcdev: int32 = dm_create_writecache("dmwc0", wcache, worig, 1, 8, 16)
+    if wcdev < 0:
+        _dm_emerg1("[device-mapper] FAIL: dm_create_writecache rc=%d\n",
+                   cast[uint64](cast[int64](wcdev)))
+        return 0
+    wctx: int32 = dm_wc_ctx_of("dmwc0")
+    if wctx < 0:
+        _dm_emerg0("[device-mapper] FAIL: writecache ctx lookup\n")
+        return 0
+
+    # (a) Write pattern A to origin block 0 through the writecache. The NEW
+    # data must land on the CACHE device (so a read through the device returns
+    # it) while the RAW origin block 0 still holds its OLD pre-write contents.
+    if blk_write_sectors(wcdev, 0, 1, &_dm_wc_pa[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: writecache write blk0\n")
+        return 0
+    if blk_read_sectors(worig, 0, 1, &_dm_wc_raw[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: writecache raw origin read blk0\n")
+        return 0
+    if _dm_buf_eq(&_dm_wc_raw[0], &_dm_wc_orig0[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: writecache origin not stale (write-through?)\n")
+        ok = 0
+    else:
+        _dm_emerg0("[dm] writecache write-back: origin stale, data on cache OK\n")
+    # The new data must read back THROUGH the device (served from cache).
+    if blk_read_sectors(wcdev, 0, 1, &_dm_wc_rd[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: writecache read blk0\n")
+        return 0
+    if _dm_buf_eq(&_dm_wc_rd[0], &_dm_wc_pa[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: writecache read did not serve cached data\n")
+        ok = 0
+    else:
+        _dm_emerg0("[dm] writecache read serves cached new data OK\n")
+
+    # (b) A read of block 5 (never written through the cache) must fall through
+    # to the ORIGIN (returning the seeded origin contents, pattern C).
+    if blk_read_sectors(wcdev, 5, 1, &_dm_wc_rd[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: writecache read blk5\n")
+        return 0
+    if _dm_buf_eq(&_dm_wc_rd[0], &_dm_wc_pc[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: writecache uncached read missed origin\n")
+        ok = 0
+    else:
+        _dm_emerg0("[dm] writecache uncached read falls through to origin OK\n")
+
+    # Write two more blocks (2 and 4) so the flush has several dirty slots.
+    if blk_write_sectors(wcdev, 2, 1, &_dm_wc_pb[0]) != 0 or \
+       blk_write_sectors(wcdev, 4, 1, &_dm_wc_pc[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: writecache write blk2/blk4\n")
+        return 0
+    # Three blocks were written; the dirty count must be exactly 3.
+    if dm_wc_dirty_count(wctx) != 3:
+        _dm_emerg1("[device-mapper] FAIL: writecache dirty count != 3 (got=%d)\n",
+                   cast[uint64](dm_wc_dirty_count(wctx)))
+        ok = 0
+
+    # (c) FLUSH: write back every dirty slot. After the flush the ORIGIN must
+    # hold the written data for all three blocks and dirty count must be 0.
+    if dm_wc_flush_all(wctx) != 0:
+        _dm_emerg0("[device-mapper] FAIL: writecache flush rc\n")
+        return 0
+    flush_ok: int32 = 1
+    if blk_read_sectors(worig, 0, 1, &_dm_wc_raw[0]) != 0 or \
+       _dm_buf_eq(&_dm_wc_raw[0], &_dm_wc_pa[0], SECTOR_SIZE) != 1:
+        flush_ok = 0
+    if blk_read_sectors(worig, 2, 1, &_dm_wc_raw[0]) != 0 or \
+       _dm_buf_eq(&_dm_wc_raw[0], &_dm_wc_pb[0], SECTOR_SIZE) != 1:
+        flush_ok = 0
+    if blk_read_sectors(worig, 4, 1, &_dm_wc_raw[0]) != 0 or \
+       _dm_buf_eq(&_dm_wc_raw[0], &_dm_wc_pc[0], SECTOR_SIZE) != 1:
+        flush_ok = 0
+    if flush_ok != 1 or dm_wc_dirty_count(wctx) != 0:
+        _dm_emerg1("[device-mapper] FAIL: writecache flush incomplete (dirty=%d)\n",
+                   cast[uint64](dm_wc_dirty_count(wctx)))
+        ok = 0
+    else:
+        _dm_emerg0("[dm] writecache flush writes back to origin, dirty cleared OK\n")
+
+    # (d) PERSISTENCE / crash recovery: write a NEW pattern (B) to block 7
+    # through the cache but do NOT flush it. Reset origin block 7 to a known
+    # OLD value first so we can prove the un-flushed data is recovered, not
+    # read from the origin. Then TEAR DOWN the mapped device (the cache
+    # ramdisk and its persisted metadata survive) and bring up a FRESH
+    # writecache over the SAME cache device. It must resume the dirty slot:
+    # a read returns the un-flushed new data, and a flush lands it on origin.
+    if blk_write_sectors(worig, 7, 1, &_dm_wc_pc[0]) != 0:   # OLD origin value
+        _dm_emerg0("[device-mapper] FAIL: writecache origin reset blk7\n")
+        return 0
+    if blk_write_sectors(wcdev, 7, 1, &_dm_wc_pb[0]) != 0:   # NEW (un-flushed)
+        _dm_emerg0("[device-mapper] FAIL: writecache write blk7\n")
+        return 0
+    # The origin block 7 must still hold the OLD value (un-flushed write).
+    if blk_read_sectors(worig, 7, 1, &_dm_wc_raw[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: writecache raw origin read blk7\n")
+        return 0
+    if _dm_buf_eq(&_dm_wc_raw[0], &_dm_wc_pc[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: writecache blk7 origin not stale\n")
+        ok = 0
+    # Tear down the mapped device WITHOUT flushing — the persisted metadata +
+    # dirty data remain on the cache ramdisk.
+    dm_remove("dmwc0")
+    # Bring up a FRESH writecache over the SAME cache + origin devices.
+    wcdev2: int32 = dm_create_writecache("dmwc1", wcache, worig, 1, 8, 16)
+    if wcdev2 < 0:
+        _dm_emerg1("[device-mapper] FAIL: dm_create_writecache resume rc=%d\n",
+                   cast[uint64](cast[int64](wcdev2)))
+        return 0
+    wctx2: int32 = dm_wc_ctx_of("dmwc1")
+    if wctx2 < 0:
+        _dm_emerg0("[device-mapper] FAIL: writecache resume ctx lookup\n")
+        return 0
+    # The resumed device must still see block 7 as dirty (un-flushed write).
+    if dm_wc_dirty_count(wctx2) != 1:
+        _dm_emerg1("[device-mapper] FAIL: writecache resume lost dirty (dirty=%d)\n",
+                   cast[uint64](dm_wc_dirty_count(wctx2)))
+        ok = 0
+    # A read of block 7 through the resumed device must serve the un-flushed
+    # NEW data (pattern B), NOT the stale origin (pattern C).
+    if blk_read_sectors(wcdev2, 7, 1, &_dm_wc_rd[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: writecache resume read blk7\n")
+        return 0
+    if _dm_buf_eq(&_dm_wc_rd[0], &_dm_wc_pb[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: writecache resume did not recover dirty data\n")
+        ok = 0
+    else:
+        _dm_emerg0("[dm] writecache metadata persists: un-flushed write recovered OK\n")
+    # And a flush on the resumed device must land the recovered data on origin.
+    if dm_wc_flush_all(wctx2) != 0:
+        _dm_emerg0("[device-mapper] FAIL: writecache resume flush rc\n")
+        return 0
+    if blk_read_sectors(worig, 7, 1, &_dm_wc_raw[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: writecache resume raw origin read blk7\n")
+        return 0
+    if _dm_buf_eq(&_dm_wc_raw[0], &_dm_wc_pb[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: writecache resume flush did not persist\n")
+        ok = 0
+    else:
+        _dm_emerg0("[dm] writecache recovered write flushes to origin OK\n")
+
+    if ok == 1:
+        _dm_emerg0("[dm] writecache PASS\n")
+
+    dm_remove("dmwc1")
 
     if ok == 1:
         _dm_emerg0("[device-mapper] PASS\n")

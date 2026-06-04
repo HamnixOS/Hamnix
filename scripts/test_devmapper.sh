@@ -169,6 +169,13 @@ check "era query since era 1"    "[devmapper] era: all written chunks {2,5,9} re
 check "era rewrite new data"     "[devmapper] era: re-written chunk reads back new data OK"
 check "era metadata persist"     "[dm] PASS era-persist"
 check "era subtest PASS"         "[dm] era PASS"
+check "writecache write-back"    "[dm] writecache write-back: origin stale, data on cache OK"
+check "writecache cached read"   "[dm] writecache read serves cached new data OK"
+check "writecache fallthrough"   "[dm] writecache uncached read falls through to origin OK"
+check "writecache flush"         "[dm] writecache flush writes back to origin, dirty cleared OK"
+check "writecache persist recov" "[dm] writecache metadata persists: un-flushed write recovered OK"
+check "writecache recov flush"   "[dm] writecache recovered write flushes to origin OK"
+check "writecache subtest PASS"  "[dm] writecache PASS"
 check "device-mapper PASS"       "[device-mapper] PASS"
 
 if [ "$fail" -ne 0 ]; then
