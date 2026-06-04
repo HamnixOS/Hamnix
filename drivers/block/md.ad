@@ -113,6 +113,25 @@ class MdArray:
     bitmap_region_sectors: uint64
     bitmap_nregions:       uint64
     bitmap_buf:            Ptr[uint8]
+    # Partial Parity Log (PPL) — RAID5 write-hole journal. When `ppl_on` is
+    # non-zero, every partial-stripe RAID5 write first APPENDS a journal
+    # entry (stripe index + partial parity = XOR of the UNMODIFIED data
+    # chunks of that stripe) to a dedicated journal block device BEFORE the
+    # new data/parity touch the array. If the machine crashes between the
+    # data write and the parity write, the on-array parity is stale; on
+    # recovery (md_ppl_recover) the un-acknowledged journal entries are
+    # replayed — for each, parity is recomputed as partial_parity XOR
+    # current_on_disk_data and written to the parity member, making parity
+    # consistent with the data again so a later degraded read reconstructs
+    # the CORRECT value. Entries are RETIRED (the journal head reset) once a
+    # full stripe write completes. `ppl_slot` is the journal block device;
+    # `ppl_head` is the next free journal slot (entry count); `ppl_chunk`
+    # is the per-entry partial-parity payload size in sectors (== chunk).
+    ppl_on:        uint32
+    ppl_pad:       uint32
+    ppl_slot:      int32
+    ppl_head:      uint32          # number of live (un-retired) entries
+    ppl_chunk:     uint64          # payload sectors per entry (== chunk_sectors)
     members:       Array[8, MdMember]
 
 
@@ -138,6 +157,10 @@ def md_init():
         md_arrays[i].n_members = 0
         md_arrays[i].capacity  = 0
         md_arrays[i].self_slot = -1
+        md_arrays[i].bitmap_on = 0
+        md_arrays[i].ppl_on    = 0
+        md_arrays[i].ppl_slot  = -1
+        md_arrays[i].ppl_head  = 0
         i = i + 1
     md_inited = 1
     printk0("md: software RAID ready (raid0 stripe + raid1 mirror)\n")
@@ -790,6 +813,319 @@ def _md_raid5_write_chunkfrag(dev: Ptr[MdArray], stripe: uint64,
                              frag, cast[Ptr[uint8]](&_md_r5_scratch_a[0]))
 
 
+# =========================================================================
+# PPL — Partial Parity Log (RAID5 write-hole journal)
+# =========================================================================
+#
+# Linux's drivers/md/raid5-ppl.c. A RAID5 partial-stripe write updates a
+# data chunk and the parity chunk as TWO separate device writes. If the
+# machine crashes BETWEEN them, the on-array parity is stale: it no longer
+# equals the XOR of the (now changed) data chunks. A later DEGRADED read of
+# an UNTOUCHED chunk in that stripe is reconstructed as
+#   missing = stale_P XOR (other current data)
+# and is therefore SILENTLY WRONG — the RAID5 "write hole".
+#
+# PPL closes the hole with a small journal. For the chunk being written we
+# log the PARTIAL PARITY:
+#
+#   PP = old_P XOR old_data
+#      = XOR of all the OTHER (UNMODIFIED) data chunks of the stripe
+#
+# The journal entry is appended BEFORE the new data/parity hit the array.
+# After a crash, the data member holds the NEW data (the data write
+# completed) but parity is stale. RECOVERY replays each live entry: it reads
+# the CURRENT data of the logged data member off the array and recomputes
+#   new_P = PP XOR current_data
+# which is exactly XOR(unmodified data) XOR new_data = the parity CONSISTENT
+# with the present on-disk data — and writes it to the parity member. A
+# subsequent degraded read of any untouched chunk now reconstructs the
+# CORRECT value. Once a full stripe write completes normally the entries are
+# RETIRED (journal head reset, header invalidated) so recovery is a no-op.
+#
+# JOURNAL ON-DISK LAYOUT (on the dedicated journal block device):
+#   sector 0                  : header  — magic + n_entries (persisted so
+#                               recovery works from the journal ALONE after
+#                               a simulated reboot, with no in-RAM state).
+#   per entry i (i = 0..n-1):
+#     meta sector  = 1 + i * (1 + ppl_chunk)         : stripe/dm/off/frag/valid
+#     payload      = meta + 1 .. + frag              : PP (partial parity)
+# ppl_chunk sectors are reserved for payload per slot (fixed-size slots) so
+# a slot index maps to a fixed LBA without scanning.
+
+_MD_PPL_MAGIC: uint32 = 0x50504C31       # "PPL1"
+_MD_PPL_MAX_ENTRIES: uint64 = 16         # journal capacity (slots)
+
+# Per-entry metadata, packed at the head of the entry's meta sector. The
+# journal device is byte-addressed via these little helpers so no struct
+# punning is needed.
+def _md_ppl_meta_lba(dev: Ptr[MdArray], slot: uint64) -> uint64:
+    # First (metadata) sector of journal entry `slot`.
+    return 1 + slot * (1 + dev[0].ppl_chunk)
+
+
+def _md_ppl_payload_lba(dev: Ptr[MdArray], slot: uint64) -> uint64:
+    # First payload (partial-parity) sector of journal entry `slot`.
+    return _md_ppl_meta_lba(dev, slot) + 1
+
+
+# A scratch sector for journal header/metadata I/O, plus a chunk-wide
+# partial-parity payload buffer. Sized to a FULL default chunk so a payload
+# write/read never overflows (the BSS-overflow trap). Module-scope.
+_md_ppl_meta:    Array[512, uint8]        # one metadata/header sector
+_md_ppl_payload: Array[65536, uint8]      # one chunk of partial parity (128s)
+
+
+def _md_u32_put(p: Ptr[uint8], off: uint64, v: uint32):
+    p[off]     = cast[uint8](v & 0xFF)
+    p[off + 1] = cast[uint8]((v >> 8) & 0xFF)
+    p[off + 2] = cast[uint8]((v >> 16) & 0xFF)
+    p[off + 3] = cast[uint8]((v >> 24) & 0xFF)
+
+
+def _md_u32_get(p: Ptr[uint8], off: uint64) -> uint32:
+    a: uint32 = cast[uint32](p[off])
+    b: uint32 = cast[uint32](p[off + 1])
+    c: uint32 = cast[uint32](p[off + 2])
+    d: uint32 = cast[uint32](p[off + 3])
+    return a | (b << 8) | (c << 16) | (d << 24)
+
+
+def _md_u64_put(p: Ptr[uint8], off: uint64, v: uint64):
+    _md_u32_put(p, off, cast[uint32](v & 0xFFFFFFFF))
+    _md_u32_put(p, off + 4, cast[uint32]((v >> 32) & 0xFFFFFFFF))
+
+
+def _md_u64_get(p: Ptr[uint8], off: uint64) -> uint64:
+    lo: uint64 = cast[uint64](_md_u32_get(p, off))
+    hi: uint64 = cast[uint64](_md_u32_get(p, off + 4))
+    return lo | (hi << 32)
+
+
+def md_ppl_enable(name: Ptr[char], journal_slot: int32) -> int32:
+    # Attach a Partial Parity Log to RAID5 array `name`, journaling to the
+    # block device `journal_slot` (mdadm --consistency-policy=ppl). Resets
+    # the journal header to empty. Returns 0 on success, negative on error.
+    if journal_slot < 0:
+        return -1
+    slot: int32 = find_blockdev(name)
+    if slot < 0:
+        return -1
+    i: uint64 = 0
+    while i < MD_MAX_ARRAYS:
+        if md_arrays[i].used != 0 and md_arrays[i].self_slot == slot:
+            dev: Ptr[MdArray] = &md_arrays[i]
+            if dev[0].level != MD_LEVEL_RAID5:
+                printk0("md: ppl only on raid5\n")
+                return -1
+            # The journal must hold the header + MAX_ENTRIES fixed slots.
+            need: uint64 = 1 + _MD_PPL_MAX_ENTRIES * (1 + dev[0].chunk_sectors)
+            if blk_capacity_sectors(journal_slot) < need:
+                printk0("md: ppl journal too small\n")
+                return -1
+            dev[0].ppl_slot  = journal_slot
+            dev[0].ppl_chunk = dev[0].chunk_sectors
+            dev[0].ppl_head  = 0
+            dev[0].ppl_on    = 1
+            return _md_ppl_write_header(dev, 0)
+        i = i + 1
+    return -1
+
+
+def _md_ppl_write_header(dev: Ptr[MdArray], n_entries: uint32) -> int32:
+    # Persist the journal header (magic + entry count). n_entries==0 marks
+    # the journal EMPTY (retired) so recovery becomes a no-op.
+    z: uint64 = 0
+    while z < SECTOR_SIZE:
+        _md_ppl_meta[z] = 0
+        z = z + 1
+    if n_entries != 0:
+        _md_u32_put(cast[Ptr[uint8]](&_md_ppl_meta[0]), 0, _MD_PPL_MAGIC)
+        _md_u32_put(cast[Ptr[uint8]](&_md_ppl_meta[0]), 4, n_entries)
+    return blk_write_sectors(dev[0].ppl_slot, 0, 1,
+                             cast[Ptr[uint8]](&_md_ppl_meta[0]))
+
+
+def _md_ppl_log_entry(dev: Ptr[MdArray], stripe: uint64, dm: uint64,
+                      off: uint64, frag: uint64, pp: Ptr[uint8]) -> int32:
+    # Append a PPL entry: stripe/data-member/offset/frag metadata + the
+    # partial-parity payload `pp` (frag sectors). Persists the updated header
+    # LAST so the entry count only advances once the entry is fully on the
+    # journal. Returns 0 on success.
+    if dev[0].ppl_head >= cast[uint32](_MD_PPL_MAX_ENTRIES):
+        # Journal full: flush by retiring (the caller's pending writes will
+        # be re-logged). Treated as a soft error here.
+        return -1
+    slot: uint64 = cast[uint64](dev[0].ppl_head)
+    nb: uint64 = frag * SECTOR_SIZE
+    # Metadata sector.
+    z: uint64 = 0
+    while z < SECTOR_SIZE:
+        _md_ppl_meta[z] = 0
+        z = z + 1
+    m: Ptr[uint8] = cast[Ptr[uint8]](&_md_ppl_meta[0])
+    _md_u32_put(m, 0, _MD_PPL_MAGIC)
+    _md_u32_put(m, 4, 1)                       # valid
+    _md_u64_put(m, 8, stripe)
+    _md_u64_put(m, 16, dm)
+    _md_u64_put(m, 24, off)
+    _md_u64_put(m, 32, frag)
+    wr: int32 = blk_write_sectors(dev[0].ppl_slot, _md_ppl_meta_lba(dev, slot),
+                                  1, m)
+    if wr != 0:
+        return wr
+    # Payload (partial parity).
+    pr: int32 = blk_write_sectors(dev[0].ppl_slot,
+                                  _md_ppl_payload_lba(dev, slot), frag, pp)
+    if pr != 0:
+        return pr
+    dev[0].ppl_head = dev[0].ppl_head + 1
+    return _md_ppl_write_header(dev, dev[0].ppl_head)
+
+
+def _md_ppl_retire(dev: Ptr[MdArray]) -> int32:
+    # Mark all journal entries retired (the full stripe write completed and
+    # parity is now consistent). Resets the head and invalidates the header
+    # so a future recovery does nothing.
+    dev[0].ppl_head = 0
+    return _md_ppl_write_header(dev, 0)
+
+
+def _md_raid5_write_logged(dev: Ptr[MdArray], stripe: uint64, didx: uint64,
+                           off: uint64, frag: uint64, buf: Ptr[uint8],
+                           tear: int32) -> int32:
+    # PPL-protected RMW of one data chunk-fragment. Computes the partial
+    # parity PP = old_P XOR old_data = XOR of the unmodified data chunks,
+    # APPENDS a journal entry, then writes the new data and (unless `tear`
+    # simulates a crash) the new parity. With `tear != 0` the data write
+    # lands but the parity write is SKIPPED — leaving the array in the exact
+    # torn-write state PPL recovery must repair, with a live journal entry.
+    n: uint64 = cast[uint64](dev[0].n_members)
+    pd: uint64 = _md_r5_pd_idx(n, stripe)
+    dm: uint64 = _md_r5_data_member(n, pd, didx)
+    nb: uint64 = frag * SECTOR_SIZE
+    if dev[0].members[dm].failed != 0 or dev[0].members[pd].failed != 0:
+        # PPL protects the clean (non-degraded) RMW path; fall back when a
+        # member is already down (parity can't be the recovery anchor).
+        return _md_raid5_write_chunkfrag(dev, stripe, didx, off, frag, buf)
+    par_lba: uint64 = _md_r5_member_lba(dev, pd, stripe, off)
+    dlba: uint64 = _md_r5_member_lba(dev, dm, stripe, off)
+    # PP accumulator = old_P XOR old_data.
+    prc: int32 = blk_read_sectors(dev[0].members[pd].under_slot, par_lba, frag,
+                                  cast[Ptr[uint8]](&_md_ppl_payload[0]))
+    if prc != 0:
+        return prc
+    drc: int32 = blk_read_sectors(dev[0].members[dm].under_slot, dlba, frag,
+                                  cast[Ptr[uint8]](&_md_r5_scratch_b[0]))
+    if drc != 0:
+        return drc
+    _md_xor_into(cast[Ptr[uint8]](&_md_ppl_payload[0]),
+                 cast[Ptr[uint8]](&_md_r5_scratch_b[0]), nb)
+    # 1) journal the partial parity BEFORE touching the array.
+    lrc: int32 = _md_ppl_log_entry(dev, stripe, dm, off, frag,
+                                   cast[Ptr[uint8]](&_md_ppl_payload[0]))
+    if lrc != 0:
+        return lrc
+    # 2) write the new data.
+    wrc: int32 = blk_write_sectors(dev[0].members[dm].under_slot, dlba, frag,
+                                   buf)
+    if wrc != 0:
+        return wrc
+    if tear != 0:
+        # Simulated crash between data and parity writes: stop here, leaving
+        # stale parity + a live journal entry for md_ppl_recover to replay.
+        return 0
+    # 3) new_P = PP XOR new_data (== old_P XOR old_data XOR new_data).
+    _md_xor_into(cast[Ptr[uint8]](&_md_ppl_payload[0]), buf, nb)
+    parc: int32 = blk_write_sectors(dev[0].members[pd].under_slot, par_lba,
+                                    frag, cast[Ptr[uint8]](&_md_ppl_payload[0]))
+    if parc != 0:
+        return parc
+    # 4) full stripe write done — retire the journal.
+    return _md_ppl_retire(dev)
+
+
+def _md_dev_by_name(name: Ptr[char]) -> Ptr[MdArray]:
+    # Resolve array `name` to its MdArray pointer, or null if not found.
+    slot: int32 = find_blockdev(name)
+    if slot < 0:
+        return cast[Ptr[MdArray]](0)
+    i: uint64 = 0
+    while i < MD_MAX_ARRAYS:
+        if md_arrays[i].used != 0 and md_arrays[i].self_slot == slot:
+            return &md_arrays[i]
+        i = i + 1
+    return cast[Ptr[MdArray]](0)
+
+
+def md_ppl_recover(name: Ptr[char]) -> int32:
+    # Replay un-acknowledged PPL entries to close the write hole after a
+    # crash. Reads the journal header from the journal device; for each live
+    # entry, reads the partial parity AND the CURRENT on-array data of the
+    # logged data member, recomputes new_P = PP XOR current_data, and writes
+    # it to the parity member — restoring parity consistent with the present
+    # data. Retires the journal when done. Returns the number of entries
+    # replayed (>= 0), or a negative error.
+    dev: Ptr[MdArray] = _md_dev_by_name(name)
+    if cast[uint64](dev) == 0:
+        return -1
+    if dev[0].ppl_on == 0 or dev[0].level != MD_LEVEL_RAID5:
+        return -1
+    # Read the persisted header.
+    hr: int32 = blk_read_sectors(dev[0].ppl_slot, 0, 1,
+                                 cast[Ptr[uint8]](&_md_ppl_meta[0]))
+    if hr != 0:
+        return hr
+    magic: uint32 = _md_u32_get(cast[Ptr[uint8]](&_md_ppl_meta[0]), 0)
+    if magic != _MD_PPL_MAGIC:
+        return 0                              # clean shutdown — nothing to do
+    n_entries: uint32 = _md_u32_get(cast[Ptr[uint8]](&_md_ppl_meta[0]), 4)
+    replayed: int32 = 0
+    e: uint64 = 0
+    while e < cast[uint64](n_entries):
+        # Read this entry's metadata.
+        mr: int32 = blk_read_sectors(dev[0].ppl_slot, _md_ppl_meta_lba(dev, e),
+                                     1, cast[Ptr[uint8]](&_md_ppl_meta[0]))
+        if mr != 0:
+            return mr
+        em: Ptr[uint8] = cast[Ptr[uint8]](&_md_ppl_meta[0])
+        if _md_u32_get(em, 0) == _MD_PPL_MAGIC and _md_u32_get(em, 4) != 0:
+            stripe: uint64 = _md_u64_get(em, 8)
+            dm:     uint64 = _md_u64_get(em, 16)
+            off:    uint64 = _md_u64_get(em, 24)
+            frag:   uint64 = _md_u64_get(em, 32)
+            nb: uint64 = frag * SECTOR_SIZE
+            n: uint64 = cast[uint64](dev[0].n_members)
+            pd: uint64 = _md_r5_pd_idx(n, stripe)
+            # Partial parity payload -> accumulator.
+            pr: int32 = blk_read_sectors(dev[0].ppl_slot,
+                                         _md_ppl_payload_lba(dev, e), frag,
+                                         cast[Ptr[uint8]](&_md_ppl_payload[0]))
+            if pr != 0:
+                return pr
+            # Current on-array data of the logged data member.
+            dlba: uint64 = _md_r5_member_lba(dev, dm, stripe, off)
+            dr: int32 = blk_read_sectors(dev[0].members[dm].under_slot, dlba,
+                                         frag,
+                                         cast[Ptr[uint8]](&_md_r5_scratch_b[0]))
+            if dr != 0:
+                return dr
+            # new_P = PP XOR current_data.
+            _md_xor_into(cast[Ptr[uint8]](&_md_ppl_payload[0]),
+                         cast[Ptr[uint8]](&_md_r5_scratch_b[0]), nb)
+            par_lba: uint64 = _md_r5_member_lba(dev, pd, stripe, off)
+            wr: int32 = blk_write_sectors(dev[0].members[pd].under_slot,
+                                          par_lba, frag,
+                                          cast[Ptr[uint8]](&_md_ppl_payload[0]))
+            if wr != 0:
+                return wr
+            replayed = replayed + 1
+        e = e + 1
+    # Recovery done — retire the journal so a re-run is a no-op.
+    if _md_ppl_retire(dev) != 0:
+        return -1
+    return replayed
+
+
 def _md_raid5_io(dev: Ptr[MdArray], is_write: int32, vlba: uint64,
                  count: uint64, buf: Ptr[uint8]) -> int32:
     # Walk the request span, splitting at chunk boundaries (exactly like
@@ -816,7 +1152,14 @@ def _md_raid5_io(dev: Ptr[MdArray], is_write: int32, vlba: uint64,
             cast[uint64](buf) + done * SECTOR_SIZE)
         rc: int32 = 0
         if is_write != 0:
-            rc = _md_raid5_write_chunkfrag(dev, stripe, didx, off, frag, bufp)
+            if dev[0].ppl_on != 0:
+                # PPL-protected RMW: journal the partial parity before the
+                # data/parity writes touch the array (tear=0 = full write).
+                rc = _md_raid5_write_logged(dev, stripe, didx, off, frag,
+                                            bufp, 0)
+            else:
+                rc = _md_raid5_write_chunkfrag(dev, stripe, didx, off, frag,
+                                               bufp)
         else:
             rc = _md_raid5_read_chunkfrag(dev, stripe, didx, off, frag, bufp)
         if rc != 0:
@@ -1562,6 +1905,11 @@ def md_create_raid5(name: Ptr[char], slots: Ptr[int32], n: uint64,
     md_arrays[idx].n_members     = cast[uint32](n)
     md_arrays[idx].rr            = 0
     md_arrays[idx].chunk_sectors = cs
+    md_arrays[idx].bitmap_on     = 0
+    md_arrays[idx].ppl_on        = 0
+    md_arrays[idx].ppl_slot      = -1
+    md_arrays[idx].ppl_head      = 0
+    md_arrays[idx].ppl_chunk     = cs
     # Capacity = data disks * per-member span = (N-1) * per_member.
     md_arrays[idx].capacity      = per_member * (n - 1)
     i = 0
@@ -1988,6 +2336,13 @@ _md_back_ops3:    BlockDeviceOps
 _md_back_ops4:    BlockDeviceOps
 _md_back_ops5:    BlockDeviceOps
 
+# Dedicated PPL journal backing ramdisk (registered as "mdjrnl0"). 256
+# sectors = 128 KiB, mirroring the mdback stores. The RAID5 PPL self-test
+# journals partial-parity entries here before the data/parity hit the
+# array, then replays them on recovery.
+_md_jrnl_store0:  Array[131072, uint8]   # 256 * 512
+_md_jrnl_ops0:    BlockDeviceOps
+
 # Self-test scratch buffers (all module-scope, sized for the largest single
 # transfer the test performs).
 _md_t_pat:    Array[1024, uint8]   # patterns written through an array
@@ -2097,6 +2452,20 @@ def _md_back5_write(priv: uint64, lba: uint64, count: uint64,
     return 0
 
 
+def _md_jrnl0_read(priv: uint64, lba: uint64, count: uint64,
+                   buf: Ptr[uint8]) -> int32:
+    src: uint64 = cast[uint64](&_md_jrnl_store0[0]) + lba * SECTOR_SIZE
+    memcpy(buf, cast[Ptr[uint8]](src), count * SECTOR_SIZE)
+    return 0
+
+
+def _md_jrnl0_write(priv: uint64, lba: uint64, count: uint64,
+                    buf: Ptr[uint8]) -> int32:
+    dst: uint64 = cast[uint64](&_md_jrnl_store0[0]) + lba * SECTOR_SIZE
+    memcpy(cast[Ptr[uint8]](dst), buf, count * SECTOR_SIZE)
+    return 0
+
+
 def _md_emerg0(s: Ptr[char]):
     printk_set_level(PRINTK_LEVEL_EMERG)
     printk0(s)
@@ -2171,6 +2540,30 @@ def _md_back_register(idx: uint64) -> int32:
     _md_back_ops5.write_sectors = _md_back5_write
     _md_back_ops5.flush         = cast[Fn[int32, uint64]](0)
     return register_blockdev(name, _MD_BACK_SECTORS, &_md_back_ops5, 0)
+
+
+def _md_jrnl_register() -> int32:
+    # Register the dedicated PPL journal ramdisk as "mdjrnl0". Returns the
+    # slot, or the existing slot if already registered. Zeroes the store on
+    # first registration so the journal starts empty.
+    nm: Array[16, uint8]
+    nm[0] = 0x6D   # 'm'
+    nm[1] = 0x64   # 'd'
+    nm[2] = 0x6A   # 'j'
+    nm[3] = 0x72   # 'r'
+    nm[4] = 0x6E   # 'n'
+    nm[5] = 0x6C   # 'l'
+    nm[6] = 0x30   # '0'
+    nm[7] = 0
+    name: Ptr[char] = cast[Ptr[char]](&nm[0])
+    existing: int32 = find_blockdev(name)
+    if existing >= 0:
+        return existing
+    _md_zero_store(cast[Ptr[uint8]](&_md_jrnl_store0[0]))
+    _md_jrnl_ops0.read_sectors  = _md_jrnl0_read
+    _md_jrnl_ops0.write_sectors = _md_jrnl0_write
+    _md_jrnl_ops0.flush         = cast[Fn[int32, uint64]](0)
+    return register_blockdev(name, _MD_BACK_SECTORS, &_md_jrnl_ops0, 0)
 
 
 def _md_buf_eq(a: Ptr[uint8], b: Ptr[uint8], n: uint64) -> int32:
@@ -2413,6 +2806,20 @@ def md_selftest() -> int32:
         ok = 0
 
     # ================================================================
+    # Test 4b: RAID5 PPL — Partial Parity Log closes the write hole. A torn
+    # write (data on disk, parity NOT yet, live journal entry) is repaired by
+    # md_ppl_recover so a subsequent DEGRADED read of an untouched chunk
+    # reconstructs the CORRECT value (and would be WRONG without recovery).
+    # ================================================================
+    bj: int32 = _md_jrnl_register()
+    if bj < 0:
+        _md_emerg0("[mdraid] FAIL: mdjrnl0 register\n")
+        ok = 0
+    else:
+        if _md_ppl_test(b0, b1, b2, bj) != 1:
+            ok = 0
+
+    # ================================================================
     # Test 5: RAID6 — dual-parity (P XOR + Q GF(2^8)) striping, two-fault
     # reconstruction (data+data, data+P, data+Q), RMW writes, rebuild.
     # ================================================================
@@ -2576,6 +2983,137 @@ def _md_raid5_test(b0: int32, b1: int32, b2: int32, b3: int32) -> int32:
 
     md_remove("md5")
     _md_emerg0("[md] raid5 PASS\n")
+    return 1
+
+
+# Scratch for the RAID5 PPL self-test. The test array uses chunk=4 sectors,
+# so a full chunk is 2 KiB; size every buffer to a FULL chunk (4 sectors =
+# 2048 bytes) so a chunk-wide read/write never overflows into the next
+# global (the BSS-overflow trap that previously broke RAID5). Module-scope.
+_md_ppl_baseA: Array[2048, uint8]   # baseline D0 (pat A), 4 sectors
+_md_ppl_baseB: Array[2048, uint8]   # baseline D1 (pat B), 4 sectors
+_md_ppl_newC:  Array[2048, uint8]   # torn-write new D0 (pat C), 4 sectors
+_md_ppl_rd:    Array[2048, uint8]   # degraded readback of the untouched chunk
+_md_slotsppl:  Array[8, int32]
+
+
+def _md_ppl_test(b0: int32, b1: int32, b2: int32, bj: int32) -> int32:
+    # RAID5 PPL write-hole closure, end-to-end. RAID5 over mdback0,1,2
+    # (chunk=4), journaling to mdjrnl0 (bj). Returns 1 PASS / 0 FAIL.
+    #
+    # Stripe-0 geometry (left-symmetric): pd=(N-1)-(0%N)=2 -> P on mdback2;
+    # D0 (didx0) on member (2+1)%3=0 (mdback0); D1 (didx1) on member
+    # (2+1+1)%3=1 (mdback1). vLBA 0..3 = D0, vLBA 4..7 = D1.
+    _md_emerg0("[mdraid] raid5 ppl: begin\n")
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store0[0]))
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store1[0]))
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store2[0]))
+    _md_zero_store(cast[Ptr[uint8]](&_md_jrnl_store0[0]))
+
+    _md_slotsppl[0] = b0
+    _md_slotsppl[1] = b1
+    _md_slotsppl[2] = b2
+    r5: int32 = md_create_raid5("md5p", &_md_slotsppl[0], 3, 4)
+    if r5 < 0:
+        _md_emerg1("[mdraid] FAIL: ppl md_create_raid5 rc=%d\n",
+                   cast[uint64](cast[int64](r5)))
+        return 0
+    if md_ppl_enable("md5p", bj) != 0:
+        _md_emerg0("[mdraid] FAIL: md_ppl_enable\n")
+        return 0
+    _md_emerg0("[mdraid] raid5 ppl: journal attached (mdjrnl0) OK\n")
+
+    # ---- Baseline: write D0=pat A (vLBA0..3) and D1=pat B (vLBA4..7) through
+    # the PPL array. These full RMW writes journal then RETIRE, so afterward
+    # the journal is empty and parity P = A XOR B is consistent. ----
+    _md_fill(cast[Ptr[uint8]](&_md_ppl_baseA[0]), 4 * SECTOR_SIZE, 311)
+    _md_fill(cast[Ptr[uint8]](&_md_ppl_baseB[0]), 4 * SECTOR_SIZE, 467)
+    if blk_write_sectors(r5, 0, 4, cast[Ptr[uint8]](&_md_ppl_baseA[0])) != 0:
+        _md_emerg0("[mdraid] FAIL: ppl baseline D0 write\n")
+        return 0
+    if blk_write_sectors(r5, 4, 4, cast[Ptr[uint8]](&_md_ppl_baseB[0])) != 0:
+        _md_emerg0("[mdraid] FAIL: ppl baseline D1 write\n")
+        return 0
+    # The journal must be RETIRED after the clean full writes.
+    dev: Ptr[MdArray] = _md_dev_by_name("md5p")
+    if cast[uint64](dev) == 0:
+        _md_emerg0("[mdraid] FAIL: ppl dev lookup\n")
+        return 0
+    if dev[0].ppl_head != 0:
+        _md_emerg0("[mdraid] FAIL: ppl journal not retired after clean write\n")
+        return 0
+    _md_emerg0("[mdraid] raid5 ppl: clean write retires journal OK\n")
+
+    # ---- TORN WRITE: overwrite D0 (vLBA0..3) with pat C but SIMULATE A CRASH
+    # between the data write and the parity write (tear=1). The new data C
+    # lands on mdback0; parity (mdback2) stays STALE at A^B; a live journal
+    # entry holds PP = old_P^old_D0 = (A^B)^A = B. ----
+    _md_fill(cast[Ptr[uint8]](&_md_ppl_newC[0]), 4 * SECTOR_SIZE, 829)
+    if _md_raid5_write_logged(dev, 0, 0, 0, 4,
+                              cast[Ptr[uint8]](&_md_ppl_newC[0]), 1) != 0:
+        _md_emerg0("[mdraid] FAIL: ppl torn write\n")
+        return 0
+    if dev[0].ppl_head != 1:
+        _md_emerg0("[mdraid] FAIL: ppl journal entry not present after tear\n")
+        return 0
+    # mdback0 (D0) must now physically hold the NEW pattern C (data write
+    # completed before the crash).
+    if blk_read_sectors(b0, 0, 4, cast[Ptr[uint8]](&_md_ppl_rd[0])) != 0:
+        _md_emerg0("[mdraid] FAIL: ppl raw read mdback0\n")
+        return 0
+    if _md_buf_eq(cast[Ptr[uint8]](&_md_ppl_newC[0]),
+                  cast[Ptr[uint8]](&_md_ppl_rd[0]), 4 * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdraid] FAIL: ppl torn data not on member\n")
+        return 0
+    _md_emerg0("[mdraid] raid5 ppl: torn write (data yes, parity no, journal entry) OK\n")
+
+    # ---- Fail D1 (mdback1) and wipe its backing so a degraded read of the
+    # UNTOUCHED chunk vLBA4..7 can ONLY come from XOR reconstruction
+    # (P XOR D0). ----
+    if md_fail_member("md5p", 1) != 0:
+        _md_emerg0("[mdraid] FAIL: ppl md_fail_member(1)\n")
+        return 0
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store1[0]))
+
+    # ---- WITHOUT RECOVERY: the degraded read reconstructs P^D0 =
+    # (A^B)^C != B, i.e. the WRONG value (the write hole). Prove it differs
+    # from the correct untouched pattern B. ----
+    if blk_read_sectors(r5, 4, 4, cast[Ptr[uint8]](&_md_ppl_rd[0])) != 0:
+        _md_emerg0("[mdraid] FAIL: ppl pre-recovery degraded read\n")
+        return 0
+    if _md_buf_eq(cast[Ptr[uint8]](&_md_ppl_rd[0]),
+                  cast[Ptr[uint8]](&_md_ppl_baseB[0]), 4 * SECTOR_SIZE) != 0:
+        _md_emerg0("[mdraid] FAIL: ppl write hole not reproduced (read already correct)\n")
+        return 0
+    _md_emerg0("[md] PASS raid5-ppl-writehole-reproduced\n")
+
+    # ---- RECOVERY: replay the journal. md_ppl_recover reads PP=B and the
+    # current D0=C off the array, recomputes new_P = PP^C = B^C, and writes
+    # it to the parity member (mdback2) — restoring parity consistent with
+    # the present data. ----
+    rep: int32 = md_ppl_recover("md5p")
+    if rep < 1:
+        _md_emerg1("[mdraid] FAIL: ppl recovery replayed=%d (want >=1)\n",
+                   cast[uint64](cast[int64](rep)))
+        return 0
+    if dev[0].ppl_head != 0:
+        _md_emerg0("[mdraid] FAIL: ppl journal not retired after recovery\n")
+        return 0
+    _md_emerg0("[md] PASS raid5-ppl-recover-replay\n")
+
+    # ---- AFTER RECOVERY: the degraded read of the untouched chunk
+    # reconstructs new_P^D0 = (B^C)^C = B — the CORRECT original value. ----
+    if blk_read_sectors(r5, 4, 4, cast[Ptr[uint8]](&_md_ppl_rd[0])) != 0:
+        _md_emerg0("[mdraid] FAIL: ppl post-recovery degraded read\n")
+        return 0
+    if _md_buf_eq(cast[Ptr[uint8]](&_md_ppl_rd[0]),
+                  cast[Ptr[uint8]](&_md_ppl_baseB[0]), 4 * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdraid] FAIL: ppl post-recovery degraded read wrong\n")
+        return 0
+    _md_emerg0("[md] PASS raid5-ppl-degraded-read-correct\n")
+
+    md_remove("md5p")
+    _md_emerg0("[md] raid5 ppl PASS\n")
     return 1
 
 

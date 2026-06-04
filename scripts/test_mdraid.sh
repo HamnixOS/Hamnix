@@ -114,6 +114,13 @@ check "raid5 degraded read"          "[md] PASS raid5-degraded-read"
 check "raid5 degraded write"         "[md] PASS raid5-degraded-write"
 check "raid5 rebuild"                "[md] PASS raid5-rebuild"
 check "raid5 PASS"                   "[md] raid5 PASS"
+check "raid5 ppl journal attached"   "[mdraid] raid5 ppl: journal attached (mdjrnl0) OK"
+check "raid5 ppl clean retire"       "[mdraid] raid5 ppl: clean write retires journal OK"
+check "raid5 ppl torn write"         "[mdraid] raid5 ppl: torn write (data yes, parity no, journal entry) OK"
+check "raid5 ppl write hole repro"   "[md] PASS raid5-ppl-writehole-reproduced"
+check "raid5 ppl recover replay"     "[md] PASS raid5-ppl-recover-replay"
+check "raid5 ppl degraded correct"   "[md] PASS raid5-ppl-degraded-read-correct"
+check "raid5 ppl PASS"               "[md] raid5 ppl PASS"
 check "raid6 GF field"               "[md] PASS raid6-gf"
 check "raid6 Q syndrome real"        "[mdraid] raid6: Q syndrome = g^0.D0 ^ g^1.D1 OK"
 check "raid6 P parity real"          "[mdraid] raid6: P parity = D0 ^ D1 OK"
@@ -140,4 +147,4 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
-echo "[test_mdraid] PASS — native software RAID: RAID0 stripe routing (with boundary-straddle split), RAID1 mirror fan-out + degraded survivor round-trip, RAID5 distributed-parity striping with XOR degraded-read reconstruction + RMW parity + member rebuild, RAID6 dual-parity (P XOR + Q GF(2^8)) striping with one- and two-fault reconstruction (data+data, data+P, data+Q), GF read-modify-write parity, and full member rebuild, and RAID10 near=2 striped mirrors (both copies verified per-member + degraded read/write via the surviving mirror), and a RAID1 WRITE-INTENT BITMAP (md internal bitmap) that marks only written regions dirty while a member is down and resyncs ONLY those dirty regions on re-add (fast partial resync) — leaving the array consistent and the bitmap clear — all verified"
+echo "[test_mdraid] PASS — native software RAID: RAID0 stripe routing (with boundary-straddle split), RAID1 mirror fan-out + degraded survivor round-trip, RAID5 distributed-parity striping with XOR degraded-read reconstruction + RMW parity + member rebuild, a RAID5 PARTIAL PARITY LOG (PPL) that closes the write hole — a torn write (data on disk, parity NOT yet written, live mdjrnl0 journal entry) is replayed by md_ppl_recover so a subsequent DEGRADED read of an untouched chunk reconstructs the CORRECT value (proven WRONG without recovery, CORRECT after) and the journal retires on clean writes — RAID6 dual-parity (P XOR + Q GF(2^8)) striping with one- and two-fault reconstruction (data+data, data+P, data+Q), GF read-modify-write parity, and full member rebuild, and RAID10 near=2 striped mirrors (both copies verified per-member + degraded read/write via the surviving mirror), and a RAID1 WRITE-INTENT BITMAP (md internal bitmap) that marks only written regions dirty while a member is down and resyncs ONLY those dirty regions on re-add (fast partial resync) — leaving the array consistent and the bitmap clear — all verified"
