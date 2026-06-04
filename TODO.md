@@ -307,7 +307,16 @@ STATUS.md). What remains, off the critical path and parallelisable:
 - [~] Multi-arch (ARM64) (#175): Adder aarch64 backend landed — both
   `aarch64-linux` (runnable Linux ELF) and `aarch64-bare-metal`
   (QEMU `virt` boot stub over PL011 UART). **Open**: full bare-metal
-  kernel port (Phase 3).
+  kernel port (Phase 3+).
+- [ ] **Arch convergence (tracked goal).** Today `arch/arm64/kmain.ad`
+  is a standalone single-file spine that proves primitives phase-by-phase
+  and does NOT link the mature x86 core (`sys/src/9/port/`, `kernel/`,
+  `mm/`, `fs/`, `net/`, `drivers/`). The endgame is to factor an
+  arch-interface (boot/MMU/trap/timer/IRQ/per-CPU/context-switch hooks)
+  and link the shared portable core into the ARM64 port — Linux's
+  one-core/per-arch-backend model. **Gating decision (user, 2026-06-03):
+  do this once the ARM64 bring-up is stable** — keep proving primitives
+  phase-by-phase first, then converge; do not converge prematurely.
 - [ ] **#186 Native packages go source-based (Gentoo-style).** Since the
   Adder compiler self-hosts on-box (#154), the **native** `hpm` repo
   becomes **source-primary + optional binary cache** (Gentoo source+binpkg
