@@ -2183,6 +2183,15 @@ def arm64_sync_handler(frame_ptr: Ptr[uint64]) -> int64:
             if arm64_p36_active != 0:
                 if arm64_p36_try_fault(esr) != 0:
                     return 0
+            # Phase 37: while the blocking-pipe IPC demo runs, a data abort is a
+            # first-touch TRANSLATION fault on a loaded segment page of WHICHEVER
+            # process (producer or consumer) is currently live (the loader pre-
+            # stamped each process's private segment L3 PTEs). arm64_p37_try_fault
+            # confirms the VA lies in a loaded segment of the live process, accounts
+            # it, flushes, and resumes (return 1).
+            if arm64_p37_active != 0:
+                if arm64_p37_try_fault(esr) != 0:
+                    return 0
             # Phase 16: while the mmap demo is live, a data abort might be a
             # demand fault inside a LIVE anonymous VMA (page it in + resume) or a
             # post-munmap touch of a now-dead VMA (fall through to the reaper,
@@ -2330,6 +2339,14 @@ def arm64_sync_handler(frame_ptr: Ptr[uint64]) -> int64:
     # per-program segment page-ins happen on the ABORT path (arm64_p36_try_fault).
     if arm64_p36_active != 0:
         return arm64_p36_dispatch(frame_ptr, nr, a0, a1, a2)
+
+    # Phase 37: while the blocking-pipe IPC demo is live (two on-disk EL0 processes
+    # running concurrently under the live timer scheduler), route every svc into
+    # the Phase-37 dispatcher (pipe_write / pipe_read / report / exit). pipe_read on
+    # an EMPTY pipe DESCHEDULES the caller (saves its resume ctx, marks it BLOCKED,
+    # parks its EL0 PC); pipe_write fills the ring and WAKES a blocked reader.
+    if arm64_p37_active != 0:
+        return arm64_p37_dispatch(frame_ptr, nr, a0, a1, a2)
 
     # Phase 23: while the TLS demo is live, route every svc into the Phase-23
     # dispatcher (settls / tick-report). SETTLS installs the running thread's
@@ -2919,6 +2936,14 @@ def arm64_sched_pick(cur_ctx: uint64) -> uint64:
     # the RUNNABLE tasks (skipping SLEEPING and EXITED/DEAD), swapping TTBR0+ASID.
     if arm64_p29_active != 0:
         return arm64_p29_sched_pick(cur_ctx)
+
+    # Phase 37: when the blocking-pipe IPC scheduler is live, feed preemptions to
+    # its picker — each tick it REAPS any process that called exit (EXITED -> DEAD),
+    # then round-robins the two processes, SKIPPING any process that is BLOCKED on
+    # an empty pipe (a blocked reader is woken only by a peer's pipe_write, never the
+    # timer), swapping TTBR0+ASID into the next runnable process's private space.
+    if arm64_p37_active != 0:
+        return arm64_p37_sched_pick(cur_ctx)
 
     if arm64_p28_active != 0:
         return arm64_p28_sched_pick(cur_ctx)
@@ -16007,6 +16032,14 @@ def arm64_p36_finish() -> int64:
         _uart_puts(rp)
         pp: Ptr[char] = "[arm64] Phase 36 PASS: multi-process FAT16 userland (INITA file round-trip + spawned CHILDB + reaped exit status + ordering)\n"
         _uart_puts(pp)
+        # Hand off to Phase 37 (a real BLOCKING in-kernel pipe between two on-disk
+        # EL0 processes) on the SAME live virtio-blk transport. arm64_p37_run never
+        # returns (its verdict halts after the pipe round-trip).
+        arm64_p37_run(arm64_p36_blk_base)
+        # Unreachable: arm64_p37_run halts. Safety loop.
+        _msr_daifset(2)
+        while True:
+            _wfi()
     else:
         fp: Ptr[char] = "[arm64] Phase 36 FAIL: multi-process userland workflow verdict failed\n"
         _uart_puts(fp)
@@ -16101,6 +16134,1162 @@ def arm64_p36_run(base: uint64) -> int64:
     _isb()
     _eret()                                      # -> EL0; INITA runs, drives the rest
     # Unreachable: INITA's exit() halts after the verdict.
+    while True:
+        _wfi()
+    return 0
+
+
+# ===========================================================================
+# Phase 37 — a REAL BLOCKING IN-KERNEL PIPE for IPC between TWO on-disk EL0
+# user processes running CONCURRENTLY under the live preemptive timer scheduler.
+#
+# Two on-disk ELF64 programs are loaded off the live FAT16 disk, each into its
+# OWN private ASID-tagged EL0 address space (reusing the Phase-36 segment-loader
+# shape, here built fresh for Phase 37 with distinct PA backing + ASIDs):
+#
+#   PRODA.ELF (producer, slot 0): writes a known PROD_LEN-byte sequence into the
+#     pipe with ONE pipe_write syscall, then exit()s.
+#   CONSB.ELF (consumer, slot 1): repeatedly pipe_read()s into its data segment.
+#     On an EMPTY pipe the read BLOCKS the consumer (it is descheduled — its full
+#     resume context is saved, it is marked BLOCKED, its EL0 PC is parked on a
+#     self-loop — so the scheduler runs the producer instead and NEVER dispatches
+#     the consumer again until it is woken). The producer's pipe_write fills the
+#     ring buffer AND wakes the blocked reader, physically delivering the queued
+#     bytes into the consumer's backing pages and setting its resumed read() return
+#     value. The consumer loops until it has all PROD_LEN bytes, then report()s the
+#     received bytes (the kernel cross-checks them byte-for-byte against the known
+#     sequence) and exit()s.
+#
+# This is a GENUINE blocking pipe, NOT a faked round-trip:
+#   * The pipe is a real ring buffer with head/tail indices + a byte count.
+#   * The consumer GENUINELY blocks (enters the BLOCKED state, is parked, and is
+#     skipped by the round-robin picker — arm64_p37_reader_blocked counts how many
+#     times it actually slept on the empty pipe; the verdict requires it be > 0).
+#   * The wake is driven by the WRITE, not the timer (arm64_p37_woken_by_write is
+#     set only inside pipe_write; the verdict requires it).
+#   * The bytes the consumer reports must equal the producer's known sequence
+#     byte-for-byte (kernel-verified), else FAIL.
+#
+# Both processes run preemptively: the EL1 generic-timer IRQ round-robins the two
+# slots' private (TTBR0+ASID) address spaces exactly like the Phase-28 blocking
+# scheduler, here extended with a pipe-blocked task state + an EXITED/reaped state.
+#
+# EL0 syscalls added/wired for Phase 37 (free numbers, documented here):
+#   SYS_P37_PIPE_WRITE (710): a0 = buf VA, a1 = len. Append `len` bytes from the
+#                             caller's buffer into the pipe ring; if a reader is
+#                             blocked, deliver queued bytes into its buffer + wake
+#                             it. Returns bytes accepted into the ring.
+#   SYS_P37_PIPE_READ  (711): a0 = buf VA, a1 = len. If the ring has bytes, copy up
+#                             to `len` out and return the count (>=1). If the ring
+#                             is EMPTY and the writer has not closed, BLOCK the
+#                             caller until a write wakes it (then it returns the
+#                             delivered count). Returns 0 only at clean EOF.
+#   SYS_P37_REPORT     (712): a0 = check-id, a1 = buf VA, a2 = len/value. The
+#                             consumer reports the bytes it received; the kernel
+#                             confirms they equal the known producer sequence.
+#   SYS_P37_EXIT       (713): a0 = status. Mark the caller EXITED (the scheduler
+#                             reaps it); when both processes are DEAD, run verdict.
+#
+# Fresh RAM regions (clear of every prior phase's blocks). EL1-only page tables +
+# context blocks live in free EL1 RAM above the Phase-28 scratch (<=0x401D_4000)
+# and below the EL0 window (0x4020_0000). Data PA backing lives above Phase 36's
+# top block (P36_PCTX at 0x454B_0000), starting at 0x4550_0000.
+# ===========================================================================
+
+# --- Phase-37 fresh RAM region (clear of P36 <=0x454B_xxxx) ----------------
+P37_FILE_PA: uint64 = 0x45500000             # raw on-disk ELF bytes (producer/consumer)
+P37_FILE_CAP: int64 = 8192                   # max ELF file bytes we read
+
+# Producer (PRODA.ELF) private EL0 space. Reuses Phase-36 program-A segment VAs
+# (valid EL0 VAs) but with distinct PA backing + page tables + ASID.
+P37A_TEXT_VA: uint64 = 0x42600000
+P37A_DATA_VA: uint64 = 0x42800000
+P37A_STACK_VA: uint64 = 0x42A00000
+P37A_TEXT_L2_INDEX: uint64 = 19              # (0x4260_0000 - 0x4000_0000) / 2 MiB
+P37A_DATA_L2_INDEX: uint64 = 20
+P37A_STACK_L2_INDEX: uint64 = 21
+P37A_STACK_TOP: uint64 = 0x42A01000
+P37A_ASID: uint64 = 26                       # distinct from every prior ASID
+
+# Consumer (CONSB.ELF) private EL0 space. DISTINCT segment VAs (a different 2 MiB
+# window) so the demand-fault handler attributes faults unambiguously.
+P37B_TEXT_VA: uint64 = 0x42C00000
+P37B_DATA_VA: uint64 = 0x42E00000
+P37B_STACK_VA: uint64 = 0x43000000
+P37B_TEXT_L2_INDEX: uint64 = 22              # (0x42C0_0000 - 0x4000_0000) / 2 MiB
+P37B_DATA_L2_INDEX: uint64 = 23
+P37B_STACK_L2_INDEX: uint64 = 24
+P37B_STACK_TOP: uint64 = 0x43001000
+P37B_ASID: uint64 = 27
+
+# Per-slot EL1-only page tables (L1/L2 + three L3) + context blocks, in free EL1
+# RAM above the Phase-28 scratch (P28 ends <=0x401D_4000) and below 0x4020_0000.
+P37A_L1: uint64 = 0x401D4000
+P37A_L2: uint64 = 0x401D5000
+P37A_TEXT_L3: uint64 = 0x401D6000
+P37A_DATA_L3: uint64 = 0x401D7000
+P37A_STACK_L3: uint64 = 0x401D8000
+P37B_L1: uint64 = 0x401D9000
+P37B_L2: uint64 = 0x401DA000
+P37B_TEXT_L3: uint64 = 0x401DB000
+P37B_DATA_L3: uint64 = 0x401DC000
+P37B_STACK_L3: uint64 = 0x401DD000
+P37A_CTX: uint64 = 0x401DE000                # 34 x 8-byte resume-context slots
+P37B_CTX: uint64 = 0x401DF000
+P37_PARK_CTX: uint64 = 0x401E0000            # throwaway ctx for a parked blocked task
+
+# Data PA backing for the two processes' segments + stacks.
+P37A_TEXT_PA: uint64 = 0x45520000
+P37A_DATA_PA: uint64 = 0x45530000
+P37A_STACK_PA: uint64 = 0x45540000
+P37B_TEXT_PA: uint64 = 0x45560000
+P37B_DATA_PA: uint64 = 0x45570000
+P37B_STACK_PA: uint64 = 0x45580000
+
+# W^X page permissions (identical encoding to Phase 36).
+P37_PAGE_RX: uint64 = 0x7C7
+P37_PAGE_RW: uint64 = 0x40000000000747
+P37_PAGE_RO: uint64 = 0x400000000007C7
+
+# Phase-37 EL0 syscall numbers (free; documented in the header above).
+SYS_P37_PIPE_WRITE: uint64 = 710
+SYS_P37_PIPE_READ: uint64 = 711
+SYS_P37_REPORT: uint64 = 712
+SYS_P37_EXIT: uint64 = 713
+
+# check-id for SYS_P37_REPORT.
+P37_CHK_PIPE: uint64 = 0                      # consumer reports the received bytes
+
+# Task-state model: reuse the Phase-28 numbering; BLOCKED = parked on the empty
+# pipe (woken only by a peer write); EXITED = called exit (scheduler reaps); DEAD
+# = reaped (never dispatched again).
+P37_RUNNABLE: int64 = 1
+P37_BLOCKED: int64 = 2
+P37_EXITED: int64 = 3
+P37_DEAD: int64 = 4
+
+# The known PROD_LEN-byte sequence the producer writes (position-coded so no big
+# inline table is needed). The kernel verifies the consumer received exactly this.
+P37_PROD_LEN: int64 = 24
+def arm64_p37_prod_byte(i: int64) -> uint8:
+    return cast[uint8]((0x21 + (i * 7)) & 0x7F)
+
+# Expected exit statuses (the verdict asserts these are observed).
+P37_PROD_EXIT: uint64 = 0x33                 # 51 — producer's exit status
+P37_CONS_EXIT: uint64 = 0x44                 # 68 — consumer's exit status
+
+# The pipe: a ring buffer with head (read cursor), tail (write cursor) and a live
+# byte count. Capacity is a power-of-two-free fixed size that holds the sequence.
+P37_PIPE_CAP: int64 = 64
+P37_PIPE_BUF_PA: uint64 = 0x45590000         # the ring buffer's backing page
+arm64_p37_pipe_head: int64 = 0               # next byte to read
+arm64_p37_pipe_tail: int64 = 0               # next slot to write
+arm64_p37_pipe_count: int64 = 0              # live bytes in the ring
+arm64_p37_pipe_writer_closed: int64 = 0      # producer finished writing (EOF)
+
+# --- Phase-37 bookkeeping --------------------------------------------------
+arm64_p37_active: int64 = 0
+arm64_p37_cur: int64 = 0                      # live slot (0 = producer, 1 = consumer)
+arm64_p37_tick: int64 = 0                     # logical scheduler tick
+arm64_p37_switches: int64 = 0                 # TTBR0+ASID swaps performed
+arm64_p37_reader_blocked: int64 = 0           # times the consumer slept on an empty pipe
+arm64_p37_woken_by_write: int64 = 0           # set when a write woke the blocked reader
+arm64_p37_bytes_written: int64 = 0            # total bytes the producer pushed
+arm64_p37_bytes_read: int64 = 0               # total bytes the consumer pulled
+arm64_p37_skips: int64 = 0                    # times the picker passed over a BLOCKED slot
+
+# Per-slot state.
+arm64_p37_state0: int64 = 0
+arm64_p37_state1: int64 = 0
+arm64_p37_exit0: uint64 = 0xFFFF
+arm64_p37_exit1: uint64 = 0xFFFF
+arm64_p37_a_text_faults: int64 = 0
+arm64_p37_a_data_faults: int64 = 0
+arm64_p37_b_text_faults: int64 = 0
+arm64_p37_b_data_faults: int64 = 0
+arm64_p37_blk_base: uint64 = 0
+
+# When the consumer blocks on an empty pipe, record its pending read request so a
+# later write can deliver bytes straight into the consumer's backing pages and set
+# its resumed read() return value.
+arm64_p37_pending_buf_va: uint64 = 0          # consumer's read buffer VA
+arm64_p37_pending_len: int64 = 0              # consumer's requested length
+
+# Verdict evidence.
+arm64_p37_rt_ok: int64 = 0                     # consumer's received bytes matched
+arm64_p37_prod_exited: int64 = 0
+arm64_p37_cons_exited: int64 = 0
+
+
+# ---- per-slot accessors (idx: 0 = producer, 1 = consumer) -----------------
+def arm64_p37_state_for(idx: int64) -> int64:
+    if idx == 0:
+        return arm64_p37_state0
+    return arm64_p37_state1
+
+def arm64_p37_set_state(idx: int64, st: int64) -> int64:
+    if idx == 0:
+        arm64_p37_state0 = st
+    else:
+        arm64_p37_state1 = st
+    return 0
+
+def arm64_p37_ctx_for(idx: int64) -> uint64:
+    if idx == 0:
+        return P37A_CTX
+    return P37B_CTX
+
+def arm64_p37_asid_for(idx: int64) -> uint64:
+    if idx == 0:
+        return P37A_ASID
+    return P37B_ASID
+
+def arm64_p37_l1_for(idx: int64) -> uint64:
+    if idx == 0:
+        return P37A_L1
+    return P37B_L1
+
+def arm64_p37_data_pa_for(idx: int64) -> uint64:
+    if idx == 0:
+        return P37A_DATA_PA
+    return P37B_DATA_PA
+
+def arm64_p37_data_va_for(idx: int64) -> uint64:
+    if idx == 0:
+        return P37A_DATA_VA
+    return P37B_DATA_VA
+
+
+# Translate a DATA-segment VA in slot `idx` to its physical backing address. The
+# data segment is one 2 MiB-mapped window (P37x_DATA_VA -> P37x_DATA_PA); a VA in
+# [data_va, data_va+page) maps to data_pa + (va - data_va). Returns 0 if the VA is
+# not inside the slot's data segment page.
+def arm64_p37_data_va_to_pa(idx: int64, va: uint64) -> uint64:
+    base_va: uint64 = arm64_p37_data_va_for(idx)
+    if va < base_va:
+        return cast[uint64](0)
+    off: uint64 = va - base_va
+    if off >= P26_PAGE_SIZE:
+        return cast[uint64](0)
+    return arm64_p37_data_pa_for(idx) + off
+
+
+# Build process `prog` (0=producer,1=consumer)'s fresh private EL0 address space
+# (L1/L2 + three 2 MiB slots redirected to private L3 tables) and wire its EL0
+# stack page RW. Mirrors arm64_p36_build_space but over the Phase-37 globals.
+def arm64_p37_build_space(prog: int64) -> int64:
+    l1_base: uint64 = P37A_L1
+    l2_base: uint64 = P37A_L2
+    text_l3: uint64 = P37A_TEXT_L3
+    data_l3: uint64 = P37A_DATA_L3
+    stack_l3: uint64 = P37A_STACK_L3
+    text_l2i: uint64 = P37A_TEXT_L2_INDEX
+    data_l2i: uint64 = P37A_DATA_L2_INDEX
+    stack_l2i: uint64 = P37A_STACK_L2_INDEX
+    stack_va: uint64 = P37A_STACK_VA
+    stack_pa: uint64 = P37A_STACK_PA
+    if prog == 1:
+        l1_base = P37B_L1
+        l2_base = P37B_L2
+        text_l3 = P37B_TEXT_L3
+        data_l3 = P37B_DATA_L3
+        stack_l3 = P37B_STACK_L3
+        text_l2i = P37B_TEXT_L2_INDEX
+        data_l2i = P37B_DATA_L2_INDEX
+        stack_l2i = P37B_STACK_L2_INDEX
+        stack_va = P37B_STACK_VA
+        stack_pa = P37B_STACK_PA
+
+    l1: Ptr[uint64] = cast[Ptr[uint64]](l1_base)
+    l2: Ptr[uint64] = cast[Ptr[uint64]](l2_base)
+
+    i: int64 = 0
+    while i < 512:
+        l1[i] = cast[uint64](0)
+        i = i + 1
+    l1[0] = cast[uint64](0) | DEV_FLAGS
+
+    tl3: Ptr[uint64] = cast[Ptr[uint64]](text_l3)
+    dl3: Ptr[uint64] = cast[Ptr[uint64]](data_l3)
+    sl3: Ptr[uint64] = cast[Ptr[uint64]](stack_l3)
+    k: int64 = 0
+    while k < 512:
+        tl3[k] = cast[uint64](0)
+        dl3[k] = cast[uint64](0)
+        sl3[k] = cast[uint64](0)
+        k = k + 1
+
+    j: int64 = 0
+    while j < 512:
+        blk_pa: uint64 = RAM_BASE + (cast[uint64](j) * L2_BLOCK_SIZE)
+        if cast[uint64](j) == text_l2i:
+            l2[j] = text_l3 | DESC_TABLE
+        elif cast[uint64](j) == data_l2i:
+            l2[j] = data_l3 | DESC_TABLE
+        elif cast[uint64](j) == stack_l2i:
+            l2[j] = stack_l3 | DESC_TABLE
+        else:
+            l2[j] = blk_pa | MEM_FLAGS
+        j = j + 1
+
+    l1[1] = l2_base | DESC_TABLE
+    _dsb_ish()
+
+    # Wire the EL0 stack page (RW non-exec).
+    sidx: uint64 = (stack_va >> cast[uint64](12)) & cast[uint64](0x1FF)
+    sl3[cast[int64](sidx)] = stack_pa | P37_PAGE_RW
+    sp: Ptr[uint64] = cast[Ptr[uint64]](stack_pa)
+    z: int64 = 0
+    while z < 512:
+        sp[z] = cast[uint64](0)
+        z = z + 1
+    _dsb_ish()
+    return 0
+
+
+# Map [seg_va, seg_va+filesz) onto seg_pa with page_flags in its 2 MiB slot's
+# private L3, copying p_filesz bytes from the Phase-37 ELF file buffer. The backing
+# page is pre-cleared (BSS reads zero). Identical shape to arm64_p36_map_segment.
+def arm64_p37_map_segment(seg_va: uint64, seg_pa: uint64, foff: uint64, filesz: uint64, l3_base: uint64, page_flags: uint64) -> int64:
+    pg: Ptr[uint8] = cast[Ptr[uint8]](seg_pa)
+    c: int64 = 0
+    while c < cast[int64](P26_PAGE_SIZE):
+        pg[c] = cast[uint8](0)
+        c = c + 1
+    fbuf: Ptr[uint8] = cast[Ptr[uint8]](P37_FILE_PA)
+    n: uint64 = cast[uint64](0)
+    while n < filesz:
+        pg[cast[int64](n)] = fbuf[cast[int64](foff + n)]
+        n = n + cast[uint64](1)
+    _dsb_ish()
+    l3: Ptr[uint64] = cast[Ptr[uint64]](l3_base)
+    idx: uint64 = (seg_va >> cast[uint64](12)) & cast[uint64](0x1FF)
+    l3[cast[int64](idx)] = seg_pa | page_flags
+    _dsb_ish()
+    _isb()
+    return 0
+
+
+# Little-endian readers out of the Phase-37 ELF file buffer.
+def _p37_rd16(off: uint64) -> uint64:
+    p: Ptr[uint8] = cast[Ptr[uint8]](P37_FILE_PA)
+    b0: uint64 = cast[uint64](p[cast[int64](off)])
+    b1: uint64 = cast[uint64](p[cast[int64](off + cast[uint64](1))])
+    return b0 | (b1 << cast[uint64](8))
+
+
+def _p37_rd32(off: uint64) -> uint64:
+    p: Ptr[uint8] = cast[Ptr[uint8]](P37_FILE_PA)
+    r: uint64 = cast[uint64](0)
+    i: int64 = 0
+    while i < 4:
+        r = r | (cast[uint64](p[cast[int64](off + cast[uint64](i))]) << cast[uint64](i * 8))
+        i = i + 1
+    return r
+
+
+def _p37_rd64(off: uint64) -> uint64:
+    p: Ptr[uint8] = cast[Ptr[uint8]](P37_FILE_PA)
+    r: uint64 = cast[uint64](0)
+    i: int64 = 0
+    while i < 8:
+        r = r | (cast[uint64](p[cast[int64](off + cast[uint64](i))]) << cast[uint64](i * 8))
+        i = i + 1
+    return r
+
+
+def arm64_p37_flags_for(pflags: uint64) -> uint64:
+    if (pflags & PF_W) != cast[uint64](0):
+        return P37_PAGE_RW
+    if (pflags & PF_X) != cast[uint64](0):
+        return P37_PAGE_RX
+    return P37_PAGE_RO
+
+
+# Read the on-disk ELF named by the 11-byte name at `name_pa` off the live FAT16
+# volume into P37_FILE_PA (following its cluster chain). Returns byte length, or
+# -1 on not-found / read error. Mirrors arm64_p36_read_elf over P37_FILE_PA.
+def arm64_p37_read_elf(base: uint64, name_pa: uint64) -> int64:
+    loc: int64 = arm64_p36_locate(base, name_pa)
+    if loc != 1:
+        return -1
+    first_clus: int64 = arm64_p36_loc_first_clus
+    file_size: int64 = arm64_p36_loc_size
+    if first_clus < 2:
+        return -1
+    sec_per_clus: int64 = arm64_p31_sec_per_clus
+    dst_off: int64 = 0
+    want_len: int64 = file_size
+    clus: int64 = first_clus
+    guard: int64 = 0
+    dst: Ptr[uint8] = cast[Ptr[uint8]](P37_FILE_PA)
+    src: Ptr[uint8] = cast[Ptr[uint8]](P31_SEC_PA)
+    while clus >= 2 and clus < 0xFFF8 and dst_off < want_len:
+        guard = guard + 1
+        if guard > 4096:
+            return -1
+        clus_lba: int64 = arm64_p31_data_lba + ((clus - 2) * sec_per_clus)
+        sc: int64 = 0
+        while sc < sec_per_clus:
+            if dst_off < want_len:
+                if arm64_p30_read_sector_into(base, cast[uint64](clus_lba + sc), P31_SEC_PA) != 1:
+                    return -1
+                take: int64 = arm64_p31_bytes_per_sec
+                if dst_off + take > want_len:
+                    take = want_len - dst_off
+                i: int64 = 0
+                while i < take:
+                    if dst_off < P37_FILE_CAP:
+                        dst[dst_off] = src[i]
+                        dst_off = dst_off + 1
+                    else:
+                        i = take
+                    i = i + 1
+            sc = sc + 1
+        nxt: int64 = arm64_p31_fat_next(base, clus)
+        if nxt < 0:
+            return -1
+        clus = nxt
+    return dst_off
+
+
+# Parse + load the on-disk ELF64 in P37_FILE_PA into process `prog`'s space. Same
+# validation/phdr walk as arm64_p36_load_elf. Returns e_entry, or 0 on failure.
+def arm64_p37_load_elf(prog: int64) -> uint64:
+    fbuf: Ptr[uint8] = cast[Ptr[uint8]](P37_FILE_PA)
+    nl: Ptr[char] = "\n"
+
+    if cast[uint64](fbuf[0]) != ELF_EI_MAG0:
+        return cast[uint64](0)
+    if cast[uint64](fbuf[1]) != ELF_EI_MAG1:
+        return cast[uint64](0)
+    if cast[uint64](fbuf[2]) != ELF_EI_MAG2:
+        return cast[uint64](0)
+    if cast[uint64](fbuf[3]) != ELF_EI_MAG3:
+        return cast[uint64](0)
+    if cast[uint64](fbuf[4]) != ELFCLASS64:
+        return cast[uint64](0)
+    if cast[uint64](fbuf[5]) != ELFDATA2LSB:
+        return cast[uint64](0)
+
+    e_type: uint64 = _p37_rd16(EH_TYPE)
+    e_machine: uint64 = _p37_rd16(EH_MACHINE)
+    e_entry: uint64 = _p37_rd64(EH_ENTRY)
+    e_phoff: uint64 = _p37_rd64(EH_PHOFF)
+    e_phentsize: uint64 = _p37_rd16(EH_PHENTSIZE)
+    e_phnum: uint64 = _p37_rd16(EH_PHNUM)
+
+    if e_type != ET_EXEC:
+        return cast[uint64](0)
+    if e_machine != EM_AARCH64:
+        return cast[uint64](0)
+
+    text_va: uint64 = P37A_TEXT_VA
+    data_va: uint64 = P37A_DATA_VA
+    text_pa: uint64 = P37A_TEXT_PA
+    data_pa: uint64 = P37A_DATA_PA
+    text_l3: uint64 = P37A_TEXT_L3
+    data_l3: uint64 = P37A_DATA_L3
+    if prog == 1:
+        text_va = P37B_TEXT_VA
+        data_va = P37B_DATA_VA
+        text_pa = P37B_TEXT_PA
+        data_pa = P37B_DATA_PA
+        text_l3 = P37B_TEXT_L3
+        data_l3 = P37B_DATA_L3
+
+    hm: Ptr[char] = "[arm64] Phase 37 ELF: prog="
+    _uart_puts(hm)
+    _uart_puthex(cast[uint64](prog))
+    hm2: Ptr[char] = " entry="
+    _uart_puts(hm2)
+    _uart_puthex(e_entry)
+    hm3: Ptr[char] = " phnum="
+    _uart_puts(hm3)
+    _uart_puthex(e_phnum)
+    _uart_puts(nl)
+
+    segs: int64 = 0
+    ph: uint64 = 0
+    while ph < e_phnum:
+        b: uint64 = e_phoff + (ph * e_phentsize)
+        p_type: uint64 = _p37_rd32(b + PH_TYPE)
+        if p_type == PT_LOAD:
+            p_flags: uint64 = _p37_rd32(b + PH_FLAGS)
+            p_offset: uint64 = _p37_rd64(b + PH_OFFSET)
+            p_vaddr: uint64 = _p37_rd64(b + PH_VADDR)
+            p_filesz: uint64 = _p37_rd64(b + PH_FILESZ)
+            page_flags: uint64 = arm64_p37_flags_for(p_flags)
+
+            seg_pa: uint64 = cast[uint64](0)
+            l3_base: uint64 = cast[uint64](0)
+            if p_vaddr == text_va:
+                seg_pa = text_pa
+                l3_base = text_l3
+            elif p_vaddr == data_va:
+                seg_pa = data_pa
+                l3_base = data_l3
+            else:
+                return cast[uint64](0)
+
+            arm64_p37_map_segment(p_vaddr, seg_pa, p_offset, p_filesz, l3_base, page_flags)
+            segs = segs + 1
+        ph = ph + cast[uint64](1)
+
+    if segs < 1:
+        return cast[uint64](0)
+    return e_entry
+
+
+# TTBR0_EL1 for process `prog`: its private L1 root + its ASID in bits[63:48].
+def arm64_p37_ttbr0_for(prog: int64) -> uint64:
+    if prog == 1:
+        return P37B_L1 | (P37B_ASID << P23_ASID_SHIFT)
+    return P37A_L1 | (P37A_ASID << P23_ASID_SHIFT)
+
+
+# Recycle process `prog`'s ASID and make its private TTBR0 live.
+def arm64_p37_switch_to(prog: int64) -> int64:
+    asid: uint64 = P37A_ASID
+    if prog == 1:
+        asid = P37B_ASID
+    _dsb_ish()
+    _tlbi_aside1is(asid << P23_ASID_SHIFT)
+    _dsb_ish()
+    _isb()
+    _msr_ttbr0_el1(arm64_p37_ttbr0_for(prog))
+    _dsb_ish()
+    _tlbi_aside1is(asid << P23_ASID_SHIFT)
+    _dsb_ish()
+    _isb()
+    return 0
+
+
+# Initialise process `prog`'s resume-context block for a clean first ERET into its
+# entry, on its own EL0 stack, in EL0t with IRQs UNMASKED (so the timer preempts).
+def arm64_p37_init_ctx(prog: int64, entry: uint64) -> int64:
+    ctx: Ptr[uint64] = cast[Ptr[uint64]](arm64_p37_ctx_for(prog))
+    i: int64 = 0
+    while i < 34:
+        ctx[i] = cast[uint64](0)
+        i = i + 1
+    stack_top: uint64 = P37A_STACK_TOP
+    if prog == 1:
+        stack_top = P37B_STACK_TOP
+    ctx[CTX_SP_EL0] = stack_top
+    ctx[CTX_ELR] = entry
+    ctx[CTX_SPSR] = SPSR_EL0T_IRQ
+    return 0
+
+
+# Phase-37 demand-fault entry. A first touch of a loaded segment page of the LIVE
+# process (producer or consumer) takes a translation fault (loader pre-stamped the
+# PTE). Confirm the VA lies in a loaded segment of the current process, account it,
+# flush the VA, and resume (return 1); anything else -> 0 (fall through to reaper).
+def arm64_p37_try_fault(esr: uint64) -> int64:
+    dfsc: uint64 = esr & ESR_DFSC_MASK
+    kind: uint64 = dfsc >> ESR_DFSC_KIND_SHIFT
+    if kind != ESR_DFSC_KIND_XLAT:
+        return 0
+    far: uint64 = cast[uint64](_mrs_far_el1())
+    page_va: uint64 = far & cast[uint64](0xFFFFFFFFFFFFF000)
+
+    in_seg: int64 = 0
+    if arm64_p37_cur == 0:
+        if page_va == P37A_TEXT_VA:
+            arm64_p37_a_text_faults = arm64_p37_a_text_faults + 1
+            in_seg = 1
+        elif page_va == P37A_DATA_VA:
+            arm64_p37_a_data_faults = arm64_p37_a_data_faults + 1
+            in_seg = 1
+    else:
+        if page_va == P37B_TEXT_VA:
+            arm64_p37_b_text_faults = arm64_p37_b_text_faults + 1
+            in_seg = 1
+        elif page_va == P37B_DATA_VA:
+            arm64_p37_b_data_faults = arm64_p37_b_data_faults + 1
+            in_seg = 1
+    if in_seg == 0:
+        return 0
+
+    _dsb_ish()
+    _tlbi_vaae1is(page_va >> cast[uint64](12))
+    _dsb_ish()
+    _isb()
+    return 1
+
+
+# ---- the ring-buffer pipe -------------------------------------------------
+# Push one byte into the ring. Returns 1 if accepted, 0 if the ring was full.
+def arm64_p37_ring_push(byte: uint8) -> int64:
+    if arm64_p37_pipe_count >= P37_PIPE_CAP:
+        return 0
+    rb: Ptr[uint8] = cast[Ptr[uint8]](P37_PIPE_BUF_PA)
+    rb[arm64_p37_pipe_tail] = byte
+    arm64_p37_pipe_tail = arm64_p37_pipe_tail + 1
+    if arm64_p37_pipe_tail >= P37_PIPE_CAP:
+        arm64_p37_pipe_tail = 0
+    arm64_p37_pipe_count = arm64_p37_pipe_count + 1
+    return 1
+
+
+# Pop one byte out of the ring into *out_pa. Returns 1 if a byte was popped, 0 if
+# the ring was empty.
+def arm64_p37_ring_pop(out_pa: uint64) -> int64:
+    if arm64_p37_pipe_count <= 0:
+        return 0
+    rb: Ptr[uint8] = cast[Ptr[uint8]](P37_PIPE_BUF_PA)
+    o: Ptr[uint8] = cast[Ptr[uint8]](out_pa)
+    o[0] = rb[arm64_p37_pipe_head]
+    arm64_p37_pipe_head = arm64_p37_pipe_head + 1
+    if arm64_p37_pipe_head >= P37_PIPE_CAP:
+        arm64_p37_pipe_head = 0
+    arm64_p37_pipe_count = arm64_p37_pipe_count - 1
+    return 1
+
+
+# Drain up to `len` bytes from the ring into the slot `idx` data-segment buffer at
+# VA `buf_va` (translated to its physical backing). Returns bytes delivered.
+def arm64_p37_drain_into(idx: int64, buf_va: uint64, len: int64) -> int64:
+    delivered: int64 = 0
+    one: uint64 = P37_PIPE_BUF_PA + cast[uint64](P37_PIPE_CAP)   # scratch byte slot
+    while delivered < len:
+        if arm64_p37_pipe_count <= 0:
+            delivered = delivered   # ring drained
+            return delivered
+        dst_pa: uint64 = arm64_p37_data_va_to_pa(idx, buf_va + cast[uint64](delivered))
+        if dst_pa == cast[uint64](0):
+            return delivered
+        if arm64_p37_ring_pop(one) != 1:
+            return delivered
+        sb: Ptr[uint8] = cast[Ptr[uint8]](one)
+        db: Ptr[uint8] = cast[Ptr[uint8]](dst_pa)
+        db[0] = sb[0]
+        delivered = delivered + 1
+    return delivered
+
+
+# pipe_write(buf_va, len): append `len` bytes from the CURRENT (producer's) buffer
+# into the ring. The producer is live, so buf_va resolves through the live TTBR0 —
+# we read it directly. After enqueuing, if the consumer is BLOCKED on an empty read
+# we deliver queued bytes straight into its backing pages, set its resumed read()
+# return value (x0) and WAKE it (BLOCKED -> RUNNABLE). Returns bytes accepted.
+def arm64_p37_do_pipe_write(buf_va: uint64, len: int64) -> int64:
+    src: Ptr[uint8] = cast[Ptr[uint8]](buf_va)
+    accepted: int64 = 0
+    i: int64 = 0
+    while i < len:
+        if arm64_p37_ring_push(src[i]) != 1:
+            i = len            # ring full; stop (the consumer will drain + this
+                               # producer would re-write — but the demo fits cap)
+        else:
+            accepted = accepted + 1
+            i = i + 1
+    arm64_p37_bytes_written = arm64_p37_bytes_written + accepted
+
+    wm: Ptr[char] = "[arm64] Phase 37: producer pipe_write "
+    _uart_puts(wm)
+    _uart_puthex(cast[uint64](accepted))
+    wm2: Ptr[char] = " bytes (ring count now "
+    _uart_puts(wm2)
+    _uart_puthex(cast[uint64](arm64_p37_pipe_count))
+    wm3: Ptr[char] = ")\n"
+    _uart_puts(wm3)
+
+    # If the consumer is blocked waiting on the pipe, deliver + wake it.
+    if arm64_p37_state_for(1) == P37_BLOCKED:
+        delivered: int64 = arm64_p37_drain_into(1, arm64_p37_pending_buf_va, arm64_p37_pending_len)
+        if delivered > 0:
+            arm64_p37_bytes_read = arm64_p37_bytes_read + delivered
+            cctx: Ptr[uint64] = cast[Ptr[uint64]](arm64_p37_ctx_for(1))
+            cctx[CTX_X0] = cast[uint64](delivered)   # the woken read() returns this
+            _dsb_ish()
+            arm64_p37_set_state(1, P37_RUNNABLE)
+            arm64_p37_woken_by_write = 1
+            km: Ptr[char] = "[arm64] Phase 37: write woke the BLOCKED consumer, delivered "
+            _uart_puts(km)
+            _uart_puthex(cast[uint64](delivered))
+            km2: Ptr[char] = " bytes -> RUNNABLE\n"
+            _uart_puts(km2)
+    return accepted
+
+
+# pipe_read(frame_ptr, buf_va, len): if the ring has bytes, drain up to `len` into
+# the caller's (consumer's) buffer and return the count (>=1). If the ring is EMPTY
+# and the writer has not closed, BLOCK the caller: save its full resume context,
+# record its pending read request, mark it BLOCKED, and park its EL0 PC on a self-
+# loop so the next timer tick runs the producer. The producer's write delivers the
+# bytes + wakes it. Returns 0 only at clean EOF (writer closed AND ring empty).
+def arm64_p37_do_pipe_read(frame_ptr: Ptr[uint64], buf_va: uint64, len: int64) -> int64:
+    if arm64_p37_pipe_count > 0:
+        got: int64 = arm64_p37_drain_into(1, buf_va, len)
+        arm64_p37_bytes_read = arm64_p37_bytes_read + got
+        frame_ptr[0] = cast[uint64](got)
+        return 0
+
+    if arm64_p37_pipe_writer_closed != 0:
+        frame_ptr[0] = cast[uint64](0)            # clean EOF
+        return 0
+
+    # Empty pipe, writer still open -> BLOCK the consumer (slot 1).
+    cur: int64 = arm64_p37_cur
+
+    # Save the caller's full resume context (so it RESUMES past the svc on wake).
+    ctx: Ptr[uint64] = cast[Ptr[uint64]](arm64_p37_ctx_for(cur))
+    i: int64 = 0
+    while i < 31:
+        ctx[i] = frame_ptr[i]                     # x0..x30 from the saved svc frame
+        i = i + 1
+    ctx[CTX_X0] = cast[uint64](0)                 # overwritten with the delivered count
+    ctx[CTX_SP_EL0] = cast[uint64](_mrs_sp_el0())
+    ctx[CTX_ELR] = cast[uint64](_mrs_elr_el1())   # resume PC = insn after the svc
+    ctx[CTX_SPSR] = SPSR_EL0T_IRQ                 # EL0t, IRQs on (re-preemptible)
+    _dsb_ish()
+
+    # Record the pending read request so a later write delivers straight into the
+    # consumer's backing pages.
+    arm64_p37_pending_buf_va = buf_va
+    arm64_p37_pending_len = len
+
+    arm64_p37_set_state(cur, P37_BLOCKED)
+    arm64_p37_reader_blocked = arm64_p37_reader_blocked + 1
+
+    bm: Ptr[char] = "[arm64] Phase 37: consumer pipe_read on EMPTY pipe -> BLOCKED (sleep #"
+    _uart_puts(bm)
+    _uart_puthex(cast[uint64](arm64_p37_reader_blocked))
+    bm2: Ptr[char] = ")\n"
+    _uart_puts(bm2)
+
+    # Park the blocked slot's LIVE EL0 PC on a self-loop word in its OWN executable
+    # TEXT page so the immediate svc-eret merely spins until the next timer tick
+    # preempts it (it makes NO observable progress). CRUCIAL: point arm64_current_ctx
+    # at the throwaway park ctx so the preempting IRQ spills the spin state THERE,
+    # not over the slot's real (just-saved) resume context.
+    park: uint64 = arm64_p37_park_addr(cur)
+    _msr_elr_el1(park)
+    _isb()
+    frame_ptr[0] = cast[uint64](0)
+    arm64_current_ctx = P37_PARK_CTX
+    return 0
+
+
+# Materialise a one-instruction self-loop (`b .`) at the end of slot `idx`'s TEXT
+# page (an executable EL0 page) and return its EL0 VA. Used to park a blocked
+# task's EL0 PC harmlessly until the next timer tick preempts it.
+def arm64_p37_park_addr(idx: int64) -> uint64:
+    text_pa: uint64 = P37A_TEXT_PA
+    text_va: uint64 = P37A_TEXT_VA
+    if idx == 1:
+        text_pa = P37B_TEXT_PA
+        text_va = P37B_TEXT_VA
+    off: uint64 = cast[uint64](0xFFC)              # last word of the text page
+    _emit_word(text_pa + off, cast[uint64](0x14000000))   # b . (self-loop)
+    _dsb_ish()
+    _isb()
+    return text_va + off
+
+
+# report(check-id, buf_va, len/value): the consumer reports the bytes it received
+# through the pipe; the kernel cross-checks them byte-for-byte against the known
+# producer sequence (so the consumer cannot fake a PASS). Returns 1 if they match.
+def arm64_p37_do_report(chk: uint64, buf_va: uint64, val: uint64) -> int64:
+    if chk == P37_CHK_PIPE:
+        if cast[int64](val) != P37_PROD_LEN:
+            return 0
+        ub: Ptr[uint8] = cast[Ptr[uint8]](buf_va)
+        ok: int64 = 1
+        i: int64 = 0
+        while i < P37_PROD_LEN:
+            if ub[i] != arm64_p37_prod_byte(i):
+                ok = 0
+            i = i + 1
+        if ok != 0:
+            arm64_p37_rt_ok = 1
+        return ok
+    return 0
+
+
+# exit(status): mark the caller EXITED (the scheduler reaps it). If the producer
+# exits, mark the pipe writer closed so a future empty read returns clean EOF.
+def arm64_p37_do_exit(frame_ptr: Ptr[uint64], status: uint64) -> int64:
+    cur: int64 = arm64_p37_cur
+    if cur == 0:
+        arm64_p37_exit0 = status
+        arm64_p37_prod_exited = 1
+        arm64_p37_pipe_writer_closed = 1
+    else:
+        arm64_p37_exit1 = status
+        arm64_p37_cons_exited = 1
+    arm64_p37_set_state(cur, P37_EXITED)
+
+    em: Ptr[char] = "[arm64] Phase 37: "
+    _uart_puts(em)
+    if cur == 0:
+        pn: Ptr[char] = "producer"
+        _uart_puts(pn)
+    else:
+        cn: Ptr[char] = "consumer"
+        _uart_puts(cn)
+    em2: Ptr[char] = " exit(status="
+    _uart_puts(em2)
+    _uart_puthex(status)
+    em3: Ptr[char] = ") -> EXITED\n"
+    _uart_puts(em3)
+
+    # Park the exiting task's EL0 PC on a self-loop so the immediate svc-eret spins
+    # until the next timer tick reaps it. Redirect arm64_current_ctx to the park
+    # ctx so the preempting IRQ does not clobber anything meaningful.
+    park: uint64 = arm64_p37_park_addr(cur)
+    _msr_elr_el1(park)
+    _isb()
+    frame_ptr[0] = cast[uint64](0)
+    arm64_current_ctx = P37_PARK_CTX
+    return 0
+
+
+# Phase-37 syscall dispatcher. Routed from arm64_sync_handler while the demo is
+# live. Services the blocking-pipe ABI (pipe_write / pipe_read / report / exit).
+def arm64_p37_dispatch(frame_ptr: Ptr[uint64], nr: uint64, a0: uint64, a1: uint64, a2: uint64) -> int64:
+    if nr == SYS_P37_PIPE_WRITE:
+        n: int64 = arm64_p37_do_pipe_write(a0, cast[int64](a1))
+        frame_ptr[0] = cast[uint64](n)
+        return 0
+    if nr == SYS_P37_PIPE_READ:
+        return arm64_p37_do_pipe_read(frame_ptr, a0, cast[int64](a1))
+    if nr == SYS_P37_REPORT:
+        r: int64 = arm64_p37_do_report(a0, a1, a2)
+        frame_ptr[0] = cast[uint64](r)
+        return 0
+    if nr == SYS_P37_EXIT:
+        return arm64_p37_do_exit(frame_ptr, a0)
+
+    um: Ptr[char] = "[arm64] EL0 unknown syscall (phase 37)\n"
+    _uart_puts(um)
+    frame_ptr[0] = cast[uint64](0)
+    return 0
+
+
+# Pick the next non-BLOCKED, non-DEAD slot after `from_idx`, round-robin over the
+# two slots. A BLOCKED slot is SKIPPED (tallied — proof the blocked reader is
+# genuinely passed over). Returns -1 if neither slot is runnable this tick.
+def arm64_p37_next_runnable(from_idx: int64) -> int64:
+    steps: int64 = 0
+    idx: int64 = from_idx
+    while steps < 2:
+        idx = idx + 1
+        if idx >= 2:
+            idx = 0
+        st: int64 = arm64_p37_state_for(idx)
+        if st == P37_RUNNABLE:
+            return idx
+        if st == P37_BLOCKED:
+            arm64_p37_skips = arm64_p37_skips + 1
+        steps = steps + 1
+    return -1
+
+
+# Reap any EXITED slot (EXITED -> DEAD). Returns the number of slots reaped.
+def arm64_p37_reap() -> int64:
+    reaped: int64 = 0
+    idx: int64 = 0
+    while idx < 2:
+        if arm64_p37_state_for(idx) == P37_EXITED:
+            arm64_p37_set_state(idx, P37_DEAD)
+            reaped = reaped + 1
+        idx = idx + 1
+    return reaped
+
+
+# Phase-37 timer-IRQ scheduler. Ack/re-arm the timer, EOI, advance the logical
+# tick, REAP any EXITED slot, and if both processes are DEAD run the verdict. A
+# BLOCKED reader is NEVER woken here (only a peer write wakes it) — it is skipped.
+# Round-robin to the next runnable slot, swap TTBR0+ASID into it, return its ctx.
+def arm64_p37_sched_pick(cur_ctx: uint64) -> uint64:
+    gicc_iar: Ptr[uint32] = cast[Ptr[uint32]](GICC_BASE + GICC_IAR)
+    gicc_eoir: Ptr[uint32] = cast[Ptr[uint32]](GICC_BASE + GICC_EOIR)
+
+    iar: uint32 = gicc_iar[0]
+    intid: uint64 = cast[uint64](iar) & cast[uint64](0x3FF)
+
+    if intid != VTIMER_INTID:
+        gicc_eoir[0] = iar                  # spurious: EOI, stay on this slot
+        return cur_ctx
+
+    _msr_cntv_ctl_el0(cast[uint64](0))
+    _msr_cntv_tval_el0(arm64_timer_period)
+    _msr_cntv_ctl_el0(cast[uint64](1))
+    gicc_eoir[0] = iar
+
+    arm64_p37_tick = arm64_p37_tick + 1
+
+    # Reap any process that called exit (EXITED -> DEAD).
+    arm64_p37_reap()
+
+    # Both processes done -> verdict.
+    if arm64_p37_state_for(0) == P37_DEAD:
+        if arm64_p37_state_for(1) == P37_DEAD:
+            arm64_p37_finish()
+            while True:
+                _wfi()
+
+    # Safety: a runaway tick budget ends the demo (prevents an infinite boot if a
+    # logic bug ever leaves both processes wedged). Generous so the real workload
+    # always completes first.
+    if arm64_p37_tick >= 4000:
+        arm64_p37_finish()
+        while True:
+            _wfi()
+
+    nxt: int64 = arm64_p37_next_runnable(arm64_p37_cur)
+    if nxt < 0:
+        # No runnable slot this tick (e.g. the consumer is BLOCKED and the producer
+        # has already exited+been reaped — shouldn't persist; the next tick's reap/
+        # verdict resolves it). Stay on the current parked ctx and idle.
+        return cur_ctx
+
+    arm64_p37_switches = arm64_p37_switches + 1
+    arm64_p37_cur = nxt
+    arm64_p37_switch_to(nxt)
+    next_ctx: uint64 = arm64_p37_ctx_for(nxt)
+    arm64_current_ctx = next_ctx
+    return next_ctx
+
+
+# Phase-37 verdict. PASS iff: the consumer GENUINELY blocked on the empty pipe at
+# least once; the wake was driven by the producer's WRITE (not the timer); the
+# producer wrote and the consumer read the full known sequence; the consumer's
+# received bytes matched byte-for-byte (kernel-verified); the picker skipped the
+# blocked reader at least once; and both processes exited with their expected
+# statuses. Prints the summary + PASS marker, then halts (last phase).
+def arm64_p37_finish() -> int64:
+    arm64_p37_active = 0
+    nl: Ptr[char] = "\n"
+
+    sm: Ptr[char] = "[arm64] Phase 37 summary: bytes_written="
+    _uart_puts(sm)
+    _uart_puthex(cast[uint64](arm64_p37_bytes_written))
+    s1: Ptr[char] = " bytes_read="
+    _uart_puts(s1)
+    _uart_puthex(cast[uint64](arm64_p37_bytes_read))
+    s2: Ptr[char] = " reader_blocked="
+    _uart_puts(s2)
+    _uart_puthex(cast[uint64](arm64_p37_reader_blocked))
+    s3: Ptr[char] = " woken_by_write="
+    _uart_puts(s3)
+    _uart_puthex(cast[uint64](arm64_p37_woken_by_write))
+    s4: Ptr[char] = " skips="
+    _uart_puts(s4)
+    _uart_puthex(cast[uint64](arm64_p37_skips))
+    s5: Ptr[char] = " switches="
+    _uart_puts(s5)
+    _uart_puthex(cast[uint64](arm64_p37_switches))
+    s6: Ptr[char] = " rt_ok="
+    _uart_puts(s6)
+    _uart_puthex(cast[uint64](arm64_p37_rt_ok))
+    s7: Ptr[char] = " prod_exit="
+    _uart_puts(s7)
+    _uart_puthex(arm64_p37_exit0)
+    s8: Ptr[char] = " cons_exit="
+    _uart_puts(s8)
+    _uart_puthex(arm64_p37_exit1)
+    _uart_puts(nl)
+
+    ok: int64 = 1
+    # The consumer genuinely blocked on the empty pipe at least once.
+    if arm64_p37_reader_blocked < 1:
+        ok = 0
+    # The wake was driven by the producer's write, not the timer.
+    if arm64_p37_woken_by_write == 0:
+        ok = 0
+    # The full known sequence round-tripped through the pipe.
+    if arm64_p37_bytes_written != P37_PROD_LEN:
+        ok = 0
+    if arm64_p37_bytes_read != P37_PROD_LEN:
+        ok = 0
+    # The consumer's received bytes matched the producer's known sequence.
+    if arm64_p37_rt_ok == 0:
+        ok = 0
+    # Both processes exited with their expected statuses.
+    if arm64_p37_prod_exited == 0:
+        ok = 0
+    if arm64_p37_cons_exited == 0:
+        ok = 0
+    if arm64_p37_exit0 != P37_PROD_EXIT:
+        ok = 0
+    if arm64_p37_exit1 != P37_CONS_EXIT:
+        ok = 0
+    # No process left wedged BLOCKED at the verdict.
+    if arm64_p37_state_for(1) == P37_BLOCKED:
+        ok = 0
+
+    if ok != 0:
+        rp: Ptr[char] = "[arm64] Phase 37: a real in-kernel ring-buffer pipe carried a known byte sequence between TWO on-disk EL0 processes running concurrently under the preemptive timer scheduler; the consumer genuinely BLOCKED on the empty pipe (descheduled + skipped by the picker) and was woken by the producer's write, then received the sequence byte-for-byte\n"
+        _uart_puts(rp)
+        pp: Ptr[char] = "[arm64] Phase 37 PASS: pipe IPC blocking round-trip (consumer blocked on empty pipe, woken by producer write, received the known 24-byte sequence byte-identically)\n"
+        _uart_puts(pp)
+    else:
+        fp: Ptr[char] = "[arm64] Phase 37 FAIL: blocking-pipe IPC verdict failed\n"
+        _uart_puts(fp)
+
+    _msr_daifset(2)
+    while True:
+        _wfi()
+    return 0
+
+
+# Phase-37 entry point (hand-off from arm64_p36_finish on a Phase-36 PASS), with
+# the live virtio-blk transport `base`. Read PRODA.ELF + CONSB.ELF off the FAT16
+# disk, build each process's fresh private EL0 space, load each ELF, init both
+# resume contexts, mark both RUNNABLE, then ERET into the producer at EL0t with the
+# timer LIVE and IRQs UNMASKED so the timer preempts and both processes run
+# concurrently. The consumer blocks on the empty pipe; the producer's write wakes
+# it. Never returns (halts at the verdict).
+def arm64_p37_run(base: uint64) -> int64:
+    intro: Ptr[char] = "[arm64] Phase 37: blocking in-kernel pipe IPC (two on-disk EL0 processes: PRODA + CONSB)\n"
+    _uart_puts(intro)
+    nl: Ptr[char] = "\n"
+
+    _msr_daifset(2)                              # mask EL1 IRQs while we build
+    arm64_p37_blk_base = base
+    arm64_p37_cur = 0
+
+    # Reset the pipe + bookkeeping.
+    arm64_p37_pipe_head = 0
+    arm64_p37_pipe_tail = 0
+    arm64_p37_pipe_count = 0
+    arm64_p37_pipe_writer_closed = 0
+    rb: Ptr[uint8] = cast[Ptr[uint8]](P37_PIPE_BUF_PA)
+    z: int64 = 0
+    while z < (P37_PIPE_CAP + 1):
+        rb[z] = cast[uint8](0)
+        z = z + 1
+
+    # Re-parse the FAT16 BPB off sector 0 (fills arm64_p31_* geometry globals).
+    if arm64_p30_read_sector_into(base, cast[uint64](0), P31_SEC_PA) != 1:
+        fp: Ptr[char] = "[arm64] Phase 37 FAIL: boot-sector read failed\n"
+        _uart_puts(fp)
+        _msr_daifset(2)
+        while True:
+            _wfi()
+        return 0
+    if arm64_p31_parse_bpb() != 1:
+        fp2: Ptr[char] = "[arm64] Phase 37 FAIL: BPB geometry not a supported FAT16\n"
+        _uart_puts(fp2)
+        _msr_daifset(2)
+        while True:
+            _wfi()
+        return 0
+
+    # Build + load the PRODUCER (PRODA.ELF, slot 0).
+    nm: uint64 = P31_FILE_PA
+    np: Ptr[uint8] = cast[Ptr[uint8]](nm)
+    # "PRODA   ELF"
+    np[0] = cast[uint8](0x50)    # P
+    np[1] = cast[uint8](0x52)    # R
+    np[2] = cast[uint8](0x4F)    # O
+    np[3] = cast[uint8](0x44)    # D
+    np[4] = cast[uint8](0x41)    # A
+    np[5] = cast[uint8](0x20)
+    np[6] = cast[uint8](0x20)
+    np[7] = cast[uint8](0x20)
+    np[8] = cast[uint8](0x45)    # E
+    np[9] = cast[uint8](0x4C)    # L
+    np[10] = cast[uint8](0x46)   # F
+    flen: int64 = arm64_p37_read_elf(base, nm)
+    if flen <= 0:
+        fp3: Ptr[char] = "[arm64] Phase 37 FAIL: could not read PRODA.ELF off the FAT16 disk\n"
+        _uart_puts(fp3)
+        _msr_daifset(2)
+        while True:
+            _wfi()
+        return 0
+    rm: Ptr[char] = "[arm64] Phase 37: read PRODA.ELF off disk ("
+    _uart_puts(rm)
+    _uart_puthex(cast[uint64](flen))
+    rm2: Ptr[char] = " bytes); building producer EL0 space\n"
+    _uart_puts(rm2)
+    arm64_p37_build_space(0)
+    arm64_p37_switch_to(0)
+    entry_a: uint64 = arm64_p37_load_elf(0)
+    if entry_a == cast[uint64](0):
+        fp4: Ptr[char] = "[arm64] Phase 37 FAIL: PRODA.ELF failed header/phdr validation\n"
+        _uart_puts(fp4)
+        _msr_daifset(2)
+        while True:
+            _wfi()
+        return 0
+    arm64_p37_init_ctx(0, entry_a)
+    arm64_p37_set_state(0, P37_RUNNABLE)
+
+    # Build + load the CONSUMER (CONSB.ELF, slot 1).
+    np[0] = cast[uint8](0x43)    # C
+    np[1] = cast[uint8](0x4F)    # O
+    np[2] = cast[uint8](0x4E)    # N
+    np[3] = cast[uint8](0x53)    # S
+    np[4] = cast[uint8](0x42)    # B
+    np[5] = cast[uint8](0x20)
+    np[6] = cast[uint8](0x20)
+    np[7] = cast[uint8](0x20)
+    np[8] = cast[uint8](0x45)    # E
+    np[9] = cast[uint8](0x4C)    # L
+    np[10] = cast[uint8](0x46)   # F
+    flen2: int64 = arm64_p37_read_elf(base, nm)
+    if flen2 <= 0:
+        fp5: Ptr[char] = "[arm64] Phase 37 FAIL: could not read CONSB.ELF off the FAT16 disk\n"
+        _uart_puts(fp5)
+        _msr_daifset(2)
+        while True:
+            _wfi()
+        return 0
+    rm3: Ptr[char] = "[arm64] Phase 37: read CONSB.ELF off disk ("
+    _uart_puts(rm3)
+    _uart_puthex(cast[uint64](flen2))
+    rm4: Ptr[char] = " bytes); building consumer EL0 space\n"
+    _uart_puts(rm4)
+    arm64_p37_build_space(1)
+    arm64_p37_switch_to(1)
+    entry_b: uint64 = arm64_p37_load_elf(1)
+    if entry_b == cast[uint64](0):
+        fp6: Ptr[char] = "[arm64] Phase 37 FAIL: CONSB.ELF failed header/phdr validation\n"
+        _uart_puts(fp6)
+        _msr_daifset(2)
+        while True:
+            _wfi()
+        return 0
+    arm64_p37_init_ctx(1, entry_b)
+    arm64_p37_set_state(1, P37_RUNNABLE)
+
+    arm64_p37_active = 1
+
+    em: Ptr[char] = "[arm64] Phase 37: launching producer PRODA (ASID 26) + consumer CONSB (ASID 27) concurrently under the timer; entry_a="
+    _uart_puts(em)
+    _uart_puthex(entry_a)
+    em2: Ptr[char] = " entry_b="
+    _uart_puts(em2)
+    _uart_puthex(entry_b)
+    _uart_puts(nl)
+
+    # Start the CONSUMER (slot 1) running FIRST so it reaches its pipe_read on the
+    # still-EMPTY pipe and GENUINELY BLOCKS before the producer ever writes — a
+    # deterministic blocking ordering. The blocked consumer is then descheduled and
+    # the round-robin picker dispatches the producer, whose pipe_write fills the ring
+    # and wakes the consumer. ERET with IRQs UNMASKED so the timer round-robins both.
+    arm64_p37_cur = 1
+    arm64_p37_switch_to(1)
+    ctx: Ptr[uint64] = cast[Ptr[uint64]](arm64_p37_ctx_for(1))
+    arm64_current_ctx = arm64_p37_ctx_for(1)
+    # Re-arm the timer but keep EL1 IRQs MASKED until the ERET. The consumer's ctx
+    # SPSR (SPSR_EL0T_IRQ) has IRQs UNMASKED, so the ERET atomically drops to EL0
+    # with the timer live; any pending tick fires in EL0 (-> arm64_sched_pick), NOT
+    # in EL1 (which would hit the Phase-3 handler and restart the phase sequence).
+    _msr_cntv_tval_el0(arm64_timer_period)
+    _msr_cntv_ctl_el0(cast[uint64](1))
+    _msr_spsr_el1(ctx[CTX_SPSR])
+    _msr_elr_el1(ctx[CTX_ELR])
+    _msr_sp_el0(ctx[CTX_SP_EL0])
+    _isb()
+    _eret()                                      # -> EL0; both processes run
+    # Unreachable: the verdict halts.
     while True:
         _wfi()
     return 0
