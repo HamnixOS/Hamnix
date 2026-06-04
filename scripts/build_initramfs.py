@@ -2296,6 +2296,19 @@ if os.environ.get("ENABLE_VLAN_TEST") == "1":
 if os.environ.get("ENABLE_GENEVE_TEST") == "1":
     FILES.append(("/etc/geneve-test", b"1\n"))
 
+# Native L2TPv3 (RFC 3931) Ethernet-pseudowire encap/decap self-test.
+# scripts/test_l2tp.sh sets ENABLE_L2TP_TEST=1 to plant /etc/l2tp-test;
+# init/main.ad's boot:37.l2tp gate then runs l2tp_selftest()
+# (drivers/net/l2tp.ad), a pure in-memory test that builds a known inner
+# Ethernet frame and ENCAPs it as Eth|IP|UDP:1701|L2TPv3(SessionID[+Cookie]+
+# L2-sublayer)|inner across two sessions (one cookie-less, one with a 64-bit
+# cookie), DECAPs each demuxing on Session ID + cookie, and verifies the inner
+# frame + Session ID + cookie + sequence number round-trip byte-identical
+# while rejecting a wrong cookie / unknown session. Prints "[l2tp] PASS" /
+# "[l2tp] FAIL". Default boots ship no marker.
+if os.environ.get("ENABLE_L2TP_TEST") == "1":
+    FILES.append(("/etc/l2tp-test", b"1\n"))
+
 # Native link aggregation (bonding) self-test. scripts/test_bond.sh sets
 # ENABLE_BOND_TEST=1 to plant /etc/bond-test; init/main.ad's boot:37.bond
 # gate then runs bond_selftest() (drivers/net/bond.ad), a pure in-memory test

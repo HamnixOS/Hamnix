@@ -1,0 +1,772 @@
+# drivers/net/l2tp.ad
+#
+# L2TPv3 — Layer 2 Tunneling Protocol Version 3 (RFC 3931), data plane. Like
+# GENEVE/VXLAN, an L2-over-L3 overlay: a complete inner Ethernet frame is
+# carried inside UDP/IPv4 (L2TPv3-over-UDP, the standard NAT-friendly
+# encapsulation) as an Ethernet PSEUDOWIRE. Unlike VXLAN/GENEVE, L2TPv3
+# demultiplexes by a 32-bit SESSION ID rather than a 24-bit VNI, and each
+# session may carry an OPTIONAL 64-bit COOKIE (a negotiated, randomly-chosen
+# value the receiver matches to filter spoofed/mis-delivered packets). This
+# driver implements the real data-message encap/decap with per-session cookie
+# demux, both cookie-present and cookie-absent.
+#
+# Outer frame layout (this is what ENCAP produces and DECAP consumes):
+#
+#   +----------------------------------------------------------+
+#   | Outer Ethernet (14)  dst MAC | src MAC | ethertype=0x0800 |
+#   +----------------------------------------------------------+
+#   | Outer IPv4 (20)      proto=17 (UDP), correct len + csum   |
+#   +----------------------------------------------------------+
+#   | Outer UDP (8)        dport=1701, len, checksum            |
+#   +----------------------------------------------------------+
+#   | L2TPv3 Session ID (4)     32-bit, NON-zero for data msgs  |
+#   +----------------------------------------------------------+
+#   | L2TPv3 Cookie (0 or 8)    optional 64-bit, per-session    |
+#   +----------------------------------------------------------+
+#   | Default L2-specific sublayer (4)   S bit + 24-bit seq#    |
+#   +----------------------------------------------------------+
+#   | Inner Ethernet frame (the original L2 frame, byte-exact)  |
+#   +----------------------------------------------------------+
+#
+# L2TPv3-over-UDP data message header (RFC 3931 §4.1.2.1 / §3.2.2). On UDP, an
+# L2TP data message begins with the 32-bit Session ID. A Session ID of 0 marks
+# a control message; data messages use the non-zero session value negotiated
+# at session establishment. The optional Cookie (0, 4, or 8 octets — this
+# driver implements the 0 and 8 cases) immediately follows the Session ID.
+#
+#    0                   1                   2                   3
+#    0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+#   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+#   |                          Session ID                           |
+#   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+#   |                    Cookie (optional, 0/4/8 octets)            |
+#   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+#
+# Default L2-specific sublayer (RFC 3931 §4.6) — for the Ethernet pseudowire
+# the default sublayer is 32 bits:
+#
+#    0                   1                   2                   3
+#    0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+#   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+#   |x|S|x|x|x|x|x|x|              Sequence Number                  |
+#   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+#
+#   Bit 1 (0x40 of byte 0): S — when set, the 24-bit Sequence Number is valid.
+#   Bytes 1..3: 24-bit Sequence Number.
+#
+# We reuse the native stack's framing primitives rather than reinvent them:
+# ip_csum16 (drivers/net/ip.ad) is the RFC-1071 ones'-complement Internet
+# checksum used for both the IPv4 header checksum and the UDP checksum (over a
+# pseudo-header). The on-wire byte offsets here match IpHdr / UdpHdr / EthHdr
+# exactly.
+
+from kernel.printk.printk import printk0, printk1, printk2, printk_set_level
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
+from drivers.net.ip import ip_csum16, IP_HDR_LEN, IPPROTO_UDP, IP_TTL
+from drivers.net.eth import ETH_HDR_LEN, ETH_P_IP
+from drivers.net.udp import UDP_HDR_LEN
+
+
+# --- Wire constants ----------------------------------------------------
+
+# IANA-assigned L2TP UDP destination port (RFC 3931 §4.1.2 — port 1701).
+L2TP_UDP_PORT: uint16 = 1701
+
+# L2TPv3 data-message field sizes (bytes on the wire).
+L2TP_SID_LEN:     uint64 = 4      # 32-bit Session ID
+L2TP_COOKIE_LEN:  uint64 = 8      # 64-bit Cookie (when present)
+L2TP_SUBLAYER_LEN: uint64 = 4     # default L2-specific sublayer (S + seq#)
+
+# Default-L2-sublayer flags (byte 0 of the 4-byte sublayer).
+L2TP_S_BIT: uint8 = 0x40          # Sequence Number present/valid
+
+# Outer overhead BEFORE the L2TPv3 session header begins:
+# eth(14) + ip(20) + udp(8) = 42. The L2TPv3 header (SID [+cookie] + sublayer)
+# follows, then the inner frame.
+L2TP_OUTER_OVERHEAD: uint64 = 42
+
+
+# Counters (mirror the /sys-visible accounting a real l2tp netdev keeps).
+l2tp_tx_encaps: uint64 = 0
+l2tp_rx_decaps: uint64 = 0
+l2tp_rx_drops:  uint64 = 0
+
+
+# =====================================================================
+# Big-endian field writers / readers
+# =====================================================================
+
+def _l2t_put16(buf: Ptr[uint8], off: uint64, v: uint16):
+    buf[off]     = cast[uint8]((cast[uint32](v) >> 8) & 0xFF)
+    buf[off + 1] = cast[uint8](cast[uint32](v) & 0xFF)
+
+
+def _l2t_get16(buf: Ptr[uint8], off: uint64) -> uint16:
+    hi: uint16 = cast[uint16](buf[off]) << 8
+    lo: uint16 = cast[uint16](buf[off + 1])
+    return hi | lo
+
+
+def _l2t_put32(buf: Ptr[uint8], off: uint64, v: uint32):
+    buf[off]     = cast[uint8]((v >> 24) & 0xFF)
+    buf[off + 1] = cast[uint8]((v >> 16) & 0xFF)
+    buf[off + 2] = cast[uint8]((v >> 8) & 0xFF)
+    buf[off + 3] = cast[uint8](v & 0xFF)
+
+
+def _l2t_get32(buf: Ptr[uint8], off: uint64) -> uint32:
+    r: uint32 = cast[uint32](buf[off]) << 24
+    r = r | (cast[uint32](buf[off + 1]) << 16)
+    r = r | (cast[uint32](buf[off + 2]) << 8)
+    r = r | cast[uint32](buf[off + 3])
+    return r
+
+
+def _l2t_put64(buf: Ptr[uint8], off: uint64, v: uint64):
+    buf[off]     = cast[uint8]((v >> 56) & 0xFF)
+    buf[off + 1] = cast[uint8]((v >> 48) & 0xFF)
+    buf[off + 2] = cast[uint8]((v >> 40) & 0xFF)
+    buf[off + 3] = cast[uint8]((v >> 32) & 0xFF)
+    buf[off + 4] = cast[uint8]((v >> 24) & 0xFF)
+    buf[off + 5] = cast[uint8]((v >> 16) & 0xFF)
+    buf[off + 6] = cast[uint8]((v >> 8) & 0xFF)
+    buf[off + 7] = cast[uint8](v & 0xFF)
+
+
+def _l2t_get64(buf: Ptr[uint8], off: uint64) -> uint64:
+    r: uint64 = cast[uint64](buf[off]) << 56
+    r = r | (cast[uint64](buf[off + 1]) << 48)
+    r = r | (cast[uint64](buf[off + 2]) << 40)
+    r = r | (cast[uint64](buf[off + 3]) << 32)
+    r = r | (cast[uint64](buf[off + 4]) << 24)
+    r = r | (cast[uint64](buf[off + 5]) << 16)
+    r = r | (cast[uint64](buf[off + 6]) << 8)
+    r = r | cast[uint64](buf[off + 7])
+    return r
+
+
+def l2tp_init():
+    # Reset counters. Idempotent.
+    l2tp_tx_encaps = 0
+    l2tp_rx_decaps = 0
+    l2tp_rx_drops  = 0
+
+
+# =====================================================================
+# UDP checksum over the IPv4 pseudo-header (RFC 768 / RFC 1071)
+# =====================================================================
+
+L2TP_PSEUDO_BYTES: uint64 = 12
+_l2t_pseudo: Array[12, uint8]
+
+
+def _l2t_csum_accum(buf: Ptr[uint8], length: uint64, seed: uint32) -> uint32:
+    # Accumulate the RFC-1071 16-bit-word sum of `buf` into `seed`
+    # (NOT yet folded / complemented). Mirrors ip_csum16's word loop.
+    sum32: uint32 = seed
+    i: uint64 = 0
+    end_pairs: uint64 = length & ~cast[uint64](1)
+    while i < end_pairs:
+        word: uint32 = (cast[uint32](buf[i]) << 8) | cast[uint32](buf[i + 1])
+        sum32 = sum32 + word
+        i = i + 2
+    if i < length:
+        sum32 = sum32 + (cast[uint32](buf[i]) << 8)
+    return sum32
+
+
+def l2tp_udp_checksum(src_ip: uint32, dst_ip: uint32,
+                      udp_seg: Ptr[uint8], udp_len: uint64) -> uint16:
+    # Compute the IPv4 UDP checksum over [pseudo-header | UDP segment].
+    # udp_seg points at the UDP header (its length field must already be set);
+    # udp_len is the UDP header+payload length. The checksum field inside
+    # udp_seg (offset 6..7) must be zero on entry.
+    _l2t_pseudo[0] = cast[uint8]((src_ip >> 24) & 0xFF)
+    _l2t_pseudo[1] = cast[uint8]((src_ip >> 16) & 0xFF)
+    _l2t_pseudo[2] = cast[uint8]((src_ip >> 8) & 0xFF)
+    _l2t_pseudo[3] = cast[uint8](src_ip & 0xFF)
+    _l2t_pseudo[4] = cast[uint8]((dst_ip >> 24) & 0xFF)
+    _l2t_pseudo[5] = cast[uint8]((dst_ip >> 16) & 0xFF)
+    _l2t_pseudo[6] = cast[uint8]((dst_ip >> 8) & 0xFF)
+    _l2t_pseudo[7] = cast[uint8](dst_ip & 0xFF)
+    _l2t_pseudo[8] = 0
+    _l2t_pseudo[9] = IPPROTO_UDP
+    _l2t_pseudo[10] = cast[uint8]((udp_len >> 8) & 0xFF)
+    _l2t_pseudo[11] = cast[uint8](udp_len & 0xFF)
+    sum32: uint32 = _l2t_csum_accum(cast[Ptr[uint8]](&_l2t_pseudo[0]),
+                                    L2TP_PSEUDO_BYTES, 0)
+    sum32 = _l2t_csum_accum(udp_seg, udp_len, sum32)
+    while (sum32 >> 16) != 0:
+        sum32 = (sum32 & 0xFFFF) + (sum32 >> 16)
+    csum: uint16 = cast[uint16](~sum32 & 0xFFFF)
+    if csum == 0:
+        csum = 0xFFFF
+    return csum
+
+
+# =====================================================================
+# L2TPv3 header size helpers
+# =====================================================================
+
+def l2tp_hdr_len(has_cookie: int32) -> uint64:
+    # Length (bytes) of the L2TPv3 session header + default sublayer:
+    # SID(4) [+ Cookie(8)] + sublayer(4).
+    if has_cookie != 0:
+        return L2TP_SID_LEN + L2TP_COOKIE_LEN + L2TP_SUBLAYER_LEN
+    return L2TP_SID_LEN + L2TP_SUBLAYER_LEN
+
+
+# =====================================================================
+# ENCAP
+# =====================================================================
+
+def l2tp_encap(inner: Ptr[uint8], inner_len: uint64,
+               session_id: uint32, has_cookie: int32, cookie: uint64,
+               seq: uint32,
+               src_ip: uint32, dst_ip: uint32,
+               src_mac: Ptr[uint8], dst_mac: Ptr[uint8],
+               out: Ptr[uint8], out_cap: uint64) -> int64:
+    # Build the full outer L2TPv3 frame into `out` and return its total
+    # length, or a negative code on error (-1 buffer too small, -2 a zero
+    # Session ID, which is reserved for control messages and invalid for a
+    # data message).
+    #
+    #   out = OuterEth(14)|OuterIP(20)|OuterUDP(8)
+    #         |L2TPv3 SID(4)[+Cookie(8)]+Sublayer(4)|inner
+    #
+    # `has_cookie` selects whether the 64-bit `cookie` is emitted. `seq` is
+    # the 24-bit sequence number placed in the default L2-specific sublayer
+    # (the S bit is always set so the sequence number is valid).
+    if session_id == 0:
+        return -2
+
+    l2hdr: uint64 = l2tp_hdr_len(has_cookie)
+    total: uint64 = L2TP_OUTER_OVERHEAD + l2hdr + inner_len
+    if total > out_cap:
+        return -1
+
+    # --- Outer Ethernet header (offset 0..13) ---
+    i: uint64 = 0
+    while i < 6:
+        out[i]     = dst_mac[i]      # dst MAC 0..5
+        out[6 + i] = src_mac[i]      # src MAC 6..11
+        i = i + 1
+    _l2t_put16(out, 12, ETH_P_IP)    # ethertype 0x0800
+
+    # --- Outer IPv4 header (offset 14..33) ---
+    ip_off: uint64 = ETH_HDR_LEN
+    ip_total: uint64 = IP_HDR_LEN + UDP_HDR_LEN + l2hdr + inner_len
+    out[ip_off + 0] = 0x45                          # version 4, IHL 5
+    out[ip_off + 1] = 0                             # DSCP/ECN
+    _l2t_put16(out, ip_off + 2, cast[uint16](ip_total))
+    _l2t_put16(out, ip_off + 4, 0)                  # id
+    _l2t_put16(out, ip_off + 6, 0)                  # flags/frag = 0
+    out[ip_off + 8] = IP_TTL                        # TTL
+    out[ip_off + 9] = IPPROTO_UDP                   # protocol 17
+    _l2t_put16(out, ip_off + 10, 0)                 # checksum (below)
+    _l2t_put32(out, ip_off + 12, src_ip)            # src IPv4
+    _l2t_put32(out, ip_off + 16, dst_ip)            # dst IPv4
+    ip_csum: uint16 = ip_csum16(cast[Ptr[uint8]](
+        cast[uint64](out) + ip_off), IP_HDR_LEN)
+    _l2t_put16(out, ip_off + 10, ip_csum)
+
+    # --- Outer UDP header (offset 34..41) ---
+    udp_off: uint64 = ip_off + IP_HDR_LEN
+    udp_len: uint64 = UDP_HDR_LEN + l2hdr + inner_len
+    _l2t_put16(out, udp_off + 0, L2TP_UDP_PORT)     # src port
+    _l2t_put16(out, udp_off + 2, L2TP_UDP_PORT)     # dst port 1701
+    _l2t_put16(out, udp_off + 4, cast[uint16](udp_len))
+    _l2t_put16(out, udp_off + 6, 0)                 # checksum (below)
+
+    # --- L2TPv3 session header (offset 42..) ---
+    l2_off: uint64 = udp_off + UDP_HDR_LEN
+    _l2t_put32(out, l2_off, session_id)             # 32-bit Session ID
+    sub_off: uint64 = l2_off + L2TP_SID_LEN
+    if has_cookie != 0:
+        _l2t_put64(out, sub_off, cookie)            # 64-bit Cookie
+        sub_off = sub_off + L2TP_COOKIE_LEN
+
+    # --- Default L2-specific sublayer (4 bytes): S bit + 24-bit seq# ---
+    seq24: uint32 = seq & 0x00FFFFFF
+    out[sub_off + 0] = L2TP_S_BIT                            # S=1, rest 0
+    out[sub_off + 1] = cast[uint8]((seq24 >> 16) & 0xFF)    # seq hi
+    out[sub_off + 2] = cast[uint8]((seq24 >> 8) & 0xFF)     # seq mid
+    out[sub_off + 3] = cast[uint8](seq24 & 0xFF)            # seq lo
+
+    # --- Inner Ethernet frame (after the L2TPv3 header) ---
+    payload_off: uint64 = l2_off + l2hdr
+    i = 0
+    while i < inner_len:
+        out[payload_off + i] = inner[i]
+        i = i + 1
+
+    # --- UDP checksum over pseudo-header + UDP segment (now complete) ---
+    udp_csum: uint16 = l2tp_udp_checksum(src_ip, dst_ip,
+        cast[Ptr[uint8]](cast[uint64](out) + udp_off), udp_len)
+    _l2t_put16(out, udp_off + 6, udp_csum)
+
+    l2tp_tx_encaps = l2tp_tx_encaps + 1
+    return cast[int64](total)
+
+
+# =====================================================================
+# DECAP
+# =====================================================================
+
+def l2tp_is_l2tp(frame: Ptr[uint8], length: uint64) -> int32:
+    # Validate that `frame` is a well-formed L2TPv3-over-UDP data frame: long
+    # enough, IPv4 ethertype, IPv4/UDP, UDP dest port 1701, and a non-zero
+    # Session ID (data messages). Returns 1 if it looks like L2TPv3, else 0.
+    # NOTE: the minimum length here assumes a cookie-absent header; cookie
+    # presence is a per-session policy the caller checks via l2tp_decap.
+    if length < (L2TP_OUTER_OVERHEAD + L2TP_SID_LEN + L2TP_SUBLAYER_LEN):
+        return 0
+    if _l2t_get16(frame, 12) != ETH_P_IP:
+        return 0
+    ip_off: uint64 = ETH_HDR_LEN
+    if (frame[ip_off] & 0x0F) != 0x05:               # only fixed 20-byte IHL
+        return 0
+    if frame[ip_off + 9] != IPPROTO_UDP:
+        return 0
+    udp_off: uint64 = ip_off + IP_HDR_LEN
+    if _l2t_get16(frame, udp_off + 2) != L2TP_UDP_PORT:
+        return 0
+    l2_off: uint64 = udp_off + UDP_HDR_LEN
+    # Session ID 0 marks a control message, not a data message.
+    if _l2t_get32(frame, l2_off) == 0:
+        return 0
+    return 1
+
+
+def l2tp_frame_session(frame: Ptr[uint8]) -> uint32:
+    # The 32-bit Session ID from a frame (no validation; call l2tp_is_l2tp
+    # first).
+    l2_off: uint64 = ETH_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN
+    return _l2t_get32(frame, l2_off)
+
+
+def l2tp_frame_cookie(frame: Ptr[uint8]) -> uint64:
+    # The 64-bit Cookie that immediately follows the Session ID. Only
+    # meaningful when the session was negotiated WITH a cookie; the caller
+    # supplies has_cookie to l2tp_decap.
+    l2_off: uint64 = ETH_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN
+    return _l2t_get64(frame, l2_off + L2TP_SID_LEN)
+
+
+def l2tp_frame_seq(frame: Ptr[uint8], has_cookie: int32) -> uint32:
+    # The 24-bit sequence number from the default sublayer. Returns the
+    # sequence number, or 0 if the S bit is clear.
+    l2_off: uint64 = ETH_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN
+    sub_off: uint64 = l2_off + L2TP_SID_LEN
+    if has_cookie != 0:
+        sub_off = sub_off + L2TP_COOKIE_LEN
+    if (frame[sub_off] & L2TP_S_BIT) == 0:
+        return 0
+    r: uint32 = cast[uint32](frame[sub_off + 1]) << 16
+    r = r | (cast[uint32](frame[sub_off + 2]) << 8)
+    r = r | cast[uint32](frame[sub_off + 3])
+    return r
+
+
+def l2tp_decap(frame: Ptr[uint8], length: uint64,
+               exp_session: uint32, has_cookie: int32, exp_cookie: uint64,
+               out_inner: Ptr[uint8], out_cap: uint64,
+               out_seq: Ptr[uint32]) -> int64:
+    # Recover the inner Ethernet frame from an L2TPv3 outer frame, demuxing on
+    # the expected Session ID and (if has_cookie) the expected 64-bit Cookie.
+    # Strips the L2TPv3 session header + default sublayer, copies the inner
+    # frame byte-for-byte into out_inner, writes the recovered 24-bit sequence
+    # number into *out_seq (if non-NULL), and returns the inner length, or a
+    # negative code:
+    #   -1 not a valid L2TPv3 frame
+    #   -2 inner buffer too small
+    #   -3 Session ID does not match exp_session (unknown session)
+    #   -4 Cookie does not match exp_cookie (when has_cookie)
+    if l2tp_is_l2tp(frame, length) != 1:
+        l2tp_rx_drops = l2tp_rx_drops + 1
+        return -1
+    if l2tp_frame_session(frame) != exp_session:
+        l2tp_rx_drops = l2tp_rx_drops + 1
+        return -3
+    l2hdr: uint64 = l2tp_hdr_len(has_cookie)
+    # Re-check length now that we know the per-session header size.
+    if length < (L2TP_OUTER_OVERHEAD + l2hdr):
+        l2tp_rx_drops = l2tp_rx_drops + 1
+        return -1
+    if has_cookie != 0:
+        if l2tp_frame_cookie(frame) != exp_cookie:
+            l2tp_rx_drops = l2tp_rx_drops + 1
+            return -4
+    inner_off: uint64 = L2TP_OUTER_OVERHEAD + l2hdr
+    inner_len: uint64 = length - inner_off
+    if inner_len > out_cap:
+        return -2
+    if out_seq != cast[Ptr[uint32]](0):
+        out_seq[0] = l2tp_frame_seq(frame, has_cookie)
+    i: uint64 = 0
+    while i < inner_len:
+        out_inner[i] = frame[inner_off + i]
+        i = i + 1
+    l2tp_rx_decaps = l2tp_rx_decaps + 1
+    return cast[int64](inner_len)
+
+
+# =====================================================================
+# In-kernel self-test (deterministic, no NIC required)
+# =====================================================================
+#
+# Pure in-memory: build a known inner Ethernet frame, ENCAP -> DECAP round-trip
+# across TWO distinct sessions — one WITHOUT a cookie and one WITH a 64-bit
+# cookie — asserting the inner frame is byte-identical and the Session ID,
+# cookie, and sequence number survive. Re-parses the L2TPv3 header off the
+# on-wire frame. Recomputes the IPv4 + UDP checksums. Rejects a frame with a
+# wrong cookie and one with an unknown Session ID.
+
+def _l2t_emerg0(s: Ptr[char]):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0(s)
+
+
+def _l2t_emerg1(s: Ptr[char], a: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk1(s, a)
+
+
+def _l2t_emerg2(s: Ptr[char], a: uint64, b: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk2(s, a, b)
+
+
+# Generously-sized scratch globals. The inner frame is tiny (<128 bytes) but
+# the buffers are sized for a full MTU + outer overhead so an undersized
+# Array[] can't silently overflow into adjacent globals.
+L2TP_T_INNER_CAP: uint64 = 1600
+L2TP_T_OUTER_CAP: uint64 = 2048
+_l2tt_inner: Array[1600, uint8]
+_l2tt_outer: Array[2048, uint8]
+_l2tt_recov: Array[1600, uint8]
+_l2tt_mac_a: Array[6, uint8]
+_l2tt_mac_b: Array[6, uint8]
+_l2tt_mac_c: Array[6, uint8]
+
+
+def _l2t_build_inner(seed: uint8) -> uint64:
+    # Build a deterministic inner Ethernet frame: 14-byte L2 header
+    # (dst/src MAC + an arbitrary ethertype) followed by a payload whose bytes
+    # are a function of `seed`. Returns the inner frame length.
+    i: uint64 = 0
+    while i < 6:
+        _l2tt_inner[i]     = cast[uint8](0xC0 + i)       # inner dst MAC
+        _l2tt_inner[6 + i] = cast[uint8](0xD0 + i)       # inner src MAC
+        i = i + 1
+    _l2tt_inner[12] = 0x08                               # ethertype 0x0800
+    _l2tt_inner[13] = 0x00
+    plen: uint64 = 46                                    # min Ethernet payload
+    i = 0
+    while i < plen:
+        _l2tt_inner[14 + i] = cast[uint8]((cast[uint32](seed) + cast[uint32](i)) & 0xFF)
+        i = i + 1
+    return 14 + plen
+
+
+def l2tp_selftest() -> int32:
+    # Returns 1 on PASS, 0 on FAIL. Prints [l2tp] marker lines.
+    _l2t_emerg0("[l2tp] self-test start\n")
+    l2tp_init()
+    ok: int32 = 1
+
+    # Outer LCCE addressing.
+    #   local  LCCE: 10.0.0.1  MAC 02:00:00:00:00:01
+    #   remote A (session 0x11112222, NO cookie): 10.0.0.2 MAC ...:02
+    #   remote B (session 0x33334444, 64-bit cookie): 10.0.0.3 MAC ...:03
+    local_ip:   uint32 = (10 << 24) | (0 << 16) | (0 << 8) | 1
+    remoteA_ip: uint32 = (10 << 24) | (0 << 16) | (0 << 8) | 2
+    remoteB_ip: uint32 = (10 << 24) | (0 << 16) | (0 << 8) | 3
+    i: uint64 = 0
+    while i < 6:
+        _l2tt_mac_a[i] = 0
+        _l2tt_mac_b[i] = 0
+        _l2tt_mac_c[i] = 0
+        i = i + 1
+    _l2tt_mac_a[0] = 0x02
+    _l2tt_mac_a[5] = 0x01      # local MAC
+    _l2tt_mac_b[0] = 0x02
+    _l2tt_mac_b[5] = 0x02      # remote A MAC
+    _l2tt_mac_c[0] = 0x02
+    _l2tt_mac_c[5] = 0x03      # remote B MAC
+
+    sidA: uint32 = 0x11112222
+    sidB: uint32 = 0x33334444
+    cookieB: uint64 = 0xDEADBEEFCAFEF00D
+    seqA: uint32 = 0x000A1B2C & 0x00FFFFFF
+    seqB: uint32 = 0x00334455 & 0x00FFFFFF
+
+    udp_off: uint64 = ETH_HDR_LEN + IP_HDR_LEN
+    l2_off: uint64 = udp_off + UDP_HDR_LEN
+
+    # ================================================================
+    # Round 1: session A, NO cookie.
+    # ================================================================
+    inner_len1: uint64 = _l2t_build_inner(0x11)
+    out_len1: int64 = l2tp_encap(
+        cast[Ptr[uint8]](&_l2tt_inner[0]), inner_len1,
+        sidA, 0, 0, seqA,
+        local_ip, remoteA_ip,
+        cast[Ptr[uint8]](&_l2tt_mac_a[0]), cast[Ptr[uint8]](&_l2tt_mac_b[0]),
+        cast[Ptr[uint8]](&_l2tt_outer[0]), L2TP_T_OUTER_CAP)
+    if out_len1 < 0:
+        _l2t_emerg1("[l2tp] FAIL: encap(A) rc=%d\n", cast[uint64](out_len1))
+        return 0
+    exp_len1: uint64 = L2TP_OUTER_OVERHEAD + l2tp_hdr_len(0) + inner_len1
+    if cast[uint64](out_len1) != exp_len1:
+        _l2t_emerg2("[l2tp] FAIL: outer len %d != %d\n",
+                    cast[uint64](out_len1), exp_len1)
+        ok = 0
+    else:
+        _l2t_emerg1("[l2tp] PASS outer-len=%d (sessionA no-cookie)\n",
+                    cast[uint64](out_len1))
+
+    # Outer UDP dest port must be 1701.
+    dport1: uint16 = _l2t_get16(cast[Ptr[uint8]](&_l2tt_outer[0]), udp_off + 2)
+    if dport1 != L2TP_UDP_PORT:
+        _l2t_emerg1("[l2tp] FAIL: dport %d != 1701\n", cast[uint64](dport1))
+        ok = 0
+    else:
+        _l2t_emerg0("[l2tp] PASS dport=1701\n")
+
+    # Session ID must read back as sidA off the wire.
+    rb_sidA: uint32 = l2tp_frame_session(cast[Ptr[uint8]](&_l2tt_outer[0]))
+    if rb_sidA != sidA:
+        _l2t_emerg2("[l2tp] FAIL: header SID %x != %x\n",
+                    cast[uint64](rb_sidA), cast[uint64](sidA))
+        ok = 0
+    else:
+        _l2t_emerg1("[l2tp] PASS session-id=%x (no-cookie)\n", cast[uint64](rb_sidA))
+
+    # Sequence number (no cookie) must read back as seqA, S bit set.
+    rb_seqA: uint32 = l2tp_frame_seq(cast[Ptr[uint8]](&_l2tt_outer[0]), 0)
+    if rb_seqA != seqA:
+        _l2t_emerg2("[l2tp] FAIL: header seq %x != %x\n",
+                    cast[uint64](rb_seqA), cast[uint64](seqA))
+        ok = 0
+    else:
+        _l2t_emerg1("[l2tp] PASS seq=%x (no-cookie)\n", cast[uint64](rb_seqA))
+
+    # Recompute the IPv4 header checksum and compare against the stored one.
+    ip_off: uint64 = ETH_HDR_LEN
+    stored_ip_csum: uint16 = _l2t_get16(cast[Ptr[uint8]](&_l2tt_outer[0]),
+                                        ip_off + 10)
+    _l2t_put16(cast[Ptr[uint8]](&_l2tt_outer[0]), ip_off + 10, 0)
+    recomp_ip_csum: uint16 = ip_csum16(cast[Ptr[uint8]](&_l2tt_outer[ip_off]),
+                                       IP_HDR_LEN)
+    _l2t_put16(cast[Ptr[uint8]](&_l2tt_outer[0]), ip_off + 10, stored_ip_csum)
+    if stored_ip_csum != recomp_ip_csum:
+        _l2t_emerg2("[l2tp] FAIL: IP csum stored=%x recomp=%x\n",
+                    cast[uint64](stored_ip_csum), cast[uint64](recomp_ip_csum))
+        ok = 0
+    else:
+        _l2t_emerg0("[l2tp] PASS ip-checksum-valid\n")
+    # Self-consistency: ones'-complement sum over the whole 20-byte header
+    # (csum field included) must be 0.
+    whole_ip_csum: uint16 = ip_csum16(cast[Ptr[uint8]](&_l2tt_outer[ip_off]),
+                                      IP_HDR_LEN)
+    if whole_ip_csum != 0:
+        _l2t_emerg1("[l2tp] FAIL: IP header self-sum=%x (want 0)\n",
+                    cast[uint64](whole_ip_csum))
+        ok = 0
+    else:
+        _l2t_emerg0("[l2tp] PASS ip-checksum-self-consistent\n")
+
+    # Recompute the UDP checksum and compare against the stored value.
+    udp_len1: uint64 = cast[uint64](_l2t_get16(
+        cast[Ptr[uint8]](&_l2tt_outer[0]), udp_off + 4))
+    stored_udp_csum: uint16 = _l2t_get16(cast[Ptr[uint8]](&_l2tt_outer[0]),
+                                         udp_off + 6)
+    _l2t_put16(cast[Ptr[uint8]](&_l2tt_outer[0]), udp_off + 6, 0)
+    recomp_udp_csum: uint16 = l2tp_udp_checksum(local_ip, remoteA_ip,
+        cast[Ptr[uint8]](&_l2tt_outer[udp_off]), udp_len1)
+    _l2t_put16(cast[Ptr[uint8]](&_l2tt_outer[0]), udp_off + 6, stored_udp_csum)
+    if stored_udp_csum != recomp_udp_csum:
+        _l2t_emerg2("[l2tp] FAIL: UDP csum stored=%x recomp=%x\n",
+                    cast[uint64](stored_udp_csum), cast[uint64](recomp_udp_csum))
+        ok = 0
+    else:
+        _l2t_emerg0("[l2tp] PASS udp-checksum-valid (sessionA)\n")
+
+    # DECAP round-trip: demux on sidA, no cookie.
+    rseqA: uint32 = 0
+    rec_len1: int64 = l2tp_decap(cast[Ptr[uint8]](&_l2tt_outer[0]),
+        cast[uint64](out_len1),
+        sidA, 0, 0,
+        cast[Ptr[uint8]](&_l2tt_recov[0]), L2TP_T_INNER_CAP,
+        cast[Ptr[uint32]](&rseqA))
+    if rec_len1 < 0:
+        _l2t_emerg1("[l2tp] FAIL: decap(A) rc=%d\n", cast[uint64](rec_len1))
+        return 0
+    if cast[uint64](rec_len1) != inner_len1:
+        _l2t_emerg2("[l2tp] FAIL: recovered len %d != %d\n",
+                    cast[uint64](rec_len1), inner_len1)
+        ok = 0
+    if rseqA != seqA:
+        _l2t_emerg2("[l2tp] FAIL: decap seq %x != %x\n",
+                    cast[uint64](rseqA), cast[uint64](seqA))
+        ok = 0
+    identical1: int32 = 1
+    i = 0
+    while i < inner_len1:
+        if _l2tt_recov[i] != _l2tt_inner[i]:
+            identical1 = 0
+            i = inner_len1
+        else:
+            i = i + 1
+    if identical1 != 1:
+        _l2t_emerg0("[l2tp] FAIL: inner frame not byte-identical (sessionA)\n")
+        ok = 0
+    else:
+        _l2t_emerg0("[l2tp] PASS roundtrip-byte-identical (sessionA no-cookie)\n")
+
+    # ================================================================
+    # Round 2: session B, WITH a 64-bit cookie + distinct seq.
+    # ================================================================
+    inner_len2: uint64 = _l2t_build_inner(0x77)
+    out_len2: int64 = l2tp_encap(
+        cast[Ptr[uint8]](&_l2tt_inner[0]), inner_len2,
+        sidB, 1, cookieB, seqB,
+        local_ip, remoteB_ip,
+        cast[Ptr[uint8]](&_l2tt_mac_a[0]), cast[Ptr[uint8]](&_l2tt_mac_c[0]),
+        cast[Ptr[uint8]](&_l2tt_outer[0]), L2TP_T_OUTER_CAP)
+    if out_len2 < 0:
+        _l2t_emerg1("[l2tp] FAIL: encap(B) rc=%d\n", cast[uint64](out_len2))
+        return 0
+    exp_len2: uint64 = L2TP_OUTER_OVERHEAD + l2tp_hdr_len(1) + inner_len2
+    if cast[uint64](out_len2) != exp_len2:
+        _l2t_emerg2("[l2tp] FAIL: outer len(B) %d != %d\n",
+                    cast[uint64](out_len2), exp_len2)
+        ok = 0
+    else:
+        _l2t_emerg1("[l2tp] PASS outer-len=%d (sessionB cookie)\n",
+                    cast[uint64](out_len2))
+
+    # Session ID + cookie + seq must read back off the wire.
+    rb_sidB: uint32 = l2tp_frame_session(cast[Ptr[uint8]](&_l2tt_outer[0]))
+    if rb_sidB != sidB:
+        _l2t_emerg2("[l2tp] FAIL: header SID(B) %x != %x\n",
+                    cast[uint64](rb_sidB), cast[uint64](sidB))
+        ok = 0
+    else:
+        _l2t_emerg1("[l2tp] PASS session-id=%x (cookie)\n", cast[uint64](rb_sidB))
+
+    rb_cookie: uint64 = l2tp_frame_cookie(cast[Ptr[uint8]](&_l2tt_outer[0]))
+    if rb_cookie != cookieB:
+        _l2t_emerg2("[l2tp] FAIL: header cookie %x != %x\n",
+                    rb_cookie, cookieB)
+        ok = 0
+    else:
+        _l2t_emerg0("[l2tp] PASS cookie-on-wire (64-bit)\n")
+
+    rb_seqB: uint32 = l2tp_frame_seq(cast[Ptr[uint8]](&_l2tt_outer[0]), 1)
+    if rb_seqB != seqB:
+        _l2t_emerg2("[l2tp] FAIL: header seq(B) %x != %x\n",
+                    cast[uint64](rb_seqB), cast[uint64](seqB))
+        ok = 0
+    else:
+        _l2t_emerg1("[l2tp] PASS seq=%x (cookie)\n", cast[uint64](rb_seqB))
+
+    # Recompute UDP checksum for round 2 (different dst IP + cookie + payload).
+    udp_len2: uint64 = cast[uint64](_l2t_get16(
+        cast[Ptr[uint8]](&_l2tt_outer[0]), udp_off + 4))
+    stored_udp_csum2: uint16 = _l2t_get16(cast[Ptr[uint8]](&_l2tt_outer[0]),
+                                          udp_off + 6)
+    _l2t_put16(cast[Ptr[uint8]](&_l2tt_outer[0]), udp_off + 6, 0)
+    recomp_udp_csum2: uint16 = l2tp_udp_checksum(local_ip, remoteB_ip,
+        cast[Ptr[uint8]](&_l2tt_outer[udp_off]), udp_len2)
+    _l2t_put16(cast[Ptr[uint8]](&_l2tt_outer[0]), udp_off + 6, stored_udp_csum2)
+    if stored_udp_csum2 != recomp_udp_csum2:
+        _l2t_emerg2("[l2tp] FAIL: UDP csum2 stored=%x recomp=%x\n",
+                    cast[uint64](stored_udp_csum2), cast[uint64](recomp_udp_csum2))
+        ok = 0
+    else:
+        _l2t_emerg0("[l2tp] PASS udp-checksum-valid (sessionB)\n")
+
+    # DECAP round-trip: demux on sidB + matching cookie.
+    rseqB: uint32 = 0
+    rec_len2: int64 = l2tp_decap(cast[Ptr[uint8]](&_l2tt_outer[0]),
+        cast[uint64](out_len2),
+        sidB, 1, cookieB,
+        cast[Ptr[uint8]](&_l2tt_recov[0]), L2TP_T_INNER_CAP,
+        cast[Ptr[uint32]](&rseqB))
+    if rec_len2 < 0:
+        _l2t_emerg1("[l2tp] FAIL: decap(B) rc=%d\n", cast[uint64](rec_len2))
+        return 0
+    if cast[uint64](rec_len2) != inner_len2:
+        _l2t_emerg2("[l2tp] FAIL: recovered len(B) %d != %d\n",
+                    cast[uint64](rec_len2), inner_len2)
+        ok = 0
+    if rseqB != seqB:
+        _l2t_emerg2("[l2tp] FAIL: decap seq(B) %x != %x\n",
+                    cast[uint64](rseqB), cast[uint64](seqB))
+        ok = 0
+    identical2: int32 = 1
+    i = 0
+    while i < inner_len2:
+        if _l2tt_recov[i] != _l2tt_inner[i]:
+            identical2 = 0
+            i = inner_len2
+        else:
+            i = i + 1
+    if identical2 != 1:
+        _l2t_emerg0("[l2tp] FAIL: inner frame not byte-identical (sessionB)\n")
+        ok = 0
+    else:
+        _l2t_emerg0("[l2tp] PASS roundtrip-byte-identical (sessionB cookie)\n")
+
+    # ================================================================
+    # Negative 1: wrong cookie on session B must be REJECTED (-4).
+    # The frame still carries sidB + cookieB on the wire; decap with a
+    # MISMATCHED expected cookie must reject.
+    # ================================================================
+    neg_cookie: int64 = l2tp_decap(cast[Ptr[uint8]](&_l2tt_outer[0]),
+        cast[uint64](out_len2),
+        sidB, 1, 0x0000000000000000,
+        cast[Ptr[uint8]](&_l2tt_recov[0]), L2TP_T_INNER_CAP,
+        cast[Ptr[uint32]](0))
+    if neg_cookie != -4:
+        _l2t_emerg1("[l2tp] FAIL: wrong-cookie accepted rc=%d (want -4)\n",
+                    cast[uint64](neg_cookie))
+        ok = 0
+    else:
+        _l2t_emerg0("[l2tp] PASS reject-wrong-cookie\n")
+
+    # ================================================================
+    # Negative 2: unknown Session ID must be REJECTED (-3).
+    # ================================================================
+    neg_sid: int64 = l2tp_decap(cast[Ptr[uint8]](&_l2tt_outer[0]),
+        cast[uint64](out_len2),
+        0x55556666, 1, cookieB,
+        cast[Ptr[uint8]](&_l2tt_recov[0]), L2TP_T_INNER_CAP,
+        cast[Ptr[uint32]](0))
+    if neg_sid != -3:
+        _l2t_emerg1("[l2tp] FAIL: unknown-session accepted rc=%d (want -3)\n",
+                    cast[uint64](neg_sid))
+        ok = 0
+    else:
+        _l2t_emerg0("[l2tp] PASS reject-unknown-session\n")
+
+    # ================================================================
+    # Negative 3: a non-1701 frame must not be recognised as L2TPv3.
+    # ================================================================
+    _l2t_put16(cast[Ptr[uint8]](&_l2tt_outer[0]), udp_off + 2, 1234)
+    neg_port: int32 = l2tp_is_l2tp(cast[Ptr[uint8]](&_l2tt_outer[0]),
+                                   cast[uint64](out_len2))
+    if neg_port != 0:
+        _l2t_emerg0("[l2tp] FAIL: non-1701 frame accepted as L2TPv3\n")
+        ok = 0
+    else:
+        _l2t_emerg0("[l2tp] PASS reject-non-l2tp (dport 1234)\n")
+    _l2t_put16(cast[Ptr[uint8]](&_l2tt_outer[0]), udp_off + 2, L2TP_UDP_PORT)
+
+    if ok == 1:
+        _l2t_emerg0("[l2tp] PASS\n")
+        return 1
+    _l2t_emerg0("[l2tp] FAIL\n")
+    return 0
