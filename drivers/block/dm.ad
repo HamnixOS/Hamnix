@@ -489,9 +489,11 @@ def _dm_xts_decrypt_sector(sector: uint64,
 # Device-mapper core
 # =========================================================================
 
-DM_TARGET_NONE:   uint32 = 0
-DM_TARGET_LINEAR: uint32 = 1
-DM_TARGET_CRYPT:  uint32 = 2
+DM_TARGET_NONE:          uint32 = 0
+DM_TARGET_LINEAR:        uint32 = 1
+DM_TARGET_CRYPT:         uint32 = 2
+DM_TARGET_SNAPSHOT:      uint32 = 3   # frozen CoW view (reads exc-store/origin)
+DM_TARGET_SNAPSHOT_ORIGIN: uint32 = 4 # origin that performs copy-on-write
 
 DM_KEY_LEN:      uint64 = 64       # AES-256-XTS: 32B data + 32B tweak key
 DM_MAX_TARGETS:  uint64 = 8        # targets per mapped device
@@ -510,7 +512,7 @@ class DmTarget:
     start_sector: uint64           # first virtual sector this target owns
     length:       uint64           # number of sectors in the span
     under_slot:   int32            # underlying block-device slot
-    pad2:         uint32
+    snap_ctx:     int32            # snapshot-context index (-1 if not a snap)
     under_start:  uint64           # base LBA on the underlying device
 
 
@@ -529,9 +531,55 @@ class MappedDevice:
     key:         Array[64, uint8]
 
 
+# =========================================================================
+# dm-snapshot — copy-on-write context (Linux drivers/md/dm-snap.c)
+# =========================================================================
+#
+# A snapshot pairs an ORIGIN device with a separate EXCEPTION-STORE device.
+# The snapshot mapped device presents a FROZEN point-in-time view of the
+# origin. Address space is divided into fixed-size CHUNKS. The first time a
+# given origin chunk is WRITTEN (through the snapshot-origin target), the
+# chunk's ORIGINAL contents are first COPIED into a freshly allocated slot
+# in the exception store (copy-on-write); an exception-table entry records
+# origin-chunk -> exception-store-chunk, and the per-chunk "remapped" bit is
+# set. Thereafter:
+#   * a READ through the SNAPSHOT view returns the exception-store copy for
+#     any remapped chunk (the OLD pre-image), else falls through to origin;
+#   * a READ through the ORIGIN returns the live (NEW) data.
+# This is exactly Linux dm-snapshot's CoW exception model, in memory.
+
+DM_SNAP_MAX:        uint64 = 4        # snapshot contexts system-wide
+DM_SNAP_MAX_CHUNKS: uint64 = 256      # origin chunks tracked per snapshot
+
+
+class DmSnapContext:
+    used:          uint32
+    pad:           uint32
+    origin_slot:   int32              # underlying origin block device
+    exc_slot:      int32              # underlying exception-store device
+    chunk_sectors: uint64             # CoW granularity (sectors per chunk)
+    nchunks:       uint64             # origin chunks covered
+    next_exc:      uint64             # next free exception-store chunk
+    exc_capacity:  uint64             # exception-store chunks available
+    # exc_map[origin_chunk] = exception-store chunk holding its pre-image.
+    exc_map:       Array[256, uint64]
+    # remapped[origin_chunk] = 1 once the chunk has been CoW'd.
+    remapped:      Array[256, uint8]
+
+
+dm_snap_ctxs: Array[4, DmSnapContext]
+
 dm_devices: Array[8, MappedDevice]
 dm_ops:     BlockDeviceOps
 dm_inited:  uint32 = 0
+
+# One-chunk staging buffer for the CoW copy path. Snapshot I/O is
+# serialised through the synchronous block layer, so a single shared
+# module-scope chunk buffer is safe (no two CoW copies overlap). Sized for
+# the largest chunk the self-test uses (8 sectors = 4096 bytes); resize if
+# a larger chunk_sectors is ever configured.
+_DM_SNAP_CHUNK_MAX_SECTORS: uint64 = 8
+_dm_snap_cow_buf: Array[4096, uint8]    # 8 * 512
 
 # One-sector ciphertext staging buffer for the crypt path. dm-crypt I/O
 # is serialised through the synchronous block layer, so a single shared
@@ -556,8 +604,12 @@ def dm_init():
         dm_devices[i].capacity  = 0
         dm_devices[i].self_slot = -1
         i = i + 1
+    s: uint64 = 0
+    while s < DM_SNAP_MAX:
+        dm_snap_ctxs[s].used = 0
+        s = s + 1
     dm_inited = 1
-    printk0("dm: device-mapper ready (linear + crypt targets)\n")
+    printk0("dm: device-mapper ready (linear + crypt + snapshot targets)\n")
 
 
 def _dm_find_target(dev: Ptr[MappedDevice], vlba: uint64) -> int32:
@@ -629,6 +681,108 @@ def _dm_crypt_io(dev: Ptr[MappedDevice], t: Ptr[DmTarget],
     return 0
 
 
+# =========================================================================
+# dm-snapshot target handlers
+# =========================================================================
+
+def _dm_snap_cow_one_chunk(ctx: Ptr[DmSnapContext], ochunk: uint64) -> int32:
+    # Copy-on-write a single origin chunk into the exception store, IF it
+    # has not already been remapped. Reads the chunk's CURRENT (pre-write)
+    # contents from the origin and writes them to a freshly allocated
+    # exception-store chunk, then records the mapping + remapped bit. This
+    # is the heart of dm-snapshot: it must run BEFORE the origin chunk is
+    # overwritten so the snapshot preserves the OLD data. Returns 0 on
+    # success, negative on error.
+    if ctx[0].remapped[ochunk] != 0:
+        return 0                       # already preserved; nothing to do
+    if ctx[0].next_exc >= ctx[0].exc_capacity:
+        printk0("dm: snapshot exception store full\n")
+        return -1
+    ec: uint64 = ctx[0].next_exc
+    cs: uint64 = ctx[0].chunk_sectors
+    olba: uint64 = ochunk * cs
+    elba: uint64 = ec * cs
+    bufp: Ptr[uint8] = cast[Ptr[uint8]](&_dm_snap_cow_buf[0])
+    # Read the original chunk off the origin...
+    rc: int32 = blk_read_sectors(ctx[0].origin_slot, olba, cs, bufp)
+    if rc != 0:
+        return rc
+    # ...and stash the pre-image in the exception store.
+    rc = blk_write_sectors(ctx[0].exc_slot, elba, cs, bufp)
+    if rc != 0:
+        return rc
+    ctx[0].exc_map[ochunk]  = ec
+    ctx[0].remapped[ochunk] = 1
+    ctx[0].next_exc         = ec + 1
+    return 0
+
+
+def _dm_snap_origin_io(t: Ptr[DmTarget], is_write: int32, off_in_t: uint64,
+                       count: uint64, buf: Ptr[uint8]) -> int32:
+    # SNAPSHOT-ORIGIN target: a thin device over the origin that performs
+    # copy-on-write. On WRITE, every chunk this request touches is first
+    # CoW'd to the exception store (preserving the snapshot's pre-image),
+    # THEN the new data is written through to the origin. On READ it is a
+    # plain passthrough to the origin (the live view). Processed one
+    # sector at a time so chunk boundaries are handled simply.
+    ctx: Ptr[DmSnapContext] = &dm_snap_ctxs[cast[uint64](t[0].snap_ctx)]
+    cs: uint64 = ctx[0].chunk_sectors
+    s: uint64 = 0
+    while s < count:
+        olba: uint64 = t[0].under_start + off_in_t + s
+        cur: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](buf) + s * SECTOR_SIZE)
+        if is_write != 0:
+            ochunk: uint64 = olba / cs
+            rc: int32 = _dm_snap_cow_one_chunk(ctx, ochunk)
+            if rc != 0:
+                return rc
+            rc = blk_write_sectors(ctx[0].origin_slot, olba, 1, cur)
+            if rc != 0:
+                return rc
+        else:
+            rc2: int32 = blk_read_sectors(ctx[0].origin_slot, olba, 1, cur)
+            if rc2 != 0:
+                return rc2
+        s = s + 1
+    return 0
+
+
+def _dm_snap_view_io(t: Ptr[DmTarget], is_write: int32, off_in_t: uint64,
+                     count: uint64, buf: Ptr[uint8]) -> int32:
+    # SNAPSHOT target: the frozen point-in-time view. A READ returns, for
+    # each chunk, the exception-store pre-image IF that chunk has been
+    # CoW'd (remapped), else falls through to the live origin. Writes to a
+    # snapshot view are not part of this self-test's data path; they are
+    # rejected so a stray write can never corrupt the frozen image.
+    ctx: Ptr[DmSnapContext] = &dm_snap_ctxs[cast[uint64](t[0].snap_ctx)]
+    cs: uint64 = ctx[0].chunk_sectors
+    if is_write != 0:
+        printk0("dm: snapshot view is read-only\n")
+        return -1
+    s: uint64 = 0
+    while s < count:
+        olba: uint64 = t[0].under_start + off_in_t + s
+        cur: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](buf) + s * SECTOR_SIZE)
+        ochunk: uint64 = olba / cs
+        off_in_chunk: uint64 = olba - ochunk * cs
+        rc: int32 = 0
+        if ctx[0].remapped[ochunk] != 0:
+            # Preserved pre-image lives in the exception store.
+            ec: uint64 = ctx[0].exc_map[ochunk]
+            elba: uint64 = ec * cs + off_in_chunk
+            rc = blk_read_sectors(ctx[0].exc_slot, elba, 1, cur)
+        else:
+            # Never written since the snapshot was taken: read origin live
+            # (which still equals the snapshot point-in-time value).
+            rc = blk_read_sectors(ctx[0].origin_slot, olba, 1, cur)
+        if rc != 0:
+            return rc
+        s = s + 1
+    return 0
+
+
 def _dm_io(dev: Ptr[MappedDevice], is_write: int32, vlba: uint64,
            count: uint64, buf: Ptr[uint8]) -> int32:
     # Core remap. Walk the request sector-span, splitting it at target
@@ -658,6 +812,10 @@ def _dm_io(dev: Ptr[MappedDevice], is_write: int32, vlba: uint64,
         if t[0].ttype == DM_TARGET_CRYPT:
             rc = _dm_crypt_io(dev, t, is_write, off_in_t, cur_v,
                               chunk, bufp)
+        elif t[0].ttype == DM_TARGET_SNAPSHOT_ORIGIN:
+            rc = _dm_snap_origin_io(t, is_write, off_in_t, chunk, bufp)
+        elif t[0].ttype == DM_TARGET_SNAPSHOT:
+            rc = _dm_snap_view_io(t, is_write, off_in_t, chunk, bufp)
         else:
             rc = _dm_linear_io(t, is_write, off_in_t, chunk, bufp)
         if rc != 0:
@@ -738,6 +896,7 @@ def dm_create_linear(name: Ptr[char], under_slot: int32,
     dm_devices[idx].targets[0].start_sector = 0
     dm_devices[idx].targets[0].length       = length
     dm_devices[idx].targets[0].under_slot   = under_slot
+    dm_devices[idx].targets[0].snap_ctx     = -1
     dm_devices[idx].targets[0].under_start  = under_start
     if _dm_register(idx, name) != 0:
         dm_devices[idx].used = 0
@@ -776,11 +935,13 @@ def dm_create_concat(name: Ptr[char],
     dm_devices[idx].targets[0].start_sector = 0
     dm_devices[idx].targets[0].length       = len_a
     dm_devices[idx].targets[0].under_slot   = slot_a
+    dm_devices[idx].targets[0].snap_ctx     = -1
     dm_devices[idx].targets[0].under_start  = start_a
     dm_devices[idx].targets[1].ttype        = DM_TARGET_LINEAR
     dm_devices[idx].targets[1].start_sector = len_a
     dm_devices[idx].targets[1].length       = len_b
     dm_devices[idx].targets[1].under_slot   = slot_b
+    dm_devices[idx].targets[1].snap_ctx     = -1
     dm_devices[idx].targets[1].under_start  = start_b
     if _dm_register(idx, name) != 0:
         dm_devices[idx].used = 0
@@ -826,7 +987,143 @@ def dm_create_crypt(name: Ptr[char], under_slot: int32,
     dm_devices[idx].targets[0].start_sector = 0
     dm_devices[idx].targets[0].length       = length
     dm_devices[idx].targets[0].under_slot   = under_slot
+    dm_devices[idx].targets[0].snap_ctx     = -1
     dm_devices[idx].targets[0].under_start  = under_start
+    if _dm_register(idx, name) != 0:
+        dm_devices[idx].used = 0
+        return -5
+    return dm_devices[idx].self_slot
+
+
+def _dm_snap_alloc_ctx() -> int32:
+    # Claim a free snapshot context slot, or -1 if the table is full.
+    i: uint64 = 0
+    while i < DM_SNAP_MAX:
+        if dm_snap_ctxs[i].used == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def dm_create_snapshot(name: Ptr[char], origin_slot: int32,
+                       exc_slot: int32, chunk_sectors: uint64,
+                       length: uint64) -> int32:
+    # Create a dm-snapshot pair sharing one CoW context:
+    #   * a SNAPSHOT view registered as `name`     — the frozen image, and
+    #   * a SNAPSHOT-ORIGIN registered as `name`+"-origin" — the CoW origin
+    #     that filesystems/writers go through so origin writes preserve the
+    #     snapshot's pre-image in the exception store.
+    # `origin_slot` is the underlying real origin; `exc_slot` is the
+    # separate exception-store device; `chunk_sectors` is the CoW
+    # granularity; `length` is the virtual size in sectors. This mirrors
+    # `dmsetup create snap --table "0 LEN snapshot ORIGIN COW P CHUNK"`
+    # plus the implicit snapshot-origin target on the origin. Returns the
+    # registered SNAPSHOT view's block slot or a negative error.
+    dm_init()
+    if length == 0 or chunk_sectors == 0:
+        return -1
+    if origin_slot < 0 or exc_slot < 0:
+        return -2
+    if chunk_sectors > _DM_SNAP_CHUNK_MAX_SECTORS:
+        printk0("dm: snapshot chunk_sectors exceeds CoW buffer\n")
+        return -2
+    if length > blk_capacity_sectors(origin_slot):
+        printk0("dm: snapshot exceeds origin capacity\n")
+        return -3
+    nchunks: uint64 = (length + chunk_sectors - 1) / chunk_sectors
+    if nchunks > DM_SNAP_MAX_CHUNKS:
+        printk0("dm: snapshot too many chunks for exception table\n")
+        return -3
+    exc_cap: uint64 = blk_capacity_sectors(exc_slot) / chunk_sectors
+    if exc_cap == 0:
+        printk0("dm: snapshot exception store too small\n")
+        return -3
+    sctx_s: int32 = _dm_snap_alloc_ctx()
+    if sctx_s < 0:
+        printk0("dm: snapshot context table full\n")
+        return -4
+    sctx: uint64 = cast[uint64](sctx_s)
+    dm_snap_ctxs[sctx].used          = 1
+    dm_snap_ctxs[sctx].origin_slot   = origin_slot
+    dm_snap_ctxs[sctx].exc_slot      = exc_slot
+    dm_snap_ctxs[sctx].chunk_sectors = chunk_sectors
+    dm_snap_ctxs[sctx].nchunks       = nchunks
+    dm_snap_ctxs[sctx].next_exc      = 0
+    dm_snap_ctxs[sctx].exc_capacity  = exc_cap
+    c: uint64 = 0
+    while c < DM_SNAP_MAX_CHUNKS:
+        dm_snap_ctxs[sctx].exc_map[c]  = 0
+        dm_snap_ctxs[sctx].remapped[c] = 0
+        c = c + 1
+
+    # --- snapshot VIEW device (frozen image) ---
+    vidx_s: int32 = _dm_alloc_device()
+    if vidx_s < 0:
+        dm_snap_ctxs[sctx].used = 0
+        printk0("dm: device table full\n")
+        return -4
+    vidx: uint64 = cast[uint64](vidx_s)
+    dm_devices[vidx].n_targets             = 1
+    dm_devices[vidx].capacity              = length
+    dm_devices[vidx].targets[0].ttype        = DM_TARGET_SNAPSHOT
+    dm_devices[vidx].targets[0].start_sector = 0
+    dm_devices[vidx].targets[0].length       = length
+    dm_devices[vidx].targets[0].under_slot   = origin_slot
+    dm_devices[vidx].targets[0].snap_ctx     = sctx_s
+    dm_devices[vidx].targets[0].under_start  = 0
+    if _dm_register(vidx, name) != 0:
+        dm_devices[vidx].used   = 0
+        dm_snap_ctxs[sctx].used = 0
+        return -5
+    return dm_devices[vidx].self_slot
+
+
+def dm_snapshot_ctx_of(name: Ptr[char]) -> int32:
+    # Return the snapshot-context index backing the snapshot VIEW device
+    # registered under `name`, or -1 if `name` is not a live snapshot view.
+    # Lets a caller (e.g. the self-test) build the paired snapshot-origin
+    # device that shares the same CoW context.
+    slot: int32 = find_blockdev(name)
+    if slot < 0:
+        return -1
+    i: uint64 = 0
+    while i < DM_MAX_DEVICES:
+        if dm_devices[i].used != 0 and dm_devices[i].self_slot == slot:
+            if dm_devices[i].targets[0].ttype == DM_TARGET_SNAPSHOT:
+                return dm_devices[i].targets[0].snap_ctx
+            return -1
+        i = i + 1
+    return -1
+
+
+def dm_create_snapshot_origin(name: Ptr[char], snap_ctx: int32,
+                              length: uint64) -> int32:
+    # Create the SNAPSHOT-ORIGIN mapped device that shares snapshot context
+    # `snap_ctx` (returned implicitly by dm_create_snapshot, which stored it
+    # in the view's target). Writes through this device trigger copy-on-
+    # write so the paired snapshot keeps the pre-image. Returns the
+    # registered block slot or a negative error.
+    dm_init()
+    if length == 0:
+        return -1
+    if snap_ctx < 0 or cast[uint64](snap_ctx) >= DM_SNAP_MAX:
+        return -2
+    if dm_snap_ctxs[cast[uint64](snap_ctx)].used == 0:
+        return -2
+    idx_s: int32 = _dm_alloc_device()
+    if idx_s < 0:
+        printk0("dm: device table full\n")
+        return -4
+    idx: uint64 = cast[uint64](idx_s)
+    dm_devices[idx].n_targets             = 1
+    dm_devices[idx].capacity              = length
+    dm_devices[idx].targets[0].ttype        = DM_TARGET_SNAPSHOT_ORIGIN
+    dm_devices[idx].targets[0].start_sector = 0
+    dm_devices[idx].targets[0].length       = length
+    dm_devices[idx].targets[0].under_slot   = \
+        dm_snap_ctxs[cast[uint64](snap_ctx)].origin_slot
+    dm_devices[idx].targets[0].snap_ctx     = snap_ctx
+    dm_devices[idx].targets[0].under_start  = 0
     if _dm_register(idx, name) != 0:
         dm_devices[idx].used = 0
         return -5
@@ -843,6 +1140,11 @@ def dm_remove(name: Ptr[char]) -> int32:
     i: uint64 = 0
     while i < DM_MAX_DEVICES:
         if dm_devices[i].used != 0 and dm_devices[i].self_slot == slot:
+            # Releasing a snapshot VIEW also frees its shared CoW context.
+            if dm_devices[i].targets[0].ttype == DM_TARGET_SNAPSHOT:
+                sc: int32 = dm_devices[i].targets[0].snap_ctx
+                if sc >= 0 and cast[uint64](sc) < DM_SNAP_MAX:
+                    dm_snap_ctxs[cast[uint64](sc)].used = 0
             blk_unregister_by_name(name)
             dm_devices[i].used      = 0
             dm_devices[i].n_targets = 0
@@ -890,6 +1192,13 @@ _DM_BACK_SECTORS: uint64 = 256
 _dm_back_store:   Array[131072, uint8]   # 256 * 512
 _dm_back_ops:     BlockDeviceOps
 
+# Dedicated exception-store ramdisk for the dm-snapshot subtest: a SEPARATE
+# backing device (Linux dm-snapshot keeps the CoW store on its own device),
+# 256 sectors = 128 KiB.
+_DM_EXC_SECTORS:  uint64 = 256
+_dm_exc_store:    Array[131072, uint8]   # 256 * 512
+_dm_exc_ops:      BlockDeviceOps
+
 # Scratch buffers for the self-test (all module-scope, one sector each
 # unless noted).
 _dm_t_plain:   Array[512, uint8]   # plaintext written through a mapped dev
@@ -906,6 +1215,14 @@ _dm_kat_pt:    Array[512, uint8]
 _dm_kat_ct:    Array[512, uint8]
 _dm_kat_out:   Array[512, uint8]
 
+# dm-snapshot subtest scratch (all one full sector = 512 bytes — the most
+# any of these ever carries — to avoid the BSS-overflow trap).
+_dm_snap_orig:  Array[512, uint8]   # original origin-chunk contents
+_dm_snap_new:   Array[512, uint8]   # new data written to the origin
+_dm_snap_read:  Array[512, uint8]   # readback through snapshot / origin
+_dm_snap_excrd: Array[512, uint8]   # raw read from the exception store
+_dm_snap_untch: Array[512, uint8]   # pattern for the never-written chunk
+
 
 def _dm_back_read(priv: uint64, lba: uint64, count: uint64,
                   buf: Ptr[uint8]) -> int32:
@@ -917,6 +1234,20 @@ def _dm_back_read(priv: uint64, lba: uint64, count: uint64,
 def _dm_back_write(priv: uint64, lba: uint64, count: uint64,
                    buf: Ptr[uint8]) -> int32:
     dst: uint64 = cast[uint64](&_dm_back_store[0]) + lba * SECTOR_SIZE
+    memcpy(cast[Ptr[uint8]](dst), buf, count * SECTOR_SIZE)
+    return 0
+
+
+def _dm_exc_read(priv: uint64, lba: uint64, count: uint64,
+                 buf: Ptr[uint8]) -> int32:
+    src: uint64 = cast[uint64](&_dm_exc_store[0]) + lba * SECTOR_SIZE
+    memcpy(buf, cast[Ptr[uint8]](src), count * SECTOR_SIZE)
+    return 0
+
+
+def _dm_exc_write(priv: uint64, lba: uint64, count: uint64,
+                  buf: Ptr[uint8]) -> int32:
+    dst: uint64 = cast[uint64](&_dm_exc_store[0]) + lba * SECTOR_SIZE
     memcpy(cast[Ptr[uint8]](dst), buf, count * SECTOR_SIZE)
     return 0
 
@@ -952,6 +1283,23 @@ def _dm_back_register() -> int32:
     _dm_back_ops.flush         = cast[Fn[int32, uint64]](0)
     return register_blockdev("dmback0", _DM_BACK_SECTORS,
                              &_dm_back_ops, 0)
+
+
+def _dm_exc_register() -> int32:
+    # Register the dedicated exception-store ramdisk as "dmexc0". Returns
+    # the slot, or the existing slot if already registered.
+    existing: int32 = find_blockdev("dmexc0")
+    if existing >= 0:
+        return existing
+    z: uint64 = 0
+    while z < 131072:
+        _dm_exc_store[z] = 0
+        z = z + 1
+    _dm_exc_ops.read_sectors  = _dm_exc_read
+    _dm_exc_ops.write_sectors = _dm_exc_write
+    _dm_exc_ops.flush         = cast[Fn[int32, uint64]](0)
+    return register_blockdev("dmexc0", _DM_EXC_SECTORS,
+                             &_dm_exc_ops, 0)
 
 
 def _dm_buf_eq(a: Ptr[uint8], b: Ptr[uint8], n: uint64) -> int32:
@@ -1222,10 +1570,118 @@ def dm_selftest() -> int32:
     else:
         _dm_emerg0("[device-mapper] PASS dmcrypt-kat: AES-256-XTS vector matches reference OK\n")
 
+    # --- Test 5: dm-SNAPSHOT copy-on-write + passthrough ---
+    # Build a snapshot of an origin region with chunk size 8 sectors,
+    # backed by a SEPARATE exception store (dmexc0). Seed origin chunk 4
+    # (LBA 32) with a known ORIGINAL pattern and an UNTOUCHED chunk 6 (LBA
+    # 48) with a different pattern. Take the snapshot, then WRITE new data
+    # to origin chunk 4 THROUGH the snapshot-origin device — this must CoW
+    # the original into the exception store. Then prove:
+    #   (a) the snapshot view still reads the ORIGINAL pre-image,
+    #   (b) the exception store actually holds that pre-image,
+    #   (c) the origin now reads the NEW data, and
+    #   (d) the never-written chunk reads through to the origin on both
+    #       the snapshot view and the origin device.
+    exc: int32 = _dm_exc_register()
+    if exc < 0:
+        _dm_emerg0("[device-mapper] FAIL: exception store register\n")
+        return 0
+    _dm_emerg1("[device-mapper] snapshot exc-store dmexc0 slot=%d\n",
+               cast[uint64](cast[int64](exc)))
+    si: uint64 = 0
+    while si < SECTOR_SIZE:
+        _dm_snap_orig[si]  = cast[uint8]((si * 5 + 17) & 0xFF)   # chunk 4
+        _dm_snap_new[si]   = cast[uint8]((si * 9 + 200) & 0xFF)  # overwrite
+        _dm_snap_untch[si] = cast[uint8]((si * 3 + 77) & 0xFF)   # chunk 6
+        si = si + 1
+    # Seed the origin chunks directly on the backing device. Chunk 4 ->
+    # LBA 4*8 = 32; chunk 6 -> LBA 6*8 = 48.
+    if blk_write_sectors(back, 32, 1, &_dm_snap_orig[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: snapshot seed origin chunk 4\n")
+        return 0
+    if blk_write_sectors(back, 48, 1, &_dm_snap_untch[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: snapshot seed origin chunk 6\n")
+        return 0
+    # Create the snapshot VIEW (chunk=8, length=64) and its CoW origin.
+    snapv: int32 = dm_create_snapshot("dmsnap0", back, exc, 8, 64)
+    if snapv < 0:
+        _dm_emerg1("[device-mapper] FAIL: dm_create_snapshot rc=%d\n",
+                   cast[uint64](cast[int64](snapv)))
+        return 0
+    sctx: int32 = dm_snapshot_ctx_of("dmsnap0")
+    if sctx < 0:
+        _dm_emerg0("[device-mapper] FAIL: snapshot ctx lookup\n")
+        return 0
+    snapo: int32 = dm_create_snapshot_origin("dmsnap0-origin", sctx, 64)
+    if snapo < 0:
+        _dm_emerg1("[device-mapper] FAIL: dm_create_snapshot_origin rc=%d\n",
+                   cast[uint64](cast[int64](snapo)))
+        return 0
+    # Overwrite origin chunk 4 (LBA 32) THROUGH the CoW origin device. This
+    # must copy the ORIGINAL out to the exception store first.
+    if blk_write_sectors(snapo, 32, 1, &_dm_snap_new[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: snapshot origin write\n")
+        return 0
+
+    # (a) The snapshot view must STILL read the original pre-image.
+    if blk_read_sectors(snapv, 32, 1, &_dm_snap_read[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: snapshot view read (chunk 4)\n")
+        return 0
+    if _dm_buf_eq(&_dm_snap_read[0], &_dm_snap_orig[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: snapshot view lost pre-image (CoW broken)\n")
+        ok = 0
+    else:
+        _dm_emerg0("[devmapper] snapshot: CoW preserved origin pre-image OK\n")
+        _dm_emerg0("[dm] PASS snapshot-cow\n")
+
+    # (b) The exception store itself must hold the original pre-image. The
+    # first CoW allocates exception-store chunk 0 -> LBA 0.
+    if blk_read_sectors(exc, 0, 1, &_dm_snap_excrd[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: exception store read\n")
+        return 0
+    if _dm_buf_eq(&_dm_snap_excrd[0], &_dm_snap_orig[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: exception store missing pre-image\n")
+        ok = 0
+    else:
+        _dm_emerg0("[devmapper] snapshot: exception store holds pre-image OK\n")
+
+    # (c) The origin must now read the NEW data (live view advanced).
+    if blk_read_sectors(snapo, 32, 1, &_dm_snap_read[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: snapshot origin readback (chunk 4)\n")
+        return 0
+    if _dm_buf_eq(&_dm_snap_read[0], &_dm_snap_new[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: origin did not advance to new data\n")
+        ok = 0
+    else:
+        _dm_emerg0("[devmapper] snapshot: origin reads new data OK\n")
+
+    # (d) A chunk never written (chunk 6, LBA 48) reads through to the
+    # origin on BOTH the snapshot view and the origin device.
+    if blk_read_sectors(snapv, 48, 1, &_dm_snap_read[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: snapshot view read (chunk 6)\n")
+        return 0
+    if _dm_buf_eq(&_dm_snap_read[0], &_dm_snap_untch[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: snapshot passthrough (view) mismatch\n")
+        ok = 0
+    else:
+        if blk_read_sectors(snapo, 48, 1, &_dm_snap_excrd[0]) != 0:
+            _dm_emerg0("[device-mapper] FAIL: snapshot origin read (chunk 6)\n")
+            return 0
+        if _dm_buf_eq(&_dm_snap_excrd[0], &_dm_snap_untch[0], SECTOR_SIZE) != 1:
+            _dm_emerg0("[device-mapper] FAIL: snapshot passthrough (origin) mismatch\n")
+            ok = 0
+        else:
+            _dm_emerg0("[dm] PASS snapshot-passthrough\n")
+
+    if ok == 1:
+        _dm_emerg0("[dm] snapshot PASS\n")
+
     # Clean up the mapped devices (frees slots; leaves dmback0 in place).
     dm_remove("dmlin0")
     dm_remove("dmcat0")
     dm_remove("dmcrypt0")
+    dm_remove("dmsnap0")
+    dm_remove("dmsnap0-origin")
 
     if ok == 1:
         _dm_emerg0("[device-mapper] PASS\n")

@@ -20,6 +20,11 @@
 #     sectors yields DIFFERENT ciphertext (the sector-keyed plain64
 #     tweak), reads round-trip back to the original plaintext, AND the
 #     cipher reproduces an independent AES-256-XTS known-answer vector.
+#   * SNAPSHOT (dm-snapshot copy-on-write): an origin chunk written through
+#     the snapshot-origin device first copies its ORIGINAL contents into a
+#     SEPARATE exception store, so the snapshot view keeps reading the
+#     pre-image while the origin advances to the new data; a never-written
+#     chunk passes through to the origin on both views.
 #
 # The self-test needs NO external disk — it backs everything onto its own
 # in-kernel ramdisk, so the boot is fully deterministic.
@@ -107,6 +112,12 @@ check "crypt tweak sector-keyed" "[device-mapper] PASS dmcrypt-tweak: same plain
 check "crypt round-trip sec0"    "[device-mapper] PASS dmcrypt-roundtrip-sec0: sector 0 round-trips to plaintext OK"
 check "crypt round-trip sec1"    "[device-mapper] PASS dmcrypt-roundtrip-sec1: sector 1 round-trips to plaintext OK"
 check "crypt AES-XTS KAT vector" "[device-mapper] PASS dmcrypt-kat: AES-256-XTS vector matches reference OK"
+check "snapshot CoW pre-image"   "[devmapper] snapshot: CoW preserved origin pre-image OK"
+check "snapshot exc-store image" "[devmapper] snapshot: exception store holds pre-image OK"
+check "snapshot origin advanced" "[devmapper] snapshot: origin reads new data OK"
+check "snapshot CoW pass"        "[dm] PASS snapshot-cow"
+check "snapshot passthrough"     "[dm] PASS snapshot-passthrough"
+check "snapshot subtest PASS"    "[dm] snapshot PASS"
 check "device-mapper PASS"       "[device-mapper] PASS"
 
 if [ "$fail" -ne 0 ]; then
@@ -114,4 +125,4 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
-echo "[test_devmapper] PASS — native device-mapper: linear remap, two-target concatenation, and AES-256-XTS dm-crypt (aes-xts-plain64: sector-keyed tweak, ciphertext-on-disk, plaintext round-trip, known-answer vector) all verified"
+echo "[test_devmapper] PASS — native device-mapper: linear remap, two-target concatenation, AES-256-XTS dm-crypt (aes-xts-plain64: sector-keyed tweak, ciphertext-on-disk, plaintext round-trip, known-answer vector), and dm-snapshot copy-on-write (origin-write preserves the snapshot pre-image in a separate exception store; origin advances to new data; never-written chunks pass through to origin) all verified"
