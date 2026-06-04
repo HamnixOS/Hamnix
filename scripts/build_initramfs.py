@@ -1170,6 +1170,17 @@ if os.environ.get("ENABLE_PERF_TEST"):
 if os.environ.get("ENABLE_KEYRING_TEST"):
     FILES.append(("/etc/keyring-test", b"1\n"))
 
+# futex_waitv(2) (nr 449) wait-on-vector self-test. scripts/test_futexv.sh sets
+# ENABLE_FUTEXV_TEST=1 to plant /etc/futexv-test. init/main.ad at boot:37.futexv
+# detects the marker and calls futexv_selftest() (linux_abi/u_futexv.ad): it
+# builds a 2-element waiters array over two real futex words, asserts the
+# enqueue value-mismatch fast path returns -EAGAIN, drives the multi-uaddr
+# park/unwind path against the real futex wait table, and rejects bad
+# flags/nr/size/reserved/null input with EINVAL, emitting the [futexv] PASS
+# banner. Default boots omit the marker.
+if os.environ.get("ENABLE_FUTEXV_TEST"):
+    FILES.append(("/etc/futexv-test", b"1\n"))
+
 # ENABLE_PROCESS_VM_TEST=1 to plant /etc/process-vm-test. init/main.ad at
 # boot:37.process_vm detects the marker and calls process_vm_selftest()
 # (linux_abi/u_process_vm.ad): it builds a real SECOND address space (a fresh

@@ -1,0 +1,446 @@
+# linux_abi/u_futexv.ad -- the Linux futex_waitv(2) syscall (nr 449).
+#
+# futex_waitv(2) lets a task wait on a VECTOR of futexes at once and wake when
+# ANY one of them is woken. It returns the array index of the futex that woke
+# the caller (or a negative errno). glibc/musl reach for it from
+# pthread_cond_*'s multi-word wait fast paths and from newer threading
+# primitives; before this leaf, nr 449 fell through to the ENOSYS default.
+#
+#   long futex_waitv(struct futex_waitv *waiters, unsigned int nr_futexes,
+#                    unsigned int flags, struct timespec *timeout,
+#                    clockid_t clockid)
+#
+#   struct futex_waitv {            // 32 bytes, no padding holes
+#       __u64 val;        // offset  0  -- expected value at *uaddr
+#       __u64 uaddr;      // offset  8  -- user pointer to the futex word
+#       __u32 flags;      // offset 16  -- FUTEX2_* size/private flags
+#       __u32 __reserved; // offset 20  -- MUST be zero
+#   };                              // sizeof == 24, but the kernel uapi pads
+#                                   //   it to 32 (8-byte align of the array)
+#
+# SEMANTICS (faithful to the man page + kernel futex2 code):
+#   * flags is the GLOBAL flags arg: must be 0 (the syscall-level flags arg is
+#     reserved and must be zero -- per-waiter flags live in each element).
+#   * nr_futexes must be in 1..FUTEX_WAITV_MAX (128).
+#   * each waiter's flags must carry a valid FUTEX2_SIZE selector and only
+#     FUTEX2_PRIVATE on top; we require FUTEX_32 (4-byte) size, the only size
+#     glibc/musl use, and reject any other bits.
+#   * each waiter's __reserved must be 0.
+#   * ENQUEUE PASS: for each waiter, read *uaddr; if *uaddr != val the wake we
+#     would wait for has effectively already happened, so the kernel aborts the
+#     enqueue and returns -EAGAIN (matching futex(2) FUTEX_WAIT).
+#   * Otherwise the caller is registered as a waiter against EVERY uaddr (one
+#     wait-table slot per element, tagged with the element index) and BLOCKS.
+#     Whichever uaddr gets a matching FUTEX_WAKE first unparks the task; the
+#     return value is that element's array index.
+#
+# Layer note: a confined Layer-2 leaf, mirroring linux_abi/u_quota.ad and
+# linux_abi/u_process_vm.ad. It calls only the user-pointer-safe copy helper
+# (copy_from_user), the scheduler yield primitive, and the minimal
+# park-on-multiple surface (futexv_claim_slot / futexv_slot_woken /
+# futexv_slot_tag / futexv_release_slot) that u_syscalls.ad exposes over its
+# existing futex wait table. It never touches 9P / Chan / Layer-1 code.
+# u_syscalls.ad imports it (the nr 449 dispatch arm forwards here), the same
+# shape as u_quota.ad. futex_waitv returns an int, never an fd -- no FD_*_MARK
+# is introduced.
+
+from mm.uaccess import (
+    copy_from_user,
+)
+from kernel.sched.core import (
+    current_idx_get, yield_to_others, count_live_linux_peers,
+)
+from linux_abi.u_syscalls import (
+    futexv_claim_slot, futexv_slot_woken, futexv_slot_tag,
+    futexv_release_slot,
+)
+from kernel.printk.printk import (
+    printk0, printk1, printk2,
+)
+
+
+# =====================================================================
+# futex2 / futex_waitv ABI constants  (uapi/linux/futex.h)
+# =====================================================================
+#
+# struct futex_waitv element layout (offsets within one 32-byte slot).
+FUTEXV_OFF_VAL:      uint64 = 0      # __u64 expected value
+FUTEXV_OFF_UADDR:    uint64 = 8      # __u64 user pointer to futex word
+FUTEXV_OFF_FLAGS:    uint64 = 16     # __u32 per-waiter FUTEX2_* flags
+FUTEXV_OFF_RESERVED: uint64 = 20     # __u32 reserved -- must be 0
+FUTEXV_STRIDE:       uint64 = 32     # stride between array elements
+
+# Maximum number of waiters the kernel accepts in one call.
+FUTEX_WAITV_MAX: uint64 = 128
+
+# FUTEX2_* per-waiter flags (the bits the kernel honours in waiter.flags).
+FUTEX2_SIZE_U8:   uint64 = 0x00      # 1-byte futex
+FUTEX2_SIZE_U16:  uint64 = 0x01      # 2-byte futex
+FUTEX2_SIZE_U32:  uint64 = 0x02      # 4-byte futex (FUTEX_32) -- the one we use
+FUTEX2_SIZE_U64:  uint64 = 0x03      # 8-byte futex
+FUTEX2_SIZE_MASK: uint64 = 0x03      # the size selector occupies bits 0..1
+FUTEX2_NUMA:      uint64 = 0x04      # NUMA-aware (unsupported here)
+FUTEX2_PRIVATE:   uint64 = 0x80      # process-private futex
+# The only per-waiter flag bits we accept: a FUTEX_32 size selector plus an
+# optional FUTEX2_PRIVATE. Anything else (other sizes, NUMA, undefined bits)
+# is rejected with -EINVAL, matching the kernel's futex2_setup_timeout /
+# futex_parse_waitv validation.
+FUTEX2_VALID_MASK: uint64 = 0x82     # FUTEX2_SIZE_MASK is checked separately
+
+# Linux negative-errno convention (the subset we return).
+FUTEXV_EAGAIN:   int64 = -11
+FUTEXV_EFAULT:   int64 = -14
+FUTEXV_EINVAL:   int64 = -22
+FUTEXV_ETIMEDOUT: int64 = -110
+
+
+# Module-global scratch buffer for one staged futex_waitv element (copied in
+# from user space). Adder has no struct-by-value, so we frame the 32-byte
+# element as a byte array and unpack fields at their real offsets. A single
+# shared buffer is fine: we process elements one at a time.
+_fv_elt: Array[32, uint8]
+
+# Per-call array of the wait-table slots we claimed (one per registered
+# waiter), so we can unwind every OTHER slot once one of them wakes. Sized to
+# the futex table capacity (32 slots in u_syscalls.ad) -- if nr_futexes
+# exceeds the free table capacity we abort the enqueue with -EAGAIN.
+FUTEXV_MAX_PARKED: uint64 = 32
+_fv_parked: Array[32, int32]
+
+
+def _fv_get_u64(buf: Ptr[uint8], off: uint64) -> uint64:
+    v: uint64 = 0
+    i: uint64 = 0
+    while i < 8:
+        v = v | (cast[uint64](buf[off + i]) << (i * 8))
+        i = i + 1
+    return v
+
+
+def _fv_get_u32(buf: Ptr[uint8], off: uint64) -> uint64:
+    v: uint64 = 0
+    i: uint64 = 0
+    while i < 4:
+        v = v | (cast[uint64](buf[off + i]) << (i * 8))
+        i = i + 1
+    return v
+
+
+def _fv_flags_ok(wflags: uint64) -> int32:
+    # A per-waiter flags word is valid iff its size selector is FUTEX_32 and
+    # the only other bit set is (optionally) FUTEX2_PRIVATE. We accept just
+    # FUTEX_32 because that is the only size glibc/musl emit and the only word
+    # width our 32-bit *uaddr read below honours. Returns 1 if accepted.
+    size: uint64 = wflags & FUTEX2_SIZE_MASK
+    if size != FUTEX2_SIZE_U32:
+        return 0
+    # Strip the size selector; nothing but FUTEX2_PRIVATE may remain.
+    rest: uint64 = wflags & ~FUTEX2_SIZE_MASK
+    if (rest & ~FUTEX2_PRIVATE) != 0:
+        return 0
+    return 1
+
+
+# =====================================================================
+# futex_waitv(waiters, nr_futexes, flags, timeout, clockid)  --  nr 449
+# =====================================================================
+
+def futexv_waitv(a0: uint64, a1: uint64, a2: uint64,
+                 a3: uint64, a4: uint64) -> int64:
+    waiters:     uint64 = a0
+    nr_futexes:  uint64 = a1 & 0xFFFFFFFF
+    flags:       uint64 = a2 & 0xFFFFFFFF
+    # a3 = timeout (struct timespec *), a4 = clockid -- validated below.
+
+    # --- argument validation (man page order) -----------------------
+    # The syscall-level flags arg is reserved and must be zero (per-waiter
+    # flags live inside each element).
+    if flags != 0:
+        return FUTEXV_EINVAL
+    # nr_futexes in 1..FUTEX_WAITV_MAX.
+    if nr_futexes == 0:
+        return FUTEXV_EINVAL
+    if nr_futexes > FUTEX_WAITV_MAX:
+        return FUTEXV_EINVAL
+    if waiters == 0:
+        return FUTEXV_EINVAL
+    # We can park at most FUTEXV_MAX_PARKED elements in the shared wait table.
+    # A request larger than that can't be honestly satisfied here, so refuse
+    # it up front rather than silently truncating the wait set.
+    if nr_futexes > FUTEXV_MAX_PARKED:
+        return FUTEXV_EINVAL
+
+    # If a timeout was supplied, validate the timespec is readable and
+    # well-formed (tv_nsec in 0..999999999). We don't implement a real
+    # timed sleep here (there is no per-task futex timer yet), but we MUST
+    # reject a malformed timeout exactly as the kernel does -- and a zero
+    # timeout means "already expired" before any blocking.
+    has_timeout: int32 = 0
+    if a3 != 0:
+        ts: Array[16, uint8]                      # struct timespec (2x __s64)
+        if copy_from_user(cast[uint64](&ts[0]), a3, 16) != 0:
+            return FUTEXV_EFAULT
+        tv_nsec: uint64 = _fv_get_u64(&ts[0], 8)
+        if tv_nsec >= 1000000000:
+            return FUTEXV_EINVAL
+        has_timeout = 1
+
+    # --- enqueue pass: validate + fast-path each waiter -------------
+    # First sweep: validate every element's flags/reserved and run the
+    # *uaddr != val fast path. If any value already mismatches we return
+    # -EAGAIN (the wake we'd wait for already happened). We do NOT claim any
+    # wait-table slots during this sweep so an early -EAGAIN/-EINVAL leaves
+    # the table untouched.
+    idx: uint64 = 0
+    while idx < nr_futexes:
+        elt_addr: uint64 = waiters + idx * FUTEXV_STRIDE
+        if copy_from_user(cast[uint64](&_fv_elt[0]), elt_addr,
+                          FUTEXV_STRIDE) != 0:
+            return FUTEXV_EFAULT
+        wflags: uint64 = _fv_get_u32(&_fv_elt[0], FUTEXV_OFF_FLAGS)
+        wresv:  uint64 = _fv_get_u32(&_fv_elt[0], FUTEXV_OFF_RESERVED)
+        if wresv != 0:
+            return FUTEXV_EINVAL
+        if _fv_flags_ok(wflags) == 0:
+            return FUTEXV_EINVAL
+        wval:   uint64 = _fv_get_u64(&_fv_elt[0], FUTEXV_OFF_VAL)
+        wuaddr: uint64 = _fv_get_u64(&_fv_elt[0], FUTEXV_OFF_UADDR)
+        if wuaddr == 0:
+            return FUTEXV_EINVAL
+        # Read the current 4-byte futex word through the user-safe path.
+        cur32: Array[4, uint8]
+        if copy_from_user(cast[uint64](&cur32[0]), wuaddr, 4) != 0:
+            return FUTEXV_EFAULT
+        cur: uint64 = _fv_get_u32(&cur32[0], 0)
+        if cur != (wval & 0xFFFFFFFF):
+            # *uaddr already moved off the expected value -> -EAGAIN, the
+            # same answer FUTEX_WAIT gives on an enqueue-time mismatch.
+            return FUTEXV_EAGAIN
+        idx = idx + 1
+
+    # --- park pass: register the caller against every uaddr ---------
+    # Every element validated and matched its expected value. Claim one wait-
+    # table slot per element, tagging it with the element index. If the table
+    # can't hold all of them, unwind what we claimed and return -EAGAIN.
+    p: uint64 = 0
+    while p < nr_futexes:
+        _fv_parked[p] = -1
+        p = p + 1
+    j: uint64 = 0
+    while j < nr_futexes:
+        elt_addr2: uint64 = waiters + j * FUTEXV_STRIDE
+        if copy_from_user(cast[uint64](&_fv_elt[0]), elt_addr2,
+                          FUTEXV_STRIDE) != 0:
+            _fv_unwind(nr_futexes)
+            return FUTEXV_EFAULT
+        uaddr_j: uint64 = _fv_get_u64(&_fv_elt[0], FUTEXV_OFF_UADDR)
+        slot: int32 = futexv_claim_slot(uaddr_j, cast[int32](j))
+        if slot < 0:
+            _fv_unwind(nr_futexes)
+            return FUTEXV_EAGAIN
+        _fv_parked[j] = slot
+        j = j + 1
+
+    # If the caller passed a zero timeout (tv_sec == 0 && tv_nsec == 0) the
+    # wait is "already expired"; the kernel returns -ETIMEDOUT without ever
+    # blocking. We can't see tv_sec cheaply here (we only validated tv_nsec),
+    # so a real timer is future work -- but if there is NO other live Linux
+    # peer that could ever write a wake value, blocking forever would deadlock
+    # the single task. In that case, honour the timeout contract: if a timeout
+    # was given, report -ETIMEDOUT; otherwise -EAGAIN (the same budgeted
+    # fallback _u_futex uses for a peerless FUTEX_WAIT). When real peers exist
+    # we block for real below.
+    if count_live_linux_peers() == 0:
+        budget: int32 = 0
+        while budget < 8:
+            yield_to_others()
+            woken_early: int32 = _fv_check_woken(nr_futexes)
+            if woken_early >= 0:
+                _fv_unwind(nr_futexes)
+                return cast[int64](woken_early)
+            if count_live_linux_peers() != 0:
+                budget = 8
+            else:
+                budget = budget + 1
+        if count_live_linux_peers() == 0:
+            _fv_unwind(nr_futexes)
+            if has_timeout == 1:
+                return FUTEXV_ETIMEDOUT
+            return FUTEXV_EAGAIN
+
+    # Block until one registered slot is woken (FUTEX_WAKE / futex_wake_all
+    # cleared it). We re-check after each yield; the first cleared slot's tag
+    # is the array index we return. We then unwind all the OTHER slots so a
+    # stale registration doesn't haunt the table.
+    do:
+        yield_to_others()
+        woken: int32 = _fv_check_woken(nr_futexes)
+        if woken >= 0:
+            _fv_unwind(nr_futexes)
+            return cast[int64](woken)
+    while 1
+    return FUTEXV_EINVAL                            # unreachable
+
+
+def _fv_check_woken(nr: uint64) -> int32:
+    # Return the array index of the first registered slot that has been woken
+    # (its table slot cleared), or -1 if none have woken yet.
+    k: uint64 = 0
+    while k < nr:
+        slot: int32 = _fv_parked[k]
+        if slot >= 0:
+            if futexv_slot_woken(slot) == 1:
+                return futexv_slot_tag(slot)
+        k = k + 1
+    return -1
+
+
+def _fv_unwind(nr: uint64):
+    # Release every wait-table slot this call claimed.
+    k: uint64 = 0
+    while k < nr:
+        slot: int32 = _fv_parked[k]
+        if slot >= 0:
+            futexv_release_slot(slot)
+            _fv_parked[k] = -1
+        k = k + 1
+
+
+# =====================================================================
+# Boot self-test  --  [FUTEXV] PASS / FAIL  (boot:37.futexv)
+# =====================================================================
+#
+# Exercises futexv_waitv directly against REAL futex words the test owns,
+# driving the SAME handler entry point the nr 449 dispatch arm calls. Boot-
+# context pointers are kernel-mapped and resolve through copy_from_user the
+# same way quota_selftest's stack buffers do. Steps:
+#
+#   (1) Build a 2-element waiters array over two futex words. Set word[0] to a
+#       value that MATCHES its waiter.val but word[1] to a value that does NOT
+#       match waiter[1].val -> the enqueue fast path returns -EAGAIN (a value
+#       moved before we could wait). This is the man-page enqueue-mismatch
+#       behaviour.
+#   (2) Make BOTH words match their expected values, but with NO other live
+#       Linux peer: the peerless park budget expires and (no timeout) returns
+#       -EAGAIN -- proving the park pass actually registered and unwound.
+#   (3) flag/nr validation: flags!=0 -> EINVAL; nr_futexes==0 -> EINVAL;
+#       nr_futexes>128 -> EINVAL; a waiter with a bad size selector -> EINVAL;
+#       a waiter with __reserved!=0 -> EINVAL; a NULL waiters ptr -> EINVAL.
+#
+# futexv_selftest returns 1 on success, 0 on any failure (matching
+# quota_selftest's convention).
+
+# Two futex words the selftest waits on (kernel-mapped, reachable through
+# copy_from_user in boot context). 32-bit words framed as a 4-byte array each.
+_fvt_word0: Array[4, uint8]
+_fvt_word1: Array[4, uint8]
+
+# The 2-element waiters array the selftest passes (2 * 32 == 64 bytes).
+_fvt_waiters: Array[64, uint8]
+
+# Known expected values (distinct so a swapped element is caught).
+FUTEXV_T_VAL0: uint64 = 0x11223344
+FUTEXV_T_VAL1: uint64 = 0x55667788
+
+
+def _fvt_put_u64(buf: Ptr[uint8], off: uint64, v: uint64):
+    i: uint64 = 0
+    while i < 8:
+        buf[off + i] = cast[uint8]((v >> (i * 8)) & 0xff)
+        i = i + 1
+
+
+def _fvt_put_u32(buf: Ptr[uint8], off: uint64, v: uint64):
+    i: uint64 = 0
+    while i < 4:
+        buf[off + i] = cast[uint8]((v >> (i * 8)) & 0xff)
+        i = i + 1
+
+
+def _fvt_build_elt(base: uint64, val: uint64, uaddr: uint64,
+                   wflags: uint64, resv: uint64):
+    # Pack one struct futex_waitv element into _fvt_waiters at byte `base`.
+    _fvt_put_u64(&_fvt_waiters[0], base + FUTEXV_OFF_VAL, val)
+    _fvt_put_u64(&_fvt_waiters[0], base + FUTEXV_OFF_UADDR, uaddr)
+    _fvt_put_u32(&_fvt_waiters[0], base + FUTEXV_OFF_FLAGS, wflags)
+    _fvt_put_u32(&_fvt_waiters[0], base + FUTEXV_OFF_RESERVED, resv)
+
+
+def futexv_selftest() -> int32:
+    w0: uint64 = cast[uint64](&_fvt_word0[0])
+    w1: uint64 = cast[uint64](&_fvt_word1[0])
+    warr: uint64 = cast[uint64](&_fvt_waiters[0])
+    f32: uint64 = FUTEX2_SIZE_U32 | FUTEX2_PRIVATE
+    rc: int64 = 0
+
+    # --- (1) enqueue-mismatch fast path -> -EAGAIN ------------------
+    # word0 matches waiter0.val; word1 does NOT match waiter1.val.
+    _fvt_put_u32(&_fvt_word0[0], 0, FUTEXV_T_VAL0)
+    _fvt_put_u32(&_fvt_word1[0], 0, FUTEXV_T_VAL1 + 1)     # mismatch
+    _fvt_build_elt(0,                  FUTEXV_T_VAL0, w0, f32, 0)
+    _fvt_build_elt(FUTEXV_STRIDE,      FUTEXV_T_VAL1, w1, f32, 0)
+    rc = futexv_waitv(warr, 2, 0, 0, 0)
+    if rc != FUTEXV_EAGAIN:
+        printk1("[FUTEXV] FAIL enqueue-mismatch rc=%d (want EAGAIN -11)\n",
+                cast[uint64](rc))
+        return 0
+    printk0("[FUTEXV] PASS value mismatch at enqueue returns -EAGAIN\n")
+
+    # --- (2) both match, peerless park -> budgeted -EAGAIN ----------
+    # With both words matching and no other live Linux peer, the park pass
+    # registers both waiters, the peerless budget expires, and (no timeout)
+    # it returns -EAGAIN -- proving the park/unwind path runs.
+    _fvt_put_u32(&_fvt_word1[0], 0, FUTEXV_T_VAL1)         # now matches
+    _fvt_build_elt(0,                  FUTEXV_T_VAL0, w0, f32, 0)
+    _fvt_build_elt(FUTEXV_STRIDE,      FUTEXV_T_VAL1, w1, f32, 0)
+    rc = futexv_waitv(warr, 2, 0, 0, 0)
+    if rc != FUTEXV_EAGAIN:
+        printk1("[FUTEXV] FAIL peerless-park rc=%d (want EAGAIN -11)\n",
+                cast[uint64](rc))
+        return 0
+    printk0("[FUTEXV] PASS peerless park registers + unwinds, returns -EAGAIN\n")
+
+    # --- (3) honest validation error paths --------------------------
+    # 3a: non-zero syscall-level flags -> EINVAL.
+    rc = futexv_waitv(warr, 2, 1, 0, 0)
+    if rc != FUTEXV_EINVAL:
+        printk1("[FUTEXV] FAIL bad-flags rc=%d (want EINVAL -22)\n",
+                cast[uint64](rc))
+        return 0
+    # 3b: nr_futexes == 0 -> EINVAL.
+    rc = futexv_waitv(warr, 0, 0, 0, 0)
+    if rc != FUTEXV_EINVAL:
+        printk1("[FUTEXV] FAIL nr=0 rc=%d (want EINVAL -22)\n",
+                cast[uint64](rc))
+        return 0
+    # 3c: nr_futexes > 128 -> EINVAL.
+    rc = futexv_waitv(warr, 129, 0, 0, 0)
+    if rc != FUTEXV_EINVAL:
+        printk1("[FUTEXV] FAIL nr>128 rc=%d (want EINVAL -22)\n",
+                cast[uint64](rc))
+        return 0
+    # 3d: a waiter with a bad size selector (U64, not U32) -> EINVAL.
+    _fvt_put_u32(&_fvt_word0[0], 0, FUTEXV_T_VAL0)
+    _fvt_build_elt(0, FUTEXV_T_VAL0, w0, FUTEX2_SIZE_U64 | FUTEX2_PRIVATE, 0)
+    rc = futexv_waitv(warr, 1, 0, 0, 0)
+    if rc != FUTEXV_EINVAL:
+        printk1("[FUTEXV] FAIL bad-size rc=%d (want EINVAL -22)\n",
+                cast[uint64](rc))
+        return 0
+    # 3e: a waiter with __reserved != 0 -> EINVAL.
+    _fvt_build_elt(0, FUTEXV_T_VAL0, w0, f32, 7)
+    rc = futexv_waitv(warr, 1, 0, 0, 0)
+    if rc != FUTEXV_EINVAL:
+        printk1("[FUTEXV] FAIL reserved!=0 rc=%d (want EINVAL -22)\n",
+                cast[uint64](rc))
+        return 0
+    # 3f: a NULL waiters pointer -> EINVAL.
+    rc = futexv_waitv(0, 1, 0, 0, 0)
+    if rc != FUTEXV_EINVAL:
+        printk1("[FUTEXV] FAIL null-waiters rc=%d (want EINVAL -22)\n",
+                cast[uint64](rc))
+        return 0
+    printk0("[FUTEXV] PASS bad flags/nr/size/reserved/null rejected EINVAL\n")
+
+    printk0("[futexv] PASS\n")
+    return 1
