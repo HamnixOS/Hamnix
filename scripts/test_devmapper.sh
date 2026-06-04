@@ -14,11 +14,12 @@
 #     span A to backing region @64 and span B to backing region @128, so
 #     a write to a sector in each span lands in the correct backing
 #     offset (66 and 130 respectively).
-#   * CRYPT (dm-crypt / ChaCha20): plaintext written through the crypt
-#     device is CIPHERTEXT on the backing store (differs from plaintext),
-#     the SAME plaintext at two sectors yields DIFFERENT ciphertext (the
-#     sector-keyed plain64 IV), and reads round-trip back to the original
-#     plaintext.
+#   * CRYPT (dm-crypt / AES-256-XTS, the aes-xts-plain64 default):
+#     plaintext written through the crypt device is CIPHERTEXT on the
+#     backing store (differs from plaintext), the SAME plaintext at two
+#     sectors yields DIFFERENT ciphertext (the sector-keyed plain64
+#     tweak), reads round-trip back to the original plaintext, AND the
+#     cipher reproduces an independent AES-256-XTS known-answer vector.
 #
 # The self-test needs NO external disk — it backs everything onto its own
 # in-kernel ramdisk, so the boot is fully deterministic.
@@ -101,10 +102,11 @@ check "linear remap"             "[device-mapper] linear: vLBA5 -> backing secto
 check "linear readback"          "[device-mapper] linear: readback byte-identical OK"
 check "concat span A"            "[device-mapper] concat: span A vLBA2 -> backing 66 OK"
 check "concat span B"            "[device-mapper] concat: span B vLBA10 -> backing 130 OK"
-check "crypt ciphertext on disk" "[device-mapper] crypt: backing sector 192 is ciphertext OK"
-check "crypt IV sector-keyed"    "[device-mapper] crypt: same plaintext, two sectors -> different ciphertext OK"
-check "crypt round-trip sec0"    "[device-mapper] crypt: sector 0 round-trips to plaintext OK"
-check "crypt round-trip sec1"    "[device-mapper] crypt: sector 1 round-trips to plaintext OK"
+check "crypt ciphertext on disk" "[device-mapper] PASS dmcrypt-ciphertext: backing sector 192 is ciphertext OK"
+check "crypt tweak sector-keyed" "[device-mapper] PASS dmcrypt-tweak: same plaintext, two sectors -> different ciphertext OK"
+check "crypt round-trip sec0"    "[device-mapper] PASS dmcrypt-roundtrip-sec0: sector 0 round-trips to plaintext OK"
+check "crypt round-trip sec1"    "[device-mapper] PASS dmcrypt-roundtrip-sec1: sector 1 round-trips to plaintext OK"
+check "crypt AES-XTS KAT vector" "[device-mapper] PASS dmcrypt-kat: AES-256-XTS vector matches reference OK"
 check "device-mapper PASS"       "[device-mapper] PASS"
 
 if [ "$fail" -ne 0 ]; then
@@ -112,4 +114,4 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
-echo "[test_devmapper] PASS — native device-mapper: linear remap, two-target concatenation, and ChaCha20 dm-crypt (sector-keyed IV, ciphertext-on-disk, plaintext round-trip) all verified"
+echo "[test_devmapper] PASS — native device-mapper: linear remap, two-target concatenation, and AES-256-XTS dm-crypt (aes-xts-plain64: sector-keyed tweak, ciphertext-on-disk, plaintext round-trip, known-answer vector) all verified"

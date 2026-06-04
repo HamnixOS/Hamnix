@@ -35,20 +35,35 @@
 #   at an offset) but encrypts every sector on the way out and decrypts
 #   on the way in, so the bytes resting on the backing store are
 #   ciphertext while reads through the mapped device return plaintext.
-#   The cipher is ChaCha20 (RFC 8439, 256-bit key) implemented in full
-#   below — NOT a toy XOR. WHY ChaCha20: the rest of the tree already
-#   ships proven ChaCha20 implementations (drivers/net/tls.ad's kernel
-#   TLS path; lib/ssh/sshcrypto.ad for the CPL-3 SSH server), but those
-#   are module-private `_tls_*` / user-space `ssh_*` helpers — tls.ad
-#   would drag the whole network stack into the block layer's import
-#   closure, and sshcrypto.ad is a CPL-3 user file. Re-namespacing the
-#   same standard algorithm here (the codebase's established pattern —
-#   see the duplication note in lib/ssh/sshcrypto.ad) keeps the block
-#   layer's dependencies minimal while still using a real, correct,
-#   well-understood stream cipher. The per-sector IV is dm-crypt's
-#   "plain64": the 64-bit sector number is the ChaCha block-counter /
-#   nonce seed, so the SAME plaintext at two DIFFERENT sectors encrypts
-#   to DIFFERENT ciphertext.
+#   The cipher is AES-256 in XTS mode — the exact `aes-xts-plain64`
+#   construction that is Linux dm-crypt / LUKS2's default. NOT a toy XOR,
+#   NOT a stream-cipher stand-in: it is a real tweakable block cipher
+#   (IEEE Std 1619-2007) implemented in full below.
+#
+#   WHY a standalone AES here (and not the AES already in tls.ad): the
+#   tree's only AES is drivers/net/tls.ad's GCM path, which (a) needs
+#   only AES ENCRYPT (CTR mode never decrypts the cipher) so it ships no
+#   inverse cipher, and (b) keeps a SINGLE shared 240-byte round-key
+#   schedule global (aes256_rk). XTS fundamentally needs the INVERSE
+#   cipher for reads and TWO independent keys live at once (a data key
+#   and a tweak key), so tls.ad's single-schedule, encrypt-only code
+#   cannot be borrowed without either clobbering live TLS state or
+#   re-expanding keys mid-block. The clean, decoupled answer — and the
+#   one the brief sanctions when reuse is impractical — is a small
+#   self-contained AES-256 (forward + inverse cipher) that owns its own
+#   data/tweak schedules in this file, with zero coupling to the network
+#   stack's import closure.
+#
+#   XTS (XEX-based tweaked-codebook with ciphertext stealing — here every
+#   transfer is a whole 512-byte sector = 32 exact AES blocks, so no
+#   stealing is needed): the tweak for a sector is AES_tweakkey(IV) where
+#   the IV is dm-crypt's "plain64" — the 64-bit sector number, little-
+#   endian, in a 16-byte block. For each 16-byte block j within the
+#   sector the running tweak T is GF(2^128)-multiplied by the primitive
+#   element alpha=x once per block; the block is XEX-masked
+#   (C = AES_datakey(P ^ T) ^ T). Identical plaintext at two different
+#   sectors therefore encrypts to different ciphertext (different IV ->
+#   different tweak), and every block is independently seekable.
 
 from kernel.block.blk import (
     BlockDeviceOps, register_blockdev, blk_unregister_by_name,
@@ -64,138 +79,410 @@ extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
 
 # =========================================================================
-# ChaCha20 (RFC 8439) — self-contained 256-bit-key stream cipher
+# AES-256 block cipher (FIPS 197) — self-contained, forward + inverse
 # =========================================================================
 #
-# The block function and its working state live in module-scope .bss
-# scratch (we can't recurse and big buffers must be module-scope per the
-# Adder array quirk). dm-crypt I/O is serialised through the synchronous
-# block layer, so a single shared scratch state is safe.
+# A real 14-round AES with a 256-bit master key. Unlike tls.ad's GCM
+# path (encrypt-only, single shared schedule), XTS needs BOTH the
+# forward and the inverse cipher and TWO live key schedules at once (a
+# data key and a tweak key), so this implementation owns two 240-byte
+# expanded schedules. The S-box / inverse S-box / GF(2^8) tables are
+# built once at init. All working state is module-scope .bss: dm-crypt
+# I/O is serialised through the synchronous block layer, so a single
+# shared block-state buffer is safe (no two crypt transfers overlap).
 
-_dm_chacha_state:     Array[16, uint32]
-_dm_chacha_block_out: Array[64, uint8]
+_dm_aes_sbox:     Array[256, uint8]   # forward S-box
+_dm_aes_isbox:    Array[256, uint8]   # inverse S-box
+_dm_aes_inited:   int32 = 0
+# GF(2^8) log/exp scratch for S-box construction.
+_dm_aes_log:      Array[256, uint16]
+_dm_aes_exp:      Array[256, uint8]
 
-
-def _dm_rotl32(v: uint32, n: uint64) -> uint32:
-    x:  uint64 = cast[uint64](v) & 0xFFFFFFFF
-    lo: uint64 = (x << n) & 0xFFFFFFFF
-    hi: uint64 = x >> (32 - n)
-    return cast[uint32](lo | hi)
-
-
-def _dm_le_load32(buf: Ptr[uint8], off: uint64) -> uint32:
-    b0: uint32 = cast[uint32](buf[off + 0])
-    b1: uint32 = cast[uint32](buf[off + 1])
-    b2: uint32 = cast[uint32](buf[off + 2])
-    b3: uint32 = cast[uint32](buf[off + 3])
-    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
-
-
-def _dm_le_store32(buf: Ptr[uint8], off: uint64, v: uint32):
-    buf[off + 0] = cast[uint8](v & 0xFF)
-    buf[off + 1] = cast[uint8]((v >> 8) & 0xFF)
-    buf[off + 2] = cast[uint8]((v >> 16) & 0xFF)
-    buf[off + 3] = cast[uint8]((v >> 24) & 0xFF)
+# Two independent 240-byte AES-256 expanded schedules: index 0 = data
+# key, index 1 = tweak key. Both forward; the data key also gets an
+# inverse schedule for the decrypt path.
+_dm_aes_rk_data:  Array[240, uint8]
+_dm_aes_rk_tweak: Array[240, uint8]
+_dm_aes_block_st: Array[16, uint8]    # working state for one block
 
 
-def _dm_chacha_qr(a_idx: uint64, b_idx: uint64,
-                  c_idx: uint64, d_idx: uint64):
-    a: uint64 = cast[uint64](_dm_chacha_state[a_idx]) & 0xFFFFFFFF
-    b: uint64 = cast[uint64](_dm_chacha_state[b_idx]) & 0xFFFFFFFF
-    c: uint64 = cast[uint64](_dm_chacha_state[c_idx]) & 0xFFFFFFFF
-    d: uint64 = cast[uint64](_dm_chacha_state[d_idx]) & 0xFFFFFFFF
-
-    a = (a + b) & 0xFFFFFFFF
-    d = d ^ a
-    d = cast[uint64](_dm_rotl32(cast[uint32](d), 16))
-
-    c = (c + d) & 0xFFFFFFFF
-    b = b ^ c
-    b = cast[uint64](_dm_rotl32(cast[uint32](b), 12))
-
-    a = (a + b) & 0xFFFFFFFF
-    d = d ^ a
-    d = cast[uint64](_dm_rotl32(cast[uint32](d), 8))
-
-    c = (c + d) & 0xFFFFFFFF
-    b = b ^ c
-    b = cast[uint64](_dm_rotl32(cast[uint32](b), 7))
-
-    _dm_chacha_state[a_idx] = cast[uint32](a)
-    _dm_chacha_state[b_idx] = cast[uint32](b)
-    _dm_chacha_state[c_idx] = cast[uint32](c)
-    _dm_chacha_state[d_idx] = cast[uint32](d)
+def _dm_aes_rotl8(v: uint8, n: uint64) -> uint8:
+    x: uint64 = cast[uint64](v) & 0xFF
+    return cast[uint8](((x << n) | (x >> (8 - n))) & 0xFF)
 
 
-def _dm_chacha_block(key: Ptr[uint8], counter: uint32, nonce: Ptr[uint8]):
-    # ChaCha20 block, RFC 8439 §2.3: state[12] = 32-bit block counter,
-    # state[13..15] = 96-bit nonce. `key` is 32 bytes, `nonce` is 12
-    # bytes. Produces 64 keystream bytes into _dm_chacha_block_out.
-    _dm_chacha_state[0] = 0x61707865
-    _dm_chacha_state[1] = 0x3320646E
-    _dm_chacha_state[2] = 0x79622D32
-    _dm_chacha_state[3] = 0x6B206574
-    _dm_chacha_state[4]  = _dm_le_load32(key, 0)
-    _dm_chacha_state[5]  = _dm_le_load32(key, 4)
-    _dm_chacha_state[6]  = _dm_le_load32(key, 8)
-    _dm_chacha_state[7]  = _dm_le_load32(key, 12)
-    _dm_chacha_state[8]  = _dm_le_load32(key, 16)
-    _dm_chacha_state[9]  = _dm_le_load32(key, 20)
-    _dm_chacha_state[10] = _dm_le_load32(key, 24)
-    _dm_chacha_state[11] = _dm_le_load32(key, 28)
-    _dm_chacha_state[12] = counter
-    _dm_chacha_state[13] = _dm_le_load32(nonce, 0)
-    _dm_chacha_state[14] = _dm_le_load32(nonce, 4)
-    _dm_chacha_state[15] = _dm_le_load32(nonce, 8)
+def _dm_aes_xtime(b: uint8) -> uint8:
+    # b * x mod (x^8 + x^4 + x^3 + x + 1) in GF(2^8).
+    v: uint64 = cast[uint64](b) & 0xFF
+    t: uint64 = (v << 1) & 0xFF
+    if (v & 0x80) != 0:
+        t = t ^ 0x1B
+    return cast[uint8](t & 0xFF)
 
-    orig: Array[16, uint32]
+
+def _dm_aes_gfmul(a: uint8, b: uint8) -> uint8:
+    # Full GF(2^8) multiply (used for the inverse MixColumns constants
+    # 9, 11, 13, 14). Russian-peasant.
+    av: uint64 = cast[uint64](a) & 0xFF
+    bv: uint64 = cast[uint64](b) & 0xFF
+    p:  uint64 = 0
+    i:  uint64 = 0
+    while i < 8:
+        if (bv & 1) != 0:
+            p = p ^ av
+        hi: uint64 = av & 0x80
+        av = (av << 1) & 0xFF
+        if hi != 0:
+            av = av ^ 0x1B
+        bv = bv >> 1
+        i = i + 1
+    return cast[uint8](p & 0xFF)
+
+
+def _dm_aes_init():
+    # Build the forward S-box (FIPS 197 §5.1.1) and its inverse at
+    # runtime via a GF(2^8) log/exp table with generator g=3.
+    if _dm_aes_inited != 0:
+        return
+    _dm_aes_inited = 1
+    i: uint64 = 0
+    x: uint16 = 1
+    while i < 255:
+        _dm_aes_exp[i] = cast[uint8](x & 0xFF)
+        _dm_aes_log[x & 0xFF] = cast[uint16](i)
+        x2: uint16 = (x << 1) & 0xFF
+        if (x & 0x80) != 0:
+            x2 = x2 ^ 0x1B
+        x = x2 ^ x
+        x = x & 0xFF
+        i = i + 1
+    _dm_aes_exp[255] = _dm_aes_exp[0]
+    _dm_aes_sbox[0] = 0x63
+    b: uint64 = 1
+    while b < 256:
+        inv: uint8 = _dm_aes_exp[(255 - cast[uint64](_dm_aes_log[b])) & 0xFF]
+        v: uint8 = inv
+        s: uint8 = v \
+            ^ _dm_aes_rotl8(v, 1) \
+            ^ _dm_aes_rotl8(v, 2) \
+            ^ _dm_aes_rotl8(v, 3) \
+            ^ _dm_aes_rotl8(v, 4) \
+            ^ 0x63
+        _dm_aes_sbox[b] = s
+        b = b + 1
+    # Inverse S-box: isbox[sbox[b]] = b.
+    b = 0
+    while b < 256:
+        _dm_aes_isbox[_dm_aes_sbox[b]] = cast[uint8](b)
+        b = b + 1
+
+
+def _dm_aes256_expand(master: Ptr[uint8], rk: Ptr[uint8]):
+    # FIPS 197 §5.2, AES-256: Nk=8, Nr=14, 240-byte expanded key into the
+    # caller-supplied 240-byte schedule buffer `rk`.
+    _dm_aes_init()
+    i: uint64 = 0
+    while i < 32:
+        rk[i] = master[i]
+        i = i + 1
+    rcon: uint8 = 0x01
+    i = 32
+    while i < 240:
+        t0: uint8 = rk[i - 4]
+        t1: uint8 = rk[i - 3]
+        t2: uint8 = rk[i - 2]
+        t3: uint8 = rk[i - 1]
+        word_idx: uint64 = i / 4
+        if (word_idx & 7) == 0:
+            r0: uint8 = _dm_aes_sbox[t1] ^ rcon
+            r1: uint8 = _dm_aes_sbox[t2]
+            r2: uint8 = _dm_aes_sbox[t3]
+            r3: uint8 = _dm_aes_sbox[t0]
+            t0 = r0
+            t1 = r1
+            t2 = r2
+            t3 = r3
+            rcon = _dm_aes_xtime(rcon)
+        elif (word_idx & 7) == 4:
+            t0 = _dm_aes_sbox[t0]
+            t1 = _dm_aes_sbox[t1]
+            t2 = _dm_aes_sbox[t2]
+            t3 = _dm_aes_sbox[t3]
+        rk[i + 0] = rk[i - 32 + 0] ^ t0
+        rk[i + 1] = rk[i - 32 + 1] ^ t1
+        rk[i + 2] = rk[i - 32 + 2] ^ t2
+        rk[i + 3] = rk[i - 32 + 3] ^ t3
+        i = i + 4
+
+
+def _dm_aes256_encrypt(rk: Ptr[uint8], out_blk: Ptr[uint8],
+                       in_blk: Ptr[uint8]):
+    # Encrypt one 16-byte block under the 240-byte schedule `rk` (Nr=14).
+    # State held column-major s[c*4 + r].
     i: uint64 = 0
     while i < 16:
-        orig[i] = _dm_chacha_state[i]
+        _dm_aes_block_st[i] = in_blk[i] ^ rk[i]
         i = i + 1
-
-    r: uint64 = 0
-    while r < 10:
-        _dm_chacha_qr(0, 4, 8, 12)
-        _dm_chacha_qr(1, 5, 9, 13)
-        _dm_chacha_qr(2, 6, 10, 14)
-        _dm_chacha_qr(3, 7, 11, 15)
-        _dm_chacha_qr(0, 5, 10, 15)
-        _dm_chacha_qr(1, 6, 11, 12)
-        _dm_chacha_qr(2, 7, 8, 13)
-        _dm_chacha_qr(3, 4, 9, 14)
-        r = r + 1
-
+    rnd: uint64 = 1
+    while rnd <= 13:
+        i = 0
+        while i < 16:
+            _dm_aes_block_st[i] = _dm_aes_sbox[_dm_aes_block_st[i]]
+            i = i + 1
+        # ShiftRows
+        t1: uint8 = _dm_aes_block_st[1]
+        _dm_aes_block_st[1] = _dm_aes_block_st[5]
+        _dm_aes_block_st[5] = _dm_aes_block_st[9]
+        _dm_aes_block_st[9] = _dm_aes_block_st[13]
+        _dm_aes_block_st[13] = t1
+        t2a: uint8 = _dm_aes_block_st[2]
+        t2b: uint8 = _dm_aes_block_st[6]
+        _dm_aes_block_st[2] = _dm_aes_block_st[10]
+        _dm_aes_block_st[6] = _dm_aes_block_st[14]
+        _dm_aes_block_st[10] = t2a
+        _dm_aes_block_st[14] = t2b
+        t3: uint8 = _dm_aes_block_st[15]
+        _dm_aes_block_st[15] = _dm_aes_block_st[11]
+        _dm_aes_block_st[11] = _dm_aes_block_st[7]
+        _dm_aes_block_st[7] = _dm_aes_block_st[3]
+        _dm_aes_block_st[3] = t3
+        # MixColumns
+        c: uint64 = 0
+        while c < 4:
+            s0: uint8 = _dm_aes_block_st[c * 4 + 0]
+            s1: uint8 = _dm_aes_block_st[c * 4 + 1]
+            s2: uint8 = _dm_aes_block_st[c * 4 + 2]
+            s3: uint8 = _dm_aes_block_st[c * 4 + 3]
+            x0: uint8 = _dm_aes_xtime(s0)
+            x1: uint8 = _dm_aes_xtime(s1)
+            x2: uint8 = _dm_aes_xtime(s2)
+            x3: uint8 = _dm_aes_xtime(s3)
+            _dm_aes_block_st[c * 4 + 0] = x0 ^ (x1 ^ s1) ^ s2 ^ s3
+            _dm_aes_block_st[c * 4 + 1] = s0 ^ x1 ^ (x2 ^ s2) ^ s3
+            _dm_aes_block_st[c * 4 + 2] = s0 ^ s1 ^ x2 ^ (x3 ^ s3)
+            _dm_aes_block_st[c * 4 + 3] = (x0 ^ s0) ^ s1 ^ s2 ^ x3
+            c = c + 1
+        rk_base: uint64 = rnd * 16
+        i = 0
+        while i < 16:
+            _dm_aes_block_st[i] = _dm_aes_block_st[i] ^ rk[rk_base + i]
+            i = i + 1
+        rnd = rnd + 1
+    # Final round: SubBytes + ShiftRows + AddRoundKey (no MixColumns).
     i = 0
     while i < 16:
-        sum_w: uint64 = ((cast[uint64](_dm_chacha_state[i]) & 0xFFFFFFFF)
-                         + (cast[uint64](orig[i]) & 0xFFFFFFFF)) & 0xFFFFFFFF
-        _dm_le_store32(cast[Ptr[uint8]](&_dm_chacha_block_out[0]),
-                       i * 4, cast[uint32](sum_w))
+        _dm_aes_block_st[i] = _dm_aes_sbox[_dm_aes_block_st[i]]
+        i = i + 1
+    t1f: uint8 = _dm_aes_block_st[1]
+    _dm_aes_block_st[1] = _dm_aes_block_st[5]
+    _dm_aes_block_st[5] = _dm_aes_block_st[9]
+    _dm_aes_block_st[9] = _dm_aes_block_st[13]
+    _dm_aes_block_st[13] = t1f
+    t2af: uint8 = _dm_aes_block_st[2]
+    t2bf: uint8 = _dm_aes_block_st[6]
+    _dm_aes_block_st[2] = _dm_aes_block_st[10]
+    _dm_aes_block_st[6] = _dm_aes_block_st[14]
+    _dm_aes_block_st[10] = t2af
+    _dm_aes_block_st[14] = t2bf
+    t3f: uint8 = _dm_aes_block_st[15]
+    _dm_aes_block_st[15] = _dm_aes_block_st[11]
+    _dm_aes_block_st[11] = _dm_aes_block_st[7]
+    _dm_aes_block_st[7] = _dm_aes_block_st[3]
+    _dm_aes_block_st[3] = t3f
+    i = 0
+    while i < 16:
+        out_blk[i] = _dm_aes_block_st[i] ^ rk[14 * 16 + i]
         i = i + 1
 
 
-def _dm_chacha20_xor(key: Ptr[uint8], counter_start: uint32,
-                     nonce: Ptr[uint8],
-                     dst: Ptr[uint8], src: Ptr[uint8], n: uint64):
-    # XOR-encrypt n bytes from src into dst, starting at block counter
-    # `counter_start`. RFC 8439 §2.4. Encrypt and decrypt are the same
-    # operation (the keystream is added/removed by XOR), so dm-crypt's
-    # read and write paths both call this.
-    block_ptr: Ptr[uint8] = cast[Ptr[uint8]](&_dm_chacha_block_out[0])
-    pos:     uint64 = 0
-    counter: uint32 = counter_start
-    while pos < n:
-        _dm_chacha_block(key, counter, nonce)
-        chunk: uint64 = 64
-        if n - pos < chunk:
-            chunk = n - pos
+def _dm_aes256_decrypt(rk: Ptr[uint8], out_blk: Ptr[uint8],
+                       in_blk: Ptr[uint8]):
+    # Inverse cipher (FIPS 197 §5.3) — the equivalent-inverse-free
+    # straightforward form: AddRoundKey(last), then 13 rounds of
+    # InvShiftRows, InvSubBytes, AddRoundKey, InvMixColumns, then a final
+    # InvShiftRows + InvSubBytes + AddRoundKey(0).
+    i: uint64 = 0
+    while i < 16:
+        _dm_aes_block_st[i] = in_blk[i] ^ rk[14 * 16 + i]
+        i = i + 1
+    rnd: int64 = 13
+    while rnd >= 1:
+        # InvShiftRows: row r is right-rotated by r columns.
+        t1: uint8 = _dm_aes_block_st[13]
+        _dm_aes_block_st[13] = _dm_aes_block_st[9]
+        _dm_aes_block_st[9] = _dm_aes_block_st[5]
+        _dm_aes_block_st[5] = _dm_aes_block_st[1]
+        _dm_aes_block_st[1] = t1
+        t2a: uint8 = _dm_aes_block_st[2]
+        t2b: uint8 = _dm_aes_block_st[6]
+        _dm_aes_block_st[2] = _dm_aes_block_st[10]
+        _dm_aes_block_st[6] = _dm_aes_block_st[14]
+        _dm_aes_block_st[10] = t2a
+        _dm_aes_block_st[14] = t2b
+        t3: uint8 = _dm_aes_block_st[3]
+        _dm_aes_block_st[3] = _dm_aes_block_st[7]
+        _dm_aes_block_st[7] = _dm_aes_block_st[11]
+        _dm_aes_block_st[11] = _dm_aes_block_st[15]
+        _dm_aes_block_st[15] = t3
+        # InvSubBytes
+        i = 0
+        while i < 16:
+            _dm_aes_block_st[i] = _dm_aes_isbox[_dm_aes_block_st[i]]
+            i = i + 1
+        # AddRoundKey
+        rk_base: uint64 = cast[uint64](rnd) * 16
+        i = 0
+        while i < 16:
+            _dm_aes_block_st[i] = _dm_aes_block_st[i] ^ rk[rk_base + i]
+            i = i + 1
+        # InvMixColumns
+        c: uint64 = 0
+        while c < 4:
+            s0: uint8 = _dm_aes_block_st[c * 4 + 0]
+            s1: uint8 = _dm_aes_block_st[c * 4 + 1]
+            s2: uint8 = _dm_aes_block_st[c * 4 + 2]
+            s3: uint8 = _dm_aes_block_st[c * 4 + 3]
+            _dm_aes_block_st[c * 4 + 0] = _dm_aes_gfmul(s0, 14) \
+                ^ _dm_aes_gfmul(s1, 11) ^ _dm_aes_gfmul(s2, 13) \
+                ^ _dm_aes_gfmul(s3, 9)
+            _dm_aes_block_st[c * 4 + 1] = _dm_aes_gfmul(s0, 9) \
+                ^ _dm_aes_gfmul(s1, 14) ^ _dm_aes_gfmul(s2, 11) \
+                ^ _dm_aes_gfmul(s3, 13)
+            _dm_aes_block_st[c * 4 + 2] = _dm_aes_gfmul(s0, 13) \
+                ^ _dm_aes_gfmul(s1, 9) ^ _dm_aes_gfmul(s2, 14) \
+                ^ _dm_aes_gfmul(s3, 11)
+            _dm_aes_block_st[c * 4 + 3] = _dm_aes_gfmul(s0, 11) \
+                ^ _dm_aes_gfmul(s1, 13) ^ _dm_aes_gfmul(s2, 9) \
+                ^ _dm_aes_gfmul(s3, 14)
+            c = c + 1
+        rnd = rnd - 1
+    # Final round: InvShiftRows + InvSubBytes + AddRoundKey(0).
+    t1f: uint8 = _dm_aes_block_st[13]
+    _dm_aes_block_st[13] = _dm_aes_block_st[9]
+    _dm_aes_block_st[9] = _dm_aes_block_st[5]
+    _dm_aes_block_st[5] = _dm_aes_block_st[1]
+    _dm_aes_block_st[1] = t1f
+    t2af: uint8 = _dm_aes_block_st[2]
+    t2bf: uint8 = _dm_aes_block_st[6]
+    _dm_aes_block_st[2] = _dm_aes_block_st[10]
+    _dm_aes_block_st[6] = _dm_aes_block_st[14]
+    _dm_aes_block_st[10] = t2af
+    _dm_aes_block_st[14] = t2bf
+    t3f: uint8 = _dm_aes_block_st[3]
+    _dm_aes_block_st[3] = _dm_aes_block_st[7]
+    _dm_aes_block_st[7] = _dm_aes_block_st[11]
+    _dm_aes_block_st[11] = _dm_aes_block_st[15]
+    _dm_aes_block_st[15] = t3f
+    i = 0
+    while i < 16:
+        _dm_aes_block_st[i] = _dm_aes_isbox[_dm_aes_block_st[i]]
+        i = i + 1
+    i = 0
+    while i < 16:
+        out_blk[i] = _dm_aes_block_st[i] ^ rk[i]
+        i = i + 1
+
+
+# =========================================================================
+# AES-XTS (IEEE Std 1619-2007) — the aes-xts-plain64 sector transform
+# =========================================================================
+#
+# XTS encrypts/decrypts a sector as a sequence of 16-byte blocks under a
+# data key, masked by a per-block tweak. The tweak for block 0 of a
+# sector is T0 = AES_tweakkey(IV) where IV = the 64-bit sector number
+# little-endian in a 16-byte block (dm-crypt "plain64"). For each
+# subsequent block the tweak is multiplied by alpha = x in GF(2^128)
+# (the polynomial x^128 + x^7 + x^2 + x + 1, LSB-first byte order).
+#   encrypt:  C = AES_datakey(P ^ T) ^ T
+#   decrypt:  P = AES_datakey^-1(C ^ T) ^ T
+# A 512-byte sector is exactly 32 whole AES blocks, so no ciphertext
+# stealing is ever required.
+
+_dm_xts_tweak:  Array[16, uint8]   # running tweak T for the current sector
+_dm_xts_tmp:    Array[16, uint8]   # P ^ T / C ^ T scratch
+
+
+def _dm_xts_mul_alpha(t: Ptr[uint8]):
+    # Multiply the 128-bit value t by alpha = x in GF(2^128), little-
+    # endian byte order (IEEE 1619). Left-shift the whole 128-bit value
+    # by one bit; if the high bit (bit 127) carried out, XOR 0x87 into
+    # byte 0.
+    carry: uint64 = 0
+    i: uint64 = 0
+    while i < 16:
+        cur: uint64 = cast[uint64](t[i]) & 0xFF
+        newv: uint64 = ((cur << 1) | carry) & 0xFF
+        carry = (cur >> 7) & 1
+        t[i] = cast[uint8](newv)
+        i = i + 1
+    if carry != 0:
+        t[0] = t[0] ^ 0x87
+
+
+def _dm_xts_init_tweak(sector: uint64):
+    # T0 = AES_tweakkey(plain64 IV). IV = sector number little-endian in
+    # bytes 0..7, zero in 8..15.
+    iv: Array[16, uint8]
+    i: uint64 = 0
+    while i < 8:
+        iv[i] = cast[uint8]((sector >> (i * 8)) & 0xFF)
+        i = i + 1
+    while i < 16:
+        iv[i] = 0
+        i = i + 1
+    _dm_aes256_encrypt(cast[Ptr[uint8]](&_dm_aes_rk_tweak[0]),
+                       cast[Ptr[uint8]](&_dm_xts_tweak[0]),
+                       cast[Ptr[uint8]](&iv[0]))
+
+
+def _dm_xts_encrypt_sector(sector: uint64,
+                           dst: Ptr[uint8], src: Ptr[uint8]):
+    # XTS-encrypt one 512-byte sector (32 blocks). Assumes the data and
+    # tweak schedules are already expanded into _dm_aes_rk_data /
+    # _dm_aes_rk_tweak.
+    _dm_xts_init_tweak(sector)
+    tw:  Ptr[uint8] = cast[Ptr[uint8]](&_dm_xts_tweak[0])
+    tmp: Ptr[uint8] = cast[Ptr[uint8]](&_dm_xts_tmp[0])
+    dkey: Ptr[uint8] = cast[Ptr[uint8]](&_dm_aes_rk_data[0])
+    blk: uint64 = 0
+    while blk < 32:
+        base: uint64 = blk * 16
         j: uint64 = 0
-        while j < chunk:
-            dst[pos + j] = src[pos + j] ^ block_ptr[j]
+        while j < 16:
+            tmp[j] = src[base + j] ^ tw[j]
             j = j + 1
-        pos = pos + chunk
-        counter = counter + 1
+        _dm_aes256_encrypt(dkey, cast[Ptr[uint8]](
+            cast[uint64](dst) + base), tmp)
+        j = 0
+        while j < 16:
+            dst[base + j] = dst[base + j] ^ tw[j]
+            j = j + 1
+        _dm_xts_mul_alpha(tw)
+        blk = blk + 1
+
+
+def _dm_xts_decrypt_sector(sector: uint64,
+                           dst: Ptr[uint8], src: Ptr[uint8]):
+    # XTS-decrypt one 512-byte sector (32 blocks).
+    _dm_xts_init_tweak(sector)
+    tw:  Ptr[uint8] = cast[Ptr[uint8]](&_dm_xts_tweak[0])
+    tmp: Ptr[uint8] = cast[Ptr[uint8]](&_dm_xts_tmp[0])
+    dkey: Ptr[uint8] = cast[Ptr[uint8]](&_dm_aes_rk_data[0])
+    blk: uint64 = 0
+    while blk < 32:
+        base: uint64 = blk * 16
+        j: uint64 = 0
+        while j < 16:
+            tmp[j] = src[base + j] ^ tw[j]
+            j = j + 1
+        _dm_aes256_decrypt(dkey, cast[Ptr[uint8]](
+            cast[uint64](dst) + base), tmp)
+        j = 0
+        while j < 16:
+            dst[base + j] = dst[base + j] ^ tw[j]
+            j = j + 1
+        _dm_xts_mul_alpha(tw)
+        blk = blk + 1
 
 
 # =========================================================================
@@ -206,7 +493,7 @@ DM_TARGET_NONE:   uint32 = 0
 DM_TARGET_LINEAR: uint32 = 1
 DM_TARGET_CRYPT:  uint32 = 2
 
-DM_KEY_LEN:      uint64 = 32       # ChaCha20 256-bit key
+DM_KEY_LEN:      uint64 = 64       # AES-256-XTS: 32B data + 32B tweak key
 DM_MAX_TARGETS:  uint64 = 8        # targets per mapped device
 DM_MAX_DEVICES:  uint64 = 8        # mapped devices system-wide
 DM_NAME_LEN:     uint64 = 16
@@ -237,7 +524,9 @@ class MappedDevice:
     self_slot:   int32             # this mapped device's own block slot
     pad:         uint32
     targets:     Array[8, DmTarget]
-    key:         Array[32, uint8]  # ChaCha20 key (crypt targets only)
+    # AES-256-XTS key material (crypt targets only): 32-byte data key
+    # followed by 32-byte tweak key (the LUKS/dm-crypt 64-byte key split).
+    key:         Array[64, uint8]
 
 
 dm_devices: Array[8, MappedDevice]
@@ -248,9 +537,6 @@ dm_inited:  uint32 = 0
 # is serialised through the synchronous block layer, so a single shared
 # module-scope sector buffer is safe (no two crypt transfers overlap).
 _dm_crypt_sector: Array[512, uint8]
-# 12-byte ChaCha20 nonce derived per sector ("plain64" IV: the low 64
-# bits hold the sector number little-endian, the top 32 bits are zero).
-_dm_crypt_nonce:  Array[12, uint8]
 
 
 def dm_init():
@@ -289,19 +575,13 @@ def _dm_find_target(dev: Ptr[MappedDevice], vlba: uint64) -> int32:
     return -1
 
 
-def _dm_set_plain64_nonce(sector: uint64):
-    # dm-crypt "plain64" IV: the 64-bit sector number little-endian in
-    # the low 8 bytes of the 12-byte ChaCha nonce, high 4 bytes zero.
-    # This makes the keystream sector-dependent, so identical plaintext
-    # at two sectors yields different ciphertext.
-    i: uint64 = 0
-    while i < 8:
-        _dm_crypt_nonce[i] = cast[uint8]((sector >> (i * 8)) & 0xFF)
-        i = i + 1
-    _dm_crypt_nonce[8]  = 0
-    _dm_crypt_nonce[9]  = 0
-    _dm_crypt_nonce[10] = 0
-    _dm_crypt_nonce[11] = 0
+def _dm_crypt_load_keys(dev: Ptr[MappedDevice]):
+    # Expand this mapped device's 64-byte XTS key into the two AES-256
+    # schedules: bytes 0..31 = data key, bytes 32..63 = tweak key.
+    _dm_aes256_expand(cast[Ptr[uint8]](&dev[0].key[0]),
+                      cast[Ptr[uint8]](&_dm_aes_rk_data[0]))
+    _dm_aes256_expand(cast[Ptr[uint8]](&dev[0].key[32]),
+                      cast[Ptr[uint8]](&_dm_aes_rk_tweak[0]))
 
 
 def _dm_linear_io(t: Ptr[DmTarget], is_write: int32, off_in_t: uint64,
@@ -318,13 +598,14 @@ def _dm_crypt_io(dev: Ptr[MappedDevice], t: Ptr[DmTarget],
                  is_write: int32, off_in_t: uint64, vlba: uint64,
                  count: uint64, buf: Ptr[uint8]) -> int32:
     # Crypt remap: process one sector at a time so each gets its own
-    # sector-derived IV. On write, encrypt the plaintext sector from
-    # `buf` into the staging buffer and write the CIPHERTEXT to the
-    # backing device. On read, fetch the ciphertext from the backing
-    # device into staging and decrypt into the caller's `buf`. The IV is
-    # keyed on the VIRTUAL sector number (vlba) so the same plaintext at
-    # different mapped sectors produces different ciphertext.
-    keyp:   Ptr[uint8] = cast[Ptr[uint8]](&dev[0].key[0])
+    # sector-derived XTS tweak (plain64 IV). On write, AES-256-XTS-encrypt
+    # the plaintext sector from `buf` into the staging buffer and write
+    # the CIPHERTEXT to the backing device. On read, fetch the ciphertext
+    # from the backing device into staging and XTS-decrypt into the
+    # caller's `buf`. The tweak is keyed on the VIRTUAL sector number
+    # (vlba) so the same plaintext at different mapped sectors produces
+    # different ciphertext.
+    _dm_crypt_load_keys(dev)
     stagep: Ptr[uint8] = cast[Ptr[uint8]](&_dm_crypt_sector[0])
     s: uint64 = 0
     while s < count:
@@ -332,11 +613,9 @@ def _dm_crypt_io(dev: Ptr[MappedDevice], t: Ptr[DmTarget],
         vsec: uint64 = vlba + s
         cur:  Ptr[uint8] = cast[Ptr[uint8]](
             cast[uint64](buf) + s * SECTOR_SIZE)
-        _dm_set_plain64_nonce(vsec)
-        noncep: Ptr[uint8] = cast[Ptr[uint8]](&_dm_crypt_nonce[0])
         if is_write != 0:
             # plaintext (cur) -> ciphertext (staging) -> backing store
-            _dm_chacha20_xor(keyp, 0, noncep, stagep, cur, SECTOR_SIZE)
+            _dm_xts_encrypt_sector(vsec, stagep, cur)
             rc: int32 = blk_write_sectors(t[0].under_slot, ulba, 1, stagep)
             if rc != 0:
                 return rc
@@ -345,7 +624,7 @@ def _dm_crypt_io(dev: Ptr[MappedDevice], t: Ptr[DmTarget],
             rc2: int32 = blk_read_sectors(t[0].under_slot, ulba, 1, stagep)
             if rc2 != 0:
                 return rc2
-            _dm_chacha20_xor(keyp, 0, noncep, cur, stagep, SECTOR_SIZE)
+            _dm_xts_decrypt_sector(vsec, cur, stagep)
         s = s + 1
     return 0
 
@@ -514,10 +793,11 @@ def dm_create_crypt(name: Ptr[char], under_slot: int32,
                     key: Ptr[uint8], keylen: uint64) -> int32:
     # Create a dm-crypt mapped device with a SINGLE crypt target over
     # [0, length): every sector written through the mapped device is
-    # ChaCha20-encrypted (sector-keyed IV) before it reaches the backing
-    # store, and decrypted on read. `key` supplies up to DM_KEY_LEN
-    # bytes; a short key is zero-padded. This is the
-    # `dmsetup create NAME --table "0 LENGTH crypt chacha20 KEY 0 DEV START"`
+    # AES-256-XTS-encrypted (plain64 sector-keyed tweak) before it
+    # reaches the backing store, and decrypted on read. `key` supplies up
+    # to DM_KEY_LEN (64) bytes — the 32-byte data key followed by the
+    # 32-byte tweak key — and a short key is zero-padded. This is the
+    # `dmsetup create NAME --table "0 LENGTH crypt aes-xts-plain64 KEY 0 DEV START"`
     # shape. Returns the registered block slot or a negative error.
     dm_init()
     if length == 0:
@@ -617,7 +897,14 @@ _dm_t_plain2:  Array[512, uint8]   # second plaintext (concat span B)
 _dm_t_read:    Array[512, uint8]   # readback through a mapped dev
 _dm_t_under:   Array[512, uint8]   # raw read from the backing device
 _dm_t_under2:  Array[512, uint8]   # raw read from a second backing sector
-_dm_t_key:     Array[32, uint8]    # ChaCha20 key for the crypt device
+_dm_t_key:     Array[64, uint8]    # AES-256-XTS key (32B data + 32B tweak)
+
+# AES-XTS known-answer-test scratch (IEEE 1619 / OpenSSL test vector).
+# Generously sized — these hold whole-sector transforms.
+_dm_kat_key:   Array[64, uint8]
+_dm_kat_pt:    Array[512, uint8]
+_dm_kat_ct:    Array[512, uint8]
+_dm_kat_out:   Array[512, uint8]
 
 
 def _dm_back_read(priv: uint64, lba: uint64, count: uint64,
@@ -673,6 +960,97 @@ def _dm_buf_eq(a: Ptr[uint8], b: Ptr[uint8], n: uint64) -> int32:
         if a[i] != b[i]:
             return 0
         i = i + 1
+    return 1
+
+
+# Reference AES-256-XTS ciphertext for the known-answer test, computed
+# offline by Python's `cryptography` library (an independent, trusted AES
+# implementation). Parameters:
+#   key      = bytes((i*17+5)&0xFF for i in range(64))   # 32B data+32B tweak
+#   plaintext= bytes((i*3+42)&0xFF for i in range(512))  # one 512B sector
+#   sector   = 7  (plain64 IV = 7 little-endian in a 16-byte tweak block)
+# We assert the FIRST and LAST 16-byte ciphertext blocks; matching both
+# pins the cipher, the tweak derivation and the GF(2^128) alpha-multiply
+# across the whole sector.
+_DM_KAT_SECTOR: uint64 = 7
+_dm_kat_ct_first: Array[16, uint8]   # expected CT[0..15]
+_dm_kat_ct_last:  Array[16, uint8]   # expected CT[496..511]
+
+
+def _dm_xts_kat_load_expected():
+    _dm_kat_ct_first[0] = 0x26
+    _dm_kat_ct_first[1] = 0xb7
+    _dm_kat_ct_first[2] = 0x7f
+    _dm_kat_ct_first[3] = 0xa2
+    _dm_kat_ct_first[4] = 0xe2
+    _dm_kat_ct_first[5] = 0xc5
+    _dm_kat_ct_first[6] = 0x64
+    _dm_kat_ct_first[7] = 0xac
+    _dm_kat_ct_first[8] = 0xdc
+    _dm_kat_ct_first[9] = 0x4c
+    _dm_kat_ct_first[10] = 0xd4
+    _dm_kat_ct_first[11] = 0xb4
+    _dm_kat_ct_first[12] = 0x8e
+    _dm_kat_ct_first[13] = 0x61
+    _dm_kat_ct_first[14] = 0x9b
+    _dm_kat_ct_first[15] = 0x3f
+    _dm_kat_ct_last[0] = 0xfe
+    _dm_kat_ct_last[1] = 0x34
+    _dm_kat_ct_last[2] = 0x89
+    _dm_kat_ct_last[3] = 0xee
+    _dm_kat_ct_last[4] = 0x1c
+    _dm_kat_ct_last[5] = 0xad
+    _dm_kat_ct_last[6] = 0x72
+    _dm_kat_ct_last[7] = 0x2f
+    _dm_kat_ct_last[8] = 0x6c
+    _dm_kat_ct_last[9] = 0x16
+    _dm_kat_ct_last[10] = 0xad
+    _dm_kat_ct_last[11] = 0x4b
+    _dm_kat_ct_last[12] = 0x22
+    _dm_kat_ct_last[13] = 0x48
+    _dm_kat_ct_last[14] = 0x69
+    _dm_kat_ct_last[15] = 0xbb
+
+
+def _dm_xts_kat() -> int32:
+    # Returns 1 if the AES-256-XTS implementation reproduces the offline
+    # reference vector AND decrypts it back to plaintext, else 0.
+    _dm_xts_kat_load_expected()
+    i: uint64 = 0
+    while i < 64:
+        _dm_kat_key[i] = cast[uint8]((i * 17 + 5) & 0xFF)
+        i = i + 1
+    i = 0
+    while i < SECTOR_SIZE:
+        _dm_kat_pt[i] = cast[uint8]((i * 3 + 42) & 0xFF)
+        i = i + 1
+    # Load the schedules directly from the KAT key (data = bytes 0..31,
+    # tweak = bytes 32..63) and XTS-encrypt the whole sector.
+    _dm_aes256_expand(cast[Ptr[uint8]](&_dm_kat_key[0]),
+                      cast[Ptr[uint8]](&_dm_aes_rk_data[0]))
+    _dm_aes256_expand(cast[Ptr[uint8]](&_dm_kat_key[32]),
+                      cast[Ptr[uint8]](&_dm_aes_rk_tweak[0]))
+    _dm_xts_encrypt_sector(_DM_KAT_SECTOR,
+                           cast[Ptr[uint8]](&_dm_kat_ct[0]),
+                           cast[Ptr[uint8]](&_dm_kat_pt[0]))
+    # First and last ciphertext blocks must match the reference.
+    if _dm_buf_eq(&_dm_kat_ct[0], &_dm_kat_ct_first[0], 16) != 1:
+        _dm_emerg0("[device-mapper] KAT first block mismatch\n")
+        return 0
+    if _dm_buf_eq(&_dm_kat_ct[496], &_dm_kat_ct_last[0], 16) != 1:
+        _dm_emerg0("[device-mapper] KAT last block mismatch\n")
+        return 0
+    # Decrypt round-trip: must reproduce the plaintext exactly.
+    _dm_aes256_expand(cast[Ptr[uint8]](&_dm_kat_key[0]),
+                      cast[Ptr[uint8]](&_dm_aes_rk_data[0]))
+    _dm_aes256_expand(cast[Ptr[uint8]](&_dm_kat_key[32]),
+                      cast[Ptr[uint8]](&_dm_aes_rk_tweak[0]))
+    _dm_xts_decrypt_sector(_DM_KAT_SECTOR,
+                           cast[Ptr[uint8]](&_dm_kat_out[0]),
+                           cast[Ptr[uint8]](&_dm_kat_ct[0]))
+    if _dm_buf_eq(&_dm_kat_out[0], &_dm_kat_pt[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] KAT decrypt round-trip mismatch\n")
+        return 0
     return 1
 
 
@@ -804,13 +1182,13 @@ def dm_selftest() -> int32:
         _dm_emerg0("[device-mapper] FAIL: crypt backing == plaintext (no encryption)\n")
         ok = 0
     else:
-        _dm_emerg0("[device-mapper] crypt: backing sector 192 is ciphertext OK\n")
+        _dm_emerg0("[device-mapper] PASS dmcrypt-ciphertext: backing sector 192 is ciphertext OK\n")
     # (b) the two sectors' ciphertext differ (IV is sector-dependent).
     if _dm_buf_eq(&_dm_t_under[0], &_dm_t_under2[0], SECTOR_SIZE) != 0:
         _dm_emerg0("[device-mapper] FAIL: identical plaintext -> identical ciphertext (IV not sector-keyed)\n")
         ok = 0
     else:
-        _dm_emerg0("[device-mapper] crypt: same plaintext, two sectors -> different ciphertext OK\n")
+        _dm_emerg0("[device-mapper] PASS dmcrypt-tweak: same plaintext, two sectors -> different ciphertext OK\n")
     # Round-trip: read back through the crypt device -> original plaintext.
     if blk_read_sectors(cr, 0, 1, &_dm_t_read[0]) != 0:
         _dm_emerg0("[device-mapper] FAIL: crypt readback sec0\n")
@@ -819,7 +1197,7 @@ def dm_selftest() -> int32:
         _dm_emerg0("[device-mapper] FAIL: crypt round-trip sec0 mismatch\n")
         ok = 0
     else:
-        _dm_emerg0("[device-mapper] crypt: sector 0 round-trips to plaintext OK\n")
+        _dm_emerg0("[device-mapper] PASS dmcrypt-roundtrip-sec0: sector 0 round-trips to plaintext OK\n")
     if blk_read_sectors(cr, 1, 1, &_dm_t_read[0]) != 0:
         _dm_emerg0("[device-mapper] FAIL: crypt readback sec1\n")
         return 0
@@ -827,7 +1205,22 @@ def dm_selftest() -> int32:
         _dm_emerg0("[device-mapper] FAIL: crypt round-trip sec1 mismatch\n")
         ok = 0
     else:
-        _dm_emerg0("[device-mapper] crypt: sector 1 round-trips to plaintext OK\n")
+        _dm_emerg0("[device-mapper] PASS dmcrypt-roundtrip-sec1: sector 1 round-trips to plaintext OK\n")
+
+    # --- Test 4: AES-256-XTS KNOWN-ANSWER TEST (independent vector) ---
+    # The highest-confidence check: encrypt a fixed plaintext sector with
+    # a fixed 64-byte key at a fixed sector number and assert the
+    # ciphertext byte-for-byte matches a reference vector computed OFFLINE
+    # by Python's `cryptography` AES-XTS (key = (i*17+5)&0xFF, plaintext =
+    # (i*3+42)&0xFF, sector = 7, plain64 IV). This pins the cipher, the
+    # tweak derivation AND the GF(2^128) alpha-multiply across all 32
+    # blocks of the sector (first and LAST block are both asserted). Then
+    # decrypt it back and assert it returns the plaintext.
+    if _dm_xts_kat() != 1:
+        _dm_emerg0("[device-mapper] FAIL: AES-256-XTS known-answer test\n")
+        ok = 0
+    else:
+        _dm_emerg0("[device-mapper] PASS dmcrypt-kat: AES-256-XTS vector matches reference OK\n")
 
     # Clean up the mapped devices (frees slots; leaves dmback0 in place).
     dm_remove("dmlin0")
