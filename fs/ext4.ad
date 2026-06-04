@@ -47,6 +47,8 @@ from fs.jbd2 import (
     jbd2_txn_begin, jbd2_txn_add, jbd2_txn_commit, jbd2_txn_checkpoint,
     jbd2_txn_skip_checkpoint, jbd2_txn_abort, jbd2_txn_commit_nocommitblk,
     jbd2_super_magic_read,
+    jbd2_fc_blocks, jbd2_fc_first_lblk, jbd2_fc_read, jbd2_fc_write,
+    jbd2_block_size_get, jbd2_fc_enable,
 )
 # RO_COMPAT_METADATA_CSUM (#endgame): crc32c integrity for ext4
 # metadata. crc32c_update is the running-register primitive ext4 chains
@@ -177,6 +179,17 @@ ext4_log_groups_per_flex:  uint64 = 0
 # While ext4_ea_inode is 0 the e_value_inum field is ignored entirely, so
 # a filesystem WITHOUT the feature reads exactly as before.
 ext4_ea_inode: int32 = 0
+
+# COMPAT_FAST_COMMIT mount state. When the superblock declares the
+# feature (s_feature_compat & 0x400) the journal carries a reserved
+# fast-commit tail region; fsync may record a compact per-inode change
+# log there (CREAT/UNLINK/INODE/ADD_RANGE/DEL_RANGE/PAD tags ended by a
+# crc'd TAIL) and durably commit a single inode without a full JBD2
+# transaction. Replay on mount scans the fc region and re-applies the
+# tagged changes. While ext4_fast_commit is 0 the fc area is ignored and
+# the filesystem behaves exactly as before. See the fast_commit block
+# near the end of this file.
+ext4_fast_commit: int32 = 0
 
 # #149: journal (JBD2) mount state. s_feature_compat HAS_JOURNAL (0x4)
 # and s_journal_inum (sb offset 0xE0) tell us whether a journal exists
@@ -552,6 +565,14 @@ def ext4_init(slot: int32) -> int32:
     else:
         ext4_journal_inum = 0
 
+    # COMPAT_FAST_COMMIT: the journal carries a reserved fast-commit tail.
+    # Arm the fast-commit write/replay layer. A no-feature image leaves
+    # ext4_fast_commit 0 and the fc area is never touched.
+    ext4_fast_commit = 0
+    if (feature_compat & EXT4_FEATURE_COMPAT_FAST_COMMIT) != 0:
+        ext4_fast_commit = 1
+        printk0("ext4: COMPAT_FAST_COMMIT present; fast-commit log armed\n")
+
     # RO_COMPAT_METADATA_CSUM: when the superblock declares the feature
     # (s_feature_ro_compat & 0x400) build the per-fs checksum seed from
     # s_uuid (offset 0x68, 16 bytes) and arm verification. The seed is
@@ -722,10 +743,22 @@ def _ext4_journal_setup() -> int32:
         printk0("ext4: jbd2_attach failed (journal superblock bad)\n")
         return -1
     ext4_has_journal = 1
+    # COMPAT_FAST_COMMIT: reserve the journal's tail blocks for the
+    # fine-grained fast-commit log now that the journal geometry is known.
+    if ext4_fast_commit != 0:
+        jbd2_fc_enable()
+        printk1("ext4: fast-commit tail reserved (%d journal blocks)\n",
+                jbd2_fc_blocks())
     printk0("ext4: journal attached (JBD2)\n")
     # Replay any committed-but-uncheckpointed transactions left by an
     # unclean shutdown. On a clean journal this is a no-op.
     jbd2_recover()
+    # COMPAT_FAST_COMMIT: after the full-journal replay, scan the reserved
+    # fast-commit tail and re-apply any durably-recorded per-inode changes
+    # whose full transaction never landed. No-op when the feature is off
+    # or the fc region is empty/clean.
+    if ext4_fast_commit != 0:
+        _ext4_fc_replay()
     return 0
 
 
@@ -5298,6 +5331,638 @@ def ext4_fsync_smoke_test() -> int32:
     return 0
 
 
+# --- ext4 fast_commit (COMPAT_FAST_COMMIT) ------------------------
+#
+# A fine-grained, per-inode fast-commit log layered on top of the JBD2
+# full journal. This mirrors Linux's fs/ext4/fast_commit.{c,h} on-disk
+# stream format so the records we write/replay are the real ext4 fc
+# tags, not a private scheme.
+#
+# WHERE: Linux reserves the LAST `num_fc_blks` (default 256) journal
+# blocks for fast commits, OUTSIDE the circular full-journal log area.
+# jbd2_fc_first_lblk()/jbd2_fc_blocks() expose that reserved tail; we
+# treat it as a flat stream of journal blocks.
+#
+# STREAM FORMAT: the fc region is a byte stream of variable-length tag
+# records. Each record opens with a 4-byte struct ext4_fc_tl:
+#     0x00  __le16 fc_tag    (one of EXT4_FC_TAG_*)
+#     0x02  __le16 fc_len    payload length in bytes (NOT incl. this tl)
+# followed by `fc_len` payload bytes. A fast-commit ends with a TAIL
+# record whose payload is struct ext4_fc_tail { __le32 fc_tid; __le32
+# fc_crc; } — fc_crc is the crc32c over everything from the start of the
+# fc stream up to and INCLUDING the tail's fc_tid (the canonical ext4
+# fast-commit checksum coverage). A reader that recomputes a different
+# crc treats the whole fast-commit as torn and ignores it (the full
+# journal already restored a consistent older state).
+#
+# TAGS implemented (Linux values):
+#   ADD_RANGE 0x0001  add/replace one logical->physical extent of an inode
+#   DEL_RANGE 0x0002  remove a logical range of an inode
+#   CREAT     0x0003  a created dirent (parent, ino, name)
+#   UNLINK    0x0005  a removed dirent (parent, ino, name)
+#   INODE     0x0006  a full raw on-disk inode image (ino + raw bytes)
+#   PAD       0x0007  padding to a block boundary
+#   TAIL      0x0008  fc_tid + fc_crc, closes the fast-commit
+#
+# REPLAY: on mount, after JBD2 recovery, we scan the fc stream. If a
+# valid crc'd TAIL is found we apply every preceding tag in order:
+# INODE writes the raw inode back to its inode-table slot; ADD_RANGE
+# writes a recorded data block to the physical block the inode's extent
+# maps; CREAT/UNLINK adjust the parent directory (recorded for fidelity,
+# applied when the dirent path is wired). The INODE + ADD_RANGE replay
+# is the durability spine the self-test asserts byte-for-byte.
+
+EXT4_FC_TAG_ADD_RANGE: uint16 = 0x0001
+EXT4_FC_TAG_DEL_RANGE: uint16 = 0x0002
+EXT4_FC_TAG_CREAT:     uint16 = 0x0003
+EXT4_FC_TAG_LINK:      uint16 = 0x0004
+EXT4_FC_TAG_UNLINK:    uint16 = 0x0005
+EXT4_FC_TAG_INODE:     uint16 = 0x0006
+EXT4_FC_TAG_PAD:       uint16 = 0x0007
+EXT4_FC_TAG_TAIL:      uint16 = 0x0008
+
+EXT4_FC_TL_BYTES:      uint64 = 4     # sizeof(struct ext4_fc_tl)
+
+# crc32c seed Linux uses for the fast-commit checksum.
+EXT4_FC_REPLAY_CRC_SEED: uint32 = 0xFFFFFFFF
+
+# The in-memory staging buffer for ONE fast-commit. 32 KiB easily holds
+# a per-inode commit: a 256-byte inode image + a handful of 4 KiB data-
+# block records. Sized generously and bounded on append so it can never
+# overflow into the next module-scope global.
+EXT4_FC_STAGE_CAP: uint64 = 32768
+ext4_fc_stage: Array[32768, uint8]
+ext4_fc_stage_len: uint64 = 0          # bytes used in ext4_fc_stage
+ext4_fc_active:    int32  = 0          # 1 while a fast-commit is open
+
+# A separate journal-block scratch for fc I/O so it never collides with
+# ext4_blk_buf (used by the inode read/write path during replay).
+ext4_fc_io_buf: Array[4096, uint8]
+# A scratch raw-inode image (256 bytes is the max inode_size we mount).
+ext4_fc_inode_buf: Array[256, uint8]
+# A scratch data block for ADD_RANGE payloads.
+ext4_fc_data_buf: Array[4096, uint8]
+
+
+def _ext4_fc_put_u16(p: Ptr[uint8], v: uint16):
+    p[0] = cast[uint8](v & 0xFF)
+    p[1] = cast[uint8]((v >> 8) & 0xFF)
+
+
+def _ext4_fc_put_u32(p: Ptr[uint8], v: uint32):
+    p[0] = cast[uint8](v & 0xFF)
+    p[1] = cast[uint8]((v >> 8) & 0xFF)
+    p[2] = cast[uint8]((v >> 16) & 0xFF)
+    p[3] = cast[uint8]((v >> 24) & 0xFF)
+
+
+def _ext4_fc_get_u16(p: Ptr[uint8]) -> uint16:
+    return cast[uint16](p[0]) | (cast[uint16](p[1]) << 8)
+
+
+def _ext4_fc_get_u32(p: Ptr[uint8]) -> uint32:
+    return (cast[uint32](p[0])
+            | (cast[uint32](p[1]) << 8)
+            | (cast[uint32](p[2]) << 16)
+            | (cast[uint32](p[3]) << 24))
+
+
+# --- WRITE PATH ---------------------------------------------------
+
+def ext4_fc_begin() -> int32:
+    # Open a fast-commit. Records accumulate in ext4_fc_stage until
+    # ext4_fc_commit() lays them into the reserved journal tail.
+    if ext4_fast_commit == 0:
+        return -1
+    if jbd2_fc_blocks() == 0:
+        return -1
+    ext4_fc_active     = 1
+    ext4_fc_stage_len  = 0
+    return 0
+
+
+def ext4_fc_abort():
+    ext4_fc_active    = 0
+    ext4_fc_stage_len = 0
+
+
+def _ext4_fc_reserve(tag: uint16, payload_len: uint64) -> int64:
+    # Append a tag header (tl) and reserve `payload_len` payload bytes.
+    # Returns the offset of the payload region in ext4_fc_stage, or -1 if
+    # the staging buffer would overflow (bounded — never writes past the
+    # array). The caller fills the payload via the returned offset.
+    if ext4_fc_active == 0:
+        return -1
+    need: uint64 = EXT4_FC_TL_BYTES + payload_len
+    if ext4_fc_stage_len + need > EXT4_FC_STAGE_CAP:
+        printk0("ext4-fc: staging buffer full\n")
+        return -1
+    hp: Ptr[uint8] = cast[Ptr[uint8]](
+        cast[uint64](&ext4_fc_stage[0]) + ext4_fc_stage_len)
+    _ext4_fc_put_u16(hp, tag)
+    _ext4_fc_put_u16(cast[Ptr[uint8]](cast[uint64](hp) + 2),
+                     cast[uint16](payload_len))
+    payoff: uint64 = ext4_fc_stage_len + EXT4_FC_TL_BYTES
+    ext4_fc_stage_len = ext4_fc_stage_len + need
+    return cast[int64](payoff)
+
+
+def ext4_fc_add_inode(inum: uint32) -> int32:
+    # Stage an EXT4_FC_TAG_INODE record: the inode number followed by the
+    # full raw on-disk inode image, read live from disk. Replay restores
+    # this exact inode image to its inode-table slot.
+    if ext4_fc_active == 0:
+        return -1
+    if ext4_read_inode(cast[uint64](inum), &ext4_fc_inode_buf[0]) != 0:
+        return -1
+    plen: uint64 = 4 + ext4_inode_size
+    off: int64 = _ext4_fc_reserve(EXT4_FC_TAG_INODE, plen)
+    if off < 0:
+        return -1
+    base: uint64 = cast[uint64](&ext4_fc_stage[0]) + cast[uint64](off)
+    _ext4_fc_put_u32(cast[Ptr[uint8]](base), inum)
+    memcpy(cast[Ptr[uint8]](base + 4), &ext4_fc_inode_buf[0],
+           ext4_inode_size)
+    return 0
+
+
+def ext4_fc_add_data_block(inum: uint32, logical_blk: uint64,
+                           data: Ptr[uint8]) -> int32:
+    # Stage an EXT4_FC_TAG_ADD_RANGE record for ONE block: the inode, the
+    # logical block, the physical block it maps to (resolved NOW via the
+    # extent tree), and a full snapshot of the block's new contents.
+    # Replay writes `data` straight to that physical block. This records
+    # a data change durably without a full transaction — the fast-commit
+    # guarantee for fsync.
+    if ext4_fc_active == 0:
+        return -1
+    # Snapshot the caller's data FIRST: ext4_read_inode() below reuses
+    # ext4_blk_buf as its RMW scratch, which would clobber `data` if the
+    # caller handed us a pointer into ext4_blk_buf. Copying up front makes
+    # this API robust regardless of the caller's scratch choice.
+    memcpy(&ext4_fc_data_buf[0], data, ext4_block_size)
+    if ext4_read_inode(cast[uint64](inum), &ext4_fc_inode_buf[0]) != 0:
+        return -1
+    phys: uint64 = _ext4_logical_to_physical(&ext4_fc_inode_buf[0],
+                                             logical_blk)
+    if phys == 0:
+        return -1
+    # payload: ino(4) lblk(8) phys(8) len(4) + block bytes
+    plen: uint64 = 24 + ext4_block_size
+    off: int64 = _ext4_fc_reserve(EXT4_FC_TAG_ADD_RANGE, plen)
+    if off < 0:
+        return -1
+    base: uint64 = cast[uint64](&ext4_fc_stage[0]) + cast[uint64](off)
+    _ext4_fc_put_u32(cast[Ptr[uint8]](base), inum)
+    _ext4_fc_put_u32(cast[Ptr[uint8]](base + 4),
+                     cast[uint32](logical_blk & 0xFFFFFFFF))
+    _ext4_fc_put_u32(cast[Ptr[uint8]](base + 8),
+                     cast[uint32]((logical_blk >> 32) & 0xFFFFFFFF))
+    _ext4_fc_put_u32(cast[Ptr[uint8]](base + 12),
+                     cast[uint32](phys & 0xFFFFFFFF))
+    _ext4_fc_put_u32(cast[Ptr[uint8]](base + 16),
+                     cast[uint32]((phys >> 32) & 0xFFFFFFFF))
+    _ext4_fc_put_u32(cast[Ptr[uint8]](base + 20),
+                     cast[uint32](ext4_block_size))
+    memcpy(cast[Ptr[uint8]](base + 24), &ext4_fc_data_buf[0],
+           ext4_block_size)
+    return 0
+
+
+def _ext4_fc_add_dirent(tag: uint16, parent: uint32, inum: uint32,
+                        name: Ptr[char], name_len: uint64) -> int32:
+    # Stage a CREAT or UNLINK dirent record: parent ino(4) ino(4)
+    # name_len(4) + name bytes. Recorded for on-disk fidelity with
+    # Linux's fc dirent tags.
+    if ext4_fc_active == 0:
+        return -1
+    plen: uint64 = 12 + name_len
+    off: int64 = _ext4_fc_reserve(tag, plen)
+    if off < 0:
+        return -1
+    base: uint64 = cast[uint64](&ext4_fc_stage[0]) + cast[uint64](off)
+    _ext4_fc_put_u32(cast[Ptr[uint8]](base), parent)
+    _ext4_fc_put_u32(cast[Ptr[uint8]](base + 4), inum)
+    _ext4_fc_put_u32(cast[Ptr[uint8]](base + 8),
+                     cast[uint32](name_len))
+    np: Ptr[uint8] = cast[Ptr[uint8]](name)
+    i: uint64 = 0
+    while i < name_len:
+        cast[Ptr[uint8]](base + 12)[i] = np[i]
+        i = i + 1
+    return 0
+
+
+def ext4_fc_add_creat(parent: uint32, inum: uint32,
+                      name: Ptr[char], name_len: uint64) -> int32:
+    return _ext4_fc_add_dirent(EXT4_FC_TAG_CREAT, parent, inum,
+                               name, name_len)
+
+
+def ext4_fc_add_unlink(parent: uint32, inum: uint32,
+                       name: Ptr[char], name_len: uint64) -> int32:
+    return _ext4_fc_add_dirent(EXT4_FC_TAG_UNLINK, parent, inum,
+                               name, name_len)
+
+
+def ext4_fc_commit(tid: uint32) -> int32:
+    # Close the fast-commit: append a PAD (to leave the TAIL whole) and a
+    # crc'd TAIL, then write the staged stream into the reserved journal
+    # tail blocks and flush. After this returns the fast-commit is
+    # durable — a crash now is recoverable by _ext4_fc_replay().
+    if ext4_fc_active == 0:
+        return -1
+    if ext4_fc_stage_len == 0:
+        ext4_fc_active = 0
+        return 0
+
+    # Append the TAIL. Its payload is fc_tid(4) + fc_crc(4); the crc
+    # covers the whole stream up to and including fc_tid.
+    toff: int64 = _ext4_fc_reserve(EXT4_FC_TAG_TAIL, 8)
+    if toff < 0:
+        ext4_fc_abort()
+        return -1
+    tbase: uint64 = cast[uint64](&ext4_fc_stage[0]) + cast[uint64](toff)
+    _ext4_fc_put_u32(cast[Ptr[uint8]](tbase), tid)
+    # crc over [stream start .. tbase+4) — everything incl. fc_tid.
+    crc_len: uint64 = cast[uint64](toff) + 4
+    crc: uint32 = crc32c_update(EXT4_FC_REPLAY_CRC_SEED,
+                                &ext4_fc_stage[0], crc_len)
+    _ext4_fc_put_u32(cast[Ptr[uint8]](tbase + 4), crc)
+
+    # Lay the staged stream into the reserved fc tail blocks.
+    fc_first: uint64 = jbd2_fc_first_lblk()
+    fc_nblk:  uint64 = jbd2_fc_blocks()
+    bs:       uint64 = jbd2_block_size_get()
+    total:    uint64 = ext4_fc_stage_len
+    if total > fc_nblk * bs:
+        printk0("ext4-fc: commit larger than fc region\n")
+        ext4_fc_abort()
+        return -1
+    written: uint64 = 0
+    blk_i:   uint64 = 0
+    while written < total:
+        _ext4_zero(&ext4_fc_io_buf[0], bs)
+        chunk: uint64 = total - written
+        if chunk > bs:
+            chunk = bs
+        memcpy(&ext4_fc_io_buf[0],
+               cast[Ptr[uint8]](cast[uint64](&ext4_fc_stage[0]) + written),
+               chunk)
+        if jbd2_fc_write(fc_first + blk_i, &ext4_fc_io_buf[0]) != 0:
+            printk0("ext4-fc: fc tail block write failed\n")
+            ext4_fc_abort()
+            return -1
+        written = written + chunk
+        blk_i = blk_i + 1
+    ext4_fc_active    = 0
+    ext4_fc_stage_len = 0
+    printk2("ext4-fc: committed tid=%d (%d bytes)\n",
+            cast[uint64](tid), total)
+    return 0
+
+
+def ext4_fc_invalidate() -> int32:
+    # Mark the fc region clean (no pending fast-commit to replay). Done
+    # by zeroing the first fc block's tag header so a later scan sees no
+    # valid leading record. Linux clears the fc area after a full commit
+    # subsumes it; we do the same after a successful replay/checkpoint.
+    if ext4_fast_commit == 0:
+        return 0
+    fc_first: uint64 = jbd2_fc_first_lblk()
+    if fc_first == 0:
+        return 0
+    bs: uint64 = jbd2_block_size_get()
+    _ext4_zero(&ext4_fc_io_buf[0], bs)
+    return jbd2_fc_write(fc_first, &ext4_fc_io_buf[0])
+
+
+# --- REPLAY PATH --------------------------------------------------
+#
+# Read the whole fc region into ext4_fc_stage, locate the crc'd TAIL,
+# verify the crc, then apply every preceding tag in order.
+
+ext4_fc_replayed_inodes: uint64 = 0
+ext4_fc_replayed_ranges:  uint64 = 0
+
+
+def _ext4_fc_load_region() -> int64:
+    # Read the reserved fc tail into ext4_fc_stage. Returns the number of
+    # bytes loaded (fc_nblk * bs, capped at the staging buffer) or -1.
+    fc_first: uint64 = jbd2_fc_first_lblk()
+    fc_nblk:  uint64 = jbd2_fc_blocks()
+    bs:       uint64 = jbd2_block_size_get()
+    if fc_first == 0 or fc_nblk == 0 or bs == 0:
+        return -1
+    want: uint64 = fc_nblk * bs
+    if want > EXT4_FC_STAGE_CAP:
+        want = EXT4_FC_STAGE_CAP
+    nblk: uint64 = want / bs
+    i: uint64 = 0
+    while i < nblk:
+        if jbd2_fc_read(fc_first + i, &ext4_fc_io_buf[0]) != 0:
+            return -1
+        memcpy(cast[Ptr[uint8]](cast[uint64](&ext4_fc_stage[0]) + i * bs),
+               &ext4_fc_io_buf[0], bs)
+        i = i + 1
+    return cast[int64](nblk * bs)
+
+
+def _ext4_fc_find_tail(region_len: uint64) -> int64:
+    # Walk the tl stream from the front; return the offset of the TAIL
+    # record's tl, or -1 if no well-formed TAIL is found within bounds.
+    pos: uint64 = 0
+    safety: uint64 = 0
+    while pos + EXT4_FC_TL_BYTES <= region_len and safety < 100000:
+        safety = safety + 1
+        hp: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](&ext4_fc_stage[0]) + pos)
+        tag: uint16 = _ext4_fc_get_u16(hp)
+        flen: uint64 = cast[uint64](_ext4_fc_get_u16(
+            cast[Ptr[uint8]](cast[uint64](hp) + 2)))
+        if tag == EXT4_FC_TAG_TAIL:
+            if pos + EXT4_FC_TL_BYTES + 8 > region_len:
+                return -1
+            return cast[int64](pos)
+        if tag == 0:
+            # Zeroed area / no record — end of stream.
+            return -1
+        if tag != EXT4_FC_TAG_ADD_RANGE and tag != EXT4_FC_TAG_DEL_RANGE \
+                and tag != EXT4_FC_TAG_CREAT and tag != EXT4_FC_TAG_LINK \
+                and tag != EXT4_FC_TAG_UNLINK and tag != EXT4_FC_TAG_INODE \
+                and tag != EXT4_FC_TAG_PAD:
+            return -1
+        pos = pos + EXT4_FC_TL_BYTES + flen
+    return -1
+
+
+def _ext4_fc_apply_inode(payoff: uint64, plen: uint64) -> int32:
+    # payload: ino(4) + raw inode bytes. Restore the inode image to its
+    # on-disk inode-table slot.
+    if plen < 4 + 128:
+        return -1
+    base: uint64 = cast[uint64](&ext4_fc_stage[0]) + payoff
+    ino: uint32 = _ext4_fc_get_u32(cast[Ptr[uint8]](base))
+    raw_len: uint64 = plen - 4
+    if raw_len > 256:
+        raw_len = 256
+    _ext4_zero(&ext4_fc_inode_buf[0], 256)
+    memcpy(&ext4_fc_inode_buf[0], cast[Ptr[uint8]](base + 4), raw_len)
+    if ext4_write_inode(cast[uint64](ino), &ext4_fc_inode_buf[0]) != 0:
+        return -1
+    ext4_fc_replayed_inodes = ext4_fc_replayed_inodes + 1
+    return 0
+
+
+def _ext4_fc_apply_add_range(payoff: uint64, plen: uint64) -> int32:
+    # payload: ino(4) lblk(8) phys(8) len(4) + block bytes. Write the
+    # recorded block contents straight to the recorded physical block.
+    if plen < 24:
+        return -1
+    base: uint64 = cast[uint64](&ext4_fc_stage[0]) + payoff
+    phys_lo: uint32 = _ext4_fc_get_u32(cast[Ptr[uint8]](base + 12))
+    phys_hi: uint32 = _ext4_fc_get_u32(cast[Ptr[uint8]](base + 16))
+    blen:    uint32 = _ext4_fc_get_u32(cast[Ptr[uint8]](base + 20))
+    phys: uint64 = (cast[uint64](phys_hi) << 32) | cast[uint64](phys_lo)
+    if phys == 0:
+        return -1
+    n: uint64 = cast[uint64](blen)
+    if n > ext4_block_size:
+        n = ext4_block_size
+    if 24 + n > plen:
+        return -1
+    _ext4_zero(&ext4_fc_data_buf[0], ext4_block_size)
+    memcpy(&ext4_fc_data_buf[0], cast[Ptr[uint8]](base + 24), n)
+    if _ext4_write_block(phys, &ext4_fc_data_buf[0]) != 0:
+        return -1
+    ext4_fc_replayed_ranges = ext4_fc_replayed_ranges + 1
+    return 0
+
+
+def _ext4_fc_replay() -> int32:
+    # Scan the reserved fc region; if a crc-valid TAIL is present, apply
+    # every preceding INODE/ADD_RANGE/... tag in order. Returns the count
+    # of records applied, 0 if the region is clean, -1 on error.
+    ext4_fc_replayed_inodes = 0
+    ext4_fc_replayed_ranges = 0
+    loaded: int64 = _ext4_fc_load_region()
+    if loaded < 0:
+        return -1
+    region_len: uint64 = cast[uint64](loaded)
+    toff: int64 = _ext4_fc_find_tail(region_len)
+    if toff < 0:
+        printk0("ext4-fc: no pending fast-commit (region clean)\n")
+        return 0
+    tailpos: uint64 = cast[uint64](toff)
+    # Verify the crc: it covers [0 .. tailpos + tl + 4) (incl. fc_tid).
+    crc_len: uint64 = tailpos + EXT4_FC_TL_BYTES + 4
+    want_crc: uint32 = _ext4_fc_get_u32(cast[Ptr[uint8]](
+        cast[uint64](&ext4_fc_stage[0]) + tailpos + EXT4_FC_TL_BYTES + 4))
+    got_crc: uint32 = crc32c_update(EXT4_FC_REPLAY_CRC_SEED,
+                                    &ext4_fc_stage[0], crc_len)
+    if got_crc != want_crc:
+        printk2("ext4-fc: tail crc mismatch got=0x%x want=0x%x (torn, skip)\n",
+                cast[uint64](got_crc), cast[uint64](want_crc))
+        return 0
+    tid: uint32 = _ext4_fc_get_u32(cast[Ptr[uint8]](
+        cast[uint64](&ext4_fc_stage[0]) + tailpos + EXT4_FC_TL_BYTES))
+    printk1("ext4-fc: replaying fast-commit tid=%d (crc OK)\n",
+            cast[uint64](tid))
+    # Apply every tag before the TAIL.
+    pos: uint64 = 0
+    while pos < tailpos:
+        hp: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](&ext4_fc_stage[0]) + pos)
+        tag:  uint16 = _ext4_fc_get_u16(hp)
+        flen: uint64 = cast[uint64](_ext4_fc_get_u16(
+            cast[Ptr[uint8]](cast[uint64](hp) + 2)))
+        payoff: uint64 = pos + EXT4_FC_TL_BYTES
+        if tag == EXT4_FC_TAG_INODE:
+            _ext4_fc_apply_inode(payoff, flen)
+        elif tag == EXT4_FC_TAG_ADD_RANGE:
+            _ext4_fc_apply_add_range(payoff, flen)
+        # DEL_RANGE / CREAT / UNLINK / PAD are recorded but require the
+        # live dirent/truncate path; INODE+ADD_RANGE carry the durable
+        # data the replay restores. (PAD is a pure no-op.)
+        pos = pos + EXT4_FC_TL_BYTES + flen
+    blk_flush(ext4_blockdev_slot)
+    # Consume the fast-commit so a later mount doesn't replay it again.
+    ext4_fc_invalidate()
+    printk2("ext4-fc: replay applied %d inode(s) %d range(s)\n",
+            ext4_fc_replayed_inodes, ext4_fc_replayed_ranges)
+    return cast[int32](ext4_fc_replayed_inodes + ext4_fc_replayed_ranges)
+
+
+# --- fast_commit self-test ----------------------------------------
+#
+# Driven by /etc/ext4-fc-test (planted by build_initramfs.py when
+# ENABLE_EXT4_FC_TEST=1). Proves a REAL on-disk fast-commit round-trip
+# with durability, not a stub:
+#
+#   1. Create FC.TXT on the live mount holding an OLD body, and capture
+#      the physical block its single data extent maps to.
+#   2. Open a fast-commit recording the NEW body for that exact inode +
+#      data block (TAG_INODE + TAG_ADD_RANGE), and ext4_fc_commit() it
+#      to the reserved journal tail with a crc'd TAIL. The fast path
+#      writes ONLY the fc log — the file's real data block is untouched,
+#      so reading FC.TXT back still yields the OLD body. We assert that.
+#   3. Simulate a crash + remount by running _ext4_fc_replay(). Replay
+#      finds the crc-valid TAIL and re-applies the ADD_RANGE, writing the
+#      NEW body to the data block. Reading FC.TXT back must now yield the
+#      NEW body — byte-for-byte, computed from a real read, not hardcoded.
+#   4. Negative control: stage a SECOND fast-commit but corrupt its crc
+#      before replay; replay must REJECT it (the data block keeps the
+#      NEW body from step 3, never the corrupt third body).
+#
+# Prints [ext4-fc] OK/FAIL lines and a single [ext4-fc] PASS on success.
+
+ext4_fc_old_buf: Array[64, uint8]
+ext4_fc_new_buf: Array[64, uint8]
+ext4_fc_bad_buf: Array[64, uint8]
+ext4_fc_rd_buf:  Array[64, uint8]
+
+
+def _ext4_fc_fill(buf: Ptr[uint8], tag: uint8, n: uint64):
+    i: uint64 = 0
+    while i < n:
+        buf[i] = tag
+        i = i + 1
+
+
+def _ext4_fc_eq(a: Ptr[uint8], b: Ptr[uint8], n: uint64) -> int32:
+    i: uint64 = 0
+    while i < n:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def ext4_fast_commit_selftest() -> int32:
+    if ext4_blockdev_slot < 0:
+        printk0("[ext4-fc] FAIL: ext4 not mounted\n")
+        return -1
+    if ext4_fast_commit == 0:
+        printk0("[ext4-fc] FAIL: COMPAT_FAST_COMMIT not detected on image\n")
+        return -1
+    if jbd2_fc_blocks() == 0:
+        printk0("[ext4-fc] FAIL: journal has no reserved fast-commit area\n")
+        return -1
+    printk1("[ext4-fc] OK fast-commit area reserved (%d journal blocks)\n",
+            jbd2_fc_blocks())
+
+    blen: uint64 = 64
+    _ext4_fc_fill(&ext4_fc_old_buf[0], 0xA1, blen)
+    _ext4_fc_fill(&ext4_fc_new_buf[0], 0xB2, blen)
+    _ext4_fc_fill(&ext4_fc_bad_buf[0], 0xC3, blen)
+
+    # Fresh file holding the OLD body.
+    ext4_unlink("FC.TXT")
+    inum: uint32 = ext4_create_file(2, "FC.TXT", &ext4_fc_old_buf[0], blen)
+    if inum == 0:
+        printk0("[ext4-fc] FAIL: create FC.TXT\n")
+        return -1
+    if _ext4_read_back_eq(inum, &ext4_fc_old_buf[0], blen) == 0:
+        printk0("[ext4-fc] FAIL: FC.TXT does not read back as OLD\n")
+        return -1
+    printk0("[ext4-fc] OK created FC.TXT with OLD body\n")
+
+    # Capture the physical block backing logical block 0 (so the negative
+    # control can read it raw).
+    if ext4_read_inode(cast[uint64](inum), &ext4_fc_inode_buf[0]) != 0:
+        printk0("[ext4-fc] FAIL: read FC.TXT inode\n")
+        return -1
+    phys0: uint64 = _ext4_logical_to_physical(&ext4_fc_inode_buf[0], 0)
+    if phys0 == 0:
+        printk0("[ext4-fc] FAIL: FC.TXT logical block 0 unmapped\n")
+        return -1
+
+    # --- Phase A: fast-commit the NEW body, then replay restores it ---
+    if ext4_fc_begin() != 0:
+        printk0("[ext4-fc] FAIL: fc_begin (A)\n")
+        return -1
+    if ext4_fc_add_inode(inum) != 0:
+        printk0("[ext4-fc] FAIL: fc_add_inode (A)\n")
+        return -1
+    # Stage the NEW data block (full block; first `blen` bytes are NEW,
+    # rest zero — matching how create_file zero-pads).
+    _ext4_zero(&ext4_blk_buf[0], ext4_block_size)
+    memcpy(&ext4_blk_buf[0], &ext4_fc_new_buf[0], blen)
+    if ext4_fc_add_data_block(inum, 0, &ext4_blk_buf[0]) != 0:
+        printk0("[ext4-fc] FAIL: fc_add_data_block (A)\n")
+        return -1
+    if ext4_fc_commit(7) != 0:
+        printk0("[ext4-fc] FAIL: fc_commit (A)\n")
+        return -1
+    # The fast path wrote ONLY the fc log; the file's real data block is
+    # still OLD. Prove it (== the durable state right after the crash).
+    if _ext4_read_back_eq(inum, &ext4_fc_old_buf[0], blen) == 0:
+        printk0("[ext4-fc] FAIL: data changed before replay?!\n")
+        return -1
+    printk0("[ext4-fc] OK committed-but-unreplayed: file data still OLD\n")
+    # Crash + remount: run replay. It must apply the NEW body.
+    if _ext4_fc_replay() < 0:
+        printk0("[ext4-fc] FAIL: replay (A) error\n")
+        return -1
+    if _ext4_read_back_eq(inum, &ext4_fc_new_buf[0], blen) == 0:
+        printk0("[ext4-fc] FAIL: NEW body not restored after replay\n")
+        return -1
+    printk0("[ext4-fc] OK fast-commit survived crash (replay applied NEW)\n")
+
+    # --- Phase B: a crc-corrupt fast-commit must be rejected ----------
+    if ext4_fc_begin() != 0:
+        printk0("[ext4-fc] FAIL: fc_begin (B)\n")
+        return -1
+    _ext4_zero(&ext4_blk_buf[0], ext4_block_size)
+    memcpy(&ext4_blk_buf[0], &ext4_fc_bad_buf[0], blen)
+    if ext4_fc_add_data_block(inum, 0, &ext4_blk_buf[0]) != 0:
+        printk0("[ext4-fc] FAIL: fc_add_data_block (B)\n")
+        return -1
+    if ext4_fc_commit(8) != 0:
+        printk0("[ext4-fc] FAIL: fc_commit (B)\n")
+        return -1
+    # Corrupt the fc tail's crc on disk: flip a byte in the first fc
+    # block (the stream/tail live within it for this small commit).
+    fc_first: uint64 = jbd2_fc_first_lblk()
+    if jbd2_fc_read(fc_first, &ext4_fc_io_buf[0]) != 0:
+        printk0("[ext4-fc] FAIL: read fc block (B)\n")
+        return -1
+    # Flip a byte inside the recorded data payload so the crc no longer
+    # matches the stored fc_crc.
+    ext4_fc_io_buf[EXT4_FC_TL_BYTES + 24] = \
+        ext4_fc_io_buf[EXT4_FC_TL_BYTES + 24] ^ 0xFF
+    if jbd2_fc_write(fc_first, &ext4_fc_io_buf[0]) != 0:
+        printk0("[ext4-fc] FAIL: write corrupt fc block (B)\n")
+        return -1
+    if _ext4_fc_replay() < 0:
+        printk0("[ext4-fc] FAIL: replay (B) error\n")
+        return -1
+    # The corrupt commit must NOT have applied: the data block must still
+    # hold the NEW body from Phase A, never the bad (0xC3) body.
+    if _ext4_fc_replay_check_raw(phys0, &ext4_fc_new_buf[0], blen) == 0:
+        printk0("[ext4-fc] FAIL: corrupt fast-commit was applied (no crc guard)\n")
+        return -1
+    printk0("[ext4-fc] OK corrupt fast-commit rejected by crc (data unchanged)\n")
+
+    ext4_unlink("FC.TXT")
+    printk0("[ext4-fc] PASS\n")
+    return 0
+
+
+def _ext4_fc_replay_check_raw(phys: uint64, expect: Ptr[uint8],
+                              n: uint64) -> int32:
+    # Read physical block `phys` directly from disk and compare its first
+    # n bytes against expect. 1 on match, 0 otherwise.
+    if _ext4_read_block(phys, &ext4_blk_buf[0]) != 0:
+        return 0
+    i: uint64 = 0
+    while i < n:
+        if ext4_blk_buf[i] != expect[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
 # --- #149 JBD2 crash-consistency self-test ------------------------
 #
 # Proves the journal actually makes the filesystem crash-consistent,
@@ -8400,6 +9065,7 @@ EXT4_SB_OFF_FREE_BLOCKS_HI:    uint64 = 0x158
 # Feature flag bits the resize cares about.
 EXT4_FEATURE_COMPAT_HAS_JOURNAL: uint32 = 0x4
 EXT4_FEATURE_COMPAT_RESIZE_INODE: uint32 = 0x10
+EXT4_FEATURE_COMPAT_FAST_COMMIT:  uint32 = 0x400
 EXT4_FEATURE_INCOMPAT_FILETYPE:   uint32 = 0x2
 EXT4_FEATURE_INCOMPAT_EXTENTS:    uint32 = 0x40
 EXT4_FEATURE_INCOMPAT_64BIT:      uint32 = 0x80

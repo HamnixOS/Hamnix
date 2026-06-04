@@ -972,6 +972,20 @@ if os.environ.get("ENABLE_EXT4DIR_TEST") == "1":
 if os.environ.get("ENABLE_EXT4_MKDIR_TEST") == "1":
     FILES.append(("/etc/ext4-mkdir-test", b"1\n"))
 
+# ext4 fast_commit (COMPAT_FAST_COMMIT) self-test. scripts/
+# test_ext4_fast_commit.sh sets ENABLE_EXT4_FC_TEST=1 to plant
+# /etc/ext4-fc-test. init/main.ad detects the marker after the ext4
+# mount and calls ext4_fast_commit_selftest() (fs/ext4.ad): it creates a
+# file, records a NEW per-inode change (TAG_INODE + TAG_ADD_RANGE) into
+# the journal's reserved fast-commit tail closed by a crc'd TAG_TAIL,
+# proves the file still reads OLD (the fast path only wrote the fc log),
+# replays the fc region to simulate crash recovery, and byte-compares
+# the restored NEW body; it also proves a crc-corrupt fast-commit is
+# rejected. WRITES the mounted image, so it must only run on the
+# disposable fast_commit test image. Default boots omit the marker.
+if os.environ.get("ENABLE_EXT4_FC_TEST") == "1":
+    FILES.append(("/etc/ext4-fc-test", b"1\n"))
+
 # ext4 cross-directory directory-rename self-test.
 # scripts/test_ext4_dirrename.sh sets ENABLE_EXT4DIRRENAME_TEST=1 to plant
 # /etc/ext4dirrename-test. init/main.ad detects the marker after the ext4
