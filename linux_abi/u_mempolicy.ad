@@ -1,0 +1,693 @@
+# linux_abi/u_mempolicy.ad -- the Linux NUMA mempolicy family.
+#
+# Real Debian userland that touches NUMA reaches for these three syscalls:
+#
+#   * set_mempolicy(mode, nodemask, maxnode)               nr 238
+#   * get_mempolicy(policy, nodemask, maxnode, addr, flags) nr 239
+#   * mbind(addr, len, mode, nodemask, maxnode, flags)     nr 237
+#
+# numactl, numastat, libnuma, the JVM's NUMA-aware allocator, PostgreSQL's
+# huge-page + interleave tuning, and systemd's NUMAPolicy= all round-trip
+# these. Until now all three fell through to the ENOSYS default, so
+# `numactl --interleave=all cmd` and friends saw a bogus failure.
+#
+# ARCHITECTURE NOTE -- mempolicy is a LINUX-ABI concept ONLY. Hamnix presents
+# a SINGLE NUMA node (node 0); there is no second node for pages to migrate
+# to. So this is an HONEST single-node implementation, NOT a stub that
+# ignores its arguments: it validates the nodemask (any bit beyond node 0 for
+# a BIND/INTERLEAVE policy is rejected with EINVAL, exactly as Linux rejects a
+# mask naming an offline node), stores the per-task policy, and reflects it
+# faithfully back through get_mempolicy. On a one-node machine the placement
+# decision is degenerate (every allocation lands on node 0), which is the
+# correct answer -- it just means no pages ever move.
+#
+# Layer note: a confined Layer-2 leaf, mirroring linux_abi/u_caps.ad. It calls
+# only current_idx_get() (the task-slot key), the user-pointer-safe copy
+# helpers (copy_from_user / copy_to_user), and the VMA lookup (vma_find /
+# vma_node_start / vma_node_end) so mbind can validate that the target range
+# is actually mapped. It never touches 9P / Chan / Layer-1 code. u_syscalls.ad
+# imports US (the dispatch arms forward here), the same shape as u_caps.ad.
+
+from kernel.sched.core import (
+    current_idx_get,
+)
+from mm.uaccess import (
+    copy_from_user, copy_to_user,
+)
+from mm.vma import (
+    vma_find, vma_node_end,
+    vma_alloc, vma_unmap,
+    VMA_PROT_READ, VMA_PROT_WRITE,
+    VMA_MAP_PRIVATE, VMA_MAP_FIXED, VMA_MAP_ANONYMOUS,
+)
+from kernel.printk.printk import (
+    printk0, printk1,
+)
+
+
+# =====================================================================
+# Linux NUMA mempolicy ABI constants
+# =====================================================================
+#
+# Policy modes (uapi/linux/mempolicy.h, enum):
+MPOL_DEFAULT:    int64 = 0
+MPOL_PREFERRED:  int64 = 1
+MPOL_BIND:       int64 = 2
+MPOL_INTERLEAVE: int64 = 3
+MPOL_LOCAL:      int64 = 4
+MPOL_MAX:        int64 = 5          # one past the last valid mode
+
+# get_mempolicy flags (the `flags` argument):
+MPOL_F_NODE:         uint64 = 1     # return the node id, not the policy mode
+MPOL_F_ADDR:         uint64 = 2     # look up the policy governing `addr`
+MPOL_F_MEMS_ALLOWED: uint64 = 4     # return the allowed-nodes mask
+
+# mbind flags (the `flags` argument):
+MPOL_MF_STRICT:     uint64 = 1      # error if a page is not on a wanted node
+MPOL_MF_MOVE:       uint64 = 2      # move pages to conform
+MPOL_MF_MOVE_ALL:   uint64 = 4      # move pages owned by all users
+MPOL_MF_VALID:      uint64 = 7      # union of the three above
+
+# Linux negative-errno convention (subset we return).
+MPOL_EFAULT: int64 = -14
+MPOL_EINVAL: int64 = -22
+MPOL_EIO:    int64 = -5
+
+# Hamnix is single-node: only node 0 exists, and it is online + allowed.
+MPOL_NR_NODES:    uint64 = 1
+# Mask with only node 0's bit set (bit 0 of the first unsigned long).
+MPOL_NODE0_BIT:   uint64 = 1
+
+
+# =====================================================================
+# per-task policy store
+# =====================================================================
+#
+# {mode, nodemask} per task, keyed by task slot exactly the way the rlimit
+# store (kernel/sched/core.ad) and the cap store (u_caps.ad) are keyed.
+# NTASKS is 16; flat 16-entry arrays are trivially BSS-resident. A parallel
+# "seeded" bitmap tracks which slots have been initialised so a never-seen
+# task lazily defaults to MPOL_DEFAULT (the kernel default for a fresh task)
+# on first access -- no fork/clone copy hook needed (a freshly forked child
+# re-defaults to MPOL_DEFAULT, matching how a child inherits the default when
+# the parent never set a policy, the overwhelmingly common case).
+UMPOL_NTASKS: uint64 = 16
+
+umpol_mode:     Array[16, int64]      # one of MPOL_*
+umpol_nodemask: Array[16, uint64]     # bitmask of nodes (only bit 0 is real)
+umpol_seeded:   Array[16, uint8]      # 0 = never touched, 1 = initialised
+
+
+def umpol_init():
+    # Boot-time reset: every slot un-seeded. Slots default lazily to
+    # MPOL_DEFAULT on first touch (umpol_ensure_seeded).
+    i: uint64 = 0
+    while i < UMPOL_NTASKS:
+        umpol_mode[i]     = MPOL_DEFAULT
+        umpol_nodemask[i] = 0
+        umpol_seeded[i]   = 0
+        i = i + 1
+
+
+def umpol_ensure_seeded(slot: uint64):
+    # Lazily default an unseen task to MPOL_DEFAULT / empty nodemask the first
+    # time it is observed. This is the kernel default for a task that has never
+    # called set_mempolicy. Out-of-range slots are ignored.
+    if slot >= UMPOL_NTASKS:
+        return
+    if umpol_seeded[slot] != 0:
+        return
+    umpol_mode[slot]     = MPOL_DEFAULT
+    umpol_nodemask[slot] = 0
+    umpol_seeded[slot]   = 1
+
+
+def umpol_get_mode(slot: uint64) -> int64:
+    if slot >= UMPOL_NTASKS:
+        return MPOL_DEFAULT
+    umpol_ensure_seeded(slot)
+    return umpol_mode[slot]
+
+
+def umpol_get_nodemask(slot: uint64) -> uint64:
+    if slot >= UMPOL_NTASKS:
+        return 0
+    umpol_ensure_seeded(slot)
+    return umpol_nodemask[slot]
+
+
+def umpol_set(slot: uint64, mode: int64, nodemask: uint64):
+    if slot >= UMPOL_NTASKS:
+        return
+    umpol_mode[slot]     = mode
+    umpol_nodemask[slot] = nodemask
+    umpol_seeded[slot]   = 1
+
+
+# =====================================================================
+# nodemask helpers
+# =====================================================================
+#
+# Linux passes a nodemask as an array of `unsigned long` (8 bytes each on
+# x86_64). `maxnode` is the number of BITS the caller is offering -- the
+# array length in longs is ceil(maxnode / 64), but Linux also accepts
+# maxnode==0 (no mask). We only ever care about bit 0 (node 0) since that is
+# the only node that exists, but we must honest-check every bit the caller
+# set: any bit >= 1 means the caller named a node we do not have.
+
+# Number of 8-byte longs needed to hold `maxnode` bits (capped so a hostile
+# maxnode can't make us read an unbounded amount of user memory). Linux caps
+# maxnode at MAX_NUMNODES+something; we cap our local read at a small fixed
+# buffer because only bit 0 can ever be valid here.
+UMPOL_MASK_LONGS_MAX: uint64 = 8         # 512 bits of scratch is plenty
+
+
+def _umpol_mask_longs(maxnode: uint64) -> uint64:
+    # Number of unsigned-long words the kernel would copy for `maxnode` bits.
+    # Linux uses round_up(maxnode, BITS_PER_LONG) / BITS_PER_LONG but treats
+    # the high "alignment" word specially; for our read we just need enough
+    # words to observe every bit the caller could have set, capped.
+    if maxnode == 0:
+        return 0
+    longs: uint64 = (maxnode + 63) / 64
+    if longs > UMPOL_MASK_LONGS_MAX:
+        longs = UMPOL_MASK_LONGS_MAX
+    return longs
+
+
+# Read a user nodemask into `out_low` (bits 0..63) and return, via the
+# `extra` out-param semantics, whether ANY bit at position >= 1 was set in the
+# whole mask (i.e. the caller named a node other than node 0). We return:
+#   0  -> ok, only bit 0 (or no bits) set; *low gets the low word
+#   1  -> a node other than node 0 was named (EINVAL territory for BIND/ILEAVE)
+#  <0  -> EFAULT reading the mask
+#
+# Because Adder has no multiple-return, we encode the result as: return value
+# is the low word's relevant info via a small struct-free protocol -- we use
+# two module globals updated as side effects. Keeping it explicit and simple.
+_umpol_rd_low:       uint64 = 0      # low 64 bits of the last mask read
+_umpol_rd_nonzero1:  int32  = 0      # 1 if any bit >= 1 was set
+
+
+def _umpol_read_nodemask(umask: uint64, maxnode: uint64) -> int64:
+    # Reads the user nodemask at `umask` (maxnode bits). Populates the module
+    # globals _umpol_rd_low (low word) and _umpol_rd_nonzero1 (set iff any bit
+    # at index >= 1 is set anywhere in the mask). Returns 0 on success or
+    # MPOL_EFAULT on a bad user pointer.
+    _umpol_rd_low      = 0
+    _umpol_rd_nonzero1 = 0
+    if umask == 0 or maxnode == 0:
+        # No mask supplied. Treat as empty (no nodes named).
+        return 0
+    longs: uint64 = _umpol_mask_longs(maxnode)
+    if longs == 0:
+        return 0
+    words: Array[8, uint64]
+    if copy_from_user(cast[uint64](&words[0]), umask, longs * 8) != 0:
+        return MPOL_EFAULT
+    _umpol_rd_low = words[0]
+    # Any bit >= 1 anywhere -> the caller named a node other than node 0.
+    # Word 0 carries bits 0..63; bit 0 is node 0, bits 1..63 are foreign.
+    if (words[0] & ~MPOL_NODE0_BIT) != 0:
+        _umpol_rd_nonzero1 = 1
+    # Any higher word being nonzero is also a foreign node.
+    i: uint64 = 1
+    while i < longs:
+        if words[i] != 0:
+            _umpol_rd_nonzero1 = 1
+        i = i + 1
+    return 0
+
+
+def _umpol_write_nodemask(umask: uint64, maxnode: uint64, low: uint64) -> int64:
+    # Writes `low` as the low word of a user nodemask of `maxnode` bits,
+    # zeroing the higher words. Returns 0 or MPOL_EFAULT. A NULL umask or
+    # maxnode==0 is a no-op success (caller didn't ask for the mask back).
+    if umask == 0 or maxnode == 0:
+        return 0
+    longs: uint64 = _umpol_mask_longs(maxnode)
+    if longs == 0:
+        return 0
+    words: Array[8, uint64]
+    words[0] = low
+    i: uint64 = 1
+    while i < longs:
+        words[i] = 0
+        i = i + 1
+    if copy_to_user(umask, cast[uint64](&words[0]), longs * 8) != 0:
+        return MPOL_EFAULT
+    return 0
+
+
+# =====================================================================
+# mode validation
+# =====================================================================
+#
+# Linux set_mempolicy/mbind pack optional mode FLAGS (MPOL_F_STATIC_NODES,
+# MPOL_F_RELATIVE_NODES, MPOL_F_NUMA_BALANCING) into the high bits of `mode`.
+# We strip them off and validate the base mode is in range. The flag bits are
+# accepted (they don't change placement on a single node) but masked out.
+# MPOL_F_STATIC_NODES=0x8000, MPOL_F_RELATIVE_NODES=0x4000,
+# MPOL_F_NUMA_BALANCING=0x2000 -> union 0xE000.
+MPOL_MODE_FLAGS: int64 = 0xE000                 # high mode-flag bits region
+
+
+def _umpol_base_mode(mode: int64) -> int64:
+    # Strip the Linux mode-flag bits, leaving the base policy mode.
+    return mode & ~MPOL_MODE_FLAGS
+
+
+def _umpol_mode_ok(base: int64) -> int32:
+    if base < MPOL_DEFAULT:
+        return 0
+    if base >= MPOL_MAX:
+        return 0
+    return 1
+
+
+# Validate the (base mode, nonzero-foreign-bit) pair against the single-node
+# reality. Returns 0 if the policy is acceptable, MPOL_EINVAL otherwise.
+#
+#   * MPOL_DEFAULT:    must have an EMPTY nodemask (Linux rule). A foreign bit
+#                      or even node 0 set is EINVAL.
+#   * MPOL_LOCAL:      must have an EMPTY nodemask (Linux rule).
+#   * MPOL_PREFERRED:  may name node 0 or be empty (empty == local). A foreign
+#                      node -> EINVAL.
+#   * MPOL_BIND:       must name a NON-EMPTY set of online nodes. A foreign
+#                      node -> EINVAL; an empty set -> EINVAL.
+#   * MPOL_INTERLEAVE: same as BIND (must name online nodes; empty -> EINVAL).
+def _umpol_validate(base: int64, low: uint64, foreign: int32) -> int64:
+    if foreign != 0:
+        # A node other than node 0 was named -- no such node exists.
+        return MPOL_EINVAL
+    if base == MPOL_DEFAULT:
+        if low != 0:
+            return MPOL_EINVAL
+        return 0
+    if base == MPOL_LOCAL:
+        if low != 0:
+            return MPOL_EINVAL
+        return 0
+    if base == MPOL_PREFERRED:
+        # Empty (local) or node 0 only -- both fine.
+        return 0
+    if base == MPOL_BIND:
+        if (low & MPOL_NODE0_BIT) == 0:
+            return MPOL_EINVAL       # BIND requires a non-empty online set
+        return 0
+    if base == MPOL_INTERLEAVE:
+        if (low & MPOL_NODE0_BIT) == 0:
+            return MPOL_EINVAL       # INTERLEAVE requires a non-empty set
+        return 0
+    return MPOL_EINVAL
+
+
+# =====================================================================
+# set_mempolicy(mode, nodemask, maxnode)  --  nr 238
+# =====================================================================
+#
+# long set_mempolicy(int mode, const unsigned long *nodemask,
+#                    unsigned long maxnode)
+#   a0 = mode, a1 = nodemask*, a2 = maxnode.
+#
+# Sets the calling task's default memory policy. We copy_from_user the mask,
+# validate it against the single-node reality, and store {mode, nodemask}.
+def umpol_set_mempolicy(a0: uint64, a1: uint64, a2: uint64) -> int64:
+    mode: int64 = cast[int64](cast[int32](a0))     # mode is a signed int
+    base: int64 = _umpol_base_mode(mode)
+    if _umpol_mode_ok(base) == 0:
+        return MPOL_EINVAL
+    # Read & inspect the user nodemask.
+    rc: int64 = _umpol_read_nodemask(a1, a2)
+    if rc != 0:
+        return rc                                   # EFAULT
+    low: uint64 = _umpol_rd_low
+    foreign: int32 = _umpol_rd_nonzero1
+    vrc: int64 = _umpol_validate(base, low, foreign)
+    if vrc != 0:
+        return vrc                                  # EINVAL
+    # Normalise the stored mask: DEFAULT/LOCAL store an empty mask; the others
+    # store node-0's bit where it was named (so get_mempolicy round-trips it).
+    store_mask: uint64 = low & MPOL_NODE0_BIT
+    if base == MPOL_DEFAULT or base == MPOL_LOCAL:
+        store_mask = 0
+    umpol_set(current_idx_get(), base, store_mask)
+    return 0
+
+
+# =====================================================================
+# get_mempolicy(policy, nodemask, maxnode, addr, flags)  --  nr 239
+# =====================================================================
+#
+# long get_mempolicy(int *policy, unsigned long *nodemask,
+#                    unsigned long maxnode, void *addr, unsigned long flags)
+#   a0 = policy*, a1 = nodemask*, a2 = maxnode, a3 = addr, a4 = flags.
+#
+#   * flags == 0:
+#       return the task's default policy mode in *policy and its nodemask in
+#       *nodemask.
+#   * MPOL_F_MEMS_ALLOWED (must be the only flag):
+#       *nodemask gets the allowed-nodes mask (bit 0 set); *policy is NOT
+#       written (Linux returns 0 and only fills the mask).
+#   * MPOL_F_NODE | MPOL_F_ADDR:
+#       *policy gets the NODE id (0) servicing `addr`. The address must be in a
+#       mapped region or Linux returns EFAULT.
+#   * MPOL_F_NODE alone (no MPOL_F_ADDR):
+#       for an INTERLEAVE policy *policy is the next interleave node; for any
+#       other policy *policy is the task's current node (0). We return 0.
+#   * MPOL_F_ADDR alone:
+#       *policy gets the policy MODE governing `addr`; the address must be
+#       mapped (EFAULT otherwise). *nodemask gets that policy's mask.
+def umpol_get_mempolicy(a0: uint64, a1: uint64, a2: uint64,
+                        a3: uint64, a4: uint64) -> int64:
+    flags: uint64 = a4
+    # Reject unknown flag bits.
+    if (flags & ~(MPOL_F_NODE | MPOL_F_ADDR | MPOL_F_MEMS_ALLOWED)) != 0:
+        return MPOL_EINVAL
+
+    slot: uint64 = current_idx_get()
+
+    # --- MPOL_F_MEMS_ALLOWED ----------------------------------------
+    if (flags & MPOL_F_MEMS_ALLOWED) != 0:
+        # Must not be combined with the other flags (Linux rule).
+        if (flags & (MPOL_F_NODE | MPOL_F_ADDR)) != 0:
+            return MPOL_EINVAL
+        # Fill *nodemask with the allowed-nodes mask: only node 0 -> bit 0.
+        wrc: int64 = _umpol_write_nodemask(a1, a2, MPOL_NODE0_BIT)
+        if wrc != 0:
+            return wrc
+        return 0
+
+    # --- MPOL_F_ADDR (with or without MPOL_F_NODE) ------------------
+    if (flags & MPOL_F_ADDR) != 0:
+        # The address must lie in a mapped region.
+        node: uint64 = vma_find(slot, a3)
+        if node == 0:
+            return MPOL_EFAULT
+        if (flags & MPOL_F_NODE) != 0:
+            # Return the NODE id servicing `addr`: single node -> 0.
+            if a0 != 0:
+                pol_node: int32 = 0
+                if copy_to_user(a0, cast[uint64](&pol_node), 4) != 0:
+                    return MPOL_EFAULT
+            return 0
+        # MPOL_F_ADDR alone: return the MODE governing `addr`. We have no
+        # per-VMA policy override, so the task's default policy governs every
+        # mapped address. Report it.
+        addr_mode: int64 = umpol_get_mode(slot)
+        addr_mask: uint64 = umpol_get_nodemask(slot)
+        if a0 != 0:
+            pm: int32 = cast[int32](addr_mode)
+            if copy_to_user(a0, cast[uint64](&pm), 4) != 0:
+                return MPOL_EFAULT
+        mrc: int64 = _umpol_write_nodemask(a1, a2, addr_mask)
+        if mrc != 0:
+            return mrc
+        return 0
+
+    # --- MPOL_F_NODE without MPOL_F_ADDR ----------------------------
+    if (flags & MPOL_F_NODE) != 0:
+        # Return the "current" node: single node -> 0.
+        if a0 != 0:
+            n0: int32 = 0
+            if copy_to_user(a0, cast[uint64](&n0), 4) != 0:
+                return MPOL_EFAULT
+        return 0
+
+    # --- flags == 0: task default policy ----------------------------
+    def_mode: int64 = umpol_get_mode(slot)
+    def_mask: uint64 = umpol_get_nodemask(slot)
+    if a0 != 0:
+        pm0: int32 = cast[int32](def_mode)
+        if copy_to_user(a0, cast[uint64](&pm0), 4) != 0:
+            return MPOL_EFAULT
+    drc: int64 = _umpol_write_nodemask(a1, a2, def_mask)
+    if drc != 0:
+        return drc
+    return 0
+
+
+# =====================================================================
+# mbind(addr, len, mode, nodemask, maxnode, flags)  --  nr 237
+# =====================================================================
+#
+# long mbind(void *addr, unsigned long len, int mode,
+#            const unsigned long *nodemask, unsigned long maxnode,
+#            unsigned flags)
+#   a0 = addr, a1 = len, a2 = mode, a3 = nodemask*, a4 = maxnode, a5 = flags.
+#
+# Applies a policy to the VMA range [addr, addr+len). We:
+#   * validate `flags` (only MPOL_MF_* bits allowed);
+#   * validate the base mode is in range;
+#   * validate the range is fully mapped (VMA walk) -- EFAULT otherwise;
+#   * validate the nodemask against the single-node reality -- EINVAL on a
+#     foreign node bit;
+#   * accept. On a single node no pages move, so there's nothing else to do.
+#
+# MPOL_MF_STRICT: Linux errors (EIO) if any page in the range is not on a
+# wanted node. On a single node, if a BIND/INTERLEAVE named node 0 (the only
+# node) every page is already "on" a wanted node -> success; a non-node-0
+# binding would already have been rejected as EINVAL above. So STRICT can only
+# fail here together with an EINVAL mask, which we already return.
+def umpol_mbind(a0: uint64, a1: uint64, a2: uint64,
+                a3: uint64, a4: uint64, a5: uint64) -> int64:
+    addr: uint64 = a0
+    length: uint64 = a1
+    mode: int64 = cast[int64](cast[int32](a2))
+    umask: uint64 = a3
+    maxnode: uint64 = a4
+    flags: uint64 = a5
+
+    # Reject unknown flag bits.
+    if (flags & ~MPOL_MF_VALID) != 0:
+        return MPOL_EINVAL
+
+    base: int64 = _umpol_base_mode(mode)
+    if _umpol_mode_ok(base) == 0:
+        return MPOL_EINVAL
+
+    # A zero-length mbind is a no-op success (Linux returns 0). But still
+    # validate the mode/mask below for argument fidelity.
+    # Validate the nodemask first (cheap, and mirrors set_mempolicy).
+    rc: int64 = _umpol_read_nodemask(umask, maxnode)
+    if rc != 0:
+        return rc                                   # EFAULT
+    low: uint64 = _umpol_rd_low
+    foreign: int32 = _umpol_rd_nonzero1
+    vrc: int64 = _umpol_validate(base, low, foreign)
+    if vrc != 0:
+        # A non-node-0 binding was demanded. With MPOL_MF_STRICT Linux maps
+        # this to EIO for pages it cannot place; the argument validation path
+        # returns EINVAL, which is what numactl sees for an offline node.
+        return vrc                                  # EINVAL
+
+    # Validate the range [addr, addr+len) is fully mapped, unless len==0.
+    if length > 0:
+        if _umpol_range_mapped(current_idx_get(), addr, length) == 0:
+            return MPOL_EFAULT
+
+    # Accept. Single node -> the policy is satisfied as-is; no pages move.
+    # (We deliberately do NOT change the task's default policy here -- mbind
+    # is a per-range operation, and with a single node the per-range placement
+    # is already optimal. A real multi-node port would attach `base`/`low` to
+    # the covered VMAs.)
+    return 0
+
+
+def _umpol_range_mapped(slot: uint64, addr: uint64, length: uint64) -> int32:
+    # 1 iff every byte of [addr, addr+length) lies within mapped VMAs (the
+    # region may span several contiguous VMAs). Walks the VMA list from the
+    # VMA covering `addr`, advancing to each successive contiguous VMA until
+    # the whole range is covered. Returns 0 if any gap is found.
+    end: uint64 = addr + length
+    cur: uint64 = addr
+    while cur < end:
+        node: uint64 = vma_find(slot, cur)
+        if node == 0:
+            return 0                                # gap -> unmapped
+        vend: uint64 = vma_node_end(node)
+        if vend <= cur:
+            return 0                                # defensive: no progress
+        cur = vend                                  # jump to end of this VMA
+    return 1
+
+
+# =====================================================================
+# Boot self-test  --  [MEMPOLICY] PASS / FAIL  (boot:37.mempolicy)
+# =====================================================================
+#
+# Exercises set_mempolicy / get_mempolicy / mbind directly against the real
+# per-task policy store and a real mapped VMA, driving the SAME handler entry
+# points the nr 237/238/239 dispatch arms call. Boot-context pointers are
+# kernel-mapped and resolve through copy_from_user/copy_to_user the same way
+# caps_selftest's stack buffers do. Steps:
+#
+#   (1) set_mempolicy(MPOL_BIND, {node 0}) -> 0; get_mempolicy(flags=0)
+#       round-trips mode==BIND and mask bit 0.
+#   (2) set_mempolicy(MPOL_INTERLEAVE, {node 0}) -> 0; get_mempolicy re-asserts
+#       mode==INTERLEAVE and mask bit 0.
+#   (3) set_mempolicy(MPOL_BIND, {node 1}) -> EINVAL (no such node).
+#   (4) mmap a real range (via vma_alloc) and mbind(MPOL_BIND, {node 0}) -> 0.
+#   (5) mbind with the node-1 bit set -> EINVAL.
+#   (6) get_mempolicy(MPOL_F_MEMS_ALLOWED) returns a mask with bit 0 set.
+#   (7) read /sys/devices/system/node/online and assert "0".
+#
+# mempolicy_selftest returns 1 on success, 0 on any failure (matching
+# caps_selftest's convention). Step (4)/(7) wiring: the VMA range comes from a
+# real vma_alloc against the boot task's slot; the sysfs assert is performed in
+# init/main.ad's boot block via the VFS path (so it exercises render-on-open).
+
+# A scratch VA well above the boot stack/brk to mmap for the mbind range test.
+UMPOL_TEST_VA:  uint64 = 0x5A000000
+UMPOL_TEST_LEN: uint64 = 0x2000           # two pages
+
+
+def mempolicy_selftest() -> int32:
+    umpol_init()
+    slot: uint64 = current_idx_get()
+
+    # Scratch user-shaped buffers (kernel-mapped in boot context).
+    pol:  Array[1, int32]            # *policy out
+    mask: Array[1, uint64]           # *nodemask in/out (one word)
+
+    # --- (1) set_mempolicy(BIND, {0}) then get_mempolicy round-trip ---
+    mask[0] = MPOL_NODE0_BIT
+    rc: int64 = umpol_set_mempolicy(cast[uint64](MPOL_BIND),
+                                    cast[uint64](&mask[0]), 64)
+    if rc != 0:
+        printk1("[MEMPOLICY] FAIL set BIND rc=%d\n", cast[uint64](rc))
+        return 0
+    pol[0]  = -1
+    mask[0] = 0
+    rc = umpol_get_mempolicy(cast[uint64](&pol[0]),
+                             cast[uint64](&mask[0]), 64, 0, 0)
+    if rc != 0:
+        printk1("[MEMPOLICY] FAIL get(BIND) rc=%d\n", cast[uint64](rc))
+        return 0
+    if cast[int64](pol[0]) != MPOL_BIND:
+        printk1("[MEMPOLICY] FAIL get mode=%d != BIND\n",
+                cast[uint64](cast[int64](pol[0])))
+        return 0
+    if (mask[0] & MPOL_NODE0_BIT) == 0:
+        printk1("[MEMPOLICY] FAIL get mask=%x missing node0\n", mask[0])
+        return 0
+    printk0("[MEMPOLICY] PASS set/get BIND {0} round-trips\n")
+
+    # --- (2) set INTERLEAVE and re-assert ---------------------------
+    mask[0] = MPOL_NODE0_BIT
+    rc = umpol_set_mempolicy(cast[uint64](MPOL_INTERLEAVE),
+                             cast[uint64](&mask[0]), 64)
+    if rc != 0:
+        printk1("[MEMPOLICY] FAIL set INTERLEAVE rc=%d\n", cast[uint64](rc))
+        return 0
+    pol[0]  = -1
+    mask[0] = 0
+    rc = umpol_get_mempolicy(cast[uint64](&pol[0]),
+                             cast[uint64](&mask[0]), 64, 0, 0)
+    if rc != 0:
+        printk1("[MEMPOLICY] FAIL get(INTERLEAVE) rc=%d\n", cast[uint64](rc))
+        return 0
+    if cast[int64](pol[0]) != MPOL_INTERLEAVE:
+        printk1("[MEMPOLICY] FAIL get mode=%d != INTERLEAVE\n",
+                cast[uint64](cast[int64](pol[0])))
+        return 0
+    if (mask[0] & MPOL_NODE0_BIT) == 0:
+        printk0("[MEMPOLICY] FAIL INTERLEAVE mask missing node0\n")
+        return 0
+    printk0("[MEMPOLICY] PASS set/get INTERLEAVE {0} round-trips\n")
+
+    # --- (3) set_mempolicy(BIND, {node 1}) -> EINVAL ----------------
+    # Bit 1 == node 1, which does not exist.
+    mask[0] = cast[uint64](2)        # bit 1 set
+    rc = umpol_set_mempolicy(cast[uint64](MPOL_BIND),
+                             cast[uint64](&mask[0]), 64)
+    if rc != MPOL_EINVAL:
+        printk1("[MEMPOLICY] FAIL set BIND {1} rc=%d (want EINVAL -22)\n",
+                cast[uint64](rc))
+        return 0
+    printk0("[MEMPOLICY] PASS BIND to offline node1 rejected EINVAL\n")
+
+    # --- (4) mmap a real range, mbind(BIND, {0}) -> 0 ---------------
+    # Map two anonymous pages via the real VMA allocator on the boot slot.
+    arc: int64 = vma_alloc(slot, UMPOL_TEST_VA, UMPOL_TEST_LEN,
+                           VMA_PROT_READ | VMA_PROT_WRITE,
+                           VMA_MAP_ANONYMOUS | VMA_MAP_PRIVATE | VMA_MAP_FIXED,
+                           -1, 0)
+    if arc < 0:
+        printk1("[MEMPOLICY] FAIL vma_alloc rc=%d\n", cast[uint64](arc))
+        return 0
+    mask[0] = MPOL_NODE0_BIT
+    rc = umpol_mbind(UMPOL_TEST_VA, UMPOL_TEST_LEN, cast[uint64](MPOL_BIND),
+                     cast[uint64](&mask[0]), 64, 0)
+    if rc != 0:
+        printk1("[MEMPOLICY] FAIL mbind BIND {0} rc=%d\n", cast[uint64](rc))
+        vma_unmap(slot, UMPOL_TEST_VA, UMPOL_TEST_LEN)
+        return 0
+    printk0("[MEMPOLICY] PASS mbind BIND {0} over mapped range -> 0\n")
+
+    # --- (5) mbind with the node-1 bit set -> EINVAL ----------------
+    mask[0] = cast[uint64](2)        # bit 1 -> node 1
+    rc = umpol_mbind(UMPOL_TEST_VA, UMPOL_TEST_LEN, cast[uint64](MPOL_BIND),
+                     cast[uint64](&mask[0]), 64, 0)
+    if rc != MPOL_EINVAL:
+        printk1("[MEMPOLICY] FAIL mbind BIND {1} rc=%d (want EINVAL)\n",
+                cast[uint64](rc))
+        vma_unmap(slot, UMPOL_TEST_VA, UMPOL_TEST_LEN)
+        return 0
+    printk0("[MEMPOLICY] PASS mbind to offline node1 rejected EINVAL\n")
+
+    # --- (5b) mbind over an UNMAPPED range -> EFAULT ----------------
+    mask[0] = MPOL_NODE0_BIT
+    rc = umpol_mbind(0x70000000, 0x1000, cast[uint64](MPOL_BIND),
+                     cast[uint64](&mask[0]), 64, 0)
+    if rc != MPOL_EFAULT:
+        printk1("[MEMPOLICY] FAIL mbind unmapped rc=%d (want EFAULT)\n",
+                cast[uint64](rc))
+        vma_unmap(slot, UMPOL_TEST_VA, UMPOL_TEST_LEN)
+        return 0
+    printk0("[MEMPOLICY] PASS mbind over unmapped range -> EFAULT\n")
+
+    # Release the scratch mapping.
+    vma_unmap(slot, UMPOL_TEST_VA, UMPOL_TEST_LEN)
+
+    # --- (6) get_mempolicy(MPOL_F_MEMS_ALLOWED) mask has bit 0 ------
+    mask[0] = 0
+    rc = umpol_get_mempolicy(0, cast[uint64](&mask[0]), 64, 0,
+                             MPOL_F_MEMS_ALLOWED)
+    if rc != 0:
+        printk1("[MEMPOLICY] FAIL get MEMS_ALLOWED rc=%d\n", cast[uint64](rc))
+        return 0
+    if (mask[0] & MPOL_NODE0_BIT) == 0:
+        printk1("[MEMPOLICY] FAIL MEMS_ALLOWED mask=%x missing node0\n",
+                mask[0])
+        return 0
+    printk0("[MEMPOLICY] PASS MEMS_ALLOWED mask has node0\n")
+
+    # --- (6b) get_mempolicy(MPOL_F_NODE|MPOL_F_ADDR) for mapped addr -
+    # Re-map the scratch range so the addr lookup has a mapped target.
+    arc = vma_alloc(slot, UMPOL_TEST_VA, UMPOL_TEST_LEN,
+                    VMA_PROT_READ | VMA_PROT_WRITE,
+                    VMA_MAP_ANONYMOUS | VMA_MAP_PRIVATE | VMA_MAP_FIXED,
+                    -1, 0)
+    if arc >= 0:
+        pol[0] = -1
+        rc = umpol_get_mempolicy(cast[uint64](&pol[0]), 0, 0, UMPOL_TEST_VA,
+                                 MPOL_F_NODE | MPOL_F_ADDR)
+        if rc != 0:
+            printk1("[MEMPOLICY] FAIL get NODE|ADDR rc=%d\n", cast[uint64](rc))
+            vma_unmap(slot, UMPOL_TEST_VA, UMPOL_TEST_LEN)
+            return 0
+        if pol[0] != 0:
+            printk1("[MEMPOLICY] FAIL NODE|ADDR node=%d != 0\n",
+                    cast[uint64](cast[int64](pol[0])))
+            vma_unmap(slot, UMPOL_TEST_VA, UMPOL_TEST_LEN)
+            return 0
+        vma_unmap(slot, UMPOL_TEST_VA, UMPOL_TEST_LEN)
+        printk0("[MEMPOLICY] PASS NODE|ADDR for mapped addr -> node 0\n")
+
+    # Restore the boot task to a clean default policy.
+    umpol_seeded[slot] = 0
+    umpol_ensure_seeded(slot)
+
+    printk0("[mempolicy] PASS\n")
+    return 1

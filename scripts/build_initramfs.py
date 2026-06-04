@@ -1145,6 +1145,16 @@ if os.environ.get("ENABLE_CAPS_TEST"):
 # boots omit the marker.
 if os.environ.get("ENABLE_PERF_TEST"):
     FILES.append(("/etc/perf-test", b"1\n"))
+# NUMA mempolicy round-trip self-test. scripts/test_mempolicy.sh sets
+# ENABLE_MEMPOLICY_TEST=1 to plant /etc/mempolicy-test. init/main.ad detects
+# the marker and calls mempolicy_selftest() (linux_abi/u_mempolicy.ad): it
+# round-trips BIND/INTERLEAVE through the per-task store, mmaps a real range
+# and mbinds it, asserts a foreign-node mask is rejected EINVAL and that
+# MPOL_F_MEMS_ALLOWED reflects node 0, then reads /sys/devices/system/node/
+# online through the VFS path and asserts "0", emitting the [mempolicy] PASS
+# banner. Default boots omit the marker.
+if os.environ.get("ENABLE_MEMPOLICY_TEST"):
+    FILES.append(("/etc/mempolicy-test", b"1\n"))
 
 # getpriority(2)/setpriority(2) round-trip self-test. scripts/test_priosys.sh
 # sets ENABLE_PRIOSYS_TEST=1 to plant /etc/priosys-test. init/main.ad detects
