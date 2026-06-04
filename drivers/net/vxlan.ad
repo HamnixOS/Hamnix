@@ -1,0 +1,754 @@
+# drivers/net/vxlan.ad
+#
+# VXLAN — Virtual eXtensible LAN (RFC 7348). An L2-over-L3 overlay:
+# a complete inner Ethernet frame is tunneled inside UDP/IPv4 with the
+# standard destination port 4789 and an 8-byte VXLAN header carrying a
+# 24-bit VXLAN Network Identifier (VNI). This is the substrate Linux
+# uses for overlay networks (the basis of most Kubernetes CNIs).
+#
+# Outer frame layout (this is what ENCAP produces and DECAP consumes):
+#
+#   +----------------------------------------------------------+
+#   | Outer Ethernet (14)  dst MAC | src MAC | ethertype=0x0800 |
+#   +----------------------------------------------------------+
+#   | Outer IPv4 (20)      proto=17 (UDP), correct len + csum   |
+#   +----------------------------------------------------------+
+#   | Outer UDP (8)        dport=4789, len, checksum            |
+#   +----------------------------------------------------------+
+#   | VXLAN (8)            flags(I-bit) | rsvd | VNI(24) | rsvd  |
+#   +----------------------------------------------------------+
+#   | Inner Ethernet frame (the original L2 frame, byte-exact)  |
+#   +----------------------------------------------------------+
+#
+# We reuse the native stack's framing primitives rather than reinvent
+# them: ip_csum16 (drivers/net/ip.ad) is the RFC-1071 ones'-complement
+# Internet checksum used for both the IPv4 header checksum and the UDP
+# checksum (over a pseudo-header). The on-wire byte offsets here match
+# IpHdr / UdpHdr / EthHdr exactly.
+
+from kernel.printk.printk import printk0, printk1, printk2, printk_set_level
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
+from drivers.net.ip import ip_csum16, IP_HDR_LEN, IPPROTO_UDP, IP_TTL
+from drivers.net.eth import ETH_HDR_LEN, ETH_P_IP
+from drivers.net.udp import UDP_HDR_LEN
+
+
+# --- Wire constants ----------------------------------------------------
+
+# Standard VXLAN UDP destination port (RFC 7348 §5; IANA assigned 4789).
+VXLAN_UDP_PORT: uint16 = 4789
+
+# VXLAN header length (8 bytes) and the position of the inner frame.
+VXLAN_HDR_LEN: uint64 = 8
+
+# VXLAN flags byte 0: the "I" (Instance) bit (0x08) marks the VNI as
+# valid. On the wire the flags occupy the first 32-bit word, so the
+# I-bit lands in the most-significant byte: 0x08000000.
+VXLAN_FLAG_I:        uint8  = 0x08
+VXLAN_FLAGS_I_WORD:  uint32 = 0x08000000
+
+# Combined outer-overhead before the inner frame begins.
+# eth(14) + ip(20) + udp(8) + vxlan(8) = 50.
+VXLAN_OUTER_OVERHEAD: uint64 = 50
+
+
+# --- VXLAN header (8 bytes on the wire) --------------------------------
+#
+# Byte 0:   flags (I-bit at 0x08)
+# Bytes 1-3: reserved (must be 0)
+# Bytes 4-6: VNI (24-bit, big-endian)
+# Byte 7:   reserved (must be 0)
+class VxlanHdr:
+    flags:    uint8        # 0
+    rsvd0:    uint8        # 1
+    rsvd1:    uint8        # 2
+    rsvd2:    uint8        # 3
+    vni_hi:   uint8        # 4 (VNI bits 23..16)
+    vni_mid:  uint8        # 5 (VNI bits 15..8)
+    vni_lo:   uint8        # 6 (VNI bits 7..0)
+    rsvd3:    uint8        # 7
+
+
+# Counters (mirror the /sys-visible accounting a real vxlan netdev keeps).
+vxlan_tx_encaps: uint64 = 0
+vxlan_rx_decaps: uint64 = 0
+vxlan_rx_drops:  uint64 = 0
+
+
+# =====================================================================
+# VNI -> remote VTEP forwarding map
+# =====================================================================
+#
+# A send-by-VNI needs to know where to tunnel: the remote VTEP's outer
+# IPv4 + the destination MAC for the outer Ethernet header (the next-hop
+# toward that VTEP). A real vxlan device keeps an FDB; a fixed-size table
+# is enough to route a known set of overlay segments.
+
+VXLAN_FDB_MAX: uint64 = 16
+
+vxlan_fdb_inuse:    Array[16, uint8]      # 1 if slot holds a mapping
+vxlan_fdb_vni:      Array[16, uint32]     # 24-bit VNI key (host order)
+vxlan_fdb_rip:      Array[16, uint32]     # remote VTEP IPv4 (host order)
+vxlan_fdb_rmac:     Array[96, uint8]      # remote/next-hop MAC, 16 * 6 bytes
+
+
+def vxlan_init():
+    # Reset the forwarding table and counters. Idempotent.
+    i: uint64 = 0
+    while i < VXLAN_FDB_MAX:
+        vxlan_fdb_inuse[i] = 0
+        vxlan_fdb_vni[i]   = 0
+        vxlan_fdb_rip[i]   = 0
+        i = i + 1
+    i = 0
+    while i < (VXLAN_FDB_MAX * 6):
+        vxlan_fdb_rmac[i] = 0
+        i = i + 1
+    vxlan_tx_encaps = 0
+    vxlan_rx_decaps = 0
+    vxlan_rx_drops  = 0
+
+
+def vxlan_fdb_add(vni: uint32, remote_ip: uint32, remote_mac: Ptr[uint8]) -> int32:
+    # Install (or overwrite) a VNI -> remote VTEP mapping. Returns the
+    # slot index on success, -1 if the table is full. An existing entry
+    # for the same VNI is overwritten.
+    vni24: uint32 = vni & 0x00FFFFFF
+    i: uint64 = 0
+    free_slot: int32 = -1
+    while i < VXLAN_FDB_MAX:
+        if vxlan_fdb_inuse[i] != 0:
+            if vxlan_fdb_vni[i] == vni24:
+                free_slot = cast[int32](i)
+                i = VXLAN_FDB_MAX
+        else:
+            if free_slot < 0:
+                free_slot = cast[int32](i)
+        if i < VXLAN_FDB_MAX:
+            i = i + 1
+    if free_slot < 0:
+        return -1
+    slot: uint64 = cast[uint64](free_slot)
+    vxlan_fdb_inuse[slot] = 1
+    vxlan_fdb_vni[slot]   = vni24
+    vxlan_fdb_rip[slot]   = remote_ip
+    base: uint64 = slot * 6
+    j: uint64 = 0
+    while j < 6:
+        vxlan_fdb_rmac[base + j] = remote_mac[j]
+        j = j + 1
+    return cast[int32](free_slot)
+
+
+def vxlan_fdb_lookup(vni: uint32, out_ip: Ptr[uint32],
+                     out_mac: Ptr[uint8]) -> int32:
+    # Resolve a VNI to its remote VTEP. On a hit, writes the remote IPv4
+    # into *out_ip and the 6-byte remote MAC into out_mac[0..5], and
+    # returns the slot index. Returns -1 if the VNI is unknown.
+    vni24: uint32 = vni & 0x00FFFFFF
+    i: uint64 = 0
+    while i < VXLAN_FDB_MAX:
+        if vxlan_fdb_inuse[i] != 0:
+            if vxlan_fdb_vni[i] == vni24:
+                if out_ip != cast[Ptr[uint32]](0):
+                    out_ip[0] = vxlan_fdb_rip[i]
+                base: uint64 = i * 6
+                j: uint64 = 0
+                while j < 6:
+                    out_mac[j] = vxlan_fdb_rmac[base + j]
+                    j = j + 1
+                return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+# =====================================================================
+# Little big-endian field writers / readers
+# =====================================================================
+
+def _vx_put16(buf: Ptr[uint8], off: uint64, v: uint16):
+    buf[off]     = cast[uint8]((cast[uint32](v) >> 8) & 0xFF)
+    buf[off + 1] = cast[uint8](cast[uint32](v) & 0xFF)
+
+
+def _vx_get16(buf: Ptr[uint8], off: uint64) -> uint16:
+    hi: uint16 = cast[uint16](buf[off]) << 8
+    lo: uint16 = cast[uint16](buf[off + 1])
+    return hi | lo
+
+
+def _vx_put32(buf: Ptr[uint8], off: uint64, v: uint32):
+    buf[off]     = cast[uint8]((v >> 24) & 0xFF)
+    buf[off + 1] = cast[uint8]((v >> 16) & 0xFF)
+    buf[off + 2] = cast[uint8]((v >> 8) & 0xFF)
+    buf[off + 3] = cast[uint8](v & 0xFF)
+
+
+def _vx_get32(buf: Ptr[uint8], off: uint64) -> uint32:
+    r: uint32 = cast[uint32](buf[off]) << 24
+    r = r | (cast[uint32](buf[off + 1]) << 16)
+    r = r | (cast[uint32](buf[off + 2]) << 8)
+    r = r | cast[uint32](buf[off + 3])
+    return r
+
+
+# =====================================================================
+# UDP checksum over the IPv4 pseudo-header (RFC 768 / RFC 1071)
+# =====================================================================
+#
+# The UDP checksum covers a 12-byte pseudo-header (src IP, dst IP, zero,
+# protocol, UDP length) plus the UDP header and payload. We build the
+# pseudo-header into a small scratch and fold its 16-bit sum together
+# with the sum over the UDP segment, reusing the same RFC-1071 folding
+# math ip_csum16 uses. A computed value of 0x0000 is transmitted as
+# 0xFFFF per RFC 768 (0 means "no checksum").
+
+VXLAN_PSEUDO_BYTES: uint64 = 12
+_vx_pseudo: Array[12, uint8]
+
+
+def _vx_csum_accum(buf: Ptr[uint8], length: uint64, seed: uint32) -> uint32:
+    # Accumulate the RFC-1071 16-bit-word sum of `buf` into `seed`
+    # (NOT yet folded / complemented). Mirrors ip_csum16's word loop.
+    sum32: uint32 = seed
+    i: uint64 = 0
+    end_pairs: uint64 = length & ~cast[uint64](1)
+    while i < end_pairs:
+        word: uint32 = (cast[uint32](buf[i]) << 8) | cast[uint32](buf[i + 1])
+        sum32 = sum32 + word
+        i = i + 2
+    if i < length:
+        sum32 = sum32 + (cast[uint32](buf[i]) << 8)
+    return sum32
+
+
+def vxlan_udp_checksum(src_ip: uint32, dst_ip: uint32,
+                       udp_seg: Ptr[uint8], udp_len: uint64) -> uint16:
+    # Compute the IPv4 UDP checksum over [pseudo-header | UDP segment].
+    # udp_seg points at the UDP header (its length field must already be
+    # set); udp_len is the UDP header+payload length. The checksum field
+    # inside udp_seg (offset 6..7) must be zero on entry.
+    _vx_pseudo[0] = cast[uint8]((src_ip >> 24) & 0xFF)
+    _vx_pseudo[1] = cast[uint8]((src_ip >> 16) & 0xFF)
+    _vx_pseudo[2] = cast[uint8]((src_ip >> 8) & 0xFF)
+    _vx_pseudo[3] = cast[uint8](src_ip & 0xFF)
+    _vx_pseudo[4] = cast[uint8]((dst_ip >> 24) & 0xFF)
+    _vx_pseudo[5] = cast[uint8]((dst_ip >> 16) & 0xFF)
+    _vx_pseudo[6] = cast[uint8]((dst_ip >> 8) & 0xFF)
+    _vx_pseudo[7] = cast[uint8](dst_ip & 0xFF)
+    _vx_pseudo[8] = 0
+    _vx_pseudo[9] = IPPROTO_UDP
+    _vx_pseudo[10] = cast[uint8]((udp_len >> 8) & 0xFF)
+    _vx_pseudo[11] = cast[uint8](udp_len & 0xFF)
+    sum32: uint32 = _vx_csum_accum(cast[Ptr[uint8]](&_vx_pseudo[0]),
+                                   VXLAN_PSEUDO_BYTES, 0)
+    sum32 = _vx_csum_accum(udp_seg, udp_len, sum32)
+    while (sum32 >> 16) != 0:
+        sum32 = (sum32 & 0xFFFF) + (sum32 >> 16)
+    csum: uint16 = cast[uint16](~sum32 & 0xFFFF)
+    if csum == 0:
+        csum = 0xFFFF
+    return csum
+
+
+# =====================================================================
+# ENCAP
+# =====================================================================
+
+def vxlan_encap(inner: Ptr[uint8], inner_len: uint64, vni: uint32,
+                src_ip: uint32, dst_ip: uint32,
+                src_mac: Ptr[uint8], dst_mac: Ptr[uint8],
+                out: Ptr[uint8], out_cap: uint64) -> int64:
+    # Build the full outer VXLAN frame into `out` and return its total
+    # length, or a negative code on error (-1 buffer too small).
+    #
+    #   out = OuterEth(14) | OuterIP(20) | OuterUDP(8) | VXLAN(8) | inner
+    #
+    # All lengths and checksums are computed correctly. The inner frame
+    # is copied byte-for-byte after the VXLAN header.
+    total: uint64 = VXLAN_OUTER_OVERHEAD + inner_len
+    if total > out_cap:
+        return -1
+
+    # --- Outer Ethernet header (offset 0..13) ---
+    i: uint64 = 0
+    while i < 6:
+        out[i]     = dst_mac[i]      # dst MAC 0..5
+        out[6 + i] = src_mac[i]      # src MAC 6..11
+        i = i + 1
+    _vx_put16(out, 12, ETH_P_IP)     # ethertype 0x0800
+
+    # --- Outer IPv4 header (offset 14..33) ---
+    ip_off: uint64 = ETH_HDR_LEN
+    ip_total: uint64 = IP_HDR_LEN + UDP_HDR_LEN + VXLAN_HDR_LEN + inner_len
+    out[ip_off + 0] = 0x45                          # version 4, IHL 5
+    out[ip_off + 1] = 0                             # DSCP/ECN
+    _vx_put16(out, ip_off + 2, cast[uint16](ip_total))
+    _vx_put16(out, ip_off + 4, 0)                   # id
+    _vx_put16(out, ip_off + 6, 0)                   # flags/frag = 0
+    out[ip_off + 8] = IP_TTL                        # TTL
+    out[ip_off + 9] = IPPROTO_UDP                   # protocol 17
+    _vx_put16(out, ip_off + 10, 0)                  # checksum (computed below)
+    _vx_put32(out, ip_off + 12, src_ip)             # src IPv4
+    _vx_put32(out, ip_off + 16, dst_ip)             # dst IPv4
+    # IPv4 header checksum over the 20-byte header (checksum field zero).
+    ip_csum: uint16 = ip_csum16(cast[Ptr[uint8]](
+        cast[uint64](out) + ip_off), IP_HDR_LEN)
+    _vx_put16(out, ip_off + 10, ip_csum)
+
+    # --- Outer UDP header (offset 34..41) ---
+    udp_off: uint64 = ip_off + IP_HDR_LEN
+    udp_len: uint64 = UDP_HDR_LEN + VXLAN_HDR_LEN + inner_len
+    # Source port: RFC 7348 recommends a hash of the inner flow for ECMP
+    # entropy; a fixed VXLAN-range port is valid too. Use the standard
+    # port so the segment is symmetric and easy to validate.
+    _vx_put16(out, udp_off + 0, VXLAN_UDP_PORT)     # src port
+    _vx_put16(out, udp_off + 2, VXLAN_UDP_PORT)     # dst port 4789
+    _vx_put16(out, udp_off + 4, cast[uint16](udp_len))
+    _vx_put16(out, udp_off + 6, 0)                  # checksum (computed below)
+
+    # --- VXLAN header (offset 42..49) ---
+    vx_off: uint64 = udp_off + UDP_HDR_LEN
+    vni24: uint32 = vni & 0x00FFFFFF
+    # flags word: I-bit set, rest reserved zero.
+    out[vx_off + 0] = VXLAN_FLAG_I
+    out[vx_off + 1] = 0
+    out[vx_off + 2] = 0
+    out[vx_off + 3] = 0
+    out[vx_off + 4] = cast[uint8]((vni24 >> 16) & 0xFF)   # VNI hi
+    out[vx_off + 5] = cast[uint8]((vni24 >> 8) & 0xFF)    # VNI mid
+    out[vx_off + 6] = cast[uint8](vni24 & 0xFF)           # VNI lo
+    out[vx_off + 7] = 0                                   # reserved
+
+    # --- Inner Ethernet frame (offset 50..) ---
+    payload_off: uint64 = vx_off + VXLAN_HDR_LEN
+    i = 0
+    while i < inner_len:
+        out[payload_off + i] = inner[i]
+        i = i + 1
+
+    # --- UDP checksum over pseudo-header + UDP segment (now complete) ---
+    udp_csum: uint16 = vxlan_udp_checksum(src_ip, dst_ip,
+        cast[Ptr[uint8]](cast[uint64](out) + udp_off), udp_len)
+    _vx_put16(out, udp_off + 6, udp_csum)
+
+    vxlan_tx_encaps = vxlan_tx_encaps + 1
+    return cast[int64](total)
+
+
+# =====================================================================
+# DECAP
+# =====================================================================
+
+def vxlan_is_vxlan(frame: Ptr[uint8], length: uint64) -> int32:
+    # Validate that `frame` is a well-formed VXLAN outer frame: long
+    # enough, IPv4 ethertype, IPv4/UDP, UDP dest port 4789, and the
+    # VXLAN I-bit set. Returns 1 if it is VXLAN, 0 otherwise.
+    if length < VXLAN_OUTER_OVERHEAD:
+        return 0
+    # Outer ethertype must be IPv4.
+    if _vx_get16(frame, 12) != ETH_P_IP:
+        return 0
+    ip_off: uint64 = ETH_HDR_LEN
+    # IHL: only the fixed 20-byte header is supported here.
+    if (frame[ip_off] & 0x0F) != 0x05:
+        return 0
+    if frame[ip_off + 9] != IPPROTO_UDP:
+        return 0
+    udp_off: uint64 = ip_off + IP_HDR_LEN
+    if _vx_get16(frame, udp_off + 2) != VXLAN_UDP_PORT:
+        return 0
+    vx_off: uint64 = udp_off + UDP_HDR_LEN
+    if (frame[vx_off] & VXLAN_FLAG_I) == 0:
+        return 0
+    return 1
+
+
+def vxlan_decap_vni(frame: Ptr[uint8], length: uint64) -> int64:
+    # Extract the 24-bit VNI from a validated VXLAN frame. Returns the
+    # VNI (>= 0) or -1 if the frame is not VXLAN.
+    if vxlan_is_vxlan(frame, length) != 1:
+        return -1
+    vx_off: uint64 = ETH_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN
+    vni: uint32 = (cast[uint32](frame[vx_off + 4]) << 16) \
+                | (cast[uint32](frame[vx_off + 5]) << 8) \
+                | cast[uint32](frame[vx_off + 6])
+    return cast[int64](vni)
+
+
+def vxlan_decap(frame: Ptr[uint8], length: uint64,
+                out_inner: Ptr[uint8], out_cap: uint64,
+                out_vni: Ptr[uint32]) -> int64:
+    # Recover the inner Ethernet frame from a VXLAN outer frame. Copies
+    # the inner frame byte-for-byte into out_inner, writes the VNI into
+    # *out_vni (if non-NULL), and returns the inner frame length, or a
+    # negative code (-1 not VXLAN, -2 inner buffer too small).
+    if vxlan_is_vxlan(frame, length) != 1:
+        vxlan_rx_drops = vxlan_rx_drops + 1
+        return -1
+    inner_off: uint64 = VXLAN_OUTER_OVERHEAD
+    inner_len: uint64 = length - inner_off
+    if inner_len > out_cap:
+        return -2
+    if out_vni != cast[Ptr[uint32]](0):
+        vx_off: uint64 = ETH_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN
+        out_vni[0] = (cast[uint32](frame[vx_off + 4]) << 16) \
+                   | (cast[uint32](frame[vx_off + 5]) << 8) \
+                   | cast[uint32](frame[vx_off + 6])
+    i: uint64 = 0
+    while i < inner_len:
+        out_inner[i] = frame[inner_off + i]
+        i = i + 1
+    vxlan_rx_decaps = vxlan_rx_decaps + 1
+    return cast[int64](inner_len)
+
+
+# =====================================================================
+# Send-by-VNI: encap an inner frame to whichever VTEP the FDB maps the
+# VNI to. The local VTEP source IP/MAC are passed in. Returns the outer
+# frame length built into `out`, or negative (-3 = VNI not in FDB).
+# =====================================================================
+
+_vx_route_mac: Array[6, uint8]
+
+
+def vxlan_send_by_vni(inner: Ptr[uint8], inner_len: uint64, vni: uint32,
+                      local_ip: uint32, local_mac: Ptr[uint8],
+                      out: Ptr[uint8], out_cap: uint64) -> int64:
+    remote_ip: uint32 = 0
+    rip_ptr: Ptr[uint32] = cast[Ptr[uint32]](&remote_ip)
+    hit: int32 = vxlan_fdb_lookup(vni, rip_ptr,
+                                  cast[Ptr[uint8]](&_vx_route_mac[0]))
+    if hit < 0:
+        return -3
+    return vxlan_encap(inner, inner_len, vni, local_ip, remote_ip,
+                       local_mac, cast[Ptr[uint8]](&_vx_route_mac[0]),
+                       out, out_cap)
+
+
+# =====================================================================
+# In-kernel self-test (deterministic, no NIC required)
+# =====================================================================
+#
+# Mirrors drivers/block/md.ad::md_selftest. Pure in-memory: build a known
+# inner Ethernet frame, ENCAP -> DECAP round-trip, assert byte-identity,
+# assert outer header fields (dport 4789, I-bit, VNI) and recompute the
+# IPv4 + UDP checksums to prove they were laid down correctly. Covers two
+# distinct VNIs and exercises the VNI->VTEP forwarding map.
+
+def _vx_emerg0(s: Ptr[char]):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0(s)
+
+
+def _vx_emerg1(s: Ptr[char], a: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk1(s, a)
+
+
+def _vx_emerg2(s: Ptr[char], a: uint64, b: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk2(s, a, b)
+
+
+# Generously-sized scratch globals. An inner frame here is tiny (<128
+# bytes) but the buffers are sized for a full MTU + outer overhead so an
+# undersized Array[] can't silently overflow into adjacent globals.
+VXLAN_T_INNER_CAP: uint64 = 1600
+VXLAN_T_OUTER_CAP: uint64 = 1700
+_vxt_inner:  Array[1600, uint8]
+_vxt_outer:  Array[1700, uint8]
+_vxt_recov:  Array[1600, uint8]
+_vxt_mac_a:  Array[6, uint8]
+_vxt_mac_b:  Array[6, uint8]
+_vxt_mac_c:  Array[6, uint8]
+
+
+def _vx_build_inner(seed: uint8) -> uint64:
+    # Build a deterministic inner Ethernet frame: 14-byte L2 header
+    # (dst/src MAC + an arbitrary ethertype) followed by a payload whose
+    # bytes are a function of `seed` so two VNIs carry distinct frames.
+    # Returns the inner frame length.
+    i: uint64 = 0
+    while i < 6:
+        _vxt_inner[i]     = cast[uint8](0xA0 + i)       # inner dst MAC
+        _vxt_inner[6 + i] = cast[uint8](0xB0 + i)       # inner src MAC
+        i = i + 1
+    _vxt_inner[12] = 0x08                               # ethertype 0x0800
+    _vxt_inner[13] = 0x00
+    plen: uint64 = 46                                   # min Ethernet payload
+    i = 0
+    while i < plen:
+        _vxt_inner[14 + i] = cast[uint8]((cast[uint32](seed) + cast[uint32](i)) & 0xFF)
+        i = i + 1
+    return 14 + plen
+
+
+def vxlan_selftest() -> int32:
+    # Returns 1 on PASS, 0 on FAIL. Prints [vxlan] marker lines.
+    _vx_emerg0("[vxlan] self-test start\n")
+    vxlan_init()
+    ok: int32 = 1
+
+    # Outer VTEP addressing.
+    #   local  VTEP: 10.0.0.1   MAC 02:00:00:00:00:01
+    #   remote VTEP A (VNI 100): 10.0.0.2  MAC 02:00:00:00:00:02
+    #   remote VTEP B (VNI 5000):10.0.0.3  MAC 02:00:00:00:00:03
+    local_ip:  uint32 = (10 << 24) | (0 << 16) | (0 << 8) | 1
+    remoteA_ip: uint32 = (10 << 24) | (0 << 16) | (0 << 8) | 2
+    remoteB_ip: uint32 = (10 << 24) | (0 << 16) | (0 << 8) | 3
+    i: uint64 = 0
+    while i < 6:
+        _vxt_mac_a[i] = 0
+        _vxt_mac_b[i] = 0
+        _vxt_mac_c[i] = 0
+        i = i + 1
+    _vxt_mac_a[0] = 0x02
+    _vxt_mac_a[5] = 0x01      # local MAC
+    _vxt_mac_b[0] = 0x02
+    _vxt_mac_b[5] = 0x02      # remote A MAC
+    _vxt_mac_c[0] = 0x02
+    _vxt_mac_c[5] = 0x03      # remote B MAC
+
+    # Populate the VNI -> VTEP forwarding map with two entries.
+    a_slot: int32 = vxlan_fdb_add(100, remoteA_ip,
+                                  cast[Ptr[uint8]](&_vxt_mac_b[0]))
+    b_slot: int32 = vxlan_fdb_add(5000, remoteB_ip,
+                                  cast[Ptr[uint8]](&_vxt_mac_c[0]))
+    if a_slot < 0 or b_slot < 0:
+        _vx_emerg0("[vxlan] FAIL: FDB add\n")
+        return 0
+    _vx_emerg0("[vxlan] PASS fdb-add (VNI 100 + VNI 5000 installed)\n")
+
+    # ================================================================
+    # Round 1: VNI 100 via the forwarding map (send_by_vni).
+    # ================================================================
+    inner_len1: uint64 = _vx_build_inner(0x11)
+    out_len1: int64 = vxlan_send_by_vni(
+        cast[Ptr[uint8]](&_vxt_inner[0]), inner_len1, 100,
+        local_ip, cast[Ptr[uint8]](&_vxt_mac_a[0]),
+        cast[Ptr[uint8]](&_vxt_outer[0]), VXLAN_T_OUTER_CAP)
+    if out_len1 < 0:
+        _vx_emerg1("[vxlan] FAIL: send_by_vni rc=%d\n",
+                   cast[uint64](out_len1))
+        return 0
+    exp_len1: uint64 = VXLAN_OUTER_OVERHEAD + inner_len1
+    if cast[uint64](out_len1) != exp_len1:
+        _vx_emerg2("[vxlan] FAIL: outer len %d != %d\n",
+                   cast[uint64](out_len1), exp_len1)
+        ok = 0
+    else:
+        _vx_emerg1("[vxlan] PASS outer-len=%d (VNI100)\n", cast[uint64](out_len1))
+
+    # The FDB must have routed to remote VTEP A's MAC + IP.
+    udp_off: uint64 = ETH_HDR_LEN + IP_HDR_LEN
+    vx_off:  uint64 = udp_off + UDP_HDR_LEN
+    # Outer dst MAC == remote A MAC (02:..:02).
+    if _vxt_outer[0] != 0x02 or _vxt_outer[5] != 0x02:
+        _vx_emerg0("[vxlan] FAIL: FDB did not route to VTEP A MAC\n")
+        ok = 0
+    else:
+        _vx_emerg0("[vxlan] PASS fdb-route-mac (VNI100 -> VTEP A)\n")
+    # Outer dst IP == remote A IP (offset 16 in the IP header).
+    routed_dst_ip: uint32 = _vx_get32(cast[Ptr[uint8]](&_vxt_outer[0]),
+                                      ETH_HDR_LEN + 16)
+    if routed_dst_ip != remoteA_ip:
+        _vx_emerg0("[vxlan] FAIL: FDB routed to wrong VTEP IP\n")
+        ok = 0
+    else:
+        _vx_emerg0("[vxlan] PASS fdb-route-ip (VNI100 -> 10.0.0.2)\n")
+
+    # Outer UDP dest port must be 4789.
+    dport1: uint16 = _vx_get16(cast[Ptr[uint8]](&_vxt_outer[0]), udp_off + 2)
+    if dport1 != VXLAN_UDP_PORT:
+        _vx_emerg1("[vxlan] FAIL: dport %d != 4789\n", cast[uint64](dport1))
+        ok = 0
+    else:
+        _vx_emerg0("[vxlan] PASS dport=4789\n")
+
+    # VXLAN I-bit must be set.
+    if (_vxt_outer[vx_off] & VXLAN_FLAG_I) == 0:
+        _vx_emerg0("[vxlan] FAIL: I-bit not set\n")
+        ok = 0
+    else:
+        _vx_emerg0("[vxlan] PASS i-bit-set\n")
+
+    # VNI in the header must read back as 100.
+    vni_rb1: int64 = vxlan_decap_vni(cast[Ptr[uint8]](&_vxt_outer[0]),
+                                     cast[uint64](out_len1))
+    if vni_rb1 != 100:
+        _vx_emerg1("[vxlan] FAIL: header VNI %d != 100\n",
+                   cast[uint64](vni_rb1))
+        ok = 0
+    else:
+        _vx_emerg0("[vxlan] PASS vni=100\n")
+
+    # Recompute the IPv4 header checksum and compare against the stored
+    # value: zero the stored field, recompute, compare.
+    ip_off: uint64 = ETH_HDR_LEN
+    stored_ip_csum: uint16 = _vx_get16(cast[Ptr[uint8]](&_vxt_outer[0]),
+                                       ip_off + 10)
+    _vx_put16(cast[Ptr[uint8]](&_vxt_outer[0]), ip_off + 10, 0)
+    recomp_ip_csum: uint16 = ip_csum16(cast[Ptr[uint8]](&_vxt_outer[ip_off]),
+                                       IP_HDR_LEN)
+    _vx_put16(cast[Ptr[uint8]](&_vxt_outer[0]), ip_off + 10, stored_ip_csum)
+    if stored_ip_csum != recomp_ip_csum:
+        _vx_emerg2("[vxlan] FAIL: IP csum stored=%x recomp=%x\n",
+                   cast[uint64](stored_ip_csum), cast[uint64](recomp_ip_csum))
+        ok = 0
+    else:
+        _vx_emerg0("[vxlan] PASS ip-checksum-valid\n")
+    # An independent proof the stored header is internally consistent:
+    # the ones'-complement sum over the full 20-byte header (csum field
+    # included) must be 0 (i.e. ip_csum16 over the header == 0).
+    whole_ip_csum: uint16 = ip_csum16(cast[Ptr[uint8]](&_vxt_outer[ip_off]),
+                                      IP_HDR_LEN)
+    if whole_ip_csum != 0:
+        _vx_emerg1("[vxlan] FAIL: IP header self-sum=%x (want 0)\n",
+                   cast[uint64](whole_ip_csum))
+        ok = 0
+    else:
+        _vx_emerg0("[vxlan] PASS ip-checksum-self-consistent\n")
+
+    # Recompute the UDP checksum and compare against the stored value.
+    udp_len1: uint64 = cast[uint64](_vx_get16(
+        cast[Ptr[uint8]](&_vxt_outer[0]), udp_off + 4))
+    stored_udp_csum: uint16 = _vx_get16(cast[Ptr[uint8]](&_vxt_outer[0]),
+                                        udp_off + 6)
+    _vx_put16(cast[Ptr[uint8]](&_vxt_outer[0]), udp_off + 6, 0)
+    recomp_udp_csum: uint16 = vxlan_udp_checksum(local_ip, remoteA_ip,
+        cast[Ptr[uint8]](&_vxt_outer[udp_off]), udp_len1)
+    _vx_put16(cast[Ptr[uint8]](&_vxt_outer[0]), udp_off + 6, stored_udp_csum)
+    if stored_udp_csum != recomp_udp_csum:
+        _vx_emerg2("[vxlan] FAIL: UDP csum stored=%x recomp=%x\n",
+                   cast[uint64](stored_udp_csum), cast[uint64](recomp_udp_csum))
+        ok = 0
+    else:
+        _vx_emerg0("[vxlan] PASS udp-checksum-valid\n")
+
+    # DECAP round-trip: recover the inner frame, assert byte-identity.
+    rvni1: uint32 = 0
+    rec_len1: int64 = vxlan_decap(cast[Ptr[uint8]](&_vxt_outer[0]),
+        cast[uint64](out_len1),
+        cast[Ptr[uint8]](&_vxt_recov[0]), VXLAN_T_INNER_CAP,
+        cast[Ptr[uint32]](&rvni1))
+    if rec_len1 < 0:
+        _vx_emerg1("[vxlan] FAIL: decap rc=%d\n", cast[uint64](rec_len1))
+        return 0
+    if cast[uint64](rec_len1) != inner_len1:
+        _vx_emerg2("[vxlan] FAIL: recovered len %d != %d\n",
+                   cast[uint64](rec_len1), inner_len1)
+        ok = 0
+    if rvni1 != 100:
+        _vx_emerg1("[vxlan] FAIL: decap VNI %d != 100\n", cast[uint64](rvni1))
+        ok = 0
+    identical1: int32 = 1
+    i = 0
+    while i < inner_len1:
+        if _vxt_recov[i] != _vxt_inner[i]:
+            identical1 = 0
+            i = inner_len1
+        else:
+            i = i + 1
+    if identical1 != 1:
+        _vx_emerg0("[vxlan] FAIL: inner frame not byte-identical (VNI100)\n")
+        ok = 0
+    else:
+        _vx_emerg0("[vxlan] PASS roundtrip-byte-identical (VNI100)\n")
+
+    # ================================================================
+    # Round 2: VNI 5000 — a second, distinct VNI through the FDB. A
+    # different inner payload proves the two tunnels don't cross-talk.
+    # ================================================================
+    inner_len2: uint64 = _vx_build_inner(0x77)
+    out_len2: int64 = vxlan_send_by_vni(
+        cast[Ptr[uint8]](&_vxt_inner[0]), inner_len2, 5000,
+        local_ip, cast[Ptr[uint8]](&_vxt_mac_a[0]),
+        cast[Ptr[uint8]](&_vxt_outer[0]), VXLAN_T_OUTER_CAP)
+    if out_len2 < 0:
+        _vx_emerg1("[vxlan] FAIL: send_by_vni(5000) rc=%d\n",
+                   cast[uint64](out_len2))
+        return 0
+    # FDB must have routed to remote VTEP B (MAC 02:..:03, IP 10.0.0.3).
+    if _vxt_outer[0] != 0x02 or _vxt_outer[5] != 0x03:
+        _vx_emerg0("[vxlan] FAIL: FDB did not route to VTEP B MAC\n")
+        ok = 0
+    routed_dst_ip2: uint32 = _vx_get32(cast[Ptr[uint8]](&_vxt_outer[0]),
+                                       ETH_HDR_LEN + 16)
+    if routed_dst_ip2 != remoteB_ip:
+        _vx_emerg0("[vxlan] FAIL: FDB routed VNI5000 to wrong VTEP IP\n")
+        ok = 0
+    else:
+        _vx_emerg0("[vxlan] PASS fdb-route (VNI5000 -> VTEP B 10.0.0.3)\n")
+
+    vni_rb2: int64 = vxlan_decap_vni(cast[Ptr[uint8]](&_vxt_outer[0]),
+                                     cast[uint64](out_len2))
+    if vni_rb2 != 5000:
+        _vx_emerg1("[vxlan] FAIL: header VNI %d != 5000\n",
+                   cast[uint64](vni_rb2))
+        ok = 0
+    else:
+        _vx_emerg0("[vxlan] PASS vni=5000\n")
+
+    # Recompute UDP checksum for round 2 (different dst IP + payload).
+    udp_len2: uint64 = cast[uint64](_vx_get16(
+        cast[Ptr[uint8]](&_vxt_outer[0]), udp_off + 4))
+    stored_udp_csum2: uint16 = _vx_get16(cast[Ptr[uint8]](&_vxt_outer[0]),
+                                         udp_off + 6)
+    _vx_put16(cast[Ptr[uint8]](&_vxt_outer[0]), udp_off + 6, 0)
+    recomp_udp_csum2: uint16 = vxlan_udp_checksum(local_ip, remoteB_ip,
+        cast[Ptr[uint8]](&_vxt_outer[udp_off]), udp_len2)
+    _vx_put16(cast[Ptr[uint8]](&_vxt_outer[0]), udp_off + 6, stored_udp_csum2)
+    if stored_udp_csum2 != recomp_udp_csum2:
+        _vx_emerg2("[vxlan] FAIL: UDP csum2 stored=%x recomp=%x\n",
+                   cast[uint64](stored_udp_csum2), cast[uint64](recomp_udp_csum2))
+        ok = 0
+    else:
+        _vx_emerg0("[vxlan] PASS udp-checksum-valid (VNI5000)\n")
+
+    # DECAP round-trip for VNI 5000.
+    rvni2: uint32 = 0
+    rec_len2: int64 = vxlan_decap(cast[Ptr[uint8]](&_vxt_outer[0]),
+        cast[uint64](out_len2),
+        cast[Ptr[uint8]](&_vxt_recov[0]), VXLAN_T_INNER_CAP,
+        cast[Ptr[uint32]](&rvni2))
+    if rec_len2 < 0:
+        _vx_emerg1("[vxlan] FAIL: decap(5000) rc=%d\n", cast[uint64](rec_len2))
+        return 0
+    if rvni2 != 5000:
+        _vx_emerg1("[vxlan] FAIL: decap VNI %d != 5000\n", cast[uint64](rvni2))
+        ok = 0
+    identical2: int32 = 1
+    i = 0
+    while i < inner_len2:
+        if _vxt_recov[i] != _vxt_inner[i]:
+            identical2 = 0
+            i = inner_len2
+        else:
+            i = i + 1
+    if identical2 != 1:
+        _vx_emerg0("[vxlan] FAIL: inner frame not byte-identical (VNI5000)\n")
+        ok = 0
+    else:
+        _vx_emerg0("[vxlan] PASS roundtrip-byte-identical (VNI5000)\n")
+
+    # ================================================================
+    # Negative: a non-VXLAN frame (wrong dport) must be rejected.
+    # ================================================================
+    # Corrupt the dport in the current outer buffer and confirm decap
+    # refuses it, then restore.
+    _vx_put16(cast[Ptr[uint8]](&_vxt_outer[0]), udp_off + 2, 1234)
+    neg: int64 = vxlan_decap_vni(cast[Ptr[uint8]](&_vxt_outer[0]),
+                                 cast[uint64](out_len2))
+    if neg != -1:
+        _vx_emerg0("[vxlan] FAIL: non-4789 frame accepted as VXLAN\n")
+        ok = 0
+    else:
+        _vx_emerg0("[vxlan] PASS reject-non-vxlan (dport 1234)\n")
+    _vx_put16(cast[Ptr[uint8]](&_vxt_outer[0]), udp_off + 2, VXLAN_UDP_PORT)
+
+    if ok == 1:
+        _vx_emerg0("[vxlan] PASS\n")
+        return 1
+    _vx_emerg0("[vxlan] FAIL\n")
+    return 0

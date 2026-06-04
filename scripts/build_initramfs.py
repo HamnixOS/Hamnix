@@ -2175,6 +2175,19 @@ if os.environ.get("ENABLE_DEVMAPPER_TEST") == "1":
 if os.environ.get("ENABLE_MDRAID_TEST") == "1":
     FILES.append(("/etc/mdraid-test", b"1\n"))
 
+# Native VXLAN (RFC 7348) encap/decap self-test. scripts/test_vxlan.sh sets
+# ENABLE_VXLAN_TEST=1 to plant /etc/vxlan-test; init/main.ad's boot:37.vxlan
+# gate then runs vxlan_selftest() (drivers/net/vxlan.ad), a pure in-memory
+# test that builds a known inner Ethernet frame, ENCAPs it to a VNI over
+# UDP/IPv4 (Eth|IP|UDP:4789|VXLAN|inner) with chosen outer IP/MAC, DECAPs the
+# result and asserts the recovered inner frame is byte-identical, and verifies
+# the outer dport 4789, the VXLAN I-bit, the 24-bit VNI, and recomputed IPv4 +
+# UDP checksums across two VNIs routed through the VNI->VTEP forwarding map.
+# Prints "[vxlan] PASS" / "[vxlan] FAIL". Default boots ship no marker so the
+# VXLAN self-test is a no-op everywhere else.
+if os.environ.get("ENABLE_VXLAN_TEST") == "1":
+    FILES.append(("/etc/vxlan-test", b"1\n"))
+
 # Linux-style overlayfs (union filesystem) self-test. scripts/test_overlayfs.sh
 # sets ENABLE_OVERLAYFS_TEST=1 to plant /etc/overlayfs-test; init/main.ad's
 # boot:37.ovl gate then runs overlayfs_selftest() (fs/overlayfs.ad), which
