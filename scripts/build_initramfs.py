@@ -1189,6 +1189,15 @@ if os.environ.get("ENABLE_PROCIO_TEST"):
 if os.environ.get("ENABLE_PROCLIMITS_TEST"):
     FILES.append(("/etc/proclimits-test", b"1\n"))
 
+# /proc/<pid>/fd self-test. scripts/test_procfd.sh sets ENABLE_PROCFD_TEST=1 to
+# plant /etc/procfd-test. init/main.ad detects the marker and calls
+# procfd_selftest() (devproc.ad): it renders emit_proc_fd for the boot slot and
+# asserts the standard descriptors 0/1/2 are listed with their target column
+# reading "/dev/cons", then emits the [PROCFD] PASS banner. Needs no extra
+# device.
+if os.environ.get("ENABLE_PROCFD_TEST"):
+    FILES.append(("/etc/procfd-test", b"1\n"))
+
 # /proc/<pid>/ctl write-surface self-test. scripts/test_procctl.sh sets
 # ENABLE_PROCCTL_TEST=1 to plant /etc/procctl-test. init/main.ad detects the
 # marker and calls procctl_selftest() (devproc.ad): it drives the real
