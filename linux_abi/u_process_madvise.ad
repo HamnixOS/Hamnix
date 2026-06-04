@@ -1,0 +1,421 @@
+# linux_abi/u_process_madvise.ad -- the Linux process_madvise(2) syscall (nr 440).
+#
+# process_madvise applies an madvise(2) advice to memory ranges that live in
+# ANOTHER process, identified by a pidfd:
+#
+#   ssize_t process_madvise(int pidfd, const struct iovec *iovec,
+#                           size_t vlen, int advice, unsigned int flags)
+#
+# `iovec` is an array of `vlen` { void *base; size_t len } entries naming the
+# RANGES in the target process to advise; the advice (one of the values Linux
+# allows for the remote variant -- MADV_WILLNEED / MADV_DONTNEED / MADV_COLD /
+# MADV_PAGEOUT) is applied to each range. It returns the number of bytes
+# successfully advised. Userspace memory managers / balloon drivers / the
+# `process_madvise`-based reclaim daemons (Android's lmkd, systemd-oomd-style
+# proactive reclaim) use it to push another process's cold pages out without
+# that process cooperating.
+#
+# ARCHITECTURE NOTE -- this is a REAL cross-process operation, NOT a stub:
+#
+#   * pidfd -> target pid : the `pidfd` argument is PROVEN a real pidfd
+#     (FD_PIDFD_MARK via vfs_fd_marker) and translated through the SAME pidfd
+#     object table (upidfd_get) pidfd_send_signal / pidfd_getfd use.
+#   * target pid -> live task slot : task_lookup_by_pid (skips STATE_FREE); a
+#     STATE_EXITED slot is a reaped/zombie target with no address space -> -ESRCH.
+#   * the advice is applied against the TARGET task's OWN VMA set: vma_find()
+#     locates each page's VMA in the target slot, and -- for the one advice with
+#     an OBSERVABLE contract on Hamnix, MADV_DONTNEED -- the page's PHYSICAL
+#     frame is resolved by WALKING THE TARGET's page table (uaccess_resolve on
+#     task_pml4(slot), the exact non-allocating walker process_vm_readv uses for
+#     a foreign address space) and zeroed in place. Hamnix has no demand paging,
+#     so zeroing-in-place is how the DONTNEED contract ("the range reads back as
+#     zero afterwards") is honoured -- a subsequent read in the target genuinely
+#     sees zero. The other advices (WILLNEED / COLD / PAGEOUT) are hints with no
+#     backing readahead / swap state for Hamnix to act on; they are accepted as
+#     no-harm no-ops (their bytes still count toward the return value, matching
+#     a successful advise).
+#
+# Validation (Linux sys_process_madvise gate ordering): flags != 0 -> -EINVAL;
+# an advice not in the remote-allowed set -> -EINVAL; a non-pidfd `pidfd` ->
+# -EBADF; a dead/reaped target -> -ESRCH; vlen above UIO_MAXIOV -> -EINVAL; an
+# iovec array pointer that itself faults -> -EFAULT (when nothing advised yet).
+#
+# Layer note: a confined Layer-2 leaf, mirroring linux_abi/u_pidfd_getfd.ad and
+# linux_abi/u_process_vm.ad. It imports the pidfd object-table accessor
+# (upidfd_get), the kernel task primitives (task_lookup_by_pid / task_state /
+# task_pml4 / task_pid_at / current_idx_get), the VMA query layer (vma_find /
+# vma_node_prot / vma_register_anon + the prot/MADV constants), the validated
+# copy-from-user + foreign-address-space page walker (copy_from_user /
+# uaccess_resolve), and printk for the self-test. It never touches 9P / Chan /
+# Layer-1 code; u_syscalls.ad imports the nr 440 dispatch arm the same way.
+
+from linux_abi.u_pidfd import (
+    upidfd_get,
+)
+from fs.vfs import (
+    vfs_fd_marker, vfs_close,
+)
+from kernel.sched.core import (
+    task_lookup_by_pid, task_state, task_pml4, task_pid_at,
+    current_idx_get,
+    STATE_EXITED,
+)
+from mm.uaccess import (
+    copy_from_user, uaccess_resolve,
+)
+from mm.vma import (
+    vma_find, vma_node_prot,
+    VMA_PROT_WRITE, VMA_PAGE_SIZE,
+)
+from kernel.printk.printk import (
+    printk0, printk1,
+)
+
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
+
+# =====================================================================
+# fd marker + errno subset (Linux negative-errno convention)
+# =====================================================================
+#
+# FD_PIDFD_MARK is the marker pidfd_open(2) stamps on a pidfd fd; we read it
+# back through vfs_fd_marker to PROVE the `pidfd` argument is a real pidfd
+# before trusting upidfd_get's (task,fd) -> pid lookup. Re-declared here (same
+# value u_pidfd_getfd.ad uses) to keep this leaf importable standalone.
+PMA_FD_PIDFD_MARK: uint32 = 0xFFFFFFD1
+
+PMA_ESRCH:  int64 = -3
+PMA_EFAULT: int64 = -14
+PMA_EBADF:  int64 = -9
+PMA_EINVAL: int64 = -22
+
+# Linux caps vlen at UIO_MAXIOV (1024).
+PMA_MAX_IOV: uint64 = 1024
+
+# A single struct iovec is 16 bytes: { void *iov_base; size_t iov_len }.
+PMA_IOVEC_SZ: uint64 = 16
+
+# The advice values Linux permits for the REMOTE (process_madvise) variant.
+PMA_MADV_WILLNEED: int32 = 3
+PMA_MADV_DONTNEED: int32 = 4
+PMA_MADV_COLD:     int32 = 20
+PMA_MADV_PAGEOUT:  int32 = 21
+
+
+def _pma_advice_ok(advice: int32) -> int32:
+    # 1 iff `advice` is in the set process_madvise accepts, else 0.
+    if advice == PMA_MADV_WILLNEED:
+        return 1
+    if advice == PMA_MADV_DONTNEED:
+        return 1
+    if advice == PMA_MADV_COLD:
+        return 1
+    if advice == PMA_MADV_PAGEOUT:
+        return 1
+    return 0
+
+
+# =====================================================================
+# cross-process advice over ONE range in the target task
+# =====================================================================
+#
+# Apply `advice` to [addr, addr+len) in the TARGET task `slot` (PML4
+# `tpml4`). Returns the number of bytes that fell within one of the target's
+# VMAs (the count we report as "advised"). For MADV_DONTNEED, the page's
+# target frame is resolved by walking tpml4 and zeroed in place so the target
+# genuinely reads back zero. WILLNEED / COLD / PAGEOUT are no-harm hints: the
+# bytes still count, nothing is mutated.
+def _pma_advise_range(slot: uint64, tpml4: uint64,
+                      addr: uint64, len_in: uint64, advice: int32) -> uint64:
+    if len_in == 0:
+        return 0
+    # Page-round the range the way madvise(2) does.
+    addr_al: uint64 = addr & ~(VMA_PAGE_SIZE - 1)
+    end_unal: uint64 = addr + len_in
+    end_v: uint64 = (end_unal + VMA_PAGE_SIZE - 1) & ~(VMA_PAGE_SIZE - 1)
+    advised: uint64 = 0
+    do_zero: int32 = 0
+    if advice == PMA_MADV_DONTNEED:
+        do_zero = 1
+    va: uint64 = addr_al
+    while va < end_v:
+        node: uint64 = vma_find(slot, va)
+        if node != 0:
+            # This page belongs to one of the target's VMAs -> it counts as
+            # advised. For DONTNEED, zero the target's PHYSICAL frame (walk
+            # the TARGET's page table, never the caller's identity window).
+            # Skip a non-writable VMA: a DONTNEED there has no observable
+            # zero-back contract and uaccess_resolve(need_write=1) would
+            # reject a read-only leaf anyway.
+            prot: int32 = vma_node_prot(node)
+            if do_zero != 0 and (prot & VMA_PROT_WRITE) != 0:
+                phys: uint64 = uaccess_resolve(tpml4, va, 1)
+                if phys != 0:
+                    memset(cast[Ptr[uint8]](phys), 0, VMA_PAGE_SIZE)
+            advised = advised + VMA_PAGE_SIZE
+        va = va + VMA_PAGE_SIZE
+    # Report at most the requested byte length (the last page may overhang).
+    if advised > len_in:
+        return len_in
+    return advised
+
+
+# =====================================================================
+# process_madvise(pidfd, iovec, vlen, advice, flags)  --  nr 440
+# =====================================================================
+#
+#   a0 = pidfd, a1 = iovec, a2 = vlen, a3 = advice, a4 = flags.
+#
+# Returns the number of bytes successfully advised (>= 0) or a negative errno.
+def process_madvise_handler(a0: uint64, a1: uint64, a2: uint64,
+                            a3: uint64, a4: uint64) -> int64:
+    flags: uint64 = a4
+    advice: int32 = cast[int32](a3)
+
+    # (1) flags is reserved; only 0 is valid (Linux sys_process_madvise gate).
+    if flags != 0:
+        return PMA_EINVAL
+
+    # (2) advice must be one process_madvise allows, else -EINVAL.
+    if _pma_advice_ok(advice) == 0:
+        return PMA_EINVAL
+
+    # (3) vlen bound (UIO_MAXIOV). A vlen of 0 advises nothing.
+    vlen: uint64 = a2
+    if vlen > PMA_MAX_IOV:
+        return PMA_EINVAL
+
+    pidfd: int32 = cast[int32](a0)
+
+    # (4) The `pidfd` must be a real pidfd object (FD_PIDFD_MARK), else -EBADF.
+    if vfs_fd_marker(pidfd) != PMA_FD_PIDFD_MARK:
+        return PMA_EBADF
+
+    # (5) pidfd -> target pid via the pidfd object table (the SAME route
+    # pidfd_send_signal / pidfd_getfd use).
+    tgt_pid: int64 = upidfd_get(current_idx_get(), pidfd)
+    if tgt_pid < 0:
+        return PMA_EBADF
+
+    # (6) target pid -> live task slot. A STATE_EXITED slot is a zombie whose
+    # address space is gone -> -ESRCH (Linux reports ESRCH once the task dies).
+    slot: int32 = task_lookup_by_pid(cast[uint64](tgt_pid))
+    if slot < 0:
+        return PMA_ESRCH
+    if task_state(slot) == STATE_EXITED:
+        return PMA_ESRCH
+    tpml4: uint64 = task_pml4(slot)
+    if tpml4 == 0:
+        return PMA_ESRCH
+
+    if vlen == 0:
+        return 0
+
+    # (7) Walk the caller's iovec array, applying the advice to each range in
+    # the target. The iovec array lives in the CALLER's memory; pull each
+    # entry via copy_from_user. An iovec slot that itself faults is -EFAULT
+    # if nothing has been advised yet, else a short return of the count so far.
+    su: uint64 = cast[uint64](slot)
+    total: uint64 = 0
+    i: uint64 = 0
+    while i < vlen:
+        ent: uint64 = a1 + i * PMA_IOVEC_SZ
+        raw: Array[16, uint8]
+        if copy_from_user(cast[uint64](&raw[0]), ent, PMA_IOVEC_SZ) != 0:
+            if total == 0:
+                return PMA_EFAULT
+            return cast[int64](total)
+        ibase: uint64 = cast[Ptr[uint64]](cast[uint64](&raw[0]))[0]
+        ilen:  uint64 = cast[Ptr[uint64]](cast[uint64](&raw[8]))[0]
+        total = total + _pma_advise_range(su, tpml4, ibase, ilen, advice)
+        i = i + 1
+
+    return cast[int64](total)
+
+
+# =====================================================================
+# Boot self-test  --  [process-madvise] PASS / FAIL  (boot:37.process_madvise)
+# =====================================================================
+#
+# A REAL cross-process round trip in boot context:
+#
+#   (1) Build a genuine SECOND address space: create a real user task slot
+#       (create_user_task) whose PML4 is DISTINCT from the boot task's, map a
+#       known physical page into THAT remote PML4 at a high non-identity user
+#       vaddr (vaddr != phys), and register a real writable anonymous VMA over
+#       that vaddr in the target slot (so vma_find resolves it).
+#   (2) Stamp a non-zero PATTERN into the remote page's PHYSICAL frame.
+#   (3) pidfd_open(target_pid) -> a pidfd to the OTHER task; build an iovec
+#       naming the remote range; drive the REAL process_madvise(MADV_DONTNEED)
+#       path (pidfd -> target slot -> target page-walk -> zero).
+#   (4) Inspect the remote PHYSICAL frame directly: it must now read back ALL
+#       ZERO -- the OBSERVABLE cross-process DONTNEED effect.
+#   (5) Error paths: flags != 0 -> -EINVAL; a bad advice -> -EINVAL; a non-pidfd
+#       fd -> -EBADF; a pidfd to an EXITED target -> -ESRCH.
+#
+# Returns 1 on success, 0 on any failure (the sibling leaves' convention).
+
+from kernel.sched.core import (
+    current_task, FD_CLOSED_MARK,
+    notetest_release_slot,
+    create_user_task,
+    TaskStruct,
+)
+from mm.uaccess import (
+    uaccess_current_pml4,
+)
+from mm.page_alloc import (
+    alloc_page, free_page,
+)
+from mm.vma import (
+    vma_register_anon, VMA_PROT_READ,
+)
+from fs.elf import (
+    vm_map_user_page,
+)
+from linux_abi.u_pidfd import (
+    upidfd_open, upidfd_init,
+)
+
+# A high, non-identity remote vaddr (vaddr != phys, so a raw deref of the
+# vaddr would touch unmapped RAM -- proving the page-walk is real).
+PMA_RVADDR: uint64 = 0x0000555500000000
+
+
+def _pma_fail(msg: Ptr[char]) -> int32:
+    printk0("[process-madvise] FAIL: ")
+    printk0(msg)
+    printk0("\n")
+    return 0
+
+
+def process_madvise_selftest() -> int32:
+    # Boot context's fd table slots 3..15 are held by earlier boot resources;
+    # pidfd_open would return -EMFILE. Mirror pidfd_getfd_selftest: save slots
+    # 3..15, free them (FD_CLOSED_MARK) for the body, then restore.
+    boot_task: Ptr[TaskStruct] = current_task()
+    fd_save: Array[16, uint32]
+    si: uint64 = 3
+    while si < 16:
+        fd_save[si] = boot_task[0].fd_idx[si]
+        boot_task[0].fd_idx[si] = FD_CLOSED_MARK
+        si = si + 1
+
+    rc: int32 = _pma_selftest_body()
+
+    ri: uint64 = 3
+    while ri < 16:
+        boot_task[0].fd_idx[ri] = fd_save[ri]
+        ri = ri + 1
+    return rc
+
+
+def _pma_selftest_body() -> int32:
+    # The pidfd object table is shared with u_pidfd; (re)initialise it so a
+    # prior selftest's stale entries cannot bleed in. Idempotent.
+    upidfd_init()
+
+    # --- (1) build a real SECOND address space -----------------------
+    name0: Ptr[uint8] = "pma-remote"
+    rslot: int32 = create_user_task(0x400000, cast[uint64](name0))
+    if rslot < 0:
+        return _pma_fail("could not create remote task")
+    rpid: uint64 = task_pid_at(rslot)
+    rpml4: uint64 = task_pml4(rslot)
+    boot_pml4: uint64 = uaccess_current_pml4()
+    if rpml4 == 0 or rpml4 == boot_pml4:
+        return _pma_fail("remote pml4 not distinct from boot")
+
+    # Map a known physical page into the REMOTE pml4 at a non-identity vaddr.
+    p_rem: uint64 = alloc_page()
+    if p_rem == 0:
+        return _pma_fail("alloc_page (remote frame)")
+    if vm_map_user_page(rpml4, PMA_RVADDR, p_rem, 1) < 0:
+        free_page(p_rem)
+        return _pma_fail("could not map remote page")
+    # Register a real WRITABLE anonymous VMA over the remote vaddr in the
+    # target slot, so the handler's vma_find()/vma_node_prot() resolve it.
+    rsu: uint64 = cast[uint64](rslot)
+    if vma_register_anon(rsu, PMA_RVADDR, 4096,
+                         VMA_PROT_READ | VMA_PROT_WRITE) < 0:
+        free_page(p_rem)
+        return _pma_fail("could not register target VMA")
+
+    # --- (2) stamp a non-zero PATTERN into the remote PHYSICAL frame --
+    i: uint64 = 0
+    while i < 4096:
+        cast[Ptr[uint8]](p_rem)[i] = cast[uint8](0xA5)
+        i = i + 1
+
+    # --- (3) pidfd_open the TARGET; process_madvise(DONTNEED) the range
+    pf64: int64 = upidfd_open(rpid, 0)
+    if pf64 < 0:
+        free_page(p_rem)
+        return _pma_fail("pidfd_open(target) returned an error")
+    pidfd: int32 = cast[int32](pf64)
+
+    iov: Array[16, uint8]
+    cast[Ptr[uint64]](cast[uint64](&iov[0]))[0] = PMA_RVADDR
+    cast[Ptr[uint64]](cast[uint64](&iov[8]))[0] = 4096
+    rn: int64 = process_madvise_handler(cast[uint64](pidfd),
+                                        cast[uint64](&iov[0]), 1,
+                                        cast[uint64](PMA_MADV_DONTNEED), 0)
+    if rn != 4096:
+        vfs_close(pidfd)
+        free_page(p_rem)
+        printk1("[process-madvise] FAIL: DONTNEED rc=%d (want 4096)\n",
+                cast[uint64](rn))
+        return 0
+
+    # --- (4) the remote frame must now read back ALL ZERO ------------
+    j: uint64 = 0
+    while j < 4096:
+        if cast[Ptr[uint8]](p_rem)[j] != 0:
+            vfs_close(pidfd)
+            free_page(p_rem)
+            printk1("[process-madvise] FAIL: remote byte %d not zeroed\n", j)
+            return 0
+        j = j + 1
+    printk0("[process-madvise] PASS: cross-process MADV_DONTNEED zeroed the target's page\n")
+
+    # --- (5) error paths ---------------------------------------------
+    # flags != 0 -> -EINVAL.
+    if process_madvise_handler(cast[uint64](pidfd),
+                               cast[uint64](&iov[0]), 1,
+                               cast[uint64](PMA_MADV_DONTNEED), 1) != PMA_EINVAL:
+        vfs_close(pidfd)
+        free_page(p_rem)
+        return _pma_fail("flags!=0 did not return EINVAL")
+    # an unsupported advice (e.g. MADV_NORMAL=0) -> -EINVAL.
+    if process_madvise_handler(cast[uint64](pidfd),
+                               cast[uint64](&iov[0]), 1,
+                               cast[uint64](0), 0) != PMA_EINVAL:
+        vfs_close(pidfd)
+        free_page(p_rem)
+        return _pma_fail("bad advice did not return EINVAL")
+    # a non-pidfd fd as `pidfd` -> -EBADF (fd 0 is stdin, not a pidfd).
+    if process_madvise_handler(cast[uint64](0),
+                               cast[uint64](&iov[0]), 1,
+                               cast[uint64](PMA_MADV_DONTNEED), 0) != PMA_EBADF:
+        vfs_close(pidfd)
+        free_page(p_rem)
+        return _pma_fail("non-pidfd argument did not return EBADF")
+    printk0("[process-madvise] PASS: EINVAL/EBADF error paths correct\n")
+
+    # --- (6) target exits: process_madvise -> -ESRCH -----------------
+    # Releasing the borrowed task slot returns it to STATE_FREE; the target pid
+    # is now gone, so a process_madvise against the still-valid pidfd is -ESRCH.
+    # (create_user_task's slot is reclaimed the same way; release it explicitly.)
+    notetest_release_slot(rslot)
+    if process_madvise_handler(cast[uint64](pidfd),
+                               cast[uint64](&iov[0]), 1,
+                               cast[uint64](PMA_MADV_DONTNEED), 0) != PMA_ESRCH:
+        vfs_close(pidfd)
+        free_page(p_rem)
+        return _pma_fail("process_madvise on an exited target did not return ESRCH")
+    printk0("[process-madvise] PASS: process_madvise on an exited target -> ESRCH\n")
+
+    vfs_close(pidfd)
+    free_page(p_rem)
+    printk0("[process_madvise] PASS\n")
+    return 1

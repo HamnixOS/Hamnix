@@ -1227,6 +1227,18 @@ if os.environ.get("ENABLE_PIDFD_GETFD_TEST"):
 if os.environ.get("ENABLE_PROCESS_VM_TEST"):
     FILES.append(("/etc/process-vm-test", b"1\n"))
 
+# process_madvise(2) (nr 440) cross-process advice self-test.
+# scripts/test_process_madvise.sh sets ENABLE_PROCESS_MADVISE_TEST=1 to plant
+# /etc/process-madvise-test. init/main.ad at boot:37.process_madvise detects the
+# marker and calls process_madvise_selftest() (linux_abi/u_process_madvise.ad):
+# it builds a real SECOND task, maps a known page in it, stamps a non-zero
+# pattern, then drives the REAL process_madvise(MADV_DONTNEED) path via a pidfd
+# to the target and asserts the target's page reads back ALL ZERO — the
+# observable cross-process effect — plus the -EINVAL / -EBADF / -ESRCH
+# boundaries, emitting the [process_madvise] PASS banner. Default boots omit it.
+if os.environ.get("ENABLE_PROCESS_MADVISE_TEST"):
+    FILES.append(("/etc/process-madvise-test", b"1\n"))
+
 # mseal(2) (nr 462) memory-seal self-test. scripts/test_mseal.sh sets
 # ENABLE_MSEAL_TEST=1 to plant /etc/mseal-test. init/main.ad at boot:37.mseal
 # detects the marker and calls umseal_selftest() (linux_abi/u_mseal.ad): it
