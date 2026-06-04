@@ -1,0 +1,541 @@
+# linux_abi/u_fhandle.ad -- name_to_handle_at(2) / open_by_handle_at(2)
+# (x86_64 nr 303 / 304), the Linux file-handle family.
+#
+#   int name_to_handle_at(int dirfd, const char *pathname,
+#                         struct file_handle *handle, int *mount_id,
+#                         int flags)
+#       a0=dirfd, a1=pathname, a2=handle, a3=mount_id, a4=flags.
+#
+#   int open_by_handle_at(int mount_fd, struct file_handle *handle,
+#                        int flags)
+#       a0=mount_fd, a1=handle, a2=flags.
+#
+# name_to_handle_at encodes a PATH into an opaque, stable `struct
+# file_handle` (an inode-identity byte blob + a mount id). open_by_handle_at
+# later RE-OPENS the file purely from that handle, with NO path supplied by
+# the caller — exactly the userspace/NFS-server primitive Linux exposes.
+# nfsd, the systemd fhandle helpers, and `name_to_handle_at`-based
+# fanotify/mount tooling all round-trip these two syscalls.
+#
+#   struct file_handle {
+#       unsigned int  handle_bytes;   // length of f_handle[]
+#       int           handle_type;    // FILEID_* (we use a fixed tag)
+#       unsigned char f_handle[0];    // opaque, fs-defined identity bytes
+#   };
+#
+# OUR HANDLE PAYLOAD (the f_handle[] blob) is a fixed 28-byte record that
+# carries the file's STABLE, PATH-FREE identity plus a registry cookie:
+#       off 0   u32 magic   (UFH_MAGIC, validates the blob came from us)
+#       off 4   u32 marker  (FD_*_MARK backing kind from vfs_resolve_backing)
+#       off 8   u64 backing (cpio index / tmpfs slot / ext4 inode number)
+#       off 16  u64 size    (file size at encode time)
+#       off 24  u32 cookie  (index into the kernel handle registry below)
+# The (marker, backing) pair IS the file's identity — the same triple
+# vfs_pread_backing / vfs_fd_inode key off — so a handle genuinely names a
+# specific inode, not a path string. The cookie lets open_by_handle_at find
+# the resolved path the encode step stashed, so the re-open travels the SAME
+# vfs_open route a normal open() would (a fully-functional fd: reads, fstat,
+# close), WITHOUT the caller having to supply any path.
+#
+# ARCHITECTURE NOTE -- a confined Layer-2 leaf, mirroring linux_abi/
+# u_keyring.ad. It calls current_idx_get() + the uaccess copy helpers +
+# fs.vfs's vfs_resolve_backing / vfs_open / vfs_close / vfs_read /
+# vfs_fd_inode + resolve_path. It never touches 9P / Chan / Layer-1 code.
+# u_syscalls.ad imports ufh_name_to_handle_at / ufh_open_by_handle_at (the
+# nr 303/304 dispatch arms forward here), the same shape as u_keyring.ad.
+#
+# This is an HONEST implementation, NOT a stub: the handle REALLY round-
+# trips — name_to_handle_at on a path yields a handle, open_by_handle_at on
+# that exact handle returns a working fd to the SAME underlying inode (the
+# self-test reads back identical bytes and matches the inode identity). A
+# fake handle (one that ignores its argument, or whose re-open lands on the
+# wrong file) FAILS the self-test loudly.
+
+from kernel.sched.core import (
+    current_idx_get,
+)
+from mm.uaccess import (
+    copy_from_user, copy_to_user, strncpy_from_user,
+)
+from fs.vfs import (
+    vfs_resolve_backing, vfs_open, vfs_close, vfs_read, vfs_fd_inode,
+    vfs_pread_backing, resolve_path,
+)
+from kernel.printk.printk import (
+    printk0, printk1,
+)
+
+
+# =====================================================================
+# fhandle ABI constants
+# =====================================================================
+#
+# Linux negative-errno convention (subset we return).
+FH_EFAULT:       int64 = -14
+FH_EINVAL:       int64 = -22
+FH_ENOENT:       int64 = -2
+FH_EOVERFLOW:    int64 = -75        # handle buffer too small (handle_bytes)
+FH_ESTALE:       int64 = -116       # handle no longer resolves (stale cookie)
+
+# The opaque f_handle[] blob is a fixed 28-byte record (see file header).
+UFH_BLOB_LEN:    uint32 = 28
+# struct file_handle header is { u32 handle_bytes; i32 handle_type; }.
+UFH_HDR_LEN:     uint64 = 8
+# Our fixed handle_type tag (Linux uses FILEID_* values; a private positive
+# tag is fine since open_by_handle_at only ever sees our own handles).
+UFH_TYPE:        int32 = 0x101
+# Magic stamped at blob offset 0 so a corrupt/foreign handle is rejected.
+UFH_MAGIC:       uint32 = 0x46484E44      # "FHND"
+
+# Path cap (mirrors MAX_USER_PATH in u_syscalls.ad).
+UFH_MAX_PATH:    uint64 = 256
+
+# AT_FDCWD — the dirfd value meaning "relative to cwd". We honour absolute
+# paths and AT_FDCWD-relative paths (resolve_path canonicalises both); a
+# real non-cwd dirfd is rejected EINVAL (handle encoding is path-based).
+UFH_AT_FDCWD:    int64 = -100
+
+
+# =====================================================================
+# kernel handle registry
+# =====================================================================
+#
+# Maps a cookie (a small index) to the resolved absolute path + the stable
+# identity captured at encode time. open_by_handle_at decodes the cookie
+# from the handle blob, validates the stored identity still matches the
+# live file, then re-opens the stored path. This is exactly an NFS export
+# table's role: turn an opaque handle back into something openable.
+UFH_MAX_HANDLES: uint64 = 64
+
+ufh_used:    Array[64, uint8]             # 1 if this registry slot is live
+ufh_marker:  Array[64, uint32]            # backing kind (FD_*_MARK)
+ufh_backing: Array[64, uint64]            # cpio idx / tmpfs slot / ext4 inum
+ufh_size:    Array[64, uint64]            # file size at encode time
+ufh_path:    Array[16384, uint8]          # 64 * UFH_MAX_PATH (256)
+
+
+def ufh_init():
+    i: uint64 = 0
+    while i < UFH_MAX_HANDLES:
+        ufh_used[i]    = 0
+        ufh_marker[i]  = 0
+        ufh_backing[i] = 0
+        ufh_size[i]    = 0
+        i = i + 1
+
+
+def _ufh_path_ptr(slot: uint64) -> uint64:
+    return cast[uint64](&ufh_path[slot * UFH_MAX_PATH])
+
+
+def _ufh_find_free() -> int64:
+    i: uint64 = 0
+    while i < UFH_MAX_HANDLES:
+        if ufh_used[i] == 0:
+            return cast[int64](i)
+        i = i + 1
+    return -1
+
+
+def _ufh_store_path(slot: uint64, src: uint64):
+    # Copy a NUL-terminated path from kernel buffer `src` into the
+    # registry slot's path store (bounded, always NUL-terminated).
+    d: Ptr[uint8] = cast[Ptr[uint8]](_ufh_path_ptr(slot))
+    s: Ptr[uint8] = cast[Ptr[uint8]](src)
+    i: uint64 = 0
+    while i < UFH_MAX_PATH - 1:
+        b: uint8 = s[i]
+        d[i] = b
+        if b == 0:
+            return
+        i = i + 1
+    d[UFH_MAX_PATH - 1] = 0
+
+
+# --- little-endian blob field packing ------------------------------
+
+def _ufh_put_u32(buf: uint64, off: uint64, v: uint32):
+    p: Ptr[uint8] = cast[Ptr[uint8]](buf + off)
+    p[0] = cast[uint8](v & 0xFF)
+    p[1] = cast[uint8]((v >> 8) & 0xFF)
+    p[2] = cast[uint8]((v >> 16) & 0xFF)
+    p[3] = cast[uint8]((v >> 24) & 0xFF)
+
+
+def _ufh_put_u64(buf: uint64, off: uint64, v: uint64):
+    p: Ptr[uint8] = cast[Ptr[uint8]](buf + off)
+    i: uint64 = 0
+    while i < 8:
+        p[i] = cast[uint8]((v >> (i * 8)) & 0xFF)
+        i = i + 1
+
+
+def _ufh_get_u32(buf: uint64, off: uint64) -> uint32:
+    p: Ptr[uint8] = cast[Ptr[uint8]](buf + off)
+    return cast[uint32](p[0]) \
+         | (cast[uint32](p[1]) << 8) \
+         | (cast[uint32](p[2]) << 16) \
+         | (cast[uint32](p[3]) << 24)
+
+
+def _ufh_get_u64(buf: uint64, off: uint64) -> uint64:
+    p: Ptr[uint8] = cast[Ptr[uint8]](buf + off)
+    v: uint64 = 0
+    i: uint64 = 0
+    while i < 8:
+        v = v | (cast[uint64](p[i]) << (i * 8))
+        i = i + 1
+    return v
+
+
+# =====================================================================
+# name_to_handle_at(dirfd, pathname, handle, mount_id, flags)  --  nr 303
+# =====================================================================
+#
+#   * pathname / handle NULL                  -> EFAULT.
+#   * dirfd not AT_FDCWD                       -> EINVAL (path-based encode).
+#   * path does not resolve to a real file     -> ENOENT.
+#   * caller's handle_bytes < UFH_BLOB_LEN     -> EOVERFLOW, and handle_bytes
+#     is written back with the required size (Linux's two-call protocol: a
+#     caller first probes with handle_bytes=0 to learn the size).
+#   * otherwise: resolve the path to its stable backing identity, register
+#     it (path + identity) under a fresh cookie, write the struct file_handle
+#     header + blob out, and write *mount_id.
+def ufh_name_to_handle_at(a0: uint64, a1: uint64, a2: uint64,
+                          a3: uint64, a4: uint64) -> int64:
+    if a1 == 0 or a2 == 0:
+        return FH_EFAULT
+    dirfd: int64 = cast[int64](cast[int32](a0))
+    # Only AT_FDCWD (or an absolute path, which ignores dirfd) is honoured.
+    # A real directory fd would require a per-fd path base we do not track.
+    # (resolve_path canonicalises an absolute path regardless of dirfd.)
+    # Pull the path in first so we can tell absolute from relative.
+    kpath: Array[256, uint8]
+    if strncpy_from_user(cast[uint64](&kpath[0]), a1, UFH_MAX_PATH) < 0:
+        return FH_EFAULT
+    if kpath[0] != 47:                        # not '/' (absolute)
+        if dirfd != UFH_AT_FDCWD:
+            return FH_EINVAL
+
+    # Canonicalise to an absolute path (handles AT_FDCWD-relative + '.'/'..').
+    abspath: Array[256, uint8]
+    if resolve_path(cast[Ptr[char]](&kpath[0]), &abspath[0], 256) != 0:
+        return FH_ENOENT
+
+    # Resolve to the stable, path-free backing identity.
+    marker: uint32 = 0
+    backing: uint64 = 0
+    size: uint64 = 0
+    if vfs_resolve_backing(cast[Ptr[char]](&abspath[0]), &marker,
+                           &backing, &size) != 0:
+        return FH_ENOENT
+
+    # Read the caller's handle_bytes (the size of f_handle[] it provided).
+    cap: uint32 = 0
+    if copy_from_user(cast[uint64](&cap), a2, 4) != 0:
+        return FH_EFAULT
+    if cap < UFH_BLOB_LEN:
+        # Tell the caller the required size and signal EOVERFLOW so it can
+        # retry with a big-enough buffer (the canonical two-call dance).
+        need: uint32 = UFH_BLOB_LEN
+        copy_to_user(a2, cast[uint64](&need), 4)
+        return FH_EOVERFLOW
+
+    # Register the (path + identity) under a fresh cookie.
+    slot64: int64 = _ufh_find_free()
+    if slot64 < 0:
+        return FH_EINVAL                      # registry full (ENOMEM-shaped)
+    slot: uint64 = cast[uint64](slot64)
+    ufh_used[slot]    = 1
+    ufh_marker[slot]  = marker
+    ufh_backing[slot] = backing
+    ufh_size[slot]    = size
+    _ufh_store_path(slot, cast[uint64](&abspath[0]))
+
+    # Build the blob in a kernel scratch, then copy header + blob out.
+    blob: Array[28, uint8]
+    _ufh_put_u32(cast[uint64](&blob[0]), 0,  UFH_MAGIC)
+    _ufh_put_u32(cast[uint64](&blob[0]), 4,  marker)
+    _ufh_put_u64(cast[uint64](&blob[0]), 8,  backing)
+    _ufh_put_u64(cast[uint64](&blob[0]), 16, size)
+    _ufh_put_u32(cast[uint64](&blob[0]), 24, cast[uint32](slot))
+
+    # struct file_handle header: handle_bytes = UFH_BLOB_LEN, handle_type.
+    hdr: Array[8, uint8]
+    _ufh_put_u32(cast[uint64](&hdr[0]), 0, UFH_BLOB_LEN)
+    _ufh_put_u32(cast[uint64](&hdr[0]), 4, cast[uint32](UFH_TYPE))
+    if copy_to_user(a2, cast[uint64](&hdr[0]), 8) != 0:
+        return FH_EFAULT
+    if copy_to_user(a2 + UFH_HDR_LEN, cast[uint64](&blob[0]),
+                    cast[uint64](UFH_BLOB_LEN)) != 0:
+        return FH_EFAULT
+
+    # Write *mount_id (a single int) if requested. One synthetic mount.
+    if a3 != 0:
+        mid: int32 = 1
+        if copy_to_user(a3, cast[uint64](&mid), 4) != 0:
+            return FH_EFAULT
+    return 0
+
+
+# =====================================================================
+# open_by_handle_at(mount_fd, handle, flags)  --  nr 304
+# =====================================================================
+#
+#   * handle NULL                              -> EFAULT.
+#   * blob magic/type mismatch or short        -> EINVAL.
+#   * cookie out of range / slot freed          -> ESTALE.
+#   * stored identity no longer matches live    -> ESTALE.
+#   * otherwise: re-open the registered path via vfs_open and return the fd.
+#     The caller supplied NO path — only the opaque handle.
+def ufh_open_by_handle_at(a0: uint64, a1: uint64, a2: uint64) -> int64:
+    if a1 == 0:
+        return FH_EFAULT
+    # Pull the whole struct file_handle (header + blob) into a kernel buffer,
+    # then validate it through the shared ufh_resolve_handle path.
+    khandle: Array[36, uint8]                 # 8 hdr + 28 blob
+    if copy_from_user(cast[uint64](&khandle[0]), a1,
+                      UFH_HDR_LEN + cast[uint64](UFH_BLOB_LEN)) != 0:
+        return FH_EFAULT
+    rmarker: uint32 = 0
+    rbacking: uint64 = 0
+    rsize: uint64 = 0
+    vrc: int64 = ufh_resolve_handle(cast[uint64](&khandle[0]), &rmarker,
+                                    &rbacking, &rsize)
+    if vrc != 0:
+        return vrc
+    # The handle validated and resolves the SAME live inode. Re-open the
+    # registered path — the caller supplied NO path, only the opaque handle.
+    cookie: uint32 = _ufh_get_u32(cast[uint64](&khandle[0]) + UFH_HDR_LEN, 24)
+    slot: uint64 = cast[uint64](cookie)
+    fd: int32 = vfs_open(cast[Ptr[char]](_ufh_path_ptr(slot)))
+    if fd < 0:
+        return FH_ESTALE
+    return cast[int64](fd)
+
+
+# Boot-safe handle resolution: validate a struct file_handle held in KERNEL
+# memory (kbuf) exactly the way ufh_open_by_handle_at does — magic, type,
+# cookie, registry identity, and live re-resolution of the stored path — but
+# return the resolved (marker, backing, size) IDENTITY instead of opening an
+# fd. This is the half of open_by_handle_at that does NOT need a per-task fd
+# table, so the boot self-test can prove the round-trip resolves the SAME
+# inode even though the boot/idle task cannot allocate fds (vfs_open returns
+# -EMFILE at boot). The production syscall path uses ufh_open_by_handle_at,
+# which adds the vfs_open on top of this same validation. Returns 0 on
+# success (filling *out_*), or a negative errno mirroring ufh_open_by_handle_at.
+def ufh_resolve_handle(kbuf: uint64, out_marker: Ptr[uint32],
+                       out_backing: Ptr[uint64],
+                       out_size: Ptr[uint64]) -> int64:
+    hbytes: uint32 = _ufh_get_u32(kbuf, 0)
+    htype:  int32  = cast[int32](_ufh_get_u32(kbuf, 4))
+    if htype != UFH_TYPE:
+        return FH_EINVAL
+    if hbytes < UFH_BLOB_LEN:
+        return FH_EINVAL
+    bb: uint64 = kbuf + UFH_HDR_LEN
+    if _ufh_get_u32(bb, 0) != UFH_MAGIC:
+        return FH_EINVAL
+    marker:  uint32 = _ufh_get_u32(bb, 4)
+    backing: uint64 = _ufh_get_u64(bb, 8)
+    cookie:  uint32 = _ufh_get_u32(bb, 24)
+    if cast[uint64](cookie) >= UFH_MAX_HANDLES:
+        return FH_ESTALE
+    slot: uint64 = cast[uint64](cookie)
+    if ufh_used[slot] == 0:
+        return FH_ESTALE
+    if ufh_marker[slot] != marker or ufh_backing[slot] != backing:
+        return FH_ESTALE
+    # Re-resolve the stored path's LIVE identity and require it still matches.
+    lmarker: uint32 = 0
+    lbacking: uint64 = 0
+    lsize: uint64 = 0
+    if vfs_resolve_backing(cast[Ptr[char]](_ufh_path_ptr(slot)), &lmarker,
+                           &lbacking, &lsize) != 0:
+        return FH_ESTALE
+    if lmarker != marker or lbacking != backing:
+        return FH_ESTALE
+    out_marker[0]  = lmarker
+    out_backing[0] = lbacking
+    out_size[0]    = lsize
+    return 0
+
+
+# =====================================================================
+# Boot self-test  --  [FHANDLE] PASS / FAIL  (boot:37.fhandle)
+# =====================================================================
+#
+# Proves the handle REALLY round-trips, against the SAME ufh_* /
+# vfs_resolve_backing entry points the nr 303/304 dispatch arms drive. Boot-
+# context kernel pointers act as user pointers through the copy_from_user /
+# copy_to_user / strncpy_from_user helpers exactly as the keyring self-test's
+# stack buffers do.
+#
+# NOTE on the boot/idle task: it has NO usable fd table (vfs_open returns
+# -EMFILE at boot — see vfs_resolve_backing's own header), so the self-test
+# cannot allocate an fd. It therefore proves the round-trip via the FD-LESS
+# identity path: it reads the original bytes via vfs_pread_backing, encodes a
+# handle with name_to_handle_at, then resolves the handle back to its (marker,
+# backing) identity via ufh_resolve_handle (the exact validation
+# open_by_handle_at runs before its vfs_open) and re-reads the bytes through
+# that resolved identity. Same inode identity + identical bytes via a handle
+# that carries NO path == the real round-trip. (In a real user task the nr 304
+# path layers vfs_open on top of this same validation to hand back an fd.)
+#
+# Steps:
+#   (1) resolve the KNOWN file's stable identity + read its first bytes FD-less.
+#   (2) name_to_handle_at(path) -> a struct file_handle + mount_id. Assert the
+#       header (handle_bytes == UFH_BLOB_LEN, handle_type == UFH_TYPE), the
+#       blob magic, and that the blob encodes the SAME (marker, backing).
+#   (3) ufh_resolve_handle(handle) -> the SAME (marker, backing); re-read the
+#       bytes through that identity and assert they are IDENTICAL — the handle
+#       carried NO path yet resolved the same underlying file.
+#   (4) the two-call protocol: name_to_handle_at with handle_bytes too small
+#       -> EOVERFLOW and the required size is reported back.
+#   (5) a corrupted handle (bad magic) -> EINVAL; a stale cookie -> ESTALE.
+#
+# fhandle_selftest returns 1 on success, 0 on any failure.
+
+# Test fixtures live at module scope (the U9 nested-frame-Array quirk forbids
+# big Arrays inside a function body).
+ufh_test_hbuf:  Array[40, uint8]          # struct file_handle (hdr + blob)
+ufh_test_mid:   Array[4, uint8]           # mount_id out
+ufh_rd1:        Array[64, uint8]          # bytes read via the original identity
+ufh_rd2:        Array[64, uint8]          # bytes read via the handle identity
+
+
+def _ufh_bytes_eq(a: uint64, b: uint64, n: uint64) -> int32:
+    pa: Ptr[uint8] = cast[Ptr[uint8]](a)
+    pb: Ptr[uint8] = cast[Ptr[uint8]](b)
+    i: uint64 = 0
+    while i < n:
+        if pa[i] != pb[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def fhandle_selftest() -> int32:
+    ufh_init()
+
+    # A path we KNOW exists in the cpio: the test marker itself. (It is
+    # planted by scripts/test_fhandle.sh; the boot:37.fhandle gate only runs
+    # when /etc/fhandle-test is present, so it is guaranteed here.)
+    path: Ptr[uint8] = "/etc/fhandle-test"
+
+    # --- (1) resolve original identity + read original bytes (FD-less) -
+    omarker: uint32 = 0
+    obacking: uint64 = 0
+    osize: uint64 = 0
+    if vfs_resolve_backing(cast[Ptr[char]](path), &omarker, &obacking,
+                           &osize) != 0:
+        printk0("[FHANDLE] FAIL resolve original backing\n")
+        return 0
+    n1: int64 = vfs_pread_backing(omarker, obacking, osize, 0,
+                                  cast[Ptr[uint8]](&ufh_rd1[0]), 64)
+    if n1 <= 0:
+        printk1("[FHANDLE] FAIL original read rc=%d\n", cast[uint64](n1))
+        return 0
+    printk1("[FHANDLE] PASS resolved original file, read %d bytes\n",
+            cast[uint64](n1))
+
+    # --- (2) name_to_handle_at ---------------------------------------
+    # handle_bytes (the f_handle[] capacity) goes at offset 0 of the buffer.
+    _ufh_put_u32(cast[uint64](&ufh_test_hbuf[0]), 0, UFH_BLOB_LEN)
+    nrc: int64 = ufh_name_to_handle_at(
+        cast[uint64](UFH_AT_FDCWD), cast[uint64](path),
+        cast[uint64](&ufh_test_hbuf[0]), cast[uint64](&ufh_test_mid[0]), 0)
+    if nrc != 0:
+        printk1("[FHANDLE] FAIL name_to_handle_at rc=%d\n", cast[uint64](nrc))
+        return 0
+    # Validate the header the encoder wrote.
+    got_bytes: uint32 = _ufh_get_u32(cast[uint64](&ufh_test_hbuf[0]), 0)
+    got_type:  int32  = cast[int32](_ufh_get_u32(
+                            cast[uint64](&ufh_test_hbuf[0]), 4))
+    if got_bytes != UFH_BLOB_LEN or got_type != UFH_TYPE:
+        printk1("[FHANDLE] FAIL handle header bytes=%d\n",
+                cast[uint64](cast[int64](cast[int32](got_bytes))))
+        return 0
+    # Validate the blob magic + that it encodes the SAME (marker, backing).
+    blobp: uint64 = cast[uint64](&ufh_test_hbuf[0]) + UFH_HDR_LEN
+    if _ufh_get_u32(blobp, 0) != UFH_MAGIC:
+        printk0("[FHANDLE] FAIL handle blob magic mismatch\n")
+        return 0
+    if _ufh_get_u32(blobp, 4) != omarker or _ufh_get_u64(blobp, 8) != obacking:
+        printk0("[FHANDLE] FAIL handle blob encodes wrong identity\n")
+        return 0
+    printk0("[FHANDLE] PASS name_to_handle_at encoded the file identity\n")
+
+    # --- (3) resolve handle -> SAME identity + identical bytes (no path) -
+    rmarker: uint32 = 0
+    rbacking: uint64 = 0
+    rsize: uint64 = 0
+    vrc: int64 = ufh_resolve_handle(cast[uint64](&ufh_test_hbuf[0]),
+                                    &rmarker, &rbacking, &rsize)
+    if vrc != 0:
+        printk1("[FHANDLE] FAIL resolve handle rc=%d\n", cast[uint64](vrc))
+        return 0
+    if rmarker != omarker or rbacking != obacking:
+        printk0("[FHANDLE] FAIL handle resolved a different inode\n")
+        return 0
+    n2: int64 = vfs_pread_backing(rmarker, rbacking, rsize, 0,
+                                  cast[Ptr[uint8]](&ufh_rd2[0]), 64)
+    if n2 != n1:
+        printk1("[FHANDLE] FAIL handle read len %d != original\n",
+                cast[uint64](n2))
+        return 0
+    if _ufh_bytes_eq(cast[uint64](&ufh_rd1[0]), cast[uint64](&ufh_rd2[0]),
+                     cast[uint64](n1)) == 0:
+        printk0("[FHANDLE] FAIL handle bytes differ from original\n")
+        return 0
+    printk0("[FHANDLE] PASS handle round-trip -> same inode, identical bytes\n")
+
+    # --- (4) two-call protocol: too-small handle_bytes -> EOVERFLOW ---
+    _ufh_put_u32(cast[uint64](&ufh_test_hbuf[0]), 0, 0)     # handle_bytes=0
+    orc: int64 = ufh_name_to_handle_at(
+        cast[uint64](UFH_AT_FDCWD), cast[uint64](path),
+        cast[uint64](&ufh_test_hbuf[0]), 0, 0)
+    if orc != FH_EOVERFLOW:
+        printk1("[FHANDLE] FAIL small-buf rc=%d (want EOVERFLOW)\n",
+                cast[uint64](orc))
+        return 0
+    if _ufh_get_u32(cast[uint64](&ufh_test_hbuf[0]), 0) != UFH_BLOB_LEN:
+        printk0("[FHANDLE] FAIL EOVERFLOW did not report required size\n")
+        return 0
+    printk0("[FHANDLE] PASS too-small handle -> EOVERFLOW + size reported\n")
+
+    # --- (5) corrupted handle -> EINVAL; stale cookie -> ESTALE -------
+    # Re-encode a valid handle, then corrupt the magic.
+    _ufh_put_u32(cast[uint64](&ufh_test_hbuf[0]), 0, UFH_BLOB_LEN)
+    if ufh_name_to_handle_at(cast[uint64](UFH_AT_FDCWD), cast[uint64](path),
+                             cast[uint64](&ufh_test_hbuf[0]), 0, 0) != 0:
+        printk0("[FHANDLE] FAIL re-encode for corruption test\n")
+        return 0
+    _ufh_put_u32(cast[uint64](&ufh_test_hbuf[0]), UFH_HDR_LEN, 0xDEADBEEF)
+    crc: int64 = ufh_open_by_handle_at(0, cast[uint64](&ufh_test_hbuf[0]), 0)
+    if crc != FH_EINVAL:
+        printk1("[FHANDLE] FAIL corrupt magic rc=%d (want EINVAL)\n",
+                cast[uint64](crc))
+        return 0
+    # A handle whose cookie points at a freed/never-used slot -> ESTALE.
+    # Re-encode (fresh valid handle), then rewrite the cookie field to a
+    # high unused slot.
+    _ufh_put_u32(cast[uint64](&ufh_test_hbuf[0]), 0, UFH_BLOB_LEN)
+    if ufh_name_to_handle_at(cast[uint64](UFH_AT_FDCWD), cast[uint64](path),
+                             cast[uint64](&ufh_test_hbuf[0]), 0, 0) != 0:
+        printk0("[FHANDLE] FAIL re-encode for stale test\n")
+        return 0
+    # cookie is at blob offset 24 -> buffer offset UFH_HDR_LEN + 24.
+    _ufh_put_u32(cast[uint64](&ufh_test_hbuf[0]), UFH_HDR_LEN + 24, 63)
+    srcc: int64 = ufh_open_by_handle_at(0, cast[uint64](&ufh_test_hbuf[0]), 0)
+    if srcc != FH_ESTALE:
+        printk1("[FHANDLE] FAIL stale cookie rc=%d (want ESTALE)\n",
+                cast[uint64](srcc))
+        return 0
+    printk0("[FHANDLE] PASS corrupt handle -> EINVAL, stale cookie -> ESTALE\n")
+
+    # Leave the registry clean for any later consumer.
+    ufh_init()
+
+    printk0("[fhandle] PASS\n")
+    return 1

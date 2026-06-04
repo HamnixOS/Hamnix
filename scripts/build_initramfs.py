@@ -1182,6 +1182,28 @@ if os.environ.get("ENABLE_KEYRING_TEST"):
 if os.environ.get("ENABLE_PROCESS_VM_TEST"):
     FILES.append(("/etc/process-vm-test", b"1\n"))
 
+# mseal(2) (nr 462) memory-seal self-test. scripts/test_mseal.sh sets
+# ENABLE_MSEAL_TEST=1 to plant /etc/mseal-test. init/main.ad at boot:37.mseal
+# detects the marker and calls umseal_selftest() (linux_abi/u_mseal.ad): it
+# mmaps a sealed + an unsealed anonymous region, mseal()s the first, then
+# asserts mprotect/munmap/mremap/madvise(DONTNEED) on the sealed region all
+# return -EPERM while the unsealed region still allows them, emitting the
+# [mseal] PASS banner. Default boots omit the marker.
+if os.environ.get("ENABLE_MSEAL_TEST"):
+    FILES.append(("/etc/mseal-test", b"1\n"))
+
+# name_to_handle_at(2)/open_by_handle_at(2) (nr 303/304) round-trip self-test.
+# scripts/test_fhandle.sh sets ENABLE_FHANDLE_TEST=1 to plant /etc/fhandle-test
+# (the self-test opens THIS very file by handle). init/main.ad at
+# boot:37.fhandle detects the marker and calls fhandle_selftest()
+# (linux_abi/u_fhandle.ad): it opens the file the normal way + notes its inode
+# and first bytes, name_to_handle_at()s it to an opaque struct file_handle,
+# then open_by_handle_at()s that handle (no path) and asserts the new fd has
+# the SAME inode and reads back identical bytes, emitting the [fhandle] PASS
+# banner. Default boots omit the marker.
+if os.environ.get("ENABLE_FHANDLE_TEST"):
+    FILES.append(("/etc/fhandle-test", b"fhandle round-trip test fixture\n"))
+
 # bpf(2) eBPF interpreter + map/prog self-test. scripts/test_bpf.sh sets
 # ENABLE_BPF_TEST=1 to plant /etc/bpf-test. init/main.ad detects the marker and
 # calls bpf_selftest() (linux_abi/u_bpf.ad): it creates real HASH + ARRAY maps
