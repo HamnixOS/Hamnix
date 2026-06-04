@@ -220,6 +220,17 @@ from linux_abi.u_unixsock import (
     afunix_fdbuf_for_ep, afunix_ep_for_fdbuf,
     AFU_AF_UNIX, AFU_SOCK_STREAM, AFU_SOCK_DGRAM, AFU_EAGAIN,
 )
+# AF_NETLINK / NETLINK_ROUTE (rtnetlink) — a Layer-2 framing window onto
+# the kernel's existing net state (drivers/net/ip.ad + eth.ad), letting
+# Debian's `ip` / systemd / libmnl enumerate interfaces, addresses and
+# routes. A netlink fd is a FD_SOCKET_MARK fd whose fd_buf carries the
+# NL_FDBUF_TAG (0x50000000, distinct from the AF_UNIX 0x40000000 tag).
+from linux_abi.u_netlink import (
+    nl_socket, nl_bind, nl_getsockname,
+    nl_send, nl_recv, nl_can_read, nl_close,
+    nl_fdbuf_for_ep, nl_ep_for_fdbuf,
+    NL_AF_NETLINK, NL_EAGAIN,
+)
 # U-socket: socket(2)/connect(2) on a real TCP connection. The TCP
 # stack itself is drivers/net/tcp.ad; fs/socket_state.ad is the per-
 # socket-fd backing-record store shared with fs/vfs.ad's read/write/
@@ -1278,6 +1289,18 @@ def _u_read_body(a0: uint64, a1: uint64, a2: uint64,
     # AF_UNIX: a unix-socket fd's read(2) drains its in-kernel conduit
     # (stream ring or datagram queue), NOT the vfs socket arms. Intercept
     # before any vfs routing.
+    # AF_NETLINK: read(2) drains the endpoint's queued framed dump bytes,
+    # same as recv. Intercept before any vfs routing.
+    rd_nlep: int32 = _u_netlink_ep(fd)
+    if rd_nlep >= 0:
+        rd_nrn: int64 = nl_recv(rd_nlep, a1, a2)
+        if rd_nrn == NL_EAGAIN:
+            if nonblock != 0:
+                return NL_EAGAIN
+            while rd_nrn == NL_EAGAIN:
+                yield_to_others()
+                rd_nrn = nl_recv(rd_nlep, a1, a2)
+        return rd_nrn
     rd_uxep: int32 = _u_afunix_ep(fd)
     if rd_uxep >= 0:
         if afunix_get_type(rd_uxep) == AFU_SOCK_DGRAM:
@@ -1417,6 +1440,11 @@ def _u_write_body(a0: uint64, a1: uint64, a2: uint64,
     # copy_from_user needs a chunked kernel bounce buffer in every vfs
     # write backend — deferred. access_ok range-checks a1 at the gate.
     fd: int32 = cast[int32](a0)
+    # AF_NETLINK: write(2) of nlmsghdr-framed request(s) builds + queues
+    # the matching dump, same as send. Intercept before any vfs routing.
+    wr_nlep: int32 = _u_netlink_ep(fd)
+    if wr_nlep >= 0:
+        return nl_send(wr_nlep, a1, a2)
     # AF_UNIX: a unix-socket fd's write(2) pushes into the peer's conduit
     # (stream ring) or delivers one datagram to the connected peer.
     # Intercept before any vfs routing.
@@ -1517,6 +1545,11 @@ def _u_close(a0: uint64, a1: uint64, a2: uint64,
     cl_uxep: int32 = _u_afunix_ep(cast[int32](a0))
     if cl_uxep >= 0:
         afunix_close(cl_uxep)
+    # AF_NETLINK: release the in-kernel endpoint (its rx ring + port id).
+    # vfs.ad has never heard of the NETLINK tag, so drop it here.
+    cl_nlep: int32 = _u_netlink_ep(cast[int32](a0))
+    if cl_nlep >= 0:
+        nl_close(cl_nlep)
     # io_uring: an FD_IORING_MARK fd owns a kernel ring context (SQ/CQ/SQE
     # regions). vfs.ad has never heard of FD_IORING_MARK, so free the
     # context here before the fd slot is recycled.
@@ -3125,6 +3158,16 @@ def _u_afunix_ep(fd: int32) -> int32:
     return afunix_ep_for_fdbuf(vfs_socket_fd_get_record(fd))
 
 
+# AF_NETLINK fd recogniser: returns the netlink endpoint slot backing a
+# socket fd, or -1 if the fd is not a netlink socket. A netlink fd is a
+# FD_SOCKET_MARK fd whose fd_buf carries the NL_FDBUF_TAG;
+# nl_ep_for_fdbuf decodes + validates it (and rejects the AF_UNIX tag).
+def _u_netlink_ep(fd: int32) -> int32:
+    if vfs_fd_is_socket(fd) == 0:
+        return -1
+    return nl_ep_for_fdbuf(vfs_socket_fd_get_record(fd))
+
+
 def _u_socket(a0: uint64, a1: uint64, a2: uint64,
               a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int socket(int domain, int type, int protocol)
@@ -3146,6 +3189,30 @@ def _u_socket(a0: uint64, a1: uint64, a2: uint64,
     if (cast[uint64](sock_type) & O_NONBLOCK_BIT) != 0:
         sock_nonblock = 1
     sock_type = sock_type & 0xFF
+    if domain == NL_AF_NETLINK:
+        # AF_NETLINK socket. `protocol` selects the netlink family
+        # (NETLINK_ROUTE == 0 is the one `ip` / systemd use). Allocate an
+        # in-kernel endpoint in linux_abi/u_netlink.ad, then a real
+        # FD_SOCKET_MARK fd whose fd_buf carries the NETLINK tag so
+        # read/write/close intercept it here and the fs/vfs.ad arms (and
+        # the AF_UNIX arms) ignore it.
+        nlep: int32 = nl_socket(sock_type, cast[uint32](a2))
+        if nlep < 0:
+            set_current_errstr("socket: AF_NETLINK endpoint pool exhausted")
+            return cast[int64](nlep)
+        nlfd: int32 = vfs_alloc_socket_fd()
+        if nlfd < 0:
+            nl_close(nlep)
+            set_current_errstr("socket: out of fd slots")
+            return cast[int64](nlfd)
+        if vfs_socket_fd_set_record(nlfd, nl_fdbuf_for_ep(nlep)) != 0:
+            nl_close(nlep)
+            vfs_close(nlfd)
+            set_current_errstr("socket: AF_NETLINK fd record bind failed")
+            return ELINUX_BADF
+        if sock_nonblock != 0:
+            _u_set_fd_nonblock(nlfd, 1)
+        return cast[int64](nlfd)
     if domain == AFU_AF_UNIX:
         # AF_UNIX (local) domain socket. Allocate an in-kernel endpoint
         # in linux_abi/u_unixsock.ad, then a real FD_SOCKET_MARK fd whose
@@ -3623,6 +3690,10 @@ def _u_bind(a0: uint64, a1: uint64, a2: uint64,
     #   offset 4 : uint32 sin_addr    (network / big-endian IPv4)
     #   offset 8 : uint8[8] sin_zero  (padding)
     fd: int32 = cast[int32](a0)
+    # AF_NETLINK: record the bound nl_pid / nl_groups (any pid accepted).
+    nlep_b: int32 = _u_netlink_ep(fd)
+    if nlep_b >= 0:
+        return nl_bind(nlep_b, a1, cast[int32](a2))
     # AF_UNIX: register the endpoint's name in the rendezvous table.
     uxep: int32 = _u_afunix_ep(fd)
     if uxep >= 0:
@@ -3761,6 +3832,11 @@ def _u_getsockname(a0: uint64, a1: uint64, a2: uint64,
     # Zero out the returned addrlen so callers see "empty address". The
     # addr buffer is left as-is — Linux only writes min(len, *addrlen)
     # bytes, and our length is zero.
+    # AF_NETLINK: report the bound sockaddr_nl (nl_pid/nl_groups) so
+    # libmnl's mnl_socket_get_portid sees the auto-assigned port id.
+    gsn_nlep: int32 = _u_netlink_ep(cast[int32](a0))
+    if gsn_nlep >= 0:
+        return nl_getsockname(gsn_nlep, a1, a2)
     if vfs_fd_is_socket(cast[int32](a0)) == 0:
         return ELINUX_BADF
     if a2 != 0:
@@ -3956,6 +4032,12 @@ def _u_sendto(a0: uint64, a1: uint64, a2: uint64,
     # NULL dest_addr requires the socket to have been connect(2)'d (the
     # fixed peer is used). `flags` (MSG_DONTWAIT etc.) are ignored.
     fd: int32 = cast[int32](a0)
+    # AF_NETLINK: a sendto/send carries one or more nlmsghdr-framed GET
+    # requests; build + queue the matching dump (dest_addr is the kernel,
+    # which we ignore). Returns the request byte count "sent".
+    nlep_s: int32 = _u_netlink_ep(fd)
+    if nlep_s >= 0:
+        return nl_send(nlep_s, a1, a2)
     # AF_UNIX: a DGRAM endpoint delivers one datagram by name (or to its
     # connected peer); a STREAM endpoint degrades to write(2).
     uxep: int32 = _u_afunix_ep(fd)
@@ -4037,6 +4119,31 @@ def _u_recvfrom(a0: uint64, a1: uint64, a2: uint64,
     # fill it with the datagram's source (sockaddr_in) and set *addrlen
     # to 16. `flags` are ignored.
     fd: int32 = cast[int32](a0)
+    # AF_NETLINK: drain queued framed reply bytes (a prior send queued the
+    # dump). A blocking recv yields until the dump is available; report the
+    # kernel as the source addr (nl_pid 0) when src_addr is supplied.
+    nlep_r: int32 = _u_netlink_ep(fd)
+    if nlep_r >= 0:
+        nlnb: int32 = _u_fd_is_nonblock(fd)
+        nrn: int64 = nl_recv(nlep_r, a1, a2)
+        if nrn == NL_EAGAIN:
+            if nlnb != 0:
+                return NL_EAGAIN
+            while nrn == NL_EAGAIN:
+                yield_to_others()
+                nrn = nl_recv(nlep_r, a1, a2)
+        if a4 != 0:
+            # sockaddr_nl source: family AF_NETLINK, nl_pid 0 (kernel).
+            na: Ptr[uint8] = cast[Ptr[uint8]](a4)
+            na[0] = cast[uint8](NL_AF_NETLINK & 0xFF)
+            na[1] = cast[uint8]((NL_AF_NETLINK >> 8) & 0xFF)
+            naz: uint64 = 2
+            while naz < 12:
+                na[naz] = 0
+                naz = naz + 1
+            if a5 != 0:
+                cast[Ptr[uint32]](a5)[0] = 12
+        return nrn
     # AF_UNIX: a DGRAM endpoint dequeues one datagram; a STREAM endpoint
     # degrades to read(2).
     uxep: int32 = _u_afunix_ep(fd)
@@ -4135,6 +4242,15 @@ def _u_poll_fd_revents(fd: int32, events: uint32) -> uint32:
         if pf_pid >= 0:
             if upidfd_target_readable(cast[uint64](pf_pid)) != 0:
                 ready = ready | POLLIN_BIT
+    # AF_NETLINK: a netlink fd is POLLIN-readable once a dump reply is
+    # queued (after the caller's send), and always POLLOUT-writable (a
+    # request can be sent any time). vfs has no view of the netlink rx
+    # ring, so the readiness is answered here in the Layer-2 shim.
+    pf_nlep: int32 = _u_netlink_ep(fd)
+    if pf_nlep >= 0:
+        ready = POLLOUT_BIT
+        if nl_can_read(pf_nlep) != 0:
+            ready = ready | POLLIN_BIT
     # The bits the caller may request (POLLIN/PRI/OUT) are masked by
     # `events`; the error bits always pass through.
     requestable: uint32 = events | POLLERR_BIT | POLLHUP_BIT \

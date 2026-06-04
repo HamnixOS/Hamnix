@@ -528,6 +528,13 @@ if os.environ.get("ENABLE_MQUEUE_TEST") == "1":
 if os.environ.get("ENABLE_AFUNIX_TEST") == "1":
     FILES.append(("/etc/afunix-test", b"1\n"))
 
+# AF_NETLINK / NETLINK_ROUTE (rtnetlink) self-test. scripts/test_netlink.sh
+# sets ENABLE_NETLINK_TEST=1 to plant /etc/netlink-test; init/main.ad at
+# boot:37.netlink detects the marker and runs nl_selftest(), which frames +
+# parses RTM_GETLINK / RTM_GETADDR / RTM_GETROUTE dumps.
+if os.environ.get("ENABLE_NETLINK_TEST") == "1":
+    FILES.append(("/etc/netlink-test", b"1\n"))
+
 # pidfd process-management family (pidfd_open/pidfd_send_signal/waitid)
 # self-test. scripts/test_pidfd.sh sets ENABLE_PIDFD_TEST=1 to plant
 # /etc/pidfd-test; init/main.ad at boot:37.pidfd detects the marker and
