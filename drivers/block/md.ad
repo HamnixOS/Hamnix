@@ -43,7 +43,7 @@
 from kernel.block.blk import (
     BlockDeviceOps, register_blockdev, blk_unregister_by_name,
     blk_read_sectors, blk_write_sectors, find_blockdev,
-    blk_capacity_sectors, SECTOR_SIZE,
+    blk_capacity_sectors, blk_set_capacity, SECTOR_SIZE,
 )
 from kernel.printk.printk import (
     printk0, printk1, printk2, printk_set_level,
@@ -159,6 +159,29 @@ class MdArray:
     ppl_slot:      int32
     ppl_head:      uint32          # number of live (un-retired) entries
     ppl_chunk:     uint64          # payload sectors per entry (== chunk_sectors)
+    # ---- Online reshape / grow (capacity expansion) -------------------
+    # md's "reshape" — grow a RAID5 array by adding a member (N -> N+1 data
+    # disks) and RESTRIPE the existing data across the new wider geometry
+    # while preserving every block. The restripe is crash-restartable: a
+    # `reshape_position` checkpoint (in VIRTUAL CHUNKS already converted) is
+    # persisted to a dedicated metadata block device (`reshape_slot`) after
+    # every new-stripe, so an interrupted reshape resumes from the last
+    # committed point instead of restarting (and never re-reading already-
+    # rewritten old data). `reshape_on` is the in-progress flag;
+    # `reshape_old_n` records the member count BEFORE the grow (the geometry
+    # the not-yet-converted tail still lives in); `reshape_new_n` the count
+    # AFTER (the geometry the converted head + every future I/O uses). The
+    # restripe walks `reshape_pos` from 0 to the data-chunk count; below it
+    # data is laid out NEW, at/above it data is still laid out OLD. This is
+    # exactly Linux md's reshape_position split.
+    reshape_on:     uint32
+    reshape_old_n:  uint32
+    reshape_new_n:  uint32
+    reshape_pad:    uint32
+    reshape_slot:   int32          # metadata device for the persisted checkpoint
+    reshape_pad2:   uint32
+    reshape_pos:    uint64         # virtual chunks already converted to NEW
+    reshape_nchunks: uint64        # total data chunks to convert
     members:       Array[8, MdMember]
 
 
@@ -188,6 +211,9 @@ def md_init():
         md_arrays[i].ppl_on    = 0
         md_arrays[i].ppl_slot  = -1
         md_arrays[i].ppl_head  = 0
+        md_arrays[i].reshape_on    = 0
+        md_arrays[i].reshape_slot  = -1
+        md_arrays[i].reshape_pos   = 0
         i = i + 1
     md_inited = 1
     printk0("md: software RAID ready (raid0 stripe + raid1 mirror)\n")
@@ -938,6 +964,16 @@ _MD_R5_CHUNK_BYTES: uint64 = 65536        # 128 sectors * 512
 _md_r5_scratch_a: Array[65536, uint8]     # old data / accumulator
 _md_r5_scratch_b: Array[65536, uint8]     # old parity / surviving chunk
 _md_r5_scratch_c: Array[65536, uint8]     # reconstruction accumulator
+
+# Online-reshape (RAID5 grow) restripe window. One new-stripe at a time is
+# staged here: up to (MD_MAX_MEMBERS-1)=7 data chunks read from the OLD
+# layout, then written into the NEW layout, with the parity computed in
+# _md_rs_par. Sized to a FULL window of 7 default chunks (7*64 KiB) + one
+# parity chunk so a max-width new-stripe never overflows (the BSS-overflow
+# trap). Module-scope per the Adder large-array quirk.
+_md_rs_window: Array[458752, uint8]       # 7 * 65536 — staged new-stripe data
+_md_rs_par:    Array[65536, uint8]        # recomputed parity chunk
+_md_rs_meta:   Array[512, uint8]          # reshape checkpoint metadata sector
 
 
 def _md_xor_into(dst: Ptr[uint8], src: Ptr[uint8], n: uint64):
@@ -2209,6 +2245,9 @@ def md_create_raid5(name: Ptr[char], slots: Ptr[int32], n: uint64,
     md_arrays[idx].ppl_slot      = -1
     md_arrays[idx].ppl_head      = 0
     md_arrays[idx].ppl_chunk     = cs
+    md_arrays[idx].reshape_on    = 0
+    md_arrays[idx].reshape_slot  = -1
+    md_arrays[idx].reshape_pos   = 0
     # Capacity = data disks * per-member span = (N-1) * per_member.
     md_arrays[idx].capacity      = per_member * (n - 1)
     i = 0
@@ -2303,6 +2342,330 @@ def md_raid5_rebuild(name: Ptr[char], member_idx: uint64,
         row = row + 1
     # Recovery complete: clear the Faulty bit.
     dev[0].members[member_idx].failed = 0
+    return 0
+
+
+# =========================================================================
+# Online RAID5 reshape / grow (capacity expansion)
+# =========================================================================
+#
+# Linux md's "reshape" — grow a RAID5 array by adding a member, widening it
+# from N to N+1 disks (N-1 -> N DATA columns per stripe) and RESTRIPING the
+# existing data across the new geometry while preserving every block. The
+# usable capacity grows from (N-1)*per_member to N*per_member.
+#
+# The hard part is that OLD and NEW layouts share the SAME backing devices,
+# so a naive in-place rewrite can clobber not-yet-converted data. We exploit
+# the fact that the new geometry is DENSER (more data columns => fewer chunk
+# ROWS for the same data), so a virtual chunk's NEW chunk-row is always <=
+# its OLD chunk-row. Processing FORWARD, one NEW-stripe at a time, and
+# READING that stripe's old-layout data chunks fully into RAM BEFORE writing
+# the new layout, never overwrites an old data chunk that a later new-stripe
+# still needs (proven exhaustively for N -> N+1). Old PARITY cells may be
+# overwritten — that's fine, parity is recomputed from scratch.
+#
+# CRASH-RESTARTABLE: after every converted new-stripe a `reshape_position`
+# checkpoint (in VIRTUAL CHUNKS already laid out NEW) is persisted to a
+# dedicated metadata block device. A reshape interrupted by a crash resumes
+# from the last committed checkpoint (md_reshape_resume) — converted chunks
+# below the checkpoint are NEW, the tail at/above is still OLD, and we pick
+# up exactly where we left off without re-reading already-rewritten data.
+
+_MD_RESHAPE_MAGIC: uint32 = 0x52455348      # "RESH"
+
+
+def _md_rs_pd_idx(n: uint64, stripe: uint64) -> uint64:
+    # Parity member for `stripe` in an N-member left-symmetric RAID5
+    # (same rule as _md_r5_pd_idx but with an EXPLICIT member count so the
+    # reshape can compute BOTH the old and the new geometry).
+    return (n - 1) - (stripe % n)
+
+
+def _md_rs_data_member(n: uint64, pd: uint64, didx: uint64) -> uint64:
+    return (pd + 1 + didx) % n
+
+
+def _md_rs_read_data_chunk(dev: Ptr[MdArray], n: uint64, vc: uint64,
+                           out: Ptr[uint8]) -> int32:
+    # Read the full DATA chunk for virtual chunk `vc` under an N-member
+    # left-symmetric RAID5 geometry into `out` (chunk_sectors sectors). If
+    # that data member is Faulty, reconstruct it as the XOR of every OTHER
+    # member's chunk at the same row + parity (single-fault recovery).
+    chunk: uint64 = dev[0].chunk_sectors
+    nb: uint64 = chunk * SECTOR_SIZE
+    nd: uint64 = n - 1
+    stripe: uint64 = vc / nd
+    didx:   uint64 = vc % nd
+    pd: uint64 = _md_rs_pd_idx(n, stripe)
+    dm: uint64 = _md_rs_data_member(n, pd, didx)
+    if dev[0].members[dm].failed == 0:
+        mlba: uint64 = stripe * chunk + dev[0].members[dm].under_start
+        return blk_read_sectors(dev[0].members[dm].under_slot, mlba, chunk, out)
+    # Degraded: reconstruct from survivors XOR parity.
+    z: uint64 = 0
+    while z < nb:
+        out[z] = 0
+        z = z + 1
+    m: uint64 = 0
+    while m < n:
+        if m != dm:
+            if dev[0].members[m].failed != 0:
+                return -1               # second fault — unrecoverable
+            mlba: uint64 = stripe * chunk + dev[0].members[m].under_start
+            rc: int32 = blk_read_sectors(dev[0].members[m].under_slot, mlba,
+                                         chunk, cast[Ptr[uint8]](&_md_rs_par[0]))
+            if rc != 0:
+                return rc
+            _md_xor_into(out, cast[Ptr[uint8]](&_md_rs_par[0]), nb)
+        m = m + 1
+    return 0
+
+
+def _md_rs_checkpoint_save(dev: Ptr[MdArray], pos: uint64) -> int32:
+    # Persist the reshape checkpoint (magic + old_n + new_n + nchunks + pos)
+    # to sector 0 of the reshape metadata device, so an interrupted reshape
+    # resumes from `pos`. Returns 0 / -1.
+    if dev[0].reshape_slot < 0:
+        return -1
+    p: Ptr[uint8] = cast[Ptr[uint8]](&_md_rs_meta[0])
+    z: uint64 = 0
+    while z < 512:
+        p[z] = 0
+        z = z + 1
+    _md_u32_put(p, 0, _MD_RESHAPE_MAGIC)
+    _md_u32_put(p, 4, dev[0].reshape_old_n)
+    _md_u32_put(p, 8, dev[0].reshape_new_n)
+    _md_u32_put(p, 12, cast[uint32](dev[0].reshape_nchunks))
+    _md_u32_put(p, 16, cast[uint32](pos))
+    return blk_write_sectors(dev[0].reshape_slot, 0, 1, p)
+
+
+def _md_rs_checkpoint_load(dev: Ptr[MdArray]) -> int32:
+    # Read the persisted checkpoint into the array's reshape state. Returns
+    # the saved `pos` (>=0) on a valid header, or -1 if none / bad magic.
+    if dev[0].reshape_slot < 0:
+        return -1
+    p: Ptr[uint8] = cast[Ptr[uint8]](&_md_rs_meta[0])
+    rc: int32 = blk_read_sectors(dev[0].reshape_slot, 0, 1, p)
+    if rc != 0:
+        return -1
+    if _md_u32_get(p, 0) != _MD_RESHAPE_MAGIC:
+        return -1
+    dev[0].reshape_old_n  = _md_u32_get(p, 4)
+    dev[0].reshape_new_n  = _md_u32_get(p, 8)
+    dev[0].reshape_nchunks = cast[uint64](_md_u32_get(p, 12))
+    pos: uint64 = cast[uint64](_md_u32_get(p, 16))
+    dev[0].reshape_pos = pos
+    return cast[int32](pos)
+
+
+def _md_rs_convert_stripe(dev: Ptr[MdArray], new_stripe: uint64) -> int32:
+    # Convert one NEW-geometry stripe: read its data virtual chunks from the
+    # OLD layout into the window buffer, then write them into the NEW layout
+    # and write the recomputed parity. Returns 0 / -1. Reads happen BEFORE
+    # any write so a not-yet-converted old data chunk is never clobbered.
+    old_n: uint64 = cast[uint64](dev[0].reshape_old_n)
+    new_n: uint64 = cast[uint64](dev[0].reshape_new_n)
+    chunk: uint64 = dev[0].chunk_sectors
+    nb: uint64 = chunk * SECTOR_SIZE
+    new_nd: uint64 = new_n - 1
+    nchunks: uint64 = dev[0].reshape_nchunks
+    # Stage every (existing) data chunk of this new-stripe from OLD geometry.
+    d: uint64 = 0
+    while d < new_nd:
+        vc: uint64 = new_stripe * new_nd + d
+        wptr: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](&_md_rs_window[0]) + d * nb)
+        if vc < nchunks:
+            rc: int32 = _md_rs_read_data_chunk(dev, old_n, vc, wptr)
+            if rc != 0:
+                return rc
+        else:
+            # Past the end of real data (the last new-stripe may be partial):
+            # zero-fill so parity is still well-defined for whole rows.
+            z: uint64 = 0
+            while z < nb:
+                wptr[z] = 0
+                z = z + 1
+        d = d + 1
+    # Recompute parity = XOR of all staged data chunks.
+    pp: Ptr[uint8] = cast[Ptr[uint8]](&_md_rs_par[0])
+    z2: uint64 = 0
+    while z2 < nb:
+        pp[z2] = 0
+        z2 = z2 + 1
+    d = 0
+    while d < new_nd:
+        wptr2: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](&_md_rs_window[0]) + d * nb)
+        _md_xor_into(pp, wptr2, nb)
+        d = d + 1
+    # Now WRITE the new layout: data chunks then the parity chunk.
+    pd: uint64 = _md_rs_pd_idx(new_n, new_stripe)
+    d = 0
+    while d < new_nd:
+        vc: uint64 = new_stripe * new_nd + d
+        if vc < nchunks:
+            dm: uint64 = _md_rs_data_member(new_n, pd, d)
+            mlba: uint64 = new_stripe * chunk + dev[0].members[dm].under_start
+            wptr3: Ptr[uint8] = cast[Ptr[uint8]](
+                cast[uint64](&_md_rs_window[0]) + d * nb)
+            wrc: int32 = blk_write_sectors(dev[0].members[dm].under_slot,
+                                           mlba, chunk, wptr3)
+            if wrc != 0:
+                return wrc
+        d = d + 1
+    plba: uint64 = new_stripe * chunk + dev[0].members[pd].under_start
+    return blk_write_sectors(dev[0].members[pd].under_slot, plba, chunk, pp)
+
+
+def _md_rs_run_loop(dev: Ptr[MdArray]) -> int32:
+    # Drive the restripe from the current checkpoint to completion, one
+    # new-stripe at a time, persisting the checkpoint after each. The
+    # checkpoint advances in VIRTUAL CHUNKS so a resume re-enters at the
+    # right new-stripe. Returns 0 / -1.
+    new_nd: uint64 = cast[uint64](dev[0].reshape_new_n) - 1
+    nchunks: uint64 = dev[0].reshape_nchunks
+    # Resume at the new-stripe containing reshape_pos (pos is a multiple of
+    # new_nd because we only ever checkpoint on a stripe boundary).
+    new_stripe: uint64 = dev[0].reshape_pos / new_nd
+    n_new_stripes: uint64 = (nchunks + new_nd - 1) / new_nd
+    while new_stripe < n_new_stripes:
+        rc: int32 = _md_rs_convert_stripe(dev, new_stripe)
+        if rc != 0:
+            return rc
+        new_stripe = new_stripe + 1
+        npos: uint64 = new_stripe * new_nd
+        if npos > nchunks:
+            npos = nchunks
+        dev[0].reshape_pos = npos
+        if _md_rs_checkpoint_save(dev, npos) != 0:
+            return -1
+    return 0
+
+
+def md_reshape_grow(name: Ptr[char], new_slot: int32,
+                    meta_slot: int32) -> int32:
+    # Grow RAID5 array `name` by adding member `new_slot`, restriping the
+    # existing data across the wider N+1 geometry (mdadm --grow
+    # --raid-devices=N+1 --add). `meta_slot` is a small dedicated block
+    # device that holds the crash-restartable reshape checkpoint. On success
+    # the array has one more member, capacity grows by per_member sectors,
+    # and EVERY pre-existing block reads back byte-identical through the new
+    # geometry. Returns 0 on success, negative on error.
+    if new_slot < 0 or meta_slot < 0:
+        return -1
+    slot: int32 = find_blockdev(name)
+    if slot < 0:
+        return -1
+    ai: uint64 = 0
+    found: int32 = -1
+    while ai < MD_MAX_ARRAYS:
+        if md_arrays[ai].used != 0 and md_arrays[ai].self_slot == slot:
+            found = cast[int32](ai)
+            ai = MD_MAX_ARRAYS
+        else:
+            ai = ai + 1
+    if found < 0:
+        return -1
+    idx: uint64 = cast[uint64](found)
+    dev: Ptr[MdArray] = &md_arrays[idx]
+    if dev[0].level != MD_LEVEL_RAID5:
+        return -2
+    old_n: uint64 = cast[uint64](dev[0].n_members)
+    if old_n + 1 > MD_MAX_MEMBERS:
+        return -3
+    # No grow while degraded — the restripe reconstructs missing data once,
+    # but refuse to widen a degraded array (mdadm requires a clean array).
+    f: uint64 = 0
+    while f < old_n:
+        if dev[0].members[f].failed != 0:
+            printk0("md: reshape blocked — array degraded\n")
+            return -4
+        f = f + 1
+    chunk: uint64 = dev[0].chunk_sectors
+    per_member: uint64 = dev[0].members[0].usable
+    new_cap: uint64 = blk_capacity_sectors(new_slot)
+    if new_cap < per_member:
+        printk0("md: reshape new member too small\n")
+        return -5
+    new_n: uint64 = old_n + 1
+    # Install the new member (clean, no bad blocks) at the next slot.
+    dev[0].members[old_n].under_slot  = new_slot
+    dev[0].members[old_n].failed      = 0
+    dev[0].members[old_n].bb_n        = 0
+    dev[0].members[old_n].under_start = 0
+    dev[0].members[old_n].usable      = per_member
+    # Set up reshape state. The number of data chunks to convert is the OLD
+    # data capacity in chunks ((old_n-1) data columns * rows-per-member).
+    rows: uint64 = per_member / chunk
+    dev[0].reshape_old_n   = cast[uint32](old_n)
+    dev[0].reshape_new_n   = cast[uint32](new_n)
+    dev[0].reshape_nchunks = (old_n - 1) * rows
+    dev[0].reshape_slot    = meta_slot
+    dev[0].reshape_pos     = 0
+    dev[0].reshape_on      = 1
+    if _md_rs_checkpoint_save(dev, 0) != 0:
+        dev[0].reshape_on = 0
+        return -6
+    rc: int32 = _md_rs_run_loop(dev)
+    if rc != 0:
+        printk0("md: reshape restripe failed\n")
+        return -7
+    # Restripe complete: commit the new geometry & capacity.
+    dev[0].n_members = cast[uint32](new_n)
+    dev[0].capacity  = per_member * (new_n - 1)
+    if blk_set_capacity(dev[0].self_slot, dev[0].capacity) != 0:
+        return -8
+    dev[0].reshape_on = 0
+    return 0
+
+
+def md_reshape_resume(name: Ptr[char], meta_slot: int32) -> int32:
+    # Resume a crash-interrupted reshape of RAID5 array `name` from the
+    # persisted checkpoint on `meta_slot`. The caller must have already
+    # re-assembled the array with the FULL (new) member set in place but
+    # n_members still at the OLD count (the tail is still OLD-laid-out). This
+    # reloads old_n/new_n/nchunks/pos from the checkpoint, drives the restripe
+    # to completion, and commits the new geometry. Returns 0 / negative.
+    if meta_slot < 0:
+        return -1
+    slot: int32 = find_blockdev(name)
+    if slot < 0:
+        return -1
+    ai: uint64 = 0
+    found: int32 = -1
+    while ai < MD_MAX_ARRAYS:
+        if md_arrays[ai].used != 0 and md_arrays[ai].self_slot == slot:
+            found = cast[int32](ai)
+            ai = MD_MAX_ARRAYS
+        else:
+            ai = ai + 1
+    if found < 0:
+        return -1
+    idx: uint64 = cast[uint64](found)
+    dev: Ptr[MdArray] = &md_arrays[idx]
+    if dev[0].level != MD_LEVEL_RAID5:
+        return -2
+    dev[0].reshape_slot = meta_slot
+    pos: int32 = _md_rs_checkpoint_load(dev)
+    if pos < 0:
+        return -3
+    new_n: uint64 = cast[uint64](dev[0].reshape_new_n)
+    # Make sure the new member is present (the resume caller re-attached it).
+    if new_n > MD_MAX_MEMBERS:
+        return -4
+    dev[0].reshape_on = 1
+    rc: int32 = _md_rs_run_loop(dev)
+    if rc != 0:
+        return -5
+    chunk: uint64 = dev[0].chunk_sectors
+    per_member: uint64 = dev[0].members[0].usable
+    dev[0].n_members = cast[uint32](new_n)
+    dev[0].capacity  = per_member * (new_n - 1)
+    if blk_set_capacity(dev[0].self_slot, dev[0].capacity) != 0:
+        return -6
+    dev[0].reshape_on = 0
     return 0
 
 
@@ -4224,3 +4587,266 @@ def _md_badblocks_test(b0: int32, b1: int32, b2: int32) -> int32:
     md_remove("mdbb5")
     _md_emerg0("[md] badblocks PASS\n")
     return 1
+
+
+# =========================================================================
+# Online RAID5 reshape / grow self-test
+# =========================================================================
+#
+# Gated boot self-test (init/main.ad boot:37.mdreshape, planted
+# /etc/mdreshape-test by build_initramfs.py when ENABLE_MDRESHAPE_TEST=1).
+# It runs against the dedicated in-kernel backing ramdisks (mdback0..4) plus
+# the journal ramdisk (mdjrnl0) as the reshape checkpoint metadata device, so
+# it never touches ram0's FAT image and is fully deterministic.
+#
+# It PROVES a REAL online RAID5 grow:
+#   1. Build a 3-member RAID5 (chunk=4, data capacity 512 sectors) and write
+#      a KNOWN pattern across EVERY data sector (multiple stripes).
+#   2. Snapshot the whole 512-sector array image.
+#   3. Grow to 4 members (add mdback3) with md_reshape_grow — a real restripe
+#      walking a persisted checkpoint from 0 to the data-chunk count, reading
+#      OLD-geometry stripes and rewriting them in the NEW geometry.
+#   4. Verify the usable capacity GREW from 512 to 768 sectors.
+#   5. Verify EVERY original sector reads back BYTE-IDENTICAL through the new
+#      4-member geometry (the data was preserved across the restripe).
+#   6. Verify the newly-gained capacity (sectors 512..767) is usable: write a
+#      pattern there and read it back through the array.
+#   7. Verify CRASH-RESTARTABILITY: re-run the same grow but interrupt it
+#      mid-restripe (stop the loop at a checkpoint), then md_reshape_resume
+#      from the persisted checkpoint and confirm the data still verifies.
+
+# Reshape self-test scratch. The test array's data capacity is 512 sectors
+# = 256 KiB; size the snapshot + pattern + grown-region buffers to a FULL
+# array image so a whole-array read/compare never overflows (the BSS-
+# overflow trap). Module-scope per the Adder large-array quirk.
+_md_rt_pat:   Array[262144, uint8]   # 512 sectors written across the array
+_md_rt_snap:  Array[262144, uint8]   # pre-reshape full-array snapshot
+_md_rt_read:  Array[393216, uint8]   # 768 sectors readback (grown capacity)
+_md_rt_grow:  Array[131072, uint8]   # 256 sectors written to the grown tail
+_md_slotsrt:  Array[8, int32]
+
+
+def _md_reshape_one(b0: int32, b1: int32, b2: int32, b3: int32,
+                    bmeta: int32) -> int32:
+    # Core grow + verify. Builds the 3-member array, writes a known image,
+    # grows to 4 members, and verifies capacity growth + byte-identical
+    # readback + grown-tail usability. Returns 1 PASS / 0 FAIL.
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store0[0]))
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store1[0]))
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store2[0]))
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store3[0]))
+    _md_zero_store(cast[Ptr[uint8]](&_md_jrnl_store0[0]))
+
+    _md_slotsrt[0] = b0
+    _md_slotsrt[1] = b1
+    _md_slotsrt[2] = b2
+    r5: int32 = md_create_raid5("mdrs", &_md_slotsrt[0], 3, 4)
+    if r5 < 0:
+        _md_emerg1("[mdreshape] FAIL: md_create_raid5 rc=%d\n",
+                   cast[uint64](cast[int64](r5)))
+        return 0
+    cap0: uint64 = blk_capacity_sectors(r5)
+    _md_emerg1("[mdreshape] raid5 (3 members) capacity=%d sectors\n", cap0)
+    if cap0 != 512:
+        _md_emerg0("[mdreshape] FAIL: initial capacity wrong (want 512)\n")
+        md_remove("mdrs")
+        return 0
+
+    # ---- Write a known pattern across EVERY data sector (512 sectors). ----
+    _md_fill(&_md_rt_pat[0], 512 * SECTOR_SIZE, 919)
+    if blk_write_sectors(r5, 0, 512, &_md_rt_pat[0]) != 0:
+        _md_emerg0("[mdreshape] FAIL: write full image\n")
+        md_remove("mdrs")
+        return 0
+    # Snapshot the whole array image straight back (sanity, pre-reshape).
+    if blk_read_sectors(r5, 0, 512, &_md_rt_snap[0]) != 0:
+        _md_emerg0("[mdreshape] FAIL: snapshot read\n")
+        md_remove("mdrs")
+        return 0
+    if _md_buf_eq(&_md_rt_pat[0], &_md_rt_snap[0], 512 * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdreshape] FAIL: pre-reshape image mismatch\n")
+        md_remove("mdrs")
+        return 0
+    _md_emerg0("[mdreshape] wrote+verified full 512s image (3 members) OK\n")
+
+    # ---- GROW to 4 members (add mdback3); restripe across new geometry. ----
+    rc: int32 = md_reshape_grow("mdrs", b3, bmeta)
+    if rc != 0:
+        _md_emerg1("[mdreshape] FAIL: md_reshape_grow rc=%d\n",
+                   cast[uint64](cast[int64](rc)))
+        md_remove("mdrs")
+        return 0
+    _md_emerg0("[mdreshape] grow 3->4 members restripe complete OK\n")
+
+    # ---- Capacity must have GROWN to 3 * 256 = 768 sectors. ----
+    cap1: uint64 = blk_capacity_sectors(r5)
+    _md_emerg1("[mdreshape] raid5 (4 members) capacity=%d sectors\n", cap1)
+    if cap1 != 768:
+        _md_emerg0("[mdreshape] FAIL: grown capacity wrong (want 768)\n")
+        md_remove("mdrs")
+        return 0
+    _md_emerg0("[mdreshape] capacity grew 512 -> 768 sectors OK\n")
+
+    # ---- Every original sector must read back BYTE-IDENTICAL. ----
+    if blk_read_sectors(r5, 0, 512, &_md_rt_read[0]) != 0:
+        _md_emerg0("[mdreshape] FAIL: post-reshape read\n")
+        md_remove("mdrs")
+        return 0
+    if _md_buf_eq(&_md_rt_pat[0], &_md_rt_read[0], 512 * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdreshape] FAIL: data NOT preserved across reshape\n")
+        md_remove("mdrs")
+        return 0
+    _md_emerg0("[md] PASS mdreshape-data-preserved\n")
+
+    # ---- The newly-gained tail (512..767) must be usable. ----
+    _md_fill(&_md_rt_grow[0], 256 * SECTOR_SIZE, 1313)
+    if blk_write_sectors(r5, 512, 256, &_md_rt_grow[0]) != 0:
+        _md_emerg0("[mdreshape] FAIL: write grown tail\n")
+        md_remove("mdrs")
+        return 0
+    if blk_read_sectors(r5, 512, 256, &_md_rt_read[0]) != 0:
+        _md_emerg0("[mdreshape] FAIL: read grown tail\n")
+        md_remove("mdrs")
+        return 0
+    if _md_buf_eq(&_md_rt_grow[0], &_md_rt_read[0], 256 * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdreshape] FAIL: grown tail mismatch\n")
+        md_remove("mdrs")
+        return 0
+    # And the original head is STILL intact after using the tail.
+    if blk_read_sectors(r5, 0, 512, &_md_rt_read[0]) != 0:
+        _md_emerg0("[mdreshape] FAIL: head re-read after tail write\n")
+        md_remove("mdrs")
+        return 0
+    if _md_buf_eq(&_md_rt_pat[0], &_md_rt_read[0], 512 * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdreshape] FAIL: head corrupted by tail write\n")
+        md_remove("mdrs")
+        return 0
+    _md_emerg0("[md] PASS mdreshape-grown-capacity-usable\n")
+
+    md_remove("mdrs")
+    return 1
+
+
+def _md_reshape_crash_restart(b0: int32, b1: int32, b2: int32, b3: int32,
+                              bmeta: int32) -> int32:
+    # Crash-restartability: start a grow, run only PART of the restripe (stop
+    # at a mid checkpoint), then md_reshape_resume from the persisted
+    # checkpoint and verify the data still reads back byte-identical. This
+    # proves the checkpoint truly drives resume (not a single atomic pass).
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store0[0]))
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store1[0]))
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store2[0]))
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store3[0]))
+    _md_zero_store(cast[Ptr[uint8]](&_md_jrnl_store0[0]))
+
+    _md_slotsrt[0] = b0
+    _md_slotsrt[1] = b1
+    _md_slotsrt[2] = b2
+    r5: int32 = md_create_raid5("mdrs2", &_md_slotsrt[0], 3, 4)
+    if r5 < 0:
+        _md_emerg0("[mdreshape] FAIL: crash-test create\n")
+        return 0
+    _md_fill(&_md_rt_pat[0], 512 * SECTOR_SIZE, 757)
+    if blk_write_sectors(r5, 0, 512, &_md_rt_pat[0]) != 0:
+        _md_emerg0("[mdreshape] FAIL: crash-test write\n")
+        md_remove("mdrs2")
+        return 0
+
+    # Resolve the array and set up reshape state by hand so we can run the
+    # restripe loop PARTIALLY (simulating a crash partway through).
+    dev: Ptr[MdArray] = _md_dev_by_name("mdrs2")
+    if cast[uint64](dev) == 0:
+        _md_emerg0("[mdreshape] FAIL: crash-test resolve\n")
+        md_remove("mdrs2")
+        return 0
+    chunk: uint64 = dev[0].chunk_sectors
+    per_member: uint64 = dev[0].members[0].usable
+    rows: uint64 = per_member / chunk
+    # Install the new member (mdback3) at slot 3.
+    dev[0].members[3].under_slot  = b3
+    dev[0].members[3].failed      = 0
+    dev[0].members[3].bb_n        = 0
+    dev[0].members[3].under_start = 0
+    dev[0].members[3].usable      = per_member
+    dev[0].reshape_old_n   = 3
+    dev[0].reshape_new_n   = 4
+    dev[0].reshape_nchunks = 2 * rows          # (old_n-1) * rows
+    dev[0].reshape_slot    = bmeta
+    dev[0].reshape_pos     = 0
+    dev[0].reshape_on      = 1
+    if _md_rs_checkpoint_save(dev, 0) != 0:
+        _md_emerg0("[mdreshape] FAIL: crash-test checkpoint init\n")
+        md_remove("mdrs2")
+        return 0
+
+    # Convert only the FIRST new-stripe, then persist its checkpoint and STOP
+    # (the simulated crash). new_nd = 3 data chunks per new-stripe.
+    if _md_rs_convert_stripe(dev, 0) != 0:
+        _md_emerg0("[mdreshape] FAIL: crash-test partial convert\n")
+        md_remove("mdrs2")
+        return 0
+    dev[0].reshape_pos = 3                       # one new-stripe done (3 vc)
+    if _md_rs_checkpoint_save(dev, 3) != 0:
+        _md_emerg0("[mdreshape] FAIL: crash-test partial checkpoint\n")
+        md_remove("mdrs2")
+        return 0
+    # Simulate a reboot: wipe ALL in-RAM reshape state so resume MUST come
+    # from the persisted checkpoint alone.
+    dev[0].reshape_on      = 0
+    dev[0].reshape_pos     = 0
+    dev[0].reshape_old_n   = 0
+    dev[0].reshape_new_n   = 0
+    dev[0].reshape_nchunks = 0
+    dev[0].reshape_slot    = -1
+    _md_emerg0("[mdreshape] crash sim: 1 new-stripe converted, state wiped OK\n")
+
+    # Resume from the persisted checkpoint.
+    rrc: int32 = md_reshape_resume("mdrs2", bmeta)
+    if rrc != 0:
+        _md_emerg1("[mdreshape] FAIL: md_reshape_resume rc=%d\n",
+                   cast[uint64](cast[int64](rrc)))
+        md_remove("mdrs2")
+        return 0
+    if blk_capacity_sectors(r5) != 768:
+        _md_emerg0("[mdreshape] FAIL: crash-test capacity after resume\n")
+        md_remove("mdrs2")
+        return 0
+    if blk_read_sectors(r5, 0, 512, &_md_rt_read[0]) != 0:
+        _md_emerg0("[mdreshape] FAIL: crash-test post-resume read\n")
+        md_remove("mdrs2")
+        return 0
+    if _md_buf_eq(&_md_rt_pat[0], &_md_rt_read[0], 512 * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdreshape] FAIL: data lost across crash+resume\n")
+        md_remove("mdrs2")
+        return 0
+    _md_emerg0("[md] PASS mdreshape-crash-restartable\n")
+    md_remove("mdrs2")
+    return 1
+
+
+def md_reshape_selftest() -> int32:
+    # Returns 1 on PASS, 0 on FAIL. Prints [mdreshape] marker lines.
+    _md_emerg0("[mdreshape] self-test start\n")
+    md_init()
+
+    b0: int32 = _md_back_register(0)
+    b1: int32 = _md_back_register(1)
+    b2: int32 = _md_back_register(2)
+    b3: int32 = _md_back_register(3)
+    bmeta: int32 = _md_jrnl_register()
+    if b0 < 0 or b1 < 0 or b2 < 0 or b3 < 0 or bmeta < 0:
+        _md_emerg0("[mdreshape] FAIL: backing register\n")
+        _md_emerg0("[mdreshape] FAIL\n")
+        return 0
+
+    ok: int32 = 1
+    if _md_reshape_one(b0, b1, b2, b3, bmeta) != 1:
+        ok = 0
+    if _md_reshape_crash_restart(b0, b1, b2, b3, bmeta) != 1:
+        ok = 0
+
+    if ok == 1:
+        _md_emerg0("[mdreshape] PASS\n")
+        return 1
+    _md_emerg0("[mdreshape] FAIL\n")
+    return 0

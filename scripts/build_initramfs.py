@@ -2189,6 +2189,20 @@ if os.environ.get("ENABLE_DEVMAPPER_TEST") == "1":
 if os.environ.get("ENABLE_MDRAID_TEST") == "1":
     FILES.append(("/etc/mdraid-test", b"1\n"))
 
+# Native software-RAID (md) ONLINE RESHAPE / GROW self-test.
+# scripts/test_mdreshape.sh sets ENABLE_MDRESHAPE_TEST=1 to plant
+# /etc/mdreshape-test; init/main.ad's boot:37.mdreshape gate then runs
+# md_reshape_selftest() (drivers/block/md.ad), which builds a 3-member RAID5,
+# writes a known image across every data sector, GROWS it to 4 members with a
+# real crash-restartable restripe (md_reshape_grow), and verifies the usable
+# capacity grew (512 -> 768 sectors), every original block reads back
+# byte-identical through the new geometry, the grown tail is usable, and an
+# interrupted restripe resumes from the persisted checkpoint. Prints
+# "[mdreshape] PASS" / "[mdreshape] FAIL". Default boots ship no marker so
+# the md reshape self-test is a no-op everywhere else.
+if os.environ.get("ENABLE_MDRESHAPE_TEST") == "1":
+    FILES.append(("/etc/mdreshape-test", b"1\n"))
+
 # Native VXLAN (RFC 7348) encap/decap self-test. scripts/test_vxlan.sh sets
 # ENABLE_VXLAN_TEST=1 to plant /etc/vxlan-test; init/main.ad's boot:37.vxlan
 # gate then runs vxlan_selftest() (drivers/net/vxlan.ad), a pure in-memory
