@@ -48,6 +48,11 @@ from fs.jbd2 import (
     jbd2_txn_skip_checkpoint, jbd2_txn_abort, jbd2_txn_commit_nocommitblk,
     jbd2_super_magic_read,
 )
+# RO_COMPAT_METADATA_CSUM (#endgame): crc32c integrity for ext4
+# metadata. crc32c_update is the running-register primitive ext4 chains
+# for seeded per-object checksums; crc32c is the finalized form whose
+# KAT (crc32c("123456789")==0xE3069283) self-checks the polynomial.
+from fs.crc32c import crc32c, crc32c_update, crc32c_selftest
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
@@ -85,6 +90,19 @@ ext4_gdt_block:       uint64 = 0
 # cover the boot area, and we need sectors 2..3 for the sb itself.
 ext4_sb_buf: Array[1024, uint8]
 
+# RO_COMPAT_METADATA_CSUM mount state. ext4_metadata_csum is 1 once
+# the superblock's s_feature_ro_compat declares the feature AND the
+# crc32c KAT passed at mount; while it is 0 every checksum path is a
+# no-op (a filesystem WITHOUT the feature is read/written exactly as
+# before). ext4_csum_seed is the per-filesystem seed: crc32c_update(
+# ~0, s_uuid, 16) — the running register that every per-object inode /
+# dir-block / extent-block checksum chains its object identifiers onto.
+# s_uuid lives at superblock offset 0x68 (16 bytes).
+ext4_metadata_csum: int32  = 0
+ext4_csum_seed:     uint32 = 0
+EXT4_SB_OFF_UUID:   uint64 = 0x68
+EXT4_SB_OFF_CHECKSUM: uint64 = 0x3FC      # s_checksum, last u32 of the 1 KiB sb
+
 # #149: journal (JBD2) mount state. s_feature_compat HAS_JOURNAL (0x4)
 # and s_journal_inum (sb offset 0xE0) tell us whether a journal exists
 # and which inode holds it. ext4_has_journal is 1 once jbd2_attach
@@ -116,6 +134,295 @@ def _ext4_read_u32(p: Ptr[uint8]) -> uint32:
             | (cast[uint32](p[1]) << 8)
             | (cast[uint32](p[2]) << 16)
             | (cast[uint32](p[3]) << 24))
+
+
+# --- metadata_csum (RO_COMPAT_METADATA_CSUM) ----------------------
+#
+# When the feature is set, ext4 protects each metadata object with a
+# crc32c seeded by the filesystem UUID (and, per object, the inode
+# number + i_generation). The on-disk register is the RAW running CRC
+# (no final xor). These helpers verify on read and recompute on write.
+# All of them are no-ops when ext4_metadata_csum == 0, so a filesystem
+# without the feature is untouched.
+
+
+def _ext4_inode_csum(inode_buf: Ptr[uint8], inum: uint64) -> uint32:
+    # Compute the crc32c an inode SHOULD carry. The seed chains the
+    # fs UUID seed with the inode number and i_generation (both LE32),
+    # then folds the entire inode with its checksum fields zeroed.
+    #   l_i_checksum_lo  u16 @ 0x7C (osd2.linux2)
+    #   i_checksum_hi    u16 @ 0x82 (present only when inode_size > 128
+    #                                AND i_extra_isize covers 0x82)
+    gen: uint32 = _ext4_read_u32(cast[Ptr[uint8]](cast[uint64](inode_buf)
+                                                  + 0x64))
+    inum_le: Array[4, uint8]
+    _ext4_write_u32(&inum_le[0], cast[uint32](inum))
+    gen_le: Array[4, uint8]
+    _ext4_write_u32(&gen_le[0], gen)
+    seed: uint32 = ext4_csum_seed
+    seed = crc32c_update(seed, &inum_le[0], 4)
+    seed = crc32c_update(seed, &gen_le[0], 4)
+    # Fold the inode with checksum fields temporarily zeroed. Save +
+    # restore so the caller's buffer is unperturbed.
+    save_lo: uint16 = _ext4_read_u16(cast[Ptr[uint8]](cast[uint64](inode_buf)
+                                                      + 0x7C))
+    has_hi: int32 = 0
+    save_hi: uint16 = 0
+    if ext4_inode_size > 128:
+        extra: uint16 = _ext4_read_u16(cast[Ptr[uint8]](
+            cast[uint64](inode_buf) + 0x80))
+        # i_checksum_hi at 0x82 is the 3rd extra-isize word; present
+        # when extra_isize reaches it (offset 0x82 - 0x80 + 2 = 4).
+        if cast[uint64](extra) >= 4:
+            has_hi = 1
+            save_hi = _ext4_read_u16(cast[Ptr[uint8]](
+                cast[uint64](inode_buf) + 0x82))
+    _ext4_write_u16(cast[Ptr[uint8]](cast[uint64](inode_buf) + 0x7C), 0)
+    if has_hi != 0:
+        _ext4_write_u16(cast[Ptr[uint8]](cast[uint64](inode_buf) + 0x82), 0)
+    c: uint32 = crc32c_update(seed, inode_buf, ext4_inode_size)
+    _ext4_write_u16(cast[Ptr[uint8]](cast[uint64](inode_buf) + 0x7C), save_lo)
+    if has_hi != 0:
+        _ext4_write_u16(cast[Ptr[uint8]](cast[uint64](inode_buf) + 0x82),
+                        save_hi)
+    return c
+
+
+def _ext4_inode_stored_csum(inode_buf: Ptr[uint8]) -> uint32:
+    # Read the stored checksum out of l_i_checksum_lo (+hi). When the
+    # hi half is absent only the low 16 bits are meaningful.
+    lo: uint16 = _ext4_read_u16(cast[Ptr[uint8]](cast[uint64](inode_buf)
+                                                 + 0x7C))
+    hi: uint16 = 0
+    if ext4_inode_size > 128:
+        extra: uint16 = _ext4_read_u16(cast[Ptr[uint8]](
+            cast[uint64](inode_buf) + 0x80))
+        if cast[uint64](extra) >= 4:
+            hi = _ext4_read_u16(cast[Ptr[uint8]](cast[uint64](inode_buf)
+                                                 + 0x82))
+    return (cast[uint32](hi) << 16) | cast[uint32](lo)
+
+
+def _ext4_inode_csum_set(inode_buf: Ptr[uint8], inum: uint64):
+    # Recompute and store the inode checksum. No-op unless the feature
+    # is on. Called on every inode write so a write→re-read validates.
+    if ext4_metadata_csum == 0:
+        return
+    c: uint32 = _ext4_inode_csum(inode_buf, inum)
+    _ext4_write_u16(cast[Ptr[uint8]](cast[uint64](inode_buf) + 0x7C),
+                    cast[uint16](c & 0xFFFF))
+    if ext4_inode_size > 128:
+        extra: uint16 = _ext4_read_u16(cast[Ptr[uint8]](
+            cast[uint64](inode_buf) + 0x80))
+        if cast[uint64](extra) >= 4:
+            _ext4_write_u16(cast[Ptr[uint8]](cast[uint64](inode_buf) + 0x82),
+                            cast[uint16]((c >> 16) & 0xFFFF))
+
+
+def ext4_inode_csum_ok(inode_buf: Ptr[uint8], inum: uint64) -> int32:
+    # 1 if the inode's stored checksum matches (or feature off / hi
+    # absent makes a half-width compare). Returns 0 on mismatch.
+    if ext4_metadata_csum == 0:
+        return 1
+    want: uint32 = _ext4_inode_csum(inode_buf, inum)
+    got:  uint32 = _ext4_inode_stored_csum(inode_buf)
+    # When inode_size==128 only the low 16 bits exist on disk.
+    if ext4_inode_size <= 128:
+        if (want & 0xFFFF) == (got & 0xFFFF):
+            return 1
+        return 0
+    if want == got:
+        return 1
+    return 0
+
+
+def _ext4_dirblock_csum_seed(dir_inum: uint64, dir_gen: uint32) -> uint32:
+    seed: uint32 = ext4_csum_seed
+    inum_le: Array[4, uint8]
+    _ext4_write_u32(&inum_le[0], cast[uint32](dir_inum))
+    gen_le: Array[4, uint8]
+    _ext4_write_u32(&gen_le[0], dir_gen)
+    seed = crc32c_update(seed, &inum_le[0], 4)
+    seed = crc32c_update(seed, &gen_le[0], 4)
+    return seed
+
+
+def _ext4_dirblock_csum(block_buf: Ptr[uint8], dir_inum: uint64,
+                        dir_gen: uint32) -> uint32:
+    # crc32c over the directory block EXCLUDING its 12-byte
+    # ext4_dir_entry_tail, seeded by uuid+inum+generation. The tail's
+    # det_checksum (last u32 of the block) stores this value.
+    seed: uint32 = _ext4_dirblock_csum_seed(dir_inum, dir_gen)
+    return crc32c_update(seed, block_buf, ext4_block_size - 12)
+
+
+def ext4_dirblock_csum_ok(block_buf: Ptr[uint8], dir_inum: uint64,
+                          dir_gen: uint32) -> int32:
+    # Verify a directory leaf block that carries a dir_entry_tail. A
+    # tail is a fake entry at block_size-12 with inode==0, rec_len==12,
+    # name_len==0, file_type==0xDE; its last u32 is det_checksum. Blocks
+    # without a recognisable tail (e.g. htree index blocks) are skipped
+    # (return 1) — only verify what actually carries a checksum.
+    if ext4_metadata_csum == 0:
+        return 1
+    tail: uint64 = cast[uint64](block_buf) + ext4_block_size - 12
+    t_inode:   uint32 = _ext4_read_u32(cast[Ptr[uint8]](tail + 0))
+    t_rec_len: uint16 = _ext4_read_u16(cast[Ptr[uint8]](tail + 4))
+    t_ft:      uint8  = cast[Ptr[uint8]](tail + 7)[0]
+    if t_inode != 0 or t_rec_len != 12 or t_ft != 0xDE:
+        return 1                                # not a checksummed tail
+    stored: uint32 = _ext4_read_u32(cast[Ptr[uint8]](tail + 8))
+    if _ext4_dirblock_csum(block_buf, dir_inum, dir_gen) == stored:
+        return 1
+    return 0
+
+
+def ext4_dirblock_csum_set(block_buf: Ptr[uint8], dir_inum: uint64,
+                           dir_gen: uint32):
+    # Stamp the dir_entry_tail's det_checksum. No-op unless the feature
+    # is on and the block already carries a recognisable tail.
+    if ext4_metadata_csum == 0:
+        return
+    tail: uint64 = cast[uint64](block_buf) + ext4_block_size - 12
+    t_rec_len: uint16 = _ext4_read_u16(cast[Ptr[uint8]](tail + 4))
+    t_ft:      uint8  = cast[Ptr[uint8]](tail + 7)[0]
+    if t_rec_len != 12 or t_ft != 0xDE:
+        return
+    c: uint32 = _ext4_dirblock_csum(block_buf, dir_inum, dir_gen)
+    _ext4_write_u32(cast[Ptr[uint8]](tail + 8), c)
+
+
+def _ext4_dirblock_stamp_in_buf(parent_inum: uint64, parent_gen: uint32):
+    # Restamp the dir_entry_tail checksum in ext4_blk_buf (the scratch
+    # the dirent-insert/unlink paths mutate a directory block in) before
+    # it is written back, so a metadata_csum directory write keeps the
+    # block's tail checksum valid. No-op without the feature.
+    #
+    # The seed needs the parent's inode number AND i_generation; callers
+    # pass the generation directly (read out of the parent-inode buffer
+    # they already hold) because the only other source — ext4_read_inode —
+    # reads through ext4_blk_buf, which is the very buffer holding the
+    # mutated directory block we're about to checksum and write. Reading
+    # the inode here would clobber it. Passing parent_gen keeps this
+    # buffer-safe.
+    if ext4_metadata_csum == 0:
+        return
+    ext4_dirblock_csum_set(&ext4_blk_buf[0], parent_inum, parent_gen)
+
+
+def _ext4_sb_csum() -> uint32:
+    # crc32c over the on-disk superblock image in ext4_sb_buf MINUS the
+    # trailing 4-byte s_checksum. RAW register (no final xor).
+    return crc32c_update(0xFFFFFFFF, &ext4_sb_buf[0], EXT4_SB_OFF_CHECKSUM)
+
+
+def ext4_sb_csum_ok() -> int32:
+    if ext4_metadata_csum == 0:
+        return 1
+    stored: uint32 = _ext4_read_u32(cast[Ptr[uint8]](
+        cast[uint64](&ext4_sb_buf[0]) + EXT4_SB_OFF_CHECKSUM))
+    if _ext4_sb_csum() == stored:
+        return 1
+    return 0
+
+
+# The metadata_csum self-test reads the root directory's first data
+# block; keep a dedicated scratch so it never collides with the buffers
+# the verification helpers themselves chase through.
+ext4_csum_test_buf: Array[4096, uint8]
+
+
+def _ext4_csum_run_selftest():
+    # Driven from ext4_init() ONLY when the mounted fs declares
+    # metadata_csum. Proves, on a real image, that:
+    #   (a) the crc32c KAT passes,
+    #   (b) the superblock checksum verifies,
+    #   (c) a real inode checksum verifies,
+    #   (d) a real directory-block checksum verifies,
+    #   (e) corruption is DETECTED (negative test),
+    #   (f) a recompute→re-read round-trip yields a valid checksum.
+    # Each step prints a [ext4csum] line; a final [ext4csum] PASS only
+    # if every step passed. Logging is gated on the feature, so a
+    # normal (no-csum) boot stays quiet.
+    ok_all: int32 = 1
+
+    # (a) crc32c known-answer test.
+    if crc32c_selftest() != 0:
+        printk0("[ext4csum] PASS verify-crc32c-kat (crc32c('123456789')=0xE3069283)\n")
+    else:
+        printk0("[ext4csum] FAIL verify-crc32c-kat\n")
+        ok_all = 0
+
+    # (b) superblock checksum.
+    if ext4_sb_csum_ok() != 0:
+        printk0("[ext4csum] PASS verify-superblock\n")
+    else:
+        printk0("[ext4csum] FAIL verify-superblock\n")
+        ok_all = 0
+
+    # (c) inode checksum — read the root inode (#2) and verify.
+    ino: Array[256, uint8]
+    if ext4_read_inode(2, &ino[0]) == 0:
+        if ext4_inode_csum_ok(&ino[0], 2) != 0:
+            printk0("[ext4csum] PASS verify-inode (root inode #2)\n")
+        else:
+            printk0("[ext4csum] FAIL verify-inode\n")
+            ok_all = 0
+    else:
+        printk0("[ext4csum] FAIL verify-inode (read failed)\n")
+        ok_all = 0
+
+    # (d) directory-block checksum — root dir's first data block.
+    dir_gen: uint32 = _ext4_read_u32(cast[Ptr[uint8]](cast[uint64](&ino[0])
+                                                      + 0x64))
+    dblk: uint64 = _ext4_logical_to_physical(&ino[0], 0)
+    dirblk_ok: int32 = 0
+    if dblk != 0:
+        if _ext4_read_block(dblk, &ext4_csum_test_buf[0]) == 0:
+            if ext4_dirblock_csum_ok(&ext4_csum_test_buf[0], 2, dir_gen) != 0:
+                printk0("[ext4csum] PASS verify-dirblock (root dir block)\n")
+                dirblk_ok = 1
+            else:
+                printk0("[ext4csum] FAIL verify-dirblock\n")
+                ok_all = 0
+    if dirblk_ok == 0 and dblk == 0:
+        printk0("[ext4csum] FAIL verify-dirblock (no root data block)\n")
+        ok_all = 0
+
+    # (e) negative test: flip a byte in the dir block in RAM and confirm
+    # the checksum no longer matches (corruption is DETECTED). Restore
+    # the byte afterwards so nothing is written back corrupt.
+    if dirblk_ok != 0:
+        victim: uint8 = ext4_csum_test_buf[0]
+        ext4_csum_test_buf[0] = victim ^ cast[uint8](0xFF)
+        if ext4_dirblock_csum_ok(&ext4_csum_test_buf[0], 2, dir_gen) == 0:
+            printk0("[ext4csum] PASS detect-corruption (flipped byte rejected)\n")
+        else:
+            printk0("[ext4csum] FAIL detect-corruption (mutation undetected)\n")
+            ok_all = 0
+        ext4_csum_test_buf[0] = victim
+
+    # (f) write/recompute round-trip: zero the checksum register in a
+    # copy, recompute it via the writer path, then verify the reader
+    # accepts it — proving the writer reproduces the on-disk value.
+    if ext4_read_inode(2, &ino[0]) == 0:
+        _ext4_write_u16(cast[Ptr[uint8]](cast[uint64](&ino[0]) + 0x7C), 0)
+        if ext4_inode_size > 128:
+            _ext4_write_u16(cast[Ptr[uint8]](cast[uint64](&ino[0]) + 0x82), 0)
+        _ext4_inode_csum_set(&ino[0], 2)
+        if ext4_inode_csum_ok(&ino[0], 2) != 0:
+            printk0("[ext4csum] PASS roundtrip-inode (recompute matches)\n")
+        else:
+            printk0("[ext4csum] FAIL roundtrip-inode\n")
+            ok_all = 0
+    else:
+        printk0("[ext4csum] FAIL roundtrip-inode (read failed)\n")
+        ok_all = 0
+
+    if ok_all != 0:
+        printk0("[ext4csum] PASS\n")
+    else:
+        printk0("[ext4csum] FAIL\n")
 
 
 def ext4_init(slot: int32) -> int32:
@@ -170,6 +477,27 @@ def ext4_init(slot: int32) -> int32:
     else:
         ext4_journal_inum = 0
 
+    # RO_COMPAT_METADATA_CSUM: when the superblock declares the feature
+    # (s_feature_ro_compat & 0x400) build the per-fs checksum seed from
+    # s_uuid (offset 0x68, 16 bytes) and arm verification. The seed is
+    # the RAW running register crc32c_update(~0, uuid, 16) that every
+    # per-object inode / dir-block checksum chains onto. We also gate on
+    # the crc32c KAT so a broken crc primitive never silently "passes"
+    # verification. A no-feature filesystem leaves ext4_metadata_csum 0
+    # and behaves exactly as before.
+    ext4_metadata_csum = 0
+    ext4_csum_seed = 0
+    ro_compat: uint32 = _ext4_read_u32(
+        cast[Ptr[uint8]](cast[uint64](sb) + EXT4_SB_OFF_FEATURE_RO_COMPAT))
+    if (ro_compat & EXT4_FEATURE_RO_COMPAT_METADATA_CSUM) != 0:
+        if crc32c_selftest() != 0:
+            ext4_csum_seed = crc32c_update(
+                0xFFFFFFFF,
+                cast[Ptr[uint8]](cast[uint64](sb) + EXT4_SB_OFF_UUID), 16)
+            ext4_metadata_csum = 1
+        else:
+            printk0("ext4: crc32c KAT failed; metadata_csum verify disabled\n")
+
     ext4_blockdev_slot = slot
     printk2("ext4: mounted; block_size=%d inodes_count=%d\n",
             ext4_block_size, ext4_inodes_count)
@@ -183,6 +511,14 @@ def ext4_init(slot: int32) -> int32:
     # exactly as before. A journalled image parses its JBD2 superblock
     # and replays any uncheckpointed transactions before we return.
     _ext4_journal_setup()
+
+    # RO_COMPAT_METADATA_CSUM self-test. Runs ONLY on a metadata_csum
+    # filesystem (the seed/feature were armed above); a normal no-csum
+    # boot skips it entirely and emits no [ext4csum] lines. Verifies the
+    # superblock, an inode, and a directory block on read, proves
+    # corruption is detected, and round-trips a recompute.
+    if ext4_metadata_csum != 0:
+        _ext4_csum_run_selftest()
     return 0
 
 
@@ -1540,6 +1876,10 @@ def ext4_write_inode(inum: uint64, src: Ptr[uint8]) -> int32:
                        + idx * ext4_inode_size
     sec_lba:   uint64 = inode_byte / SECTOR_SIZE
     sec_off:   uint64 = inode_byte % SECTOR_SIZE
+    # metadata_csum: recompute l_i_checksum_lo (+hi) over the inode
+    # we're about to persist so a write→re-read validates. No-op on a
+    # filesystem without the feature.
+    _ext4_inode_csum_set(src, inum)
     # Read 2 sectors → RMW → write 2 sectors. ext4_blk_buf is the
     # natural scratch (1024 bytes, fits 2 sectors).
     if blk_read_sectors(ext4_blockdev_slot, sec_lba, 2,
@@ -1735,6 +2075,11 @@ def ext4_dir_insert(parent_inum: uint64, name: Ptr[char],
     parent_inode: Array[256, uint8]
     if ext4_read_inode(parent_inum, &parent_inode[0]) != 0:
         return -1
+    # Capture i_generation now (before any ext4_blk_buf reuse) so the
+    # dir-block checksum restamp below can seed correctly without an
+    # inode re-read that would clobber the mutated dir block.
+    parent_gen: uint32 = _ext4_read_u32(
+        cast[Ptr[uint8]](cast[uint64](&parent_inode[0]) + 0x64))
     dir_size: uint64 = cast[uint64](ext4_inode_size_lo(&parent_inode[0]))
     if dir_size == 0:
         return -1
@@ -1784,6 +2129,7 @@ def ext4_dir_insert(parent_inum: uint64, name: Ptr[char],
                 while pp < cast[uint64](e_rec_len):
                     cast[Ptr[uint8]](e + pp)[0] = 0
                     pp = pp + 1
+                _ext4_dirblock_stamp_in_buf(parent_inum, parent_gen)
                 return _ext4_write_block(phys, &ext4_blk_buf[0])
         else:
             e_name_len: uint8 = cast[Ptr[uint8]](e + 6)[0]
@@ -1809,6 +2155,7 @@ def ext4_dir_insert(parent_inum: uint64, name: Ptr[char],
                 while pp < new_rec_len:
                     cast[Ptr[uint8]](new_e + pp)[0] = 0
                     pp = pp + 1
+                _ext4_dirblock_stamp_in_buf(parent_inum, parent_gen)
                 return _ext4_write_block(phys, &ext4_blk_buf[0])
         pos = pos + cast[uint64](e_rec_len)
     printk0("ext4: dir block full (no slack for insert)\n")
@@ -1949,6 +2296,8 @@ def _ext4_dir_unlink_in_root(name: Ptr[char]) -> uint32:
     root_inode: Array[256, uint8]
     if ext4_read_inode(2, &root_inode[0]) != 0:
         return 0
+    root_gen: uint32 = _ext4_read_u32(
+        cast[Ptr[uint8]](cast[uint64](&root_inode[0]) + 0x64))
     dir_size: uint64 = cast[uint64](ext4_inode_size_lo(&root_inode[0]))
     if dir_size == 0:
         return 0
@@ -1977,6 +2326,7 @@ def _ext4_dir_unlink_in_root(name: Ptr[char]) -> uint32:
                                               cast[Ptr[uint8]](name),
                                               nlen) != 0:
                     _ext4_write_u32(cast[Ptr[uint8]](e + 0), 0)
+                    _ext4_dirblock_stamp_in_buf(2, root_gen)
                     _ext4_write_block(phys, &ext4_blk_buf[0])
                     return e_inum
             pos = pos + cast[uint64](e_rec_len)
@@ -2292,6 +2642,12 @@ def ext4_unlink(name: Ptr[char]) -> int32:
     root_inode: Array[256, uint8]
     if ext4_read_inode(2, &root_inode[0]) != 0:
         return -1
+    # Capture root i_generation up front for the metadata_csum dir-block
+    # restamp below — the later inode reads clobber ext4_blk_buf and the
+    # dir block we tombstone, so we cannot re-read the inode at restamp
+    # time without trampling the block we're about to write.
+    root_gen: uint32 = _ext4_read_u32(
+        cast[Ptr[uint8]](cast[uint64](&root_inode[0]) + 0x64))
     dir_size: uint64 = cast[uint64](ext4_inode_size_lo(&root_inode[0]))
     if dir_size == 0:
         return -2                                  # -ENOENT
@@ -2351,6 +2707,9 @@ def ext4_unlink(name: Ptr[char]) -> int32:
         return -1
     _ext4_write_u32(cast[Ptr[uint8]](
         cast[uint64](&ext4_blk_buf[0]) + target_pos + 0), 0)
+    # metadata_csum: restamp the dir block's tail checksum before the
+    # write so the tombstone keeps the block's crc32c valid.
+    _ext4_dirblock_stamp_in_buf(2, root_gen)
     return _ext4_journal_write_block(target_phys, &ext4_blk_buf[0])
 
 
@@ -2478,6 +2837,8 @@ def ext4_rmdir(path: Ptr[char]) -> int32:
     # above trampled ext4_blk_buf), mirroring ext4_unlink's tail.
     if ext4_read_inode(cast[uint64](parent_inum), &parent_inode[0]) != 0:
         return -1
+    parent_gen: uint32 = _ext4_read_u32(
+        cast[Ptr[uint8]](cast[uint64](&parent_inode[0]) + 0x64))
     psize: uint64 = cast[uint64](ext4_inode_size_lo(&parent_inode[0]))
     pblocks: uint64 = (psize + ext4_block_size - 1) / ext4_block_size
     nlen: uint64 = _ext4_strlen(leaf)
@@ -2517,6 +2878,7 @@ def ext4_rmdir(path: Ptr[char]) -> int32:
         return 0
     _ext4_write_u32(cast[Ptr[uint8]](
         cast[uint64](&ext4_blk_buf[0]) + tpos + 0), 0)
+    _ext4_dirblock_stamp_in_buf(cast[uint64](parent_inum), parent_gen)
     return _ext4_journal_write_block(tphys, &ext4_blk_buf[0])
 
 
@@ -4056,6 +4418,8 @@ def _ext4_dir_tombstone(dir_inum: uint64, name: Ptr[char]) -> int32:
     dir_inode: Array[256, uint8]
     if ext4_read_inode(dir_inum, &dir_inode[0]) != 0:
         return 0
+    dir_gen: uint32 = _ext4_read_u32(
+        cast[Ptr[uint8]](cast[uint64](&dir_inode[0]) + 0x64))
     dir_size: uint64 = cast[uint64](ext4_inode_size_lo(&dir_inode[0]))
     if dir_size == 0:
         return 0
@@ -4084,6 +4448,7 @@ def _ext4_dir_tombstone(dir_inum: uint64, name: Ptr[char]) -> int32:
                                               cast[Ptr[uint8]](name),
                                               nlen) != 0:
                     _ext4_write_u32(cast[Ptr[uint8]](e + 0), 0)
+                    _ext4_dirblock_stamp_in_buf(dir_inum, dir_gen)
                     if _ext4_write_block(phys, &ext4_blk_buf[0]) != 0:
                         return 0
                     return e_inum
@@ -4104,6 +4469,8 @@ def _ext4_dir_rewrite_dotdot(dir_inum: uint64,
     dir_inode: Array[256, uint8]
     if ext4_read_inode(dir_inum, &dir_inode[0]) != 0:
         return -1
+    dir_gen: uint32 = _ext4_read_u32(
+        cast[Ptr[uint8]](cast[uint64](&dir_inode[0]) + 0x64))
     phys: uint64 = _ext4_logical_to_physical(&dir_inode[0], 0)
     if phys == 0:
         return -2
@@ -4120,6 +4487,7 @@ def _ext4_dir_rewrite_dotdot(dir_inum: uint64,
                 and cast[Ptr[uint8]](e + 8)[0] == 0x2E \
                 and cast[Ptr[uint8]](e + 9)[0] == 0x2E:
             _ext4_write_u32(cast[Ptr[uint8]](e + 0), new_parent)
+            _ext4_dirblock_stamp_in_buf(dir_inum, dir_gen)
             return _ext4_journal_write_block(phys, &ext4_blk_buf[0])
         pos = pos + cast[uint64](e_rec_len)
     return -2
@@ -6920,7 +7288,13 @@ def _ext4_write_dot_dotdot(blk_buf: Ptr[uint8], self_inum: uint32,
     cast[Ptr[uint8]](p + 6)[0] = 1                          # name_len = 1
     cast[Ptr[uint8]](p + 7)[0] = 2                          # EXT4_FT_DIR
     cast[Ptr[uint8]](p + 8)[0] = 0x2E                       # '.'
+    # On a metadata_csum fs the last 12 bytes of every leaf dir block
+    # are an ext4_dir_entry_tail (fake inode=0, rec_len=12, name_len=0,
+    # file_type=0xDE, det_checksum u32). ".." must stop short of it so
+    # its rec_len leaves room for the tail.
     rest: uint64 = ext4_block_size - 12
+    if ext4_metadata_csum != 0:
+        rest = ext4_block_size - 12 - 12
     _ext4_write_u32(cast[Ptr[uint8]](p + 12), parent_inum)
     _ext4_write_u16(cast[Ptr[uint8]](p + 16),
                     cast[uint16](rest))
@@ -6928,6 +7302,15 @@ def _ext4_write_dot_dotdot(blk_buf: Ptr[uint8], self_inum: uint32,
     cast[Ptr[uint8]](p + 19)[0] = 2                         # EXT4_FT_DIR
     cast[Ptr[uint8]](p + 20)[0] = 0x2E                      # '.'
     cast[Ptr[uint8]](p + 21)[0] = 0x2E                      # '.'
+    if ext4_metadata_csum != 0:
+        # Lay down the dir_entry_tail skeleton; det_checksum is stamped
+        # by the caller (it knows the dir's inum + generation).
+        tail: uint64 = p + ext4_block_size - 12
+        _ext4_write_u32(cast[Ptr[uint8]](tail + 0), 0)      # fake inode=0
+        _ext4_write_u16(cast[Ptr[uint8]](tail + 4), 12)     # rec_len=12
+        cast[Ptr[uint8]](tail + 6)[0] = 0                   # name_len=0
+        cast[Ptr[uint8]](tail + 7)[0] = 0xDE                # file_type
+        _ext4_write_u32(cast[Ptr[uint8]](tail + 8), 0)      # det_checksum
 
 
 def _ext4_dir_create_child(parent_inum: uint64,
@@ -6950,6 +7333,10 @@ def _ext4_dir_create_child(parent_inum: uint64,
     # Lay down the . / .. dirents into ext4_blk_buf, write to disk.
     _ext4_write_dot_dotdot(&ext4_blk_buf[0], new_inum,
                            cast[uint32](parent_inum))
+    # Stamp the new dir block's tail checksum. A fresh dir inode's
+    # i_generation is 0 (_ext4_build_dir_inode zeroes the inode), so the
+    # seed uses generation 0 — matching what a later read recomputes.
+    _ext4_dirblock_stamp_in_buf(cast[uint64](new_inum), 0)
     if _ext4_write_block(new_blk, &ext4_blk_buf[0]) != 0:
         printk0("[ext4_mkdir] write data block FAIL\n")
         ext4_free_block(new_blk)
@@ -7101,6 +7488,8 @@ def _ext4_dir_unlink_in_dir(parent_inum: uint64,
     parent_inode: Array[256, uint8]
     if ext4_read_inode(parent_inum, &parent_inode[0]) != 0:
         return 0
+    parent_gen: uint32 = _ext4_read_u32(
+        cast[Ptr[uint8]](cast[uint64](&parent_inode[0]) + 0x64))
     dir_size: uint64 = cast[uint64](
         ext4_inode_size_lo(&parent_inode[0]))
     if dir_size == 0:
@@ -7130,6 +7519,7 @@ def _ext4_dir_unlink_in_dir(parent_inum: uint64,
                             cast[Ptr[uint8]](e + 8),
                             name_buf, name_len) != 0:
                     _ext4_write_u32(cast[Ptr[uint8]](e + 0), 0)
+                    _ext4_dirblock_stamp_in_buf(parent_inum, parent_gen)
                     _ext4_write_block(phys, &ext4_blk_buf[0])
                     return e_inum
             pos = pos + cast[uint64](e_rec_len)
