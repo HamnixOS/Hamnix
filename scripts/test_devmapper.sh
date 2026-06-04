@@ -30,6 +30,11 @@
 #     validates and round-trips byte-identical. Corrupting the underlying
 #     backing sector directly is then DETECTED on the next read — the
 #     integrity device fails the I/O instead of returning the corrupt bytes.
+#   * VERITY (dm-verity / read-only Merkle hash tree, salted SHA-256): clean
+#     data blocks are hashed into a hash-tree block whose hash is the trusted
+#     ROOT. A clean block verifies and round-trips; flipping a byte in a data
+#     block, in the block's hash-tree leaf, or in any other hash-tree entry
+#     (root mismatch) is DETECTED and the read fails with an I/O error.
 #
 # The self-test needs NO external disk — it backs everything onto its own
 # in-kernel ramdisk, so the boot is fully deterministic.
@@ -131,6 +136,11 @@ check "thin on-demand alloc"     "[dm] PASS thin-ondemand-alloc"
 check "thin remap stable"        "[dm] PASS thin-remap-stable"
 check "thin prov vs unprov"      "[devmapper] thin: provisioned vs unprovisioned distinguished OK"
 check "thin subtest PASS"        "[dm] thin PASS"
+check "verity clean round-trip"  "[dm] verity clean block verified + round-trip OK"
+check "verity data corruption"   "[dm] verity data-corruption rejected"
+check "verity hashtree corrupt"  "[dm] verity hash-tree-corruption rejected"
+check "verity root mismatch"     "[dm] verity root-hash mismatch rejected"
+check "verity subtest PASS"      "[dm] verity PASS"
 check "device-mapper PASS"       "[device-mapper] PASS"
 
 if [ "$fail" -ne 0 ]; then
@@ -138,4 +148,4 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
-echo "[test_devmapper] PASS — native device-mapper: linear remap, two-target concatenation, AES-256-XTS dm-crypt (aes-xts-plain64: sector-keyed tweak, ciphertext-on-disk, plaintext round-trip, known-answer vector), dm-snapshot copy-on-write (origin-write preserves the snapshot pre-image in a separate exception store; origin advances to new data; never-written chunks pass through to origin), dm-integrity (per-sector salted crc32c tags: a known sector round-trips with its tag validated; corrupting the backing sector behind the target is DETECTED and the read fails instead of returning corrupt data), and dm-thin thin provisioning (a thin device over-provisioned 32x the pool reads unprovisioned blocks as zeros consuming no pool space; the first write to a virtual block allocates exactly one pool block on demand and reads back correctly; re-writing a provisioned block allocates nothing; provisioned vs unprovisioned regions are distinguished) all verified"
+echo "[test_devmapper] PASS — native device-mapper: linear remap, two-target concatenation, AES-256-XTS dm-crypt (aes-xts-plain64: sector-keyed tweak, ciphertext-on-disk, plaintext round-trip, known-answer vector), dm-snapshot copy-on-write (origin-write preserves the snapshot pre-image in a separate exception store; origin advances to new data; never-written chunks pass through to origin), dm-integrity (per-sector salted crc32c tags: a known sector round-trips with its tag validated; corrupting the backing sector behind the target is DETECTED and the read fails instead of returning corrupt data), dm-thin thin provisioning (a thin device over-provisioned 32x the pool reads unprovisioned blocks as zeros consuming no pool space; the first write to a virtual block allocates exactly one pool block on demand and reads back correctly; re-writing a provisioned block allocates nothing; provisioned vs unprovisioned regions are distinguished), and dm-verity (read-only Merkle hash tree of salted SHA-256 over 4096-byte blocks rooted at a trusted root hash: a clean block verifies and round-trips byte-identical; flipping a byte in a data block, in the block's own hash-tree leaf, or in another hash-tree entry — root-hash mismatch — is each DETECTED and the read fails with an I/O error) all verified"
