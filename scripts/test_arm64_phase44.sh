@@ -814,7 +814,7 @@ cp -f "$DISK" "$SCRATCH" || fail "could not create writable scratch disk"
 #     the timeout (and a 124 rc) is expected and fine as long as every PASS banner
 #     below is present.
 timeout 600 "$QEMU" \
-    -M virt -cpu cortex-a72 -smp 2 -nographic -no-reboot \
+    -M virt -cpu cortex-a72 -smp 2 -m 256M -nographic -no-reboot \
     -kernel "$ELF" \
     -drive if=none,file="$SCRATCH",format=raw,id=hd0 \
     -device virtio-blk-device,drive=hd0 \
