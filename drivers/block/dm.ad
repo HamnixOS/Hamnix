@@ -750,6 +750,7 @@ DM_TARGET_SNAPSHOT_ORIGIN: uint32 = 4 # origin that performs copy-on-write
 DM_TARGET_INTEGRITY:     uint32 = 5   # per-sector crc32c integrity tags
 DM_TARGET_THIN:          uint32 = 6   # thin-provisioned (on-demand alloc)
 DM_TARGET_VERITY:        uint32 = 7   # read-only Merkle-tree (sha256) verify
+DM_TARGET_CACHE:         uint32 = 8   # fast cache device fronting slow origin
 
 DM_KEY_LEN:      uint64 = 64       # AES-256-XTS: 32B data + 32B tweak key
 DM_MAX_TARGETS:  uint64 = 8        # targets per mapped device
@@ -984,6 +985,90 @@ class DmVerityContext:
 
 dm_verity_ctxs: Array[4, DmVerityContext]
 
+
+# =========================================================================
+# dm-cache — fast cache device fronting a slow origin (Linux dm-cache /
+# drivers/md/dm-cache-target.c)
+# =========================================================================
+#
+# dm-cache layers a SMALL, FAST cache device in front of a LARGE, SLOW
+# origin device, transparently caching hot blocks on the fast device. The
+# virtual mapped device presents the FULL origin address space; the cache
+# is invisible — reads and writes always look like they hit the origin, but
+# in practice frequently-touched blocks live on (and are served from) the
+# fast cache.
+#
+# CACHE BLOCK GRANULARITY: the address space is carved into fixed-size
+# CACHE BLOCKS of `block_sectors` sectors each. The fast cache device holds
+# a fixed number (`ncache`) of SLOTS, each able to hold exactly one origin
+# block. A cache mapping table records, per slot, which origin block it
+# currently holds plus VALID and DIRTY bits and a last-use timestamp.
+#
+# READ path:
+#   * HIT  — the requested origin block is resident in a valid slot: serve
+#            the bytes straight from the fast cache device.
+#   * MISS — not resident: read the block from the slow origin, PROMOTE it
+#            into a cache slot (choosing a victim by LRU; if the victim is
+#            DIRTY its contents are written BACK to the origin first so no
+#            data is lost), and serve the freshly promoted bytes. A second
+#            read of the same block now HITs.
+#
+# WRITE path depends on MODE:
+#   * WRITETHROUGH — the write updates BOTH the cache slot (promoting on a
+#                    miss) AND the origin, so the cache stays CLEAN: the
+#                    origin is always coherent and a slot can be evicted with
+#                    no writeback.
+#   * WRITEBACK    — the write updates ONLY the cache slot and marks it
+#                    DIRTY; the origin is left STALE. The dirty data reaches
+#                    the origin only when the slot is evicted, or when an
+#                    explicit FLUSH (dm_cache_writeback_all) walks every
+#                    dirty slot and writes it back, after which the origin
+#                    again matches the cache.
+#
+# REPLACEMENT POLICY: true LRU. Every access stamps the slot with a
+# monotonically increasing clock; eviction picks the valid slot with the
+# smallest stamp (the least-recently-used). Empty (invalid) slots are
+# filled first.
+#
+# OBSERVABILITY: per-context hit / miss counters (dm_cache_hits /
+# dm_cache_misses) the self-test asserts on, proving promotion and HIT/MISS
+# accounting are genuinely computed (a cold read MISSes then promotes; a
+# warm read HITs).
+#
+# This is exactly Linux dm-cache's smq/writeback model in miniature: one
+# fast device, one origin, an in-core mapping with LRU eviction, dirty
+# writeback, and writethrough/writeback modes.
+
+DM_CACHE_MAX:          uint64 = 2      # cache contexts system-wide
+DM_CACHE_MAX_SLOTS:    uint64 = 64     # cache slots per context
+DM_CACHE_MAX_BLKSECS:  uint64 = 8      # max sectors per cache block (<= 4096B)
+
+DM_CACHE_WRITETHROUGH: uint32 = 0
+DM_CACHE_WRITEBACK:    uint32 = 1
+
+
+class DmCacheContext:
+    used:          uint32
+    mode:          uint32              # WRITETHROUGH or WRITEBACK
+    cache_slot:    int32               # underlying FAST cache block device
+    origin_slot:   int32               # underlying SLOW origin block device
+    block_sectors: uint64              # sectors per cache block (alloc unit)
+    nblocks:       uint64              # origin blocks the device covers
+    ncache:        uint64              # cache slots available (<= nblocks)
+    clock:         uint64              # monotonic LRU access stamp source
+    hits:          uint64              # read/write HIT count
+    misses:        uint64              # read/write MISS count
+    # Per-slot mapping. tag[s] = origin block resident in slot s (valid only
+    # when valid[s]); dirty[s] = 1 when the slot holds data newer than origin
+    # (writeback mode); used[s] = LRU stamp of last access.
+    valid:         Array[64, uint8]
+    dirty:         Array[64, uint8]
+    tag:           Array[64, uint64]
+    stamp:         Array[64, uint64]
+
+
+dm_cache_ctxs: Array[2, DmCacheContext]
+
 dm_devices: Array[8, MappedDevice]
 dm_ops:     BlockDeviceOps
 dm_inited:  uint32 = 0
@@ -1000,6 +1085,13 @@ _dm_snap_cow_buf: Array[4096, uint8]    # 8 * 512
 # is serialised through the synchronous block layer, so a single shared
 # module-scope sector buffer is safe (no two crypt transfers overlap).
 _dm_crypt_sector: Array[512, uint8]
+
+# One-cache-block staging buffer for the dm-cache promote / writeback path.
+# Sized to the largest cache block the target supports (DM_CACHE_MAX_BLKSECS
+# = 8 sectors = 4096 bytes) per the BSS-overflow trap. dm-cache I/O is
+# serialised through the synchronous block layer, so a single shared buffer
+# is safe (no two cache transfers overlap).
+_dm_cache_buf:    Array[4096, uint8]    # 8 * 512
 
 
 def dm_init():
@@ -1039,8 +1131,12 @@ def dm_init():
     while vr < DM_VERITY_MAX:
         dm_verity_ctxs[vr].used = 0
         vr = vr + 1
+    ca: uint64 = 0
+    while ca < DM_CACHE_MAX:
+        dm_cache_ctxs[ca].used = 0
+        ca = ca + 1
     dm_inited = 1
-    printk0("dm: device-mapper ready (linear + crypt + snapshot + integrity + thin + verity targets)\n")
+    printk0("dm: device-mapper ready (linear + crypt + snapshot + integrity + thin + verity + cache targets)\n")
 
 
 def _dm_find_target(dev: Ptr[MappedDevice], vlba: uint64) -> int32:
@@ -1513,6 +1609,202 @@ def _dm_verity_io(t: Ptr[DmTarget], is_write: int32, off_in_t: uint64,
     return 0
 
 
+# =========================================================================
+# dm-cache target handlers
+# =========================================================================
+
+def _dm_cache_find(ctx: Ptr[DmCacheContext], oblk: uint64) -> int32:
+    # Return the cache slot currently holding origin block `oblk`, or -1 if
+    # the block is not resident.
+    n: uint64 = ctx[0].ncache
+    i: uint64 = 0
+    while i < n:
+        if ctx[0].valid[i] != 0 and ctx[0].tag[i] == oblk:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _dm_cache_victim(ctx: Ptr[DmCacheContext]) -> int32:
+    # Pick a cache slot to (re)use for a promotion. Prefer an EMPTY (invalid)
+    # slot; otherwise evict the least-recently-used valid slot (smallest LRU
+    # stamp). Returns the slot index (always >= 0; ncache >= 1).
+    n: uint64 = ctx[0].ncache
+    i: uint64 = 0
+    while i < n:
+        if ctx[0].valid[i] == 0:
+            return cast[int32](i)
+        i = i + 1
+    # All slots full: find the smallest stamp (least recently used).
+    best:    uint64 = 0
+    best_st: uint64 = ctx[0].stamp[0]
+    i = 1
+    while i < n:
+        if ctx[0].stamp[i] < best_st:
+            best_st = ctx[0].stamp[i]
+            best    = i
+        i = i + 1
+    return cast[int32](best)
+
+
+def _dm_cache_touch(ctx: Ptr[DmCacheContext], slot: uint64):
+    # Stamp a slot as just-used for the LRU policy.
+    ctx[0].clock = ctx[0].clock + 1
+    ctx[0].stamp[slot] = ctx[0].clock
+
+
+def _dm_cache_evict_slot(ctx: Ptr[DmCacheContext], slot: uint64) -> int32:
+    # Make `slot` available for a new block. If it currently holds a VALID
+    # DIRTY block (writeback mode), its data is first written BACK to the
+    # origin so nothing is lost. After this the slot is invalid.
+    bs:  uint64 = ctx[0].block_sectors
+    buf: Ptr[uint8] = cast[Ptr[uint8]](&_dm_cache_buf[0])
+    if ctx[0].valid[slot] != 0 and ctx[0].dirty[slot] != 0:
+        victim_blk: uint64 = ctx[0].tag[slot]
+        # Read the dirty data out of the cache device and flush it to origin.
+        rc: int32 = blk_read_sectors(ctx[0].cache_slot, slot * bs, bs, buf)
+        if rc != 0:
+            return rc
+        rc = blk_write_sectors(ctx[0].origin_slot, victim_blk * bs, bs, buf)
+        if rc != 0:
+            return rc
+    ctx[0].valid[slot] = 0
+    ctx[0].dirty[slot] = 0
+    return 0
+
+
+def _dm_cache_promote(ctx: Ptr[DmCacheContext], oblk: uint64) -> int32:
+    # Bring origin block `oblk` into a cache slot: choose a victim (writing it
+    # back first if dirty), copy the origin block's CURRENT contents into the
+    # chosen cache slot, and record the (slot -> oblk, valid, clean) mapping.
+    # Returns the slot index (>= 0) or a negative error.
+    bs:  uint64 = ctx[0].block_sectors
+    buf: Ptr[uint8] = cast[Ptr[uint8]](&_dm_cache_buf[0])
+    vslot_s: int32 = _dm_cache_victim(ctx)
+    vslot:   uint64 = cast[uint64](vslot_s)
+    erc: int32 = _dm_cache_evict_slot(ctx, vslot)
+    if erc != 0:
+        return erc
+    # Copy the origin block into the cache slot.
+    rc: int32 = blk_read_sectors(ctx[0].origin_slot, oblk * bs, bs, buf)
+    if rc != 0:
+        return rc
+    rc = blk_write_sectors(ctx[0].cache_slot, vslot * bs, bs, buf)
+    if rc != 0:
+        return rc
+    ctx[0].valid[vslot] = 1
+    ctx[0].dirty[vslot] = 0
+    ctx[0].tag[vslot]   = oblk
+    _dm_cache_touch(ctx, vslot)
+    return vslot_s
+
+
+def _dm_cache_io_block(ctx: Ptr[DmCacheContext], is_write: int32,
+                       oblk: uint64, buf: Ptr[uint8]) -> int32:
+    # Service ONE cache-block-aligned I/O for origin block `oblk`. Updates the
+    # hit/miss counters, performs promotion / eviction / writeback, and obeys
+    # the configured mode for writes.
+    bs: uint64 = ctx[0].block_sectors
+    slot_s: int32 = _dm_cache_find(ctx, oblk)
+    if slot_s < 0:
+        # MISS — promote the block into the cache, then serve from cache.
+        ctx[0].misses = ctx[0].misses + 1
+        slot_s = _dm_cache_promote(ctx, oblk)
+        if slot_s < 0:
+            return slot_s
+    else:
+        # HIT — block already resident.
+        ctx[0].hits = ctx[0].hits + 1
+    slot: uint64 = cast[uint64](slot_s)
+    _dm_cache_touch(ctx, slot)
+    if is_write == 0:
+        # READ: serve from the (now resident) cache slot.
+        return blk_read_sectors(ctx[0].cache_slot, slot * bs, bs, buf)
+    # WRITE: always update the cache slot.
+    rc: int32 = blk_write_sectors(ctx[0].cache_slot, slot * bs, bs, buf)
+    if rc != 0:
+        return rc
+    if ctx[0].mode == DM_CACHE_WRITEBACK:
+        # Cache holds the newest data; origin is now stale until writeback.
+        ctx[0].dirty[slot] = 1
+        return 0
+    # WRITETHROUGH: also push to origin so the slot stays clean.
+    ctx[0].dirty[slot] = 0
+    return blk_write_sectors(ctx[0].origin_slot, oblk * bs, bs, buf)
+
+
+def _dm_cache_io(t: Ptr[DmTarget], is_write: int32, off_in_t: uint64,
+                 count: uint64, buf: Ptr[uint8]) -> int32:
+    # CACHE target. Process one cache BLOCK at a time (count is a sector
+    # count; cache I/O is block-aligned). Each block is dispatched through the
+    # hit/miss + promotion machinery in _dm_cache_io_block.
+    ctx: Ptr[DmCacheContext] = &dm_cache_ctxs[cast[uint64](t[0].snap_ctx)]
+    bs: uint64 = ctx[0].block_sectors
+    s: uint64 = 0
+    while s < count:
+        osec: uint64 = off_in_t + s
+        if (osec % bs) != 0 or (count - s) < bs:
+            printk0("dm: cache I/O not block-aligned\n")
+            return -1
+        oblk: uint64 = osec / bs
+        if oblk >= ctx[0].nblocks:
+            printk1("dm: cache I/O past origin span (blk=%d)\n", oblk)
+            return -1
+        cur: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](buf) + s * SECTOR_SIZE)
+        rc: int32 = _dm_cache_io_block(ctx, is_write, oblk, cur)
+        if rc != 0:
+            return rc
+        s = s + bs
+    return 0
+
+
+def dm_cache_writeback_all(cache_idx: int32) -> int32:
+    # Explicit FLUSH: walk every cache slot and, if it holds VALID DIRTY data
+    # (writeback mode), write it back to the origin and mark it clean. After
+    # this the origin matches the cache for every cached block. Returns 0 on
+    # success or a negative error. (dmsetup message ... flush / cleaner.)
+    if cache_idx < 0 or cast[uint64](cache_idx) >= DM_CACHE_MAX:
+        return -1
+    ci: uint64 = cast[uint64](cache_idx)
+    if dm_cache_ctxs[ci].used == 0:
+        return -1
+    ctx: Ptr[DmCacheContext] = &dm_cache_ctxs[ci]
+    bs:  uint64 = ctx[0].block_sectors
+    buf: Ptr[uint8] = cast[Ptr[uint8]](&_dm_cache_buf[0])
+    i: uint64 = 0
+    while i < ctx[0].ncache:
+        if ctx[0].valid[i] != 0 and ctx[0].dirty[i] != 0:
+            blkno: uint64 = ctx[0].tag[i]
+            rc: int32 = blk_read_sectors(ctx[0].cache_slot, i * bs, bs, buf)
+            if rc != 0:
+                return rc
+            rc = blk_write_sectors(ctx[0].origin_slot, blkno * bs, bs, buf)
+            if rc != 0:
+                return rc
+            ctx[0].dirty[i] = 0
+        i = i + 1
+    return 0
+
+
+def dm_cache_hits(cache_idx: int32) -> int64:
+    # Observe the cache HIT count, or -1 for an invalid/free context.
+    if cache_idx < 0 or cast[uint64](cache_idx) >= DM_CACHE_MAX:
+        return -1
+    if dm_cache_ctxs[cast[uint64](cache_idx)].used == 0:
+        return -1
+    return cast[int64](dm_cache_ctxs[cast[uint64](cache_idx)].hits)
+
+
+def dm_cache_misses(cache_idx: int32) -> int64:
+    # Observe the cache MISS count, or -1 for an invalid/free context.
+    if cache_idx < 0 or cast[uint64](cache_idx) >= DM_CACHE_MAX:
+        return -1
+    if dm_cache_ctxs[cast[uint64](cache_idx)].used == 0:
+        return -1
+    return cast[int64](dm_cache_ctxs[cast[uint64](cache_idx)].misses)
+
+
 def _dm_io(dev: Ptr[MappedDevice], is_write: int32, vlba: uint64,
            count: uint64, buf: Ptr[uint8]) -> int32:
     # Core remap. Walk the request sector-span, splitting it at target
@@ -1552,6 +1844,8 @@ def _dm_io(dev: Ptr[MappedDevice], is_write: int32, vlba: uint64,
             rc = _dm_thin_io(t, is_write, off_in_t, chunk, bufp)
         elif t[0].ttype == DM_TARGET_VERITY:
             rc = _dm_verity_io(t, is_write, off_in_t, chunk, bufp)
+        elif t[0].ttype == DM_TARGET_CACHE:
+            rc = _dm_cache_io(t, is_write, off_in_t, chunk, bufp)
         else:
             rc = _dm_linear_io(t, is_write, off_in_t, chunk, bufp)
         if rc != 0:
@@ -2139,6 +2433,108 @@ def dm_create_verity(name: Ptr[char], data_slot: int32, data_start: uint64,
     return dm_devices[idx].self_slot
 
 
+def _dm_cache_alloc_ctx() -> int32:
+    # Claim a free cache context slot, or -1 if the table is full.
+    i: uint64 = 0
+    while i < DM_CACHE_MAX:
+        if dm_cache_ctxs[i].used == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def dm_create_cache(name: Ptr[char], cache_slot: int32, origin_slot: int32,
+                    block_sectors: uint64, ncache: uint64,
+                    nblocks: uint64, mode: uint32) -> int32:
+    # Create a dm-cache mapped device: a FAST `cache_slot` device caching the
+    # SLOW `origin_slot` device. The address space is carved into `nblocks`
+    # cache blocks of `block_sectors` sectors each; the fast device holds
+    # `ncache` slots (ncache < nblocks makes eviction observable). `mode` is
+    # DM_CACHE_WRITETHROUGH or DM_CACHE_WRITEBACK. The mapped device presents
+    # the FULL origin span (nblocks * block_sectors sectors). This is the
+    # `dmsetup create NAME --table "0 LEN cache METADEV CACHEDEV ORIGINDEV
+    # BLK ... writethrough|writeback ..."` shape. Returns the registered block
+    # slot or a negative error.
+    dm_init()
+    if cache_slot < 0 or origin_slot < 0:
+        return -2
+    if block_sectors == 0 or block_sectors > DM_CACHE_MAX_BLKSECS:
+        printk0("dm: cache block size exceeds staging buffer capacity\n")
+        return -2
+    if nblocks == 0:
+        return -2
+    if ncache == 0 or ncache > DM_CACHE_MAX_SLOTS:
+        printk0("dm: cache slot count exceeds mapping-table capacity\n")
+        return -3
+    if mode != DM_CACHE_WRITETHROUGH and mode != DM_CACHE_WRITEBACK:
+        return -2
+    length: uint64 = nblocks * block_sectors
+    if length > blk_capacity_sectors(origin_slot):
+        printk0("dm: cache target exceeds underlying origin capacity\n")
+        return -3
+    if ncache * block_sectors > blk_capacity_sectors(cache_slot):
+        printk0("dm: cache slots exceed underlying cache-device capacity\n")
+        return -3
+    cidx_s: int32 = _dm_cache_alloc_ctx()
+    if cidx_s < 0:
+        printk0("dm: cache context table full\n")
+        return -4
+    cidx: uint64 = cast[uint64](cidx_s)
+    dm_cache_ctxs[cidx].mode          = mode
+    dm_cache_ctxs[cidx].cache_slot    = cache_slot
+    dm_cache_ctxs[cidx].origin_slot   = origin_slot
+    dm_cache_ctxs[cidx].block_sectors = block_sectors
+    dm_cache_ctxs[cidx].nblocks       = nblocks
+    dm_cache_ctxs[cidx].ncache        = ncache
+    dm_cache_ctxs[cidx].clock         = 0
+    dm_cache_ctxs[cidx].hits          = 0
+    dm_cache_ctxs[cidx].misses        = 0
+    s: uint64 = 0
+    while s < ncache:
+        dm_cache_ctxs[cidx].valid[s] = 0
+        dm_cache_ctxs[cidx].dirty[s] = 0
+        dm_cache_ctxs[cidx].tag[s]   = 0
+        dm_cache_ctxs[cidx].stamp[s] = 0
+        s = s + 1
+    dm_cache_ctxs[cidx].used = 1
+    idx_s: int32 = _dm_alloc_device()
+    if idx_s < 0:
+        dm_cache_ctxs[cidx].used = 0
+        printk0("dm: device table full\n")
+        return -4
+    idx: uint64 = cast[uint64](idx_s)
+    dm_devices[idx].n_targets               = 1
+    dm_devices[idx].capacity                = length
+    dm_devices[idx].targets[0].ttype        = DM_TARGET_CACHE
+    dm_devices[idx].targets[0].start_sector = 0
+    dm_devices[idx].targets[0].length       = length
+    dm_devices[idx].targets[0].under_slot   = origin_slot
+    dm_devices[idx].targets[0].snap_ctx     = cidx_s
+    dm_devices[idx].targets[0].under_start  = 0
+    if _dm_register(idx, name) != 0:
+        dm_devices[idx].used     = 0
+        dm_cache_ctxs[cidx].used = 0
+        return -5
+    return dm_devices[idx].self_slot
+
+
+def dm_cache_ctx_of(name: Ptr[char]) -> int32:
+    # Return the cache-context index backing the cache mapped device `name`,
+    # or -1 if none. Lets a caller (e.g. the self-test) observe hit/miss
+    # counters and trigger an explicit writeback flush.
+    slot: int32 = find_blockdev(name)
+    if slot < 0:
+        return -1
+    i: uint64 = 0
+    while i < DM_MAX_DEVICES:
+        if dm_devices[i].used != 0 and dm_devices[i].self_slot == slot:
+            if dm_devices[i].targets[0].ttype == DM_TARGET_CACHE:
+                return dm_devices[i].targets[0].snap_ctx
+            return -1
+        i = i + 1
+    return -1
+
+
 def dm_remove(name: Ptr[char]) -> int32:
     # Tear down a mapped device by name: unregister its block-device
     # identity and free the MappedDevice slot. dmsetup remove NAME.
@@ -2170,6 +2566,11 @@ def dm_remove(name: Ptr[char]) -> int32:
                 vc: int32 = dm_devices[i].targets[0].snap_ctx
                 if vc >= 0 and cast[uint64](vc) < DM_VERITY_MAX:
                     dm_verity_ctxs[cast[uint64](vc)].used = 0
+            # Releasing a cache device frees its cache-mapping context.
+            if dm_devices[i].targets[0].ttype == DM_TARGET_CACHE:
+                cc: int32 = dm_devices[i].targets[0].snap_ctx
+                if cc >= 0 and cast[uint64](cc) < DM_CACHE_MAX:
+                    dm_cache_ctxs[cast[uint64](cc)].used = 0
             blk_unregister_by_name(name)
             dm_devices[i].used      = 0
             dm_devices[i].n_targets = 0
@@ -2244,6 +2645,18 @@ _DM_VERHASH_SECTORS: uint64 = 256
 _dm_verhash_store:   Array[131072, uint8]   # 256 * 512
 _dm_verhash_ops:     BlockDeviceOps
 
+# Dedicated FAST CACHE ramdisk for the dm-cache subtest. Deliberately SMALL
+# (32 sectors = 16 KiB) relative to the origin so eviction is exercised.
+_DM_CFAST_SECTORS: uint64 = 32
+_dm_cfast_store:   Array[16384, uint8]   # 32 * 512
+_dm_cfast_ops:     BlockDeviceOps
+
+# Dedicated SLOW ORIGIN ramdisk for the dm-cache subtest. 256 sectors =
+# 128 KiB — much larger than the cache device above.
+_DM_CORIG_SECTORS: uint64 = 256
+_dm_corig_store:   Array[131072, uint8]   # 256 * 512
+_dm_corig_ops:     BlockDeviceOps
+
 # Scratch buffers for the self-test (all module-scope, one sector each
 # unless noted).
 _dm_t_plain:   Array[512, uint8]   # plaintext written through a mapped dev
@@ -2289,6 +2702,16 @@ _dm_ver_data1:   Array[4096, uint8]   # a second clean data block
 _dm_ver_rd:      Array[4096, uint8]   # readback through the verity device
 _dm_ver_salt:    Array[32, uint8]     # per-target verity salt
 _dm_ver_raw:     Array[4096, uint8]   # raw block read from data/hash device
+
+# dm-cache subtest scratch (all one full sector = 512 bytes to avoid the
+# BSS-overflow trap; the cache subtest uses 1-sector cache blocks).
+_dm_cache_pa:    Array[512, uint8]   # pattern for origin block A
+_dm_cache_pb:    Array[512, uint8]   # pattern for origin block B
+_dm_cache_pc:    Array[512, uint8]   # pattern for origin block C
+_dm_cache_pd:    Array[512, uint8]   # pattern for origin block D
+_dm_cache_pw:    Array[512, uint8]   # writeback/writethrough write pattern
+_dm_cache_rd:    Array[512, uint8]   # readback through the cache device
+_dm_cache_raw:   Array[512, uint8]   # raw read from the origin device
 
 
 def _dm_back_read(priv: uint64, lba: uint64, count: uint64,
@@ -2458,6 +2881,66 @@ def _dm_verhash_register() -> int32:
     _dm_verhash_ops.flush         = cast[Fn[int32, uint64]](0)
     return register_blockdev("dmverhash0", _DM_VERHASH_SECTORS,
                              &_dm_verhash_ops, 0)
+
+
+def _dm_cfast_read(priv: uint64, lba: uint64, count: uint64,
+                   buf: Ptr[uint8]) -> int32:
+    src: uint64 = cast[uint64](&_dm_cfast_store[0]) + lba * SECTOR_SIZE
+    memcpy(buf, cast[Ptr[uint8]](src), count * SECTOR_SIZE)
+    return 0
+
+
+def _dm_cfast_write(priv: uint64, lba: uint64, count: uint64,
+                    buf: Ptr[uint8]) -> int32:
+    dst: uint64 = cast[uint64](&_dm_cfast_store[0]) + lba * SECTOR_SIZE
+    memcpy(cast[Ptr[uint8]](dst), buf, count * SECTOR_SIZE)
+    return 0
+
+
+def _dm_cfast_register() -> int32:
+    # Register the dedicated dm-cache FAST cache ramdisk as "dmcfast0".
+    existing: int32 = find_blockdev("dmcfast0")
+    if existing >= 0:
+        return existing
+    z: uint64 = 0
+    while z < 16384:
+        _dm_cfast_store[z] = 0
+        z = z + 1
+    _dm_cfast_ops.read_sectors  = _dm_cfast_read
+    _dm_cfast_ops.write_sectors = _dm_cfast_write
+    _dm_cfast_ops.flush         = cast[Fn[int32, uint64]](0)
+    return register_blockdev("dmcfast0", _DM_CFAST_SECTORS,
+                             &_dm_cfast_ops, 0)
+
+
+def _dm_corig_read(priv: uint64, lba: uint64, count: uint64,
+                   buf: Ptr[uint8]) -> int32:
+    src: uint64 = cast[uint64](&_dm_corig_store[0]) + lba * SECTOR_SIZE
+    memcpy(buf, cast[Ptr[uint8]](src), count * SECTOR_SIZE)
+    return 0
+
+
+def _dm_corig_write(priv: uint64, lba: uint64, count: uint64,
+                    buf: Ptr[uint8]) -> int32:
+    dst: uint64 = cast[uint64](&_dm_corig_store[0]) + lba * SECTOR_SIZE
+    memcpy(cast[Ptr[uint8]](dst), buf, count * SECTOR_SIZE)
+    return 0
+
+
+def _dm_corig_register() -> int32:
+    # Register the dedicated dm-cache SLOW origin ramdisk as "dmcorig0".
+    existing: int32 = find_blockdev("dmcorig0")
+    if existing >= 0:
+        return existing
+    z: uint64 = 0
+    while z < 131072:
+        _dm_corig_store[z] = 0
+        z = z + 1
+    _dm_corig_ops.read_sectors  = _dm_corig_read
+    _dm_corig_ops.write_sectors = _dm_corig_write
+    _dm_corig_ops.flush         = cast[Fn[int32, uint64]](0)
+    return register_blockdev("dmcorig0", _DM_CORIG_SECTORS,
+                             &_dm_corig_ops, 0)
 
 
 def _dm_buf_eq(a: Ptr[uint8], b: Ptr[uint8], n: uint64) -> int32:
@@ -3187,7 +3670,10 @@ def dm_selftest() -> int32:
     if ok == 1:
         _dm_emerg0("[dm] verity PASS\n")
 
-    # Clean up the mapped devices (frees slots; leaves dmback0 in place).
+    # Free the earlier subtests' mapped-device slots BEFORE the cache subtest:
+    # the MappedDevice table holds DM_MAX_DEVICES (8) slots and tests 1..8 have
+    # already claimed all of them. Each device above is fully exercised, so
+    # releasing them now reclaims slots for the two cache devices below.
     dm_remove("dmlin0")
     dm_remove("dmcat0")
     dm_remove("dmcrypt0")
@@ -3196,6 +3682,222 @@ def dm_selftest() -> int32:
     dm_remove("dmint0")
     dm_remove("dmthin0")
     dm_remove("dmverity0")
+
+    # --- Test 9: dm-CACHE fast-device caching of a slow origin ---
+    # Build a cache device over a SMALL fast ramdisk (dmcfast0, 2 usable
+    # slots) fronting a LARGER slow origin (dmcorig0). 1-sector cache blocks,
+    # ncache=2 < nblocks=8 so eviction is forced. We PROVE:
+    #   (a) a COLD read of an origin block MISSes, PROMOTEs the block into a
+    #       cache slot, and serves the correct data; the SECOND read HITs (the
+    #       hit/miss counters are genuinely computed);
+    #   (b) WRITETHROUGH: a write updates BOTH cache and origin (origin stays
+    #       coherent) and the slot stays CLEAN;
+    #   (c) EVICTION of a DIRTY victim (writeback mode) writes the victim's
+    #       newest data BACK to the origin before reusing the slot, so no data
+    #       is lost;
+    #   (d) WRITEBACK: a write updates ONLY the cache (origin left STALE) until
+    #       an explicit FLUSH, after which the origin matches the cache.
+    cfast: int32 = _dm_cfast_register()
+    if cfast < 0:
+        _dm_emerg0("[device-mapper] FAIL: cache fast-device register\n")
+        return 0
+    corig: int32 = _dm_corig_register()
+    if corig < 0:
+        _dm_emerg0("[device-mapper] FAIL: cache origin register\n")
+        return 0
+    _dm_emerg2("[device-mapper] cache fast dmcfast0 slot=%d origin dmcorig0 slot=%d\n",
+               cast[uint64](cast[int64](cfast)),
+               cast[uint64](cast[int64](corig)))
+    # Distinct origin-block patterns (one sector each).
+    cbi: uint64 = 0
+    while cbi < SECTOR_SIZE:
+        _dm_cache_pa[cbi] = cast[uint8]((cbi * 3 + 10) & 0xFF)
+        _dm_cache_pb[cbi] = cast[uint8]((cbi * 5 + 20) & 0xFF)
+        _dm_cache_pc[cbi] = cast[uint8]((cbi * 7 + 30) & 0xFF)
+        _dm_cache_pd[cbi] = cast[uint8]((cbi * 11 + 40) & 0xFF)
+        _dm_cache_pw[cbi] = cast[uint8]((cbi * 13 + 50) & 0xFF)
+        cbi = cbi + 1
+    # Pre-seed origin blocks 0..3 directly on the slow device.
+    if blk_write_sectors(corig, 0, 1, &_dm_cache_pa[0]) != 0 or \
+       blk_write_sectors(corig, 1, 1, &_dm_cache_pb[0]) != 0 or \
+       blk_write_sectors(corig, 2, 1, &_dm_cache_pc[0]) != 0 or \
+       blk_write_sectors(corig, 3, 1, &_dm_cache_pd[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: cache origin seed\n")
+        return 0
+
+    # ---- WRITETHROUGH device: miss/hit accounting, eviction, coherence ----
+    cwt: int32 = dm_create_cache("dmcache-wt", cfast, corig, 1, 2, 8,
+                                 DM_CACHE_WRITETHROUGH)
+    if cwt < 0:
+        _dm_emerg1("[device-mapper] FAIL: dm_create_cache wt rc=%d\n",
+                   cast[uint64](cast[int64](cwt)))
+        return 0
+    wtctx: int32 = dm_cache_ctx_of("dmcache-wt")
+
+    # (a) Cold read of block 0 -> MISS then promote; data must equal pattern A.
+    if blk_read_sectors(cwt, 0, 1, &_dm_cache_rd[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: cache cold read blk0\n")
+        return 0
+    h0: int64 = dm_cache_hits(wtctx)
+    m0: int64 = dm_cache_misses(wtctx)
+    if _dm_buf_eq(&_dm_cache_rd[0], &_dm_cache_pa[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: cache cold read wrong data\n")
+        ok = 0
+    elif h0 != 0 or m0 != 1:
+        _dm_emerg2("[device-mapper] FAIL: cache cold read accounting (hits=%d misses=%d)\n",
+                   cast[uint64](h0), cast[uint64](m0))
+        ok = 0
+    else:
+        _dm_emerg0("[dm] cache cold read MISS + promote OK\n")
+    # Second read of block 0 -> HIT (hits 0 -> 1, misses unchanged).
+    if blk_read_sectors(cwt, 0, 1, &_dm_cache_rd[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: cache warm read blk0\n")
+        return 0
+    h1: int64 = dm_cache_hits(wtctx)
+    m1: int64 = dm_cache_misses(wtctx)
+    if _dm_buf_eq(&_dm_cache_rd[0], &_dm_cache_pa[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: cache warm read wrong data\n")
+        ok = 0
+    elif h1 != 1 or m1 != 1:
+        _dm_emerg2("[device-mapper] FAIL: cache warm read accounting (hits=%d misses=%d)\n",
+                   cast[uint64](h1), cast[uint64](m1))
+        ok = 0
+    else:
+        _dm_emerg0("[dm] cache warm read HIT OK\n")
+
+    # (b) WRITETHROUGH coherence: write a new pattern to block 0 through the
+    # cache; both the cache AND the raw origin must hold it, and a re-read
+    # through the cache (a HIT) returns it.
+    if blk_write_sectors(cwt, 0, 1, &_dm_cache_pw[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: cache writethrough write\n")
+        return 0
+    if blk_read_sectors(corig, 0, 1, &_dm_cache_raw[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: cache wt raw origin read\n")
+        return 0
+    if _dm_buf_eq(&_dm_cache_raw[0], &_dm_cache_pw[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: cache writethrough origin stale\n")
+        ok = 0
+    else:
+        _dm_emerg0("[dm] cache writethrough origin coherent OK\n")
+
+    # (c) EVICTION of a CLEAN victim: only 2 slots exist; blocks 0 and 1 are
+    # currently resident (block 0 promoted above; promote block 1 now). Then
+    # touch blocks 2 and 3 to force two evictions. Because writethrough keeps
+    # every slot CLEAN, the evicted blocks' origin data is already coherent,
+    # so re-reading every block through the cache returns the correct bytes
+    # (block 0 = pattern W after the writethrough; 1/2/3 = B/C/D).
+    if blk_read_sectors(cwt, 1, 1, &_dm_cache_rd[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: cache promote blk1\n")
+        return 0
+    # Now both slots hold {0, 1}. Read block 2 -> evicts LRU (block 0), block 3
+    # -> evicts block 1. After this no original block is resident.
+    if blk_read_sectors(cwt, 2, 1, &_dm_cache_rd[0]) != 0 or \
+       blk_read_sectors(cwt, 3, 1, &_dm_cache_rd[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: cache eviction reads\n")
+        return 0
+    # Re-read every block; the data must still be correct (clean evictions).
+    cwt_ok: int32 = 1
+    if blk_read_sectors(cwt, 0, 1, &_dm_cache_rd[0]) != 0 or \
+       _dm_buf_eq(&_dm_cache_rd[0], &_dm_cache_pw[0], SECTOR_SIZE) != 1:
+        cwt_ok = 0
+    if blk_read_sectors(cwt, 1, 1, &_dm_cache_rd[0]) != 0 or \
+       _dm_buf_eq(&_dm_cache_rd[0], &_dm_cache_pb[0], SECTOR_SIZE) != 1:
+        cwt_ok = 0
+    if blk_read_sectors(cwt, 2, 1, &_dm_cache_rd[0]) != 0 or \
+       _dm_buf_eq(&_dm_cache_rd[0], &_dm_cache_pc[0], SECTOR_SIZE) != 1:
+        cwt_ok = 0
+    if blk_read_sectors(cwt, 3, 1, &_dm_cache_rd[0]) != 0 or \
+       _dm_buf_eq(&_dm_cache_rd[0], &_dm_cache_pd[0], SECTOR_SIZE) != 1:
+        cwt_ok = 0
+    if cwt_ok != 1:
+        _dm_emerg0("[device-mapper] FAIL: cache clean-eviction data loss\n")
+        ok = 0
+    else:
+        _dm_emerg0("[dm] cache clean eviction preserves data OK\n")
+
+    # ---- WRITEBACK device: dirty stale-until-flush + dirty-victim writeback.
+    cwb: int32 = dm_create_cache("dmcache-wb", cfast, corig, 1, 2, 8,
+                                 DM_CACHE_WRITEBACK)
+    if cwb < 0:
+        _dm_emerg1("[device-mapper] FAIL: dm_create_cache wb rc=%d\n",
+                   cast[uint64](cast[int64](cwb)))
+        return 0
+    wbctx: int32 = dm_cache_ctx_of("dmcache-wb")
+    # Reset origin blocks 0/1 to fresh known patterns A/B (the wt phase left
+    # block 0 as W); use them as the writeback baseline.
+    if blk_write_sectors(corig, 0, 1, &_dm_cache_pa[0]) != 0 or \
+       blk_write_sectors(corig, 1, 1, &_dm_cache_pb[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: cache wb origin reset\n")
+        return 0
+
+    # (d) WRITEBACK leaves origin stale: write pattern W to block 0 through the
+    # writeback cache. The cache must return W on read, but the RAW origin must
+    # still hold the OLD pattern A (stale) until a flush.
+    if blk_write_sectors(cwb, 0, 1, &_dm_cache_pw[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: cache writeback write\n")
+        return 0
+    if blk_read_sectors(cwb, 0, 1, &_dm_cache_rd[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: cache writeback read\n")
+        return 0
+    if blk_read_sectors(corig, 0, 1, &_dm_cache_raw[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: cache wb raw origin read\n")
+        return 0
+    if _dm_buf_eq(&_dm_cache_rd[0], &_dm_cache_pw[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: cache writeback cache wrong data\n")
+        ok = 0
+    elif _dm_buf_eq(&_dm_cache_raw[0], &_dm_cache_pa[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: cache writeback origin not stale\n")
+        ok = 0
+    else:
+        _dm_emerg0("[dm] cache writeback origin stale before flush OK\n")
+    # Explicit FLUSH: origin must now match the cache (pattern W at block 0).
+    if dm_cache_writeback_all(wbctx) != 0:
+        _dm_emerg0("[device-mapper] FAIL: cache writeback flush rc\n")
+        return 0
+    if blk_read_sectors(corig, 0, 1, &_dm_cache_raw[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: cache wb raw origin read (post-flush)\n")
+        return 0
+    if _dm_buf_eq(&_dm_cache_raw[0], &_dm_cache_pw[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: cache writeback flush did not persist\n")
+        ok = 0
+    else:
+        _dm_emerg0("[dm] cache writeback flush makes origin coherent OK\n")
+
+    # (e) EVICTION of a DIRTY victim writes it back automatically. Origin
+    # block 1 currently = pattern B. Dirty block 1 in the writeback cache by
+    # writing pattern C to it (cache holds {0:W, 1:C}; origin block 1 still B).
+    if blk_write_sectors(cwb, 1, 1, &_dm_cache_pc[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: cache wb dirty blk1 write\n")
+        return 0
+    if blk_read_sectors(corig, 1, 1, &_dm_cache_raw[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: cache wb raw blk1 (pre-evict)\n")
+        return 0
+    if _dm_buf_eq(&_dm_cache_raw[0], &_dm_cache_pb[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: cache wb dirty blk1 not stale pre-evict\n")
+        ok = 0
+    # Force eviction: both slots full {0,1}; read block 2 then block 3, which
+    # evict the two LRU slots (blocks 0 and 1). The dirty victim (block 1 = C)
+    # must be written BACK to origin during eviction.
+    if blk_read_sectors(cwb, 2, 1, &_dm_cache_rd[0]) != 0 or \
+       blk_read_sectors(cwb, 3, 1, &_dm_cache_rd[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: cache wb eviction reads\n")
+        return 0
+    if blk_read_sectors(corig, 1, 1, &_dm_cache_raw[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: cache wb raw blk1 (post-evict)\n")
+        return 0
+    if _dm_buf_eq(&_dm_cache_raw[0], &_dm_cache_pc[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: cache dirty victim not written back\n")
+        ok = 0
+    else:
+        _dm_emerg0("[dm] cache dirty-victim eviction writeback OK\n")
+
+    if ok == 1:
+        _dm_emerg0("[dm] cache PASS\n")
+
+    # Clean up the cache mapped devices (the earlier targets were already
+    # removed before the cache subtest; this leaves dmback0 in place).
+    dm_remove("dmcache-wt")
+    dm_remove("dmcache-wb")
 
     if ok == 1:
         _dm_emerg0("[device-mapper] PASS\n")
