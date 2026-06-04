@@ -3176,7 +3176,33 @@ class X86CodeGen:
             return
         self.gen_index_address(expr)
         size = self.element_size_of(expr.obj)
-        self.emit_load_sized(size, "%rax", "%rax")
+        # Sign-extend when the element type is a known SIGNED sub-8-byte
+        # integer (e.g. `cast[Ptr[int32]](p)[0]`), so a negative value loaded
+        # via indexing compares correctly against negative immediates / in
+        # int64 context. Without this, a 4-byte int32 -9 zero-extends to a
+        # positive 0x00000000FFFFFFF7 and `... >= 0` is silently true.
+        signed = self._index_elem_is_signed(expr.obj)
+        self.emit_load_sized_signed(size, signed, "%rax", "%rax")
+
+    def _index_elem_is_signed(self, container: Expr) -> bool:
+        """True if container's element/base type is a known signed integer.
+        Defaults to False (zero-extend) for unknown / unsigned / aggregate
+        element types, preserving the historical behaviour for those."""
+        t = self.get_expr_type(container)
+        elem = None
+        if isinstance(t, ArrayType):
+            elem = t.element_type
+        elif isinstance(t, PointerType):
+            elem = t.base_type
+        if elem is None:
+            return False
+        if not (hasattr(elem, "name")
+                and getattr(elem, "name", None) in self._INT_NAMES):
+            return False
+        unsigned = self._is_unsigned_type(elem)
+        # _is_unsigned_type may return None (unknown); treat that as unsigned
+        # (zero-extend) to stay conservative.
+        return unsigned is False
 
     def _emit_gs_load_sized(self, size: int, disp: int, addr_suffix: str,
                             dst: str) -> None:

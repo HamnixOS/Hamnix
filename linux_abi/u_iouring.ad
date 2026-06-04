@@ -48,7 +48,7 @@ from fs.vfs import (
     vfs_alloc_l2_fd, vfs_fd_marker,
     vfs_read, vfs_write, vfs_fsync, vfs_lseek, vfs_close, vfs_open_memfd,
     vfs_open, vfs_open_write, vfs_fd_poll, vfs_fd_is_dir, vfs_fd_mtime,
-    resolve_path,
+    resolve_path, vfs_pipe,
 )
 from arch.x86.kernel.time import (
     get_jiffies,
@@ -94,12 +94,30 @@ IORING_OP_FSYNC:       uint8 = 3
 IORING_OP_READ_FIXED:  uint8 = 4
 IORING_OP_WRITE_FIXED: uint8 = 5
 IORING_OP_POLL_ADD:    uint8 = 6
+IORING_OP_POLL_REMOVE: uint8 = 7
+IORING_OP_TIMEOUT:     uint8 = 11
+IORING_OP_ASYNC_CANCEL: uint8 = 14
+IORING_OP_LINK_TIMEOUT: uint8 = 15
 IORING_OP_FALLOCATE:   uint8 = 17
 IORING_OP_OPENAT:      uint8 = 18
 IORING_OP_CLOSE:       uint8 = 19
 IORING_OP_STATX:       uint8 = 21
 IORING_OP_READ:        uint8 = 22
 IORING_OP_WRITE:       uint8 = 23
+
+# SQE flags byte (io_uring_sqe.flags, +1). The link bits chain SQEs so the
+# next SQE does not start until this one completes; a failed link cancels
+# the rest of the chain.
+IOSQE_IO_LINK:     uint8 = 0x04      # this SQE links to the next
+IOSQE_IO_HARDLINK: uint8 = 0x08      # link survives a failed SQE
+
+# IORING_TIMEOUT_* flags (sqe.timeout_flags, carried in op_flags +28).
+IORING_TIMEOUT_ABS: uint32 = 0x1     # off is an absolute jiffy deadline
+
+# Extra errnos used by the control-flow opcodes.
+IOU_ENOENT:    int64 = -2
+IOU_ETIME:     int64 = -62           # -ETIME (timeout expired)
+IOU_ECANCELED: int64 = -125          # -ECANCELED (request was cancelled)
 
 # io_uring_register opcodes.
 IORING_REGISTER_BUFFERS:   uint32 = 0
@@ -169,6 +187,66 @@ _ring_reg_nbuf:  Array[8, uint32]
 _ring_reg_nfile: Array[8, uint32]
 _ring_buf_base:  Array[128, uint64]
 _ring_buf_len:   Array[128, uint64]
+
+# --- in-flight POLL_ADD registry (per ring) -------------------------
+#
+# POLL_ADD on a NOT-currently-ready fd arms a pending request instead of
+# completing immediately: it is recorded here keyed by user_data, and its
+# CQE is posted at the END of the io_uring_enter batch (re-sampling the fd)
+# UNLESS a POLL_REMOVE / ASYNC_CANCEL targeting the same user_data cancels
+# it first (which posts -ECANCELED for the poll and 0 for the cancel SQE).
+# This gives the cancel opcodes real, observable semantics in the
+# synchronous-completion model: a poll that is not yet satisfied is a live,
+# cancellable in-flight request for the duration of the enter() call.
+# Flat [ring*IOURING_MAX_POLL + idx]. _poll_live==1 marks an armed slot.
+IOURING_MAX_POLL: uint64 = 16
+_poll_live:  Array[128, int32]       # 1 if this poll slot is armed
+_poll_ud:    Array[128, uint64]      # user_data identifying the request
+_poll_fd:    Array[128, int32]       # the polled fd
+_poll_mask:  Array[128, uint32]      # requested poll event mask
+
+
+def _poll_slot(su: uint64, idx: uint64) -> uint64:
+    return su * IOURING_MAX_POLL + idx
+
+
+def _poll_clear_ring(su: uint64):
+    # Drop every armed poll for a ring (called at enter-entry and teardown).
+    pi: uint64 = 0
+    while pi < IOURING_MAX_POLL:
+        ps: uint64 = _poll_slot(su, pi)
+        _poll_live[ps] = 0
+        _poll_ud[ps] = 0
+        _poll_fd[ps] = -1
+        _poll_mask[ps] = 0
+        pi = pi + 1
+
+
+def _poll_arm(su: uint64, ud: uint64, fd: int32, mask: uint32) -> int64:
+    # Record a pending poll. Returns 0 on success or -ENOMEM if the per-ring
+    # poll table is full.
+    pi: uint64 = 0
+    while pi < IOURING_MAX_POLL:
+        ps: uint64 = _poll_slot(su, pi)
+        if _poll_live[ps] == 0:
+            _poll_live[ps] = 1
+            _poll_ud[ps] = ud
+            _poll_fd[ps] = fd
+            _poll_mask[ps] = mask
+            return 0
+        pi = pi + 1
+    return IOU_ENOMEM
+
+
+def _poll_find(su: uint64, ud: uint64) -> int64:
+    # Return the armed-poll slot index for user_data `ud`, or -1.
+    pi: uint64 = 0
+    while pi < IOURING_MAX_POLL:
+        ps: uint64 = _poll_slot(su, pi)
+        if _poll_live[ps] != 0 and _poll_ud[ps] == ud:
+            return cast[int64](pi)
+        pi = pi + 1
+    return -1
 
 
 def _iouring_pool_init():
@@ -419,6 +497,8 @@ def _iouring_teardown_slot(su: uint64):
         _ring_buf_base[tslot] = 0
         _ring_buf_len[tslot] = 0
         tb = tb + 1
+    # Drop any armed in-flight polls for this slot.
+    _poll_clear_ring(su)
 
 
 def iouring_close_fd(fd: int32) -> int32:
@@ -483,6 +563,7 @@ def iouring_mmap_region(fd: int32, offset: uint64) -> uint64:
 #   u64 user_data;    +32  (echoed verbatim into the CQE)
 #   ... (rest unused here)
 SQE_OPCODE:    uint64 = 0
+SQE_FLAGS:     uint64 = 1       # IOSQE_* link bits
 SQE_FD:        uint64 = 4
 SQE_OFF:       uint64 = 8
 SQE_ADDR:      uint64 = 16
@@ -742,11 +823,105 @@ def _iouring_do_fallocate(fd: int32, off: uint64, len_bytes: uint64) -> int64:
     return 0
 
 
+# --- TIMEOUT / cancel opcode helpers --------------------------------
+#
+# These need ring + completion-batch context (the count of CQEs already
+# posted this enter(), and the per-ring poll registry), so they live OUT
+# of the generic _iouring_exec_sqe (which only sees the SQE) and are
+# dispatched directly from the submission loop.
+
+
+def _iouring_do_timeout(sqe: uint64, posted: uint32) -> int64:
+    # IORING_OP_TIMEOUT. Two modes, selected by the `off` field:
+    #   * count mode (off > 0): complete with 0 if at least `off` completion
+    #     events have already been posted in this enter() batch, else -ETIME.
+    #     This is the "wait for N completions, else time out" idiom — in the
+    #     synchronous-completion model every submitted op has already
+    #     completed by the time the TIMEOUT is reached, so the count is known.
+    #   * relative-time mode (off == 0): the timespec at `addr` gives a delay.
+    #     There is no pending async work for a relative timeout to wait on in
+    #     this synchronous model, so the deadline has effectively already
+    #     elapsed: it expires immediately with -ETIME (the canonical
+    #     "io_uring timeout fired" result).
+    off:  uint64 = cast[Ptr[uint64]](sqe + SQE_OFF)[0]
+    addr: uint64 = cast[Ptr[uint64]](sqe + SQE_ADDR)[0]
+    count: uint32 = cast[Ptr[uint32]](sqe + SQE_LEN)[0]
+    if off != 0:
+        # Count-timeout: target is `off` completions; `count` (len) carries
+        # the same target in liburing's prep_timeout, so honour whichever is
+        # set. Met -> 0, otherwise -ETIME.
+        target: uint64 = off
+        if cast[uint64](count) > target:
+            target = cast[uint64](count)
+        if cast[uint64](posted) >= target:
+            return 0
+        return IOU_ETIME
+    # Relative-time mode: a struct timespec { s64 tv_sec; s64 tv_nsec; } may
+    # live at addr. We read it (for a real non-zero delay we still expire
+    # immediately — no async producer can satisfy it) purely so a malformed
+    # pointer is tolerated like Linux. The result is always -ETIME on expiry.
+    if addr != 0:
+        # touch the timespec so the contract (addr points at a timespec) is
+        # exercised; its value does not change the synchronous outcome.
+        tv_sec: int64 = cast[Ptr[int64]](addr + 0)[0]
+        tv_nsec: int64 = cast[Ptr[int64]](addr + 8)[0]
+        if tv_sec < 0 or tv_nsec < 0:
+            return IOU_EINVAL
+    return IOU_ETIME
+
+
+def _iouring_do_cancel(su: uint64, target_ud: uint64) -> int64:
+    # IORING_OP_POLL_REMOVE / IORING_OP_ASYNC_CANCEL. Look up an armed
+    # in-flight poll by user_data; if found, post a -ECANCELED CQE for the
+    # cancelled request, drop it from the registry, and return 0 (the cancel
+    # SQE itself completes 0 = "found"). If no such request is in flight,
+    # return -ENOENT. Both POLL_REMOVE and ASYNC_CANCEL share this body —
+    # ASYNC_CANCEL is the general form, POLL_REMOVE the poll-specific name.
+    slot64: int64 = _poll_find(su, target_ud)
+    if slot64 < 0:
+        return IOU_ENOENT
+    ps: uint64 = _poll_slot(su, cast[uint64](slot64))
+    cancelled_ud: uint64 = _poll_ud[ps]
+    _poll_live[ps] = 0
+    _poll_ud[ps] = 0
+    _poll_fd[ps] = -1
+    _poll_mask[ps] = 0
+    # Post the cancelled request's own completion (-ECANCELED) first.
+    _iouring_post_cqe(su, cancelled_ud, IOU_ECANCELED)
+    return 0
+
+
+def _iouring_flush_pending_polls(su: uint64):
+    # End-of-enter() flush: any poll still armed (never cancelled) completes
+    # now. We re-sample the fd's CURRENT readiness (vfs_fd_poll) and post the
+    # intersection with the requested mask — the same result a synchronous
+    # POLL_ADD would have produced, just deferred so it stayed cancellable
+    # for the duration of the batch.
+    pi: uint64 = 0
+    while pi < IOURING_MAX_POLL:
+        ps: uint64 = _poll_slot(su, pi)
+        if _poll_live[ps] != 0:
+            fdv: int32 = _poll_fd[ps]
+            udv: uint64 = _poll_ud[ps]
+            res: int64 = _iouring_do_poll_add(fdv, _poll_mask[ps])
+            _poll_live[ps] = 0
+            _poll_ud[ps] = 0
+            _poll_fd[ps] = -1
+            _poll_mask[ps] = 0
+            _iouring_post_cqe(su, udv, res)
+        pi = pi + 1
+
+
 def _iouring_exec_sqe(su: uint64, sqe: uint64) -> int64:
     # Decode one SQE and execute its opcode synchronously, returning the
     # result the CQE should carry (>=0 bytes / 0 success, or -errno).
     # `su` is the owning ring-context slot (needed to resolve the
     # registered fixed-buffer table for READ_FIXED / WRITE_FIXED).
+    #
+    # NOTE: the control-flow opcodes (TIMEOUT, POLL_ADD-deferred,
+    # POLL_REMOVE, ASYNC_CANCEL, LINK_TIMEOUT) are handled directly in the
+    # submission loop (they need completion-batch / poll-registry context);
+    # they never reach here.
     opcode: uint8 = cast[Ptr[uint8]](sqe + SQE_OPCODE)[0]
     fd: int32 = cast[Ptr[int32]](sqe + SQE_FD)[0]
     off: uint64 = cast[Ptr[uint64]](sqe + SQE_OFF)[0]
@@ -905,9 +1080,27 @@ def io_uring_enter(a0: uint64, a1: uint64, a2: uint64,
     sq_head: uint32 = _u32_load(sq_base, RING_HDR_HEAD)
     sq_tail: uint32 = _u32_load(sq_base, RING_HDR_TAIL)
 
+    # NOTE: a deferred POLL_ADD is flushed (completed) at the END of this
+    # same enter() batch, so no armed poll survives a batch — every batch
+    # therefore starts with an empty poll registry. A POLL_ADD and the
+    # POLL_REMOVE/ASYNC_CANCEL that targets it must be submitted in the SAME
+    # enter() batch (the canonical io_uring usage), so the cancel runs before
+    # the flush and finds the still-armed poll.
+
+    # posted == count of CQEs we have published this batch (TIMEOUT
+    # count-mode reads it). chain_broken == a linked SQE earlier in the
+    # CURRENT link chain failed, so the rest of the chain is auto-cancelled
+    # with -ECANCELED. prev_ud / prev_was_link track the immediately
+    # preceding SQE so a LINK_TIMEOUT can attach to it.
+    posted: uint32 = 0
+    chain_broken: int32 = 0
+    prev_ud: uint64 = 0
+    prev_was_link: int32 = 0
+
     # Consume up to to_submit SQEs that userspace has published (between
     # head and tail). Each consumed SQE is executed inline and its CQE
-    # posted immediately.
+    # posted immediately, honouring IOSQE_IO_LINK chain ordering/cancel
+    # semantics and the control-flow opcodes.
     while submitted < to_submit and sq_head != sq_tail:
         arr_idx: uint32 = sq_head & mask
         # SQ `array` indirection: array[arr_idx] -> sqe slot.
@@ -916,10 +1109,86 @@ def io_uring_enter(a0: uint64, a1: uint64, a2: uint64,
         sqe_idx = sqe_idx & mask
         sqe: uint64 = sqes + cast[uint64](sqe_idx) * SQE_BYTES
         user_data: uint64 = cast[Ptr[uint64]](sqe + SQE_USER_DATA)[0]
-        res: int64 = _iouring_exec_sqe(su, sqe)
+        opcode: uint8 = cast[Ptr[uint8]](sqe + SQE_OPCODE)[0]
+        sflags: uint8 = cast[Ptr[uint8]](sqe + SQE_FLAGS)[0]
+        is_link: int32 = 0
+        if (sflags & IOSQE_IO_LINK) != 0 or (sflags & IOSQE_IO_HARDLINK) != 0:
+            is_link = 1
+        is_hardlink: int32 = 0
+        if (sflags & IOSQE_IO_HARDLINK) != 0:
+            is_hardlink = 1
+
+        res: int64 = 0
+        if chain_broken != 0:
+            # An earlier linked SQE in this chain failed: cancel this one.
+            res = IOU_ECANCELED
+        elif opcode == IORING_OP_TIMEOUT:
+            res = _iouring_do_timeout(sqe, posted)
+        elif opcode == IORING_OP_LINK_TIMEOUT:
+            # A timeout attached to the PREVIOUS linked SQE. In the
+            # synchronous model the linked target already completed before we
+            # reach its LINK_TIMEOUT, so the timeout never has to fire: it
+            # completes with -ECANCELED (the standard result for a
+            # link-timeout whose target finished in time — the timeout itself
+            # is cancelled). If there was no preceding linked SQE it is a
+            # plain -EINVAL.
+            if prev_was_link != 0:
+                res = IOU_ECANCELED
+            else:
+                res = IOU_EINVAL
+        elif opcode == IORING_OP_POLL_REMOVE or opcode == IORING_OP_ASYNC_CANCEL:
+            # Target request user_data lives in the SQE addr field for both
+            # (poll_remove: sqe->addr; async_cancel: sqe->addr).
+            target_ud: uint64 = cast[Ptr[uint64]](sqe + SQE_ADDR)[0]
+            res = _iouring_do_cancel(su, target_ud)
+        elif opcode == IORING_OP_POLL_ADD:
+            # Deferred poll: if the fd is already ready, complete now; else
+            # arm it as an in-flight request that stays cancellable until the
+            # end of this enter() (then flushed by _iouring_flush_pending_polls).
+            pfd: int32 = cast[Ptr[int32]](sqe + SQE_FD)[0]
+            pmask: uint32 = cast[Ptr[uint32]](sqe + SQE_OP_FLAGS)[0] & 0xFFFF
+            ready_now: int64 = _iouring_do_poll_add(pfd, pmask)
+            if ready_now > 0 or ready_now < 0:
+                res = ready_now            # ready or error -> complete now
+            else:
+                # Not ready: arm and defer. Do NOT post a CQE yet; skip the
+                # post below by continuing after advancing the chain state.
+                arm: int64 = _poll_arm(su, user_data, pfd, pmask)
+                if arm < 0:
+                    res = arm              # table full -> complete with error
+                else:
+                    # Deferred: advance SQ bookkeeping, leave chain state,
+                    # and move on without posting a CQE now.
+                    prev_ud = user_data
+                    prev_was_link = is_link
+                    if is_link == 0:
+                        chain_broken = 0
+                    sq_head = sq_head + 1
+                    submitted = submitted + 1
+                    continue
+        else:
+            res = _iouring_exec_sqe(su, sqe)
+
         _iouring_post_cqe(su, user_data, res)
+        posted = posted + 1
+
+        # Update link-chain state for the NEXT SQE.
+        if is_link != 0:
+            # If this linked SQE failed, break the rest of the chain — unless
+            # it is a HARDLINK, which keeps the chain running past a failure.
+            if res < 0 and is_hardlink == 0:
+                chain_broken = 1
+        else:
+            # Chain terminates here; the next SQE starts a fresh chain.
+            chain_broken = 0
+        prev_ud = user_data
+        prev_was_link = is_link
+
         sq_head = sq_head + 1
         submitted = submitted + 1
+
+    # Flush any poll that stayed armed (never cancelled) — it completes now.
+    _iouring_flush_pending_polls(su)
 
     # Publish the new SQ head so userspace knows what we consumed.
     _u32_store(sq_base, RING_HDR_HEAD, sq_head)
@@ -1599,6 +1868,277 @@ def _iouring_selftest_body():
         return
     vfs_close(ofd_r)
     printk0("[iouring] PASS: POLL_ADD one-shot readiness (POLLIN ready)\n")
+
+    # --- (4e) LINKED SQEs: first succeeds, second runs after it --------
+    # Build a 2-SQE link: SQE[0]=NOP(IOSQE_IO_LINK, ud 0x7001) followed by
+    # SQE[1]=WRITE(tfd, "LN", 2, ud 0x7002). The link flag makes the WRITE
+    # wait for the NOP; both complete (NOP res 0, WRITE res 2). Submit BOTH
+    # in one enter() batch (to_submit=2, min_complete=2).
+    lfd: int32 = vfs_open_memfd("iouring-link", 0)
+    if lfd < 0:
+        _iou_fail("could not open memfd for link test")
+        vfs_close(fd)
+        return
+    _iou_src[0] = cast[uint8](76)        # 'L'
+    _iou_src[1] = cast[uint8](78)        # 'N'
+    sqe_l0: uint64 = sqes + 0
+    _iou_zero_sqe(sqe_l0)
+    cast[Ptr[uint8]](sqe_l0 + SQE_OPCODE)[0] = IORING_OP_NOP
+    cast[Ptr[uint8]](sqe_l0 + SQE_FLAGS)[0] = IOSQE_IO_LINK
+    cast[Ptr[uint64]](sqe_l0 + SQE_USER_DATA)[0] = cast[uint64](0x7001)
+    sqe_l1: uint64 = sqes + 1 * SQE_BYTES
+    _iou_zero_sqe(sqe_l1)
+    cast[Ptr[uint8]](sqe_l1 + SQE_OPCODE)[0] = IORING_OP_WRITE
+    cast[Ptr[int32]](sqe_l1 + SQE_FD)[0] = lfd
+    cast[Ptr[uint64]](sqe_l1 + SQE_ADDR)[0] = cast[uint64](&_iou_src[0])
+    cast[Ptr[uint32]](sqe_l1 + SQE_LEN)[0] = 2
+    cast[Ptr[uint64]](sqe_l1 + SQE_USER_DATA)[0] = cast[uint64](0x7002)
+    # Publish both SQEs (array[tail]=0, array[tail+1]=1) and enter(2,2).
+    lt: uint32 = _u32_load(sq_base, RING_HDR_TAIL)
+    cast[Ptr[uint32]](sq_array + cast[uint64](lt & mask) * 4)[0] = 0
+    cast[Ptr[uint32]](sq_array + cast[uint64]((lt + 1) & mask) * 4)[0] = 1
+    _u32_store(sq_base, RING_HDR_TAIL, lt + 2)
+    el: int64 = io_uring_enter(cast[uint64](fd), 2, 2,
+                               cast[uint64](IORING_ENTER_GETEVENTS), 0, 0)
+    if el != 2:
+        _iou_fail("enter(linked NOP+WRITE) did not report 2 submissions")
+        vfs_close(lfd)
+        vfs_close(fd)
+        return
+    lch: uint32 = _u32_load(cq_base, RING_HDR_HEAD)
+    lcqe0: uint64 = cq_cqes + cast[uint64](lch & mask) * CQE_BYTES
+    lcqe1: uint64 = cq_cqes + cast[uint64]((lch + 1) & mask) * CQE_BYTES
+    if cast[Ptr[uint64]](lcqe0 + 0)[0] != cast[uint64](0x7001):
+        _iou_fail("linked NOP CQE user_data wrong")
+        vfs_close(lfd)
+        vfs_close(fd)
+        return
+    if cast[Ptr[int32]](lcqe0 + 8)[0] != 0:
+        _iou_fail("linked NOP res not 0")
+        vfs_close(lfd)
+        vfs_close(fd)
+        return
+    if cast[Ptr[uint64]](lcqe1 + 0)[0] != cast[uint64](0x7002):
+        _iou_fail("linked WRITE CQE user_data wrong")
+        vfs_close(lfd)
+        vfs_close(fd)
+        return
+    if cast[Ptr[int32]](lcqe1 + 8)[0] != 2:
+        _iou_fail("linked WRITE did not run after NOP (res != 2)")
+        vfs_close(lfd)
+        vfs_close(fd)
+        return
+    _u32_store(cq_base, RING_HDR_HEAD, lch + 2)
+    vfs_close(lfd)
+    printk0("[iouring] PASS: linked SQEs (NOP -> WRITE ran in order)\n")
+
+    # --- (4f) LINK FAILURE auto-cancels the rest of the chain ----------
+    # SQE[0]=WRITE on a BAD fd (-1) with IOSQE_IO_LINK -> fails (-EBADF);
+    # SQE[1]=NOP linked after it must be auto-cancelled with -ECANCELED and
+    # MUST NOT execute. ud 0x7101 (fail) then 0x7102 (cancelled).
+    sqe_f0: uint64 = sqes + 0
+    _iou_zero_sqe(sqe_f0)
+    cast[Ptr[uint8]](sqe_f0 + SQE_OPCODE)[0] = IORING_OP_WRITE
+    cast[Ptr[int32]](sqe_f0 + SQE_FD)[0] = -1            # bad fd -> -EBADF
+    cast[Ptr[uint64]](sqe_f0 + SQE_ADDR)[0] = cast[uint64](&_iou_src[0])
+    cast[Ptr[uint32]](sqe_f0 + SQE_LEN)[0] = 2
+    cast[Ptr[uint8]](sqe_f0 + SQE_FLAGS)[0] = IOSQE_IO_LINK
+    cast[Ptr[uint64]](sqe_f0 + SQE_USER_DATA)[0] = cast[uint64](0x7101)
+    sqe_f1: uint64 = sqes + 1 * SQE_BYTES
+    _iou_zero_sqe(sqe_f1)
+    cast[Ptr[uint8]](sqe_f1 + SQE_OPCODE)[0] = IORING_OP_NOP
+    cast[Ptr[uint64]](sqe_f1 + SQE_USER_DATA)[0] = cast[uint64](0x7102)
+    ft: uint32 = _u32_load(sq_base, RING_HDR_TAIL)
+    cast[Ptr[uint32]](sq_array + cast[uint64](ft & mask) * 4)[0] = 0
+    cast[Ptr[uint32]](sq_array + cast[uint64]((ft + 1) & mask) * 4)[0] = 1
+    _u32_store(sq_base, RING_HDR_TAIL, ft + 2)
+    ef: int64 = io_uring_enter(cast[uint64](fd), 2, 2,
+                               cast[uint64](IORING_ENTER_GETEVENTS), 0, 0)
+    if ef != 2:
+        _iou_fail("enter(failing link) did not report 2 submissions")
+        vfs_close(fd)
+        return
+    fch: uint32 = _u32_load(cq_base, RING_HDR_HEAD)
+    fcqe0: uint64 = cq_cqes + cast[uint64](fch & mask) * CQE_BYTES
+    fcqe1: uint64 = cq_cqes + cast[uint64]((fch + 1) & mask) * CQE_BYTES
+    if cast[Ptr[uint64]](fcqe0 + 0)[0] != cast[uint64](0x7101):
+        _iou_fail("failing-link CQE0 user_data wrong")
+        vfs_close(fd)
+        return
+    fres0: int64 = cast[int64](cast[Ptr[int32]](fcqe0 + 8)[0])
+    if fres0 >= 0:
+        _iou_fail("failing-link WRITE did not fail")
+        vfs_close(fd)
+        return
+    if cast[Ptr[uint64]](fcqe1 + 0)[0] != cast[uint64](0x7102):
+        _iou_fail("cancelled-link CQE1 user_data wrong")
+        vfs_close(fd)
+        return
+    fres1: int64 = cast[int64](cast[Ptr[int32]](fcqe1 + 8)[0])
+    if fres1 != IOU_ECANCELED:
+        _iou_fail("linked SQE after failure not -ECANCELED")
+        vfs_close(fd)
+        return
+    _u32_store(cq_base, RING_HDR_HEAD, fch + 2)
+    printk0("[iouring] PASS: failed link auto-cancels chain (-ECANCELED)\n")
+
+    # --- (4g) TIMEOUT fires -ETIME -------------------------------------
+    # A relative TIMEOUT (off==0, timespec at addr) has no async work to
+    # wait on in the synchronous model and expires with -ETIME.
+    cast[Ptr[uint64]](cast[uint64](&_iou_src[0]) + 0)[0] = 0    # tv_sec
+    cast[Ptr[uint64]](cast[uint64](&_iou_src[0]) + 8)[0] = 0    # tv_nsec (timespec)
+    sqe_to: uint64 = sqes + 0
+    _iou_zero_sqe(sqe_to)
+    cast[Ptr[uint8]](sqe_to + SQE_OPCODE)[0] = IORING_OP_TIMEOUT
+    cast[Ptr[uint64]](sqe_to + SQE_OFF)[0] = 0           # relative-time mode
+    cast[Ptr[uint64]](sqe_to + SQE_ADDR)[0] = cast[uint64](&_iou_src[0])
+    cast[Ptr[uint32]](sqe_to + SQE_LEN)[0] = 1
+    cast[Ptr[uint64]](sqe_to + SQE_USER_DATA)[0] = cast[uint64](0x7201)
+    tores: int64 = _iou_run_one(fd, sq_base, cq_base, sq_array, cq_cqes,
+                                mask, 0, cast[uint64](0x7201))
+    if tores != IOU_ETIME:
+        _iou_fail("TIMEOUT did not complete with -ETIME")
+        vfs_close(fd)
+        return
+    printk0("[iouring] PASS: TIMEOUT fired -ETIME\n")
+
+    # --- (4h) POLL_ADD on a not-ready fd then ASYNC_CANCEL it ----------
+    # A pipe read-end with no writer queued is NOT readable, so POLL_ADD
+    # (POLLIN) on it defers (arms an in-flight request). An ASYNC_CANCEL
+    # targeting its user_data in the SAME enter() batch cancels it: the poll
+    # gets -ECANCELED, the cancel SQE gets 0. Submit both in one enter(2,2).
+    pipefds: Array[2, int32]
+    if vfs_pipe(&pipefds[0]) != 0:
+        _iou_fail("could not create pipe for poll-cancel test")
+        vfs_close(fd)
+        return
+    pipe_rd: int32 = pipefds[0]
+    pipe_wr: int32 = pipefds[1]
+    sqe_pp: uint64 = sqes + 0
+    _iou_zero_sqe(sqe_pp)
+    cast[Ptr[uint8]](sqe_pp + SQE_OPCODE)[0] = IORING_OP_POLL_ADD
+    cast[Ptr[int32]](sqe_pp + SQE_FD)[0] = pipe_rd
+    cast[Ptr[uint32]](sqe_pp + SQE_OP_FLAGS)[0] = 0x1    # POLLIN (not ready)
+    cast[Ptr[uint64]](sqe_pp + SQE_USER_DATA)[0] = cast[uint64](0x7301)
+    sqe_ac: uint64 = sqes + 1 * SQE_BYTES
+    _iou_zero_sqe(sqe_ac)
+    cast[Ptr[uint8]](sqe_ac + SQE_OPCODE)[0] = IORING_OP_ASYNC_CANCEL
+    cast[Ptr[uint64]](sqe_ac + SQE_ADDR)[0] = cast[uint64](0x7301)  # target ud
+    cast[Ptr[uint64]](sqe_ac + SQE_USER_DATA)[0] = cast[uint64](0x7302)
+    pt: uint32 = _u32_load(sq_base, RING_HDR_TAIL)
+    cast[Ptr[uint32]](sq_array + cast[uint64](pt & mask) * 4)[0] = 0
+    cast[Ptr[uint32]](sq_array + cast[uint64]((pt + 1) & mask) * 4)[0] = 1
+    _u32_store(sq_base, RING_HDR_TAIL, pt + 2)
+    ep: int64 = io_uring_enter(cast[uint64](fd), 2, 2,
+                               cast[uint64](IORING_ENTER_GETEVENTS), 0, 0)
+    if ep != 2:
+        _iou_fail("enter(poll+cancel) did not report 2 submissions")
+        vfs_close(pipe_rd)
+        vfs_close(pipe_wr)
+        vfs_close(fd)
+        return
+    # CQE order: the CANCEL posts the cancelled poll's -ECANCELED first
+    # (inside _iouring_do_cancel), then the cancel SQE's own 0. So:
+    #   CQE0 = poll (ud 0x7301, res -ECANCELED)
+    #   CQE1 = cancel (ud 0x7302, res 0)
+    pch: uint32 = _u32_load(cq_base, RING_HDR_HEAD)
+    pcqe0: uint64 = cq_cqes + cast[uint64](pch & mask) * CQE_BYTES
+    pcqe1: uint64 = cq_cqes + cast[uint64]((pch + 1) & mask) * CQE_BYTES
+    if cast[Ptr[uint64]](pcqe0 + 0)[0] != cast[uint64](0x7301):
+        _iou_fail("poll-cancel CQE0 user_data wrong")
+        vfs_close(pipe_rd)
+        vfs_close(pipe_wr)
+        vfs_close(fd)
+        return
+    pres0: int64 = cast[int64](cast[Ptr[int32]](pcqe0 + 8)[0])
+    if pres0 != IOU_ECANCELED:
+        _iou_fail("cancelled POLL_ADD not -ECANCELED")
+        vfs_close(pipe_rd)
+        vfs_close(pipe_wr)
+        vfs_close(fd)
+        return
+    if cast[Ptr[uint64]](pcqe1 + 0)[0] != cast[uint64](0x7302):
+        _iou_fail("poll-cancel CQE1 user_data wrong")
+        vfs_close(pipe_rd)
+        vfs_close(pipe_wr)
+        vfs_close(fd)
+        return
+    if cast[Ptr[int32]](pcqe1 + 8)[0] != 0:
+        _iou_fail("ASYNC_CANCEL of a live poll did not return 0 (found)")
+        vfs_close(pipe_rd)
+        vfs_close(pipe_wr)
+        vfs_close(fd)
+        return
+    _u32_store(cq_base, RING_HDR_HEAD, pch + 2)
+    printk0("[iouring] PASS: POLL_ADD then ASYNC_CANCEL round-trip\n")
+
+    # --- (4i) ASYNC_CANCEL of an unknown request -> -ENOENT ------------
+    sqe_nc: uint64 = sqes + 0
+    _iou_zero_sqe(sqe_nc)
+    cast[Ptr[uint8]](sqe_nc + SQE_OPCODE)[0] = IORING_OP_ASYNC_CANCEL
+    cast[Ptr[uint64]](sqe_nc + SQE_ADDR)[0] = cast[uint64](0xDEAD)  # no such ud
+    cast[Ptr[uint64]](sqe_nc + SQE_USER_DATA)[0] = cast[uint64](0x7401)
+    ncres: int64 = _iou_run_one(fd, sq_base, cq_base, sq_array, cq_cqes,
+                                mask, 0, cast[uint64](0x7401))
+    if ncres != IOU_ENOENT:
+        _iou_fail("ASYNC_CANCEL of unknown request did not return -ENOENT")
+        vfs_close(pipe_rd)
+        vfs_close(pipe_wr)
+        vfs_close(fd)
+        return
+    vfs_close(pipe_rd)
+    vfs_close(pipe_wr)
+    printk0("[iouring] PASS: ASYNC_CANCEL of unknown request -> -ENOENT\n")
+
+    # --- (4j) LINK_TIMEOUT attached to a linked SQE --------------------
+    # SQE[0]=NOP(IOSQE_IO_LINK, ud 0x7501); SQE[1]=LINK_TIMEOUT(ud 0x7502)
+    # attached to it. The NOP completes in time, so the link-timeout is
+    # cancelled (-ECANCELED) — the standard io_uring result for a
+    # link-timeout whose target finished before the deadline. The NOP
+    # itself completes 0.
+    sqe_lt0: uint64 = sqes + 0
+    _iou_zero_sqe(sqe_lt0)
+    cast[Ptr[uint8]](sqe_lt0 + SQE_OPCODE)[0] = IORING_OP_NOP
+    cast[Ptr[uint8]](sqe_lt0 + SQE_FLAGS)[0] = IOSQE_IO_LINK
+    cast[Ptr[uint64]](sqe_lt0 + SQE_USER_DATA)[0] = cast[uint64](0x7501)
+    sqe_lt1: uint64 = sqes + 1 * SQE_BYTES
+    _iou_zero_sqe(sqe_lt1)
+    cast[Ptr[uint8]](sqe_lt1 + SQE_OPCODE)[0] = IORING_OP_LINK_TIMEOUT
+    cast[Ptr[uint64]](sqe_lt1 + SQE_ADDR)[0] = cast[uint64](&_iou_src[0]) # timespec
+    cast[Ptr[uint64]](sqe_lt1 + SQE_USER_DATA)[0] = cast[uint64](0x7502)
+    ltt: uint32 = _u32_load(sq_base, RING_HDR_TAIL)
+    cast[Ptr[uint32]](sq_array + cast[uint64](ltt & mask) * 4)[0] = 0
+    cast[Ptr[uint32]](sq_array + cast[uint64]((ltt + 1) & mask) * 4)[0] = 1
+    _u32_store(sq_base, RING_HDR_TAIL, ltt + 2)
+    elt: int64 = io_uring_enter(cast[uint64](fd), 2, 2,
+                                cast[uint64](IORING_ENTER_GETEVENTS), 0, 0)
+    if elt != 2:
+        _iou_fail("enter(NOP+LINK_TIMEOUT) did not report 2 submissions")
+        vfs_close(fd)
+        return
+    ltch: uint32 = _u32_load(cq_base, RING_HDR_HEAD)
+    ltcqe0: uint64 = cq_cqes + cast[uint64](ltch & mask) * CQE_BYTES
+    ltcqe1: uint64 = cq_cqes + cast[uint64]((ltch + 1) & mask) * CQE_BYTES
+    if cast[Ptr[uint64]](ltcqe0 + 0)[0] != cast[uint64](0x7501):
+        _iou_fail("LINK_TIMEOUT target NOP user_data wrong")
+        vfs_close(fd)
+        return
+    lt_nop_res: int64 = cast[int64](cast[Ptr[int32]](ltcqe0 + 8)[0])
+    if lt_nop_res != 0:
+        _iou_fail("LINK_TIMEOUT target NOP res not 0")
+        vfs_close(fd)
+        return
+    if cast[Ptr[uint64]](ltcqe1 + 0)[0] != cast[uint64](0x7502):
+        _iou_fail("LINK_TIMEOUT CQE user_data wrong")
+        vfs_close(fd)
+        return
+    lt_res: int64 = cast[int64](cast[Ptr[int32]](ltcqe1 + 8)[0])
+    if lt_res != IOU_ECANCELED:
+        _iou_fail("LINK_TIMEOUT not cancelled after target completed in time")
+        vfs_close(fd)
+        return
+    _u32_store(cq_base, RING_HDR_HEAD, ltch + 2)
+    printk0("[iouring] PASS: LINK_TIMEOUT cancelled (target completed in time)\n")
 
     # --- (5) io_uring_register buffers round-trip ----------------------
     reg: int64 = io_uring_register(cast[uint64](fd), IORING_REGISTER_BUFFERS,
