@@ -1192,6 +1192,17 @@ if os.environ.get("ENABLE_KEYRING_TEST"):
 if os.environ.get("ENABLE_FUTEXV_TEST"):
     FILES.append(("/etc/futexv-test", b"1\n"))
 
+# ENABLE_PIDFD_GETFD_TEST=1 to plant /etc/pidfd-getfd-test. init/main.ad at
+# boot:37.pidfd_getfd detects the marker and calls pidfd_getfd_selftest()
+# (linux_abi/u_pidfd_getfd.ad): it opens a real file fd, derives a pidfd to
+# self, getfd's the fd into a new caller slot, asserts the two slots share one
+# backing object (the cross-process dup is real — marker + fd_buf identical and
+# the duplicate survives closing the source), then drives the
+# flags!=0/non-pidfd/closed-targetfd error paths, emitting the [pidfd-getfd]
+# PASS banner. Default boots omit the marker.
+if os.environ.get("ENABLE_PIDFD_GETFD_TEST"):
+    FILES.append(("/etc/pidfd-getfd-test", b"1\n"))
+
 # ENABLE_PROCESS_VM_TEST=1 to plant /etc/process-vm-test. init/main.ad at
 # boot:37.process_vm detects the marker and calls process_vm_selftest()
 # (linux_abi/u_process_vm.ad): it builds a real SECOND address space (a fresh

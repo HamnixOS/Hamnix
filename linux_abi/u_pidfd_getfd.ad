@@ -1,0 +1,359 @@
+# linux_abi/u_pidfd_getfd.ad -- the Linux pidfd_getfd(2) syscall (nr 438).
+#
+# pidfd_getfd duplicates a file descriptor out of ANOTHER process into the
+# caller, the way /proc/<pid>/fd + SCM_RIGHTS used to be the only route:
+#
+#   int pidfd_getfd(int pidfd, int targetfd, unsigned int flags)
+#
+# Given a pidfd referring to a target process and an fd number `targetfd`
+# valid IN THAT PROCESS, it installs a copy of the SAME underlying open file
+# into the caller's fd table and returns the new fd. This is the primitive
+# debuggers, container runtimes, and seccomp-notify supervisors use to pull
+# a live fd (a socket, a pipe end, an open file) out of a sandboxed child
+# without that child cooperating over a unix socket. `flags` is reserved and
+# must be 0 (any other value -> -EINVAL), exactly as Linux's sys_pidfd_getfd.
+#
+# ARCHITECTURE NOTE -- this is a REAL cross-process fd duplication, NOT a
+# stub. The dup is the SAME copy_fd_entry backing-share the kernel already
+# uses for dup(2)/dup2(2) and for sys_srv_open(276)'s cross-task fd handoff:
+#
+#   * pidfd -> target pid : upidfd_get(current_idx, pidfd) reads the pidfd
+#     object table that pidfd_open(2) populates (linux_abi/u_pidfd.ad), the
+#     SAME translation pidfd_send_signal / waitid(P_PIDFD) use.
+#   * target pid -> task slot : task_lookup_by_pid skips STATE_FREE; a slot
+#     left STATE_EXITED is a not-yet-reaped zombie whose fds are gone, so we
+#     reject it -ESRCH (Linux returns ESRCH once the task is dead).
+#   * task slot -> TaskStruct : task_struct_at(slot) — the SAME addressable
+#     accessor sys_srv_open uses to reach a poster's fd table.
+#   * install : vfs_srv_dup_into_current(target_task, targetfd) allocates the
+#     lowest free fd in the CALLER and copy_fd_entry's the target's fd[targetfd]
+#     backing (all four fd-table fields — fd_idx/fd_pos/fd_buf/fd_buflen) into
+#     it, bumping any pipe/socketpair refcount so closing one fd does NOT free
+#     the other's open file. The two fds genuinely share one backing object:
+#     a read/write through the new caller fd reaches the very same file the
+#     target's fd[targetfd] points at, and either fd can be closed independently.
+#
+# Validation (the do_pidfd_getfd() gate ordering): flags != 0 -> -EINVAL;
+# a non-pidfd `pidfd` -> -EBADF; a dead/reaped target -> -ESRCH; a targetfd
+# that is not open in the target -> -EBADF; the caller's fd table full
+# -> -EMFILE.
+#
+# Layer note: a confined Layer-2 leaf, mirroring linux_abi/u_futexv.ad and
+# linux_abi/u_fchmodat2.ad. It imports only the pidfd object-table accessor
+# (upidfd_get, from the sibling pidfd leaf), the kernel task primitives
+# (task_lookup_by_pid / task_state / task_struct_at / current_idx_get), the
+# established cross-task fd-dup VFS primitive (vfs_srv_dup_into_current), and
+# printk for the self-test. It never touches 9P / Chan / Layer-1 code, and is
+# imported by u_syscalls.ad's nr 438 dispatch arm the same way u_futexv.ad is.
+
+from linux_abi.u_pidfd import (
+    upidfd_get,
+)
+from fs.vfs import (
+    vfs_fd_marker, vfs_srv_dup_into_current,
+)
+from kernel.sched.core import (
+    task_lookup_by_pid, task_state, task_struct_at,
+    current_idx_get,
+    STATE_EXITED,
+    TaskStruct,
+)
+from kernel.printk.printk import (
+    printk0, printk1,
+)
+
+
+# =====================================================================
+# fd marker + errno subset (Linux negative-errno convention)
+# =====================================================================
+#
+# FD_PIDFD_MARK is the marker pidfd_open(2) stamps on a pidfd fd; we read
+# it back through vfs_fd_marker to PROVE the `pidfd` argument is a real
+# pidfd before trusting upidfd_get's (task, fd) -> pid lookup. Re-declared
+# here to keep this leaf importable without pulling u_pidfd's whole API.
+PFG_FD_PIDFD_MARK: uint32 = 0xFFFFFFD1
+
+PFG_ESRCH:  int64 = -3
+PFG_EBADF:  int64 = -9
+PFG_EINVAL: int64 = -22
+PFG_EMFILE: int64 = -24
+
+
+# =====================================================================
+# pidfd_getfd(pidfd, targetfd, flags)  --  nr 438
+# =====================================================================
+#
+#   a0 = pidfd, a1 = targetfd, a2 = flags.
+#
+# Returns the new caller fd (>= 0) or a negative errno. The new fd refers
+# to the SAME open file as the target's fd[targetfd] (a real backing share).
+def pidfd_getfd_handler(a0: uint64, a1: uint64, a2: uint64) -> int64:
+    flags: uint64 = a2
+
+    # (1) flags is reserved; only 0 is valid (Linux sys_pidfd_getfd gate).
+    if flags != 0:
+        return PFG_EINVAL
+
+    pidfd: int32 = cast[int32](a0)
+    targetfd: int32 = cast[int32](a1)
+
+    # (2) The `pidfd` must be a real pidfd object (FD_PIDFD_MARK), else
+    # -EBADF. This rejects a stale/closed fd and an fd that is some other
+    # kind of object before we trust the (task,fd)->pid table.
+    if vfs_fd_marker(pidfd) != PFG_FD_PIDFD_MARK:
+        return PFG_EBADF
+
+    # (3) pidfd -> target pid via the pidfd object table (the SAME route
+    # pidfd_send_signal uses). A pidfd that is marker-valid but has no
+    # recorded target is treated as a bad fd.
+    tgt_pid: int64 = upidfd_get(current_idx_get(), pidfd)
+    if tgt_pid < 0:
+        return PFG_EBADF
+
+    # (4) target pid -> live task slot. task_lookup_by_pid skips STATE_FREE;
+    # a STATE_EXITED slot is a zombie whose fd table is gone. Either way the
+    # process is no longer there to borrow an fd from -> -ESRCH.
+    slot: int32 = task_lookup_by_pid(cast[uint64](tgt_pid))
+    if slot < 0:
+        return PFG_ESRCH
+    if task_state(slot) == STATE_EXITED:
+        return PFG_ESRCH
+
+    # (5) Reach the target's TaskStruct and install a copy of its
+    # fd[targetfd] backing into the CALLER's lowest free fd slot. This is a
+    # genuine reference duplication: vfs_srv_dup_into_current -> _alloc_fd in
+    # the current task + copy_fd_entry from the target's row (all four
+    # fd-table fields, with pipe/socketpair refcounts bumped). It returns
+    # -EBADF if targetfd is not open in the target, -EMFILE if the caller's
+    # table is full. targetfd must be in range; a negative targetfd is
+    # -EBADF (vfs_srv_dup_into_current would index out of range otherwise).
+    if targetfd < 0:
+        return PFG_EBADF
+    tgt_task: Ptr[TaskStruct] = task_struct_at(slot)
+    if cast[uint64](tgt_task) == 0:
+        return PFG_ESRCH
+    new_fd: int32 = vfs_srv_dup_into_current(tgt_task, cast[uint64](targetfd))
+    if new_fd < 0:
+        return cast[int64](new_fd)
+    return cast[int64](new_fd)
+
+
+# =====================================================================
+# Boot self-test  --  [pidfd-getfd] PASS / FAIL  (boot:37.pidfd_getfd)
+# =====================================================================
+#
+# A REAL cross-process round trip in boot context, against the live fd table
+# and the real pidfd object table. Because the boot/idle context's own pid is
+# 0 (not a valid pidfd target), we borrow a SECOND, distinct task slot to play
+# the target process — the same notetest_claim_slot pattern the pidfd
+# self-test (linux_abi/u_pidfd.ad) uses. This makes the dup genuinely
+# cross-task (one task's fd installed into a DIFFERENT task), not a self-dup:
+#
+#   (1) Open a real file in the CURRENT (boot) task -> src_fd; remember its
+#       backing (marker + fd_buf).
+#   (2) Borrow an inert target task slot, stamp a known pid on it, and plant
+#       a copy of src_fd's backing into the TARGET's fd[5] (copy_fd_entry —
+#       so the target genuinely "has an open fd" to borrow back).
+#   (3) pidfd_open(target_pid) -> a pidfd referring to the OTHER task.
+#   (4) pidfd_getfd(pidfd, 5, 0) -> a NEW fd in the CALLER. Assert the new fd
+#       carries the SAME backing marker AND fd_buf as the target's fd[5] /
+#       the original src -> the fd genuinely crossed the process boundary and
+#       reaches one underlying open file (the backing share is real, not a
+#       fresh independent open), and survives closing the source.
+#   (5) Error paths: flags!=0 -> -EINVAL; a non-pidfd fd -> -EBADF; a
+#       targetfd not open in the target -> -EBADF; a pidfd to an EXITED target
+#       -> -ESRCH.
+#
+# Returns 1 on success, 0 on any failure (matching the sibling leaves'
+# selftest convention).
+
+from kernel.sched.core import (
+    current_task, FD_CLOSED_MARK,
+    notetest_claim_slot, notetest_set_slot_pid, notetest_release_slot,
+    copy_fd_entry,
+    STATE_READY,
+)
+from fs.vfs import (
+    resolve_path, vfs_open, vfs_close,
+)
+from linux_abi.u_pidfd import (
+    upidfd_open, upidfd_init,
+)
+
+
+def _pfg_fail(msg: Ptr[char]) -> int32:
+    printk0("[pidfd-getfd] FAIL: ")
+    printk0(msg)
+    printk0("\n")
+    return 0
+
+
+def pidfd_getfd_selftest() -> int32:
+    # Boot context is the boot/idle task: its fd-table slots 3..15 are held
+    # by earlier boot resources, so a fresh vfs_open / pidfd_open would return
+    # -EMFILE. Mirror fchmodat2_selftest / landlock_selftest: save slots
+    # 3..15, free them (FD_CLOSED_MARK) for the body, then restore. This lets
+    # the REAL fd allocation paths the handler and pidfd_open use actually
+    # claim fds, exactly as a userspace task would.
+    boot_task: Ptr[TaskStruct] = current_task()
+    fd_save: Array[16, uint32]
+    si: uint64 = 3
+    while si < 16:
+        fd_save[si] = boot_task[0].fd_idx[si]
+        boot_task[0].fd_idx[si] = FD_CLOSED_MARK
+        si = si + 1
+
+    rc: int32 = _pfg_selftest_body()
+
+    ri: uint64 = 3
+    while ri < 16:
+        boot_task[0].fd_idx[ri] = fd_save[ri]
+        ri = ri + 1
+    return rc
+
+
+def _pfg_selftest_body() -> int32:
+    # The pidfd object table is shared with u_pidfd; (re)initialise it so a
+    # prior selftest's stale (task,fd)->pid entries cannot bleed in. Idempotent.
+    upidfd_init()
+
+    # --- (1) open a REAL file in the current (boot) task -------------
+    # The cpio marker planted by scripts/test_pidfd_getfd.sh is a real
+    # openable path; we borrow an fd to it.
+    good: Ptr[char] = "/etc/pidfd-getfd-test"
+    abuf: Array[256, uint8]
+    prc: int32 = resolve_path(good, &abuf[0], 256)
+    if prc != 0:
+        return _pfg_fail("could not resolve /etc/pidfd-getfd-test")
+    src_fd: int32 = vfs_open(cast[Ptr[char]](&abuf[0]))
+    if src_fd < 0:
+        return _pfg_fail("could not open /etc/pidfd-getfd-test")
+    bt: Ptr[TaskStruct] = current_task()
+    src_u: uint64 = cast[uint64](src_fd)
+    src_mark: uint32 = bt[0].fd_idx[src_u]
+    src_buf:  uint64 = bt[0].fd_buf[src_u]
+
+    # --- (2) borrow a SECOND task slot to be the TARGET process ------
+    # The boot/idle context's own pid is 0 (not a valid pidfd target), so we
+    # claim an inert task slot, stamp a known pid, give it an initialised fd
+    # table, and plant a copy of src_fd's backing into the target's fd[5] —
+    # now the target genuinely "has an open fd" to borrow back across the
+    # process boundary.
+    PFG_TGT_FD: uint64 = 5
+    tgt_slot: int32 = notetest_claim_slot(STATE_READY, 0)
+    if tgt_slot < 0:
+        vfs_close(src_fd)
+        return _pfg_fail("could not claim a target task slot")
+    tgt_pid: uint64 = 91101
+    notetest_set_slot_pid(tgt_slot, tgt_pid)
+    tgt_task: Ptr[TaskStruct] = task_struct_at(tgt_slot)
+    if cast[uint64](tgt_task) == 0:
+        notetest_release_slot(tgt_slot)
+        vfs_close(src_fd)
+        return _pfg_fail("task_struct_at returned NULL for the target slot")
+    # Initialise the target's fd table to all-closed (notetest_claim_slot
+    # leaves fd_idx untouched), then plant src_fd's backing into fd[5].
+    ti: uint64 = 0
+    while ti < 16:
+        tgt_task[0].fd_idx[ti]    = FD_CLOSED_MARK
+        tgt_task[0].fd_pos[ti]    = 0
+        tgt_task[0].fd_buf[ti]    = 0
+        tgt_task[0].fd_buflen[ti] = 0
+        ti = ti + 1
+    if copy_fd_entry(tgt_task, PFG_TGT_FD, bt, src_u) < 0:
+        notetest_release_slot(tgt_slot)
+        vfs_close(src_fd)
+        return _pfg_fail("could not plant a backing into the target fd table")
+
+    # --- (3) pidfd_open the TARGET's pid -> a pidfd to the OTHER task -
+    pf64: int64 = upidfd_open(tgt_pid, 0)
+    if pf64 < 0:
+        notetest_release_slot(tgt_slot)
+        vfs_close(src_fd)
+        return _pfg_fail("pidfd_open(target) returned an error")
+    pidfd: int32 = cast[int32](pf64)
+
+    # --- (4) pidfd_getfd(pidfd, 5, 0) -> a NEW fd in the CALLER ------
+    g64: int64 = pidfd_getfd_handler(cast[uint64](pidfd),
+                                     PFG_TGT_FD, 0)
+    if g64 < 0:
+        notetest_release_slot(tgt_slot)
+        vfs_close(src_fd)
+        vfs_close(pidfd)
+        printk1("[pidfd-getfd] FAIL: pidfd_getfd rc=%d (want a new fd)\n",
+                cast[uint64](g64))
+        return 0
+    new_fd: int32 = cast[int32](g64)
+    if new_fd == src_fd or new_fd == pidfd:
+        notetest_release_slot(tgt_slot)
+        vfs_close(src_fd)
+        vfs_close(pidfd)
+        return _pfg_fail("pidfd_getfd returned an aliased fd number")
+    new_u: uint64 = cast[uint64](new_fd)
+    # The crux: the new CALLER fd must reach the SAME backing object as the
+    # TARGET's fd[5] (== the original src). Backing identity is (marker,
+    # fd_buf): a real copy_fd_entry cross-process share copies both. A fresh
+    # independent open would differ.
+    if bt[0].fd_idx[new_u] != src_mark:
+        notetest_release_slot(tgt_slot)
+        vfs_close(src_fd)
+        vfs_close(pidfd)
+        vfs_close(new_fd)
+        return _pfg_fail("dup'd fd marker differs from target (not shared)")
+    if bt[0].fd_buf[new_u] != src_buf:
+        notetest_release_slot(tgt_slot)
+        vfs_close(src_fd)
+        vfs_close(pidfd)
+        vfs_close(new_fd)
+        return _pfg_fail("dup'd fd backing (fd_buf) differs from target")
+    if bt[0].fd_idx[new_u] != tgt_task[0].fd_idx[PFG_TGT_FD]:
+        notetest_release_slot(tgt_slot)
+        vfs_close(src_fd)
+        vfs_close(pidfd)
+        vfs_close(new_fd)
+        return _pfg_fail("caller fd backing differs from the target's fd[5]")
+    printk0("[pidfd-getfd] PASS: cross-process getfd shares the target's backing\n")
+
+    # Closing the caller's own SOURCE fd must NOT invalidate the duplicate's
+    # backing — a real reference dup keeps the open file alive while the new
+    # fd holds it.
+    vfs_close(src_fd)
+    if bt[0].fd_idx[new_u] != src_mark or bt[0].fd_buf[new_u] != src_buf:
+        notetest_release_slot(tgt_slot)
+        vfs_close(pidfd)
+        vfs_close(new_fd)
+        return _pfg_fail("closing source fd disturbed the duplicate's backing")
+    printk0("[pidfd-getfd] PASS: duplicate survives close of the source fd\n")
+    vfs_close(new_fd)
+
+    # --- (5) error paths --------------------------------------------
+    # flags != 0 -> -EINVAL.
+    if pidfd_getfd_handler(cast[uint64](pidfd), PFG_TGT_FD, 1) != PFG_EINVAL:
+        notetest_release_slot(tgt_slot)
+        vfs_close(pidfd)
+        return _pfg_fail("flags!=0 did not return EINVAL")
+    # a non-pidfd fd as `pidfd` -> -EBADF (fd 0 is stdin, not a pidfd).
+    if pidfd_getfd_handler(cast[uint64](0), PFG_TGT_FD, 0) != PFG_EBADF:
+        notetest_release_slot(tgt_slot)
+        vfs_close(pidfd)
+        return _pfg_fail("non-pidfd argument did not return EBADF")
+    # a targetfd not open in the target -> -EBADF. The target's fd[7] was
+    # initialised to FD_CLOSED_MARK and never planted.
+    if pidfd_getfd_handler(cast[uint64](pidfd), cast[uint64](7), 0) != PFG_EBADF:
+        notetest_release_slot(tgt_slot)
+        vfs_close(pidfd)
+        return _pfg_fail("closed targetfd did not return EBADF")
+    printk0("[pidfd-getfd] PASS: EINVAL/EBADF error paths correct\n")
+
+    # --- (6) target exits: pidfd_getfd -> -ESRCH --------------------
+    # Releasing the borrowed slot returns it to STATE_FREE; the target pid is
+    # now gone, so a getfd against the still-valid pidfd must report -ESRCH.
+    notetest_release_slot(tgt_slot)
+    if pidfd_getfd_handler(cast[uint64](pidfd), PFG_TGT_FD, 0) != PFG_ESRCH:
+        vfs_close(pidfd)
+        return _pfg_fail("getfd on an exited target did not return ESRCH")
+    printk0("[pidfd-getfd] PASS: getfd on an exited target -> ESRCH\n")
+
+    vfs_close(pidfd)
+    printk0("[pidfd-getfd] PASS\n")
+    return 1
