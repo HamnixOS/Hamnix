@@ -103,6 +103,17 @@ ext4_csum_seed:     uint32 = 0
 EXT4_SB_OFF_UUID:   uint64 = 0x68
 EXT4_SB_OFF_CHECKSUM: uint64 = 0x3FC      # s_checksum, last u32 of the 1 KiB sb
 
+# INCOMPAT_INLINE_DATA mount state. ext4_inline_data is 1 once the
+# superblock's s_feature_incompat declares the feature (bit 0x8000).
+# While it is 0 the per-inode inline flag is ignored entirely, so a
+# filesystem WITHOUT the feature reads exactly as before. When the
+# feature is on and an inode carries EXT4_INODE_INLINE_DATA (i_flags
+# bit 0x10000000) its data lives directly inside the inode: the first
+# up-to-60 bytes in the i_block[] area (offset 0x28), with any
+# overflow in the "system.data" extended attribute. Such inodes own
+# NO data blocks / extents.
+ext4_inline_data:   int32  = 0
+
 # #149: journal (JBD2) mount state. s_feature_compat HAS_JOURNAL (0x4)
 # and s_journal_inum (sb offset 0xE0) tell us whether a journal exists
 # and which inode holds it. ext4_has_journal is 1 once jbd2_attach
@@ -498,6 +509,18 @@ def ext4_init(slot: int32) -> int32:
         else:
             printk0("ext4: crc32c KAT failed; metadata_csum verify disabled\n")
 
+    # INCOMPAT_INLINE_DATA: when the superblock declares the feature
+    # (s_feature_incompat & 0x8000) tiny files/dirs may store their data
+    # directly inside the inode (i_block[] + the system.data xattr)
+    # instead of in data blocks. We arm read support; a no-feature image
+    # leaves ext4_inline_data 0 and the per-inode inline flag is ignored.
+    ext4_inline_data = 0
+    incompat_feat: uint32 = _ext4_read_u32(
+        cast[Ptr[uint8]](cast[uint64](sb) + EXT4_SB_OFF_FEATURE_INCOMPAT))
+    if (incompat_feat & EXT4_FEATURE_INCOMPAT_INLINE_DATA) != 0:
+        ext4_inline_data = 1
+        printk0("ext4: INCOMPAT_INLINE_DATA present; inline read path armed\n")
+
     ext4_blockdev_slot = slot
     printk2("ext4: mounted; block_size=%d inodes_count=%d\n",
             ext4_block_size, ext4_inodes_count)
@@ -712,6 +735,15 @@ def ext4_inode_size_lo(buf: Ptr[uint8]) -> uint32:
 # entries out of the leaf blocks. See _ext4_dirblock_lookup.
 INODE_I_FLAGS_OFFSET: uint64 = 0x20           # i_flags
 EXT4_INDEX_FL:        uint32 = 0x1000         # dir uses htree index
+# EXT4_INODE_INLINE_DATA: inode's data lives inside the inode itself
+# (i_block[] + system.data xattr) rather than in data blocks. Only
+# meaningful when the filesystem carries INCOMPAT_INLINE_DATA.
+EXT4_INLINE_DATA_FL:  uint32 = 0x10000000
+
+# The in-inode portion of inline data starts at the i_block[] window
+# (inode offset 0x28) and is at most 60 bytes (the i_block[] size).
+EXT4_INLINE_IBLOCK_OFF:  uint64 = 0x28
+EXT4_INLINE_IBLOCK_MAX:  uint64 = 60
 
 
 def ext4_inode_flags(buf: Ptr[uint8]) -> uint32:
@@ -721,6 +753,18 @@ def ext4_inode_flags(buf: Ptr[uint8]) -> uint32:
 
 def ext4_inode_is_htree_dir(buf: Ptr[uint8]) -> int32:
     if (ext4_inode_flags(buf) & EXT4_INDEX_FL) != 0:
+        return 1
+    return 0
+
+
+def ext4_inode_is_inline(buf: Ptr[uint8]) -> int32:
+    # 1 if this inode stores its data inline (feature armed AND the
+    # per-inode EXT4_INODE_INLINE_DATA flag is set). Gated on the
+    # mount-time feature flag so non-inline images behave exactly as
+    # before even if some inode spuriously carries the bit.
+    if ext4_inline_data == 0:
+        return 0
+    if (ext4_inode_flags(buf) & EXT4_INLINE_DATA_FL) != 0:
         return 1
     return 0
 
@@ -1028,6 +1072,66 @@ def _ext4_logical_to_physical(inode_buf: Ptr[uint8],
     return 0
 
 
+# --- inline_data (INCOMPAT_INLINE_DATA) read path ----------------
+#
+# An inode with EXT4_INODE_INLINE_DATA holds its bytes directly:
+#   * bytes [0, 60)        : the i_block[] window at inode offset 0x28
+#   * bytes [60, i_size)   : the value of the "system.data" xattr
+# There are NO extents / data blocks. The system.data xattr value
+# carries exactly i_size-60 bytes (it may itself live in-inode or in
+# the external i_file_acl block — ext4_getxattr handles both).
+
+# Scratch for the system.data xattr value (inline overflow past the
+# first 60 bytes). One fs block bounds the maximum: the external xattr
+# block is a single block, and an in-inode value is far smaller. Sized
+# to the largest fs block we mount so a full system.data value never
+# overflows this buffer.
+ext4_inline_data_buf: Array[4096, uint8]
+
+
+def _ext4_read_inline_data(inode_buf: Ptr[uint8], pos: uint64,
+                           count: uint64, buf: Ptr[uint8]) -> int64:
+    # Copy up to `count` bytes from file offset `pos` of an inline-data
+    # inode into `buf`. Caller has already clamped count to <= i_size-pos
+    # and verified pos < i_size. Returns bytes copied, or -1 on error
+    # (system.data xattr expected but missing/too large).
+    total: uint64 = 0
+    # Part 1: the i_block[] window covers logical bytes [0, 60).
+    iblock_base: uint64 = cast[uint64](inode_buf) + EXT4_INLINE_IBLOCK_OFF
+    if pos < EXT4_INLINE_IBLOCK_MAX:
+        avail: uint64 = EXT4_INLINE_IBLOCK_MAX - pos
+        chunk: uint64 = count
+        if chunk > avail:
+            chunk = avail
+        memcpy(buf, cast[Ptr[uint8]](iblock_base + pos), chunk)
+        total = chunk
+    if total >= count:
+        return cast[int64](total)
+    # Part 2: bytes at or past offset 60 come from system.data. Fetch the
+    # whole value once (bounded by the xattr block) then slice it.
+    n: int32 = ext4_getxattr(inode_buf, "system.data", 11,
+                             &ext4_inline_data_buf[0], 4096)
+    if n < 0:
+        return -1
+    val_len: uint64 = cast[uint64](n)
+    # File offset of the next byte we still owe the caller.
+    next_off: uint64 = pos + total
+    # Offset of that byte inside the system.data value (value byte 0 maps
+    # to file offset 60).
+    xoff: uint64 = next_off - EXT4_INLINE_IBLOCK_MAX
+    if xoff >= val_len:
+        return cast[int64](total)
+    want: uint64 = count - total
+    avail2: uint64 = val_len - xoff
+    if want > avail2:
+        want = avail2
+    memcpy(cast[Ptr[uint8]](cast[uint64](buf) + total),
+           cast[Ptr[uint8]](cast[uint64](&ext4_inline_data_buf[0]) + xoff),
+           want)
+    total = total + want
+    return cast[int64](total)
+
+
 def ext4_read_file(inum: uint32, pos: uint64, count: uint64,
                    buf: Ptr[uint8]) -> int64:
     # Reads `count` bytes starting at file offset `pos` from the
@@ -1041,6 +1145,11 @@ def ext4_read_file(inum: uint32, pos: uint64, count: uint64,
     remaining: uint64 = size - pos
     if count > remaining:
         count = remaining
+
+    # inline_data inode: bytes live in the inode (i_block[] + system.data
+    # xattr), not in extents. Gated on the mount-time feature flag.
+    if ext4_inode_is_inline(&inode[0]) != 0:
+        return _ext4_read_inline_data(&inode[0], pos, count, buf)
 
     total: uint64 = 0
     while total < count:
@@ -8093,6 +8202,7 @@ EXT4_FEATURE_INCOMPAT_FLEX_BG:    uint32 = 0x200
 EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER: uint32 = 0x1
 EXT4_FEATURE_RO_COMPAT_GDT_CSUM:     uint32 = 0x10
 EXT4_FEATURE_RO_COMPAT_METADATA_CSUM: uint32 = 0x400
+EXT4_FEATURE_INCOMPAT_INLINE_DATA:    uint32 = 0x8000
 
 
 # Scratch buffer for reading the 1024-byte superblock from disk
