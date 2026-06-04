@@ -812,6 +812,18 @@ SYS_copy_file_range: uint64 = 326
 SYS_splice:          uint64 = 275
 SYS_tee:             uint64 = 276
 SYS_vmsplice:        uint64 = 278
+# close_range(2): close every open fd in the inclusive span [first, last].
+# glibc's posix_spawn / abort-path fd scrubbers and modern coreutils call
+# this to drop inherited descriptors in one trap instead of a close() loop.
+# Hamnix has no FD_CLOEXEC table, so CLOSE_RANGE_CLOEXEC degrades to a plain
+# close (the fds are gone either way); CLOSE_RANGE_UNSHARE is a no-op since
+# every task already owns a private fd table.
+SYS_close_range:     uint64 = 436
+CLOSE_RANGE_UNSHARE: uint64 = 0x02
+CLOSE_RANGE_CLOEXEC: uint64 = 0x04
+# Upper bound of the close_range walk. Mirrors fs/vfs.ad's _VFS_NR_FDS (the
+# per-task fd-table size); keep the two in sync if the table ever grows.
+CLOSE_RANGE_FD_CAP:  uint64 = 16
 # U35: AF_UNIX socket-shaped stubs. Hamnix has no network stack, but
 # busybox / glibc paths that probe socket(2) early (e.g. sh's
 # job-control / `[`-builtin code path) still need *some* answer. We
@@ -5893,6 +5905,48 @@ def _u_vmsplice(a0: uint64, a1: uint64, a2: uint64,
     return total
 
 
+def _u_close_range(a0: uint64, a1: uint64, a2: uint64,
+                   a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # int close_range(unsigned int first, unsigned int last,
+    #                 unsigned int flags)
+    #
+    # Close every open fd in the inclusive span [first, last]. Linux lets
+    # `last` be ~0u ("close everything from first up"), so we clamp the top
+    # of the walk to the fd-table size (_VFS_NR_FDS) — there is nothing open
+    # past it. Each live fd is dropped through _u_close so the full per-fd
+    # teardown (O_NONBLOCK clear, pidfd / AF_UNIX / io_uring context release)
+    # runs exactly as a plain close(2) would; an already-closed slot in the
+    # span is skipped (not an error — that's the whole point of the syscall).
+    first: uint64 = a0 & 0xFFFFFFFF
+    last:  uint64 = a1 & 0xFFFFFFFF
+    flags: uint64 = a2
+    # EINVAL: an inverted range, or an unknown flag bit.
+    if first > last:
+        return ELINUX_INVAL
+    known: uint64 = CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC
+    if (flags & ~known) != 0:
+        return ELINUX_INVAL
+    # CLOSE_RANGE_UNSHARE is a no-op here (each task already owns a private
+    # fd table). CLOSE_RANGE_CLOEXEC would only flag-not-close the fds, but
+    # Hamnix keeps no FD_CLOEXEC bitmap, so the safe, conservative behaviour
+    # is to close them outright — the caller asked for them gone at the next
+    # exec, and a hard close satisfies that strictly.
+    #
+    # Clamp the upper bound to the per-task fd-table size: nothing is open
+    # past it, and `last` is routinely ~0u ("everything from first up"). We
+    # use a self-contained cap that matches fs/vfs.ad's _VFS_NR_FDS (16);
+    # vfs_fd_is_open already rejects any fd >= the table size, so an over-
+    # large cap is still safe — this just keeps the walk finite.
+    if last >= CLOSE_RANGE_FD_CAP:
+        last = CLOSE_RANGE_FD_CAP - 1
+    fd: uint64 = first
+    while fd <= last:
+        if vfs_fd_is_open(cast[int32](fd)) != 0:
+            _u_close(fd, 0, 0, 0, 0, 0)
+        fd = fd + 1
+    return 0
+
+
 def _u_access_path(upath: uint64, mode: uint64) -> int64:
     # Shared body for access(2) / faccessat(2) / faccessat2(2). `upath`
     # is the user path pointer (relative paths resolve against the task
@@ -9646,6 +9700,219 @@ def splice_selftest() -> int32:
     return 0
 
 
+# ---------------------------------------------------------------------
+# close_range(2) + statx(2) boot self-test.
+#
+# Gated by /etc/closerange-test (build_initramfs.py plants it when
+# ENABLE_CLOSERANGE_TEST=1); init/main.ad calls close_range_selftest() at
+# boot. Three legs, all driven through the real syscall dispatcher so the
+# entry points exercised are the same ones a Linux binary would hit:
+#
+#   1. statx round-trip : write a known 8-byte file, statx it by path via
+#      AT_FDCWD, and assert stx_mask, stx_size, and the S_IFREG type bits.
+#   2. tee + splice end-to-end : write a payload into pipe A, tee it into
+#      pipe B (A stays intact), then splice B into a file and read it back
+#      byte-for-byte — proving tee duplicates and splice transfers.
+#   3. close_range : dup a base fd four times, close_range the whole dup
+#      span, and assert every fd in it is closed while fds outside stay
+#      open. Then a second close_range over an already-closed span returns
+#      0 (closing an already-closed slot is not an error).
+#
+# Prints "[closerange] PASS" once every assertion holds.
+
+def close_range_selftest() -> int32:
+    # Prime the boot task's fd table the same way splice_selftest does so
+    # the open / pipe / dup legs can grab real fd slots.
+    boot_task: Ptr[TaskStruct] = current_task()
+    fd_save: Array[16, uint32]
+    fdi: uint64 = 3
+    while fdi < 16:
+        fd_save[fdi] = boot_task[0].fd_idx[fdi]
+        boot_task[0].fd_idx[fdi] = FD_CLOSED_MARK
+        fdi = fdi + 1
+
+    payload: Array[8, uint8]
+    payload[0] = 67                                      # 'C'
+    payload[1] = 76                                      # 'L'
+    payload[2] = 79                                      # 'O'
+    payload[3] = 83                                      # 'S'
+    payload[4] = 69                                      # 'E'
+    payload[5] = 82                                      # 'R'
+    payload[6] = 57                                      # '9'
+    payload[7] = 56                                      # '8'
+
+    # --- 1. statx round-trip -----------------------------------------
+    sx_name: Ptr[char] = cast[Ptr[char]]("/tmp/closerange-statx")
+    sx_fd: int32 = vfs_open_write(sx_name)
+    if sx_fd < 0:
+        printk1("[closerange] FAIL statx file open=%d\n",
+                cast[uint64](cast[int64](sx_fd)))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    vfs_write(sx_fd, &payload[0], 8)
+    vfs_close(sx_fd)
+    sx_buf: Array[256, uint8]
+    # statx(dirfd, path, flags, mask, buf) — five args; a4 (buf) needs the
+    # full six-arg dispatch, so route it directly rather than the 4-arg
+    # _uabi_test_dispatch wrapper.
+    sx_rc: int64 = linux_u_syscall_dispatch(SYS_statx, AT_FDCWD_U64,
+                                            cast[uint64]("/tmp/closerange-statx"),
+                                            0, cast[uint64](STATX_BASIC_STATS),
+                                            cast[uint64](&sx_buf[0]), 0)
+    if sx_rc != 0:
+        printk1("[closerange] FAIL statx rc=%d\n", cast[uint64](sx_rc))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    sx_mask: uint32 = cast[Ptr[uint32]](cast[uint64](&sx_buf[0]) + STATX_OFF_MASK)[0]
+    if (sx_mask & STATX_BASIC_STATS) != STATX_BASIC_STATS:
+        printk1("[closerange] FAIL statx mask=%x\n", cast[uint64](sx_mask))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    sx_size: uint64 = cast[Ptr[uint64]](cast[uint64](&sx_buf[0]) + STATX_OFF_SIZE)[0]
+    if sx_size != 8:
+        printk1("[closerange] FAIL statx size=%d\n", sx_size)
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    sx_mode: uint16 = cast[Ptr[uint16]](cast[uint64](&sx_buf[0]) + STATX_OFF_MODE)[0]
+    # S_IFMT = 0xF000; S_IFREG = 0x8000. The planted file is a regular file.
+    if (cast[uint32](sx_mode) & 0xF000) != 0x8000:
+        printk1("[closerange] FAIL statx type bits=%x\n",
+                cast[uint64](cast[uint32](sx_mode)))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    printk0("[closerange] statx (mask/size/type) OK\n")
+
+    # --- 2. tee + splice end-to-end ----------------------------------
+    ta: Array[2, int32]
+    tb: Array[2, int32]
+    if vfs_pipe(&ta[0]) != 0 or vfs_pipe(&tb[0]) != 0:
+        printk0("[closerange] FAIL te pipe alloc\n")
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    vfs_write(ta[1], &payload[0], 8)
+    te_n: int64 = _uabi_test_dispatch(SYS_tee,
+                                      cast[uint64](ta[0]),
+                                      cast[uint64](tb[1]),
+                                      8, 0)
+    if te_n != 8:
+        printk1("[closerange] FAIL tee count=%d\n", cast[uint64](te_n))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    # splice the duplicated bytes out of pipe B into a file, then read back.
+    te_dst: int32 = vfs_open_write(cast[Ptr[char]]("/tmp/closerange-splice"))
+    if te_dst < 0:
+        printk0("[closerange] FAIL te dst open\n")
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    sp_n: int64 = linux_u_syscall_dispatch(SYS_splice,
+                                           cast[uint64](tb[0]), 0,
+                                           cast[uint64](te_dst), 0,
+                                           8, 0)
+    if sp_n != 8:
+        printk1("[closerange] FAIL splice count=%d\n", cast[uint64](sp_n))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    vfs_lseek(te_dst, 0, 0)
+    te_rb: Array[8, uint8]
+    te_rn: int64 = vfs_read(te_dst, &te_rb[0], 8)
+    if te_rn != 8 or _splice_bytes_eq(&te_rb[0], &payload[0], 8) == 0:
+        printk1("[closerange] FAIL splice readback n=%d\n", cast[uint64](te_rn))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    # The tee left the source intact — pipe A still holds the 8 bytes.
+    ta_rb: Array[8, uint8]
+    ta_rn: int64 = vfs_read(ta[0], &ta_rb[0], 8)
+    if ta_rn != 8 or _splice_bytes_eq(&ta_rb[0], &payload[0], 8) == 0:
+        printk1("[closerange] FAIL tee src consumed n=%d\n", cast[uint64](ta_rn))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    vfs_close(ta[0])
+    vfs_close(ta[1])
+    vfs_close(tb[0])
+    vfs_close(tb[1])
+    vfs_close(te_dst)
+    printk0("[closerange] tee+splice end-to-end OK\n")
+
+    # --- 3. close_range over a dup span ------------------------------
+    # Open a base fd, dup it four times so we hold a contiguous-ish span,
+    # then close_range the whole span and assert every fd is closed.
+    cr_base: int32 = vfs_open_write(cast[Ptr[char]]("/tmp/closerange-fds"))
+    if cr_base < 0:
+        printk0("[closerange] FAIL base open\n")
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    cr_d: Array[4, int32]
+    di: uint64 = 0
+    cr_ok: int32 = 1
+    while di < 4:
+        cr_d[di] = vfs_dup(cr_base)
+        if cr_d[di] < 0:
+            cr_ok = 0
+        di = di + 1
+    if cr_ok == 0:
+        printk0("[closerange] FAIL dup\n")
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    # Compute the [lo, hi] span across base + its four dups.
+    lo: int32 = cr_base
+    hi: int32 = cr_base
+    di = 0
+    while di < 4:
+        if cr_d[di] < lo:
+            lo = cr_d[di]
+        if cr_d[di] > hi:
+            hi = cr_d[di]
+        di = di + 1
+    # Every fd in the span must be open right now.
+    fi: int32 = lo
+    while fi <= hi:
+        if vfs_fd_is_open(fi) == 0:
+            printk1("[closerange] FAIL fd %d not open pre-close\n",
+                    cast[uint64](cast[int64](fi)))
+            _pty_selftest_restore(boot_task, &fd_save[0])
+            return 1
+        fi = fi + 1
+    cr_rc: int64 = _uabi_test_dispatch(SYS_close_range,
+                                       cast[uint64](lo),
+                                       cast[uint64](hi),
+                                       0, 0)
+    if cr_rc != 0:
+        printk1("[closerange] FAIL close_range rc=%d\n", cast[uint64](cr_rc))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    # Now every fd in [lo, hi] must be closed.
+    fi = lo
+    while fi <= hi:
+        if vfs_fd_is_open(fi) != 0:
+            printk1("[closerange] FAIL fd %d still open post-close\n",
+                    cast[uint64](cast[int64](fi)))
+            _pty_selftest_restore(boot_task, &fd_save[0])
+            return 1
+        fi = fi + 1
+    # Re-running over the now-empty span is a no-op success (closing an
+    # already-closed slot is exactly what close_range tolerates).
+    cr_rc2: int64 = _uabi_test_dispatch(SYS_close_range,
+                                        cast[uint64](lo),
+                                        cast[uint64](hi),
+                                        0, 0)
+    if cr_rc2 != 0:
+        printk1("[closerange] FAIL re-close rc=%d\n", cast[uint64](cr_rc2))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    # An inverted range is EINVAL.
+    cr_inv: int64 = _uabi_test_dispatch(SYS_close_range, 5, 3, 0, 0)
+    if cr_inv != ELINUX_INVAL:
+        printk1("[closerange] FAIL inverted want EINVAL got=%d\n",
+                cast[uint64](cr_inv))
+        _pty_selftest_restore(boot_task, &fd_save[0])
+        return 1
+    printk0("[closerange] close_range span (closed + idempotent + EINVAL) OK\n")
+
+    _pty_selftest_restore(boot_task, &fd_save[0])
+    printk0("[closerange] PASS\n")
+    return 0
+
+
 def _splice_bytes_eq(a: Ptr[uint8], b: Ptr[uint8], n: uint64) -> int32:
     # 1 if the first n bytes of a and b are equal, else 0.
     i: uint64 = 0
@@ -11275,6 +11542,10 @@ def _linux_u_syscall_dispatch_inner(nr: uint64,
         return _u_tee(a0, a1, a2, a3, a4, a5)
     if nr == SYS_vmsplice:
         return _u_vmsplice(a0, a1, a2, a3, a4, a5)
+    # close_range(2): bulk-close the fd span [first, last]. Routes each
+    # live fd through _u_close so per-fd teardown matches a plain close.
+    if nr == SYS_close_range:
+        return _u_close_range(a0, a1, a2, a3, a4, a5)
     # socket(2) family. U-socket: socket / connect / sendto / recvfrom
     # are now bridged to the real in-kernel TCP stack (drivers/net/
     # tcp.ad) for AF_INET + SOCK_STREAM — a user binary can complete a

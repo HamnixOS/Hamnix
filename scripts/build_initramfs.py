@@ -559,6 +559,12 @@ if os.environ.get("ENABLE_IOURING_TEST") == "1":
 if os.environ.get("ENABLE_SPLICE_TEST") == "1":
     FILES.append(("/etc/splice-test", b"1\n"))
 
+# close_range(2) + statx(2) self-test. scripts/test_close_range.sh sets
+# ENABLE_CLOSERANGE_TEST=1 to plant /etc/closerange-test; init/main.ad at
+# boot:37.closerange detects the marker and runs close_range_selftest().
+if os.environ.get("ENABLE_CLOSERANGE_TEST") == "1":
+    FILES.append(("/etc/closerange-test", b"1\n"))
+
 # ext4 xattr + POSIX ACL self-test. scripts/test_ext4_xattr.sh sets
 # ENABLE_EXT4XATTR_TEST=1 to plant /etc/ext4xattr-test; init/main.ad at
 # boot:37.xat detects the marker and runs ext4_xattr_selftest().
