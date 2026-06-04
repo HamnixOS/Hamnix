@@ -1,0 +1,785 @@
+# drivers/net/igmp.ad
+#
+# IPv4 multicast + IGMPv2 (RFC 2236) / IGMPv3 (RFC 3376) for the native
+# net stack. IGMP is the protocol a host uses to tell its local multicast
+# router which multicast groups it wants to receive. It rides DIRECTLY on
+# IPv4 (protocol number 2) — there is no UDP/TCP layer — with TTL 1 (it is
+# strictly link-local, never forwarded) and the IPv4 Router Alert option
+# (RFC 2113) so every router on the path that sees the datagram inspects it.
+#
+# Message types (the first byte of the IGMP message):
+#   0x11  Membership Query        (router -> hosts; general or group-specific)
+#   0x16  Version 2 Membership Report
+#   0x17  Version 2 Leave Group
+#   0x22  Version 3 Membership Report
+#
+# IGMPv2 message (8 bytes, RFC 2236 §2):
+#   +0 type    +1 max_resp_time   +2..3 checksum   +4..7 group_address
+# The checksum is the standard RFC-1071 ones'-complement Internet checksum
+# computed over the whole IGMP message — same algorithm as ip_csum16, which
+# we reuse rather than reimplement.
+#
+# IGMPv3 Membership Report (RFC 3376 §4.2):
+#   +0 type(0x22)  +1 reserved  +2..3 checksum  +4..5 reserved
+#   +6..7 number_of_group_records(N)
+#   then N group records, each:
+#     +0 record_type  +1 aux_data_len(words)  +2..3 number_of_sources(S)
+#     +4..7 multicast_address   then S source addresses (4 bytes each)
+#     then aux_data_len*4 bytes of aux data
+# We emit one record with record_type CHANGE_TO_EXCLUDE_MODE (4) / a plain
+# MODE_IS_EXCLUDE (2) and zero sources — the "(*,G) join" a host issues for
+# an any-source-multicast subscription.
+#
+# We REUSE the native stack's IPv4 framing: ip_csum16 (RFC-1071 checksum)
+# from drivers/net/ip.ad, and the Ethernet constants from drivers/net/eth.ad.
+# This file adds the IGMP message codec, the host group-membership table,
+# join/leave/query logic, the multicast-MAC mapping, and a multicast
+# RX-accept predicate that ip.ad's receive path consults so a multicast
+# datagram is only delivered when the host has actually joined the group.
+
+from kernel.printk.printk import printk0, printk1, printk2, printk_set_level
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
+from drivers.net.ip import ip_csum16, IP_TTL
+from drivers.net.eth import ETH_HDR_LEN, ETH_P_IP, eth_get_mac, eth_tx
+
+
+# --- IGMP wire constants ----------------------------------------------
+
+# Message types (first byte of the IGMP message body).
+IGMP_QUERY:       uint8 = 0x11    # Membership Query (general/group-specific)
+IGMP_V2_REPORT:   uint8 = 0x16    # Version 2 Membership Report
+IGMP_V2_LEAVE:    uint8 = 0x17    # Version 2 Leave Group
+IGMP_V3_REPORT:   uint8 = 0x22    # Version 3 Membership Report
+
+# IGMPv3 group-record types (RFC 3376 §4.2.12).
+IGMP_MODE_IS_INCLUDE:        uint8 = 1
+IGMP_MODE_IS_EXCLUDE:        uint8 = 2
+IGMP_CHANGE_TO_INCLUDE_MODE: uint8 = 3
+IGMP_CHANGE_TO_EXCLUDE_MODE: uint8 = 4
+
+# IGMP rides on IPv4 protocol 2 with TTL 1 (link-local only) and the
+# Router Alert option. We keep the protocol number local to avoid forcing
+# every ip.ad consumer to learn an IGMP symbol; ip.ad declares its own
+# IPPROTO_IGMP for the inbound demux.
+IGMP_IPPROTO: uint8 = 2
+IGMP_TTL:     uint8 = 1
+
+# IPv4 Router Alert option (RFC 2113): copy-flag set, class 0, number 20
+# -> option type 0x94, length 4, value 0x0000. This makes the IPv4 header
+# 24 bytes (IHL=6) instead of the usual 20.
+IGMP_IP_HDR_LEN: uint64 = 24       # 20 fixed + 4 Router-Alert option
+IGMP_IP_IHL:     uint8  = 6        # 24 / 4
+
+# Sizes of the IGMP messages we build.
+IGMP_V2_MSG_LEN: uint64 = 8        # type+resp+csum+group
+# IGMPv3 report: 8-byte fixed header + one 8-byte group record (0 sources).
+IGMP_V3_MSG_LEN: uint64 = 16
+
+
+# --- Multicast / address helpers --------------------------------------
+
+def igmp_is_multicast(b0: uint8) -> int32:
+    # 224.0.0.0/4 — the class-D multicast range. The top four bits of the
+    # first octet are 1110, i.e. 0xE0..0xEF inclusive. Mask to 8 bits so a
+    # stale high register half can't perturb the compare.
+    b0m: uint32 = cast[uint32](b0) & 0xFF
+    if (b0m & 0xF0) == 0xE0:
+        return 1
+    return 0
+
+
+def igmp_is_all_hosts(b0: uint8, b1: uint8, b2: uint8, b3: uint8) -> int32:
+    # The all-hosts group 224.0.0.1 — every IP host is always a member of
+    # this group (RFC 1112 §4); membership is implicit and never reported.
+    if (cast[uint32](b0) & 0xFF) != 224:
+        return 0
+    if (cast[uint32](b1) & 0xFF) != 0:
+        return 0
+    if (cast[uint32](b2) & 0xFF) != 0:
+        return 0
+    if (cast[uint32](b3) & 0xFF) != 1:
+        return 0
+    return 1
+
+
+def igmp_mcast_mac(g0: uint8, g1: uint8, g2: uint8, g3: uint8,
+                   out_mac: Ptr[uint8]):
+    # Map an IPv4 multicast group address to its Ethernet multicast MAC
+    # (RFC 1112 §6.4): 01:00:5e + the LOW 23 BITS of the group address.
+    # The high bit of the second octet (g1) is intentionally dropped — the
+    # OUI reserves only 23 bits, so 32 group addresses share one MAC. The
+    # low 23 bits are: bit 23 of g1 is masked OFF (g1 & 0x7F), g2, g3.
+    out_mac[0] = 0x01
+    out_mac[1] = 0x00
+    out_mac[2] = 0x5e
+    out_mac[3] = cast[uint8](cast[uint32](g1) & 0x7F)
+    out_mac[4] = g2
+    out_mac[5] = g3
+
+
+# --- Host multicast group-membership table ----------------------------
+#
+# A small fixed table of (group_address, ifindex) the host has joined.
+# RX filtering consults this so a multicast datagram is delivered IFF the
+# host joined the group (or it is the always-joined all-hosts 224.0.0.1).
+# Stock Linux keeps this per-interface in struct ip_mc_list; we have one
+# logical interface so a flat table keyed on the 32-bit group + ifindex is
+# sufficient and never allocates.
+
+IGMP_MAX_GROUPS: uint64 = 32
+
+igmp_grp_addr:  Array[32, uint32]    # group address, network order packed
+igmp_grp_if:    Array[32, int32]     # ifindex the membership is on
+igmp_grp_used:  Array[32, uint8]     # 1 = slot occupied
+igmp_grp_count: uint64 = 0
+
+
+def _igmp_pack4(b0: uint8, b1: uint8, b2: uint8, b3: uint8) -> uint32:
+    # Pack four address bytes (network order, b0 most-significant) into a
+    # uint32 used as the group-table key.
+    r: uint32 = cast[uint32](b0) & 0xFF
+    r = (r << 8) | (cast[uint32](b1) & 0xFF)
+    r = (r << 8) | (cast[uint32](b2) & 0xFF)
+    r = (r << 8) | (cast[uint32](b3) & 0xFF)
+    return r
+
+
+def igmp_table_init():
+    # Clear every slot. Called from igmp_init() at boot and from the
+    # self-test so a re-run starts from a known-empty table.
+    i: uint64 = 0
+    while i < IGMP_MAX_GROUPS:
+        igmp_grp_addr[i] = 0
+        igmp_grp_if[i] = 0
+        igmp_grp_used[i] = 0
+        i = i + 1
+    igmp_grp_count = 0
+
+
+def _igmp_find(key: uint32, ifindex: int32) -> int64:
+    # Return the slot index of an existing (group,ifindex) membership, or
+    # -1 if the host is not a member. Linear scan — the table is tiny.
+    i: uint64 = 0
+    while i < IGMP_MAX_GROUPS:
+        if igmp_grp_used[i] == 1:
+            if igmp_grp_addr[i] == key:
+                if igmp_grp_if[i] == ifindex:
+                    return cast[int64](i)
+        i = i + 1
+    return cast[int64](-1)
+
+
+def igmp_is_member(b0: uint8, b1: uint8, b2: uint8, b3: uint8,
+                   ifindex: int32) -> int32:
+    # 1 if the host has joined (b0.b1.b2.b3, ifindex). Does NOT special-case
+    # 224.0.0.1 — that implicit membership is handled by the RX predicate.
+    key: uint32 = _igmp_pack4(b0, b1, b2, b3)
+    if _igmp_find(key, ifindex) >= 0:
+        return 1
+    return 0
+
+
+# --- IGMP message codec -----------------------------------------------
+
+def igmp_build_v2(msg: Ptr[uint8], msg_type: uint8, max_resp: uint8,
+                  g0: uint8, g1: uint8, g2: uint8, g3: uint8) -> uint64:
+    # Build an 8-byte IGMPv2 message (Report 0x16, Leave 0x17, or a Query
+    # 0x11) into `msg`. Lays down type, max-response time, a zero checksum
+    # placeholder, the 4-byte group, then computes the RFC-1071 checksum
+    # over the whole 8 bytes and stores it big-endian. Returns the length.
+    msg[0] = msg_type
+    msg[1] = max_resp
+    msg[2] = 0                 # checksum placeholder hi
+    msg[3] = 0                 # checksum placeholder lo
+    msg[4] = g0
+    msg[5] = g1
+    msg[6] = g2
+    msg[7] = g3
+    csum: uint16 = ip_csum16(msg, IGMP_V2_MSG_LEN)
+    msg[2] = cast[uint8]((cast[uint32](csum) >> 8) & 0xFF)
+    msg[3] = cast[uint8](cast[uint32](csum) & 0xFF)
+    return IGMP_V2_MSG_LEN
+
+
+def igmp_build_v3_report(msg: Ptr[uint8], record_type: uint8,
+                         g0: uint8, g1: uint8, g2: uint8,
+                         g3: uint8) -> uint64:
+    # Build a 16-byte IGMPv3 Membership Report (RFC 3376 §4.2) carrying a
+    # single group record with zero sources — the (*,G) any-source join a
+    # host issues. Layout: 8-byte report header + one 8-byte group record.
+    msg[0] = IGMP_V3_REPORT
+    msg[1] = 0                 # reserved
+    msg[2] = 0                 # checksum placeholder hi
+    msg[3] = 0                 # checksum placeholder lo
+    msg[4] = 0                 # reserved
+    msg[5] = 0                 # reserved
+    msg[6] = 0                 # number_of_group_records hi
+    msg[7] = 1                 # number_of_group_records lo == 1
+    # Group record.
+    msg[8]  = record_type      # record type (CHANGE_TO_EXCLUDE / MODE_IS_EXCLUDE)
+    msg[9]  = 0                # aux_data_len (32-bit words) == 0
+    msg[10] = 0                # number_of_sources hi
+    msg[11] = 0                # number_of_sources lo == 0
+    msg[12] = g0               # multicast address
+    msg[13] = g1
+    msg[14] = g2
+    msg[15] = g3
+    csum: uint16 = ip_csum16(msg, IGMP_V3_MSG_LEN)
+    msg[2] = cast[uint8]((cast[uint32](csum) >> 8) & 0xFF)
+    msg[3] = cast[uint8](cast[uint32](csum) & 0xFF)
+    return IGMP_V3_MSG_LEN
+
+
+def igmp_csum_ok(msg: Ptr[uint8], length: uint64) -> int32:
+    # Verify an IGMP message's checksum. ip_csum16 over the whole message
+    # (the stored checksum included) folds to zero for a valid message.
+    if ip_csum16(msg, length) == 0:
+        return 1
+    return 0
+
+
+def igmp_parse_type(msg: Ptr[uint8], length: uint64) -> uint8:
+    # First byte is the message type; 0 (an invalid IGMP type) if runt.
+    if length < 1:
+        return 0
+    return msg[0]
+
+
+def igmp_parse_group(msg: Ptr[uint8], length: uint64, out_grp: Ptr[uint8]) -> int32:
+    # Extract the 4-byte group address from a v2 message (offset 4) or a
+    # v3 report's first group record (offset 12). Returns 1 on success.
+    t: uint8 = igmp_parse_type(msg, length)
+    if t == IGMP_V3_REPORT:
+        if length < IGMP_V3_MSG_LEN:
+            return 0
+        out_grp[0] = msg[12]
+        out_grp[1] = msg[13]
+        out_grp[2] = msg[14]
+        out_grp[3] = msg[15]
+        return 1
+    # v2 Query / Report / Leave: group at offset 4.
+    if length < IGMP_V2_MSG_LEN:
+        return 0
+    out_grp[0] = msg[4]
+    out_grp[1] = msg[5]
+    out_grp[2] = msg[6]
+    out_grp[3] = msg[7]
+    return 1
+
+
+# --- Outbound: build a full Eth|IP(+RtrAlert)|IGMP frame ---------------
+#
+# An IGMP message is sent to a multicast destination: a Report/Leave goes
+# to the group itself (a Leave goes to 224.0.0.2 all-routers in v2), with
+# TTL 1 and the Router Alert option. We build the complete L2 frame in a
+# scratch buffer so the self-test can inspect every field without a NIC,
+# then eth_tx submits it on the live path.
+
+IGMP_FRAME_CAP: uint64 = 128
+igmp_tx_frame: Array[128, uint8]
+
+
+def _igmp_build_frame(msg_type: uint8,
+                      d0: uint8, d1: uint8, d2: uint8, d3: uint8,
+                      g0: uint8, g1: uint8, g2: uint8, g3: uint8,
+                      s0: uint8, s1: uint8, s2: uint8, s3: uint8,
+                      use_v3: int32, record_type: uint8) -> uint64:
+    # Lay down Ethernet (14) | IPv4 with Router Alert (24) | IGMP into
+    # igmp_tx_frame. d* is the IP/multicast DESTINATION (also drives the
+    # destination MAC via igmp_mcast_mac); g* is the GROUP carried inside
+    # the IGMP message; s* is our source IP. Returns total frame length.
+    #
+    # --- Ethernet header ---
+    dst_mac: Array[6, uint8]
+    igmp_mcast_mac(d0, d1, d2, d3, cast[Ptr[uint8]](&dst_mac[0]))
+    i: uint64 = 0
+    while i < 6:
+        igmp_tx_frame[i] = dst_mac[i]
+        i = i + 1
+    src_mac: Ptr[uint8] = eth_get_mac()
+    i = 0
+    while i < 6:
+        igmp_tx_frame[6 + i] = src_mac[i]
+        i = i + 1
+    igmp_tx_frame[12] = cast[uint8]((cast[uint32](ETH_P_IP) >> 8) & 0xFF)
+    igmp_tx_frame[13] = cast[uint8](cast[uint32](ETH_P_IP) & 0xFF)
+    # --- IPv4 header (24 bytes, IHL=6 for the Router Alert option) ---
+    ip: uint64 = ETH_HDR_LEN
+    # Build the IGMP message first so we know its length for total_length.
+    igmp_off: uint64 = ip + IGMP_IP_HDR_LEN
+    msg_len: uint64 = 0
+    igmp_ptr: Ptr[uint8] = cast[Ptr[uint8]](&igmp_tx_frame[igmp_off])
+    if use_v3 == 1:
+        msg_len = igmp_build_v3_report(igmp_ptr, record_type, g0, g1, g2, g3)
+    else:
+        msg_len = igmp_build_v2(igmp_ptr, msg_type, 0, g0, g1, g2, g3)
+    total_len: uint64 = IGMP_IP_HDR_LEN + msg_len
+    igmp_tx_frame[ip + 0] = (4 << 4) | IGMP_IP_IHL          # version 4, IHL 6
+    igmp_tx_frame[ip + 1] = 0                                # DSCP/ECN
+    igmp_tx_frame[ip + 2] = cast[uint8]((total_len >> 8) & 0xFF)
+    igmp_tx_frame[ip + 3] = cast[uint8](total_len & 0xFF)
+    igmp_tx_frame[ip + 4] = 0                                # id hi
+    igmp_tx_frame[ip + 5] = 0                                # id lo
+    igmp_tx_frame[ip + 6] = 0                                # flags/frag hi
+    igmp_tx_frame[ip + 7] = 0                                # flags/frag lo
+    igmp_tx_frame[ip + 8] = IGMP_TTL                         # TTL 1
+    igmp_tx_frame[ip + 9] = IGMP_IPPROTO                     # protocol 2
+    igmp_tx_frame[ip + 10] = 0                               # csum hi (placeholder)
+    igmp_tx_frame[ip + 11] = 0                               # csum lo
+    igmp_tx_frame[ip + 12] = s0                              # source IP
+    igmp_tx_frame[ip + 13] = s1
+    igmp_tx_frame[ip + 14] = s2
+    igmp_tx_frame[ip + 15] = s3
+    igmp_tx_frame[ip + 16] = d0                              # dest IP (group)
+    igmp_tx_frame[ip + 17] = d1
+    igmp_tx_frame[ip + 18] = d2
+    igmp_tx_frame[ip + 19] = d3
+    # Router Alert option (RFC 2113): type 0x94, len 4, value 0x0000.
+    igmp_tx_frame[ip + 20] = 0x94
+    igmp_tx_frame[ip + 21] = 0x04
+    igmp_tx_frame[ip + 22] = 0x00
+    igmp_tx_frame[ip + 23] = 0x00
+    # IPv4 header checksum over the 24 header bytes.
+    hcsum: uint16 = ip_csum16(cast[Ptr[uint8]](&igmp_tx_frame[ip]), IGMP_IP_HDR_LEN)
+    igmp_tx_frame[ip + 10] = cast[uint8]((cast[uint32](hcsum) >> 8) & 0xFF)
+    igmp_tx_frame[ip + 11] = cast[uint8](cast[uint32](hcsum) & 0xFF)
+    return ETH_HDR_LEN + total_len
+
+
+# --- join / leave / query handling ------------------------------------
+
+igmp_reports_sent: uint64 = 0
+igmp_leaves_sent:  uint64 = 0
+igmp_our_ip0: uint8 = 0
+igmp_our_ip1: uint8 = 0
+igmp_our_ip2: uint8 = 0
+igmp_our_ip3: uint8 = 0
+
+
+def igmp_set_our_ip(b0: uint8, b1: uint8, b2: uint8, b3: uint8):
+    # The source IP stamped into outbound IGMP frames. Set from the same
+    # config path that drives ip.ad's ip_our_ip; defaults to 0.0.0.0,
+    # which is the valid source for an initial Report on an unconfigured
+    # interface (RFC 3376 §4).
+    igmp_our_ip0 = b0
+    igmp_our_ip1 = b1
+    igmp_our_ip2 = b2
+    igmp_our_ip3 = b3
+
+
+def _igmp_send_v3_report(g0: uint8, g1: uint8, g2: uint8, g3: uint8,
+                         record_type: uint8) -> uint64:
+    # Build and transmit an IGMPv3 Report for group g* to 224.0.0.22 (the
+    # IGMPv3 all-routers destination, RFC 3376 §4) and return the frame
+    # length. The single group record carries record_type with 0 sources.
+    flen: uint64 = _igmp_build_frame(IGMP_V3_REPORT,
+                                     224, 0, 0, 22,
+                                     g0, g1, g2, g3,
+                                     igmp_our_ip0, igmp_our_ip1,
+                                     igmp_our_ip2, igmp_our_ip3,
+                                     1, record_type)
+    eth_tx(cast[Ptr[uint8]](&igmp_tx_frame[0]), flen)
+    igmp_reports_sent = igmp_reports_sent + 1
+    return flen
+
+
+def igmp_join(g0: uint8, g1: uint8, g2: uint8, g3: uint8,
+              ifindex: int32) -> int32:
+    # Join a multicast group: record the membership and send an
+    # unsolicited IGMPv3 Membership Report (CHANGE_TO_EXCLUDE_MODE, the
+    # any-source-multicast subscription). Returns 1 on success, 0 if the
+    # address is not multicast or the table is full. Joining an already
+    # joined group is idempotent (re-sends the Report, per RFC 3376 robustness).
+    if igmp_is_multicast(g0) == 0:
+        return 0
+    key: uint32 = _igmp_pack4(g0, g1, g2, g3)
+    existing: int64 = _igmp_find(key, ifindex)
+    if existing < 0:
+        # Find a free slot.
+        slot: int64 = cast[int64](-1)
+        i: uint64 = 0
+        while i < IGMP_MAX_GROUPS:
+            if igmp_grp_used[i] == 0:
+                slot = cast[int64](i)
+                i = IGMP_MAX_GROUPS
+            else:
+                i = i + 1
+        if slot < 0:
+            return 0
+        si: uint64 = cast[uint64](slot)
+        igmp_grp_addr[si] = key
+        igmp_grp_if[si] = ifindex
+        igmp_grp_used[si] = 1
+        igmp_grp_count = igmp_grp_count + 1
+    _igmp_send_v3_report(g0, g1, g2, g3, IGMP_CHANGE_TO_EXCLUDE_MODE)
+    return 1
+
+
+def igmp_leave(g0: uint8, g1: uint8, g2: uint8, g3: uint8,
+               ifindex: int32) -> int32:
+    # Leave a multicast group: clear the membership and send an IGMPv2
+    # Leave Group (0x17) to 224.0.0.2 (all-routers). Returns 1 if we were
+    # a member, 0 otherwise.
+    key: uint32 = _igmp_pack4(g0, g1, g2, g3)
+    slot: int64 = _igmp_find(key, ifindex)
+    if slot < 0:
+        return 0
+    si: uint64 = cast[uint64](slot)
+    igmp_grp_used[si] = 0
+    igmp_grp_addr[si] = 0
+    igmp_grp_if[si] = 0
+    if igmp_grp_count > 0:
+        igmp_grp_count = igmp_grp_count - 1
+    # IGMPv2 Leave Group -> 224.0.0.2 (all-routers), the group inside.
+    flen: uint64 = _igmp_build_frame(IGMP_V2_LEAVE,
+                                     224, 0, 0, 2,
+                                     g0, g1, g2, g3,
+                                     igmp_our_ip0, igmp_our_ip1,
+                                     igmp_our_ip2, igmp_our_ip3,
+                                     0, 0)
+    eth_tx(cast[Ptr[uint8]](&igmp_tx_frame[0]), flen)
+    igmp_leaves_sent = igmp_leaves_sent + 1
+    return 1
+
+
+def igmp_handle_query(msg: Ptr[uint8], length: uint64, ifindex: int32) -> int32:
+    # Respond to a Membership Query (type 0x11). A GENERAL query (group
+    # address 0.0.0.0) asks the host to report EVERY group it has joined;
+    # a GROUP-SPECIFIC query (non-zero group) asks only about that group.
+    # For each matching joined group we send an unsolicited Report. Returns
+    # the number of Reports sent (RFC 2236 §3 / RFC 3376 §5.2).
+    t: uint8 = igmp_parse_type(msg, length)
+    if t != IGMP_QUERY:
+        return 0
+    qgrp: Array[4, uint8]
+    if igmp_parse_group(msg, length, cast[Ptr[uint8]](&qgrp[0])) == 0:
+        return 0
+    is_general: int32 = 0
+    if qgrp[0] == 0:
+        if qgrp[1] == 0:
+            if qgrp[2] == 0:
+                if qgrp[3] == 0:
+                    is_general = 1
+    sent: int32 = 0
+    i: uint64 = 0
+    while i < IGMP_MAX_GROUPS:
+        if igmp_grp_used[i] == 1:
+            if igmp_grp_if[i] == ifindex:
+                ga: uint32 = igmp_grp_addr[i]
+                gb0: uint8 = cast[uint8]((ga >> 24) & 0xFF)
+                gb1: uint8 = cast[uint8]((ga >> 16) & 0xFF)
+                gb2: uint8 = cast[uint8]((ga >> 8) & 0xFF)
+                gb3: uint8 = cast[uint8](ga & 0xFF)
+                grp_match: int32 = is_general
+                if is_general == 0:
+                    # Group-specific: report only if this group matches.
+                    if gb0 == qgrp[0]:
+                        if gb1 == qgrp[1]:
+                            if gb2 == qgrp[2]:
+                                if gb3 == qgrp[3]:
+                                    grp_match = 1
+                if grp_match == 1:
+                    _igmp_send_v3_report(gb0, gb1, gb2, gb3,
+                                         IGMP_MODE_IS_EXCLUDE)
+                    sent = sent + 1
+        i = i + 1
+    return sent
+
+
+# --- Inbound IGMP demux (called from ip.ad on protocol 2) -------------
+
+igmp_in_queries: uint64 = 0
+igmp_in_reports: uint64 = 0
+
+
+def igmp_rx(msg: Ptr[uint8], length: uint64,
+            s0: uint8, s1: uint8, s2: uint8, s3: uint8):
+    # Inbound IGMP. ip.ad hands us the IGMP message (the IPv4 header, incl.
+    # the Router Alert option, already peeled). Validate the checksum, then
+    # dispatch by type: a Query triggers Reports for our joined groups; a
+    # Report from another host on the link is informational (a router would
+    # suppress our own Report — RFC 2236 report-suppression — but as a host
+    # we simply count it). Malformed/short messages are dropped.
+    if length < 1:
+        return
+    if igmp_csum_ok(msg, length) == 0:
+        printk0("[igmp] rx: bad checksum, dropping\n")
+        return
+    t: uint8 = msg[0]
+    if t == IGMP_QUERY:
+        igmp_in_queries = igmp_in_queries + 1
+        igmp_handle_query(msg, length, 0)
+        return
+    if t == IGMP_V2_REPORT:
+        igmp_in_reports = igmp_in_reports + 1
+        return
+    if t == IGMP_V3_REPORT:
+        igmp_in_reports = igmp_in_reports + 1
+        return
+    # v2 Leave and unknown types: nothing for a host to do.
+    return
+
+
+# --- Multicast RX-accept predicate (consulted by ip.ad) ---------------
+
+def igmp_mcast_accept(b0: uint8, b1: uint8, b2: uint8, b3: uint8,
+                      ifindex: int32) -> int32:
+    # Decide whether an inbound IPv4 datagram with multicast DESTINATION
+    # b0.b1.b2.b3 should be accepted and delivered. Returns 1 = accept,
+    # 0 = reject. The all-hosts group 224.0.0.1 is ALWAYS accepted (every
+    # host is an implicit member). Any other multicast group is accepted
+    # IFF the host has explicitly joined it on this interface. ip.ad only
+    # calls this for multicast destinations; unicast never reaches here.
+    if igmp_is_all_hosts(b0, b1, b2, b3) == 1:
+        return 1
+    if igmp_is_member(b0, b1, b2, b3, ifindex) == 1:
+        return 1
+    return 0
+
+
+def igmp_init():
+    # Boot-time init: clear the membership table. Called from start_kernel
+    # alongside the other net-layer inits.
+    igmp_table_init()
+    igmp_reports_sent = 0
+    igmp_leaves_sent = 0
+    igmp_in_queries = 0
+    igmp_in_reports = 0
+
+
+# Accessors for /proc-style introspection and the self-test.
+def igmp_reports_sent_get() -> uint64:
+    return igmp_reports_sent
+
+def igmp_leaves_sent_get() -> uint64:
+    return igmp_leaves_sent
+
+def igmp_group_count_get() -> uint64:
+    return igmp_grp_count
+
+
+# =====================================================================
+# In-kernel self-test (deterministic, NO NIC required)
+# =====================================================================
+#
+# Mirrors drivers/net/vxlan.ad::vxlan_selftest / drivers/block/md.ad::
+# md_selftest. Pure in-memory: build v2 + v3 Reports and parse them back,
+# verify checksums + group, verify the multicast-MAC mapping, then exercise
+# the group table + RX-accept predicate across join/leave, and finally
+# parse a Membership Query and assert a Report is produced. Prints
+# [igmp] PASS <prop> per property and a final [igmp] PASS; on any mismatch
+# prints [igmp] FAIL <prop> and returns 0. Returns 1 on full PASS.
+
+def _ig_emerg0(s: Ptr[char]):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0(s)
+
+def _ig_emerg1(s: Ptr[char], a: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk1(s, a)
+
+def _ig_emerg2(s: Ptr[char], a: uint64, b: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk2(s, a, b)
+
+
+# Generously-sized scratch buffers (the messages are <=16 bytes; these are
+# oversized so an undersized Array can't silently overflow a neighbour).
+IGMP_T_CAP: uint64 = 64
+_igt_v2:   Array[64, uint8]
+_igt_v3:   Array[64, uint8]
+_igt_qry:  Array[64, uint8]
+_igt_grp:  Array[4, uint8]
+_igt_mac:  Array[6, uint8]
+
+
+def igmp_selftest() -> int32:
+    _ig_emerg0("[igmp] self-test start\n")
+
+    # Start from a clean table so the test is order-independent.
+    igmp_table_init()
+    igmp_reports_sent = 0
+    igmp_leaves_sent = 0
+    igmp_set_our_ip(10, 0, 2, 15)
+
+    # Test group: 239.1.2.3 (administratively-scoped private multicast).
+    # ---- (1) IGMPv2 Membership Report build + parse ----
+    v2ptr: Ptr[uint8] = cast[Ptr[uint8]](&_igt_v2[0])
+    v2len: uint64 = igmp_build_v2(v2ptr, IGMP_V2_REPORT, 0, 239, 1, 2, 3)
+    if v2len != IGMP_V2_MSG_LEN:
+        _ig_emerg1("[igmp] FAIL v2-len=%d\n", v2len)
+        return 0
+    if igmp_parse_type(v2ptr, v2len) != IGMP_V2_REPORT:
+        _ig_emerg0("[igmp] FAIL v2-type mismatch\n")
+        return 0
+    if igmp_csum_ok(v2ptr, v2len) != 1:
+        _ig_emerg0("[igmp] FAIL v2-checksum\n")
+        return 0
+    if igmp_parse_group(v2ptr, v2len, cast[Ptr[uint8]](&_igt_grp[0])) != 1:
+        _ig_emerg0("[igmp] FAIL v2-parse-group\n")
+        return 0
+    if _igt_grp[0] != 239:
+        _ig_emerg0("[igmp] FAIL v2-group[0]\n")
+        return 0
+    if _igt_grp[1] != 1:
+        _ig_emerg0("[igmp] FAIL v2-group[1]\n")
+        return 0
+    if _igt_grp[2] != 2:
+        _ig_emerg0("[igmp] FAIL v2-group[2]\n")
+        return 0
+    if _igt_grp[3] != 3:
+        _ig_emerg0("[igmp] FAIL v2-group[3]\n")
+        return 0
+    _ig_emerg0("[igmp] PASS v2-report-build-parse (239.1.2.3 type=0x16 csum ok)\n")
+
+    # ---- (2) IGMPv3 Membership Report build + parse ----
+    v3ptr: Ptr[uint8] = cast[Ptr[uint8]](&_igt_v3[0])
+    v3len: uint64 = igmp_build_v3_report(v3ptr, IGMP_CHANGE_TO_EXCLUDE_MODE,
+                                         239, 1, 2, 3)
+    if v3len != IGMP_V3_MSG_LEN:
+        _ig_emerg1("[igmp] FAIL v3-len=%d\n", v3len)
+        return 0
+    if igmp_parse_type(v3ptr, v3len) != IGMP_V3_REPORT:
+        _ig_emerg0("[igmp] FAIL v3-type mismatch\n")
+        return 0
+    if igmp_csum_ok(v3ptr, v3len) != 1:
+        _ig_emerg0("[igmp] FAIL v3-checksum\n")
+        return 0
+    # number_of_group_records == 1
+    if v3ptr[7] != 1:
+        _ig_emerg1("[igmp] FAIL v3-nrec=%d\n", cast[uint64](v3ptr[7]))
+        return 0
+    if igmp_parse_group(v3ptr, v3len, cast[Ptr[uint8]](&_igt_grp[0])) != 1:
+        _ig_emerg0("[igmp] FAIL v3-parse-group\n")
+        return 0
+    if _igt_grp[0] != 239:
+        _ig_emerg0("[igmp] FAIL v3-group[0]\n")
+        return 0
+    if _igt_grp[3] != 3:
+        _ig_emerg0("[igmp] FAIL v3-group[3]\n")
+        return 0
+    _ig_emerg0("[igmp] PASS v3-report-build-parse (239.1.2.3 type=0x22 1 record csum ok)\n")
+
+    # ---- (3) Multicast MAC mapping: 239.1.2.3 -> 01:00:5e:01:02:03 ----
+    igmp_mcast_mac(239, 1, 2, 3, cast[Ptr[uint8]](&_igt_mac[0]))
+    if _igt_mac[0] != 0x01:
+        _ig_emerg0("[igmp] FAIL mac[0]\n")
+        return 0
+    if _igt_mac[1] != 0x00:
+        _ig_emerg0("[igmp] FAIL mac[1]\n")
+        return 0
+    if _igt_mac[2] != 0x5e:
+        _ig_emerg0("[igmp] FAIL mac[2]\n")
+        return 0
+    if _igt_mac[3] != 0x01:
+        _ig_emerg1("[igmp] FAIL mac[3]=%x (want 01)\n", cast[uint64](_igt_mac[3]))
+        return 0
+    if _igt_mac[4] != 0x02:
+        _ig_emerg1("[igmp] FAIL mac[4]=%x (want 02)\n", cast[uint64](_igt_mac[4]))
+        return 0
+    if _igt_mac[5] != 0x03:
+        _ig_emerg1("[igmp] FAIL mac[5]=%x (want 03)\n", cast[uint64](_igt_mac[5]))
+        return 0
+    _ig_emerg0("[igmp] PASS mcast-mac (239.1.2.3 -> 01:00:5e:01:02:03)\n")
+
+    # Also verify the 23-bit fold: 239.129.2.3 maps to the SAME low-23-bit
+    # MAC as 239.1.2.3 (high bit of the 2nd octet is dropped).
+    igmp_mcast_mac(239, 129, 2, 3, cast[Ptr[uint8]](&_igt_mac[0]))
+    if _igt_mac[3] != 0x01:
+        _ig_emerg1("[igmp] FAIL mac-fold[3]=%x (want 01)\n", cast[uint64](_igt_mac[3]))
+        return 0
+    _ig_emerg0("[igmp] PASS mcast-mac-23bit-fold (239.129.2.3 -> 01:00:5e:01:02:03)\n")
+
+    # ---- (4) RX-accept predicate before join: REJECT 239.1.2.3 ----
+    if igmp_mcast_accept(239, 1, 2, 3, 0) != 0:
+        _ig_emerg0("[igmp] FAIL pre-join accept should be REJECT\n")
+        return 0
+    _ig_emerg0("[igmp] PASS rx-reject-before-join (239.1.2.3)\n")
+
+    # all-hosts 224.0.0.1 always accepted, even with no joins.
+    if igmp_mcast_accept(224, 0, 0, 1, 0) != 1:
+        _ig_emerg0("[igmp] FAIL all-hosts 224.0.0.1 must always ACCEPT\n")
+        return 0
+    _ig_emerg0("[igmp] PASS rx-accept-all-hosts (224.0.0.1)\n")
+
+    # ---- (5) join(239.1.2.3): membership + unsolicited Report ----
+    before_reports: uint64 = igmp_reports_sent
+    if igmp_join(239, 1, 2, 3, 0) != 1:
+        _ig_emerg0("[igmp] FAIL join returned non-1\n")
+        return 0
+    if igmp_group_count_get() != 1:
+        _ig_emerg1("[igmp] FAIL group-count=%d after join (want 1)\n",
+                   igmp_group_count_get())
+        return 0
+    if igmp_reports_sent <= before_reports:
+        _ig_emerg0("[igmp] FAIL join did not send unsolicited Report\n")
+        return 0
+    _ig_emerg0("[igmp] PASS join-sends-report (239.1.2.3 membership recorded)\n")
+
+    # RX-accept now ACCEPTs the joined group.
+    if igmp_mcast_accept(239, 1, 2, 3, 0) != 1:
+        _ig_emerg0("[igmp] FAIL post-join accept should be ACCEPT\n")
+        return 0
+    _ig_emerg0("[igmp] PASS rx-accept-after-join (239.1.2.3)\n")
+
+    # An UNJOINED group is still REJECTed.
+    if igmp_mcast_accept(239, 9, 9, 9, 0) != 0:
+        _ig_emerg0("[igmp] FAIL unjoined 239.9.9.9 should be REJECT\n")
+        return 0
+    _ig_emerg0("[igmp] PASS rx-reject-unjoined (239.9.9.9)\n")
+
+    # ---- (6) Membership Query -> Report for joined group ----
+    qptr: Ptr[uint8] = cast[Ptr[uint8]](&_igt_qry[0])
+    # General query: group address 0.0.0.0, max_resp 100 (10s).
+    qlen: uint64 = igmp_build_v2(qptr, IGMP_QUERY, 100, 0, 0, 0, 0)
+    if igmp_parse_type(qptr, qlen) != IGMP_QUERY:
+        _ig_emerg0("[igmp] FAIL query-type mismatch\n")
+        return 0
+    if igmp_csum_ok(qptr, qlen) != 1:
+        _ig_emerg0("[igmp] FAIL query-checksum\n")
+        return 0
+    rbefore: uint64 = igmp_reports_sent
+    nrep: int32 = igmp_handle_query(qptr, qlen, 0)
+    if nrep != 1:
+        _ig_emerg1("[igmp] FAIL general-query produced %d reports (want 1)\n",
+                   cast[uint64](nrep))
+        return 0
+    if igmp_reports_sent <= rbefore:
+        _ig_emerg0("[igmp] FAIL query did not emit a Report frame\n")
+        return 0
+    _ig_emerg0("[igmp] PASS query-produces-report (general query -> 1 Report)\n")
+
+    # Group-specific query for a DIFFERENT group -> 0 reports.
+    qlen2: uint64 = igmp_build_v2(qptr, IGMP_QUERY, 100, 239, 5, 5, 5)
+    nrep2: int32 = igmp_handle_query(qptr, qlen2, 0)
+    if nrep2 != 0:
+        _ig_emerg1("[igmp] FAIL group-specific query (wrong group) made %d reports\n",
+                   cast[uint64](nrep2))
+        return 0
+    _ig_emerg0("[igmp] PASS query-group-specific-mismatch (0 Reports)\n")
+
+    # ---- (7) leave(239.1.2.3): membership cleared, RX now REJECT ----
+    before_leaves: uint64 = igmp_leaves_sent
+    if igmp_leave(239, 1, 2, 3, 0) != 1:
+        _ig_emerg0("[igmp] FAIL leave returned non-1\n")
+        return 0
+    if igmp_leaves_sent <= before_leaves:
+        _ig_emerg0("[igmp] FAIL leave did not send a Leave frame\n")
+        return 0
+    if igmp_group_count_get() != 0:
+        _ig_emerg1("[igmp] FAIL group-count=%d after leave (want 0)\n",
+                   igmp_group_count_get())
+        return 0
+    if igmp_mcast_accept(239, 1, 2, 3, 0) != 0:
+        _ig_emerg0("[igmp] FAIL post-leave accept should be REJECT\n")
+        return 0
+    _ig_emerg0("[igmp] PASS leave-clears-membership (239.1.2.3 now REJECT)\n")
+
+    # all-hosts is STILL accepted after leave.
+    if igmp_mcast_accept(224, 0, 0, 1, 0) != 1:
+        _ig_emerg0("[igmp] FAIL all-hosts must remain ACCEPT after leave\n")
+        return 0
+    _ig_emerg0("[igmp] PASS all-hosts-still-accept-after-leave (224.0.0.1)\n")
+
+    _ig_emerg0("[igmp] PASS\n")
+    return 1

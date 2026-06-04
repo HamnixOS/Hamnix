@@ -2188,6 +2188,18 @@ if os.environ.get("ENABLE_MDRAID_TEST") == "1":
 if os.environ.get("ENABLE_VXLAN_TEST") == "1":
     FILES.append(("/etc/vxlan-test", b"1\n"))
 
+# Native IPv4 multicast + IGMPv2/v3 (RFC 2236 / RFC 3376) self-test.
+# scripts/test_igmp.sh sets ENABLE_IGMP_TEST=1 to plant /etc/igmp-test;
+# init/main.ad's boot:37.igmp gate then runs igmp_selftest()
+# (drivers/net/igmp.ad), a pure in-memory test that builds + parses v2 and
+# v3 Membership Reports (type/group/checksum), maps a group IP to its
+# 01:00:5e multicast MAC, and exercises join/leave against the multicast
+# RX-accept predicate plus a Membership-Query -> Report path. Prints
+# "[igmp] PASS" / "[igmp] FAIL". Default boots ship no marker so it is a
+# no-op everywhere else.
+if os.environ.get("ENABLE_IGMP_TEST") == "1":
+    FILES.append(("/etc/igmp-test", b"1\n"))
+
 # Linux-style overlayfs (union filesystem) self-test. scripts/test_overlayfs.sh
 # sets ENABLE_OVERLAYFS_TEST=1 to plant /etc/overlayfs-test; init/main.ad's
 # boot:37.ovl gate then runs overlayfs_selftest() (fs/overlayfs.ad), which
