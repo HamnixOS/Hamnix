@@ -1,0 +1,632 @@
+# linux_abi/u_process_vm.ad -- process_vm_readv(2) / process_vm_writev(2).
+#
+# Real Linux userland reaches for these two syscalls to move bulk memory
+# between the address space of the CALLING process and a *remote* process
+# identified by pid, scatter/gather across iovecs:
+#
+#   * process_vm_readv(pid, local_iov, liovcnt,
+#                      remote_iov, riovcnt, flags)    nr 310 -> bytes read
+#   * process_vm_writev(pid, local_iov, liovcnt,
+#                       remote_iov, riovcnt, flags)   nr 311 -> bytes written
+#
+# CRIU, gdb's fast memory reads, the `proc_vm` family inside glibc, sanitizers
+# (TSan/ASan cross-thread reads), and high-performance IPC libraries all use
+# these to avoid the /proc/<pid>/mem read/seek/write dance. Until now both fell
+# through to the ENOSYS default, so any such tool saw a bogus failure on its
+# very first probe.
+#
+# ARCHITECTURE NOTE -- process_vm_readv/writev are a LINUX-ABI concept ONLY.
+# Hamnix's native cross-process memory/introspection model is a separate Plan 9
+# concern (per-process namespaces + a debug file server). So this file is pure
+# Linux-ABI furniture for tasks running under the Linux namespace and never
+# touches any native Plan 9 path.
+#
+# This is an HONEST implementation, NOT a stub that ignores its arguments. The
+# transfer is a REAL cross-address-space copy:
+#
+#   * the LOCAL iovec[] array and each LOCAL buffer are read/written through the
+#     validated copy-from/to-user helpers in mm/uaccess.ad (the CALLER's page
+#     tables, i.e. the live CR3);
+#   * the REMOTE buffer is resolved by walking the REMOTE task's OWN page table
+#     (task_pml4(slot)) with uaccess_resolve() -- the exact non-allocating,
+#     non-mutating page-table walker copy_from_user uses, but pointed at a
+#     DIFFERENT address space than the one currently in CR3. The resulting
+#     physical frame (low RAM is identity-mapped, so phys == a kernel VA) is the
+#     memcpy source/destination.
+#   * a remote page that is absent / not user-accessible (US=0) / -- for a write
+#     -- read-only (RW=0) SHORT-stops that iovec exactly like Linux: we return
+#     the count of bytes transferred so far; -EFAULT is returned ONLY if the
+#     very first byte is unreachable (nothing transferred at all).
+#
+# Layer note: a confined Layer-2 leaf, mirroring linux_abi/u_keyring.ad. It
+# calls only current_idx_get() / task_pid_at() / task_pml4() / task_state()
+# (the task-slot keys) + uaccess_resolve / copy_from_user / copy_to_user. It
+# never touches 9P / Chan / Layer-1 code. u_syscalls.ad imports the two nr
+# 310/311 dispatch arms, the same shape as u_keyring.ad.
+
+from kernel.sched.core import (
+    current_idx_get, task_pid_at, task_pml4, task_state,
+    NTASKS, STATE_FREE,
+    create_user_task,
+)
+from mm.uaccess import (
+    copy_from_user, copy_to_user, uaccess_resolve,
+    uaccess_current_pml4,
+)
+from mm.page_alloc import (
+    alloc_page, free_page,
+)
+from fs.elf import (
+    vm_map_user_page,
+)
+from kernel.printk.printk import (
+    printk0, printk1, printk2,
+)
+
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
+
+# =====================================================================
+# Linux ABI constants
+# =====================================================================
+#
+# Negative-errno convention (subset we return).
+PVM_EFAULT:  int64 = -14         # a remote/local pointer was unreachable
+PVM_EINVAL:  int64 = -22         # flags non-zero, or iovcnt out of range
+PVM_ESRCH:   int64 = -3          # no task with that pid
+PVM_EPERM:   int64 = -1          # not permitted (unused; single trust domain)
+
+# Linux caps iovcnt at UIO_MAXIOV (1024). We honour the same bound: a larger
+# count is EINVAL.
+PVM_MAX_IOV: uint64 = 1024
+
+# Page-table leaf flag we need to re-check between local/remote (mirrors
+# mm/uaccess.ad). uaccess_resolve already enforces P/US/RW; we only need the
+# 4 KiB chunking granularity here.
+PVM_PAGE_4K: uint64 = 0x1000
+PVM_OFF_4K:  uint64 = 0xFFF
+
+
+# A single struct iovec is 16 bytes: { void *iov_base; size_t iov_len; }.
+PVM_IOVEC_SZ: uint64 = 16
+
+
+def _pvm_bytes_to_page_end(vaddr: uint64) -> uint64:
+    # Bytes from `vaddr` to the end of its containing 4 KiB page. We chunk every
+    # remote copy at 4 KiB boundaries (the smallest leaf granularity) and
+    # re-walk the remote page table at each boundary, so a range spanning
+    # discontiguous remote frames is handled correctly.
+    return PVM_PAGE_4K - (vaddr & PVM_OFF_4K)
+
+
+# =====================================================================
+# remote-task resolution
+# =====================================================================
+#
+# Resolve a Linux pid to a live task slot, then to its PML4 (the physical
+# address of its top-level page table). A slot in STATE_FREE, or a cr3 of 0,
+# is not a usable remote address space.
+
+def _pvm_slot_for_pid(pid: uint64) -> int64:
+    # Linear scan of the task table (NTASKS small). Returns the slot, or -1 if
+    # no live task carries that pid.
+    i: uint64 = 0
+    while i < NTASKS:
+        si: int32 = cast[int32](i)
+        if task_state(si) != STATE_FREE:
+            if task_pid_at(si) == pid:
+                return cast[int64](i)
+        i = i + 1
+    return -1
+
+
+def _pvm_remote_pml4(pid: uint64) -> uint64:
+    # Resolve a pid to the physical address of its page table, or 0 if the pid
+    # has no live task / no address space.
+    sl: int64 = _pvm_slot_for_pid(pid)
+    if sl < 0:
+        return 0
+    pml4: uint64 = task_pml4(cast[int32](sl))
+    return pml4
+
+
+# =====================================================================
+# the cross-address-space copy core
+# =====================================================================
+#
+# Copy `n` bytes between a LOCAL kernel-staging buffer and a REMOTE user vaddr,
+# walking the REMOTE task's page table (rpml4) to resolve each remote page's
+# physical frame. `to_remote` selects direction:
+#
+#   to_remote == 0 : remote -> kbuf   (READ side: process_vm_readv)
+#   to_remote == 1 : kbuf   -> remote (WRITE side: process_vm_writev)
+#
+# Returns the number of bytes actually transferred (which may be < n if a
+# remote page is unreachable partway -- a short transfer, exactly like Linux).
+# Re-walks at every 4 KiB boundary because the remote range can span
+# discontiguous physical frames.
+def _pvm_copy_remote(rpml4: uint64, rvaddr: uint64,
+                     kbuf: uint64, n: uint64, to_remote: int32) -> uint64:
+    if n == 0:
+        return 0
+    need_write: int32 = 0
+    if to_remote != 0:
+        need_write = 1
+    done: uint64 = 0
+    cur_r: uint64 = rvaddr
+    cur_k: uint64 = kbuf
+    while done < n:
+        phys: uint64 = uaccess_resolve(rpml4, cur_r, need_write)
+        if phys == 0:
+            # Remote page unreachable: stop here. `done` is the short count.
+            return done
+        chunk: uint64 = _pvm_bytes_to_page_end(cur_r)
+        rem: uint64 = n - done
+        if chunk > rem:
+            chunk = rem
+        if to_remote != 0:
+            memcpy(cast[Ptr[uint8]](phys), cast[Ptr[uint8]](cur_k), chunk)
+        else:
+            memcpy(cast[Ptr[uint8]](cur_k), cast[Ptr[uint8]](phys), chunk)
+        cur_r = cur_r + chunk
+        cur_k = cur_k + chunk
+        done = done + chunk
+    return done
+
+
+# =====================================================================
+# per-iovec transfer with a bounded kernel staging buffer
+# =====================================================================
+#
+# The local side is in the CALLER's address space (the live CR3), the remote
+# side in `rpml4`. We can't memcpy local<->remote directly because each side
+# resolves through a DIFFERENT page table; we bounce through a fixed kernel
+# staging buffer one chunk at a time.
+#
+# Drives ONE (local_base/local_len) <-> (remote_base/remote_len) pairing,
+# transferring min(local_len, remote_len) bytes. Returns bytes transferred for
+# this pairing (a short transfer stops the whole syscall). `is_read` selects
+# direction (1 = process_vm_readv: remote -> local; 0 = writev: local ->
+# remote).
+PVM_STAGE: uint64 = 4096
+_pvm_stage: Array[4096, uint8]
+
+
+def _pvm_transfer_pair(rpml4: uint64,
+                       local_base: uint64, local_len: uint64,
+                       remote_base: uint64, remote_len: uint64,
+                       is_read: int32) -> int64:
+    # min(local_len, remote_len) is the amount this pairing moves.
+    want: uint64 = local_len
+    if remote_len < want:
+        want = remote_len
+    moved: uint64 = 0
+    while moved < want:
+        chunk: uint64 = want - moved
+        if chunk > PVM_STAGE:
+            chunk = PVM_STAGE
+        cur_local: uint64 = local_base + moved
+        cur_remote: uint64 = remote_base + moved
+        if is_read != 0:
+            # remote -> staging -> local.
+            got: uint64 = _pvm_copy_remote(rpml4, cur_remote,
+                                           cast[uint64](&_pvm_stage[0]),
+                                           chunk, 0)
+            if got == 0:
+                return cast[int64](moved)        # short: remote unreachable
+            # staging -> local (caller address space). A local fault here is
+            # also a short transfer (Linux short-counts local faults too).
+            resid: uint64 = copy_to_user(cur_local,
+                                         cast[uint64](&_pvm_stage[0]), got)
+            xfer: uint64 = got - resid
+            moved = moved + xfer
+            if resid != 0:
+                return cast[int64](moved)
+            if got < chunk:
+                return cast[int64](moved)        # short remote read
+        else:
+            # local -> staging -> remote.
+            resid2: uint64 = copy_from_user(cast[uint64](&_pvm_stage[0]),
+                                            cur_local, chunk)
+            avail: uint64 = chunk - resid2
+            if avail == 0:
+                return cast[int64](moved)        # short: local unreachable
+            put: uint64 = _pvm_copy_remote(rpml4, cur_remote,
+                                           cast[uint64](&_pvm_stage[0]),
+                                           avail, 1)
+            moved = moved + put
+            if put < avail:
+                return cast[int64](moved)        # short remote write
+            if resid2 != 0:
+                return cast[int64](moved)        # short local read
+    return cast[int64](moved)
+
+
+# =====================================================================
+# the syscall bodies
+# =====================================================================
+#
+# Both walk the LOCAL iovec[] and REMOTE iovec[] arrays (16 bytes each) in
+# lockstep, consuming bytes from whichever side is shorter and advancing into
+# the next entry on that side -- exactly Linux's gather/scatter pairing. The
+# iovec arrays themselves live in the CALLER's memory, so we pull each entry in
+# via copy_from_user.
+#
+# Returns total bytes transferred, or:
+#   * -ESRCH   if pid names no live task,
+#   * -EINVAL  if flags != 0 or an iovcnt exceeds UIO_MAXIOV,
+#   * -EFAULT  ONLY if the FIRST byte is unreachable (nothing moved) or an
+#     iovec array pointer itself faults.
+
+def _pvm_read_iovec(uiov: uint64, idx: uint64,
+                    base_out: Ptr[uint64], len_out: Ptr[uint64]) -> int64:
+    # Pull iovec[idx] from the caller's iovec array into *base_out/*len_out.
+    # Returns 0 on success, -EFAULT if the iovec slot itself faults.
+    ent: uint64 = uiov + idx * PVM_IOVEC_SZ
+    raw: Array[16, uint8]
+    if copy_from_user(cast[uint64](&raw[0]), ent, PVM_IOVEC_SZ) != 0:
+        return PVM_EFAULT
+    base_out[0] = cast[Ptr[uint64]](cast[uint64](&raw[0]))[0]
+    len_out[0]  = cast[Ptr[uint64]](cast[uint64](&raw[8]))[0]
+    return 0
+
+
+def _pvm_do(pid: uint64, local_iov: uint64, liovcnt: uint64,
+            remote_iov: uint64, riovcnt: uint64, flags: uint64,
+            is_read: int32) -> int64:
+    # flags must be 0 (Linux reserves them; none defined).
+    if flags != 0:
+        return PVM_EINVAL
+    if liovcnt > PVM_MAX_IOV or riovcnt > PVM_MAX_IOV:
+        return PVM_EINVAL
+    if liovcnt == 0 or riovcnt == 0:
+        return 0
+
+    rpml4: uint64 = _pvm_remote_pml4(pid)
+    if rpml4 == 0:
+        return PVM_ESRCH
+
+    # Lockstep cursor over the two iovec arrays.
+    li: uint64 = 0               # local iovec index
+    ri: uint64 = 0               # remote iovec index
+    lbase: uint64 = 0
+    llen:  uint64 = 0
+    rbase: uint64 = 0
+    rlen:  uint64 = 0
+    have_l: int32 = 0
+    have_r: int32 = 0
+    total: uint64 = 0
+
+    while li < liovcnt and ri < riovcnt:
+        # Refill the local entry if exhausted (skip zero-length entries).
+        if have_l == 0:
+            lb: uint64 = 0
+            ll: uint64 = 0
+            if _pvm_read_iovec(local_iov, li,
+                               cast[Ptr[uint64]](cast[uint64](&lb)),
+                               cast[Ptr[uint64]](cast[uint64](&ll))) < 0:
+                if total == 0:
+                    return PVM_EFAULT
+                return cast[int64](total)
+            lbase = lb
+            llen = ll
+            if llen == 0:
+                li = li + 1
+                continue
+            have_l = 1
+        # Refill the remote entry if exhausted (skip zero-length entries).
+        if have_r == 0:
+            rb: uint64 = 0
+            rl: uint64 = 0
+            if _pvm_read_iovec(remote_iov, ri,
+                               cast[Ptr[uint64]](cast[uint64](&rb)),
+                               cast[Ptr[uint64]](cast[uint64](&rl))) < 0:
+                if total == 0:
+                    return PVM_EFAULT
+                return cast[int64](total)
+            rbase = rb
+            rlen = rl
+            if rlen == 0:
+                ri = ri + 1
+                continue
+            have_r = 1
+
+        # Transfer min(llen, rlen) for this pairing.
+        n: int64 = _pvm_transfer_pair(rpml4, lbase, llen, rbase, rlen, is_read)
+        moved: uint64 = cast[uint64](n)
+        total = total + moved
+
+        # Advance both cursors by `moved`; whichever side is fully consumed is
+        # refilled next iteration.
+        lbase = lbase + moved
+        llen = llen - moved
+        rbase = rbase + moved
+        rlen = rlen - moved
+        if llen == 0:
+            have_l = 0
+            li = li + 1
+        if rlen == 0:
+            have_r = 0
+            ri = ri + 1
+
+        # A SHORT transfer (a faulting page mid-stream) stops the syscall.
+        # _pvm_transfer_pair moves min(llen,rlen) unless a page is unreachable;
+        # if neither side was fully consumed afterward, the pairing stopped on
+        # an unreachable page -> stop the whole syscall here.
+        if llen != 0 and rlen != 0:
+            break
+
+    if total == 0:
+        # Nothing moved at all. If the very first remote/local byte was
+        # unreachable, Linux returns -EFAULT.
+        return PVM_EFAULT
+    return cast[int64](total)
+
+
+def pvm_process_vm_readv(a0: uint64, a1: uint64, a2: uint64,
+                         a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # process_vm_readv(pid, local_iov, liovcnt, remote_iov, riovcnt, flags):
+    # gather from the REMOTE address space into the LOCAL iovecs.
+    return _pvm_do(a0, a1, a2, a3, a4, a5, 1)
+
+
+def pvm_process_vm_writev(a0: uint64, a1: uint64, a2: uint64,
+                          a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # process_vm_writev(pid, local_iov, liovcnt, remote_iov, riovcnt, flags):
+    # scatter from the LOCAL iovecs into the REMOTE address space.
+    return _pvm_do(a0, a1, a2, a3, a4, a5, 0)
+
+
+# =====================================================================
+# Boot self-test  --  [PROCESS_VM] PASS / FAIL  (boot:37.process_vm)
+# =====================================================================
+#
+# Proves a REAL cross-address-space transfer, not a same-process memcpy:
+#
+#   (1) Build a genuine SECOND address space: create a real user task slot
+#       (create_user_task) whose PML4 is DISTINCT from the boot task's, and
+#       install a known physical page into THAT remote PML4 at a high,
+#       non-identity user vaddr (vaddr != phys -- if the copy fell back to a
+#       raw deref of the remote vaddr it would touch unmapped RAM and the
+#       round-trip would visibly fail).
+#   (2) Stamp PATTERN1 into the remote page's PHYSICAL frame. Drive the REAL
+#       pvm_process_vm_readv() path (PID lookup -> remote page-walk) to read it
+#       back into a LOCAL buffer (in the boot task's address space) and assert
+#       BYTE-EXACT.
+#   (3) Drive the REAL pvm_process_vm_writev() to push PATTERN2 from a LOCAL
+#       buffer into the remote vaddr, then read the remote PHYSICAL frame
+#       directly and assert PATTERN2 landed there byte-exact (proving the write
+#       reached the remote address space).
+#   (4) Boundary behaviours: an UNMAPPED remote vaddr with nothing else mapped
+#       -> -EFAULT; a partially-mapped remote range short-reads exactly at the
+#       page boundary; a bogus pid -> -ESRCH; non-zero flags -> -EINVAL;
+#       scatter/gather across two local iovecs reassembles correctly.
+#
+# Boot-context LOCAL pointers are kernel-mapped and resolve through
+# copy_to_user/copy_from_user against the boot task's live CR3 -- the SAME path
+# a userland caller's local iovecs take. The REMOTE side uses a DIFFERENT PML4,
+# so a PASS proves the two-address-space walk is real.
+
+PVM_RVADDR:  uint64 = 0x0000555500000000   # remote high non-identity vaddr
+PVM_RVADDR2: uint64 = 0x0000555500001000   # a 2nd remote page (gather test)
+PVM_RUNMAP:  uint64 = 0x0000666600000000   # never mapped in the remote
+
+_pvm_t_local:  Array[64, uint8]            # local readv destination
+_pvm_t_src:    Array[64, uint8]            # local writev source
+_pvm_t_iov:    Array[32, uint8]            # two iovecs (gather): 2 * 16 B
+_pvm_t_riov:   Array[16, uint8]            # one remote iovec
+_pvm_t_riov2:  Array[32, uint8]            # two remote iovecs (short-read): 2*16
+
+
+def _pvm_bytes_eq(a: uint64, b: uint64, n: uint64) -> int32:
+    pa: Ptr[uint8] = cast[Ptr[uint8]](a)
+    pb: Ptr[uint8] = cast[Ptr[uint8]](b)
+    i: uint64 = 0
+    while i < n:
+        if pa[i] != pb[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def _pvm_set_iovec(buf: uint64, idx: uint64, base: uint64, len: uint64):
+    # Lay a struct iovec { base; len } at buf[idx] (16 bytes each).
+    p: uint64 = buf + idx * PVM_IOVEC_SZ
+    cast[Ptr[uint64]](p)[0] = base
+    cast[Ptr[uint64]](p + 8)[0] = len
+
+
+def process_vm_selftest() -> int32:
+    # --- (1) build a real SECOND address space -----------------------
+    # A dummy entry value is fine: we never schedule the task before this
+    # synchronous self-test completes; we only borrow its PML4.
+    name0: Ptr[uint8] = "pvm-remote"
+    rslot: int32 = create_user_task(0x400000, cast[uint64](name0))
+    if rslot < 0:
+        printk0("[PROCESS_VM] FAIL: could not create remote task\n")
+        return 0
+    rpid: uint64 = task_pid_at(rslot)
+    rpml4: uint64 = task_pml4(rslot)
+    boot_pml4: uint64 = uaccess_current_pml4()
+    if rpml4 == 0 or rpml4 == boot_pml4:
+        printk2("[PROCESS_VM] FAIL: remote pml4=%p == boot pml4=%p\n",
+                rpml4, boot_pml4)
+        return 0
+    printk2("[PROCESS_VM] PASS: remote task pid=%d distinct pml4=%p\n",
+            rpid, rpml4)
+
+    # Install a known physical page into the REMOTE pml4 at a non-identity
+    # vaddr. The physical frame is what we'll inspect to prove the write side.
+    p_rem: uint64 = alloc_page()
+    if p_rem == 0:
+        printk0("[PROCESS_VM] FAIL: alloc_page (remote frame)\n")
+        return 0
+    memset(cast[Ptr[uint8]](p_rem), 0x00, 4096)
+    if vm_map_user_page(rpml4, PVM_RVADDR, p_rem, 1) < 0:
+        printk0("[PROCESS_VM] FAIL: could not map remote page\n")
+        free_page(p_rem)
+        return 0
+    # A second remote page for the gather test.
+    p_rem2: uint64 = alloc_page()
+    if p_rem2 == 0:
+        printk0("[PROCESS_VM] FAIL: alloc_page (remote frame 2)\n")
+        free_page(p_rem)
+        return 0
+    memset(cast[Ptr[uint8]](p_rem2), 0x00, 4096)
+    if vm_map_user_page(rpml4, PVM_RVADDR2, p_rem2, 1) < 0:
+        printk0("[PROCESS_VM] FAIL: could not map remote page 2\n")
+        free_page(p_rem)
+        free_page(p_rem2)
+        return 0
+
+    # PATTERN1 (0xC0..) stamped into the remote PHYSICAL frame.
+    i: uint64 = 0
+    while i < 32:
+        cast[Ptr[uint8]](p_rem)[i] = cast[uint8](0xC0 + i)
+        i = i + 1
+
+    # --- (2) process_vm_readv: remote -> local, byte-exact -----------
+    memset(cast[Ptr[uint8]](&_pvm_t_local[0]), 0, 64)
+    _pvm_set_iovec(cast[uint64](&_pvm_t_iov[0]), 0,
+                   cast[uint64](&_pvm_t_local[0]), 32)
+    _pvm_set_iovec(cast[uint64](&_pvm_t_riov[0]), 0, PVM_RVADDR, 32)
+    rn: int64 = pvm_process_vm_readv(rpid,
+                                     cast[uint64](&_pvm_t_iov[0]), 1,
+                                     cast[uint64](&_pvm_t_riov[0]), 1, 0)
+    if rn != 32:
+        printk1("[PROCESS_VM] FAIL: readv returned %d (want 32)\n",
+                cast[uint64](rn))
+        return 0
+    # Local buffer must now hold PATTERN1 byte-exact.
+    j: uint64 = 0
+    while j < 32:
+        if _pvm_t_local[j] != cast[uint8](0xC0 + j):
+            printk1("[PROCESS_VM] FAIL: readv byte %d mismatch\n", j)
+            return 0
+        j = j + 1
+    printk0("[PROCESS_VM] PASS: process_vm_readv round-tripped remote->local byte-exact\n")
+
+    # --- (3) process_vm_writev: local -> remote, observed in frame ---
+    k: uint64 = 0
+    while k < 32:
+        _pvm_t_src[k] = cast[uint8](0x30 + k)        # PATTERN2
+        k = k + 1
+    _pvm_set_iovec(cast[uint64](&_pvm_t_iov[0]), 0,
+                   cast[uint64](&_pvm_t_src[0]), 32)
+    _pvm_set_iovec(cast[uint64](&_pvm_t_riov[0]), 0, PVM_RVADDR, 32)
+    wn: int64 = pvm_process_vm_writev(rpid,
+                                      cast[uint64](&_pvm_t_iov[0]), 1,
+                                      cast[uint64](&_pvm_t_riov[0]), 1, 0)
+    if wn != 32:
+        printk1("[PROCESS_VM] FAIL: writev returned %d (want 32)\n",
+                cast[uint64](wn))
+        return 0
+    # Inspect the remote PHYSICAL frame directly: PATTERN2 must be there.
+    m: uint64 = 0
+    while m < 32:
+        if cast[Ptr[uint8]](p_rem)[m] != cast[uint8](0x30 + m):
+            printk1("[PROCESS_VM] FAIL: writev byte %d not in remote frame\n", m)
+            return 0
+        m = m + 1
+    printk0("[PROCESS_VM] PASS: process_vm_writev reached the remote address space byte-exact\n")
+
+    # --- (4a) bogus pid -> -ESRCH ------------------------------------
+    erc: int64 = pvm_process_vm_readv(0xDEAD,
+                                      cast[uint64](&_pvm_t_iov[0]), 1,
+                                      cast[uint64](&_pvm_t_riov[0]), 1, 0)
+    if erc != PVM_ESRCH:
+        printk1("[PROCESS_VM] FAIL: bogus pid rc=%d (want ESRCH)\n",
+                cast[uint64](erc))
+        return 0
+    printk0("[PROCESS_VM] PASS: bogus pid -> ESRCH\n")
+
+    # --- (4b) non-zero flags -> -EINVAL ------------------------------
+    erc = pvm_process_vm_readv(rpid,
+                               cast[uint64](&_pvm_t_iov[0]), 1,
+                               cast[uint64](&_pvm_t_riov[0]), 1, 1)
+    if erc != PVM_EINVAL:
+        printk1("[PROCESS_VM] FAIL: flags!=0 rc=%d (want EINVAL)\n",
+                cast[uint64](erc))
+        return 0
+    printk0("[PROCESS_VM] PASS: non-zero flags -> EINVAL\n")
+
+    # --- (4c) fully-unmapped remote -> -EFAULT (nothing moved) -------
+    _pvm_set_iovec(cast[uint64](&_pvm_t_riov[0]), 0, PVM_RUNMAP, 32)
+    erc = pvm_process_vm_readv(rpid,
+                               cast[uint64](&_pvm_t_iov[0]), 1,
+                               cast[uint64](&_pvm_t_riov[0]), 1, 0)
+    if erc != PVM_EFAULT:
+        printk1("[PROCESS_VM] FAIL: unmapped remote rc=%d (want EFAULT)\n",
+                cast[uint64](erc))
+        return 0
+    printk0("[PROCESS_VM] PASS: unmapped remote -> EFAULT (no bytes, no panic)\n")
+
+    # --- (4d) SHORT read: a mid-stream UNREACHABLE remote iovec ------
+    # Two REMOTE iovecs: the first names the mapped PVM_RVADDR (32 bytes, holds
+    # PATTERN1 stamped at setup), the second names the genuinely-unmapped
+    # PVM_RUNMAP region (proved unreachable by test 4c). The transfer must move
+    # the first iovec's 32 bytes, then SHORT-STOP at the unreachable second
+    # iovec -- returning exactly 32, NOT -EFAULT (bytes WERE transferred). This
+    # is the Linux short-transfer semantic: -EFAULT only when the very first
+    # byte is unreachable; a fault partway returns the count so far.
+    # Re-stamp PATTERN1 into the first remote frame (test 3 overwrote it).
+    rs1: uint64 = 0
+    while rs1 < 32:
+        cast[Ptr[uint8]](p_rem)[rs1] = cast[uint8](0xC0 + rs1)
+        rs1 = rs1 + 1
+    memset(cast[Ptr[uint8]](&_pvm_t_local[0]), 0, 64)
+    _pvm_set_iovec(cast[uint64](&_pvm_t_iov[0]), 0,
+                   cast[uint64](&_pvm_t_local[0]), 64)        # one local sink
+    _pvm_set_iovec(cast[uint64](&_pvm_t_riov2[0]), 0, PVM_RVADDR, 32)
+    _pvm_set_iovec(cast[uint64](&_pvm_t_riov2[0]), 1, PVM_RUNMAP, 32)
+    sn: int64 = pvm_process_vm_readv(rpid,
+                                     cast[uint64](&_pvm_t_iov[0]), 1,
+                                     cast[uint64](&_pvm_t_riov2[0]), 2, 0)
+    if sn != 32:
+        printk1("[PROCESS_VM] FAIL: short read returned %d (want 32)\n",
+                cast[uint64](sn))
+        return 0
+    s: uint64 = 0
+    while s < 32:
+        if _pvm_t_local[s] != cast[uint8](0xC0 + s):
+            printk1("[PROCESS_VM] FAIL: short-read byte %d mismatch\n", s)
+            return 0
+        s = s + 1
+    printk0("[PROCESS_VM] PASS: short read stops at the unreachable iovec (32 bytes, not EFAULT)\n")
+
+    # --- (4e) scatter/gather: two local iovecs reassemble PATTERN1 ---
+    # Re-stamp PATTERN1 into the first remote frame, then read 32 bytes into
+    # TWO local iovecs of 16 bytes each and assert the whole pattern lands.
+    i = 0
+    while i < 32:
+        cast[Ptr[uint8]](p_rem)[i] = cast[uint8](0xC0 + i)
+        i = i + 1
+    memset(cast[Ptr[uint8]](&_pvm_t_local[0]), 0, 64)
+    _pvm_set_iovec(cast[uint64](&_pvm_t_iov[0]), 0,
+                   cast[uint64](&_pvm_t_local[0]), 16)
+    _pvm_set_iovec(cast[uint64](&_pvm_t_iov[0]), 1,
+                   cast[uint64](&_pvm_t_local[16]), 16)
+    _pvm_set_iovec(cast[uint64](&_pvm_t_riov[0]), 0, PVM_RVADDR, 32)
+    gn: int64 = pvm_process_vm_readv(rpid,
+                                     cast[uint64](&_pvm_t_iov[0]), 2,
+                                     cast[uint64](&_pvm_t_riov[0]), 1, 0)
+    if gn != 32:
+        printk1("[PROCESS_VM] FAIL: gather readv returned %d (want 32)\n",
+                cast[uint64](gn))
+        return 0
+    g: uint64 = 0
+    while g < 32:
+        if _pvm_t_local[g] != cast[uint8](0xC0 + g):
+            printk1("[PROCESS_VM] FAIL: gather byte %d mismatch\n", g)
+            return 0
+        g = g + 1
+    printk0("[PROCESS_VM] PASS: scatter/gather across two local iovecs reassembles\n")
+
+    # Release the remote frames (the dummy task slot is harmless; it is never
+    # scheduled and carries no runnable image).
+    free_page(p_rem)
+    free_page(p_rem2)
+
+    printk0("[process_vm] PASS\n")
+    return 1

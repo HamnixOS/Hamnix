@@ -1170,6 +1170,18 @@ if os.environ.get("ENABLE_PERF_TEST"):
 if os.environ.get("ENABLE_KEYRING_TEST"):
     FILES.append(("/etc/keyring-test", b"1\n"))
 
+# ENABLE_PROCESS_VM_TEST=1 to plant /etc/process-vm-test. init/main.ad at
+# boot:37.process_vm detects the marker and calls process_vm_selftest()
+# (linux_abi/u_process_vm.ad): it builds a real SECOND address space (a fresh
+# task slot with a distinct PML4), stamps a known pattern into a remote page at
+# a non-identity vaddr, then drives the REAL process_vm_readv/writev path
+# (pid lookup -> remote page-table walk) and asserts the cross-address-space
+# transfer is byte-exact in both directions, plus the short-read / -EFAULT /
+# -ESRCH / -EINVAL / scatter-gather boundary behaviours, emitting the
+# [process_vm] PASS banner. Default boots omit the marker.
+if os.environ.get("ENABLE_PROCESS_VM_TEST"):
+    FILES.append(("/etc/process-vm-test", b"1\n"))
+
 # bpf(2) eBPF interpreter + map/prog self-test. scripts/test_bpf.sh sets
 # ENABLE_BPF_TEST=1 to plant /etc/bpf-test. init/main.ad detects the marker and
 # calls bpf_selftest() (linux_abi/u_bpf.ad): it creates real HASH + ARRAY maps
