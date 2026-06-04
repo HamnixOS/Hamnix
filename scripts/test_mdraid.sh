@@ -124,6 +124,11 @@ check "raid6 rebuild"                "[md] PASS raid6-rebuild"
 check "raid6 data+Q read"            "[md] PASS raid6-data+Q-read"
 check "raid6 degraded write"         "[md] PASS raid6-degraded-write"
 check "raid6 PASS"                   "[md] raid6 PASS"
+check "raid10 both copies present"   "[mdraid] raid10: both copies present OK"
+check "raid10 rw"                    "[md] PASS raid10-rw"
+check "raid10 degraded read"         "[md] PASS raid10-degraded-read"
+check "raid10 degraded write"        "[md] PASS raid10-degraded-write"
+check "raid10 PASS"                  "[md] raid10 PASS"
 check "mdraid PASS"                  "[mdraid] PASS"
 
 if [ "$fail" -ne 0 ]; then
@@ -131,4 +136,4 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
-echo "[test_mdraid] PASS — native software RAID: RAID0 stripe routing (with boundary-straddle split), RAID1 mirror fan-out + degraded survivor round-trip, RAID5 distributed-parity striping with XOR degraded-read reconstruction + RMW parity + member rebuild, and RAID6 dual-parity (P XOR + Q GF(2^8)) striping with one- and two-fault reconstruction (data+data, data+P, data+Q), GF read-modify-write parity, and full member rebuild all verified"
+echo "[test_mdraid] PASS — native software RAID: RAID0 stripe routing (with boundary-straddle split), RAID1 mirror fan-out + degraded survivor round-trip, RAID5 distributed-parity striping with XOR degraded-read reconstruction + RMW parity + member rebuild, RAID6 dual-parity (P XOR + Q GF(2^8)) striping with one- and two-fault reconstruction (data+data, data+P, data+Q), GF read-modify-write parity, and full member rebuild, and RAID10 near=2 striped mirrors (both copies verified per-member + degraded read/write via the surviving mirror) all verified"

@@ -62,6 +62,7 @@ MD_LEVEL_RAID0: uint32 = 1       # striping
 MD_LEVEL_RAID1: uint32 = 2       # mirroring
 MD_LEVEL_RAID5: uint32 = 5       # striping + distributed single parity
 MD_LEVEL_RAID6: uint32 = 6       # striping + dual parity (P XOR, Q GF(2^8))
+MD_LEVEL_RAID10: uint32 = 10     # striped mirrors (near=2 layout)
 
 MD_MAX_MEMBERS: uint64 = 8       # member disks per array
 MD_MAX_ARRAYS:  uint64 = 8       # md arrays system-wide
@@ -269,6 +270,101 @@ def _md_raid1_io(dev: Ptr[MdArray], is_write: int32, vlba: uint64,
     rlba: uint64 = vlba + dev[0].members[pu].under_start
     rslot: int32 = dev[0].members[pu].under_slot
     return blk_read_sectors(rslot, rlba, count, buf)
+
+
+# =========================================================================
+# RAID10 — striped mirrors (near=2 layout)
+# =========================================================================
+#
+# Linux's drivers/md/raid10.c near=2 layout. The virtual address space is
+# carved into CHUNKS like RAID0, but every chunk is stored COPIES=2 times.
+# For N members and copies=2 (N even), virtual chunk `c` is laid out as:
+#
+#   stripe  s = c / (N / copies)              (member chunk-row)
+#   for copy k in 0..copies-1:
+#     device d = (c * copies + k) % N         (which member holds copy k)
+#   member chunk offset (per device LBA) = s * chunk_sectors + off
+#
+# So for N=4, copies=2 the mirror PAIRS are (dev0,dev1) and (dev2,dev3):
+#   vchunk0 -> dev0+dev1 stripe0 ; vchunk1 -> dev2+dev3 stripe0
+#   vchunk2 -> dev0+dev1 stripe1 ; vchunk3 -> dev2+dev3 stripe1
+# Capacity = (N / copies) * per_member_usable.
+#
+# A WRITE fans out to BOTH live copies of the chunk (skipping a Faulty
+# member, exactly like raid1 within each mirror pair). A READ is served
+# from EITHER copy — we prefer copy0, falling back to copy1 if copy0 is
+# Faulty (read_balance choosing a live mirror). DEGRADED MODE: the array
+# survives as long as each mirror pair keeps one live member.
+
+MD_RAID10_COPIES: uint64 = 2     # near=2: every chunk stored twice
+
+
+def _md_raid10_io(dev: Ptr[MdArray], is_write: int32, vlba: uint64,
+                  count: uint64, buf: Ptr[uint8]) -> int32:
+    # Near=2 striped-mirror remap. Walk the request sector-span, splitting
+    # it at chunk boundaries (a request that straddles two chunks lands on a
+    # different mirror pair, so it must be split — just like RAID0). For each
+    # sub-span compute the two copies' (device, member-LBA) and fan a write
+    # to both live copies / serve a read from either live copy.
+    if count == 0:
+        return 0
+    n: uint64 = cast[uint64](dev[0].n_members)
+    copies: uint64 = MD_RAID10_COPIES
+    groups: uint64 = n / copies
+    chunk: uint64 = dev[0].chunk_sectors
+    done: uint64 = 0
+    while done < count:
+        cur_v: uint64 = vlba + done
+        chunk_index:   uint64 = cur_v / chunk
+        offset_in_chk: uint64 = cur_v % chunk
+        stripe:        uint64 = chunk_index / groups
+        # Sectors remaining in THIS chunk from offset_in_chk on.
+        avail: uint64 = chunk - offset_in_chk
+        frag: uint64 = count - done
+        if frag > avail:
+            frag = avail
+        bufp: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](buf) + done * SECTOR_SIZE)
+        if is_write != 0:
+            wrote_any: int32 = 0
+            k: uint64 = 0
+            while k < copies:
+                d: uint64 = (chunk_index * copies + k) % n
+                if dev[0].members[d].failed == 0:
+                    mlba: uint64 = stripe * chunk + offset_in_chk \
+                        + dev[0].members[d].under_start
+                    rc: int32 = blk_write_sectors(
+                        dev[0].members[d].under_slot, mlba, frag, bufp)
+                    if rc != 0:
+                        return rc
+                    wrote_any = 1
+                k = k + 1
+            if wrote_any == 0:
+                printk0("md: raid10 write with no live copy\n")
+                return -1
+        else:
+            # READ: serve from the first live copy of this chunk.
+            picked: int32 = -1
+            k = 0
+            while k < copies:
+                d: uint64 = (chunk_index * copies + k) % n
+                if dev[0].members[d].failed == 0:
+                    picked = cast[int32](d)
+                    k = copies
+                else:
+                    k = k + 1
+            if picked < 0:
+                printk0("md: raid10 read with no live copy\n")
+                return -1
+            pu: uint64 = cast[uint64](picked)
+            rlba: uint64 = stripe * chunk + offset_in_chk \
+                + dev[0].members[pu].under_start
+            rc2: int32 = blk_read_sectors(
+                dev[0].members[pu].under_slot, rlba, frag, bufp)
+            if rc2 != 0:
+                return rc2
+        done = done + frag
+    return 0
 
 
 # =========================================================================
@@ -1071,6 +1167,8 @@ def _md_io(dev: Ptr[MdArray], is_write: int32, vlba: uint64,
         return _md_raid5_io(dev, is_write, vlba, count, buf)
     if dev[0].level == MD_LEVEL_RAID6:
         return _md_raid6_io(dev, is_write, vlba, count, buf)
+    if dev[0].level == MD_LEVEL_RAID10:
+        return _md_raid10_io(dev, is_write, vlba, count, buf)
     return -1
 
 
@@ -1398,6 +1496,66 @@ def md_create_raid6(name: Ptr[char], slots: Ptr[int32], n: uint64,
     return md_arrays[idx].self_slot
 
 
+def md_create_raid10(name: Ptr[char], slots: Ptr[int32], n: uint64,
+                     chunk_sectors: uint64) -> int32:
+    # Assemble a RAID10 array (striped mirrors, near=2) from `n` member
+    # slots. `n` must be even and >= 2: every chunk is mirrored across a pair
+    # of members and the pairs are striped. Capacity = (N / copies) *
+    # per_member usable. The per-member usable span is clamped to the
+    # smallest member and rounded DOWN to a whole number of chunks (uniform
+    # stripe geometry). This is the `mdadm --create NAME --level=10
+    # --layout=n2 --chunk=CHUNK -n N dev0 dev1 ...` shape. Returns the
+    # registered block slot (>= 0) or a negative error.
+    md_init()
+    if n < 2 or n > MD_MAX_MEMBERS:
+        return -1
+    # near=2 needs an even member count (each chunk stored on a mirror pair).
+    if (n % MD_RAID10_COPIES) != 0:
+        printk0("md: raid10 needs an even member count\n")
+        return -1
+    cs: uint64 = chunk_sectors
+    if cs == 0:
+        cs = MD_DEFAULT_CHUNK_SECTORS
+    smallest: uint64 = 0
+    i: uint64 = 0
+    while i < n:
+        s: int32 = slots[i]
+        if s < 0:
+            return -2
+        cap: uint64 = blk_capacity_sectors(s)
+        if cap == 0:
+            return -2
+        if smallest == 0 or cap < smallest:
+            smallest = cap
+        i = i + 1
+    per_member: uint64 = (smallest / cs) * cs
+    if per_member == 0:
+        printk0("md: raid10 members smaller than one chunk\n")
+        return -3
+    idx_s: int32 = _md_alloc_array()
+    if idx_s < 0:
+        printk0("md: array table full\n")
+        return -4
+    idx: uint64 = cast[uint64](idx_s)
+    md_arrays[idx].level         = MD_LEVEL_RAID10
+    md_arrays[idx].n_members     = cast[uint32](n)
+    md_arrays[idx].rr            = 0
+    md_arrays[idx].chunk_sectors = cs
+    # Capacity = (N / copies) data-groups * per-member span.
+    md_arrays[idx].capacity      = per_member * (n / MD_RAID10_COPIES)
+    i = 0
+    while i < n:
+        md_arrays[idx].members[i].under_slot  = slots[i]
+        md_arrays[idx].members[i].failed      = 0
+        md_arrays[idx].members[i].under_start = 0
+        md_arrays[idx].members[i].usable      = per_member
+        i = i + 1
+    if _md_register(idx, name) != 0:
+        md_arrays[idx].used = 0
+        return -5
+    return md_arrays[idx].self_slot
+
+
 def md_raid6_rebuild(name: Ptr[char], member_idx: uint64,
                      new_slot: int32) -> int32:
     # Replace a Faulty member of RAID6 array `name` with block device
@@ -1527,6 +1685,16 @@ def md_fail_member(name: Ptr[char], member_idx: uint64) -> int32:
                     k = k + 1
                 if live <= 1 and md_arrays[i].members[member_idx].failed == 0:
                     printk0("md: refusing to fail last live mirror\n")
+                    return -1
+            # RAID10 near=2: don't fail a member whose mirror partner is
+            # already Faulty (that would lose a whole mirror pair). Partners
+            # are paired (0,1),(2,3),... so the partner is member_idx XOR 1.
+            if md_arrays[i].level == MD_LEVEL_RAID10:
+                partner: uint64 = member_idx ^ 1
+                if partner < cast[uint64](md_arrays[i].n_members) \
+                        and md_arrays[i].members[partner].failed != 0 \
+                        and md_arrays[i].members[member_idx].failed == 0:
+                    printk0("md: refusing to fail both halves of a mirror\n")
                     return -1
             md_arrays[i].members[member_idx].failed = 1
             return 0
@@ -2019,6 +2187,14 @@ def md_selftest() -> int32:
     if _md_raid6_test(b0, b1, b2, b3, b4, b5) != 1:
         ok = 0
 
+    # ================================================================
+    # Test 6: RAID10 — striped mirrors (near=2). Verify both copies of a
+    # chunk land on the correct mirror pair at the right offset, then run
+    # degraded read+write through a surviving mirror after a member fails.
+    # ================================================================
+    if _md_raid10_test(b0, b1, b2, b3) != 1:
+        ok = 0
+
     if ok == 1:
         _md_emerg0("[mdraid] PASS\n")
         return 1
@@ -2375,4 +2551,152 @@ def _md_raid6_test(b0: int32, b1: int32, b2: int32, b3: int32,
 
     md_remove("md6")
     _md_emerg0("[md] raid6 PASS\n")
+    return 1
+
+
+# Extra scratch for the RAID10 self-test. The test transfers up to 16
+# sectors (8 KiB) THROUGH the array in one go, so the pattern/readback
+# buffers MUST be 8192 bytes — an undersized scratch buffer would silently
+# overflow into the next module-scope global (the exact bug that blocked
+# RAID5). Raw per-member chunk reads (<=4 sectors = 2 KiB) reuse the shared
+# _md_t_raw0/_md_t_raw1 (4096) buffers. Module-scope per the Adder quirk.
+_md_t10_pat:   Array[8192, uint8]   # 16 sectors written through the array
+_md_t10_read:  Array[8192, uint8]   # readback through the array
+_md_slots10:   Array[8, int32]
+
+
+def _md_raid10_test(b0: int32, b1: int32, b2: int32, b3: int32) -> int32:
+    # RAID10 near=2 over FOUR members (mdback0..3), chunk = 4 sectors.
+    # Mirror pairs are (mdback0,mdback1) and (mdback2,mdback3); chunks are
+    # striped across the two pairs. Geometry (chunk=4 sectors):
+    #   vchunk0 (vLBA 0..3)  -> pair(0,1) stripe0  -> member mlba 0..3
+    #   vchunk1 (vLBA 4..7)  -> pair(2,3) stripe0  -> member mlba 0..3
+    #   vchunk2 (vLBA 8..11) -> pair(0,1) stripe1  -> member mlba 4..7
+    #   vchunk3 (vLBA12..15) -> pair(2,3) stripe1  -> member mlba 4..7
+    # Returns 1 PASS / 0 FAIL.
+    _md_emerg0("[mdraid] raid10: begin\n")
+    # Re-zero the four member stores (earlier tests dirtied them).
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store0[0]))
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store1[0]))
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store2[0]))
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store3[0]))
+
+    _md_slots10[0] = b0
+    _md_slots10[1] = b1
+    _md_slots10[2] = b2
+    _md_slots10[3] = b3
+    r10: int32 = md_create_raid10("md10", &_md_slots10[0], 4, 4)
+    if r10 < 0:
+        _md_emerg1("[mdraid] FAIL: md_create_raid10 rc=%d\n",
+                   cast[uint64](cast[int64](r10)))
+        return 0
+    # Capacity = (N/copies) * per_member = 2 * floor(256/4)*4 = 2 * 256 = 512.
+    r10cap: uint64 = blk_capacity_sectors(r10)
+    _md_emerg1("[mdraid] raid10 capacity=%d sectors\n", r10cap)
+    if r10cap != 512:
+        _md_emerg0("[mdraid] FAIL: raid10 capacity wrong (want 512)\n")
+        return 0
+
+    # ---- Write a known 16-sector pattern at vLBA 0 (4 chunks across both
+    # stripes/pairs) and read it back through the healthy array. ----
+    _md_fill(&_md_t10_pat[0], 16 * SECTOR_SIZE, 1010)
+    if blk_write_sectors(r10, 0, 16, &_md_t10_pat[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raid10 write 16s\n")
+        return 0
+    if blk_read_sectors(r10, 0, 16, &_md_t10_read[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raid10 readback 16s\n")
+        return 0
+    if _md_buf_eq(&_md_t10_pat[0], &_md_t10_read[0], 16 * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdraid] FAIL: raid10 rw mismatch\n")
+        return 0
+    _md_emerg0("[md] PASS raid10-rw\n")
+
+    # ---- Verify BOTH COPIES are REAL and landed on the right members at the
+    # right offset. vchunk0 (vLBA 0..3) is copy0=mdback0 mlba0..3 and
+    # copy1=mdback1 mlba0..3 — both must byte-equal the first chunk of the
+    # written pattern. vchunk2 (vLBA 8..11) is copy0=mdback0 mlba4..7 and
+    # copy1=mdback1 mlba4..7 — the stripe1 row on the SAME pair. ----
+    if blk_read_sectors(b0, 0, 4, &_md_t_raw0[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raw read mdback0 chunk0\n")
+        return 0
+    if blk_read_sectors(b1, 0, 4, &_md_t_raw1[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raw read mdback1 chunk0\n")
+        return 0
+    # Both copies of vchunk0 must equal the pattern's first 4 sectors.
+    if _md_buf_eq(&_md_t10_pat[0], &_md_t_raw0[0], 4 * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdraid] FAIL: raid10 copy0 (mdback0) wrong\n")
+        return 0
+    if _md_buf_eq(&_md_t10_pat[0], &_md_t_raw1[0], 4 * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdraid] FAIL: raid10 copy1 (mdback1) wrong\n")
+        return 0
+    # vchunk1 (vLBA 4..7) must be on the OTHER pair (mdback2/mdback3) mlba0..3
+    # and NOT on the first pair's stripe1 row yet (mdback0 mlba4 stays zero
+    # until vchunk2 is written — but we wrote 16s so mlba4 holds vchunk2).
+    if blk_read_sectors(b2, 0, 4, &_md_t_raw0[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raw read mdback2 chunk0\n")
+        return 0
+    if blk_read_sectors(b3, 0, 4, &_md_t_raw1[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raw read mdback3 chunk0\n")
+        return 0
+    # vchunk1 occupies the pattern's sectors 4..7.
+    if _md_buf_eq(cast[Ptr[uint8]](cast[uint64](&_md_t10_pat[0])
+                  + 4 * SECTOR_SIZE), &_md_t_raw0[0], 4 * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdraid] FAIL: raid10 vchunk1 copy0 (mdback2) wrong\n")
+        return 0
+    if _md_buf_eq(cast[Ptr[uint8]](cast[uint64](&_md_t10_pat[0])
+                  + 4 * SECTOR_SIZE), &_md_t_raw1[0], 4 * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdraid] FAIL: raid10 vchunk1 copy1 (mdback3) wrong\n")
+        return 0
+    _md_emerg0("[mdraid] raid10: both copies present OK\n")
+
+    # ---- DEGRADED READ: fail member0 (mdback0). vchunk0 copy0 lived on
+    # mdback0; the array must serve it from the surviving mirror mdback1.
+    # Wipe mdback0 underneath so a read that did NOT route to the survivor
+    # would return garbage — proving the data truly comes from the mirror. ----
+    if md_fail_member("md10", 0) != 0:
+        _md_emerg0("[mdraid] FAIL: md_fail_member raid10\n")
+        return 0
+    _md_emerg0("[mdraid] raid10: member0 marked Faulty (degraded)\n")
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store0[0]))
+    if blk_read_sectors(r10, 0, 16, &_md_t10_read[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raid10 degraded read\n")
+        return 0
+    if _md_buf_eq(&_md_t10_pat[0], &_md_t10_read[0], 16 * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdraid] FAIL: raid10 degraded read mismatch\n")
+        return 0
+    _md_emerg0("[md] PASS raid10-degraded-read\n")
+
+    # ---- DEGRADED WRITE: with member0 still Faulty, overwrite vLBA 0..3
+    # (vchunk0) with a NEW pattern. It must reach the survivor mdback1 and
+    # NOT the failed member0 (mdback0 stays zero). Then read it back via the
+    # survivor. ----
+    _md_fill(&_md_t10_pat[0], 4 * SECTOR_SIZE, 2020)
+    if blk_write_sectors(r10, 0, 4, &_md_t10_pat[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raid10 degraded write\n")
+        return 0
+    # Survivor (mdback1) holds the new data at mlba 0..3.
+    if blk_read_sectors(b1, 0, 4, &_md_t_raw1[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raw read mdback1 mlba0\n")
+        return 0
+    if _md_buf_eq(&_md_t10_pat[0], &_md_t_raw1[0], 4 * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdraid] FAIL: raid10 degraded write missed survivor\n")
+        return 0
+    # Failed member (mdback0) must NOT have the new data (still zero).
+    if blk_read_sectors(b0, 0, 4, &_md_t_raw0[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raw read mdback0 mlba0\n")
+        return 0
+    if _md_buf_eq(&_md_t10_pat[0], &_md_t_raw0[0], 4 * SECTOR_SIZE) != 0:
+        _md_emerg0("[mdraid] FAIL: raid10 degraded write leaked to failed\n")
+        return 0
+    # Read back vchunk0 through the degraded array -> new data via survivor.
+    if blk_read_sectors(r10, 0, 4, &_md_t10_read[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raid10 degraded write readback\n")
+        return 0
+    if _md_buf_eq(&_md_t10_pat[0], &_md_t10_read[0], 4 * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdraid] FAIL: raid10 degraded write readback mismatch\n")
+        return 0
+    _md_emerg0("[md] PASS raid10-degraded-write\n")
+
+    md_remove("md10")
+    _md_emerg0("[md] raid10 PASS\n")
     return 1
