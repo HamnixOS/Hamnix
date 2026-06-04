@@ -1605,6 +1605,21 @@ if os.environ.get("ENABLE_EXT4IDX_TEST") == "1":
 if os.environ.get("ENABLE_EXT4D2_TEST") == "1":
     FILES.append(("/etc/ext4d2-test", b"1\n"))
 
+# ext4 htree (dir_index) hash-lookup self-test. scripts/test_ext4_htree.sh
+# sets ENABLE_EXT4_HTREE_TEST=1 to plant /etc/ext4-htree-test. init/main.ad
+# detects the marker after the ext4 mount and calls ext4_htree_selftest()
+# (fs/ext4.ad): it first runs a directory-hash KAT (legacy/half_md4/tea)
+# against values precomputed by Linux's debugfs `dx_hash`, proving the
+# hash matches Linux bit-for-bit; then it resolves the on-disk "bigdir"
+# htree directory (minted by the test script with enough entries to force
+# >=1 dx index level), looks up several names through the dx_root/dx_node
+# hash-descend path, cross-checks each against the linear all-block scan,
+# and asserts the descend touched only a handful of leaf blocks (not every
+# directory block). READ-only, so it is safe on any mounted image, but it
+# only finds "bigdir" on the test script's image — opt-in via the marker.
+if os.environ.get("ENABLE_EXT4_HTREE_TEST") == "1":
+    FILES.append(("/etc/ext4-htree-test", b"1\n"))
+
 # ext4 extent-FREE / no-leak self-test. scripts/test_ext4_extent_free.sh
 # sets ENABLE_EXT4EXTFREE_TEST=1 to plant /etc/ext4extfree-test.
 # init/main.ad detects the marker after the ext4 mount and calls
