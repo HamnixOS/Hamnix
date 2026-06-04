@@ -100,6 +100,19 @@ class MdArray:
     chunk_sectors: uint64          # RAID0 stripe size (sectors)
     self_slot:     int32           # this array's own block slot
     pad:           uint32
+    # Write-intent ("internal") bitmap. When `bitmap_on` is non-zero this
+    # array tracks dirty regions: BEFORE a write to a region its dirty bit
+    # is set; after the mirror is known in-sync the bit is cleared. A member
+    # that drops and re-adds is then resynced over ONLY the dirty regions
+    # (fast partial resync) instead of the whole device. `bitmap_buf` is a
+    # bit array (one bit per region) supplied by the caller; the array does
+    # not own the storage. `bitmap_region_sectors` is the region size and
+    # `bitmap_nregions` the number of regions covering the whole capacity.
+    bitmap_on:             uint32
+    bitmap_pad:            uint32
+    bitmap_region_sectors: uint64
+    bitmap_nregions:       uint64
+    bitmap_buf:            Ptr[uint8]
     members:       Array[8, MdMember]
 
 
@@ -241,6 +254,10 @@ def _md_raid1_io(dev: Ptr[MdArray], is_write: int32, vlba: uint64,
         return 0
     n: uint64 = cast[uint64](dev[0].n_members)
     if is_write != 0:
+        # Write-intent bitmap: mark every region this write touches dirty
+        # BEFORE the data reaches any member, so a member that is missing
+        # (or fails mid-write) is later resynced over exactly these regions.
+        md_bitmap_mark_write(dev, vlba, count)
         wrote_any: int32 = 0
         i: uint64 = 0
         while i < n:
@@ -270,6 +287,204 @@ def _md_raid1_io(dev: Ptr[MdArray], is_write: int32, vlba: uint64,
     rlba: uint64 = vlba + dev[0].members[pu].under_start
     rslot: int32 = dev[0].members[pu].under_slot
     return blk_read_sectors(rslot, rlba, count, buf)
+
+
+# Scratch buffer for the bitmap resync: holds ONE region's worth of sectors
+# copied from the source member onto the recovered member. Module-scope per
+# the Adder large-array quirk; sized well above any test region size.
+_md_resync_buf: Array[65536, uint8]
+
+
+# =========================================================================
+# Write-intent bitmap (md "internal bitmap") — fast partial resync
+# =========================================================================
+#
+# A redundant array can carry a bitmap that divides its virtual capacity
+# into fixed-size REGIONS (bitmap_region_sectors each). One bit per region
+# records "write-intent": the region MAY differ between mirror members and
+# must be resynced if a member drops and rejoins. Linux md uses exactly
+# this to avoid a full-device resync after a transient member failure.
+#
+# Lifecycle:
+#   * write to a region  -> set its dirty bit BEFORE the write reaches the
+#     members (so a crash mid-write leaves the region marked for resync).
+#   * region known clean -> clear the bit (here: once both mirror members
+#     are proven in sync).
+#   * member re-added     -> walk ONLY the set bits, copying those regions
+#     from a good member onto the recovered one. Untouched regions are
+#     skipped entirely, so the resync cost is proportional to the dirty
+#     working set, not the device size.
+
+def _md_bitmap_byte(dev: Ptr[MdArray], region: uint64) -> Ptr[uint8]:
+    base: uint64 = cast[uint64](dev[0].bitmap_buf)
+    return cast[Ptr[uint8]](base + (region >> 3))
+
+
+def md_bitmap_set(dev: Ptr[MdArray], region: uint64):
+    # Mark `region` dirty (write-intent). No-op if the bitmap is off or the
+    # region is out of range.
+    if dev[0].bitmap_on == 0:
+        return
+    if region >= dev[0].bitmap_nregions:
+        return
+    p: Ptr[uint8] = _md_bitmap_byte(dev, region)
+    p[0] = cast[uint8](cast[uint64](p[0]) | (1 << (region & 7)))
+
+
+def md_bitmap_clear(dev: Ptr[MdArray], region: uint64):
+    # Clear `region`'s dirty bit (region is known in-sync).
+    if dev[0].bitmap_on == 0:
+        return
+    if region >= dev[0].bitmap_nregions:
+        return
+    p: Ptr[uint8] = _md_bitmap_byte(dev, region)
+    p[0] = cast[uint8](cast[uint64](p[0]) & (~(1 << (region & 7)) & 0xFF))
+
+
+def md_bitmap_test(dev: Ptr[MdArray], region: uint64) -> int32:
+    # Return 1 if `region`'s dirty bit is set, else 0.
+    if dev[0].bitmap_on == 0:
+        return 0
+    if region >= dev[0].bitmap_nregions:
+        return 0
+    p: Ptr[uint8] = _md_bitmap_byte(dev, region)
+    if (cast[uint64](p[0]) & (1 << (region & 7))) != 0:
+        return 1
+    return 0
+
+
+def md_bitmap_count_dirty(dev: Ptr[MdArray]) -> uint64:
+    # Count the number of dirty regions currently marked.
+    if dev[0].bitmap_on == 0:
+        return 0
+    n: uint64 = 0
+    r: uint64 = 0
+    while r < dev[0].bitmap_nregions:
+        if md_bitmap_test(dev, r) != 0:
+            n = n + 1
+        r = r + 1
+    return n
+
+
+def md_bitmap_mark_write(dev: Ptr[MdArray], vlba: uint64, count: uint64):
+    # Mark every region touched by the write span [vlba, vlba+count) dirty.
+    # Called BEFORE the write is dispatched to the members.
+    if dev[0].bitmap_on == 0 or count == 0:
+        return
+    rs: uint64 = dev[0].bitmap_region_sectors
+    first: uint64 = vlba / rs
+    last:  uint64 = (vlba + count - 1) / rs
+    r: uint64 = first
+    while r <= last:
+        md_bitmap_set(dev, r)
+        r = r + 1
+
+
+def md_bitmap_enable(name: Ptr[char], region_sectors: uint64,
+                     store: Ptr[uint8], store_bytes: uint64) -> int32:
+    # Attach a write-intent bitmap to array `name`, dividing its capacity
+    # into `region_sectors`-sized regions. `store` is the caller-owned bit
+    # array (must hold at least ceil(nregions/8) bytes); the bitmap starts
+    # all-clear (the array is assumed in-sync at enable time). Returns the
+    # region count on success, or a negative error.
+    slot: int32 = find_blockdev(name)
+    if slot < 0:
+        return -1
+    if region_sectors == 0:
+        return -1
+    i: uint64 = 0
+    while i < MD_MAX_ARRAYS:
+        if md_arrays[i].used != 0 and md_arrays[i].self_slot == slot:
+            cap: uint64 = md_arrays[i].capacity
+            nreg: uint64 = (cap + region_sectors - 1) / region_sectors
+            need: uint64 = (nreg + 7) >> 3
+            if store_bytes < need:
+                printk0("md: bitmap store too small\n")
+                return -2
+            # Start clear (the array is in-sync when the bitmap is created).
+            z: uint64 = 0
+            while z < need:
+                store[z] = 0
+                z = z + 1
+            md_arrays[i].bitmap_buf            = store
+            md_arrays[i].bitmap_region_sectors = region_sectors
+            md_arrays[i].bitmap_nregions       = nreg
+            md_arrays[i].bitmap_on             = 1
+            return cast[int32](nreg)
+        i = i + 1
+    return -1
+
+
+def md_bitmap_resync(name: Ptr[char], member_idx: uint64,
+                     new_slot: int32) -> int64:
+    # Re-add (recover) member `member_idx` of array `name` using the
+    # write-intent bitmap: copy ONLY the dirty regions from a live, in-sync
+    # member onto the recovered member, then clear those bits. `new_slot`
+    # (>= 0) replaces the member's underlying device, or -1 to recover the
+    # existing (now cleared-Faulty) member in place. Returns the NUMBER OF
+    # REGIONS resynced (>= 0), or a negative error. This is the fast path:
+    # the whole device is NOT rewritten — only the regions that took writes
+    # while the member was missing.
+    slot: int32 = find_blockdev(name)
+    if slot < 0:
+        return -1
+    i: uint64 = 0
+    while i < MD_MAX_ARRAYS:
+        if md_arrays[i].used != 0 and md_arrays[i].self_slot == slot:
+            dev: Ptr[MdArray] = &md_arrays[i]
+            if dev[0].level != MD_LEVEL_RAID1:
+                return -2
+            if dev[0].bitmap_on == 0:
+                return -3
+            n: uint64 = cast[uint64](dev[0].n_members)
+            if member_idx >= n:
+                return -1
+            # Find a LIVE, non-target source member to copy from.
+            src: uint64 = n
+            k: uint64 = 0
+            while k < n:
+                if k != member_idx and dev[0].members[k].failed == 0:
+                    src = k
+                    k = n
+                else:
+                    k = k + 1
+            if src >= n:
+                return -4
+            # Swap in the replacement device (if any) and un-fail the target.
+            if new_slot >= 0:
+                dev[0].members[member_idx].under_slot = new_slot
+            dev[0].members[member_idx].failed = 0
+            src_slot: int32 = dev[0].members[src].under_slot
+            src_start: uint64 = dev[0].members[src].under_start
+            dst_slot: int32 = dev[0].members[member_idx].under_slot
+            dst_start: uint64 = dev[0].members[member_idx].under_start
+            rs: uint64 = dev[0].bitmap_region_sectors
+            cap: uint64 = dev[0].capacity
+            resynced: uint64 = 0
+            r: uint64 = 0
+            while r < dev[0].bitmap_nregions:
+                if md_bitmap_test(dev, r) != 0:
+                    vlba: uint64 = r * rs
+                    cnt: uint64 = rs
+                    if vlba + cnt > cap:
+                        cnt = cap - vlba
+                    # Copy this dirty region from the source member onto the
+                    # recovered member, one region at a time.
+                    rc: int32 = blk_read_sectors(src_slot,
+                        src_start + vlba, cnt, &_md_resync_buf[0])
+                    if rc != 0:
+                        return -5
+                    rc = blk_write_sectors(dst_slot,
+                        dst_start + vlba, cnt, &_md_resync_buf[0])
+                    if rc != 0:
+                        return -5
+                    # Region is now in sync on both members — clear the bit.
+                    md_bitmap_clear(dev, r)
+                    resynced = resynced + 1
+                r = r + 1
+            return cast[int64](resynced)
+        i = i + 1
+    return -1
 
 
 # =========================================================================
@@ -1278,11 +1493,16 @@ def md_create_raid1(name: Ptr[char], slots: Ptr[int32], n: uint64) -> int32:
         printk0("md: array table full\n")
         return -4
     idx: uint64 = cast[uint64](idx_s)
-    md_arrays[idx].level         = MD_LEVEL_RAID1
-    md_arrays[idx].n_members     = cast[uint32](n)
-    md_arrays[idx].rr            = 0
-    md_arrays[idx].chunk_sectors = 0
-    md_arrays[idx].capacity      = smallest
+    md_arrays[idx].level           = MD_LEVEL_RAID1
+    md_arrays[idx].n_members       = cast[uint32](n)
+    md_arrays[idx].rr              = 0
+    md_arrays[idx].chunk_sectors   = 0
+    md_arrays[idx].capacity        = smallest
+    # A freshly-created array carries no bitmap until md_bitmap_enable.
+    md_arrays[idx].bitmap_on             = 0
+    md_arrays[idx].bitmap_region_sectors = 0
+    md_arrays[idx].bitmap_nregions       = 0
+    md_arrays[idx].bitmap_buf            = cast[Ptr[uint8]](0)
     i = 0
     while i < n:
         md_arrays[idx].members[i].under_slot  = slots[i]
@@ -1780,6 +2000,18 @@ _md_t_raw1:   Array[4096, uint8]   # raw read from member 1 (up to 4-sector chun
 _md_slots0:   Array[8, int32]
 _md_slots1:   Array[8, int32]
 
+# Write-intent-bitmap subtest scratch (module-scope per the Adder quirk).
+# The test array is a 256-sector RAID1 with 8-sector regions -> 32 regions,
+# so the bitmap needs ceil(32/8)=4 bytes; oversize the store to 64 bytes
+# (512 regions of headroom) to keep clear of the BSS-overflow trap.
+_md_bm_store:  Array[64, uint8]
+# Per-region pattern buffers: one region = 8 sectors = 4096 bytes. Each is
+# sized to a FULL region so a region-wide write/read never overflows.
+_md_bm_pat:    Array[4096, uint8]
+_md_bm_read:   Array[4096, uint8]
+_md_bm_raw:    Array[4096, uint8]
+_md_slotsbm:   Array[8, int32]
+
 
 def _md_back0_read(priv: uint64, lba: uint64, count: uint64,
                    buf: Ptr[uint8]) -> int32:
@@ -2193,6 +2425,15 @@ def md_selftest() -> int32:
     # degraded read+write through a surviving mirror after a member fails.
     # ================================================================
     if _md_raid10_test(b0, b1, b2, b3) != 1:
+        ok = 0
+
+    # ================================================================
+    # Test 7: WRITE-INTENT BITMAP — a RAID1 carries an internal bitmap;
+    # after a member fails, writes mark only their regions dirty, and the
+    # re-add resyncs ONLY those dirty regions (fast partial resync), leaving
+    # the array consistent and the bitmap clear.
+    # ================================================================
+    if _md_bitmap_selftest(b2, b3) != 1:
         ok = 0
 
     if ok == 1:
@@ -2699,4 +2940,175 @@ def _md_raid10_test(b0: int32, b1: int32, b2: int32, b3: int32) -> int32:
 
     md_remove("md10")
     _md_emerg0("[md] raid10 PASS\n")
+    return 1
+
+
+# A region holds 8 sectors; the test array is 256 sectors -> 32 regions.
+_MD_BM_REGION_SECTORS: uint64 = 8
+
+
+def _md_bm_dev(name: Ptr[char]) -> Ptr[MdArray]:
+    # Resolve an array by name to its MdArray (or null).
+    slot: int32 = find_blockdev(name)
+    if slot < 0:
+        return cast[Ptr[MdArray]](0)
+    i: uint64 = 0
+    while i < MD_MAX_ARRAYS:
+        if md_arrays[i].used != 0 and md_arrays[i].self_slot == slot:
+            return &md_arrays[i]
+        i = i + 1
+    return cast[Ptr[MdArray]](0)
+
+
+def _md_bitmap_selftest(b2: int32, b3: int32) -> int32:
+    # Write-intent bitmap over a RAID1 (mdback2=member0, mdback3=member1).
+    # Region = 8 sectors -> 32 regions for the 256-sector array. Returns 1
+    # PASS / 0 FAIL. Proves a member that drops and rejoins is resynced over
+    # ONLY the regions that took writes while it was down — NOT the whole
+    # device.
+    _md_emerg0("[mdraid] bitmap: begin\n")
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store2[0]))
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store3[0]))
+
+    _md_slotsbm[0] = b2
+    _md_slotsbm[1] = b3
+    rbm: int32 = md_create_raid1("mdbm", &_md_slotsbm[0], 2)
+    if rbm < 0:
+        _md_emerg1("[mdraid] FAIL: bitmap md_create_raid1 rc=%d\n",
+                   cast[uint64](cast[int64](rbm)))
+        return 0
+
+    # Attach the write-intent bitmap (8-sector regions). 256/8 = 32 regions.
+    nreg: int32 = md_bitmap_enable("mdbm", _MD_BM_REGION_SECTORS,
+                                   &_md_bm_store[0], 64)
+    if nreg != 32:
+        _md_emerg1("[mdraid] FAIL: bitmap enable nreg=%d (want 32)\n",
+                   cast[uint64](cast[int64](nreg)))
+        return 0
+    _md_emerg1("[mdraid] bitmap: enabled, %d regions\n",
+               cast[uint64](cast[int64](nreg)))
+
+    dev: Ptr[MdArray] = _md_bm_dev("mdbm")
+    if cast[uint64](dev) == 0:
+        _md_emerg0("[mdraid] FAIL: bitmap dev lookup\n")
+        return 0
+
+    # The bitmap starts clear (array is in-sync at enable time).
+    if md_bitmap_count_dirty(dev) != 0:
+        _md_emerg0("[mdraid] FAIL: bitmap not clear at enable\n")
+        return 0
+
+    # Fail member1 (mdback3). The array runs degraded off member0 (mdback2).
+    if md_fail_member("mdbm", 1) != 0:
+        _md_emerg0("[mdraid] FAIL: bitmap md_fail_member(1)\n")
+        return 0
+    _md_emerg0("[mdraid] bitmap: member1 marked Faulty (degraded)\n")
+
+    # Write a DISTINCT pattern to a FEW specific regions while member1 is
+    # down. Region r covers vLBA r*8 .. r*8+7. Touch regions 2, 5 and 20 by
+    # writing one sector at the START of each region. Only member0 (mdback2)
+    # receives the data; member1 (mdback3) is skipped.
+    # --- region 2 (vLBA 16) ---
+    _md_fill(&_md_bm_pat[0], SECTOR_SIZE, 1212)
+    if blk_write_sectors(rbm, 16, 1, &_md_bm_pat[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: bitmap write region2\n")
+        return 0
+    # --- region 5 (vLBA 40) ---
+    _md_fill(&_md_bm_pat[0], SECTOR_SIZE, 1515)
+    if blk_write_sectors(rbm, 40, 1, &_md_bm_pat[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: bitmap write region5\n")
+        return 0
+    # --- region 20 (vLBA 160) ---
+    _md_fill(&_md_bm_pat[0], SECTOR_SIZE, 2020)
+    if blk_write_sectors(rbm, 160, 1, &_md_bm_pat[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: bitmap write region20\n")
+        return 0
+
+    # Exactly regions 2, 5 and 20 must be marked dirty; every OTHER region
+    # must stay clear. This proves write-intent is tracked per region.
+    if md_bitmap_test(dev, 2) != 1 or md_bitmap_test(dev, 5) != 1 \
+            or md_bitmap_test(dev, 20) != 1:
+        _md_emerg0("[mdraid] FAIL: bitmap dirty regions not all set\n")
+        return 0
+    dirty: uint64 = md_bitmap_count_dirty(dev)
+    if dirty != 3:
+        _md_emerg1("[mdraid] FAIL: bitmap dirty count=%d (want 3)\n", dirty)
+        return 0
+    # Spot-check that untouched regions stayed clear.
+    if md_bitmap_test(dev, 0) != 0 or md_bitmap_test(dev, 3) != 0 \
+            or md_bitmap_test(dev, 19) != 0 or md_bitmap_test(dev, 31) != 0:
+        _md_emerg0("[mdraid] FAIL: bitmap clean region wrongly dirty\n")
+        return 0
+    _md_emerg0("[mdraid] bitmap: only dirty regions marked OK\n")
+
+    # WIPE the ENTIRE member1 store (mdback3) so a resync that copied the
+    # whole device would touch all 32 regions, but a bitmap-driven resync
+    # touches only the 3 dirty ones — leaving the other 29 regions ZERO on
+    # member1 (provable below).
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store3[0]))
+
+    # Re-add member1 with the SAME underlying device and bitmap-resync.
+    n_resynced: int64 = md_bitmap_resync("mdbm", 1, -1)
+    if n_resynced < 0:
+        _md_emerg1("[mdraid] FAIL: bitmap resync rc=%d\n",
+                   cast[uint64](n_resynced))
+        return 0
+    _md_emerg1("[mdraid] bitmap: resync touched %d regions\n",
+               cast[uint64](n_resynced))
+    # PARTIAL: the resync must have walked ONLY the 3 dirty regions, far
+    # fewer than the 32 regions of the whole device.
+    if n_resynced != 3:
+        _md_emerg1("[mdraid] FAIL: bitmap resync touched %d regions (want 3)\n",
+                   cast[uint64](n_resynced))
+        return 0
+    _md_emerg0("[md] PASS bitmap-partial-resync\n")
+
+    # CONSISTENT: the 3 dirty regions on member1 (mdback3) must now byte-match
+    # member0 (mdback2). Read each region raw from both members and compare.
+    rs: uint64 = _MD_BM_REGION_SECTORS
+    if blk_read_sectors(b2, 2 * rs, rs, &_md_bm_raw[0]) != 0 \
+            or blk_read_sectors(b3, 2 * rs, rs, &_md_bm_read[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: bitmap raw read region2\n")
+        return 0
+    if _md_buf_eq(&_md_bm_raw[0], &_md_bm_read[0], rs * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdraid] FAIL: bitmap region2 inconsistent after resync\n")
+        return 0
+    if blk_read_sectors(b2, 5 * rs, rs, &_md_bm_raw[0]) != 0 \
+            or blk_read_sectors(b3, 5 * rs, rs, &_md_bm_read[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: bitmap raw read region5\n")
+        return 0
+    if _md_buf_eq(&_md_bm_raw[0], &_md_bm_read[0], rs * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdraid] FAIL: bitmap region5 inconsistent after resync\n")
+        return 0
+    if blk_read_sectors(b2, 20 * rs, rs, &_md_bm_raw[0]) != 0 \
+            or blk_read_sectors(b3, 20 * rs, rs, &_md_bm_read[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: bitmap raw read region20\n")
+        return 0
+    if _md_buf_eq(&_md_bm_raw[0], &_md_bm_read[0], rs * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdraid] FAIL: bitmap region20 inconsistent after resync\n")
+        return 0
+    _md_emerg0("[md] PASS bitmap-consistent-after-resync\n")
+
+    # PROOF the resync was PARTIAL, not a whole-device copy: an UNTOUCHED
+    # region (region 10) on the wiped member1 must STILL be zero — the
+    # bitmap resync never copied it. Compare against an all-zero region.
+    z: uint64 = 0
+    while z < rs * SECTOR_SIZE:
+        _md_bm_pat[z] = 0
+        z = z + 1
+    if blk_read_sectors(b3, 10 * rs, rs, &_md_bm_read[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: bitmap raw read clean region10\n")
+        return 0
+    if _md_buf_eq(&_md_bm_pat[0], &_md_bm_read[0], rs * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdraid] FAIL: bitmap clean region was resynced (not partial)\n")
+        return 0
+
+    # The bitmap must be ALL-CLEAR after the resync (every dirty region was
+    # resynced and its bit cleared).
+    if md_bitmap_count_dirty(dev) != 0:
+        _md_emerg0("[mdraid] FAIL: bitmap not clear after resync\n")
+        return 0
+    _md_emerg0("[md] bitmap PASS\n")
+
+    md_remove("mdbm")
     return 1
