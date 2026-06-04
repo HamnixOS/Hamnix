@@ -2227,6 +2227,18 @@ if os.environ.get("ENABLE_GRE_TEST") == "1":
 if os.environ.get("ENABLE_BRIDGE_TEST") == "1":
     FILES.append(("/etc/bridge-test", b"1\n"))
 
+# Native IEEE 802.1Q VLAN tagging self-test. scripts/test_vlan.sh sets
+# ENABLE_VLAN_TEST=1 to plant /etc/vlan-test; init/main.ad's boot:37.vlan
+# gate then runs vlan_selftest() (drivers/net/vlan.ad), a pure in-memory
+# test that registers logical vlan interfaces (VID->iface), round-trips a
+# 4-byte 802.1Q tag INSERT+STRIP asserting the inner Ethernet frame is
+# byte-identical and the decoded {PCP,DEI,VID} match, proves the ingress
+# filter DROPS an unregistered VID and ACCEPTS a registered one, and proves
+# egress tagging stamps an interface's VID. Prints "[vlan] PASS" / "[vlan]
+# FAIL". Default boots ship no marker so it is a no-op everywhere else.
+if os.environ.get("ENABLE_VLAN_TEST") == "1":
+    FILES.append(("/etc/vlan-test", b"1\n"))
+
 # Linux-style overlayfs (union filesystem) self-test. scripts/test_overlayfs.sh
 # sets ENABLE_OVERLAYFS_TEST=1 to plant /etc/overlayfs-test; init/main.ad's
 # boot:37.ovl gate then runs overlayfs_selftest() (fs/overlayfs.ad), which

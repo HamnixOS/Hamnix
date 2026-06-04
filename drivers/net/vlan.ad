@@ -1,0 +1,642 @@
+# drivers/net/vlan.ad
+#
+# IEEE 802.1Q — VLAN tagging.
+#
+# A VLAN tag is a 4-byte field spliced into an Ethernet II frame, right
+# after the 12-byte destination+source MAC pair and BEFORE the original
+# EtherType. On the wire (all multi-byte fields big-endian):
+#
+#   untagged:  | dst[6] | src[6] | ethertype[2] | payload... |
+#                                  ^^^^^^^^^^^^^^
+#   tagged:    | dst[6] | src[6] | TPID[2] | TCI[2] | ethertype[2] | payload |
+#                                  \_________________/
+#                                   the 4-byte 802.1Q tag
+#
+# TPID  = 0x8100  (the 802.1Q Tag Protocol Identifier, big-endian).
+# TCI   = Tag Control Information, a 16-bit word:
+#
+#     bit 15..13  PCP  — Priority Code Point (3 bits, 802.1p priority)
+#     bit 12      DEI  — Drop Eligible Indicator (1 bit; legacy CFI)
+#     bit 11..0   VID  — VLAN Identifier (12 bits, 0..4095)
+#
+# This module computes the tag bytes genuinely (no shortcuts): insert
+# splices the 4 bytes in and shifts the inner ethertype+payload right;
+# strip removes them and decodes {PCP, DEI, VID}; a small fixed VID->iface
+# table backs ingress filtering (drop unregistered VIDs) and egress tagging
+# (a frame leaving a vlan interface gets that interface's VID).
+
+from kernel.printk.printk import printk0, printk1, printk2, printk_set_level
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
+from drivers.net.eth import ETH_HDR_LEN, ETH_P_IP
+
+
+# --- Wire constants ----------------------------------------------------
+
+# 802.1Q Tag Protocol Identifier. Lives at frame offset 12..13 in a
+# C-VLAN (customer) tagged frame, big-endian.
+ETH_P_8021Q: uint16 = 0x8100
+
+# The 4-byte VLAN tag (TPID[2] + TCI[2]).
+VLAN_TAG_LEN: uint64 = 4
+
+# Offset of the tag within an Ethernet frame: immediately after the two
+# 6-byte MAC addresses.
+VLAN_MAC_LEN: uint64 = 12
+
+# A VID is 12 bits.
+VLAN_VID_MASK: uint16 = 0x0FFF
+VLAN_VID_MAX:  uint16 = 4095
+
+# Field shifts/masks inside the 16-bit TCI.
+VLAN_PCP_SHIFT: uint16 = 13          # PCP occupies bits 15..13
+VLAN_DEI_SHIFT: uint16 = 12          # DEI occupies bit 12
+VLAN_PCP_MASK:  uint16 = 0x7         # 3 bits
+VLAN_DEI_MASK:  uint16 = 0x1         # 1 bit
+
+
+# Counters (mirror the /sys-visible accounting a real vlan netdev keeps).
+vlan_tx_tags:   uint64 = 0           # frames tagged on egress
+vlan_rx_strips: uint64 = 0           # frames whose tag was stripped
+vlan_rx_drops:  uint64 = 0           # frames dropped by ingress filter
+
+
+# =====================================================================
+# Per-VLAN interface table: VID -> logical vlan interface
+# =====================================================================
+#
+# A real vlan netdev (e.g. eth0.100) is a logical interface bound to a
+# parent NIC and a single VID. A fixed-size table is enough to register a
+# known set of VLAN interfaces and resolve a VID to its logical ifindex.
+
+VLAN_IF_MAX: uint64 = 16
+
+vlan_if_inuse: Array[16, uint8]      # 1 if slot holds a vlan interface
+vlan_if_vid:   Array[16, uint16]     # the VID this interface carries
+vlan_if_pcp:   Array[16, uint8]      # default egress PCP for this interface
+
+
+def vlan_init():
+    # Reset the interface table and counters. Idempotent.
+    i: uint64 = 0
+    while i < VLAN_IF_MAX:
+        vlan_if_inuse[i] = 0
+        vlan_if_vid[i]   = 0
+        vlan_if_pcp[i]   = 0
+        i = i + 1
+    vlan_tx_tags   = 0
+    vlan_rx_strips = 0
+    vlan_rx_drops  = 0
+
+
+def vlan_if_add(vid: uint16, pcp: uint8) -> int32:
+    # Register (or overwrite) a logical vlan interface for `vid` with a
+    # default egress priority `pcp`. Returns the slot index on success,
+    # -1 if the table is full or the VID is out of range. An existing
+    # interface for the same VID is overwritten.
+    if vid > VLAN_VID_MAX:
+        return -1
+    i: uint64 = 0
+    free_slot: int32 = -1
+    while i < VLAN_IF_MAX:
+        if vlan_if_inuse[i] != 0:
+            if vlan_if_vid[i] == vid:
+                free_slot = cast[int32](i)
+                i = VLAN_IF_MAX
+        else:
+            if free_slot < 0:
+                free_slot = cast[int32](i)
+        if i < VLAN_IF_MAX:
+            i = i + 1
+    if free_slot < 0:
+        return -1
+    slot: uint64 = cast[uint64](free_slot)
+    vlan_if_inuse[slot] = 1
+    vlan_if_vid[slot]   = vid
+    vlan_if_pcp[slot]   = pcp
+    return cast[int32](free_slot)
+
+
+def vlan_if_lookup(vid: uint16) -> int32:
+    # Resolve a VID to its registered vlan interface slot index, or -1 if
+    # the VID is not registered. This is the ingress-filter predicate: an
+    # unregistered VID returns -1 and the frame is dropped.
+    i: uint64 = 0
+    while i < VLAN_IF_MAX:
+        if vlan_if_inuse[i] != 0:
+            if vlan_if_vid[i] == vid:
+                return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+# =====================================================================
+# TCI <-> {PCP, DEI, VID} codec
+# =====================================================================
+
+def vlan_make_tci(pcp: uint8, dei: uint8, vid: uint16) -> uint16:
+    # Pack {PCP(3), DEI(1), VID(12)} into the 16-bit TCI word.
+    p: uint16 = (cast[uint16](pcp) & VLAN_PCP_MASK) << VLAN_PCP_SHIFT
+    d: uint16 = (cast[uint16](dei) & VLAN_DEI_MASK) << VLAN_DEI_SHIFT
+    v: uint16 = vid & VLAN_VID_MASK
+    return p | d | v
+
+
+def vlan_tci_pcp(tci: uint16) -> uint8:
+    return cast[uint8]((tci >> VLAN_PCP_SHIFT) & VLAN_PCP_MASK)
+
+
+def vlan_tci_dei(tci: uint16) -> uint8:
+    return cast[uint8]((tci >> VLAN_DEI_SHIFT) & VLAN_DEI_MASK)
+
+
+def vlan_tci_vid(tci: uint16) -> uint16:
+    return tci & VLAN_VID_MASK
+
+
+# =====================================================================
+# Big-endian 16-bit field writers / readers
+# =====================================================================
+
+def _vlan_put16(buf: Ptr[uint8], off: uint64, v: uint16):
+    buf[off]     = cast[uint8]((cast[uint32](v) >> 8) & 0xFF)
+    buf[off + 1] = cast[uint8](cast[uint32](v) & 0xFF)
+
+
+def _vlan_get16(buf: Ptr[uint8], off: uint64) -> uint16:
+    hi: uint16 = cast[uint16](buf[off]) << 8
+    lo: uint16 = cast[uint16](buf[off + 1])
+    return hi | lo
+
+
+# =====================================================================
+# Tag INSERT (egress)
+# =====================================================================
+
+def vlan_tag_insert(frame: Ptr[uint8], length: uint64,
+                    pcp: uint8, dei: uint8, vid: uint16,
+                    out: Ptr[uint8], out_cap: uint64) -> int64:
+    # Splice a 4-byte 802.1Q tag into an untagged Ethernet frame.
+    #
+    #   in : | dst[6] | src[6] | ethertype[2] | payload... |
+    #   out: | dst[6] | src[6] | 0x8100 | TCI | ethertype[2] | payload |
+    #
+    # Returns the tagged-frame length (length + 4), or a negative code:
+    #   -1 input shorter than a bare Ethernet header
+    #   -2 output buffer too small
+    if length < ETH_HDR_LEN:
+        return -1
+    total: uint64 = length + VLAN_TAG_LEN
+    if total > out_cap:
+        return -2
+
+    # 1) Copy the two MAC addresses (12 bytes) verbatim.
+    i: uint64 = 0
+    while i < VLAN_MAC_LEN:
+        out[i] = frame[i]
+        i = i + 1
+
+    # 2) Splice the tag: TPID then TCI.
+    _vlan_put16(out, VLAN_MAC_LEN, ETH_P_8021Q)
+    tci: uint16 = vlan_make_tci(pcp, dei, vid)
+    _vlan_put16(out, VLAN_MAC_LEN + 2, tci)
+
+    # 3) Copy the original ethertype + payload (everything from offset 12
+    #    of the input) shifted right by the 4 tag bytes.
+    src_off: uint64 = VLAN_MAC_LEN
+    dst_off: uint64 = VLAN_MAC_LEN + VLAN_TAG_LEN
+    rest: uint64 = length - VLAN_MAC_LEN
+    j: uint64 = 0
+    while j < rest:
+        out[dst_off + j] = frame[src_off + j]
+        j = j + 1
+
+    vlan_tx_tags = vlan_tx_tags + 1
+    return cast[int64](total)
+
+
+# =====================================================================
+# Tag STRIP (ingress)
+# =====================================================================
+
+def vlan_is_tagged(frame: Ptr[uint8], length: uint64) -> int32:
+    # Returns 1 if `frame` is a well-formed 802.1Q-tagged frame (long
+    # enough and TPID 0x8100 at offset 12), 0 otherwise.
+    if length < (ETH_HDR_LEN + VLAN_TAG_LEN):
+        return 0
+    if _vlan_get16(frame, VLAN_MAC_LEN) != ETH_P_8021Q:
+        return 0
+    return 1
+
+
+def vlan_tag_strip(frame: Ptr[uint8], length: uint64,
+                   out: Ptr[uint8], out_cap: uint64,
+                   out_pcp: Ptr[uint8], out_dei: Ptr[uint8],
+                   out_vid: Ptr[uint16]) -> int64:
+    # Strip the 4-byte 802.1Q tag from a tagged frame, recovering the
+    # original untagged frame into `out` and decoding {PCP, DEI, VID}
+    # into the (optional) out pointers.
+    #
+    #   in : | dst[6] | src[6] | 0x8100 | TCI | ethertype[2] | payload |
+    #   out: | dst[6] | src[6] | ethertype[2] | payload... |
+    #
+    # Returns the untagged-frame length (length - 4), or a negative code:
+    #   -1 not an 802.1Q tagged frame
+    #   -2 output buffer too small
+    if vlan_is_tagged(frame, length) != 1:
+        return -1
+    total: uint64 = length - VLAN_TAG_LEN
+    if total > out_cap:
+        return -2
+
+    # Decode the TCI before we drop it.
+    tci: uint16 = _vlan_get16(frame, VLAN_MAC_LEN + 2)
+    if out_pcp != cast[Ptr[uint8]](0):
+        out_pcp[0] = vlan_tci_pcp(tci)
+    if out_dei != cast[Ptr[uint8]](0):
+        out_dei[0] = vlan_tci_dei(tci)
+    if out_vid != cast[Ptr[uint16]](0):
+        out_vid[0] = vlan_tci_vid(tci)
+
+    # 1) Copy the two MAC addresses (12 bytes) verbatim.
+    i: uint64 = 0
+    while i < VLAN_MAC_LEN:
+        out[i] = frame[i]
+        i = i + 1
+
+    # 2) Copy everything AFTER the tag (the original ethertype + payload),
+    #    shifting it left by the 4 tag bytes.
+    src_off: uint64 = VLAN_MAC_LEN + VLAN_TAG_LEN
+    dst_off: uint64 = VLAN_MAC_LEN
+    rest: uint64 = length - src_off
+    j: uint64 = 0
+    while j < rest:
+        out[dst_off + j] = frame[src_off + j]
+        j = j + 1
+
+    vlan_rx_strips = vlan_rx_strips + 1
+    return cast[int64](total)
+
+
+# =====================================================================
+# Ingress: filter on VID, deliver the inner untagged frame
+# =====================================================================
+
+def vlan_ingress(frame: Ptr[uint8], length: uint64,
+                 out: Ptr[uint8], out_cap: uint64,
+                 out_vid: Ptr[uint16]) -> int64:
+    # Process a received tagged frame through the ingress filter:
+    #   * strip the tag and decode the VID;
+    #   * if the VID is NOT registered in the interface table, DROP
+    #     (return -3) and bump vlan_rx_drops;
+    #   * otherwise deliver the recovered inner untagged frame into `out`
+    #     and return its length.
+    # The decoded VID is written to *out_vid (if non-NULL) on accept.
+    pcp: uint8 = 0
+    dei: uint8 = 0
+    vid: uint16 = 0
+    n: int64 = vlan_tag_strip(frame, length, out, out_cap,
+                              cast[Ptr[uint8]](&pcp),
+                              cast[Ptr[uint8]](&dei),
+                              cast[Ptr[uint16]](&vid))
+    if n < 0:
+        return n
+    if vlan_if_lookup(vid) < 0:
+        # Unregistered VID — ingress filter drops it.
+        vlan_rx_drops = vlan_rx_drops + 1
+        return -3
+    if out_vid != cast[Ptr[uint16]](0):
+        out_vid[0] = vid
+    return n
+
+
+# =====================================================================
+# Egress: tag a frame with the VID of the vlan interface it leaves
+# =====================================================================
+
+def vlan_egress(if_slot: uint64, frame: Ptr[uint8], length: uint64,
+                out: Ptr[uint8], out_cap: uint64) -> int64:
+    # Tag a frame leaving the logical vlan interface in `if_slot`. The
+    # tag's VID is the interface's registered VID and the PCP is the
+    # interface's configured default priority (DEI=0). Returns the tagged
+    # length, or a negative code:
+    #   -4 if_slot is not an active vlan interface
+    #   (other negatives propagate from vlan_tag_insert)
+    if if_slot >= VLAN_IF_MAX:
+        return -4
+    if vlan_if_inuse[if_slot] == 0:
+        return -4
+    vid: uint16 = vlan_if_vid[if_slot]
+    pcp: uint8  = vlan_if_pcp[if_slot]
+    return vlan_tag_insert(frame, length, pcp, 0, vid, out, out_cap)
+
+
+# =====================================================================
+# In-kernel self-test (deterministic, no NIC required)
+# =====================================================================
+#
+# Mirrors drivers/net/gre.ad::gre_selftest / bridge.ad::bridge_selftest.
+# Pure in-memory: build a known untagged Ethernet frame, INSERT a tag and
+# verify the tag bytes / decoded fields, STRIP it and assert the inner
+# frame is byte-identical, prove ingress filtering DROPS an unregistered
+# VID and ACCEPTS a registered one, and prove egress tagging stamps the
+# interface's VID.
+
+def _vlan_emerg0(s: Ptr[char]):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0(s)
+
+
+def _vlan_emerg1(s: Ptr[char], a: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk1(s, a)
+
+
+def _vlan_emerg2(s: Ptr[char], a: uint64, b: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk2(s, a, b)
+
+
+# Generously-sized scratch globals. The largest tagged frame is the MTU
+# Ethernet frame (1514) + 4-byte tag = 1518; we round every buffer up to
+# 1600 so an undersized Array[] can't silently overflow into the adjacent
+# module-scope global (BSS is laid out in declaration order).
+VLAN_T_CAP: uint64 = 1600
+_vlant_plain:  Array[1600, uint8]    # the original untagged frame
+_vlant_tagged: Array[1600, uint8]    # after INSERT
+_vlant_recov:  Array[1600, uint8]    # after STRIP
+
+
+def _vlan_build_plain(seed: uint8) -> uint64:
+    # Build a deterministic untagged Ethernet frame:
+    #   dst MAC aa:aa:aa:aa:aa:aa, src MAC bb:bb:bb:bb:bb:bb,
+    #   EtherType 0x0800 (IPv4), then `plen` payload bytes f(seed).
+    # Returns the frame length.
+    plen: uint64 = 40
+    i: uint64 = 0
+    while i < 6:
+        _vlant_plain[i]     = 0xAA               # dst
+        _vlant_plain[6 + i] = 0xBB               # src
+        i = i + 1
+    _vlan_put16(cast[Ptr[uint8]](&_vlant_plain[0]), VLAN_MAC_LEN, ETH_P_IP)
+    j: uint64 = 0
+    while j < plen:
+        _vlant_plain[ETH_HDR_LEN + j] = cast[uint8](
+            (cast[uint32](seed) + cast[uint32](j)) & 0xFF)
+        j = j + 1
+    return ETH_HDR_LEN + plen
+
+
+def _vlan_check_tag(tagged_len: uint64, plain_len: uint64,
+                    pcp: uint8, dei: uint8, vid: uint16) -> int32:
+    # Assert the tagged-frame invariants for _vlant_tagged: correct total
+    # length, MAC pair preserved, TPID 0x8100, TCI decodes back to the
+    # given {PCP,DEI,VID}, and the inner ethertype+payload sits right after
+    # the tag byte-identical to the original. Returns 1 OK, 0 FAIL.
+    ok: int32 = 1
+    exp_len: uint64 = plain_len + VLAN_TAG_LEN
+    if tagged_len != exp_len:
+        _vlan_emerg2("[vlan] FAIL: tagged len %d != %d\n", tagged_len, exp_len)
+        ok = 0
+
+    # MAC pair (first 12 bytes) preserved.
+    m: uint64 = 0
+    macs_ok: int32 = 1
+    while m < VLAN_MAC_LEN:
+        if _vlant_tagged[m] != _vlant_plain[m]:
+            macs_ok = 0
+            m = VLAN_MAC_LEN
+        else:
+            m = m + 1
+    if macs_ok != 1:
+        _vlan_emerg0("[vlan] FAIL: MAC addresses not preserved across tag\n")
+        ok = 0
+
+    # TPID at offset 12 must be 0x8100.
+    tpid: uint16 = _vlan_get16(cast[Ptr[uint8]](&_vlant_tagged[0]),
+                               VLAN_MAC_LEN)
+    if tpid != ETH_P_8021Q:
+        _vlan_emerg1("[vlan] FAIL: TPID %x != 0x8100\n", cast[uint64](tpid))
+        ok = 0
+
+    # TCI at offset 14 must decode back to the same fields.
+    tci: uint16 = _vlan_get16(cast[Ptr[uint8]](&_vlant_tagged[0]),
+                              VLAN_MAC_LEN + 2)
+    if vlan_tci_pcp(tci) != pcp:
+        _vlan_emerg2("[vlan] FAIL: decoded PCP %d != %d\n",
+                     cast[uint64](vlan_tci_pcp(tci)), cast[uint64](pcp))
+        ok = 0
+    if vlan_tci_dei(tci) != dei:
+        _vlan_emerg2("[vlan] FAIL: decoded DEI %d != %d\n",
+                     cast[uint64](vlan_tci_dei(tci)), cast[uint64](dei))
+        ok = 0
+    if vlan_tci_vid(tci) != vid:
+        _vlan_emerg2("[vlan] FAIL: decoded VID %d != %d\n",
+                     cast[uint64](vlan_tci_vid(tci)), cast[uint64](vid))
+        ok = 0
+
+    # Inner ethertype + payload must follow the tag byte-identical to the
+    # original (which lives from offset 12 of _vlant_plain).
+    inner_off: uint64 = VLAN_MAC_LEN + VLAN_TAG_LEN
+    rest: uint64 = plain_len - VLAN_MAC_LEN
+    k: uint64 = 0
+    same: int32 = 1
+    while k < rest:
+        if _vlant_tagged[inner_off + k] != _vlant_plain[VLAN_MAC_LEN + k]:
+            same = 0
+            k = rest
+        else:
+            k = k + 1
+    if same != 1:
+        _vlan_emerg0("[vlan] FAIL: inner ethertype/payload not after tag\n")
+        ok = 0
+
+    return ok
+
+
+def _vlan_roundtrip(pcp: uint8, dei: uint8, vid: uint16, seed: uint8) -> int32:
+    # INSERT a tag, validate the tagged frame, STRIP it, and assert the
+    # recovered untagged frame is byte-identical and the decoded fields
+    # match. Returns 1 PASS, 0 FAIL.
+    ok: int32 = 1
+    plain_len: uint64 = _vlan_build_plain(seed)
+
+    tagged_len: int64 = vlan_tag_insert(
+        cast[Ptr[uint8]](&_vlant_plain[0]), plain_len, pcp, dei, vid,
+        cast[Ptr[uint8]](&_vlant_tagged[0]), VLAN_T_CAP)
+    if tagged_len < 0:
+        _vlan_emerg1("[vlan] FAIL: tag_insert rc=%d\n", cast[uint64](tagged_len))
+        return 0
+
+    if _vlan_check_tag(cast[uint64](tagged_len), plain_len, pcp, dei, vid) != 1:
+        ok = 0
+    else:
+        _vlan_emerg0("[vlan] tag insert + fields OK\n")
+
+    # STRIP round-trip.
+    rpcp: uint8 = 0
+    rdei: uint8 = 0
+    rvid: uint16 = 0
+    recov_len: int64 = vlan_tag_strip(
+        cast[Ptr[uint8]](&_vlant_tagged[0]), cast[uint64](tagged_len),
+        cast[Ptr[uint8]](&_vlant_recov[0]), VLAN_T_CAP,
+        cast[Ptr[uint8]](&rpcp), cast[Ptr[uint8]](&rdei),
+        cast[Ptr[uint16]](&rvid))
+    if recov_len < 0:
+        _vlan_emerg1("[vlan] FAIL: tag_strip rc=%d\n", cast[uint64](recov_len))
+        return 0
+    if cast[uint64](recov_len) != plain_len:
+        _vlan_emerg2("[vlan] FAIL: recovered len %d != %d\n",
+                     cast[uint64](recov_len), plain_len)
+        ok = 0
+    if rpcp != pcp or rdei != dei or rvid != vid:
+        _vlan_emerg2("[vlan] FAIL: strip decoded VID %d (want %d)\n",
+                     cast[uint64](rvid), cast[uint64](vid))
+        ok = 0
+
+    # The recovered frame must be byte-identical to the original.
+    identical: int32 = 1
+    i: uint64 = 0
+    while i < plain_len:
+        if _vlant_recov[i] != _vlant_plain[i]:
+            identical = 0
+            i = plain_len
+        else:
+            i = i + 1
+    if identical != 1:
+        _vlan_emerg0("[vlan] FAIL: stripped frame not byte-identical\n")
+        ok = 0
+    else:
+        _vlan_emerg0("[vlan] tag strip round-trip byte-identical OK\n")
+
+    return ok
+
+
+def vlan_selftest() -> int32:
+    # Returns 1 on PASS, 0 on FAIL. Prints [vlan] marker lines.
+    _vlan_emerg0("[vlan] self-test start\n")
+    vlan_init()
+    ok: int32 = 1
+
+    # Register two logical vlan interfaces:
+    #   VID 100 (eth0.100) default PCP 3
+    #   VID 200 (eth0.200) default PCP 5
+    s100: int32 = vlan_if_add(100, 3)
+    s200: int32 = vlan_if_add(200, 5)
+    if s100 < 0 or s200 < 0:
+        _vlan_emerg0("[vlan] FAIL: interface add\n")
+        return 0
+    _vlan_emerg0("[vlan] PASS if-add (VID 100 pcp3, VID 200 pcp5)\n")
+
+    # The interface table must resolve registered VIDs and miss others.
+    if vlan_if_lookup(100) < 0 or vlan_if_lookup(200) < 0:
+        _vlan_emerg0("[vlan] FAIL: registered VID lookup miss\n")
+        ok = 0
+    if vlan_if_lookup(300) >= 0:
+        _vlan_emerg0("[vlan] FAIL: unregistered VID 300 resolved\n")
+        ok = 0
+    else:
+        _vlan_emerg0("[vlan] PASS if-lookup\n")
+
+    # --- Round-trip 1: PCP 3, DEI 0, VID 100 ---
+    if _vlan_roundtrip(3, 0, 100, 0x11) != 1:
+        ok = 0
+    else:
+        _vlan_emerg0("[vlan] PASS roundtrip-vid100\n")
+
+    # --- Round-trip 2: PCP 7, DEI 1, VID 4094 (max-ish, all fields hot) ---
+    if _vlan_roundtrip(7, 1, 4094, 0x55) != 1:
+        ok = 0
+    else:
+        _vlan_emerg0("[vlan] PASS roundtrip-vid4094\n")
+
+    # --- Ingress filter: registered VID accepted, inner delivered. ---
+    plain_len: uint64 = _vlan_build_plain(0x33)
+    acc_tagged: int64 = vlan_tag_insert(
+        cast[Ptr[uint8]](&_vlant_plain[0]), plain_len, 2, 0, 100,
+        cast[Ptr[uint8]](&_vlant_tagged[0]), VLAN_T_CAP)
+    if acc_tagged < 0:
+        _vlan_emerg0("[vlan] FAIL: ingress-accept tag build\n")
+        return 0
+    acc_vid: uint16 = 0
+    acc_n: int64 = vlan_ingress(
+        cast[Ptr[uint8]](&_vlant_tagged[0]), cast[uint64](acc_tagged),
+        cast[Ptr[uint8]](&_vlant_recov[0]), VLAN_T_CAP,
+        cast[Ptr[uint16]](&acc_vid))
+    if acc_n < 0:
+        _vlan_emerg1("[vlan] FAIL: registered VID dropped rc=%d\n",
+                     cast[uint64](acc_n))
+        ok = 0
+    if acc_vid != 100 or cast[uint64](acc_n) != plain_len:
+        _vlan_emerg0("[vlan] FAIL: ingress-accept VID/len wrong\n")
+        ok = 0
+    # Delivered inner frame must be byte-identical to the original.
+    acc_same: int32 = 1
+    ai: uint64 = 0
+    while ai < plain_len:
+        if _vlant_recov[ai] != _vlant_plain[ai]:
+            acc_same = 0
+            ai = plain_len
+        else:
+            ai = ai + 1
+    if acc_same != 1:
+        _vlan_emerg0("[vlan] FAIL: ingress-accept inner not identical\n")
+        ok = 0
+    if ok == 1:
+        _vlan_emerg0("[vlan] ingress-filter accept (VID 100) OK\n")
+
+    # --- Ingress filter: unregistered VID 300 must be DROPPED. ---
+    drop_tagged: int64 = vlan_tag_insert(
+        cast[Ptr[uint8]](&_vlant_plain[0]), plain_len, 0, 0, 300,
+        cast[Ptr[uint8]](&_vlant_tagged[0]), VLAN_T_CAP)
+    if drop_tagged < 0:
+        _vlan_emerg0("[vlan] FAIL: ingress-drop tag build\n")
+        return 0
+    drops_before: uint64 = vlan_rx_drops
+    drop_vid: uint16 = 0
+    drop_n: int64 = vlan_ingress(
+        cast[Ptr[uint8]](&_vlant_tagged[0]), cast[uint64](drop_tagged),
+        cast[Ptr[uint8]](&_vlant_recov[0]), VLAN_T_CAP,
+        cast[Ptr[uint16]](&drop_vid))
+    if drop_n != -3:
+        _vlan_emerg1("[vlan] FAIL: unregistered VID 300 accepted (rc=%d)\n",
+                     cast[uint64](drop_n))
+        ok = 0
+    if vlan_rx_drops != (drops_before + 1):
+        _vlan_emerg0("[vlan] FAIL: rx-drop counter not bumped\n")
+        ok = 0
+    if ok == 1:
+        _vlan_emerg0("[vlan] ingress-filter drop (VID 300) OK\n")
+
+    # --- Egress: a frame leaving eth0.200 gets tagged with VID 200. ---
+    eplain_len: uint64 = _vlan_build_plain(0x77)
+    eslot: uint64 = cast[uint64](s200)
+    egr_len: int64 = vlan_egress(
+        eslot, cast[Ptr[uint8]](&_vlant_plain[0]), eplain_len,
+        cast[Ptr[uint8]](&_vlant_tagged[0]), VLAN_T_CAP)
+    if egr_len < 0:
+        _vlan_emerg1("[vlan] FAIL: egress rc=%d\n", cast[uint64](egr_len))
+        ok = 0
+    else:
+        # The egress tag must carry the interface VID (200) and PCP (5).
+        etci: uint16 = _vlan_get16(cast[Ptr[uint8]](&_vlant_tagged[0]),
+                                   VLAN_MAC_LEN + 2)
+        if vlan_tci_vid(etci) != 200:
+            _vlan_emerg1("[vlan] FAIL: egress VID %d != 200\n",
+                         cast[uint64](vlan_tci_vid(etci)))
+            ok = 0
+        if vlan_tci_pcp(etci) != 5:
+            _vlan_emerg1("[vlan] FAIL: egress PCP %d != 5\n",
+                         cast[uint64](vlan_tci_pcp(etci)))
+            ok = 0
+        if _vlan_get16(cast[Ptr[uint8]](&_vlant_tagged[0]),
+                       VLAN_MAC_LEN) != ETH_P_8021Q:
+            _vlan_emerg0("[vlan] FAIL: egress TPID != 0x8100\n")
+            ok = 0
+        if ok == 1:
+            _vlan_emerg0("[vlan] egress tagging (eth0.200 -> VID 200) OK\n")
+
+    if ok == 1:
+        _vlan_emerg0("[vlan] PASS\n")
+        return 1
+    _vlan_emerg0("[vlan] FAIL\n")
+    return 0
