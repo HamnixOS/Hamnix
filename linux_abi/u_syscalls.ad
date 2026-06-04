@@ -230,6 +230,22 @@ from linux_abi.u_keyring import (
 # from the close arm. bpf_selftest is the boot:37.bpf round-trip test.
 from linux_abi.u_bpf import (
     bpf_syscall, bpf_close_fd, FD_BPF_PROG_MARK, FD_BPF_MAP_MARK,
+    bpf_selftest,
+)
+# Landlock LSM (landlock_create_ruleset/add_rule/restrict_self, nr 444/445/446).
+# A REAL per-task path-based deny filter; confined Layer-2 leaf in
+# linux_abi/u_landlock.ad. Landlock is Linux-ABI-only furniture LAYERED ON TOP
+# of native namespace enforcement: landlock_check_open() is consulted in the
+# Linux-ABI open path (_u_open) and denies a restricted task's open of a path
+# its active ruleset does not cover (-EACCES); a task with no ruleset (every
+# native process) is a cheap no-op. landlock_close_fd clears the per-fd record
+# on close; the build/check helpers drive the boot:37.landlock self-test.
+from linux_abi.u_landlock import (
+    landlock_create_ruleset, landlock_add_rule, landlock_restrict_self,
+    landlock_check_open, landlock_close_fd, landlock_init,
+    landlock_check_version_and_einval, landlock_build_test_ruleset,
+    landlock_clear_active,
+    FD_LANDLOCK_MARK, LL_REQ_READ, LL_REQ_WRITE, LL_EACCES,
 )
 # §fuse: mount(2) "fuse" type binds a target subtree to a FUSE connection.
 # fuse_mount(slot, target, len) does the namespace attach; fuse_selftest is
@@ -810,6 +826,11 @@ SYS_keyctl:          uint64 = 250
 # state in linux_abi/u_bpf.ad (real bytecode execution, real key->value maps,
 # real rejection of invalid programs).
 SYS_bpf:             uint64 = 321
+# Landlock LSM (x86_64 syscall numbers). Forwarded to the per-task path-based
+# deny filter in linux_abi/u_landlock.ad (the open hook lives in _u_open).
+SYS_landlock_create_ruleset: uint64 = 444
+SYS_landlock_add_rule:       uint64 = 445
+SYS_landlock_restrict_self:  uint64 = 446
 # §fuse: mount(2) — x86_64 nr 165. The only filesystem type we honour here
 # is "fuse" / "fuse.<sub>": mount("fuse", target, "fuse", flags, "fd=N")
 # binds `target` in the namespace to the FUSE connection opened on fd N. Any
@@ -1588,6 +1609,21 @@ def _u_open(a0: uint64, a1: uint64, a2: uint64,
     _u_translate_proc_to_dev(&abs_path[0])
     # O_ACCMODE == 3: O_RDONLY 0, O_WRONLY 1, O_RDWR 2.
     accmode: uint64 = flags & 3
+    # Landlock enforcement: if the calling task has an active ruleset, gate
+    # this open against it on the RESOLVED absolute path. A write-mode open
+    # (O_WRONLY/O_RDWR) requests WRITE_FILE; a read-only open requests
+    # READ_FILE. landlock_check_open returns 0 (allow) or -EACCES (deny). A
+    # task with no ruleset — every native process, and every Linux task that
+    # has not called restrict_self — returns 0 immediately (a cheap no-op),
+    # so native open behaviour is untouched. This is layered ON TOP of the
+    # native namespace enforcement that vfs_open already applies.
+    ll_req: uint64 = LL_REQ_READ
+    if accmode != 0:
+        ll_req = LL_REQ_WRITE
+    ll_rc: int64 = landlock_check_open(cast[Ptr[char]](&abs_path[0]), ll_req)
+    if ll_rc != 0:
+        set_current_errstr("open: denied by landlock ruleset")
+        return ll_rc
     if accmode != 0:
         # Write (or read-write) open — open-or-create-for-write.
         rc = vfs_open_write(cast[Ptr[char]](&abs_path[0]))
@@ -1628,6 +1664,13 @@ def _u_close(a0: uint64, a1: uint64, a2: uint64,
     cl_bpf_mk: uint32 = vfs_fd_marker(cast[int32](a0))
     if cl_bpf_mk == FD_BPF_MAP_MARK or cl_bpf_mk == FD_BPF_PROG_MARK:
         bpf_close_fd(cast[int32](a0))
+    # A landlock ruleset fd carries its (task,fd)->ruleset record in the
+    # Layer-2 landlock table; vfs.ad has never heard of FD_LANDLOCK_MARK, so
+    # clear it here before the fd slot is recycled. NOTE: closing the ruleset
+    # fd does NOT lift an active restriction — the active ruleset is keyed by
+    # task, not by the fd (matching Linux, where the sandbox survives close).
+    if vfs_fd_marker(cast[int32](a0)) == FD_LANDLOCK_MARK:
+        landlock_close_fd(current_idx_get(), cast[int32](a0))
     # AF_UNIX: release the in-kernel endpoint (latches the peer's
     # EOF/EPIPE) before the fd slot is recycled — fs/vfs.ad has never
     # heard of the AF_UNIX tag, so it cannot drop the endpoint.
@@ -10249,6 +10292,113 @@ def pty_selftest() -> int32:
     return 0
 
 
+# =====================================================================
+# Landlock LSM self-test — enforcement half  (boot:37.landlock)
+# =====================================================================
+#
+# Proves the Landlock filter genuinely gates REAL open() calls. It lives here
+# (not in the linux_abi/u_landlock.ad leaf) because driving the dispatch needs
+# _uabi_test_dispatch, which a leaf cannot import without a circular dependency
+# (the same reason pty_selftest lives here). The leaf owns the self-contained
+# parts (ABI version probe + malformed-create EINVAL + ruleset build/restrict);
+# this entry stitches them together with the dispatch-driven open checks.
+#
+# Steps:
+#   (A) leaf: ABI version probe > 0; (B) malformed create -> EINVAL.
+#   (C) leaf: create a ruleset handling READ_FILE, add a PATH_BENEATH rule
+#       allowing READ under /etc/landlock-allowed, restrict self.
+#   (D) open /etc/landlock-allowed/data (allowed)            -> SUCCEEDS.
+#   (E) open /etc/landlock-denied/data  (exists, NOT covered) -> -EACCES.
+#       The denied file genuinely exists, so the deny is the RULESET, not
+#       ENOENT — proving the rules truly gate the open.
+#
+# Returns 1 on PASS, 0 on any failure (matching caps_selftest's convention).
+# The boot task's fd table is uninitialised (only create_user_task /
+# kthread_create prime it), so free fd slots 3..15 before any open and restore
+# them after — the same snapshot/restore dance pty_selftest uses.
+def landlock_selftest() -> int32:
+    landlock_init()
+
+    boot_task: Ptr[TaskStruct] = current_task()
+    ll_fd_save: Array[16, uint32]
+    ll_fdi: uint64 = 3
+    while ll_fdi < 16:
+        ll_fd_save[ll_fdi] = boot_task[0].fd_idx[ll_fdi]
+        boot_task[0].fd_idx[ll_fdi] = FD_CLOSED_MARK
+        ll_fdi = ll_fdi + 1
+
+    rc: int32 = _landlock_selftest_body()
+
+    # Restore the boot task's original fd-table slots (3..15) and clear the
+    # task's active restriction so nothing downstream is left sandboxed.
+    ll_rfdi: uint64 = 3
+    while ll_rfdi < 16:
+        boot_task[0].fd_idx[ll_rfdi] = ll_fd_save[ll_rfdi]
+        ll_rfdi = ll_rfdi + 1
+    landlock_clear_active()
+    return rc
+
+
+def _landlock_selftest_body() -> int32:
+    # --- (A)+(B): leaf-owned version + malformed-create checks ----------
+    if landlock_check_version_and_einval() != 1:
+        return 0
+
+    # --- (C): leaf builds + restricts a real READ-under-allowed ruleset -
+    rs_fd64: int64 = landlock_build_test_ruleset()
+    if rs_fd64 < 0:
+        return 0
+    rs_fd: int32 = cast[int32](rs_fd64)
+
+    # --- (D): open an ALLOWED path -> succeeds --------------------------
+    allowed_path: Ptr[uint8] = cast[Ptr[uint8]]("/etc/landlock-allowed/data")
+    ok_fd: int64 = _uabi_test_dispatch(SYS_openat, AT_FDCWD_U64,
+                                       cast[uint64](allowed_path), 0, 0)
+    if ok_fd < 0:
+        printk1("[landlock] FAIL allowed open rc=%d (want >=0)\n",
+                cast[uint64](ok_fd))
+        vfs_close(rs_fd)
+        return 0
+    _uabi_test_dispatch(SYS_close, cast[uint64](ok_fd), 0, 0, 0)
+    printk0("[LANDLOCK] PASS open under allowed dir succeeded\n")
+
+    # --- (E): open a NON-allowed (but existing) path -> EACCES ----------
+    denied_path: Ptr[uint8] = cast[Ptr[uint8]]("/etc/landlock-denied/data")
+    deny_fd: int64 = _uabi_test_dispatch(SYS_openat, AT_FDCWD_U64,
+                                         cast[uint64](denied_path), 0, 0)
+    if deny_fd != LL_EACCES:
+        printk1("[landlock] FAIL denied open rc=%d (want EACCES -13)\n",
+                cast[uint64](deny_fd))
+        if deny_fd >= 0:
+            _uabi_test_dispatch(SYS_close, cast[uint64](deny_fd), 0, 0, 0)
+        vfs_close(rs_fd)
+        return 0
+    printk0("[LANDLOCK] PASS open outside allowed dir denied EACCES\n")
+
+    # Sanity: the denied file genuinely EXISTS — temporarily lift the
+    # restriction and confirm the open SUCCEEDS, proving the EACCES above was
+    # the ruleset, not a missing file. Re-arm the restriction afterwards is
+    # not possible (one-way), so we clear-then-reopen-then-the-body-ends; the
+    # final landlock_clear_active in landlock_selftest handles teardown.
+    landlock_clear_active()
+    exists_fd: int64 = _uabi_test_dispatch(SYS_openat, AT_FDCWD_U64,
+                                           cast[uint64](denied_path), 0, 0)
+    if exists_fd < 0:
+        printk1("[landlock] FAIL denied file missing rc=%d (test setup bug)\n",
+                cast[uint64](exists_fd))
+        vfs_close(rs_fd)
+        return 0
+    _uabi_test_dispatch(SYS_close, cast[uint64](exists_fd), 0, 0, 0)
+    printk0("[LANDLOCK] PASS denied path exists (EACCES was the ruleset)\n")
+
+    # Tidy: drop the per-fd record + the ruleset fd.
+    landlock_close_fd(current_idx_get(), rs_fd)
+    vfs_close(rs_fd)
+
+    printk0("[landlock] PASS\n")
+    return 1
+
+
 def _pty_build_pts_path(dst: Ptr[uint8], n: uint64):
     # Write "/dev/pts/<n>\0" into dst (n < 100 covers the 16-pair pool).
     dst[0] = 47                                          # '/'
@@ -12674,6 +12824,18 @@ def _linux_u_syscall_dispatch_inner(nr: uint64,
     # executes the bytecode and returns r0 — never a stub.
     if nr == SYS_bpf:
         return bpf_syscall(a0, a1, a2)
+    # Landlock LSM -> per-task path-based deny filter (linux_abi/u_landlock.ad).
+    # create_ruleset(attr,size,flags): version-probe when flags==VERSION, else
+    # allocate a ruleset fd (FD_LANDLOCK_MARK). add_rule(fd,type,attr,flags):
+    # add a PATH_BENEATH path-prefix + allowed_access rule. restrict_self(fd,
+    # flags): attach the ruleset to the task (one-way). Enforcement runs in
+    # _u_open via landlock_check_open().
+    if nr == SYS_landlock_create_ruleset:
+        return landlock_create_ruleset(a0, a1, a2)
+    if nr == SYS_landlock_add_rule:
+        return landlock_add_rule(a0, a1, a2, a3)
+    if nr == SYS_landlock_restrict_self:
+        return landlock_restrict_self(a0, a1)
     # §fuse: mount("fuse", target, "fuse", flags, "fd=N") -> bind `target`
     # to the FUSE connection on fd N. a0=source(ignored), a1=target,
     # a2=fstype, a3=flags(ignored), a4=data("fd=N"). See _u_mount.

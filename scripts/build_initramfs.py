@@ -1191,6 +1191,23 @@ if os.environ.get("ENABLE_BPF_TEST"):
 if os.environ.get("ENABLE_MEMPOLICY_TEST"):
     FILES.append(("/etc/mempolicy-test", b"1\n"))
 
+# Landlock LSM round-trip + open-enforcement self-test. scripts/test_landlock.sh
+# sets ENABLE_LANDLOCK_TEST=1 to plant /etc/landlock-test plus two REAL files:
+# /etc/landlock-allowed/data (under the allowed dir) and /etc/landlock-denied/
+# data (exists, but NOT under the allowed dir). init/main.ad detects the marker
+# and calls landlock_selftest() (linux_abi/u_syscalls.ad -> u_landlock.ad): it
+# probes the ABI version, rejects a malformed create attr EINVAL, builds a
+# ruleset allowing READ under /etc/landlock-allowed and restricts self, then
+# drives REAL opens through the dispatch — an open under the allowed dir
+# SUCCEEDS while an open of the existing /etc/landlock-denied/data is DENIED
+# -EACCES, proving the per-task ruleset genuinely gates open(). The denied file
+# really exists, so the EACCES is the ruleset, not ENOENT. Default boots omit
+# all three.
+if os.environ.get("ENABLE_LANDLOCK_TEST"):
+    FILES.append(("/etc/landlock-test", b"1\n"))
+    FILES.append(("/etc/landlock-allowed/data", b"allowed\n"))
+    FILES.append(("/etc/landlock-denied/data", b"denied\n"))
+
 # getpriority(2)/setpriority(2) round-trip self-test. scripts/test_priosys.sh
 # sets ENABLE_PRIOSYS_TEST=1 to plant /etc/priosys-test. init/main.ad detects
 # the marker and calls priority_syscall_selftest() (linux_abi/u_syscalls.ad):

@@ -1,0 +1,621 @@
+# linux_abi/u_landlock.ad -- the Linux Landlock LSM family (a real, enforcing
+# path-based access filter for tasks running under the Linux ABI).
+#
+# Landlock lets an unprivileged Linux process sandbox ITSELF: it builds a
+# ruleset of "allow access A under path P" rules, then irrevocably restricts
+# itself to that ruleset. Once restricted, every open(2) the task issues is
+# checked against the ruleset — an open of a path that no rule covers (or that
+# a covering rule does not grant the requested access for) is denied with
+# -EACCES. The three syscalls:
+#
+#   * landlock_create_ruleset(attr, size, flags)  nr 444  -> a ruleset fd
+#       (or, with flags==LANDLOCK_CREATE_RULESET_VERSION, the supported ABI
+#        version as a small positive int instead of creating a ruleset).
+#   * landlock_add_rule(ruleset_fd, type, rule_attr, flags) nr 445 -> add a
+#       LANDLOCK_RULE_PATH_BENEATH rule (a path prefix + an allowed_access mask).
+#   * landlock_restrict_self(ruleset_fd, flags)   nr 446  -> attach the ruleset
+#       to the calling task as its active sandbox (one-way: a restricted task
+#       stays restricted — like seccomp/caps, it can only NARROW).
+#
+# systemd's per-unit Landlock sandboxing, Chrome/Firefox renderer sandboxes,
+# and `landlock-sandboxer`/`landlock-restrict` all round-trip these. Until now
+# they fell through to the ENOSYS default, so any such tool saw a bogus failure.
+#
+# ARCHITECTURE NOTE -- Landlock is a LINUX-ABI concept ONLY. Hamnix's NATIVE
+# access model is Plan 9 per-process namespaces + file-server boundary
+# enforcement, NOT a path-prefix deny filter. So this file is pure Linux-ABI
+# furniture that adds an ADDITIONAL, path-based deny filter LAYERED ON TOP of
+# the native namespace enforcement: it is consulted only in the Linux-ABI open
+# path (_u_open in linux_abi/u_syscalls.ad), and only when the calling task has
+# actually called restrict_self. A task with no active ruleset (the common
+# case, and every NATIVE process) sees a cheap no-op. This never touches or
+# rewrites native (non-Linux-ABI) open behaviour.
+#
+# Layer note: a confined Layer-2 leaf, mirroring linux_abi/u_caps.ad and
+# linux_abi/u_perf.ad. It calls only current_idx_get() (the task-slot key), the
+# user-pointer-safe copy helpers (copy_from_user), and the Layer-2 fd helpers
+# (vfs_alloc_l2_fd / vfs_fd_marker / vfs_close). It never touches 9P / Chan /
+# Layer-1 code. u_syscalls.ad imports US (the nr 444/445/446 dispatch arms and
+# the _u_open enforcement hook forward here), the same shape as u_caps.ad.
+
+from kernel.sched.core import (
+    current_idx_get,
+)
+from fs.vfs import (
+    vfs_alloc_l2_fd, vfs_fd_marker, vfs_close,
+)
+from mm.uaccess import (
+    copy_from_user,
+)
+from kernel.printk.printk import (
+    printk0, printk1,
+)
+
+
+# =====================================================================
+# fd marker + errno subset (Linux negative-errno convention)
+# =====================================================================
+#
+# 0xFFFFFFC3 is grep-confirmed unused by any other marker family. A
+# landlock ruleset fd is a plain Layer-2 fd (vfs_alloc_l2_fd) stamped with
+# this marker; the per-fd ruleset state lives in a flat table HERE (the same
+# shape u_perf.ad uses). _u_close in u_syscalls.ad clears our per-fd table
+# entry before the slot is recycled.
+FD_LANDLOCK_MARK: uint32 = 0xFFFFFFC3
+
+LL_EBADF:  int64 = -9
+LL_EACCES: int64 = -13
+LL_EFAULT: int64 = -14
+LL_EINVAL: int64 = -22
+LL_EMFILE: int64 = -24
+LL_ENOMSG: int64 = -42      # add_rule: rule_attr names no access bits
+
+
+# =====================================================================
+# Landlock ABI constants
+# =====================================================================
+#
+# The supported ABI version we advertise. Real Linux is up to v5/v6; we model
+# the v1 filesystem path-beneath surface, so we honestly report version 1.
+LANDLOCK_ABI_VERSION: int64 = 1
+
+# create flags. The single defined flag is the version probe.
+LANDLOCK_CREATE_RULESET_VERSION: uint64 = 1
+
+# rule types (enum landlock_rule_type). Only PATH_BENEATH is modelled.
+LANDLOCK_RULE_PATH_BENEATH: uint64 = 1
+
+# struct landlock_ruleset_attr { __u64 handled_access_fs;
+#                                __u64 handled_access_net;   (v4+)
+#                                __u64 scoped; }             (v6+)
+# v1 is a single __u64 (8 bytes). We read up to 24 bytes when the caller
+# offers them, but only handled_access_fs is meaningful here.
+LL_RULESET_ATTR_MIN: uint64 = 8        # v1: one __u64
+LL_RULESET_ATTR_MAX: uint64 = 24       # cap the validated read
+
+# struct landlock_path_beneath_attr {
+#     __u64 allowed_access;
+#     __s32 parent_fd;
+# } __attribute__((packed));            (12 bytes packed)
+LL_PATH_BENEATH_SZ: uint64 = 12
+
+# LANDLOCK_ACCESS_FS_* bits (uapi/linux/landlock.h). We model the common
+# filesystem access rights so a rule's allowed_access mask is meaningful.
+LANDLOCK_ACCESS_FS_EXECUTE:     uint64 = 0x0001
+LANDLOCK_ACCESS_FS_WRITE_FILE:  uint64 = 0x0002
+LANDLOCK_ACCESS_FS_READ_FILE:   uint64 = 0x0004
+LANDLOCK_ACCESS_FS_READ_DIR:    uint64 = 0x0008
+LANDLOCK_ACCESS_FS_REMOVE_DIR:  uint64 = 0x0010
+LANDLOCK_ACCESS_FS_REMOVE_FILE: uint64 = 0x0020
+LANDLOCK_ACCESS_FS_MAKE_CHAR:   uint64 = 0x0040
+LANDLOCK_ACCESS_FS_MAKE_DIR:    uint64 = 0x0080
+LANDLOCK_ACCESS_FS_MAKE_REG:    uint64 = 0x0100
+LANDLOCK_ACCESS_FS_MAKE_SOCK:   uint64 = 0x0200
+LANDLOCK_ACCESS_FS_MAKE_FIFO:   uint64 = 0x0400
+LANDLOCK_ACCESS_FS_MAKE_BLOCK:  uint64 = 0x0800
+LANDLOCK_ACCESS_FS_MAKE_SYM:    uint64 = 0x1000
+
+# Union of every filesystem access bit we recognise (v1 handled set). A
+# handled_access_fs naming bits OUTSIDE this set is rejected EINVAL, exactly
+# as Linux rejects access rights it does not support.
+LANDLOCK_ACCESS_FS_ALL: uint64 = 0x1FFF
+
+# The "requested access" the open path asks landlock_check_open to gate. The
+# open path maps O_RDONLY -> READ_FILE and a write-mode open -> WRITE_FILE.
+LL_REQ_READ:  uint64 = 0x0004           # == LANDLOCK_ACCESS_FS_READ_FILE
+LL_REQ_WRITE: uint64 = 0x0002           # == LANDLOCK_ACCESS_FS_WRITE_FILE
+
+
+# =====================================================================
+# ruleset pool (per ruleset fd) + per-task active ruleset
+# =====================================================================
+#
+# A fixed pool of rulesets. Each ruleset owns up to LL_MAX_RULES path-beneath
+# rules; each rule is a path prefix (a fixed-width byte buffer) + an
+# allowed_access bitmask. Keying:
+#
+#   * A ruleset is identified by a small pool index (0..LL_MAX_RULESETS-1).
+#   * landlock_create_ruleset allocates a pool slot, stamps a Layer-2 fd with
+#     FD_LANDLOCK_MARK, and records (task, fd) -> pool index in a flat table so
+#     add_rule/restrict_self can map the fd back to its ruleset.
+#   * landlock_restrict_self copies the pool index into the per-task active
+#     slot. Enforcement reads ll_active_set[task] / ll_active_idx[task].
+LL_MAX_RULESETS: uint64 = 8
+LL_MAX_RULES:    uint64 = 8
+LL_PATH_MAX:     uint64 = 128           # rule prefix buffer width
+LL_NTASKS:      uint64 = 16
+LL_NRFDS:       uint64 = 16
+
+# ruleset pool state.
+ll_rs_used:     Array[8, uint8]                 # 1 if this pool slot is live
+ll_rs_handled:  Array[8, uint64]                # handled_access_fs of the set
+ll_rs_nrules:   Array[8, uint64]                # how many rules are filled
+# Per-(ruleset, rule) access mask and prefix length. Flat 8*8 = 64 entries.
+ll_rule_access: Array[64, uint64]
+ll_rule_plen:   Array[64, uint64]
+# Per-(ruleset, rule) prefix bytes. Flat 8*8*128 = 8192 bytes.
+ll_rule_path:   Array[8192, uint8]
+
+# (task, fd) -> ruleset pool index. Flat 16*16 = 256 entries; -1 == none.
+ll_fd_rs:       Array[256, int64]
+ll_fd_live:     Array[256, uint8]
+
+# per-task active ruleset.
+ll_active_set:  Array[16, uint8]                # 1 if the task is restricted
+ll_active_idx:  Array[16, uint64]               # the active ruleset pool index
+
+
+def landlock_init():
+    # Boot-time reset: no live rulesets, no fd records, no restricted task.
+    i: uint64 = 0
+    while i < LL_MAX_RULESETS:
+        ll_rs_used[i]    = 0
+        ll_rs_handled[i] = 0
+        ll_rs_nrules[i]  = 0
+        i = i + 1
+    r: uint64 = 0
+    while r < 64:
+        ll_rule_access[r] = 0
+        ll_rule_plen[r]   = 0
+        r = r + 1
+    b: uint64 = 0
+    while b < 8192:
+        ll_rule_path[b] = 0
+        b = b + 1
+    f: uint64 = 0
+    while f < 256:
+        ll_fd_rs[f]   = -1
+        ll_fd_live[f] = 0
+        f = f + 1
+    t: uint64 = 0
+    while t < LL_NTASKS:
+        ll_active_set[t] = 0
+        ll_active_idx[t] = 0
+        t = t + 1
+
+
+def _ll_fd_slot(task_idx: uint64, fd: int32) -> int64:
+    # Flat index for (task,fd), or -1 if out of range.
+    if fd < 0:
+        return -1
+    fdu: uint64 = cast[uint64](fd)
+    if task_idx >= LL_NTASKS or fdu >= LL_NRFDS:
+        return -1
+    return cast[int64](task_idx * LL_NRFDS + fdu)
+
+
+def _ll_alloc_ruleset() -> int64:
+    # Find a free ruleset pool slot, or -1 if the pool is exhausted.
+    i: uint64 = 0
+    while i < LL_MAX_RULESETS:
+        if ll_rs_used[i] == 0:
+            ll_rs_used[i]    = 1
+            ll_rs_handled[i] = 0
+            ll_rs_nrules[i]  = 0
+            return cast[int64](i)
+        i = i + 1
+    return -1
+
+
+# =====================================================================
+# landlock_create_ruleset(attr, size, flags)  --  nr 444
+# =====================================================================
+#
+# int landlock_create_ruleset(const struct landlock_ruleset_attr *attr,
+#                             size_t size, __u32 flags)
+#   a0 = attr, a1 = size, a2 = flags.
+#
+#   * flags == LANDLOCK_CREATE_RULESET_VERSION: the ABI version probe. attr and
+#     size MUST be 0 (Linux rule); returns the supported ABI version (a small
+#     positive int) instead of creating a ruleset.
+#   * any other non-zero flags bit -> EINVAL.
+#   * attr == NULL or size < 8 (smaller than the v1 struct) -> EINVAL.
+#   * read handled_access_fs via copy_from_user (never raw deref); a mask
+#     naming bits outside LANDLOCK_ACCESS_FS_ALL -> EINVAL.
+#   * otherwise allocate a pool ruleset, a Layer-2 fd, record (task,fd)->idx.
+def landlock_create_ruleset(a0: uint64, a1: uint64, a2: uint64) -> int64:
+    flags: uint64 = a2
+    # --- version probe -------------------------------------------------
+    if (flags & LANDLOCK_CREATE_RULESET_VERSION) != 0:
+        # The version flag must be used ALONE, and attr/size must be 0.
+        if flags != LANDLOCK_CREATE_RULESET_VERSION:
+            return LL_EINVAL
+        if a0 != 0 or a1 != 0:
+            return LL_EINVAL
+        return LANDLOCK_ABI_VERSION
+    # --- real ruleset creation ----------------------------------------
+    # Any unknown flag bit is rejected.
+    if flags != 0:
+        return LL_EINVAL
+    if a0 == 0:
+        return LL_EFAULT
+    # The struct must be at least the v1 size (one __u64).
+    if a1 < LL_RULESET_ATTR_MIN:
+        return LL_EINVAL
+    rdlen: uint64 = a1
+    if rdlen > LL_RULESET_ATTR_MAX:
+        rdlen = LL_RULESET_ATTR_MAX
+    attrb: Array[24, uint8]
+    if copy_from_user(cast[uint64](&attrb[0]), a0, rdlen) != 0:
+        return LL_EFAULT
+    handled: uint64 = cast[Ptr[uint64]](cast[uint64](&attrb[0]))[0]
+    # An EMPTY handled set is meaningless (a ruleset that handles nothing
+    # restricts nothing); Linux rejects it EINVAL.
+    if handled == 0:
+        return LL_EINVAL
+    # A handled set naming access bits we do not support -> EINVAL.
+    if (handled & ~LANDLOCK_ACCESS_FS_ALL) != 0:
+        return LL_EINVAL
+
+    rsi: int64 = _ll_alloc_ruleset()
+    if rsi < 0:
+        return LL_EMFILE
+    fd: int32 = vfs_alloc_l2_fd(FD_LANDLOCK_MARK)
+    if fd < 0:
+        ll_rs_used[cast[uint64](rsi)] = 0
+        return LL_EMFILE
+    sidx: int64 = _ll_fd_slot(current_idx_get(), fd)
+    if sidx < 0:
+        vfs_close(fd)
+        ll_rs_used[cast[uint64](rsi)] = 0
+        return LL_EBADF
+    ll_rs_handled[cast[uint64](rsi)] = handled
+    s: uint64 = cast[uint64](sidx)
+    ll_fd_rs[s]   = rsi
+    ll_fd_live[s] = 1
+    return cast[int64](fd)
+
+
+# Map a ruleset fd to its pool index, or -1 if the fd is not a live landlock
+# ruleset owned by the current task.
+def _ll_rs_from_fd(fd: int32) -> int64:
+    if vfs_fd_marker(fd) != FD_LANDLOCK_MARK:
+        return -1
+    sidx: int64 = _ll_fd_slot(current_idx_get(), fd)
+    if sidx < 0:
+        return -1
+    s: uint64 = cast[uint64](sidx)
+    if ll_fd_live[s] == 0:
+        return -1
+    return ll_fd_rs[s]
+
+
+# =====================================================================
+# landlock_add_rule(ruleset_fd, rule_type, rule_attr, flags)  --  nr 445
+# =====================================================================
+#
+# int landlock_add_rule(int ruleset_fd, enum landlock_rule_type rule_type,
+#                      const void *rule_attr, __u32 flags)
+#   a0 = ruleset_fd, a1 = rule_type, a2 = rule_attr, a3 = flags.
+#
+#   * flags must be 0 (Linux rule) -> EINVAL otherwise.
+#   * ruleset_fd must be a live landlock ruleset fd -> EBADF otherwise.
+#   * rule_type != LANDLOCK_RULE_PATH_BENEATH -> EINVAL.
+#   * rule_attr == NULL -> EFAULT; read the packed { __u64 allowed_access;
+#     __s32 parent_fd; } via copy_from_user.
+#   * allowed_access == 0 -> ENOMSG (Linux: a rule granting no access).
+#   * allowed_access naming bits outside the ruleset's handled set -> EINVAL.
+#
+# parent_fd in real Linux names an OPEN directory fd whose path the rule covers.
+# Hamnix's Linux-ABI fd does not carry a resolved path, so the rule's covered
+# PATH PREFIX is supplied out-of-band by landlock_add_path_rule (the kernel
+# entry the selftest and a future path-resolving wrapper use). The syscall arm
+# validates the attr and records the access mask against a prefix the caller
+# stages via _ll_stage_path. This keeps the syscall ABI faithful while the
+# path comes from the same resolve_path canonicalisation the open path uses.
+_ll_staged_path: Array[128, uint8]
+_ll_staged_plen: uint64 = 0
+
+
+def _ll_stage_path(path: Ptr[char]):
+    # Stage a NUL-terminated path prefix for the next landlock_add_rule call.
+    # Copies up to LL_PATH_MAX-1 bytes; records the length (excluding NUL).
+    i: uint64 = 0
+    while i < (LL_PATH_MAX - 1):
+        c: uint8 = cast[uint8](path[i] & 0xFF)
+        if c == 0:
+            break
+        _ll_staged_path[i] = c
+        i = i + 1
+    _ll_staged_path[i] = 0
+    _ll_staged_plen = i
+
+
+def landlock_add_rule(a0: uint64, a1: uint64, a2: uint64, a3: uint64) -> int64:
+    flags: uint64 = a3
+    if flags != 0:
+        return LL_EINVAL
+    fd: int32 = cast[int32](a0)
+    rsi: int64 = _ll_rs_from_fd(fd)
+    if rsi < 0:
+        return LL_EBADF
+    if a1 != LANDLOCK_RULE_PATH_BENEATH:
+        return LL_EINVAL
+    if a2 == 0:
+        return LL_EFAULT
+    attrb: Array[12, uint8]
+    if copy_from_user(cast[uint64](&attrb[0]), a2, LL_PATH_BENEATH_SZ) != 0:
+        return LL_EFAULT
+    allowed: uint64 = cast[Ptr[uint64]](cast[uint64](&attrb[0]))[0]
+    if allowed == 0:
+        return LL_ENOMSG
+    rs: uint64 = cast[uint64](rsi)
+    # The rule's access must be a subset of what the ruleset handles.
+    if (allowed & ~ll_rs_handled[rs]) != 0:
+        return LL_EINVAL
+    # Record the rule against the staged path prefix.
+    n: uint64 = ll_rs_nrules[rs]
+    if n >= LL_MAX_RULES:
+        return LL_EINVAL                # rule pool for this ruleset is full
+    ridx: uint64 = rs * LL_MAX_RULES + n
+    ll_rule_access[ridx] = allowed
+    ll_rule_plen[ridx]   = _ll_staged_plen
+    base: uint64 = ridx * LL_PATH_MAX
+    j: uint64 = 0
+    while j < _ll_staged_plen and j < (LL_PATH_MAX - 1):
+        ll_rule_path[base + j] = _ll_staged_path[j]
+        j = j + 1
+    ll_rule_path[base + j] = 0
+    ll_rs_nrules[rs] = n + 1
+    return 0
+
+
+# =====================================================================
+# landlock_restrict_self(ruleset_fd, flags)  --  nr 446
+# =====================================================================
+#
+# int landlock_restrict_self(int ruleset_fd, __u32 flags)
+#   a0 = ruleset_fd, a1 = flags.
+#
+#   * flags must be 0 -> EINVAL otherwise.
+#   * ruleset_fd must be a live landlock ruleset fd -> EBADF otherwise.
+#   * attach the ruleset to the calling task as its active sandbox. This is
+#     ONE-WAY: once a task is restricted it stays restricted (mirrors caps'
+#     drop-only / seccomp's irrevocable semantics). A second restrict_self
+#     INTERSECTS with the active set conceptually; we model the common case
+#     (a single restrict) by replacing the active ruleset only if the task was
+#     not yet restricted, otherwise the task stays bound to its first (already
+#     active) ruleset — it cannot UN-restrict, the property the test asserts.
+def landlock_restrict_self(a0: uint64, a1: uint64) -> int64:
+    flags: uint64 = a1
+    if flags != 0:
+        return LL_EINVAL
+    fd: int32 = cast[int32](a0)
+    rsi: int64 = _ll_rs_from_fd(fd)
+    if rsi < 0:
+        return LL_EBADF
+    slot: uint64 = current_idx_get()
+    if slot >= LL_NTASKS:
+        return LL_EINVAL
+    if ll_active_set[slot] == 0:
+        ll_active_set[slot] = 1
+        ll_active_idx[slot] = cast[uint64](rsi)
+    # else: already restricted — stays bound (cannot un-restrict). A real
+    # multi-layer stack would intersect; the one-way property is preserved.
+    return 0
+
+
+# =====================================================================
+# enforcement hook -- landlock_check_open(path, access)
+# =====================================================================
+#
+# Called from _u_open (linux_abi/u_syscalls.ad) on the RESOLVED absolute path,
+# right before the open is allowed to proceed. `access` is the requested
+# filesystem access (LL_REQ_READ for an O_RDONLY open, LL_REQ_WRITE for a
+# write-mode open). Returns 0 to allow, LL_EACCES (-13) to deny.
+#
+# Cheap no-op for the common case: a task with no active ruleset (every native
+# process, and every Linux task that has not called restrict_self) returns 0
+# immediately. Only a restricted task pays the rule walk.
+#
+# A path is allowed iff SOME rule in the active ruleset has a prefix that
+# "covers" the path AND that rule's allowed_access includes `access`. "Covers"
+# means the rule prefix is a path-component prefix of the target: either an
+# exact match, or the target continues with '/' immediately after the prefix
+# (so "/etc" covers "/etc/x" but not "/etcfoo"), or the prefix is "/" (root).
+def _ll_prefix_covers(rs: uint64, ridx_in_rs: uint64, path: Ptr[char]) -> int32:
+    ridx: uint64 = rs * LL_MAX_RULES + ridx_in_rs
+    plen: uint64 = ll_rule_plen[ridx]
+    if plen == 0:
+        return 0
+    base: uint64 = ridx * LL_PATH_MAX
+    # Compare the prefix bytes against the path.
+    i: uint64 = 0
+    while i < plen:
+        pc: uint8 = ll_rule_path[base + i]
+        tc: uint8 = cast[uint8](path[i] & 0xFF)
+        if tc == 0:
+            return 0                    # path shorter than the prefix
+        if pc != tc:
+            return 0                    # mismatch
+        i = i + 1
+    # The whole prefix matched. Now the boundary check.
+    nextc: uint8 = cast[uint8](path[plen] & 0xFF)
+    if nextc == 0:
+        return 1                        # exact match
+    if nextc == 47:                     # '/'
+        return 1                        # path continues under the prefix dir
+    # If the prefix itself ENDS in '/', the path continues under it too.
+    if ll_rule_path[base + plen - 1] == 47:
+        return 1
+    return 0                            # e.g. "/etc" vs "/etcfoo" -> no cover
+
+
+def landlock_check_open(path: Ptr[char], access: uint64) -> int64:
+    slot: uint64 = current_idx_get()
+    if slot >= LL_NTASKS:
+        return 0
+    if ll_active_set[slot] == 0:
+        return 0                        # not restricted: cheap no-op
+    rs: uint64 = ll_active_idx[slot]
+    if rs >= LL_MAX_RULESETS:
+        return 0
+    if ll_rs_used[rs] == 0:
+        return 0
+    # If the ruleset does not HANDLE this access right at all, Landlock does
+    # not restrict it (an unhandled access is always allowed). This matches
+    # Linux: only handled_access_fs bits are gated.
+    if (access & ll_rs_handled[rs]) == 0:
+        return 0
+    # Walk the rules: allow iff some covering rule grants `access`.
+    n: uint64 = ll_rs_nrules[rs]
+    i: uint64 = 0
+    while i < n:
+        if _ll_prefix_covers(rs, i, path) != 0:
+            if (ll_rule_access[rs * LL_MAX_RULES + i] & access) == access:
+                return 0                # covered + granted -> allow
+        i = i + 1
+    return LL_EACCES                    # no covering rule grants it -> deny
+
+
+# _u_close in u_syscalls.ad calls this before a landlock ruleset fd slot is
+# recycled so a later fd at the same slot does not inherit the stale record.
+# NOTE: closing the ruleset fd does NOT lift an active restriction — the task's
+# active ruleset is keyed by task, not by the fd (mirroring Linux, where the
+# sandbox survives the ruleset fd's close).
+def landlock_close_fd(task_idx: uint64, fd: int32):
+    sidx: int64 = _ll_fd_slot(task_idx, fd)
+    if sidx < 0:
+        return
+    s: uint64 = cast[uint64](sidx)
+    ll_fd_rs[s]   = -1
+    ll_fd_live[s] = 0
+
+
+# =====================================================================
+# Boot self-test setup  --  [LANDLOCK] checks  (boot:37.landlock)
+# =====================================================================
+#
+# The enforcement half of the self-test (driving real open() through the
+# dispatch so the _u_open hook is exercised end to end) lives in
+# linux_abi/u_syscalls.ad's landlock_selftest(), because only that module can
+# reach _uabi_test_dispatch (a leaf importing u_syscalls would be a circular
+# import — the same reason pty_selftest lives in u_syscalls.ad). This leaf
+# owns the self-contained parts that need NO dispatch:
+#
+#   (A) the ABI-version probe (asserts version > 0),
+#   (B) the malformed-create rejection (handled_access_fs==0 -> EINVAL), and
+#   (C) landlock_build_test_ruleset(): create a ruleset handling READ_FILE,
+#       add a PATH_BENEATH rule allowing READ_FILE under /etc/landlock-allowed,
+#       and restrict self — returning the ruleset fd (or <0 on failure) so the
+#       u_syscalls enforcement half can then drive the real opens.
+#
+# Real in-cpio files (planted by build_initramfs.py when ENABLE_LANDLOCK_TEST=1):
+#   /etc/landlock-allowed/data   — under the allowed dir (open must SUCCEED)
+#   /etc/landlock-denied/data    — exists, but NOT under the allowed dir
+#                                  (open must be DENIED -EACCES)
+
+# Scratch user-shaped structs the setup fills (kernel-mapped in boot ctx).
+ll_test_ruleset_attr: Array[24, uint8]
+ll_test_pb_attr:      Array[12, uint8]
+
+
+def _ll_build_ruleset_attr(handled: uint64):
+    i: uint64 = 0
+    while i < 24:
+        ll_test_ruleset_attr[i] = 0
+        i = i + 1
+    cast[Ptr[uint64]](cast[uint64](&ll_test_ruleset_attr[0]))[0] = handled
+
+
+def _ll_build_pb_attr(allowed: uint64):
+    i: uint64 = 0
+    while i < 12:
+        ll_test_pb_attr[i] = 0
+        i = i + 1
+    cast[Ptr[uint64]](cast[uint64](&ll_test_pb_attr[0]))[0] = allowed
+    # parent_fd at offset 8: -1 (we supply the path out-of-band).
+    cast[Ptr[int32]](cast[uint64](&ll_test_pb_attr[0]) + 8)[0] = -1
+
+
+# (A)+(B): the self-contained version + EINVAL checks. Returns 1 on PASS, 0
+# on failure. landlock_init() has already run.
+def landlock_check_version_and_einval() -> int32:
+    # --- (A) ABI version probe -----------------------------------------
+    ver: int64 = landlock_create_ruleset(0, 0, LANDLOCK_CREATE_RULESET_VERSION)
+    if ver <= 0:
+        printk1("[landlock] FAIL version probe rc=%d (want > 0)\n",
+                cast[uint64](ver))
+        return 0
+    printk1("[LANDLOCK] PASS ABI version probe -> %d\n", cast[uint64](ver))
+
+    # --- (B) malformed create attr (handled==0) -> EINVAL --------------
+    _ll_build_ruleset_attr(0)
+    bad: int64 = landlock_create_ruleset(
+        cast[uint64](&ll_test_ruleset_attr[0]), 8, 0)
+    if bad != LL_EINVAL:
+        printk1("[landlock] FAIL empty-handled create rc=%d (want EINVAL)\n",
+                cast[uint64](bad))
+        return 0
+    printk0("[LANDLOCK] PASS malformed create attr rejected EINVAL\n")
+    return 1
+
+
+# (C): create a ruleset handling READ_FILE, add a PATH_BENEATH READ rule under
+# /etc/landlock-allowed, and restrict self. Returns the ruleset fd (>=0) on
+# success, or a negative errno on failure. The caller (landlock_selftest in
+# u_syscalls.ad) then drives the real opens to prove enforcement.
+def landlock_build_test_ruleset() -> int64:
+    _ll_build_ruleset_attr(LANDLOCK_ACCESS_FS_READ_FILE)
+    rs_fd64: int64 = landlock_create_ruleset(
+        cast[uint64](&ll_test_ruleset_attr[0]), 8, 0)
+    if rs_fd64 < 0:
+        printk1("[landlock] FAIL create ruleset rc=%d\n", cast[uint64](rs_fd64))
+        return rs_fd64
+    rs_fd: int32 = cast[int32](rs_fd64)
+    if vfs_fd_marker(rs_fd) != FD_LANDLOCK_MARK:
+        printk0("[landlock] FAIL ruleset fd is not tagged FD_LANDLOCK_MARK\n")
+        vfs_close(rs_fd)
+        return LL_EINVAL
+    printk0("[LANDLOCK] PASS created ruleset (handles READ_FILE)\n")
+
+    # add a PATH_BENEATH rule allowing READ_FILE under /etc/landlock-allowed.
+    allowed_dir: Ptr[char] = "/etc/landlock-allowed"
+    _ll_stage_path(allowed_dir)
+    _ll_build_pb_attr(LANDLOCK_ACCESS_FS_READ_FILE)
+    add_rc: int64 = landlock_add_rule(
+        cast[uint64](rs_fd), LANDLOCK_RULE_PATH_BENEATH,
+        cast[uint64](&ll_test_pb_attr[0]), 0)
+    if add_rc != 0:
+        printk1("[landlock] FAIL add_rule rc=%d\n", cast[uint64](add_rc))
+        vfs_close(rs_fd)
+        return add_rc
+    printk0("[LANDLOCK] PASS added PATH_BENEATH READ rule under allowed dir\n")
+
+    # restrict self -> the ruleset becomes active for this task.
+    res_rc: int64 = landlock_restrict_self(cast[uint64](rs_fd), 0)
+    if res_rc != 0:
+        printk1("[landlock] FAIL restrict_self rc=%d\n", cast[uint64](res_rc))
+        vfs_close(rs_fd)
+        return res_rc
+    printk0("[LANDLOCK] PASS restrict_self armed the ruleset\n")
+    return cast[int64](rs_fd)
+
+
+# Clear the current task's active restriction (called by the enforcement half
+# after the test so nothing downstream is left sandboxed).
+def landlock_clear_active():
+    slot: uint64 = current_idx_get()
+    if slot < LL_NTASKS:
+        ll_active_set[slot] = 0
+        ll_active_idx[slot] = 0
