@@ -1215,6 +1215,23 @@ if os.environ.get("ENABLE_FUTEXV_TEST"):
 if os.environ.get("ENABLE_PIDFD_GETFD_TEST"):
     FILES.append(("/etc/pidfd-getfd-test", b"1\n"))
 
+# cachestat(2) (nr 451) page-cache residency self-test. scripts/test_cachestat.sh
+# sets ENABLE_CACHESTAT_TEST=1 to plant /etc/cachestat-test (the gate marker)
+# AND /etc/cachestat-data (the backing file the test maps). init/main.ad at
+# boot:37.cachestat detects the marker and calls cachestat_selftest()
+# (linux_abi/u_cachestat.ad): it maps /etc/cachestat-data into a file-backed
+# VMA, opens an fd to it, asserts cachestat's nr_cache is 0 before any page is
+# faulted, equals the page count after the populator faults the pages in, and is
+# clamped for a sub-range query, then drives the flags!=0/bad-pointer/closed-fd
+# error paths, emitting the [cachestat] PASS banner. The 4-page data file lets
+# the test cover multi-page residency and a sub-range query. Default boots omit
+# both files.
+if os.environ.get("ENABLE_CACHESTAT_TEST"):
+    FILES.append(("/etc/cachestat-test", b"1\n"))
+    _cs_len = 4 * 4096
+    _cs_data = bytes(((i * 31 + 7) & 0xFF) for i in range(_cs_len))
+    FILES.append(("/etc/cachestat-data", _cs_data))
+
 # ENABLE_PROCESS_VM_TEST=1 to plant /etc/process-vm-test. init/main.ad at
 # boot:37.process_vm detects the marker and calls process_vm_selftest()
 # (linux_abi/u_process_vm.ad): it builds a real SECOND address space (a fresh

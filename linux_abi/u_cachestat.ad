@@ -1,0 +1,381 @@
+# linux_abi/u_cachestat.ad -- the Linux cachestat(2) syscall (nr 451).
+#
+# cachestat queries the PAGE-CACHE residency of a file descriptor over a byte
+# range and reports per-page-state counts:
+#
+#   int cachestat(unsigned int fd,
+#                 struct cachestat_range *cstat_range,
+#                 struct cachestat *cstat,
+#                 unsigned int flags)
+#
+#   struct cachestat_range { __u64 off; __u64 len; }                 (16 bytes)
+#   struct cachestat {
+#       __u64 nr_cache;            /* pages cached (resident)        */
+#       __u64 nr_dirty;            /* dirty pages                    */
+#       __u64 nr_writeback;        /* pages under write-back         */
+#       __u64 nr_evicted;          /* pages evicted from cache       */
+#       __u64 nr_recently_evicted; /* of which evicted recently      */
+#   }                                                                (40 bytes)
+#
+# A `len` of 0 means "to the end of the file". flags is reserved and must be 0
+# (any other value -> -EINVAL, exactly as Linux's sys_cachestat gate).
+# cachestat is what `fincore`, copy tools, and cache-aware databases use to ask
+# the kernel which parts of a file are already hot in the page cache so they can
+# skip readahead or choose a copy strategy — it does NOT itself populate or
+# evict anything.
+#
+# ARCHITECTURE NOTE -- this is a REAL query of Hamnix's actual file page-cache
+# state, NOT a stub. In Hamnix a file's "page cache" is the set of its pages
+# that have been demand-faulted into a FILE-BACKED VMA (is_file=1; see
+# mm/vma.ad vma_alloc_file_*). When a process mmap()s a file and touches a page,
+# the #PF handler (vma_demand_fault) reads that page's bytes from the backing
+# store and installs a PRESENT PTE — so the page is now resident in cache. A
+# page never touched (or dropped via madvise(MADV_DONTNEED), which clears its
+# PTE) is NOT present. The present/not-present PTE state of the file's VMA pages
+# therefore IS the per-file page-cache residency cachestat reports:
+#
+#   * fd -> stable backing identity (marker, backing, size) via
+#     vfs_fd_backing_info — the SAME triple the file-backed mmap path uses.
+#   * mm/vma.ad::vma_cachestat_count walks the caller's file-backed VMAs whose
+#     (marker, backing) match, and over the page-aligned span of [off, off+len)
+#     counts present pages (nr_cache) and present pages with the PTE Dirty bit
+#     set (nr_dirty — a MAP_SHARED-writable file page that was written and not
+#     yet flushed). A read-only page-table walk; it never faults or mutates.
+#   * nr_writeback / nr_evicted / nr_recently_evicted are 0: Hamnix has no
+#     asynchronous write-back queue and keeps no per-file eviction history, so
+#     the honest count for those fields is zero (there is no such state to
+#     report — not a placeholder).
+#
+# The counts genuinely TRACK a real cache operation: with the file mapped but no
+# page faulted, nr_cache is 0; after the populator faults N pages in, nr_cache
+# is N; a sub-range query reports only the pages overlapping that range. The
+# self-test proves exactly this round trip (see cachestat_selftest below).
+#
+# Layer note: a confined Layer-2 leaf, mirroring linux_abi/u_fchmodat2.ad and
+# linux_abi/u_pidfd_getfd.ad. It calls only the user-pointer-safe copy helpers
+# (copy_from_user / copy_to_user), the fd->backing snapshot accessor
+# (vfs_fd_backing_info), the VMA residency counter (vma_cachestat_count), and
+# printk for the self-test. It never touches 9P / Chan / Layer-1 code. It is
+# imported by u_syscalls.ad's nr 451 dispatch arm the same way u_fchmodat2.ad is.
+# cachestat returns ints (0 / negative errno), never fds -- no FD_*_MARK here.
+
+from mm.uaccess import (
+    copy_from_user, copy_to_user,
+)
+from fs.vfs import (
+    vfs_fd_backing_info,
+)
+from mm.vma import (
+    vma_cachestat_count,
+)
+from kernel.sched.core import (
+    current_idx_get,
+)
+from kernel.printk.printk import (
+    printk0, printk1, printk2,
+)
+
+
+# =====================================================================
+# Linux cachestat ABI constants
+# =====================================================================
+#
+# Negative-errno convention (the subset cachestat returns).
+CS_EBADF:  int64 = -9
+CS_EFAULT: int64 = -14
+CS_EINVAL: int64 = -22
+
+CS_PAGE_SIZE: uint64 = 4096
+
+
+# =====================================================================
+# cachestat(fd, range*, cstat*, flags)  --  nr 451
+# =====================================================================
+#
+#   a0 = fd, a1 = struct cachestat_range*, a2 = struct cachestat*, a3 = flags.
+#
+# Returns 0 on success (cstat filled) or a negative errno.
+def cachestat_handler(a0: uint64, a1: uint64, a2: uint64,
+                      a3: uint64, a4: uint64, a5: uint64) -> int64:
+    fd: int32 = cast[int32](a0)
+    urange: uint64 = a1
+    ucstat: uint64 = a2
+    flags: uint64 = a3
+
+    # (1) flags is reserved; only 0 is valid (Linux sys_cachestat gate).
+    if flags != 0:
+        return CS_EINVAL
+
+    # (2) fd -> stable backing identity. A closed / non-file fd is -EBADF.
+    marker: uint32 = 0
+    backing: uint64 = 0
+    fsize: uint64 = 0
+    brc: int32 = vfs_fd_backing_info(fd, &marker, &backing, &fsize)
+    if brc != 0:
+        return CS_EBADF
+
+    # (3) Copy the user struct cachestat_range in through the user-pointer-safe
+    # helper, so a bad user pointer is a clean -EFAULT, not a page fault.
+    crange: Array[2, uint64]                       # [0]=off, [1]=len
+    if copy_from_user(cast[uint64](&crange[0]), urange, 16) != 0:
+        return CS_EFAULT
+    off: uint64 = crange[0]
+    length: uint64 = crange[1]
+
+    # (4) Clamp the range to the file. len==0 means "to EOF" (Linux). An off at
+    # or past EOF yields an empty range -> all-zero counts (a valid answer).
+    if off >= fsize:
+        length = 0
+    else:
+        if length == 0 or off + length > fsize:
+            length = fsize - off
+
+    # (5) Real residency query against the caller's file-backed VMAs that map
+    # this same backing object. Counts present (cached) pages and dirty pages.
+    nr_cache: uint64 = 0
+    nr_dirty: uint64 = 0
+    if length != 0:
+        vma_cachestat_count(current_idx_get(), marker, backing,
+                            off, length, &nr_cache, &nr_dirty)
+
+    # (6) Fill struct cachestat and copy it out. nr_writeback / nr_evicted /
+    # nr_recently_evicted are 0 (no async write-back queue, no eviction
+    # history) -- the honest answer for this tree.
+    cstat: Array[5, uint64]
+    cstat[0] = nr_cache                            # nr_cache
+    cstat[1] = nr_dirty                            # nr_dirty
+    cstat[2] = 0                                   # nr_writeback
+    cstat[3] = 0                                   # nr_evicted
+    cstat[4] = 0                                   # nr_recently_evicted
+    if copy_to_user(ucstat, cast[uint64](&cstat[0]), 40) != 0:
+        return CS_EFAULT
+    return 0
+
+
+# =====================================================================
+# Boot self-test  --  [cachestat] PASS / FAIL  (boot:37.cachestat)
+# =====================================================================
+#
+# A REAL page-cache round trip against the live VFS + VMA machinery. The boot
+# (kernel) task maps the known backing file /etc/cachestat-data into a
+# file-backed demand VMA, opens an fd to the SAME file (so cachestat's
+# fd->backing resolution matches the VMA's backing), and proves cachestat's
+# counts TRACK the real cache state:
+#
+#   (1) With the file mapped but NO page faulted, cachestat(fd) -> nr_cache 0
+#       (nothing is resident yet).
+#   (2) Fault in the first 2 pages via the real populator (vma_demand_fault, the
+#       SAME path do_page_fault uses). cachestat(fd) over the whole file ->
+#       nr_cache == 2 (exactly the pages we brought in — proof the count tracks
+#       a real cache op and is not hard-coded).
+#   (3) Fault in the remaining 2 pages. cachestat(fd) -> nr_cache == 4.
+#   (4) A sub-range query (off=0, len=1 page) -> nr_cache == 1 (only the
+#       overlapping page is counted), proving the byte-range clamping is real.
+#   (5) Error paths: flags!=0 -> -EINVAL; a closed/never-open fd -> -EBADF; a
+#       bad user range pointer -> -EFAULT.
+#
+# Returns 1 on success, 0 on any failure (matching the sibling leaves'
+# selftest convention).
+
+from mm.vma import (
+    vma_alloc_file_demand, vma_demand_fault,
+)
+from fs.vfs import (
+    FD_FILEMMAP_INITRAMFS, resolve_path, vfs_open, vfs_close,
+    FD_CLOSED_MARK,
+)
+from fs.cpio import (
+    initramfs_entry_count, initramfs_entry_name, initramfs_entry_size,
+)
+from kernel.sched.core import (
+    task_pml4, current_task, TaskStruct,
+)
+
+# The file-backed VMA's data pages are non-executable; vma_demand_fault stamps
+# NX into their PTEs. This self-test runs at boot:37.cachestat, BEFORE
+# syscall_init (boot:39) arms IA32_EFER.NXE, so without enabling NXE first the
+# first read of a mapped page would take a reserved-bit #PF. set_efer_nxe is
+# idempotent (syscall_init re-arms it later). Same pattern mmap_file_selftest
+# uses.
+extern def set_efer_nxe()
+
+
+def _cs_fail(msg: Ptr[char]) -> int32:
+    printk0("[cachestat] FAIL: ")
+    printk0(msg)
+    printk0("\n")
+    return 0
+
+
+def cachestat_selftest() -> int32:
+    # Boot context is the boot/idle task: its fd-table slots 3..15 are held by
+    # earlier boot resources, so a fresh vfs_open would return -EMFILE. Mirror
+    # fchmodat2_selftest / pidfd_getfd_selftest: save slots 3..15, free them
+    # (FD_CLOSED_MARK) for the body, then restore. This lets the real vfs_open
+    # the body uses actually claim an fd, exactly as a userspace task would.
+    boot_task: Ptr[TaskStruct] = current_task()
+    fd_save: Array[16, uint32]
+    si: uint64 = 3
+    while si < 16:
+        fd_save[si] = boot_task[0].fd_idx[si]
+        boot_task[0].fd_idx[si] = FD_CLOSED_MARK
+        si = si + 1
+
+    rc: int32 = _cs_selftest_body()
+
+    ri: uint64 = 3
+    while ri < 16:
+        boot_task[0].fd_idx[ri] = fd_save[ri]
+        ri = ri + 1
+    return rc
+
+
+def _cs_selftest_body() -> int32:
+    set_efer_nxe()
+    PROT_READ:   int32 = 0x1
+    MAP_PRIVATE: int32 = 0x2
+    PG: uint64 = CS_PAGE_SIZE
+
+    boot_slot: uint64 = current_idx_get()
+    boot_pml4: uint64 = task_pml4(cast[int32](boot_slot))
+
+    # Locate the known backing file /etc/cachestat-data in the initramfs. The
+    # boot task has no userland fd table for vfs_open at VMA-build time, so we
+    # build the backing snapshot directly from the cpio index — the SAME
+    # (marker, backing, size) triple vfs_fd_backing_info returns for a userland
+    # open of a cpio file. "/etc/cachestat-data" is 19 chars + NUL = 20 bytes.
+    data_idx: int64 = -1
+    di: uint64 = 0
+    dcnt: uint64 = initramfs_entry_count()
+    dtgt: Ptr[uint8] = "/etc/cachestat-data"
+    while di < dcnt:
+        dnm: Ptr[char] = initramfs_entry_name(di)
+        dok: int32 = 1
+        dj: uint64 = 0
+        while dj < 20:                             # 19 chars + NUL
+            if cast[uint8](dnm[dj]) != dtgt[dj]:
+                dok = 0
+                dj = 20
+            else:
+                dj = dj + 1
+        if dok == 1:
+            data_idx = cast[int64](di)
+            di = dcnt
+        else:
+            di = di + 1
+    if data_idx < 0:
+        return _cs_fail("/etc/cachestat-data not in initramfs")
+
+    marker:  uint32 = FD_FILEMMAP_INITRAMFS
+    backing: uint64 = cast[uint64](data_idx)
+    fsize:   uint64 = initramfs_entry_size(cast[uint64](data_idx))
+    npages:  uint64 = (fsize + PG - 1) / PG
+    if npages < 4:
+        printk1("[cachestat] FAIL: backing too small (%d pages, want >=4)\n",
+                npages)
+        return 0
+
+    # Open an fd to the SAME file so cachestat's fd->backing resolution matches
+    # the VMA's backing (marker + cpio index identical).
+    abuf: Array[256, uint8]
+    if resolve_path(cast[Ptr[char]](dtgt), &abuf[0], 256) != 0:
+        return _cs_fail("could not resolve /etc/cachestat-data")
+    fd: int32 = vfs_open(cast[Ptr[char]](&abuf[0]))
+    if fd < 0:
+        return _cs_fail("could not open /etc/cachestat-data")
+
+    # Build a whole-file PROT_READ MAP_PRIVATE file-backed demand VMA.
+    base64: int64 = vma_alloc_file_demand(boot_slot, 0, fsize,
+                                          PROT_READ, MAP_PRIVATE,
+                                          cast[int32](marker), backing,
+                                          fsize, 0)
+    if base64 < 0:
+        vfs_close(fd)
+        return _cs_fail("vma_alloc_file_demand failed")
+    base: uint64 = cast[uint64](base64)
+
+    crange: Array[2, uint64]
+    cstat: Array[5, uint64]
+
+    # --- (1) mapped but nothing faulted -> nr_cache 0 ----------------
+    crange[0] = 0
+    crange[1] = 0                                  # 0 == to EOF
+    if cachestat_handler(cast[uint64](fd), cast[uint64](&crange[0]),
+                         cast[uint64](&cstat[0]), 0, 0, 0) != 0:
+        vfs_close(fd)
+        return _cs_fail("cachestat(initial) returned an error")
+    if cstat[0] != 0:
+        printk1("[cachestat] FAIL: initial nr_cache=%d (want 0)\n", cstat[0])
+        vfs_close(fd)
+        return 0
+    printk0("[cachestat] PASS unfaulted file -> nr_cache 0\n")
+
+    # --- (2) fault first 2 pages -> nr_cache 2 -----------------------
+    vma_demand_fault(boot_slot, boot_pml4, base + 0 * PG)
+    vma_demand_fault(boot_slot, boot_pml4, base + 1 * PG)
+    if cachestat_handler(cast[uint64](fd), cast[uint64](&crange[0]),
+                         cast[uint64](&cstat[0]), 0, 0, 0) != 0:
+        vfs_close(fd)
+        return _cs_fail("cachestat(after 2 faults) returned an error")
+    if cstat[0] != 2:
+        printk1("[cachestat] FAIL: nr_cache=%d after 2 faults (want 2)\n",
+                cstat[0])
+        vfs_close(fd)
+        return 0
+    printk0("[cachestat] PASS 2 pages faulted -> nr_cache 2\n")
+
+    # --- (3) fault remaining pages -> nr_cache == npages -------------
+    fp: uint64 = 2
+    while fp < npages:
+        vma_demand_fault(boot_slot, boot_pml4, base + fp * PG)
+        fp = fp + 1
+    if cachestat_handler(cast[uint64](fd), cast[uint64](&crange[0]),
+                         cast[uint64](&cstat[0]), 0, 0, 0) != 0:
+        vfs_close(fd)
+        return _cs_fail("cachestat(after all faults) returned an error")
+    if cstat[0] != npages:
+        printk2("[cachestat] FAIL: nr_cache=%d after all faults (want %d)\n",
+                cstat[0], npages)
+        vfs_close(fd)
+        return 0
+    # nr_writeback / nr_evicted / nr_recently_evicted must be 0.
+    if cstat[2] != 0 or cstat[3] != 0 or cstat[4] != 0:
+        vfs_close(fd)
+        return _cs_fail("writeback/evicted counters not zero")
+    printk1("[cachestat] PASS whole file resident -> nr_cache %d\n", npages)
+
+    # --- (4) sub-range query -> only overlapping pages counted -------
+    crange[0] = 0
+    crange[1] = PG                                 # first page only
+    if cachestat_handler(cast[uint64](fd), cast[uint64](&crange[0]),
+                         cast[uint64](&cstat[0]), 0, 0, 0) != 0:
+        vfs_close(fd)
+        return _cs_fail("cachestat(sub-range) returned an error")
+    if cstat[0] != 1:
+        printk1("[cachestat] FAIL: sub-range nr_cache=%d (want 1)\n", cstat[0])
+        vfs_close(fd)
+        return 0
+    printk0("[cachestat] PASS sub-range [0,1page) -> nr_cache 1\n")
+
+    # --- (5) error paths --------------------------------------------
+    # flags != 0 -> -EINVAL.
+    crange[0] = 0
+    crange[1] = 0
+    if cachestat_handler(cast[uint64](fd), cast[uint64](&crange[0]),
+                         cast[uint64](&cstat[0]), 1, 0, 0) != CS_EINVAL:
+        vfs_close(fd)
+        return _cs_fail("flags!=0 did not return EINVAL")
+    # A bad user range pointer -> -EFAULT (address 0 never maps).
+    if cachestat_handler(cast[uint64](fd), 0,
+                         cast[uint64](&cstat[0]), 0, 0, 0) != CS_EFAULT:
+        vfs_close(fd)
+        return _cs_fail("bad range pointer did not return EFAULT")
+    # A closed fd -> -EBADF.
+    vfs_close(fd)
+    if cachestat_handler(cast[uint64](fd), cast[uint64](&crange[0]),
+                         cast[uint64](&cstat[0]), 0, 0, 0) != CS_EBADF:
+        return _cs_fail("closed fd did not return EBADF")
+    printk0("[cachestat] PASS EINVAL/EFAULT/EBADF error paths correct\n")
+
+    printk0("[cachestat] PASS\n")
+    return 1
