@@ -1169,6 +1169,17 @@ if os.environ.get("ENABLE_PERF_TEST"):
 # boots omit the marker.
 if os.environ.get("ENABLE_KEYRING_TEST"):
     FILES.append(("/etc/keyring-test", b"1\n"))
+
+# bpf(2) eBPF interpreter + map/prog self-test. scripts/test_bpf.sh sets
+# ENABLE_BPF_TEST=1 to plant /etc/bpf-test. init/main.ad detects the marker and
+# calls bpf_selftest() (linux_abi/u_bpf.ad): it creates real HASH + ARRAY maps
+# and round-trips key->value bytes, PROG_LOADs + TEST_RUNs a real eBPF program
+# computing ctx[0]+ctx[1] (asserting the exact sum 1337) plus a stack STX/LDX
+# round-trip, and asserts three deliberately invalid programs are rejected
+# (no-EXIT/bad-register -> EINVAL, OOB-stack store -> EACCES), emitting the
+# [bpf] PASS banner. Default boots omit the marker.
+if os.environ.get("ENABLE_BPF_TEST"):
+    FILES.append(("/etc/bpf-test", b"1\n"))
 # NUMA mempolicy round-trip self-test. scripts/test_mempolicy.sh sets
 # ENABLE_MEMPOLICY_TEST=1 to plant /etc/mempolicy-test. init/main.ad detects
 # the marker and calls mempolicy_selftest() (linux_abi/u_mempolicy.ad): it

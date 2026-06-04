@@ -1,0 +1,1383 @@
+# linux_abi/u_bpf.ad -- the Linux bpf(2) syscall family (eBPF maps + programs).
+#
+# Real Linux observability/networking tooling reaches for bpf(2) constantly:
+#
+#   * bpf(BPF_MAP_CREATE, attr, size)        nr 321 -> a map fd
+#   * bpf(BPF_MAP_UPDATE_ELEM, attr, size)          -> store key->value bytes
+#   * bpf(BPF_MAP_LOOKUP_ELEM, attr, size)          -> read value for a key
+#   * bpf(BPF_MAP_DELETE_ELEM, attr, size)          -> drop a key
+#   * bpf(BPF_PROG_LOAD, attr, size)                -> verify+load a prog fd
+#   * bpf(BPF_PROG_TEST_RUN, attr, size)            -> run a prog over a context
+#
+# bpftool, libbpf, bcc/bpftrace, systemd's IPAccounting/cgroup BPF, and any
+# tool that loads an eBPF program or pins a map round-trips this syscall. Until
+# now it fell through to the ENOSYS default, so every such tool saw a bogus
+# failure on its very first probe.
+#
+# ARCHITECTURE NOTE -- bpf(2) is a LINUX-ABI concept ONLY. Hamnix's native
+# model exposes kernel programmability through Plan 9 file servers and native
+# Adder kernel modules (the .ko L-shim), NOT an in-kernel bytecode VM syscall.
+# So this file is pure Linux-ABI furniture: it models eBPF maps + programs for
+# tasks running under the Linux namespace, and it never touches any native
+# Plan 9 path. Crucially it is HONEST, not a stub: programs are run by a real
+# in-kernel eBPF bytecode INTERPRETER that computes real outputs, maps store +
+# look up real key->value bytes, and invalid programs are actually REJECTED by
+# a lite verifier (no BPF_EXIT, out-of-range registers, OOB stack -> EINVAL).
+#
+# Layer note: a confined Layer-2 leaf, mirroring linux_abi/u_perf.ad /
+# u_caps.ad / u_mempolicy.ad. It calls only the user-pointer-safe copy helpers
+# (copy_from_user / copy_to_user) + vfs_alloc_l2_fd / vfs_fd_marker / vfs_close
+# for the map/prog fds. It never touches 9P / Chan / Layer-1 code. The map/prog
+# state lives in fixed pools HERE; u_syscalls.ad imports US (the nr-321 dispatch
+# arm forwards here), the same shape as u_perf.ad.
+
+from fs.vfs import (
+    vfs_alloc_l2_fd, vfs_fd_marker, vfs_close,
+)
+from mm.uaccess import (
+    copy_from_user, copy_to_user,
+)
+from kernel.printk.printk import (
+    printk0, printk1,
+)
+
+
+# =====================================================================
+# fd markers + errno subset (Linux negative-errno convention)
+# =====================================================================
+#
+# Two distinct fd markers: one for program fds, one for map fds. 0xFFFFFFC1 and
+# 0xFFFFFFC2 sit in the free gap below FD_PERF_MARK (0xCF) and are confirmed
+# unused across the whole tree (grep -rn 0xFFFFFFC1 / 0xFFFFFFC2). Declared
+# HERE, not in core.ad/vfs.ad: the close path falls through cleanly for an
+# unknown marker, and _u_close in u_syscalls.ad clears our pool entries before
+# the slot is recycled (the same shape perf/pidfd use).
+FD_BPF_PROG_MARK: uint32 = 0xFFFFFFC1
+FD_BPF_MAP_MARK:  uint32 = 0xFFFFFFC2
+
+BPF_EPERM:  int64 = -1
+BPF_ENOENT: int64 = -2
+BPF_EBADF:  int64 = -9
+BPF_ENOMEM: int64 = -12
+BPF_EACCES: int64 = -13
+BPF_EFAULT: int64 = -14
+BPF_EEXIST: int64 = -17
+BPF_EINVAL: int64 = -22
+BPF_EMFILE: int64 = -24
+BPF_E2BIG:  int64 = -7
+
+
+# =====================================================================
+# bpf(2) command numbers (uapi/linux/bpf.h, enum bpf_cmd)
+# =====================================================================
+BPF_MAP_CREATE:       uint64 = 0
+BPF_MAP_LOOKUP_ELEM:  uint64 = 1
+BPF_MAP_UPDATE_ELEM:  uint64 = 2
+BPF_MAP_DELETE_ELEM:  uint64 = 3
+BPF_PROG_LOAD:        uint64 = 5
+BPF_PROG_TEST_RUN:    uint64 = 10
+
+# bpf_map_type subset we model.
+BPF_MAP_TYPE_HASH:  uint64 = 1
+BPF_MAP_TYPE_ARRAY: uint64 = 2
+
+# BPF_MAP_UPDATE_ELEM flags.
+BPF_ANY:     uint64 = 0      # create or update
+BPF_NOEXIST: uint64 = 1      # create only (fail if exists)
+BPF_EXIST:   uint64 = 2      # update only (fail if missing)
+
+
+# =====================================================================
+# union bpf_attr field offsets (the subset we read)
+# =====================================================================
+#
+# union bpf_attr is a large fixed-size union; each command uses a different
+# anonymous struct at offset 0. We read only the leading fields each command
+# needs, via a single validated copy_from_user into a kernel buffer. The
+# offsets below match the x86_64 layout of uapi/linux/bpf.h.
+#
+# --- BPF_MAP_CREATE (struct { map_type; key_size; value_size; max_entries; })
+BPF_ATTR_MAP_TYPE:       uint64 = 0      # __u32 map_type
+BPF_ATTR_KEY_SIZE:       uint64 = 4      # __u32 key_size
+BPF_ATTR_VALUE_SIZE:     uint64 = 8      # __u32 value_size
+BPF_ATTR_MAX_ENTRIES:    uint64 = 12     # __u32 max_entries
+#
+# --- BPF_MAP_*_ELEM (struct { map_fd; key; value/next_key; flags; })
+BPF_ATTR_MAP_FD:         uint64 = 0      # __u32 map_fd
+BPF_ATTR_KEY:            uint64 = 8      # __aligned_u64 key
+BPF_ATTR_VALUE:          uint64 = 16     # __aligned_u64 value (or next_key)
+BPF_ATTR_ELEM_FLAGS:     uint64 = 24     # __u64 flags
+#
+# --- BPF_PROG_LOAD (struct { prog_type; insn_cnt; insns; license; ... })
+BPF_ATTR_PROG_TYPE:      uint64 = 0      # __u32 prog_type
+BPF_ATTR_INSN_CNT:       uint64 = 4      # __u32 insn_cnt
+BPF_ATTR_INSNS:          uint64 = 8      # __aligned_u64 insns
+BPF_ATTR_LICENSE:        uint64 = 16     # __aligned_u64 license
+#
+# --- BPF_PROG_TEST_RUN (struct test { prog_fd; retval; data_size_in;
+#                          data_size_out; data_in; data_out; ... })
+BPF_ATTR_TEST_PROG_FD:   uint64 = 0      # __u32 prog_fd
+BPF_ATTR_TEST_RETVAL:    uint64 = 4      # __u32 retval (out)
+BPF_ATTR_TEST_DSZ_IN:    uint64 = 8      # __u32 data_size_in
+BPF_ATTR_TEST_DSZ_OUT:   uint64 = 12     # __u32 data_size_out (in/out)
+BPF_ATTR_TEST_DATA_IN:   uint64 = 16     # __aligned_u64 data_in
+BPF_ATTR_TEST_DATA_OUT:  uint64 = 24     # __aligned_u64 data_out
+
+# We copy this many bytes of bpf_attr in (covers every field above).
+BPF_ATTR_READ_SZ: uint64 = 48
+
+
+# =====================================================================
+# eBPF instruction encoding (struct bpf_insn, 8 bytes)
+# =====================================================================
+#
+#   struct bpf_insn {
+#       __u8  code;          // opcode (offset 0)
+#       __u8  dst:4, src:4;  // registers (offset 1; low nibble = dst)
+#       __s16 off;           // signed offset (offset 2)
+#       __s32 imm;           // signed immediate (offset 4)
+#   };
+#
+# We decode each 8-byte insn out of a kernel buffer.
+
+# instruction class (low 3 bits of code)
+BPF_LD:   uint64 = 0x00
+BPF_LDX:  uint64 = 0x01
+BPF_ST:   uint64 = 0x02
+BPF_STX:  uint64 = 0x03
+BPF_ALU:  uint64 = 0x04          # 32-bit ALU
+BPF_JMP:  uint64 = 0x05
+BPF_ALU64: uint64 = 0x07         # 64-bit ALU
+
+# ALU/JMP operation (high 4 bits of code)
+BPF_ADD:  uint64 = 0x00
+BPF_SUB:  uint64 = 0x10
+BPF_MUL:  uint64 = 0x20
+BPF_DIV:  uint64 = 0x30
+BPF_OR:   uint64 = 0x40
+BPF_AND:  uint64 = 0x50
+BPF_LSH:  uint64 = 0x60
+BPF_RSH:  uint64 = 0x70
+BPF_MOV:  uint64 = 0xb0
+BPF_NEG:  uint64 = 0x80
+BPF_XOR:  uint64 = 0xa0
+
+# JMP operations
+BPF_JA:   uint64 = 0x00
+BPF_JEQ:  uint64 = 0x10
+BPF_JGT:  uint64 = 0x20
+BPF_JGE:  uint64 = 0x30
+BPF_JNE:  uint64 = 0x50
+BPF_JLT:  uint64 = 0xa0
+BPF_JLE:  uint64 = 0xb0
+BPF_CALL: uint64 = 0x80
+BPF_EXIT: uint64 = 0x90
+
+# source operand (bit 3 of code): 0 = immediate (K), 1 = register (X)
+BPF_K:    uint64 = 0x00
+BPF_X:    uint64 = 0x08
+
+# LD modes / sizes (for LD_IMM64 and LDX/STX memory ops)
+BPF_IMM:  uint64 = 0x00          # mode for the LD_IMM64 wide insn
+BPF_MEM:  uint64 = 0x60          # mode for LDX/STX/ST memory ops
+BPF_W:    uint64 = 0x00          # 32-bit word
+BPF_H:    uint64 = 0x08          # 16-bit half
+BPF_B:    uint64 = 0x10          # 8-bit byte
+BPF_DW:   uint64 = 0x18          # 64-bit double word
+
+# The wide LD_IMM64 opcode: BPF_LD | BPF_IMM | BPF_DW == 0x18.
+OP_LD_IMM64: uint64 = 0x18       # 0x00 | 0x00 | 0x18
+
+# eBPF has 11 registers r0..r10; r10 is the read-only frame pointer.
+BPF_MAX_REG:   uint64 = 11
+BPF_REG_FP:    uint64 = 10       # frame pointer (top of the 512-byte stack)
+BPF_STACK_SIZE: uint64 = 512     # eBPF stack frame is exactly 512 bytes
+
+
+# =====================================================================
+# map pool -- real key/value byte storage
+# =====================================================================
+#
+# A small fixed pool of maps. Each map has a type, key_size, value_size,
+# max_entries, plus a flat byte arena of (max_entries * (key_size+value_size))
+# slots and a per-slot "used" bit. ARRAY maps index directly by the u32 key;
+# HASH maps do a linear scan over used slots comparing key bytes. The arena is
+# a single shared byte pool partitioned per map at create time (offset+len),
+# which keeps the BSS footprint bounded and the layout trivial.
+BPF_MAX_MAPS:      uint64 = 8
+BPF_MAX_KEY:       uint64 = 16       # bytes
+BPF_MAX_VALUE:     uint64 = 64       # bytes
+BPF_MAX_ENTRIES_C: uint64 = 64       # entries per map cap
+# Per-map storage block: max_entries * (key+value). With the caps above that's
+# 64 * (16+64) = 5120 bytes; times BPF_MAX_MAPS (8) = 40960 bytes of arena.
+BPF_MAP_BLOCK:     uint64 = 5120
+BPF_ARENA_SZ:      uint64 = 40960    # BPF_MAX_MAPS * BPF_MAP_BLOCK
+
+bpf_map_live:        Array[8, uint8]      # 1 if this map slot is allocated
+bpf_map_type:        Array[8, uint64]
+bpf_map_key_size:    Array[8, uint64]
+bpf_map_value_size:  Array[8, uint64]
+bpf_map_max_entries: Array[8, uint64]
+bpf_map_fd:          Array[8, int32]      # the vfs fd this map is bound to
+# Per-(map, entry) "used" bit: BPF_MAX_MAPS * BPF_MAX_ENTRIES_C entries.
+bpf_entry_used:      Array[512, uint8]    # 8 * 64
+# The shared key/value arena.
+bpf_arena:           Array[40960, uint8]
+
+# prog pool -- loaded eBPF programs.
+#
+# Each program slot stores its instruction stream as raw bytes (insn_cnt * 8)
+# in a per-prog instruction arena. We keep insn_cnt and the fd binding.
+BPF_MAX_PROGS:     uint64 = 8
+BPF_MAX_INSNS:     uint64 = 256      # instructions per program cap
+# Per-prog insn block: BPF_MAX_INSNS * 8 bytes = 2048; times 8 progs = 16384.
+BPF_PROG_BLOCK:    uint64 = 2048
+BPF_INSN_ARENA_SZ: uint64 = 16384
+
+bpf_prog_live:     Array[8, uint8]
+bpf_prog_insn_cnt: Array[8, uint64]
+bpf_prog_fd:       Array[8, int32]
+bpf_insn_arena:    Array[16384, uint8]
+
+
+def bpf_init():
+    i: uint64 = 0
+    while i < BPF_MAX_MAPS:
+        bpf_map_live[i]        = 0
+        bpf_map_type[i]        = 0
+        bpf_map_key_size[i]    = 0
+        bpf_map_value_size[i]  = 0
+        bpf_map_max_entries[i] = 0
+        bpf_map_fd[i]          = -1
+        i = i + 1
+    j: uint64 = 0
+    while j < 512:
+        bpf_entry_used[j] = 0
+        j = j + 1
+    p: uint64 = 0
+    while p < BPF_MAX_PROGS:
+        bpf_prog_live[p]     = 0
+        bpf_prog_insn_cnt[p] = 0
+        bpf_prog_fd[p]       = -1
+        p = p + 1
+
+
+# Find the map pool slot bound to a given fd, or -1.
+def _bpf_map_slot_for_fd(fd: int32) -> int64:
+    if fd < 0:
+        return -1
+    i: uint64 = 0
+    while i < BPF_MAX_MAPS:
+        if bpf_map_live[i] != 0 and bpf_map_fd[i] == fd:
+            return cast[int64](i)
+        i = i + 1
+    return -1
+
+
+# Find the prog pool slot bound to a given fd, or -1.
+def _bpf_prog_slot_for_fd(fd: int32) -> int64:
+    if fd < 0:
+        return -1
+    i: uint64 = 0
+    while i < BPF_MAX_PROGS:
+        if bpf_prog_live[i] != 0 and bpf_prog_fd[i] == fd:
+            return cast[int64](i)
+        i = i + 1
+    return -1
+
+
+# Byte offset of map `slot`'s storage block in the shared arena.
+def _bpf_map_block_off(slot: uint64) -> uint64:
+    return slot * BPF_MAP_BLOCK
+
+
+# Byte offset of entry `e` within map `slot`'s block (key bytes start here;
+# value bytes follow after key_size).
+def _bpf_entry_off(slot: uint64, e: uint64) -> uint64:
+    stride: uint64 = bpf_map_key_size[slot] + bpf_map_value_size[slot]
+    return _bpf_map_block_off(slot) + e * stride
+
+
+# =====================================================================
+# BPF_MAP_CREATE
+# =====================================================================
+#
+# Validate the requested map type/sizes against our caps, allocate a pool slot,
+# bind a Layer-2 fd stamped FD_BPF_MAP_MARK, and return it. Zeroes the map's
+# used bits so it starts empty.
+def bpf_map_create(attr_buf: uint64) -> int64:
+    map_type: uint64    = cast[uint64](cast[Ptr[uint32]](attr_buf + BPF_ATTR_MAP_TYPE)[0])
+    key_size: uint64    = cast[uint64](cast[Ptr[uint32]](attr_buf + BPF_ATTR_KEY_SIZE)[0])
+    value_size: uint64  = cast[uint64](cast[Ptr[uint32]](attr_buf + BPF_ATTR_VALUE_SIZE)[0])
+    max_entries: uint64 = cast[uint64](cast[Ptr[uint32]](attr_buf + BPF_ATTR_MAX_ENTRIES)[0])
+
+    if map_type != BPF_MAP_TYPE_HASH and map_type != BPF_MAP_TYPE_ARRAY:
+        return BPF_EINVAL
+    if key_size == 0 or key_size > BPF_MAX_KEY:
+        return BPF_EINVAL
+    if value_size == 0 or value_size > BPF_MAX_VALUE:
+        return BPF_EINVAL
+    if max_entries == 0 or max_entries > BPF_MAX_ENTRIES_C:
+        return BPF_EINVAL
+    # ARRAY maps use a 4-byte (u32 index) key in Linux.
+    if map_type == BPF_MAP_TYPE_ARRAY and key_size != 4:
+        return BPF_EINVAL
+
+    # Find a free map pool slot.
+    slot: int64 = -1
+    i: uint64 = 0
+    while i < BPF_MAX_MAPS:
+        if bpf_map_live[i] == 0:
+            slot = cast[int64](i)
+            i = BPF_MAX_MAPS
+        else:
+            i = i + 1
+    if slot < 0:
+        return BPF_ENOMEM
+    s: uint64 = cast[uint64](slot)
+
+    fd: int32 = vfs_alloc_l2_fd(FD_BPF_MAP_MARK)
+    if fd < 0:
+        return BPF_EMFILE
+
+    bpf_map_live[s]        = 1
+    bpf_map_type[s]        = map_type
+    bpf_map_key_size[s]    = key_size
+    bpf_map_value_size[s]  = value_size
+    bpf_map_max_entries[s] = max_entries
+    bpf_map_fd[s]          = fd
+
+    # Zero the per-entry used bits for this map.
+    e: uint64 = 0
+    while e < BPF_MAX_ENTRIES_C:
+        bpf_entry_used[s * BPF_MAX_ENTRIES_C + e] = 0
+        e = e + 1
+    # For ARRAY maps every entry pre-exists with a zeroed value (Linux
+    # semantics: all indices 0..max_entries-1 are valid from creation).
+    if map_type == BPF_MAP_TYPE_ARRAY:
+        e2: uint64 = 0
+        while e2 < max_entries:
+            bpf_entry_used[s * BPF_MAX_ENTRIES_C + e2] = 1
+            # Zero the key+value bytes.
+            off: uint64 = _bpf_entry_off(s, e2)
+            b: uint64 = 0
+            stride: uint64 = key_size + value_size
+            while b < stride:
+                bpf_arena[off + b] = 0
+                b = b + 1
+            # Store the index as the key (little-endian u32).
+            cast[Ptr[uint32]](cast[uint64](&bpf_arena[off]))[0] = cast[uint32](e2)
+            e2 = e2 + 1
+    return cast[int64](fd)
+
+
+# Compare key bytes at arena offset `off` against a key buffer; 1 if equal.
+def _bpf_key_eq(off: uint64, kbuf: uint64, key_size: uint64) -> int32:
+    i: uint64 = 0
+    kp: Ptr[uint8] = cast[Ptr[uint8]](kbuf)
+    while i < key_size:
+        if bpf_arena[off + i] != kp[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+# Find the entry index in map `slot` whose stored key matches the key in `kbuf`.
+# Returns the entry index, or -1 if not present.
+def _bpf_find_entry(slot: uint64, kbuf: uint64) -> int64:
+    key_size: uint64 = bpf_map_key_size[slot]
+    if bpf_map_type[slot] == BPF_MAP_TYPE_ARRAY:
+        # ARRAY: key is a u32 index.
+        idx: uint64 = cast[uint64](cast[Ptr[uint32]](kbuf)[0])
+        if idx >= bpf_map_max_entries[slot]:
+            return -1
+        return cast[int64](idx)
+    # HASH: linear scan over used entries.
+    e: uint64 = 0
+    while e < bpf_map_max_entries[slot]:
+        if bpf_entry_used[slot * BPF_MAX_ENTRIES_C + e] != 0:
+            off: uint64 = _bpf_entry_off(slot, e)
+            if _bpf_key_eq(off, kbuf, key_size) != 0:
+                return cast[int64](e)
+        e = e + 1
+    return -1
+
+
+# =====================================================================
+# BPF_MAP_LOOKUP_ELEM
+# =====================================================================
+def bpf_map_lookup(attr_buf: uint64) -> int64:
+    map_fd: int32  = cast[int32](cast[Ptr[uint32]](attr_buf + BPF_ATTR_MAP_FD)[0])
+    ukey:   uint64 = cast[Ptr[uint64]](attr_buf + BPF_ATTR_KEY)[0]
+    uvalue: uint64 = cast[Ptr[uint64]](attr_buf + BPF_ATTR_VALUE)[0]
+    slot64: int64 = _bpf_map_slot_for_fd(map_fd)
+    if slot64 < 0:
+        return BPF_EBADF
+    slot: uint64 = cast[uint64](slot64)
+    if ukey == 0 or uvalue == 0:
+        return BPF_EFAULT
+    key_size: uint64 = bpf_map_key_size[slot]
+    value_size: uint64 = bpf_map_value_size[slot]
+    # Pull the key into a kernel buffer.
+    kbuf: Array[16, uint8]
+    if copy_from_user(cast[uint64](&kbuf[0]), ukey, key_size) != 0:
+        return BPF_EFAULT
+    e64: int64 = _bpf_find_entry(slot, cast[uint64](&kbuf[0]))
+    if e64 < 0:
+        return BPF_ENOENT
+    e: uint64 = cast[uint64](e64)
+    off: uint64 = _bpf_entry_off(slot, e) + key_size      # value bytes
+    if copy_to_user(uvalue, cast[uint64](&bpf_arena[off]), value_size) != 0:
+        return BPF_EFAULT
+    return 0
+
+
+# =====================================================================
+# BPF_MAP_UPDATE_ELEM
+# =====================================================================
+def bpf_map_update(attr_buf: uint64) -> int64:
+    map_fd: int32  = cast[int32](cast[Ptr[uint32]](attr_buf + BPF_ATTR_MAP_FD)[0])
+    ukey:   uint64 = cast[Ptr[uint64]](attr_buf + BPF_ATTR_KEY)[0]
+    uvalue: uint64 = cast[Ptr[uint64]](attr_buf + BPF_ATTR_VALUE)[0]
+    flags:  uint64 = cast[Ptr[uint64]](attr_buf + BPF_ATTR_ELEM_FLAGS)[0]
+    slot64: int64 = _bpf_map_slot_for_fd(map_fd)
+    if slot64 < 0:
+        return BPF_EBADF
+    slot: uint64 = cast[uint64](slot64)
+    if ukey == 0 or uvalue == 0:
+        return BPF_EFAULT
+    if flags != BPF_ANY and flags != BPF_NOEXIST and flags != BPF_EXIST:
+        return BPF_EINVAL
+    key_size: uint64 = bpf_map_key_size[slot]
+    value_size: uint64 = bpf_map_value_size[slot]
+    kbuf: Array[16, uint8]
+    if copy_from_user(cast[uint64](&kbuf[0]), ukey, key_size) != 0:
+        return BPF_EFAULT
+    vbuf: Array[64, uint8]
+    if copy_from_user(cast[uint64](&vbuf[0]), uvalue, value_size) != 0:
+        return BPF_EFAULT
+
+    existing: int64 = _bpf_find_entry(slot, cast[uint64](&kbuf[0]))
+
+    if bpf_map_type[slot] == BPF_MAP_TYPE_ARRAY:
+        # ARRAY entries always exist; flags BPF_NOEXIST is rejected by Linux.
+        if existing < 0:
+            return BPF_E2BIG                 # index out of range -> Linux E2BIG
+        if flags == BPF_NOEXIST:
+            return BPF_EEXIST
+        e: uint64 = cast[uint64](existing)
+        off: uint64 = _bpf_entry_off(slot, e) + key_size
+        b: uint64 = 0
+        while b < value_size:
+            bpf_arena[off + b] = vbuf[b]
+            b = b + 1
+        return 0
+
+    # HASH map.
+    if existing >= 0:
+        if flags == BPF_NOEXIST:
+            return BPF_EEXIST
+        e: uint64 = cast[uint64](existing)
+        off: uint64 = _bpf_entry_off(slot, e) + key_size
+        b: uint64 = 0
+        while b < value_size:
+            bpf_arena[off + b] = vbuf[b]
+            b = b + 1
+        return 0
+    # New key.
+    if flags == BPF_EXIST:
+        return BPF_ENOENT
+    # Find a free entry slot.
+    free_e: int64 = -1
+    ei: uint64 = 0
+    while ei < bpf_map_max_entries[slot]:
+        if bpf_entry_used[slot * BPF_MAX_ENTRIES_C + ei] == 0:
+            free_e = cast[int64](ei)
+            ei = bpf_map_max_entries[slot]
+        else:
+            ei = ei + 1
+    if free_e < 0:
+        return BPF_E2BIG                     # map full
+    ne: uint64 = cast[uint64](free_e)
+    off2: uint64 = _bpf_entry_off(slot, ne)
+    # Store key bytes then value bytes.
+    kb: uint64 = 0
+    while kb < key_size:
+        bpf_arena[off2 + kb] = kbuf[kb]
+        kb = kb + 1
+    vb: uint64 = 0
+    while vb < value_size:
+        bpf_arena[off2 + key_size + vb] = vbuf[vb]
+        vb = vb + 1
+    bpf_entry_used[slot * BPF_MAX_ENTRIES_C + ne] = 1
+    return 0
+
+
+# =====================================================================
+# BPF_MAP_DELETE_ELEM
+# =====================================================================
+def bpf_map_delete(attr_buf: uint64) -> int64:
+    map_fd: int32  = cast[int32](cast[Ptr[uint32]](attr_buf + BPF_ATTR_MAP_FD)[0])
+    ukey:   uint64 = cast[Ptr[uint64]](attr_buf + BPF_ATTR_KEY)[0]
+    slot64: int64 = _bpf_map_slot_for_fd(map_fd)
+    if slot64 < 0:
+        return BPF_EBADF
+    slot: uint64 = cast[uint64](slot64)
+    if ukey == 0:
+        return BPF_EFAULT
+    # ARRAY maps do not support delete (Linux returns EINVAL).
+    if bpf_map_type[slot] == BPF_MAP_TYPE_ARRAY:
+        return BPF_EINVAL
+    key_size: uint64 = bpf_map_key_size[slot]
+    kbuf: Array[16, uint8]
+    if copy_from_user(cast[uint64](&kbuf[0]), ukey, key_size) != 0:
+        return BPF_EFAULT
+    e64: int64 = _bpf_find_entry(slot, cast[uint64](&kbuf[0]))
+    if e64 < 0:
+        return BPF_ENOENT
+    bpf_entry_used[slot * BPF_MAX_ENTRIES_C + cast[uint64](e64)] = 0
+    return 0
+
+
+# =====================================================================
+# Verifier-lite
+# =====================================================================
+#
+# Walk the instruction stream and reject programs that:
+#   * are empty or exceed BPF_MAX_INSNS (-EINVAL)
+#   * reference a register number >= 11 in any dst/src field (-EINVAL)
+#   * do a BPF_STX/LDX/ST memory op against the frame pointer (r10) with an
+#     offset that lands outside [-512, 0) (out-of-bounds stack -> -EACCES)
+#   * never contain a BPF_EXIT (-EINVAL: program falls off the end)
+#   * contain a backward/forward jump target outside [0, insn_cnt) (-EINVAL)
+#
+# This is intentionally a SUBSET of the real verifier — enough to honestly
+# reject the malformed programs the selftest throws at it, not a full
+# data-flow + type checker. Returns 0 if accepted, a negative errno otherwise.
+def _bpf_verify(insn_base: uint64, insn_cnt: uint64) -> int64:
+    if insn_cnt == 0:
+        return BPF_EINVAL
+    if insn_cnt > BPF_MAX_INSNS:
+        return BPF_E2BIG
+
+    saw_exit: int32 = 0
+    pc: uint64 = 0
+    while pc < insn_cnt:
+        ip: uint64 = insn_base + pc * 8
+        code: uint64 = cast[uint64](cast[Ptr[uint8]](ip)[0])
+        regs: uint64 = cast[uint64](cast[Ptr[uint8]](ip + 1)[0])
+        dst:  uint64 = regs & 0x0F
+        src:  uint64 = (regs >> 4) & 0x0F
+        off:  int64  = cast[int64](cast[Ptr[int16]](ip + 2)[0])
+
+        # Register-range check (both nibbles must name r0..r10).
+        if dst >= BPF_MAX_REG:
+            return BPF_EINVAL
+        if src >= BPF_MAX_REG:
+            return BPF_EINVAL
+
+        cls: uint64 = code & 0x07
+
+        # The wide LD_IMM64 occupies TWO insn slots; skip the trailing one.
+        if code == OP_LD_IMM64:
+            if pc + 1 >= insn_cnt:
+                return BPF_EINVAL            # truncated wide load
+            pc = pc + 2
+            continue
+
+        # Stack-bounds check for frame-pointer-relative memory ops. r10 is the
+        # frame pointer; valid stack accesses use a negative offset in
+        # [-512, 0). For LDX the FP is `src`; for STX/ST the FP is `dst`.
+        if cls == BPF_LDX:
+            if src == BPF_REG_FP:
+                if off >= 0 or off < (0 - cast[int64](BPF_STACK_SIZE)):
+                    return BPF_EACCES
+        if cls == BPF_STX or cls == BPF_ST:
+            if dst == BPF_REG_FP:
+                if off >= 0 or off < (0 - cast[int64](BPF_STACK_SIZE)):
+                    return BPF_EACCES
+
+        # Jump-target range check (relative to the NEXT insn, Linux semantics).
+        if cls == BPF_JMP:
+            opj: uint64 = code & 0xF0
+            if opj == BPF_EXIT:
+                saw_exit = 1
+            else:
+                if opj != BPF_CALL:
+                    tgt: int64 = cast[int64](pc) + 1 + off
+                    if tgt < 0 or tgt >= cast[int64](insn_cnt):
+                        return BPF_EINVAL
+        pc = pc + 1
+
+    if saw_exit == 0:
+        return BPF_EINVAL                    # no BPF_EXIT: falls off the end
+    return 0
+
+
+# =====================================================================
+# BPF_PROG_LOAD
+# =====================================================================
+#
+# Copy the instruction stream into a per-prog arena, run the lite verifier,
+# allocate a pool slot + a Layer-2 fd stamped FD_BPF_PROG_MARK. The license
+# pointer is accepted but not enforced (we model GPL programs only implicitly).
+def bpf_prog_load(attr_buf: uint64) -> int64:
+    insn_cnt: uint64 = cast[uint64](cast[Ptr[uint32]](attr_buf + BPF_ATTR_INSN_CNT)[0])
+    uinsns:   uint64 = cast[Ptr[uint64]](attr_buf + BPF_ATTR_INSNS)[0]
+    if insn_cnt == 0:
+        return BPF_EINVAL
+    if insn_cnt > BPF_MAX_INSNS:
+        return BPF_E2BIG
+    if uinsns == 0:
+        return BPF_EFAULT
+
+    # Find a free prog pool slot first (so a verify failure leaks no fd).
+    slot: int64 = -1
+    i: uint64 = 0
+    while i < BPF_MAX_PROGS:
+        if bpf_prog_live[i] == 0:
+            slot = cast[int64](i)
+            i = BPF_MAX_PROGS
+        else:
+            i = i + 1
+    if slot < 0:
+        return BPF_ENOMEM
+    s: uint64 = cast[uint64](slot)
+
+    # Copy the instruction bytes into this prog's block.
+    nbytes: uint64 = insn_cnt * 8
+    block_off: uint64 = s * BPF_PROG_BLOCK
+    if copy_from_user(cast[uint64](&bpf_insn_arena[block_off]), uinsns, nbytes) != 0:
+        return BPF_EFAULT
+
+    # Verify against the lite verifier BEFORE allocating an fd.
+    vrc: int64 = _bpf_verify(cast[uint64](&bpf_insn_arena[block_off]), insn_cnt)
+    if vrc != 0:
+        return vrc
+
+    fd: int32 = vfs_alloc_l2_fd(FD_BPF_PROG_MARK)
+    if fd < 0:
+        return BPF_EMFILE
+    bpf_prog_live[s]     = 1
+    bpf_prog_insn_cnt[s] = insn_cnt
+    bpf_prog_fd[s]       = fd
+    return cast[int64](fd)
+
+
+# =====================================================================
+# eBPF interpreter
+# =====================================================================
+#
+# Run prog pool slot `s` over a context buffer (kernel pointer `ctx`, `ctx_len`
+# bytes). Registers r0..r9 start zeroed; r1 = pointer to the context; r10 = the
+# frame pointer (top of a 512-byte zeroed stack). Supports:
+#   * BPF_ALU64 MOV/ADD/SUB/MUL/AND/OR/XOR/LSH/RSH (imm + reg)
+#   * BPF_LD_IMM64 (wide 64-bit immediate load)
+#   * BPF_LDX/BPF_STX (MEM) B/H/W/DW against ctx (via r1) and the stack (r10)
+#   * BPF_JMP JEQ/JNE/JGT/JGE/JLT/JLE (imm + reg), JA, EXIT
+# Returns r0 (the program's return value). The interpreter has a strict step
+# budget so a malformed (but verifier-passed) loop cannot hang the kernel.
+
+BPF_RUN_MAX_STEPS: uint64 = 100000
+
+# A scratch register file + stack the interpreter uses (single-threaded boot/
+# syscall context, so module-global scratch is safe and keeps the call frame
+# small). regs[0..10]; stack is 512 bytes.
+bpf_regs:  Array[11, uint64]
+bpf_stack: Array[512, uint8]
+
+
+def _bpf_load_mem(addr: uint64, size: uint64) -> uint64:
+    # Load `size` (1/2/4/8) bytes little-endian from kernel address `addr`.
+    if size == 1:
+        return cast[uint64](cast[Ptr[uint8]](addr)[0])
+    if size == 2:
+        return cast[uint64](cast[Ptr[uint16]](addr)[0])
+    if size == 4:
+        return cast[uint64](cast[Ptr[uint32]](addr)[0])
+    return cast[Ptr[uint64]](addr)[0]
+
+
+def _bpf_store_mem(addr: uint64, size: uint64, val: uint64):
+    if size == 1:
+        cast[Ptr[uint8]](addr)[0] = cast[uint8](val & 0xFF)
+        return
+    if size == 2:
+        cast[Ptr[uint16]](addr)[0] = cast[uint16](val & 0xFFFF)
+        return
+    if size == 4:
+        cast[Ptr[uint32]](addr)[0] = cast[uint32](val & 0xFFFFFFFF)
+        return
+    cast[Ptr[uint64]](addr)[0] = val
+
+
+def _bpf_size_bytes(code: uint64) -> uint64:
+    sz: uint64 = code & 0x18
+    if sz == BPF_W:
+        return 4
+    if sz == BPF_H:
+        return 2
+    if sz == BPF_B:
+        return 1
+    return 8                                 # BPF_DW
+
+
+# Run prog slot `s`. ctx/ctx_len describe the (kernel-resident) context buffer.
+# The computed r0 is written through the `out_r0` pointer; returns 0 on success
+# or a negative errno on a runtime fault (bad memory access, step budget).
+def _bpf_run_prog(s: uint64, ctx: uint64, ctx_len: uint64, out_r0: uint64) -> int64:
+    insn_cnt: uint64 = bpf_prog_insn_cnt[s]
+    base: uint64 = cast[uint64](&bpf_insn_arena[s * BPF_PROG_BLOCK])
+
+    # Zero the register file and the stack.
+    ri: uint64 = 0
+    while ri < BPF_MAX_REG:
+        bpf_regs[ri] = 0
+        ri = ri + 1
+    si: uint64 = 0
+    while si < BPF_STACK_SIZE:
+        bpf_stack[si] = 0
+        si = si + 1
+    # r1 = context pointer; r10 = frame pointer (top of the 512-byte stack).
+    bpf_regs[1]  = ctx
+    bpf_regs[10] = cast[uint64](&bpf_stack[0]) + BPF_STACK_SIZE
+
+    stack_base: uint64 = cast[uint64](&bpf_stack[0])
+    stack_top:  uint64 = stack_base + BPF_STACK_SIZE
+    ctx_end:    uint64 = ctx + ctx_len
+
+    pc: uint64 = 0
+    steps: uint64 = 0
+    while pc < insn_cnt:
+        steps = steps + 1
+        if steps > BPF_RUN_MAX_STEPS:
+            return BPF_EINVAL                # runaway loop guard
+
+        ip: uint64 = base + pc * 8
+        code: uint64 = cast[uint64](cast[Ptr[uint8]](ip)[0])
+        regs_b: uint64 = cast[uint64](cast[Ptr[uint8]](ip + 1)[0])
+        dst: uint64 = regs_b & 0x0F
+        src: uint64 = (regs_b >> 4) & 0x0F
+        off: int64  = cast[int64](cast[Ptr[int16]](ip + 2)[0])
+        imm: int64  = cast[int64](cast[Ptr[int32]](ip + 4)[0])
+
+        cls: uint64 = code & 0x07
+        op:  uint64 = code & 0xF0
+        srcbit: uint64 = code & 0x08
+
+        # --- wide LD_IMM64 -----------------------------------------------
+        if code == OP_LD_IMM64:
+            # imm of this insn is the low 32 bits; the NEXT insn's imm is the
+            # high 32 bits. dst = (hi << 32) | (lo & 0xFFFFFFFF).
+            lo: uint64 = cast[uint64](imm) & 0xFFFFFFFF
+            ip2: uint64 = base + (pc + 1) * 8
+            hi: uint64 = cast[uint64](cast[int64](cast[Ptr[int32]](ip2 + 4)[0])) & 0xFFFFFFFF
+            bpf_regs[dst] = (hi << 32) | lo
+            pc = pc + 2
+            continue
+
+        # --- ALU64 -------------------------------------------------------
+        if cls == BPF_ALU64:
+            operand: uint64 = 0
+            if srcbit == BPF_X:
+                operand = bpf_regs[src]
+            else:
+                operand = cast[uint64](imm)
+            if op == BPF_MOV:
+                bpf_regs[dst] = operand
+            elif op == BPF_ADD:
+                bpf_regs[dst] = bpf_regs[dst] + operand
+            elif op == BPF_SUB:
+                bpf_regs[dst] = bpf_regs[dst] - operand
+            elif op == BPF_MUL:
+                bpf_regs[dst] = bpf_regs[dst] * operand
+            elif op == BPF_AND:
+                bpf_regs[dst] = bpf_regs[dst] & operand
+            elif op == BPF_OR:
+                bpf_regs[dst] = bpf_regs[dst] | operand
+            elif op == BPF_XOR:
+                bpf_regs[dst] = bpf_regs[dst] ^ operand
+            elif op == BPF_LSH:
+                bpf_regs[dst] = bpf_regs[dst] << (operand & 63)
+            elif op == BPF_RSH:
+                bpf_regs[dst] = bpf_regs[dst] >> (operand & 63)
+            elif op == BPF_DIV:
+                if operand == 0:
+                    bpf_regs[dst] = 0        # eBPF defines div-by-0 -> 0
+                else:
+                    bpf_regs[dst] = bpf_regs[dst] / operand
+            else:
+                return BPF_EINVAL            # unsupported ALU64 op
+            pc = pc + 1
+            continue
+
+        # --- LDX (load from memory into dst) -----------------------------
+        if cls == BPF_LDX:
+            size: uint64 = _bpf_size_bytes(code)
+            addr: uint64 = bpf_regs[src] + cast[uint64](off)
+            # Bound the access to either the ctx buffer or the stack frame.
+            if addr >= ctx and (addr + size) <= ctx_end:
+                bpf_regs[dst] = _bpf_load_mem(addr, size)
+            elif addr >= stack_base and (addr + size) <= stack_top:
+                bpf_regs[dst] = _bpf_load_mem(addr, size)
+            else:
+                return BPF_EACCES            # out-of-bounds load
+            pc = pc + 1
+            continue
+
+        # --- STX (store dst-relative from src) ---------------------------
+        if cls == BPF_STX:
+            size: uint64 = _bpf_size_bytes(code)
+            addr: uint64 = bpf_regs[dst] + cast[uint64](off)
+            if addr >= ctx and (addr + size) <= ctx_end:
+                _bpf_store_mem(addr, size, bpf_regs[src])
+            elif addr >= stack_base and (addr + size) <= stack_top:
+                _bpf_store_mem(addr, size, bpf_regs[src])
+            else:
+                return BPF_EACCES            # out-of-bounds store
+            pc = pc + 1
+            continue
+
+        # --- ST (store immediate, dst-relative) --------------------------
+        if cls == BPF_ST:
+            size: uint64 = _bpf_size_bytes(code)
+            addr: uint64 = bpf_regs[dst] + cast[uint64](off)
+            if addr >= ctx and (addr + size) <= ctx_end:
+                _bpf_store_mem(addr, size, cast[uint64](imm))
+            elif addr >= stack_base and (addr + size) <= stack_top:
+                _bpf_store_mem(addr, size, cast[uint64](imm))
+            else:
+                return BPF_EACCES
+            pc = pc + 1
+            continue
+
+        # --- JMP ---------------------------------------------------------
+        if cls == BPF_JMP:
+            if op == BPF_EXIT:
+                # r0 holds the return value.
+                cast[Ptr[uint64]](out_r0)[0] = bpf_regs[0]
+                return 0
+            if op == BPF_JA:
+                pc = cast[uint64](cast[int64](pc) + 1 + off)
+                continue
+            # Conditional. Compare dst against (src reg or imm).
+            cmp_rhs: uint64 = 0
+            if srcbit == BPF_X:
+                cmp_rhs = bpf_regs[src]
+            else:
+                cmp_rhs = cast[uint64](imm)
+            lhs: uint64 = bpf_regs[dst]
+            taken: int32 = 0
+            if op == BPF_JEQ:
+                if lhs == cmp_rhs:
+                    taken = 1
+            elif op == BPF_JNE:
+                if lhs != cmp_rhs:
+                    taken = 1
+            elif op == BPF_JGT:
+                if lhs > cmp_rhs:
+                    taken = 1
+            elif op == BPF_JGE:
+                if lhs >= cmp_rhs:
+                    taken = 1
+            elif op == BPF_JLT:
+                if lhs < cmp_rhs:
+                    taken = 1
+            elif op == BPF_JLE:
+                if lhs <= cmp_rhs:
+                    taken = 1
+            else:
+                return BPF_EINVAL            # unsupported JMP op
+            if taken != 0:
+                pc = cast[uint64](cast[int64](pc) + 1 + off)
+            else:
+                pc = pc + 1
+            continue
+
+        # Unknown instruction class.
+        return BPF_EINVAL
+
+    # Fell off the end without EXIT (verifier should have caught this).
+    return BPF_EINVAL
+
+
+# =====================================================================
+# BPF_PROG_TEST_RUN
+# =====================================================================
+#
+# Copy the input context from data_in, run the program over it, write the
+# (possibly mutated) context back to data_out, and store r0 into attr.retval.
+# Returns 0 on success. We model the common single-buffer case.
+def bpf_prog_test_run(attr_buf: uint64, uattr: uint64) -> int64:
+    prog_fd: int32 = cast[int32](cast[Ptr[uint32]](attr_buf + BPF_ATTR_TEST_PROG_FD)[0])
+    dsz_in:  uint64 = cast[uint64](cast[Ptr[uint32]](attr_buf + BPF_ATTR_TEST_DSZ_IN)[0])
+    udata_in: uint64 = cast[Ptr[uint64]](attr_buf + BPF_ATTR_TEST_DATA_IN)[0]
+    udata_out: uint64 = cast[Ptr[uint64]](attr_buf + BPF_ATTR_TEST_DATA_OUT)[0]
+    slot64: int64 = _bpf_prog_slot_for_fd(prog_fd)
+    if slot64 < 0:
+        return BPF_EBADF
+    s: uint64 = cast[uint64](slot64)
+    if dsz_in > 256:
+        return BPF_E2BIG
+    ctxbuf: Array[256, uint8]
+    ci: uint64 = 0
+    while ci < 256:
+        ctxbuf[ci] = 0
+        ci = ci + 1
+    if udata_in != 0 and dsz_in > 0:
+        if copy_from_user(cast[uint64](&ctxbuf[0]), udata_in, dsz_in) != 0:
+            return BPF_EFAULT
+    r0: Array[1, uint64]
+    r0[0] = 0
+    rrc: int64 = _bpf_run_prog(s, cast[uint64](&ctxbuf[0]), dsz_in,
+                               cast[uint64](&r0[0]))
+    if rrc != 0:
+        return rrc
+    # Write r0 back into attr.retval (in the user attr struct).
+    if uattr != 0:
+        rv: uint32 = cast[uint32](r0[0] & 0xFFFFFFFF)
+        if copy_to_user(uattr + BPF_ATTR_TEST_RETVAL, cast[uint64](&rv), 4) != 0:
+            return BPF_EFAULT
+    # Copy the (possibly mutated) context back out.
+    if udata_out != 0 and dsz_in > 0:
+        if copy_to_user(udata_out, cast[uint64](&ctxbuf[0]), dsz_in) != 0:
+            return BPF_EFAULT
+    return 0
+
+
+# =====================================================================
+# bpf(cmd, attr, size)  --  nr 321
+# =====================================================================
+#
+# int bpf(int cmd, union bpf_attr *attr, unsigned int size)
+#   a0 = cmd, a1 = attr pointer, a2 = size.
+#
+# Read the leading attr bytes into a kernel buffer via copy_from_user (never a
+# raw user deref), then dispatch to the per-command handler. attr == NULL or a
+# size below what we read -> EFAULT/EINVAL.
+def bpf_syscall(a0: uint64, a1: uint64, a2: uint64) -> int64:
+    cmd: uint64 = a0
+    uattr: uint64 = a1
+    size: uint64 = a2
+    if uattr == 0:
+        return BPF_EFAULT
+    if size == 0:
+        return BPF_EINVAL
+    # Copy the leading attr bytes. We only ever consult the first
+    # BPF_ATTR_READ_SZ bytes; if the caller offered fewer, copy what we can but
+    # require at least 16 bytes (the smallest command struct we read).
+    if size < 16:
+        return BPF_EINVAL
+    rdsz: uint64 = size
+    if rdsz > BPF_ATTR_READ_SZ:
+        rdsz = BPF_ATTR_READ_SZ
+    attr: Array[48, uint8]
+    ai: uint64 = 0
+    while ai < BPF_ATTR_READ_SZ:
+        attr[ai] = 0
+        ai = ai + 1
+    if copy_from_user(cast[uint64](&attr[0]), uattr, rdsz) != 0:
+        return BPF_EFAULT
+    abuf: uint64 = cast[uint64](&attr[0])
+
+    if cmd == BPF_MAP_CREATE:
+        return bpf_map_create(abuf)
+    if cmd == BPF_MAP_LOOKUP_ELEM:
+        return bpf_map_lookup(abuf)
+    if cmd == BPF_MAP_UPDATE_ELEM:
+        return bpf_map_update(abuf)
+    if cmd == BPF_MAP_DELETE_ELEM:
+        return bpf_map_delete(abuf)
+    if cmd == BPF_PROG_LOAD:
+        return bpf_prog_load(abuf)
+    if cmd == BPF_PROG_TEST_RUN:
+        return bpf_prog_test_run(abuf, uattr)
+    return BPF_EINVAL                        # unsupported command
+
+
+# =====================================================================
+# close hook
+# =====================================================================
+#
+# _u_close in u_syscalls.ad calls this before the fd slot is recycled so a
+# later fd allocated at the same slot does not inherit a stale map/prog. We free
+# whichever pool slot (if any) is bound to this fd.
+def bpf_close_fd(fd: int32):
+    ms: int64 = _bpf_map_slot_for_fd(fd)
+    if ms >= 0:
+        s: uint64 = cast[uint64](ms)
+        bpf_map_live[s] = 0
+        bpf_map_fd[s]   = -1
+        # Clear the used bits so the arena block is fully free for reuse.
+        e: uint64 = 0
+        while e < BPF_MAX_ENTRIES_C:
+            bpf_entry_used[s * BPF_MAX_ENTRIES_C + e] = 0
+            e = e + 1
+        return
+    ps: int64 = _bpf_prog_slot_for_fd(fd)
+    if ps >= 0:
+        p: uint64 = cast[uint64](ps)
+        bpf_prog_live[p]     = 0
+        bpf_prog_fd[p]       = -1
+        bpf_prog_insn_cnt[p] = 0
+
+
+# =====================================================================
+# instruction-builder helpers (for the self-test)
+# =====================================================================
+#
+# Encode one 8-byte bpf_insn into the byte buffer at `dst` (a kernel pointer)
+# at instruction index `idx`. Mirrors the BPF_* macros in uapi/linux/bpf.h.
+def _bpf_emit(dst: uint64, idx: uint64, code: uint64, dreg: uint64,
+              sreg: uint64, off: int64, imm: int64):
+    ip: uint64 = dst + idx * 8
+    cast[Ptr[uint8]](ip)[0]     = cast[uint8](code & 0xFF)
+    regbyte: uint64 = (dreg & 0x0F) | ((sreg & 0x0F) << 4)
+    cast[Ptr[uint8]](ip + 1)[0] = cast[uint8](regbyte & 0xFF)
+    cast[Ptr[int16]](ip + 2)[0] = cast[int16](off)
+    cast[Ptr[int32]](ip + 4)[0] = cast[int32](imm)
+
+
+# =====================================================================
+# Boot self-test  --  [BPF] PASS / [bpf] PASS  (boot:37.bpf)
+# =====================================================================
+#
+# Exercises the REAL bpf(2) path directly in boot context, driving the SAME
+# handler entry points the nr-321 dispatch arm calls. Boot-context pointers are
+# kernel-mapped and resolve through copy_from_user/copy_to_user the same way
+# perf/caps/mempolicy self-tests' stack buffers do, so no userland binary is
+# needed. The boot task that runs this hook has an UNINITIALISED fd table, so we
+# free fd slots 3..15 before any vfs_alloc_l2_fd and restore them after — the
+# same snapshot/restore dance do_perf_selftest uses.
+#
+# Steps:
+#   (1) MAP_CREATE a HASH map, UPDATE a key, LOOKUP it back, assert the value
+#       round-trips byte-for-byte; LOOKUP a missing key -> ENOENT; DELETE and
+#       assert the key is gone.
+#   (2) MAP_CREATE an ARRAY map, UPDATE index 3, LOOKUP it back.
+#   (3) PROG_LOAD a real eBPF program that computes r0 = ctx[0]+ctx[1] (two u64
+#       context fields), TEST_RUN it over a context, assert the exact sum.
+#   (4) PROG_LOAD a program that writes to the stack then loads it back (LDX/STX
+#       round-trip) and returns it; assert the value.
+#   (5) PROG_LOAD a deliberately INVALID program (no BPF_EXIT) -> EINVAL.
+#   (6) PROG_LOAD a program with an out-of-range register -> EINVAL.
+#   (7) PROG_LOAD a program with an out-of-bounds stack store -> EACCES.
+
+from kernel.sched.core import (
+    TaskStruct, current_task, FD_CLOSED_MARK,
+)
+
+
+# Scratch buffers the self-test fills (kernel-mapped in boot context). Sized to
+# cover a union bpf_attr (we use 48) and an instruction stream.
+bpf_test_attr:  Array[48, uint8]
+bpf_test_insns: Array[256, uint8]      # up to 32 insns
+bpf_test_ctx:   Array[64, uint8]
+bpf_test_key:   Array[16, uint8]
+bpf_test_val:   Array[64, uint8]
+
+
+def _bpf_fail(msg: Ptr[char]):
+    printk0("[bpf] FAIL: ")
+    printk0(msg)
+    printk0("\n")
+
+
+def _bpf_zero_attr():
+    i: uint64 = 0
+    while i < 48:
+        bpf_test_attr[i] = 0
+        i = i + 1
+
+
+def bpf_selftest() -> int32:
+    bpf_init()
+
+    # Free fd slots 3..15 in the boot task's fd table (snapshot to restore),
+    # the same dance do_perf_selftest uses.
+    bt: Ptr[TaskStruct] = current_task()
+    fd_save: Array[16, uint32]
+    fdi: uint64 = 3
+    while fdi < 16:
+        fd_save[fdi] = bt[0].fd_idx[fdi]
+        bt[0].fd_idx[fdi] = FD_CLOSED_MARK
+        fdi = fdi + 1
+
+    rc: int32 = _bpf_selftest_body()
+
+    rfdi: uint64 = 3
+    while rfdi < 16:
+        bt[0].fd_idx[rfdi] = fd_save[rfdi]
+        rfdi = rfdi + 1
+    return rc
+
+
+def _bpf_selftest_body() -> int32:
+    abase: uint64 = cast[uint64](&bpf_test_attr[0])
+
+    # ================= (1) HASH map round-trip ======================
+    _bpf_zero_attr()
+    cast[Ptr[uint32]](abase + BPF_ATTR_MAP_TYPE)[0]    = cast[uint32](BPF_MAP_TYPE_HASH)
+    cast[Ptr[uint32]](abase + BPF_ATTR_KEY_SIZE)[0]    = cast[uint32](8)
+    cast[Ptr[uint32]](abase + BPF_ATTR_VALUE_SIZE)[0]  = cast[uint32](8)
+    cast[Ptr[uint32]](abase + BPF_ATTR_MAX_ENTRIES)[0] = cast[uint32](16)
+    hmap64: int64 = bpf_syscall(BPF_MAP_CREATE, abase, 48)
+    if hmap64 < 0:
+        _bpf_fail("MAP_CREATE(HASH) returned an error")
+        return 0
+    hmap: int32 = cast[int32](hmap64)
+    if vfs_fd_marker(hmap) != FD_BPF_MAP_MARK:
+        _bpf_fail("HASH map fd not tagged FD_BPF_MAP_MARK")
+        return 0
+    printk0("[BPF] PASS MAP_CREATE(HASH) -> map fd\n")
+
+    # UPDATE key=0x1122334455667788 -> value=0xDEADBEEFCAFEBABE
+    cast[Ptr[uint64]](cast[uint64](&bpf_test_key[0]))[0] = 0x1122334455667788
+    cast[Ptr[uint64]](cast[uint64](&bpf_test_val[0]))[0] = 0xDEADBEEFCAFEBABE
+    _bpf_zero_attr()
+    cast[Ptr[uint32]](abase + BPF_ATTR_MAP_FD)[0]    = cast[uint32](hmap)
+    cast[Ptr[uint64]](abase + BPF_ATTR_KEY)[0]       = cast[uint64](&bpf_test_key[0])
+    cast[Ptr[uint64]](abase + BPF_ATTR_VALUE)[0]     = cast[uint64](&bpf_test_val[0])
+    cast[Ptr[uint64]](abase + BPF_ATTR_ELEM_FLAGS)[0] = BPF_ANY
+    if bpf_syscall(BPF_MAP_UPDATE_ELEM, abase, 48) != 0:
+        _bpf_fail("MAP_UPDATE_ELEM(HASH) failed")
+        return 0
+
+    # LOOKUP it back into a fresh value buffer; assert the round-trip.
+    rdval: Array[8, uint8]
+    cast[Ptr[uint64]](cast[uint64](&rdval[0]))[0] = 0
+    _bpf_zero_attr()
+    cast[Ptr[uint32]](abase + BPF_ATTR_MAP_FD)[0] = cast[uint32](hmap)
+    cast[Ptr[uint64]](abase + BPF_ATTR_KEY)[0]    = cast[uint64](&bpf_test_key[0])
+    cast[Ptr[uint64]](abase + BPF_ATTR_VALUE)[0]  = cast[uint64](&rdval[0])
+    if bpf_syscall(BPF_MAP_LOOKUP_ELEM, abase, 48) != 0:
+        _bpf_fail("MAP_LOOKUP_ELEM(HASH) failed")
+        return 0
+    got: uint64 = cast[Ptr[uint64]](cast[uint64](&rdval[0]))[0]
+    if got != 0xDEADBEEFCAFEBABE:
+        printk1("[bpf] FAIL HASH value round-trip got=%x\n", got)
+        return 0
+    printk0("[BPF] PASS HASH update+lookup round-trips the value bytes\n")
+
+    # LOOKUP a missing key -> ENOENT.
+    missing: Array[8, uint8]
+    cast[Ptr[uint64]](cast[uint64](&missing[0]))[0] = 0x9999999999999999
+    _bpf_zero_attr()
+    cast[Ptr[uint32]](abase + BPF_ATTR_MAP_FD)[0] = cast[uint32](hmap)
+    cast[Ptr[uint64]](abase + BPF_ATTR_KEY)[0]    = cast[uint64](&missing[0])
+    cast[Ptr[uint64]](abase + BPF_ATTR_VALUE)[0]  = cast[uint64](&rdval[0])
+    if bpf_syscall(BPF_MAP_LOOKUP_ELEM, abase, 48) != BPF_ENOENT:
+        _bpf_fail("LOOKUP of a missing key did not return ENOENT")
+        return 0
+    printk0("[BPF] PASS LOOKUP of a missing key -> ENOENT\n")
+
+    # DELETE the key, then LOOKUP -> ENOENT.
+    _bpf_zero_attr()
+    cast[Ptr[uint32]](abase + BPF_ATTR_MAP_FD)[0] = cast[uint32](hmap)
+    cast[Ptr[uint64]](abase + BPF_ATTR_KEY)[0]    = cast[uint64](&bpf_test_key[0])
+    if bpf_syscall(BPF_MAP_DELETE_ELEM, abase, 48) != 0:
+        _bpf_fail("MAP_DELETE_ELEM(HASH) failed")
+        return 0
+    _bpf_zero_attr()
+    cast[Ptr[uint32]](abase + BPF_ATTR_MAP_FD)[0] = cast[uint32](hmap)
+    cast[Ptr[uint64]](abase + BPF_ATTR_KEY)[0]    = cast[uint64](&bpf_test_key[0])
+    cast[Ptr[uint64]](abase + BPF_ATTR_VALUE)[0]  = cast[uint64](&rdval[0])
+    if bpf_syscall(BPF_MAP_LOOKUP_ELEM, abase, 48) != BPF_ENOENT:
+        _bpf_fail("LOOKUP after DELETE did not return ENOENT")
+        return 0
+    printk0("[BPF] PASS DELETE removed the key\n")
+
+    # ================= (2) ARRAY map round-trip =====================
+    _bpf_zero_attr()
+    cast[Ptr[uint32]](abase + BPF_ATTR_MAP_TYPE)[0]    = cast[uint32](BPF_MAP_TYPE_ARRAY)
+    cast[Ptr[uint32]](abase + BPF_ATTR_KEY_SIZE)[0]    = cast[uint32](4)
+    cast[Ptr[uint32]](abase + BPF_ATTR_VALUE_SIZE)[0]  = cast[uint32](8)
+    cast[Ptr[uint32]](abase + BPF_ATTR_MAX_ENTRIES)[0] = cast[uint32](8)
+    amap64: int64 = bpf_syscall(BPF_MAP_CREATE, abase, 48)
+    if amap64 < 0:
+        _bpf_fail("MAP_CREATE(ARRAY) returned an error")
+        return 0
+    amap: int32 = cast[int32](amap64)
+
+    akey: Array[4, uint8]
+    cast[Ptr[uint32]](cast[uint64](&akey[0]))[0] = cast[uint32](3)      # index 3
+    aval: Array[8, uint8]
+    cast[Ptr[uint64]](cast[uint64](&aval[0]))[0] = 0x00C0FFEE0000002A
+    _bpf_zero_attr()
+    cast[Ptr[uint32]](abase + BPF_ATTR_MAP_FD)[0]     = cast[uint32](amap)
+    cast[Ptr[uint64]](abase + BPF_ATTR_KEY)[0]        = cast[uint64](&akey[0])
+    cast[Ptr[uint64]](abase + BPF_ATTR_VALUE)[0]      = cast[uint64](&aval[0])
+    cast[Ptr[uint64]](abase + BPF_ATTR_ELEM_FLAGS)[0] = BPF_ANY
+    if bpf_syscall(BPF_MAP_UPDATE_ELEM, abase, 48) != 0:
+        _bpf_fail("MAP_UPDATE_ELEM(ARRAY) failed")
+        return 0
+    ardv: Array[8, uint8]
+    cast[Ptr[uint64]](cast[uint64](&ardv[0]))[0] = 0
+    _bpf_zero_attr()
+    cast[Ptr[uint32]](abase + BPF_ATTR_MAP_FD)[0] = cast[uint32](amap)
+    cast[Ptr[uint64]](abase + BPF_ATTR_KEY)[0]    = cast[uint64](&akey[0])
+    cast[Ptr[uint64]](abase + BPF_ATTR_VALUE)[0]  = cast[uint64](&ardv[0])
+    if bpf_syscall(BPF_MAP_LOOKUP_ELEM, abase, 48) != 0:
+        _bpf_fail("MAP_LOOKUP_ELEM(ARRAY) failed")
+        return 0
+    agot: uint64 = cast[Ptr[uint64]](cast[uint64](&ardv[0]))[0]
+    if agot != 0x00C0FFEE0000002A:
+        printk1("[bpf] FAIL ARRAY value round-trip got=%x\n", agot)
+        return 0
+    printk0("[BPF] PASS ARRAY update+lookup round-trips at index 3\n")
+
+    # ================= (3) PROG_LOAD + TEST_RUN: r0 = ctx[0]+ctx[1] ==
+    # The program (8 insns):
+    #   r2 = *(u64 *)(r1 + 0)      ; ctx[0]
+    #   r3 = *(u64 *)(r1 + 8)      ; ctx[1]
+    #   r0 = r2
+    #   r0 += r3
+    #   exit                       ; return r0
+    ibase: uint64 = cast[uint64](&bpf_test_insns[0])
+    n: uint64 = 0
+    # LDX r2 = *(u64*)(r1+0)  : code = BPF_LDX|BPF_MEM|BPF_DW = 0x79
+    _bpf_emit(ibase, n, BPF_LDX | BPF_MEM | BPF_DW, 2, 1, 0, 0)
+    n = n + 1
+    # LDX r3 = *(u64*)(r1+8)
+    _bpf_emit(ibase, n, BPF_LDX | BPF_MEM | BPF_DW, 3, 1, 8, 0)
+    n = n + 1
+    # MOV r0 = r2  : code = BPF_ALU64|BPF_MOV|BPF_X = 0xbf
+    _bpf_emit(ibase, n, BPF_ALU64 | BPF_MOV | BPF_X, 0, 2, 0, 0)
+    n = n + 1
+    # ADD r0 += r3 : code = BPF_ALU64|BPF_ADD|BPF_X = 0x0f
+    _bpf_emit(ibase, n, BPF_ALU64 | BPF_ADD | BPF_X, 0, 3, 0, 0)
+    n = n + 1
+    # EXIT : code = BPF_JMP|BPF_EXIT = 0x95
+    _bpf_emit(ibase, n, BPF_JMP | BPF_EXIT, 0, 0, 0, 0)
+    n = n + 1
+
+    _bpf_zero_attr()
+    cast[Ptr[uint32]](abase + BPF_ATTR_PROG_TYPE)[0] = cast[uint32](1)      # SOCKET_FILTER
+    cast[Ptr[uint32]](abase + BPF_ATTR_INSN_CNT)[0]  = cast[uint32](n)
+    cast[Ptr[uint64]](abase + BPF_ATTR_INSNS)[0]     = ibase
+    prog64: int64 = bpf_syscall(BPF_PROG_LOAD, abase, 48)
+    if prog64 < 0:
+        printk1("[bpf] FAIL PROG_LOAD(sum) rc=%d\n", cast[uint64](prog64))
+        return 0
+    prog: int32 = cast[int32](prog64)
+    if vfs_fd_marker(prog) != FD_BPF_PROG_MARK:
+        _bpf_fail("prog fd not tagged FD_BPF_PROG_MARK")
+        return 0
+    printk0("[BPF] PASS PROG_LOAD(sum) accepted -> prog fd\n")
+
+    # TEST_RUN with ctx[0]=1000, ctx[1]=337 -> r0 = 1337.
+    cast[Ptr[uint64]](cast[uint64](&bpf_test_ctx[0]))[0] = 1000
+    cast[Ptr[uint64]](cast[uint64](&bpf_test_ctx[8]))[0] = 337
+    _bpf_zero_attr()
+    cast[Ptr[uint32]](abase + BPF_ATTR_TEST_PROG_FD)[0] = cast[uint32](prog)
+    cast[Ptr[uint32]](abase + BPF_ATTR_TEST_DSZ_IN)[0]  = cast[uint32](16)
+    cast[Ptr[uint64]](abase + BPF_ATTR_TEST_DATA_IN)[0] = cast[uint64](&bpf_test_ctx[0])
+    cast[Ptr[uint64]](abase + BPF_ATTR_TEST_DATA_OUT)[0] = 0
+    if bpf_syscall(BPF_PROG_TEST_RUN, abase, 48) != 0:
+        _bpf_fail("PROG_TEST_RUN(sum) failed")
+        return 0
+    retval: uint32 = cast[Ptr[uint32]](abase + BPF_ATTR_TEST_RETVAL)[0]
+    if cast[uint64](retval) != 1337:
+        printk1("[bpf] FAIL sum prog retval=%d (expected 1337)\n",
+                cast[uint64](retval))
+        return 0
+    printk0("[BPF] PASS interpreter computed ctx[0]+ctx[1] == 1337\n")
+
+    # ================= (4) PROG_LOAD: stack STX/LDX round-trip ======
+    #   r1 = 0x2A           ; LD_IMM64 low; (use ALU64 MOV imm for simplicity)
+    #   *(u64*)(r10 - 8) = r1
+    #   r0 = *(u64*)(r10 - 8)
+    #   exit
+    n2: uint64 = 0
+    # MOV r1 = 0x2A (imm) : BPF_ALU64|BPF_MOV|BPF_K = 0xb7
+    _bpf_emit(ibase, n2, BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 0x2A)
+    n2 = n2 + 1
+    # STX *(u64*)(r10-8) = r1 : BPF_STX|BPF_MEM|BPF_DW = 0x7b
+    _bpf_emit(ibase, n2, BPF_STX | BPF_MEM | BPF_DW, 10, 1, 0 - 8, 0)
+    n2 = n2 + 1
+    # LDX r0 = *(u64*)(r10-8) : BPF_LDX|BPF_MEM|BPF_DW = 0x79
+    _bpf_emit(ibase, n2, BPF_LDX | BPF_MEM | BPF_DW, 0, 10, 0 - 8, 0)
+    n2 = n2 + 1
+    _bpf_emit(ibase, n2, BPF_JMP | BPF_EXIT, 0, 0, 0, 0)
+    n2 = n2 + 1
+    _bpf_zero_attr()
+    cast[Ptr[uint32]](abase + BPF_ATTR_PROG_TYPE)[0] = cast[uint32](1)
+    cast[Ptr[uint32]](abase + BPF_ATTR_INSN_CNT)[0]  = cast[uint32](n2)
+    cast[Ptr[uint64]](abase + BPF_ATTR_INSNS)[0]     = ibase
+    prog2_64: int64 = bpf_syscall(BPF_PROG_LOAD, abase, 48)
+    if prog2_64 < 0:
+        printk1("[bpf] FAIL PROG_LOAD(stack) rc=%d\n", cast[uint64](prog2_64))
+        return 0
+    prog2: int32 = cast[int32](prog2_64)
+    _bpf_zero_attr()
+    cast[Ptr[uint32]](abase + BPF_ATTR_TEST_PROG_FD)[0] = cast[uint32](prog2)
+    cast[Ptr[uint32]](abase + BPF_ATTR_TEST_DSZ_IN)[0]  = cast[uint32](0)
+    cast[Ptr[uint64]](abase + BPF_ATTR_TEST_DATA_IN)[0] = 0
+    cast[Ptr[uint64]](abase + BPF_ATTR_TEST_DATA_OUT)[0] = 0
+    if bpf_syscall(BPF_PROG_TEST_RUN, abase, 48) != 0:
+        _bpf_fail("PROG_TEST_RUN(stack) failed")
+        return 0
+    rv2: uint32 = cast[Ptr[uint32]](abase + BPF_ATTR_TEST_RETVAL)[0]
+    if cast[uint64](rv2) != 0x2A:
+        printk1("[bpf] FAIL stack prog retval=%d (expected 0x2A)\n",
+                cast[uint64](rv2))
+        return 0
+    printk0("[BPF] PASS interpreter STX/LDX stack round-trip == 0x2A\n")
+
+    # ================= (5) reject: no BPF_EXIT ======================
+    n3: uint64 = 0
+    _bpf_emit(ibase, n3, BPF_ALU64 | BPF_MOV | BPF_K, 0, 0, 0, 1)   # r0 = 1
+    n3 = n3 + 1
+    # (no EXIT)
+    _bpf_zero_attr()
+    cast[Ptr[uint32]](abase + BPF_ATTR_INSN_CNT)[0] = cast[uint32](n3)
+    cast[Ptr[uint64]](abase + BPF_ATTR_INSNS)[0]    = ibase
+    if bpf_syscall(BPF_PROG_LOAD, abase, 48) != BPF_EINVAL:
+        _bpf_fail("program with no BPF_EXIT was not rejected EINVAL")
+        return 0
+    printk0("[BPF] PASS verifier rejected a program with no BPF_EXIT\n")
+
+    # ================= (6) reject: out-of-range register ============
+    n4: uint64 = 0
+    # MOV r13 = 0  (r13 does not exist; dst nibble 13)
+    _bpf_emit(ibase, n4, BPF_ALU64 | BPF_MOV | BPF_K, 13, 0, 0, 0)
+    n4 = n4 + 1
+    _bpf_emit(ibase, n4, BPF_JMP | BPF_EXIT, 0, 0, 0, 0)
+    n4 = n4 + 1
+    _bpf_zero_attr()
+    cast[Ptr[uint32]](abase + BPF_ATTR_INSN_CNT)[0] = cast[uint32](n4)
+    cast[Ptr[uint64]](abase + BPF_ATTR_INSNS)[0]    = ibase
+    if bpf_syscall(BPF_PROG_LOAD, abase, 48) != BPF_EINVAL:
+        _bpf_fail("program with an out-of-range register was not rejected")
+        return 0
+    printk0("[BPF] PASS verifier rejected an out-of-range register\n")
+
+    # ================= (7) reject: out-of-bounds stack store ========
+    n5: uint64 = 0
+    _bpf_emit(ibase, n5, BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 0)
+    n5 = n5 + 1
+    # STX *(u64*)(r10 + 8) = r1  ; positive offset off the frame -> OOB
+    _bpf_emit(ibase, n5, BPF_STX | BPF_MEM | BPF_DW, 10, 1, 8, 0)
+    n5 = n5 + 1
+    _bpf_emit(ibase, n5, BPF_JMP | BPF_EXIT, 0, 0, 0, 0)
+    n5 = n5 + 1
+    _bpf_zero_attr()
+    cast[Ptr[uint32]](abase + BPF_ATTR_INSN_CNT)[0] = cast[uint32](n5)
+    cast[Ptr[uint64]](abase + BPF_ATTR_INSNS)[0]    = ibase
+    if bpf_syscall(BPF_PROG_LOAD, abase, 48) != BPF_EACCES:
+        _bpf_fail("program with an OOB stack store was not rejected EACCES")
+        return 0
+    printk0("[BPF] PASS verifier rejected an out-of-bounds stack store\n")
+
+    # Tidy up: drop the maps and progs we created.
+    bpf_close_fd(hmap)
+    bpf_close_fd(amap)
+    bpf_close_fd(prog)
+    bpf_close_fd(prog2)
+    vfs_close(hmap)
+    vfs_close(amap)
+    vfs_close(prog)
+    vfs_close(prog2)
+
+    printk0("[bpf] PASS\n")
+    return 1
