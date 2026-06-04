@@ -171,8 +171,42 @@ NVME_ADMIN_GET_LOG:     uint8 = 0x02
 NVME_ADMIN_DELETE_CQ:   uint8 = 0x04
 NVME_ADMIN_CREATE_CQ:   uint8 = 0x05
 NVME_ADMIN_IDENTIFY:    uint8 = 0x06
+NVME_ADMIN_ABORT:       uint8 = 0x08
 NVME_ADMIN_SET_FEATURES: uint8 = 0x09
 NVME_ADMIN_GET_FEATURES: uint8 = 0x0A
+NVME_ADMIN_ASYNC_EVENT: uint8 = 0x0C    # Asynchronous Event Request
+
+# --- Asynchronous Event Request (admin opcode 0x0C) ----------------
+#
+# An AER is "submitted and forgotten": the controller does NOT complete
+# it until an asynchronous event actually occurs (a health/critical-
+# warning state change, an error-log entry, a namespace-attribute change,
+# etc.). The host is expected to keep up to AERL+1 of them outstanding at
+# all times. When the controller posts a completion, DW0 carries the
+# event:
+#   bits  0..2   Asynchronous Event Type
+#                  0 = Error, 1 = SMART/Health, 2 = Notice, 6 = I/O cmd,
+#                  7 = Vendor specific
+#   bits  8..15  Asynchronous Event Information (type-specific)
+#   bits 16..23  Associated Log Page identifier (the log to GET to clear
+#                the event and learn the detail)
+# After draining an AER completion the host SHOULD read the indicated log
+# page (which clears the event in the controller) and then submit a fresh
+# AER to keep the queue full.
+NVME_AER_TYPE_ERROR:  uint32 = 0x0
+NVME_AER_TYPE_SMART:  uint32 = 0x1
+NVME_AER_TYPE_NOTICE: uint32 = 0x2
+
+# Error Information log identifier (GET LOG PAGE log id 0x01). Read on an
+# AER "Error" event to retrieve the most recent error-log entries.
+NVME_LOG_ERROR:       uint32 = 0x01
+# Error Information log entries are 64 bytes each; we read one entry.
+NVME_ERROR_LOG_BYTES: uint32 = 64
+
+# How many AERs we attempt to keep outstanding. Clamped to AERL+1 read
+# from Identify Controller byte 259 (AERL is 0-based). Most controllers
+# (incl. QEMU's nvme) report AERL=3 → 4 outstanding.
+NVME_AER_MAX_OUTSTANDING: uint32 = 4
 
 NVME_IO_FLUSH:          uint8 = 0x00
 NVME_IO_WRITE:          uint8 = 0x01
@@ -249,6 +283,30 @@ class NvmeState:
     irq_pin:        uint32       # IOAPIC pin we redirected (diag)
     pad_irq:        uint32
     irq_count:      uint64       # IRQs handled
+
+    # PCI bus/device/function of the active controller, captured at probe
+    # so the timeout->reset-recovery path can re-run the init dance
+    # (re-enable BAR/bus-master, re-read BAR0) without re-scanning PCI.
+    bdf:            uint32
+
+    # --- Asynchronous Event Request bookkeeping -------------------
+    # aer_limit  = AERL+1 (max AERs the controller wants outstanding),
+    #              clamped to NVME_AER_MAX_OUTSTANDING.
+    # aer_outstanding = how many AERs we currently have submitted.
+    # aer_events = count of async-event completions we have drained.
+    # aer_last_* = decode of the most recently drained AER completion.
+    aer_limit:          uint32
+    aer_outstanding:    uint32
+    aer_events:         uint64
+    aer_last_type:      uint32
+    aer_last_info:      uint32
+    aer_last_logpage:   uint32
+
+    # --- Timeout / abort / reset-recovery bookkeeping -------------
+    # abort_count = admin Abort commands that round-tripped.
+    # reset_count = controller-level reset recoveries performed.
+    abort_count:        uint64
+    reset_count:        uint64
 
     # 40-byte controller model string + NUL.
     model:          Array[41, uint8]
@@ -513,6 +571,51 @@ def _build_sq_entry(slot_addr: uint64, opcode: uint8, cid: uint32,
     p[13] = cdw13
     p[14] = cdw14
     p[15] = cdw15
+
+
+# Sentinel status returned by _poll_completion_to when the bounded spin
+# budget is exhausted without a completion. Distinct from a real NVMe
+# status (which only occupies the low 15 bits) so callers can tell a
+# timeout apart from a controller-reported error.
+NVME_POLL_TIMEOUT: uint32 = 0xFFFF
+
+# Default polling budget for ordinary admin/I/O commands. ~50M TCG
+# iterations is "effectively forever" on QEMU but bounded so a wedged
+# controller can't hang the boot.
+NVME_POLL_SPIN_DEFAULT: uint64 = 50000000
+
+
+def _poll_completion_to(cq_base: uint64, head_p: Ptr[uint32],
+                        phase_p: Ptr[uint32], cq_doorbell: uint64,
+                        depth: uint32, max_spin: uint64) -> uint32:
+    # Bounded-timeout completion poll. Identical to _poll_completion but
+    # the spin budget is caller-supplied so the timeout-recovery path can
+    # use a deliberately tiny budget to provoke a timeout, while normal
+    # callers pass NVME_POLL_SPIN_DEFAULT. Returns the NVMe status on a
+    # completion, or NVME_POLL_TIMEOUT if the budget is exhausted.
+    head: uint32 = head_p[0]
+    expected_phase: uint32 = phase_p[0]
+    slot_addr: uint64 = cq_base \
+                      + cast[uint64](head) * NVME_CQ_ENTRY_BYTES
+    spin: uint64 = 0
+    while spin < max_spin:
+        e: Ptr[uint32] = cast[Ptr[uint32]](slot_addr)
+        dw3: uint32 = e[3]
+        cur_phase: uint32 = (dw3 >> 16) & 0x1
+        if cur_phase == expected_phase:
+            last_cqe_dw0 = e[0]
+            status: uint32 = (dw3 >> 17) & 0x7FFF
+            new_head: uint32 = head + 1
+            new_phase: uint32 = expected_phase
+            if new_head >= depth:
+                new_head = 0
+                new_phase = 1 - expected_phase
+            head_p[0] = new_head
+            phase_p[0] = new_phase
+            _nvme_mmio_w32(cq_doorbell, new_head)
+            return status
+        spin = spin + 1
+    return NVME_POLL_TIMEOUT
 
 
 def _poll_completion(cq_base: uint64, head_p: Ptr[uint32],
@@ -879,8 +982,19 @@ def _nvme_identify_controller(buf: uint64) -> int32:
     mn_src: Ptr[uint8] = cast[Ptr[uint8]](buf + 24)
     _copy_trimmed(mn_src, &nvme.model[0], 40)
 
+    # Byte 259 = AERL (Asynchronous Event Request Limit), 0-based. The
+    # controller wants up to AERL+1 AERs outstanding. Clamp to our cap.
+    aerl: uint32 = cast[uint32](cast[Ptr[uint8]](buf + 259)[0])
+    lim: uint32 = aerl + 1
+    if lim > NVME_AER_MAX_OUTSTANDING:
+        lim = NVME_AER_MAX_OUTSTANDING
+    if lim < 1:
+        lim = 1
+    nvme.aer_limit = lim
+
     printk1("[nvme] model=%s\n",  cast[uint64](&nvme.model[0]))
     printk1("[nvme] serial=%s\n", cast[uint64](&nvme.serial[0]))
+    printk1("[nvme] AER limit=%d\n", cast[uint64](nvme.aer_limit))
     return 0
 
 
@@ -1388,6 +1502,358 @@ def nvme_fetch_smart_log() -> int32:
     return 0
 
 
+# --- Admin submit WITHOUT waiting (fire-and-forget) ---------------
+#
+# The Asynchronous Event Request command is the one admin command we must
+# NOT poll for: it stays outstanding in the controller until an async
+# event actually occurs, possibly never during a boot. This builds the
+# SQE at the admin tail, rings the SQ doorbell, and returns the CID it
+# used so the caller can track/abort it — but it does NOT touch the CQ.
+# The corresponding completion is drained later by _nvme_drain_aers().
+def _admin_submit_nowait(opcode: uint8, nsid: uint32,
+                         prp1: uint64, prp2: uint64,
+                         cdw10: uint32, cdw11: uint32,
+                         cdw12: uint32, cdw13: uint32,
+                         cdw14: uint32, cdw15: uint32) -> uint32:
+    cid: uint32 = nvme.admin_cid
+    nvme.admin_cid = cid + 1
+    slot_addr: uint64 = nvme.asq \
+                      + cast[uint64](nvme.asq_tail) \
+                      * NVME_SQ_ENTRY_BYTES
+    _build_sq_entry(slot_addr, opcode, cid, nsid, prp1, prp2,
+                    cdw10, cdw11, cdw12, cdw13, cdw14, cdw15)
+    new_tail: uint32 = nvme.asq_tail + 1
+    if new_tail >= NVME_QUEUE_DEPTH:
+        new_tail = 0
+    nvme.asq_tail = new_tail
+    _nvme_mmio_w32(_sq_doorbell(NVME_ADMIN_QID), new_tail)
+    return cid
+
+
+# --- Asynchronous Event Request (admin opcode 0x0C) ----------------
+#
+# Submit a single AER. All DWORDs are zero — the command carries no data
+# buffer; the event is reported entirely through the completion DW0. We
+# fire it without waiting and bump aer_outstanding.
+def _nvme_submit_one_aer() -> int32:
+    if nvme.bar0 == 0:
+        return -1
+    _admin_submit_nowait(NVME_ADMIN_ASYNC_EVENT, 0, 0, 0,
+                         0, 0, 0, 0, 0, 0)
+    nvme.aer_outstanding = nvme.aer_outstanding + 1
+    return 0
+
+
+# Top up outstanding AERs to the controller's requested limit. Called at
+# init (after IDENTIFY established aer_limit) and after each AER drains.
+def _nvme_refill_aers():
+    while nvme.aer_outstanding < nvme.aer_limit:
+        if _nvme_submit_one_aer() != 0:
+            return
+    printk2("[nvme-aer] %d AER(s) outstanding (limit=%d)\n",
+            cast[uint64](nvme.aer_outstanding),
+            cast[uint64](nvme.aer_limit))
+
+
+# --- Error Information log (GET LOG PAGE log id 0x01) ---------------
+#
+# Read on an AER "Error" event. The Error Information log is an array of
+# 64-byte entries; we fetch the first entry, which holds the error count,
+# the SQID/CID of the offending command, the status field, and the
+# parameter/LBA/NSID context. Reading it clears the pending error event.
+def _nvme_fetch_error_log() -> int32:
+    if nvme.bar0 == 0:
+        return -1
+    buf: uint64 = alloc_pages(0)
+    if buf == 0:
+        return -1
+    memset(cast[Ptr[uint8]](buf), 0, 4096)
+    numd: uint32 = (NVME_ERROR_LOG_BYTES / 4) - 1     # DWORDs-1 = 15
+    cdw10: uint32 = (numd << 16) | (NVME_LOG_ERROR & 0xFF)
+    status: uint32 = _admin_submit_and_wait(
+        NVME_ADMIN_GET_LOG, 0xFFFFFFFF, buf, 0,
+        cdw10, 0, 0, 0, 0, 0)
+    if status != 0:
+        printk1("[nvme-aer] GET LOG (error) failed (status=%x)\n",
+                cast[uint64](status))
+        free_pages(buf, 0)
+        return -1
+    # Entry layout (NVMe base spec): bytes 0..7 = error count, byte 8..9
+    # SQID, 10..11 CID, 12..13 status field.
+    ecount: uint64 = cast[Ptr[uint64]](buf)[0]
+    sqid: uint32 = cast[uint32](cast[Ptr[uint16]](buf + 8)[0])
+    ecid: uint32 = cast[uint32](cast[Ptr[uint16]](buf + 10)[0])
+    estat: uint32 = cast[uint32](cast[Ptr[uint16]](buf + 12)[0])
+    printk2("[nvme-aer] error-log count=%d sqid=%d",
+            ecount, cast[uint64](sqid))
+    printk2(" cid=%d status=%x\n",
+            cast[uint64](ecid), cast[uint64](estat))
+    free_pages(buf, 0)
+    return 0
+
+
+# Act on a single drained AER completion DW0. Decode type/info/log-page,
+# read the indicated log to clear the event in the controller, then a
+# fresh AER will be refilled by the caller. Returns 0 always (best
+# effort; a failed log read is logged but not fatal).
+def _nvme_handle_aer_dw0(dw0: uint32) -> int32:
+    atype:   uint32 = dw0 & 0x7
+    ainfo:   uint32 = (dw0 >> 8) & 0xFF
+    logpage: uint32 = (dw0 >> 16) & 0xFF
+    nvme.aer_last_type    = atype
+    nvme.aer_last_info    = ainfo
+    nvme.aer_last_logpage = logpage
+    nvme.aer_events = nvme.aer_events + 1
+    printk2("[nvme-aer] event type=%d info=%x",
+            cast[uint64](atype), cast[uint64](ainfo))
+    printk1(" logpage=%x\n", cast[uint64](logpage))
+    # An AER consumes one outstanding slot when it completes.
+    if nvme.aer_outstanding > 0:
+        nvme.aer_outstanding = nvme.aer_outstanding - 1
+    # Read the log page the controller pointed at, which clears the
+    # event so the controller will report the next one.
+    if logpage == NVME_LOG_ERROR:
+        _nvme_fetch_error_log()
+    else:
+        if logpage == NVME_LOG_SMART:
+            nvme_fetch_smart_log()
+        else:
+            # Notice / namespace-change / unknown: read whatever log the
+            # controller indicated. If it's a log id we don't model, the
+            # SMART read still clears most QEMU events; fall back to that.
+            nvme_fetch_smart_log()
+    return 0
+
+
+# Non-blocking drain of any pending AER completions on the admin CQ.
+# Unlike a normal command we never spin waiting for an AER — we only pop
+# completions that are ALREADY present (phase already flipped). For each,
+# decode + handle it, then refill the AER queue. Returns the number of
+# AER completions drained this pass.
+def _nvme_drain_aers() -> uint32:
+    if nvme.bar0 == 0:
+        return 0
+    drained: uint32 = 0
+    more: int32 = 1
+    while more == 1:
+        more = 0
+        head: uint32 = nvme.acq_head
+        expected_phase: uint32 = nvme.acq_phase
+        slot_addr: uint64 = nvme.acq \
+                          + cast[uint64](head) * NVME_CQ_ENTRY_BYTES
+        e: Ptr[uint32] = cast[Ptr[uint32]](slot_addr)
+        dw3: uint32 = e[3]
+        cur_phase: uint32 = (dw3 >> 16) & 0x1
+        if cur_phase == expected_phase:
+            # A completion is present. Capture DW0 + advance the CQ.
+            dw0: uint32 = e[0]
+            new_head: uint32 = head + 1
+            new_phase: uint32 = expected_phase
+            if new_head >= NVME_QUEUE_DEPTH:
+                new_head = 0
+                new_phase = 1 - expected_phase
+            nvme.acq_head = new_head
+            nvme.acq_phase = new_phase
+            _nvme_mmio_w32(_cq_doorbell(NVME_ADMIN_QID), new_head)
+            _nvme_handle_aer_dw0(dw0)
+            drained = drained + 1
+            more = 1
+    if drained > 0:
+        _nvme_refill_aers()
+    return drained
+
+
+# --- Admin Abort (admin opcode 0x08) -------------------------------
+#
+# Abort the command identified by (sqid, cid). CDW10 packs
+# [SQID:0..15 | CID:16..31]. The completion DW0 bit 0 is "Abort failed"
+# (1 = the controller could not abort, e.g. the command already
+# completed); status 0 with DW0 bit0=0 means the abort succeeded. We log
+# either way and return 0 if the command round-tripped to the controller
+# (status 0), -1 on a controller error.
+def _nvme_abort(sqid: uint32, cid: uint32) -> int32:
+    if nvme.bar0 == 0:
+        return -1
+    cdw10: uint32 = (sqid & 0xFFFF) | ((cid & 0xFFFF) << 16)
+    status: uint32 = _admin_submit_and_wait(
+        NVME_ADMIN_ABORT, 0, 0, 0,
+        cdw10, 0, 0, 0, 0, 0)
+    if status != 0:
+        printk1("[nvme] ABORT cmd failed (status=%x)\n",
+                cast[uint64](status))
+        return -1
+    abort_failed: uint32 = last_cqe_dw0 & 0x1
+    nvme.abort_count = nvme.abort_count + 1
+    if abort_failed != 0:
+        printk2("[nvme] ABORT sqid=%d cid=%d: not aborted (already done)\n",
+                cast[uint64](sqid), cast[uint64](cid))
+    else:
+        printk2("[nvme] ABORT sqid=%d cid=%d: aborted\n",
+                cast[uint64](sqid), cast[uint64](cid))
+    return 0
+
+
+# --- Controller-level reset recovery -------------------------------
+#
+# The resilience path real NVMe drivers must have: when a command times
+# out and an Abort cannot recover it (or the controller has gone CFS),
+# tear the controller down with CC.EN=0, wait CSTS.RDY=0, then re-run the
+# init dance (admin queues, CC.EN=1, IDENTIFY, SET FEATURES, recreate I/O
+# queues). This is the SAME disable->enable sequence nvme_smoke_test
+# uses; factored here so it can be invoked mid-operation. Returns 0 on a
+# clean recovery, -1 if the controller will not come back.
+def _nvme_reset_recovery() -> int32:
+    if nvme.bar0 == 0:
+        return -1
+    bar0: uint64 = nvme.bar0
+    printk0("[nvme-reset] beginning controller reset recovery\n")
+
+    # Re-assert PCI MEM + bus-master (a real reset can clear these).
+    _nvme_pci_enable_mem_and_master(nvme.bdf)
+
+    # ----- Disable: CC.EN=0, wait CSTS.RDY=0 -----
+    cc: uint32 = _nvme_mmio_r32(bar0 + NVME_CC)
+    _nvme_mmio_w32(bar0 + NVME_CC, cc & ~NVME_CC_EN)
+    if _wait_csts_rdy(bar0, 0) != 0:
+        printk0("[nvme-reset] disable timeout\n")
+        return -1
+
+    # ----- Re-init admin queue ring state (reuse the same pages) -----
+    memset(cast[Ptr[uint8]](nvme.asq), 0, 4096)
+    memset(cast[Ptr[uint8]](nvme.acq), 0, 4096)
+    nvme.asq_tail = 0
+    nvme.acq_head = 0
+    nvme.acq_phase = 1
+    nvme.admin_cid = 0
+    nvme.aer_outstanding = 0
+
+    aqa: uint32 = ((NVME_QUEUE_DEPTH - 1) << 16) | (NVME_QUEUE_DEPTH - 1)
+    _nvme_mmio_w32(bar0 + NVME_AQA, aqa)
+    _nvme_mmio_w64(bar0 + NVME_ASQ, nvme.asq)
+    _nvme_mmio_w64(bar0 + NVME_ACQ, nvme.acq)
+
+    # ----- Re-enable: CC.EN=1, wait CSTS.RDY=1 -----
+    new_cc: uint32 = NVME_CC_EN | NVME_CC_IOSQES_6 | NVME_CC_IOCQES_4
+    _nvme_mmio_w32(bar0 + NVME_CC, new_cc)
+    if _wait_csts_rdy(bar0, NVME_CSTS_RDY) != 0:
+        printk0("[nvme-reset] enable timeout\n")
+        return -1
+    printk0("[nvme-reset] controller ready again\n")
+
+    # ----- Re-IDENTIFY + re-create the I/O queues -----
+    id_buf: uint64 = kmalloc(4096)
+    if id_buf == 0:
+        printk0("[nvme-reset] kmalloc failed\n")
+        return -1
+    if _nvme_identify_controller(id_buf) != 0:
+        return -1
+
+    # Recreate every I/O queue pair we had before. The SQ/CQ memory +
+    # PRP pools are still allocated; we only re-issue SET FEATURES +
+    # CREATE-CQ/SQ and reset the ring head/tail/phase/cid.
+    granted: uint32 = _nvme_set_num_queues()
+    want: uint32 = nvme.n_io_queues
+    if want == 0:
+        want = 1
+    if want > granted:
+        want = granted
+    qid: uint32 = NVME_IO_QID
+    while qid <= want:
+        io_sq_tail[qid] = 0
+        io_cq_head[qid] = 0
+        io_cq_phase[qid] = 1
+        io_q_cid[qid] = 0
+        memset(cast[Ptr[uint8]](io_cq_base[qid]), 0, 4096)
+        if _nvme_create_iocq_q(qid, io_cq_base[qid]) != 0:
+            printk1("[nvme-reset] recreate CQ qid=%d failed\n",
+                    cast[uint64](qid))
+            return -1
+        if _nvme_create_iosq_q(qid, io_sq_base[qid]) != 0:
+            printk1("[nvme-reset] recreate SQ qid=%d failed\n",
+                    cast[uint64](qid))
+            return -1
+        if qid == NVME_IO_QID:
+            _sync_legacy_q1()
+        qid = qid + 1
+
+    # Re-arm the AER queue on the freshly enabled controller.
+    _nvme_refill_aers()
+
+    nvme.reset_count = nvme.reset_count + 1
+    printk1("[nvme-reset] recovery complete (reset_count=%d)\n",
+            nvme.reset_count)
+    return 0
+
+
+# --- Timeout-aware admin command with abort + reset escalation -----
+#
+# Issue an admin command with a BOUNDED completion budget. On timeout we
+# escalate: (1) submit an Abort for the timed-out (sqid=0, cid), (2) if
+# the controller still hasn't completed it, perform a full reset
+# recovery. Returns the command status (0 = success), NVME_POLL_TIMEOUT
+# if it ultimately could not be completed even after recovery.
+# Test hook: when non-zero, _admin_submit_to skips the post-abort
+# recovery poll on a timeout and proceeds straight to a real controller
+# reset. Lets the self-test exercise the full timeout->abort->reset
+# escalation deterministically on a healthy emulated controller (where no
+# command can be made to truly hang). Zero in all production paths.
+nvme_force_reset_on_timeout: int32 = 0
+
+
+def _admin_submit_to(opcode: uint8, nsid: uint32,
+                     prp1: uint64, prp2: uint64,
+                     cdw10: uint32, cdw11: uint32,
+                     cdw12: uint32, cdw13: uint32,
+                     cdw14: uint32, cdw15: uint32,
+                     max_spin: uint64) -> uint32:
+    cid: uint32 = nvme.admin_cid
+    nvme.admin_cid = cid + 1
+    slot_addr: uint64 = nvme.asq \
+                      + cast[uint64](nvme.asq_tail) \
+                      * NVME_SQ_ENTRY_BYTES
+    _build_sq_entry(slot_addr, opcode, cid, nsid, prp1, prp2,
+                    cdw10, cdw11, cdw12, cdw13, cdw14, cdw15)
+    new_tail: uint32 = nvme.asq_tail + 1
+    if new_tail >= NVME_QUEUE_DEPTH:
+        new_tail = 0
+    nvme.asq_tail = new_tail
+    _nvme_mmio_w32(_sq_doorbell(NVME_ADMIN_QID), new_tail)
+    status: uint32 = _poll_completion_to(nvme.acq,
+                                         &nvme.acq_head, &nvme.acq_phase,
+                                         _cq_doorbell(NVME_ADMIN_QID),
+                                         NVME_QUEUE_DEPTH, max_spin)
+    if status != NVME_POLL_TIMEOUT:
+        return status
+
+    # Timed out. Escalate: Abort the outstanding command (admin SQID=0).
+    printk2("[nvme] admin cmd opc=%x cid=%d TIMEOUT -> abort\n",
+            cast[uint64](opcode), cast[uint64](cid))
+    _nvme_abort(NVME_ADMIN_QID, cid)
+    # Did the abort (or the command itself) post a completion now? The
+    # self-test sets nvme_force_reset_on_timeout to skip this recovery
+    # poll and drive the FULL escalation to a real controller reset even
+    # though QEMU would otherwise have completed the (real) command —
+    # there is no way on a healthy emulated controller to make a command
+    # genuinely never complete, so the test hook forces the reset path.
+    if nvme_force_reset_on_timeout == 0:
+        status = _poll_completion_to(nvme.acq,
+                                     &nvme.acq_head, &nvme.acq_phase,
+                                     _cq_doorbell(NVME_ADMIN_QID),
+                                     NVME_QUEUE_DEPTH,
+                                     NVME_POLL_SPIN_DEFAULT)
+        if status != NVME_POLL_TIMEOUT:
+            return status
+
+    # Abort did not recover it: full controller reset recovery.
+    printk0("[nvme] abort ineffective -> reset recovery\n")
+    if _nvme_reset_recovery() != 0:
+        return NVME_POLL_TIMEOUT
+    # After a reset the original command is gone; the caller must resubmit
+    # if it still cares. We report timeout so the caller fails cleanly
+    # rather than acting on a stale completion.
+    return NVME_POLL_TIMEOUT
+
+
 # --- Public write/read wrappers ------------------------------------
 #
 # Same shape as virtio-blk's read_sectors / write_sectors so the
@@ -1518,6 +1984,14 @@ def nvme_smoke_test() -> int32:
         printk0("[nvme] no controller found\n")
         return -1
     printk1("[nvme] controller found bdf=%x\n", cast[uint64](bdf))
+
+    # Remember the bdf so the timeout->reset-recovery path can re-assert
+    # PCI MEM/bus-master without re-scanning the bus.
+    nvme.bdf = bdf
+    nvme.aer_outstanding = 0
+    nvme.aer_events = 0
+    nvme.abort_count = 0
+    nvme.reset_count = 0
 
     _nvme_pci_enable_mem_and_master(bdf)
 
@@ -1773,6 +2247,15 @@ def nvme_smoke_test() -> int32:
     # PASS markers the test script greps for.
     _nvme_health_self_test()
 
+    # ----- Async Event Request + Abort + reset-recovery -----------
+    # Arm the controller's async-event reporting (keeps aer_limit AERs
+    # outstanding), then run the resilience self-test that proves an AER
+    # is parked in the controller, an Abort round-trips, and the
+    # timeout->reset-recovery path brings the controller back usable.
+    # Emits "[nvme-aer]" PASS markers the test script greps for.
+    _nvme_refill_aers()
+    _nvme_aer_self_test()
+
     return 0
 
 
@@ -1978,6 +2461,99 @@ def _nvme_health_self_test() -> int32:
                 cast[uint64](nvme.smart_avail_spare))
         return -1
     printk0("[nvme-health] PASS smart-log\n")
+    return 0
+
+
+def _nvme_aer_self_test() -> int32:
+    # Resilience self-test for the new AER / Abort / reset-recovery code.
+    # Exercises three independent properties against the REAL emulated
+    # controller:
+    #
+    #   (1) AER is submitted and the driver stays healthy. _nvme_refill_aers
+    #       has already parked aer_limit AERs in the controller; assert at
+    #       least one is outstanding and that a normal admin command
+    #       (IDENTIFY controller via a fresh fetch) still completes — i.e.
+    #       the parked AERs don't wedge the admin queue.
+    #
+    #   (2) An Abort command round-trips. We Abort a CID on the admin
+    #       queue; QEMU replies (typically "not aborted" since nothing
+    #       matches, but the command itself completes with status 0). That
+    #       proves opcode 0x08 submission + completion handling work.
+    #
+    #   (3) The timeout->reset-recovery path is invoked and the controller
+    #       comes back usable. We issue an admin IDENTIFY through the
+    #       timeout-aware path with a DELIBERATELY tiny spin budget (1),
+    #       which always "times out" before QEMU posts the completion. That
+    #       drives the real escalation: Abort, then a REAL controller
+    #       disable->enable reset dance. Afterwards we prove the controller
+    #       is usable by issuing a normal IDENTIFY + an I/O read of LBA 0.
+
+    # (1) AER outstanding + admin queue still healthy.
+    if nvme.aer_outstanding < 1:
+        printk0("[nvme-aer] FAIL: no AER outstanding after refill\n")
+        return -1
+    id_buf: uint64 = kmalloc(4096)
+    if id_buf == 0:
+        printk0("[nvme-aer] FAIL: kmalloc\n")
+        return -1
+    if _nvme_identify_controller(id_buf) != 0:
+        printk0("[nvme-aer] FAIL: admin cmd wedged with AERs parked\n")
+        return -1
+    # Drain any AER completions QEMU may have posted (it won't have on a
+    # quiet boot, but the drain path must be exercised + must not hang).
+    _nvme_drain_aers()
+    printk1("[nvme-aer] PASS aer-submit (outstanding=%d)\n",
+            cast[uint64](nvme.aer_outstanding))
+
+    # (2) Abort round-trips.
+    abefore: uint64 = nvme.abort_count
+    if _nvme_abort(NVME_ADMIN_QID, 0x1234) != 0:
+        printk0("[nvme-aer] FAIL: abort did not round-trip\n")
+        return -1
+    if nvme.abort_count <= abefore:
+        printk0("[nvme-aer] FAIL: abort_count did not advance\n")
+        return -1
+    printk1("[nvme-aer] PASS abort (abort_count=%d)\n", nvme.abort_count)
+
+    # (3) Timeout -> abort -> reset recovery. A zero spin budget makes the
+    # bounded poll return TIMEOUT immediately (the command is still really
+    # outstanding in the controller), and the force hook skips the
+    # post-abort recovery poll so the FULL escalation runs to a REAL
+    # controller disable->enable reset dance.
+    rbefore: uint64 = nvme.reset_count
+    nvme_force_reset_on_timeout = 1
+    st: uint32 = _admin_submit_to(NVME_ADMIN_IDENTIFY, 0, id_buf, 0,
+                                  NVME_CNS_CONTROLLER, 0, 0, 0, 0, 0,
+                                  cast[uint64](0))
+    nvme_force_reset_on_timeout = 0
+    # st is expected to be NVME_POLL_TIMEOUT (command discarded by reset);
+    # what matters is that a REAL reset happened and the controller is
+    # usable afterwards.
+    if nvme.reset_count <= rbefore:
+        printk0("[nvme-aer] FAIL: reset recovery never fired\n")
+        return -1
+    printk1("[nvme-aer] reset recovery fired (reset_count=%d)\n",
+            nvme.reset_count)
+
+    # Prove the controller is usable post-reset: a clean IDENTIFY...
+    if _nvme_identify_controller(id_buf) != 0:
+        printk0("[nvme-aer] FAIL: IDENTIFY after reset\n")
+        return -1
+    # ...and a real I/O read of LBA 0 through the recreated I/O queue.
+    rbuf: uint64 = alloc_pages(0)
+    if rbuf == 0:
+        printk0("[nvme-aer] FAIL: alloc_pages\n")
+        return -1
+    memset(cast[Ptr[uint8]](rbuf), 0, 4096)
+    if _nvme_read_lba(0, 1, rbuf) != 0:
+        printk0("[nvme-aer] FAIL: I/O read after reset\n")
+        free_pages(rbuf, 0)
+        return -1
+    free_pages(rbuf, 0)
+    printk1("[nvme-aer] PASS reset-recovery (reset_count=%d)\n",
+            nvme.reset_count)
+
+    printk0("[nvme-aer] PASS\n")
     return 0
 
 
