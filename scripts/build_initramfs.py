@@ -1157,6 +1157,18 @@ if os.environ.get("ENABLE_CAPS_TEST"):
 # boots omit the marker.
 if os.environ.get("ENABLE_PERF_TEST"):
     FILES.append(("/etc/perf-test", b"1\n"))
+
+# Kernel keyring round-trip self-test. scripts/test_keyring.sh sets
+# ENABLE_KEYRING_TEST=1 to plant /etc/keyring-test. init/main.ad at
+# boot:37.keyring detects the marker and calls keyring_selftest()
+# (linux_abi/u_keyring.ad): it add_keys a "user" key with a known payload,
+# KEYCTL_READs it back byte-for-byte, KEYCTL_UPDATEs and re-reads,
+# request_key/KEYCTL_SEARCH finds it (a bogus description -> ENOKEY),
+# LINK/UNLINKs across the per-user keyring, then KEYCTL_REVOKEs and asserts a
+# later READ returns EKEYREVOKED, emitting the [keyring] PASS banner. Default
+# boots omit the marker.
+if os.environ.get("ENABLE_KEYRING_TEST"):
+    FILES.append(("/etc/keyring-test", b"1\n"))
 # NUMA mempolicy round-trip self-test. scripts/test_mempolicy.sh sets
 # ENABLE_MEMPOLICY_TEST=1 to plant /etc/mempolicy-test. init/main.ad detects
 # the marker and calls mempolicy_selftest() (linux_abi/u_mempolicy.ad): it

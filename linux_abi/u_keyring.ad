@@ -1,0 +1,1081 @@
+# linux_abi/u_keyring.ad -- the Linux kernel keyring family.
+#
+# Real Linux userland reaches for the keyring API for credential/secret storage:
+#
+#   * add_key(type, desc, payload, plen, keyring)         nr 248 -> a key serial
+#   * request_key(type, desc, callout, keyring)           nr 249 -> a key serial
+#   * keyctl(cmd, arg2, arg3, arg4, arg5)                 nr 250 -> cmd-specific
+#
+# keyutils (`keyctl add/print/read/search/revoke`), libkeyutils, systemd's
+# credential plumbing, kerberos ticket caches, ecryptfs/fscrypt key management,
+# and NFS idmapper all round-trip these three syscalls. Until now all three fell
+# through to the ENOSYS default, so any such tool saw a bogus failure on its
+# very first probe.
+#
+# ARCHITECTURE NOTE -- the kernel keyring is a LINUX-ABI concept ONLY. Hamnix's
+# native secret/credential model is a separate Plan 9 concern (per-process
+# namespaces + file-server boundary, e.g. a factotum-shaped key server), NOT a
+# keyring syscall. So this file is pure Linux-ABI furniture: it models a real
+# per-process / per-user keyring store for tasks running under the Linux
+# namespace and never touches any native Plan 9 path. The store here gates no
+# native operation; it exists so keyutils' add/read/update/search/revoke
+# round-trip is faithful — the bar real Debian tooling needs.
+#
+# This is an HONEST implementation, NOT a stub that ignores its arguments:
+# payloads store and read back byte-for-byte, searches actually find/miss
+# correctly, a revoked key actually fails later reads with EKEYREVOKED, and a
+# too-long payload is actually rejected with EINVAL. Keys are identified by
+# Linux-style key SERIAL numbers (positive int32), NOT fds, so this leaf needs
+# NO fd marker.
+#
+# Layer note: a confined Layer-2 leaf, mirroring linux_abi/u_caps.ad and
+# linux_abi/u_mempolicy.ad. It calls only current_idx_get() (the task-slot key)
+# + the user-pointer-safe copy helpers (copy_from_user / copy_to_user /
+# strncpy_from_user). It never touches 9P / Chan / Layer-1 code. u_syscalls.ad
+# imports US (the nr 248/249/250 dispatch arms forward here), the same shape as
+# u_caps.ad.
+
+from kernel.sched.core import (
+    current_idx_get,
+)
+from mm.uaccess import (
+    copy_from_user, copy_to_user, strncpy_from_user,
+)
+from kernel.printk.printk import (
+    printk0, printk1,
+)
+
+
+# =====================================================================
+# Linux keyring ABI constants
+# =====================================================================
+#
+# Special keyring IDs (uapi/linux/keyctl.h). These are NEGATIVE pseudo-serials a
+# caller passes where a keyring serial is expected; we resolve them to the
+# task's real per-process / per-user keyring serial.
+KEY_SPEC_THREAD_KEYRING:       int32 = -1
+KEY_SPEC_PROCESS_KEYRING:      int32 = -2
+KEY_SPEC_SESSION_KEYRING:      int32 = -3
+KEY_SPEC_USER_KEYRING:         int32 = -4
+KEY_SPEC_USER_SESSION_KEYRING: int32 = -5
+
+# keyctl command numbers (the `cmd` first argument to keyctl(2)).
+KEYCTL_GET_KEYRING_ID: uint64 = 0
+KEYCTL_JOIN_SESSION:   uint64 = 1
+KEYCTL_UPDATE:         uint64 = 2
+KEYCTL_REVOKE:         uint64 = 3
+KEYCTL_CHOWN:          uint64 = 4
+KEYCTL_SETPERM:        uint64 = 5
+KEYCTL_DESCRIBE:       uint64 = 6
+KEYCTL_CLEAR:          uint64 = 7
+KEYCTL_LINK:           uint64 = 8
+KEYCTL_UNLINK:         uint64 = 9
+KEYCTL_SEARCH:         uint64 = 10
+KEYCTL_READ:           uint64 = 11
+
+# Linux negative-errno convention (subset we return).
+KEY_EPERM:        int64 = -1
+KEY_ENOENT:       int64 = -2
+KEY_EFAULT:       int64 = -14
+KEY_EINVAL:       int64 = -22
+KEY_ENOTDIR:      int64 = -20
+KEY_ENOKEY:       int64 = -126        # no matching key found (request_key/SEARCH)
+KEY_EKEYREVOKED:  int64 = -128        # operation on a revoked key
+
+# Bounds. A user key payload tops out at the Linux default (32k), but our store
+# caps it at a smaller honest bound (keyutils' common keys are tiny); anything
+# longer is rejected EINVAL exactly the way Linux rejects an over-quota payload.
+KEY_MAX_PAYLOAD: uint64 = 1024        # bytes
+KEY_MAX_TYPE:    uint64 = 32          # type-string buffer (incl NUL)
+KEY_MAX_DESC:    uint64 = 64          # description-string buffer (incl NUL)
+
+# Key type tags. We model two: "user" (carries a payload) and "keyring" (a
+# container that links other keys).
+KEY_TYPE_USER:    int32 = 0
+KEY_TYPE_KEYRING: int32 = 1
+
+
+# =====================================================================
+# the key store
+# =====================================================================
+#
+# A flat fixed-capacity table of key objects. Each key occupies parallel arrays
+# indexed by KEY SLOT (0..UKEY_MAX_KEYS-1). The public identity of a key is its
+# SERIAL (a monotonically increasing positive int32) — slots are an internal
+# detail. Serial 0 is never a valid key.
+#
+#   ukey_used     : 1 if this slot holds a live key object, 0 if free
+#   ukey_serial   : the key's serial (positive int32, unique)
+#   ukey_type     : KEY_TYPE_USER / KEY_TYPE_KEYRING
+#   ukey_uid      : owning uid (per-user keyring partitioning)
+#   ukey_revoked  : 1 once KEYCTL_REVOKE ran; later ops -> EKEYREVOKED
+#   ukey_desc     : the description string (NUL-terminated, KEY_MAX_DESC)
+#   ukey_payload  : the payload bytes (KEY_MAX_PAYLOAD)
+#   ukey_plen     : payload length in bytes
+#
+# Keyring membership (which keys a keyring links) is a boolean matrix
+# ukey_link[keyring_slot * UKEY_MAX_KEYS + member_slot].
+UKEY_MAX_KEYS: uint64 = 32
+
+ukey_used:    Array[32, uint8]
+ukey_serial:  Array[32, int32]
+ukey_type:    Array[32, int32]
+ukey_uid:     Array[32, int32]
+ukey_revoked: Array[32, uint8]
+ukey_desc:    Array[2048, uint8]      # 32 * KEY_MAX_DESC (64)
+ukey_payload: Array[32768, uint8]     # 32 * KEY_MAX_PAYLOAD (1024)
+ukey_plen:    Array[32, uint64]
+
+# Membership matrix: keyring_slot -> member_slot linkage.
+ukey_link:    Array[1024, uint8]      # 32 * 32
+
+# Per-task special keyrings (resolved from KEY_SPEC_*). Keyed by task slot.
+# A value of 0 means "not yet created" — created lazily on first use.
+UKEY_NTASKS: uint64 = 16
+ukey_proc_ring: Array[16, int32]      # per-process keyring serial per task slot
+ukey_user_ring: Array[16, int32]      # per-user keyring serial per task slot
+
+# Monotonic serial allocator. Linux key serials are positive; start at 0x100
+# (256) so they look like real kernel serials rather than tiny indices.
+ukey_next_serial: int32 = 0x100
+
+
+def ukey_init():
+    # Boot-time reset: drop every key, clear every link, forget every task's
+    # special keyrings, and re-seed the serial allocator.
+    i: uint64 = 0
+    while i < UKEY_MAX_KEYS:
+        ukey_used[i]    = 0
+        ukey_serial[i]  = 0
+        ukey_type[i]    = KEY_TYPE_USER
+        ukey_uid[i]     = 0
+        ukey_revoked[i] = 0
+        ukey_plen[i]    = 0
+        i = i + 1
+    j: uint64 = 0
+    while j < 1024:
+        ukey_link[j] = 0
+        j = j + 1
+    t: uint64 = 0
+    while t < UKEY_NTASKS:
+        ukey_proc_ring[t] = 0
+        ukey_user_ring[t] = 0
+        t = t + 1
+    ukey_next_serial = 0x100
+
+
+# --- low-level slot helpers ----------------------------------------
+
+def _ukey_desc_ptr(slot: uint64) -> uint64:
+    return cast[uint64](&ukey_desc[slot * KEY_MAX_DESC])
+
+
+def _ukey_payload_ptr(slot: uint64) -> uint64:
+    return cast[uint64](&ukey_payload[slot * KEY_MAX_PAYLOAD])
+
+
+def _ukey_find_free_slot() -> int64:
+    # Return a free key slot, or -1 if the table is full.
+    i: uint64 = 0
+    while i < UKEY_MAX_KEYS:
+        if ukey_used[i] == 0:
+            return cast[int64](i)
+        i = i + 1
+    return -1
+
+
+def _ukey_slot_for_serial(serial: int32) -> int64:
+    # Resolve a positive key serial to its slot index, or -1 if no live key has
+    # that serial. Serial 0 / negative is never a real key.
+    if serial <= 0:
+        return -1
+    i: uint64 = 0
+    while i < UKEY_MAX_KEYS:
+        if ukey_used[i] != 0 and ukey_serial[i] == serial:
+            return cast[int64](i)
+        i = i + 1
+    return -1
+
+
+def _ukey_alloc_serial() -> int32:
+    s: int32 = ukey_next_serial
+    ukey_next_serial = ukey_next_serial + 1
+    return s
+
+
+# --- string compare against the stored NUL-terminated buffers -------
+
+def _ukey_streq(kbuf: uint64, other: uint64, maxlen: uint64) -> int32:
+    # 1 iff the two NUL-terminated byte buffers are equal (up to maxlen).
+    a: Ptr[uint8] = cast[Ptr[uint8]](kbuf)
+    b: Ptr[uint8] = cast[Ptr[uint8]](other)
+    i: uint64 = 0
+    while i < maxlen:
+        if a[i] != b[i]:
+            return 0
+        if a[i] == 0:
+            return 1
+        i = i + 1
+    return 1
+
+
+def _ukey_store_str(kbuf: uint64, src: uint64, maxlen: uint64):
+    # Copy a NUL-terminated string from kernel buffer `src` into `kbuf`,
+    # bounded by maxlen (always NUL-terminated).
+    d: Ptr[uint8] = cast[Ptr[uint8]](kbuf)
+    s: Ptr[uint8] = cast[Ptr[uint8]](src)
+    i: uint64 = 0
+    while i < maxlen - 1:
+        b: uint8 = s[i]
+        d[i] = b
+        if b == 0:
+            return
+        i = i + 1
+    d[maxlen - 1] = 0
+
+
+def _ukey_strlen(kbuf: uint64, maxlen: uint64) -> uint64:
+    p: Ptr[uint8] = cast[Ptr[uint8]](kbuf)
+    i: uint64 = 0
+    while i < maxlen:
+        if p[i] == 0:
+            return i
+        i = i + 1
+    return maxlen
+
+
+# --- type-string parsing -------------------------------------------
+
+def _ukey_type_from_str(kbuf: uint64) -> int32:
+    # Map a NUL-terminated type string to a KEY_TYPE_* tag, or -1 if unknown.
+    # We honour "user" and "keyring".
+    user_lit: Ptr[uint8] = "user"
+    ring_lit: Ptr[uint8] = "keyring"
+    if _ukey_streq(kbuf, cast[uint64](user_lit), KEY_MAX_TYPE) != 0:
+        return KEY_TYPE_USER
+    if _ukey_streq(kbuf, cast[uint64](ring_lit), KEY_MAX_TYPE) != 0:
+        return KEY_TYPE_KEYRING
+    return -1
+
+
+# =====================================================================
+# keyring membership
+# =====================================================================
+
+def _ukey_link_set(ring_slot: uint64, member_slot: uint64):
+    ukey_link[ring_slot * UKEY_MAX_KEYS + member_slot] = 1
+
+
+def _ukey_link_clear(ring_slot: uint64, member_slot: uint64):
+    ukey_link[ring_slot * UKEY_MAX_KEYS + member_slot] = 0
+
+
+def _ukey_is_linked(ring_slot: uint64, member_slot: uint64) -> int32:
+    if ukey_link[ring_slot * UKEY_MAX_KEYS + member_slot] != 0:
+        return 1
+    return 0
+
+
+# =====================================================================
+# special-keyring resolution
+# =====================================================================
+#
+# A keyring object is just a key of type KEY_TYPE_KEYRING. Create one for the
+# task's per-process / per-user keyring lazily on first use. We use the task
+# slot as a stand-in uid (Hamnix's Linux-namespace tasks are modelled per-slot).
+
+def _ukey_make_keyring(uid: int32, desc_lit: uint64) -> int32:
+    slot64: int64 = _ukey_find_free_slot()
+    if slot64 < 0:
+        return -1
+    slot: uint64 = cast[uint64](slot64)
+    serial: int32 = _ukey_alloc_serial()
+    ukey_used[slot]    = 1
+    ukey_serial[slot]  = serial
+    ukey_type[slot]    = KEY_TYPE_KEYRING
+    ukey_uid[slot]     = uid
+    ukey_revoked[slot] = 0
+    ukey_plen[slot]    = 0
+    _ukey_store_str(_ukey_desc_ptr(slot), desc_lit, KEY_MAX_DESC)
+    return serial
+
+
+def _ukey_proc_keyring(task_slot: uint64) -> int32:
+    # Resolve (creating if needed) the per-process keyring for a task.
+    if task_slot >= UKEY_NTASKS:
+        return -1
+    if ukey_proc_ring[task_slot] != 0:
+        # Confirm it still exists (boot reset could have cleared it).
+        if _ukey_slot_for_serial(ukey_proc_ring[task_slot]) >= 0:
+            return ukey_proc_ring[task_slot]
+    lit: Ptr[uint8] = "_pid"
+    s: int32 = _ukey_make_keyring(cast[int32](task_slot), cast[uint64](lit))
+    if s < 0:
+        return -1
+    ukey_proc_ring[task_slot] = s
+    return s
+
+
+def _ukey_user_keyring(task_slot: uint64) -> int32:
+    # Resolve (creating if needed) the per-user keyring for a task.
+    if task_slot >= UKEY_NTASKS:
+        return -1
+    if ukey_user_ring[task_slot] != 0:
+        if _ukey_slot_for_serial(ukey_user_ring[task_slot]) >= 0:
+            return ukey_user_ring[task_slot]
+    lit: Ptr[uint8] = "_uid"
+    s: int32 = _ukey_make_keyring(cast[int32](task_slot), cast[uint64](lit))
+    if s < 0:
+        return -1
+    ukey_user_ring[task_slot] = s
+    return s
+
+
+def _ukey_resolve_keyring(task_slot: uint64, kr: int32) -> int32:
+    # Resolve a keyring argument (special id or real serial) to a real keyring
+    # serial. Returns the serial, or 0 if it cannot be resolved.
+    if kr == KEY_SPEC_PROCESS_KEYRING:
+        return _ukey_proc_keyring(task_slot)
+    if kr == KEY_SPEC_THREAD_KEYRING:
+        return _ukey_proc_keyring(task_slot)
+    if kr == KEY_SPEC_SESSION_KEYRING:
+        return _ukey_proc_keyring(task_slot)
+    if kr == KEY_SPEC_USER_KEYRING:
+        return _ukey_user_keyring(task_slot)
+    if kr == KEY_SPEC_USER_SESSION_KEYRING:
+        return _ukey_user_keyring(task_slot)
+    # A real serial: it must name a live keyring-type key.
+    sl: int64 = _ukey_slot_for_serial(kr)
+    if sl < 0:
+        return 0
+    if ukey_type[cast[uint64](sl)] != KEY_TYPE_KEYRING:
+        return 0
+    return kr
+
+
+# =====================================================================
+# add_key(type, description, payload, plen, keyring)  --  nr 248
+# =====================================================================
+#
+# key_serial_t add_key(const char *type, const char *description,
+#                      const void *payload, size_t plen, key_serial_t keyring)
+#   a0 = type*, a1 = description*, a2 = payload*, a3 = plen, a4 = keyring.
+#
+#   * type / description NULL                 -> EFAULT.
+#   * unknown type                            -> EINVAL (we model user/keyring).
+#   * plen > KEY_MAX_PAYLOAD                   -> EINVAL (over-quota payload).
+#   * keyring cannot be resolved              -> ENOKEY.
+#   * if a key of the same type+description already exists in the target keyring
+#     -> UPDATE it in place (replace payload) and return its existing serial
+#     (matches Linux: add_key updates an existing matching key).
+#   * otherwise create a new key, link it into the target keyring, return its
+#     new serial.
+def ukey_add_key(a0: uint64, a1: uint64, a2: uint64,
+                 a3: uint64, a4: uint64) -> int64:
+    if a0 == 0 or a1 == 0:
+        return KEY_EFAULT
+    plen: uint64 = a3
+    if plen > KEY_MAX_PAYLOAD:
+        return KEY_EINVAL
+    keyring_arg: int32 = cast[int32](a4)
+
+    task_slot: uint64 = current_idx_get()
+
+    # Pull the type + description strings into kernel buffers (validated copies).
+    tbuf: Array[32, uint8]
+    if strncpy_from_user(cast[uint64](&tbuf[0]), a0, KEY_MAX_TYPE) < 0:
+        return KEY_EFAULT
+    ktype: int32 = _ukey_type_from_str(cast[uint64](&tbuf[0]))
+    if ktype < 0:
+        return KEY_EINVAL
+
+    dbuf: Array[64, uint8]
+    if strncpy_from_user(cast[uint64](&dbuf[0]), a1, KEY_MAX_DESC) < 0:
+        return KEY_EFAULT
+
+    # Resolve the destination keyring (special id or real serial).
+    ring_serial: int32 = _ukey_resolve_keyring(task_slot, keyring_arg)
+    if ring_serial == 0:
+        return KEY_ENOKEY
+    ring_slot: int64 = _ukey_slot_for_serial(ring_serial)
+    if ring_slot < 0:
+        return KEY_ENOKEY
+
+    # Pull the payload into a kernel staging buffer first (so a bad pointer
+    # fails before we mutate the store).
+    pbuf: Array[1024, uint8]
+    if plen > 0:
+        if a2 == 0:
+            return KEY_EFAULT
+        if copy_from_user(cast[uint64](&pbuf[0]), a2, plen) != 0:
+            return KEY_EFAULT
+
+    # If a key of the same type+description is already linked in the target
+    # keyring, UPDATE it in place (Linux add_key semantics).
+    existing: int64 = _ukey_search_in_ring(cast[uint64](ring_slot), ktype,
+                                           cast[uint64](&dbuf[0]))
+    if existing >= 0:
+        es: uint64 = cast[uint64](existing)
+        if ukey_revoked[es] != 0:
+            return KEY_EKEYREVOKED
+        # Replace the payload byte-for-byte.
+        _ukey_copy_payload_in(es, cast[uint64](&pbuf[0]), plen)
+        return cast[int64](ukey_serial[es])
+
+    # Create a brand-new key.
+    slot64: int64 = _ukey_find_free_slot()
+    if slot64 < 0:
+        return KEY_EINVAL                 # table full (ENOMEM-shaped; honest)
+    slot: uint64 = cast[uint64](slot64)
+    serial: int32 = _ukey_alloc_serial()
+    ukey_used[slot]    = 1
+    ukey_serial[slot]  = serial
+    ukey_type[slot]    = ktype
+    ukey_uid[slot]     = cast[int32](task_slot)
+    ukey_revoked[slot] = 0
+    _ukey_store_str(_ukey_desc_ptr(slot), cast[uint64](&dbuf[0]), KEY_MAX_DESC)
+    _ukey_copy_payload_in(slot, cast[uint64](&pbuf[0]), plen)
+    # Link it into the destination keyring.
+    _ukey_link_set(cast[uint64](ring_slot), slot)
+    return cast[int64](serial)
+
+
+def _ukey_copy_payload_in(slot: uint64, src: uint64, plen: uint64):
+    # Copy `plen` bytes from kernel buffer `src` into the key's payload store.
+    dst: uint64 = _ukey_payload_ptr(slot)
+    dp: Ptr[uint8] = cast[Ptr[uint8]](dst)
+    sp: Ptr[uint8] = cast[Ptr[uint8]](src)
+    i: uint64 = 0
+    while i < plen:
+        dp[i] = sp[i]
+        i = i + 1
+    ukey_plen[slot] = plen
+
+
+def _ukey_search_in_ring(ring_slot: uint64, ktype: int32,
+                         desc_kbuf: uint64) -> int64:
+    # Find a live, linked key of (ktype, desc) in the given keyring. Returns the
+    # member key's SLOT, or -1 if not found. (Search ignores revoked keys.)
+    m: uint64 = 0
+    while m < UKEY_MAX_KEYS:
+        if _ukey_is_linked(ring_slot, m) != 0:
+            if ukey_used[m] != 0 and ukey_revoked[m] == 0:
+                if ukey_type[m] == ktype:
+                    if _ukey_streq(_ukey_desc_ptr(m), desc_kbuf,
+                                   KEY_MAX_DESC) != 0:
+                        return cast[int64](m)
+        m = m + 1
+    return -1
+
+
+# =====================================================================
+# request_key(type, description, callout_info, keyring)  --  nr 249
+# =====================================================================
+#
+# key_serial_t request_key(const char *type, const char *description,
+#                          const char *callout_info, key_serial_t keyring)
+#   a0 = type*, a1 = description*, a2 = callout_info*, a3 = keyring.
+#
+# Searches the process keyring then the user keyring for a key of (type,
+# description). Returns its serial, or ENOKEY if not found. (We do NOT run the
+# /sbin/request-key upcall: callout_info is accepted but no helper is invoked,
+# which is the correct behaviour when no key is found and no upcall is
+# configured — the caller gets ENOKEY.)
+def ukey_request_key(a0: uint64, a1: uint64, a2: uint64,
+                     a3: uint64) -> int64:
+    if a0 == 0 or a1 == 0:
+        return KEY_EFAULT
+    task_slot: uint64 = current_idx_get()
+
+    tbuf: Array[32, uint8]
+    if strncpy_from_user(cast[uint64](&tbuf[0]), a0, KEY_MAX_TYPE) < 0:
+        return KEY_EFAULT
+    ktype: int32 = _ukey_type_from_str(cast[uint64](&tbuf[0]))
+    if ktype < 0:
+        return KEY_EINVAL
+
+    dbuf: Array[64, uint8]
+    if strncpy_from_user(cast[uint64](&dbuf[0]), a1, KEY_MAX_DESC) < 0:
+        return KEY_EFAULT
+
+    found: int64 = _ukey_search_all_rings(task_slot, ktype,
+                                          cast[uint64](&dbuf[0]))
+    if found < 0:
+        return KEY_ENOKEY
+    return cast[int64](ukey_serial[cast[uint64](found)])
+
+
+def _ukey_search_all_rings(task_slot: uint64, ktype: int32,
+                           desc_kbuf: uint64) -> int64:
+    # Search the process keyring then the user keyring. Returns the member
+    # SLOT, or -1 on a miss.
+    proc_serial: int32 = _ukey_proc_keyring(task_slot)
+    if proc_serial != 0:
+        ps: int64 = _ukey_slot_for_serial(proc_serial)
+        if ps >= 0:
+            hit: int64 = _ukey_search_in_ring(cast[uint64](ps), ktype,
+                                              desc_kbuf)
+            if hit >= 0:
+                return hit
+    user_serial: int32 = _ukey_user_keyring(task_slot)
+    if user_serial != 0:
+        us: int64 = _ukey_slot_for_serial(user_serial)
+        if us >= 0:
+            hit2: int64 = _ukey_search_in_ring(cast[uint64](us), ktype,
+                                               desc_kbuf)
+            if hit2 >= 0:
+                return hit2
+    return -1
+
+
+# =====================================================================
+# keyctl(cmd, arg2, arg3, arg4, arg5)  --  nr 250
+# =====================================================================
+#
+# long keyctl(int cmd, ...)
+#   a0 = cmd, a1..a4 = arg2..arg5 (cmd-specific).
+#
+# Supported commands operate against REAL key state:
+#   KEYCTL_READ           (arg2=keyid, arg3=buf, arg4=buflen)
+#   KEYCTL_UPDATE         (arg2=keyid, arg3=payload, arg4=plen)
+#   KEYCTL_REVOKE         (arg2=keyid)
+#   KEYCTL_SEARCH         (arg2=keyring, arg3=type, arg4=desc, arg5=dest_ring)
+#   KEYCTL_DESCRIBE       (arg2=keyid, arg3=buf, arg4=buflen)
+#   KEYCTL_LINK           (arg2=keyid, arg3=keyring)
+#   KEYCTL_UNLINK         (arg2=keyid, arg3=keyring)
+#   KEYCTL_CLEAR          (arg2=keyring)
+#   KEYCTL_GET_KEYRING_ID (arg2=special_id, arg3=create) -> real serial
+def ukey_keyctl(a0: uint64, a1: uint64, a2: uint64,
+                a3: uint64, a4: uint64) -> int64:
+    cmd: uint64 = a0
+    if cmd == KEYCTL_GET_KEYRING_ID:
+        return _ukey_get_keyring_id(a1)
+    if cmd == KEYCTL_READ:
+        return _ukey_keyctl_read(a1, a2, a3)
+    if cmd == KEYCTL_UPDATE:
+        return _ukey_keyctl_update(a1, a2, a3)
+    if cmd == KEYCTL_REVOKE:
+        return _ukey_keyctl_revoke(a1)
+    if cmd == KEYCTL_SEARCH:
+        return _ukey_keyctl_search(a1, a2, a3, a4)
+    if cmd == KEYCTL_DESCRIBE:
+        return _ukey_keyctl_describe(a1, a2, a3)
+    if cmd == KEYCTL_LINK:
+        return _ukey_keyctl_link(a1, a2)
+    if cmd == KEYCTL_UNLINK:
+        return _ukey_keyctl_unlink(a1, a2)
+    if cmd == KEYCTL_CLEAR:
+        return _ukey_keyctl_clear(a1)
+    # Commands we accept syntactically but model as no-ops returning success
+    # (CHOWN/SETPERM on a single-user model) or that fall through to EINVAL.
+    if cmd == KEYCTL_CHOWN:
+        return 0
+    if cmd == KEYCTL_SETPERM:
+        return 0
+    return KEY_EINVAL
+
+
+def _ukey_get_keyring_id(special: uint64) -> int64:
+    # Resolve a special keyring id to its real serial, creating it on demand.
+    task_slot: uint64 = current_idx_get()
+    sid: int32 = cast[int32](special)
+    serial: int32 = _ukey_resolve_keyring(task_slot, sid)
+    if serial == 0:
+        return KEY_ENOKEY
+    return cast[int64](serial)
+
+
+def _ukey_keyctl_read(keyid: uint64, ubuf: uint64, buflen: uint64) -> int64:
+    # KEYCTL_READ: copy the key's payload out to `ubuf` (up to buflen bytes).
+    # Returns the FULL payload length (even if it exceeds buflen — Linux returns
+    # the true size so the caller can grow its buffer), or an errno.
+    serial: int32 = cast[int32](keyid)
+    sl: int64 = _ukey_slot_for_serial(serial)
+    if sl < 0:
+        return KEY_ENOKEY
+    slot: uint64 = cast[uint64](sl)
+    if ukey_revoked[slot] != 0:
+        return KEY_EKEYREVOKED
+    plen: uint64 = ukey_plen[slot]
+    # buflen == 0 (or NULL buf): just report the size.
+    if ubuf == 0 or buflen == 0:
+        return cast[int64](plen)
+    n: uint64 = plen
+    if n > buflen:
+        n = buflen
+    if n > 0:
+        if copy_to_user(ubuf, _ukey_payload_ptr(slot), n) != 0:
+            return KEY_EFAULT
+    return cast[int64](plen)
+
+
+def _ukey_keyctl_update(keyid: uint64, upayload: uint64, plen: uint64) -> int64:
+    # KEYCTL_UPDATE: replace the key's payload with `plen` bytes from upayload.
+    serial: int32 = cast[int32](keyid)
+    sl: int64 = _ukey_slot_for_serial(serial)
+    if sl < 0:
+        return KEY_ENOKEY
+    slot: uint64 = cast[uint64](sl)
+    if ukey_revoked[slot] != 0:
+        return KEY_EKEYREVOKED
+    if plen > KEY_MAX_PAYLOAD:
+        return KEY_EINVAL
+    pbuf: Array[1024, uint8]
+    if plen > 0:
+        if upayload == 0:
+            return KEY_EFAULT
+        if copy_from_user(cast[uint64](&pbuf[0]), upayload, plen) != 0:
+            return KEY_EFAULT
+    _ukey_copy_payload_in(slot, cast[uint64](&pbuf[0]), plen)
+    return 0
+
+
+def _ukey_keyctl_revoke(keyid: uint64) -> int64:
+    # KEYCTL_REVOKE: mark the key revoked; later READ/UPDATE -> EKEYREVOKED.
+    serial: int32 = cast[int32](keyid)
+    sl: int64 = _ukey_slot_for_serial(serial)
+    if sl < 0:
+        return KEY_ENOKEY
+    slot: uint64 = cast[uint64](sl)
+    if ukey_revoked[slot] != 0:
+        return KEY_EKEYREVOKED            # already revoked
+    ukey_revoked[slot] = 1
+    return 0
+
+
+def _ukey_keyctl_search(keyring: uint64, utype: uint64, udesc: uint64,
+                        dest_ring: uint64) -> int64:
+    # KEYCTL_SEARCH: search `keyring` for a key of (type, desc). On a hit,
+    # optionally link it into dest_ring (if non-zero). Returns the serial or
+    # ENOKEY.
+    task_slot: uint64 = current_idx_get()
+    ring_serial: int32 = _ukey_resolve_keyring(task_slot, cast[int32](keyring))
+    if ring_serial == 0:
+        return KEY_ENOKEY
+    ring_slot: int64 = _ukey_slot_for_serial(ring_serial)
+    if ring_slot < 0:
+        return KEY_ENOKEY
+
+    tbuf: Array[32, uint8]
+    if utype == 0:
+        return KEY_EFAULT
+    if strncpy_from_user(cast[uint64](&tbuf[0]), utype, KEY_MAX_TYPE) < 0:
+        return KEY_EFAULT
+    ktype: int32 = _ukey_type_from_str(cast[uint64](&tbuf[0]))
+    if ktype < 0:
+        return KEY_EINVAL
+
+    dbuf: Array[64, uint8]
+    if udesc == 0:
+        return KEY_EFAULT
+    if strncpy_from_user(cast[uint64](&dbuf[0]), udesc, KEY_MAX_DESC) < 0:
+        return KEY_EFAULT
+
+    hit: int64 = _ukey_search_in_ring(cast[uint64](ring_slot), ktype,
+                                      cast[uint64](&dbuf[0]))
+    if hit < 0:
+        return KEY_ENOKEY
+    hit_slot: uint64 = cast[uint64](hit)
+
+    # Optionally link the found key into a destination keyring.
+    dest: int32 = cast[int32](dest_ring)
+    if dest != 0:
+        dest_serial: int32 = _ukey_resolve_keyring(task_slot, dest)
+        if dest_serial != 0:
+            ds: int64 = _ukey_slot_for_serial(dest_serial)
+            if ds >= 0:
+                _ukey_link_set(cast[uint64](ds), hit_slot)
+    return cast[int64](ukey_serial[hit_slot])
+
+
+def _ukey_keyctl_describe(keyid: uint64, ubuf: uint64, buflen: uint64) -> int64:
+    # KEYCTL_DESCRIBE: write a "type;uid;gid;perm;description" string out. We
+    # emit "<type>;<uid>;0;3f010000;<desc>". Returns the full description length.
+    serial: int32 = cast[int32](keyid)
+    sl: int64 = _ukey_slot_for_serial(serial)
+    if sl < 0:
+        return KEY_ENOKEY
+    slot: uint64 = cast[uint64](sl)
+    # Build the description in a kernel buffer.
+    out: Array[160, uint8]
+    pos: uint64 = 0
+    # type
+    if ukey_type[slot] == KEY_TYPE_KEYRING:
+        pos = _ukey_append_lit(cast[uint64](&out[0]), pos, "keyring")
+    else:
+        pos = _ukey_append_lit(cast[uint64](&out[0]), pos, "user")
+    pos = _ukey_append_lit(cast[uint64](&out[0]), pos, ";")
+    pos = _ukey_append_int(cast[uint64](&out[0]), pos, cast[uint64](ukey_uid[slot]))
+    pos = _ukey_append_lit(cast[uint64](&out[0]), pos, ";0;3f010000;")
+    pos = _ukey_append_str(cast[uint64](&out[0]), pos, _ukey_desc_ptr(slot),
+                           KEY_MAX_DESC)
+    # NUL-terminate.
+    cast[Ptr[uint8]](cast[uint64](&out[0]) + pos)[0] = 0
+    total: uint64 = pos + 1               # include the NUL in the count
+    if ubuf == 0 or buflen == 0:
+        return cast[int64](total)
+    n: uint64 = total
+    if n > buflen:
+        n = buflen
+    if copy_to_user(ubuf, cast[uint64](&out[0]), n) != 0:
+        return KEY_EFAULT
+    return cast[int64](total)
+
+
+def _ukey_append_lit(buf: uint64, pos: uint64, lit: Ptr[char]) -> uint64:
+    d: Ptr[uint8] = cast[Ptr[uint8]](buf)
+    s: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](lit))
+    i: uint64 = 0
+    p: uint64 = pos
+    while s[i] != 0:
+        d[p] = s[i]
+        p = p + 1
+        i = i + 1
+    return p
+
+
+def _ukey_append_str(buf: uint64, pos: uint64, src: uint64,
+                     maxlen: uint64) -> uint64:
+    d: Ptr[uint8] = cast[Ptr[uint8]](buf)
+    s: Ptr[uint8] = cast[Ptr[uint8]](src)
+    i: uint64 = 0
+    p: uint64 = pos
+    while i < maxlen:
+        if s[i] == 0:
+            return p
+        d[p] = s[i]
+        p = p + 1
+        i = i + 1
+    return p
+
+
+def _ukey_append_int(buf: uint64, pos: uint64, val: uint64) -> uint64:
+    # Append the decimal representation of `val`.
+    d: Ptr[uint8] = cast[Ptr[uint8]](buf)
+    if val == 0:
+        d[pos] = cast[uint8](48)          # '0'
+        return pos + 1
+    # Render digits into a small scratch, then reverse them in.
+    tmp: Array[24, uint8]
+    n: uint64 = val
+    cnt: uint64 = 0
+    while n > 0:
+        tmp[cnt] = cast[uint8](48 + (n % 10))
+        n = n / 10
+        cnt = cnt + 1
+    p: uint64 = pos
+    k: uint64 = cnt
+    while k > 0:
+        d[p] = tmp[k - 1]
+        p = p + 1
+        k = k - 1
+    return p
+
+
+def _ukey_keyctl_link(keyid: uint64, keyring: uint64) -> int64:
+    # KEYCTL_LINK: link an existing key into a keyring.
+    task_slot: uint64 = current_idx_get()
+    serial: int32 = cast[int32](keyid)
+    sl: int64 = _ukey_slot_for_serial(serial)
+    if sl < 0:
+        return KEY_ENOKEY
+    ring_serial: int32 = _ukey_resolve_keyring(task_slot, cast[int32](keyring))
+    if ring_serial == 0:
+        return KEY_ENOKEY
+    ring_slot: int64 = _ukey_slot_for_serial(ring_serial)
+    if ring_slot < 0:
+        return KEY_ENOKEY
+    if ukey_type[cast[uint64](ring_slot)] != KEY_TYPE_KEYRING:
+        return KEY_ENOTDIR
+    _ukey_link_set(cast[uint64](ring_slot), cast[uint64](sl))
+    return 0
+
+
+def _ukey_keyctl_unlink(keyid: uint64, keyring: uint64) -> int64:
+    # KEYCTL_UNLINK: remove a key's link from a keyring.
+    task_slot: uint64 = current_idx_get()
+    serial: int32 = cast[int32](keyid)
+    sl: int64 = _ukey_slot_for_serial(serial)
+    if sl < 0:
+        return KEY_ENOKEY
+    ring_serial: int32 = _ukey_resolve_keyring(task_slot, cast[int32](keyring))
+    if ring_serial == 0:
+        return KEY_ENOKEY
+    ring_slot: int64 = _ukey_slot_for_serial(ring_serial)
+    if ring_slot < 0:
+        return KEY_ENOKEY
+    if _ukey_is_linked(cast[uint64](ring_slot), cast[uint64](sl)) == 0:
+        return KEY_ENOENT                 # not linked here
+    _ukey_link_clear(cast[uint64](ring_slot), cast[uint64](sl))
+    return 0
+
+
+def _ukey_keyctl_clear(keyring: uint64) -> int64:
+    # KEYCTL_CLEAR: unlink every member of a keyring (the keyring survives).
+    task_slot: uint64 = current_idx_get()
+    ring_serial: int32 = _ukey_resolve_keyring(task_slot, cast[int32](keyring))
+    if ring_serial == 0:
+        return KEY_ENOKEY
+    ring_slot: int64 = _ukey_slot_for_serial(ring_serial)
+    if ring_slot < 0:
+        return KEY_ENOKEY
+    rs: uint64 = cast[uint64](ring_slot)
+    m: uint64 = 0
+    while m < UKEY_MAX_KEYS:
+        _ukey_link_clear(rs, m)
+        m = m + 1
+    return 0
+
+
+# =====================================================================
+# Boot self-test  --  [KEYRING] PASS / FAIL  (boot:37.keyring)
+# =====================================================================
+#
+# Exercises add_key / request_key / keyctl directly against the real key store,
+# driving the SAME handler entry points the nr 248/249/250 dispatch arms call.
+# Boot-context pointers are kernel-mapped and resolve through copy_from_user /
+# copy_to_user / strncpy_from_user the same way caps_selftest's stack buffers
+# do, so no userland binary is needed. Steps (mirroring the required fixture
+# assertions):
+#
+#   (1) add_key("user", "test:key", PAYLOAD1) -> a serial; KEYCTL_READ reads it
+#       back BYTE-EXACT.
+#   (2) KEYCTL_UPDATE to PAYLOAD2; re-READ asserts the NEW payload byte-exact.
+#   (3) request_key("user", "test:key") finds it (same serial); a bogus desc
+#       returns ENOKEY; KEYCTL_SEARCH likewise finds/misses.
+#   (4) KEYCTL_REVOKE then READ returns EKEYREVOKED.
+#   plus error paths: a too-long payload -> EINVAL; an unknown type -> EINVAL;
+#   LINK/UNLINK/DESCRIBE/CLEAR against real state.
+#
+# keyring_selftest is the entry init/main.ad's boot:37.keyring gate calls. It
+# returns 1 on success, 0 on any failure (matching caps_selftest's convention).
+
+# Test payloads. Distinct contents so a byte-exact mismatch is caught.
+ukey_test_p1: Array[16, uint8]
+ukey_test_p2: Array[16, uint8]
+ukey_test_rd: Array[64, uint8]
+
+
+def _ukey_fill_payloads():
+    # PAYLOAD1 = bytes 0xA0..0xAF ; PAYLOAD2 = bytes 0x10,0x11.. (different len).
+    i: uint64 = 0
+    while i < 16:
+        ukey_test_p1[i] = cast[uint8](0xA0 + i)
+        i = i + 1
+    j: uint64 = 0
+    while j < 16:
+        ukey_test_p2[j] = cast[uint8](0x10 + j)
+        j = j + 1
+
+
+def _ukey_bytes_eq(a: uint64, b: uint64, n: uint64) -> int32:
+    pa: Ptr[uint8] = cast[Ptr[uint8]](a)
+    pb: Ptr[uint8] = cast[Ptr[uint8]](b)
+    i: uint64 = 0
+    while i < n:
+        if pa[i] != pb[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def keyring_selftest() -> int32:
+    ukey_init()
+    _ukey_fill_payloads()
+
+    # Kernel-mapped "user" string buffers (act as user pointers in boot ctx).
+    type_user: Ptr[uint8] = "user"
+    desc_key:  Ptr[uint8] = "test:key"
+    desc_bad:  Ptr[uint8] = "no:such:key"
+    type_bad:  Ptr[uint8] = "asymmetric"
+
+    # --- (1) add_key + READ byte-exact -------------------------------
+    rc: int64 = ukey_add_key(cast[uint64](type_user), cast[uint64](desc_key),
+                             cast[uint64](&ukey_test_p1[0]), 16,
+                             cast[uint64](cast[int64](KEY_SPEC_PROCESS_KEYRING)))
+    if rc <= 0:
+        printk1("[KEYRING] FAIL add_key rc=%d\n", cast[uint64](rc))
+        return 0
+    serial: int32 = cast[int32](rc)
+    printk1("[KEYRING] PASS add_key user/test:key -> serial %d\n",
+            cast[uint64](cast[int64](serial)))
+
+    rdn: int64 = _ukey_keyctl_read(cast[uint64](cast[int64](serial)),
+                                   cast[uint64](&ukey_test_rd[0]), 64)
+    if rdn != 16:
+        printk1("[KEYRING] FAIL READ len=%d != 16\n", cast[uint64](rdn))
+        return 0
+    if _ukey_bytes_eq(cast[uint64](&ukey_test_rd[0]),
+                      cast[uint64](&ukey_test_p1[0]), 16) == 0:
+        printk0("[KEYRING] FAIL READ payload not byte-exact (P1)\n")
+        return 0
+    printk0("[KEYRING] PASS READ returned payload1 byte-exact\n")
+
+    # --- (2) UPDATE then re-READ byte-exact --------------------------
+    urc: int64 = _ukey_keyctl_update(cast[uint64](cast[int64](serial)),
+                                     cast[uint64](&ukey_test_p2[0]), 16)
+    if urc != 0:
+        printk1("[KEYRING] FAIL UPDATE rc=%d\n", cast[uint64](urc))
+        return 0
+    rdn = _ukey_keyctl_read(cast[uint64](cast[int64](serial)),
+                            cast[uint64](&ukey_test_rd[0]), 64)
+    if rdn != 16:
+        printk1("[KEYRING] FAIL READ-after-update len=%d\n", cast[uint64](rdn))
+        return 0
+    if _ukey_bytes_eq(cast[uint64](&ukey_test_rd[0]),
+                      cast[uint64](&ukey_test_p2[0]), 16) == 0:
+        printk0("[KEYRING] FAIL READ payload not byte-exact (P2)\n")
+        return 0
+    printk0("[KEYRING] PASS UPDATE + re-READ returns payload2 byte-exact\n")
+
+    # --- (2b) add_key with the SAME type+desc UPDATES in place -------
+    # Re-add with payload1: must return the SAME serial (update, not a new key).
+    rc2: int64 = ukey_add_key(cast[uint64](type_user), cast[uint64](desc_key),
+                              cast[uint64](&ukey_test_p1[0]), 16,
+                              cast[uint64](cast[int64](KEY_SPEC_PROCESS_KEYRING)))
+    if rc2 != cast[int64](serial):
+        printk1("[KEYRING] FAIL re-add gave new serial %d (want update)\n",
+                cast[uint64](rc2))
+        return 0
+    printk0("[KEYRING] PASS re-add same type+desc updates existing key\n")
+
+    # --- (3) request_key finds it; bogus desc -> ENOKEY --------------
+    frc: int64 = ukey_request_key(cast[uint64](type_user),
+                                  cast[uint64](desc_key), 0,
+                                  cast[uint64](cast[int64](KEY_SPEC_PROCESS_KEYRING)))
+    if frc != cast[int64](serial):
+        printk1("[KEYRING] FAIL request_key found %d != serial\n",
+                cast[uint64](frc))
+        return 0
+    printk0("[KEYRING] PASS request_key found the key by type+desc\n")
+
+    frc = ukey_request_key(cast[uint64](type_user), cast[uint64](desc_bad),
+                           0, cast[uint64](cast[int64](KEY_SPEC_PROCESS_KEYRING)))
+    if frc != KEY_ENOKEY:
+        printk1("[KEYRING] FAIL request_key(bogus) rc=%d (want ENOKEY)\n",
+                cast[uint64](frc))
+        return 0
+    printk0("[KEYRING] PASS request_key(bogus desc) -> ENOKEY\n")
+
+    # KEYCTL_SEARCH against the process keyring finds it too.
+    src: int64 = _ukey_keyctl_search(
+        cast[uint64](cast[int64](KEY_SPEC_PROCESS_KEYRING)),
+        cast[uint64](type_user), cast[uint64](desc_key), 0)
+    if src != cast[int64](serial):
+        printk1("[KEYRING] FAIL KEYCTL_SEARCH found %d != serial\n",
+                cast[uint64](src))
+        return 0
+    printk0("[KEYRING] PASS KEYCTL_SEARCH found the key\n")
+
+    src = _ukey_keyctl_search(
+        cast[uint64](cast[int64](KEY_SPEC_PROCESS_KEYRING)),
+        cast[uint64](type_user), cast[uint64](desc_bad), 0)
+    if src != KEY_ENOKEY:
+        printk1("[KEYRING] FAIL KEYCTL_SEARCH(bogus) rc=%d (want ENOKEY)\n",
+                cast[uint64](src))
+        return 0
+    printk0("[KEYRING] PASS KEYCTL_SEARCH(bogus) -> ENOKEY\n")
+
+    # --- (3b) DESCRIBE returns a non-empty string --------------------
+    drc: int64 = _ukey_keyctl_describe(cast[uint64](cast[int64](serial)),
+                                       cast[uint64](&ukey_test_rd[0]), 64)
+    if drc <= 0:
+        printk1("[KEYRING] FAIL DESCRIBE rc=%d\n", cast[uint64](drc))
+        return 0
+    printk0("[KEYRING] PASS DESCRIBE returned a key description\n")
+
+    # --- (3c) error paths: too-long payload + unknown type -> EINVAL -
+    erc: int64 = ukey_add_key(cast[uint64](type_user), cast[uint64](desc_key),
+                              cast[uint64](&ukey_test_p1[0]), KEY_MAX_PAYLOAD + 1,
+                              cast[uint64](cast[int64](KEY_SPEC_PROCESS_KEYRING)))
+    if erc != KEY_EINVAL:
+        printk1("[KEYRING] FAIL too-long payload rc=%d (want EINVAL)\n",
+                cast[uint64](erc))
+        return 0
+    erc = ukey_add_key(cast[uint64](type_bad), cast[uint64](desc_key),
+                       cast[uint64](&ukey_test_p1[0]), 16,
+                       cast[uint64](cast[int64](KEY_SPEC_PROCESS_KEYRING)))
+    if erc != KEY_EINVAL:
+        printk1("[KEYRING] FAIL unknown type rc=%d (want EINVAL)\n",
+                cast[uint64](erc))
+        return 0
+    printk0("[KEYRING] PASS too-long payload + unknown type rejected EINVAL\n")
+
+    # --- (3d) LINK into the user keyring, then request_key finds via it
+    uid_ring: int64 = _ukey_get_keyring_id(
+        cast[uint64](cast[int64](KEY_SPEC_USER_KEYRING)))
+    if uid_ring <= 0:
+        printk1("[KEYRING] FAIL get user keyring id rc=%d\n",
+                cast[uint64](uid_ring))
+        return 0
+    lrc: int64 = _ukey_keyctl_link(cast[uint64](cast[int64](serial)),
+                                   cast[uint64](uid_ring))
+    if lrc != 0:
+        printk1("[KEYRING] FAIL LINK rc=%d\n", cast[uint64](lrc))
+        return 0
+    # Now UNLINK from the process keyring; request_key must STILL find it via
+    # the user keyring (proving the second-ring search works).
+    proc_ring: int64 = _ukey_get_keyring_id(
+        cast[uint64](cast[int64](KEY_SPEC_PROCESS_KEYRING)))
+    ulrc: int64 = _ukey_keyctl_unlink(cast[uint64](cast[int64](serial)),
+                                      cast[uint64](proc_ring))
+    if ulrc != 0:
+        printk1("[KEYRING] FAIL UNLINK rc=%d\n", cast[uint64](ulrc))
+        return 0
+    frc = ukey_request_key(cast[uint64](type_user), cast[uint64](desc_key),
+                           0, cast[uint64](cast[int64](KEY_SPEC_PROCESS_KEYRING)))
+    if frc != cast[int64](serial):
+        printk1("[KEYRING] FAIL request_key via user ring rc=%d\n",
+                cast[uint64](frc))
+        return 0
+    printk0("[KEYRING] PASS LINK to user keyring + UNLINK from proc still found\n")
+
+    # --- (4) REVOKE then READ -> EKEYREVOKED -------------------------
+    vrc: int64 = _ukey_keyctl_revoke(cast[uint64](cast[int64](serial)))
+    if vrc != 0:
+        printk1("[KEYRING] FAIL REVOKE rc=%d\n", cast[uint64](vrc))
+        return 0
+    rdn = _ukey_keyctl_read(cast[uint64](cast[int64](serial)),
+                            cast[uint64](&ukey_test_rd[0]), 64)
+    if rdn != KEY_EKEYREVOKED:
+        printk1("[KEYRING] FAIL READ-after-revoke rc=%d (want EKEYREVOKED)\n",
+                cast[uint64](rdn))
+        return 0
+    printk0("[KEYRING] PASS REVOKE then READ -> EKEYREVOKED\n")
+
+    # A revoked key is no longer found by request_key/SEARCH.
+    frc = ukey_request_key(cast[uint64](type_user), cast[uint64](desc_key),
+                           0, cast[uint64](cast[int64](KEY_SPEC_USER_KEYRING)))
+    if frc != KEY_ENOKEY:
+        printk1("[KEYRING] FAIL revoked key still found rc=%d (want ENOKEY)\n",
+                cast[uint64](frc))
+        return 0
+    printk0("[KEYRING] PASS revoked key no longer found by request_key\n")
+
+    # --- (5) CLEAR empties a keyring ---------------------------------
+    # Add a fresh key, then CLEAR the user keyring and confirm it is gone.
+    desc_k2: Ptr[uint8] = "second:key"
+    rc3: int64 = ukey_add_key(cast[uint64](type_user), cast[uint64](desc_k2),
+                              cast[uint64](&ukey_test_p1[0]), 8,
+                              cast[uint64](cast[int64](KEY_SPEC_USER_KEYRING)))
+    if rc3 <= 0:
+        printk1("[KEYRING] FAIL add second key rc=%d\n", cast[uint64](rc3))
+        return 0
+    crc: int64 = _ukey_keyctl_clear(
+        cast[uint64](cast[int64](KEY_SPEC_USER_KEYRING)))
+    if crc != 0:
+        printk1("[KEYRING] FAIL CLEAR rc=%d\n", cast[uint64](crc))
+        return 0
+    frc = ukey_request_key(cast[uint64](type_user), cast[uint64](desc_k2),
+                           0, cast[uint64](cast[int64](KEY_SPEC_USER_KEYRING)))
+    if frc != KEY_ENOKEY:
+        printk1("[KEYRING] FAIL CLEAR left key findable rc=%d (want ENOKEY)\n",
+                cast[uint64](frc))
+        return 0
+    printk0("[KEYRING] PASS CLEAR emptied the keyring\n")
+
+    # Leave the store clean for any later boot consumer.
+    ukey_init()
+
+    printk0("[keyring] PASS\n")
+    return 1
