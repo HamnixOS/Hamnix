@@ -1,0 +1,629 @@
+# drivers/net/gre.ad
+#
+# GRE — Generic Routing Encapsulation (RFC 2784) over IPv4, IP protocol 47.
+# A point-to-point L3 tunnel: an inner payload (typically a complete inner
+# IPv4 packet) is carried inside an outer IPv4 packet with proto=47 and a
+# minimal 4-byte GRE header. This is the substrate of classic site-to-site
+# tunnels (and the basis of NVGRE / PPTP framing).
+#
+# Outer frame layout (this is what ENCAP produces and DECAP consumes):
+#
+#   +----------------------------------------------------------+
+#   | Outer IPv4 (20)      proto=47 (GRE), correct len + csum   |
+#   +----------------------------------------------------------+
+#   | GRE (4, or 8 with C-bit)                                  |
+#   |   flags+version(2) | protocol-type(2)                     |
+#   |   [ checksum(2) | reserved1(2) ] only if C-bit set        |
+#   +----------------------------------------------------------+
+#   | Inner payload (e.g. the original inner IPv4 packet)       |
+#   +----------------------------------------------------------+
+#
+# Unlike VXLAN there is no outer Ethernet / UDP layer: GRE rides directly
+# on IPv4 as a protocol of its own (47). We reuse the native stack's
+# ip_csum16 (RFC-1071 ones'-complement Internet checksum) for the outer
+# IPv4 header checksum, and the same folding math for the optional GRE
+# checksum (RFC 2784 §2.5: ones'-complement over the GRE header + payload
+# with the checksum field taken as zero).
+
+from kernel.printk.printk import printk0, printk1, printk2, printk_set_level
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
+from drivers.net.ip import ip_csum16, IP_HDR_LEN, IP_TTL
+from drivers.net.eth import ETH_P_IP
+
+
+# --- Wire constants ----------------------------------------------------
+
+# IANA IP protocol number for GRE (RFC 2784 §1; RFC 1701).
+IPPROTO_GRE: uint8 = 47
+
+# GRE header lengths. Base (RFC 2784 mandatory form) is 4 bytes:
+#   flags+version(2) | protocol-type(2).
+# With the Checksum-Present (C) bit set, a 2-byte checksum and a 2-byte
+# reserved field follow, for an 8-byte header.
+GRE_HDR_BASE_LEN: uint64 = 4
+GRE_HDR_CSUM_LEN: uint64 = 8
+
+# Flags+version word, byte 0 high bit: the Checksum-Present (C) bit.
+# On the wire the flags occupy the first 16-bit word; C lands in the MSB:
+# 0x8000. The basic RFC 2784 packet sets the whole flags+version word to 0.
+GRE_FLAG_C_WORD: uint16 = 0x8000
+GRE_FLAGS_BASIC: uint16 = 0x0000
+
+# GRE Protocol Type for an inner IPv4 packet (the EtherType for IPv4).
+GRE_PROTO_IPV4: uint16 = 0x0800
+
+# Largest GRE overhead before the inner payload (outer IP + 8-byte GRE).
+GRE_OUTER_OVERHEAD_MAX: uint64 = 28      # IP_HDR_LEN(20) + GRE_HDR_CSUM_LEN(8)
+
+
+# Counters (mirror the /sys-visible accounting a real gre netdev keeps).
+gre_tx_encaps: uint64 = 0
+gre_rx_decaps: uint64 = 0
+gre_rx_drops:  uint64 = 0
+
+
+# =====================================================================
+# Tunnel table: a small (local,remote,key) keyed lookup
+# =====================================================================
+#
+# A real gre netdev is point-to-point with a configured local + remote
+# endpoint and an optional key. A fixed-size table is enough to resolve a
+# known set of tunnels by key.
+
+GRE_TUN_MAX: uint64 = 16
+
+gre_tun_inuse:  Array[16, uint8]      # 1 if slot holds a tunnel
+gre_tun_key:    Array[16, uint32]     # tunnel key (host order)
+gre_tun_local:  Array[16, uint32]     # local VTEP IPv4 (host order)
+gre_tun_remote: Array[16, uint32]     # remote VTEP IPv4 (host order)
+
+
+def gre_init():
+    # Reset the tunnel table and counters. Idempotent.
+    i: uint64 = 0
+    while i < GRE_TUN_MAX:
+        gre_tun_inuse[i]  = 0
+        gre_tun_key[i]    = 0
+        gre_tun_local[i]  = 0
+        gre_tun_remote[i] = 0
+        i = i + 1
+    gre_tx_encaps = 0
+    gre_rx_decaps = 0
+    gre_rx_drops  = 0
+
+
+def gre_tunnel_add(key: uint32, local_ip: uint32, remote_ip: uint32) -> int32:
+    # Install (or overwrite) a tunnel keyed by `key`. Returns the slot
+    # index on success, -1 if the table is full. An existing entry for the
+    # same key is overwritten.
+    i: uint64 = 0
+    free_slot: int32 = -1
+    while i < GRE_TUN_MAX:
+        if gre_tun_inuse[i] != 0:
+            if gre_tun_key[i] == key:
+                free_slot = cast[int32](i)
+                i = GRE_TUN_MAX
+        else:
+            if free_slot < 0:
+                free_slot = cast[int32](i)
+        if i < GRE_TUN_MAX:
+            i = i + 1
+    if free_slot < 0:
+        return -1
+    slot: uint64 = cast[uint64](free_slot)
+    gre_tun_inuse[slot]  = 1
+    gre_tun_key[slot]    = key
+    gre_tun_local[slot]  = local_ip
+    gre_tun_remote[slot] = remote_ip
+    return cast[int32](free_slot)
+
+
+def gre_tunnel_lookup(key: uint32, out_local: Ptr[uint32],
+                      out_remote: Ptr[uint32]) -> int32:
+    # Resolve a tunnel by key. On a hit, writes the local IPv4 into
+    # *out_local and the remote IPv4 into *out_remote (if non-NULL) and
+    # returns the slot index. Returns -1 if the key is unknown.
+    i: uint64 = 0
+    while i < GRE_TUN_MAX:
+        if gre_tun_inuse[i] != 0:
+            if gre_tun_key[i] == key:
+                if out_local != cast[Ptr[uint32]](0):
+                    out_local[0] = gre_tun_local[i]
+                if out_remote != cast[Ptr[uint32]](0):
+                    out_remote[0] = gre_tun_remote[i]
+                return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+# =====================================================================
+# Big-endian field writers / readers
+# =====================================================================
+
+def _gre_put16(buf: Ptr[uint8], off: uint64, v: uint16):
+    buf[off]     = cast[uint8]((cast[uint32](v) >> 8) & 0xFF)
+    buf[off + 1] = cast[uint8](cast[uint32](v) & 0xFF)
+
+
+def _gre_get16(buf: Ptr[uint8], off: uint64) -> uint16:
+    hi: uint16 = cast[uint16](buf[off]) << 8
+    lo: uint16 = cast[uint16](buf[off + 1])
+    return hi | lo
+
+
+def _gre_put32(buf: Ptr[uint8], off: uint64, v: uint32):
+    buf[off]     = cast[uint8]((v >> 24) & 0xFF)
+    buf[off + 1] = cast[uint8]((v >> 16) & 0xFF)
+    buf[off + 2] = cast[uint8]((v >> 8) & 0xFF)
+    buf[off + 3] = cast[uint8](v & 0xFF)
+
+
+def _gre_get32(buf: Ptr[uint8], off: uint64) -> uint32:
+    r: uint32 = cast[uint32](buf[off]) << 24
+    r = r | (cast[uint32](buf[off + 1]) << 16)
+    r = r | (cast[uint32](buf[off + 2]) << 8)
+    r = r | cast[uint32](buf[off + 3])
+    return r
+
+
+# =====================================================================
+# GRE checksum (RFC 2784 §2.5)
+# =====================================================================
+#
+# When the C bit is set, the 16-bit checksum field holds the ones'-
+# complement of the ones'-complement sum of all 16-bit words of the GRE
+# header AND the payload, with the checksum field itself taken as zero.
+# This is the same RFC-1071 fold ip_csum16 uses, but covering the GRE
+# header + inner payload rather than just an IPv4 header. `gre_seg` points
+# at the start of the GRE header; gre_len is GRE header + payload length.
+# The checksum field (offset 4..5) must be zero on entry.
+
+def _gre_csum16(gre_seg: Ptr[uint8], gre_len: uint64) -> uint16:
+    sum32: uint32 = 0
+    i: uint64 = 0
+    end_pairs: uint64 = gre_len & ~cast[uint64](1)
+    while i < end_pairs:
+        word: uint32 = (cast[uint32](gre_seg[i]) << 8) | cast[uint32](gre_seg[i + 1])
+        sum32 = sum32 + word
+        i = i + 2
+    if i < gre_len:
+        sum32 = sum32 + (cast[uint32](gre_seg[i]) << 8)
+    while (sum32 >> 16) != 0:
+        sum32 = (sum32 & 0xFFFF) + (sum32 >> 16)
+    return cast[uint16](~sum32 & 0xFFFF)
+
+
+# =====================================================================
+# ENCAP
+# =====================================================================
+
+def gre_encap(inner: Ptr[uint8], inner_len: uint64,
+              proto_type: uint16, with_csum: int32,
+              src_ip: uint32, dst_ip: uint32,
+              out: Ptr[uint8], out_cap: uint64) -> int64:
+    # Build the full outer GRE frame into `out` and return its total
+    # length, or a negative code on error (-1 buffer too small).
+    #
+    #   out = OuterIP(20) | GRE(4 or 8) | inner
+    #
+    # `proto_type` is the GRE Protocol Type (0x0800 for an inner IPv4
+    # packet). If with_csum != 0 the C bit is set and the GRE checksum is
+    # computed over the GRE header + payload. All outer IPv4 lengths and
+    # the IPv4 header checksum are computed correctly.
+    gre_hdr_len: uint64 = GRE_HDR_BASE_LEN
+    if with_csum != 0:
+        gre_hdr_len = GRE_HDR_CSUM_LEN
+    total: uint64 = IP_HDR_LEN + gre_hdr_len + inner_len
+    if total > out_cap:
+        return -1
+
+    # --- Outer IPv4 header (offset 0..19) ---
+    ip_total: uint64 = total
+    out[0] = 0x45                            # version 4, IHL 5
+    out[1] = 0                               # DSCP/ECN
+    _gre_put16(out, 2, cast[uint16](ip_total))
+    _gre_put16(out, 4, 0)                    # id
+    _gre_put16(out, 6, 0)                    # flags/frag = 0
+    out[8]  = IP_TTL                         # TTL
+    out[9]  = IPPROTO_GRE                    # protocol 47
+    _gre_put16(out, 10, 0)                   # checksum (computed below)
+    _gre_put32(out, 12, src_ip)              # src IPv4
+    _gre_put32(out, 16, dst_ip)              # dst IPv4
+    ip_csum: uint16 = ip_csum16(out, IP_HDR_LEN)
+    _gre_put16(out, 10, ip_csum)
+
+    # --- GRE header (offset 20..) ---
+    gre_off: uint64 = IP_HDR_LEN
+    flags_ver: uint16 = GRE_FLAGS_BASIC
+    if with_csum != 0:
+        flags_ver = GRE_FLAG_C_WORD
+    _gre_put16(out, gre_off + 0, flags_ver)        # flags+version
+    _gre_put16(out, gre_off + 2, proto_type)       # protocol type
+    payload_off: uint64 = gre_off + GRE_HDR_BASE_LEN
+    if with_csum != 0:
+        _gre_put16(out, gre_off + 4, 0)            # checksum (computed below)
+        _gre_put16(out, gre_off + 6, 0)            # reserved1
+        payload_off = gre_off + GRE_HDR_CSUM_LEN
+
+    # --- Inner payload ---
+    i: uint64 = 0
+    while i < inner_len:
+        out[payload_off + i] = inner[i]
+        i = i + 1
+
+    # --- GRE checksum over GRE header + payload (now complete) ---
+    if with_csum != 0:
+        gre_seg_len: uint64 = gre_hdr_len + inner_len
+        gre_csum: uint16 = _gre_csum16(
+            cast[Ptr[uint8]](cast[uint64](out) + gre_off), gre_seg_len)
+        _gre_put16(out, gre_off + 4, gre_csum)
+
+    gre_tx_encaps = gre_tx_encaps + 1
+    return cast[int64](total)
+
+
+# =====================================================================
+# DECAP
+# =====================================================================
+
+def gre_is_gre(frame: Ptr[uint8], length: uint64) -> int32:
+    # Validate that `frame` is a well-formed GRE outer frame: long enough,
+    # IPv4 with IHL 5, proto=47, and a recognised GRE flags+version word
+    # (version 0, only the C bit optionally set; RFC 2784 reserved bits 0).
+    # Returns 1 if it is GRE, 0 otherwise.
+    if length < (IP_HDR_LEN + GRE_HDR_BASE_LEN):
+        return 0
+    if (frame[0] & 0xF0) != 0x40:                  # IPv4
+        return 0
+    if (frame[0] & 0x0F) != 0x05:                  # IHL 5 (no options)
+        return 0
+    if frame[9] != IPPROTO_GRE:
+        return 0
+    gre_off: uint64 = IP_HDR_LEN
+    flags_ver: uint16 = _gre_get16(frame, gre_off)
+    # RFC 2784: version (low 3 bits) must be 0; only the C bit (0x8000) of
+    # the flags may be set — all other flag/reserved bits must be zero.
+    if (flags_ver & 0x7FFF) != 0:
+        return 0
+    # If the C bit is set, the 8-byte form must fit.
+    if (flags_ver & GRE_FLAG_C_WORD) != 0:
+        if length < (IP_HDR_LEN + GRE_HDR_CSUM_LEN):
+            return 0
+    return 1
+
+
+def gre_decap(frame: Ptr[uint8], length: uint64,
+              out_inner: Ptr[uint8], out_cap: uint64,
+              out_proto: Ptr[uint16]) -> int64:
+    # Recover the inner payload from a GRE outer frame. Copies the inner
+    # payload byte-for-byte into out_inner, writes the GRE Protocol Type
+    # into *out_proto (if non-NULL), and returns the inner payload length,
+    # or a negative code:
+    #   -1 not GRE / malformed
+    #   -2 inner buffer too small
+    #   -3 GRE checksum mismatch (C bit set but checksum invalid)
+    if gre_is_gre(frame, length) != 1:
+        gre_rx_drops = gre_rx_drops + 1
+        return -1
+    gre_off: uint64 = IP_HDR_LEN
+    flags_ver: uint16 = _gre_get16(frame, gre_off)
+    proto_type: uint16 = _gre_get16(frame, gre_off + 2)
+    gre_hdr_len: uint64 = GRE_HDR_BASE_LEN
+    has_csum: int32 = 0
+    if (flags_ver & GRE_FLAG_C_WORD) != 0:
+        gre_hdr_len = GRE_HDR_CSUM_LEN
+        has_csum = 1
+
+    # Validate the GRE checksum if present (RFC 2784 §2.5): zero the stored
+    # field, recompute over GRE header + payload, compare, restore.
+    if has_csum != 0:
+        gre_seg_len: uint64 = length - gre_off
+        stored: uint16 = _gre_get16(frame, gre_off + 4)
+        _gre_put16(frame, gre_off + 4, 0)
+        recomp: uint16 = _gre_csum16(
+            cast[Ptr[uint8]](cast[uint64](frame) + gre_off), gre_seg_len)
+        _gre_put16(frame, gre_off + 4, stored)
+        if stored != recomp:
+            gre_rx_drops = gre_rx_drops + 1
+            return -3
+
+    inner_off: uint64 = gre_off + gre_hdr_len
+    inner_len: uint64 = length - inner_off
+    if inner_len > out_cap:
+        return -2
+    if out_proto != cast[Ptr[uint16]](0):
+        out_proto[0] = proto_type
+    i: uint64 = 0
+    while i < inner_len:
+        out_inner[i] = frame[inner_off + i]
+        i = i + 1
+    gre_rx_decaps = gre_rx_decaps + 1
+    return cast[int64](inner_len)
+
+
+# =====================================================================
+# Send-by-key: encap an inner payload to whichever remote endpoint the
+# tunnel table maps the key to (using its configured local source IP).
+# Returns the outer frame length built into `out`, or negative
+# (-3 = key not in the tunnel table).
+# =====================================================================
+
+def gre_send_by_key(inner: Ptr[uint8], inner_len: uint64,
+                    proto_type: uint16, with_csum: int32, key: uint32,
+                    out: Ptr[uint8], out_cap: uint64) -> int64:
+    local_ip: uint32 = 0
+    remote_ip: uint32 = 0
+    hit: int32 = gre_tunnel_lookup(key, cast[Ptr[uint32]](&local_ip),
+                                   cast[Ptr[uint32]](&remote_ip))
+    if hit < 0:
+        return -3
+    return gre_encap(inner, inner_len, proto_type, with_csum,
+                     local_ip, remote_ip, out, out_cap)
+
+
+# =====================================================================
+# In-kernel self-test (deterministic, no NIC required)
+# =====================================================================
+#
+# Mirrors drivers/net/vxlan.ad::vxlan_selftest. Pure in-memory: build a
+# known inner IPv4 payload, ENCAP -> DECAP round-trip, assert byte-identity
+# and the parsed protocol type, assert outer fields (proto 47, valid IPv4
+# checksum, correct GRE flags+protocol-type, inner bytes at the right
+# offset). Done BOTH with the GRE checksum disabled and enabled, plus a
+# negative test that a corrupted GRE-checksum frame is rejected.
+
+def _gre_emerg0(s: Ptr[char]):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0(s)
+
+
+def _gre_emerg1(s: Ptr[char], a: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk1(s, a)
+
+
+def _gre_emerg2(s: Ptr[char], a: uint64, b: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk2(s, a, b)
+
+
+# Generously-sized scratch globals. An inner payload here is tiny (<128
+# bytes) but the buffers are sized for a full MTU + outer overhead so an
+# undersized Array[] can't silently overflow into adjacent globals.
+GRE_T_INNER_CAP: uint64 = 1600
+GRE_T_OUTER_CAP: uint64 = 1700
+_gret_inner:  Array[1600, uint8]
+_gret_outer:  Array[1700, uint8]
+_gret_recov:  Array[1600, uint8]
+
+
+def _gre_build_inner(seed: uint8) -> uint64:
+    # Build a deterministic inner IPv4 packet: a 20-byte IPv4 header with a
+    # valid header checksum followed by a payload whose bytes are a function
+    # of `seed`. Returns the inner packet length.
+    plen: uint64 = 40                          # inner payload after IP header
+    total: uint64 = IP_HDR_LEN + plen
+    _gret_inner[0] = 0x45                       # version 4, IHL 5
+    _gret_inner[1] = 0
+    _gre_put16(cast[Ptr[uint8]](&_gret_inner[0]), 2, cast[uint16](total))
+    _gre_put16(cast[Ptr[uint8]](&_gret_inner[0]), 4, 0)
+    _gre_put16(cast[Ptr[uint8]](&_gret_inner[0]), 6, 0)
+    _gret_inner[8] = IP_TTL
+    _gret_inner[9] = 6                          # inner proto TCP (arbitrary)
+    _gre_put16(cast[Ptr[uint8]](&_gret_inner[0]), 10, 0)
+    # inner src/dst 192.168.1.seed -> 192.168.2.seed
+    _gre_put32(cast[Ptr[uint8]](&_gret_inner[0]), 12,
+               (192 << 24) | (168 << 16) | (1 << 8) | cast[uint32](seed))
+    _gre_put32(cast[Ptr[uint8]](&_gret_inner[0]), 16,
+               (192 << 24) | (168 << 16) | (2 << 8) | cast[uint32](seed))
+    ic: uint16 = ip_csum16(cast[Ptr[uint8]](&_gret_inner[0]), IP_HDR_LEN)
+    _gre_put16(cast[Ptr[uint8]](&_gret_inner[0]), 10, ic)
+    i: uint64 = 0
+    while i < plen:
+        _gret_inner[IP_HDR_LEN + i] = cast[uint8](
+            (cast[uint32](seed) + cast[uint32](i)) & 0xFF)
+        i = i + 1
+    return total
+
+
+def _gre_check_outer(out_len: uint64, gre_hdr_len: uint64,
+                     inner_len: uint64, expect_c: int32) -> int32:
+    # Assert the common outer-frame invariants for a freshly-built frame in
+    # _gret_outer: proto 47, valid IPv4 checksum, correct GRE flags + IPv4
+    # protocol-type, and that the inner bytes sit at the right offset and
+    # are byte-identical to _gret_inner. Returns 1 on all-OK, 0 on any FAIL.
+    ok: int32 = 1
+    exp_len: uint64 = IP_HDR_LEN + gre_hdr_len + inner_len
+    if out_len != exp_len:
+        _gre_emerg2("[gre] FAIL: outer len %d != %d\n", out_len, exp_len)
+        ok = 0
+
+    # Outer IP protocol must be 47 (GRE).
+    if _gret_outer[9] != IPPROTO_GRE:
+        _gre_emerg1("[gre] FAIL: outer proto %d != 47\n",
+                    cast[uint64](_gret_outer[9]))
+        ok = 0
+
+    # Outer IPv4 header checksum must verify: ones'-complement sum over the
+    # full 20-byte header (csum field included) must be 0.
+    whole_ip_csum: uint16 = ip_csum16(cast[Ptr[uint8]](&_gret_outer[0]),
+                                      IP_HDR_LEN)
+    if whole_ip_csum != 0:
+        _gre_emerg1("[gre] FAIL: outer IP header self-sum=%x (want 0)\n",
+                    cast[uint64](whole_ip_csum))
+        ok = 0
+
+    # GRE flags+version and protocol-type.
+    gre_off: uint64 = IP_HDR_LEN
+    fv: uint16 = _gre_get16(cast[Ptr[uint8]](&_gret_outer[0]), gre_off)
+    if expect_c != 0:
+        if (fv & GRE_FLAG_C_WORD) == 0:
+            _gre_emerg0("[gre] FAIL: C bit expected but not set\n")
+            ok = 0
+    else:
+        if fv != GRE_FLAGS_BASIC:
+            _gre_emerg1("[gre] FAIL: flags+ver %x != 0 (basic)\n",
+                        cast[uint64](fv))
+            ok = 0
+    pt: uint16 = _gre_get16(cast[Ptr[uint8]](&_gret_outer[0]), gre_off + 2)
+    if pt != GRE_PROTO_IPV4:
+        _gre_emerg1("[gre] FAIL: proto-type %x != 0x0800\n", cast[uint64](pt))
+        ok = 0
+
+    # Inner bytes must sit at the right offset, byte-identical.
+    inner_off: uint64 = gre_off + gre_hdr_len
+    j: uint64 = 0
+    same: int32 = 1
+    while j < inner_len:
+        if _gret_outer[inner_off + j] != _gret_inner[j]:
+            same = 0
+            j = inner_len
+        else:
+            j = j + 1
+    if same != 1:
+        _gre_emerg0("[gre] FAIL: inner bytes not at correct offset\n")
+        ok = 0
+
+    return ok
+
+
+def _gre_roundtrip(with_csum: int32, key: uint32, seed: uint8) -> int32:
+    # ENCAP an inner IPv4 payload via the tunnel table, validate the outer
+    # header, DECAP it, and assert the recovered inner is byte-identical and
+    # the parsed protocol type is 0x0800. Returns 1 on PASS, 0 on FAIL.
+    ok: int32 = 1
+    inner_len: uint64 = _gre_build_inner(seed)
+    gre_hdr_len: uint64 = GRE_HDR_BASE_LEN
+    if with_csum != 0:
+        gre_hdr_len = GRE_HDR_CSUM_LEN
+
+    out_len: int64 = gre_send_by_key(
+        cast[Ptr[uint8]](&_gret_inner[0]), inner_len,
+        GRE_PROTO_IPV4, with_csum, key,
+        cast[Ptr[uint8]](&_gret_outer[0]), GRE_T_OUTER_CAP)
+    if out_len < 0:
+        _gre_emerg1("[gre] FAIL: send_by_key rc=%d\n", cast[uint64](out_len))
+        return 0
+
+    if _gre_check_outer(cast[uint64](out_len), gre_hdr_len, inner_len,
+                        with_csum) != 1:
+        ok = 0
+    else:
+        _gre_emerg0("[gre] encap header valid OK\n")
+
+    # DECAP round-trip.
+    rproto: uint16 = 0
+    rec_len: int64 = gre_decap(cast[Ptr[uint8]](&_gret_outer[0]),
+        cast[uint64](out_len),
+        cast[Ptr[uint8]](&_gret_recov[0]), GRE_T_INNER_CAP,
+        cast[Ptr[uint16]](&rproto))
+    if rec_len < 0:
+        _gre_emerg1("[gre] FAIL: decap rc=%d\n", cast[uint64](rec_len))
+        return 0
+    if cast[uint64](rec_len) != inner_len:
+        _gre_emerg2("[gre] FAIL: recovered len %d != %d\n",
+                    cast[uint64](rec_len), inner_len)
+        ok = 0
+    if rproto != GRE_PROTO_IPV4:
+        _gre_emerg1("[gre] FAIL: decap proto-type %x != 0x0800\n",
+                    cast[uint64](rproto))
+        ok = 0
+    identical: int32 = 1
+    i: uint64 = 0
+    while i < inner_len:
+        if _gret_recov[i] != _gret_inner[i]:
+            identical = 0
+            i = inner_len
+        else:
+            i = i + 1
+    if identical != 1:
+        _gre_emerg0("[gre] FAIL: inner payload not byte-identical\n")
+        ok = 0
+    else:
+        _gre_emerg0("[gre] decap round-trip byte-identical OK\n")
+
+    return ok
+
+
+def gre_selftest() -> int32:
+    # Returns 1 on PASS, 0 on FAIL. Prints [gre] marker lines.
+    _gre_emerg0("[gre] self-test start\n")
+    gre_init()
+    ok: int32 = 1
+
+    # Tunnel endpoints:
+    #   tunnel key 0x2000: local 10.0.0.1 <-> remote 10.0.0.2
+    local_ip:  uint32 = (10 << 24) | (0 << 16) | (0 << 8) | 1
+    remote_ip: uint32 = (10 << 24) | (0 << 16) | (0 << 8) | 2
+    t_slot: int32 = gre_tunnel_add(0x2000, local_ip, remote_ip)
+    if t_slot < 0:
+        _gre_emerg0("[gre] FAIL: tunnel add\n")
+        return 0
+    _gre_emerg0("[gre] PASS tunnel-add (key 0x2000 10.0.0.1<->10.0.0.2)\n")
+
+    # The tunnel table must resolve the key to the right endpoints.
+    rl: uint32 = 0
+    rr: uint32 = 0
+    if gre_tunnel_lookup(0x2000, cast[Ptr[uint32]](&rl),
+                         cast[Ptr[uint32]](&rr)) < 0:
+        _gre_emerg0("[gre] FAIL: tunnel lookup miss\n")
+        ok = 0
+    if rl != local_ip or rr != remote_ip:
+        _gre_emerg0("[gre] FAIL: tunnel lookup wrong endpoints\n")
+        ok = 0
+    else:
+        _gre_emerg0("[gre] PASS tunnel-lookup\n")
+
+    # --- Round 1: GRE checksum DISABLED (basic RFC 2784 4-byte header) ---
+    if _gre_roundtrip(0, 0x2000, 0x11) != 1:
+        ok = 0
+    else:
+        _gre_emerg0("[gre] PASS roundtrip-no-csum\n")
+
+    # --- Round 2: GRE checksum ENABLED (8-byte header, C bit) ---
+    if _gre_roundtrip(1, 0x2000, 0x55) != 1:
+        ok = 0
+    else:
+        _gre_emerg0("[gre] PASS roundtrip-csum\n")
+
+    # --- Negative: corrupt a GRE-checksum frame; decap must reject it. ---
+    # Build a fresh checksummed frame, then flip a payload byte WITHOUT
+    # recomputing the GRE checksum so the stored checksum no longer matches.
+    inner_len: uint64 = _gre_build_inner(0x33)
+    out_len: int64 = gre_encap(
+        cast[Ptr[uint8]](&_gret_inner[0]), inner_len,
+        GRE_PROTO_IPV4, 1, local_ip, remote_ip,
+        cast[Ptr[uint8]](&_gret_outer[0]), GRE_T_OUTER_CAP)
+    if out_len < 0:
+        _gre_emerg0("[gre] FAIL: encap for corrupt test\n")
+        return 0
+    # A clean decap of this frame must succeed first (sanity).
+    rproto0: uint16 = 0
+    clean: int64 = gre_decap(cast[Ptr[uint8]](&_gret_outer[0]),
+        cast[uint64](out_len),
+        cast[Ptr[uint8]](&_gret_recov[0]), GRE_T_INNER_CAP,
+        cast[Ptr[uint16]](&rproto0))
+    if clean < 0:
+        _gre_emerg1("[gre] FAIL: clean csum frame rejected rc=%d\n",
+                    cast[uint64](clean))
+        ok = 0
+    # Corrupt the last inner payload byte (do NOT touch the GRE checksum).
+    corrupt_off: uint64 = cast[uint64](out_len) - 1
+    _gret_outer[corrupt_off] = _gret_outer[corrupt_off] ^ 0xFF
+    rproto1: uint16 = 0
+    bad: int64 = gre_decap(cast[Ptr[uint8]](&_gret_outer[0]),
+        cast[uint64](out_len),
+        cast[Ptr[uint8]](&_gret_recov[0]), GRE_T_INNER_CAP,
+        cast[Ptr[uint16]](&rproto1))
+    if bad != -3:
+        _gre_emerg1("[gre] FAIL: corrupt-csum frame accepted (rc=%d)\n",
+                    cast[uint64](bad))
+        ok = 0
+    else:
+        _gre_emerg0("[gre] checksum reject-corrupt OK\n")
+
+    if ok == 1:
+        _gre_emerg0("[gre] PASS\n")
+        return 1
+    _gre_emerg0("[gre] FAIL\n")
+    return 0

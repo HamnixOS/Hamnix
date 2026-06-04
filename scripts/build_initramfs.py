@@ -2200,6 +2200,19 @@ if os.environ.get("ENABLE_VXLAN_TEST") == "1":
 if os.environ.get("ENABLE_IGMP_TEST") == "1":
     FILES.append(("/etc/igmp-test", b"1\n"))
 
+# Native GRE (RFC 2784) encap/decap-over-IPv4 self-test.
+# scripts/test_gre.sh sets ENABLE_GRE_TEST=1 to plant /etc/gre-test;
+# init/main.ad's boot:37.gre gate then runs gre_selftest()
+# (drivers/net/gre.ad), a pure in-memory test that ENCAPs a known inner
+# IPv4 payload into OuterIP(proto=47)|GRE|inner (with the IPv4 header
+# checksum via ip_csum16 and an optional RFC-2784 GRE checksum), DECAPs it
+# back byte-for-byte asserting the parsed protocol type 0x0800, runs both
+# the no-checksum and checksum forms, and rejects a corrupted GRE-checksum
+# frame. Prints "[gre] PASS" / "[gre] FAIL". Default boots ship no marker
+# so it is a no-op everywhere else.
+if os.environ.get("ENABLE_GRE_TEST") == "1":
+    FILES.append(("/etc/gre-test", b"1\n"))
+
 # Native learning Ethernet bridge (the brX/brctl software bridge) self-test.
 # scripts/test_bridge.sh sets ENABLE_BRIDGE_TEST=1 to plant /etc/bridge-test;
 # init/main.ad's boot:37.bridge gate then runs bridge_selftest()
