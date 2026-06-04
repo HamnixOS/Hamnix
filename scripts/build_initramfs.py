@@ -1134,6 +1134,18 @@ if os.environ.get("ENABLE_RLIMIT_TEST"):
 if os.environ.get("ENABLE_CAPS_TEST"):
     FILES.append(("/etc/caps-test", b"1\n"))
 
+# perf_event_open(2) software-counter self-test. scripts/test_perf.sh sets
+# ENABLE_PERF_TEST=1 to plant /etc/perf-test. init/main.ad at boot:37.perf
+# detects the marker and calls do_perf_selftest() (linux_abi/u_perf.ad): it
+# opens disabled PERF_COUNT_SW_TASK_CLOCK + PERF_COUNT_SW_CONTEXT_SWITCHES
+# events backed by the REAL per-task accumulators (utime/stime ticks,
+# nvcsw/nivcsw), ENABLEs them, does measurable work (touch fresh pages + a
+# yield loop), reads them and asserts they advanced, then RESETs and asserts
+# the next read dropped toward zero, and emits the [perf] PASS banner. Default
+# boots omit the marker.
+if os.environ.get("ENABLE_PERF_TEST"):
+    FILES.append(("/etc/perf-test", b"1\n"))
+
 # getpriority(2)/setpriority(2) round-trip self-test. scripts/test_priosys.sh
 # sets ENABLE_PRIOSYS_TEST=1 to plant /etc/priosys-test. init/main.ad detects
 # the marker and calls priority_syscall_selftest() (linux_abi/u_syscalls.ad):

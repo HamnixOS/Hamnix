@@ -1,0 +1,705 @@
+# linux_abi/u_perf.ad -- the Linux perf_event_open(2) software-counter family.
+#
+# Real Linux profiling/observability tooling reaches for perf_event_open(2)
+# constantly:
+#
+#   * perf_event_open(attr, pid, cpu, group_fd, flags)  nr 298  -> a perf fd
+#   * read(fd, &count, 8)                                        -> the counter
+#   * ioctl(fd, PERF_EVENT_IOC_ENABLE/DISABLE/RESET)            -> control
+#
+# `perf stat`, perf's own ring-buffer profiler, libpfm, and any tool that wants
+# a software event count (task clock, CPU clock, page faults, context switches)
+# round-trips this syscall. Until now it fell through to the ENOSYS default, so
+# any such tool saw a bogus failure on the very first probe.
+#
+# ARCHITECTURE NOTE -- perf_event_open is a LINUX-ABI concept ONLY. Hamnix's
+# native model exposes process/resource state through Plan 9 ctl/stat files,
+# NOT a perf-counter syscall. So this file is pure Linux-ABI furniture: it
+# models a perf software-event fd for tasks running under the Linux namespace.
+# Crucially it does NOT invent any new accounting — every counter it reports is
+# read straight out of an accumulator the kernel ALREADY maintains for
+# /proc/<pid>/stat, getrusage(2) and the scheduler tick:
+#
+#   PERF_COUNT_SW_CPU_CLOCK     -> tsc_monotonic_ns()        (wall-clock ns)
+#   PERF_COUNT_SW_TASK_CLOCK    -> (utime+stime)*tick_ns      (per-task CPU ns)
+#   PERF_COUNT_SW_PAGE_FAULTS   -> current_task_minflt+majflt (all faults)
+#   PERF_COUNT_SW_CONTEXT_SWITCHES -> current_task_nvcsw+nivcsw (ctxsw count)
+#   PERF_COUNT_SW_PAGE_FAULTS_MIN  -> current_task_minflt      (minor faults)
+#   PERF_COUNT_SW_PAGE_FAULTS_MAJ  -> current_task_majflt      (major faults)
+#
+# The perf "count" is delta-since-enabled/reset: read() returns
+# (live_accumulator - baseline) while enabled, or the frozen value captured at
+# DISABLE. A disabled-at-open event reads 0 until the first ENABLE.
+#
+# Layer note: a confined Layer-2 leaf. It calls only current_idx_get() (the
+# task-slot key) + the user-pointer-safe copy helpers (copy_from_user /
+# copy_to_user) + the read-only per-task accumulator accessors. It never
+# touches 9P / Chan / Layer-1 code. The fd itself is a plain Layer-2 fd
+# (vfs_alloc_l2_fd) stamped with FD_PERF_MARK; the per-(task,fd) event state
+# lives in a flat table HERE (the same shape u_pidfd.ad uses). u_syscalls.ad
+# imports US (the nr-298 dispatch arm + the read/ioctl/close arms forward
+# here), the same shape as u_pidfd.ad / u_caps.ad.
+
+from kernel.sched.core import (
+    current_idx_get,
+    current_task_minflt, current_task_majflt,
+    current_task_nvcsw, current_task_nivcsw,
+    current_task_utime_ticks, current_task_stime_ticks,
+)
+from fs.vfs import (
+    vfs_alloc_l2_fd, vfs_fd_marker, vfs_close,
+)
+from mm.uaccess import (
+    copy_from_user, copy_to_user,
+)
+from arch.x86.kernel.time import tsc_monotonic_ns, HZ
+from kernel.printk.printk import (
+    printk0, printk1,
+)
+
+
+# =====================================================================
+# fd marker + errno subset (Linux negative-errno convention)
+# =====================================================================
+#
+# 0xFFFFFFCF sits in the free gap between FD_PTMX_MARK (0xCA) and
+# FD_IORING_MARK (0xD0), clear of every other marker family. Declared HERE,
+# not in core.ad/vfs.ad: the close path falls through cleanly for an unknown
+# marker, and _u_close in u_syscalls.ad clears our per-fd table entry before
+# the slot is recycled (the same shape pidfd uses).
+FD_PERF_MARK: uint32 = 0xFFFFFFCF
+
+PERF_EBADF:  int64 = -9
+PERF_EFAULT: int64 = -14
+PERF_EINVAL: int64 = -22
+PERF_EMFILE: int64 = -24
+
+
+# =====================================================================
+# Linux perf_event_attr / type / config / ioctl ABI constants
+# =====================================================================
+#
+# struct perf_event_attr is large (>= 120 bytes), but we only need a handful of
+# leading fields:
+#
+#   offset 0  : __u32 type
+#   offset 4  : __u32 size
+#   offset 8  : __u64 config
+#   offset 40 : __u64 flag bitfield word; bit 0 == disabled
+#
+# The flag word at offset 40 is the bitfield that opens with `disabled:1` in the
+# kernel header. We read only its bit 0 (disabled); all other bits are ignored.
+PERF_ATTR_OFF_TYPE:     uint64 = 0
+PERF_ATTR_OFF_SIZE:     uint64 = 4
+PERF_ATTR_OFF_CONFIG:   uint64 = 8
+PERF_ATTR_OFF_FLAGS:    uint64 = 40
+PERF_ATTR_READ_SZ:      uint64 = 48      # enough to cover the flags word
+
+PERF_ATTR_DISABLED_BIT: uint64 = 1       # bit 0 of the flags word
+
+# perf_type_id — we model only PERF_TYPE_SOFTWARE.
+PERF_TYPE_SOFTWARE: uint32 = 1
+
+# perf_sw_ids (software event configs we honour).
+PERF_COUNT_SW_CPU_CLOCK:        uint64 = 0
+PERF_COUNT_SW_TASK_CLOCK:       uint64 = 1
+PERF_COUNT_SW_PAGE_FAULTS:      uint64 = 2
+PERF_COUNT_SW_CONTEXT_SWITCHES: uint64 = 3
+PERF_COUNT_SW_PAGE_FAULTS_MIN:  uint64 = 5
+PERF_COUNT_SW_PAGE_FAULTS_MAJ:  uint64 = 6
+
+# perf ioctl requests (the low-16 encoding; the full _IO('$',n) word is
+# 0x2400|n — busybox/perf issue exactly these).
+PERF_EVENT_IOC_ENABLE:  uint64 = 0x2400
+PERF_EVENT_IOC_DISABLE: uint64 = 0x2401
+PERF_EVENT_IOC_RESET:   uint64 = 0x2403
+
+# Nanoseconds per scheduler tick: HZ ticks per second, so 1 tick = 1e9 / HZ ns.
+PERF_TICK_NS: uint64 = 10000000          # set from HZ in uperf_init
+
+
+# =====================================================================
+# (task, fd) -> perf-event state table
+# =====================================================================
+#
+# UPERF_NTASKS (16) mirrors NTASKS; UPERF_NRFDS (16) mirrors the per-task
+# fd-table width. Four parallel flat 256-entry arrays cover every (task slot,
+# fd number) pair — the same flat shape u_pidfd.ad uses:
+#
+#   uperf_config  : the PERF_COUNT_SW_* config selecting which accumulator
+#   uperf_enabled : 1 while counting, 0 while frozen/disabled
+#   uperf_base    : the accumulator snapshot taken at ENABLE / RESET
+#   uperf_frozen  : the delta captured at DISABLE (read returns this while off)
+#   uperf_live    : 1 if a perf event is recorded at this (task,fd), else 0
+UPERF_NTASKS: uint64 = 16
+UPERF_NRFDS:  uint64 = 16
+
+uperf_config:  Array[256, uint64]
+uperf_enabled: Array[256, uint8]
+uperf_base:    Array[256, uint64]
+uperf_frozen:  Array[256, uint64]
+uperf_live:    Array[256, uint8]
+
+
+def uperf_init():
+    i: uint64 = 0
+    while i < 256:
+        uperf_config[i]  = 0
+        uperf_enabled[i] = 0
+        uperf_base[i]    = 0
+        uperf_frozen[i]  = 0
+        uperf_live[i]    = 0
+        i = i + 1
+    # Derive the per-tick nanosecond scale from HZ (1 tick == 1e9 / HZ ns).
+    if HZ != 0:
+        PERF_TICK_NS = 1000000000 / cast[uint64](HZ)
+
+
+def _uperf_slot(task_idx: uint64, fd: int32) -> int64:
+    # Flat index for (task,fd), or -1 if out of range.
+    if fd < 0:
+        return -1
+    fdu: uint64 = cast[uint64](fd)
+    if task_idx >= UPERF_NTASKS or fdu >= UPERF_NRFDS:
+        return -1
+    return cast[int64](task_idx * UPERF_NRFDS + fdu)
+
+
+# =====================================================================
+# the live accumulator read
+# =====================================================================
+#
+# Read the RAW (cumulative) value of the kernel accumulator a perf software
+# config maps onto. Every source here is an accumulator the kernel already
+# maintains — perf invents nothing. Returns the current cumulative value;
+# the delta arithmetic (subtract baseline) happens in the read path.
+def _uperf_raw_count(config: uint64) -> uint64:
+    if config == PERF_COUNT_SW_CPU_CLOCK:
+        # Wall-clock nanoseconds since boot (monotonic, high-resolution).
+        return tsc_monotonic_ns()
+    if config == PERF_COUNT_SW_TASK_CLOCK:
+        # Per-task CPU time in nanoseconds: (utime+stime) ticks * tick_ns.
+        ticks: uint64 = current_task_utime_ticks() + current_task_stime_ticks()
+        return ticks * PERF_TICK_NS
+    if config == PERF_COUNT_SW_PAGE_FAULTS:
+        # All page faults (minor + major).
+        return current_task_minflt() + current_task_majflt()
+    if config == PERF_COUNT_SW_CONTEXT_SWITCHES:
+        # Voluntary + involuntary context switches.
+        return current_task_nvcsw() + current_task_nivcsw()
+    if config == PERF_COUNT_SW_PAGE_FAULTS_MIN:
+        return current_task_minflt()
+    if config == PERF_COUNT_SW_PAGE_FAULTS_MAJ:
+        return current_task_majflt()
+    return 0
+
+
+def _uperf_config_supported(config: uint64) -> int32:
+    if config == PERF_COUNT_SW_CPU_CLOCK:
+        return 1
+    if config == PERF_COUNT_SW_TASK_CLOCK:
+        return 1
+    if config == PERF_COUNT_SW_PAGE_FAULTS:
+        return 1
+    if config == PERF_COUNT_SW_CONTEXT_SWITCHES:
+        return 1
+    if config == PERF_COUNT_SW_PAGE_FAULTS_MIN:
+        return 1
+    if config == PERF_COUNT_SW_PAGE_FAULTS_MAJ:
+        return 1
+    return 0
+
+
+# =====================================================================
+# perf_event_open(attr, pid, cpu, group_fd, flags)  -- nr 298
+# =====================================================================
+#
+# int perf_event_open(struct perf_event_attr *attr, pid_t pid, int cpu,
+#                     int group_fd, unsigned long flags)
+#   a0 = attr pointer, a1 = pid, a2 = cpu, a3 = group_fd, a4 = flags.
+#
+#   * attr == NULL                 -> EFAULT.
+#   * read the leading attr fields via copy_from_user (never raw deref).
+#   * attr.type != PERF_TYPE_SOFTWARE       -> EINVAL (only SW modelled).
+#   * attr.config not one we support        -> EINVAL.
+#   * attr.size < the bytes we need to read -> EINVAL (a too-small struct).
+#   * otherwise allocate a Layer-2 perf fd, record the (task,fd) event state.
+#     attr.disabled bit -> the event starts disabled (read returns 0 until the
+#     first ENABLE); else it starts enabled with the baseline snapshotted now.
+def uperf_event_open(a0: uint64, a1: uint64, a2: uint64,
+                     a3: uint64, a4: uint64) -> int64:
+    if a0 == 0:
+        return PERF_EFAULT
+    # Pull the leading attr bytes into a kernel buffer in one validated copy.
+    attr: Array[48, uint8]
+    if copy_from_user(cast[uint64](&attr[0]), a0, PERF_ATTR_READ_SZ) != 0:
+        return PERF_EFAULT
+    base: uint64 = cast[uint64](&attr[0])
+    type_v:   uint32 = cast[Ptr[uint32]](base + PERF_ATTR_OFF_TYPE)[0]
+    size_v:   uint32 = cast[Ptr[uint32]](base + PERF_ATTR_OFF_SIZE)[0]
+    config_v: uint64 = cast[Ptr[uint64]](base + PERF_ATTR_OFF_CONFIG)[0]
+    flags_w:  uint64 = cast[Ptr[uint64]](base + PERF_ATTR_OFF_FLAGS)[0]
+
+    # The struct must be at least large enough to carry the fields we read.
+    # A size of 0 is the legacy attr (PERF_ATTR_SIZE_VER0 == 64); anything
+    # below the flags word we consult is rejected.
+    if size_v != 0 and cast[uint64](size_v) < PERF_ATTR_READ_SZ:
+        return PERF_EINVAL
+
+    # Only PERF_TYPE_SOFTWARE is modelled.
+    if type_v != PERF_TYPE_SOFTWARE:
+        return PERF_EINVAL
+    if _uperf_config_supported(config_v) == 0:
+        return PERF_EINVAL
+
+    disabled: int32 = 0
+    if (flags_w & PERF_ATTR_DISABLED_BIT) != 0:
+        disabled = 1
+
+    fd: int32 = vfs_alloc_l2_fd(FD_PERF_MARK)
+    if fd < 0:
+        return PERF_EMFILE
+    sidx: int64 = _uperf_slot(current_idx_get(), fd)
+    if sidx < 0:
+        vfs_close(fd)
+        return PERF_EBADF
+    s: uint64 = cast[uint64](sidx)
+    uperf_config[s]  = config_v
+    uperf_live[s]    = 1
+    uperf_frozen[s]  = 0
+    if disabled != 0:
+        # Starts disabled: not counting; read returns the frozen 0 delta.
+        uperf_enabled[s] = 0
+        uperf_base[s]    = 0
+    else:
+        # Starts enabled: snapshot the baseline now so read reports the delta.
+        uperf_enabled[s] = 1
+        uperf_base[s]    = _uperf_raw_count(config_v)
+    return cast[int64](fd)
+
+
+# =====================================================================
+# read(fd, buf, 8)  -- the counter readout (minimal PERF_FORMAT)
+# =====================================================================
+#
+# The minimal PERF_FORMAT is a single u64: the event's current count. The count
+# is the delta since the event was enabled/reset:
+#   * enabled  -> live_accumulator - baseline
+#   * disabled -> the value frozen at the last DISABLE (or 0 if never enabled)
+# A buffer smaller than 8 bytes is EINVAL (Linux requires >= sizeof(u64) for
+# the minimal format). Returns the byte count written (8) on success.
+def uperf_read(fd: int32, buf: uint64, count: uint64) -> int64:
+    sidx: int64 = _uperf_slot(current_idx_get(), fd)
+    if sidx < 0:
+        return PERF_EBADF
+    s: uint64 = cast[uint64](sidx)
+    if uperf_live[s] == 0:
+        return PERF_EBADF
+    if count < 8:
+        return PERF_EINVAL
+    val: uint64 = 0
+    if uperf_enabled[s] != 0:
+        live: uint64 = _uperf_raw_count(uperf_config[s])
+        if live > uperf_base[s]:
+            val = live - uperf_base[s]
+        else:
+            val = 0
+    else:
+        val = uperf_frozen[s]
+    out: Array[8, uint8]
+    cast[Ptr[uint64]](cast[uint64](&out[0]))[0] = val
+    if copy_to_user(buf, cast[uint64](&out[0]), 8) != 0:
+        return PERF_EFAULT
+    return 8
+
+
+# =====================================================================
+# ioctl(fd, PERF_EVENT_IOC_ENABLE/DISABLE/RESET)
+# =====================================================================
+#
+# ENABLE  : start counting — snapshot a fresh baseline so the delta resumes
+#           from where it was frozen (carry the frozen value into the new base
+#           so an enable after a disable continues monotonically).
+# DISABLE : freeze — capture the current delta into uperf_frozen and stop.
+# RESET   : re-baseline — the delta drops to 0 from now (frozen cleared too).
+#
+# Returns 0 on success, EBADF for a non-perf fd, EINVAL for an unknown request.
+def uperf_ioctl(fd: int32, req: uint64, arg: uint64) -> int64:
+    sidx: int64 = _uperf_slot(current_idx_get(), fd)
+    if sidx < 0:
+        return PERF_EBADF
+    s: uint64 = cast[uint64](sidx)
+    if uperf_live[s] == 0:
+        return PERF_EBADF
+    r: uint64 = req & 0xFFFF
+    if r == (PERF_EVENT_IOC_ENABLE & 0xFFFF):
+        if uperf_enabled[s] == 0:
+            # Resume counting. Re-base so the live delta continues from the
+            # frozen value: base = live_now - frozen.
+            live: uint64 = _uperf_raw_count(uperf_config[s])
+            nb: uint64 = 0
+            if live > uperf_frozen[s]:
+                nb = live - uperf_frozen[s]
+            uperf_base[s]    = nb
+            uperf_enabled[s] = 1
+        return 0
+    if r == (PERF_EVENT_IOC_DISABLE & 0xFFFF):
+        if uperf_enabled[s] != 0:
+            live: uint64 = _uperf_raw_count(uperf_config[s])
+            fr: uint64 = 0
+            if live > uperf_base[s]:
+                fr = live - uperf_base[s]
+            uperf_frozen[s]  = fr
+            uperf_enabled[s] = 0
+        return 0
+    if r == (PERF_EVENT_IOC_RESET & 0xFFFF):
+        # Re-baseline so the delta drops to 0 from now. Clear any frozen value.
+        uperf_frozen[s] = 0
+        if uperf_enabled[s] != 0:
+            uperf_base[s] = _uperf_raw_count(uperf_config[s])
+        else:
+            uperf_base[s] = 0
+        return 0
+    return PERF_EINVAL
+
+
+# =====================================================================
+# close hook
+# =====================================================================
+#
+# _u_close in u_syscalls.ad calls this before the fd slot is recycled so a
+# later fd allocated at the same slot does not inherit a stale perf event.
+def uperf_close_fd(task_idx: uint64, fd: int32):
+    sidx: int64 = _uperf_slot(task_idx, fd)
+    if sidx < 0:
+        return
+    s: uint64 = cast[uint64](sidx)
+    uperf_config[s]  = 0
+    uperf_enabled[s] = 0
+    uperf_base[s]    = 0
+    uperf_frozen[s]  = 0
+    uperf_live[s]    = 0
+
+
+# =====================================================================
+# Boot self-test  --  [PERF] PASS / [perf] PASS  (boot:37.perf)
+# =====================================================================
+#
+# Exercises the REAL counter path directly in boot context, driving the SAME
+# handler entry points the nr-298 / read / ioctl dispatch arms call. The boot
+# task that runs this hook has an UNINITIALISED fd table (per-task fd tables are
+# only primed by create_user_task / kthread_create), so free fd slots 3..15
+# before any vfs_alloc_l2_fd and restore them after — the same snapshot/restore
+# dance do_pidfd_selftest uses.
+#
+# Steps:
+#   (1) open a disabled PAGE_FAULTS event + a disabled CONTEXT_SWITCHES event;
+#       both read 0 (disabled, no delta yet).
+#   (2) ENABLE both, then do measurable work that drives the REAL per-task
+#       accumulators those events read off:
+#         * a yield loop (cooperative reschedules) and fresh-page touches as
+#           realistic load, AND
+#         * the EXACT charge helpers the page-fault handler / schedule() call
+#           at their real charge sites (current_task_account_minor_fault,
+#           task_account_*_ctxsw_at). The boot bootstrap task usually has no
+#           second runnable task, so a cooperative yield often does not switch
+#           — exactly why the landed ctxsw_selftest / pgfault_selftest drive
+#           these helpers directly to advance the accumulators deterministically.
+#       Read both and assert each advanced to the expected non-zero delta.
+#   (3) Read again and assert each is monotonic (>= the first read).
+#   (4) RESET both and assert the next read dropped toward zero.
+#
+# do_perf_selftest is the entry init/main.ad's boot:37.perf gate calls. It
+# returns 1 on success, 0 on any failure (matching caps_selftest's convention).
+
+from kernel.sched.core import (
+    TaskStruct, current_task, FD_CLOSED_MARK,
+    yield_to_others,
+    # The EXACT accumulator-charge helpers the page-fault handler and
+    # schedule() drive at their real charge sites. The boot bootstrap task
+    # usually has no second runnable task, so a cooperative yield often does
+    # not actually switch — exactly the reason the landed ctxsw_selftest /
+    # pgfault_selftest charge these helpers directly to advance the REAL
+    # per-task accumulators deterministically. perf reads those same
+    # accumulators, so this exercises the real counter path end to end.
+    current_task_account_minor_fault,
+    task_account_voluntary_ctxsw_at,
+    task_account_involuntary_ctxsw_at,
+)
+
+
+PERF_SELFTEST_PAGES: uint64 = 64         # fresh pages to touch (minor faults)
+PERF_SELFTEST_YIELDS: uint64 = 200       # yield loop iterations
+
+
+# A scratch attr buffer the self-test fills (mirrors a userland
+# struct perf_event_attr). 48 bytes covers the flags word at offset 40.
+uperf_test_attr: Array[48, uint8]
+# A demand-faultable scratch arena so the self-test can touch fresh pages and
+# drive real minor faults through the page-fault accounting path. 64 pages.
+uperf_test_arena: Array[262144, uint8]   # 64 * 4096
+
+
+def _uperf_build_attr(config: uint64, disabled: int32):
+    # Zero the buffer, then plant type=SOFTWARE, size=48, config, disabled bit.
+    i: uint64 = 0
+    while i < 48:
+        uperf_test_attr[i] = 0
+        i = i + 1
+    base: uint64 = cast[uint64](&uperf_test_attr[0])
+    cast[Ptr[uint32]](base + PERF_ATTR_OFF_TYPE)[0]   = PERF_TYPE_SOFTWARE
+    cast[Ptr[uint32]](base + PERF_ATTR_OFF_SIZE)[0]   = cast[uint32](48)
+    cast[Ptr[uint64]](base + PERF_ATTR_OFF_CONFIG)[0] = config
+    if disabled != 0:
+        cast[Ptr[uint64]](base + PERF_ATTR_OFF_FLAGS)[0] = PERF_ATTR_DISABLED_BIT
+    else:
+        cast[Ptr[uint64]](base + PERF_ATTR_OFF_FLAGS)[0] = 0
+
+
+def _perf_fail(msg: Ptr[char]):
+    printk0("[perf] FAIL: ")
+    printk0(msg)
+    printk0("\n")
+
+
+def do_perf_selftest() -> int32:
+    uperf_init()
+
+    # Free fd slots 3..15 in the boot task's fd table (snapshot to restore).
+    pf_boot_task: Ptr[TaskStruct] = current_task()
+    pf_fd_save: Array[16, uint32]
+    pf_fdi: uint64 = 3
+    while pf_fdi < 16:
+        pf_fd_save[pf_fdi] = pf_boot_task[0].fd_idx[pf_fdi]
+        pf_boot_task[0].fd_idx[pf_fdi] = FD_CLOSED_MARK
+        pf_fdi = pf_fdi + 1
+
+    rc: int32 = _do_perf_selftest_body()
+
+    # Restore the boot task's original fd-table slots (3..15).
+    pf_rfdi: uint64 = 3
+    while pf_rfdi < 16:
+        pf_boot_task[0].fd_idx[pf_rfdi] = pf_fd_save[pf_rfdi]
+        pf_rfdi = pf_rfdi + 1
+    return rc
+
+
+# How many faults / switches the deterministic work loop charges. perf must
+# report exactly these deltas (the boot task starts each event's baseline at
+# ENABLE, so the delta is purely the work we drive after that).
+PERF_WORK_FAULTS:  uint64 = 8        # minor faults charged after ENABLE
+PERF_WORK_VCTXSW:  uint64 = 3        # voluntary switches charged after ENABLE
+PERF_WORK_ICTXSW:  uint64 = 5        # involuntary switches charged after ENABLE
+PERF_WORK_CTXSW:   uint64 = 8        # total switches (= VCTXSW + ICTXSW)
+
+
+def _uperf_do_work():
+    # Realistic load: touch fresh pages + cooperatively yield. On the boot
+    # bootstrap task these rarely fault or switch (one runnable task), so we
+    # ALSO drive the exact accumulator-charge helpers the page-fault handler
+    # and schedule() call at their real sites — the same approach the landed
+    # pgfault_selftest / ctxsw_selftest use to advance the REAL per-task
+    # counters deterministically. perf reads those same accumulators.
+    pg: uint64 = 0
+    while pg < PERF_SELFTEST_PAGES:
+        uperf_test_arena[pg * 4096] = cast[uint8]((pg & 0xFF))
+        pg = pg + 1
+    yi: uint64 = 0
+    while yi < PERF_SELFTEST_YIELDS:
+        yield_to_others()
+        yi = yi + 1
+    # Deterministically advance the real accumulators perf reads.
+    slot: uint64 = current_idx_get()
+    f: uint64 = 0
+    while f < PERF_WORK_FAULTS:
+        current_task_account_minor_fault()
+        f = f + 1
+    v: uint64 = 0
+    while v < PERF_WORK_VCTXSW:
+        task_account_voluntary_ctxsw_at(slot)
+        v = v + 1
+    iv: uint64 = 0
+    while iv < PERF_WORK_ICTXSW:
+        task_account_involuntary_ctxsw_at(slot)
+        iv = iv + 1
+
+
+def _do_perf_selftest_body() -> int32:
+    # --- (1) open two DISABLED software events --------------------------
+    _uperf_build_attr(PERF_COUNT_SW_PAGE_FAULTS, 1)
+    pf_fd64: int64 = uperf_event_open(cast[uint64](&uperf_test_attr[0]),
+                                      0, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0)
+    if pf_fd64 < 0:
+        _perf_fail("perf_event_open(PAGE_FAULTS) returned an error")
+        return 0
+    pf_fd: int32 = cast[int32](pf_fd64)
+    if vfs_fd_marker(pf_fd) != FD_PERF_MARK:
+        _perf_fail("PAGE_FAULTS fd is not tagged FD_PERF_MARK")
+        return 0
+
+    _uperf_build_attr(PERF_COUNT_SW_CONTEXT_SWITCHES, 1)
+    cs_fd64: int64 = uperf_event_open(cast[uint64](&uperf_test_attr[0]),
+                                      0, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0)
+    if cs_fd64 < 0:
+        vfs_close(pf_fd)
+        _perf_fail("perf_event_open(CONTEXT_SWITCHES) returned an error")
+        return 0
+    cs_fd: int32 = cast[int32](cs_fd64)
+    printk0("[PERF] PASS opened PAGE_FAULTS + CONTEXT_SWITCHES events\n")
+
+    # While disabled, both must read 0 (no delta accumulated yet).
+    rd_buf: Array[8, uint8]
+    if uperf_read(pf_fd, cast[uint64](&rd_buf[0]), 8) != 8:
+        vfs_close(pf_fd)
+        vfs_close(cs_fd)
+        _perf_fail("read(PAGE_FAULTS) while disabled did not return 8 bytes")
+        return 0
+    dis_pf: uint64 = cast[Ptr[uint64]](cast[uint64](&rd_buf[0]))[0]
+    if uperf_read(cs_fd, cast[uint64](&rd_buf[0]), 8) != 8:
+        vfs_close(pf_fd)
+        vfs_close(cs_fd)
+        _perf_fail("read(CONTEXT_SWITCHES) while disabled did not return 8")
+        return 0
+    dis_cs: uint64 = cast[Ptr[uint64]](cast[uint64](&rd_buf[0]))[0]
+    if dis_pf != 0 or dis_cs != 0:
+        vfs_close(pf_fd)
+        vfs_close(cs_fd)
+        _perf_fail("a disabled event read a non-zero delta")
+        return 0
+    printk0("[PERF] PASS disabled events read zero\n")
+
+    # --- (2) ENABLE both, do measurable work, assert the exact deltas ----
+    if uperf_ioctl(pf_fd, PERF_EVENT_IOC_ENABLE, 0) != 0:
+        vfs_close(pf_fd)
+        vfs_close(cs_fd)
+        _perf_fail("ioctl(ENABLE) on PAGE_FAULTS failed")
+        return 0
+    if uperf_ioctl(cs_fd, PERF_EVENT_IOC_ENABLE, 0) != 0:
+        vfs_close(pf_fd)
+        vfs_close(cs_fd)
+        _perf_fail("ioctl(ENABLE) on CONTEXT_SWITCHES failed")
+        return 0
+
+    _uperf_do_work()
+
+    if uperf_read(cs_fd, cast[uint64](&rd_buf[0]), 8) != 8:
+        vfs_close(pf_fd)
+        vfs_close(cs_fd)
+        _perf_fail("read(CONTEXT_SWITCHES) after work did not return 8")
+        return 0
+    cs_after: uint64 = cast[Ptr[uint64]](cast[uint64](&rd_buf[0]))[0]
+    if uperf_read(pf_fd, cast[uint64](&rd_buf[0]), 8) != 8:
+        vfs_close(pf_fd)
+        vfs_close(cs_fd)
+        _perf_fail("read(PAGE_FAULTS) after work did not return 8")
+        return 0
+    pf_after: uint64 = cast[Ptr[uint64]](cast[uint64](&rd_buf[0]))[0]
+
+    # Both must have advanced to a non-zero delta. The deltas reflect the
+    # deterministic charges (yields may add MORE switches on a busier system,
+    # so assert >= the charged amount, not ==).
+    if pf_after < PERF_WORK_FAULTS:
+        vfs_close(pf_fd)
+        vfs_close(cs_fd)
+        _perf_fail("PAGE_FAULTS delta did not reach the charged minor faults")
+        return 0
+    if cs_after < PERF_WORK_CTXSW:
+        vfs_close(pf_fd)
+        vfs_close(cs_fd)
+        _perf_fail("CONTEXT_SWITCHES delta did not reach the charged switches")
+        return 0
+    printk1("[PERF] PASS PAGE_FAULTS advanced to %d\n", pf_after)
+    printk1("[PERF] PASS CONTEXT_SWITCHES advanced to %d\n", cs_after)
+
+    # --- (3) monotonic: more work, the delta only grows ------------------
+    _uperf_do_work()
+    if uperf_read(cs_fd, cast[uint64](&rd_buf[0]), 8) != 8:
+        vfs_close(pf_fd)
+        vfs_close(cs_fd)
+        _perf_fail("second read(CONTEXT_SWITCHES) did not return 8")
+        return 0
+    cs_again: uint64 = cast[Ptr[uint64]](cast[uint64](&rd_buf[0]))[0]
+    # A second batch of work must have grown the delta strictly (never shrunk).
+    if cs_again <= cs_after:
+        vfs_close(pf_fd)
+        vfs_close(cs_fd)
+        _perf_fail("CONTEXT_SWITCHES did not grow after more work")
+        return 0
+    printk0("[PERF] PASS CONTEXT_SWITCHES monotonic-increasing while enabled\n")
+
+    # --- (4) RESET, assert the next read dropped toward zero -------------
+    if uperf_ioctl(cs_fd, PERF_EVENT_IOC_RESET, 0) != 0:
+        vfs_close(pf_fd)
+        vfs_close(cs_fd)
+        _perf_fail("ioctl(RESET) on CONTEXT_SWITCHES failed")
+        return 0
+    if uperf_read(cs_fd, cast[uint64](&rd_buf[0]), 8) != 8:
+        vfs_close(pf_fd)
+        vfs_close(cs_fd)
+        _perf_fail("read(CONTEXT_SWITCHES) after RESET did not return 8")
+        return 0
+    cs_reset: uint64 = cast[Ptr[uint64]](cast[uint64](&rd_buf[0]))[0]
+    # The reset baseline is "now"; the next read (no work in between) reflects
+    # only switches since RESET, far below the pre-reset value.
+    if cs_reset >= cs_again:
+        vfs_close(pf_fd)
+        vfs_close(cs_fd)
+        _perf_fail("CONTEXT_SWITCHES did not drop after RESET")
+        return 0
+    printk1("[PERF] PASS CONTEXT_SWITCHES dropped after RESET to %d\n", cs_reset)
+
+    # --- DISABLE freezes the delta --------------------------------------
+    # Re-read the pre-disable value, DISABLE, do more work, and assert the
+    # frozen read is unchanged (proving DISABLE stops counting).
+    if uperf_read(pf_fd, cast[uint64](&rd_buf[0]), 8) != 8:
+        vfs_close(pf_fd)
+        vfs_close(cs_fd)
+        _perf_fail("pre-disable read(PAGE_FAULTS) did not return 8")
+        return 0
+    pf_pre_dis: uint64 = cast[Ptr[uint64]](cast[uint64](&rd_buf[0]))[0]
+    if uperf_ioctl(pf_fd, PERF_EVENT_IOC_DISABLE, 0) != 0:
+        vfs_close(pf_fd)
+        vfs_close(cs_fd)
+        _perf_fail("ioctl(DISABLE) on PAGE_FAULTS failed")
+        return 0
+    _uperf_do_work()
+    if uperf_read(pf_fd, cast[uint64](&rd_buf[0]), 8) != 8:
+        vfs_close(pf_fd)
+        vfs_close(cs_fd)
+        _perf_fail("post-disable read(PAGE_FAULTS) did not return 8")
+        return 0
+    pf_frozen: uint64 = cast[Ptr[uint64]](cast[uint64](&rd_buf[0]))[0]
+    if pf_frozen != pf_pre_dis:
+        vfs_close(pf_fd)
+        vfs_close(cs_fd)
+        _perf_fail("PAGE_FAULTS kept counting after DISABLE")
+        return 0
+    printk0("[PERF] PASS DISABLE froze the PAGE_FAULTS delta\n")
+
+    # --- error-path coverage -------------------------------------------
+    # A read of fewer than 8 bytes is EINVAL.
+    if uperf_read(cs_fd, cast[uint64](&rd_buf[0]), 4) != PERF_EINVAL:
+        vfs_close(pf_fd)
+        vfs_close(cs_fd)
+        _perf_fail("short read did not return EINVAL")
+        return 0
+    # A non-software type is EINVAL at open.
+    _uperf_build_attr(PERF_COUNT_SW_CPU_CLOCK, 0)
+    cast[Ptr[uint32]](cast[uint64](&uperf_test_attr[0]) + PERF_ATTR_OFF_TYPE)[0] = \
+        cast[uint32](4)                      # PERF_TYPE_RAW — unsupported
+    if uperf_event_open(cast[uint64](&uperf_test_attr[0]),
+                        0, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0) != PERF_EINVAL:
+        vfs_close(pf_fd)
+        vfs_close(cs_fd)
+        _perf_fail("non-software perf type did not return EINVAL")
+        return 0
+    printk0("[PERF] PASS EINVAL error paths correct\n")
+
+    # Tidy: drop the per-fd records + the fd-table slots.
+    uperf_close_fd(current_idx_get(), pf_fd)
+    uperf_close_fd(current_idx_get(), cs_fd)
+    vfs_close(pf_fd)
+    vfs_close(cs_fd)
+
+    printk0("[perf] PASS\n")
+    return 1
