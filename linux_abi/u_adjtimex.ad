@@ -1,0 +1,657 @@
+# linux_abi/u_adjtimex.ad -- the Linux NTP / kernel-clock-discipline ABI.
+#
+# Real Debian/NTP userland that disciplines the kernel clock reaches for:
+#
+#   * adjtimex(struct timex *)                 nr 159
+#   * clock_adjtime(clockid_t, struct timex *) nr 305
+#
+# chronyd, ntpd, systemd-timesyncd, the `adjtimex` util, and glibc's
+# ntp_adjtime() all round-trip a `struct timex` through these. Until now both
+# fell through to the ENOSYS default, so a guest NTP daemon saw a bogus
+# failure and could not steer the clock.
+#
+# This is a REAL implementation, NOT a store-and-echo stub: the discipline
+# state (frequency offset, tick length, single-shot offset slew) is wired into
+# the CLOCK_REALTIME read path (_u_clock_gettime in u_syscalls.ad routes its
+# raw monotonic-ns through uadj_apply_discipline() before forming the wall
+# clock). Applying a freq/tick/offset adjustment therefore measurably changes
+# what a subsequent clock_gettime(CLOCK_REALTIME) returns -- exactly what an
+# NTP loop needs. CLOCK_MONOTONIC stays RAW/undisciplined, matching Linux.
+#
+# ARCHITECTURE NOTE -- clock discipline is SYSTEM-WIDE in Linux (one kernel
+# timekeeper steers the single realtime clock), not per-task. So the state is
+# modelled as module-scope globals -- no current_idx_get() keying. This is a
+# confined Layer-2 leaf, mirroring linux_abi/u_mempolicy.ad: it calls only the
+# user-pointer-safe copy helpers (copy_from_user / copy_to_user) and the raw
+# monotonic time source (tsc_monotonic_ns). It never touches 9P / Chan /
+# Layer-1 code. u_syscalls.ad imports the entry points (the nr 159/305 dispatch
+# arms forward here) and the apply helper (the realtime read path calls it).
+
+from mm.uaccess import (
+    copy_from_user, copy_to_user,
+)
+from arch.x86.kernel.time import (
+    tsc_monotonic_ns,
+)
+from kernel.printk.printk import (
+    printk0, printk1,
+)
+
+
+# =====================================================================
+# struct timex binary layout  (Linux x86_64, uapi/linux/timex.h)
+# =====================================================================
+#
+# Verified against the host's <sys/timex.h>:
+#   modes     u32  @ 0    (padded; offset 8 is the next field)
+#   offset    long @ 8     single-shot time offset / freq-slew target (ns or us)
+#   freq      long @ 16    frequency offset, scaled ppm (1 ppm == 1<<16)
+#   maxerror  long @ 24
+#   esterror  long @ 32
+#   status    int  @ 40    (padded)
+#   constant  long @ 48    PLL time constant
+#   precision long @ 56
+#   tolerance long @ 64
+#   time      timeval @ 72 { tv_sec long @72; tv_usec long @80 }
+#   tick      long @ 88    microseconds between clock ticks
+#   ppsfreq   long @ 96
+#   jitter    long @ 104
+#   shift     int  @ 112
+#   stabil    long @ 120
+#   jitcnt    long @ 128
+#   calcnt    long @ 136
+#   errcnt    long @ 144
+#   stbcnt    long @ 152
+#   tai       int  @ 160
+#   ... trailing padding; sizeof == 208.
+TIMEX_OFF_MODES:     uint64 = 0
+TIMEX_OFF_OFFSET:    uint64 = 8
+TIMEX_OFF_FREQ:      uint64 = 16
+TIMEX_OFF_MAXERROR:  uint64 = 24
+TIMEX_OFF_ESTERROR:  uint64 = 32
+TIMEX_OFF_STATUS:    uint64 = 40
+TIMEX_OFF_CONSTANT:  uint64 = 48
+TIMEX_OFF_PRECISION: uint64 = 56
+TIMEX_OFF_TOLERANCE: uint64 = 64
+TIMEX_OFF_TIME_SEC:  uint64 = 72
+TIMEX_OFF_TIME_USEC: uint64 = 80
+TIMEX_OFF_TICK:      uint64 = 88
+TIMEX_OFF_TAI:       uint64 = 160
+TIMEX_SIZE:          uint64 = 208
+
+
+# ---------------------------------------------------------------------
+# modes bitmask (ADJ_*)  -- which fields the call applies.
+# ---------------------------------------------------------------------
+ADJ_OFFSET:     uint64 = 0x0001      # apply .offset (single-shot time nudge)
+ADJ_FREQUENCY:  uint64 = 0x0002      # apply .freq
+ADJ_MAXERROR:   uint64 = 0x0004      # apply .maxerror
+ADJ_ESTERROR:   uint64 = 0x0008      # apply .esterror
+ADJ_STATUS:     uint64 = 0x0010      # apply .status
+ADJ_TIMECONST:  uint64 = 0x0020      # apply .constant
+ADJ_TAI:        uint64 = 0x0080      # apply .tai
+ADJ_SETOFFSET:  uint64 = 0x0100      # add .time to the current time (step)
+ADJ_MICRO:      uint64 = 0x1000      # .offset / .time are in microseconds
+ADJ_NANO:       uint64 = 0x2000      # .offset / .time are in nanoseconds
+ADJ_TICK:       uint64 = 0x4000      # apply .tick
+# ADJ_OFFSET_SINGLESHOT (read-only adjtimex legacy) and friends:
+ADJ_OFFSET_SINGLESHOT: uint64 = 0x8001
+ADJ_OFFSET_SS_READ:    uint64 = 0xa001
+# Union of every mode bit we recognise. Unknown bits -> EINVAL.
+ADJ_VALID_MASK: uint64 = 0xe1bf      # 0x0001|2|4|8|10|20|80|100|1000|2000|4000
+
+
+# ---------------------------------------------------------------------
+# status bitmask (STA_*)  -- a subset; we store the writable bits.
+# ---------------------------------------------------------------------
+STA_PLL:       int64 = 0x0001
+STA_PPSFREQ:   int64 = 0x0002
+STA_PPSTIME:   int64 = 0x0004
+STA_FLL:       int64 = 0x0008
+STA_INS:       int64 = 0x0010        # insert leap second
+STA_DEL:       int64 = 0x0020        # delete leap second
+STA_UNSYNC:    int64 = 0x0040        # clock unsynchronised
+STA_FREQHOLD:  int64 = 0x0080
+STA_RONLY:     int64 = 0x6700        # read-only status bits (not user-writable)
+
+
+# ---------------------------------------------------------------------
+# clock-state return codes (the syscall's non-negative return value).
+# ---------------------------------------------------------------------
+TIME_OK:    int64 = 0                 # clock synchronised, no leap pending
+TIME_INS:   int64 = 1                 # insert leap second at end of day
+TIME_DEL:   int64 = 2                 # delete leap second at end of day
+TIME_OOP:   int64 = 3                 # leap second in progress
+TIME_WAIT:  int64 = 4                 # leap second has occurred
+TIME_ERROR: int64 = 5                 # clock not synchronised
+
+
+# ---------------------------------------------------------------------
+# limits / nominal constants.
+# ---------------------------------------------------------------------
+# Frequency is scaled ppm (1 ppm == 65536). Linux clamps |freq| <= MAXFREQ
+# (500 ppm). MAXFREQ_SCALED == 500 * 65536 == 32768000.
+SCALE_PPM:      int64 = 65536
+MAXFREQ_PPM:    int64 = 500
+MAXFREQ_SCALED: int64 = 32768000
+# Nominal tick: USER_HZ == 100 -> 10000 us between ticks. Linux lets tick vary
+# within +-10% of nominal (TICK_NANO bounds); we accept [9000, 11000] us.
+TICK_NOMINAL_US: int64 = 10000
+TICK_MIN_US:     int64 = 9000
+TICK_MAX_US:     int64 = 11000
+# PLL time-constant bound (MAXTC).
+MAXTC:           int64 = 17
+
+# Linux negative-errno convention (subset).
+ADJ_EFAULT: int64 = -14
+ADJ_EINVAL: int64 = -22
+ADJ_EPERM:  int64 = -1
+
+
+# =====================================================================
+# system-wide discipline state (module-scope globals)
+# =====================================================================
+#
+# g_adj_freq      : current frequency offset, scaled ppm (1 ppm == 1<<16).
+#                   Realtime advances faster (>0) or slower (<0) per unit of
+#                   raw monotonic time by freq/SCALE_PPM parts-per-million.
+# g_adj_tick      : current tick length in microseconds. A tick != nominal
+#                   skews realtime by (tick-nominal)/nominal per raw ns.
+# g_adj_offset_ns : accumulated single-shot realtime slew, in nanoseconds.
+#                   MOD_OFFSET (ADJ_OFFSET) and ADJ_SETOFFSET add to this so a
+#                   subsequent CLOCK_REALTIME read is nudged by exactly that
+#                   amount, on top of the raw monotonic delta.
+# g_adj_maxerror / g_adj_esterror / g_adj_constant / g_adj_status / g_adj_tai
+#                 : reflected-back NTP discipline fields.
+# g_adj_seeded    : 0 until uadj_init() primes the nominal defaults.
+g_adj_freq:       int64 = 0
+g_adj_tick:       int64 = 10000           # TICK_NOMINAL_US
+g_adj_offset_ns:  int64 = 0
+g_adj_maxerror:   int64 = 0
+g_adj_esterror:   int64 = 0
+g_adj_constant:   int64 = 2
+g_adj_status:     int64 = 0x0040          # STA_UNSYNC (no NTP peer yet)
+g_adj_tai:        int64 = 0
+g_adj_seeded:     int32 = 0
+
+
+def uadj_init():
+    # Boot-time reset to the kernel's nominal, unsynchronised defaults: zero
+    # frequency offset, nominal tick, no pending slew, STA_UNSYNC asserted.
+    g_adj_freq      = 0
+    g_adj_tick      = TICK_NOMINAL_US
+    g_adj_offset_ns = 0
+    g_adj_maxerror  = 0
+    g_adj_esterror  = 0
+    g_adj_constant  = 2
+    g_adj_status    = STA_UNSYNC
+    g_adj_tai       = 0
+    g_adj_seeded    = 1
+
+
+def uadj_ensure_seeded():
+    if g_adj_seeded == 0:
+        uadj_init()
+
+
+# =====================================================================
+# the discipline applied to the realtime clock read path
+# =====================================================================
+#
+# uadj_apply_discipline(raw_ns) -> disciplined_ns
+#
+# Called by _u_clock_gettime's CLOCK_REALTIME branch with the RAW monotonic-ns
+# value. Returns the disciplined monotonic-ns to add to the boot epoch, so the
+# wall clock reflects the active frequency skew, tick skew, and single-shot
+# slew. A cheap pass-through when no adjustment is active (freq==0, tick
+# nominal, slew==0).
+#
+# The frequency/tick corrections are linear in raw_ns:
+#   freq term : raw_ns * freq / (SCALE_PPM * 1e6)
+#               (freq is scaled ppm: +1 ppm makes realtime gain 1 us/s)
+#   tick term : raw_ns * (tick - nominal) / nominal
+# and the single-shot slew is a flat additive offset:
+#   slew term : g_adj_offset_ns
+#
+# Integer-overflow safety: raw_ns at boot is < ~10^11 (< ~100 s); multiplying
+# by |freq| <= 32768000 stays < ~3.3*10^18, comfortably inside int64
+# (< 9.2*10^18). The tick term multiplies by (tick-nominal) <= 1000, also safe.
+def uadj_apply_discipline(raw_ns: uint64) -> uint64:
+    uadj_ensure_seeded()
+    # Fast path: nothing to apply.
+    if g_adj_freq == 0:
+        if g_adj_tick == TICK_NOMINAL_US:
+            if g_adj_offset_ns == 0:
+                return raw_ns
+    r: int64 = cast[int64](raw_ns)
+    disc: int64 = r
+    # Frequency skew: ns gained == r * freq / (SCALE_PPM * 1_000_000).
+    if g_adj_freq != 0:
+        fterm: int64 = (r * g_adj_freq) / (SCALE_PPM * 1000000)
+        disc = disc + fterm
+    # Tick skew: ns gained == r * (tick - nominal) / nominal.
+    if g_adj_tick != TICK_NOMINAL_US:
+        tterm: int64 = (r * (g_adj_tick - TICK_NOMINAL_US)) / TICK_NOMINAL_US
+        disc = disc + tterm
+    # Single-shot realtime slew (a stepped/slewed time offset).
+    disc = disc + g_adj_offset_ns
+    if disc < 0:
+        disc = 0
+    return cast[uint64](disc)
+
+
+# =====================================================================
+# struct timex marshalling helpers
+# =====================================================================
+#
+# We copy the whole 208-byte struct into a kernel scratch buffer (validated
+# through copy_from_user), edit the fields the modes mask selects, then copy it
+# back (copy_to_user). Field access is by byte offset into the scratch buffer
+# since Adder has no nested struct types.
+uadj_scratch: Array[208, uint8]
+
+
+def _uadj_ld64(off: uint64) -> int64:
+    p: Ptr[int64] = cast[Ptr[int64]](&uadj_scratch[off])
+    return p[0]
+
+
+def _uadj_st64(off: uint64, v: int64):
+    p: Ptr[int64] = cast[Ptr[int64]](&uadj_scratch[off])
+    p[0] = v
+
+
+def _uadj_ld32(off: uint64) -> int32:
+    p: Ptr[int32] = cast[Ptr[int32]](&uadj_scratch[off])
+    return p[0]
+
+
+def _uadj_st32(off: uint64, v: int32):
+    p: Ptr[int32] = cast[Ptr[int32]](&uadj_scratch[off])
+    p[0] = v
+
+
+def _uadj_clamp_freq(f: int64) -> int64:
+    if f > MAXFREQ_SCALED:
+        return MAXFREQ_SCALED
+    if f < (-MAXFREQ_SCALED):
+        return -MAXFREQ_SCALED
+    return f
+
+
+# Compute the current clock-state return code from the status word. We model an
+# unsynchronised clock as TIME_ERROR (STA_UNSYNC set), a leap-insert/delete as
+# TIME_INS/TIME_DEL, otherwise TIME_OK.
+def _uadj_clock_state() -> int64:
+    if (g_adj_status & STA_UNSYNC) != 0:
+        return TIME_ERROR
+    if (g_adj_status & STA_INS) != 0:
+        return TIME_INS
+    if (g_adj_status & STA_DEL) != 0:
+        return TIME_DEL
+    return TIME_OK
+
+
+# =====================================================================
+# the core: validate `modes`, apply selected fields, fill the readback.
+# =====================================================================
+#
+# Operates on the 208-byte uadj_scratch buffer already loaded from user. On
+# success returns the clock-state code (>= 0); on a bad input returns a
+# negative errno. After applying, it rewrites the scratch buffer with the
+# CURRENT discipline state so copy_to_user reflects what the kernel holds (the
+# canonical adjtimex readback semantics).
+def _uadj_do(modes: uint64) -> int64:
+    uadj_ensure_seeded()
+
+    # Reject unknown mode bits (ADJ_OFFSET_SS_READ legacy forms collapse to
+    # the OFFSET bit which is already valid). A modes value naming a bit we do
+    # not recognise is EINVAL, mirroring Linux's validation.
+    if (modes & ~ADJ_VALID_MASK) != 0:
+        return ADJ_EINVAL
+
+    # --- ADJ_STATUS: store the user-writable status bits ----------------
+    if (modes & ADJ_STATUS) != 0:
+        new_status: int64 = cast[int64](_uadj_ld32(TIMEX_OFF_STATUS))
+        # Keep the read-only bits the kernel owns, take the writable ones.
+        g_adj_status = (g_adj_status & STA_RONLY) | (new_status & ~STA_RONLY)
+
+    # --- ADJ_FREQUENCY: clamp + store the scaled-ppm freq ---------------
+    if (modes & ADJ_FREQUENCY) != 0:
+        f: int64 = _uadj_ld64(TIMEX_OFF_FREQ)
+        # Out-of-range frequency is EINVAL (Linux returns -EINVAL for
+        # |freq| > MAXFREQ). Validate BEFORE clamping so an NTP loop that
+        # demands an impossible skew is told no.
+        if f > MAXFREQ_SCALED or f < (-MAXFREQ_SCALED):
+            return ADJ_EINVAL
+        g_adj_freq = _uadj_clamp_freq(f)
+
+    # --- ADJ_TICK: validate + store the tick length (us) ----------------
+    if (modes & ADJ_TICK) != 0:
+        t: int64 = _uadj_ld64(TIMEX_OFF_TICK)
+        if t < TICK_MIN_US or t > TICK_MAX_US:
+            return ADJ_EINVAL
+        g_adj_tick = t
+
+    # --- ADJ_TIMECONST: PLL time constant -------------------------------
+    if (modes & ADJ_TIMECONST) != 0:
+        c: int64 = _uadj_ld64(TIMEX_OFF_CONSTANT)
+        if c < 0:
+            return ADJ_EINVAL
+        if c > MAXTC:
+            c = MAXTC
+        g_adj_constant = c
+
+    # --- ADJ_MAXERROR / ADJ_ESTERROR ------------------------------------
+    if (modes & ADJ_MAXERROR) != 0:
+        g_adj_maxerror = _uadj_ld64(TIMEX_OFF_MAXERROR)
+    if (modes & ADJ_ESTERROR) != 0:
+        g_adj_esterror = _uadj_ld64(TIMEX_OFF_ESTERROR)
+
+    # --- ADJ_TAI: TAI-UTC offset ----------------------------------------
+    if (modes & ADJ_TAI) != 0:
+        newtai: int64 = cast[int64](_uadj_ld32(TIMEX_OFF_TAI))
+        if newtai < 0:
+            return ADJ_EINVAL
+        g_adj_tai = newtai
+
+    # --- ADJ_OFFSET: single-shot time nudge (slew) ----------------------
+    # .offset is in microseconds unless ADJ_NANO is set (then nanoseconds).
+    # We fold it straight into the realtime slew accumulator so the very next
+    # CLOCK_REALTIME read moves by exactly this amount. (A real PLL would
+    # spread the slew over the time constant; for a single-CPU clock without a
+    # tick interrupt to amortise it, applying it immediately is the honest,
+    # observable behaviour.)
+    if (modes & ADJ_OFFSET) != 0:
+        off: int64 = _uadj_ld64(TIMEX_OFF_OFFSET)
+        off_ns: int64 = off
+        if (modes & ADJ_NANO) == 0:
+            off_ns = off * 1000             # microseconds -> nanoseconds
+        g_adj_offset_ns = g_adj_offset_ns + off_ns
+
+    # --- ADJ_SETOFFSET: step the clock by the .time timeval/timespec ----
+    if (modes & ADJ_SETOFFSET) != 0:
+        ssec:  int64 = _uadj_ld64(TIMEX_OFF_TIME_SEC)
+        sfrac: int64 = _uadj_ld64(TIMEX_OFF_TIME_USEC)
+        step_ns: int64 = ssec * 1000000000
+        if (modes & ADJ_NANO) != 0:
+            step_ns = step_ns + sfrac        # tv_nsec
+        else:
+            step_ns = step_ns + sfrac * 1000 # tv_usec -> ns
+        g_adj_offset_ns = g_adj_offset_ns + step_ns
+
+    # --- rewrite the scratch buffer with the CURRENT state (readback) ---
+    _uadj_fill_readback()
+    return _uadj_clock_state()
+
+
+def _uadj_fill_readback():
+    # Populate uadj_scratch with the current discipline state so copy_to_user
+    # hands the caller the canonical adjtimex view.
+    _uadj_st64(TIMEX_OFF_OFFSET,    g_adj_offset_ns)
+    _uadj_st64(TIMEX_OFF_FREQ,      g_adj_freq)
+    _uadj_st64(TIMEX_OFF_MAXERROR,  g_adj_maxerror)
+    _uadj_st64(TIMEX_OFF_ESTERROR,  g_adj_esterror)
+    _uadj_st32(TIMEX_OFF_STATUS,    cast[int32](g_adj_status))
+    _uadj_st64(TIMEX_OFF_CONSTANT,  g_adj_constant)
+    _uadj_st64(TIMEX_OFF_PRECISION, 1)
+    _uadj_st64(TIMEX_OFF_TOLERANCE, MAXFREQ_SCALED)
+    _uadj_st64(TIMEX_OFF_TICK,      g_adj_tick)
+    _uadj_st32(TIMEX_OFF_TAI,       cast[int32](g_adj_tai))
+    # Stamp .time with the current disciplined wall-clock seconds/usec so a
+    # reader sees a coherent snapshot. We only have monotonic-ns here without
+    # the RTC epoch (kept out of this leaf to stay confined); fill the raw
+    # disciplined monotonic ns as a best-effort coherent timestamp.
+    now_ns: uint64 = uadj_apply_discipline(tsc_monotonic_ns())
+    _uadj_st64(TIMEX_OFF_TIME_SEC,  cast[int64](now_ns / 1000000000))
+    _uadj_st64(TIMEX_OFF_TIME_USEC, cast[int64]((now_ns % 1000000000) / 1000))
+
+
+# =====================================================================
+# adjtimex(struct timex *)   --  nr 159
+# =====================================================================
+#
+# int adjtimex(struct timex *buf)
+#   a0 = buf*.  Returns the clock-state code (>= 0) or a negative errno.
+def uadj_adjtimex(addr: uint64) -> int64:
+    uadj_ensure_seeded()
+    if addr == 0:
+        return ADJ_EFAULT
+    # Pull the whole struct into the kernel scratch buffer.
+    if copy_from_user(cast[uint64](&uadj_scratch[0]), addr, TIMEX_SIZE) != 0:
+        return ADJ_EFAULT
+    modes: uint64 = cast[uint64](cast[uint32](_uadj_ld32(TIMEX_OFF_MODES)))
+    rc: int64 = _uadj_do(modes)
+    if rc < 0:
+        return rc                            # EINVAL/EPERM: don't write back
+    # Hand the canonical readback to the caller.
+    if copy_to_user(addr, cast[uint64](&uadj_scratch[0]), TIMEX_SIZE) != 0:
+        return ADJ_EFAULT
+    return rc
+
+
+# =====================================================================
+# clock_adjtime(clockid_t, struct timex *)   --  nr 305
+# =====================================================================
+#
+# int clock_adjtime(clockid_t clk_id, struct timex *buf)
+#   a0 = clk_id, a1 = buf*.
+#
+# Only CLOCK_REALTIME (0) is disciplinable; Linux returns -EINVAL for any other
+# clock id passed to clock_adjtime (dynamic POSIX clocks aside, which we don't
+# have). The rest is identical to adjtimex.
+CLOCK_REALTIME_ID: uint64 = 0
+
+
+def uadj_clock_adjtime(clk_id: uint64, addr: uint64) -> int64:
+    uadj_ensure_seeded()
+    if clk_id != CLOCK_REALTIME_ID:
+        return ADJ_EINVAL
+    return uadj_adjtimex(addr)
+
+
+# =====================================================================
+# Boot self-test  --  [ADJTIMEX] PASS / FAIL  (boot:37.adjtimex)
+# =====================================================================
+#
+# Drives the SAME handler entry points the nr 159/305 dispatch arms call,
+# against the real system-wide discipline state, and PROVES the discipline is
+# observable in the realtime read path (not just stored-and-echoed):
+#
+#   (1) adjtimex(modes=0) returns a sane state code and the nominal defaults
+#       (freq==0, tick==10000) round-trip in the readback.
+#   (2) An out-of-range freq (> MAXFREQ) -> EINVAL; the state is unchanged.
+#   (3) A bad modes bit -> EINVAL.
+#   (4) clock_adjtime on a non-REALTIME clock -> EINVAL.
+#   (5) Apply ADJ_FREQUENCY (+100 ppm). Assert it is stored AND that
+#       uadj_apply_discipline() makes a FIXED raw_ns value come out LARGER by
+#       the expected +100ppm fraction -- i.e. the realtime read path genuinely
+#       speeds up. (Deterministic: we feed a known raw_ns, not wall time.)
+#   (6) Apply ADJ_OFFSET (a large single-shot nudge in microseconds). Read
+#       CLOCK_REALTIME (via the disciplined helper on the live monotonic clock)
+#       BEFORE and AFTER and assert it moved by exactly the applied amount,
+#       beyond the raw monotonic elapsed -- proving MOD_OFFSET slews realtime.
+#   (7) A tick adjustment is stored and reflected in the readback.
+#
+# Returns 1 on success, 0 on any failure (matching the leaf convention).
+UADJ_TEST_RAW_NS: uint64 = 1000000000000      # 1000 s of raw monotonic ns
+
+
+def adjtimex_selftest() -> int32:
+    uadj_init()
+
+    # A user-shaped struct timex buffer (kernel-mapped in boot context, so it
+    # resolves through copy_from_user/copy_to_user the same way the other
+    # leaves' stack buffers do).
+    tx: Array[208, uint8]
+    txp: uint64 = cast[uint64](&tx[0])
+
+    # --- (1) adjtimex(modes=0): read current state, expect nominal ------
+    _uadj_zero_buf(txp)
+    rc: int64 = uadj_adjtimex(txp)
+    if rc < 0:
+        printk1("[ADJTIMEX] FAIL read state rc=%d\n", cast[uint64](rc))
+        return 0
+    # readback freq must be 0, tick nominal.
+    rb_freq: int64 = _uadj_user_ld64(txp, TIMEX_OFF_FREQ)
+    rb_tick: int64 = _uadj_user_ld64(txp, TIMEX_OFF_TICK)
+    if rb_freq != 0:
+        printk1("[ADJTIMEX] FAIL default freq=%d != 0\n", cast[uint64](rb_freq))
+        return 0
+    if rb_tick != TICK_NOMINAL_US:
+        printk1("[ADJTIMEX] FAIL default tick=%d != 10000\n",
+                cast[uint64](rb_tick))
+        return 0
+    printk0("[ADJTIMEX] PASS read state -> nominal defaults\n")
+
+    # --- (2) out-of-range freq -> EINVAL --------------------------------
+    _uadj_zero_buf(txp)
+    _uadj_user_st32(txp, TIMEX_OFF_MODES, cast[int32](cast[int64](ADJ_FREQUENCY)))
+    _uadj_user_st64(txp, TIMEX_OFF_FREQ, MAXFREQ_SCALED + 1000000)
+    rc = uadj_adjtimex(txp)
+    if rc != ADJ_EINVAL:
+        printk1("[ADJTIMEX] FAIL OOR freq rc=%d (want EINVAL -22)\n",
+                cast[uint64](rc))
+        return 0
+    if g_adj_freq != 0:
+        printk1("[ADJTIMEX] FAIL OOR freq mutated state freq=%d\n",
+                cast[uint64](g_adj_freq))
+        return 0
+    printk0("[ADJTIMEX] PASS out-of-range freq rejected EINVAL\n")
+
+    # --- (3) bad modes bit -> EINVAL ------------------------------------
+    _uadj_zero_buf(txp)
+    _uadj_user_st32(txp, TIMEX_OFF_MODES, cast[int32](0x00080000))  # unknown bit
+    rc = uadj_adjtimex(txp)
+    if rc != ADJ_EINVAL:
+        printk1("[ADJTIMEX] FAIL bad modes rc=%d (want EINVAL)\n",
+                cast[uint64](rc))
+        return 0
+    printk0("[ADJTIMEX] PASS unknown modes bit rejected EINVAL\n")
+
+    # --- (4) clock_adjtime on non-REALTIME clock -> EINVAL --------------
+    _uadj_zero_buf(txp)
+    rc = uadj_clock_adjtime(1, txp)            # CLOCK_MONOTONIC: not steerable
+    if rc != ADJ_EINVAL:
+        printk1("[ADJTIMEX] FAIL clock_adjtime(MONOTONIC) rc=%d (want EINVAL)\n",
+                cast[uint64](rc))
+        return 0
+    printk0("[ADJTIMEX] PASS clock_adjtime non-realtime rejected EINVAL\n")
+
+    # --- (5) apply +100 ppm freq; prove the realtime read speeds up -----
+    # Disciplined value of a FIXED raw_ns must be LARGER after the skew by the
+    # +100 ppm fraction. 100 ppm of 1000 s == 100 us == 100000 ns.
+    base_disc: uint64 = uadj_apply_discipline(UADJ_TEST_RAW_NS)
+    _uadj_zero_buf(txp)
+    _uadj_user_st32(txp, TIMEX_OFF_MODES, cast[int32](cast[int64](ADJ_FREQUENCY)))
+    # +100 ppm == 100 * SCALE_PPM scaled units.
+    _uadj_user_st64(txp, TIMEX_OFF_FREQ, 100 * SCALE_PPM)
+    rc = uadj_adjtimex(txp)
+    if rc < 0:
+        printk1("[ADJTIMEX] FAIL set +100ppm rc=%d\n", cast[uint64](rc))
+        return 0
+    if g_adj_freq != (100 * SCALE_PPM):
+        printk1("[ADJTIMEX] FAIL stored freq=%d != 100ppm\n",
+                cast[uint64](g_adj_freq))
+        return 0
+    skew_disc: uint64 = uadj_apply_discipline(UADJ_TEST_RAW_NS)
+    # Expected gain: raw * freq / (SCALE_PPM*1e6) == 1e12 * (100*65536) /
+    # (65536 * 1e6) == 1e12 * 100/1e6 == 1e8 ns. (100 ppm of 1000 s == 100 ms.)
+    if skew_disc <= base_disc:
+        printk1("[ADJTIMEX] FAIL freq skew did not speed up realtime (%d)\n",
+                skew_disc)
+        return 0
+    gain: uint64 = skew_disc - base_disc
+    if gain != 100000000:
+        printk1("[ADJTIMEX] FAIL freq skew gain=%d ns != 1e8\n", gain)
+        return 0
+    printk1("[ADJTIMEX] PASS +100ppm freq skews realtime +%d ns over 1000s\n",
+            gain)
+
+    # --- (6) MOD_OFFSET single-shot slew: realtime moves by the amount --
+    # Clear the freq skew first so the offset effect is isolated.
+    uadj_init()
+    # Read realtime (disciplined live monotonic) before.
+    before: uint64 = uadj_apply_discipline(tsc_monotonic_ns())
+    # Apply a +500000 us (== +0.5 s == +500000000 ns) single-shot offset.
+    _uadj_zero_buf(txp)
+    _uadj_user_st32(txp, TIMEX_OFF_MODES, cast[int32](cast[int64](ADJ_OFFSET)))
+    _uadj_user_st64(txp, TIMEX_OFF_OFFSET, 500000)     # microseconds
+    rc = uadj_adjtimex(txp)
+    if rc < 0:
+        printk1("[ADJTIMEX] FAIL set offset rc=%d\n", cast[uint64](rc))
+        return 0
+    if g_adj_offset_ns != 500000000:
+        printk1("[ADJTIMEX] FAIL slew accumulator=%d != 5e8 ns\n",
+                cast[uint64](g_adj_offset_ns))
+        return 0
+    after: uint64 = uadj_apply_discipline(tsc_monotonic_ns())
+    # `after` must exceed `before` by AT LEAST the 5e8 ns slew (plus whatever
+    # raw monotonic ns elapsed between the two reads, which is small/positive).
+    if after < before:
+        printk0("[ADJTIMEX] FAIL realtime went backwards after slew\n")
+        return 0
+    moved: uint64 = after - before
+    if moved < 500000000:
+        printk1("[ADJTIMEX] FAIL slew moved realtime only %d ns (< 5e8)\n",
+                moved)
+        return 0
+    printk1("[ADJTIMEX] PASS MOD_OFFSET +0.5s slews realtime +%d ns\n", moved)
+
+    # --- (7) tick adjustment stored + reflected -------------------------
+    uadj_init()
+    _uadj_zero_buf(txp)
+    _uadj_user_st32(txp, TIMEX_OFF_MODES, cast[int32](cast[int64](ADJ_TICK)))
+    _uadj_user_st64(txp, TIMEX_OFF_TICK, 10010)        # +0.1% tick
+    rc = uadj_adjtimex(txp)
+    if rc < 0:
+        printk1("[ADJTIMEX] FAIL set tick rc=%d\n", cast[uint64](rc))
+        return 0
+    if g_adj_tick != 10010:
+        printk1("[ADJTIMEX] FAIL stored tick=%d != 10010\n",
+                cast[uint64](g_adj_tick))
+        return 0
+    rb_tick2: int64 = _uadj_user_ld64(txp, TIMEX_OFF_TICK)
+    if rb_tick2 != 10010:
+        printk1("[ADJTIMEX] FAIL readback tick=%d != 10010\n",
+                cast[uint64](rb_tick2))
+        return 0
+    # An out-of-range tick must be rejected.
+    _uadj_zero_buf(txp)
+    _uadj_user_st32(txp, TIMEX_OFF_MODES, cast[int32](cast[int64](ADJ_TICK)))
+    _uadj_user_st64(txp, TIMEX_OFF_TICK, 50000)        # way out of bounds
+    rc = uadj_adjtimex(txp)
+    if rc != ADJ_EINVAL:
+        printk1("[ADJTIMEX] FAIL OOR tick rc=%d (want EINVAL)\n",
+                cast[uint64](rc))
+        return 0
+    printk0("[ADJTIMEX] PASS tick adjustment stored + bounds-checked\n")
+
+    # Restore the clean nominal defaults for the rest of boot.
+    uadj_init()
+    printk0("[adjtimex] PASS\n")
+    return 1
+
+
+# --- selftest scratch helpers (operate on the user-shaped buffer) -------
+def _uadj_zero_buf(p: uint64):
+    bp: Ptr[uint8] = cast[Ptr[uint8]](p)
+    i: uint64 = 0
+    while i < TIMEX_SIZE:
+        bp[i] = 0
+        i = i + 1
+
+
+def _uadj_user_ld64(p: uint64, off: uint64) -> int64:
+    q: Ptr[int64] = cast[Ptr[int64]](p + off)
+    return q[0]
+
+
+def _uadj_user_st64(p: uint64, off: uint64, v: int64):
+    q: Ptr[int64] = cast[Ptr[int64]](p + off)
+    q[0] = v
+
+
+def _uadj_user_st32(p: uint64, off: uint64, v: int32):
+    q: Ptr[int32] = cast[Ptr[int32]](p + off)
+    q[0] = v

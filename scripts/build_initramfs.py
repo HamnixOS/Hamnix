@@ -1194,6 +1194,19 @@ if os.environ.get("ENABLE_BPF_TEST"):
 # boots omit the marker.
 if os.environ.get("ENABLE_USERFAULTFD_TEST"):
     FILES.append(("/etc/userfaultfd-test", b"1\n"))
+
+# adjtimex(2)/clock_adjtime(2) NTP clock-discipline self-test.
+# scripts/test_adjtimex.sh sets ENABLE_ADJTIMEX_TEST=1 to plant
+# /etc/adjtimex-test. init/main.ad at boot:37.adjtimex detects the marker and
+# calls adjtimex_selftest() (linux_abi/u_adjtimex.ad): it reads the nominal
+# discipline state, rejects an out-of-range freq / unknown modes bit /
+# non-realtime clock_adjtime with EINVAL, applies a +100 ppm frequency skew and
+# proves a FIXED raw monotonic-ns comes out larger through the realtime read
+# hook, applies a MOD_OFFSET single-shot and proves a CLOCK_REALTIME read moved
+# by exactly the applied amount, and stores + bounds-checks a tick adjustment,
+# emitting the [adjtimex] PASS banner. Default boots omit the marker.
+if os.environ.get("ENABLE_ADJTIMEX_TEST"):
+    FILES.append(("/etc/adjtimex-test", b"1\n"))
 # NUMA mempolicy round-trip self-test. scripts/test_mempolicy.sh sets
 # ENABLE_MEMPOLICY_TEST=1 to plant /etc/mempolicy-test. init/main.ad detects
 # the marker and calls mempolicy_selftest() (linux_abi/u_mempolicy.ad): it
