@@ -2310,6 +2310,20 @@ if os.environ.get("ENABLE_VLAN_TEST") == "1":
 if os.environ.get("ENABLE_GENEVE_TEST") == "1":
     FILES.append(("/etc/geneve-test", b"1\n"))
 
+# Native MACsec (IEEE 802.1AE) GCM-AES-128 link-layer encryption self-test.
+# scripts/test_macsec.sh sets ENABLE_MACSEC_TEST=1 to plant /etc/macsec-test;
+# init/main.ad's boot:37.macsec gate then runs macsec_selftest()
+# (drivers/net/macsec.ad), a pure in-memory test that runs a published
+# GCM-AES-128 known-answer vector, PROTECTs a known inner Ethernet frame into
+# dst|src|SecTAG(0x88E5,E/C/SC,AN,PN)|ciphertext|ICV (reusing the TLS AES-GCM
+# AEAD), proves the on-wire payload is real ciphertext, VALIDATEs it back
+# byte-identical, and proves the security properties (tampered ciphertext/ICV
+# rejected, replayed PN rejected, wrong key fails ICV) across two Secure
+# Associations. Prints "[macsec] PASS" / "[macsec] FAIL". Default boots ship
+# no marker.
+if os.environ.get("ENABLE_MACSEC_TEST") == "1":
+    FILES.append(("/etc/macsec-test", b"1\n"))
+
 # Native L2TPv3 (RFC 3931) Ethernet-pseudowire encap/decap self-test.
 # scripts/test_l2tp.sh sets ENABLE_L2TP_TEST=1 to plant /etc/l2tp-test;
 # init/main.ad's boot:37.l2tp gate then runs l2tp_selftest()

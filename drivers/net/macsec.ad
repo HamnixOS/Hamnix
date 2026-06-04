@@ -1,0 +1,1039 @@
+# drivers/net/macsec.ad
+#
+# MACsec — IEEE 802.1AE — link-layer (L2) authenticated frame encryption.
+# This is a NATIVE link-layer encryption shim, peer to the tunnel/overlay
+# drivers (geneve/vxlan/gre/l2tp): it takes a complete inner Ethernet frame
+# and produces a protected MACsec frame on the same physical link. There is
+# NO socket API and no IP encapsulation — MACsec operates hop-by-hop between
+# two stations on one Ethernet segment.
+#
+# Cipher suite: the IEEE-default GCM-AES-128 (the overwhelmingly common
+# deployment). The AES-GCM-128 AEAD primitive is REUSED from the native
+# stack's TLS implementation (drivers/net/tls.ad: _tls_aes_gcm_seal /
+# _tls_aes_gcm_open with key_len=16) — we do NOT reimplement AES or GHASH.
+#
+# Protected frame layout (802.1AE §9 / §10):
+#
+#   +----------------------------------------------------------------+
+#   | Dst MAC (6) | Src MAC (6)                                       |  (kept
+#   +----------------------------------------------------------------+   in clear)
+#   | SecTAG: MACsec EtherType 0x88E5 (2) | TCI/AN (1) | SL (1)       |
+#   |         | Packet Number PN (4) | optional SCI (8)               |
+#   +----------------------------------------------------------------+
+#   | Secure Data (User Data)  -- ENCRYPTED when E=1,C=1              |
+#   +----------------------------------------------------------------+
+#   | ICV (16)  -- GCM authentication tag                            |
+#   +----------------------------------------------------------------+
+#
+# SecTAG fields (802.1AE §9.3):
+#
+#    0                   1                   2                   3
+#    0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+#   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+#   |     MACsec EtherType 0x88E5   |  TCI | AN  |       SL        |
+#   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+#   |                     Packet Number (PN)                        |
+#   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+#   |             Secure Channel Identifier (SCI) [if SC=1]          |
+#   |                            (8 bytes)                           |
+#   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+#
+#   TCI/AN byte (bit 7..0):
+#     V   (0x80) : version, 0
+#     ES  (0x40) : End Station (SCI is implicit, source MAC)
+#     SC  (0x20) : SCI Present (the 8-byte SCI follows the PN)
+#     SCB (0x10) : Single Copy Broadcast (EPON)
+#     E   (0x08) : Encryption (user data is encrypted)
+#     C   (0x04) : Changed Text (secure data differs from user data; ICV present)
+#     AN  (0x03) : 2-bit Association Number selecting the active SA / key
+#
+#   SL (Short Length): if the secure-data length is < 48 bytes, SL carries it
+#   (1..47); otherwise SL = 0.
+#
+# The 96-bit GCM IV for GCM-AES is SCI (8 bytes) || PN (4 bytes), per
+# 802.1AE-2006 §14.5 (and SP 800-38D 12-byte nonce). The AAD is the
+# Destination MAC + Source MAC + the whole SecTAG (the bytes that are
+# authenticated but not encrypted); the user data is the AEAD plaintext.
+#
+# A small SecY / Secure-Channel / Secure-Association model is implemented:
+# one transmit Secure Channel with an incrementing PN, and (per direction)
+# two Secure Associations selectable by the 2-bit AN. Replay protection on
+# receive rejects a PN at or below the highest accepted PN.
+
+from kernel.printk.printk import printk0, printk1, printk2, printk_set_level
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
+from drivers.net.eth import ETH_HDR_LEN
+from drivers.net.tls import _tls_aes_gcm_seal, _tls_aes_gcm_open
+
+
+# --- Wire constants ----------------------------------------------------
+
+# IEEE 802.1AE MACsec EtherType (the SecTAG begins with this).
+MACSEC_ETHERTYPE: uint16 = 0x88E5
+
+# TCI flag bits in the TCI/AN byte.
+MACSEC_TCI_V:   uint8 = 0x80     # Version (must be 0)
+MACSEC_TCI_ES:  uint8 = 0x40     # End Station
+MACSEC_TCI_SC:  uint8 = 0x20     # SCI present
+MACSEC_TCI_SCB: uint8 = 0x10     # Single Copy Broadcast
+MACSEC_TCI_E:   uint8 = 0x08     # Encryption
+MACSEC_TCI_C:   uint8 = 0x04     # Changed Text
+MACSEC_AN_MASK: uint8 = 0x03     # 2-bit Association Number
+
+# Field lengths.
+MACSEC_SCI_LEN:    uint64 = 8    # Secure Channel Identifier
+MACSEC_ICV_LEN:    uint64 = 16   # GCM authentication tag
+MACSEC_GCM_IV_LEN: uint64 = 12   # 96-bit GCM nonce = SCI||PN
+MACSEC_KEY_LEN:    uint64 = 16   # GCM-AES-128 key (SAK)
+
+# SecTAG length WITH the optional 8-byte SCI present (SC=1):
+#   ethertype(2) + TCI/AN(1) + SL(1) + PN(4) + SCI(8) = 16.
+MACSEC_SECTAG_LEN_SCI: uint64 = 16
+# SecTAG length WITHOUT the SCI (SC=0): 2 + 1 + 1 + 4 = 8.
+MACSEC_SECTAG_LEN_NOSCI: uint64 = 8
+
+# Byte offsets of the SecTAG fields, relative to the SecTAG start (which is
+# itself right after the 12-byte dst+src MAC area).
+MACSEC_OFF_ETYPE: uint64 = 0
+MACSEC_OFF_TCI:   uint64 = 2
+MACSEC_OFF_SL:    uint64 = 3
+MACSEC_OFF_PN:    uint64 = 4
+MACSEC_OFF_SCI:   uint64 = 8     # only when SC=1
+
+# Short-Length threshold: secure data shorter than this carries its length
+# in the SL field; at or above it, SL = 0.
+MACSEC_MIN_DATA: uint64 = 48
+
+
+# Counters (mirror the /sys-visible MACsec statistics a real SecY keeps).
+macsec_tx_protected: uint64 = 0
+macsec_rx_validated: uint64 = 0
+macsec_rx_drops_icv: uint64 = 0     # ICV verification failures
+macsec_rx_drops_replay: uint64 = 0  # replay-window rejections
+macsec_rx_drops_bad: uint64 = 0     # malformed / not-MACsec
+
+
+# =====================================================================
+# SecY / SC / SA model
+# =====================================================================
+#
+# We model ONE transmit Secure Channel (with its own SCI + PN counter) and a
+# matching receive Secure Channel, each holding up to TWO Secure Associations
+# (keys) addressed by the 2-bit AN. On transmit we pick the active AN and use
+# its SAK; on receive we look up the SAK by the AN carried in the SecTAG.
+#
+# Transmit SC.
+macsec_tx_sci:      Array[8, uint8]      # transmit SCI (system id + port)
+macsec_tx_pn:       uint32 = 1           # next PN to use (must be nonzero)
+macsec_tx_active_an: uint8 = 0           # active Association Number
+
+# Receive SC.
+macsec_rx_sci:      Array[8, uint8]      # expected peer SCI
+macsec_rx_next_pn:  uint32 = 1           # lowest acceptable PN (replay window)
+macsec_replay_protect: int32 = 1         # 1 = enforce replay window
+
+# Per-AN keys (Secure Association Keys). Index by AN (0..3); we populate
+# AN 0 and AN 1 in the model. 4 * 16 = 64 bytes.
+macsec_sak:         Array[64, uint8]
+macsec_sa_in_use:   Array[4, uint8]      # 1 if SA[AN] holds a valid key
+
+
+def macsec_init():
+    # Reset counters + PN state. Idempotent. Keys/SCI are installed
+    # separately by macsec_install_tx_sc / macsec_install_sa.
+    macsec_tx_protected = 0
+    macsec_rx_validated = 0
+    macsec_rx_drops_icv = 0
+    macsec_rx_drops_replay = 0
+    macsec_rx_drops_bad = 0
+    macsec_tx_pn = 1
+    macsec_tx_active_an = 0
+    macsec_rx_next_pn = 1
+    macsec_replay_protect = 1
+    i: uint64 = 0
+    while i < 4:
+        macsec_sa_in_use[i] = 0
+        i = i + 1
+
+
+def macsec_install_tx_sc(sci: Ptr[uint8], start_pn: uint32):
+    # Install the transmit Secure Channel's SCI and initial PN.
+    i: uint64 = 0
+    while i < 8:
+        macsec_tx_sci[i] = sci[i]
+        i = i + 1
+    macsec_tx_pn = start_pn
+    if macsec_tx_pn == 0:
+        macsec_tx_pn = 1
+
+
+def macsec_install_rx_sc(sci: Ptr[uint8], next_pn: uint32):
+    # Install the receive Secure Channel's expected peer SCI + replay floor.
+    i: uint64 = 0
+    while i < 8:
+        macsec_rx_sci[i] = sci[i]
+        i = i + 1
+    macsec_rx_next_pn = next_pn
+    if macsec_rx_next_pn == 0:
+        macsec_rx_next_pn = 1
+
+
+def macsec_install_sa(an: uint8, key: Ptr[uint8]):
+    # Install a 16-byte SAK for Association Number `an` (0..3).
+    a: uint64 = cast[uint64](an & 0x3)
+    base: uint64 = a * MACSEC_KEY_LEN
+    i: uint64 = 0
+    while i < MACSEC_KEY_LEN:
+        macsec_sak[base + i] = key[i]
+        i = i + 1
+    macsec_sa_in_use[a] = 1
+
+
+def macsec_set_active_an(an: uint8):
+    macsec_tx_active_an = an & 0x3
+
+
+def macsec_set_replay_protect(on: int32):
+    macsec_replay_protect = on
+
+
+# =====================================================================
+# Big-endian field writers / readers
+# =====================================================================
+
+def _ms_put32(buf: Ptr[uint8], off: uint64, v: uint32):
+    buf[off]     = cast[uint8]((v >> 24) & 0xFF)
+    buf[off + 1] = cast[uint8]((v >> 16) & 0xFF)
+    buf[off + 2] = cast[uint8]((v >> 8) & 0xFF)
+    buf[off + 3] = cast[uint8](v & 0xFF)
+
+
+def _ms_get32(buf: Ptr[uint8], off: uint64) -> uint32:
+    r: uint32 = cast[uint32](buf[off]) << 24
+    r = r | (cast[uint32](buf[off + 1]) << 16)
+    r = r | (cast[uint32](buf[off + 2]) << 8)
+    r = r | cast[uint32](buf[off + 3])
+    return r
+
+
+def _ms_put16(buf: Ptr[uint8], off: uint64, v: uint16):
+    buf[off]     = cast[uint8]((cast[uint32](v) >> 8) & 0xFF)
+    buf[off + 1] = cast[uint8](cast[uint32](v) & 0xFF)
+
+
+def _ms_get16(buf: Ptr[uint8], off: uint64) -> uint16:
+    hi: uint16 = cast[uint16](buf[off]) << 8
+    lo: uint16 = cast[uint16](buf[off + 1])
+    return hi | lo
+
+
+# =====================================================================
+# GCM IV construction (96-bit nonce = SCI || PN)
+# =====================================================================
+
+# Scratch IV + AAD globals. The AAD is dst(6)+src(6)+SecTAG(<=16) = at most
+# 28 bytes; size generously. The IV is exactly 12 bytes.
+_ms_iv:  Array[16, uint8]
+_ms_aad: Array[64, uint8]
+
+
+def _ms_build_iv(sci: Ptr[uint8], pn: uint32):
+    # 802.1AE GCM-AES IV = SCI(8 bytes) || PN(4 bytes, big-endian).
+    i: uint64 = 0
+    while i < 8:
+        _ms_iv[i] = sci[i]
+        i = i + 1
+    _ms_put32(cast[Ptr[uint8]](&_ms_iv[0]), 8, pn)
+
+
+# =====================================================================
+# ENCRYPT (transmit)
+# =====================================================================
+
+def macsec_protect(inner: Ptr[uint8], inner_len: uint64,
+                   an: uint8, pn: uint32,
+                   out: Ptr[uint8], out_cap: uint64) -> int64:
+    # Build a protected MACsec frame from a complete inner Ethernet frame.
+    #
+    #   inner = dst(6) | src(6) | ethertype(2) | user-data...
+    #   out   = dst(6) | src(6) | SecTAG(16, SC=1) | encrypted-data | ICV(16)
+    #
+    # GCM-AES-128 with E=1,C=1 (confidentiality + integrity). The user data
+    # (everything after the inner 12-byte dst+src MACs, i.e. the inner
+    # ethertype + payload) is the AEAD plaintext; the AAD is the outer
+    # dst+src MACs + the SecTAG. Returns the protected frame length, or a
+    # negative code: -1 buffer too small, -2 inner frame too short, -3 no SAK
+    # installed for `an`.
+    if inner_len < ETH_HDR_LEN:
+        return -2
+    a: uint64 = cast[uint64](an & 0x3)
+    if macsec_sa_in_use[a] != 1:
+        return -3
+
+    # User data = the inner frame minus its 12-byte dst+src MAC area. In
+    # 802.1AE the secured payload is the original frame's MSDU including its
+    # EtherType, so we keep dst+src in clear and encrypt from byte 12 on.
+    data_off: uint64 = 12
+    data_len: uint64 = inner_len - data_off
+
+    sectag_len: uint64 = MACSEC_SECTAG_LEN_SCI    # SC=1: 16-byte SecTAG
+    total: uint64 = data_off + sectag_len + data_len + MACSEC_ICV_LEN
+    if total > out_cap:
+        return -1
+
+    # --- Outer dst+src MAC (copied verbatim from the inner frame) ---
+    i: uint64 = 0
+    while i < 12:
+        out[i] = inner[i]
+        i = i + 1
+
+    # --- SecTAG (offset 12 ..) ---
+    st: uint64 = 12
+    _ms_put16(out, st + MACSEC_OFF_ETYPE, MACSEC_ETHERTYPE)
+    # TCI/AN: V=0, SC=1 (SCI present), E=1, C=1, plus the 2-bit AN.
+    tci: uint8 = MACSEC_TCI_SC | MACSEC_TCI_E | MACSEC_TCI_C \
+                 | cast[uint8](a & 0x3)
+    out[st + MACSEC_OFF_TCI] = tci
+    # SL (Short Length): if the secure data < 48 bytes, carry its length.
+    sl: uint8 = 0
+    if data_len < MACSEC_MIN_DATA:
+        sl = cast[uint8](data_len & 0xFF)
+    out[st + MACSEC_OFF_SL] = sl
+    # PN (32-bit, big-endian).
+    _ms_put32(out, st + MACSEC_OFF_PN, pn)
+    # SCI (8 bytes) — the transmit SC's SCI.
+    i = 0
+    while i < 8:
+        out[st + MACSEC_OFF_SCI + i] = macsec_tx_sci[i]
+        i = i + 1
+
+    # --- GCM IV = SCI || PN ---
+    _ms_build_iv(cast[Ptr[uint8]](&macsec_tx_sci[0]), pn)
+
+    # --- AAD = dst(6) + src(6) + SecTAG (E=1,C=1 => no user data in AAD) ---
+    aad_len: uint64 = 12 + sectag_len
+    i = 0
+    while i < aad_len:
+        _ms_aad[i] = out[i]
+        i = i + 1
+
+    # --- AEAD seal: encrypt the user data, append the 16-byte ICV ---
+    ct_off: uint64 = st + sectag_len
+    icv_off: uint64 = ct_off + data_len
+    base: uint64 = a * MACSEC_KEY_LEN
+    _tls_aes_gcm_seal(
+        cast[Ptr[uint8]](&macsec_sak[base]), MACSEC_KEY_LEN,
+        cast[Ptr[uint8]](&_ms_iv[0]),
+        cast[Ptr[uint8]](&_ms_aad[0]), aad_len,
+        cast[Ptr[uint8]](cast[uint64](inner) + data_off), data_len,
+        cast[Ptr[uint8]](cast[uint64](out) + ct_off),
+        cast[Ptr[uint8]](cast[uint64](out) + icv_off))
+
+    macsec_tx_protected = macsec_tx_protected + 1
+    return cast[int64](total)
+
+
+def macsec_protect_next(inner: Ptr[uint8], inner_len: uint64,
+                        out: Ptr[uint8], out_cap: uint64) -> int64:
+    # Transmit-path convenience: protect using the active AN + the SC's PN
+    # counter, then increment the PN (per-frame, 802.1AE §10.5). Returns the
+    # protected length, or a negative code from macsec_protect.
+    rc: int64 = macsec_protect(inner, inner_len, macsec_tx_active_an,
+                               macsec_tx_pn, out, out_cap)
+    if rc < 0:
+        return rc
+    macsec_tx_pn = macsec_tx_pn + 1
+    if macsec_tx_pn == 0:          # PN exhaustion would require an SA rekey
+        macsec_tx_pn = 1
+    return rc
+
+
+# =====================================================================
+# DECRYPT (receive)
+# =====================================================================
+
+def macsec_is_macsec(frame: Ptr[uint8], length: uint64) -> int32:
+    # 1 if `frame` carries a MACsec SecTAG (EtherType 0x88E5 right after the
+    # 12-byte dst+src MAC area) and is long enough to hold a SecTAG + ICV.
+    if length < (12 + MACSEC_SECTAG_LEN_NOSCI + MACSEC_ICV_LEN):
+        return 0
+    if _ms_get16(frame, 12 + MACSEC_OFF_ETYPE) != MACSEC_ETHERTYPE:
+        return 0
+    return 1
+
+
+def macsec_frame_an(frame: Ptr[uint8]) -> uint8:
+    return frame[12 + MACSEC_OFF_TCI] & MACSEC_AN_MASK
+
+
+def macsec_frame_pn(frame: Ptr[uint8]) -> uint32:
+    return _ms_get32(frame, 12 + MACSEC_OFF_PN)
+
+
+def macsec_validate(frame: Ptr[uint8], length: uint64,
+                    out_inner: Ptr[uint8], out_cap: uint64,
+                    out_pn: Ptr[uint32]) -> int64:
+    # Validate + decrypt a protected MACsec frame, recovering the original
+    # inner Ethernet frame. Verifies the ICV (rejecting on mismatch),
+    # enforces the replay window via the PN, and on success copies
+    #   dst(6) | src(6) | decrypted-user-data
+    # into out_inner. Returns the inner length, or a negative code:
+    #   -1 not a MACsec frame / malformed
+    #   -2 out buffer too small
+    #   -3 no SAK installed for the frame's AN
+    #   -4 replay-window rejection (PN at/below the floor)
+    #   -5 ICV verification failed (tamper / wrong key)
+    if macsec_is_macsec(frame, length) != 1:
+        macsec_rx_drops_bad = macsec_rx_drops_bad + 1
+        return -1
+
+    tci: uint8 = frame[12 + MACSEC_OFF_TCI]
+    an: uint8 = tci & MACSEC_AN_MASK
+    a: uint64 = cast[uint64](an)
+    if macsec_sa_in_use[a] != 1:
+        macsec_rx_drops_bad = macsec_rx_drops_bad + 1
+        return -3
+
+    # SecTAG length depends on the SC (SCI-present) flag.
+    sectag_len: uint64 = MACSEC_SECTAG_LEN_NOSCI
+    if (tci & MACSEC_TCI_SC) != 0:
+        sectag_len = MACSEC_SECTAG_LEN_SCI
+    if length < (12 + sectag_len + MACSEC_ICV_LEN):
+        macsec_rx_drops_bad = macsec_rx_drops_bad + 1
+        return -1
+
+    pn: uint32 = _ms_get32(frame, 12 + MACSEC_OFF_PN)
+
+    # Replay protection: reject a PN at or below the highest accepted PN.
+    if macsec_replay_protect != 0:
+        if pn < macsec_rx_next_pn:
+            macsec_rx_drops_replay = macsec_rx_drops_replay + 1
+            return -4
+
+    # The IV uses the SCI carried in the frame (SC=1) or the configured peer
+    # SCI (SC=0, implicit).
+    if (tci & MACSEC_TCI_SC) != 0:
+        _ms_build_iv(cast[Ptr[uint8]](cast[uint64](frame) + 12 + MACSEC_OFF_SCI), pn)
+    else:
+        _ms_build_iv(cast[Ptr[uint8]](&macsec_rx_sci[0]), pn)
+
+    # Ciphertext spans from the end of the SecTAG to the start of the ICV.
+    ct_off: uint64 = 12 + sectag_len
+    icv_off: uint64 = length - MACSEC_ICV_LEN
+    if icv_off < ct_off:
+        macsec_rx_drops_bad = macsec_rx_drops_bad + 1
+        return -1
+    data_len: uint64 = icv_off - ct_off
+
+    inner_len: uint64 = 12 + data_len
+    if inner_len > out_cap:
+        return -2
+
+    # AAD = dst(6) + src(6) + SecTAG (the authenticated-but-clear bytes).
+    aad_len: uint64 = 12 + sectag_len
+    i: uint64 = 0
+    while i < aad_len:
+        _ms_aad[i] = frame[i]
+        i = i + 1
+
+    # Recover dst+src MACs in clear up front (they are not encrypted).
+    i = 0
+    while i < 12:
+        out_inner[i] = frame[i]
+        i = i + 1
+
+    base: uint64 = a * MACSEC_KEY_LEN
+    rc: int32 = _tls_aes_gcm_open(
+        cast[Ptr[uint8]](&macsec_sak[base]), MACSEC_KEY_LEN,
+        cast[Ptr[uint8]](&_ms_iv[0]),
+        cast[Ptr[uint8]](&_ms_aad[0]), aad_len,
+        cast[Ptr[uint8]](cast[uint64](frame) + ct_off), data_len,
+        cast[Ptr[uint8]](cast[uint64](frame) + icv_off),
+        cast[Ptr[uint8]](cast[uint64](out_inner) + 12))
+    if rc != 0:
+        macsec_rx_drops_icv = macsec_rx_drops_icv + 1
+        return -5
+
+    # ICV verified — advance the replay window past this PN.
+    if macsec_replay_protect != 0:
+        macsec_rx_next_pn = pn + 1
+
+    if out_pn != cast[Ptr[uint32]](0):
+        out_pn[0] = pn
+
+    macsec_rx_validated = macsec_rx_validated + 1
+    return cast[int64](inner_len)
+
+
+# =====================================================================
+# In-kernel self-test (deterministic, no NIC required)
+# =====================================================================
+#
+# Proves the REAL authenticated-encryption round-trip + the security
+# properties of 802.1AE GCM-AES-128:
+#   1. A published NIST/McGrew GCM-AES-128 known-answer test vector — proves
+#      the reused AEAD core is byte-correct.
+#   2. PROTECT a known inner Ethernet frame: assert the on-wire user data is
+#      genuinely ciphertext (differs from plaintext), the SecTAG carries the
+#      0x88E5 EtherType + E/C/SC flags + AN + PN, and the 16-byte ICV is
+#      present.
+#   3. VALIDATE the protected frame: recover the inner frame byte-identical.
+#   4. Tamper a ciphertext byte -> ICV REJECT.
+#   5. Tamper the ICV -> ICV REJECT.
+#   6. Replay the same PN -> replay REJECT.
+#   7. Wrong key (different AN's SAK) -> ICV REJECT.
+#   8. A second SA (AN=1, different key) round-trips independently.
+
+def _ms_emerg0(s: Ptr[char]):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0(s)
+
+
+def _ms_emerg1(s: Ptr[char], a: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk1(s, a)
+
+
+def _ms_emerg2(s: Ptr[char], a: uint64, b: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk2(s, a, b)
+
+
+# Generously-sized scratch globals. The inner frame is small; the protected
+# frame is inner + SecTAG(16) + ICV(16). Size for a full MTU + headroom so an
+# undersized Array[] can't silently overflow into adjacent BSS globals.
+MACSEC_T_INNER_CAP: uint64 = 2048
+MACSEC_T_OUT_CAP:   uint64 = 2048
+_mst_inner: Array[2048, uint8]
+_mst_out:   Array[2048, uint8]
+_mst_recov: Array[2048, uint8]
+_mst_sci:   Array[8, uint8]
+_mst_key0:  Array[16, uint8]
+_mst_key1:  Array[16, uint8]
+
+# Known-answer-test scratch (McGrew/Viega GCM Test Case 4, 96-bit IV).
+_mst_kat_key:   Array[16, uint8]
+_mst_kat_iv:    Array[12, uint8]
+_mst_kat_aad:   Array[20, uint8]
+_mst_kat_pt:    Array[64, uint8]
+_mst_kat_ct:    Array[64, uint8]
+_mst_kat_tag:   Array[16, uint8]
+_mst_kat_expct: Array[64, uint8]
+_mst_kat_exptag: Array[16, uint8]
+_mst_kat_dec:   Array[64, uint8]
+
+
+def _ms_build_inner(seed: uint8) -> uint64:
+    # Deterministic inner Ethernet frame: dst/src MAC + ethertype + payload.
+    i: uint64 = 0
+    while i < 6:
+        _mst_inner[i]     = cast[uint8](0xD0 + i)     # inner dst MAC
+        _mst_inner[6 + i] = cast[uint8](0xE0 + i)     # inner src MAC
+        i = i + 1
+    _mst_inner[12] = 0x08                             # ethertype 0x0800
+    _mst_inner[13] = 0x00
+    plen: uint64 = 50
+    i = 0
+    while i < plen:
+        _mst_inner[14 + i] = cast[uint8]((cast[uint32](seed) + cast[uint32](i) * 3) & 0xFF)
+        i = i + 1
+    return 14 + plen
+
+
+def _ms_kat() -> int32:
+    # McGrew/Viega "GCM" Test Case 4 (GCM-AES-128, 96-bit IV, with AAD):
+    #   K   = feffe9928665731c6d6a8f9467308308
+    #   IV  = cafebabefacedbaddecaf888
+    #   A   = feedfacedeadbeeffeedfacedeadbeefabaddad2   (20 bytes)
+    #   P   = d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a31
+    #         8a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39
+    #         (60 bytes)
+    #   C   = 42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329ac
+    #         a12e21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e091
+    #   T   = 5bc94fbc3221a5db94fae95ae7121a47
+    _mst_kat_key[0]=0xfe
+    _mst_kat_key[1]=0xff
+    _mst_kat_key[2]=0xe9
+    _mst_kat_key[3]=0x92
+    _mst_kat_key[4]=0x86
+    _mst_kat_key[5]=0x65
+    _mst_kat_key[6]=0x73
+    _mst_kat_key[7]=0x1c
+    _mst_kat_key[8]=0x6d
+    _mst_kat_key[9]=0x6a
+    _mst_kat_key[10]=0x8f
+    _mst_kat_key[11]=0x94
+    _mst_kat_key[12]=0x67
+    _mst_kat_key[13]=0x30
+    _mst_kat_key[14]=0x83
+    _mst_kat_key[15]=0x08
+
+    _mst_kat_iv[0]=0xca
+    _mst_kat_iv[1]=0xfe
+    _mst_kat_iv[2]=0xba
+    _mst_kat_iv[3]=0xbe
+    _mst_kat_iv[4]=0xfa
+    _mst_kat_iv[5]=0xce
+    _mst_kat_iv[6]=0xdb
+    _mst_kat_iv[7]=0xad
+    _mst_kat_iv[8]=0xde
+    _mst_kat_iv[9]=0xca
+    _mst_kat_iv[10]=0xf8
+    _mst_kat_iv[11]=0x88
+
+    _mst_kat_aad[0]=0xfe
+    _mst_kat_aad[1]=0xed
+    _mst_kat_aad[2]=0xfa
+    _mst_kat_aad[3]=0xce
+    _mst_kat_aad[4]=0xde
+    _mst_kat_aad[5]=0xad
+    _mst_kat_aad[6]=0xbe
+    _mst_kat_aad[7]=0xef
+    _mst_kat_aad[8]=0xfe
+    _mst_kat_aad[9]=0xed
+    _mst_kat_aad[10]=0xfa
+    _mst_kat_aad[11]=0xce
+    _mst_kat_aad[12]=0xde
+    _mst_kat_aad[13]=0xad
+    _mst_kat_aad[14]=0xbe
+    _mst_kat_aad[15]=0xef
+    _mst_kat_aad[16]=0xab
+    _mst_kat_aad[17]=0xad
+    _mst_kat_aad[18]=0xda
+    _mst_kat_aad[19]=0xd2
+
+    # Plaintext (60 bytes).
+    _mst_kat_pt[0]=0xd9
+    _mst_kat_pt[1]=0x31
+    _mst_kat_pt[2]=0x32
+    _mst_kat_pt[3]=0x25
+    _mst_kat_pt[4]=0xf8
+    _mst_kat_pt[5]=0x84
+    _mst_kat_pt[6]=0x06
+    _mst_kat_pt[7]=0xe5
+    _mst_kat_pt[8]=0xa5
+    _mst_kat_pt[9]=0x59
+    _mst_kat_pt[10]=0x09
+    _mst_kat_pt[11]=0xc5
+    _mst_kat_pt[12]=0xaf
+    _mst_kat_pt[13]=0xf5
+    _mst_kat_pt[14]=0x26
+    _mst_kat_pt[15]=0x9a
+    _mst_kat_pt[16]=0x86
+    _mst_kat_pt[17]=0xa7
+    _mst_kat_pt[18]=0xa9
+    _mst_kat_pt[19]=0x53
+    _mst_kat_pt[20]=0x15
+    _mst_kat_pt[21]=0x34
+    _mst_kat_pt[22]=0xf7
+    _mst_kat_pt[23]=0xda
+    _mst_kat_pt[24]=0x2e
+    _mst_kat_pt[25]=0x4c
+    _mst_kat_pt[26]=0x30
+    _mst_kat_pt[27]=0x3d
+    _mst_kat_pt[28]=0x8a
+    _mst_kat_pt[29]=0x31
+    _mst_kat_pt[30]=0x8a
+    _mst_kat_pt[31]=0x72
+    _mst_kat_pt[32]=0x1c
+    _mst_kat_pt[33]=0x3c
+    _mst_kat_pt[34]=0x0c
+    _mst_kat_pt[35]=0x95
+    _mst_kat_pt[36]=0x95
+    _mst_kat_pt[37]=0x68
+    _mst_kat_pt[38]=0x09
+    _mst_kat_pt[39]=0x53
+    _mst_kat_pt[40]=0x2f
+    _mst_kat_pt[41]=0xcf
+    _mst_kat_pt[42]=0x0e
+    _mst_kat_pt[43]=0x24
+    _mst_kat_pt[44]=0x49
+    _mst_kat_pt[45]=0xa6
+    _mst_kat_pt[46]=0xb5
+    _mst_kat_pt[47]=0x25
+    _mst_kat_pt[48]=0xb1
+    _mst_kat_pt[49]=0x6a
+    _mst_kat_pt[50]=0xed
+    _mst_kat_pt[51]=0xf5
+    _mst_kat_pt[52]=0xaa
+    _mst_kat_pt[53]=0x0d
+    _mst_kat_pt[54]=0xe6
+    _mst_kat_pt[55]=0x57
+    _mst_kat_pt[56]=0xba
+    _mst_kat_pt[57]=0x63
+    _mst_kat_pt[58]=0x7b
+    _mst_kat_pt[59]=0x39
+
+    # Expected ciphertext (60 bytes).
+    _mst_kat_expct[0]=0x42
+    _mst_kat_expct[1]=0x83
+    _mst_kat_expct[2]=0x1e
+    _mst_kat_expct[3]=0xc2
+    _mst_kat_expct[4]=0x21
+    _mst_kat_expct[5]=0x77
+    _mst_kat_expct[6]=0x74
+    _mst_kat_expct[7]=0x24
+    _mst_kat_expct[8]=0x4b
+    _mst_kat_expct[9]=0x72
+    _mst_kat_expct[10]=0x21
+    _mst_kat_expct[11]=0xb7
+    _mst_kat_expct[12]=0x84
+    _mst_kat_expct[13]=0xd0
+    _mst_kat_expct[14]=0xd4
+    _mst_kat_expct[15]=0x9c
+    _mst_kat_expct[16]=0xe3
+    _mst_kat_expct[17]=0xaa
+    _mst_kat_expct[18]=0x21
+    _mst_kat_expct[19]=0x2f
+    _mst_kat_expct[20]=0x2c
+    _mst_kat_expct[21]=0x02
+    _mst_kat_expct[22]=0xa4
+    _mst_kat_expct[23]=0xe0
+    _mst_kat_expct[24]=0x35
+    _mst_kat_expct[25]=0xc1
+    _mst_kat_expct[26]=0x7e
+    _mst_kat_expct[27]=0x23
+    _mst_kat_expct[28]=0x29
+    _mst_kat_expct[29]=0xac
+    _mst_kat_expct[30]=0xa1
+    _mst_kat_expct[31]=0x2e
+    _mst_kat_expct[32]=0x21
+    _mst_kat_expct[33]=0xd5
+    _mst_kat_expct[34]=0x14
+    _mst_kat_expct[35]=0xb2
+    _mst_kat_expct[36]=0x54
+    _mst_kat_expct[37]=0x66
+    _mst_kat_expct[38]=0x93
+    _mst_kat_expct[39]=0x1c
+    _mst_kat_expct[40]=0x7d
+    _mst_kat_expct[41]=0x8f
+    _mst_kat_expct[42]=0x6a
+    _mst_kat_expct[43]=0x5a
+    _mst_kat_expct[44]=0xac
+    _mst_kat_expct[45]=0x84
+    _mst_kat_expct[46]=0xaa
+    _mst_kat_expct[47]=0x05
+    _mst_kat_expct[48]=0x1b
+    _mst_kat_expct[49]=0xa3
+    _mst_kat_expct[50]=0x0b
+    _mst_kat_expct[51]=0x39
+    _mst_kat_expct[52]=0x6a
+    _mst_kat_expct[53]=0x0a
+    _mst_kat_expct[54]=0xac
+    _mst_kat_expct[55]=0x97
+    _mst_kat_expct[56]=0x3d
+    _mst_kat_expct[57]=0x58
+    _mst_kat_expct[58]=0xe0
+    _mst_kat_expct[59]=0x91
+
+    # Expected tag (16 bytes).
+    _mst_kat_exptag[0]=0x5b
+    _mst_kat_exptag[1]=0xc9
+    _mst_kat_exptag[2]=0x4f
+    _mst_kat_exptag[3]=0xbc
+    _mst_kat_exptag[4]=0x32
+    _mst_kat_exptag[5]=0x21
+    _mst_kat_exptag[6]=0xa5
+    _mst_kat_exptag[7]=0xdb
+    _mst_kat_exptag[8]=0x94
+    _mst_kat_exptag[9]=0xfa
+    _mst_kat_exptag[10]=0xe9
+    _mst_kat_exptag[11]=0x5a
+    _mst_kat_exptag[12]=0xe7
+    _mst_kat_exptag[13]=0x12
+    _mst_kat_exptag[14]=0x1a
+    _mst_kat_exptag[15]=0x47
+
+    pt_len: uint64 = 60
+    aad_len: uint64 = 20
+
+    _tls_aes_gcm_seal(
+        cast[Ptr[uint8]](&_mst_kat_key[0]), 16,
+        cast[Ptr[uint8]](&_mst_kat_iv[0]),
+        cast[Ptr[uint8]](&_mst_kat_aad[0]), aad_len,
+        cast[Ptr[uint8]](&_mst_kat_pt[0]), pt_len,
+        cast[Ptr[uint8]](&_mst_kat_ct[0]),
+        cast[Ptr[uint8]](&_mst_kat_tag[0]))
+
+    ct_ok: int32 = 1
+    i: uint64 = 0
+    while i < pt_len:
+        if _mst_kat_ct[i] != _mst_kat_expct[i]:
+            ct_ok = 0
+            i = pt_len
+        else:
+            i = i + 1
+    tag_ok: int32 = 1
+    i = 0
+    while i < 16:
+        if _mst_kat_tag[i] != _mst_kat_exptag[i]:
+            tag_ok = 0
+            i = 16
+        else:
+            i = i + 1
+    if ct_ok != 1 or tag_ok != 1:
+        return 0
+
+    # Round-trip: open recovers the plaintext under the expected tag.
+    op: int32 = _tls_aes_gcm_open(
+        cast[Ptr[uint8]](&_mst_kat_key[0]), 16,
+        cast[Ptr[uint8]](&_mst_kat_iv[0]),
+        cast[Ptr[uint8]](&_mst_kat_aad[0]), aad_len,
+        cast[Ptr[uint8]](&_mst_kat_expct[0]), pt_len,
+        cast[Ptr[uint8]](&_mst_kat_exptag[0]),
+        cast[Ptr[uint8]](&_mst_kat_dec[0]))
+    if op != 0:
+        return 0
+    i = 0
+    while i < pt_len:
+        if _mst_kat_dec[i] != _mst_kat_pt[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def macsec_selftest() -> int32:
+    # Returns 1 on PASS, 0 on FAIL. Prints [macsec] marker lines.
+    _ms_emerg0("[macsec] self-test start\n")
+    macsec_init()
+    ok: int32 = 1
+
+    # --- 1. Known-answer test against the McGrew/Viega GCM-AES-128 vector. --
+    if _ms_kat() != 1:
+        _ms_emerg0("[macsec] FAIL: GCM-AES-128 known-answer-test mismatch\n")
+        ok = 0
+    else:
+        _ms_emerg0("[macsec] PASS gcm-aes-128-kat (McGrew/Viega TC4)\n")
+
+    # --- SecY / SC / SA setup. ---
+    # Transmit & receive SC share the SCI (single point-to-point link here).
+    i: uint64 = 0
+    while i < 8:
+        _mst_sci[i] = cast[uint8](0x52 + i)         # arbitrary SCI
+        i = i + 1
+    macsec_install_tx_sc(cast[Ptr[uint8]](&_mst_sci[0]), 1)
+    macsec_install_rx_sc(cast[Ptr[uint8]](&_mst_sci[0]), 1)
+    # Two distinct SAKs, addressed by AN 0 and AN 1.
+    i = 0
+    while i < 16:
+        _mst_key0[i] = cast[uint8](0x10 + i)
+        _mst_key1[i] = cast[uint8](0xA0 + i)
+        i = i + 1
+    macsec_install_sa(0, cast[Ptr[uint8]](&_mst_key0[0]))
+    macsec_install_sa(1, cast[Ptr[uint8]](&_mst_key1[0]))
+    macsec_set_active_an(0)
+
+    # --- 2. PROTECT a known inner frame (AN=0, PN via the SC counter). ---
+    inner_len: uint64 = _ms_build_inner(0x5A)
+    prot_len: int64 = macsec_protect_next(
+        cast[Ptr[uint8]](&_mst_inner[0]), inner_len,
+        cast[Ptr[uint8]](&_mst_out[0]), MACSEC_T_OUT_CAP)
+    if prot_len < 0:
+        _ms_emerg1("[macsec] FAIL: protect rc=%d\n", cast[uint64](prot_len))
+        return 0
+    # Expected protected length: inner + SecTAG(16) + ICV(16).
+    exp_len: uint64 = inner_len + MACSEC_SECTAG_LEN_SCI + MACSEC_ICV_LEN
+    if cast[uint64](prot_len) != exp_len:
+        _ms_emerg2("[macsec] FAIL: protected len %d != %d\n",
+                   cast[uint64](prot_len), exp_len)
+        ok = 0
+    else:
+        _ms_emerg1("[macsec] PASS protected-len=%d\n", cast[uint64](prot_len))
+
+    # SecTAG EtherType must be 0x88E5.
+    etype: uint16 = _ms_get16(cast[Ptr[uint8]](&_mst_out[0]), 12 + MACSEC_OFF_ETYPE)
+    if etype != MACSEC_ETHERTYPE:
+        _ms_emerg1("[macsec] FAIL: SecTAG ethertype %x != 0x88E5\n", cast[uint64](etype))
+        ok = 0
+    else:
+        _ms_emerg0("[macsec] PASS sectag-ethertype=0x88E5\n")
+
+    # TCI flags: SC, E, C must be set; AN must be 0.
+    tci: uint8 = _mst_out[12 + MACSEC_OFF_TCI]
+    if (tci & MACSEC_TCI_SC) == 0 or (tci & MACSEC_TCI_E) == 0 \
+       or (tci & MACSEC_TCI_C) == 0:
+        _ms_emerg1("[macsec] FAIL: TCI flags %x missing SC/E/C\n", cast[uint64](tci))
+        ok = 0
+    else:
+        _ms_emerg0("[macsec] PASS tci-flags-SC-E-C\n")
+    if (tci & MACSEC_AN_MASK) != 0:
+        _ms_emerg1("[macsec] FAIL: AN %d != 0\n", cast[uint64](tci & MACSEC_AN_MASK))
+        ok = 0
+    else:
+        _ms_emerg0("[macsec] PASS an=0\n")
+
+    # PN must be 1 (the SC's initial PN).
+    pn_wire: uint32 = _ms_get32(cast[Ptr[uint8]](&_mst_out[0]), 12 + MACSEC_OFF_PN)
+    if pn_wire != 1:
+        _ms_emerg1("[macsec] FAIL: wire PN %d != 1\n", cast[uint64](pn_wire))
+        ok = 0
+    else:
+        _ms_emerg0("[macsec] PASS pn=1\n")
+
+    # The on-wire secure data must be genuine CIPHERTEXT (differ from the
+    # plaintext user data). Compare the protected payload bytes against the
+    # inner user data byte-for-byte; they must NOT all match.
+    ct_off: uint64 = 12 + MACSEC_SECTAG_LEN_SCI
+    data_off: uint64 = 12
+    data_len: uint64 = inner_len - data_off
+    differs: int32 = 0
+    i = 0
+    while i < data_len:
+        if _mst_out[ct_off + i] != _mst_inner[data_off + i]:
+            differs = 1
+            i = data_len
+        else:
+            i = i + 1
+    if differs != 1:
+        _ms_emerg0("[macsec] FAIL: secure data equals plaintext (not encrypted)\n")
+        ok = 0
+    else:
+        _ms_emerg0("[macsec] PASS payload-is-ciphertext\n")
+
+    # --- 3. VALIDATE: decrypt + recover the inner frame byte-identical. ---
+    rpn: uint32 = 0
+    rec_len: int64 = macsec_validate(
+        cast[Ptr[uint8]](&_mst_out[0]), cast[uint64](prot_len),
+        cast[Ptr[uint8]](&_mst_recov[0]), MACSEC_T_INNER_CAP,
+        cast[Ptr[uint32]](&rpn))
+    if rec_len < 0:
+        _ms_emerg1("[macsec] FAIL: validate rc=%d\n", cast[uint64](rec_len))
+        return 0
+    if cast[uint64](rec_len) != inner_len:
+        _ms_emerg2("[macsec] FAIL: recovered len %d != %d\n",
+                   cast[uint64](rec_len), inner_len)
+        ok = 0
+    if rpn != 1:
+        _ms_emerg1("[macsec] FAIL: recovered PN %d != 1\n", cast[uint64](rpn))
+        ok = 0
+    identical: int32 = 1
+    i = 0
+    while i < inner_len:
+        if _mst_recov[i] != _mst_inner[i]:
+            identical = 0
+            i = inner_len
+        else:
+            i = i + 1
+    if identical != 1:
+        _ms_emerg0("[macsec] FAIL: recovered inner frame not byte-identical\n")
+        ok = 0
+    else:
+        _ms_emerg0("[macsec] PASS roundtrip-byte-identical\n")
+
+    # --- 4. Tamper a ciphertext byte -> ICV REJECT. ---
+    saved: uint8 = _mst_out[ct_off + 3]
+    _mst_out[ct_off + 3] = saved ^ 0xFF
+    macsec_install_rx_sc(cast[Ptr[uint8]](&_mst_sci[0]), 1)   # reset replay floor
+    bad: int64 = macsec_validate(
+        cast[Ptr[uint8]](&_mst_out[0]), cast[uint64](prot_len),
+        cast[Ptr[uint8]](&_mst_recov[0]), MACSEC_T_INNER_CAP,
+        cast[Ptr[uint32]](&rpn))
+    _mst_out[ct_off + 3] = saved                              # restore
+    if bad != -5:
+        _ms_emerg1("[macsec] FAIL: tampered ciphertext accepted rc=%d\n", cast[uint64](bad))
+        ok = 0
+    else:
+        _ms_emerg0("[macsec] PASS reject-tampered-ciphertext\n")
+
+    # --- 5. Tamper the ICV -> ICV REJECT. ---
+    icv_off: uint64 = cast[uint64](prot_len) - MACSEC_ICV_LEN
+    sicv: uint8 = _mst_out[icv_off]
+    _mst_out[icv_off] = sicv ^ 0x80
+    macsec_install_rx_sc(cast[Ptr[uint8]](&_mst_sci[0]), 1)
+    badicv: int64 = macsec_validate(
+        cast[Ptr[uint8]](&_mst_out[0]), cast[uint64](prot_len),
+        cast[Ptr[uint8]](&_mst_recov[0]), MACSEC_T_INNER_CAP,
+        cast[Ptr[uint32]](&rpn))
+    _mst_out[icv_off] = sicv
+    if badicv != -5:
+        _ms_emerg1("[macsec] FAIL: tampered ICV accepted rc=%d\n", cast[uint64](badicv))
+        ok = 0
+    else:
+        _ms_emerg0("[macsec] PASS reject-tampered-icv\n")
+
+    # --- 6. Replay: re-submit PN=1 after a clean validation -> REJECT. ---
+    # Reset the replay floor to 1, validate once (advances floor to 2), then
+    # validate the SAME frame (PN=1) again — it must be replay-rejected.
+    macsec_install_rx_sc(cast[Ptr[uint8]](&_mst_sci[0]), 1)
+    first: int64 = macsec_validate(
+        cast[Ptr[uint8]](&_mst_out[0]), cast[uint64](prot_len),
+        cast[Ptr[uint8]](&_mst_recov[0]), MACSEC_T_INNER_CAP,
+        cast[Ptr[uint32]](&rpn))
+    if first < 0:
+        _ms_emerg1("[macsec] FAIL: replay-setup validate rc=%d\n", cast[uint64](first))
+        ok = 0
+    replay: int64 = macsec_validate(
+        cast[Ptr[uint8]](&_mst_out[0]), cast[uint64](prot_len),
+        cast[Ptr[uint8]](&_mst_recov[0]), MACSEC_T_INNER_CAP,
+        cast[Ptr[uint32]](&rpn))
+    if replay != -4:
+        _ms_emerg1("[macsec] FAIL: replayed PN accepted rc=%d\n", cast[uint64](replay))
+        ok = 0
+    else:
+        _ms_emerg0("[macsec] PASS reject-replayed-pn\n")
+
+    # --- 7. Wrong key: validate AN=0 frame as if it were AN=1's key. ---
+    # Forge the AN bits in the SecTAG to 1 (so validate picks AN=1's SAK),
+    # then re-validate — the ICV must fail because the bytes were sealed
+    # under AN=0's key (and the AN is part of neither AAD-changing here, but
+    # the SAK differs so GCM tag won't match). Restore afterwards.
+    macsec_install_rx_sc(cast[Ptr[uint8]](&_mst_sci[0]), 1)
+    stci: uint8 = _mst_out[12 + MACSEC_OFF_TCI]
+    _mst_out[12 + MACSEC_OFF_TCI] = (stci & 0xFC) | 0x01   # clear AN bits, set AN=1
+    wrongkey: int64 = macsec_validate(
+        cast[Ptr[uint8]](&_mst_out[0]), cast[uint64](prot_len),
+        cast[Ptr[uint8]](&_mst_recov[0]), MACSEC_T_INNER_CAP,
+        cast[Ptr[uint32]](&rpn))
+    _mst_out[12 + MACSEC_OFF_TCI] = stci
+    if wrongkey != -5:
+        _ms_emerg1("[macsec] FAIL: wrong-key frame accepted rc=%d\n", cast[uint64](wrongkey))
+        ok = 0
+    else:
+        _ms_emerg0("[macsec] PASS reject-wrong-key\n")
+
+    # --- 8. Second SA (AN=1, distinct key) round-trips independently. ---
+    macsec_set_active_an(1)
+    macsec_install_tx_sc(cast[Ptr[uint8]](&_mst_sci[0]), 100)   # fresh PN base
+    macsec_install_rx_sc(cast[Ptr[uint8]](&_mst_sci[0]), 100)
+    inner_len2: uint64 = _ms_build_inner(0x7E)
+    prot_len2: int64 = macsec_protect_next(
+        cast[Ptr[uint8]](&_mst_inner[0]), inner_len2,
+        cast[Ptr[uint8]](&_mst_out[0]), MACSEC_T_OUT_CAP)
+    if prot_len2 < 0:
+        _ms_emerg1("[macsec] FAIL: protect(AN1) rc=%d\n", cast[uint64](prot_len2))
+        return 0
+    tci2: uint8 = _mst_out[12 + MACSEC_OFF_TCI]
+    if (tci2 & MACSEC_AN_MASK) != 1:
+        _ms_emerg1("[macsec] FAIL: AN2 %d != 1\n", cast[uint64](tci2 & MACSEC_AN_MASK))
+        ok = 0
+    pn2: uint32 = _ms_get32(cast[Ptr[uint8]](&_mst_out[0]), 12 + MACSEC_OFF_PN)
+    if pn2 != 100:
+        _ms_emerg1("[macsec] FAIL: AN1 wire PN %d != 100\n", cast[uint64](pn2))
+        ok = 0
+    rpn2: uint32 = 0
+    rec_len2: int64 = macsec_validate(
+        cast[Ptr[uint8]](&_mst_out[0]), cast[uint64](prot_len2),
+        cast[Ptr[uint8]](&_mst_recov[0]), MACSEC_T_INNER_CAP,
+        cast[Ptr[uint32]](&rpn2))
+    if rec_len2 < 0:
+        _ms_emerg1("[macsec] FAIL: validate(AN1) rc=%d\n", cast[uint64](rec_len2))
+        return 0
+    identical2: int32 = 1
+    i = 0
+    while i < inner_len2:
+        if _mst_recov[i] != _mst_inner[i]:
+            identical2 = 0
+            i = inner_len2
+        else:
+            i = i + 1
+    if identical2 != 1 or rpn2 != 100:
+        _ms_emerg0("[macsec] FAIL: AN1 round-trip not byte-identical\n")
+        ok = 0
+    else:
+        _ms_emerg0("[macsec] PASS roundtrip-an1-pn100\n")
+
+    if ok == 1:
+        _ms_emerg0("[macsec] PASS\n")
+        return 1
+    _ms_emerg0("[macsec] FAIL\n")
+    return 0
