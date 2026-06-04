@@ -2239,6 +2239,19 @@ if os.environ.get("ENABLE_BRIDGE_TEST") == "1":
 if os.environ.get("ENABLE_VLAN_TEST") == "1":
     FILES.append(("/etc/vlan-test", b"1\n"))
 
+# Native link aggregation (bonding) self-test. scripts/test_bond.sh sets
+# ENABLE_BOND_TEST=1 to plant /etc/bond-test; init/main.ad's boot:37.bond
+# gate then runs bond_selftest() (drivers/net/bond.ad), a pure in-memory test
+# that enslaves fake member NICs into a bond and drives the REAL slave-
+# selection logic: mode-1 active-backup tx routes to the single active slave;
+# marking the active slave's link down promotes a live backup and tx fails
+# over to it; mode-0 balance-rr distributes frames round-robin across the live
+# slaves (even 2-each over 4) and SKIPS a slave whose link goes down; release
+# shrinks the member set. Prints "[bond] PASS" / "[bond] FAIL". Default boots
+# ship no marker so it is a no-op everywhere else.
+if os.environ.get("ENABLE_BOND_TEST") == "1":
+    FILES.append(("/etc/bond-test", b"1\n"))
+
 # Linux-style overlayfs (union filesystem) self-test. scripts/test_overlayfs.sh
 # sets ENABLE_OVERLAYFS_TEST=1 to plant /etc/overlayfs-test; init/main.ad's
 # boot:37.ovl gate then runs overlayfs_selftest() (fs/overlayfs.ad), which
