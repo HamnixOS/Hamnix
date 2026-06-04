@@ -25,6 +25,11 @@
 #     SEPARATE exception store, so the snapshot view keeps reading the
 #     pre-image while the origin advances to the new data; a never-written
 #     chunk passes through to the origin on both views.
+#   * INTEGRITY (dm-integrity / per-sector crc32c tags): a sector written
+#     through the integrity device records a salted crc32c tag; the readback
+#     validates and round-trips byte-identical. Corrupting the underlying
+#     backing sector directly is then DETECTED on the next read — the
+#     integrity device fails the I/O instead of returning the corrupt bytes.
 #
 # The self-test needs NO external disk — it backs everything onto its own
 # in-kernel ramdisk, so the boot is fully deterministic.
@@ -118,6 +123,9 @@ check "snapshot origin advanced" "[devmapper] snapshot: origin reads new data OK
 check "snapshot CoW pass"        "[dm] PASS snapshot-cow"
 check "snapshot passthrough"     "[dm] PASS snapshot-passthrough"
 check "snapshot subtest PASS"    "[dm] snapshot PASS"
+check "integrity round-trip"     "[devmapper] integrity: tag validated round-trip OK"
+check "integrity detect corrupt" "[dm] PASS integrity-detect-corruption"
+check "integrity subtest PASS"   "[dm] integrity PASS"
 check "device-mapper PASS"       "[device-mapper] PASS"
 
 if [ "$fail" -ne 0 ]; then
@@ -125,4 +133,4 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
-echo "[test_devmapper] PASS — native device-mapper: linear remap, two-target concatenation, AES-256-XTS dm-crypt (aes-xts-plain64: sector-keyed tweak, ciphertext-on-disk, plaintext round-trip, known-answer vector), and dm-snapshot copy-on-write (origin-write preserves the snapshot pre-image in a separate exception store; origin advances to new data; never-written chunks pass through to origin) all verified"
+echo "[test_devmapper] PASS — native device-mapper: linear remap, two-target concatenation, AES-256-XTS dm-crypt (aes-xts-plain64: sector-keyed tweak, ciphertext-on-disk, plaintext round-trip, known-answer vector), dm-snapshot copy-on-write (origin-write preserves the snapshot pre-image in a separate exception store; origin advances to new data; never-written chunks pass through to origin), and dm-integrity (per-sector salted crc32c tags: a known sector round-trips with its tag validated; corrupting the backing sector behind the target is DETECTED and the read fails instead of returning corrupt data) all verified"

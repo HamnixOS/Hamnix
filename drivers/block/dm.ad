@@ -74,6 +74,9 @@ from kernel.printk.printk import (
     printk0, printk1, printk2, printk_set_level,
 )
 from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
+from fs.crc32c import (
+    crc32c, crc32c_update,
+)
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
@@ -494,6 +497,7 @@ DM_TARGET_LINEAR:        uint32 = 1
 DM_TARGET_CRYPT:         uint32 = 2
 DM_TARGET_SNAPSHOT:      uint32 = 3   # frozen CoW view (reads exc-store/origin)
 DM_TARGET_SNAPSHOT_ORIGIN: uint32 = 4 # origin that performs copy-on-write
+DM_TARGET_INTEGRITY:     uint32 = 5   # per-sector crc32c integrity tags
 
 DM_KEY_LEN:      uint64 = 64       # AES-256-XTS: 32B data + 32B tweak key
 DM_MAX_TARGETS:  uint64 = 8        # targets per mapped device
@@ -569,6 +573,45 @@ class DmSnapContext:
 
 dm_snap_ctxs: Array[4, DmSnapContext]
 
+
+# =========================================================================
+# dm-integrity — per-sector cryptographic integrity tags
+# (Linux drivers/md/dm-integrity.c)
+# =========================================================================
+#
+# Each mapped sector carries a small integrity TAG computed over its data.
+# On WRITE the tag is (re)computed from the sector bytes and stashed in a
+# dedicated METADATA tag store; on READ the tag is recomputed over the data
+# fetched from the backing device and compared against the stored tag. A
+# mismatch — the sector was corrupted underneath us (bit-rot, a torn write,
+# or a malicious tamper) — is reported as an I/O ERROR rather than silently
+# handing back the corrupt bytes. This is exactly Linux dm-integrity's
+# detection guarantee.
+#
+# The tag is a crc32c over the sector's 512 bytes, SALTED with the sector
+# index (the underlying LBA folded into the running register before the
+# data). The salt binds a tag to its sector position, so a valid sector
+# relocated to a different LBA also fails verification — a sector can't be
+# replayed/relocated undetected. (Linux dm-integrity supports HMAC tags for
+# the keyed case; crc32c is its CRC tag mode, which is what we model here.)
+
+DM_INTEG_MAX:         uint64 = 4      # integrity contexts system-wide
+DM_INTEG_MAX_SECTORS: uint64 = 256    # tagged sectors per context
+
+
+class DmIntegContext:
+    used:        uint32
+    pad:         uint32
+    nsectors:    uint64                # number of tagged sectors
+    # valid[s] = 1 once sector s has a tag written (a read of an unwritten
+    # sector is allowed to pass with no stored tag yet).
+    valid:       Array[256, uint8]
+    # tags[s] = the crc32c integrity tag for tagged sector s.
+    tags:        Array[256, uint32]
+
+
+dm_integ_ctxs: Array[4, DmIntegContext]
+
 dm_devices: Array[8, MappedDevice]
 dm_ops:     BlockDeviceOps
 dm_inited:  uint32 = 0
@@ -608,8 +651,12 @@ def dm_init():
     while s < DM_SNAP_MAX:
         dm_snap_ctxs[s].used = 0
         s = s + 1
+    g: uint64 = 0
+    while g < DM_INTEG_MAX:
+        dm_integ_ctxs[g].used = 0
+        g = g + 1
     dm_inited = 1
-    printk0("dm: device-mapper ready (linear + crypt + snapshot targets)\n")
+    printk0("dm: device-mapper ready (linear + crypt + snapshot + integrity targets)\n")
 
 
 def _dm_find_target(dev: Ptr[MappedDevice], vlba: uint64) -> int32:
@@ -783,6 +830,77 @@ def _dm_snap_view_io(t: Ptr[DmTarget], is_write: int32, off_in_t: uint64,
     return 0
 
 
+# =========================================================================
+# dm-integrity target handler
+# =========================================================================
+
+# One-sector staging buffer for the integrity read-verify path. dm I/O is
+# serialised through the synchronous block layer, so a single shared
+# module-scope sector buffer is safe (no two integrity transfers overlap).
+_dm_integ_sector: Array[512, uint8]
+
+
+def _dm_integ_tag(sector: uint64, data: Ptr[uint8]) -> uint32:
+    # Compute the per-sector integrity tag: a crc32c over the 512 data
+    # bytes, SALTED with the sector index so a valid sector relocated to a
+    # different LBA fails verification. We fold the 8 little-endian bytes of
+    # `sector` into the running crc32c register first (seeding the salt),
+    # then chain the sector data, and finalize (xor 0xFFFFFFFF).
+    salt: Array[8, uint8]
+    i: uint64 = 0
+    while i < 8:
+        salt[i] = cast[uint8]((sector >> (i * 8)) & 0xFF)
+        i = i + 1
+    c: uint32 = crc32c_update(0xFFFFFFFF, &salt[0], 8)
+    c = crc32c_update(c, data, SECTOR_SIZE)
+    return c ^ 0xFFFFFFFF
+
+
+def _dm_integ_io(t: Ptr[DmTarget], is_write: int32, off_in_t: uint64,
+                 vlba: uint64, count: uint64, buf: Ptr[uint8]) -> int32:
+    # INTEGRITY target. Process one sector at a time. On WRITE, write the
+    # data through to the backing device, compute the integrity tag over the
+    # data (salted with the underlying sector), and store the tag in the
+    # context's tag store keyed by sector. On READ, fetch the data from the
+    # backing device, recompute the tag, and compare against the stored tag:
+    # a MATCH copies the verified data into the caller's buffer; a MISMATCH
+    # is reported as an I/O error (negative return) so the caller never sees
+    # the corrupt bytes.
+    ctx: Ptr[DmIntegContext] = &dm_integ_ctxs[cast[uint64](t[0].snap_ctx)]
+    stagep: Ptr[uint8] = cast[Ptr[uint8]](&_dm_integ_sector[0])
+    s: uint64 = 0
+    while s < count:
+        ulba:  uint64 = t[0].under_start + off_in_t + s
+        vsec:  uint64 = vlba + s
+        cur:   Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](buf) + s * SECTOR_SIZE)
+        if vsec >= ctx[0].nsectors:
+            printk1("dm: integrity I/O past tagged span (vsec=%d)\n", vsec)
+            return -1
+        if is_write != 0:
+            rc: int32 = blk_write_sectors(t[0].under_slot, ulba, 1, cur)
+            if rc != 0:
+                return rc
+            ctx[0].tags[vsec]  = _dm_integ_tag(ulba, cur)
+            ctx[0].valid[vsec] = 1
+        else:
+            rc2: int32 = blk_read_sectors(t[0].under_slot, ulba, 1, stagep)
+            if rc2 != 0:
+                return rc2
+            if ctx[0].valid[vsec] != 0:
+                want: uint32 = ctx[0].tags[vsec]
+                got:  uint32 = _dm_integ_tag(ulba, stagep)
+                if got != want:
+                    # Corruption detected — refuse to hand back the data.
+                    printk2("dm: integrity tag mismatch sec=%d (corruption detected)\n",
+                            vsec, cast[uint64](got))
+                    return -5
+            # Verified (or never tagged) — deliver the data.
+            memcpy(cur, stagep, SECTOR_SIZE)
+        s = s + 1
+    return 0
+
+
 def _dm_io(dev: Ptr[MappedDevice], is_write: int32, vlba: uint64,
            count: uint64, buf: Ptr[uint8]) -> int32:
     # Core remap. Walk the request sector-span, splitting it at target
@@ -816,6 +934,8 @@ def _dm_io(dev: Ptr[MappedDevice], is_write: int32, vlba: uint64,
             rc = _dm_snap_origin_io(t, is_write, off_in_t, chunk, bufp)
         elif t[0].ttype == DM_TARGET_SNAPSHOT:
             rc = _dm_snap_view_io(t, is_write, off_in_t, chunk, bufp)
+        elif t[0].ttype == DM_TARGET_INTEGRITY:
+            rc = _dm_integ_io(t, is_write, off_in_t, cur_v, chunk, bufp)
         else:
             rc = _dm_linear_io(t, is_write, off_in_t, chunk, bufp)
         if rc != 0:
@@ -1130,6 +1250,71 @@ def dm_create_snapshot_origin(name: Ptr[char], snap_ctx: int32,
     return dm_devices[idx].self_slot
 
 
+def _dm_integ_alloc_ctx() -> int32:
+    # Claim a free integrity context slot, or -1 if the table is full.
+    i: uint64 = 0
+    while i < DM_INTEG_MAX:
+        if dm_integ_ctxs[i].used == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def dm_create_integrity(name: Ptr[char], under_slot: int32,
+                        under_start: uint64, length: uint64) -> int32:
+    # Create a dm-integrity mapped device with a SINGLE integrity target
+    # over [0, length): every sector written through the mapped device is
+    # passed through to the backing store AND gets a per-sector crc32c
+    # integrity tag recorded in a dedicated tag store; every read recomputes
+    # the tag over the fetched data and FAILS the I/O if it does not match
+    # the stored tag (corruption detection). This is the
+    # `dmsetup create NAME --table "0 LENGTH integrity DEV START ..."` shape
+    # in crc32c tag mode. Returns the registered block slot or a negative
+    # error.
+    dm_init()
+    if length == 0:
+        return -1
+    if under_slot < 0:
+        return -2
+    if length > DM_INTEG_MAX_SECTORS:
+        printk0("dm: integrity span exceeds tag-store capacity\n")
+        return -3
+    if under_start + length > blk_capacity_sectors(under_slot):
+        printk0("dm: integrity target exceeds underlying capacity\n")
+        return -3
+    cidx_s: int32 = _dm_integ_alloc_ctx()
+    if cidx_s < 0:
+        printk0("dm: integrity context table full\n")
+        return -4
+    cidx: uint64 = cast[uint64](cidx_s)
+    dm_integ_ctxs[cidx].nsectors = length
+    vi: uint64 = 0
+    while vi < length:
+        dm_integ_ctxs[cidx].valid[vi] = 0
+        dm_integ_ctxs[cidx].tags[vi]  = 0
+        vi = vi + 1
+    dm_integ_ctxs[cidx].used = 1
+    idx_s: int32 = _dm_alloc_device()
+    if idx_s < 0:
+        dm_integ_ctxs[cidx].used = 0
+        printk0("dm: device table full\n")
+        return -4
+    idx: uint64 = cast[uint64](idx_s)
+    dm_devices[idx].n_targets               = 1
+    dm_devices[idx].capacity                = length
+    dm_devices[idx].targets[0].ttype        = DM_TARGET_INTEGRITY
+    dm_devices[idx].targets[0].start_sector = 0
+    dm_devices[idx].targets[0].length       = length
+    dm_devices[idx].targets[0].under_slot   = under_slot
+    dm_devices[idx].targets[0].snap_ctx     = cidx_s
+    dm_devices[idx].targets[0].under_start  = under_start
+    if _dm_register(idx, name) != 0:
+        dm_devices[idx].used     = 0
+        dm_integ_ctxs[cidx].used = 0
+        return -5
+    return dm_devices[idx].self_slot
+
+
 def dm_remove(name: Ptr[char]) -> int32:
     # Tear down a mapped device by name: unregister its block-device
     # identity and free the MappedDevice slot. dmsetup remove NAME.
@@ -1145,6 +1330,11 @@ def dm_remove(name: Ptr[char]) -> int32:
                 sc: int32 = dm_devices[i].targets[0].snap_ctx
                 if sc >= 0 and cast[uint64](sc) < DM_SNAP_MAX:
                     dm_snap_ctxs[cast[uint64](sc)].used = 0
+            # Releasing an integrity device also frees its tag-store context.
+            if dm_devices[i].targets[0].ttype == DM_TARGET_INTEGRITY:
+                ic: int32 = dm_devices[i].targets[0].snap_ctx
+                if ic >= 0 and cast[uint64](ic) < DM_INTEG_MAX:
+                    dm_integ_ctxs[cast[uint64](ic)].used = 0
             blk_unregister_by_name(name)
             dm_devices[i].used      = 0
             dm_devices[i].n_targets = 0
@@ -1222,6 +1412,12 @@ _dm_snap_new:   Array[512, uint8]   # new data written to the origin
 _dm_snap_read:  Array[512, uint8]   # readback through snapshot / origin
 _dm_snap_excrd: Array[512, uint8]   # raw read from the exception store
 _dm_snap_untch: Array[512, uint8]   # pattern for the never-written chunk
+
+# dm-integrity subtest scratch (all one full sector = 512 bytes to avoid the
+# BSS-overflow trap).
+_dm_integ_plain: Array[512, uint8]   # known data written through integrity dev
+_dm_integ_read:  Array[512, uint8]   # readback through the integrity device
+_dm_integ_raw:   Array[512, uint8]   # raw read from the backing device
 
 
 def _dm_back_read(priv: uint64, lba: uint64, count: uint64,
@@ -1676,12 +1872,70 @@ def dm_selftest() -> int32:
     if ok == 1:
         _dm_emerg0("[dm] snapshot PASS\n")
 
+    # --- Test 6: dm-INTEGRITY per-sector tag round-trip + corruption detect ---
+    # Map [0, 32) of a virtual device onto dmback0 @ 224 with an integrity
+    # target. Write a KNOWN pattern through the integrity device at virtual
+    # LBA 3 (a crc32c tag, salted with the underlying sector, is computed and
+    # stored). Read it back through the integrity device and verify (a) the
+    # data round-trips byte-identical AND the stored tag validated. Then
+    # CORRUPT the underlying backing sector directly (simulate bit-rot by
+    # flipping a byte on the raw backing device behind the target) and read
+    # again through the integrity device: the recomputed tag must NOT match
+    # the stored tag, so the read must FAIL (return an error) instead of
+    # handing back the corrupted bytes.
+    ii: uint64 = 0
+    while ii < SECTOR_SIZE:
+        _dm_integ_plain[ii] = cast[uint8]((ii * 19 + 23) & 0xFF)
+        ii = ii + 1
+    integ: int32 = dm_create_integrity("dmint0", back, 224, 32)
+    if integ < 0:
+        _dm_emerg1("[device-mapper] FAIL: dm_create_integrity rc=%d\n",
+                   cast[uint64](cast[int64](integ)))
+        return 0
+    # Write the known sector through the integrity device (tag computed+stored).
+    if blk_write_sectors(integ, 3, 1, &_dm_integ_plain[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: integrity write\n")
+        return 0
+    # Read it back: must round-trip byte-identical (tag validated en route).
+    if blk_read_sectors(integ, 3, 1, &_dm_integ_read[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: integrity readback (tag should have validated)\n")
+        return 0
+    if _dm_buf_eq(&_dm_integ_plain[0], &_dm_integ_read[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: integrity round-trip mismatch\n")
+        ok = 0
+    else:
+        _dm_emerg0("[devmapper] integrity: tag validated round-trip OK\n")
+    # Now CORRUPT the underlying backing sector directly. Virtual LBA 3 ->
+    # backing sector 224 + 3 = 227. Read it raw, flip one byte, write it back
+    # raw — the integrity target's stored tag is untouched, so the next read
+    # through the integrity device must detect the mismatch.
+    if blk_read_sectors(back, 227, 1, &_dm_integ_raw[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: integrity raw backing read 227\n")
+        return 0
+    _dm_integ_raw[0] = cast[uint8](cast[uint64](_dm_integ_raw[0]) ^ 0xFF)
+    if blk_write_sectors(back, 227, 1, &_dm_integ_raw[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: integrity raw backing write 227\n")
+        return 0
+    # Read through the integrity device again: it MUST fail (non-zero rc)
+    # because the recomputed tag no longer matches the stored tag.
+    corrupt_rc: int32 = blk_read_sectors(integ, 3, 1, &_dm_integ_read[0])
+    if corrupt_rc == 0:
+        _dm_emerg0("[device-mapper] FAIL: integrity returned corrupted data (no detection)\n")
+        ok = 0
+    else:
+        _dm_emerg1("[dm] PASS integrity-detect-corruption (read rc=%d)\n",
+                   cast[uint64](cast[int64](corrupt_rc)))
+
+    if ok == 1:
+        _dm_emerg0("[dm] integrity PASS\n")
+
     # Clean up the mapped devices (frees slots; leaves dmback0 in place).
     dm_remove("dmlin0")
     dm_remove("dmcat0")
     dm_remove("dmcrypt0")
     dm_remove("dmsnap0")
     dm_remove("dmsnap0-origin")
+    dm_remove("dmint0")
 
     if ok == 1:
         _dm_emerg0("[device-mapper] PASS\n")
