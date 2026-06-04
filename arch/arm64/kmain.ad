@@ -2174,6 +2174,15 @@ def arm64_sync_handler(frame_ptr: Ptr[uint64]) -> int64:
             if arm64_p32_active != 0:
                 if arm64_p32_try_fault(esr) != 0:
                     return 0
+            # Phase 36: while the on-disk multi-process userland scenario runs, a
+            # data abort is a first-touch TRANSLATION fault on a loaded segment
+            # page of WHICHEVER program (A or B) is currently live (the loader
+            # pre-stamped the segment L3 PTEs in each program's private space).
+            # arm64_p36_try_fault confirms the VA lies in a loaded segment of the
+            # live program, accounts it, flushes, and resumes (return 1).
+            if arm64_p36_active != 0:
+                if arm64_p36_try_fault(esr) != 0:
+                    return 0
             # Phase 16: while the mmap demo is live, a data abort might be a
             # demand fault inside a LIVE anonymous VMA (page it in + resume) or a
             # post-munmap touch of a now-dead VMA (fall through to the reaper,
@@ -2312,6 +2321,15 @@ def arm64_sync_handler(frame_ptr: Ptr[uint64]) -> int64:
     # happen on the ABORT path (arm64_p32_try_fault), not here.
     if arm64_p32_active != 0:
         return arm64_p32_dispatch(frame_ptr, nr, a0, a1, a2)
+
+    # Phase 36: while the on-disk multi-process userland scenario runs, route
+    # every svc into the Phase-36 dispatcher — a real EL0 ABI: open/read/write/
+    # close against the live FAT16 disk, spawn (synchronously load + run a second
+    # on-disk ELF in its own EL0 space), and exit (child resumes the parent past
+    # its spawn svc with x0 = child exit status; parent runs the verdict). The
+    # per-program segment page-ins happen on the ABORT path (arm64_p36_try_fault).
+    if arm64_p36_active != 0:
+        return arm64_p36_dispatch(frame_ptr, nr, a0, a1, a2)
 
     # Phase 23: while the TLS demo is live, route every svc into the Phase-23
     # dispatcher (settls / tick-report). SETTLS installs the running thread's
@@ -14946,11 +14964,1143 @@ def arm64_p35_run() -> int64:
         _uart_puts(rpd)
         pp: Ptr[char] = "[arm64] Phase 35 PASS: virtio-blk WRITE + FAT16 filesystem write round-trip -> ARM64-WRITE-OK-A64\n"
         _uart_puts(pp)
+        # Hand off to Phase 36 (on-disk multi-process userland scenario): load
+        # INITA.ELF + run it at EL0; it does a real open/write/read/close file
+        # round-trip on the FAT16 disk, spawns CHILDB.ELF (a second EL0 process)
+        # which writes a marker file, then reaps the child's exit status and
+        # confirms the marker — proving the EL0 syscall surface is rich enough to
+        # run actual cooperating programs. arm64_p36_run never returns.
+        arm64_p36_run(base)
+        # Unreachable: arm64_p36_run halts after its verdict.
     else:
         fp18: Ptr[char] = "[arm64] Phase 35 FAIL: FAT16 re-read content did not match the written payload\n"
         _uart_puts(fp18)
 
     _msr_daifset(2)
+    while True:
+        _wfi()
+    return 0
+
+
+# ===========================================================================
+# PHASE 36 — a real multi-process, filesystem-using userland scenario.
+#
+# Phase 36 composes everything the prior phases built — the P32 on-disk-ELF
+# loader, the P31 FAT16 READ path, the P35 FAT16 WRITE path, and a fresh EL0
+# address space per program — into an actual cooperating two-program workload,
+# proving the EL0 syscall surface is rich enough to support real programs.
+#
+# Program A (INITA.ELF, loaded off the FAT16 disk, run at EL0):
+#   1. open("WORK.TXT"), write 16 bytes, close   -> durable FAT16 WRITE
+#   2. open("WORK.TXT"), read it back, verify     -> FAT16 READ round-trip
+#      (proves the EL0 open/write/close/read path reaches the real filesystem)
+#   3. spawn("CHILDB.ELF")  -> the kernel synchronously loads + runs a SECOND
+#      EL0 program (Program B) in its OWN private ASID-tagged address space.
+#      Program B opens "MARK.TXT", writes a marker byte sequence, and exits with
+#      a known status. spawn() returns B's exit status to A (the reap).
+#   4. A opens "MARK.TXT", reads it, and confirms B actually ran (the marker is
+#      present) AND that the reaped exit status matches      -> ORDERING proof.
+#   5. A exit()s with its own status; the kernel runs the verdict.
+#
+# EL0 syscalls added/wired for Phase 36 (real, FS-backed, no faked results):
+#   SYS_P36_OPEN  (700): a0 = name-id (0=WORK.TXT,1=MARK.TXT,2=CHILDB.ELF)
+#                         -> fd >= 0, or -1.  Loads the file's bytes into the
+#                            open-file's RAM buffer (or marks "new/empty").
+#   SYS_P36_WRITE (701): a0=fd a1=buf a2=len. fd 1 = UART; else append into the
+#                            open file's RAM buffer (flushed to disk on close).
+#   SYS_P36_READ  (702): a0=fd a1=buf a2=len -> bytes read from the file buffer.
+#   SYS_P36_CLOSE (703): a0=fd. Flushes the (possibly grown) buffer to the file's
+#                            FAT16 data cluster + updates its dir-entry size.
+#   SYS_P36_SPAWN (704): a0 = prog-id (only CHILDB supported) -> child exit status.
+#                            Saves the caller's full EL0 resume context, loads the
+#                            child ELF into its OWN EL0 space, ERETs into it; the
+#                            child's exit() restores the parent verbatim with x0
+#                            = child status (the synchronous reap).
+#   SYS_P36_EXIT  (705): a0 = status. Child -> resume parent past its spawn svc.
+#                            Parent -> run the Phase-36 verdict + halt.
+#
+# Everything stays inside kmain.ad. The two on-disk ELFs (INITA.ELF, CHILDB.ELF)
+# are planted on the FAT16 disk by scripts/test_arm64_phase36.sh. Deterministic,
+# abort-driven (EL1 IRQs masked), segment page-ins via arm64_p36_try_fault.
+# ===========================================================================
+
+# --- Phase-36 fresh RAM region (clear of P32 0x4520_xxxx + P35 0x4530_xxxx) ---
+P36_FILE_PA: uint64 = 0x45400000             # raw on-disk ELF bytes (A or B)
+P36_FILE_CAP: int64 = 8192                   # max ELF file bytes we read
+
+# Program A (INITA.ELF) private EL0 space. Reuses the P32 segment VAs (valid EL0
+# VAs) but with distinct PA backing + page tables + ASID.
+P36A_TEXT_VA: uint64 = 0x42600000
+P36A_DATA_VA: uint64 = 0x42800000
+P36A_STACK_VA: uint64 = 0x42A00000
+P36A_TEXT_L2_INDEX: uint64 = 19              # (0x4260_0000 - 0x4000_0000) / 2 MiB
+P36A_DATA_L2_INDEX: uint64 = 20
+P36A_STACK_L2_INDEX: uint64 = 21
+P36A_L1: uint64 = 0x45410000
+P36A_L2: uint64 = 0x45411000
+P36A_TEXT_L3: uint64 = 0x45412000
+P36A_DATA_L3: uint64 = 0x45413000
+P36A_STACK_L3: uint64 = 0x45414000
+P36A_TEXT_PA: uint64 = 0x45420000
+P36A_DATA_PA: uint64 = 0x45430000
+P36A_STACK_PA: uint64 = 0x45440000
+P36A_STACK_TOP: uint64 = 0x42A01000
+P36A_ASID: uint64 = 24                       # distinct from every prior ASID
+
+# Program B (CHILDB.ELF) private EL0 space. DISTINCT segment VAs (a different
+# 2 MiB window) so the demand-fault handler attributes faults unambiguously.
+P36B_TEXT_VA: uint64 = 0x42C00000
+P36B_DATA_VA: uint64 = 0x42E00000
+P36B_STACK_VA: uint64 = 0x43000000
+P36B_TEXT_L2_INDEX: uint64 = 22              # (0x42C0_0000 - 0x4000_0000) / 2 MiB
+P36B_DATA_L2_INDEX: uint64 = 23
+P36B_STACK_L2_INDEX: uint64 = 24
+P36B_L1: uint64 = 0x45450000
+P36B_L2: uint64 = 0x45451000
+P36B_TEXT_L3: uint64 = 0x45452000
+P36B_DATA_L3: uint64 = 0x45453000
+P36B_STACK_L3: uint64 = 0x45454000
+P36B_TEXT_PA: uint64 = 0x45460000
+P36B_DATA_PA: uint64 = 0x45470000
+P36B_STACK_PA: uint64 = 0x45480000
+P36B_STACK_TOP: uint64 = 0x43001000
+P36B_ASID: uint64 = 25
+
+# Per-open-file RAM data buffers (one each for the two files the demo touches).
+P36_WORK_BUF_PA: uint64 = 0x45490000         # WORK.TXT data buffer
+P36_MARK_BUF_PA: uint64 = 0x454A0000         # MARK.TXT data buffer
+P36_FILE_BUF_CAP: int64 = 512                # one cluster fits the demo payloads
+
+# W^X page permissions (identical encoding to Phase 32).
+P36_PAGE_RX: uint64 = 0x7C7
+P36_PAGE_RW: uint64 = 0x40000000000747
+P36_PAGE_RO: uint64 = 0x400000000007C7
+
+# Phase-36 EL0 syscall numbers (clear of every prior phase's private nrs).
+SYS_P36_OPEN: uint64 = 700
+SYS_P36_WRITE: uint64 = 701
+SYS_P36_READ: uint64 = 702
+SYS_P36_CLOSE: uint64 = 703
+SYS_P36_SPAWN: uint64 = 704
+SYS_P36_EXIT: uint64 = 705
+SYS_P36_REPORT: uint64 = 706                  # a0=check-id a1=buf a2=len/value
+
+# name-ids handed to open() (x0).
+P36_NID_WORK: uint64 = 0                      # WORK.TXT
+P36_NID_MARK: uint64 = 1                      # MARK.TXT
+
+# prog-id handed to spawn() (x0).
+P36_PROG_CHILDB: uint64 = 0
+
+# Expected exit statuses (the test asserts these are observed).
+P36_CHILD_EXIT: uint64 = 0x2A                # 42 — Program B's exit status
+P36_PARENT_EXIT: uint64 = 0x5B               # 91 — Program A's exit status
+
+# Known payloads the two programs write (the kernel verifies the FS round-trip
+# AND the cross-process marker against these). INITA's WORK.TXT payload is a
+# fixed 16-byte pattern; CHILDB's MARK.TXT marker is a fixed 12-byte sequence.
+# (The kernel computes the byte at index i so no big inline table is needed.)
+P36_WORK_LEN: int64 = 16                      # INITA's WORK.TXT payload length
+P36_MARK_LEN: int64 = 12                      # CHILDB's MARK.TXT marker length
+
+# check-ids for SYS_P36_REPORT (x0).
+P36_CHK_WORK: uint64 = 0                       # A reports WORK.TXT read-back bytes
+P36_CHK_MARK: uint64 = 1                       # A reports MARK.TXT (B's) marker bytes
+P36_CHK_STATUS: uint64 = 2                     # A reports the reaped spawn() status
+
+
+# The expected i-th byte of INITA's WORK.TXT payload: 'A','B',... position-coded.
+def arm64_p36_work_byte(i: int64) -> uint8:
+    return cast[uint8]((0x41 + (i * 3)) & 0x7F)
+
+
+# The expected i-th byte of CHILDB's MARK.TXT marker: 'M','m',... position-coded.
+def arm64_p36_mark_byte(i: int64) -> uint8:
+    return cast[uint8]((0x4D + (i * 5)) & 0x7F)
+
+# --- Phase-36 bookkeeping --------------------------------------------------
+arm64_p36_active: int64 = 0
+arm64_p36_cur_prog: int64 = 0                # 0 = A (parent), 1 = B (child)
+arm64_p36_a_text_faults: int64 = 0
+arm64_p36_a_data_faults: int64 = 0
+arm64_p36_b_text_faults: int64 = 0
+arm64_p36_b_data_faults: int64 = 0
+arm64_p36_blk_base: uint64 = 0              # the live virtio-blk transport base
+
+# Workflow evidence (read by the verdict).
+arm64_p36_a_file_rt_ok: int64 = 0           # A's WORK.TXT write->read round-trip OK
+arm64_p36_b_ran: int64 = 0                  # Program B actually executed (entered EL0)
+arm64_p36_b_wrote_mark: int64 = 0           # B's MARK.TXT close flushed to disk
+arm64_p36_child_status: uint64 = 0xFFFF     # the reaped child exit status (spawn ret)
+arm64_p36_a_saw_mark: int64 = 0             # A re-read MARK.TXT and confirmed B's marker
+arm64_p36_a_saw_status: uint64 = 0xFFFF     # the status value A observed from spawn
+arm64_p36_a_exited: int64 = 0
+arm64_p36_a_exit_code: uint64 = 0xFFFF
+
+# Saved parent (Program A) EL0 resume context across a spawn (synchronous reap).
+P36_PCTX: uint64 = 0x454B0000               # 34 x 8-byte slots (x0..x30,SP,ELR,SPSR)
+
+# Open-file table: ONE live slot is enough for the demo (files are opened, used,
+# and closed strictly one at a time). Records the located dir entry + which RAM
+# buffer holds the file's bytes + the live byte length.
+arm64_p36_of_used: int64 = 0                 # 1 if a file is currently open
+arm64_p36_of_nid: uint64 = 0xFFFF            # name-id of the open file
+arm64_p36_of_dir_lba: int64 = -1
+arm64_p36_of_ent_off: int64 = -1
+arm64_p36_of_first_clus: int64 = -1
+arm64_p36_of_len: int64 = 0                  # current logical length (bytes)
+arm64_p36_of_buf: uint64 = 0                 # PA of the file's RAM data buffer
+arm64_p36_of_rpos: int64 = 0                 # read cursor (bytes consumed by read())
+
+
+# ---- the 8.3 directory names this phase touches (space-padded to 11) ------
+# Fill an 11-byte name buffer at `dst` with the 8.3 name selected by `nid`.
+def arm64_p36_fill_name(dst: uint64, nid: uint64) -> int64:
+    p: Ptr[uint8] = cast[Ptr[uint8]](dst)
+    i: int64 = 0
+    while i < 11:
+        p[i] = cast[uint8](0x20)             # space-pad
+        i = i + 1
+    if nid == P36_NID_WORK:
+        # "WORK    TXT"
+        p[0] = cast[uint8](0x57)             # W
+        p[1] = cast[uint8](0x4F)             # O
+        p[2] = cast[uint8](0x52)             # R
+        p[3] = cast[uint8](0x4B)             # K
+        p[8] = cast[uint8](0x54)             # T
+        p[9] = cast[uint8](0x58)             # X
+        p[10] = cast[uint8](0x54)            # T
+    else:
+        # "MARK    TXT"
+        p[0] = cast[uint8](0x4D)             # M
+        p[1] = cast[uint8](0x41)             # A
+        p[2] = cast[uint8](0x52)             # R
+        p[3] = cast[uint8](0x4B)             # K
+        p[8] = cast[uint8](0x54)             # T
+        p[9] = cast[uint8](0x58)             # X
+        p[10] = cast[uint8](0x54)            # T
+    return 0
+
+
+# The 8.3 name of the spawnable child program: "CHILDB  ELF".
+P36_CHILDB0: uint8 = 0x43                     # C
+P36_CHILDB1: uint8 = 0x48                     # H
+P36_CHILDB2: uint8 = 0x49                     # I
+P36_CHILDB3: uint8 = 0x4C                     # L
+P36_CHILDB4: uint8 = 0x44                     # D
+P36_CHILDB5: uint8 = 0x42                     # B
+P36_CHILDB6: uint8 = 0x20                     # ' '
+P36_CHILDB7: uint8 = 0x20                     # ' '
+P36_CHILDB8: uint8 = 0x45                     # E
+P36_CHILDB9: uint8 = 0x4C                     # L
+P36_CHILDB10: uint8 = 0x46                    # F
+
+# "INITA   ELF" — Program A's on-disk ELF name.
+P36_INITA0: uint8 = 0x49                      # I
+P36_INITA1: uint8 = 0x4E                      # N
+P36_INITA2: uint8 = 0x49                      # I
+P36_INITA3: uint8 = 0x54                      # T
+P36_INITA4: uint8 = 0x41                      # A
+P36_INITA5: uint8 = 0x20                      # ' '
+P36_INITA6: uint8 = 0x20                      # ' '
+P36_INITA7: uint8 = 0x20                      # ' '
+P36_INITA8: uint8 = 0x45                      # E
+P36_INITA9: uint8 = 0x4C                      # L
+P36_INITA10: uint8 = 0x46                     # F
+
+
+# Compare the 11-byte dir-entry name at `pa`+`off` against an 11-byte name buffer
+# at `name_pa`. Returns 1 on a full match, else 0.
+def arm64_p36_name_eq(pa: uint64, off: int64, name_pa: uint64) -> int64:
+    p: Ptr[uint8] = cast[Ptr[uint8]](pa)
+    q: Ptr[uint8] = cast[Ptr[uint8]](name_pa)
+    i: int64 = 0
+    while i < 11:
+        if p[off + i] != q[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+# Locate the 8.3 file named by the 11-byte buffer at `name_pa` in the root dir.
+# On success records dir_lba/ent_off/first_clus/size into the four out-globals
+# (arm64_p36_loc_*) and returns 1; returns 0 if not found, -1 on a read error.
+arm64_p36_loc_dir_lba: int64 = -1
+arm64_p36_loc_ent_off: int64 = -1
+arm64_p36_loc_first_clus: int64 = -1
+arm64_p36_loc_size: int64 = 0
+
+def arm64_p36_locate(base: uint64, name_pa: uint64) -> int64:
+    arm64_p36_loc_dir_lba = -1
+    arm64_p36_loc_ent_off = -1
+    arm64_p36_loc_first_clus = -1
+    arm64_p36_loc_size = 0
+    s: int64 = 0
+    while s < arm64_p31_root_secs:
+        lba: int64 = arm64_p31_root_lba + s
+        if arm64_p30_read_sector_into(base, cast[uint64](lba), P31_SEC_PA) != 1:
+            return -1
+        e: int64 = 0
+        while e < arm64_p31_bytes_per_sec:
+            pp: Ptr[uint8] = cast[Ptr[uint8]](P31_SEC_PA)
+            first_byte: uint8 = pp[e]
+            if cast[uint64](first_byte) == cast[uint64](0):
+                s = arm64_p31_root_secs            # 0x00 = end of directory
+                e = arm64_p31_bytes_per_sec
+            else:
+                if arm64_p36_name_eq(P31_SEC_PA, e, name_pa) == 1:
+                    arm64_p36_loc_dir_lba = lba
+                    arm64_p36_loc_ent_off = e
+                    arm64_p36_loc_first_clus = arm64_p31_rd16(P31_SEC_PA, e + 26)
+                    arm64_p36_loc_size = arm64_p31_rd32(P31_SEC_PA, e + 28)
+                    s = arm64_p31_root_secs
+                    e = arm64_p31_bytes_per_sec
+                else:
+                    e = e + 32
+        s = s + 1
+    if arm64_p36_loc_dir_lba < 0:
+        return 0
+    return 1
+
+
+# Read the file's data cluster (its first sector — payloads fit one cluster) into
+# `dst_pa` and return its size. Caller has already located the entry.
+def arm64_p36_read_file_into(base: uint64, first_clus: int64, size: int64, dst_pa: uint64) -> int64:
+    d: Ptr[uint8] = cast[Ptr[uint8]](dst_pa)
+    z: int64 = 0
+    while z < P36_FILE_BUF_CAP:
+        d[z] = cast[uint8](0)
+        z = z + 1
+    if first_clus < 2:
+        return 0
+    clus_lba: int64 = arm64_p31_data_lba + ((first_clus - 2) * arm64_p31_sec_per_clus)
+    if arm64_p30_read_sector_into(base, cast[uint64](clus_lba), P31_SEC_PA) != 1:
+        return -1
+    src: Ptr[uint8] = cast[Ptr[uint8]](P31_SEC_PA)
+    take: int64 = size
+    if take > P36_FILE_BUF_CAP:
+        take = P36_FILE_BUF_CAP
+    i: int64 = 0
+    while i < take:
+        d[i] = src[i]
+        i = i + 1
+    return take
+
+
+# Flush the open file's buffer to its FAT16 data cluster (first sector) and update
+# its directory-entry size on disk — the real P35-style WRITE path. Returns 1 OK.
+def arm64_p36_flush_file(base: uint64) -> int64:
+    if arm64_p36_of_first_clus < 2:
+        return 0
+    # 1. write the data cluster's first sector from the file buffer.
+    clus_lba: int64 = arm64_p31_data_lba + ((arm64_p36_of_first_clus - 2) * arm64_p31_sec_per_clus)
+    # Stage the (zero-padded) buffer into the shared write buffer.
+    w: Ptr[uint8] = cast[Ptr[uint8]](P35_WBUF_PA)
+    src: Ptr[uint8] = cast[Ptr[uint8]](arm64_p36_of_buf)
+    i: int64 = 0
+    while i < arm64_p31_bytes_per_sec:
+        if i < arm64_p36_of_len:
+            w[i] = src[i]
+        else:
+            w[i] = cast[uint8](0)
+        i = i + 1
+    _dsb_ish()
+    if arm64_p30_write_sector_from(base, cast[uint64](clus_lba), P35_WBUF_PA) != 1:
+        return 0
+    # 2. update the dir-entry size field (offset +28, u32).
+    if arm64_p30_read_sector_into(base, cast[uint64](arm64_p36_of_dir_lba), P35_WBUF_PA) != 1:
+        return 0
+    szp: Ptr[uint8] = cast[Ptr[uint8]](P35_WBUF_PA + cast[uint64](arm64_p36_of_ent_off + 28))
+    szp[0] = cast[uint8](arm64_p36_of_len & 0xFF)
+    szp[1] = cast[uint8]((arm64_p36_of_len >> 8) & 0xFF)
+    szp[2] = cast[uint8]((arm64_p36_of_len >> 16) & 0xFF)
+    szp[3] = cast[uint8]((arm64_p36_of_len >> 24) & 0xFF)
+    _dsb_ish()
+    if arm64_p30_write_sector_from(base, cast[uint64](arm64_p36_of_dir_lba), P35_WBUF_PA) != 1:
+        return 0
+    return 1
+
+
+# ---- the on-disk ELF loader, parameterized per program (A or B) -----------
+# Little-endian readers out of the Phase-36 ELF file buffer (P36_FILE_PA).
+def _p36_rd16(off: uint64) -> uint64:
+    p: Ptr[uint8] = cast[Ptr[uint8]](P36_FILE_PA)
+    b0: uint64 = cast[uint64](p[cast[int64](off)])
+    b1: uint64 = cast[uint64](p[cast[int64](off + cast[uint64](1))])
+    return b0 | (b1 << cast[uint64](8))
+
+
+def _p36_rd32(off: uint64) -> uint64:
+    p: Ptr[uint8] = cast[Ptr[uint8]](P36_FILE_PA)
+    r: uint64 = cast[uint64](0)
+    i: int64 = 0
+    while i < 4:
+        r = r | (cast[uint64](p[cast[int64](off + cast[uint64](i))]) << cast[uint64](i * 8))
+        i = i + 1
+    return r
+
+
+def _p36_rd64(off: uint64) -> uint64:
+    p: Ptr[uint8] = cast[Ptr[uint8]](P36_FILE_PA)
+    r: uint64 = cast[uint64](0)
+    i: int64 = 0
+    while i < 8:
+        r = r | (cast[uint64](p[cast[int64](off + cast[uint64](i))]) << cast[uint64](i * 8))
+        i = i + 1
+    return r
+
+
+# Read the on-disk ELF named by the 11-byte name at `name_pa` off the live FAT16
+# volume into P36_FILE_PA (following its cluster chain). Returns byte length, or
+# -1 on not-found / read error.
+def arm64_p36_read_elf(base: uint64, name_pa: uint64) -> int64:
+    loc: int64 = arm64_p36_locate(base, name_pa)
+    if loc != 1:
+        return -1
+    first_clus: int64 = arm64_p36_loc_first_clus
+    file_size: int64 = arm64_p36_loc_size
+    if first_clus < 2:
+        return -1
+    sec_per_clus: int64 = arm64_p31_sec_per_clus
+    dst_off: int64 = 0
+    want_len: int64 = file_size
+    clus: int64 = first_clus
+    guard: int64 = 0
+    dst: Ptr[uint8] = cast[Ptr[uint8]](P36_FILE_PA)
+    src: Ptr[uint8] = cast[Ptr[uint8]](P31_SEC_PA)
+    while clus >= 2 and clus < 0xFFF8 and dst_off < want_len:
+        guard = guard + 1
+        if guard > 4096:
+            return -1
+        clus_lba: int64 = arm64_p31_data_lba + ((clus - 2) * sec_per_clus)
+        sc: int64 = 0
+        while sc < sec_per_clus:
+            if dst_off < want_len:
+                if arm64_p30_read_sector_into(base, cast[uint64](clus_lba + sc), P31_SEC_PA) != 1:
+                    return -1
+                take: int64 = arm64_p31_bytes_per_sec
+                if dst_off + take > want_len:
+                    take = want_len - dst_off
+                i: int64 = 0
+                while i < take:
+                    if dst_off < P36_FILE_CAP:
+                        dst[dst_off] = src[i]
+                        dst_off = dst_off + 1
+                    else:
+                        i = take
+                    i = i + 1
+            sc = sc + 1
+        nxt: int64 = arm64_p31_fat_next(base, clus)
+        if nxt < 0:
+            return -1
+        clus = nxt
+    return dst_off
+
+
+# Derive the L3 PAGE flags for a parsed ELF segment (W^X).
+def arm64_p36_flags_for(pflags: uint64) -> uint64:
+    if (pflags & PF_W) != cast[uint64](0):
+        return P36_PAGE_RW
+    if (pflags & PF_X) != cast[uint64](0):
+        return P36_PAGE_RX
+    return P36_PAGE_RO
+
+
+# Build program `prog` (0=A,1=B)'s fresh private EL0 address space (L1/L2 + three
+# 2 MiB slots redirected to private L3 tables) and wire its EL0 stack page RW.
+def arm64_p36_build_space(prog: int64) -> int64:
+    l1_base: uint64 = P36A_L1
+    l2_base: uint64 = P36A_L2
+    text_l3: uint64 = P36A_TEXT_L3
+    data_l3: uint64 = P36A_DATA_L3
+    stack_l3: uint64 = P36A_STACK_L3
+    text_l2i: uint64 = P36A_TEXT_L2_INDEX
+    data_l2i: uint64 = P36A_DATA_L2_INDEX
+    stack_l2i: uint64 = P36A_STACK_L2_INDEX
+    stack_va: uint64 = P36A_STACK_VA
+    stack_pa: uint64 = P36A_STACK_PA
+    if prog == 1:
+        l1_base = P36B_L1
+        l2_base = P36B_L2
+        text_l3 = P36B_TEXT_L3
+        data_l3 = P36B_DATA_L3
+        stack_l3 = P36B_STACK_L3
+        text_l2i = P36B_TEXT_L2_INDEX
+        data_l2i = P36B_DATA_L2_INDEX
+        stack_l2i = P36B_STACK_L2_INDEX
+        stack_va = P36B_STACK_VA
+        stack_pa = P36B_STACK_PA
+
+    l1: Ptr[uint64] = cast[Ptr[uint64]](l1_base)
+    l2: Ptr[uint64] = cast[Ptr[uint64]](l2_base)
+
+    i: int64 = 0
+    while i < 512:
+        l1[i] = cast[uint64](0)
+        i = i + 1
+    l1[0] = cast[uint64](0) | DEV_FLAGS
+
+    tl3: Ptr[uint64] = cast[Ptr[uint64]](text_l3)
+    dl3: Ptr[uint64] = cast[Ptr[uint64]](data_l3)
+    sl3: Ptr[uint64] = cast[Ptr[uint64]](stack_l3)
+    k: int64 = 0
+    while k < 512:
+        tl3[k] = cast[uint64](0)
+        dl3[k] = cast[uint64](0)
+        sl3[k] = cast[uint64](0)
+        k = k + 1
+
+    j: int64 = 0
+    while j < 512:
+        blk_pa: uint64 = RAM_BASE + (cast[uint64](j) * L2_BLOCK_SIZE)
+        if cast[uint64](j) == text_l2i:
+            l2[j] = text_l3 | DESC_TABLE
+        elif cast[uint64](j) == data_l2i:
+            l2[j] = data_l3 | DESC_TABLE
+        elif cast[uint64](j) == stack_l2i:
+            l2[j] = stack_l3 | DESC_TABLE
+        else:
+            l2[j] = blk_pa | MEM_FLAGS
+        j = j + 1
+
+    l1[1] = l2_base | DESC_TABLE
+    _dsb_ish()
+
+    # Wire the EL0 stack page (RW non-exec).
+    sidx: uint64 = (stack_va >> cast[uint64](12)) & cast[uint64](0x1FF)
+    sl3[cast[int64](sidx)] = stack_pa | P36_PAGE_RW
+    sp: Ptr[uint64] = cast[Ptr[uint64]](stack_pa)
+    z: int64 = 0
+    while z < 512:
+        sp[z] = cast[uint64](0)
+        z = z + 1
+    _dsb_ish()
+    return 0
+
+
+# Map [seg_va, seg_va+memsz) onto seg_pa with page_flags in its 2 MiB slot's
+# private L3. Backing page pre-cleared (BSS reads zero), p_filesz bytes copied in.
+def arm64_p36_map_segment(seg_va: uint64, seg_pa: uint64, foff: uint64, filesz: uint64, l3_base: uint64, page_flags: uint64) -> int64:
+    pg: Ptr[uint8] = cast[Ptr[uint8]](seg_pa)
+    c: int64 = 0
+    while c < cast[int64](P26_PAGE_SIZE):
+        pg[c] = cast[uint8](0)
+        c = c + 1
+    fbuf: Ptr[uint8] = cast[Ptr[uint8]](P36_FILE_PA)
+    n: uint64 = cast[uint64](0)
+    while n < filesz:
+        pg[cast[int64](n)] = fbuf[cast[int64](foff + n)]
+        n = n + cast[uint64](1)
+    _dsb_ish()
+    l3: Ptr[uint64] = cast[Ptr[uint64]](l3_base)
+    idx: uint64 = (seg_va >> cast[uint64](12)) & cast[uint64](0x1FF)
+    l3[cast[int64](idx)] = seg_pa | page_flags
+    _dsb_ish()
+    _isb()
+    return 0
+
+
+# Parse + load the on-disk ELF64 in P36_FILE_PA into program `prog`'s space.
+# Validates the header, walks the phdrs, maps each PT_LOAD by its VADDR onto that
+# program's private PA backing. Returns e_entry, or 0 on a validation failure.
+def arm64_p36_load_elf(prog: int64) -> uint64:
+    fbuf: Ptr[uint8] = cast[Ptr[uint8]](P36_FILE_PA)
+    nl: Ptr[char] = "\n"
+
+    if cast[uint64](fbuf[0]) != ELF_EI_MAG0:
+        return cast[uint64](0)
+    if cast[uint64](fbuf[1]) != ELF_EI_MAG1:
+        return cast[uint64](0)
+    if cast[uint64](fbuf[2]) != ELF_EI_MAG2:
+        return cast[uint64](0)
+    if cast[uint64](fbuf[3]) != ELF_EI_MAG3:
+        return cast[uint64](0)
+    if cast[uint64](fbuf[4]) != ELFCLASS64:
+        return cast[uint64](0)
+    if cast[uint64](fbuf[5]) != ELFDATA2LSB:
+        return cast[uint64](0)
+
+    e_type: uint64 = _p36_rd16(EH_TYPE)
+    e_machine: uint64 = _p36_rd16(EH_MACHINE)
+    e_entry: uint64 = _p36_rd64(EH_ENTRY)
+    e_phoff: uint64 = _p36_rd64(EH_PHOFF)
+    e_phentsize: uint64 = _p36_rd16(EH_PHENTSIZE)
+    e_phnum: uint64 = _p36_rd16(EH_PHNUM)
+
+    if e_type != ET_EXEC:
+        return cast[uint64](0)
+    if e_machine != EM_AARCH64:
+        return cast[uint64](0)
+
+    text_va: uint64 = P36A_TEXT_VA
+    data_va: uint64 = P36A_DATA_VA
+    text_pa: uint64 = P36A_TEXT_PA
+    data_pa: uint64 = P36A_DATA_PA
+    text_l3: uint64 = P36A_TEXT_L3
+    data_l3: uint64 = P36A_DATA_L3
+    if prog == 1:
+        text_va = P36B_TEXT_VA
+        data_va = P36B_DATA_VA
+        text_pa = P36B_TEXT_PA
+        data_pa = P36B_DATA_PA
+        text_l3 = P36B_TEXT_L3
+        data_l3 = P36B_DATA_L3
+
+    hm: Ptr[char] = "[arm64] Phase 36 ELF: prog="
+    _uart_puts(hm)
+    _uart_puthex(cast[uint64](prog))
+    hm2: Ptr[char] = " entry="
+    _uart_puts(hm2)
+    _uart_puthex(e_entry)
+    hm3: Ptr[char] = " phnum="
+    _uart_puts(hm3)
+    _uart_puthex(e_phnum)
+    _uart_puts(nl)
+
+    segs: int64 = 0
+    ph: uint64 = 0
+    while ph < e_phnum:
+        b: uint64 = e_phoff + (ph * e_phentsize)
+        p_type: uint64 = _p36_rd32(b + PH_TYPE)
+        if p_type == PT_LOAD:
+            p_flags: uint64 = _p36_rd32(b + PH_FLAGS)
+            p_offset: uint64 = _p36_rd64(b + PH_OFFSET)
+            p_vaddr: uint64 = _p36_rd64(b + PH_VADDR)
+            p_filesz: uint64 = _p36_rd64(b + PH_FILESZ)
+            page_flags: uint64 = arm64_p36_flags_for(p_flags)
+
+            sm: Ptr[char] = "[arm64] Phase 36 PT_LOAD: vaddr="
+            _uart_puts(sm)
+            _uart_puthex(p_vaddr)
+            fm: Ptr[char] = " filesz="
+            _uart_puts(fm)
+            _uart_puthex(p_filesz)
+            xm: Ptr[char] = " flags="
+            _uart_puts(xm)
+            _uart_puthex(p_flags)
+            _uart_puts(nl)
+
+            seg_pa: uint64 = cast[uint64](0)
+            l3_base: uint64 = cast[uint64](0)
+            if p_vaddr == text_va:
+                seg_pa = text_pa
+                l3_base = text_l3
+            elif p_vaddr == data_va:
+                seg_pa = data_pa
+                l3_base = data_l3
+            else:
+                return cast[uint64](0)
+
+            arm64_p36_map_segment(p_vaddr, seg_pa, p_offset, p_filesz, l3_base, page_flags)
+            segs = segs + 1
+        ph = ph + cast[uint64](1)
+
+    if segs < 1:
+        return cast[uint64](0)
+    return e_entry
+
+
+# TTBR0_EL1 for program `prog`: its private L1 root + its ASID in bits[63:48].
+def arm64_p36_ttbr0_for(prog: int64) -> uint64:
+    if prog == 1:
+        return P36B_L1 | (P36B_ASID << P23_ASID_SHIFT)
+    return P36A_L1 | (P36A_ASID << P23_ASID_SHIFT)
+
+
+# Recycle program `prog`'s ASID and make its private TTBR0 live.
+def arm64_p36_switch_to(prog: int64) -> int64:
+    asid: uint64 = P36A_ASID
+    if prog == 1:
+        asid = P36B_ASID
+    _dsb_ish()
+    _tlbi_aside1is(asid << P23_ASID_SHIFT)
+    _dsb_ish()
+    _isb()
+    _msr_ttbr0_el1(arm64_p36_ttbr0_for(prog))
+    _dsb_ish()
+    _tlbi_aside1is(asid << P23_ASID_SHIFT)
+    _dsb_ish()
+    _isb()
+    return 0
+
+
+# Phase-36 demand-fault entry. A first touch of a loaded segment page of the LIVE
+# program (A or B) takes a translation fault (loader pre-stamped the PTE). Confirm
+# the VA lies in a loaded segment of the current program, account it, flush the
+# VA, and resume (return 1); anything else -> 0 (fall through to the reaper).
+def arm64_p36_try_fault(esr: uint64) -> int64:
+    dfsc: uint64 = esr & ESR_DFSC_MASK
+    kind: uint64 = dfsc >> ESR_DFSC_KIND_SHIFT
+    if kind != ESR_DFSC_KIND_XLAT:
+        return 0
+    far: uint64 = cast[uint64](_mrs_far_el1())
+    page_va: uint64 = far & cast[uint64](0xFFFFFFFFFFFFF000)
+
+    in_seg: int64 = 0
+    if arm64_p36_cur_prog == 0:
+        if page_va == P36A_TEXT_VA:
+            arm64_p36_a_text_faults = arm64_p36_a_text_faults + 1
+            in_seg = 1
+        elif page_va == P36A_DATA_VA:
+            arm64_p36_a_data_faults = arm64_p36_a_data_faults + 1
+            in_seg = 1
+    else:
+        if page_va == P36B_TEXT_VA:
+            arm64_p36_b_text_faults = arm64_p36_b_text_faults + 1
+            in_seg = 1
+        elif page_va == P36B_DATA_VA:
+            arm64_p36_b_data_faults = arm64_p36_b_data_faults + 1
+            in_seg = 1
+    if in_seg == 0:
+        return 0
+
+    _dsb_ish()
+    _tlbi_vaae1is(page_va >> cast[uint64](12))
+    _dsb_ish()
+    _isb()
+    return 1
+
+
+# open(nid): locate the file on the FAT16 disk, load its bytes into the file's
+# RAM buffer, set up the single open-file slot. Returns fd (0) or -1.
+def arm64_p36_do_open(nid: uint64) -> int64:
+    if arm64_p36_of_used != 0:
+        return -1
+    base: uint64 = arm64_p36_blk_base
+    arm64_p36_fill_name(P31_FILE_PA, nid)        # stage the 11-byte name
+    loc: int64 = arm64_p36_locate(base, P31_FILE_PA)
+    if loc != 1:
+        return -1
+    buf: uint64 = P36_WORK_BUF_PA
+    if nid == P36_NID_MARK:
+        buf = P36_MARK_BUF_PA
+    got: int64 = arm64_p36_read_file_into(base, arm64_p36_loc_first_clus, arm64_p36_loc_size, buf)
+    if got < 0:
+        return -1
+    arm64_p36_of_used = 1
+    arm64_p36_of_nid = nid
+    arm64_p36_of_dir_lba = arm64_p36_loc_dir_lba
+    arm64_p36_of_ent_off = arm64_p36_loc_ent_off
+    arm64_p36_of_first_clus = arm64_p36_loc_first_clus
+    arm64_p36_of_len = arm64_p36_loc_size
+    arm64_p36_of_buf = buf
+    arm64_p36_of_rpos = 0
+    return 0
+
+
+# write(fd, buf, len): fd 1 = UART; else OVERWRITE the open file's buffer from the
+# start (truncating-write, like a freshly-opened file). Returns bytes written.
+def arm64_p36_do_write(fd: uint64, ubuf: uint64, ulen: uint64) -> int64:
+    if fd == cast[uint64](1):
+        b: Ptr[uint8] = cast[Ptr[uint8]](ubuf)
+        n: uint64 = cast[uint64](0)
+        while n < ulen:
+            _uart_putc(b[cast[int64](n)])
+            n = n + cast[uint64](1)
+        return cast[int64](ulen)
+    if arm64_p36_of_used == 0:
+        return -1
+    n2: int64 = cast[int64](ulen)
+    if n2 > P36_FILE_BUF_CAP:
+        n2 = P36_FILE_BUF_CAP
+    src: Ptr[uint8] = cast[Ptr[uint8]](ubuf)
+    dst: Ptr[uint8] = cast[Ptr[uint8]](arm64_p36_of_buf)
+    i: int64 = 0
+    while i < n2:
+        dst[i] = src[i]
+        i = i + 1
+    arm64_p36_of_len = n2                         # truncating write: file len = bytes written
+    return n2
+
+
+# read(fd, buf, len): copy up to `len` bytes from the open file's buffer (from the
+# read cursor) into the EL0 buffer. Returns bytes read (0 at EOF).
+def arm64_p36_do_read(fd: uint64, ubuf: uint64, ulen: uint64) -> int64:
+    if arm64_p36_of_used == 0:
+        return -1
+    avail: int64 = arm64_p36_of_len - arm64_p36_of_rpos
+    if avail < 0:
+        avail = 0
+    take: int64 = cast[int64](ulen)
+    if take > avail:
+        take = avail
+    src: Ptr[uint8] = cast[Ptr[uint8]](arm64_p36_of_buf + cast[uint64](arm64_p36_of_rpos))
+    dst: Ptr[uint8] = cast[Ptr[uint8]](ubuf)
+    i: int64 = 0
+    while i < take:
+        dst[i] = src[i]
+        i = i + 1
+    arm64_p36_of_rpos = arm64_p36_of_rpos + take
+    return take
+
+
+# close(fd): flush the open file's buffer to the FAT16 disk (data cluster + dir
+# size) and release the open-file slot. Returns 1 OK, -1 on error.
+def arm64_p36_do_close(fd: uint64) -> int64:
+    if arm64_p36_of_used == 0:
+        return -1
+    base: uint64 = arm64_p36_blk_base
+    nid: uint64 = arm64_p36_of_nid
+    ok: int64 = arm64_p36_flush_file(base)
+    # Evidence: the child (Program B) durably flushed MARK.TXT to the FAT16 disk.
+    if ok == 1:
+        if arm64_p36_cur_prog == 1:
+            if nid == P36_NID_MARK:
+                arm64_p36_b_wrote_mark = 1
+    arm64_p36_of_used = 0
+    arm64_p36_of_nid = cast[uint64](0xFFFF)
+    if ok != 1:
+        return -1
+    return 1
+
+
+# spawn(prog-id): synchronously load + run the child program in its own EL0 space.
+# Saves the caller's (Program A's) full EL0 resume context into P36_PCTX, builds
+# the child space, loads CHILDB.ELF into it, switches TTBR0 + ERETs into the
+# child. NEVER returns here — the child's exit() restores the parent. The frame is
+# the parent's saved svc frame (used to capture x0..x30).
+def arm64_p36_do_spawn(frame_ptr: Ptr[uint64], progid: uint64) -> int64:
+    nl: Ptr[char] = "\n"
+    base: uint64 = arm64_p36_blk_base
+
+    # 1. Save the parent (A)'s FULL EL0 resume context so the child's exit() can
+    #    restore it verbatim, resuming A right after this spawn svc.
+    pctx: Ptr[uint64] = cast[Ptr[uint64]](P36_PCTX)
+    i: int64 = 0
+    while i < 31:
+        pctx[i] = frame_ptr[i]                    # x0..x30
+        i = i + 1
+    pctx[31] = cast[uint64](_mrs_sp_el0())        # SP_EL0
+    pctx[32] = cast[uint64](_mrs_elr_el1())       # ELR_EL1 = PC after spawn svc
+    pctx[33] = SPSR_EL0T_DAIF                      # resume PSTATE: EL0t, IRQs masked
+    _dsb_ish()
+
+    # 2. Read CHILDB.ELF off the FAT16 disk into the ELF file buffer.
+    nm: uint64 = P31_FILE_PA
+    np: Ptr[uint8] = cast[Ptr[uint8]](nm)
+    np[0] = P36_CHILDB0
+    np[1] = P36_CHILDB1
+    np[2] = P36_CHILDB2
+    np[3] = P36_CHILDB3
+    np[4] = P36_CHILDB4
+    np[5] = P36_CHILDB5
+    np[6] = P36_CHILDB6
+    np[7] = P36_CHILDB7
+    np[8] = P36_CHILDB8
+    np[9] = P36_CHILDB9
+    np[10] = P36_CHILDB10
+    flen: int64 = arm64_p36_read_elf(base, nm)
+    if flen <= 0:
+        fp: Ptr[char] = "[arm64] Phase 36 FAIL: could not read CHILDB.ELF off the FAT16 disk\n"
+        _uart_puts(fp)
+        arm64_p36_finish()
+        while True:
+            _wfi()
+
+    sm: Ptr[char] = "[arm64] Phase 36: read CHILDB.ELF off disk ("
+    _uart_puts(sm)
+    _uart_puthex(cast[uint64](flen))
+    sm2: Ptr[char] = " bytes); building child EL0 space + launching\n"
+    _uart_puts(sm2)
+
+    # 3. Build the child's fresh space, load the ELF, switch in, mark it live.
+    arm64_p36_build_space(1)
+    arm64_p36_switch_to(1)
+    entry: uint64 = arm64_p36_load_elf(1)
+    if entry == cast[uint64](0):
+        fp2: Ptr[char] = "[arm64] Phase 36 FAIL: CHILDB.ELF failed header/phdr validation\n"
+        _uart_puts(fp2)
+        arm64_p36_finish()
+        while True:
+            _wfi()
+
+    arm64_p36_cur_prog = 1
+    arm64_p36_b_ran = 1
+
+    em: Ptr[char] = "[arm64] Phase 36: launching child CHILDB at EL0 (ASID 25), entry "
+    _uart_puts(em)
+    _uart_puthex(entry)
+    _uart_puts(nl)
+
+    # 4. ERET into the child. A clean frame (x0..x30 = 0) is restored by the svc
+    #    stub; we set ELR/SP_EL0/SPSR for the child entry.
+    j: int64 = 0
+    while j < 31:
+        frame_ptr[j] = cast[uint64](0)
+        j = j + 1
+    _msr_spsr_el1(SPSR_EL0T_DAIF)
+    _msr_elr_el1(entry)
+    _msr_sp_el0(P36B_STACK_TOP)
+    _isb()
+    return 0                                       # stub ERETs into the child entry
+
+
+# exit(status): child -> reap (resume the parent past its spawn svc with x0 =
+# status). parent -> run the verdict. Routed from the dispatcher.
+def arm64_p36_do_exit(frame_ptr: Ptr[uint64], status: uint64) -> int64:
+    nl: Ptr[char] = "\n"
+    if arm64_p36_cur_prog == 1:
+        # --- child exit: synchronous reap, resume the parent (Program A) ---
+        arm64_p36_child_status = status
+        cm: Ptr[char] = "[arm64] Phase 36: child CHILDB exit(status="
+        _uart_puts(cm)
+        _uart_puthex(status)
+        cm2: Ptr[char] = ") -> reaping, resuming parent INITA\n"
+        _uart_puts(cm2)
+
+        # Switch TTBR0 back to the parent (A) and restore its full EL0 context.
+        arm64_p36_cur_prog = 0
+        arm64_p36_switch_to(0)
+        pctx: Ptr[uint64] = cast[Ptr[uint64]](P36_PCTX)
+        i: int64 = 0
+        while i < 31:
+            frame_ptr[i] = pctx[i]                 # x0..x30 restored
+            i = i + 1
+        frame_ptr[0] = status                      # spawn() returns the child status
+        _msr_sp_el0(pctx[31])
+        _msr_elr_el1(pctx[32])
+        _msr_spsr_el1(pctx[33])
+        _isb()
+        return 0                                   # stub ERETs back into the parent
+
+    # --- parent exit: record + run the verdict ---
+    arm64_p36_a_exit_code = status
+    arm64_p36_a_exited = 1
+    arm64_p36_finish()
+    while True:
+        _wfi()
+    return 0
+
+
+# report(check-id, buf, len/value): Program A reports a result it computed in its
+# OWN address space; the kernel cross-checks it against the genuine expected
+# state, recording the verified evidence the verdict reads. This keeps the PASS
+# kernel-verified (the program cannot fake a result — the kernel compares the
+# reported user bytes against what it knows must be on disk).
+#   CHK_WORK   : a1 = A's read-back of WORK.TXT, a2 = len. Kernel confirms it
+#                equals the known 16-byte payload -> a_file_rt_ok.
+#   CHK_MARK   : a1 = A's read-back of MARK.TXT (B's marker), a2 = len. Kernel
+#                confirms it equals the known 12-byte marker -> a_saw_mark.
+#   CHK_STATUS : a2 = the spawn() return value A observed -> a_saw_status.
+def arm64_p36_do_report(chk: uint64, ubuf: uint64, val: uint64) -> int64:
+    if chk == P36_CHK_WORK:
+        if cast[int64](val) != P36_WORK_LEN:
+            return 0
+        ub: Ptr[uint8] = cast[Ptr[uint8]](ubuf)
+        ok: int64 = 1
+        i: int64 = 0
+        while i < P36_WORK_LEN:
+            if ub[i] != arm64_p36_work_byte(i):
+                ok = 0
+            i = i + 1
+        if ok != 0:
+            arm64_p36_a_file_rt_ok = 1
+        return ok
+    if chk == P36_CHK_MARK:
+        if cast[int64](val) != P36_MARK_LEN:
+            return 0
+        ub2: Ptr[uint8] = cast[Ptr[uint8]](ubuf)
+        ok2: int64 = 1
+        j: int64 = 0
+        while j < P36_MARK_LEN:
+            if ub2[j] != arm64_p36_mark_byte(j):
+                ok2 = 0
+            j = j + 1
+        if ok2 != 0:
+            arm64_p36_a_saw_mark = 1
+        return ok2
+    if chk == P36_CHK_STATUS:
+        arm64_p36_a_saw_status = val
+        return 1
+    return 0
+
+
+# Phase-36 syscall dispatcher. Routed from arm64_sync_handler while the demo is
+# live. Services the real EL0 file/process ABI (open/write/read/close/spawn/exit).
+def arm64_p36_dispatch(frame_ptr: Ptr[uint64], nr: uint64, a0: uint64, a1: uint64, a2: uint64) -> int64:
+    if nr == SYS_P36_OPEN:
+        fd: int64 = arm64_p36_do_open(a0)
+        frame_ptr[0] = cast[uint64](fd)
+        return 0
+    if nr == SYS_P36_WRITE:
+        n: int64 = arm64_p36_do_write(a0, a1, a2)
+        frame_ptr[0] = cast[uint64](n)
+        return 0
+    if nr == SYS_P36_READ:
+        n2: int64 = arm64_p36_do_read(a0, a1, a2)
+        frame_ptr[0] = cast[uint64](n2)
+        return 0
+    if nr == SYS_P36_CLOSE:
+        r: int64 = arm64_p36_do_close(a0)
+        frame_ptr[0] = cast[uint64](r)
+        return 0
+    if nr == SYS_P36_REPORT:
+        r2: int64 = arm64_p36_do_report(a0, a1, a2)
+        frame_ptr[0] = cast[uint64](r2)
+        return 0
+    if nr == SYS_P36_SPAWN:
+        return arm64_p36_do_spawn(frame_ptr, a0)
+    if nr == SYS_P36_EXIT:
+        return arm64_p36_do_exit(frame_ptr, a0)
+
+    um: Ptr[char] = "[arm64] EL0 unknown syscall (phase 36)\n"
+    _uart_puts(um)
+    frame_ptr[0] = cast[uint64](0)
+    return 0
+
+
+# Phase-36 verdict. PASS iff the full workflow verified:
+#   - Program A's WORK.TXT write->read round-trip matched (real FS open/write/
+#     close/read against FAT16);
+#   - Program B actually ran at EL0 (entered + executed);
+#   - B durably wrote MARK.TXT (close flushed it to the FAT16 disk);
+#   - A re-read MARK.TXT and saw B's marker (ORDERING: B ran before A re-read);
+#   - A observed (reaped) B's exit status, and it matched the expected value;
+#   - A exited with its own expected status.
+def arm64_p36_finish() -> int64:
+    arm64_p36_active = 0
+    nl: Ptr[char] = "\n"
+
+    sm: Ptr[char] = "[arm64] Phase 36 summary: a_file_rt_ok="
+    _uart_puts(sm)
+    _uart_puthex(cast[uint64](arm64_p36_a_file_rt_ok))
+    g1: Ptr[char] = " b_ran="
+    _uart_puts(g1)
+    _uart_puthex(cast[uint64](arm64_p36_b_ran))
+    g2: Ptr[char] = " b_wrote_mark="
+    _uart_puts(g2)
+    _uart_puthex(cast[uint64](arm64_p36_b_wrote_mark))
+    g3: Ptr[char] = " a_saw_mark="
+    _uart_puts(g3)
+    _uart_puthex(cast[uint64](arm64_p36_a_saw_mark))
+    g4: Ptr[char] = " child_status="
+    _uart_puts(g4)
+    _uart_puthex(arm64_p36_child_status)
+    g5: Ptr[char] = " a_saw_status="
+    _uart_puts(g5)
+    _uart_puthex(arm64_p36_a_saw_status)
+    g6: Ptr[char] = " a_exit="
+    _uart_puts(g6)
+    _uart_puthex(arm64_p36_a_exit_code)
+    _uart_puts(nl)
+
+    ok: int64 = 1
+    if arm64_p36_a_file_rt_ok == 0:
+        ok = 0
+    if arm64_p36_b_ran == 0:
+        ok = 0
+    if arm64_p36_b_wrote_mark == 0:
+        ok = 0
+    if arm64_p36_a_saw_mark == 0:
+        ok = 0
+    if arm64_p36_child_status != P36_CHILD_EXIT:
+        ok = 0
+    if arm64_p36_a_saw_status != P36_CHILD_EXIT:
+        ok = 0
+    if arm64_p36_a_exited == 0:
+        ok = 0
+    if arm64_p36_a_exit_code != P36_PARENT_EXIT:
+        ok = 0
+
+    if ok != 0:
+        rp: Ptr[char] = "[arm64] Phase 36: ran INITA.ELF at EL0 (real open/write/close/read FAT16 round-trip), it spawned CHILDB.ELF as a SECOND EL0 process in its own address space, the child wrote a marker file + exited, and the parent reaped the child's exit status and confirmed the marker — a real multi-process, filesystem-using userland\n"
+        _uart_puts(rp)
+        pp: Ptr[char] = "[arm64] Phase 36 PASS: multi-process FAT16 userland (INITA file round-trip + spawned CHILDB + reaped exit status + ordering)\n"
+        _uart_puts(pp)
+    else:
+        fp: Ptr[char] = "[arm64] Phase 36 FAIL: multi-process userland workflow verdict failed\n"
+        _uart_puts(fp)
+
+    _msr_daifset(2)
+    while True:
+        _wfi()
+    return 0
+
+
+# Phase-36 entry point (hand-off from arm64_p35_run on a Phase-35 PASS), with the
+# live virtio-blk transport `base`. Re-parse the FAT16 BPB (Phase 35 left the
+# transport live but we re-read the boot sector to be safe), read INITA.ELF off
+# the disk, build Program A's fresh EL0 space, load it, and ERET into it at EL0t
+# with IRQs masked. INITA drives the rest via its syscalls. Never returns.
+def arm64_p36_run(base: uint64) -> int64:
+    intro: Ptr[char] = "[arm64] Phase 36: multi-process FAT16 userland (INITA + spawned CHILDB)\n"
+    _uart_puts(intro)
+    nl: Ptr[char] = "\n"
+
+    _msr_daifset(2)                              # deterministic: EL1 IRQs masked
+    arm64_p36_blk_base = base
+    arm64_p36_cur_prog = 0
+
+    # Re-parse the FAT16 BPB off sector 0 (fills arm64_p31_* geometry globals).
+    if arm64_p30_read_sector_into(base, cast[uint64](0), P31_SEC_PA) != 1:
+        fp: Ptr[char] = "[arm64] Phase 36 FAIL: boot-sector read failed\n"
+        _uart_puts(fp)
+        _msr_daifset(2)
+        while True:
+            _wfi()
+        return 0
+    if arm64_p31_parse_bpb() != 1:
+        fp2: Ptr[char] = "[arm64] Phase 36 FAIL: BPB geometry not a supported FAT16\n"
+        _uart_puts(fp2)
+        _msr_daifset(2)
+        while True:
+            _wfi()
+        return 0
+
+    # Read INITA.ELF off the disk.
+    nm: uint64 = P31_FILE_PA
+    np: Ptr[uint8] = cast[Ptr[uint8]](nm)
+    np[0] = P36_INITA0
+    np[1] = P36_INITA1
+    np[2] = P36_INITA2
+    np[3] = P36_INITA3
+    np[4] = P36_INITA4
+    np[5] = P36_INITA5
+    np[6] = P36_INITA6
+    np[7] = P36_INITA7
+    np[8] = P36_INITA8
+    np[9] = P36_INITA9
+    np[10] = P36_INITA10
+    flen: int64 = arm64_p36_read_elf(base, nm)
+    if flen <= 0:
+        fp3: Ptr[char] = "[arm64] Phase 36 FAIL: could not read INITA.ELF off the FAT16 disk\n"
+        _uart_puts(fp3)
+        _msr_daifset(2)
+        while True:
+            _wfi()
+        return 0
+
+    rm: Ptr[char] = "[arm64] Phase 36: read INITA.ELF off disk ("
+    _uart_puts(rm)
+    _uart_puthex(cast[uint64](flen))
+    rm2: Ptr[char] = " bytes); building parent EL0 space + launching\n"
+    _uart_puts(rm2)
+
+    # Build Program A's fresh EL0 space, switch in, load the ELF.
+    arm64_p36_build_space(0)
+    arm64_p36_switch_to(0)
+    entry: uint64 = arm64_p36_load_elf(0)
+    if entry == cast[uint64](0):
+        fp4: Ptr[char] = "[arm64] Phase 36 FAIL: INITA.ELF failed header/phdr validation\n"
+        _uart_puts(fp4)
+        _msr_daifset(2)
+        while True:
+            _wfi()
+        return 0
+
+    arm64_p36_active = 1
+
+    em: Ptr[char] = "[arm64] Phase 36: launching parent INITA at EL0 (ASID 24), entry "
+    _uart_puts(em)
+    _uart_puthex(entry)
+    _uart_puts(nl)
+
+    _msr_spsr_el1(SPSR_EL0T_DAIF)               # EL0t, IRQ/FIQ masked (deterministic)
+    _msr_elr_el1(entry)
+    _msr_sp_el0(P36A_STACK_TOP)
+    _isb()
+    _eret()                                      # -> EL0; INITA runs, drives the rest
+    # Unreachable: INITA's exit() halts after the verdict.
     while True:
         _wfi()
     return 0
