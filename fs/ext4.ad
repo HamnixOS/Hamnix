@@ -245,6 +245,38 @@ ext4_htree_buf: Array[4096, uint8]
 # fewer blocks than the linear scan, proving the index was used.
 ext4_htree_leaf_reads: uint64 = 0
 
+# --- htree (dir_index) INSERT / leaf-split scratch ----------------
+# The WRITE path (ext4_htree_dir_insert + _ext4_htree_do_split) needs
+# its OWN block buffers, kept disjoint from ext4_blk_buf (the leaf the
+# insert mutates) and ext4_htree_buf (the index node it edits) so a
+# split can hold the old leaf, the new leaf and the parent index node
+# in flight simultaneously.
+#   ext4_htins_oldleaf — the leaf being split (rewritten in place)
+#   ext4_htins_newleaf — the freshly allocated sibling leaf
+#   ext4_htins_idxbuf  — the dx_root/dx_node index block being edited
+# 4 KiB each covers 1 KiB..4 KiB fs blocks; undersizing would overflow
+# into the next BSS global (the recurring trap).
+ext4_htins_oldleaf: Array[4096, uint8]
+ext4_htins_newleaf: Array[4096, uint8]
+ext4_htins_idxbuf:  Array[4096, uint8]
+
+# do_split sort map: one (hash, byte-offset, rec_len) triple per live
+# dirent in the leaf being split. A 1 KiB block holds at most ~85 8-byte
+# records, a 4 KiB block ~340; 512 slots is a safe ceiling for any block
+# size we mint. Three parallel arrays avoid a struct.
+EXT4_HTINS_MAP_MAX: uint64 = 512
+ext4_htins_map_hash: Array[512, uint32]
+ext4_htins_map_off:  Array[512, uint16]
+ext4_htins_map_rlen: Array[512, uint16]
+
+# Logical block of each frame's index node, recorded during the WRITE
+# descent so the parent dx index node can be re-read + edited when a
+# leaf split needs a new dx_entry inserted. Frame 0 == dir logical 0.
+ext4_htins_frame_logical: Array[8, uint64]
+ext4_htins_frame_eoff:    Array[8, uint64]
+ext4_htins_frame_at:      Array[8, uint32]
+ext4_htins_nframes:       uint32 = 0
+
 
 def _ext4_read_u16(p: Ptr[uint8]) -> uint16:
     return cast[uint16](p[0]) | (cast[uint16](p[1]) << 8)
@@ -1912,6 +1944,215 @@ def ext4_htree_selftest():
         printk0("[ext4-htree] FAIL\n")
 
 
+# --- htree INSERT self-test ---------------------------------------
+#
+# Gated on /etc/ext4-htins-test (planted by build_initramfs.py when
+# ENABLE_EXT4_HTINS_TEST=1). Drives the WRITE path:
+#   (1) resolve the on-disk htree directory "htdir" (minted by
+#       scripts/test_ext4_htree_insert.sh with enough entries to be a
+#       real dir_index dir),
+#   (2) record the dx_root indirect_levels BEFORE,
+#   (3) insert a batch of NEW names (forcing >= 1 leaf split and ideally
+#       an index-level growth) via ext4_create_file -> ext4_dir_insert ->
+#       ext4_htree_dir_insert,
+#   (4) verify EVERY inserted name resolves via the hash-descend lookup
+#       to the inode that was created for it,
+#   (5) verify the directory still validates: each inserted name's
+#       descend result matches the independent linear scan, and the
+#       dx_root indirect_levels grew (or stayed >=1),
+#   (6) verify a pre-existing name still resolves (split didn't lose it).
+# Verdict is computed from real lookups + a structure check, NOT a
+# hard-coded PASS. WRITES the image, so opt-in via the marker.
+
+# How many fresh names to insert. The test fixture seeds "htdir" with
+# enough entries that its dx_root is nearly full (count ~111 of limit
+# 124 at 1 KiB blocks, indirect_levels 0); inserting this many more names
+# forces many leaf splits, fills the dx_root, and triggers the 0->1
+# index-level growth — then keeps inserting so the resulting two-level
+# htree is exercised by further descends/inserts.
+EXT4_HTINS_INSERT_COUNT: uint64 = 1200
+
+# Scratch name buffer ("ins000000\0" style). 24 bytes is ample for the
+# "ins" prefix + a 6-digit counter + NUL (undersizing overflows the next
+# BSS global — the recurring trap).
+ext4_htins_namebuf: Array[24, uint8]
+
+
+def _ext4_htins_make_name(idx: uint64):
+    # Format "ins%06u" into ext4_htins_namebuf with a trailing NUL.
+    ext4_htins_namebuf[0] = 0x69                              # 'i'
+    ext4_htins_namebuf[1] = 0x6E                              # 'n'
+    ext4_htins_namebuf[2] = 0x73                              # 's'
+    d: uint64 = idx
+    p: uint64 = 8
+    while p >= 3:
+        ext4_htins_namebuf[p] = cast[uint8](0x30 + cast[uint8](d % 10))
+        d = d / 10
+        if p == 3:
+            p = 2                                            # exit
+        else:
+            p = p - 1
+    ext4_htins_namebuf[9] = 0
+
+
+def _ext4_htins_dx_levels(dir_inum: uint32) -> int64:
+    # Read the dx_root indirect_levels of `dir_inum`. Returns -1 on error.
+    dirbuf: Array[256, uint8]
+    if ext4_read_inode(cast[uint64](dir_inum), &dirbuf[0]) != 0:
+        return -1
+    phys0: uint64 = _ext4_logical_to_physical(&dirbuf[0], 0)
+    if phys0 == 0:
+        return -1
+    if _ext4_read_block(phys0, &ext4_htree_buf[0]) != 0:
+        return -1
+    ind: uint8 = cast[Ptr[uint8]](
+        cast[uint64](&ext4_htree_buf[0]) + 0x1E)[0]
+    return cast[int64](cast[uint64](ind))
+
+
+def ext4_htree_insert_selftest():
+    if ext4_blockdev_slot < 0:
+        printk0("[ext4-htins] FAIL: ext4 not mounted\n")
+        return
+    if ext4_metadata_csum != 0:
+        printk0("[ext4-htins] FAIL: image carries metadata_csum (use ^metadata_csum)\n")
+        printk0("[ext4-htins] FAIL\n")
+        return
+    ok_all: int32 = 1
+
+    dir_inum: uint32 = ext4_resolve_dir("htdir")
+    if dir_inum == 0:
+        printk0("[ext4-htins] FAIL: cannot resolve /htdir\n")
+        printk0("[ext4-htins] FAIL\n")
+        return
+    dirbuf: Array[256, uint8]
+    if ext4_read_inode(cast[uint64](dir_inum), &dirbuf[0]) != 0:
+        printk0("[ext4-htins] FAIL: cannot read htdir inode\n")
+        printk0("[ext4-htins] FAIL\n")
+        return
+    if ext4_inode_is_htree_dir(&dirbuf[0]) == 0:
+        printk0("[ext4-htins] FAIL: htdir is not an htree (dir_index) dir\n")
+        printk0("[ext4-htins] FAIL\n")
+        return
+    printk0("[ext4-htins] PASS htdir is EXT4_INDEX_FL (htree)\n")
+
+    levels_before: int64 = _ext4_htins_dx_levels(dir_inum)
+    blocks_before: uint64 = cast[uint64](
+        ext4_inode_size_lo(&dirbuf[0])) / ext4_block_size
+    printk2("[ext4-htins] before: indirect_levels=%d, %d dir blocks\n",
+            cast[uint64](levels_before), blocks_before)
+
+    # Sanity: a pre-existing name must resolve up-front so we can prove
+    # the splits below don't lose it.
+    pre_inum: uint32 = ext4_dir_lookup_htree(&dirbuf[0], "seed000000")
+    if pre_inum == 0 or ext4_htree_used == 0:
+        printk0("[ext4-htins] FAIL: seed000000 missing before inserts\n")
+        ok_all = 0
+
+    # Insert a batch of NEW names through the full create path (which
+    # routes EXT4_INDEX_FL parents to ext4_htree_dir_insert). Each create
+    # mints a real inode; we record nothing but the success count — the
+    # lookup phase reproduces each name and asserts it resolves.
+    body: Ptr[uint8] = "x"
+    inserted: uint64 = 0
+    i: uint64 = 0
+    while i < EXT4_HTINS_INSERT_COUNT:
+        _ext4_htins_make_name(i)
+        ni: uint32 = ext4_create_file(
+            cast[uint64](dir_inum),
+            cast[Ptr[char]](&ext4_htins_namebuf[0]), body, 1)
+        if ni == 0:
+            printk1("[ext4-htins] FAIL: create failed at #%d\n", i)
+            ok_all = 0
+            i = EXT4_HTINS_INSERT_COUNT
+        else:
+            inserted = inserted + 1
+            i = i + 1
+    printk1("[ext4-htins] inserted %d new names\n", inserted)
+
+    # Re-read the dir inode (i_size / extents grew across splits).
+    if ext4_read_inode(cast[uint64](dir_inum), &dirbuf[0]) != 0:
+        printk0("[ext4-htins] FAIL: re-read htdir inode\n")
+        printk0("[ext4-htins] FAIL\n")
+        return
+    levels_after: int64 = _ext4_htins_dx_levels(dir_inum)
+    blocks_after: uint64 = cast[uint64](
+        ext4_inode_size_lo(&dirbuf[0])) / ext4_block_size
+    printk2("[ext4-htins] after:  indirect_levels=%d, %d dir blocks\n",
+            cast[uint64](levels_after), blocks_after)
+
+    # A leaf split allocates a new directory block — so the dir MUST have
+    # grown. (Proves real splitting happened, not in-place reuse.)
+    if blocks_after <= blocks_before:
+        printk0("[ext4-htins] FAIL: dir did not grow (no leaf split)\n")
+        ok_all = 0
+    else:
+        printk1("[ext4-htins] PASS leaf split grew dir by %d block(s)\n",
+                blocks_after - blocks_before)
+
+    # Verify EVERY inserted name resolves via the hash-descend path AND
+    # matches the independent linear scan (no corruption).
+    verified: uint64 = 0
+    lookups_ok: int32 = 1
+    j: uint64 = 0
+    while j < inserted:
+        _ext4_htins_make_name(j)
+        nmp: Ptr[char] = cast[Ptr[char]](&ext4_htins_namebuf[0])
+        ext4_htree_used = 0
+        ht_inum: uint32 = ext4_dir_lookup_htree(&dirbuf[0], nmp)
+        if ext4_htree_used == 0:
+            printk1("[ext4-htins] FAIL: htree path bailed for ins#%d\n", j)
+            lookups_ok = 0
+            j = inserted
+        elif ht_inum == 0:
+            printk1("[ext4-htins] FAIL: htree miss for ins#%d\n", j)
+            lookups_ok = 0
+            j = inserted
+        else:
+            lin_inum: uint32 = _ext4_dir_lookup_linear(&dirbuf[0], nmp)
+            if ht_inum != lin_inum:
+                printk2("[ext4-htins] FAIL: ins htree %d != linear %d\n",
+                        cast[uint64](ht_inum), cast[uint64](lin_inum))
+                lookups_ok = 0
+                j = inserted
+            else:
+                verified = verified + 1
+                j = j + 1
+    if lookups_ok != 0 and verified == inserted and inserted > 0:
+        printk1("[ext4-htins] PASS all %d inserted names resolve via descend\n",
+                verified)
+    else:
+        printk2("[ext4-htins] FAIL: only %d/%d inserted names verified\n",
+                verified, inserted)
+        ok_all = 0
+
+    # The pre-existing seed name must STILL resolve after all the splits.
+    post_inum: uint32 = ext4_dir_lookup_htree(&dirbuf[0], "seed000000")
+    if ext4_htree_used != 0 and post_inum != 0 and post_inum == pre_inum:
+        printk0("[ext4-htins] PASS pre-existing name survived splits\n")
+    else:
+        printk0("[ext4-htins] FAIL: pre-existing name lost across splits\n")
+        ok_all = 0
+
+    # Structure: the index must remain >= 1 level. If it started at 0 it
+    # should have grown to 1 (index-level growth); if it started >=1 it
+    # stays valid.
+    if levels_after < 1:
+        printk0("[ext4-htins] FAIL: dx index has no indirect level\n")
+        ok_all = 0
+    elif levels_after > levels_before:
+        printk2("[ext4-htins] PASS index grew %d -> %d level(s)\n",
+                cast[uint64](levels_before), cast[uint64](levels_after))
+    else:
+        printk1("[ext4-htins] PASS index stable at %d level(s)\n",
+                cast[uint64](levels_after))
+
+    if ok_all != 0:
+        printk0("[ext4-htins] PASS\n")
+    else:
+        printk0("[ext4-htins] FAIL\n")
+
+
 def _ext4_dir_lookup_linear(dir_inode_buf: Ptr[uint8],
                             name: Ptr[char]) -> uint32:
     # Pure linear all-block scan, used by the self-test to cross-check
@@ -3232,6 +3473,14 @@ def ext4_dir_insert(parent_inum: uint64, name: Ptr[char],
     parent_inode: Array[256, uint8]
     if ext4_read_inode(parent_inum, &parent_inode[0]) != 0:
         return -1
+    # If the parent is an EXT4_INDEX_FL (htree / dir_index) directory,
+    # route to the hash-indexed insert path: descend the dx index to the
+    # target leaf, split it if full, and maintain the index. The linear
+    # last-block split below would corrupt an htree (its leaves are
+    # hash-ordered, not append-ordered).
+    if ext4_inode_is_htree_dir(&parent_inode[0]) != 0:
+        return ext4_htree_dir_insert(parent_inum, name, child_inum,
+                                     file_type)
     # Capture i_generation now (before any ext4_blk_buf reuse) so the
     # dir-block checksum restamp below can seed correctly without an
     # inode re-read that would clobber the mutated dir block.
@@ -3317,6 +3566,741 @@ def ext4_dir_insert(parent_inum: uint64, name: Ptr[char],
         pos = pos + cast[uint64](e_rec_len)
     printk0("ext4: dir block full (no slack for insert)\n")
     return -1
+
+
+# === htree (dir_index) directory INSERT — the WRITE path ==========
+#
+# ext4_dir_insert (above) handles LINEAR directories: it splits an
+# existing dirent's slack to slot the new name into one of the dir's
+# data blocks. An EXT4_INDEX_FL (dir_index / htree) directory is
+# different: logical block 0 is a dx_root index node, its dx_entry array
+# maps hash ranges to LEAF blocks, and the real dirents live only in the
+# leaves. Inserting a name there means: hash it, descend the dx index to
+# the ONE leaf whose hash range covers it, and insert into that leaf. If
+# the leaf is full, SPLIT it — allocate a sibling leaf, redistribute the
+# entries by hash (Linux's do_split), add a new dx_entry {hash,block} to
+# the parent, and place the new name in whichever half it hashes to. If
+# the parent index node itself is full, grow the index (0->1 level).
+#
+# After any insert the directory remains a valid htree that
+# ext4_dir_lookup_htree resolves correctly.
+#
+# NOTE: index-block (dx) checksums (the metadata_csum "dx_tail") are not
+# maintained here, so htree INSERT targets images WITHOUT metadata_csum.
+# Leaf (data) block tails ARE preserved when present.
+
+
+def _ext4_leaf_dirent_insert(leaf: uint64, name: Ptr[char],
+                             name_len: uint64, child_inum: uint32,
+                             file_type: uint8) -> int32:
+    # Insert (name, child_inum) into the directory LEAF block already in
+    # the buffer at byte address `leaf`. Uses the same tombstone-reuse /
+    # slack-split rule as ext4_dir_insert. Returns 0 on success, -1 if
+    # the block has no room (caller must split). A metadata_csum tail
+    # (fake dirent rec_len=12, ft=0xDE) is treated as an unusable record
+    # by the >= needed test, so it is preserved automatically.
+    needed: uint64 = _ext4_dirent_padded_size(name_len)
+    pos: uint64 = 0
+    while pos < ext4_block_size:
+        e: uint64 = leaf + pos
+        e_inum:    uint32 = _ext4_read_u32(cast[Ptr[uint8]](e + 0))
+        e_rec_len: uint16 = _ext4_read_u16(cast[Ptr[uint8]](e + 4))
+        if e_rec_len == 0:
+            return -1
+        if e_inum == 0:
+            # tombstone (or csum tail, which has rec_len 12 < needed for
+            # any real name so it is skipped). Reuse in place if it fits.
+            if cast[uint64](e_rec_len) >= needed:
+                _ext4_write_u32(cast[Ptr[uint8]](e + 0), child_inum)
+                cast[Ptr[uint8]](e + 6)[0] = cast[uint8](name_len)
+                cast[Ptr[uint8]](e + 7)[0] = file_type
+                ci: uint64 = 0
+                while ci < name_len:
+                    cast[Ptr[uint8]](e + 8 + ci)[0] = cast[uint8](name[ci])
+                    ci = ci + 1
+                pp: uint64 = 8 + name_len
+                while pp < cast[uint64](e_rec_len):
+                    cast[Ptr[uint8]](e + pp)[0] = 0
+                    pp = pp + 1
+                return 0
+        else:
+            e_name_len: uint8 = cast[Ptr[uint8]](e + 6)[0]
+            true_e: uint64 = _ext4_dirent_padded_size(
+                cast[uint64](e_name_len))
+            if cast[uint64](e_rec_len) >= true_e + needed:
+                new_rec_len: uint64 = cast[uint64](e_rec_len) - true_e
+                _ext4_write_u16(cast[Ptr[uint8]](e + 4),
+                                cast[uint16](true_e))
+                new_e: uint64 = leaf + pos + true_e
+                _ext4_write_u32(cast[Ptr[uint8]](new_e + 0), child_inum)
+                _ext4_write_u16(cast[Ptr[uint8]](new_e + 4),
+                                cast[uint16](new_rec_len))
+                cast[Ptr[uint8]](new_e + 6)[0] = cast[uint8](name_len)
+                cast[Ptr[uint8]](new_e + 7)[0] = file_type
+                ci: uint64 = 0
+                while ci < name_len:
+                    cast[Ptr[uint8]](new_e + 8 + ci)[0] = cast[uint8](name[ci])
+                    ci = ci + 1
+                pp: uint64 = 8 + name_len
+                while pp < new_rec_len:
+                    cast[Ptr[uint8]](new_e + pp)[0] = 0
+                    pp = pp + 1
+                return 0
+        pos = pos + cast[uint64](e_rec_len)
+    return -1
+
+
+def _ext4_htins_build_map(leaf: uint64) -> int64:
+    # Collect every LIVE dirent in the leaf at byte address `leaf` into
+    # the ext4_htins_map_* arrays (hash / byte-offset / rec_len), then
+    # sort the map ascending by hash with a simple insertion sort. The
+    # csum tail (inum==0, ft==0xDE) and any tombstone are skipped — only
+    # real names carry a hash. Returns the live entry count, or -1 if the
+    # block has more entries than the map can hold or is malformed.
+    n: int64 = 0
+    pos: uint64 = 0
+    while pos < ext4_block_size:
+        e: uint64 = leaf + pos
+        e_inum:    uint32 = _ext4_read_u32(cast[Ptr[uint8]](e + 0))
+        e_rec_len: uint16 = _ext4_read_u16(cast[Ptr[uint8]](e + 4))
+        if e_rec_len == 0:
+            return -1
+        if pos + cast[uint64](e_rec_len) > ext4_block_size:
+            return -1
+        if e_inum != 0:
+            e_name_len: uint64 = cast[uint64](cast[Ptr[uint8]](e + 6)[0])
+            if e_name_len != 0:
+                if cast[uint64](n) >= EXT4_HTINS_MAP_MAX:
+                    return -1
+                minor: uint32 = 0
+                h: uint32 = ext4_dirhash(cast[Ptr[uint8]](e + 8),
+                                         e_name_len, &minor)
+                ext4_htins_map_hash[cast[uint64](n)] = h
+                ext4_htins_map_off[cast[uint64](n)]  = cast[uint16](pos)
+                ext4_htins_map_rlen[cast[uint64](n)] = cast[uint16](
+                    _ext4_dirent_padded_size(e_name_len))
+                n = n + 1
+        pos = pos + cast[uint64](e_rec_len)
+    # Insertion sort by hash (n is small: <= entries-per-block).
+    i: int64 = 1
+    while i < n:
+        kh: uint32 = ext4_htins_map_hash[cast[uint64](i)]
+        ko: uint16 = ext4_htins_map_off[cast[uint64](i)]
+        kr: uint16 = ext4_htins_map_rlen[cast[uint64](i)]
+        j: int64 = i - 1
+        while j >= 0 and ext4_htins_map_hash[cast[uint64](j)] > kh:
+            ext4_htins_map_hash[cast[uint64](j + 1)] = \
+                ext4_htins_map_hash[cast[uint64](j)]
+            ext4_htins_map_off[cast[uint64](j + 1)] = \
+                ext4_htins_map_off[cast[uint64](j)]
+            ext4_htins_map_rlen[cast[uint64](j + 1)] = \
+                ext4_htins_map_rlen[cast[uint64](j)]
+            j = j - 1
+        ext4_htins_map_hash[cast[uint64](j + 1)] = kh
+        ext4_htins_map_off[cast[uint64](j + 1)]  = ko
+        ext4_htins_map_rlen[cast[uint64](j + 1)] = kr
+        i = i + 1
+    return n
+
+
+def _ext4_leaf_init_empty(buf: uint64):
+    # Initialise `buf` as an EMPTY directory leaf: one dirent with
+    # inum=0 spanning the whole usable region (minus a csum tail if the
+    # fs carries metadata_csum). Subsequent _ext4_leaf_dirent_insert
+    # calls carve real records out of this slack.
+    _ext4_zero(cast[Ptr[uint8]](buf), ext4_block_size)
+    span: uint64 = ext4_block_size
+    if ext4_metadata_csum != 0:
+        span = ext4_block_size - 12
+        tail: uint64 = buf + ext4_block_size - 12
+        _ext4_write_u16(cast[Ptr[uint8]](tail + 4), 12)        # rec_len
+        cast[Ptr[uint8]](tail + 7)[0] = 0xDE                   # ft
+    _ext4_write_u32(cast[Ptr[uint8]](buf + 0), 0)              # inum=0
+    _ext4_write_u16(cast[Ptr[uint8]](buf + 4), cast[uint16](span))
+
+
+def _ext4_leaf_append_raw(buf: uint64, src_e: uint64, name_len: uint64,
+                          cursor: Ptr[uint64]):
+    # Copy the dirent at `src_e` (header + name) into `buf` at byte
+    # offset *cursor as a tightly-packed record (rec_len == true padded
+    # size), advancing *cursor. The final record's rec_len is fixed up
+    # by the caller to span the block's remaining slack.
+    off: uint64 = cursor[0]
+    dst: uint64 = buf + off
+    true_sz: uint64 = _ext4_dirent_padded_size(name_len)
+    # inum + name_len + file_type, then the name.
+    _ext4_write_u32(cast[Ptr[uint8]](dst + 0),
+                    _ext4_read_u32(cast[Ptr[uint8]](src_e + 0)))
+    _ext4_write_u16(cast[Ptr[uint8]](dst + 4), cast[uint16](true_sz))
+    cast[Ptr[uint8]](dst + 6)[0] = cast[Ptr[uint8]](src_e + 6)[0]
+    cast[Ptr[uint8]](dst + 7)[0] = cast[Ptr[uint8]](src_e + 7)[0]
+    k: uint64 = 0
+    while k < name_len:
+        cast[Ptr[uint8]](dst + 8 + k)[0] = cast[Ptr[uint8]](src_e + 8 + k)[0]
+        k = k + 1
+    cursor[0] = off + true_sz
+
+
+def _ext4_htins_do_split(dir_inum: uint64, dir_gen: uint32,
+                         inode_buf: Ptr[uint8],
+                         old_logical: uint64,
+                         name: Ptr[char], name_len: uint64,
+                         child_inum: uint32, file_type: uint8,
+                         new_hash_out: Ptr[uint32]) -> int64:
+    # Split the FULL leaf at dir logical block `old_logical`. Allocates a
+    # sibling leaf (a new logical block at the end of the dir), copies the
+    # hash-sorted lower half of the entries into the OLD block and the
+    # upper half into the NEW block, splitting at the median hash, then
+    # inserts the new name into whichever half its hash falls in.
+    #
+    # The split hash (first hash of the upper half) is returned via
+    # new_hash_out so the caller can register a dx_entry {hash, newblk}
+    # in the parent index node. Returns the NEW leaf's LOGICAL block on
+    # success, or -1 on failure.
+    #
+    # On entry the OLD leaf must already be loaded in ext4_htins_oldleaf.
+    old: uint64 = cast[uint64](&ext4_htins_oldleaf[0])
+    new_: uint64 = cast[uint64](&ext4_htins_newleaf[0])
+    cnt: int64 = _ext4_htins_build_map(old)
+    if cnt < 1:
+        return -1
+    # Median split: lower half hashes [0,split), upper [split,cnt).
+    split: int64 = cnt / 2
+    # Linux nudges the boundary so equal-hash runs stay on one side.
+    while split < cnt and ext4_htins_map_hash[cast[uint64](split)] \
+            == ext4_htins_map_hash[cast[uint64](split - 1)]:
+        split = split + 1
+    if split >= cnt:
+        split = cnt - 1
+    split_hash: uint32 = ext4_htins_map_hash[cast[uint64](split)]
+
+    # Allocate the sibling physical block and append it to the dir inode
+    # as the next logical block.
+    dir_size: uint64 = cast[uint64](ext4_inode_size_lo(inode_buf))
+    new_logical: uint64 = dir_size / ext4_block_size
+    new_phys: uint64 = ext4_alloc_block()
+    if new_phys == 0:
+        return -1
+    if _ext4_extent_append_block(inode_buf, new_logical, new_phys) != 0:
+        ext4_free_block(new_phys)
+        return -1
+    # Grow i_size by one block so lookups walk the new leaf.
+    _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](inode_buf) + 4),
+                    cast[uint32](dir_size + ext4_block_size))
+
+    # Rebuild both leaves from the sorted map. Pack lower half into a
+    # fresh empty old-image, upper half into the new leaf.
+    _ext4_zero(new_, ext4_block_size)
+    # Scratch copy of the old leaf's bytes so we can rebuild over `old`
+    # while still reading the originals: copy old -> new first as a
+    # staging area is awkward; instead pack from a saved source. Use
+    # ext4_htins_idxbuf as the immutable source snapshot.
+    src: uint64 = cast[uint64](&ext4_htins_idxbuf[0])
+    memcpy(cast[Ptr[uint8]](src), cast[Ptr[uint8]](old), ext4_block_size)
+
+    _ext4_leaf_init_empty(old)
+    _ext4_leaf_init_empty(new_)
+    lo_cursor: uint64 = 0
+    hi_cursor: uint64 = 0
+    mi: int64 = 0
+    while mi < cnt:
+        e_off: uint64 = cast[uint64](ext4_htins_map_off[cast[uint64](mi)])
+        src_e: uint64 = src + e_off
+        nl: uint64 = cast[uint64](cast[Ptr[uint8]](src_e + 6)[0])
+        if mi < split:
+            _ext4_leaf_append_raw(old, src_e, nl, &lo_cursor)
+        else:
+            _ext4_leaf_append_raw(new_, src_e, nl, &hi_cursor)
+        mi = mi + 1
+    # Fix up each half's last record to span the block's slack (so the
+    # block is a valid dirent chain with no gap).
+    _ext4_htins_seal_leaf(old, lo_cursor)
+    _ext4_htins_seal_leaf(new_, hi_cursor)
+
+    # Insert the new name into whichever half its hash belongs to.
+    minor: uint32 = 0
+    nh: uint32 = ext4_dirhash(cast[Ptr[uint8]](name), name_len, &minor)
+    target: uint64 = old
+    if nh >= split_hash:
+        target = new_
+    if _ext4_leaf_dirent_insert(target, name, name_len,
+                                child_inum, file_type) != 0:
+        # Shouldn't happen (we just freed half a block) — but bail safe.
+        return -1
+
+    # Stamp leaf checksums (no-op without metadata_csum) and write both.
+    ext4_dirblock_csum_set(cast[Ptr[uint8]](old), dir_inum, dir_gen)
+    ext4_dirblock_csum_set(cast[Ptr[uint8]](new_), dir_inum, dir_gen)
+    old_phys: uint64 = _ext4_logical_to_physical(inode_buf, old_logical)
+    if old_phys == 0:
+        return -1
+    if _ext4_write_block(old_phys, cast[Ptr[uint8]](old)) != 0:
+        return -1
+    if _ext4_write_block(new_phys, cast[Ptr[uint8]](new_)) != 0:
+        return -1
+    new_hash_out[0] = split_hash
+    return cast[int64](new_logical)
+
+
+def _ext4_htins_seal_leaf(buf: uint64, cursor: uint64):
+    # After packing records up to byte offset `cursor`, extend the LAST
+    # record's rec_len so it spans to the end of the usable region (the
+    # block end, minus a csum tail if present). If no records were packed
+    # the block is left as an empty leaf.
+    usable: uint64 = ext4_block_size
+    if ext4_metadata_csum != 0:
+        usable = ext4_block_size - 12
+    if cursor == 0:
+        _ext4_leaf_init_empty(buf)
+        return
+    # Walk to the last record and grow its rec_len.
+    pos: uint64 = 0
+    last: uint64 = 0
+    while pos < cursor:
+        last = pos
+        rl: uint16 = _ext4_read_u16(cast[Ptr[uint8]](buf + pos + 4))
+        if rl == 0:
+            break
+        pos = pos + cast[uint64](rl)
+    _ext4_write_u16(cast[Ptr[uint8]](buf + last + 4),
+                    cast[uint16](usable - last))
+
+
+def _ext4_htins_descend_write(inode_buf: Ptr[uint8], hash: uint32,
+                              leaf_out: Ptr[uint64]) -> int64:
+    # Descend the dx index for `hash`, recording each frame's index-node
+    # logical block + entries offset + chosen `at` into the
+    # ext4_htins_frame_* arrays (so a split can edit the parent). Reads
+    # index blocks through ext4_htins_idxbuf. Returns the dx_root's
+    # indirect_levels (>=0), filling *leaf_out with the target LEAF
+    # logical block, or -1 on a structural error.
+    phys0: uint64 = _ext4_logical_to_physical(inode_buf, 0)
+    if phys0 == 0:
+        return -1
+    if _ext4_read_block(phys0, &ext4_htins_idxbuf[0]) != 0:
+        return -1
+    base: uint64 = cast[uint64](&ext4_htins_idxbuf[0])
+    info_length: uint8 = cast[Ptr[uint8]](base + 0x1D)[0]
+    indirect:    uint8 = cast[Ptr[uint8]](base + 0x1E)[0]
+    if info_length != 8:
+        return -1
+    if cast[uint32](indirect) >= 8:
+        return -1
+    entries_off: uint64 = 0x18 + cast[uint64](info_length)
+    entries: uint64 = base + entries_off
+    cur_logical: uint64 = 0
+    level: uint32 = 0
+    ext4_htins_nframes = cast[uint32](indirect) + 1
+    while True:
+        count: uint32 = _dx_get_count(entries)
+        limit: uint32 = _dx_get_limit(entries)
+        if count == 0 or count > limit:
+            return -1
+        at: uint32 = _dx_bsearch(entries, count, hash)
+        ext4_htins_frame_logical[level] = cur_logical
+        ext4_htins_frame_eoff[level] = entries_off
+        ext4_htins_frame_at[level] = at
+        child_block: uint32 = _dx_entry_block(entries, at)
+        if level >= cast[uint32](indirect):
+            leaf_out[0] = cast[uint64](child_block)
+            return cast[int64](cast[uint64](indirect))
+        phys: uint64 = _ext4_logical_to_physical(
+            inode_buf, cast[uint64](child_block))
+        if phys == 0:
+            return -1
+        if _ext4_read_block(phys, &ext4_htins_idxbuf[0]) != 0:
+            return -1
+        base = cast[uint64](&ext4_htins_idxbuf[0])
+        cur_logical = cast[uint64](child_block)
+        entries_off = 8
+        entries = base + entries_off
+        level = level + 1
+
+
+def _ext4_dx_insert_entry(entries: uint64, at: uint32,
+                          hash: uint32, block: uint32) -> int32:
+    # Insert a dx_entry {hash, block} into the dx_entry array `entries`
+    # immediately AFTER index `at` (Linux keeps the array hash-sorted and
+    # places the new sibling's entry right after the one we descended
+    # into). Shifts the tail up by one slot. Returns 0 on success, -1 if
+    # the node is full (count == limit) — caller must grow the index.
+    count: uint32 = _dx_get_count(entries)
+    limit: uint32 = _dx_get_limit(entries)
+    if count >= limit:
+        return -1
+    # Shift entries (at+1 .. count-1) up by one 8-byte slot.
+    i: int64 = cast[int64](count) - 1
+    while i > cast[int64](at):
+        sh: uint32 = _dx_entry_hash(entries, cast[uint32](i))
+        sb: uint32 = _dx_entry_block(entries, cast[uint32](i))
+        _ext4_write_u32(cast[Ptr[uint8]](entries + cast[uint64](i + 1) * 8 + 0), sh)
+        _ext4_write_u32(cast[Ptr[uint8]](entries + cast[uint64](i + 1) * 8 + 4), sb)
+        i = i - 1
+    slot: uint64 = cast[uint64](at + 1)
+    _ext4_write_u32(cast[Ptr[uint8]](entries + slot * 8 + 0), hash)
+    _ext4_write_u32(cast[Ptr[uint8]](entries + slot * 8 + 4), block)
+    # Bump count (the u16 at +2 of entry 0, the countlimit).
+    _ext4_write_u16(cast[Ptr[uint8]](entries + 2), cast[uint16](count + 1))
+    return 0
+
+
+def _ext4_htins_split_node(inode_buf: Ptr[uint8],
+                           node_logical: uint64,
+                           new_leaf_hash: uint32, new_leaf_block: uint32,
+                           out_node_hash: Ptr[uint32],
+                           out_node_logical: Ptr[uint32]) -> int32:
+    # Split the FULL interior dx_node at dir logical block `node_logical`
+    # (currently loaded in ext4_htins_idxbuf), the way ext4_dx_add_entry
+    # does when an interior index node fills. Allocates a sibling dx_node,
+    # moves the upper half of the node's dx_entries into it, inserts the
+    # pending {new_leaf_hash, new_leaf_block} dx_entry into whichever half
+    # it belongs, and reports the new node's first hash + logical block via
+    # out_* so the caller can register it in the root. Returns 0 on
+    # success, -1 on failure. The OLD node is left in ext4_htins_idxbuf
+    # (rewritten); the caller writes it back.
+    old_node: uint64 = cast[uint64](&ext4_htins_idxbuf[0])
+    o_entries: uint64 = old_node + 8
+    o_count: uint32 = _dx_get_count(o_entries)
+    o_limit: uint32 = _dx_get_limit(o_entries)
+    # New dx_node block.
+    dir_size: uint64 = cast[uint64](ext4_inode_size_lo(inode_buf))
+    new_logical: uint64 = dir_size / ext4_block_size
+    new_phys: uint64 = ext4_alloc_block()
+    if new_phys == 0:
+        return -1
+    if _ext4_extent_append_block(inode_buf, new_logical, new_phys) != 0:
+        ext4_free_block(new_phys)
+        return -1
+    _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](inode_buf) + 4),
+                    cast[uint32](dir_size + ext4_block_size))
+
+    # Build the new node skeleton in ext4_htins_newleaf.
+    new_node: uint64 = cast[uint64](&ext4_htins_newleaf[0])
+    _ext4_zero(cast[Ptr[uint8]](new_node), ext4_block_size)
+    _ext4_write_u32(cast[Ptr[uint8]](new_node + 0), 0)        # fake inode
+    _ext4_write_u16(cast[Ptr[uint8]](new_node + 4),
+                    cast[uint16](ext4_block_size))            # rec_len
+    n_entries: uint64 = new_node + 8
+    n_limit: uint32 = cast[uint32]((ext4_block_size - 8) / 8)
+    # Split point: move entries [split, o_count) to the new node.
+    split: uint32 = o_count / 2
+    if split < 1:
+        split = 1
+    moved: uint32 = o_count - split
+    # The new node's entry 0 carries its countlimit; the first MOVED entry
+    # supplies entry 0's block (and its hash becomes the node's range key).
+    first_moved_hash: uint32 = _dx_entry_hash(o_entries, split)
+    _ext4_write_u16(cast[Ptr[uint8]](n_entries + 0), cast[uint16](n_limit))
+    _ext4_write_u16(cast[Ptr[uint8]](n_entries + 2), cast[uint16](moved))
+    k: uint32 = 0
+    while k < moved:
+        sh: uint32 = _dx_entry_hash(o_entries, split + k)
+        sb: uint32 = _dx_entry_block(o_entries, split + k)
+        if k == 0:
+            _ext4_write_u32(cast[Ptr[uint8]](n_entries + 4), sb)
+        else:
+            _ext4_write_u32(cast[Ptr[uint8]](n_entries + cast[uint64](k) * 8 + 0), sh)
+            _ext4_write_u32(cast[Ptr[uint8]](n_entries + cast[uint64](k) * 8 + 4), sb)
+        k = k + 1
+    # Shrink the old node's count to the lower half.
+    _ext4_write_u16(cast[Ptr[uint8]](o_entries + 2), cast[uint16](split))
+
+    # Insert the pending {new_leaf_hash, new_leaf_block} into whichever
+    # half its hash belongs to.
+    if new_leaf_hash < first_moved_hash:
+        oat: uint32 = _dx_bsearch(o_entries, split, new_leaf_hash)
+        if _ext4_dx_insert_entry(o_entries, oat, new_leaf_hash,
+                                 new_leaf_block) != 0:
+            return -1
+    else:
+        nat: uint32 = _dx_bsearch(n_entries, moved, new_leaf_hash)
+        if _ext4_dx_insert_entry(n_entries, nat, new_leaf_hash,
+                                 new_leaf_block) != 0:
+            return -1
+
+    if _ext4_write_block(new_phys, cast[Ptr[uint8]](new_node)) != 0:
+        return -1
+    out_node_hash[0] = first_moved_hash
+    out_node_logical[0] = cast[uint32](new_logical)
+    return 0
+
+
+def _ext4_extent_meta_block_count(inode_buf: Ptr[uint8]) -> uint64:
+    # Count the extent-TREE metadata blocks an inode owns (the on-disk
+    # index/leaf blocks of the extent tree itself, NOT the file-data blocks
+    # they map). e2fsck includes these in i_blocks. A depth-0 (inline)
+    # extent tree has NO metadata blocks. For depth >= 1, every index entry
+    # at every interior level points at one extent-tree block:
+    #   depth 1: each inode index entry -> 1 leaf block.
+    #   depth 2: each inode index entry -> 1 L1 index block, and each of
+    #            those -> its leaf blocks.
+    # We walk the tree counting those blocks. The dense left-to-right trees
+    # our writers build stay shallow (this dir track reaches depth 1).
+    eh: uint64 = cast[uint64](inode_buf) + INODE_I_BLOCK_OFFSET
+    magic: uint16 = _ext4_read_u16(cast[Ptr[uint8]](eh + 0))
+    if magic != EXT4_EXTENT_MAGIC:
+        return 0
+    depth: uint16 = _ext4_read_u16(
+        cast[Ptr[uint8]](eh + EXT4_EH_DEPTH_OFFSET))
+    if depth == 0:
+        return 0
+    in_entries: uint16 = _ext4_read_u16(
+        cast[Ptr[uint8]](eh + EXT4_EH_ENTRIES_OFFSET))
+    in_max: uint16 = _ext4_read_u16(cast[Ptr[uint8]](eh + 4))
+    if in_entries > in_max:
+        return 0
+    if depth == 1:
+        # Each inode index entry owns exactly one leaf block.
+        return cast[uint64](in_entries)
+    if depth == 2:
+        # Each inode index entry owns one L1 index block plus that block's
+        # leaf children.
+        total: uint64 = cast[uint64](in_entries)
+        i: uint16 = 0
+        while i < in_entries:
+            ei: uint64 = eh + 12 + cast[uint64](i) * 12
+            idx_lo: uint32 = _ext4_read_u32(cast[Ptr[uint8]](ei + 4))
+            idx_hi: uint16 = _ext4_read_u16(cast[Ptr[uint8]](ei + 8))
+            idx_blk: uint64 = (cast[uint64](idx_hi) << 32) \
+                            | cast[uint64](idx_lo)
+            if _ext4_read_block(idx_blk, &ext4_extidx_buf[0]) == 0:
+                l1p: uint64 = cast[uint64](&ext4_extidx_buf[0])
+                l1_ent: uint16 = _ext4_read_u16(cast[Ptr[uint8]](l1p + 2))
+                l1_mx:  uint16 = _ext4_read_u16(cast[Ptr[uint8]](l1p + 4))
+                if l1_ent <= l1_mx:
+                    total = total + cast[uint64](l1_ent)
+            i = i + 1
+        return total
+    # depth >= 3 is not produced by this directory writer.
+    return 0
+
+
+def _ext4_htins_restamp_iblocks(inode_buf: Ptr[uint8]):
+    # Re-stamp i_blocks_lo (offset 28, 512-byte units) from the directory
+    # inode's current extent coverage after a split / index growth added
+    # data blocks. Keeps stat + e2fsck's i_blocks accounting consistent
+    # with the blocks the dir now occupies: file-data blocks PLUS the
+    # extent-tree metadata blocks (which e2fsck also counts toward
+    # i_blocks once the inline extent leaf overflows into a real tree).
+    block_cnt: uint64 = _ext4_inode_block_count(inode_buf)
+    meta_cnt: uint64 = _ext4_extent_meta_block_count(inode_buf)
+    sectors_per_block: uint64 = ext4_block_size / SECTOR_SIZE
+    _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](inode_buf) + 28),
+                    cast[uint32]((block_cnt + meta_cnt) * sectors_per_block))
+
+
+def ext4_htree_dir_insert(parent_inum: uint64, name: Ptr[char],
+                          child_inum: uint32, file_type: uint8) -> int32:
+    # Insert (name, child_inum) into the EXT4_INDEX_FL directory
+    # `parent_inum`. Hashes the name, descends the dx index to the target
+    # leaf, and inserts there if it fits. On a full leaf it performs a
+    # real leaf split (sibling leaf + median-hash redistribute) and
+    # registers a new dx_entry in the parent. When the parent index node
+    # is itself full it grows the index from 0 to 1 indirect level.
+    # Returns 0 on success, -1 on failure.
+    if parent_inum == 0:
+        return -1
+    name_len: uint64 = _ext4_strlen(name)
+    if name_len == 0 or name_len > 255:
+        return -1
+    parent_inode: Array[256, uint8]
+    if ext4_read_inode(parent_inum, &parent_inode[0]) != 0:
+        return -1
+    parent_gen: uint32 = _ext4_read_u32(
+        cast[Ptr[uint8]](cast[uint64](&parent_inode[0]) + 0x64))
+    minor: uint32 = 0
+    hash: uint32 = ext4_dirhash(cast[Ptr[uint8]](name), name_len, &minor)
+
+    leaf_logical: uint64 = 0
+    ind: int64 = _ext4_htins_descend_write(&parent_inode[0], hash,
+                                           &leaf_logical)
+    if ind < 0:
+        return -1
+    leaf_phys: uint64 = _ext4_logical_to_physical(&parent_inode[0],
+                                                  leaf_logical)
+    if leaf_phys == 0:
+        return -1
+    if _ext4_read_block(leaf_phys, &ext4_htins_oldleaf[0]) != 0:
+        return -1
+    old: uint64 = cast[uint64](&ext4_htins_oldleaf[0])
+    # Fast path: the target leaf has room.
+    if _ext4_leaf_dirent_insert(old, name, name_len, child_inum,
+                                file_type) == 0:
+        ext4_dirblock_csum_set(cast[Ptr[uint8]](old), parent_inum,
+                               parent_gen)
+        return _ext4_write_block(leaf_phys, cast[Ptr[uint8]](old))
+
+    # Leaf is full — split it. (The oldleaf buffer still holds the leaf.)
+    new_hash: uint32 = 0
+    deepest: uint32 = cast[uint32](ind)
+    new_logical_i64: int64 = _ext4_htins_do_split(
+        parent_inum, parent_gen, &parent_inode[0], leaf_logical,
+        name, name_len, child_inum, file_type, &new_hash)
+    if new_logical_i64 < 0:
+        return -1
+    new_logical: uint64 = cast[uint64](new_logical_i64)
+
+    # Register the new leaf in the parent (deepest) index node. Re-read
+    # that node into ext4_htins_idxbuf, insert the dx_entry after `at`.
+    pframe: uint32 = deepest
+    pidx_logical: uint64 = ext4_htins_frame_logical[pframe]
+    peoff: uint64 = ext4_htins_frame_eoff[pframe]
+    pat: uint32 = ext4_htins_frame_at[pframe]
+    pidx_phys: uint64 = _ext4_logical_to_physical(&parent_inode[0],
+                                                  pidx_logical)
+    if pidx_phys == 0:
+        return -1
+    if _ext4_read_block(pidx_phys, &ext4_htins_idxbuf[0]) != 0:
+        return -1
+    pentries: uint64 = cast[uint64](&ext4_htins_idxbuf[0]) + peoff
+    if _ext4_dx_insert_entry(pentries, pat, new_hash,
+                             cast[uint32](new_logical)) == 0:
+        # The inode was mutated (i_size + extents grew); re-stamp i_blocks
+        # and persist, then write the parent index block.
+        _ext4_htins_restamp_iblocks(&parent_inode[0])
+        if ext4_write_inode(parent_inum, &parent_inode[0]) != 0:
+            return -1
+        return _ext4_write_block(pidx_phys, &ext4_htins_idxbuf[0])
+
+    # Parent index node is FULL.
+    if deepest != 0:
+        # The full node is an interior dx_node (level >= 1). Split it (the
+        # node is still in ext4_htins_idxbuf), write the shrunk old node
+        # back, then register the new sibling node in the ROOT. The root is
+        # frame `deepest-1` (logical block 0).
+        snode_hash: uint32 = 0
+        snode_logical: uint32 = 0
+        if _ext4_htins_split_node(&parent_inode[0], pidx_logical,
+                                  new_hash, cast[uint32](new_logical),
+                                  &snode_hash, &snode_logical) != 0:
+            return -1
+        # Write the shrunk old dx_node back (it is in ext4_htins_idxbuf).
+        if _ext4_write_block(pidx_phys, &ext4_htins_idxbuf[0]) != 0:
+            return -1
+        # Register {snode_hash, snode_logical} in the root after the root's
+        # recorded `at` for this branch.
+        rframe: uint32 = deepest - 1
+        rlogical: uint64 = ext4_htins_frame_logical[rframe]
+        reoff: uint64 = ext4_htins_frame_eoff[rframe]
+        rat: uint32 = ext4_htins_frame_at[rframe]
+        rphys: uint64 = _ext4_logical_to_physical(&parent_inode[0], rlogical)
+        if rphys == 0:
+            return -1
+        if _ext4_read_block(rphys, &ext4_htins_idxbuf[0]) != 0:
+            return -1
+        rentries: uint64 = cast[uint64](&ext4_htins_idxbuf[0]) + reoff
+        if _ext4_dx_insert_entry(rentries, rat, snode_hash,
+                                 snode_logical) != 0:
+            # Root is itself full — growing to a 3rd level is not
+            # supported here (the workload only reaches 2 levels).
+            printk0("ext4: htree root full at 2 levels (unsupported)\n")
+            return -1
+        _ext4_htins_restamp_iblocks(&parent_inode[0])
+        if ext4_write_inode(parent_inum, &parent_inode[0]) != 0:
+            return -1
+        return _ext4_write_block(rphys, &ext4_htins_idxbuf[0])
+
+    # Single-level (dx_root only, indirect_levels==0) -> two-level growth.
+    _ext4_htins_restamp_iblocks(&parent_inode[0])
+    if ext4_write_inode(parent_inum, &parent_inode[0]) != 0:
+        return -1
+    if _ext4_htins_grow_index(parent_inum, parent_gen, &parent_inode[0],
+                              new_hash, cast[uint32](new_logical)) != 0:
+        return -1
+    _ext4_htins_restamp_iblocks(&parent_inode[0])
+    return ext4_write_inode(parent_inum, &parent_inode[0])
+
+
+def _ext4_htins_grow_index(dir_inum: uint64, dir_gen: uint32,
+                           inode_buf: Ptr[uint8],
+                           extra_hash: uint32,
+                           extra_block: uint32) -> int32:
+    # Grow a single-level htree (dx_root only, indirect_levels==0) to two
+    # levels, the way ext4_dx_add_entry does when the root's dx_entry
+    # array fills. Steps:
+    #   1. allocate a new dx_node block,
+    #   2. move ALL of the root's dx_entries into it,
+    #   3. shrink the root to a single dx_entry pointing at the new node,
+    #   4. set the root's indirect_levels to 1,
+    #   5. insert the pending {extra_hash, extra_block} dx_entry into the
+    #      new node (which now has a full block of slots).
+    # Returns 0 on success, -1 on failure.
+    root_phys: uint64 = _ext4_logical_to_physical(inode_buf, 0)
+    if root_phys == 0:
+        return -1
+    if _ext4_read_block(root_phys, &ext4_htins_idxbuf[0]) != 0:
+        return -1
+    rbase: uint64 = cast[uint64](&ext4_htins_idxbuf[0])
+    info_length: uint8 = cast[Ptr[uint8]](rbase + 0x1D)[0]
+    if info_length != 8:
+        return -1
+    r_entries_off: uint64 = 0x18 + cast[uint64](info_length)
+    r_entries: uint64 = rbase + r_entries_off
+    r_count: uint32 = _dx_get_count(r_entries)
+    r_limit: uint32 = _dx_get_limit(r_entries)
+
+    # Allocate + append the new dx_node logical block.
+    dir_size: uint64 = cast[uint64](ext4_inode_size_lo(inode_buf))
+    node_logical: uint64 = dir_size / ext4_block_size
+    node_phys: uint64 = ext4_alloc_block()
+    if node_phys == 0:
+        return -1
+    if _ext4_extent_append_block(inode_buf, node_logical, node_phys) != 0:
+        ext4_free_block(node_phys)
+        return -1
+    _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](inode_buf) + 4),
+                    cast[uint32](dir_size + ext4_block_size))
+
+    # Build the new dx_node in ext4_htins_oldleaf (free scratch here).
+    node: uint64 = cast[uint64](&ext4_htins_oldleaf[0])
+    _ext4_zero(cast[Ptr[uint8]](node), ext4_block_size)
+    # dx_node: 8-byte fake dirent (rec_len spans block) then entries[].
+    _ext4_write_u32(cast[Ptr[uint8]](node + 0), 0)            # fake inode
+    _ext4_write_u16(cast[Ptr[uint8]](node + 4),
+                    cast[uint16](ext4_block_size))            # rec_len
+    n_entries_off: uint64 = 8
+    n_entries: uint64 = node + n_entries_off
+    # dx_countlimit at entry 0: limit = (block_size - 8) / 8, count =
+    # r_count (we copy all root entries in).
+    node_limit: uint32 = cast[uint32]((ext4_block_size - n_entries_off) / 8)
+    _ext4_write_u16(cast[Ptr[uint8]](n_entries + 0),
+                    cast[uint16](node_limit))                 # limit
+    _ext4_write_u16(cast[Ptr[uint8]](n_entries + 2),
+                    cast[uint16](r_count))                    # count
+    # Copy root entries 0..r_count-1 into the node. Entry 0's hash field
+    # is the dummy "0" of the first range, preserved verbatim.
+    ci: uint32 = 0
+    while ci < r_count:
+        h: uint32 = _dx_entry_hash(r_entries, ci)
+        b: uint32 = _dx_entry_block(r_entries, ci)
+        if ci == 0:
+            # keep the countlimit u16s we just wrote; only set the block.
+            _ext4_write_u32(cast[Ptr[uint8]](n_entries + 4), b)
+        else:
+            _ext4_write_u32(cast[Ptr[uint8]](n_entries + cast[uint64](ci) * 8 + 0), h)
+            _ext4_write_u32(cast[Ptr[uint8]](n_entries + cast[uint64](ci) * 8 + 4), b)
+        ci = ci + 1
+    # Insert the pending entry into the node (it now has node_limit slots).
+    # Find the right slot via bsearch on the just-built array.
+    n_at: uint32 = _dx_bsearch(n_entries, r_count, extra_hash)
+    if _ext4_dx_insert_entry(n_entries, n_at, extra_hash, extra_block) != 0:
+        ext4_free_block(node_phys)
+        return -1
+    if _ext4_write_block(node_phys, cast[Ptr[uint8]](node)) != 0:
+        return -1
+
+    # Rewrite the root: indirect_levels = 1, a single dx_entry pointing
+    # at the node (logical block node_logical), count = 1.
+    cast[Ptr[uint8]](rbase + 0x1E)[0] = 1                     # indirect_levels
+    _ext4_write_u16(cast[Ptr[uint8]](r_entries + 2), 1)      # count = 1
+    _ext4_write_u32(cast[Ptr[uint8]](r_entries + 4),
+                    cast[uint32](node_logical))               # block ptr
+    # entry 0 hash field holds the limit (lo u16) + count (hi u16); leave
+    # the limit alone, we set count above. The hash value of entry 0 is
+    # ignored by the descend (it is the catch-all), so no hash write.
+    if _ext4_write_block(root_phys, &ext4_htins_idxbuf[0]) != 0:
+        return -1
+    return 0
 
 
 def ext4_create_file(parent_inum: uint64, name: Ptr[char],

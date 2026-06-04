@@ -1620,6 +1620,20 @@ if os.environ.get("ENABLE_EXT4D2_TEST") == "1":
 if os.environ.get("ENABLE_EXT4_HTREE_TEST") == "1":
     FILES.append(("/etc/ext4-htree-test", b"1\n"))
 
+# ext4 htree (dir_index) INSERT / leaf-split WRITE self-test.
+# scripts/test_ext4_htree_insert.sh sets ENABLE_EXT4_HTINS_TEST=1 to plant
+# /etc/ext4-htins-test. init/main.ad detects the marker after the ext4
+# mount and calls ext4_htree_insert_selftest() (fs/ext4.ad): it resolves
+# the on-disk "htdir" dir_index directory, inserts a batch of new names
+# (forcing >= 1 leaf split and an index-level growth) through the full
+# create -> ext4_dir_insert -> ext4_htree_dir_insert write path, then
+# verifies every inserted name resolves via the hash-descend lookup to the
+# inode created for it, the dir grew (real split), the pre-existing name
+# survived, and the index stayed a valid htree. WRITES the mounted image,
+# so opt-in via the marker; default boots omit it so it never fires.
+if os.environ.get("ENABLE_EXT4_HTINS_TEST") == "1":
+    FILES.append(("/etc/ext4-htins-test", b"1\n"))
+
 # ext4 extent-FREE / no-leak self-test. scripts/test_ext4_extent_free.sh
 # sets ENABLE_EXT4EXTFREE_TEST=1 to plant /etc/ext4extfree-test.
 # init/main.ad detects the marker after the ext4 mount and calls
