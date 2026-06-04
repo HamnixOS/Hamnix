@@ -498,6 +498,7 @@ DM_TARGET_CRYPT:         uint32 = 2
 DM_TARGET_SNAPSHOT:      uint32 = 3   # frozen CoW view (reads exc-store/origin)
 DM_TARGET_SNAPSHOT_ORIGIN: uint32 = 4 # origin that performs copy-on-write
 DM_TARGET_INTEGRITY:     uint32 = 5   # per-sector crc32c integrity tags
+DM_TARGET_THIN:          uint32 = 6   # thin-provisioned (on-demand alloc)
 
 DM_KEY_LEN:      uint64 = 64       # AES-256-XTS: 32B data + 32B tweak key
 DM_MAX_TARGETS:  uint64 = 8        # targets per mapped device
@@ -612,6 +613,60 @@ class DmIntegContext:
 
 dm_integ_ctxs: Array[4, DmIntegContext]
 
+
+# =========================================================================
+# dm-thin — thin provisioning (Linux drivers/md/dm-thin.c)
+# =========================================================================
+#
+# A thin POOL owns a fixed-size DATA device (here an in-kernel ramdisk).
+# Physical storage is carved into fixed-size BLOCKS (block_sectors sectors
+# each). A THIN device presents a large VIRTUAL address space but starts
+# with ZERO physical blocks allocated: nothing in the pool is consumed
+# until data is actually written. The first WRITE to a virtual block
+# allocates a fresh pool block from the pool's free-block allocator,
+# records a (thin virtual block -> pool physical block) mapping, and writes
+# the data there. A READ of an UNPROVISIONED (never-written) virtual block
+# returns ZEROS and consumes no pool block. Subsequent reads/writes of a
+# provisioned virtual block hit its mapped pool block. Because the virtual
+# size can vastly exceed the pool's physical capacity, over-provisioning is
+# directly observable as (virtual blocks >> currently allocated blocks).
+# A write that cannot allocate (pool exhausted) returns an I/O error.
+#
+# This is exactly Linux dm-thin's on-demand single-provisioning model: one
+# shared pool, many thin volumes that lazily claim blocks from it.
+
+DM_THIN_POOL_MAX:    uint64 = 2        # thin pools system-wide
+DM_THIN_DEV_MAX:     uint64 = 4        # thin devices system-wide
+DM_THIN_MAX_PBLOCKS: uint64 = 256      # pool physical blocks per pool
+DM_THIN_MAX_VBLOCKS: uint64 = 1024     # virtual blocks tracked per thin dev
+
+
+class DmThinPool:
+    used:          uint32
+    pad:           uint32
+    data_slot:     int32               # underlying pool DATA block device
+    pad2:          uint32
+    block_sectors: uint64              # sectors per pool block (alloc unit)
+    nblocks:       uint64              # total pool blocks (physical capacity)
+    nallocated:    uint64              # pool blocks currently handed out
+    # free[b] = 1 while pool block b is unallocated and available.
+    free:          Array[256, uint8]
+
+
+class DmThinDev:
+    used:          uint32
+    pad:           uint32
+    pool_idx:      int32               # owning thin pool index
+    pad2:          uint32
+    nvblocks:      uint64              # virtual blocks this thin dev presents
+    # mapped[v] = 1 once virtual block v has a pool block; pmap[v] holds it.
+    mapped:        Array[1024, uint8]
+    pmap:          Array[1024, uint64]
+
+
+dm_thin_pools: Array[2, DmThinPool]
+dm_thin_devs:  Array[4, DmThinDev]
+
 dm_devices: Array[8, MappedDevice]
 dm_ops:     BlockDeviceOps
 dm_inited:  uint32 = 0
@@ -655,8 +710,16 @@ def dm_init():
     while g < DM_INTEG_MAX:
         dm_integ_ctxs[g].used = 0
         g = g + 1
+    tp: uint64 = 0
+    while tp < DM_THIN_POOL_MAX:
+        dm_thin_pools[tp].used = 0
+        tp = tp + 1
+    td: uint64 = 0
+    while td < DM_THIN_DEV_MAX:
+        dm_thin_devs[td].used = 0
+        td = td + 1
     dm_inited = 1
-    printk0("dm: device-mapper ready (linear + crypt + snapshot + integrity targets)\n")
+    printk0("dm: device-mapper ready (linear + crypt + snapshot + integrity + thin targets)\n")
 
 
 def _dm_find_target(dev: Ptr[MappedDevice], vlba: uint64) -> int32:
@@ -901,6 +964,83 @@ def _dm_integ_io(t: Ptr[DmTarget], is_write: int32, off_in_t: uint64,
     return 0
 
 
+# =========================================================================
+# dm-thin target handler
+# =========================================================================
+
+# One-sector zero buffer used to satisfy reads of UNPROVISIONED thin
+# virtual blocks (no pool block allocated). dm I/O is serialised through the
+# synchronous block layer, so a single shared module-scope buffer is safe.
+_dm_thin_zero: Array[512, uint8]
+
+
+def _dm_thin_pool_alloc_block(pool: Ptr[DmThinPool]) -> int64:
+    # Hand out a fresh free pool block, marking it allocated and bumping the
+    # allocated-block count. Returns the pool block index, or -1 if the pool
+    # is exhausted (no free block remains) — the dm-thin out-of-space case.
+    b: uint64 = 0
+    while b < pool[0].nblocks:
+        if pool[0].free[b] != 0:
+            pool[0].free[b]    = 0
+            pool[0].nallocated = pool[0].nallocated + 1
+            return cast[int64](b)
+        b = b + 1
+    return -1
+
+
+def _dm_thin_io(t: Ptr[DmTarget], is_write: int32, off_in_t: uint64,
+                count: uint64, buf: Ptr[uint8]) -> int32:
+    # THIN target. Process one sector at a time. Each virtual sector belongs
+    # to a virtual BLOCK (block_sectors sectors). On READ of an UNPROVISIONED
+    # virtual block, return ZEROS (no pool block allocated, no pool consumed).
+    # On WRITE to an unprovisioned virtual block, allocate a fresh pool block
+    # from the free allocator, record the (vblock -> pblock) mapping, then
+    # write the data to its sector within the pool block. Provisioned blocks
+    # remap straight to their pool block on the data device.
+    tdev: Ptr[DmThinDev] = &dm_thin_devs[cast[uint64](t[0].snap_ctx)]
+    pool: Ptr[DmThinPool] = &dm_thin_pools[cast[uint64](tdev[0].pool_idx)]
+    bs:   uint64 = pool[0].block_sectors
+    zerop: Ptr[uint8] = cast[Ptr[uint8]](&_dm_thin_zero[0])
+    zi: uint64 = 0
+    while zi < SECTOR_SIZE:
+        _dm_thin_zero[zi] = 0
+        zi = zi + 1
+    s: uint64 = 0
+    while s < count:
+        vsec:  uint64 = off_in_t + s
+        vblk:  uint64 = vsec / bs
+        offib: uint64 = vsec - vblk * bs
+        cur:   Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](buf) + s * SECTOR_SIZE)
+        if vblk >= tdev[0].nvblocks:
+            printk1("dm: thin I/O past virtual size (vblk=%d)\n", vblk)
+            return -1
+        if is_write != 0:
+            if tdev[0].mapped[vblk] == 0:
+                # First write to this virtual block: provision on demand.
+                nb: int64 = _dm_thin_pool_alloc_block(pool)
+                if nb < 0:
+                    printk1("dm: thin pool out of space (vblk=%d)\n", vblk)
+                    return -28               # -ENOSPC
+                tdev[0].pmap[vblk]   = cast[uint64](nb)
+                tdev[0].mapped[vblk] = 1
+            plba: uint64 = tdev[0].pmap[vblk] * bs + offib
+            rc: int32 = blk_write_sectors(pool[0].data_slot, plba, 1, cur)
+            if rc != 0:
+                return rc
+        else:
+            if tdev[0].mapped[vblk] == 0:
+                # Unprovisioned: never written -> reads back as zeros.
+                memcpy(cur, zerop, SECTOR_SIZE)
+            else:
+                plba2: uint64 = tdev[0].pmap[vblk] * bs + offib
+                rc2: int32 = blk_read_sectors(pool[0].data_slot, plba2, 1, cur)
+                if rc2 != 0:
+                    return rc2
+        s = s + 1
+    return 0
+
+
 def _dm_io(dev: Ptr[MappedDevice], is_write: int32, vlba: uint64,
            count: uint64, buf: Ptr[uint8]) -> int32:
     # Core remap. Walk the request sector-span, splitting it at target
@@ -936,6 +1076,8 @@ def _dm_io(dev: Ptr[MappedDevice], is_write: int32, vlba: uint64,
             rc = _dm_snap_view_io(t, is_write, off_in_t, chunk, bufp)
         elif t[0].ttype == DM_TARGET_INTEGRITY:
             rc = _dm_integ_io(t, is_write, off_in_t, cur_v, chunk, bufp)
+        elif t[0].ttype == DM_TARGET_THIN:
+            rc = _dm_thin_io(t, is_write, off_in_t, chunk, bufp)
         else:
             rc = _dm_linear_io(t, is_write, off_in_t, chunk, bufp)
         if rc != 0:
@@ -1315,6 +1457,134 @@ def dm_create_integrity(name: Ptr[char], under_slot: int32,
     return dm_devices[idx].self_slot
 
 
+def _dm_thin_alloc_pool() -> int32:
+    # Claim a free thin-pool slot, or -1 if the table is full.
+    i: uint64 = 0
+    while i < DM_THIN_POOL_MAX:
+        if dm_thin_pools[i].used == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _dm_thin_alloc_dev() -> int32:
+    # Claim a free thin-device slot, or -1 if the table is full.
+    i: uint64 = 0
+    while i < DM_THIN_DEV_MAX:
+        if dm_thin_devs[i].used == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def dm_create_thin_pool(data_slot: int32, block_sectors: uint64,
+                        nblocks: uint64) -> int32:
+    # Create a thin POOL over an underlying DATA block device. The pool's
+    # physical capacity is `nblocks` blocks of `block_sectors` sectors each;
+    # every block starts FREE (zero allocated). Thin devices later draw their
+    # on-demand blocks from this pool. This is the dm-thin-pool target:
+    # `dmsetup create pool --table "0 LEN thin-pool METADEV DATADEV BLK ..."`.
+    # Returns the pool index (>= 0) or a negative error.
+    dm_init()
+    if data_slot < 0:
+        return -2
+    if block_sectors == 0:
+        return -2
+    if nblocks == 0 or nblocks > DM_THIN_MAX_PBLOCKS:
+        printk0("dm: thin pool block count exceeds allocator capacity\n")
+        return -3
+    if nblocks * block_sectors > blk_capacity_sectors(data_slot):
+        printk0("dm: thin pool exceeds underlying data capacity\n")
+        return -3
+    pidx_s: int32 = _dm_thin_alloc_pool()
+    if pidx_s < 0:
+        printk0("dm: thin pool table full\n")
+        return -4
+    pidx: uint64 = cast[uint64](pidx_s)
+    dm_thin_pools[pidx].data_slot     = data_slot
+    dm_thin_pools[pidx].block_sectors = block_sectors
+    dm_thin_pools[pidx].nblocks       = nblocks
+    dm_thin_pools[pidx].nallocated    = 0
+    b: uint64 = 0
+    while b < nblocks:
+        dm_thin_pools[pidx].free[b] = 1
+        b = b + 1
+    dm_thin_pools[pidx].used = 1
+    return pidx_s
+
+
+def dm_thin_pool_allocated(pool_idx: int32) -> int64:
+    # Return the number of pool blocks currently handed out (allocated) for
+    # the pool at `pool_idx`, or -1 for an invalid/free pool. Lets a caller
+    # (e.g. the self-test) observe over-provisioning: virtual size can vastly
+    # exceed this physical allocation.
+    if pool_idx < 0 or cast[uint64](pool_idx) >= DM_THIN_POOL_MAX:
+        return -1
+    p: uint64 = cast[uint64](pool_idx)
+    if dm_thin_pools[p].used == 0:
+        return -1
+    return cast[int64](dm_thin_pools[p].nallocated)
+
+
+def dm_create_thin(name: Ptr[char], pool_idx: int32,
+                   virtual_sectors: uint64) -> int32:
+    # Create a THIN device drawing from the pool at `pool_idx`. It presents
+    # `virtual_sectors` of VIRTUAL capacity but allocates ZERO pool blocks up
+    # front: physical blocks are claimed on demand on first write. The
+    # virtual size may vastly exceed the pool's physical capacity
+    # (over-provisioning). This is the dm-thin target:
+    # `dmsetup create thin --table "0 LEN thin POOLDEV DEVID"`. Returns the
+    # registered block slot or a negative error.
+    dm_init()
+    if virtual_sectors == 0:
+        return -1
+    if pool_idx < 0 or cast[uint64](pool_idx) >= DM_THIN_POOL_MAX:
+        return -2
+    if dm_thin_pools[cast[uint64](pool_idx)].used == 0:
+        return -2
+    bs: uint64 = dm_thin_pools[cast[uint64](pool_idx)].block_sectors
+    if virtual_sectors % bs != 0:
+        printk0("dm: thin virtual size not a multiple of pool block size\n")
+        return -3
+    nvb: uint64 = virtual_sectors / bs
+    if nvb > DM_THIN_MAX_VBLOCKS:
+        printk0("dm: thin virtual size exceeds mapping-table capacity\n")
+        return -3
+    didx_s: int32 = _dm_thin_alloc_dev()
+    if didx_s < 0:
+        printk0("dm: thin device table full\n")
+        return -4
+    didx: uint64 = cast[uint64](didx_s)
+    dm_thin_devs[didx].pool_idx = pool_idx
+    dm_thin_devs[didx].nvblocks = nvb
+    vb: uint64 = 0
+    while vb < nvb:
+        dm_thin_devs[didx].mapped[vb] = 0
+        dm_thin_devs[didx].pmap[vb]   = 0
+        vb = vb + 1
+    dm_thin_devs[didx].used = 1
+    idx_s: int32 = _dm_alloc_device()
+    if idx_s < 0:
+        dm_thin_devs[didx].used = 0
+        printk0("dm: device table full\n")
+        return -4
+    idx: uint64 = cast[uint64](idx_s)
+    dm_devices[idx].n_targets               = 1
+    dm_devices[idx].capacity                = virtual_sectors
+    dm_devices[idx].targets[0].ttype        = DM_TARGET_THIN
+    dm_devices[idx].targets[0].start_sector = 0
+    dm_devices[idx].targets[0].length       = virtual_sectors
+    dm_devices[idx].targets[0].under_slot   = \
+        dm_thin_pools[cast[uint64](pool_idx)].data_slot
+    dm_devices[idx].targets[0].snap_ctx     = didx_s
+    dm_devices[idx].targets[0].under_start  = 0
+    if _dm_register(idx, name) != 0:
+        dm_devices[idx].used    = 0
+        dm_thin_devs[didx].used = 0
+        return -5
+    return dm_devices[idx].self_slot
+
+
 def dm_remove(name: Ptr[char]) -> int32:
     # Tear down a mapped device by name: unregister its block-device
     # identity and free the MappedDevice slot. dmsetup remove NAME.
@@ -1335,6 +1605,12 @@ def dm_remove(name: Ptr[char]) -> int32:
                 ic: int32 = dm_devices[i].targets[0].snap_ctx
                 if ic >= 0 and cast[uint64](ic) < DM_INTEG_MAX:
                     dm_integ_ctxs[cast[uint64](ic)].used = 0
+            # Releasing a thin device frees its mapping context; the shared
+            # pool persists (other thin volumes may still draw from it).
+            if dm_devices[i].targets[0].ttype == DM_TARGET_THIN:
+                tc: int32 = dm_devices[i].targets[0].snap_ctx
+                if tc >= 0 and cast[uint64](tc) < DM_THIN_DEV_MAX:
+                    dm_thin_devs[cast[uint64](tc)].used = 0
             blk_unregister_by_name(name)
             dm_devices[i].used      = 0
             dm_devices[i].n_targets = 0
@@ -1389,6 +1665,14 @@ _DM_EXC_SECTORS:  uint64 = 256
 _dm_exc_store:    Array[131072, uint8]   # 256 * 512
 _dm_exc_ops:      BlockDeviceOps
 
+# Dedicated POOL DATA ramdisk for the dm-thin subtest: the physical block
+# store the thin pool carves into on-demand blocks. 256 sectors = 128 KiB —
+# deliberately SMALL relative to the thin device's huge virtual size so
+# over-provisioning is observable.
+_DM_POOL_SECTORS: uint64 = 256
+_dm_pool_store:   Array[131072, uint8]   # 256 * 512
+_dm_pool_ops:     BlockDeviceOps
+
 # Scratch buffers for the self-test (all module-scope, one sector each
 # unless noted).
 _dm_t_plain:   Array[512, uint8]   # plaintext written through a mapped dev
@@ -1418,6 +1702,14 @@ _dm_snap_untch: Array[512, uint8]   # pattern for the never-written chunk
 _dm_integ_plain: Array[512, uint8]   # known data written through integrity dev
 _dm_integ_read:  Array[512, uint8]   # readback through the integrity device
 _dm_integ_raw:   Array[512, uint8]   # raw read from the backing device
+
+# dm-thin subtest scratch (all one full sector = 512 bytes to avoid the
+# BSS-overflow trap).
+_dm_thin_pat0:   Array[512, uint8]   # pattern written to first thin vblock
+_dm_thin_pat1:   Array[512, uint8]   # pattern written to second thin vblock
+_dm_thin_pat0b:  Array[512, uint8]   # rewrite pattern for first thin vblock
+_dm_thin_read:   Array[512, uint8]   # readback through the thin device
+_dm_thin_zchk:   Array[512, uint8]   # all-zero reference for unprovisioned
 
 
 def _dm_back_read(priv: uint64, lba: uint64, count: uint64,
@@ -1496,6 +1788,37 @@ def _dm_exc_register() -> int32:
     _dm_exc_ops.flush         = cast[Fn[int32, uint64]](0)
     return register_blockdev("dmexc0", _DM_EXC_SECTORS,
                              &_dm_exc_ops, 0)
+
+
+def _dm_pool_read(priv: uint64, lba: uint64, count: uint64,
+                  buf: Ptr[uint8]) -> int32:
+    src: uint64 = cast[uint64](&_dm_pool_store[0]) + lba * SECTOR_SIZE
+    memcpy(buf, cast[Ptr[uint8]](src), count * SECTOR_SIZE)
+    return 0
+
+
+def _dm_pool_write(priv: uint64, lba: uint64, count: uint64,
+                   buf: Ptr[uint8]) -> int32:
+    dst: uint64 = cast[uint64](&_dm_pool_store[0]) + lba * SECTOR_SIZE
+    memcpy(cast[Ptr[uint8]](dst), buf, count * SECTOR_SIZE)
+    return 0
+
+
+def _dm_pool_register() -> int32:
+    # Register the dedicated thin-pool DATA ramdisk as "dmpool0". Returns the
+    # slot, or the existing slot if already registered.
+    existing: int32 = find_blockdev("dmpool0")
+    if existing >= 0:
+        return existing
+    z: uint64 = 0
+    while z < 131072:
+        _dm_pool_store[z] = 0
+        z = z + 1
+    _dm_pool_ops.read_sectors  = _dm_pool_read
+    _dm_pool_ops.write_sectors = _dm_pool_write
+    _dm_pool_ops.flush         = cast[Fn[int32, uint64]](0)
+    return register_blockdev("dmpool0", _DM_POOL_SECTORS,
+                             &_dm_pool_ops, 0)
 
 
 def _dm_buf_eq(a: Ptr[uint8], b: Ptr[uint8], n: uint64) -> int32:
@@ -1929,6 +2252,131 @@ def dm_selftest() -> int32:
     if ok == 1:
         _dm_emerg0("[dm] integrity PASS\n")
 
+    # --- Test 7: dm-THIN thin provisioning (on-demand pool allocation) ---
+    # Build a thin POOL over a SMALL dedicated data ramdisk (dmpool0, 256
+    # sectors) with block_sectors=8, nblocks=32 (32*8 = 256 sectors). Then
+    # create a thin device whose VIRTUAL size is 8192 sectors (1024 blocks)
+    # — 32x the pool's physical capacity, so it is heavily over-provisioned.
+    # Prove:
+    #   (a) reading an UNPROVISIONED virtual block returns ZEROS and consumes
+    #       ZERO pool blocks (no physical allocation on read),
+    #   (b) writing two specific virtual blocks allocates EXACTLY two pool
+    #       blocks and the data reads back byte-correct,
+    #   (c) RE-writing an already-provisioned block does NOT allocate a new
+    #       pool block (allocation count unchanged),
+    #   (d) the mapping distinguishes provisioned (reads data) vs
+    #       unprovisioned (reads zeros) virtual regions.
+    pooldd: int32 = _dm_pool_register()
+    if pooldd < 0:
+        _dm_emerg0("[device-mapper] FAIL: thin pool data register\n")
+        return 0
+    _dm_emerg1("[device-mapper] thin pool-data dmpool0 slot=%d\n",
+               cast[uint64](cast[int64](pooldd)))
+    ti2: uint64 = 0
+    while ti2 < SECTOR_SIZE:
+        _dm_thin_pat0[ti2]  = cast[uint8]((ti2 * 7 + 31) & 0xFF)
+        _dm_thin_pat1[ti2]  = cast[uint8]((ti2 * 13 + 5) & 0xFF)
+        _dm_thin_pat0b[ti2] = cast[uint8]((ti2 * 23 + 99) & 0xFF)
+        _dm_thin_zchk[ti2]  = 0
+        ti2 = ti2 + 1
+    poolidx: int32 = dm_create_thin_pool(pooldd, 8, 32)
+    if poolidx < 0:
+        _dm_emerg1("[device-mapper] FAIL: dm_create_thin_pool rc=%d\n",
+                   cast[uint64](cast[int64](poolidx)))
+        return 0
+    # Virtual size = 8192 sectors (1024 blocks) >> 256 pool sectors.
+    thin: int32 = dm_create_thin("dmthin0", poolidx, 8192)
+    if thin < 0:
+        _dm_emerg1("[device-mapper] FAIL: dm_create_thin rc=%d\n",
+                   cast[uint64](cast[int64](thin)))
+        return 0
+
+    # (a) Read an UNPROVISIONED virtual block (block 100 -> vsec 800). It
+    # must read back as zeros AND must not have consumed any pool block.
+    if blk_read_sectors(thin, 800, 1, &_dm_thin_read[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: thin unprovisioned read\n")
+        return 0
+    a0: int64 = dm_thin_pool_allocated(poolidx)
+    if _dm_buf_eq(&_dm_thin_read[0], &_dm_thin_zchk[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: thin unprovisioned read not zero\n")
+        ok = 0
+    elif a0 != 0:
+        _dm_emerg1("[device-mapper] FAIL: thin read consumed pool blocks (alloc=%d)\n",
+                   cast[uint64](a0))
+        ok = 0
+    else:
+        _dm_emerg0("[devmapper] thin: unprovisioned read returns zeros OK\n")
+
+    # (b) Write two specific virtual blocks: block 5 (vsec 40) and block 200
+    # (vsec 1600). Each first-write must allocate exactly one pool block, so
+    # the allocation count goes 0 -> 2, and the data must read back correctly.
+    if blk_write_sectors(thin, 40, 1, &_dm_thin_pat0[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: thin write vblk5\n")
+        return 0
+    if blk_write_sectors(thin, 1600, 1, &_dm_thin_pat1[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: thin write vblk200\n")
+        return 0
+    a1: int64 = dm_thin_pool_allocated(poolidx)
+    if a1 != 2:
+        _dm_emerg1("[device-mapper] FAIL: thin two writes != two pool blocks (alloc=%d)\n",
+                   cast[uint64](a1))
+        ok = 0
+    else:
+        _dm_emerg0("[dm] PASS thin-ondemand-alloc\n")
+    # Data must read back byte-identical from both provisioned blocks.
+    if blk_read_sectors(thin, 40, 1, &_dm_thin_read[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: thin readback vblk5\n")
+        return 0
+    if _dm_buf_eq(&_dm_thin_read[0], &_dm_thin_pat0[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: thin vblk5 data mismatch\n")
+        ok = 0
+    if blk_read_sectors(thin, 1600, 1, &_dm_thin_read[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: thin readback vblk200\n")
+        return 0
+    if _dm_buf_eq(&_dm_thin_read[0], &_dm_thin_pat1[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: thin vblk200 data mismatch\n")
+        ok = 0
+
+    # (c) Re-write an already-provisioned block (block 5). The mapping
+    # already exists, so NO new pool block may be allocated: the count must
+    # stay at 2. The new data must read back.
+    if blk_write_sectors(thin, 40, 1, &_dm_thin_pat0b[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: thin rewrite vblk5\n")
+        return 0
+    a2: int64 = dm_thin_pool_allocated(poolidx)
+    if a2 != 2:
+        _dm_emerg1("[device-mapper] FAIL: thin rewrite allocated a block (alloc=%d)\n",
+                   cast[uint64](a2))
+        ok = 0
+    else:
+        _dm_emerg0("[dm] PASS thin-remap-stable\n")
+    if blk_read_sectors(thin, 40, 1, &_dm_thin_read[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: thin readback after rewrite\n")
+        return 0
+    if _dm_buf_eq(&_dm_thin_read[0], &_dm_thin_pat0b[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: thin rewrite data mismatch\n")
+        ok = 0
+
+    # (d) Provisioned vs unprovisioned distinction: block 5 (provisioned)
+    # reads the data, while a NEIGHBOURING never-written block (block 6 ->
+    # vsec 48) still reads zeros and did not consume a pool block.
+    if blk_read_sectors(thin, 48, 1, &_dm_thin_read[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: thin neighbour read\n")
+        return 0
+    a3: int64 = dm_thin_pool_allocated(poolidx)
+    if _dm_buf_eq(&_dm_thin_read[0], &_dm_thin_zchk[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: thin neighbour not unprovisioned\n")
+        ok = 0
+    elif a3 != 2:
+        _dm_emerg1("[device-mapper] FAIL: thin neighbour read allocated (alloc=%d)\n",
+                   cast[uint64](a3))
+        ok = 0
+    else:
+        _dm_emerg0("[devmapper] thin: provisioned vs unprovisioned distinguished OK\n")
+
+    if ok == 1:
+        _dm_emerg0("[dm] thin PASS\n")
+
     # Clean up the mapped devices (frees slots; leaves dmback0 in place).
     dm_remove("dmlin0")
     dm_remove("dmcat0")
@@ -1936,6 +2384,7 @@ def dm_selftest() -> int32:
     dm_remove("dmsnap0")
     dm_remove("dmsnap0-origin")
     dm_remove("dmint0")
+    dm_remove("dmthin0")
 
     if ok == 1:
         _dm_emerg0("[device-mapper] PASS\n")

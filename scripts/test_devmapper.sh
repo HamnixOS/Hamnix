@@ -126,6 +126,11 @@ check "snapshot subtest PASS"    "[dm] snapshot PASS"
 check "integrity round-trip"     "[devmapper] integrity: tag validated round-trip OK"
 check "integrity detect corrupt" "[dm] PASS integrity-detect-corruption"
 check "integrity subtest PASS"   "[dm] integrity PASS"
+check "thin unprovisioned zeros" "[devmapper] thin: unprovisioned read returns zeros OK"
+check "thin on-demand alloc"     "[dm] PASS thin-ondemand-alloc"
+check "thin remap stable"        "[dm] PASS thin-remap-stable"
+check "thin prov vs unprov"      "[devmapper] thin: provisioned vs unprovisioned distinguished OK"
+check "thin subtest PASS"        "[dm] thin PASS"
 check "device-mapper PASS"       "[device-mapper] PASS"
 
 if [ "$fail" -ne 0 ]; then
@@ -133,4 +138,4 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
-echo "[test_devmapper] PASS — native device-mapper: linear remap, two-target concatenation, AES-256-XTS dm-crypt (aes-xts-plain64: sector-keyed tweak, ciphertext-on-disk, plaintext round-trip, known-answer vector), dm-snapshot copy-on-write (origin-write preserves the snapshot pre-image in a separate exception store; origin advances to new data; never-written chunks pass through to origin), and dm-integrity (per-sector salted crc32c tags: a known sector round-trips with its tag validated; corrupting the backing sector behind the target is DETECTED and the read fails instead of returning corrupt data) all verified"
+echo "[test_devmapper] PASS — native device-mapper: linear remap, two-target concatenation, AES-256-XTS dm-crypt (aes-xts-plain64: sector-keyed tweak, ciphertext-on-disk, plaintext round-trip, known-answer vector), dm-snapshot copy-on-write (origin-write preserves the snapshot pre-image in a separate exception store; origin advances to new data; never-written chunks pass through to origin), dm-integrity (per-sector salted crc32c tags: a known sector round-trips with its tag validated; corrupting the backing sector behind the target is DETECTED and the read fails instead of returning corrupt data), and dm-thin thin provisioning (a thin device over-provisioned 32x the pool reads unprovisioned blocks as zeros consuming no pool space; the first write to a virtual block allocates exactly one pool block on demand and reads back correctly; re-writing a provisioned block allocates nothing; provisioned vs unprovisioned regions are distinguished) all verified"
