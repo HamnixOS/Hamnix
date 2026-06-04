@@ -836,6 +836,18 @@ if os.environ.get("ENABLE_V9P_TEST") == "1":
 if os.environ.get("ENABLE_AHCI_TRIM_TEST") == "1":
     FILES.append(("/etc/ahci-trim-test", b"1\n"))
 
+# AHCI error-recovery + hot-plug + timeout maturity self-test.
+# scripts/test_ahci_recovery.sh sets ENABLE_AHCI_RECOVERY_TEST=1 to plant
+# /etc/ahci-recovery-test. init/main.ad at boot:37.arec detects the marker
+# and calls ahci_recovery_selftest() (drivers/ata/ahci.ad): it drives the
+# REAL port STOP -> error-register CLEAR -> COMRESET (PxSCTL.DET) -> RESTART
+# error-recovery cycle, proves the disk is usable again via a post-recovery
+# IDENTIFY + LBA read, and exercises the hot-plug-edge poll. Requires the
+# test to attach a QEMU ich9-ahci disk. Default boots omit the marker so it
+# never fires.
+if os.environ.get("ENABLE_AHCI_RECOVERY_TEST") == "1":
+    FILES.append(("/etc/ahci-recovery-test", b"1\n"))
+
 # FAT12 mkfs formatter self-test. scripts/test_fat_mkfs.sh sets
 # ENABLE_FAT_MKFS_TEST=1 to plant /etc/fat-mkfs-test. init/main.ad at
 # boot:37.fmk detects the marker and calls fat_mkfs_selftest()

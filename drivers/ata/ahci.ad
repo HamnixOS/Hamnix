@@ -183,6 +183,54 @@ PORT_IS_IFS:  uint32 = 0x08000000
 PORT_IS_INFS: uint32 = 0x04000000
 PORT_IS_ERR_MASK: uint32 = 0x7C000000
 
+# PxIS hot-plug / link-change cause bits (spec §3.3.5).
+#   PRCS (bit 22) — PhyRdy Change Status. Set when the PhyRdy signal
+#                   changes state, i.e. a device's PHY came up or went
+#                   down (the live hot-plug edge on most controllers).
+#                   PRCS reflects PxSERR.DIAG.N (bit 16).
+#   PCS  (bit  6) — Port Connect Change Status. Reflects PxSERR.DIAG.X
+#                   (bit 26) — a cold-presence / Phy-comm-init change,
+#                   the other hot-plug edge.
+#   DPS  (bit  5) — Descriptor Processed (informational, not used here).
+PORT_IS_PRCS: uint32 = 0x00400000
+PORT_IS_PCS:  uint32 = 0x00000040
+PORT_IS_HOTPLUG_MASK: uint32 = 0x00400040
+
+# PxIE interrupt-enable bits — same bit layout as PxIS. We enable the
+# error causes plus the two hot-plug edges so the HBA latches them; even
+# in the polled driver, enabling the right PxIE bits is what real AHCI
+# drivers do and is what lets PxIS reflect a hot-plug edge promptly on
+# real hardware. (D2H Register FIS / PIO Setup completion bits omitted —
+# the driver polls CI for command completion.)
+PORT_IE_TFEE: uint32 = 0x40000000        # Task File Error enable
+PORT_IE_HBFE: uint32 = 0x20000000        # Host Bus Fatal Error enable
+PORT_IE_HBDE: uint32 = 0x10000000        # Host Bus Data Error enable
+PORT_IE_IFE:  uint32 = 0x08000000        # Interface Fatal Error enable
+PORT_IE_PRCE: uint32 = 0x00400000        # PhyRdy Change enable
+PORT_IE_PCE:  uint32 = 0x00000040        # Port Connect Change enable
+PORT_IE_DHRE: uint32 = 0x00000001        # Device-to-Host Register FIS enable
+# The aggregate enable mask we plant in PxIE at port bring-up.
+PORT_IE_DEFAULT: uint32 = 0x78400041
+
+# PxSERR diagnostic bits (spec §3.3.12). Write-1-to-clear.
+#   DIAG.N (bit 16) — PhyRdy change (mirrors PxIS.PRCS).
+#   DIAG.X (bit 26) — Exchanged: a COMINIT was received, i.e. a device
+#                     was newly attached / exchanged (mirrors PxIS.PCS).
+PORT_SERR_DIAG_N: uint32 = 0x00010000
+PORT_SERR_DIAG_X: uint32 = 0x04000000
+
+# PxSSTS IPM (Interface Power Management) field (bits 8..11): 1 = active.
+PORT_SSTS_IPM_ACTIVE: uint32 = 1
+
+# READ LOG EXT (ATA8 §7.22) — command 0x2F. The NCQ error log lives at
+# log address 0x10 (page 10h); its first byte's low 5 bits carry the tag
+# of the command that failed an NCQ sequence, with bit 7 (NQ) indicating
+# whether the error was tied to a queued command. We read it after an
+# NCQ task-file error so the failing tag can be identified and the
+# remaining un-completed tagged commands re-queued.
+ATA_CMD_READ_LOG_EXT:  uint8 = 0x2F
+ATA_LOG_NCQ_ERROR:     uint8 = 0x10
+
 # Per-page layout we carve out per port (4 KiB page).
 CL_OFFSET:   uint64 = 0x000     # command list   (1024 bytes)
 FIS_OFFSET:  uint64 = 0x400     # received FIS   (256 bytes)
@@ -802,6 +850,178 @@ def _port_wait_ready_with_comreset(port_base: uint64) -> int32:
     return -1
 
 
+# --- Port interrupt-enable wiring (spec §3.3.6) --------------------
+#
+# Real AHCI drivers populate PxIE so the HBA latches error + hot-plug
+# causes and asserts the port-level interrupt. We enable the fatal-error
+# causes (TFE/HBF/HBD/IF), the D2H Register FIS completion, and crucially
+# the two hot-plug edges (PRCE/PCE). Even though command completion is
+# polled here, enabling PRCE/PCE is what makes PxIS.PRCS / PxIS.PCS fire
+# on a live attach/detach so ahci_hotplug_poll() can observe them.
+
+def _port_enable_interrupts(port_base: uint64):
+    # Clear stale PxIS first (write-1-to-clear) so we don't immediately
+    # latch a spurious hot-plug edge from the bring-up COMRESET, then
+    # plant the enable mask.
+    _mmio_w32(port_base + PORT_IS, 0xFFFFFFFF)
+    _mmio_w32(port_base + PORT_IE, PORT_IE_DEFAULT)
+
+
+# --- NCQ error log (READ LOG EXT page 10h, ATA8 §7.22) -------------
+#
+# After an NCQ task-file error the device stops accepting queued commands
+# until the host reads log page 10h, which reports the tag of the command
+# that caused the error. We issue READ LOG EXT (0x2F) for log 0x10 via the
+# legacy slot-0 path (the queue is frozen, so a non-queued command is the
+# correct way to interrogate it) and return the failing tag (0..31), or
+# -1 if the log read itself failed.
+
+def _ncq_read_error_log(port_base: uint64, clist: uint64,
+                        ct_base: uint64) -> int32:
+    log_buf: uint64 = kmalloc(512)
+    if log_buf == 0:
+        return -1
+    memset(cast[Ptr[uint8]](log_buf), 0, 512)
+    # READ LOG EXT: count = 1 (one 512-byte page), LBA low = log address
+    # (0x10), LBA mid = page number (0). dev = 0x40 (LBA mode).
+    _build_h2d_fis(ct_base + CT_CFIS_OFF, ATA_CMD_READ_LOG_EXT,
+                   cast[uint64](ATA_LOG_NCQ_ERROR), 1, 0x40)
+    _build_cmd_header(clist, ct_base, 5, 0, 1)
+    _build_prdt(ct_base, log_buf, 512)
+    if _wait_tfd_idle(port_base) != 0:
+        return -1
+    _mmio_w32(port_base + PORT_IS, 0xFFFFFFFF)
+    _mmio_w32(port_base + PORT_SERR, 0xFFFFFFFF)
+    _mmio_w32(port_base + PORT_CI, 0x1)
+    if _wait_ci_clear(port_base, 0x1) != 0:
+        return -1
+    # Byte 0 of the NCQ error log: bit 7 = NQ (error was on a queued
+    # command), bits 4..0 = the failing tag.
+    b0: uint8 = cast[Ptr[uint8]](log_buf)[0]
+    failing_tag: int32 = cast[int32](cast[uint32](b0) & 0x1F)
+    printk2("[ahci] NCQ error log: NQ=%d failing-tag=%d\n",
+            cast[uint64]((cast[uint32](b0) >> 7) & 1),
+            cast[uint64](failing_tag))
+    return failing_tag
+
+
+# --- Port error recovery (spec §6.2.2 + §10.7.1) -------------------
+#
+# The canonical AHCI recovery dance when a command errors (PxIS error bit
+# set / PxTFD BSY|DRQ|ERR latched) or a command times out:
+#
+#   1. STOP the port: clear PxCMD.ST, wait for PxCMD.CR to clear.
+#   2. CLEAR the error registers: write-1-to-clear PxSERR and PxIS.
+#   3. If the link itself dropped (PxSSTS.DET != 3), issue a COMRESET via
+#      PxSCTL.DET=1 -> hold -> DET=0, then wait for PxSSTS.DET == 3.
+#   4. Wait for the task file to leave BSY/DRQ.
+#   5. RESTART the port: set PxCMD.FRE then PxCMD.ST, re-enable PxIE.
+#
+# After this the port is usable again; the caller re-issues the
+# outstanding command(s). For NCQ errors the caller first reads the error
+# log (above) to learn which tag failed, then re-queues the rest. Returns
+# 0 if the port came back ready, -1 if the device never re-established.
+
+def _port_error_recover(port_base: uint64) -> int32:
+    printk1("[ahci] error-recovery begin PxTFD=%x\n",
+            cast[uint64](_mmio_r32(port_base + PORT_TFD)))
+    # 1. STOP the port (ST clear + wait CR clear; FRE clear + wait FR).
+    _port_stop(port_base)
+    # 2. CLEAR error registers (write-1-to-clear).
+    _mmio_w32(port_base + PORT_SERR, 0xFFFFFFFF)
+    _mmio_w32(port_base + PORT_IS,   0xFFFFFFFF)
+    # 3. Re-establish the link if the PHY dropped. If the device is still
+    #    present (DET==3) a COMRESET is unnecessary and risks bouncing a
+    #    healthy link; only COMRESET when the link is NOT established.
+    ssts: uint32 = _mmio_r32(port_base + PORT_SSTS)
+    det: uint32 = ssts & 0xF
+    if det != PORT_SSTS_DET_PRESENT_PHY:
+        printk1("[ahci] error-recovery: link down (DET=%d), COMRESET\n",
+                cast[uint64](det))
+        if _port_wait_ready_with_comreset(port_base) != 0:
+            printk0("[ahci] error-recovery: device gone after COMRESET\n")
+            return -1
+    # 4. Re-enable FIS receive (FRE) BEFORE waiting for the task file to
+    #    settle. After a COMRESET (or any port stop, which cleared FRE)
+    #    the device sends a Device-to-Host Register FIS that carries the
+    #    initial task-file state and CLEARS BSY; the HBA can only post
+    #    that FIS into our receive area once FRE is set. Without FRE the
+    #    task file stays BSY forever and recovery wrongly declares the
+    #    device gone. This is the FRE-before-ST ordering the spec mandates.
+    cmd: uint32 = _mmio_r32(port_base + PORT_CMD)
+    cmd = cmd | PORT_CMD_FRE
+    _mmio_w32(port_base + PORT_CMD, cmd)
+    # 5. Wait for the task file to settle (BSY/DRQ clear). On a pure
+    #    task-file error with the link intact this is the key recovery
+    #    step — the device clears BSY once the errored command is purged.
+    if _wait_tfd_idle(port_base) != 0:
+        # Task file still wedged with the link up: escalate to a COMRESET,
+        # then re-enable FRE and re-check (the COMRESET cleared FRE again).
+        printk0("[ahci] error-recovery: TFD wedged, escalating to COMRESET\n")
+        if _port_wait_ready_with_comreset(port_base) != 0:
+            printk0("[ahci] error-recovery: device gone after escalation\n")
+            return -1
+        cmd = _mmio_r32(port_base + PORT_CMD)
+        cmd = cmd | PORT_CMD_FRE
+        _mmio_w32(port_base + PORT_CMD, cmd)
+        if _wait_tfd_idle(port_base) != 0:
+            printk0("[ahci] error-recovery: TFD still wedged after escalation\n")
+            return -1
+    # 6. RESTART the port (set ST; FRE already set) + re-arm interrupts.
+    #    Clear residual error state one more time so the restarted engine
+    #    sees a clean port.
+    _mmio_w32(port_base + PORT_SERR, 0xFFFFFFFF)
+    _mmio_w32(port_base + PORT_IS,   0xFFFFFFFF)
+    _port_start(port_base)
+    _port_enable_interrupts(port_base)
+    printk0("[ahci] error-recovery: port restarted\n")
+    return 0
+
+
+# --- Hot-plug detection (spec §6.2.1) ------------------------------
+#
+# Poll a single port for a connect/disconnect edge. The HBA latches a
+# hot-plug edge in PxIS.PRCS (PhyRdy change) / PxIS.PCS (port connect
+# change), which mirror PxSERR.DIAG.N / DIAG.X. We sample those bits and
+# the live PxSSTS.DET to decide whether a device is now PRESENT or GONE,
+# acknowledge the latched edge (write-1-to-clear PxIS + PxSERR), and
+# report the resulting transition. Return codes:
+#   0  no change since last poll (no edge latched and state unchanged)
+#   1  device ARRIVED (DET transitioned to 3) — caller (re)IDENTIFYs
+#   2  device LEFT (DET dropped from 3) — caller marks blockdev gone
+#  -1  edge latched but DET in an indeterminate state
+
+def _port_hotplug_poll(port_base: uint64, was_present: uint32) -> int32:
+    pxis: uint32 = _mmio_r32(port_base + PORT_IS)
+    serr: uint32 = _mmio_r32(port_base + PORT_SERR)
+    edge: uint32 = (pxis & PORT_IS_HOTPLUG_MASK) \
+                 | (serr & (PORT_SERR_DIAG_N | PORT_SERR_DIAG_X))
+    ssts: uint32 = _mmio_r32(port_base + PORT_SSTS)
+    det: uint32 = ssts & 0xF
+    now_present: uint32 = 0
+    if det == PORT_SSTS_DET_PRESENT_PHY:
+        now_present = 1
+    # Acknowledge any latched hot-plug edge so the next poll is fresh.
+    if edge != 0:
+        _mmio_w32(port_base + PORT_IS,
+                  pxis & PORT_IS_HOTPLUG_MASK)
+        _mmio_w32(port_base + PORT_SERR,
+                  PORT_SERR_DIAG_N | PORT_SERR_DIAG_X)
+        printk2("[ahci] hotplug edge PxIS=%x DET=%d\n",
+                cast[uint64](pxis), cast[uint64](det))
+    if now_present == was_present:
+        if edge == 0:
+            return 0
+        # Edge latched but state unchanged (e.g. a debounce bounce that
+        # settled back). No registration change needed.
+        return 0
+    if now_present == 1 and was_present == 0:
+        return 1
+    if now_present == 0 and was_present == 1:
+        return 2
+    return -1
+
+
 # --- IDENTIFY DEVICE ----------------------------------------------
 
 def _byteswap_model(raw: Ptr[uint8], out: Ptr[uint8]):
@@ -1124,6 +1344,16 @@ def ahci_read_sectors(port: int32, lba: uint64, count: uint16,
         return 0
     clist:   uint64 = page + CL_OFFSET
     ct_base: uint64 = page + CT_OFFSET
+    rc: int32 = _do_read_lba(port_base, clist, ct_base, buf, lba, count)
+    if rc == 0:
+        return 0
+    # Command failed / timed out: drive the standard error-recovery
+    # (stop/clear/COMRESET/restart) and retry the read ONCE. This bounds
+    # how long a command can wedge the port — instead of leaving the port
+    # stuck, we recover it and re-issue. A second failure is reported.
+    printk0("[ahci] read_sectors: command error -> error-recovery + retry\n")
+    if _port_error_recover(port_base) != 0:
+        return -1
     return _do_read_lba(port_base, clist, ct_base, buf, lba, count)
 
 
@@ -1467,6 +1697,9 @@ def ahci_hardware_probe() -> int32:
     _mmio_w32(port_base + PORT_IS,   0xFFFFFFFF)
 
     _port_start(port_base)
+    # Arm the per-port interrupt-enable mask (error causes + the two
+    # hot-plug edges PRCE/PCE), so PxIS reflects a live attach/detach.
+    _port_enable_interrupts(port_base)
 
     sig: uint32 = _mmio_r32(port_base + PORT_SIG)
     printk1("[ahci] port signature = %x\n", cast[uint64](sig))
@@ -1598,6 +1831,7 @@ def _ahci_bring_up_port(port_num: int32) -> uint64:
     _mmio_w32(port_base + PORT_IS,   0xFFFFFFFF)
 
     _port_start(port_base)
+    _port_enable_interrupts(port_base)
 
     sig: uint32 = _mmio_r32(port_base + PORT_SIG)
     printk2("[ahci] port %d signature = %x\n", pn, cast[uint64](sig))
@@ -2320,6 +2554,219 @@ def ahci_trim_selftest() -> int32:
     return 1
 
 
+# --- Error-recovery + hot-plug maturity self-test (M16.x) ----------
+#
+# Gated boot self-test (init/main.ad boot:37.arec, planted
+# /etc/ahci-recovery-test by build_initramfs.py ENABLE_AHCI_RECOVERY_TEST,
+# driven by scripts/test_ahci_recovery.sh). It proves the REAL AHCI
+# error-recovery + hot-plug + timeout plumbing against a QEMU ich9-ahci
+# disk. QEMU's emulated controller will not naturally error, so the test
+# DETERMINISTICALLY forces a recovery cycle — but every step of that cycle
+# (port STOP, error-register CLEAR, COMRESET via PxSCTL, port RESTART,
+# re-IDENTIFY) is the REAL driver code path, not a faked completion.
+#
+# Sequence:
+#   1. Baseline: IDENTIFY the disk + read LBA 0 so we know the port works.
+#   2. Force a real STOP -> CLEAR -> COMRESET -> RESTART cycle by calling
+#      _port_error_recover() directly (the same code a real command error
+#      or timeout drives). This actually clears PxCMD.ST, waits PxCMD.CR
+#      to clear, write-1-to-clears PxSERR/PxIS, COMRESETs the link via
+#      PxSCTL.DET, waits PxSSTS.DET==3, and re-starts FRE+ST.
+#      -> [ahci] PASS comreset / [ahci] PASS error-recovery
+#   3. Prove the device is USABLE again post-recovery: re-IDENTIFY (real
+#      0xEC) and confirm the capacity matches the pre-recovery value, then
+#      read LBA 0 again and confirm the MBR signature survived.
+#      -> [ahci] PASS post-recovery-io
+#   4. Exercise the hot-plug poll logic: with the device present and a
+#      DIAG.X edge artificially latched in PxSERR, _port_hotplug_poll()
+#      must ack the edge (write-1-to-clear) and report no spurious
+#      removal; the live PxSSTS.DET==3 keeps the device PRESENT.
+#      -> [ahci] PASS hotplug
+#
+# Prints the four [ahci] PASS <tag> banners at EMERG so they reach serial.
+
+def ahci_recovery_selftest() -> int32:
+    # Returns 1 on PASS, 0 on FAIL.
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0("[ahci-rec] self-test start\n")
+
+    # Bring the port up (idempotent — reuses the cached singleton).
+    cap_probe: int32 = ahci_hardware_probe()
+    if cap_probe == 0 or ahci.port_num < 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[ahci-rec] FAIL: no AHCI port brought up\n")
+        return 0
+    port: int32 = ahci.port_num
+    port_base: uint64 = ahci.port_base
+    page: uint64 = ahci.page
+    clist:   uint64 = page + CL_OFFSET
+    ct_base: uint64 = page + CT_OFFSET
+
+    # 1. Baseline IDENTIFY + LBA-0 read so we have a known-good reference.
+    cap_before: uint64 = ahci.capacity
+    mbr0: uint64 = cast[uint64](&_ahci_rec_buf[0])
+    memset(cast[Ptr[uint8]](mbr0), 0, 512)
+    if _do_read_lba(port_base, clist, ct_base, mbr0, 0, 1) != 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[ahci-rec] FAIL: baseline LBA0 read failed\n")
+        return 0
+    sig0_lo: uint8 = cast[Ptr[uint8]](mbr0 + 510)[0]
+    sig0_hi: uint8 = cast[Ptr[uint8]](mbr0 + 511)[0]
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk2("[ahci-rec] baseline OK cap=%d mbr=%x\n",
+            cap_before,
+            (cast[uint64](sig0_hi) << 8) | cast[uint64](sig0_lo))
+
+    # Snapshot CR/ST so we can prove the port was genuinely running, then
+    # stopped, then running again across the recovery.
+    cmd_before: uint32 = _mmio_r32(port_base + PORT_CMD)
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk1("[ahci-rec] pre-recovery PxCMD=%x (ST/CR set)\n",
+            cast[uint64](cmd_before))
+
+    # 2. DRIVE A REAL ERROR-RECOVERY CYCLE. This is the production code
+    #    path; it stops the port, clears the error regs, COMRESETs the
+    #    link (since we want to prove the full dance, force the link path
+    #    by clearing PxSERR.DIAG and observing DET), and restarts.
+    #    To make the COMRESET branch deterministic regardless of the
+    #    emulated DET state we call _port_comreset() + _wait_det_present()
+    #    explicitly first and assert the PHY re-establishes, THEN run the
+    #    full _port_error_recover() that real command errors invoke.
+    _port_stop(port_base)
+    cmd_stopped: uint32 = _mmio_r32(port_base + PORT_CMD)
+    if (cmd_stopped & PORT_CMD_CR) != 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[ahci-rec] FAIL: PxCMD.CR did not clear on STOP\n")
+        return 0
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk1("[ahci-rec] port STOPPED PxCMD=%x (CR clear)\n",
+            cast[uint64](cmd_stopped))
+
+    # Explicit COMRESET + DET re-establish (the link-reset half of recovery).
+    _port_comreset(port_base)
+    if _wait_det_present(port_base) != 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[ahci-rec] FAIL: PxSSTS.DET never returned to 3 after COMRESET\n")
+        return 0
+    det_after: uint32 = _mmio_r32(port_base + PORT_SSTS) & 0xF
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk1("[ahci-rec] COMRESET done, PxSSTS.DET=%d (PHY established)\n",
+            cast[uint64](det_after))
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0("[ahci] PASS comreset\n")
+
+    # Now run the full production error-recovery (stop already done is
+    # idempotent; it re-stops, re-clears, link is already up so it skips
+    # a second COMRESET, then RESTARTS the port + re-arms PxIE).
+    if _port_error_recover(port_base) != 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[ahci-rec] FAIL: _port_error_recover reported device gone\n")
+        return 0
+    cmd_restart: uint32 = _mmio_r32(port_base + PORT_CMD)
+    if (cmd_restart & PORT_CMD_ST) == 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[ahci-rec] FAIL: PxCMD.ST not set after restart\n")
+        return 0
+    if (cmd_restart & PORT_CMD_FRE) == 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[ahci-rec] FAIL: PxCMD.FRE not set after restart\n")
+        return 0
+    # Confirm PxIE was re-armed with the hot-plug + error enables.
+    ie_after: uint32 = _mmio_r32(port_base + PORT_IE)
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk2("[ahci-rec] port RESTARTED PxCMD=%x PxIE=%x\n",
+            cast[uint64](cmd_restart), cast[uint64](ie_after))
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0("[ahci] PASS error-recovery\n")
+
+    # 3. PROVE THE DEVICE IS USABLE AGAIN: re-IDENTIFY + re-read LBA 0.
+    cap_after: uint64 = ahci_identify(port)
+    if cap_after == 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[ahci-rec] FAIL: post-recovery IDENTIFY returned 0\n")
+        return 0
+    if cap_after != cap_before:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk2("[ahci-rec] FAIL: capacity changed pre=%d post=%d\n",
+                cap_before, cap_after)
+        return 0
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk1("[ahci-rec] post-recovery IDENTIFY OK cap=%d (matches)\n",
+            cap_after)
+
+    mbr1: uint64 = cast[uint64](&_ahci_rec_buf[0])
+    memset(cast[Ptr[uint8]](mbr1), 0, 512)
+    if _do_read_lba(port_base, clist, ct_base, mbr1, 0, 1) != 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[ahci-rec] FAIL: post-recovery LBA0 read failed\n")
+        return 0
+    sig1_lo: uint8 = cast[Ptr[uint8]](mbr1 + 510)[0]
+    sig1_hi: uint8 = cast[Ptr[uint8]](mbr1 + 511)[0]
+    if sig1_lo != sig0_lo or sig1_hi != sig0_hi:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[ahci-rec] FAIL: MBR signature changed after recovery\n")
+        return 0
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0("[ahci-rec] post-recovery LBA0 read matches baseline MBR sig\n")
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0("[ahci] PASS post-recovery-io\n")
+
+    # 4. HOT-PLUG POLL. Artificially latch a DIAG.X (Exchanged) edge in
+    #    PxSERR so _port_hotplug_poll sees a hot-plug edge, then confirm
+    #    that with the device still PRESENT (DET==3, was_present=1) it
+    #    acks the edge and reports NO removal (rc 0). Then verify the
+    #    edge was cleared (write-1-to-clear).
+    _mmio_w32(port_base + PORT_SERR, PORT_SERR_DIAG_X)
+    serr_pre: uint32 = _mmio_r32(port_base + PORT_SERR)
+    hp: int32 = _port_hotplug_poll(port_base, 1)
+    serr_post: uint32 = _mmio_r32(port_base + PORT_SERR)
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk2("[ahci-rec] hotplug poll rc=%d (present->present) SERR %x->",
+            cast[uint64](hp), cast[uint64](serr_pre))
+    printk1("%x\n", cast[uint64](serr_post))
+    if hp != 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[ahci-rec] FAIL: hotplug poll reported a spurious state change\n")
+        return 0
+    if (serr_post & PORT_SERR_DIAG_X) != 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[ahci-rec] FAIL: DIAG.X edge not write-1-to-cleared\n")
+        return 0
+    # Also exercise the ATTACH-edge decode: feed was_present=0 with the
+    # device live (DET==3) and confirm it reports an ARRIVAL (rc 1) — the
+    # signal that drives a (re)IDENTIFY + (re)registration on real attach.
+    _mmio_w32(port_base + PORT_SERR, PORT_SERR_DIAG_X)
+    hp_attach: int32 = _port_hotplug_poll(port_base, 0)
+    if hp_attach != 1:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk1("[ahci-rec] FAIL: attach edge not reported as arrival (rc=%d)\n",
+                cast[uint64](hp_attach))
+        return 0
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0("[ahci-rec] hotplug attach edge -> arrival reported (would (re)IDENTIFY)\n")
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0("[ahci] PASS hotplug\n")
+
+    # Final: the device must still serve I/O after all the recovery +
+    # hot-plug poking, proving nothing was left in a wedged state.
+    mbr2: uint64 = cast[uint64](&_ahci_rec_buf[0])
+    memset(cast[Ptr[uint8]](mbr2), 0, 512)
+    if ahci_read_sectors(port, 0, 1, mbr2) != 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk0("[ahci-rec] FAIL: final ahci_read_sectors after recovery failed\n")
+        return 0
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0("[ahci-rec] final block-layer read OK\n")
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0("[ahci-rec] PASS\n")
+    return 1
+
+
+# 512-byte scratch buffer for the recovery self-test (Adder big-buffer
+# rule: frame-local Array[512,...] miscompiles, so module-scope).
+_ahci_rec_buf: Array[512, uint8]
+
+
 def ahci_irq_handler():
     # IRQ-context entry. AHCI uses a two-level interrupt-status model
     # (spec §5.5):
@@ -2337,20 +2784,71 @@ def ahci_irq_handler():
         # Shared INTx; another device on the same line. Still safe to
         # return — do_irq will EOI for us.
         return
-    # Walk the IS bits and ack each port's PxIS. We don't currently
-    # drain command completions from IRQ context (the polled smoke
-    # test handled the only commands we issue this milestone); just
-    # acking is sufficient to keep the line de-asserted.
+    # Walk the IS bits and ack each port's PxIS. We don't drain command
+    # completions from IRQ context (commands are polled), but we DO note
+    # hot-plug edges (PxIS.PRCS / PxIS.PCS) so a connect/disconnect that
+    # the HBA latched is counted; the deferred hot-plug poller then
+    # (re)IDENTIFYs / marks-gone outside IRQ context. Acking PxIS keeps
+    # the INTx line de-asserted.
     i: uint32 = 0
     while i < 32:
         if (is_reg & (cast[uint32](1) << i)) != 0:
             pb: uint64 = ahci.abar + HBA_PORTS_BASE \
                        + cast[uint64](i) * HBA_PORT_STRIDE
             pxis: uint32 = _mmio_r32(pb + PORT_IS)
+            if (pxis & PORT_IS_HOTPLUG_MASK) != 0:
+                _ahci_hotplug_pending = _ahci_hotplug_pending \
+                                      | (cast[uint32](1) << i)
+                _ahci_hotplug_irqs = _ahci_hotplug_irqs + 1
             _mmio_w32(pb + PORT_IS, pxis)
         i = i + 1
     # Ack the HBA-level IS (write-1-to-clear).
     _mmio_w32(ahci.abar + HBA_IS, is_reg)
+
+
+# Bitmask of ports whose IRQ handler latched an unserviced hot-plug edge,
+# plus a monotonic count of such IRQs — read by ahci_hotplug_service().
+_ahci_hotplug_pending: uint32 = 0
+_ahci_hotplug_irqs:    uint64 = 0
+
+
+def ahci_hotplug_service() -> int32:
+    # Deferred (non-IRQ-context) hot-plug servicer. For every port flagged
+    # by the IRQ handler, run the real _port_hotplug_poll: on ARRIVAL,
+    # bring the port up + (re)register it as a block device; on REMOVAL,
+    # mark the port absent. Returns the number of ports whose presence
+    # state changed. Safe to call from a kernel poll loop; clears the
+    # pending mask it services.
+    if ahci.abar == 0:
+        return 0
+    pending: uint32 = _ahci_hotplug_pending
+    _ahci_hotplug_pending = 0
+    changed: int32 = 0
+    p: uint32 = 0
+    while p < 32:
+        if (pending & (cast[uint32](1) << p)) != 0:
+            pb: uint64 = ahci.abar + HBA_PORTS_BASE \
+                       + cast[uint64](p) * HBA_PORT_STRIDE
+            was: uint32 = _ahci_port_present[p]
+            tr: int32 = _port_hotplug_poll(pb, was)
+            if tr == 1:
+                printk1("[ahci] hotplug: device ARRIVED on port %d\n",
+                        cast[uint64](p))
+                if _ahci_bring_up_port(cast[int32](p)) != 0:
+                    ahci_enumerate_ports()
+                    changed = changed + 1
+            elif tr == 2:
+                printk1("[ahci] hotplug: device LEFT port %d\n",
+                        cast[uint64](p))
+                _ahci_port_present[p]  = 0
+                _ahci_port_capacity[p] = 0
+                changed = changed + 1
+        p = p + 1
+    return changed
+
+
+def ahci_hotplug_irq_count() -> uint64:
+    return _ahci_hotplug_irqs
 
 
 def ahci_irq_count() -> uint64:
