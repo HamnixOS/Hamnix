@@ -1190,6 +1190,15 @@ if os.environ.get("ENABLE_BPF_TEST"):
 # banner. Default boots omit the marker.
 if os.environ.get("ENABLE_MEMPOLICY_TEST"):
     FILES.append(("/etc/mempolicy-test", b"1\n"))
+# quotactl(2) disk-quota round-trip self-test. scripts/test_quota.sh sets
+# ENABLE_QUOTA_TEST=1 to plant /etc/quota-test. init/main.ad detects the marker
+# and calls quota_selftest() (linux_abi/u_quota.ad): it Q_QUOTAONs a fs,
+# Q_SETQUOTA/Q_GETQUOTA round-trips a dqblk byte-exact, Q_SETINFO/Q_GETINFO
+# round-trips grace times, Q_QUOTAOFF makes a subsequent Q_GETQUOTA observe
+# ESRCH, and a bad cmd/type/special is rejected EINVAL/ENODEV, emitting the
+# [quota] PASS banner. Default boots omit the marker.
+if os.environ.get("ENABLE_QUOTA_TEST"):
+    FILES.append(("/etc/quota-test", b"1\n"))
 
 # Landlock LSM round-trip + open-enforcement self-test. scripts/test_landlock.sh
 # sets ENABLE_LANDLOCK_TEST=1 to plant /etc/landlock-test plus two REAL files:

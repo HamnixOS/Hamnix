@@ -1,0 +1,796 @@
+# linux_abi/u_quota.ad -- the Linux disk-quota syscall, quotactl(2) (nr 179).
+#
+# Real Debian userland that touches disk quotas reaches for quotactl(2):
+#
+#   * quota / repquota / edquota / setquota (the quota-tools package)
+#   * warnquota, quotacheck, quotaon/quotaoff
+#   * systemd's quota-enforcing of per-user tmpfs/projids
+#
+# All of them round-trip the Q_GETQUOTA / Q_SETQUOTA / Q_GETINFO / Q_SETINFO /
+# Q_QUOTAON / Q_QUOTAOFF / Q_SYNC subcommands. Until now quotactl fell through
+# to the ENOSYS default, so `quota -u root` and `setquota` saw a bogus failure.
+#
+# ARCHITECTURE NOTE -- disk quotas are a LINUX-ABI concept ONLY. Hamnix's
+# native resource model is Plan 9 ctl/stat files, NOT POSIX/Linux per-uid disk
+# quotas. So this is an HONEST Linux-ABI leaf, NOT a stub that ignores its
+# arguments: it maintains a REAL per-(filesystem, type, id) quota store, stores
+# the limits Q_SETQUOTA writes, returns them byte-exact through Q_GETQUOTA,
+# toggles a real per-fs enforced flag on Q_QUOTAON/OFF, and round-trips grace
+# periods through Q_GETINFO/Q_SETINFO. What you SET is what you GET, framed at
+# the real Linux struct byte offsets. Bad input is REJECTED (EINVAL/EFAULT/
+# ENODEV), never silently accepted.
+#
+# Layer note: a confined Layer-2 leaf, mirroring linux_abi/u_mempolicy.ad and
+# linux_abi/u_caps.ad. It calls only the user-pointer-safe copy helpers
+# (copy_from_user / copy_to_user) and printk for the self-test. It never
+# touches 9P / Chan / Layer-1 code. u_syscalls.ad imports it (the nr 179
+# dispatch arm forwards here), the same shape as u_mempolicy.ad. quotactl
+# returns ints, never fds -- no FD_*_MARK is introduced.
+
+from mm.uaccess import (
+    copy_from_user, copy_to_user,
+)
+from kernel.printk.printk import (
+    printk0, printk1, printk2,
+)
+
+
+# =====================================================================
+# Linux disk-quota ABI constants  (uapi/linux/quota.h, uapi/linux/dqblk_xfs.h)
+# =====================================================================
+#
+# quotactl(cmd, special, id, addr): `cmd` packs a subcommand in its high bits
+# and a quota TYPE (USRQUOTA/GRPQUOTA/PRJQUOTA) in its low byte:
+#
+#   QCMD(subcmd, type) = ((subcmd) << SUBCMDSHIFT) | (type & SUBCMDMASK)
+#
+# with SUBCMDSHIFT=8 and SUBCMDMASK=0xff.
+QUOTA_SUBCMDSHIFT: uint64 = 8
+QUOTA_SUBCMDMASK:  uint64 = 0xff
+
+# Quota types (the low byte of cmd).
+USRQUOTA: uint64 = 0
+GRPQUOTA: uint64 = 1
+PRJQUOTA: uint64 = 2
+MAXQUOTAS: uint64 = 3            # one past the last valid type
+
+# Generic (VFS) quotactl subcommands (the high bits of cmd, pre-shift).
+Q_SYNC:      uint64 = 0x800001   # sync disk copy of quotas (no-op success)
+Q_QUOTAON:   uint64 = 0x800002   # turn quotas on for a fs
+Q_QUOTAOFF:  uint64 = 0x800003   # turn quotas off for a fs
+Q_GETFMT:    uint64 = 0x800004   # get on-disk quota format
+Q_GETINFO:   uint64 = 0x800005   # get info about quotafile (grace times)
+Q_SETINFO:   uint64 = 0x800006   # set info about quotafile (grace times)
+Q_GETQUOTA:  uint64 = 0x800007   # get a user/group quota limits+usage
+Q_SETQUOTA:  uint64 = 0x800008   # set a user/group quota limits
+
+# Quota format identifier we report from Q_GETFMT.
+QFMT_VFS_V1: uint64 = 4          # current generic on-disk quota format
+
+# dqb_valid / dqi_valid bitmask flags. Q_SETQUOTA / Q_SETINFO honour only the
+# fields whose valid bit is set, leaving the rest untouched (Linux semantics).
+QIF_BLIMITS: uint64 = 1          # block hard/soft limits
+QIF_SPACE:   uint64 = 2          # curspace (used blocks)
+QIF_ILIMITS: uint64 = 4          # inode hard/soft limits
+QIF_INODES:  uint64 = 8          # curinodes (used inodes)
+QIF_BTIME:   uint64 = 16         # block grace expiry
+QIF_ITIME:   uint64 = 32         # inode grace expiry
+QIF_LIMITS:  uint64 = 5          # QIF_BLIMITS | QIF_ILIMITS
+QIF_USAGE:   uint64 = 10         # QIF_SPACE | QIF_INODES
+QIF_TIMES:   uint64 = 48         # QIF_BTIME | QIF_ITIME
+QIF_ALL:     uint64 = 63         # everything
+
+# dqi_valid flags for Q_SETINFO (which info fields are meaningful).
+IIF_BGRACE: uint64 = 1
+IIF_IGRACE: uint64 = 2
+IIF_FLAGS:  uint64 = 4
+IIF_ALL:    uint64 = 7
+
+# Linux negative-errno convention (the subset we return).
+QUOTA_EPERM:  int64 = -1
+QUOTA_ESRCH:  int64 = -3
+QUOTA_EFAULT: int64 = -14
+QUOTA_EINVAL: int64 = -22
+QUOTA_ENODEV: int64 = -19
+QUOTA_ENOSYS: int64 = -38
+
+
+# =====================================================================
+# struct if_dqblk  (uapi/linux/quota.h) -- the Q_GETQUOTA/Q_SETQUOTA buffer
+# =====================================================================
+#
+#   struct if_dqblk {
+#       __u64 dqb_bhardlimit;   // offset  0  -- in quota-blocks (1 KiB units)
+#       __u64 dqb_bsoftlimit;   // offset  8
+#       __u64 dqb_curspace;     // offset 16  -- in BYTES of used space
+#       __u64 dqb_ihardlimit;   // offset 24
+#       __u64 dqb_isoftlimit;   // offset 32
+#       __u64 dqb_curinodes;    // offset 40
+#       __u64 dqb_btime;        // offset 48  -- block grace expiry (epoch s)
+#       __u64 dqb_itime;        // offset 56  -- inode grace expiry (epoch s)
+#       __u32 dqb_valid;        // offset 64
+#   };                          // sizeof == 72 (4 bytes tail padding)
+DQBLK_OFF_BHARD:  uint64 = 0
+DQBLK_OFF_BSOFT:  uint64 = 8
+DQBLK_OFF_CURSP:  uint64 = 16
+DQBLK_OFF_IHARD:  uint64 = 24
+DQBLK_OFF_ISOFT:  uint64 = 32
+DQBLK_OFF_CURIN:  uint64 = 40
+DQBLK_OFF_BTIME:  uint64 = 48
+DQBLK_OFF_ITIME:  uint64 = 56
+DQBLK_OFF_VALID:  uint64 = 64
+DQBLK_SIZE:       uint64 = 72
+
+# struct if_dqinfo (uapi/linux/quota.h) -- the Q_GETINFO/Q_SETINFO buffer.
+#
+#   struct if_dqinfo {
+#       __u64 dqi_bgrace;       // offset  0  -- block grace period (seconds)
+#       __u64 dqi_igrace;       // offset  8  -- inode grace period (seconds)
+#       __u32 dqi_flags;        // offset 16
+#       __u32 dqi_valid;        // offset 20
+#   };                          // sizeof == 24
+DQINFO_OFF_BGRACE: uint64 = 0
+DQINFO_OFF_IGRACE: uint64 = 8
+DQINFO_OFF_FLAGS:  uint64 = 16
+DQINFO_OFF_VALID:  uint64 = 20
+DQINFO_SIZE:       uint64 = 24
+
+
+# =====================================================================
+# the quota store
+# =====================================================================
+#
+# A small fixed set of "filesystems" the store knows about (keyed by an index
+# resolved from the `special` device string). For each fs we keep an enforced
+# flag and per-type (USR/GRP) grace periods (dqi). The per-(fs,type,id) dqblk
+# state is an ASSOCIATIVE table keyed by the real uid/gid -- so ANY id (0, 50,
+# 1000, 65534) is valid, exactly as Linux accepts any qid_t. An id with no
+# explicit quota slot reads back an all-zero dqblk (Linux returns a zero block,
+# not an error). Flat arrays are trivially BSS-resident.
+#
+# We honestly resolve `special` to one of a small fixed set of mounted-fs ids
+# (UQUOTA_NFS). The selftest keys the canonical root fs (index 0). An unknown
+# special resolves to "no such device" -> ENODEV.
+UQUOTA_NFS:    uint64 = 4         # number of distinct filesystems modelled
+UQUOTA_NTYPES: uint64 = 2         # USRQUOTA, GRPQUOTA
+UQUOTA_NSLOTS: uint64 = 64        # dqblk slots per (fs,type) -- distinct ids
+
+# Per-fs enforced flag: index fs -> 1 when quotas are ON for that fs.
+uq_on: Array[4, uint8]
+
+# Per-(fs,type) grace info. Flat: row = fs*UQUOTA_NTYPES + type.
+UQUOTA_INFO_ROWS: uint64 = 8      # UQUOTA_NFS * UQUOTA_NTYPES
+uq_bgrace: Array[8, uint64]       # block grace period, seconds
+uq_igrace: Array[8, uint64]       # inode grace period, seconds
+uq_iflags: Array[8, uint32]       # dqi_flags
+
+# Per-(fs,type) associative dqblk table. Flat row index for slot S of (fs,type)
+# is (fs*UQUOTA_NTYPES + type)*UQUOTA_NSLOTS + S. Total rows =
+# UQUOTA_INFO_ROWS * UQUOTA_NSLOTS = 8 * 64 = 512. uq_used[row]==1 marks a slot
+# holding a real (key=uq_id[row]) quota; ==0 marks a free slot.
+UQUOTA_DQ_ROWS: uint64 = 512
+uq_used:   Array[512, uint8]      # 1 = slot holds a quota for uq_id[row]
+uq_id:     Array[512, uint64]     # the uid/gid this slot's dqblk belongs to
+uq_bhard:  Array[512, uint64]
+uq_bsoft:  Array[512, uint64]
+uq_cursp:  Array[512, uint64]     # used space, BYTES
+uq_ihard:  Array[512, uint64]
+uq_isoft:  Array[512, uint64]
+uq_curin:  Array[512, uint64]     # used inodes
+uq_btime:  Array[512, uint64]     # block grace expiry, epoch seconds
+uq_itime:  Array[512, uint64]     # inode grace expiry, epoch seconds
+
+
+def uquota_init():
+    # Boot-time reset: every fs OFF, every dqblk slot free, default grace
+    # periods (the Linux MAX_DQ_TIME / MAX_IQ_TIME defaults: 7 days).
+    f: uint64 = 0
+    while f < UQUOTA_NFS:
+        uq_on[f] = 0
+        f = f + 1
+    r: uint64 = 0
+    while r < UQUOTA_INFO_ROWS:
+        uq_bgrace[r] = 604800     # 7 days in seconds (Linux MAX_DQ_TIME)
+        uq_igrace[r] = 604800     # 7 days in seconds (Linux MAX_IQ_TIME)
+        uq_iflags[r] = 0
+        r = r + 1
+    d: uint64 = 0
+    while d < UQUOTA_DQ_ROWS:
+        uq_used[d] = 0
+        uq_id[d] = 0
+        uq_bhard[d] = 0
+        uq_bsoft[d] = 0
+        uq_cursp[d] = 0
+        uq_ihard[d] = 0
+        uq_isoft[d] = 0
+        uq_curin[d] = 0
+        uq_btime[d] = 0
+        uq_itime[d] = 0
+        d = d + 1
+
+
+# =====================================================================
+# `special` device-string resolution
+# =====================================================================
+#
+# Linux quotactl takes `special` as a path to the block device backing a
+# mounted filesystem (e.g. "/dev/sda1"). We resolve it HONESTLY to a small
+# fixed set of fs indices. We accept a canonical set of names mapping to fs 0
+# (the root). An unknown / unreadable special -> ENODEV. A NULL special (used
+# by some subcommands like a global Q_SYNC) maps to fs 0.
+#
+# To avoid an unbounded user-string read we copy at most UQUOTA_SPECIAL_MAX
+# bytes and match against a tiny table. The selftest passes fs index 0's
+# canonical name.
+UQUOTA_SPECIAL_MAX: uint64 = 64
+
+
+def _uq_streq(a: Ptr[uint8], b: Ptr[uint8], n: uint64) -> int32:
+    # 1 iff the NUL-terminated strings a and b are equal within n bytes.
+    i: uint64 = 0
+    while i < n:
+        ca: uint8 = a[i]
+        cb: uint8 = b[i]
+        if ca != cb:
+            return 0
+        if ca == 0:
+            return 1
+        i = i + 1
+    return 1
+
+
+def _uq_resolve_special(special: uint64) -> int64:
+    # Resolve the user `special` device path to a fs index in [0,UQUOTA_NFS),
+    # or a negative errno. A NULL pointer -> fs 0 (global/root). An unknown
+    # device -> ENODEV. A bad pointer -> EFAULT.
+    if special == 0:
+        return 0
+    kbuf: Array[64, uint8]
+    if copy_from_user(cast[uint64](&kbuf[0]), special,
+                      UQUOTA_SPECIAL_MAX) != 0:
+        return QUOTA_EFAULT
+    # Force NUL-termination of the scratch buffer's last byte (defensive: the
+    # source might not be NUL-terminated within the window).
+    kbuf[UQUOTA_SPECIAL_MAX - 1] = 0
+    # Canonical names for fs 0 (the root filesystem).
+    n_root0: Ptr[uint8] = "/dev/root"
+    n_root1: Ptr[uint8] = "/dev/sda1"
+    n_root2: Ptr[uint8] = "/"
+    if _uq_streq(&kbuf[0], n_root0, UQUOTA_SPECIAL_MAX) == 1:
+        return 0
+    if _uq_streq(&kbuf[0], n_root1, UQUOTA_SPECIAL_MAX) == 1:
+        return 0
+    if _uq_streq(&kbuf[0], n_root2, UQUOTA_SPECIAL_MAX) == 1:
+        return 0
+    # fs 1..3 canonical names (second/third mounted filesystems).
+    n_sdb1: Ptr[uint8] = "/dev/sdb1"
+    n_sdc1: Ptr[uint8] = "/dev/sdc1"
+    n_sdd1: Ptr[uint8] = "/dev/sdd1"
+    if _uq_streq(&kbuf[0], n_sdb1, UQUOTA_SPECIAL_MAX) == 1:
+        return 1
+    if _uq_streq(&kbuf[0], n_sdc1, UQUOTA_SPECIAL_MAX) == 1:
+        return 2
+    if _uq_streq(&kbuf[0], n_sdd1, UQUOTA_SPECIAL_MAX) == 1:
+        return 3
+    return QUOTA_ENODEV
+
+
+# =====================================================================
+# cmd decoding + small helpers
+# =====================================================================
+
+def _uq_subcmd(cmd: uint64) -> uint64:
+    return cmd >> QUOTA_SUBCMDSHIFT
+
+
+def _uq_type(cmd: uint64) -> uint64:
+    return cmd & QUOTA_SUBCMDMASK
+
+
+def _uq_info_row(fs: uint64, qtype: uint64) -> uint64:
+    return fs * UQUOTA_NTYPES + qtype
+
+
+def _uq_base_row(fs: uint64, qtype: uint64) -> uint64:
+    # First slot row for the (fs,type) associative dqblk table.
+    return (fs * UQUOTA_NTYPES + qtype) * UQUOTA_NSLOTS
+
+
+def _uq_find_slot(fs: uint64, qtype: uint64, id: uint64) -> int64:
+    # Return the row index of the slot holding `id`'s dqblk for (fs,type), or
+    # -1 if no slot is allocated for that id.
+    base: uint64 = _uq_base_row(fs, qtype)
+    s: uint64 = 0
+    while s < UQUOTA_NSLOTS:
+        row: uint64 = base + s
+        if uq_used[row] == 1:
+            if uq_id[row] == id:
+                return cast[int64](row)
+        s = s + 1
+    return -1
+
+
+def _uq_alloc_slot(fs: uint64, qtype: uint64, id: uint64) -> int64:
+    # Find an existing slot for `id`, or claim a free one and zero its dqblk.
+    # Returns the row index, or -1 if the table for (fs,type) is full.
+    existing: int64 = _uq_find_slot(fs, qtype, id)
+    if existing >= 0:
+        return existing
+    base: uint64 = _uq_base_row(fs, qtype)
+    s: uint64 = 0
+    while s < UQUOTA_NSLOTS:
+        row: uint64 = base + s
+        if uq_used[row] == 0:
+            uq_used[row] = 1
+            uq_id[row]   = id
+            uq_bhard[row] = 0
+            uq_bsoft[row] = 0
+            uq_cursp[row] = 0
+            uq_ihard[row] = 0
+            uq_isoft[row] = 0
+            uq_curin[row] = 0
+            uq_btime[row] = 0
+            uq_itime[row] = 0
+            return cast[int64](row)
+        s = s + 1
+    return -1
+
+
+# Module-global scratch buffer for a dqblk staged for copy in/out. Adder has
+# no struct-by-value, so we frame the 72-byte struct as a byte array and pack
+# fields at their real offsets.
+_uq_blkbuf: Array[72, uint8]
+_uq_infobuf: Array[24, uint8]
+
+
+def _uq_put_u64(buf: Ptr[uint8], off: uint64, v: uint64):
+    # Little-endian store of a 64-bit field at byte offset `off`.
+    i: uint64 = 0
+    while i < 8:
+        buf[off + i] = cast[uint8]((v >> (i * 8)) & 0xff)
+        i = i + 1
+
+
+def _uq_get_u64(buf: Ptr[uint8], off: uint64) -> uint64:
+    v: uint64 = 0
+    i: uint64 = 0
+    while i < 8:
+        v = v | (cast[uint64](buf[off + i]) << (i * 8))
+        i = i + 1
+    return v
+
+
+def _uq_put_u32(buf: Ptr[uint8], off: uint64, v: uint64):
+    i: uint64 = 0
+    while i < 4:
+        buf[off + i] = cast[uint8]((v >> (i * 8)) & 0xff)
+        i = i + 1
+
+
+def _uq_get_u32(buf: Ptr[uint8], off: uint64) -> uint64:
+    v: uint64 = 0
+    i: uint64 = 0
+    while i < 4:
+        v = v | (cast[uint64](buf[off + i]) << (i * 8))
+        i = i + 1
+    return v
+
+
+# =====================================================================
+# subcommand handlers
+# =====================================================================
+
+def _uq_quotaon(fs: uint64) -> int64:
+    uq_on[fs] = 1
+    return 0
+
+
+def _uq_quotaoff(fs: uint64) -> int64:
+    uq_on[fs] = 0
+    return 0
+
+
+def _uq_sync(fs: uint64) -> int64:
+    # Flush the in-memory quota copy to disk. We have no on-disk quotafile;
+    # the store IS the canonical copy, so this is success with nothing to do.
+    return 0
+
+
+def _uq_getfmt(fs: uint64, addr: uint64) -> int64:
+    # Q_GETFMT: *addr (a __u32) gets the on-disk quota format id. Quotas must
+    # be ON for the fs (Linux returns ESRCH if no quota is enabled).
+    if uq_on[fs] == 0:
+        return QUOTA_ESRCH
+    fmt: uint32 = cast[uint32](QFMT_VFS_V1)
+    if copy_to_user(addr, cast[uint64](&fmt), 4) != 0:
+        return QUOTA_EFAULT
+    return 0
+
+
+def _uq_getinfo(fs: uint64, qtype: uint64, addr: uint64) -> int64:
+    # Q_GETINFO: fill *addr (struct if_dqinfo) with the fs's grace periods.
+    row: uint64 = _uq_info_row(fs, qtype)
+    j: uint64 = 0
+    while j < DQINFO_SIZE:
+        _uq_infobuf[j] = 0
+        j = j + 1
+    _uq_put_u64(&_uq_infobuf[0], DQINFO_OFF_BGRACE, uq_bgrace[row])
+    _uq_put_u64(&_uq_infobuf[0], DQINFO_OFF_IGRACE, uq_igrace[row])
+    _uq_put_u32(&_uq_infobuf[0], DQINFO_OFF_FLAGS, cast[uint64](uq_iflags[row]))
+    _uq_put_u32(&_uq_infobuf[0], DQINFO_OFF_VALID, IIF_ALL)
+    if copy_to_user(addr, cast[uint64](&_uq_infobuf[0]), DQINFO_SIZE) != 0:
+        return QUOTA_EFAULT
+    return 0
+
+
+def _uq_setinfo(fs: uint64, qtype: uint64, addr: uint64) -> int64:
+    # Q_SETINFO: read *addr (struct if_dqinfo); honour the fields whose
+    # dqi_valid bit is set, leaving the rest untouched.
+    if copy_from_user(cast[uint64](&_uq_infobuf[0]), addr, DQINFO_SIZE) != 0:
+        return QUOTA_EFAULT
+    valid: uint64 = _uq_get_u32(&_uq_infobuf[0], DQINFO_OFF_VALID)
+    row: uint64 = _uq_info_row(fs, qtype)
+    if (valid & IIF_BGRACE) != 0:
+        uq_bgrace[row] = _uq_get_u64(&_uq_infobuf[0], DQINFO_OFF_BGRACE)
+    if (valid & IIF_IGRACE) != 0:
+        uq_igrace[row] = _uq_get_u64(&_uq_infobuf[0], DQINFO_OFF_IGRACE)
+    if (valid & IIF_FLAGS) != 0:
+        uq_iflags[row] = cast[uint32](_uq_get_u32(&_uq_infobuf[0],
+                                                  DQINFO_OFF_FLAGS))
+    return 0
+
+
+def _uq_getquota(fs: uint64, qtype: uint64, id: uint64, addr: uint64) -> int64:
+    # Q_GETQUOTA: fill *addr (struct if_dqblk) with the (fs,type,id) limits
+    # and live usage. An id with no allocated slot returns an all-zero dqblk
+    # (no explicit quota -> zero limits, exactly what Linux returns -- not an
+    # error). Any uid/gid value is accepted (associative table keyed by id).
+    j: uint64 = 0
+    while j < DQBLK_SIZE:
+        _uq_blkbuf[j] = 0
+        j = j + 1
+    slot: int64 = _uq_find_slot(fs, qtype, id)
+    if slot >= 0:
+        row: uint64 = cast[uint64](slot)
+        _uq_put_u64(&_uq_blkbuf[0], DQBLK_OFF_BHARD, uq_bhard[row])
+        _uq_put_u64(&_uq_blkbuf[0], DQBLK_OFF_BSOFT, uq_bsoft[row])
+        _uq_put_u64(&_uq_blkbuf[0], DQBLK_OFF_CURSP, uq_cursp[row])
+        _uq_put_u64(&_uq_blkbuf[0], DQBLK_OFF_IHARD, uq_ihard[row])
+        _uq_put_u64(&_uq_blkbuf[0], DQBLK_OFF_ISOFT, uq_isoft[row])
+        _uq_put_u64(&_uq_blkbuf[0], DQBLK_OFF_CURIN, uq_curin[row])
+        _uq_put_u64(&_uq_blkbuf[0], DQBLK_OFF_BTIME, uq_btime[row])
+        _uq_put_u64(&_uq_blkbuf[0], DQBLK_OFF_ITIME, uq_itime[row])
+    _uq_put_u32(&_uq_blkbuf[0], DQBLK_OFF_VALID, QIF_ALL)
+    if copy_to_user(addr, cast[uint64](&_uq_blkbuf[0]), DQBLK_SIZE) != 0:
+        return QUOTA_EFAULT
+    return 0
+
+
+def _uq_setquota(fs: uint64, qtype: uint64, id: uint64, addr: uint64) -> int64:
+    # Q_SETQUOTA: read *addr (struct if_dqblk); honour the fields whose
+    # dqb_valid bit is set, leaving the rest untouched. Allocates an associative
+    # slot for `id` (any uid/gid). ENOSPC-shaped EINVAL only if the per-(fs,type)
+    # table is full (more than UQUOTA_NSLOTS distinct ids).
+    if copy_from_user(cast[uint64](&_uq_blkbuf[0]), addr, DQBLK_SIZE) != 0:
+        return QUOTA_EFAULT
+    valid: uint64 = _uq_get_u32(&_uq_blkbuf[0], DQBLK_OFF_VALID)
+    slot: int64 = _uq_alloc_slot(fs, qtype, id)
+    if slot < 0:
+        return QUOTA_EINVAL                          # per-(fs,type) table full
+    row: uint64 = cast[uint64](slot)
+    if (valid & QIF_BLIMITS) != 0:
+        uq_bhard[row] = _uq_get_u64(&_uq_blkbuf[0], DQBLK_OFF_BHARD)
+        uq_bsoft[row] = _uq_get_u64(&_uq_blkbuf[0], DQBLK_OFF_BSOFT)
+    if (valid & QIF_SPACE) != 0:
+        uq_cursp[row] = _uq_get_u64(&_uq_blkbuf[0], DQBLK_OFF_CURSP)
+    if (valid & QIF_ILIMITS) != 0:
+        uq_ihard[row] = _uq_get_u64(&_uq_blkbuf[0], DQBLK_OFF_IHARD)
+        uq_isoft[row] = _uq_get_u64(&_uq_blkbuf[0], DQBLK_OFF_ISOFT)
+    if (valid & QIF_INODES) != 0:
+        uq_curin[row] = _uq_get_u64(&_uq_blkbuf[0], DQBLK_OFF_CURIN)
+    if (valid & QIF_BTIME) != 0:
+        uq_btime[row] = _uq_get_u64(&_uq_blkbuf[0], DQBLK_OFF_BTIME)
+    if (valid & QIF_ITIME) != 0:
+        uq_itime[row] = _uq_get_u64(&_uq_blkbuf[0], DQBLK_OFF_ITIME)
+    return 0
+
+
+# =====================================================================
+# quotactl(cmd, special, id, addr)  --  nr 179
+# =====================================================================
+#
+# long quotactl(unsigned int cmd, const char *special, qid_t id, caddr_t addr)
+#   a0 = cmd, a1 = special*, a2 = id, a3 = addr.
+#
+# `cmd` packs QCMD(subcmd, type). We:
+#   * decode subcmd + type; reject an out-of-range type with EINVAL;
+#   * resolve `special` to a fs index (ENODEV on an unknown device);
+#   * dispatch the subcommand against the REAL per-fs / per-id store;
+#   * for GET/SET-QUOTA require quotas to be ON for the fs (ESRCH otherwise),
+#     exactly as Linux's vfs quotactl returns ESRCH when the quota is off.
+#   * an unknown subcmd -> EINVAL.
+def uquota_quotactl(a0: uint64, a1: uint64, a2: uint64, a3: uint64) -> int64:
+    cmd: uint64 = a0
+    special: uint64 = a1
+    id: uint64 = a2
+    addr: uint64 = a3
+
+    subcmd: uint64 = _uq_subcmd(cmd)
+    qtype: uint64 = _uq_type(cmd)
+
+    # Validate the quota type (low byte of cmd).
+    if qtype >= MAXQUOTAS:
+        return QUOTA_EINVAL
+    # We model only USR/GRP quota state (PRJQUOTA is a valid Linux type but we
+    # do not maintain a project-id store): reject PRJQUOTA as EINVAL rather
+    # than silently aliasing it onto a wrong row.
+    if qtype >= UQUOTA_NTYPES:
+        return QUOTA_EINVAL
+
+    # Resolve the backing filesystem from `special`.
+    fsr: int64 = _uq_resolve_special(special)
+    if fsr < 0:
+        return fsr                                   # ENODEV / EFAULT
+    fs: uint64 = cast[uint64](fsr)
+
+    # --- Q_QUOTAON / Q_QUOTAOFF -------------------------------------
+    if subcmd == Q_QUOTAON:
+        return _uq_quotaon(fs)
+    if subcmd == Q_QUOTAOFF:
+        return _uq_quotaoff(fs)
+
+    # --- Q_SYNC (no-op success; special may be NULL -> fs 0) --------
+    if subcmd == Q_SYNC:
+        return _uq_sync(fs)
+
+    # --- Q_GETFMT ---------------------------------------------------
+    if subcmd == Q_GETFMT:
+        return _uq_getfmt(fs, addr)
+
+    # --- Q_GETINFO / Q_SETINFO --------------------------------------
+    # Grace-time info round-trips even before quotas are on (quota-tools reads
+    # the info to seed defaults), but require an addr.
+    if subcmd == Q_GETINFO:
+        if addr == 0:
+            return QUOTA_EFAULT
+        return _uq_getinfo(fs, qtype, addr)
+    if subcmd == Q_SETINFO:
+        if addr == 0:
+            return QUOTA_EFAULT
+        return _uq_setinfo(fs, qtype, addr)
+
+    # --- Q_GETQUOTA / Q_SETQUOTA ------------------------------------
+    # These operate on enforced quota state: Linux returns ESRCH if quotas are
+    # off for the fs. This makes Q_QUOTAOFF observable: a GETQUOTA after OFF
+    # fails ESRCH.
+    if subcmd == Q_GETQUOTA:
+        if addr == 0:
+            return QUOTA_EFAULT
+        if uq_on[fs] == 0:
+            return QUOTA_ESRCH
+        return _uq_getquota(fs, qtype, id, addr)
+    if subcmd == Q_SETQUOTA:
+        if addr == 0:
+            return QUOTA_EFAULT
+        if uq_on[fs] == 0:
+            return QUOTA_ESRCH
+        return _uq_setquota(fs, qtype, id, addr)
+
+    # Unknown subcommand.
+    return QUOTA_EINVAL
+
+
+# =====================================================================
+# Boot self-test  --  [QUOTA] PASS / FAIL  (boot:37.quota)
+# =====================================================================
+#
+# Exercises quotactl directly against the real per-fs / per-id quota store,
+# driving the SAME handler entry point the nr 179 dispatch arm calls. Boot-
+# context pointers are kernel-mapped and resolve through copy_from_user /
+# copy_to_user the same way mempolicy_selftest's stack buffers do. Steps:
+#
+#   (1) Q_QUOTAON the root fs -> 0.
+#   (2) Q_SETQUOTA a dqblk with known block+inode hard/soft limits and live
+#       usage for uid 1000; Q_GETQUOTA reads it back and asserts every field
+#       round-trips byte-exact.
+#   (3) Q_SETINFO grace times (bgrace/igrace); Q_GETINFO asserts they
+#       round-trip byte-exact.
+#   (4) Q_QUOTAOFF then a Q_GETQUOTA asserts -ESRCH (off-state observable).
+#   (5) a bad cmd (unknown subcmd) asserts -EINVAL; a bad type asserts
+#       -EINVAL; an unknown special asserts -ENODEV.
+#
+# quota_selftest returns 1 on success, 0 on any failure (matching
+# mempolicy_selftest's convention).
+
+# uid the selftest writes a quota for (any uid/gid is valid via the
+# associative slot table). The device name is a function-local string literal
+# in quota_selftest, since Adder only allows string initializers on Array-typed
+# globals, not Ptr globals.
+UQUOTA_TEST_UID: uint64 = 1000
+
+# Known limits the selftest writes and reads back (chosen distinct so a swapped
+# field is caught).
+UQUOTA_T_BHARD: uint64 = 0x0000000000100000   # 1,048,576 blocks
+UQUOTA_T_BSOFT: uint64 = 0x00000000000C0000   #   786,432 blocks
+UQUOTA_T_CURSP: uint64 = 0x0000000012345678   # used bytes
+UQUOTA_T_IHARD: uint64 = 0x0000000000020000   # 131,072 inodes
+UQUOTA_T_ISOFT: uint64 = 0x0000000000018000   #  98,304 inodes
+UQUOTA_T_CURIN: uint64 = 0x000000000000ABCD   # used inodes
+UQUOTA_T_BTIME: uint64 = 0x0000000066AABBCC   # block grace expiry
+UQUOTA_T_ITIME: uint64 = 0x0000000066DDEEFF   # inode grace expiry
+UQUOTA_T_BGRACE: uint64 = 0x000000000001C200  # 115200s grace period
+UQUOTA_T_IGRACE: uint64 = 0x000000000002A300  # 172800s grace period
+
+
+def quota_selftest() -> int32:
+    uquota_init()
+
+    # Canonical root-fs device name (resolves to fs index 0).
+    test_dev: Ptr[uint8] = "/dev/root"
+
+    # Scratch user-shaped buffers (kernel-mapped in boot context). They stage
+    # the if_dqblk / if_dqinfo structs that quotactl copies in/out.
+    blk:  Array[72, uint8]
+    info: Array[24, uint8]
+
+    qcmd: uint64 = 0
+    rc: int64 = 0
+
+    # --- (1) Q_QUOTAON root fs --------------------------------------
+    qcmd = (Q_QUOTAON << QUOTA_SUBCMDSHIFT) | USRQUOTA
+    rc = uquota_quotactl(qcmd, cast[uint64](test_dev), 0, 0)
+    if rc != 0:
+        printk1("[QUOTA] FAIL quotaon rc=%d\n", cast[uint64](rc))
+        return 0
+    printk0("[QUOTA] PASS Q_QUOTAON root fs -> 0\n")
+
+    # --- (2) Q_SETQUOTA then Q_GETQUOTA round-trip ------------------
+    # Pack the known dqblk into the scratch buffer at the real offsets.
+    bi: uint64 = 0
+    while bi < DQBLK_SIZE:
+        blk[bi] = 0
+        bi = bi + 1
+    _uq_put_u64(&blk[0], DQBLK_OFF_BHARD, UQUOTA_T_BHARD)
+    _uq_put_u64(&blk[0], DQBLK_OFF_BSOFT, UQUOTA_T_BSOFT)
+    _uq_put_u64(&blk[0], DQBLK_OFF_CURSP, UQUOTA_T_CURSP)
+    _uq_put_u64(&blk[0], DQBLK_OFF_IHARD, UQUOTA_T_IHARD)
+    _uq_put_u64(&blk[0], DQBLK_OFF_ISOFT, UQUOTA_T_ISOFT)
+    _uq_put_u64(&blk[0], DQBLK_OFF_CURIN, UQUOTA_T_CURIN)
+    _uq_put_u64(&blk[0], DQBLK_OFF_BTIME, UQUOTA_T_BTIME)
+    _uq_put_u64(&blk[0], DQBLK_OFF_ITIME, UQUOTA_T_ITIME)
+    _uq_put_u32(&blk[0], DQBLK_OFF_VALID, QIF_ALL)
+
+    qcmd = (Q_SETQUOTA << QUOTA_SUBCMDSHIFT) | USRQUOTA
+    rc = uquota_quotactl(qcmd, cast[uint64](test_dev),
+                         UQUOTA_TEST_UID, cast[uint64](&blk[0]))
+    if rc != 0:
+        printk1("[QUOTA] FAIL setquota rc=%d\n", cast[uint64](rc))
+        return 0
+
+    # Zero the buffer so a stale read can't masquerade as a round-trip.
+    bi = 0
+    while bi < DQBLK_SIZE:
+        blk[bi] = 0
+        bi = bi + 1
+    qcmd = (Q_GETQUOTA << QUOTA_SUBCMDSHIFT) | USRQUOTA
+    rc = uquota_quotactl(qcmd, cast[uint64](test_dev),
+                         UQUOTA_TEST_UID, cast[uint64](&blk[0]))
+    if rc != 0:
+        printk1("[QUOTA] FAIL getquota rc=%d\n", cast[uint64](rc))
+        return 0
+
+    # Assert every field round-trips byte-exact.
+    if _uq_get_u64(&blk[0], DQBLK_OFF_BHARD) != UQUOTA_T_BHARD:
+        printk2("[QUOTA] FAIL bhard got=%x want=%x\n",
+                _uq_get_u64(&blk[0], DQBLK_OFF_BHARD), UQUOTA_T_BHARD)
+        return 0
+    if _uq_get_u64(&blk[0], DQBLK_OFF_BSOFT) != UQUOTA_T_BSOFT:
+        printk2("[QUOTA] FAIL bsoft got=%x want=%x\n",
+                _uq_get_u64(&blk[0], DQBLK_OFF_BSOFT), UQUOTA_T_BSOFT)
+        return 0
+    if _uq_get_u64(&blk[0], DQBLK_OFF_CURSP) != UQUOTA_T_CURSP:
+        printk2("[QUOTA] FAIL curspace got=%x want=%x\n",
+                _uq_get_u64(&blk[0], DQBLK_OFF_CURSP), UQUOTA_T_CURSP)
+        return 0
+    if _uq_get_u64(&blk[0], DQBLK_OFF_IHARD) != UQUOTA_T_IHARD:
+        printk2("[QUOTA] FAIL ihard got=%x want=%x\n",
+                _uq_get_u64(&blk[0], DQBLK_OFF_IHARD), UQUOTA_T_IHARD)
+        return 0
+    if _uq_get_u64(&blk[0], DQBLK_OFF_ISOFT) != UQUOTA_T_ISOFT:
+        printk2("[QUOTA] FAIL isoft got=%x want=%x\n",
+                _uq_get_u64(&blk[0], DQBLK_OFF_ISOFT), UQUOTA_T_ISOFT)
+        return 0
+    if _uq_get_u64(&blk[0], DQBLK_OFF_CURIN) != UQUOTA_T_CURIN:
+        printk2("[QUOTA] FAIL curinodes got=%x want=%x\n",
+                _uq_get_u64(&blk[0], DQBLK_OFF_CURIN), UQUOTA_T_CURIN)
+        return 0
+    if _uq_get_u64(&blk[0], DQBLK_OFF_BTIME) != UQUOTA_T_BTIME:
+        printk2("[QUOTA] FAIL btime got=%x want=%x\n",
+                _uq_get_u64(&blk[0], DQBLK_OFF_BTIME), UQUOTA_T_BTIME)
+        return 0
+    if _uq_get_u64(&blk[0], DQBLK_OFF_ITIME) != UQUOTA_T_ITIME:
+        printk2("[QUOTA] FAIL itime got=%x want=%x\n",
+                _uq_get_u64(&blk[0], DQBLK_OFF_ITIME), UQUOTA_T_ITIME)
+        return 0
+    printk0("[QUOTA] PASS Q_SETQUOTA/Q_GETQUOTA dqblk round-trips byte-exact\n")
+
+    # --- (3) Q_SETINFO then Q_GETINFO round-trip --------------------
+    ii: uint64 = 0
+    while ii < DQINFO_SIZE:
+        info[ii] = 0
+        ii = ii + 1
+    _uq_put_u64(&info[0], DQINFO_OFF_BGRACE, UQUOTA_T_BGRACE)
+    _uq_put_u64(&info[0], DQINFO_OFF_IGRACE, UQUOTA_T_IGRACE)
+    _uq_put_u32(&info[0], DQINFO_OFF_FLAGS, 0)
+    _uq_put_u32(&info[0], DQINFO_OFF_VALID, IIF_BGRACE | IIF_IGRACE)
+
+    qcmd = (Q_SETINFO << QUOTA_SUBCMDSHIFT) | USRQUOTA
+    rc = uquota_quotactl(qcmd, cast[uint64](test_dev), 0,
+                         cast[uint64](&info[0]))
+    if rc != 0:
+        printk1("[QUOTA] FAIL setinfo rc=%d\n", cast[uint64](rc))
+        return 0
+
+    ii = 0
+    while ii < DQINFO_SIZE:
+        info[ii] = 0
+        ii = ii + 1
+    qcmd = (Q_GETINFO << QUOTA_SUBCMDSHIFT) | USRQUOTA
+    rc = uquota_quotactl(qcmd, cast[uint64](test_dev), 0,
+                         cast[uint64](&info[0]))
+    if rc != 0:
+        printk1("[QUOTA] FAIL getinfo rc=%d\n", cast[uint64](rc))
+        return 0
+    if _uq_get_u64(&info[0], DQINFO_OFF_BGRACE) != UQUOTA_T_BGRACE:
+        printk2("[QUOTA] FAIL bgrace got=%x want=%x\n",
+                _uq_get_u64(&info[0], DQINFO_OFF_BGRACE), UQUOTA_T_BGRACE)
+        return 0
+    if _uq_get_u64(&info[0], DQINFO_OFF_IGRACE) != UQUOTA_T_IGRACE:
+        printk2("[QUOTA] FAIL igrace got=%x want=%x\n",
+                _uq_get_u64(&info[0], DQINFO_OFF_IGRACE), UQUOTA_T_IGRACE)
+        return 0
+    printk0("[QUOTA] PASS Q_SETINFO/Q_GETINFO grace times round-trip\n")
+
+    # --- (4) Q_QUOTAOFF then Q_GETQUOTA -> ESRCH (off observable) ---
+    qcmd = (Q_QUOTAOFF << QUOTA_SUBCMDSHIFT) | USRQUOTA
+    rc = uquota_quotactl(qcmd, cast[uint64](test_dev), 0, 0)
+    if rc != 0:
+        printk1("[QUOTA] FAIL quotaoff rc=%d\n", cast[uint64](rc))
+        return 0
+    qcmd = (Q_GETQUOTA << QUOTA_SUBCMDSHIFT) | USRQUOTA
+    rc = uquota_quotactl(qcmd, cast[uint64](test_dev),
+                         UQUOTA_TEST_UID, cast[uint64](&blk[0]))
+    if rc != QUOTA_ESRCH:
+        printk1("[QUOTA] FAIL getquota-after-off rc=%d (want ESRCH -3)\n",
+                cast[uint64](rc))
+        return 0
+    printk0("[QUOTA] PASS Q_QUOTAOFF makes Q_GETQUOTA observe ESRCH\n")
+
+    # --- (5) honest error paths -------------------------------------
+    # 5a: unknown subcmd -> EINVAL. 0x8000FF is not a real subcommand.
+    qcmd = (cast[uint64](0x8000FF) << QUOTA_SUBCMDSHIFT) | USRQUOTA
+    rc = uquota_quotactl(qcmd, cast[uint64](test_dev), 0, 0)
+    if rc != QUOTA_EINVAL:
+        printk1("[QUOTA] FAIL bad-subcmd rc=%d (want EINVAL -22)\n",
+                cast[uint64](rc))
+        return 0
+    # 5b: bad quota type (>= MAXQUOTAS) -> EINVAL.
+    qcmd = (Q_GETINFO << QUOTA_SUBCMDSHIFT) | 0x09
+    rc = uquota_quotactl(qcmd, cast[uint64](test_dev), 0,
+                         cast[uint64](&info[0]))
+    if rc != QUOTA_EINVAL:
+        printk1("[QUOTA] FAIL bad-type rc=%d (want EINVAL -22)\n",
+                cast[uint64](rc))
+        return 0
+    # 5c: unknown special device -> ENODEV.
+    bad_dev: Ptr[uint8] = "/dev/nonesuch9"
+    qcmd = (Q_QUOTAON << QUOTA_SUBCMDSHIFT) | USRQUOTA
+    rc = uquota_quotactl(qcmd, cast[uint64](bad_dev), 0, 0)
+    if rc != QUOTA_ENODEV:
+        printk1("[QUOTA] FAIL unknown-special rc=%d (want ENODEV -19)\n",
+                cast[uint64](rc))
+        return 0
+    printk0("[QUOTA] PASS bad cmd/type/special rejected EINVAL/ENODEV\n")
+
+    printk0("[quota] PASS\n")
+    return 1
