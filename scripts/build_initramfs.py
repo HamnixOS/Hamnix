@@ -1117,6 +1117,16 @@ if os.environ.get("ENABLE_RUCHILD_TEST"):
 if os.environ.get("ENABLE_RLIMIT_TEST"):
     FILES.append(("/etc/rlimit-test", b"1\n"))
 
+# capget(2)/capset(2) round-trip self-test. scripts/test_caps.sh sets
+# ENABLE_CAPS_TEST=1 to plant /etc/caps-test. init/main.ad detects the marker
+# and calls caps_selftest() (linux_abi/u_caps.ad): it version-probes capget,
+# reads the seeded full cap set, DROPs CAP_NET_RAW via capset and proves the
+# real per-task cap store persisted it, then asserts re-adding a permitted bit
+# is rejected with EPERM, and emits the [CAPS] PASS banner. Default boots omit
+# the marker.
+if os.environ.get("ENABLE_CAPS_TEST"):
+    FILES.append(("/etc/caps-test", b"1\n"))
+
 # getpriority(2)/setpriority(2) round-trip self-test. scripts/test_priosys.sh
 # sets ENABLE_PRIOSYS_TEST=1 to plant /etc/priosys-test. init/main.ad detects
 # the marker and calls priority_syscall_selftest() (linux_abi/u_syscalls.ad):

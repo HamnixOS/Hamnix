@@ -1,0 +1,446 @@
+# linux_abi/u_caps.ad -- the Linux POSIX capabilities family (capget/capset).
+#
+# Real Debian userland reaches for the POSIX.1e capability API constantly:
+#
+#   * capget(header, data)   nr 125  -> read a task's effective/permitted/
+#                                       inheritable cap sets (or version-probe)
+#   * capset(header, data)   nr 126  -> set the calling task's cap sets
+#
+# libcap (`capsh --print`, `getcap`/`setcap`'s runtime checks), systemd's
+# CapabilityBoundingSet plumbing, ping's cap_net_raw drop-after-bind, dpkg/apt
+# privilege checks — they all round-trip these two syscalls. Until now both
+# fell through to the ENOSYS default, so any such tool saw a bogus failure.
+#
+# ARCHITECTURE NOTE -- caps are a LINUX-ABI concept ONLY. Hamnix's native
+# security model is Plan 9 per-process namespaces + file-server boundary
+# enforcement, NOT POSIX capabilities. So this file is pure Linux-ABI
+# furniture: it models a per-task capability set for tasks running under the
+# Linux namespace and never touches any native Plan 9 path. The cap sets here
+# do not gate any kernel operation; they exist so libcap's get/set round-trip
+# is faithful (the bar real Debian tooling needs).
+#
+# Layer note: a confined Layer-2 leaf. It calls only current_idx_get() (the
+# task-slot key) + the user-pointer-safe copy helpers (copy_from_user /
+# copy_to_user). It never touches 9P / Chan / Layer-1 code. u_syscalls.ad
+# imports US (the dispatch arms forward here), the same shape as u_pidfd.ad.
+
+from kernel.sched.core import (
+    current_idx_get,
+)
+from mm.uaccess import (
+    copy_from_user, copy_to_user,
+)
+from kernel.printk.printk import (
+    printk0, printk1,
+)
+
+
+# =====================================================================
+# Linux capability ABI constants
+# =====================================================================
+#
+# struct __user_cap_header_struct { __u32 version; int pid; }   (8 bytes)
+# struct __user_cap_data_struct   { __u32 effective;
+#                                    __u32 permitted;
+#                                    __u32 inheritable; }        (12 bytes each)
+#
+# _LINUX_CAPABILITY_VERSION_3 is the current preferred version; libcap probes
+# for it by calling capget with data==NULL and reading the version the kernel
+# writes back. v1 carries ONE __user_cap_data_struct (caps 0..31); v2/v3 carry
+# TWO (element [0] = caps 0..31, element [1] = caps 32..63).
+CAP_VERSION_1: uint32 = 0x19980330
+CAP_VERSION_2: uint32 = 0x20071026
+CAP_VERSION_3: uint32 = 0x20080522
+
+CAP_HEADER_SZ: uint64 = 8           # { __u32 version; int pid; }
+CAP_DATA_SZ:   uint64 = 12          # { __u32 eff; __u32 perm; __u32 inher; }
+
+# Linux negative-errno convention (subset we return).
+CAPS_EPERM:   int64 = -1
+CAPS_EFAULT:  int64 = -14
+CAPS_EINVAL:  int64 = -22
+
+
+# =====================================================================
+# per-task capability store
+# =====================================================================
+#
+# Three 64-bit cap sets per task (effective / permitted / inheritable), keyed
+# by task slot exactly the way the rlimit store (kernel/sched/core.ad
+# g_rlim_cur/g_rlim_max) is keyed. NTASKS is 16; a flat 16-entry uint64 array
+# per set is trivially BSS-resident. A parallel "seeded" bitmap tracks which
+# slots have been initialised so a never-before-seen task lazily defaults to
+# the full (root-like) cap set on first access -- this keeps Debian tools happy
+# without needing a fork/clone copy hook (a freshly forked child simply
+# re-defaults to full caps on its first capget, matching a root context).
+UCAPS_NTASKS: uint64 = 16
+
+ucaps_effective:   Array[16, uint64]
+ucaps_permitted:   Array[16, uint64]
+ucaps_inheritable: Array[16, uint64]
+ucaps_seeded:      Array[16, uint8]      # 0 = never touched, 1 = initialised
+
+# The full 64-bit cap set (all of caps 0..63 set). Real Linux caps top out
+# around bit 40, but modelling all 64 bits is harmless and keeps the mask
+# arithmetic simple.
+UCAPS_FULL: uint64 = 0xFFFFFFFFFFFFFFFF
+
+
+def ucaps_init():
+    # Boot-time reset: every slot un-seeded, all sets cleared. Slots default
+    # lazily to full caps on first touch (ucaps_ensure_seeded).
+    i: uint64 = 0
+    while i < UCAPS_NTASKS:
+        ucaps_effective[i]   = 0
+        ucaps_permitted[i]   = 0
+        ucaps_inheritable[i] = 0
+        ucaps_seeded[i]      = 0
+        i = i + 1
+
+
+def ucaps_ensure_seeded(slot: uint64):
+    # Lazily default an unseen task to the full (root-like) cap set the first
+    # time it is observed. Mirrors the "init/root context gets the full set"
+    # common case; a child that forks from such a context re-defaults to full
+    # here, which is the correct root-like answer for the Debian tools that
+    # consult caps. Out-of-range slots are ignored.
+    if slot >= UCAPS_NTASKS:
+        return
+    if ucaps_seeded[slot] != 0:
+        return
+    ucaps_effective[slot]   = UCAPS_FULL
+    ucaps_permitted[slot]   = UCAPS_FULL
+    ucaps_inheritable[slot] = 0          # Linux default: empty inheritable set
+    ucaps_seeded[slot]      = 1
+
+
+def ucaps_get_effective(slot: uint64) -> uint64:
+    if slot >= UCAPS_NTASKS:
+        return 0
+    ucaps_ensure_seeded(slot)
+    return ucaps_effective[slot]
+
+
+def ucaps_get_permitted(slot: uint64) -> uint64:
+    if slot >= UCAPS_NTASKS:
+        return 0
+    ucaps_ensure_seeded(slot)
+    return ucaps_permitted[slot]
+
+
+def ucaps_get_inheritable(slot: uint64) -> uint64:
+    if slot >= UCAPS_NTASKS:
+        return 0
+    ucaps_ensure_seeded(slot)
+    return ucaps_inheritable[slot]
+
+
+def ucaps_set(slot: uint64, eff: uint64, perm: uint64, inher: uint64):
+    if slot >= UCAPS_NTASKS:
+        return
+    ucaps_effective[slot]   = eff
+    ucaps_permitted[slot]   = perm
+    ucaps_inheritable[slot] = inher
+    ucaps_seeded[slot]      = 1
+
+
+# =====================================================================
+# header version validation
+# =====================================================================
+#
+# Returns 1 for a version we honour (v1/v2/v3), 0 otherwise.
+def _ucaps_version_ok(ver: uint32) -> int32:
+    if ver == CAP_VERSION_1:
+        return 1
+    if ver == CAP_VERSION_2:
+        return 1
+    if ver == CAP_VERSION_3:
+        return 1
+    return 0
+
+
+# How many __user_cap_data_struct elements a header version carries: 1 for v1,
+# 2 for v2/v3.
+def _ucaps_ndata(ver: uint32) -> uint64:
+    if ver == CAP_VERSION_1:
+        return 1
+    return 2
+
+
+# =====================================================================
+# capget(header, data)  --  nr 125
+# =====================================================================
+#
+# int capget(cap_user_header_t header, cap_user_data_t data)
+#   a0 = header pointer, a1 = data pointer.
+#
+#   * header == NULL              -> EFAULT (the header is always required).
+#   * data == NULL                -> the version-PROBE form: write the kernel's
+#                                    preferred version (v3) back into
+#                                    header.version and return 0. This is how
+#                                    libcap negotiates the ABI.
+#   * unrecognised header.version -> rewrite header.version to the preferred
+#                                    version and return EINVAL (matches Linux).
+#   * otherwise                   -> copy the target task's three cap sets out
+#                                    into the data array (two 32-bit halves per
+#                                    64-bit set: [0]=low 32, [1]=high 32).
+#
+# pid==0 (or the caller's own slot) targets the current task. We only model the
+# current-task case for the data read; a non-self pid is accepted but reports
+# the current task's caps (sufficient for the libcap round-trip — capsh/ping
+# query self). Out-of-our-knowledge tasks lazily default to full caps.
+def ucaps_capget(a0: uint64, a1: uint64) -> int64:
+    if a0 == 0:
+        return CAPS_EFAULT
+    # Read the 8-byte header { __u32 version; int pid; }.
+    hdr: Array[8, uint8]
+    if copy_from_user(cast[uint64](&hdr[0]), a0, CAP_HEADER_SZ) != 0:
+        return CAPS_EFAULT
+    ver: uint32 = cast[Ptr[uint32]](cast[uint64](&hdr[0]))[0]
+
+    # Version-probe / bad-version handling: if the version is not one we
+    # honour, rewrite the header to our preferred version. For the NULL-data
+    # probe form this is the negotiation path and returns 0; for a bad version
+    # with non-NULL data Linux returns EINVAL after the rewrite.
+    if _ucaps_version_ok(ver) == 0:
+        cast[Ptr[uint32]](cast[uint64](&hdr[0]))[0] = CAP_VERSION_3
+        if copy_to_user(a0, cast[uint64](&hdr[0]), CAP_HEADER_SZ) != 0:
+            return CAPS_EFAULT
+        if a1 == 0:
+            return 0
+        return CAPS_EINVAL
+
+    # data == NULL: pure version probe. Echo the (valid) version back so libcap
+    # sees a stable, accepted version and return 0.
+    if a1 == 0:
+        cast[Ptr[uint32]](cast[uint64](&hdr[0]))[0] = ver
+        if copy_to_user(a0, cast[uint64](&hdr[0]), CAP_HEADER_SZ) != 0:
+            return CAPS_EFAULT
+        return 0
+
+    # Resolve the target slot. The header pid field (offset 4) selects the
+    # task; 0 means the current task. We model self (current) caps.
+    slot: uint64 = current_idx_get()
+
+    eff:   uint64 = ucaps_get_effective(slot)
+    perm:  uint64 = ucaps_get_permitted(slot)
+    inher: uint64 = ucaps_get_inheritable(slot)
+
+    ndata: uint64 = _ucaps_ndata(ver)
+
+    # Assemble the data array in a kernel buffer, then copy it out in one shot.
+    # Each __user_cap_data_struct is { eff_lo, perm_lo, inher_lo } for element
+    # [0] and { eff_hi, perm_hi, inher_hi } for element [1].
+    out: Array[24, uint8]        # max 2 * 12 bytes
+    o: Ptr[uint32] = cast[Ptr[uint32]](cast[uint64](&out[0]))
+    # element [0] -- caps 0..31 (low 32 bits)
+    o[0] = cast[uint32](eff   & 0xFFFFFFFF)
+    o[1] = cast[uint32](perm  & 0xFFFFFFFF)
+    o[2] = cast[uint32](inher & 0xFFFFFFFF)
+    if ndata == 2:
+        # element [1] -- caps 32..63 (high 32 bits)
+        o[3] = cast[uint32]((eff   >> 32) & 0xFFFFFFFF)
+        o[4] = cast[uint32]((perm  >> 32) & 0xFFFFFFFF)
+        o[5] = cast[uint32]((inher >> 32) & 0xFFFFFFFF)
+
+    if copy_to_user(a1, cast[uint64](&out[0]), ndata * CAP_DATA_SZ) != 0:
+        return CAPS_EFAULT
+    return 0
+
+
+# =====================================================================
+# capset(header, data)  --  nr 126
+# =====================================================================
+#
+# int capset(cap_user_header_t header, cap_user_data_t data)
+#   a0 = header pointer, a1 = data pointer.
+#
+#   * header == NULL / data == NULL -> EFAULT (both required for a set).
+#   * unrecognised header.version   -> rewrite header to preferred + EINVAL.
+#   * header.pid must be 0 or the caller's own tid; Linux forbids setting
+#     another process's caps via this syscall -> EPERM otherwise.
+#   * standard rule enforcement (common case, no CAP_SETPCAP modelled):
+#       - new permitted MUST be a subset of old permitted (a process can only
+#         DROP permitted caps; adding a bit not already permitted -> EPERM).
+#       - new effective MUST be a subset of new permitted (-EPERM otherwise).
+#       - inheritable is modelled leniently (any value accepted).
+def ucaps_capset(a0: uint64, a1: uint64) -> int64:
+    if a0 == 0 or a1 == 0:
+        return CAPS_EFAULT
+    # Read the 8-byte header.
+    hdr: Array[8, uint8]
+    if copy_from_user(cast[uint64](&hdr[0]), a0, CAP_HEADER_SZ) != 0:
+        return CAPS_EFAULT
+    ver: uint32 = cast[Ptr[uint32]](cast[uint64](&hdr[0]))[0]
+    pid: int32  = cast[Ptr[int32]](cast[uint64](&hdr[0]) + 4)[0]
+
+    if _ucaps_version_ok(ver) == 0:
+        cast[Ptr[uint32]](cast[uint64](&hdr[0]))[0] = CAP_VERSION_3
+        if copy_to_user(a0, cast[uint64](&hdr[0]), CAP_HEADER_SZ) != 0:
+            return CAPS_EFAULT
+        return CAPS_EINVAL
+
+    slot: uint64 = current_idx_get()
+
+    # capset may only target the calling thread: pid 0 or the caller's own tid.
+    # current_idx_get is the slot, not the Linux tid, but pid 0 is the
+    # overwhelmingly common libcap call; a non-zero pid that does not match the
+    # caller is rejected with EPERM. We treat pid==(our own pid) as allowed by
+    # forwarding through; the conservative model rejects any other non-zero pid.
+    if pid != 0:
+        # Reject setting another process's caps. (We cannot cheaply map slot ->
+        # Linux tid here without a core import, so the strict-but-safe rule is:
+        # only pid==0 is the self form. A real tid-match would also be allowed
+        # but libcap always passes 0 for self.)
+        return CAPS_EPERM
+
+    ndata: uint64 = _ucaps_ndata(ver)
+
+    # Read the data array { eff, perm, inher } * ndata.
+    inb: Array[24, uint8]
+    if copy_from_user(cast[uint64](&inb[0]), a1, ndata * CAP_DATA_SZ) != 0:
+        return CAPS_EFAULT
+    di: Ptr[uint32] = cast[Ptr[uint32]](cast[uint64](&inb[0]))
+
+    new_eff:   uint64 = cast[uint64](di[0])
+    new_perm:  uint64 = cast[uint64](di[1])
+    new_inher: uint64 = cast[uint64](di[2])
+    if ndata == 2:
+        new_eff   = new_eff   | (cast[uint64](di[3]) << 32)
+        new_perm  = new_perm  | (cast[uint64](di[4]) << 32)
+        new_inher = new_inher | (cast[uint64](di[5]) << 32)
+
+    # Rule enforcement against the task's CURRENT (old) sets.
+    old_perm: uint64 = ucaps_get_permitted(slot)
+
+    # new permitted must be a subset of old permitted: every bit set in
+    # new_perm must already be set in old_perm. Equivalent: (new & ~old) == 0.
+    if (new_perm & ~old_perm) != 0:
+        return CAPS_EPERM
+
+    # new effective must be a subset of new permitted.
+    if (new_eff & ~new_perm) != 0:
+        return CAPS_EPERM
+
+    # inheritable: lenient (accept as given).
+    ucaps_set(slot, new_eff, new_perm, new_inher)
+    return 0
+
+
+# =====================================================================
+# Boot self-test  --  [CAPS] PASS / FAIL  (boot:37.caps)
+# =====================================================================
+#
+# Exercises capget/capset directly against the real per-task cap store, driving
+# the SAME handler entry points the nr 125/126 dispatch arms call. Boot-context
+# pointers are kernel-mapped and resolve through copy_from_user/copy_to_user
+# the same way rlimit_selftest's stack buffers do, so no userland binary is
+# needed. Steps (mirroring the required C-fixture assertions):
+#
+#   (1) version-probe capget (data == NULL)  -> header.version becomes v3, rc 0
+#   (2) capget(self) reports the seeded full effective/permitted sets
+#   (3) capset(self) DROPPING one permitted cap, then capget asserts the drop
+#   (4) capset(self) trying to ADD a permitted bit back -> EPERM
+#
+# caps_selftest is the entry init/main.ad's boot:37.caps gate calls. It returns
+# 1 on success, 0 on any failure (matching rlimit_selftest's convention).
+
+# A single Linux capability bit we drop/re-add in the test. CAP_NET_RAW is 13 --
+# the cap `ping` keeps to open raw sockets, a natural real-world example.
+CAP_NET_RAW_BIT: uint64 = 13
+
+
+def caps_selftest() -> int32:
+    ucaps_init()
+    slot: uint64 = current_idx_get()
+
+    # --- (1) version-probe capget (data == NULL) ---------------------
+    hdr: Array[8, uint8]
+    # Plant a deliberately bogus version so the probe path must rewrite it.
+    cast[Ptr[uint32]](cast[uint64](&hdr[0]))[0] = 0xDEADBEEF
+    cast[Ptr[int32]](cast[uint64](&hdr[0]) + 4)[0] = 0
+    rc: int64 = ucaps_capget(cast[uint64](&hdr[0]), 0)
+    if rc != 0:
+        printk1("[CAPS] FAIL version-probe rc=%d\n", cast[uint64](rc))
+        return 0
+    probed_ver: uint32 = cast[Ptr[uint32]](cast[uint64](&hdr[0]))[0]
+    if probed_ver != CAP_VERSION_3:
+        printk1("[CAPS] FAIL probe ver=%x != 0x20080522\n",
+                cast[uint64](probed_ver))
+        return 0
+
+    # --- (2) capget(self): seeded full effective/permitted -----------
+    # Use a valid v3 header now.
+    cast[Ptr[uint32]](cast[uint64](&hdr[0]))[0] = CAP_VERSION_3
+    cast[Ptr[int32]](cast[uint64](&hdr[0]) + 4)[0] = 0
+    data: Array[24, uint8]
+    rc = ucaps_capget(cast[uint64](&hdr[0]), cast[uint64](&data[0]))
+    if rc != 0:
+        printk1("[CAPS] FAIL capget(self) rc=%d\n", cast[uint64](rc))
+        return 0
+    dp: Ptr[uint32] = cast[Ptr[uint32]](cast[uint64](&data[0]))
+    eff0: uint64  = cast[uint64](dp[0]) | (cast[uint64](dp[3]) << 32)
+    perm0: uint64 = cast[uint64](dp[1]) | (cast[uint64](dp[4]) << 32)
+    if eff0 != UCAPS_FULL or perm0 != UCAPS_FULL:
+        printk1("[CAPS] FAIL default not full eff=%x\n", eff0)
+        printk1("[CAPS]      perm=%x\n", perm0)
+        return 0
+    printk0("[CAPS] PASS default cap set is full (root-like)\n")
+
+    # --- (3) capset(self) dropping CAP_NET_RAW from permitted+effective
+    drop_mask: uint64 = ~(cast[uint64](1) << CAP_NET_RAW_BIT)
+    new_perm: uint64 = UCAPS_FULL & drop_mask
+    new_eff:  uint64 = UCAPS_FULL & drop_mask
+    # Build the v3 data array (2 elements) to set.
+    setd: Array[24, uint8]
+    sp: Ptr[uint32] = cast[Ptr[uint32]](cast[uint64](&setd[0]))
+    sp[0] = cast[uint32](new_eff   & 0xFFFFFFFF)
+    sp[1] = cast[uint32](new_perm  & 0xFFFFFFFF)
+    sp[2] = 0                                          # inheritable lo
+    sp[3] = cast[uint32]((new_eff  >> 32) & 0xFFFFFFFF)
+    sp[4] = cast[uint32]((new_perm >> 32) & 0xFFFFFFFF)
+    sp[5] = 0                                          # inheritable hi
+    rc = ucaps_capset(cast[uint64](&hdr[0]), cast[uint64](&setd[0]))
+    if rc != 0:
+        printk1("[CAPS] FAIL capset drop rc=%d\n", cast[uint64](rc))
+        return 0
+    # capget again and assert CAP_NET_RAW is gone from permitted+effective.
+    rc = ucaps_capget(cast[uint64](&hdr[0]), cast[uint64](&data[0]))
+    if rc != 0:
+        printk1("[CAPS] FAIL capget-after-drop rc=%d\n", cast[uint64](rc))
+        return 0
+    eff1: uint64  = cast[uint64](dp[0]) | (cast[uint64](dp[3]) << 32)
+    perm1: uint64 = cast[uint64](dp[1]) | (cast[uint64](dp[4]) << 32)
+    net_raw_bit: uint64 = cast[uint64](1) << CAP_NET_RAW_BIT
+    if (perm1 & net_raw_bit) != 0:
+        printk0("[CAPS] FAIL CAP_NET_RAW still in permitted after drop\n")
+        return 0
+    if (eff1 & net_raw_bit) != 0:
+        printk0("[CAPS] FAIL CAP_NET_RAW still in effective after drop\n")
+        return 0
+    printk0("[CAPS] PASS dropped CAP_NET_RAW persisted in the store\n")
+
+    # --- (4) capset trying to ADD a permitted bit back -> EPERM ------
+    # Now permitted lacks CAP_NET_RAW; ask to set it back -> must be EPERM
+    # (cannot raise permitted above the current set).
+    addd: Array[24, uint8]
+    ap: Ptr[uint32] = cast[Ptr[uint32]](cast[uint64](&addd[0]))
+    ap[0] = cast[uint32](UCAPS_FULL & 0xFFFFFFFF)      # eff lo (full again)
+    ap[1] = cast[uint32](UCAPS_FULL & 0xFFFFFFFF)      # perm lo (full again)
+    ap[2] = 0
+    ap[3] = cast[uint32]((UCAPS_FULL >> 32) & 0xFFFFFFFF)
+    ap[4] = cast[uint32]((UCAPS_FULL >> 32) & 0xFFFFFFFF)
+    ap[5] = 0
+    rc = ucaps_capset(cast[uint64](&hdr[0]), cast[uint64](&addd[0]))
+    if rc != CAPS_EPERM:
+        printk1("[CAPS] FAIL add-cap rc=%d (expected EPERM -1)\n",
+                cast[uint64](rc))
+        return 0
+    printk0("[CAPS] PASS adding a permitted bit rejected with EPERM\n")
+
+    # Re-seed the slot so the boot task is left in a clean (full-cap) state.
+    ucaps_seeded[slot] = 0
+    ucaps_ensure_seeded(slot)
+
+    printk0("[CAPS] PASS\n")
+    return 1
