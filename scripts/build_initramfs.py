@@ -748,6 +748,17 @@ if os.environ.get("ENABLE_DISKSTATS_TEST") == "1":
 if os.environ.get("ENABLE_BLK_SCHED_TEST") == "1":
     FILES.append(("/etc/blk-sched-test", b"1\n"))
 
+# virtio-blk FLUSH / DISCARD / WRITE_ZEROES self-test.
+# scripts/test_virtio_blk_dwz.sh sets ENABLE_VBLK_DWZ_TEST=1 to plant
+# /etc/virtio-blk-dwz-test. init/main.ad at boot:37.vblkdwz detects the
+# marker and calls virtio_blk_dwz_selftest() (drivers/block/virtio_blk.ad):
+# it boots with a virtio-blk drive advertising discard/flush, then issues a
+# REAL FLUSH (type 4), a REAL WRITE_ZEROES (type 13) + readback proving the
+# region is zero, and a REAL DISCARD (type 11) — each with device status-byte
+# checking. Default boots omit the marker so it never fires.
+if os.environ.get("ENABLE_VBLK_DWZ_TEST") == "1":
+    FILES.append(("/etc/virtio-blk-dwz-test", b"1\n"))
+
 # Phase G: Plan 9 note-group WIDE delivery self-test. scripts/test_notepg.sh
 # sets ENABLE_NOTEPG_TEST=1 to plant /etc/notepg-test. init/main.ad at
 # boot:37.npg detects the marker and calls notegroup_selftest()
