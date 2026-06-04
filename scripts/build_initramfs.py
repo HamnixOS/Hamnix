@@ -2200,6 +2200,20 @@ if os.environ.get("ENABLE_VXLAN_TEST") == "1":
 if os.environ.get("ENABLE_IGMP_TEST") == "1":
     FILES.append(("/etc/igmp-test", b"1\n"))
 
+# Native learning Ethernet bridge (the brX/brctl software bridge) self-test.
+# scripts/test_bridge.sh sets ENABLE_BRIDGE_TEST=1 to plant /etc/bridge-test;
+# init/main.ad's boot:37.bridge gate then runs bridge_selftest()
+# (drivers/net/bridge.ad), a pure in-memory test that joins three fake capture
+# ports into one bridge and drives the REAL bridge_rx() learn+forward path:
+# an unknown-unicast FLOODS to all non-ingress ports; a learned source yields
+# a unicast delivered ONLY to the learned port (never flooded/hairpinned); a
+# broadcast dst floods to all non-ingress ports; and the MAC-learning FDB
+# returns the correct ingress port per learned source. Prints "[bridge] PASS"
+# / "[bridge] FAIL". Default boots ship no marker so it is a no-op everywhere
+# else.
+if os.environ.get("ENABLE_BRIDGE_TEST") == "1":
+    FILES.append(("/etc/bridge-test", b"1\n"))
+
 # Linux-style overlayfs (union filesystem) self-test. scripts/test_overlayfs.sh
 # sets ENABLE_OVERLAYFS_TEST=1 to plant /etc/overlayfs-test; init/main.ad's
 # boot:37.ovl gate then runs overlayfs_selftest() (fs/overlayfs.ad), which

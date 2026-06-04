@@ -1,0 +1,524 @@
+# drivers/net/bridge.ad
+#
+# A native learning Ethernet bridge — the software equivalent of Linux's
+# brX netdev / brctl (a learning L2 switch). It joins N ports into one
+# broadcast domain and forwards frames between them based on a learned
+# MAC forwarding database (FDB):
+#
+#   * On every received frame the bridge LEARNS the (source MAC -> ingress
+#     port) association into the FDB.
+#   * It then looks up the frame's DESTINATION MAC in the FDB:
+#       - KNOWN and on a different port  -> forward ONLY to that port
+#         (unicast — the whole point of a learning switch vs. a dumb hub).
+#       - UNKNOWN, or broadcast/multicast -> FLOOD to every port except the
+#         ingress port.
+#   * A frame is NEVER sent back out the port it arrived on.
+#
+# This is purely an L2 forwarding feature inside the native stack — there
+# is no socket API involved. Each bridge port carries a TX hook: an
+# (port_index, frame, len) callback the bridge invokes to push a frame out
+# of that port. The self-test installs fake capture ports to PROVE the
+# learn+flood+forward data path without any NIC.
+
+from kernel.printk.printk import printk0, printk1, printk2, printk_set_level
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
+from drivers.net.eth import ETH_HDR_LEN
+
+
+# --- Sizing constants --------------------------------------------------
+
+# Maximum number of ports a single bridge can join (Linux's BR_MAX_PORTS
+# is 1024; 8 is plenty for the native use case and the self-test).
+BRIDGE_MAX_PORTS: uint64 = 8
+
+# Fixed-size MAC forwarding database. A real bridge ages entries out; this
+# table uses round-robin replacement once full, which is sufficient to keep
+# the hot set resident and never overflows.
+BRIDGE_FDB_MAX: uint64 = 64
+
+# Ethernet address length.
+BRIDGE_MAC_LEN: uint64 = 6
+
+# The largest L2 frame we forward (standard Ethernet MTU 1500 + 14-byte
+# header). Every frame/capture scratch buffer is sized to this so an
+# oversized copy can never silently overflow into the next BSS global.
+BRIDGE_MAX_FRAME: uint64 = 1514
+
+
+# --- The bridge structure ----------------------------------------------
+#
+# A port's TX hook receives (port_index, frame_ptr, frame_len). The bridge
+# itself is identity-less w.r.t. the hook; the hook closes over whatever
+# device state it needs via the port index.
+#
+# We keep the whole bridge in module-scope globals (the runtime has no heap
+# allocator wired for driver structs here, and a single software bridge is
+# the common case). bridge_create() resets it; the API still threads a
+# Bridge* so the shape matches a multi-instance design.
+
+class Bridge:
+    nports:  uint64                       # number of joined ports
+    # Per-port TX hook function pointers. Signature:
+    #   def hook(port: uint64, frame: Ptr[uint8], length: uint64)
+    tx_hooks: Array[8, Fn[None, uint64, Ptr[uint8], uint64]]   # BRIDGE_MAX_PORTS
+    # FDB parallel arrays (entry i is valid iff fdb_inuse[i] == 1).
+    fdb_inuse: Array[64, uint8]          # BRIDGE_FDB_MAX
+    fdb_mac:   Array[384, uint8]         # BRIDGE_FDB_MAX * 6 (flattened)
+    fdb_port:  Array[64, uint64]         # ingress port the MAC was seen on
+    fdb_next:  uint64                     # round-robin replacement cursor
+    # Accounting (mirrors the per-bridge stats a real br netdev keeps).
+    n_learned: uint64
+    n_flooded: uint64
+    n_unicast: uint64
+
+
+# A single static bridge instance. bridge_create() returns its address.
+g_bridge: Bridge
+
+
+# --- printk helpers (force EMERG level so banners always surface) ------
+
+def _br_emerg0(s: Ptr[char]):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0(s)
+
+
+def _br_emerg1(s: Ptr[char], a: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk1(s, a)
+
+
+def _br_emerg2(s: Ptr[char], a: uint64, b: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk2(s, a, b)
+
+
+# --- Bridge lifecycle --------------------------------------------------
+
+def bridge_create() -> Ptr[Bridge]:
+    # Reset the static bridge to an empty state and hand back its address.
+    br: Ptr[Bridge] = &g_bridge
+    br[0].nports = 0
+    br[0].fdb_next = 0
+    br[0].n_learned = 0
+    br[0].n_flooded = 0
+    br[0].n_unicast = 0
+    i: uint64 = 0
+    while i < BRIDGE_MAX_PORTS:
+        br[0].tx_hooks[i] = cast[Fn[None, uint64, Ptr[uint8], uint64]](0)
+        i = i + 1
+    j: uint64 = 0
+    while j < BRIDGE_FDB_MAX:
+        br[0].fdb_inuse[j] = 0
+        br[0].fdb_port[j] = 0
+        j = j + 1
+    k: uint64 = 0
+    while k < (BRIDGE_FDB_MAX * BRIDGE_MAC_LEN):
+        br[0].fdb_mac[k] = 0
+        k = k + 1
+    return br
+
+
+def bridge_add_port(br: Ptr[Bridge],
+                    tx_hook: Fn[None, uint64, Ptr[uint8], uint64]) -> int32:
+    # Join a new port whose egress is driven by tx_hook. Returns the new
+    # port index (>=0), or -1 if the bridge is full.
+    if br[0].nports >= BRIDGE_MAX_PORTS:
+        return cast[int32](0 - 1)
+    p: uint64 = br[0].nports
+    br[0].tx_hooks[p] = tx_hook
+    br[0].nports = p + 1
+    return cast[int32](p)
+
+
+# --- MAC helpers -------------------------------------------------------
+
+def _br_mac_eq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    # 1 if the two 6-byte MACs are equal, else 0.
+    i: uint64 = 0
+    while i < BRIDGE_MAC_LEN:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def _br_is_broadcast(mac: Ptr[uint8]) -> int32:
+    # 1 if the MAC is ff:ff:ff:ff:ff:ff (L2 broadcast).
+    i: uint64 = 0
+    while i < BRIDGE_MAC_LEN:
+        if mac[i] != 0xff:
+            return 0
+        i = i + 1
+    return 1
+
+
+def _br_is_multicast(mac: Ptr[uint8]) -> int32:
+    # 1 if the I/G (group) bit of the first octet is set. Broadcast is a
+    # special case of multicast; both must flood.
+    if (cast[uint64](mac[0]) & 0x01) == 1:
+        return 1
+    return 0
+
+
+# --- FDB (forwarding database) -----------------------------------------
+
+def _br_fdb_mac_ptr(br: Ptr[Bridge], slot: uint64) -> Ptr[uint8]:
+    # Address of the 6-byte MAC for FDB entry `slot` in the flat array.
+    return cast[Ptr[uint8]](&br[0].fdb_mac[slot * BRIDGE_MAC_LEN])
+
+
+def bridge_fdb_lookup(br: Ptr[Bridge], mac: Ptr[uint8]) -> int64:
+    # Return the port a MAC was learned on, or -1 if unknown.
+    i: uint64 = 0
+    while i < BRIDGE_FDB_MAX:
+        if br[0].fdb_inuse[i] == 1:
+            entry: Ptr[uint8] = _br_fdb_mac_ptr(br, i)
+            if _br_mac_eq(entry, mac) == 1:
+                return cast[int64](br[0].fdb_port[i])
+        i = i + 1
+    return cast[int64](0 - 1)
+
+
+def bridge_fdb_learn(br: Ptr[Bridge], mac: Ptr[uint8], port: uint64):
+    # Insert or refresh (mac -> port). Never learns a broadcast/multicast
+    # source (such a source MAC would be malformed; real bridges ignore it).
+    if _br_is_multicast(mac) == 1:
+        return
+    # If the MAC is already present, just update its port (handles a station
+    # that moved to a different port) and we're done.
+    i: uint64 = 0
+    while i < BRIDGE_FDB_MAX:
+        if br[0].fdb_inuse[i] == 1:
+            entry: Ptr[uint8] = _br_fdb_mac_ptr(br, i)
+            if _br_mac_eq(entry, mac) == 1:
+                br[0].fdb_port[i] = port
+                return
+        i = i + 1
+    # Not present: find a free slot, else round-robin replace.
+    slot: uint64 = BRIDGE_FDB_MAX
+    j: uint64 = 0
+    while j < BRIDGE_FDB_MAX:
+        if br[0].fdb_inuse[j] == 0:
+            slot = j
+            j = BRIDGE_FDB_MAX
+        else:
+            j = j + 1
+    if slot == BRIDGE_FDB_MAX:
+        # Table full — evict the round-robin victim.
+        slot = br[0].fdb_next
+        br[0].fdb_next = (br[0].fdb_next + 1) % BRIDGE_FDB_MAX
+    dst: Ptr[uint8] = _br_fdb_mac_ptr(br, slot)
+    k: uint64 = 0
+    while k < BRIDGE_MAC_LEN:
+        dst[k] = mac[k]
+        k = k + 1
+    br[0].fdb_port[slot] = port
+    br[0].fdb_inuse[slot] = 1
+    br[0].n_learned = br[0].n_learned + 1
+
+
+# --- Egress ------------------------------------------------------------
+
+def _br_tx(br: Ptr[Bridge], port: uint64, frame: Ptr[uint8], length: uint64):
+    # Invoke a port's TX hook. No-op if unset.
+    hook: Fn[None, uint64, Ptr[uint8], uint64] = br[0].tx_hooks[port]
+    if hook == cast[Fn[None, uint64, Ptr[uint8], uint64]](0):
+        return
+    hook(port, frame, length)
+
+
+def _br_flood(br: Ptr[Bridge], ingress: uint64, frame: Ptr[uint8],
+              length: uint64):
+    # Send the frame out every port except the ingress port.
+    p: uint64 = 0
+    while p < br[0].nports:
+        if p != ingress:
+            _br_tx(br, p, frame, length)
+        p = p + 1
+    br[0].n_flooded = br[0].n_flooded + 1
+
+
+# --- The forwarding decision -------------------------------------------
+
+def bridge_rx(br: Ptr[Bridge], ingress: uint64, frame: Ptr[uint8],
+              length: uint64):
+    # Drive the learn + forward path for one received frame.
+    #
+    # Ethernet header: bytes [0..5] = dst MAC, [6..11] = src MAC.
+    if length < ETH_HDR_LEN:
+        return                              # runt — nothing to forward
+    if ingress >= br[0].nports:
+        return                              # frame from a non-port
+    dst_mac: Ptr[uint8] = frame
+    src_mac: Ptr[uint8] = cast[Ptr[uint8]](
+        cast[uint64](frame) + BRIDGE_MAC_LEN)
+
+    # 1) LEARN the source.
+    bridge_fdb_learn(br, src_mac, ingress)
+
+    # 2) Decide egress by destination.
+    if _br_is_multicast(dst_mac) == 1:
+        # Broadcast/multicast always floods (BUM traffic).
+        _br_flood(br, ingress, frame, length)
+        return
+    dport: int64 = bridge_fdb_lookup(br, dst_mac)
+    if dport < 0:
+        # Unknown unicast -> flood.
+        _br_flood(br, ingress, frame, length)
+        return
+    out: uint64 = cast[uint64](dport)
+    if out == ingress:
+        # Destination is on the ingress port — drop (never hairpin).
+        return
+    # Known unicast on a different port -> forward only there.
+    _br_tx(br, out, frame, length)
+    br[0].n_unicast = br[0].n_unicast + 1
+
+
+# =====================================================================
+# Self-test: in-memory fake ports that capture transmitted frames
+# =====================================================================
+#
+# Three capture ports record every frame their TX hook receives. We then
+# drive bridge_rx() with crafted frames and assert the forwarding pattern.
+
+# Per-port capture: count of frames delivered + a copy of the LAST frame
+# (its length + bytes). Sized to BRIDGE_MAX_FRAME so a max frame can't
+# overflow into the adjacent global.
+_bt_cap_count: Array[8, uint64]                 # frames captured per port
+_bt_cap_len:   Array[8, uint64]                 # length of last captured
+_bt_cap_buf0:  Array[1514, uint8]               # port0 last frame bytes
+_bt_cap_buf1:  Array[1514, uint8]               # port1 last frame bytes
+_bt_cap_buf2:  Array[1514, uint8]               # port2 last frame bytes
+
+# Scratch frame the self-test crafts (sized to the max frame).
+_bt_frame:     Array[1514, uint8]
+
+
+def _bt_reset_captures():
+    i: uint64 = 0
+    while i < BRIDGE_MAX_PORTS:
+        _bt_cap_count[i] = 0
+        _bt_cap_len[i] = 0
+        i = i + 1
+
+
+def _bt_store(buf: Ptr[uint8], frame: Ptr[uint8], length: uint64):
+    n: uint64 = length
+    if n > BRIDGE_MAX_FRAME:
+        n = BRIDGE_MAX_FRAME
+    i: uint64 = 0
+    while i < n:
+        buf[i] = frame[i]
+        i = i + 1
+
+
+# The three capture TX hooks. Each records that a frame was delivered to
+# its port and stashes a copy of the bytes.
+def _bt_hook0(port: uint64, frame: Ptr[uint8], length: uint64):
+    _bt_cap_count[0] = _bt_cap_count[0] + 1
+    _bt_cap_len[0] = length
+    _bt_store(cast[Ptr[uint8]](&_bt_cap_buf0[0]), frame, length)
+
+
+def _bt_hook1(port: uint64, frame: Ptr[uint8], length: uint64):
+    _bt_cap_count[1] = _bt_cap_count[1] + 1
+    _bt_cap_len[1] = length
+    _bt_store(cast[Ptr[uint8]](&_bt_cap_buf1[0]), frame, length)
+
+
+def _bt_hook2(port: uint64, frame: Ptr[uint8], length: uint64):
+    _bt_cap_count[2] = _bt_cap_count[2] + 1
+    _bt_cap_len[2] = length
+    _bt_store(cast[Ptr[uint8]](&_bt_cap_buf2[0]), frame, length)
+
+
+def _bt_build_frame(dst: Ptr[uint8], src: Ptr[uint8], payload: uint8) -> uint64:
+    # Lay an Ethernet frame: dst(6) | src(6) | ethertype(2) | payload(46).
+    # Returns the total length (a min-size 60-byte L2 frame).
+    i: uint64 = 0
+    while i < 6:
+        _bt_frame[i] = dst[i]
+        _bt_frame[6 + i] = src[i]
+        i = i + 1
+    _bt_frame[12] = 0x08            # ethertype 0x0800 (IPv4) — arbitrary
+    _bt_frame[13] = 0x00
+    j: uint64 = 14
+    while j < 60:
+        _bt_frame[j] = payload
+        j = j + 1
+    return 60
+
+
+# Reusable MAC scratch buffers for the self-test. Stations are unicast
+# (02:00:00:00:00:xx); FF is the L2 broadcast.
+_bt_mac_aa: Array[6, uint8]        # station A  02:00:00:00:00:AA
+_bt_mac_bb: Array[6, uint8]        # station B  02:00:00:00:00:BB
+_bt_mac_cc: Array[6, uint8]        # station C  02:00:00:00:00:CC
+_bt_mac_ff: Array[6, uint8]        # FF:FF:FF:FF:FF:FF (broadcast)
+
+
+def _bt_set_unicast_mac(m: Ptr[uint8], last: uint8):
+    # Build a proper locally-administered UNICAST MAC 02:00:00:00:00:<last>.
+    # The first octet 0x02 has the I/G (group) bit (bit0) clear, so the
+    # bridge treats it as an individual address and LEARNS it — a station
+    # MAC whose first octet has bit0 set would (correctly) be ignored as a
+    # malformed source by the learning logic.
+    m[0] = 0x02
+    m[1] = 0x00
+    m[2] = 0x00
+    m[3] = 0x00
+    m[4] = 0x00
+    m[5] = last
+
+
+def _bt_fill_mac(m: Ptr[uint8], v: uint8):
+    i: uint64 = 0
+    while i < 6:
+        m[i] = v
+        i = i + 1
+
+
+def bridge_selftest() -> int32:
+    # Returns 1 on PASS, 0 on FAIL. Drives the REAL bridge_rx() path through
+    # three fake capture ports and asserts learn/flood/forward behaviour.
+    _br_emerg0("[bridge] self-test start\n")
+    ok: int32 = 1
+
+    # Stations AA/BB/CC are proper locally-administered UNICAST MACs
+    # (02:00:00:00:00:xx) so the bridge learns them; FF is the L2 broadcast.
+    _bt_set_unicast_mac(cast[Ptr[uint8]](&_bt_mac_aa[0]), 0xAA)
+    _bt_set_unicast_mac(cast[Ptr[uint8]](&_bt_mac_bb[0]), 0xBB)
+    _bt_set_unicast_mac(cast[Ptr[uint8]](&_bt_mac_cc[0]), 0xCC)
+    _bt_fill_mac(cast[Ptr[uint8]](&_bt_mac_ff[0]), 0xFF)
+
+    br: Ptr[Bridge] = bridge_create()
+    p0: int32 = bridge_add_port(br, _bt_hook0)
+    p1: int32 = bridge_add_port(br, _bt_hook1)
+    p2: int32 = bridge_add_port(br, _bt_hook2)
+    if p0 != 0 or p1 != 1 or p2 != 2:
+        _br_emerg0("[bridge] FAIL: add_port indices wrong\n")
+        return 0
+    if br[0].nports != 3:
+        _br_emerg0("[bridge] FAIL: nports != 3\n")
+        return 0
+    _br_emerg0("[bridge] ports OK (3 ports joined)\n")
+
+    # ----------------------------------------------------------------
+    # (a) Unknown-unicast FLOOD: port0 sends src=AA dst=BB (BB unknown).
+    #     Must flood to port1 + port2 but NOT port0 (ingress).
+    # ----------------------------------------------------------------
+    _bt_reset_captures()
+    flen: uint64 = _bt_build_frame(
+        cast[Ptr[uint8]](&_bt_mac_bb[0]),     # dst BB (unknown)
+        cast[Ptr[uint8]](&_bt_mac_aa[0]),     # src AA
+        0x11)
+    bridge_rx(br, 0, cast[Ptr[uint8]](&_bt_frame[0]), flen)
+    if _bt_cap_count[0] != 0:
+        _br_emerg1("[bridge] FAIL: flood hit ingress port0 (cnt=%d)\n",
+                   _bt_cap_count[0])
+        ok = 0
+    if _bt_cap_count[1] != 1 or _bt_cap_count[2] != 1:
+        _br_emerg2("[bridge] FAIL: flood missed (p1=%d p2=%d)\n",
+                   _bt_cap_count[1], _bt_cap_count[2])
+        ok = 0
+    if ok == 1:
+        _br_emerg0("[bridge] flood-unknown OK\n")
+
+    # (d-part-1) The source AA must now be learned on port0.
+    aa_port: int64 = bridge_fdb_lookup(br, cast[Ptr[uint8]](&_bt_mac_aa[0]))
+    if aa_port != 0:
+        _br_emerg1("[bridge] FAIL: AA learned on wrong port (%d)\n",
+                   cast[uint64](aa_port))
+        ok = 0
+    else:
+        _br_emerg0("[bridge] fdb-learned AA->port0 OK\n")
+
+    # ----------------------------------------------------------------
+    # (b) Learned UNICAST: port1 sends src=BB dst=AA. AA is known on
+    #     port0, so it must be delivered ONLY to port0 (not flooded).
+    # ----------------------------------------------------------------
+    _bt_reset_captures()
+    ulen: uint64 = _bt_build_frame(
+        cast[Ptr[uint8]](&_bt_mac_aa[0]),     # dst AA (known on port0)
+        cast[Ptr[uint8]](&_bt_mac_bb[0]),     # src BB
+        0x22)
+    bridge_rx(br, 1, cast[Ptr[uint8]](&_bt_frame[0]), ulen)
+    if _bt_cap_count[0] != 1:
+        _br_emerg1("[bridge] FAIL: unicast not delivered to port0 (cnt=%d)\n",
+                   _bt_cap_count[0])
+        ok = 0
+    if _bt_cap_count[1] != 0:
+        _br_emerg0("[bridge] FAIL: unicast echoed to ingress port1\n")
+        ok = 0
+    if _bt_cap_count[2] != 0:
+        _br_emerg1("[bridge] FAIL: unicast leaked to port2 (cnt=%d)\n",
+                   _bt_cap_count[2])
+        ok = 0
+    # Verify the delivered bytes are byte-identical to what we sent.
+    if _bt_cap_len[0] != ulen:
+        _br_emerg2("[bridge] FAIL: unicast len %d != %d\n",
+                   _bt_cap_len[0], ulen)
+        ok = 0
+    else:
+        ci: uint64 = 0
+        while ci < ulen:
+            if _bt_cap_buf0[ci] != _bt_frame[ci]:
+                _br_emerg1("[bridge] FAIL: unicast byte mismatch @%d\n", ci)
+                ok = 0
+                ci = ulen
+            else:
+                ci = ci + 1
+    if ok == 1:
+        _br_emerg0("[bridge] learned-unicast OK\n")
+
+    # (d-part-2) BB must now be learned on port1.
+    bb_port: int64 = bridge_fdb_lookup(br, cast[Ptr[uint8]](&_bt_mac_bb[0]))
+    if bb_port != 1:
+        _br_emerg1("[bridge] FAIL: BB learned on wrong port (%d)\n",
+                   cast[uint64](bb_port))
+        ok = 0
+    else:
+        _br_emerg0("[bridge] fdb-learned BB->port1 OK\n")
+
+    # ----------------------------------------------------------------
+    # (c) BROADCAST flood: port2 sends src=CC dst=FF:FF:FF:FF:FF:FF.
+    #     Must flood to port0 + port1 (both non-ingress) but NOT port2.
+    # ----------------------------------------------------------------
+    _bt_reset_captures()
+    blen: uint64 = _bt_build_frame(
+        cast[Ptr[uint8]](&_bt_mac_ff[0]),     # dst broadcast
+        cast[Ptr[uint8]](&_bt_mac_cc[0]),     # src CC
+        0x33)
+    bridge_rx(br, 2, cast[Ptr[uint8]](&_bt_frame[0]), blen)
+    if _bt_cap_count[2] != 0:
+        _br_emerg1("[bridge] FAIL: broadcast hit ingress port2 (cnt=%d)\n",
+                   _bt_cap_count[2])
+        ok = 0
+    if _bt_cap_count[0] != 1 or _bt_cap_count[1] != 1:
+        _br_emerg2("[bridge] FAIL: broadcast missed (p0=%d p1=%d)\n",
+                   _bt_cap_count[0], _bt_cap_count[1])
+        ok = 0
+    if ok == 1:
+        _br_emerg0("[bridge] broadcast-flood OK\n")
+
+    # (d-part-3) CC must now be learned on port2; a broadcast dst must NOT
+    # have been learned as a forwarding MAC.
+    cc_port: int64 = bridge_fdb_lookup(br, cast[Ptr[uint8]](&_bt_mac_cc[0]))
+    if cc_port != 2:
+        _br_emerg1("[bridge] FAIL: CC learned on wrong port (%d)\n",
+                   cast[uint64](cc_port))
+        ok = 0
+    ff_port: int64 = bridge_fdb_lookup(br, cast[Ptr[uint8]](&_bt_mac_ff[0]))
+    if ff_port >= 0:
+        _br_emerg0("[bridge] FAIL: broadcast MAC was learned into FDB\n")
+        ok = 0
+    if ok == 1:
+        _br_emerg0("[bridge] fdb-verified OK (AA/BB/CC learned, FF not)\n")
+
+    if ok == 1:
+        _br_emerg0("[bridge] PASS\n")
+        return 1
+    _br_emerg0("[bridge] FAIL\n")
+    return 0
