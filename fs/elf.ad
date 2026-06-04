@@ -1473,6 +1473,143 @@ def elf_map_one_page(pml4_phys: uint64, va: uint64,
     return 0
 
 
+# -----------------------------------------------------------------------
+# Huge-page (2 MiB PMD) demand-paging helpers.
+# -----------------------------------------------------------------------
+#
+# These mirror elf_prepare_demand_range / elf_map_one_page but operate at
+# PMD (page-directory) granularity so a MAP_HUGETLB anonymous mmap is
+# backed by REAL 2 MiB pages (one PS=1 PDE covering 2 MiB, a single TLB
+# entry) instead of 512 ordinary 4 KiB PTEs.
+#
+# elf_prepare_huge_demand_range: ensure the per-task PDPT + PD exist for
+# [vlow, vhigh) (2 MiB-aligned) but leave EVERY covering PDE not-present
+# (PDE == 0), so a touch fires a NOT-PRESENT #PF that the huge-page fault
+# handler resolves with a single 2 MiB PDE. Distinct from the 4 KiB
+# prepare in that it stops at the PD level — it never cracks a PDE into a
+# 512-entry PT.
+#
+# Must lie within one 1 GiB PDPT entry (same as the 4 KiB path). vlow and
+# vhigh must be 2 MiB-aligned. Returns 0 on success, -1 on OOM / misuse.
+
+def elf_prepare_huge_demand_range(pml4_phys: uint64, vlow: uint64,
+                                  vhigh: uint64) -> int32:
+    if vlow >= vhigh:
+        return 0
+    if (vlow & (PAGE_SIZE_2M - 1)) != 0:
+        return -1
+    if (vhigh & (PAGE_SIZE_2M - 1)) != 0:
+        return -1
+    pml4_idx_lo: uint64 = (vlow >> 39) & 0x1FF
+    pml4_idx_hi: uint64 = ((vhigh - 1) >> 39) & 0x1FF
+    pdpt_idx_lo: uint64 = (vlow >> 30) & 0x1FF
+    pdpt_idx_hi: uint64 = ((vhigh - 1) >> 30) & 0x1FF
+    if pml4_idx_lo != pml4_idx_hi:
+        return -1
+    if pdpt_idx_lo != pdpt_idx_hi:
+        return -1
+
+    pml4: Ptr[uint64] = cast[Ptr[uint64]](pml4_phys)
+    bsp_pml4: Ptr[uint64] = cast[Ptr[uint64]](
+        cow_boot_cr3() & PT_ADDR_MASK)
+
+    # Step 1: ensure a per-task PDPT (clone the shared boot PDPT, or
+    # build a fresh one for an absent PML4 slot).
+    pml4_entry: uint64 = pml4[pml4_idx_lo]
+    if (pml4_entry & PT_FLAG_P) == 0:
+        new_pdpt0: uint64 = alloc_page()
+        if new_pdpt0 == 0:
+            return -1
+        memset(cast[Ptr[uint8]](new_pdpt0), 0, 4096)
+        pml4[pml4_idx_lo] = new_pdpt0 \
+            | PT_FLAG_US | PT_FLAG_RW | PT_FLAG_P
+        pml4_entry = pml4[pml4_idx_lo]
+    elif pml4_entry == bsp_pml4[pml4_idx_lo]:
+        new_pdpt: uint64 = alloc_page()
+        if new_pdpt == 0:
+            return -1
+        old_pdpt_phys: uint64 = pml4_entry & PT_ADDR_MASK
+        memcpy(cast[Ptr[uint8]](new_pdpt),
+               cast[Ptr[uint8]](old_pdpt_phys), 4096)
+        pml4[pml4_idx_lo] = new_pdpt \
+            | (pml4_entry & ~PT_ADDR_MASK)
+        pml4_entry = pml4[pml4_idx_lo]
+
+    pdpt: Ptr[uint64] = cast[Ptr[uint64]](pml4_entry & PT_ADDR_MASK)
+
+    # Step 2: crack a PS=1 1 GiB PDPT entry (or build one for an absent
+    # entry) into a PD of identity 2 MiB pages, so kernel reads inside
+    # the 1 GiB stay resolvable.
+    pdpt_entry: uint64 = pdpt[pdpt_idx_lo]
+    if (pdpt_entry & PT_FLAG_PS) != 0 or (pdpt_entry & PT_FLAG_P) == 0:
+        new_pd: uint64 = alloc_page()
+        if new_pd == 0:
+            return -1
+        gib_base: uint64 = pdpt_idx_lo * PAGE_SIZE_1G
+        _build_identity_pd(new_pd, gib_base)
+        pdpt[pdpt_idx_lo] = new_pd \
+            | PT_FLAG_US | PT_FLAG_RW | PT_FLAG_P
+        pdpt_entry = pdpt[pdpt_idx_lo]
+
+    pd: Ptr[uint64] = cast[Ptr[uint64]](pdpt_entry & PT_ADDR_MASK)
+
+    # Step 3: for each 2 MiB slot in [vlow, vhigh), ZERO the PDE so the
+    # first access faults NOT-PRESENT. The PD itself was either the
+    # boot identity PD (now cloned) or freshly built identity above; we
+    # OVERWRITE the covering PDE to 0 so the user huge mapping is demand
+    # paged, not the identity 2 MiB page.
+    vaddr: uint64 = vlow
+    do:
+        pd_idx: uint64 = (vaddr >> 21) & 0x1FF
+        pd[pd_idx] = 0
+        invlpg_one(vaddr)
+        vaddr = vaddr + PAGE_SIZE_2M
+    while vaddr < vhigh
+    return 0
+
+
+# elf_map_one_huge_pde — install a single 2 MiB PS=1 leaf at the PD level.
+#
+# The PDPT/PD for `va` must already exist (call
+# elf_prepare_huge_demand_range first). Sets the covering PDE to
+# (phys | PT_FLAG_PS | PT_FLAG_US | PT_FLAG_P | extra_flags) with
+# PT_FLAG_RW added when want_write != 0, and invalidates the TLB entry.
+# `phys` must be a 2 MiB-aligned physically-contiguous frame; `va` is
+# floored to its 2 MiB boundary. `extra_flags` carries PT_FLAG_NX for a
+# data (non-exec) huge mapping, exactly like elf_map_one_page.
+#
+# Returns 0 on success, -1 if any level is missing or already a PS leaf
+# (would mean the prepare step never ran / collided).
+
+def elf_map_one_huge_pde(pml4_phys: uint64, va: uint64,
+                         phys: uint64, want_write: int32,
+                         extra_flags: uint64) -> int32:
+    va_al: uint64 = va & ~(PAGE_SIZE_2M - 1)
+    if (phys & (PAGE_SIZE_2M - 1)) != 0:
+        return -1
+    pml4_idx: uint64 = (va_al >> 39) & 0x1FF
+    pdpt_idx: uint64 = (va_al >> 30) & 0x1FF
+    pd_idx:   uint64 = (va_al >> 21) & 0x1FF
+
+    pml4: Ptr[uint64] = cast[Ptr[uint64]](pml4_phys)
+    pml4e: uint64 = pml4[pml4_idx]
+    if (pml4e & PT_FLAG_P) == 0:
+        return -1
+    pdpt: Ptr[uint64] = cast[Ptr[uint64]](pml4e & PT_ADDR_MASK)
+    pdpte: uint64 = pdpt[pdpt_idx]
+    if (pdpte & PT_FLAG_P) == 0:
+        return -1
+    if (pdpte & PT_FLAG_PS) != 0:
+        return -1
+    pd: Ptr[uint64] = cast[Ptr[uint64]](pdpte & PT_ADDR_MASK)
+    flags: uint64 = PT_FLAG_PS | PT_FLAG_US | PT_FLAG_P | extra_flags
+    if want_write != 0:
+        flags = flags | PT_FLAG_RW
+    pd[pd_idx] = phys | flags
+    invlpg_one(va_al)
+    return 0
+
+
 def elf_install_user_range(pml4_phys: uint64, vlow: uint64,
                            vhigh: uint64, phys_base: uint64,
                            label: Ptr[uint8], extra_flags: uint64) -> int32:

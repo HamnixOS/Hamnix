@@ -53,7 +53,9 @@
 #   padding). Backing pages come from alloc_pages at the order that
 #   covers the page-rounded length.
 
-from kernel.printk.printk import printk1
+from kernel.printk.printk import (
+    printk1, printk_set_level, PRINTK_LEVEL_NOTICE,
+)
 from kernel.sched.core import (
     TaskStruct,
     task_vma_list_head, set_task_vma_list_head,
@@ -70,6 +72,7 @@ from fs.elf import (
     elf_install_user_mapping, vm_cow_share_range,
     vm_share_range, vm_protect_range, vm_pin_range,
     elf_prepare_demand_range, elf_map_one_page,
+    elf_prepare_huge_demand_range, elf_map_one_huge_pde,
     PT_FLAG_NX, PT_FLAG_RW,
 )
 # §file-mmap: identity-based kernel pread for file-backed VMA fault-in.
@@ -112,6 +115,29 @@ VMA_MAP_SHARED:    int32 = 0x01
 VMA_MAP_PRIVATE:   int32 = 0x02
 VMA_MAP_FIXED:     int32 = 0x10
 VMA_MAP_ANONYMOUS: int32 = 0x20
+# MAP_HUGETLB: back this anonymous mapping with 2 MiB huge pages (one
+# PS=1 PDE per 2 MiB, a single TLB entry) instead of 512 4 KiB pages.
+# Mirrors Linux <bits/mman-linux.h> MAP_HUGETLB (0x40000). The default
+# huge size is 2 MiB (Linux's MAP_HUGE_2MB); the length and a non-zero
+# MAP_FIXED addr must both be 2 MiB-aligned, matching hugetlbfs.
+VMA_MAP_HUGETLB:   int32 = 0x40000
+
+# 2 MiB huge page geometry. VMA_HUGE_ORDER is the buddy-allocator order
+# (mm/page_alloc.ad) whose run is exactly 2 MiB: 2^9 × 4 KiB = 512 pages
+# = 0x200000. alloc_pages(VMA_HUGE_ORDER) returns a 2 MiB-aligned,
+# physically-contiguous run (memblock_alloc aligns to the run width),
+# which is exactly what a single PS=1 PDE needs.
+VMA_HUGE_SIZE:  uint64 = 0x200000          # 2 MiB
+VMA_HUGE_ORDER: int32  = 9                 # 2^9 pages == 2 MiB
+
+# HugePages accounting (observable, e.g. /proc/meminfo HugePages_*).
+# nr_hugepages_total: 2 MiB huge PDEs ever installed by a demand fault.
+# nr_hugepages_live: currently-mapped 2 MiB huge pages (incremented on
+# install, decremented on teardown). Both are simple counters a test or
+# procfs node can read to PROVE a real 2 MiB PDE was used (not 512 4 KiB
+# pages).
+nr_hugepages_total: uint64 = 0
+nr_hugepages_live:  uint64 = 0
 
 # PROT_* — stored but not yet honoured by the page table.
 VMA_PROT_NONE:  int32 = 0x0
@@ -345,6 +371,16 @@ class VmaNode:
     # 8-byte-aligned file_size) so file_size stays aligned; it is an int32
     # peer of is_file_shared so the two int32s pack into one 8-byte slot.
     sealed:         int32
+    # §hugepage: 1 when this is a MAP_HUGETLB anonymous demand VMA backed
+    # by REAL 2 MiB huge pages. It is ALSO is_demand=1 (pages populated
+    # lazily on #PF), but the fault handler allocates a 2 MiB-aligned,
+    # physically-contiguous order-9 buddy run and installs ONE PS=1 PDE
+    # (elf_map_one_huge_pde) covering the whole 2 MiB rather than 512
+    # 4 KiB PTEs. The teardown path frees each resident 2 MiB run at
+    # order-9 (free_pages) by walking the PD level. is_huge is mutually
+    # exclusive with is_file / is_shared / is_cow / is_pinned. Appended
+    # last; an int32 peer of `sealed` so the two pack into one 8-byte slot.
+    is_huge:        int32
     # For a file-backed VMA, `backing` (above) is REPURPOSED to hold the
     # stable backing IDENTITY (cpio index / tmpfs slot / ext4 inode num /
     # buffer pointer) rather than a physical page run — a file-backed
@@ -358,11 +394,13 @@ class VmaNode:
 # VmaNode size: 6 uint64 (48) + 10 int32 (40) = 88 bytes; §file-mmap
 # adds is_file + file_marker (2 int32 = 8) + file_size (uint64 = 8) for
 # 104 bytes; §shared-mmap adds is_file_shared (int32 = 4) for 108 bytes;
-# §mseal adds sealed (int32 = 4) for 112 bytes total. memset-zeroed on
-# alloc, so every node defaults to is_file=0 / is_file_shared=0 / sealed=0
-# (anonymous/non-file/unsealed) unless a file-backed allocator or mseal(2)
+# §mseal adds sealed (int32 = 4) for 112 bytes total. §hugepage appends
+# is_huge (int32 = 4) which pairs with sealed into one 8-byte slot for
+# 120 bytes total (rounded up to 8). memset-zeroed on alloc, so every
+# node defaults to is_file=0 / is_file_shared=0 / sealed=0 / is_huge=0
+# (anonymous/non-file/unsealed/non-huge) unless an allocator or mseal(2)
 # sets them.
-VMA_NODE_SIZE: uint64 = 112
+VMA_NODE_SIZE: uint64 = 120
 
 
 def _vma_node_new() -> uint64:
@@ -398,6 +436,7 @@ def _vma_node_set(node: uint64, start: uint64, end: uint64,
     cast[Ptr[VmaNode]](node)[0].file_size   = 0
     cast[Ptr[VmaNode]](node)[0].is_file_shared = 0
     cast[Ptr[VmaNode]](node)[0].sealed      = 0
+    cast[Ptr[VmaNode]](node)[0].is_huge     = 0
 
 
 def _vma_node_get_next(node: uint64) -> uint64:
@@ -478,6 +517,61 @@ def _vma_pte_lookup(pml4_phys: uint64, vaddr: uint64) -> uint64:
     return pte
 
 
+def _vma_huge_pde_lookup(pml4_phys: uint64, vaddr: uint64) -> uint64:
+    # §hugepage: return the PRESENT 2 MiB PS=1 PDE mapping `vaddr`, or 0
+    # if any level above is not-present or the PDE is not a present huge
+    # leaf. Read-only — never allocates or cracks a table. Used by the
+    # huge-VMA teardown to find each resident 2 MiB frame.
+    if pml4_phys == 0:
+        return 0
+    pml4_idx: uint64 = (vaddr >> 39) & 0x1FF
+    pdpt_idx: uint64 = (vaddr >> 30) & 0x1FF
+    pd_idx:   uint64 = (vaddr >> 21) & 0x1FF
+
+    pml4: Ptr[uint64] = cast[Ptr[uint64]](pml4_phys & VMA_PT_ADDR_MASK)
+    pml4e: uint64 = pml4[pml4_idx]
+    if (pml4e & VMA_PT_FLAG_P) == 0:
+        return 0
+    pdpt: Ptr[uint64] = cast[Ptr[uint64]](pml4e & VMA_PT_ADDR_MASK)
+    pdpte: uint64 = pdpt[pdpt_idx]
+    if (pdpte & VMA_PT_FLAG_P) == 0:
+        return 0
+    if (pdpte & VMA_PT_FLAG_PS) != 0:
+        return 0
+    pd: Ptr[uint64] = cast[Ptr[uint64]](pdpte & VMA_PT_ADDR_MASK)
+    pde: uint64 = pd[pd_idx]
+    if (pde & VMA_PT_FLAG_P) == 0:
+        return 0
+    if (pde & VMA_PT_FLAG_PS) == 0:
+        return 0
+    return pde
+
+
+def _vma_huge_pde_clear(pml4_phys: uint64, vaddr: uint64):
+    # §hugepage: zero the 2 MiB PS=1 PDE mapping `vaddr` (after its frame
+    # has been freed) and flush the TLB entry, so a later access faults
+    # not-present rather than reusing a stale huge translation. No-op if
+    # the PDE isn't a present huge leaf.
+    if pml4_phys == 0:
+        return
+    pml4_idx: uint64 = (vaddr >> 39) & 0x1FF
+    pdpt_idx: uint64 = (vaddr >> 30) & 0x1FF
+    pd_idx:   uint64 = (vaddr >> 21) & 0x1FF
+    pml4: Ptr[uint64] = cast[Ptr[uint64]](pml4_phys & VMA_PT_ADDR_MASK)
+    pml4e: uint64 = pml4[pml4_idx]
+    if (pml4e & VMA_PT_FLAG_P) == 0:
+        return
+    pdpt: Ptr[uint64] = cast[Ptr[uint64]](pml4e & VMA_PT_ADDR_MASK)
+    pdpte: uint64 = pdpt[pdpt_idx]
+    if (pdpte & VMA_PT_FLAG_P) == 0 or (pdpte & VMA_PT_FLAG_PS) != 0:
+        return
+    pd: Ptr[uint64] = cast[Ptr[uint64]](pdpte & VMA_PT_ADDR_MASK)
+    pde: uint64 = pd[pd_idx]
+    if (pde & VMA_PT_FLAG_P) != 0 and (pde & VMA_PT_FLAG_PS) != 0:
+        pd[pd_idx] = 0
+        invlpg_one(vaddr & ~(VMA_HUGE_SIZE - 1))
+
+
 def _vma_free_cow_range(pml4_phys: uint64, vlo: uint64, vhi: uint64):
     # Free every present 4 KiB page of a COW node in [vlo, vhi) through
     # the COW refcount. cow_drop_page(phys) returns 1 when this was the
@@ -531,6 +625,36 @@ def _vma_node_free(slot: uint64, node: uint64, pml4_phys: uint64):
         _vma_writeback_node(node, pml4_phys,
                             cast[Ptr[VmaNode]](node)[0].start,
                             cast[Ptr[VmaNode]](node)[0].end)
+
+    # §hugepage: a MAP_HUGETLB VMA owns 2 MiB huge frames installed as
+    # PS=1 PDEs (NOT 4 KiB PTEs). Walk the range at 2 MiB granularity;
+    # each resident huge PDE points at a 2 MiB-aligned order-9 buddy run
+    # that is freed whole with free_pages(phys, VMA_HUGE_ORDER), then the
+    # PDE is cleared and the TLB flushed. Demand-charged 2 MiB per page,
+    # so uncharge the same. Checked before the generic is_demand arm
+    # (a huge VMA is also is_demand).
+    if cast[Ptr[VmaNode]](node)[0].is_huge != 0:
+        h_start: uint64 = cast[Ptr[VmaNode]](node)[0].start
+        h_end:   uint64 = cast[Ptr[VmaNode]](node)[0].end
+        haddr: uint64 = h_start
+        freed_huge: uint64 = 0
+        while haddr < h_end:
+            hpde: uint64 = _vma_huge_pde_lookup(pml4_phys, haddr)
+            if hpde != 0:
+                hphys: uint64 = hpde & VMA_PT_ADDR_MASK
+                if hphys != 0:
+                    free_pages(hphys, VMA_HUGE_ORDER)
+                    _vma_huge_pde_clear(pml4_phys, haddr)
+                    freed_huge = freed_huge + 1
+            haddr = haddr + VMA_HUGE_SIZE
+        if freed_huge > 0:
+            nscap_mem_uncharge_slot(slot, freed_huge * VMA_HUGE_SIZE)
+            if nr_hugepages_live >= freed_huge:
+                nr_hugepages_live = nr_hugepages_live - freed_huge
+        if nr_vma_nodes_live > 0:
+            nr_vma_nodes_live = nr_vma_nodes_live - 1
+        kfree(node)
+        return
 
     is_demand: int32 = cast[Ptr[VmaNode]](node)[0].is_demand
     if is_demand != 0:
@@ -1730,6 +1854,91 @@ def vma_alloc_demand(slot: uint64, addr_in: uint64, len_in: uint64,
 
 
 # ---------------------------------------------------------------------
+# §hugepage — vma_alloc_huge_demand: demand-paged 2 MiB MAP_HUGETLB mmap
+# ---------------------------------------------------------------------
+#
+# Creates a MAP_HUGETLB anonymous VMA (is_huge=1, is_demand=1) whose
+# virtual range is prepared at PMD granularity: the per-task PDPT + PD
+# exist for [base, base+length), but every covering 2 MiB PDE is left
+# NOT-PRESENT (PDE == 0). A user touch fires a NOT-PRESENT #PF;
+# do_page_fault → vma_demand_fault sees is_huge and resolves it by
+# allocating ONE 2 MiB-aligned, physically-contiguous order-9 buddy run,
+# zeroing it, and installing a single PS=1 PDE covering the whole 2 MiB
+# (elf_map_one_huge_pde). No 4 KiB PTEs are ever created for the range.
+#
+# hugetlbfs/Linux MAP_HUGETLB semantics: the LENGTH must be a multiple of
+# the huge-page size (2 MiB) and a MAP_FIXED addr must be 2 MiB-aligned —
+# this is enforced by the SYS_MMAP caller (it returns -EINVAL otherwise),
+# but we re-align defensively here. The mapping lives in the same
+# [1 GiB, 4 GiB) large-VMA window as the ordinary demand path; the window
+# base is 4 MiB-aligned (vma_large_next / VMA_MAX_CHUNK), so every carved
+# window is trivially 2 MiB-aligned.
+#
+# Returns the resolved base (>= 0) on success, or a negative Linux errno.
+
+def vma_alloc_huge_demand(slot: uint64, addr_in: uint64, len_in: uint64,
+                          prot: int32, flags: int32) -> int64:
+    if len_in == 0:
+        return cast[int64](-22)
+    # MAP_HUGETLB requires a huge-page-aligned length (Linux -EINVAL
+    # otherwise). The SYS_MMAP caller already validated; round UP to a
+    # 2 MiB multiple defensively so we never under-prepare the range.
+    length: uint64 = (len_in + VMA_HUGE_SIZE - 1) & ~(VMA_HUGE_SIZE - 1)
+
+    # MAP_FIXED: honour exactly, but the address must be 2 MiB-aligned.
+    is_fixed: int32 = 0
+    if (flags & VMA_MAP_FIXED) != 0 and addr_in != 0:
+        if (addr_in & (VMA_HUGE_SIZE - 1)) != 0:
+            return cast[int64](-22)
+        is_fixed = 1
+
+    base: uint64 = 0
+    if is_fixed != 0:
+        _vma_carve_range(slot, addr_in, addr_in + length)
+        base = addr_in
+    else:
+        # Carve a 4-MiB-aligned window from the large-VMA region (same
+        # window bump as the ordinary demand path; 4 MiB-aligned implies
+        # 2 MiB-aligned and keeps each window inside one 1 GiB PDPT entry).
+        window: uint64 = (length + VMA_MAX_CHUNK - 1) \
+                         & ~(VMA_MAX_CHUNK - 1)
+        base = vma_large_next
+        if base + window > VMA_LARGE_LIMIT:
+            printk1("vma: huge window exhausted (need 0x%x)\n", window)
+            return cast[int64](-12)
+        vma_large_next = base + window
+
+    # Prepare the page tables at PMD granularity: PDPT + PD exist, every
+    # covering 2 MiB PDE left not-present. Split into per-GiB chunks the
+    # same way the 4 KiB demand path does (the huge prepare also refuses a
+    # range crossing a 1 GiB PDPT entry).
+    pml4: uint64 = task_pml4(cast[int32](slot))
+    GIB: uint64 = 0x40000000
+    cur: uint64 = base
+    while cur < base + length:
+        gib_end: uint64 = (cur + GIB) & ~(GIB - 1)
+        chunk_end: uint64 = gib_end
+        if chunk_end > base + length:
+            chunk_end = base + length
+        if elf_prepare_huge_demand_range(pml4, cur, chunk_end) < 0:
+            printk1("vma: huge PT prep failed @ 0x%x\n", cur)
+            return cast[int64](-12)
+        cur = chunk_end
+
+    load_cr3(pml4)
+
+    node: uint64 = _vma_node_new()
+    if node == 0:
+        return cast[int64](-12)
+    end_v: uint64 = base + length
+    _vma_node_set(node, base, end_v, prot, flags, -1, 0, 0, 0)
+    cast[Ptr[VmaNode]](node)[0].is_demand = 1
+    cast[Ptr[VmaNode]](node)[0].is_huge   = 1
+    _vma_insert_sorted(slot, node)
+    return cast[int64](base)
+
+
+# ---------------------------------------------------------------------
 # §file-mmap — vma_alloc_file_demand: demand-paged FILE-backed mmap
 # ---------------------------------------------------------------------
 #
@@ -1848,6 +2057,75 @@ def _vma_alloc_file_core(slot: uint64, addr_in: uint64, len_in: uint64,
 # The `slot` argument is the task slot index needed to look up the VMA
 # list. The caller (do_page_fault) must supply it.
 
+# ---------------------------------------------------------------------
+# §hugepage — _vma_demand_fault_huge: populate one 2 MiB huge page on #PF
+# ---------------------------------------------------------------------
+#
+# Resolves a NOT-PRESENT fault inside a MAP_HUGETLB (is_huge) VMA by
+# allocating ONE 2 MiB-aligned, physically-contiguous order-9 buddy run,
+# zero-filling it (anonymous-mapping contract), and installing a single
+# PS=1 PDE covering the whole 2 MiB via elf_map_one_huge_pde. A 2 MiB
+# huge page is one PDE / one TLB entry — touching any 4 KiB offset in the
+# 2 MiB resolves the entire 2 MiB at once. Returns 1 on success, -1 on
+# OOM / namespace-cap denial, 0 only if the node is somehow not huge
+# (caller already vetted is_huge).
+#
+# `node` is the VMA covering fault_va (already looked up by the caller).
+
+def _vma_demand_fault_huge(slot: uint64, pml4_phys: uint64,
+                           fault_va: uint64, node: uint64) -> int32:
+    prot: int32 = cast[Ptr[VmaNode]](node)[0].prot
+    want_write: int32 = 0
+    if (prot & VMA_PROT_WRITE) != 0:
+        want_write = 1
+
+    # The 2 MiB-aligned virtual base of the huge page covering fault_va.
+    huge_va: uint64 = fault_va & ~(VMA_HUGE_SIZE - 1)
+
+    # #174: charge the whole 2 MiB to the faulting task's namespace BEFORE
+    # touching the allocator. Deny (return -1, no allocation) on over-cap.
+    if nscap_mem_charge_slot(slot, VMA_HUGE_SIZE) != 0:
+        printk1("vma: huge demand DENIED by namespace mem cap at va=0x%x\n",
+                fault_va)
+        return -1
+
+    # Allocate a 2 MiB-aligned, physically-contiguous order-9 run. The
+    # buddy allocator's memblock fallback aligns a 2 MiB request to 2 MiB,
+    # and a split from a higher order is also naturally aligned — so the
+    # returned base is guaranteed 2 MiB-aligned (required by a PS=1 PDE).
+    phys: uint64 = alloc_pages(VMA_HUGE_ORDER)
+    if phys == 0:
+        nscap_mem_uncharge_slot(slot, VMA_HUGE_SIZE)
+        printk1("vma: huge demand OOM at va=0x%x\n", fault_va)
+        return -1
+    if (phys & (VMA_HUGE_SIZE - 1)) != 0:
+        # Should never happen given the allocator's alignment contract;
+        # bail rather than install a mis-aligned PS=1 PDE.
+        free_pages(phys, VMA_HUGE_ORDER)
+        nscap_mem_uncharge_slot(slot, VMA_HUGE_SIZE)
+        printk1("vma: huge alloc mis-aligned 0x%x\n", phys)
+        return -1
+    memset(cast[Ptr[uint8]](phys), 0, VMA_HUGE_SIZE)
+
+    # Install the single 2 MiB PS=1 PDE. W^X: NX unless mmap'd PROT_EXEC,
+    # RW only when PROT_WRITE — same policy as the 4 KiB demand path.
+    if elf_map_one_huge_pde(pml4_phys, huge_va, phys, want_write,
+                            _vma_nx_flag(prot)) < 0:
+        free_pages(phys, VMA_HUGE_ORDER)
+        nscap_mem_uncharge_slot(slot, VMA_HUGE_SIZE)
+        printk1("vma: huge PDE install failed at va=0x%x\n", fault_va)
+        return -1
+
+    nr_hugepages_total = nr_hugepages_total + 1
+    nr_hugepages_live = nr_hugepages_live + 1
+    # NOTICE level so the PS-bit proof survives the post-interactive
+    # console-loglevel gate (which suppresses ordinary INFO chatter once
+    # the hamsh prompt is up) — the test harness greps this line.
+    printk_set_level(PRINTK_LEVEL_NOTICE)
+    printk1("[hugepage] installed 2MiB PS-bit PDE at va=0x%x\n", huge_va)
+    return 1
+
+
 def vma_demand_fault(slot: uint64, pml4_phys: uint64,
                      fault_va: uint64) -> int32:
     # Find the VMA covering fault_va.
@@ -1859,6 +2137,12 @@ def vma_demand_fault(slot: uint64, pml4_phys: uint64,
         # VMA exists but is not demand-paged — some other kind of
         # not-present fault (shouldn't happen normally).
         return 0
+
+    # §hugepage: a MAP_HUGETLB VMA resolves the fault with a single 2 MiB
+    # huge page (one PS=1 PDE), NOT a 4 KiB page. Route to the dedicated
+    # huge handler before the ordinary 4 KiB path.
+    if cast[Ptr[VmaNode]](node)[0].is_huge != 0:
+        return _vma_demand_fault_huge(slot, pml4_phys, fault_va, node)
 
     prot: int32 = cast[Ptr[VmaNode]](node)[0].prot
     want_write: int32 = 0
@@ -2826,3 +3110,18 @@ def vma_nodes_live() -> uint64:
     # Current count of live VmaNode heap allocations across all tasks.
     # A spawn/reap cycle that returns to the same value is leak-free.
     return nr_vma_nodes_live
+
+
+def vma_hugepages_total() -> uint64:
+    # §hugepage: cumulative count of 2 MiB huge PDEs ever installed by a
+    # MAP_HUGETLB demand fault. Monotonically increasing. Surfaced as
+    # /proc/meminfo HugePages_Total.
+    return nr_hugepages_total
+
+
+def vma_hugepages_live() -> uint64:
+    # §hugepage: 2 MiB huge pages currently mapped (installed minus freed
+    # at teardown). Surfaced as /proc/meminfo HugePages_Free's complement
+    # (we report the live/in-use count directly so a leak shows as
+    # monotonic growth across a map/unmap cycle).
+    return nr_hugepages_live

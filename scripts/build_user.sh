@@ -35,10 +35,17 @@ build_one stdin_demo                   # used by scripts/test_stdin.sh
 # Hamnix-compiled userland binaries.
 build_adder_user() {
     local name="$1"
-    echo "[build_user] compiling user/${name}.ad -> build/user/${name}.elf"
+    # Source lives in user/<name>.ad normally; a regression-test fixture
+    # (e.g. test_hugepage) lives in tests/<name>.ad. Prefer user/, fall
+    # back to tests/ so a test program can be registered here too.
+    local src="user/${name}.ad"
+    if [ ! -f "$src" ] && [ -f "tests/${name}.ad" ]; then
+        src="tests/${name}.ad"
+    fi
+    echo "[build_user] compiling ${src} -> build/user/${name}.elf"
     python3 -m compiler.adder compile \
         --target=x86_64-adder-user \
-        "user/${name}.ad" \
+        "$src" \
         -o "build/user/${name}.elf"
     file "build/user/${name}.elf"
 }
@@ -173,6 +180,7 @@ build_adder_user preempt_demo         # preemption test: spawns the hog, proves 
 build_adder_user nice_hi              # #151 CFS-lite: high-priority (nice -20) CPU hog
 build_adder_user nice_lo              # #151 CFS-lite: low-priority  (nice +19) CPU hog
 build_adder_user nice_demo            # #151 CFS-lite: spawns nice_hi + nice_lo, proves CPU-share ratio
+build_adder_user test_hugepage        # §hugepage: 2 MiB MAP_HUGETLB mmap test (tests/test_hugepage.ad)
 build_adder_user hpm                  # Hamnix package manager (docs/packages.md)
 build_adder_user mkfs_ext4            # installer: format a /dev/blk/<dev> as ext4 (via /ctl)
 build_adder_user mkfs_fat             # installer: format a /dev/blk/<dev> as FAT (via /ctl; stub)
