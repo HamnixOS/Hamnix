@@ -11617,6 +11617,7 @@ VRING_DESC_F_WRITE: uint16 = 2               # device writes (driver reads)
 
 # virtio-blk request header layout + types.
 VIRTIO_BLK_T_IN: uint32 = 0                   # read from device
+VIRTIO_BLK_T_OUT: uint32 = 1                  # write to device (Phase 35)
 VIRTIO_BLK_S_OK: uint8 = 0                    # request status: success
 
 # Our split virtqueue size (power of 2, <= QueueNumMax). 8 is plenty for a few
@@ -12572,6 +12573,67 @@ def arm64_p30_read_sector(base: uint64, sector: uint64) -> int64:
     return arm64_p30_read_sector_into(base, sector, P30_DATA_PA)
 
 
+# Issue ONE VIRTIO_BLK_T_OUT write of `sector` FROM the caller-chosen physical
+# buffer `src` (must hold at least 512 bytes). Same request virtqueue + polling
+# scheme as the read path; the only differences are the header type (T_OUT) and
+# the data descriptor being DEVICE-READABLE (no F_WRITE) instead of device-writable.
+# Returns 1 on a clean completion with status == OK, else 0. (Phase 35.)
+def arm64_p30_write_sector_from(base: uint64, sector: uint64, src: uint64) -> int64:
+    # Build the request header at P30_HDR_PA: type(u32) reserved(u32) sector(u64).
+    ht: Ptr[uint32] = cast[Ptr[uint32]](P30_HDR_PA + cast[uint64](0))
+    ht[0] = VIRTIO_BLK_T_OUT
+    hr: Ptr[uint32] = cast[Ptr[uint32]](P30_HDR_PA + cast[uint64](4))
+    hr[0] = cast[uint32](0)
+    hs: Ptr[uint64] = cast[Ptr[uint64]](P30_HDR_PA + cast[uint64](8))
+    hs[0] = sector
+
+    # Poison the status byte so a stale OK can't masquerade as a fresh completion.
+    sbp: Ptr[uint8] = cast[Ptr[uint8]](P30_STATUS_PA)
+    sbp[0] = cast[uint8](0xFF)
+    _dsb_ish()
+
+    # Three-descriptor chain: header (R) -> data (R) -> status (W).
+    #   desc 0: header,  16 bytes, F_NEXT -> 1
+    #   desc 1: data,    512 bytes, F_NEXT (device-READABLE: the bytes to write)
+    #   desc 2: status,  1 byte,    F_WRITE
+    arm64_p30_set_desc(0, P30_HDR_PA, cast[uint32](16), VRING_DESC_F_NEXT, cast[uint16](1))
+    arm64_p30_set_desc(1, src, cast[uint32](SECTOR_SIZE), VRING_DESC_F_NEXT, cast[uint16](2))
+    arm64_p30_set_desc(2, P30_STATUS_PA, cast[uint32](1), VRING_DESC_F_WRITE, cast[uint16](0))
+    _dsb_ish()
+
+    # Publish descriptor head 0 into the avail ring at the current slot, then
+    # bump avail.idx with a release barrier so the device sees the entry.
+    slot: uint64 = cast[uint64](arm64_p30_avail_idx) & cast[uint64](P30_QSIZE - 1)
+    aring: Ptr[uint16] = cast[Ptr[uint16]](P30_AVAIL_PA + cast[uint64](4) + (slot * cast[uint64](2)))
+    aring[0] = cast[uint16](0)                       # head descriptor index = 0
+    _dsb_ish()
+    arm64_p30_avail_idx = arm64_p30_avail_idx + cast[uint16](1)
+    aidx: Ptr[uint16] = cast[Ptr[uint16]](P30_AVAIL_PA + cast[uint64](2))
+    aidx[0] = arm64_p30_avail_idx
+    _dsb_ish()
+
+    # Snapshot used.idx, notify the device on queue 0, then poll for completion.
+    before: uint16 = arm64_p30_used_idx()
+    _vmmio_w32(base + VMMIO_QUEUE_NOTIFY, cast[uint32](0))
+    _dsb_ish()
+
+    spins: int64 = 0
+    while spins < 200000000:
+        _dsb_ish()
+        now: uint16 = arm64_p30_used_idx()
+        if now != before:
+            isr: uint32 = _vmmio_r32(base + VMMIO_INTERRUPT_STATUS)
+            if isr != cast[uint32](0):
+                _vmmio_w32(base + VMMIO_INTERRUPT_ACK, isr)
+            _dsb_ish()
+            stp: Ptr[uint8] = cast[Ptr[uint8]](P30_STATUS_PA)
+            if cast[uint64](stp[0]) == cast[uint64](VIRTIO_BLK_S_OK):
+                return 1
+            return 0
+        spins = spins + 1
+    return 0     # timed out: device never completed the request
+
+
 # Phase 30 entry point (hand-off from arm64_p29_finish on success). Find the
 # virtio-blk transport, bring it up, read sector 0 (and a couple more), verify
 # the known tag the test wrote at sector 0, print the PASS/FAIL verdict, halt.
@@ -12730,6 +12792,19 @@ arm64_p31_fat_lba: int64 = 0                 # first FAT sector
 arm64_p31_root_lba: int64 = 0                # first root-dir sector
 arm64_p31_root_secs: int64 = 0              # # sectors in the root dir
 arm64_p31_data_lba: int64 = 0               # first sector of cluster 2
+
+# ---------------------------------------------------------------------------
+# Phase 35 scratch buffers — a private Normal-WB region clear of every prior
+# phase's buffers (P30 ring @0x4500_0000, P31 @0x4510_0000, P32 @0x4520_0000).
+# We reuse the live virtio-blk transport + the P31 BPB/FAT helpers; these two
+# 512-byte pages back the raw round-trip and the FS-level rewrite/read-back.
+# ---------------------------------------------------------------------------
+P35_WBUF_PA: uint64 = 0x45300000             # 512-byte WRITE source buffer
+P35_RBUF_PA: uint64 = 0x45301000             # 512-byte READ-BACK buffer
+# A high scratch sector well beyond the 2 MiB image's used FAT16 area (data
+# region starts ~sector 65 and the planted files occupy a handful of clusters);
+# sector 4000 is inside the 4096-sector volume but holds no FS metadata we need.
+P35_SCRATCH_LBA: uint64 = 4000
 
 
 # ===========================================================================
@@ -14477,9 +14552,407 @@ def arm64_p34_run(base: uint64) -> int64:
         _uart_puts(rp)
         pp: Ptr[char] = "[arm64] Phase 34 PASS: IPv4/ICMP echo round-trip (ping 10.0.2.2) over native virtio-net\n"
         _uart_puts(pp)
+        # Hand off to Phase 35 (writable virtio-blk + a real FAT16 FS write). The
+        # net device used here is irrelevant to P35: it re-finds + re-brings-up the
+        # SAME virtio-blk transport (idempotent) and reuses the P31 FAT16 helpers.
+        arm64_p35_run()
     else:
         fp4: Ptr[char] = "[arm64] Phase 34 FAIL: echo round-trip verdict failed\n"
         _uart_puts(fp4)
+    return 0
+
+
+# ===========================================================================
+# PHASE 35 — make the virtio-mmio block path WRITABLE and prove a real
+# round-trip filesystem WRITE on qemu-virt.
+#
+# Phases 30/31 proved the polled virtio-mmio block transport can READ raw
+# sectors and parse a FAT16 volume. Phase 35 adds the WRITE direction
+# (VIRTIO_BLK_T_OUT over the same request virtqueue) and proves durability two
+# ways:
+#   1. RAW round-trip: write a known pattern to a high scratch sector (clear of
+#      FS metadata), read it back, confirm the bytes match.
+#   2. FS-level round-trip: rewrite HELLO.TXT's data cluster with NEW bytes and
+#      update its directory-entry size on disk, then re-locate the file and
+#      re-read it through the normal FAT16 chain READ path — proving the new
+#      bytes come back through the real filesystem read.
+# All buffers live in fresh Normal-WB RAM (P35_*); the transport + FAT helpers
+# are reused. arm64_p35_run never returns (it halts after the verdict).
+# ===========================================================================
+
+# The new HELLO.TXT content this phase writes through the filesystem. Same
+# length as the original ("HAMNIX-ARM64-FS-OK", 18 bytes) so it fits the single
+# planted data cluster without growing the FAT chain — the proof is a content
+# change that survives a real FAT-chain read.
+P35_NEW0: uint8 = 0x41                        # 'A'
+P35_NEW1: uint8 = 0x52                        # 'R'
+P35_NEW2: uint8 = 0x4D                        # 'M'
+P35_NEW3: uint8 = 0x36                        # '6'
+P35_NEW4: uint8 = 0x34                        # '4'
+P35_NEW5: uint8 = 0x2D                        # '-'
+P35_NEW6: uint8 = 0x57                        # 'W'
+P35_NEW7: uint8 = 0x52                        # 'R'
+P35_NEW8: uint8 = 0x49                        # 'I'
+P35_NEW9: uint8 = 0x54                        # 'T'
+P35_NEW10: uint8 = 0x45                       # 'E'
+P35_NEW11: uint8 = 0x2D                       # '-'
+P35_NEW12: uint8 = 0x4F                       # 'O'
+P35_NEW13: uint8 = 0x4B                       # 'K'
+P35_NEW14: uint8 = 0x2D                       # '-'
+P35_NEW15: uint8 = 0x41                       # 'A'
+P35_NEW16: uint8 = 0x36                       # '6'
+P35_NEW17: uint8 = 0x34                       # '4'
+P35_NEW_LEN: int64 = 18
+
+arm64_p35_active: int64 = 0
+
+
+# Fetch the j-th expected new-payload byte (helper avoids a big inline table).
+def arm64_p35_new_byte(j: int64) -> uint8:
+    if j == 0:
+        return P35_NEW0
+    if j == 1:
+        return P35_NEW1
+    if j == 2:
+        return P35_NEW2
+    if j == 3:
+        return P35_NEW3
+    if j == 4:
+        return P35_NEW4
+    if j == 5:
+        return P35_NEW5
+    if j == 6:
+        return P35_NEW6
+    if j == 7:
+        return P35_NEW7
+    if j == 8:
+        return P35_NEW8
+    if j == 9:
+        return P35_NEW9
+    if j == 10:
+        return P35_NEW10
+    if j == 11:
+        return P35_NEW11
+    if j == 12:
+        return P35_NEW12
+    if j == 13:
+        return P35_NEW13
+    if j == 14:
+        return P35_NEW14
+    if j == 15:
+        return P35_NEW15
+    if j == 16:
+        return P35_NEW16
+    return P35_NEW17
+
+
+# Phase 35 entry point (hand-off from arm64_p34_run on a Phase-34 PASS). Never
+# returns: halts after printing the verdict.
+def arm64_p35_run() -> int64:
+    arm64_p35_active = 1
+    intro: Ptr[char] = "[arm64] Phase 35: writable virtio-blk + real FAT16 filesystem write\n"
+    _uart_puts(intro)
+    nl: Ptr[char] = "\n"
+
+    # --- 0. (re)acquire the virtio-blk transport ---------------------------
+    base: uint64 = arm64_p30_find_blk()
+    if base == cast[uint64](0):
+        fp: Ptr[char] = "[arm64] Phase 35 FAIL: no virtio-blk transport found\n"
+        _uart_puts(fp)
+        _msr_daifset(2)
+        while True:
+            _wfi()
+        return 0
+    if arm64_p30_setup(base) != 1:
+        fp2: Ptr[char] = "[arm64] Phase 35 FAIL: block device bring-up failed\n"
+        _uart_puts(fp2)
+        _msr_daifset(2)
+        while True:
+            _wfi()
+        return 0
+
+    # --- 1. RAW write -> read-back round-trip on a scratch sector ----------
+    # Fill the write buffer with a known, position-dependent pattern.
+    wp: Ptr[uint8] = cast[Ptr[uint8]](P35_WBUF_PA)
+    i: int64 = 0
+    while i < SECTOR_SIZE:
+        wp[i] = cast[uint8]((i * 7 + 0x5A) & 0xFF)
+        i = i + 1
+    _dsb_ish()
+
+    if arm64_p30_write_sector_from(base, P35_SCRATCH_LBA, P35_WBUF_PA) != 1:
+        fp3: Ptr[char] = "[arm64] Phase 35 FAIL: scratch-sector write did not complete OK\n"
+        _uart_puts(fp3)
+        _msr_daifset(2)
+        while True:
+            _wfi()
+        return 0
+
+    if arm64_p30_read_sector_into(base, P35_SCRATCH_LBA, P35_RBUF_PA) != 1:
+        fp4: Ptr[char] = "[arm64] Phase 35 FAIL: scratch-sector read-back did not complete\n"
+        _uart_puts(fp4)
+        _msr_daifset(2)
+        while True:
+            _wfi()
+        return 0
+
+    rp: Ptr[uint8] = cast[Ptr[uint8]](P35_RBUF_PA)
+    raw_ok: int64 = 1
+    i = 0
+    while i < SECTOR_SIZE:
+        if rp[i] != cast[uint8]((i * 7 + 0x5A) & 0xFF):
+            raw_ok = 0
+        i = i + 1
+    if raw_ok == 0:
+        fp5: Ptr[char] = "[arm64] Phase 35 FAIL: scratch read-back bytes did not match the written pattern\n"
+        _uart_puts(fp5)
+        _msr_daifset(2)
+        while True:
+            _wfi()
+        return 0
+    rm: Ptr[char] = "[arm64] Phase 35: raw write->read-back of scratch sector "
+    _uart_puts(rm)
+    _uart_puthex(P35_SCRATCH_LBA)
+    rm2: Ptr[char] = " verified (512 bytes match)\n"
+    _uart_puts(rm2)
+
+    # --- 2. re-parse the FAT16 BPB off sector 0 ----------------------------
+    if arm64_p30_read_sector_into(base, cast[uint64](0), P31_SEC_PA) != 1:
+        fp6: Ptr[char] = "[arm64] Phase 35 FAIL: boot-sector read for FS write failed\n"
+        _uart_puts(fp6)
+        _msr_daifset(2)
+        while True:
+            _wfi()
+        return 0
+    if arm64_p31_parse_bpb() != 1:
+        fp7: Ptr[char] = "[arm64] Phase 35 FAIL: BPB geometry not a supported FAT16\n"
+        _uart_puts(fp7)
+        _msr_daifset(2)
+        while True:
+            _wfi()
+        return 0
+
+    # --- 3. locate HELLO.TXT's directory entry (sector LBA + offset) -------
+    dir_lba: int64 = -1
+    ent_off: int64 = -1
+    first_clus: int64 = -1
+    s: int64 = 0
+    while s < arm64_p31_root_secs:
+        lba: int64 = arm64_p31_root_lba + s
+        if arm64_p30_read_sector_into(base, cast[uint64](lba), P31_SEC_PA) != 1:
+            fp8: Ptr[char] = "[arm64] Phase 35 FAIL: root-dir sector read failed\n"
+            _uart_puts(fp8)
+            _msr_daifset(2)
+            while True:
+                _wfi()
+            return 0
+        e: int64 = 0
+        while e < arm64_p31_bytes_per_sec:
+            pp: Ptr[uint8] = cast[Ptr[uint8]](P31_SEC_PA)
+            first_byte: uint8 = pp[e]
+            if cast[uint64](first_byte) == cast[uint64](0):
+                s = arm64_p31_root_secs
+                e = arm64_p31_bytes_per_sec
+            else:
+                if arm64_p31_name_matches(P31_SEC_PA, e) == 1:
+                    dir_lba = lba
+                    ent_off = e
+                    first_clus = arm64_p31_rd16(P31_SEC_PA, e + 26)
+                    s = arm64_p31_root_secs
+                    e = arm64_p31_bytes_per_sec
+                else:
+                    e = e + 32
+        s = s + 1
+
+    if first_clus < 2:
+        fp9: Ptr[char] = "[arm64] Phase 35 FAIL: HELLO.TXT not found for FS write\n"
+        _uart_puts(fp9)
+        _msr_daifset(2)
+        while True:
+            _wfi()
+        return 0
+
+    fm: Ptr[char] = "[arm64] Phase 35: HELLO.TXT dir_lba="
+    _uart_puts(fm)
+    _uart_puthex(cast[uint64](dir_lba))
+    fm2: Ptr[char] = " ent_off="
+    _uart_puts(fm2)
+    _uart_puthex(cast[uint64](ent_off))
+    fm3: Ptr[char] = " first_clus="
+    _uart_puts(fm3)
+    _uart_puthex(cast[uint64](first_clus))
+    _uart_puts(nl)
+
+    # --- 4. rewrite the file's data cluster with the NEW payload -----------
+    # The payload (18 bytes) fits within the single data cluster, so we read the
+    # cluster's first sector, overwrite the leading bytes, and write it back.
+    clus_lba: int64 = arm64_p31_data_lba + ((first_clus - 2) * arm64_p31_sec_per_clus)
+    if arm64_p30_read_sector_into(base, cast[uint64](clus_lba), P35_WBUF_PA) != 1:
+        fp10: Ptr[char] = "[arm64] Phase 35 FAIL: data-cluster read-modify-write read failed\n"
+        _uart_puts(fp10)
+        _msr_daifset(2)
+        while True:
+            _wfi()
+        return 0
+    dwp: Ptr[uint8] = cast[Ptr[uint8]](P35_WBUF_PA)
+    j: int64 = 0
+    while j < P35_NEW_LEN:
+        dwp[j] = arm64_p35_new_byte(j)
+        j = j + 1
+    _dsb_ish()
+    if arm64_p30_write_sector_from(base, cast[uint64](clus_lba), P35_WBUF_PA) != 1:
+        fp11: Ptr[char] = "[arm64] Phase 35 FAIL: data-cluster write did not complete OK\n"
+        _uart_puts(fp11)
+        _msr_daifset(2)
+        while True:
+            _wfi()
+        return 0
+
+    # --- 5. update the directory entry's size field (offset +28, u32) ------
+    # Re-read the dir sector, set the 4-byte size to the new length, write back.
+    if arm64_p30_read_sector_into(base, cast[uint64](dir_lba), P35_WBUF_PA) != 1:
+        fp12: Ptr[char] = "[arm64] Phase 35 FAIL: dir-entry read-modify-write read failed\n"
+        _uart_puts(fp12)
+        _msr_daifset(2)
+        while True:
+            _wfi()
+        return 0
+    szp: Ptr[uint8] = cast[Ptr[uint8]](P35_WBUF_PA + cast[uint64](ent_off + 28))
+    szp[0] = cast[uint8](P35_NEW_LEN & 0xFF)
+    szp[1] = cast[uint8]((P35_NEW_LEN >> 8) & 0xFF)
+    szp[2] = cast[uint8]((P35_NEW_LEN >> 16) & 0xFF)
+    szp[3] = cast[uint8]((P35_NEW_LEN >> 24) & 0xFF)
+    _dsb_ish()
+    if arm64_p30_write_sector_from(base, cast[uint64](dir_lba), P35_WBUF_PA) != 1:
+        fp13: Ptr[char] = "[arm64] Phase 35 FAIL: dir-entry size write did not complete OK\n"
+        _uart_puts(fp13)
+        _msr_daifset(2)
+        while True:
+            _wfi()
+        return 0
+
+    wmsg: Ptr[char] = "[arm64] Phase 35: rewrote HELLO.TXT data cluster + dir size via virtio-blk WRITE\n"
+    _uart_puts(wmsg)
+
+    # --- 6. re-read HELLO.TXT through the normal FAT16 read path -----------
+    # Re-locate the file fresh (proving the on-disk dir entry is consistent) and
+    # follow its FAT chain, assembling the bytes into P31_FILE_PA.
+    rd_clus: int64 = -1
+    rd_size: int64 = 0
+    s = 0
+    while s < arm64_p31_root_secs:
+        lba2: int64 = arm64_p31_root_lba + s
+        if arm64_p30_read_sector_into(base, cast[uint64](lba2), P31_SEC_PA) != 1:
+            fp14: Ptr[char] = "[arm64] Phase 35 FAIL: re-read root-dir sector failed\n"
+            _uart_puts(fp14)
+            _msr_daifset(2)
+            while True:
+                _wfi()
+            return 0
+        e2: int64 = 0
+        while e2 < arm64_p31_bytes_per_sec:
+            pp2: Ptr[uint8] = cast[Ptr[uint8]](P31_SEC_PA)
+            fb2: uint8 = pp2[e2]
+            if cast[uint64](fb2) == cast[uint64](0):
+                s = arm64_p31_root_secs
+                e2 = arm64_p31_bytes_per_sec
+            else:
+                if arm64_p31_name_matches(P31_SEC_PA, e2) == 1:
+                    rd_clus = arm64_p31_rd16(P31_SEC_PA, e2 + 26)
+                    rd_size = arm64_p31_rd32(P31_SEC_PA, e2 + 28)
+                    s = arm64_p31_root_secs
+                    e2 = arm64_p31_bytes_per_sec
+                else:
+                    e2 = e2 + 32
+        s = s + 1
+
+    if rd_clus < 2:
+        fp15: Ptr[char] = "[arm64] Phase 35 FAIL: HELLO.TXT not found on FAT re-read\n"
+        _uart_puts(fp15)
+        _msr_daifset(2)
+        while True:
+            _wfi()
+        return 0
+
+    spc: int64 = arm64_p31_sec_per_clus
+    dst_off: int64 = 0
+    clus: int64 = rd_clus
+    remaining: int64 = rd_size
+    guard: int64 = 0
+    while remaining > 0:
+        if clus < 2:
+            remaining = 0
+        else:
+            if clus >= 0xFFF8:
+                remaining = 0
+            else:
+                if guard > 4096:
+                    remaining = 0
+                else:
+                    guard = guard + 1
+                    cl: int64 = arm64_p31_data_lba + ((clus - 2) * spc)
+                    sc: int64 = 0
+                    while sc < spc:
+                        if remaining <= 0:
+                            sc = spc
+                        else:
+                            if arm64_p30_read_sector_into(base, cast[uint64](cl + sc), P31_SEC_PA) != 1:
+                                fp16: Ptr[char] = "[arm64] Phase 35 FAIL: FAT-chain data read failed\n"
+                                _uart_puts(fp16)
+                                _msr_daifset(2)
+                                while True:
+                                    _wfi()
+                                return 0
+                            take: int64 = arm64_p31_bytes_per_sec
+                            if remaining < take:
+                                take = remaining
+                            dst_off = arm64_p31_copy_bytes(P31_SEC_PA, 0, dst_off, take)
+                            remaining = remaining - take
+                            sc = sc + 1
+                    nxt: int64 = arm64_p31_fat_next(base, clus)
+                    if nxt < 0:
+                        fp17: Ptr[char] = "[arm64] Phase 35 FAIL: FAT-chain link read failed\n"
+                        _uart_puts(fp17)
+                        _msr_daifset(2)
+                        while True:
+                            _wfi()
+                        return 0
+                    clus = nxt
+
+    # --- 7. verify the re-read bytes equal the NEW payload -----------------
+    fbuf: Ptr[uint8] = cast[Ptr[uint8]](P31_FILE_PA)
+    fs_ok: int64 = 1
+    if rd_size != P35_NEW_LEN:
+        fs_ok = 0
+    if dst_off != P35_NEW_LEN:
+        fs_ok = 0
+    if fs_ok != 0:
+        k: int64 = 0
+        while k < P35_NEW_LEN:
+            if fbuf[k] != arm64_p35_new_byte(k):
+                fs_ok = 0
+            k = k + 1
+
+    sm: Ptr[char] = "[arm64] Phase 35 summary: raw_ok=1 fs_read_len="
+    _uart_puts(sm)
+    _uart_puthex(cast[uint64](dst_off))
+    sm2: Ptr[char] = " new_len="
+    _uart_puts(sm2)
+    _uart_puthex(cast[uint64](P35_NEW_LEN))
+    _uart_puts(nl)
+
+    if fs_ok != 0:
+        rpd: Ptr[char] = "[arm64] Phase 35: wrote a scratch sector and read it back byte-for-byte, then rewrote HELLO.TXT's data cluster + dir-entry size over the virtio-blk WRITE path and read the new content back through the real FAT16 chain (ARM64-WRITE-OK-A64)\n"
+        _uart_puts(rpd)
+        pp: Ptr[char] = "[arm64] Phase 35 PASS: virtio-blk WRITE + FAT16 filesystem write round-trip -> ARM64-WRITE-OK-A64\n"
+        _uart_puts(pp)
+    else:
+        fp18: Ptr[char] = "[arm64] Phase 35 FAIL: FAT16 re-read content did not match the written payload\n"
+        _uart_puts(fp18)
+
+    _msr_daifset(2)
+    while True:
+        _wfi()
     return 0
 
 
