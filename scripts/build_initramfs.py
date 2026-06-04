@@ -2252,6 +2252,21 @@ if os.environ.get("ENABLE_VLAN_TEST") == "1":
 if os.environ.get("ENABLE_BOND_TEST") == "1":
     FILES.append(("/etc/bond-test", b"1\n"))
 
+# Native traffic control Token Bucket Filter (tbf) egress shaping self-test.
+# scripts/test_qdisc.sh sets ENABLE_QDISC_TEST=1 to plant /etc/qdisc-test;
+# init/main.ad's boot:37.qdisc gate then runs qdisc_selftest()
+# (drivers/net/qdisc.ad), a pure in-memory test that drives the REAL token
+# accounting against an INJECTED virtual clock: a full bucket admits a burst
+# up to its depth back-to-back; the next packet at the same instant EXCEEDS
+# (drops) because the bucket is empty; advancing virtual time refills the
+# bucket (rate * elapsed tokens, capped at burst) and re-admits a packet; a
+# long idle is capped at the burst depth (no hoarding); a steady stream at
+# exactly `rate` sustains (all conform); and a stream above `rate` sheds the
+# excess. Prints "[qdisc] PASS" / "[qdisc] FAIL". Default boots ship no marker
+# so it is a no-op everywhere else.
+if os.environ.get("ENABLE_QDISC_TEST") == "1":
+    FILES.append(("/etc/qdisc-test", b"1\n"))
+
 # Linux-style overlayfs (union filesystem) self-test. scripts/test_overlayfs.sh
 # sets ENABLE_OVERLAYFS_TEST=1 to plant /etc/overlayfs-test; init/main.ad's
 # boot:37.ovl gate then runs overlayfs_selftest() (fs/overlayfs.ad), which

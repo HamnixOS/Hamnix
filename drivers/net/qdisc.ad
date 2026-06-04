@@ -1,0 +1,309 @@
+# drivers/net/qdisc.ad
+#
+# Native traffic control: a Token Bucket Filter (tbf) egress qdisc.
+#
+# This implements REAL egress rate shaping with a classic token bucket,
+# the same algorithm Linux's `tc qdisc add ... tbf` uses:
+#
+#   * `rate`   — the sustained fill rate in tokens/second, where ONE token
+#                buys ONE byte of egress. The bucket gains `rate` tokens per
+#                second of (virtual) time.
+#   * `burst`  — the bucket DEPTH: the maximum number of tokens (bytes) that
+#                can accumulate. A full bucket lets a burst of up to `burst`
+#                bytes leave back-to-back; the bucket then drains and the
+#                long-run egress rate is clamped to `rate`.
+#   * tokens   — the CURRENT bucket level, in tokens (bytes). Refills as
+#                virtual time advances and is capped at `burst`.
+#
+# Virtual time is INJECTED: every enqueue call is handed the current
+# timestamp (`now`, in ticks). The bucket refills for the elapsed ticks
+# since the last enqueue. Refill math:
+#
+#       elapsed   = now - last_update                       (ticks)
+#       gained    = (rate * elapsed) / TICKS_PER_SEC        (tokens)
+#       tokens    = min(tokens + gained, burst)
+#       last_update advances by the amount of time we actually "consumed"
+#                 (so sub-tick fractional credit is not silently dropped).
+#
+# Conform/exceed decision for a packet of N bytes:
+#
+#       refill to `now`
+#       if tokens >= N:  CONFORM  -> tokens -= N, packet passes (return 1)
+#       else:            EXCEED   -> packet dropped               (return 0)
+#
+# Because the clock is injected, the whole shaper is deterministic and the
+# self-test never touches the wall clock.
+
+from kernel.printk.printk import printk0, printk1, printk2, printk_set_level
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
+
+
+# --- Time base -------------------------------------------------------------
+#
+# Virtual time is measured in abstract "ticks"; TICKS_PER_SEC ticks make one
+# second. 1000 ticks/sec == millisecond resolution, which keeps the test's
+# numbers tidy (a 1000 B/s rate gains exactly 1 token per tick).
+TBF_TICKS_PER_SEC: uint64 = 1000
+
+
+# =====================================================================
+# Token bucket state (a single tbf qdisc instance)
+# =====================================================================
+#
+# Module-scope globals only (no heap structs). One bucket is enough to
+# model an egress qdisc on one interface; the self-test reconfigures it
+# between scenarios via tbf_config().
+
+tbf_rate:        uint64 = 0      # fill rate, tokens (bytes) per second
+tbf_burst:       uint64 = 0      # bucket depth, max tokens (bytes)
+tbf_tokens:      uint64 = 0      # current token level (bytes)
+tbf_last_update: uint64 = 0      # virtual time the bucket was last refilled
+
+# Counters mirroring the /sys accounting a real tbf qdisc keeps.
+tbf_pkts_pass:  uint64 = 0       # packets that CONFORMED (passed)
+tbf_pkts_drop:  uint64 = 0       # packets that EXCEEDED (dropped)
+tbf_bytes_pass: uint64 = 0       # total conforming bytes egressed
+
+
+def tbf_config(rate: uint64, burst: uint64, now: uint64):
+    # Configure (or reconfigure) the bucket: set rate + depth, START FULL
+    # (a freshly-installed tbf admits a full burst immediately), and anchor
+    # virtual time to `now`. Resets the pass/drop counters.
+    tbf_rate        = rate
+    tbf_burst       = burst
+    tbf_tokens      = burst
+    tbf_last_update = now
+    tbf_pkts_pass   = 0
+    tbf_pkts_drop   = 0
+    tbf_bytes_pass  = 0
+
+
+def tbf_refill(now: uint64):
+    # Advance the bucket to virtual time `now`: add (rate * elapsed) /
+    # TICKS_PER_SEC tokens, capped at burst. To avoid silently discarding
+    # fractional (sub-tick) credit, last_update only advances by the whole
+    # number of ticks whose tokens we actually banked.
+    if now <= tbf_last_update:
+        # Clock did not advance (or went backwards) — nothing to add.
+        return
+    elapsed: uint64 = now - tbf_last_update
+    # tokens gained over `elapsed` ticks. rate*elapsed can be large, so this
+    # is computed in uint64 throughout.
+    gained: uint64 = (tbf_rate * elapsed) / TBF_TICKS_PER_SEC
+    if gained == 0:
+        # Not enough elapsed time to mint even one whole token. Leave
+        # last_update PUT so the fractional credit accrues toward the next
+        # refill instead of being lost.
+        return
+    # The whole number of ticks those `gained` tokens correspond to. Advance
+    # last_update by exactly that, banking the remainder for next time.
+    consumed_ticks: uint64 = (gained * TBF_TICKS_PER_SEC) / tbf_rate
+    tbf_last_update = tbf_last_update + consumed_ticks
+    new_tokens: uint64 = tbf_tokens + gained
+    if new_tokens > tbf_burst:
+        new_tokens = tbf_burst
+    tbf_tokens = new_tokens
+
+
+def tbf_enqueue(nbytes: uint64, now: uint64) -> int32:
+    # The egress shaping decision for a packet of `nbytes` bytes at virtual
+    # time `now`. Refills the bucket to `now`, then:
+    #   * tokens >= nbytes -> CONFORM: spend the tokens, return 1 (pass).
+    #   * otherwise        -> EXCEED:  return 0 (drop).
+    tbf_refill(now)
+    if tbf_tokens >= nbytes:
+        tbf_tokens     = tbf_tokens - nbytes
+        tbf_pkts_pass  = tbf_pkts_pass + 1
+        tbf_bytes_pass = tbf_bytes_pass + nbytes
+        return 1
+    tbf_pkts_drop = tbf_pkts_drop + 1
+    return 0
+
+
+def tbf_token_level() -> uint64:
+    # Current token level (for assertions / introspection).
+    return tbf_tokens
+
+
+# =====================================================================
+# In-kernel self-test (deterministic, injected virtual clock)
+# =====================================================================
+#
+# Mirrors drivers/net/vlan.ad::vlan_selftest / bond.ad::bond_selftest.
+# Pure in-memory, no NIC. Drives the REAL token accounting against an
+# injected `now` so timing is fully deterministic.
+
+def _tbf_emerg0(s: Ptr[char]):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0(s)
+
+
+def _tbf_emerg1(s: Ptr[char], a: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk1(s, a)
+
+
+def _tbf_emerg2(s: Ptr[char], a: uint64, b: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk2(s, a, b)
+
+
+def qdisc_selftest() -> int32:
+    # Returns 1 on PASS, 0 on FAIL. Prints [qdisc] marker lines.
+    _tbf_emerg0("[qdisc] self-test start\n")
+    ok: int32 = 1
+
+    # ------------------------------------------------------------------
+    # Scenario A — burst-up-to-depth, then exceed at the SAME instant,
+    #              then refill enough and pass again.
+    #
+    # rate  = 1000 bytes/sec (with TICKS_PER_SEC=1000 -> 1 token/tick)
+    # burst = 1500 bytes (bucket depth)
+    # All packets are 500 bytes. A full bucket (1500) admits exactly 3
+    # back-to-back 500 B packets (1500 B) at t=0; the 4th at the same
+    # instant must EXCEED (bucket empty). ------------------------------
+    tbf_config(1000, 1500, 0)
+    if tbf_token_level() != 1500:
+        _tbf_emerg1("[qdisc] FAIL: fresh bucket level %d != 1500\n",
+                    tbf_token_level())
+        ok = 0
+
+    # Three conforming 500 B packets at t=0 drain the full 1500 B burst.
+    burst_ok: int32 = 1
+    bi: uint64 = 0
+    while bi < 3:
+        r: int32 = tbf_enqueue(500, 0)
+        if r != 1:
+            burst_ok = 0
+            bi = 3
+        else:
+            bi = bi + 1
+    if burst_ok != 1:
+        _tbf_emerg0("[qdisc] FAIL: full burst of 3x500B did not all conform\n")
+        ok = 0
+    if tbf_token_level() != 0:
+        _tbf_emerg1("[qdisc] FAIL: post-burst level %d != 0\n",
+                    tbf_token_level())
+        ok = 0
+    if ok == 1:
+        _tbf_emerg0("[qdisc] burst up to depth (3x500B = 1500B burst) conforms OK\n")
+
+    # The very next 500 B packet at the SAME instant (t=0) must EXCEED —
+    # the bucket is empty and no time has passed to refill it.
+    over: int32 = tbf_enqueue(500, 0)
+    if over != 0:
+        _tbf_emerg0("[qdisc] FAIL: over-burst packet at t=0 did not drop\n")
+        ok = 0
+    else:
+        _tbf_emerg0("[qdisc] over-burst packet (bucket empty) drops OK\n")
+
+    # Advance virtual time by 500 ticks. At 1000 B/s that mints exactly
+    # 500 tokens (1000 * 500 / 1000), so a 500 B packet now CONFORMS.
+    after_refill: int32 = tbf_enqueue(500, 500)
+    if after_refill != 1:
+        _tbf_emerg0("[qdisc] FAIL: packet after 500-tick refill did not pass\n")
+        ok = 0
+    else:
+        _tbf_emerg0("[qdisc] refill (advance 500 ticks -> +500 tokens) re-admits OK\n")
+    # Exactly drained again.
+    if tbf_token_level() != 0:
+        _tbf_emerg1("[qdisc] FAIL: post-refill level %d != 0\n",
+                    tbf_token_level())
+        ok = 0
+
+    # ------------------------------------------------------------------
+    # Scenario B — refill is CAPPED at burst (no token hoarding).
+    # Let a long idle period elapse; the bucket must not exceed `burst`.
+    # ------------------------------------------------------------------
+    tbf_config(1000, 1500, 1000)
+    # Idle for 10 seconds (10000 ticks) — would mint 10000 tokens if
+    # uncapped, but the depth is 1500. A no-op refill via a 0-byte probe.
+    tbf_refill(11000)
+    if tbf_token_level() != 1500:
+        _tbf_emerg1("[qdisc] FAIL: idle refill not capped at burst, level=%d\n",
+                    tbf_token_level())
+        ok = 0
+    else:
+        _tbf_emerg0("[qdisc] long-idle refill capped at burst (1500) OK\n")
+
+    # ------------------------------------------------------------------
+    # Scenario C — a steady stream EXACTLY at `rate` sustains forever
+    #              (every packet conforms).
+    #
+    # rate = 1000 B/s, burst = 1000 B. Send a 100 B packet every 100
+    # ticks: arrival rate = 100 B / 0.1 s = 1000 B/s == rate. Over 50
+    # packets ALL must conform (the bucket refills exactly what each
+    # packet spends). --------------------------------------------------
+    tbf_config(1000, 1000, 0)
+    sustain_ok: int32 = 1
+    sp: uint64 = 0
+    while sp < 50:
+        t: uint64 = sp * 100              # 0, 100, 200, ... ticks
+        r2: int32 = tbf_enqueue(100, t)
+        if r2 != 1:
+            sustain_ok = 0
+            sp = 50
+        else:
+            sp = sp + 1
+    if sustain_ok != 1:
+        _tbf_emerg0("[qdisc] FAIL: steady stream at rate shed a packet\n")
+        ok = 0
+    if tbf_pkts_drop != 0:
+        _tbf_emerg1("[qdisc] FAIL: steady-at-rate dropped %d packets\n",
+                    tbf_pkts_drop)
+        ok = 0
+    if tbf_pkts_pass != 50:
+        _tbf_emerg1("[qdisc] FAIL: steady-at-rate only passed %d/50\n",
+                    tbf_pkts_pass)
+        ok = 0
+    if ok == 1:
+        _tbf_emerg2("[qdisc] steady stream at rate sustains (%d pass / %d drop) OK\n",
+                    tbf_pkts_pass, tbf_pkts_drop)
+
+    # ------------------------------------------------------------------
+    # Scenario D — a stream ABOVE `rate` sheds the excess.
+    #
+    # Same shaper (rate 1000 B/s, burst 1000 B) but offer 100 B packets
+    # every 50 ticks: offered rate = 100 B / 0.05 s = 2000 B/s == 2x rate.
+    # Long-run egress is clamped to `rate`, so ~half the packets must drop.
+    # Over 100 offered packets: burst lets the first ~10 through, then it
+    # settles to 1 pass + 1 drop per pair. Assert that a substantial
+    # fraction is shed and that passes do NOT exceed the conforming budget.
+    # ------------------------------------------------------------------
+    tbf_config(1000, 1000, 0)
+    op: uint64 = 0
+    while op < 100:
+        t2: uint64 = op * 50              # every 50 ticks -> 2x rate
+        tbf_enqueue(100, t2)              # ignore per-packet result; tally below
+        op = op + 1
+    # Total span = 99 * 50 = 4950 ticks ≈ 4.95 s. Conforming budget =
+    # initial burst (1000 B) + rate*span = 1000 + 1000*4950/1000 = 5950 B,
+    # i.e. at most 59 of the 100-byte packets can conform. The rest (>=41)
+    # MUST be shed. We assert excess is genuinely dropped AND that we never
+    # passed more bytes than the token budget allowed.
+    if tbf_pkts_drop == 0:
+        _tbf_emerg0("[qdisc] FAIL: over-rate stream shed nothing\n")
+        ok = 0
+    if (tbf_pkts_pass + tbf_pkts_drop) != 100:
+        _tbf_emerg2("[qdisc] FAIL: over-rate accounted %d pass + %d drop != 100\n",
+                    tbf_pkts_pass, tbf_pkts_drop)
+        ok = 0
+    # Conforming bytes must not exceed the token budget (5950 B == 59 pkts).
+    if tbf_bytes_pass > 5950:
+        _tbf_emerg1("[qdisc] FAIL: passed %d bytes exceeds token budget 5950\n",
+                    tbf_bytes_pass)
+        ok = 0
+    # And the excess shed must be the offered-minus-budget (>=41 packets).
+    if tbf_pkts_drop < 41:
+        _tbf_emerg1("[qdisc] FAIL: over-rate shed only %d (< 41 expected)\n",
+                    tbf_pkts_drop)
+        ok = 0
+    if ok == 1:
+        _tbf_emerg2("[qdisc] over-rate stream sheds excess (%d pass / %d drop) OK\n",
+                    tbf_pkts_pass, tbf_pkts_drop)
+
+    if ok == 1:
+        _tbf_emerg0("[qdisc] PASS\n")
+        return 1
+    _tbf_emerg0("[qdisc] FAIL\n")
+    return 0
