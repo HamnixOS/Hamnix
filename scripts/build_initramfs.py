@@ -571,6 +571,13 @@ if os.environ.get("ENABLE_CLOSERANGE_TEST") == "1":
 if os.environ.get("ENABLE_FANOTIFY_TEST") == "1":
     FILES.append(("/etc/fanotify-test", b"1\n"))
 
+# init_module/finit_module/delete_module self-test. scripts/test_module_
+# syscalls.sh sets ENABLE_KMODSYS_TEST=1 to plant /etc/kmodsys-test;
+# init/main.ad at boot:37.kmodsys detects the marker and runs
+# kmod_syscall_selftest().
+if os.environ.get("ENABLE_KMODSYS_TEST") == "1":
+    FILES.append(("/etc/kmodsys-test", b"1\n"))
+
 # ext4 xattr + POSIX ACL self-test. scripts/test_ext4_xattr.sh sets
 # ENABLE_EXT4XATTR_TEST=1 to plant /etc/ext4xattr-test; init/main.ad at
 # boot:37.xat detects the marker and runs ext4_xattr_selftest().

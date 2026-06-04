@@ -418,6 +418,12 @@ from drivers.rtc.cmos import rtc_boot_epoch_get
 from mm.slab import kmalloc, kfree, kzalloc
 from mm.page_alloc import alloc_pages, free_pages, \
     page_alloc_free_count, alloc_page, free_page
+# §kmod: init_module / finit_module / delete_module marshal user (or fd)
+# .ko bytes into Hamnix's existing in-kernel Linux-module loader. We only
+# wire the syscall entry points; the loader machinery is unchanged.
+from linux_abi.loader import (
+    kmod_linux_load, kmod_linux_unload, kmod_linux_find_by_name,
+)
 # sysinfo(2) reports the machine's real RAM extent (the memblock region)
 # and what of it is still unhanded-out, plus any pages the buddy allocator
 # has parked back on its free list.
@@ -478,6 +484,10 @@ from mm.uaccess import (
 # the C-runtime shim that compiler.adder links against; same pattern as
 # linux_abi/u_libc.ad and mm/slab.ad.
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+# memcpy: the finit_module grow-by-chunks read loop copies the partial
+# image into a freshly-enlarged buffer. Same C-runtime-shim extern as
+# memset / the other arch modules.
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 # M16.36: needed by _u_brk to flush stale TLB entries after the lazy
 # brk reservation installs fresh per-task PT entries — the same TLB-
 # flush dance do_execve / SYS_SPAWN do after elf_apply_last_user_mapping.
@@ -946,6 +956,13 @@ SYS_memfd_create:      uint64 = 319
 SYS_io_uring_setup:    uint64 = 425
 SYS_io_uring_enter:    uint64 = 426
 SYS_io_uring_register: uint64 = 427
+# §kmod: Linux module management. init_module(175) takes an in-memory
+# .ko image; finit_module(313) takes an open fd to the .ko (the path
+# real modern insmod/modprobe use); delete_module(176) unloads by name.
+# All three funnel into Hamnix's existing kmod_linux_load/unload loader.
+SYS_init_module:       uint64 = 175
+SYS_delete_module:     uint64 = 176
+SYS_finit_module:      uint64 = 313
 
 
 # Linux errno values returned by stub handlers. Kept local to avoid
@@ -953,7 +970,9 @@ SYS_io_uring_register: uint64 = 427
 # as <asm-generic/errno-base.h>.
 ELINUX_NOENT:  int64 = -2
 ELINUX_SRCH:   int64 = -3
+ELINUX_NOEXEC: int64 = -8           # -ENOEXEC — bad / non-ELF module image
 ELINUX_BADF:   int64 = -9
+ELINUX_NOMEM:  int64 = -12          # -ENOMEM — module buffer alloc failed
 # #163: -EFAULT for the uaccess-converted handlers below. (A second
 # ELINUX_FAULT is declared later near the seccomp block with the same
 # value; both resolve to -14. This early copy guarantees the converted
@@ -5651,6 +5670,184 @@ def _u_copy_file_range(a0: uint64, a1: uint64, a2: uint64,
     return total
 
 
+# §kmod handlers -----------------------------------------------------
+#
+# init_module / finit_module / delete_module: the Linux module-management
+# trio. They marshal user-supplied (or fd-backed) .ko bytes into Hamnix's
+# existing kmod_linux_load loader and resolve a module name back to its
+# loaded slot for kmod_linux_unload. The loader itself is unchanged — we
+# only do the user<->kernel buffer plumbing here.
+#
+# A cap on the image we'll accept: the loader backs the .ko in pages via
+# alloc_pages (MAX_ORDER = 4 MiB), so an oversized request would fail
+# there anyway. 8 MiB is comfortably above any real .ko while bounding a
+# bogus `len` before we even try to allocate.
+KMOD_MAX_IMAGE: uint64 = 8388608        # 8 MiB
+# Chunk size for the finit_module fd read loop.
+KMOD_READ_CHUNK: uint64 = 65536
+
+
+def _u_init_module(a0: uint64, a1: uint64, a2: uint64,
+                   a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # long init_module(void *module_image, unsigned long len,
+    #                  const char *param_values)
+    #
+    # Copy `len` bytes of the .ko image out of user memory into a kernel
+    # buffer, hand it to the in-kernel loader, and free the buffer. The
+    # param_values string is accepted but ignored — Hamnix modules carry
+    # no module_param plumbing here.
+    uimg: uint64 = a0
+    ulen: uint64 = a1
+    if uimg == 0 or ulen == 0:
+        return ELINUX_INVAL
+    if ulen > KMOD_MAX_IMAGE:
+        return ELINUX_NOMEM
+    kbuf: uint64 = kmalloc(ulen)
+    if kbuf == 0:
+        return ELINUX_NOMEM
+    # Single translated copy of the whole image; a bad user pointer
+    # surfaces as -EFAULT rather than a kernel #PF.
+    if copy_from_user(kbuf, uimg, ulen) != 0:
+        kfree(kbuf)
+        return ELINUX_EFAULT
+    slot: int32 = kmod_linux_load(cast[Ptr[uint8]](kbuf), ulen)
+    kfree(kbuf)
+    if slot < 0:
+        # Loader returns a negative -errno-ish code; map anything we don't
+        # specifically recognise onto -ENOEXEC (the kernel's generic
+        # "not a loadable module" answer for init_module).
+        if cast[int64](slot) == ELINUX_NOMEM:
+            return ELINUX_NOMEM
+        return ELINUX_NOEXEC
+    return 0
+
+
+def _u_finit_module(a0: uint64, a1: uint64, a2: uint64,
+                    a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # long finit_module(int fd, const char *param_values, int flags)
+    #
+    # The path real modern insmod/modprobe use: read the entire .ko out of
+    # an already-open fd into a kernel buffer, then load it. We size the
+    # file via lseek(SEEK_END); if that fails (stream fd) we fall back to a
+    # grow-by-chunks read loop. param_values + flags are accepted, ignored.
+    fd: int32 = cast[int32](a0)
+    if fd < 0:
+        return ELINUX_BADF
+
+    fsz: int64 = _u_file_size_via_lseek(fd)
+    if fsz > 0:
+        # Known size: one allocation, seek to 0, read it all.
+        total_sz: uint64 = cast[uint64](fsz)
+        if total_sz > KMOD_MAX_IMAGE:
+            return ELINUX_NOMEM
+        kbuf: uint64 = kmalloc(total_sz)
+        if kbuf == 0:
+            return ELINUX_NOMEM
+        sk: int64 = vfs_lseek(fd, 0, 0)            # SEEK_SET
+        if sk < 0:
+            kfree(kbuf)
+            return ELINUX_NOEXEC
+        got: uint64 = 0
+        ok: int32 = 1
+        while got < total_sz:
+            want: uint64 = total_sz - got
+            n: int64 = vfs_read(fd, cast[Ptr[uint8]](kbuf + got), want)
+            if n < 0:
+                ok = 0
+                break
+            if n == 0:
+                break                              # short EOF — load what we have
+            got = got + cast[uint64](n)
+        if ok == 0:
+            kfree(kbuf)
+            return ELINUX_NOEXEC
+        slot: int32 = kmod_linux_load(cast[Ptr[uint8]](kbuf), got)
+        kfree(kbuf)
+        if slot < 0:
+            if cast[int64](slot) == ELINUX_NOMEM:
+                return ELINUX_NOMEM
+            return ELINUX_NOEXEC
+        return 0
+
+    # Unknown size (lseek-rejecting fd): grow a buffer by reading chunks.
+    cap: uint64 = KMOD_READ_CHUNK
+    buf2: uint64 = kmalloc(cap)
+    if buf2 == 0:
+        return ELINUX_NOMEM
+    used: uint64 = 0
+    fail: int32 = 0
+    cont: int32 = 1
+    while cont != 0:
+        if used == cap:
+            # Grow ×2 (bounded), copy, free old.
+            newcap: uint64 = cap * 2
+            if newcap > KMOD_MAX_IMAGE:
+                newcap = KMOD_MAX_IMAGE
+            if newcap == cap:
+                fail = 1                           # exceeded the image cap
+                break
+            nb: uint64 = kmalloc(newcap)
+            if nb == 0:
+                fail = 1
+                break
+            memcpy(cast[Ptr[uint8]](nb), cast[Ptr[uint8]](buf2), used)
+            kfree(buf2)
+            buf2 = nb
+            cap = newcap
+        r: int64 = vfs_read(fd, cast[Ptr[uint8]](buf2 + used), cap - used)
+        if r < 0:
+            fail = 1
+            break
+        if r == 0:
+            cont = 0                               # EOF
+            continue
+        used = used + cast[uint64](r)
+    if fail != 0 or used == 0:
+        kfree(buf2)
+        if used == 0:
+            return ELINUX_NOEXEC
+        return ELINUX_NOMEM
+    slot2: int32 = kmod_linux_load(cast[Ptr[uint8]](buf2), used)
+    kfree(buf2)
+    if slot2 < 0:
+        if cast[int64](slot2) == ELINUX_NOMEM:
+            return ELINUX_NOMEM
+        return ELINUX_NOEXEC
+    return 0
+
+
+# delete_module name scratch — MODULE_NAME_LEN-shaped, NUL-terminated.
+_kmod_delname: Array[64, uint8]
+
+
+def _u_delete_module(a0: uint64, a1: uint64, a2: uint64,
+                     a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # long delete_module(const char *name_user, int flags)
+    #
+    # Copy the NUL-terminated module name out of user memory (bounded),
+    # resolve it to its loaded slot, and run the loader's unload. flags
+    # (O_NONBLOCK / O_TRUNC force) are accepted but ignored.
+    uname: uint64 = a0
+    if uname == 0:
+        return ELINUX_EFAULT
+    # strncpy_from_user returns the length copied (>= 0) or -EFAULT.
+    cl: int64 = strncpy_from_user(cast[uint64](&_kmod_delname[0]), uname, 64)
+    if cl < 0:
+        return ELINUX_EFAULT
+    if cl >= 64:
+        return ELINUX_NAMETOOLONG
+    _kmod_delname[63] = 0
+    slot: int32 = kmod_linux_find_by_name(&_kmod_delname[0])
+    if slot < 0:
+        return ELINUX_NOENT
+    rc: int32 = kmod_linux_unload(slot)
+    if rc < 0:
+        if cast[int64](rc) == ELINUX_NOENT:
+            return ELINUX_NOENT
+        return ELINUX_INVAL
+    return 0
+
+
 # splice/tee/vmsplice staging buffer. Module-scope so the move loop
 # never blows the syscall stack — matches sendfile / copy_file_range's
 # 4 KiB grain so a pipe<->file move fills the ring in the same cadence.
@@ -10147,6 +10344,77 @@ def splice_selftest() -> int32:
 
 
 # ---------------------------------------------------------------------
+# §kmod: init_module / finit_module / delete_module boot self-test.
+#
+# Drives all three module-management syscalls through the REAL
+# linux_u_syscall_dispatch entry — the same path a Linux insmod /
+# modprobe / rmmod in the distro namespace takes — so the wiring,
+# the user-buffer plumbing, and delete_module's name->slot resolver
+# are all exercised. We assert on the error paths (which need no real
+# .ko image and so stay hermetic): a NULL/oversize image is rejected
+# before the loader, a bad fd is -EBADF, and deleting an unknown name
+# is -ENOENT. The positive full-load round-trip (finit_module of a real
+# distro .ko followed by delete_module) is covered end-to-end by
+# scripts/test_l30_distro_module.sh, which already stages a real .ko.
+#
+# Gated by /etc/kmodsys-test (build_initramfs.py plants it when
+# ENABLE_KMODSYS_TEST=1); init/main.ad calls kmod_syscall_selftest().
+# Prints "[kmodsys] PASS" once every assertion holds.
+
+def kmod_syscall_selftest() -> int32:
+    # 1. init_module(NULL, 0, NULL) -> -EINVAL (rejected before alloc).
+    r1: int64 = linux_u_syscall_dispatch(SYS_init_module, 0, 0, 0, 0, 0, 0)
+    if r1 != ELINUX_INVAL:
+        printk1("[kmodsys] FAIL init_module(NULL) rc=%d\n", cast[uint64](r1))
+        return 1
+    printk0("[kmodsys] init_module(NULL)->EINVAL OK\n")
+
+    # 2. init_module with a non-NULL image but an absurd len -> -ENOMEM
+    #    (the cap rejects it before we ever touch user memory). a0 is a
+    #    harmless non-zero kernel pointer; the len check fires first.
+    big: uint64 = KMOD_MAX_IMAGE + 4096
+    r2: int64 = linux_u_syscall_dispatch(SYS_init_module,
+                                         cast[uint64](&big), big, 0, 0, 0, 0)
+    if r2 != ELINUX_NOMEM:
+        printk1("[kmodsys] FAIL init_module(oversize) rc=%d\n",
+                cast[uint64](r2))
+        return 1
+    printk0("[kmodsys] init_module(oversize)->ENOMEM OK\n")
+
+    # 3. finit_module(-1, NULL, 0) -> -EBADF (bad fd rejected up front).
+    r3: int64 = linux_u_syscall_dispatch(SYS_finit_module,
+                                         cast[uint64](cast[int64](-1)),
+                                         0, 0, 0, 0, 0)
+    if r3 != ELINUX_BADF:
+        printk1("[kmodsys] FAIL finit_module(-1) rc=%d\n", cast[uint64](r3))
+        return 1
+    printk0("[kmodsys] finit_module(badfd)->EBADF OK\n")
+
+    # 4. delete_module("no_such_module", 0) -> -ENOENT. This drives the
+    #    full name copy-in + kmod_linux_find_by_name scan, proving the
+    #    resolver returns -1 (=> ENOENT) for an unloaded name.
+    miss: Array[16, uint8]
+    miss[0]  = 110                                       # 'n'
+    miss[1]  = 111                                       # 'o'
+    miss[2]  = 95                                        # '_'
+    miss[3]  = 115                                       # 's'
+    miss[4]  = 117                                       # 'u'
+    miss[5]  = 99                                        # 'c'
+    miss[6]  = 104                                       # 'h'
+    miss[7]  = 0
+    r4: int64 = linux_u_syscall_dispatch(SYS_delete_module,
+                                         cast[uint64](&miss[0]), 0, 0, 0, 0, 0)
+    if r4 != ELINUX_NOENT:
+        printk1("[kmodsys] FAIL delete_module(missing) rc=%d\n",
+                cast[uint64](r4))
+        return 1
+    printk0("[kmodsys] delete_module(missing)->ENOENT OK\n")
+
+    printk0("[kmodsys] PASS\n")
+    return 0
+
+
+# ---------------------------------------------------------------------
 # close_range(2) + statx(2) boot self-test.
 #
 # Gated by /etc/closerange-test (build_initramfs.py plants it when
@@ -12133,6 +12401,17 @@ def _linux_u_syscall_dispatch_inner(nr: uint64,
     # path. Real handler overrides any autostub routing for nr 326.
     if nr == SYS_copy_file_range:
         return _u_copy_file_range(a0, a1, a2, a3, a4, a5)
+    # §kmod: init_module / finit_module / delete_module. These let real
+    # Linux insmod / modprobe / rmmod (in the distro namespace) drive
+    # Hamnix's in-kernel .ko loader. init_module takes an in-memory image,
+    # finit_module reads the .ko from an fd (the modern insmod path), and
+    # delete_module unloads by name.
+    if nr == SYS_init_module:
+        return _u_init_module(a0, a1, a2, a3, a4, a5)
+    if nr == SYS_finit_module:
+        return _u_finit_module(a0, a1, a2, a3, a4, a5)
+    if nr == SYS_delete_module:
+        return _u_delete_module(a0, a1, a2, a3, a4, a5)
     # Pipe zero-copy I/O family: splice (pipe<->file / pipe<->pipe),
     # tee (non-consuming pipe->pipe duplicate), vmsplice (user iovec ->
     # pipe). Built on the same VFS read/write + pipe-ring primitives the
