@@ -166,6 +166,18 @@ ext4_64bit: int32 = 0
 ext4_flex_bg:              int32  = 0
 ext4_log_groups_per_flex:  uint64 = 0
 
+# INCOMPAT_EA_INODE mount state. When the superblock declares the
+# feature (s_feature_incompat & 0x400) a single extended attribute whose
+# value is too large for the inline / external-block value region may be
+# stored in its OWN dedicated inode. For such an xattr the entry's
+# e_value_inum field (the u32 at entry offset 0x04 that, without this
+# feature, is the always-zero e_value_block) names that inode; the value
+# bytes are the referenced inode's regular file data (read via the normal
+# extent / block-map path) and the value length is that inode's i_size.
+# While ext4_ea_inode is 0 the e_value_inum field is ignored entirely, so
+# a filesystem WITHOUT the feature reads exactly as before.
+ext4_ea_inode: int32 = 0
+
 # #149: journal (JBD2) mount state. s_feature_compat HAS_JOURNAL (0x4)
 # and s_journal_inum (sb offset 0xE0) tell us whether a journal exists
 # and which inode holds it. ext4_has_journal is 1 once jbd2_attach
@@ -640,6 +652,15 @@ def ext4_init(slot: int32) -> int32:
         printk1("ext4: INCOMPAT_FLEX_BG present; log_groups_per_flex=%d\n",
                 ext4_log_groups_per_flex)
         printk0("ext4:   metadata located via descriptor fields (flex-aware)\n")
+
+    # INCOMPAT_EA_INODE: an xattr value too big for the inline / external
+    # block value region is stored in its own inode, named by the entry's
+    # e_value_inum field. Arm the xattr read path to follow e_value_inum.
+    # A no-feature image leaves ext4_ea_inode 0 and the field is ignored.
+    ext4_ea_inode = 0
+    if (incompat_feat & EXT4_FEATURE_INCOMPAT_EA_INODE) != 0:
+        ext4_ea_inode = 1
+        printk0("ext4: INCOMPAT_EA_INODE present; ea-inode xattr read armed\n")
 
     ext4_blockdev_slot = slot
     printk2("ext4: mounted; block_size=%d inodes_count=%d\n",
@@ -8389,6 +8410,7 @@ EXT4_FEATURE_RO_COMPAT_GDT_CSUM:     uint32 = 0x10
 EXT4_FEATURE_RO_COMPAT_BIGALLOC:     uint32 = 0x200
 EXT4_FEATURE_RO_COMPAT_METADATA_CSUM: uint32 = 0x400
 EXT4_FEATURE_INCOMPAT_INLINE_DATA:    uint32 = 0x8000
+EXT4_FEATURE_INCOMPAT_EA_INODE:       uint32 = 0x400
 
 
 # Scratch buffer for reading the 1024-byte superblock from disk
@@ -9259,6 +9281,26 @@ def _ext4_xattr_full_name(idx: uint8, name_bytes: Ptr[uint8],
     return plen + name_len
 
 
+def _ext4_xattr_read_ea_inode(ea_inum: uint64, vsize: uint64,
+                              out_buf: Ptr[uint8]) -> int32:
+    # EA_INODE value read. The attribute's value is the regular file data
+    # of inode `ea_inum`: walk its extents / block map (exactly as a normal
+    # file read) and copy `vsize` bytes into out_buf. `vsize` is the xattr
+    # entry's e_value_size, which equals the ea-inode's i_size, so the value
+    # is returned in full even when it spans multiple filesystem blocks.
+    # Returns the byte count copied, or -EIO (-5) if the inode/data is
+    # unreadable. out_buf is the caller's getxattr buffer, already verified
+    # to hold at least vsize bytes (the e_value_size > out_cap check ran
+    # before we got here).
+    NEG_EIO: int32 = -5
+    if vsize == 0:
+        return 0
+    got: int64 = ext4_read_file(cast[uint32](ea_inum), 0, vsize, out_buf)
+    if got != cast[int64](vsize):
+        return NEG_EIO
+    return cast[int32](vsize)
+
+
 def _ext4_xattr_scan(entries_base: uint64, region_end: uint64,
                      value_base: uint64,
                      want: Ptr[char], want_len: uint64,
@@ -9286,6 +9328,12 @@ def _ext4_xattr_scan(entries_base: uint64, region_end: uint64,
             return -1
         e_value_offs: uint16 = _ext4_read_u16(
             cast[Ptr[uint8]](p + 0x02))
+        # e_value_inum overlaps the legacy e_value_block field at entry
+        # offset 0x04. Without INCOMPAT_EA_INODE this is always 0; with the
+        # feature a non-zero value names the inode holding the attribute's
+        # value as that inode's regular file data.
+        e_value_inum: uint32 = _ext4_read_u32(
+            cast[Ptr[uint8]](p + 0x04))
         e_value_size: uint32 = _ext4_read_u32(
             cast[Ptr[uint8]](p + 0x08))
         name_bytes: Ptr[uint8] = cast[Ptr[uint8]](p + EXT4_XATTR_ENTRY_HDR)
@@ -9300,6 +9348,13 @@ def _ext4_xattr_scan(entries_base: uint64, region_end: uint64,
                 vsize: uint64 = cast[uint64](e_value_size)
                 if vsize > out_cap:
                     return NEG_ERANGE
+                # EA_INODE: the value lives in its own inode's data blocks.
+                # Gated on the feature bit AND a non-zero e_value_inum, so
+                # every non-ea-inode attribute takes the original in-region
+                # copy path bit-for-bit.
+                if ext4_ea_inode != 0 and e_value_inum != 0:
+                    return _ext4_xattr_read_ea_inode(
+                        cast[uint64](e_value_inum), vsize, out_buf)
                 vsrc: uint64 = value_base + cast[uint64](e_value_offs)
                 memcpy(out_buf, cast[Ptr[uint8]](vsrc), vsize)
                 return cast[int32](vsize)
@@ -10353,10 +10408,89 @@ ext4_xattr_big_val: Array[1024, uint8]
 ext4_xattr_big_rd:  Array[1024, uint8]
 ext4_xattr_acl_rd:  Array[128, uint8]
 
+# --- EA_INODE (INCOMPAT_EA_INODE) read probe ----------------------
+#
+# A large xattr value (too big for the inline / external-block value
+# region) is stored in its OWN inode under the EA_INODE feature. The
+# host-side test (scripts/test_ext4_eainode.sh) mints an image WITH
+# `-O ea_inode`, plants a regular file carrying a `user.big` attribute
+# whose value is several filesystem blocks of a known repeating pattern,
+# then boots this kernel. This probe (run from ext4_xattr_selftest, which
+# the /etc/ext4xattr-test marker already arms) reads `user.big` back
+# through ext4_getxattr and asserts head + tail sentinels of the pattern
+# plus the exact length, proving the value resolved through the ea-inode's
+# data blocks. It is fully gated on the probe file existing, so the plain
+# xattr test image (which has no such file) skips it with no effect.
+#
+# 16 KiB read buffer: the planted value is several KiB; size the buffer to
+# the largest value read through it so it cannot overflow into the next
+# module-scope global. The probe file lives at the partition root (the
+# resolver path is already relative to the ext4 root).
+EXT4_EAINODE_VAL_LEN:     uint64 = 8192      # bytes the value must be
+ext4_eainode_rd: Array[16384, uint8]
+
+
+def ext4_eainode_probe() -> int32:
+    # Returns 1 if the probe ran and PASSED, 0 if the probe file is absent
+    # (skip — non-ea_inode image), -1 on a probe FAILURE. The pattern is a
+    # repeating 0..255 byte ramp: value[i] == (i & 0xFF). We assert the
+    # full length, the head bytes, and the tail bytes (so a multi-block
+    # value must have resolved every block of the ea-inode, not just the
+    # first).
+    if ext4_blockdev_slot < 0:
+        return 0
+    if ext4_ea_inode == 0:
+        # Feature not present on this image: nothing to probe.
+        return 0
+    probe_path: Ptr[char] = "BIGATTR.BIN"
+    probe_name: Ptr[char] = "user.big"
+    inum:  uint32 = 0
+    fsize: uint64 = 0
+    if ext4_resolve_file(probe_path, &inum, &fsize) == 0:
+        # Probe file absent on this image — skip cleanly.
+        return 0
+    printk0("[ext4eainode] probe file present; reading user.big via ea-inode\n")
+    if ext4_read_inode(cast[uint64](inum),
+                       &ext4_xattr_inode_buf[0]) != 0:
+        printk0("[ext4eainode] FAIL: read probe inode\n")
+        return -1
+    g: int32 = ext4_getxattr(&ext4_xattr_inode_buf[0],
+                             probe_name,
+                             _ext4_strlen(probe_name),
+                             &ext4_eainode_rd[0], 16384)
+    if g != cast[int32](EXT4_EAINODE_VAL_LEN):
+        printk1("[ext4eainode] FAIL: getxattr user.big len=%d\n",
+                cast[uint64](cast[int64](g)))
+        printk1("[ext4eainode]   expected len=%d\n", EXT4_EAINODE_VAL_LEN)
+        return -1
+    # Verify EVERY byte of the multi-block value matches the (i & 0xFF) ramp.
+    i: uint64 = 0
+    while i < EXT4_EAINODE_VAL_LEN:
+        if ext4_eainode_rd[i] != cast[uint8](i & 0xFF):
+            printk1("[ext4eainode] FAIL: value byte mismatch at offset %d\n", i)
+            return -1
+        i = i + 1
+    # Explicit head + tail sentinel report (the script greps these).
+    printk2("[ext4eainode] head bytes ok: [0]=%d [1]=%d\n",
+            cast[uint64](ext4_eainode_rd[0]),
+            cast[uint64](ext4_eainode_rd[1]))
+    printk2("[ext4eainode] tail bytes ok: [len-2]=%d [len-1]=%d\n",
+            cast[uint64](ext4_eainode_rd[EXT4_EAINODE_VAL_LEN - 2]),
+            cast[uint64](ext4_eainode_rd[EXT4_EAINODE_VAL_LEN - 1]))
+    printk1("[ext4eainode] value verified byte-exact, len=%d\n",
+            EXT4_EAINODE_VAL_LEN)
+    printk0("[ext4eainode] PASS\n")
+    return 1
+
 
 def ext4_xattr_selftest() -> int32:
     if ext4_blockdev_slot < 0:
         printk0("[ext4-xattr] FAIL: ext4 not mounted\n")
+        return -1
+    # EA_INODE read probe (skips cleanly on a non-ea_inode image). A probe
+    # FAILURE is fatal so the host test sees no [ext4eainode] PASS banner.
+    if ext4_eainode_probe() < 0:
+        printk0("[ext4-xattr] FAIL: ea-inode probe failed\n")
         return -1
     if ext4_inode_size < 256:
         # No in-inode slack on 128-byte-inode images; nothing to test.
