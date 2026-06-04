@@ -72,6 +72,23 @@ MD_NAME_LEN:    uint64 = 16
 MD_DEFAULT_CHUNK_SECTORS: uint64 = 128
 
 
+# Per-member bad-block list capacity. A fixed-capacity sorted array of
+# {start, count} ranges, exactly like Linux md's struct badblocks: instead
+# of failing a whole device on a single bad sector, md records the bad range
+# and keeps the (still-good) rest of the device IN the array.
+MD_MAX_BADBLOCKS: uint64 = 16
+
+
+class MdBadBlock:
+    # One bad-block range on a member: sectors [start, start+count) are known
+    # bad (unreadable / unwritable) on this member's UNDERLYING device, in the
+    # array's virtual sector address space (RAID1) or per-member LBA space
+    # (RAID5 — the member-LBA within the stripe row). Ranges are kept SORTED
+    # by start and never overlap (adjacent/overlapping inserts are merged).
+    start: uint64
+    count: uint64
+
+
 class MdMember:
     # One member disk of an array. `under_slot` is the underlying block
     # device's slot; `under_start` is the base LBA on that device where
@@ -80,10 +97,20 @@ class MdMember:
     # sectors of that member this array may use. `failed` is the Faulty
     # bit: a failed member is skipped on read and dropped on write so the
     # array runs degraded off the survivors.
+    #
+    # `bb_n` is the number of live bad-block ranges in `bb` (a sorted,
+    # merged, fixed-capacity list). A member with recorded bad blocks but
+    # still-good remaining sectors stays IN the array (NOT Faulty): reads over
+    # a bad range are served from redundancy (mirror/parity) and a successful
+    # write to a bad range CLEARS it. This is the whole point of bad-block
+    # lists vs. whole-device failure.
     under_slot:  int32
     failed:      uint32
+    bb_n:        uint32
+    bb_pad:      uint32
     under_start: uint64
     usable:      uint64
+    bb:          Array[16, MdBadBlock]
 
 
 class MdArray:
@@ -265,6 +292,89 @@ def _md_raid1_pick_read(dev: Ptr[MdArray]) -> int32:
     return -1
 
 
+def _md_raid1_pick_read_good(dev: Ptr[MdArray], vlba: uint64,
+                             count: uint64) -> int32:
+    # Round-robin read balance across the NON-FAILED members, additionally
+    # SKIPPING any member that has the requested range [vlba,vlba+count)
+    # recorded as a bad block. Returns a member index, or -1 if no live
+    # member can serve the whole range cleanly (caller must fall back). This
+    # is exactly Linux's read_balance avoiding rdevs with badblocks over the
+    # request.
+    n: uint64 = cast[uint64](dev[0].n_members)
+    if n == 0:
+        return -1
+    start: uint64 = cast[uint64](dev[0].rr) % n
+    i: uint64 = 0
+    while i < n:
+        cand: uint64 = (start + i) % n
+        if dev[0].members[cand].failed == 0:
+            if md_badblocks_check(&dev[0].members[cand], vlba, count) == 0:
+                dev[0].rr = cast[uint32]((cand + 1) % n)
+                return cast[int32](cand)
+        i = i + 1
+    return -1
+
+
+def _md_raid1_read_span(dev: Ptr[MdArray], vlba: uint64, count: uint64,
+                        buf: Ptr[uint8]) -> int32:
+    # Read [vlba,vlba+count) from the mirror, serving each sub-span from a
+    # live member that does NOT have it recorded bad. The request is SPLIT at
+    # bad-block boundaries: a sub-span all members agree is good is read from
+    # the round-robin pick; a sub-span bad on the picked member is served from
+    # ANOTHER member that holds a good copy. A bad range thus NEVER fails the
+    # device — it is satisfied from the mirror, and the bad member stays IN
+    # the array. Returns 0 / -1.
+    if count == 0:
+        return 0
+    n: uint64 = cast[uint64](dev[0].n_members)
+    done: uint64 = 0
+    while done < count:
+        cur: uint64 = vlba + done
+        # Find the longest run starting at `cur` that some single live member
+        # can serve cleanly. First try a member with NO bad block over the
+        # remaining span; if none can do the whole rest, shrink to the next
+        # bad-block boundary and retry.
+        rest: uint64 = count - done
+        served: int32 = 0
+        # Try the round-robin pick for the whole remaining span first.
+        pick: int32 = _md_raid1_pick_read_good(dev, cur, rest)
+        if pick >= 0:
+            pu: uint64 = cast[uint64](pick)
+            bp: Ptr[uint8] = cast[Ptr[uint8]](
+                cast[uint64](buf) + done * SECTOR_SIZE)
+            rc: int32 = blk_read_sectors(dev[0].members[pu].under_slot,
+                cur + dev[0].members[pu].under_start, rest, bp)
+            if rc != 0:
+                return rc
+            done = done + rest
+            served = 1
+        if served == 0:
+            # No single member can serve the whole rest cleanly. Serve ONE
+            # sector at a time from whichever live member has it good — this
+            # always terminates and correctly straddles bad-block boundaries.
+            chosen: int32 = -1
+            m: uint64 = 0
+            while m < n:
+                if dev[0].members[m].failed == 0 \
+                        and md_badblocks_check(&dev[0].members[m], cur, 1) == 0:
+                    chosen = cast[int32](m)
+                    m = n
+                else:
+                    m = m + 1
+            if chosen < 0:
+                printk0("md: raid1 read range bad on every member\n")
+                return -1
+            cu: uint64 = cast[uint64](chosen)
+            bp2: Ptr[uint8] = cast[Ptr[uint8]](
+                cast[uint64](buf) + done * SECTOR_SIZE)
+            rc2: int32 = blk_read_sectors(dev[0].members[cu].under_slot,
+                cur + dev[0].members[cu].under_start, 1, bp2)
+            if rc2 != 0:
+                return rc2
+            done = done + 1
+    return 0
+
+
 def _md_raid1_io(dev: Ptr[MdArray], is_write: int32, vlba: uint64,
                  count: uint64, buf: Ptr[uint8]) -> int32:
     # Mirror remap. A WRITE fans out to every NON-FAILED member at the
@@ -295,21 +405,200 @@ def _md_raid1_io(dev: Ptr[MdArray], is_write: int32, vlba: uint64,
                     # mark the rdev Faulty and retry, but a synchronous
                     # error here means the device truly rejected the I/O).
                     return rc
+                # Clear-on-successful-write: a write to a recorded bad range
+                # that SUCCEEDED means the media is good again (relocated/
+                # recovered), so drop the bad-block record for this range —
+                # exactly Linux md's rdev_clear_badblocks on a successful
+                # retry. The member then serves future reads of this range
+                # directly again.
+                if md_badblocks_check(&dev[0].members[i], vlba, count) != 0:
+                    md_badblocks_clear(&dev[0].members[i], vlba, count)
                 wrote_any = 1
             i = i + 1
         if wrote_any == 0:
             printk0("md: raid1 write with no live member\n")
             return -1
         return 0
-    # READ: choose one live member.
-    pick: int32 = _md_raid1_pick_read(dev)
-    if pick < 0:
-        printk0("md: raid1 read with no live member\n")
+    # READ: serve each sub-span from a live member that holds it good,
+    # routing around recorded bad blocks via the mirror.
+    return _md_raid1_read_span(dev, vlba, count, buf)
+
+
+# =========================================================================
+# Per-member bad-block list (md "struct badblocks")
+# =========================================================================
+#
+# Linux's drivers/md/md.c keeps, per rdev, a SORTED list of bad-block ranges
+# {start_sector, length, ack}. A single unreadable sector therefore does NOT
+# fail the whole device: md records the bad range, serves that read from
+# redundancy (the mirror copy on RAID1, parity reconstruction on RAID5), and
+# the device stays IN the array continuing to serve every good sector. A
+# later write that lands on a bad range is retried by the lower layer; if it
+# SUCCEEDS the bad-block record is CLEARED (the media relocated/recovered).
+#
+# Here each MdMember carries a fixed-capacity (`MD_MAX_BADBLOCKS`) array of
+# {start, count} ranges kept SORTED by start and MERGED (adjacent or
+# overlapping inserts coalesce into one range). The list is addressed in the
+# member's own LBA space: for RAID1 a virtual sector v maps to the same
+# member sector v, so a range is stated in virtual sectors; for RAID5 the
+# range is stated in the member's per-row LBA (stripe*chunk+off).
+
+
+def _md_bb_overlaps(s1: uint64, c1: uint64, s2: uint64, c2: uint64) -> int32:
+    # Do ranges [s1,s1+c1) and [s2,s2+c2) intersect? 1 yes / 0 no.
+    if c1 == 0 or c2 == 0:
+        return 0
+    if s1 + c1 <= s2:
+        return 0
+    if s2 + c2 <= s1:
+        return 0
+    return 1
+
+
+def md_badblocks_check(mem: Ptr[MdMember], sector: uint64,
+                       count: uint64) -> int32:
+    # Does the range [sector, sector+count) intersect ANY recorded bad block
+    # on this member? Returns 1 if it hits a bad block, else 0. The list is
+    # sorted, so we can stop once a range starts past the query end.
+    if count == 0:
+        return 0
+    n: uint64 = cast[uint64](mem[0].bb_n)
+    i: uint64 = 0
+    while i < n:
+        bs: uint64 = mem[0].bb[i].start
+        bc: uint64 = mem[0].bb[i].count
+        if bs >= sector + count:
+            return 0                        # sorted: no later range can hit
+        if _md_bb_overlaps(sector, count, bs, bc) != 0:
+            return 1
+        i = i + 1
+    return 0
+
+
+def md_badblocks_set(mem: Ptr[MdMember], sector: uint64,
+                     count: uint64) -> int32:
+    # Record [sector, sector+count) as bad on this member, INSERTING into the
+    # sorted list and MERGING with any adjacent or overlapping existing range.
+    # Returns 0 on success, -1 if the list is full (and the range could not be
+    # merged into an existing one). Coalescing keeps the list compact and the
+    # merge logic genuine (no fixed slots): every range that touches or
+    # overlaps the new one is absorbed into a single combined range.
+    if count == 0:
+        return 0
+    ns: uint64 = sector
+    ne: uint64 = sector + count             # exclusive end
+    # First pass: absorb every existing range that touches/overlaps
+    # [ns, ne) — "touches" means end == start (adjacent), so the union is one
+    # contiguous range. Removed ranges are compacted out of the array.
+    n: uint64 = cast[uint64](mem[0].bb_n)
+    w: uint64 = 0                           # write cursor for the compacted list
+    r: uint64 = 0
+    while r < n:
+        es: uint64 = mem[0].bb[r].start
+        ee: uint64 = es + mem[0].bb[r].count
+        # Adjacent or overlapping if the ranges are not strictly separated.
+        if ee < ns or es > ne:
+            # Disjoint: keep this range as-is (compact down).
+            mem[0].bb[w].start = es
+            mem[0].bb[w].count = ee - es
+            w = w + 1
+        else:
+            # Merge: grow [ns,ne) to cover this range too.
+            if es < ns:
+                ns = es
+            if ee > ne:
+                ne = ee
+        r = r + 1
+    # Now insert the merged range [ns,ne) keeping the list sorted by start.
+    if w >= MD_MAX_BADBLOCKS:
         return -1
-    pu: uint64 = cast[uint64](pick)
-    rlba: uint64 = vlba + dev[0].members[pu].under_start
-    rslot: int32 = dev[0].members[pu].under_slot
-    return blk_read_sectors(rslot, rlba, count, buf)
+    # Find insertion index (first existing range whose start > ns).
+    ins: uint64 = w
+    j: uint64 = 0
+    while j < w:
+        if mem[0].bb[j].start > ns:
+            ins = j
+            j = w
+        else:
+            j = j + 1
+    # Shift the tail up by one to open a slot at `ins`.
+    k: uint64 = w
+    while k > ins:
+        mem[0].bb[k].start = mem[0].bb[k - 1].start
+        mem[0].bb[k].count = mem[0].bb[k - 1].count
+        k = k - 1
+    mem[0].bb[ins].start = ns
+    mem[0].bb[ins].count = ne - ns
+    mem[0].bb_n = cast[uint32](w + 1)
+    return 0
+
+
+# Scratch for md_badblocks_clear's split rebuild (module-scope per the Adder
+# large-array quirk). A clear can split each existing range into two, so the
+# rebuilt list can momentarily hold up to 2*MD_MAX_BADBLOCKS ranges before the
+# overflow guard rejects it.
+_md_bb_clr_s: Array[32, uint64]
+_md_bb_clr_c: Array[32, uint64]
+
+
+def md_badblocks_clear(mem: Ptr[MdMember], sector: uint64,
+                       count: uint64) -> int32:
+    # Remove [sector, sector+count) from the member's bad-block list (a write
+    # to a bad range SUCCEEDED, so the media is good again). Genuinely SPLITS
+    # ranges: a cleared sub-range in the middle of a recorded range leaves the
+    # surrounding still-bad parts as two trimmed ranges. Returns the number of
+    # ranges remaining, or -1 if a split would overflow the list.
+    if count == 0:
+        return cast[int32](mem[0].bb_n)
+    cs: uint64 = sector
+    ce: uint64 = sector + count             # exclusive end of cleared span
+    n: uint64 = cast[uint64](mem[0].bb_n)
+    # Build the new list in scratch (left-half / right-half splits), then copy
+    # it back. Worst case each existing range splits into two, so cap the
+    # output at MD_MAX_BADBLOCKS.
+    w: uint64 = 0
+    r: uint64 = 0
+    while r < n:
+        es: uint64 = mem[0].bb[r].start
+        ec: uint64 = mem[0].bb[r].count
+        ee: uint64 = es + ec
+        if ee <= cs or es >= ce:
+            # Untouched by the cleared span — keep whole.
+            if w >= MD_MAX_BADBLOCKS:
+                return -1
+            _md_bb_clr_s[w] = es
+            _md_bb_clr_c[w] = ec
+            w = w + 1
+        else:
+            # Overlaps the cleared span: keep the bad part BEFORE cs (if any)
+            # and the bad part AFTER ce (if any).
+            if es < cs:
+                if w >= MD_MAX_BADBLOCKS:
+                    return -1
+                _md_bb_clr_s[w] = es
+                _md_bb_clr_c[w] = cs - es
+                w = w + 1
+            if ee > ce:
+                if w >= MD_MAX_BADBLOCKS:
+                    return -1
+                _md_bb_clr_s[w] = ce
+                _md_bb_clr_c[w] = ee - ce
+                w = w + 1
+        r = r + 1
+    # Copy the rebuilt sorted list back (it stays sorted: splits preserve
+    # order, and we walked the input in order).
+    i: uint64 = 0
+    while i < w:
+        mem[0].bb[i].start = _md_bb_clr_s[i]
+        mem[0].bb[i].count = _md_bb_clr_c[i]
+        i = i + 1
+    mem[0].bb_n = cast[uint32](w)
+    return cast[int32](w)
+
+
+def md_badblocks_count(mem: Ptr[MdMember]) -> uint64:
+    # Number of recorded bad-block ranges on this member.
+    return cast[uint64](mem[0].bb_n)
 
 
 # Scratch buffer for the bitmap resync: holds ONE region's worth of sectors
@@ -476,6 +765,7 @@ def md_bitmap_resync(name: Ptr[char], member_idx: uint64,
             # Swap in the replacement device (if any) and un-fail the target.
             if new_slot >= 0:
                 dev[0].members[member_idx].under_slot = new_slot
+                dev[0].members[member_idx].bb_n       = 0
             dev[0].members[member_idx].failed = 0
             src_slot: int32 = dev[0].members[src].under_slot
             src_start: uint64 = dev[0].members[src].under_start
@@ -713,15 +1003,22 @@ def _md_raid5_read_chunkfrag(dev: Ptr[MdArray], stripe: uint64,
                              didx: uint64, off: uint64, frag: uint64,
                              buf: Ptr[uint8]) -> int32:
     # Read one chunk-fragment of data-block `didx` in `stripe`. If its data
-    # member is live, read it directly. If it's Faulty, reconstruct via XOR.
+    # member is live AND the fragment is not recorded bad on that member, read
+    # it directly. If the member is Faulty OR the fragment hits a recorded bad
+    # block, reconstruct the chunk by XOR of the surviving data + parity —
+    # WITHOUT failing the whole device. A bad block on one member is therefore
+    # transparently satisfied by parity reconstruction (the bad member stays
+    # IN the array serving its good sectors), and the bad range is recorded so
+    # future reads avoid the unreadable media.
     n: uint64 = cast[uint64](dev[0].n_members)
     pd: uint64 = _md_r5_pd_idx(n, stripe)
     dm: uint64 = _md_r5_data_member(n, pd, didx)
-    if dev[0].members[dm].failed == 0:
-        mlba: uint64 = _md_r5_member_lba(dev, dm, stripe, off)
+    mlba: uint64 = _md_r5_member_lba(dev, dm, stripe, off)
+    if dev[0].members[dm].failed == 0 \
+            and md_badblocks_check(&dev[0].members[dm], mlba, frag) == 0:
         return blk_read_sectors(dev[0].members[dm].under_slot, mlba,
                                 frag, buf)
-    # Degraded: reconstruct the missing data fragment into `buf`.
+    # Degraded (member Faulty) or bad-block hit: reconstruct via parity XOR.
     return _md_r5_recon_data(dev, stripe, dm, off, frag, buf)
 
 
@@ -1799,6 +2096,7 @@ def md_create_raid0(name: Ptr[char], slots: Ptr[int32], n: uint64,
     while i < n:
         md_arrays[idx].members[i].under_slot  = slots[i]
         md_arrays[idx].members[i].failed      = 0
+        md_arrays[idx].members[i].bb_n        = 0
         md_arrays[idx].members[i].under_start = 0
         md_arrays[idx].members[i].usable      = per_member
         i = i + 1
@@ -1850,6 +2148,7 @@ def md_create_raid1(name: Ptr[char], slots: Ptr[int32], n: uint64) -> int32:
     while i < n:
         md_arrays[idx].members[i].under_slot  = slots[i]
         md_arrays[idx].members[i].failed      = 0
+        md_arrays[idx].members[i].bb_n        = 0
         md_arrays[idx].members[i].under_start = 0
         md_arrays[idx].members[i].usable      = smallest
         i = i + 1
@@ -1916,6 +2215,7 @@ def md_create_raid5(name: Ptr[char], slots: Ptr[int32], n: uint64,
     while i < n:
         md_arrays[idx].members[i].under_slot  = slots[i]
         md_arrays[idx].members[i].failed      = 0
+        md_arrays[idx].members[i].bb_n        = 0
         md_arrays[idx].members[i].under_start = 0
         md_arrays[idx].members[i].usable      = per_member
         i = i + 1
@@ -1967,9 +2267,11 @@ def md_raid5_rebuild(name: Ptr[char], member_idx: uint64,
             printk0("md: raid5 rebuild blocked — second member Faulty\n")
             return -2
         f = f + 1
-    # Point the member at the fresh device, mark it live, then fill it.
+    # Point the member at the fresh device, mark it live, drop any stale
+    # bad-block records (fresh media), then fill it.
     dev[0].members[member_idx].under_slot  = new_slot
     dev[0].members[member_idx].under_start = 0
+    dev[0].members[member_idx].bb_n        = 0
     chunk: uint64 = dev[0].chunk_sectors
     per_member: uint64 = dev[0].members[member_idx].usable
     rows: uint64 = per_member / chunk
@@ -2055,6 +2357,7 @@ def md_create_raid6(name: Ptr[char], slots: Ptr[int32], n: uint64,
     while i < n:
         md_arrays[idx].members[i].under_slot  = slots[i]
         md_arrays[idx].members[i].failed      = 0
+        md_arrays[idx].members[i].bb_n        = 0
         md_arrays[idx].members[i].under_start = 0
         md_arrays[idx].members[i].usable      = per_member
         i = i + 1
@@ -2115,6 +2418,7 @@ def md_create_raid10(name: Ptr[char], slots: Ptr[int32], n: uint64,
     while i < n:
         md_arrays[idx].members[i].under_slot  = slots[i]
         md_arrays[idx].members[i].failed      = 0
+        md_arrays[idx].members[i].bb_n        = 0
         md_arrays[idx].members[i].under_start = 0
         md_arrays[idx].members[i].usable      = per_member
         i = i + 1
@@ -2224,8 +2528,10 @@ def md_raid6_rebuild(name: Ptr[char], member_idx: uint64,
             if rc != 0:
                 return rc
         row = row + 1
-    # Recovery complete: switch to the fresh device and clear the Faulty bit.
+    # Recovery complete: switch to the fresh device and clear the Faulty bit
+    # (and any stale bad-block records — fresh media).
     dev[0].members[member_idx].under_slot = new_slot
+    dev[0].members[member_idx].bb_n       = 0
     dev[0].members[member_idx].failed     = 0
     return 0
 
@@ -2841,6 +3147,16 @@ def md_selftest() -> int32:
     # the array consistent and the bitmap clear.
     # ================================================================
     if _md_bitmap_selftest(b2, b3) != 1:
+        ok = 0
+
+    # ================================================================
+    # Test 8: PER-MEMBER BAD-BLOCK LIST — a single bad sector does NOT fail
+    # the whole device. The sorted bad-block list merges/clears genuinely; a
+    # RAID1 read over a bad block is served from the mirror, a RAID5 read over
+    # a bad block is reconstructed via parity, a clear-on-successful-write
+    # drops the record, and the member stays IN the array serving good I/O.
+    # ================================================================
+    if _md_badblocks_test(b0, b1, b2) != 1:
         ok = 0
 
     if ok == 1:
@@ -3649,4 +3965,262 @@ def _md_bitmap_selftest(b2: int32, b3: int32) -> int32:
     _md_emerg0("[md] bitmap PASS\n")
 
     md_remove("mdbm")
+    return 1
+
+
+# =========================================================================
+# Bad-block-list self-test (md "struct badblocks")
+# =========================================================================
+#
+# Proves the per-member bad-block list: insert/merge/clear of sorted ranges
+# (genuinely computed), a RAID1 read over a bad block served from the MIRROR
+# (member stays non-Faulty), clear-on-successful-write, and a RAID5 bad-block
+# read reconstructed via PARITY. This is the whole point of bad-block lists vs
+# whole-device failure: a device with recorded bad blocks but good remaining
+# sectors stays IN the array and keeps serving good I/O.
+
+# Scratch for the bad-block self-test. The RAID1 leg moves up to 4 sectors
+# (2 KiB) per array op; the RAID5 leg moves a full 4-sector chunk (2 KiB) and
+# a 16-sector readback (8 KiB). Size every buffer to its largest transfer so a
+# read/write never overflows into the next module-scope global (the BSS
+# overflow trap). Module-scope per the Adder large-array quirk.
+_md_bb_pat:    Array[8192, uint8]   # pattern written through an array (<=16s)
+_md_bb_read:   Array[8192, uint8]   # readback through an array (<=16s)
+_md_bb_raw:    Array[2048, uint8]   # raw per-member read (<=4-sector chunk)
+_md_bb_junk:   Array[2048, uint8]   # corruption pattern stamped under a bad blk
+_md_slotsbb:   Array[8, int32]
+
+
+_md_bb_unit_mem: MdMember
+
+
+def _md_badblocks_unit() -> int32:
+    # Unit-test the sorted insert/merge/check/clear math against a standalone
+    # MdMember (no array I/O). Returns 1 PASS / 0 FAIL.
+    mem: Ptr[MdMember] = &_md_bb_unit_mem
+    mem[0].bb_n = 0
+    # Empty list: nothing intersects.
+    if md_badblocks_check(mem, 0, 100) != 0:
+        _md_emerg0("[mdraid] FAIL: badblocks empty check\n")
+        return 0
+    # Insert [100,4]. One range; a query inside hits, outside misses.
+    md_badblocks_set(mem, 100, 4)
+    if md_badblocks_count(mem) != 1:
+        _md_emerg0("[mdraid] FAIL: badblocks first insert count\n")
+        return 0
+    if md_badblocks_check(mem, 102, 1) != 1:
+        _md_emerg0("[mdraid] FAIL: badblocks inside-hit\n")
+        return 0
+    if md_badblocks_check(mem, 50, 10) != 0 \
+            or md_badblocks_check(mem, 104, 4) != 0:
+        _md_emerg0("[mdraid] FAIL: badblocks outside-miss\n")
+        return 0
+    # Insert [104,4] — ADJACENT to [100,4) (end 104 == start 104): must MERGE
+    # into a single [100,8) range, NOT add a second range.
+    md_badblocks_set(mem, 104, 4)
+    if md_badblocks_count(mem) != 1:
+        _md_emerg0("[mdraid] FAIL: badblocks adjacent-merge count\n")
+        return 0
+    if mem[0].bb[0].start != 100 or mem[0].bb[0].count != 8:
+        _md_emerg1("[mdraid] FAIL: badblocks adjacent-merge range start=%d\n",
+                   mem[0].bb[0].start)
+        return 0
+    _md_emerg0("[mdraid] badblocks: adjacent ranges merge OK\n")
+    # Insert [106,6] — OVERLAPS [100,8): must extend to [100,12), still one.
+    md_badblocks_set(mem, 106, 6)
+    if md_badblocks_count(mem) != 1 or mem[0].bb[0].start != 100 \
+            or mem[0].bb[0].count != 12:
+        _md_emerg0("[mdraid] FAIL: badblocks overlap-merge\n")
+        return 0
+    _md_emerg0("[mdraid] badblocks: overlapping ranges merge OK\n")
+    # Insert a DISJOINT [200,4): two ranges, kept sorted.
+    md_badblocks_set(mem, 200, 4)
+    if md_badblocks_count(mem) != 2 or mem[0].bb[0].start != 100 \
+            or mem[0].bb[1].start != 200:
+        _md_emerg0("[mdraid] FAIL: badblocks disjoint sorted insert\n")
+        return 0
+    # Insert a range BEFORE both ([10,2]): must sort to index 0.
+    md_badblocks_set(mem, 10, 2)
+    if md_badblocks_count(mem) != 3 or mem[0].bb[0].start != 10 \
+            or mem[0].bb[1].start != 100 or mem[0].bb[2].start != 200:
+        _md_emerg0("[mdraid] FAIL: badblocks sorted head insert\n")
+        return 0
+    _md_emerg0("[mdraid] badblocks: sorted insert keeps order OK\n")
+    # Bridging insert [112,88] joins [100,12) and [200,4) into [100,104):
+    # spans the gap and touches both -> they coalesce into ONE range.
+    md_badblocks_set(mem, 112, 88)
+    # [100,12)=100..112 ; [112,88)=112..200 ; [200,4)=200..204 -> all touch ->
+    # one range [100,204) plus the disjoint [10,2). Count must be 2.
+    if md_badblocks_count(mem) != 2 or mem[0].bb[1].start != 100 \
+            or mem[0].bb[1].count != 104:
+        _md_emerg1("[mdraid] FAIL: badblocks bridging-merge count=%d\n",
+                   md_badblocks_count(mem))
+        return 0
+    _md_emerg0("[mdraid] badblocks: bridging insert coalesces OK\n")
+    # CLEAR a sub-range in the MIDDLE of [100,204): clear [120,10) -> SPLIT
+    # into [100,120) and [130,74). Plus the untouched [10,2). Count = 3.
+    if md_badblocks_clear(mem, 120, 10) < 0:
+        _md_emerg0("[mdraid] FAIL: badblocks clear rc\n")
+        return 0
+    if md_badblocks_count(mem) != 3:
+        _md_emerg1("[mdraid] FAIL: badblocks middle-clear split count=%d\n",
+                   md_badblocks_count(mem))
+        return 0
+    # The cleared hole must now read as GOOD; the surrounding parts bad.
+    if md_badblocks_check(mem, 122, 4) != 0:
+        _md_emerg0("[mdraid] FAIL: badblocks cleared hole still bad\n")
+        return 0
+    if md_badblocks_check(mem, 110, 4) != 1 \
+            or md_badblocks_check(mem, 132, 4) != 1:
+        _md_emerg0("[mdraid] FAIL: badblocks split halves not bad\n")
+        return 0
+    _md_emerg0("[md] PASS badblocks-list-merge-clear\n")
+    return 1
+
+
+def _md_badblocks_test(b0: int32, b1: int32, b2: int32) -> int32:
+    # End-to-end: RAID1 mirror read around a bad block + clear-on-write, then
+    # a RAID5 parity-reconstructed bad-block read. mdback0/mdback1/mdback2.
+    # Returns 1 PASS / 0 FAIL.
+    _md_emerg0("[mdraid] badblocks: begin\n")
+    if _md_badblocks_unit() != 1:
+        return 0
+
+    # ---------------- RAID1 leg ----------------
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store0[0]))
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store1[0]))
+    _md_slotsbb[0] = b0
+    _md_slotsbb[1] = b1
+    rb: int32 = md_create_raid1("mdbb", &_md_slotsbb[0], 2)
+    if rb < 0:
+        _md_emerg1("[mdraid] FAIL: badblocks md_create_raid1 rc=%d\n",
+                   cast[uint64](cast[int64](rb)))
+        return 0
+    dev: Ptr[MdArray] = _md_bm_dev("mdbb")
+    if cast[uint64](dev) == 0:
+        _md_emerg0("[mdraid] FAIL: badblocks dev lookup\n")
+        return 0
+
+    # Write a known 4-sector pattern at vLBA 10..13 — lands on BOTH members.
+    _md_fill(&_md_bb_pat[0], 4 * SECTOR_SIZE, 1313)
+    if blk_write_sectors(rb, 10, 4, &_md_bb_pat[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: badblocks raid1 seed write\n")
+        return 0
+
+    # Record a BAD BLOCK on member0 (mdback0) covering vLBA 11..12, and stamp
+    # GARBAGE under it so a read that wrongly used member0 would mismatch —
+    # proving the read truly routes to the mirror (member1).
+    if md_badblocks_set(&dev[0].members[0], 11, 2) != 0:
+        _md_emerg0("[mdraid] FAIL: badblocks raid1 set\n")
+        return 0
+    if md_badblocks_check(&dev[0].members[0], 11, 1) != 1:
+        _md_emerg0("[mdraid] FAIL: badblocks raid1 check after set\n")
+        return 0
+    _md_fill(&_md_bb_junk[0], 2 * SECTOR_SIZE, 9999)
+    if blk_write_sectors(b0, 11, 2, &_md_bb_junk[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: badblocks raid1 corrupt member0\n")
+        return 0
+
+    # Member0 must remain NON-Faulty — a bad block does NOT fail the device.
+    if dev[0].members[0].failed != 0:
+        _md_emerg0("[mdraid] FAIL: badblocks raid1 member wrongly Faulty\n")
+        return 0
+    _md_emerg0("[mdraid] badblocks raid1: member stays non-Faulty OK\n")
+
+    # Read vLBA 10..13 THROUGH the array. The bad sub-range 11..12 must be
+    # served from the mirror (member1), so the whole 4-sector read matches the
+    # ORIGINAL pattern despite member0's media being garbage there.
+    if blk_read_sectors(rb, 10, 4, &_md_bb_read[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: badblocks raid1 read\n")
+        return 0
+    if _md_buf_eq(&_md_bb_pat[0], &_md_bb_read[0], 4 * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdraid] FAIL: badblocks raid1 read mismatch (mirror not used)\n")
+        return 0
+    _md_emerg0("[md] PASS badblocks-raid1-read-via-mirror\n")
+
+    # CLEAR-ON-SUCCESSFUL-WRITE: write a NEW pattern over the bad range
+    # vLBA 11..12 through the array. The write succeeds on member0, so the
+    # bad-block record for that range is CLEARED and member0 physically holds
+    # the new data.
+    _md_fill(&_md_bb_pat[0], 2 * SECTOR_SIZE, 1414)
+    if blk_write_sectors(rb, 11, 2, &_md_bb_pat[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: badblocks raid1 clearing write\n")
+        return 0
+    if md_badblocks_check(&dev[0].members[0], 11, 2) != 0:
+        _md_emerg0("[mdraid] FAIL: badblocks not cleared after good write\n")
+        return 0
+    if md_badblocks_count(&dev[0].members[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: badblocks list not empty after clear\n")
+        return 0
+    # member0 (mdback0) physically holds the new data at 11..12 now.
+    if blk_read_sectors(b0, 11, 2, &_md_bb_raw[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: badblocks raw read member0 after clear\n")
+        return 0
+    if _md_buf_eq(&_md_bb_pat[0], &_md_bb_raw[0], 2 * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdraid] FAIL: badblocks member0 missing data after clear\n")
+        return 0
+    _md_emerg0("[md] PASS badblocks-clear-on-write\n")
+
+    md_remove("mdbb")
+
+    # ---------------- RAID5 leg ----------------
+    # RAID5 over mdback0,1,2 (chunk=4). Write a 16-sector pattern, record a
+    # bad block on a DATA member, corrupt its backing, and prove the read is
+    # reconstructed via PARITY (member stays non-Faulty).
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store0[0]))
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store1[0]))
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store2[0]))
+    _md_slotsbb[0] = b0
+    _md_slotsbb[1] = b1
+    _md_slotsbb[2] = b2
+    r5: int32 = md_create_raid5("mdbb5", &_md_slotsbb[0], 3, 4)
+    if r5 < 0:
+        _md_emerg1("[mdraid] FAIL: badblocks md_create_raid5 rc=%d\n",
+                   cast[uint64](cast[int64](r5)))
+        return 0
+    dev5: Ptr[MdArray] = _md_bm_dev("mdbb5")
+    if cast[uint64](dev5) == 0:
+        _md_emerg0("[mdraid] FAIL: badblocks raid5 dev lookup\n")
+        return 0
+    _md_fill(&_md_bb_pat[0], 16 * SECTOR_SIZE, 1515)
+    if blk_write_sectors(r5, 0, 16, &_md_bb_pat[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: badblocks raid5 seed write\n")
+        return 0
+    # Stripe0 geometry (N=3): pd=2 (mdback2=P); D0 (didx0) on member
+    # (2+1)%3=0 (mdback0) at member-LBA stripe*chunk+off = 0. Record a bad
+    # block on member0 (data member of stripe0/D0) for member-LBA 0..3, and
+    # corrupt mdback0's first chunk so a direct read would be garbage.
+    if md_badblocks_set(&dev5[0].members[0], 0, 4) != 0:
+        _md_emerg0("[mdraid] FAIL: badblocks raid5 set\n")
+        return 0
+    _md_fill(&_md_bb_junk[0], 4 * SECTOR_SIZE, 8888)
+    if blk_write_sectors(b0, 0, 4, &_md_bb_junk[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: badblocks raid5 corrupt member0\n")
+        return 0
+    # Member0 must stay NON-Faulty.
+    if dev5[0].members[0].failed != 0:
+        _md_emerg0("[mdraid] FAIL: badblocks raid5 member wrongly Faulty\n")
+        return 0
+    # Read vLBA 0..3 (stripe0/D0 — the bad chunk) through the array. It must
+    # be reconstructed via parity (P XOR D1) and match the ORIGINAL pattern,
+    # NOT the corrupted media on mdback0.
+    if blk_read_sectors(r5, 0, 4, &_md_bb_read[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: badblocks raid5 read\n")
+        return 0
+    if _md_buf_eq(&_md_bb_pat[0], &_md_bb_read[0], 4 * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdraid] FAIL: badblocks raid5 read mismatch (parity not used)\n")
+        return 0
+    _md_emerg0("[md] PASS badblocks-raid5-read-via-parity\n")
+    # And the rest of the array (the good chunks) still reads correctly while
+    # member0 carries a bad block — proving good I/O continues.
+    if blk_read_sectors(r5, 0, 16, &_md_bb_read[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: badblocks raid5 full read\n")
+        return 0
+    if _md_buf_eq(&_md_bb_pat[0], &_md_bb_read[0], 16 * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdraid] FAIL: badblocks raid5 full read mismatch\n")
+        return 0
+    _md_emerg0("[mdraid] badblocks raid5: good sectors still served OK\n")
+
+    md_remove("mdbb5")
+    _md_emerg0("[md] badblocks PASS\n")
     return 1

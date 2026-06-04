@@ -140,6 +140,17 @@ check "bitmap only dirty marked"     "[mdraid] bitmap: only dirty regions marked
 check "bitmap partial resync"        "[md] PASS bitmap-partial-resync"
 check "bitmap consistent resync"     "[md] PASS bitmap-consistent-after-resync"
 check "bitmap PASS"                  "[md] bitmap PASS"
+check "badblocks adjacent merge"     "[mdraid] badblocks: adjacent ranges merge OK"
+check "badblocks overlap merge"      "[mdraid] badblocks: overlapping ranges merge OK"
+check "badblocks sorted insert"      "[mdraid] badblocks: sorted insert keeps order OK"
+check "badblocks bridging coalesce"  "[mdraid] badblocks: bridging insert coalesces OK"
+check "badblocks list merge/clear"   "[md] PASS badblocks-list-merge-clear"
+check "badblocks member non-faulty"  "[mdraid] badblocks raid1: member stays non-Faulty OK"
+check "badblocks raid1 via mirror"   "[md] PASS badblocks-raid1-read-via-mirror"
+check "badblocks clear on write"     "[md] PASS badblocks-clear-on-write"
+check "badblocks raid5 via parity"   "[md] PASS badblocks-raid5-read-via-parity"
+check "badblocks raid5 good I/O"     "[mdraid] badblocks raid5: good sectors still served OK"
+check "badblocks PASS"               "[md] badblocks PASS"
 check "mdraid PASS"                  "[mdraid] PASS"
 
 if [ "$fail" -ne 0 ]; then
@@ -147,4 +158,4 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
-echo "[test_mdraid] PASS — native software RAID: RAID0 stripe routing (with boundary-straddle split), RAID1 mirror fan-out + degraded survivor round-trip, RAID5 distributed-parity striping with XOR degraded-read reconstruction + RMW parity + member rebuild, a RAID5 PARTIAL PARITY LOG (PPL) that closes the write hole — a torn write (data on disk, parity NOT yet written, live mdjrnl0 journal entry) is replayed by md_ppl_recover so a subsequent DEGRADED read of an untouched chunk reconstructs the CORRECT value (proven WRONG without recovery, CORRECT after) and the journal retires on clean writes — RAID6 dual-parity (P XOR + Q GF(2^8)) striping with one- and two-fault reconstruction (data+data, data+P, data+Q), GF read-modify-write parity, and full member rebuild, and RAID10 near=2 striped mirrors (both copies verified per-member + degraded read/write via the surviving mirror), and a RAID1 WRITE-INTENT BITMAP (md internal bitmap) that marks only written regions dirty while a member is down and resyncs ONLY those dirty regions on re-add (fast partial resync) — leaving the array consistent and the bitmap clear — all verified"
+echo "[test_mdraid] PASS — native software RAID: RAID0 stripe routing (with boundary-straddle split), RAID1 mirror fan-out + degraded survivor round-trip, RAID5 distributed-parity striping with XOR degraded-read reconstruction + RMW parity + member rebuild, a RAID5 PARTIAL PARITY LOG (PPL) that closes the write hole — a torn write (data on disk, parity NOT yet written, live mdjrnl0 journal entry) is replayed by md_ppl_recover so a subsequent DEGRADED read of an untouched chunk reconstructs the CORRECT value (proven WRONG without recovery, CORRECT after) and the journal retires on clean writes — RAID6 dual-parity (P XOR + Q GF(2^8)) striping with one- and two-fault reconstruction (data+data, data+P, data+Q), GF read-modify-write parity, and full member rebuild, and RAID10 near=2 striped mirrors (both copies verified per-member + degraded read/write via the surviving mirror), and a RAID1 WRITE-INTENT BITMAP (md internal bitmap) that marks only written regions dirty while a member is down and resyncs ONLY those dirty regions on re-add (fast partial resync) — leaving the array consistent and the bitmap clear — and a PER-MEMBER BAD-BLOCK LIST (md struct badblocks) where a single bad sector does NOT fail the whole device: the sorted range list genuinely merges adjacent/overlapping inserts and splits on clear, a RAID1 read over a bad block is served from the MIRROR, a RAID5 read over a bad block is reconstructed via PARITY, a successful write CLEARS the bad-block record, and the member stays IN the array (non-Faulty) serving every good sector — all verified"
