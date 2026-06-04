@@ -22,6 +22,11 @@
 #   * WRITEV bytes to a tmpfs file via the ring, then READV them back
 #     byte-exact via the ring (reusing the vfs_write/vfs_read backends),
 #     and FSYNC via the ring.
+#   * WRITE_FIXED then READ_FIXED through a REGISTERED fixed buffer
+#     (selected by SQE buf_index), byte-exact.
+#   * OPENAT(create) -> WRITE -> CLOSE -> OPENAT(read) -> READ byte-exact,
+#     then STATX of the same path (size assertion), all via the ring.
+#   * POLL_ADD synchronous one-shot readiness (POLLIN on a regular file).
 #   * io_uring_register/UNREGISTER buffers round-trip.
 #
 # Pass marker:  [iouring] PASS
@@ -94,11 +99,29 @@ else
     fail=1
 fi
 
+# Per-opcode assertions for the new FILE/IO opcodes. Each must print its
+# own PASS line; a missing line means the opcode path did not complete.
+for marker in \
+    "WRITE_FIXED/READ_FIXED byte-exact via reg buf" \
+    "OPENAT(create) -> WRITE -> CLOSE via the ring" \
+    "OPENAT(read) -> READ byte-exact via the ring" \
+    "STATX via the ring (size=7)" \
+    "POLL_ADD one-shot readiness (POLLIN ready)"
+do
+    if grep -aqF "[iouring] PASS: $marker" "$LOG"; then
+        echo "[test_iouring] PASS: $marker"
+    else
+        echo "[test_iouring] FAIL: missing opcode PASS line: $marker" >&2
+        fail=1
+    fi
+done
+
 if [ "$fail" -ne 0 ]; then
     echo "[test_iouring] FAIL"
     exit 1
 fi
 
 echo "[test_iouring] PASS -- io_uring setup/enter/register round-trip:" \
-     "NOP completion, WRITEV+READV byte-exact via the ring, FSYNC, and" \
-     "register/unregister buffers"
+     "NOP completion, WRITEV+READV byte-exact, FSYNC, WRITE_FIXED/READ_FIXED" \
+     "via a registered buffer, OPENAT->WRITE->CLOSE->OPENAT->READ->STATX," \
+     "POLL_ADD readiness, and register/unregister buffers"

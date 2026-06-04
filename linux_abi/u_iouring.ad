@@ -47,7 +47,16 @@ from mm.slab import (
 from fs.vfs import (
     vfs_alloc_l2_fd, vfs_fd_marker,
     vfs_read, vfs_write, vfs_fsync, vfs_lseek, vfs_close, vfs_open_memfd,
+    vfs_open, vfs_open_write, vfs_fd_poll, vfs_fd_is_dir, vfs_fd_mtime,
+    resolve_path,
 )
+from arch.x86.kernel.time import (
+    get_jiffies,
+)
+
+# memset is a freestanding C-ABI leaf (mm/slab.ad, mm/uaccess.ad, etc. all
+# declare it identically). We use it to zero the statx scratch before fill.
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
 # §self-test only: the boot:37.iouring hook runs in the bootstrap task,
 # whose per-task fd table is uninitialised. We free slots 3..15 before the
 # body and restore after — the same dance memfd/pidfd self-tests perform.
@@ -78,12 +87,19 @@ IORING_OFF_CQ_RING: uint64 = 0x8000000
 IORING_OFF_SQES:    uint64 = 0x10000000
 
 # Opcodes (io_uring_op). Only the ones we execute are named.
-IORING_OP_NOP:    uint8 = 0
-IORING_OP_READV:  uint8 = 1
-IORING_OP_WRITEV: uint8 = 2
-IORING_OP_FSYNC:  uint8 = 3
-IORING_OP_READ:   uint8 = 22
-IORING_OP_WRITE:  uint8 = 23
+IORING_OP_NOP:         uint8 = 0
+IORING_OP_READV:       uint8 = 1
+IORING_OP_WRITEV:      uint8 = 2
+IORING_OP_FSYNC:       uint8 = 3
+IORING_OP_READ_FIXED:  uint8 = 4
+IORING_OP_WRITE_FIXED: uint8 = 5
+IORING_OP_POLL_ADD:    uint8 = 6
+IORING_OP_FALLOCATE:   uint8 = 17
+IORING_OP_OPENAT:      uint8 = 18
+IORING_OP_CLOSE:       uint8 = 19
+IORING_OP_STATX:       uint8 = 21
+IORING_OP_READ:        uint8 = 22
+IORING_OP_WRITE:       uint8 = 23
 
 # io_uring_register opcodes.
 IORING_REGISTER_BUFFERS:   uint32 = 0
@@ -144,6 +160,15 @@ _ring_cq_off:  Array[8, uint64]      # CQ ring region offset within base
 _ring_sqes_off: Array[8, uint64]     # SQE array region offset within base
 _ring_entries: Array[8, uint32]      # SQ/CQ entry count (power of two)
 _ring_inited:  int32 = 0
+
+# io_uring_register bookkeeping (declared here, ahead of the teardown path
+# that clears them). _ring_reg_nbuf/_ring_reg_nfile count registrations;
+# _ring_buf_base/_ring_buf_len snapshot the registered fixed-buffer iovecs
+# (flat [ring*IOURING_MAX_REGBUF + idx]) for READ_FIXED / WRITE_FIXED.
+_ring_reg_nbuf:  Array[8, uint32]
+_ring_reg_nfile: Array[8, uint32]
+_ring_buf_base:  Array[128, uint64]
+_ring_buf_len:   Array[128, uint64]
 
 
 def _iouring_pool_init():
@@ -384,6 +409,16 @@ def _iouring_teardown_slot(su: uint64):
     _ring_fd[su] = -1
     _ring_base[su] = 0
     _ring_total[su] = 0
+    # Drop any registered fixed-buffer snapshots for this slot so a future
+    # ring reusing the slot starts with an empty buffer table.
+    _ring_reg_nbuf[su] = 0
+    _ring_reg_nfile[su] = 0
+    tb: uint64 = 0
+    while tb < IOURING_MAX_REGBUF:
+        tslot: uint64 = _regbuf_slot(su, tb)
+        _ring_buf_base[tslot] = 0
+        _ring_buf_len[tslot] = 0
+        tb = tb + 1
 
 
 def iouring_close_fd(fd: int32) -> int32:
@@ -452,7 +487,26 @@ SQE_FD:        uint64 = 4
 SQE_OFF:       uint64 = 8
 SQE_ADDR:      uint64 = 16
 SQE_LEN:       uint64 = 24
+SQE_OP_FLAGS:  uint64 = 28      # rw_flags / open_flags / statx_flags / poll_events
 SQE_USER_DATA: uint64 = 32
+# union { __u16 buf_index; __u16 buf_group; } at +26. READ_FIXED /
+# WRITE_FIXED select their registered buffer from this index.
+SQE_BUF_INDEX: uint64 = 26
+
+
+# --- Registered fixed-buffer table (per ring) -----------------------
+#
+# io_uring_register(REGISTER_BUFFERS) hands the kernel an array of
+# `struct iovec { void *iov_base; size_t iov_len; }`. READ_FIXED /
+# WRITE_FIXED then reference a registered buffer by SQE buf_index instead
+# of carrying the address in the SQE. We snapshot up to IOURING_MAX_REGBUF
+# (base,len) pairs per ring at registration time so the fixed opcodes can
+# resolve + bounds-check the target buffer.
+IOURING_MAX_REGBUF: uint64 = 16
+
+
+def _regbuf_slot(su: uint64, idx: uint64) -> uint64:
+    return su * IOURING_MAX_REGBUF + idx
 
 
 def _iouring_do_readv(fd: int32, iov: uint64, cnt: uint64) -> int64:
@@ -511,14 +565,194 @@ def _iouring_do_writev(fd: int32, iov: uint64, cnt: uint64) -> int64:
     return total
 
 
-def _iouring_exec_sqe(sqe: uint64) -> int64:
+# --- new opcode helpers (synchronous, mirroring READ/WRITE) ---------
+#
+# Each resolves the same lower-level VFS leaves the corresponding Linux
+# syscall handler in u_syscalls.ad ultimately calls — vfs_open /
+# vfs_open_write (openat), vfs_close (close), vfs_fd_poll (poll readiness),
+# vfs_lseek + vfs_fd_is_dir + vfs_fd_mtime (statx). We deliberately do NOT
+# import from u_syscalls.ad (it imports FROM us — a cycle); we call the
+# leaves directly, exactly as READ/WRITE already call vfs_read/vfs_write.
+
+# Linux open-flag access-mode mask (O_ACCMODE == 3: RDONLY 0, WRONLY 1,
+# RDWR 2). A write/read-write open routes to vfs_open_write so a
+# create-for-write SQE behaves like open(O_WRONLY|O_CREAT); read routes to
+# vfs_open. This mirrors _u_open's "branch on flags & O_ACCMODE".
+IOU_O_ACCMODE: uint64 = 3
+
+
+def _iouring_do_openat(addr: uint64, open_flags: uint32) -> int64:
+    # addr -> NUL-terminated pathname (user/SQE memory; accessed directly,
+    # same contract as the iovec walk above). Resolve to an absolute path,
+    # then open read- or write-mode per the access bits. Returns the new fd
+    # (>=0) or -errno.
+    if addr == 0:
+        return IOU_EFAULT
+    abs_path: Array[256, uint8]
+    rc: int32 = resolve_path(cast[Ptr[char]](addr), &abs_path[0], 256)
+    if rc != 0:
+        return cast[int64](rc)
+    accmode: uint64 = cast[uint64](open_flags) & IOU_O_ACCMODE
+    nfd: int32 = 0
+    if accmode != 0:
+        nfd = vfs_open_write(cast[Ptr[char]](&abs_path[0]))
+    else:
+        nfd = vfs_open(cast[Ptr[char]](&abs_path[0]))
+    return cast[int64](nfd)
+
+
+def _iouring_do_close(fd: int32) -> int64:
+    # io_uring CLOSE on a ring fd must tear down the ring context (vfs.ad
+    # never learned FD_IORING_MARK), exactly as the close(2) path does.
+    iouring_close_fd(fd)
+    rc: int32 = vfs_close(fd)
+    return cast[int64](rc)
+
+
+# struct statx layout (uapi) — the subset _u_fill_statx fills. We mirror it
+# here from vfs leaves so STATX needs no u_syscalls import.
+IOU_STATX_SIZE:        uint64 = 256
+IOU_STATX_OFF_MASK:    uint64 = 0
+IOU_STATX_OFF_BLKSIZE: uint64 = 4
+IOU_STATX_OFF_NLINK:   uint64 = 16
+IOU_STATX_OFF_UID:     uint64 = 20
+IOU_STATX_OFF_GID:     uint64 = 24
+IOU_STATX_OFF_MODE:    uint64 = 28
+IOU_STATX_OFF_INO:     uint64 = 32
+IOU_STATX_OFF_SIZE:    uint64 = 40
+IOU_STATX_OFF_BLOCKS:  uint64 = 48
+IOU_STATX_OFF_ATIME:   uint64 = 72
+IOU_STATX_OFF_MTIME:   uint64 = 88
+IOU_STATX_OFF_CTIME:   uint64 = 104
+IOU_STATX_BASIC_STATS: uint32 = 0x7FF
+IOU_STAT_MODE_REG:     uint32 = 0o100644
+IOU_STAT_MODE_DIR:     uint32 = 0o040755
+
+_iou_statx_scratch: Array[256, uint8]
+
+
+def _iouring_fill_statx(buf: uint64, fd: int32) -> int64:
+    # Mirror of u_syscalls.ad::_u_fill_statx, assembling into a kernel
+    # scratch then copying out once (a bad statxbuf is a clean -EFAULT).
+    if buf == 0:
+        return IOU_EINVAL
+    ksx: uint64 = cast[uint64](&_iou_statx_scratch[0])
+    memset(cast[Ptr[uint8]](ksx), 0, IOU_STATX_SIZE)
+    cast[Ptr[uint32]](ksx + IOU_STATX_OFF_MASK)[0]    = IOU_STATX_BASIC_STATS
+    cast[Ptr[uint32]](ksx + IOU_STATX_OFF_BLKSIZE)[0] = 4096
+    cast[Ptr[uint32]](ksx + IOU_STATX_OFF_NLINK)[0]   = 1
+    cast[Ptr[uint32]](ksx + IOU_STATX_OFF_UID)[0]     = 0
+    cast[Ptr[uint32]](ksx + IOU_STATX_OFF_GID)[0]     = 0
+    mode_v: uint16 = cast[uint16](IOU_STAT_MODE_REG)
+    if vfs_fd_is_dir(fd) != 0:
+        mode_v = cast[uint16](IOU_STAT_MODE_DIR)
+    cast[Ptr[uint16]](ksx + IOU_STATX_OFF_MODE)[0]    = mode_v
+    cast[Ptr[uint64]](ksx + IOU_STATX_OFF_INO)[0]     = cast[uint64](fd)
+    # File size via lseek(SEEK_END) then restore the offset to 0.
+    size: int64 = vfs_lseek(fd, 0, 2)
+    if size < 0:
+        size = 0
+    vfs_lseek(fd, 0, 0)
+    cast[Ptr[uint64]](ksx + IOU_STATX_OFF_SIZE)[0]    = cast[uint64](size)
+    blocks: int64 = (size + 511) / 512
+    cast[Ptr[uint64]](ksx + IOU_STATX_OFF_BLOCKS)[0]  = cast[uint64](blocks)
+    j: uint64 = get_jiffies()
+    sec: int64 = cast[int64](j / 100)
+    mt: int64 = vfs_fd_mtime(fd)
+    if mt >= 0:
+        sec = mt
+    cast[Ptr[int64]](ksx + IOU_STATX_OFF_ATIME)[0]    = sec
+    cast[Ptr[int64]](ksx + IOU_STATX_OFF_MTIME)[0]    = sec
+    cast[Ptr[int64]](ksx + IOU_STATX_OFF_CTIME)[0]    = sec
+    if copy_to_user(buf, ksx, IOU_STATX_SIZE) != 0:
+        return IOU_EFAULT
+    return 0
+
+
+def _iouring_do_statx(dirfd: int32, path_addr: uint64,
+                      mask: uint32, statxbuf: uint64) -> int64:
+    # statx(dirfd, path, flags, mask, statxbuf). `mask` is accepted and
+    # ignored (we always report STATX_BASIC_STATS, like _u_statx). The path
+    # is opened read-only, the statx buffer filled, then the fd closed.
+    if path_addr == 0 or statxbuf == 0:
+        return IOU_EINVAL
+    abs_path: Array[256, uint8]
+    rc: int32 = resolve_path(cast[Ptr[char]](path_addr), &abs_path[0], 256)
+    if rc != 0:
+        return cast[int64](rc)
+    sfd: int32 = vfs_open(cast[Ptr[char]](&abs_path[0]))
+    if sfd < 0:
+        return cast[int64](sfd)
+    rv: int64 = _iouring_fill_statx(statxbuf, sfd)
+    vfs_close(sfd)
+    return rv
+
+
+def _iouring_do_poll_add(fd: int32, poll_mask: uint32) -> int64:
+    # SYNCHRONOUS one-shot readiness shim (consistent with this file's
+    # synchronous-completion model): there is no async wakeup. We sample the
+    # fd's CURRENT readiness via vfs_fd_poll and post the intersection with
+    # the requested poll mask in the CQE res. A real async POLL_ADD would
+    # arm a waiter and complete later; here the CQE carries the ready bits
+    # observed at submit time (0 if the fd is not currently ready).
+    if fd < 0:
+        return IOU_EBADF
+    ready: uint32 = vfs_fd_poll(fd)
+    # poll_mask of 0 means "any event"; otherwise filter to requested bits
+    # (always surface error/hangup bits, as Linux does).
+    err_bits: uint32 = 0x0008 | 0x0010      # POLLERR | POLLHUP
+    want: uint32 = poll_mask | err_bits
+    got: uint32 = ready & want
+    return cast[int64](got)
+
+
+def _iouring_do_fallocate(fd: int32, off: uint64, len_bytes: uint64) -> int64:
+    # fallocate(fd, mode, offset, len). Our backing files (tmpfs/memfd) grow
+    # on write and have no preallocation distinct from size, so the only
+    # observable contract is "the file is at least offset+len bytes". We
+    # realise that by seeking to offset+len and writing one zero byte at the
+    # last position if needed; for the common mode=0 keep-size-FALSE this
+    # matches Linux's "blocks are allocated and the file size grows". We
+    # implement it as a best-effort size extension via lseek + a single
+    # zero-byte write, then restore the offset. Returns 0 on success.
+    if fd < 0:
+        return IOU_EBADF
+    end_off: uint64 = off + len_bytes
+    if end_off == 0:
+        return 0
+    cur: int64 = vfs_lseek(fd, 0, 1)         # SEEK_CUR: save offset
+    if cur < 0:
+        cur = 0
+    sz: int64 = vfs_lseek(fd, 0, 2)          # SEEK_END: current size
+    if sz < 0:
+        sz = 0
+    if cast[uint64](sz) >= end_off:
+        vfs_lseek(fd, cur, 0)                # already big enough
+        return 0
+    # Extend: write a single zero byte at end_off-1.
+    zero: Array[1, uint8]
+    zero[0] = 0
+    if vfs_lseek(fd, cast[int64](end_off) - 1, 0) < 0:
+        vfs_lseek(fd, cur, 0)
+        return IOU_EINVAL
+    wn: int64 = vfs_write(fd, &zero[0], 1)
+    vfs_lseek(fd, cur, 0)                     # restore offset
+    if wn < 0:
+        return wn
+    return 0
+
+
+def _iouring_exec_sqe(su: uint64, sqe: uint64) -> int64:
     # Decode one SQE and execute its opcode synchronously, returning the
     # result the CQE should carry (>=0 bytes / 0 success, or -errno).
+    # `su` is the owning ring-context slot (needed to resolve the
+    # registered fixed-buffer table for READ_FIXED / WRITE_FIXED).
     opcode: uint8 = cast[Ptr[uint8]](sqe + SQE_OPCODE)[0]
     fd: int32 = cast[Ptr[int32]](sqe + SQE_FD)[0]
     off: uint64 = cast[Ptr[uint64]](sqe + SQE_OFF)[0]
     addr: uint64 = cast[Ptr[uint64]](sqe + SQE_ADDR)[0]
     len: uint32 = cast[Ptr[uint32]](sqe + SQE_LEN)[0]
+    op_flags: uint32 = cast[Ptr[uint32]](sqe + SQE_OP_FLAGS)[0]
 
     if opcode == IORING_OP_NOP:
         return 0
@@ -551,9 +785,79 @@ def _iouring_exec_sqe(sqe: uint64) -> int64:
     if opcode == IORING_OP_FSYNC:
         rc: int32 = vfs_fsync(fd)
         return cast[int64](rc)
+    if opcode == IORING_OP_READ_FIXED:
+        # Buffer comes from the ring's registered-buffer table, indexed by
+        # the SQE buf_index. `addr`/`len` give the offset+length WITHIN that
+        # registered buffer (liburing's io_uring_prep_read_fixed contract).
+        bi: uint16 = cast[Ptr[uint16]](sqe + SQE_BUF_INDEX)[0]
+        bbase: uint64 = 0
+        bres: int64 = _iouring_resolve_fixed(su, cast[uint64](bi),
+                                             addr, cast[uint64](len), &bbase)
+        if bres < 0:
+            return bres
+        if off != 0:
+            skf: int64 = vfs_lseek(fd, cast[int64](off), 0)
+            if skf < 0:
+                return skf
+        return vfs_read(fd, cast[Ptr[uint8]](bbase), cast[uint64](len))
+    if opcode == IORING_OP_WRITE_FIXED:
+        biw: uint16 = cast[Ptr[uint16]](sqe + SQE_BUF_INDEX)[0]
+        wbase: uint64 = 0
+        wres: int64 = _iouring_resolve_fixed(su, cast[uint64](biw),
+                                             addr, cast[uint64](len), &wbase)
+        if wres < 0:
+            return wres
+        if off != 0:
+            skw: int64 = vfs_lseek(fd, cast[int64](off), 0)
+            if skw < 0:
+                return skw
+        return vfs_write(fd, cast[Ptr[uint8]](wbase), cast[uint64](len))
+    if opcode == IORING_OP_OPENAT:
+        # dirfd in SQE_FD (AT_FDCWD / absolute path only), pathname in addr,
+        # open flags in op_flags. Returns the new fd in the CQE res.
+        return _iouring_do_openat(addr, op_flags)
+    if opcode == IORING_OP_CLOSE:
+        return _iouring_do_close(fd)
+    if opcode == IORING_OP_STATX:
+        # dirfd=SQE_FD, path=addr, flags=op_flags (ignored), mask=len,
+        # statxbuf=off. Mirrors statx(2)'s argument shuffle.
+        return _iouring_do_statx(fd, addr, len, off)
+    if opcode == IORING_OP_FALLOCATE:
+        # fd=SQE_FD, mode in addr (ignored — best-effort size extension),
+        # offset=off, len=len. Linux's fallocate puts len in addr and offset
+        # in off; we follow that: off=offset, addr=mode, len=len.
+        return _iouring_do_fallocate(fd, off, cast[uint64](len))
+    if opcode == IORING_OP_POLL_ADD:
+        # Synchronous one-shot readiness shim. poll_events in op_flags
+        # (low 16 bits). Posts the currently-ready mask in the CQE res.
+        return _iouring_do_poll_add(fd, op_flags & 0xFFFF)
     # Unknown opcode: Linux posts -EINVAL in the CQE (the ring keeps
     # working). Do the same.
     return IOU_EINVAL
+
+
+def _iouring_resolve_fixed(su: uint64, buf_index: uint64,
+                           rel_off: uint64, nbytes: uint64,
+                           out_base: Ptr[uint64]) -> int64:
+    # Resolve a READ_FIXED/WRITE_FIXED target: look up the registered
+    # buffer by index, bounds-check [rel_off, rel_off+nbytes) against its
+    # registered length, and write the absolute kernel address into
+    # *out_base. Returns 0 on success or -errno (EFAULT / EINVAL).
+    if buf_index >= IOURING_MAX_REGBUF:
+        return IOU_EINVAL
+    if _ring_reg_nbuf[su] == 0:
+        return IOU_EFAULT               # no buffers registered
+    if buf_index >= cast[uint64](_ring_reg_nbuf[su]):
+        return IOU_EINVAL
+    slot: uint64 = _regbuf_slot(su, buf_index)
+    rbase: uint64 = _ring_buf_base[slot]
+    rlen: uint64 = _ring_buf_len[slot]
+    if rbase == 0:
+        return IOU_EFAULT
+    if rel_off + nbytes > rlen:
+        return IOU_EFAULT               # request escapes the registered buffer
+    out_base[0] = rbase + rel_off
+    return 0
 
 
 def _iouring_post_cqe(su: uint64, user_data: uint64, res: int64):
@@ -612,7 +916,7 @@ def io_uring_enter(a0: uint64, a1: uint64, a2: uint64,
         sqe_idx = sqe_idx & mask
         sqe: uint64 = sqes + cast[uint64](sqe_idx) * SQE_BYTES
         user_data: uint64 = cast[Ptr[uint64]](sqe + SQE_USER_DATA)[0]
-        res: int64 = _iouring_exec_sqe(sqe)
+        res: int64 = _iouring_exec_sqe(su, sqe)
         _iouring_post_cqe(su, user_data, res)
         sq_head = sq_head + 1
         submitted = submitted + 1
@@ -640,14 +944,13 @@ def io_uring_enter(a0: uint64, a1: uint64, a2: uint64,
 
 # --- io_uring_register (nr 427) -------------------------------------
 #
-# Minimal support: REGISTER_BUFFERS / REGISTER_FILES record that
-# registration happened (and validate the args), then succeed. Since our
-# opcodes resolve buffers/fds directly from each SQE at execution time
-# (we do not use the fixed-buffer / fixed-file fast paths), registration
-# is a bookkeeping no-op that nonetheless lets liburing's
-# io_uring_register_buffers()/files() succeed. UNREGISTER mirrors it.
-_ring_reg_nbuf:  Array[8, uint32]
-_ring_reg_nfile: Array[8, uint32]
+# REGISTER_BUFFERS snapshots the supplied iovec array into the per-ring
+# fixed-buffer table (consumed by READ_FIXED / WRITE_FIXED via buf_index).
+# REGISTER_FILES records that fixed files were registered (our opcodes
+# resolve fds directly from the SQE, so file registration stays a
+# bookkeeping success that lets liburing's io_uring_register_files()
+# succeed). UNREGISTER mirrors each. The backing globals are declared up
+# top alongside the ring pool (the teardown path clears them).
 
 
 def io_uring_register(a0: uint64, a1: uint64, a2: uint64,
@@ -668,11 +971,30 @@ def io_uring_register(a0: uint64, a1: uint64, a2: uint64,
             return IOU_EINVAL
         if _ring_reg_nbuf[su] != 0:
             return IOU_EBUSY               # already registered
+        if nr_args > cast[uint32](IOURING_MAX_REGBUF):
+            return IOU_EINVAL
+        # a2 -> struct iovec[nr_args] { void *base; size_t len; } (16 B each).
+        # Snapshot each (base,len) so READ_FIXED/WRITE_FIXED can resolve and
+        # bounds-check by buf_index. The iovec array lives in user/SQE memory
+        # (accessed directly, same contract as the SQE iovec walk).
+        bi: uint64 = 0
+        while bi < cast[uint64](nr_args):
+            iv: uint64 = a2 + bi * 16
+            slot: uint64 = _regbuf_slot(su, bi)
+            _ring_buf_base[slot] = cast[Ptr[uint64]](iv)[0]
+            _ring_buf_len[slot]  = cast[Ptr[uint64]](iv + 8)[0]
+            bi = bi + 1
         _ring_reg_nbuf[su] = nr_args
         return 0
     if opcode == IORING_UNREGISTER_BUFFERS:
         if _ring_reg_nbuf[su] == 0:
             return IOU_EINVAL
+        ci: uint64 = 0
+        while ci < IOURING_MAX_REGBUF:
+            cslot: uint64 = _regbuf_slot(su, ci)
+            _ring_buf_base[cslot] = 0
+            _ring_buf_len[cslot]  = 0
+            ci = ci + 1
         _ring_reg_nbuf[su] = 0
         return 0
     if opcode == IORING_REGISTER_FILES:
@@ -705,12 +1027,48 @@ _iou_params: Array[120, uint8]       # user-visible io_uring_params (boot ctx)
 _iou_iov:    Array[16, uint8]        # one iovec (base@0, len@8)
 _iou_src:    Array[32, uint8]        # writev payload
 _iou_dst:    Array[32, uint8]        # readv buffer
+_iou_path:   Array[64, uint8]        # OPENAT pathname (NUL-terminated)
+_iou_statxb: Array[256, uint8]       # STATX result buffer (struct statx)
+_iou_fixbuf: Array[64, uint8]        # registered fixed buffer (READ/WRITE_FIXED)
 
 
 def _iou_fail(msg: Ptr[char]):
     printk0("[iouring] FAIL: ")
     printk0(msg)
     printk0("\n")
+
+
+# Submit SQE slot `sqe_slot` (already built in the SQE array) through the
+# ring and reap its single CQE, returning the CQE `res`. Verifies the
+# echoed user_data matches `want_ud`; on any mismatch returns a sentinel
+# (IOU_EINVAL) so the caller's assertion fails. Encapsulates the
+# publish-tail / enter / read-cqe / advance-head dance the inline NOP/
+# WRITEV/READV/FSYNC blocks above spell out by hand.
+def _iou_run_one(fd: int32, sq_base: uint64, cq_base: uint64,
+                 sq_array: uint64, cq_cqes: uint64, mask: uint32,
+                 sqe_slot: uint32, want_ud: uint64) -> int64:
+    sqt: uint32 = _u32_load(sq_base, RING_HDR_TAIL)
+    cast[Ptr[uint32]](sq_array + cast[uint64](sqt & mask) * 4)[0] = sqe_slot
+    _u32_store(sq_base, RING_HDR_TAIL, sqt + 1)
+    er: int64 = io_uring_enter(cast[uint64](fd), 1, 1,
+                               cast[uint64](IORING_ENTER_GETEVENTS), 0, 0)
+    if er != 1:
+        return IOU_EINVAL
+    cqh: uint32 = _u32_load(cq_base, RING_HDR_HEAD)
+    cqe: uint64 = cq_cqes + cast[uint64](cqh & mask) * CQE_BYTES
+    ud: uint64 = cast[Ptr[uint64]](cqe + 0)[0]
+    res: int64 = cast[int64](cast[Ptr[int32]](cqe + 8)[0])
+    _u32_store(cq_base, RING_HDR_HEAD, cqh + 1)
+    if ud != want_ud:
+        return IOU_EINVAL
+    return res
+
+
+def _iou_zero_sqe(sqe: uint64):
+    z: uint64 = 0
+    while z < SQE_BYTES:
+        cast[Ptr[uint8]](sqe + z)[0] = 0
+        z = z + 1
 
 
 def iouring_selftest():
@@ -985,6 +1343,262 @@ def _iouring_selftest_body():
         return
     _u32_store(cq_base, RING_HDR_HEAD, cq_head + 1)
     printk0("[iouring] PASS: FSYNC completed via the ring\n")
+
+    # --- (4b) WRITE_FIXED then READ_FIXED via a registered buffer ------
+    # Register _iou_fixbuf as fixed buffer index 0, fill it, WRITE_FIXED it
+    # to a fresh memfd, then READ_FIXED it back byte-exact through the same
+    # registered buffer (offset region selected by addr/len within it).
+    fixfd: int32 = vfs_open_memfd("iouring-fixed", 0)
+    if fixfd < 0:
+        _iou_fail("could not open memfd for fixed-buffer test")
+        vfs_close(tfd)
+        vfs_close(fd)
+        return
+    fb: uint64 = cast[uint64](&_iou_fixbuf[0])
+    fi: uint64 = 0
+    while fi < 64:
+        _iou_fixbuf[fi] = 0
+        fi = fi + 1
+    # payload "FIXED-OK" (8 bytes) at the start of the registered buffer.
+    fp: Ptr[uint8] = "FIXED-OK"
+    fi = 0
+    while fi < 8:
+        _iou_fixbuf[fi] = fp[fi]
+        fi = fi + 1
+    # Register the buffer (iovec base=fixbuf, len=64).
+    cast[Ptr[uint64]](cast[uint64](&_iou_iov[0]) + 0)[0] = fb
+    cast[Ptr[uint64]](cast[uint64](&_iou_iov[0]) + 8)[0] = 64
+    rfreg: int64 = io_uring_register(cast[uint64](fd), IORING_REGISTER_BUFFERS,
+                                     cast[uint64](&_iou_iov[0]), 1, 0, 0)
+    if rfreg != 0:
+        _iou_fail("register fixed buffer failed")
+        vfs_close(fixfd)
+        vfs_close(tfd)
+        vfs_close(fd)
+        return
+    # SQE: WRITE_FIXED(fixfd, buf_index=0, rel_off=0, len=8, file_off=0).
+    sqe_wf: uint64 = sqes + 4 * SQE_BYTES
+    _iou_zero_sqe(sqe_wf)
+    cast[Ptr[uint8]](sqe_wf + SQE_OPCODE)[0] = IORING_OP_WRITE_FIXED
+    cast[Ptr[int32]](sqe_wf + SQE_FD)[0] = fixfd
+    cast[Ptr[uint64]](sqe_wf + SQE_OFF)[0] = 0
+    cast[Ptr[uint64]](sqe_wf + SQE_ADDR)[0] = 0          # rel offset in buf
+    cast[Ptr[uint32]](sqe_wf + SQE_LEN)[0] = 8
+    cast[Ptr[uint16]](sqe_wf + SQE_BUF_INDEX)[0] = 0
+    cast[Ptr[uint64]](sqe_wf + SQE_USER_DATA)[0] = cast[uint64](0x4444)
+    wfres: int64 = _iou_run_one(fd, sq_base, cq_base, sq_array, cq_cqes,
+                                mask, 4, cast[uint64](0x4444))
+    if wfres != 8:
+        _iou_fail("WRITE_FIXED did not write 8 bytes")
+        io_uring_register(cast[uint64](fd), IORING_UNREGISTER_BUFFERS,
+                          0, 0, 0, 0)
+        vfs_close(fixfd)
+        vfs_close(tfd)
+        vfs_close(fd)
+        return
+    # Clobber the buffer, rewind the file, READ_FIXED back into it.
+    fi = 0
+    while fi < 8:
+        _iou_fixbuf[fi] = 0
+        fi = fi + 1
+    vfs_lseek(fixfd, 0, 0)
+    sqe_rf: uint64 = sqes + 5 * SQE_BYTES
+    _iou_zero_sqe(sqe_rf)
+    cast[Ptr[uint8]](sqe_rf + SQE_OPCODE)[0] = IORING_OP_READ_FIXED
+    cast[Ptr[int32]](sqe_rf + SQE_FD)[0] = fixfd
+    cast[Ptr[uint64]](sqe_rf + SQE_OFF)[0] = 0
+    cast[Ptr[uint64]](sqe_rf + SQE_ADDR)[0] = 0
+    cast[Ptr[uint32]](sqe_rf + SQE_LEN)[0] = 8
+    cast[Ptr[uint16]](sqe_rf + SQE_BUF_INDEX)[0] = 0
+    cast[Ptr[uint64]](sqe_rf + SQE_USER_DATA)[0] = cast[uint64](0x5555)
+    rfres: int64 = _iou_run_one(fd, sq_base, cq_base, sq_array, cq_cqes,
+                                mask, 5, cast[uint64](0x5555))
+    if rfres != 8:
+        _iou_fail("READ_FIXED did not read 8 bytes")
+        io_uring_register(cast[uint64](fd), IORING_UNREGISTER_BUFFERS,
+                          0, 0, 0, 0)
+        vfs_close(fixfd)
+        vfs_close(tfd)
+        vfs_close(fd)
+        return
+    fi = 0
+    while fi < 8:
+        if _iou_fixbuf[fi] != fp[fi]:
+            _iou_fail("READ_FIXED bytes differ from WRITE_FIXED payload")
+            io_uring_register(cast[uint64](fd), IORING_UNREGISTER_BUFFERS,
+                              0, 0, 0, 0)
+            vfs_close(fixfd)
+            vfs_close(tfd)
+            vfs_close(fd)
+            return
+        fi = fi + 1
+    io_uring_register(cast[uint64](fd), IORING_UNREGISTER_BUFFERS, 0, 0, 0, 0)
+    vfs_close(fixfd)
+    printk0("[iouring] PASS: WRITE_FIXED/READ_FIXED byte-exact via reg buf\n")
+
+    # --- (4c) OPENAT -> WRITE -> CLOSE -> OPENAT -> READ -> STATX -------
+    # Build the path "/tmp/iouring-openat" (tmpfs is writable+creatable).
+    op: Ptr[uint8] = "/tmp/iouring-openat"
+    pi2: uint64 = 0
+    while pi2 < 19:
+        _iou_path[pi2] = op[pi2]
+        pi2 = pi2 + 1
+    _iou_path[19] = 0
+    pathp: uint64 = cast[uint64](&_iou_path[0])
+
+    # SQE: OPENAT(dirfd=AT_FDCWD, path, flags=O_WRONLY|O_CREAT). We only act
+    # on the access bits; O_WRONLY=1 routes to vfs_open_write (create).
+    O_WRONLY_CREAT: uint32 = 0o101         # O_WRONLY(1) | O_CREAT(0o100)
+    sqe_oa: uint64 = sqes + 4 * SQE_BYTES
+    _iou_zero_sqe(sqe_oa)
+    cast[Ptr[uint8]](sqe_oa + SQE_OPCODE)[0] = IORING_OP_OPENAT
+    cast[Ptr[int32]](sqe_oa + SQE_FD)[0] = -100          # AT_FDCWD
+    cast[Ptr[uint64]](sqe_oa + SQE_ADDR)[0] = pathp
+    cast[Ptr[uint32]](sqe_oa + SQE_OP_FLAGS)[0] = O_WRONLY_CREAT
+    cast[Ptr[uint64]](sqe_oa + SQE_USER_DATA)[0] = cast[uint64](0x6001)
+    wfd2: int64 = _iou_run_one(fd, sq_base, cq_base, sq_array, cq_cqes,
+                               mask, 4, cast[uint64](0x6001))
+    if wfd2 < 0:
+        _iou_fail("OPENAT(write) did not return a valid fd")
+        vfs_close(tfd)
+        vfs_close(fd)
+        return
+    ofd_w: int32 = cast[int32](wfd2)
+
+    # Fill payload "openat!" (7 bytes) and WRITE it via the ring.
+    owp: Ptr[uint8] = "openat!"
+    oi: uint64 = 0
+    while oi < 7:
+        _iou_src[oi] = owp[oi]
+        oi = oi + 1
+    sqe_w2: uint64 = sqes + 5 * SQE_BYTES
+    _iou_zero_sqe(sqe_w2)
+    cast[Ptr[uint8]](sqe_w2 + SQE_OPCODE)[0] = IORING_OP_WRITE
+    cast[Ptr[int32]](sqe_w2 + SQE_FD)[0] = ofd_w
+    cast[Ptr[uint64]](sqe_w2 + SQE_ADDR)[0] = cast[uint64](&_iou_src[0])
+    cast[Ptr[uint32]](sqe_w2 + SQE_LEN)[0] = 7
+    cast[Ptr[uint64]](sqe_w2 + SQE_USER_DATA)[0] = cast[uint64](0x6002)
+    w2res: int64 = _iou_run_one(fd, sq_base, cq_base, sq_array, cq_cqes,
+                                mask, 5, cast[uint64](0x6002))
+    if w2res != 7:
+        _iou_fail("WRITE to OPENAT'd fd did not write 7 bytes")
+        vfs_close(ofd_w)
+        vfs_close(tfd)
+        vfs_close(fd)
+        return
+
+    # CLOSE the write fd via the ring.
+    sqe_cl: uint64 = sqes + 6 * SQE_BYTES
+    _iou_zero_sqe(sqe_cl)
+    cast[Ptr[uint8]](sqe_cl + SQE_OPCODE)[0] = IORING_OP_CLOSE
+    cast[Ptr[int32]](sqe_cl + SQE_FD)[0] = ofd_w
+    cast[Ptr[uint64]](sqe_cl + SQE_USER_DATA)[0] = cast[uint64](0x6003)
+    clres: int64 = _iou_run_one(fd, sq_base, cq_base, sq_array, cq_cqes,
+                                mask, 6, cast[uint64](0x6003))
+    if clres != 0:
+        _iou_fail("CLOSE via the ring did not return 0")
+        vfs_close(tfd)
+        vfs_close(fd)
+        return
+    printk0("[iouring] PASS: OPENAT(create) -> WRITE -> CLOSE via the ring\n")
+
+    # Re-OPENAT read-only, READ the bytes back, assert byte-exact.
+    sqe_oa2: uint64 = sqes + 4 * SQE_BYTES
+    _iou_zero_sqe(sqe_oa2)
+    cast[Ptr[uint8]](sqe_oa2 + SQE_OPCODE)[0] = IORING_OP_OPENAT
+    cast[Ptr[int32]](sqe_oa2 + SQE_FD)[0] = -100         # AT_FDCWD
+    cast[Ptr[uint64]](sqe_oa2 + SQE_ADDR)[0] = pathp
+    cast[Ptr[uint32]](sqe_oa2 + SQE_OP_FLAGS)[0] = 0     # O_RDONLY
+    cast[Ptr[uint64]](sqe_oa2 + SQE_USER_DATA)[0] = cast[uint64](0x6004)
+    rfd2: int64 = _iou_run_one(fd, sq_base, cq_base, sq_array, cq_cqes,
+                               mask, 4, cast[uint64](0x6004))
+    if rfd2 < 0:
+        _iou_fail("OPENAT(read) did not return a valid fd")
+        vfs_close(tfd)
+        vfs_close(fd)
+        return
+    ofd_r: int32 = cast[int32](rfd2)
+    oj: uint64 = 0
+    while oj < 32:
+        _iou_dst[oj] = 0
+        oj = oj + 1
+    sqe_r2: uint64 = sqes + 5 * SQE_BYTES
+    _iou_zero_sqe(sqe_r2)
+    cast[Ptr[uint8]](sqe_r2 + SQE_OPCODE)[0] = IORING_OP_READ
+    cast[Ptr[int32]](sqe_r2 + SQE_FD)[0] = ofd_r
+    cast[Ptr[uint64]](sqe_r2 + SQE_ADDR)[0] = cast[uint64](&_iou_dst[0])
+    cast[Ptr[uint32]](sqe_r2 + SQE_LEN)[0] = 7
+    cast[Ptr[uint64]](sqe_r2 + SQE_USER_DATA)[0] = cast[uint64](0x6005)
+    r2res: int64 = _iou_run_one(fd, sq_base, cq_base, sq_array, cq_cqes,
+                                mask, 5, cast[uint64](0x6005))
+    if r2res != 7:
+        _iou_fail("READ from re-OPENAT'd fd did not read 7 bytes")
+        vfs_close(ofd_r)
+        vfs_close(tfd)
+        vfs_close(fd)
+        return
+    ok: uint64 = 0
+    while ok < 7:
+        if _iou_dst[ok] != owp[ok]:
+            _iou_fail("OPENAT round-trip bytes differ from payload")
+            vfs_close(ofd_r)
+            vfs_close(tfd)
+            vfs_close(fd)
+            return
+        ok = ok + 1
+    printk0("[iouring] PASS: OPENAT(read) -> READ byte-exact via the ring\n")
+
+    # STATX the path via the ring; assert res 0 and size == 7.
+    si: uint64 = 0
+    while si < 256:
+        _iou_statxb[si] = 0
+        si = si + 1
+    sqe_sx: uint64 = sqes + 6 * SQE_BYTES
+    _iou_zero_sqe(sqe_sx)
+    cast[Ptr[uint8]](sqe_sx + SQE_OPCODE)[0] = IORING_OP_STATX
+    cast[Ptr[int32]](sqe_sx + SQE_FD)[0] = -100          # AT_FDCWD dirfd
+    cast[Ptr[uint64]](sqe_sx + SQE_ADDR)[0] = pathp      # path
+    cast[Ptr[uint32]](sqe_sx + SQE_OP_FLAGS)[0] = 0      # flags (ignored)
+    cast[Ptr[uint32]](sqe_sx + SQE_LEN)[0] = 0x7FF       # mask (ignored)
+    cast[Ptr[uint64]](sqe_sx + SQE_OFF)[0] = cast[uint64](&_iou_statxb[0])
+    cast[Ptr[uint64]](sqe_sx + SQE_USER_DATA)[0] = cast[uint64](0x6006)
+    sxres: int64 = _iou_run_one(fd, sq_base, cq_base, sq_array, cq_cqes,
+                                mask, 6, cast[uint64](0x6006))
+    if sxres != 0:
+        _iou_fail("STATX via the ring did not return 0")
+        vfs_close(ofd_r)
+        vfs_close(tfd)
+        vfs_close(fd)
+        return
+    sx_size: uint64 = cast[Ptr[uint64]](cast[uint64](&_iou_statxb[0])
+                                        + IOU_STATX_OFF_SIZE)[0]
+    if sx_size != 7:
+        _iou_fail("STATX reported wrong file size")
+        vfs_close(ofd_r)
+        vfs_close(tfd)
+        vfs_close(fd)
+        return
+    printk0("[iouring] PASS: STATX via the ring (size=7)\n")
+
+    # --- (4d) POLL_ADD synchronous one-shot readiness ------------------
+    # A regular file fd is always POLLIN|POLLOUT-ready; assert the returned
+    # ready mask includes POLLIN(0x1) when we poll for it.
+    sqe_pa: uint64 = sqes + 5 * SQE_BYTES
+    _iou_zero_sqe(sqe_pa)
+    cast[Ptr[uint8]](sqe_pa + SQE_OPCODE)[0] = IORING_OP_POLL_ADD
+    cast[Ptr[int32]](sqe_pa + SQE_FD)[0] = ofd_r
+    cast[Ptr[uint32]](sqe_pa + SQE_OP_FLAGS)[0] = 0x1    # POLLIN
+    cast[Ptr[uint64]](sqe_pa + SQE_USER_DATA)[0] = cast[uint64](0x6007)
+    pares: int64 = _iou_run_one(fd, sq_base, cq_base, sq_array, cq_cqes,
+                                mask, 5, cast[uint64](0x6007))
+    if (pares & 0x1) == 0:
+        _iou_fail("POLL_ADD did not report POLLIN ready on a regular file")
+        vfs_close(ofd_r)
+        vfs_close(tfd)
+        vfs_close(fd)
+        return
+    vfs_close(ofd_r)
+    printk0("[iouring] PASS: POLL_ADD one-shot readiness (POLLIN ready)\n")
 
     # --- (5) io_uring_register buffers round-trip ----------------------
     reg: int64 = io_uring_register(cast[uint64](fd), IORING_REGISTER_BUFFERS,
