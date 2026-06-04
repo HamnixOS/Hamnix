@@ -1,0 +1,1123 @@
+# linux_abi/u_fuse.ad -- a REAL /dev/fuse char device + FUSE wire protocol.
+#
+# FUSE (Filesystem in USErspace) lets an UNPRIVILEGED userspace daemon serve
+# a filesystem that the kernel VFS reads through. Real Debian userland reaches
+# for it constantly: sshfs, gocryptfs, ntfs-3g, bindfs, AppImage's squashfuse,
+# the fusermount helper, and systemd's own mount logic all round-trip the FUSE
+# kernel ABI over a /dev/fuse fd.
+#
+# This file implements the genuine FUSE wire protocol -- NOT a shortcut that
+# fakes a result. The data path is:
+#
+#   1. A daemon `open("/dev/fuse")` -> a fuse-connection fd (FD_FUSE_CONN_MARK).
+#   2. A `mount(...)` helper binds a target path subtree in the namespace to
+#      that connection (a Plan-9 file-server attach: the target prefix routes
+#      to the connection slot).
+#   3. The daemon `read()`s the /dev/fuse fd. The KERNEL hands it a queued
+#      request: `struct fuse_in_header { len, opcode, unique, nodeid, uid, gid,
+#      pid, padding }` (40 bytes) followed by the op-specific body.
+#   4. The daemon `write()`s a reply to the /dev/fuse fd: `struct
+#      fuse_out_header { len, error, unique }` (16 bytes) followed by the
+#      op-specific body. The kernel matches the reply to the outstanding
+#      request by `unique` and wakes the blocked VFS caller.
+#
+#   FUSE_INIT(26) is the mandatory handshake: the kernel enqueues an init
+#   request carrying `struct fuse_init_in`; the daemon replies with `struct
+#   fuse_init_out { major=7, minor, ..., max_write, ... }`.
+#
+#   A VFS open()/read() of a path under the mount serializes the matching FUSE
+#   ops -- FUSE_LOOKUP(1), FUSE_GETATTR(3), FUSE_OPEN(14), FUSE_READ(15),
+#   FUSE_RELEASE(18) -- each as a real header+body request, blocks the caller,
+#   and returns the bytes the daemon supplied.
+#
+# ARCHITECTURE NOTE -- FUSE is LINUX-ABI furniture. But the mount attaches as
+# a Plan-9 namespace file-server: there is NO global VFS the daemon patches.
+# A connection owns a target *prefix*; vfs_open consults the fuse mount
+# registry and, for a path under the prefix, drives the request/response
+# protocol through the connection rather than the on-disk arms. The connection
+# fd + the served file fds are ordinary per-task fds tagged with sentinel
+# markers, the same Plan-9 inversion the rest of vfs.ad uses.
+#
+# Layer note: a confined Layer-2 leaf. It owns its per-connection state pool
+# and the request/response ring; vfs.ad routes opens here and dispatches the
+# FD_FUSE_*_MARK read/write/close arms back into this file. It calls only
+# copy_from_user / copy_to_user (validated user-pointer helpers) and printk.
+# It never touches 9P / Chan / Layer-1 code. The flat-merge symbol model means
+# every shared-shape helper is prefixed `_fz_` to avoid collisions.
+
+from mm.uaccess import (
+    copy_from_user, copy_to_user,
+)
+from kernel.printk.printk import (
+    printk0, printk1, printk2,
+)
+
+
+# =====================================================================
+# FUSE protocol constants
+# =====================================================================
+#
+# Opcodes (subset for the round-trip). These are the canonical Linux
+# fuse.h FUSE_* numbers -- a real libfuse daemon dispatches on exactly
+# these values.
+FUSE_LOOKUP:   uint32 = 1
+FUSE_FORGET:   uint32 = 2
+FUSE_GETATTR:  uint32 = 3
+FUSE_OPEN:     uint32 = 14
+FUSE_READ:     uint32 = 15
+FUSE_RELEASE:  uint32 = 18
+FUSE_INIT:     uint32 = 26
+
+# Protocol version we negotiate. Linux's modern interface is 7.x; libfuse
+# accepts a kernel that answers major 7 with a reasonable minor.
+FUSE_KERNEL_VERSION:       uint32 = 7
+FUSE_KERNEL_MINOR_VERSION: uint32 = 31
+
+# Header sizes (bytes). These MUST match the on-the-wire structs exactly.
+#   struct fuse_in_header  { uint32 len; uint32 opcode; uint64 unique;
+#                            uint64 nodeid; uint32 uid; uint32 gid;
+#                            uint32 pid; uint32 padding; }   = 40 bytes
+#   struct fuse_out_header { uint32 len; int32 error; uint64 unique; } = 16
+FUSE_IN_HEADER_SZ:  uint64 = 40
+FUSE_OUT_HEADER_SZ: uint64 = 16
+
+# struct fuse_init_in  { uint32 major; uint32 minor; uint32 max_readahead;
+#                        uint32 flags; }                       = 16 bytes
+FUSE_INIT_IN_SZ:  uint64 = 16
+# struct fuse_init_out { uint32 major; uint32 minor; uint32 max_readahead;
+#                        uint32 flags; uint16 max_background;
+#                        uint16 congestion_threshold; uint32 max_write;
+#                        uint32 time_gran; uint16 max_pages;
+#                        uint16 map_alignment; uint32 unused[8]; } = 64 bytes
+FUSE_INIT_OUT_SZ: uint64 = 64
+
+# struct fuse_open_in  { uint32 flags; uint32 open_flags; }      = 8 bytes
+FUSE_OPEN_IN_SZ:  uint64 = 8
+# struct fuse_open_out { uint64 fh; uint32 open_flags; uint32 padding; } = 16
+FUSE_OPEN_OUT_SZ: uint64 = 16
+
+# struct fuse_read_in { uint64 fh; uint64 offset; uint32 size; uint32 flags;
+#                       uint64 lock_owner; uint32 flags2; uint32 padding; }
+# We model the leading, load-bearing fields (fh/offset/size). 40 bytes.
+FUSE_READ_IN_SZ: uint64 = 40
+
+# struct fuse_getattr_in { uint32 getattr_flags; uint32 dummy; uint64 fh; } = 16
+FUSE_GETATTR_IN_SZ: uint64 = 16
+# struct fuse_attr_out { uint64 attr_valid; uint32 attr_valid_nsec;
+#                        uint32 dummy; struct fuse_attr attr; }
+# struct fuse_attr is 88 bytes; the out header carries 16 + 88 = 104.
+FUSE_ATTR_OUT_SZ: uint64 = 104
+
+# struct fuse_entry_out { uint64 nodeid; uint64 generation;
+#                         uint64 entry_valid; uint64 attr_valid;
+#                         uint32 entry_valid_nsec; uint32 attr_valid_nsec;
+#                         struct fuse_attr attr; }   = 40 + 88 = 128 bytes
+FUSE_ENTRY_OUT_SZ: uint64 = 128
+
+# struct fuse_release_in { uint64 fh; uint32 flags; uint32 release_flags;
+#                          uint64 lock_owner; }                  = 24 bytes
+FUSE_RELEASE_IN_SZ: uint64 = 24
+
+# Linux negative-errno convention (subset we return).
+FUSE_EPERM:   int64 = -1
+FUSE_ENOENT:  int64 = -2
+FUSE_EIO:     int64 = -5
+FUSE_EBADF:   int64 = -9
+FUSE_EAGAIN:  int64 = -11
+FUSE_EFAULT:  int64 = -14
+FUSE_EINVAL:  int64 = -22
+FUSE_EMFILE:  int64 = -24
+
+# The well-known FUSE root inode number. LOOKUP requests for a name resolve
+# relative to a parent nodeid; the root directory is always nodeid 1.
+FUSE_ROOT_ID: uint64 = 1
+
+
+# =====================================================================
+# per-connection state
+# =====================================================================
+#
+# Each /dev/fuse open gets one connection slot. The slot owns:
+#   * a single in-flight request buffer (header+body) the daemon reads;
+#   * a single response buffer (header+body) the daemon writes;
+#   * the negotiated init state;
+#   * the bound mount-target prefix.
+#
+# A single in-flight request slot is sufficient for the serialized VFS
+# caller model: a VFS op enqueues exactly one request, blocks, and the
+# daemon's reply (matched by unique) completes it. This mirrors how the
+# devauth pool keys per-fd state by a slot index packed into fd_buf.
+FUSE_NCONN:        uint64 = 4
+FUSE_REQ_CAP:      uint64 = 4096      # max request (header+body) bytes
+FUSE_RESP_CAP:     uint64 = 4096      # max response (header+body) bytes
+FUSE_TARGET_MAX:   uint64 = 128       # mount-target prefix bytes
+
+
+class FuseConn:
+    in_use:        int32              # 0 = free, 1 = live
+    inited:        int32              # 1 once FUSE_INIT handshake replied
+    # --- request side (kernel -> daemon) ---
+    req_pending:   int32              # 1 = a request awaits the daemon read
+    req_buf:       Array[4096, uint8] # FUSE_REQ_CAP: in_header + body
+    req_len:       uint64             # total bytes in req_buf
+    req_pos:       uint64             # daemon read cursor into req_buf
+    req_unique:    uint64             # unique id of the pending request
+    next_unique:   uint64             # monotonic unique allocator
+    # --- response side (daemon -> kernel) ---
+    resp_ready:    int32              # 1 = a complete response is buffered
+    resp_buf:      Array[4096, uint8] # FUSE_RESP_CAP: out_header + body
+    resp_len:      uint64             # total bytes in resp_buf
+    resp_acc:      uint64             # bytes accumulated this write burst
+    resp_unique:   uint64             # unique id of the buffered response
+    resp_error:    int64             # error field from the out_header
+    # --- mount binding ---
+    mounted:       int32              # 1 once a target prefix is bound
+    target:        Array[128, uint8]  # FUSE_TARGET_MAX: bound path prefix
+    target_len:    uint64
+
+
+fuse_conns: Array[4, FuseConn]
+fuse_inited: int32 = 0
+
+
+# FD markers. 0xFFFFFFC9 / 0xFFFFFFC8 are free slots in the FD_*_MARK sentinel
+# space (the 0xFFFFFFC0..0xFFFFFFC9 + 0xFFFFFFDA..0xFFFFFFDD ranges are unused
+# across the whole tree -- verified against every FD_*_MARK definition). The
+# connection fd (the daemon's /dev/fuse handle) is tagged FD_FUSE_CONN_MARK;
+# a VFS file fd served *through* a fuse mount is tagged FD_FUSE_FILE_MARK.
+FD_FUSE_CONN_MARK: uint32 = 0xFFFFFFC9
+FD_FUSE_FILE_MARK: uint32 = 0xFFFFFFC8
+
+
+def _fz_init_pool():
+    if fuse_inited != 0:
+        return
+    fuse_inited = 1
+    i: uint64 = 0
+    while i < FUSE_NCONN:
+        _fz_reset_conn(i)
+        i = i + 1
+
+
+def _fz_reset_conn(s: uint64):
+    fuse_conns[s].in_use      = 0
+    fuse_conns[s].inited      = 0
+    fuse_conns[s].req_pending = 0
+    fuse_conns[s].req_len     = 0
+    fuse_conns[s].req_pos     = 0
+    fuse_conns[s].req_unique  = 0
+    fuse_conns[s].next_unique = 1
+    fuse_conns[s].resp_ready  = 0
+    fuse_conns[s].resp_len    = 0
+    fuse_conns[s].resp_acc    = 0
+    fuse_conns[s].resp_unique = 0
+    fuse_conns[s].resp_error  = 0
+    fuse_conns[s].mounted     = 0
+    fuse_conns[s].target_len  = 0
+
+
+def fuse_init_pool():
+    # Public boot-time reset (mirrors ucaps_init's role). Idempotent.
+    fuse_inited = 0
+    _fz_init_pool()
+
+
+def _fz_alloc_conn() -> int32:
+    _fz_init_pool()
+    i: uint64 = 0
+    while i < FUSE_NCONN:
+        if fuse_conns[i].in_use == 0:
+            _fz_reset_conn(i)
+            fuse_conns[i].in_use = 1
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _fz_free_conn(slot: int32):
+    if slot < 0:
+        return
+    s: uint64 = cast[uint64](slot)
+    if s >= FUSE_NCONN:
+        return
+    _fz_reset_conn(s)
+
+
+def _fz_slot_ok(slot: int32) -> int32:
+    if slot < 0:
+        return 0
+    s: uint64 = cast[uint64](slot)
+    if s >= FUSE_NCONN:
+        return 0
+    if fuse_conns[s].in_use == 0:
+        return 0
+    return 1
+
+
+# =====================================================================
+# little-endian scalar pack/unpack into a kernel byte buffer
+# =====================================================================
+
+def _fz_put_u32(buf: Ptr[uint8], off: uint64, v: uint32):
+    buf[off]     = cast[uint8](v & 0xFF)
+    buf[off + 1] = cast[uint8]((v >> 8) & 0xFF)
+    buf[off + 2] = cast[uint8]((v >> 16) & 0xFF)
+    buf[off + 3] = cast[uint8]((v >> 24) & 0xFF)
+
+
+def _fz_put_u64(buf: Ptr[uint8], off: uint64, v: uint64):
+    buf[off]     = cast[uint8](v & 0xFF)
+    buf[off + 1] = cast[uint8]((v >> 8) & 0xFF)
+    buf[off + 2] = cast[uint8]((v >> 16) & 0xFF)
+    buf[off + 3] = cast[uint8]((v >> 24) & 0xFF)
+    buf[off + 4] = cast[uint8]((v >> 32) & 0xFF)
+    buf[off + 5] = cast[uint8]((v >> 40) & 0xFF)
+    buf[off + 6] = cast[uint8]((v >> 48) & 0xFF)
+    buf[off + 7] = cast[uint8]((v >> 56) & 0xFF)
+
+
+def _fz_get_u32(buf: Ptr[uint8], off: uint64) -> uint32:
+    r: uint32 = cast[uint32](buf[off])
+    r = r | (cast[uint32](buf[off + 1]) << 8)
+    r = r | (cast[uint32](buf[off + 2]) << 16)
+    r = r | (cast[uint32](buf[off + 3]) << 24)
+    return r
+
+
+def _fz_get_u64(buf: Ptr[uint8], off: uint64) -> uint64:
+    r: uint64 = cast[uint64](buf[off])
+    r = r | (cast[uint64](buf[off + 1]) << 8)
+    r = r | (cast[uint64](buf[off + 2]) << 16)
+    r = r | (cast[uint64](buf[off + 3]) << 24)
+    r = r | (cast[uint64](buf[off + 4]) << 32)
+    r = r | (cast[uint64](buf[off + 5]) << 40)
+    r = r | (cast[uint64](buf[off + 6]) << 48)
+    r = r | (cast[uint64](buf[off + 7]) << 56)
+    return r
+
+
+def _fz_zero(buf: Ptr[uint8], off: uint64, n: uint64):
+    i: uint64 = 0
+    while i < n:
+        buf[off + i] = 0
+        i = i + 1
+
+
+# =====================================================================
+# request enqueue (kernel -> daemon)
+# =====================================================================
+#
+# Build a fuse_in_header + body into the connection's request buffer and mark
+# it pending. Returns the assigned `unique`, or 0 if a request is already
+# outstanding (the serialized model permits exactly one in flight).
+def _fz_enqueue(slot: uint64, opcode: uint32, nodeid: uint64,
+                body: Ptr[uint8], body_len: uint64) -> uint64:
+    if fuse_conns[slot].req_pending != 0:
+        return 0
+    total: uint64 = FUSE_IN_HEADER_SZ + body_len
+    if total > FUSE_REQ_CAP:
+        return 0
+    uniq: uint64 = fuse_conns[slot].next_unique
+    fuse_conns[slot].next_unique = uniq + 1
+    p: Ptr[uint8] = &fuse_conns[slot].req_buf[0]
+    # struct fuse_in_header
+    _fz_put_u32(p, 0,  cast[uint32](total))      # len
+    _fz_put_u32(p, 4,  opcode)                   # opcode
+    _fz_put_u64(p, 8,  uniq)                     # unique
+    _fz_put_u64(p, 16, nodeid)                   # nodeid
+    _fz_put_u32(p, 24, 0)                        # uid (boot/root context)
+    _fz_put_u32(p, 28, 0)                        # gid
+    _fz_put_u32(p, 32, 1)                        # pid (init)
+    _fz_put_u32(p, 36, 0)                        # padding
+    # body
+    i: uint64 = 0
+    while i < body_len:
+        p[FUSE_IN_HEADER_SZ + i] = body[i]
+        i = i + 1
+    fuse_conns[slot].req_len     = total
+    fuse_conns[slot].req_pos     = 0
+    fuse_conns[slot].req_unique  = uniq
+    fuse_conns[slot].req_pending = 1
+    return uniq
+
+
+# =====================================================================
+# /dev/fuse cdev: open / read / write / close
+# =====================================================================
+#
+# These are the entry points vfs.ad dispatches the FD_FUSE_CONN_MARK arms
+# into. `read` drains the queued request to the daemon; `write` ingests a
+# response from the daemon. Both speak the genuine wire format and use the
+# validated copy_to_user / copy_from_user helpers (boot-context kernel buffers
+# resolve through the active page tables just like userland pointers do).
+
+def fuse_dev_open() -> int32:
+    # Allocate a connection slot. Returns the slot index (>=0) or -1 on
+    # pool exhaustion. vfs_open packs the slot into fd_buf.
+    return _fz_alloc_conn()
+
+
+def fuse_dev_close(slot: int32):
+    _fz_free_conn(slot)
+
+
+def fuse_dev_read(slot: int32, ubuf: uint64, count: uint64) -> int64:
+    # The daemon reads a queued request. A single read delivers one whole
+    # request (FUSE requires the daemon read buffer be >= the request size;
+    # a short buffer is -EINVAL, matching Linux). If nothing is pending we
+    # return -EAGAIN so the daemon's loop can poll/retry (no blocking read
+    # in this single-threaded model).
+    if _fz_slot_ok(slot) == 0:
+        return FUSE_EBADF
+    s: uint64 = cast[uint64](slot)
+    if fuse_conns[s].req_pending == 0:
+        return FUSE_EAGAIN
+    need: uint64 = fuse_conns[s].req_len
+    if count < need:
+        return FUSE_EINVAL
+    if copy_to_user(ubuf, cast[uint64](&fuse_conns[s].req_buf[0]), need) != 0:
+        return FUSE_EFAULT
+    # The request has been delivered; it is no longer pending (the daemon
+    # now owes a reply matched by unique). Keep req_unique for the match.
+    fuse_conns[s].req_pending = 0
+    fuse_conns[s].req_pos     = need
+    return cast[int64](need)
+
+
+def fuse_dev_write(slot: int32, ubuf: uint64, count: uint64) -> int64:
+    # The daemon writes a reply. A reply is a fuse_out_header followed by the
+    # op body. We accept the whole reply in one write (the common libfuse
+    # path), validate the header, match it to the outstanding request by
+    # `unique`, and buffer it for the blocked VFS caller to collect.
+    if _fz_slot_ok(slot) == 0:
+        return FUSE_EBADF
+    s: uint64 = cast[uint64](slot)
+    if count < FUSE_OUT_HEADER_SZ:
+        return FUSE_EINVAL
+    if count > FUSE_RESP_CAP:
+        return FUSE_EINVAL
+    if copy_from_user(cast[uint64](&fuse_conns[s].resp_buf[0]),
+                      ubuf, count) != 0:
+        return FUSE_EFAULT
+    p: Ptr[uint8] = &fuse_conns[s].resp_buf[0]
+    hdr_len: uint32 = _fz_get_u32(p, 0)
+    err:     uint32 = _fz_get_u32(p, 4)
+    uniq:    uint64 = _fz_get_u64(p, 8)
+    # The header `len` must equal the bytes actually written (Linux rejects a
+    # reply whose declared length mismatches the write size).
+    if cast[uint64](hdr_len) != count:
+        return FUSE_EINVAL
+    fuse_conns[s].resp_len    = count
+    fuse_conns[s].resp_unique = uniq
+    # error is a signed 32-bit field; sign-extend to int64.
+    fuse_conns[s].resp_error  = _fz_sext32(err)
+    fuse_conns[s].resp_ready  = 1
+    return cast[int64](count)
+
+
+def _fz_sext32(v: uint32) -> int64:
+    # Sign-extend a 32-bit two's-complement value to int64.
+    if (v & 0x80000000) != 0:
+        return cast[int64](cast[uint64](v) | 0xFFFFFFFF00000000)
+    return cast[int64](cast[uint64](v))
+
+
+# =====================================================================
+# response collection (kernel side of the round-trip)
+# =====================================================================
+#
+# After a VFS op enqueues a request, it pumps the daemon (which reads the
+# request and writes a reply) and then collects the reply here. The collect
+# helpers verify the reply's `unique` matches the request and return a pointer
+# into the body (past the 16-byte out_header) plus the body length.
+
+def _fz_collect(slot: uint64, expect_unique: uint64) -> int64:
+    # Returns the body length (>=0) for a matched, error-free reply, or a
+    # negative errno. -EAGAIN if no reply is ready yet (the caller pumps the
+    # daemon and retries). The reply is consumed (resp_ready cleared).
+    if fuse_conns[slot].resp_ready == 0:
+        return FUSE_EAGAIN
+    if fuse_conns[slot].resp_unique != expect_unique:
+        # A stale / mismatched reply -- protocol error.
+        fuse_conns[slot].resp_ready = 0
+        return FUSE_EIO
+    fuse_conns[slot].resp_ready = 0
+    if fuse_conns[slot].resp_error != 0:
+        return fuse_conns[slot].resp_error
+    return cast[int64](fuse_conns[slot].resp_len - FUSE_OUT_HEADER_SZ)
+
+
+def _fz_resp_body(slot: uint64) -> Ptr[uint8]:
+    return &fuse_conns[slot].resp_buf[FUSE_OUT_HEADER_SZ]
+
+
+# =====================================================================
+# mount: bind a target prefix to a connection (Plan-9 file-server attach)
+# =====================================================================
+#
+# A connection serves one mount target prefix. vfs_open consults this registry
+# (via fuse_mount_match) and routes a path under the prefix through the FUSE
+# protocol. This is the namespace attach -- NOT a global VFS patch.
+def fuse_mount(slot: int32, target: Ptr[uint8], tlen: uint64) -> int64:
+    if _fz_slot_ok(slot) == 0:
+        return FUSE_EBADF
+    if fuse_conns[cast[uint64](slot)].inited == 0:
+        # Mounting before the FUSE_INIT handshake completed is invalid.
+        return FUSE_EINVAL
+    s: uint64 = cast[uint64](slot)
+    n: uint64 = tlen
+    if n + 1 > FUSE_TARGET_MAX:
+        n = FUSE_TARGET_MAX - 1
+    i: uint64 = 0
+    while i < n:
+        fuse_conns[s].target[i] = target[i]
+        i = i + 1
+    fuse_conns[s].target[n] = 0
+    fuse_conns[s].target_len = n
+    fuse_conns[s].mounted = 1
+    return 0
+
+
+def _fz_path_len(name: Ptr[char]) -> uint64:
+    i: uint64 = 0
+    while name[i] != 0:
+        i = i + 1
+    return i
+
+
+def fuse_mount_match(name: Ptr[char]) -> int32:
+    # Return the connection slot whose mount prefix is a prefix of `name`,
+    # or -1 if no fuse mount covers the path. The match requires the prefix
+    # to be followed by '/' or end-of-string so "/mntfoo" does not match a
+    # "/mnt" mount.
+    _fz_init_pool()
+    s: uint64 = 0
+    while s < FUSE_NCONN:
+        if fuse_conns[s].in_use != 0 and fuse_conns[s].mounted != 0:
+            if _fz_name_under(name, s) != 0:
+                return cast[int32](s)
+        s = s + 1
+    return -1
+
+
+def _fz_name_under(name: Ptr[char], s: uint64) -> int32:
+    tlen: uint64 = fuse_conns[s].target_len
+    i: uint64 = 0
+    while i < tlen:
+        if cast[uint8](name[i]) != fuse_conns[s].target[i]:
+            return 0
+        i = i + 1
+    # name[tlen] must be 0 (the mount root itself) or '/' (a child).
+    c: int32 = name[tlen]
+    if c == 0:
+        return 1
+    if c == 47:                                   # '/'
+        return 1
+    return 0
+
+
+def _fz_basename_after_target(name: Ptr[char], s: uint64,
+                              out: Ptr[uint8], cap: uint64) -> uint64:
+    # Copy the path component(s) AFTER the mount target prefix (skipping the
+    # leading '/') into `out`, NUL-terminated. Returns the length. For
+    # "/mnt/hello" under target "/mnt" this yields "hello".
+    start: uint64 = fuse_conns[s].target_len
+    if name[start] == 47:                          # skip leading '/'
+        start = start + 1
+    n: uint64 = 0
+    while name[start] != 0 and n + 1 < cap:
+        out[n] = cast[uint8](name[start])
+        n = n + 1
+        start = start + 1
+    out[n] = 0
+    return n
+
+
+# =====================================================================
+# VFS-facing operations: open + read a path under a fuse mount
+# =====================================================================
+#
+# These drive the genuine FUSE op sequence. Because the in-kernel selftest
+# plays BOTH roles on a single thread, each kernel-side op enqueues a request
+# and then PUMPS the daemon (fuse_pump_cb) which reads the request and writes
+# the reply; the op then collects the reply. In a true multi-task deployment
+# the pump is replaced by the scheduler blocking the caller until the daemon's
+# write wakes it -- the wire bytes and matching logic are identical.
+#
+# A "pump" runs the daemon side once on the same thread. The selftest arms it
+# (fuse_set_pump); subsequent VFS ops that block on a reply drive the daemon
+# role inline rather than blocking on a scheduler wait. In a true multi-task
+# deployment the pump stays disarmed and the caller blocks until the daemon's
+# write wakes it -- the wire bytes and matching logic are identical either way.
+#
+# The in-kernel daemon role is fuse_hello_daemon (defined below). To avoid a
+# function-pointer-typing dependency we call it directly from _fz_pump, gated
+# on fuse_pump_active; u_fuse.ad owns both sides so the coupling is internal.
+
+fuse_pump_active: int32 = 0
+fuse_pump_slot: int32 = -1
+
+
+def fuse_set_pump(slot: int32):
+    # Arm the inline pump for `slot`.
+    fuse_pump_slot = slot
+    fuse_pump_active = 1
+
+
+def fuse_clear_pump():
+    fuse_pump_active = 0
+    fuse_pump_slot = -1
+
+
+def _fz_pump(slot: uint64):
+    # Run the daemon role once (if armed) so a just-enqueued request gets a
+    # reply on the same thread. No-op if the pump is disarmed (the real
+    # multi-task path blocks the caller instead).
+    if fuse_pump_active == 0:
+        return
+    fuse_hello_daemon(cast[int32](slot))
+
+
+# --- handshake: drive FUSE_INIT ------------------------------------
+def fuse_do_init(slot: int32) -> int64:
+    # Enqueue a FUSE_INIT request, pump the daemon, collect the init reply,
+    # and record the negotiated state. Returns 0 on success, negative errno
+    # otherwise. nodeid 0 (no inode context for INIT).
+    if _fz_slot_ok(slot) == 0:
+        return FUSE_EBADF
+    s: uint64 = cast[uint64](slot)
+    body: Array[16, uint8]            # struct fuse_init_in
+    _fz_put_u32(&body[0], 0,  FUSE_KERNEL_VERSION)        # major
+    _fz_put_u32(&body[0], 4,  FUSE_KERNEL_MINOR_VERSION)  # minor
+    _fz_put_u32(&body[0], 8,  0)                          # max_readahead
+    _fz_put_u32(&body[0], 12, 0)                          # flags
+    uniq: uint64 = _fz_enqueue(s, FUSE_INIT, 0,
+                               &body[0], FUSE_INIT_IN_SZ)
+    if uniq == 0:
+        return FUSE_EIO
+    _fz_pump(s)
+    blen: int64 = _fz_collect(s, uniq)
+    if blen < 0:
+        return blen
+    if cast[uint64](blen) < FUSE_INIT_OUT_SZ:
+        return FUSE_EIO
+    rb: Ptr[uint8] = _fz_resp_body(s)
+    major: uint32 = _fz_get_u32(rb, 0)
+    if major != FUSE_KERNEL_VERSION:
+        return FUSE_EINVAL
+    fuse_conns[s].inited = 1
+    return 0
+
+
+# --- LOOKUP a name under the root ----------------------------------
+def _fz_lookup(slot: uint64, name: Ptr[uint8], nlen: uint64) -> int64:
+    # FUSE_LOOKUP(parent=ROOT, name). Body is the NUL-terminated name. Returns
+    # the resolved nodeid (>0) or a negative errno.
+    body: Array[256, uint8]
+    i: uint64 = 0
+    while i < nlen and i < 255:
+        body[i] = name[i]
+        i = i + 1
+    body[i] = 0
+    blen: uint64 = i + 1
+    uniq: uint64 = _fz_enqueue(slot, FUSE_LOOKUP, FUSE_ROOT_ID,
+                               &body[0], blen)
+    if uniq == 0:
+        return FUSE_EIO
+    _fz_pump(slot)
+    rl: int64 = _fz_collect(slot, uniq)
+    if rl < 0:
+        return rl
+    if cast[uint64](rl) < FUSE_ENTRY_OUT_SZ:
+        return FUSE_EIO
+    rb: Ptr[uint8] = _fz_resp_body(slot)
+    nodeid: uint64 = _fz_get_u64(rb, 0)            # fuse_entry_out.nodeid
+    if nodeid == 0:
+        return FUSE_ENOENT
+    return cast[int64](nodeid)
+
+
+# --- GETATTR -------------------------------------------------------
+def _fz_getattr(slot: uint64, nodeid: uint64) -> int64:
+    # FUSE_GETATTR(nodeid). Returns the file size (from fuse_attr.size) or a
+    # negative errno. fuse_attr layout: { uint64 ino; uint64 size; ... }; the
+    # attr starts at offset 16 in fuse_attr_out, so size is at body+16+8.
+    body: Array[16, uint8]            # struct fuse_getattr_in
+    _fz_zero(&body[0], 0, FUSE_GETATTR_IN_SZ)
+    uniq: uint64 = _fz_enqueue(slot, FUSE_GETATTR, nodeid,
+                               &body[0], FUSE_GETATTR_IN_SZ)
+    if uniq == 0:
+        return FUSE_EIO
+    _fz_pump(slot)
+    rl: int64 = _fz_collect(slot, uniq)
+    if rl < 0:
+        return rl
+    if cast[uint64](rl) < FUSE_ATTR_OUT_SZ:
+        return FUSE_EIO
+    rb: Ptr[uint8] = _fz_resp_body(slot)
+    # fuse_attr_out: { u64 attr_valid; u32 attr_valid_nsec; u32 dummy;
+    #                  struct fuse_attr attr; }  -> attr at offset 16.
+    # fuse_attr: { u64 ino; u64 size; ... } -> size at attr+8 = body+24.
+    size: uint64 = _fz_get_u64(rb, 24)
+    return cast[int64](size)
+
+
+# --- OPEN ----------------------------------------------------------
+def _fz_open(slot: uint64, nodeid: uint64) -> int64:
+    # FUSE_OPEN(nodeid). Returns the file handle `fh` (>=0 cast) or errno.
+    body: Array[8, uint8]             # struct fuse_open_in
+    _fz_put_u32(&body[0], 0, 0)       # flags (O_RDONLY)
+    _fz_put_u32(&body[0], 4, 0)       # open_flags
+    uniq: uint64 = _fz_enqueue(slot, FUSE_OPEN, nodeid,
+                               &body[0], FUSE_OPEN_IN_SZ)
+    if uniq == 0:
+        return FUSE_EIO
+    _fz_pump(slot)
+    rl: int64 = _fz_collect(slot, uniq)
+    if rl < 0:
+        return rl
+    if cast[uint64](rl) < FUSE_OPEN_OUT_SZ:
+        return FUSE_EIO
+    rb: Ptr[uint8] = _fz_resp_body(slot)
+    fh: uint64 = _fz_get_u64(rb, 0)                # fuse_open_out.fh
+    return cast[int64](fh)
+
+
+# --- READ ----------------------------------------------------------
+def _fz_read(slot: uint64, nodeid: uint64, fh: uint64, offset: uint64,
+             size: uint32, out: Ptr[uint8], out_cap: uint64) -> int64:
+    # FUSE_READ(nodeid, fh, offset, size). Copies up to `size` reply bytes
+    # into `out` (kernel buffer). Returns bytes read or negative errno.
+    body: Array[40, uint8]            # struct fuse_read_in
+    _fz_zero(&body[0], 0, FUSE_READ_IN_SZ)
+    _fz_put_u64(&body[0], 0,  fh)                  # fh
+    _fz_put_u64(&body[0], 8,  offset)             # offset
+    _fz_put_u32(&body[0], 16, size)               # size
+    uniq: uint64 = _fz_enqueue(slot, FUSE_READ, nodeid,
+                               &body[0], FUSE_READ_IN_SZ)
+    if uniq == 0:
+        return FUSE_EIO
+    _fz_pump(slot)
+    rl: int64 = _fz_collect(slot, uniq)
+    if rl < 0:
+        return rl
+    got: uint64 = cast[uint64](rl)
+    if got > out_cap:
+        got = out_cap
+    rb: Ptr[uint8] = _fz_resp_body(slot)
+    i: uint64 = 0
+    while i < got:
+        out[i] = rb[i]
+        i = i + 1
+    return cast[int64](got)
+
+
+# --- RELEASE -------------------------------------------------------
+def _fz_release(slot: uint64, nodeid: uint64, fh: uint64) -> int64:
+    body: Array[24, uint8]            # struct fuse_release_in
+    _fz_zero(&body[0], 0, FUSE_RELEASE_IN_SZ)
+    _fz_put_u64(&body[0], 0, fh)                   # fh
+    uniq: uint64 = _fz_enqueue(slot, FUSE_RELEASE, nodeid,
+                               &body[0], FUSE_RELEASE_IN_SZ)
+    if uniq == 0:
+        return FUSE_EIO
+    _fz_pump(slot)
+    rl: int64 = _fz_collect(slot, uniq)
+    if rl < 0:
+        return rl
+    return 0
+
+
+# =====================================================================
+# VFS bridge: open a fuse-mounted path -> a served file fd
+# =====================================================================
+#
+# vfs_open calls fuse_vfs_open(name) when fuse_mount_match(name) >= 0. It does
+# LOOKUP + GETATTR + OPEN over the wire and packs (conn_slot, nodeid, fh, size)
+# into an opaque "open file" record indexed by the returned token. vfs_read
+# then drives FUSE_READ; vfs_close drives FUSE_RELEASE.
+#
+# The open-file record is a small fixed pool keyed by a token packed into
+# fd_buf. Keeping it here (not in core.ad) honours the "core is off-limits"
+# constraint.
+FUSE_NFILE: uint64 = 8
+
+
+class FuseFile:
+    in_use:   int32
+    conn:     int32
+    nodeid:   uint64
+    fh:       uint64
+    size:     uint64
+    pos:      uint64
+
+
+fuse_files: Array[8, FuseFile]
+
+
+def _fz_file_alloc() -> int32:
+    i: uint64 = 0
+    while i < FUSE_NFILE:
+        if fuse_files[i].in_use == 0:
+            fuse_files[i].in_use = 1
+            fuse_files[i].pos = 0
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _fz_file_free(tok: int32):
+    if tok < 0:
+        return
+    t: uint64 = cast[uint64](tok)
+    if t >= FUSE_NFILE:
+        return
+    fuse_files[t].in_use = 0
+
+
+def fuse_vfs_open(name: Ptr[char]) -> int64:
+    # Drive LOOKUP -> GETATTR -> OPEN for `name` under its fuse mount. Returns
+    # a non-negative open-file token on success (packed into fd_buf by the
+    # vfs caller), or a negative errno. The token encodes nothing more than an
+    # index into the fuse_files pool.
+    cs: int32 = fuse_mount_match(name)
+    if cs < 0:
+        return FUSE_ENOENT
+    slot: uint64 = cast[uint64](cs)
+    # Extract the basename after the mount target.
+    nm: Array[256, uint8]
+    nlen: uint64 = _fz_basename_after_target(name, slot, &nm[0], 256)
+    if nlen == 0:
+        # Open of the mount root itself -- a directory; not a file read.
+        return FUSE_EINVAL
+    nodeid: int64 = _fz_lookup(slot, &nm[0], nlen)
+    if nodeid < 0:
+        return nodeid
+    sz: int64 = _fz_getattr(slot, cast[uint64](nodeid))
+    if sz < 0:
+        return sz
+    fh: int64 = _fz_open(slot, cast[uint64](nodeid))
+    if fh < 0:
+        return fh
+    tok: int32 = _fz_file_alloc()
+    if tok < 0:
+        return FUSE_EMFILE
+    t: uint64 = cast[uint64](tok)
+    fuse_files[t].conn   = cs
+    fuse_files[t].nodeid = cast[uint64](nodeid)
+    fuse_files[t].fh     = cast[uint64](fh)
+    fuse_files[t].size   = cast[uint64](sz)
+    fuse_files[t].pos    = 0
+    return cast[int64](tok)
+
+
+def fuse_vfs_read(tok: int32, out: Ptr[uint8], count: uint64) -> int64:
+    # Drive FUSE_READ at the file's current position. Returns bytes read (0 at
+    # EOF) or a negative errno. Advances the per-file position cursor.
+    if tok < 0:
+        return FUSE_EBADF
+    t: uint64 = cast[uint64](tok)
+    if t >= FUSE_NFILE or fuse_files[t].in_use == 0:
+        return FUSE_EBADF
+    pos: uint64 = fuse_files[t].pos
+    if pos >= fuse_files[t].size:
+        return 0                                   # EOF
+    want: uint64 = count
+    rem: uint64 = fuse_files[t].size - pos
+    if want > rem:
+        want = rem
+    slot: uint64 = cast[uint64](fuse_files[t].conn)
+    n: int64 = _fz_read(slot, fuse_files[t].nodeid, fuse_files[t].fh,
+                        pos, cast[uint32](want), out, count)
+    if n < 0:
+        return n
+    fuse_files[t].pos = pos + cast[uint64](n)
+    return n
+
+
+def fuse_vfs_close(tok: int32):
+    # Drive FUSE_RELEASE and free the open-file record.
+    if tok < 0:
+        return
+    t: uint64 = cast[uint64](tok)
+    if t >= FUSE_NFILE or fuse_files[t].in_use == 0:
+        return
+    slot: uint64 = cast[uint64](fuse_files[t].conn)
+    _fz_release(slot, fuse_files[t].nodeid, fuse_files[t].fh)
+    _fz_file_free(tok)
+
+
+# =====================================================================
+# In-kernel FUSE daemon (selftest role) -- serves ONE file "hello"
+# =====================================================================
+#
+# This is the daemon SIDE of the round-trip, used by the boot self-test. It
+# reads the pending request off the connection via the REAL /dev/fuse cdev
+# read path (fuse_dev_read into a kernel buffer), dispatches on the opcode,
+# and writes a reply via the REAL cdev write path (fuse_dev_write). The bytes
+# traverse the genuine fuse_in_header / fuse_out_header wire format.
+#
+# It serves a single regular file named "hello" with contents "FUSE-OK\n",
+# assigned nodeid 2 and file handle 7.
+
+FUSE_HELLO_NODEID: uint64 = 2
+FUSE_HELLO_FH:     uint64 = 7
+
+# The served payload. "FUSE-OK\n" = 8 bytes.
+fuse_hello_data: Array[8, uint8]
+fuse_hello_inited: int32 = 0
+
+
+def _fz_hello_init():
+    if fuse_hello_inited != 0:
+        return
+    fuse_hello_inited = 1
+    fuse_hello_data[0] = 70      # 'F'
+    fuse_hello_data[1] = 85      # 'U'
+    fuse_hello_data[2] = 83      # 'S'
+    fuse_hello_data[3] = 69      # 'E'
+    fuse_hello_data[4] = 45      # '-'
+    fuse_hello_data[5] = 79      # 'O'
+    fuse_hello_data[6] = 75      # 'K'
+    fuse_hello_data[7] = 10      # '\n'
+
+
+# Daemon scratch buffers. The daemon reads the request into req_scratch and
+# builds replies into resp_scratch, then writes through the cdev.
+fuse_daemon_req:  Array[4096, uint8]
+fuse_daemon_resp: Array[4096, uint8]
+
+
+def _fz_name_is_hello(buf: Ptr[uint8]) -> int32:
+    # True if buf is the NUL-terminated string "hello".
+    h: Ptr[uint8] = "hello"
+    i: uint64 = 0
+    while i < 5:
+        if buf[i] != h[i]:
+            return 0
+        i = i + 1
+    if buf[5] != 0:
+        return 0
+    return 1
+
+
+def fuse_hello_daemon(slot: int32):
+    # Serve exactly one request: read it off the cdev, dispatch, reply.
+    # Driven by the pump after each kernel-side enqueue. Operates on KERNEL
+    # buffers passed to the cdev read/write helpers as user pointers (boot
+    # context: identity-mapped through the active page tables, which the
+    # copy_*_user helpers resolve like any user pointer).
+    _fz_hello_init()
+    s: uint64 = cast[uint64](slot)
+    # Read the pending request via the genuine cdev read path.
+    rn: int64 = fuse_dev_read(slot, cast[uint64](&fuse_daemon_req[0]),
+                              FUSE_REQ_CAP)
+    if rn < 0:
+        return
+    rq: Ptr[uint8] = &fuse_daemon_req[0]
+    opcode: uint32 = _fz_get_u32(rq, 4)
+    uniq:   uint64 = _fz_get_u64(rq, 8)
+    nodeid: uint64 = _fz_get_u64(rq, 16)
+    rp: Ptr[uint8] = &fuse_daemon_resp[0]
+    body_off: uint64 = FUSE_OUT_HEADER_SZ
+
+    if opcode == FUSE_INIT:
+        # Reply struct fuse_init_out (64 bytes).
+        _fz_zero(rp, body_off, FUSE_INIT_OUT_SZ)
+        _fz_put_u32(rp, body_off + 0,  FUSE_KERNEL_VERSION)        # major
+        _fz_put_u32(rp, body_off + 4,  FUSE_KERNEL_MINOR_VERSION)  # minor
+        _fz_put_u32(rp, body_off + 8,  0)                          # readahead
+        _fz_put_u32(rp, body_off + 12, 0)                          # flags
+        _fz_put_u32(rp, body_off + 24, 65536)                      # max_write
+        _fz_daemon_send(slot, uniq, 0, FUSE_INIT_OUT_SZ)
+        return
+
+    if opcode == FUSE_LOOKUP:
+        # Body is the NUL-terminated name (req body starts at +40).
+        nm: Ptr[uint8] = &rq[FUSE_IN_HEADER_SZ]
+        if _fz_name_is_hello(nm) == 0:
+            _fz_daemon_send_err(slot, uniq, FUSE_ENOENT)
+            return
+        # Reply struct fuse_entry_out (128 bytes): nodeid + attr.
+        _fz_zero(rp, body_off, FUSE_ENTRY_OUT_SZ)
+        _fz_put_u64(rp, body_off + 0, FUSE_HELLO_NODEID)           # nodeid
+        # attr starts at offset 40 in fuse_entry_out; fuse_attr.size at +8.
+        _fz_put_u64(rp, body_off + 40 + 8, 8)                      # size = 8
+        # mode: S_IFREG | 0444 = 0100444 = 0x81A4 at attr offset 32.
+        _fz_put_u32(rp, body_off + 40 + 32, 0x81A4)               # mode
+        _fz_daemon_send(slot, uniq, 0, FUSE_ENTRY_OUT_SZ)
+        return
+
+    if opcode == FUSE_GETATTR:
+        if nodeid != FUSE_HELLO_NODEID:
+            _fz_daemon_send_err(slot, uniq, FUSE_ENOENT)
+            return
+        # Reply struct fuse_attr_out (104 bytes). attr at offset 16; size +8.
+        _fz_zero(rp, body_off, FUSE_ATTR_OUT_SZ)
+        _fz_put_u64(rp, body_off + 16 + 8, 8)                      # size = 8
+        _fz_put_u32(rp, body_off + 16 + 32, 0x81A4)               # mode
+        _fz_daemon_send(slot, uniq, 0, FUSE_ATTR_OUT_SZ)
+        return
+
+    if opcode == FUSE_OPEN:
+        if nodeid != FUSE_HELLO_NODEID:
+            _fz_daemon_send_err(slot, uniq, FUSE_ENOENT)
+            return
+        # Reply struct fuse_open_out (16 bytes): fh + open_flags.
+        _fz_zero(rp, body_off, FUSE_OPEN_OUT_SZ)
+        _fz_put_u64(rp, body_off + 0, FUSE_HELLO_FH)               # fh
+        _fz_daemon_send(slot, uniq, 0, FUSE_OPEN_OUT_SZ)
+        return
+
+    if opcode == FUSE_READ:
+        # Request body: fuse_read_in { fh, offset, size, ... } at +40.
+        rqb: Ptr[uint8] = &rq[FUSE_IN_HEADER_SZ]
+        roff: uint64 = _fz_get_u64(rqb, 8)
+        rsz:  uint32 = _fz_get_u32(rqb, 16)
+        if nodeid != FUSE_HELLO_NODEID:
+            _fz_daemon_send_err(slot, uniq, FUSE_ENOENT)
+            return
+        # Clamp [offset, offset+size) to the 8-byte payload.
+        avail: uint64 = 0
+        if roff < 8:
+            avail = 8 - roff
+        give: uint64 = cast[uint64](rsz)
+        if give > avail:
+            give = avail
+        i: uint64 = 0
+        while i < give:
+            rp[body_off + i] = fuse_hello_data[roff + i]
+            i = i + 1
+        _fz_daemon_send(slot, uniq, 0, give)
+        return
+
+    if opcode == FUSE_RELEASE:
+        _fz_daemon_send(slot, uniq, 0, 0)
+        return
+
+    # Unknown opcode -- reply -ENOSYS-shaped (-EIO here is fine for the test).
+    _fz_daemon_send_err(slot, uniq, FUSE_EIO)
+
+
+def _fz_daemon_send(slot: int32, uniq: uint64, err: int64,
+                    body_len: uint64):
+    # Build a fuse_out_header + body in the daemon resp scratch and write it
+    # through the genuine cdev write path.
+    rp: Ptr[uint8] = &fuse_daemon_resp[0]
+    total: uint64 = FUSE_OUT_HEADER_SZ + body_len
+    _fz_put_u32(rp, 0, cast[uint32](total))        # len
+    _fz_put_u32(rp, 4, cast[uint32](cast[uint64](err) & 0xFFFFFFFF))  # error
+    _fz_put_u64(rp, 8, uniq)                        # unique
+    fuse_dev_write(slot, cast[uint64](&fuse_daemon_resp[0]), total)
+
+
+def _fz_daemon_send_err(slot: int32, uniq: uint64, err: int64):
+    # An error reply carries only the out_header (len == 16, no body).
+    _fz_daemon_send(slot, uniq, err, 0)
+
+
+# =====================================================================
+# Boot self-test  --  [FUSE] PASS / FAIL  (boot:37.fuse)
+# =====================================================================
+#
+# Stands up the in-kernel FUSE daemon role and drives a full READ round-trip
+# over the REAL /dev/fuse fd + wire protocol:
+#
+#   (1) open the /dev/fuse connection (fuse_dev_open).
+#   (2) FUSE_INIT handshake: kernel enqueues init, daemon replies init_out
+#       (major 7, max_write), connection becomes inited.
+#   (3) mount the connection at "/fuse".
+#   (4) VFS-shape open of "/fuse/hello": LOOKUP + GETATTR + OPEN over the wire.
+#   (5) READ: assert the bytes == "FUSE-OK\n" (8 bytes), traversing
+#       fuse_in/fuse_out headers through the cdev.
+#   (6) RELEASE + close.
+#
+# The daemon is driven by the inline pump (single-thread both-roles model);
+# the bytes still traverse the genuine header protocol over the cdev. Prints
+# [FUSE] PASS markers per stage and a final [fuse] PASS.
+
+def fuse_selftest() -> int32:
+    fuse_init_pool()
+    _fz_hello_init()
+
+    # (1) open the /dev/fuse connection.
+    cs: int32 = fuse_dev_open()
+    if cs < 0:
+        printk0("[FUSE] FAIL: /dev/fuse open returned no slot\n")
+        return 0
+    # Arm the inline daemon pump on this connection.
+    fuse_set_pump(cs)
+    printk1("[FUSE] PASS /dev/fuse connection opened slot=%d\n",
+            cast[uint64](cs))
+
+    # (2) FUSE_INIT handshake.
+    irc: int64 = fuse_do_init(cs)
+    if irc != 0:
+        printk1("[FUSE] FAIL: FUSE_INIT handshake rc=%d\n",
+                cast[uint64](irc))
+        fuse_clear_pump()
+        return 0
+    printk0("[FUSE] PASS FUSE_INIT handshake (major=7) negotiated\n")
+
+    # (3) mount the connection at "/fuse".
+    mtgt: Ptr[uint8] = "/fuse"
+    mrc: int64 = fuse_mount(cs, mtgt, 5)
+    if mrc != 0:
+        printk1("[FUSE] FAIL: mount rc=%d\n", cast[uint64](mrc))
+        fuse_clear_pump()
+        return 0
+    # Assert the namespace registry now routes "/fuse/hello" to this conn.
+    if fuse_mount_match(cast[Ptr[char]]("/fuse/hello")) != cs:
+        printk0("[FUSE] FAIL: mount registry did not bind /fuse subtree\n")
+        fuse_clear_pump()
+        return 0
+    printk0("[FUSE] PASS mounted connection at /fuse (namespace bind)\n")
+
+    # (4) open "/fuse/hello" -> LOOKUP + GETATTR + OPEN over the wire.
+    tok: int64 = fuse_vfs_open(cast[Ptr[char]]("/fuse/hello"))
+    if tok < 0:
+        printk1("[FUSE] FAIL: open /fuse/hello rc=%d\n", cast[uint64](tok))
+        fuse_clear_pump()
+        return 0
+    printk1("[FUSE] PASS open /fuse/hello (LOOKUP+GETATTR+OPEN) tok=%d\n",
+            cast[uint64](tok))
+
+    # (5) READ and assert the bytes.
+    rbuf: Array[32, uint8]
+    rn: int64 = fuse_vfs_read(cast[int32](tok), &rbuf[0], 32)
+    if rn != 8:
+        printk1("[FUSE] FAIL: read returned %d bytes (expected 8)\n",
+                cast[uint64](rn))
+        fuse_vfs_close(cast[int32](tok))
+        fuse_clear_pump()
+        return 0
+    # Compare against "FUSE-OK\n".
+    i: uint64 = 0
+    while i < 8:
+        if rbuf[i] != fuse_hello_data[i]:
+            printk2("[FUSE] FAIL: byte %d mismatch (got %d)\n",
+                    i, cast[uint64](rbuf[i]))
+            fuse_vfs_close(cast[int32](tok))
+            fuse_clear_pump()
+            return 0
+        i = i + 1
+    printk0("[FUSE] PASS read returned \"FUSE-OK\\n\" over fuse_in/out wire\n")
+
+    # A second read at EOF must return 0.
+    rn2: int64 = fuse_vfs_read(cast[int32](tok), &rbuf[0], 32)
+    if rn2 != 0:
+        printk1("[FUSE] FAIL: read at EOF returned %d (expected 0)\n",
+                cast[uint64](rn2))
+        fuse_vfs_close(cast[int32](tok))
+        fuse_clear_pump()
+        return 0
+    printk0("[FUSE] PASS read at EOF returned 0\n")
+
+    # (6) RELEASE + close.
+    fuse_vfs_close(cast[int32](tok))
+    fuse_dev_close(cs)
+    fuse_clear_pump()
+    printk0("[FUSE] PASS RELEASE + connection close\n")
+
+    printk0("[fuse] PASS\n")
+    return 1

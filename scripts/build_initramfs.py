@@ -1017,6 +1017,18 @@ if os.environ.get("ENABLE_TMPFS_LINK_TEST") == "1":
 if os.environ.get("ENABLE_CGROUP2_TEST") == "1":
     FILES.append(("/etc/cgroup2-test", b"1\n"))
 
+# §fuse: /dev/fuse + FUSE wire-protocol READ round-trip. scripts/test_fuse.sh
+# sets ENABLE_FUSE_TEST=1 to plant /etc/fuse-test. init/main.ad's boot:37.fuse
+# hook detects the marker and calls fuse_selftest() (linux_abi/u_fuse.ad): it
+# stands up an in-kernel FUSE daemon role serving one file "hello" ==
+# "FUSE-OK\n", opens a /dev/fuse connection, runs the FUSE_INIT handshake,
+# mounts at /fuse, then drives LOOKUP+GETATTR+OPEN+READ+RELEASE over the
+# genuine fuse_in/fuse_out header protocol across the real cdev and asserts the
+# bytes. No disk needed. Default boots omit the marker so the self-test never
+# fires.
+if os.environ.get("ENABLE_FUSE_TEST") == "1":
+    FILES.append(("/etc/fuse-test", b"1\n"))
+
 # statfs(2)/fstatfs(2) capacity self-test. scripts/test_statfs.sh sets
 # ENABLE_STATFS_TEST=1 to plant /etc/statfs-test. init/main.ad at
 # boot:37.sfs detects the marker after the ext4 mount and calls
