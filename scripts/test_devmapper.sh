@@ -42,6 +42,12 @@
 #     WRITEBACK leaves the origin STALE until an explicit flush, after which
 #     the origin matches the cache; and evicting a DIRTY victim writes its
 #     newest data back to the origin automatically.
+#   * ERA (dm-era / per-chunk write-era generation tracking): each write
+#     stamps the CURRENT era on the touched chunk; advancing the era
+#     partitions future writes from past ones; a query returns EXACTLY the
+#     set of chunks written in or after a target era (the "blocks changed
+#     since N" incremental-backup primitive); and the per-chunk era metadata
+#     is persisted to a metadata device and round-trips through a reload.
 #
 # The self-test needs NO external disk — it backs everything onto its own
 # in-kernel ramdisk, so the boot is fully deterministic.
@@ -156,6 +162,13 @@ check "cache writeback stale"    "[dm] cache writeback origin stale before flush
 check "cache writeback flush"    "[dm] cache writeback flush makes origin coherent OK"
 check "cache dirty-victim wb"    "[dm] cache dirty-victim eviction writeback OK"
 check "cache subtest PASS"       "[dm] cache PASS"
+check "era era-1 write intact"   "[devmapper] era: era-1 write reads back intact OK"
+check "era advance"              "[dm] PASS era-advance"
+check "era query since era 2"    "[dm] PASS era-query-since"
+check "era query since era 1"    "[devmapper] era: all written chunks {2,5,9} reported since era 1 OK"
+check "era rewrite new data"     "[devmapper] era: re-written chunk reads back new data OK"
+check "era metadata persist"     "[dm] PASS era-persist"
+check "era subtest PASS"         "[dm] era PASS"
 check "device-mapper PASS"       "[device-mapper] PASS"
 
 if [ "$fail" -ne 0 ]; then
@@ -163,4 +176,4 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
-echo "[test_devmapper] PASS — native device-mapper: linear remap, two-target concatenation, AES-256-XTS dm-crypt (aes-xts-plain64: sector-keyed tweak, ciphertext-on-disk, plaintext round-trip, known-answer vector), dm-snapshot copy-on-write (origin-write preserves the snapshot pre-image in a separate exception store; origin advances to new data; never-written chunks pass through to origin), dm-integrity (per-sector salted crc32c tags: a known sector round-trips with its tag validated; corrupting the backing sector behind the target is DETECTED and the read fails instead of returning corrupt data), dm-thin thin provisioning (a thin device over-provisioned 32x the pool reads unprovisioned blocks as zeros consuming no pool space; the first write to a virtual block allocates exactly one pool block on demand and reads back correctly; re-writing a provisioned block allocates nothing; provisioned vs unprovisioned regions are distinguished), and dm-verity (read-only Merkle hash tree of salted SHA-256 over 4096-byte blocks rooted at a trusted root hash: a clean block verifies and round-trips byte-identical; flipping a byte in a data block, in the block's own hash-tree leaf, or in another hash-tree entry — root-hash mismatch — is each DETECTED and the read fails with an I/O error), and dm-cache (a small fast cache device fronting a larger slow origin with LRU eviction: a cold read MISSes and promotes the block into a cache slot so the second read HITs with genuinely-computed hit/miss counters; WRITETHROUGH updates both cache and origin keeping the origin coherent so clean evictions lose no data; WRITEBACK updates only the cache and leaves the origin stale until an explicit flush makes it coherent; and evicting a DIRTY victim writes its newest data back to the origin automatically) all verified"
+echo "[test_devmapper] PASS — native device-mapper: linear remap, two-target concatenation, AES-256-XTS dm-crypt (aes-xts-plain64: sector-keyed tweak, ciphertext-on-disk, plaintext round-trip, known-answer vector), dm-snapshot copy-on-write (origin-write preserves the snapshot pre-image in a separate exception store; origin advances to new data; never-written chunks pass through to origin), dm-integrity (per-sector salted crc32c tags: a known sector round-trips with its tag validated; corrupting the backing sector behind the target is DETECTED and the read fails instead of returning corrupt data), dm-thin thin provisioning (a thin device over-provisioned 32x the pool reads unprovisioned blocks as zeros consuming no pool space; the first write to a virtual block allocates exactly one pool block on demand and reads back correctly; re-writing a provisioned block allocates nothing; provisioned vs unprovisioned regions are distinguished), and dm-verity (read-only Merkle hash tree of salted SHA-256 over 4096-byte blocks rooted at a trusted root hash: a clean block verifies and round-trips byte-identical; flipping a byte in a data block, in the block's own hash-tree leaf, or in another hash-tree entry — root-hash mismatch — is each DETECTED and the read fails with an I/O error), and dm-cache (a small fast cache device fronting a larger slow origin with LRU eviction: a cold read MISSes and promotes the block into a cache slot so the second read HITs with genuinely-computed hit/miss counters; WRITETHROUGH updates both cache and origin keeping the origin coherent so clean evictions lose no data; WRITEBACK updates only the cache and leaves the origin stale until an explicit flush makes it coherent; and evicting a DIRTY victim writes its newest data back to the origin automatically), and dm-era (per-chunk write-era generation tracking: each write stamps the current era on the touched chunk; advancing the era partitions later writes from earlier ones; a query enumerates EXACTLY the chunks written in or after a target era — the 'blocks changed since N' incremental-backup primitive, with a re-written chunk's era correctly advancing; and the per-chunk era metadata is persisted to a separate metadata device and round-trips through a reload) all verified"

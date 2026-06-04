@@ -751,6 +751,7 @@ DM_TARGET_INTEGRITY:     uint32 = 5   # per-sector crc32c integrity tags
 DM_TARGET_THIN:          uint32 = 6   # thin-provisioned (on-demand alloc)
 DM_TARGET_VERITY:        uint32 = 7   # read-only Merkle-tree (sha256) verify
 DM_TARGET_CACHE:         uint32 = 8   # fast cache device fronting slow origin
+DM_TARGET_ERA:           uint32 = 9   # per-chunk write-era (generation) tracking
 
 DM_KEY_LEN:      uint64 = 64       # AES-256-XTS: 32B data + 32B tweak key
 DM_MAX_TARGETS:  uint64 = 8        # targets per mapped device
@@ -1069,6 +1070,63 @@ class DmCacheContext:
 
 dm_cache_ctxs: Array[2, DmCacheContext]
 
+
+# =========================================================================
+# dm-era — per-chunk write-era (generation) tracking (Linux drivers/md/
+# dm-era-target.c)
+# =========================================================================
+#
+# dm-era sits OVER an origin device and records, per fixed-size CHUNK, the
+# ERA in which that chunk was last WRITTEN. An era is a monotonically
+# increasing generation counter. The device starts at era 1; a userspace
+# `message take_metadata_snapshot`/`message <new_era>` operation ADVANCES
+# the current era (here dm_era_advance), bumping the counter so that all
+# subsequent writes are stamped with the NEW era.
+#
+# DATA PATH: a write through the era device is forwarded straight to the
+# origin (transparent passthrough — era never alters the data), and the
+# touched chunk's era slot is STAMPED with the CURRENT era. A read is a
+# plain passthrough to the origin. Because the stamp is the *current* era
+# at write time, the era array partitions chunks by the generation in which
+# they last changed.
+#
+# QUERY: dm_era_query_since(target_era) enumerates every chunk whose
+# recorded era is >= target_era — i.e. the set of chunks WRITTEN IN OR AFTER
+# that generation. This is exactly dm-era's use case: after a snapshot at
+# era N, "which blocks changed since N?" drives an INCREMENTAL backup or a
+# cache-coherency invalidation after a power failure (only the changed
+# blocks need re-copying / re-validating).
+#
+# PERSISTENCE: the per-chunk era array is written to a dedicated METADATA
+# device so it survives a teardown / power loss. Layout on the metadata
+# device: sector 0 is a small HEADER (magic, nchunks, current_era);
+# sectors 1.. hold the packed uint32 era array (128 era words per 512-byte
+# sector). dm_era_persist() flushes the in-core array out; dm_era_reload()
+# reads it back. A freshly created device whose metadata carries our magic
+# RESUMES from the persisted state (current era + per-chunk eras), modelling
+# dm-era's superblock resume.
+
+DM_ERA_MAX:         uint64 = 2        # era contexts system-wide
+DM_ERA_MAX_CHUNKS:  uint64 = 256      # origin chunks tracked per era device
+DM_ERA_PER_SECTOR:  uint64 = 128      # uint32 era words per 512-byte sector
+DM_ERA_MAGIC:       uint32 = 0xE2A0DA7A  # metadata-superblock magic ("eraDATA")
+
+
+class DmEraContext:
+    used:          uint32
+    pad:           uint32
+    origin_slot:   int32               # underlying ORIGIN block device
+    meta_slot:     int32               # underlying METADATA block device
+    chunk_sectors: uint64              # sectors per era-tracked chunk
+    nchunks:       uint64              # origin chunks covered
+    current_era:   uint32              # generation stamped on the next write
+    pad2:          uint32
+    # era[c] = the era in which chunk c was last written (0 = never written).
+    era:           Array[256, uint32]
+
+
+dm_era_ctxs: Array[2, DmEraContext]
+
 dm_devices: Array[8, MappedDevice]
 dm_ops:     BlockDeviceOps
 dm_inited:  uint32 = 0
@@ -1092,6 +1150,12 @@ _dm_crypt_sector: Array[512, uint8]
 # serialised through the synchronous block layer, so a single shared buffer
 # is safe (no two cache transfers overlap).
 _dm_cache_buf:    Array[4096, uint8]    # 8 * 512
+
+# One-sector staging buffer for the dm-era metadata persistence path. The
+# era header and each packed era-array sector are 512 bytes. dm-era I/O is
+# serialised through the synchronous block layer, so a single shared
+# module-scope sector buffer is safe (no two metadata transfers overlap).
+_dm_era_meta_buf: Array[512, uint8]     # one metadata sector
 
 
 def dm_init():
@@ -1135,8 +1199,12 @@ def dm_init():
     while ca < DM_CACHE_MAX:
         dm_cache_ctxs[ca].used = 0
         ca = ca + 1
+    er: uint64 = 0
+    while er < DM_ERA_MAX:
+        dm_era_ctxs[er].used = 0
+        er = er + 1
     dm_inited = 1
-    printk0("dm: device-mapper ready (linear + crypt + snapshot + integrity + thin + verity + cache targets)\n")
+    printk0("dm: device-mapper ready (linear + crypt + snapshot + integrity + thin + verity + cache + era targets)\n")
 
 
 def _dm_find_target(dev: Ptr[MappedDevice], vlba: uint64) -> int32:
@@ -1805,6 +1873,192 @@ def dm_cache_misses(cache_idx: int32) -> int64:
     return cast[int64](dm_cache_ctxs[cast[uint64](cache_idx)].misses)
 
 
+# =========================================================================
+# dm-era target handlers
+# =========================================================================
+
+def _dm_era_put_u32(buf: Ptr[uint8], off: uint64, v: uint32):
+    # Store a uint32 little-endian into a byte buffer at byte offset `off`.
+    uv: uint64 = cast[uint64](v)
+    buf[off]     = cast[uint8](uv & 0xFF)
+    buf[off + 1] = cast[uint8]((uv >> 8) & 0xFF)
+    buf[off + 2] = cast[uint8]((uv >> 16) & 0xFF)
+    buf[off + 3] = cast[uint8]((uv >> 24) & 0xFF)
+
+
+def _dm_era_get_u32(buf: Ptr[uint8], off: uint64) -> uint32:
+    # Load a uint32 little-endian from a byte buffer at byte offset `off`.
+    b0: uint64 = cast[uint64](buf[off])
+    b1: uint64 = cast[uint64](buf[off + 1])
+    b2: uint64 = cast[uint64](buf[off + 2])
+    b3: uint64 = cast[uint64](buf[off + 3])
+    return cast[uint32](b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
+
+
+def dm_era_persist(era_idx: int32) -> int32:
+    # Flush the in-core era state out to the metadata device so it survives a
+    # teardown / power loss. Sector 0 = header (magic, nchunks, current_era);
+    # sectors 1.. = the packed uint32 era array (DM_ERA_PER_SECTOR words per
+    # sector). Returns 0 on success, negative on error.
+    if era_idx < 0 or cast[uint64](era_idx) >= DM_ERA_MAX:
+        return -1
+    ei: uint64 = cast[uint64](era_idx)
+    if dm_era_ctxs[ei].used == 0:
+        return -1
+    ctx: Ptr[DmEraContext] = &dm_era_ctxs[ei]
+    buf: Ptr[uint8] = cast[Ptr[uint8]](&_dm_era_meta_buf[0])
+    # --- header sector ---
+    z: uint64 = 0
+    while z < SECTOR_SIZE:
+        buf[z] = 0
+        z = z + 1
+    _dm_era_put_u32(buf, 0, DM_ERA_MAGIC)
+    _dm_era_put_u32(buf, 4, cast[uint32](ctx[0].nchunks))
+    _dm_era_put_u32(buf, 8, ctx[0].current_era)
+    if blk_write_sectors(ctx[0].meta_slot, 0, 1, buf) != 0:
+        return -1
+    # --- packed era-array sectors ---
+    nsec: uint64 = (ctx[0].nchunks + DM_ERA_PER_SECTOR - 1) / DM_ERA_PER_SECTOR
+    s: uint64 = 0
+    while s < nsec:
+        zz: uint64 = 0
+        while zz < SECTOR_SIZE:
+            buf[zz] = 0
+            zz = zz + 1
+        j: uint64 = 0
+        while j < DM_ERA_PER_SECTOR:
+            c: uint64 = s * DM_ERA_PER_SECTOR + j
+            if c < ctx[0].nchunks:
+                _dm_era_put_u32(buf, j * 4, ctx[0].era[c])
+            j = j + 1
+        if blk_write_sectors(ctx[0].meta_slot, 1 + s, 1, buf) != 0:
+            return -1
+        s = s + 1
+    return 0
+
+
+def dm_era_reload(era_idx: int32) -> int32:
+    # Load persisted era state from the metadata device back into the in-core
+    # context. Returns 1 if a valid persisted superblock (matching magic and
+    # nchunks) was found and loaded, 0 if no/invalid superblock (fresh
+    # device), or negative on I/O error.
+    if era_idx < 0 or cast[uint64](era_idx) >= DM_ERA_MAX:
+        return -1
+    ei: uint64 = cast[uint64](era_idx)
+    if dm_era_ctxs[ei].used == 0:
+        return -1
+    ctx: Ptr[DmEraContext] = &dm_era_ctxs[ei]
+    buf: Ptr[uint8] = cast[Ptr[uint8]](&_dm_era_meta_buf[0])
+    if blk_read_sectors(ctx[0].meta_slot, 0, 1, buf) != 0:
+        return -1
+    if _dm_era_get_u32(buf, 0) != DM_ERA_MAGIC:
+        return 0                       # fresh metadata; nothing to resume
+    persisted_nchunks: uint64 = cast[uint64](_dm_era_get_u32(buf, 4))
+    if persisted_nchunks != ctx[0].nchunks:
+        return 0                       # geometry mismatch; treat as fresh
+    ctx[0].current_era = _dm_era_get_u32(buf, 8)
+    nsec: uint64 = (ctx[0].nchunks + DM_ERA_PER_SECTOR - 1) / DM_ERA_PER_SECTOR
+    s: uint64 = 0
+    while s < nsec:
+        if blk_read_sectors(ctx[0].meta_slot, 1 + s, 1, buf) != 0:
+            return -1
+        j: uint64 = 0
+        while j < DM_ERA_PER_SECTOR:
+            c: uint64 = s * DM_ERA_PER_SECTOR + j
+            if c < ctx[0].nchunks:
+                ctx[0].era[c] = _dm_era_get_u32(buf, j * 4)
+            j = j + 1
+        s = s + 1
+    return 1
+
+
+def _dm_era_io(t: Ptr[DmTarget], is_write: int32, off_in_t: uint64,
+               count: uint64, buf: Ptr[uint8]) -> int32:
+    # ERA target. READ is a plain passthrough to the origin. WRITE forwards
+    # the data to the origin AND stamps the CURRENT era on every chunk the
+    # request touches, then persists the (changed) era metadata. Processed one
+    # sector at a time so chunk boundaries are handled simply.
+    ctx: Ptr[DmEraContext] = &dm_era_ctxs[cast[uint64](t[0].snap_ctx)]
+    cs: uint64 = ctx[0].chunk_sectors
+    stamped: int32 = 0
+    s: uint64 = 0
+    while s < count:
+        olba: uint64 = t[0].under_start + off_in_t + s
+        cur: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](buf) + s * SECTOR_SIZE)
+        if is_write != 0:
+            rc: int32 = blk_write_sectors(ctx[0].origin_slot, olba, 1, cur)
+            if rc != 0:
+                return rc
+            ochunk: uint64 = olba / cs
+            if ochunk < ctx[0].nchunks:
+                if ctx[0].era[ochunk] != ctx[0].current_era:
+                    ctx[0].era[ochunk] = ctx[0].current_era
+                    stamped = 1
+        else:
+            rc2: int32 = blk_read_sectors(ctx[0].origin_slot, olba, 1, cur)
+            if rc2 != 0:
+                return rc2
+        s = s + 1
+    if stamped != 0:
+        # Persist the updated era metadata so it survives a power loss.
+        if dm_era_persist(t[0].snap_ctx) != 0:
+            printk0("dm: era metadata persist failed\n")
+            return -1
+    return 0
+
+
+def dm_era_advance(era_idx: int32) -> int32:
+    # Advance the current era (generation). All subsequent writes stamp the
+    # NEW era on their chunks, partitioning future changes from past ones.
+    # Persists the new current-era to the metadata superblock. Returns the new
+    # era on success, negative on error. (dmsetup message DEV 0 <new_era>.)
+    if era_idx < 0 or cast[uint64](era_idx) >= DM_ERA_MAX:
+        return -1
+    ei: uint64 = cast[uint64](era_idx)
+    if dm_era_ctxs[ei].used == 0:
+        return -1
+    dm_era_ctxs[ei].current_era = dm_era_ctxs[ei].current_era + 1
+    if dm_era_persist(era_idx) != 0:
+        return -1
+    return cast[int32](dm_era_ctxs[ei].current_era)
+
+
+def dm_era_current(era_idx: int32) -> int32:
+    # Observe the current era, or -1 for an invalid/free context.
+    if era_idx < 0 or cast[uint64](era_idx) >= DM_ERA_MAX:
+        return -1
+    if dm_era_ctxs[cast[uint64](era_idx)].used == 0:
+        return -1
+    return cast[int32](dm_era_ctxs[cast[uint64](era_idx)].current_era)
+
+
+def dm_era_query_since(era_idx: int32, target_era: uint32,
+                       out_chunks: Ptr[uint64], max_out: uint64) -> int64:
+    # Enumerate every chunk whose recorded era is >= target_era — the set of
+    # chunks WRITTEN IN OR AFTER generation target_era. Fills `out_chunks`
+    # (capacity max_out) with the matching chunk indices in ascending order
+    # and returns the COUNT. Returns -1 on an invalid context, -2 if the
+    # result set would exceed max_out. (dm-era's "blocks changed since N".)
+    if era_idx < 0 or cast[uint64](era_idx) >= DM_ERA_MAX:
+        return -1
+    ei: uint64 = cast[uint64](era_idx)
+    if dm_era_ctxs[ei].used == 0:
+        return -1
+    ctx: Ptr[DmEraContext] = &dm_era_ctxs[ei]
+    n: uint64 = 0
+    c: uint64 = 0
+    while c < ctx[0].nchunks:
+        e: uint32 = ctx[0].era[c]
+        if e != 0 and e >= target_era:
+            if n >= max_out:
+                return -2
+            out_chunks[n] = c
+            n = n + 1
+        c = c + 1
+    return cast[int64](n)
+
+
 def _dm_io(dev: Ptr[MappedDevice], is_write: int32, vlba: uint64,
            count: uint64, buf: Ptr[uint8]) -> int32:
     # Core remap. Walk the request sector-span, splitting it at target
@@ -1846,6 +2100,8 @@ def _dm_io(dev: Ptr[MappedDevice], is_write: int32, vlba: uint64,
             rc = _dm_verity_io(t, is_write, off_in_t, chunk, bufp)
         elif t[0].ttype == DM_TARGET_CACHE:
             rc = _dm_cache_io(t, is_write, off_in_t, chunk, bufp)
+        elif t[0].ttype == DM_TARGET_ERA:
+            rc = _dm_era_io(t, is_write, off_in_t, chunk, bufp)
         else:
             rc = _dm_linear_io(t, is_write, off_in_t, chunk, bufp)
         if rc != 0:
@@ -2535,6 +2791,110 @@ def dm_cache_ctx_of(name: Ptr[char]) -> int32:
     return -1
 
 
+def _dm_era_alloc_ctx() -> int32:
+    # Claim a free era context slot, or -1 if the table is full.
+    i: uint64 = 0
+    while i < DM_ERA_MAX:
+        if dm_era_ctxs[i].used == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def dm_create_era(name: Ptr[char], origin_slot: int32, meta_slot: int32,
+                  chunk_sectors: uint64, nchunks: uint64) -> int32:
+    # Create a dm-era mapped device over `origin_slot`, tracking the last-
+    # written era of each of `nchunks` chunks (chunk_sectors sectors each) and
+    # persisting that metadata to `meta_slot`. The mapped device presents the
+    # FULL origin span (nchunks * chunk_sectors sectors). If the metadata
+    # device already carries our superblock with matching geometry, the era
+    # state (current era + per-chunk eras) is RESUMED from it; otherwise the
+    # device starts at era 1 with all chunks unwritten. This is the
+    # `dmsetup create NAME --table "0 LEN era METADEV ORIGINDEV BLK"` shape.
+    # Returns the registered block slot or a negative error.
+    dm_init()
+    if origin_slot < 0 or meta_slot < 0:
+        return -2
+    if chunk_sectors == 0:
+        return -2
+    if nchunks == 0 or nchunks > DM_ERA_MAX_CHUNKS:
+        printk0("dm: era chunk count exceeds era-table capacity\n")
+        return -3
+    length: uint64 = nchunks * chunk_sectors
+    if length > blk_capacity_sectors(origin_slot):
+        printk0("dm: era target exceeds underlying origin capacity\n")
+        return -3
+    # Metadata footprint: 1 header sector + ceil(nchunks/PER_SECTOR) array
+    # sectors. Must fit on the metadata device.
+    meta_sectors: uint64 = 1 + (nchunks + DM_ERA_PER_SECTOR - 1) / \
+        DM_ERA_PER_SECTOR
+    if meta_sectors > blk_capacity_sectors(meta_slot):
+        printk0("dm: era metadata exceeds underlying metadata-device capacity\n")
+        return -3
+    eidx_s: int32 = _dm_era_alloc_ctx()
+    if eidx_s < 0:
+        printk0("dm: era context table full\n")
+        return -4
+    eidx: uint64 = cast[uint64](eidx_s)
+    dm_era_ctxs[eidx].origin_slot   = origin_slot
+    dm_era_ctxs[eidx].meta_slot     = meta_slot
+    dm_era_ctxs[eidx].chunk_sectors = chunk_sectors
+    dm_era_ctxs[eidx].nchunks       = nchunks
+    dm_era_ctxs[eidx].current_era   = 1     # fresh devices start at era 1
+    c: uint64 = 0
+    while c < nchunks:
+        dm_era_ctxs[eidx].era[c] = 0        # 0 = never written
+        c = c + 1
+    dm_era_ctxs[eidx].used = 1
+    # Resume from persisted metadata if a valid superblock is present.
+    rl: int32 = dm_era_reload(eidx_s)
+    if rl < 0:
+        dm_era_ctxs[eidx].used = 0
+        printk0("dm: era metadata reload I/O error\n")
+        return -5
+    idx_s: int32 = _dm_alloc_device()
+    if idx_s < 0:
+        dm_era_ctxs[eidx].used = 0
+        printk0("dm: device table full\n")
+        return -4
+    idx: uint64 = cast[uint64](idx_s)
+    dm_devices[idx].n_targets               = 1
+    dm_devices[idx].capacity                = length
+    dm_devices[idx].targets[0].ttype        = DM_TARGET_ERA
+    dm_devices[idx].targets[0].start_sector = 0
+    dm_devices[idx].targets[0].length       = length
+    dm_devices[idx].targets[0].under_slot   = origin_slot
+    dm_devices[idx].targets[0].snap_ctx     = eidx_s
+    dm_devices[idx].targets[0].under_start  = 0
+    # Persist the initial (or resumed) superblock so a teardown before any
+    # write still leaves valid metadata behind.
+    if dm_era_persist(eidx_s) != 0:
+        dm_era_ctxs[eidx].used = 0
+        printk0("dm: era initial metadata persist failed\n")
+        return -5
+    if _dm_register(idx, name) != 0:
+        dm_devices[idx].used    = 0
+        dm_era_ctxs[eidx].used  = 0
+        return -5
+    return dm_devices[idx].self_slot
+
+
+def dm_era_ctx_of(name: Ptr[char]) -> int32:
+    # Return the era-context index backing the era mapped device `name`, or -1
+    # if none. Lets a caller (the self-test) advance the era and run queries.
+    slot: int32 = find_blockdev(name)
+    if slot < 0:
+        return -1
+    i: uint64 = 0
+    while i < DM_MAX_DEVICES:
+        if dm_devices[i].used != 0 and dm_devices[i].self_slot == slot:
+            if dm_devices[i].targets[0].ttype == DM_TARGET_ERA:
+                return dm_devices[i].targets[0].snap_ctx
+            return -1
+        i = i + 1
+    return -1
+
+
 def dm_remove(name: Ptr[char]) -> int32:
     # Tear down a mapped device by name: unregister its block-device
     # identity and free the MappedDevice slot. dmsetup remove NAME.
@@ -2571,6 +2931,12 @@ def dm_remove(name: Ptr[char]) -> int32:
                 cc: int32 = dm_devices[i].targets[0].snap_ctx
                 if cc >= 0 and cast[uint64](cc) < DM_CACHE_MAX:
                     dm_cache_ctxs[cast[uint64](cc)].used = 0
+            # Releasing an era device frees its era-tracking context (the
+            # persisted metadata on the metadata device survives).
+            if dm_devices[i].targets[0].ttype == DM_TARGET_ERA:
+                ec2: int32 = dm_devices[i].targets[0].snap_ctx
+                if ec2 >= 0 and cast[uint64](ec2) < DM_ERA_MAX:
+                    dm_era_ctxs[cast[uint64](ec2)].used = 0
             blk_unregister_by_name(name)
             dm_devices[i].used      = 0
             dm_devices[i].n_targets = 0
@@ -2657,6 +3023,17 @@ _DM_CORIG_SECTORS: uint64 = 256
 _dm_corig_store:   Array[131072, uint8]   # 256 * 512
 _dm_corig_ops:     BlockDeviceOps
 
+# Dedicated ORIGIN ramdisk for the dm-era subtest. 256 sectors = 128 KiB.
+_DM_EORIG_SECTORS: uint64 = 256
+_dm_eorig_store:   Array[131072, uint8]   # 256 * 512
+_dm_eorig_ops:     BlockDeviceOps
+
+# Dedicated METADATA ramdisk for the dm-era subtest (holds the era
+# superblock + packed per-chunk era array). 256 sectors = 128 KiB.
+_DM_EMETA_SECTORS: uint64 = 256
+_dm_emeta_store:   Array[131072, uint8]   # 256 * 512
+_dm_emeta_ops:     BlockDeviceOps
+
 # Scratch buffers for the self-test (all module-scope, one sector each
 # unless noted).
 _dm_t_plain:   Array[512, uint8]   # plaintext written through a mapped dev
@@ -2712,6 +3089,18 @@ _dm_cache_pd:    Array[512, uint8]   # pattern for origin block D
 _dm_cache_pw:    Array[512, uint8]   # writeback/writethrough write pattern
 _dm_cache_rd:    Array[512, uint8]   # readback through the cache device
 _dm_cache_raw:   Array[512, uint8]   # raw read from the origin device
+
+# dm-era subtest scratch (all one full sector = 512 bytes to avoid the
+# BSS-overflow trap; the era subtest uses 8-sector chunks but writes 1
+# sector — the first sector of each chunk — per chunk).
+_dm_era_p0:      Array[512, uint8]   # pattern for chunk written in era 1
+_dm_era_p1:      Array[512, uint8]   # pattern for chunk written in era 1
+_dm_era_p2:      Array[512, uint8]   # pattern for chunk written in era 2
+_dm_era_p3:      Array[512, uint8]   # pattern for chunk written in era 2
+_dm_era_rd:      Array[512, uint8]   # readback through the era device
+# Query result buffer: chunk indices returned by dm_era_query_since. Sized
+# to DM_ERA_MAX_CHUNKS (256) so a full-device result never overflows.
+_dm_era_qbuf:    Array[256, uint64]  # query result chunk indices
 
 
 def _dm_back_read(priv: uint64, lba: uint64, count: uint64,
@@ -2941,6 +3330,66 @@ def _dm_corig_register() -> int32:
     _dm_corig_ops.flush         = cast[Fn[int32, uint64]](0)
     return register_blockdev("dmcorig0", _DM_CORIG_SECTORS,
                              &_dm_corig_ops, 0)
+
+
+def _dm_eorig_read(priv: uint64, lba: uint64, count: uint64,
+                   buf: Ptr[uint8]) -> int32:
+    src: uint64 = cast[uint64](&_dm_eorig_store[0]) + lba * SECTOR_SIZE
+    memcpy(buf, cast[Ptr[uint8]](src), count * SECTOR_SIZE)
+    return 0
+
+
+def _dm_eorig_write(priv: uint64, lba: uint64, count: uint64,
+                    buf: Ptr[uint8]) -> int32:
+    dst: uint64 = cast[uint64](&_dm_eorig_store[0]) + lba * SECTOR_SIZE
+    memcpy(cast[Ptr[uint8]](dst), buf, count * SECTOR_SIZE)
+    return 0
+
+
+def _dm_eorig_register() -> int32:
+    # Register the dedicated dm-era ORIGIN ramdisk as "dmeorig0".
+    existing: int32 = find_blockdev("dmeorig0")
+    if existing >= 0:
+        return existing
+    z: uint64 = 0
+    while z < 131072:
+        _dm_eorig_store[z] = 0
+        z = z + 1
+    _dm_eorig_ops.read_sectors  = _dm_eorig_read
+    _dm_eorig_ops.write_sectors = _dm_eorig_write
+    _dm_eorig_ops.flush         = cast[Fn[int32, uint64]](0)
+    return register_blockdev("dmeorig0", _DM_EORIG_SECTORS,
+                             &_dm_eorig_ops, 0)
+
+
+def _dm_emeta_read(priv: uint64, lba: uint64, count: uint64,
+                   buf: Ptr[uint8]) -> int32:
+    src: uint64 = cast[uint64](&_dm_emeta_store[0]) + lba * SECTOR_SIZE
+    memcpy(buf, cast[Ptr[uint8]](src), count * SECTOR_SIZE)
+    return 0
+
+
+def _dm_emeta_write(priv: uint64, lba: uint64, count: uint64,
+                    buf: Ptr[uint8]) -> int32:
+    dst: uint64 = cast[uint64](&_dm_emeta_store[0]) + lba * SECTOR_SIZE
+    memcpy(cast[Ptr[uint8]](dst), buf, count * SECTOR_SIZE)
+    return 0
+
+
+def _dm_emeta_register() -> int32:
+    # Register the dedicated dm-era METADATA ramdisk as "dmemeta0".
+    existing: int32 = find_blockdev("dmemeta0")
+    if existing >= 0:
+        return existing
+    z: uint64 = 0
+    while z < 131072:
+        _dm_emeta_store[z] = 0
+        z = z + 1
+    _dm_emeta_ops.read_sectors  = _dm_emeta_read
+    _dm_emeta_ops.write_sectors = _dm_emeta_write
+    _dm_emeta_ops.flush         = cast[Fn[int32, uint64]](0)
+    return register_blockdev("dmemeta0", _DM_EMETA_SECTORS,
+                             &_dm_emeta_ops, 0)
 
 
 def _dm_buf_eq(a: Ptr[uint8], b: Ptr[uint8], n: uint64) -> int32:
@@ -3898,6 +4347,165 @@ def dm_selftest() -> int32:
     # removed before the cache subtest; this leaves dmback0 in place).
     dm_remove("dmcache-wt")
     dm_remove("dmcache-wb")
+
+    # --- Test 10: dm-ERA per-chunk write-era (generation) tracking ---
+    # Build an era device over a dedicated ORIGIN ramdisk (dmeorig0) with its
+    # per-chunk era metadata persisted to a separate METADATA ramdisk
+    # (dmemeta0). chunk=8 sectors, nchunks=16 (origin span 128 sectors). The
+    # device starts at era 1. We PROVE:
+    #   (a) writes in era 1 stamp era 1 on their chunks and read back intact;
+    #   (b) advancing the era to 2 and writing more chunks stamps era 2;
+    #   (c) "chunks written since era 2" returns EXACTLY the era-2 chunks
+    #       (including a chunk re-written in era 2 — its era advances), and
+    #       "chunks written since era 1" returns ALL written chunks, ordered;
+    #   (d) the era metadata survives: it round-trips through the metadata
+    #       device (reload after wiping the in-core array reproduces it).
+    eorig: int32 = _dm_eorig_register()
+    if eorig < 0:
+        _dm_emerg0("[device-mapper] FAIL: era origin register\n")
+        return 0
+    emeta: int32 = _dm_emeta_register()
+    if emeta < 0:
+        _dm_emerg0("[device-mapper] FAIL: era metadata register\n")
+        return 0
+    _dm_emerg2("[device-mapper] era origin dmeorig0 slot=%d meta dmemeta0 slot=%d\n",
+               cast[uint64](cast[int64](eorig)),
+               cast[uint64](cast[int64](emeta)))
+    # Distinct per-chunk patterns (one sector each).
+    ebi: uint64 = 0
+    while ebi < SECTOR_SIZE:
+        _dm_era_p0[ebi] = cast[uint8]((ebi * 3 + 11) & 0xFF)   # chunk 2, era 1
+        _dm_era_p1[ebi] = cast[uint8]((ebi * 5 + 22) & 0xFF)   # chunk 5, era 1
+        _dm_era_p2[ebi] = cast[uint8]((ebi * 7 + 33) & 0xFF)   # chunk 5, era 2
+        _dm_era_p3[ebi] = cast[uint8]((ebi * 11 + 44) & 0xFF)  # chunk 9, era 2
+        ebi = ebi + 1
+    eradev: int32 = dm_create_era("dmera0", eorig, emeta, 8, 16)
+    if eradev < 0:
+        _dm_emerg1("[device-mapper] FAIL: dm_create_era rc=%d\n",
+                   cast[uint64](cast[int64](eradev)))
+        return 0
+    ectx: int32 = dm_era_ctx_of("dmera0")
+    if ectx < 0:
+        _dm_emerg0("[device-mapper] FAIL: era ctx lookup\n")
+        return 0
+    # Fresh device must start at era 1.
+    if dm_era_current(ectx) != 1:
+        _dm_emerg1("[device-mapper] FAIL: era did not start at 1 (cur=%d)\n",
+                   cast[uint64](cast[int64](dm_era_current(ectx))))
+        ok = 0
+
+    # (a) Era-1 batch: write chunk 2 (vsec 16) and chunk 5 (vsec 40). Each
+    # write stamps the CURRENT era (1) on its chunk; data must read back.
+    if blk_write_sectors(eradev, 16, 1, &_dm_era_p0[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: era write chunk2 era1\n")
+        return 0
+    if blk_write_sectors(eradev, 40, 1, &_dm_era_p1[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: era write chunk5 era1\n")
+        return 0
+    if blk_read_sectors(eradev, 16, 1, &_dm_era_rd[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: era readback chunk2\n")
+        return 0
+    if _dm_buf_eq(&_dm_era_rd[0], &_dm_era_p0[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: era chunk2 data mismatch\n")
+        ok = 0
+    else:
+        _dm_emerg0("[devmapper] era: era-1 write reads back intact OK\n")
+
+    # (b) Advance the era to 2. Subsequent writes stamp era 2.
+    newera: int32 = dm_era_advance(ectx)
+    if newera != 2:
+        _dm_emerg1("[device-mapper] FAIL: era advance != 2 (got=%d)\n",
+                   cast[uint64](cast[int64](newera)))
+        ok = 0
+    else:
+        _dm_emerg0("[dm] PASS era-advance\n")
+    # Era-2 batch: RE-write chunk 5 (vsec 40, now era 2) and write a fresh
+    # chunk 9 (vsec 72). Re-writing chunk 5 advances ITS era 1 -> 2.
+    if blk_write_sectors(eradev, 40, 1, &_dm_era_p2[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: era rewrite chunk5 era2\n")
+        return 0
+    if blk_write_sectors(eradev, 72, 1, &_dm_era_p3[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: era write chunk9 era2\n")
+        return 0
+
+    # (c) Query "chunks written since era 2": must be EXACTLY {5, 9} (chunk 5
+    # re-written in era 2, chunk 9 new in era 2; chunk 2 stayed at era 1).
+    q2: int64 = dm_era_query_since(ectx, 2, &_dm_era_qbuf[0],
+                                   DM_ERA_MAX_CHUNKS)
+    era2_ok: int32 = 1
+    if q2 != 2:
+        era2_ok = 0
+    elif _dm_era_qbuf[0] != 5 or _dm_era_qbuf[1] != 9:
+        era2_ok = 0
+    if era2_ok != 1:
+        _dm_emerg1("[device-mapper] FAIL: era query-since-2 wrong set (count=%d)\n",
+                   cast[uint64](q2))
+        ok = 0
+    else:
+        _dm_emerg0("[dm] PASS era-query-since (chunks {5,9} changed since era 2)\n")
+    # Query "chunks written since era 1": must be EXACTLY {2, 5, 9}, ordered.
+    q1: int64 = dm_era_query_since(ectx, 1, &_dm_era_qbuf[0],
+                                   DM_ERA_MAX_CHUNKS)
+    era1_ok: int32 = 1
+    if q1 != 3:
+        era1_ok = 0
+    elif _dm_era_qbuf[0] != 2 or _dm_era_qbuf[1] != 5 or _dm_era_qbuf[2] != 9:
+        era1_ok = 0
+    if era1_ok != 1:
+        _dm_emerg1("[device-mapper] FAIL: era query-since-1 wrong set (count=%d)\n",
+                   cast[uint64](q1))
+        ok = 0
+    else:
+        _dm_emerg0("[devmapper] era: all written chunks {2,5,9} reported since era 1 OK\n")
+    # The era-2 re-written chunk 5 must read back the NEW (era-2) data, proving
+    # the data path is real, not just metadata bookkeeping.
+    if blk_read_sectors(eradev, 40, 1, &_dm_era_rd[0]) != 0:
+        _dm_emerg0("[device-mapper] FAIL: era readback chunk5 era2\n")
+        return 0
+    if _dm_buf_eq(&_dm_era_rd[0], &_dm_era_p2[0], SECTOR_SIZE) != 1:
+        _dm_emerg0("[device-mapper] FAIL: era chunk5 era2 data mismatch\n")
+        ok = 0
+    else:
+        _dm_emerg0("[devmapper] era: re-written chunk reads back new data OK\n")
+
+    # (d) Persistence: clobber the in-core era array + current era, then
+    # reload from the metadata device. The reloaded state must reproduce the
+    # exact partition (query-since-2 == {5,9} again), proving the metadata
+    # genuinely survives on the metadata device.
+    eci: uint64 = cast[uint64](ectx)
+    cz: uint64 = 0
+    while cz < dm_era_ctxs[eci].nchunks:
+        dm_era_ctxs[eci].era[cz] = 0
+        cz = cz + 1
+    dm_era_ctxs[eci].current_era = 0
+    rlrc: int32 = dm_era_reload(ectx)
+    if rlrc != 1:
+        _dm_emerg1("[device-mapper] FAIL: era metadata reload (rc=%d)\n",
+                   cast[uint64](cast[int64](rlrc)))
+        ok = 0
+    elif dm_era_current(ectx) != 2:
+        _dm_emerg1("[device-mapper] FAIL: era reload lost current era (cur=%d)\n",
+                   cast[uint64](cast[int64](dm_era_current(ectx))))
+        ok = 0
+    else:
+        q2b: int64 = dm_era_query_since(ectx, 2, &_dm_era_qbuf[0],
+                                        DM_ERA_MAX_CHUNKS)
+        persist_ok: int32 = 1
+        if q2b != 2:
+            persist_ok = 0
+        elif _dm_era_qbuf[0] != 5 or _dm_era_qbuf[1] != 9:
+            persist_ok = 0
+        if persist_ok != 1:
+            _dm_emerg1("[device-mapper] FAIL: era reload wrong set (count=%d)\n",
+                       cast[uint64](q2b))
+            ok = 0
+        else:
+            _dm_emerg0("[dm] PASS era-persist (metadata round-trips via meta device)\n")
+
+    if ok == 1:
+        _dm_emerg0("[dm] era PASS\n")
+
+    dm_remove("dmera0")
 
     if ok == 1:
         _dm_emerg0("[device-mapper] PASS\n")
