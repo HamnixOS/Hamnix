@@ -61,6 +61,7 @@ MD_LEVEL_NONE:  uint32 = 0
 MD_LEVEL_RAID0: uint32 = 1       # striping
 MD_LEVEL_RAID1: uint32 = 2       # mirroring
 MD_LEVEL_RAID5: uint32 = 5       # striping + distributed single parity
+MD_LEVEL_RAID6: uint32 = 6       # striping + dual parity (P XOR, Q GF(2^8))
 
 MD_MAX_MEMBERS: uint64 = 8       # member disks per array
 MD_MAX_ARRAYS:  uint64 = 8       # md arrays system-wide
@@ -514,6 +515,542 @@ def _md_raid5_io(dev: Ptr[MdArray], is_write: int32, vlba: uint64,
 
 
 # =========================================================================
+# RAID6 — striping with dual distributed parity (P XOR + Q GF(2^8))
+# =========================================================================
+#
+# Linux's drivers/md/raid6 algorithm. Each STRIPE (one chunk-row spanning
+# all N members) holds N-2 DATA chunks plus a P parity chunk and a Q
+# syndrome chunk; both P and Q ROTATE per stripe so the parity write load
+# is spread across all disks. Capacity = (N-2) * per_member_chunks *
+# chunk_sectors.
+#
+# GEOMETRY (a clean rotating P/Q layout, left-symmetric in spirit):
+#
+#   stripe s  = vchunk / (N-2)        (which chunk-row)
+#   didx   d  = vchunk % (N-2)        (data-block index within the stripe,
+#                                      0..N-3 — also the Q coefficient power)
+#   pd_idx    = (N-1) - (s % N)       (member holding P for stripe s; starts
+#                                      on the LAST member at s=0, rotates left)
+#   qd_idx    = (pd_idx + 1) % N      (member holding Q, just after P)
+#   data member for data-index d = (qd_idx + 1 + d) % N
+#                                      (data blocks start just after Q, wrap)
+#   member chunk offset = s * chunk_sectors   (same row on every member)
+#
+# PARITY MATH over GF(2^8), the Rijndael field, generator g = 2, reducing
+# polynomial 0x11d (i.e. x^8 + x^4 + x^3 + x^2 + 1, the standard md poly):
+#
+#   P = D_0 XOR D_1 XOR ... XOR D_{N-3}          (plain XOR, like RAID5)
+#   Q = (g^0 . D_0) XOR (g^1 . D_1) XOR ... XOR (g^{N-3} . D_{N-3})
+#
+# where g^i . D means GF(2^8) multiply of every byte of chunk D_i by the
+# field element g^i. Two member failures are recoverable:
+#
+#   * one data + (P or Q or neither) lost  -> rebuild data from P (XOR) when
+#     P survives, else from Q.
+#   * two data blocks D_x, D_y lost (x<y):  solve the 2x2 GF system
+#         P'  = P  XOR (sum of surviving data)        (= D_x XOR D_y)
+#         Q'  = Q  XOR (sum of g^i.surviving data)    (= g^x.D_x XOR g^y.D_y)
+#       => D_x = ( g^{-x} . ( (g^{y-x}/(g^{y-x} XOR 1)).P' XOR
+#                              (1/(g^{y-x} XOR 1)).Q'/g^x ) ) ... — we use the
+#       standard md closed form:
+#         A = g^{y-x},  denom = A XOR 1
+#         D_x = (A/denom) . P'  XOR  (1/denom) . (Q' . g^{-x})
+#         D_y = P' XOR D_x
+#
+# These are implemented byte-wise with a log/antilog table multiply.
+
+# GF(2^8) log / antilog (exp) tables for g = 2, poly 0x11d. Built once at
+# first use. _md_gf_exp[i] = g^i (i in 0..509, doubled so g^i * g^j needs no
+# wrap), _md_gf_log[v] = the exponent e with g^e == v (v in 1..255).
+_md_gf_exp:    Array[512, uint8]
+_md_gf_log:    Array[256, uint8]
+_md_gf_ready:  uint32 = 0
+
+
+def _md_gf_init():
+    # Populate the GF(2^8) log/antilog tables (Rijndael field, g=2, 0x11d).
+    if _md_gf_ready != 0:
+        return
+    x: uint64 = 1
+    i: uint64 = 0
+    while i < 255:
+        _md_gf_exp[i] = cast[uint8](x)
+        _md_gf_log[x] = cast[uint8](i)
+        # x = x * 2 in GF(2^8): shift left, reduce by 0x11d if bit 8 set.
+        x = x << 1
+        if (x & 0x100) != 0:
+            x = x ^ 0x11d
+        i = i + 1
+    # Duplicate the cycle so exp[i] for i up to 509 needs no modulo.
+    i = 255
+    while i < 510:
+        _md_gf_exp[i] = _md_gf_exp[i - 255]
+        i = i + 1
+    _md_gf_log[0] = 0
+    _md_gf_ready = 1
+
+
+def _md_gf_mul(a: uint64, b: uint64) -> uint64:
+    # GF(2^8) multiply of two field elements (each 0..255). Returns 0..255.
+    if a == 0 or b == 0:
+        return 0
+    la: uint64 = cast[uint64](_md_gf_log[a & 0xFF])
+    lb: uint64 = cast[uint64](_md_gf_log[b & 0xFF])
+    return cast[uint64](_md_gf_exp[la + lb])     # la+lb <= 508, table covers it
+
+
+def _md_gf_pow2(p: uint64) -> uint64:
+    # g^p for g = 2 (the per-data-block Q coefficient). p in 0..N-3 < 255.
+    return cast[uint64](_md_gf_exp[p % 255])
+
+
+def _md_gf_inv(a: uint64) -> uint64:
+    # Multiplicative inverse of a (a != 0) in GF(2^8): g^(255 - log a).
+    la: uint64 = cast[uint64](_md_gf_log[a & 0xFF])
+    return cast[uint64](_md_gf_exp[255 - la])
+
+
+def _md_gf_mul_into(dst: Ptr[uint8], src: Ptr[uint8], c: uint64, n: uint64):
+    # dst[i] ^= (c . src[i]) over GF(2^8), for n bytes. The Q accumulate
+    # primitive. When c == 1 this is a plain XOR.
+    if c == 0:
+        return
+    if c == 1:
+        i0: uint64 = 0
+        while i0 < n:
+            dst[i0] = dst[i0] ^ src[i0]
+            i0 = i0 + 1
+        return
+    lc: uint64 = cast[uint64](_md_gf_log[c & 0xFF])
+    i: uint64 = 0
+    while i < n:
+        v: uint64 = cast[uint64](src[i])
+        if v != 0:
+            lv: uint64 = cast[uint64](_md_gf_log[v])
+            dst[i] = dst[i] ^ _md_gf_exp[lc + lv]
+        i = i + 1
+
+
+def _md_gf_scale(dst: Ptr[uint8], c: uint64, n: uint64):
+    # dst[i] = c . dst[i] over GF(2^8), in place, for n bytes.
+    if c == 1:
+        return
+    if c == 0:
+        z: uint64 = 0
+        while z < n:
+            dst[z] = 0
+            z = z + 1
+        return
+    lc: uint64 = cast[uint64](_md_gf_log[c & 0xFF])
+    i: uint64 = 0
+    while i < n:
+        v: uint64 = cast[uint64](dst[i])
+        if v != 0:
+            lv: uint64 = cast[uint64](_md_gf_log[v])
+            dst[i] = _md_gf_exp[lc + lv]
+        else:
+            dst[i] = 0
+        i = i + 1
+
+
+# Per-chunk scratch buffers for RAID6 RMW / reconstruction. One full default
+# chunk (64 KiB) each. Module-scope per the Adder large-array quirk. Distinct
+# from the RAID5 set so a RAID6 op never aliases RAID5 scratch.
+_md_r6_acc_p:  Array[65536, uint8]    # P accumulator
+_md_r6_acc_q:  Array[65536, uint8]    # Q accumulator
+_md_r6_tmp:    Array[65536, uint8]    # a freshly-read member fragment
+_md_r6_dx:     Array[65536, uint8]    # solved D_x
+_md_r6_dy:     Array[65536, uint8]    # solved D_y
+_md_r6_rbuf:   Array[65536, uint8]    # rebuild output (distinct from recon scratch)
+_md_r6_pacc2:  Array[65536, uint8]    # P accumulator for the recon-aware P/Q build
+_md_r6_qacc2:  Array[65536, uint8]    # Q accumulator for the recon-aware P/Q build
+_md_r6_pqdat:  Array[65536, uint8]    # one (possibly reconstructed) data chunk
+
+
+def _md_r6_pd_idx(n: uint64, stripe: uint64) -> uint64:
+    # Member index holding the P chunk for `stripe`.
+    return (n - 1) - (stripe % n)
+
+
+def _md_r6_qd_idx(n: uint64, stripe: uint64) -> uint64:
+    # Member index holding the Q chunk for `stripe` (just after P, wrapping).
+    return (_md_r6_pd_idx(n, stripe) + 1) % n
+
+
+def _md_r6_data_member(n: uint64, pd: uint64, qd: uint64,
+                       didx: uint64) -> uint64:
+    # Member index holding data-block `didx` (0..N-3): data packs right
+    # after Q, wrapping.
+    return (qd + 1 + didx) % n
+
+
+def _md_r6_data_index_of(n: uint64, pd: uint64, qd: uint64,
+                         member: uint64) -> int32:
+    # Inverse map: given a member that is neither P nor Q for this stripe,
+    # return its data-block index (0..N-3) — which is also its Q coefficient
+    # power. Returns -1 if `member` is the P or Q member.
+    if member == pd or member == qd:
+        return -1
+    nd: uint64 = n - 2
+    d: uint64 = 0
+    while d < nd:
+        if _md_r6_data_member(n, pd, qd, d) == member:
+            return cast[int32](d)
+        d = d + 1
+    return -1
+
+
+def _md_r6_member_lba(dev: Ptr[MdArray], member: uint64,
+                      row_chunk: uint64, off: uint64) -> uint64:
+    return row_chunk * dev[0].chunk_sectors + off \
+        + dev[0].members[member].under_start
+
+
+def _md_r6_read_member(dev: Ptr[MdArray], member: uint64, stripe: uint64,
+                       off: uint64, frag: uint64, out: Ptr[uint8]) -> int32:
+    # Raw read of one member's chunk-fragment at this stripe row/offset.
+    mlba: uint64 = _md_r6_member_lba(dev, member, stripe, off)
+    return blk_read_sectors(dev[0].members[member].under_slot, mlba,
+                            frag, out)
+
+
+def _md_r6_build_pq(dev: Ptr[MdArray], stripe: uint64, off: uint64,
+                    frag: uint64, skip_a: int32, skip_b: int32) -> int32:
+    # Compute P (into _md_r6_acc_p) and Q (into _md_r6_acc_q) over ALL data
+    # members of `stripe`, reading each live data member fresh, EXCEPT the
+    # members `skip_a`/`skip_b` (pass -1 to skip none) which the caller is
+    # supplying itself. Any non-skipped data member that is Faulty makes this
+    # impossible -> returns -1. nb = frag * SECTOR_SIZE.
+    n: uint64 = cast[uint64](dev[0].n_members)
+    nb: uint64 = frag * SECTOR_SIZE
+    pd: uint64 = _md_r6_pd_idx(n, stripe)
+    qd: uint64 = _md_r6_qd_idx(n, stripe)
+    nd: uint64 = n - 2
+    z: uint64 = 0
+    while z < nb:
+        _md_r6_acc_p[z] = 0
+        _md_r6_acc_q[z] = 0
+        z = z + 1
+    d: uint64 = 0
+    while d < nd:
+        dm: uint64 = _md_r6_data_member(n, pd, qd, d)
+        if cast[int32](dm) != skip_a and cast[int32](dm) != skip_b:
+            if dev[0].members[dm].failed != 0:
+                return -1
+            rc: int32 = _md_r6_read_member(dev, dm, stripe, off, frag,
+                                           cast[Ptr[uint8]](&_md_r6_tmp[0]))
+            if rc != 0:
+                return rc
+            _md_xor_into(cast[Ptr[uint8]](&_md_r6_acc_p[0]),
+                         cast[Ptr[uint8]](&_md_r6_tmp[0]), nb)
+            _md_gf_mul_into(cast[Ptr[uint8]](&_md_r6_acc_q[0]),
+                            cast[Ptr[uint8]](&_md_r6_tmp[0]),
+                            _md_gf_pow2(d), nb)
+        d = d + 1
+    return 0
+
+
+def _md_r6_recon_one_via_p(dev: Ptr[MdArray], stripe: uint64, want: uint64,
+                           off: uint64, frag: uint64,
+                           out: Ptr[uint8]) -> int32:
+    # Single-fault rebuild of data member `want` using P: out = P XOR (all
+    # other data). Requires P live and no second fault among data. Used when
+    # exactly one data member (and possibly Q) is down but P survives.
+    n: uint64 = cast[uint64](dev[0].n_members)
+    nb: uint64 = frag * SECTOR_SIZE
+    pd: uint64 = _md_r6_pd_idx(n, stripe)
+    qd: uint64 = _md_r6_qd_idx(n, stripe)
+    nd: uint64 = n - 2
+    # Start with P.
+    rc: int32 = _md_r6_read_member(dev, pd, stripe, off, frag, out)
+    if rc != 0:
+        return rc
+    d: uint64 = 0
+    while d < nd:
+        dm: uint64 = _md_r6_data_member(n, pd, qd, d)
+        if dm != want:
+            if dev[0].members[dm].failed != 0:
+                return -1
+            rc2: int32 = _md_r6_read_member(dev, dm, stripe, off, frag,
+                                            cast[Ptr[uint8]](&_md_r6_tmp[0]))
+            if rc2 != 0:
+                return rc2
+            _md_xor_into(out, cast[Ptr[uint8]](&_md_r6_tmp[0]), nb)
+        d = d + 1
+    return 0
+
+
+def _md_r6_recon_one_via_q(dev: Ptr[MdArray], stripe: uint64, want: uint64,
+                           wexp: uint64, off: uint64, frag: uint64,
+                           out: Ptr[uint8]) -> int32:
+    # Single-fault rebuild of data member `want` (Q coefficient power `wexp`)
+    # using Q: Q = g^wexp.D_want XOR (sum of g^i.other_data), so
+    #   D_want = g^{-wexp} . ( Q XOR (sum of g^i.other_data) ).
+    # Used when P is the OTHER lost member (data + P down) but Q survives.
+    n: uint64 = cast[uint64](dev[0].n_members)
+    nb: uint64 = frag * SECTOR_SIZE
+    pd: uint64 = _md_r6_pd_idx(n, stripe)
+    qd: uint64 = _md_r6_qd_idx(n, stripe)
+    nd: uint64 = n - 2
+    # out = Q.
+    rc: int32 = _md_r6_read_member(dev, qd, stripe, off, frag, out)
+    if rc != 0:
+        return rc
+    d: uint64 = 0
+    while d < nd:
+        dm: uint64 = _md_r6_data_member(n, pd, qd, d)
+        if dm != want:
+            if dev[0].members[dm].failed != 0:
+                return -1
+            rc2: int32 = _md_r6_read_member(dev, dm, stripe, off, frag,
+                                            cast[Ptr[uint8]](&_md_r6_tmp[0]))
+            if rc2 != 0:
+                return rc2
+            # out ^= g^d . other_data.
+            _md_gf_mul_into(out, cast[Ptr[uint8]](&_md_r6_tmp[0]),
+                            _md_gf_pow2(d), nb)
+        d = d + 1
+    # out = g^{-wexp} . out.
+    _md_gf_scale(out, _md_gf_inv(_md_gf_pow2(wexp)), nb)
+    return 0
+
+
+def _md_r6_recon_two_data(dev: Ptr[MdArray], stripe: uint64,
+                          wx: uint64, wy: uint64, off: uint64, frag: uint64,
+                          outx: Ptr[uint8], outy: Ptr[uint8]) -> int32:
+    # Rebuild TWO lost data members wx, wy (both live P and Q) using the
+    # standard RAID6 two-data-failure solve. ex/ey are their Q coefficient
+    # powers. Produces D_wx into outx and D_wy into outy.
+    n: uint64 = cast[uint64](dev[0].n_members)
+    nb: uint64 = frag * SECTOR_SIZE
+    pd: uint64 = _md_r6_pd_idx(n, stripe)
+    qd: uint64 = _md_r6_qd_idx(n, stripe)
+    iex: int32 = _md_r6_data_index_of(n, pd, qd, wx)
+    iey: int32 = _md_r6_data_index_of(n, pd, qd, wy)
+    if iex < 0 or iey < 0:
+        return -1
+    ex: uint64 = cast[uint64](iex)
+    ey: uint64 = cast[uint64](iey)
+    # P' = P XOR (sum of surviving data)  (== D_wx XOR D_wy)
+    # Q' = Q XOR (sum of g^i.surviving data) (== g^ex.D_wx XOR g^ey.D_wy)
+    # Build P' in acc_p, Q' in acc_q by summing every data member except the
+    # two lost, then folding in the real P and Q chunks.
+    if _md_r6_build_pq(dev, stripe, off, frag, cast[int32](wx),
+                       cast[int32](wy)) != 0:
+        return -1
+    # acc_p currently = sum of surviving data; fold in stored P.
+    rc: int32 = _md_r6_read_member(dev, pd, stripe, off, frag,
+                                   cast[Ptr[uint8]](&_md_r6_tmp[0]))
+    if rc != 0:
+        return rc
+    _md_xor_into(cast[Ptr[uint8]](&_md_r6_acc_p[0]),
+                 cast[Ptr[uint8]](&_md_r6_tmp[0]), nb)    # acc_p = P'
+    rc2: int32 = _md_r6_read_member(dev, qd, stripe, off, frag,
+                                    cast[Ptr[uint8]](&_md_r6_tmp[0]))
+    if rc2 != 0:
+        return rc2
+    _md_xor_into(cast[Ptr[uint8]](&_md_r6_acc_q[0]),
+                 cast[Ptr[uint8]](&_md_r6_tmp[0]), nb)     # acc_q = Q'
+    # Solve. A = g^{ey-ex} (ey>ex since wy is at a higher data index? not
+    # guaranteed — handle either order). denom = A XOR 1.
+    # D_wx = (A . P' XOR Q'.g^{-ex}) . (1/denom)        [md closed form]
+    # Derivation: from P' = Dx XOR Dy and Q' = g^ex.Dx XOR g^ey.Dy,
+    #   Q' XOR g^ey.P' = (g^ex XOR g^ey).Dx
+    #   Dx = (Q' XOR g^ey.P') / (g^ex XOR g^ey)
+    gex: uint64 = _md_gf_pow2(ex)
+    gey: uint64 = _md_gf_pow2(ey)
+    denom: uint64 = gex ^ gey
+    if denom == 0:
+        return -1
+    invd: uint64 = _md_gf_inv(denom)
+    # outx = g^ey . P'  (copy P' then scale)
+    cc: uint64 = 0
+    while cc < nb:
+        outx[cc] = _md_r6_acc_p[cc]
+        cc = cc + 1
+    _md_gf_scale(outx, gey, nb)
+    # outx ^= Q'
+    _md_xor_into(outx, cast[Ptr[uint8]](&_md_r6_acc_q[0]), nb)
+    # outx . (1/denom)
+    _md_gf_scale(outx, invd, nb)              # outx = D_wx
+    # D_wy = P' XOR D_wx
+    cc = 0
+    while cc < nb:
+        outy[cc] = _md_r6_acc_p[cc] ^ outx[cc]
+        cc = cc + 1
+    return 0
+
+
+def _md_raid6_read_chunkfrag(dev: Ptr[MdArray], stripe: uint64,
+                             didx: uint64, off: uint64, frag: uint64,
+                             buf: Ptr[uint8]) -> int32:
+    # Read one chunk-fragment of data-block `didx` in `stripe`. If its data
+    # member is live, read directly. If degraded, reconstruct depending on
+    # which two members are down.
+    n: uint64 = cast[uint64](dev[0].n_members)
+    pd: uint64 = _md_r6_pd_idx(n, stripe)
+    qd: uint64 = _md_r6_qd_idx(n, stripe)
+    dm: uint64 = _md_r6_data_member(n, pd, qd, didx)
+    if dev[0].members[dm].failed == 0:
+        return _md_r6_read_member(dev, dm, stripe, off, frag, buf)
+    # `dm` is down. Find any OTHER faulty member in this stripe.
+    other: int32 = -1
+    m: uint64 = 0
+    while m < n:
+        if m != dm and dev[0].members[m].failed != 0:
+            other = cast[int32](m)
+            m = n
+        else:
+            m = m + 1
+    if other < 0:
+        # Single fault -> P is live, rebuild via P.
+        return _md_r6_recon_one_via_p(dev, stripe, dm, off, frag, buf)
+    ou: uint64 = cast[uint64](other)
+    if ou == pd:
+        # data + P down: P gone, Q live -> rebuild via Q.
+        return _md_r6_recon_one_via_q(dev, stripe, dm, didx, off, frag, buf)
+    if ou == qd:
+        # data + Q down: Q gone, P live -> rebuild via P.
+        return _md_r6_recon_one_via_p(dev, stripe, dm, off, frag, buf)
+    # Two data members down: solve. We want `dm`; the other is a data member.
+    nb: uint64 = frag * SECTOR_SIZE
+    rc: int32 = _md_r6_recon_two_data(dev, stripe, dm, ou, off, frag,
+                                      cast[Ptr[uint8]](&_md_r6_dx[0]),
+                                      cast[Ptr[uint8]](&_md_r6_dy[0]))
+    if rc != 0:
+        return rc
+    # _md_r6_dx holds D_dm (since we passed wx=dm).
+    i: uint64 = 0
+    while i < nb:
+        buf[i] = _md_r6_dx[i]
+        i = i + 1
+    return 0
+
+
+def _md_r6_build_pq_recon(dev: Ptr[MdArray], stripe: uint64, off: uint64,
+                          frag: uint64, out_p: Ptr[uint8],
+                          out_q: Ptr[uint8]) -> int32:
+    # Compute P (into out_p) and Q (into out_q) for `stripe` by reading EVERY
+    # data member through the reconstructing read path, so a Faulty data
+    # member is itself rebuilt from the survivors before being folded in.
+    # This is what rebuild of the P or Q member needs when a SECOND (data)
+    # member is also Faulty: the missing data is recoverable (only two faults
+    # total), so P/Q can still be regenerated. Uses dedicated scratch that
+    # does NOT alias the read path's internals. nb = frag * SECTOR_SIZE.
+    n: uint64 = cast[uint64](dev[0].n_members)
+    nb: uint64 = frag * SECTOR_SIZE
+    pd: uint64 = _md_r6_pd_idx(n, stripe)
+    qd: uint64 = _md_r6_qd_idx(n, stripe)
+    nd: uint64 = n - 2
+    z: uint64 = 0
+    while z < nb:
+        out_p[z] = 0
+        out_q[z] = 0
+        z = z + 1
+    d: uint64 = 0
+    while d < nd:
+        rc: int32 = _md_raid6_read_chunkfrag(dev, stripe, d, off, frag,
+                                             cast[Ptr[uint8]](&_md_r6_pqdat[0]))
+        if rc != 0:
+            return rc
+        _md_xor_into(out_p, cast[Ptr[uint8]](&_md_r6_pqdat[0]), nb)
+        _md_gf_mul_into(out_q, cast[Ptr[uint8]](&_md_r6_pqdat[0]),
+                        _md_gf_pow2(d), nb)
+        d = d + 1
+    return 0
+
+
+def _md_raid6_write_chunkfrag(dev: Ptr[MdArray], stripe: uint64,
+                              didx: uint64, off: uint64, frag: uint64,
+                              buf: Ptr[uint8]) -> int32:
+    # Write one data chunk-fragment, recomputing BOTH P and Q for the stripe
+    # from scratch (read all other data members, fold in the new data) and
+    # writing P, Q and the data atomically-as-possible. This full-stripe
+    # parity recompute is simpler and always correct; with small test chunks
+    # it is also cheap. Degraded handling:
+    #   * data member faulty: we cannot store the data, but we still compute
+    #     P and Q from the new value so the (reconstructable) chunk reflects
+    #     it; a SECOND fault among the other needed members is unrecoverable.
+    #   * P faulty: skip the P write (Q still maintained).
+    #   * Q faulty: skip the Q write (P still maintained).
+    n: uint64 = cast[uint64](dev[0].n_members)
+    nb: uint64 = frag * SECTOR_SIZE
+    pd: uint64 = _md_r6_pd_idx(n, stripe)
+    qd: uint64 = _md_r6_qd_idx(n, stripe)
+    dm: uint64 = _md_r6_data_member(n, pd, qd, didx)
+    data_failed: uint32 = dev[0].members[dm].failed
+    par_failed:  uint32 = dev[0].members[pd].failed
+    q_failed:    uint32 = dev[0].members[qd].failed
+
+    # Sum P and Q over every OTHER data member (skip `dm`; we add new data
+    # below). A faulty other data member is a second fault -> unrecoverable.
+    if _md_r6_build_pq(dev, stripe, off, frag, cast[int32](dm), -1) != 0:
+        return -1
+    # Fold in the NEW data for `dm` (coefficient g^didx for Q).
+    _md_xor_into(cast[Ptr[uint8]](&_md_r6_acc_p[0]), buf, nb)
+    _md_gf_mul_into(cast[Ptr[uint8]](&_md_r6_acc_q[0]), buf,
+                    _md_gf_pow2(didx), nb)
+
+    # Write the new data (if its member is live).
+    if data_failed == 0:
+        dlba: uint64 = _md_r6_member_lba(dev, dm, stripe, off)
+        wrc: int32 = blk_write_sectors(dev[0].members[dm].under_slot, dlba,
+                                       frag, buf)
+        if wrc != 0:
+            return wrc
+    # Write P (if live).
+    if par_failed == 0:
+        plba: uint64 = _md_r6_member_lba(dev, pd, stripe, off)
+        prc: int32 = blk_write_sectors(dev[0].members[pd].under_slot, plba,
+                                       frag,
+                                       cast[Ptr[uint8]](&_md_r6_acc_p[0]))
+        if prc != 0:
+            return prc
+    # Write Q (if live).
+    if q_failed == 0:
+        qlba: uint64 = _md_r6_member_lba(dev, qd, stripe, off)
+        qrc: int32 = blk_write_sectors(dev[0].members[qd].under_slot, qlba,
+                                       frag,
+                                       cast[Ptr[uint8]](&_md_r6_acc_q[0]))
+        if qrc != 0:
+            return qrc
+    return 0
+
+
+def _md_raid6_io(dev: Ptr[MdArray], is_write: int32, vlba: uint64,
+                 count: uint64, buf: Ptr[uint8]) -> int32:
+    # Walk the request span, splitting at chunk boundaries, mapping each
+    # chunk through the rotating P/Q layout.
+    if count == 0:
+        return 0
+    n: uint64 = cast[uint64](dev[0].n_members)
+    chunk: uint64 = dev[0].chunk_sectors
+    nd: uint64 = n - 2                  # data chunks per stripe
+    done: uint64 = 0
+    while done < count:
+        cur_v: uint64 = vlba + done
+        vchunk: uint64 = cur_v / chunk
+        off:    uint64 = cur_v % chunk
+        stripe: uint64 = vchunk / nd
+        didx:   uint64 = vchunk % nd
+        avail: uint64 = chunk - off
+        frag: uint64 = count - done
+        if frag > avail:
+            frag = avail
+        bufp: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](buf) + done * SECTOR_SIZE)
+        rc: int32 = 0
+        if is_write != 0:
+            rc = _md_raid6_write_chunkfrag(dev, stripe, didx, off, frag, bufp)
+        else:
+            rc = _md_raid6_read_chunkfrag(dev, stripe, didx, off, frag, bufp)
+        if rc != 0:
+            return rc
+        done = done + frag
+    return 0
+
+
+# =========================================================================
 # I/O dispatch (block-layer vtable adapters)
 # =========================================================================
 
@@ -532,6 +1069,8 @@ def _md_io(dev: Ptr[MdArray], is_write: int32, vlba: uint64,
         return _md_raid1_io(dev, is_write, vlba, count, buf)
     if dev[0].level == MD_LEVEL_RAID5:
         return _md_raid5_io(dev, is_write, vlba, count, buf)
+    if dev[0].level == MD_LEVEL_RAID6:
+        return _md_raid6_io(dev, is_write, vlba, count, buf)
     return -1
 
 
@@ -799,6 +1338,172 @@ def md_raid5_rebuild(name: Ptr[char], member_idx: uint64,
     return 0
 
 
+def md_create_raid6(name: Ptr[char], slots: Ptr[int32], n: uint64,
+                    chunk_sectors: uint64) -> int32:
+    # Assemble a RAID6 array (striping + dual distributed parity P+Q) from
+    # `n` member slots, n >= 4. Each stripe holds N-2 data chunks plus a
+    # rotating P (XOR) and Q (GF(2^8)) chunk; capacity = (N-2) * per_member
+    # usable. The per-member usable span is clamped to the smallest member
+    # and rounded DOWN to a whole number of chunks. This is the `mdadm
+    # --create NAME --level=6 --chunk=CHUNK -n N dev0 dev1 ...` shape.
+    # Returns the registered block slot (>= 0) or a negative error.
+    md_init()
+    _md_gf_init()
+    if n < 4 or n > MD_MAX_MEMBERS:
+        return -1
+    cs: uint64 = chunk_sectors
+    if cs == 0:
+        cs = MD_DEFAULT_CHUNK_SECTORS
+    # RMW/reconstruction scratch buffers are one default chunk wide.
+    if cs > MD_DEFAULT_CHUNK_SECTORS:
+        printk0("md: raid6 chunk too large\n")
+        return -1
+    smallest: uint64 = 0
+    i: uint64 = 0
+    while i < n:
+        s: int32 = slots[i]
+        if s < 0:
+            return -2
+        cap: uint64 = blk_capacity_sectors(s)
+        if cap == 0:
+            return -2
+        if smallest == 0 or cap < smallest:
+            smallest = cap
+        i = i + 1
+    per_member: uint64 = (smallest / cs) * cs
+    if per_member == 0:
+        printk0("md: raid6 members smaller than one chunk\n")
+        return -3
+    idx_s: int32 = _md_alloc_array()
+    if idx_s < 0:
+        printk0("md: array table full\n")
+        return -4
+    idx: uint64 = cast[uint64](idx_s)
+    md_arrays[idx].level         = MD_LEVEL_RAID6
+    md_arrays[idx].n_members     = cast[uint32](n)
+    md_arrays[idx].rr            = 0
+    md_arrays[idx].chunk_sectors = cs
+    # Capacity = data disks * per-member span = (N-2) * per_member.
+    md_arrays[idx].capacity      = per_member * (n - 2)
+    i = 0
+    while i < n:
+        md_arrays[idx].members[i].under_slot  = slots[i]
+        md_arrays[idx].members[i].failed      = 0
+        md_arrays[idx].members[i].under_start = 0
+        md_arrays[idx].members[i].usable      = per_member
+        i = i + 1
+    if _md_register(idx, name) != 0:
+        md_arrays[idx].used = 0
+        return -5
+    return md_arrays[idx].self_slot
+
+
+def md_raid6_rebuild(name: Ptr[char], member_idx: uint64,
+                     new_slot: int32) -> int32:
+    # Replace a Faulty member of RAID6 array `name` with block device
+    # `new_slot` and RECONSTRUCT its contents row-by-row from the survivors
+    # (mdadm --add + recovery). For each chunk-row, the replaced member plays
+    # one of three roles: a DATA chunk, the P chunk, or the Q chunk.
+    #   * data role  -> reconstruct via P+other data (or Q if needed). With at
+    #     most ONE other fault tolerated, we use the existing degraded-read
+    #     path which already covers data+P / data+Q / data+data.
+    #   * P role      -> P = XOR of all data chunks.
+    #   * Q role      -> Q = sum of g^i . D_i over all data chunks.
+    # A SECOND faulty member is tolerated as long as the rebuilt member plus
+    # that member do not exceed two simultaneous faults (RAID6's guarantee).
+    # Returns 0 on success, negative on error.
+    if new_slot < 0:
+        return -1
+    slot: int32 = find_blockdev(name)
+    if slot < 0:
+        return -1
+    ai: uint64 = 0
+    found: int32 = -1
+    while ai < MD_MAX_ARRAYS:
+        if md_arrays[ai].used != 0 and md_arrays[ai].self_slot == slot:
+            found = cast[int32](ai)
+            ai = MD_MAX_ARRAYS
+        else:
+            ai = ai + 1
+    if found < 0:
+        return -1
+    idx: uint64 = cast[uint64](found)
+    dev: Ptr[MdArray] = &md_arrays[idx]
+    if dev[0].level != MD_LEVEL_RAID6:
+        return -1
+    n: uint64 = cast[uint64](dev[0].n_members)
+    if member_idx >= n:
+        return -1
+    # RAID6 tolerates up to TWO faults: refuse only if a THIRD member (i.e. a
+    # second member OTHER than member_idx) is also Faulty.
+    nfault: uint64 = 0
+    f: uint64 = 0
+    while f < n:
+        if f != member_idx and dev[0].members[f].failed != 0:
+            nfault = nfault + 1
+        f = f + 1
+    if nfault > 1:
+        printk0("md: raid6 rebuild blocked — too many Faulty members\n")
+        return -2
+    chunk: uint64 = dev[0].chunk_sectors
+    per_member: uint64 = dev[0].members[member_idx].usable
+    rows: uint64 = per_member / chunk
+    nb: uint64 = chunk * SECTOR_SIZE
+    # IMPORTANT: keep the member marked Faulty while we read survivors so the
+    # reconstruction helpers see the correct degraded set. Point it at the
+    # fresh device first; clear Faulty only after the whole rebuild.
+    # The fresh device backs this member from LBA 0.
+    dev[0].members[member_idx].under_start = 0
+    row: uint64 = 0
+    while row < rows:
+        pd: uint64 = _md_r6_pd_idx(n, row)
+        qd: uint64 = _md_r6_qd_idx(n, row)
+        rc: int32 = 0
+        if member_idx == pd:
+            # Rebuild P = XOR of all data chunks. Use the recon-aware builder
+            # so a concurrently-Faulty data member is reconstructed first.
+            rc = _md_r6_build_pq_recon(dev, row, 0, chunk,
+                                       cast[Ptr[uint8]](&_md_r6_pacc2[0]),
+                                       cast[Ptr[uint8]](&_md_r6_qacc2[0]))
+            if rc != 0:
+                return rc
+            rc = blk_write_sectors(new_slot, row * chunk, chunk,
+                                   cast[Ptr[uint8]](&_md_r6_pacc2[0]))
+            if rc != 0:
+                return rc
+        elif member_idx == qd:
+            # Rebuild Q = sum g^i.D_i, recon-aware (handles a 2nd faulty data).
+            rc = _md_r6_build_pq_recon(dev, row, 0, chunk,
+                                       cast[Ptr[uint8]](&_md_r6_pacc2[0]),
+                                       cast[Ptr[uint8]](&_md_r6_qacc2[0]))
+            if rc != 0:
+                return rc
+            rc = blk_write_sectors(new_slot, row * chunk, chunk,
+                                   cast[Ptr[uint8]](&_md_r6_qacc2[0]))
+            if rc != 0:
+                return rc
+        else:
+            # Data role: reconstruct via the degraded-read path (handles a
+            # concurrent second fault). Need the data-block index for this row.
+            di: int32 = _md_r6_data_index_of(n, pd, qd, member_idx)
+            if di < 0:
+                return -1
+            rc = _md_raid6_read_chunkfrag(dev, row, cast[uint64](di), 0,
+                                          chunk,
+                                          cast[Ptr[uint8]](&_md_r6_rbuf[0]))
+            if rc != 0:
+                return rc
+            rc = blk_write_sectors(new_slot, row * chunk, chunk,
+                                   cast[Ptr[uint8]](&_md_r6_rbuf[0]))
+            if rc != 0:
+                return rc
+        row = row + 1
+    # Recovery complete: switch to the fresh device and clear the Faulty bit.
+    dev[0].members[member_idx].under_slot = new_slot
+    dev[0].members[member_idx].failed     = 0
+    return 0
+
+
 def md_fail_member(name: Ptr[char], member_idx: uint64) -> int32:
     # Mark member `member_idx` of array `name` Faulty — the degraded-mode
     # trigger (mdadm --fail). For a RAID1 array the array keeps serving
@@ -886,10 +1591,14 @@ _md_back_store0:  Array[131072, uint8]   # 256 * 512
 _md_back_store1:  Array[131072, uint8]
 _md_back_store2:  Array[131072, uint8]
 _md_back_store3:  Array[131072, uint8]
+_md_back_store4:  Array[131072, uint8]   # RAID6 needs >=4 members + a spare
+_md_back_store5:  Array[131072, uint8]
 _md_back_ops0:    BlockDeviceOps
 _md_back_ops1:    BlockDeviceOps
 _md_back_ops2:    BlockDeviceOps
 _md_back_ops3:    BlockDeviceOps
+_md_back_ops4:    BlockDeviceOps
+_md_back_ops5:    BlockDeviceOps
 
 # Self-test scratch buffers (all module-scope, sized for the largest single
 # transfer the test performs).
@@ -960,6 +1669,34 @@ def _md_back3_write(priv: uint64, lba: uint64, count: uint64,
     return 0
 
 
+def _md_back4_read(priv: uint64, lba: uint64, count: uint64,
+                   buf: Ptr[uint8]) -> int32:
+    src: uint64 = cast[uint64](&_md_back_store4[0]) + lba * SECTOR_SIZE
+    memcpy(buf, cast[Ptr[uint8]](src), count * SECTOR_SIZE)
+    return 0
+
+
+def _md_back4_write(priv: uint64, lba: uint64, count: uint64,
+                    buf: Ptr[uint8]) -> int32:
+    dst: uint64 = cast[uint64](&_md_back_store4[0]) + lba * SECTOR_SIZE
+    memcpy(cast[Ptr[uint8]](dst), buf, count * SECTOR_SIZE)
+    return 0
+
+
+def _md_back5_read(priv: uint64, lba: uint64, count: uint64,
+                   buf: Ptr[uint8]) -> int32:
+    src: uint64 = cast[uint64](&_md_back_store5[0]) + lba * SECTOR_SIZE
+    memcpy(buf, cast[Ptr[uint8]](src), count * SECTOR_SIZE)
+    return 0
+
+
+def _md_back5_write(priv: uint64, lba: uint64, count: uint64,
+                    buf: Ptr[uint8]) -> int32:
+    dst: uint64 = cast[uint64](&_md_back_store5[0]) + lba * SECTOR_SIZE
+    memcpy(cast[Ptr[uint8]](dst), buf, count * SECTOR_SIZE)
+    return 0
+
+
 def _md_emerg0(s: Ptr[char]):
     printk_set_level(PRINTK_LEVEL_EMERG)
     printk0(s)
@@ -983,7 +1720,7 @@ def _md_zero_store(p: Ptr[uint8]):
 
 
 def _md_back_register(idx: uint64) -> int32:
-    # Register backing ramdisk `idx` (0..3) as "mdback<idx>". Returns the
+    # Register backing ramdisk `idx` (0..5) as "mdback<idx>". Returns the
     # slot, or the existing slot if already registered. Zeroes the store
     # on first registration so the test starts clean.
     nm: Array[16, uint8]
@@ -993,7 +1730,7 @@ def _md_back_register(idx: uint64) -> int32:
     nm[3] = 0x61   # 'a'
     nm[4] = 0x63   # 'c'
     nm[5] = 0x6B   # 'k'
-    nm[6] = cast[uint8](0x30 + idx)   # '0'..'3'
+    nm[6] = cast[uint8](0x30 + idx)   # '0'..'5'
     nm[7] = 0
     name: Ptr[char] = cast[Ptr[char]](&nm[0])
     existing: int32 = find_blockdev(name)
@@ -1017,11 +1754,23 @@ def _md_back_register(idx: uint64) -> int32:
         _md_back_ops2.write_sectors = _md_back2_write
         _md_back_ops2.flush         = cast[Fn[int32, uint64]](0)
         return register_blockdev(name, _MD_BACK_SECTORS, &_md_back_ops2, 0)
-    _md_zero_store(cast[Ptr[uint8]](&_md_back_store3[0]))
-    _md_back_ops3.read_sectors  = _md_back3_read
-    _md_back_ops3.write_sectors = _md_back3_write
-    _md_back_ops3.flush         = cast[Fn[int32, uint64]](0)
-    return register_blockdev(name, _MD_BACK_SECTORS, &_md_back_ops3, 0)
+    if idx == 3:
+        _md_zero_store(cast[Ptr[uint8]](&_md_back_store3[0]))
+        _md_back_ops3.read_sectors  = _md_back3_read
+        _md_back_ops3.write_sectors = _md_back3_write
+        _md_back_ops3.flush         = cast[Fn[int32, uint64]](0)
+        return register_blockdev(name, _MD_BACK_SECTORS, &_md_back_ops3, 0)
+    if idx == 4:
+        _md_zero_store(cast[Ptr[uint8]](&_md_back_store4[0]))
+        _md_back_ops4.read_sectors  = _md_back4_read
+        _md_back_ops4.write_sectors = _md_back4_write
+        _md_back_ops4.flush         = cast[Fn[int32, uint64]](0)
+        return register_blockdev(name, _MD_BACK_SECTORS, &_md_back_ops4, 0)
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store5[0]))
+    _md_back_ops5.read_sectors  = _md_back5_read
+    _md_back_ops5.write_sectors = _md_back5_write
+    _md_back_ops5.flush         = cast[Fn[int32, uint64]](0)
+    return register_blockdev(name, _MD_BACK_SECTORS, &_md_back_ops5, 0)
 
 
 def _md_buf_eq(a: Ptr[uint8], b: Ptr[uint8], n: uint64) -> int32:
@@ -1050,7 +1799,9 @@ def md_selftest() -> int32:
     b1: int32 = _md_back_register(1)
     b2: int32 = _md_back_register(2)
     b3: int32 = _md_back_register(3)
-    if b0 < 0 or b1 < 0 or b2 < 0 or b3 < 0:
+    b4: int32 = _md_back_register(4)
+    b5: int32 = _md_back_register(5)
+    if b0 < 0 or b1 < 0 or b2 < 0 or b3 < 0 or b4 < 0 or b5 < 0:
         _md_emerg0("[mdraid] FAIL: backing register\n")
         return 0
     _md_emerg2("[mdraid] backing mdback0 slot=%d mdback1 slot=%d\n",
@@ -1261,6 +2012,13 @@ def md_selftest() -> int32:
     if _md_raid5_test(b0, b1, b2, b3) != 1:
         ok = 0
 
+    # ================================================================
+    # Test 5: RAID6 — dual-parity (P XOR + Q GF(2^8)) striping, two-fault
+    # reconstruction (data+data, data+P, data+Q), RMW writes, rebuild.
+    # ================================================================
+    if _md_raid6_test(b0, b1, b2, b3, b4, b5) != 1:
+        ok = 0
+
     if ok == 1:
         _md_emerg0("[mdraid] PASS\n")
         return 1
@@ -1401,4 +2159,220 @@ def _md_raid5_test(b0: int32, b1: int32, b2: int32, b3: int32) -> int32:
 
     md_remove("md5")
     _md_emerg0("[md] raid5 PASS\n")
+    return 1
+
+
+# Extra scratch for the RAID6 self-test. Sized generously (the test reads up
+# to 16-sector spans = 8 KiB; an undersized buffer would silently overflow
+# into adjacent globals and corrupt the expected pattern — the exact bug that
+# blocked RAID5). Module-scope per the Adder large-array quirk.
+_md_t6_pat:   Array[8192, uint8]   # 16 sectors written through the array
+_md_t6_read:  Array[8192, uint8]   # readback through the array
+_md_t6_raw:   Array[4096, uint8]   # raw read of one member chunk (<=4 sectors)
+_md_t6_exp:   Array[4096, uint8]   # expected raw-Q reference
+_md_slots6:   Array[8, int32]
+
+
+def _md_r6_expect_q(nd: uint64, da: Ptr[uint8], db: Ptr[uint8], n: uint64):
+    # Compute the reference Q syndrome of a stripe whose two data chunks are
+    # `da` (data-block 0, coeff g^0=1) and `db` (data-block 1, coeff g^1=2)
+    # into _md_t6_exp, for `n` bytes. Only used to independently verify the
+    # on-disk Q chunk for the 2-data-block (N=4) stripe layout.
+    i: uint64 = 0
+    while i < n:
+        _md_t6_exp[i] = 0
+        i = i + 1
+    _md_gf_mul_into(cast[Ptr[uint8]](&_md_t6_exp[0]), da, 1, n)        # g^0.D0
+    _md_gf_mul_into(cast[Ptr[uint8]](&_md_t6_exp[0]), db, 2, n)        # g^1.D1
+
+
+def _md_raid6_test(b0: int32, b1: int32, b2: int32, b3: int32,
+                   b4: int32, b5: int32) -> int32:
+    # RAID6 over FOUR members (mdback0..3), chunk = 4 sectors. mdback4 and
+    # mdback5 are spares for rebuild. Returns 1 PASS / 0 FAIL.
+    #
+    # Geometry for N=4, nd=2 data blocks per stripe:
+    #   stripe 0: pd=3 qd=0  D0=mdback1 D1=mdback2 P=mdback3 Q=mdback0
+    #   stripe 1: pd=2 qd=3  D0=mdback0 D1=mdback1 P=mdback2 Q=mdback3
+    _md_emerg0("[mdraid] raid6: begin\n")
+    _md_gf_init()
+    # Self-check the GF field: g^0=1, g^1=2, 3*7 in GF(2^8) = 9 (classic),
+    # and a . a^{-1} = 1 — proves the tables are real, not stubbed.
+    if _md_gf_mul(1, 5) != 5 or _md_gf_mul(2, 2) != 4 \
+            or _md_gf_mul(3, 7) != 9:
+        _md_emerg0("[mdraid] FAIL: raid6 GF mul table wrong\n")
+        return 0
+    gv: uint64 = 0x53
+    if _md_gf_mul(gv, _md_gf_inv(gv)) != 1:
+        _md_emerg0("[mdraid] FAIL: raid6 GF inverse wrong\n")
+        return 0
+    _md_emerg0("[md] PASS raid6-gf\n")
+
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store0[0]))
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store1[0]))
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store2[0]))
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store3[0]))
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store4[0]))
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store5[0]))
+
+    _md_slots6[0] = b0
+    _md_slots6[1] = b1
+    _md_slots6[2] = b2
+    _md_slots6[3] = b3
+    r6: int32 = md_create_raid6("md6", &_md_slots6[0], 4, 4)
+    if r6 < 0:
+        _md_emerg1("[mdraid] FAIL: md_create_raid6 rc=%d\n",
+                   cast[uint64](cast[int64](r6)))
+        return 0
+    # Capacity = (N-2) * per_member = 2 * floor(256/4)*4 = 2 * 256 = 512.
+    r6cap: uint64 = blk_capacity_sectors(r6)
+    _md_emerg1("[mdraid] raid6 capacity=%d sectors\n", r6cap)
+    if r6cap != 512:
+        _md_emerg0("[mdraid] FAIL: raid6 capacity wrong (want 512)\n")
+        return 0
+
+    # ---- Write a known 16-sector pattern at vLBA 0 (spans 4 data chunks =
+    # 2 stripes) and read it back through the healthy array. ----
+    _md_fill(&_md_t6_pat[0], 16 * SECTOR_SIZE, 919)
+    if blk_write_sectors(r6, 0, 16, &_md_t6_pat[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raid6 write 16s\n")
+        return 0
+    if blk_read_sectors(r6, 0, 16, &_md_t6_read[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raid6 readback 16s\n")
+        return 0
+    if _md_buf_eq(&_md_t6_pat[0], &_md_t6_read[0], 16 * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdraid] FAIL: raid6 rw mismatch\n")
+        return 0
+    _md_emerg0("[md] PASS raid6-rw\n")
+
+    # ---- Verify the Q syndrome on disk is the REAL GF computation. For
+    # stripe 0: D0=mdback1, D1=mdback2, Q=mdback0. Q must equal
+    # g^0.D0 XOR g^1.D1. ----
+    if blk_read_sectors(b1, 0, 4, &_md_t6_raw[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raid6 raw read D0\n")
+        return 0
+    if blk_read_sectors(b2, 0, 4, &_md_t6_read[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raid6 raw read D1\n")
+        return 0
+    _md_r6_expect_q(2, &_md_t6_raw[0], &_md_t6_read[0], 4 * SECTOR_SIZE)
+    if blk_read_sectors(b0, 0, 4, &_md_t6_read[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raid6 raw read Q\n")
+        return 0
+    if _md_buf_eq(&_md_t6_exp[0], &_md_t6_read[0], 4 * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdraid] FAIL: raid6 Q != g^0.D0 ^ g^1.D1\n")
+        return 0
+    _md_emerg0("[mdraid] raid6: Q syndrome = g^0.D0 ^ g^1.D1 OK\n")
+    # And P (mdback3 for stripe0) must equal D0 XOR D1.
+    if blk_read_sectors(b1, 0, 4, &_md_t6_raw[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raid6 raw read D0 (P chk)\n")
+        return 0
+    if blk_read_sectors(b2, 0, 4, &_md_t6_read[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raid6 raw read D1 (P chk)\n")
+        return 0
+    _md_xor_into(&_md_t6_raw[0], &_md_t6_read[0], 4 * SECTOR_SIZE)
+    if blk_read_sectors(b3, 0, 4, &_md_t6_read[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raid6 raw read P\n")
+        return 0
+    if _md_buf_eq(&_md_t6_raw[0], &_md_t6_read[0], 4 * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdraid] FAIL: raid6 P != D0 ^ D1\n")
+        return 0
+    _md_emerg0("[mdraid] raid6: P parity = D0 ^ D1 OK\n")
+
+    # ---- SINGLE data fault: fail mdback1 (a data member), wipe it, read the
+    # whole 16s back. Reconstructs via P. ----
+    if md_fail_member("md6", 1) != 0:
+        _md_emerg0("[mdraid] FAIL: raid6 fail member1\n")
+        return 0
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store1[0]))
+    if blk_read_sectors(r6, 0, 16, &_md_t6_read[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raid6 single-fault read\n")
+        return 0
+    if _md_buf_eq(&_md_t6_pat[0], &_md_t6_read[0], 16 * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdraid] FAIL: raid6 single-fault read mismatch\n")
+        return 0
+    _md_emerg0("[md] PASS raid6-degraded-read-1\n")
+
+    # ---- TWO DATA faults: also fail mdback2 (the other data member in
+    # stripe0; in stripe1 mdback1 and mdback2 are D1 and P respectively, so
+    # this exercises BOTH the two-data solve AND a data+P solve). Wipe both
+    # and read all 16s back via the GF two-failure reconstruction. ----
+    if md_fail_member("md6", 2) != 0:
+        _md_emerg0("[mdraid] FAIL: raid6 fail member2\n")
+        return 0
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store1[0]))
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store2[0]))
+    if blk_read_sectors(r6, 0, 16, &_md_t6_read[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raid6 two-fault read\n")
+        return 0
+    if _md_buf_eq(&_md_t6_pat[0], &_md_t6_read[0], 16 * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdraid] FAIL: raid6 two-fault read mismatch\n")
+        return 0
+    _md_emerg0("[md] PASS raid6-degraded-read-2\n")
+
+    # ---- Rebuild member1 onto spare mdback4 (member2 still Faulty: a single
+    # remaining fault, well within RAID6's two-fault tolerance). ----
+    if md_raid6_rebuild("md6", 1, b4) != 0:
+        _md_emerg0("[mdraid] FAIL: raid6 rebuild member1\n")
+        return 0
+    # Then rebuild member2 onto spare mdback5 (now zero faults). ----
+    if md_raid6_rebuild("md6", 2, b5) != 0:
+        _md_emerg0("[mdraid] FAIL: raid6 rebuild member2\n")
+        return 0
+    if blk_read_sectors(r6, 0, 16, &_md_t6_read[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raid6 post-rebuild read\n")
+        return 0
+    if _md_buf_eq(&_md_t6_pat[0], &_md_t6_read[0], 16 * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdraid] FAIL: raid6 post-rebuild mismatch\n")
+        return 0
+    # Confirm rebuilt mdback4 physically holds stripe0 D0 (mdback1's role):
+    # stripe0 D0 = vLBA 0..3 (data-block index 0). Pattern bytes 0..2047.
+    if blk_read_sectors(b4, 0, 4, &_md_t6_raw[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raid6 raw read rebuilt member1\n")
+        return 0
+    if _md_buf_eq(&_md_t6_pat[0], &_md_t6_raw[0], 4 * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdraid] FAIL: raid6 rebuilt member1 chunk wrong\n")
+        return 0
+    _md_emerg0("[md] PASS raid6-rebuild\n")
+
+    # ---- DATA + Q fault: fail a data member and the Q member of a stripe,
+    # then overwrite + read back. For stripe0, Q=mdback0, D0=mdback1(=b4 now).
+    # Fail mdback0 (Q) and mdback1's role... but membership changed after
+    # rebuild (member1 now backed by b4). Use member indices: fail member 0
+    # (Q for stripe0) and member 1 (D0 for stripe0) and verify reconstruction
+    # of D0 via P (data+Q -> rebuild via P). ----
+    if md_fail_member("md6", 0) != 0:
+        _md_emerg0("[mdraid] FAIL: raid6 fail member0 (Q)\n")
+        return 0
+    if md_fail_member("md6", 1) != 0:
+        _md_emerg0("[mdraid] FAIL: raid6 fail member1 (data)\n")
+        return 0
+    # Wipe member1's backing (b4) so a non-reconstructing read returns junk.
+    _md_zero_store(cast[Ptr[uint8]](&_md_back_store4[0]))
+    if blk_read_sectors(r6, 0, 4, &_md_t6_read[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raid6 data+Q read\n")
+        return 0
+    if _md_buf_eq(&_md_t6_pat[0], &_md_t6_read[0], 4 * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdraid] FAIL: raid6 data+Q read mismatch\n")
+        return 0
+    _md_emerg0("[md] PASS raid6-data+Q-read\n")
+
+    # ---- DEGRADED WRITE with member1 (a data member) Faulty: overwrite
+    # stripe0's D0 region (vLBA 0..3) with a new pattern. P and Q must be
+    # recomputed so the reconstructed (faulty) chunk reflects the new data.
+    # member0 (Q) is also Faulty here, exercising the "skip Q write, still
+    # maintain P" branch. Read back via reconstruction. ----
+    _md_fill(&_md_t6_pat[0], 4 * SECTOR_SIZE, 727)
+    if blk_write_sectors(r6, 0, 4, &_md_t6_pat[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raid6 degraded write\n")
+        return 0
+    if blk_read_sectors(r6, 0, 4, &_md_t6_read[0]) != 0:
+        _md_emerg0("[mdraid] FAIL: raid6 degraded write readback\n")
+        return 0
+    if _md_buf_eq(&_md_t6_pat[0], &_md_t6_read[0], 4 * SECTOR_SIZE) != 1:
+        _md_emerg0("[mdraid] FAIL: raid6 degraded write mismatch\n")
+        return 0
+    _md_emerg0("[md] PASS raid6-degraded-write\n")
+
+    md_remove("md6")
+    _md_emerg0("[md] raid6 PASS\n")
     return 1
