@@ -12400,10 +12400,10 @@ def arm64_p30_used_idx() -> uint16:
     return v
 
 
-# Issue ONE VIRTIO_BLK_T_IN read of `sector` into P30_DATA_PA (512 bytes). Polls
-# the used ring until the device completes the request. Returns 1 on a clean
-# completion with status byte == OK, else 0.
-def arm64_p30_read_sector(base: uint64, sector: uint64) -> int64:
+# Issue ONE VIRTIO_BLK_T_IN read of `sector` into the caller-chosen physical
+# buffer `dst` (must be at least 512 bytes). Polls the used ring until the device
+# completes the request. Returns 1 on a clean completion with status == OK, else 0.
+def arm64_p30_read_sector_into(base: uint64, sector: uint64, dst: uint64) -> int64:
     # Build the request header at P30_HDR_PA: type(u32) reserved(u32) sector(u64).
     ht: Ptr[uint32] = cast[Ptr[uint32]](P30_HDR_PA + cast[uint64](0))
     ht[0] = VIRTIO_BLK_T_IN
@@ -12414,7 +12414,7 @@ def arm64_p30_read_sector(base: uint64, sector: uint64) -> int64:
 
     # Pre-poison the data buffer + status byte so a stale read can't masquerade
     # as a fresh device write.
-    arm64_p30_bzero(P30_DATA_PA, SECTOR_SIZE)
+    arm64_p30_bzero(dst, SECTOR_SIZE)
     sbp: Ptr[uint8] = cast[Ptr[uint8]](P30_STATUS_PA)
     sbp[0] = cast[uint8](0xFF)
     _dsb_ish()
@@ -12424,7 +12424,7 @@ def arm64_p30_read_sector(base: uint64, sector: uint64) -> int64:
     #   desc 1: data,    512 bytes, F_NEXT | F_WRITE -> 2
     #   desc 2: status,  1 byte,    F_WRITE
     arm64_p30_set_desc(0, P30_HDR_PA, cast[uint32](16), VRING_DESC_F_NEXT, cast[uint16](1))
-    arm64_p30_set_desc(1, P30_DATA_PA, cast[uint32](SECTOR_SIZE), VRING_DESC_F_NEXT | VRING_DESC_F_WRITE, cast[uint16](2))
+    arm64_p30_set_desc(1, dst, cast[uint32](SECTOR_SIZE), VRING_DESC_F_NEXT | VRING_DESC_F_WRITE, cast[uint16](2))
     arm64_p30_set_desc(2, P30_STATUS_PA, cast[uint32](1), VRING_DESC_F_WRITE, cast[uint16](0))
     _dsb_ish()
 
@@ -12460,6 +12460,12 @@ def arm64_p30_read_sector(base: uint64, sector: uint64) -> int64:
             return 0
         spins = spins + 1
     return 0     # timed out: device never completed the request
+
+
+# Thin wrapper: read `sector` into the shared P30_DATA_PA buffer (Phase 30's
+# original single-buffer behavior; kept so Phase 30's call sites are unchanged).
+def arm64_p30_read_sector(base: uint64, sector: uint64) -> int64:
+    return arm64_p30_read_sector_into(base, sector, P30_DATA_PA)
 
 
 # Phase 30 entry point (hand-off from arm64_p29_finish on success). Find the
@@ -12541,6 +12547,14 @@ def arm64_p30_run() -> int64:
         _uart_puts(sm)
         pp: Ptr[char] = "[arm64] Phase 30 PASS: virtio-blk read sector 0 -> HAMNIXARM\n"
         _uart_puts(pp)
+        # Hand off to Phase 31 (parse a real FAT16 filesystem off the same
+        # virtio-blk device). It reuses our live, brought-up transport `base`.
+        arm64_p31_run(base)
+        # Unreachable: arm64_p31_run halts. Safety loop.
+        _msr_daifset(2)
+        while True:
+            _wfi()
+        return 0
     else:
         sm2: Ptr[char] = "[arm64] Phase 30 summary: tag="
         _uart_puts(sm2)
@@ -12557,6 +12571,363 @@ def arm64_p30_run() -> int64:
         _uart_puts(nl)
         fp4: Ptr[char] = "[arm64] Phase 30 FAIL: tag/readback mismatch\n"
         _uart_puts(fp4)
+
+    _msr_daifset(2)
+    while True:
+        _wfi()
+    return 0
+
+
+# ===========================================================================
+# PHASE 31 — parse a real FAT16 filesystem off the SAME virtio-blk device.
+# ===========================================================================
+# Phase 30 brings up the polled virtio-mmio block transport and proves a raw
+# sector read. Phase 31 builds directly on that: it reuses the live transport
+# (handed in as `base`) and the generalized read-sector primitive
+# (arm64_p30_read_sector_into) to read FILESYSTEM blocks, then parses a minimal
+# READ-ONLY FAT16 volume entirely INLINE:
+#   1. read the boot sector (LBA 0) and parse the BPB — bytes/sector,
+#      sectors/cluster, reserved sectors, #FATs, root-dir entry count,
+#      sectors/FAT — and derive the FAT, root-dir and data-region LBAs.
+#   2. scan the root directory for the 8.3 file "HELLO   TXT".
+#   3. follow its cluster chain through FAT16 (16-bit entries; >=0xFFF8 = EOC),
+#      reading each cluster's sectors and copying the file's bytes out.
+#   4. verify the file's bytes equal the known ASCII payload "HAMNIX-ARM64-FS-OK".
+# No write, no LFN, no subdirectories — minimal robust read path.
+#
+# Our scratch buffers live in fresh Normal-WB RAM at 0x4510_0000, clear of
+# Phase 30's ring/buffer region (0x4500_0000..0x4500_6000).
+# ---------------------------------------------------------------------------
+P31_SEC_PA: uint64 = 0x45100000              # 512-byte scratch sector buffer
+P31_FILE_PA: uint64 = 0x45101000             # assembled file-content buffer
+P31_FILE_CAP: int64 = 4096                   # max file bytes we assemble
+
+# Known target file (8.3, space-padded to 11 chars) + expected payload.
+P31_NAME0: uint8 = 0x48                       # 'H'
+P31_NAME1: uint8 = 0x45                       # 'E'
+P31_NAME2: uint8 = 0x4C                       # 'L'
+P31_NAME3: uint8 = 0x4C                       # 'L'
+P31_NAME4: uint8 = 0x4F                       # 'O'
+P31_NAME5: uint8 = 0x20                       # ' '
+P31_NAME6: uint8 = 0x20                       # ' '
+P31_NAME7: uint8 = 0x20                       # ' '
+P31_NAME8: uint8 = 0x54                       # 'T'
+P31_NAME9: uint8 = 0x58                       # 'X'
+P31_NAME10: uint8 = 0x54                      # 'T'
+
+# Parsed BPB fields (module-scope so the helpers can share them).
+arm64_p31_bytes_per_sec: int64 = 0
+arm64_p31_sec_per_clus: int64 = 0
+arm64_p31_reserved: int64 = 0
+arm64_p31_num_fats: int64 = 0
+arm64_p31_root_ent_cnt: int64 = 0
+arm64_p31_sec_per_fat: int64 = 0
+arm64_p31_fat_lba: int64 = 0                 # first FAT sector
+arm64_p31_root_lba: int64 = 0                # first root-dir sector
+arm64_p31_root_secs: int64 = 0              # # sectors in the root dir
+arm64_p31_data_lba: int64 = 0               # first sector of cluster 2
+
+
+# Read a little-endian u16 from byte offset `off` of buffer `pa`.
+def arm64_p31_rd16(pa: uint64, off: int64) -> int64:
+    p: Ptr[uint8] = cast[Ptr[uint8]](pa)
+    b0: int64 = cast[int64](p[off])
+    b1: int64 = cast[int64](p[off + 1])
+    return b0 | (b1 << 8)
+
+
+# Read a little-endian u32 from byte offset `off` of buffer `pa`.
+def arm64_p31_rd32(pa: uint64, off: int64) -> int64:
+    p: Ptr[uint8] = cast[Ptr[uint8]](pa)
+    b0: int64 = cast[int64](p[off])
+    b1: int64 = cast[int64](p[off + 1])
+    b2: int64 = cast[int64](p[off + 2])
+    b3: int64 = cast[int64](p[off + 3])
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+
+
+# Parse the BPB out of the boot sector already loaded at P31_SEC_PA, fill the
+# module globals + derived region LBAs. Returns 1 if the geometry looks sane.
+def arm64_p31_parse_bpb() -> int64:
+    arm64_p31_bytes_per_sec = arm64_p31_rd16(P31_SEC_PA, 11)
+    pp: Ptr[uint8] = cast[Ptr[uint8]](P31_SEC_PA)
+    arm64_p31_sec_per_clus = cast[int64](pp[13])
+    arm64_p31_reserved = arm64_p31_rd16(P31_SEC_PA, 14)
+    arm64_p31_num_fats = cast[int64](pp[16])
+    arm64_p31_root_ent_cnt = arm64_p31_rd16(P31_SEC_PA, 17)
+    arm64_p31_sec_per_fat = arm64_p31_rd16(P31_SEC_PA, 22)
+
+    # Geometry sanity: we only handle the simple FAT16 case we build the disk as.
+    if arm64_p31_bytes_per_sec != 512:
+        return 0
+    if arm64_p31_sec_per_clus < 1:
+        return 0
+    if arm64_p31_num_fats < 1:
+        return 0
+    if arm64_p31_sec_per_fat < 1:
+        return 0
+    if arm64_p31_root_ent_cnt < 1:
+        return 0
+
+    # Derived region layout (all in sectors):
+    #   FAT(s)      start at  reserved
+    #   root dir    starts at reserved + num_fats * sec_per_fat
+    #   data region starts at root_lba + root_secs (cluster 2 lives here)
+    arm64_p31_fat_lba = arm64_p31_reserved
+    arm64_p31_root_lba = arm64_p31_reserved + (arm64_p31_num_fats * arm64_p31_sec_per_fat)
+    root_bytes: int64 = arm64_p31_root_ent_cnt * 32
+    arm64_p31_root_secs = (root_bytes + (arm64_p31_bytes_per_sec - 1)) / arm64_p31_bytes_per_sec
+    arm64_p31_data_lba = arm64_p31_root_lba + arm64_p31_root_secs
+    return 1
+
+
+# Compare the 11-byte 8.3 name at byte offset `off` of buffer `pa` against the
+# known target name. Returns 1 on a full match, else 0.
+def arm64_p31_name_matches(pa: uint64, off: int64) -> int64:
+    p: Ptr[uint8] = cast[Ptr[uint8]](pa)
+    if p[off + 0] != P31_NAME0:
+        return 0
+    if p[off + 1] != P31_NAME1:
+        return 0
+    if p[off + 2] != P31_NAME2:
+        return 0
+    if p[off + 3] != P31_NAME3:
+        return 0
+    if p[off + 4] != P31_NAME4:
+        return 0
+    if p[off + 5] != P31_NAME5:
+        return 0
+    if p[off + 6] != P31_NAME6:
+        return 0
+    if p[off + 7] != P31_NAME7:
+        return 0
+    if p[off + 8] != P31_NAME8:
+        return 0
+    if p[off + 9] != P31_NAME9:
+        return 0
+    if p[off + 10] != P31_NAME10:
+        return 0
+    return 1
+
+
+# Look up the FAT16 successor of cluster `clus`: read the FAT sector holding the
+# 16-bit entry at byte offset clus*2 and return that entry. Returns -1 on a read
+# failure. Values >= 0xFFF8 mean end-of-chain.
+def arm64_p31_fat_next(base: uint64, clus: int64) -> int64:
+    fat_byte: int64 = clus * 2
+    sec_in_fat: int64 = fat_byte / arm64_p31_bytes_per_sec
+    off_in_sec: int64 = fat_byte - (sec_in_fat * arm64_p31_bytes_per_sec)
+    lba: int64 = arm64_p31_fat_lba + sec_in_fat
+    if arm64_p30_read_sector_into(base, cast[uint64](lba), P31_SEC_PA) != 1:
+        return -1
+    return arm64_p31_rd16(P31_SEC_PA, off_in_sec)
+
+
+# Copy `n` bytes from src_pa+src_off into P31_FILE_PA+dst_off. Returns new dst_off.
+def arm64_p31_copy_bytes(src_pa: uint64, src_off: int64, dst_off: int64, n: int64) -> int64:
+    s: Ptr[uint8] = cast[Ptr[uint8]](src_pa)
+    d: Ptr[uint8] = cast[Ptr[uint8]](P31_FILE_PA)
+    i: int64 = 0
+    o: int64 = dst_off
+    while i < n:
+        if o < P31_FILE_CAP:
+            d[o] = s[src_off + i]
+            o = o + 1
+        i = i + 1
+    return o
+
+
+# Phase 31 entry point: hand-off from arm64_p30_run on success, with the live
+# virtio-blk transport `base`. Parse the FAT16 volume, find HELLO.TXT, follow its
+# cluster chain, read its bytes, verify against the known payload, print verdict.
+def arm64_p31_run(base: uint64) -> int64:
+    intro: Ptr[char] = "[arm64] Phase 31: parse FAT16 filesystem off virtio-blk\n"
+    _uart_puts(intro)
+    nl: Ptr[char] = "\n"
+
+    # --- 1. read + parse the boot sector (BPB) -----------------------------
+    if arm64_p30_read_sector_into(base, cast[uint64](0), P31_SEC_PA) != 1:
+        fp: Ptr[char] = "[arm64] Phase 31 FAIL: boot-sector read did not complete\n"
+        _uart_puts(fp)
+        _msr_daifset(2)
+        while True:
+            _wfi()
+        return 0
+
+    if arm64_p31_parse_bpb() != 1:
+        fp2: Ptr[char] = "[arm64] Phase 31 FAIL: BPB geometry not a supported FAT16\n"
+        _uart_puts(fp2)
+        _msr_daifset(2)
+        while True:
+            _wfi()
+        return 0
+
+    bm: Ptr[char] = "[arm64] Phase 31: BPB bps="
+    _uart_puts(bm)
+    _uart_puthex(cast[uint64](arm64_p31_bytes_per_sec))
+    bm2: Ptr[char] = " spc="
+    _uart_puts(bm2)
+    _uart_puthex(cast[uint64](arm64_p31_sec_per_clus))
+    bm3: Ptr[char] = " rsvd="
+    _uart_puts(bm3)
+    _uart_puthex(cast[uint64](arm64_p31_reserved))
+    bm4: Ptr[char] = " nfat="
+    _uart_puts(bm4)
+    _uart_puthex(cast[uint64](arm64_p31_num_fats))
+    bm5: Ptr[char] = " spf="
+    _uart_puts(bm5)
+    _uart_puthex(cast[uint64](arm64_p31_sec_per_fat))
+    bm6: Ptr[char] = " rootent="
+    _uart_puts(bm6)
+    _uart_puthex(cast[uint64](arm64_p31_root_ent_cnt))
+    _uart_puts(nl)
+
+    rm: Ptr[char] = "[arm64] Phase 31: layout fat_lba="
+    _uart_puts(rm)
+    _uart_puthex(cast[uint64](arm64_p31_fat_lba))
+    rm2: Ptr[char] = " root_lba="
+    _uart_puts(rm2)
+    _uart_puthex(cast[uint64](arm64_p31_root_lba))
+    rm3: Ptr[char] = " data_lba="
+    _uart_puts(rm3)
+    _uart_puthex(cast[uint64](arm64_p31_data_lba))
+    _uart_puts(nl)
+
+    # --- 2. scan the root directory for HELLO.TXT --------------------------
+    first_clus: int64 = -1
+    file_size: int64 = 0
+    s: int64 = 0
+    while s < arm64_p31_root_secs:
+        lba: int64 = arm64_p31_root_lba + s
+        if arm64_p30_read_sector_into(base, cast[uint64](lba), P31_SEC_PA) != 1:
+            fp3: Ptr[char] = "[arm64] Phase 31 FAIL: root-dir sector read failed\n"
+            _uart_puts(fp3)
+            _msr_daifset(2)
+            while True:
+                _wfi()
+            return 0
+        e: int64 = 0
+        while e < arm64_p31_bytes_per_sec:
+            pp: Ptr[uint8] = cast[Ptr[uint8]](P31_SEC_PA)
+            first_byte: uint8 = pp[e]
+            # 0x00 = end of directory; 0xE5 = deleted; skip volume-label/dir.
+            if cast[uint64](first_byte) == cast[uint64](0):
+                s = arm64_p31_root_secs            # break outer loop
+                e = arm64_p31_bytes_per_sec
+            else:
+                if arm64_p31_name_matches(P31_SEC_PA, e) == 1:
+                    first_clus = arm64_p31_rd16(P31_SEC_PA, e + 26)
+                    file_size = arm64_p31_rd32(P31_SEC_PA, e + 28)
+                    s = arm64_p31_root_secs        # found it: break outer
+                    e = arm64_p31_bytes_per_sec
+                else:
+                    e = e + 32
+        s = s + 1
+
+    if first_clus < 0:
+        fp4: Ptr[char] = "[arm64] Phase 31 FAIL: HELLO.TXT not found in root dir\n"
+        _uart_puts(fp4)
+        _msr_daifset(2)
+        while True:
+            _wfi()
+        return 0
+
+    fm: Ptr[char] = "[arm64] Phase 31: found HELLO.TXT first_clus="
+    _uart_puts(fm)
+    _uart_puthex(cast[uint64](first_clus))
+    fm2: Ptr[char] = " size="
+    _uart_puts(fm2)
+    _uart_puthex(cast[uint64](file_size))
+    _uart_puts(nl)
+
+    # --- 3. follow the cluster chain, assembling file bytes ----------------
+    sec_per_clus: int64 = arm64_p31_sec_per_clus
+    clus_bytes: int64 = sec_per_clus * arm64_p31_bytes_per_sec
+    dst_off: int64 = 0
+    clus: int64 = first_clus
+    remaining: int64 = file_size
+    guard: int64 = 0                         # bound the walk (corruption guard)
+    while remaining > 0:
+        if clus < 2:
+            break
+        if clus >= 0xFFF8:
+            break
+        if guard > 4096:
+            break
+        guard = guard + 1
+        # cluster N's first sector = data_lba + (N - 2) * sec_per_clus.
+        clus_lba: int64 = arm64_p31_data_lba + ((clus - 2) * sec_per_clus)
+        sc: int64 = 0
+        while sc < sec_per_clus:
+            if remaining <= 0:
+                sc = sec_per_clus
+            else:
+                if arm64_p30_read_sector_into(base, cast[uint64](clus_lba + sc), P31_SEC_PA) != 1:
+                    fp5: Ptr[char] = "[arm64] Phase 31 FAIL: data sector read failed\n"
+                    _uart_puts(fp5)
+                    _msr_daifset(2)
+                    while True:
+                        _wfi()
+                    return 0
+                take: int64 = arm64_p31_bytes_per_sec
+                if remaining < take:
+                    take = remaining
+                dst_off = arm64_p31_copy_bytes(P31_SEC_PA, 0, dst_off, take)
+                remaining = remaining - take
+                sc = sc + 1
+        # advance to the next cluster in the chain.
+        nxt: int64 = arm64_p31_fat_next(base, clus)
+        if nxt < 0:
+            fp6: Ptr[char] = "[arm64] Phase 31 FAIL: FAT chain read failed\n"
+            _uart_puts(fp6)
+            _msr_daifset(2)
+            while True:
+                _wfi()
+            return 0
+        clus = nxt
+
+    # --- 4. verify the assembled bytes equal the known payload -------------
+    # Expected payload: "HAMNIX-ARM64-FS-OK" (18 bytes).
+    payload: Ptr[char] = "HAMNIX-ARM64-FS-OK"
+    pb: Ptr[uint8] = cast[Ptr[uint8]](payload)
+    fbuf: Ptr[uint8] = cast[Ptr[uint8]](P31_FILE_PA)
+    want_len: int64 = 0
+    while pb[want_len] != 0:
+        want_len = want_len + 1
+
+    ok: int64 = 1
+    if file_size != want_len:
+        ok = 0
+    if dst_off != want_len:
+        ok = 0
+    if ok != 0:
+        i: int64 = 0
+        while i < want_len:
+            if fbuf[i] != pb[i]:
+                ok = 0
+            i = i + 1
+
+    if ok != 0:
+        sm: Ptr[char] = "[arm64] Phase 31 summary: parsed FAT16, read HELLO.TXT ("
+        _uart_puts(sm)
+        _uart_puthex(cast[uint64](dst_off))
+        sm2: Ptr[char] = " bytes) = HAMNIX-ARM64-FS-OK\n"
+        _uart_puts(sm2)
+        pp2: Ptr[char] = "[arm64] Phase 31 PASS: FAT16 read HELLO.TXT -> HAMNIX-ARM64-FS-OK\n"
+        _uart_puts(pp2)
+    else:
+        em: Ptr[char] = "[arm64] Phase 31 summary: got_len="
+        _uart_puts(em)
+        _uart_puthex(cast[uint64](dst_off))
+        em2: Ptr[char] = " want_len="
+        _uart_puts(em2)
+        _uart_puthex(cast[uint64](want_len))
+        em3: Ptr[char] = " file_size="
+        _uart_puts(em3)
+        _uart_puthex(cast[uint64](file_size))
+        _uart_puts(nl)
+        fp7: Ptr[char] = "[arm64] Phase 31 FAIL: HELLO.TXT content mismatch\n"
+        _uart_puts(fp7)
 
     _msr_daifset(2)
     while True:
