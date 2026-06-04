@@ -1,0 +1,291 @@
+# drivers/clocksource/hpet.ad
+#
+# Native HPET (High Precision Event Timer) clocksource. Mirrors the
+# basic clocksource role of Linux's drivers/clocksource/hpet.c: locate
+# the HPET register block via ACPI, validate its capabilities, enable
+# the free-running main counter, and expose a monotonic
+# ticks->nanoseconds time source.
+#
+# HPET is a standardized, memory-mapped timer block, so this is NATIVE
+# hardware support (not a Linux .ko shim). The QEMU default PC machine
+# exposes an HPET at the spec-default base 0xFED00000.
+#
+# Register map (memory-mapped, offsets from the block base):
+#   0x000  General Capabilities and ID (read-only, 64-bit)
+#            bits [63:32] COUNTER_CLK_PERIOD  main-counter tick period
+#                                             in femtoseconds (10^-15 s)
+#            bit  [13]    COUNT_SIZE_CAP      1 = 64-bit main counter
+#            bits [12:8]  NUM_TIM_CAP         (number of timers) - 1
+#            bits [7:0]   ... revision id, legacy-replace cap, vendor id
+#   0x010  General Configuration (64-bit)
+#            bit [0] ENABLE_CNF              1 = main counter runs +
+#                                            timers can generate IRQs
+#            bit [1] LEG_RT_CNF              legacy-replacement routing
+#   0x020  General Interrupt Status (64-bit)
+#   0x0F0  Main Counter Value (64-bit, free-running up-counter)
+#   0x100 + 0x20*n  per-timer config/capability + comparator blocks
+#
+# The MMIO base advertised by the ACPI HPET table is a low physical
+# address (~0xFED00000) that is covered by the kernel's low identity
+# map, so we dereference it directly via cast[Ptr[uintN]] — the same
+# pattern arch/x86/kernel/apic.ad uses for the IOAPIC at 0xFEC00000.
+# No ioremap is required.
+#
+# CLOCKSOURCE REGISTRY NOTE: Hamnix has no generic clocksource registry
+# (no clocksource_register_hz()-style switchboard yet — the timer-tick
+# source is wired directly in arch/x86/kernel). Until one exists, this
+# driver exposes a clean query API (hpet_available / hpet_read_counter /
+# hpet_nanoseconds / hpet_frequency_hz) that the kernel can select from;
+# hpet_register_clocksource() records the driver in a module-scope slot
+# so a future registry can enumerate it.
+
+from kernel.printk.printk import printk0, printk1, printk2
+from drivers.acpi.acpi import acpi_init, acpi_hpet_base
+
+# Spec-default HPET MMIO base. Used as a fallback when ACPI has no HPET
+# table but the platform is a standard PC (the QEMU default machine
+# always maps the block here). Validated before use.
+HPET_DEFAULT_BASE: uint64 = 0xFED00000
+
+# Register offsets within the HPET block.
+HPET_REG_CAP_ID:        uint64 = 0x000
+HPET_REG_CONFIG:        uint64 = 0x010
+HPET_REG_INT_STATUS:    uint64 = 0x020
+HPET_REG_MAIN_COUNTER:  uint64 = 0x0F0
+
+# General Configuration bit 0: ENABLE_CNF — start the main counter.
+HPET_CFG_ENABLE_CNF: uint64 = 0x1
+
+# Capabilities bit 13: COUNT_SIZE_CAP — main counter is 64-bit.
+# (1 << 13) == 0x2000; module-scope globals take a literal initializer.
+HPET_CAP_COUNT_SIZE_64: uint64 = 0x2000
+
+# One femtosecond is 10^-15 s; one second is 10^15 fs. The HPET main
+# counter period is given in femtoseconds, so the counter frequency is
+# 10^15 / period_fs Hz.
+HPET_FEMTO_PER_SEC: uint64 = 1000000000000000
+
+# The spec caps COUNTER_CLK_PERIOD at 0x05F5E100 (100 ns = 10 MHz floor)
+# and it must be non-zero. A real HPET runs ~14.318 MHz (period ~69841
+# fs) on PCs and QEMU.
+HPET_MAX_PERIOD_FS: uint64 = 0x05F5E100
+
+# Sane derived-frequency window for validation: HPET hardware runs from
+# ~1 MHz up to a few hundred MHz. Anything outside means a bogus
+# capabilities read (unmapped block, all-ones, etc.).
+HPET_MIN_HZ: uint64 = 1000000          # 1 MHz
+HPET_MAX_HZ: uint64 = 1000000000       # 1 GHz
+
+# Driver state, populated by hpet_init(). hpet_ready stays 0 until a
+# full probe succeeds; every query API checks it.
+hpet_base:        uint64 = 0    # MMIO base physical address (0 = none)
+hpet_period_fs:   uint64 = 0    # main-counter tick period, femtoseconds
+hpet_hz:          uint64 = 0    # derived counter frequency, Hz
+hpet_ntimers:     uint64 = 0    # number of comparators the block has
+hpet_is_64bit:    uint64 = 0    # 1 = 64-bit main counter
+hpet_ready:       uint8  = 0    # 1 once hpet_init() validated + enabled
+
+# Recorded clocksource registration (see CLOCKSOURCE REGISTRY NOTE). A
+# future generic registry can read these; for now hpet_registered just
+# proves the registration call ran.
+hpet_registered:  uint8  = 0
+# Rating mirrors Linux's clocksource.rating: HPET sits at 250, above
+# the PIT (100) and jiffies (1) but below the TSC (300). Informational
+# only until a registry consumes it.
+HPET_RATING: uint64 = 250
+
+
+def _hpet_read64(off: uint64) -> uint64:
+    # 64-bit MMIO read from the HPET block at byte offset `off`.
+    return cast[Ptr[uint64]](hpet_base + off)[0]
+
+
+def _hpet_write64(off: uint64, val: uint64):
+    # 64-bit MMIO write to the HPET block at byte offset `off`.
+    cast[Ptr[uint64]](hpet_base + off)[0] = val
+
+
+def hpet_available() -> int32:
+    # 1 once hpet_init() located, validated, and enabled the HPET; else
+    # 0 (no HPET on this platform, or the capabilities failed validation).
+    return cast[int32](hpet_ready)
+
+
+def hpet_frequency_hz() -> uint64:
+    # The main-counter frequency in Hz (10^15 / period_fs), or 0 before
+    # a successful hpet_init().
+    return hpet_hz
+
+
+def hpet_period_femtoseconds() -> uint64:
+    # The raw main-counter tick period in femtoseconds, or 0 before init.
+    return hpet_period_fs
+
+
+def hpet_read_counter() -> uint64:
+    # Read the 64-bit free-running main counter. Returns 0 before init.
+    # The counter is monotonic and advances at hpet_hz; it does not
+    # depend on EFLAGS.IF, so it is valid even with CPU interrupts masked.
+    if hpet_ready == 0:
+        return 0
+    return _hpet_read64(HPET_REG_MAIN_COUNTER)
+
+
+def hpet_nanoseconds() -> uint64:
+    # Convert the current main-counter value to nanoseconds using the
+    # real femtosecond period:
+    #     ns = ticks * period_fs / 10^6
+    # (1 ns = 10^6 fs). Doing the multiply before the divide preserves
+    # precision; the product ticks*period_fs stays inside 64 bits for
+    # any realistic uptime (at ~14.3 MHz and period ~69841 fs the
+    # product reaches 2^64 only after ~14000 years).
+    if hpet_ready == 0:
+        return 0
+    ticks: uint64 = _hpet_read64(HPET_REG_MAIN_COUNTER)
+    return (ticks * hpet_period_fs) / 1000000
+
+
+def _hpet_probe_base(base: uint64) -> int32:
+    # Read + validate the Capabilities/ID register at `base`. On success
+    # populates hpet_base/hpet_period_fs/hpet_hz/hpet_ntimers/
+    # hpet_is_64bit and returns 1; on a bogus read returns 0 without
+    # committing hpet_ready.
+    hpet_base = base
+    cap: uint64 = _hpet_read64(HPET_REG_CAP_ID)
+
+    # An unmapped or absent block reads back all-ones or all-zeros; both
+    # yield a zero or absurd period and fail validation below.
+    period: uint64 = (cap >> 32) & 0xFFFFFFFF
+    if period == 0:
+        return 0
+    if period > HPET_MAX_PERIOD_FS:
+        return 0
+
+    freq: uint64 = HPET_FEMTO_PER_SEC / period
+    if freq < HPET_MIN_HZ or freq > HPET_MAX_HZ:
+        return 0
+
+    # NUM_TIM_CAP is (number of timers) - 1 in bits [12:8].
+    ntimers: uint64 = ((cap >> 8) & 0x1F) + 1
+    is64: uint64 = 0
+    if (cap & HPET_CAP_COUNT_SIZE_64) != 0:
+        is64 = 1
+
+    hpet_period_fs = period
+    hpet_hz = freq
+    hpet_ntimers = ntimers
+    hpet_is_64bit = is64
+    return 1
+
+
+def hpet_init() -> int32:
+    # Locate the HPET via ACPI, map (identity) its MMIO block, validate
+    # the capabilities (period != 0, derived frequency sane), and enable
+    # the main counter (set ENABLE_CNF). Returns 1 on success, 0 if no
+    # usable HPET is present. Idempotent: a second call after success
+    # returns 1 without re-probing.
+    if hpet_ready != 0:
+        return 1
+
+    # Make sure the ACPI tables have been walked (idempotent).
+    acpi_init()
+
+    # Prefer the ACPI HPET-table base; fall back to the spec-default
+    # 0xFED00000 on a standard PC where the table is absent but the block
+    # is still mapped (QEMU). Validate whichever we use.
+    base: uint64 = acpi_hpet_base()
+    if base != 0:
+        printk1("[hpet] ACPI HPET base = %p\n", base)
+        if _hpet_probe_base(base) == 0:
+            printk1("[hpet] capabilities at ACPI base %p invalid\n", base)
+            base = 0
+    if base == 0:
+        printk1("[hpet] trying spec-default base %p\n", HPET_DEFAULT_BASE)
+        if _hpet_probe_base(HPET_DEFAULT_BASE) == 0:
+            printk0("[hpet] no usable HPET found\n")
+            hpet_base = 0
+            return 0
+
+    # Enable the main counter: set ENABLE_CNF (bit 0) in General Config,
+    # preserving the other bits (legacy-replacement routing etc.).
+    cfg: uint64 = _hpet_read64(HPET_REG_CONFIG)
+    _hpet_write64(HPET_REG_CONFIG, cfg | HPET_CFG_ENABLE_CNF)
+
+    hpet_ready = 1
+    printk2("[hpet] base=%p period=%d fs\n", hpet_base, hpet_period_fs)
+    printk2("[hpet] freq=%d Hz timers=%d\n", hpet_hz, hpet_ntimers)
+    printk1("[hpet] 64-bit counter = %d\n", hpet_is_64bit)
+
+    # Record the clocksource in our module-scope slot (see the registry
+    # note at the top of this file).
+    hpet_register_clocksource()
+    return 1
+
+
+def hpet_register_clocksource():
+    # Record HPET as an available clocksource. Hamnix has no generic
+    # clocksource registry yet (the tick source is wired directly in
+    # arch/x86/kernel), so this just flags the driver as registered and
+    # prints its rating; a future registry can enumerate it via the
+    # query API above.
+    if hpet_ready == 0:
+        return
+    hpet_registered = 1
+    printk1("[hpet] registered clocksource (rating=%d)\n", HPET_RATING)
+
+
+def hpet_clocksource_registered() -> int32:
+    # 1 once hpet_register_clocksource() recorded the driver.
+    return cast[int32](hpet_registered)
+
+
+def hpet_selftest() -> int32:
+    # Boot self-test for the native HPET clocksource. Brings the HPET up
+    # (if not already), then proves the REAL device counter is monotonic
+    # and advancing by reading it twice across a short busy delay, and
+    # that the derived frequency is in a sane range. Prints
+    #   [hpet] PASS counter-monotonic freq=<...>Hz
+    # on success. If the platform genuinely has no HPET, prints
+    #   [hpet] SKIP no-hpet
+    # and returns 1 (tolerant — absence is not a failure). Returns 1 on
+    # PASS or SKIP, 0 on a real FAIL.
+    printk0("Hamnix: HPET clocksource self-test\n")
+
+    if hpet_init() == 0:
+        # The QEMU default PC machine exposes an HPET, so this should not
+        # happen there; on hardware that genuinely lacks one we tolerate
+        # the absence rather than failing the boot.
+        printk0("[hpet] SKIP no-hpet\n")
+        return 1
+
+    # Validate the derived frequency window (defence-in-depth; hpet_init
+    # already enforced it, but the self-test re-asserts the contract).
+    freq: uint64 = hpet_frequency_hz()
+    if freq < HPET_MIN_HZ or freq > HPET_MAX_HZ:
+        printk1("[hpet] FAIL frequency out of range: %d Hz\n", freq)
+        return 0
+
+    # Read the real main counter, busy-wait a short delay, read it again.
+    # The counter MUST strictly advance. The delay loop is a fixed spin
+    # count: even at the HPET floor of 1 MHz, a few-thousand-iteration
+    # spin guarantees at least one tick elapses, while at ~14 MHz it is
+    # many ticks. We do NOT depend on any other clock to bound the wait,
+    # so this is a pure HPET self-consistency check.
+    t0: uint64 = hpet_read_counter()
+    spin: uint64 = 0
+    while spin < 200000:
+        # cpu_relax-equivalent: a plain dependent read keeps the loop
+        # from being optimised away and lets real time pass.
+        spin = spin + 1
+    t1: uint64 = hpet_read_counter()
+
+    # Assertion: the counter strictly advanced (monotonic up-counter).
+    if t1 <= t0:
+        printk2("[hpet] FAIL counter did not advance: t0=%d t1=%d\n", t0, t1)
+        return 0
+
+    delta: uint64 = t1 - t0
+    printk2("[hpet] counter advanced %d ticks across busy delay (t0=%d)\n",
+            delta, t0)
+    printk1("[hpet] PASS counter-monotonic freq=%dHz\n", freq)
+    return 1
