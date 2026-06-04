@@ -1180,6 +1180,20 @@ if os.environ.get("ENABLE_KEYRING_TEST"):
 # [bpf] PASS banner. Default boots omit the marker.
 if os.environ.get("ENABLE_BPF_TEST"):
     FILES.append(("/etc/bpf-test", b"1\n"))
+
+# userfaultfd(2) demand-paging-in-userspace self-test. scripts/test_userfaultfd.sh
+# sets ENABLE_USERFAULTFD_TEST=1 to plant /etc/userfaultfd-test. init/main.ad at
+# boot:37.userfaultfd detects the marker and calls userfaultfd_selftest()
+# (linux_abi/u_userfaultfd.ad): it creates a uffd, runs the UFFDIO_API handshake,
+# mmaps an anonymous demand region and UFFDIO_REGISTERs it for missing faults,
+# simulates a fault (the do_page_fault hook claims it and enqueues a
+# UFFD_EVENT_PAGEFAULT uffd_msg, suppressing demand-zero), reads the uffd_msg,
+# UFFDIO_COPYs known bytes into the faulted page through the real mm mapping path
+# (elf_map_one_page) and reads the page back byte-exact, plus a UFFDIO_ZEROPAGE
+# page that reads back all-zero, emitting the [userfaultfd] PASS banner. Default
+# boots omit the marker.
+if os.environ.get("ENABLE_USERFAULTFD_TEST"):
+    FILES.append(("/etc/userfaultfd-test", b"1\n"))
 # NUMA mempolicy round-trip self-test. scripts/test_mempolicy.sh sets
 # ENABLE_MEMPOLICY_TEST=1 to plant /etc/mempolicy-test. init/main.ad detects
 # the marker and calls mempolicy_selftest() (linux_abi/u_mempolicy.ad): it

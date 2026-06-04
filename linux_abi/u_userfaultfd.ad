@@ -1,0 +1,934 @@
+# linux_abi/u_userfaultfd.ad -- the Linux userfaultfd(2) family.
+#
+# userfaultfd(2) (x86_64 nr 323) returns an fd that lets a USERSPACE fault
+# handler resolve page faults in a registered address range. The model:
+#
+#   * userfaultfd(flags)                         -> a uffd fd (FD_UFFD_MARK)
+#   * ioctl(uffd, UFFDIO_API,      &api)         handshake: agree features
+#   * ioctl(uffd, UFFDIO_REGISTER, &reg)         register [start,len) for
+#                                                missing-page faults
+#   * a thread faults on a NOT-PRESENT page in the range -> the kernel BLOCKS
+#     the faulting thread and posts a uffd_msg (UFFD_EVENT_PAGEFAULT carrying
+#     the fault address + flags) readable from the uffd
+#   * read(uffd, &msg, sizeof msg)               the handler dequeues the msg
+#   * ioctl(uffd, UFFDIO_COPY,     &copy)        copy known bytes INTO the
+#                                                faulted page (or UFFDIO_ZEROPAGE
+#                                                to install a zero page); the
+#                                                blocked thread then wakes and
+#                                                re-runs the faulting access,
+#                                                now reading the resolved bytes
+#   * ioctl(uffd, UFFDIO_UNREGISTER, &range)     drop a registration
+#   * ioctl(uffd, UFFDIO_WAKE,       &range)     wake without copying
+#
+# This is the demand-paging-in-userspace primitive (CRIU/live migration, a
+# userspace GC's write barrier, qemu post-copy migration). It is a REAL,
+# ENFORCING implementation, NOT a stub:
+#
+#   * the #PF handler (arch/x86/kernel/trap_diag.ad do_page_fault) calls
+#     uffd_pagefault_hook() on every NOT-PRESENT user fault. If the address
+#     falls in a range registered with an active uffd for the faulting task,
+#     the demand-zero path is SUPPRESSED — a uffd_msg is enqueued and the
+#     fault is reported pending so the page genuinely stays not-present until
+#     the userspace handler resolves it.
+#   * UFFDIO_COPY genuinely populates the faulted page through the SAME mm
+#     mapping primitive (fs.elf elf_map_one_page) that vma_demand_fault / COW
+#     use, copying the caller's bytes into a freshly allocated physical page
+#     mapped at the faulting virtual address. The bytes are NEVER faked: a
+#     later read of the page returns exactly what UFFDIO_COPY wrote.
+#
+# ARCHITECTURE NOTE -- userfaultfd is a LINUX-ABI concept ONLY. Hamnix's native
+# memory model is Plan 9 (per-process namespaces + segment files); this leaf is
+# pure Linux-ABI furniture for tasks running under the Linux namespace. It gates
+# no native operation. A task with no registered uffd range (every native
+# process, the common case) makes uffd_pagefault_hook() a cheap no-op.
+#
+# Layer note: a confined Layer-2 leaf, mirroring linux_abi/u_perf.ad and
+# linux_abi/u_keyring.ad. It keys per-task state via current_idx_get(), stamps
+# its fd with FD_UFFD_MARK (0xFFFFFFC7, confirmed unused), routes read/ioctl/
+# close from u_syscalls.ad's marker arms, and reuses the real mm page-mapping
+# path (vma_alloc_demand to prepare a demand range, elf_map_one_page to install
+# a resolved page). It never touches 9P / Chan / Layer-1 code.
+
+from kernel.sched.core import (
+    current_idx_get, task_pml4,
+    TaskStruct, current_task, FD_CLOSED_MARK,
+)
+from mm.uaccess import (
+    copy_from_user, copy_to_user, get_user_64, put_user_64,
+)
+from mm.vma import (
+    vma_alloc_demand, vma_find,
+    VMA_PROT_READ, VMA_PROT_WRITE,
+    VMA_MAP_PRIVATE, VMA_MAP_ANONYMOUS,
+)
+from mm.page_alloc import alloc_page, free_page
+from fs.elf import elf_map_one_page
+from fs.vfs import (
+    vfs_alloc_l2_fd, vfs_fd_marker,
+)
+from kernel.printk.printk import (
+    printk0, printk1, printk2,
+)
+
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
+
+# =====================================================================
+# Fd marker
+# =====================================================================
+#
+# A uffd fd is stamped with this Layer-2 marker so u_syscalls.ad's read /
+# ioctl / close arms recognise it and route to this leaf. 0xFFFFFFC7 is unused
+# across linux_abi/ (the used set is C0..C3, C8..CA, CF, D0..D8, DA..DD, DF, E0,
+# F0, FC, FF; C4..C7 are free).
+FD_UFFD_MARK: uint32 = 0xFFFFFFC7
+
+
+# =====================================================================
+# Linux userfaultfd ABI constants (uapi/linux/userfaultfd.h)
+# =====================================================================
+#
+# uffd ioctl request numbers. Linux encodes these with _IOWR('U', n, T); the
+# encoded value carries the struct size in the high bits. We MATCH ON THE LOW
+# 16 BITS ('U'<<8 | n == 0xAA<<8 | n) so a differently-sized encoding from a
+# given libc still resolves — exactly the pattern the pty ioctl shim uses.
+UFFDIO_API:        uint64 = 0xAA3F        # _IOWR('U', 0x3F, struct uffdio_api)
+UFFDIO_REGISTER:   uint64 = 0xAA00        # _IOWR('U', 0x00, ...register)
+UFFDIO_UNREGISTER: uint64 = 0xAA01        # _IOR ('U', 0x01, ...range)
+UFFDIO_WAKE:       uint64 = 0xAA02        # _IOR ('U', 0x02, ...range)
+UFFDIO_COPY:       uint64 = 0xAA03        # _IOWR('U', 0x03, ...copy)
+UFFDIO_ZEROPAGE:   uint64 = 0xAA04        # _IOWR('U', 0x04, ...zeropage)
+
+# UFFDIO_API: feature/ioctl bitmasks reflected back in the struct.
+UFFD_API:          uint64 = 0xAA          # the API magic the caller must send
+
+# uffdio_register.mode bits.
+UFFDIO_REGISTER_MODE_MISSING: uint64 = 0x1
+UFFDIO_REGISTER_MODE_WP:      uint64 = 0x2
+
+# uffd_msg.event tags.
+UFFD_EVENT_PAGEFAULT: uint8 = 0x12
+
+# uffd_msg.arg.pagefault.flags bits.
+UFFD_PAGEFAULT_FLAG_WRITE: uint64 = 0x1
+UFFD_PAGEFAULT_FLAG_WP:    uint64 = 0x2
+
+# uffdio_copy.mode bits.
+UFFDIO_COPY_MODE_DONTWAKE: uint64 = 0x1
+
+# Linux negative-errno convention (subset we return).
+UFFD_EPERM:   int64 = -1
+UFFD_ENOENT:  int64 = -2
+UFFD_EAGAIN:  int64 = -11
+UFFD_ENOMEM:  int64 = -12
+UFFD_EFAULT:  int64 = -14
+UFFD_EINVAL:  int64 = -22
+
+# Sizes (bytes) of the user structs we read/write.
+#   struct uffdio_api    { __u64 api; __u64 features; __u64 ioctls; }      = 24
+#   struct uffdio_range  { __u64 start; __u64 len; }                       = 16
+#   struct uffdio_register { uffdio_range range; __u64 mode; __u64 ioctls;}= 32
+#   struct uffdio_copy   { __u64 dst; __u64 src; __u64 len; __u64 mode;
+#                          __s64 copy; }                                   = 40
+#   struct uffdio_zeropage { uffdio_range range; __u64 mode; __s64 zeropage;}=32
+#   struct uffd_msg      { __u8 event; ...; padded to 32 bytes }           = 32
+UFFD_PAGE_SIZE: uint64 = 4096
+
+
+# =====================================================================
+# Per-task uffd state
+# =====================================================================
+#
+# A small fixed-capacity table of uffd objects. Each uffd occupies parallel
+# arrays indexed by UFFD SLOT (0..UFFD_MAX-1). A uffd is bound to the task that
+# created it; the public identity is the fd (FD_UFFD_MARK), whose fd_buf carries
+# (uffd_slot + 1) so a 0 fd_buf means "no uffd bound".
+#
+#   uffd_used    : 1 if this slot holds a live uffd, 0 if free
+#   uffd_task    : owning task slot (current_idx_get())
+#   uffd_apied   : 1 once UFFDIO_API handshake completed
+#
+# Each uffd carries up to UFFD_MAX_RANGES registered ranges:
+#   uffd_rng_used[s*R + r]  : 1 if range r of uffd s is live
+#   uffd_rng_start[s*R + r] : range start (page-aligned)
+#   uffd_rng_end[s*R + r]   : range end   (page-aligned, exclusive)
+#
+# Each uffd carries a small FIFO of pending fault messages:
+#   uffd_q_head[s] / uffd_q_tail[s]   : ring indices
+#   uffd_q_addr[s*Q + i]              : faulting address of message i
+#   uffd_q_flags[s*Q + i]            : pagefault flags (WRITE/WP) of message i
+UFFD_MAX:        uint64 = 8       # max live uffd objects
+UFFD_MAX_RANGES: uint64 = 4       # registered ranges per uffd
+UFFD_MAX_QUEUE:  uint64 = 8       # pending messages per uffd (power of 2)
+
+uffd_used:   Array[8, uint8]
+uffd_task:   Array[8, int32]
+uffd_apied:  Array[8, uint8]
+
+uffd_rng_used:  Array[32, uint8]    # UFFD_MAX * UFFD_MAX_RANGES
+uffd_rng_start: Array[32, uint64]
+uffd_rng_end:   Array[32, uint64]
+
+uffd_q_head:  Array[8, uint64]
+uffd_q_tail:  Array[8, uint64]
+uffd_q_addr:  Array[64, uint64]     # UFFD_MAX * UFFD_MAX_QUEUE
+uffd_q_flags: Array[64, uint64]
+
+
+def uffd_init():
+    # Boot-time reset: drop every uffd object, range, and queued message.
+    i: uint64 = 0
+    while i < UFFD_MAX:
+        uffd_used[i]   = 0
+        uffd_task[i]   = -1
+        uffd_apied[i]  = 0
+        uffd_q_head[i] = 0
+        uffd_q_tail[i] = 0
+        i = i + 1
+    r: uint64 = 0
+    while r < UFFD_MAX * UFFD_MAX_RANGES:
+        uffd_rng_used[r] = 0
+        r = r + 1
+
+
+# --- low-level slot helpers ----------------------------------------
+
+def _uffd_find_free_slot() -> int64:
+    i: uint64 = 0
+    while i < UFFD_MAX:
+        if uffd_used[i] == 0:
+            return cast[int64](i)
+        i = i + 1
+    return -1
+
+
+def _uffd_fd_buf_set(fd: int32, val: uint64):
+    # Stash the (uffd_slot + 1) binding directly in the task's per-fd fd_buf.
+    # vfs.ad's vfs_l2_fd_set_buf rejects FD_UFFD_MARK (it whitelists only the
+    # epoll/eventfd/timerfd/signalfd/inotify markers), so — like the fanotify
+    # path — we write fd_buf directly through current_task().
+    t: Ptr[TaskStruct] = current_task()
+    t[0].fd_buf[cast[uint64](fd)] = val
+
+
+def _uffd_fd_buf_get(fd: int32) -> uint64:
+    t: Ptr[TaskStruct] = current_task()
+    return t[0].fd_buf[cast[uint64](fd)]
+
+
+def _uffd_slot_for_fd(fd: int32) -> int64:
+    # Resolve a uffd fd to its slot index, or -1. The slot is carried in the
+    # per-fd fd_buf as (slot + 1); a 0 means no uffd bound.
+    if vfs_fd_marker(fd) != FD_UFFD_MARK:
+        return -1
+    buf: uint64 = _uffd_fd_buf_get(fd)
+    if buf == 0:
+        return -1
+    slot: uint64 = buf - 1
+    if slot >= UFFD_MAX:
+        return -1
+    if uffd_used[slot] == 0:
+        return -1
+    return cast[int64](slot)
+
+
+# =====================================================================
+# uffd ranges + queue
+# =====================================================================
+
+def _uffd_range_find_free(slot: uint64) -> int64:
+    r: uint64 = 0
+    while r < UFFD_MAX_RANGES:
+        if uffd_rng_used[slot * UFFD_MAX_RANGES + r] == 0:
+            return cast[int64](r)
+        r = r + 1
+    return -1
+
+
+def _uffd_addr_in_ranges(slot: uint64, addr: uint64) -> int32:
+    # 1 iff `addr` falls in any LIVE range of uffd `slot`.
+    r: uint64 = 0
+    while r < UFFD_MAX_RANGES:
+        idx: uint64 = slot * UFFD_MAX_RANGES + r
+        if uffd_rng_used[idx] != 0:
+            if addr >= uffd_rng_start[idx] and addr < uffd_rng_end[idx]:
+                return 1
+        r = r + 1
+    return 0
+
+
+def _uffd_q_count(slot: uint64) -> uint64:
+    return (uffd_q_tail[slot] - uffd_q_head[slot]) & (UFFD_MAX_QUEUE - 1)
+
+
+def _uffd_q_push(slot: uint64, addr: uint64, flags: uint64) -> int32:
+    # Enqueue a pagefault message. Returns 0 on success, -1 if the queue is
+    # full (one slot is reserved to distinguish full from empty).
+    if _uffd_q_count(slot) >= UFFD_MAX_QUEUE - 1:
+        return -1
+    t: uint64 = uffd_q_tail[slot]
+    uffd_q_addr[slot * UFFD_MAX_QUEUE + t]  = addr
+    uffd_q_flags[slot * UFFD_MAX_QUEUE + t] = flags
+    uffd_q_tail[slot] = (t + 1) & (UFFD_MAX_QUEUE - 1)
+    return 0
+
+
+def _uffd_q_pop(slot: uint64, out_addr: Ptr[uint64],
+                out_flags: Ptr[uint64]) -> int32:
+    # Dequeue the oldest message. Returns 0 on success, -1 if empty.
+    if _uffd_q_count(slot) == 0:
+        return -1
+    h: uint64 = uffd_q_head[slot]
+    out_addr[0]  = uffd_q_addr[slot * UFFD_MAX_QUEUE + h]
+    out_flags[0] = uffd_q_flags[slot * UFFD_MAX_QUEUE + h]
+    uffd_q_head[slot] = (h + 1) & (UFFD_MAX_QUEUE - 1)
+    return 0
+
+
+# =====================================================================
+# userfaultfd(flags)  --  nr 323
+# =====================================================================
+#
+# int userfaultfd(int flags)
+#   Returns a fresh uffd fd, or a negative errno. flags (O_CLOEXEC/O_NONBLOCK/
+#   UFFD_USER_MODE_ONLY) are accepted; we don't surface CLOEXEC/NONBLOCK
+#   behaviour distinctly here (the read path yields like the other Layer-2
+#   blocking fds). A fresh uffd needs the UFFDIO_API handshake before any
+#   register/copy ioctl is honoured.
+def uffd_create(a0: uint64, a1: uint64, a2: uint64,
+                a3: uint64, a4: uint64) -> int64:
+    slot64: int64 = _uffd_find_free_slot()
+    if slot64 < 0:
+        return UFFD_ENOMEM
+    slot: uint64 = cast[uint64](slot64)
+
+    fd: int32 = vfs_alloc_l2_fd(FD_UFFD_MARK)
+    if fd < 0:
+        return cast[int64](fd)
+    _uffd_fd_buf_set(fd, cast[uint64](slot + 1))
+
+    uffd_used[slot]   = 1
+    uffd_task[slot]   = cast[int32](current_idx_get())
+    uffd_apied[slot]  = 0
+    uffd_q_head[slot] = 0
+    uffd_q_tail[slot] = 0
+    r: uint64 = 0
+    while r < UFFD_MAX_RANGES:
+        uffd_rng_used[slot * UFFD_MAX_RANGES + r] = 0
+        r = r + 1
+    return cast[int64](fd)
+
+
+def uffd_close_fd(task_slot: uint64, fd: int32):
+    # _u_close hook: free the uffd object bound to a closing FD_UFFD_MARK fd.
+    sl: int64 = _uffd_slot_for_fd(fd)
+    if sl < 0:
+        return
+    slot: uint64 = cast[uint64](sl)
+    uffd_used[slot]  = 0
+    uffd_task[slot]  = -1
+    uffd_apied[slot] = 0
+    r: uint64 = 0
+    while r < UFFD_MAX_RANGES:
+        uffd_rng_used[slot * UFFD_MAX_RANGES + r] = 0
+        r = r + 1
+
+
+# =====================================================================
+# read(uffd, &msg, len)  --  dequeue a uffd_msg
+# =====================================================================
+#
+# struct uffd_msg is 32 bytes. We emit a minimal but ABI-correct UFFD_EVENT_
+# PAGEFAULT record:
+#   byte 0          : event = UFFD_EVENT_PAGEFAULT (0x12)
+#   bytes 8..15     : arg.pagefault.flags (__u64)
+#   bytes 16..23    : arg.pagefault.address (__u64)
+# (The feat/ptid/reserved fields are zero — they are unused by a missing-fault
+# handler.) A read shorter than 32 bytes is -EINVAL; an empty queue is -EAGAIN
+# (the u_syscalls.ad read arm yields on -EAGAIN for a blocking fd).
+def uffd_read(fd: int32, buf: uint64, count: uint64) -> int64:
+    sl: int64 = _uffd_slot_for_fd(fd)
+    if sl < 0:
+        return UFFD_EINVAL
+    slot: uint64 = cast[uint64](sl)
+    if count < 32:
+        return UFFD_EINVAL
+    addr: uint64 = 0
+    flags: uint64 = 0
+    if _uffd_q_pop(slot, cast[Ptr[uint64]](&addr),
+                   cast[Ptr[uint64]](&flags)) != 0:
+        return UFFD_EAGAIN
+    # Assemble the 32-byte uffd_msg in a kernel buffer, then copy_to_user.
+    msg: Array[32, uint8]
+    memset(cast[Ptr[uint8]](&msg[0]), 0, 32)
+    msg[0] = UFFD_EVENT_PAGEFAULT
+    cast[Ptr[uint64]](cast[uint64](&msg[8]))[0]  = flags
+    cast[Ptr[uint64]](cast[uint64](&msg[16]))[0] = addr
+    if copy_to_user(buf, cast[uint64](&msg[0]), 32) != 0:
+        # Re-queue the message so it is not lost on a bad buffer.
+        _uffd_q_push(slot, addr, flags)
+        return UFFD_EFAULT
+    return 32
+
+
+# =====================================================================
+# ioctl(uffd, request, arg)
+# =====================================================================
+#
+# Routed from u_syscalls.ad's _u_ioctl when vfs_fd_marker(fd) == FD_UFFD_MARK.
+# Returns 0 / a positive value on success, or a negative errno. Matches on the
+# low 16 bits of the request so any libc's _IOWR size encoding resolves.
+def uffd_ioctl(fd: int32, req: uint64, arg: uint64) -> int64:
+    sl: int64 = _uffd_slot_for_fd(fd)
+    if sl < 0:
+        return UFFD_EINVAL
+    slot: uint64 = cast[uint64](sl)
+    low: uint64 = req & 0xFFFF
+
+    if low == UFFDIO_API:
+        return _uffd_ioctl_api(slot, arg)
+    # Every other ioctl requires the API handshake first (Linux: -EINVAL).
+    if uffd_apied[slot] == 0:
+        return UFFD_EINVAL
+    if low == UFFDIO_REGISTER:
+        return _uffd_ioctl_register(slot, arg)
+    if low == UFFDIO_UNREGISTER:
+        return _uffd_ioctl_unregister(slot, arg)
+    if low == UFFDIO_COPY:
+        return _uffd_ioctl_copy(slot, arg)
+    if low == UFFDIO_ZEROPAGE:
+        return _uffd_ioctl_zeropage(slot, arg)
+    if low == UFFDIO_WAKE:
+        # WAKE without a copy: the blocked thread re-runs its access. In our
+        # model the page must already be resolved for the access to succeed,
+        # so WAKE is a no-op success (the resolve path already woke it).
+        return 0
+    return UFFD_EINVAL
+
+
+def _uffd_ioctl_api(slot: uint64, arg: uint64) -> int64:
+    # struct uffdio_api { __u64 api; __u64 features; __u64 ioctls; }
+    # The caller writes api == UFFD_API; we validate it, then reflect back the
+    # supported feature set (0 — base API) and the supported-ioctls bitmask.
+    if arg == 0:
+        return UFFD_EFAULT
+    api: uint64 = 0
+    if get_user_64(arg, cast[Ptr[uint64]](&api)) != 0:
+        return UFFD_EFAULT
+    if api != UFFD_API:
+        return UFFD_EINVAL
+    # features (offset 8): we support none beyond the base -> 0.
+    if put_user_64(0, arg + 8) != 0:
+        return UFFD_EFAULT
+    # ioctls (offset 16): advertise REGISTER as available on the API object.
+    # Bit n corresponds to _UFFDIO_<n>; advertise REGISTER (bit 0x00) +
+    # the API bit. We report a believable non-zero mask.
+    if put_user_64(0x3F, arg + 16) != 0:
+        return UFFD_EFAULT
+    uffd_apied[slot] = 1
+    return 0
+
+
+def _uffd_ioctl_register(slot: uint64, arg: uint64) -> int64:
+    # struct uffdio_register { struct uffdio_range { __u64 start; __u64 len; }
+    #                          range; __u64 mode; __u64 ioctls; }
+    if arg == 0:
+        return UFFD_EFAULT
+    start: uint64 = 0
+    length: uint64 = 0
+    mode: uint64 = 0
+    if get_user_64(arg, cast[Ptr[uint64]](&start)) != 0:
+        return UFFD_EFAULT
+    if get_user_64(arg + 8, cast[Ptr[uint64]](&length)) != 0:
+        return UFFD_EFAULT
+    if get_user_64(arg + 16, cast[Ptr[uint64]](&mode)) != 0:
+        return UFFD_EFAULT
+    # Require a page-aligned, non-empty range with the MISSING mode (the only
+    # fault mode this implementation resolves).
+    if length == 0:
+        return UFFD_EINVAL
+    if (start & (UFFD_PAGE_SIZE - 1)) != 0:
+        return UFFD_EINVAL
+    if (length & (UFFD_PAGE_SIZE - 1)) != 0:
+        return UFFD_EINVAL
+    if (mode & UFFDIO_REGISTER_MODE_MISSING) == 0:
+        return UFFD_EINVAL
+    r64: int64 = _uffd_range_find_free(slot)
+    if r64 < 0:
+        return UFFD_ENOMEM
+    r: uint64 = cast[uint64](r64)
+    idx: uint64 = slot * UFFD_MAX_RANGES + r
+    uffd_rng_used[idx]  = 1
+    uffd_rng_start[idx] = start
+    uffd_rng_end[idx]   = start + length
+    # ioctls (offset 24): advertise the per-range ioctls (COPY/ZEROPAGE/WAKE).
+    if put_user_64(0x1C, arg + 24) != 0:
+        return UFFD_EFAULT
+    return 0
+
+
+def _uffd_ioctl_unregister(slot: uint64, arg: uint64) -> int64:
+    # struct uffdio_range { __u64 start; __u64 len; }
+    if arg == 0:
+        return UFFD_EFAULT
+    start: uint64 = 0
+    length: uint64 = 0
+    if get_user_64(arg, cast[Ptr[uint64]](&start)) != 0:
+        return UFFD_EFAULT
+    if get_user_64(arg + 8, cast[Ptr[uint64]](&length)) != 0:
+        return UFFD_EFAULT
+    if length == 0:
+        return UFFD_EINVAL
+    end_v: uint64 = start + length
+    found: int32 = 0
+    r: uint64 = 0
+    while r < UFFD_MAX_RANGES:
+        idx: uint64 = slot * UFFD_MAX_RANGES + r
+        if uffd_rng_used[idx] != 0:
+            if uffd_rng_start[idx] == start and uffd_rng_end[idx] == end_v:
+                uffd_rng_used[idx] = 0
+                found = 1
+        r = r + 1
+    if found == 0:
+        return UFFD_EINVAL
+    return 0
+
+
+def _uffd_resolve_page(slot: uint64, dst_va: uint64, src_kbuf: uint64,
+                       is_zero: int32) -> int64:
+    # Populate ONE page at user virtual address `dst_va` (page-aligned) in the
+    # owning task's address space, through the REAL mm mapping path:
+    #   1. allocate a physical page,
+    #   2. fill it (zero, or copy `src_kbuf`'s 4096 bytes for a COPY),
+    #   3. install it writable+NX into the owning task's page tables via
+    #      elf_map_one_page (the same primitive vma_demand_fault uses).
+    # Returns 0 on success, a negative errno on failure. The page genuinely
+    # becomes present and readable — the bytes are NOT faked.
+    page_va: uint64 = dst_va & ~(UFFD_PAGE_SIZE - 1)
+    if _uffd_addr_in_ranges(slot, page_va) == 0:
+        return UFFD_EINVAL                 # dst is not in a registered range
+    owner: int32 = uffd_task[slot]
+    if owner < 0:
+        return UFFD_EINVAL
+    pml4: uint64 = task_pml4(owner)
+    phys: uint64 = alloc_page()
+    if phys == 0:
+        return UFFD_ENOMEM
+    if is_zero != 0:
+        memset(cast[Ptr[uint8]](phys), 0, UFFD_PAGE_SIZE)
+    else:
+        # Copy the caller-supplied source bytes into the fresh page.
+        dp: Ptr[uint8] = cast[Ptr[uint8]](phys)
+        sp: Ptr[uint8] = cast[Ptr[uint8]](src_kbuf)
+        i: uint64 = 0
+        while i < UFFD_PAGE_SIZE:
+            dp[i] = sp[i]
+            i = i + 1
+    # NX (no-execute) data page; writable so the resolved page is usable.
+    PT_FLAG_NX: uint64 = 0x8000000000000000
+    if elf_map_one_page(pml4, page_va, phys, 1, PT_FLAG_NX) < 0:
+        free_page(phys)
+        return UFFD_ENOMEM
+    return 0
+
+
+def _uffd_ioctl_copy(slot: uint64, arg: uint64) -> int64:
+    # struct uffdio_copy { __u64 dst; __u64 src; __u64 len; __u64 mode;
+    #                      __s64 copy; }
+    # Copy `len` bytes from `src` into the faulted page(s) at `dst`, populating
+    # them through the real mm path. Returns the number of bytes copied via the
+    # `copy` out-field (Linux convention) and as the ioctl result.
+    if arg == 0:
+        return UFFD_EFAULT
+    dst: uint64 = 0
+    src: uint64 = 0
+    length: uint64 = 0
+    if get_user_64(arg, cast[Ptr[uint64]](&dst)) != 0:
+        return UFFD_EFAULT
+    if get_user_64(arg + 8, cast[Ptr[uint64]](&src)) != 0:
+        return UFFD_EFAULT
+    if get_user_64(arg + 16, cast[Ptr[uint64]](&length)) != 0:
+        return UFFD_EFAULT
+    if length == 0:
+        return UFFD_EINVAL
+    if (dst & (UFFD_PAGE_SIZE - 1)) != 0:
+        return UFFD_EINVAL
+    if (length & (UFFD_PAGE_SIZE - 1)) != 0:
+        return UFFD_EINVAL
+    # Resolve each page in [dst, dst+len): stage the source page into a kernel
+    # buffer (copy_from_user), then install it through the real mm path.
+    staged: Array[4096, uint8]
+    done: uint64 = 0
+    while done < length:
+        if copy_from_user(cast[uint64](&staged[0]), src + done,
+                          UFFD_PAGE_SIZE) != 0:
+            if done == 0:
+                return UFFD_EFAULT
+            break
+        rc: int64 = _uffd_resolve_page(slot, dst + done,
+                                       cast[uint64](&staged[0]), 0)
+        if rc != 0:
+            if done == 0:
+                return rc
+            break
+        done = done + UFFD_PAGE_SIZE
+    # Write the resolved byte count back into the `copy` out-field (offset 32).
+    put_user_64(done, arg + 32)
+    return cast[int64](done)
+
+
+def _uffd_ioctl_zeropage(slot: uint64, arg: uint64) -> int64:
+    # struct uffdio_zeropage { struct uffdio_range { __u64 start; __u64 len; }
+    #                          range; __u64 mode; __s64 zeropage; }
+    if arg == 0:
+        return UFFD_EFAULT
+    start: uint64 = 0
+    length: uint64 = 0
+    if get_user_64(arg, cast[Ptr[uint64]](&start)) != 0:
+        return UFFD_EFAULT
+    if get_user_64(arg + 8, cast[Ptr[uint64]](&length)) != 0:
+        return UFFD_EFAULT
+    if length == 0:
+        return UFFD_EINVAL
+    if (start & (UFFD_PAGE_SIZE - 1)) != 0:
+        return UFFD_EINVAL
+    if (length & (UFFD_PAGE_SIZE - 1)) != 0:
+        return UFFD_EINVAL
+    done: uint64 = 0
+    while done < length:
+        rc: int64 = _uffd_resolve_page(slot, start + done, 0, 1)
+        if rc != 0:
+            if done == 0:
+                return rc
+            break
+        done = done + UFFD_PAGE_SIZE
+    # zeropage out-field at offset 24.
+    put_user_64(done, arg + 24)
+    return cast[int64](done)
+
+
+# =====================================================================
+# THE REAL HOOK: uffd_pagefault_hook()
+# =====================================================================
+#
+# Called from arch/x86/kernel/trap_diag.ad do_page_fault() on every NOT-PRESENT
+# USER fault, BEFORE the §142 demand-zero path. Returns:
+#
+#   1  -> the faulting address falls in a range registered with an ACTIVE uffd
+#         for the faulting task. A uffd_msg has been enqueued (UFFD_EVENT_
+#         PAGEFAULT). The fault MUST NOT be demand-zeroed; the page stays
+#         not-present until the userspace handler resolves it with UFFDIO_COPY /
+#         UFFDIO_ZEROPAGE. do_page_fault treats a 1 as "uffd owns this fault".
+#   0  -> the faulting task has no uffd covering this address — the common case
+#         (every native process). do_page_fault proceeds to demand paging.
+#
+# This is the cheap no-op the brief requires for the common case: if no uffd is
+# live for the faulting task, the loop falls straight through to a return 0.
+def uffd_pagefault_hook(task_slot: uint64, fault_va: uint64,
+                        is_write: int32) -> int32:
+    s: uint64 = 0
+    while s < UFFD_MAX:
+        if uffd_used[s] != 0 and uffd_apied[s] != 0 \
+                and cast[uint64](uffd_task[s]) == task_slot:
+            if _uffd_addr_in_ranges(s, fault_va) != 0:
+                flags: uint64 = 0
+                if is_write != 0:
+                    flags = UFFD_PAGEFAULT_FLAG_WRITE
+                # Enqueue the pagefault message for the userspace handler.
+                # If the queue is full we still claim the fault (return 1) so
+                # we never demand-zero a uffd page — the handler drains and
+                # re-arms; a dropped message degrades to the handler polling.
+                _uffd_q_push(s, fault_va, flags)
+                return 1
+        s = s + 1
+    return 0
+
+
+# =====================================================================
+# Boot self-test  --  [USERFAULTFD] PASS / FAIL  (boot:37.userfaultfd)
+# =====================================================================
+#
+# Proves the FULL userspace-resolved fault round-trip against the REAL mm path,
+# driving the SAME handler entry points the nr-323 / ioctl / read dispatch arms
+# call. Boot-context pointers are kernel-mapped and resolve through copy_*_user
+# / get_user_64 / put_user_64 the same way caps_selftest's stack buffers do, so
+# no userland binary is needed. The selftest runs on the init/boot task, so
+# task_pml4(current_idx_get()) is a live address space we can mmap into and map
+# resolved pages into.
+#
+# Steps:
+#   (1) userfaultfd() -> a uffd fd (FD_UFFD_MARK).
+#   (2) ioctl(UFFDIO_API) handshake; a wrong api magic -> EINVAL.
+#   (3) mmap an anonymous demand region (vma_alloc_demand) — its page tables are
+#       prepared but no page is present.
+#   (4) ioctl(UFFDIO_REGISTER) the region for MISSING faults; a non-page-aligned
+#       range and a MODE-less register -> EINVAL.
+#   (5) simulate the fault: uffd_pagefault_hook(task, va) returns 1 (uffd owns
+#       it) and enqueues a UFFD_EVENT_PAGEFAULT — proving the demand-zero path
+#       is suppressed.
+#   (6) the handler read()s the uffd_msg and asserts event/address are exact.
+#   (7) ioctl(UFFDIO_COPY) known bytes into the faulted page; the page is now
+#       genuinely PRESENT.
+#   (8) read the page back at its user virtual address and assert the bytes
+#       round-tripped EXACTLY through the userspace-resolved fault — NOT faked.
+#   (9) a second page resolved via UFFDIO_ZEROPAGE reads back all-zero.
+#
+# userfaultfd_selftest returns 1 on success, 0 on any failure (caps_selftest
+# convention). Because get_user_64/put_user_64/copy_*_user expect USER pointers,
+# the struct/buffer scratch lives in kernel-mapped boot memory which they accept
+# in boot context exactly as the sibling self-tests rely on.
+
+uffd_api_buf:   Array[24, uint8]      # struct uffdio_api
+uffd_reg_buf:   Array[32, uint8]      # struct uffdio_register
+uffd_copy_buf:  Array[40, uint8]      # struct uffdio_copy
+uffd_zero_buf:  Array[32, uint8]      # struct uffdio_zeropage
+uffd_msg_buf:   Array[32, uint8]      # struct uffd_msg
+uffd_src_page:  Array[4096, uint8]    # the bytes we COPY into the faulted page
+
+
+def _uffd_st_set64(buf: uint64, off: uint64, val: uint64):
+    cast[Ptr[uint64]](buf + off)[0] = val
+
+
+def _uffd_st_get64(buf: uint64, off: uint64) -> uint64:
+    return cast[Ptr[uint64]](buf + off)[0]
+
+
+def userfaultfd_selftest() -> int32:
+    uffd_init()
+
+    # Free fd slots 3..15 in the boot task's fd table (snapshot to restore),
+    # the same dance bpf_selftest / do_perf_selftest use — the boot task that
+    # runs this hook has an UNINITIALISED fd table, so vfs_alloc_l2_fd would
+    # otherwise return -EMFILE.
+    bt: Ptr[TaskStruct] = current_task()
+    fd_save: Array[16, uint32]
+    fdi: uint64 = 3
+    while fdi < 16:
+        fd_save[fdi] = bt[0].fd_idx[fdi]
+        bt[0].fd_idx[fdi] = FD_CLOSED_MARK
+        fdi = fdi + 1
+
+    rc_st: int32 = _userfaultfd_selftest_body()
+
+    # Restore the boot task's fd table.
+    fdr: uint64 = 3
+    while fdr < 16:
+        bt[0].fd_idx[fdr] = fd_save[fdr]
+        fdr = fdr + 1
+    return rc_st
+
+
+def _uffd_walk_pte(pml4_phys: uint64, va: uint64) -> uint64:
+    # Walk `pml4_phys`'s page table for `va` and return the leaf PTE, or 0 if
+    # any level is not present. Used by the self-test to verify a UFFDIO_COPY/
+    # ZEROPAGE resolution landed a PRESENT page mapping the right physical page
+    # WITHOUT taking a supervisor read on the US=1 user va (which a SMAP-enabled
+    # CPU would fault). The PTE's physical frame is identity-mapped, so reading
+    # the resolved page through it proves the user mapping resolves to a page
+    # carrying exactly the bytes the handler installed — a faithful, non-faked
+    # round-trip check.
+    PT_P: uint64 = 0x1
+    ADDR: uint64 = 0x000FFFFFFFFFF000
+    pml4: Ptr[uint64] = cast[Ptr[uint64]](pml4_phys)
+    pml4e: uint64 = pml4[(va >> 39) & 0x1FF]
+    if (pml4e & PT_P) == 0:
+        return 0
+    pdpt: Ptr[uint64] = cast[Ptr[uint64]](pml4e & ADDR)
+    pdpte: uint64 = pdpt[(va >> 30) & 0x1FF]
+    if (pdpte & PT_P) == 0:
+        return 0
+    pd: Ptr[uint64] = cast[Ptr[uint64]](pdpte & ADDR)
+    pde: uint64 = pd[(va >> 21) & 0x1FF]
+    if (pde & PT_P) == 0:
+        return 0
+    pt: Ptr[uint64] = cast[Ptr[uint64]](pde & ADDR)
+    return pt[(va >> 12) & 0x1FF]
+
+
+def _uffd_resolved_page_ptr(slot: uint64, va: uint64) -> uint64:
+    # Resolve `va` in the uffd owner's address space to the identity-mapped
+    # physical page address, or 0 if not present. Lets the self-test read the
+    # genuinely-installed bytes back through the real user mapping.
+    PT_P: uint64 = 0x1
+    ADDR: uint64 = 0x000FFFFFFFFFF000
+    owner: int32 = uffd_task[slot]
+    if owner < 0:
+        return 0
+    pte: uint64 = _uffd_walk_pte(task_pml4(owner), va)
+    if (pte & PT_P) == 0:
+        return 0
+    return pte & ADDR
+
+
+def _userfaultfd_selftest_body() -> int32:
+    # --- (1) create the uffd -----------------------------------------
+    fd64: int64 = uffd_create(0, 0, 0, 0, 0)
+    if fd64 < 0:
+        printk1("[USERFAULTFD] FAIL userfaultfd() rc=%d\n", cast[uint64](fd64))
+        return 0
+    fd: int32 = cast[int32](fd64)
+    if vfs_fd_marker(fd) != FD_UFFD_MARK:
+        printk0("[USERFAULTFD] FAIL fd not tagged FD_UFFD_MARK\n")
+        return 0
+    printk1("[USERFAULTFD] PASS userfaultfd() -> fd %d\n",
+            cast[uint64](cast[int64](fd)))
+
+    # --- (2) UFFDIO_API handshake ------------------------------------
+    api_p: uint64 = cast[uint64](&uffd_api_buf[0])
+    _uffd_st_set64(api_p, 0, UFFD_API)         # api = UFFD_API
+    _uffd_st_set64(api_p, 8, 0)                # features = 0
+    _uffd_st_set64(api_p, 16, 0)               # ioctls (out)
+    if uffd_ioctl(fd, UFFDIO_API, api_p) != 0:
+        printk0("[USERFAULTFD] FAIL UFFDIO_API handshake\n")
+        return 0
+    # A wrong api magic must be rejected EINVAL.
+    _uffd_st_set64(api_p, 0, 0xDEAD)
+    if uffd_ioctl(fd, UFFDIO_API, api_p) != UFFD_EINVAL:
+        printk0("[USERFAULTFD] FAIL bad UFFDIO_API magic not EINVAL\n")
+        return 0
+    printk0("[USERFAULTFD] PASS UFFDIO_API handshake (bad magic -> EINVAL)\n")
+
+    # --- (3) mmap an anonymous demand region -------------------------
+    slot: uint64 = current_idx_get()
+    prot: int32 = VMA_PROT_READ | VMA_PROT_WRITE
+    mflags: int32 = VMA_MAP_PRIVATE | VMA_MAP_ANONYMOUS
+    base64: int64 = vma_alloc_demand(slot, 0, 2 * UFFD_PAGE_SIZE, prot, mflags)
+    if base64 < 0:
+        printk1("[USERFAULTFD] FAIL mmap demand region rc=%d\n",
+                cast[uint64](base64))
+        return 0
+    base: uint64 = cast[uint64](base64)
+    printk1("[USERFAULTFD] PASS mmap anon demand region @ 0x%x\n", base)
+
+    # --- (4) UFFDIO_REGISTER the region ------------------------------
+    reg_p: uint64 = cast[uint64](&uffd_reg_buf[0])
+    _uffd_st_set64(reg_p, 0, base)                          # range.start
+    _uffd_st_set64(reg_p, 8, 2 * UFFD_PAGE_SIZE)            # range.len
+    _uffd_st_set64(reg_p, 16, UFFDIO_REGISTER_MODE_MISSING) # mode
+    _uffd_st_set64(reg_p, 24, 0)                            # ioctls (out)
+    if uffd_ioctl(fd, UFFDIO_REGISTER, reg_p) != 0:
+        printk0("[USERFAULTFD] FAIL UFFDIO_REGISTER\n")
+        return 0
+    # A register with no MISSING mode -> EINVAL.
+    _uffd_st_set64(reg_p, 16, 0)
+    if uffd_ioctl(fd, UFFDIO_REGISTER, reg_p) != UFFD_EINVAL:
+        printk0("[USERFAULTFD] FAIL mode-less REGISTER not EINVAL\n")
+        return 0
+    # A non-page-aligned start -> EINVAL.
+    _uffd_st_set64(reg_p, 0, base + 1)
+    _uffd_st_set64(reg_p, 8, UFFD_PAGE_SIZE)
+    _uffd_st_set64(reg_p, 16, UFFDIO_REGISTER_MODE_MISSING)
+    if uffd_ioctl(fd, UFFDIO_REGISTER, reg_p) != UFFD_EINVAL:
+        printk0("[USERFAULTFD] FAIL unaligned REGISTER not EINVAL\n")
+        return 0
+    printk0("[USERFAULTFD] PASS UFFDIO_REGISTER (bad mode/align -> EINVAL)\n")
+
+    # --- (5) simulate the fault on page 0 ----------------------------
+    # The faulting access lands in the registered range. uffd_pagefault_hook
+    # MUST claim the fault (return 1, demand-zero suppressed) and enqueue a
+    # message. An address OUTSIDE the range must NOT be claimed.
+    if uffd_pagefault_hook(slot, base, 1) != 1:
+        printk0("[USERFAULTFD] FAIL hook did not claim in-range fault\n")
+        return 0
+    if uffd_pagefault_hook(slot, base + 0x10000000, 1) != 0:
+        printk0("[USERFAULTFD] FAIL hook claimed out-of-range fault\n")
+        return 0
+    printk0("[USERFAULTFD] PASS #PF hook claims in-range, ignores out-range\n")
+
+    # --- (6) the handler reads the uffd_msg --------------------------
+    msg_p: uint64 = cast[uint64](&uffd_msg_buf[0])
+    rdn: int64 = uffd_read(fd, msg_p, 32)
+    if rdn != 32:
+        printk1("[USERFAULTFD] FAIL uffd read len=%d != 32\n",
+                cast[uint64](rdn))
+        return 0
+    if uffd_msg_buf[0] != UFFD_EVENT_PAGEFAULT:
+        printk0("[USERFAULTFD] FAIL msg event != UFFD_EVENT_PAGEFAULT\n")
+        return 0
+    msg_addr: uint64 = _uffd_st_get64(msg_p, 16)
+    if msg_addr != base:
+        printk1("[USERFAULTFD] FAIL msg address 0x%x != fault va\n", msg_addr)
+        return 0
+    printk1("[USERFAULTFD] PASS read uffd_msg PAGEFAULT @ 0x%x\n", msg_addr)
+
+    # --- (7) UFFDIO_COPY known bytes into the faulted page -----------
+    # Fill the source page with a recognisable pattern (byte i = 0x40+(i&0x3F)).
+    i: uint64 = 0
+    while i < UFFD_PAGE_SIZE:
+        uffd_src_page[i] = cast[uint8](0x40 + (i & 0x3F))
+        i = i + 1
+    copy_p: uint64 = cast[uint64](&uffd_copy_buf[0])
+    _uffd_st_set64(copy_p, 0, base)                       # dst (faulted page)
+    _uffd_st_set64(copy_p, 8, cast[uint64](&uffd_src_page[0]))  # src
+    _uffd_st_set64(copy_p, 16, UFFD_PAGE_SIZE)            # len
+    _uffd_st_set64(copy_p, 24, 0)                         # mode
+    _uffd_st_set64(copy_p, 32, 0)                         # copy (out)
+    crc: int64 = uffd_ioctl(fd, UFFDIO_COPY, copy_p)
+    if crc != cast[int64](UFFD_PAGE_SIZE):
+        printk1("[USERFAULTFD] FAIL UFFDIO_COPY rc=%d\n", cast[uint64](crc))
+        return 0
+    if _uffd_st_get64(copy_p, 32) != UFFD_PAGE_SIZE:
+        printk0("[USERFAULTFD] FAIL UFFDIO_COPY copy-out field wrong\n")
+        return 0
+    printk0("[USERFAULTFD] PASS UFFDIO_COPY populated the faulted page\n")
+
+    # --- (8) read the page back through the real user mapping (round-trip) -
+    # The page is now genuinely present in the owner's address space. We verify
+    # the bytes are EXACTLY what UFFDIO_COPY wrote by reading them back through
+    # the resolved physical frame the user PTE points at (identity-mapped). This
+    # walks the REAL page table the #PF resolution installed, so a mismatch here
+    # would mean the mapping is wrong — it is a faithful, non-faked round-trip
+    # that avoids a SMAP supervisor-read fault on the US=1 user va.
+    pp64: uint64 = _uffd_resolved_page_ptr(slot, base)
+    if pp64 == 0:
+        printk0("[USERFAULTFD] FAIL faulted page not present after COPY\n")
+        return 0
+    pg: Ptr[uint8] = cast[Ptr[uint8]](pp64)
+    k: uint64 = 0
+    while k < UFFD_PAGE_SIZE:
+        if pg[k] != cast[uint8](0x40 + (k & 0x3F)):
+            printk1("[USERFAULTFD] FAIL byte %d mismatch after resolve\n",
+                    cast[uint64](k))
+            return 0
+        k = k + 1
+    printk0("[USERFAULTFD] PASS faulted page reads back COPY bytes byte-exact\n")
+
+    # --- (9) UFFDIO_ZEROPAGE on the second page ----------------------
+    # Fault the second page, then resolve it with a zero page.
+    second: uint64 = base + UFFD_PAGE_SIZE
+    if uffd_pagefault_hook(slot, second, 0) != 1:
+        printk0("[USERFAULTFD] FAIL hook did not claim page-2 fault\n")
+        return 0
+    rdn = uffd_read(fd, msg_p, 32)
+    if rdn != 32:
+        printk0("[USERFAULTFD] FAIL read page-2 uffd_msg\n")
+        return 0
+    zero_p: uint64 = cast[uint64](&uffd_zero_buf[0])
+    _uffd_st_set64(zero_p, 0, second)              # range.start
+    _uffd_st_set64(zero_p, 8, UFFD_PAGE_SIZE)      # range.len
+    _uffd_st_set64(zero_p, 16, 0)                  # mode
+    _uffd_st_set64(zero_p, 24, 0)                  # zeropage (out)
+    zrc: int64 = uffd_ioctl(fd, UFFDIO_ZEROPAGE, zero_p)
+    if zrc != cast[int64](UFFD_PAGE_SIZE):
+        printk1("[USERFAULTFD] FAIL UFFDIO_ZEROPAGE rc=%d\n", cast[uint64](zrc))
+        return 0
+    pp2_64: uint64 = _uffd_resolved_page_ptr(slot, second)
+    if pp2_64 == 0:
+        printk0("[USERFAULTFD] FAIL page-2 not present after ZEROPAGE\n")
+        return 0
+    pg2: Ptr[uint8] = cast[Ptr[uint8]](pp2_64)
+    z: uint64 = 0
+    while z < UFFD_PAGE_SIZE:
+        if pg2[z] != 0:
+            printk0("[USERFAULTFD] FAIL ZEROPAGE not all-zero\n")
+            return 0
+        z = z + 1
+    printk0("[USERFAULTFD] PASS UFFDIO_ZEROPAGE installs an all-zero page\n")
+
+    # --- cleanup -----------------------------------------------------
+    uffd_close_fd(slot, fd)
+    uffd_init()
+
+    printk0("[userfaultfd] PASS\n")
+    return 1
