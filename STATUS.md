@@ -782,6 +782,13 @@ uaccess layer, and broad driver/filesystem maturity.
 | **Pseudo-terminals (PTY)** | 16 master/slave pairs entirely in the Linux-ABI shim (`linux_abi/u_pty.ad`) with cooked/raw line discipline (ICANON/ECHO/OPOST/ONLCR) + termios + winsize, wired through real syscall dispatch for tmux/screen/sshd. (`63dbd57b`) | **Done** |
 | **Interactive Linux-guest TTY/termios** | `enter linux { /bin/sh }` stdin now reaches the process. (`#164`) | **Done** |
 | **Container primitives** | `unshare`/`clone` `CLONE_NEWNS` mapped onto the Plan 9 mount namespace. (`#240`) | **Done** |
+| **fanotify** | `fanotify_init`/`fanotify_mark` in the Linux-ABI shim. (`#295`) | **Done** |
+| **POSIX capabilities** | `capget`/`capset(2)` over a real per-task capability set; `/etc/caps-test` selftest round-trips effective/permitted/inheritable masks. (`#296`) | **Done** |
+| **cgroup v2** | `/sys/fs/cgroup` pseudo-fs view (controllers, `cgroup.procs`, hierarchy). (`#297`) | **Done** |
+| **AF_NETLINK / NETLINK_ROUTE** | rtnetlink shim — socket-shaped netlink fd serving `RTM_GET*` furniture for `ip`-style tools. (`#298`) | **Done** |
+| **perf_event_open** | Software counters (`PERF_COUNT_SW_*`) with a real per-event count store, `read(2)`/`ioctl` ENABLE/DISABLE/RESET. (`#299`) | **Done** |
+| **mempolicy (NUMA)** | `set_mempolicy`/`get_mempolicy`/`mbind` backed by a real per-task `{mode,nodemask}` store + honest single-node validation; `/sys/devices/system/node/online` served through the VFS. (`#300`) | **Done** |
+| **FUSE** | `/dev/fuse` round-trip: `mount`-registered FUSE filesystem with a real in-kernel request/response queue. (`#301`) | **Done** |
 
 ### Time, events, observability
 

@@ -4,11 +4,12 @@
 
 # Hamnix
 
-**A from-scratch x86_64 OS, written in Adder — a Python-syntax systems
-language with a hand-written x86_64 compiler (no LLVM).** Hamnix is the
-OS; Adder is the language and compiler used to write it. UEFI-only;
-boots off a GPT disk image and reaches an interactive shell on real
-hardware.
+**A from-scratch x86_64 OS (with an in-progress AArch64 port), written
+in Adder — a Python-syntax systems language with a hand-written compiler
+(no LLVM).** Hamnix is the OS; Adder is the language and compiler used to
+write it. On x86_64 it is UEFI-only; boots off a GPT disk image and
+reaches an interactive shell on real hardware. The AArch64 backend and
+kernel port boot to EL0 userspace on QEMU `virt`.
 
 The novel claim is the **layered architecture**: native Plan 9-shape
 syscalls underneath, with a Linux ABI shim sitting on top so unmodified

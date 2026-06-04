@@ -222,8 +222,9 @@ STATUS.md). What remains, off the critical path and parallelisable:
   cgroups.
 - [x] seccomp-lite (#160): per-task syscall filter at the Layer-2
   dispatch boundary.
-- [ ] `seccomp-bpf` (full classic-BPF program); POSIX capabilities
-  (drop-root daemons).
+- [x] POSIX capabilities (#296): `capget`/`capset(2)` (drop-root
+  daemons).
+- [ ] `seccomp-bpf` (full classic-BPF program).
 
 ### §15 Compiler / language infra
 - [ ] `match` / `case` tokenization → implement.

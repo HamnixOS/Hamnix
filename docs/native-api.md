@@ -373,8 +373,8 @@ shape.
 | `/dev/random` | r | CSPRNG bytes. |
 | `/dev/pid` | r | ASCII decimal: calling process's pid. |
 | `/dev/eth<n>` | r/w | Raw ethernet frames for NIC `n`. Owned by `ipd`. |
-| `/dev/mouse` | r/w | Per-window mouse events; write repositions cursor. Served by `rio` (see `rio.md`). |
-| `/dev/draw/new` | r/w | Allocate a draw context; read lists open ids. Served by `rio`. |
+| `/dev/mouse` | r/w | Per-window mouse events; write repositions cursor. Served by `hamUI` (see `hamUI.md`). |
+| `/dev/draw/new` | r/w | Allocate a draw context; read lists open ids. Served by `hamUI`. |
 | `/dev/draw/<id>/{data,ctl,refresh}` | r/w | Per-context draw protocol, control, and repaint wait. Served by `rio`. |
 | `/dev/wctl` | r/w | Per-window control (resize/move/raise). Served by `rio`. |
 | `/dev/wsys` | r/w | System-wide window control; write spawns a window. Served by `rio`. |
