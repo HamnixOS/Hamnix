@@ -2267,6 +2267,20 @@ if os.environ.get("ENABLE_BRIDGE_TEST") == "1":
 if os.environ.get("ENABLE_VLAN_TEST") == "1":
     FILES.append(("/etc/vlan-test", b"1\n"))
 
+# Native GENEVE (RFC 8926) encap/decap self-test. scripts/test_geneve.sh sets
+# ENABLE_GENEVE_TEST=1 to plant /etc/geneve-test; init/main.ad's boot:37.geneve
+# gate then runs geneve_selftest() (drivers/net/geneve.ad), a pure in-memory
+# test that builds a known inner Ethernet frame plus a 2-entry GENEVE option
+# TLV block (a critical 0x0101/8-byte option + a non-critical 0x0202/4-byte
+# option), ENCAPs them to a VNI over UDP/IPv4 (Eth|IP|UDP:6081|GENEVE|opts|
+# inner), walks the option TLVs by length, then DECAPs past the variable
+# option block and asserts the inner frame + VNI + every option round-trip
+# byte-identical, verifying the dport 6081, version 0 + Opt Len, the C flag,
+# the TEB protocol type, and recomputed IPv4/UDP checksums across two VNIs.
+# Prints "[geneve] PASS" / "[geneve] FAIL". Default boots ship no marker.
+if os.environ.get("ENABLE_GENEVE_TEST") == "1":
+    FILES.append(("/etc/geneve-test", b"1\n"))
+
 # Native link aggregation (bonding) self-test. scripts/test_bond.sh sets
 # ENABLE_BOND_TEST=1 to plant /etc/bond-test; init/main.ad's boot:37.bond
 # gate then runs bond_selftest() (drivers/net/bond.ad), a pure in-memory test

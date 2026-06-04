@@ -1,0 +1,901 @@
+# drivers/net/geneve.ad
+#
+# GENEVE — Generic Network Virtualization Encapsulation (RFC 8926). Like
+# VXLAN, an L2-over-L3 overlay: a complete inner Ethernet frame is tunneled
+# inside UDP/IPv4 with the IANA destination port 6081 and an 8-byte GENEVE
+# base header carrying a 24-bit Virtual Network Identifier (VNI). Unlike
+# VXLAN, GENEVE carries a variable-length list of OPTION TLVs between the
+# base header and the inner payload — that extensibility is the whole point
+# of GENEVE, and this driver implements real TLV build/parse (option class,
+# type, length in 4-byte units, variable data), walking multiple options.
+#
+# Outer frame layout (this is what ENCAP produces and DECAP consumes):
+#
+#   +----------------------------------------------------------+
+#   | Outer Ethernet (14)  dst MAC | src MAC | ethertype=0x0800 |
+#   +----------------------------------------------------------+
+#   | Outer IPv4 (20)      proto=17 (UDP), correct len + csum   |
+#   +----------------------------------------------------------+
+#   | Outer UDP (8)        dport=6081, len, checksum            |
+#   +----------------------------------------------------------+
+#   | GENEVE base (8)      ver|optlen|O|C|rsvd|prot|VNI(24)|rsvd |
+#   +----------------------------------------------------------+
+#   | GENEVE options (opt_len * 4 bytes)  one or more TLVs       |
+#   +----------------------------------------------------------+
+#   | Inner Ethernet frame (the original L2 frame, byte-exact)  |
+#   +----------------------------------------------------------+
+#
+# The base header (RFC 8926 §3.1):
+#
+#    0                   1                   2                   3
+#    0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+#   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+#   |Ver|  Opt Len  |O|C|    Rsvd.  |          Protocol Type        |
+#   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+#   |        Virtual Network Identifier (VNI)       |    Reserved   |
+#   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+#
+#   Byte 0: Ver(2 MSb)=0 | Opt Len(6 LSb) — options length in 4-byte units.
+#   Byte 1: O bit (0x80, OAM) | C bit (0x40, critical options present) | rsvd.
+#   Bytes 2-3: Protocol Type (the ethertype of the inner frame).
+#   Bytes 4-6: VNI (24-bit, big-endian).
+#   Byte 7: reserved (must be 0).
+#
+# Each option TLV (RFC 8926 §3.2):
+#
+#    0                   1                   2                   3
+#    0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+#   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+#   |          Option Class         |      Type     |R|R|R| Length  |
+#   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+#   |                      Variable-Length Option Data ...          |
+#   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+#
+#   Bytes 0-1: Option Class (16-bit, big-endian).
+#   Byte 2:    Type (the high bit, 0x80, marks the option "critical").
+#   Byte 3:    R(3 MSb) | Length(5 LSb) — option DATA length in 4-byte units
+#              (so the whole TLV is 4 + Length*4 bytes).
+#
+# We reuse the native stack's framing primitives rather than reinvent them:
+# ip_csum16 (drivers/net/ip.ad) is the RFC-1071 ones'-complement Internet
+# checksum used for both the IPv4 header checksum and the UDP checksum (over
+# a pseudo-header). The on-wire byte offsets here match IpHdr / UdpHdr /
+# EthHdr exactly.
+
+from kernel.printk.printk import printk0, printk1, printk2, printk_set_level
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_EMERG
+from drivers.net.ip import ip_csum16, IP_HDR_LEN, IPPROTO_UDP, IP_TTL
+from drivers.net.eth import ETH_HDR_LEN, ETH_P_IP
+from drivers.net.udp import UDP_HDR_LEN
+
+
+# --- Wire constants ----------------------------------------------------
+
+# IANA-assigned GENEVE UDP destination port (RFC 8926 §3.3 — port 6081).
+GENEVE_UDP_PORT: uint16 = 6081
+
+# GENEVE base header length (8 bytes); the position of the options that
+# follow it, and then the inner frame.
+GENEVE_BASE_LEN: uint64 = 8
+
+# Base-header version: 2-bit Ver field, current version is 0. It occupies
+# the two most-significant bits of byte 0.
+GENEVE_VER: uint8 = 0
+
+# Flag bits in base-header byte 1.
+GENEVE_FLAG_O: uint8 = 0x80     # OAM frame
+GENEVE_FLAG_C: uint8 = 0x40     # Critical options present
+
+# Combined outer-overhead BEFORE the GENEVE options begin:
+# eth(14) + ip(20) + udp(8) + geneve-base(8) = 50.
+GENEVE_OUTER_OVERHEAD: uint64 = 50
+
+# Inner frame's protocol type for a tunneled Ethernet frame. RFC 8926 uses
+# the "Transparent Ethernet Bridging" ethertype 0x6558 for full L2 frames
+# (matching GRE/NVGRE), distinct from ETH_P_IP.
+GENEVE_PROTO_TEB: uint16 = 0x6558
+
+
+# --- GENEVE base header (8 bytes on the wire) --------------------------
+class GeneveHdr:
+    ver_optlen: uint8       # 0: Ver(2) | Opt Len(6, in 4-byte units)
+    flags:      uint8       # 1: O(0x80) | C(0x40) | rsvd
+    proto_hi:   uint8       # 2: Protocol Type high byte
+    proto_lo:   uint8       # 3: Protocol Type low byte
+    vni_hi:     uint8       # 4: VNI bits 23..16
+    vni_mid:    uint8       # 5: VNI bits 15..8
+    vni_lo:     uint8       # 6: VNI bits 7..0
+    rsvd:       uint8       # 7: reserved
+
+
+# Counters (mirror the /sys-visible accounting a real geneve netdev keeps).
+geneve_tx_encaps: uint64 = 0
+geneve_rx_decaps: uint64 = 0
+geneve_rx_drops:  uint64 = 0
+
+
+# =====================================================================
+# Little big-endian field writers / readers
+# =====================================================================
+
+def _gnv_put16(buf: Ptr[uint8], off: uint64, v: uint16):
+    buf[off]     = cast[uint8]((cast[uint32](v) >> 8) & 0xFF)
+    buf[off + 1] = cast[uint8](cast[uint32](v) & 0xFF)
+
+
+def _gnv_get16(buf: Ptr[uint8], off: uint64) -> uint16:
+    hi: uint16 = cast[uint16](buf[off]) << 8
+    lo: uint16 = cast[uint16](buf[off + 1])
+    return hi | lo
+
+
+def _gnv_put32(buf: Ptr[uint8], off: uint64, v: uint32):
+    buf[off]     = cast[uint8]((v >> 24) & 0xFF)
+    buf[off + 1] = cast[uint8]((v >> 16) & 0xFF)
+    buf[off + 2] = cast[uint8]((v >> 8) & 0xFF)
+    buf[off + 3] = cast[uint8](v & 0xFF)
+
+
+def _gnv_get32(buf: Ptr[uint8], off: uint64) -> uint32:
+    r: uint32 = cast[uint32](buf[off]) << 24
+    r = r | (cast[uint32](buf[off + 1]) << 16)
+    r = r | (cast[uint32](buf[off + 2]) << 8)
+    r = r | cast[uint32](buf[off + 3])
+    return r
+
+
+# =====================================================================
+# GENEVE option TLV build / parse
+# =====================================================================
+#
+# This is the distinguishing feature of GENEVE versus VXLAN. Options live
+# in the (opt_len * 4) bytes between the 8-byte base header and the inner
+# frame. Each option is 4 header bytes + (data_words * 4) data bytes, so
+# every option (and the whole option block) is a whole number of 4-byte
+# words — which is exactly why opt_len / option Length are expressed in
+# 4-byte units.
+
+def geneve_init():
+    # Reset counters. Idempotent.
+    geneve_tx_encaps = 0
+    geneve_rx_decaps = 0
+    geneve_rx_drops  = 0
+
+
+def geneve_opt_build(buf: Ptr[uint8], off: uint64,
+                     opt_class: uint16, opt_type: uint8,
+                     data: Ptr[uint8], data_len: uint64,
+                     critical: int32) -> int64:
+    # Write one option TLV at buf[off]. `data_len` is the option DATA length
+    # in BYTES and MUST be a multiple of 4 (GENEVE options are 4-byte
+    # aligned). Returns the total number of bytes the TLV occupies
+    # (4 + data_len), or -1 on a misaligned/oversized length.
+    if (data_len & 0x3) != 0:
+        return -1
+    data_words: uint64 = data_len >> 2
+    if data_words > 31:                      # 5-bit Length field
+        return -1
+    type_byte: uint8 = opt_type
+    if critical != 0:
+        type_byte = type_byte | 0x80         # critical-option bit
+    _gnv_put16(buf, off, opt_class)          # 0-1: option class
+    buf[off + 2] = type_byte                 # 2: type (+ critical bit)
+    buf[off + 3] = cast[uint8](data_words & 0x1F)   # 3: R|R|R|Length(5)
+    i: uint64 = 0
+    while i < data_len:
+        buf[off + 4 + i] = data[i]
+        i = i + 1
+    return cast[int64](4 + data_len)
+
+
+def geneve_opt_class(buf: Ptr[uint8], off: uint64) -> uint16:
+    return _gnv_get16(buf, off)
+
+
+def geneve_opt_type(buf: Ptr[uint8], off: uint64) -> uint8:
+    return buf[off + 2]
+
+
+def geneve_opt_is_critical(buf: Ptr[uint8], off: uint64) -> int32:
+    if (buf[off + 2] & 0x80) != 0:
+        return 1
+    return 0
+
+
+def geneve_opt_data_len(buf: Ptr[uint8], off: uint64) -> uint64:
+    # Option DATA length in BYTES (Length field is in 4-byte words).
+    return cast[uint64](buf[off + 3] & 0x1F) << 2
+
+
+def geneve_opt_total_len(buf: Ptr[uint8], off: uint64) -> uint64:
+    # Whole TLV length in bytes: 4-byte option header + data.
+    return 4 + geneve_opt_data_len(buf, off)
+
+
+# =====================================================================
+# UDP checksum over the IPv4 pseudo-header (RFC 768 / RFC 1071)
+# =====================================================================
+
+GENEVE_PSEUDO_BYTES: uint64 = 12
+_gnv_pseudo: Array[12, uint8]
+
+
+def _gnv_csum_accum(buf: Ptr[uint8], length: uint64, seed: uint32) -> uint32:
+    # Accumulate the RFC-1071 16-bit-word sum of `buf` into `seed`
+    # (NOT yet folded / complemented). Mirrors ip_csum16's word loop.
+    sum32: uint32 = seed
+    i: uint64 = 0
+    end_pairs: uint64 = length & ~cast[uint64](1)
+    while i < end_pairs:
+        word: uint32 = (cast[uint32](buf[i]) << 8) | cast[uint32](buf[i + 1])
+        sum32 = sum32 + word
+        i = i + 2
+    if i < length:
+        sum32 = sum32 + (cast[uint32](buf[i]) << 8)
+    return sum32
+
+
+def geneve_udp_checksum(src_ip: uint32, dst_ip: uint32,
+                        udp_seg: Ptr[uint8], udp_len: uint64) -> uint16:
+    # Compute the IPv4 UDP checksum over [pseudo-header | UDP segment].
+    # udp_seg points at the UDP header (its length field must already be
+    # set); udp_len is the UDP header+payload length. The checksum field
+    # inside udp_seg (offset 6..7) must be zero on entry.
+    _gnv_pseudo[0] = cast[uint8]((src_ip >> 24) & 0xFF)
+    _gnv_pseudo[1] = cast[uint8]((src_ip >> 16) & 0xFF)
+    _gnv_pseudo[2] = cast[uint8]((src_ip >> 8) & 0xFF)
+    _gnv_pseudo[3] = cast[uint8](src_ip & 0xFF)
+    _gnv_pseudo[4] = cast[uint8]((dst_ip >> 24) & 0xFF)
+    _gnv_pseudo[5] = cast[uint8]((dst_ip >> 16) & 0xFF)
+    _gnv_pseudo[6] = cast[uint8]((dst_ip >> 8) & 0xFF)
+    _gnv_pseudo[7] = cast[uint8](dst_ip & 0xFF)
+    _gnv_pseudo[8] = 0
+    _gnv_pseudo[9] = IPPROTO_UDP
+    _gnv_pseudo[10] = cast[uint8]((udp_len >> 8) & 0xFF)
+    _gnv_pseudo[11] = cast[uint8](udp_len & 0xFF)
+    sum32: uint32 = _gnv_csum_accum(cast[Ptr[uint8]](&_gnv_pseudo[0]),
+                                    GENEVE_PSEUDO_BYTES, 0)
+    sum32 = _gnv_csum_accum(udp_seg, udp_len, sum32)
+    while (sum32 >> 16) != 0:
+        sum32 = (sum32 & 0xFFFF) + (sum32 >> 16)
+    csum: uint16 = cast[uint16](~sum32 & 0xFFFF)
+    if csum == 0:
+        csum = 0xFFFF
+    return csum
+
+
+# =====================================================================
+# ENCAP
+# =====================================================================
+
+def geneve_encap(inner: Ptr[uint8], inner_len: uint64, vni: uint32,
+                 src_ip: uint32, dst_ip: uint32,
+                 src_mac: Ptr[uint8], dst_mac: Ptr[uint8],
+                 opts: Ptr[uint8], opts_len: uint64,
+                 out: Ptr[uint8], out_cap: uint64) -> int64:
+    # Build the full outer GENEVE frame into `out` and return its total
+    # length, or a negative code on error (-1 buffer too small, -2 the
+    # option block is not 4-byte aligned or exceeds the 6-bit opt_len
+    # field).
+    #
+    #   out = OuterEth(14)|OuterIP(20)|OuterUDP(8)|GENEVE-base(8)|opts|inner
+    #
+    # `opts` (opts_len bytes) is the pre-built option-TLV block; it MUST be
+    # a multiple of 4 bytes and at most 252 bytes (opt_len is 6 bits =
+    # 0..63 words). Pass opts_len 0 for no options.
+    if (opts_len & 0x3) != 0:
+        return -2
+    opt_words: uint64 = opts_len >> 2
+    if opt_words > 63:
+        return -2
+
+    total: uint64 = GENEVE_OUTER_OVERHEAD + opts_len + inner_len
+    if total > out_cap:
+        return -1
+
+    # --- Outer Ethernet header (offset 0..13) ---
+    i: uint64 = 0
+    while i < 6:
+        out[i]     = dst_mac[i]      # dst MAC 0..5
+        out[6 + i] = src_mac[i]      # src MAC 6..11
+        i = i + 1
+    _gnv_put16(out, 12, ETH_P_IP)    # ethertype 0x0800
+
+    # --- Outer IPv4 header (offset 14..33) ---
+    ip_off: uint64 = ETH_HDR_LEN
+    ip_total: uint64 = IP_HDR_LEN + UDP_HDR_LEN + GENEVE_BASE_LEN \
+                       + opts_len + inner_len
+    out[ip_off + 0] = 0x45                          # version 4, IHL 5
+    out[ip_off + 1] = 0                             # DSCP/ECN
+    _gnv_put16(out, ip_off + 2, cast[uint16](ip_total))
+    _gnv_put16(out, ip_off + 4, 0)                  # id
+    _gnv_put16(out, ip_off + 6, 0)                  # flags/frag = 0
+    out[ip_off + 8] = IP_TTL                        # TTL
+    out[ip_off + 9] = IPPROTO_UDP                   # protocol 17
+    _gnv_put16(out, ip_off + 10, 0)                 # checksum (below)
+    _gnv_put32(out, ip_off + 12, src_ip)            # src IPv4
+    _gnv_put32(out, ip_off + 16, dst_ip)            # dst IPv4
+    ip_csum: uint16 = ip_csum16(cast[Ptr[uint8]](
+        cast[uint64](out) + ip_off), IP_HDR_LEN)
+    _gnv_put16(out, ip_off + 10, ip_csum)
+
+    # --- Outer UDP header (offset 34..41) ---
+    udp_off: uint64 = ip_off + IP_HDR_LEN
+    udp_len: uint64 = UDP_HDR_LEN + GENEVE_BASE_LEN + opts_len + inner_len
+    _gnv_put16(out, udp_off + 0, GENEVE_UDP_PORT)   # src port
+    _gnv_put16(out, udp_off + 2, GENEVE_UDP_PORT)   # dst port 6081
+    _gnv_put16(out, udp_off + 4, cast[uint16](udp_len))
+    _gnv_put16(out, udp_off + 6, 0)                 # checksum (below)
+
+    # --- GENEVE base header (offset 42..49) ---
+    gnv_off: uint64 = udp_off + UDP_HDR_LEN
+    vni24: uint32 = vni & 0x00FFFFFF
+    # byte 0: Ver(2 MSb) | Opt Len(6 LSb, in 4-byte words).
+    out[gnv_off + 0] = cast[uint8]((cast[uint32](GENEVE_VER) << 6)
+                                   | (opt_words & 0x3F))
+    flags_byte: uint8 = 0
+    if opts_len > 0:
+        # Mark critical-options present if any carried option is critical.
+        oi: uint64 = 0
+        while oi < opts_len:
+            if (opts[oi + 2] & 0x80) != 0:
+                flags_byte = flags_byte | GENEVE_FLAG_C
+            oi = oi + geneve_opt_total_len(opts, oi)
+    out[gnv_off + 1] = flags_byte                   # O|C|rsvd
+    _gnv_put16(out, gnv_off + 2, GENEVE_PROTO_TEB)  # inner protocol type
+    out[gnv_off + 4] = cast[uint8]((vni24 >> 16) & 0xFF)   # VNI hi
+    out[gnv_off + 5] = cast[uint8]((vni24 >> 8) & 0xFF)    # VNI mid
+    out[gnv_off + 6] = cast[uint8](vni24 & 0xFF)           # VNI lo
+    out[gnv_off + 7] = 0                                   # reserved
+
+    # --- GENEVE options (offset 50 .. 50+opts_len) ---
+    opt_off: uint64 = gnv_off + GENEVE_BASE_LEN
+    i = 0
+    while i < opts_len:
+        out[opt_off + i] = opts[i]
+        i = i + 1
+
+    # --- Inner Ethernet frame (after the options) ---
+    payload_off: uint64 = opt_off + opts_len
+    i = 0
+    while i < inner_len:
+        out[payload_off + i] = inner[i]
+        i = i + 1
+
+    # --- UDP checksum over pseudo-header + UDP segment (now complete) ---
+    udp_csum: uint16 = geneve_udp_checksum(src_ip, dst_ip,
+        cast[Ptr[uint8]](cast[uint64](out) + udp_off), udp_len)
+    _gnv_put16(out, udp_off + 6, udp_csum)
+
+    geneve_tx_encaps = geneve_tx_encaps + 1
+    return cast[int64](total)
+
+
+# =====================================================================
+# DECAP
+# =====================================================================
+
+def geneve_is_geneve(frame: Ptr[uint8], length: uint64) -> int32:
+    # Validate that `frame` is a well-formed GENEVE outer frame: long
+    # enough, IPv4 ethertype, IPv4/UDP, UDP dest port 6081, version 0, and
+    # the declared option block fits inside the frame. Returns 1 if it is
+    # GENEVE, 0 otherwise.
+    if length < GENEVE_OUTER_OVERHEAD:
+        return 0
+    if _gnv_get16(frame, 12) != ETH_P_IP:
+        return 0
+    ip_off: uint64 = ETH_HDR_LEN
+    if (frame[ip_off] & 0x0F) != 0x05:               # only fixed 20-byte IHL
+        return 0
+    if frame[ip_off + 9] != IPPROTO_UDP:
+        return 0
+    udp_off: uint64 = ip_off + IP_HDR_LEN
+    if _gnv_get16(frame, udp_off + 2) != GENEVE_UDP_PORT:
+        return 0
+    gnv_off: uint64 = udp_off + UDP_HDR_LEN
+    # Version must be 0 (top 2 bits of byte 0).
+    if ((frame[gnv_off] >> 6) & 0x3) != cast[uint8](GENEVE_VER):
+        return 0
+    # The advertised option block (opt_len words) must fit.
+    opt_words: uint64 = cast[uint64](frame[gnv_off] & 0x3F)
+    opts_len: uint64 = opt_words << 2
+    if (GENEVE_OUTER_OVERHEAD + opts_len) > length:
+        return 0
+    return 1
+
+
+def geneve_opts_len(frame: Ptr[uint8]) -> uint64:
+    # Option block length in BYTES, from the base header's Opt Len field.
+    gnv_off: uint64 = ETH_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN
+    return cast[uint64](frame[gnv_off] & 0x3F) << 2
+
+
+def geneve_decap_vni(frame: Ptr[uint8], length: uint64) -> int64:
+    # Extract the 24-bit VNI from a validated GENEVE frame. Returns the VNI
+    # (>= 0) or -1 if the frame is not GENEVE.
+    if geneve_is_geneve(frame, length) != 1:
+        return -1
+    gnv_off: uint64 = ETH_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN
+    vni: uint32 = (cast[uint32](frame[gnv_off + 4]) << 16) \
+                | (cast[uint32](frame[gnv_off + 5]) << 8) \
+                | cast[uint32](frame[gnv_off + 6])
+    return cast[int64](vni)
+
+
+def geneve_decap(frame: Ptr[uint8], length: uint64,
+                 out_inner: Ptr[uint8], out_cap: uint64,
+                 out_vni: Ptr[uint32]) -> int64:
+    # Recover the inner Ethernet frame from a GENEVE outer frame. Walks past
+    # the variable-length option block, copies the inner frame byte-for-byte
+    # into out_inner, writes the VNI into *out_vni (if non-NULL), and returns
+    # the inner frame length, or a negative code (-1 not GENEVE, -2 inner
+    # buffer too small).
+    if geneve_is_geneve(frame, length) != 1:
+        geneve_rx_drops = geneve_rx_drops + 1
+        return -1
+    opts_len: uint64 = geneve_opts_len(frame)
+    inner_off: uint64 = GENEVE_OUTER_OVERHEAD + opts_len
+    inner_len: uint64 = length - inner_off
+    if inner_len > out_cap:
+        return -2
+    if out_vni != cast[Ptr[uint32]](0):
+        gnv_off: uint64 = ETH_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN
+        out_vni[0] = (cast[uint32](frame[gnv_off + 4]) << 16) \
+                   | (cast[uint32](frame[gnv_off + 5]) << 8) \
+                   | cast[uint32](frame[gnv_off + 6])
+    i: uint64 = 0
+    while i < inner_len:
+        out_inner[i] = frame[inner_off + i]
+        i = i + 1
+    geneve_rx_decaps = geneve_rx_decaps + 1
+    return cast[int64](inner_len)
+
+
+# geneve_options_off — byte offset of the GENEVE option block within a
+# validated frame (the start of the first TLV), so callers can walk options.
+def geneve_options_off(frame: Ptr[uint8]) -> uint64:
+    return GENEVE_OUTER_OVERHEAD
+
+
+# =====================================================================
+# In-kernel self-test (deterministic, no NIC required)
+# =====================================================================
+#
+# Pure in-memory: build a known inner Ethernet frame, build TWO option TLVs
+# (one critical, one not, of different sizes), ENCAP -> DECAP round-trip,
+# assert the inner frame is byte-identical and the VNI + every option (class,
+# type, critical bit, data) survives. Recompute the IPv4 + UDP checksums to
+# prove they were laid down correctly. Covers two distinct VNIs.
+
+def _gnv_emerg0(s: Ptr[char]):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk0(s)
+
+
+def _gnv_emerg1(s: Ptr[char], a: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk1(s, a)
+
+
+def _gnv_emerg2(s: Ptr[char], a: uint64, b: uint64):
+    printk_set_level(PRINTK_LEVEL_EMERG)
+    printk2(s, a, b)
+
+
+# Generously-sized scratch globals. The inner frame is tiny (<128 bytes) and
+# the options are a couple dozen bytes, but the buffers are sized for a full
+# MTU + outer overhead + a full 252-byte option block so an undersized
+# Array[] can't silently overflow into adjacent globals.
+GENEVE_T_INNER_CAP: uint64 = 1600
+GENEVE_T_OUTER_CAP: uint64 = 2048
+GENEVE_T_OPTS_CAP:  uint64 = 256
+_gnvt_inner:  Array[1600, uint8]
+_gnvt_opts:   Array[256,  uint8]
+_gnvt_outer:  Array[2048, uint8]
+_gnvt_recov:  Array[1600, uint8]
+_gnvt_odata1: Array[8,    uint8]
+_gnvt_odata2: Array[4,    uint8]
+_gnvt_mac_a:  Array[6, uint8]
+_gnvt_mac_b:  Array[6, uint8]
+_gnvt_mac_c:  Array[6, uint8]
+
+
+def _gnv_build_inner(seed: uint8) -> uint64:
+    # Build a deterministic inner Ethernet frame: 14-byte L2 header
+    # (dst/src MAC + an arbitrary ethertype) followed by a payload whose
+    # bytes are a function of `seed`. Returns the inner frame length.
+    i: uint64 = 0
+    while i < 6:
+        _gnvt_inner[i]     = cast[uint8](0xA0 + i)       # inner dst MAC
+        _gnvt_inner[6 + i] = cast[uint8](0xB0 + i)       # inner src MAC
+        i = i + 1
+    _gnvt_inner[12] = 0x08                               # ethertype 0x0800
+    _gnvt_inner[13] = 0x00
+    plen: uint64 = 46                                    # min Ethernet payload
+    i = 0
+    while i < plen:
+        _gnvt_inner[14 + i] = cast[uint8]((cast[uint32](seed) + cast[uint32](i)) & 0xFF)
+        i = i + 1
+    return 14 + plen
+
+
+def _gnv_build_opts(seed: uint8) -> uint64:
+    # Build a 2-TLV option block into _gnvt_opts. Returns the block length.
+    #   Option 1: class 0x0101, type 0x80 (critical), 8 bytes of data.
+    #   Option 2: class 0x0202, type 0x01 (non-critical), 4 bytes of data.
+    i: uint64 = 0
+    while i < 8:
+        _gnvt_odata1[i] = cast[uint8]((cast[uint32](seed) ^ (0x10 + cast[uint32](i))) & 0xFF)
+        i = i + 1
+    i = 0
+    while i < 4:
+        _gnvt_odata2[i] = cast[uint8]((cast[uint32](seed) + (0x40 + cast[uint32](i))) & 0xFF)
+        i = i + 1
+    off: uint64 = 0
+    t1: int64 = geneve_opt_build(cast[Ptr[uint8]](&_gnvt_opts[0]), off,
+                                 0x0101, 0x00,
+                                 cast[Ptr[uint8]](&_gnvt_odata1[0]), 8, 1)
+    if t1 < 0:
+        return 0
+    off = off + cast[uint64](t1)
+    t2: int64 = geneve_opt_build(cast[Ptr[uint8]](&_gnvt_opts[0]), off,
+                                 0x0202, 0x01,
+                                 cast[Ptr[uint8]](&_gnvt_odata2[0]), 4, 0)
+    if t2 < 0:
+        return 0
+    off = off + cast[uint64](t2)
+    return off
+
+
+def geneve_selftest() -> int32:
+    # Returns 1 on PASS, 0 on FAIL. Prints [geneve] marker lines.
+    _gnv_emerg0("[geneve] self-test start\n")
+    geneve_init()
+    ok: int32 = 1
+
+    # Outer VTEP addressing.
+    #   local  VTEP: 10.0.0.1   MAC 02:00:00:00:00:01
+    #   remote VTEP A (VNI 100):  10.0.0.2  MAC 02:00:00:00:00:02
+    #   remote VTEP B (VNI 7777): 10.0.0.3  MAC 02:00:00:00:00:03
+    local_ip:   uint32 = (10 << 24) | (0 << 16) | (0 << 8) | 1
+    remoteA_ip: uint32 = (10 << 24) | (0 << 16) | (0 << 8) | 2
+    remoteB_ip: uint32 = (10 << 24) | (0 << 16) | (0 << 8) | 3
+    i: uint64 = 0
+    while i < 6:
+        _gnvt_mac_a[i] = 0
+        _gnvt_mac_b[i] = 0
+        _gnvt_mac_c[i] = 0
+        i = i + 1
+    _gnvt_mac_a[0] = 0x02
+    _gnvt_mac_a[5] = 0x01      # local MAC
+    _gnvt_mac_b[0] = 0x02
+    _gnvt_mac_b[5] = 0x02      # remote A MAC
+    _gnvt_mac_c[0] = 0x02
+    _gnvt_mac_c[5] = 0x03      # remote B MAC
+
+    # Build the 2-option TLV block.
+    opts_len: uint64 = _gnv_build_opts(0x33)
+    if opts_len == 0:
+        _gnv_emerg0("[geneve] FAIL: option build\n")
+        return 0
+    # Two options: (4+8) + (4+4) = 20 bytes.
+    if opts_len != 20:
+        _gnv_emerg1("[geneve] FAIL: opts_len %d != 20\n", opts_len)
+        ok = 0
+    else:
+        _gnv_emerg1("[geneve] PASS opt-build opts_len=%d (2 TLVs)\n", opts_len)
+
+    # Walk the freshly-built option block and assert its TLV structure
+    # parses back to what we wrote (proves real TLV walking by length).
+    walk: uint64 = 0
+    seen: uint64 = 0
+    parse_ok: int32 = 1
+    while walk < opts_len:
+        ocls: uint16 = geneve_opt_class(cast[Ptr[uint8]](&_gnvt_opts[0]), walk)
+        otyp: uint8  = geneve_opt_type(cast[Ptr[uint8]](&_gnvt_opts[0]), walk)
+        ocrit: int32 = geneve_opt_is_critical(cast[Ptr[uint8]](&_gnvt_opts[0]), walk)
+        odlen: uint64 = geneve_opt_data_len(cast[Ptr[uint8]](&_gnvt_opts[0]), walk)
+        if seen == 0:
+            if ocls != 0x0101 or ocrit != 1 or odlen != 8:
+                parse_ok = 0
+        else:
+            if ocls != 0x0202 or otyp != 0x01 or ocrit != 0 or odlen != 4:
+                parse_ok = 0
+        seen = seen + 1
+        walk = walk + geneve_opt_total_len(cast[Ptr[uint8]](&_gnvt_opts[0]), walk)
+    if seen != 2 or parse_ok != 1:
+        _gnv_emerg1("[geneve] FAIL: opt-walk seen=%d\n", seen)
+        ok = 0
+    else:
+        _gnv_emerg0("[geneve] PASS opt-walk (2 TLVs: critical 0x0101/8 + 0x0202/4)\n")
+
+    # ================================================================
+    # Round 1: VNI 100, with the 2-option block.
+    # ================================================================
+    inner_len1: uint64 = _gnv_build_inner(0x11)
+    out_len1: int64 = geneve_encap(
+        cast[Ptr[uint8]](&_gnvt_inner[0]), inner_len1, 100,
+        local_ip, remoteA_ip,
+        cast[Ptr[uint8]](&_gnvt_mac_a[0]), cast[Ptr[uint8]](&_gnvt_mac_b[0]),
+        cast[Ptr[uint8]](&_gnvt_opts[0]), opts_len,
+        cast[Ptr[uint8]](&_gnvt_outer[0]), GENEVE_T_OUTER_CAP)
+    if out_len1 < 0:
+        _gnv_emerg1("[geneve] FAIL: encap rc=%d\n", cast[uint64](out_len1))
+        return 0
+    exp_len1: uint64 = GENEVE_OUTER_OVERHEAD + opts_len + inner_len1
+    if cast[uint64](out_len1) != exp_len1:
+        _gnv_emerg2("[geneve] FAIL: outer len %d != %d\n",
+                    cast[uint64](out_len1), exp_len1)
+        ok = 0
+    else:
+        _gnv_emerg1("[geneve] PASS outer-len=%d (VNI100)\n", cast[uint64](out_len1))
+
+    udp_off: uint64 = ETH_HDR_LEN + IP_HDR_LEN
+    gnv_off: uint64 = udp_off + UDP_HDR_LEN
+
+    # Outer UDP dest port must be 6081.
+    dport1: uint16 = _gnv_get16(cast[Ptr[uint8]](&_gnvt_outer[0]), udp_off + 2)
+    if dport1 != GENEVE_UDP_PORT:
+        _gnv_emerg1("[geneve] FAIL: dport %d != 6081\n", cast[uint64](dport1))
+        ok = 0
+    else:
+        _gnv_emerg0("[geneve] PASS dport=6081\n")
+
+    # Base-header version must be 0; Opt Len must be opts_len/4 words.
+    ver1: uint8 = (_gnvt_outer[gnv_off] >> 6) & 0x3
+    optw1: uint8 = _gnvt_outer[gnv_off] & 0x3F
+    if ver1 != 0:
+        _gnv_emerg1("[geneve] FAIL: version %d != 0\n", cast[uint64](ver1))
+        ok = 0
+    else:
+        _gnv_emerg0("[geneve] PASS version=0\n")
+    if cast[uint64](optw1) != (opts_len >> 2):
+        _gnv_emerg2("[geneve] FAIL: optlen %d words != %d\n",
+                    cast[uint64](optw1), opts_len >> 2)
+        ok = 0
+    else:
+        _gnv_emerg1("[geneve] PASS optlen=%d-words\n", cast[uint64](optw1))
+
+    # The C (critical-options-present) flag must be set, since option 1 is
+    # critical.
+    if (_gnvt_outer[gnv_off + 1] & GENEVE_FLAG_C) == 0:
+        _gnv_emerg0("[geneve] FAIL: C-flag not set despite critical option\n")
+        ok = 0
+    else:
+        _gnv_emerg0("[geneve] PASS c-flag-set\n")
+
+    # Protocol type must be Transparent Ethernet Bridging (0x6558).
+    ptype1: uint16 = _gnv_get16(cast[Ptr[uint8]](&_gnvt_outer[0]), gnv_off + 2)
+    if ptype1 != GENEVE_PROTO_TEB:
+        _gnv_emerg1("[geneve] FAIL: proto-type %x != 0x6558\n", cast[uint64](ptype1))
+        ok = 0
+    else:
+        _gnv_emerg0("[geneve] PASS proto-type=TEB(0x6558)\n")
+
+    # VNI in the header must read back as 100.
+    vni_rb1: int64 = geneve_decap_vni(cast[Ptr[uint8]](&_gnvt_outer[0]),
+                                      cast[uint64](out_len1))
+    if vni_rb1 != 100:
+        _gnv_emerg1("[geneve] FAIL: header VNI %d != 100\n", cast[uint64](vni_rb1))
+        ok = 0
+    else:
+        _gnv_emerg0("[geneve] PASS vni=100\n")
+
+    # Recompute the IPv4 header checksum and compare against the stored one.
+    ip_off: uint64 = ETH_HDR_LEN
+    stored_ip_csum: uint16 = _gnv_get16(cast[Ptr[uint8]](&_gnvt_outer[0]),
+                                        ip_off + 10)
+    _gnv_put16(cast[Ptr[uint8]](&_gnvt_outer[0]), ip_off + 10, 0)
+    recomp_ip_csum: uint16 = ip_csum16(cast[Ptr[uint8]](&_gnvt_outer[ip_off]),
+                                       IP_HDR_LEN)
+    _gnv_put16(cast[Ptr[uint8]](&_gnvt_outer[0]), ip_off + 10, stored_ip_csum)
+    if stored_ip_csum != recomp_ip_csum:
+        _gnv_emerg2("[geneve] FAIL: IP csum stored=%x recomp=%x\n",
+                    cast[uint64](stored_ip_csum), cast[uint64](recomp_ip_csum))
+        ok = 0
+    else:
+        _gnv_emerg0("[geneve] PASS ip-checksum-valid\n")
+    # Self-consistency: ones'-complement sum over the whole 20-byte header
+    # (csum field included) must be 0.
+    whole_ip_csum: uint16 = ip_csum16(cast[Ptr[uint8]](&_gnvt_outer[ip_off]),
+                                      IP_HDR_LEN)
+    if whole_ip_csum != 0:
+        _gnv_emerg1("[geneve] FAIL: IP header self-sum=%x (want 0)\n",
+                    cast[uint64](whole_ip_csum))
+        ok = 0
+    else:
+        _gnv_emerg0("[geneve] PASS ip-checksum-self-consistent\n")
+
+    # Recompute the UDP checksum and compare against the stored value.
+    udp_len1: uint64 = cast[uint64](_gnv_get16(
+        cast[Ptr[uint8]](&_gnvt_outer[0]), udp_off + 4))
+    stored_udp_csum: uint16 = _gnv_get16(cast[Ptr[uint8]](&_gnvt_outer[0]),
+                                         udp_off + 6)
+    _gnv_put16(cast[Ptr[uint8]](&_gnvt_outer[0]), udp_off + 6, 0)
+    recomp_udp_csum: uint16 = geneve_udp_checksum(local_ip, remoteA_ip,
+        cast[Ptr[uint8]](&_gnvt_outer[udp_off]), udp_len1)
+    _gnv_put16(cast[Ptr[uint8]](&_gnvt_outer[0]), udp_off + 6, stored_udp_csum)
+    if stored_udp_csum != recomp_udp_csum:
+        _gnv_emerg2("[geneve] FAIL: UDP csum stored=%x recomp=%x\n",
+                    cast[uint64](stored_udp_csum), cast[uint64](recomp_udp_csum))
+        ok = 0
+    else:
+        _gnv_emerg0("[geneve] PASS udp-checksum-valid\n")
+
+    # Walk the option TLVs IN THE ENCAPSULATED FRAME and assert they match
+    # the originals byte-for-byte (the distinguishing GENEVE feature).
+    opt_base: uint64 = geneve_options_off(cast[Ptr[uint8]](&_gnvt_outer[0]))
+    frame_opts_len: uint64 = geneve_opts_len(cast[Ptr[uint8]](&_gnvt_outer[0]))
+    if frame_opts_len != opts_len:
+        _gnv_emerg2("[geneve] FAIL: frame opts_len %d != %d\n",
+                    frame_opts_len, opts_len)
+        ok = 0
+    opt_identical: int32 = 1
+    i = 0
+    while i < opts_len:
+        if _gnvt_outer[opt_base + i] != _gnvt_opts[i]:
+            opt_identical = 0
+            i = opts_len
+        else:
+            i = i + 1
+    if opt_identical != 1:
+        _gnv_emerg0("[geneve] FAIL: option block not byte-identical in frame\n")
+        ok = 0
+    else:
+        _gnv_emerg0("[geneve] PASS options-byte-identical (VNI100)\n")
+    # Re-parse the two TLVs out of the on-wire frame and verify class/data.
+    w: uint64 = opt_base
+    n: uint64 = 0
+    wire_ok: int32 = 1
+    while w < (opt_base + opts_len):
+        c: uint16 = geneve_opt_class(cast[Ptr[uint8]](&_gnvt_outer[0]), w)
+        dl: uint64 = geneve_opt_data_len(cast[Ptr[uint8]](&_gnvt_outer[0]), w)
+        if n == 0:
+            if c != 0x0101 or dl != 8 \
+               or geneve_opt_is_critical(cast[Ptr[uint8]](&_gnvt_outer[0]), w) != 1:
+                wire_ok = 0
+        else:
+            if c != 0x0202 or dl != 4 \
+               or geneve_opt_is_critical(cast[Ptr[uint8]](&_gnvt_outer[0]), w) != 0:
+                wire_ok = 0
+        n = n + 1
+        w = w + geneve_opt_total_len(cast[Ptr[uint8]](&_gnvt_outer[0]), w)
+    if n != 2 or wire_ok != 1:
+        _gnv_emerg1("[geneve] FAIL: on-wire TLV reparse n=%d\n", n)
+        ok = 0
+    else:
+        _gnv_emerg0("[geneve] PASS on-wire-tlv-reparse (2 TLVs)\n")
+
+    # DECAP round-trip: recover the inner frame past the options, assert
+    # byte-identity and VNI.
+    rvni1: uint32 = 0
+    rec_len1: int64 = geneve_decap(cast[Ptr[uint8]](&_gnvt_outer[0]),
+        cast[uint64](out_len1),
+        cast[Ptr[uint8]](&_gnvt_recov[0]), GENEVE_T_INNER_CAP,
+        cast[Ptr[uint32]](&rvni1))
+    if rec_len1 < 0:
+        _gnv_emerg1("[geneve] FAIL: decap rc=%d\n", cast[uint64](rec_len1))
+        return 0
+    if cast[uint64](rec_len1) != inner_len1:
+        _gnv_emerg2("[geneve] FAIL: recovered len %d != %d\n",
+                    cast[uint64](rec_len1), inner_len1)
+        ok = 0
+    if rvni1 != 100:
+        _gnv_emerg1("[geneve] FAIL: decap VNI %d != 100\n", cast[uint64](rvni1))
+        ok = 0
+    identical1: int32 = 1
+    i = 0
+    while i < inner_len1:
+        if _gnvt_recov[i] != _gnvt_inner[i]:
+            identical1 = 0
+            i = inner_len1
+        else:
+            i = i + 1
+    if identical1 != 1:
+        _gnv_emerg0("[geneve] FAIL: inner frame not byte-identical (VNI100)\n")
+        ok = 0
+    else:
+        _gnv_emerg0("[geneve] PASS roundtrip-byte-identical (VNI100)\n")
+
+    # ================================================================
+    # Round 2: VNI 7777 — a second, distinct VNI with a different inner
+    # payload AND a freshly-seeded option block, proving the option data
+    # round-trips per-tunnel rather than via a stale global.
+    # ================================================================
+    opts_len2: uint64 = _gnv_build_opts(0x99)
+    inner_len2: uint64 = _gnv_build_inner(0x77)
+    out_len2: int64 = geneve_encap(
+        cast[Ptr[uint8]](&_gnvt_inner[0]), inner_len2, 7777,
+        local_ip, remoteB_ip,
+        cast[Ptr[uint8]](&_gnvt_mac_a[0]), cast[Ptr[uint8]](&_gnvt_mac_c[0]),
+        cast[Ptr[uint8]](&_gnvt_opts[0]), opts_len2,
+        cast[Ptr[uint8]](&_gnvt_outer[0]), GENEVE_T_OUTER_CAP)
+    if out_len2 < 0:
+        _gnv_emerg1("[geneve] FAIL: encap(7777) rc=%d\n", cast[uint64](out_len2))
+        return 0
+
+    vni_rb2: int64 = geneve_decap_vni(cast[Ptr[uint8]](&_gnvt_outer[0]),
+                                      cast[uint64](out_len2))
+    if vni_rb2 != 7777:
+        _gnv_emerg1("[geneve] FAIL: header VNI %d != 7777\n", cast[uint64](vni_rb2))
+        ok = 0
+    else:
+        _gnv_emerg0("[geneve] PASS vni=7777\n")
+
+    # Recompute UDP checksum for round 2 (different dst IP + payload).
+    udp_len2: uint64 = cast[uint64](_gnv_get16(
+        cast[Ptr[uint8]](&_gnvt_outer[0]), udp_off + 4))
+    stored_udp_csum2: uint16 = _gnv_get16(cast[Ptr[uint8]](&_gnvt_outer[0]),
+                                          udp_off + 6)
+    _gnv_put16(cast[Ptr[uint8]](&_gnvt_outer[0]), udp_off + 6, 0)
+    recomp_udp_csum2: uint16 = geneve_udp_checksum(local_ip, remoteB_ip,
+        cast[Ptr[uint8]](&_gnvt_outer[udp_off]), udp_len2)
+    _gnv_put16(cast[Ptr[uint8]](&_gnvt_outer[0]), udp_off + 6, stored_udp_csum2)
+    if stored_udp_csum2 != recomp_udp_csum2:
+        _gnv_emerg2("[geneve] FAIL: UDP csum2 stored=%x recomp=%x\n",
+                    cast[uint64](stored_udp_csum2), cast[uint64](recomp_udp_csum2))
+        ok = 0
+    else:
+        _gnv_emerg0("[geneve] PASS udp-checksum-valid (VNI7777)\n")
+
+    # The on-wire options must equal the freshly-built block (proves the
+    # frame carries THIS tunnel's options, not round-1's).
+    opt_base2: uint64 = geneve_options_off(cast[Ptr[uint8]](&_gnvt_outer[0]))
+    opt_identical2: int32 = 1
+    i = 0
+    while i < opts_len2:
+        if _gnvt_outer[opt_base2 + i] != _gnvt_opts[i]:
+            opt_identical2 = 0
+            i = opts_len2
+        else:
+            i = i + 1
+    if opt_identical2 != 1:
+        _gnv_emerg0("[geneve] FAIL: option block not byte-identical (VNI7777)\n")
+        ok = 0
+    else:
+        _gnv_emerg0("[geneve] PASS options-byte-identical (VNI7777)\n")
+
+    # DECAP round-trip for VNI 7777.
+    rvni2: uint32 = 0
+    rec_len2: int64 = geneve_decap(cast[Ptr[uint8]](&_gnvt_outer[0]),
+        cast[uint64](out_len2),
+        cast[Ptr[uint8]](&_gnvt_recov[0]), GENEVE_T_INNER_CAP,
+        cast[Ptr[uint32]](&rvni2))
+    if rec_len2 < 0:
+        _gnv_emerg1("[geneve] FAIL: decap(7777) rc=%d\n", cast[uint64](rec_len2))
+        return 0
+    if rvni2 != 7777:
+        _gnv_emerg1("[geneve] FAIL: decap VNI %d != 7777\n", cast[uint64](rvni2))
+        ok = 0
+    identical2: int32 = 1
+    i = 0
+    while i < inner_len2:
+        if _gnvt_recov[i] != _gnvt_inner[i]:
+            identical2 = 0
+            i = inner_len2
+        else:
+            i = i + 1
+    if identical2 != 1:
+        _gnv_emerg0("[geneve] FAIL: inner frame not byte-identical (VNI7777)\n")
+        ok = 0
+    else:
+        _gnv_emerg0("[geneve] PASS roundtrip-byte-identical (VNI7777)\n")
+
+    # ================================================================
+    # Negative: a non-GENEVE frame (wrong dport) must be rejected.
+    # ================================================================
+    _gnv_put16(cast[Ptr[uint8]](&_gnvt_outer[0]), udp_off + 2, 1234)
+    neg: int64 = geneve_decap_vni(cast[Ptr[uint8]](&_gnvt_outer[0]),
+                                  cast[uint64](out_len2))
+    if neg != -1:
+        _gnv_emerg0("[geneve] FAIL: non-6081 frame accepted as GENEVE\n")
+        ok = 0
+    else:
+        _gnv_emerg0("[geneve] PASS reject-non-geneve (dport 1234)\n")
+    _gnv_put16(cast[Ptr[uint8]](&_gnvt_outer[0]), udp_off + 2, GENEVE_UDP_PORT)
+
+    if ok == 1:
+        _gnv_emerg0("[geneve] PASS\n")
+        return 1
+    _gnv_emerg0("[geneve] FAIL\n")
+    return 0
