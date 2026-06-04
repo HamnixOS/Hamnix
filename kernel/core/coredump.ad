@@ -39,9 +39,10 @@
 # ELF layout produced
 #
 #   [ Elf64_Ehdr                       ]  e_type = ET_CORE, mach = x86_64
-#   [ Phdr 0: PT_NOTE                   ]  -> NT_PRSTATUS (CORE)
+#   [ Phdr 0: PT_NOTE                   ]  -> NT_PRSTATUS + NT_PRPSINFO
+#                                            + NT_AUXV (all named "CORE")
 #   [ Phdr 1..N: PT_LOAD per VMA region ]
-#   [ PT_NOTE contents (prstatus note)  ]
+#   [ PT_NOTE contents (the three notes)]
 #   [ PT_LOAD 0 bytes ... PT_LOAD N-1   ]
 #
 # All multi-byte fields are little-endian (x86_64), written by byte
@@ -59,6 +60,8 @@ from kernel.sched.core import (
     task_image_lo, task_image_hi,
     task_ustack_lo, task_ustack_sz,
     task_brk_base, task_brk_end,
+    task_parent_pid, task_uid_at, task_gid_at,
+    get_task_comm_ptr,
 )
 from mm.vma import (
     vma_iter_first, vma_iter_next,
@@ -91,6 +94,8 @@ _CD_PF_W:         uint32 = 0x2
 _CD_PF_R:         uint32 = 0x4
 
 _CD_NT_PRSTATUS:  uint32 = 1
+_CD_NT_PRPSINFO:  uint32 = 3
+_CD_NT_AUXV:      uint32 = 6
 
 _CD_EHDR_SZ:      uint64 = 64
 _CD_PHDR_SZ:      uint64 = 56
@@ -126,6 +131,42 @@ _CD_GREG_EFLAGS: uint64 = 18
 _CD_GREG_RSP:    uint64 = 19
 _CD_GREG_SS:     uint64 = 20
 
+# elf_prpsinfo layout (Linux <sys/procfs.h> on x86_64). 136 bytes; we
+# zero-fill the whole struct and populate the load-bearing identity
+# fields a `gdb info proc` reader consults.
+#   pr_state  (char)        @ 0   numeric run-state byte
+#   pr_sname  (char)        @ 1   one-letter state ('R','S','Z',...)
+#   pr_zomb   (char)        @ 2   1 iff a zombie
+#   pr_nice   (char)        @ 3
+#   pr_flag   (unsigned long)@ 8
+#   pr_uid    (unsigned int) @ 16
+#   pr_gid    (unsigned int) @ 20
+#   pr_pid    (int)         @ 24
+#   pr_ppid   (int)         @ 28
+#   pr_pgrp   (int)         @ 32
+#   pr_sid    (int)         @ 36
+#   pr_fname  (char[16])    @ 40   short command name (basename, "comm")
+#   pr_psargs (char[80])    @ 56   the command line / args
+_CD_PRPSINFO_SZ:        uint64 = 136
+_CD_PRPSINFO_UID_OFF:   uint64 = 16
+_CD_PRPSINFO_GID_OFF:   uint64 = 20
+_CD_PRPSINFO_PID_OFF:   uint64 = 24
+_CD_PRPSINFO_PPID_OFF:  uint64 = 28
+_CD_PRPSINFO_FNAME_OFF: uint64 = 40
+_CD_PRPSINFO_PSARGS_OFF: uint64 = 56
+
+# Auxiliary-vector type numbers (Linux include/uapi/linux/auxvec.h).
+# We only emit the entries we can faithfully reconstruct from per-task
+# state at coredump time. AT_PAGESZ is universally known; AT_NULL
+# terminates. (AT_PHDR/AT_ENTRY are NOT stored per-task in Hamnix — the
+# loader builds the auxv directly on the user stack at exec time and
+# keeps only "last-loaded" globals, which are not reliably THIS task's,
+# so they are deliberately omitted rather than fabricated.)
+_CD_AT_NULL:   uint64 = 0
+_CD_AT_PAGESZ: uint64 = 6
+# NT_AUXV descriptor: 2 Elf64_auxv_t pairs (AT_PAGESZ, AT_NULL) * 16.
+_CD_AUXV_SZ:   uint64 = 32
+
 # ---------------------------------------------------------------------
 # Module-scope flat buffers
 # ---------------------------------------------------------------------
@@ -135,15 +176,20 @@ _CD_GREG_SS:     uint64 = 20
 #
 #   _cd_hdr  — the whole ELF prologue: Ehdr (64) + (1 + MAX_SEGMENTS)
 #              phdrs. 64 + 129*56 = 7288 bytes; round to 8192.
-#   _cd_note — the PT_NOTE payload: 12-byte Elf64_Nhdr + "CORE\0" padded
-#              to 8 + prstatus (336). 384 is ample.
+#   _cd_note — the PT_NOTE payload: THREE consecutive notes, each a
+#              12-byte Elf64_Nhdr + 4-byte-padded "CORE\0" name (8) +
+#              4-byte-padded descriptor:
+#                NT_PRSTATUS  desc 336  -> 12 + 8 + 336 = 356
+#                NT_PRPSINFO  desc 136  -> 12 + 8 + 136 = 156
+#                NT_AUXV      desc  32  -> 12 + 8 +  32 =  52
+#              total = 564 bytes. 768 is ample headroom.
 #   _cd_copy — a 4 KiB staging page for copying VMA bytes out one page at
 #              a time (tmpfs_write takes a kernel src pointer).
 _CD_HDR_CAP:  uint64 = 8192
-_CD_NOTE_CAP: uint64 = 384
+_CD_NOTE_CAP: uint64 = 768
 
 _cd_hdr:  Array[8192, uint8]
-_cd_note: Array[384, uint8]
+_cd_note: Array[768, uint8]
 _cd_copy: Array[4096, uint8]
 
 # Collected dumpable regions: the three fixed task segments (loaded ELF
@@ -213,47 +259,133 @@ def _cd_pflags(prot: int32) -> uint32:
 
 
 # ---------------------------------------------------------------------
-# The PT_NOTE payload: one NT_PRSTATUS note ("CORE")
+# The PT_NOTE payload: standard Linux core notes, all named "CORE"
 # ---------------------------------------------------------------------
+#
+# Three consecutive notes are emitted, each in the canonical
+# Elf64_Nhdr + 4-byte-padded-name + 4-byte-padded-descriptor shape that
+# every other note (gdb, readelf, the self-test) expects:
+#
+#   NT_PRSTATUS (1)  — register state (RIP/RSP/RFLAGS/CS/SS from the fault)
+#   NT_PRPSINFO (3)  — process identity (pid/ppid/uid/gid/state/comm/args)
+#   NT_AUXV     (6)  — auxiliary vector (AT_PAGESZ + AT_NULL terminator)
+#
+# Each note's descriptor sizes EXCLUDE padding (the ELF note convention —
+# the consumer rounds namesz/descsz up to 4). The "CORE\0" name is 5
+# bytes, rounded up to 8.
 
-def _cd_build_note(iret_frame: Ptr[uint64]):
-    # Layout of _cd_note:
-    #   [0]  Elf64_Nhdr: n_namesz=5, n_descsz=PRSTATUS_SZ, n_type=NT_PRSTATUS
-    #   [12] "CORE\0" padded to 8 bytes (name is 4-byte aligned -> 8)
-    #   [20] prstatus (336 bytes), pr_reg at +112
-    # Total = 12 + 8 + 336 = 356 bytes.
+def _cd_put_core_name(off: uint64):
+    # Write the 4-byte-aligned "CORE\0" note name (5 bytes -> 8) at `off`.
+    # The buffer is pre-zeroed so the padding past the NUL is already 0.
+    _cd_note[off + 0] = 67                                   # 'C'
+    _cd_note[off + 1] = 79                                   # 'O'
+    _cd_note[off + 2] = 82                                   # 'R'
+    _cd_note[off + 3] = 69                                   # 'E'
+    _cd_note[off + 4] = 0
+
+
+def _cd_build_note(iret_frame: Ptr[uint64], slot: uint64,
+                   pid: uint64):
+    # Build the whole PT_NOTE payload into _cd_note. Returns nothing; the
+    # total byte length is reported by _cd_note_total(). Notes are laid
+    # out back to back; we track the running write cursor `o`.
     memset(&_cd_note[0], 0, _CD_NOTE_CAP)
 
-    # Elf64_Nhdr (note descriptor sizes EXCLUDE padding, per the ELF
-    # note convention — the consumer rounds namesz/descsz up to 4).
-    _cd_put_u32(&_cd_note[0], 0, cast[uint32](5))             # n_namesz "CORE\0"
-    _cd_put_u32(&_cd_note[0], 4, cast[uint32](_CD_PRSTATUS_SZ))  # n_descsz
-    _cd_put_u32(&_cd_note[0], 8, _CD_NT_PRSTATUS)            # n_type
-
-    # name "CORE\0" at offset 12 (already zeroed beyond the NUL).
-    _cd_note[12] = 67                                        # 'C'
-    _cd_note[13] = 79                                        # 'O'
-    _cd_note[14] = 82                                        # 'R'
-    _cd_note[15] = 69                                        # 'E'
-    _cd_note[16] = 0
-
-    # prstatus.pr_reg — populate from the fault iret frame when present.
-    # The iret frame (arch/x86/kernel/trap_asm.S) is the ascending quad
-    # run: [0]=RIP [1]=CS [2]=RFLAGS [3]=RSP [4]=SS. The general-purpose
-    # registers (rax/rbx/...) are not threaded through to this site, so
-    # they are left zero — RIP/RSP/RFLAGS/CS/SS are the load-bearing
-    # post-mortem state and are captured exactly.
+    # ----- Note 1: NT_PRSTATUS ---------------------------------------
+    # nhdr @0, name @12, desc (prstatus, 336B, pr_reg @+112) @20.
+    o: uint64 = 0
+    _cd_put_u32(&_cd_note[0], o + 0, cast[uint32](5))           # n_namesz
+    _cd_put_u32(&_cd_note[0], o + 4, cast[uint32](_CD_PRSTATUS_SZ))
+    _cd_put_u32(&_cd_note[0], o + 8, _CD_NT_PRSTATUS)
+    _cd_put_core_name(o + 12)
+    # prstatus.pr_reg from the fault iret frame when present. The iret
+    # frame (arch/x86/kernel/trap_asm.S) is the ascending quad run:
+    # [0]=RIP [1]=CS [2]=RFLAGS [3]=RSP [4]=SS. The general-purpose
+    # registers are not threaded to this site, so they stay zero —
+    # RIP/RSP/RFLAGS/CS/SS are the load-bearing post-mortem state.
+    # _cd_greg writes relative to the prstatus desc at note offset 20,
+    # which is exactly where this first note's descriptor sits.
     if iret_frame != cast[Ptr[uint64]](0):
         _cd_greg(_CD_GREG_RIP,    iret_frame[0])
         _cd_greg(_CD_GREG_CS,     iret_frame[1])
         _cd_greg(_CD_GREG_EFLAGS, iret_frame[2])
         _cd_greg(_CD_GREG_RSP,    iret_frame[3])
         _cd_greg(_CD_GREG_SS,     iret_frame[4])
+    o = o + 12 + 8 + _CD_PRSTATUS_SZ
+
+    # ----- Note 2: NT_PRPSINFO ---------------------------------------
+    # The note gdb uses for `info proc`: pid/ppid/uid/gid/state + comm.
+    ps_hdr: uint64 = o
+    _cd_put_u32(&_cd_note[0], ps_hdr + 0, cast[uint32](5))     # n_namesz
+    _cd_put_u32(&_cd_note[0], ps_hdr + 4, cast[uint32](_CD_PRPSINFO_SZ))
+    _cd_put_u32(&_cd_note[0], ps_hdr + 8, _CD_NT_PRPSINFO)
+    _cd_put_core_name(ps_hdr + 12)
+    ps_desc: uint64 = ps_hdr + 20
+    # pr_state / pr_sname: the task is being core-dumped because it is
+    # terminating on a fatal fault. Report it as RUNNING ('R'=0) — the
+    # ground-truth state at the instant of the fault. pr_zomb stays 0.
+    _cd_note[ps_desc + 0] = 0                                  # pr_state (R)
+    _cd_note[ps_desc + 1] = 82                                 # pr_sname 'R'
+    # pr_uid / pr_gid.
+    _cd_put_u32(&_cd_note[0], ps_desc + _CD_PRPSINFO_UID_OFF,
+                cast[uint32](task_uid_at(cast[int32](slot))))
+    _cd_put_u32(&_cd_note[0], ps_desc + _CD_PRPSINFO_GID_OFF,
+                cast[uint32](task_gid_at(cast[int32](slot))))
+    # pr_pid / pr_ppid (32-bit ints in the struct).
+    _cd_put_u32(&_cd_note[0], ps_desc + _CD_PRPSINFO_PID_OFF,
+                cast[uint32](pid))
+    _cd_put_u32(&_cd_note[0], ps_desc + _CD_PRPSINFO_PPID_OFF,
+                cast[uint32](task_parent_pid(cast[int32](slot))))
+    # pr_fname[16] = the process short name ("comm", PR_SET_NAME storage).
+    # Copy up to 15 bytes + leave a NUL; the buffer is pre-zeroed.
+    comm: Ptr[uint8] = get_task_comm_ptr(slot)
+    ci: uint64 = 0
+    while ci < 15:
+        cb: uint8 = comm[ci]
+        if cb == 0:
+            ci = 15
+        else:
+            _cd_note[ps_desc + _CD_PRPSINFO_FNAME_OFF + ci] = cb
+            ci = ci + 1
+    # pr_psargs[80] = command line. We have no preserved argv string at
+    # the dump site, so mirror comm into psargs as a best-effort cmdline
+    # (this is exactly what gdb shows for `info proc cmdline`).
+    ai: uint64 = 0
+    while ai < 15:
+        ab: uint8 = comm[ai]
+        if ab == 0:
+            ai = 15
+        else:
+            _cd_note[ps_desc + _CD_PRPSINFO_PSARGS_OFF + ai] = ab
+            ai = ai + 1
+    o = o + 12 + 8 + _CD_PRPSINFO_SZ
+
+    # ----- Note 3: NT_AUXV -------------------------------------------
+    # The process auxiliary vector. Hamnix does not stash a per-task auxv
+    # (the loader writes it straight onto the user stack at exec time and
+    # keeps only "last-loaded" globals), so we emit the entries we can
+    # state faithfully for THIS task: AT_PAGESZ, then the AT_NULL
+    # terminator. A 2-entry auxv is well-formed and lets gdb parse the
+    # note without complaint.
+    ax_hdr: uint64 = o
+    _cd_put_u32(&_cd_note[0], ax_hdr + 0, cast[uint32](5))     # n_namesz
+    _cd_put_u32(&_cd_note[0], ax_hdr + 4, cast[uint32](_CD_AUXV_SZ))
+    _cd_put_u32(&_cd_note[0], ax_hdr + 8, _CD_NT_AUXV)
+    _cd_put_core_name(ax_hdr + 12)
+    ax_desc: uint64 = ax_hdr + 20
+    _cd_put_u64(&_cd_note[0], ax_desc + 0,  _CD_AT_PAGESZ)     # a_type
+    _cd_put_u64(&_cd_note[0], ax_desc + 8,  _CD_PAGE_SIZE)     # a_un.a_val
+    _cd_put_u64(&_cd_note[0], ax_desc + 16, _CD_AT_NULL)       # terminator
+    _cd_put_u64(&_cd_note[0], ax_desc + 24, 0)
+    o = o + 12 + 8 + _CD_AUXV_SZ
 
 
 def _cd_note_total() -> uint64:
-    # 12-byte nhdr + 8-byte padded name + prstatus.
-    return 12 + 8 + _CD_PRSTATUS_SZ
+    # Sum of the three notes: each = 12 nhdr + 8 padded name + padded desc.
+    n1: uint64 = 12 + 8 + _CD_PRSTATUS_SZ
+    n2: uint64 = 12 + 8 + _CD_PRPSINFO_SZ
+    n3: uint64 = 12 + 8 + _CD_AUXV_SZ
+    return n1 + n2 + n3
 
 
 # ---------------------------------------------------------------------
@@ -333,7 +465,7 @@ def coredump_write_current(sig: uint64, iret_frame: Ptr[uint64]) -> int32:
     phnum: int32 = 1 + nseg
 
     # --- build the PT_NOTE payload now (we need its size) -----------
-    _cd_build_note(iret_frame)
+    _cd_build_note(iret_frame, slot, pid)
     note_sz: uint64 = _cd_note_total()
 
     # --- lay out file offsets ---------------------------------------

@@ -23,6 +23,8 @@
 #   - "COREDUMP: core ET_CORE x86_64 ok"
 #   - "COREDUMP: PT_LOAD sentinel match"
 #   - "COREDUMP: NT_PRSTATUS rip ok"
+#   - "COREDUMP: NT_PRPSINFO present"
+#   - "COREDUMP: NT_AUXV present"
 #   - "coredump: PASS"
 #
 # REQUIRES: musl-gcc on $PATH (build-on-missing via _ensure_ubin.sh).
@@ -94,6 +96,8 @@ check_marker "parent saw SIGSEGV"  "COREDUMP: parent saw SIGSEGV child"
 check_marker "ET_CORE x86_64"      "COREDUMP: core ET_CORE x86_64 ok"
 check_marker "PT_LOAD sentinel"    "COREDUMP: PT_LOAD sentinel match"
 check_marker "NT_PRSTATUS rip"     "COREDUMP: NT_PRSTATUS rip ok"
+check_marker "NT_PRPSINFO present" "COREDUMP: NT_PRPSINFO present"
+check_marker "NT_AUXV present"     "COREDUMP: NT_AUXV present"
 check_marker "fixture PASS"        "coredump: PASS"
 
 # Diagnostics on failure.

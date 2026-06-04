@@ -25,6 +25,9 @@
  *        - e_machine== EM_X86_64 (62)
  *        - >= 1 PT_NOTE program header carrying an NT_PRSTATUS note whose
  *          recorded RIP is non-zero (the faulting instruction pointer)
+ *        - the same PT_NOTE also carries an NT_PRPSINFO (3) note (the one
+ *          gdb uses for `info proc`) AND an NT_AUXV (6) note — so a real
+ *          gdb loads the core without complaining about missing notes
  *        - >= 1 PT_LOAD whose [p_vaddr, p_vaddr+p_filesz) covers
  *          &g_sentinel AND whose dumped bytes at that vaddr equal the
  *          0xC0DEFACE sentinel.
@@ -39,6 +42,8 @@
  *   "COREDUMP: core ET_CORE x86_64 ok"
  *   "COREDUMP: PT_LOAD sentinel match"
  *   "COREDUMP: NT_PRSTATUS rip ok"
+ *   "COREDUMP: NT_PRPSINFO present"
+ *   "COREDUMP: NT_AUXV present"
  *   "coredump: PASS" / "coredump: FAIL ..."
  */
 
@@ -102,6 +107,8 @@ static uint64_t rd64(const unsigned char *p) {
 #define PT_LOAD       1
 #define PT_NOTE       4
 #define NT_PRSTATUS   1
+#define NT_PRPSINFO   3
+#define NT_AUXV       6
 /* prstatus.pr_reg starts at +112; RIP is gpreg index 16 -> +112+16*8. */
 #define PRSTATUS_RIP_OFF (112 + 16 * 8)
 
@@ -219,8 +226,10 @@ int main(void) {
         return 1;
     }
 
-    int load_ok = 0;
-    int rip_ok  = 0;
+    int load_ok    = 0;
+    int rip_ok     = 0;
+    int prpsinfo_ok = 0;
+    int auxv_ok    = 0;
 
     for (uint16_t i = 0; i < e_phnum; i++) {
         uint64_t ph = e_phoff + (uint64_t)i * e_phentsz;
@@ -265,6 +274,24 @@ int main(void) {
                     say_hex("COREDUMP: prstatus rip=", rip);
                     if (rip != 0) rip_ok = 1;
                 }
+                if (ntype == NT_PRPSINFO &&
+                    desc_off + 32 <= (uint64_t)total) {
+                    /* prpsinfo.pr_pid is at desc+24 (int). The dumped task
+                     * is the crashing child; its recorded pid must be
+                     * non-zero. This proves the identity note is real, not
+                     * a zero-filled placeholder. */
+                    uint32_t pr_pid = rd32(corebuf + desc_off + 24);
+                    say_hex("COREDUMP: prpsinfo pid=", (uint64_t)pr_pid);
+                    if (pr_pid != 0) prpsinfo_ok = 1;
+                }
+                if (ntype == NT_AUXV &&
+                    desc_off + 16 <= (uint64_t)total) {
+                    /* First auxv pair must be a real a_type (non-NULL):
+                     * we emit AT_PAGESZ (6) then the AT_NULL terminator. */
+                    uint64_t a_type = rd64(corebuf + desc_off + 0);
+                    say_hex("COREDUMP: auxv a_type=", a_type);
+                    if (a_type != 0) auxv_ok = 1;
+                }
                 uint64_t desc_pad = (descsz + 3) & ~3u;
                 no = no + 12 + name_pad + desc_pad;
                 if (name_pad + desc_pad == 0) break;   /* guard */
@@ -284,6 +311,18 @@ int main(void) {
         return 1;
     }
     SAY("COREDUMP: NT_PRSTATUS rip ok");
+
+    if (!prpsinfo_ok) {
+        SAY("coredump: FAIL no NT_PRPSINFO note");
+        return 1;
+    }
+    SAY("COREDUMP: NT_PRPSINFO present");
+
+    if (!auxv_ok) {
+        SAY("coredump: FAIL no NT_AUXV note");
+        return 1;
+    }
+    SAY("COREDUMP: NT_AUXV present");
 
     SAY("coredump: PASS");
     return 0;
