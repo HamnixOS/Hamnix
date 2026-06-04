@@ -1272,6 +1272,16 @@ if os.environ.get("ENABLE_MEMPOLICY_TEST"):
 if os.environ.get("ENABLE_QUOTA_TEST"):
     FILES.append(("/etc/quota-test", b"1\n"))
 
+# fchmodat2(2) (nr 452) self-test. scripts/test_fchmodat2.sh sets
+# ENABLE_FCHMODAT2_TEST=1 to plant /etc/fchmodat2-test, which is BOTH the boot
+# marker AND the real openable file fchmodat2_selftest() (linux_abi/u_fchmodat2.ad)
+# chmods: it chmods the path with flags=0 and AT_SYMLINK_NOFOLLOW (both -> 0),
+# a missing path -> ENOENT, an unsupported flag -> EINVAL, AT_EMPTY_PATH on the
+# open fd -> 0, and off-fd AT_EMPTY_PATH -> EBADF, emitting [fchmodat2] PASS.
+# Default boots omit the marker.
+if os.environ.get("ENABLE_FCHMODAT2_TEST"):
+    FILES.append(("/etc/fchmodat2-test", b"1\n"))
+
 # Landlock LSM round-trip + open-enforcement self-test. scripts/test_landlock.sh
 # sets ENABLE_LANDLOCK_TEST=1 to plant /etc/landlock-test plus two REAL files:
 # /etc/landlock-allowed/data (under the allowed dir) and /etc/landlock-denied/

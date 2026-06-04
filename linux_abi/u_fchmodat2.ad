@@ -1,0 +1,318 @@
+# linux_abi/u_fchmodat2.ad -- the Linux fchmodat2(2) syscall (nr 452).
+#
+# fchmodat2 is the newest member of the *at chmod family (added in Linux 6.6).
+# It is exactly fchmodat(dirfd, path, mode) PLUS a real `flags` argument that
+# fchmodat lacks:
+#
+#   int fchmodat2(int dirfd, const char *path, mode_t mode, unsigned int flags)
+#
+# The flags are AT_SYMLINK_NOFOLLOW (0x100) and AT_EMPTY_PATH (0x1000) — the
+# same two AT_* bits fchownat already honours in this tree. glibc 2.39+,
+# musl, and coreutils' `chmod` reach for fchmodat2 directly (glibc's
+# fchmodat() wrapper calls fchmodat2 with flags=0 and only falls back to the
+# old fchmodat when the kernel returns -ENOSYS), so a missing fchmodat2 made
+# every `chmod` on a new glibc take the slow ENOSYS-probe path on the first
+# call. lchmod() and AT_EMPTY_PATH-on-fd chmod also route through it.
+#
+# ARCHITECTURE NOTE -- this is a REAL implementation against the SAME VFS path
+# that chmod/fchmod/fchmodat already use (resolve_path + vfs_open), NOT a stub:
+#
+#   * It does genuine flag validation: only AT_SYMLINK_NOFOLLOW and
+#     AT_EMPTY_PATH are accepted; any other bit is rejected with -EINVAL,
+#     exactly as the Linux do_fchmodat2() vfs entry does.
+#   * AT_EMPTY_PATH with an empty path operates on `dirfd` itself (the
+#     fchmod-on-fd case): a valid open fd succeeds, a stale fd is -EBADF.
+#   * A normal path is copied in through the user-pointer-safe copy helpers,
+#     resolved, and the target is opened to PROVE it exists — a chmod on a
+#     missing path returns -ENOENT (the bit `install`/`tar -p`/`chmod` check),
+#     a resolvable path returns 0.
+#   * AT_SYMLINK_NOFOLLOW is accepted and is a no-op here because Hamnix's
+#     native fs presents no symlinks, so follow and no-follow resolve the same
+#     target (the honest single-namespace answer, same as _u_chown's lchown).
+#
+# Hamnix's native side is single-user/root and has no writable inode-mode
+# store (ext4_path_mode is read-only; tmpfs/cpio carry no mode bits), so a
+# chmod from root that resolves its target SUCCEEDS — identical to the existing
+# _u_chmod contract. fchmodat2 adds the real flags layer on top of that path.
+#
+# Layer note: a confined Layer-2 leaf, mirroring linux_abi/u_quota.ad and
+# linux_abi/u_mempolicy.ad. It calls only the user-pointer-safe path copy
+# helper (strncpy_from_user) plus the VFS resolve/open primitives the other
+# *at handlers already use, and printk for the self-test. It never touches
+# 9P / Chan / Layer-1 code. u_syscalls.ad imports it (the nr 452 dispatch arm
+# forwards here), the same shape as u_quota.ad. fchmodat2 returns ints, never
+# fds -- no FD_*_MARK is introduced.
+
+from mm.uaccess import (
+    strncpy_from_user,
+)
+from fs.vfs import (
+    resolve_path, vfs_open, vfs_close, vfs_fd_is_open,
+    FD_CLOSED_MARK,
+)
+from kernel.sched.core import (
+    current_task, TaskStruct,
+)
+from kernel.printk.printk import (
+    printk0, printk1,
+)
+
+
+# =====================================================================
+# Linux fchmodat2 ABI constants
+# =====================================================================
+#
+# dirfd sentinel and the two AT_* flags the call accepts (uapi/linux/fcntl.h).
+FCM2_AT_FDCWD:          uint64 = 0xFFFFFFFFFFFFFF9C   # AT_FDCWD (-100)
+FCM2_AT_SYMLINK_NOFOLLOW: uint64 = 0x100              # AT_SYMLINK_NOFOLLOW
+FCM2_AT_EMPTY_PATH:     uint64 = 0x1000               # AT_EMPTY_PATH
+# The complete set of flag bits fchmodat2 understands. Any bit outside this
+# mask is invalid input -> -EINVAL (Linux do_fchmodat2 valid-flags gate).
+FCM2_VALID_FLAGS:      uint64 = 0x1100                # NOFOLLOW | EMPTY_PATH
+
+# Negative-errno convention (the subset fchmodat2 returns).
+FCM2_EBADF:   int64 = -9
+FCM2_EFAULT:  int64 = -14
+FCM2_EINVAL:  int64 = -22
+FCM2_ENOENT:  int64 = -2
+FCM2_ENAMETOOLONG: int64 = -36
+
+# Path copy-in cap (mirrors u_syscalls MAX_USER_PATH).
+FCM2_PATH_MAX: uint64 = 256
+
+
+def _fcm2_path_is_empty(kp: Ptr[uint8]) -> int32:
+    # 1 iff the kernel-copied path is the empty string.
+    if kp[0] == 0:
+        return 1
+    return 0
+
+
+def _fcm2_path_is_abs(kp: Ptr[uint8]) -> int32:
+    # 1 iff the kernel-copied path is absolute (starts with '/').
+    if kp[0] == 47:                                  # '/'
+        return 1
+    return 0
+
+
+# =====================================================================
+# fchmodat2(dirfd, path, mode, flags)  --  nr 452
+# =====================================================================
+#
+#   a0 = dirfd, a1 = path*, a2 = mode, a3 = flags.
+#
+# The kernel-side handler returns an int64 (negative errno or 0).
+def fchmodat2_handler(a0: uint64, a1: uint64, a2: uint64,
+                      a3: uint64, a4: uint64, a5: uint64) -> int64:
+    dirfd: uint64 = a0
+    upath: uint64 = a1
+    flags: uint64 = a3
+
+    # (1) Real flag validation: reject any bit outside the accepted set. This
+    # is the do_fchmodat2() valid-flags gate — `chmod --reference` and glibc's
+    # probe both depend on a bad flag failing EINVAL rather than being ignored.
+    if (flags & ~FCM2_VALID_FLAGS) != 0:
+        return FCM2_EINVAL
+
+    empty_path: int32 = 0
+    if (flags & FCM2_AT_EMPTY_PATH) != 0:
+        empty_path = 1
+    # AT_SYMLINK_NOFOLLOW is accepted; with no symlinks present, follow and
+    # no-follow resolve to the same target, so there is nothing further to do
+    # for that bit.
+
+    # (2) Copy the user path into a kernel buffer up-front so every subsequent
+    # deref hits kernel memory — a bad user pointer is a clean -EFAULT, not a
+    # page fault. A NULL path with AT_EMPTY_PATH is the fchmod-on-fd case.
+    kpath: Array[256, uint8]
+    if upath == 0:
+        # NULL path. Only valid as the AT_EMPTY_PATH-on-fd form.
+        if empty_path == 1:
+            return _fcm2_chmod_fd(dirfd)
+        return FCM2_EFAULT
+    r: int64 = strncpy_from_user(cast[uint64](&kpath[0]), upath, FCM2_PATH_MAX)
+    if r < 0:
+        return FCM2_EFAULT
+    if cast[uint64](r) >= FCM2_PATH_MAX - 1:
+        return FCM2_ENAMETOOLONG                     # no NUL inside the cap
+
+    # (3) AT_EMPTY_PATH with an empty path operates on dirfd itself.
+    if empty_path == 1 and _fcm2_path_is_empty(&kpath[0]) == 1:
+        return _fcm2_chmod_fd(dirfd)
+
+    # (4) dirfd model: this tree resolves relative paths against the process
+    # CWD only for AT_FDCWD; a non-AT_FDCWD dirfd with a relative path is not
+    # supported (matching _u_fchmodat / _u_statx). An absolute path ignores
+    # dirfd entirely.
+    is_abs: int32 = _fcm2_path_is_abs(&kpath[0])
+    if dirfd != FCM2_AT_FDCWD and is_abs == 0:
+        return FCM2_EBADF
+
+    # (5) Resolve and prove the target exists, then succeed (single-user/root
+    # chmod with no writable mode store — the existing _u_chmod contract).
+    abs_path: Array[256, uint8]
+    rc: int32 = resolve_path(cast[Ptr[char]](&kpath[0]), &abs_path[0], 256)
+    if rc != 0:
+        return FCM2_ENOENT
+    fd: int32 = vfs_open(cast[Ptr[char]](&abs_path[0]))
+    if fd < 0:
+        return FCM2_ENOENT
+    vfs_close(fd)
+    return 0
+
+
+def _fcm2_chmod_fd(fd: uint64) -> int64:
+    # The AT_EMPTY_PATH-on-fd form: chmod the open file behind `fd`. A live fd
+    # succeeds; a stale/closed fd is -EBADF. AT_FDCWD is never a real fd, so an
+    # AT_EMPTY_PATH chmod against AT_FDCWD is -EBADF (Linux returns EBADF for an
+    # empty path with dirfd==AT_FDCWD).
+    if fd == FCM2_AT_FDCWD:
+        return FCM2_EBADF
+    if vfs_fd_is_open(cast[int32](fd)) == 0:
+        return FCM2_EBADF
+    return 0
+
+
+# =====================================================================
+# Boot self-test  --  [FCHMODAT2] PASS / FAIL  (boot:37.fchmodat2)
+# =====================================================================
+#
+# Exercises fchmodat2_handler directly — the SAME entry point the nr 452
+# dispatch arm calls — against the REAL VFS resolve/open path and the real
+# fd table. Boot-context pointers are kernel-mapped and resolve through
+# strncpy_from_user the same way quota_selftest's stack buffers do. Steps:
+#
+#   (1) fchmodat2(AT_FDCWD, "/etc/fchmodat2-test", 0644, 0) -> 0
+#       (the cpio marker file is a REAL openable path; mode 0644, no flags).
+#   (2) fchmodat2(AT_FDCWD, "/etc/fchmodat2-test", 0755, AT_SYMLINK_NOFOLLOW)
+#       -> 0  (the NOFOLLOW flag is accepted, not rejected).
+#   (3) fchmodat2(AT_FDCWD, "/no/such/path/xyz", 0644, 0) -> -ENOENT
+#       (a missing target really fails, proving the resolve is real).
+#   (4) fchmodat2(AT_FDCWD, path, 0644, 0x4) -> -EINVAL
+#       (an unsupported flag bit is rejected, not silently ignored).
+#   (5) AT_EMPTY_PATH on a REAL open fd: open "/etc/fchmodat2-test", then
+#       fchmodat2(fd, NULL, 0600, AT_EMPTY_PATH) -> 0 (chmod-on-fd), and
+#       fchmodat2(fd, "", 0600, AT_EMPTY_PATH) -> 0 (empty-string form).
+#   (6) AT_EMPTY_PATH on a stale fd -> -EBADF, and AT_EMPTY_PATH with
+#       dirfd==AT_FDCWD -> -EBADF (the off-fd error path is observable).
+#
+# fchmodat2_selftest returns 1 on success, 0 on any failure (matching
+# quota_selftest's convention).
+
+def fchmodat2_selftest() -> int32:
+    # Boot context is the boot/idle task: its fd table slots 3..15 are held by
+    # earlier boot resources, so a fresh vfs_open would return -EMFILE. Mirror
+    # landlock_selftest's fd-table juggle: save slots 3..15, free them
+    # (FD_CLOSED_MARK) for the duration of the body, then restore them. This
+    # lets the REAL VFS resolve/open path the handler uses actually allocate an
+    # fd, exactly as a userspace task would.
+    boot_task: Ptr[TaskStruct] = current_task()
+    fd_save: Array[16, uint32]
+    si: uint64 = 3
+    while si < 16:
+        fd_save[si] = boot_task[0].fd_idx[si]
+        boot_task[0].fd_idx[si] = FD_CLOSED_MARK
+        si = si + 1
+
+    rc: int32 = _fchmodat2_selftest_body()
+
+    ri: uint64 = 3
+    while ri < 16:
+        boot_task[0].fd_idx[ri] = fd_save[ri]
+        ri = ri + 1
+    return rc
+
+
+def _fchmodat2_selftest_body() -> int32:
+    # The cpio marker planted by scripts/test_fchmodat2.sh is also the real
+    # file the test chmods. Function-local string literals (Adder allows string
+    # initializers only on Array-typed globals, not bare Ptr globals, so these
+    # live as locals).
+    good: Ptr[char] = "/etc/fchmodat2-test"
+    miss: Ptr[char] = "/no/such/path/xyz"
+    empty: Ptr[char] = ""
+
+    rc: int64 = 0
+
+    # --- (1) plain chmod, no flags, on a real path -> 0 -------------
+    rc = fchmodat2_handler(FCM2_AT_FDCWD, cast[uint64](good),
+                           0x1A4, 0, 0, 0)            # 0644 octal
+    if rc != 0:
+        printk1("[FCHMODAT2] FAIL plain chmod rc=%d (want 0)\n",
+                cast[uint64](rc))
+        return 0
+    printk0("[FCHMODAT2] PASS chmod 0644 /etc/fchmodat2-test flags=0 -> 0\n")
+
+    # --- (2) AT_SYMLINK_NOFOLLOW accepted -> 0 ----------------------
+    rc = fchmodat2_handler(FCM2_AT_FDCWD, cast[uint64](good),
+                           0x1ED, FCM2_AT_SYMLINK_NOFOLLOW, 0, 0)  # 0755
+    if rc != 0:
+        printk1("[FCHMODAT2] FAIL NOFOLLOW rc=%d (want 0)\n",
+                cast[uint64](rc))
+        return 0
+    printk0("[FCHMODAT2] PASS AT_SYMLINK_NOFOLLOW accepted -> 0\n")
+
+    # --- (3) missing target -> -ENOENT ------------------------------
+    rc = fchmodat2_handler(FCM2_AT_FDCWD, cast[uint64](miss),
+                           0x1A4, 0, 0, 0)
+    if rc != FCM2_ENOENT:
+        printk1("[FCHMODAT2] FAIL missing-path rc=%d (want ENOENT -2)\n",
+                cast[uint64](rc))
+        return 0
+    printk0("[FCHMODAT2] PASS missing path -> -ENOENT (resolve is real)\n")
+
+    # --- (4) unsupported flag bit -> -EINVAL ------------------------
+    rc = fchmodat2_handler(FCM2_AT_FDCWD, cast[uint64](good),
+                           0x1A4, 0x4, 0, 0)          # 0x4 is not a valid flag
+    if rc != FCM2_EINVAL:
+        printk1("[FCHMODAT2] FAIL bad-flag rc=%d (want EINVAL -22)\n",
+                cast[uint64](rc))
+        return 0
+    printk0("[FCHMODAT2] PASS unsupported flag rejected -> -EINVAL\n")
+
+    # --- (5) AT_EMPTY_PATH on a real open fd -> 0 -------------------
+    abuf: Array[256, uint8]
+    prc: int32 = resolve_path(good, &abuf[0], 256)
+    if prc != 0:
+        printk1("[FCHMODAT2] FAIL resolve marker rc=%d\n", cast[uint64](prc))
+        return 0
+    fd: int32 = vfs_open(cast[Ptr[char]](&abuf[0]))
+    if fd < 0:
+        printk1("[FCHMODAT2] FAIL open marker fd=%d\n", cast[uint64](fd))
+        return 0
+    rc = fchmodat2_handler(cast[uint64](fd), 0,
+                           0x180, FCM2_AT_EMPTY_PATH, 0, 0)  # NULL path, 0600
+    if rc != 0:
+        printk1("[FCHMODAT2] FAIL EMPTY_PATH-on-fd(NULL) rc=%d (want 0)\n",
+                cast[uint64](rc))
+        vfs_close(fd)
+        return 0
+    rc = fchmodat2_handler(cast[uint64](fd), cast[uint64](empty),
+                           0x180, FCM2_AT_EMPTY_PATH, 0, 0)  # "" path, 0600
+    if rc != 0:
+        printk1("[FCHMODAT2] FAIL EMPTY_PATH-on-fd(\"\") rc=%d (want 0)\n",
+                cast[uint64](rc))
+        vfs_close(fd)
+        return 0
+    vfs_close(fd)
+    printk0("[FCHMODAT2] PASS AT_EMPTY_PATH on a real open fd -> 0\n")
+
+    # --- (6) AT_EMPTY_PATH off-fd error paths -> -EBADF ------------
+    # A stale fd (just closed) must fail EBADF.
+    rc = fchmodat2_handler(cast[uint64](fd), 0,
+                           0x180, FCM2_AT_EMPTY_PATH, 0, 0)
+    if rc != FCM2_EBADF:
+        printk1("[FCHMODAT2] FAIL EMPTY_PATH stale-fd rc=%d (want EBADF -9)\n",
+                cast[uint64](rc))
+        return 0
+    # AT_EMPTY_PATH with dirfd==AT_FDCWD is EBADF (no real fd behind it).
+    rc = fchmodat2_handler(FCM2_AT_FDCWD, 0,
+                           0x180, FCM2_AT_EMPTY_PATH, 0, 0)
+    if rc != FCM2_EBADF:
+        printk1("[FCHMODAT2] FAIL EMPTY_PATH AT_FDCWD rc=%d (want EBADF -9)\n",
+                cast[uint64](rc))
+        return 0
+    printk0("[FCHMODAT2] PASS AT_EMPTY_PATH off-fd paths -> -EBADF\n")
+
+    printk0("[fchmodat2] PASS\n")
+    return 1
